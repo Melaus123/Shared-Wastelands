@@ -1,0 +1,9 @@
+MinHook - "multihook" variant (vendored for RE_Kenshi migration stage 1, coop::AddHook in hooks.cpp)
+
+Upstream:  https://github.com/m417z/minhook
+Branch:    multihook
+Commit:    4f18d18 ("Add missing exports")
+Vendored:  2026-09-28
+Licence:   BSD-2-Clause (see LICENSE.txt; authors in AUTHORS.txt)
+State:     unmodified - include/, src/, src/hde/, LICENSE.txt and AUTHORS.txt are byte-for-byte copies of that commit.
+           Only the files needed to compile the library were taken (no build/, cmake/, dll_resources/).

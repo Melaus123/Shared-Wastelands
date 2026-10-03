@@ -1,0 +1,3 @@
+# No line-ending conversion on check-in or checkout: the vendored headers (owner decision 103) check out
+# byte-for-byte as copied, and lib\ (made here from the game's own DLLs, T-373 - see SOURCE.txt) stays exact.
+* -text

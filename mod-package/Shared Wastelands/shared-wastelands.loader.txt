@@ -1,0 +1,8 @@
+# shared-wastelands loader marker (mig6, owner decision 118).
+# SharedWastelandsLoader.dll - the one Plugin=SharedWastelandsLoader line in the game's Plugins_x64.cfg - looks in every mods\*\ folder,
+# then every Steam Workshop item folder, for this file, loads the DLL it names from THIS folder and calls the export it
+# names. Format: src/common/loadermarker.h. Players with RE_Kenshi load the mod through RE_Kenshi.json instead; the mod
+# starts once either way.
+format=1
+dll=SharedWastelands.dll
+start=coopEarlyStart

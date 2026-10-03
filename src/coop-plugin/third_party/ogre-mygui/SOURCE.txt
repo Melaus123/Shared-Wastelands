@@ -1,0 +1,26 @@
+Ogre 2.0.0 pre-release and MyGUI - headers (vendored) and x64 import libraries (made here, T-373)
+
+HEADERS (include\) - kept in the repo so the build needs no download.
+              include\ogre    Ogre 2.0.0 pre-release headers, configured as the game's OgreMain is built
+                              (OGRE_MEMORY_ALLOCATOR 4) - never swap in stock Ogre
+              include\mygui   MyGUI headers
+State:      unmodified - whole directories, byte for byte. .gitattributes here turns line-ending conversion off so
+            a checkout stays byte-identical.
+            The build includes only a subset (measured with /showIncludes: 17 Ogre headers, 95 MyGUI headers); the
+            directories are whole so a new #include needs nothing from outside the repo.
+Licence:    MIT. MyGUI: include\mygui\COPYING.MIT. Ogre: the MIT text is at the top of every Ogre header (e.g.
+            include\ogre\OgrePrerequisites.h, "Copyright (c) 2000-2014 Torus Knot Software Ltd").
+
+IMPORT LIBRARIES (lib\) - T-373 (owner 280/282): made by this project from the GAME'S OWN DLLs.
+lib\<name>.def is the source; lib\<name>.lib is made from it.
+  1. dumpbin /exports "C:\Program Files (x86)\Steam\steamapps\common\Kenshi\<name>.dll"  (read-only; MSVC 14.44)
+  2. every named export -> lib\<name>.def (LIBRARY <name>.dll / EXPORTS); a name whose exported address lies in a
+     non-executable section of that DLL is marked DATA (only __imp_<name> is made for it)
+  3. lib /def:<name>.def /machine:x64 /out:<name>.lib   (MSVC 14.44.35207, VS 2022 Build Tools)
+  The script that did 1-3 and the check: build/t373_make_libs.py (in the T-373 worktree's build\, gitignored).
+              OgreMain_x64.dll     9329 exports (707 DATA)  -> lib\OgreMain_x64.lib     sha256 36a3601c8886ae9aec4f3267d195a16471421645f656a619d097ae4618d07404
+              MyGUIEngine_x64.dll  3598 exports (496 DATA)  -> lib\MyGUIEngine_x64.lib  sha256 0686a72ce98071f3e5716b48136f9e653d16309e5e41a1efb6893e91adc51d42
+  (lib.exe stamps a time into each member, so a rerun gives a different sha256 for the same .def.)
+Coverage check (2026-09-30): every name SharedWastelands.dll imports from the two DLLs today (dumpbin /imports of
+  four current builds: 7 OgreMain_x64 names, 63 MyGUIEngine_x64 names) is in the new .def, with the same code/data
+  kind as in the libraries it replaces. The plugin build's import gate is the final check.
