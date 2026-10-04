@@ -113,6 +113,9 @@ void GarmentsNoteOwnerMove(unsigned int uid, const std::string& section, int op)
 // MAIN THREAD. The copy is removed (spawn.cpp RemoveLocalCopy): forget its dead-copy marks (review D3a) and its createBody-guard
 // marks (T-293 fold 2).
 void DeadlookForgetCopy(unsigned int uid);
+// MAIN THREAD (spawn.cpp SpawnWorldTeardown): the world is going - every copy's marks DeadlookForgetCopy forgets one copy at a
+// time are forgotten at once, so a copy met in the next world with the same uid starts with none (its first look is its own).
+void DeadlookForgetAllCopies();
 
 // R1-a / R1-a-b (review-r1a LOW-3): cumulative count of remote APPEARANCE / CLOTHING entries that
 // ENTERED a wait because the character was settled but not yet built - once per uid per wait, not
@@ -152,6 +155,9 @@ int CharacterProneSafe(::Character* c, int* reasonOut);
 // is better dressed first; callers bound this wait). The appearance and clothing applies wait while a copy lies down
 // or is limp. MAIN THREAD.
 int KnockdownWait(unsigned int uid, ::Character* c);
+// The knockdown hold for this copy gave up waiting for its looks (spawn.cpp KnockdownMustWait). Counted lookKoArrival gaveUp
+// when the owner says knocked out and the copy's first look is still pending. MAIN THREAD.
+void NoteKnockLooksGaveUp(unsigned int uid);
 
 // crash1: 1 = the copy lies down (PoseState 2..4), is limp, or is about to be (its `unconcious` byte or wake-up clock is
 // set); 0 = standing; -1 = unreadable (treat as down). MAIN THREAD.

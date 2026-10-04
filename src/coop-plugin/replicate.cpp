@@ -64,6 +64,7 @@ static unsigned long long kMig3AiIsEnemy = 0; static coop::AddrReg kMig3AiIsEnem
 #include "../common/getupcrawl.h"   // T-178 crawl1 (H050): MoveDrivesProne - a crawler (prone 2, not a ragdoll) is driven
 #include "../common/uidtable.h"   // mirror1 (crash T487): AdoptDecision / DriveDecision
 #include "../common/insidewire.h"   // P25 fold 2: the owner's INSIDE word - its staleness and send rules
+#include "../common/copyjudge.h"   // T-573: the judge held while the simulation is stopped; a given-up copy re-armed
 #include <set>                    // mirror1: the once-per-uid refusal log
 #include <sstream>
 #include <locale>
@@ -427,6 +428,10 @@ struct Puppet
     float catchupFromX, catchupFromZ, catchupDriftBefore;
     int   catchupTries;
     bool  catchupGaveUp;
+    int   rearms;             // T-573: give-ups lifted so far (copyjudge::kMaxRearms at most)
+    int   gaveUpWindows;      // T-573: judged windows since the current give-up
+    long long heldFromTick;   // T-573: the frame this game's simulation stopped for this copy's judge; -1 = running
+    double heldFromSec;       // T-573: ... and when, in NowSeconds; -1 = running
     int   snapCause;          // review-r2 item 5: kSnapCauseFar / kSnapCauseStuck, set at placement; 0 = none yet
     int   snapWatchWindows;   // review-r2 item 1: judged windows since the last snap; -1 = no snap being watched
     int   snapStrikes;        // ... snaps followed by lost/stalled again within kSnapStrikeWindows
@@ -750,6 +755,11 @@ long long g_catchupSnaps     = 0;
 long long g_catchupEffective = 0;   // the puppet actually moved by roughly the gap
 long long g_catchupIneffective = 0;
 long long g_catchupGaveUp    = 0;
+long long g_catchupGaveUpFinal = 0;   // T-573: give-ups with no re-arm left
+long long g_catchupRearmed   = 0;     // T-573: given-up copies tried again (copyjudge)
+long long g_judgeHeldFrames  = 0;     // T-573: copy-frames neither judged nor driven because this game's simulation was stopped
+long long g_judgeHeldResumes = 0;     // T-573: copies whose window clocks moved on by a stop that ended
+bool      g_simHeld          = false; // T-573: this frame's stopped state, read live in ReplicateTick
 // F324: declined because the character is ragdolled, which makes placement structurally impossible
 // (F314). Counted, not silent - "declined" and "failed" are different results and the run must be
 // able to tell them apart.
@@ -770,6 +780,7 @@ long long g_stalledNotClosing      = 0;
 long long g_snapEffectiveBy[3]   = {0, 0, 0};
 long long g_snapIneffectiveBy[3] = {0, 0, 0};
 long long g_snapGaveUpBy[3]      = {0, 0, 0};
+long long g_snapGaveUpByTest     = 0;   // T-573: give-ups made by the TEST-ONLY giveup verb - its own bucket, so the causes sum
 long long g_snapStrikes            = 0;   // item 1: a snapped copy lost/stalled again within kSnapStrikeWindows
 long long g_snapRateCapped         = 0;   // item 1: a snap declined - kSnapRateMax already in the last 60 s
 long long g_snapStuckAfterUnstick  = 0;   // item 2: stuck snaps fired by "still stalled after an unstick order"
@@ -2409,6 +2420,13 @@ static bool FollowDriveStep(unsigned int uid, Puppet& p, CharMovement* mv, const
                 const bool shortOf = sx * p.fHX + sz * p.fHZ > 0.0f;
                 if (shortOf && sx * sx + sz * sz > p.fStopArrive * p.fStopArrive) return false;
             }
+            // Standing ends the push: a push frame's steering left set keeps the engine walking the copy on at run speed past
+            // the stop (H066), so a copy still driving leaves its path here, as the hold's first frame does.
+            if (p.driving)
+            {
+                if (!SafeLeavePath(mv)) ++g_pathLeaveFaulted;
+                p.driving = false;
+            }
             return true;   // stands (at N: until N is ahead again)
         }
     }
@@ -3254,6 +3272,51 @@ std::string P093SummaryLine()
 }
 // PROBE-END: P093
 
+// T-573: what a give-up's log line adds - whether, and after how many judged windows, the copy is tried again.
+std::string RearmNote(const Puppet& p)
+{
+    if (!copyjudge::RearmLeft(p.rearms))
+        return " No re-arm left (" + N2(copyjudge::kMaxRearms) + " used): this copy is not placed again.";
+    return " Tried again after " + N2(copyjudge::RearmWaitWindows(p.rearms)) + " judged windows (re-arm "
+           + N2(p.rearms + 1) + " of " + N2(copyjudge::kMaxRearms) + ").";
+}
+
+// T-573: the bookkeeping every give-up shares - the wait for the next re-arm starts now.
+void NoteGaveUp(Puppet& p)
+{
+    p.gaveUpWindows = 0;
+    if (!copyjudge::RearmLeft(p.rearms)) ++g_catchupGaveUpFinal;
+}
+
+// T-573: every clock a copy's judgement, grace or hold reads moves on by a stop of this game's simulation that ended
+// this frame (copyjudge.h), so each counts running time only. Called for every copy every frame, before its drive.
+// Frame clocks: the progress window, the unstick order, the path's progress window, its issue-to-moving timer and
+// failed-flag trust, the H021 order re-issue, the combat-snap score. Real-time clocks: the path's pending grace (issue
+// and budget wait), its hold on the push, the owner-still and owner-turned watches, the combat reconcile's previous
+// frame, the follow stop watch, and the placement rate cap's snap times.
+void HoldShiftClocks(Puppet& p, double now)
+{
+    const long long sh = copyjudge::HoldShift(g_simHeld, g_tick, &p.heldFromTick);
+    const double ss = copyjudge::HoldShiftSec(g_simHeld, now, &p.heldFromSec);
+    if (sh <= 0 && !(ss > 0.0)) return;
+    p.progressCheckTick = copyjudge::ShiftClock(p.progressCheckTick, sh);
+    p.unstickTick       = copyjudge::ShiftClock(p.unstickTick, sh);
+    p.pathProgTick      = copyjudge::ShiftClock(p.pathProgTick, sh);
+    p.pathAwaitTick     = copyjudge::ShiftClock(p.pathAwaitTick, sh);
+    p.pathIssueTick     = copyjudge::ShiftClock(p.pathIssueTick, sh);
+    p.orderTick         = copyjudge::ShiftClock(p.orderTick, sh);
+    p.nativeSnapTick    = copyjudge::ShiftClock(p.nativeSnapTick, sh);
+    p.pathIssueAt         = copyjudge::ShiftSince(p.pathIssueAt, ss);
+    p.pathWantSince       = copyjudge::ShiftSince(p.pathWantSince, ss);
+    p.pathHoldUntil       = copyjudge::ShiftSince(p.pathHoldUntil, ss);
+    p.pathOwnerStillSince = copyjudge::ShiftSince(p.pathOwnerStillSince, ss);
+    p.pathTurnSince       = copyjudge::ShiftSince(p.pathTurnSince, ss);
+    p.rcLastTickAt        = copyjudge::ShiftSince(p.rcLastTickAt, ss);
+    if (p.fStopProg.armed) p.fStopProg.bestAt = copyjudge::ShiftSince(p.fStopProg.bestAt, ss);
+    for (int i = 0; i < kSnapRateMax; ++i) p.snapTimes[i] = copyjudge::ShiftSince(p.snapTimes[i], ss);
+    ++g_judgeHeldResumes;
+}
+
 void DrivePuppet(unsigned int uid, Puppet& p)
 {
     if (!PlausibleObj(p.ch)) { if (p.nativeWindow) { ++g_rcSkippedNoChar; p.rcVisPrimed = false; } return; }
@@ -3306,6 +3369,14 @@ void DrivePuppet(unsigned int uid, Puppet& p)
         PoseNoteHeldFrame();
         return;
     }
+
+    // T-573: WHILE THIS GAME'S SIMULATION IS STOPPED (copyjudge.h) NOTHING BELOW RUNS for this copy: no combat-window
+    // reconcile or its drift sums, no combat-snap score, no follow playback or stop watch, no walking push or route, no
+    // progress window, strike, give-up or placement. Nothing moves while the engine is stopped, so each would read "went
+    // nowhere" or write a position the engine does not apply until it runs. What still runs above: the drift numbers
+    // (lastDrift / maxDrift) and the pose hold. HoldShiftClocks moves every clock these read on by the held span when the
+    // simulation runs again, so the first running frame carries on as if no time had passed.
+    if (g_simHeld) { ++g_judgeHeldFrames; return; }
 
     // H015 / P059 - INSIDE A NATIVE COMBAT WINDOW THE AI OWNS THE LEGS. Measured, not driven:
     // the AI is closing on the same target the authority's copy is closing on, so the two bodies
@@ -3675,6 +3746,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
             p.catchupGaveUp = true;
             ++g_catchupGaveUp;
             ++g_snapGaveUpBy[cause];
+            NoteGaveUp(p);   // T-573
             // review-r2 item 5: the old text said "this one reported standing" - nothing re-reads that here. What
             // is known is that the snap gates declined prone and ragdolled copies AT PLACEMENT.
             ErrorLog("[M2] catch-up GIVING UP on uid=" + N2(uid) + " after "
@@ -3685,7 +3757,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                      " this character, which is a DIFFERENT result from 'it cannot walk there'"
                      " and must not be read as one (F314: for a ragdolled character the"
                      " write-back is skipped entirely - this one was neither prone nor ragdolled"
-                     " when it was placed; its state now is not re-read).");
+                     " when it was placed; its state now is not re-read)." + RearmNote(p));
         }
         else { ++g_catchupIneffective; ++g_snapIneffectiveBy[cause]; }
     }
@@ -3955,13 +4027,31 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                     p.catchupGaveUp = true;
                     ++g_catchupGaveUp;
                     ++g_snapGaveUpBy[sc];
+                    NoteGaveUp(p);   // T-573
                     ErrorLog("[M2] catch-up GIVING UP on uid=" + N2(uid) + ": " + N2(kSnapMaxStrikes)
                              + " strikes, the last after a " + SnapCauseName(sc) + " snap - each time the copy was "
                              + (stalled ? "stalled" : "lost") + " again within " + N2(kSnapStrikeWindows)
-                             + " windows of being placed, so placing it does not keep it with its owner (review-r2 item 1)");
+                             + " windows of being placed, so placing it does not keep it with its owner (review-r2 item 1)."
+                             + RearmNote(p));
                 }
             }
             else if (p.snapWatchWindows >= kSnapStrikeWindows) p.snapWatchWindows = -1;
+        }
+
+        // T-573: a given-up copy waits its judged windows, then is tried again - bounded and backed off (copyjudge.h), so
+        // F189's runaway stays impossible while a copy no longer stands out of place for the rest of its life.
+        if (p.catchupGaveUp)
+        {
+            ++p.gaveUpWindows;
+            if (copyjudge::RearmDue(p.rearms, p.gaveUpWindows))
+            {
+                ++p.rearms;
+                ++g_catchupRearmed;
+                p.catchupGaveUp = false; p.catchupTries = 0; p.snapStrikes = 0; p.snapWatchWindows = -1; p.gaveUpWindows = 0;
+                ErrorLog("[M2] catch-up RE-ARMED uid=" + N2(uid) + " (re-arm " + N2(p.rearms) + " of "
+                         + N2(copyjudge::kMaxRearms) + ", drift " + F2(dist) + ") - the give-up is lifted; the stuck and"
+                         " far placements may place this copy again");
+            }
         }
 
         p.progressCheckTick = g_tick;
@@ -4286,6 +4376,7 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
         p.progressCheckTick = 0; p.progressFromX = 0.0f; p.progressFromZ = 0.0f; p.progressFromDist = 0.0f;
         p.stalledWindows = 0; p.catchupPending = false; p.catchupDriftBefore = 0.0f;
         p.catchupFromX = 0.0f; p.catchupFromZ = 0.0f; p.catchupTries = 0; p.catchupGaveUp = false;
+        p.rearms = 0; p.gaveUpWindows = 0; p.heldFromTick = -1; p.heldFromSec = -1.0;   // T-573
         p.progressFromTX = 0.0f; p.progressFromTZ = 0.0f; p.snapCause = 0; p.snapWatchWindows = -1; p.snapStrikes = 0;
         for (int si = 0; si < kSnapRateMax; ++si) p.snapTimes[si] = -1.0e9;
         p.snapTimesNext = 0; p.unstickEnded = false;
@@ -5716,11 +5807,21 @@ void ReplicateTick()
     DrainOffThreadDespawns();   // T-304 (2): this game's off-thread destroys are announced here, before the reclaim frees their rows
     if ((g_tick % 30) == 0) MirrorReclaimDestroyed();
 
+    // T-573: this frame's stopped state, read live from the engine (its pause flag or a zero speed multiplier - the P039
+    // rule); while stopped no copy is judged, placed or driven (copyjudge.h).
+    {
+        bool paused = false;
+        float mul = 1.0f;
+        const bool ok = PauseSnapshot(&paused, &mul);
+        g_simHeld = copyjudge::SimulationHeld(ok, paused, mul, ok && _finite(mul) != 0);
+    }
     // Drive every puppet EVERY frame, not on the send cadence: the target updates at
     // ~10 Hz but the push must be continuous or the character stutters between updates.
+    const double shiftNow = NowSeconds();   // T-573: the held span's seconds
     for (std::map<unsigned int, Puppet>::iterator it = g_puppets.begin();
          it != g_puppets.end(); ++it)
     {
+        HoldShiftClocks(it->second, shiftNow);   // T-573: before the drive, so no judgement spans a stop
         DrivePuppet(it->first, it->second);
         RunBoostSettle(it->first, it->second);   // T-189 runboost: a raise the drive did not renew this frame ends
     }
@@ -5899,6 +6000,7 @@ void AdoptRemotePuppet(unsigned int uid)
         p.progressCheckTick = 0; p.progressFromX = 0.0f; p.progressFromZ = 0.0f; p.progressFromDist = 0.0f;
         p.stalledWindows = 0; p.catchupPending = false; p.catchupDriftBefore = 0.0f;
         p.catchupFromX = 0.0f; p.catchupFromZ = 0.0f; p.catchupTries = 0; p.catchupGaveUp = false;
+        p.rearms = 0; p.gaveUpWindows = 0; p.heldFromTick = -1; p.heldFromSec = -1.0;   // T-573
         p.progressFromTX = 0.0f; p.progressFromTZ = 0.0f; p.snapCause = 0; p.snapWatchWindows = -1; p.snapStrikes = 0;
         for (int si = 0; si < kSnapRateMax; ++si) p.snapTimes[si] = -1.0e9;
         p.snapTimesNext = 0; p.unstickEnded = false;
@@ -6788,6 +6890,27 @@ void SetDriveSpeed(float v)
 
 float GetDriveSpeed() { return g_driveSpeed; }
 
+// T-573 TEST-ONLY lever (`giveup <uid>`, 0 = every copy): mark copies given up exactly as a failed placement does, so a
+// run can watch a given-up copy wait and be tried again. Returns how many copies it marked.
+int ForceCatchupGiveUp(unsigned int uid)
+{
+    int n = 0;
+    for (std::map<unsigned int, Puppet>::iterator it = g_puppets.begin(); it != g_puppets.end(); ++it)
+    {
+        if (uid != 0 && it->first != uid) continue;
+        Puppet& p = it->second;
+        if (p.catchupGaveUp) continue;
+        p.catchupGaveUp = true;
+        p.catchupPending = false;
+        ++g_catchupGaveUp;
+        ++g_snapGaveUpByTest;
+        NoteGaveUp(p);
+        ++n;
+        ErrorLog("[M2] TEST giveup uid=" + N2(it->first) + " - marked given up as a failed placement would." + RearmNote(p));
+    }
+    return n;
+}
+
 // P037 / F315. See the constants block for why this is a TEST before it is a fix, and why it is
 // triggered by the puppet's own displacement rather than by the size of the gap.
 void SetCatchup(bool on)
@@ -6909,6 +7032,10 @@ void ReportReplication()
        << " catchupEffective=" << N2(g_catchupEffective)
        << " catchupIneffective=" << N2(g_catchupIneffective)
        << " catchupGaveUp=" << N2(g_catchupGaveUp)
+       << " catchupGaveUpFinal=" << N2(g_catchupGaveUpFinal)   // T-573
+       << " catchupRearmed=" << N2(g_catchupRearmed)
+       << " judgeHeldFrames=" << N2(g_judgeHeldFrames)
+       << " judgeHeldResumes=" << N2(g_judgeHeldResumes)
        << " catchupSkippedRagdoll=" << N2(g_catchupSkippedRagdoll)
        // Decision 60 - placements by cause. snapStuck is catchupSnaps under its cause name (both
        // kept: readouts grep catchupSnaps). stalledNotClosing: item 5's added stall cause.
@@ -6924,6 +7051,8 @@ void ReportReplication()
        << " snapStuckEffective=" << N2(g_snapEffectiveBy[kSnapCauseStuck])
        << " snapStuckIneffective=" << N2(g_snapIneffectiveBy[kSnapCauseStuck])
        << " snapStuckGaveUp=" << N2(g_snapGaveUpBy[kSnapCauseStuck])
+       << " snapNoCauseGaveUp=" << N2(g_snapGaveUpBy[0])   // T-573: with the two above and the next, sums to catchupGaveUp
+       << " snapTestGaveUp=" << N2(g_snapGaveUpByTest)
        << " snapStrikes=" << N2(g_snapStrikes)
        << " snapRateCapped=" << N2(g_snapRateCapped)
        << " snapStuckAfterUnstick=" << N2(g_snapStuckAfterUnstick)

@@ -31,6 +31,7 @@
 #include "steamprobe.h"   /* T-290 S0: the relay probe's words, settle rule, log line and version reader */
 #include "upnpplan.h"     /* T-53: the router port opening's decisions - when to ask, the entry's text, what is there, when it goes */
 #include "nametag.h"      /* the name tag over another player's characters - its two lines and its colour */
+#include "playerstab.h"   /* T-545: the PLAYERS tab - its rows, words, tab numbers and the other game's lines */
 #include "joblever.h"     /* P17 / P43: the jobtest, cagetest and `boxdigest ... players` argument shapes */
 #include "panelfit.h"  /* P8i-b: the panel's size refusal and its give-up rule, as pure arithmetic */
 #include "../common/hbmath.h"   /* E47-S2: the world-group heartbeat's cadence arithmetic - the same header the plugin compiles */
@@ -84,8 +85,10 @@
 #include "snapdigest.h"  /* snap1 (user decision 2026-09-26) */
 #include "researchwire.h"  /* loot2b: RESEARCH_BOX and research_boxes.txt lines */
 #include "townrebuild.h"   /* towns2: the 60% rule, the 5-day timer, the sight test and the group verdict */
+#include "townpending.h"   /* T-580: which notebook notes hold a town's creation back (decision 34) */
 #include "townreoffer.h"   /* T-392 (owner 335 a / 337 a): the town gates' set-aside causes and the re-offer decision */
 #include "barwire.h"  /* refill1: TOWN_BAR, town_bars.txt lines and the refill decisions */
+#include "owedpop.h"   /* T-581: the owed town populations - the row, its wire, its file line and both sides' decisions */
 #include "worldrelwire.h"  /* par24: WORLD_REL and world_relations.txt lines */
 #include "lootroute.h"    /* loot2c part B: the materialise / give routes' pure decisions */
 #include "boxowner.h"     /* inv4: who writes a player building's storage (the owner rung) */
@@ -114,6 +117,7 @@
 #include "runboost.h"   /* T-189 runboost (H051): running / boost / decide / ceiling */
 #include <cmath>        /* T-189: std::sqrt, std::fabs */
 #include "getupcrawl.h"   /* T-178 crawl1 (H050): owner up / copy ready / MOVE drives a crawler */
+#include "copyjudge.h"   /* T-573: the copy judge held while the simulation is stopped; a given-up copy re-armed */
 #include "sneakwire.h"    /* the owner's stealth mode in STATE bit 7, and what the copy's game does with it */
 #include "slotwire.h"      /* stand1: the per-slot stand-in names and the N-party zone owner swap */
 #include "copykeep.h"     /* copy1: a copy keeps its blood across the stats push; a refused kit item goes to its own section */
@@ -132,6 +136,7 @@
 #include "standinpurge.h" /* inv7a: the stand-in purge at load - one character's steps */
 #include "ownrec.h"       /* mmo1: the own-squad record writer's names, index line, write decisions and pacing */
 #include "copybody.h"     /* crash2: the animal copy body-rebuild skip rule */
+#include "kolook.h"       /* a copy met while its owner says knocked out is dressed before its knockdown */
 #include "humantest.h"    /* T-293: the human class rule */
 #include "orphanpurge.h"  /* orphan1: the leaf gate's unlinked arm and the orphan cleanup's steps */
 #include "dirlevels.h"    /* tickwait: EnsureDir's folder levels */
@@ -149,12 +154,24 @@
 #include "pausemenu.h"   /* T-514: where the pause menu's rows go */
 #include "addrlookup.h"  /* T-524: the internet address from the lookup websites */
 #include "bugreport.h"   /* T-461: REPORT A BUG - words, scrub, compressor, budget, zip, the nearby-log messages */
+#include "teamwire.h"   /* T-546 step 3: the player-faction membership table and TEAM (60) */
+#include "teameffect.h"   /* T-546 step 4: what membership does - the pin, the tag's colour and line 2, base access, a notice's names */
+#include "teamstanding.h"   /* T-546 step 5: the shared standing */
+#include "teamresearch.h"   /* T-546 step 6: the shared research */
+#include "teamscreens.h"   /* T-546 step 7: the faction screens - the bottom line, the boxes, the message lines */
+#include "teamorders.h"   /* T-546 step 7: the orders a teammate's character is not offered */
+#include "teamally.h"   /* T-546 (owner 512): a teammate's faction answers ally / not-enemy as one's own */
+#include "fallenwire.h"   /* T-556: the fallen list - snapshot byte form, list trimming, squad choice, road */
+#include "resurrectfee.h"   /* T-556: the resurrection fee and its host options */
+#include "fallentab.h"   /* T-556: the FALLEN tab - its words and states */
+#include "relside.h"   /* T-563: the entry a faction-relations changer wrote */
 #include "titleart.h"   /* T-513: the mod's title art - the cover crop and the note's place on it */
 
 #include <cstdio>
 #include <limits>   /* par24 */
 #include <algorithm>   /* par24 */
 #include <io.h>        /* _findfirst: t_address_tables_count_matches */
+#include <cctype>      /* std::isalnum: t_address_bindings_fit */
 #include <cstring>
 #include <cstddef>   /* offsetof */
 #include <string>
@@ -5114,6 +5131,154 @@ void DoorExpect(const char* tag, const coopdoor::DoorDecideIn& in, int want)
              + " -> " + DoorActName(got) + ", wanted " + DoorActName(want));
 }
 
+/* T-160: a holder's word about a settled door is PLAYED (openDoor / closeDoor); everything nobody watched
+ * move is SNAPPED.  [1] is the assertion the snap-only applier fails: it had no play arm at all. */
+void t_door_a_holder_word_plays_the_swing_and_the_rest_snap()
+{
+    using namespace coopdoor;
+    if (DoorApplyHow(kDoorWhyHolderWord, kDoorClosed, kDoorOpen, 1) != kDoorApplyPlay)
+        Fail("[1] a holder's OPEN for a settled CLOSED door is not played");
+    if (DoorApplyHow(kDoorWhyHolderWord, kDoorOpen, kDoorClosed, 1) != kDoorApplyPlay)
+        Fail("[2] a holder's CLOSED for a settled OPEN door is not played");
+    if (DoorApplyHow(kDoorWhyForcedOpen, kDoorOpen, kDoorClosed, 1) != kDoorApplySnap)
+        Fail("[3] a gate physics setup forced open is not snapped back");
+    if (DoorApplyHow(kDoorWhyArrival, kDoorOpen, kDoorClosed, 1) != kDoorApplySnap)
+        Fail("[4] a first word about a door is not snapped");
+    if (DoorApplyHow(kDoorWhyHolderWord, kDoorClosed, kDoorOpen, 0) != kDoorApplySnap)
+        Fail("[5] a swing is played although the engine call failed its prologue check");
+    if (DoorApplyHow(kDoorWhyHolderWord, kDoorOpening, kDoorOpen, 1) != kDoorApplySnap)
+        Fail("[6] a mid-swing door is given a swing");
+    if (DoorPlayStartedState(kDoorOpen) != kDoorOpening || DoorPlayStartedState(kDoorClosed) != kDoorClosing)
+        Fail("[7] the started state of a swing is wrong");
+}
+/* T-160: the frames of a swing this game played are its own, so they are never reported to the holder
+ * (the echo); any other change ends the swing and is the world's.  [1] fails on the snap-only applier's
+ * funnel, which booked the OPENING frame of any engine call as a local writer. */
+void t_door_a_played_swing_is_ours_until_it_lands()
+{
+    using namespace coopdoor;
+    if (DoorPlayNote(kDoorOpen, kDoorOpening) != kDoorPlayOwned)   Fail("[1] the OPENING frame of a played open is not ours");
+    if (DoorPlayNote(kDoorOpen, kDoorOpen) != kDoorPlayLanded)     Fail("[2] the landing of a played open is not ours");
+    if (DoorPlayNote(kDoorClosed, kDoorClosing) != kDoorPlayOwned) Fail("[3] the CLOSING frame of a played close is not ours");
+    if (DoorPlayNote(kDoorClosed, kDoorClosed) != kDoorPlayLanded) Fail("[4] the landing of a played close is not ours");
+    if (DoorPlayNote(kDoorOpen, kDoorClosing) != kDoorPlayBroken)  Fail("[5] a close during a played open is taken as ours");
+    if (DoorPlayNote(kDoorClosed, kDoorOpen) != kDoorPlayBroken)   Fail("[6] a snap open during a played close is taken as ours");
+    if (DoorPlayNote(-1, kDoorOpen) != kDoorPlayNone)              Fail("[7] a door with no swing is classified as one");
+    if (DoorPlayOverdue(kDoorOpen, 1000ul, 1000ul + kDoorPlayLandMs - 1) != 0) Fail("[8] a swing is overdue early");
+    if (DoorPlayOverdue(kDoorOpen, 1000ul, 1000ul + kDoorPlayLandMs) != 1)     Fail("[9] a swing is never overdue");
+    if (DoorPlayOverdue(kDoorClosed, 0xFFFFF000ul, 0x00000100ul) != 0)          Fail("[10] the tick-count wrap makes a swing overdue");
+    if (DoorPlayOverdue(-1, 0ul, 100000ul) != 0)                                 Fail("[11] no swing is overdue");
+}
+/* T-160: the lock word carries the lock AND the owner's wish to lock, and the receiving game moves toward
+ * the holder's word one engine call at a time.  [1] fails on the old wire, which collapsed the byte to
+ * locked-or-not and so could never say "lock it when it shuts". */
+void t_door_the_lock_word_is_applied_by_the_engine_lock_calls()
+{
+    using namespace coopdoor;
+    if (DoorLockWord(0, 1) != 2 || DoorLockWord(1, 1) != 3 || DoorLockWord(5, 0) != 1 || DoorLockWord(0, 0) != 0)
+        Fail("[1] the lock word does not carry both bits");
+    if (DoorLockWordValid(4) != 0 || DoorLockWordValid(-1) != 0 || DoorLockWordValid(3) != 1)
+        Fail("[2] a lock byte outside 0..3 is accepted");
+    /* the holder's player locked a shut door (lockButton: wants 1, locked 1); this game's is unlocked: lockDoor
+       makes both, silently - lockButton's sound is heard everywhere */
+    if (DoorLockStep(kDoorClosed, 0, 3) != kDoorLockStepLock) Fail("[3] a lock press on a shut door is not mirrored by lockDoor");
+    if (DoorLockStep(kDoorClosed, 2, 3) != kDoorLockStepLock) Fail("[4] a wanted lock on a shut door is not locked");
+    /* the holder's player unlocked (wants 0, locked 0): the wish is cleared as lockButton clears it, then unlockDoor */
+    if (DoorLockStep(kDoorClosed, 3, 0) != kDoorLockStepClearWants) Fail("[5] an unlock press does not clear the wish");
+    if (DoorLockStep(kDoorClosed, 1, 0) != kDoorLockStepUnlock) Fail("[6] a leftover lock is not unlocked");
+    /* the holder's player opened a locked door: openButton clears the lock and keeps the wish */
+    if (DoorLockStep(kDoorOpen, 3, 2) != kDoorLockStepUnlock) Fail("[7] an opened door keeps its lock");
+    /* word 1 - locked without the wish, what the NPC lock action 0x337630 writes - and a lock on an open door:
+       copied with the direct write that action makes */
+    if (DoorLockStep(kDoorClosed, 0, 1) != kDoorLockStepSetLocked) Fail("[8] an NPC's lock (word 1) is not copied");
+    if (DoorLockStep(kDoorOpen, 2, 3) != kDoorLockStepSetLocked)   Fail("[9] a lock on an open door is not copied");
+    if (DoorLockStep(kDoorClosing, 0, 3) != kDoorLockStepWait)        Fail("[10] the lock is touched mid-swing");
+    if (DoorLockStep(kDoorClosed, 3, 3) != kDoorLockStepNone)         Fail("[11] an agreeing lock is touched");
+    if (DoorLockStep(kDoorClosed, 3, -1) != kDoorLockStepNone)        Fail("[12] a lock nobody has spoken about is touched");
+    /* the last-actor rule, for the lock */
+    if (DoorLockDecide(3, 0, 0, 0) != kDoorActLock)       Fail("[13] a holder's lock word is not applied");
+    if (DoorLockDecide(3, 0, 1, 0) != kDoorActReport)     Fail("[14] a non-holder reverts its own player's lock");
+    if (DoorLockDecide(3, 0, 1, 1) != kDoorActAdoptLocal) Fail("[15] the holder reverts its own player's lock");
+    if (DoorLockDecide(3, 3, 1, 0) != kDoorActNothing)    Fail("[16] agreeing locks are not left alone");
+    if (DoorLockDecide(2, -1, 0, 0) != kDoorActNothing)   Fail("[17] a lock nobody has spoken about is decided");
+    /* the invalid-live-word exits: a word read outside 0..3 decides nothing and writes nothing */
+    if (DoorLockDecide(4, 0, 0, 0) != kDoorActNothing || DoorLockDecide(-1, 3, 1, 1) != kDoorActNothing)
+        Fail("[18] an invalid live lock word is decided");
+    if (DoorLockStep(kDoorClosed, 4, 3) != kDoorLockStepNone || DoorLockStep(kDoorOpen, -1, 0) != kDoorLockStepNone)
+        Fail("[19] an invalid live lock word is written toward");
+    if (DoorLockStep(kDoorClosed, 0, 7) != kDoorLockStepNone) Fail("[20] an invalid holder lock word is written toward");
+}
+/* T-160: NO LOCK WORD IS UNREACHABLE.  Every live word moves to every holder word, on a shut door and on an open
+ * one, inside one visit, when each write does what the engine's code does (lockDoor: wish 1, and the lock if
+ * shut; unlockDoor: lock 0; the direct writes: wish 0, lock 1).  [1] fails on the lockButton applier, which
+ * left word 1 (an NPC's lock) and a lock on an open door unreachable. */
+void t_door_every_lock_word_is_reachable()
+{
+    using namespace coopdoor;
+    const int states[2] = { kDoorClosed, kDoorOpen };
+    for (int si = 0; si < 2; ++si)
+        for (int from = 0; from <= 3; ++from)
+            for (int to = 0; to <= 3; ++to)
+            {
+                int w = from, n = 0;
+                for (; n < kDoorLockStepsPerVisit; ++n)
+                {
+                    const int step = DoorLockStep(states[si], w, to);
+                    int l = DoorLockWordLocked(w), x = DoorLockWordWants(w);
+                    if (step == kDoorLockStepNone) break;
+                    if (step == kDoorLockStepLock) { x = 1; if (states[si] == kDoorClosed) l = 1; }
+                    else if (step == kDoorLockStepUnlock) l = 0;
+                    else if (step == kDoorLockStepClearWants) x = 0;
+                    else if (step == kDoorLockStepSetLocked) l = 1;
+                    else { Fail("[2] a terminal door is told to wait"); return; }
+                    if (DoorLockWord(l, x) == w) { Fail("[3] a lock step does not move the word"); return; }
+                    w = DoorLockWord(l, x);
+                }
+                if (w != to) { Fail("[1] a holder lock word is not reached inside one visit"); return; }
+            }
+}
+/* T-160 fold: A LOCK NO DETOUR SAW IS THIS GAME'S OWN.  The NPC lock action 0x337630 closes (nothing, on a shut
+ * door) and writes the lock byte itself, so no hook sees it.  [2] and [3] fail on the first T-160 applier,
+ * which took the live word against the holder's with no local flag and UNLOCKED the NPC's door - on the
+ * holder too. */
+void t_door_a_lock_no_detour_saw_is_a_local_write()
+{
+    using namespace coopdoor;
+    /* this game last saw word 0; the holder's word is 0; the NPC wrote locked (word 1) */
+    if (DoorLockUnseenWrite(1, 0) != 1) Fail("[1] an NPC's lock on a shut door is not this game's own");
+    if (DoorLockDecide(1, 0, DoorLockUnseenWrite(1, 0), 0) != kDoorActReport)     Fail("[2] the receiver undoes its own NPC's lock");
+    if (DoorLockDecide(1, 0, DoorLockUnseenWrite(1, 0), 1) != kDoorActAdoptLocal) Fail("[3] the holder undoes its own NPC's lock");
+    /* this game's own apply: the row records the word the write left, so the next look sees nothing new */
+    if (DoorLockUnseenWrite(3, 3) != 0) Fail("[4] this game's own lock apply is taken as a local write");
+    if (DoorLockDecide(0, 3, DoorLockUnseenWrite(0, 0), 0) != kDoorActLock) Fail("[5] a holder's word is not applied when nothing local happened");
+    /* invalid words say nothing */
+    if (DoorLockUnseenWrite(4, 0) != 0 || DoorLockUnseenWrite(1, -1) != 0 || DoorLockUnseenWrite(-1, 1) != 0)
+        Fail("[6] an invalid lock word is taken as a local write");
+    /* a played swing that lands with a lock of this game's own inside it is reported at the landing */
+    if (DoorPlayLandReport(1, 0, 0) != 1) Fail("[7] a lock pressed mid-swing is not reported at the landing");
+    if (DoorPlayLandReport(0, 0, 1) != 1) Fail("[8] an NPC's lock written mid-swing is not reported at the landing");
+    if (DoorPlayLandReport(0, 3, 3) != 0) Fail("[9] a plain landing is reported");
+}
+/* T-160: THE LIVE ROWS ARE SWEPT TOO.  The holder's own NPC locking a shut door no word has named, and a lockDoor
+ * the engine refuses on a closed door that has not settled.  [1] fails where the unseen-lock test runs only on
+ * doors the other game has spoken about (the holder's own NPC lock never goes out); [5] fails where a refused
+ * lockDoor is retried until the row gives up. */
+void t_door_a_live_row_lock_no_detour_saw_is_queued()
+{
+    using namespace coopdoor;
+    if (DoorLockSweepQueues(kDoorClosed, kDoorClosed, 1, 0) != 1) Fail("[1] an NPC's lock on a shut door is not queued");
+    if (DoorLockSweepQueues(kDoorClosed, kDoorClosed, 0, 0) != 0) Fail("[2] a no-op close with no lock is queued");
+    if (DoorLockSweepQueues(kDoorClosing, kDoorClosing, 1, 0) != 0 || DoorLockSweepQueues(kDoorClosed, kDoorOpen, 1, 0) != 0)
+        Fail("[3] a door mid-swing, or not in the state the row recorded, is queued from the sweep");
+    if (DoorLockSweepQueues(kDoorClosed, kDoorClosed, 1, -1) != 0) Fail("[4] a row with no recorded word is queued");
+    if (DoorLockStepAfterRefusal(kDoorLockStepLock, kDoorClosed, 1) != kDoorLockStepSetLocked)
+        Fail("[5] a lockDoor refused on a closed door is not followed by the direct lock write");
+    if (DoorLockStepAfterRefusal(kDoorLockStepLock, kDoorClosed, 0) != kDoorLockStepLock
+        || DoorLockStepAfterRefusal(kDoorLockStepLock, kDoorOpen, 1) != kDoorLockStepLock
+        || DoorLockStepAfterRefusal(kDoorLockStepUnlock, kDoorClosed, 1) != kDoorLockStepUnlock)
+        Fail("[6] a step is replaced where lockDoor was not refused on a closed door");
+}
+
 /* T236d, exactly: game B does not hold sector 43,11; B's own NPC opened the house door (live OPEN),
  * A's published answer is CLOSED.  The shipped code applied CLOSED - 2,652 times at 12.7-16.6 Hz.
  * [1] is the assertion that fails on the pre-patch logic: it demanded Apply where the rule now
@@ -8246,6 +8411,45 @@ void t_m7a2_context_platoon_record()
       if (refusals != 8) Fail("the table: 6 context rows with none mine (handed over or not, known 0..2) + 2 handed-over rows with a known member and none mine"); }
 }
 
+/* BlockSquadWrite: a squad numbered in this game's block whose known members are all another game's is neither written nor published as
+   this game's; E2's own case (no uid known), a squad holding a person this game runs, and a squad of another block are left to the
+   existing rules. */
+void t_t574_block_squad_other_game()
+{
+    using namespace coopsquad;
+    /* mineByBlock, chars, known, mine, releasedHere */
+    if (BlockSquadWrite(1, 1, 1, 0, 0) != kBlockWriteRefuseOtherGame) Fail("the logged shape: my block, one member, another game's copy that arrived by SPAWN - refused");
+    if (BlockSquadWrite(1, 21, 21, 0, 0) != kBlockWriteRefuseOtherGame) Fail("my block, 21 members, all another game's copies - refused");
+    if (BlockSquadWrite(1, 1, 1, 0, 1) != kBlockWriteGo) Fail("released in place: my squad, its one person handed to another game (dual run / revoke / hand-over) - written");
+    if (BlockSquadWrite(1, 5, 5, 0, 2) != kBlockWriteGo) Fail("released in place: two of five handed over in place, three copies - written");
+    if (BlockSquadWrite(1, 3, 2, 0, 0) != kBlockWriteGo) Fail("known < chars: a member not identified (maybe this game's own) - written");
+    if (BlockSquadWrite(1, 3, 0, 0, 0) != kBlockWriteGo) Fail("my block, no uid known (gone by sleep time) - E2 decides: written");
+    if (BlockSquadWrite(1, 3, 3, 1, 0) != kBlockWriteGo) Fail("my block, one of mine beside two of another game's - written");
+    if (BlockSquadWrite(1, 4, 4, 4, 0) != kBlockWriteGo) Fail("my block, every member mine - written");
+    if (BlockSquadWrite(0, 2, 2, 0, 0) != kBlockWriteGo) Fail("not my block - the member rule decides (and counts), not this one");
+    if (BlockSquadWrite(1, 2, 2, 0, -1) != kBlockWriteGo) Fail("the released read faulted (-1) - read as some: written");
+    { int refusals = 0;
+      for (int b = 0; b <= 1; ++b) for (int ch = 0; ch <= 3; ++ch) for (int k = 0; k <= ch; ++k) for (int m = 0; m <= k; ++m) for (int rh = -1; rh <= k - m; ++rh)
+      {
+          const int w = BlockSquadWrite(b, ch, k, m, rh);
+          if (w == kBlockWriteRefuseOtherGame) ++refusals; else if (w != kBlockWriteGo) Fail("the table: only Go or RefuseOtherGame");
+          if ((w == kBlockWriteRefuseOtherGame) != (b != 0 && k > 0 && k == ch && m == 0 && rh == 0)) Fail("the table: refused exactly when my block, every member identified, none mine, none released here");
+      }
+      if (refusals != 3) Fail("the table: my block, chars 1..3 all identified, none mine, none released - three rows"); }
+    /* the gates in the order the sleep and the heartbeat ask them (ContextSleepWrite, then BlockSquadWrite): a squad that goes on to be
+       written holds a person this game runs or ran, a member not identified, no known person at all, or is not numbered here */
+    for (int c = 0; c <= 1; ++c) for (int h = 0; h <= 1; ++h) for (int b = 0; b <= 1; ++b) for (int k = 0; k <= 3; ++k) for (int m = 0; m <= k; ++m) for (int rh = 0; rh <= 1; ++rh)
+    {
+        const int ch = 3;
+        const int sw = ContextSleepWrite(c, h, k, m);
+        const bool goes = (sw == kCtxSleepGo || sw == kCtxSleepGoContextWithMine) && BlockSquadWrite(b, ch, k, m, rh) == kBlockWriteGo;
+        if (goes && c == 0 && b != 0 && k == ch && m == 0 && rh == 0) Fail("both gates: a squad formed here around another game's people went on");
+        if (!goes && m > 0) Fail("both gates: a squad holding a person this game runs was refused");
+        if (!goes && c == 0 && h == 0 && rh != 0) Fail("both gates: a squad released in place (not marked handed over) was refused");
+        if (!goes && c == 0 && h == 0 && k < ch) Fail("both gates: a squad with a member not identified was refused");
+        if (c == 0 && h != 0 && k > 0 && m == 0 && sw != kCtxSleepRefuseHandedOver) Fail("both gates: a handed-over squad keeps its own refusal and counter");
+    }
+}
 
 /* M7a3f3 H1 [m7a3f3-t2]: the three announce states - only an explicit withheld mark says "the other games were never told"; 0 and 1 keep
    the meaning the former 0/1 argument had. */
@@ -8891,7 +9095,8 @@ void t_prof1_profiles()
     if (NewDecide(rows, P, "Beta", 2, 0, &n) != kOk || n != 2) Fail("the second profile is number 2");
     Row b = a; b.num = 2; b.name = "Beta"; b.faction = "Beta"; rows.push_back(b);
     if (NewDecide(rows, P, "Gamma", 2, 0, &n) != kRefusedCap) Fail("NEW is refused at the cap");
-    if (NewDecide(rows, Q, "Alpha", 2, 0, &n) != kOk || n != 1) Fail("the cap and the names are per person");
+    if (NewDecide(rows, Q, "ALPHA", 2, 0, &n) != kRefusedNameTaken) Fail("T-368: a player name is unique in the world, whoever holds it (the name rule)");
+    if (NewDecide(rows, Q, "Omega", 2, 0, &n) != kOk || n != 1) Fail("the cap is per person");
     if (NewDecide(rows, P, "", 5, 0, &n) != kRefusedName) Fail("an empty name is refused");
     if (DeleteDecide(rows, P, 2, 1) != kRefusedInUse || DeleteDecide(rows, P, 9, 0) != kRefusedUnknown || DeleteDecide(rows, P, 2, 0) != kOk)
         Fail("the delete rule: not while played, not an unknown number");
@@ -8981,7 +9186,7 @@ void t_names2a_faction_row()
     if (!FactionForRow("ABCDEFGHIJKLMNOPQRSTUVW WXYZ", &f) || f != "ABCDEFGHIJKLMNOPQRSTUVW") Fail("names2a: a space the cut leaves at the end is trimmed");
     f = "old";
     if (FactionForRow("", &f) || FactionForRow("    ", &f) || f != "old") Fail("names2a: an empty name is refused and the old value kept");
-    if (FactionForRow("Caf\xC3\xA9", &f)) Fail("names2a: a name the display rule refuses is refused");
+    if (!FactionForRow("Caf\xC3\xA9", &f) || f != "Caf\xC3\xA9") Fail("names2a: T-368: a name beyond plain characters stands in the row unchanged");
     Row r; r.num = 24; r.slot = 3; r.faction = "x";
     if (!FactionForRow(long30 + long30, &r.faction)) Fail("names2a: a 60-character name fits the row");
     r.person = std::string(32, 'a'); r.name = "Crew";
@@ -9004,6 +9209,351 @@ void t_names2a_faction_row()
     if (FactionDecide(rows, P + ".4", 4, "GapThree", &i, &f) != kFacRefusedUnknown) Fail("names2a: a profile with no row is refused");
     if (FactionDecide(rows, Q, 1, "   ", &i, &f) != kFacRefusedName || rows[3].faction != "Q") Fail("names2a: an empty name is refused, the row unchanged");
     if (FactionDecide(rows, Q, 1, long30, &i, &f) != kFacSet || f.size() != 24) Fail("names2a: a long name is set cut to 24");
+}
+
+/* H068 (owner 471): Kenshi's default "Nameless" at a load becomes each profile's own "Nameless <n>" - the operator's and every joiner's, played
+   or not (a profile whose folder already held a save counts as played at its first admission) - and that answer shows no box. */
+void t_h068_default_faction_numbers()
+{
+    using namespace coopprof;
+    const std::string A(32, 'a'), B(32, 'b'), C(32, 'c');
+    std::vector<Row> rows;
+    { Row r; r.person = A; r.num = 1; r.name = "PlayerA"; r.faction = NamelessFree(rows, -1); r.created = 10; r.played = 1; rows.push_back(r); }
+    { Row r; r.person = B; r.num = 1; r.name = "PlayerB"; r.faction = NamelessFree(rows, -1); r.created = 12; r.played = 1; rows.push_back(r); }
+    if (rows[0].faction != "Nameless 1" || rows[1].faction != "Nameless 2") Fail("H068: profiles are made with Nameless 1, Nameless 2");
+    int i = -1; std::string f;
+    /* the operator's first load */
+    if (FactionDecide(rows, A, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1" || i != 0) Fail("H068: the operator's first load keeps Nameless 1");
+    rows[(size_t)i].faction = f;
+    if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", f) != kFacApplySilent) Fail("H068: the operator's answer shows no box");
+    /* a joiner's first load */
+    if (FactionDecide(rows, B, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 2" || i != 1) Fail("H068: a joiner's first load keeps Nameless 2");
+    rows[(size_t)i].faction = f;
+    if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", f) != kFacApplySilent) Fail("H068: a joiner's answer shows no box");
+    { Row r; r.person = C; r.num = 1; r.name = "PlayerC"; r.faction = NamelessFree(rows, -1); r.created = 30; r.played = 0; rows.push_back(r); }
+    if (rows[2].faction != "Nameless 3") Fail("H068: the third profile is made with Nameless 3");
+    if (FactionDecide(rows, C, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 3") Fail("H068: a never-played joiner's first load keeps Nameless 3");
+    rows[(size_t)i].faction = f;
+    /* a second profile of the operator */
+    { Row r; r.person = A; r.num = 2; r.name = "Second"; r.faction = NamelessFree(rows, -1); r.created = 40; rows.push_back(r); }
+    if (rows[3].faction != "Nameless 4") Fail("H068: a second profile is made with Nameless 4");
+    /* a played profile reloading a save whose faction is still Kenshi's Nameless */
+    if (FactionDecide(rows, B, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 2") Fail("H068: a played profile's reload of a Nameless save keeps Nameless 2");
+    /* a typed name is judged by the name rule: a free one is set, a taken one goes back */
+    if (FactionDecide(rows, B, 1, "Hub Rats", &i, &f, 1) != kFacSet || f != "Hub Rats") Fail("H068: a free typed name is the player's");
+    rows[1].faction = f;
+    if (FactionDecide(rows, C, 1, "hub rats", &i, &f, 1) != kFacBack || f != "Nameless 3") Fail("H068: a typed name another holds goes back");
+    if (FactionDecide(rows, A, 1, "Nameless 3", &i, &f, 1) != kFacBack || f != "Nameless 1") Fail("H068: a typed Nameless number another holds goes back");
+    /* B, now 'Hub Rats', reloads an older save still named Nameless: its row holds no number - the lowest free one (2, freed by its rename) */
+    if (FactionDecide(rows, B, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 2") Fail("H068: a row without a Nameless number takes the lowest free one at a Nameless load");
+    /* no profile's faction is Kenshi's plain Nameless after these loads */
+    for (size_t k = 0; k < rows.size(); ++k) if (NameSame(rows[k].faction, kEngineFactionDefault)) Fail("H068: no row holds Kenshi's plain Nameless");
+}
+
+/* H069: a faction name counts as held only while a faction carries it NOW (Kenshi's record index keeps every old name; the FACTION tab
+   renames a faction without its record), and a stand-in under a clash name takes its player's name back once nothing holds it. A toy
+   game: records with a record name and an optional live faction, and an index that, like Kenshi's, only ever adds names. */
+struct H069Rec { std::string record, live; bool hasLive; };
+struct H069Game
+{
+    std::vector<H069Rec> recs; std::vector<std::pair<std::string, int> > index;
+    int Add(const std::string& n, bool live) { H069Rec r; r.record = n; r.live = n; r.hasLive = live; recs.push_back(r); Index(n, (int)recs.size() - 1); return (int)recs.size() - 1; }
+    void Index(const std::string& n, int r) { for (size_t k = 0; k < index.size(); ++k) if (index[k].first == n) { index[k].second = r; return; } index.push_back(std::make_pair(n, r)); }
+    void RenameRecord(int r, const std::string& n) { Index(n, r); recs[(size_t)r].record = n; }   /* the old name stays indexed */
+    void RenameBoth(int r, const std::string& n) { recs[(size_t)r].live = n; RenameRecord(r, n); }   /* the mod's rename */
+    void TabRename(int r, const std::string& n) { recs[(size_t)r].live = n; }                        /* Kenshi's FACTION tab */
+    bool Held(const std::string& n, int except) const
+    {
+        int hit = -1; for (size_t k = 0; k < index.size(); ++k) if (index[k].first == n) hit = index[k].second;
+        bool live = false; for (size_t k = 0; k < recs.size(); ++k) if ((int)k != except && recs[k].hasLive && recs[k].live == n) live = true;
+        const bool ih = hit >= 0 && hit != except;
+        return coopslot::FactionNameHeld(n, live, ih, ih ? recs[(size_t)hit].record : std::string(), ih && recs[(size_t)hit].hasLive, ih ? recs[(size_t)hit].live : std::string());
+    }
+    std::string Clash(const std::string& want, int slot, int self) const { const bool wt = Held(want, self); return coopslot::StandInClashName(want, slot, wt, wt && Held(want + " (peer)", self)); }
+};
+void t_h069_freed_names_are_free()
+{
+    /* the pure rule */
+    if (!coopslot::FactionNameHeld("N1", true, false, "", false, "")) Fail("H069: a live faction carrying the name holds it");
+    if (coopslot::FactionNameHeld("N1", false, true, "N4", true, "N4")) Fail("H069: an indexed record renamed away does not hold its old name");
+    if (coopslot::FactionNameHeld("N1", false, true, "N1", true, "N4")) Fail("H069: a record whose faction was renamed by the tab does not hold the old name");
+    if (!coopslot::FactionNameHeld("N1", false, true, "N1", false, "")) Fail("H069: a record with no live faction holds its record name");
+    if (coopslot::FactionNameHeld("N1", false, false, "", false, "")) Fail("H069: no hit, not held");
+    if (!coopslot::StandInAsksAgain("N4 (peer)", "N4") || coopslot::StandInAsksAgain("N4", "N4") || coopslot::StandInAsksAgain("x", "")) Fail("H069: StandInAsksAgain");
+    /* a freed own old name (T965 A 314.482): my faction 'Nameless 1' renamed on the FACTION tab to 'Nameless 4'; B's stand-in asks 'Nameless 1' */
+    {
+        H069Game g; const int mine = g.Add("Nameless 1", true); const int sb = g.Add("Nameless 2", true); g.Add("Nameless 3", true);
+        g.TabRename(mine, "Nameless 4");
+        if (g.Held("Nameless 1", sb)) Fail("H069: my old name is free after a tab rename");
+        if (g.Clash("Nameless 1", 1, sb) != "Nameless 1") Fail("H069: B's stand-in takes my old name plainly");
+        if (!g.Held("Nameless 4", sb)) Fail("H069: my new name is held");
+        g.RenameRecord(mine, "Nameless 4");   /* MyRecordFollowsName */
+        if (g.Held("Nameless 1", sb) || !g.Held("Nameless 4", sb)) Fail("H069: after the record follows, the old name is free and the new one held");
+    }
+    /* a 40 ms transient name (T965 B 272.541-300.214): C's stand-in carries 'Nameless 4' for a moment, then 'Nameless 3' again */
+    {
+        H069Game g; g.Add("Nameless 2", true); const int sa = g.Add("Nameless 1", true); const int sc = g.Add("Nameless 3", true);
+        g.RenameBoth(sc, "Nameless 4"); g.RenameBoth(sc, "Nameless 3");
+        if (g.Held("Nameless 4", sa) || g.Clash("Nameless 4", 0, sa) != "Nameless 4") Fail("H069: a name held for a moment and left is free (no peer)");
+    }
+    /* the clash happens inside the moment: A's stand-in goes aside, and takes its name back as soon as C's stand-in leaves it */
+    {
+        H069Game g; g.Add("Nameless 2", true); const int sa = g.Add("Nameless 1", true); const int sc = g.Add("Nameless 3", true);
+        g.RenameBoth(sc, "Nameless 4");
+        const std::string asked("Nameless 4");
+        std::string cur = g.Clash(asked, 0, sa); g.RenameBoth(sa, cur);
+        if (cur != "Nameless 4 (peer)") Fail("H069: while C's stand-in carries the name, A's goes aside");
+        g.RenameBoth(sc, "Nameless 3");
+        if (!coopslot::StandInAsksAgain(cur, asked)) Fail("H069: the aside stand-in asks again");
+        cur = g.Clash(asked, 0, sa); g.RenameBoth(sa, cur);
+        if (cur != "Nameless 4" || coopslot::StandInAsksAgain(cur, asked)) Fail("H069: the freed name comes back, and the stand-in stops asking");
+        if (g.Held("Nameless 4 (peer)", -1)) Fail("H069: no faction carries the clash name afterwards");
+    }
+}
+
+/* T-368 (owner 265-270, 472): player names and faction names unique per world, connected or not; a new player's faction "Nameless <n>". */
+void t_t368_unique_names()
+{
+    using namespace coopprof;
+    /* the name rule */
+    if (!NameSame("Anna", "anna") || !NameSame(" Anna ", "Anna") || !NameSame("Hub  Rats", "hub rats") || NameSame("Hub Rats", "HubRats")
+        || NameSame("Anna", "Anne") || NameKey("  A  b ") != "a b") Fail("T-368: the name rule (case, ends, inner runs of spaces)");
+    const std::string P(32, 'a'), Q(32, 'b'), R(32, 'c');
+    std::vector<Row> rows;
+    { Row a; a.person = P; a.num = 1; a.name = "Anna"; a.faction = "Hub Rats"; a.created = 100; a.played = 1; rows.push_back(a); }
+    { Row a; a.person = Q; a.num = 1; a.name = "Ben"; a.faction = "Nameless 1"; a.created = 200; a.played = 0; rows.push_back(a); }
+    { Row a; a.person = Q; a.num = 2; a.name = "Cid"; a.faction = "Sand Fleas"; a.created = 300; a.played = 1; a.active = 0; rows.push_back(a); }
+    { Row a; a.person = R; a.num = 1; a.name = "Dee"; a.faction = "Nameless 3"; a.created = 400; a.played = 1; rows.push_back(a); }
+    /* player names */
+    unsigned n = 0;
+    if (!PlayerNameTaken(rows, "ANNA") || PlayerNameTaken(rows, "Cid")) Fail("T-368: an active profile's name is taken, a deleted one's is free");
+    if (NewDecide(rows, R, "anna", 5, 0, &n) != kRefusedNameTaken) Fail("T-368: NEW with another person's player name is refused");
+    if (NewDecide(rows, R, "Cid", 5, 0, &n) != kOk) Fail("T-368: NEW with a deleted profile's player name is made");
+    if (VerdictText(kRefusedNameTaken, 0) != "that name is already taken in this world") Fail("T-368: the approved NEW PROFILE words (owner 270 a)");
+    if (coopui::NameTakenText("Anna") != "The name \"Anna\" is already taken in this world. Change PLAYER NAME and try again." || !coopui::NoticeIsNameTaken(coopui::NameTakenText("Anna"))
+        || coopui::NoticeTitle(coopui::NameTakenText("Anna")) != "CAN'T JOIN") Fail("T-368: the CAN'T JOIN name-taken box");
+    /* the lowest free Nameless <n> */
+    if (NamelessFree(rows, -1) != "Nameless 2") Fail("T-368: the lowest Nameless number no active faction holds (1 and 3 held)");
+    if (NamelessFree(rows, 1) != "Nameless 1") Fail("T-368: a row's own Nameless number is free for that row");
+    if (!IsNamelessNumbered("Nameless 12") || IsNamelessNumbered("Nameless") || IsNamelessNumbered("Nameless 0") || IsNamelessNumbered("Nameless 01")
+        || IsNamelessNumbered("Nameless 2a") || IsNamelessNumbered("nameless 2")) Fail("T-368: the Nameless <n> shape");
+    /* the lists: every OTHER active profile's faction name */
+    const std::vector<std::string> forP = TakenFactionsFor(rows, P, 1);
+    if (forP.size() != 2 || forP[0] != "Nameless 1" || forP[1] != "Nameless 3") Fail("T-368: TAKEN for a profile leaves out its own row and deleted rows");
+    if (!FactionTakenIn(forP, "  nameless   1 ") || FactionTakenIn(forP, "Hub Rats") || FactionTakenIn(forP, "Sand Fleas") || FactionTakenIn(forP, ""))
+        Fail("T-368: the game's check - the name rule, its own name and freed names allowed");
+    { std::vector<std::string> l; l.push_back("ABCDEFGHIJKLMNOPQRSTUVWX");
+      if (!FactionTakenIn(l, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")) Fail("T-368: a name longer than the row is judged as the row keeps it"); }
+    /* the world's judgement of a faction name */
+    int i = -1; std::string f;
+    if (FactionDecide(rows, P, 1, "Sand Fleas", &i, &f, 1) != kFacSet || f != "Sand Fleas") Fail("T-368: a rename to a deleted profile's faction name is taken");
+    if (FactionDecide(rows, P, 1, "nameless 3", &i, &f, 1) != kFacBack || f != "Hub Rats" || i != 0) Fail("T-368: a rename to a taken name goes back to the row's own");
+    if (FactionDecide(rows, P, 1, "Nameless 3", &i, &f, 0) != kFacMoved || f != "Nameless 2") Fail("T-368: a load with a taken name takes the lowest free Nameless number");
+    if (FactionDecide(rows, P, 1, "hub rats", &i, &f, 1) != kFacSet || f != "hub rats") Fail("T-368: a profile may re-case its own faction name");
+    if (FactionDecide(rows, Q, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-368: a never-played profile's new game keeps its row's Nameless number");
+    if (FactionDecide(rows, R, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 3" || i != 3)
+        Fail("T-368: a PLAYED profile reloading a save whose faction is Kenshi's Nameless keeps its own Nameless number");
+    if (FactionDecide(rows, R, 1, "Nameless", &i, &f, 1) != kFacSet || f != "Nameless") Fail("T-368: Nameless TYPED on the FACTION tab is judged as any name");
+    { std::vector<Row> r2(rows); r2[1].faction = "Hub Rats";
+      if (FactionDecide(r2, Q, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-368: a new game whose row holds no Nameless number gets the lowest free one");
+      r2[1].faction = "Nameless 3";
+      if (FactionDecide(r2, Q, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-368: a new game whose row's Nameless number another holds gets the lowest free one");
+      r2[1].faction = "Nameless"; r2[1].played = 1;
+      if (FactionDecide(r2, Q, 1, "Nameless", &i, &f, 0) != kFacDefault || f != "Nameless 1") Fail("T-368: a row holding Kenshi's plain Nameless takes the lowest free number at a load");
+      /* a world whose names clashed before the rule: the profile made first keeps the name */
+      r2[1].faction = "Hub Rats"; r2[1].played = 1;
+      if (FactionDecide(r2, P, 1, "Hub Rats", &i, &f, 0) != kFacSame) Fail("T-368: of two rows holding one name, the one made first keeps it");
+      if (FactionDecide(r2, Q, 1, "Hub Rats", &i, &f, 0) != kFacMoved || f != "Nameless 1") Fail("T-368: of two rows holding one name, the later one is moved at its load");
+      if (FactionDecide(r2, Q, 1, "Hub Rats", &i, &f, 1) != kFacBack || f != "Hub Rats") Fail("T-368: a rename to a name another holds is refused even in a clashing world"); }
+    if (FactionDecide(rows, Q + ".2", 2, "Hub Rats", &i, &f, 0) != kFacRefusedUnknown) Fail("T-368: a deleted profile's row is not judged");
+    /* what the game does with the world's answer */
+    if (FactionApplyDecide(kFacBack, "Nameless 3", "Nameless 3", "Hub Rats") != kFacApplyBackBox) Fail("T-368: back - the change-back box");
+    if (FactionApplyDecide(kFacMoved, "Nameless 3", "Nameless 3", "Nameless 2") != kFacApplyMovedBox) Fail("T-368: moved - the load box");
+    if (FactionApplyDecide(kFacDefault, "Nameless", "Nameless", "Nameless 2") != kFacApplySilent) Fail("T-368: Kenshi's default name takes the profile's Nameless number - no box");
+    if (FactionApplyDecide(kFacBack, "Other", "Nameless 3", "Hub Rats") != kFacApplyDrop) Fail("T-368: an answer about a name the faction no longer has is dropped");
+    if (FactionApplyDecide(kFacDefault, "Hub Rats", "Hub Rats", "Nameless 2") != kFacApplyDrop) Fail("T-368: a Nameless number is applied only to Kenshi's Nameless");
+    if (FactionApplyDecide(kFacSet, "A", "A", "B") != kFacApplyDrop || FactionApplyDecide(kFacBack, "A", "A", "") != kFacApplyDrop) Fail("T-368: nothing else is applied");
+    /* the words */
+    if (std::string(coopui::kFactionBoxTitle) != "Faction Name"
+        || coopui::FactionBackText("Hub Rats", "Sand Fleas") != "Your faction name \"Hub Rats\" is already taken in this world, so it was changed back to \"Sand Fleas\"."
+        || coopui::FactionMovedText("Hub Rats", "Sand Fleas") != "Another player in this world already uses the faction name \"Hub Rats\". Your faction is now called \"Sand Fleas\". You can rename it on the FACTION tab.")
+        Fail("T-368: the approved Faction Name box words (owner 270 a)");
+    /* the wire */
+    std::vector<char> w; int kind = 0; unsigned num = 0; std::string nm;
+    EncodeRequest(&w, kReqRename, 2, "Hub Rats");
+    if (!DecodeRequest(w, &kind, &num, &nm) || kind != kReqRename || num != 2 || nm != "Hub Rats") Fail("T-368: a kind 5 RENAME request round-trips");
+    w.clear(); EncodeTaken(&w, forP);
+    std::vector<std::string> back;
+    if (AnswerKindOf(w) != kAnsTaken || !DecodeTaken(w, &back) || back != forP) Fail("T-368: a TAKEN answer round-trips");
+    { std::vector<char> t(w); t.push_back(0); if (DecodeTaken(t, &back)) Fail("T-368: a TAKEN answer with a trailing byte is refused"); }
+    { std::vector<char> t(w.begin(), w.end() - 1); if (DecodeTaken(t, &back)) Fail("T-368: a torn TAKEN answer is refused"); }
+    { std::vector<char> e; EncodeTaken(&e, std::vector<std::string>()); if (!DecodeTaken(e, &back) || !back.empty()) Fail("T-368: an empty TAKEN list round-trips"); }
+    FactionAnswer fa; fa.verdict = kFacMoved; fa.num = 3; fa.asked = "Hub Rats"; fa.name = "Nameless 2";
+    w.clear(); EncodeFactionAnswer(&w, fa);
+    FactionAnswer fb;
+    if (AnswerKindOf(w) != kAnsFaction || !DecodeFactionAnswer(w, &fb) || fb.verdict != kFacMoved || fb.num != 3 || fb.asked != "Hub Rats" || fb.name != "Nameless 2")
+        Fail("T-368: a FACTION answer round-trips");
+    { std::vector<char> t(w); t[1] = (char)kFacSet; if (DecodeFactionAnswer(t, &fb)) Fail("T-368: a FACTION answer with a verdict that changes nothing is refused"); }
+    { Answer a; std::vector<char> t(w); if (DecodeAnswer(t, &a)) Fail("T-368: the list decoder does not read a FACTION answer"); }
+    if (AnswerKindOf(std::vector<char>()) != -1) Fail("T-368: an empty answer has no kind");
+}
+
+/* T-368: every faction name a player can type is unique and kept unchanged; own-name re-case; the stale stand-in moved aside; the
+   answer acknowledgement; the edges of the name rule, the clash tie-break, the file reader and the wire. */
+void t_t368_format_owed_reply()
+{
+    using namespace coopprof;
+    const std::string hashy("#1; Crew");
+    /* 1: a world folder whose rows may carry the '#' field is format 2 - a build that knows 1 refuses it */
+    {
+        Row a; a.person = std::string(32, 'a'); a.num = 1; a.name = "Anna"; a.faction = hashy; a.created = 1;
+        const std::string line = RowFormat(a);
+        if (line.find("\t#23313B2043726577\t") == std::string::npos || coopworld::DisplayNameOk(FactionFieldFormat(hashy), 0))
+            Fail("T-368: a '#' faction field is one the display-name rule (the format-1 row reader) refuses");
+        unsigned n = 0;
+        const int rs = swformat::FormatParse(true, swformat::FormatText(swformat::kKindWorld, swformat::kWorldFolderFormat), swformat::kKindWorld, &n);
+        if (swformat::kWorldFolderFormat != 2 || rs != swformat::kFormatRead || swformat::FormatDecide(rs, n, 1) != swformat::kFormatRefuseNewer
+            || !swformat::FormatRefuses(swformat::FormatDecide(rs, n, 1)))
+            Fail("T-368: a build at world format 1 refuses a folder this build wrote");
+        if (swformat::FormatDecide(swformat::kFormatRead, 1, swformat::kWorldFolderFormat) != swformat::kFormatConvert
+            || swformat::FormatSteps(1, swformat::kWorldFolderFormat).size() != 1) Fail("T-368: this build converts a format-1 world in one step");
+    }
+    /* 2: an accepted judgement clears what was owed; a changed name is owed instead; a refusal keeps it */
+    if (FactionOwedAfter(kFacSet) != kFacOwedClear || FactionOwedAfter(kFacSame) != kFacOwedClear) Fail("T-368: an accepted name clears the owed answer");
+    if (FactionOwedAfter(kFacBack) != kFacOwedReplace || FactionOwedAfter(kFacMoved) != kFacOwedReplace || FactionOwedAfter(kFacDefault) != kFacOwedReplace)
+        Fail("T-368: a changed name's answer is owed in place of the old one");
+    if (FactionOwedAfter(kFacRefusedSender) != kFacOwedKeep || FactionOwedAfter(kFacRefusedUnknown) != kFacOwedKeep || FactionOwedAfter(kFacRefusedName) != kFacOwedKeep)
+        Fail("T-368: a refusal leaves the owed answer");
+    {   /* a Moved answer is owed; the player renames to a free name before it arrives - the world accepts it and owes nothing */
+        const std::string P(32, 'a'), Q(32, 'b');
+        Row a; a.person = P; a.num = 1; a.name = "Anna"; a.faction = "Nameless 2"; a.created = 1; a.played = 1;
+        Row b = a; b.person = Q; b.name = "Ben"; b.faction = "Hub Rats"; b.created = 2;
+        std::vector<Row> rows; rows.push_back(a); rows.push_back(b);
+        int i = -1; std::string fac;
+        const int v = FactionDecide(rows, SlotKey(P, 1), 1, "Free Folk", &i, &fac, 1);
+        if (v != kFacSet || FactionOwedAfter(v) != kFacOwedClear) Fail("T-368: a newer accepted rename clears an older owed answer");
+    }
+    /* 3: the game acknowledges only an answer it carries; a record holding the name sends the kept name back once */
+    if (FactionApplyDecide(kFacMoved, "Nameless 2", "Hub Rats", "Nameless 2") != kFacApplyHave) Fail("T-368: an answer already applied is had");
+    if (FactionApplyDecide(kFacSet, "B", "A", "B") != kFacApplyDrop) Fail("T-368: only the three answer verdicts apply");
+    if (FactionReplyDecide(kFacApplyDrop, false, false) != kFacReplyNone || FactionReplyDecide(kFacApplyDrop, true, false) != kFacReplyNone)
+        Fail("T-368: an old answer is neither acknowledged nor reported");
+    if (FactionReplyDecide(kFacApplyHave, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplyHave, true, true) != kFacReplySeen)
+        Fail("T-368: an answer the faction carries is acknowledged");
+    if (FactionReplyDecide(kFacApplyMovedBox, false, false) != kFacReplySeen || FactionReplyDecide(kFacApplySilent, false, true) != kFacReplySeen)
+        Fail("T-368: an applied answer is acknowledged");
+    if (FactionReplyDecide(kFacApplyBackBox, true, false) != kFacReplyReport) Fail("T-368: a record holding the name - the kept name is reported back");
+    if (FactionReplyDecide(kFacApplyMovedBox, true, true) != kFacReplyNone) Fail("T-368: the same answer is reported back once only");
+}
+void t_t368_names_all_typed()
+{
+    using namespace coopprof;
+    const std::string P(32, 'a'), Q(32, 'b'), R(32, 'c');
+    const std::string cafe("Caf\xC3\xA9"), hashy("#1; Crew"), tabby("A\tB"), pct("50% Crew");
+    /* 2: the row's field form */
+    if (FactionFieldFormat("Hub Rats") != "Hub Rats" || FactionFieldFormat(pct) != pct) Fail("T-368: a plain faction name is written as it is");
+    if (FactionFieldFormat(hashy) != "#23313B2043726577") Fail("T-368: a name with '#' / ';' is written as '#' + hex");
+    {
+        const char* names[] = { "Caf\xC3\xA9", "#1; Crew", "A\tB", "50% Crew", "Hub Rats", ";", "\xE6\x97\xA5\xE6\x9C\xAC" };
+        for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k)
+        {
+            std::string back;
+            if (!FactionFieldParse(FactionFieldFormat(names[k]), &back) || back != names[k]) Fail(std::string("T-368: the field form gives back the name typed: ") + names[k]);
+        }
+    }
+    {
+        std::string back;
+        if (FactionFieldParse("", &back) || FactionFieldParse("#", &back) || FactionFieldParse("#2", &back) || FactionFieldParse("#ZZ", &back)
+            || FactionFieldParse("#20", &back) || FactionFieldParse("#41424320", &back) || FactionFieldParse(" Hub", &back)
+            || FactionFieldParse("#" + std::string(50, '4'), &back)) Fail("T-368: a field that is no name (empty, torn hex, edge space, over 24 bytes) is refused");
+        if (!FactionFieldParse("#41", &back) || back != "A" || !FactionFieldParse("#4a", &back) || back != "J") Fail("T-368: hex digits of either case read");
+    }
+    {
+        Row r; r.person = P; r.num = 1; r.name = "Anna"; r.faction = hashy; r.created = 5;
+        const std::string line = RowFormat(r);
+        Row back;
+        if (line.find(';') != std::string::npos || !RowParse(line, &back) || back.faction != hashy) Fail("T-368: a '#' / ';' faction survives profiles.txt unchanged");
+        r.faction = cafe;
+        if (!RowParse(RowFormat(r), &back) || back.faction != cafe) Fail("T-368: a non-ASCII faction survives profiles.txt unchanged");
+        if (!RowParse("prof1\t" + P + "\t1\t-1\t5\t0\tactive\tAnna\tHub Rats\tplayed", &back) || back.faction != "Hub Rats") Fail("T-368: a row written before the field form reads unchanged");
+    }
+    std::string f; int i = -1;
+    if (!FactionForRow(hashy, &f) || f != hashy || !FactionForRow(tabby, &f) || f != tabby) Fail("T-368: every name a player can type is judged");
+    {
+        std::vector<Row> rows;
+        { Row a; a.person = P; a.num = 1; a.name = "Anna"; a.faction = cafe; a.created = 100; a.played = 1; rows.push_back(a); }
+        { Row a; a.person = Q; a.num = 1; a.name = "Ben"; a.faction = hashy; a.created = 200; a.played = 1; rows.push_back(a); }
+        { Row a; a.person = R; a.num = 1; a.name = "Cid"; a.faction = "Nameless 1"; a.created = 300; a.played = 1; rows.push_back(a); }
+        if (FactionDecide(rows, R, 1, "CAF\xC3\xA9", &i, &f, 1) != kFacBack || f != "Nameless 1") Fail("T-368: a non-ASCII name another holds is refused (the name rule on the decoded text)");
+        if (FactionDecide(rows, R, 1, "#1;  crew", &i, &f, 1) != kFacBack) Fail("T-368: a '#' / ';' name another holds is refused");
+        if (FactionDecide(rows, R, 1, "Caf\xC3\x89", &i, &f, 1) != kFacSet) Fail("T-368: bytes beyond ASCII are compared as they are");
+        const std::vector<std::string> forR = TakenFactionsFor(rows, R, 1);
+        if (!FactionTakenIn(forR, " caf\xC3\xA9 ") || !FactionTakenIn(forR, "#1; CREW") || FactionTakenIn(forR, "Nameless 1")) Fail("T-368: the game's check holds every name");
+        std::vector<char> w; std::vector<std::string> back;
+        EncodeTaken(&w, forR);
+        if (!DecodeTaken(w, &back) || back != forR) Fail("T-368: TAKEN carries every name unchanged");
+    }
+    /* 5: a player may re-case or re-space their OWN name, also in a world whose names clashed before the rule */
+    {
+        std::vector<Row> rows;
+        { Row a; a.person = P; a.num = 1; a.name = "Anna"; a.faction = "Hub Rats"; a.created = 100; a.played = 1; rows.push_back(a); }
+        { Row a; a.person = Q; a.num = 1; a.name = "Ben"; a.faction = "Hub Rats"; a.created = 200; a.played = 1; rows.push_back(a); }
+        if (FactionDecide(rows, P, 1, "hub  RATS", &i, &f, 1) != kFacSet || f != "hub  RATS") Fail("T-368: the first holder of a clashing name may re-case it");
+        if (FactionDecide(rows, Q, 1, "HUB RATS", &i, &f, 1) != kFacBack || f != "Hub Rats") Fail("T-368: the later holder of a clashing name may not take it in another case");
+        if (!TakenFactionsFor(rows, P, 1).empty()) Fail("T-368: the first holder's list leaves out its own name repeated by a later row");
+        const std::vector<std::string> forQ = TakenFactionsFor(rows, Q, 1);
+        if (forQ.size() != 1 || forQ[0] != "Hub Rats") Fail("T-368: the later holder's list has the first holder's name");
+        rows.pop_back();
+        if (FactionDecide(rows, P, 1, "Hub Rats", &i, &f, 1) != kFacSame) Fail("T-368: a rename equal to the current name changes nothing");
+        if (FactionDecide(rows, P, 1, "HUB RATS", &i, &f, 1) != kFacSet) Fail("T-368: a profile may re-case its own name");
+        /* the tie-break: made in the same second, the row listed first holds the name */
+        { Row a; a.person = Q; a.num = 1; a.name = "Ben"; a.faction = "hub rats"; a.created = 100; a.played = 1; rows.push_back(a); }
+        if (!FactionHeldEarlier(rows, "Hub Rats", 1) || FactionHeldEarlier(rows, "Hub Rats", 0)) Fail("T-368: same second - the row listed first holds the name");
+    }
+    /* the file reader */
+    {
+        Row a; a.person = P; a.num = 1; a.name = "Anna"; a.faction = "Hub Rats"; a.created = 1;
+        Row d = a; d.num = 2; d.name = "Gone"; d.active = 0;
+        Row b = a; b.person = Q; b.name = "Ben"; b.faction = hashy;
+        const std::vector<Row> got = ActiveRowsOfFile(RowFormat(a) + "\r\n" + RowFormat(d) + "\r\nnot a row\r\n\r\n" + RowFormat(b));
+        if (got.size() != 2 || got[0].name != "Anna" || got[0].faction != "Hub Rats" || got[1].faction != hashy) Fail("T-368: the file reader - CRLF, deleted rows, junk, no final newline");
+    }
+    /* what the game does with an answer: over 24 characters, edge spaces, a name equal to the one it has */
+    {
+        const std::string long30("ABCDEFGHIJKLMNOPQRSTUVWXYZ1234");
+        if (FactionApplyDecide(kFacBack, "  " + long30 + " ", long30.substr(0, 24), "Old") != kFacApplyBackBox) Fail("T-368: an answer judged on the row's cut of a long name applies");
+        if (FactionApplyDecide(kFacMoved, " Hub Rats ", "Hub Rats", "Nameless 2") != kFacApplyMovedBox) Fail("T-368: an answer applies through edge spaces");
+        if (FactionApplyDecide(kFacMoved, "Nameless 2", "Nameless 2", "Nameless 2") != kFacApplyHave) Fail("T-368: an answer naming the name it has is had already");
+    }
+    /* the answers on the wire */
+    {
+        FactionAnswer fa, fb; fa.num = 4; fa.asked = hashy; fa.name = cafe;
+        const int vs[] = { kFacBack, kFacDefault };
+        for (int k = 0; k < 2; ++k)
+        {
+            fa.verdict = vs[k];
+            std::vector<char> w; EncodeFactionAnswer(&w, fa);
+            if (!DecodeFactionAnswer(w, &fb) || fb.verdict != vs[k] || fb.num != 4 || fb.asked != hashy || fb.name != cafe) Fail("T-368: changed-back / default-name answers round-trip");
+            w.push_back(0);
+            if (DecodeFactionAnswer(w, &fb)) Fail("T-368: an answer with a trailing byte is refused");
+        }
+        std::vector<std::string> many(kTakenWireMax + 5, std::string("N")), back;
+        std::vector<char> w; EncodeTaken(&w, many);
+        if (!DecodeTaken(w, &back) || back.size() != kTakenWireMax) Fail("T-368: a TAKEN list over the limit is cut to it");
+        std::vector<char> over; over.push_back((char)kAnsTaken); over.push_back(0); WPutU32(&over, kTakenWireMax + 1);
+        if (DecodeTaken(over, &back)) Fail("T-368: a TAKEN count over the limit is refused");
+        std::vector<char> r; int kind = 0; unsigned num = 0; std::string nm;
+        EncodeRequest(&r, kReqFactionSeen, 3, cafe);
+        if (!DecodeRequest(r, &kind, &num, &nm) || kind != kReqFactionSeen || num != 3 || nm != cafe) Fail("T-368: a kind 6 FACTION SEEN round-trips");
+    }
+    /* 1: a stand-in record carrying the world's name moves aside; any other record keeps its name */
+    {
+        std::string aside;
+        if (!coopslot::StandInAsideName(coopslot::StandInId(3), "Hub Rats", false, &aside) || aside != "Hub Rats (peer)") Fail("T-368: a stand-in moves aside to '<name> (peer)'");
+        if (!coopslot::StandInAsideName(coopslot::StandInId(3), "Hub Rats", true, &aside) || aside != "Hub Rats (peer) (p3)") Fail("T-368: then to '<name> (peer) (p<slot>)'");
+        if (coopslot::StandInAsideName("54-gamedata.base", "Hub Rats", false, &aside) || coopslot::StandInAsideName(coopslot::kLegacyPeerId, "Hub Rats", false, &aside))
+            Fail("T-368: a record that is no per-slot stand-in's keeps its name");
+    }
 }
 
 /* names1: MSG_NAME - the owner's character name for the other game's copy. */
@@ -9459,6 +10009,224 @@ void t_stand1_slot_wire()
     if (!coopslot::WireLacksSlot("@slot:?:Nameless") || !coopslot::WireLacksSlot("@slot:?") || coopslot::WireLacksSlot("@slot:1:Nameless") || coopslot::WireLacksSlot("Nameless")) Fail("WireLacksSlot");
 }
 
+/* building ownership with three or more players (src/common/slotwire.h): the one player-number lookup, the swap naming the same
+   player on every game, the area file's owner scan, the area read's owner gate, the stand-in cap, the protocol-67 rule */
+void P106PushStr(std::string* f, const std::string& s)
+{
+    const unsigned int n = (unsigned int)s.size();
+    f->push_back((char)(n & 0xFF)); f->push_back((char)((n >> 8) & 0xFF)); f->push_back((char)((n >> 16) & 0xFF)); f->push_back((char)((n >> 24) & 0xFF));
+    *f += s;
+}
+void t_p106_owner_lookup()
+{
+    const std::string sh("204-gamedata.base");
+    if (coopslot::OwnerSlotOfId(sh, sh, 3) != 3) Fail("p106: the shared id is the viewer's own player");
+    if (coopslot::OwnerSlotOfId(sh, sh, -1) != coopslot::kOwnerNoViewer || coopslot::OwnerSlotOfId(sh, sh, 1024) != coopslot::kOwnerNoViewer) Fail("p106: the shared id on a game with no number");
+    if (coopslot::OwnerSlotOfId("coop-p7", sh, 0) != 7 || coopslot::OwnerSlotOfId("coop-p1023", sh, 0) != 1023 || coopslot::OwnerSlotOfId("coop-p0", sh, 0) != 0) Fail("p106: coop-p<n> is player n");
+    if (coopslot::OwnerSlotOfId("coop-peer", sh, 0) != coopslot::kOwnerLegacy) Fail("p106: coop-peer is the legacy owner");
+    if (coopslot::OwnerSlotOfId("45-gamedata.base", sh, 0) != coopslot::kOwnerWorld || coopslot::OwnerSlotOfId("", sh, 0) != coopslot::kOwnerWorld
+        || coopslot::OwnerSlotOfId("coop-p07", sh, 0) != coopslot::kOwnerWorld || coopslot::OwnerSlotOfId("coop-p1024", sh, 0) != coopslot::kOwnerWorld) Fail("p106: a world owner is nobody's");
+    if (coopslot::OwnerIdForSlot(2, sh, 2) != sh || coopslot::OwnerIdForSlot(7, sh, 2) != "coop-p7" || !coopslot::OwnerIdForSlot(-1, sh, 2).empty()
+        || !coopslot::OwnerIdForSlot(1024, sh, 2).empty() || !coopslot::OwnerIdForSlot(7, sh, -1).empty()) Fail("p106: OwnerIdForSlot");
+    /* every number a 3-player world uses, written by player 1 and read by player 0: the swap names the same player on the reader */
+    for (int s = 0; s < 3; ++s)
+    {
+        const std::string onWriter = coopslot::OwnerIdForSlot(s, sh, 1);
+        if (coopslot::OwnerSlotOfId(onWriter, sh, 1) != s) Fail("p106: round trip on the writer");
+        std::string to; const int k = coopslot::ZoneOwnerSwapN(onWriter, sh, 0, 1, true, &to);
+        const std::string onReader = coopslot::OwnerIdForSlot(s, sh, 0);
+        if ((k == coopslot::kSwapNone ? onWriter : to) != onReader) Fail("p106: the swap does not name the same player on the reader");
+    }
+    /* the two-player swap is unchanged: writer's own -> its stand-in, mine -> mine, my own record untouched */
+    std::string out;
+    if (coopslot::ZoneOwnerSwapN(sh, sh, 0, 1, false, &out) != coopslot::kSwapToStandIn || out != "coop-p1") Fail("p106: the writer's own building -> its stand-in");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-p0", sh, 0, 1, false, &out) != coopslot::kSwapToMine || out != sh) Fail("p106: my building in the writer's record -> mine");
+    out.clear(); if (coopslot::ZoneOwnerSwapN(sh, sh, 1, 1, false, &out) != coopslot::kSwapNoWriter || !out.empty()) Fail("p106: my own record is not swapped");
+    out.clear(); if (coopslot::ZoneOwnerSwapN(sh, sh, 0, -1, false, &out) != coopslot::kSwapNoWriter) Fail("p106: no writer number - not swapped");
+    /* a third player's building stays under its stand-in (it needs one here - the scan below) */
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-p2", sh, 0, 1, true, &out) != coopslot::kSwapNone || !out.empty()) Fail("p106: a third player's owner stays");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("45-gamedata.base", sh, 0, 1, true, &out) != coopslot::kSwapNone || !out.empty()) Fail("p106: a town's building stays");
+    /* the protocol-67 rule on the world server's count */
+    if (!coopslot::LegacyPeerIsMineByWorld(1) || !coopslot::LegacyPeerIsMineByWorld(2) || coopslot::LegacyPeerIsMineByWorld(3) || coopslot::LegacyPeerIsMineByWorld(40)
+        || coopslot::LegacyPeerIsMineByWorld(-1)) Fail("p106: coop-peer is mine only in a world the world server counts at most two players in");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-peer", sh, 0, 2, true, &out) != coopslot::kSwapLegacyToMine || out != sh) Fail("p106: two players: coop-peer -> mine");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-peer", sh, 0, 2, false, &out) != coopslot::kSwapLegacyInactive || !out.empty()) Fail("p106: more than two players: coop-peer kept");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-peer", sh, 0, 0, false, &out) != coopslot::kSwapNone || !out.empty()) Fail("p106: my own old record is untouched by the rule");
+    out.clear(); if (coopslot::ZoneOwnerSwap("coop-peer", sh, 0, 2, &out) != coopslot::kSwapLegacyToMine) Fail("p106: ZoneOwnerSwap is the two-player rule");
+}
+void t_p106_zone_names_every_player()
+{
+    std::string f;
+    P106PushStr(&f, "owner faction ID"); P106PushStr(&f, "coop-p7");
+    P106PushStr(&f, "owner faction ID"); P106PushStr(&f, "204-gamedata.base");
+    P106PushStr(&f, "owner faction ID"); P106PushStr(&f, "coop-p12");
+    P106PushStr(&f, "coop-p7"); f.push_back('5');   /* a digit right after the string: the length decides, so this is 7, never 75 */
+    P106PushStr(&f, "coop-peer"); P106PushStr(&f, "coop-p01"); P106PushStr(&f, "coop-p1024"); P106PushStr(&f, "coop-p");
+    f += "coop-p9";   /* raw text, not a length-prefixed string: never an owner */
+    std::vector<int> named;
+    const int hits = coopslot::ZoneFileNamedSlots((const unsigned char*)f.data(), f.size(), &named);
+    if (hits != 3 || named.size() != 2 || named[0] != 7 || named[1] != 12) Fail("p106: the scan finds exactly coop-p7 (twice) and coop-p12");
+    std::string cut; P106PushStr(&cut, "coop-p33"); cut.resize(cut.size() - 1);
+    std::vector<int> none;
+    if (coopslot::ZoneFileNamedSlots((const unsigned char*)cut.data(), cut.size(), &none) != 0 || !none.empty()) Fail("p106: a truncated string is not read");
+    if (coopslot::ZoneFileNamedSlots(0, 100, &none) != 0 || coopslot::ZoneFileNamedSlots((const unsigned char*)"ab", 2, &none) != 0) Fail("p106: empty input");
+    /* who needs a stand-in: the writer and every named number except me */
+    std::vector<int> need; named.push_back(0);
+    coopslot::SlotsNeedingStandIn(named, 0, 2, &need);
+    if (need.size() != 3 || need[0] != 2 || need[1] != 7 || need[2] != 12) Fail("p106: writer 2 + named 7, 12 (not me, 0)");
+    std::vector<int> need2; coopslot::SlotsNeedingStandIn(named, 2, 2, &need2);
+    if (need2.size() != 3 || need2[0] != 7 || need2[1] != 12 || need2[2] != 0) Fail("p106: my own record names no writer stand-in");
+    /* the area read's owner gate: the writer's stand-in alone no longer lets a record through */
+    if (!coopslot::ZoneSwapReady(0, 2, true)) Fail("p106: the writer-only check passes");
+    if (coopslot::ZoneOwnersReady(0, 2, true, 1)) Fail("p106: a named player with no stand-in here refuses the swap");
+    if (coopslot::ZoneOwnersReady(0, 2, true, -1)) Fail("p106: an unreadable file refuses the swap");
+    if (coopslot::ZoneOwnersReady(0, 2, false, 0) || coopslot::ZoneOwnersReady(-1, 2, true, 0)) Fail("p106: the writer-only conditions still hold");
+    if (!coopslot::ZoneOwnersReady(0, 2, true, 0)) Fail("p106: every named player has a stand-in - the swap goes ahead");
+    /* the stand-ins made before any area is read: writers first, then named owners, the cap counted */
+    std::vector<int> wr, nm, outs;
+    wr.push_back(2); wr.push_back(0); wr.push_back(2);
+    nm.push_back(7); nm.push_back(2); nm.push_back(0); nm.push_back(12);
+    const std::vector<int> noneHave;
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, 0, noneHave, 16, &outs) != 0 || outs.size() != 3 || outs[0] != 2 || outs[1] != 7 || outs[2] != 12) Fail("p106: writers then named owners, each once, not me");
+    outs.clear();
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, 0, noneHave, 2, &outs) != 1 || outs.size() != 2 || outs[0] != 2 || outs[1] != 7) Fail("p106: the cap keeps the first two and counts one left out");
+    outs.clear();
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, -1, noneHave, 16, &outs) != 0 || !outs.empty()) Fail("p106: none while my own number is unknown");
+    outs.clear(); outs.push_back(12);
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, 0, noneHave, 2, &outs) != 0 || outs.size() != 3 || outs[0] != 12 || outs[1] != 2 || outs[2] != 7) Fail("p106: a player already listed is not listed or counted twice");
+}
+/* the area read's legacy gate, the swap without this game's number, the cap that counts placeholders made, the helper slot past 254 */
+void t_p106_fold1()
+{
+    using namespace coopbuild;
+    const std::string sh("204-gamedata.base");
+    std::string out;
+    /* the swap on a game whose own number is not known: the writer's building -> its stand-in, never to this game's id */
+    if (coopslot::ZoneOwnerSwapN(sh, sh, -1, 1, true, &out) != coopslot::kSwapToStandIn || out != "coop-p1") Fail("p106 fold1: no number of mine - the writer's building -> its stand-in");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-p3", sh, -1, 1, true, &out) != coopslot::kSwapNone || !out.empty()) Fail("p106 fold1: no number of mine - a third player's building stays");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-p0", sh, -1, 1, true, &out) != coopslot::kSwapNone || !out.empty()) Fail("p106 fold1: no number of mine - coop-p0 stays (never read as mine)");
+    out.clear(); if (coopslot::ZoneOwnerSwapN(sh, sh, -1, -1, true, &out) != coopslot::kSwapNoWriter || !out.empty()) Fail("p106 fold1: neither number known - not swapped");
+    /* the legacy branch with no writer number, and with the world server's count unknown */
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-peer", sh, 0, -1, true, &out) != coopslot::kSwapNone || !out.empty()) Fail("p106 fold1: coop-peer with no writer number stays");
+    out.clear(); if (coopslot::ZoneOwnerSwapN("coop-peer", sh, 0, 2, coopslot::LegacyPeerIsMineByWorld(-1), &out) != coopslot::kSwapLegacyInactive || !out.empty()) Fail("p106 fold1: count unknown - coop-peer never handed to me");
+    /* the area read's legacy gate */
+    if (!coopslot::ZoneLegacyPeerReady(false, 0, 2, -1, false)) Fail("p106 fold1: a record naming no coop-peer is not this gate's");
+    if (coopslot::ZoneLegacyPeerReady(true, 0, 2, -1, true) || coopslot::ZoneLegacyPeerReady(true, 0, 2, -1, false)) Fail("p106 fold1: count unknown - refused, never judged on a guess");
+    if (!coopslot::ZoneLegacyPeerReady(true, 0, 2, 2, false) || !coopslot::ZoneLegacyPeerReady(true, 0, 2, 1, false)) Fail("p106 fold1: two players - coop-peer is mine, no faction needed");
+    if (coopslot::ZoneLegacyPeerReady(true, 0, 2, 3, false)) Fail("p106 fold1: three players and no coop-peer faction here - refused");
+    if (!coopslot::ZoneLegacyPeerReady(true, 0, 2, 3, true)) Fail("p106 fold1: three players and a coop-peer faction here - read");
+    if (!coopslot::ZoneLegacyPeerReady(true, 0, -1, -1, false) || !coopslot::ZoneLegacyPeerReady(true, 2, 2, -1, false)) Fail("p106 fold1: no writer, or my own record - not this gate's");
+    /* the file scan: over-long "coop-p..." strings name nobody; coop-peer is reported apart */
+    std::string f;
+    P106PushStr(&f, "coop-p12345"); P106PushStr(&f, "coop-p10230"); P106PushStr(&f, "coop-peerX");
+    f.push_back((char)0x07); f.push_back((char)0x00); f.push_back((char)0x00); f.push_back((char)0x01); f += "coop-p5";   /* a length past the file's end */
+    std::vector<int> named; bool leg = false;
+    if (coopslot::ZoneFileNamedSlots((const unsigned char*)f.data(), f.size(), &named, &leg) != 0 || !named.empty() || leg) Fail("p106 fold1: an over-long or cut coop-p string named a player");
+    std::string g; P106PushStr(&g, "coop-peer"); P106PushStr(&g, "coop-p4");
+    named.clear(); leg = false;
+    if (coopslot::ZoneFileNamedSlots((const unsigned char*)g.data(), g.size(), &named, &leg) != 1 || named.size() != 1 || named[0] != 4 || !leg) Fail("p106 fold1: coop-peer is reported, coop-p4 named");
+    named.clear();
+    if (coopslot::ZoneFileNamedSlots((const unsigned char*)g.data(), g.size(), &named) != 1) Fail("p106 fold1: the scan without the legacy report");
+    /* the cap counts placeholders made: players with a stand-in already are skipped and never count */
+    std::vector<int> wr, nm, have, outs;
+    wr.push_back(2); wr.push_back(5); nm.push_back(7); nm.push_back(12);
+    have.push_back(2); have.push_back(7);
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, 0, have, 1, &outs) != 1 || outs.size() != 1 || outs[0] != 5) Fail("p106 fold1: room 1 - player 5 made, 12 left out, 2 and 7 not counted");
+    outs.clear();
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, 0, have, 2, &outs) != 0 || outs.size() != 2 || outs[0] != 5 || outs[1] != 12) Fail("p106 fold1: room 2 - both players without a stand-in");
+    outs.clear(); have.push_back(5); have.push_back(12);
+    if (coopslot::AreaStandInSlotsCapped(wr, nm, 0, have, 0, &outs) != 0 || !outs.empty()) Fail("p106 fold1: no room, but every player has a stand-in - none left out");
+    /* a saved row neither layout reads: the two-byte layout's answer */
+    BuildMsg m; m.kind = kBuildPlace; m.key = "1459-gamedata.base@31,22:-512345,8122,12345"; m.sid = "1459-gamedata.base"; m.needed = 5.0f; m.ownerSlot = 3;
+    std::vector<char> b; EncodeBuild(&b, m);
+    std::vector<char> cut(b.begin(), b.begin() + 5);
+    BuildMsg o;
+    const int r2 = DecodeBuild(&cut[0], cut.size(), &o);
+    if (r2 == kBuildDecodeOk || DecodeBuildSaved(&cut[0], cut.size(), &o) != r2) Fail("p106 fold1: a saved row neither layout reads is refused with the wire layout's answer");
+    /* the STATE's helper slots carry 0..1023 */
+    BuildMsg st; st.kind = kBuildState; st.key = "1459-gamedata.base@1,2:3,4,5"; st.needed = 2.0f;
+    BuildHelpAck a; a.slot = 1023; a.seq = 5; a.live = 6; a.nEx = 1; a.ex[0] = 2.0f; st.helpAcks.push_back(a);
+    BuildHelpAck a2; a2.slot = 300; a2.seq = 1; a2.live = 1; st.helpAcks.push_back(a2);
+    std::vector<char> sb;
+    if (!EncodeBuild(&sb, st) || DecodeBuild(&sb[0], sb.size(), &o) != kBuildDecodeOk || o.helpAcks.size() != 2 || o.helpAcks[0].slot != 1023 || o.helpAcks[0].live != 6
+        || o.helpAcks[1].slot != 300) Fail("p106 fold1: helper slots 1023 and 300 did not survive a STATE");
+    if (DecodeBuildSaved(&sb[0], sb.size(), &o) != kBuildDecodeOk || o.helpAcks.size() != 2 || o.helpAcks[0].slot != 1023) Fail("p106 fold1: a saved STATE with two-byte helper slots");
+    st.helpAcks[1].slot = 1024; std::vector<char> xb;
+    if (EncodeBuild(&xb, st)) Fail("p106 fold1: a helper slot past the notebook's slots was encoded");
+    BuildMsg s1; s1.kind = kBuildState; s1.key = "k"; s1.needed = 1.0f;
+    BuildHelpAck a7; a7.slot = 7; a7.seq = 9; a7.live = 9; s1.helpAcks.push_back(a7);
+    std::vector<char> nb; EncodeBuild(&nb, s1);
+    const size_t t = nb.size() - (2 + 4 + 4 + 1) - 1;   /* the tail's row-count byte */
+    if (((unsigned char)nb[t] & kBuildHelpTailWide) == 0 || (unsigned char)nb[t + 1] != 7 || nb[t + 2] != 0) Fail("p106 fold1: the helper slot is not two little-endian bytes under the wide flag");
+    std::vector<char> ob(nb); ob[t] = (char)((unsigned char)ob[t] & ~kBuildHelpTailWide); ob.erase(ob.begin() + (long)(t + 2));   /* a row written with a one-byte slot */
+    if (DecodeBuildSaved(&ob[0], ob.size(), &o) != kBuildDecodeOk || o.helpAcks.size() != 1 || o.helpAcks[0].slot != 7 || o.helpAcks[0].seq != 9) Fail("p106 fold1: a saved one-byte helper slot did not read");
+    /* pp.help keeps an owner slot up to 1023 */
+    std::vector<coopown::HelpRecRow> rows(1), got; rows[0].key = "k"; rows[0].slot = 1023;
+    std::vector<char> rb; coopown::EncodeHelpRec(rows, &rb);
+    if (!coopown::DecodeHelpRec(rb, &got) || got.size() != 1 || got[0].slot != 1023) Fail("p106 fold1: pp.help lost slot 1023");
+    rows[0].slot = 1024; coopown::EncodeHelpRec(rows, &rb);
+    if (coopown::DecodeHelpRec(rb, &got)) Fail("p106 fold1: pp.help took slot 1024");
+}
+/* PLAYERS carries the world server's player count after its rows */
+void t_p106_world_players_wire()
+{
+    using namespace coopjoin;
+    std::vector<RosterRow> rows(1); rows[0].slot = 2; rows[0].stage = (unsigned)kStageInWorld; rows[0].name = "B";
+    std::vector<char> m;
+    if (!RosterEncode(rows, 3, &m)) { Fail("p106: a roster with a world count was refused"); return; }
+    std::vector<RosterRow> back; unsigned wp = 0;
+    if (!RosterDecode(&m[0], m.size(), &back, &wp) || back.size() != 1 || back[0].slot != 2 || wp != 3) Fail("p106: the world count did not round-trip");
+    if (!RosterDecode(&m[0], m.size(), &back, 0)) Fail("p106: the count may be ignored");
+    std::vector<char> old(m.begin(), m.end() - 4);   /* the rows alone */
+    if (RosterDecode(&old[0], old.size(), &back, &wp)) Fail("p106: a roster without the world count decoded");
+    std::vector<char> big; if (RosterEncode(rows, kWorldPlayersMax + 1, &big)) Fail("p106: more players than slots was encoded");
+    std::vector<char> hand(old); const unsigned over = kWorldPlayersMax + 1; JsPut32(&hand, over);
+    if (RosterDecode(&hand[0], hand.size(), &back, &wp)) Fail("p106: more players than slots decoded");
+    std::vector<char> full; if (!RosterEncode(rows, kWorldPlayersMax, &full) || !RosterDecode(&full[0], full.size(), &back, &wp) || wp != kWorldPlayersMax) Fail("p106: 1024 players fit");
+}
+/* the build message's owner number is two bytes; rows saved with the one-byte number still read */
+void t_p106_owner_two_bytes()
+{
+    using namespace coopbuild;
+    BuildMsg m; m.kind = kBuildPlace;
+    m.key = "1459-gamedata.base@31,22:-512345,8122,12345"; m.sid = "1459-gamedata.base"; m.needed = 5.0f;
+    BuildMsg o;
+    const int slots[] = { 0, 3, 254, 255, 256, 1023 };
+    for (int i = 0; i < 6; ++i)
+    {
+        m.ownerSlot = (unsigned short)slots[i]; m.nonce = 0;
+        std::vector<char> b;
+        if (!EncodeBuild(&b, m) || DecodeBuild(&b[0], b.size(), &o) != kBuildDecodeOk || o.ownerSlot != slots[i]) Fail("p106: an owner number did not survive the wire");
+        if ((unsigned char)b[b.size() - 2] != (slots[i] & 0xFF) || (unsigned char)b.back() != ((slots[i] >> 8) & 0xFF)) Fail("p106: the owner number is not two little-endian bytes at the end");
+        m.nonce = 0x01020304u; std::vector<char> bn;
+        if (!EncodeBuild(&bn, m) || bn.size() != b.size() + 4 || DecodeBuild(&bn[0], bn.size(), &o) != kBuildDecodeOk || o.ownerSlot != slots[i] || o.nonce != 0x01020304u) Fail("p106: owner + nonce did not survive the wire");
+    }
+    m.ownerSlot = kBuildOwnerSender; m.nonce = 0;
+    std::vector<char> sb;
+    if (!EncodeBuild(&sb, m) || DecodeBuild(&sb[0], sb.size(), &o) != kBuildDecodeOk || o.ownerSlot != kBuildOwnerSender) Fail("p106: the sender's own piece did not survive");
+    m.ownerSlot = 1024; std::vector<char> nb;
+    if (EncodeBuild(&nb, m)) Fail("p106: an owner number past the notebook's slots was encoded");
+    std::vector<char> hb(sb); hb[hb.size() - 2] = 0x00; hb[hb.size() - 1] = 0x04;   /* 1024 */
+    if (DecodeBuild(&hb[0], hb.size(), &o) != kBuildDecodeBadValue) Fail("p106: an owner number past the notebook's slots decoded");
+    /* a row saved with the one-byte owner number: the wire refuses it, the saved-row reader takes it */
+    m.ownerSlot = 3; m.nonce = 0; std::vector<char> nb3; EncodeBuild(&nb3, m);
+    std::vector<char> old3(nb3.begin(), nb3.end() - 1);   /* the high byte gone: owner 3 in one byte */
+    if (DecodeBuild(&old3[0], old3.size(), &o) == kBuildDecodeOk) Fail("p106: the wire took a one-byte owner number");
+    if (DecodeBuildSaved(&old3[0], old3.size(), &o) != kBuildDecodeOk || o.ownerSlot != 3 || o.nonce != 0) Fail("p106: a saved one-byte owner row did not read");
+    std::vector<char> oldS(old3); oldS.back() = (char)0xFF;
+    if (DecodeBuildSaved(&oldS[0], oldS.size(), &o) != kBuildDecodeOk || o.ownerSlot != kBuildOwnerSender) Fail("p106: a saved one-byte 0xFF did not read as the sender");
+    m.nonce = 0xA1B2C3D4u; std::vector<char> nn; EncodeBuild(&nn, m);
+    std::vector<char> oldN(nn); oldN.erase(oldN.end() - 5);   /* owner 3 in one byte, then the nonce */
+    if (DecodeBuildSaved(&oldN[0], oldN.size(), &o) != kBuildDecodeOk || o.ownerSlot != 3 || o.nonce != 0xA1B2C3D4u) Fail("p106: a saved one-byte owner row with a nonce did not read");
+    if (DecodeBuildSaved(&nn[0], nn.size(), &o) != kBuildDecodeOk || o.ownerSlot != 3 || o.nonce != 0xA1B2C3D4u) Fail("p106: the saved-row reader takes the two-byte layout first");
+    /* the copy list: a copy of player 1023's piece is a row */
+    BuildCopyRec c; c.key = m.key; c.sid = m.sid; c.slot = 1023; c.nonce = 9;
+    std::string rk; std::vector<char> pb, stb; BuildCopyRec back;
+    if (!BuildCopyRowMake(c, &rk, &pb, &stb) || !BuildCopyRowRead(rk, std::string(pb.begin(), pb.end()), std::string(stb.begin(), stb.end()), &back) || back.slot != 1023) Fail("p106: a copy row for player 1023");
+    c.slot = 1024; if (BuildCopyRowMake(c, &rk, &pb, &stb)) Fail("p106: a copy row past the notebook's slots");
+    int why = -1;
+    if (coopown::HouseOwnerOfNewPiece(1, coopown::kOwnPeer, 1023, 1, &why) != 1023 || why != coopown::kHoHanded) Fail("p106: a house of player 1023 is handed to player 1023");
+}
 /* the players a game makes a stand-in for before it reads any area record (src/common/slotwire.h AreaWriterStandInSlots), the
    placeholder name such a stand-in carries, and the one name-clash rule for a new stand-in and a rename. Fails before: none of
    it existed - a stand-in was made only when its player's characters or names arrived, after the first area read. */
@@ -9616,6 +10384,213 @@ void t_t392_reoffer_decide()
     if (townreoffer::Decide(1, 0, 0, 0, 0, 0) != townreoffer::kReWait) Fail("nobody holds it and it is not this game's to presume - wait");
     if (townreoffer::Decide(1, 0, 0, 0, -1, -1) != townreoffer::kReWait) Fail("no fresh map - wait, no timer and no fallback");
     if (townreoffer::Decide(1, 0, 0, 0, -2, 1) != townreoffer::kReWait) Fail("teardown is not an answer - wait");
+}
+/* ---- T-581: A TOWN'S FIRST POPULATION THAT WAS SET ASIDE IS KEPT ON THE WORLD SERVER UNTIL IT IS MADE (src/common/owedpop.h) ---- */
+static owedpop::Row T581Row(unsigned kind, const char* key, const char* sid) { owedpop::Row r; r.kind = kind; r.key = key; r.sid = sid; r.x = -2150.5f; r.z = 9876.25f; return r; }
+void t_t581_wire()
+{
+    std::vector<char> b; owedpop::Msg m;
+    const owedpop::Row r = T581Row(owedpop::kKindResidents, "54321-rebirth.mod|31,45|-21505,98762", "Mongrel");
+    if (!owedpop::EncodeAdd(&b, r) || owedpop::Decode(&b[0], b.size(), &m) != 1 || m.op != owedpop::kOpAdd || m.row.key != r.key || m.row.sid != r.sid || m.row.x != r.x || m.row.z != r.z || m.kind != owedpop::kKindResidents) Fail("ADD round trip");
+    b.push_back(0);
+    if (owedpop::Decode(&b[0], b.size(), &m) != 0) Fail("a trailing byte is malformed");
+    if (!owedpop::EncodeKey(&b, owedpop::kOpClaim, owedpop::kKindBar, "Mongrel") || owedpop::Decode(&b[0], b.size(), &m) != 1 || m.op != owedpop::kOpClaim || m.key != "Mongrel" || m.kind != owedpop::kKindBar) Fail("CLAIM round trip");
+    if (owedpop::EncodeKey(&b, owedpop::kOpDone, owedpop::kKindBar, "Mongrel")) Fail("EncodeKey carries CLAIM and RELEASE only");
+    if (!owedpop::EncodeDone(&b, owedpop::kOpDone, owedpop::kKindResidents, r.key, owedpop::kWhyHas) || owedpop::Decode(&b[0], b.size(), &m) != 1 || m.op != owedpop::kOpDone || m.why != owedpop::kWhyHas) Fail("DONE round trip");
+    if (owedpop::EncodeDone(&b, owedpop::kOpDone, owedpop::kKindResidents, r.key, owedpop::kWhyAway)) Fail("away is never sent up");
+    if (!owedpop::EncodeDone(&b, owedpop::kOpGone, owedpop::kKindResidents, r.key, owedpop::kWhyAway) || owedpop::Decode(&b[0], b.size(), &m) != 1 || m.op != owedpop::kOpGone) Fail("GONE carries away");
+    std::vector<owedpop::Row> rows; owedpop::Row a = r; a.claimant = (int)owedpop::kClaimYou; rows.push_back(a);
+    owedpop::Row c = T581Row(owedpop::kKindBar, "Mongrel", "Mongrel"); c.claimant = (int)owedpop::kClaimOther; rows.push_back(c);
+    if (!owedpop::EncodeRows(&b, rows) || owedpop::Decode(&b[0], b.size(), &m) != 1 || m.rows.size() != 2 || m.rows[0].claimant != (int)owedpop::kClaimYou || m.rows[1].claimant != (int)owedpop::kClaimOther || m.rows[1].kind != owedpop::kKindBar) Fail("ROWS round trip with each row's claim");
+    if (owedpop::EncodeRows(&b, std::vector<owedpop::Row>())) Fail("an empty ROWS is not sent");
+    owedpop::Row bad = r; bad.key = std::string("a\tb");
+    if (owedpop::EncodeAdd(&b, bad)) Fail("a key with a control character is not a row");
+    bad = r; bad.key = std::string(129, 'k');
+    if (owedpop::EncodeAdd(&b, bad)) Fail("a key past 128 bytes is not a row");
+    bad = r; bad.kind = 3;
+    if (owedpop::EncodeAdd(&b, bad)) Fail("an unknown kind is not a row");
+    const char junk[4] = { 9, 0, 0, 0 };
+    if (owedpop::Decode(junk, 4, &m) != 0 || owedpop::Decode(0, 0, &m) != 0) Fail("an unknown op or an empty message is malformed");
+}
+void t_t581_table()
+{
+    owedpop::Table t;
+    const owedpop::Row r = T581Row(owedpop::kKindResidents, "B1", "Mongrel");
+    if (owedpop::TableAdd(&t, r) != 1 || owedpop::TableAdd(&t, r) != 0 || t.size() != 1) Fail("ADD stores once; a second ADD changes nothing");
+    owedpop::Row bar = T581Row(owedpop::kKindBar, "B1", "Mongrel");
+    if (owedpop::TableAdd(&t, bar) != 1 || t.size() != 2) Fail("a bar row and a residents row with the same key are two rows");
+    if (owedpop::TableClaim(&t, owedpop::kKindResidents, "B1", 1) != owedpop::kClaimGranted) Fail("the first asker is given the row");
+    if (owedpop::TableClaim(&t, owedpop::kKindResidents, "B1", 1) != owedpop::kClaimGranted) Fail("asking again for one's own row is still granted");
+    if (owedpop::TableClaim(&t, owedpop::kKindResidents, "B1", 2) != owedpop::kClaimHeld) Fail("a second game waits while the first holds it");
+    if (owedpop::TableClaim(&t, owedpop::kKindResidents, "B9", 2) != owedpop::kClaimAbsent) Fail("no such row");
+    if (owedpop::ClaimFor(1, 1) != (int)owedpop::kClaimYou || owedpop::ClaimFor(1, 2) != (int)owedpop::kClaimOther || owedpop::ClaimFor(0, 2) != (int)owedpop::kClaimNone) Fail("each game is told yours / another's / nobody's");
+    if (owedpop::TableRelease(&t, owedpop::kKindResidents, "B1", 2) != 0) Fail("only the holder releases");
+    if (owedpop::TableDone(&t, owedpop::kKindResidents, "B1", 2, owedpop::kWhyFault) != owedpop::kDoneRefused) Fail("a game that does not hold the row may not say fault");
+    if (owedpop::TableDone(&t, owedpop::kKindResidents, "B1", 2, owedpop::kWhyGone) != -1) Fail("nor gone");
+    if (owedpop::TableRelease(&t, owedpop::kKindResidents, "B1", 1) != 1 || owedpop::TableClaim(&t, owedpop::kKindResidents, "B1", 2) != owedpop::kClaimGranted) Fail("released, it is given to the next asker");
+    if (owedpop::TablePeerGone(&t, 2).size() != 1 || t[owedpop::TableKey(owedpop::kKindResidents, "B1")].claimant != 0) Fail("a game that leaves loses the rows it held");
+    if (owedpop::TableDone(&t, owedpop::kKindBar, "B1", 3, owedpop::kWhyHas) != 1 || t.size() != 1) Fail("any game may say has - the work is already there");
+    if (owedpop::TableClaim(&t, owedpop::kKindResidents, "B1", 3) != owedpop::kClaimGranted || owedpop::TableDone(&t, owedpop::kKindResidents, "B1", 3, owedpop::kWhyMade) != 1 || !t.empty()) Fail("the holder's made removes the row");
+    if (owedpop::TableDone(&t, owedpop::kKindResidents, "B1", 3, owedpop::kWhyMade) != 0) Fail("a second made finds no row");
+    if (owedpop::TableClaim(&t, owedpop::kKindResidents, "B1", 0) != owedpop::kClaimHeld) Fail("a game with no slot is never given a row");
+}
+void t_t581_file()
+{
+    owedpop::Table t, u;
+    owedpop::TableAdd(&t, T581Row(owedpop::kKindResidents, "54321-rebirth.mod|31,45|-21505,98762", "Mongrel"));
+    owedpop::TableAdd(&t, T581Row(owedpop::kKindBar, "Mongrel", "Mongrel"));
+    owedpop::TableClaim(&t, owedpop::kKindBar, "Mongrel", 4);
+    std::string text;
+    for (owedpop::Table::const_iterator it = t.begin(); it != t.end(); ++it) text += owedpop::Line(it->second);
+    size_t at = 0; int ok = 0;
+    while (at < text.size()) { const size_t nl = text.find('\n', at); ok += owedpop::ParseLine(text.substr(at, nl - at) + "\r", &u); at = nl + 1; }
+    if (ok != 2 || u.size() != 2) Fail("both rows come back from their lines");
+    const owedpop::Row& b = u[owedpop::TableKey(owedpop::kKindBar, "Mongrel")];
+    if (b.claimant != 0 || b.sid != "Mongrel" || b.x != -2150.5f || b.z != 9876.25f) Fail("a row comes back nobody's, with its town and position");
+    if (owedpop::ParseLine("v2\t1\tk\ts\t0\t0", &u) != 0 || owedpop::ParseLine("v1\t1\tk\ts\t0", &u) != 0 || owedpop::ParseLine("v1\t7\tk\ts\t0\t0", &u) != 0 || owedpop::ParseLine("v1\t1\tk\ts\tx\t0", &u) != 0) Fail("unusable lines are refused");
+}
+void t_t581_load_cause()
+{
+    if (owedpop::kCauseOwed != townreoffer::kDefOwed || owedpop::kCauseTestLever != townreoffer::kDefTestLever || owedpop::kCauseNone != townreoffer::kDefNone) Fail("the cause numbers agree with townreoffer.h");
+    if (std::strcmp(townreoffer::DeferCauseName(townreoffer::kDefOwed), "owed") != 0 || std::strcmp(townreoffer::DeferCauseName(townreoffer::kDefTestLever), "test-lever") != 0) Fail("cause names owed / test-lever");
+    if (owedpop::LoadCause(owedpop::kCauseNone, 1, 1, 0) != owedpop::kCauseOwed) Fail("a never-saved zone loaded again: owed residents this game would make are set aside, made under a claim");
+    if (owedpop::LoadCause(owedpop::kCauseNone, 1, 0, 0) != owedpop::kCauseNone) Fail("nothing owed: made at load as before");
+    if (owedpop::LoadCause(owedpop::kCauseNone, 1, 0, 1) != owedpop::kCauseTestLever) Fail("the lever sets aside what this game would make");
+    if (owedpop::LoadCause(owedpop::kCauseNone, 0, 1, 1) != owedpop::kCauseNone) Fail("another game holds the area: the gate's own answer stands");
+    if (owedpop::LoadCause(owedpop::kCauseNone, -2, 1, 1) != owedpop::kCauseNone) Fail("teardown: the gate's own answer stands");
+    if (owedpop::LoadCause(townreoffer::kDefNoMap, -1, 1, 1) != townreoffer::kDefNoMap) Fail("a set-aside cause already given stands");
+}
+void t_t581_commit()
+{
+    using namespace owedpop;
+    const int G = townreoffer::kReGenerate, O = townreoffer::kReOther, W = townreoffer::kReWait;
+    const int Y = (int)kClaimYou, Nn = (int)kClaimNone, Ot = (int)kClaimOther;
+    if (Commit(G, 1, 0, 0, Nn) != kActMake) Fail("work only this game knows, holder: made as before");
+    if (Commit(G, 1, 0, 1, Nn) != kActClaim) Fail("an owed row nobody holds: ask for it first");
+    if (Commit(G, 1, 0, 1, Ot) != kActWait) Fail("an owed row another game holds: wait");
+    if (Commit(G, 1, 0, 1, Y) != kActMake) Fail("an owed row given to this game: make it");
+    if (Commit(G, 1, 0, 2, Nn) != kActWait) Fail("sent and not back yet: wait for the row");
+    if (Commit(G, 1, -1, 1, Y) != kActWait) Fail("residents unreadable: wait");
+    if (Commit(G, 1, 1, 1, Ot) != kActDoneHas || Commit(O, 1, 1, 2, Nn) != kActDoneHas) Fail("the residents are already there: DONE has, from any game");
+    if (Commit(O, 1, 1, 0, Nn) != kActForget) Fail("already there, only this game knew: settled here");
+    if (Commit(O, 1, 0, 0, Nn) != kActForget || Commit(O, 1, -1, 0, Nn) != kActForget) Fail("another game holds it, only this game knew: settled as the gate settles it");
+    if (Commit(O, 1, 0, 1, Nn) != kActWait || Commit(O, 1, 0, 1, Y) != kActWait) Fail("another game holds an owed row: this game never settles it - the holder makes it");
+    if (Commit(W, 1, 0, 1, Y) != kActWait || Commit(W, 1, 0, 0, Nn) != kActWait) Fail("no answer about the area: wait");
+    if (Commit(G, 0, -1, 0, Nn) != kActForget) Fail("a building gone, only this game knew: forgotten");
+    if (Commit(G, 0, -1, 1, Y) != kActDoneGone) Fail("a building gone, the row is this game's: DONE gone");
+    if (Commit(G, 0, -1, 1, Nn) != kActClaim || Commit(O, 0, -1, 1, Nn) != kActWait || Commit(G, 0, -1, 1, Ot) != kActWait) Fail("a building gone, the row is not this game's: the holder of the area says so");
+    if (Commit(G, -1, -1, 1, Y) != kActWait) Fail("an incomplete search: wait");
+    if (KeepClaim(1, 1, 0) != 1 || KeepClaim(0, 1, 0) != 0 || KeepClaim(1, 0, 0) != 0 || KeepClaim(1, -1, 0) != 0 || KeepClaim(1, 1, 1) != 0) Fail("a row is kept only while this game holds its area with the zone live and the lever off");
+}
+/* two games and the world server, through the same table and decisions both sides compile. A and B are slots 0 and 1 (claimants 1, 2). */
+void t_t581_two_games()
+{
+    using namespace owedpop;
+    const int G = townreoffer::kReGenerate, O = townreoffer::kReOther;
+    Table srv;
+    const std::string key = "54321-rebirth.mod|31,45|-21505,98762";
+    /* A's gate set the residents aside (no fresh area map); its ADD reaches the world server */
+    if (TableAdd(&srv, T581Row(kKindResidents, key.c_str(), "Mongrel")) != 1) Fail("stored");
+    /* racing: both games think they hold the area (a stale map) and ask - one is given it, the other waits */
+    int makes = 0;
+    const int ca = TableClaim(&srv, kKindResidents, key, 1), cb = TableClaim(&srv, kKindResidents, key, 2);
+    if (ca != kClaimGranted || cb != kClaimHeld) Fail("racing: the first asker is given it, the second waits");
+    const int claimA = ClaimFor(srv[TableKey(kKindResidents, key)].claimant, 1), claimB = ClaimFor(srv[TableKey(kKindResidents, key)].claimant, 2);
+    if (Commit(G, 1, 0, 1, claimA) == kActMake) ++makes;
+    if (Commit(G, 1, 0, 1, claimB) == kActMake) ++makes;
+    if (makes != 1) Fail("racing: exactly one game makes the residents");
+    if (TableDone(&srv, kKindResidents, key, 1, kWhyMade) != 1 || !srv.empty()) Fail("racing: the maker's DONE removes the row");
+    if (TableDone(&srv, kKindResidents, key, 2, kWhyMade) != 0) Fail("racing: nothing is left for the other game");
+    /* holder change: A is given the row, its player walks away - it hands the row back; B now holds the area and makes it */
+    TableAdd(&srv, T581Row(kKindResidents, key.c_str(), "Mongrel"));
+    TableClaim(&srv, kKindResidents, key, 1);
+    if (KeepClaim(1, 0, 0) != 0) Fail("holder change: A no longer holds the area - it hands the row back");
+    TableRelease(&srv, kKindResidents, key, 1);
+    if (Commit(O, 1, 0, 1, ClaimFor(srv[TableKey(kKindResidents, key)].claimant, 1)) != kActWait) Fail("holder change: A never makes it while B holds the area");
+    if (Commit(G, 1, 0, 1, ClaimFor(srv[TableKey(kKindResidents, key)].claimant, 2)) != kActClaim) Fail("holder change: B asks");
+    if (TableClaim(&srv, kKindResidents, key, 2) != kClaimGranted || Commit(G, 1, 0, 1, ClaimFor(srv[TableKey(kKindResidents, key)].claimant, 2)) != kActMake) Fail("holder change: B is given it and makes it");
+    if (TableDone(&srv, kKindResidents, key, 1, kWhyMade) != kDoneMadeAsHas || !srv.empty()) Fail("holder change: A's late made is taken as has - the people exist, and B never makes a second population");
+    TableDone(&srv, kKindResidents, key, 2, kWhyMade);
+    /* a crash while holding a row: the link ends, the row is nobody's again and the other game is given it */
+    TableAdd(&srv, T581Row(kKindResidents, key.c_str(), "Mongrel"));
+    TableClaim(&srv, kKindResidents, key, 1);
+    if (TablePeerGone(&srv, 1).size() != 1 || TableClaim(&srv, kKindResidents, key, 2) != kClaimGranted) Fail("crash: the row goes to the game still here");
+    srv.clear();
+    /* a zone saved without its residents, then the world reloaded later: the row survives the world server's own restart (its
+       file) and the reloaded game - zone loaded from its save, nothing set aside in memory - finds it at its town check-up */
+    TableAdd(&srv, T581Row(kKindResidents, key.c_str(), "Mongrel"));
+    TableClaim(&srv, kKindResidents, key, 1);
+    Table disk; ParseLine(Line(srv[TableKey(kKindResidents, key)]), &disk);
+    if (disk.size() != 1 || disk.begin()->second.claimant != 0) Fail("reload: the row is on disk and nobody's after a restart");
+    if (LoadCause(kCauseNone, 1, 1, 0) != kCauseOwed) Fail("reload: a game that loads the zone fresh sets the owed residents aside rather than make them unclaimed");
+    if (Commit(G, 1, 0, 1, ClaimFor(disk.begin()->second.claimant, 1)) != kActClaim) Fail("reload: the holder asks for the row");
+    if (TableClaim(&disk, kKindResidents, key, 1) != kClaimGranted || Commit(G, 1, 0, 1, (int)kClaimYou) != kActMake) Fail("reload: given it, the holder makes the residents");
+    if (TableDone(&disk, kKindResidents, key, 1, kWhyMade) != 1 || !disk.empty()) Fail("reload: made once, the row is gone");
+    /* the other game already shows residents (copies of the maker's): it removes a row it does not hold */
+    TableAdd(&disk, T581Row(kKindResidents, key.c_str(), "Mongrel"));
+    TableClaim(&disk, kKindResidents, key, 1);
+    if (Commit(O, 1, 1, 1, ClaimFor(disk.begin()->second.claimant, 2)) != kActDoneHas || TableDone(&disk, kKindResidents, key, 2, kWhyHas) != 1) Fail("has: any game that sees the residents ends the row");
+}
+/* T-581 + T-580: what a residents re-run that ran leaves, from T-580's per-run counts */
+void t_t581_after_rerun()
+{
+    using namespace owedpop;
+    if (AfterRerun(2, townpending::RerunKeep(2, 0), 0, 1, 0) != kRunDoneMade) Fail("residents made under a grant: DONE made");
+    if (AfterRerun(2, townpending::RerunKeep(2, 1), 0, 1, 1) != kRunDoneMade) Fail("some made, some refused: DONE made");
+    if (AfterRerun(0, townpending::RerunKeep(0, 0), 0, 1, 0) != kRunDoneEmpty) Fail("the engine chose none and nothing refused: DONE empty, never made");
+    if (AfterRerun(0, townpending::RerunKeep(0, 0), 0, 1, 2) != kRunRelease) Fail("none made, refused for another cause: handed back, not counted - like a lost hold");
+    if (AfterRerun(0, townpending::RerunKeep(0, 3), 0, 1, 3) != kRunKeep) Fail("decision 34 refused them all: kept, the owed row stays (no DONE)");
+    if (AfterRerun(0, 1, townpending::KeptGiveUp(townpending::kMaxKeptReruns), 1, 3) != kRunGiveUpRelease) Fail("given up at the bound: handed back, never removed");
+    if (AfterRerun(0, 1, townpending::KeptGiveUp(townpending::kMaxKeptReruns - 1), 1, 3) != kRunKeep) Fail("under the bound: still kept");
+    if (AfterRerun(0, 1, 1, 0, 1) != kRunGiveUpLocal || AfterRerun(3, 0, 0, 0, 0) != kRunLocalDone || AfterRerun(0, 0, 0, 0, 2) != kRunLocalDone) Fail("only this game knew it: nothing is sent");
+    Table t; TableAdd(&t, T581Row(kKindResidents, "E1", "X"));
+    if (TableDone(&t, kKindResidents, "E1", 1, kWhyEmpty, 100.0) != kDoneRefused) Fail("empty only from the game holding the row");
+    TableClaim(&t, kKindResidents, "E1", 1, 100.0);
+    if (TableDone(&t, kKindResidents, "E1", 1, kWhyEmpty, 100.0) != kDoneCounted || t.size() != 1) Fail("empty from the holder is counted and handed back, like gone and fault");
+    if (TableClaim(&t, kKindResidents, "E1", 2, 100.0 + kRetrySpacingSec - 1.0) != kClaimLater) Fail("spaced: not given again for 5 minutes");
+    if (TableClaim(&t, kKindResidents, "E1", 2, 100.0 + kRetrySpacingSec) != kClaimGranted) Fail("given again after the spacing");
+    std::vector<char> b; Msg m;
+    if (!EncodeDone(&b, kOpDone, kKindResidents, "E1", kWhyEmpty) || Decode(&b[0], b.size(), &m) != 1 || m.why != kWhyEmpty) Fail("DONE empty goes up");
+    if (EncodeDone(&b, kOpDone, kKindResidents, "E1", kWhyFull)) Fail("full is never sent up");
+    if (!EncodeDone(&b, kOpGone, kKindResidents, "E1", kWhyFull) || Decode(&b[0], b.size(), &m) != 1 || GoneKeepsLocal(m.why) != 1 || GoneKeepsLocal(kWhyMade) != 0) Fail("GONE full: the game keeps its work and makes it as before");
+    if (AskAgain(1, kReaskMs - 1) != 0 || AskAgain(1, kReaskMs) != 1 || AskAgain(0, 999999) != 0) Fail("a claim with no answer is asked again after 30 s; a release never");
+    if (CountedWhy(kWhyEmpty) != 1 || CountedWhy(kWhyGone) != 1 || CountedWhy(kWhyFault) != 1 || CountedWhy(kWhyMade) != 0 || CountedWhy(kWhyHas) != 0) Fail("gone, fault and empty are the counted reports");
+}
+/* T-581 fold 1: settling work whose row left while this game was away, gone / fault retries, the per-game cap, the bar's done test */
+void t_t581_fold()
+{
+    using namespace owedpop;
+    if (FlushStep(0, 5, 0, 0) != kFlushSend) Fail("never sent: send");
+    if (FlushStep(5, 5, 0, 0) != kFlushKeep || FlushStep(-1, 5, 0, 1) != kFlushKeep) Fail("sent on this link, or not sendable: nothing");
+    if (FlushStep(4, 5, 1, 1) != kFlushMark) Fail("its row is in the new table: counted as sent, not sent again");
+    if (FlushStep(4, 5, 0, 1) != kFlushSettle) Fail("its row was in the table and is gone from the new one: settled, never sent again");
+    if (FlushStep(4, 5, 0, 0) != kFlushSend) Fail("sent but never seen in the table (the link dropped first): sent again");
+    Table t; const std::string key = "B1";
+    double now = 1000.0;
+    TableAdd(&t, T581Row(kKindResidents, "B1", "Mongrel"));
+    for (int i = 1; i < kTriesMax; ++i)
+    {
+        if (TableClaim(&t, kKindResidents, key, 1, now) != kClaimGranted) Fail("handed back after a fault: given again once the spacing ran");
+        if (TableDone(&t, kKindResidents, key, 1, kWhyFault, now) != kDoneCounted || t[TableKey(kKindResidents, key)].claimant != 0) Fail("a fault is counted and the row handed back, kept");
+        if (TableClaim(&t, kKindResidents, key, 1, now + 1.0) != kClaimLater) Fail("a fault is retried, but not within seconds");
+        now += kRetrySpacingSec;
+    }
+    TableClaim(&t, kKindResidents, key, 2, now);
+    if (TableDone(&t, kKindResidents, key, 2, kWhyGone, now) != kDoneCounted) Fail("a gone report is counted apart from the faults");
+    now += kRetrySpacingSec;
+    TableClaim(&t, kKindResidents, key, 2, now);
+    if (TableDone(&t, kKindResidents, key, 2, kWhyFault, now) != kDoneRemoved || !t.empty()) Fail("the third fault removes the row");
+    TableAdd(&t, T581Row(kKindResidents, "B2", "Mongrel"));
+    for (int i = 0; i < kTriesMax; ++i) { now += kRetrySpacingSec; TableClaim(&t, kKindResidents, "B2", 1, now); TableDone(&t, kKindResidents, "B2", 1, kWhyGone, now); }
+    if (!t.empty()) Fail("the third gone removes the row");
+    if (TableAddFrom(&t, T581Row(kKindResidents, "C1", "X"), 1, 2) != 1 || TableAddFrom(&t, T581Row(kKindResidents, "C2", "X"), 1, 2) != 1) Fail("rows under the cap are stored");
+    if (TableAddFrom(&t, T581Row(kKindResidents, "C3", "X"), 1, 2) != kAddFull || t.size() != 2) Fail("a game at its cap is refused");
+    if (TableAddFrom(&t, T581Row(kKindResidents, "C1", "X"), 1, 2) != 0) Fail("a row already stored is unchanged, not refused");
+    if (TableAddFrom(&t, T581Row(kKindResidents, "C3", "X"), 2, 2) != 1) Fail("the cap is per game");
+    if (kRowsPerGame != 2048 || kTriesMax != 3) Fail("the cap is 2048 rows a game and a row lives through three gone or three fault reports");
+    if (BarHas(1, 0, -2, 0, 0) != 1) Fail("a list used up on this town object counts at once");
+    if (BarHas(0, 1, 1, 1, 0) != 1 || BarHas(0, 1, 0, 0, 1) != 1) Fail("a fill elsewhere or a removed row counts with the zone live");
+    if (BarHas(0, 0, 1, 1, 1) != 0 || BarHas(0, 1, -2, 1, 1) != 0) Fail("zone not live, or the world being freed: wait, as before");
 }
 /* T-438 (t438-test): a set-aside building still runs populateBuilding (faction, furniture) with its squads refused as SET ASIDE */
 void t_t438_residents_aside()
@@ -10114,7 +11089,7 @@ void t_build1b_place_wire()
     m.rot[0] = 0.5f; m.rot[1] = 0.0f; m.rot[2] = 0.8660254f; m.rot[3] = 0.0f;
     m.complete = 0; m.progress = 0.0f; m.needed = 12.5f;
     std::vector<char> b;
-    const size_t want = 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + 1 + 4 + 1 + 1;   /* build1-e: form, floor, outside; build1h: owner slot */
+    const size_t want = 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + 1 + 4 + 1 + 2;   /* form, floor, outside, the two-byte owner number */
     if (!coopbuild::EncodeBuild(&b, m) || b.size() != want) { Fail("a PLACE did not encode to its exact size"); return; }
     coopbuild::BuildMsg o;
     if (coopbuild::DecodeBuild(&b[0], b.size(), &o) != coopbuild::kBuildDecodeOk || o.kind != 1 || o.key != m.key || o.sid != m.sid
@@ -10140,7 +11115,7 @@ void t_build1b_place_wire()
         const char empty2[2] = { 5, 0 };
         if (coopbuild::DecodeBuild(empty2, 2, &o) == coopbuild::kBuildDecodeOk) Fail("a HAND_ACK with an empty key was accepted");
     }
-    std::vector<char> c(b); c[want - 17] = 2;   /* the complete byte (build1-e: 6 trailing bytes after the host key; build1h: 7) */
+    std::vector<char> c(b); c[want - 18] = 2;   /* the complete byte (8 trailing bytes after the host key: form, floor, outside, the two-byte owner number) */
     if (coopbuild::DecodeBuild(&c[0], c.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a PLACE with complete=2 was accepted");
     std::vector<char> zk(b); zk[1] = 0;
     if (coopbuild::DecodeBuild(&zk[0], zk.size(), &o) == coopbuild::kBuildDecodeOk) Fail("a PLACE with an empty key was accepted");
@@ -10244,16 +11219,16 @@ void t_build1h_place_owner_slot()
     coopbuild::BuildMsg m; m.kind = coopbuild::kBuildPlace;
     m.key = "1459-gamedata.base@31,22:-512345,8122,12345"; m.sid = "1459-gamedata.base";
     m.hostKey = "57-gamedata.base@31,22:-512300,8100,12300"; m.hostForm = coopbuild::kBuildHostIndoorsOnly;
-    if (m.ownerSlot != coopbuild::kBuildOwnerSender) Fail("a PLACE's owner slot must default to the sender (0xFF)");
+    if (m.ownerSlot != coopbuild::kBuildOwnerSender) Fail("a PLACE's owner slot must default to the sender");
     std::vector<char> b; coopbuild::BuildMsg o;
-    if (!coopbuild::EncodeBuild(&b, m) || coopbuild::DecodeBuild(&b[0], b.size(), &o) != coopbuild::kBuildDecodeOk || o.ownerSlot != 0xFF)
+    if (!coopbuild::EncodeBuild(&b, m) || coopbuild::DecodeBuild(&b[0], b.size(), &o) != coopbuild::kBuildDecodeOk || o.ownerSlot != coopbuild::kBuildOwnerSender)
         Fail("a sender-owned PLACE did not survive the round trip");
     m.ownerSlot = 3; std::vector<char> h;
-    if (!coopbuild::EncodeBuild(&h, m) || h.size() != b.size() || h.back() != 3 || coopbuild::DecodeBuild(&h[0], h.size(), &o) != coopbuild::kBuildDecodeOk
+    if (!coopbuild::EncodeBuild(&h, m) || h.size() != b.size() || h[h.size() - 2] != 3 || h.back() != 0 || coopbuild::DecodeBuild(&h[0], h.size(), &o) != coopbuild::kBuildDecodeOk
         || o.ownerSlot != 3 || o.hostForm != coopbuild::kBuildHostIndoorsOnly || o.hostKey != m.hostKey)
         Fail("a handed PLACE (owner slot 3) did not survive the round trip");
     std::vector<char> cut(h.begin(), h.end() - 1);
-    if (coopbuild::DecodeBuild(&cut[0], cut.size(), &o) == coopbuild::kBuildDecodeOk) Fail("a protocol-73 PLACE (no owner byte) was accepted");
+    if (coopbuild::DecodeBuild(&cut[0], cut.size(), &o) == coopbuild::kBuildDecodeOk) Fail("a PLACE cut inside its owner number was accepted");
 }
 
 /* build1h H1: a piece placed inside another player's house is the house owner's; the shared build record decides the box writer first */
@@ -10271,8 +11246,8 @@ void t_build1h_house_owner()
     if (HouseOwnerOfNewPiece(1, kOwnUnknown, -1, 1, &why) != -1 || why != kHoUnresolved) Fail("unknown owner: unresolved");
     if (HouseOwnerOfNewPiece(1, kOwnShared, -1, 1, &why) != -1 || why != kHoUnresolved) Fail("shared faction: unresolved");
     if (HouseOwnerOfNewPiece(1, kOwnUnreadable, -1, 1, &why) != -1 || why != kHoUnresolved) Fail("unreadable house: unresolved");
-    if (HouseOwnerOfNewPiece(1, kOwnPeer, kHandSlotMax + 1, 1, &why) != -1 || why != kHoUnresolved) Fail("a slot the PLACE byte cannot carry: unresolved");
-    if (HouseOwnerOfNewPiece(1, kOwnPeer, kHandSlotMax, 1, &why) != kHandSlotMax) Fail("slot 254 fits the byte");
+    if (HouseOwnerOfNewPiece(1, kOwnPeer, kHandSlotMax + 1, 1, &why) != -1 || why != kHoUnresolved) Fail("a number past the notebook's slots: unresolved");
+    if (HouseOwnerOfNewPiece(1, kOwnPeer, kHandSlotMax, 1, &why) != kHandSlotMax) Fail("slot 1023 fits the owner number");
     int slot = -9, via = -9;
     if (PickOwnerRec(1, 3, 1, 1, kOwnMe, 1, kOwnMe, 1, &slot, &via) != kOwnPeer || slot != 3 || via != 2) Fail("the record beats the host");
     if (PickOwnerRec(1, 1, 1, 0, kOwnNone, -1, kOwnPeer, 3, &slot, &via) != kOwnMe || slot != 1 || via != 2) Fail("a record naming my slot is mine");
@@ -10301,7 +11276,7 @@ void t_build1e_furniture_wire()
     m.pos[0] = 17.5f; m.pos[1] = 0.0f; m.pos[2] = -35.25f;
     m.hostForm = coopbuild::kBuildHostSub; m.floor = 2; m.outside = 1; m.needed = 10.0f;
     std::vector<char> b;
-    const size_t want = 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 1;   /* build1h: + owner slot */
+    const size_t want = 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 2;   /* + the two-byte owner number */
     if (!coopbuild::EncodeBuild(&b, m) || b.size() != want) { Fail("a furniture PLACE did not encode to its exact size"); return; }
     coopbuild::BuildMsg o;
     if (coopbuild::DecodeBuild(&b[0], b.size(), &o) != coopbuild::kBuildDecodeOk || o.hostKey != m.hostKey || o.hostForm != 1
@@ -10309,11 +11284,11 @@ void t_build1e_furniture_wire()
         Fail("a furniture PLACE did not survive the round trip");
     for (size_t cut = 0; cut < b.size(); ++cut)
         if (coopbuild::DecodeBuild(&b[0], cut, &o) == coopbuild::kBuildDecodeOk) { Fail("a truncated furniture PLACE was accepted"); break; }
-    std::vector<char> f3(b); f3[want - 7] = 3;
+    std::vector<char> f3(b); f3[want - 8] = 3;
     if (coopbuild::DecodeBuild(&f3[0], f3.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a PLACE with host form 3 was accepted");
-    std::vector<char> o2(b); o2[want - 2] = 2;
+    std::vector<char> o2(b); o2[want - 3] = 2;
     if (coopbuild::DecodeBuild(&o2[0], o2.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a PLACE with outside=2 was accepted");
-    std::vector<char> fl(b); { const int big = 5000; std::memcpy(&fl[want - 6], &big, 4); }
+    std::vector<char> fl(b); { const int big = 5000; std::memcpy(&fl[want - 7], &big, 4); }
     if (coopbuild::DecodeBuild(&fl[0], fl.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a PLACE with floor 5000 was accepted");
     coopbuild::BuildMsg free1 = m; free1.hostKey.clear(); std::vector<char> fb;
     if (coopbuild::EncodeBuild(&fb, free1)) Fail("a free-standing PLACE with a host form was encoded");
@@ -10321,7 +11296,7 @@ void t_build1e_furniture_wire()
     if (!coopbuild::EncodeBuild(&fb, free1) || coopbuild::DecodeBuild(&fb[0], fb.size(), &o) != coopbuild::kBuildDecodeOk
         || !o.hostKey.empty() || o.hostForm != 0)
         Fail("a free-standing PLACE did not survive the round trip");
-    std::vector<char> ff(fb); ff[ff.size() - 7] = 1;
+    std::vector<char> ff(fb); ff[ff.size() - 8] = 1;
     if (coopbuild::DecodeBuild(&ff[0], ff.size(), &o) != coopbuild::kBuildDecodeBadValue) Fail("a free-standing PLACE with host form 1 was accepted");
     coopbuild::BuildMsg lo = m; lo.floor = -coopbuild::kBuildMaxFloor; std::vector<char> lb;
     if (!coopbuild::EncodeBuild(&lb, lo)) Fail("a PLACE with floor -1024 was refused");
@@ -10662,7 +11637,7 @@ void t_help1_wire()
     coopbuild::BuildHelpAck a; a.slot = 1; a.seq = 9; a.nEx = 2; a.ex[0] = 0.0f; a.ex[1] = 2.5f;
     s.helpAcks.push_back(a);
     std::vector<char> sb;
-    if (!coopbuild::EncodeBuild(&sb, s) || sb.size() != plain.size() + 1 + 1 + 4 + 4 + 1 + 8) Fail("help1 fold 3: a STATE tail did not encode to its size (+ u32 live)");
+    if (!coopbuild::EncodeBuild(&sb, s) || sb.size() != plain.size() + 1 + 2 + 4 + 4 + 1 + 8) Fail("help1 fold 3: a STATE tail did not encode to its size (two-byte slot, + u32 live)");
     else
     {
         if (coopbuild::DecodeBuild(&sb[0], sb.size(), &o) != coopbuild::kBuildDecodeOk || o.helpAcks.size() != 1 || o.helpAcks[0].slot != 1 || o.helpAcks[0].seq != 9
@@ -11134,7 +12109,7 @@ void t_p87root_copy_list()
     std::string brk;
     std::vector<char> bpb, bsb;
     bad.slot = -1; if (coopbuild::BuildCopyRowMake(bad, &brk, &bpb, &bsb)) Fail("p87root: a copy with no owner slot was encoded");
-    bad.slot = 255; if (coopbuild::BuildCopyRowMake(bad, &brk, &bpb, &bsb)) Fail("p87root: a copy whose slot is the sender marker was encoded");
+    bad.slot = 1024; if (coopbuild::BuildCopyRowMake(bad, &brk, &bpb, &bsb)) Fail("p87root: a copy whose slot is past the notebook's slots was encoded");
     bad = c; bad.sid.clear(); if (coopbuild::BuildCopyRowMake(bad, &brk, &bpb, &bsb)) Fail("p87root: a copy with no sid was encoded");
     if (coopbuild::BuildCopyRowRead(frk, ps, ss, &back)) Fail("p87root: a row read under another key's row key");
     if (coopbuild::BuildCopyRowRead(rk, ps, std::string(fsb.begin(), fsb.end()), &back)) Fail("p87root: a row with another key's STATE was read");
@@ -13210,8 +14185,8 @@ void t_pp6_one_press_load()
     if (c.isNew != 0 || c.num != 2) Fail("pp6: a chosen profile gone from the world -> the last used");
     c = HostProfileChoose(mine, 0, "Scott", "X");
     if (c.isNew != 0 || c.num != 1 || c.name != "Scott") Fail("pp6: a NEW PROFILE name already taken plays that profile");
-    c = HostProfileChoose(mine, 0, "scott", "X");   /* T-201 PP6' fold: the world's NewDecide compares case too - "scott" is a new one */
-    if (c.isNew == 0 || c.name != "scott") Fail("pp6 fold: CHANGE's NEW PROFILE name is compared exactly, as the world's NewDecide does");
+    c = HostProfileChoose(mine, 0, "scott", "X");   /* T-368: the world's NewDecide name rule - "scott" is the name "Scott" */
+    if (c.isNew != 0 || c.num != 1) Fail("T-368: CHANGE's NEW PROFILE name is compared as the world's NewDecide does (case ignored)");
     c = HostProfileChoose(mine, 0, "Trader", "X");
     if (c.isNew == 0 || c.name != "Trader") Fail("pp6: CHANGE's NEW PROFILE name is made at the press");
     if (coopui::HostProfileValue("Scott", 1, 1) != "Scott (new)" || coopui::HostProfileValue("Scott", 0, 1) != "Scott"
@@ -13260,6 +14235,78 @@ void t_pp6_one_press_load()
     if (coopui::NoticeTitle(coopui::kLoadFailText) != "CAN'T LOAD" || coopui::NoticeTitle(coopui::kLoadLinkLostText) != "CAN'T LOAD"
         || coopui::NoticeTitle(coopui::kHostPickFailText) != "CAN'T HOST" || coopui::NoticeTitle(coopui::kSaveNotHereText) != "CAN'T LOAD")
         Fail("pp6 fold: the A-D box titles");
+    /* owner 470: a press prepares; the role is cancelled when the title is back with no world on its way */
+    {
+        const int phases[4] = { coopui::kPrepArmed, coopui::kPrepWindowWait, coopui::kPrepWindowSeen, coopui::kPrepPosted };
+        for (int code = -1; code <= 4; ++code)
+            for (int sh = 0; sh <= 1; ++sh)
+            {
+                coopui::PrepFacts n; n.phase = coopui::kPrepNone; n.requestCode = code; n.windowShown = sh;
+                if (coopui::PrepStep(n) != coopui::kPrepKeep) Fail("owner 470: no prepared press - nothing is touched (a test-armed game included)");
+            }
+        for (int k = 0; k < 4; ++k)
+        {
+            coopui::PrepFacts f; f.phase = phases[k];
+            coopui::PrepFacts g = f; g.roleSingle = 1; g.windowShown = 1;
+            if (coopui::PrepStep(g) != coopui::kPrepForget) Fail("owner 470: the role is single already - the phase is forgotten, nothing left twice");
+            g = f; g.panelWanted = 1;
+            if (coopui::PrepStep(g) != coopui::kPrepKeep) Fail("owner 470: the panel is open - its own CANCEL / X / Escape decide");
+            g = f; g.pressBusy = 1;
+            if (coopui::PrepStep(g) != coopui::kPrepKeep) Fail("owner 470: the press or its load steps are running");
+            for (int code = 2; code <= 4; ++code)
+            {
+                g = f; g.requestCode = code;
+                const bool own = phases[k] == coopui::kPrepPosted
+                              || (code == 4 && (phases[k] == coopui::kPrepWindowWait || phases[k] == coopui::kPrepWindowSeen));
+                if (coopui::PrepStep(g) != (own ? coopui::kPrepKeep : coopui::kPrepCancelForeign))
+                    Fail("owner 470: the press's own request is kept; Kenshi's own CONTINUE / LOAD / IMPORT (a request it did not post) leaves the role first");
+            }
+            g = f; g.reshowPending = 1;
+            if (coopui::PrepStep(g) != coopui::kPrepKeep) Fail("owner 470: a refused NEW GAME's window is coming back - kept");
+        }
+        coopui::PrepFacts f;
+        f.phase = coopui::kPrepWindowWait;
+        if (coopui::PrepStep(f) != coopui::kPrepKeep) Fail("owner 470: the opened NEW GAME window not up yet - kept");
+        f.windowShown = 1;
+        if (coopui::PrepStep(f) != coopui::kPrepSeen) Fail("owner 470: the opened NEW GAME window is up - seen");
+        f.requestCode = -1; f.windowShown = 0;
+        if (coopui::PrepStep(f) != coopui::kPrepKeep) Fail("owner 470: the window not up yet, the request unreadable - kept");
+        f.requestCode = 0; f.waitedMs = coopui::kPrepWindowWaitMs - 1;
+        if (coopui::PrepStep(f) != coopui::kPrepKeep) Fail("owner 470: the opened window not up yet, within its wait - kept");
+        f.waitedMs = coopui::kPrepWindowWaitMs;
+        if (coopui::PrepStep(f) != coopui::kPrepCancel) Fail("owner 470: the opened window never came up - cancelled like a back-out");
+        f.windowShown = 1;
+        if (coopui::PrepStep(f) != coopui::kPrepSeen) Fail("owner 470: the opened window up late - seen, not cancelled");
+        f.windowShown = 0; f.requestCode = -1;
+        if (coopui::PrepStep(f) != coopui::kPrepUnread) Fail("owner 470: the window never came up, the request unreadable - kept and said");
+        if (std::string(coopui::PrepCancelWhy(coopui::kPrepWindowWait)).empty() || std::string(coopui::PrepForeignWhy(2)) == coopui::PrepForeignWhy(3))
+            Fail("owner 470: the window-never-came-up and foreign-request reasons");
+        f = coopui::PrepFacts(); f.phase = coopui::kPrepWindowSeen; f.windowShown = 1;
+        if (coopui::PrepStep(f) != coopui::kPrepKeep) Fail("owner 470: the NEW GAME window is up - kept");
+        f.windowShown = 0;
+        if (coopui::PrepStep(f) != coopui::kPrepCancel) Fail("owner 470: the NEW GAME window closed with no world on its way - cancelled");
+        f.requestCode = 1;
+        if (coopui::PrepStep(f) != coopui::kPrepCancel) Fail("owner 470: a save request is no world start - cancelled");
+        f.requestCode = -1;
+        if (coopui::PrepStep(f) != coopui::kPrepUnread) Fail("owner 470: the request unreadable with the window closed - kept and said");
+        f = coopui::PrepFacts(); f.phase = coopui::kPrepArmed;
+        if (coopui::PrepStep(f) != coopui::kPrepCancel) Fail("owner 470: the panel closed with the role armed and no world on its way - cancelled");
+        f.windowShown = 1;
+        if (coopui::PrepStep(f) != coopui::kPrepCancel) Fail("owner 470: a NEW GAME window this press did not open keeps nothing");
+        f = coopui::PrepFacts(); f.phase = coopui::kPrepPosted;
+        if (coopui::PrepStep(f) != coopui::kPrepCancel) Fail("owner 470: the posted load was refused (the request cleared) - cancelled");
+        const std::string w1 = coopui::PrepCancelWhy(coopui::kPrepWindowSeen), w2 = coopui::PrepCancelWhy(coopui::kPrepPosted), w3 = coopui::PrepCancelWhy(coopui::kPrepArmed);
+        if (w1.empty() || w2.empty() || w3.empty() || w1 == w2 || w2 == w3 || w1 == w3) Fail("owner 470: each cancel says its own reason");
+        /* the left HOST's world server: done once it has ended; ended outright only past the server's own drain limit; never waited on */
+        if (coopui::NbStopStep(1, 0, 0, 0) != coopui::kNbStopDone || coopui::NbStopStep(1, 1, coopui::kNbStopGraceMs + 5, coopui::kNbStopEndWaitMs + 5) != coopui::kNbStopDone)
+            Fail("owner 470 fold: a world server that has ended is done, whatever else holds");
+        if (coopui::NbStopStep(0, 0, 0, 0) != coopui::kNbStopWait || coopui::NbStopStep(0, 0, coopui::kNbStopGraceMs - 1, 0) != coopui::kNbStopWait)
+            Fail("owner 470 fold: within the grace - asked again next tick (a server in start-up included)");
+        if (coopui::NbStopStep(0, 0, coopui::kNbStopGraceMs, 0) != coopui::kNbStopEnd) Fail("owner 470 fold: not ended within the grace - ended");
+        if (coopui::NbStopStep(0, 1, coopui::kNbStopGraceMs + 9999, coopui::kNbStopEndWaitMs - 1) != coopui::kNbStopWait) Fail("owner 470 fold: ended once - its exit is waited for, not ended twice");
+        if (coopui::NbStopStep(0, 1, coopui::kNbStopGraceMs + 9999, coopui::kNbStopEndWaitMs) != coopui::kNbStopGiveUp) Fail("owner 470 fold: the exit never seen after the end - the stop is given up, not held for ever");
+        if (coopui::kNbStopGraceMs < 60000u + 1000u) Fail("owner 470 fold: the grace covers the world server's own 60 s drain limit");
+    }
     /* item 6: the post - ready goes at once, never fails at once, a pending request is waited on (its state) up to the bound */
     if (coopui::LoadPostStep(1, 0) != coopui::kPostGo || coopui::LoadPostStep(1, 999999) != coopui::kPostGo) Fail("pp6 fold: a load the engine takes now is posted");
     if (coopui::LoadPostStep(-1, 0) != coopui::kPostFail) Fail("pp6 fold: anySavesExist() false fails at once (box A), no retry");
@@ -13447,6 +14494,7 @@ bool Mp5NotebookOk(const std::string& k, const std::string& v)
     if (k == "basepolicy") return v == "shared" || v == "owner" || v == "locked";
     if (k == "timemode") return v == "fixed" || v == "consensus";
     if (k == "profilecap") return coopprof::CapValueOk(v) != 0;   /* ui5: store_main.cpp OptionValueOk's own check */
+    if (swfee::IsOptionKey(k)) return swfee::OptionValueOk(k, v);   /* T-556: the world server's own check */
     return false;
 }
 void t_mp5_game_options_rows()
@@ -13460,11 +14508,12 @@ void t_mp5_game_options_rows()
         if (d.dflt[0] != 0 && coopui::OptCanon(i, d.dflt).empty()) Fail(std::string("default is not a legal value: ") + d.key);
         std::string v = d.dflt[0] != 0 ? coopui::OptCanon(i, d.dflt) : coopui::OptStep(i, "", 1);
         int guard = 0;
-        while (d.kind != coopui::kOptKindTick && coopui::OptCanStep(i, v, -1) && ++guard < 50) v = coopui::OptStep(i, v, -1);
+        const bool fixedRow = coopui::OptIsTick(i) || d.kind == coopui::kOptKindAmount;   /* a tick box or a typing box: no steps */
+        while (!fixedRow && coopui::OptCanStep(i, v, -1) && ++guard < 50) v = coopui::OptStep(i, v, -1);
         const std::string low = v;
         int values = 1;
         if (!Mp5NotebookOk(d.key, v)) Fail(std::string("the notebook refuses ") + d.key + "=" + v);
-        while (d.kind != coopui::kOptKindTick && coopui::OptCanStep(i, v, 1) && ++guard < 100)
+        while (!fixedRow && coopui::OptCanStep(i, v, 1) && ++guard < 100)
         {
             v = coopui::OptStep(i, v, 1);
             ++values;
@@ -13476,7 +14525,8 @@ void t_mp5_game_options_rows()
         const std::string k = d.key;
         if (d.kind == coopui::kOptKindDifficulty) { wantLow = "0.25"; wantHigh = "4"; wantN = 10; }
         else if (d.kind == coopui::kOptKindWorld) { wantLow = "0.25"; wantHigh = "2"; wantN = 8; }
-        else if (d.kind == coopui::kOptKindTick) { wantLow = d.dflt; wantHigh = d.dflt; wantN = 1; }
+        else if (fixedRow) { wantLow = d.dflt; wantHigh = d.dflt; wantN = 1; }
+        else if (k == "resurrectgrowth") { wantLow = "steady"; wantHigh = "steep"; wantN = 2; }   /* T-556 */
         else if (k == "gt.attacks") { wantLow = "0"; wantHigh = "5"; wantN = 6; }
         else if (k == "gt.limbloss") { wantLow = "0"; wantHigh = "3"; wantN = 4; }
         else if (k == "recruitmult") { wantLow = "auto"; wantHigh = "4"; wantN = 5; }
@@ -13487,7 +14537,7 @@ void t_mp5_game_options_rows()
             Fail(k + ": steps " + low + ".." + high + " (" + I(values) + ") - wanted " + wantLow + ".." + wantHigh + " (" + I(wantN) + ")");
         if (d.kind == coopui::kOptKindTick && (coopui::OptStep(i, "0", 1) != "1" || coopui::OptStep(i, "1", 1) != "0")) Fail(k + ": a tick box flips");
     }
-    if (perTab[0] != 9 || perTab[1] != 6 || perTab[2] != 4) Fail("rows per tab: " + I(perTab[0]) + "/" + I(perTab[1]) + "/" + I(perTab[2]));
+    if (perTab[0] != 9 || perTab[1] != 6 || perTab[2] != 7) Fail("rows per tab: " + I(perTab[0]) + "/" + I(perTab[1]) + "/" + I(perTab[2]));
     for (int t = 0; t < coopui::kOptTabCount; ++t) if (perTab[t] > coopui::kOptRowsShown || coopui::OptIndexOf(t, perTab[t]) != -1) Fail("a tab has more rows than the screen");
     const int gdm = coopui::OptIndexOf(coopui::kOptTabDifficulty, 0);
     if (coopui::OptShown(gdm, "1") != "1.0x" || coopui::OptShown(gdm, "0.25") != "0.25x" || coopui::OptShown(gdm, "1.5") != "1.5x"
@@ -13505,6 +14555,81 @@ void t_mp5_game_options_rows()
     was[gdm] = "1"; now[gdm] = "2"; was[pol] = "shared"; now[pol] = "shared"; now[att] = "";
     const std::vector<std::pair<std::string, std::string> > ch = coopui::OptChanged(now, was);
     if (ch.size() != 1 || ch[0].first != "gp.gdm" || ch[0].second != "2") Fail("only the changed rows are handed on: " + I((int)ch.size()));
+}
+
+/* T-556 effort 3b (decision 509): GAME OPTIONS' resurrection rows - the MULTIPLAYER tab's rows 5 to 7, the fee box's rule, the
+   line under FEE GROWTH word for word, the greying, the mods line's new place, DEFAULTS and the hand-over. */
+void t_t556f_fee_rows()
+{
+    const int on = coopui::OptIndexOfKey("resurrect"), fee = coopui::OptIndexOfKey("resurrectfee"), gr = coopui::OptIndexOfKey("resurrectgrowth");
+    if (on < 0 || fee < 0 || gr < 0) { Fail("the three rows exist"); return; }
+    if (coopui::OptIndexOf(coopui::kOptTabCoop, 4) != on || coopui::OptIndexOf(coopui::kOptTabCoop, 5) != fee || coopui::OptIndexOf(coopui::kOptTabCoop, 6) != gr
+        || coopui::OptRowOf(coopui::kOptTabCoop, fee) != 5 || coopui::OptTabRows(coopui::kOptTabCoop) != 7)
+        Fail("RESURRECTION, RESURRECTION FEE, FEE GROWTH are the MULTIPLAYER tab's rows 5, 6, 7");
+    if (std::string(coopui::OptDefs()[on].label) != "RESURRECTION" || std::string(coopui::OptDefs()[fee].label) != "RESURRECTION FEE"
+        || std::string(coopui::OptDefs()[gr].label) != "FEE GROWTH") Fail("the approved labels");
+    if (!coopui::OptIsTick(on) || coopui::OptIsTick(fee) || coopui::OptIsTick(gr) || coopui::OptDefs()[fee].kind != coopui::kOptKindAmount)
+        Fail("a tick box, a typing box, a < > row");
+    if (coopui::OptTabRows(coopui::kOptTabCoop) + 2 > coopui::kOptRowsShown) Fail("the FEE GROWTH line's two row spaces fit under the rows");
+    /* the tick */
+    if (coopui::OptStep(on, "off", 1) != "on" || coopui::OptStep(on, "on", -1) != "off" || !coopui::OptTickOn(on, "on") || coopui::OptTickOn(on, "off")
+        || coopui::OptShown(on, "on") != "" || coopui::OptCanon(on, "1") != "" || coopui::OptCanon(on, "on") != "on") Fail("the RESURRECTION tick");
+    /* FEE GROWTH: Steady < > Steep */
+    if (coopui::OptShown(gr, "steady") != "Steady" || coopui::OptShown(gr, "steep") != "Steep" || coopui::OptStep(gr, "steep", -1) != "steady"
+        || coopui::OptStep(gr, "steady", 1) != "steep" || coopui::OptCanStep(gr, "steep", 1) || coopui::OptCanStep(gr, "steady", -1)) Fail("FEE GROWTH steps");
+    /* the box: digits only, at most 6; an empty box stands for the value the screen opened with */
+    if (coopui::OptFeeBoxFilter("12a3") != "123" || coopui::OptFeeBoxFilter("1,000") != "1000" || coopui::OptFeeBoxFilter("-5") != "5"
+        || coopui::OptFeeBoxFilter("9999999") != "999999" || coopui::OptFeeBoxFilter("c.") != "" || coopui::OptFeeBoxFilter(" 25 ") != "25")
+        Fail("the box keeps digits only, six at most");
+    if (coopui::OptFeeCanon("0050") != "50" || coopui::OptFeeCanon("000") != "0" || coopui::OptFeeCanon("") != "" || coopui::OptFeeCanon("1000000") != ""
+        || coopui::OptFeeCanon("12a") != "" || coopui::OptFeeCanon("999999") != "999999") Fail("the amount's text");
+    if (coopui::OptFeeBoxValue("", "2500") != "2500" || coopui::OptFeeBoxValue("0", "2500") != "0" || coopui::OptFeeBoxValue("040", "2500") != "40")
+        Fail("an empty box goes back to the opened value");
+    if (coopui::OptCanon(fee, "1000") != "1000" || coopui::OptCanon(fee, "1000000") != "" || coopui::OptStep(fee, "1000", 1) != "1000" || coopui::OptShown(fee, "750") != "750")
+        Fail("the fee row's value");
+    if (!swfee::OptionValueOk("resurrectfee", coopui::OptCanon(fee, "999999")) || !swfee::OptionValueOk("resurrectfee", coopui::OptCanon(fee, "0")))
+        Fail("every amount the box can hold, the world server accepts");
+    /* Kenshi's money style */
+    if (coopui::OptMoneyText(0) != "c.0" || coopui::OptMoneyText(999) != "c.999" || coopui::OptMoneyText(1000) != "c.1,000"
+        || coopui::OptMoneyText(16000) != "c.16,000" || coopui::OptMoneyText(999999) != "c.999,999" || coopui::OptMoneyText(15999984000000LL) != "c.15,999,984,000,000")
+        Fail("money text: " + coopui::OptMoneyText(1000));
+    /* the line under FEE GROWTH, word for word from the approved page */
+    if (coopui::OptFeeExplain("on", "1000", "steep") != "The more of a player's brought-back characters are alive, the more the next costs: free with none, then c.1,000, c.4,000, c.9,000, c.16,000 ...")
+        Fail("the Steep line: " + coopui::OptFeeExplain("on", "1000", "steep"));
+    if (coopui::OptFeeExplain("on", "1000", "steady") != "The more of a player's brought-back characters are alive, the more the next costs: free with none, then c.1,000, c.2,000, c.3,000, c.4,000 ...")
+        Fail("the Steady line");
+    if (coopui::OptFeeExplain("on", "0", "steep") != "Bringing back a fallen character is free." || coopui::OptFeeExplain("on", "000", "steady") != "Bringing back a fallen character is free.")
+        Fail("the amount-0 line");
+    if (coopui::OptFeeExplain("off", "1000", "steep") != "" || coopui::OptFeeExplain("", "1000", "steep") != "") Fail("no line while RESURRECTION is not ticked");
+    if (coopui::OptFeeExplain("on", "2500", "steep").find("then c.2,500, c.10,000, c.22,500, c.40,000 ...") == std::string::npos
+        || coopui::OptFeeExplain("on", "999999", "steep").find("c.15,999,984 ...") == std::string::npos) Fail("the typed amount is filled in");
+    /* greying */
+    std::string v[coopui::kOptCount];
+    for (int i = 0; i < coopui::kOptCount; ++i) v[i] = coopui::OptCanon(i, coopui::OptDefs()[i].dflt);
+    if (v[on] != "off" || v[fee] != "1000" || v[gr] != "steep") Fail("DEFAULTS: not ticked, 1000, Steep");
+    if (!coopui::OptRowLit(on, v) || coopui::OptRowLit(fee, v) || coopui::OptRowLit(gr, v)) Fail("off: the fee box and FEE GROWTH grey");
+    for (int i = 0; i < coopui::kOptCount; ++i) if (i != fee && i != gr && !coopui::OptRowLit(i, v)) Fail(std::string("a row that does not depend on RESURRECTION greyed: ") + coopui::OptDefs()[i].key);
+    v[on] = "on";
+    if (!coopui::OptRowLit(fee, v) || !coopui::OptRowLit(gr, v)) Fail("on: both lit");
+    v[fee] = "0";
+    if (!coopui::OptRowLit(fee, v) || coopui::OptRowLit(gr, v)) Fail("amount 0: FEE GROWTH greys, the box stays lit");
+    /* the notes: the mods line moved under the rows (the Difficulty tab's note place) */
+    if (coopui::OptNoteText(coopui::kOptTabCoop) != "All players must use the same mods as the host."
+        || coopui::OptNoteText(coopui::kOptTabDifficulty) != "Animal nests: only affects areas not yet visited." || coopui::OptNoteText(coopui::kOptTabWorld) != "")
+        Fail("the notes under the rows");
+    /* the hand-over: only the changed rows, in the world server's words */
+    std::string was[coopui::kOptCount], now[coopui::kOptCount];
+    for (int i = 0; i < coopui::kOptCount; ++i) { was[i] = coopui::OptCanon(i, coopui::OptDefs()[i].dflt); now[i] = was[i]; }
+    now[on] = "on"; now[fee] = "2500"; now[gr] = "steady";
+    const std::vector<std::pair<std::string, std::string> > ch = coopui::OptChanged(now, was);
+    if (ch.size() != 3 || ch[0].first != "resurrect" || ch[0].second != "on" || ch[1].first != "resurrectfee" || ch[1].second != "2500"
+        || ch[2].first != "resurrectgrowth" || ch[2].second != "steady") Fail("the three rows are handed on as the world server's words: " + I((int)ch.size()));
+    for (size_t k = 0; k < ch.size(); ++k) if (!swfee::OptionValueOk(ch[k].first, ch[k].second)) Fail("the world server refuses " + ch[k].first);
+    /* the test driver reaches the tick box and the fee box */
+    const coopui::UiDriveName* t = coopui::UiDriveFind("opttick", coopui::kDriveButton);
+    const coopui::UiDriveName* te = coopui::UiDriveFind("opttick" + std::string(1, (char)('a' + coopui::OptRowOf(coopui::kOptTabCoop, on))), coopui::kDriveButton);
+    const coopui::UiDriveName* fb = coopui::UiDriveFind("fee", coopui::kDriveEdit);
+    if (t != 0 || te == 0 || std::string(te->w1) != "CoopOptTick4" || fb == 0 || std::string(fb->w1) != "SWOptFeeEdit") Fail("the driver's opttick / fee names");
 }
 
 /* mp4 (design-mpmenu1 section 6): the Hosting screen's address pick, its words and the players list. */
@@ -16527,7 +17652,10 @@ void t_pp1_ui_drive_names()
         { "worldname", "3", "CoopDlgNameEdit" }, { "profilename", "3", "CoopDlgNameEdit" },
         { "bugreport", "1", "BugReportTitleButton" }, { "bugsend", "1", "BugReportSend" }, { "bugcancel", "1", "BugReportCancel" },
         { "bugok", "1", "BugReportSentOk" }, { "bugback", "1", "BugReportFailBack" }, { "bugretry", "1", "BugReportFailRetry" },
-        { "bugtext", "3", "BugReportText" } };
+        { "bugtext", "3", "BugReportText" },
+        { "optticka", "1", "CoopOptTick0" }, { "opttickb", "1", "CoopOptTick1" }, { "opttickc", "1", "CoopOptTick2" }, { "opttickd", "1", "CoopOptTick3" },
+        { "optticke", "1", "CoopOptTick4" }, { "opttickf", "1", "CoopOptTick5" }, { "opttickg", "1", "CoopOptTick6" }, { "opttickh", "1", "CoopOptTick7" },
+        { "optticki", "1", "CoopOptTick8" }, { "fee", "3", "SWOptFeeEdit" } };
     const size_t want = sizeof(kWant) / sizeof(kWant[0]);
     size_t n = 0;
     const coopui::UiDriveName* t = coopui::UiDriveTable(&n);
@@ -17691,6 +18819,70 @@ void t_crash2_copy_body_decide()
         if (got == kCopyBodyRun || got == kCopyBodyWait) ++seen[got];
     }
     if (seen[kCopyBodyRun] == 0 || seen[kCopyBodyWait] == 0) Fail("T-511: the coverage reached run and wait");
+}
+
+void t_t500_ko_look_gate()
+{
+    using namespace coopkolook;
+    // the named branches
+    if (LookGate(0, 0, true, false, false, true, true) != kLookApply)
+        Fail("T-500: a standing, alive copy whose owner says KO, first look, knockdown held -> its look applies");
+    if (LookGate(0, 1, true, false, false, true, true) != kLookWait)
+        Fail("T-500: a lying copy keeps waiting even while its knockdown is held");
+    if (LookGate(1, 0, true, false, false, true, true) != kLookNever || LookGate(1, 0, false, false, false, true, false) != kLookNever
+        || LookGate(-1, 0, false, true, true, true, false) != kLookNever)
+        Fail("T-500: a dead (or unreadable) copy never takes a look");
+    if (LookGate(0, 0, true, false, false, true, false) != kLookWait)
+        Fail("T-500: owner says KO, knockdown not held -> wait");
+    if (LookGate(0, 0, true, false, false, false, true) != kLookWait)
+        Fail("T-500: owner says KO, not the first look -> wait");
+    if (LookGate(0, -1, true, false, false, true, true) != kLookWait)
+        Fail("T-500: an unreadable pose reads as down -> wait");
+    if (LookGate(0, 0, false, true, true, true, false) != kLookApply)
+        Fail("T-500: a dead arrival still takes its first look alive (unchanged)");
+    if (LookGate(0, 0, false, true, false, true, false) != kLookWait)
+        Fail("T-500: owner says dead, no first look wanted -> wait (unchanged)");
+    if (LookGate(0, 0, false, false, false, false, false) != kLookApply)
+        Fail("T-500: an ordinary standing copy takes its look");
+    if (LookThroughKoHold(0, 0, false, false, false, true, false) || !LookThroughKoHold(0, 0, true, false, false, true, true)
+        || LookThroughKoHold(0, 1, true, false, false, true, true))
+        Fail("T-500: only a look let through by the held knockdown is marked as such");
+    if (LookGate(0, 0, true, true, true, true, true) != kLookApply || LookThroughKoHold(0, 0, true, true, true, true, true))
+        Fail("T-500: a look the owner's 'dead' lets through (dead arrival) is not counted as the knocked-out exception");
+    // the hold is live only while present, not given up and inside the one bound
+    if (!KnockHoldLive(true, false, 0) || !KnockHoldLive(true, false, kFirstLookWaitMs - 1)
+        || KnockHoldLive(true, false, kFirstLookWaitMs) || KnockHoldLive(true, true, 0) || KnockHoldLive(false, false, 0))
+        Fail("T-500: the knockdown hold reads live only while held, not given up, inside kFirstLookWaitMs");
+    if (kFirstLookWaitMs != 5000ul) Fail("T-500: the first-look bound is 5 s");
+    // clothing: the same exception for the copy whose look went through
+    if (!ClothingThroughKoHold(0, 0, true, false, true, true)) Fail("T-500: that copy's worn items go through while standing and held");
+    if (ClothingThroughKoHold(0, 1, true, false, true, true) || ClothingThroughKoHold(1, 0, true, false, true, true)
+        || ClothingThroughKoHold(0, 0, true, false, true, false) || ClothingThroughKoHold(0, 0, true, false, false, true)
+        || ClothingThroughKoHold(0, 0, false, false, true, true) || ClothingThroughKoHold(0, 0, true, true, true, true))
+        Fail("T-500: the clothing exception needs alive, standing, owner KO (not dead), the look through it, the hold live");
+    // clothing that missed it: the look went through, alive, owner KO not dead, and the hold gone or the copy down
+    if (!ClothingMissedKoHold(0, 0, true, false, true, false) || !ClothingMissedKoHold(0, 1, true, false, true, true))
+        Fail("T-500: worn items that find the hold gone, or the copy down, are counted as missing the exception");
+    if (ClothingMissedKoHold(0, 0, true, false, true, true) || ClothingMissedKoHold(0, 0, true, false, false, false)
+        || ClothingMissedKoHold(1, 0, true, false, true, false) || ClothingMissedKoHold(0, 0, false, false, true, false)
+        || ClothingMissedKoHold(0, 0, true, true, true, false))
+        Fail("T-500: a pass, a look not through the exception, a dead copy, an owner awake or dead are not counted as a miss");
+    for (int d = 0; d < 2; ++d) for (int w = 0; w < 2; ++w) for (int k = 0; k < 2; ++k) for (int od = 0; od < 2; ++od)
+    for (int lt = 0; lt < 2; ++lt) for (int h = 0; h < 2; ++h)
+        if (ClothingMissedKoHold(d, w, k != 0, od != 0, lt != 0, h != 0)
+            && ClothingThroughKoHold(d, w, k != 0, od != 0, lt != 0, h != 0))
+            Fail("T-500: worn items never both pass the exception and miss it");
+    // the whole table, against its rule, with coverage of every verdict
+    int seen[3] = { 0, 0, 0 };
+    for (int d = 0; d < 2; ++d) for (int w = 0; w < 2; ++w) for (int k = 0; k < 2; ++k) for (int od = 0; od < 2; ++od)
+    for (int dw = 0; dw < 2; ++dw) for (int f = 0; f < 2; ++f) for (int h = 0; h < 2; ++h)
+    {
+        const int got = LookGate(d, w, k != 0, od != 0, dw != 0, f != 0, h != 0);
+        const int want = d ? kLookNever : w ? kLookWait : (od && !dw) ? kLookWait : (k && !(f && h)) ? kLookWait : kLookApply;
+        if (got != want) Fail("T-500: the look gate answers by its table for every input");
+        if (got >= 0 && got < 3) ++seen[got];
+    }
+    if (seen[kLookApply] == 0 || seen[kLookWait] == 0 || seen[kLookNever] == 0) Fail("T-500: the coverage reached apply, wait and never");
 }
 
 /* T-293: the human test is the appearance object's vtable pointer against the AppearanceHumanVt row. Numbers from T625's
@@ -21395,6 +22587,59 @@ void t_p105b2_serve_step()
     if (HoldServeStep(0, 1, 1, 0, 1) != kReasonBusy) Fail("P105b2: a full table is busy (asked again)");
     if (HoldServeStep(0, 1, 1, 0, 0) != kHsTake) Fail("P105b2: the ordinary case takes the item");
 }
+void t_t159_box_to_box()
+{
+    using namespace coophold;
+    /* the asker: srcIsBox, dstIsBox, dstMine, dstHeld, dstKeyHas, dstInBag, dstFacade, srcWriterSlot, dstWriterSlot */
+    if (LandIntoOtherBox(1, 1, 0, 1, 1, 0, 0, 3, 3) != 1) Fail("T-159: two boxes the same other game writes - a LAND into the second box");
+    if (LandIntoOtherBox(1, 1, 0, 1, 1, 0, 0, -1, -1) != 1) Fail("T-159: no slot known for either box - both go to the one linked game");
+    if (LandIntoOtherBox(1, 1, 0, 1, 1, 0, 0, 3, 4) != 0) Fail("T-159: the second box is written by a third game - the old road");
+    if (LandIntoOtherBox(1, 1, 0, 1, 1, 0, 0, 3, -1) != 0) Fail("T-159: one writer unknown - never guessed equal");
+    if (LandIntoOtherBox(1, 1, 1, 0, 1, 0, 0, 3, 3) != 0) Fail("T-159: this game writes the second box - the T-164 take road, not a LAND");
+    if (LandIntoOtherBox(1, 1, 0, 0, 1, 0, 0, 3, 3) != 0) Fail("T-159: no holder known for the second box - no LAND");
+    if (LandIntoOtherBox(1, 1, 0, 1, 0, 0, 0, 3, 3) != 0) Fail("T-159: a box with no key cannot be named");
+    if (LandIntoOtherBox(1, 1, 0, 1, 1, 1, 0, 3, 3) != 0) Fail("T-159: a square inside a pack has no LAND form");
+    if (LandIntoOtherBox(1, 1, 0, 1, 1, 0, 1, 3, 3) != 0) Fail("T-159: a shop facade's half is the shop road's");
+    if (LandIntoOtherBox(0, 1, 0, 1, 1, 0, 0, 3, 3) != 0) Fail("T-159: out of a character - not this road");
+    if (LandIntoOtherBox(1, 0, 0, 1, 1, 0, 0, 3, 3) != 0) Fail("T-159: into a character - not this road");
+    /* the writer: otherBox, targetWriter, targetAccess, targetShopPiece */
+    if (LandTargetOpen(0, 0, 0, 1) != 1) Fail("T-159: a LAND inside one container is never barred here");
+    if (LandTargetOpen(1, 1, 1, 0) != 1) Fail("T-159: the writer writes both boxes and the policy lets the player in - open");
+    if (LandTargetOpen(1, 0, 1, 0) != 0) Fail("T-159: the writer does not write the target box - barred (the item goes home)");
+    if (LandTargetOpen(1, 1, 0, 0) != 0) Fail("T-159: the target box's access policy refuses - barred");
+    if (LandTargetOpen(1, 1, 1, 1) != 0) Fail("T-159: a shop piece is never filled by another player's cursor - barred");
+    /* a barred target plans with no target square: back to its own square, then any square of its own box, else kept */
+    if (LandPlan(kHowPlaced, 0, 0, 1, 1) != kLpOld) Fail("T-159: a barred or full target - back to its own square");
+    if (LandPlan(kHowPlaced, 0, 0, 0, 1) != kLpFree) Fail("T-159: its own square taken - any free square");
+    if (LandPlan(kHowPlaced, 0, 0, 0, 0) != kLpKeep || LandWhereOf(kLpKeep) != kWhereKept) Fail("T-159: no room anywhere - kept, never dropped");
+    if (LandPlan(kHowPlaced, 1, 0, 1, 1) != kLpPlaceExact) Fail("T-159: an open target square - placed exactly there");
+    /* otherBox, targetOpen, freeInTarget, freeInOwn */
+    if (LandFreeFrom(0, 1, 1, 1) != kLfTarget || LandFreeFrom(0, 1, 0, 1) != kLfNone) Fail("T-159: one container - its own free squares only");
+    if (LandFreeFrom(1, 1, 1, 1) != kLfTarget) Fail("T-159: into another box - a free square of the target first");
+    if (LandFreeFrom(1, 1, 0, 1) != kLfOwn) Fail("T-159: the target box is full - a free square of the item's own box");
+    if (LandFreeFrom(1, 0, 1, 1) != kLfOwn) Fail("T-159: a barred target is never filled - its own box");
+    if (LandFreeFrom(1, 1, 0, 0) != kLfNone) Fail("T-159: both boxes full - none (kept)");
+    if (LandFreeFrom(1, 0, 1, 0) != kLfNone) Fail("T-159: a barred target is never filled, even when the item's own box is full - none (kept)");
+    /* the exact target square taken, the target box has room: a free square there before the way home (freeTargetFirst) */
+    if (LandPlan(kHowPlaced, 0, 0, 1, 1, 0, 1) != kLpFree) Fail("T-159: the target square taken, the target box has room - its first free square, not home");
+    if (LandPlan(kHowPlaced, 1, 0, 1, 1, 0, 1) != kLpPlaceExact) Fail("T-159: the target square free - placed exactly there, not on a free square");
+    if (LandPlan(kHowMerged, 0, 1, 1, 1, 0, 1) != kLpMergeExact) Fail("T-159: a merge onto the target stack still comes first");
+    if (LandPlan(kHowPlaced, 0, 0, 1, 0, 0, 1) != kLpOld) Fail("T-159: no free square found - home to its own square");
+    if (LandPlan(kHowPlaced, 0, 0, 1, 1, 0, 0) != kLpOld) Fail("T-159: the free square is the own box's (target barred or full) - its own square first");
+    /* a split that cannot land: back onto the stack it came off (mergeOldOk) before any free square, as HdPutBack */
+    if (LandPlan(kHowPlaced, 0, 0, 0, 1, 1, 0) != kLpMergeOld || LandWhereOf(kLpMergeOld) != kWhereOld) Fail("T-159: a refused split merges back onto its own stack (where=old)");
+    if (LandPlan(kHowPlaced, 0, 0, 0, 0, 1, 0) != kLpMergeOld) Fail("T-159: a refused split merges back even with no free square - never kept");
+    if (LandPlan(kHowPlaced, 0, 0, 1, 1, 1, 0) != kLpOld) Fail("T-159: the own square free (the stack gone) - placed there");
+    if (LandPlan(kHowPlaced, 0, 0, 0, 1, 0, 0) != kLpFree) Fail("T-159: the own stack full or another record - a free square");
+    if (LandPlan(kHowPlaced, 0, 0, 0, 1, 1, 1) != kLpFree) Fail("T-159: a split into the target box with room there - the target's free square first");
+    /* the asker's re-read of the target box: reask, otherBox, targetMineNow */
+    if (LandTargetReread(0, 1, 1) != kRrNone) Fail("T-159: an exact answer - nothing re-read");
+    if (LandTargetReread(1, 0, 1) != kRrNone) Fail("T-159: a LAND inside one container - no second box");
+    if (LandTargetReread(1, 1, 0) != kRrAsk) Fail("T-159: the target box written by another game - the ordinary ask");
+    if (LandTargetReread(1, 1, 1) != kRrPull) Fail("T-159: this game writes the target box now - pulled from the previous writer, never kept as shown");
+    /* a drop into another box is named like a drop into the same container */
+    if (HowAtDrop(1, 1, 0, 0) != kHowMerged || HowAtDrop(1, 0, 1, 0) != kHowSwap || HowAtDrop(1, 0, 0, 0) != kHowPlaced) Fail("T-159: placed / merged / swapped into the other box");
+}
 void t_p105b2_land_plan()
 {
     using namespace coophold;
@@ -23862,10 +25107,8 @@ void t_hire_done_to_every_game()
 void t_stale_drop_and_sweep()
 {
     using namespace coopsquad;
-    if (StaleDropGoesOn(0, 1) != 1) Fail("another game's file with another player present: cancelled");
-    if (StaleDropGoesOn(0, 0) != 0) Fail("another game's file with nobody else in the world: thrown away");
-    if (StaleDropGoesOn(1, 0) != 1) Fail("a refused context platoon's drop was cancelled because this game is alone - the copy stays awake");
-    if (StaleDropGoesOn(1, 1) != 1) Fail("a refused context platoon's drop with others present: cancelled");
+    if (StaleDropGoesOn(1) != 1) Fail("another game's file with another player present: cancelled");
+    if (StaleDropGoesOn(0) != 0) Fail("another game's file with nobody else in the world: thrown away");
     if (StaleSweepStep(0, 1, 1) != kStaleSweepIdle) Fail("no sweep armed: it ran");
     if (StaleSweepStep(1, 0, 0) != kStaleSweepWait) Fail("armed, the world still loading: disarmed before a world (an arrival during the load is lost)");
     if (StaleSweepStep(1, 0, 1) != kStaleSweepWait) Fail("armed, no world yet: ran");
@@ -24011,19 +25254,19 @@ void t_m11a_roster_round_trip()
     RosterSortBySlot(&rows);
     if (rows[0].slot != 0 || rows[1].slot != 1 || rows[2].slot != 2) Fail("the roster is not sorted by slot");
     std::vector<char> b;
-    if (!RosterEncode(rows, &b)) { Fail("a three-row roster was refused"); return; }
-    std::vector<RosterRow> back;
-    if (!RosterDecode(&b[0], b.size(), &back) || back.size() != 3) { Fail("the roster did not come back"); return; }
+    if (!RosterEncode(rows, 3, &b)) { Fail("a three-row roster was refused"); return; }
+    std::vector<RosterRow> back; unsigned wp = 0;
+    if (!RosterDecode(&b[0], b.size(), &back, &wp) || back.size() != 3 || wp != 3) { Fail("the roster did not come back"); return; }
     if (back[0].name != "PlayerA" || back[0].op != 1 || back[0].stage != (unsigned)kStageInWorld) Fail("row 0 changed on the way");
     if (back[1].name.size() != kNameMax || back[1].stage != (unsigned)kStageLoading) Fail("a long name was not cut to the bound");
     if (back[2].name != "PlayerC" || back[2].viewDist != 1500.5f || back[2].slot != 2) Fail("row 2 changed on the way");
-    if (RosterDecode(&b[0], b.size() - 1, &back) || RosterDecode(0, 0, &back)) Fail("a short roster decoded");
+    if (RosterDecode(&b[0], b.size() - 1, &back, &wp) || RosterDecode(0, 0, &back, &wp)) Fail("a short roster decoded");
     std::vector<char> longer(b); longer.push_back(0);
-    if (RosterDecode(&longer[0], longer.size(), &back)) Fail("a roster with trailing bytes decoded");
+    if (RosterDecode(&longer[0], longer.size(), &back, &wp)) Fail("a roster with trailing bytes decoded");
     std::vector<char> bad(b); const unsigned st = 9; std::memcpy(&bad[4 + 4], &st, 4);
-    if (RosterDecode(&bad[0], bad.size(), &back)) Fail("a roster row with an unknown stage decoded");
+    if (RosterDecode(&bad[0], bad.size(), &back, &wp)) Fail("a roster row with an unknown stage decoded");
     std::vector<char> empty; std::vector<RosterRow> none;
-    if (!RosterEncode(none, &empty) || !RosterDecode(&empty[0], empty.size(), &back) || !back.empty()) Fail("an empty roster did not round-trip");
+    if (!RosterEncode(none, 0, &empty) || !RosterDecode(&empty[0], empty.size(), &back, &wp) || !back.empty() || wp != 0) Fail("an empty roster did not round-trip");
     const std::string t = RosterText(rows, 2);
     if (t.find("slot 2 'PlayerC' title (this game)") == std::string::npos || t.find("slot 0 'PlayerA' in-world operator") == std::string::npos) Fail("the roster line does not name each player's stage");
 }
@@ -24313,13 +25556,42 @@ std::string T313ReadFile(const char* path)
     std::fclose(f);
     return out;
 }
+/* The loader keeps every AddrReg binding in a fixed registry (addrtable.h kAddrMaxRegs); one binding too many disables the whole
+   mod at load ("addrRegOverflow"). Counts the bindings in the plugin's sources the way they are written
+   ("coop::AddrReg <name>(" or "AddrReg <name>(") and fails with room to spare. Runs from src\coop-test. */
+void t_address_bindings_fit()
+{
+    long bindings = 0;
+    const char* const pats[2] = { "../coop-plugin/*.cpp", "../coop-plugin/*.h" };
+    for (int k = 0; k < 2; ++k)
+    {
+        struct _finddata_t fd;
+        intptr_t h = _findfirst(pats[k], &fd);
+        if (h == -1) { if (k == 0) Fail("no plugin source found under ../coop-plugin (the suite runs from src/coop-test)"); continue; }
+        do
+        {
+            const std::string text = T313ReadFile((std::string("../coop-plugin/") + fd.name).c_str());
+            for (size_t at = text.find("AddrReg "); at != std::string::npos; at = text.find("AddrReg ", at + 8))
+            {
+                size_t q = at + 8;
+                while (q < text.size() && (std::isalnum((unsigned char)text[q]) || text[q] == '_')) ++q;
+                if (q > at + 8 && q < text.size() && text[q] == '(') ++bindings;
+            }
+        } while (_findnext(h, &fd) == 0);
+        _findclose(h);
+    }
+    if (bindings < 400) Fail("only " + D((double)bindings) + " AddrReg bindings counted - the count is not reading the plugin's sources");
+    if (bindings + 64 > coopaddr::kAddrMaxRegs)
+        Fail(D((double)bindings) + " AddrReg bindings against a registry of " + D((double)coopaddr::kAddrMaxRegs) + " - raise coopaddr::kAddrMaxRegs (addrtable.h) before the mod disables itself at load");
+}
 void t_t313_protocol_63_both_sides()
 {
-    if (coopfeed::kFeedProtocol != 69 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 69) Fail("the feed's protocol/message numbers are not 69/58");
+    if (coopfeed::kFeedProtocol != 87 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 87) Fail("the feed's protocol/message numbers are not 87/58");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
-    if (plugin.find("const unsigned int kStoreProtocol = 69;") == std::string::npos) Fail("the plugin does not speak world-server protocol 69");
-    if (server.find("const unsigned int kProtocol = 69;") == std::string::npos) Fail("the world server does not speak protocol 69");
+    if (plugin.find("const unsigned int kStoreProtocol = 87;") == std::string::npos) Fail("the plugin does not speak world-server protocol 87");
+    if (server.find("const unsigned int kProtocol = 87;") == std::string::npos) Fail("the world server does not speak protocol 87");
+    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 87u) Fail("OWED is not 63 (protocol 87) on both sides and in owedpop.h");
     if (plugin.find("kStoreMsgBundle = 59;") == std::string::npos || server.find("MSG_BUNDLE = 59") == std::string::npos || coopbundle::kMsgBundle != 59u) Fail("BUNDLE is not 59 on both sides and in sendbundle.h");
     if (plugin.find("kStoreMsgRecordFeed = 58;") == std::string::npos || server.find("MSG_RECORD_FEED = 58") == std::string::npos) Fail("RECORD_FEED is not 58 on both sides");
 }
@@ -25184,6 +26456,26 @@ void t_a1b2f3_fold3()
         if ((coopsquad::ContextWake(1, heldMine, 1) == coopsquad::kCtxWakeRefuse) != (coopsquad::ContextSleepWrite(1, 0, sleeps[i][0], sleeps[i][1]) == coopsquad::kCtxSleepRefuseContext))
             Fail("H060: the wake and sleep rules disagree about a context platoon");
     }
+    /* H067 (T954 A, 101 wakes 5 s apart): a context platoon that sleeps holding none of this game's people is removed at that sleep -
+       exactly the platoons whose next wake the wake rule would refuse */
+    for (int i = 0; i < 4; ++i)
+    {
+        const int heldMine = coopsquad::ContextSleepWrite(1, 0, sleeps[i][0], sleeps[i][1]) == coopsquad::kCtxSleepGoContextWithMine ? 1 : 0;
+        if (coopsquad::ContextSleepDrop(1, heldMine) != (coopsquad::ContextWake(1, heldMine, 1) == coopsquad::kCtxWakeRefuse ? 1 : 0))
+            Fail("H067: the sleep removal and the wake rule disagree about a context platoon");
+    }
+    if (coopsquad::ContextSleepDrop(1, 0) != 1) Fail("H067 (T954 A 234.737): a player's emptied squad copy went to sleep and was kept - the engine wakes it every 5 s");
+    if (coopsquad::ContextSleepDrop(1, 1) != 0) Fail("H067: a context platoon holding a person this game runs (a take-back) was removed");
+    if (coopsquad::ContextSleepDrop(0, 0) != 0) Fail("H067: a squad that is not a context platoon was removed at its sleep");
+    using namespace coopsquad;
+    if (ContextDropStep(0, 0, 1, 0, 1, 0) != kCtxDropCancel) Fail("H067: a platoon no longer in the context map (superseded, retired, hired from) was removed");
+    if (ContextDropStep(1, 1, 1, 0, 1, 0) != kCtxDropCancel) Fail("H067: a context platoon whose last sleep held a person this game runs was removed");
+    if (ContextDropStep(1, 0, 0, 0, 0, 0) != kCtxDropRetry) Fail("H067: an unreadable platoon was acted on");
+    if (ContextDropStep(1, 0, 1, 0, 1, 0) != kCtxDropDestroy) Fail("H067 (T954 A): the asleep context platoon in a stand-in faction was not destroyed");
+    if (ContextDropStep(1, 0, 1, 0, 0, 0) != kCtxDropRetry) Fail("H067: an asleep platoon not found in its own faction's sleeping list was destroyed");
+    if (ContextDropStep(1, 0, 1, 1, 0, 0) != kCtxDropRetire) Fail("H067: a refused wake's awake body was left standing");
+    if (ContextDropStep(1, 0, 1, 1, 0, 1) != kCtxDropKeepLive) Fail("H067: an announcement's live copy in a reused context platoon was removed");
+    if (ContextDropStep(1, 0, 1, 1, 1, 2) != kCtxDropKeepLive) Fail("H067: a reused context platoon with copies was removed");
 }
 /* ---- M7a A1 BUILD 1 (owner decision 347 a; src/common/liveowner.h; design .modding/investigations/m7a-a1-design-2026-10-02.md sec. 3) [a1b1-t0] ---- */
 void t_a1b1_world_first_route()
@@ -26504,7 +27796,7 @@ void t_t429_format_decide()
     const std::vector<unsigned int> s = FormatSteps(1, 4);
     if (s.size() != 3 || s[0] != 1 || s[1] != 2 || s[2] != 3 || FormatSteps(0, 1).size() != 1 || FormatSteps(0, 1)[0] != 0 || !FormatSteps(2, 2).empty())
         Fail("the steps run in order from the found number to the known one");
-    if (FolderFormatKnown(kKindWorld) != 1 || FolderFormatKnown(kKindJoined) != 1 || FolderFormatKnown(kKindRecords) != 1) Fail("each kind starts at 1");
+    if (FolderFormatKnown(kKindWorld) != 2 || FolderFormatKnown(kKindJoined) != 1 || FolderFormatKnown(kKindRecords) != 1) Fail("world 2 (the '#' faction field), joined and records 1");
     if (std::string(swnames::kFormatFile) != "format.txt") Fail("the file name, from names.h");
 }
 void t_t490_t429_words()
@@ -26601,7 +27893,7 @@ void t_t490_lobby_folder_format()
     const std::string ownOther = coopworld::WorldTxtFormatWithId("mptest-t912", 1700000000LL, "1700000000-00000001", false);
     const std::string ownSame = coopworld::WorldTxtFormatWithId("mptest-t912", 1791032144LL, id, false);
     const std::string f99j = swformat::FormatText(swformat::kKindJoined, 99), f1j = swformat::FormatText(swformat::kKindJoined, 1);
-    const std::string f99w = swformat::FormatText(swformat::kKindWorld, 99), f1w = swformat::FormatText(swformat::kKindWorld, 1);
+    const std::string f99w = swformat::FormatText(swformat::kKindWorld, 99), f1w = swformat::FormatText(swformat::kKindWorld, swformat::kWorldFolderFormat);
     bool joined = false; unsigned n = 0; std::string why;
     if (LinkFolderFormatDecide(ownOther, id, true, f1w, true, f99j, &n, &why, &joined) != swformat::kFormatRefuseNewer || !joined || n != 99)
         Fail("a joined folder at format 99 refuses the link (this computer runs another world of that name)");
@@ -26717,6 +28009,434 @@ void t_nametag_colours()
         if (r != w[i].r || g != w[i].g || b != w[i].b)
             Fail("level " + I(w[i].level) + " colour " + I(r) + "," + I(g) + "," + I(b) + " is not the approved one");
     }
+}
+void t_nametag_outline()
+{
+    using namespace nametag;
+    /* one copy each way - up, down, left, right - every one exactly 1 px from the line */
+    bool up = false, down = false, left = false, right = false;
+    int sx = 0, sy = 0;
+    for (int k = 0; k < kOutlineCopies; ++k)
+    {
+        int dx = 9, dy = 9;
+        OutlineOffset(k, &dx, &dy);
+        if (dx * dx + dy * dy != 1) Fail("outline copy " + I(k) + " is not 1 px from the line");
+        if (dx == 0 && dy == -1) { if (up) Fail("two copies up"); up = true; }
+        if (dx == 0 && dy == 1)  { if (down) Fail("two copies down"); down = true; }
+        if (dx == -1 && dy == 0) { if (left) Fail("two copies left"); left = true; }
+        if (dx == 1 && dy == 0)  { if (right) Fail("two copies right"); right = true; }
+        sx += dx; sy += dy;
+    }
+    if (!(up && down && left && right)) Fail("the outline misses a side");
+    if (sx != 0 || sy != 0)             Fail("the outline leans to one side");
+    int dx = 9, dy = 9;
+    OutlineOffset(kOutlineCopies, &dx, &dy);
+    if (dx != 0 || dy != 0)             Fail("an index past the copies moves nothing");
+}
+/* T-545: THE PLAYERS TAB (src/common/playerstab.h, the header playerstab.cpp and relations.cpp compile). */
+void t_playerstab_tab_place()
+{
+    using namespace playerstab;
+    /* PLAYERS after the game's seven: none of the numbers the game's code switches on or compares with (0..6) is PLAYERS */
+    if (kTabIndex != kEngineTabCount || kEngineTabCount != 7 || std::string(kTabCaption) != "PLAYERS") Fail("PLAYERS sits after AI");
+    const char* order[7] = { "MAP", "FACTION", "RESEARCH", "CRAFTING", "SQUADS", "DIALOGUE", "AI" };
+    for (int e = 0; e < 7; ++e)
+    {
+        if (std::string(EngineTabCaption(e)) != order[e]) Fail("the game's tab " + I(e) + " is " + order[e]);
+        if (e == kTabIndex || std::string(EngineTabCaption(e)) == kTabCaption) Fail("game tab " + I(e) + " is on PLAYERS");
+    }
+    if (std::string(EngineTabCaption(kTabIndex)) != "" || std::string(EngineTabCaption(-1)) != "") Fail("PLAYERS's position is no game tab");
+    for (int k = 0; k < kEngineTabNumbersUsed; ++k)
+    {
+        const int n = EngineTabNumberUsed(k);
+        if (n < 0 || n >= kEngineTabCount || n == kTabIndex) Fail("a number the game's code uses (" + I(n) + ") is PLAYERS or no game tab");
+    }
+    if (EngineTabNumberUsed(kEngineTabNumbersUsed) != -1) Fail("past the list");
+    if (std::string(EngineTabCaption(kFactionTab)) != "FACTION" || std::string(EngineTabCaption(3)) != "CRAFTING") Fail("FACTION / the tutorial's CRAFTING keep their positions");
+}
+void t_playerstab_rows()
+{
+    using namespace playerstab;
+    RowIn in;
+    in.slot = 3; in.rosterName = " Kim "; in.placeholder = "Player 3"; in.faction = "Iron Wolves";
+    in.you = nametag::kFriendly; in.them = nametag::kHostile; in.online = true;
+    RowView r = RowFor(in);
+    /* the name in the tag's colour: the worse of the two (they are hostile -> red) */
+    if (r.cell[0] != "#e65139Kim") Fail("player cell: " + r.cell[0]);
+    if (r.cell[1] != "Iron Wolves" || r.cell[2] != "Ally" || r.cell[3] != "Hostile" || r.cell[4] != "Online") Fail("row cells");
+    if (r.you != nametag::kFriendly || r.tag != nametag::kHostile || r.faction != "Iron Wolves" || r.slot != 3) Fail("row levels");
+    /* both ally -> green; offline */
+    in.them = nametag::kFriendly; in.online = false;
+    r = RowFor(in);
+    if (r.cell[0] != "#5cb473Kim" || r.cell[4] != "Offline") Fail("ally row: " + r.cell[0] + " " + r.cell[4]);
+    /* no roster name: the name remembered this session, else the placeholder */
+    in.rosterName = ""; in.rememberedName = "Kim"; r = RowFor(in);
+    if (r.cell[0] != "#5cb473Kim") Fail("remembered name");
+    in.rememberedName = "  "; r = RowFor(in);
+    if (r.cell[0] != "#5cb473Player 3") Fail("placeholder name: " + r.cell[0]);
+    /* unread directions count as neutral (the tag's rule), and the YOU column then reads Neutral */
+    in.you = nametag::kUnknown; in.them = nametag::kUnknown; r = RowFor(in);
+    if (r.cell[2] != "Neutral" || r.cell[3] != "Neutral" || r.you != nametag::kNeutral || r.cell[0].compare(0, 7, "#f0cd57") != 0) Fail("unread row");
+    /* a '#' typed in a name or a faction is shown, never read as a colour */
+    in.rosterName = "#1 Kim"; in.faction = "The #Blades"; r = RowFor(in);
+    if (r.cell[0] != "#f0cd57##1 Kim" || r.cell[1] != "The ##Blades" || r.faction != "The #Blades") Fail("hash escaped: " + r.cell[0] + " / " + r.cell[1]);
+    if (ColourCode(nametag::kFriendly) != "#5cb473" || ColourCode(nametag::kNeutral) != "#f0cd57" || ColourCode(nametag::kHostile) != "#e65139") Fail("tag colours");
+    /* order and identity */
+    std::vector<RowView> v(3);
+    v[0].slot = 7; v[1].slot = 2; v[2].slot = 5;
+    SortBySlot(&v);
+    if (v[0].slot != 2 || v[1].slot != 5 || v[2].slot != 7) Fail("rows by slot");
+    std::vector<RowView> w = v;
+    if (!SameSlots(v, w)) Fail("same slots");
+    w[1].slot = 6;
+    if (SameSlots(v, w)) Fail("a different player is a rebuild");
+    w.pop_back();
+    if (SameSlots(v, w)) Fail("a player gone is a rebuild");
+    if (RowOfSlot(v, 5) != 1 || RowOfSlot(v, 9) != -1) Fail("row of slot");
+}
+void t_playerstab_bottom_and_press()
+{
+    using namespace playerstab;
+    std::vector<RowView> rows(2);
+    rows[0].slot = 1; rows[0].faction = "Dust Kings"; rows[0].you = nametag::kNeutral;
+    rows[1].slot = 4; rows[1].faction = "Iron Wolves"; rows[1].you = nametag::kHostile;
+    Bottom b = BottomFor(rows, -1);
+    if (b.selected || b.line != "Select a player." || b.ticked != -1) Fail("nothing selected");
+    b = BottomFor(rows, 4);
+    if (!b.selected || b.line != "YOUR STANCE TOWARDS IRON WOLVES" || b.ticked != 2) Fail("selected: " + b.line);
+    b = BottomFor(rows, 9);
+    if (b.selected || b.line != "Select a player.") Fail("a selected player no longer listed");
+    /* exactly one ticked, in the buttons' order ALLY NEUTRAL HOSTILE */
+    if (std::string(ButtonCaption(0)) != "ALLY" || std::string(ButtonCaption(1)) != "NEUTRAL" || std::string(ButtonCaption(2)) != "HOSTILE") Fail("button captions");
+    if (std::string(LevelVerb(0)) != "ally" || std::string(LevelVerb(1)) != "neutral" || std::string(LevelVerb(2)) != "hostile") Fail("relate words");
+    for (int k = 0; k < 3; ++k)
+        for (int t = -1; t < 3; ++t)
+        {
+            const int p = PressFor(k, t);
+            const int want = (k == t) ? kPressNothing : (k == 2 ? kPressConfirm : kPressSet);
+            if (p != want) Fail("press " + I(k) + " with " + I(t) + " ticked");
+        }
+    if (PressFor(3, 0) != kPressNothing || PressFor(-1, 0) != kPressNothing) Fail("no such button");
+}
+void t_playerstab_words()
+{
+    using namespace playerstab;
+    if (BoxText(" Iron Wolves ") != "Become hostile towards Iron Wolves? Your people will attack theirs on sight, and theirs will fight back.") Fail("box text");
+    if (std::string(kBoxTitle) != "SET HOSTILE" || std::string(kBoxCancel) != "CANCEL" || std::string(kBoxConfirm) != "HOSTILE") Fail("box words");
+    if (MyLine(2, "Iron Wolves") != "You are now hostile towards Iron Wolves.") Fail("hostile line");
+    if (MyLine(0, "Iron Wolves") != "You are now allies of Iron Wolves.") Fail("ally line");
+    if (MyLine(1, "Iron Wolves") != "You are now neutral towards Iron Wolves.") Fail("neutral line");
+    if (StanceLine("the rusty blades") != "YOUR STANCE TOWARDS THE RUSTY BLADES") Fail("stance line in capitals");
+    const char* heads[5] = { "PLAYER", "FACTION", "YOU", "THEM", "STATUS" };
+    for (int c = 0; c < kColumns; ++c) if (std::string(ColumnHead(c)) != heads[c]) Fail("column " + I(c));
+    const int widths[6] = { 400, 657, 1200, 33, 0, -50 };
+    for (int i = 0; i < 6; ++i)
+    {
+        int cw[kColumns];
+        ColumnWidths(widths[i], cw);
+        int sum = 0;
+        for (int c = 0; c < kColumns; ++c) { if (cw[c] < 0) Fail("a negative column for width " + I(widths[i])); sum += cw[c]; }
+        if (sum != (widths[i] > 0 ? widths[i] : 0)) Fail("columns fill the width " + I(widths[i]) + " (" + I(sum) + ")");
+    }
+    /* out of range: nothing */
+    if (std::string(ButtonCaption(3)) != "" || std::string(ButtonCaption(-1)) != "") Fail("button caption out of range");
+    if (std::string(LevelVerb(3)) != "" || std::string(LevelVerb(-1)) != "") Fail("level verb out of range");
+    if (std::string(ColumnHead(kColumns)) != "" || std::string(ColumnHead(-1)) != "" || ColumnPercent(kColumns) != 0) Fail("column out of range");
+    if (Fill("no key here", "F") != "no key here") Fail("Fill with no {1}");
+    if (Fill("{1} and {1}", " F ") != "F and {1}") Fail("Fill fills the one {1} the engine's sentences hold");
+    /* a '#' in a faction name is shown, never read as a colour, wherever the name appears */
+    if (StanceLine("The #Blades") != "YOUR STANCE TOWARDS THE ##BLADES") Fail("stance line escapes: " + StanceLine("The #Blades"));
+    if (BoxText("#1") != "Become hostile towards ##1? Your people will attack theirs on sight, and theirs will fight back.") Fail("box text escapes");
+    if (MyLine(0, "#1") != "You are now allies of ##1." || MyLine(1, "#1") != "You are now neutral towards ##1." || MyLine(2, "#1") != "You are now hostile towards ##1.") Fail("message lines escape");
+    std::vector<std::string> n = TheirNotices(0.0f, false, -100.0f, false, "#1");
+    if (n.size() != 1 || n[0] != "##1 are now hostile towards you") Fail("their line escapes");
+}
+void t_playerstab_their_notices()
+{
+    using namespace playerstab;
+    std::vector<std::string> n = TheirNotices(0.0f, false, -100.0f, false, "Iron Wolves");
+    if (n.size() != 1 || n[0] != "Iron Wolves are now hostile towards you") Fail("neutral -> hostile");
+    n = TheirNotices(-100.0f, false, 0.0f, false, "Iron Wolves");
+    if (n.size() != 1 || n[0] != "Iron Wolves are no longer hostile towards you") Fail("hostile -> neutral");
+    n = TheirNotices(0.0f, false, 100.0f, false, "Iron Wolves");
+    if (n.size() != 1 || n[0] != "Iron Wolves are now your allies") Fail("neutral -> ally");
+    n = TheirNotices(100.0f, false, 0.0f, false, "Iron Wolves");
+    if (n.size() != 1 || n[0] != "Iron Wolves are no longer your ally") Fail("ally -> neutral");
+    /* ally straight to hostile: both of the engine's lines, in its order */
+    n = TheirNotices(100.0f, false, -100.0f, false, "Iron Wolves");
+    if (n.size() != 2 || n[0] != "Iron Wolves are now hostile towards you" || n[1] != "Iron Wolves are no longer your ally") Fail("ally -> hostile");
+    n = TheirNotices(-100.0f, false, 100.0f, false, "Iron Wolves");
+    if (n.size() != 2 || n[0] != "Iron Wolves are no longer hostile towards you" || n[1] != "Iron Wolves are now your allies") Fail("hostile -> ally");
+    /* the table's rule (nametag::LevelOf): -30 is hostile, 50 is ally - a line exactly when the THEM column changes level */
+    if (TheirNotices(-29.0f, false, -30.0f, false, "F").size() != 1) Fail("-30 is the enemy line");
+    if (TheirNotices(-30.0f, false, -29.0f, false, "F").size() != 1) Fail("leaving -30");
+    if (TheirNotices(40.0f, false, 50.0f, false, "F").size() != 1) Fail("50 is ally, as the table shows it");
+    if (TheirNotices(50.0f, false, 50.5f, false, "F").size() != 0) Fail("ally to ally is no line");
+    if (TheirNotices(-100.0f, false, -100.0f, false, "F").size() != 0 || TheirNotices(0.0f, false, 10.0f, false, "F").size() != 0) Fail("no crossing, no line");
+    /* the ally flag is the same rule: the table shows Ally, so the sentences say so */
+    for (float v = -20.0f; v <= 40.0f; v += 10.0f)
+    {
+        const int lv = nametag::LevelOf(v, true);
+        n = TheirNotices(v, true, v, false, "F");
+        if (lv != nametag::kFriendly || n.size() != 1 || n[0] != "F are no longer your ally") Fail("flag cleared: no longer ally at " + I((int)v));
+        n = TheirNotices(v, false, v, true, "F");
+        if (n.size() != 1 || n[0] != "F are now your allies") Fail("flag set: now allies at " + I((int)v));
+    }
+    n = TheirNotices(-100.0f, true, 0.0f, true, "F");   /* the enemy test comes first: a flagged -100 is hostile, a flagged 0 ally */
+    if (n.size() != 2 || n[0] != "F are no longer hostile towards you" || n[1] != "F are now your allies") Fail("flagged hostile -> flagged neutral");
+    /* the engine's own tests, on the value alone */
+    if (EngineNoticeCrossed(40.0f, 50.0f) || !EngineNoticeCrossed(50.0f, 50.5f) || !EngineNoticeCrossed(-29.0f, -30.0f) || !EngineNoticeCrossed(60.0f, 0.0f)) Fail("engine notice edges");
+    if (EngineNoticeCrossed(0.0f, 10.0f) || EngineNoticeCrossed(-100.0f, -40.0f) || EngineNoticeCrossed(100.0f, 60.0f)) Fail("engine: no crossing, no notice");
+}
+/* one line per change of level the player has not been told of */
+void t_playerstab_notice_book()
+{
+    using namespace playerstab;
+    NoticeBook bk;
+    /* first change: counted from the value held before the write */
+    std::vector<std::string> n = bk.Live("B|A", 0.0f, false, 100.0f, false, "FB");
+    if (n.size() != 1 || n[0] != "FB are now your allies") Fail("first live change");
+    /* the same change again (a second road, a resend): nothing */
+    if (!bk.Live("B|A", 0.0f, false, 100.0f, false, "FB").empty()) Fail("a change brought twice is shown once");
+    /* this game's engine moved the pair across the lines (a fight) and printed its own sentences, and the pair stayed at the
+       engine's value (no put-back): the owner's change to the same level adds nothing */
+    if (!bk.EngineSaid("B|A", 100.0f, -100.0f, false)) Fail("the engine printed for 100 -> -100");
+    if (!bk.Live("B|A", 100.0f, false, -100.0f, false, "FB").empty()) Fail("the engine already said it - no duplicate");
+    /* an engine move with no crossing prints nothing and leaves the book */
+    if (bk.EngineSaid("B|A", -100.0f, -90.0f, false)) Fail("no crossing, no engine notice");
+    n = bk.Live("B|A", -100.0f, false, 0.0f, false, "FB");
+    if (n.size() != 1 || n[0] != "FB are no longer hostile towards you") Fail("leaving hostile after the engine's line");
+    /* a snapshot only moves what was told */
+    bk.Quiet("C|A", -100.0f, false);
+    if (!bk.Live("C|A", 0.0f, false, -100.0f, false, "FC").empty()) Fail("a snapshot told it already");
+    n = bk.Live("C|A", -100.0f, false, 0.0f, false, "FC");
+    if (n.size() != 1 || n[0] != "FC are no longer hostile towards you") Fail("after a snapshot");
+    /* pairs are kept apart; a new world starts from the held values */
+    if (bk.Size() != 2) Fail("two pairs told");
+    bk.Clear();
+    n = bk.Live("B|A", 0.0f, false, 100.0f, false, "FB");
+    if (bk.Size() != 1 || n.size() != 1) Fail("a new world counts from the held value");
+}
+/* this game's engine moves the pair and prints, the mod puts it back to the owner's value (the book takes the value put back),
+   then the owner's own change: exactly the sentences of the table's change, from the value put back to the owner's new one */
+void t_playerstab_notice_putback()
+{
+    using namespace playerstab;
+    NoticeBook bk;
+    bk.Quiet("B|A", 0.0f, false);                                                   /* the owner's neutral, as the table shows it */
+    if (!bk.EngineSaid("B|A", 0.0f, -100.0f, false)) Fail("the engine printed for 0 -> -100");
+    bk.Quiet("B|A", 0.0f, false);                                                   /* put back to the owner's 0 */
+    std::vector<std::string> n = bk.Live("B|A", 0.0f, false, -100.0f, false, "FB");  /* the owner turns hostile */
+    if (n != TheirNotices(0.0f, false, -100.0f, false, "FB") || n.size() != 1 || n[0] != "FB are now hostile towards you") Fail("a real hostile after a put-back is shown");
+    /* the engine moved an ally side to neutral and printed; put back to ally; the owner leaves ally: one line, not a false "allies" */
+    bk.Quiet("C|A", 100.0f, false);
+    if (!bk.EngineSaid("C|A", 100.0f, 0.0f, false)) Fail("the engine printed for 100 -> 0");
+    bk.Quiet("C|A", 100.0f, false);
+    n = bk.Live("C|A", 100.0f, false, 0.0f, false, "FC");
+    if (n.size() != 1 || n[0] != "FC are no longer your ally") Fail("leaving ally after a put-back");
+    /* the owner's change that stays at the level put back: nothing */
+    bk.Quiet("D|A", 100.0f, false);
+    if (!bk.EngineSaid("D|A", 100.0f, -50.0f, false)) Fail("the engine printed for 100 -> -50");
+    bk.Quiet("D|A", 100.0f, false);
+    if (!bk.Live("D|A", 100.0f, false, 80.0f, false, "FD").empty()) Fail("no change of level from the value put back");
+}
+/* a NEUTRAL or HOSTILE choice clears the ally flag; ALLY and an unset flag change nothing */
+void t_playerstab_ally_flag()
+{
+    using namespace playerstab;
+    if (ClearsAllyFlag(0, true) || !ClearsAllyFlag(1, true) || !ClearsAllyFlag(2, true)) Fail("which choices clear the flag");
+    if (ClearsAllyFlag(1, false) || ClearsAllyFlag(2, false) || ClearsAllyFlag(3, true) || ClearsAllyFlag(-1, true)) Fail("nothing to clear / no such button");
+    /* after the clear the row, the tick and the sentence agree: a flagged 0 is Ally; cleared, Neutral, and the other game says so */
+    RowIn in; in.slot = 2; in.faction = "F"; in.you = nametag::LevelOf(0.0f, true); in.them = nametag::kNeutral;
+    if (RowFor(in).cell[2] != "Ally") Fail("a flagged entry reads Ally");
+    in.you = nametag::LevelOf(0.0f, false);
+    if (RowFor(in).cell[2] != "Neutral" || RowFor(in).you != 1) Fail("cleared, it reads Neutral with NEUTRAL ticked");
+    const std::vector<std::string> n = TheirNotices(0.0f, true, 0.0f, false, "F");
+    if (n.size() != 1 || n[0] != "F are no longer your ally") Fail("and the other game's sentence follows");
+}
+/* a carried player's faction (record id coop-p<n>) travels and is keyed as "@slot:<n>" */
+void t_slotwire_carried_faction()
+{
+    using namespace coopslot;
+    if (StandInIdAsSlotWire("coop-p3", 1) != "@slot:3") Fail("coop-p3 travels as @slot:3");
+    if (StandInIdAsSlotWire("coop-p3", -1) != "@slot:3") Fail("before this game has a slot");
+    if (StandInIdAsSlotWire("coop-p1", 1) != "coop-p1") Fail("this game's own number is not another player");
+    if (StandInIdAsSlotWire("coop-peer", 1) != "coop-peer" || StandInIdAsSlotWire("Nameless", 1) != "Nameless" || StandInIdAsSlotWire("coop-p03", 1) != "coop-p03") Fail("other ids unchanged");
+    if (StandInIdAsSlotWire("@slot:3:Kim", 1) != "@slot:3:Kim") Fail("a wire name unchanged");
+    /* one key for every name of one player */
+    if (RelationSideKey("coop-p3", 1) != "@slot:3" || RelationSideKey("@slot:3", 1) != "@slot:3" || RelationSideKey("@slot:3:Kim", 1) != "@slot:3") Fail("one key per player");
+    if (RelationSideKey("coop-p1", 1) != "coop-p1" || RelationSideKey("Nameless", 1) != "Nameless") Fail("other keys unchanged");
+    /* the receiver judges the carried player's side as that player's, never the sender's */
+    if (PairOwnerSlot(StandInIdAsSlotWire("coop-p3", 1), "@slot:1:Me") != 3) Fail("their side is slot 3's");
+    if (PairOwnerSlot("@slot:1:Me", StandInIdAsSlotWire("coop-p3", 1)) != 1) Fail("my side towards them is mine");
+    int slot = -1; bool hasName = true;
+    if (!ParseSlotWire(StandInIdAsSlotWire("coop-p12", 0), &slot, 0, &hasName) || slot != 12 || hasName) Fail("@slot:12 has no name (never creates a stand-in)");
+}
+void t_playerstab_lever_parse()
+{
+    using namespace playerstab;
+    Lever l = ParseLever("");
+    if (l.kind != kLeverReport) Fail("bare is the report");
+    l = ParseLever(" open ");
+    if (l.kind != kLeverOpen) Fail("open");
+    l = ParseLever("select 12");
+    if (l.kind != kLeverSelect || l.slot != 12) Fail("select 12");
+    l = ParseLever("stance hostile");
+    if (l.kind != kLeverStance || l.button != 2) Fail("stance hostile");
+    l = ParseLever("stance ally");
+    if (l.kind != kLeverStance || l.button != 0) Fail("stance ally");
+    if (ParseLever("confirm").kind != kLeverConfirm || ParseLever("cancel").kind != kLeverCancel) Fail("box verbs");
+    if (ParseLever("faction").kind != kLeverFaction || ParseLever("faction 1").kind != kLeverBad) Fail("faction");
+    l = ParseLever("select 1023");
+    if (l.kind != kLeverSelect || l.slot != 1023) Fail("select 1023");
+    if (ParseLever("select 12345").kind != kLeverBad || ParseLever("select 00012").kind != kLeverBad) Fail("a 5-digit select is refused");
+    const char* bad[6] = { "select", "select -1", "select x", "stance friendly", "open now", "close" };
+    for (int i = 0; i < 6; ++i) if (ParseLever(bad[i]).kind != kLeverBad) Fail(std::string("bad lever accepted: ") + bad[i]);
+}
+/* T-546 step 7: THE FACTION SCREENS (src/common/teamscreens.h) - every word from build/pages/player-factions.html */
+void t_t546h_bottom_line()
+{
+    using namespace teamscreen;
+    Sel s; s.faction = "Iron Wolves"; s.name = "Kim"; s.online = true; s.you = nametag::kHostile;
+    View v = ViewFor(true, s);
+    if (v.lineKind != kLineStance || v.line != "YOUR STANCE TOWARDS IRON WOLVES" || !v.stance || v.left != kActNone || v.right != kActInvite) Fail("in no faction: the stance line, the buttons, INVITE TO FACTION");
+    s.online = false; v = ViewFor(true, s);
+    if (v.right != kActNone || !v.stance) Fail("an offline player: no INVITE TO FACTION, the stance buttons stay");
+    s.online = true; s.inTeam = true; v = ViewFor(true, s);
+    if (v.right != kActNone || !v.stance) Fail("a player in another faction: no INVITE TO FACTION");
+    s.inTeam = false; s.myRole = kRoleFounder; v = ViewFor(true, s);
+    if (!v.stance || v.right != kActInvite || v.left != kActNone || v.lineKind != kLineStance) Fail("the founder towards a player outside: stance and INVITE");
+    s.mate = true; s.name = "Sam"; v = ViewFor(true, s);
+    if (v.lineKind != kLineMember || v.line != "SAM IS A MEMBER OF YOUR FACTION" || v.stance || v.left != kActDisband || v.right != kActRemove) Fail("B7.1: the founder with a member selected");
+    s.myRole = kRoleMember; s.name = "Alex"; v = ViewFor(true, s);
+    if (v.line != "ALEX IS A MEMBER OF YOUR FACTION" || v.stance || v.left != kActNone || v.right != kActLeave) Fail("a member with a teammate selected: LEAVE FACTION only");
+    s.mate = false; s.name = "Kim"; s.founder = "Alex"; v = ViewFor(true, s);
+    if (v.lineKind != kLineFounders || v.line != "STANCE TOWARDS IRON WOLVES: HOSTILE (SET BY ALEX)" || v.stance || v.right != kActLeave || v.left != kActNone) Fail("B7.2: a member towards a player outside");
+    s.you = nametag::kFriendly; v = ViewFor(true, s);
+    if (v.line != "STANCE TOWARDS IRON WOLVES: ALLY (SET BY ALEX)") Fail("the founder's ALLY");
+    s.you = nametag::kUnknown; v = ViewFor(true, s);
+    if (v.line != "STANCE TOWARDS IRON WOLVES: NEUTRAL (SET BY ALEX)") Fail("an unread level reads NEUTRAL, as the table");
+    s.you = nametag::kHostile; s.founder = ""; v = ViewFor(true, s);
+    if (v.line != "STANCE TOWARDS IRON WOLVES: HOSTILE") Fail("the founder's name unknown: no SET BY part");
+    v = ViewFor(false, s);
+    if (v.lineKind != kLineSelect || v.line != "Select a player." || v.right != kActLeave || v.stance) Fail("a member with nothing selected keeps LEAVE FACTION");
+    s.myRole = kRoleFounder; v = ViewFor(false, s);
+    if (v.right != kActNone || v.left != kActNone || v.stance) Fail("the founder with nothing selected: no button");
+    s.myRole = kRoleNone; v = ViewFor(false, s);
+    if (v.right != kActNone || v.left != kActNone) Fail("in no faction, nothing selected: no button");
+    s.myRole = kRoleFounder; s.mate = true; s.name = ""; v = ViewFor(true, s);
+    if (!v.line.empty() || v.right != kActNone || v.left != kActDisband) Fail("a member whose name is not known: no line, no REMOVE FROM FACTION (its box names the member), DISBAND stays");
+    s.name = "  "; v = ViewFor(true, s);
+    if (v.right != kActNone) Fail("a blank name is not known");
+    s.myRole = kRoleNone; s.mate = true; s.name = "Sam"; v = ViewFor(true, s);
+    if (v.lineKind != kLineStance) Fail("a teammate with no role here (no table) is read as anyone else");
+    if (MemberLine("Sa#m") != "SA##M IS A MEMBER OF YOUR FACTION" || MemberLine("  ") != "") Fail("a name escaped, an empty name no line");
+    if (FoundersStanceLine("A#B", nametag::kNeutral, "x#y") != "STANCE TOWARDS A##B: NEUTRAL (SET BY X##Y)") Fail("names escaped in the founder's line");
+    if (RoleCell(true) != "Founder" || RoleCell(false) != "Member") Fail("the role cells");
+    const char* caps[5] = { "", "INVITE TO FACTION", "REMOVE FROM FACTION", "DISBAND FACTION", "LEAVE FACTION" };
+    for (int a = 0; a <= kActLast; ++a)
+    {
+        if (std::string(ActionCaption(a)) != caps[a]) Fail("action caption " + I(a));
+        if (a > 0 && ActionOfWord(ActionWord(a)) != a) Fail("action word " + I(a));
+    }
+    if (ActionOfWord("promote") != kActNone || std::string(ActionCaption(9)) != "") Fail("no such action");
+    if (BoxOfAction(kActInvite) != kBoxNone || BoxOfAction(kActRemove) != kBoxRemove || BoxOfAction(kActDisband) != kBoxDisband || BoxOfAction(kActLeave) != kBoxLeave) Fail("the box each action asks first with");
+}
+void t_t546h_boxes()
+{
+    using namespace teamscreen;
+    if (std::string(BoxTitle(kBoxInvite)) != "FACTION INVITATION" || std::string(BoxLeft(kBoxInvite)) != "DECLINE" || std::string(BoxRight(kBoxInvite)) != "ACCEPT") Fail("B7.3 frame");
+    if (BoxText(kBoxInvite, "The Rusty Blades", "Alex") != "Alex invites you to join The Rusty Blades. Members share research and standing with every faction, and can enter each other's bases. Your characters and money stay yours.") Fail("B7.3 words");
+    if (std::string(BoxTitle(kBoxLeave)) != "LEAVE FACTION" || std::string(BoxLeft(kBoxLeave)) != "CANCEL" || std::string(BoxRight(kBoxLeave)) != "LEAVE") Fail("B7.4 frame");
+    if (BoxText(kBoxLeave, "The Rusty Blades", "") != "Leave The Rusty Blades? You keep your research. Your standing with every faction goes back to what it was before you joined.") Fail("B7.4 words");
+    if (std::string(BoxTitle(kBoxRemove)) != "REMOVE FROM FACTION" || std::string(BoxLeft(kBoxRemove)) != "CANCEL" || std::string(BoxRight(kBoxRemove)) != "REMOVE") Fail("B7.5 frame");
+    if (BoxText(kBoxRemove, "The Rusty Blades", "Sam") != "Remove Sam from The Rusty Blades? Sam keeps their research. Their standing with every faction goes back to what it was before joining.") Fail("B7.5 words");
+    if (std::string(BoxTitle(kBoxDisband)) != "DISBAND FACTION" || std::string(BoxLeft(kBoxDisband)) != "CANCEL" || std::string(BoxRight(kBoxDisband)) != "DISBAND") Fail("B7.6 frame");
+    if (BoxText(kBoxDisband, "The Rusty Blades", "") != "Disband The Rusty Blades? Every member leaves the faction and keeps their research.") Fail("B7.6 words");
+    if (std::string(BoxTitle(kBoxAway)) != "FACTION" || std::string(BoxLeft(kBoxAway)) != "" || std::string(BoxRight(kBoxAway)) != "OK") Fail("B7.7 frame: OK alone");
+    if (BoxText(kBoxAway, "The Rusty Blades", "") != "You were removed from The Rusty Blades while you were away. You kept your research; your standing with every faction is back to what it was before you joined.") Fail("B7.7 words");
+    if (std::string(BoxTitle(kBoxHostile)) != "SET HOSTILE" || std::string(BoxLeft(kBoxHostile)) != "CANCEL" || std::string(BoxRight(kBoxHostile)) != "HOSTILE"
+        || BoxText(kBoxHostile, "", "Iron Wolves") != playerstab::BoxText("Iron Wolves")) Fail("SET HOSTILE through the same frame");
+    if (!BoxText(kBoxInvite, "The Rusty Blades", "").empty() || !BoxText(kBoxInvite, "", "Alex").empty() || !BoxText(kBoxRemove, "T", " ").empty()
+        || !BoxText(kBoxLeave, "", "").empty() || !BoxText(kBoxDisband, "", "").empty() || !BoxText(kBoxAway, "", "").empty() || !BoxText(kBoxNone, "T", "N").empty())
+        Fail("a box whose words need a name not known is not shown");
+    if (BoxText(kBoxRemove, "R#B", "S#m") != "Remove S##m from R##B? S##m keeps their research. Their standing with every faction goes back to what it was before joining.") Fail("names escaped in a box");
+    if (std::string(BoxTitle(99)) != "" || std::string(BoxRight(-1)) != "") Fail("no such box");
+    if (!InviteBoxDue(true, false, false, true) || InviteBoxDue(false, false, false, true) || InviteBoxDue(true, true, false, true) || InviteBoxDue(true, false, true, true)
+        || InviteBoxDue(true, false, false, false)) Fail("the invitation box: waiting, no box of ours up, no blocking box up, the name known");
+    if (!InviteBoxEnds(false, 3, 3) || !InviteBoxEnds(true, 4, 3) || InviteBoxEnds(true, 3, 3)) Fail("the invitation box ends when answered / ended or replaced");
+}
+void t_t546h_message_lines()
+{
+    using namespace teamscreen;
+    const std::string T = "The Rusty Blades";
+    if (NoticeLine(swteam::kEvInvite, swteam::kOk, false, "Sam", T) != "Invitation sent to Sam.") Fail("invite");
+    if (NoticeLine(swteam::kEvExpired, swteam::kOk, false, "Sam", T) != "Sam did not answer." || NoticeLine(swteam::kEvExpired, swteam::kOk, true, "Sam", T) != "") Fail("expired: the founder's line; none for the invited player");
+    if (NoticeLine(swteam::kEvDeclined, swteam::kOk, false, "Sam", T) != "Sam declined your invitation." || NoticeLine(swteam::kEvDeclined, swteam::kOk, true, "Sam", T) != "") Fail("declined");
+    if (NoticeLine(swteam::kEvJoined, swteam::kOk, false, "Sam", T) != "Sam joined The Rusty Blades." || NoticeLine(swteam::kEvJoined, swteam::kOk, true, "Sam", T) != "You joined The Rusty Blades.") Fail("joined");
+    if (NoticeLine(swteam::kEvLeft, swteam::kOk, false, "Sam", T) != "Sam left The Rusty Blades." || NoticeLine(swteam::kEvLeft, swteam::kOk, true, "Sam", T) != "You left The Rusty Blades.") Fail("left");
+    if (NoticeLine(swteam::kEvRemoved, swteam::kOk, false, "Sam", T) != "Sam was removed from The Rusty Blades." || NoticeLine(swteam::kEvRemoved, swteam::kOk, true, "Sam", T) != "You were removed from The Rusty Blades.") Fail("removed");
+    if (NoticeLine(swteam::kEvDisbanded, swteam::kOk, false, "Alex", T) != "The Rusty Blades was disbanded." || NoticeLine(swteam::kEvDisbanded, swteam::kOk, true, "Alex", T) != "The Rusty Blades was disbanded.") Fail("disbanded");
+    if (NoticeLine(swteam::kEvJoined, swteam::kOk, true, "", T) != "You joined The Rusty Blades.") Fail("this player's own line needs no name");
+    for (int e = 1; e <= swteam::kEvLast; ++e)
+        for (int me = 0; me < 2; ++me)
+        {
+            if (NoticeLine(e, swteam::kRefInTeam, me != 0, "Sam", T) != "") Fail("a refusal has no line (event " + I(e) + ")");
+            if (NoticeLine(e, swteam::kOk, me != 0, "", T).find("  ") != std::string::npos) Fail("no line with a missing name");
+            if (me == 0 && NoticeLine(e, swteam::kOk, false, "", T) != "" && e != swteam::kEvDisbanded) Fail("another player's line needs the name (event " + I(e) + ")");
+        }
+    const int none[5] = { swteam::kEvAnswer, swteam::kEvLeave, swteam::kEvInviteGone, swteam::kEvResearchWhole, swteam::kEvResearchOwn };
+    for (int k = 0; k < 5; ++k) if (NoticeLine(none[k], swteam::kOk, false, "Sam", T) != "" || NoticeLine(none[k], swteam::kOk, true, "Sam", T) != "") Fail("no page words for event " + I(none[k]));
+    if (NoticeLine(swteam::kEvLeft, swteam::kOk, false, "S#m", "R#B") != "S##m left R##B.") Fail("names escaped");
+    if (NoticeLine(swteam::kEvLeft, swteam::kOk, true, "Sam", "") != "") Fail("no faction name: no line");
+    if (ResearchCompleteShown("Iron Plates", "Sam") != "Research complete: Iron Plates (Sam)." || ResearchCompleteShown("Iron Plates", "") != "" || ResearchCompleteShown("", "Sam") != "") Fail("the research line");
+    if (swteam::ResearchSharedLine(6) != "Shared research: 6 new technologies.") Fail("the shared research line");
+}
+/* the fold's rules: the box back after a refused ACCEPT, the held lines, the team's own writes quiet, the table's settle wait */
+void t_t546h_fold_rules()
+{
+    using namespace teamscreen;
+    if (!InviteBackAfterRefusal(swteam::kEvAnswer, swteam::kRefNoSnapshot, true) || !InviteBackAfterRefusal(swteam::kEvAnswer, swteam::kRefNotSaved, true)) Fail("a refusal that keeps the invitation brings the box back");
+    if (InviteBackAfterRefusal(swteam::kEvAnswer, swteam::kRefNoInvite, true) || InviteBackAfterRefusal(swteam::kEvAnswer, swteam::kOk, true)
+        || InviteBackAfterRefusal(swteam::kEvAnswer, swteam::kRefNotSaved, false) || InviteBackAfterRefusal(swteam::kEvInvite, swteam::kRefNotSaved, true)) Fail("no box back otherwise");
+    HeldLines h;
+    HoldLine(&h, "one"); HoldLine(&h, ""); HoldLine(&h, "two");
+    if (!TakeHeld(&h, false).empty() || h.q.size() != 2) Fail("not ready: the lines stay held");
+    std::vector<std::string> t = TakeHeld(&h, true);
+    if (t.size() != 2 || t[0] != "one" || t[1] != "two" || !h.q.empty()) Fail("ready: in order, each once");
+    if (!TakeHeld(&h, true).empty()) Fail("a line is shown once");
+    HoldLine(&h, "three");
+    PutBack(&h, t, 1);
+    if (h.q.size() != 2 || h.q[0] != "two" || h.q[1] != "three") Fail("a line not shown yet goes back in front, in order");
+    for (int i = 0; i < 40; ++i) HoldLine(&h, "x" + I(i));
+    if (h.q.size() != kHeldLines || h.q.back() != "x39" || h.dropped != (unsigned)(42 - kHeldLines)) Fail("at most kHeldLines held, the oldest dropped");
+    if (!MateQuiet(true, 0, 5000) || MateQuiet(false, 0, 5000) || !MateQuiet(false, 1000, 1000 + kMateQuietMs - 1) || MateQuiet(false, 1000, 1000 + kMateQuietMs)) Fail("the team's own writes are quiet");
+    if (!MateQuiet(false, 0xFFFFFF00u, 0x00000010u)) Fail("the quiet window across the tick count's wrap");
+    if (MatesSettling(0, 100) || !MatesSettling(100, 100 + kMatesSettleMs - 1) || MatesSettling(100, 100 + kMatesSettleMs)) Fail("the table's settle wait");
+}
+void t_t546h_rows_and_lever()
+{
+    using namespace playerstab;
+    RowIn in; in.slot = 2; in.rosterName = "Sam"; in.faction = "The Rusty Blades"; in.you = nametag::kFriendly; in.them = nametag::kFriendly; in.teammate = true; in.online = true;
+    RowView r = RowFor(in);
+    if (r.cell[2] != "Member" || r.cell[3] != "Member" || r.cell[1] != "The Rusty Blades" || r.cell[4] != "Online") Fail("a member's row: Member / Member");
+    if (r.cell[0] != "#5a9be6Sam" || TeamColourCode() != "#5a9be6") Fail("a teammate's name in team blue: " + r.cell[0]);
+    in.mateFounder = true; r = RowFor(in);
+    if (r.cell[2] != "Founder" || r.cell[3] != "Founder") Fail("the founder's row: Founder / Founder");
+    in.teammate = false; in.mateFounder = true; in.inTeam = true; in.you = nametag::kHostile; in.them = nametag::kNeutral; r = RowFor(in);
+    if (r.cell[2] != "Hostile" || r.cell[3] != "Neutral" || !r.inTeam || r.cell[0] != ColouredName("Sam", nametag::kHostile)) Fail("anyone else: levels, the tag's colour, in a faction");
+    in.teammate = true; r = RowFor(in);
+    if (r.inTeam) Fail("a teammate is not 'in another faction'");
+    in.rosterName = ""; in.rememberedName = ""; in.placeholder = "Player 2"; r = RowFor(in);
+    if (!r.name.empty() || r.cell[0].find("Player 2") == std::string::npos) Fail("the faction screens' name is never the placeholder (the cell keeps it)");
+    in.rememberedName = "Sam"; r = RowFor(in);
+    if (r.name != "Sam") Fail("the remembered name");
+    Lever l = ParseLever("action invite");
+    if (l.kind != kLeverAction || l.button != teamscreen::kActInvite) Fail("action invite");
+    if (ParseLever("action remove").button != teamscreen::kActRemove || ParseLever("action disband").button != teamscreen::kActDisband || ParseLever("action leave").button != teamscreen::kActLeave) Fail("action words");
+    if (ParseLever("action").kind != kLeverBad || ParseLever("action promote").kind != kLeverBad || ParseLever("action leave now").kind != kLeverBad) Fail("bad action levers");
+    if (ParseLever("shown").kind != kLeverShown || ParseLever("shown 1").kind != kLeverBad) Fail("shown");
+    for (int a = 1; a <= teamscreen::kActLast; ++a) if (ParseLever(std::string("action ") + teamscreen::ActionWord(a)).button != a) Fail("the lever's words are teamscreens.h's");
 }
 void t_nametag_caption()
 {
@@ -26994,6 +28714,54 @@ void t_titleart_rows_and_note()
             }
     }
 }
+/* T-530 (owner 464 a): the menu column on the mod's art - the first shown button under the painted title, the last one inside
+   97% of the height, at every window shape asked for, with CONTINUE (8 buttons) and without (7). The game's rows come from
+   the layout (Kenshi_MainMenu.layout: CONTINUE 0.138889, NEW GAME 0.25, height 0.0638889 of the screen). */
+void t_titleart_menu_column()
+{
+    /* 1920x1080, CONTINUE shown: the title ends on row 254; top 254 + 22, the pitch closed up from the game's 120 to 100 */
+    swtitle::MenuColumn m = swtitle::MenuColumnPlan(1080, 254, 8, 120, 69);
+    if (!m.ok || m.top != 276 || m.pitch != 100 || m.height != 69) Fail("1920x1080 with CONTINUE: top 276, pitch 100, height 69");
+    m = swtitle::MenuColumnPlan(1080, 254, 7, 120, 69);
+    if (!m.ok || m.top != 276 || m.pitch != 117 || m.height != 69) Fail("1920x1080 without CONTINUE: top 276, pitch 117, height 69");
+    /* 5120x1440 (32:9): the title ends on row 678; the buttons are shortened to keep a 1.2% gap */
+    m = swtitle::MenuColumnPlan(1440, 678, 8, 160, 92);
+    if (!m.ok || m.top != 707 || m.pitch != 85 || m.height != 68) Fail("5120x1440 with CONTINUE: top 707, pitch 85, height 68");
+    /* one button: the game's pitch and height */
+    m = swtitle::MenuColumnPlan(1080, 254, 1, 120, 69);
+    if (!m.ok || m.top != 276 || m.pitch != 120 || m.height != 69) Fail("one button keeps the game's rows");
+    /* the room never grows the pitch past the game's own */
+    m = swtitle::MenuColumnPlan(1080, 10, 3, 120, 69);
+    if (!m.ok || m.pitch != 120) Fail("a short column keeps the game's pitch");
+    /* no plan: a screen far too wide (the title ends below the screen), buttons under half the game's height, bad numbers */
+    m = swtitle::MenuColumnPlan(1000, 1587, 8, 111, 63);
+    if (m.ok) Fail("the title below the screen: no plan");
+    m = swtitle::MenuColumnPlan(1000, 600, 8, 111, 63);
+    if (m.ok) Fail("buttons under half the game's height: no plan");
+    if (swtitle::MenuColumnPlan(0, 254, 8, 120, 69).ok || swtitle::MenuColumnPlan(1080, 254, 0, 120, 69).ok
+        || swtitle::MenuColumnPlan(1080, 254, 8, 0, 69).ok || swtitle::MenuColumnPlan(1080, 254, 8, 120, 0).ok
+        || swtitle::MenuColumnPlan(1080, -1, 8, 120, 69).ok) Fail("a number not positive: no plan");
+    /* every shape asked for: 16:9, 16:10, 21:9, 43:18, 32:9, 1280x720, the tall 960x1080, 16:9 900, 16:10 900, 1920x822 */
+    const int sizes[][2] = { { 1920, 1080 }, { 1920, 1200 }, { 2560, 1080 }, { 3440, 1440 }, { 5120, 1440 }, { 1280, 720 }, { 960, 1080 },
+                             { 1600, 900 }, { 1440, 900 }, { 1920, 822 } };
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i)
+    {
+        const int pw = sizes[i][0], ph = sizes[i][1];
+        const swtitle::Rect c = swtitle::CoverCrop(1672, 941, pw, ph);
+        const int titleBottom = swtitle::ArtRowOnBox(swtitle::kTitleBottom, 941, c, ph);
+        const int gamePitch = (int)(ph * 0.25) - (int)(ph * 0.138889), gameHeight = (int)(ph * 0.0638889);
+        for (int shown = 7; shown <= 8; ++shown)
+        {
+            m = swtitle::MenuColumnPlan(ph, titleBottom, shown, gamePitch, gameHeight);
+            if (!m.ok) { Fail("a plan at every shape asked for"); continue; }
+            if (m.top <= titleBottom || m.top < titleBottom + (int)(ph * 0.02)) Fail("the first button under the painted title, 2% clear");
+            if (m.top + (shown - 1) * m.pitch + m.height > (int)(ph * 0.97 + 0.5)) Fail("EXIT's bottom inside 97% of the height");
+            if (m.pitch > gamePitch || m.height > gameHeight || m.height * 2 < gameHeight) Fail("never wider apart or taller than the game's rows");
+            if (m.pitch - m.height < (int)(ph * 0.012 + 0.5)) Fail("a 1.2% gap between buttons");
+            if (m.height < gameHeight && m.pitch - m.height != (int)(ph * 0.012 + 0.5)) Fail("shortened only as far as the gap needs");
+        }
+    }
+}
 void t_joblever_parse()
 {
     joblever::JobWork w;
@@ -27240,6 +29008,2647 @@ void t_netaddr_presses_and_answers()
     if (s.state == kNetAddrLooking || s.startLookup != 0) Fail("the websites were asked without a press");
 }
 
+/* ---- T-556 (t556a): the fallen list - src/common/fallenwire.h ---- */
+swfallen::Fallen T556Snap(unsigned int uid, const char* name)
+{
+    swfallen::Fallen f;
+    f.uid = uid; f.templateName = "Greenlander"; f.name = name; f.race = "Greenlander"; f.sid = "45123-rebirth.mod"; f.unique = 1; f.animal = 0; f.age = 0.0f;
+    f.statsHave = 1;
+    for (int i = 0; i < swfallen::kStatsCount; ++i) { float v = 1.5f * (float)i; std::memcpy(&f.stats[i], &v, 4); }
+    f.stats[43] = 7u;
+    const char look[] = "record\0bytes\x01\xff";
+    f.look.assign(look, look + sizeof(look));
+    f.x = -50978.5f; f.y = 1520.25f; f.z = 2932.75f; f.diedUnix = 1790000000ULL; f.cause = swfallen::kCauseMedical;
+    f.handIndex = 4242; f.handSerial = 77;
+    f.place = "The Hub";
+    f.day = 41; f.why = swfallen::kWhyBloodLoss;
+    return f;
+}
+bool T556Same(const swfallen::Fallen& a, const swfallen::Fallen& b)
+{
+    return a.uid == b.uid && a.templateName == b.templateName && a.name == b.name && a.race == b.race && a.sid == b.sid && a.unique == b.unique
+        && a.animal == b.animal && a.age == b.age && a.statsHave == b.statsHave && std::memcmp(a.stats, b.stats, sizeof(a.stats)) == 0
+        && a.look == b.look && a.x == b.x && a.y == b.y && a.z == b.z && a.diedUnix == b.diedUnix && a.cause == b.cause
+        && a.handIndex == b.handIndex && a.handSerial == b.handSerial && a.place == b.place && a.day == b.day && a.why == b.why;
+}
+void t_t556_fallen_round_trip()
+{
+    using namespace swfallen;
+    Fallen a = T556Snap(0x00C00011u, "Beep"), b;
+    std::vector<char> bytes;
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || !T556Same(a, b)) Fail("a person's snapshot round trip");
+    Fallen pet = T556Snap(0x00C00012u, "Bonedog Pup"); pet.animal = 1; pet.unique = 0; pet.age = 0.35f; pet.templateName = "Bonedog"; pet.race = "?";
+    EncodeFallen(pet, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || !T556Same(pet, b) || b.animal != 1 || b.unique != 0) Fail("an animal's snapshot round trip");
+    Fallen noStats = T556Snap(5, "X"); noStats.statsHave = 0;
+    EncodeFallen(noStats, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.statsHave != 0 || b.stats[3] != 0) Fail("unread stats travel as zeros with the flag clear");
+    EncodeFallen(a, &bytes);
+    for (size_t cut = 0; cut < bytes.size(); ++cut)
+        if (DecodeFallen(&bytes[0], cut, &b)) { Fail("a truncated snapshot was accepted"); break; }
+    std::vector<char> more(bytes); more.push_back(0);
+    if (DecodeFallen(&more[0], more.size(), &b)) Fail("trailing bytes were accepted");
+    std::vector<char> ver(bytes); ver[0] = (char)(kFallenVersion + 1);
+    if (DecodeFallen(&ver[0], ver.size(), &b)) Fail("another version was accepted");
+    Fallen noTmpl = a; noTmpl.templateName = "";
+    EncodeFallen(noTmpl, &bytes);
+    if (DecodeFallen(&bytes[0], bytes.size(), &b)) Fail("an empty template name was accepted");
+    Fallen longName = a; longName.name = std::string(80, 'n');
+    EncodeFallen(longName, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.name.size() != kNameMax) Fail("a name over 64 bytes is cut to 64");
+}
+void t_t556_fallen_list_keeps_forty()
+{
+    using namespace swfallen;
+    if (kFallenKeep != 40) Fail("the list keeps 40 (owner 510)");
+    std::vector<Fallen> list;
+    int cut = 0;
+    for (unsigned int u = 1; u <= 45; ++u) cut += FallenPush(&list, T556Snap(u, "n"));
+    if ((int)list.size() != kFallenKeep || cut != 5) Fail("45 deaths keep the newest 40 and cut 5");
+    if (list[0].uid != 45 || list[39].uid != 6) Fail("the list is newest first");
+    Fallen again = T556Snap(10, "again");
+    if (FallenPush(&list, again) != 0 || (int)list.size() != kFallenKeep || list[0].name != "again") Fail("a second snapshot of one uid replaces the first");
+    int tens = 0; for (size_t i = 0; i < list.size(); ++i) if (list[i].uid == 10) ++tens;
+    if (tens != 1) Fail("one entry per uid");
+    Fallen out;
+    if (!FallenTake(&list, 0, &out) || out.uid != 10 || (int)list.size() != kFallenKeep - 1 || list[0].uid != 45) Fail("take 0 removes the newest");
+    if (FallenTake(&list, 39, &out) || FallenTake(&list, -1, &out)) Fail("take outside the list is refused");
+}
+void t_t556_fallen_squad_choice()
+{
+    using namespace swfallen;
+    std::vector<SquadRow> rows;
+    SquadRow r;
+    r.squad = 0xA0; r.alive = 0; rows.push_back(r);   /* row 0: squad A, dead */
+    r.squad = 0xB0; r.alive = 1; rows.push_back(r);   /* row 1: squad B, alive -> squad 0 */
+    r.squad = 0xA0; r.alive = 1; rows.push_back(r);   /* row 2: squad A, alive -> squad 1 */
+    r.squad = 0xB0; r.alive = 1; rows.push_back(r);   /* row 3 */
+    r.squad = 0;    r.alive = 1; rows.push_back(r);   /* row 4: no squad - never numbered */
+    r.squad = 0xC0; r.alive = 0; rows.push_back(r);   /* row 5: squad C, nobody alive - never numbered */
+    int n = 0;
+    if (PickSquadAnchor(rows, -1, &n) != 1 || n != 2) Fail("the default is the squad of the first living member");
+    if (PickSquadAnchor(rows, 0, &n) != 1) Fail("squad 0");
+    if (PickSquadAnchor(rows, 1, &n) != 2) Fail("squad 1 is anchored on its first LIVING member");
+    if (PickSquadAnchor(rows, 2, &n) != -1) Fail("a squad with no living member has no number");
+    if (PickSquadAnchor(std::vector<SquadRow>(), -1, &n) != -1 || n != 0) Fail("no characters, no squad");
+}
+void t_t556_fallen_road()
+{
+    using namespace swfallen;
+    if (RoadDecide(0, 2, 9, 2, 9) != kRoadCreate) Fail("fields equal to the member's: create alone");
+    if (RoadDecide(0, 0, 9, 2, 9) != kRoadCreateRecruit) Fail("a movement field differs: recruit");
+    if (RoadDecide(0, 2, 0, 2, 9) != kRoadCreateRecruit) Fail("the +0x1A0 field differs: recruit");
+    if (RoadDecide(0, 2, 9, -1, 9) != kRoadCreateRecruit) Fail("the member unreadable: recruit");
+    if (RoadDecide(1, 0, 0, 2, 9) != kRoadCreate) Fail("an animal is never recruited");
+    if (RoadDecide(0, 2, 9, 2, -1) != kRoadCreateRecruit) Fail("the member's +0x1A0 field unreadable alone: recruit");
+    if (std::string(RoadWord(kRoadCreateRecruit)) != "create+recruit" || std::string(CauseWord(kCauseMedical)) != "medical") Fail("words");
+}
+void t_t556_fallen_size_edges()
+{
+    using namespace swfallen;
+    Fallen a = T556Snap(9, "Edge"), b;
+    std::vector<char> bytes;
+    a.look.assign(kLookMax, 'L');
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.look.size() != kLookMax) Fail("a record of exactly kLookMax is kept and read back");
+    a.look.assign(kLookMax + 1, 'L');
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || !b.look.empty()) Fail("a record over kLookMax is not kept");
+    a.look.clear();
+    EncodeFallen(a, &bytes);
+    const unsigned int big = (unsigned int)kLookMax + 1;   /* the last 4 bytes are the record's length */
+    for (int i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = (char)((big >> (8 * i)) & 0xFF);
+    if (DecodeFallen(&bytes[0], bytes.size(), &b)) Fail("a length over kLookMax is refused on decode");
+    a.templateName = std::string(300, 't');
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.templateName.size() != kTextMax) Fail("a template name is cut to 255 bytes");
+}
+/* ---- T-556 effort 4: where a bring-back may stand, and the place of a death (src/common/fallenwire.h) ---- */
+void t_t556_fallen_v2_row()
+{
+    using namespace swfallen;
+    Fallen a = T556Snap(0x00C00051u, "Old"), b;
+    a.look.clear(); a.place.clear();
+    std::vector<char> bytes;
+    EncodeFallen(a, &bytes);
+    if (bytes[0] != (char)kFallenVersion || kFallenVersion != 4 || kFallenVersionNoDay != 3 || kFallenVersionNoPlace != 2) Fail("the snapshot's byte form is 4, the forms before it 3 and 2");
+    /* with no look and no place the tail is: place length (1), day (4), how (1), record length (4) */
+    std::vector<char> v3(bytes.begin(), bytes.end() - 9);
+    v3.insert(v3.end(), bytes.end() - 4, bytes.end());
+    v3[0] = (char)kFallenVersionNoDay;
+    a.day = -1; a.why = kWhyUnknown;
+    if (!DecodeFallen(&v3[0], v3.size(), &b) || !T556Same(a, b)) Fail("a row kept before the day reads, with day -1 and how unknown");
+    std::vector<char> v3more(v3); v3more[0] = (char)kFallenVersion;
+    if (DecodeFallen(&v3more[0], v3more.size(), &b)) Fail("a form-4 row without its day was accepted");
+    /* the form before the place: no place byte either */
+    std::vector<char> v2(bytes.begin(), bytes.end() - 10);
+    v2.insert(v2.end(), bytes.end() - 4, bytes.end());
+    v2[0] = (char)kFallenVersionNoPlace;
+    if (!DecodeFallen(&v2[0], v2.size(), &b) || !T556Same(a, b) || !b.place.empty()) Fail("a row kept before the place reads, with no place");
+    {   /* a fallen.txt line an earlier world server wrote (form 2) loads into the book */
+        Book bk; int why = -1;
+        const std::string prof = "p9.1";
+        if (!BookParseLine("F " + Hex(prof.data(), prof.size()) + " " + Hex(&v2[0], v2.size()) + "\r", &bk, &why) || why != kLineOk
+            || BookList(bk, prof).size() != 1 || BookList(bk, prof)[0].name != "Old" || !BookList(bk, prof)[0].place.empty())
+            Fail("a form-2 fallen.txt line loads, with no place");
+    }
+    std::vector<char> v2more(v2); v2more[0] = (char)kFallenVersionNoDay;
+    if (DecodeFallen(&v2more[0], v2more.size(), &b)) Fail("a form-3 row without its place was accepted");
+    a.day = 0; a.why = kWhyStarvation;
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.day != 0 || b.why != kWhyStarvation) Fail("the day and how round trip");
+    a.place = "Squin";
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.place != "Squin") Fail("the place round trip");
+    a.place = std::string(300, 'p');
+    EncodeFallen(a, &bytes);
+    if (!DecodeFallen(&bytes[0], bytes.size(), &b) || b.place.size() != kTextMax) Fail("a place is cut to 255 bytes");
+    std::vector<char> up; Up u;
+    a.place = "Admag";
+    EncodeAdd(&up, a);
+    if (!DecodeUp(&up[0], up.size(), &u) || u.snap.place != "Admag") Fail("an ADD carries the place");
+}
+void t_t556_place_rules()
+{
+    using namespace swfallen;
+    MateState m;
+    if (BesideVerdict(m) != kBesideNoSuch) Fail("no character: noSuch");
+    m.found = 1;
+    if (BesideVerdict(m) != kBesideNotMine) Fail("another game's character: notMine");
+    m.mine = 1;
+    if (BesideVerdict(m) != kBesideNotOwn) Fail("another faction's character: notOwn");
+    m.ownFaction = 1;
+    if (BesideVerdict(m) != kBesideOk) Fail("a free own character: allowed");
+    MateState d(m); d.dead = 1; d.unconscious = -1;
+    if (BesideVerdict(d) != kBesideDead) Fail("dead comes before an unreadable state");
+    MateState x(m); x.slaveState = -1;
+    if (BesideVerdict(x) != kBesideUnreadable) Fail("an unreadable state refuses (fails closed)");
+    x = m; x.dead = -1;
+    if (BesideVerdict(x) != kBesideUnreadable) Fail("an unreadable death flag refuses");
+    x = m; x.unconscious = 1; x.carried = 1;
+    if (BesideVerdict(x) != kBesideKnockedOut) Fail("knocked out (and carried): ko first");
+    x = m; x.carried = 1;
+    if (BesideVerdict(x) != kBesideCarried) Fail("carried");
+    x = m; x.inSomething = 2;
+    if (BesideVerdict(x) != kBesideCaged) Fail("in a cage");
+    x = m; x.inSomething = 1;
+    if (BesideVerdict(x) != kBesideOk) Fail("in a bed is free");
+    x = m; x.chained = 1;
+    if (BesideVerdict(x) != kBesideChained) Fail("in chains");
+    x = m; x.slaveState = 1;
+    if (BesideVerdict(x) != kBesideEnslaved) Fail("a slave");
+    x.slaveState = 2;
+    if (BesideVerdict(x) != kBesideEnslaved) Fail("an escaping slave");
+    x.slaveState = 3;
+    if (BesideVerdict(x) != kBesideOk) Fail("an ex-slave is free");
+    x.slaveState = 4;
+    if (BesideVerdict(x) != kBesideUnreadable) Fail("a slave state past the engine's range does not read");
+    /* an enemy that cannot fight */
+    MateState o;
+    if (AbleToFight(o) != 1) Fail("a free character can fight");
+    o.unconscious = -1; o.carried = -1; o.inSomething = -1; o.chained = -1; o.slaveState = -1;
+    if (AbleToFight(o) != 1) Fail("unreadable states leave an enemy able to fight");
+    o = MateState(); o.unconscious = 1;
+    if (AbleToFight(o) != 0) Fail("a knocked-out enemy cannot fight");
+    o = MateState(); o.carried = 1;
+    if (AbleToFight(o) != 0) Fail("a carried enemy cannot fight");
+    o = MateState(); o.inSomething = 2;
+    if (AbleToFight(o) != 0) Fail("a caged enemy cannot fight");
+    o = MateState(); o.inSomething = 1;
+    if (AbleToFight(o) != 1) Fail("an enemy in a bed can fight (it can get up)");
+    o = MateState(); o.chained = 1;
+    if (AbleToFight(o) != 0) Fail("a chained enemy cannot fight");
+    o = MateState(); o.slaveState = 1;
+    if (AbleToFight(o) != 0) Fail("an enslaved enemy cannot fight");
+    o = MateState(); o.dead = 1;
+    if (AbleToFight(o) != 0) Fail("a dead enemy cannot fight");
+    if (std::string(UnableWhy(o)) != "dead") Fail("why: dead");
+    o = MateState(); o.unconscious = 1; o.carried = 1;
+    if (std::string(UnableWhy(o)) != "ko") Fail("why: knocked out (and carried) reads ko first");
+    o.unconscious = 0;
+    if (std::string(UnableWhy(o)) != "carried") Fail("why: carried");
+    o = MateState(); o.inSomething = 2;
+    if (std::string(UnableWhy(o)) != "caged") Fail("why: caged");
+    o = MateState(); o.chained = 1;
+    if (std::string(UnableWhy(o)) != "chained") Fail("why: chained");
+    o = MateState(); o.slaveState = 2;
+    if (std::string(UnableWhy(o)) != "enslaved") Fail("why: enslaved");
+    o = MateState(); o.unconscious = -1;
+    if (std::string(UnableWhy(o)) != "" || AbleToFight(o) != 1) Fail("why: an able enemy has no reason");
+    /* T-562 / H070: another player's character at a hostile standing is an enemy even when isEnemyOf says no */
+    if (EnemyVerdict(1, -1) != 1 || EnemyVerdict(0, 1) != 1 || EnemyVerdict(-1, 1) != 1) Fail("either test saying enemy makes an enemy");
+    if (EnemyVerdict(0, 0) != 0 || EnemyVerdict(0, -1) != 0) Fail("neither saying enemy: not an enemy");
+    if (EnemyVerdict(-1, 0) != -1 || EnemyVerdict(-1, -1) != -1) Fail("isEnemyOf unread and the standing not hostile: unread");
+    NearRow nr; nr.dist = 100.0f; nr.enemy = 0;
+    if (std::string(NotCountedWhy(nr, kEnemyNearUnits)) != "not an enemy") Fail("not counted: not an enemy");
+    nr.enemy = -1;
+    if (std::string(NotCountedWhy(nr, kEnemyNearUnits)) != "enemy state unreadable") Fail("not counted: unreadable");
+    nr.enemy = 1; nr.able = 0;
+    if (std::string(NotCountedWhy(nr, kEnemyNearUnits)) != "cannot fight") Fail("not counted: cannot fight");
+    nr.able = 1;
+    if (std::string(NotCountedWhy(nr, kEnemyNearUnits)) != "") Fail("a counted enemy has no not-counted reason");
+    nr.enemy = 0; nr.dist = 600.0f;
+    if (std::string(NotCountedWhy(nr, kEnemyNearUnits)) != "") Fail("outside the radius is not listed");
+    /* the enemy rule */
+    if (kEnemyNearUnits != 500.0f) Fail("the enemy radius is 50 m");
+    std::vector<NearRow> rows;
+    NearRow r;
+    r.dist = 499.0f; r.enemy = 0; rows.push_back(r);     /* a friend near */
+    r.dist = 501.0f; r.enemy = 1; rows.push_back(r);     /* an enemy just outside */
+    r.dist = 100.0f; r.enemy = -1; rows.push_back(r);    /* unreadable near */
+    EnemyCount e = CountEnemiesNear(rows, kEnemyNearUnits);
+    if (e.within != 0 || e.unknown != 1 || e.nearestRow != -1 || e.nearest != -1.0f) Fail("no enemy within 50 m (an unreadable one only counted)");
+    if (PlaceVerdict(m, e) != kBesideOk) Fail("an unreadable near character never refuses");
+    r.dist = 500.0f; r.enemy = 1; rows.push_back(r);     /* an enemy at exactly 50 m */
+    r.dist = 320.0f; r.enemy = 1; rows.push_back(r);
+    r.dist = -1.0f; r.enemy = 1; rows.push_back(r);      /* a bad distance */
+    r.dist = 50.0f; r.enemy = 1; r.able = 0; rows.push_back(r);   /* a knocked-out enemy beside it */
+    e = CountEnemiesNear(rows, kEnemyNearUnits);
+    if (e.within != 2 || e.nearestRow != 4 || e.nearest != 320.0f || e.unable != 1) Fail("two enemies within 50 m, the nearest at 32 m; one that cannot fight not counted");
+    std::vector<NearRow> only(1); only[0].dist = 10.0f; only[0].enemy = 1; only[0].able = 0;
+    if (PlaceVerdict(m, CountEnemiesNear(only, kEnemyNearUnits)) != kBesideOk) Fail("only enemies that cannot fight: allowed");
+    if (PlaceVerdict(m, e) != kBesideEnemyNear) Fail("an enemy near refuses a free squadmate");
+    if (PlaceVerdict(d, e) != kBesideDead) Fail("the squadmate's own reason comes before the enemy rule");
+    if (std::string(BesideTag(kBesideEnemyNear)) != "enemyNear" || std::string(BesideTag(kBesideKnockedOut)) != "ko" || std::string(BesideTag(99)) != "?")
+        Fail("the reason tags");
+    for (int i = 0; i < kBesideCodes; ++i) if (std::string(BesideWord(i)) == "?") Fail("every reason has words");
+}
+void t_t556_place_town()
+{
+    using namespace swfallen;
+    std::vector<TownDist> rows;
+    if (NearestTown(rows) != -1) Fail("no towns: no place");
+    TownDist t;
+    t.name = "Squin"; t.dist = 9000.0f; rows.push_back(t);
+    t.name = ""; t.dist = 10.0f; rows.push_back(t);          /* a town with no readable name */
+    t.name = "The Hub"; t.dist = 1200.0f; rows.push_back(t);
+    t.name = "Bad"; t.dist = -5.0f; rows.push_back(t);        /* a bad distance */
+    if (NearestTown(rows) != 2) Fail("the nearest named town");
+    if (kPlaceMaxUnits != 30000.0f) Fail("the place reaches 3 km");
+    std::vector<TownDist> far;
+    t.name = "Far"; t.dist = 30001.0f; far.push_back(t);
+    if (NearestTown(far) != -1) Fail("a town past 3 km is no place");
+    t.name = "Edge"; t.dist = 30000.0f; far.push_back(t);
+    if (NearestTown(far) != 1) Fail("a town at exactly 3 km is the place");
+    if (PlaceWords("The Hub") != "near The Hub" || PlaceWords("") != "unknown") Fail("the place's words");
+}
+void t_t556_fallen_once_per_uid()
+{
+    using namespace swfallen;
+    std::set<unsigned int> seen;
+    if (!FallenNoteOnce(&seen, 77)) Fail("the first death call of a uid is snapshotted");
+    if (FallenNoteOnce(&seen, 77)) Fail("a second death call of the same uid adds nothing");
+    if (!FallenNoteOnce(&seen, 78)) Fail("another uid is its own first time");
+    if (FallenNoteOnce(&seen, 0)) Fail("uid 0 is never snapshotted");
+    std::vector<Fallen> list; FallenPush(&list, T556Snap(77, "a")); Fallen out; FallenTake(&list, 0, &out);
+    if (FallenNoteOnce(&seen, out.uid) || !list.empty()) Fail("a uid already brought back is never listed again");
+}
+/* ---- T-556 effort 2: the fallen list on the world server, and a named character brought back (src/common/fallenwire.h) ---- */
+void t_t556_fallen_wire()
+{
+    using namespace swfallen;
+    if (kMsgFallen != 61) Fail("FALLEN is not 61");
+    Fallen a = T556Snap(0x00C00031u, "Ruka");
+    std::vector<char> b; Up u;
+    EncodeAdd(&b, a);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpAdd || u.uid != a.uid || !T556Same(u.snap, a)) Fail("an ADD round trip");
+    std::vector<char> more(b); more.push_back(0);
+    if (DecodeUp(&more[0], more.size(), &u)) Fail("an ADD with trailing bytes was accepted");
+    for (size_t cut = 0; cut < b.size(); cut += 7) if (DecodeUp(&b[0], cut, &u)) { Fail("a truncated ADD was accepted"); break; }
+    EncodeTake(&b, 0x00C00031u, 7731u);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpTake || u.uid != 0x00C00031u || u.newSerial != 7731u) Fail("a TAKE round trip");
+    EncodeAsk(&b);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpAsk) Fail("an ASK round trip");
+    EncodeAlive(&b, 55);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpAlive || u.uid != 55) Fail("an ALIVE round trip");
+    EncodeUndo(&b, 56);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpUndo || u.uid != 56) Fail("an UNDO round trip");
+    std::vector<unsigned int> ids; ids.push_back(3); ids.push_back(9);
+    EncodeSaved(&b, ids);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpSaved || u.uids != ids) Fail("a SAVED round trip");
+    b[1] = 41;   /* the count past 40 */
+    if (DecodeUp(&b[0], b.size(), &u)) Fail("a SAVED of 41 was accepted");
+    b.assign(1, (char)9);
+    if (DecodeUp(&b[0], b.size(), &u)) Fail("an unknown kind was accepted");
+    std::vector<Fallen> rows, back; std::vector<Pend> pend; std::vector<PendWire> pw;
+    for (unsigned int i = 1; i <= 3; ++i) rows.push_back(T556Snap(i, "r"));
+    rows[1].unique = 0; rows[1].sid = "";
+    Pend p; p.row = T556Snap(40, "taken"); p.newSerial = 9001; pend.push_back(p);
+    EncodeTable(&b, rows, pend);
+    if (!DecodeTable(&b[0], b.size(), &back, &pw) || back.size() != 3 || !T556Same(back[0], rows[0]) || !T556Same(back[1], rows[1])
+        || pw.size() != 1 || pw[0].uid != 40 || pw[0].newSerial != 9001 || !T556Same(pw[0].row, p.row)) Fail("a TABLE round trip, pending rows included");
+    EncodeTable(&b, std::vector<Fallen>(), std::vector<Pend>());
+    if (!DecodeTable(&b[0], b.size(), &back, &pw) || !back.empty() || !pw.empty()) Fail("an empty TABLE round trip");
+    for (unsigned int i = 4; i <= 45; ++i) rows.push_back(T556Snap(i, "r"));
+    EncodeTable(&b, rows, pend);
+    if (!DecodeTable(&b[0], b.size(), &back, &pw) || (int)back.size() != kFallenKeep) Fail("a TABLE carries at most 40 rows");
+    b[1] = 41; b[2] = 0; b[3] = 0; b[4] = 0;
+    if (DecodeTable(&b[0], b.size(), &back, &pw)) Fail("a TABLE claiming 41 rows was accepted");
+    EncodeAdd(&b, a);
+    if (DecodeTable(&b[0], b.size(), &back, &pw)) Fail("an ADD read as a TABLE");
+}
+void t_t556_fallen_book_file()
+{
+    using namespace swfallen;
+    Book bk;
+    int cut = 0;
+    for (unsigned int u = 1; u <= 45; ++u) cut += BookAdd(&bk, "p100.1", T556Snap(u, "alex"));
+    BookAdd(&bk, "p200.2", T556Snap(900, "sam"));
+    if ((int)BookList(bk, "p100.1").size() != kFallenKeep || cut != 5 || BookList(bk, "p100.1")[0].uid != 45) Fail("40 per profile, newest first");
+    if (BookList(bk, "p200.2").size() != 1 || BookRows(bk) != 41) Fail("each profile has its own list");
+    if (BookAdd(&bk, "p100.1", T556Snap(12, "again")) != 0 || BookList(bk, "p100.1")[0].name != "again" || (int)BookList(bk, "p100.1").size() != kFallenKeep) Fail("an ADD replaces an older row of the same character");
+    int twelves = 0; for (size_t i = 0; i < BookList(bk, "p100.1").size(); ++i) if (BookList(bk, "p100.1")[i].uid == 12) ++twelves;
+    if (twelves != 1) Fail("one row per character");
+    BookAdd(&bk, "p200.2", T556Snap(12, "same uid, other profile"));
+    if (BookList(bk, "p200.2").size() != 2) Fail("another profile's row of the same uid is its own");
+    /* take -> pending */
+    Fallen out;
+    if (!BookTake(&bk, "p100.1", 12, 5012, &out) || out.name != "again" || (int)BookList(bk, "p100.1").size() != kFallenKeep - 1
+        || BookPending(bk, "p100.1").size() != 1 || BookPending(bk, "p100.1")[0].newSerial != 5012) Fail("a TAKE makes the row pending");
+    if (BookTake(&bk, "p100.1", 12, 5012, &out)) Fail("a second TAKE of the same row finds nothing");
+    if (BookTake(&bk, "p300.1", 1, 1, &out)) Fail("a TAKE for a profile with no list finds nothing");
+    /* the file, pending rows included */
+    const std::string text = BookFile(bk);
+    if (text.find("\nP ") == std::string::npos) Fail("a pending row is written as a P line");
+    Book rd; std::istringstream f(text); std::string line; int bad = 0;
+    while (std::getline(f, line)) { int why = 0; if (!BookParseLine(line + "\r", &rd, &why)) ++bad; }
+    if (bad != 0 || BookFile(rd) != text) Fail("the file does not read back");
+    if (BookList(rd, "p100.1")[0].uid != 45 || !T556Same(BookList(rd, "p200.2")[1], T556Snap(900, "sam")) || BookPending(rd, "p100.1")[0].newSerial != 5012) Fail("the file's order or rows differ");
+    int why = 0;
+    const std::string first = text.substr(0, text.find('\n'));
+    if (BookParseLine(first, &rd, &why) || why != kLineDuplicate) Fail("a duplicate row is refused");
+    const std::string pline = text.substr(text.find("\nP ") + 1, text.find('\n', text.find("\nP ") + 1) - text.find("\nP ") - 1);
+    if (BookParseLine("F" + pline.substr(1, pline.find(' ', 2) - 1) + " " + pline.substr(pline.find(' ', pline.find(' ', 2) + 1) + 1), &rd, &why) || why != kLineDuplicate) Fail("a listed row of a pending uid is refused");
+    if (BookParseLine("F zz 00", &rd, &why) || why != kLineBad) Fail("bad hex is refused");
+    if (BookParseLine("P 7066 x1 00", &rd, &why) || why != kLineBad) Fail("a P line with a bad serial is refused");
+    if (BookParseLine("X 00 00", &rd, &why) || BookParseLine("", &rd, &why)) Fail("a line that is not an F / P line is refused");
+    Book full; for (unsigned int u = 1; u <= 41; ++u) { std::vector<char> by; EncodeFallen(T556Snap(u, "x"), &by); const std::string l = "F " + Hex("pf", 2) + " " + Hex(&by[0], by.size()); BookParseLine(l, &full, &why); }
+    if (why != kLineOverKeep || (int)BookList(full, "pf").size() != kFallenKeep) Fail("a 41st row in the file is refused");
+    /* saved, undo */
+    Pend pd;
+    if (BookSaved(&bk, "p100.1", 99, &pd)) Fail("SAVED of a row that is not pending finds nothing");
+    Book undo = bk;
+    if (!BookSaved(&bk, "p100.1", 12, &pd) || pd.row.uid != 12 || !BookPending(bk, "p100.1").empty() || bk.pending.count("p100.1") != 0) Fail("SAVED makes a pending row final");
+    if (!BookUndo(&undo, "p100.1", 12, &pd, &cut) || cut != 0 || (int)BookList(undo, "p100.1").size() != kFallenKeep || !BookPending(undo, "p100.1").empty()) Fail("UNDO puts the row back on the list");
+    if (BookList(undo, "p100.1")[kFallenKeep - 1].uid != 12) Fail("the row goes back in its place by time of death (after rows of the same time)");
+    Book order; Fallen older = T556Snap(70, "older"); older.diedUnix = 100; Fallen newer = T556Snap(71, "newer"); newer.diedUnix = 300;
+    BookAdd(&order, "q", older); BookAdd(&order, "q", newer);
+    Fallen mid = T556Snap(72, "mid"); mid.diedUnix = 200; BookAdd(&order, "q", mid); BookTake(&order, "q", 72, 1, &out);
+    if (!BookUndo(&order, "q", 72, &pd, &cut) || BookList(order, "q")[0].uid != 71 || BookList(order, "q")[1].uid != 72 || BookList(order, "q")[2].uid != 70) Fail("UNDO keeps newest first");
+    {
+        Book sp; Fallen first = T556Snap(80, "eve"); first.handSerial = 380; first.diedUnix = 100;
+        BookAdd(&sp, "r", first); BookTake(&sp, "r", 80, 880, &out);
+        Fallen again = T556Snap(81, "eve"); again.handSerial = 880; again.diedUnix = 200;   /* the brought-back eve died too */
+        BookAdd(&sp, "r", again);
+        std::vector<Fallen> samePerson;
+        if (!BookUndo(&sp, "r", 80, &pd, &cut, &samePerson) || BookList(sp, "r").size() != 1 || BookList(sp, "r")[0].uid != 80
+            || samePerson.size() != 1 || samePerson[0].uid != 81) Fail("UNDO drops the brought-back character's own later death: one person, one row");
+    }
+    BookTake(&order, "q", 70, 1, &out);
+    BookAdd(&order, "q", T556Snap(70, "died again"));
+    if (!BookPending(order, "q").empty() || BookList(order, "q")[0].name != "died again") Fail("a new death of a pending uid replaces the pending row");
+    /* alive, profile deleted */
+    if (!BookDrop(&bk, "p200.2", 900, &out) || BookList(bk, "p200.2").size() != 1) Fail("ALIVE drops a listed row");
+    if (BookDrop(&bk, "p200.2", 900, &out)) Fail("a second ALIVE finds nothing");
+    BookTake(&bk, "p200.2", 12, 3, &out);
+    if (bk.lists.count("p200.2") != 0 || BookPending(bk, "p200.2").size() != 1) Fail("an emptied list goes, its pending row stays");
+    if (BookProfileDeleted(&bk, "p200.2") != 1 || bk.pending.count("p200.2") != 0) Fail("a deleted profile's pending rows go");
+    if (BookProfileDeleted(&bk, "p100.1") != (size_t)(kFallenKeep - 1) || BookRows(bk) != 0 || BookPendingRows(bk) != 0 || BookProfileDeleted(&bk, "p100.1") != 0) Fail("a deleted profile's list goes");
+    if (BookFile(bk) != "") Fail("an empty book writes an empty file");
+}
+void t_t556_fallen_table_apply()
+{
+    using namespace swfallen;
+    std::vector<Fallen> table, list; std::vector<Taken> taken;
+    for (unsigned int u = 1; u <= 3; ++u) table.push_back(T556Snap(u, "t"));
+    TableApply(table, &taken, &list);
+    if (list.size() != 3 || !taken.empty()) Fail("a table becomes the copy");
+    Taken t; t.uid = 2; t.gen = 1; t.sentMs = 1000; taken.push_back(t);
+    TableApply(table, &taken, &list);
+    if (list.size() != 2 || list[0].uid != 1 || list[1].uid != 3 || taken.size() != 1) Fail("a table sent before the TAKE was handled does not offer the row again");
+    if (RetryDue(1, 1000, 1, 1000 + kRetryMs - 1)) Fail("not due on the same link before the wait");
+    if (!RetryDue(1, 1000, 1, 1000 + kRetryMs)) Fail("due on the same link after the wait (a refused TAKE)");
+    if (!RetryDue(1, 1000, 2, 1001)) Fail("due at once on a new link");
+    if (!RetryDue(-1, 0, 2, 5)) Fail("a message never sent is due once a link is up");
+    if (RetryDue(-1, 0, -1, 5) || RetryDue(1, 0, -1, 99999)) Fail("never due with no link");
+    if (!RetryDue(1, 0xFFFFFF00u, 1, 0xFFFFFF00u + kRetryMs)) Fail("the wait survives the tick counter wrapping");
+    table.erase(table.begin() + 1);   /* the server dropped row 2 */
+    TableApply(table, &taken, &list);
+    if (!taken.empty() || list.size() != 2) Fail("a taken row the table no longer lists is forgotten");
+    TableApply(std::vector<Fallen>(), &taken, &list);
+    if (!list.empty()) Fail("an empty table empties the copy");
+}
+swfallen::LiveChar T556Live(unsigned int serial, const char* name, const char* tmpl, const char* race)
+{
+    swfallen::LiveChar c; c.serial = serial; c.name = name; c.templateName = tmpl; c.race = race; return c;
+}
+void t_t556_fallen_reconcile()
+{
+    using namespace swfallen;
+    std::vector<Fallen> listed; std::vector<PendWire> pend; std::vector<LiveChar> live; Reconciled out;
+    Fallen alex = T556Snap(1, "alex"); alex.handSerial = 501; alex.unique = 0;
+    Fallen sam = T556Snap(2, "sam"); sam.handSerial = 502; sam.unique = 0;
+    Fallen noHand = T556Snap(3, "unread"); noHand.handSerial = 0; noHand.unique = 0;
+    Fallen seto = T556Snap(4, "Seto"); seto.handSerial = 504; seto.unique = 1; seto.templateName = "Seto"; seto.race = "Shek";
+    Fallen other = T556Snap(5, "pup"); other.handSerial = 505; other.unique = 0; other.templateName = "Bonedog"; other.race = "Bonedog";
+    listed.push_back(alex); listed.push_back(sam); listed.push_back(noHand); listed.push_back(seto); listed.push_back(other);
+    live.push_back(T556Live(501, "alex", "Greenlander", "Greenlander"));
+    live.push_back(T556Live(504, "Seto", "Seto", "Shek"));
+    live.push_back(T556Live(505, "rex", "Garru", "Garru"));   /* the pup's serial on another kind of character */
+    live.push_back(T556Live(0, "zero", "Greenlander", "Greenlander"));
+    Reconcile(listed, pend, live, false, &out);
+    if (out.alive.size() != 1 || out.alive[0] != 1) Fail("ALIVE: same serial and kind only; never an unread handle, never a named row, never another kind on the same serial");
+    if (!out.saved.empty() || !out.undo.empty() || !out.held.empty()) Fail("between loads only the ALIVE check runs");
+    /* pending, once per load */
+    PendWire bySerial; bySerial.uid = 10; bySerial.newSerial = 610; bySerial.row = T556Snap(10, "ana"); bySerial.row.unique = 0; bySerial.row.handSerial = 410;
+    PendWire byName; byName.uid = 11; byName.newSerial = 611; byName.row = T556Snap(11, "ben"); byName.row.unique = 0; byName.row.handSerial = 411;
+    PendWire onlyOriginal; onlyOriginal.uid = 12; onlyOriginal.newSerial = 612; onlyOriginal.row = T556Snap(12, "cal"); onlyOriginal.row.unique = 0; onlyOriginal.row.handSerial = 412;
+    PendWire gone; gone.uid = 13; gone.newSerial = 613; gone.row = T556Snap(13, "dee"); gone.row.unique = 0; gone.row.handSerial = 413;
+    PendWire namedNoProof; namedNoProof.uid = 14; namedNoProof.newSerial = 614; namedNoProof.row = T556Snap(14, "Ruka"); namedNoProof.row.unique = 1; namedNoProof.row.handSerial = 414;
+    PendWire namedProof; namedProof.uid = 15; namedProof.newSerial = 615; namedProof.row = T556Snap(15, "Burn"); namedProof.row.unique = 1; namedProof.row.handSerial = 415;
+    pend.push_back(bySerial); pend.push_back(byName); pend.push_back(onlyOriginal); pend.push_back(gone); pend.push_back(namedNoProof); pend.push_back(namedProof);
+    live.clear();
+    live.push_back(T556Live(610, "someone", "Greenlander", "Greenlander"));   /* the new serial */
+    live.push_back(T556Live(9999, "ben", "Greenlander", "Greenlander"));      /* ben by name, template and race under another serial */
+    live.push_back(T556Live(412, "cal", "Greenlander", "Greenlander"));       /* cal's ORIGINAL character: not the bring-back */
+    live.push_back(T556Live(415, "Burn", "Greenlander", "Greenlander"));      /* Burn's original alive: the save predates the death */
+    Reconcile(std::vector<Fallen>(), pend, live, true, &out);
+    if (out.saved.size() != 2 || out.saved[0] != 10 || out.saved[1] != 11) Fail("a bring-back is in the loaded world by its new serial, or by name + template + race");
+    if (out.undo.size() != 3 || out.undo[0] != 12 || out.undo[1] != 13 || out.undo[2] != 15) Fail("UNDO: the row's own original is not the bring-back; an absent one is undone; a named one only with its original alive");
+    if (out.held.size() != 1 || out.held[0] != 14) Fail("a named bring-back with no proof the save predates it stays pending");
+    /* the unanswered TAKE / ALIVE carried over a teardown */
+    Taken take; take.kind = kUpTake; take.newSerial = 610;
+    Taken alive; alive.kind = kUpAlive; alive.rowSerial = 412;
+    Taken absent; absent.kind = kUpTake; absent.newSerial = 777;
+    if (!TakenStillTrue(take, live) || !TakenStillTrue(alive, live) || TakenStillTrue(absent, live)) Fail("a carried-over TAKE / ALIVE is kept only while true in the new world");
+    Taken noSerial; noSerial.kind = kUpAlive;
+    if (TakenStillTrue(noSerial, live)) Fail("a carried-over message with no serial is dropped");
+}
+void t_t556_unique_bring_back()
+{
+    using namespace swfallen;
+    UniqueRow r;
+    if (UniqueOnGameState(false, &r, 0, 1) != kUqStored || r.state != 0 || r.playerInvolved != 1 || r.back != 0) Fail("a death is stored");
+    if (UniqueOnGameState(true, &r, 1, 0) != kUqRefusedDead || r.state != 0) Fail("DEAD is final for a game's ALIVE");
+    if (UniqueOnGameState(true, &r, 2, 0) != kUqRefusedDead) Fail("DEAD is final for a game's IMPRISONED");
+    if (UniqueOnBringBack(true, &r) != 0 || r.state != 1 || r.playerInvolved != 0 || r.back != 1 || r.backNow != 1) Fail("a bring-back makes the row ALIVE, back 1");
+    if (UniqueOnGameState(true, &r, 2, 0) != kUqStored || r.state != 2 || r.back != 1) Fail("a brought-back character's states are stored, back kept");
+    if (UniqueOnGameState(true, &r, 0, 1) != kUqStored || r.state != 0 || r.back != 1) Fail("a brought-back character's death is recorded again");
+    if (UniqueOnGameState(true, &r, 1, 0) != kUqRefusedDead) Fail("dead again is final again");
+    if (UniqueOnBringBack(true, &r) != 0 || r.state != 1 || r.back != 2 || r.backNow != 2) Fail("a second bring-back: back 2");
+    UniqueRow u = r; UniqueOnUndo(&u);
+    if (u.state != 0 || u.back != 1 || u.backNow != 1) Fail("an UNDO makes it DEAD again, back - 1");
+    UniqueRow zero; zero.state = 0; UniqueOnUndo(&zero);
+    if (zero.back != 0 || zero.backNow != 0) Fail("an UNDO never takes back below 0");
+    UniqueRow none;
+    if (UniqueOnBringBack(false, &none) != -1 || none.state != 1 || none.back != 1) Fail("a bring-back with no row makes one");
+    /* the file line */
+    std::string sid; UniqueRow p;
+    UniqueRow dead; dead.state = 0; dead.playerInvolved = 1;
+    if (UniqueFileLine("42-rebirth.mod", dead) != "v1\t42-rebirth.mod\t0\t1\n") Fail("a row never brought back keeps the v1 line: " + UniqueFileLine("42-rebirth.mod", dead));
+    if (UniqueFileLine("42-rebirth.mod", r) != "v2\t42-rebirth.mod\t1\t0\t2\n") Fail("a brought-back row is a v2 line");
+    if (!UniqueParseFileLine("v1\t42-rebirth.mod\t0\t1\r", &sid, &p) || sid != "42-rebirth.mod" || p.state != 0 || p.playerInvolved != 1 || p.back != 0) Fail("a v1 line reads");
+    if (!UniqueParseFileLine(UniqueFileLine("Seto", r), &sid, &p) || sid != "Seto" || p.state != 1 || p.back != 2 || p.backNow != 0) Fail("a v2 line reads back (backNow is never written)");
+    if (UniqueParseFileLine("v1\t\t0\t0", &sid, &p) || UniqueParseFileLine("v1\tx\t3\t0", &sid, &p) || UniqueParseFileLine("v2\tx\t1\t0", &sid, &p) || UniqueParseFileLine("v3\tx\t1\t0\t1", &sid, &p))
+        Fail("an empty sid, a state past 2, a short v2 line and another version are refused");
+    /* the deferred merge: memory started from an empty map, so a bring-back this session has back = backNow = 1 */
+    UniqueRow merged;
+    UniqueRow fileDead; fileDead.state = 0;
+    UniqueRow held; UniqueOnBringBack(false, &held);
+    if (UniqueMergeRows(true, fileDead, held, &merged) != coopmerge::kMergeTakeDeferred || merged.state != 1 || merged.back != 1 || merged.backNow != 0) Fail("a bring-back held while the file was shut wins over the file's DEAD");
+    UniqueRow fileDeadBack1; fileDeadBack1.state = 0; fileDeadBack1.back = 1;   /* brought back once before, died again */
+    if (UniqueMergeRows(true, fileDeadBack1, held, &merged) != coopmerge::kMergeTakeDeferred || merged.state != 1 || merged.back != 2) Fail("a second bring-back held while the file was shut wins too, and its count adds to the file's");
+    UniqueRow heldAlive; heldAlive.state = 1;
+    if (UniqueMergeRows(true, fileDeadBack1, heldAlive, &merged) != coopmerge::kMergeKeepLoaded || merged.state != 0 || merged.back != 1) Fail("an ALIVE with no bring-back this session stays refused, the file's count kept");
+    UniqueRow heldUndone = held; UniqueOnUndo(&heldUndone);
+    if (UniqueMergeRows(true, fileDeadBack1, heldUndone, &merged) != coopmerge::kMergeTakeDeferred || merged.state != 0 || merged.back != 1) Fail("an undone bring-back never lowers the file's count");
+    UniqueRow fileAliveBack3; fileAliveBack3.state = 1; fileAliveBack3.back = 3; UniqueRow heldDeath; heldDeath.state = 0;
+    if (UniqueMergeRows(true, fileAliveBack3, heldDeath, &merged) != coopmerge::kMergeTakeDeferred || merged.state != 0 || merged.back != 3) Fail("a death held while shut is stored, the count kept");
+    if (UniqueMergeRows(false, UniqueRow(), held, &merged) != coopmerge::kMergeInsertDeferred || merged.back != 1 || merged.backNow != 0) Fail("a row the file lacks is inserted");
+    /* a game's side */
+    if (!BringBackWrite(0, 1, 1, 0)) Fail("the server's bring-back is written over this game's DEAD");
+    if (!BringBackWrite(0, 2, 1, 0)) Fail("an IMPRISONED brought-back character is written too");
+    if (BringBackWrite(0, 1, 0, 0)) Fail("an ALIVE with no bring-back never lifts a DEAD");
+    if (BringBackWrite(0, 1, 1, 1)) Fail("this game's own dead body keeps its DEAD (it died again)");
+    if (BringBackWrite(1, 0, 1, 0) || BringBackWrite(2, 1, 1, 0)) Fail("only a DEAD entry is written past");
+    if (DeadMayPublish(0, 1)) Fail("a DEAD read while a living own character carries the record is not published");
+    if (!DeadMayPublish(0, 0) || !DeadMayPublish(1, 1)) Fail("a DEAD with no living carrier, and every other state, are published");
+}
+void t_t556_fallen_protocol_74()
+{
+    const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
+    if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
+    if (plugin.find("kStoreMsgFallen = 61;") == std::string::npos || server.find("MSG_FALLEN = 61") == std::string::npos || swfallen::kMsgFallen != 61u) Fail("FALLEN is not 61 on both sides and in fallenwire.h");
+    if (server.find("PutU32(&m, r.back)") == std::string::npos) Fail("the world server's UNIQUE_STATE does not carry the bring-back count");
+}
+
+/* ---- T-556 effort 3a: the resurrection fee, its host options and A (src/common/resurrectfee.h, fallenwire.h back rows) ---- */
+void t_t556_fee_price()
+{
+    using namespace swfee;
+    Price p = PriceFor(1000, kGrowthSteep, 0);
+    if (p.price != 0 || p.capped || p.alive != 0) Fail("A = 0: free");
+    p = PriceFor(1000, kGrowthSteep, 1);
+    if (p.price != 1000) Fail("steep, A = 1: the amount");
+    p = PriceFor(1000, kGrowthSteep, 2);
+    if (p.price != 4000 || p.amount != 1000 || p.alive != 2 || p.growth != kGrowthSteep) Fail("steep, A = 2: 1000 x 2 x 2 = 4000, with its parts");
+    p = PriceFor(1000, kGrowthSteady, 3);
+    if (p.price != 3000 || p.growth != kGrowthSteady) Fail("steady, A = 3: 1000 x 3 = 3000");
+    if (PriceFor(1000, kGrowthSteep, 3).price != 9000) Fail("steep, A = 3: 9000");
+    if (PriceFor(0, kGrowthSteep, 5).price != 0) Fail("an amount of 0 is free");
+    if (PriceFor(-5, kGrowthSteep, 2).price != 0 || PriceFor(1000, kGrowthSteep, -2).price != 0) Fail("a negative amount or A reads as 0");
+    if (PriceFor(1000, 7, 2).price != 4000 || PriceFor(1000, 7, 2).growth != kGrowthSteep) Fail("an unknown growth reads as steep");
+    p = PriceFor(kMoneyMax, kGrowthSteady, 1);
+    if (p.price != kMoneyMax || p.capped) Fail("the largest amount x 1 is exact, not capped");
+    p = PriceFor(kMoneyMax, kGrowthSteady, 2);
+    if (p.price != kMoneyMax || !p.capped) Fail("steady over the money field's max is capped there");
+    p = PriceFor(100000, kGrowthSteep, 200);   /* 100000 x 200 = 2e7, x 200 = 4e9: over */
+    if (p.price != kMoneyMax || !p.capped) Fail("steep over the money field's max is capped there");
+    p = PriceFor(53687, kGrowthSteep, 200);    /* 53687 x 40000 = 2147480000: under */
+    if (p.price != 2147480000LL || p.capped) Fail("steep just under the max is exact");
+    p = PriceFor(1, kGrowthSteep, 2147483647);
+    if (p.price != kMoneyMax || !p.capped) Fail("a huge A does not overflow");
+    if (RuleWords(PriceFor(1000, kGrowthSteep, 2)) != "steep: 1000 x 2 x 2 = 4000") Fail("the steep rule's words");
+    if (RuleWords(PriceFor(1000, kGrowthSteady, 3)) != "steady: 1000 x 3 = 3000") Fail("the steady rule's words");
+    if (RuleWords(PriceFor(1000, kGrowthSteep, 0)).find("free") == std::string::npos) Fail("a free price says so");
+    if (RuleWords(PriceFor(kMoneyMax, kGrowthSteady, 2)).find("capped") == std::string::npos) Fail("a capped price says so");
+}
+void t_t556_fee_options()
+{
+    using namespace swfee;
+    if (std::string(kKeyOn) != "resurrect" || std::string(kKeyAmount) != "resurrectfee" || std::string(kKeyGrowth) != "resurrectgrowth") Fail("the key names");
+    if (OnCode("on") != 1 || OnCode("off") != 0 || OnCode("On") != -1 || OnCode("") != -1) Fail("resurrect: on | off");
+    if (GrowthCode("steady") != kGrowthSteady || GrowthCode("steep") != kGrowthSteep || GrowthCode("flat") != -1) Fail("resurrectgrowth: steady | steep");
+    if (AmountCode("0") != 0 || AmountCode("1000") != 1000 || AmountCode("2147483647") != kMoneyMax) Fail("resurrectfee: 0 .. the money field's max");
+    if (AmountCode("2147483648") != -1 || AmountCode("01") != -1 || AmountCode("-1") != -1 || AmountCode("") != -1 || AmountCode("1e3") != -1
+        || AmountCode("12345678901") != -1 || AmountCode(" 5") != -1) Fail("resurrectfee: anything else is refused");
+    if (!OptionValueOk("resurrect", "off") || !OptionValueOk("resurrectfee", "250") || !OptionValueOk("resurrectgrowth", "steady")) Fail("legal values pass");
+    if (OptionValueOk("resurrect", "yes") || OptionValueOk("resurrectfee", "x") || OptionValueOk("resurrectgrowth", "") || OptionValueOk("resurrectcost", "1")) Fail("illegal values and other keys are refused");
+    if (!IsOptionKey("resurrectfee") || IsOptionKey("recruitmult")) Fail("IsOptionKey");
+    if (kDefaultGrowth != kGrowthSteep || kDefaultAmount != 1000) Fail("the defaults: steep, 1000");
+    const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp"), rs = T313ReadFile("../coop-plugin/resurrect.cpp");
+    if (plugin.empty() || server.empty() || rs.empty()) { Fail("could not read store.cpp, store_main.cpp or resurrect.cpp"); return; }
+    if (server.find("if (swfee::IsOptionKey(key)) return swfee::OptionValueOk(key, value);") == std::string::npos) Fail("the world server's OptionValueOk does not accept the resurrection keys");
+    if (plugin.find("if (coop::ResurrectOption(ok2, ov)) continue;") == std::string::npos || plugin.find("coop::ResurrectOptionsMapEnd(gpComplete && !rcRefusal);") == std::string::npos)
+        Fail("the game's OPTIONS drain does not hand the resurrection keys to resurrect.cpp");
+    if (rs.find("int g_optOn = 0,") == std::string::npos) Fail("resurrection is not off until the host's map says on");
+}
+void t_t556_back_rows()
+{
+    using namespace swfallen;
+    Book bk; Fallen out; Pend pd;
+    Fallen ana = T556Snap(10, "ana"); ana.unique = 0; ana.handSerial = 410;
+    Fallen ben = T556Snap(11, "ben"); ben.unique = 0; ben.handSerial = 411;
+    BookAdd(&bk, "p", ana); BookAdd(&bk, "p", ben);
+    BookTake(&bk, "p", 10, 610, &out); BookTake(&bk, "p", 11, 611, &out);
+    if (!BookBack(bk, "p").empty()) Fail("a pending bring-back is not a back row yet");
+    if (!BookSavedFinal(&bk, "p", 10, &pd) || BookBack(bk, "p").size() != 1 || BookPending(bk, "p").size() != 1) Fail("SAVED makes a back row");
+    const BackRow r = BookBack(bk, "p")[0];
+    if (r.uid != 10 || r.newSerial != 610 || r.origSerial != 410 || r.diedUid != 0 || r.name != "ana" || r.templateName != "Greenlander" || r.race != "Greenlander") Fail("the back row's fields");
+    if (BookSavedFinal(&bk, "p", 10, &pd)) Fail("a second SAVED finds nothing");
+    /* ben's bring-back dies before the save finishes: SAVED marks its back row dead at once */
+    Fallen ben2 = T556Snap(20, "ben"); ben2.unique = 0; ben2.handSerial = 611;
+    BookAdd(&bk, "p", ben2);
+    if (!BookSavedFinal(&bk, "p", 11, &pd) || BookBack(bk, "p")[0].newSerial != 611 || BookBack(bk, "p")[0].diedUid != 20) Fail("a bring-back already dead at its SAVED is marked dead");
+    /* ana's bring-back dies: its back row is marked by the death */
+    Fallen ana2 = T556Snap(21, "ana"); ana2.unique = 0; ana2.handSerial = 610;
+    BookAdd(&bk, "p", ana2);
+    if (BookBack(bk, "p")[1].diedUid != 21) Fail("a death with a back row's serial marks it dead");
+    Fallen other = T556Snap(22, "zed"); other.unique = 0; other.handSerial = 999;
+    BookAdd(&bk, "p", other);
+    if (BookBack(bk, "p")[1].diedUid != 21 || BookBack(bk, "p")[0].diedUid != 20) Fail("another death marks nothing");
+    /* ALIVE of ana's second death: the loaded save predates it - the back row is alive again */
+    if (!BookAlive(&bk, "p", 21, &out) || BookBack(bk, "p")[1].diedUid != 0) Fail("ALIVE of a back row's death makes it alive again");
+    if (BookAlive(&bk, "p", 21, &out)) Fail("a second ALIVE finds nothing");
+    /* the file, back rows included */
+    const std::string text = BookFile(bk);
+    if (text.find("\nB ") == std::string::npos) Fail("a back row is written as a B line");
+    Book rd2; std::istringstream f(text); std::string line; int bad = 0, why = 0;
+    while (std::getline(f, line)) if (!BookParseLine(line + "\r", &rd2, &why)) ++bad;
+    if (bad != 0 || BookFile(rd2) != text || BookBack(rd2, "p").size() != 2 || BookBack(rd2, "p")[0].diedUid != 20) Fail("back rows read back from the file in order");
+    const size_t bAt = text.find("\nB ") + 1;
+    const std::string bline = text.substr(bAt, text.find('\n', bAt) - bAt);
+    if (BookParseLine(bline, &rd2, &why) || why != kLineDuplicate) Fail("a B line of a serial already kept is refused");
+    if (BookParseLine("B 70 zz", &rd2, &why) || why != kLineBad || BookParseLine("B 70", &rd2, &why)) Fail("a bad B line is refused");
+    /* the wire */
+    std::vector<char> b; std::vector<Fallen> rows; std::vector<PendWire> pw; std::vector<BackRow> back;
+    EncodeTable(&b, BookList(bk, "p"), BookPending(bk, "p"), BookBack(bk, "p"));
+    if (!DecodeTable(&b[0], b.size(), &rows, &pw, &back) || back.size() != 2 || back[0].newSerial != 611 || back[1].name != "ana" || back[0].diedUid != 20) Fail("a TABLE carries the back rows");
+    if (!DecodeTable(&b[0], b.size(), &rows, &pw)) Fail("a TABLE decodes without keeping its back rows");
+    std::vector<char> more(b); more.push_back(0);
+    if (DecodeTable(&more[0], more.size(), &rows, &pw, &back)) Fail("a TABLE with trailing bytes after the back rows was accepted");
+    EncodeTable(&b, std::vector<Fallen>(), std::vector<Pend>());
+    b[b.size() - 4] = (char)((kBackMax + 1) & 0xFF); b[b.size() - 3] = (char)(((kBackMax + 1) >> 8) & 0xFF);
+    if (DecodeTable(&b[0], b.size(), &rows, &pw, &back)) Fail("a TABLE claiming more than kBackMax back rows was accepted");
+    std::vector<char> one; EncodeBack(r, &one);
+    BackRow r2;
+    if (!DecodeBack(&one[0], one.size(), &r2) || r2.newSerial != r.newSerial || r2.origSerial != r.origSerial || r2.name != r.name || r2.race != r.race) Fail("a back row round trip");
+    for (size_t cut = 0; cut < one.size(); ++cut) if (DecodeBack(&one[0], cut, &r2)) { Fail("a truncated back row was accepted"); break; }
+    one[0] = (char)(kBackVersion + 1);
+    if (DecodeBack(&one[0], one.size(), &r2)) Fail("another back row version was accepted");
+    one[0] = 1;   /* the form before the TAKE's time: never written by a released build, refused */
+    if (DecodeBack(&one[0], one.size(), &r2)) Fail("a version-1 back row was accepted");
+    /* trimming: dead rows beyond kBackDiedKeep go, oldest first; living rows stay */
+    std::vector<BackRow> v;
+    for (unsigned int i = 1; i <= (unsigned int)kBackDiedKeep + 10; ++i) { BackRow d; d.newSerial = 1000 + i; d.diedUid = i; BackPush(&v, d); }
+    for (unsigned int i = 1; i <= 5; ++i) { BackRow a; a.newSerial = 5000 + i; BackPush(&v, a); }
+    int dead = 0, alive = 0; for (size_t i = 0; i < v.size(); ++i) { if (v[i].diedUid) ++dead; else ++alive; }
+    if (dead != kBackDiedKeep || alive != 5 || v[0].newSerial != 5005 || v[v.size() - 1].newSerial != 1011) Fail("dead back rows beyond the keep go, oldest first; living ones stay");
+    BackRow again; again.newSerial = 5003; again.name = "again"; BackPush(&v, again);
+    int n5003 = 0; for (size_t i = 0; i < v.size(); ++i) if (v[i].newSerial == 5003) ++n5003;
+    if (n5003 != 1 || v[0].name != "again") Fail("a back row of the same character replaces the older one");
+    /* a deleted profile's back rows go */
+    if (BookProfileDeleted(&bk, "p") == 0 || !BookBack(bk, "p").empty() || BookBackRows(bk) != 0) Fail("a deleted profile's back rows go");
+}
+void t_t556_count_alive()
+{
+    using namespace swfallen;
+    std::vector<BackKey> keys; std::vector<LiveChar> live;
+    BackKey k;
+    k.newSerial = 610; k.origSerial = 410; k.byName = 1; k.name = "ana"; k.templateName = "Greenlander"; k.race = "Greenlander"; keys.push_back(k);   /* a back row */
+    k.newSerial = 611; k.origSerial = 411; k.byName = 1; k.name = "ben"; keys.push_back(k);                                                       /* a back row; ben is dead */
+    k.newSerial = 612; k.origSerial = 412; k.byName = 1; k.name = "cal"; keys.push_back(k);                                                       /* a pending row */
+    BackKey t; t.newSerial = 612; keys.push_back(t);                                                                                             /* cal's own TAKE too */
+    live.push_back(T556Live(610, "ana", "Greenlander", "Greenlander"));
+    live.push_back(T556Live(612, "cal", "Greenlander", "Greenlander"));
+    live.push_back(T556Live(700, "dee", "Greenlander", "Greenlander"));   /* never brought back */
+    BackCount c = CountBackAlive(keys, live);
+    if (c.alive != 2 || c.bySerial != 2 || c.byName != 0) Fail("living brought-back characters count once each; a dead one and an ordinary one do not");
+    live.push_back(T556Live(9611, "ben", "Greenlander", "Greenlander"));  /* ben under another serial (a load gave it a new one) */
+    c = CountBackAlive(keys, live);
+    if (c.alive != 3 || c.byName != 1) Fail("a key no serial matched may match by name, template and race");
+    keys[1].byName = 0;
+    if (CountBackAlive(keys, live).alive != 2) Fail("a key known dead never matches by name");
+    keys[1].byName = 1;
+    live.back().serial = 411;   /* ben's ORIGINAL character (a save that predates the death) */
+    if (CountBackAlive(keys, live).alive != 2) Fail("the dead character's own serial is not the bring-back");
+    live.back().serial = 9611; live.back().race = "Shek";
+    if (CountBackAlive(keys, live).alive != 2) Fail("another race does not match by name");
+    live.back().race = "Greenlander";
+    std::vector<LiveChar> two; two.push_back(T556Live(9001, "ana", "Greenlander", "Greenlander"));
+    std::vector<BackKey> twoKeys; BackKey a1 = keys[0]; a1.newSerial = 1; BackKey a2 = keys[0]; a2.newSerial = 2; twoKeys.push_back(a1); twoKeys.push_back(a2);
+    c = CountBackAlive(twoKeys, two);
+    if (c.alive != 1 || c.byName != 1) Fail("one living character counts once, however many keys name it");
+    std::vector<LiveChar> one; one.push_back(T556Live(610, "ana", "Greenlander", "Greenlander"));
+    std::vector<BackKey> both; both.push_back(keys[0]); BackKey other = keys[0]; other.newSerial = 777; both.push_back(other);
+    c = CountBackAlive(both, one);
+    if (c.alive != 1 || c.bySerial != 1 || c.byName != 0) Fail("a character counted by serial is not counted again by name");
+    if (CountBackAlive(std::vector<BackKey>(), live).alive != 0 || CountBackAlive(keys, std::vector<LiveChar>()).alive != 0) Fail("no keys or nobody alive: A = 0");
+    BackKey zero;
+    std::vector<BackKey> zk(1, zero); std::vector<LiveChar> zl(1, T556Live(0, "z", "t", "r"));
+    if (CountBackAlive(zk, zl).alive != 0) Fail("a serial of 0 never matches");
+}
+void t_t556_table_worst_fits()
+{
+    using namespace swfallen;
+    if (!(kTableWorstBytes < (size_t)(32u << 20))) Fail("the largest TABLE does not fit ENet's 32 MiB packet");
+    std::vector<Fallen> rows; std::vector<Pend> pend; std::vector<BackRow> back;
+    for (unsigned int u = 1; u <= (unsigned int)kFallenKeep; ++u)
+    {
+        Fallen f = T556Snap(u, "n"); f.look.assign(kLookMax, 'L'); f.name = std::string(kNameMax, 'n'); f.templateName = std::string(kTextMax, 't');
+        f.race = std::string(kTextMax, 'r'); f.sid = std::string(kTextMax, 's'); f.place = std::string(kTextMax, 'p');
+        rows.push_back(f);
+        Pend p; p.row = f; p.row.uid = 1000 + u; p.newSerial = u; pend.push_back(p);
+    }
+    for (int i = 0; i < kBackMax; ++i) { BackRow r; r.newSerial = (unsigned int)i + 1; r.name = std::string(kNameMax, 'n'); r.templateName = std::string(kTextMax, 't'); r.race = std::string(kTextMax, 'r'); back.push_back(r); }
+    std::vector<char> b; EncodeTable(&b, rows, pend, back);
+    if (b.size() > kTableWorstBytes) Fail("a TABLE at every cap is larger than kTableWorstBytes");
+    std::vector<Fallen> r2; std::vector<PendWire> p2; std::vector<BackRow> b2;
+    if (!DecodeTable(&b[0], b.size(), &r2, &p2, &b2) || (int)r2.size() != kFallenKeep || (int)p2.size() != kFallenKeep || (int)b2.size() != kBackMax) Fail("a TABLE at every cap round trips");
+}
+
+/* ---- T-556 effort 5: the FALLEN tab (src/common/fallentab.h) - the words of build/pages/resurrection.html ---- */
+void t_t556_tab_rows()
+{
+    using namespace swtab;
+    if (Money(0) != "c.0" || Money(999) != "c.999" || Money(1000) != "c.1,000" || Money(361000) != "c.361,000" || Money(2147483647LL) != "c.2,147,483,647")
+        Fail("money is written c.1,000");
+    swfallen::Fallen f = T556Snap(7, "Ruka");
+    f.race = "Shek"; f.day = 41; f.place = "Squin"; f.why = swfallen::kWhyBloodLoss; f.unique = 0;
+    Row r = RowFor(f);
+    if (r.uid != 7 || r.cell[0] != "Ruka" || r.cell[1] != "Shek" || r.cell[2] != "Day 41" || r.cell[3] != "near Squin" || r.cell[4] != "Blood loss") Fail("a row's cells");
+    f.why = swfallen::kWhyStarvation; if (RowFor(f).cell[4] != "Starvation") Fail("starvation");
+    f.why = swfallen::kWhyInjuries; if (RowFor(f).cell[4] != "Injuries") Fail("injuries");
+    f.why = swfallen::kWhyUnknown; if (RowFor(f).cell[4] != "Injuries") Fail("a row kept before the cause was read says injuries");
+    f.day = -1; f.place.clear(); r = RowFor(f);
+    if (!r.cell[2].empty() || !r.cell[3].empty()) Fail("no day and no town: empty cells");
+    f.race = "?"; f.templateName = "Bonedog"; if (RowFor(f).cell[1] != "Bonedog") Fail("an unread race shows the record name");
+    f.unique = 1; f.templateName = "Seto"; f.name = "Seto"; if (!RowFor(f).setoOrBigBo) Fail("Seto gets the extra sentence");
+    f.templateName = "Big Bo"; f.name = "Bo"; if (!RowFor(f).setoOrBigBo) Fail("Big Bo, renamed, gets the extra sentence");
+    f.unique = 0; f.templateName = "Seto"; f.name = "Seto"; if (RowFor(f).setoOrBigBo) Fail("only a named character gets the sentence");
+    if (SelectLine() != "Select a fallen character to bring them back. Your last 40 are kept.") Fail("the select line");
+    if (std::string(kEmptyLine) != "None of your characters has fallen.") Fail("the empty line");
+    std::vector<Row> a(1, RowFor(f)), b = a;
+    if (!SameRows(a, b) || RowOfUid(a, 7) != 0 || RowOfUid(a, 8) != -1 || RowOfUid(a, 0) != -1) Fail("rows compare and are found by uid");
+    b[0].cell[2] = "Day 2"; if (SameRows(a, b)) Fail("a changed cell is a change");
+    int w[kColumns]; ColumnWidths(1000, w);
+    int sum = 0; for (int c = 0; c < kColumns; ++c) sum += w[c];
+    if (sum != 1000 || std::string(ColumnHead(0)) != "NAME" || std::string(ColumnHead(4)) != "CAUSE") Fail("the columns");
+    if (StripButtonWidth(140, 7, 7) != 140 || StripButtonWidth(140, 7, 8) != 122 || StripButtonWidth(140, 7, 9) != 108) Fail("nine tabs share the strip of seven");
+    using swfallen::DeathWhy;
+    if (DeathWhy(swfallen::kCauseMedical, 1, 50.0f, -0.1f) != swfallen::kWhyStarvation || DeathWhy(swfallen::kCauseMedical, 1, -3.0f, 100.0f) != swfallen::kWhyBloodLoss
+        || DeathWhy(swfallen::kCauseMedical, 1, 40.0f, 100.0f) != swfallen::kWhyInjuries || DeathWhy(swfallen::kCauseOther, 1, -3.0f, -1.0f) != swfallen::kWhyInjuries
+        || DeathWhy(swfallen::kCauseMedical, 0, -3.0f, -1.0f) != swfallen::kWhyInjuries) Fail("how a death came");
+}
+void t_t556_tab_price_lines()
+{
+    using namespace swtab;
+    std::vector<std::string> none, one(1, "Tama"), two, nine;
+    two.push_back("Tama"); two.push_back("Hobbs");
+    nine = two; for (int i = 0; i < 7; ++i) nine.push_back("X");
+    PriceLines p = PriceLinesFor(1, 1000, swfee::kGrowthSteep, two);
+    if (!p.shown || p.line[0] != "PRICE c.4,000 (the host's steep rule: c.1,000 x 2 x 2)" || p.line[1] != "2 characters you brought back are alive: Tama, Hobbs."
+        || p.line[2] != "Each one alive makes the next cost more.") Fail("steep, two alive");
+    p = PriceLinesFor(1, 1000, swfee::kGrowthSteady, one);
+    if (p.line[0] != "PRICE c.1,000 (the host's steady rule: c.1,000 x 1)" || p.line[1] != "1 character you brought back is alive: Tama.") Fail("steady, one alive");
+    p = PriceLinesFor(1, 1000, swfee::kGrowthSteep, nine);
+    if (p.line[0] != "PRICE c.81,000 (the host's steep rule: c.1,000 x 9 x 9)" || p.line[1] != "9 characters you brought back are alive: Tama, Hobbs and 7 more.") Fail("nine alive: two names and 7 more");
+    std::vector<std::string> three(two); three.push_back("Mira");
+    if (AliveNames(three) != "Tama, Hobbs, Mira") Fail("three names are all listed");
+    p = PriceLinesFor(1, 1000, swfee::kGrowthSteep, none);
+    if (p.line[0] != "PRICE: free" || p.line[1] != "None of the characters you brought back is alive." || p.line[2] != "Each one alive makes the next cost more.") Fail("none alive: free");
+    p = PriceLinesFor(1, 0, swfee::kGrowthSteep, two);
+    if (p.line[0] != "PRICE: free" || p.line[1] != "The host has made bringing back free." || !p.line[2].empty()) Fail("amount 0: free");
+    p = PriceLinesFor(0, 1000, swfee::kGrowthSteep, two);
+    if (p.shown || !p.line[0].empty()) Fail("off: the price lines are hidden");
+    if (ButtonCaption(1, 4000) != "BRING BACK  c.4,000" || ButtonCaption(1, 0) != "BRING BACK" || ButtonCaption(0, 4000) != "BRING BACK") Fail("the button");
+    if (BesideLabel("Ruka") != "BRING RUKA BACK BESIDE" || MateItem("Beep", "Hub Crew") != "Beep  (Hub Crew)" || MateItem("Beep", "") != "Beep") Fail("the label and the drop-down's items");
+}
+void t_t556_tab_box_and_lines()
+{
+    using namespace swtab;
+    const std::string head = "Ruka returns with all limbs and no equipment. Their gear stays with their body where they fell.";
+    if (BoxText("Ruka", "Beep", 1000, swfee::kGrowthSteep, 2, 0) != "Bring Ruka back beside Beep for c.4,000? " + head
+        + " The price is c.1,000 x 2 x 2 because 2 characters you brought back are alive. After this one, the next will cost c.9,000.") Fail("the box, steep");
+    if (BoxText("Ruka", "Beep", 1000, swfee::kGrowthSteady, 2, 0) != "Bring Ruka back beside Beep for c.2,000? " + head
+        + " The price is c.1,000 x 2 because 2 characters you brought back are alive. After this one, the next will cost c.3,000.") Fail("the box, steady");
+    if (BoxText("Ruka", "Beep", 1000, swfee::kGrowthSteep, 0, 0) != "Bring Ruka back beside Beep? " + head
+        + " It is free because none of the characters you brought back is alive. After this one, the next will cost c.1,000.") Fail("the box, free");
+    if (BoxText("Ruka", "Beep", 0, swfee::kGrowthSteep, 3, 0) != "Bring Ruka back beside Beep? " + head) Fail("the box, amount 0");
+    if (BoxText("Seto", "Beep", 1000, swfee::kGrowthSteep, 2, 1) != "Bring Seto back beside Beep for c.4,000? Seto returns with all limbs and no equipment. Their gear stays with their body where they fell."
+        " The price is c.1,000 x 2 x 2 because 2 characters you brought back are alive. After this one, the next will cost c.9,000. What happened in the world because Seto died stays as it is.") Fail("the box, Seto");
+    if (std::string(kBoxTitle) != "BRING BACK" || std::string(kBoxCancel) != "CANCEL" || std::string(kBoxConfirm) != "BRING BACK") Fail("the box's title and buttons");
+    if (ProgressLine("Ruka") != "Bringing Ruka back..." || DoneLine("Ruka", "Beep", 4000) != "Ruka is back, beside Beep. Paid c.4,000." || DoneLine("Ruka", "Beep", 0) != "Ruka is back, beside Beep.")
+        Fail("the progress and done lines");
+    if (RefusalWords(kRefOff, "Ruka", "Beep", 0, 0) != "The host has turned off resurrection in this world."
+        || RefusalWords(kRefShort, "Ruka", "Beep", 4000, 1000) != "You need c.4,000 to bring back Ruka. You have c.1,000."
+        || RefusalWords(kRefNoMate, "Ruka", "", 0, 0) != "You need a living character for Ruka to come back beside."
+        || RefusalWords(kRefEnemy, "Ruka", "Beep", 0, 0) != "Enemies are near Beep. Pick someone else, or try again when it's safe."
+        || RefusalWords(kRefPriceChanged, "Ruka", "Beep", 1000, 0) != "The price is now c.1,000. Check it and press BRING BACK again."
+        || RefusalWords(kRefMateGone, "Ruka", "Beep", 0, 0) != "Beep can't be picked any more. Pick someone else."
+        || RefusalWords(kRefNoWorld, "Ruka", "Beep", 0, 0) != "Couldn't reach the world. Ruka was not brought back and nothing was paid. Try again in a moment."
+        || RefusalWords(kRefFailed, "Ruka", "Beep", 0, 0) != "Ruka was not brought back and nothing was paid. Try again in a moment.")
+        Fail("the refusals' words");
+    if (RefusalOfBeside(swfallen::kBesideEnemyNear) != kRefEnemy || RefusalOfBeside(swfallen::kBesideKnockedOut) != kRefMateGone || RefusalOfBeside(swfallen::kBesideDead) != kRefMateGone)
+        Fail("the road's placement refusals as the tab says them");
+}
+void t_t556_tab_states()
+{
+    using namespace swtab;
+    ViewIn in; in.on = 1; in.rows = 3; in.mates = 2; in.price = 4000; in.money = 9000; in.moneyRead = 1;
+    View v = ViewFor(in);
+    if (!v.priceShown || v.emptyShown || v.pickShown || v.btnEnabled || v.caption != kCapSelect) Fail("nothing selected: the select line, no picker");
+    in.selected = 1; v = ViewFor(in);
+    if (!v.pickShown || !v.pickEnabled || !v.btnEnabled || v.caption != kCapNone) Fail("a row selected: picker and button");
+    in.note = kRefEnemy; v = ViewFor(in);
+    if (!v.btnEnabled || v.caption != kCapRefusal || v.refusal != kRefEnemy) Fail("the press's refusal stays on the caption line");
+    in.note = kRefNone; in.money = 1000; v = ViewFor(in);
+    if (v.btnEnabled || !v.pickEnabled || v.refusal != kRefShort) Fail("short money: the button greyed, the price still shown");
+    in.money = 9000; in.mates = 0; v = ViewFor(in);
+    if (v.btnEnabled || v.pickEnabled || v.refusal != kRefNoMate) Fail("no one to come back beside");
+    in.mates = 2; in.busy = 1; v = ViewFor(in);
+    if (v.btnEnabled || v.pickEnabled || v.caption != kCapBusy) Fail("while it happens: the progress line, the button greyed");
+    in.busy = 0; in.on = 0; v = ViewFor(in);
+    if (v.priceShown || v.btnEnabled || v.pickEnabled || !v.pickShown || v.refusal != kRefOff) Fail("off: the list shown, price lines hidden, picker and button greyed");
+    in.on = 1; in.rows = 0; in.selected = 0; v = ViewFor(in);
+    if (!v.emptyShown || v.caption != kCapNone || !v.priceShown) Fail("the empty list");
+    if (ParseLever("open").kind != kLeverOpen || ParseLever("select 2").n != 2 || ParseLever("mate 1").kind != kLeverMate || ParseLever("press").kind != kLeverPress
+        || ParseLever("confirm").kind != kLeverConfirm || ParseLever("cancel").kind != kLeverCancel || ParseLever("").kind != kLeverReport
+        || ParseLever("select").kind != kLeverBad || ParseLever("select -1").kind != kLeverBad || ParseLever("open now").kind != kLeverBad || ParseLever("fly").kind != kLeverBad)
+        Fail("the lever's forms");
+}
+void t_t556_tab_fold1()
+{
+    using namespace swtab;
+    std::vector<int> t;
+    t.push_back(20); t.push_back(40); t.push_back(50); t.push_back(50); t.push_back(40); t.push_back(48); t.push_back(10); t.push_back(42); t.push_back(36);
+    std::vector<int> w = StripWidths(413, 8, t);
+    const int want[9] = { 28, 48, 58, 58, 48, 56, 18, 50, 49 };
+    int sum = 0; bool same = w.size() == 9;
+    for (size_t i = 0; same && i < 9; ++i) { same = w[i] == want[i]; sum += w[i]; }
+    if (!same || sum != 413) Fail("nine tabs whose captions do not fit equal shares: each its caption + pad, the rest shared");
+    std::vector<int> two; two.push_back(20); two.push_back(30);
+    w = StripWidths(413, 4, two);
+    if (w.size() != 2 || w[0] != 207 || w[1] != 206) Fail("captions that fit: equal shares filling the strip");
+    w = EqualWidths(413, 9);
+    sum = 0; for (size_t i = 0; i < w.size(); ++i) sum += w[i];
+    if (w.size() != 9 || w[0] != 46 || w[7] != 46 || w[8] != 45 || sum != 413) Fail("equal widths share the strip's remainder: 9 x 45 + 8 fills 413");
+    if (!EqualWidths(413, 0).empty() || EqualWidths(0, 3).size() != 3 || EqualWidths(0, 3)[0] != 0) Fail("equal widths of nothing");
+    std::vector<int> three(3, 30);
+    w = StripWidths(100, 10, three);
+    if (w.size() != 3 || w[0] != 33 || w[1] != 33 || w[2] != 34) Fail("captions with pad wider than the strip: the pad shrinks");
+    std::vector<int> wide(2, 30);
+    w = StripWidths(50, 5, wide);
+    if (w.size() != 2 || w[0] != 30 || w[1] != 30) Fail("captions wider than the strip: no pad");
+    if (!StripWidths(413, 8, std::vector<int>()).empty()) Fail("no tabs");
+    if (PlaceCell("The Hub") != "near the Hub" || PlaceCell("Squin") != "near Squin" || PlaceCell("Theodore") != "near Theodore" || PlaceCell("") != "")
+        Fail("a town named The ... reads the mid-sentence");
+    if (DayOfCell("Day 41") != 41 || DayOfCell("Day 0") != 0 || DayOfCell("Day") != -1 || DayOfCell("Day x") != -1 || DayOfCell("") != -1) Fail("the day in a DIED cell");
+    if (!CellLess(kDiedColumn, "Day 9", "Day 10") || CellLess(kDiedColumn, "Day 10", "Day 9") || !CellLess(kDiedColumn, "", "Day 0")
+        || !CellLess(0, "Day 10", "Day 9") || CellLess(0, "b", "a")) Fail("DIED sorts by the day's number, the rest by text");
+    if (DayWords(0) != "Day 0" || DayWords(-1) != "") Fail("day 0");
+    /* No row mapping to test: MyGUI's MultiListBox keeps its rows in the order they were added and sorts only how it draws
+       them - every public index (getIndexSelected, setIndexSelected, getSubItemNameAt) is the order of adding, which the game's
+       MyGUIEngine_x64.dll converts to the drawn order inside (convertToBack). The FALLEN list's index is its row's index. */
+    std::vector<int> sel(3, 0); sel[1] = 1; sel[2] = 1;
+    std::vector<int> none(2, 0);
+    if (StartMate(sel) != 1 || StartMate(none) != 0 || StartMate(std::vector<int>()) != -1) Fail("the drop-down starts on the character selected in the game, else the first");
+    ViewIn in; in.on = 1; in.rows = 3; in.selected = 1; in.mates = 2; in.price = 4000; in.money = 1000; in.moneyRead = 1; in.boxUp = 1;
+    View v = ViewFor(in);
+    if (!v.btnEnabled || !v.pickEnabled || v.caption != kCapNone) Fail("money spent while the box is open: nothing said until BRING BACK");
+    in.boxUp = 0; in.moneyRead = 0; in.money = 0; v = ViewFor(in);
+    if (!v.btnEnabled || v.caption != kCapNone) Fail("the purse unread: the button stays, nothing said");
+    if (RefusalWords(kRefPriceChanged, "Ruka", "Beep", 0, 0) != "The price is now free. Check it and press BRING BACK again.") Fail("the price is now free");
+    if (std::string(RefusalTag(kRefShort)) != "short" || std::string(RefusalTag(kRefNone)) != "none" || std::string(RefusalTag(kRefFailed)) != "failed"
+        || std::string(RefusalTag(kRefCodes)) != "?" || std::string(RefusalTag(-1)) != "?") Fail("the refusals' tags");
+    std::vector<std::string> four; four.push_back("A"); four.push_back("B"); four.push_back("C"); four.push_back("D");
+    if (AliveNames(four) != "A, B and 2 more") Fail("four names: two and 2 more");
+    if (ParseLever("select 2 3").kind != kLeverBad || ParseLever("report").kind != kLeverReport || ParseLever("mate 1 2").kind != kLeverBad) Fail("the lever's extra words");
+}
+void t_t556_count_alive_names()
+{
+    using namespace swfallen;
+    std::vector<BackKey> keys(2);
+    keys[0].newSerial = 900;   /* found by serial */
+    keys[1].newSerial = 901; keys[1].byName = 1; keys[1].name = "Hobbs"; keys[1].templateName = "Greenlander"; keys[1].race = "Greenlander";
+    std::vector<LiveChar> live(3);
+    live[0].serial = 12; live[0].name = "Hobbs"; live[0].templateName = "Greenlander"; live[0].race = "Greenlander";
+    live[1].serial = 900; live[1].name = "Tama";
+    live[2].serial = 13; live[2].name = "Beep";
+    std::vector<size_t> counted;
+    const BackCount c = CountBackAlive(keys, live, &counted);
+    if (c.alive != 2 || counted.size() != 2 || counted[0] != 1 || counted[1] != 0) Fail("who A counts, in the order counted (by serial, then by name)");
+    if (CountBackAlive(keys, live).alive != 2) Fail("the count without the list");
+}
+
+void t_t556_died_marks()
+{
+    using namespace swfallen;
+    Book bk; Fallen out; Pend pd;
+    /* a pending bring-back's death marks the pending row, and the mark outlives the death row being cut from the list */
+    Fallen eve = T556Snap(30, "eve"); eve.unique = 0; eve.handSerial = 430;
+    BookAdd(&bk, "p", eve); BookTake(&bk, "p", 30, 630, &out);
+    Fallen eve2 = T556Snap(31, "eve"); eve2.unique = 0; eve2.handSerial = 630; eve2.diedUnix = 1;
+    BookAdd(&bk, "p", eve2);
+    if (BookPending(bk, "p")[0].diedUid != 31) Fail("a pending bring-back's death marks its pending row");
+    for (unsigned int u = 100; u < 100 + (unsigned int)kFallenKeep; ++u) { Fallen x = T556Snap(u, "x"); x.unique = 0; x.handSerial = 9000 + u; BookAdd(&bk, "p", x); }
+    if (SerialDied(630, BookList(bk, "p"))) Fail("the death row was cut from the list");
+    std::vector<char> b; std::vector<Fallen> rows; std::vector<PendWire> pw;
+    EncodeTable(&b, BookList(bk, "p"), BookPending(bk, "p"));
+    if (!DecodeTable(&b[0], b.size(), &rows, &pw) || pw.size() != 1 || pw[0].diedUid != 31) Fail("a TABLE's pending row carries its died mark");
+    const std::string text = BookFile(bk);
+    if (text.find(" 630/31/0 ") == std::string::npos) Fail("a P line carries the died mark");
+    Book rd2; std::istringstream f(text); std::string line; int bad = 0, why = 0;
+    while (std::getline(f, line)) if (!BookParseLine(line, &rd2, &why)) ++bad;
+    if (bad != 0 || BookFile(rd2) != text || BookPending(rd2, "p")[0].diedUid != 31) Fail("the died mark reads back from the file");
+    if (BookParseLine("P 70 5/ 00", &rd2, &why) || BookParseLine("P 70 /5 00", &rd2, &why) || BookParseLine("P 70 5/x/1 00", &rd2, &why)
+        || BookParseLine("P 70 5/1 00", &rd2, &why) || BookParseLine("P 70 5/1/2/3 00", &rd2, &why) || BookParseLine("P 70 5/1/ 00", &rd2, &why)) Fail("a bad died mark is refused");
+    if (!BookSavedFinal(&bk, "p", 30, &pd) || BookBack(bk, "p")[0].diedUid != 31) Fail("SAVED carries the pending row's mark to the back row, the death row long cut");
+    /* ALIVE of the death clears a pending row's mark */
+    Book al; Fallen fay = T556Snap(40, "fay"); fay.unique = 0; fay.handSerial = 440;
+    BookAdd(&al, "p", fay); BookTake(&al, "p", 40, 640, &out);
+    Fallen fay2 = T556Snap(41, "fay"); fay2.unique = 0; fay2.handSerial = 640; BookAdd(&al, "p", fay2);
+    if (!BookAlive(&al, "p", 41, &out) || BookPending(al, "p")[0].diedUid != 0) Fail("ALIVE of the death clears the pending row's mark");
+    /* SAVED finds the death among the PENDING rows: the brought-back character died and was itself brought back */
+    Book re; Fallen gus = T556Snap(50, "gus"); gus.unique = 0; gus.handSerial = 450;
+    BookAdd(&re, "p", gus); BookTake(&re, "p", 50, 650, &out);
+    Pend hand; hand.row = T556Snap(51, "gus"); hand.row.unique = 0; hand.row.handSerial = 650; hand.newSerial = 750;
+    re.pending["p"].push_back(hand);   /* its death, already taken (pending), with no mark on the first row */
+    if (!BookSavedFinal(&re, "p", 50, &pd) || BookBack(re, "p")[0].diedUid != 51) Fail("SAVED finds the death among the pending rows");
+    /* a bring-back whose new serial is 0: the first later death of the same name, template and race marks it; no other does */
+    Book z; Fallen hal = T556Snap(60, "hal"); hal.unique = 0; hal.handSerial = 460;
+    BookAdd(&z, "p", hal); BookTake(&z, "p", 60, 0, &out);
+    Fallen notHal = T556Snap(61, "hal"); notHal.unique = 0; notHal.race = "Shek"; BookAdd(&z, "p", notHal);
+    if (BookPending(z, "p")[0].diedUid != 0) Fail("a death of another race does not mark a serial-0 bring-back");
+    Fallen hal2 = T556Snap(62, "hal"); hal2.unique = 0; BookAdd(&z, "p", hal2);
+    Fallen hal3 = T556Snap(63, "hal"); hal3.unique = 0; BookAdd(&z, "p", hal3);
+    if (BookPending(z, "p")[0].diedUid != 62) Fail("the first later death of the same name, template and race marks a serial-0 bring-back");
+    BookSavedFinal(&z, "p", 60, &pd);
+    Fallen hal4 = T556Snap(64, "hal"); hal4.unique = 0; BookAdd(&z, "p", hal4);
+    if (BookBack(z, "p")[0].diedUid != 62) Fail("a serial-0 back row keeps its first mark");
+    if (!DiesAs(hal2, 0, 60, "hal", "Greenlander", "Greenlander", 0) || DiesAs(hal, 0, 60, "hal", "Greenlander", "Greenlander", 0) || DiesAs(hal2, 0, 60, "", "Greenlander", "Greenlander", 0)
+        || !DiesAs(eve2, 630, 30, "x", "y", "z", 0) || DiesAs(eve2, 631, 30, "eve", "Greenlander", "Greenlander", 0)) Fail("DiesAs: by serial when read, else by name on another row");
+    if (DiesAs(hal2, 0, 60, "hal", "Greenlander", "Greenlander", hal2.diedUnix + 1) || !DiesAs(hal2, 0, 60, "hal", "Greenlander", "Greenlander", hal2.diedUnix)) Fail("DiesAs by name: only a death at or after the bring-back");
+    {   /* a serial-0 bring-back is not marked by a same-named death dated before its TAKE (an old ADD arriving late) */
+        Book late; Fallen ivy = T556Snap(70, "ivy"); ivy.unique = 0; ivy.handSerial = 470; ivy.diedUnix = 100;
+        BookAdd(&late, "p", ivy); BookTake(&late, "p", 70, 0, &out, 500);
+        if (BookPending(late, "p")[0].takenUnix != 500) Fail("the pending row keeps the TAKE's time");
+        Fallen old = T556Snap(71, "ivy"); old.unique = 0; old.diedUnix = 400; BookAdd(&late, "p", old);
+        if (BookPending(late, "p")[0].diedUid != 0) Fail("a same-named death before the TAKE does not mark a serial-0 bring-back");
+        Fallen after = T556Snap(72, "ivy"); after.unique = 0; after.diedUnix = 600; BookAdd(&late, "p", after);
+        if (BookPending(late, "p")[0].diedUid != 72) Fail("a same-named death after the TAKE marks it");
+        const std::string lt = BookFile(late);
+        if (lt.find(" 0/72/500 ") == std::string::npos) Fail("a P line carries the died mark and the TAKE's time");
+        Book lr; std::istringstream lf(lt); std::string ll; int lbad = 0;
+        while (std::getline(lf, ll)) if (!BookParseLine(ll, &lr, &why)) ++lbad;
+        if (lbad != 0 || BookFile(lr) != lt || BookPending(lr, "p")[0].takenUnix != 500) Fail("the TAKE's time reads back from the file");
+        BookSavedFinal(&late, "p", 70, &pd);
+        if (BookBack(late, "p")[0].takenUnix != 500 || BookBack(late, "p")[0].diedUid != 72) Fail("the back row keeps the TAKE's time and the mark");
+        std::vector<char> tb; Up tu; EncodeTake(&tb, 70, 0, 500);
+        if (!DecodeUp(&tb[0], tb.size(), &tu) || tu.kind != kUpTake || tu.takenUnix != 500) Fail("a TAKE carries its time");
+    }
+    if (SerialDied(0, BookList(z, "p"))) Fail("a serial of 0 never died");
+    /* trimming: dead rows go first when over kBackMax; living rows only when no dead row is left */
+    std::vector<BackRow> v;
+    for (int i = 0; i < 5; ++i) { BackRow d; d.newSerial = 100000 + (unsigned int)i; d.diedUid = 1 + (unsigned int)i; v.push_back(d); }
+    for (int i = 0; i < kBackMax - 5; ++i) { BackRow a; a.newSerial = 200000 + (unsigned int)i; v.push_back(a); }
+    int dropped = 0;
+    for (int i = 0; i < 5; ++i) { BackRow a; a.newSerial = 300000 + (unsigned int)i; dropped += BackPush(&v, a); }
+    int dead = 0; for (size_t i = 0; i < v.size(); ++i) if (v[i].diedUid) ++dead;
+    if ((int)v.size() != kBackMax || dead != 0 || dropped != 0) Fail("over kBackMax, dead rows go before any living row");
+    BackRow last; last.newSerial = 400000; dropped = BackPush(&v, last);
+    if ((int)v.size() != kBackMax || dropped != 1 || v[v.size() - 1].newSerial != 200000 + (unsigned int)(kBackMax - 7)) Fail("with no dead row left, the oldest living row goes, counted");
+    /* a B line past kBackMax has its own reason */
+    Book full; std::vector<char> by;
+    for (int i = 0; i <= kBackMax; ++i) { BackRow r; r.newSerial = 1 + (unsigned int)i; EncodeBack(r, &by); BookParseLine("B 70 " + Hex(&by[0], by.size()), &full, &why); }
+    if (why != kLineOverBack || (int)BookBack(full, "p").size() != kBackMax) Fail("a back row past kBackMax is refused as kLineOverBack");
+    /* the game's side, read: known-dead pending rows never match by name; money unread refuses only a priced bring-back; 40 pending refuse */
+    const std::string rs = T313ReadFile("../coop-plugin/resurrect.cpp");
+    if (rs.find("k.byName = (g_pendWire[i].diedUid == 0 && !DeathKnown(g_pendWire[i].newSerial)) ? 1 : 0;") == std::string::npos) Fail("a known-dead pending row may match by name");
+    if (rs.find("if (moneyRead != 1 && fee.price > 0)") == std::string::npos) Fail("an unread purse refuses a free bring-back");
+    if (rs.find("PendingNow() >= swfallen::kFallenKeep") == std::string::npos) Fail("a 41st pending bring-back is not refused");
+    if (rs.find("const int kRing = 256;") == std::string::npos) Fail("the noted-deaths ring holds fewer than a wiped squad");
+}
+
+/* ---- T-546 step 3 (t546a): the player-faction membership table and TEAM (60) - src/common/teamwire.h ---- */
+std::vector<char> T546Snap(const char* s) { return std::vector<char>(s, s + std::strlen(s)); }
+std::map<std::string, unsigned> T546Slots()
+{
+    std::map<std::string, unsigned> m;
+    m["alex.1"] = 0; m["sam.1"] = 1; m["kim.1"] = 2; m["jo.1"] = 3; m["max.1"] = 4;
+    return m;
+}
+/* the book written to the file and read back gives the same file text */
+bool T546FileRoundTrip(const swteam::Book& b)
+{
+    const std::string f = swteam::BookFile(b);
+    swteam::Book r; std::istringstream is(f); std::string line; int bad = 0;
+    while (std::getline(is, line)) if (!line.empty() && !swteam::BookParseLine(line, &r)) ++bad;
+    return bad == 0 && swteam::BookFile(r) == f;
+}
+void t_t546_team_wire_round_trip()
+{
+    using namespace swteam;
+    std::vector<char> b; Up u;
+    EncodeInvite(&b, 3, "The Rusty Blades");
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpInvite || u.slot != 3 || u.name != "The Rusty Blades") Fail("INVITE round trip");
+    const std::vector<char> snap = T546Snap("om3g-standing-bytes");
+    if (!EncodeAnswer(&b, true, 104, snap) || !DecodeUp(&b[0], b.size(), &u) || u.kind != kUpAnswer || u.accept != 1 || u.snapRows != 104 || u.snap != snap) Fail("ACCEPT round trip");
+    EncodeAnswer(&b, false, 0, std::vector<char>());
+    if (!DecodeUp(&b[0], b.size(), &u) || u.accept != 0 || !u.snap.empty()) Fail("DECLINE round trip");
+    EncodeLeave(&b); if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpLeave) Fail("LEAVE round trip");
+    EncodeRemove(&b, 2); if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpRemove || u.slot != 2) Fail("REMOVE round trip");
+    EncodeDisband(&b); if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpDisband) Fail("DISBAND round trip");
+    EncodeRestoreDone(&b, 7); if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpRestoreDone || u.no != 7) Fail("RESTORE_DONE round trip");
+    /* refusals: a trailing byte, a cut message, an unknown kind, an accept byte that is not 0 or 1, a down kind sent up */
+    EncodeRemove(&b, 2); b.push_back(0); if (DecodeUp(&b[0], b.size(), &u)) Fail("a trailing byte decoded");
+    EncodeInvite(&b, 3, "Name"); if (DecodeUp(&b[0], b.size() - 1, &u)) Fail("a cut INVITE decoded");
+    b.assign(1, (char)99); if (DecodeUp(&b[0], b.size(), &u)) Fail("an unknown kind decoded");
+    EncodeAnswer(&b, true, 1, snap); b[1] = 2; if (DecodeUp(&b[0], b.size(), &u)) Fail("an accept byte of 2 decoded");
+    EncodeInvited(&b, 0, "X", 60); if (DecodeUp(&b[0], b.size(), &u)) Fail("a down message decoded as up");
+    if (DecodeUp(0, 0, &u)) Fail("nothing decoded");
+    /* down */
+    Down d;
+    std::vector<WireTeam> t(1); t[0].no = 4; t[0].founderSlot = 0; t[0].name = "The Rusty Blades"; t[0].memberSlots.push_back(1); t[0].memberSlots.push_back(2);
+    EncodeTable(&b, t);
+    if (!DecodeDown(&b[0], b.size(), &d) || d.kind != kDnTable || d.table.size() != 1 || d.table[0].no != 4 || d.table[0].memberSlots.size() != 2 || d.table[0].memberSlots[1] != 2
+        || TableText(d.table) != "team 4 'The Rusty Blades' founder=s0 members=s1,s2") Fail("TABLE round trip: " + TableText(d.table));
+    EncodeTable(&b, std::vector<WireTeam>());
+    if (!DecodeDown(&b[0], b.size(), &d) || !d.table.empty() || TableText(d.table) != "no teams") Fail("empty TABLE");
+    EncodeInvited(&b, 0, "The Rusty Blades", 60);
+    if (!DecodeDown(&b[0], b.size(), &d) || d.kind != kDnInvited || d.fromSlot != 0 || d.teamName != "The Rusty Blades" || d.secondsLeft != 60) Fail("INVITED round trip");
+    EncodeNotice(&b, kEvInvite, kRefInTeam, 0, 2, "");
+    if (!DecodeDown(&b[0], b.size(), &d) || d.kind != kDnNotice || d.event != (unsigned)kEvInvite || d.result != (unsigned)kRefInTeam || d.subjectSlot != 2) Fail("NOTICE round trip");
+    Owed o; o.no = 9; o.why = kWhyRemoved; o.away = 1; o.teamName = "T"; o.snapRows = 104; o.snap = snap;
+    EncodeRestore(&b, o);
+    if (!DecodeDown(&b[0], b.size(), &d) || d.kind != kDnRestore || d.no != 9 || d.why != (unsigned)kWhyRemoved || d.away != 1 || d.snapRows != 104 || d.snap != snap) Fail("RESTORE round trip");
+    b.push_back(0); if (DecodeDown(&b[0], b.size(), &d)) Fail("a RESTORE with a trailing byte decoded");
+    EncodeLeave(&b); if (DecodeDown(&b[0], b.size(), &d)) Fail("an up message decoded as down");
+    /* the wire number is the store's */
+    if (kMsgTeam != 60) Fail("TEAM is not 60");
+    if (std::string(ResultName(kRefFounderLeaves)) != "founder-has-members" || std::string(EventName(kEvExpired)) != "expired" || std::string(ResultName(99)) != "?") Fail("names");
+    if (TableText(t).find('\n') != std::string::npos) Fail("a table line breaks");
+    t[0].name = "Bad'Name\n"; if (TableText(t) != "team 4 'Bad_Name_' founder=s0 members=s1,s2") Fail("a name's quote and line break are not cleaned: " + TableText(t));
+}
+/* three members (the founder and two who accepted), the file kept whole */
+void t_t546_team_three_members()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0;
+    if (InviteDecide(&b, "alex.1", "sam.1", true, true, "The Rusty Blades", 100.0) != kOk) Fail("alex invites sam");
+    if (!b.teams.empty()) Fail("an invitation made a team");
+    if (AnswerDecide(&b, "sam.1", true, 104, T546Snap("sam-before"), 1000, 101.0, &v, &no) != kOk || no != 1 || v.from != "alex.1") Fail("sam accepts");
+    if (InviteDecide(&b, "alex.1", "kim.1", true, true, "ignored - the team's name is used", 102.0) != kOk) Fail("alex invites kim");
+    if (b.invites[0].name != "The Rusty Blades") Fail("the second invitation does not carry the team's name");
+    if (AnswerDecide(&b, "kim.1", true, 98, T546Snap("kim-before"), 1001, 103.0, &v, &no) != kOk || no != 1) Fail("kim accepts");
+    if (TableText(ToWire(b, T546Slots())) != "team 1 'The Rusty Blades' founder=s0 members=s1,s2") Fail("three members: " + TableText(ToWire(b, T546Slots())));
+    if (TeamOf(b, "kim.1") != 0 || !IsFounder(b, "alex.1") || IsFounder(b, "sam.1") || TeamOf(b, "jo.1") != -1) Fail("who is in which team");
+    if (b.teams[0].members[0].snap != T546Snap("sam-before") || b.teams[0].members[1].snapRows != 98 || b.teams[0].members[1].joinedAt != 1001) Fail("a member's pre-join standing was not kept as sent");
+    if (!T546FileRoundTrip(b)) Fail("three members: the file does not read back");
+    swteam::Book r; std::istringstream is(BookFile(b)); std::string line;
+    while (std::getline(is, line)) BookParseLine(line, &r);
+    if (TableText(ToWire(r, T546Slots())) != "team 1 'The Rusty Blades' founder=s0 members=s1,s2" || r.teams[0].members[1].snap != T546Snap("kim-before") || r.nextTeam != 2) Fail("the file read back differs");
+    /* a second team, and a member who leaves keeps nothing in the team but is owed its standing back */
+    if (InviteDecide(&b, "jo.1", "max.1", true, true, "Iron Wolves", 104.0) != kOk || AnswerDecide(&b, "max.1", true, 90, T546Snap("max"), 1002, 105.0, &v, &no) != kOk || no != 2) Fail("a second team");
+    Owed o;
+    if (LeaveDecide(&b, "sam.1", 1003, &o) != kOk || o.id != "sam.1" || o.why != kWhyLeft || o.away != 0 || o.snap != T546Snap("sam-before") || o.teamName != "The Rusty Blades") Fail("sam leaves");
+    if (TableText(ToWire(b, T546Slots())) != "team 1 'The Rusty Blades' founder=s0 members=s2; team 2 'Iron Wolves' founder=s3 members=s4") Fail("after sam left: " + TableText(ToWire(b, T546Slots())));
+    TeamEnd end;
+    if (LeaveDecide(&b, "kim.1", 1004, &o, 0, 0, 0, 0, &end) != kOk || TableText(ToWire(b, T546Slots())) != "team 2 'Iron Wolves' founder=s3 members=s4") Fail("the last member leaves: the team ends - " + TableText(ToWire(b, T546Slots())));
+    if (!end.ended || end.founder != "alex.1" || end.teamName != "The Rusty Blades" || end.teamNo != 1 || end.row.no != 0 || end.rowSkipped || TeamOf(b, "alex.1") != -1)
+        Fail("the team ended with its last member: the founder in no team, no row (the founder made the team)");
+    if (!T546FileRoundTrip(b)) Fail("after the team ended: the file does not read back");
+    if (b.owed.size() != 2 || b.owed[0].no == b.owed[1].no) Fail("two restore rows with their own numbers");
+    o = Owed();
+    if (LeaveDecide(&b, "alex.1", 1005, &o) != kRefNotInTeam || o.no != 0 || b.owed.size() != 2) Fail("the founder of the ended team is in no team");
+    Book lone;   /* a founder alone kept in a table from before a team ended with its last member: still leaves, the team ends */
+    if (!BookParseLine("T 7 61 41", &lone) || LeaveDecide(&lone, "a", 1006, &o) != kOk || !lone.teams.empty()) Fail("a lone founder from an older table leaves");
+}
+void t_t546_team_refusals()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0; Owed o;
+    InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 0.0); AnswerDecide(&b, "sam.1", true, 1, T546Snap("s"), 1, 1.0, &v, &no);
+    InviteDecide(&b, "jo.1", "max.1", true, true, "Wolves", 0.0); AnswerDecide(&b, "max.1", true, 1, T546Snap("m"), 1, 1.0, &v, &no);
+    if (InviteDecide(&b, "alex.1", "max.1", true, true, "", 2.0) != kRefInTeam) Fail("an invitation to a member of another team");
+    if (InviteDecide(&b, "alex.1", "jo.1", true, true, "", 2.0) != kRefInTeam) Fail("an invitation to another team's founder");
+    if (InviteDecide(&b, "sam.1", "kim.1", true, true, "", 2.0) != kRefNotFounder) Fail("a member invites");
+    if (InviteDecide(&b, "alex.1", "alex.1", true, true, "", 2.0) != kRefSelf) Fail("an invitation to oneself");
+    if (InviteDecide(&b, "alex.1", "kim.1", true, false, "", 2.0) != kRefNotOnline) Fail("an invitation to a player who is not connected");
+    if (InviteDecide(&b, "alex.1", "", false, false, "", 2.0) != kRefUnknownPlayer) Fail("an invitation to a slot nobody holds");
+    if (InviteDecide(&b, "alex.1", "kim.1", true, true, "", 2.0) != kOk) Fail("alex invites kim");
+    if (InviteDecide(&b, "jo.1", "kim.1", true, true, "", 3.0) != kRefInvitePending) Fail("a second invitation while one waits");
+    if (LeaveDecide(&b, "alex.1", 1, &o) != kRefFounderLeaves) Fail("the founder leaves with members");
+    if (LeaveDecide(&b, "kim.1", 1, &o) != kRefNotInTeam) Fail("a player in no team leaves");
+    if (AnswerDecide(&b, "jo.1", true, 1, T546Snap("j"), 1, 4.0, &v, &no) != kRefNoInvite) Fail("an answer with no invitation");
+    if (AnswerDecide(&b, "kim.1", true, 0, std::vector<char>(), 1, 4.0, &v, &no) != kRefNoSnapshot || InviteTo(b, "kim.1") < 0) Fail("an accept with no standing: refused and the invitation kept");
+    if (RemoveDecide(&b, "alex.1", "max.1", true, true, 1, &o) != kRefNotMember) Fail("removing another team's member");
+    if (RemoveDecide(&b, "sam.1", "alex.1", true, true, 1, &o) != kRefNotFounder) Fail("a member removes");
+    if (RemoveDecide(&b, "kim.1", "sam.1", true, true, 1, &o) != kRefNotInTeam) Fail("a player in no team removes");
+    if (RemoveDecide(&b, "alex.1", "", false, false, 1, &o) != kRefUnknownPlayer) Fail("removing a slot nobody holds");
+    if (RemoveDecide(&b, "alex.1", "alex.1", true, true, 1, &o) != kRefSelf) Fail("the founder removes themself");
+    std::vector<Owed> made; std::string name;
+    if (DisbandDecide(&b, "sam.1", std::vector<std::string>(), 1, &made, &name) != kRefNotFounder || !made.empty()) Fail("a member disbands");
+    if (DisbandDecide(&b, "kim.1", std::vector<std::string>(), 1, &made, &name) != kRefNotInTeam) Fail("a player in no team disbands");
+    /* an accept after the inviter became another founder's member */
+    Book c;
+    InviteDecide(&c, "kim.1", "jo.1", true, true, "Kims", 0.0);
+    InviteDecide(&c, "alex.1", "kim.1", true, true, "Blades", 0.0);
+    AnswerDecide(&c, "kim.1", true, 1, T546Snap("k"), 1, 1.0, &v, &no);
+    if (AnswerDecide(&c, "jo.1", true, 1, T546Snap("j"), 1, 2.0, &v, &no) != kRefNotFounder || TeamOf(c, "jo.1") != -1 || InviteTo(c, "jo.1") >= 0) Fail("an accept of a member's old invitation");
+    /* a full team */
+    Book f;
+    for (unsigned i = 0; i < kMaxMembers; ++i)
+    {
+        const std::string id = "p" + I((int)i);
+        if (InviteDecide(&f, "alex.1", id, true, true, "Big", 0.0) != kOk || AnswerDecide(&f, id, true, 1, T546Snap("x"), 1, 1.0, &v, &no) != kOk) { Fail("filling the team"); return; }
+    }
+    if (InviteDecide(&f, "alex.1", "late.1", true, true, "Big", 2.0) != kRefTeamFull) Fail("an invitation into a full team");
+    /* the file refuses broken lines */
+    Book g;
+    if (BookParseLine("M 1 7a 1 1 61", &g)) Fail("a member line before its team line");
+    if (BookParseLine("T 1 zz 41", &g) || BookParseLine("O 1 61 9 0 41 1 - 1", &g) || BookParseLine("X", &g) || BookParseLine("N 0 1", &g)) Fail("a broken line was taken");
+    if (!BookParseLine("T 1 61 41\r", &g) || BookParseLine("T 2 61 42", &g)) Fail("a team line, then a second team for the same founder");
+}
+/* a member removed while away: the row waits for that player's next join and is dropped when its game answers */
+void t_t546_team_offline_removal()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0; Owed o;
+    InviteDecide(&b, "alex.1", "kim.1", true, true, "Blades", 0.0);
+    AnswerDecide(&b, "kim.1", true, 98, T546Snap("kim-before"), 50, 1.0, &v, &no);
+    TeamEnd end;
+    if (RemoveDecide(&b, "alex.1", "kim.1", true, false, 60, &o, 0, 0, 0, &end) != kOk) Fail("removing a member who is away");
+    if (o.away != 1 || o.why != kWhyRemoved || o.snap != T546Snap("kim-before") || o.snapRows != 98 || o.teamName != "Blades" || o.madeAt != 60) Fail("the while-away row");
+    if (TeamOf(b, "kim.1") != -1 || TeamOf(b, "alex.1") != -1 || !b.teams.empty() || !end.ended || end.founder != "alex.1" || end.row.no != 0 || b.owed.size() != 1)
+        Fail("the last member removed while away: the team ended, the founder in no team");
+    if (!T546FileRoundTrip(b)) Fail("the owed row does not survive the file");
+    Book r; std::istringstream is(BookFile(b)); std::string line;
+    while (std::getline(is, line)) BookParseLine(line, &r);
+    if (r.owed.size() != 1 || r.owed[0].away != 1 || r.owed[0].snap != T546Snap("kim-before") || r.owed[0].id != "kim.1") Fail("the owed row read back");
+    if (RestoreDone(&r, "alex.1", r.owed[0].no)) Fail("another player answered the row");
+    if (RestoreDone(&r, "kim.1", r.owed[0].no + 1)) Fail("a wrong number answered the row");
+    if (!RestoreDone(&r, "kim.1", o.no) || !r.owed.empty()) Fail("the answer drops the row");
+    if (RestoreDone(&r, "kim.1", o.no)) Fail("a second answer found a row");
+    /* the numbers keep rising across the file */
+    InviteDecide(&r, "alex.1", "sam.1", true, true, "", 2.0);
+    AnswerDecide(&r, "sam.1", true, 1, T546Snap("s"), 1, 3.0, &v, &no);
+    Owed o2; LeaveDecide(&r, "sam.1", 70, &o2);
+    if (o2.no <= o.no) Fail("a restore number was reused");
+}
+void t_t546_team_expiry_and_disband()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0; std::vector<Invite> gone;
+    InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 10.0);
+    ExpireInvites(&b, 10.0 + kInviteSeconds - 0.1, &gone);
+    if (!gone.empty() || InviteTo(b, "sam.1") < 0) Fail("an invitation ended early");
+    ExpireInvites(&b, 10.0 + kInviteSeconds, &gone);
+    if (gone.size() != 1 || gone[0].from != "alex.1" || InviteTo(b, "sam.1") >= 0) Fail("an invitation did not end at 60 s");
+    if (AnswerDecide(&b, "sam.1", true, 1, T546Snap("s"), 1, 71.0, &v, &no) != kRefNoInvite) Fail("an answer after the end");
+    InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 100.0);
+    if (AnswerDecide(&b, "sam.1", true, 1, T546Snap("s"), 1, 100.0 + kInviteSeconds, &v, &no) != kRefNoInvite) Fail("an answer at the end itself");
+    /* a connection closing ends the invitations from and to that player */
+    gone.clear(); ExpireInvites(&b, 200.0, &gone);
+    InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 200.0);
+    InviteDecide(&b, "jo.1", "kim.1", true, true, "Wolves", 200.0);
+    gone.clear(); DropInvitesOf(&b, "sam.1", &gone);
+    if (gone.size() != 1 || InviteTo(b, "kim.1") < 0) Fail("a closed connection ended the wrong invitations");
+    /* disband: a restore row for every member, the away flag from who is connected, the founder's invitations gone */
+    Book d;
+    InviteDecide(&d, "alex.1", "sam.1", true, true, "Blades", 0.0); AnswerDecide(&d, "sam.1", true, 3, T546Snap("s"), 1, 1.0, &v, &no);
+    InviteDecide(&d, "alex.1", "kim.1", true, true, "Blades", 0.0); AnswerDecide(&d, "kim.1", true, 4, T546Snap("k"), 1, 1.0, &v, &no);
+    InviteDecide(&d, "alex.1", "jo.1", true, true, "Blades", 2.0);
+    std::vector<std::string> online; online.push_back("alex.1"); online.push_back("sam.1");
+    std::vector<Owed> made; std::string name;
+    if (DisbandDecide(&d, "alex.1", online, 5, &made, &name) != kOk || name != "Blades") Fail("disband");
+    if (made.size() != 2 || made[0].id != "sam.1" || made[0].away != 0 || made[1].id != "kim.1" || made[1].away != 1 || made[1].snap != T546Snap("k") || made[0].why != kWhyDisbanded)
+        Fail("the disband's restore rows");
+    if (!d.teams.empty() || InviteTo(d, "jo.1") >= 0 || d.owed.size() != 2) Fail("after the disband");
+    if (TableText(ToWire(d, T546Slots())) != "no teams") Fail("the table after the disband");
+    /* the disbanded founder may found again */
+    if (InviteDecide(&d, "alex.1", "sam.1", true, true, "Blades", 10.0) != kOk || AnswerDecide(&d, "sam.1", true, 3, T546Snap("s"), 1, 11.0, &v, &no) != kOk || no != 2) Fail("found again after a disband");
+}
+
+/* an ACCEPT refused: in a team meanwhile, the team full, too many teams; a decline; the join's name is the team's own */
+void t_t546_team_accept_refusals()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0; std::string name;
+    InviteDecide(&b, "alex.1", "kim.1", true, true, "Blades", 0.0);
+    InviteDecide(&b, "kim.1", "jo.1", true, true, "Kims", 0.0);
+    if (AnswerDecide(&b, "jo.1", true, 1, T546Snap("j"), 1, 1.0, &v, &no, &name) != kOk || name != "Kims") Fail("jo joins kim");
+    if (AnswerDecide(&b, "kim.1", true, 1, T546Snap("k"), 1, 2.0, &v, &no) != kRefInTeam || InviteTo(b, "kim.1") >= 0) Fail("an accept by a player who founded a team meanwhile");
+    Book f;
+    for (unsigned i = 0; i + 1 < kMaxMembers; ++i)
+    {
+        const std::string id = "p" + I((int)i);
+        if (InviteDecide(&f, "alex.1", id, true, true, "Big", 0.0) != kOk || AnswerDecide(&f, id, true, 1, T546Snap("x"), 1, 1.0, &v, &no) != kOk) { Fail("filling the team"); return; }
+    }
+    InviteDecide(&f, "alex.1", "a.1", true, true, "Big", 5.0); InviteDecide(&f, "alex.1", "b.1", true, true, "Big", 5.0);
+    if (AnswerDecide(&f, "a.1", true, 1, T546Snap("a"), 1, 6.0, &v, &no) != kOk) Fail("the last place taken");
+    if (AnswerDecide(&f, "b.1", true, 1, T546Snap("b"), 1, 6.0, &v, &no) != kRefTeamFull || InviteTo(f, "b.1") >= 0 || TeamOf(f, "b.1") >= 0) Fail("an accept into a team that filled meanwhile");
+    Book m;
+    InviteDecide(&m, "x.1", "y.1", true, true, "X", 0.0);
+    for (unsigned i = 0; i < kMaxTeams; ++i)
+    {
+        const std::string fo = "f" + I((int)i), me = "g" + I((int)i);
+        if (InviteDecide(&m, fo, me, true, true, "T", 0.0) != kOk || AnswerDecide(&m, me, true, 1, T546Snap("g"), 1, 1.0, &v, &no) != kOk) { Fail("making the teams"); return; }
+    }
+    if (AnswerDecide(&m, "y.1", true, 1, T546Snap("y"), 1, 2.0, &v, &no) != kRefTooMany || m.teams.size() != kMaxTeams || InviteTo(m, "y.1") >= 0) Fail("an accept that would make a team past the limit");
+    if (InviteDecide(&m, "x.1", "z.1", true, true, "X", 3.0) != kRefTooMany) Fail("an invitation that would make a team past the limit");
+    Book d;
+    InviteDecide(&d, "alex.1", "sam.1", true, true, "Blades", 0.0);
+    if (AnswerDecide(&d, "sam.1", false, 0, std::vector<char>(), 1, 1.0, &v, &no) != kOk || InviteTo(d, "sam.1") >= 0 || v.from != "alex.1" || !d.teams.empty()) Fail("a decline");
+    if (AnswerDecide(&d, "sam.1", false, 0, std::vector<char>(), 1, 2.0, &v, &no) != kRefNoInvite) Fail("a second decline");
+    Book n;
+    InviteDecide(&n, "alex.1", "sam.1", true, true, "Old Name", 0.0); InviteDecide(&n, "alex.1", "kim.1", true, true, "New Name", 0.0);
+    if (AnswerDecide(&n, "kim.1", true, 1, T546Snap("k"), 1, 1.0, &v, &no, &name) != kOk || name != "New Name") Fail("the first accept names the team");
+    if (AnswerDecide(&n, "sam.1", true, 1, T546Snap("s"), 1, 2.0, &v, &no, &name) != kOk || name != "New Name" || v.name != "Old Name") Fail("the join's name is not the team's own: " + name);
+    if (AnswerRefusalEndsInvite(kRefNoSnapshot) || AnswerRefusalEndsInvite(kRefNotSaved) || AnswerRefusalEndsInvite(kOk) || !AnswerRefusalEndsInvite(kRefNoInvite)
+        || !AnswerRefusalEndsInvite(kRefOwedFull) || !AnswerRefusalEndsInvite(kRefTeamFull)) Fail("which refusals end the invitation");
+    if (std::string(ResultName(kRefOwedFull)) != "restore-backlog" || std::string(ResultName(kRefNotSaved)) != "not-saved") Fail("the new refusal names");
+}
+/* the limits on the wire: a standing over 64 KB, a RESTORE over it or cut, a TABLE with too many teams or members, a long name; ASK */
+void t_t546_team_size_limits()
+{
+    using namespace swteam;
+    if (kMaxSnapshot != 64u * 1024u) Fail("the standing limit is not 64 KB");
+    const std::vector<char> big(kMaxSnapshot + 1, 'x'), edge(kMaxSnapshot, 'x');
+    std::vector<char> b; Up u; Down d;
+    if (EncodeAnswer(&b, true, 1, big)) Fail("an over-limit standing was encoded");
+    if (!EncodeAnswer(&b, true, 1, edge) || !DecodeUp(&b[0], b.size(), &u) || u.snap.size() != kMaxSnapshot) Fail("a standing at the limit");
+    b.clear(); PutU8(&b, kUpAnswer); PutU8(&b, 1); PutU32(&b, 1); PutBytes(&b, &big[0], big.size());
+    if (DecodeUp(&b[0], b.size(), &u)) Fail("an over-limit ANSWER decoded");
+    Book k; Invite v; unsigned no = 0;
+    InviteDecide(&k, "alex.1", "sam.1", true, true, "Blades", 0.0);
+    if (AnswerDecide(&k, "sam.1", true, 1, big, 1, 1.0, &v, &no) != kRefNoSnapshot || InviteTo(k, "sam.1") < 0 || !k.teams.empty()) Fail("an over-limit standing taken");
+    Owed o; o.no = 1; o.why = kWhyLeft; o.snap = big;
+    EncodeRestore(&b, o); if (DecodeDown(&b[0], b.size(), &d)) Fail("an over-limit RESTORE decoded");
+    o.snap = edge; EncodeRestore(&b, o);
+    if (!DecodeDown(&b[0], b.size(), &d) || d.snap.size() != kMaxSnapshot) Fail("a RESTORE at the limit");
+    if (DecodeDown(&b[0], b.size() - 1, &d)) Fail("a cut RESTORE decoded");
+    b.clear(); PutU8(&b, kDnTable); PutU32(&b, kMaxTeams + 1);
+    if (DecodeDown(&b[0], b.size(), &d)) Fail("a TABLE of too many teams decoded");
+    std::vector<WireTeam> t(1); t[0].no = 1; t[0].memberSlots.assign(kMaxMembers + 1, 1u);
+    EncodeTable(&b, t); if (DecodeDown(&b[0], b.size(), &d)) Fail("a TABLE team of too many members decoded");
+    EncodeTable(&b, std::vector<WireTeam>()); if (DecodeDown(&b[0], b.size() - 1, &d)) Fail("a cut TABLE decoded");
+    EncodeNotice(&b, kEvJoined, kOk, 0, 1, std::string(kMaxName + 1, 'n')); if (DecodeDown(&b[0], b.size(), &d)) Fail("a NOTICE with a name over the limit decoded");
+    EncodeNotice(&b, kEvJoined, kOk, 0, 1, std::string(kMaxName, 'n')); if (!DecodeDown(&b[0], b.size(), &d)) Fail("a NOTICE with a name at the limit");
+    EncodeAsk(&b);
+    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpAsk) Fail("ASK round trip");
+    b.push_back(0); if (DecodeUp(&b[0], b.size(), &u)) Fail("an ASK with a trailing byte decoded");
+}
+/* at most kMaxOwedEach restore rows per player, kMaxOwed in the world: the step that would make one more is refused, no number used */
+void t_t546_team_owed_limit()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0; Owed o;
+    for (unsigned i = 0; i < kMaxOwedEach; ++i)
+    {
+        if (InviteDecide(&b, "alex.1", "kim.1", true, true, "Blades", i * 10.0) != kOk || AnswerDecide(&b, "kim.1", true, 1, T546Snap("k"), 1, i * 10.0 + 1, &v, &no) != kOk
+            || LeaveDecide(&b, "kim.1", 1, &o) != kOk) { Fail("kim joins and leaves"); return; }
+    }
+    if (OwedCount(b, "kim.1") != kMaxOwedEach) Fail("kim's rows");
+    if (InviteDecide(&b, "alex.1", "kim.1", true, true, "", 100.0) != kRefOwedFull || InviteTo(b, "kim.1") >= 0) Fail("an invitation to a player whose rows are full");
+    Book c = b; c.owed.pop_back();
+    if (InviteDecide(&c, "alex.1", "kim.1", true, true, "", 100.0) != kOk) Fail("an invitation below the limit");
+    c.owed.push_back(b.owed.back());
+    if (AnswerDecide(&c, "kim.1", true, 1, T546Snap("k"), 1, 101.0, &v, &no) != kRefOwedFull || InviteTo(c, "kim.1") >= 0 || TeamOf(c, "kim.1") >= 0) Fail("an accept with the rows full");
+    Book r = b;   /* each leave above ended the team with its last member: alex founds one again with kim in it */
+    { Team t; t.no = r.nextTeam++; t.founder = "alex.1"; t.name = "Blades"; t.members.push_back(Member()); t.members.back().id = "kim.1"; t.members.back().snap = T546Snap("k"); r.teams.push_back(t); }
+    const unsigned next = r.nextOwed; const size_t rows = r.owed.size();
+    if (LeaveDecide(&r, "kim.1", 1, &o) != kRefOwedFull) Fail("a leave with the rows full");
+    if (RemoveDecide(&r, "alex.1", "kim.1", true, true, 1, &o) != kRefOwedFull) Fail("a removal with the rows full");
+    std::vector<Owed> made; std::string name;
+    if (DisbandDecide(&r, "alex.1", std::vector<std::string>(), 1, &made, &name) != kRefOwedFull || !made.empty()) Fail("a disband with a member's rows full");
+    if (r.nextOwed != next || r.owed.size() != rows || TeamOf(r, "kim.1") != 0 || r.teams.size() != 1) Fail("a refused departure changed the table");
+    Book w;
+    InviteDecide(&w, "alex.1", "sam.1", true, true, "Blades", 0.0); AnswerDecide(&w, "sam.1", true, 1, T546Snap("s"), 1, 1.0, &v, &no);
+    for (unsigned i = 0; i < kMaxOwed; ++i) { Owed x; x.no = 1000 + i; x.id = "g" + I((int)(i / kMaxOwedEach)); x.why = kWhyLeft; w.owed.push_back(x); }
+    const unsigned wn = w.nextOwed;
+    if (LeaveDecide(&w, "sam.1", 1, &o) != kRefOwedFull || w.nextOwed != wn || TeamOf(w, "sam.1") != 0) Fail("a departure past the world's limit");
+    if (!RestoreDone(&w, "g0", 1000) || LeaveDecide(&w, "sam.1", 1, &o) != kOk || o.no != wn) Fail("a row answered makes room again");
+}
+/* a founder's team ends (a disband with no members, a lone founder leaving - a team kept from a table older than the rule that
+   ends a team with its last member): every invitation they had open ends with it */
+void t_t546_team_founder_ends()
+{
+    using namespace swteam;
+    Book b; Owed o;
+    if (!BookParseLine("T 1 616c65782e31 426c61646573", &b) || TeamOf(b, "alex.1") != 0 || b.teams[0].name != "Blades") { Fail("a lone founder's team line"); return; }
+    InviteDecide(&b, "alex.1", "kim.1", true, true, "", 5.0);
+    InviteDecide(&b, "jo.1", "max.1", true, true, "Wolves", 5.0);
+    Book c = b;
+    std::vector<Owed> made; std::string name; std::vector<Invite> gone;
+    if (DisbandDecide(&b, "alex.1", std::vector<std::string>(), 3, &made, &name, &gone) != kOk || !made.empty() || !b.teams.empty() || name != "Blades") Fail("a disband with no members");
+    if (gone.size() != 1 || gone[0].to != "kim.1" || InviteTo(b, "kim.1") >= 0 || InviteTo(b, "max.1") < 0) Fail("the disband's open invitations");
+    gone.clear(); o = Owed();
+    if (LeaveDecide(&c, "alex.1", 3, &o, &gone) != kOk || o.no != 0 || !c.teams.empty()) Fail("a lone founder leaves");
+    if (gone.size() != 1 || gone[0].to != "kim.1" || gone[0].name != "Blades" || InviteTo(c, "kim.1") >= 0 || InviteTo(c, "max.1") < 0) Fail("the lone founder's open invitations");
+}
+/* teams.txt edge cases: the number line in any order, duplicate numbers, refused team lines' members, limits */
+void t_t546_team_load_edges()
+{
+    using namespace swteam;
+    Book b; int why = -1;
+    if (!BookParseLine("T 5 61 41", &b) || !BookParseLine("M 5 62 1 1 -", &b) || !BookParseLine("N 2 3", &b, &why) || why != kLineOk || !BookParseLine("O 9 63 1 0 41 1 - 7", &b)) Fail("the lines");
+    if (b.nextTeam != 6 || b.nextOwed != 10) Fail("a number line read after the rows lowered the next numbers: " + I((int)b.nextTeam) + " " + I((int)b.nextOwed));
+    if (!BookParseLine("N 99 100", &b) || b.nextTeam != 99 || b.nextOwed != 100) Fail("a higher number line");
+    if (BookParseLine("T 5 64 42", &b, &why) || why != kLineDuplicate) Fail("a duplicate team number taken");
+    if (BookParseLine("M 5 65 1 1 -", &b, &why) || why != kLineBad || TeamOf(b, "e") != -1) Fail("a member line of a refused team line taken");
+    if (BookParseLine("O 9 66 1 0 41 1 - 7", &b, &why) || why != kLineDuplicate) Fail("a duplicate row number taken");
+    if (BookParseLine("T 0 67 41", &b) || BookParseLine("T 4294967295 67 41", &b) || BookParseLine("O 0 67 1 0 41 1 - 7", &b)) Fail("a team or row number 0 or the largest taken");
+    const std::string over(2 * (kMaxSnapshot + 1), 'a'), at(2 * kMaxSnapshot, 'a');
+    if (BookParseLine("T 6 68 41", &b) == false) Fail("team 6");
+    if (BookParseLine("M 6 69 1 1 " + over, &b) || BookParseLine("O 20 69 1 0 41 1 " + over + " 7", &b)) Fail("a standing over the limit taken");
+    if (!BookParseLine("M 6 69 1 1 " + at, &b)) Fail("a standing at the limit refused");
+    if (BookParseLine("T 7 6a " + std::string(2 * (kMaxName + 1), 'a'), &b)) Fail("a name over the limit taken");
+    for (unsigned i = 0; i + 1 < kMaxOwedEach; ++i) if (!BookParseLine("O " + I((int)(30 + i)) + " 63 1 0 41 1 - 7", &b)) Fail("row " + I((int)i));
+    if (BookParseLine("O 50 63 1 0 41 1 - 7", &b, &why) || why != kLineBad || OwedCount(b, "c") != kMaxOwedEach) Fail("a ninth row for one player taken");
+    if (TableText(ToWire(b, std::map<std::string, unsigned>())) != "no teams") Fail("players with no slot are not on the wire");
+}
+/* a deleted profile (owner 482 a): a member out with no row; a founder's role to the member who joined first; a lone founder's team ends */
+void t_t546_team_profile_deleted()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0; Owed o;
+    InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 0.0); AnswerDecide(&b, "sam.1", true, 1, T546Snap("s"), 1, 1.0, &v, &no);
+    InviteDecide(&b, "alex.1", "kim.1", true, true, "Blades", 2.0); AnswerDecide(&b, "kim.1", true, 1, T546Snap("k"), 2, 3.0, &v, &no);
+    InviteDecide(&b, "alex.1", "jo.1", true, true, "Blades", 4.0);
+    std::vector<Invite> gone; std::string name, nf; unsigned dropped = 9;
+    Book m = b;
+    if (ProfileDeletedDecide(&m, "kim.1", &gone, &name, &nf, &dropped) != kDelMember || TeamOf(m, "kim.1") != -1 || !m.owed.empty() || dropped != 0 || name != "Blades"
+        || InviteTo(m, "jo.1") < 0 || m.teams[0].members.size() != 1) Fail("a member's profile deleted");
+    Book f = b; gone.clear(); nf.clear();
+    if (ProfileDeletedDecide(&f, "alex.1", &gone, &name, &nf, &dropped) != kDelFounderPassed || nf != "sam.1" || !IsFounder(f, "sam.1") || f.teams[0].no != b.teams[0].no
+        || f.teams[0].name != "Blades" || f.teams[0].members.size() != 1 || f.teams[0].members[0].id != "kim.1" || TeamOf(f, "alex.1") != -1) Fail("the founder's profile deleted");
+    if (gone.size() != 1 || gone[0].to != "jo.1" || InviteTo(f, "jo.1") >= 0) Fail("the deleted founder's invitation");
+    if (f.teams[0].founderSnap != T546Snap("s") || f.teams[0].founderSnapRows != 1) Fail("the promoted founder's pre-join standing was not kept");
+    if (!T546FileRoundTrip(f)) Fail("the passed team does not read back");
+    {
+        Book r; std::istringstream is(BookFile(f)); std::string line;
+        while (std::getline(is, line)) BookParseLine(line, &r);
+        if (r.teams.size() != 1 || r.teams[0].founderSnap != T546Snap("s") || r.teams[0].founderSnapRows != 1 || r.teams[0].founder != "sam.1") Fail("the promoted founder's standing read back");
+    }
+    if (InviteDecide(&f, "sam.1", "jo.1", true, true, "", 10.0) != kOk) Fail("the new founder invites");
+    std::vector<Owed> made;
+    Book fd = f;   /* the promoted founder disbands with kim in: kim's row, then their own */
+    if (DisbandDecide(&fd, "sam.1", std::vector<std::string>(), 12, &made, &name) != kOk || !fd.teams.empty()) Fail("the new founder disbands");
+    if (made.size() != 2 || made[1].id != "sam.1" || made[1].why != kWhyDisbanded || made[1].away != 0 || made[1].snap != T546Snap("s")) Fail("the promoted founder disbands: their own restore row");
+    TeamEnd end;
+    if (RemoveDecide(&f, "sam.1", "kim.1", true, true, 11, &o, 0, 0, 0, &end) != kOk || o.why != kWhyRemoved || o.id != "kim.1") Fail("the new founder removes");
+    if (!end.ended || !f.teams.empty() || end.founder != "sam.1" || end.row.no == 0 || end.row.id != "sam.1" || end.row.why != kWhyDisbanded || end.row.away != 0
+        || end.row.snap != T546Snap("s") || end.row.snapRows != 1 || end.teamName != "Blades" || f.owed.size() != 2) Fail("the last member removed: the team ends, the promoted founder's own row as a disband's");
+    if (end.gone.size() != 1 || end.gone[0].to != "jo.1" || InviteTo(f, "jo.1") >= 0) Fail("the founder's invitation ends with the team");
+    /* a promoted founder with members disbands: the members' rows, then the founder's; refused whole when the founder's row has no room */
+    Book d = b; gone.clear();
+    InviteDecide(&d, "alex.1", "max.1", true, true, "", 5.0); AnswerDecide(&d, "max.1", true, 3, T546Snap("x"), 4, 6.0, &v, &no);
+    ProfileDeletedDecide(&d, "alex.1", &gone, &name, &nf, &dropped);
+    Book full = d;
+    for (unsigned i = 0; i < kMaxOwedEach; ++i) { Owed x; x.no = 900 + i; x.id = "sam.1"; x.why = kWhyLeft; full.owed.push_back(x); }
+    made.clear();
+    if (DisbandDecide(&full, "sam.1", std::vector<std::string>(), 13, &made, &name) != kRefOwedFull || full.teams.size() != 1 || !made.empty()) Fail("a disband whose founder row has no room");
+    if (RemoveDecide(&full, "sam.1", "kim.1", true, true, 13, &o) != kOk) Fail("the full founder removes kim");
+    o = Owed(); end = TeamEnd();
+    const size_t owedBefore = full.owed.size();
+    if (RemoveDecide(&full, "sam.1", "max.1", true, true, 13, &o, 0, 0, 0, &end) != kRefOwedFull || full.teams.size() != 1 || full.teams[0].members.size() != 1 || o.no != 0 || end.ended
+        || full.owed.size() != owedBefore) Fail("removing the last member when the founder's row has no room: refused whole, nothing changed");
+    made.clear();
+    if (DisbandDecide(&d, "sam.1", std::vector<std::string>(1, "kim.1"), 15, &made, &name) != kOk || made.size() != 3 || made[0].id != "kim.1" || made[1].id != "max.1"
+        || made[2].id != "sam.1" || made[2].snap != T546Snap("s") || made[1].away != 1 || made[0].away != 0 || made[2].away != 0) Fail("a promoted founder with members disbands");
+    /* the file refuses a founder standing with no team line, a second one for a team, an empty one */
+    Book g; int why = -1;
+    if (BookParseLine("F 3 1 61", &g)) Fail("a founder standing before its team line");
+    if (!BookParseLine("T 3 61 41", &g) || BookParseLine("F 3 1 -", &g) || !BookParseLine("F 3 2 6162", &g, &why) || why != kLineOk) Fail("a founder standing line");
+    if (BookParseLine("F 3 1 63", &g, &why) || why != kLineDuplicate || g.teams[0].founderSnapRows != 2) Fail("a second founder standing for one team");
+    Book e;
+    InviteDecide(&e, "alex.1", "sam.1", true, true, "Blades", 0.0); AnswerDecide(&e, "sam.1", true, 1, T546Snap("s"), 1, 1.0, &v, &no); LeaveDecide(&e, "sam.1", 2, &o);
+    if (!e.teams.empty() || e.owed.size() != 1) Fail("sam left: the team ended with its last member");
+    BookParseLine("T 5 61 41", &e);   /* a founder alone, kept in a table from before a team ended with its last member */
+    gone.clear();
+    if (ProfileDeletedDecide(&e, "a", &gone, &name, &nf, &dropped) != kDelTeamEnded || !e.teams.empty() || e.owed.size() != 1) Fail("a lone founder's profile deleted");
+    if (ProfileDeletedDecide(&e, "sam.1", &gone, &name, &nf, &dropped) != kDelNone || dropped != 1 || !e.owed.empty()) Fail("a deleted player's restore rows");
+    if (ProfileDeletedDecide(&e, "nobody.1", &gone, &name, &nf, &dropped) != kDelNone || dropped != 0) Fail("a profile in no team");
+}
+/* a deletion that leaves one player alone in a team ends it as a disband (never refused: a row with no room is skipped) */
+void t_t546h_profile_deleted_last()
+{
+    using namespace swteam;
+    Book p; Invite v; unsigned no = 0;
+    InviteDecide(&p, "alex.1", "sam.1", true, true, "Blades", 0.0); AnswerDecide(&p, "sam.1", true, 1, T546Snap("s"), 1, 1.0, &v, &no);
+    InviteDecide(&p, "alex.1", "kim.1", true, true, "Blades", 2.0);
+    std::vector<Invite> gone; std::string name, nf; unsigned dropped = 0; TeamEnd end;
+    Book q = p;
+    const std::vector<std::string> on(1, "alex.1");
+    if (ProfileDeletedDecide(&q, "sam.1", &gone, &name, &nf, &dropped, 50, &on, &end) != kDelLastEnded || !q.teams.empty() || !end.ended || end.founder != "alex.1"
+        || end.row.no != 0 || end.rowSkipped || name != "Blades") Fail("the last member's profile deleted: the team ends, no row for a founder who made it");
+    if (end.gone.size() != 1 || end.gone[0].to != "kim.1" || InviteTo(q, "kim.1") >= 0) Fail("the founder's invitation ends with the team");
+    q = p; end = TeamEnd(); nf.clear(); gone.clear();
+    if (ProfileDeletedDecide(&q, "alex.1", &gone, &name, &nf, &dropped, 51, 0, &end) != kDelLastEnded || !q.teams.empty() || end.founder != "sam.1" || nf != "sam.1"
+        || end.row.no == 0 || end.row.id != "sam.1" || end.row.why != kWhyDisbanded || end.row.away != 1 || end.row.snap != T546Snap("s") || end.row.madeAt != 51
+        || q.owed.size() != 1 || q.owed[0].no != end.row.no) Fail("the founder's own profile deleted with one member: the team ends, the member's standing goes back (away)");
+    if (gone.size() != 1 || gone[0].from != "alex.1") Fail("the deleted founder's invitation");
+    if (!T546FileRoundTrip(q)) Fail("the ended team's row does not read back");
+    q = p; end = TeamEnd();
+    for (unsigned i = 0; i < kMaxOwedEach; ++i) { Owed x; x.no = 700 + i; x.id = "sam.1"; x.why = kWhyLeft; q.owed.push_back(x); }
+    if (ProfileDeletedDecide(&q, "alex.1", &gone, &name, &nf, &dropped, 52, 0, &end) != kDelLastEnded || !q.teams.empty() || !end.rowSkipped || end.row.no != 0
+        || q.owed.size() != kMaxOwedEach) Fail("a deletion is never refused: the team ends, the row with no room skipped");
+    q = p;   /* with two members the team stays */
+    InviteDecide(&q, "alex.1", "jo.1", true, true, "", 3.0); AnswerDecide(&q, "jo.1", true, 1, T546Snap("j"), 2, 4.0, &v, &no);
+    end = TeamEnd();
+    if (ProfileDeletedDecide(&q, "sam.1", &gone, &name, &nf, &dropped, 53, 0, &end) != kDelMember || q.teams.size() != 1 || end.ended) Fail("a member deleted from a team of three: the team stays");
+}
+/* a DECLINE: the same inviter's next invitation to that player waits 60 s (memory only) */
+void t_t546h_decline_wait()
+{
+    using namespace swteam;
+    Book b; Invite v; unsigned no = 0;
+    if (InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 10.0) != kOk || AnswerDecide(&b, "sam.1", false, 0, std::vector<char>(), 1, 12.0, &v, &no) != kOk) Fail("sam declines");
+    if (InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 12.5) != kRefDeclined || InviteTo(b, "sam.1") >= 0) Fail("a re-invite at once is refused");
+    if (InviteDecide(&b, "jo.1", "sam.1", true, true, "Wolves", 13.0) != kOk) Fail("another inviter is not held back");
+    if (AnswerDecide(&b, "sam.1", false, 0, std::vector<char>(), 1, 14.0, &v, &no) != kOk || b.declined.size() != 2) Fail("sam declines jo too");
+    if (InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 12.0 + kDeclineWaitSeconds - 0.1) != kRefDeclined) Fail("still refused just before the wait ends");
+    std::vector<Invite> gone;
+    ExpireInvites(&b, 12.0 + kDeclineWaitSeconds, &gone);
+    if (!gone.empty() || b.declined.size() != 1 || b.declined[0].from != "jo.1") Fail("the wait past its time dropped (not an ended invitation), jo's kept");
+    if (InviteDecide(&b, "alex.1", "sam.1", true, true, "Blades", 12.0 + kDeclineWaitSeconds) != kOk) Fail("after 60 s the invitation goes");
+    Book c = b; c.declined.clear();
+    if (BookFile(b) != BookFile(c)) Fail("the decline wait is never in the file");
+    if (AnswerDecide(&b, "sam.1", false, 0, std::vector<char>(), 1, 80.0, &v, &no) != kOk || b.declined.size() != 2) Fail("a second decline by the same pair: one wait, renewed");
+    for (size_t i = 0; i < b.declined.size(); ++i) if (b.declined[i].from == "alex.1" && b.declined[i].expiresAt != 80.0 + kDeclineWaitSeconds) Fail("the renewed wait");
+    if (std::string(ResultName(kRefDeclined)) != "declined-recently" || kRefLast != kRefDeclined) Fail("the refusal's name");
+    Book a;   /* an ACCEPT starts no wait */
+    InviteDecide(&a, "alex.1", "sam.1", true, true, "Blades", 0.0);
+    if (AnswerDecide(&a, "sam.1", true, 1, T546Snap("s"), 1, 1.0, &v, &no) != kOk || !a.declined.empty()) Fail("an accept starts no wait");
+}
+/* a game's RESTORE rows: held until its world is loaded, a repeat of a held or answered number applies nothing, per world */
+void t_t546_team_inbox()
+{
+    using namespace swteam;
+    Inbox in; Down d; d.kind = kDnRestore; d.no = 4;
+    if (InboxArrive(&in, "w1", d) != kInHeld || InboxArrive(&in, "w1", d) != kInAgainHeld || in.held.size() != 1) Fail("a row held once");
+    std::vector<Down> ready; InboxTake(&in, &ready);
+    if (ready.size() != 1 || ready[0].no != 4 || !in.held.empty()) Fail("the held row out");
+    if (InboxArrive(&in, "w1", d) != kInAgainDone || !in.held.empty()) Fail("an answered row came again");
+    if (InboxArrive(&in, "w2", d) != kInHeld) Fail("another world's row of the same number");
+    for (unsigned i = 0; i < kInboxDoneKept + 5; ++i) InboxMarkDone(&in, 100 + i);
+    if (in.done.size() != kInboxDoneKept || in.done.back() != 100 + kInboxDoneKept + 4) Fail("the answered numbers kept");
+}
+
+/* ---- T-546 step 5 (t546c): shared standing - the team's record (src/common/teamwire.h) and each game's part (teamstanding.h) ---- */
+swteam::PreJoin T546cPreJoin()
+{
+    swteam::PreJoin p;
+    p.npc.name = "Sam's Crew"; p.npc.platoonIds = 7;
+    coopown::FacRow a; a.sid = "17-gamedata.base"; a.rel = -60.0f; a.trust = 2.0f; a.trustNeg = 1.0f; a.relBack = -55.0f; a.flags = 2; a.flagsBack = 0;
+    coopown::FacRow b; b.sid = "204-gamedata.base"; b.rel = 40.0f; b.relBack = 35.5f; b.flags = 0; b.flagsBack = 0;
+    p.npc.rows.push_back(a); p.npc.rows.push_back(b);
+    swteam::PlayerSide s0; s0.slot = 0; s0.rel = 12.5f; s0.flags = 0;
+    swteam::PlayerSide s5; s5.slot = 5; s5.rel = 60.0f; s5.flags = 1;
+    p.players.push_back(s0); p.players.push_back(s5);
+    return p;
+}
+void t_t546c_prejoin_snapshot()
+{
+    using namespace swteam;
+    const PreJoin p = T546cPreJoin();
+    std::vector<char> b; EncodePreJoin(p, &b);
+    PreJoin q;
+    if (DecodePreJoin(b, &q) != kPjOk) { Fail("the pre-join snapshot decodes"); return; }
+    if (q.npc.name != p.npc.name || q.npc.platoonIds != 7 || q.npc.rows.size() != 2 || q.players.size() != 2) Fail("its shape survives the round trip");
+    else if (q.players[0].slot != 0 || q.players[0].rel != 12.5f || q.players[1].slot != 5 || q.players[1].rel != 60.0f || q.players[1].flags != 1) Fail("each side survives, with its ally flag");
+    /* a version 1 snapshot (sides without flags) still decodes: flags -1 = not recorded */
+    std::vector<char> fac; coopown::EncodeFaction(p.npc, &fac);
+    std::vector<char> v1; PutU32(&v1, kPreJoinMagic); PutU32(&v1, 1); PutBytes(&v1, &fac[0], fac.size()); PutU32(&v1, 1); PutU32(&v1, 3); PutF32(&v1, -40.0f);
+    PreJoin o1;
+    if (DecodePreJoin(v1, &o1) != kPjOk || o1.players.size() != 1 || o1.players[0].flags != -1 || o1.players[0].rel != -40.0f) Fail("a version 1 snapshot decodes, flags not recorded");
+    PreJoin old;
+    if (DecodePreJoin(fac, &old) != kPjOk || old.npc.rows.size() != 2 || !old.players.empty()) Fail("a plain pp.faction record still decodes, with no sides");
+    PreJoin x;
+    std::vector<char> v9 = b; v9[4] = 9;
+    if (DecodePreJoin(v9, &x) != kPjVersion) Fail("an unknown version is HELD (kPjVersion), not called broken");
+    std::vector<char> extra = b; extra.push_back(0);
+    if (DecodePreJoin(extra, &x) != kPjMalformed) Fail("a trailing byte is broken");
+    std::vector<char> cut(b.begin(), b.end() - 3);
+    if (DecodePreJoin(cut, &x) != kPjMalformed) Fail("a cut snapshot is broken");
+    std::vector<char> blob; EncodeAnswer(&blob, true, 2, b);
+    Up u;
+    if (!DecodeUp(&blob[0], blob.size(), &u) || u.snap != b) Fail("the snapshot travels in the ACCEPT unchanged (the world server keeps it unread)");
+}
+swteam::Book T546cBook()
+{
+    swteam::Book b;
+    swteam::Team t; t.no = 3; t.founder = "pa"; t.name = "The Rusty Blades";
+    swteam::Member c; c.id = "pc"; c.snapRows = 1; c.snap.push_back('x');
+    swteam::Member d; d.id = "pd"; d.snapRows = 1; d.snap.push_back('y');
+    t.members.push_back(c); t.members.push_back(d);
+    b.teams.push_back(t); b.nextTeam = 4;
+    return b;
+}
+swteam::TeamRec T546cRec()
+{
+    swteam::TeamRec r;
+    swteam::RecRow x; x.sid = "17-gamedata.base"; x.rel = 10.0f; x.trust = 1.0f; x.relBack = -5.0f; x.flags = 0; x.flagsBack = 2; x.have = swteam::kHaveFwd | swteam::kHaveBack;
+    r.rows.push_back(x);
+    swteam::RecStance st; st.slot = 1; st.rel = -100.0f; st.flags = 0; r.stances.push_back(st);
+    return r;
+}
+void t_t546c_record_seed_delta()
+{
+    using namespace swteam;
+    Book b = T546cBook();
+    std::vector<Delta> ds(1); ds[0].sid = "17-gamedata.base"; ds[0].dir = 0; ds[0].dRel = -30.0f; ds[0].dTrust = 2.0f;
+    if (DeltaDecide(&b, "pc", ds) != kRefNoRecord) Fail("a change before the founder seeded is refused (no-record)");
+    if (SeedDecide(&b, "pc", T546cRec()) != kRefNotFounder) Fail("only the founder seeds");
+    if (SeedDecide(&b, "pz", T546cRec()) != kRefNotInTeam) Fail("a player in no team seeds nothing");
+    if (SeedDecide(&b, "pa", T546cRec()) != kOk || !b.teams[0].rec.seeded || b.teams[0].rec.gen != 1 || b.teams[0].rec.rows.size() != 1) Fail("the founder's seed is the record (gen 1)");
+    if (SeedDecide(&b, "pa", T546cRec()) != kRefSeeded) Fail("a team seeds once");
+    if (DeltaDecide(&b, "pc", ds) != kOk) { Fail("a member's change is taken"); return; }
+    const RecRow& r = b.teams[0].rec.rows[0];
+    if (r.rel != -20.0f || r.trust != 3.0f || r.relBack != -5.0f || b.teams[0].rec.gen != 2) Fail("the member's difference added to the team's value; the other direction untouched; gen up");
+    ds[0].dRel = -500.0f;
+    DeltaDecide(&b, "pd", ds);
+    if (b.teams[0].rec.rows[0].rel != kRecLow) Fail("the relation stays on the engine's scale");
+    ds[0].dRel = 30.0f;
+    DeltaDecide(&b, "pa", ds);
+    if (b.teams[0].rec.rows[0].rel != -70.0f) Fail("after the floor the next change counts from the floor (the record is the truth every member writes)");
+    std::vector<Delta> nd(2);
+    nd[0].sid = "204-gamedata.base"; nd[0].dir = 1; nd[0].rel = 44.0f; nd[0].trust = 1.5f; nd[0].dRel = 9.0f; nd[0].flags = 2;
+    nd[1].sid = "17-gamedata.base"; nd[1].dir = 1; nd[1].dRel = 5.0f; nd[1].flags = 0;
+    DeltaDecide(&b, "pc", nd);
+    const TeamRec& rec = b.teams[0].rec;
+    if (rec.rows.size() != 2 || rec.rows[1].sid != "204-gamedata.base" || rec.rows[1].have != (unsigned)kHaveBack || rec.rows[1].relBack != 44.0f || rec.rows[1].flagsBack != 2)
+        Fail("a direction the record does not hold takes the member's value (and only that direction is held)");
+    if (rec.rows[0].relBack != 0.0f || rec.rows[0].flagsBack != 0) Fail("a held direction moves by the difference, its flags the member's");
+    if (DeltaDecide(&b, "pz", ds) != kRefNotInTeam) Fail("a player in no team changes no record");
+}
+void t_t546c_record_stance_side()
+{
+    using namespace swteam;
+    Book b = T546cBook();
+    if (StanceDecide(&b, "pa", 1, false, -100.0f, 0) != kRefNoRecord) Fail("a stance before the seed is refused");
+    SeedDecide(&b, "pa", T546cRec());
+    if (StanceDecide(&b, "pc", 1, false, 0.0f, 0) != kOk || b.teams[0].rec.stances[0].rel != 0.0f) Fail("owner 512: a member's own side change is the team's stance (the latest wins)");
+    if (StanceDecide(&b, "pa", 2, true, -100.0f, 0) != kRefInTeam) Fail("never a stance towards a member (the pin's)");
+    if (StanceDecide(&b, "pa", 1, false, 30.0f, 1) != kOk || b.teams[0].rec.stances.size() != 1 || b.teams[0].rec.stances[0].rel != 30.0f || b.teams[0].rec.stances[0].flags != 1)
+        Fail("the founder's stance replaces the record's towards that player");
+    if (StanceDecide(&b, "pa", 9, false, -300.0f, 0) != kOk || b.teams[0].rec.stances.size() != 2 || b.teams[0].rec.stances[1].rel != kRecLow) Fail("a stance towards a new player is added, on the scale");
+    if (!DropStance(&b.teams[0].rec, 9) || b.teams[0].rec.stances.size() != 1 || DropStance(&b.teams[0].rec, 9)) Fail("a joiner's slot leaves the stances once");
+    bool kept = false;
+    if (SideDecide(&b, "pc", 2, "pa", 0, 12.0f, 0, &kept) != kOk || !kept) Fail("a member's side before the pin is kept");
+    if (SideDecide(&b, "pc", 2, "pa", 0, 100.0f, 1, &kept) != kOk || kept || b.teams[0].sides[0].rel != 12.0f) Fail("the first report is kept - a later one (after the pin) is not");
+    if (SideDecide(&b, "pc", 2, "pz", 7, 1.0f, 0, &kept) != kRefNotMember || SideDecide(&b, "pc", 2, "pc", 2, 1.0f, 0, &kept) != kRefNotMember) Fail("a side only between two members of one team");
+}
+void t_t546c_departure_both_sides()
+{
+    using namespace swteam;
+    Book b = T546cBook();
+    bool k = false;
+    SideDecide(&b, "pc", 2, "pa", 0, 10.0f, 0, &k);   /* C towards A before the pin */
+    SideDecide(&b, "pa", 0, "pc", 2, -20.0f, 2, &k);  /* A towards C */
+    SideDecide(&b, "pd", 4, "pc", 2, 5.0f, 0, &k);    /* D towards C */
+    SideDecide(&b, "pc", 2, "pd", 4, 7.0f, 0, &k);    /* C towards D */
+    SideDecide(&b, "pa", 0, "pd", 4, 1.0f, 0, &k);    /* A towards D */
+    Owed made; std::vector<Owed> sideRows;
+    if (LeaveDecide(&b, "pc", 100, &made, 0, &sideRows) != kOk) { Fail("C leaves"); return; }
+    if (made.id != "pc" || made.snap.size() != 1 || made.sides.size() != 2 || made.sides[0].slot != 0 || made.sides[0].rel != 10.0f || made.sides[1].slot != 4)
+        Fail("the leaver's row: its snapshot and its sides towards each remaining member");
+    if (sideRows.size() != 2 || sideRows[0].id != "pa" || sideRows[0].sides.size() != 1 || sideRows[0].sides[0].slot != 2 || sideRows[0].sides[0].rel != -20.0f || sideRows[0].sides[0].flags != 2
+        || sideRows[1].id != "pd" || sideRows[1].sides[0].rel != 5.0f || !sideRows[1].snap.empty())
+        Fail("477, both sides: a row for each remaining member with its side towards the leaver only (and its flags)");
+    if (b.owed.size() != 3 || b.teams[0].sides.size() != 1 || b.teams[0].sides[0].owner != "pa" || b.teams[0].sides[0].other != "pd") Fail("every side with the leaver is dropped; the others stay");
+    /* a remaining member whose rows are full: its side row is not made, and the departure goes ahead (one player's backlog never
+       stops another's leave); side rows name a remaining member who is away */
+    Book f = T546cBook();
+    SideDecide(&f, "pa", 0, "pc", 2, 1.0f, 0, &k);
+    SideDecide(&f, "pd", 4, "pc", 2, 2.0f, 0, &k);
+    for (unsigned i = 0; i < kMaxOwedEach; ++i) { Owed o; o.no = 50 + i; o.id = "pa"; o.why = kWhyLeft; f.owed.push_back(o); }
+    std::vector<Owed> fr; std::vector<std::string> skipped; const std::vector<std::string> online(1, "pa");
+    if (LeaveDecide(&f, "pc", 100, &made, 0, &fr, &online, &skipped) != kOk || f.teams[0].members.size() != 1 || skipped.size() != 1 || skipped[0] != "pa"
+        || fr.size() != 1 || fr[0].id != "pd" || fr[0].away != 1)
+        Fail("a full backlog skips only that player's side row (named); the leave goes ahead; an offline member's side row is marked away");
+    /* the leaver's own rows full: refused, nothing changed */
+    Book g = T546cBook();
+    for (unsigned i = 0; i < kMaxOwedEach; ++i) { Owed o; o.no = 70 + i; o.id = "pc"; o.why = kWhyLeft; g.owed.push_back(o); }
+    if (LeaveDecide(&g, "pc", 100, &made) != kRefOwedFull || g.teams[0].members.size() != 2) Fail("no room for the leaver's own row: refused");
+    /* disband: every member's row carries all its sides; the founder's too */
+    Book d = T546cBook();
+    SideDecide(&d, "pc", 2, "pa", 0, 10.0f, 0, &k); SideDecide(&d, "pd", 4, "pc", 2, 5.0f, 0, &k); SideDecide(&d, "pa", 0, "pd", 4, 3.0f, 0, &k);
+    std::vector<Owed> rows; std::string name;
+    if (DisbandDecide(&d, "pa", std::vector<std::string>(1, "pc"), 100, &rows, &name) != kOk || rows.size() != 3) { Fail("disband: a row for each member and the founder (who holds a side)"); return; }
+    if (rows[0].id != "pc" || rows[0].away != 0 || rows[0].sides.size() != 1 || rows[1].id != "pd" || rows[1].away != 1 || rows[1].sides[0].slot != 2 || rows[2].id != "pa" || rows[2].sides[0].slot != 4)
+        Fail("disband rows carry each player's own sides, away named");
+}
+/* ---- T-546 step 8 (t546i): three players in one faction - a departure from a team that stays ---- */
+void t_t546i_departure_stance()
+{
+    using namespace swteam;
+    /* A founds, C (slot 2) and D (slot 4) are members; the record is seeded with a stance towards slot 1 (an outsider) */
+    Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+    bool k = false;
+    SideDecide(&b, "pa", 0, "pc", 2, -20.0f, 2, &k);  /* A towards C before the pin */
+    SideDecide(&b, "pd", 4, "pc", 2, 5.0f, 0, &k);    /* D towards C */
+    SideDecide(&b, "pc", 2, "pa", 0, 10.0f, 0, &k);   /* C towards A */
+    const unsigned g0 = b.teams[0].rec.gen;
+    Owed made; std::vector<Owed> sideRows; TeamEnd end;
+    const std::vector<std::string> online(1, "pa");   /* C is away: removed while offline */
+    if (RemoveDecide(&b, "pa", "pc", true, false, 100, &made, &sideRows, &online, 0, &end) != kOk || end.ended) { Fail("A removes C while C is away; A and D stay a team"); return; }
+    if (made.id != "pc" || made.away != 1 || made.sides.size() != 1 || made.sides[0].slot != 0) Fail("C's own row is a while-away row with its side towards A");
+    if (!sideRows.empty()) Fail("a team that stays: its record carries the stance towards C, so A and D get no side rows (476)");
+    const TeamRec& r = b.teams[0].rec;
+    size_t at = r.stances.size();
+    for (size_t i = 0; i < r.stances.size(); ++i) if (r.stances[i].slot == 2) at = i;
+    if (at == r.stances.size() || r.stances[at].rel != -20.0f || r.stances[at].flags != 2 || r.gen != g0 + 1)
+        Fail("the team that stays takes the founder's side from before the pin as its stance towards the removed member (one new generation)");
+    if (r.stances.size() != 2 || r.stances[0].slot != 1 || r.stances[0].rel != -100.0f) Fail("the other stances stay as they were");
+    if (b.teams[0].sides.size() != 0) Fail("every side with the removed member is dropped (D's towards A was never recorded)");
+    /* the founder holds no recorded side towards the leaver (they were allies before the pin): the record does not change */
+    Book n = T546cBook(); SeedDecide(&n, "pa", T546cRec());
+    SideDecide(&n, "pd", 4, "pc", 2, 5.0f, 0, &k);
+    const unsigned n0 = n.teams[0].rec.gen;
+    if (LeaveDecide(&n, "pc", 100, &made) != kOk || n.teams[0].rec.gen != n0 || n.teams[0].rec.stances.size() != 1) Fail("no founder's side from before the pin: no stance is made up");
+    /* the stance is already the founder's side: no new generation */
+    Book same = T546cBook(); SeedDecide(&same, "pa", T546cRec());
+    SideDecide(&same, "pa", 0, "pc", 2, 7.0f, 0, &k);
+    StanceDecide(&same, "pa", 2, false, 7.0f, 0);
+    const unsigned s0 = same.teams[0].rec.gen;
+    if (LeaveDecide(&same, "pc", 100, &made) != kOk || same.teams[0].rec.gen != s0) Fail("a stance already the founder's side is no new generation");
+    /* a record not seeded: nothing is made */
+    Book ns = T546cBook();
+    SideDecide(&ns, "pa", 0, "pc", 2, -20.0f, 0, &k);
+    if (LeaveDecide(&ns, "pc", 100, &made) != kOk || ns.teams[0].rec.seeded || !ns.teams[0].rec.stances.empty()) Fail("an unseeded record takes no stance");
+    /* the last member's departure ends the team: no record is left to change, and the departure is not refused */
+    Book two = T546cBook(); SeedDecide(&two, "pa", T546cRec());
+    SideDecide(&two, "pa", 0, "pd", 4, 3.0f, 0, &k);
+    if (LeaveDecide(&two, "pc", 100, &made) != kOk || LeaveDecide(&two, "pd", 100, &made, 0, 0, 0, 0, &end) != kOk || !end.ended || !two.teams.empty())
+        Fail("the last member's leave ends the team as before");
+    /* the stance survives the file */
+    Book f = T546cBook(); SeedDecide(&f, "pa", T546cRec());
+    SideDecide(&f, "pa", 0, "pc", 2, -20.0f, 2, &k);
+    LeaveDecide(&f, "pc", 100, &made);
+    Book back; std::istringstream in(BookFile(f)); std::string line;
+    while (std::getline(in, line)) BookParseLine(line, &back);
+    if (back.teams.size() != 1 || back.teams[0].rec.stances.size() != 2 || back.teams[0].rec.stances[1].slot != 2 || back.teams[0].rec.stances[1].rel != -20.0f)
+        Fail("teams.txt keeps the stance towards the departed member");
+    /* the game's side: the teammates who left between two tables */
+    std::vector<unsigned> before; before.push_back(1); before.push_back(2); before.push_back(4);
+    std::vector<unsigned> now; now.push_back(4); now.push_back(1);
+    const std::vector<unsigned> gone = DepartedMates(before, now);
+    if (gone.size() != 1 || gone[0] != 2) Fail("the teammate missing from the new table has departed");
+    if (!DepartedMates(now, before).empty() || !DepartedMates(std::vector<unsigned>(), before).empty()) Fail("a join is no departure");
+    if (DepartedMates(before, std::vector<unsigned>()).size() != 3) Fail("the team ended (or this player left): every former teammate has departed");
+}
+void t_t546c_record_wire_and_file()
+{
+    using namespace swteam;
+    TeamRec r = T546cRec(); r.gen = 7; r.seeded = 1;
+    std::vector<char> blob; EncodeRec(r, &blob);
+    TeamRec q;
+    if (!DecodeRec(blob, &q) || q.gen != 7 || !q.seeded || q.rows.size() != 1 || q.rows[0].flagsBack != 2 || q.rows[0].have != 3u || q.stances.size() != 1 || q.stances[0].rel != -100.0f) Fail("the record's round trip");
+    std::vector<char> bad = blob; bad.push_back(1);
+    if (DecodeRec(bad, &q)) Fail("a record with a trailing byte is refused");
+    std::vector<char> m; EncodeRecord(&m, 3, r);
+    Down d;
+    if (!DecodeDown(&m[0], m.size(), &d) || d.kind != kDnRecord || d.recTeam != 3 || d.rec.gen != 7) Fail("RECORD down");
+    std::vector<Delta> ds(1); ds[0].sid = "x"; ds[0].dir = 1; ds[0].dRel = -3.0f; ds[0].rel = 4.0f; ds[0].flags = 2;
+    EncodeDeltas(&m, ds);
+    Up u;
+    if (!DecodeUp(&m[0], m.size(), &u) || u.kind != kUpDelta || u.deltas.size() != 1 || u.deltas[0].dir != 1 || u.deltas[0].dRel != -3.0f || u.deltas[0].flags != 2) Fail("DELTA up");
+    if (!EncodeSeed(&m, r) || !DecodeUp(&m[0], m.size(), &u) || u.kind != kUpSeed || u.rec.rows.size() != 1) Fail("SEED up");
+    EncodeStance(&m, 5, -40.0f, 0);
+    if (!DecodeUp(&m[0], m.size(), &u) || u.kind != kUpStance || u.slot != 5 || u.rel != -40.0f) Fail("STANCE up");
+    EncodeSide(&m, 6, 12.0f, 1);
+    if (!DecodeUp(&m[0], m.size(), &u) || u.kind != kUpSide || u.slot != 6 || u.flags != 1) Fail("SIDE up");
+    Owed o; o.no = 9; o.id = "pc"; o.why = kWhyRemoved; o.teamName = "T"; RecStance st; st.slot = 0; st.rel = 10.0f; st.flags = 1; o.sides.push_back(st);
+    EncodeRestore(&m, o);
+    if (!DecodeDown(&m[0], m.size(), &d) || d.kind != kDnRestore || d.sides.size() != 1 || d.sides[0].rel != 10.0f || !d.snap.empty()) Fail("RESTORE down carries the sides");
+    /* the file: R, S and an O line with sides read back to the same text; an O line without sides still reads */
+    Book b = T546cBook();
+    SeedDecide(&b, "pa", T546cRec());
+    bool k = false; SideDecide(&b, "pc", 2, "pa", 0, 10.5f, 1, &k);
+    b.owed.push_back(o); b.nextOwed = 10;
+    const std::string text = BookFile(b);
+    Book back; std::istringstream is(text); std::string line; int lines = 0;
+    while (std::getline(is, line)) { if (!BookParseLine(line, &back)) Fail("a line of the file did not read back: " + line.substr(0, 40)); ++lines; }
+    if (BookFile(back) != text) Fail("teams.txt with the record, a side and a row with sides reads back to the same text");
+    if (back.teams.size() != 1 || !back.teams[0].rec.seeded || back.teams[0].sides.size() != 1 || back.teams[0].sides[0].rel != 10.5f || back.owed[0].sides.size() != 1) Fail("the read-back book holds them");
+    Book old;
+    BookParseLine("O 4 7063 1 0 54 0 - 100", &old);
+    if (old.owed.size() != 1 || !old.owed[0].sides.empty()) Fail("an O line written before the sides still reads");
+    Book dup = back;
+    if (BookParseLine("R 3 " + HexV(blob), &dup)) Fail("a second record line for one team is refused");
+    const std::vector<std::string> ids = TeamIds(b.teams[0]);
+    if (ids.size() != 3 || ids[0] != "pa" || ids[1] != "pc" || ids[2] != "pd") Fail("a RECORD goes to the founder, then the members in joining order");
+}
+void t_t546c_game_rules()
+{
+    using namespace swteam;
+    std::vector<WireTeam> t(1); t[0].no = 1; t[0].founderSlot = 0; t[0].memberSlots.push_back(2); t[0].memberSlots.push_back(4);
+    if (RoleOf(t, 0) != 1 || RoleOf(t, 2) != 0 || RoleOf(t, 3) != -1) Fail("role: founder, member, none");
+    if (!StanceIsFounders(0, false) || StanceIsFounders(1, false) || StanceIsFounders(0, true) || StanceIsFounders(-1, false)) Fail("476: a member's stance towards a non-member is the founder's");
+    std::vector<unsigned> fan = FanOutTargets(t, 1, 2);
+    if (fan.size() != 2 || fan[0] != 0 || fan[1] != 4) Fail("476, either side: a stance towards a member is set towards the whole team");
+    if (!FanOutTargets(t, 4, 2).empty() || !FanOutTargets(t, 1, 3).empty()) Fail("no fan-out inside one's own team, or towards a player in no team");
+    if (!SeedDue(1, false, false) || SeedDue(1, true, false) || SeedDue(1, false, true) || SeedDue(0, false, false)) Fail("the founder seeds a team with no record, once a link");
+    if (!RecordWriteDue(true, true, true, true) || RecordWriteDue(false, true, true, true) || RecordWriteDue(true, false, true, true) || RecordWriteDue(true, true, false, true) || RecordWriteDue(true, true, true, false))
+        Fail("the record is written when owed, the world ready, in that team and seeded");
+    Delta d;
+    if (!DeltaOf("x", 0, Standing(-30.0f, 2.0f, 0.0f), 2, Standing(10.0f, 1.0f, 0.0f), 0, &d) || d.dRel != -40.0f || d.dTrust != 1.0f || d.rel != -30.0f || d.flags != 2) Fail("an own change: the difference from the base, and the value now");
+    if (DeltaOf("x", 0, Standing(1.0f, 0, 0), 0, Standing(1.0f, 0, 0), 0, &d)) Fail("nothing moved: no change");
+    if (!DeltaOf("x", 1, Standing(1.0f, 0, 0), 2, Standing(1.0f, 0, 0), 0, &d)) Fail("a flag alone is a change");
+    std::vector<PlayerSide> snap = T546cPreJoin().players;
+    std::vector<RecStance> row(2); row[0].slot = 5; row[0].rel = 10.0f; row[0].flags = 0; row[1].slot = 7; row[1].rel = -3.0f;
+    const std::vector<PlayerSide> merged = MergeSides(snap, row);
+    if (merged.size() != 3 || merged[1].slot != 5 || merged[1].rel != 60.0f || merged[1].flags != 1 || merged[2].slot != 7 || merged[2].rel != -3.0f)
+        Fail("the snapshot's own side wins over the side recorded before the pin; a side the snapshot lacks comes from the row");
+    std::vector<unsigned> mates(1, 5), skipped;
+    const std::vector<PlayerSide> back = RestoreSides(merged, 2, mates, &skipped);
+    if (back.size() != 2 || back[0].slot != 0 || back[1].slot != 7 || skipped.size() != 1 || skipped[0] != 5) Fail("a teammate now is left at ally (skipped, named)");
+    if (RestoreRetryMs(1) != kRestoreRetryFirstMs || RestoreRetryMs(2) != 2 * kRestoreRetryFirstMs || RestoreRetryMs(40) != kRestoreRetryCapMs) Fail("a row not written: the wait doubles to its cap");
+    if (!RestoreDue(true, true) || RestoreDue(false, true) || RestoreDue(true, false)) Fail("written only with the world ready and a table from this link");
+    std::vector<int> lv(1, nametag::kFriendly); lv.push_back(nametag::kUnknown);
+    if (TheirSideTowardsTeam(lv) != nametag::kFriendly) Fail("an unread side does not count");
+    lv.push_back(nametag::kHostile);
+    if (TheirSideTowardsTeam(lv) != nametag::kHostile) Fail("hostile towards any member: hostile towards the team");
+    Inbox in; Down d1; d1.kind = kDnRestore; d1.no = 4; Down d2 = d1; d2.no = 6;
+    InboxArrive(&in, "w", d1); InboxArrive(&in, "w", d2);
+    if (!InboxAnswerOne(&in, 6) || in.held.size() != 1 || in.held[0].no != 4) Fail("a written row leaves the held list; the other stays held");
+    if (InboxArrive(&in, "w", d2) != kInAgainDone || InboxArrive(&in, "w", d1) != kInAgainHeld) Fail("written: answered again; not written: still held");
+    /* the PLAYERS tab: towards a non-member a member's buttons are all disabled, its own (the founder's) value ticked */
+    std::vector<playerstab::RowView> rows(1); rows[0].slot = 3; rows[0].you = nametag::kHostile; rows[0].founderSets = true;
+    const playerstab::Bottom bt = playerstab::BottomFor(rows, 3);
+    if (bt.ticked != nametag::kHostile || playerstab::ButtonEnabled(bt, 0) || playerstab::ButtonEnabled(bt, 2) || playerstab::LockLook(bt) != 2) Fail("476 on the PLAYERS tab: greyed, the founder's value shown");
+    if (playerstab::PressForRow(0, nametag::kHostile, false, true) != playerstab::kPressNothing) Fail("a press does nothing there");
+}
+void t_t546c_fold1()
+{
+    using namespace swteam;
+    /* the record: an empty or zero change is no new generation; kDirAbsolute takes the member's value; the size cap */
+    Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+    const unsigned g0 = b.teams[0].rec.gen; bool changed = true;
+    if (DeltaDecide(&b, "pc", std::vector<Delta>(), &changed) != kOk || changed || b.teams[0].rec.gen != g0) Fail("an empty DELTA changes nothing");
+    std::vector<Delta> z(1); z[0].sid = "17-gamedata.base"; z[0].dir = 0; z[0].flags = 0;
+    if (DeltaDecide(&b, "pc", z, &changed) != kOk || changed || b.teams[0].rec.gen != g0) Fail("a zero change is no new generation");
+    z[0].dir = 0 | kDirAbsolute; z[0].rel = 33.0f; z[0].trust = 4.0f;
+    if (DeltaDecide(&b, "pc", z, &changed) != kOk || !changed || b.teams[0].rec.rows[0].rel != 33.0f || b.teams[0].rec.rows[0].trust != 4.0f) Fail("a change with no base here takes the member's value");
+    if (StanceDecide(&b, "pa", 1, false, -100.0f, 0, &changed) != kOk || changed) Fail("the same stance again is no new generation");
+    Book big = T546cBook(); TeamRec huge; for (int i = 0; i < 1300; ++i) { RecRow x; x.sid = "faction-number-" + I(i) + "-gamedata.base"; x.have = 3; huge.rows.push_back(x); }
+    if (RecBytes(huge) <= kMaxSnapshot || SeedDecide(&big, "pa", huge) != kRefTooMany) Fail("a record over the 64 KB limit is refused at the seed");
+    TeamRec most; for (int i = 0; i < 800; ++i) { RecRow x; x.sid = "faction-number-" + I(i) + "-gamedata.base"; x.have = 3; most.rows.push_back(x); }
+    if (SeedDecide(&big, "pa", most) != kOk) { Fail("a record under the limit seeds"); return; }
+    std::vector<Delta> grow;
+    for (int i = 0; i < 400; ++i) { Delta d; d.sid = "another-faction-" + I(i) + "-gamedata.base"; d.dir = 0; d.rel = 1.0f; grow.push_back(d); }
+    Book before = big;
+    if (DeltaDecide(&big, "pc", grow) != kRefTooMany) Fail("a DELTA that would grow the record past the limit is refused (the world server keeps its copy)");
+    std::vector<char> enc; EncodeRec(before.teams[0].rec, &enc);
+    Book rb = T546cBook();
+    if (enc.size() > kMaxSnapshot || !BookParseLine("R 3 " + HexV(enc), &rb)) Fail("a record within the limit reads back from teams.txt (the file reader agrees)");
+    /* 1: a departure row's NPC part is written once, each side once; a side with no faction here has nothing to write */
+    RestoreProgress pg;
+    if (SideDone(pg, 2)) Fail("nothing done at first");
+    pg.npcDone = true; pg.sidesDone.push_back(2);
+    if (!SideDone(pg, 2) || SideDone(pg, 4)) Fail("a written side is not written again; the others still are");
+    if (SideOutcome(1) != kSideWritten || SideOutcome(-1) != kSideNothing || SideOutcome(-2) != kSideRetry) Fail("no faction of that player here: nothing to write, not a retry");
+    /* 2: the side reported is the first pin write's */
+    if (!SideReportDue(1, false) || SideReportDue(1, true) || SideReportDue(0, false) || SideReportDue(-1, false)) Fail("only the first pin write reports a side; a side already at the pin reports nothing");
+    /* 3: an old record is not written over unsent own changes */
+    if (RecordWriteSafe(false, true) || !RecordWriteSafe(true, true) || !RecordWriteSafe(false, false)) Fail("no link and a base: the record waits; after a load (no base) it is written");
+    if (!GatherDue(true, true, true) || GatherDue(false, true, true) || GatherDue(true, false, true) || GatherDue(true, true, false)) Fail("own changes gathered with a base, a link and a record (or the founder's SEED)");
+    /* 13: stances the record lacks */
+    std::vector<PlayerSide> mine(3); mine[0].slot = 1; mine[1].slot = 2; mine[2].slot = 6;
+    std::vector<RecStance> rs(1); rs[0].slot = 1;
+    const std::vector<unsigned> miss = StancesMissing(mine, rs, std::vector<unsigned>(1, 2), 0, std::vector<unsigned>());
+    if (miss.size() != 1 || miss[0] != 6) Fail("the founder fills a stance only for a player outside the team the record lacks");
+    if (!StancesMissing(mine, rs, std::vector<unsigned>(1, 2), 0, std::vector<unsigned>(1, 6)).empty()) Fail("a player who has just left the team waits for the record after the departure");
+    if (!SideMoveIsTeamStance(0) || !SideMoveIsTeamStance(1) || SideMoveIsTeamStance(-1)) Fail("owner 512: a side moved on any member's game is the team's stance");
+}
+/* ---- T-546 step 8 fold 1: three players - the leaver's own sides, the remaining members' sides from the record, the fill's wait,
+   a newer own change, the stance's caps ---- */
+void t_t546i_fold1()
+{
+    using namespace swteam;
+    bool k = false;
+    /* 1: A (slot 0) founds; B (pc, slot 2) joins - its snapshot holds its own sides: towards A 12, towards C (pd, slot 4) 15; C
+       joins, and B's pin towards C found A's stance (-100, written from the record), which B recorded; B leaves while C stays */
+    {
+        Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+        PreJoin pj = T546cPreJoin(); pj.players.clear();
+        PlayerSide toA; toA.slot = 0; toA.rel = 12.0f; toA.flags = 0; pj.players.push_back(toA);
+        PlayerSide toC; toC.slot = 4; toC.rel = 15.0f; toC.flags = 0; pj.players.push_back(toC);
+        EncodePreJoin(pj, &b.teams[0].members[0].snap);
+        SideDecide(&b, "pc", 2, "pa", 0, 12.0f, 0, &k);
+        SideDecide(&b, "pc", 2, "pd", 4, -100.0f, 0, &k);
+        SideDecide(&b, "pa", 0, "pc", 2, -30.0f, 2, &k);   /* A towards B before the pin */
+        SideDecide(&b, "pd", 4, "pc", 2, 40.0f, 0, &k);    /* C towards B before the pin */
+        const unsigned g0 = b.teams[0].rec.gen;
+        Owed made; std::vector<Owed> sideRows; TeamEnd end;
+        if (LeaveDecide(&b, "pc", 100, &made, 0, &sideRows, 0, 0, &end) != kOk || end.ended) { Fail("B leaves; A and C stay a team"); return; }
+        PreJoin back;
+        if (DecodePreJoin(made.snap, &back) != kPjOk) { Fail("B's row carries its snapshot"); return; }
+        const std::vector<PlayerSide> put = MergeSides(back.players, made.sides);
+        float towardsC = 0.0f, towardsA = 0.0f; int found = 0;
+        for (size_t i = 0; i < put.size(); ++i) { if (put[i].slot == 4) { towardsC = put[i].rel; ++found; } if (put[i].slot == 0) { towardsA = put[i].rel; ++found; } }
+        if (found != 2 || put.size() != 2 || towardsC != 15.0f || towardsA != 12.0f) Fail("477: B's side towards C comes back as B's own pre-join value (15), not A's stance the pin found (-100)");
+        if (!sideRows.empty()) Fail("476: A and C take the team's stance towards B from the record - no side rows");
+        const TeamRec& r = b.teams[0].rec;
+        size_t at = r.stances.size();
+        for (size_t i = 0; i < r.stances.size(); ++i) if (r.stances[i].slot == 2) at = i;
+        if (at == r.stances.size() || r.stances[at].rel != -30.0f || r.stances[at].flags != 2 || r.gen != g0 + 1) Fail("the record's stance towards B is A's side from before the pin");
+    }
+    {   /* a side the snapshot lacks comes from the row */
+        std::vector<PlayerSide> snap(1); snap[0].slot = 0; snap[0].rel = 12.0f; snap[0].flags = 0;
+        std::vector<RecStance> row(2); row[0].slot = 0; row[0].rel = 100.0f; row[0].flags = 1; row[1].slot = 6; row[1].rel = -5.0f; row[1].flags = 2;
+        const std::vector<PlayerSide> m = MergeSides(snap, row);
+        if (m.size() != 2 || m[0].rel != 12.0f || m[0].flags != 0 || m[1].slot != 6 || m[1].rel != -5.0f || m[1].flags != 2) Fail("the row fills only the players the snapshot lacks");
+        if (MergeSides(std::vector<PlayerSide>(), row).size() != 2) Fail("no snapshot sides (a plain pp.faction snapshot): every recorded side");
+    }
+    {   /* the team ends with the departure: the founder's side row is made */
+        Book b = T546cBook(); b.teams[0].members.pop_back(); SeedDecide(&b, "pa", T546cRec());
+        SideDecide(&b, "pa", 0, "pc", 2, -30.0f, 0, &k);
+        Owed made; std::vector<Owed> sideRows; TeamEnd end;
+        if (LeaveDecide(&b, "pc", 100, &made, 0, &sideRows, 0, 0, &end) != kOk || !end.ended || sideRows.size() != 1 || sideRows[0].id != "pa" || sideRows[0].sides[0].rel != -30.0f)
+            Fail("a team of two ends: the founder's own side towards the leaver comes back by its row");
+    }
+    {   /* the team stays but the founder holds no recorded side towards the leaver: the record carries no stance - side rows */
+        Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+        SideDecide(&b, "pd", 4, "pc", 2, 5.0f, 0, &k);
+        Owed made; std::vector<Owed> sideRows;
+        if (LeaveDecide(&b, "pc", 100, &made, 0, &sideRows) != kOk || sideRows.size() != 1 || sideRows[0].id != "pd") Fail("no stance in the record: the remaining member's own side comes back by its row");
+    }
+    {   /* StanceBackOnDeparture replaces a stance the record holds towards that slot */
+        Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+        StanceDecide(&b, "pa", 2, false, 7.0f, 1);
+        SideDecide(&b, "pa", 0, "pc", 2, -20.0f, 2, &k);
+        const unsigned g0 = b.teams[0].rec.gen;
+        Owed made; std::vector<Owed> sideRows;
+        LeaveDecide(&b, "pc", 100, &made, 0, &sideRows);
+        const TeamRec& r = b.teams[0].rec;
+        if (r.stances.size() != 2 || r.stances[1].slot != 2 || r.stances[1].rel != -20.0f || r.stances[1].flags != 2 || r.gen != g0 + 1 || !sideRows.empty())
+            Fail("a stance towards the leaver's slot is replaced by the founder's side (one new generation), and no side rows");
+    }
+    {   /* the caps: a record full of stances, or one at the size limit, takes no stance - the side rows are made instead */
+        Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+        while (b.teams[0].rec.stances.size() < kMaxStances) { RecStance x; x.slot = 100 + (unsigned)b.teams[0].rec.stances.size(); b.teams[0].rec.stances.push_back(x); }
+        SideDecide(&b, "pa", 0, "pc", 2, -20.0f, 0, &k); SideDecide(&b, "pd", 4, "pc", 2, 5.0f, 0, &k);
+        const unsigned g0 = b.teams[0].rec.gen;
+        Owed made; std::vector<Owed> sideRows;
+        if (LeaveDecide(&b, "pc", 100, &made, 0, &sideRows) != kOk || b.teams[0].rec.gen != g0 || b.teams[0].rec.stances.size() != kMaxStances || sideRows.size() != 2)
+            Fail("kMaxStances: no stance added, the record unchanged; A and D get their side rows");
+        Book z = T546cBook();
+        TeamRec big; big.seeded = 1;
+        RecRow one; one.sid = "pad-1000"; one.have = 3;
+        const size_t base = RecBytes(big);
+        big.rows.push_back(one);
+        const size_t rowBytes = RecBytes(big) - base;
+        const size_t n = (kMaxSnapshot - base) / rowBytes;
+        big.rows.clear();
+        for (size_t i = 0; i < n; ++i) { RecRow x; x.sid = "pad-" + I(1000 + (int)i); x.have = 3; big.rows.push_back(x); }
+        big.rows.back().sid += std::string(kMaxSnapshot - RecBytes(big), 'p');
+        if (RecBytes(big) != kMaxSnapshot) { Fail("the padded record is exactly at the size limit"); return; }
+        z.teams[0].rec = big;
+        SideDecide(&z, "pa", 0, "pc", 2, -20.0f, 0, &k);
+        std::vector<Owed> zr;
+        if (LeaveDecide(&z, "pc", 100, &made, 0, &zr) != kOk || z.teams[0].rec.gen != big.gen || !z.teams[0].rec.stances.empty() || RecBytes(z.teams[0].rec) != kMaxSnapshot || zr.size() != 1)
+            Fail("kMaxSnapshot: a stance that would grow the record past the limit is not taken; the founder gets its side row");
+    }
+    {   /* a deleted member's profile: the team that stays takes the founder's side as its stance */
+        Book b = T546cBook(); SeedDecide(&b, "pa", T546cRec());
+        SideDecide(&b, "pa", 0, "pc", 2, -20.0f, 2, &k);
+        const unsigned g0 = b.teams[0].rec.gen;
+        std::vector<Invite> gone; std::string name, nf; unsigned dropped = 0;
+        if (ProfileDeletedDecide(&b, "pc", &gone, &name, &nf, &dropped) != kDelMember || b.teams[0].rec.stances.size() != 2 || b.teams[0].rec.stances[1].slot != 2
+            || b.teams[0].rec.stances[1].rel != -20.0f || b.teams[0].rec.gen != g0 + 1 || !b.teams[0].sides.empty())
+            Fail("a deleted member: StanceBackOnDeparture as for a leave, its sides dropped");
+    }
+    {   /* the fill waits only for the players held rows put a side back towards; a row this build cannot read holds back no other */
+        std::vector<Down> held(2);
+        PreJoin pj; PlayerSide a; a.slot = 0; a.rel = 1.0f; pj.players.push_back(a); a.slot = 4; pj.players.push_back(a);
+        EncodePreJoin(pj, &held[0].snap);
+        RecStance st; st.slot = 6; held[0].sides.push_back(st);
+        PutU32(&held[1].snap, kPreJoinMagic); PutU32(&held[1].snap, 9);
+        st.slot = 7; held[1].sides.push_back(st); st.slot = 4; held[1].sides.push_back(st);
+        PreJoin q;
+        if (DecodePreJoin(held[1].snap, &q) != kPjVersion) Fail("a snapshot of a version this build does not know");
+        const std::vector<unsigned> w = HeldSideSlots(held);
+        if (w.size() != 4 || w[0] != 0 || w[1] != 4 || w[2] != 6 || w[3] != 7) Fail("the held rows' players: recorded sides and readable snapshots, ascending, once each");
+        std::vector<PlayerSide> mine(3); mine[0].slot = 3; mine[1].slot = 5; mine[2].slot = 7;
+        const std::vector<unsigned> miss = StancesMissing(mine, std::vector<RecStance>(), std::vector<unsigned>(), 0, w);
+        if (miss.size() != 2 || miss[0] != 3 || miss[1] != 5) Fail("the founder's fill goes on for every player no held row names");
+        if (!HeldSideSlots(std::vector<Down>()).empty()) Fail("no held rows: nobody waits");
+    }
+    /* a newer own change stands */
+    if (OwnSideStands(0, false, 0, 5) || !OwnSideStands(6, false, 0, 5) || OwnSideStands(5, false, 0, 5)) Fail("an own change after the row arrived stands; none, or an older one, does not");
+    if (!OwnSideStands(4, true, 3, 5) || OwnSideStands(3, true, 3, 5) || OwnSideStands(4, true, 7, 5)) Fail("counted from the pin's end or the row's arrival, whichever came first");
+}
+/* ---- T-546 step 4 (t546b): what membership does on each game - src/common/teameffect.h ---- */
+std::vector<swteam::WireTeam> T546bTable()
+{
+    std::vector<swteam::WireTeam> t(2);
+    t[0].no = 4; t[0].founderSlot = 0; t[0].name = "The Rusty Blades"; t[0].memberSlots.push_back(2); t[0].memberSlots.push_back(1);
+    t[1].no = 7; t[1].founderSlot = 3; t[1].name = "Dust Kings";
+    return t;
+}
+std::string T546bList(const std::vector<unsigned>& v) { std::string s; for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + I((int)v[i]); return s; }
+void t_t546b_teammates_and_index()
+{
+    using namespace swteam;
+    const std::vector<WireTeam> t = T546bTable();
+    if (T546bList(TeammatesOf(t, 1)) != "0,2") Fail("a member's teammates: the founder and the other member, ascending - " + T546bList(TeammatesOf(t, 1)));
+    if (T546bList(TeammatesOf(t, 0)) != "1,2") Fail("the founder's teammates: its members");
+    if (!TeammatesOf(t, 3).empty()) Fail("a founder alone has no teammates");
+    if (!TeammatesOf(t, 9).empty() || !TeammatesOf(std::vector<WireTeam>(), 0).empty()) Fail("a player in no team, or no table, has none");
+    if (!SameTeam(t, 0, 2) || !SameTeam(t, 2, 1)) Fail("two of one team");
+    if (SameTeam(t, 1, 1) || SameTeam(t, 2, 3) || SameTeam(t, 3, 9) || SameTeam(t, 8, 9)) Fail("one player, two teams, or no team is not the same team");
+    std::vector<WireTeam> big = t; big[1].memberSlots.push_back(kSlotIndexCap + 5);
+    const std::vector<unsigned> idx = TeamIndex(big);
+    if (idx.size() != kSlotIndexCap || idx[0] != 4 || idx[1] != 4 || idx[2] != 4 || idx[3] != 7 || idx[5] != 0) Fail("the slot index by team number");
+    std::vector<WireTeam> zero(1); zero[0].no = 0; zero[0].founderSlot = 6;
+    if (TeamIndex(zero)[6] == 0) Fail("a team numbered 0 still marks its players as in a team");
+}
+void t_t546b_pin_start_end()
+{
+    using namespace swteam;
+    /* A (slot 0) invites C (slot 2), C accepts, C leaves - as C's game sees the tables */
+    std::vector<WireTeam> joined(1); joined[0].no = 1; joined[0].founderSlot = 0; joined[0].memberSlots.push_back(2);
+    std::vector<WireTeam> left(1); left[0].no = 1; left[0].founderSlot = 0;
+    std::vector<unsigned> pinned;
+    PinPlan p = PlanPins(pinned, TeammatesOf(joined, 2));
+    if (T546bList(p.start) != "0" || !p.end.empty() || !p.keep.empty()) Fail("joining starts the pin towards the founder");
+    pinned = TeammatesOf(joined, 2);
+    p = PlanPins(pinned, TeammatesOf(joined, 2));
+    if (!p.start.empty() || !p.end.empty() || T546bList(p.keep) != "0") Fail("the same table again keeps the pin and starts nothing");
+    p = PlanPins(pinned, TeammatesOf(left, 2));
+    if (!p.start.empty() || T546bList(p.end) != "0" || !p.keep.empty()) Fail("leaving ends the pin");
+    /* the founder's side: a second member joins, the first is removed */
+    std::vector<unsigned> a; a.push_back(2);
+    std::vector<unsigned> now; now.push_back(1);
+    p = PlanPins(a, now);
+    if (T546bList(p.start) != "1" || T546bList(p.end) != "2" || !p.keep.empty()) Fail("one member in, another out");
+    std::vector<unsigned> both; both.push_back(1); both.push_back(3);
+    p = PlanPins(now, both);
+    if (T546bList(p.start) != "3" || T546bList(p.keep) != "1" || !p.end.empty()) Fail("a third player joins");
+    p = PlanPins(both, std::vector<unsigned>());
+    if (T546bList(p.end) != "1,3" || !p.start.empty()) Fail("a disband ends every pin");
+    /* the value */
+    if (PinNeedsWrite(true, 100.0f) || PinNeedsWrite(true, 99.6f)) Fail("a side at the pin is not written");
+    if (!PinNeedsWrite(true, 99.4f) || !PinNeedsWrite(true, 0.0f) || !PinNeedsWrite(true, -100.0f)) Fail("a side below the pin is written back");
+    if (PinNeedsWrite(false, -100.0f)) Fail("an unread side is not written");
+    /* a stance towards a teammate */
+    if (!StanceAllowedTowards(true, 0) || StanceAllowedTowards(true, 1) || StanceAllowedTowards(true, 2)) Fail("towards a teammate only ally");
+    if (!StanceAllowedTowards(false, 0) || !StanceAllowedTowards(false, 1) || !StanceAllowedTowards(false, 2)) Fail("towards anyone else any stance");
+}
+void t_t546b_tag_look()
+{
+    using namespace swteam;
+    if (TagColourClass(true) != kTagTeam || TagColourClass(false) != kTagByStanding) Fail("the colour class");
+    if (TagFactionLine("Nameless 3", false, "The Rusty Blades", "The Rusty Blades") != "Nameless 3") Fail("a player in no team shows its own faction");
+    if (TagFactionLine("Nameless 3", true, "The Rusty Blades", "Old Name") != "The Rusty Blades") Fail("a player in a team shows the founder's faction name as it is now");
+    if (TagFactionLine("Nameless 3", true, " \t", "Old Name") != "Old Name") Fail("no founder name here: the name the team was made with");
+    if (TagFactionLine("Nameless 3", true, "", "") != "Nameless 3") Fail("no name at all: its own");
+    const nametag::Rgb b = nametag::TeamColour();
+    if ((int)(b.r * 255.0f + 0.5f) != 0x5a || (int)(b.g * 255.0f + 0.5f) != 0x9b || (int)(b.b * 255.0f + 0.5f) != 0xe6) Fail("team blue is #5a9be6");
+    const nametag::Rgb h = nametag::TagColour(nametag::kHostile, true), r = nametag::TagColour(nametag::kHostile, false), x = nametag::LevelColour(nametag::kHostile);
+    if (h.r != b.r || h.g != b.g || h.b != b.b) Fail("a teammate is blue whatever the standing reads");
+    if (r.r != x.r || r.g != x.g || r.b != x.b) Fail("anyone else has the standing's colour");
+}
+void t_t546b_member_access()
+{
+    using namespace swteam;
+    if (!MemberOpens(0, 2, 4, 4)) Fail("a teammate's building opens");
+    if (MemberOpens(0, 0, 4, 4)) Fail("the owner is not a member's case");
+    if (MemberOpens(0, 2, 4, 7) || MemberOpens(0, 2, 0, 0) || MemberOpens(0, 2, 4, 0)) Fail("different teams, or none, do not open");
+    if (MemberOpens(-1, 2, 4, 4) || MemberOpens(0, -1, 4, 4)) Fail("an unknown owner or asker does not open");
+    /* from a table: A founded team 4 with C; B is in none */
+    const std::vector<unsigned> idx = TeamIndex(T546bTable());
+    if (!MemberOpens(0, 1, idx[0], idx[1]) || MemberOpens(0, 3, idx[0], idx[3]) || MemberOpens(0, 5, idx[0], idx[5])) Fail("the index's answers");
+}
+void t_t546b_notice_names()
+{
+    using namespace swteam;
+    if (PlayerWords("Sam", "Old", "Dust Kings", 1) != "Sam") Fail("the roster's name first");
+    if (PlayerWords("", "Sam", "Dust Kings", 1) != "Sam") Fail("a player who left: the name the roster gave it");
+    if (PlayerWords("", "", "Dust Kings", 1) != "Dust Kings") Fail("never seen this session: its faction name");
+    if (PlayerWords("", "", "", 1) != "s1") Fail("nothing known: the slot");
+}
+/* step 4b: the box stub policy.cpp writes over buildingSelected's inline owner test (1.0.65 0x7FC241 `cmp qword [rax+0x250],0`,
+   then `jne` LOOT): 16 teammate cells, the original compare first, back to the jne at site + 8 */
+void t_t546b_box_stub()
+{
+    unsigned char p[0x400];
+    std::memset(p, 0xCC, sizeof(p));
+    const unsigned long long site = 0x1407FC241ull;
+    const int n = coopcrime::SightStubBuild(p, site, 16, 0x400);
+    if (n != 50 + 13 * 16 || n > 0x400) Fail("the 16-cell stub's length " + I(n));
+    static const unsigned char test[8] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00 };
+    if (std::memcmp(p, test, 8) != 0 || p[8] != 0x0F || p[9] != 0x85) Fail("the original compare first, a player faction straight back");
+    const int N = 14 + 13 * 16;
+    if (std::memcmp(p + N, test, 8) != 0) Fail("a non-teammate: the original compare again (ZF=1, the steal line as before)");
+    unsigned long long back = 0; std::memcpy(&back, p + N + 28, 8);
+    if (back != site + 8) Fail("back to the jne at site + 8");
+    int disp = 0; std::memcpy(&disp, p + 14 + 13 * 15 + 3, 4);
+    if (14 + 13 * 15 + 7 + disp != 0x400 + 8 + 8 * 15) Fail("cell 15's compare reads cell 15");
+}
+/* the PLAYERS tab towards a teammate: ALLY ticked, NEUTRAL and HOSTILE disabled and doing nothing, no box */
+void t_t546b_players_tab_teammate()
+{
+    using namespace playerstab;
+    RowIn in; in.slot = 2; in.rosterName = "Sam"; in.faction = "Dust Kings"; in.you = nametag::kNeutral; in.them = nametag::kFriendly; in.teammate = true;
+    std::vector<RowView> rows; rows.push_back(RowFor(in));
+    Bottom b = BottomFor(rows, 2);
+    if (!b.selected || !b.locked || b.ticked != 0) Fail("a teammate's row: ALLY shown ticked, locked");
+    if (!ButtonEnabled(b, 0) || ButtonEnabled(b, 1) || ButtonEnabled(b, 2)) Fail("only ALLY can be pressed towards a teammate");
+    if (PressForRow(1, rows[0].you, true) != kPressNothing || PressForRow(2, rows[0].you, true) != kPressNothing) Fail("NEUTRAL / HOSTILE towards a teammate do nothing (no box)");
+    if (PressForRow(0, nametag::kNeutral, true) != kPressSet || PressForRow(0, nametag::kFriendly, true) != kPressNothing) Fail("ALLY towards a teammate sets ally only when not there yet");
+    if (std::string(NothingWhy(2, true)).find("teammate") == std::string::npos || std::string(NothingWhy(0, false)) != "nothing (already ticked)") Fail("the log's reason for a press that did nothing");
+    in.teammate = false; rows[0] = RowFor(in); b = BottomFor(rows, 2);
+    if (b.locked || b.ticked != nametag::kNeutral || !ButtonEnabled(b, 1) || !ButtonEnabled(b, 2)) Fail("anyone else: the own level ticked, every button");
+    if (PressForRow(2, nametag::kNeutral, false) != kPressConfirm || PressForRow(1, nametag::kFriendly, false) != kPressSet) Fail("anyone else: the presses as before");
+    b = BottomFor(rows, 9);
+    if (b.locked || b.selected) Fail("nothing selected is not locked");
+}
+
+/* ---- T-546 step 5 fold 2: which entry of an NPC standing each road writes, for a player faction and for an NPC faction
+   (src/common/teamstanding.h NpcDirOfWritten / NpcDirOfCall / NpcEntriesOf over relside.h) ---- */
+/* T-546 step 5 fold 3: the final save at quit runs on the loop's own thread (asked of it from another thread, never before it
+   starts) and saves only a file with unsaved changes that may be rewritten; a side write that failed for any reason but
+   "no faction of that player here" is tried again */
+/* ---- T-546 step 6 (t546d): the shared research - teamwire.h RESEARCH / Q lines / ResearchDecide, src/common/teamresearch.h ---- */
+std::vector<std::string> T546dV(const char* a, const char* b = 0, const char* c = 0, const char* d = 0)
+{
+    std::vector<std::string> v; v.push_back(a); if (b) v.push_back(b); if (c) v.push_back(c); if (d) v.push_back(d); return v;
+}
+swteam::Book T546dBook()
+{
+    /* team 1: founder A, member B; C in no team */
+    swteam::Book b; swteam::Team t; t.no = 1; t.founder = "A"; t.name = "The Rusty Blades";
+    swteam::Member m; m.id = "B"; t.members.push_back(m);
+    b.teams.push_back(t); b.nextTeam = 2;
+    return b;
+}
+void t_t546d_union_decide()
+{
+    using namespace swteam;
+    Book b = T546dBook(); std::vector<std::string> added;
+    if (ResearchDecide(&b, "C", T546dV("x"), &added) != swteam::kRefNotInTeam || !added.empty()) Fail("a player in no team adds nothing (not-in-team)");
+    if (ResearchDecide(&b, "A", T546dV("t3", "t1", "t2", "t1"), &added) != swteam::kOk || added != T546dV("t1", "t2", "t3")) Fail("the founder's whole list: every tech new, sorted, once");
+    if (b.teams[0].research != T546dV("t1", "t2", "t3")) Fail("the team holds the founder's techs");
+    if (ResearchDecide(&b, "B", T546dV("t2", "t4"), &added) != swteam::kOk || added != T546dV("t4")) Fail("the member's list adds only what the team lacks (the union)");
+    if (b.teams[0].research != T546dV("t1", "t2", "t3", "t4")) Fail("the union is sorted and unique");
+    if (ResearchDecide(&b, "B", T546dV("t4", "t1"), &added) != swteam::kOk || !added.empty()) Fail("techs the team holds add nothing - nothing to save or send (no echo)");
+    if (ResearchDecide(&b, "A", T546dV("ok", ""), &added) != swteam::kRefTooMany || b.teams[0].research.size() != 4) Fail("an empty stringID refuses the whole list");
+    std::vector<std::string> many; for (unsigned i = 0; i <= kMaxTechs; ++i) many.push_back("m" + swteam::U(i));
+    if (ResearchDecide(&b, "A", many, &added) != swteam::kRefTooMany || b.teams[0].research.size() != 4) Fail("more than kMaxTechs refuses the whole list");
+    /* leaving takes nothing away: the team keeps its research, the leaver's game keeps its own (nothing is sent to remove) */
+    Owed made; std::vector<Invite> gone;
+    { Member d2; d2.id = "D"; b.teams[0].members.push_back(d2); }   /* a second member: B's leave does not end the team */
+    if (LeaveDecide(&b, "B", 100, &made, &gone) != swteam::kOk || b.teams[0].research.size() != 4) Fail("a member leaving leaves the team's research as it was");
+    if (ResearchDecide(&b, "B", T546dV("t9"), &added) != swteam::kRefNotInTeam) Fail("after leaving, the player's finishes no longer reach the team");
+}
+void t_t546d_wire_and_file()
+{
+    using namespace swteam;
+    std::vector<char> b; Up u; Down d;
+    if (!EncodeResearchUp(&b, true, T546dV("1962-gamedata.base", "2087-gamedata.base")) || !DecodeUp(&b[0], b.size(), &u) || u.kind != kUpResearch || u.whole != 1
+        || u.techs != T546dV("1962-gamedata.base", "2087-gamedata.base")) Fail("RESEARCH up (whole) round-trips");
+    if (!EncodeResearchUp(&b, false, T546dV("1938-gamedata.base")) || !DecodeUp(&b[0], b.size(), &u) || u.whole != 0 || u.techs.size() != 1) Fail("RESEARCH up (own) round-trips");
+    if (!EncodeResearchUp(&b, true, std::vector<std::string>()) || !DecodeUp(&b[0], b.size(), &u) || !u.techs.empty()) Fail("an empty whole list travels (a game with nothing finished)");
+    if (EncodeResearchUp(&b, false, T546dV(""))) Fail("an empty stringID is not encoded");
+    if (!EncodeResearchDown(&b, 7, false, 3, T546dV("t1")) || !DecodeDown(&b[0], b.size(), &d) || d.kind != kDnResearch || d.resTeam != 7 || d.resWhole != 0 || d.resBy != 3
+        || d.techs != T546dV("t1")) Fail("RESEARCH down (a member's finish, with the finisher's slot) round-trips");
+    if (!EncodeResearchDown(&b, 7, true, 3, T546dV("t1", "t2")) || !DecodeDown(&b[0], b.size(), &d) || d.resWhole != 1 || d.resBy != 3 || d.techs.size() != 2)
+        Fail("RESEARCH down (whole) names the game it answers");
+    if (!EncodeResearchDown(&b, 7, true, 0xFFFFFFFFu, T546dV("t1")) || !DecodeDown(&b[0], b.size(), &d) || d.resBy != 0xFFFFFFFFu) Fail("RESEARCH down (whole for all) names no game");
+    EncodeResearchDown(&b, 7, true, 0, T546dV("t1")); b.push_back(0);
+    if (DecodeDown(&b[0], b.size(), &d)) Fail("a trailing byte is malformed");
+    EncodeResearchUp(&b, true, T546dV("t1")); b[1] = 2;
+    if (DecodeUp(&b[0], b.size(), &u)) Fail("a whole flag other than 0 / 1 is malformed");
+    /* teams.txt: Q lines after the team's T line, read back to the same union; a duplicate and an orphan are refused */
+    Book k = T546dBook(); std::vector<std::string> added;
+    ResearchDecide(&k, "A", T546dV("1962-gamedata.base", "2087-gamedata.base"), &added);
+    const std::string text = BookFile(k);
+    if (text.find("Q 1 ") == std::string::npos) Fail("the team's research is written as Q lines");
+    Book r; std::istringstream in(text); std::string line; int bad = 0;
+    while (std::getline(in, line)) if (!BookParseLine(line, &r)) ++bad;
+    if (bad != 0 || r.teams.size() != 1 || r.teams[0].research != k.teams[0].research || BookFile(r) != text) Fail("teams.txt's research reads back the same");
+    int why = swteam::kLineOk;
+    if (BookParseLine("Q 1 " + Hex(std::string("1962-gamedata.base")), &r, &why) || why != swteam::kLineDuplicate) Fail("a tech written twice is a duplicate");
+    if (BookParseLine("Q 9 " + Hex(std::string("x")), &r)) Fail("a Q line of no team is refused");
+    if (BookParseLine("Q 1 zz", &r)) Fail("a Q line that is not hex is refused");
+}
+void t_t546d_game_rules()
+{
+    using namespace swteam;
+    /* which techs are new to whom: the team's, minus mine, minus what this game's data lacks */
+    std::set<std::string> known; known.insert("t1"); known.insert("t2"); known.insert("t3");
+    if (ResearchNewToMe(T546dV("t3", "t1", "t2", "zz"), T546dV("t1"), known) != T546dV("t2", "t3")) Fail("new to me = the team's minus mine, known here, sorted");
+    if (!ResearchNewToMe(T546dV("t1"), T546dV("t1"), known).empty()) Fail("a tech I have is not new");
+    if (!ResearchNewToMe(T546dV("zz"), std::vector<std::string>(), known).empty()) Fail("a tech this game's data lacks is never loaded");
+    /* THE RECORD: own fields kept, the queue unchanged, the new techs after "num finished" */
+    coopown::ResearchRec own;
+    own.f.push_back(std::make_pair(std::string("num currents"), 1.0f));
+    own.f.push_back(std::make_pair(std::string("num finished"), 2.0f));
+    own.f.push_back(std::make_pair(std::string("current prog0"), 0.4f));
+    own.s.push_back(std::make_pair(std::string("current0"), std::string("q1")));
+    own.s.push_back(std::make_pair(std::string("finished0"), std::string("t1")));
+    own.s.push_back(std::make_pair(std::string("finished1"), std::string("t0")));
+    own.s.push_back(std::make_pair(std::string("finished2"), std::string("stale")));   /* past "num finished": not a finished tech */
+    coopown::SortResearch(&own);
+    coopown::ResearchRec out; int added = 0, dropped = 0;
+    ResearchMergeRecord(own, T546dV("t2", "t1", "t3", "t2"), &out, &added, &dropped);
+    if (added != 2 || dropped != 0) Fail("two techs appended (t1 already finished, t2 once); the queued q1 is not finished and stays");
+    const std::vector<std::string> fin = coopown::ResearchFinishedSids(out);
+    if (fin != T546dV("t1", "t0", "t2", "t3")) Fail("finished = mine in order, then the new ones (the stale entry overwritten)");
+    float nf = 0, nc = 0, prog = 0; std::string cur;
+    for (size_t i = 0; i < out.f.size(); ++i) { if (out.f[i].first == "num finished") nf = out.f[i].second; if (out.f[i].first == "num currents") nc = out.f[i].second; if (out.f[i].first == "current prog0") prog = out.f[i].second; }
+    for (size_t i = 0; i < out.s.size(); ++i) if (out.s[i].first == "current0") cur = out.s[i].second;
+    if (nf != 4.0f) Fail("num finished raised to 4");
+    if (nc != 1.0f || cur != "q1" || prog != 0.4f) Fail("the queue (num currents, current0, its progress) is kept unchanged");
+    if (out.f.size() != own.f.size() || out.s.size() != own.s.size() + 1) Fail("no field is dropped; one finished entry added beside the overwritten stale one");
+    std::set<std::string> res(fin.begin(), fin.end());
+    if (coopown::ResearchRestoreVerdict(out, res) != coopown::kRsRestore) Fail("the merged record is one Research::load takes (no _Default Start fall-back)");
+    coopown::ResearchRec same; ResearchMergeRecord(own, T546dV("t1", "t0"), &same, &added, &dropped);
+    if (added != 0 || dropped != 0 || coopown::ResearchFinishedSids(same) != coopown::ResearchFinishedSids(own)) Fail("nothing new: the record is not changed");
+    coopown::ResearchRec bare, bareOut; ResearchMergeRecord(bare, T546dV("t5"), &bareOut, &added, &dropped);
+    if (added != 1 || coopown::ResearchFinishedSids(bareOut) != T546dV("t5")) Fail("a record with no num finished gets one");
+    /* THE ECHO RULE */
+    std::set<std::string> applied, held; applied.insert("fromMate"); held.insert("teamHas");
+    if (ResearchOwnToSend(T546dV("mine", "fromMate", "teamHas", "mine"), applied, held) != T546dV("mine")) Fail("only this player's own finishes go up, once");
+    if (!ResearchOwnToSend(T546dV("fromMate"), applied, held).empty()) Fail("a tech applied from a teammate is never re-sent as this player's own");
+    /* the team the message is for; when the whole list is due */
+    if (!ResearchForMyTeam(3, 3) || ResearchForMyTeam(0, 3) || ResearchForMyTeam(4, 3)) Fail("a research message is applied only to the team this player is in now");
+    if (!ResearchWholeDue(3, 0, -1, 5) || ResearchWholeDue(3, 3, 5, 5) || !ResearchWholeDue(3, 3, 4, 5) || !ResearchWholeDue(3, 2, 5, 5) || ResearchWholeDue(0, 0, -1, 5))
+        Fail("the whole list goes once per load, link and team, and never outside a team");
+    /* the approved lines */
+    if (ResearchSharedLine(6) != "Shared research: 6 new technologies.") Fail("the shared-research line is the approved one");
+    if (ResearchCompleteLine("Iron Plates", "Sam") != "Research complete: Iron Plates (Sam).") Fail("the research-complete line is the approved one");
+}
+/* a research record with a queue: finished f0.., queued (sid, progress) front first */
+coopown::ResearchRec T546dRec(const std::vector<std::string>& fin, const std::vector<std::pair<std::string, float> >& queue)
+{
+    coopown::ResearchRec r; char k[48];
+    r.f.push_back(std::make_pair(std::string("num finished"), (float)fin.size()));
+    r.f.push_back(std::make_pair(std::string("num currents"), (float)queue.size()));
+    for (size_t i = 0; i < fin.size(); ++i) { std::sprintf(k, "finished%d", (int)i); r.s.push_back(std::make_pair(std::string(k), fin[i])); }
+    for (size_t i = 0; i < queue.size(); ++i)
+    {
+        std::sprintf(k, "current%d", (int)i); r.s.push_back(std::make_pair(std::string(k), queue[i].first));
+        std::sprintf(k, "current prog%d", (int)i); r.f.push_back(std::make_pair(std::string(k), queue[i].second));
+    }
+    r.s.push_back(std::make_pair(std::string("paid0"), std::string("X")));   /* another field: kept as it is */
+    coopown::SortResearch(&r);
+    return r;
+}
+std::vector<std::pair<std::string, float> > T546dQ(const char* a, float pa, const char* b = 0, float pb = 0, const char* c = 0, float pc = 0)
+{
+    std::vector<std::pair<std::string, float> > q; q.push_back(std::make_pair(std::string(a), pa));
+    if (b) q.push_back(std::make_pair(std::string(b), pb)); if (c) q.push_back(std::make_pair(std::string(c), pc));
+    return q;
+}
+std::string T546dQText(const std::vector<swteam::QueuedTech>& q)
+{
+    std::string o; char p[32];
+    for (size_t i = 0; i < q.size(); ++i) { std::sprintf(p, "%.2f", q[i].prog); o += (i ? " " : "") + q[i].sid + ":" + p; }
+    return o;
+}
+/* ---- T-546 step 7 (t546e): a teammate's character is offered what one's own character is offered - src/common/teamorders.h ---- */
+void t_t546e_team_orders()
+{
+    using namespace swteamord;
+    /* the orders the menu offers on one's own character stay: first aid, loot, stand up, follow, bodyguard, put down, release, shackles,
+       a cage exit, carry, splint */
+    const int own[] = { 25, 26, 28, 31, 45, 60, 69, 110, 185, 186, 201, 207, 225, 249 };
+    for (int i = 0; i < 14; ++i) if (!OwnOffered(own[i], false) || !OwnOffered(own[i], true)) Fail("own order not kept: " + I(own[i]));
+    if (kOwnOfferedCount != 14) Fail("the own set has fourteen orders");
+    /* every attack, knock-out, kidnap and take-away order goes; talk goes except in a cage */
+    const int other[] = { 5, 16, 61, 223, 228, 235, 246, 273, 0, -1, 4096 };
+    for (int i = 0; i < (int)(sizeof(other) / sizeof(other[0])); ++i) if (OwnOffered(other[i], false) || OwnOffered(other[i], true)) Fail("order kept: " + I(other[i]));
+    if (OwnOffered(12, false) || !OwnOffered(12, true)) Fail("talk is offered on one's own character only in a cage");
+    /* the filter: in place, the kept ones in their order, kidnap becomes carry, the counts */
+    int list[] = { 61, 45, 31, 12, 228, 246, 5, 16, 26 };
+    int removed = -1, replaced = -1;
+    int n = FilterForTeammate(list, 9, false, &removed, &replaced);
+    if (n != 4 || removed != 5 || replaced != 1) Fail("filter count " + I(n) + " removed " + I(removed) + " replaced " + I(replaced));
+    if (ListText(list, n) != "45,31,225,26") Fail("filter keeps the rest in order, kidnap as carry: " + ListText(list, n));
+    int caged[] = { 12, 26, 246, 228, 60 };
+    n = FilterForTeammate(caged, 5, true, &removed, &replaced);
+    if (ListText(caged, n) != "12,26,225,60" || removed != 1 || replaced != 1) Fail("a caged teammate keeps talk, kidnap as carry: " + ListText(caged, n));
+    int both[] = { 225, 45, 246 };
+    n = FilterForTeammate(both, 3, false, &removed, &replaced);
+    if (ListText(both, n) != "225,45" || removed != 1 || replaced != 0) Fail("kidnap beside carry goes: " + ListText(both, n));
+    int t995[] = { 228, 61, 45, 31, 225 };
+    n = FilterForTeammate(t995, 5, false, &removed, &replaced);
+    if (ListText(t995, n) != "45,31,225" || removed != 2) Fail("the T995 sneaking list: " + ListText(t995, n));
+    int none[] = { 45, 31 };
+    if (FilterForTeammate(none, 2, false, &removed, 0) != 2 || removed != 0 || ListText(none, 2) != "45,31") Fail("a list of own orders is unchanged");
+    int all[] = { 61, 228 };
+    if (FilterForTeammate(all, 2, false, 0, &replaced) != 0 || replaced != 0) Fail("a list of other orders only empties");
+    if (FilterForTeammate(0, 3, false, &removed, &replaced) != 0 || removed != 0 || replaced != 0) Fail("no array: nothing to filter");
+    if (FilterForTeammate(list, -1, false, 0, 0) != -1) Fail("an unreadable count is left as it is");
+    if (FilterForTeammate(list, 0, false, 0, 0) != 0) Fail("an empty list stays empty");
+    /* which fill is filtered: the isEnemy mark filters every later fill; otherwise the clicked character's list (sub 0) or the
+       furniture person's list (sub 1), never the furniture's own list */
+    if (!MenuFiltered(true, 0, false, false) || !MenuFiltered(true, 1, false, false)) Fail("the isEnemy mark filters the list");
+    if (!MenuFiltered(false, 0, true, false) || MenuFiltered(false, 1, true, false)) Fail("a clicked teammate's character: its own list only");
+    if (!MenuFiltered(false, 1, false, true) || MenuFiltered(false, 0, false, true)) Fail("a teammate in a bed or cage: the nested list only, not the furniture's");
+    if (MenuFiltered(false, 0, false, false) || MenuFiltered(false, 1, false, false)) Fail("no teammate: nothing filtered");
+    /* the isEnemy site: inside a build, on its thread, at the builder's own call site */
+    if (!MenuEnemySite(true, true, 0x7A6C8Eull, 0x7A6C8Eull)) Fail("the builder's isEnemy site marks");
+    if (MenuEnemySite(false, true, 0x7A6C8Eull, 0x7A6C8Eull) || MenuEnemySite(true, false, 0x7A6C8Eull, 0x7A6C8Eull)
+        || MenuEnemySite(true, true, 0x7FAB12ull, 0x7A6C8Eull) || MenuEnemySite(true, true, 0, 0)) Fail("any other isEnemy call does not mark");
+    /* the texts */
+    if (ListText(0, 0) != "none" || ListText(list, 0) != "none") Fail("an empty list reads none");
+    const int mixed[] = { 45, 61, 12, 228 };
+    if (NotOwnIn(mixed, 4, false) != "61,12,228" || NotOwnIn(mixed, 4, true) != "61,228" || NotOwnIn(mixed, 1, false) != "none" || NotOwnIn(0, 2, false) != "none")
+        Fail("not-own text: " + NotOwnIn(mixed, 4, false));
+    /* the cells */
+    int a = 0, b = 0, c = 0;
+    void* volatile cells[4] = { 0, &a, 0, &b };
+    if (!TeammateFaction(&a, cells, 4) || !TeammateFaction(&b, cells, 4)) Fail("a faction in the cells is a teammate's");
+    if (TeammateFaction(&c, cells, 4) || TeammateFaction(0, cells, 4) || TeammateFaction(&a, 0, 4) || TeammateFaction(&b, cells, 3)) Fail("a faction not in the cells (or no faction, no cells, past n) is not");
+    void* volatile empty[2] = { 0, 0 };
+    if (TeammateFaction(&a, empty, 2)) Fail("empty cells hold no teammate");
+    /* the sneaking answer: forced off only on a teammate's right-click, its own thread, its one call site */
+    if (!SneakForcedOff(true, true, 0x7FB0E1ull, 0x7FB0E1ull)) Fail("the right-click's site on a teammate is forced off");
+    if (SneakForcedOff(false, true, 0x7FB0E1ull, 0x7FB0E1ull) || SneakForcedOff(true, false, 0x7FB0E1ull, 0x7FB0E1ull)
+        || SneakForcedOff(true, true, 0x7FA9D3ull, 0x7FB0E1ull) || SneakForcedOff(true, true, 0, 0)) Fail("every other caller gets the engine's answer");
+}
+/* ---- T-546 (owner 512): a teammate's faction is answered as one's own - src/common/teamally.h ---- */
+void t_t546f_team_pair()
+{
+    using namespace swteamally;
+    int own = 0, mateB = 0, mateC = 0, npc = 0;
+    void* volatile cells[kCells];
+    for (int k = 0; k < kCells; ++k) cells[k] = 0;
+    /* in no team: no set, no pair - not even own with own's former teammate */
+    if (CellsWrite(cells, kCells, &own, 0, 0) != 0 || cells[0] != 0) Fail("a player in no team has no team set");
+    if (TeamPair(&own, &mateB, cells, kCells)) Fail("in no team: no pair");
+    /* in a team: own first, then the mates; a zero mate or own among the mates is skipped */
+    void* mates[4] = { &mateB, 0, &own, &mateC };
+    if (CellsWrite(cells, kCells, &own, mates, 4) != 3 || cells[0] != (void*)&own || cells[1] != (void*)&mateB || cells[2] != (void*)&mateC || cells[3] != 0)
+        Fail("the set: own, B, C");
+    if (!TeamPair(&own, &mateB, cells, kCells) || !TeamPair(&mateB, &own, cells, kCells)) Fail("own and a teammate: a pair both ways");
+    if (!TeamPair(&mateB, &mateC, cells, kCells)) Fail("two teammates (both copies here): a pair");
+    /* one side in the team */
+    if (TeamPair(&own, &npc, cells, kCells) || TeamPair(&npc, &mateB, cells, kCells)) Fail("one side outside the team: no pair");
+    /* the same faction is the engine's own exit */
+    if (TeamPair(&own, &own, cells, kCells) || TeamPair(&mateB, &mateB, cells, kCells)) Fail("the same faction is never answered here");
+    if (TeamPair(0, &own, cells, kCells) || TeamPair(&own, 0, cells, kCells) || TeamPair(&own, &mateB, 0, kCells)) Fail("no faction / no cells: no pair");
+    /* a former teammate after leave: the set written again without it */
+    void* afterLeave[1] = { &mateC };
+    if (CellsWrite(cells, kCells, &own, afterLeave, 1) != 2 || cells[1] != (void*)&mateC || cells[2] != 0) Fail("after B leaves: own, C");
+    if (TeamPair(&own, &mateB, cells, kCells) || TeamPair(&mateB, &mateC, cells, kCells)) Fail("a former teammate: no pair");
+    if (!TeamPair(&own, &mateC, cells, kCells)) Fail("the remaining teammate: still a pair");
+    /* the last teammate leaves: the set empties, own too */
+    if (CellsWrite(cells, kCells, &own, 0, 0) != 0 || cells[0] != 0 || cells[1] != 0) Fail("the team gone: empty");
+    void* onlyOwn[1] = { &own };
+    if (CellsWrite(cells, kCells, &own, onlyOwn, 1) != 0 || cells[0] != 0) Fail("own alone among the mates is no team");
+    /* a world torn down: no own faction yet, the mates still held */
+    void* twoMates[2] = { &mateB, &mateC };
+    if (CellsWrite(cells, kCells, 0, twoMates, 2) != 2 || cells[0] != (void*)&mateB || TeamPair(&own, &mateB, cells, kCells) || !TeamPair(&mateB, &mateC, cells, kCells))
+        Fail("no own faction: the mates only");
+    /* the cap */
+    void* many[20];
+    int fac[20];
+    for (int i = 0; i < 20; ++i) many[i] = &fac[i];
+    if (CellsWrite(cells, kCells, &own, many, 20) != kCells || cells[kCells - 1] != (void*)&fac[kCells - 2]) Fail("the set stops at its cells");
+    if (CellsWrite(0, kCells, &own, mates, 4) != 0 || CellsWrite(cells, 0, &own, mates, 4) != 0) Fail("no cells: nothing written");
+    if (InSet(&npc, cells, kCells) || !InSet(&own, cells, 1) || InSet(&fac[0], cells, 1)) Fail("InSet looks only at the first n cells");
+}
+void t_t546d_fold1()
+{
+    using namespace swteam;
+    /* THE QUEUE as Research::save writes it, front first, with each entry's progress */
+    const coopown::ResearchRec r = T546dRec(T546dV("f0"), T546dQ("X", 0.5f, "Y", 0.25f, "Z", 0.0f));
+    if (T546dQText(ResearchQueueOf(r)) != "X:0.50 Y:0.25 Z:0.00") Fail("the queue is read front first with its progress");
+    if (!ResearchIndexKey("current12", "current") || ResearchIndexKey("current prog0", "current") || !ResearchIndexKey("current prog0", "current prog") || ResearchIndexKey("current", "current"))
+        Fail("current<i> and current prog<i> are told apart");
+    /* THE ROAD a teammate's tech takes, from the queue as it stands */
+    const std::vector<QueuedTech> q = ResearchQueueOf(r);
+    if (ResearchApplyRoute(q, "W") != kResViaSetResearched) Fail("not queued here: setResearched");
+    if (ResearchApplyRoute(q, "X") != kResViaSetResearched) Fail("the queue's front: setResearched (it pops the front, the matching entry)");
+    if (ResearchApplyRoute(q, "Y") != kResViaLoad) Fail("queued behind the front: Research::load (setResearched would pop X)");
+    if (ResearchApplyRoute(q, "Z") != kResViaLoad) Fail("queued several behind: Research::load");
+    if (ResearchApplyRoute(std::vector<QueuedTech>(), "X") != kResViaSetResearched) Fail("an empty queue: setResearched");
+    std::vector<QueuedTech> twice = ResearchQueueOf(T546dRec(T546dV("f0"), T546dQ("X", 0.5f, "Y", 0.1f, "X", 0.0f)));
+    if (ResearchApplyRoute(twice, "X") != kResViaLoad) Fail("at the front and again behind: Research::load (setResearched would pop twice)");
+    /* the record for a tech queued behind the front: finished, out of the queue, X kept at the front with its progress */
+    coopown::ResearchRec out; int added = 0, dropped = 0;
+    ResearchMergeRecord(r, T546dV("Y"), &out, &added, &dropped);
+    if (added != 1 || dropped != 1) Fail("Y appended as finished and taken out of the queue");
+    if (coopown::ResearchFinishedSids(out) != T546dV("f0", "Y")) Fail("Y finished once, after this game's own");
+    if (T546dQText(ResearchQueueOf(out)) != "X:0.50 Z:0.00") Fail("the queue keeps X at the front with its progress, then Z, renumbered");
+    int stale = 0; for (size_t i = 0; i < out.s.size(); ++i) if (out.s[i].first == "current2") ++stale;
+    for (size_t i = 0; i < out.f.size(); ++i) if (out.f[i].first == "current prog2") ++stale;
+    if (stale != 0) Fail("no entry is left past the renumbered queue");
+    bool paid = false; for (size_t i = 0; i < out.s.size(); ++i) if (out.s[i].first == "paid0" && out.s[i].second == "X") paid = true;
+    if (!paid) Fail("every other field is kept");
+    ResearchMergeRecord(r, T546dV("Z", "X"), &out, &added, &dropped);
+    if (added != 2 || dropped != 2 || T546dQText(ResearchQueueOf(out)) != "Y:0.25") Fail("several queued techs finished: the one left is the front, its progress kept");
+    /* THE JOIN: the team holds a tech this game has queued - it leaves the queue; a queue with none of the team's is untouched */
+    ResearchMergeRecord(r, T546dV("t1", "Z", "t2"), &out, &added, &dropped);
+    if (added != 3 || dropped != 1 || T546dQText(ResearchQueueOf(out)) != "X:0.50 Y:0.25") Fail("at the join a queued tech the team holds leaves the queue, the rest kept in order");
+    ResearchMergeRecord(r, T546dV("t1"), &out, &added, &dropped);
+    if (added != 1 || dropped != 0 || T546dQText(ResearchQueueOf(out)) != "X:0.50 Y:0.25 Z:0.00") Fail("no queued tech finished: the queue unchanged");
+    ResearchMergeRecord(r, T546dV("X", "Y", "Z"), &out, &added, &dropped);
+    float nc = -1;
+    for (size_t i = 0; i < out.f.size(); ++i) if (out.f[i].first == "num currents") nc = out.f[i].second;
+    if (dropped != 3 || nc != 0.0f || !ResearchQueueOf(out).empty()) Fail("every queued tech finished: an empty queue (num currents 0)");
+    /* THE ANSWERS and the resend wait */
+    if (ResearchDownKind(true, 2, 2) != kResDnWholeAnswer || ResearchDownKind(true, 0xFFFFFFFFu, 2) != kResDnTeamWhole || ResearchDownKind(true, 3, 2) != kResDnTeamWhole
+        || ResearchDownKind(false, 2, 2) != kResDnOwnAnswer || ResearchDownKind(false, 3, 2) != kResDnMateTech || ResearchDownKind(false, 2, -1) != kResDnMateTech)
+        Fail("a RESEARCH message is read as an answer to this game, the team's research, or a teammate's tech");
+    if (ResearchMinus(T546dV("a", "b", "c"), T546dV("b", "x")) != T546dV("a", "c")) Fail("an answer leaves only what it did not cover");
+    if (ResearchResendWaitMs(0) != 2000 || ResearchResendWaitMs(1) != 4000 || ResearchResendWaitMs(4) != 32000 || ResearchResendWaitMs(5) != 60000 || ResearchResendWaitMs(40) != 60000)
+        Fail("the resend wait grows from 2 s and stops at 60 s");
+    /* a refusal travels as a NOTICE with its own event */
+    std::vector<char> b; Down d;
+    EncodeNotice(&b, kEvResearchWhole, kRefNotSaved, 2, 2, std::string());
+    if (!DecodeDown(&b[0], b.size(), &d) || d.kind != kDnNotice || d.event != (unsigned)kEvResearchWhole || d.result != (unsigned)kRefNotSaved || d.actorSlot != 2)
+        Fail("a refused whole list is a NOTICE research-whole with its reason");
+    if (std::string(EventName(kEvResearchWhole)) != "research-whole" || std::string(EventName(kEvResearchOwn)) != "research-own") Fail("the research refusals are named");
+}
+void t_t546c_fold3()
+{
+    using namespace coopwq;
+    if (QuitSaveRoute(true, false) != kQuitSaveHere || QuitSaveRoute(true, true) != kQuitSaveHere) Fail("a quit on the loop's own thread saves there, at start-up or in the loop");
+    if (QuitSaveRoute(false, true) != kQuitSaveAskLoop) Fail("a quit on another thread asks the running loop");
+    if (QuitSaveRoute(false, false) != kQuitSaveNone) Fail("a quit on another thread before the loop starts touches nothing of the loop's");
+    if (!QuitSaveFile(true, false)) Fail("unsaved changes are saved at quit");
+    if (QuitSaveFile(false, false)) Fail("nothing unsaved: nothing written at quit");
+    if (QuitSaveFile(true, true) || QuitSaveFile(false, true)) Fail("a file unreadable at start is never rewritten, not even at quit");
+    if (swteam::SideOutcome(-3) != swteam::kSideRetry) Fail("not writable now (no world, an address missing, the entry unread): tried again");
+    if (swteam::SideOutcome(-1) != swteam::kSideNothing) Fail("only a faction the list provably lacks is nothing to write");
+    if (swteam::SideOutcome(-2) != swteam::kSideRetry || swteam::SideOutcome(0) != swteam::kSideRetry) Fail("the setter raised, or any other failure: tried again");
+}
+void t_t546c_npc_entry_roads()
+{
+    using namespace swteam;
+    const int me = 1, x = 2, s = 3, y = 4;   /* this game's player faction, an NPC faction, another player's stand-in, a second NPC faction */
+    /* the engine's own roads towards this game's player faction: every one moves X -> me (dir 1, the entry this game reads) */
+    if (NpcDirOfCall(relside::kAffect, false, x, me, me, true) != 1) Fail("a witnessed crime (X's relations towards me) moves X -> me");
+    if (NpcDirOfCall(relside::kAffectEvent, false, x, me, me, true) != 1) Fail("a fight (X's relations towards me, by event) moves X -> me");
+    const int onMine[] = { relside::kAffect, relside::kAffectEvent, relside::kDeclareWar, relside::kNoLongerEnemies, relside::kSetEnemy, relside::kAffectTrust };
+    for (int i = 0; i < 6; ++i)
+        if (NpcDirOfCall(onMine[i], true, me, x, me, true) != 1) Fail("a changer on this player's relations towards X (war, peace, trust) moves X -> me, never the unread mine -> X");
+    /* setRelation writes the object's own table: the mod's team writes name their entry outright */
+    if (NpcDirOfCall(relside::kSetRelation, true, me, x, me, true) != 0) Fail("setRelation on this player's relations writes mine -> X (read only on the other games)");
+    if (NpcDirOfCall(relside::kSetRelation, false, x, me, me, true) != 1) Fail("setRelation on X's relations towards me writes X -> me");
+    if (NpcDirOfCall(relside::kNotAChanger, true, me, x, me, true) != 0 || NpcDirOfCall(relside::kNotAChanger, false, x, me, me, true) != 1) Fail("a read names its pair as called");
+    /* another player's faction as it is held HERE (a stand-in: a plain relations object, never this game's): nothing of this
+       game's NPC standing moves - that player's own game owns and marks it */
+    for (int i = 0; i < 6; ++i)
+    {
+        if (NpcDirOfCall(onMine[i], false, s, x, me, true) != kDirNone) Fail("a changer on a stand-in's relations is not this game's standing");
+        if (NpcDirOfCall(onMine[i], false, x, s, me, true) != kDirNone) Fail("X's relations towards a stand-in is not this game's standing");
+    }
+    if (NpcDirOfCall(relside::kSetRelation, false, s, x, me, true) != kDirNone) Fail("the stand-in's own table is that player's");
+    /* not an NPC counterpart, or no side of mine: nothing marked as the team's NPC standing */
+    if (NpcDirOfCall(relside::kDeclareWar, true, me, s, me, false) != kDirNone) Fail("towards another player's faction: not an NPC standing (the stance road)");
+    if (NpcDirOfCall(relside::kAffect, false, x, y, me, true) != kDirNone) Fail("world-vs-world is not this game's standing");
+    if (NpcDirOfCall(relside::kAffect, true, me, me, me, true) != kDirNone) Fail("the player's self entry is no NPC standing");
+    if (NpcDirOfWritten(true, false, true) != 0 || NpcDirOfWritten(false, true, true) != 1 || NpcDirOfWritten(false, false, true) != kDirNone || NpcDirOfWritten(true, false, false) != kDirNone)
+        Fail("NpcDirOfWritten: 0 mine -> X, 1 X -> mine, else none");
+    /* the team's writes of one record row: X -> me whenever the row holds it, mine -> X whenever it holds that */
+    if (NpcEntriesOf(kHaveFwd | kHaveBack) != (unsigned)(kWriteItMine | kWriteMineIt)) Fail("a row with both directions writes both entries");
+    if (NpcEntriesOf(kHaveBack) != (unsigned)kWriteItMine) Fail("a row with only X -> team writes only the entry read here");
+    if (NpcEntriesOf(kHaveFwd) != (unsigned)kWriteMineIt) Fail("a row with only team -> X writes only the stand-in's table entry");
+    if (NpcEntriesOf(0) != 0u) Fail("a row with nothing writes nothing");
+    /* a member's crime reaches the record on the side that moved: dir 1 moves relBack and leaves rel */
+    TeamRec r; RecRow row; row.sid = "17-gamedata.base"; row.rel = 5.0f; row.relBack = 10.0f; row.have = kHaveFwd | kHaveBack; r.rows.push_back(row);
+    Delta d; d.sid = row.sid; d.dir = (unsigned)NpcDirOfCall(relside::kAffect, false, x, me, me, true); d.dRel = -20.0f; d.rel = -10.0f; d.flags = 0;
+    if (!ApplyDelta(&r, d) || r.rows[0].relBack != -10.0f || r.rows[0].rel != 5.0f) Fail("a crime's change moves the record's X -> team, never team -> X");
+    /* a war on a member's own relations (the record has no X -> team yet): the member's value is taken on that side */
+    TeamRec r2; RecRow row2; row2.sid = "18-gamedata.base"; row2.rel = 0.0f; row2.have = kHaveFwd; r2.rows.push_back(row2);
+    Delta w; w.sid = row2.sid; w.dir = (unsigned)NpcDirOfCall(relside::kDeclareWar, true, me, x, me, true); w.dRel = -35.0f; w.rel = -35.0f; w.flags = 2;
+    if (!ApplyDelta(&r2, w) || r2.rows[0].relBack != -35.0f || (r2.rows[0].have & kHaveBack) == 0 || r2.rows[0].rel != 0.0f || r2.rows[0].flagsBack != 2u)
+        Fail("a war's change lands on X -> team with its flags");
+    if (NpcEntriesOf(r2.rows[0].have) != (unsigned)(kWriteItMine | kWriteMineIt)) Fail("after it, both entries are written on every member's game");
+}
+
+/* ---- T-563: which entry a faction-relations changer wrote (src/common/relside.h) ---- */
+void t_t563_written_pair()
+{
+    using namespace relside;
+    const int me = 1, x = 2, s = 3;
+    int o = 0, t = 0;
+    const int lookups[] = { kAffect, kAffectEvent, kDeclareWar, kNoLongerEnemies, kSetEnemy, kAffectTrust };
+    for (int i = 0; i < 6; ++i)
+    {
+        WrittenPair(lookups[i], true, me, x, &o, &t);
+        if (o != x || t != me) Fail("a changer that finds its entry through the lookup, on the player's relations, wrote X -> player");
+        WrittenPair(lookups[i], true, me, s, &o, &t);
+        if (o != s || t != me) Fail("towards another player's faction it wrote that faction's side towards this player");
+        WrittenPair(lookups[i], false, x, me, &o, &t);
+        if (o != x || t != me) Fail("on an NPC faction's relations the pair is as called (the crime and fight roads)");
+        WrittenPair(lookups[i], true, me, me, &o, &t);
+        if (o != me || t != me) Fail("the player's own self entry is not swapped");
+    }
+    WrittenPair(kSetRelation, true, me, x, &o, &t);
+    if (o != me || t != x) Fail("setRelation writes the object's own table: the pair as called");
+    WrittenPair(kNotAChanger, true, me, x, &o, &t);
+    if (o != me || t != x) Fail("a read of the pair as named (the snapshot) is never swapped");
+    if (WritesOtherSide(kDeclareWar, false, false)) Fail("not the player's relations: no swap");
+    if (!WritesOtherSide(kAffectTrust, true, false)) Fail("affectTrust reaches its entry through the lookup");
+    if (WritesOtherSide(kSetRelation, true, false) || WritesOtherSide(kNotAChanger, true, false) || WritesOtherSide(99, true, false))
+        Fail("setRelation, a read and an unknown changer are never swapped");
+}
+
+/* T-563 fold 1: where a forwarded change goes - the written pair's road, the moment, the snapshot's player-side rows */
+void t_t563_forward_roads()
+{
+    using namespace relside;
+    Side me = { true, false, false }, npc = { false, false, true }, npc2 = { false, false, true }, other = { false, true, false };
+    /* a changer on the player's relations towards an NPC faction: swapped to X -> me, which this game owns and sends */
+    { int o = 0, t = 0; WrittenPair(kDeclareWar, true, 1, 2, &o, &t); if (o != 2 || t != 1) Fail("on the player's relations towards X: X -> me written"); }
+    if (PairRoad(npc, me) != kRoadSend) Fail("swap -> X -> me is this game's: sent");
+    /* towards another player's stand-in: swapped to S -> me, that player's side: put back */
+    { int o = 0, t = 0; WrittenPair(kNoLongerEnemies, true, 1, 3, &o, &t); if (o != 3 || t != 1) Fail("towards a stand-in: S -> me written"); }
+    if (PairRoad(other, me) != kRoadPutBack) Fail("swap toward a stand-in -> put back (the other player's side)");
+    /* the roads as before for unswapped pairs */
+    if (PairRoad(me, npc) != kRoadSend) Fail("my own table: sent");
+    if (PairRoad(me, other) != kRoadSend) Fail("mine -> another player: mine, sent");
+    if (PairRoad(npc, me) != kRoadSend) Fail("X -> me (the crime / fight road): sent");
+    if (PairRoad(npc, other) != kRoadPutBack) Fail("X -> another player: that player's, put back");
+    if (PairRoad(other, npc) != kRoadPutBack) Fail("another player's table: put back");
+    if (PairRoad(npc, npc2) != kRoadWorldTable) Fail("world-vs-world: the world server's table");
+    Side carried = { false, false, false };   /* a coop-p<n> record naming this game's own slot, or unreadable: not a world faction */
+    if (PairRoad(npc, carried) != kRoadPutBack || PairRoad(carried, npc) != kRoadPutBack) Fail("a faction neither world nor a player's: no owner here, put back");
+    if (!OwnsPair(me, other) || OwnsPair(other, me) || !OwnsPair(npc, me) || OwnsPair(npc, other)) Fail("OwnsPair: one owner per direction");
+    /* the moment */
+    if (ForwardMoment(true, true, false) != kMomentEcho || ForwardMoment(true, false, true) != kMomentEcho) Fail("the mod's own write: no echo");
+    if (ForwardMoment(false, true, false) != kMomentQueue) Fail("a worker thread: queued");
+    if (ForwardMoment(false, true, true) != kMomentNow) Fail("the main thread: now");
+    if (ForwardMoment(false, false, false) != kMomentNow) Fail("before the main thread is known: now");
+}
+
+/* T-573: src/common/copyjudge.h - the judge held while this game's simulation is stopped, and the bounded re-arm. */
+void t_t573_simulation_held()
+{
+    const float muls[] = { 0.0f, 1.0f, 5.0f };
+    for (int ok = 0; ok < 2; ++ok)
+        for (int pz = 0; pz < 2; ++pz)
+            for (int m = 0; m < 3; ++m)
+                for (int fin = 0; fin < 2; ++fin)
+                {
+                    const bool want = ok != 0 && fin != 0 && (pz != 0 || muls[m] == 0.0f);
+                    if (copyjudge::SimulationHeld(ok != 0, pz != 0, muls[m], fin != 0) != want)
+                        Fail("SimulationHeld ok=" + I(ok) + " paused=" + I(pz) + " mul#" + I(m) + " finite=" + I(fin));
+                }
+}
+
+void t_t573_hold_shift()
+{
+    long long from = -1;
+    if (copyjudge::HoldShift(false, 50, &from) != 0 || from != -1) Fail("running, never held: no shift, no mark");
+    if (copyjudge::HoldShift(true, 100, &from) != 0 || from != 100) Fail("the first held frame is marked");
+    if (copyjudge::HoldShift(true, 101, &from) != 0 || from != 100) Fail("a later held frame keeps the first mark");
+    if (copyjudge::HoldShift(true, 104, &from) != 0 || from != 100) Fail("still held: no shift yet");
+    if (copyjudge::HoldShift(false, 105, &from) != 5 || from != -1) Fail("the first running frame returns the held span and clears");
+    if (copyjudge::HoldShift(false, 106, &from) != 0 || from != -1) Fail("the shift is paid once");
+    from = 200;
+    if (copyjudge::HoldShift(false, 200, &from) != 0 || from != -1) Fail("a zero span shifts nothing and clears");
+    from = 300;
+    if (copyjudge::HoldShift(false, 250, &from) != 0 || from != -1) Fail("a span that went backwards shifts nothing and clears");
+}
+
+void t_t573_shift_clock()
+{
+    if (copyjudge::ShiftClock(0, 40) != 0) Fail("a clock not started stays 0");
+    if (copyjudge::ShiftClock(1000, 0) != 1000) Fail("no span: unchanged");
+    if (copyjudge::ShiftClock(1000, -5) != 1000) Fail("a negative span: unchanged");
+    if (copyjudge::ShiftClock(1000, 40) != 1040) Fail("a started clock moves on by the span");
+}
+
+/* The reporter's pause, frame by frame: a copy that goes nowhere while held is never judged during the hold, and its
+   first window after the hold is judged only once it has run kWin frames - the windows count running frames only. */
+void t_t573_window_counts_running_frames()
+{
+    const long long kWin = 240;
+    for (int heldLen = 0; heldLen <= 2000; heldLen += 250)
+        for (int heldAt = 1; heldAt < 300; heldAt += 37)
+        {
+            long long clock = 1, from = -1, ran = 0;
+            int rollsHeld = 0, rolls = 0;
+            for (long long tick = 1; tick < 4000; ++tick)
+            {
+                const bool held = tick >= heldAt && tick < heldAt + heldLen;
+                clock = copyjudge::ShiftClock(clock, copyjudge::HoldShift(held, tick, &from));
+                if (held) continue;   /* DrivePuppet returns before the judge */
+                ++ran;
+                if (tick - clock >= kWin)
+                {
+                    ++rolls;
+                    if (ran - (rolls - 1) * kWin < kWin) ++rollsHeld;
+                    clock = tick;
+                }
+            }
+            if (rollsHeld != 0) Fail("a window was judged before it had run its frames, held " + I(heldLen) + " at " + I(heldAt));
+            if (rolls < 1) Fail("no window was judged at all, held " + I(heldLen));
+        }
+}
+
+void t_t573_hold_shift_sec()
+{
+    double from = -1.0;
+    if (copyjudge::HoldShiftSec(false, 5.0, &from) != 0.0 || from != -1.0) Fail("running, never held: no shift, no mark");
+    if (copyjudge::HoldShiftSec(true, 10.0, &from) != 0.0 || from != 10.0) Fail("the first held second is marked");
+    if (copyjudge::HoldShiftSec(true, 12.0, &from) != 0.0 || from != 10.0) Fail("a later held frame keeps the mark");
+    if (copyjudge::HoldShiftSec(false, 14.5, &from) != 4.5 || from != -1.0) Fail("the first running frame returns the held seconds and clears");
+    if (copyjudge::HoldShiftSec(false, 15.0, &from) != 0.0) Fail("the shift is paid once");
+    from = 20.0;
+    if (copyjudge::HoldShiftSec(false, 19.0, &from) != 0.0 || from != -1.0) Fail("a span that went backwards shifts nothing and clears");
+}
+
+void t_t573_shift_since()
+{
+    if (copyjudge::ShiftSince(0.0, 4.0) != 0.0) Fail("a clock not set stays 0");
+    if (copyjudge::ShiftSince(7.0, 0.0) != 7.0) Fail("no span: unchanged");
+    if (copyjudge::ShiftSince(7.0, -1.0) != 7.0) Fail("a negative span: unchanged");
+    if (copyjudge::ShiftSince(7.0, 4.0) != 11.0) Fail("a set clock moves on by the span");
+    /* The review's case: a route issued at 10.0 with a 2 s pending grace, the game stopped 10.5 - 14.5. Shifted, the
+       first running frame is 0.5 s into the grace, not 4.5 s past it; an "until" already past stays past. */
+    double from = -1.0;
+    copyjudge::HoldShiftSec(true, 10.5, &from);
+    const double ss = copyjudge::HoldShiftSec(false, 14.5, &from);
+    const double issueAt = copyjudge::ShiftSince(10.0, ss);
+    if (!(14.5 - issueAt < 2.0) || 14.5 - issueAt != 0.5) Fail("the grace counts running time only");
+    const double holdUntil = copyjudge::ShiftSince(9.0, ss);
+    if (!(14.5 >= holdUntil)) Fail("an expired hold stays expired");
+    const double liveHold = copyjudge::ShiftSince(11.0, ss);
+    if (liveHold - 14.5 != 0.5) Fail("a live hold keeps its remaining 0.5 s");
+}
+
+void t_t573_rearm_schedule()
+{
+    if (copyjudge::kMaxRearms != 3) Fail("three re-arms per copy");
+    const int want[] = { -1, 15, 60, 240, -1, -1, -1 };
+    for (int r = -1; r <= 5; ++r)
+    {
+        if (copyjudge::RearmWaitWindows(r) != want[r + 1]) Fail("RearmWaitWindows " + I(r));
+        if (copyjudge::RearmLeft(r) != (want[r + 1] >= 0)) Fail("RearmLeft " + I(r));
+        for (int w = 0; w <= 300; ++w)
+            if (copyjudge::RearmDue(r, w) != (want[r + 1] >= 0 && w >= want[r + 1])) Fail("RearmDue r=" + I(r) + " w=" + I(w));
+    }
+    for (int r = 1; r < copyjudge::kMaxRearms; ++r)
+        if (copyjudge::RearmWaitWindows(r) <= copyjudge::RearmWaitWindows(r - 1)) Fail("each wait is longer than the one before");
+}
+
+/* THE BOUND (F189): a copy that gives up on every chance it gets is re-armed at most kMaxRearms times however long it
+   lives, and after the last give-up it is never re-armed again. */
+void t_t573_rearm_bound()
+{
+    int rearms = 0, windows = 0, giveUps = 1, lifted = 0;   /* given up at window 0 */
+    bool gaveUp = true;
+    for (int win = 1; win <= 100000; ++win)
+    {
+        if (!gaveUp) { gaveUp = true; ++giveUps; windows = 0; continue; }   /* gives up again at once */
+        ++windows;
+        if (copyjudge::RearmDue(rearms, windows)) { ++rearms; ++lifted; gaveUp = false; windows = 0; }
+    }
+    if (lifted != copyjudge::kMaxRearms) Fail("re-armed " + I(lifted) + " times, expected " + I(copyjudge::kMaxRearms));
+    if (giveUps != copyjudge::kMaxRearms + 1) Fail("gave up " + I(giveUps) + " times, expected " + I(copyjudge::kMaxRearms + 1));
+    if (!gaveUp || copyjudge::RearmLeft(rearms)) Fail("the last give-up stands");
+}
+
+/* T-580: decision 34 - a town is held back only by notes this game is about to place (an area loaded here, or in or beside the town) */
+void t_t580_note_role()
+{
+    for (int t = 0; t < 2; ++t) for (int d = 0; d < 2; ++d) for (int p = 0; p < 2; ++p) for (int q = 0; q < 2; ++q)
+    {
+        const int r = townpending::NoteRole(t, d, p, q);
+        const int want = t == 0 ? townpending::kNoteNoTown : d != 0 ? townpending::kNoteDeleted : p != 0 ? townpending::kNotePlaced : q == 0 ? townpending::kNoteNoPos : townpending::kNoteListed;
+        if (r != want) Fail("NoteRole(" + I(t) + "," + I(d) + "," + I(p) + "," + I(q) + ") = " + I(r) + ", expected " + I(want));
+    }
+}
+void t_t580_holds()
+{
+    if (townpending::Holds(10, 10, 1, 40, 40) != 1) Fail("a note in an area loaded here holds the town, wherever the town is");
+    if (townpending::Holds(10, 10, 0, 40, 40) != 0) Fail("a note sleeping in an area not loaded here, far from the town, does not hold it");
+    if (townpending::Holds(40, 40, 0, 40, 40) != 1) Fail("a note in the town's own area holds it (that area is loading)");
+    if (townpending::Holds(41, 39, 0, 40, 40) != 1) Fail("a note beside the town (ring 1) holds it");
+    if (townpending::Holds(42, 40, 0, 40, 40) != 0) Fail("a note two areas off, not loaded here, does not hold it");
+    if (townpending::Holds(40, 42, 0, 40, 40) != 0) Fail("two areas off on the other axis does not hold it");
+    if (townpending::Holds(40, 40, 0, -1, -1) != 1) Fail("an unread asked area holds the town (the old, safe answer)");
+    if (townpending::Holds(-1, -1, 0, 40, 40) != 1) Fail("a note with no position here holds the town");
+    if (townpending::Holds(-1, -1, 0, -1, -1) != 1) Fail("no position and no asked area: held");
+    if (townpending::Holds(40, 40, 1, -1, -1) != 1) Fail("an unread town area and a note loaded here: held");
+    if (townpending::Holds(0, 0, 0, 1, 1) != 1 || townpending::Holds(63, 63, 0, 62, 62) != 1) Fail("ring 1 at the map edges");
+}
+void t_t580_pending_combinations()
+{
+    /* every combination: deleted / placed here / loaded here / beside the town, with and without a town and a position */
+    for (int t = 0; t < 2; ++t) for (int d = 0; d < 2; ++d) for (int p = 0; p < 2; ++p) for (int q = 0; q < 2; ++q) for (int l = 0; l < 2; ++l) for (int b = 0; b < 2; ++b)
+    {
+        const int rx = b != 0 ? 21 : 5, ry = b != 0 ? 19 : 5;   /* beside the town at 20,20, or 15 areas away */
+        const int got = townpending::Pending(t, d, p, q, rx, ry, l, 20, 20);
+        const int want = (t != 0 && d == 0 && p == 0 && (q == 0 || l != 0 || b != 0)) ? 1 : 0;   /* no position here holds, as before T-580 */
+        if (got != want) Fail("Pending(town=" + I(t) + " deleted=" + I(d) + " placed=" + I(p) + " pos=" + I(q) + " loaded=" + I(l) + " beside=" + I(b) + ") = " + I(got) + ", expected " + I(want));
+    }
+    if (townpending::Pending(1, 1, 0, 1, 20, 20, 1, 20, 20) != 0) Fail("a deleted group never holds its town, even in a loaded area");
+    if (townpending::Pending(1, 0, 1, 1, 20, 20, 1, 20, 20) != 0) Fail("a group placed here never holds its town (the engine counts it)");
+    if (townpending::Pending(1, 0, 0, 1, 5, 5, 0, 20, 20) != 0) Fail("a group asleep where this game does not load never holds its town");
+    if (townpending::Pending(1, 0, 0, 1, 5, 5, 1, 20, 20) != 1) Fail("a group not placed yet in a loaded area holds its town (no duplicates)");
+    if (townpending::Pending(1, 0, 0, 0, 5, 5, 0, 20, 20) != 1) Fail("a group with no position here holds its town (cannot be shown elsewhere)");
+    if (townpending::Pending(1, 0, 0, 1, 5, 5, 0, -1, -1) != 1) Fail("an unread town area: a far group holds (the old answer)");
+    if (townpending::Pending(1, 0, 1, 0, 5, 5, 0, 20, 20) != 0) Fail("placed here never holds, position or not");
+}
+void t_t580_rerun_keep()
+{
+    if (townpending::RerunKeep(0, 1) != 1) Fail("nothing made, a notebook-pending refusal: the entry stays");
+    if (townpending::RerunKeep(1, 1) != 0) Fail("a squad made: the entry ends");
+    if (townpending::RerunKeep(2, 0) != 0) Fail("squads made, nothing refused: the entry ends");
+    if (townpending::RerunKeep(0, 0) != 0) Fail("nothing made, nothing refused (the engine chose none): the entry ends");
+}
+void t_t580_ask_area()
+{
+    int ax = 0, ay = 0;
+    townpending::AskArea(1, 10, 11, 1, 20, 21, 1, 30, 31, &ax, &ay); if (ax != 10 || ay != 11) Fail("the town's area first");
+    townpending::AskArea(0, 10, 11, 1, 20, 21, 1, 30, 31, &ax, &ay); if (ax != 20 || ay != 21) Fail("then the building context's area (the re-offer's fallback)");
+    townpending::AskArea(0, 10, 11, 0, 20, 21, 1, 30, 31, &ax, &ay); if (ax != 30 || ay != 31) Fail("then the spawn position");
+    townpending::AskArea(0, 10, 11, 0, 20, 21, 0, 30, 31, &ax, &ay); if (ax != -1 || ay != -1) Fail("nothing reads: -1 (held)");
+    if (townpending::InRun(0, 0) != 0 || townpending::InRun(0, 7) != 0) Fail("no re-run raised: nothing counts");
+    if (townpending::InRun(7, 7) != 1) Fail("the re-run's own thread counts");
+    if (townpending::InRun(7, 8) != 0) Fail("another thread's building fill never counts for the re-run");
+}
+void t_t580_kept_bound()
+{
+    int reruns = 0; bool gaveUp = false;
+    for (int kept = 1; kept <= 100 && !gaveUp; ++kept) { ++reruns; if (townpending::KeptGiveUp(kept)) gaveUp = true; }
+    if (!gaveUp || reruns != townpending::kMaxKeptReruns) Fail("kept re-runs end at " + I(reruns) + ", expected " + I(townpending::kMaxKeptReruns));
+    if (townpending::KeptGiveUp(townpending::kMaxKeptReruns - 1) != 0) Fail("below the bound the entry waits");
+}
+void t_t580_town_answer()
+{
+    if (townpending::TownAnswer(0, 0) != townpending::kTownNotListed) Fail("no listed area = not listed");
+    if (townpending::TownAnswer(3, 0) != townpending::kTownElsewhere) Fail("listed areas none of which hold = elsewhere");
+    if (townpending::TownAnswer(3, 1) != townpending::kTownHeld) Fail("one holding area = held");
+    if (townpending::TownAnswer(1, 1) != townpending::kTownHeld) Fail("the only area holds = held");
+}
+void t_t580_log_due()
+{
+    if (townpending::LogDue(0, 0u, 12345u) != 1) Fail("the first refusal is logged");
+    if (townpending::LogDue(1, 1000u, 1000u + townpending::kRelogMs - 1u) != 0) Fail("inside 5 minutes: not logged again");
+    if (townpending::LogDue(1, 1000u, 1000u + townpending::kRelogMs) != 1) Fail("at 5 minutes: logged again");
+    if (townpending::LogDue(1, 0xFFFFFF00u, 0xFFFFFF00u + townpending::kRelogMs) != 1) Fail("across the 49-day wrap: logged again at 5 minutes");
+    if (townpending::LogDue(1, 0xFFFFFF00u, 0x00000010u) != 0) Fail("across the wrap, a few ms later: not logged");
+    /* a stuck town refused every 2 s for an hour logs 12 lines (the first and one per 5 minutes) */
+    int logged = 0, seen = 0; unsigned last = 0;
+    for (unsigned ms = 0; ms < 3600000u; ms += 2000u) { if (townpending::LogDue(seen, last, ms)) { ++logged; last = ms; } seen = 1; }
+    if (logged != 12) Fail("an hour of refusals every 2 s logged " + I(logged) + " lines, expected 12");
+}
+
 const TestRow kTests[] =
 {
     { "clock_decide_never_writes_below_current",              t_clock_decide_never_writes_below_current },
@@ -27314,6 +31723,12 @@ const TestRow kTests[] =
     { "addr_signatures_resolve_every_kind_and_refuse_anything_less",          t_addr_signatures_resolve_every_kind_and_refuse_anything_less },
     { "addr_pattern_refusal_clears_every_slot",                               t_addr_pattern_refusal_clears_every_slot },
     { "door_last_actor_is_reported_not_reverted",            t_door_last_actor_is_reported_not_reverted },
+    { "door_a_holder_word_plays_the_swing_and_the_rest_snap", t_door_a_holder_word_plays_the_swing_and_the_rest_snap },
+    { "door_a_played_swing_is_ours_until_it_lands",           t_door_a_played_swing_is_ours_until_it_lands },
+    { "door_the_lock_word_is_applied_by_the_engine_lock_calls", t_door_the_lock_word_is_applied_by_the_engine_lock_calls },
+    { "door_every_lock_word_is_reachable",                   t_door_every_lock_word_is_reachable },
+    { "door_a_lock_no_detour_saw_is_a_local_write",          t_door_a_lock_no_detour_saw_is_a_local_write },
+    { "door_a_live_row_lock_no_detour_saw_is_queued",        t_door_a_live_row_lock_no_detour_saw_is_queued },
     { "door_only_terminal_states_are_compared",              t_door_only_terminal_states_are_compared },
     { "door_give_up_counts_corrections_that_were_undone",    t_door_give_up_counts_corrections_that_were_undone },
     { "door_drain_drop_and_re_registration_booking",         t_door_drain_drop_and_re_registration_booking },
@@ -27494,6 +31909,11 @@ const TestRow kTests[] =
     { "t246_fold_notice",                                            t_t246_fold_notice },   /* T-246 fold (owner 201; review 2026-09-29) */
     { "stand1_slot_wire",                                             t_stand1_slot_wire },
     { "area_writer_standins",                                         t_area_writer_standins },
+    { "p106_owner_lookup",                                            t_p106_owner_lookup },
+    { "p106_zone_names_every_player",                                 t_p106_zone_names_every_player },
+    { "p106_world_players_wire",                                      t_p106_world_players_wire },
+    { "p106_owner_two_bytes",                                         t_p106_owner_two_bytes },
+    { "p106_fold1",                                                   t_p106_fold1 },
     { "mp4_hosting_address_pick_and_players",                         t_mp4_hosting_address_pick_and_players },
     { "mp5_game_options_rows",                                        t_mp5_game_options_rows },
     { "prof3_profiles_screen_words",                                  t_prof3_profiles_screen_words },
@@ -27527,6 +31947,11 @@ const TestRow kTests[] =
     { "inv6p2_owner_tails_box_bag_kit",                                t_inv6p2_owner_tails },
     { "ground_player_mark_decision396",                                t_ground_player_mark },
     { "names2a_faction_row_cut_trim_empty_sender",                    t_names2a_faction_row },
+    { "t368_unique_player_and_faction_names_nameless_n",              t_t368_unique_names },
+    { "h068_default_faction_is_each_profiles_nameless_n",             t_h068_default_faction_numbers },
+    { "h069_freed_faction_names_are_free",                             t_h069_freed_names_are_free },
+    { "t368_every_typed_name_own_recase_aside_ack_edges",             t_t368_names_all_typed },
+    { "t368_world_format_2_owed_cleared_ack_after_apply",             t_t368_format_owed_reply },
     { "restore1a_world_guard_verdicts_failopen_joiner_fields_wire",    t_restore1a_world_guard },
     { "restore1b1_ownhigh_refusal_book_wire_tags_prune_broadcast",     t_restore1b1_ownhigh_checkpoints },
     { "restore1b1_fold_rejudge_welcome_leave_rank_world_path_bin",     t_restore1b1_fold },
@@ -27540,6 +31965,7 @@ const TestRow kTests[] =
     { "inv7a3_own_id_supersede_and_woken_recheck",                     t_inv7a3_own_id_supersede_and_woken_recheck },
     { "inv7e2_reloaded_copy_retire_this_link_generation",              t_inv7e2_reloaded_copy_retire },
     { "crash2_copy_body_rebuild_skip_rule",                            t_crash2_copy_body_decide },
+    { "t500_owner_ko_copy_first_look_gate",                            t_t500_ko_look_gate },
     { "t293_human_class_by_vtable",                                    t_t293_human_class_by_vtable },
     { "mmo2_mark_overlay_set_platoon_chars_roster_check",              t_mmo2_overlay_roster },
     { "mmo4_leave_save_gate_slot_autosave_skip_phases",                t_mmo4_leave_save },
@@ -27591,6 +32017,7 @@ const TestRow kTests[] =
     { "t1b1_xfer_take_by_squad_position_else_member",                 t_t1b1_xfer_take },
     { "m7a2_handover_once",                                           t_m7a2_handover_once },   /* [m7a2-t0] */
     { "m7a2_context_platoon_record",                                  t_m7a2_context_platoon_record },   /* [m7a2-tc1] */
+    { "t574_block_squad_other_game",                                  t_t574_block_squad_other_game },
     { "m7a3f3_announced_three_state",                                 t_m7a3f3_announced_three_state },   /* [m7a3f3-t8] */
     { "m7a3f3_handed_over_supersede",                                 t_m7a3f3_handed_over_supersede },
     { "m7a3f3_handed_over_wake",                                      t_m7a3f3_handed_over_wake },
@@ -27858,6 +32285,7 @@ const TestRow kTests[] =
     { "t313_feed_ask_decision",                                      t_t313_feed_ask_decision },
     { "t313_feed_paging_converges",                                  t_t313_feed_paging_converges },
     { "t313_feed_end_marker_arms_once",                              t_t313_feed_end_marker_arms_once },
+    { "address_bindings_fit",                                        t_address_bindings_fit },
     { "t313_protocol_63_both_sides",                                 t_t313_protocol_63_both_sides },
     { "t346_wire_roundtrip",                                         t_t346_wire_roundtrip },
     { "t346_want_rule",                                              t_t346_want_rule },
@@ -27891,6 +32319,14 @@ const TestRow kTests[] =
     { "p124_stop_measure",                                           t_p124_stop_measure },   /* PROBE P124 */
     { "t392_defer_cause",                                            t_t392_defer_cause },
     { "t392_reoffer_decide",                                         t_t392_reoffer_decide },
+    { "t581_wire",                                                   t_t581_wire },
+    { "t581_table",                                                  t_t581_table },
+    { "t581_file",                                                   t_t581_file },
+    { "t581_load_cause",                                             t_t581_load_cause },
+    { "t581_commit",                                                 t_t581_commit },
+    { "t581_two_games",                                              t_t581_two_games },
+    { "t581_fold",                                                   t_t581_fold },
+    { "t581_after_rerun",                                            t_t581_after_rerun },
     { "t438_residents_aside",                                        t_t438_residents_aside },
 
     { "pp7_list_hides_only_stamped_on_kenshi_lists",                  t_pp7_list_hides_only_stamped_on_kenshi_lists },
@@ -27912,6 +32348,7 @@ const TestRow kTests[] =
     { "p105b2_absorb",                                               t_p105b2_absorb },
     { "p105b2_serve_step",                                           t_p105b2_serve_step },
     { "p105b2_land_plan",                                            t_p105b2_land_plan },
+    { "t159_box_to_box",                                             t_t159_box_to_box },   /* T-159 */
     { "p105b2_answer_action",                                        t_p105b2_answer_action },
     { "p105b2_how_at_drop",                                          t_p105b2_how_at_drop },
     { "p105b2_scenario_reask_once",                                  t_p105b2_scenario_reask_once },
@@ -27999,6 +32436,26 @@ const TestRow kTests[] =
     { "nametag_worse_of_two",                                         t_nametag_worse_of_two },
     { "nametag_colours",                                              t_nametag_colours },
     { "nametag_caption",                                              t_nametag_caption },
+    { "nametag_outline",                                              t_nametag_outline },
+    { "playerstab_tab_place",                                         t_playerstab_tab_place },
+    { "playerstab_rows",                                              t_playerstab_rows },
+    { "playerstab_bottom_and_press",                                  t_playerstab_bottom_and_press },
+    { "playerstab_words",                                             t_playerstab_words },
+    { "playerstab_their_notices",                                     t_playerstab_their_notices },
+    { "playerstab_notice_book",                                       t_playerstab_notice_book },
+    { "playerstab_notice_putback",                                    t_playerstab_notice_putback },
+    { "playerstab_ally_flag",                                         t_playerstab_ally_flag },
+    { "slotwire_carried_faction",                                     t_slotwire_carried_faction },
+    { "playerstab_lever_parse",                                       t_playerstab_lever_parse },
+    { "t546h_bottom_line",                                            t_t546h_bottom_line },
+    { "t546h_boxes",                                                  t_t546h_boxes },
+    { "t546h_message_lines",                                          t_t546h_message_lines },
+    { "t546h_rows_and_lever",                                         t_t546h_rows_and_lever },
+    { "t546h_fold_rules",                                             t_t546h_fold_rules },
+    { "t546h_decline_wait",                                           t_t546h_decline_wait },
+    { "t546i_departure_stance",                                       t_t546i_departure_stance },
+    { "t546i_fold1",                                                  t_t546i_fold1 },
+    { "t546h_profile_deleted_last",                                   t_t546h_profile_deleted_last },
     { "ctx_key_faction",                                              t_ctx_key_faction },
     { "uidslots_fill_refuses_then_forget_frees_a_slot",               t_uidslots_fill_refuses_then_forget_frees_a_slot },
     { "uidslots_remove_keeps_colliding_run_findable",                 t_uidslots_remove_keeps_colliding_run_findable },
@@ -28007,13 +32464,94 @@ const TestRow kTests[] =
     { "joblever_parse",                                               t_joblever_parse },   /* P17 / P43 TEST-ONLY levers */
     { "titleart_cover_crop",                                          t_titleart_cover_crop },
     { "titleart_rows_and_note",                                       t_titleart_rows_and_note },
+    { "titleart_menu_column",                                         t_titleart_menu_column },
     { "pausemenu_kenshi_layout_outside_multiplayer",                  t_pausemenu_kenshi_layout_outside_multiplayer },
     { "pausemenu_closed_up_in_multiplayer",                           t_pausemenu_closed_up_in_multiplayer },
     { "pausemenu_order_and_reopen_never_move_twice",                  t_pausemenu_order_and_reopen_never_move_twice },
     { "pausemenu_refuses_rows_out_of_order",                          t_pausemenu_refuses_rows_out_of_order },
     { "pausemenu_hosting_row",                                        t_pausemenu_hosting_row },
     { "addrlookup_sites_and_answers",                                 t_addrlookup_sites_and_answers },
-    { "netaddr_presses_and_answers",                                  t_netaddr_presses_and_answers }
+    { "netaddr_presses_and_answers",                                  t_netaddr_presses_and_answers },
+    { "t546_team_wire_round_trip",                                    t_t546_team_wire_round_trip },   /* T-546 step 3 */
+    { "t546_team_three_members",                                      t_t546_team_three_members },
+    { "t546_team_refusals",                                           t_t546_team_refusals },
+    { "t546_team_offline_removal",                                    t_t546_team_offline_removal },
+    { "t546_team_expiry_and_disband",                                 t_t546_team_expiry_and_disband },
+    { "t546_team_accept_refusals",                                    t_t546_team_accept_refusals },   /* T-546 step 3 fold 1 */
+    { "t546_team_size_limits",                                        t_t546_team_size_limits },
+    { "t546_team_owed_limit",                                         t_t546_team_owed_limit },
+    { "t546_team_founder_ends",                                       t_t546_team_founder_ends },
+    { "t546_team_load_edges",                                         t_t546_team_load_edges },
+    { "t546_team_profile_deleted",                                    t_t546_team_profile_deleted },
+    { "t546_team_inbox",                                              t_t546_team_inbox },
+    { "t556_fallen_round_trip",                                       t_t556_fallen_round_trip },
+    { "t556_fallen_list_keeps_forty",                                 t_t556_fallen_list_keeps_forty },
+    { "t556_fallen_squad_choice",                                     t_t556_fallen_squad_choice },
+    { "t556_fallen_road",                                             t_t556_fallen_road },
+    { "t556_fallen_size_edges",                                       t_t556_fallen_size_edges },
+    { "t556_fallen_once_per_uid",                                     t_t556_fallen_once_per_uid },
+    { "t556_fallen_v2_row",                                           t_t556_fallen_v2_row },
+    { "t556_place_rules",                                             t_t556_place_rules },
+    { "t556_place_town",                                              t_t556_place_town },
+    { "t546b_teammates_and_index",                                    t_t546b_teammates_and_index },   /* T-546 step 4 */
+    { "t546b_pin_start_end",                                          t_t546b_pin_start_end },
+    { "t546b_tag_look",                                               t_t546b_tag_look },
+    { "t546b_member_access",                                          t_t546b_member_access },
+    { "t546b_notice_names",                                           t_t546b_notice_names },
+    { "t546b_players_tab_teammate",                                   t_t546b_players_tab_teammate },
+    { "t546b_box_stub",                                               t_t546b_box_stub },
+    { "t546c_prejoin_snapshot",                                       t_t546c_prejoin_snapshot },   /* T-546 step 5 */
+    { "t546c_record_seed_delta",                                      t_t546c_record_seed_delta },
+    { "t546c_record_stance_side",                                     t_t546c_record_stance_side },
+    { "t546c_departure_both_sides",                                   t_t546c_departure_both_sides },
+    { "t546c_record_wire_and_file",                                   t_t546c_record_wire_and_file },
+    { "t546c_game_rules",                                             t_t546c_game_rules },
+    { "t546c_fold1",                                                  t_t546c_fold1 },
+    { "t546c_npc_entry_roads",                                        t_t546c_npc_entry_roads },   /* T-546 step 5 fold 2 */
+    { "t546c_fold3",                                                  t_t546c_fold3 },             /* T-546 step 5 fold 3 */
+    { "t546d_union_decide",                                           t_t546d_union_decide },      /* T-546 step 6 */
+    { "t546d_wire_and_file",                                          t_t546d_wire_and_file },
+    { "t546d_game_rules",                                             t_t546d_game_rules },
+    { "t546d_fold1",                                                  t_t546d_fold1 },
+    { "t546e_team_orders",                                            t_t546e_team_orders },   /* T-546 step 7 */
+    { "t546f_team_pair",                                              t_t546f_team_pair },   /* T-546 (owner 512): ally / not-enemy between teammates */
+    { "t556_fallen_wire",                                             t_t556_fallen_wire },
+    { "t556_fallen_book_file",                                        t_t556_fallen_book_file },
+    { "t556_fallen_table_apply",                                      t_t556_fallen_table_apply },
+    { "t556_fallen_reconcile",                                        t_t556_fallen_reconcile },
+    { "t556_unique_bring_back",                                       t_t556_unique_bring_back },
+    { "t556_fallen_protocol_74",                                      t_t556_fallen_protocol_74 },
+    { "t556_fee_price",                                               t_t556_fee_price },
+    { "t556_fee_options",                                             t_t556_fee_options },
+    { "t556_back_rows",                                               t_t556_back_rows },
+    { "t556_count_alive",                                             t_t556_count_alive },
+    { "t556_table_worst_fits",                                        t_t556_table_worst_fits },
+    { "t556_died_marks",                                              t_t556_died_marks },
+    { "t556_tab_rows",                                                t_t556_tab_rows },
+    { "t556_tab_price_lines",                                         t_t556_tab_price_lines },
+    { "t556_tab_box_and_lines",                                       t_t556_tab_box_and_lines },
+    { "t556_tab_states",                                              t_t556_tab_states },
+    { "t556_tab_fold1",                                               t_t556_tab_fold1 },
+    { "t556_count_alive_names",                                       t_t556_count_alive_names },
+    { "t563_written_pair",                                            t_t563_written_pair },
+    { "t563_forward_roads",                                           t_t563_forward_roads },
+    { "t556f_fee_rows",                                               t_t556f_fee_rows },
+    { "t573_simulation_held",                                         t_t573_simulation_held },
+    { "t573_hold_shift",                                              t_t573_hold_shift },
+    { "t573_shift_clock",                                             t_t573_shift_clock },
+    { "t573_window_counts_running_frames",                            t_t573_window_counts_running_frames },
+    { "t573_rearm_schedule",                                          t_t573_rearm_schedule },
+    { "t573_rearm_bound",                                             t_t573_rearm_bound },
+    { "t573_hold_shift_sec",                                          t_t573_hold_shift_sec },
+    { "t573_shift_since",                                             t_t573_shift_since },
+    { "t580_note_role",                                               t_t580_note_role },
+    { "t580_holds",                                                   t_t580_holds },
+    { "t580_pending_combinations",                                    t_t580_pending_combinations },
+    { "t580_rerun_keep",                                              t_t580_rerun_keep },
+    { "t580_ask_area",                                                t_t580_ask_area },
+    { "t580_kept_bound",                                              t_t580_kept_bound },
+    { "t580_town_answer",                                             t_t580_town_answer },
+    { "t580_log_due",                                                 t_t580_log_due }
 };
 
 }   /* anonymous namespace */

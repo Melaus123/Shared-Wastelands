@@ -17112,6 +17112,8 @@ static int ItOp0BagRowsLate(ItemMoveMsg* m)
    end), the world's teardown. A game save (decision 13.2 (b), 15.5) puts every kept item back into its own square before saveGame and
    lifts it out again after saveGame returns. No player-facing text: everything is silent (a refusal puts the item back, as today). */
 namespace { int ShopStackMax(void* item, void* sec); int P105ReturnPod(); }   /* defined below, in the same unnamed namespace (C2668) */
+int HdWriter(int isBox, const std::string& key, unsigned int uid, void** bldOut);   /* defined below */
+void ItParityPullOne(const std::string& key);                                       /* defined below */
 
 const int kHdAskCap = 64, kHdHoldCap = 32, kHdAnsCap = 16, kHdLineCap = 600;
 const unsigned int kHdTimeoutMs = 10000u, kHdParkRetryMs = 2000u, kHdDoneKeepMs = 20000u;
@@ -17119,7 +17121,7 @@ const unsigned int kHdTimeoutMs = 10000u, kHdParkRetryMs = 2000u, kHdDoneKeepMs 
 const int kHdAHoldSent = 0, kHdAHoldYes = 1, kHdAHoldGone = 2, kHdAHoldPolicy = 3, kHdAHoldReask = 4, kHdALandSent = 5,
           kHdALandExact = 6, kHdALandElsewhere = 7, kHdALandReask = 8, kHdAPutBackRefused = 9, kHdABoxReasked = 10,
           kHdAAbsorbed = 11, kHdARowsDropped = 12, kHdAUnnameable = 13, kHdALandBack = 14, kHdALandRefused = 15,
-          kHdAHoldCountDiffers = 16, kHdACount = 17;
+          kHdAHoldCountDiffers = 16, kHdALandOtherBox = 17, kHdALandTargetPulled = 18, kHdACount = 19;   /* T-159: landOtherBox, landTargetPulled */
 long long g_hdA[kHdACount];
 /* the writer's - holdServe[...] */
 const int kHdWGranted = 0, kHdWRefGone = 1, kHdWRefWrongItem = 2, kHdWRefShort = 3, kHdWRefNotHolder = 4, kHdWRefPolicy = 5,
@@ -17127,7 +17129,8 @@ const int kHdWGranted = 0, kHdWRefGone = 1, kHdWRefWrongItem = 2, kHdWRefShort =
           kHdWLandKept = 12, kHdWLandNoHold = 13, kHdWBackSession = 14, kHdWBackEdge = 15, kHdWBackTeardown = 16,
           kHdWParkedPlaced = 17, kHdWBackNotWriter = 18, kHdWPublished = 19, kHdWPublishFailed = 20,
           kHdWHoldRecord = 21, kHdWHoldLandFirst = 22, kHdWBackGround = 23, kHdWBackGroundFault = 24, kHdWBackNoGround = 25,   /* fold 2 */
-          kHdWCount = 26;
+          kHdWLandOtherBox = 26, kHdWOtherBoxBarred = 27,   /* T-159 */
+          kHdWCount = 28;
 long long g_hdW[kHdWCount];
 /* the save edges - holdSave[...] */
 const int kHdSPutBack = 0, kHdSLifted = 1, kHdSKeptOut = 2, kHdSRelostEnded = 3, kHdSZoneEnded = 4, kHdSOffThread = 5,
@@ -17154,6 +17157,7 @@ struct HdAsk
     void* cursorItem;         /* a HOLD: the object on this game's cursor - COMPARED, never dereferenced */
     int landAnswered, landRefused;   /* fold 1 (HIGH-1): a HOLD - its LAND was answered for good / refused */
     std::string landSec, landKey2; int landX, landY, landUnits, landHow, landReask;   /* fold 1 (MED-1): a HOLD - its LAND as sent (sent again on a late grant) */
+    std::string landBox;      /* T-159: a HOLD - its LAND's target box when that is ANOTHER box the same game writes (empty = the hold's own container) */
     HdAsk() : used(0), id(0u), kind(0), holdId(0u), sentAt(0u), nextAt(0u), doneAt(0u), tries(0), waiting(0), granted(0), landed(0),
               done(0), split(0), reaskBox(0), cursorItem(0), landAnswered(0), landRefused(0), landX(0), landY(0), landUnits(0), landHow(0),
               landReask(0) {}
@@ -17292,8 +17296,10 @@ unsigned int HdSendHold(const ItEntry& e, unsigned int uid, int units, int whole
           + " (on this player's cursor; the writer lifts it)" + (sent != 0 ? std::string("") : std::string(" - the send FAILED; the row asks again")));
     return a.id;
 }
-/* LAND under a hold this game asked: the target square of the SAME container. reaskBox: re-ask the box (and key2) on its answer. */
-unsigned int HdSendLand(unsigned int holdId, const char* section, int x, int y, int units, int how, int reaskBox, const std::string& key2)
+/* LAND under a hold this game asked: the target square of the SAME container, or (toBox, T-159) of another box the same game writes -
+   named by its key as the taker box (takerUid 0). reaskBox: re-ask the box (and key2) on its answer. */
+unsigned int HdSendLand(unsigned int holdId, const char* section, int x, int y, int units, int how, int reaskBox, const std::string& key2,
+                        const std::string& toBox = std::string())
 {
     const int h = HdAskFind(holdId);
     if (h < 0 || g_hdAsk[h].kind != 0 || (g_hdAsk[h].done != 0 && g_hdAsk[h].granted == 0))
@@ -17309,12 +17315,15 @@ unsigned int HdSendLand(unsigned int holdId, const char* section, int x, int y, 
     a.rq = hold.rq;
     a.rq.id = a.id; a.rq.dir = coophold::kDirLand; a.rq.holdId = holdId; a.rq.holdHow = how; a.rq.holdSlot = MySlotForWire();
     a.rq.takerSection = section; a.rq.takerX = x; a.rq.takerY = y; a.rq.quantity = (units > 0) ? units : 1;
+    if (!toBox.empty()) { a.rq.takerUid = 0; a.rq.takerBoxKey = toBox; ++g_hdA[kHdALandOtherBox]; }   /* T-159: into another box */
     hold.landed = 1;
     hold.landSec = section; hold.landX = x; hold.landY = y; hold.landUnits = units; hold.landHow = how; hold.landReask = reaskBox; hold.landKey2 = key2;   /* fold 1 (MED-1) */
+    hold.landBox = toBox;
     if (coophold::HoldRowDone(hold.granted, hold.landed, hold.landAnswered) != 0) HdDone(hold);
     const int sent = HdSendRow(i);
     ++g_hdA[kHdALandSent];
-    HdSay("[ITEMS] P105 land " + N((long long)a.id) + " (hold " + N((long long)holdId) + ") sent: -> " + std::string(section) + " " + HdXY(x, y)
+    HdSay("[ITEMS] P105 land " + N((long long)a.id) + " (hold " + N((long long)holdId) + ") sent: -> " + (toBox.empty() ? std::string("") : "box '" + toBox + "' ")
+          + std::string(section) + " " + HdXY(x, y)
           + " how=" + HdHowName(how) + " x" + N((long long)a.rq.quantity) + (reaskBox != 0 ? " (the box is re-asked on the answer)" : "")
           + (sent != 0 ? std::string("") : std::string(" - the send FAILED; the row asks again")));
     return a.id;
@@ -17354,14 +17363,27 @@ void HdSplitPickup()
     if (ItReadFields(g_splitPend.cloneItem, &fe) != 1) { ++g_hdA[kHdAUnnameable]; return; }
     g_splitPend.hdHold = HdSendHold(se, g_splitPend.uid, se.quantity, 0, fe, g_splitPend.cloneItem);
 }
-/* A one-tick move inside one container another game writes: a REMOVE (op 1) or a SPLIT (op 3) and the ADD (op 0) of the same
-   container in the same drain. */
+/* T-159: an item out of box 'src' (another game writes it) put down in a DIFFERENT box 'cur' that the same game writes - a LAND into
+   'cur' (coophold::LandIntoOtherBox; the writers are the games this game's requests for the two keys go to, read live). */
+int HdOtherBoxLand(const ItEntry& src, const ItEntry& cur, int curMine, int curVerdict)
+{
+    if (src.kind != kKindBox || cur.kind != kKindBox || std::strcmp(src.boxKey, cur.boxKey) == 0) return 0;
+    ItemRequestMsg ra, rb;
+    ra.ownerUid = 0; ra.ownerBoxKey = src.boxKey;
+    rb.ownerUid = 0; rb.ownerBoxKey = cur.boxKey;
+    return coophold::LandIntoOtherBox(1, 1, curMine, curVerdict == kBoxHeld ? 1 : 0, cur.boxKey[0] != 0 ? 1 : 0, cur.bagPath.has != 0 ? 1 : 0,
+                                      cur.shopFacade != 0 ? 1 : 0, ItemRequestTargetSlot(ra), ItemRequestTargetSlot(rb));
+}
+/* A one-tick move inside one container another game writes, or (T-159) from one box to another box that game writes: a REMOVE (op 1)
+   or a SPLIT (op 3) and the ADD (op 0) in the same drain. */
 int HdOneTickOk(const ItEntry& a, const ItEntry& b, int mineA, int boxA, int boxB, unsigned int uidA, unsigned int uidB)
 {
     if (HdEligible(a, uidA, boxA, mineA) == 0 || b.bagPath.has != 0 || b.shopFacade != 0 || a.kind != b.kind) return 0;
-    if (a.x == b.x && a.y == b.y && std::strcmp(a.section, b.section) == 0) return 0;   /* out and straight back (the itemtake lever's refusal): nothing moved */
-    if (a.kind == kKindBox) return (boxB == kBoxHeld && a.box == b.box && std::strcmp(a.boxKey, b.boxKey) == 0) ? 1 : 0;
-    return (uidA != 0 && uidA == uidB) ? 1 : 0;
+    const int sameBox = (a.kind == kKindBox && a.box == b.box && std::strcmp(a.boxKey, b.boxKey) == 0) ? 1 : 0;
+    const int sameOne = (a.kind == kKindBox) ? sameBox : ((uidA != 0 && uidA == uidB) ? 1 : 0);
+    if (sameOne != 0 && a.x == b.x && a.y == b.y && std::strcmp(a.section, b.section) == 0) return 0;   /* out and straight back (the itemtake lever's refusal): nothing moved */
+    if (a.kind == kKindBox) return (boxB == kBoxHeld && sameBox != 0) ? 1 : HdOtherBoxLand(a, b, 0, boxB);
+    return sameOne;
 }
 void HdOneTick(const ItEntry& src, const ItEntry& dst, unsigned int uid)
 {
@@ -17369,7 +17391,8 @@ void HdOneTick(const ItEntry& src, const ItEntry& dst, unsigned int uid)
     const int units = (split != 0) ? src.quantity : (dst.quantity > 0 ? dst.quantity : src.quantity);
     const unsigned int id = HdSendHold(src, uid, units, split != 0 ? 0 : 1, dst, 0);   /* an ADD's 0x2A block names the record */
     if (id == 0) return;
-    HdSendLand(id, dst.section, dst.x, dst.y, units, coophold::kHowPlaced, 0, "");
+    const std::string toBox = (src.kind == kKindBox && dst.kind == kKindBox && std::strcmp(src.boxKey, dst.boxKey) != 0) ? std::string(dst.boxKey) : std::string();
+    HdSendLand(id, dst.section, dst.x, dst.y, units, coophold::kHowPlaced, 0, toBox, toBox);   /* T-159: the target box is re-asked too on a non-exact answer */
 }
 /* THE ENGINE'S MERGE AT A DROP (15.3): the stack at the target square is removed (op 1, a DIFFERENT object at the same square of the
    same container) and its units folded into the incoming object (op 2 on it), which is then filed there (op 0). Those halves belong
@@ -17388,13 +17411,19 @@ int HdMergedAt(const int* idx, int n, int* consumed, int addK)
     }
     return found;
 }
-/* The drop that ends a held drag (or a held split). 1 = a LAND into the same container went out (the caller is done); 0 = a LAND
-   back onto the item's own square went out first and the caller goes on with the road that drop always took. */
-int HdHeldDrop(unsigned int holdId, const ItEntry& src, const ItEntry& cur, int curMine, int merged, int displaced)
+/* The drop that ends a held drag (or a held split). 1 = a LAND into the same container, or (T-159) into another box the same game
+   writes, went out (the caller is done); 0 = a LAND back onto the item's own square went out first and the caller goes on with the
+   road that drop always took. curVerdict: the drop container's area verdict. */
+int HdHeldDrop(unsigned int holdId, const ItEntry& src, const ItEntry& cur, int curMine, int curVerdict, int merged, int displaced)
 {
     if (curMine == 0 && cur.bagPath.has == 0 && ItSameAddressee(src, cur) != 0)
     {
         HdSendLand(holdId, cur.section, cur.x, cur.y, src.quantity, coophold::HowAtDrop(1, merged, displaced, 0), 0, "");
+        return 1;
+    }
+    if (HdOtherBoxLand(src, cur, curMine, curVerdict) != 0)
+    {   /* T-159: both boxes are written by the same other game - one LAND moves the held item from its box into this one */
+        HdSendLand(holdId, cur.section, cur.x, cur.y, src.quantity, coophold::HowAtDrop(1, merged, displaced, 0), 0, std::string(cur.boxKey), std::string(cur.boxKey));
         return 1;
     }
     HdLandBack(holdId, curMine == 0 ? 1 : 0, (curMine == 0 && cur.kind == kKindBox) ? std::string(cur.boxKey) : std::string());
@@ -17404,7 +17433,12 @@ int HdBoxPending(const char* key)   /* ItBoxHasPendingMoves: a P109 answer waits
 {
     if (key == 0 || key[0] == 0) return 0;
     for (int i = 0; i < kHdAskCap; ++i)
-        if (g_hdAsk[i].used != 0 && g_hdAsk[i].done == 0 && g_hdAsk[i].rq.ownerUid == 0 && g_hdAsk[i].rq.ownerBoxKey == key) return 1;
+    {
+        const HdAsk& a = g_hdAsk[i];
+        if (a.used == 0 || a.done != 0) continue;
+        if (a.rq.ownerUid == 0 && a.rq.ownerBoxKey == key) return 1;
+        if (a.kind == 1 && a.rq.takerUid == 0 && a.rq.takerBoxKey == key) return 1;   /* T-159: a LAND into this box from another one */
+    }
     return 0;
 }
 /* ApplyItemMove's first test (after the sender check): a publication tagged with THIS game's slot is never applied (design 3.4). */
@@ -17429,11 +17463,11 @@ int HdNoteConfirm(const ItemConfirmMsg& cf)
         {
             a.granted = 1; a.landAnswered = 0; a.landRefused = 0;
             ++g_hdA[kHdAHoldYes];
-            const std::string ls = a.landSec, lk = a.landKey2;
+            const std::string ls = a.landSec, lk = a.landKey2, lb = a.landBox;
             const int lx = a.landX, ly = a.landY, lu = a.landUnits, lh = a.landHow;
             const unsigned int hid = a.id;
             HdSay("[ITEMS] P105 hold " + N((long long)hid) + " granted AFTER its land was refused (the land overtook it) - the land is sent again");
-            HdSendLand(hid, ls.c_str(), lx, ly, lu, lh, 1, lk);
+            HdSendLand(hid, ls.c_str(), lx, ly, lu, lh, 1, lk, lb);
         }
         return 1;
     }
@@ -17484,6 +17518,8 @@ int HdNoteConfirm(const ItemConfirmMsg& cf)
           + ((act != coophold::kAnNone || a.reaskBox != 0) ? " - box re-asked" : ""));
     const int reask = (act != coophold::kAnNone || a.reaskBox != 0) ? 1 : 0;
     const std::string key2 = a.reaskKey2;
+    const int otherBox = (a.kind == 1 && a.rq.ownerUid == 0 && a.rq.takerUid == 0 && !a.rq.takerBoxKey.empty() && a.rq.takerBoxKey != a.rq.ownerBoxKey
+                          && key2 == a.rq.takerBoxKey) ? 1 : 0;   /* T-159: a LAND into another box - key2 is that box */
     HdDone(a);
     {   /* fold 1 (HIGH-1): its HOLD row is done now, granted or not - nothing else ends a hold that was never granted */
         const int h = HdAskFind(a.holdId);
@@ -17494,7 +17530,19 @@ int HdNoteConfirm(const ItemConfirmMsg& cf)
             if (hold.done == 0 && coophold::HoldRowDone(hold.granted, hold.landed, hold.landAnswered) != 0) HdDone(hold);
         }
     }
-    if (reask != 0) { HdAskBox(key); if (key2 != key) HdAskBox(key2); }
+    if (reask != 0)
+    {
+        HdAskBox(key);
+        const int rr = coophold::LandTargetReread(1, otherBox, otherBox != 0 ? HdWriter(1, key2, 0, 0) : 0);
+        if (rr == coophold::kRrPull)
+        {   /* T-159: this game writes the target box now - the previous writer's copy goes in over the one showing the dropped item */
+            ++g_hdA[kHdALandTargetPulled];
+            HdSay(head + ": this game writes box '" + key2 + "' now (handed over while the land was in flight) - that box is PULLED from"
+                  " the game that served the land, so the item stays where the writer put it");
+            ItParityPullOne(key2);
+        }
+        else if (key2 != key) HdAskBox(key2);
+    }
     return 1;
 }
 void HdAskTick(unsigned int now)
@@ -17550,13 +17598,14 @@ void HdCfFields(ItemConfirmMsg* cf, const ItEntry& fe)
     cf->quality = fe.quality; cf->charges = fe.charges; cf->functionKind = fe.functionKind; cf->level = fe.level; cf->unique = fe.unique;
 }
 /* ONE publication of a hold's change, through the one road every publication takes. tagId != 0: the request tag (the asker absorbs it). */
-void HdPublish(int hi, int op, const std::string& section, int x, int y, int qty, unsigned int tagId)
+void HdPublish(int hi, int op, const std::string& section, int x, int y, int qty, unsigned int tagId,
+               const std::string& otherKey = std::string(), const std::string& otherId = std::string())   /* T-159: the change is in another box */
 {
     const HdHold& h = g_hdHold[hi];
     const ItEntry& fe = g_hdHoldFe[hi];
     ItemMoveMsg m;
     m.op = op; m.section = section; m.x = x; m.y = y; m.quantity = qty;
-    if (h.isBox != 0) { m.uid = 0; m.boxKey = h.key; m.boxId = h.boxId; } else m.uid = h.uid;
+    if (h.isBox != 0) { m.uid = 0; m.boxKey = otherKey.empty() ? h.key : otherKey; m.boxId = otherKey.empty() ? h.boxId : otherId; } else m.uid = h.uid;
     if (op == 0)
     {
         m.baseSid = fe.baseSid; m.companySid = fe.companySid; m.materialSid = fe.materialSid; m.colorSid = fe.colorSid;
@@ -17676,8 +17725,31 @@ void HdServeLand(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg*
         HdSay(who + " REFUSED notWriter - the hold stays until this game hands it back");
         return;
     }
+    /* T-159: a LAND whose taker box is ANOTHER box - that box takes the item only when this game writes it too, its access policy
+       lets the player in and it is not a shop piece (coophold::LandTargetOpen); a barred target plans with no target square */
+    const int other = (h.isBox != 0 && r.takerUid == 0 && !r.takerBoxKey.empty() && r.takerBoxKey != h.key) ? 1 : 0;
+    int topen = 1;
+    std::string tid;
+    if (other != 0)
+    {
+        void* tbld = 0;
+        const int tw = HdWriter(1, r.takerBoxKey, 0, &tbld);
+        const int tshop = (tbld != 0 && ItShopPieceBuildingAny(tbld) != 0) ? 1 : 0;
+        const int tacc = (tbld != 0 && BoxAccessAllowed(tbld, fromPeer, false)) ? 1 : 0;
+        topen = coophold::LandTargetOpen(1, tw, tacc, tshop);
+        if (topen == 0) ++g_hdW[kHdWOtherBoxBarred];
+        else
+        {
+            char idb[kBoxKeyCap]; idb[0] = 0;
+            if (ItStrPodWhy((const char*)tbld + kBldInstanceUid, idb, kBoxKeyCap) != 1) idb[0] = 0;   /* the cross-check id; absent is ordinary */
+            tid = idb;
+        }
+        HdSay(who + " names another box '" + r.takerBoxKey + "': " + (topen != 0 ? std::string("open") : "BARRED (writer=" + N((long long)tw) + " access="
+              + N((long long)tacc) + " shopPiece=" + N((long long)tshop) + ") - the item goes back into its own box"));
+    }
+    const std::string tkey = (other != 0) ? r.takerBoxKey : h.key;
     ::Inventory* inv = 0; ::Inventory* oinv = 0;
-    ::InventorySection* tsec = HdSec(h.isBox, h.key, h.uid, r.takerSection, &inv);
+    ::InventorySection* tsec = (topen != 0) ? HdSec(h.isBox, tkey, h.uid, r.takerSection, &inv) : 0;
     ::InventorySection* osec = HdSec(h.isBox, h.key, h.uid, h.section, &oinv);
     void* const esc = h.escrow;
     const int units = h.units, how = r.holdHow, tx = r.takerX, ty = r.takerY;
@@ -17690,31 +17762,54 @@ void HdServeLand(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg*
         if (ItBaseSidPod(occ, sid, kSidCap) != 0 && std::strcmp(sid, g_hdHoldFe[hi].baseSid) == 0 && mx > 1 && oq + units <= mx) mergeOk = 1;
     }
     const int oldFits = (osec != 0 && ItFitsPod(osec, esc, h.x, h.y) == 1) ? 1 : 0;
-    ::InventorySection* fsec = (tsec != 0) ? tsec : osec;
-    int fx = -1, fy = -1;
-    const int freeFound = (fsec != 0 && ItFirstFreeSlot(fsec, esc, &fx, &fy) == 1 && fx >= 0) ? 1 : 0;
-    int plan = coophold::LandPlan(how, cellFits, mergeOk, oldFits, freeFound);
-    int done = 0, px = 0, py = 0;
+    void* oocc = 0; int ooq = 0, mergeOldOk = 0;   /* units off a stack: that stack, still on the hold's own square with room (HdPutBack's step) */
+    if (h.whole == 0 && osec != 0 && ItGetAtPod(osec, h.x, h.y, &oocc) != 0 && oocc != 0 && oocc != esc && ItIntPod(oocc, kItemQuantity, &ooq) != 0)
+    {
+        char sid[kSidCap]; sid[0] = 0;
+        const int mx = ShopStackMax(oocc, osec);
+        if (ItBaseSidPod(oocc, sid, kSidCap) != 0 && std::strcmp(sid, g_hdHoldFe[hi].baseSid) == 0 && mx > 1 && ooq + units <= mx) mergeOldOk = 1;
+    }
+    ::InventorySection* fsec = (other == 0) ? ((tsec != 0) ? tsec : osec) : tsec;
+    int fx = -1, fy = -1, ofx = -1, ofy = -1;
+    const int freeT = (fsec != 0 && ItFirstFreeSlot(fsec, esc, &fx, &fy) == 1 && fx >= 0) ? 1 : 0;
+    const int freeO = (other != 0 && osec != 0 && ItFirstFreeSlot(osec, esc, &ofx, &ofy) == 1 && ofx >= 0) ? 1 : 0;
+    const int freeFrom = coophold::LandFreeFrom(other, topen, freeT, freeO);   /* T-159: a full target sends the item home */
+    if (freeFrom == coophold::kLfOwn) { fsec = osec; fx = ofx; fy = ofy; }
+    const int freeFound = (freeFrom != coophold::kLfNone) ? 1 : 0;
+    /* T-159: a free square of the target box comes before the way home (the player chose that box) */
+    int plan = coophold::LandPlan(how, cellFits, mergeOk, oldFits, freeFound, mergeOldOk, (other != 0 && freeFrom == coophold::kLfTarget) ? 1 : 0);
+    int done = 0, px = 0, py = 0, mq = 0;
     std::string psec;
     if (plan == coophold::kLpPlaceExact) { psec = r.takerSection; px = tx; py = ty; done = (ItShowPutGhostPod(tsec, esc, tx, ty) == 1) ? 1 : 0; }
     else if (plan == coophold::kLpMergeExact)
     {
         psec = r.takerSection; px = tx; py = ty;
-        if (ItShowUnitsPod(tsec, inv, occ, tx, ty, units) == 1) { HdDestroyPod(esc); done = 2; }
+        if (ItShowUnitsPod(tsec, inv, occ, tx, ty, units) == 1) { HdDestroyPod(esc); done = 2; mq = oq + units; }
     }
     else if (plan == coophold::kLpOld) { psec = h.section; px = h.x; py = h.y; done = (ItShowPutGhostPod(osec, esc, h.x, h.y) == 1) ? 1 : 0; }
+    else if (plan == coophold::kLpMergeOld)
+    {
+        psec = h.section; px = h.x; py = h.y;
+        if (ItShowUnitsPod(osec, oinv, oocc, h.x, h.y, units) == 1) { HdDestroyPod(esc); done = 2; mq = ooq + units; }
+    }
     else if (plan == coophold::kLpFree) { psec = (fsec == tsec) ? r.takerSection : h.section; px = fx; py = fy; done = (ItShowPutGhostPod(fsec, esc, fx, fy) == 1) ? 1 : 0; }
     if (done == 0) plan = coophold::kLpKeep;
     const int where = coophold::LandWhereOf(plan);
-    if (done == 1) HdPublish(hi, 0, psec, px, py, units, r.id);
-    else if (done == 2) HdPublish(hi, 2, psec, px, py, oq + units, r.id);
+    /* T-159: where it went decides which box the publication names - the target box (exact, or a free square there) or its own */
+    const int inTarget = (other != 0 && done != 0 && tsec != 0
+                          && (plan == coophold::kLpPlaceExact || plan == coophold::kLpMergeExact || (plan == coophold::kLpFree && fsec == tsec))) ? 1 : 0;
+    const std::string pkey = (inTarget != 0) ? tkey : std::string(), pid = (inTarget != 0) ? tid : std::string();
+    if (inTarget != 0) ++g_hdW[kHdWLandOtherBox];
+    if (done == 1) HdPublish(hi, 0, psec, px, py, units, r.id, pkey, pid);
+    else if (done == 2) HdPublish(hi, 2, psec, px, py, mq, r.id, pkey, pid);
     if (plan == coophold::kLpPlaceExact) { if (how == coophold::kHowSwap) ++g_hdW[kHdWLandSwapped]; else ++g_hdW[kHdWLandPlaced]; }
     else if (plan == coophold::kLpMergeExact) ++g_hdW[kHdWLandMerged];
     else if (plan == coophold::kLpKeep) ++g_hdW[kHdWLandKept];
     else ++g_hdW[kHdWLandElsewhere];
     cf->ok = 1; cf->quantity = units; cf->landHas = 1; cf->landWhere = where; cf->landX = px; cf->landY = py; HdCfFields(cf, g_hdHoldFe[hi]);
-    HdSay(who + " -> " + (done != 0 ? psec + " " + HdXY(px, py) : std::string("nowhere yet")) + " how=" + HdHowName(how) + " where=" + HdWhereName(where)
-          + (plan == coophold::kLpKeep ? " (no room: the item is KEPT here and placed when room appears - never dropped)" : ""));
+    HdSay(who + " -> " + (inTarget != 0 ? "box '" + tkey + "' " : std::string("")) + (done != 0 ? psec + " " + HdXY(px, py) : std::string("nowhere yet")) + " how=" + HdHowName(how) + " where=" + HdWhereName(where)
+          + (plan == coophold::kLpKeep ? " (no room: the item is KEPT here and placed when room appears - never dropped)" : "")
+        + (plan == coophold::kLpMergeOld ? " (units back onto the stack they came off)" : ""));
     if (done != 0) h = HdHold();
     else { h.parked = 1; h.parkedAt = ::GetTickCount(); }
 }
@@ -18021,11 +18116,11 @@ void HdTick()   /* every drain, before the ring is looked at */
 std::string HdReportTokens()
 {
     std::string s = " cursorHold[holdSent,holdYes,holdGone,holdPolicy,holdReask,landSent,landExact,landElsewhere,landReask,putBackRefused,boxReasked,"
-                    "absorbedTagged,rowsDroppedLinkEdge,unnameable,landBack,landRefused,holdCountDiffers]=";
+                    "absorbedTagged,rowsDroppedLinkEdge,unnameable,landBack,landRefused,holdCountDiffers,landOtherBox,landTargetPulled]=";
     for (int i = 0; i < kHdACount; ++i) s += (i != 0 ? "," : "") + N(g_hdA[i]);
     s += " holdServe[granted,refGone,refWrongItem,refShort,refNotHolder,refPolicy,refBusy,repeatAnswered,landPlaced,landMerged,landSwapped,"
          "landElsewhere,landKept,landNoHold,backSession,backEdge,backTeardown,parkedPlaced,backNotWriter,published,publishFailed,"
-         "holdRecordAnswered,holdLandFirst,backGround,backGroundFault,backNoGround]=";
+         "holdRecordAnswered,holdLandFirst,backGround,backGroundFault,backNoGround,landOtherBox,otherBoxBarred]=";
     for (int i = 0; i < kHdWCount; ++i) s += (i != 0 ? "," : "") + N(g_hdW[i]);
     s += " holdSave[putBack,lifted,keptOut,relostEnded,zoneEnded,offThread,noEnd,zoneKeptOut,zoneGroundFault,endedPublished,endedUnpublished]=";
     for (int i = 0; i < kHdSCount; ++i) s += (i != 0 ? "," : "") + N(g_hdS[i]);
@@ -18597,11 +18692,11 @@ void ItemsTickDrain()
             if (s_mine[k] == 0)
             {
                 /* P105 build 2: units held from a container another game writes - a LAND there, or (another container) back first */
-                if (sp.hdHold != 0 && HdHeldDrop(sp.hdHold, sp.re, cur, 0, hdMergeSplit, 0) != 0) continue;
+                if (sp.hdHold != 0 && HdHeldDrop(sp.hdHold, sp.re, cur, 0, s_box[k], hdMergeSplit, 0) != 0) continue;
                 ++g_heldSplitNotOurs;
                 continue;
             }
-            if (sp.hdHold != 0) HdHeldDrop(sp.hdHold, sp.re, cur, 1, 0, 0);   /* P105 build 2: into this game's own - the units go back onto their stack first, then the TAKE as always */
+            if (sp.hdHold != 0) HdHeldDrop(sp.hdHold, sp.re, cur, 1, s_box[k], 0, 0);   /* P105 build 2: into this game's own - the units go back onto their stack first, then the TAKE as always */
             ++g_heldSplitPaired;
             DebugLog("[ITEMS] held split paired TAKE from uid=" + N((long long)sp.uid) + " "
                      + std::string(sp.re.section) + " " + N((long long)sp.re.x) + "," + N((long long)sp.re.y)
@@ -18660,7 +18755,7 @@ void ItemsTickDrain()
             {
                 const int hdSwap = (stageUsed != 0 && stage.hdHold != 0 && ItSameAddressee(stage.re, cur) != 0 && stage.re.x == cur.x
                                     && stage.re.y == cur.y && std::strcmp(stage.re.section, cur.section) == 0) ? 1 : 0;
-                if (HdHeldDrop(hp.hdHold, hp.re, cur, s_mine[k], hdMergeHeld, hdSwap) != 0) continue;
+                if (HdHeldDrop(hp.hdHold, hp.re, cur, s_mine[k], s_box[k], hdMergeHeld, hdSwap) != 0) continue;
             }
             if (s_mine[k] != hp.mine)
             {
@@ -31480,15 +31575,74 @@ std::string P105CursorBody(const std::string& arg)
     }
     return usage;
 }
+/* T-159 TEST-ONLY: boxmove <fromKey> <section> <fx> <fy> <toKey> [n] - n units (the whole item when omitted or >= its count) from one
+   square of a box into the FIRST FREE square of the same-named section of ANOTHER box, through the engine's own take-out + add, so the
+   drain sees a one-tick move between two boxes. */
+std::string P105BoxMoveCross(const std::vector<std::string>& tok)
+{
+    int fx = 0, fy = 0, n = 0;
+    if (P105Int(tok[2], 0, 999, &fx) == 0 || P105Int(tok[3], 0, 999, &fy) == 0) return "error boxmove: the squares must be whole numbers 0..999";
+    if (tok.size() == 6 && P105Int(tok[5], 1, 100000, &n) == 0) return "error boxmove: n must be a whole number 1..100000";
+    void* b = ItBoxResolve(tok[0].c_str());
+    if (b == 0) return "error boxmove: no loaded box has the key " + tok[0];
+    void* b2 = ItBoxResolve(tok[4].c_str());
+    if (b2 == 0) return "error boxmove: no loaded box has the key " + tok[4];
+    if (b == b2) return "error boxmove: both keys name the same box (use <tx> <ty> for a move inside one box)";
+    ::Inventory* inv = ItBoxInventory(b);
+    ::Inventory* inv2 = ItBoxInventory(b2);
+    if (inv == 0 || inv2 == 0) return "error boxmove: box '" + (inv == 0 ? tok[0] : tok[4]) + "' has no readable inventory";
+    const int v1 = ItBoxMoveVerdict(b, tok[0]), v2 = ItBoxMoveVerdict(b2, tok[4]);
+    ::InventorySection* sec = inv->getSection(tok[1]);
+    ::InventorySection* sec2 = inv2->getSection(tok[1]);
+    if (!ItObj(sec) || !ItObj(sec2)) return "error boxmove: box '" + (!ItObj(sec) ? tok[0] : tok[4]) + "' has no section called '" + tok[1] + "'";
+    if (ItSlotInSectionWhy(sec, fx, fy) != 1) return "error boxmove: " + tok[1] + " has no such square";
+    void* item = 0;
+    if (ItGetAtPod(sec, fx, fy, &item) == 0 || !ItObj(item)) return "error boxmove: nothing at " + tok[1] + " " + N((long long)fx) + "," + N((long long)fy);
+    int q0 = 0;
+    ItIntPod(item, kItemQuantity, &q0);
+    const std::string before = P105ItemDesc(item);
+    int tx = -1, ty = -1;
+    if (ItFirstFreeSlot(sec2, item, &tx, &ty) != 1 || tx < 0) return "error boxmove: box '" + tok[4] + "' has no free square for " + before + " - nothing moved";
+    const int split = (n > 0 && n < q0) ? 1 : 0;
+    void* moved = 0;
+    const int tookCall = ItTakeOutPod(inv, item, split != 0 ? n : -1, &moved);
+    if (tookCall == 0 || !ItObj(moved))
+        return "error boxmove: the engine's take-out " + std::string(tookCall == 0 ? "faulted" : "gave nothing") + " - " + before;
+    const int placed = ItLeverAddAt(sec2, moved, tx, ty);
+    if (placed == -1) { ++g_testLeverAddFaulted; return "error boxmove: the engine's add FAULTED; the item is kept where that left it (" + P105ItemDesc(moved) + ")"; }
+    if (placed != 1)
+    {
+        if (split == 0)
+        {
+            const int back = ItLeverPutBackAt(sec, moved, fx, fy);
+            if (back == 1) ++g_leverPutBack; else ++g_leverLost;
+            return "error boxmove: box '" + tok[4] + "' took nothing at " + N((long long)tx) + "," + N((long long)ty) + "; put back at the source=" + N((long long)back);
+        }
+        int rx = -1, ry = -1, alt = 0;
+        if (ItFirstFreeSlot(sec, moved, &rx, &ry) != 0 && rx >= 0) alt = ItLeverAddAt(sec, moved, rx, ry);
+        if (alt != 1) ++g_leverLost;
+        return "error boxmove: the split-off " + P105ItemDesc(moved) + " was refused by box '" + tok[4] + "'; placed back in the source box at "
+             + N((long long)rx) + "," + N((long long)ry) + " = " + N((long long)alt) + (alt != 1 ? " - LOST (leverLost +1)" : "");
+    }
+    ++g_p105Moves;
+    void* src = 0;
+    ItGetAtPod(sec, fx, fy, &src);
+    return "ok boxmove box '" + tok[0] + "' (verdict " + N((long long)v1) + ") " + tok[1] + " " + N((long long)fx) + "," + N((long long)fy) + " -> box '" + tok[4]
+         + "' (verdict " + N((long long)v2) + ") " + tok[1] + " " + N((long long)tx) + "," + N((long long)ty) + " " + (split != 0 ? "split n=" + N((long long)n) : std::string("whole"))
+         + " before=" + before + " moved=" + P105ItemDesc(moved) + " sourceNow=" + P105ItemDesc(src)
+         + " - the engine's own take-out + add rang (two boxes); the drain sees them this tick";
+}
 std::string P105BoxMoveBody(const std::string& arg)
 {
     const std::vector<std::string> tok = P105Tokens(arg);
-    const std::string usage = "error boxmove usage: boxmove <boxKey> <section> <fx> <fy> <tx> <ty> [n]";
-    if (tok.size() != 6 && tok.size() != 7) return usage;
+    const std::string usage = "error boxmove usage: boxmove <boxKey> <section> <fx> <fy> <tx> <ty> [n] | boxmove <fromKey> <section> <fx> <fy> <toKey> [n]";
+    const int cross = ((tok.size() == 5 || tok.size() == 6) && tok[4].find('@') != std::string::npos) ? 1 : 0;   /* a box key always carries '@' */
+    if (tok.size() != 6 && tok.size() != 7 && cross == 0) return usage;
     if (g_base == 0) return "error boxmove: not installed";
     if (ItOnMainThread() == 0) return "error boxmove: not on the main thread";
     if (StoreTearingDown() != 0) return "error boxmove: the engine is tearing the world down - try again";
     if (ItParityCursorBusy() != 0 || ItHeldLive() != 0) return "error boxmove: something is on the cursor";
+    if (cross != 0) return P105BoxMoveCross(tok);
     int fx = 0, fy = 0, tx = 0, ty = 0, n = 0;
     if (P105Int(tok[2], 0, 999, &fx) == 0 || P105Int(tok[3], 0, 999, &fy) == 0 || P105Int(tok[4], 0, 999, &tx) == 0 || P105Int(tok[5], 0, 999, &ty) == 0)
         return "error boxmove: the squares must be whole numbers 0..999";

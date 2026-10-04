@@ -238,6 +238,18 @@ private:
     long long m_inHand, m_maxDepth, m_jobs, m_failed;
 };
 
+/* THE FINAL SAVE AT QUIT (rule 3): the two files the main loop rewrites whole on its once-a-second tick - the teams' standing
+   records (teams.txt) and the world-relations table (world_relations.txt) - are saved once more when the process is asked to
+   quit, before the write queue drains. They belong to the main loop's thread, so the save runs there: at once when the quit
+   came on that thread (between start-up steps, or at the top of a loop pass); asked of the loop, and waited for, when it came on
+   another thread (the console's quit events, the session-end window, the parent Kenshi's watch); and not at all while the
+   loop has not started (start-up is still loading on that thread and no game has sent anything). */
+enum { kQuitSaveHere = 0, kQuitSaveAskLoop = 1, kQuitSaveNone = 2 };
+inline int QuitSaveRoute(bool onLoopThread, bool loopRunning) { return onLoopThread ? kQuitSaveHere : loopRunning ? kQuitSaveAskLoop : kQuitSaveNone; }
+/* one file is saved at quit when it holds changes not yet on disk - unless it was on disk and unreadable at start, so it is
+   never rewritten this session */
+inline bool QuitSaveFile(bool dirty, bool loadDeferred) { return dirty && !loadDeferred; }
+
 }   /* namespace coopwq */
 
 #endif

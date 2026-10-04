@@ -9,6 +9,8 @@
 // differently yet - this is the map the later milestones (M-D handoff, M-E host entering) act on.
 #pragma once
 #include <string>
+#include <utility>
+#include <vector>
 namespace coop {
 
 struct Sector { int x, y; };
@@ -24,6 +26,9 @@ void ReportZones();
 std::string BuildingsCommand();     // piece 3b lever: buildings in the active zones by owner faction
 std::string TownsCommand();         // P4c lever: every town in the engine's TownList, nearest first (sid, sector, position, held-by-host)
 std::string TownListCommand();      // towns1: every town, one [TOWNS] town line each (name, sid, sector, position)
+// The engine's TownList as (record name, distance on the ground from x,z) - the same guarded reads as `towns`; a town whose row
+// does not read is left out. false = no town list. *faults = the towns left out. MAIN THREAD.
+bool TownDistances(float x, float z, std::vector<std::pair<std::string, float> >* out, unsigned* faults);
 std::string OwnBuildingCommand();   // piece 3b lever: the nearest building becomes my player faction's
 void* NearestBuildingWhere(int (*want)(void*), double* dist, std::string* err, unsigned* seen = 0);   // P18 fold 1: the nearest building `want` accepts (buyhouse nearest)
 // E22c (P6e), MAIN THREAD: every BUILDING in this game's currently active zones, written into the caller's

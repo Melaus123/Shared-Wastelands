@@ -301,6 +301,12 @@ float GameWorld::frameSpeedScale() const
     return a != 0 ? ((Fn)a)(this) : 0.0f;
 }
 
+/* T-573: the 0.0 above for an unbound row is not a speed; PauseSnapshot asks this first. */
+bool GameWorld::frameSpeedScaleBound() const
+{
+    return coop::AddrAbs(kGcWorldFrameSpeed) != 0;
+}
+
 bool GameWorld::isPaused() const
 {
     typedef bool (*Fn)(const void* self);

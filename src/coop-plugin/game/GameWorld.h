@@ -29,6 +29,7 @@ public:
     bool destroy(RootObject* obj, bool justUnloaded, const char* debugInfo);
     const GameHashSet<Character*>::type& activeCharacters() const;
     float frameSpeedScale() const;
+    bool frameSpeedScaleBound() const;   // T-573: false when the frameSpeedScale row is unbound (it then returns 0.0)
     bool isPaused() const;
 
 private:

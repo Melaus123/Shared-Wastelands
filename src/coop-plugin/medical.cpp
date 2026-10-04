@@ -31,6 +31,7 @@
 #include "medical.h"
 #include "combat.h"   // K2: NoteKnockEdgeAnyThread - the knock edge hand-off to the hit hook
 #include "stats.h"   // S1: the stats counters ride the [P014] REPORT line
+#include "resurrect.h"   // T-556: the [FALLEN] REPORT line
 #include "worldsync.h"   // H030: AnnouncedToPeer
 #include "spawn.h"
 #include "net/session.h"
@@ -871,7 +872,8 @@ void ApplyOwnerDeath(unsigned int uid, int dead)
     if (SpawnDeathLookWanted(uid))
     {
         /* T-303 fold 1 (owner decision 223): a copy its SPAWN said dead takes its owner's first APPEARANCE alive, on its built
-           body, before any kill - the STATE route waits too (bounded: 3 s after the body is built, 30 s after the SPAWN). */
+           body, before any kill - the STATE route waits too (bounded: kSpawnDeathLookWaitMs after the body is built, 30 s after
+           the SPAWN). */
         const LONG64 n = InterlockedIncrement64(&g_deathHeldForLook);
         if (n <= 8) DebugLog("[DEATH] uid=" + N(uid) + " the owner says dead - held: its first APPEARANCE is applied alive first"
                              " (T-303 fold 1, decision 223; deathHeldForLook=" + N(n) + ")");
@@ -927,9 +929,13 @@ static volatile LONG64 g_spawnFlagDeadRecv  = 0;   // copy: SPAWNs received sayi
 static volatile LONG64 g_spawnFlagKoRecv    = 0;   // copy: SPAWNs received saying knocked out (T-303 fold 1)
 static volatile LONG64 g_spawnDeadNotYet    = 0;   // copy: arrivals that went pending - caps the 'not dead yet' line (T-303 fold 1)
 static volatile LONG64 g_spawnDeadLookApplied = 0; // copy: ... took its owner's APPEARANCE alive before the kill (decision 223)
-static volatile LONG64 g_spawnDeadNoLook    = 0;   // copy: ... killed without it - none applied within 3 s of a built body, or the apply failed
+static volatile LONG64 g_spawnDeadNoLook    = 0;   // copy: ... killed without it - none applied within kSpawnDeathLookWaitMs of a built body, or the apply failed
+/* How long a SPAWN death waits for the copy's first APPEARANCE: 3 s from the moment its body is first seen built, so it covers
+   the apply only (the knockdown hold's longer bound, kolook.h kFirstLookWaitMs, also covers the build). */
+static const DWORD kSpawnDeathLookWaitMs = 3000;
 /* T-303 fold 1: one pending SPAWN death. look (owner decision 223): 0 = waiting for the owner's first APPEARANCE to be
-   applied to the ALIVE, built copy; 1 = applied; 2 = given up (3 s after the body was first seen built, or the apply failed). */
+   applied to the ALIVE, built copy; 1 = applied; 2 = given up (kSpawnDeathLookWaitMs after the body was first seen
+   built, or the apply failed). */
 struct SpawnDeadEntry
 {
     DWORD at;        // GetTickCount of the SPAWN
@@ -981,7 +987,8 @@ void CopyNoteSpawnFlags(unsigned int uid, unsigned int flags)
 static const char* SpawnDeathWhy(int why)
 {
     return why == 1 ? "no copy loaded" : why == 2 ? "its body is not built yet" : why == 4 ? "declareDead faulted"
-         : why == 5 ? "its first appearance is applied alive first, up to 3 s after its body is built" : "its death was deferred";
+         : why == 5 ? "its first appearance is applied alive first, up to 3 s after its body is built"
+         : "its death was deferred";
 }
 
 // T-303 fold 1 (owner decision 223): true while a copy its SPAWN said dead still waits for its owner's first APPEARANCE - the
@@ -1014,7 +1021,8 @@ void SpawnDeathNoteLookApplied(unsigned int uid, bool ok)
 // touched until CharacterBuilt(c, 0) == 1 - the test the look and clothing applies take (appearance.cpp):
 // CopyRebuildInFlightAny reads a copy with NO appearance object as not busy, so declareDead could otherwise run on a copy
 // with no built body / ragdoll. Owner decision 223: the built, standing copy first takes its owner's APPEARANCE once (the
-// look apply sets e->look), waiting at most 3 s after its body is first seen built (then killed anyway, spawnDeadNoLook).
+// look apply sets e->look), waiting at most kSpawnDeathLookWaitMs after its body is first seen built (then killed
+// anyway, spawnDeadNoLook).
 // Its clothing stays held meanwhile (the owner says dead) and goes through the dead-dress path after the kill.
 static int SpawnDeathTry(unsigned int uid, ::Character* c, SpawnDeadEntry* e, int* whyOut)
 {
@@ -1026,11 +1034,12 @@ static int SpawnDeathTry(unsigned int uid, ::Character* c, SpawnDeadEntry* e, in
     if (!e->built) { e->built = true; e->builtAt = now; }
     if (e->look == 0)
     {
-        if ((DWORD)(now - e->builtAt) < 3000) { *whyOut = 5; return 0; }
+        if ((DWORD)(now - e->builtAt) < kSpawnDeathLookWaitMs) { *whyOut = 5; return 0; }
         e->look = 2;
         const LONG64 n = InterlockedIncrement64(&g_spawnDeadNoLook);
         if (n <= 8)
-            DebugLog("[DEATH] uid=" + N(uid) + " the SPAWN said dead - no APPEARANCE applied within 3 s of its body being built;"
+            DebugLog("[DEATH] uid=" + N(uid) + " the SPAWN said dead - no APPEARANCE applied within "
+                     + N((long long)kSpawnDeathLookWaitMs) + " ms of its body being built;"
                      " killed with the look it has (T-303 fold 1, decision 223; spawnDeadNoLook=" + N(n) + ")");
     }
     if (CopyRebuildInFlightAny(c) != 0) { *whyOut = 3; return 0; }   // the look apply's rebuild: waited here, not counted deferred
@@ -1158,6 +1167,16 @@ void ApplyOwnerDeathRequest(unsigned int uid, const std::string& caller, unsigne
     const LONG64 n = InterlockedIncrement64(&g_deathReqIgnored);
     if (n <= 8 || n % 100 == 0)
         DebugLog("[DEATH] death request uid=" + N(uid) + " caller=" + caller + " from peer " + N(fromPeer) + " IGNORED - " + why + " (#" + N(n) + ")");
+}
+
+// T-556 (resurrect.cpp): how Character::declareDead was reached, from the caller's return address. ANY THREAD.
+// swfallen::kCause*: 1 MedicalSystem's update (its two declareDead call sites), 2 Inventory::deathCheck, 3 Character::unequipItem,
+// 0 anything else (a lever, a script, an unlisted engine path, or the caller rows unbound).
+int DeathCallerCause(unsigned long long ret)
+{
+    if (coopstate::MedicalUpdateDeathCall(ret, g_eventKillBase, kMedUpdateDeathRet1Rva, kMedUpdateDeathRet2Rva)) return 1;
+    const int e = EventKillCause(ret);
+    return e == 1 ? 2 : (e == 2 ? 3 : 0);
 }
 
 // par6 TEST-ONLY lever: `kill <uid>` - the engine's own death steps (MedicalSystem::dead = 1, Character::declareDead) on
@@ -1446,6 +1465,7 @@ void ReportMedical()
        << PoseReportToken();   /* POSE (read-poses) */
     DebugLog(ss.str());
     DebugLog(NameReportLine());   /* names1 */
+    DebugLog(ResurrectReportLine());   /* T-556 */
     DebugLog(SlaveReportLine());   /* slave1 */
     DebugLog(CaptureReportLine());  /* P11 */
     DebugLog(TagsReportLine());   /* tags1 */

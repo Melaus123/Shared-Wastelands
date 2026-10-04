@@ -80,6 +80,8 @@ int UiPauseMenuReshow();
 // (Kenshi_MainMenuPopupPanel) through the engine's own getter and show function - the route the in-game ESC key takes (F537(a):
 // 0x47A0B0 -> 0x9164F0 -> show 0x913250) - no injected input (F010). Refused (logged) at the title screen. true = the menu is open.
 bool UiMenuCommand(const std::string& args);
+bool UiFactionTabCaption(const std::string& name);   // T-368, MAIN THREAD: the FACTION tab's name box shows the name the world gave this game's player faction
+bool UiFactionTabRename(const std::string& name);   // T-368, TEST-ONLY `renamemyfaction tab <name>`: the FACTION tab's name box gets the name and its Enter (the engine's own handler runs)
 // pp1b (review 2026-09-27) - an accepted `uiclick engine:<Suffix>` is QUEUED and fired here, at the TAIL of the pump that ran the
 // command (coop.cpp: after orig_titleUpdate / after orig_mainLoop and TagsTick). The status was written `ok uiclick` first; a
 // click that refuses here (the widget is gone or covered by then) writes `error uiclick`, as quitmenu does.

@@ -17,11 +17,14 @@
 #include "effect.h"   /* T-327: EffectTick, ReportEffect, eatbite */
 #include "medical.h"
 #include "stats.h"   /* S1: StatsTick */
+#include "resurrect.h"   /* T-556: ResurrectTick and the TEST-ONLY `resurrect` lever */
+#include "fallentab.h"   /* T-556: ReportFallenTab */
 #include "store.h"
 #include "ownstore.h"   /* mmo1: ownsave verb, [OWNSAVE] report */
 #include "playerfaction.h"
 #include "tags.h"   /* tags1: `tags on|off|lift <n>` */
 #include "relations.h"
+#include "playerstab.h"   /* T-545: the TEST-ONLY playerstab lever, [PLAYERS] REPORT */
 #include "peace.h"
 #include "towngen.h"
 #include "../common/recruitmult.h"   /* recruit3: the recruitmult values */
@@ -40,6 +43,7 @@ namespace coop { bool GroundFindLastPick(bool target, float* x, float* z, long l
 #include "settings.h"   /* settings1 S1: SettingsTick, settingsdump */
 #include "crime.h"    /* crime3: CrimeTick, ReportCrime */
 #include "doors.h"
+#include "team.h"   /* T-546 step 3: the TEST-ONLY `team` lever */
 #include "worldsync.h"
 #include "soak.h"
 #include "appearance.h"
@@ -244,6 +248,8 @@ void ReportEverything()
     coop::ReportTownGen();
     coop::ReportDoors();   /* E45 */
     coop::ReportRelations();
+    coop::ReportPlayersTab();   /* T-545 */
+    coop::ReportFallenTab();    /* T-556: the FALLEN tab */
     coop::ReportPeace();   /* E42: folded in here rather than behind a verb of its own - F125/F177 */
     coop::ReportCrimeTest();   /* crime11: the lever's counters (P077 removed) */
     coop::ReportCrime();   /* crime3 */
@@ -354,6 +360,7 @@ void CommandChannelTick()
     coop::DoorsTick();       /* E45: publishes the door changes the detours recorded and applies the holder's */
     coop::BuildTick();       /* build1-a: logs the construction events the detours queued (P082) */
     coop::SettingsTick();    /* settings1 S1: [SETTINGS]/[MODS] at the link-up and world-live edges (look only) */
+    coop::TeamTick();        /* T-546: held RESTORE rows answered once the world is loaded; the table asked for after a world teardown */
     coop::CaptureTestTick();   /* P11 (test-only lever): nothing unless `capturetest` armed it */
     coop::WorldSyncTick();   // P033: adopts world characters, throttled; no-op when off
 
@@ -372,6 +379,7 @@ void CommandChannelTick()
     /* S1 (read-stats): the owner's stat values - changed ones, and each character every ~30 s; at most
        kStatsMaxPerTick (16) MSG_STATS per call, 128 owned characters read per call. */
     if (s_stateTicks % 30 == 0) coop::StatsTick();
+    coop::ResurrectTick();   /* T-556: this game's own dead are snapshotted here; a bring-back's look is finished here */
     /* crime3: the owner's crime sampler - a crime lives ~20 game s, so each owned character is read every few ticks
        (128 per call, at most 16 MSG_CRIME a call). */
     if (s_stateTicks % 15 == 7) coop::CrimeTick();
@@ -676,8 +684,19 @@ void CommandChannelTick()
     else if (verb == "relation")   /* P079 (rel2): read-only - one faction's standing with this game's player and with the peer */
     {
         std::string sid, sid2;
-        is >> sid >> sid2;   /* ally1: a second token makes it the pair readout `relation <a> <b>` (@me, @peer or a stringID) */
-        if (sid.empty()) { DebugLog("[cmd] malformed: 'relation' requires a faction stringID"); WriteStatus("error relation missing-sid"); }
+        is >> sid;
+        std::string kind, rest;
+        if (sid == "change") is >> kind;   /* TEST-ONLY `relation change crime|war|peace <faction>`; `relation of <faction>` - a name may hold spaces */
+        if (sid == "change" || sid == "of")
+        {
+            std::getline(is, rest);
+            while (!rest.empty() && (rest[0] == ' ' || rest[0] == '\t')) rest.erase(0, 1);
+            while (!rest.empty() && (rest[rest.size() - 1] == ' ' || rest[rest.size() - 1] == '\r' || rest[rest.size() - 1] == '\n')) rest.erase(rest.size() - 1);
+        }
+        else is >> sid2;   /* ally1: a second token makes it the pair readout `relation <a> <b>` (@me, @peer or a stringID) */
+        if (sid == "change") WriteStatus(coop::RelationChangeLever(kind, rest));
+        else if (sid == "of") WriteStatus(coop::RelationOfProbe(rest));
+        else if (sid.empty()) { DebugLog("[cmd] malformed: 'relation' requires a faction stringID"); WriteStatus("error relation missing-sid"); }
         else if (!sid2.empty()) WriteStatus(coop::RelationPairProbe(sid, sid2));
         else WriteStatus(coop::RelationProbe(sid));
         finished = true;
@@ -687,6 +706,12 @@ void CommandChannelTick()
         std::string mode; is >> mode;
         if (mode != "on" && mode != "off") { WriteStatus("error ally usage"); }
         else WriteStatus(coop::AllySet(mode == "on"));
+        finished = true;
+    }
+    else if (verb == "team")   /* T-546 step 3 TEST-ONLY: team invite <slot> | accept | decline | leave | remove <slot> | disband | show - team.cpp TeamCommand; [TEAM] lines */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::TeamCommand(rest));
         finished = true;
     }
     else if (verb == "worldrel")   /* par24 TEST-ONLY: worldrel [set <a> <b> <value> | test | get <a> <b>] - one world-vs-world standing moved on THIS game (it travels via the notebook) */
@@ -705,6 +730,12 @@ void CommandChannelTick()
     else if (verb == "liveprobe")   /* M6 TEST-ONLY: one LIVE AREA probe for this game's player sector - only the games with that sector loaded or one ring from it receive it */
     {
         WriteStatus(coop::StoreLiveProbe());
+        finished = true;
+    }
+    else if (verb == "playerstab")   /* T-545 TEST-ONLY: playerstab [faction | open | select <slot> | stance ally|neutral|hostile | confirm | cancel] - the PLAYERS tab's own controls, fired as a click */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::PlayersTabCommand(rest));
         finished = true;
     }
     else if (verb == "relate")   /* relate1: relate <target> ally|neutral|hostile - towards another player's stand-in only; `ally on|off` is the alias */
@@ -838,6 +869,23 @@ void CommandChannelTick()
         }
         finished = true;
     }
+    // T-573 TEST-ONLY. `giveup <uid>` (0 = every copy) - mark copies given up as three failed placements would, so a run
+    // can watch a given-up copy wait and be tried again ([M2] catch-up RE-ARMED).
+    else if (verb == "giveup")
+    {
+        unsigned int uid = 0;
+        if (is >> uid)
+        {
+            const int n = coop::ForceCatchupGiveUp(uid);
+            WriteStatus(n > 0 ? "ok giveup" : "error giveup: no copy to mark (unknown uid, or already given up)");
+        }
+        else
+        {
+            ErrorLog("[M2] giveup: expected a uid (0 = every copy) - REFUSED, nothing is marked");
+            WriteStatus("error giveup needs a uid (0 = every copy)");
+        }
+        finished = true;
+    }
     else if (verb == "roster")
     {
         /* P8a: `roster` is unchanged.  `roster full [<page>]` is the per-character listing build/read-roster-t236.md
@@ -908,6 +956,13 @@ void CommandChannelTick()
         }
         finished = true;
     }
+    else if (verb == "worldaway")   /* T-546 step 8 TEST verb: worldaway <seconds 5-600> - this game's world-server link closed here and the
+                                       re-dial held that long, then dialled again as after any outage, its world kept ([STORE] worldaway) */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::StoreWorldAwayLever(Trim(rest)));
+        finished = true;
+    }
     else if (verb == "leave")
     {
         /* mmo4 (e47-mmo-design 4.1): in a co-op world with the profile's own slot known, the writer is drained and that
@@ -954,6 +1009,12 @@ void CommandChannelTick()
         WriteStatus(coop::RangedTestLever(Trim(rest)));
         finished = true;
     }
+    else if (verb == "ffshow")   /* T-546 (owner 512) verb, read only: ffshow <uid1> <uid2> - how two characters stand towards each other ([FF] line) */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::FfShowLever(Trim(rest)));
+        finished = true;
+    }
     else if (verb == "groundline")   /* T-310 TEST verb, read only: groundline <x1> <z1> <x2> <z2> [tolU] | uid <uidFrom> <uidTo> [tolU] | report */
     {
         std::string rest; std::getline(is, rest);
@@ -964,6 +1025,12 @@ void CommandChannelTick()
     {
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::GroundFindLever(Trim(rest)));
+        finished = true;
+    }
+    else if (verb == "resurrect")   /* T-556 TEST-ONLY: resurrect list | resurrect <n> [squad <i>] | resurrect tab ... - resurrect.cpp, fallentab.cpp; [FALLEN] lines */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::ResurrectLever(Trim(rest)));
         finished = true;
     }
     else if (verb == "kill")   /* par6 (parity P6) TEST verb: kill <uid> - the engine's death steps; a copy's gate must refuse it */
@@ -978,6 +1045,23 @@ void CommandChannelTick()
         unsigned int uid = 0;
         if (!(is >> uid) || uid == 0) WriteStatus("error destroybody: usage destroybody <uid>");
         else WriteStatus(coop::DestroyBodyLever(uid));
+        finished = true;
+    }
+    else if (verb == "copysquad")   /* TEST-ONLY verb: copysquad <uid> | nearest - a copy of another game's world character (the one named, or the nearest within 2000 u of this game's first player character) is moved by this game's engine into a new squad of its own faction, numbered by this game (hire.cpp CopySquadLever / CopySquadNearestLever) */
+    {
+        std::string arg; is >> arg;
+        const unsigned int uid = arg.empty() ? 0u : (unsigned int)strtoul(arg.c_str(), 0, 10);
+        if (arg == "nearest") WriteStatus(coop::CopySquadNearestLever());
+        else if (uid == 0) WriteStatus("error copysquad: usage copysquad <uid> | nearest");
+        else WriteStatus(coop::CopySquadLever(uid));
+        finished = true;
+    }
+    else if (verb == "owedtest")   /* TEST-ONLY verb: owedtest aside on|off | show - while on, this game sets aside every building's residents and bar roll it would make, and its town check-up makes none (towngen.cpp OwedLever); show logs the owed rows as this game sees them */
+    {
+        std::string a1, a2; is >> a1 >> a2;
+        if (a1 == "show") WriteStatus(coop::TownGenOwedLever("show"));
+        else if (a1 == "aside" && (a2 == "on" || a2 == "off")) WriteStatus(coop::TownGenOwedLever(a2));
+        else WriteStatus("error owedtest: usage owedtest aside on|off | owedtest show");
         finished = true;
     }
     else if (verb == "bodydown")   /* P10 TEST verb: bodydown <anchorUid> - an owned animal near the anchor knocked out; an animal copy's body rebuilt while down (crash2 proof) */
@@ -1510,7 +1594,8 @@ void CommandChannelTick()
     {
         // boxmove <boxKey> <section> <fx> <fy> <tx> <ty> [n]   - p105h TEST-ONLY lever: n units (the whole item when omitted or >= its
         // count) from one square of a box to a FREE square of the same box, through the engine's own take-out + add, so the drain
-        // sees a one-tick drag inside one container. One [ITEMS] p105 boxmove line (coop::BoxMoveCommand).
+        // sees a one-tick drag inside one container. boxmove <fromKey> <section> <fx> <fy> <toKey> [n] (T-159): the same into the
+        // first free square of that section of ANOTHER box. One [ITEMS] p105 boxmove line (coop::BoxMoveCommand).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BoxMoveCommand(Trim(arg))); finished = true;
     }
@@ -1573,8 +1658,17 @@ void CommandChannelTick()
     }
     else if (verb == "renamemyfaction")
     {
+        // renamemyfaction <name>       - the engine's write on this game's player faction (setName + the record), with no FACTION tab check:
+        //                                 a rename the other games have not heard of yet (the world judges it: T-368 kind 5)
+        // renamemyfaction tab <name>   - TEST-ONLY (T-368): the FACTION tab's name box gets <name> and its Enter - Kenshi's own handler,
+        //                                through the mod's check of the world's faction names (ui.cpp UiFactionTabRename)
         std::string name; std::getline(is, name); size_t s0 = name.find_first_not_of(" \t"); name = (s0 == std::string::npos) ? std::string() : name.substr(s0);
-        WriteStatus(coop::RenameMyFaction(name) ? "ok renamemyfaction" : "error renamemyfaction");
+        if (name.compare(0, 4, "tab ") == 0)
+        {
+            const std::string typed = name.substr(4);
+            WriteStatus(coop::UiFactionTabRename(typed) ? "ok renamemyfaction tab" : "error renamemyfaction tab");
+        }
+        else WriteStatus(coop::RenameMyFaction(name) ? "ok renamemyfaction" : "error renamemyfaction");
         finished = true;
     }
     else if (verb == "boxlist")
@@ -1833,6 +1927,20 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildTestArm(Trim(arg))); finished = true;
     }
+    else if (verb == "standin")
+    {
+        // standin <slot> [read] - TEST-ONLY lever: make (or take into the table) the stand-in for any player number and read it back
+        // (name, placeholder, the loaded buildings it owns); `read` makes nothing.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::StandInCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "buildgive")
+    {
+        // buildgive <key-substring|nearest> <slot> - TEST-ONLY lever: give a loaded building to that player's faction (its stand-in,
+        // made as a placeholder if this game has none).
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BuildGiveCommand(Trim(arg))); finished = true;
+    }
     else if (verb == "buildlist")
     {
         // buildlist - read-only: the build1 registry (position key -> sid, owner, progress) with live values
@@ -1867,6 +1975,13 @@ void CommandChannelTick()
     }
     else if (verb == "buildings") { WriteStatus(coop::BuildingsCommand()); finished = true; }
     else if (verb == "towns") { WriteStatus(coop::TownsCommand()); finished = true; }
+    else if (verb == "pendnote")   /* TEST-ONLY verb (T-580): pendnote add <townSid> <x> <z> | clear | show <townSid> <x> <z> - a test note of a town at a world position in decision 34's pending set (store.cpp StorePendNoteCommand) */
+    {
+        std::string op, town; float x = 0.0f, z = 0.0f; is >> op;
+        if (op != "clear" && !(is >> town >> x >> z)) WriteStatus("error pendnote: add / show need <townSid> <x> <z> (numbers) - nothing added");
+        else WriteStatus(coop::StorePendNoteCommand(op, town, x, z));
+        finished = true;
+    }
     else if (verb == "townlist") { WriteStatus(coop::TownListCommand()); finished = true; }   // towns1: read-only, every town with name and position
     else if (verb == "ownbuilding") { WriteStatus(coop::OwnBuildingCommand()); finished = true; }
     else if (verb == "jobtest")
@@ -1903,6 +2018,14 @@ void CommandChannelTick()
         // own buy callback - the price is taken), or a read of the house's owner, doors and residents. build.cpp BuyHouseCommand.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuyHouseCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "doortest")
+    {
+        // doortest open|close|lock|npclock|show <nearest|last|key> | doortest show held   - T-160 (TEST-ONLY): this game moves one door
+        // the way its own world would (openDoor / closeDoor / the lock button / the NPC lock action), or reads one; doors.cpp
+        // DoorTestCommand. [DOORTEST] lines.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::DoorTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "townrepop")
     {
@@ -2594,6 +2717,12 @@ void CommandChannelTick()
 }
 
 int StoreSaveRequestCode(const void* saveMgr);   /* store.cpp (store.h): SaveManager+0xA0, -1 unreadable */
+/* The engine's pending request (SaveManager+0xA0) as it stands now - the title pump reads it to tell whether a world is on its way. */
+int SaveRequestCodeNow()
+{
+    SaveManager* sm = SaveManager::getSingleton();
+    return sm == 0 ? -1 : StoreSaveRequestCode(sm);
+}
 /* T-201 PP6' fold (item 6): CAN THE LOAD BE POSTED NOW? 1 = yes (SaveManager+0xA0 reads 0); 0 = a request is pending (+0xA0 != 0 -
    readable, the engine returns it to 0 when that request is done, so the caller waits on it: coopui::LoadPostStep); -1 = never on this
    title (no SaveManager, anySavesExist() false, or +0xA0 unreadable - none of which a wait changes). MAIN THREAD, title pump. */

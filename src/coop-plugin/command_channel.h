@@ -32,6 +32,7 @@
 namespace coop {
 // T-201 PP6': SaveManager::load(name) and the request code read back - 1 posted, 0 not posted, -1 not tried (MAIN THREAD).
 int PostLoadChecked(const std::string& saveName);
+int SaveRequestCodeNow();   /* SaveManager+0xA0 now: 0 none, 1 save, 2 load, 3 import, 4 new game; -1 no SaveManager or unreadable (MAIN THREAD) */
 int LoadPostReady();   /* T-201 PP6' fold: 1 a load can be posted now, 0 a request is pending (wait), -1 never on this title */
 
 // Called from the menu pump (TitleScreen::update) on the main thread.

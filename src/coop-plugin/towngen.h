@@ -28,6 +28,11 @@ std::string Towns2Command(const std::string& args);
 /* refill1: the notebook's town_bars rows (store.cpp's drain, MAIN THREAD) - a WELCOME empties the table, TOWN_BAR fills it */
 void RefillTableReset();
 void RefillNoteRows(const std::vector<char>& payload);
+/* T-581: the world server's owed town populations (src/common/owedpop.h) - store.cpp's drain, MAIN THREAD: a WELCOME empties
+   this game's copy of the table, OWED fills and changes it. The TEST-ONLY verb `owedtest aside on|off | show`. */
+void TownGenOwedReset();
+void TownGenOwedArrive(const std::vector<char>& payload);
+std::string TownGenOwedLever(const std::string& arg);
 void ReportTownGen();              // the [TG] report line
 void TownGenTick();                // MAIN THREAD: captures the main thread id on the first tick (review-p4a HIGH-2)
 void TownGenWorldTeardown();

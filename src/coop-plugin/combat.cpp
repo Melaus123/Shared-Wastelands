@@ -34,6 +34,7 @@
 #include "appearance.h"  // T240: AppearanceBodyAttached - is this victim a body the engine can orient?
 #include "net/session.h"
 #include "relations.h"   /* par24: WorldRelSafePointDrain */
+#include "peace.h"   /* T-546 (owner 512): the team pair and its counters, for the ffshow line */
 #include "store.h"   // K2: EngineWritesBlocked - no knock is applied while a world loads or tears down
 #include "speech.h"  // crimetest: CrimeTestDrain runs at this same safe point
 #include "build.h"   /* build1-a: BuildTestDrain runs at this same safe point */
@@ -768,10 +769,9 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
 //   * T-311 (pvp1 'Being attacked keeps the standard automatic combat response'): after the wound the owner also plays
 //     iShotYou's victim-side reactions with the shooter's COPY as the attacker - rememberCharacter 0x673A10 (ST_TEMPORARY_ENEMY,
 //     onPurpose), AI::underRangedAttack 0x998E80 (onPurpose, combat +0x130 clear) and the hit reaction 0x438E50 - see ShotReactOne.
-//     T-311 fold 1: underRangedAttack DOES change faction standing - it calls the relations table's slot +0x28, the 'change
-//     standing by event' setter relations.cpp hooks (decomp_998e80.txt:38). Kept on purpose (manager decision 2026-09-30): it
-//     is what the engine does in single player when shot. On B the pair B-player-faction -> A-faction is B's own
-//     (relations.cpp Owned: mine->peer is mine), so its single owner forwards the change to A once - not doubled.
+//     underRangedAttack calls the victim's faction relations' slot +0x28, the 'change standing by event' setter
+//     (decomp_998e80.txt:38). The victim here is this game's own character, whose faction's relations are the player's
+//     PlayerFactionRelations, and its slot +0x28 is empty (H071): the call moves no standing on the victim's game.
 //     Still not played: iShotYou's own faction-relation calls behind victim +0x5B9 / +0x5BC, 0x8C5AB0 (victim +0x450) and
 //     the "Impact"/"Deflection" sound - T-311 LEFTOVERS.
 // =====================================================================================================================
@@ -2015,9 +2015,118 @@ static void ShotReactWatchTick()
     }
 }
 
+// T-546 (owner 512), READ ONLY: `ffshow <uid1> <uid2>` - how two characters stand towards each other, both directions, on the game it
+// is sent to. Taken at the K2 safe point (worker paused: isEnemyOf can insert a default standing row, F617). For each direction
+// (a towards b): isAllyOf / isEnemyOf (factorInDisguises 1) through a's own vtable +0x3F0 / +0x3E8, i.e. through peace.cpp's
+// detours; the squad memory's marks on b - Character::isTagged 0x677ED0 (a, b, tag) for 4 ST_TEMPORARY_ENEMY and 3 TEMP_ALLY,
+// the test isAllyOf / isEnemyOf make; whether b is in a's CombatClass attacker list (lektor<hand> +0x1F8, the list
+// 0x666390 adds to: count +0x200, elements +0x208, 0x20 bytes each, the hand's five numbers at +8 compared with b's own handle
+// at b +0x60) and in its threats list (lektor<Character*> +0x220); a's combat target (+0x290) and combat mode (+0x130). One [FF]
+// line, with the team pair, peace.cpp's team counters and relations.cpp's skipped standing changes.
+namespace {
+unsigned long long kFfIsTagged = 0; static coop::AddrReg kFfIsTagged_reg("Character_isTagged", &kFfIsTagged);   /* Steam_1.0.65 0x677ED0 */
+typedef char (*FfIsTaggedFn)(::Character*, ::Character*, int);
+typedef char (*FfAnswerFn)(::Character*, ::Character*, char);
+const size_t kFfVtIsAlly = 0x3F0, kFfVtIsEnemy = 0x3E8;
+const size_t kFfAttackers = 0x1F8, kFfThreats = 0x220, kFfLektorCount = 0x8, kFfLektorStuff = 0x10, kFfHandStride = 0x20, kFfHandNumbers = 0x8;
+const size_t kFfCharHandNumbers = 0x60;   /* the character's own hand (+0x58) past its vtable pointer: type, container, containerSerial, index, serial */
+const int kFfTagTemporaryEnemy = 4, kFfTagTemporaryAlly = 3, kFfListCap = 64;
+unsigned int g_ffA = 0, g_ffB = 0;
+bool g_ffDue = false;
+long long g_ffLines = 0;
+/* One direction, a towards b. Each field -1 = unread (a fault, or no combat class / row). 1 read, 0 a fault. */
+struct FfSide { int ally, enemy, tag4, tag3, inAttackers, attackers, inThreats, threats, mode; const void* target; };
+int FfAnswerPod(::Character* a, ::Character* b, size_t slot, int* out)
+{
+    *out = -1;
+    __try { const FfAnswerFn f = *(const FfAnswerFn*)(*(const char* const*)a + slot); *out = f(a, b, 1) != 0 ? 1 : 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int FfTagPod(FfIsTaggedFn f, ::Character* a, ::Character* b, int tag, int* out)
+{
+    *out = -1;
+    if (f == 0) return 0;
+    __try { *out = f(a, b, tag) != 0 ? 1 : 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int FfCombatPod(::Character* a, ::Character* b, FfSide* s)
+{
+    s->inAttackers = s->attackers = s->inThreats = s->threats = s->mode = -1; s->target = 0;
+    __try
+    {
+        const char* body = *(const char* const*)((const char*)a + kRsCharBody);
+        if (!RsPlaus(body)) return 0;
+        const char* cc = *(const char* const*)(body + kRsBodyCombat);
+        if (!RsPlaus(cc)) return 0;
+        s->mode = *(const unsigned char*)(cc + kRsCombatFlag130) != 0 ? 1 : 0;   /* _isInCombatMode 0x4400B0 reads this byte */
+        s->target = *(const void* const*)(cc + kRsCombatTarget);
+        unsigned char bHand[20];
+        std::memcpy(bHand, (const char*)b + kFfCharHandNumbers, 20);
+        const unsigned int na = *(const unsigned int*)(cc + kFfAttackers + kFfLektorCount);
+        const char* ea = *(const char* const*)(cc + kFfAttackers + kFfLektorStuff);
+        s->attackers = (int)na; s->inAttackers = 0;
+        for (unsigned int i = 0; i < na && i < (unsigned int)kFfListCap && RsPlaus(ea); ++i)
+            if (std::memcmp(ea + i * kFfHandStride + kFfHandNumbers, bHand, 20) == 0) { s->inAttackers = 1; break; }
+        const unsigned int nt = *(const unsigned int*)(cc + kFfThreats + kFfLektorCount);
+        const void* const* et = *(const void* const* const*)(cc + kFfThreats + kFfLektorStuff);
+        s->threats = (int)nt; s->inThreats = 0;
+        for (unsigned int i = 0; i < nt && i < (unsigned int)kFfListCap && RsPlaus(et); ++i)
+            if (et[i] == (const void*)b) { s->inThreats = 1; break; }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string FfSideText(::Character* a, ::Character* b, unsigned int ua, unsigned int ub)
+{
+    FfSide s;
+    FfAnswerPod(a, b, kFfVtIsAlly, &s.ally);
+    FfAnswerPod(a, b, kFfVtIsEnemy, &s.enemy);
+    const FfIsTaggedFn tf = kFfIsTagged != 0 ? (FfIsTaggedFn)coop::AddrAbs(kFfIsTagged) : (FfIsTaggedFn)0;
+    FfTagPod(tf, a, b, kFfTagTemporaryEnemy, &s.tag4);
+    FfTagPod(tf, a, b, kFfTagTemporaryAlly, &s.tag3);
+    FfCombatPod(a, b, &s);
+    std::string tgt = "NONE";
+    if (s.target == (const void*)b) tgt = "THE OTHER (uid=" + N3(ub) + ")";
+    else if (s.target != 0) { const unsigned int tu = UidOf((::Character*)s.target); tgt = "OTHER (" + (tu != 0 ? "uid=" + N3(tu) : Ptr(s.target)) + ")"; }
+    return N3(ua) + "->" + N3(ub) + " ally=" + N3(s.ally) + " enemy=" + N3(s.enemy) + " tag4=" + N3(s.tag4) + " tag3=" + N3(s.tag3)
+         + " inAttackers=" + N3(s.inAttackers) + "/" + N3(s.attackers) + " inThreats=" + N3(s.inThreats) + "/" + N3(s.threats)
+         + " combatMode=" + N3(s.mode) + " target=" + tgt;
+}
+void FfShowRun()
+{
+    g_ffDue = false;
+    ::Character* a = FindSpawned(g_ffA);
+    ::Character* b = FindSpawned(g_ffB);
+    if (a == 0 || b == 0)
+    {
+        DebugLog("[FF] ffshow " + N3(g_ffA) + " " + N3(g_ffB) + " -> " + (a == 0 ? "no character uid=" + N3(g_ffA) : "no character uid=" + N3(g_ffB)));
+        return;
+    }
+    ++g_ffLines;
+    DebugLog("[FF] ffshow teamPair=" + N3(coop::PeaceTeamPairOfCharacters((void*)a, (void*)b))
+             + " | " + FfSideText(a, b, g_ffA, g_ffB) + " | " + FfSideText(b, a, g_ffB, g_ffA)
+             + " |" + coop::PeaceTeamTokens() + " teamEventSkipped=" + N3(coop::RelationsTeamEventSkipped())
+             + " isTaggedRow=" + N3(kFfIsTagged != 0 ? 1 : 0)
+             + " (ally/enemy through the hooked isAllyOf/isEnemyOf; tag4 = a temporary-enemy mark, tag3 = a temporary-ally mark; -1 unread)");
+}
+} // namespace (T-546 ffshow)
+
+// MAIN THREAD (the command channel): `ffshow <uid1> <uid2>` - the [FF] line at the next K2 safe point. READ ONLY.
+std::string FfShowLever(const std::string& args)
+{
+    std::istringstream is(args);
+    unsigned int a = 0, b = 0;
+    if (!(is >> a >> b) || a == 0 || b == 0 || a == b) return "error ffshow: usage ffshow <uid1> <uid2> (two different characters)";
+    if (FindSpawned(a) == 0) return "error ffshow: no character uid=" + N3(a);
+    if (FindSpawned(b) == 0) return "error ffshow: no character uid=" + N3(b);
+    g_ffA = a; g_ffB = b; g_ffDue = true;
+    return "ok ffshow " + N3(a) + " " + N3(b) + " (the [FF] line at the next safe point)";
+}
+
 // P104 fix, K2 safe point (MAIN THREAD, worker paused). See combat.h.
 void ShotSafePointDrain()
 {
+    if (g_ffDue && !EngineWritesBlocked()) FfShowRun();   /* T-546: the ffshow readout, worker paused */
     /* T-311 fold 1: the WATCH lines sample here, worker paused - the victim's treatsAsEnemy can insert a default standing row (F617),
        which the ordinary per-frame tick must not do while the worker runs. Not while a world loads or tears down. */
     if (!EngineWritesBlocked()) ShotReactWatchTick();

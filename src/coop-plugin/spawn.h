@@ -11,6 +11,7 @@
 // Global scope: the engine's Character, not a coop:: one. Declaring it inside the
 // namespace would mint a distinct coop::Character that shadows the real type.
 class Character;
+class ActivePlatoon;   // T-556: CreateOwnInSquad
 
 namespace coop {
 
@@ -26,6 +27,13 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
 // `factionName` (empty = the reference's, as `spawn`), the new uid handed back. CreateAt still needs `watchplayer`.
 bool SpawnTemplateNear(const std::string& templateName, unsigned int anchorUid, float dx, float dz,
                        const std::string& factionName, bool keepContainer, unsigned int* uidOut);
+// T-556: a new character of this player's own faction (LocalPlayerFaction, passed to the creation core explicitly) made at
+// `pos` into `squad`, owned here, NOT announced (the caller sends CONTEXT + SPAWN). MAIN THREAD.
+bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut);
+// T-556: a character's current name, cut as MSG_NAME cuts it (false = unreadable / empty); and the engine's setName on a
+// character this game drives (its rename is sent like any other). MAIN THREAD.
+bool NameOf(const void* c, std::string* out);
+bool NameSetOwn(::Character* c, const std::string& name);
 // P11: what `tasks <uid>` prints, handed back - the adopted goal and hasPendingOrders (-1 = unreadable). False = not readable here.
 bool TaskGoalOf(unsigned int uid, std::string* goal, int* hasPendingOrders);
 
@@ -507,6 +515,9 @@ void ReportHealth(unsigned int uid);
 // the ownership guard still accepts the sender; drop a uid that FindSpawned no longer returns.
 // Does nothing while EngineWritesBlocked(). MAIN THREAD, every in-game frame beside AppearanceTick.
 void ProneParkTick();
+// true = this copy's knockdown is held for its looks right now (KnockdownMustWait's record: held, not given up, inside
+// coopkolook::kFirstLookWaitMs). The look and clothing gates let an owner-KO copy's first dress through only then. MAIN THREAD.
+bool CopyKnockdownHeld(unsigned int uid);
 
 // PROBE P011 (DIAGNOSTIC ONLY, F111): sample a character's goal on the main pump and log
 // every CHANGE of goal string / hasPendingOrders for `seconds`. Answers what an accepted order

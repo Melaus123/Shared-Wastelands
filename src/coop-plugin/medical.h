@@ -178,4 +178,7 @@ void ReportKO(unsigned int uid);
 // and not at all the other two. Refuses on any uid we do not own.
 bool WoundPart(unsigned int uid, int part, float stun, float cut);
 
+// T-556: how Character::declareDead was reached, from the caller's return address (swfallen::kCause*). ANY THREAD.
+int DeathCallerCause(unsigned long long ret);
+
 } // namespace coop

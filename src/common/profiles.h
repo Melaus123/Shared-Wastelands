@@ -24,9 +24,21 @@
  *        in-game name. No answer: the notebook writes it into that profile's row (FactionForRow) or refuses it.
  *        T-201 PP6' (owner 175, store protocol 56): kind 4 SAVED | u32 the sender's own profile number | u32 0 (no name) - sent by a
  *        game after its own save of that profile FINISHED. No answer: the notebook marks the row played (SavedDecide).
+ *        T-368 (store protocol 70): kind 3 FACTION is the name the game's world LOADED with; kind 5 RENAME | u32 the sender's own profile
+ *        number | u32 len + the name its player just gave its faction. The notebook judges both against every other profile's faction
+ *        name (FactionDecide) and answers only when it changed the name (FACTION answer below).
+ *        T-368: kind 6 FACTION SEEN | u32 the sender's own profile number | u32 len + the name a FACTION answer gave - the game has that
+ *        answer; the world sends an answer not yet acknowledged again at that profile's next admission.
+ *        A faction name is any text the player could type (up to kRowFactionMax bytes): the wire carries its bytes as they are, and
+ *        profiles.txt keeps it in its field form (FactionFieldFormat - plain, or '#' + hex where plain text would not survive the file).
  *   down (notebook -> game): u8 answers (0 LIST, 1 NEW, 2 DELETE, 3 PICK) | u8 verdict | u32 cap | u32 subject number
  *                            | u32 count (<= kWireRowsMax) | count x {u32 number, i32 slot, u32 created, u32 last played,
  *                              u32 played (56: 1 = a finished save reached the world), u32 len + name, u32 len + faction}
+ *        T-368 (store protocol 70), two more answers, each with its own body (AnswerKindOf reads the first byte):
+ *          4 FACTION: u8 4 | u8 verdict (kFacBack / kFacMoved / kFacDefault) | u32 subject number | u32 len + the name judged
+ *                     | u32 len + the name the profile's faction has now - to the sender of a kind 3 / 5 whose name the world changed
+ *          5 TAKEN:   u8 5 | u8 0 | u32 count (<= kTakenWireMax) | count x {u32 len + faction name} - every OTHER profile's faction
+ *                     name in the world, connected or not: to a game at its admission and to every admitted game at each change
  *
  * Pure: no engine memory, no Windows, no ENet; the offline suite runs the same code. C++03 (VS2010 v100).
  */
@@ -50,14 +62,14 @@ const unsigned kNumMax = 9999;                                /* profile numbers
 const unsigned kWireRowsMax = 64;                             /* active rows in one PROFILES answer (cap <= 16) */
 const size_t   kWireStrMax = 64;
 
-enum Kind { kReqNew = 1, kReqDelete = 2, kReqFaction = 3, kReqSaved = 4 };   /* T-201 PP6' (owner 175): 4 SAVED - a game's own save of its profile finished */   /* names2a: 3 FACTION - a playing game's faction name for its own row */
-enum Answers { kAnsList = 0, kAnsNew = 1, kAnsDelete = 2, kAnsPick = 3 };
+enum Kind { kReqNew = 1, kReqDelete = 2, kReqFaction = 3, kReqSaved = 4, kReqRename = 5, kReqFactionSeen = 6 };   /* T-368: 5 RENAME - the player renamed its faction; 6 FACTION SEEN - the game has a FACTION answer */   /* T-201 PP6' (owner 175): 4 SAVED - a game's own save of its profile finished */   /* names2a: 3 FACTION - a playing game's faction name for its own row */
+enum Answers { kAnsList = 0, kAnsNew = 1, kAnsDelete = 2, kAnsPick = 3, kAnsFaction = 4, kAnsTaken = 5 };   /* T-368: 4 and 5 have their own bodies */
 enum Verdict
 {
     kOk = 0,
     kRefusedCap = 1,        /* NEW at the host's cap */
     kRefusedName = 2,       /* NEW with a name the display-name rule refuses */
-    kRefusedNameTaken = 3,  /* NEW with the name of one of this person's active profiles */
+    kRefusedNameTaken = 3,  /* NEW with the name of an active profile of anyone in this world (NameSame) */
     kRefusedUnknown = 4,    /* PICK / DELETE of a number this person has no active profile under */
     kRefusedInUse = 5,      /* DELETE of the profile being played right now */
     kRefusedNumUsed = 6,    /* NEW asking for a number this person has held before (TEST profile=<n> only) */
@@ -106,10 +118,57 @@ struct Row
     Row() : num(0), slot(-1), created(0), lastPlayed(0), active(1), played(0) {}
 };
 
+/* A ROW'S FACTION FIELD. A faction name is whatever the player typed on Kenshi's FACTION tab (any bytes, 1..24 of them, no space at
+   either end once trimmed - FactionForRow). The field keeps a name that passes the display-name rule as it is (every row written
+   before this form reads unchanged: that rule refuses '#'); any other name - '#', ';', a tab, bytes beyond ASCII - is written as '#'
+   followed by two upper-case hex digits per byte, so profiles.txt holds every name and gives back exactly the name typed. A world folder
+   whose rows may carry the '#' form is at format 2 (swformat::kWorldFolderFormat): a build that knows only format 1 refuses to open or
+   write that folder at all, so it never drops such a row as unreadable and never writes the file without it. */
+inline bool FactionNameFits(const std::string& f)
+{
+    return !f.empty() && f.size() <= coopcfg::kCfgPlayerNameFieldMax && f[0] != ' ' && f[f.size() - 1] != ' ';
+}
+inline std::string FactionFieldFormat(const std::string& f)
+{
+    if (coopworld::DisplayNameOk(f, 0)) return f;
+    static const char hex[] = "0123456789ABCDEF";
+    std::string o("#");
+    for (size_t i = 0; i < f.size(); ++i) { const unsigned char c = (unsigned char)f[i]; o += hex[c >> 4]; o += hex[c & 15]; }
+    return o;
+}
+inline int HexDigitValue(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+/* False = the field is neither a plain name nor a '#' hex form of a name that fits (the row is unreadable). */
+inline bool FactionFieldParse(const std::string& field, std::string* out)
+{
+    if (field.empty() || field[0] != '#')
+    {
+        if (!coopworld::DisplayNameOk(field, 0)) return false;
+        *out = field;
+        return true;
+    }
+    if (field.size() < 3 || (field.size() - 1) % 2 != 0) return false;
+    std::string f;
+    for (size_t i = 1; i + 1 < field.size(); i += 2)
+    {
+        const int hi = HexDigitValue(field[i]), lo = HexDigitValue(field[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        f += (char)(unsigned char)(hi * 16 + lo);
+    }
+    if (!FactionNameFits(f)) return false;
+    *out = f;
+    return true;
+}
+
 inline std::string RowFormat(const Row& r)
 {
     return "prof1\t" + r.person + "\t" + PNum((long long)r.num) + "\t" + PNum((long long)r.slot) + "\t" + PNum(r.created)
-         + "\t" + PNum(r.lastPlayed) + "\t" + (r.active ? "active" : "deleted") + "\t" + r.name + "\t" + r.faction
+         + "\t" + PNum(r.lastPlayed) + "\t" + (r.active ? "active" : "deleted") + "\t" + r.name + "\t" + FactionFieldFormat(r.faction)
          + (r.played ? "\tplayed" : "\tunplayed");   /* T-201 PP6' (owner 175): field 10 */
 }
 inline int RowParse(const std::string& line, Row* out)
@@ -137,14 +196,76 @@ inline int RowParse(const std::string& line, Row* out)
     const int s = std::atoi(f[3].c_str());
     if (s < -1 || s >= coopstore::kSlotLifetimeMax) return 0;
     if (f[6] != "active" && f[6] != "deleted") return 0;
-    if (!coopworld::DisplayNameOk(f[7], 0) || !coopworld::DisplayNameOk(fac, 0)) return 0;
+    std::string facName;
+    if (!coopworld::DisplayNameOk(f[7], 0) || !FactionFieldParse(fac, &facName)) return 0;
     Row r;
     r.person = f[1]; r.num = (unsigned)n; r.slot = s;
     r.created = (long long)std::atof(f[4].c_str()); r.lastPlayed = (long long)std::atof(f[5].c_str());
-    r.active = f[6] == "active" ? 1 : 0; r.name = f[7]; r.faction = fac;
+    r.active = f[6] == "active" ? 1 : 0; r.name = f[7]; r.faction = facName;
     r.played = played >= 0 ? played : (s >= 0 ? 1 : 0);
     *out = r;
     return 1;
+}
+
+/* ---- T-368 (owner 265-270, 472): ONE NAME RULE FOR PLAYER NAMES AND FACTION NAMES IN A WORLD ----
+   Two names are the same name when they match with spaces trimmed from both ends, every run of spaces inside counted as one, and
+   ASCII letters compared without case (every other byte compared as it is): "Anna", "anna" and " Anna " are one name. Player names (a profile's name) and faction names
+   are two separate lists; each is unique among the world's ACTIVE profiles, whoever they belong to and whether or not they are
+   connected. A deleted profile's two names are free again. */
+inline std::string NameKey(const std::string& s)
+{
+    std::string o;
+    bool space = false;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        char c = s[i];
+        if (c == ' ') { space = !o.empty(); continue; }
+        if (space) { o += ' '; space = false; }
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        o += c;
+    }
+    return o;
+}
+inline bool NameSame(const std::string& a, const std::string& b) { return NameKey(a) == NameKey(b); }
+/* Is this player name an active profile's name, anyone's? */
+inline bool PlayerNameTaken(const std::vector<Row>& rows, const std::string& name)
+{
+    for (size_t i = 0; i < rows.size(); ++i) if (rows[i].active && NameSame(rows[i].name, name)) return true;
+    return false;
+}
+/* The first active row other than `except` (-1 = none excepted) whose faction name is this one; -1 = nobody's. */
+inline int FactionHolder(const std::vector<Row>& rows, const std::string& faction, int except)
+{
+    for (size_t i = 0; i < rows.size(); ++i) if ((int)i != except && rows[i].active && NameSame(rows[i].faction, faction)) return (int)i;
+    return -1;
+}
+/* A new player's faction (owner 472): "Nameless <n>", n the lowest number no other active profile's faction name uses. */
+const char* const kEngineFactionDefault = "Nameless";   /* the name Kenshi gives every new game's player faction */
+inline std::string NamelessName(unsigned n) { return std::string(kEngineFactionDefault) + " " + PNum((long long)n); }
+inline std::string NamelessFree(const std::vector<Row>& rows, int except)
+{
+    for (unsigned n = 1; n <= (unsigned)rows.size() + 1; ++n)
+        if (FactionHolder(rows, NamelessName(n), except) < 0) return NamelessName(n);
+    return NamelessName((unsigned)rows.size() + 1);   /* not reached: rows.size() + 1 numbers cannot all be held by fewer rows */
+}
+/* "Nameless <n>" exactly as NamelessName writes it (n from 1, no leading zero). */
+inline bool IsNamelessNumbered(const std::string& f)
+{
+    const std::string base = std::string(kEngineFactionDefault) + " ";
+    if (f.size() <= base.size() || f.compare(0, base.size(), base) != 0 || f[base.size()] == '0') return false;
+    for (size_t i = base.size(); i < f.size(); ++i) if (f[i] < '0' || f[i] > '9') return false;
+    return true;
+}
+/* In a world whose names clashed before this rule, the profile made first keeps the name: is another active row holding this faction
+   name older than row i (made earlier, or made in the same second and listed first)? */
+inline bool FactionHeldEarlier(const std::vector<Row>& rows, const std::string& faction, int i)
+{
+    for (size_t j = 0; j < rows.size(); ++j)
+    {
+        if ((int)j == i || !rows[j].active || !NameSame(rows[j].faction, faction)) continue;
+        if (rows[j].created < rows[(size_t)i].created || (rows[j].created == rows[(size_t)i].created && (int)j < i)) return true;
+    }
+    return false;
 }
 
 /* ---- decisions ---- */
@@ -171,8 +292,7 @@ inline int NewDecide(const std::vector<Row>& rows, const std::string& person, co
 {
     if (!coopworld::DisplayNameOk(name, 0)) return kRefusedName;
     if (CountActive(rows, person) >= cap) return kRefusedCap;
-    for (size_t i = 0; i < rows.size(); ++i)
-        if (rows[i].person == person && rows[i].active && rows[i].name == name) return kRefusedNameTaken;
+    if (PlayerNameTaken(rows, name)) return kRefusedNameTaken;   /* T-368: anyone's active profile, by the world's name rule */
     unsigned n = wantNum;
     if (n == 0) n = NextNum(rows, person);
     else if (FindRow(rows, person, n) >= 0) return kRefusedNumUsed;
@@ -618,7 +738,7 @@ inline int AutoLoadDecide(bool folderFound, bool quickSave, bool neverPlayed)
 inline const char* AutoLoadVerdictName(int v) { return v == kAutoLoadLoad ? "load" : v == kAutoLoadNewGame ? "newgame" : "missing"; }
 /* T-201 PP6' (owner 134 + 141 + 143): THE PROFILE A HOST PRESS PLAYS. mine = this person's ACTIVE profiles in the world; chosenNum /
    chosenNew = what CHANGE -> SELECT (or its NEW PROFILE) left, 0 / "" = nothing chosen. A chosen row still there wins; a chosen new
-   name that one of mine already has (exactly - the world's NewDecide compares case too) plays that one; otherwise the one played last; with
+   name that one of mine already has (NameSame - the world's NewDecide rule) plays that one; otherwise the one played last; with
    none, a new one named after the player (AutoNewName). */
 struct HostProfileChoice { unsigned num; std::string name; int isNew; HostProfileChoice() : num(0), isNew(0) {} };
 inline HostProfileChoice HostProfileChoose(const std::vector<Row>& mine, unsigned chosenNum, const std::string& chosenNew, const std::string& playerName)
@@ -627,7 +747,7 @@ inline HostProfileChoice HostProfileChoose(const std::vector<Row>& mine, unsigne
     for (size_t i = 0; i < mine.size() && chosenNum != 0; ++i)
         if (mine[i].num == chosenNum) { c.num = mine[i].num; c.name = mine[i].name; return c; }
     for (size_t i = 0; i < mine.size() && !chosenNew.empty(); ++i)
-        if (mine[i].name == chosenNew) { c.num = mine[i].num; c.name = mine[i].name; return c; }
+        if (NameSame(mine[i].name, chosenNew)) { c.num = mine[i].num; c.name = mine[i].name; return c; }
     if (!chosenNew.empty()) { c.name = chosenNew; c.isNew = 1; return c; }
     unsigned num = 0;
     if (AutoPickDecide(mine, 0, &num) == kAutoPick)
@@ -649,6 +769,23 @@ inline std::vector<Row> PersonActiveRows(const std::string& fileText, const std:
         if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
         Row r;
         if (RowParse(line, &r) && r.active && r.person == person) out.push_back(r);
+        a = e + 1;
+    }
+    return out;
+}
+/* T-368: every active row of a world's profiles.txt text, anyone's (the host's NEW PROFILE on CHANGE checks the name against them). */
+inline std::vector<Row> ActiveRowsOfFile(const std::string& fileText)
+{
+    std::vector<Row> out;
+    size_t a = 0;
+    while (a < fileText.size())
+    {
+        size_t e = fileText.find('\n', a);
+        if (e == std::string::npos) e = fileText.size();
+        std::string line = fileText.substr(a, e - a);
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        Row r;
+        if (RowParse(line, &r) && r.active) out.push_back(r);
         a = e + 1;
     }
     return out;
@@ -732,7 +869,8 @@ inline std::string FactionCutForRow(const std::string& name)
     return name.substr(0, n);
 }
 /* The row's faction for an in-game name: spaces trimmed from both ends, cut (FactionCutForRow), trailing spaces the cut
-   exposed trimmed again. False = nothing usable (empty, or not plain characters) - the caller keeps the old value. */
+   exposed trimmed again. Any text Kenshi's FACTION tab lets a player type stands (the row's field form holds every byte -
+   FactionFieldFormat). False = nothing left (empty, or only spaces) - the caller keeps the old value. */
 inline bool FactionForRow(const std::string& name, std::string* out)
 {
     size_t b = 0, e = name.size();
@@ -740,23 +878,110 @@ inline bool FactionForRow(const std::string& name, std::string* out)
     while (e > b && name[e - 1] == ' ') --e;
     std::string s = FactionCutForRow(name.substr(b, e - b));
     while (!s.empty() && s[s.size() - 1] == ' ') s.erase(s.size() - 1);
-    if (!coopworld::DisplayNameOk(s, 0)) return false;
+    if (!FactionNameFits(s)) return false;
     *out = s;
     return true;
 }
-enum FactionVerdict { kFacSet = 0, kFacSame = 1, kFacRefusedSender = 2, kFacRefusedUnknown = 3, kFacRefusedName = 4 };
-/* Kind 3 from the connection admitted under senderKey (its slot key; empty = not admitted). Only that profile's own row may be
-   written: the number must name the sender's profile. kFacSet / kFacSame fill *rowOut and *facOut. */
+/* kFacBack / kFacMoved / kFacDefault (T-368): the world gives the profile's faction another name - the row takes *facOut and the sender
+   is told (the FACTION answer). Back = a RENAME to a name another profile holds: the row keeps its name and the game goes back to it;
+   Moved = the world LOADED with a name another profile holds: the row and the game take the lowest free "Nameless <n>"; Default = the
+   world LOADED with Kenshi's own default "Nameless" (owner 471: every player's default faction is its own "Nameless <n>"), whoever the
+   player is, operator included, played or not: the profile's own "Nameless <n>" (its row's, while no other profile holds that, else
+   the lowest free one). Kenshi's plain "Nameless" is therefore never a profile's faction name after a load. */
+enum FactionVerdict { kFacSet = 0, kFacSame = 1, kFacRefusedSender = 2, kFacRefusedUnknown = 3, kFacRefusedName = 4,
+                      kFacBack = 5, kFacMoved = 6, kFacDefault = 7 };
+/* Kind 3 FACTION (rename 0: the name the game's world loaded with) or kind 5 RENAME (rename 1: the name the player just gave) from the
+   connection admitted under senderKey (its slot key; empty = not admitted). Only that profile's own row may be written: the number must
+   name the sender's profile. Every verdict from kFacSet on fills *rowOut and *facOut (the row's faction name after it); kFacSame,
+   kFacBack leave the row as it is. Kenshi's "Nameless" at a load is always kFacDefault (its answer is owed even where the row already
+   holds the number, so the game's faction takes it). Any other name - and "Nameless" TYPED on the FACTION tab (a rename) - is judged
+   by the name rule: a name no other active profile holds is the sender's, and so is its own row's name in another case or spacing; a
+   name another holds is refused (Back) on a rename and replaced (Moved) at a load - except that where two rows already hold one name,
+   the profile made first keeps it (and may re-case it). */
 inline int FactionDecide(const std::vector<Row>& rows, const std::string& senderKey, unsigned num, const std::string& name,
-                         int* rowOut, std::string* facOut)
+                         int* rowOut, std::string* facOut, int rename = 0)
 {
     if (senderKey.empty() || num < 1 || SlotKey(PersonOfKey(senderKey), num) != senderKey) return kFacRefusedSender;
     const int i = FindRow(rows, PersonOfKey(senderKey), num);
     if (i < 0 || !rows[(size_t)i].active) return kFacRefusedUnknown;
     std::string f;
     if (!FactionForRow(name, &f)) return kFacRefusedName;
-    *rowOut = i; *facOut = f;
-    return rows[(size_t)i].faction == f ? kFacSame : kFacSet;
+    const Row& r = rows[(size_t)i];
+    *rowOut = i;
+    if (rename == 0 && f == kEngineFactionDefault)
+    {
+        *facOut = (IsNamelessNumbered(r.faction) && FactionHolder(rows, r.faction, i) < 0) ? r.faction : NamelessFree(rows, i);
+        return kFacDefault;
+    }
+    if (FactionHolder(rows, f, i) < 0 || (NameSame(r.faction, f) && !FactionHeldEarlier(rows, f, i)))
+    {
+        *facOut = f;
+        return r.faction == f ? kFacSame : kFacSet;
+    }
+    if (rename != 0) { *facOut = r.faction; return kFacBack; }
+    *facOut = NamelessFree(rows, i);
+    return kFacMoved;
+}
+/* T-368: every OTHER active profile's faction name - what the game of profile (person, num) may not take. A name this profile holds by
+   right (FactionDecide: its own row's, unless a row made earlier holds it too) is left out even where another row repeats it, so the
+   player can re-case or re-space their own name. */
+inline std::vector<std::string> TakenFactionsFor(const std::vector<Row>& rows, const std::string& person, unsigned num)
+{
+    const int own = FindRow(rows, person, num);
+    const bool ownByRight = own >= 0 && rows[(size_t)own].active && !FactionHeldEarlier(rows, rows[(size_t)own].faction, own);
+    std::vector<std::string> out;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (!rows[i].active || (int)i == own) continue;
+        if (ownByRight && NameSame(rows[i].faction, rows[(size_t)own].faction)) continue;
+        out.push_back(rows[i].faction);
+    }
+    return out;
+}
+/* T-368, the game's side: is this name (as the world's row would keep it - FactionForRow) another profile's faction name? */
+inline bool FactionTakenIn(const std::vector<std::string>& taken, const std::string& name)
+{
+    std::string f;
+    if (!FactionForRow(name, &f)) return false;
+    for (size_t i = 0; i < taken.size(); ++i) if (NameSame(taken[i], f)) return true;
+    return false;
+}
+/* T-368, the game's side: what a FACTION answer does to this game's player faction, whose name is now `current`. Have = the faction
+   carries the answer's name already. Otherwise the answer judged `asked`; when the faction no longer carries that name (the player
+   renamed again, or another world loaded) the answer is old and is dropped - the newer name was sent and the world's judgement of it
+   settles what the world owed (FactionOwedAfter). */
+enum FactionApply { kFacApplyDrop = 0, kFacApplySilent = 1, kFacApplyBackBox = 2, kFacApplyMovedBox = 3, kFacApplyHave = 4 };
+inline int FactionApplyDecide(int verdict, const std::string& current, const std::string& asked, const std::string& to)
+{
+    if (to.empty() || (verdict != kFacBack && verdict != kFacMoved && verdict != kFacDefault)) return kFacApplyDrop;
+    if (to == current) return kFacApplyHave;
+    std::string cur;
+    if (!FactionForRow(current, &cur) || cur != asked) return kFacApplyDrop;
+    if (verdict == kFacBack) return kFacApplyBackBox;
+    if (verdict == kFacMoved) return kFacApplyMovedBox;
+    return current == kEngineFactionDefault ? kFacApplySilent : kFacApplyDrop;
+}
+/* T-368, the game's side: what the game tells the world after a FACTION answer (`how` = FactionApplyDecide). Seen = kind 6, the faction
+   carries the answer's name (applied now, or already). Report = kind 3 of the name the faction kept: the answer could not be applied
+   because a faction record of this game already carries its name, so the world judges the kept name as a load and its row and the game
+   agree again. None = an old answer (dropped), or that same answer was reported back once already - the world sends it again at the
+   profile's next admission instead of the two going back and forth. */
+enum FactionReply { kFacReplyNone = 0, kFacReplySeen = 1, kFacReplyReport = 2 };
+inline int FactionReplyDecide(int how, bool recordTaken, bool reportedBefore)
+{
+    if (how == kFacApplyDrop) return kFacReplyNone;
+    if (how == kFacApplyHave || !recordTaken) return kFacReplySeen;
+    return reportedBefore ? kFacReplyNone : kFacReplyReport;
+}
+/* T-368, the world's side: what a judgement of a kind 3 / 5 does to the FACTION answer still owed to that profile (sent, not yet
+   acknowledged). Clear = the world accepted the game's name (Set / Same), so an older answer is never sent over it; Replace = this
+   judgement's own answer is owed instead; Keep = refused, nothing changed. */
+enum FactionOwed { kFacOwedKeep = 0, kFacOwedClear = 1, kFacOwedReplace = 2 };
+inline int FactionOwedAfter(int verdict)
+{
+    if (verdict == kFacSet || verdict == kFacSame) return kFacOwedClear;
+    if (verdict == kFacBack || verdict == kFacMoved || verdict == kFacDefault) return kFacOwedReplace;
+    return kFacOwedKeep;
 }
 /* T-201 PP6' (owner 175): kind 4 SAVED from the connection admitted under senderKey - only that profile's own row is marked played. */
 enum SavedVerdict { kSavedSet = 0, kSavedSame = 1, kSavedRefusedSender = 2, kSavedRefusedUnknown = 3 };
@@ -775,7 +1000,8 @@ inline const char* FactionVerdictName(int v)
     switch (v)
     {
     case kFacSet: return "set"; case kFacSame: return "same"; case kFacRefusedSender: return "notYourProfile";
-    case kFacRefusedUnknown: return "unknown"; case kFacRefusedName: return "name"; default: return "other";
+    case kFacRefusedUnknown: return "unknown"; case kFacRefusedName: return "name";
+    case kFacBack: return "takenChangedBack"; case kFacMoved: return "takenRenamed"; case kFacDefault: return "default"; default: return "other";
     }
 }
 
@@ -787,7 +1013,7 @@ inline std::string VerdictText(int v, unsigned cap)
     case kOk:               return "done";
     case kRefusedCap:       return "you already have " + PNum((long long)cap) + " profiles in this world, which is the most the host allows - delete one before making a new one";
     case kRefusedName:      return "that profile name cannot be used - use 1 to 24 plain characters";
-    case kRefusedNameTaken: return "you already have a profile with that name in this world";
+    case kRefusedNameTaken: return "that name is already taken in this world";   /* T-368 (owner 270 a) */
     case kRefusedUnknown:   return "that profile is not in this world any more";
     case kRefusedInUse:     return "that profile is being played right now, so it cannot be deleted";
     case kRefusedNumUsed:   return "that profile can't be reused";
@@ -829,7 +1055,7 @@ inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, 
     if (b.empty()) return false;
     size_t at = 1;
     const int k = (unsigned char)b[0];
-    if (k != kReqNew && k != kReqDelete && k != kReqFaction && k != kReqSaved) return false;   /* names2a: kind 3; T-201 PP6': kind 4 */
+    if (k != kReqNew && k != kReqDelete && k != kReqFaction && k != kReqSaved && k != kReqRename && k != kReqFactionSeen) return false;   /* names2a: kind 3; T-201 PP6': kind 4; T-368: kinds 5, 6 */
     if (!WGetU32(b, &at, num) || !WGetStr(b, &at, name) || at != b.size()) return false;
     *kind = k; return true;
 }
@@ -881,6 +1107,44 @@ inline bool DecodeAnswer(const std::vector<char>& b, Answer* a)
         o.hasWorld = true; o.worldIdUpgraded = (fl & 1u) != 0;
     }
     *a = o; return true;
+}
+
+/* T-368: the first byte of a PROFILES answer says which body follows (-1 = empty). */
+inline int AnswerKindOf(const std::vector<char>& b) { return b.empty() ? -1 : (int)(unsigned char)b[0]; }
+const unsigned kTakenWireMax = 4096;   /* faction names in one TAKEN answer: the world's active profiles, far above any real world */
+inline void EncodeTaken(std::vector<char>* b, const std::vector<std::string>& names)
+{
+    b->push_back((char)(unsigned char)kAnsTaken); b->push_back(0);
+    const size_t n = names.size() > kTakenWireMax ? kTakenWireMax : names.size();
+    WPutU32(b, (unsigned)n);
+    for (size_t i = 0; i < n; ++i) WPutStr(b, names[i].substr(0, kWireStrMax));
+}
+inline bool DecodeTaken(const std::vector<char>& b, std::vector<std::string>* names)
+{
+    if (b.size() < 2 || (unsigned char)b[0] != kAnsTaken) return false;
+    size_t at = 2; unsigned n = 0;
+    if (!WGetU32(b, &at, &n) || n > kTakenWireMax) return false;
+    std::vector<std::string> o;
+    for (unsigned i = 0; i < n; ++i) { std::string s; if (!WGetStr(b, &at, &s)) return false; o.push_back(s); }
+    if (at != b.size()) return false;
+    names->swap(o);
+    return true;
+}
+struct FactionAnswer { int verdict; unsigned num; std::string asked, name; FactionAnswer() : verdict(kFacSame), num(0) {} };
+inline void EncodeFactionAnswer(std::vector<char>* b, const FactionAnswer& a)
+{
+    b->push_back((char)(unsigned char)kAnsFaction); b->push_back((char)(unsigned char)a.verdict);
+    WPutU32(b, a.num); WPutStr(b, a.asked.substr(0, kWireStrMax)); WPutStr(b, a.name.substr(0, kWireStrMax));
+}
+inline bool DecodeFactionAnswer(const std::vector<char>& b, FactionAnswer* a)
+{
+    if (b.size() < 2 || (unsigned char)b[0] != kAnsFaction) return false;
+    FactionAnswer o; o.verdict = (unsigned char)b[1];
+    if (o.verdict != kFacBack && o.verdict != kFacMoved && o.verdict != kFacDefault) return false;
+    size_t at = 2;
+    if (!WGetU32(b, &at, &o.num) || !WGetStr(b, &at, &o.asked) || !WGetStr(b, &at, &o.name) || at != b.size()) return false;
+    *a = o;
+    return true;
 }
 
 /* T-490 / owner 429: DOES THE FOLDER A LINK WOULD USE REFUSE IT? The folder is coopworld::WorldDataDirDecide's - the world's own folder

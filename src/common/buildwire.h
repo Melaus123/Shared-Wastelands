@@ -48,6 +48,8 @@ const unsigned char kBuildHelpGone = 9;        /* help1 fold (review MED 3, prot
                                                   handed back less what was already handed back; sent only once the owner's record holding them has landed */
 const unsigned int  kBuildMaxHelpers = 8;      /* help1: helper slots a STATE's confirmation tail carries */
 const unsigned char kBuildHelpTailLive = 0x80;  /* help1 fold 3 (protocol 95): set on a STATE tail's row count - each row carries u32 live after seq */
+const unsigned char kBuildHelpTailWide = 0x40;  /* set on a STATE tail's row count: each row's helper slot is two bytes (little-endian, 0..1023);
+                                                  without it (a pp.build record written before) the slot is one byte */
 const float         kBuildHelpMax = 1.0e6f;    /* help1: a HELP_WORK progress or material delta above this (or below 0) is refused */
 const unsigned char kBuildReasonDismantled = 1;   /* build1-d REMOVE reasons */
 const unsigned char kBuildReasonDestroyed = 2;
@@ -71,7 +73,7 @@ const int kBuildDecodeBadValue = 4;   /* a float that is not finite, complete no
    help1 fold 3 (finding 1): on the wire seq is the LANDED last applied (on the owner's disk) and live the owner's live last applied */
 struct BuildHelpAck
 {
-    unsigned char slot;
+    unsigned short slot;    /* the helper's notebook slot, 0..kBuildOwnerSlotMax */
     unsigned int seq;
     unsigned int live;      /* help1 fold 3: a STATE tail's live last applied (>= seq; 0 in the owner's own rows, which hold the live seq in seq) */
     unsigned char nEx;
@@ -99,7 +101,7 @@ struct BuildMsg
     unsigned char hostForm;         /* build1-e PLACE: kBuildHost* (0 when hostKey is empty) */
     int floor;                      /* build1-e PLACE: createBuilding's floor */
     unsigned char outside;          /* build1-e PLACE: createBuilding's outsideFurniture (0/1) */
-    unsigned char ownerSlot;        /* build1h PLACE (protocol 74): the piece's owner - 0..254 = handed to that slot (a house owner), 0xFF = the sender */
+    unsigned short ownerSlot;       /* PLACE: the piece's owner - 0..kBuildOwnerSlotMax = handed to that player (a house owner), kBuildOwnerSender = the sender; two bytes on the wire */
     unsigned int nonce;             /* house2 fold PLACE (protocol 76): the placer's per-placement nonce, 0 = none (written only when non-zero); help1 fold 3 HELP_WORK / HELP_GONE: the placement the work was done on */
     unsigned int seq;               /* help1 HELP_WORK: the helper's per-piece sequence (> 0); progress = dProgress, nMats / mats = dMat */
     unsigned char reset;            /* help1 HELP_WORK: 1 = the helper's copy was a ruin and the work rebuilt it (the engine's reset) */
@@ -107,7 +109,7 @@ struct BuildMsg
     unsigned char rmFlags;          /* P87 fold 1 REMOVE: kBuildRm* (0 = none); nonce = the placement it ends, hostKey = a furniture tombstone's host */
     std::vector<BuildHelpAck> helpAcks;   /* help1 STATE: the confirmation tail (empty = not written); fold 3: each row landed seq + live */
     float mats[kBuildMaxMats];
-    BuildMsg() : kind(0), complete(0), destroyed(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFF),
+    BuildMsg() : kind(0), complete(0), destroyed(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFFFF),
                  nonce(0), seq(0), reset(0), applied(0), rmFlags(0)
     {
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
@@ -116,7 +118,9 @@ struct BuildMsg
     }
 };
 
-const unsigned char kBuildOwnerSender = 0xFF;   /* build1h: a PLACE's ownerSlot meaning "the sender's own piece" (every PLACE before 74) */
+const unsigned short kBuildOwnerSender = 0xFFFF;   /* a PLACE's ownerSlot meaning "the sender's own piece" */
+const unsigned short kBuildOwnerSlotMax = 1023;   /* the notebook's slots 0..1023 (slotwire.h kSlotMax) */
+const unsigned char kBuildOwnerSenderOneByte = 0xFF;   /* the sender, in a PLACE whose owner number is one byte (pp.build rows and owed-file rows saved by builds that wrote one byte) */
 
 inline bool BuildFloatOk(float v) { return v == v && v > -1.0e30f && v < 1.0e30f; }
 /* review-build1b note 4: (0,0,0,0) or a huge quaternion is refused; an honest builder sends a unit one */
@@ -136,7 +140,7 @@ inline bool BuildHelpAcksOk(const std::vector<BuildHelpAck>& a)
     if (a.size() > kBuildMaxHelpers) return false;
     for (size_t i = 0; i < a.size(); ++i)
     {
-        if ((a[i].seq == 0 && a[i].live == 0) || a[i].nEx > kBuildMaxMats) return false;
+        if ((a[i].seq == 0 && a[i].live == 0) || a[i].nEx > kBuildMaxMats || a[i].slot > kBuildOwnerSlotMax) return false;
         for (size_t j = 0; j < i; ++j) if (a[j].slot == a[i].slot) return false;
         for (unsigned int k = 0; k < a[i].nEx; ++k) if (!BuildFloatOk(a[i].ex[k]) || a[i].ex[k] < 0.0f) return false;
     }
@@ -176,6 +180,7 @@ inline bool BuildEncodable(const BuildMsg& m)
     if (m.hostForm > kBuildHostIndoorsOnly || (m.hostKey.empty() && m.hostForm != 0) || m.outside > 1
         || m.floor < -kBuildMaxFloor || m.floor > kBuildMaxFloor)   /* build1-e */
         return false;
+    if (m.ownerSlot != kBuildOwnerSender && m.ownerSlot > kBuildOwnerSlotMax) return false;
     for (int i = 0; i < 3; ++i) if (!BuildFloatOk(m.pos[i])) return false;
     if (!BuildRotOk(m.rot)) return false;
     return BuildFloatOk(m.progress) && BuildFloatOk(m.needed);
@@ -247,12 +252,12 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
     }
     if (m.kind == kBuildState)
     {
-        size_t tail = 0;   /* help1 (protocol 90): u8 rows | per row u8 slot, u32 seq, u8 n, n x f32 refused (cumulative) - only when rows exist;
-                              help1 fold 3 (protocol 95): the rows byte carries kBuildHelpTailLive and each row u32 live after seq */
+        size_t tail = 0;   /* u8 rows (| kBuildHelpTailLive | kBuildHelpTailWide) | per row u16 slot, u32 seq, u32 live, u8 n, n x f32 refused
+                              (cumulative) - only when rows exist */
         if (!m.helpAcks.empty())
         {
             tail = 1;
-            for (size_t j = 0; j < m.helpAcks.size(); ++j) tail += 1 + 4 + 4 + 1 + 4 * (size_t)m.helpAcks[j].nEx;
+            for (size_t j = 0; j < m.helpAcks.size(); ++j) tail += 2 + 4 + 4 + 1 + 4 * (size_t)m.helpAcks[j].nEx;
         }
         b->resize(at + 1 + 1 + m.key.size() + 4 + 4 + 1 + 1 + 4 * (size_t)m.nMats + tail);
         char* q = &(*b)[at];
@@ -265,12 +270,13 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         for (unsigned int i = 0; i < m.nMats; ++i) BuildPutF(&q, m.mats[i]);
         if (tail != 0)
         {
-            *q++ = (char)(m.helpAcks.size() | kBuildHelpTailLive);   /* help1 fold 3: the rows carry live */
+            *q++ = (char)(m.helpAcks.size() | kBuildHelpTailLive | kBuildHelpTailWide);   /* the rows carry live and a two-byte slot */
             for (size_t j = 0; j < m.helpAcks.size(); ++j)
             {
                 const BuildHelpAck& a = m.helpAcks[j];
                 const unsigned int live = (a.live > a.seq) ? a.live : a.seq;   /* help1 fold 3: never below the landed seq */
-                *q++ = (char)a.slot;
+                *q++ = (char)(a.slot & 0xFF);
+                *q++ = (char)((a.slot >> 8) & 0xFF);
                 std::memcpy(q, &a.seq, 4); q += 4;
                 std::memcpy(q, &live, 4); q += 4;
                 *q++ = (char)a.nEx;
@@ -279,7 +285,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         }
         return true;
     }
-    b->resize(at + 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 1 + (m.nonce != 0 ? 4 : 0));   /* build1h: + the owner-slot byte; house2 fold: + the nonce */
+    b->resize(at + 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 2 + (m.nonce != 0 ? 4 : 0));   /* + the two owner-number bytes; + the nonce */
     char* p = &(*b)[at];
     *p++ = (char)m.kind;
     BuildPutS(&p, m.key);
@@ -293,7 +299,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
     *p++ = (char)m.hostForm;   /* build1-e */
     std::memcpy(p, &m.floor, 4); p += 4;
     *p++ = (char)m.outside;
-    *p++ = (char)m.ownerSlot;   /* build1h (protocol 74) */
+    *p++ = (char)(m.ownerSlot & 0xFF); *p++ = (char)((m.ownerSlot >> 8) & 0xFF);   /* the owner number, little-endian */
     if (m.nonce != 0) { std::memcpy(p, &m.nonce, 4); p += 4; }   /* house2 fold (protocol 76) */
     return true;
 }
@@ -325,7 +331,8 @@ inline void BuildRemoveTail(const char* p, size_t size, size_t off, BuildMsg* m)
     if (BuildGetS(p, size, &off, kBuildMaxKey, &hk) == kBuildDecodeOk) m->hostKey = hk;
 }
 
-inline int DecodeBuild(const char* p, size_t size, BuildMsg* out)
+/* ownerBytes: how many bytes a PLACE's owner number takes - 2 (EncodeBuild, the wire), or 1 (DecodeBuildSaved's older rows) */
+inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int ownerBytes)
 {
     if (p == 0 || size < 1) return kBuildDecodeTooShort;
     BuildMsg m;
@@ -412,13 +419,15 @@ inline int DecodeBuild(const char* p, size_t size, BuildMsg* out)
         {
             const unsigned int h0 = (unsigned char)p[off]; off += 1;
             const int withLive = (h0 & kBuildHelpTailLive) != 0 ? 1 : 0;   /* help1 fold 3 (protocol 95): each row u32 live after seq; without the flag (a pp.build record written before) live = seq */
-            const unsigned int h = h0 & 0x7Fu;
+            const int wide = (h0 & kBuildHelpTailWide) != 0 ? 1 : 0;   /* a two-byte helper slot; without the flag (a pp.build record written before) one byte */
+            const unsigned int h = h0 & 0x3Fu;
             if (h == 0 || h > kBuildMaxHelpers) return kBuildDecodeBadValue;
             for (unsigned int j = 0; j < h; ++j)
             {
-                if (size - off < (size_t)(1 + 4 + (withLive != 0 ? 4 : 0) + 1)) return kBuildDecodeTooShort;
+                if (size - off < (size_t)((wide != 0 ? 2 : 1) + 4 + (withLive != 0 ? 4 : 0) + 1)) return kBuildDecodeTooShort;
                 BuildHelpAck a;
-                a.slot = (unsigned char)p[off]; off += 1;
+                if (wide != 0) { a.slot = (unsigned short)((unsigned char)p[off] | ((unsigned int)(unsigned char)p[off + 1] << 8)); off += 2; }
+                else { a.slot = (unsigned char)p[off]; off += 1; }
                 std::memcpy(&a.seq, p + off, 4); off += 4;
                 if (withLive != 0) { std::memcpy(&a.live, p + off, 4); off += 4; if (a.live < a.seq) return kBuildDecodeBadValue; }   /* help1 fold 3 */
                 else a.live = a.seq;
@@ -448,16 +457,26 @@ inline int DecodeBuild(const char* p, size_t size, BuildMsg* out)
     std::memcpy(&m.needed, p + off, 4); off += 4;
     r = BuildGetS(p, size, &off, kBuildMaxKey, &m.hostKey);
     if (r != kBuildDecodeOk) return r;
-    if (size - off < (size_t)(1 + 4 + 1 + 1)) return kBuildDecodeTooShort;   /* build1-e (protocol 62); build1h: + owner slot (protocol 74) */
+    if (size - off < (size_t)(1 + 4 + 1 + 1)) return kBuildDecodeTooShort;   /* host form, floor, outside, the owner number */
     m.hostForm = (unsigned char)p[off]; off += 1;
     std::memcpy(&m.floor, p + off, 4); off += 4;
     m.outside = (unsigned char)p[off]; off += 1;
-    m.ownerSlot = (unsigned char)p[off]; off += 1;   /* build1h: any value - 0xFF the sender, else the owner's slot */
-    if (size - off >= 4)   /* house2 fold (protocol 76): the per-placement nonce; absent = 0 (an old sender, an old owed-file row) */
+    if (ownerBytes == 2)
+    {
+        if (size - off < 2) return kBuildDecodeTooShort;
+        m.ownerSlot = (unsigned short)((unsigned char)p[off] | ((unsigned short)(unsigned char)p[off + 1] << 8)); off += 2;   /* little-endian */
+        if (m.ownerSlot != kBuildOwnerSender && m.ownerSlot > kBuildOwnerSlotMax) return kBuildDecodeBadValue;
+    }
+    else
+    {
+        const unsigned char o = (unsigned char)p[off]; off += 1;   /* the one-byte owner number: 0xFF the sender, else the slot */
+        m.ownerSlot = (o == kBuildOwnerSenderOneByte) ? kBuildOwnerSender : (unsigned short)o;
+    }
+    if (size - off >= 4)   /* the per-placement nonce; absent = 0 */
     {
         std::memcpy(&m.nonce, p + off, 4); off += 4;
         if (m.nonce == 0) return kBuildDecodeBadValue;   /* one encoding: a zero nonce is never written */
-        if (off != size) return kBuildDecodeBadValue;     /* house2 fold 2: nothing follows the nonce */
+        if (off != size) return kBuildDecodeBadValue;     /* nothing follows the nonce */
     }
     else if (size - off != 0) return kBuildDecodeTooShort;
     if (m.hostForm > kBuildHostIndoorsOnly || (m.hostKey.empty() && m.hostForm != 0) || m.outside > 1
@@ -469,6 +488,16 @@ inline int DecodeBuild(const char* p, size_t size, BuildMsg* out)
     if (!BuildFloatOk(m.progress) || !BuildFloatOk(m.needed)) return kBuildDecodeBadValue;
     if (out) *out = m;
     return kBuildDecodeOk;
+}
+/* a message as it arrives on the wire (and as EncodeBuild writes it): a PLACE's owner number is two bytes */
+inline int DecodeBuild(const char* p, size_t size, BuildMsg* out) { return DecodeBuildLayout(p, size, out, 2); }
+/* a message as this game saved it (pp.build rows, the owed file): EncodeBuild's layout, else - for a PLACE - the layout with a
+   one-byte owner number (0xFF = the sender) that rows saved by earlier builds carry */
+inline int DecodeBuildSaved(const char* p, size_t size, BuildMsg* out)
+{
+    const int r = DecodeBuildLayout(p, size, out, 2);
+    if (r == kBuildDecodeOk || p == 0 || size < 1 || (unsigned char)p[0] != kBuildPlace) return r;
+    return DecodeBuildLayout(p, size, out, 1) == kBuildDecodeOk ? kBuildDecodeOk : r;
 }
 
 /* house2: the order gate (0x7F9280) and the Shift-job gate (0x7F4EF0) share one rule - on a piece this game handed to another
@@ -515,7 +544,7 @@ inline int BuildCommitOrderKept(int handedInCommit, int gateInstalled) { return 
    when the very placement it names was removed here: its (key, nonce) is on the removed list (exactListed). A new placement at the same
    spot draws a new nonce and is accepted. A PLACE with no nonce (an old sender, an old owed-file row) keeps the key-only rule
    (keyListed = the key is on the list with any nonce). An ordinary PLACE after a REMOVE stays a new piece at the same spot (build1-d). */
-inline bool BuildLatePlaceRefused(unsigned char ownerSlot, unsigned int nonce, int exactListed, int keyListed)
+inline bool BuildLatePlaceRefused(unsigned short ownerSlot, unsigned int nonce, int exactListed, int keyListed)
 {
     if (ownerSlot == kBuildOwnerSender) return false;
     return (nonce != 0) ? (exactListed != 0) : (keyListed != 0);
@@ -533,7 +562,7 @@ inline int BuildOwedMergeRow(std::map<std::string, Row>* mem, const std::set<std
 }
 /* house2 fold 2 (recheck-house2): a row the load scan rebuilt has no nonce (0); a hand-over PLACE re-sent for it carrying a nonce gives
    the row that nonce, so a later removal lists the real (key, nonce). A row that has a nonce keeps it. */
-inline unsigned int BuildAdoptNonce(unsigned int rowNonce, unsigned char ownerSlot, unsigned int placeNonce)
+inline unsigned int BuildAdoptNonce(unsigned int rowNonce, unsigned short ownerSlot, unsigned int placeNonce)
 {
     return (rowNonce == 0 && ownerSlot != kBuildOwnerSender && placeNonce != 0) ? placeNonce : rowNonce;
 }
@@ -914,7 +943,7 @@ inline void BuildHelpSum(const std::vector<BuildHelpEntry>& owed, float* dP, int
     }
 }
 /* the owner's confirmation row for a slot; create != 0 adds it (0 when the tail is full) */
-inline BuildHelpAck* BuildHelpAckFor(std::vector<BuildHelpAck>* acks, unsigned char slot, int create)
+inline BuildHelpAck* BuildHelpAckFor(std::vector<BuildHelpAck>* acks, unsigned short slot, int create)
 {
     for (size_t i = 0; i < acks->size(); ++i) if ((*acks)[i].slot == slot) return &(*acks)[i];
     if (create == 0 || acks->size() >= kBuildMaxHelpers) return 0;
@@ -1046,7 +1075,7 @@ inline bool BuildTombRowOf(const std::string& rowKey, const std::string& key)
    faction at load). Row key "~c" + 8 hex FNV-1a of the key + ':' + the key's first bytes (<= kBuildMaxKey), as the "~t" tombstone row -
    never a "~t" / "~g" row, never a bare key. Row layout version 1 (kBuildCopyRowVersion): the PLACE bytes are a PLACE of the WHOLE key -
    sid, the PLACE's pose, the placement nonce, host / form / floor / outside for furniture - whose ownerSlot is the copy OWNER's slot
-   (0..254; an own row's PLACE carries 0xFF), the STATE bytes an empty STATE of the key. A later layout takes a new row-key letter; a row
+   (0..kBuildOwnerSlotMax; an own row's PLACE carries kBuildOwnerSender), the STATE bytes an empty STATE of the key. A later layout takes a new row-key letter; a row
    that does not read as this layout is refused (counted, left in the record). */
 const int kBuildCopyRowVersion = 1;
 /* P87 rf1: THE LIST'S CEILING. pp.build's codec caps each row (ownrec.h kBuildRecMaxBytes, 4096 per PLACE / STATE; DecodeBuildRec's
@@ -1065,7 +1094,7 @@ const int kBuildCopyEmptyLoads = 3;
 struct BuildCopyRec
 {
     std::string key, sid, hostKey;
-    int slot;                /* the owner's slot, 0..254 */
+    int slot;                /* the owner's slot, 0..kBuildOwnerSlotMax */
     unsigned int nonce;      /* the placement's nonce, 0 = none */
     float pos[3];
     float rot[4];
@@ -1121,15 +1150,15 @@ inline bool BuildCopyRecSame(const BuildCopyRec& a, const BuildCopyRec& b)
     for (int i = 0; i < 4; ++i) if (a.rot[i] != b.rot[i]) return false;
     return true;
 }
-/* false (nothing usable) when the entry cannot be a v1 row: no key / sid, a slot outside 0..254, or a PLACE / STATE not encodable */
+/* false (nothing usable) when the entry cannot be a v1 row: no key / sid, a slot outside 0..kBuildOwnerSlotMax, or a PLACE / STATE not encodable */
 inline bool BuildCopyRowMake(const BuildCopyRec& c, std::string* rowKey, std::vector<char>* place, std::vector<char>* state)
 {
-    if (c.key.empty() || c.key.size() > kBuildMaxKey || c.sid.empty() || c.slot < 0 || c.slot > 254) return false;
+    if (c.key.empty() || c.key.size() > kBuildMaxKey || c.sid.empty() || c.slot < 0 || c.slot > (int)kBuildOwnerSlotMax) return false;
     BuildMsg m;
     m.kind = kBuildPlace; m.key = c.key; m.sid = c.sid;
     for (int i = 0; i < 3; ++i) m.pos[i] = c.pos[i];
     for (int i = 0; i < 4; ++i) m.rot[i] = c.rot[i];
-    m.complete = 0; m.ownerSlot = (unsigned char)c.slot; m.nonce = c.nonce;
+    m.complete = 0; m.ownerSlot = (unsigned short)c.slot; m.nonce = c.nonce;
     if (!c.hostKey.empty()) { m.hostKey = c.hostKey; m.hostForm = c.hostForm; m.floor = c.floor; m.outside = c.outside; }
     BuildMsg st;
     st.kind = kBuildState; st.key = c.key;
@@ -1146,7 +1175,7 @@ inline bool BuildCopyRowRead(const std::string& rowKey, const std::string& place
 {
     if (!BuildCopyRowIs(rowKey) || place.empty() || state.empty()) return false;
     BuildMsg m, st;
-    if (DecodeBuild(place.data(), place.size(), &m) != kBuildDecodeOk || m.kind != kBuildPlace) return false;
+    if (DecodeBuildSaved(place.data(), place.size(), &m) != kBuildDecodeOk || m.kind != kBuildPlace) return false;
     if (!BuildCopyRowOf(rowKey, m.key) || m.ownerSlot == kBuildOwnerSender || m.sid.empty()) return false;
     if (DecodeBuild(state.data(), state.size(), &st) != kBuildDecodeOk || st.kind != kBuildState || st.key != m.key) return false;
     BuildCopyRec c;

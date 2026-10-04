@@ -12,7 +12,12 @@
 #include "policy.h"      // E36 / decision 40: PROBE P028 and the pointer the OwnedByAPlayerFaction hook compares against
 #include "net/session.h"  // SessionLinked, SendRelSync
 #include "store.h"        /* stand1: StoreMySlot / StoreLastKnownSlot - my slot for the wire */
+#include "config.h"       /* RoleIsSingle */
 #include "../common/slotwire.h"   /* stand1: coop-p<n>, @slot:<n> */
+#include "../common/profiles.h"   /* T-368: FactionApplyDecide, kEngineFactionDefault */
+#include "../common/panelstatus.h"   /* T-368: the Faction Name boxes' approved words */
+#include "hooks.h"        /* T-368: coop::AddHook */
+#include "ui.h"           /* T-368: UiFactionTabCaption */
 #include "worldsync.h"    /* stand1 fold (1d): WorldSyncReannounceAll */
 #include "tags.h"         // tags1: a peer-faction rename re-captions the name labels
 #include "coop_log.h"
@@ -52,6 +57,7 @@ template <class T> std::string S(const T& v) { std::ostringstream o; o << v; ret
 ::Faction* CreatePeer(int slot, const std::string& name);
 void RenamePeer(int idx, const std::string& name);
 bool NameTaken(const std::string& name, ::Faction* except);
+void AskClashNamesAgain();
 bool Plaus(const void* p) { return p != 0 && (uintptr_t)p > 0x10000 && (uintptr_t)p < 0x00007FFFFFFFFFFFull; }
 // the module's own copy, as every module keeps one (identity.cpp's rule): the object and its vtable pointer both readable
 bool PlausibleObject(const void* p)
@@ -145,7 +151,12 @@ std::string StandInsText()
         if (g_si[i].f != 0) { t += (n++ ? " " : "") + std::string("p") + S(g_si[i].slot) + "='" + g_si[i].name + "'@" + S((const void*)g_si[i].f); }
     return n ? "[" + t + "]" : std::string("none");
 }
-/* a stand-in's name when another faction record may carry the one wanted (coopslot::StandInClashName) - create and rename alike */
+/* a stand-in's name when another faction may carry the one wanted (coopslot::StandInClashName; NameTaken judges current names) -
+   create and rename alike.
+   The world keeps faction names unique (T-368), so " (peer)" shows only where this game's records still disagree with the world: a
+   world whose names clashed before the rule (until the later player's next load renames it), a stand-in this save carries under a name
+   the world has since given another player (a deleted profile's, or a rename made while this game was away), or a player faction named
+   like one of Kenshi's own factions. */
 std::string ClashFreeName(const std::string& want, int slot, ::Faction* except)
 {
     const bool wt = NameTaken(want, except);
@@ -195,35 +206,131 @@ std::string ClashFreeName(const std::string& want, int slot, ::Faction* except)
              + " relations setup: " + (rs == 1 ? "phase1 ok" : rs == 0 ? "NO relations object" : "phase1 FAULTED"));
     return f;
 }
-// review-p3h H2: the hazard is the record index (GameDataContainer::renameRecord), so the check is against RECORDS, not live factions
+/* The faction record that holds `name` here, `except` (and its record) never counting: a live faction carrying the name now (its
+   record), else the record Kenshi's record index names while it and its live faction still carry the name (coopslot::FactionNameHeld -
+   the index keeps every old name, and the FACTION tab renames a faction without its record). The live factions are the faction
+   directory's array, compared by current name as FactionDirectory::findFactionByName compares. 0 = no faction holds it; *held says
+   whether one does (a live holder whose record is unreadable still holds the name). MAIN THREAD. */
+::GameData* NameHolder(const std::string& name, ::Faction* except, bool* held)
+{
+    *held = false;
+    if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    void* ex = 0; if (except != 0) ReadFactionDataPod(except, &ex);
+    ::GameData* gd = coop::GameWorldPtr()->gamedata.findRecordByName(name, FACTION);
+    const bool indexHit = PlausibleObject(gd) && (void*)gd != ex;
+    bool liveHit = false, indexHasLive = false;
+    ::GameData* liveRec = 0;
+    std::string indexLiveName;
+    void** arr = 0; unsigned n = 0;
+    if (ReadFactionArrayPod(&arr, &n) == 1 && Plaus(arr) && n <= 4096)
+        for (unsigned i = 0; i < n; ++i)
+        {
+            ::Faction* f = (::Faction*)arr[i];
+            if (f == 0 || f == except || !PlausibleObject(f)) continue;
+            void* d = 0; ReadFactionDataPod(f, &d);
+            if (d != 0 && d == ex) continue;
+            const std::string& fn = f->getName();
+            if (indexHit && d == (void*)gd) { indexHasLive = true; indexLiveName = fn; }
+            if (!liveHit && fn == name) { liveHit = true; liveRec = PlausibleObject(d) ? (::GameData*)d : 0; }
+        }
+    *held = coopslot::FactionNameHeld(name, liveHit, indexHit, indexHit ? gd->name : std::string(), indexHasLive, indexLiveName);
+    if (!*held) return 0;
+    return liveHit ? liveRec : gd;
+}
 bool NameTaken(const std::string& name, ::Faction* except)
 {
-    if (!Plaus(coop::GameWorldPtr())) return false;
-    ::GameData* gd = coop::GameWorldPtr()->gamedata.findRecordByName(name, FACTION);
-    if (!PlausibleObject(gd)) return false;
-    if (except != 0) { void* d = 0; ReadFactionDataPod(except, &d); if (d == (void*)gd) return false; }
-    return true;
+    bool held = false;
+    NameHolder(name, except, &held);
+    return held;
 }
-void RenamePeer(int idx, const std::string& want)
+/* one stand-in takes the name wanted, or its clash name; true = its name changed */
+bool RenamePeerOnce(int idx, const std::string& want)
 {
-    if (idx < 0 || idx >= kMaxStandIns || g_si[idx].f == 0) return;
+    if (idx < 0 || idx >= kMaxStandIns || g_si[idx].f == 0) return false;
     StandIn& s = g_si[idx];
     s.asked = want;   /* ResolveStandIn asks again only when the wanted name changes */
     /* a name another faction record carries is resolved by the create path's rule, never refused: two players may pick one name, and
        a placeholder stand-in must still take its player's name */
     const std::string name = ClashFreeName(want, s.slot, s.f);
-    if (name == s.name) return;
+    if (name == s.name) return false;
     const std::string before = s.name;
     s.f->setName(name);
     if (PlausibleObject(s.gd)) coop::GameWorldPtr()->gamedata.renameRecord(s.gd, name);
     s.name = name; ++g_renamed; if (name != want) ++g_clashRenamed;
     coop::TagsCaptionsDirty();   /* the name tags show this faction name */
     DebugLog("[PF] peer faction renamed (slot " + S(s.slot) + ") '" + before + "' -> '" + name + "'"
-             + (name != want ? " ('" + want + "' is another faction record's name)" : std::string()) + " (getName now '" + s.f->getName() + "')");
+             + (name != want ? " ('" + want + "' is another faction's name here)" : std::string()) + " (getName now '" + s.f->getName() + "')");
+    return true;
+}
+/* every stand-in under a clash name asks for its player's name again (a faction name changed here, so it may be free now); a stand-in
+   taking its name back frees its clash name for another, so the pass repeats until no name changes (bounded by the table's size).
+   MAIN THREAD. */
+void AskClashNamesAgain()
+{
+    for (int pass = 0; pass <= kMaxStandIns; ++pass)
+    {
+        bool changed = false;
+        for (int i = 0; i < kMaxStandIns; ++i)
+        {
+            if (g_si[i].f == 0 || !coopslot::StandInAsksAgain(g_si[i].name, g_si[i].asked)) continue;
+            const std::string want(g_si[i].asked);
+            if (RenamePeerOnce(i, want)) changed = true;
+        }
+        if (!changed) return;
+    }
+}
+/* a stand-in takes the name wanted (or its clash name); a name it leaves may be the one another stand-in is waiting for */
+void RenamePeer(int idx, const std::string& want)
+{
+    if (RenamePeerOnce(idx, want)) AskClashNamesAgain();
 }
 // Named after that player's own faction; if that collides with OUR player faction's name (both "Nameless" by default) it is
 // suffixed - name lookups elsewhere in this plugin must never land on the wrong player. The name is re-applied on every
 // resolve, so a player renaming their faction mid-session is followed (the relations snapshot sent on a rename carries it too).
+/* T-368: THE NAME WRITE THE FACTION TAB MAKES (decomp_491940: PlayerInterface+8 and the player faction's own name, Faction+0x1A8), plus
+   the faction's record name (renameRecord - the record index). PlayerInterface+8 is a std::string the tab compares a typed name with and
+   puts back after a refusal; it is written only while it mirrors the faction's name. MAIN THREAD. */
+static unsigned long long kPfPlayerIfaceRva = 0; static coop::AddrReg kPfPlayerIfaceRva_reg("PlayerInterfaceGlobal", &kPfPlayerIfaceRva);   /* Steam_1.0.65 0x2133630 (var): PlayerInterface* */
+int PlayerIfaceNamePod(std::string** out)
+{
+    const unsigned long long g = coop::AddrAbs(kPfPlayerIfaceRva);
+    if (g == 0) return 0;
+    __try
+    {
+        char* pi = *(char**)g;
+        if (!Plaus(pi)) return 0;
+        const size_t len = *(const size_t*)(pi + 0x18), res = *(const size_t*)(pi + 0x20);
+        if (len > res || res > 0x10000) return 0;
+        *out = (std::string*)(pi + 8);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void WriteMyFactionName(::Faction* mine, const std::string& name)
+{
+    const std::string before = mine->getName();
+    std::string* pin = 0;
+    const int pr = PlayerIfaceNamePod(&pin);
+    const bool mirror = pr == 1 && pin != 0 && *pin == before;
+    mine->setName(name);
+    void* d = 0; ReadFactionDataPod(mine, &d);
+    if (PlausibleObject(d)) coop::GameWorldPtr()->gamedata.renameRecord((::GameData*)d, name);
+    if (mirror) pin->assign(name);
+    else DebugLog("[PF] PlayerInterface's copy of the faction name was not written (" + std::string(pr != 1 ? "unreadable" : "it does not read '" + before + "'") + ")");
+    AskClashNamesAgain();   /* the name my faction left may be the one a stand-in is waiting for */
+}
+/* The FACTION tab renames my faction (Faction+0x1A8) but not its record (decomp_491940): the record takes the faction's name, so a record
+   and its faction carry one name. MAIN THREAD. */
+void MyRecordFollowsName(::Faction* mine, const std::string& now)
+{
+    void* d = 0; ReadFactionDataPod(mine, &d);
+    if (!PlausibleObject(d)) return;
+    ::GameData* gd = (::GameData*)d;
+    if (gd->name == now) return;
+    const std::string was = gd->name;
+    coop::GameWorldPtr()->gamedata.renameRecord(gd, now);
+    DebugLog("[PF] my faction's record follows its name: '" + was + "' -> '" + gd->name + "'");
+}
 ::Faction* ResolveStandIn(int slot, const std::string& raw)
 {
     std::string name(raw);
@@ -303,6 +410,11 @@ int StandInList(int* slots, ::Faction** out, int cap)   /* T-356: crime's sight 
         if (g_si[i].f != 0 && PlausibleObject(g_si[i].f)) { slots[n] = g_si[i].slot; out[n] = g_si[i].f; ++n; }
     return n;
 }
+bool LegacyPeerFactionExists()
+{
+    if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return false;
+    return PlausibleObject(coop::GameWorldPtr()->factionDirectory->findFactionById(std::string(coopslot::kLegacyPeerId)));
+}
 bool StandInExistsForSlot(int slot)
 {
     if (slot < 0) return false;
@@ -331,6 +443,39 @@ int MakeAreaWriterStandIn(int slot, std::string* detail)
     g_si[i].placeholder = true; ++g_placeholderMade;
     if (detail) *detail = "'" + g_si[i].name + "' " + S((const void*)f);
     return 1;
+}
+/* THE player number -> this game's faction lookup (pure half: coopslot::OwnerSlotOfId / OwnerIdForSlot). MAIN THREAD. My number ->
+   my player faction; another -> its stand-in in the table. makePlaceholder (engine writes allowed): a coop-p<slot> record the loaded
+   world carries enters the table under its own name, else a placeholder is made through MakeAreaWriterStandIn (the one placeholder
+   road) - only on the number THIS link's world server gave, and never in a lone game. 0 = none. */
+::Faction* OwnerFactionForSlot(int slot, bool makePlaceholder)
+{
+    if (slot < 0 || slot > coopslot::kSlotMax) return 0;
+    if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    const int me = MySlotForWire();
+    if (me >= 0 && slot == me) return LocalPlayerFactionImpl();
+    ::Faction* f = StandInForSlot(slot);
+    if (f != 0 || !makePlaceholder) return f;
+    if (coop::StoreMySlot() < 0 || RoleIsSingle()) return 0;
+    ::Faction* saved = coop::GameWorldPtr()->factionDirectory->findFactionById(coopslot::StandInId(slot));
+    if (PlausibleObject(saved))
+    {
+        const std::string savedName = saved->getName();
+        f = CreatePeer(slot, savedName);   /* the reuse branch: the save's coop-p<slot> enters the table under its own name */
+        const int i = FindStandIn(slot);
+        if (f != 0 && i >= 0 && savedName == coopslot::PlaceholderName(slot)) g_si[i].placeholder = true;   /* a placeholder a save kept */
+        return f;
+    }
+    std::string detail;
+    if (MakeAreaWriterStandIn(slot, &detail) < 0) { DebugLog("[PF] no placeholder stand-in for player " + S(slot) + ": " + detail); return 0; }
+    return StandInForSlot(slot);
+}
+int StandInIsPlaceholder(int slot) { const int i = FindStandIn(slot); return i < 0 ? -1 : (g_si[i].placeholder ? 1 : 0); }
+::Faction* StandInRecordFaction(int slot)
+{
+    if (slot < 0 || slot > coopslot::kSlotMax || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    ::Faction* f = coop::GameWorldPtr()->factionDirectory->findFactionById(coopslot::StandInId(slot));
+    return PlausibleObject(f) ? f : 0;
 }
 std::string StandInDisplayName(::Faction* f) { const int i = FindStandInPtr(f); return i >= 0 ? g_si[i].name : std::string(); }
 ::Faction* LocalPlayerFaction() { return LocalPlayerFactionImpl(); }
@@ -416,18 +561,173 @@ bool RenameMyFaction(const std::string& name)
     if (mine == 0 || name.empty()) return false;
     if (NameTaken(name, mine)) { ErrorLog("[PF] rename refused: a faction record named '" + name + "' already exists"); return false; }   // review-p3a S7 / p3h H2
     const std::string before = mine->getName();
-    mine->setName(name);   // the tick's name check sends the snapshot (one path for the verb and the game's own UI)
-    void* d = 0; ReadFactionDataPod(mine, &d);
-    if (PlausibleObject(d)) coop::GameWorldPtr()->gamedata.renameRecord((::GameData*)d, name);
+    WriteMyFactionName(mine, name);   // the tick's name check sends the snapshot (one path for the verb and the game's own UI)
     DebugLog("[PF] my player faction renamed '" + before + "' -> '" + name + "' (getName now '" + mine->getName() + "')");
     ++g_renameVerb;        // review-p3s M1: the verb's renames are counted apart from the game's own
     PlayerFactionTick();   // the same state check the tick runs: sends the snapshot now
     return true;
 }
 
-/* names2a (investigations/names2-design.md Q3): my faction's name owed to my notebook profile row - set once per world at the
-   name baseline (a rename made offline, a save whose name differs from the profile's) and when a rename could not be sent. */
-bool g_facRowPending = false;
+/* names2a (investigations/names2-design.md Q3) + T-368: what this game owes the world about its faction name. The LOAD report (kind 3)
+   names the name this world loaded with - owed once per world from the name baseline; a RENAME (kind 5) names the faction's name when
+   it is sent - owed after a rename. Both wait while the link is down, and the load report always goes first: the world judges the
+   loaded name as a load and a rename made meanwhile as its own request, so a "changed back" names a name this save had. */
+bool g_facLoadPending = false, g_facRenamePending = false;
+std::string g_facLoadName;
+void FactionNameReportsFlush(const std::string& now)
+{
+    if (g_facLoadPending)
+    {
+        if (!StoreProfileFactionName(g_facLoadName, "world load", 0)) return;
+        g_facLoadPending = false;
+    }
+    if (g_facRenamePending && StoreProfileFactionName(now, "rename", 1)) g_facRenamePending = false;
+}
+
+/* T-368 - THE WORLD'S WORD ON MY FACTION NAME (the FACTION answer, coop::PlayerFactionWorldAnswer): held until this game's player
+   faction exists, then applied once by PlayerFactionTick. */
+struct WorldFacAnswer { int pending, verdict; unsigned num; std::string asked, name; WorldFacAnswer() : pending(0), verdict(0), num(0) {} };
+WorldFacAnswer g_worldFac;
+std::string g_worldFacReported;   /* the FACTION answer (verdict, asked, name) last reported back with a load report - reported once only */
+long long g_worldFacApplied = 0, g_worldFacDropped = 0, g_worldFacRecordTaken = 0, g_worldFacStandInMoved = 0, g_facBoxShown = 0, g_facBoxFailed = 0;
+
+/* T-368 - THE FACTION TAB (FactionsScreen's name box, 1.0.65 0x491940, F995): on Enter (eventEditSelectAccept) or when the box loses
+   focus (0x491D40) it asks FactionDirectory::findFactionByName for the typed name and, when a faction is found, shows Kenshi's own
+   "Faction Name" / "This faction name already exists" box and puts the old name back in the box; otherwise it writes the name. While
+   that handler runs on this thread, the lookup also answers for a name another profile of this world holds (connected or not - the
+   world's TAKEN list): it returns this game's own player faction, which the handler only tests against null. */
+static unsigned long long kPfFactionNameEditedRva = 0; static coop::AddrReg kPfFactionNameEditedRva_reg("FactionScreen_nameEdited", &kPfFactionNameEditedRva);   /* Steam_1.0.65 0x491940 */
+static unsigned long long kPfFindFactionByNameRva = 0; static coop::AddrReg kPfFindFactionByNameRva_reg("FactionDirectory_findFactionByName", &kPfFindFactionByNameRva);   /* Steam_1.0.65 0x2E7910 */
+static unsigned long long kPfGuiMessageBoxRva = 0; static coop::AddrReg kPfGuiMessageBoxRva_reg("GuiMessageBox", &kPfGuiMessageBoxRva);   /* Steam_1.0.65 0x741600: (gui, title, text, buttons 1 = OK, byte 1, 0) */
+static unsigned long long kPfForgottenGuiRva = 0; static coop::AddrReg kPfForgottenGuiRva_reg("ForgottenGui", &kPfForgottenGuiRva);   /* Steam_1.0.65 0x2132750: the object itself */
+typedef void (*FactionNameEditedFn)(void* screen, void* edit);
+typedef ::Faction* (*FindFactionByNameFn)(void* directory, const std::string* name);
+typedef void* (*GuiMessageBoxFn)(void* gui, const std::string* title, const std::string* text, unsigned buttons, unsigned char modal, void* callback);
+FactionNameEditedFn orig_factionNameEdited = 0;
+FindFactionByNameFn orig_findFactionByName = 0;
+DWORD g_tabThread = 0;   /* the thread inside the FACTION tab's handler; 0 = none */
+long long g_tabCalls = 0, g_tabRefused = 0;
+std::string g_tabRefusedName;
+::Faction* detour_findFactionByName(void* directory, const std::string* name)
+{
+    ::Faction* f = orig_findFactionByName(directory, name);
+    if (f != 0 || g_tabThread == 0 || name == 0 || g_tabThread != ::GetCurrentThreadId()) return f;
+    if (!coop::StoreFactionNameTakenInWorld(*name)) return f;
+    ::Faction* mine = LocalPlayerFactionImpl();
+    if (mine == 0) return f;
+    ++g_tabRefused; g_tabRefusedName = *name;
+    return mine;
+}
+/* g_tabThread names this thread for exactly the handler's span: the guard puts the outer value back however the handler ends, a C++
+   exception passing through included. */
+struct TabThreadScope
+{
+    DWORD outer;
+    TabThreadScope() : outer(g_tabThread) { g_tabThread = ::GetCurrentThreadId(); }
+    ~TabThreadScope() { g_tabThread = outer; }
+};
+void detour_factionNameEdited(void* screen, void* edit)
+{
+    ++g_tabCalls;
+    const long long refusedBefore = g_tabRefused;
+    {
+        TabThreadScope inHandler;
+        orig_factionNameEdited(screen, edit);
+    }
+    if (g_tabRefused != refusedBefore)
+    {
+        ::Faction* mine = LocalPlayerFactionImpl();
+        DebugLog("[PF] FACTION tab: '" + g_tabRefusedName + "' is another player's faction name in this world - refused with Kenshi's own box; the faction is still '"
+                 + (mine != 0 ? mine->getName() : std::string("?")) + "' (tabCalls=" + S(g_tabCalls) + " tabRefused=" + S(g_tabRefused) + ")");
+    }
+}
+/* Kenshi's own message box (the one the FACTION tab shows), with one OK - in its own frame, the strings by pointer (C2712). */
+int GuiMessageBoxPod(const std::string* title, const std::string* text)
+{
+    const unsigned long long fn = coop::AddrAbs(kPfGuiMessageBoxRva), gui = coop::AddrAbs(kPfForgottenGuiRva);
+    if (fn == 0 || gui == 0) return 0;
+    __try { ((GuiMessageBoxFn)fn)((void*)gui, title, text, 1u, (unsigned char)1, 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void ShowFactionBox(const std::string& text)
+{
+    const std::string title(coopui::kFactionBoxTitle);
+    const int r = GuiMessageBoxPod(&title, &text);
+    if (r == 1) { ++g_facBoxShown; DebugLog("[PF] box shown: '" + title + "' / '" + text + "'"); }
+    else { ++g_facBoxFailed; ErrorLog("[PF] the '" + title + "' box was NOT shown (" + std::string(r == 0 ? "no GuiMessageBox / ForgottenGui row" : "the engine's box FAULTED") + "): '" + text + "'"); }
+}
+/* MAIN THREAD: this game's player faction takes the name the world gave it, written as the FACTION tab writes one (WriteMyFactionName),
+   without telling the world back (the world's row has it already). */
+/* T-368: the world named my faction `name` and a STAND-IN record of this save carries it (coopslot::StandInAsideName) - the stand-in
+   takes its aside name, record and faction object alike, so my faction can take the world's name. False = the record is not a
+   per-slot stand-in's, or a record still carries the name after the move. MAIN THREAD. */
+bool MoveStandInAside(const std::string& name)
+{
+    bool held = false;
+    ::GameData* gd = NameHolder(name, LocalPlayerFactionImpl(), &held);
+    if (!PlausibleObject(gd)) return false;
+    const std::string sid = gd->stringID;
+    std::string aside;
+    if (!coopslot::StandInAsideName(sid, name, NameTaken(name + " (peer)", 0), &aside)) return false;
+    int idx = -1;
+    for (int i = 0; i < kMaxStandIns && idx < 0; ++i) if (g_si[i].f != 0 && g_si[i].gd == gd) idx = i;
+    ::Faction* f = idx >= 0 ? g_si[idx].f : coop::GameWorldPtr()->factionDirectory->findFactionById(sid);
+    if (PlausibleObject(f)) f->setName(aside);
+    coop::GameWorldPtr()->gamedata.renameRecord(gd, aside);
+    if (idx >= 0) g_si[idx].name = aside;
+    ++g_worldFacStandInMoved;
+    coop::TagsCaptionsDirty();
+    DebugLog("[PF] stand-in record '" + sid + "' carried '" + name + "', the name the world gave my faction - it is '" + aside + "' now"
+             + (PlausibleObject(f) ? " (its faction " + S((const void*)f) + " too)" : std::string(" (no live faction for it)")));
+    return !NameTaken(name, 0);
+}
+void ApplyWorldFactionName(::Faction* mine)
+{
+    const WorldFacAnswer a = g_worldFac;
+    g_worldFac = WorldFacAnswer();
+    const std::string before = mine->getName();
+    const int how = coopprof::FactionApplyDecide(a.verdict, before, a.asked, a.name);
+    if (how == coopprof::kFacApplyDrop)
+    {
+        ++g_worldFacDropped;
+        DebugLog("[PF] the world's '" + a.asked + "' -> '" + a.name + "' (" + coopprof::FactionVerdictName(a.verdict) + ") is not applied - my faction is '" + before
+                 + "' now, which the world judges on its own");
+        return;
+    }
+    if (how == coopprof::kFacApplyHave)
+    {
+        coop::StoreProfileFactionSeen(a.num, a.name);   /* the faction carries that name already: the world stops sending this answer */
+        DebugLog("[PF] the world's '" + a.asked + "' -> '" + a.name + "' (" + coopprof::FactionVerdictName(a.verdict) + ") is the name my faction has - acknowledged");
+        return;
+    }
+    if (NameTaken(a.name, mine) && !MoveStandInAside(a.name))
+    {
+        ++g_worldFacRecordTaken;
+        const std::string answerKey = std::string(coopprof::FactionVerdictName(a.verdict)) + "\t" + a.asked + "\t" + a.name;
+        const int reply = coopprof::FactionReplyDecide(how, true, answerKey == g_worldFacReported);
+        if (reply == coopprof::kFacReplyReport)
+        {
+            g_worldFacReported = answerKey;
+            g_facLoadPending = true; g_facLoadName = before;   /* the world's row takes the name my faction kept, judged as a load */
+        }
+        ErrorLog("[PF] the world named my faction '" + a.name + "' but a faction record in this game already carries that name - my faction stays '" + before
+                 + (reply == coopprof::kFacReplyReport ? std::string("' and that name is reported back to the world")
+                    : std::string("' (this answer was reported back once already; the world sends it again at this profile's next admission)")));
+        return;
+    }
+    WriteMyFactionName(mine, a.name);
+    g_lastSeenName = mine->getName();
+    if (g_facLoadPending) g_facLoadName = g_lastSeenName;   /* the world's row has this name now: a load report still owed names it */
+    g_facRenamePending = false;
+    coop::UiFactionTabCaption(a.name);   /* the FACTION tab's name box shows the name the faction has now */
+    ++g_worldFacApplied;
+    coop::StoreProfileFactionSeen(a.num, a.name);   /* applied: the world stops sending this answer again */
+    DebugLog("[PF] my player faction renamed by the world '" + before + "' -> '" + a.name + "' (" + coopprof::FactionVerdictName(a.verdict) + "; getName now '" + mine->getName() + "')");
+    RelationsSendSnapshot();          /* the other games learn the name now */
+    coop::TagsCaptionsDirty();
+    if (how == coopprof::kFacApplyBackBox) ShowFactionBox(coopui::FactionBackText(a.asked, a.name));
+    else if (how == coopprof::kFacApplyMovedBox) ShowFactionBox(coopui::FactionMovedText(a.asked, a.name));
+}
 
 // review-p3r H1: Faction::setName 0x385670 has NO call sites in the engine's .text (inlined everywhere; T176 saw only the plugin's
 // own calls), so a hook cannot see an in-game rename. The rename is a state change: the tick compares my player faction's live
@@ -471,7 +771,7 @@ void PlayerFactionTick()
     if (mine != g_lastSeenFaction || !g_nameBaselined)   // review-s6 M4: an empty name must not re-arm the edge every frame
     {
         const bool rebuilt = (g_lastSeenFaction != 0 || g_worldWasTornDown);   // a NEW faction object after one was seen (or after a teardown): the world was rebuilt
-        g_lastSeenFaction = mine; g_lastSeenName = now; g_nameBaselined = true; ++g_nameTickBaseline; g_worldWasTornDown = false; g_facRowPending = true;   /* names2a */
+        g_lastSeenFaction = mine; g_lastSeenName = now; g_nameBaselined = true; ++g_nameTickBaseline; g_worldWasTornDown = false; g_facLoadPending = true; g_facLoadName = now; g_facRenamePending = false;   /* names2a: the load report this world owes */
         if (rebuilt && (net::SessionLinked() || coop::StoreLiveReady()))   /* M5a fold 1 (#4): a notebook-only game re-bases too */
         {
             // review-p3s M4: the standings on both sides must be re-based on the new world - my owned entries go out, the peer's are asked for
@@ -481,16 +781,42 @@ void PlayerFactionTick()
         }
         return;
     }
+    if (g_worldFac.pending) { ApplyWorldFactionName(mine); return; }   /* T-368: the world's word on my faction name */
     if (now == g_lastSeenName)
     {
-        if (g_facRowPending && StoreProfileFactionName(now, "world load")) g_facRowPending = false;   /* names2a: once the link is up and a profile is picked */
+        FactionNameReportsFlush(now);   /* names2a: once the link is up and a profile is picked */
         return;
     }
     ++g_nameChanges;
     DebugLog("[PF] my player faction's name changed '" + g_lastSeenName + "' -> '" + now + "' - sending the standings snapshot so the peer learns it now");
     g_lastSeenName = now;
+    MyRecordFollowsName(mine, now);
+    AskClashNamesAgain();   /* the name my faction left may be the one a stand-in is waiting for */
     RelationsSendSnapshot();
-    g_facRowPending = !StoreProfileFactionName(now, "rename");   /* names2a: the lobby's faction column follows the rename */
+    coop::TagsCaptionsDirty();   /* T-546: line 2 of a team this player founded is this faction's name */
+    g_facRenamePending = true;   /* names2a: the lobby's faction column follows the rename; T-368: the world judges it (kind 5), after a load report still owed */
+    FactionNameReportsFlush(now);
+}
+
+/* T-368: the world's FACTION answer (store.cpp StoreOnProfiles), MAIN THREAD - applied by the next PlayerFactionTick with a player faction. */
+void PlayerFactionWorldAnswer(int verdict, unsigned num, const std::string& asked, const std::string& name)
+{
+    g_worldFac.pending = 1; g_worldFac.verdict = verdict; g_worldFac.num = num; g_worldFac.asked = asked; g_worldFac.name = name;
+}
+/* T-368: a new pick or a leave - an answer not applied yet belongs to the profile left (the world sends it again at that profile's next
+   admission). A world teardown keeps it: the pick's next world applies it when its faction still carries the name judged. */
+void PlayerFactionWorldAnswerForget() { g_worldFac = WorldFacAnswer(); }
+/* T-368: the FACTION tab's handler and the lookup it asks, hooked once at start (coop.cpp). */
+void InstallFactionNameHooks()
+{
+    const unsigned long long tab = coop::AddrAbs(kPfFactionNameEditedRva), find = coop::AddrAbs(kPfFindFactionByNameRva);
+    if (tab == 0 || find == 0) { ErrorLog("[PF] FACTION tab check NOT installed - the address table has no FactionScreen_nameEdited / findFactionByName row"); return; }
+    if (coop::AddHook((void*)find, (void*)&detour_findFactionByName, (void**)&orig_findFactionByName) != coop::SUCCESS)
+    { ErrorLog("[PF] AddHook findFactionByName FAILED - the FACTION tab does not refuse another player's faction name"); return; }
+    if (coop::AddHook((void*)tab, (void*)&detour_factionNameEdited, (void**)&orig_factionNameEdited) != coop::SUCCESS)
+    { ErrorLog("[PF] AddHook FactionsScreen name box FAILED - the FACTION tab does not refuse another player's faction name"); return; }
+    DebugLog("[PF] FACTION tab check installed: the name box's handler and findFactionByName are hooked; a name another profile of this world"
+             " holds is refused with Kenshi's own box");
 }
 
 void ReportPlayerFaction()
@@ -498,6 +824,11 @@ void ReportPlayerFaction()
     DebugLog("[PF] REPORT peer=" + StandInsText() + " created=" + S(g_created)
              + " wireSent=" + S(g_wireSent) + " wireResolved=" + S(g_wireResolved) + " byName=" + S(g_byName) + " byNameMissed=" + S(g_byNameMissed)
              + " mgrMissing=" + S(g_mgrMissing) + " renamed=" + S(g_renamed) + " nameChanges=" + S(g_nameChanges) + " renameVerb=" + S(g_renameVerb) + " nameTickBaseline=" + S(g_nameTickBaseline) + " nameTickNoFaction=" + S(g_nameTickNoFaction) + " worldRebasedLinked=" + S(g_worldRebasedLinked) + " createFailed=" + S(g_createFailed) + " mySlot=" + S(MySlotForWire()) + " linkPeerSlot=" + S(g_linkPeerSlot) + " wireSelfSlot=" + S(g_wireSelfSlot) + " wireNoSlot=" + S(g_wireNoSlot) + " wireLegacy=" + S(g_wireLegacy) + " tableFull=" + S(g_tableFull) + " placeholders[made,named,clashRenamed]=" + S(g_placeholderMade) + "," + S(g_placeholderNamed) + "," + S(g_clashRenamed) + " slotHeld=" + S((long)g_slotHeld) + " slotReleases=" + S(g_slotReleases) + " anyMissCached=" + S(g_anyMissCached) + " legacyPeer=" + S((const void*)g_legacyPeer) + " relationAtCreate=" + (g_relationRead == 1 ? S(g_relationAtCreate) : std::string("unread")));
+    ::Faction* mine = LocalPlayerFactionImpl();
+    DebugLog("[PF] REPORT names: mine='" + (mine != 0 ? mine->getName() : std::string("-")) + "' tab[calls,refused]=" + S(g_tabCalls) + "," + S(g_tabRefused)
+             + " world[applied,dropped,recordTaken]=" + S(g_worldFacApplied) + "," + S(g_worldFacDropped) + "," + S(g_worldFacRecordTaken)
+             + " boxes[shown,failed]=" + S(g_facBoxShown) + "," + S(g_facBoxFailed) + " owed[load,rename]=" + S(g_facLoadPending ? 1 : 0) + "," + S(g_facRenamePending ? 1 : 0) + " standInMoved=" + S(g_worldFacStandInMoved)
+             + " taken=" + coop::StoreTakenFactionsText());
 }
 }
 
@@ -506,5 +837,5 @@ namespace coop {
 void ResetPlayerFactionState() { coop::PolicyForgetPeerFaction();   /* E36 / decision 40: the stand-in's address dies with the world - see policy.cpp */
                                 for (int i = 0; i < kMaxStandIns; ++i) { g_siPtr[i] = 0; g_si[i] = StandIn(); }   /* stand1: every stand-in dies with the world; the link peer's slot does not */
                                 g_legacyPeer = 0; g_legacyLooked = false; g_anyMiss = false;   /* stand1 fold */
-                                g_renameRefused = 0; g_lastSeenName.clear(); g_lastSeenFaction = 0; g_nameBaselined = false; g_worldWasTornDown = true; }
+                                g_renameRefused = 0; g_lastSeenName.clear(); g_lastSeenFaction = 0; g_nameBaselined = false; g_worldWasTornDown = true; }   /* T-368: a FACTION answer not applied yet waits for the pick's next world (PlayerFactionWorldAnswerForget) */
 }

@@ -721,4 +721,92 @@ void ReportHire()
              + " linesOffMain=" + N((long long)g_linesOffMain) + " linesUnread=" + N(g_linesUnread) + " hook=" + N(g_doActionsHook));
 }
 
+// T-556 (resurrect.cpp), MAIN THREAD: PlayerInterface::recruit(c, edit = false). 1 joined, 0 refused, -1 fault, -2 no table
+// address for recruit, -3 no PlayerInterface.
+int HireRecruitNoEdit(::Character* c)
+{
+    if (kRecruitRva == 0) return -2;
+    void* pi = PlayerInterfacePod();
+    if (pi == 0) return -3;
+    return RecruitPod(pi, c, false);
+}
+// T-556, MAIN THREAD: Character vt+0xA0 setFaction(f, platoon). 1 called, 0 fault.
+int HireSetFaction(::Character* c, ::Faction* f, void* platoon) { return SetFactionPod(c, f, platoon); }
+/* TEST-ONLY lever `copysquad <uid>`, MAIN THREAD: a copy of another game's world character (this game does not run it) is moved by this
+   game's engine into a NEW squad of the copy's own faction - Character vt+0xA0 setFaction(its faction, no platoon): the faction's
+   addMember makes the squad, numbered by this game's engine in this game's block. The sleep write and the heartbeat publish then meet a
+   squad numbered here whose known members are all another game's (store.cpp, BlockSquadWrite). [CMD] copysquad line. */
+std::string CopySquadLever(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    ::Faction* f = 0;
+    const char* why = 0;
+    if (StoreMainThreadId() == 0 || StoreMainThreadId() != ::GetCurrentThreadId()) why = "not on the main thread";
+    else if (EngineWritesBlocked()) why = "engine writes are blocked (a world is loading)";
+    else if (!Plaus(c)) why = "no character for this uid is present on this game";
+    else if (net::IsUidMine(uid)) why = "this game runs it (the lever takes a copy of another game's character)";
+    else
+    {
+        f = FactionOfPod(c);
+        if (!Plaus(f)) why = "its faction could not be read";
+        else if (IsPlayerFaction(f) || IsPeerFaction(f)) why = "a player's character (the lever takes a world character's copy)";
+    }
+    const std::string head = "copysquad uid=" + N(uid);
+    if (why != 0)
+    {
+        DebugLog("[CMD] " + head + " -> REFUSED - " + why);
+        return "error " + head + " refused: " + why;
+    }
+    void* before = PlatoonOfPod(c);
+    if (SetFactionPod(c, f, 0) == 0)
+    {
+        ++g_setFactionFault;
+        DebugLog("[CMD] " + head + " -> setFaction FAULTED");
+        return "error " + head + " setFaction faulted";
+    }
+    void* after = PlatoonOfPod(c);
+    char b[200];
+    _snprintf(b, 199, " squad %p -> %p (new=%d, context=%d)", before, after, (after != 0 && after != before) ? 1 : 0, ContextPlatoonForActive(after) != 0 ? 1 : 0); b[199] = 0;
+    DebugLog("[CMD] " + head + " -> moved by this game's engine into a squad of its own faction:" + std::string(b));
+    return "ok " + head + std::string(b);
+}
+/* TEST-ONLY lever `copysquad nearest`, MAIN THREAD: the living copy of another game's world character (not run here, not a player's or
+   another player's faction) nearest to this game's first living player-faction character, within 2000 units (a tie goes to the lower
+   uid), is moved exactly as `copysquad <uid>` moves it. [CMD] copysquad nearest line names the uid picked and its distance. */
+std::string CopySquadNearestLever()
+{
+    unsigned int anchorUid = 0;
+    ::Character* anchorC = MyHirer(&anchorUid);
+    Ogre::Vector3 ap;
+    if (anchorC == 0 || !SafeReadPosition(anchorC, &ap))
+    {
+        DebugLog("[CMD] copysquad nearest -> REFUSED - no own living player-faction character with a readable position");
+        return "error copysquad nearest refused: no own living player-faction character with a readable position";
+    }
+    const float kMax = 2000.0f;
+    float best = kMax; unsigned int uid = 0; int candidates = 0;
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int u = 0; ::Character* c = 0; Ogre::Vector3 q;
+        if (!MirrorSlot(i, &u, &c) || u == 0 || !Plaus(c) || net::IsUidMine(u)) continue;
+        ::Faction* f = FactionOfPod(c);
+        if (!Plaus(f) || IsPlayerFaction(f) || IsPeerFaction(f)) continue;
+        if (!Alive(c) || !SafeReadPosition(c, &q)) continue;
+        const float dx = q.x - ap.x, dz = q.z - ap.z, d = sqrtf(dx * dx + dz * dz);
+        if (d > kMax) continue;
+        ++candidates;
+        if (d < best || (d == best && uid != 0 && u < uid)) { best = d; uid = u; }
+    }
+    if (uid == 0)
+    {
+        DebugLog("[CMD] copysquad nearest -> REFUSED - no living copy of another game's world character within 2000 units of uid=" + N(anchorUid));
+        return "error copysquad nearest refused: no copy within 2000 units";
+    }
+    char b[200];
+    _snprintf(b, 199, "[CMD] copysquad nearest picked uid=%u dist=%.1f anchor=%u candidates=%d", uid, best, anchorUid, candidates); b[199] = 0;
+    DebugLog(std::string(b));
+    return CopySquadLever(uid);
+}
+
 } // namespace coop

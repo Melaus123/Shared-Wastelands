@@ -1598,6 +1598,7 @@ inline void MergeBuildRows(const std::vector<BuildRow>& file, const std::vector<
    is what must not repeat. */
 inline std::string HelpRecKey() { return "pp.help"; }
 const unsigned int kHelpRecMats = 16;   /* buildwire.h kBuildMaxMats */
+const int kHelpRecSlotMax = 1023;        /* the notebook's slots 0..1023 (buildwire.h kBuildOwnerSlotMax) */
 struct HelpRecRow
 {
     std::string key;
@@ -1622,7 +1623,7 @@ inline void EncodeHelpRec(const std::vector<HelpRecRow>& rows, std::vector<char>
         RecPutI32(out, (int)s[i].goneSeq); RecPutI32(out, (int)s[i].nonce);   /* help1 fold 2 */
     }
 }
-/* false (and *rows empty) on ANY bad field: the tag, the count, an empty or over-long key, a key twice, a slot outside -1..254,
+/* false (and *rows empty) on ANY bad field: the tag, the count, an empty or over-long key, a key twice, a slot outside -1..1023,
    seq 0, a negative count, trailing bytes */
 inline bool DecodeHelpRec(const std::vector<char>& b, std::vector<HelpRecRow>* rows)
 {
@@ -1644,7 +1645,7 @@ inline bool DecodeHelpRec(const std::vector<char>& b, std::vector<HelpRecRow>* r
         bool neg = false;
         for (unsigned int k = 0; k < kHelpRecMats; ++k) { r.given[k] = GdcI32(&c); if (r.given[k] < 0) neg = true; }
         if (v2) { r.goneSeq = (unsigned int)GdcI32(&c); r.nonce = (unsigned int)GdcI32(&c); }
-        if (c.bad || r.key.empty() || r.key.size() > kBuildRecMaxKey || r.slot < -1 || r.slot > 254 || r.nextSeq == 0 || neg
+        if (c.bad || r.key.empty() || r.key.size() > kBuildRecMaxKey || r.slot < -1 || r.slot > kHelpRecSlotMax || r.nextSeq == 0 || neg
             || !seen.insert(std::make_pair(r.key, r.nonce)).second) { rows->clear(); return false; }
         rows->push_back(r);
     }

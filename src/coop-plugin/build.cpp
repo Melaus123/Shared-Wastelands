@@ -804,7 +804,7 @@ void BdCopyListAlias(const std::string& key, const BdReg& r, const coopbuild::Bu
 void BdCopyListNote(const std::string& key, const BdReg& r, const coopbuild::BuildMsg& m, int slot)
 {
     char line[400];
-    if (slot < 0 || slot > 254) { ++g_clNoSlot; return; }
+    if (slot < 0 || slot > (int)coopbuild::kBuildOwnerSlotMax) { ++g_clNoSlot; return; }
     coopbuild::BuildCopyRec c;
     c.key = key; c.sid = r.sid.empty() ? m.sid : r.sid; c.slot = slot; c.nonce = m.nonce;
     for (int i = 0; i < 3; ++i) c.pos[i] = m.pos[i];
@@ -1860,7 +1860,7 @@ void BdOwedLoad()
         const char* h = buf + 2;
         while (BdHexVal(h[0]) >= 0 && BdHexVal(h[1]) >= 0) { b.push_back((char)(BdHexVal(h[0]) * 16 + BdHexVal(h[1]))); h += 2; }
         coopbuild::BuildMsg m;
-        if (b.empty() || coopbuild::DecodeBuild(&b[0], b.size(), &m) != coopbuild::kBuildDecodeOk || m.kind != coopbuild::kBuildPlace
+        if (b.empty() || coopbuild::DecodeBuildSaved(&b[0], b.size(), &m) != coopbuild::kBuildDecodeOk || m.kind != coopbuild::kBuildPlace
             || m.ownerSlot == coopbuild::kBuildOwnerSender) continue;
         BdOwed& o = fileRows[m.key];
         o.m = m; o.acked = (buf[0] == '1') ? 1 : 0;
@@ -2884,7 +2884,7 @@ void BdOnNewPiece(void* b, int via, const float* pos, const float* rot, int meta
     for (int i = 0; i < 4; ++i) m.rot[i] = rot[i];
     m.complete = (unsigned char)(c != 0 ? 1 : 0);
     m.progress = p; m.needed = n;
-    if (handedTo >= 0) m.ownerSlot = (unsigned char)handedTo;   /* build1h: the house owner's slot (HouseOwnerOfNewPiece keeps it <= 254) */
+    if (handedTo >= 0) m.ownerSlot = (unsigned short)handedTo;   /* the house owner's slot (HouseOwnerOfNewPiece keeps it a notebook slot) */
     {   /* house2 fold (MED2): the placement's nonce, as its row keeps it (the owed-file row keeps it inside the PLACE) */
         std::map<std::string, BdReg>::const_iterator nr = g_reg.find(std::string(key));
         m.nonce = (nr != g_reg.end() && nr->second.nonce != 0) ? nr->second.nonce : BdNewNonce();
@@ -4762,7 +4762,7 @@ int BdApplyHelp(BdHelpIn& in)
 {
     const coopbuild::BuildMsg& m = in.m;
     char line[500];
-    if (in.slot < 0 || in.slot > 254)
+    if (in.slot < 0 || in.slot > (int)coopbuild::kBuildOwnerSlotMax)
     {
         ++g_helpDropRemoved;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u dropped (the sender's slot is unknown) dropRemoved=%lld", m.key.c_str(), in.slot, m.seq, g_helpDropRemoved);
@@ -4811,7 +4811,7 @@ int BdApplyHelp(BdHelpIn& in)
         const std::vector<coopbuild::BuildHelpAck>* rs = BdHelpAcksRead(m.key, r);
         if (rs != 0) { r.helpAcks = *rs; if (r.helpAcksLanded.empty()) r.helpAcksLanded = *rs; }
     }
-    const unsigned char slot = (unsigned char)in.slot;
+    const unsigned short slot = (unsigned short)in.slot;
     const coopbuild::BuildHelpAck* a0 = coopbuild::BuildHelpAckFor(&r.helpAcks, slot, 0);
     const unsigned int last = (a0 != 0) ? a0->seq : 0;
     const int verdict = coopbuild::BuildHelpSeqVerdict(last, m.seq);
@@ -8003,7 +8003,7 @@ void BuildCopyListFromBase(const std::vector<coopown::BuildRow>& rows, const cha
         }
         if (rows[i].key.empty() || rows[i].key[0] == '~') continue;   /* a tombstone / gone marker: not an own PLACE row */
         coopbuild::BuildMsg m;
-        if (coopbuild::DecodeBuild(rows[i].place.data(), rows[i].place.size(), &m) == coopbuild::kBuildDecodeOk && m.kind == coopbuild::kBuildPlace) own.insert(m.key);
+        if (coopbuild::DecodeBuildSaved(rows[i].place.data(), rows[i].place.size(), &m) == coopbuild::kBuildDecodeOk && m.kind == coopbuild::kBuildPlace) own.insert(m.key);
     }
     ++g_clBaseRead;
     BdCopyListLoaded(cl, own);
@@ -8019,8 +8019,8 @@ int BuildRestoreQueue(const std::vector<coopown::BuildRow>& rows)
     {
         ++g_rsRows;
         coopbuild::BuildMsg m, st;
-        const int a = coopbuild::DecodeBuild(rows[i].place.data(), rows[i].place.size(), &m);
-        const int s = coopbuild::DecodeBuild(rows[i].state.data(), rows[i].state.size(), &st);
+        const int a = coopbuild::DecodeBuildSaved(rows[i].place.data(), rows[i].place.size(), &m);
+        const int s = coopbuild::DecodeBuildSaved(rows[i].state.data(), rows[i].state.size(), &st);
         if (coopbuild::BuildCopyRowIs(rows[i].key))
         {   /* P87 root: a copy-list row - read after every own row (BdCopyListLoaded) */
             coopbuild::BuildCopyRec cr;
@@ -8312,6 +8312,96 @@ std::string BuyHouseCommand(const std::string& argIn)
     return out;
 }
 
+/* TEST-ONLY levers (MAIN THREAD, the command channel). `standin <slot> [read]`: make (or take into the table) the stand-in for any
+   player number through the one lookup (OwnerFactionForSlot) and read it back; `read` makes nothing. Either way the loaded buildings
+   that faction owns are counted (first 4 keys). `buildgive <key-substring|nearest> <slot>`: give the loaded building whose key holds
+   the substring (the nearest such) - or the building nearest this game's first own character - to that player's faction, through
+   the engine's own setFaction. */
+int BdOwnedByCount(void* f, std::string* keys)
+{
+    static void* list[4096];
+    int zones = 0, trunc = 0, c = 0;
+    if (f == 0) return 0;
+    const int n = LoadedBuildings(list, 4096, &zones, &trunc);
+    for (int i = 0; i < n; ++i)
+    {
+        if (BdOwnerPod(list[i]) != f) continue;
+        if (++c > 4) continue;
+        char k[kKeyCap]; k[0] = 0;
+        if (ObjectPositionKey(list[i], k, kKeyCap, "", 3, 1) == 0) { k[0] = '?'; k[1] = 0; }
+        *keys += std::string(c > 1 ? " " : "") + k;
+    }
+    return c;
+}
+std::string StandInCommand(const std::string& arg)
+{
+    int slot = -1; char mode[16]; mode[0] = 0;
+    const int got = std::sscanf(arg.c_str(), "%d %15s", &slot, mode);
+    const bool readOnly = (got == 2 && std::strcmp(mode, "read") == 0);
+    if (got < 1 || (got == 2 && !readOnly) || slot < 0 || slot > coopslot::kSlotMax) return "error standin usage: standin <slot 0..1023> [read]";
+    if (!readOnly && EngineWritesBlocked()) return "error standin: engine writes are blocked (a load or a teardown) - try again";
+    ::Faction* f = OwnerFactionForSlot(slot, !readOnly);
+    const bool inTable = (f != 0 && f != LocalPlayerFaction());
+    if (f == 0 && readOnly) f = StandInRecordFaction(slot);
+    std::string keys;
+    const int owned = BdOwnedByCount((void*)f, &keys);
+    char l[640];
+    std::sprintf(l, "%s standin player=%d id=%s faction=%p name='%.60s' mine=%d table=%d placeholder=%d worldRecord=%d recordSlot=%d ownsLoadedBuildings=%d [%.300s]",
+                 (f != 0 || readOnly) ? "ok" : "error", slot, coopslot::StandInId(slot).c_str(), (void*)f, f != 0 ? f->getName().c_str() : "",
+                 (f != 0 && f == LocalPlayerFaction()) ? 1 : 0, inTable ? 1 : 0, StandInIsPlaceholder(slot), StandInRecordFaction(slot) != 0 ? 1 : 0,
+                 f != 0 ? StandInRecordSlot(f) : -1, owned, keys.c_str());
+    DebugLog(std::string("[BUILD] P106 ") + l);
+    return std::string(l);
+}
+std::string BuildGiveCommand(const std::string& arg)
+{
+    char what[64]; what[0] = 0; int slot = -1;
+    if (std::sscanf(arg.c_str(), "%63s %d", what, &slot) != 2 || slot < 0 || slot > coopslot::kSlotMax) return "error buildgive usage: buildgive <key-substring|nearest> <slot 0..1023>";
+    if (EngineWritesBlocked()) return "error buildgive: engine writes are blocked (a load or a teardown) - try again";
+    ::Faction* mine = LocalPlayerFaction();
+    if (mine == 0) return "error buildgive: this game has no player faction";
+    ::Faction* f = OwnerFactionForSlot(slot, true);
+    if (f == 0) return "error buildgive: no faction for that player (no world, no number of mine yet, or the stand-in table is full)";
+    float cp[3];
+    if (!BdFindMyCharPos(mine, cp)) return "error buildgive: no own player-faction character with a readable position";
+    static void* list[4096];
+    int zones = 0, trunc = 0, matched = 0;
+    const int n = LoadedBuildings(list, 4096, &zones, &trunc);
+    const bool nearest = std::strcmp(what, "nearest") == 0;
+    void* best = 0; float bd = 1.0e30f;
+    for (int i = 0; i < n; ++i)
+    {
+        float q[3];
+        if (!BdCopyF((const char*)list[i] + kObjPos, q, 3)) continue;
+        if (!nearest)
+        {
+            char mk[kKeyCap]; mk[0] = 0;
+            if (ObjectPositionKey(list[i], mk, kKeyCap, "", 3, 1) == 0 || std::strstr(mk, what) == 0) continue;
+            ++matched;
+        }
+        const float dx = q[0] - cp[0], dy = q[1] - cp[1], dz = q[2] - cp[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < bd) { bd = d2; best = list[i]; }
+    }
+    char l[640];
+    if (best == 0)
+    {
+        std::sprintf(l, "error buildgive: no loaded building %s '%.60s' (%d buildings, %d key matches, walkTruncated=%d)", nearest ? "for" : "whose key holds", what, n, matched, trunc);
+        return std::string(l);
+    }
+    char k[kKeyCap]; k[0] = 0;
+    if (ObjectPositionKey(best, k, kKeyCap, "", 3, 1) == 0) { k[0] = '?'; k[1] = 0; }
+    ::Faction* before = (::Faction*)BdOwnerPod(best);
+    const std::string beforeName = (before != 0) ? before->getName() : std::string("none");
+    BdSelfScope selfScope;   /* the mod's own engine call */
+    const int ok = BdSetFactionPod(best, (void*)f);
+    void* after = BdOwnerPod(best);
+    std::sprintf(l, "%s buildgive key=%s dist=%.0f player=%d owner %p '%.40s' -> %p '%.40s' (record id %s, recordSlot=%d)%s",
+                 (ok && after == (void*)f) ? "ok" : "error", k, std::sqrt(bd), slot, (void*)before, beforeName.c_str(), after, f->getName().c_str(),
+                 coopslot::StandInId(slot).c_str(), StandInRecordSlot(f), ok ? "" : " - setFaction FAULTED");
+    DebugLog(std::string("[BUILD] P106 ") + l);
+    return std::string(l);
+}
 std::string BuildListCommand()
 {
     int n = 0, live = 0;

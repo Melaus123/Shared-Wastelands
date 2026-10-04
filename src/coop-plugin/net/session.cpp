@@ -154,7 +154,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 137;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 140;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 
 // A body has 7 parts in this build (T032/T033/T034, every character, both instances). The
 // cap is a bound on a network-supplied count, not a belief about anatomy - a peer claiming
@@ -1107,13 +1107,19 @@ void SessionOwnerMovedSend(unsigned int uid);   /* M7a2 item 3 [m7a2-sp1]: defin
 void SessionOwnerMovedAnnounce(unsigned int uid, bool prevKnown, unsigned int prevKey);   /* M7a2 fold 1 item 2 [m7a2f-sp1]: the taker's word */
 // M-D - ownership transfer. Release: this instance stops being the authority for uid and records the new owner
 // (its writes are accepted from now on). Take: this instance becomes the authority (SetLocalOwner's body).
+/* the people this game ran and released to another game (every ReleaseLocalOwner: a hand-over's acknowledgement, a release's adoption,
+   a dual run's yield, a revoke, a hire away); a person taken back or set as this game's again leaves it. Asked by the store's sleep and
+   heartbeat gate (BlockSquadWrite): a squad holding such a person is this game's own squad handed over in place. MAIN THREAD. */
+std::set<unsigned int> g_releasedHere;
+bool IsUidReleasedHere(unsigned int uid) { return uid != 0 && g_releasedHere.find(uid) != g_releasedHere.end(); }
+void MarkReleasedHere(unsigned int uid) { if (uid != 0) g_releasedHere.insert(uid); }   /* a body of this game's own world registered in place as another game's copy (spawn.cpp AdoptExistingTwin) */
 void ReleaseLocalOwner(unsigned int uid, unsigned int toPeer, unsigned int gen)
 {
     /* M7a A1 build 1 [a1b1-sp4]: the gen the new owner holds (0 = this game's gen + 1, the XFER / hire rule) moves to the copy table,
        BEFORE the OWNER_MOVED word below names it */
     const unsigned int newGen = gen != 0 ? gen : cooplo::GenTake(MineGenOf(uid));
     g_mineGen.erase(uid); g_copyGen[uid] = newGen;
-    g_localOwned.erase(uid);
+    g_localOwned.erase(uid); g_releasedHere.insert(uid);
     coopown::OwnedMirrorErase(&g_ownedMirror, uid);   /* O1: beside the set, always */
     g_owner[uid] = OwnerKeyOf(toPeer);   /* M5b: the new owner as a player key */
     g_departedPending.erase(uid);   /* M8: a hand-over after a departure supersedes it */
@@ -1129,7 +1135,7 @@ void TakeLocalOwner(unsigned int uid, unsigned int gen)
     const unsigned int prevKey = prevKnown ? prevOwn->second : 0u;
     g_mineGen[uid] = gen != 0 ? gen : cooplo::GenReadopt(MineGenOf(uid), CopyGenOf(uid));   /* M7a A1 build 1 [a1b1-sp5]: the gen the XFER / hire named + 1; 0 = out-rank every record here */
     g_copyGen.erase(uid);
-    g_localOwned.insert(uid);
+    g_localOwned.insert(uid); g_releasedHere.erase(uid);
     coopown::OwnedMirrorInsert(&g_ownedMirror, uid);   /* O1: beside the set, always */
     coop::MedicalForgetCopy(uid);   /* this game drives it now (marked above first, so no detour sees it as a copy with no words): the old owner's medical words for its copy go */
     g_owner[uid] = g_myPeerId;
@@ -1148,7 +1154,7 @@ void SetLocalOwner(unsigned int uid)
     // its own) takes the highest gen known here + 1, so a re-adoption always out-ranks any copy record elsewhere.
     g_mineGen[uid] = cooplo::GenReadopt(MineGenOf(uid), CopyGenOf(uid));
     g_copyGen.erase(uid);
-    g_localOwned.insert(uid);
+    g_localOwned.insert(uid); g_releasedHere.erase(uid);
     coopown::OwnedMirrorInsert(&g_ownedMirror, uid);   /* O1: beside the set, always */
     coop::MedicalForgetCopy(uid);   /* as TakeLocalOwner: after the marks, and no copy's medical words outlive this game taking the character */
     g_owner[uid] = g_myPeerId;
@@ -3819,7 +3825,7 @@ bool SendDoorState(const std::string& key, int state, int locked, unsigned int g
         std::vector<char> b;
         PutStr(&b, key);
         b.push_back((char)(unsigned char)state);
-        b.push_back((char)(unsigned char)(locked != 0 ? 1 : 0));
+        b.push_back((char)(unsigned char)(coopdoor::DoorLockWordValid(locked) != 0 ? locked : 0));   /* T-160: the lock word - bit 0 locked, bit 1 wantsToLock */
         PutU32(&b, gen);
         /* P8n: THE ORIGIN BYTE, APPENDED AND NOT INSERTED.  0 = the area holder's answer, 1 = an
            actor report from a game that does not hold this door.  It goes last because the decoder's

@@ -40,7 +40,7 @@
 
 namespace cooppre {
 
-const unsigned int kPreProtocol = 69;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+const unsigned int kPreProtocol = 87;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
 enum { kPreIndexAsk = 5, kPreIndexPage = 6, kPreFetch = 7, kPreFetchEnd = 8 };
 const size_t kPreIndexPageEntries = 4096;          /* at most this many index rows a page */
 const size_t kPreIndexPageBytes = 512u * 1024u;    /* and about this many bytes */

@@ -67,5 +67,23 @@ void PolicyForgetPeerFaction();
 unsigned int PolicyVtableRvaPod(void* obj);
 int PolicyClassNamePod(unsigned int vtRva, char* buf, int cap);
 std::string PolicyReport();   // the " basePolicy[...]" tokens for the [STORE] REPORT line
+// T-546 step 4 (decision 481): a TEAMMATE's buildings open to this game's player whatever the policy - the request gate
+// (BasePolicyAllows: allowedMember), the click sites, the door panel and both cursors answer "this player's own" for a building
+// whose owner shares this player's team (team.h's any-thread index). The `team access <slot> [class]` lever: that player's
+// nearest loaded building (RTTI class name containing `cls`, when given) met as a click and a hover meet it - its own
+// getDefaultTask and getMouseCursor called through the engine's dispatch, so the hooks answer and count - plus the request
+// gate's judgement, not counted; one [TEAM] access line. MAIN THREAD. Returns the status.
+std::string PolicyTeamAccessProbe(int ownerSlot, const std::string& cls);
+// T-546 step 4b: MAIN THREAD - this game's teammates' factions (at most 16; 0 / n = 0 = none) for the box stub, which lets a
+// teammate's box clicked as this player's own take the loot road in PlayerInterface::buildingSelected's inline owner test. Each cell
+// is written only when it changes.
+void PolicyTeammateFactions(void* const* facs, int n);
+// T-546 step 4b: the `team click <slot> [class]` lever - a real click (the engine's own buildingSelected) on that player's nearest
+// loaded building; one [TEAM] click line with the hook counters that moved. MAIN THREAD. Returns the status.
+std::string PolicyTeamClick(int ownerSlot, const std::string& cls);
+// T-546 step 7: the `team orders <slot>` lever - for this game's own first character and that player's first character: the engine's
+// PlayerInterface::isEnemy, the interaction menu the engine builds on it (the list made and the list shown) and the right-click
+// handler as a hover; one [TEAM] orders line. MAIN THREAD. Returns the status.
+std::string PolicyTeamOrders(int slot);
 
 }

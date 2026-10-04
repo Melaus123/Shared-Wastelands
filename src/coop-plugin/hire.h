@@ -7,6 +7,8 @@
 #pragma once
 #include <string>
 #include "../common/hirewire.h"
+class Character;   // T-556: HireRecruitNoEdit / HireSetFaction
+class Faction;
 namespace coop {
 void InstallHire();                                                       // the 0x67FAD0 detour (R0-b hold)
 void HireNoteRecv(const coophire::HireMsg& m, unsigned int fromPeer);    // MAIN THREAD (dispatch): queued for the K2 safe point
@@ -15,4 +17,8 @@ void HireSafePointDrain();                                                // MAI
 void HireForgetPeer(int slot);                                            // the player in `slot` left: my requests to it, my promises to it and its undrained messages dropped (-1: every row)
 std::string HireTestArm(const std::string& arg);                          // `hiretest near [price] | near same [<x> <z> [price]] | uid <n> [price]` (TEST-ONLY)
 void ReportHire();                                                        // one [HIRE] REPORT line
+int HireRecruitNoEdit(::Character* c);                                   // T-556: PlayerInterface::recruit(c, edit=false); 1 joined, 0 refused, <0 not called / fault
+int HireSetFaction(::Character* c, ::Faction* f, void* platoon);         // T-556: Character vt+0xA0 setFaction; 1 called, 0 fault
+std::string CopySquadNearestLever();                                       // `copysquad nearest` (TEST-ONLY): the nearest copy within 2000 u, as copysquad <uid>
+std::string CopySquadLever(unsigned int uid);                            // `copysquad <uid>` (TEST-ONLY): a copy moved into a new squad this game numbers
 }

@@ -386,6 +386,8 @@ void ClearPeerViewDistance();
 // MAIN THREAD ONLY (O1, recheck-c2b): it walks g_localOwned, a std::set the main thread mutates, so a find from a
 // worker can race an erase and walk a freed node. A detour that can run on an engine worker uses IsUidMineAnyThread.
 bool IsUidMine(unsigned int uid);
+bool IsUidReleasedHere(unsigned int uid);
+void MarkReleasedHere(unsigned int uid);    /* T-574: a body of this game's own world became another game's copy in place (a twin adopted). MAIN THREAD. */   /* T-574: this game ran the person and released it to another game (taken back: no). MAIN THREAD. */
 // M4 fold (review 2026-09-29 H1, defence in depth): does the session hold a row for this uid - an owner record (g_owner) or
 // a character this game runs (g_localOwned)? spawn.cpp AllocateUid skips (and counts) a minted uid that does. MAIN THREAD.
 bool UidHasSessionRow(unsigned int uid);

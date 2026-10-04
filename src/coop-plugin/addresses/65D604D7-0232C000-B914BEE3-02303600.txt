@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 457
+!count 477
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -59,6 +59,8 @@ BarBuildingPick                                code 0038AEC0 0038AEC0 488BC44C89
 BountyMapErase                                 code 00860790 00860790 40554883EC204883792000488BE97508
 BountyMapIndex                                 code 005E7450 005E7450 40565741544883EC4048C7442420FEFF
 BountySightTargetTest                          code 0085635D 0085635D 4883B85002000000740EF3440F101DD0
+BuildingSelectedBoxOwnerTest                   code 007FC241 007FC241 4883B85002000000755F488D15EE98E9
+PlayerInterfaceBuildingSelected                code 007FBB40 007FBB40 488BC45556574154415541564157488D
 BuildingDropItem                               code 0054DBA0 0054DBA0 4889742418574883EC70488BFA488BF1
 BuildingRegistryGlobal                         var  02133568 02133568 -
 Building_calculateSaleValue                    code 007AC760 007AC760 40534881EC8000000048C7442420FEFF
@@ -204,6 +206,8 @@ GameDataReference_dtor                         code 00069580 00069580 40534883EC
 GameFrameDt                                    var  02132734 02132734 -
 GameplayOptionsGlobal                          var  02132528 02132528 -
 GameplayOptionsLoad                            code 003EEDE0 003EEDE0 405556574154415541564157488BEC48
+LockButton                                     code 005465D0 005465D0 48895C2408574883EC4080B984030000
+LockDoor                                       code 002969B0 002969B0 83B98003000000751CF30F1005FB283F
 SavedObjectState_savedPosition                           code 0037DA00 0037DA00 8B412089028B41248942048B41288942
 SavedObjectState_stateCount                        code 0037F5D0 0037F5D0 8B8188000000C3CCCCCCCCCCCCCCCCCC
 GameWorld_activeCharacters               code 006638D0 006638D0 488D8150070000C3CCCCCCCCCCCCCCCC
@@ -309,7 +313,7 @@ NotifyStartPrisonSentence                      code 00853A80 00853A80 48895C2410
 NullHandStatic                                 var  01E395F8 01E395F8 -
 OpenDoor                                       code 00297000 00297000 4883EC4883B98003000000754780B918
 OptionsHolderGlobal                            var  02132440 02132440 -
-OptionsWindowSaveOptions                       code 003EC950 003EC950 488BC45541544155488D68C84881EC20
+OptionsWindowSaveOptions                       code 003EC950 003EC960 01000048C7442460FEFFFFFF48895810
 OrdersReceiver_issueOrder                        code 005078F0 005078F0 48895C24104C894C2420555641544155
 OrdersReceiver_dropGoals                      code 00509F40 00509F40 48895C240848896C2410488974241848
 OrdersReceiver_dropAllOrders                     code 00506A10 00506A10 40534883EC20488BD94883C13848897C
@@ -347,11 +351,13 @@ RefreshInventory                               code 004FEB50 004FEB50 488BC45748
 RelationsSetupPhase1                           code 006B3C30 006B3C30 4C8BDC565741544883EC6048C7442420
 RemoveDontDest                                 code 00749E10 00749E10 48895C2418555641544883EC2080BAD8
 RenderHolderPtr                                var  021322B8 021322B8 -
+ResearchAddToQueue                             code 008339D0 008339D0 4C8BDC565741544881EC9000000048C7
 ResearchConsume                                code 0082DA30 0082DA30 4154415541564883EC4048C7442420FE
 ResearchGetItemRet1                            ret  0082DAE8 0082DAE3 E84ED67DFF
 ResearchGetItemRet2                            ret  0082DB17 0082DB12 E81FD67DFF
 ResearchLoad                                   code 00835220 00835220 488BC45556574154415541564157488D
 ResearchSave                                   code 008301E0 008301E0 488BC45556574154415541564157488D
+ResearchSetLevel                               code 008334C0 008334C0 4883EC283B91700100007E0B89917001
 ResearchSetResearched                          code 00833680 00833680 488BC45557415441554156488DA838FE
 ResetGame                                      code 0036CA40 0036CA40 488BC455488D68984881EC6001000048
 RootObjectBase_getOwnerFactionDirect                      code 00593BB0 00593BB0 4883EC6848C7442420FEFFFFFF488B05
@@ -428,6 +434,8 @@ TradeResultMessage                             code 0070EC10 0070EC10 4055488DAC
 TradingForMoney                                code 00710240 00710240 4883EC2848833D5419A20102730733C0
 UniqueStateUpdate                              code 005CE9E0 005CE9E0 40574883EC20488BF9E84DE9A4FF84C0
 UnloadedUpdate                                 code 007EDBF0 007EDBF0 405556488D6C24B14881ECC8000000
+UnlockDoor                                     code 00569940 00569940 488B8170030000C6402000E97D6CAAFF
+UpdateGateCodeState                            code 00297250 00297250 40534883EC20488BD9E8588CD7FF488B
 UpdatePhysicalWithProgress                     code 00558680 00558680 488BC4565741544881EC2001000048C7
 UseableCursor                                  code 00546C30 00546C30 48895C2408574883EC20488B01488BD9
 UserPause                                      code 00787470 00787470 48895C241048896C2418488974242057
@@ -468,3 +476,15 @@ TradeWindowOpen                                code 00951620 00951620 4885D27450
 PlayerInterfaceCharacterEditor                 code 007F2AD0 007F2AD0 40574883EC6048C7442420FEFFFFFF48
 GameData_dtor                                  code 000B5ED0 000B5ED0 48894C2408574883EC3048C7442420FE
 ZoneMapContent_dropTownBuildings               code 009FD470 009FD470 488BC4554154415541564157488D68A1
+FactionScreen_nameEdited                       code 00491940 00491940 488BC45541544155488DA8A8FEFFFF48
+GuiMessageBox                                  code 00741600 00741600 405556574154415541564157488D6C24
+PlayerInterfaceMakeKnown                       code 007F72F0 007F72F0 4885D2743A48895424104883EC38488D
+PlayerInterfaceIsObjectSelected                code 007F4180 007F4180 4889742420574883EC20488BFA488BF1
+PlayerInterface_isEnemy                        code 0079C040 0079C040 488BC4554154415541564157488BEC48
+PlayerInterface_characterSelected              code 007FA870 007FA870 4055534154488D6C24B94881ECB00000
+Character_sneakingTest                         code 005C8CC0 005C8CC0 40534883EC2041B001488BD9410FB6D0
+SneakTestClickRet                              ret  007FB0E1 007FB0DC E89ECC84FF
+ContextMenu_showContextMenu                    code 007A6020 007A6020 405556574154415541564157488D6C24
+ContextMenu_fill                               code 007A7440 007A7440 488BC45556574154415541564157488D
+ShowMenuIsEnemyRet                             ret  007A6C8E 007A6C89 E8F39F8AFF
+Character_isTagged                             code 00677ED0 00677ED0 48895C24084889742410574883EC2048

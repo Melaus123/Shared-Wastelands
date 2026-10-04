@@ -18,7 +18,7 @@
 namespace swformat {
 
 enum FolderKind { kKindWorld = 0, kKindJoined = 1, kKindRecords = 2 };
-const unsigned int kWorldFolderFormat   = 1;   /* step 0 -> 1: world.txt gains its id line */
+const unsigned int kWorldFolderFormat   = 2;   /* step 0 -> 1: world.txt gains its id line; step 1 -> 2: a profiles.txt faction field may be '#' + hex (coopprof::FactionFieldFormat), which a build at 1 cannot read - a build at 1 refuses the folder instead of dropping those rows */
 const unsigned int kJoinedFolderFormat  = 1;   /* step 0 -> 1: the same-name world folder's outage journal is taken when it is this world's */
 const unsigned int kRecordsFolderFormat = 1;   /* step 0 -> 1: the number alone */
 const unsigned int kFormatMax = 999999999u;

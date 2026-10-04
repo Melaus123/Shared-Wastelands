@@ -3,15 +3,16 @@
    OUT OF A CONTAINER ANOTHER GAME WRITES IS HELD THERE, AND PUT DOWN THERE.
      HOLD  (ITEM_REQUEST dir 2) "the item at square S of that container is on my cursor": the writer lifts it out of its own copy into
            a hold row (alive, in no inventory) - the other players see it gone and cannot take it.
-     LAND  (ITEM_REQUEST dir 3) "the item I hold under hold H went down at square T of the SAME container": the writer puts its kept
-           object there (placed, merged onto the stack there, back onto the stack it came off, or swapped in).
-     A move inside one container (piece A) is a HOLD followed by a LAND to another square. A drop anywhere else is a LAND back onto
-     the item's own square, sent first, and then the road the drop always took (the link is ordered, so the writer has the item back
-     in its square when that road's request arrives).
+     LAND  (ITEM_REQUEST dir 3) "the item I hold under hold H went down at square T of the same container, or of ANOTHER BOX the same
+           game writes" (the taker box key names that box - T-159, protocol 138): the writer puts its kept object there (placed,
+           merged onto the stack there, back onto the stack it came off, or swapped in).
+     A move inside one container (piece A), or from one box to another box the same game writes, is a HOLD followed by a LAND. A
+     drop anywhere else is a LAND back onto the item's own square, sent first, and then the road the drop always took (the link is
+     ordered, so the writer has the item back in its square when that road's request arrives).
    Every publication the writer makes for a HOLD / LAND carries a request tag 'RQT1' {request id, the asker's slot}; the asker never
    applies a publication tagged with its own slot - it already shows that change (the absorb rule, design 3.4).
 
-   THE WIRE (protocol 126). Every block below is a fixed-size TRAILER, the last bytes of its message, announced by the message's own
+   THE WIRE (protocol 126; 138: a LAND's taker box key may name another box). Every block below is a fixed-size TRAILER, the last bytes of its message, announced by the message's own
    leading byte so no reader ever has to guess whether it is there:
      ITEM_REQUEST  dir byte 2 (HOLD) / 3 (LAND)  ->  'HLD1' {u32 tag, u32 hold id, u8 how, u32 asker slot}         13 bytes
      ITEM_CONFIRM  ok byte 2 (= ok, with where)   ->  'LND1' {u32 tag, u8 where, u32 x, u32 y}                      13 bytes
@@ -125,21 +126,25 @@ inline int HoldServeStep(int repeatRow, int isWriter, int accessOk, int refuseNe
    cellFits  the target square is empty and the kept object fits there; mergeOk  the target holds a stack of the same record with room
    for the units (the stack limit read first); oldFits  the hold's own square takes it; freeFound  some other square of the section
    takes it. A placed / swapped item goes into the square asked for; merged / back units onto the stack there. Anything else is the
-   writer's own player having changed the box meanwhile: its old square, then any square, else it is KEPT (parked, placed when room
-   appears) - every one of those is answered where != exact, and the asker re-asks the box. */
-const int kLpPlaceExact = 0, kLpMergeExact = 1, kLpOld = 2, kLpFree = 3, kLpKeep = 4;
-inline int LandPlan(int how, int cellFits, int mergeOk, int oldFits, int freeFound)
+   writer's own player having changed the box meanwhile: its old square, then (units off a stack - mergeOldOk: the stack they came
+   off is still there with room) back onto that stack, then any square, else it is KEPT (parked, placed when room appears) - every one
+   of those is answered where != exact, and the asker re-asks the box. freeTargetFirst (T-159, a LAND into another box whose free
+   square is in that box - LandFreeFrom kLfTarget): the player chose that box, so a free square there comes before the way home. */
+const int kLpPlaceExact = 0, kLpMergeExact = 1, kLpOld = 2, kLpFree = 3, kLpKeep = 4, kLpMergeOld = 5;
+inline int LandPlan(int how, int cellFits, int mergeOk, int oldFits, int freeFound, int mergeOldOk = 0, int freeTargetFirst = 0)
 {
     if ((how == kHowPlaced || how == kHowSwap) && cellFits != 0) return kLpPlaceExact;
     if ((how == kHowMerged || how == kHowBack) && mergeOk != 0) return kLpMergeExact;
+    if (freeTargetFirst != 0 && freeFound != 0) return kLpFree;
     if (oldFits != 0) return kLpOld;
+    if (mergeOldOk != 0) return kLpMergeOld;
     if (freeFound != 0) return kLpFree;
     return kLpKeep;
 }
 inline int LandWhereOf(int plan)
 {
     if (plan == kLpPlaceExact || plan == kLpMergeExact) return kWhereExact;
-    if (plan == kLpOld) return kWhereOld;
+    if (plan == kLpOld || plan == kLpMergeOld) return kWhereOld;
     if (plan == kLpFree) return kWhereFree;
     return kWhereKept;
 }
@@ -221,6 +226,51 @@ inline int HoldPreStep(int openRow, int recordFound, int landRefusedFound)
     if (recordFound != 0) return kHpRecord;
     if (landRefusedFound != 0) return kHpLandFirst;
     return kHpStep;
+}
+
+/* T-159: A DROP INTO ANOTHER BOX THE SAME GAME WRITES. An item lifted out of box X that another game writes (held, or a one-tick move)
+   and put down in box Y is a LAND into Y when: X and Y are both boxes; Y is not inside a pack and not a shop facade's half; this game
+   does not write Y but knows who does (the area verdict says another game holds it) and Y has a key; and the game that writes Y is the
+   game that writes X - the slots this game's requests for the two boxes would go to are equal (-1 included: with no slot known for
+   either, both requests go to the one linked game). 1 = a LAND into Y; 0 = the road a drop elsewhere always took (a LAND back onto
+   X's own square first). */
+inline int LandIntoOtherBox(int srcIsBox, int dstIsBox, int dstMine, int dstHeld, int dstKeyHas, int dstInBag, int dstFacade,
+                            int srcWriterSlot, int dstWriterSlot)
+{
+    if (srcIsBox == 0 || dstIsBox == 0 || dstMine != 0 || dstHeld == 0 || dstKeyHas == 0 || dstInBag != 0 || dstFacade != 0) return 0;
+    return (srcWriterSlot == dstWriterSlot) ? 1 : 0;
+}
+/* T-159: THE WRITER'S LOOK AT A LAND INTO ANOTHER BOX. The other box takes the item only when this game writes it too (read live),
+   its access policy lets that player in, and it is not a registered shop piece (never held for, or filled by, another player's
+   cursor). Otherwise the target is BARRED and the LAND is planned with no target square: the item goes back to its own square in
+   its own box, then any square there, else it is kept and placed when room appears - never dropped, never doubled; the answer says
+   where (not exact), so the asker re-reads both boxes. A LAND inside one container is never barred here. */
+inline int LandTargetOpen(int otherBox, int targetWriter, int targetAccess, int targetShopPiece)
+{
+    if (otherBox == 0) return 1;
+    return (targetWriter != 0 && targetAccess != 0 && targetShopPiece == 0) ? 1 : 0;
+}
+/* T-159: WHICH CONTAINER A LAND'S "any free square" comes from. Inside one container: that container (1). Into another box: a free
+   square of the target box first (1), else a free square of the item's own box (2) - a full target sends the item home, it never
+   waits while its own box has room. 0 = none (the item is kept). */
+const int kLfNone = 0, kLfTarget = 1, kLfOwn = 2;
+inline int LandFreeFrom(int otherBox, int targetOpen, int freeInTarget, int freeInOwn)
+{
+    if (otherBox == 0) return (freeInTarget != 0) ? kLfTarget : kLfNone;
+    if (targetOpen != 0 && freeInTarget != 0) return kLfTarget;
+    return (freeInOwn != 0) ? kLfOwn : kLfNone;
+}
+/* T-159: HOW THE ASKER RE-READS THE TARGET BOX after a LAND into another box that it must re-read (reask: the answer was not exact,
+   or the LAND was refused). The engine here already showed the item in that box at the drop. When this game does not write the box,
+   the ordinary ask (its writer's copy replaces this one). When this game WRITES it now (that box's area was handed to this game while
+   the LAND was in flight), its own copy - with the item shown at the drop - is what counts here and an ordinary ask is answered
+   "not the holder"; the box is PULLED instead: the previous writer's copy (the one the LAND was served against) goes in over this
+   one, so the item is in the box the writer put it in and nowhere else, however it was dropped (placed, merged, swapped or split). */
+const int kRrNone = 0, kRrAsk = 1, kRrPull = 2;
+inline int LandTargetReread(int reask, int otherBox, int targetMineNow)
+{
+    if (reask == 0 || otherBox == 0) return kRrNone;
+    return (targetMineNow != 0) ? kRrPull : kRrAsk;
 }
 
 }   /* namespace coophold */

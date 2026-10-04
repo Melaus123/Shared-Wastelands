@@ -51,7 +51,8 @@ bool PlatoonNudge(const std::string& worldId, float dx, float dz);
 void StoreBindPlatoon(void* platoon, const std::string& worldId);
 void StoreLinkFromWelcome(const std::string& address, unsigned short port);   /* E38 / decision 42: the notebook address the host published in its session WELCOME - opened at the title screen, before the world loads */
 void StoreRoleLeftSingle();                         /* E38 / decision 43: a `join` or `store server` verb took this game out of single-player - read the record index that was skipped at start */
-bool StoreTownPeoplePending(const char* townSid);   /* decision 34, ANY thread: the notebook lists living groups for this town that this game has not placed */
+int StoreTownPeoplePending(const char* townSid, int askSx, int askSy, char* holderOut, int holderCap);   /* decision 34 / T-580, ANY thread: does the notebook hold this town's creation back - townpending::kTownNotListed / kTownElsewhere / kTownHeld (src/common/townpending.h). (askSx, askSy) = the area the creation is for (-1 unread); holderOut (may be 0) names the note that holds it */
+std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z);   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set */
 void NoteTownPeople(const std::string& worldId, const std::string& town);   /* main thread: a received note names its home town ("" = none) */
 std::string StoreWorldIdOf(void* platoon);   /* P4p: the group's id string (Platoon+0x78), "" if unreadable */
 // P1b (b): the platoon is being destroyed by us (a live announcement superseded a sleeping copy) - forget it.
@@ -85,7 +86,10 @@ void StoreAdminDestroyEnd();
 /* M2 (decisions 32/44/54): ApplyRemoteGone and StoreWorldListed were the session link's RECORD_GONE / WORLD_LISTED entries - deleted. */
 void ApplyDeletedBits(const std::string& faction, const std::vector<char>& bits, const char* from);
 bool StoreSendAreas(const int* xy, int count, int playerX, int playerY);   // decision 32: my loaded areas (x,y pairs) to the relay, and (decision 37 amended) THIS game's own player sector after them - INT_MIN,INT_MIN when it is not known, which the relay stores for nobody
-bool StoreProfileFactionName(const std::string& name, const char* why);   /* names2a: MAIN THREAD - PROFILES kind 3, my faction's name for my profile's notebook row; false = not sent now (no profile / link down) */
+bool StoreProfileFactionName(const std::string& name, const char* why, int rename);   /* names2a: MAIN THREAD - PROFILES kind 3 (a load) or 5 (rename != 0: the player renamed), my faction's name for my profile's notebook row; false = not sent now (no profile / link down) */
+bool StoreProfileFactionSeen(unsigned num, const std::string& name);   /* T-368, MAIN THREAD: PROFILES kind 6 - this game has the FACTION answer naming `name` for profile num; false = not sent (another pick, link down) */
+bool StoreFactionNameTakenInWorld(const std::string& name);   /* T-368, MAIN THREAD: another profile of this world (connected or not) has this faction name (coopprof::FactionTakenIn over the world's TAKEN list; false in single player) */
+std::string StoreTakenFactionsText();                          /* T-368, MAIN THREAD: that list and its counters, for a log line */
 bool StoreProfileRequest(int kind, unsigned num, const std::string& name);   /* prof1: MAIN THREAD - PROFILES up (1 NEW <name>, 2 DELETE <num>); false = the notebook link is down */
 /* prof3 (design-mpmenu1 section 8) - THE YOUR PROFILES SCREEN'S HALF IN THE STORE.  MAIN THREAD, all of them: the PROFILES
    answer is read by PumpLink (main thread), and ui.cpp reads these from its title tick (main thread). */
@@ -99,6 +103,7 @@ long long StoreProfilesPanel(std::vector<StoreProfRow>* rows, unsigned* cap, uns
 int  StoreOpenSaveName(char* out, int cap);   /* PP6 fold-2 F2, MAIN THREAD: SaveFileSystem+0x120, the open save's name (the PP5 redirect's read) - 1 = read into out, 0 = unreadable */
 int  StoreAutoLoadFacts(std::string* folder, int* found, int* quickSave, int* neverPlayed, std::string* profName);   /* T-201 PP6': MAIN THREAD - 1 = the pick is admitted and its folder decided */
 int  StoreNewGameReshowTake();
+int  StoreNewGameReshowPending();   /* 1 = a refused NEW GAME's window is shown again on the next title tick (not taken) - MAIN THREAD */
 int  StoreSaveRequestCode(const void* saveMgr);   /* T-201 PP6': SaveManager+0xA0, the pending request code (-1 unreadable) - MAIN THREAD */   /* T-201 PP6' fold (F1): 1 once after a refused NEW GAME - the title pump shows the NEW GAME window again */
 bool StoreProfilePickFromPanel(unsigned num);   /* PLAY: ProfilePick(num), the same pick the automatic rule makes; false = nothing waits for a pick */
 /* M5a (T-197 piece 4; store protocol 59) - THE LIVE ROAD THROUGH THE NOTEBOOK, MAIN THREAD. StoreLiveReady: this game's
@@ -127,8 +132,11 @@ bool StoreWorldRoadPing(const char* why);
 std::string StoreLiveProbe();
 void StoreNoteCatchupAnswer(bool decoded, bool sent, long long chars);
 void WorldsyncCatchupAsk(const std::vector<char>& payload);
+bool StoreSendTeam(const std::vector<char>& payload);   /* T-546 step 3: MAIN THREAD - an encoded TEAM request to the world server; false = the link is down */
+bool StoreSendFallen(const std::vector<char>& payload);   /* T-556: MAIN THREAD - an encoded FALLEN request (ADD / TAKE / ASK) to the world server; false = the link is down */
 bool StoreSendWorldRel(const std::vector<char>& payload);   /* par24: MAIN THREAD - an encoded WORLD_REL (SEED or CHANGE) to the notebook; false = the link is down */
 bool StoreSendTownBar(const std::vector<char>& payload);   /* refill1: MAIN THREAD - encoded TOWN_BAR rows to the notebook; false = the link is down */
+bool StoreSendOwed(const std::vector<char>& payload);   /* T-581: MAIN THREAD - one encoded OWED up message (src/common/owedpop.h); false = the link is down */
 bool StoreSendResearch(const std::vector<char>& payload);   /* loot2b: MAIN THREAD - an encoded RESEARCH_BOX (one lifted box) to the notebook */
 bool StoreSendResearchTake(const std::vector<char>& payload);   /* loot2c: MAIN THREAD - an encoded RESEARCH_TAKE (one take row) to the notebook */
 bool StoreSendUniqueState(const std::string& sid, int state, int playerInvolved);   /* E5 / decision 31(c): MAIN THREAD - a named character's state to the notebook */
@@ -147,6 +155,7 @@ int  StoreJoinGateAsk(const char* where, int holdKind, const std::string& name);
 int  StoreJoinHoldPoll(int holdKind);                      // a held load of that kind: 0 = none (never held, or dropped), 1 = still held, 2 = start it now (the hold ends here)
 int  StoreRosterSlotInWorld(int slot);   // M7a fold F1, MAIN THREAD: 1 = that slot is IN_WORLD on THIS link's PLAYERS roster, 0 = it is not, -1 = no roster on this link / no slot
 int  StoreRosterNames(std::vector<std::string>* others);   // the other players on THIS link's PLAYERS roster; -1 = no roster on this link
+int  StoreWorldPlayerCount();                              // MAIN THREAD: every player number the world server ever gave in this world (THIS link's PLAYERS roster); -1 = no roster on this link
 int  StoreRosterNameOf(int slot, std::string* name);   // MAIN THREAD: the player name the last PLAYERS roster gives that slot; 1 = a name, 0 = listed without one or not listed, -1 = no roster yet
 /* M11 C1 (T-197, to-do M11; src/common/presence.h): is another player in this world - the old game-to-game link up, OR this link's
    PLAYERS roster shows another slot IN_WORLD. The seven single-writer sites ask this instead of the old link alone. */
@@ -216,8 +225,16 @@ int  StoreLinkSockState();
    SetStoreServer alone keeps a non-null link to the same address, so a re-dial is always this pair. Used by StoreRedialTick in a
    world and by config.cpp's title re-dial. */
 void RedialClearAndDial(const std::string& addr, unsigned short port, int dialAgain);
+/* TEST-ONLY `worldaway <seconds 5-600>`, MAIN THREAD: this game's world-server link (up and welcomed, a world running) is closed
+   here - the world server sees this player leave - and the re-dial is held for that long; then StoreRedialTick dials it again at
+   once, as after any outage (this game's world stays loaded: its next WELCOME brings the tables, the rows owed and the records).
+   Returns the status. */
+std::string StoreWorldAwayLever(const std::string& args);
 /* loot2c part B, MAIN THREAD: one line on the game's own message system (ShowGameMessagePod). 1 shown, 0 declined, -1 raised. */
 int StoreShowPlayerLine(const std::string& line);
+/* T-556 MAIN THREAD: the game clock's day number (the clock's own int, as the money bar's day is counted); -1 when the clock does
+   not read. */
+int StoreGameDay();
 /* U2 / W2b (decision 58), MAIN THREAD (it reads ConfigWorldKey): this game's world folder,
    %LOCALAPPDATA%\kenshi\save\coop-store\<world>, built by coopworld::WorldDir - the same construction
    SharedWastelandsServer.exe uses for its --world, so the plugin and the notebook name the same folder by construction
@@ -342,6 +359,34 @@ const int kActPeerGone = 1, kActSessionLeave = 2, kActResendHello = 3;
    verdict's loading term, and the two teardown ACTION kinds that used to run straight out of the welcome-only
    pump - review-p7h H-1's engine-touching path inside the window this header used to declare closed. */
 bool EngineWritesBlocked();
+/* T-546 step 5: a load's own-record restore (money, research, map, faction) is armed and has not run yet - the team's standing
+   writes wait for it, so the save's record does not overwrite them. MAIN THREAD. */
+bool StoreOwnRestorePending();
+/* T-546 step 6 (shared research; team.cpp, src/common/teamresearch.h). MAIN THREAD unless said.
+   StoreResearchTakeOwnFinished: the techs (stringIDs) the Research::setResearched hook saw finished on this game since the last
+   take - this game's own player's finishes - and how many were dropped past the list's cap.
+   StoreResearchFinished: this game's finished techs (Research::save's "finished<i>") and its queue's length; false = unreadable (*why).
+   StoreResearchLoadUnion: the techs of `team` this game lacks and knows, appended to its own record (every finished tech taken
+   out of its queue, the rest of the queue kept) and loaded ONCE through Research::load (no toast); *added = how many; "" = done
+   (also when nothing was missing), else why not.
+   StoreResearchApply: one tech, by the road this game's queue allows at that moment (teamresearch.h ResearchApplyRoute; *route):
+   the engine's setResearched (its "Research complete" toast and sound) - asOwn: through the hook, as this player's own finish
+   (the TEST-ONLY lever, refused for a tech queued behind the front); else as a teammate's, which the hook does not report - or,
+   for a teammate's tech queued behind the front, one Research::load (no toast). 1 = applied, 0 = not (*why), -1 = fault.
+   A fault in either switches the research category OFF for the process (StoreResearchOff; logged once).
+   StoreResearchQueue: this game's research queue now, front first (stringID, progress), and as text. StoreResearchQueueTech:
+   TEST-ONLY - the engine's own Research::addToQueue (the research screen's "add"); "" = queued, else why not (*detail: the
+   research level). StoreResearchNameOf: a tech's name in this game's data (the stringID when it has none). StoreResearchLevel:
+   this game's research level now (Research+0x170, what the queue's "add" checks a tech's level against), -1 = unreadable. */
+int StoreResearchLevel();
+void StoreResearchTakeOwnFinished(std::vector<std::string>* out, long long* dropped);
+bool StoreResearchFinished(std::vector<std::string>* sids, long long* queued, std::string* why);
+std::string StoreResearchLoadUnion(const std::vector<std::string>& team, int* added, std::string* detail);
+int StoreResearchApply(const std::string& sid, bool asOwn, std::string* name, std::string* why, int* route);
+bool StoreResearchOff();
+bool StoreResearchQueue(std::vector<std::pair<std::string, float> >* q, std::string* text, std::string* why);
+std::string StoreResearchQueueTech(const std::string& sid, std::string* name, std::string* detail);
+std::string StoreResearchNameOf(const std::string& sid);
 /* crime6 / crime10: this game's own absolute world hours - the double at clock+0xA0 the bounty map's times are measured
    against (crime9 answer 1) - -1 when unreadable. crime.cpp logs it and clamps every bounty time it writes to it.
    MAIN THREAD. */

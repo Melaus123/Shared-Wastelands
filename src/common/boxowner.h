@@ -54,10 +54,10 @@ inline int PickOwner(int hostFound, int hostCls, int hostSlot, int selfCls, int 
    a building? The placer's game decides at the commit from the host's owner class (hostCls / hostSlot as ItFactionOwnerClass
    reads them). Returns the slot the piece is HANDED to (the house owner), or -1 = the placer keeps it. *why: kHoNoHost
    (free-standing), kHoTown (nobody's house - decision 5, unchanged), kHoMine (the placer's own house), kHoHanded, kHoUnresolved
-   (the house is or may be a player's but whose cannot be read, or its slot does not fit the PLACE byte: the placer keeps it,
+   (the house is or may be a player's but whose cannot be read, or its slot is not a notebook slot: the placer keeps it,
    counted - fail visible). */
 const int kHoNoHost = 0, kHoTown = 1, kHoMine = 2, kHoHanded = 3, kHoUnresolved = 4;
-const int kHandSlotMax = 254;   /* the PLACE owner-slot byte carries 0..254; 0xFF = the sender */
+const int kHandSlotMax = 1023;   /* the PLACE's two-byte owner number carries every notebook slot 0..1023 (buildwire.h kBuildOwnerSlotMax) */
 inline int HouseOwnerOfNewPiece(int hostFound, int hostCls, int hostSlot, int mySlot, int* why)
 {
     if (hostFound == 0) { *why = kHoNoHost; return -1; }

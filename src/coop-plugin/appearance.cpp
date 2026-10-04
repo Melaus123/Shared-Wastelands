@@ -41,6 +41,8 @@
 #include "store.h"     /* crash2: StoreMainThreadId (the createBody guard skips on the main thread only) */
 #include "../common/copybody.h"   /* crash2: the pure skip rule */
 #include "../common/humantest.h"  /* T-293: the human class rule */
+#include "../common/kolook.h"     /* a copy met while its owner says knocked out is dressed before it goes down */
+#include "playerfaction.h"          /* IsStandInFaction: a copy of another player's character (lookKoArrival split) */
 #include "net/session.h"
 
 #include "coop_log.h"
@@ -174,6 +176,31 @@ std::map<unsigned int, bool> g_waitDownedClothing;
 static void NoteWaitEntered(std::map<unsigned int, bool>& waiting, unsigned int uid, long long* counter)
 {
     if (waiting.insert(std::make_pair(uid, true)).second) ++*counter;
+}
+
+// A COPY MET WHILE ITS OWNER SAYS KNOCKED OUT (src/common/kolook.h): its first look - and its worn items after it - go
+// through while it still stands and its knockdown is held for them; the hold then keeps the knockdown back while the rebuild
+// runs. g_copyLookApplied = uids of copies that have taken a look (forgotten when the copy is removed and at world teardown);
+// g_lookKoThrough = copies whose first look went through that way and whose worn items have not been applied yet (value
+// true; false once its worn items were counted clothLate).
+// lookKoArrival: [applied] first looks applied that way, [gaveUp] holds that gave up with the first look still pending
+// (the knockdown then lands and the look waits for the copy to stand), [clothLate] copies whose first look went through
+// that way but whose worn items, ready, found the hold gone or the copy down (they wait for it to stand; once per copy);
+// the Player pair counts copies of a player's characters (the copy's faction is a player's stand-in).
+std::map<unsigned int, bool> g_copyLookApplied;
+std::map<unsigned int, bool> g_lookKoThrough;
+long long g_lookKoApplied = 0, g_lookKoGaveUp = 0, g_lookKoAppliedPlayer = 0, g_lookKoGaveUpPlayer = 0;
+long long g_lookKoClothLate = 0;
+
+// 1 = the copy's faction is a player's stand-in (a copy of a player's character), 0 = not, -1 = no copy or a read faulted.
+// No C++ object with a destructor in this frame (C2712).
+static int CopyPlayerSidePod(::Character* c)
+{
+    if (c == 0) return -1;
+    ::Faction* f = 0;
+    __try { f = c->getOwnerFactionDirect(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return (f != 0 && coop::IsStandInFaction(f)) ? 1 : 0;
 }
 
 // Local guards. spawn.cpp's live in its anonymous namespace by design (they are not an
@@ -582,7 +609,8 @@ int RebuildInFlightGuarded(::Character* c)
 // that faults also waits. Off the main thread it never waits. While +0x143 stays set AppearanceBase::update calls createBody
 // and RETURNS before its +0x142 step (vt+0x30/+0x68) and its +0x141 step, so those wait with it. CopyRebuildInFlightAny
 // (the knockout / death gates) therefore reads a copy the guard holds NOW as NOT in flight - the hold is what keeps every
-// step of that rebuild off the held body - counted copyBodyHeld[gateHeldPassed]. KnockdownWait keeps the raw flags.
+// step of that rebuild off the held body - counted copyBodyHeld[gateHeldPassed]. KnockdownWait (the knockdown hold) asks
+// CopyRebuildInFlightAny too, so a copy the guard holds is not waited on there either.
 static unsigned long long kAnimalCreateBodyRva = 0;
 static AddrReg kAnimalCreateBodyRva_reg("AppearanceAnimalCreateBody", &kAnimalCreateBodyRva);   /* Steam_1.0.65 0x539C50 */
 typedef void (*AnimalCreateBodyFn)(void* app);
@@ -866,14 +894,20 @@ static void CopyBodyForgetUid(unsigned int uid)
     CopyBodyHeldRemove(uid);
 }
 
+// MAIN THREAD. Every copy is gone (world teardown, a world load): every guard mark goes with them.
+static void CopyBodyForgetAll()
+{
+    g_copyBodyEpisodes.clear();
+    g_copyBodyUidsEver.clear();
+    for (int i = 0; i < kCopyBodyHeldSlots; ++i) ::InterlockedExchange(&g_copyBodyHeldUid[i], 0);
+}
+
 // MAIN THREAD. T-293 fold 2 (F3-b): a world load (StoreWorldGenNow moved) clears the guard's maps; the uids describe the old world.
 static void CopyBodyWorldCheck()
 {
     const long gen = StoreWorldGenNow();
     if (gen == g_copyBodyMapsGen) return;
-    g_copyBodyEpisodes.clear();
-    g_copyBodyUidsEver.clear();
-    for (int i = 0; i < kCopyBodyHeldSlots; ++i) ::InterlockedExchange(&g_copyBodyHeldUid[i], 0);
+    CopyBodyForgetAll();
     g_copyBodyMapsGen = gen;
 }
 
@@ -1776,7 +1810,20 @@ void DeadlookForgetCopy(unsigned int uid)
     g_deadTouched.erase(uid);
     g_deadFirstSeen.erase(uid);
     g_deadHeldReason.erase(uid);
+    g_copyLookApplied.erase(uid);   // a re-spawned copy's first look is its own
+    g_lookKoThrough.erase(uid);
     CopyBodyForgetUid(uid);   // T-293 fold 2 (F3-b): the createBody guard's marks describe this copy only
+}
+
+// MAIN THREAD (spawn.cpp SpawnWorldTeardown): the marks above, for every copy at once - the world's copies all go with it.
+void DeadlookForgetAllCopies()
+{
+    g_deadTouched.clear();
+    g_deadFirstSeen.clear();
+    g_deadHeldReason.clear();
+    g_copyLookApplied.clear();   // a copy met in the next world with the same uid: its first look is its own
+    g_lookKoThrough.clear();
+    CopyBodyForgetAll();
 }
 
 // Defined below; declared here because the tick drives it. Ordering inside the tick is
@@ -2338,6 +2385,89 @@ bool AppearanceResendOwned(unsigned int uid)
     return true;
 }
 
+// T-556 (resurrect.cpp): a record this game applies to a character it DRIVES once its body can take it - the same gates as the
+// looktest own apply (standing, not in ragdoll, no get-up blend, settled and built) - and then sends: APPEARANCE with that
+// record, then CLOTHING with what it wears. The other games always get a look and the kit: when the apply fails, a send fails
+// or the body has not passed the gates within kOwnLookWaitMs, the character is handed to the settle send (WatchLocalRoll),
+// which sends its own look and what it wears (nothing, for a stripped character). A copy's CLOTHING waits for an APPEARANCE
+// (ApplyPendingGarments), so the kit never goes alone. A record that missed the deadline stays queued (late): it is still
+// applied, and APPEARANCE + CLOTHING sent again, when the body passes the gates; it leaves the queue only then, or when the
+// character is gone, or at world teardown. Result per uid (given once, at the first of: applied, failed, deadline, gone):
+// 0 waiting, 1 applied and both sent, 2 applied and a send failed, 3 not applied in time (still queued), 4 the apply failed
+// (2-4: handed to the settle send), -1 the character is gone. MAIN THREAD.
+struct OwnLookWait { RecordCopy rec; DWORD at; bool late; };
+static std::map<unsigned int, OwnLookWait> g_ownLook;
+static std::map<unsigned int, int> g_ownLookResult;
+static const DWORD kOwnLookWaitMs = 60000;
+
+void OwnLookQueue(unsigned int uid, const RecordCopy& rec)
+{
+    OwnLookWait& w = g_ownLook[uid];
+    w.rec = rec;
+    w.at = ::GetTickCount();
+    w.late = false;
+    g_ownLookResult[uid] = 0;
+}
+
+void OwnLookWorldTeardown()
+{
+    g_ownLook.clear();
+    g_ownLookResult.clear();
+}
+
+int OwnLookResult(unsigned int uid)
+{
+    std::map<unsigned int, int>::iterator it = g_ownLookResult.find(uid);
+    if (it == g_ownLookResult.end()) return -1;
+    const int r = it->second;
+    if (r != 0) g_ownLookResult.erase(it);
+    return r;
+}
+
+static void OwnLookTick()
+{
+    std::map<unsigned int, OwnLookWait>::iterator it = g_ownLook.begin();
+    while (it != g_ownLook.end())
+    {
+        const unsigned int uid = it->first;
+        ::Character* c = FindSpawned(uid);
+        const bool late = it->second.late;
+        if (c == 0) { if (!late) g_ownLookResult[uid] = -1; g_ownLook.erase(it++); continue; }
+        if (!late && (DWORD)(::GetTickCount() - it->second.at) >= kOwnLookWaitMs)
+        {
+            DebugLog("[P019] own record for uid=" + S(uid) + " NOT applied in " + S((long long)(kOwnLookWaitMs / 1000))
+                     + " s - its own look and kit go out by the settle send now; the record stays queued for when the body passes the gates");
+            WatchLocalRoll(uid);
+            g_ownLookResult[uid] = 3;
+            it->second.late = true;
+            ++it;
+            continue;
+        }
+        int ragdoll = 0, fault = 0;
+        OwnBodyHoldPod(c, &ragdoll, &fault);
+        BodyTestRead br;
+        if (coopbody::CopyBodyDecide(1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) { ++it; continue; }
+        BodyTestReadPod(c, &br);
+        if (br.ok == 0 || (br.blend != 0 && br.running != 0)) { ++it; continue; }
+        if (CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0)) { ++it; continue; }
+        int r = 4;
+        if (ApplyAppearanceRecord(c, it->second.rec))
+        {
+            r = net::SendAppearance(uid, it->second.rec) ? 1 : 2;
+            GarmentSet worn;
+            if (r == 1 && !(CaptureGarments(c, &worn) && net::SendClothing(uid, worn))) r = 2;
+            if (r == 1) InvNetNoteAnnounced((void*)c, uid);
+            DebugLog("[P019] -> APPEARANCE uid=" + S(uid) + (late ? " (own record applied LATE, after the deadline) " : " (own record applied first) ")
+                     + RecordSummary(it->second.rec)
+                     + (r == 1 ? " + CLOTHING " + GarmentSummary(worn) : std::string(" - a send FAILED: handed to the settle send")));
+        }
+        else DebugLog("[P019] own record for uid=" + S(uid) + " FAILED to apply - its own look and kit go out by the settle send");
+        if (r != 1) WatchLocalRoll(uid);
+        if (!late) g_ownLookResult[uid] = r;   // a late record's result (3) was given at the deadline
+        g_ownLook.erase(it++);
+    }
+}
+
 void AppearanceTick()
 {
     // This tick runs outside the engine's ragdoll pass, so the pass depth must read 0 here; anything else would hold every copy's
@@ -2353,6 +2483,7 @@ void AppearanceTick()
     CopyBodyWorldCheck();   // T-293 fold 2 (F3-b): a world load clears the createBody guard's maps
     KoSelfTick();     // P11 fold 1 TEST-ONLY lever: returns at once unless a `koself` call is being checked
     LookTestTick();   // TEST-ONLY lever: returns at once unless a `looktest` own apply waits
+    OwnLookTick();    // T-556: returns at once unless a brought-back character's record waits for its body
     BodyTestTick();   // TEST-ONLY lever: returns at once unless `bodytest pending` is armed
     // Send half: a uid we own, once its roll has settled. F157 is the whole reason this is a
     // tick and not a line inside the spawn path - at the moment the spawn returns the roll
@@ -2421,25 +2552,45 @@ void AppearanceTick()
             // clock for its clothing starts here if this is where it is first seen dead.
             // T-303: nor while its OWNER says dead and the copy's own death has not landed yet (a SPAWN death still retrying).
             // T-303 fold 1 (owner decision 223): ... except its FIRST appearance - a copy its SPAWN said dead that is still ALIVE,
-            // built and standing takes it once, then dies (medical.cpp SpawnDeathTry, at most 3 s after its body is built). A copy
+            // built and standing takes it once, then dies (medical.cpp SpawnDeathTry, at most kFirstLookWaitMs after its body is built). A copy
             // already dead never does: DeadPod refuses it first (deadlook1 unchanged).
-            if (DeadPod(c) != 0 || CopyDownedPod(c) != 0 || coop::CopyOwnerSaysKo(uid)
-                || (coop::CopyOwnerSaysDead(uid) && !coop::SpawnDeathLookWanted(uid)))
+            // A copy its OWNER says knocked out that still STANDS, alive, with its knockdown held for its looks right now
+            // (spawn.cpp CopyKnockdownHeld) takes its FIRST look here: the setAppearanceData call sets +0x142, so the hold
+            // keeps the knockdown back until the rebuild has run, and the copy goes down wearing its owner's look
+            // (src/common/kolook.h LookGate). Every read is live, at the moment of the apply.
+            const int lookDead = DeadPod(c);
+            const int lookDowned = CopyDownedPod(c);
+            const bool lookOwnerKo = coop::CopyOwnerSaysKo(uid);
+            const bool lookOwnerDead = coop::CopyOwnerSaysDead(uid);
+            const bool lookDeadWanted = lookOwnerDead && coop::SpawnDeathLookWanted(uid);
+            const bool lookFirst = g_copyLookApplied.find(uid) == g_copyLookApplied.end();
+            const bool lookHeld = lookOwnerKo && lookFirst && coop::CopyKnockdownHeld(uid);
+            if (coopkolook::LookGate(lookDead, lookDowned, lookOwnerKo, lookOwnerDead, lookDeadWanted, lookFirst, lookHeld)
+                != coopkolook::kLookApply)
             {
                 DeadNoteSeen(uid, c);
                 NoteWaitEntered(g_waitDownedAppearance, uid, &g_appearanceWaitDowned); ++it; continue;
             }
             g_waitDownedAppearance.erase(uid);
+            const bool lookKoThrough = coopkolook::LookThroughKoHold(lookDead, lookDowned, lookOwnerKo, lookOwnerDead,
+                                                                     lookDeadWanted, lookFirst, lookHeld);
 
             std::string before = AppearanceString(c);
             bool ok = ApplyAppearanceRecord(c, it->second);
-            if (ok) { ++g_c.applied; g_appearanceDone[uid] = true; }
+            if (ok) { ++g_c.applied; g_appearanceDone[uid] = true; g_copyLookApplied[uid] = true; }
             else    ++g_c.applyFailed;
+            if (ok && lookKoThrough)
+            {
+                g_lookKoThrough[uid] = true;
+                ++g_lookKoApplied;
+                if (CopyPlayerSidePod(c) == 1) ++g_lookKoAppliedPlayer;
+            }
             coop::SpawnDeathNoteLookApplied(uid, ok);   /* T-303 fold 1 (decision 223): a SPAWN-dead copy's kill waited for this */
             // PROBE-START: P091 - the APPEARANCE apply clock
             if (ok) P091NoteAppearanceApplied(uid);
             // PROBE-END: P091
-            DebugLog("[P019] <- APPEARANCE uid=" + S(uid) + (ok ? " applied" : " FAILED"));
+            DebugLog("[P019] <- APPEARANCE uid=" + S(uid) + (ok ? " applied" : " FAILED")
+                     + (lookKoThrough ? " (owner says knocked out; standing, knockdown held - lookKoArrival)" : ""));
             DebugLog("[P019]   before " + before);
             DebugLog("[P019]   after  " + AppearanceString(c));
             g_pendingRemote.erase(it++);
@@ -2507,8 +2658,32 @@ void ApplyPendingGarments()
         // re-dressed); the entry stays so that a RE-SPAWNED copy - whose marks DeadlookForgetCopy cleared - can be dressed.
         const int deadNow = DeadPod(c);
         bool deadApply = false;
-        if (deadNow != 0 || CopyDownedPod(c) != 0 || coop::CopyOwnerSaysKo(uid)   // crash1b
-            || coop::CopyOwnerSaysDead(uid))   /* T-303: owner says dead, the copy's death not landed yet - held as not-dead */
+        // The copy whose first look went through while its owner says knocked out (g_lookKoThrough) takes its worn items the
+        // same way: alive, standing and its knockdown still held for them, read live here (src/common/kolook.h).
+        const int clothDowned = CopyDownedPod(c);
+        const bool clothOwnerKo = coop::CopyOwnerSaysKo(uid);
+        const bool clothOwnerDead = coop::CopyOwnerSaysDead(uid);
+        const bool clothLookThrough = g_lookKoThrough.find(uid) != g_lookKoThrough.end();
+        const bool clothHeld = clothLookThrough && clothOwnerKo && coop::CopyKnockdownHeld(uid);
+        const bool clothKoThrough = coopkolook::ClothingThroughKoHold(deadNow, clothDowned, clothOwnerKo, clothOwnerDead,
+                                                                      clothLookThrough, clothHeld);
+        // Its first look went through on the held knockdown, but its worn items, ready now, found the hold gone (given up, past
+        // its bound) or the copy down: they wait while the owner says knocked out (clothOwnerKo). Counted once per copy (lookKoArrival clothLate).
+        if (coopkolook::ClothingMissedKoHold(deadNow, clothDowned, clothOwnerKo, clothOwnerDead, clothLookThrough, clothHeld))
+        {
+            std::map<unsigned int, bool>::iterator late = g_lookKoThrough.find(uid);
+            if (late != g_lookKoThrough.end() && late->second)
+            {
+                late->second = false;
+                ++g_lookKoClothLate;
+                DebugLog("[P022] CLOTHING uid=" + S(uid) + " its first look went through on the held knockdown, but the hold is"
+                         " gone or the copy is down now - the worn items wait for it to stand (lookKoArrival clothLate="
+                         + S(g_lookKoClothLate) + ")");
+            }
+        }
+        if (!clothKoThrough
+            && (deadNow != 0 || clothDowned != 0 || clothOwnerKo   // crash1b
+                || clothOwnerDead))   /* T-303: owner says dead, the copy's death not landed yet - held as not-dead */
         {
             const int v = (deadNow == 1) ? DeadClothingVerdict(uid, c) : kDeadNotDead;
             if (v == kDeadHeldCorpse)
@@ -2570,11 +2745,25 @@ void ApplyPendingGarments()
                          " - not expected");
             }
         }
-        DebugLog("[P022] <- CLOTHING uid=" + S(uid) + (ok ? " applied" : " FAILED") + (deadApply ? " (dead copy)" : ""));
+        if (ok) g_lookKoThrough.erase(uid);
+        DebugLog("[P022] <- CLOTHING uid=" + S(uid) + (ok ? " applied" : " FAILED") + (deadApply ? " (dead copy)" : "")
+                 + (clothKoThrough ? " (owner says knocked out; standing, knockdown held - lookKoArrival)" : ""));
         DebugLog("[P022]   before " + before);
         DebugLog("[P022]   after  " + GearString(c));
         g_pendingGarments.erase(it++);
     }
+}
+
+void NoteKnockLooksGaveUp(unsigned int uid)
+{
+    if (!coop::CopyOwnerSaysKo(uid)) return;
+    if (g_pendingRemote.find(uid) == g_pendingRemote.end()) return;          // no look waiting
+    if (g_copyLookApplied.find(uid) != g_copyLookApplied.end()) return;      // not its first look
+    ++g_lookKoGaveUp;
+    if (CopyPlayerSidePod(FindSpawned(uid)) == 1) ++g_lookKoGaveUpPlayer;
+    DebugLog("[P019] APPEARANCE uid=" + S(uid) + " the knockdown held for its first look gave up after "
+             + S((long long)coopkolook::kFirstLookWaitMs) + " ms - the copy goes down and the look waits until it stands"
+             " (lookKoArrival gaveUp=" + S(g_lookKoGaveUp) + ")");
 }
 
 int KnockdownWait(unsigned int uid, ::Character* c)
@@ -2648,6 +2837,11 @@ void ReportAppearanceCounters()
              // crash1c (R3b): alive copies waiting for their looks while the owner says KO (no behaviour change).
              + " crash1c[lookWaitOwnerKo]="
              + S(DownedWaitOwnerKoNow(g_waitDownedAppearance) + DownedWaitOwnerKoNow(g_waitDownedClothing))
+             // first looks applied to a standing copy whose owner says knocked out while its knockdown was held for them /
+             // holds that gave up with the first look pending / worn items that then found the hold gone or the copy down;
+             // then the first two for copies of a player's characters.
+             + " lookKoArrival[applied,gaveUp,clothLate]=" + S(g_lookKoApplied) + "," + S(g_lookKoGaveUp) + "," + S(g_lookKoClothLate)
+             + " lookKoArrivalPlayer[applied,gaveUp]=" + S(g_lookKoAppliedPlayer) + "," + S(g_lookKoGaveUpPlayer)
              // deadlook1 (owner decision 2026-09-26): dead HUMAN copies dressed with the owner's worn clothing (no body
              // rebuild); holds entered, once per uid per reason, for a looted dead copy (the item sync moved its items -
              // never re-dressed) / a dead animal / a dead copy not provably human / a dead human carried or in a bed or cage;

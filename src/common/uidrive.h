@@ -92,6 +92,16 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "optincg",       kDriveButton, "CoopOptInc6",           0 },
         { "optinch",       kDriveButton, "CoopOptInc7",           0 },
         { "optinci",       kDriveButton, "CoopOptInc8",           0 },
+        /* T-556: each shown row's tick box (rows a..i as above; MULTIPLAYER's RESURRECTION is row e) */
+        { "optticka",      kDriveButton, "CoopOptTick0",          0 },
+        { "opttickb",      kDriveButton, "CoopOptTick1",          0 },
+        { "opttickc",      kDriveButton, "CoopOptTick2",          0 },
+        { "opttickd",      kDriveButton, "CoopOptTick3",          0 },
+        { "optticke",      kDriveButton, "CoopOptTick4",          0 },
+        { "opttickf",      kDriveButton, "CoopOptTick5",          0 },
+        { "opttickg",      kDriveButton, "CoopOptTick6",          0 },
+        { "opttickh",      kDriveButton, "CoopOptTick7",          0 },
+        { "optticki",      kDriveButton, "CoopOptTick8",          0 },
         /* T-220: the panel's two close routes that are not a button of ours - the title-bar X and the Escape key */
         { "close",         kDriveWindowClose, "CoopPanel",         0 },
         { "escape",        kDriveEscape,      "CoopPanel",         0 },
@@ -104,6 +114,7 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "port",          kDriveEdit,   "CoopHostPortEdit",      0 },
         { "worldname",     kDriveEdit,   "CoopDlgNameEdit",       0 },
         { "profilename",   kDriveEdit,   "CoopDlgNameEdit",       0 },
+        { "fee",           kDriveEdit,   "SWOptFeeEdit",          0 },   /* T-556: GAME OPTIONS' RESURRECTION FEE box */
         /* the bug report window (bugreport.cpp): REPORT A BUG on the title screen, or in the Esc menu */
         { "bugreport",     kDriveButton, "BugReportTitleButton",  "BugReportPauseButton" },
         { "bugsend",       kDriveButton, "BugReportSend",         0 },

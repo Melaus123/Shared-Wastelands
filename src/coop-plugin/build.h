@@ -18,6 +18,8 @@ void BuildForgetWorld();                              // build1-c (review-build1
 void BuildNoteBad();                                  // build1-b: a MSG_BUILD that did not decode
 void BuildTestDrain();                                // K2 safe point (combat.cpp detour_tsRagdollUpdates): runs the armed request
 std::string BuildListCommand();
+std::string StandInCommand(const std::string& arg);     // TEST-ONLY, MAIN THREAD: `standin <slot> [read]` - make (or take into the table) / read back that player's stand-in and the loaded buildings it owns
+std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction
 std::string BuyHouseCommand(const std::string& arg);   /* P18 fold 1: TEST LEVER `buyhouse <buildingKey|nearest> [cats=<n>]` / `buyhouse show <buildingKey|last>` */
 int BuildRecordedOwnerSlot(const char* key);          // build1h, MAIN THREAD: the owner slot the build registry recorded for the piece at this P7n key (own rows: my slot); -1 none                       // MAIN THREAD, read-only: `buildlist` - the registry with live values
 void ReportBuild();                                   // one [BUILD] REPORT line (the `report` fan-out)

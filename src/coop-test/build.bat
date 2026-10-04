@@ -9,7 +9,8 @@ setlocal
 call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
 cd /d "%~dp0"
 
-cl /nologo /O2 /EHsc /MD /W4 /D_CRT_SECURE_NO_WARNINGS ^
+rem /bigobj: test_main.cpp holds more sections than the default object format allows (error C1128).
+cl /nologo /O2 /EHsc /MD /W4 /bigobj /D_CRT_SECURE_NO_WARNINGS ^
    /I ..\common ^
    test_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
    /Fecoop_test.exe ^

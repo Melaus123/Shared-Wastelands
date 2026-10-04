@@ -79,8 +79,17 @@
 //   which is the commonest apply once two games have converged and used to establish nothing at all.
 //
 // ON THE WIRE. The drain sends `kStoreMsgUniqueState` (store.cpp) on the notebook link, which the notebook process
-// knows as `MSG_UNIQUE_STATE` = 36 (src/coop-store/store_main.cpp): a string id, then the state, then playerInvolved.
+// knows as `MSG_UNIQUE_STATE` = 36 (src/coop-store/store_main.cpp): a string id, then the state, then playerInvolved. What the
+// world server sends also carries how many times that character was brought back.
+//
+// T-556 - A NAMED CHARACTER BROUGHT BACK (owner 493; the rule is src/common/fallenwire.h's). The engine's setter never lifts a
+// stored DEAD, so the world server's bring-back mark (an ALIVE with back > 0) is written into the entry directly on every game
+// whose map reads DEAD (WsBringBackPod) - except this game's own dead body, whose DEAD is newer. The game that brings one back
+// writes it ALIVE at once (WorldStateBroughtBack) and holds off a DEAD from the server for it until the server confirms. A DEAD
+// this game's map reads while a LIVING own character carries the record (the old body's squad unloading) is not published.
+// The loaded-character walk prefers a living carrier over a dead one, so the brought-back character, not the old body, answers.
 #include "worldstate.h"
+#include "resurrect.h"       // T-556: ResurrectNoteDeath - the fallen list
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "store.h"          // StoreSendUniqueState - the notebook link; P5m: StoreMainThreadId + StoreDeclareDeadPod
 #include "soak.h"           /* P7f (review-p6z C-1): GameplayRunning - F337's frame-counter test, the only honest "is there a world" (F034: the GameWorld pointer cannot tell) */
@@ -90,6 +99,8 @@
 #include <intrin.h>         // par6 fold (review-par6 #1): _ReturnAddress - which engine caller is killing a copy
 #include "coop_log.h"
 #include "game/GameWorld.h"   // P5m: activeCharacters - the engine's own set of the characters it is updating
+#include "game/Character.h"   // T-556: hasDied - a living carrier is preferred, and a living carrier's map DEAD is not published
+#include "../common/fallenwire.h"   // T-556: BringBackWrite, DeadMayPublish
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 #include <Windows.h>
 #include <map>          // E19: g_wsShadow, the main-thread picture of the state map
@@ -200,6 +211,9 @@ long long g_appliedMirrorMap = 0, g_reassertedLocal = 0;
 long long g_appliedDeadKillTwin = 0, g_reassertDamped = 0, g_reassertSent = 0, g_reassertSendFailed = 0;
 long long g_ownedHereCleared = 0, g_lastSendCapped = 0;
 long long g_loadedWalkRefused = 0, g_reportedOverflow = 0;
+long long g_broughtBackHere = 0, g_appliedBroughtBack = 0, g_backConfirmed = 0, g_deadKillHeldBack = 0, g_deadLivingCarrier = 0;   // T-556
+std::set<std::string> g_wsBackPending;   // T-556, MAIN THREAD: named characters this game brought back that the world server has not confirmed yet
+std::set<void*> g_wsBackGd;              // T-556, MAIN THREAD: the records of named characters brought back (by this game, or back > 0 from the world server)
 // E20, the send gate. `sendSkippedNotOwned` is a change on a character loaded here that is NOT ours (the ghost case,
 // which is the whole reason the gate exists). `sendSkippedUnknownOwner` is a change on a record no loaded character
 // carries any more - an unload or a respawn clear - where the shadow never established that this game owned it.
@@ -379,19 +393,32 @@ void* WsGetDataPod(const std::string* sid)   // the base container is the OBJECT
 // in this plugin (the state map's `hand` field is not carried at all - persistence-service.md 24), so the match is
 // made on the one key the map itself uses: the character's game-data record, read as a POD from Character+0x40 with
 // the same guarded read every detour uses. An implausible list size is REFUSED and counted rather than walked.
+int WsCharDeadPod(::Character* c)   // 1 dead, 0 alive, -1 unreadable
+{
+    __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// T-556: for a named character that was brought back, a living carrier is answered before a dead one - the record then has two
+// bodies here, the brought-back character and the old body, and the living one is the character the record is about. Every other
+// record keeps the walk's own order.
 ::Character* WsFindLoadedCharacter(void* gd)
 {
     if (!WsPlaus(gd) || !WsPlaus(coop::GameWorldPtr())) return 0;
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
     const size_t n = all.size();
     if (n > 20000) { ++g_loadedWalkRefused; return 0; }
+    const bool preferLiving = g_wsBackGd.count(gd) != 0;
+    ::Character* firstDead = 0;
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
         ::Character* c = *it;
         if (!WsPlaus(c)) continue;
-        if (WsCharGameData(c) == gd) return c;
+        if (WsCharGameData(c) != gd) continue;
+        if (!preferLiving) return c;
+        if (WsCharDeadPod(c) == 1) { if (firstDead == 0) firstDead = c; continue; }
+        return c;
     }
-    return 0;
+    return firstDead;
 }
 
 // ---- E20: WHO IS SIMULATING THIS RECORD HERE, AND IS IT OURS? MAIN THREAD ONLY. ----
@@ -521,6 +548,25 @@ int WsApplyPod(void* gd, int state, int playerInvolved)   // MAIN THREAD only: t
             return 1;
         }
         ((SetImprisonedFn)(g_base + kSetImprisonedRva))(map, gd, state == 2 ? (char)1 : (char)0, playerInvolved ? (char)1 : (char)0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// T-556 - MAIN THREAD: the state written into the record's entry directly, a stored DEAD included - the shape the engine's own
+// periodic update uses to write ALIVE into an existing entry (decomp_5ce9e0: find_or_insert, +0x30 = 1, +0x34 = 0). Used only for
+// a bring-back (fallenwire.h BringBackWrite); every other apply keeps the engine's own writers above.
+int WsBringBackPod(void* gd, int state, int playerInvolved)
+{
+    __try
+    {
+        void* map = ((GetMapFn)(g_base + kGetMapRva))();
+        if (!WsPlaus(map)) return 0;
+        void* key = gd;
+        void* node = ((FindOrInsertFn)(g_base + kFindOrInsertRva))(map, &key);
+        if (!WsPlaus(node)) return 0;
+        *(int*)((char*)node + kStateOff) = state;
+        *(char*)((char*)node + kPlayerOff) = playerInvolved ? (char)1 : (char)0;
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
@@ -683,8 +729,10 @@ void detour_declareDead(void* self)
     // The record is read BEFORE the original (the gate reads it and hands it back): the death path detaches the
     // character from its squad and ragdolls it, and this is a POD read of the character, not of the map.
     void* gd = 0;
-    if (!WsPlaus(self) || WsUniqueGate(self, &gd) == 0) { orig_declareDead(self); return; }
+    const int unique = WsPlaus(self) ? WsUniqueGate(self, &gd) : 0;
     orig_declareDead(self);
+    coop::ResurrectNoteDeath(self, ret, unique != 0 ? 1 : 0);   /* T-556: this game's own dead are snapshotted on the main thread */
+    if (unique == 0) return;
     if (gd != 0 && !WsApplying()) WsQueue(gd);
 }
 void detour_uniqueStateUpdate(void* self)
@@ -927,7 +975,8 @@ void WorldStateTick()
         // counters swapped populations, so `sendSkippedUnknownOwner` counted loaded twins. WsOwnedFlagOf is the
         // one place the classification lives (it is what the apply and the other three drain paths already use),
         // so a twin now lands with a ghost - flag 0, silenced, and counted as the not-ours skip that it is.
-        const int own = WsOwnershipOf(gd, 0);   // the drain needs the VERDICT, not the character
+        ::Character* carrier = 0;
+        const int own = WsOwnershipOf(gd, &carrier);   // the verdict, and (T-556) the character it was read from
         int ownedNow = WsOwnedFlagOf(own, (known ? it->second.ownedHere : 0));
         int maySend = 0;
         if (own == kOwnMine) maySend = 1;
@@ -978,6 +1027,13 @@ void WorldStateTick()
         // The register is what a respawn's clear is diffed against, so it records what this game OBSERVED non-ALIVE
         // whether or not the gate let it be published; the drain re-applies the gate when that entry is rung again.
         WsNoteReported(gd, state);   // E19: the register's only feeder, and it now runs on the main thread
+        // T-556: a DEAD read while a LIVING character of this game carries the record is not that character's death (the old
+        // body's squad unloading after a bring-back) and is not published; `deadLivingCarrier` is one more term of the identity.
+        if (maySend != 0 && own == kOwnMine && !swfallen::DeadMayPublish(state, (carrier != 0 && WsCharDeadPod(carrier) == 0) ? 1 : 0))
+        {
+            maySend = 0; ++g_deadLivingCarrier;
+            DebugLog("[WS] '" + std::string(sid) + "' reads DEAD here while a living character of this game carries it - not published (deadLivingCarrier=" + N(g_deadLivingCarrier) + ")");
+        }
         if (maySend == 0) continue;
         if (StoreSendUniqueState(std::string(sid), state, pi)) { ++g_sent; WsNoteSent(std::string(sid), state, false); }
         else ++g_sendFailed;
@@ -1022,11 +1078,13 @@ void WorldStateWorldTeardown()
     ::InterlockedExchange(&g_reportedN, 0);
     std::memset(g_reported, 0, sizeof(g_reported));
     g_wsUidGd.clear();   /* E32: the uid -> record links name this world's characters, exactly as the shadow's keys do */
+    g_wsBackPending.clear();   /* T-556: the bring-backs waiting for the server's word were made in this world */
+    g_wsBackGd.clear();        /* the next world's feed names its brought-back characters again */
     DebugLog("[WS] world teardown: forgot " + N((long long)had) + " shadow rows, the non-ALIVE register and the ring");
 }
 
 // MAIN THREAD: a state from the notebook process.
-void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved)
+void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved, unsigned int back)
 {
     ++g_recv;
     /* P7f (review-p6z C-1): this apply reaches GameDataContainer::getData, a walk of ou->activeCharacters()
@@ -1041,6 +1099,12 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
        state. This is the set the drain's first-sight rule asks. It is recorded BEFORE the id is resolved against
        this game's data, because "the notebook knows it" is true even for an id this save has never heard of. */
     g_wsNotebookSids.insert(sid);
+    /* T-556: the world server's bring-back mark confirms a bring-back made here - a DEAD for this id may kill again from now on */
+    if (state != 0 && back > 0 && g_wsBackPending.erase(sid) != 0)
+    {
+        ++g_backConfirmed;
+        DebugLog("[WS] '" + sid + "' bring-back confirmed by the world server (state " + N(state) + ", brought back " + N((long long)back) + " time(s))");
+    }
     /* P7p (review-p7f M-1): THE ACCEPTANCE TOKEN. WsGetDataPod is GameDataContainer::getData - the first engine
        call on this path, and everything above it (the malformed state, the empty sid, the null base) returns
        without touching the engine. */
@@ -1052,6 +1116,7 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
         if (g_unknownLogged.size() < 64 && g_unknownLogged.insert(sid).second) DebugLog("[WS] unique '" + sid + "' is not in this game's data - state " + N(state) + " ignored (first only per id)");
         return;
     }
+    if (back > 0) g_wsBackGd.insert(gd);   /* T-556: a brought-back character - its living carrier answers for it */
     const int before = WsStateOf(gd);
     // E19: the shadow learns what the map says here too, whatever this apply decides below. Without it the first
     // rung entry for this record would be a "first sight" of a non-ALIVE state and would be SENT - the notebook's
@@ -1084,6 +1149,14 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
         // makes. The applying-thread guard is set across it so our own declareDead detour books it as our echo and
         // sends nothing back. par6 fold (review-par6 #2): so is the world-record flag - a TWIN is a registered copy, and
         // the copy death gate would refuse this kill until the owner's STATE; the notebook's DEAD is the decision here.
+        // T-556: not a character this game brought back that the world server has not confirmed - its DEAD predates the TAKE.
+        if (g_wsBackPending.find(sid) != g_wsBackPending.end())
+        {
+            ++g_deadKillHeldBack;
+            WsShadowNote(gd, before, playerInvolved, sid, ownFlag);
+            DebugLog("[WS] '" + sid + "' is DEAD in the notebook but was brought back here and the world server has not confirmed it - NOT killed (deadKillHeld=" + N(g_deadKillHeldBack) + ")");
+            return;
+        }
         ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
         ::InterlockedExchange(&g_wsRecordKillThread, (LONG)::GetCurrentThreadId());
         const int killed = StoreDeclareDeadPod(live);
@@ -1129,6 +1202,20 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
             return;
         }
         if (localNow == state) { ++g_unchanged; WsShadowNote(gd, localNow, playerInvolved, sid, ownFlag); return; }
+        // T-556: the world server says this character was brought back and the living character carrying it here is ours - the
+        // map's DEAD is the old body's, so the server's state is written (an own DEAD body keeps the re-assert below).
+        if (swfallen::BringBackWrite(localNow, state, back, (live != 0 && WsCharDeadPod(live) == 0) ? 0 : 1))
+        {
+            ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
+            const int okb = WsBringBackPod(gd, state, playerInvolved);
+            ::InterlockedExchange(&g_wsApplyingThread, 0);
+            const int afterB = WsStateOf(gd);
+            WsShadowNote(gd, afterB, playerInvolved, sid, ownFlag);
+            if (okb == 0) { ++g_applyFault; ErrorLog("[WS] writing brought-back '" + sid + "' -> " + N(state) + " faulted"); return; }
+            ++g_appliedBroughtBack; ++g_applied;
+            DebugLog("[WS] '" + sid + "' brought back (" + N((long long)back) + " time(s)) - written " + N(state) + " over this game's DEAD, carried here by a living character of ours (map now " + N(afterB) + ")");
+            return;
+        }
         const int localPi = WsPlayerInvolvedOf(gd);
         WsShadowNote(gd, localNow, localPi, sid, ownFlag);   // what this game holds is not news for the drain to re-send
         // E27 / review-p5q HIGH-2 - THE DAMPER. During a hand-off both games own this uid for one round trip, and
@@ -1164,8 +1251,10 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
     if (own == kOwnMirror || own == kOwnTwin || own == kOwnUnknown) ++g_appliedMirrorMap;
     else if (state == 0) ++g_appliedDeadMap; else ++g_appliedMap;
 
+    /* T-556: a character the world server says was brought back is written past a stored DEAD (the setter alone would refuse) */
+    const bool backWrite = swfallen::BringBackWrite(before, state, back, 0);
     ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
-    const int ok = WsApplyPod(gd, state, playerInvolved);
+    const int ok = backWrite ? WsBringBackPod(gd, state, playerInvolved) : WsApplyPod(gd, state, playerInvolved);
     ::InterlockedExchange(&g_wsApplyingThread, 0);
     if (ok == 0)
     {
@@ -1179,7 +1268,11 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
     // refused (its setter never revives a DEAD entry) is booked as noEffect rather than as applied.
     const int after = WsStateOf(gd);
     WsShadowNote(gd, after, playerInvolved, sid, ownFlag);   // E19: what we just made the map say is not news
-    if (after == state) { ++g_applied; DebugLog("[WS] applied " + sid + " -> " + N(state) + " twin=" + N(isTwin) + " (from the notebook)"); }
+    if (after == state)
+    {
+        ++g_applied; if (backWrite) ++g_appliedBroughtBack;
+        DebugLog("[WS] applied " + sid + " -> " + N(state) + " twin=" + N(isTwin) + " (from the notebook)" + (backWrite ? " - BROUGHT BACK " + N((long long)back) + " time(s): written over this game's DEAD" : std::string()));
+    }
     else { ++g_noEffect; DebugLog("[WS] '" + sid + "' -> " + N(state) + " twin=" + N(isTwin) + " had NO EFFECT (state is " + N(after) + "; the engine's setter never revives a DEAD entry)"); }
 }
 
@@ -1198,6 +1291,33 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
 // lagged. The uid is on the ACK, so it is passed in and the record is found through the uid -> GameData* link
 // WsOwnershipOf records every time it resolves one. The Character* path is kept as the fallback for a uid nothing
 // has been recorded for (a hand-off before this game ever classified that record).
+// T-556 (owner 493) - MAIN THREAD, from resurrect.cpp right after a named character was brought back here.
+std::string WorldStateBroughtBack(const std::string& sid)
+{
+    if (g_base == 0 || sid.empty()) return "not marked (no string id)";
+    void* gd = WsGetDataPod(&sid);
+    if (gd == 0) return "not marked ('" + sid + "' is not in this game's data)";
+    g_wsBackPending.insert(sid);
+    g_wsBackGd.insert(gd);
+    const int before = WsStateOf(gd);
+    int after = before, ok = 1;
+    if (before == 0)
+    {
+        ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
+        ok = WsBringBackPod(gd, 1, 0);
+        ::InterlockedExchange(&g_wsApplyingThread, 0);
+        after = WsStateOf(gd);
+        if (ok == 0) ++g_applyFault;
+    }
+    WsShadowNote(gd, after, 0, sid, 1);   /* what this game just made the map say is not news for the drain */
+    ++g_broughtBackHere;
+    const std::string line = "this game's map read " + N(before) + " -> " + N(after)
+        + (before == 0 ? (ok ? " (written ALIVE)" : " (the write FAULTED)") : " (left as it was)")
+        + "; a DEAD from the world server does not kill it here until the server confirms the bring-back";
+    DebugLog("[WS] '" + sid + "' brought back here: " + line);
+    return line;
+}
+
 void WorldStateOnOwnershipReleased(unsigned int uid, const void* character)
 {
     void* gd = 0;
@@ -1245,7 +1365,8 @@ std::string WorldStateDetail()
          + " uniqueStateTeardown[worlds,ringDropped]=" + N(g_teardowns) + "," + N(g_teardownRingDropped)
          + " uniqueStateApply[deadKill,deadKillTwin,killNoEffect,deadMap,map,appliedMirrorMap,reassertedLocal,reassertDamped,walkRefused,reportedOverflow]=" + N(g_appliedDeadKill) + "," + N(g_appliedDeadKillTwin) + "," + N(g_killNoEffect) + "," + N(g_appliedDeadMap) + "," + N(g_appliedMap) + "," + N(g_appliedMirrorMap) + "," + N(g_reassertedLocal) + "," + N(g_reassertDamped) + "," + N(g_loadedWalkRefused) + "," + N(g_reportedOverflow)
          + " uniqueStateSend[sendSkippedNotOwned,sendSkippedUnknownOwner,sendSkippedUnknownUid,loadedNoUid,ownRefreshSkipped,ownedHereCleared,reassertSent,reassertSendFailed,lastSendCapped]=" + N(g_sendSkippedNotOwned) + "," + N(g_sendSkippedUnknownOwner) + "," + N(g_sendSkippedUnknownUid) + "," + N(g_loadedNoUid) + "," + N(g_ownRefreshSkipped) + "," + N(g_ownedHereCleared) + "," + N(g_reassertSent) + "," + N(g_reassertSendFailed) + "," + N(g_lastSendCapped)
-         + " uniqueStateRing[queued,dropped,ringDeduped,ringSlotShared,badGd,sidFault,stateFault,unloadOverflow,sendFailed,noEffect,applyFault]=" + N(g_queued) + "," + N(g_ringDropped) + "," + N(g_ringDeduped) + "," + N(g_ringSlotShared) + "," + N(g_drainBadGd) + "," + N(g_sidFault) + "," + N(g_stateFault) + "," + N(g_unloadOverflow) + "," + N(g_sendFailed) + "," + N(g_noEffect) + "," + N(g_applyFault);
+         + " uniqueStateRing[queued,dropped,ringDeduped,ringSlotShared,badGd,sidFault,stateFault,unloadOverflow,sendFailed,noEffect,applyFault]=" + N(g_queued) + "," + N(g_ringDropped) + "," + N(g_ringDeduped) + "," + N(g_ringSlotShared) + "," + N(g_drainBadGd) + "," + N(g_sidFault) + "," + N(g_stateFault) + "," + N(g_unloadOverflow) + "," + N(g_sendFailed) + "," + N(g_noEffect) + "," + N(g_applyFault)
+         + " uniqueStateBack[broughtBackHere,appliedBroughtBack,confirmed,deadKillHeld,deadLivingCarrier,pending]=" + N(g_broughtBackHere) + "," + N(g_appliedBroughtBack) + "," + N(g_backConfirmed) + "," + N(g_deadKillHeldBack) + "," + N(g_deadLivingCarrier) + "," + N((long long)g_wsBackPending.size());
 }
 
 } // namespace coop

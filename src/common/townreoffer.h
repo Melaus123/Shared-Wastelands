@@ -18,6 +18,8 @@ const int kDefNone = 0;         // answered: invent, another game holds it, or t
 const int kDefNoMap = 1;        // no fresh area map
 const int kDefNobody = 2;       // the map answered and nobody holds the area (and it is not this game's to presume)
 const int kDefNoNotebook = 3;   // no notebook link yet
+const int kDefTestLever = 4;   // T-581: the TEST-ONLY `owedtest aside on` - work this game would make now is set aside
+const int kDefOwed = 5;        // T-581: work this game would make now is an owed row it does not hold (made under a claim, owedpop.h)
 inline int DeferCause(int linked, int may, int held)
 {
     if (linked == 0) return kDefNoNotebook;
@@ -30,6 +32,8 @@ inline const char* DeferCauseName(int c)
     if (c == kDefNoMap) return "no-map";
     if (c == kDefNobody) return "nobody";
     if (c == kDefNoNotebook) return "no-notebook";
+    if (c == kDefTestLever) return "test-lever";
+    if (c == kDefOwed) return "owed";
     return "none";
 }
 
@@ -38,7 +42,8 @@ inline const char* DeferCauseName(int c)
 //   filled          1 = this game's own object already holds the result (bar: list mark 1 with count 0 - a later engine
 //                     pass used it); the entry is simply forgotten
 //   filledElsewhere 1 = the notebook records a fill by some game (bar: town_bars lastFilled >= 0) - never a second roll
-//   notebookPending 1 = the notebook lists people for the town this game has not placed yet (StoreTownPeoplePending)
+//   notebookPending 1 = the notebook lists people for the town this game has not placed yet, from an area that holds the town
+//                   (StoreTownPeoplePending answers townpending::kTownHeld - src/common/townpending.h)
 //   may             T-392 fold (review LOW): the load-time gate's own answer for the item's sector (zones' MayInventFromView:
 //                   1 invent, 0 not mine, -1 no fresh map, -2 teardown) - the same presumptions as at load
 //   held            AreaViewTS's held (1 = another game holds the area)

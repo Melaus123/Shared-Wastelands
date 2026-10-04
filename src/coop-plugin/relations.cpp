@@ -13,10 +13,16 @@
 #include "playerfaction.h"
 #include "tags.h"   /* TagsCaptionsDirty: a standing between this game and another player colours that player's name tags */
 #include "../common/nametag.h"   /* the name tag's relation levels */
+#include "../common/playerstab.h"   /* T-545: the other game's lines when another player's stance crosses the engine's lines */
+#include "team.h"                   /* T-546 step 4: TeamSameAnyThread - a teammate's side is held at ally */
+#include "peace.h"                  /* T-546 (owner 512): PeaceTeamPairAnyThread - the team pair */
+#include "../common/teameffect.h"   /* T-546 step 4: the pin's value and the stance a teammate may be given */
+#include "../common/teamstanding.h"   /* T-546 step 5: the team reason, a teammate's change taken, the either-side rule */
 #include "ownstore.h"   /* mmo3: OwnNoteFactionChange, OwnWriterOn */
 #include "../common/ownrec.h"   /* mmo3: the pp.faction record */
 #include "../common/slotwire.h"   /* stand1: @slot:<n> wire names */
 #include "../common/worldrelwire.h"   /* par24: the notebook's world-vs-world table (WORLD_REL) */
+#include "../common/relside.h"   /* the entry a changer wrote: on the player faction's relations, the other faction's side */
 #include "net/session.h"
 #include "../common/liveenvelope.h"   /* M7a fold F1: PeerInWorldAskDue */
 #include "coop_log.h"
@@ -31,6 +37,7 @@
 #include <vector>
 #include <set>   /* par24 */
 
+namespace coop { void TeamMarkOwn(::Faction* owner, ::Faction* other); }   /* T-546 step 5: defined with the shared standing below */
 namespace {
 unsigned long long kAffectRva = 0; static coop::AddrReg kAffectRva_reg("Affect", &kAffectRva);   /* P8h: the address table fills this. Steam_1.0.65 0x6B2B50 */
 unsigned long long kAffectEvRva = 0; static coop::AddrReg kAffectEvRva_reg("AffectEv", &kAffectEvRva);   /* P8h: the address table fills this. Steam_1.0.65 0x6B29D0 */
@@ -50,6 +57,8 @@ AffectFn orig_affect = 0; AffectEvFn orig_affectEv = 0; OneFn orig_declareWar = 
 SetRelFn orig_setRelation = 0; TrustFn orig_affectTrust = 0;
 
 bool g_on = true, g_installed = false, g_applying = false, g_wasLinked = false;
+bool g_teamWrite = false;   /* T-546 step 5: the write under way is the team's (the record written, a restore's NPC standing): Forward sends it with swteam::kRelReasonTeam and does not mark it as this game's own change */
+bool g_noTeamMark = false;  /* T-546 step 5: the write under way is not this game's own change (the load's own-record restore, a departure's sides put back) */
 /* E38: the snapshot latch and its deferral count. `g_snapshotSent` is lowered on the link-DOWN edge, so a
    reconnect re-sends; `g_relationsSnapshotDeferredFrames` counts PUMP FRAMES in which the snapshot was owed and could not be
    taken, which is the number that distinguishes "there was nothing to send" from "we never got round to it". */
@@ -61,7 +70,8 @@ long long g_relationsSnapshotDeferredFrames = 0;   /* P7f (review-p6z M-3): FRAM
 long long g_legacySkipped = 0;   /* stand1: pairs naming a protocol-67 `coop-peer` faction a save still carries - never forwarded */
 long long g_refusedNotSender = 0;   /* M5b: pairs refused because they belong to another player than the sender (must read 0) */ long long g_refusedOwnedHere = 0;   /* rel1: remote writes refused because this game owns the pair (must read 0) */
 long long g_changes = 0, g_forwarded = 0, g_notOwned = 0, g_echoSuppressed = 0, g_received = 0, g_applied = 0, g_unresolved = 0,
-          g_snapshots = 0, g_snapshotEntries = 0, g_faults = 0, g_sendFailed = 0, g_offNoLink = 0;
+          g_snapshots = 0, g_snapshotEntries = 0, g_sendFailed = 0, g_offNoLink = 0;
+volatile LONG64 g_faults = 0;   /* bumped on worker threads too: always interlocked */
 std::string g_lastForward, g_lastApplied;
 
 template <class T> std::string S(const T& v) { std::ostringstream o; o << v; return o.str(); }
@@ -89,9 +99,32 @@ int ReadSidPod(const ::Faction* f, char* buf, int cap)
     if (!Plaus(gd)) return 0;
     return CopyStdStringPod((const char*)gd + 0x58, buf, cap);
 }
+/* Player n's faction on this game: the stand-in met this session, else the coop-p<n> faction this world's save carries (a player
+   not seen since the world loaded; the PLAYERS tab lists them as offline). MAIN THREAD. */
+::Faction* StandInOrCarried(int n)
+{
+    ::Faction* f = coop::StandInForSlot(n);
+    if (Plaus(f)) return f;
+    if (!Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    f = coop::GameWorldPtr()->factionDirectory->findFactionById(coopslot::StandInId(n));
+    return (Plaus(f) && coop::StandInRecordSlot(f) == n) ? f : 0;
+}
+/* another player's faction: a stand-in met this session, or a coop-p<n> the save carries for a slot that is not this game's.
+   ANY THREAD (pointer compares and a guarded read of the record id). */
+bool OtherPlayersFaction(::Faction* f)
+{
+    if (!Plaus(f)) return false;
+    if (coop::IsPeerFaction(f)) return true;
+    const int s = coop::StandInRecordSlot(f);
+    return s >= 0 && s != coop::MySlotForWire();
+}
+long long g_relNotices = 0, g_relNoticesEngine = 0;   /* sentences shown here for another player's change; crossings this game's engine announced itself */
+long long g_relTeamQuiet = 0;   /* another player's changes not shown: the team's own pin, unpin or restore writes */
+playerstab::NoticeBook g_noticeBook;   /* what this player has been told about each other player's side towards them (MAIN THREAD) */
+volatile LONG64 g_playerPairEpoch = 0;   /* RelationsPlayerPairEpoch */
 // stand1 (docs/design-profiles1.md s2 Required 2): the wire name of a faction. A PLAYER faction travels by notebook SLOT - mine
-// as "@slot:<my slot>:<my faction's name>" (the name lets the other game follow a rename), a stand-in as "@slot:<its slot>" -
-// and every other faction by its stringID. Slots are absolute, so one pair has one name on both games (protocol 67's
+// as "@slot:<my slot>:<my faction's name>" (the name lets the other game follow a rename), a stand-in - met this session, or the
+// coop-p<n> faction the save carries - as "@slot:<its slot>", and every other faction by its stringID. Slots are absolute, so one pair has one name on both games (protocol 67's
 // "@player:" / "@peer" meant opposite things at the two ends and had to be swapped). A player faction with no slot yet has
 // no wire name: Snapshot waits for one, and a live change meanwhile counts as a fault.
 std::string SidOf(::Faction* f)
@@ -101,7 +134,7 @@ std::string SidOf(::Faction* f)
     if (coop::IsPlayerFaction(f)) { const int me = coop::MySlotForWire(); return me < 0 ? std::string() : coopslot::SlotWire(me, f->getName()); }
     char buf[160];
     if (!ReadSidPod(f, buf, 160)) return std::string();
-    return std::string(buf);
+    return coopslot::StandInIdAsSlotWire(std::string(buf), coop::MySlotForWire());
 }
 // "@slot:<n>[:<name>]" on THIS game: my slot is my player faction; another slot is that slot's stand-in - created (the CreatePeer
 // path) only when the name came with it, i.e. the sender's own player faction.
@@ -111,19 +144,21 @@ std::string SidOf(::Faction* f)
     if (!coopslot::ParseSlotWire(sid, &n, 0, &hasName) || n < 0) return 0;
     if (n == coop::MySlotForWire()) return coop::LocalPlayerFaction();
     if (mayCreate && hasName) return coop::ResolveWireFaction(sid);
-    return coop::StandInForSlot(n);
+    return StandInOrCarried(n);
 }
 ::Faction* FactionOf(const std::string& sid)
 {
     if (sid.empty() || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
-    if (coopslot::IsSlotWire(sid)) return FactionOfSlot(sid, true);
+    const std::string w = coopslot::StandInIdAsSlotWire(sid, coop::MySlotForWire());   /* a carried player's record id names that player's slot */
+    if (coopslot::IsSlotWire(w)) return FactionOfSlot(w, true);
     return coop::GameWorldPtr()->factionDirectory->findFactionById(sid);
 }
 // the same names produced by SidOf on THIS machine (the off-thread queue): never creates a stand-in
 ::Faction* FactionOfLocal(const std::string& sid)
 {
     if (sid.empty() || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
-    if (coopslot::IsSlotWire(sid)) return FactionOfSlot(sid, false);
+    const std::string w = coopslot::StandInIdAsSlotWire(sid, coop::MySlotForWire());
+    if (coopslot::IsSlotWire(w)) return FactionOfSlot(w, false);
     return coop::GameWorldPtr()->factionDirectory->findFactionById(sid);
 }
 struct Entry { float relation, trust, trustNeg; unsigned flags; };
@@ -153,6 +188,19 @@ int WriteEntry(void* rel, ::Faction* other, const Entry& e)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* the entry's ally flag (+0) to `on` - a plain store, as WriteEntry's */
+int SetAllyFlagPod(void* rel, ::Faction* other, bool on)
+{
+    __try
+    {
+        GetDataFn get = (GetDataFn)(Base() + kGetDataRva);
+        char* d = (char*)get(rel, other);
+        if (!Plaus(d)) return 0;
+        d[0] = on ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 int ReadFactionArrayPod(void*** arr, unsigned* n)
 {
     __try { *arr = *(void***)((char*)coop::GameWorldPtr()->factionDirectory + 0x10); *n = *(unsigned*)((char*)coop::GameWorldPtr()->factionDirectory + 8); return 1; }
@@ -171,18 +219,24 @@ void* RelationsOfPod(::Faction* f)
 void TagNoteRelation(::Faction* a, ::Faction* b)
 {
     if (!Plaus(a) || !Plaus(b)) return;
+    if (coop::IsPlayerFaction(a) || coop::IsPlayerFaction(b)) ::InterlockedIncrement64(&g_playerPairEpoch);
     if ((coop::IsPeerFaction(a) && coop::IsPlayerFaction(b)) || (coop::IsPeerFaction(b) && coop::IsPlayerFaction(a))) coop::TagsCaptionsDirty();
 }
 // Ownership: a standing involving MY player faction is mine; one involving the peer's is theirs; world-vs-world is the host's.
 // review-p3-factions: the OWNER side decides first, so a player<->player pair has exactly one owner per direction
 // (mine->peer is mine, peer->mine is theirs); then the other side; world-vs-world is the host's.
+/* ANY THREAD: pointer compares and guarded reads (IsPlayerFaction, OtherPlayersFaction, StandInRecordSlot) */
+relside::Side FacSide(::Faction* f)
+{
+    relside::Side r;
+    r.mine = coop::IsPlayerFaction(f);
+    r.otherPlayers = OtherPlayersFaction(f);   /* another player's faction - met this session or carried by the save - is that player's side */
+    r.world = !r.mine && !coop::IsPeerFaction(f) && coop::StandInRecordSlot(f) == -1;
+    return r;
+}
 bool Owned(::Faction* a, ::Faction* b)
 {
-    if (coop::IsPlayerFaction(a)) return true;
-    if (coop::IsPeerFaction(a)) return false;
-    if (coop::IsPlayerFaction(b)) return true;
-    if (coop::IsPeerFaction(b)) return false;
-    return false;   /* par24 (decision 48): world-vs-world is no game's - it was `SessionIsHost()`; WorldPair routes it to the notebook */
+    return relside::OwnsPair(FacSide(a), FacSide(b));   /* par24 (decision 48): world-vs-world is no game's; WorldPair routes it to the notebook */
 }
 /* par24 (parity P24): a pair with neither a player faction nor a player's stand-in on either side is WORLD-VS-WORLD. Its record
    is the NOTEBOOK's table (src/common/worldrelwire.h), not any one game's: a change this game's engine makes to it goes UP to
@@ -193,15 +247,14 @@ bool Owned(::Faction* a, ::Faction* b)
    -1 = an ordinary id; a slot, -2 coop-peer or -3 unreadable = not a world pair). */
 bool WorldPair(::Faction* a, ::Faction* b)
 {
-    return !coop::IsPlayerFaction(a) && !coop::IsPeerFaction(a) && !coop::IsPlayerFaction(b) && !coop::IsPeerFaction(b)
-        && coop::StandInRecordSlot(a) == -1 && coop::StandInRecordSlot(b) == -1;
+    return relside::WorldPair(FacSide(a), FacSide(b));
 }
 DWORD g_mainThread = 0; volatile LONG64 g_offThread = 0, g_queued = 0, g_queueDropped = 0; long long g_drained = 0, g_drainUnresolved = 0;
 // F483: the relation changers fire mostly on the AI worker thread (254/197 per run). The wire and the maps are main-thread only,
 // so an off-thread change is captured as POD (the entry is read there and then - the engine has just written it) and queued under
 // a lock; the tick drains the queue and forwards. Pointers are not kept: the sids are read at capture time (SidOf is string work
 // on the plugin's own heap, allocator-safe off-thread).
-struct Queued { std::string a, b; unsigned reason; };   // review-p3n F4: sids only - the drain re-reads the entry live
+struct Queued { std::string a, b; unsigned reason; bool noticed; };   /* noticed: a put-back of a move whose changer printed the engine's notice */   // review-p3n F4: sids only - the drain re-reads the entry live
 // review-p3p #5: the last value the OWNER sent for a pair we do not own - when our own engine moves that entry (it sees the
 // peer's puppets act), it is put back at once (main thread) or on the next tick (worker thread); no periodic re-send needed.
 std::map<std::string, Entry> g_ownerValues;              // key: ownerSid + "|" + otherSid (RECEIVER-side sids as they arrived)
@@ -210,22 +263,40 @@ long long g_reverted = 0, g_revertQueued = 0, g_revertNoValue = 0;
 std::string PairKey(const std::string& a, const std::string& b) { return a + "|" + b; }
 // the key under which a pair this game does not own ARRIVED. stand1: slots are absolute, so it is this game's own names in
 // key form (coopslot::SlotWireKey drops the player's name); protocol 67's marker swap is gone.
+std::string SideKey(const std::string& sid) { return coopslot::RelationSideKey(sid, coop::MySlotForWire()); }
 std::string RecvKeyOfLocal(::Faction* owner, ::Faction* other)
 {
-    return PairKey(coopslot::SlotWireKey(SidOf(owner)), coopslot::SlotWireKey(SidOf(other)));
+    return PairKey(SideKey(SidOf(owner)), SideKey(SidOf(other)));
 }
 // P081 (rel4): which pairs this game's engine moved and the mod put back - per pair: a count, the sum of the moves, and the
 // first 3 lines with a move of at least 0.01 (T318: 40 lines of 1e-5 drift hid everything else)
 struct P081Pair { long long n; long long small; double sum; int lines; };
 std::map<std::string, P081Pair> g_p081;
-int RevertPair(::Faction* owner, ::Faction* other)
+/* This game's engine moved the other player's side towards this player through a changer that prints its notice: the player
+   has been told about the engine's value (NoticeBook::EngineSaid). `from` is the owner's value the engine moved it from.
+   MAIN THREAD. */
+void NoteEngineNotice(::Faction* owner, ::Faction* other, const Entry& from, const Entry& to)
+{
+    if (!coop::IsPlayerFaction(other) || !OtherPlayersFaction(owner)) return;
+    if (g_noticeBook.EngineSaid(RecvKeyOfLocal(owner, other), from.relation, to.relation, (to.flags & 1u) != 0)) ++g_relNoticesEngine;
+}
+/* The mod put the other player's side towards this player back to its owner's value: the book holds the value put back, with
+   no line, so it equals what this game shows and the owner's next change is counted from it. MAIN THREAD. */
+void NotePutBack(::Faction* owner, ::Faction* other, const Entry& put)
+{
+    if (!coop::IsPlayerFaction(other) || !OtherPlayersFaction(owner)) return;
+    g_noticeBook.Quiet(RecvKeyOfLocal(owner, other), put.relation, (put.flags & 1u) != 0);
+}
+/* `noticed`: the engine's changer that moved it calls the engine's notice (Forward's caller says) */
+int RevertPair(::Faction* owner, ::Faction* other, bool noticed)
 {
     std::map<std::string, Entry>::const_iterator it = g_ownerValues.find(RecvKeyOfLocal(owner, other));
     if (it == g_ownerValues.end()) { ++g_revertNoValue; return 0; }
     void* rel = RelationsOfPod(owner); if (!Plaus(rel)) return -1;
     Entry engine; const int rd = ReadEntry(rel, other, &engine);   // P081: the value the engine just wrote
+    if (noticed && rd == 1) NoteEngineNotice(owner, other, it->second, engine);
     g_applying = true; const int w = WriteEntry(rel, other, it->second); g_applying = false;
-    if (w == 1) { ++g_reverted; TagNoteRelation(owner, other); }
+    if (w == 1) { ++g_reverted; TagNoteRelation(owner, other); NotePutBack(owner, other, it->second); }
     if (w == 1 && rd == 1 && engine.relation != it->second.relation)
     {
         const std::string pair = SidOf(owner) + "->" + SidOf(other);
@@ -301,22 +372,23 @@ void WorldRelTakeOffQueue()
         if (g_wrDirty.size() < (size_t)coopwrel::kWrMaxTable) g_wrDirty.insert(wk[i]); else ++g_wrDirtyDropped;
     }
 }
-void QueueOffThread(void* rel, ::Faction* other, unsigned reason)
+void QueueOffThread(void* rel, ::Faction* other, unsigned reason, bool noticed)
 {
     ::Faction* owner = OwnerOf(rel);
-    if (!Plaus(owner) || !Plaus(other)) { ++g_faults; return; }
-    if (WorldPair(owner, other)) { WorldRelQueueOff(owner, other); return; }   /* par24: the notebook's, not the session's */
-    if (!Owned(owner, other))
+    if (!Plaus(owner) || !Plaus(other)) { ::InterlockedIncrement64(&g_faults); return; }
+    const int road = relside::PairRoad(FacSide(owner), FacSide(other));
+    if (road == relside::kRoadWorldTable) { WorldRelQueueOff(owner, other); return; }   /* par24: the notebook's, not the session's */
+    if (road == relside::kRoadPutBack)
     {
         ++g_notOwned;
-        Queued rq; rq.a = SidOf(owner); rq.b = SidOf(other); rq.reason = 2;   // review-p3p #5: revert on the tick
+        Queued rq; rq.a = SidOf(owner); rq.b = SidOf(other); rq.reason = 2; rq.noticed = noticed;   // review-p3p #5: revert on the tick
         if (g_queueLockInit) { ::EnterCriticalSection(&g_queueLock); if (g_revertQueue.size() < 4096) { g_revertQueue.push_back(rq); ++g_revertQueued; } ::LeaveCriticalSection(&g_queueLock); }
         return;
     }
-    Queued q; q.a = SidOf(owner); q.b = SidOf(other); q.reason = reason;   // no engine map access off-thread beyond the engine's own
+    Queued q; q.a = SidOf(owner); q.b = SidOf(other); q.reason = reason; q.noticed = false;   // no engine map access off-thread beyond the engine's own
     if (coopslot::IsLegacyPeerId(q.a) || coopslot::IsLegacyPeerId(q.b)) { ++g_legacySkipped; return; }   /* stand1 */
     if ((q.a.empty() || q.b.empty()) && coop::MySlotForWire() < 0) { coop::NoteHeldForSlot(); return; }   /* stand1 fold (1d): held - the snapshot sent when my slot arrives carries it */
-    if (q.a.empty() || q.b.empty()) { ++g_faults; return; }
+    if (q.a.empty() || q.b.empty()) { ::InterlockedIncrement64(&g_faults); return; }
     if (!g_queueLockInit) { ::InterlockedIncrement64(&g_queueDropped); return; }
     ::EnterCriticalSection(&g_queueLock);
     if (g_queue.size() < 4096) { g_queue.push_back(q); ::InterlockedIncrement64(&g_queued); } else ::InterlockedIncrement64(&g_queueDropped);
@@ -327,17 +399,19 @@ void DrainQueue()
     if (!g_queueLockInit) return;
     std::vector<Queued> local, reverts;
     ::EnterCriticalSection(&g_queueLock); local.swap(g_queue); reverts.swap(g_revertQueue); ::LeaveCriticalSection(&g_queueLock);
-    for (size_t i = 0; g_on && i < reverts.size(); ++i) { ::Faction* o = FactionOfLocal(reverts[i].a); ::Faction* t = FactionOfLocal(reverts[i].b); if (Plaus(o) && Plaus(t)) RevertPair(o, t); }   // review-p3r M5
+    for (size_t i = 0; g_on && i < reverts.size(); ++i) { ::Faction* o = FactionOfLocal(reverts[i].a); ::Faction* t = FactionOfLocal(reverts[i].b); if (Plaus(o) && Plaus(t)) RevertPair(o, t, reverts[i].noticed); }   // review-p3r M5
     WorldRelTakeOffQueue();   /* par24: the off-thread world-pair changes, into the tick's dirty set */
     if (local.empty()) return;
+    for (size_t i = 0; i < local.size(); ++i)   /* T-546 step 5: the engine's own changes on the worker threads, marked whatever the link */
+        if (local[i].reason == 0) { ::Faction* o = FactionOfLocal(local[i].a); ::Faction* t = FactionOfLocal(local[i].b); if (Plaus(o) && Plaus(t)) coop::TeamMarkOwn(o, t); }
     if (!g_on || (!coop::net::SessionLinked() && !coop::StoreLiveReady())) { g_offNoLink += (long long)local.size(); return; }   /* M5a fold 1 (#4): a notebook-only game sends too */
     for (size_t i = 0; i < local.size(); ++i)
     {
         const Queued& q = local[i];
         ::Faction* owner = FactionOfLocal(q.a); ::Faction* other = FactionOfLocal(q.b);   // sender-side sids (T173: FactionOf swapped the players)
         if (!Plaus(owner) || !Plaus(other)) { ++g_drainUnresolved; continue; }   // renamed or freed since capture
-        void* rel = RelationsOfPod(owner); if (!Plaus(rel)) { ++g_faults; continue; }
-        Entry e; if (ReadEntry(rel, other, &e) != 1) { ++g_faults; continue; }   // main thread, the newest value
+        void* rel = RelationsOfPod(owner); if (!Plaus(rel)) { ::InterlockedIncrement64(&g_faults); continue; }
+        Entry e; if (ReadEntry(rel, other, &e) != 1) { ::InterlockedIncrement64(&g_faults); continue; }   // main thread, the newest value
         if (coop::net::SendRelation(q.a, q.b, e.relation, e.trust, e.trustNeg, e.flags, q.reason)) { ++g_forwarded; ++g_drained; g_lastForward = q.a + "->" + q.b + "=" + S(e.relation) + " (queued)"; }
         else ++g_sendFailed;
     }
@@ -350,29 +424,54 @@ void OwnFacNote(void* rel, ::Faction* other)
     ::Faction* owner = Plaus(rel) ? OwnerOf(rel) : 0;
     if ((Plaus(owner) && coop::IsPlayerFaction(owner)) || (Plaus(other) && coop::IsPlayerFaction(other))) coop::OwnNoteFactionChange();
 }
-void Forward(void* rel, ::Faction* other, unsigned reason)
+/* changer calls on the player faction's relations that wrote the other faction's entry towards the player (WrittenPair) */
+volatile LONG64 g_wroteOtherSide = 0;
+/* noticed: the hooked changer is one that calls the engine's notice 0x6B25A0 (affectRelations both overloads,
+   setNoLongerEnemies, declareWar, setEnemy - build/decomp_6b2b50 / 6b29d0 / 6b2c40 / 6b2cb0 / 6b2e40); setRelation and
+   affectTrust print nothing.
+   changer: which hooked changer moved the entry (relside::Changer), or kNotAChanger for a read of the pair as named. A changer
+   called on the player faction's relations wrote X -> player (src/common/relside.h): that pair is the one forwarded, put back
+   or recorded. ANY THREAD up to the thread test: guarded reads only. */
+void Forward(void* rel, ::Faction* other, unsigned reason, bool noticed = false, int changer = relside::kNotAChanger)
 {
+    if (changer != relside::kNotAChanger && Plaus(rel) && Plaus(other))
+    {
+        ::Faction* owner = OwnerOf(rel);
+        ::Faction* wOwner = owner; ::Faction* wOther = other;
+        relside::WrittenPair(changer, Plaus(owner) && coop::IsPlayerFaction(owner), owner, other, &wOwner, &wOther);
+        if (wOwner != owner)
+        {
+            void* wRel = RelationsOfPod(wOwner);
+            if (!Plaus(wRel)) { ::InterlockedIncrement64(&g_faults); return; }
+            ::InterlockedIncrement64(&g_wroteOtherSide);
+            rel = wRel; other = wOther;
+            noticed = false;   /* the engine's notice prints only when the faction it was called towards is the player's - here it was not */
+        }
+    }
     if (reason == 0) OwnFacNote(rel, other);   /* mmo3: every detoured writer comes through here with reason 0 (the snapshot passes 1) */
     if (reason == 0) TagNoteRelation(Plaus(rel) ? OwnerOf(rel) : 0, other);
-    if (g_applying) { ++g_echoSuppressed; return; }
-    if (g_mainThread != 0 && ::GetCurrentThreadId() != g_mainThread) { ::InterlockedIncrement64(&g_offThread); if (g_on) QueueOffThread(rel, other, reason); return; }
+    const int moment = relside::ForwardMoment(g_applying, g_mainThread != 0, ::GetCurrentThreadId() == g_mainThread);
+    if (moment == relside::kMomentEcho) { ++g_echoSuppressed; return; }
+    if (moment == relside::kMomentQueue) { ::InterlockedIncrement64(&g_offThread); if (g_on) QueueOffThread(rel, other, reason, noticed); return; }
     ++g_changes;
+    if (reason == 0 && !g_teamWrite && !g_noTeamMark) coop::TeamMarkOwn(OwnerOf(rel), other);   /* T-546 step 5: this game's own change */
     if (!g_on) return;
     ::Faction* owner = OwnerOf(rel);
-    if (!Plaus(owner) || !Plaus(other)) { ++g_faults; return; }
-    if (WorldPair(owner, other)) { WorldRelNote(owner, other); return; }   /* par24: world-vs-world goes to the notebook, never on the session link */
-    if (!Owned(owner, other)) { ++g_notOwned; if (g_on) RevertPair(owner, other); return; }   // review-p3p #5: put the owner's value back now
+    if (!Plaus(owner) || !Plaus(other)) { ::InterlockedIncrement64(&g_faults); return; }
+    const int road = relside::PairRoad(FacSide(owner), FacSide(other));
+    if (road == relside::kRoadWorldTable) { WorldRelNote(owner, other); return; }   /* par24: world-vs-world goes to the notebook, never on the session link */
+    if (road == relside::kRoadPutBack) { ++g_notOwned; if (g_on) RevertPair(owner, other, noticed); return; }   // review-p3p #5: put the owner's value back now
     if (!coop::net::SessionLinked() && !coop::StoreLiveReady()) { ++g_offNoLink; return; }   /* M5a fold 1 (#4): a game linked only to the notebook (a third player) sends its standings too - session.cpp picks the road(s), one delivery per destination */
-    Entry e; if (ReadEntry(rel, other, &e) != 1) { ++g_faults; return; }
+    Entry e; if (ReadEntry(rel, other, &e) != 1) { ::InterlockedIncrement64(&g_faults); return; }
     const std::string a = SidOf(owner), b = SidOf(other);
     if (coopslot::IsLegacyPeerId(a) || coopslot::IsLegacyPeerId(b)) { ++g_legacySkipped; return; }   /* stand1: a save's protocol-67 stand-in is dormant */
     if ((a.empty() || b.empty()) && coop::MySlotForWire() < 0) { coop::NoteHeldForSlot(); return; }   /* stand1 fold (1d): held - the snapshot sent when my slot arrives carries it */
-    if (a.empty() || b.empty()) { ++g_faults; return; }
-    if (coop::net::SendRelation(a, b, e.relation, e.trust, e.trustNeg, e.flags, reason)) { ++g_forwarded; g_lastForward = a + "->" + b + "=" + S(e.relation); }
+    if (a.empty() || b.empty()) { ::InterlockedIncrement64(&g_faults); return; }
+    if (coop::net::SendRelation(a, b, e.relation, e.trust, e.trustNeg, e.flags, (g_teamWrite && reason == 0) ? swteam::kRelReasonTeam : reason)) { ++g_forwarded; g_lastForward = a + "->" + b + "=" + S(e.relation); }
     else ++g_sendFailed;
 }
 
-float detour_affect(void* self, ::Faction* f, float amount, float mult) { float r = orig_affect(self, f, amount, mult); Forward(self, f, 0); return r; }
+float detour_affect(void* self, ::Faction* f, float amount, float mult) { float r = orig_affect(self, f, amount, mult); Forward(self, f, 0, true, relside::kAffect); return r; }
 // PROBE-START: P083
 // P083 (rel5a): which by-event affectRelations (0x6B29D0) calls this game's engine makes on pairs with a player faction or the
 // coop-peer faction on either side - event, multiplier, the entry before and after. Read-only (no writes, no sends); independent
@@ -395,8 +494,14 @@ void P083Log(void* self, ::Faction* f, int ev, float mult, int rdB, const Entry&
              + " before=" + P083Val(rdB, b) + " after=" + P083Val(rdA, a) + " applying=" + S(g_applying ? 1 : 0));
 }
 // PROBE-END: P083
+/* T-546 (owner 512): standing changes by event (a hit, a shot) between two factions of this player's team that this game's engine
+   would otherwise make - the shooter's game moving a teammate's stand-in towards this player when its copy is shot. Not passed to
+   the engine, as the player's own relations take none (PlayerFactionRelations' slot +0x28 is empty, H071): no move, no notice, no
+   forward, no revert. ANY THREAD (an interlocked count). */
+volatile LONG64 g_teamEvSkipped = 0;
 void detour_affectEv(void* self, ::Faction* f, int ev, float mult)
 {
+    if (coop::PeaceTeamPairAnyThread(Plaus(self) ? OwnerOf(self) : 0, f)) { ::InterlockedIncrement64(&g_teamEvSkipped); return; }
     // PROBE-START: P083
     const bool p083 = P083Match(self, f);
     const bool p083Main = p083 && (g_mainThread == 0 || ::GetCurrentThreadId() == g_mainThread);   // as Forward decides it
@@ -413,16 +518,18 @@ void detour_affectEv(void* self, ::Faction* f, int ev, float mult)
     // PROBE-START: P083
     if (p083Main) { Entry p083A = {0, 0, 0, 0}; const int p083RdA = p083Read ? ReadEntry(self, f, &p083A) : 0; P083Log(self, f, ev, mult, p083RdB, p083B, p083RdA, p083A); }
     // PROBE-END: P083
-    Forward(self, f, 0);
+    Forward(self, f, 0, true, relside::kAffectEvent);
 }
-void detour_declareWar(void* self, ::Faction* f) { orig_declareWar(self, f); Forward(self, f, 0); }
-void detour_noLonger(void* self, ::Faction* f) { orig_noLonger(self, f); Forward(self, f, 0); }
-void detour_setEnemy(void* self, ::Faction* f) { orig_setEnemy(self, f); Forward(self, f, 0); }
-void detour_setRelation(void* self, ::Faction* f, float v) { orig_setRelation(self, f, v); Forward(self, f, 0); }
-void detour_affectTrust(void* self, ::Faction* f, float amount, float mult) { orig_affectTrust(self, f, amount, mult); Forward(self, f, 0); }
+void detour_declareWar(void* self, ::Faction* f) { orig_declareWar(self, f); Forward(self, f, 0, true, relside::kDeclareWar); }
+void detour_noLonger(void* self, ::Faction* f) { orig_noLonger(self, f); Forward(self, f, 0, true, relside::kNoLongerEnemies); }
+void detour_setEnemy(void* self, ::Faction* f) { orig_setEnemy(self, f); Forward(self, f, 0, true, relside::kSetEnemy); }
+void detour_setRelation(void* self, ::Faction* f, float v) { orig_setRelation(self, f, v); Forward(self, f, 0, false, relside::kSetRelation); }
+void detour_affectTrust(void* self, ::Faction* f, float amount, float mult) { orig_affectTrust(self, f, amount, mult); Forward(self, f, 0, false, relside::kAffectTrust); }
 
-// The owned snapshot: my player faction against every faction, both directions (2N entries; absent entries are created at
-// the engine's default, which is what the engine would do on first contact anyway).
+// The owned snapshot: every faction's standing towards my player faction, and my player faction's own row towards every other
+// faction. This game's engine never reads that own row (the player's lookup reads X -> me), but the other games keep it as the
+// value their stand-in for this player puts back to - and the stand-in's table IS read there - so it is still sent; absent
+// entries are created at the engine's default, which is what the engine would do on first contact.
 // E38 - THIS NOW REPORTS WHETHER IT ACTUALLY SENT ANYTHING. It used to return void, and RelationsTick fired it
 // exactly once, on the link-up edge. Under decision 42 that edge happens AT THE TITLE SCREEN, where there is no
 // world and therefore no local player faction, so the function returned at its second line and the standings
@@ -435,7 +542,7 @@ bool Snapshot()
     ::Faction* mine = coop::LocalPlayerFaction();
     if (!Plaus(mine) || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return false;
     void** arr = 0; unsigned n = 0;
-    if (!ReadFactionArrayPod(&arr, &n)) { ++g_faults; return false; }
+    if (!ReadFactionArrayPod(&arr, &n)) { ::InterlockedIncrement64(&g_faults); return false; }
     if (!Plaus(arr) || n > 4096) return false;
     long long sent = 0;
     for (unsigned i = 0; i < n; ++i)
@@ -740,10 +847,13 @@ void RelationsTick()
     g_wasLinked = linked;   /* E38: still the link-edge memory, but the snapshot no longer reads it - g_snapshotSent is what says whether this link has had one */
 }
 
+/* T-546 step 5 (the shared standing block below RelationsOwnRestore): another player's side towards this game's team */
+int TeamFoldTheirs(::Faction* theirs, int level);
+
 void SetRelationsOn(bool on) { g_on = on; DebugLog(std::string("[REL] ") + (on ? "ON" : "OFF")); }
 void RelationsSendSnapshot() { Snapshot(); }
 void RelationsNoteRelayedDropped() { g_relSyncOwed = true; ++g_relDroppedResync; }   /* M5a fold 1 (#2b) */
-void RelationsForgetQueue() { g_wrApplyAll = true; g_wrTableApplied = false; g_wrSeedState = 0; g_wrSeedOut.clear(); g_wrDirty.clear(); g_wrPending.clear(); g_wrPendingChange.clear(); g_wrSent.Clear();   /* par24: the next world writes the notebook's whole table (g_wr is kept - the notebook's truth, not a pointer) and re-owes its walk */ if (!g_queueLockInit) return; ::EnterCriticalSection(&g_queueLock); g_queue.clear(); g_revertQueue.clear(); g_wrOffQueue.clear(); ::LeaveCriticalSection(&g_queueLock); }   // review-p3r M4: g_ownerValues (sids -> values) stays - the owner's truth, not a pointer   // review-p3o M3: old-world entries must not be re-resolved against the new world   // an event (a rename) - the owned entries carry "@player:<new name>"
+void RelationsForgetQueue() { RelationsTeamForgetBase(); g_noticeBook.Clear(); g_wrApplyAll = true; g_wrTableApplied = false; g_wrSeedState = 0; g_wrSeedOut.clear(); g_wrDirty.clear(); g_wrPending.clear(); g_wrPendingChange.clear(); g_wrSent.Clear();   /* par24: the next world writes the notebook's whole table (g_wr is kept - the notebook's truth, not a pointer) and re-owes its walk */ if (!g_queueLockInit) return; ::EnterCriticalSection(&g_queueLock); g_queue.clear(); g_revertQueue.clear(); g_wrOffQueue.clear(); ::LeaveCriticalSection(&g_queueLock); }   // review-p3r M4: g_ownerValues (sids -> values) stays - the owner's truth, not a pointer   // review-p3o M3: old-world entries must not be re-resolved against the new world   // an event (a rename) - the owned entries carry "@player:<new name>"
 
 void ApplyRemoteRelation(const std::string& ownerSid, const std::string& otherSid, float relation, float trust, float trustNeg,
                          unsigned int flags, unsigned int reason)
@@ -754,7 +864,9 @@ void ApplyRemoteRelation(const std::string& ownerSid, const std::string& otherSi
        must be the sending player: the notebook's stamp for a relayed pair, the session peer's PEER_SLOT otherwise. Checked
        before any name is resolved, so a refused pair creates no stand-in. Unknown on either side: taken as before. */
     {
-        const int sender = coop::WireSenderSlot(), owning = coopslot::PairOwnerSlot(ownerSid, otherSid);
+        const int me = coop::MySlotForWire();   /* a carried player's record id names that player's slot, as the receiver keys it */
+        const int sender = coop::WireSenderSlot(),
+                  owning = coopslot::PairOwnerSlot(coopslot::StandInIdAsSlotWire(ownerSid, me), coopslot::StandInIdAsSlotWire(otherSid, me));
         if (sender >= 0 && owning >= 0 && owning != sender)
         {
             if (++g_refusedNotSender <= 5) DebugLog("[REL] REFUSED '" + ownerSid + "' -> '" + otherSid + "' from slot " + S(sender) + ": that standing is slot " + S(owning) + "'s (M5b)");
@@ -780,16 +892,59 @@ void ApplyRemoteRelation(const std::string& ownerSid, const std::string& otherSi
         return;
     }
     void* rel = RelationsOfPod(owner);
-    if (!Plaus(rel)) { ++g_faults; return; }
+    if (!Plaus(rel)) { ::InterlockedIncrement64(&g_faults); return; }
     Entry e; e.relation = relation; e.trust = trust; e.trustNeg = trustNeg; e.flags = flags;
-    const std::string ka = coopslot::SlotWireKey(ownerSid), kb = coopslot::SlotWireKey(otherSid);   /* stand1: keyed by SLOT - absolute on both games, and a rename keeps its key */
+    const std::string ka = SideKey(ownerSid), kb = SideKey(otherSid);   /* stand1: keyed by SLOT - absolute on both games, and a rename keeps its key */
     g_ownerValues[PairKey(ka, kb)] = e;
+    Entry before; const int rb = ReadEntry(rel, other, &before);
     g_applying = true;
     const int w = WriteEntry(rel, other, e);
     g_applying = false;
     if (w == 1) TagNoteRelation(owner, other);
-    if (w == 1) { ++g_applied; g_lastApplied = ka + "->" + kb + "=" + S(relation) + (reason ? " (snapshot)" : ""); if (reason == 0) DebugLog("[REL] applied " + g_lastApplied); }
-    else ++g_faults;
+    /* Another player's side towards this player. The engine prints its sentences only on the game whose engine moved the standing
+       (its changers -> 0x6B25A0), fights included; this write is a plain store, so a live change is announced here in the engine's
+       words: one line per change of level from what this player was last told (g_noticeBook, which follows what this game shows:
+       a change one road already brought adds none, and an engine sentence the mod then put back counts from the value put back).
+       A snapshot's re-send only updates what was told. A teammate's side (or one within teamscreen::kMateQuietMs of the two
+       joining or parting) moved by the team's own pin, unpin or restore is told nothing either: only the faction lines are. */
+    if (w == 1 && coop::IsPlayerFaction(other) && OtherPlayersFaction(owner))
+    {
+        const std::string key = PairKey(ka, kb);
+        const int meQ = coop::MySlotForWire();
+        const int ownerSlot = coopslot::PairOwnerSlot(coopslot::StandInIdAsSlotWire(ownerSid, meQ), std::string());
+        const bool teamWrite = reason == 0 && rb == 1 && ownerSlot >= 0 && coop::TeamMateQuietAnyThread(meQ, ownerSlot);
+        if (teamWrite)
+        {
+            ++g_relTeamQuiet;
+            g_noticeBook.Quiet(key, relation, (flags & 1u) != 0);
+            if (g_relTeamQuiet <= 40) DebugLog("[RELATE] their change not shown: slot " + S(ownerSlot) + "'s side " + S(before.relation) + " -> " + S(relation)
+                                               + " is the team's own write (teammates, or joined / parted moments ago) (quiet " + S(g_relTeamQuiet) + ")");
+        }
+        else if (reason != 0 || rb != 1) g_noticeBook.Quiet(key, relation, (flags & 1u) != 0);
+        else
+        {
+            std::string name = coop::StandInDisplayName(owner);
+            if (name.empty()) name = owner->getName();
+            const std::vector<std::string> lines = g_noticeBook.Live(key, before.relation, (before.flags & 1u) != 0, relation, (flags & 1u) != 0, name);
+            for (size_t i = 0; i < lines.size(); ++i)
+            {
+                const int shown = coop::StoreShowPlayerLine(lines[i]);
+                ++g_relNotices;
+                DebugLog("[RELATE] their change shown: '" + lines[i] + "' (" + ka + "->" + kb + " " + S(before.relation) + " -> " + S(relation)
+                         + (shown == 1 ? ")" : ", message line NOT shown " + S(shown) + ")"));
+            }
+        }
+    }
+    /* logged: another game's own change, and a team's write (the record written, a restore) between two players' factions - the
+       copy of a member's side that the team's record moved on that member's game */
+    if (w == 1)
+    {
+        ++g_applied;
+        const bool teamRow = reason == swteam::kRelReasonTeam;
+        g_lastApplied = ka + "->" + kb + "=" + S(relation) + (teamRow ? " (the team's write)" : reason ? " (snapshot)" : "");
+        if (reason == 0 || (teamRow && OtherPlayersFaction(owner) && (OtherPlayersFaction(other) || coop::IsPlayerFaction(other)))) DebugLog("[REL] applied " + g_lastApplied);
+    }
+    else ::InterlockedIncrement64(&g_faults);
 }
 
 /* The name tag's level between this game's player faction and another player's faction: each direction judged by the game's
@@ -805,9 +960,26 @@ int RelationsTagLevel(::Faction* mine, ::Faction* theirs, int* reads)
         if (Plaus(rm) && ReadEntry(rm, theirs, &e) == 1) ab = nametag::LevelOf(e.relation, (e.flags & 1u) != 0);
         void* rt = RelationsOfPod(theirs);
         if (Plaus(rt) && ReadEntry(rt, mine, &e) == 1) ba = nametag::LevelOf(e.relation, (e.flags & 1u) != 0);
+        ba = TeamFoldTheirs(theirs, ba);   /* T-546 step 5 (476): its side towards any member of this game's team counts */
     }
     if (reads != 0) *reads = (ab != nametag::kUnknown ? 1 : 0) + (ba != nametag::kUnknown ? 1 : 0);
     return nametag::WorseLevel(ab, ba);
+}
+
+long long RelationsPlayerPairEpoch() { return (long long)g_playerPairEpoch; }
+
+/* T-545: both directions between this game's player faction and another player's faction, each as the name tag judges it
+   (kUnknown when unread). MAIN THREAD - the same inserting accessor as RelationsTagLevel. */
+void RelationsStanceLevels(::Faction* mine, ::Faction* theirs, int* you, int* them)
+{
+    *you = nametag::kUnknown; *them = nametag::kUnknown;
+    if (kGetDataRva == 0 || !Plaus(mine) || !Plaus(theirs)) return;
+    Entry e = { 0.0f, 0.0f, 0.0f, 0u };
+    void* rm = RelationsOfPod(mine);
+    if (Plaus(rm) && ReadEntry(rm, theirs, &e) == 1) *you = nametag::LevelOf(e.relation, (e.flags & 1u) != 0);
+    void* rt = RelationsOfPod(theirs);
+    if (Plaus(rt) && ReadEntry(rt, mine, &e) == 1) *them = nametag::LevelOf(e.relation, (e.flags & 1u) != 0);
+    *them = TeamFoldTheirs(theirs, *them);   /* T-546 step 5 (476): its side towards any member of this game's team counts */
 }
 
 // P079 (rel2): read-only. Reading through the engine's accessor seeds a missing entry at the faction's own default relation
@@ -860,7 +1032,8 @@ bool EngineEnemy(const Entry& e) { return e.relation <= kEnemyThreshold; }
    move a chosen level afterwards (vanilla). */
 const float kRelateAlly = 100.0f, kRelateNeutral = 0.0f, kRelateHostile = -100.0f;
 long long g_relSet[3] = { 0, 0, 0 };   /* ally, neutral, hostile - through the relate verb */
-long long g_relViaAlly = 0, g_relRefusedTarget = 0, g_relRefused = 0, g_relFaults = 0;
+long long g_relViaAlly = 0, g_relRefusedTarget = 0, g_relRefused = 0, g_relFaults = 0, g_relRefusedTeammate = 0, g_relRefusedFounders = 0, g_relFanOut = 0;
+bool g_relFanning = false;   /* T-546 step 5: RelateSet is setting the same stance towards the target's teammates */
 std::string g_relLast;
 std::string LevelOf(float v) { return v >= kAllyThreshold ? std::string("ally") : v <= kEnemyThreshold ? std::string("hostile") : std::string("neutral"); }
 struct WireMark { long long fwd, noLink, fail, queued; };
@@ -874,8 +1047,8 @@ std::string WireSince(const WireMark& m)
          : g_sendFailed > m.fail ? "SEND-FAILED"
          : g_on ? "not-forwarded" : "relations-off(set here only)";
 }
-/* relate1: the plain line, plus the line the player could see later. setRelation 0x6B4A30 shows no message (design s3), so the
-   mod words its own; for now it is a log line only - the on-screen text is build step 8 (relate2). */
+/* relate1: the plain line. setRelation 0x6B4A30 shows no message (design s3): the PLAYERS tab shows this player's own line
+   (playerstab.cpp SetStance) and the other game shows the engine's sentence (ApplyRemoteRelation); the relate verb shows none. */
 void RelateAnnounce(float before, const Entry& a, int ra, const std::string& level, const std::string& wire, bool viaAlly, ::Faction* target)
 {
     if (viaAlly) ++g_relViaAlly;
@@ -885,16 +1058,13 @@ void RelateAnnounce(float before, const Entry& a, int ra, const std::string& lev
              + " engineAlly=" + (ra == 1 ? S(EngineAlly(a) ? 1 : 0) : std::string("n/a"))
              + " engineEnemy=" + (ra == 1 ? S(EngineEnemy(a) ? 1 : 0) : std::string("n/a"))
              + (viaAlly ? " via=ally-verb" : ""));
-    std::string who = coop::StandInDisplayName(target);   /* stand1: the stand-in the verb named, not "the peer" */
-    if (who.empty()) who = "the other player";
-    const std::string shown = level == "ally" ? "Ally" : level == "hostile" ? "Hostile" : "Neutral";
-    DebugLog("[RELATE] player notice: 'You are now " + shown + " towards " + who + ".' (log only - the game shows no message for setRelation; on-screen text is step 8)");
+    (void)target;
 }
 ::Faction* PairFaction(const std::string& t)
 {
     if (t == "@me") return coop::LocalPlayerFaction();
     if (t == "@peer") return coop::PeerFaction();   /* stand1: kept as the alias for "the one other player" (the game on the session link) */
-    if (coopslot::IsSlotWire(t)) { int n = -1; if (!coopslot::ParseSlotWire(t, &n, 0, 0) || n < 0) return 0; return n == coop::MySlotForWire() ? coop::LocalPlayerFaction() : coop::StandInForSlot(n); }   /* stand1: @slot:<n> */
+    if (coopslot::IsSlotWire(t)) { int n = -1; if (!coopslot::ParseSlotWire(t, &n, 0, 0) || n < 0) return 0; return n == coop::MySlotForWire() ? coop::LocalPlayerFaction() : StandInOrCarried(n); }   /* stand1: @slot:<n> */
     return (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory)) ? coop::GameWorldPtr()->factionDirectory->findFactionById(t) : 0;
 }
 }
@@ -950,7 +1120,7 @@ std::string RelateSet(const std::string& target, const std::string& level)
     if (!GameplayRunning() || EngineWritesBlocked()) { ++g_relRefused; DebugLog("[RELATE] " + level + " refused: no running world (or engine writes are blocked)"); return "error relate not-in-game"; }
     ::Faction* me = coop::LocalPlayerFaction();
     ::Faction* t = PairFaction(target);
-    ::Faction* standin = (Plaus(t) && coop::IsPeerFaction(t)) ? t : 0;   /* stand1: ANY player's stand-in - @peer (the one on the link) or @slot:<n> */
+    ::Faction* standin = OtherPlayersFaction(t) ? t : 0;   /* ANY other player's stand-in - @peer (the one on the link), @slot:<n> met this session or carried by the save */
     if (!Plaus(t) || !Plaus(standin))
     {
         ++g_relRefusedTarget;
@@ -958,20 +1128,93 @@ std::string RelateSet(const std::string& target, const std::string& level)
                  + ") - relations are set towards other players only, not towns or factions");
         return "error relate not-a-player";
     }
+    /* T-546 step 4: towards a player who shares this player's faction (a team on the world server's table) only ally - the pin
+       (team.cpp) holds this side at ally while both are in it */
+    {
+        int ts = coop::StandInSlotOf(standin);
+        if (ts < 0) ts = coop::StandInRecordSlot(standin);
+        if (!swteam::StanceAllowedTowards(coop::TeamSameAnyThread(coop::MySlotForWire(), ts), li))
+        {
+            ++g_relRefusedTeammate;
+            DebugLog("[RELATE] " + level + " refused: s" + S(ts) + " shares this player's faction - this game's side towards a teammate is held at ally while both are in it");
+            return "error relate teammate";
+        }
+        /* T-546 step 5 (476): a member's stance towards a player outside its team is the founder's to set */
+        if (coop::TeamStanceIsFounders(ts))
+        {
+            ++g_relRefusedFounders;
+            DebugLog("[RELATE] " + level + " refused: this player is a member of a faction - its stance towards s" + S(ts) + " is the founder's to set");
+            return "error relate founder-sets";
+        }
+    }
     if (!Plaus(me)) { ++g_relRefused; DebugLog("[RELATE] " + level + " refused: no player faction on this game"); return "error relate no-faction"; }
     if (kSetRelationRva == 0 || kGetDataRva == 0) { ++g_relRefused; DebugLog("[RELATE] " + level + " refused: setRelation/getRelationData address not in the table"); return "error relate no-address"; }
     void* rel = RelationsOfPod(me);
     Entry b;
     if (!Plaus(rel) || ReadEntry(rel, standin, &b) != 1) { ++g_relFaults; DebugLog("[RELATE] " + level + " FAULT: my relations entry for the stand-in could not be read"); return "error relate fault"; }
+    /* A NEUTRAL or HOSTILE choice clears this side's ally FLAG (+0), which answers ally whatever the value (0x6B22E0): a plain
+       store BEFORE setRelation, so the entry Forward sends carries it cleared. The engine has no setter that clears it between two
+       factions - setNoLongerEnemies 0x6B2C40 clears the atWar byte (+2) only, and the flag is set only on a faction's own entry
+       (0x6B3C30 / 0x6B3D80). If setRelation faults the flag is set again: a refused choice leaves the entry as it was. */
+    const bool flagCleared = playerstab::ClearsAllyFlag(li, (b.flags & 1u) != 0) && SetAllyFlagPod(rel, standin, false) == 1;
     const WireMark m = MarkWire();
-    if (CallSetRelationPod(rel, standin, v) != 1) { ++g_relFaults; DebugLog("[RELATE] " + level + " FAULT: the engine's setRelation raised"); return "error relate fault"; }
+    if (CallSetRelationPod(rel, standin, v) != 1)
+    {
+        ++g_relFaults;
+        const int back = flagCleared ? SetAllyFlagPod(rel, standin, true) : 1;
+        DebugLog("[RELATE] " + level + " FAULT: the engine's setRelation raised" + (flagCleared ? (back == 1 ? " - the ally FLAG set again" : " - the ally FLAG could NOT be set again") : ""));
+        return "error relate fault";
+    }
     Entry a; const int ra = ReadEntry(rel, standin, &a);
     g_allyHaveBefore = false;   /* a chosen level replaces whatever `ally off` would have restored */
     ++g_relSet[li];
     RelateAnnounce(b.relation, a, ra, level, WireSince(m), false, standin);
+    if (flagCleared) DebugLog("[RELATE] the entry's ally FLAG was set - cleared with this " + level + " choice (the engine's ally test, the table and the other game's sentence follow the value)");
     if (ra == 1 && li != 0 && (a.flags & 1u))
-        DebugLog("[RELATE] the entry's ally FLAG is set (not by this verb) - the engine still answers ally; this verb moves only the relation value");
+        DebugLog("[RELATE] the entry's ally FLAG is STILL set after the " + level + " choice - the engine still answers ally");
+    /* T-546 step 5 (476, either side): a stance set towards a member of a faction this player is not in is set towards every
+       member of that faction - the whole team is in effect what this player chose */
+    if (!g_relFanning)
+    {
+        int ts = coop::StandInSlotOf(standin);
+        if (ts < 0) ts = coop::StandInRecordSlot(standin);
+        const std::vector<int> more = coop::TeamFanOutTargets(ts);
+        std::string said;
+        g_relFanning = true;
+        for (size_t i = 0; i < more.size(); ++i)
+        {
+            const std::string r = RelateSet(coopslot::kSlotWirePrefix + coopslot::SlotNum(more[i]), level);
+            ++g_relFanOut;
+            said += (said.empty() ? "" : ", ") + std::string("s") + S((long long)more[i]) + " " + r;
+        }
+        g_relFanning = false;
+        if (!more.empty()) DebugLog("[RELATE] " + level + " towards s" + S(ts) + " set towards the rest of its faction too (476): " + said);
+    }
     return "ok relate " + level;
+}
+
+int RelationsMineTowards(int slot, float* v)
+{
+    if (slot < 0 || slot == coop::MySlotForWire() || !GameplayRunning() || EngineWritesBlocked() || kGetDataRva == 0) return 0;
+    ::Faction* me = coop::LocalPlayerFaction();
+    ::Faction* t = StandInOrCarried(slot);
+    if (!Plaus(me) || !Plaus(t)) return 0;
+    void* rel = RelationsOfPod(me);
+    Entry e;
+    if (!Plaus(rel) || ReadEntry(rel, t, &e) != 1) return 0;
+    *v = e.relation;
+    return 1;
+}
+int RelationsPinAlly(int slot, float* before, std::string* why)
+{
+    float v = 0.0f;
+    if (RelationsMineTowards(slot, &v) != 1) { *why = "this game's side towards that player cannot be read now - no world, or no faction of that player here yet"; return -1; }
+    *before = v;
+    if (!swteam::PinNeedsWrite(true, v)) return 0;
+    const std::string r = RelateSet(coopslot::kSlotWirePrefix + coopslot::SlotNum(slot), "ally");
+    if (r.compare(0, 3, "ok ") == 0) return 1;
+    *why = "the relate road answered '" + r + "'";
+    return -2;
 }
 
 /* ally1: `relation <a> <b>` - both directions of one pair. Tokens: @me (this game's player faction), @peer (the stand-in for
@@ -993,6 +1236,87 @@ std::string RelationPairProbe(const std::string& sa, const std::string& sb)
     return "ok relation";
 }
 
+/* TEST-ONLY lever `relation change crime|war|peace <faction>` and its read-only readout `relation of <faction>`: the engine's own
+   changers on an NPC faction X and this game's player faction, as the engine's roads call them -
+   crime: X's relations affectRelations(this player's faction, -20, 1) - the witnessed-crime road (SensoryData::assessCrimes
+          0x853E40: the witness's faction towards the offender's, .rdata 0x16B0860 = -20.0, 0x167B308 = 1.0);
+   war / peace: declareWar / setNoLongerEnemies on THIS PLAYER'S faction's relations towards X - the functions a virtual call on
+          a PlayerFactionRelations lands in (vtable +0x40 / +0x38 are not overridden); they write X -> this player.
+   Each goes through the hooked function, so the forward runs as for any engine change. MAIN THREAD. */
+namespace {
+long long g_changeLevers = 0;
+int CallChangerPod(int kind, void* rel, ::Faction* f)
+{
+    __try
+    {
+        if (kind == 0) { AffectFn fn = (AffectFn)(Base() + kAffectRva); fn(rel, f, -20.0f, 1.0f); }
+        else if (kind == 1) { OneFn fn = (OneFn)(Base() + kDeclareWarRva); fn(rel, f); }
+        else { OneFn fn = (OneFn)(Base() + kNoLongerRva); fn(rel, f); }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* an NPC faction here by its stringID or its name (never this player's faction or another player's) */
+::Faction* NpcFactionNamed(const std::string& key)
+{
+    if (key.empty() || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    ::Faction* f = coop::GameWorldPtr()->factionDirectory->findFactionById(key);
+    if (!Plaus(f))
+    {
+        f = 0;
+        void** arr = 0; unsigned n = 0;
+        if (!ReadFactionArrayPod(&arr, &n) || !Plaus(arr) || n > 4096) return 0;
+        for (unsigned i = 0; i < n && f == 0; ++i) { ::Faction* c = (::Faction*)arr[i]; if (Plaus(c) && c->getName() == key) f = c; }
+    }
+    if (!Plaus(f) || coop::IsPlayerFaction(f) || OtherPlayersFaction(f)) return 0;
+    return f;
+}
+std::string EntryText(::Faction* a, ::Faction* b)
+{
+    void* rel = (Plaus(a) && Plaus(b)) ? RelationsOfPod(a) : 0;
+    Entry e;
+    if (!Plaus(rel) || ReadEntry(rel, b, &e) != 1) return "n/a";
+    return S(e.relation) + "/" + S(e.trust) + "/" + S(e.trustNeg) + ((e.flags & 2u) ? " war" : "");
+}
+std::string FactionWords(::Faction* x) { return "'" + x->getName() + "' (" + SidOf(x) + ")"; }
+}
+std::string RelationChangeLever(const std::string& kind, const std::string& faction)
+{
+    const int k = kind == "crime" ? 0 : kind == "war" ? 1 : kind == "peace" ? 2 : -1;
+    if (k < 0) return "error relation change usage: relation change crime|war|peace <faction stringID or name>";
+    if (!GameplayRunning() || EngineWritesBlocked()) return "error relation change: no running world";
+    ::Faction* mine = coop::LocalPlayerFaction();
+    ::Faction* x = NpcFactionNamed(faction);
+    if (!Plaus(mine) || !Plaus(x)) { DebugLog("[REL] change " + kind + ": no NPC faction '" + faction + "' here (or no player faction)"); return "error relation change not-found"; }
+    if (kGetDataRva == 0 || (k == 0 ? kAffectRva : k == 1 ? kDeclareWarRva : kNoLongerRva) == 0) return "error relation change: no address";
+    void* rel = RelationsOfPod(k == 0 ? x : mine);
+    if (!Plaus(rel)) return "error relation change: the relations could not be read";
+    const std::string itMine = EntryText(x, mine), mineIt = EntryText(mine, x);
+    const long long other0 = (long long)g_wroteOtherSide;
+    const WireMark m = MarkWire();
+    const int r = CallChangerPod(k, rel, k == 0 ? mine : x);
+    ++g_changeLevers;
+    const std::string what = k == 0 ? "affectRelations(-20) on " + FactionWords(x) + "'s relations towards this player's faction"
+                                    : std::string(k == 1 ? "declareWar" : "setNoLongerEnemies") + " on this player's faction's relations towards " + FactionWords(x);
+    DebugLog("[REL] change " + kind + " (TEST): the engine's " + what + (r == 1 ? std::string() : std::string(" RAISED"))
+             + " - it->mine " + itMine + " -> " + EntryText(x, mine) + ", mine->it " + mineIt + " -> " + EntryText(mine, x)
+             + " (relation/trust/trustNeg) wire=" + WireSince(m) + " wroteOtherSide+" + S((long long)g_wroteOtherSide - other0) + " levers=" + S(g_changeLevers));
+    return r == 1 ? "ok relation change " + kind : "error relation change: the engine's changer raised";
+}
+std::string RelationOfProbe(const std::string& faction)
+{
+    ::Faction* mine = coop::LocalPlayerFaction();
+    ::Faction* x = NpcFactionNamed(faction);
+    if (!Plaus(mine) || !Plaus(x)) { DebugLog("[REL] of '" + faction + "': no NPC faction by that name here (or no player faction)"); return "error relation of not-found"; }
+    std::string line = "[REL] of " + FactionWords(x) + ": s" + S((long long)coop::MySlotForWire()) + "(me) it->mine " + EntryText(x, mine) + " mine->it " + EntryText(mine, x);
+    int slots[coop::kStandInTableCap]; ::Faction* sf[coop::kStandInTableCap];
+    const int ns = coop::StandInList(slots, sf, coop::kStandInTableCap);   /* every other player's faction met here */
+    for (int i = 0; i < ns; ++i)
+        if (Plaus(sf[i])) line += "; s" + S((long long)slots[i]) + " it->its " + EntryText(x, sf[i]) + " its->it " + EntryText(sf[i], x);
+    DebugLog(line + " (relation/trust/trustNeg as this game holds them; read-only)");
+    return "ok relation of";
+}
+
 void ReportRelations()
 {
     for (std::map<std::string, P081Pair>::const_iterator p = g_p081.begin(); p != g_p081.end(); ++p)   // P081 (rel4)
@@ -1006,8 +1330,9 @@ void ReportRelations()
     }
     // PROBE-END: P083
     DebugLog("[REL] REPORT on=" + S(g_on ? 1 : 0) + " changes=" + S(g_changes) + " forwarded=" + S(g_forwarded) + " notOwned=" + S(g_notOwned)
-             + " echoSuppressed=" + S(g_echoSuppressed) + " offThread=" + S((long long)g_offThread) + " queued=" + S((long long)g_queued) + " drained=" + S(g_drained) + " drainUnresolved=" + S(g_drainUnresolved) + " reverted=" + S(g_reverted) + " revertQueued=" + S(g_revertQueued) + " revertNoValue=" + S(g_revertNoValue) + " queueDropped=" + S((long long)g_queueDropped) + " offNoLink=" + S(g_offNoLink) + " sendFailed=" + S(g_sendFailed)
-             + " | received=" + S(g_received) + " applied=" + S(g_applied) + " unresolved=" + S(g_unresolved) + " faults=" + S(g_faults) + " refusedOwnedHere=" + S(g_refusedOwnedHere) + " refusedNotSender=" + S(g_refusedNotSender) + " legacyPeerSkipped=" + S(g_legacySkipped)
+             + " teamEventSkipped=" + S((long long)g_teamEvSkipped)
+             + " echoSuppressed=" + S(g_echoSuppressed) + " wroteOtherSide=" + S((long long)g_wroteOtherSide) + " offThread=" + S((long long)g_offThread) + " queued=" + S((long long)g_queued) + " drained=" + S(g_drained) + " drainUnresolved=" + S(g_drainUnresolved) + " reverted=" + S(g_reverted) + " revertQueued=" + S(g_revertQueued) + " revertNoValue=" + S(g_revertNoValue) + " queueDropped=" + S((long long)g_queueDropped) + " offNoLink=" + S(g_offNoLink) + " sendFailed=" + S(g_sendFailed)
+             + " | received=" + S(g_received) + " applied=" + S(g_applied) + " unresolved=" + S(g_unresolved) + " faults=" + S((long long)g_faults) + " refusedOwnedHere=" + S(g_refusedOwnedHere) + " refusedNotSender=" + S(g_refusedNotSender) + " legacyPeerSkipped=" + S(g_legacySkipped)
              + " | snapshots=" + S(g_snapshots) + " entries=" + S(g_snapshotEntries) + " relSyncAsked=" + S(g_relSyncAsked) + " relPeerInWorldAsks=" + S(g_relPeerInWorldAsks) + " relSyncOwed=" + S(g_relSyncOwed ? 1 : 0) + " relKeyChanges=" + S(g_relKeyChanges) + " relRoadSnapshots=" + S(g_relRoadSnapshots) + " relDroppedResync=" + S(g_relDroppedResync) + " relationsSnapshotDeferredFrames=" + S(g_relationsSnapshotDeferredFrames) + " snapshotSent=" + S(g_snapshotSent ? 1 : 0) + " lastForward='" + g_lastForward + "' lastApplied='" + g_lastApplied + "'");
     DebugLog("[WREL] REPORT rows=" + S((long long)g_wr.size()) + " rowsIn=" + S(g_wrRowsIn) + " tableApplied=" + S(g_wrTableApplied ? 1 : 0) + " tableApplies=" + S(g_wrTableApplies)
              + " applied=" + S(g_wrApplied) + " same=" + S(g_wrSame) + " unresolved=" + S(g_wrUnresolved) + " applyFaults=" + S(g_wrApplyFaults) + " pending=" + S((long long)g_wrPending.size())
@@ -1020,7 +1345,7 @@ void ReportRelations()
     DebugLog("[ALLY] REPORT on=" + S(g_allyOn) + " off=" + S(g_allyOff) + " refused=" + S(g_allyRefused) + " faults=" + S(g_allyFaults)
              + " haveBefore=" + S(g_allyHaveBefore ? 1 : 0) + " last='" + g_allyLast + "'");
     DebugLog("[RELATE] REPORT ally=" + S(g_relSet[0]) + " neutral=" + S(g_relSet[1]) + " hostile=" + S(g_relSet[2]) + " viaAllyVerb=" + S(g_relViaAlly)
-             + " refusedTarget=" + S(g_relRefusedTarget) + " refused=" + S(g_relRefused) + " faults=" + S(g_relFaults) + " last='" + g_relLast + "'");
+             + " refusedTarget=" + S(g_relRefusedTarget) + " refusedTeammate=" + S(g_relRefusedTeammate) + " refusedFounderSets=" + S(g_relRefusedFounders) + " fanOut=" + S(g_relFanOut) + " refused=" + S(g_relRefused) + " faults=" + S(g_relFaults) + " theirChangesShown=" + S(g_relNotices) + " theirChangesByEngine=" + S(g_relNoticesEngine) + " teamWritesQuiet=" + S(g_relTeamQuiet) + " last='" + g_relLast + "'");
 }
 // crime3 (crime.cpp): the same sid mapping relations uses, for a crime's victim faction.
 std::string RelationsWireSid(::Faction* f) { return SidOf(f); }
@@ -1094,6 +1419,8 @@ void OwnRestorePair(void* rel, ::Faction* other, const Entry& cur, float relatio
 }
 bool RelationsOwnRestore(const coopown::FactionRec& rec, std::string* why, std::string* detail)
 {
+    /* T-546 step 5: a load's own-record restore is never this game's own change (the team's record is written over it after) */
+    struct NoMark { bool was; NoMark() : was(g_noTeamMark) { if (!g_teamWrite) g_noTeamMark = true; } ~NoMark() { g_noTeamMark = was; } } noMark;
     ::Faction* mine = coop::LocalPlayerFaction();
     if (!Plaus(mine) || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) { *why = "no-player-faction"; return false; }
     if (kGetDataRva == 0 || kSetRelationRva == 0) { *why = "no-address"; return false; }
@@ -1110,8 +1437,9 @@ bool RelationsOwnRestore(const coopown::FactionRec& rec, std::string* why, std::
         ++rows;
         Entry a, b;
         if (ReadEntry(rm, f, &a) != 1 || ReadEntry(rf, mine, &b) != 1) { ++faults; continue; }
-        OwnRestorePair(rm, f, a, r.rel, r.trust, r.trustNeg, r.flags, &relSet, &trustSet, &faults);   /* mmo3 fold 5/7 */
+        /* X -> mine (the entry this game's engine reads) and mine -> X (the other games keep it as this player's stand-in's table) */
         OwnRestorePair(rf, mine, b, r.relBack, r.trustBack, r.trustNegBack, r.flagsBack, &relSet, &trustSet, &faults);
+        OwnRestorePair(rm, f, a, r.rel, r.trust, r.trustNeg, r.flags, &relSet, &trustSet, &faults);   /* mmo3 fold 5/7 */
     }
     int pid = 0, pidAfter = 0;
     if (OwnPlatoonIdsPod(mine, 0, &pid) == 1)
@@ -1126,6 +1454,331 @@ bool RelationsOwnRestore(const coopown::FactionRec& rec, std::string* why, std::
              + " name[record,live]='" + rec.name + "','" + liveName + "'" + (rec.name == liveName ? std::string() : std::string(" (differs - not renamed here)"));
     if (rows > 0 && faults >= rows) { *why = "fault"; return false; }
     return true;
+}
+
+/* ---- T-546 step 5: SHARED STANDING (src/common/teamstanding.h; the record is teamwire.h TeamRec) ------------------------
+   The record is written onto this game's faction through the engine's own setRelation (and the direct trust / flag stores the
+   pp.faction restore uses) under g_teamWrite: Forward sends those rows with the team reason, and they are never marked as this
+   game's own change. Every other write of a pair of this game's faction with an NPC faction or another player's faction - the
+   engine's changers on any thread, a stance pressed - is marked (TeamMarkOwn), except the load's own-record restore and the
+   restore of a departure (g_noTeamMark). The marked NPC pairs are reported as differences from the base (the value last written
+   from the record or last reported). MAIN THREAD. */
+namespace {
+long long g_teamApplies = 0, g_teamApplyFaults = 0, g_teamDeltas = 0, g_teamUncollected = 0, g_teamSets = 0, g_teamSideWrites = 0, g_teamMarks = 0;
+std::set<std::string> g_teamDirtyNpc;          /* "<sid>|<dir>" of this game's NPC pairs moved by its own engine since the last gather */
+std::set<int> g_teamDirtySide;                 /* slots of the players this game's own side towards moved */
+unsigned long long g_sideNo = 0;               /* this game's own side changes counted (RelationsSideNoNow) */
+std::map<int, unsigned long long> g_sideOwnNo; /* slot -> the number of this game's latest own change of its side towards that player */
+struct BaseVal { swteam::Standing v; unsigned flags; };
+std::map<std::string, BaseVal> g_teamBase;     /* "<sid>|<dir>" -> the value last written from the record or last reported */
+bool g_teamBaseValid = false;                  /* the record has been written onto this world's faction (or the founder's SEED is the base) */
+struct Prior { bool had; BaseVal v; };
+std::map<std::string, Prior> g_teamLastPrior;  /* the last gather's bases before it moved them: a gather not sent is put back exactly */
+/* an NPC faction: not this game's player faction, not another player's, not a carried player record */
+bool NpcFaction(::Faction* f)
+{
+    return Plaus(f) && !coop::IsPlayerFaction(f) && !OtherPlayersFaction(f) && coop::StandInRecordSlot(f) == -1;
+}
+int SlotOfPlayerFaction(::Faction* f)
+{
+    int s = coop::StandInSlotOf(f);
+    if (s < 0) s = coop::StandInRecordSlot(f);
+    return s;
+}
+std::string DirKey(const std::string& sid, unsigned dir) { return sid + (dir ? "|1" : "|0"); }
+/* `who`'s standing with every NPC faction, both directions (the pp.faction record's rows): X -> who (relBack) is the entry this
+   game's engine reads for a player faction, who -> X (rel) the one the other games keep in its stand-in's table
+   (swteam::NpcEntriesOf); platoonIDs read only for this game's own faction */
+bool RecordOfFaction(::Faction* who, bool own, coopown::FactionRec* out, std::string* why)
+{
+    if (!Plaus(who) || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) { *why = "no-faction"; return false; }
+    if (kGetDataRva == 0) { *why = "no-address"; return false; }
+    void* rw = RelationsOfPod(who);
+    if (!Plaus(rw)) { *why = "no-relations"; return false; }
+    int pid = 0;
+    if (own && OwnPlatoonIdsPod(who, 0, &pid) != 1) { *why = "fault"; return false; }
+    void** arr = 0; unsigned n = 0;
+    if (!ReadFactionArrayPod(&arr, &n) || !Plaus(arr) || n > 4096) { *why = "no-faction-list"; return false; }
+    out->name = who->getName(); out->platoonIds = pid; out->rows.clear();
+    char buf[160];
+    for (unsigned i = 0; i < n; ++i)
+    {
+        ::Faction* f = (::Faction*)arr[i];
+        if (f == who || !NpcFaction(f)) continue;
+        if (!ReadSidPod(f, buf, 160) || buf[0] == 0) continue;
+        void* rf = RelationsOfPod(f);
+        if (!Plaus(rf)) continue;
+        Entry a, b;
+        if (ReadEntry(rw, f, &a) != 1 || ReadEntry(rf, who, &b) != 1) continue;
+        coopown::FacRow r;
+        r.sid = buf; r.rel = a.relation; r.trust = a.trust; r.trustNeg = a.trustNeg; r.relBack = b.relation; r.trustBack = b.trust; r.trustNegBack = b.trustNeg;
+        r.flags = (int)(a.flags & 3u); r.flagsBack = (int)(b.flags & 3u);
+        out->rows.push_back(r);
+    }
+    std::sort(out->rows.begin(), out->rows.end(), coopown::FacRowLess);
+    return true;
+}
+/* one side of this game's faction set to a value and flags: the flags (and trust, kept) stored first, then setRelation, so the
+   row Forward sends carries them. flags < 0: only the ally flag cleared when the value is below the ally line. */
+int WriteSide(void* rel, ::Faction* t, const Entry& cur, float v, int flags)
+{
+    if (flags >= 0)
+    {
+        if ((unsigned)flags != (cur.flags & 3u) && OwnTrustWritePod(rel, t, cur.trust, cur.trustNeg, flags) != 1) return -2;
+    }
+    else if (swteam::FlagClearedFor(v, (cur.flags & 1u) != 0)) SetAllyFlagPod(rel, t, false);
+    if (cur.relation != v && CallSetRelationPod(rel, t, v) != 1) return -2;
+    if (cur.relation == v && flags >= 0 && (unsigned)flags != (cur.flags & 3u)) Forward(rel, t, 0);
+    return 1;
+}
+}   // namespace
+
+/* MAIN THREAD (Forward on the main thread; DrainQueue for the worker threads' changes): a pair of this game's player faction
+   moved by something other than the team's own writes. (owner, other) is the WRITTEN pair - Forward resolved it through
+   relside::WrittenPair before marking or queueing - so the direction marked is the entry that moved (swteam::NpcDirOfWritten). */
+void TeamMarkOwn(::Faction* owner, ::Faction* other)
+{
+    ::Faction* mine = coop::LocalPlayerFaction();
+    if (!Plaus(mine) || !Plaus(owner) || !Plaus(other)) return;
+    ::Faction* x = owner == mine ? other : other == mine ? owner : 0;
+    if (!Plaus(x)) return;
+    const unsigned dir = owner == mine ? 0u : 1u;
+    const int npcDir = swteam::NpcDirOfWritten(owner == mine, other == mine, NpcFaction(x));
+    if (npcDir != swteam::kDirNone)
+    {
+        char buf[160];
+        if (ReadSidPod(x, buf, 160) && buf[0] != 0 && g_teamDirtyNpc.size() < 8192) { g_teamDirtyNpc.insert(DirKey(buf, (unsigned)npcDir)); ++g_teamMarks; }
+    }
+    else if (dir == 0 && OtherPlayersFaction(x))
+    {
+        const int s = SlotOfPlayerFaction(x);
+        if (s >= 0) { g_teamDirtySide.insert(s); ++g_teamMarks; g_sideOwnNo[s] = ++g_sideNo; }
+    }
+}
+/* 476: another player's side towards THIS game's team - its side towards this game's player (`level`) and towards every
+   teammate's faction here, the worst of them. A teammate's own faction is left as it is (the pin's). */
+int TeamFoldTheirs(::Faction* theirs, int level)
+{
+    const int me = coop::MySlotForWire();
+    if (me < 0 || !OtherPlayersFaction(theirs)) return level;
+    const int ts = SlotOfPlayerFaction(theirs);
+    if (ts < 0 || coop::TeamSameAnyThread(me, ts)) return level;
+    const std::vector<int> mates = coop::TeamMatesOfMine();
+    if (mates.empty()) return level;
+    void* rt = RelationsOfPod(theirs);
+    if (!Plaus(rt)) return level;
+    std::vector<int> lv(1, level);
+    for (size_t i = 0; i < mates.size(); ++i)
+    {
+        ::Faction* m = StandInOrCarried(mates[i]);
+        Entry e;
+        if (Plaus(m) && m != theirs && ReadEntry(rt, m, &e) == 1) lv.push_back(nametag::LevelOf(e.relation, (e.flags & 1u) != 0));
+    }
+    return swteam::TheirSideTowardsTeam(lv);
+}
+bool RelationsNpcRecordOf(int slot, coopown::FactionRec* out, std::string* why)
+{
+    const int me = coop::MySlotForWire();
+    const bool own = slot < 0 || slot == me;
+    ::Faction* who = own ? coop::LocalPlayerFaction() : StandInOrCarried(slot);
+    if (!Plaus(who)) { *why = own ? "no-player-faction" : "no-faction-of-that-player-here"; return false; }
+    return RecordOfFaction(who, own, out, why);
+}
+bool RelationsTeamSet(const coopown::FactionRec& rec, std::string* why, std::string* detail)
+{
+    g_teamWrite = true;
+    const bool ok = RelationsOwnRestore(rec, why, detail);
+    g_teamWrite = false;
+    if (ok) ++g_teamSets;
+    return ok;
+}
+void RelationsPlayerSides(std::vector<swteam::PlayerSide>* out)
+{
+    out->clear();
+    ::Faction* mine = coop::LocalPlayerFaction();
+    if (!Plaus(mine) || kGetDataRva == 0 || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return;
+    void* rm = RelationsOfPod(mine);
+    void** arr = 0; unsigned n = 0;
+    if (!Plaus(rm) || !ReadFactionArrayPod(&arr, &n) || !Plaus(arr) || n > 4096) return;
+    const int me = coop::MySlotForWire();
+    std::set<int> seen;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        ::Faction* f = (::Faction*)arr[i];
+        if (!Plaus(f) || f == mine || !OtherPlayersFaction(f)) continue;
+        const int s = SlotOfPlayerFaction(f);
+        if (s < 0 || s == me || seen.count(s) != 0) continue;
+        Entry e;
+        if (ReadEntry(rm, f, &e) != 1) continue;
+        seen.insert(s);
+        swteam::PlayerSide p; p.slot = (unsigned)s; p.rel = e.relation; p.flags = (int)(e.flags & 3u);
+        out->push_back(p);
+    }
+}
+int RelationsMineTowardsFull(int slot, float* v, unsigned* flags)
+{
+    if (slot < 0 || slot == coop::MySlotForWire() || !GameplayRunning() || EngineWritesBlocked() || kGetDataRva == 0) return 0;
+    ::Faction* me = coop::LocalPlayerFaction();
+    ::Faction* t = StandInOrCarried(slot);
+    if (!Plaus(me) || !Plaus(t)) return 0;
+    void* rel = RelationsOfPod(me);
+    Entry e;
+    if (!Plaus(rel) || ReadEntry(rel, t, &e) != 1) return 0;
+    *v = e.relation; *flags = e.flags & 3u;
+    return 1;
+}
+int RelationsSetMineTowards(int slot, float v, int flags, bool asTeam, float* before, std::string* why)
+{
+    ::Faction* me = coop::LocalPlayerFaction();
+    if (!GameplayRunning() || EngineWritesBlocked() || !Plaus(me) || kSetRelationRva == 0 || kGetDataRva == 0
+        || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory))
+    { *why = "this game's side towards that player cannot be written now - no world, or an engine address missing"; return -3; }
+    ::Faction* t = (slot >= 0 && slot != coop::MySlotForWire()) ? StandInOrCarried(slot) : 0;
+    if (!Plaus(t)) { *why = "no faction of that player here"; return -1; }   /* the world and its faction list are read: absent */
+    void* rel = RelationsOfPod(me);
+    Entry b;
+    if (!Plaus(rel) || ReadEntry(rel, t, &b) != 1) { *why = "this game's entry towards that player would not read"; return -3; }
+    *before = b.relation;
+    if (asTeam) g_teamWrite = true; else g_noTeamMark = true;
+    const int w = WriteSide(rel, t, b, v, flags);
+    g_teamWrite = false; g_noTeamMark = false;
+    if (w != 1) { *why = "the engine's setter raised"; return -2; }
+    ++g_teamSideWrites;
+    return 1;
+}
+bool RelationsTeamApplyRecord(const swteam::TeamRec& rec, const std::vector<int>& teammates, std::string* detail)
+{
+    ::Faction* mine = coop::LocalPlayerFaction();
+    if (!Plaus(mine) || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || kGetDataRva == 0 || kSetRelationRva == 0)
+    { *detail = "no player faction or no address"; ++g_teamApplyFaults; return false; }
+    void* rm = RelationsOfPod(mine);
+    if (!Plaus(rm)) { *detail = "no relations"; ++g_teamApplyFaults; return false; }
+    long long rows = 0, missing = 0, relSet = 0, trustSet = 0, faults = 0, stances = 0, stancesSet = 0, stancesAbsent = 0;
+    g_teamWrite = true;
+    for (size_t i = 0; i < rec.rows.size(); ++i)
+    {
+        const swteam::RecRow& r = rec.rows[i];
+        ::Faction* x = coop::GameWorldPtr()->factionDirectory->findFactionById(r.sid);
+        void* rx = NpcFaction(x) ? RelationsOfPod(x) : 0;
+        if (!Plaus(rx)) { ++missing; continue; }
+        ++rows;
+        Entry a, b;
+        /* X -> mine (the entry this game's engine reads) first, then mine -> X (the other games' stand-in table) - each when the
+           record holds it (swteam::NpcEntriesOf). The base follows a pair only when its write went through; a pair that faulted
+           keeps its old base and the record stays owed (the caller tries again) */
+        const unsigned w = swteam::NpcEntriesOf(r.have);
+        if (w & swteam::kWriteItMine)
+        {
+            const long long f0 = faults;
+            if (ReadEntry(rx, mine, &b) == 1) OwnRestorePair(rx, mine, b, r.relBack, r.trustBack, r.trustNegBack, (int)(r.flagsBack & 3u), &relSet, &trustSet, &faults); else ++faults;
+            if (faults == f0) { BaseVal bv; bv.v = swteam::Standing(r.relBack, r.trustBack, r.trustNegBack); bv.flags = r.flagsBack & 3u; g_teamBase[DirKey(r.sid, 1)] = bv; }
+        }
+        if (w & swteam::kWriteMineIt)
+        {
+            const long long f0 = faults;
+            if (ReadEntry(rm, x, &a) == 1) OwnRestorePair(rm, x, a, r.rel, r.trust, r.trustNeg, (int)(r.flags & 3u), &relSet, &trustSet, &faults); else ++faults;
+            if (faults == f0) { BaseVal bv; bv.v = swteam::Standing(r.rel, r.trust, r.trustNeg); bv.flags = r.flags & 3u; g_teamBase[DirKey(r.sid, 0)] = bv; }
+        }
+    }
+    const int me = coop::MySlotForWire();
+    for (size_t i = 0; i < rec.stances.size(); ++i)
+    {
+        const int s = (int)rec.stances[i].slot;
+        if (s == me || std::find(teammates.begin(), teammates.end(), s) != teammates.end()) continue;
+        ++stances;
+        ::Faction* t = StandInOrCarried(s);
+        Entry e;
+        if (!Plaus(t) || ReadEntry(rm, t, &e) != 1) { ++stancesAbsent; continue; }
+        if (e.relation == rec.stances[i].rel && (e.flags & 3u) == (rec.stances[i].flags & 3u)) continue;
+        if (WriteSide(rm, t, e, rec.stances[i].rel, (int)(rec.stances[i].flags & 3u)) == 1) ++stancesSet; else ++faults;
+    }
+    g_teamWrite = false;
+    g_teamBaseValid = true;   /* marks made since the gather the caller ran just before stay: the next gather measures them from this base */
+    if (faults == 0) ++g_teamApplies; else ++g_teamApplyFaults;
+    *detail = "gen " + S((long long)rec.gen) + ": NPC factions " + S(rows) + " (missing here " + S(missing) + "), relationSet " + S(relSet) + ", trustSet " + S(trustSet)
+            + "; stances " + S(stances) + " (set " + S(stancesSet) + ", no faction here " + S(stancesAbsent) + "); faults " + S(faults);
+    return faults == 0;
+}
+void RelationsTeamBaseFromRec(const swteam::TeamRec& rec)
+{
+    g_teamBase.clear();
+    for (size_t i = 0; i < rec.rows.size(); ++i)
+    {
+        const swteam::RecRow& r = rec.rows[i];
+        BaseVal f; f.v = swteam::Standing(r.rel, r.trust, r.trustNeg); f.flags = r.flags & 3u;
+        BaseVal k; k.v = swteam::Standing(r.relBack, r.trustBack, r.trustNegBack); k.flags = r.flagsBack & 3u;
+        if (r.have & swteam::kHaveFwd) g_teamBase[DirKey(r.sid, 0)] = f;
+        if (r.have & swteam::kHaveBack) g_teamBase[DirKey(r.sid, 1)] = k;
+    }
+    g_teamBaseValid = true;
+}
+void RelationsTeamCollect(std::vector<swteam::Delta>* npc, std::vector<int>* sideSlots)
+{
+    npc->clear(); sideSlots->clear(); g_teamLastPrior.clear();
+    DrainQueue();   /* the worker threads' changes are marked first */
+    if (!g_teamBaseValid || !GameplayRunning() || EngineWritesBlocked()) { g_teamDirtyNpc.clear(); g_teamDirtySide.clear(); return; }
+    ::Faction* mine = coop::LocalPlayerFaction();
+    void* rm = Plaus(mine) ? RelationsOfPod(mine) : 0;
+    if (!Plaus(rm) || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return;
+    for (std::set<std::string>::const_iterator it = g_teamDirtyNpc.begin(); it != g_teamDirtyNpc.end() && npc->size() < swteam::kMaxDeltas; ++it)
+    {
+        const std::string& key = *it;
+        const unsigned dir = key[key.size() - 1] == '1' ? 1u : 0u;
+        const std::string sid = key.substr(0, key.size() - 2);
+        ::Faction* x = coop::GameWorldPtr()->factionDirectory->findFactionById(sid);
+        void* rx = NpcFaction(x) ? RelationsOfPod(x) : 0;
+        if (!Plaus(rx)) continue;
+        Entry e;
+        if ((dir == 0 ? ReadEntry(rm, x, &e) : ReadEntry(rx, mine, &e)) != 1) continue;
+        const swteam::Standing cur(e.relation, e.trust, e.trustNeg);
+        std::map<std::string, BaseVal>::iterator b = g_teamBase.find(key);
+        BaseVal base; base.v = cur; base.flags = e.flags & 3u;
+        if (b != g_teamBase.end()) base = b->second;
+        swteam::Delta d;
+        /* no base: the record held no value of this pair when it was written here - this game's value is sent to be taken as it is */
+        if (b == g_teamBase.end()) { d.sid = sid; d.dir = dir | swteam::kDirAbsolute; d.rel = cur.rel; d.trust = cur.trust; d.trustNeg = cur.trustNeg; d.flags = e.flags & 3u; npc->push_back(d); }
+        else if (swteam::DeltaOf(sid, dir, cur, e.flags & 3u, base.v, base.flags, &d)) npc->push_back(d);
+        else continue;
+        Prior pr; pr.had = b != g_teamBase.end(); pr.v = base; g_teamLastPrior[key] = pr;
+        BaseVal nb; nb.v = cur; nb.flags = e.flags & 3u; g_teamBase[key] = nb;
+    }
+    g_teamDirtyNpc.clear();
+    for (std::set<int>::const_iterator it = g_teamDirtySide.begin(); it != g_teamDirtySide.end(); ++it) sideSlots->push_back(*it);
+    g_teamDirtySide.clear();
+    g_teamDeltas += (long long)npc->size();
+}
+void RelationsTeamUncollect(const std::vector<swteam::Delta>& npc)
+{
+    for (size_t i = 0; i < npc.size(); ++i)
+    {
+        const std::string key = DirKey(npc[i].sid, npc[i].dir & 1u);
+        std::map<std::string, Prior>::const_iterator pr = g_teamLastPrior.find(key);
+        if (pr != g_teamLastPrior.end()) { if (pr->second.had) g_teamBase[key] = pr->second.v; else g_teamBase.erase(key); }
+        g_teamDirtyNpc.insert(key);
+    }
+    g_teamLastPrior.clear();
+    g_teamUncollected += (long long)npc.size();
+    g_teamDeltas -= (long long)npc.size();
+}
+void RelationsTeamForgetBase() { g_teamBaseValid = false; g_teamBase.clear(); g_teamDirtyNpc.clear(); g_teamDirtySide.clear(); }
+int RelationsTeamDropSideMarks(const std::vector<unsigned>& slots)
+{
+    int n = 0;
+    for (size_t i = 0; i < slots.size(); ++i) n += (int)g_teamDirtySide.erase((int)slots[i]);
+    return n;
+}
+unsigned long long RelationsSideOwnNo(int slot)
+{
+    const std::map<int, unsigned long long>::const_iterator it = g_sideOwnNo.find(slot);
+    return it == g_sideOwnNo.end() ? (unsigned long long)0 : it->second;
+}
+unsigned long long RelationsSideNoNow() { return g_sideNo; }
+bool RelationsTeamBaseValid() { return g_teamBaseValid; }
+long long RelationsTeamEventSkipped() { return (long long)g_teamEvSkipped; }
+std::string RelationsTeamText()
+{
+    return "applies=" + S(g_teamApplies) + " applyFaults=" + S(g_teamApplyFaults) + " baseValid=" + S(g_teamBaseValid ? 1 : 0) + " deltasSent=" + S(g_teamDeltas)
+         + " uncollected=" + S(g_teamUncollected) + " marks=" + S(g_teamMarks) + " teamSets=" + S(g_teamSets) + " sideWrites=" + S(g_teamSideWrites);
 }
 
 /* ---- par24: the notebook side of the world-vs-world table (store.cpp's drain, the K2 safe point, the test verb) ---- */

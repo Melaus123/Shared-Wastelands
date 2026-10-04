@@ -132,6 +132,7 @@ float GetDriveSpeed();
 // teleports are acceptable. Off by default so the stall rate can be read with nothing corrected -
 // `stalledWindows` counts either way.
 void SetCatchup(bool on);
+int  ForceCatchupGiveUp(unsigned int uid);   // T-573 TEST-ONLY: `giveup <uid>` (0 = every copy); returns copies marked
 
 // H015 / P059 - NATIVE COMBAT WINDOW. While a puppet is fighting under its own AI (the gate
 // released by combat.cpp), the drive must not push it: two locomotion writers on one body is the

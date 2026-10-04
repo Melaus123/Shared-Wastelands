@@ -26,8 +26,20 @@
 // patching a function body the AI worker thread is executing right now is a live hazard, a flag test is not.
 // The detours run on the AI WORKER thread - interlocked counters only, no allocation, no strings, no logging.
 #pragma once
+#include <string>
 namespace coop {
 void InstallPeace();               // startPlugin: prologue-checked MinHook install of the two virtuals
 void SetPeaceOn(bool on);          // the peace on|off verb. MAIN THREAD: the ON edge does the evidence walk
 void ReportPeace();                // folded into ReportEverything() (F125/F177), not behind a verb of its own
+// T-546 (owner 512): teammates' characters are one side, "as if one person owned both sets". For a pair of DIFFERENT factions both
+// in this player's team - this game's player faction and its teammates' factions - both detours answer before the engine is asked,
+// as the engine answers two characters of one faction: isAllyOf 1, isEnemyOf 0 (src/common/teamally.h). Every caller gets it.
+// MAIN THREAD: the team set written - own = this game's player faction, mates = the teammates' factions (none = no team).
+void PeaceTeamFactions(void* own, void* const* mates, int n);
+// ANY THREAD: two different factions both in the team set (pointer compares only; one load when in no team).
+bool PeaceTeamPairAnyThread(const void* a, const void* b);
+// ANY THREAD: two characters of a team pair - 1 yes, 0 no, -1 a faction would not read (their own vtable +0x58, guarded).
+int PeaceTeamPairOfCharacters(void* a, void* b);
+// The " team[held,ally,notEnemy,doubt,writes]=" tokens.
+std::string PeaceTeamTokens();
 }

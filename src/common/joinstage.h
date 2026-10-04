@@ -216,7 +216,9 @@ inline bool HelloTailDecode(const char* p, size_t n, size_t at, HelloTail* t)
     return true;
 }
 
-/* PLAYERS (54, down): every admitted game, sorted by slot. */
+/* PLAYERS (54, down): every admitted game, sorted by slot, then u32 worldPlayers - every player number this world's server ever
+   gave (slots.txt, connected or not), so every game counts the same players (slotwire.h LegacyPeerIsMineByWorld). */
+const unsigned kWorldPlayersMax = 1024;   /* the notebook's slots 0..1023 */
 struct RosterRow
 {
     unsigned slot, stage, op;
@@ -229,15 +231,16 @@ inline void RosterSortBySlot(std::vector<RosterRow>* rows)
     for (size_t i = 1; i < rows->size(); ++i)
         for (size_t j = i; j > 0 && (*rows)[j - 1].slot > (*rows)[j].slot; --j) { RosterRow t = (*rows)[j - 1]; (*rows)[j - 1] = (*rows)[j]; (*rows)[j] = t; }
 }
-inline bool RosterEncode(const std::vector<RosterRow>& rows, std::vector<char>* b)
+inline bool RosterEncode(const std::vector<RosterRow>& rows, unsigned worldPlayers, std::vector<char>* b)
 {
-    if (rows.size() > kRosterMax) return false;
+    if (rows.size() > kRosterMax || worldPlayers > kWorldPlayersMax) return false;
     JsPut32(b, (unsigned)rows.size());
     for (size_t i = 0; i < rows.size(); ++i)
     { JsPut32(b, rows[i].slot); JsPut32(b, rows[i].stage); JsPut32(b, rows[i].op ? 1u : 0u); JsPutStr(b, rows[i].name); JsPutF32(b, rows[i].viewDist); }
+    JsPut32(b, worldPlayers);
     return true;
 }
-inline bool RosterDecode(const char* p, size_t n, std::vector<RosterRow>* out)
+inline bool RosterDecode(const char* p, size_t n, std::vector<RosterRow>* out, unsigned* worldPlayers)
 {
     size_t at = 0; unsigned cnt = 0;
     if (!JsGet32(p, n, &at, &cnt) || cnt > kRosterMax) return false;
@@ -249,8 +252,11 @@ inline bool RosterDecode(const char* p, size_t n, std::vector<RosterRow>* out)
         if (r.stage > (unsigned)kStageInWorld || r.op > 1) return false;
         rows.push_back(r);
     }
+    unsigned wp = 0;
+    if (!JsGet32(p, n, &at, &wp) || wp > kWorldPlayersMax) return false;
     if (at != n) return false;   /* exact: a longer frame is another shape */
     *out = rows;
+    if (worldPlayers != 0) *worldPlayers = wp;
     return true;
 }
 inline bool RosterOperatorInWorld(const std::vector<RosterRow>& rows)

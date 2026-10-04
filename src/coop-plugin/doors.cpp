@@ -10,6 +10,7 @@
 #include "../common/doorsync.h"   /* P8n: the last-actor rule, the terminal-state test, the churn give-up and the first-sighting rule - PURE, and swept by src/coop-test/test_main.cpp */
 #include "coop_log.h"
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
+#include "zones.h"   /* T-160: NearestBuildingWhere - the `doortest nearest` lever */
 #include <Windows.h>
 #include <intrin.h>
 #include <cstring>
@@ -33,6 +34,15 @@ unsigned long long kSetDoorStateRva = 0; static coop::AddrReg kSetDoorStateRva_r
    the shipped exe: the bytes at 0x29D198 are the isGate call, the build-state test,
    MOV [rbx+0x380],r14d and an E8 to the funnel's incremental-link thunk 0x481DA).  The function's
    other two calls into the funnel return to 0x29CCCD and 0x29D1EF. */
+/* THE LOCK CALLS (Confirmed from the 1.0.65 bytes; doorsync.h names what each one does).  lockButton is
+   hooked (the player's press) and called only by the doortest lever, never by the applier - its sound is
+   posted on the fixed object 0x6E and heard everywhere.  Its DataPanelLine argument is never read - its body
+   overwrites RDX before any read of it - so it is called with 0.  lockDoor and unlockDoor dereference DoorStuff+0x370 (the DoorLock) with no test, so
+   they are called only on a door whose DoorLock pointer was read as non-zero. */
+unsigned long long kLockDoorRva = 0; static coop::AddrReg kLockDoorRva_reg("LockDoor", &kLockDoorRva);   /* Steam_1.0.65 0x2969B0: locked = 1 if CLOSED and settled; wantsToLock = 1.  2 callers: its thunk and DoorStuff::update's re-lock when a closing door lands */
+unsigned long long kUnlockDoorRva = 0; static coop::AddrReg kUnlockDoorRva_reg("UnlockDoor", &kUnlockDoorRva);   /* Steam_1.0.65 0x569940: locked = 0, gate code recomputed.  No caller in the image */
+unsigned long long kUpdateGateCodeRva = 0; static coop::AddrReg kUpdateGateCodeRva_reg("UpdateGateCodeState", &kUpdateGateCodeRva);   /* Steam_1.0.65 0x297250: the door's gate code recomputed (the route-finding's view of its lock).  lockButton calls it after its lock; unlockDoor ends in it */
+unsigned long long kLockButtonRva = 0; static coop::AddrReg kLockButtonRva_reg("LockButton", &kLockButtonRva);   /* Steam_1.0.65 0x5465D0: the player's lock button - sound, wantsToLock flipped, the lock follows it */
 static unsigned long long kSetupForcedOpenRet = 0; static coop::AddrReg kSetupForcedOpenRet_reg("SetupForcedOpenRet", &kSetupForcedOpenRet);   /* stage 7/9: the address table fills this. Steam_1.0.65 0x29D1D2 */
 
 const size_t kDoorState   = 0x380;   /* int  DoorState */
@@ -68,21 +78,39 @@ const unsigned char kPrologueFunnel[8]    = { 0x40, 0x56, 0x41, 0x55, 0x41, 0x56
 const unsigned char kPrologueOpenDoor[8]  = { 0x48, 0x83, 0xEC, 0x48, 0x83, 0xB9, 0x80, 0x03 };
 const unsigned char kPrologueCloseDoor[8] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B };
 const unsigned char kPrologueSetState[8]  = { 0x33, 0xC0, 0x83, 0xFA, 0x01, 0x89, 0x91, 0x80 };
+const unsigned char kPrologueLockDoor[8]   = { 0x83, 0xB9, 0x80, 0x03, 0x00, 0x00, 0x00, 0x75 };
+const unsigned char kPrologueUnlockDoor[8] = { 0x48, 0x8B, 0x81, 0x70, 0x03, 0x00, 0x00, 0xC6 };
+const unsigned char kPrologueLockButton[8] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83 };
+const unsigned char kPrologueUpdateGateCode[9] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9 };
 
 typedef void          (*SetDoorOpenAmountFn)(void* door, float amount, unsigned char force);
 typedef unsigned char (*OpenCloseDoorFn)(void* door);
 typedef void          (*SetDoorStateFn)(void* door, int state);
 typedef void*         (*GetPositionFn)(void* obj, float* out);
 typedef void*         (*IsGateFn)(void* obj);
+typedef void          (*LockDoorFn)(void* door);
+typedef void          (*LockButtonFn)(void* door, void* panelLine);
 
 SetDoorOpenAmountFn orig_setDoorOpenAmount = 0;
 OpenCloseDoorFn     orig_openDoor = 0;
 OpenCloseDoorFn     orig_closeDoor = 0;
 SetDoorStateFn      g_setDoorState = 0;   /* CALLED, never hooked - the applier */
+LockDoorFn          orig_lockDoor = 0;
+LockButtonFn        orig_lockButton = 0;
+/* THE ENGINE ENTRY POINTS THE APPLIER CALLS (g_lockButton: the doortest lever only), each set only when its
+   prologue matched at install.  They
+   are the ENTRIES and not the trampolines, so a call goes through this file's own detour exactly as an
+   engine caller's would, and the row records what the call did (as this game's own write). */
+OpenCloseDoorFn     g_playOpen = 0;
+OpenCloseDoorFn     g_playClose = 0;
+LockDoorFn          g_lockDoor = 0;
+LockDoorFn          g_unlockDoor = 0;
+LockButtonFn        g_lockButton = 0;
+LockDoorFn          g_updateGateCode = 0;   /* updateGateCodeState, after each lock-making step of the applier */
 uintptr_t           g_base = 0;
 
 bool  g_on = true;
-int   g_hooked = 0;            /* how many of the three detours armed */
+int   g_hooked = 0;            /* how many of the five detours armed */
 int   g_setterOk = 0;          /* the applier's prologue matched */
 DWORD g_mainThread = 0;
 
@@ -109,7 +137,25 @@ long long g_doorApplyBlocked = 0;            /* EngineWritesBlocked() at the dra
 long long g_doorApplyUnresolved = 0;         /* a holder state whose key names no door this game has seen */
 long long g_doorApplyIneffective = 0;        /* the write was made and the state did not change (lesson 14) */
 long long g_doorGaveUp = 0;                  /* three ineffective corrections on one door - stopped trying */
-long long g_doorLockDiffSeen = 0;            /* the holder's lock bit differs from ours - RECORDED AND NOT APPLIED; E37 owns the lock */
+/* ---- T-160: THE PLAYED SWING AND THE APPLIED LOCK ---- */
+long long g_doorPlayStarted = 0;             /* applies made by openDoor / closeDoor (a SPAN of doorApplied) */
+long long g_doorSnapped = 0;                 /* applies made by setDoorState (the other SPAN): played + snapped = doorApplied */
+long long g_doorPlayRefused = 0;             /* openDoor / closeDoor left the door unmoved - snapped instead */
+long long g_doorPlayLanded = 0;              /* played swings that reached the holder's state */
+long long g_doorPlayInterrupted = 0;         /* played swings another writer moved before they landed */
+long long g_doorPlayOverdue = 0;             /* played swings not landed inside kDoorPlayLandMs - finished with a snap */
+long long g_doorPlayFrames = 0;              /* funnel changes that were a played swing's own frames - never reported */
+long long g_doorRelockOurs = 0;              /* the engine's re-lock at the landing of a swing this game played - its own write */
+long long g_doorLockApplied = 0;             /* visits that brought this game's lock word to the holder's */
+long long g_doorLockLocks = 0, g_doorLockUnlocks = 0;   /* lockDoor / unlockDoor calls the applier made */
+long long g_doorLockWantsCleared = 0;        /* the applier's direct write wantsToLock = 0, as lockButton writes it */
+long long g_doorLockSetLocked = 0;           /* the applier's direct write DoorLock::locked = 1, as the NPC lock action 0x337630 writes it */
+long long g_doorLockIneffective = 0;         /* a lock write that left the lock word unchanged */
+long long g_doorLockGaveUp = 0;              /* rows that stopped being lock-corrected after kDoorLockGiveUpN ineffective visits */
+long long g_doorLockNoLockObject = 0;        /* lock disagreements on a door with no DoorLock - once per event */
+long long g_doorLockNoCall = 0;              /* lock disagreements needing lockDoor / unlockDoor whose prologue did not match - once per event */
+long long g_doorLockUnseenLocal = 0;         /* a live lock word no detour saw and this game did not write - its own world's, reported or adopted */
+long long g_doorPlayLandReported = 0;        /* played swings that landed with a change of this game's own inside them - reported at the landing */
 long long g_doorRepublishedOnLink = 0;       /* rows re-offered at the session link-up edge */
 long long g_doorRowRecycled = 0;             /* a registry row whose key no longer rebuilds - freed, never written */
 long long g_doorMsgMalformed = 0;
@@ -196,6 +242,7 @@ volatile LONG g_doorLogInFlight = 0;
 /* P8n-c (review-p8n-b M-3): 1 = some row is given up on churn, so the once-a-second re-arm sweep has
    work.  The sweep clears it on a pass that finds none, so the idle cost is one interlocked read. */
 volatile LONG g_doorChurnWatch = 0;
+volatile LONG g_doorLockSweepPending = 0;    /* some row's lockSweep is set (detour_closeDoor); DoorsTick takes it */
 volatile LONG g_dirty = 0;                   /* the tick's whole pre-check: nothing to do while this is 0 */
 volatile LONG g_gen = 0;                     /* this game's monotonic publish generation */
 /* B12-a / B12 (decision 52): THE DOOR ROAD'S OWN NO-NOTEBOOK NUMBERS, which did not exist before this
@@ -217,6 +264,20 @@ long long g_doorNoNotebookSaid = 0;
    only; a worker inside the funnel at the same instant reads it as set, which costs at worst one
    attributed write and never a wrong engine action. */
 volatile LONG g_applying = 0;
+/* THE DOOR WHOSE PLAYED CLOSE HAS JUST LANDED.  DoorStuff::update 0x298FF0 writes CLOSED through the
+   funnel and then, in the same call, calls lockDoor when wantsToLock is set (the call at 0x2990A4, after
+   the funnel call at 0x29905F - Confirmed from the 1.0.65 bytes).  That re-lock is part of the close this
+   game played, not something its world did, so the lockDoor detour takes it as this game's own write
+   when it names this door.  Main thread only; DoorsTick clears it, so it never outlives the frame. */
+void* volatile g_playLandedDoor = 0;
+/* THE UNPAUSED CLOCK the landing bound of a played swing is measured on (coopdoor::DoorPlayOverdue).  The
+   engine's door update does not move a door while the pause byte is set, so DoorsTick adds a frame's time
+   only while it is clear.  One frame adds at most kDoorClockStepCapMs, so a load hitch is not counted as a
+   swing's time either.  Written on the main thread only. */
+unsigned long long kDoorPauseByteRva = 0; static coop::AddrReg kDoorPauseByteRva_reg("PauseByte", &kDoorPauseByteRva);   /* Steam_1.0.65 0x2133969 (the same row store.cpp reads) */
+volatile long g_doorUnpausedMs = 0;
+unsigned long g_doorClockLastMs = 0;
+const unsigned long kDoorClockStepCapMs = 1000;
 
 /* ============================ THE REGISTRY ============================
    A door this game has SEEN through the funnel.  Fixed arrays, claimed with interlocked writes: the
@@ -277,6 +338,13 @@ struct DoorRow
     /* ---- P8n-c ---- */
     volatile long reportAbandoned;/* M-1: the fifteen-second bound expired and this door has not AGREED since */
     volatile long refusedLogged;  /* L-5: the own-key refusal line for THIS row has been spent */
+    /* ---- T-160 ---- */
+    volatile long playTarget;     /* the terminal state a swing this game played is heading for, -1 none */
+    volatile long playStartMs;    /* when that swing was started - the landing bound measures from here */
+    volatile long lockIneffective;/* consecutive lock visits that did not move the lock word */
+    volatile long lockGaveUp;     /* this row is not lock-corrected until the two games agree about its lock */
+    volatile long lockStuck;      /* this lock disagreement could not be applied and has been counted - once per event */
+    volatile long lockSweep;      /* a close that did nothing on this door: the next tick compares its lock word */
 };
 DoorRow g_rows[kDoorRows];
 
@@ -293,6 +361,7 @@ struct DoorHeldRow
        after the active-zone walk has passed - i.e. in DoorsTick and never at message arrival. ---- */
     volatile long pendingActor;
     volatile long actorState;
+    volatile long actorLocked;   /* the reporting game's lock word - it becomes `locked` only if this game adopts the report */
 };
 DoorHeldRow g_held[kDoorHeldCap];
 
@@ -454,6 +523,78 @@ void ApplySetterPod(void* door, int state)
     ::InterlockedExchange(&g_applying, 0);
 }
 
+/* 1 = the engine's pause byte is set; 0 when it is clear, has no address row, or the read faults. */
+int DoorGamePausedPod()
+{
+    if (kDoorPauseByteRva == 0 || g_base == 0) return 0;
+    __try { return (*(volatile const unsigned char*)(g_base + (uintptr_t)kDoorPauseByteRva) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* MAIN THREAD, once per DoorsTick: the unpaused clock moves on by this frame's time unless the game is paused. */
+void DoorClockAdvance()
+{
+    const unsigned long now = GetCurrentTickMs();
+    if (g_doorClockLastMs != 0)
+    {
+        unsigned long d = now - g_doorClockLastMs;
+        if (d > kDoorClockStepCapMs) d = kDoorClockStepCapMs;
+        if (DoorGamePausedPod() == 0) ::InterlockedExchangeAdd(&g_doorUnpausedMs, (long)d);
+    }
+    g_doorClockLastMs = now;
+}
+
+/* T-160: the engine's own open / close and lock calls, and the two direct lock writes the engine's own code
+   makes where no call produces the word, each inside the same g_applying bracket as the setter, so the
+   detours they pass through record them as this game's own write. */
+void ApplyPlayPodInner(OpenCloseDoorFn fn, void* door)
+{
+    __try { fn(door); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+void ApplyPlayPod(OpenCloseDoorFn fn, void* door)
+{
+    ::InterlockedExchange(&g_applying, 1);
+    ApplyPlayPodInner(fn, door);
+    ::InterlockedExchange(&g_applying, 0);
+}
+void ApplyLockPodInner(int step, void* door)
+{
+    __try
+    {
+        if (step == coopdoor::kDoorLockStepLock) g_lockDoor(door);
+        else if (step == coopdoor::kDoorLockStepUnlock) g_unlockDoor(door);
+        else if (step == coopdoor::kDoorLockStepClearWants)
+            *(volatile unsigned char*)((char*)door + kDoorWants) = 0;   /* as lockButton 0x5465D0 writes it */
+        else if (step == coopdoor::kDoorLockStepSetLocked)
+        {
+            unsigned char* lk = *(unsigned char* const*)((const char*)door + kDoorLockPtr);
+            if (lk != 0) *(volatile unsigned char*)(lk + kLockLocked) = 1;   /* as the NPC lock action 0x337630 writes it */
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+void ApplyLockPod(int step, void* door)
+{
+    ::InterlockedExchange(&g_applying, 1);
+    ApplyLockPodInner(step, door);
+    ::InterlockedExchange(&g_applying, 0);
+}
+/* 1 = the door's DoorLock pointer reads non-zero - the three lock calls dereference it with no test. */
+int DoorHasLockPod(void* door)
+{
+    __try { return (*(void* const*)((const char*)door + kDoorLockPtr) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* After a lock-making step of the applier (lockDoor, or the direct locked = 1): the engine's updateGateCodeState
+   0x297250 on the door, as lockButton 0x5465D0 calls it after its lock and DoorStuff::update 0x298FF0 recomputes
+   the same after its re-lock, so the door's gate code matches its lock.  unlockDoor 0x569940 ends in this same
+   function, so the unlock step needs nothing more. */
+void DoorGateCodePod(void* door)
+{
+    __try { g_updateGateCode(door); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
 /* ============================ THE KEY ============================
    THE P7n POSITION KEY, built by the ONE builder the box road uses (items.cpp's ItBoxKeyBuild,
    reached through ObjectPositionKey), so a door and a box can never be named by two different
@@ -505,6 +646,8 @@ DoorRow* RowFor(void* door, const char* keyIfNew, int gate, void* owner)
         g_rows[i].churnAgreeing = 0; g_rows[i].churnAgreeMs = 0; g_rows[i].churnLogged = 0;
         g_rows[i].reportPending = 0; g_rows[i].reportFirstMs = 0; g_rows[i].reportLastMs = 0;
         g_rows[i].reportAbandoned = 0; g_rows[i].refusedLogged = 0;
+        g_rows[i].playTarget = -1; g_rows[i].playStartMs = 0; g_rows[i].lockIneffective = 0; g_rows[i].lockGaveUp = 0; g_rows[i].lockStuck = 0;
+        g_rows[i].lockSweep = 0;
         ::InterlockedExchange(&g_rows[i].ready, 1);
         return &g_rows[i];
     }
@@ -515,6 +658,13 @@ DoorRow* RowByKey(const char* key)
 {
     for (int i = 0; i < kDoorRows; ++i)
         if (g_rows[i].ready != 0 && std::strcmp(g_rows[i].key, key) == 0) return &g_rows[i];
+    return 0;
+}
+/* The live row of this door pointer, or 0.  A pointer compare only - nothing is read through it. */
+DoorRow* RowByDoor(void* door)
+{
+    for (int i = 0; i < kDoorRows; ++i)
+        if (g_rows[i].ready != 0 && g_rows[i].door == door) return &g_rows[i];
     return 0;
 }
 /* P8o: DOES THIS KEY NAME A GATE?  DoorKeyBuild appends the word "gate" VERBATIM to the gateway
@@ -539,7 +689,7 @@ DoorHeldRow* HeldFor(const char* key, int makeIt)
         std::strncpy(g_held[i].key, key, kDoorKeyCap - 1);
         g_held[i].key[kDoorKeyCap - 1] = 0;
         g_held[i].state = -1; g_held[i].locked = -1; g_held[i].gen = -1; g_held[i].fromPeer = -1;
-        g_held[i].pendingActor = 0; g_held[i].actorState = -1;
+        g_held[i].pendingActor = 0; g_held[i].actorState = -1; g_held[i].actorLocked = -1;
         g_held[i].used = 1;
         return &g_held[i];
     }
@@ -652,7 +802,9 @@ const char* HoldWord(void* door, int onMain)
 }
 
 /* THE ONE PLACE A CHANGE IS RECORDED, so the funnel and the two edge detours cannot drift apart. */
-void NoteDoor(void* door, uintptr_t retRva, const char* where)
+/* `ours` = 1: the caller already knows this change is this game's own write (the re-lock at the landing of
+   a swing this game played). */
+void NoteDoor(void* door, uintptr_t retRva, const char* where, int ours)
 {
     if (!g_on) return;
     if (DoorPlausible(door) == 0) { ::InterlockedIncrement64(&g_doorReadFault); return; }
@@ -678,17 +830,46 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where)
                    the one write the holder's answer has to survive (F633). */
                 if (kSetupForcedOpenRet != 0 && retRva == kSetupForcedOpenRet)
                 { ::InterlockedExchange(&r->forcedOpen, 1); ::InterlockedExchange(&g_dirty, 1); }
-                if (r->state == (long)state)
+                /* THE LOCK WORD IS PART OF WHAT CHANGES.  A lock pressed on a door that does not move
+                   reaches this function only from the lock detours, and it is as much a change to share
+                   as a swing is. */
+                const int word = coopdoor::DoorLockWord(locked, wants);
+                if (r->state == (long)state && r->locked == (long)word)
                 { ::InterlockedIncrement64(&g_doorSuppressedSameState); return; }
                 {
                     const int was = (int)r->state;
-                    const int self = (::InterlockedCompareExchange(&g_applying, 0, 0) != 0) ? 1 : 0;
+                    const int applying = (::InterlockedCompareExchange(&g_applying, 0, 0) != 0) ? 1 : 0;
+                    /* A SWING THIS GAME PLAYED: its frames are its own write until it lands
+                       (coopdoor::DoorPlayNote).  Only a STATE change is classified - a lock word moving
+                       on its own during a swing is somebody else's. */
+                    int played = 0, landReport = 0;
+                    if (applying == 0 && ours == 0 && r->state != (long)state)
+                    {
+                        const int v = coopdoor::DoorPlayNote((int)r->playTarget, state);
+                        if (v == coopdoor::kDoorPlayOwned) played = 1;
+                        else if (v == coopdoor::kDoorPlayLanded)
+                        {
+                            played = 1;
+                            landReport = coopdoor::DoorPlayLandReport((int)r->localWrite, (int)r->locked, word);
+                            ::InterlockedExchange(&r->playTarget, -1);
+                            ::InterlockedIncrement64(&g_doorPlayLanded);
+                            if (state == coopdoor::kDoorClosed && onMain != 0)
+                                ::InterlockedExchangePointer((void* volatile*)&g_playLandedDoor, door);
+                        }
+                        else if (v == coopdoor::kDoorPlayBroken)
+                        {
+                            ::InterlockedExchange(&r->playTarget, -1);
+                            ::InterlockedIncrement64(&g_doorPlayInterrupted);
+                        }
+                    }
+                    const int self = (applying != 0 || ours != 0 || played != 0) ? 1 : 0;
                     const unsigned long nowMs = GetCurrentTickMs();
                     ::InterlockedExchange(&r->state, (long)state);
-                    ::InterlockedExchange(&r->locked, (long)locked);
+                    ::InterlockedExchange(&r->locked, (long)word);
                     ::InterlockedExchange(&r->lastChangeMs, (long)nowMs);
                     P060Line(r, key, was, state, doa, locked, wants, broken, gate,
-                             self != 0 ? "self" : HoldWord(door, onMain), retRva, self != 0 ? "apply" : where);
+                             self != 0 ? "self" : HoldWord(door, onMain), retRva,
+                             applying != 0 ? "apply" : (played != 0 ? "play" : (ours != 0 ? "relock" : where)));
                     /* OUR OWN CORRECTION IS NOT THE WORLD MOVING A DOOR.  It is recorded above (the
                        row must track what the door actually says) and then it stops here: it is not
                        a change to publish, it is not a local writer to revert, and counting it as
@@ -697,6 +878,16 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where)
                     {
                         ::InterlockedExchange(&r->src, 1);
                         ::InterlockedIncrement64(&g_doorSelfWrite);
+                        if (played != 0) { ::InterlockedIncrement64(&g_doorPlayFrames); ::InterlockedExchange(&g_dirty, 1); }
+                        /* A SWING THAT LANDS WITH THIS GAME'S OWN CHANGE INSIDE IT (coopdoor::DoorPlayLandReport):
+                           a lock pressed, or written by the NPC lock action, while the door was mid-way was not
+                           queued - only a terminal state is - so it goes out now, on the holder as its word. */
+                        if (landReport != 0)
+                        {
+                            ::InterlockedExchange(&r->localWrite, 1);
+                            ::InterlockedIncrement64(&g_doorPlayLandReported);
+                            QueueOut(key, state, word, 1);
+                        }
                         return;
                     }
                     ::InterlockedExchange(&r->lastRet, (long)(retRva & 0xFFFFFFFFu));
@@ -788,7 +979,7 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where)
                        derives them.  Only a terminal state is queued, and under the last-actor rule
                        that queued change is ALSO the actor report a non-holder sends to the holder:
                        the drain asks who holds the door at the moment it sends. */
-                    if (state == 0 || state == 1) QueueOut(key, state, locked, 1);
+                    if (state == 0 || state == 1) QueueOut(key, state, word, 1);
                     else ::InterlockedExchange(&g_dirty, 1);
                 }
             }
@@ -809,21 +1000,53 @@ void detour_setDoorOpenAmount(void* door, float amount, unsigned char force)
 {
     const uintptr_t ret = RetRva(_ReturnAddress());
     if (orig_setDoorOpenAmount != 0) orig_setDoorOpenAmount(door, amount, force);
-    NoteDoor(door, ret, "funnel");
+    NoteDoor(door, ret, "funnel", 0);
 }
 unsigned char detour_openDoor(void* door)
 {
     const uintptr_t ret = RetRva(_ReturnAddress());
     const unsigned char rc = (orig_openDoor != 0) ? orig_openDoor(door) : 0;
-    NoteDoor(door, ret, "openDoor");
+    NoteDoor(door, ret, "openDoor", 0);
     return rc;
 }
 unsigned char detour_closeDoor(void* door)
 {
     const uintptr_t ret = RetRva(_ReturnAddress());
     const unsigned char rc = (orig_closeDoor != 0) ? orig_closeDoor(door) : 0;
-    NoteDoor(door, ret, "closeDoor");
+    NoteDoor(door, ret, "closeDoor", 0);
+    /* A close that did nothing is how the NPC lock action 0x337630 begins on a door that is already shut; its
+       lock write follows and no detour sees it, so the door's row is marked and the next tick compares its lock
+       word (DoorLockSweepRow).  Only a door with a DoorLock can be locked and only a door with a live row can be
+       compared, so a no-op close on any other door marks nothing and costs no tick. */
+    if (rc == 0 && ::InterlockedCompareExchange(&g_applying, 0, 0) == 0 && DoorHasLockPod(door) != 0)
+    {
+        DoorRow* r = RowByDoor(door);
+        if (r != 0)
+        {
+            ::InterlockedExchange(&r->lockSweep, 1);
+            ::InterlockedExchange(&g_doorLockSweepPending, 1);
+            ::InterlockedExchange(&g_dirty, 1);
+        }
+    }
     return rc;
+}
+/* T-160: THE TWO ENGINE PATHS THAT CHANGE A LOCK WITHOUT MOVING THE DOOR.  lockButton is the player's
+   lock press; lockDoor is DoorStuff::update's re-lock when a closing door lands with wantsToLock set.
+   Without them a lock pressed on a shut door would never be seen at all - the funnel only runs when a
+   door moves. */
+void detour_lockDoor(void* door)
+{
+    const uintptr_t ret = RetRva(_ReturnAddress());
+    const int ours = (door != 0 && ::InterlockedCompareExchangePointer((void* volatile*)&g_playLandedDoor, 0, door) == door) ? 1 : 0;
+    if (orig_lockDoor != 0) orig_lockDoor(door);
+    if (ours != 0) ::InterlockedIncrement64(&g_doorRelockOurs);
+    NoteDoor(door, ret, "lockDoor", ours);
+}
+void detour_lockButton(void* door, void* panelLine)
+{
+    const uintptr_t ret = RetRva(_ReturnAddress());
+    if (orig_lockButton != 0) orig_lockButton(door, panelLine);
+    NoteDoor(door, ret, "lockButton", 0);
 }
 
 /* ============================ IS THE ENGINE STILL HOLDING THIS DOOR? ============================
@@ -1060,6 +1283,98 @@ int DoorTakePending(DoorHeldRow* h)
      - the engine's own active-zone walk no longer lists the row, or the key no longer rebuilds: the
        row is DROPPED, which is exactly what `unnameable` means - this game can no longer name that
        door - and it is the same book the tick loop makes when RowByKey finds nothing. */
+/* T-160: THE HOLDER'S LOCK WORD, APPLIED WITH THE ENGINE'S OWN LOCK WRITES.  Called only once the two
+   games agree about OPEN / CLOSED, the row has passed the active-zone walk and the key re-derivation, and
+   coopdoor::DoorLockDecide said kDoorActLock.  One write per step (coopdoor::DoorLockStep), the door re-read
+   after each and the row given the word the write left - so the unseen-lock test never takes this game's own
+   apply for a local write.  A step that leaves the word unchanged ends the visit as ineffective, and
+   kDoorLockGiveUpN such visits in a row stop the lock correction on this row until the two games agree about
+   the lock again (lesson 14).  Returns a coopdoor::kDoorLockStuck* reason; kDoorLockStuckNone = applied or
+   still on its way. */
+int DoorApplyLock(DoorRow* r, DoorHeldRow* h)
+{
+    int n, lockRefused = 0;
+    if (DoorHasLockPod(r->door) == 0) return coopdoor::kDoorLockStuckNoLock;
+    for (n = 0; n < coopdoor::kDoorLockStepsPerVisit; ++n)
+    {
+        int s = 0, d = 0, l = 0, w = 0, b = 0;
+        if (DoorReadPod(r->door, &s, &d, &l, &w, &b) == 0) { ++g_doorReadFault; return coopdoor::kDoorLockStuckNone; }
+        {
+            const int before = coopdoor::DoorLockWord(l, w);
+            const int step = coopdoor::DoorLockStepAfterRefusal(coopdoor::DoorLockStep(s, before, (int)h->locked), s, lockRefused);
+            if (step == coopdoor::kDoorLockStepNone)
+            {
+                ++g_doorLockApplied;
+                ::InterlockedExchange(&r->lockIneffective, 0);
+                return coopdoor::kDoorLockStuckNone;
+            }
+            if (step == coopdoor::kDoorLockStepWait) { ::InterlockedExchange(&g_dirty, 1); return coopdoor::kDoorLockStuckNone; }
+            if ((step == coopdoor::kDoorLockStepLock && g_lockDoor == 0)
+                || (step == coopdoor::kDoorLockStepUnlock && g_unlockDoor == 0))
+                return coopdoor::kDoorLockStuckNoCall;
+            ApplyLockPod(step, r->door);
+            if ((step == coopdoor::kDoorLockStepLock || step == coopdoor::kDoorLockStepSetLocked) && g_updateGateCode != 0)
+                DoorGateCodePod(r->door);
+            if (step == coopdoor::kDoorLockStepLock) ++g_doorLockLocks;
+            else if (step == coopdoor::kDoorLockStepUnlock) ++g_doorLockUnlocks;
+            else if (step == coopdoor::kDoorLockStepClearWants) ++g_doorLockWantsCleared;
+            else ++g_doorLockSetLocked;
+            {
+                int s2 = 0, d2 = 0, l2 = 0, w2 = 0, b2 = 0;
+                if (DoorReadPod(r->door, &s2, &d2, &l2, &w2, &b2) == 0) { ++g_doorReadFault; return coopdoor::kDoorLockStuckNone; }
+                ::InterlockedExchange(&r->locked, (long)coopdoor::DoorLockWord(l2, w2));
+                if (coopdoor::DoorLockWord(l2, w2) == before)
+                {
+                    /* lockDoor refused a CLOSED door that has not settled: the next step is the direct lock write
+                       (coopdoor::DoorLockStepAfterRefusal), not an ineffective visit. */
+                    if (step == coopdoor::kDoorLockStepLock && s2 == coopdoor::kDoorClosed && lockRefused == 0)
+                    { lockRefused = 1; continue; }
+                    ++g_doorLockIneffective;
+                    if (::InterlockedIncrement(&r->lockIneffective) >= coopdoor::kDoorLockGiveUpN)
+                    {
+                        ::InterlockedExchange(&r->lockGaveUp, 1);
+                        ::InterlockedExchange(&r->lockIneffective, 0);
+                        ++g_doorLockGaveUp;
+                        DebugLog(std::string("[DOOR] the lock of '") + r->key + "' did not move for the engine's"
+                                 " own lock writes three visits in a row - left as it is until the two games agree"
+                                 " about it (doorLockGaveUp)");
+                        return coopdoor::kDoorLockStuckGaveUp;
+                    }
+                    ::InterlockedExchange(&g_dirty, 1);   /* revisited until it takes, gives up or is stuck */
+                    return coopdoor::kDoorLockStuckNone;
+                }
+            }
+        }
+    }
+    ::InterlockedExchange(&g_dirty, 1);
+    return coopdoor::kDoorLockStuckNone;
+}
+
+/* THE LOCK SWEEP OF ONE LIVE ROW (coopdoor::DoorLockSweepQueues): a row a no-op close marked, whether or not the
+   other game has ever named the door.  The same order as ApplyToRow - the active-zone walk first, then the read,
+   and the key re-derived (two virtual calls) only for a row whose word moved - and the same writes as its
+   unseen-lock branch, so a door the other game has named is not queued twice. */
+void DoorLockSweepRow(DoorRow* r)
+{
+    int state = 0, doa = 0, locked = 0, wants = 0, broken = 0, word;
+    if (DoorRowStillActive(r) == 0) { ++g_doorDroppedInactive; DropRow(r); return; }
+    if (DoorPlausible(r->door) == 0) return;
+    if (DoorReadPod(r->door, &state, &doa, &locked, &wants, &broken) == 0) { ++g_doorReadFault; return; }
+    word = coopdoor::DoorLockWord(locked, wants);
+    if (coopdoor::DoorLockSweepQueues(state, (int)r->state, word, (int)r->locked) == 0) return;
+    {
+        char again[kDoorKeyCap];
+        int gate = 0;
+        again[0] = 0;
+        if (DoorKeyBuild(r->door, again, kDoorKeyCap, &gate, 0) == 0 || std::strcmp(again, r->key) != 0)
+        { ++g_doorRowRecycled; DropRow(r); return; }
+    }
+    ::InterlockedExchange(&r->locked, (long)word);
+    ::InterlockedExchange(&r->localWrite, 1);
+    ++g_doorLockUnseenLocal;
+    QueueOut(r->key, state, word, 1);
+}
+
 int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
 {
     if (g_setterOk == 0 || g_setDoorState == 0)
@@ -1099,12 +1414,6 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                 return 0;
             }
         }
-        /* THE LOCK BIT IS CARRIED AND NOT APPLIED.  read-doors 5.4 is explicit that the door
-           datapanel exclusion (policy.cpp's kDoorPanelRetNotAnswered) may be revisited once state
-           AND the lock are synced - "but not before, and not in the same commit".  E37 owns the
-           lock; this number is how often the two games disagree about it, so E37 starts with a
-           measurement instead of an assumption. */
-        if (h->locked >= 0 && locked != (int)h->locked) ++g_doorLockDiffSeen;
         /* ---- P8n STEP 1: AN ACTOR REPORT FROM THE PEER, CONSUMED EXACTLY ONCE.  Only the holder
            serialises, so the report is adopted here or it is dropped here, and either way the
            pending flag falls - a report that stayed pending would be re-decided every tick. ---- */
@@ -1119,8 +1428,12 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                    own answer for the door; the apply below then makes this game's engine agree, and
                    the republish is what lets every other game - the reporter included - stop. */
                 ::InterlockedExchange(&h->state, (long)h->actorState);
+                if (coopdoor::DoorLockWordValid((int)h->actorLocked) != 0)
+                    ::InterlockedExchange(&h->locked, h->actorLocked);
                 ::InterlockedExchange(&r->localWrite, 0);
                 ::InterlockedExchange(&r->holderWord, 1);
+                ::InterlockedExchange(&r->lockGaveUp, 0);
+                ::InterlockedExchange(&r->lockStuck, 0);
                 QueueOut(r->key, (int)h->actorState, (int)h->locked, 0);
                 ++g_doorAdopted;
                 /* P8n-b (review-p8n M-1): AND THE APPLY BELOW IS BOOKED AS THE HOLDER'S WORD.  `reason`
@@ -1157,6 +1470,50 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                 in.weHold = DoorWeHold(r);
                 act = coopdoor::DoorDecide(in);
             }
+            /* T-160: THE STATES AGREE - NOW THE LOCK.  The same last-actor rule decides it
+               (coopdoor::DoorLockDecide), and agreement is only agreement when the lock agrees too. */
+            if (act == coopdoor::kDoorActNothing && state == (int)h->state)
+            {
+                const int word = coopdoor::DoorLockWord(locked, wants);
+                /* A LOCK NO DETOUR SAW (coopdoor::DoorLockUnseenWrite).  The row holds the word this game last
+                   saw or wrote, so a live word that differs is this game's own world - the NPC lock action
+                   0x337630 locking a door that was already shut is the known writer.  It is a local change
+                   like a hooked one: queued (for the holder, or as the holder's word) and never undone. */
+                if (coopdoor::DoorLockUnseenWrite(word, (int)r->locked) != 0)
+                {
+                    ::InterlockedExchange(&r->locked, (long)word);
+                    ::InterlockedExchange(&r->localWrite, 1);
+                    ++g_doorLockUnseenLocal;
+                    QueueOut(r->key, state, word, 1);
+                }
+                act = coopdoor::DoorLockDecide(word, (int)h->locked, (int)r->localWrite, -1);
+                if (act == coopdoor::kDoorActReport)
+                    act = coopdoor::DoorLockDecide(word, (int)h->locked, (int)r->localWrite, DoorWeHold(r));
+                if (act == coopdoor::kDoorActLock)
+                {
+                    int why = coopdoor::kDoorLockStuckGaveUp;
+                    if (r->lockGaveUp == 0)
+                    {
+                        why = DoorApplyLock(r, h);
+                        if (why == coopdoor::kDoorLockStuckNone) return 0;
+                    }
+                    /* THE LOCK CANNOT BE APPLIED HERE (no DoorLock, no lock call, or a lock that gave up) and the
+                       open / closed state agrees: the row takes the agreement clears below as for full
+                       agreement, and the event is counted once - the latch falls when the locks agree, when this
+                       game adopts a word, or when a new holder word lands. */
+                    if (::InterlockedExchange(&r->lockStuck, 1) == 0)
+                    {
+                        if (why == coopdoor::kDoorLockStuckNoLock) ++g_doorLockNoLockObject;
+                        else if (why == coopdoor::kDoorLockStuckNoCall) ++g_doorLockNoCall;
+                    }
+                    act = coopdoor::kDoorActNothing;
+                }
+                else if (act == coopdoor::kDoorActNothing)
+                {
+                    ::InterlockedExchange(&r->lockGaveUp, 0);
+                    ::InterlockedExchange(&r->lockStuck, 0);
+                }
+            }
             if (act == coopdoor::kDoorActGaveUp)
             {
                 /* P8n-b (review-p8n M-4, MANAGER RULING): a row given up on churn is not dead for the
@@ -1167,7 +1524,16 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                    256-slot apply scan, DoorRowStillActive's linear walk-list test per row and a key
                    re-derivation with two virtual calls - at frame rate for thirty seconds because ONE
                    row had given up.  DoorChurnReArmSweep now reads it at most once a second and only
-                   while g_doorChurnWatch says some row is given up.  Nothing is done here at all. */
+                   while g_doorChurnWatch says some row is given up.  Nothing else is done here. */
+                /* T-160: THE LANDING BOUND OF A SWING THIS GAME PLAYED.  A row given up on churn never reaches
+                   the waiting arm below, so a swing that has not landed inside the bound stops being this game's
+                   own write here - a later change to the door is the world's again.  No snap: the row is given
+                   up. */
+                if (coopdoor::DoorPlayOverdue((int)r->playTarget, (unsigned long)(long)r->playStartMs, (unsigned long)g_doorUnpausedMs) != 0)
+                {
+                    ::InterlockedExchange(&r->playTarget, -1);
+                    ++g_doorPlayOverdue;
+                }
                 return 0;
             }
             if (act == coopdoor::kDoorActNothing)
@@ -1200,7 +1566,14 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                    is a change, which marks the tick dirty on its own. */
                 ++g_doorMidSwingSkipped;
                 ::InterlockedExchange(&g_dirty, 1);
-                return 0;
+                /* ... unless it is a swing THIS game played that has not landed inside the bound: it is
+                   finished with a snap to the holder's state, which is what the swing was for. */
+                if (coopdoor::DoorPlayOverdue((int)r->playTarget, (unsigned long)(long)r->playStartMs, (unsigned long)g_doorUnpausedMs) == 0)
+                    return 0;
+                ::InterlockedExchange(&r->playTarget, -1);
+                ++g_doorPlayOverdue;
+                DebugLog(std::string("[DOOR] a swing this game played on '") + r->key + "' did not land inside "
+                         + "the bound - finished with a snap to the holder's state (doorPlayOverdue)");
             }
             if (act == coopdoor::kDoorActReport)
             {
@@ -1261,19 +1634,54 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                    change is already on its way out as a holder publish; all that is needed here is to
                    stop this game reverting its own door on the next tick. */
                 ::InterlockedExchange(&h->state, (long)state);
+                ::InterlockedExchange(&h->locked, (long)coopdoor::DoorLockWord(locked, wants));
                 ::InterlockedExchange(&r->localWrite, 0);
                 ::InterlockedExchange(&r->holderWord, 0);
+                ::InterlockedExchange(&r->lockGaveUp, 0);
+                ::InterlockedExchange(&r->lockStuck, 0);
                 ++g_doorAdoptedLocal;
                 return 0;
             }
         }
-        ApplySetterPod(r->door, (int)h->state);
+        /* T-160: PLAYED OR SNAPPED (coopdoor::DoorApplyHow).  A played swing is measured by what the
+           engine call left behind - OPENING or CLOSING - and a call that left the door unmoved falls
+           through to the snap on the same visit. */
+        int expect = (int)h->state;
+        {
+            const int target = (int)h->state;
+            OpenCloseDoorFn call = (target == coopdoor::kDoorOpen) ? g_playOpen : g_playClose;
+            int how = coopdoor::DoorApplyHow(reason, state, target, call != 0 ? 1 : 0);
+            if (how == coopdoor::kDoorApplyPlay)
+            {
+                int s1 = 0, d1 = 0, l1 = 0, w1 = 0, b1 = 0;
+                ::InterlockedExchange(&r->playTarget, (long)target);
+                ::InterlockedExchange(&r->playStartMs, g_doorUnpausedMs);
+                ApplyPlayPod(call, r->door);
+                if (DoorReadPod(r->door, &s1, &d1, &l1, &w1, &b1) != 0 && s1 == coopdoor::DoorPlayStartedState(target))
+                {
+                    expect = s1;
+                    ++g_doorPlayStarted;
+                    ::InterlockedExchange(&g_dirty, 1);   /* the WaitMidSwing arm watches the landing bound */
+                }
+                else
+                {
+                    ::InterlockedExchange(&r->playTarget, -1);
+                    ++g_doorPlayRefused;
+                    how = coopdoor::kDoorApplySnap;
+                }
+            }
+            if (how == coopdoor::kDoorApplySnap)
+            {
+                ApplySetterPod(r->door, target);
+                ++g_doorSnapped;
+            }
+        }
         {
             /* LESSON 14: A CORRECTIVE MEASURES ITS OWN EFFECT AND GIVES UP.  A fix that cannot fail
                visibly retries forever - 22,375 times on one character, in this project's own
                history - and "it ran 22,000 times" is not evidence it did anything. */
             int s2 = 0, d2 = 0, l2 = 0, w2 = 0, b2 = 0;
-            if (DoorReadPod(r->door, &s2, &d2, &l2, &w2, &b2) == 0 || s2 != (int)h->state)
+            if (DoorReadPod(r->door, &s2, &d2, &l2, &w2, &b2) == 0 || s2 != expect)
             {
                 ++g_doorApplyIneffective;
                 if (::InterlockedIncrement(&r->ineffective) >= 3)
@@ -1286,7 +1694,7 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                 return 0;
             }
             ::InterlockedExchange(&r->ineffective, 0);
-            ::InterlockedExchange(&r->state, (long)h->state);
+            ::InterlockedExchange(&r->state, (long)expect);
         }
         ++g_doorApplied;
         if (reason == 2) ++g_doorReapplyAfterForcedOpen;
@@ -1406,23 +1814,58 @@ void InstallDoors()
         ErrorLog("[DOOR] AddHook setDoorOpenAmount 0x298CD0 FAILED - no door change is seen");
     else ++g_hooked;
 
-    if (PrologueMatches(kOpenDoorRva, kPrologueOpenDoor, 8) == 0)
+    /* The applier's open / close calls are judged on the engine's own bytes, read here BEFORE the detours below patch them;
+       they then enter through those detours, inside the applying bracket, as the lock calls do. */
+    const int openBytesOk = (kOpenDoorRva != 0 && PrologueMatches(kOpenDoorRva, kPrologueOpenDoor, 8) != 0) ? 1 : 0;
+    const int closeBytesOk = (kCloseDoorRva != 0 && PrologueMatches(kCloseDoorRva, kPrologueCloseDoor, 8) != 0) ? 1 : 0;
+    if (openBytesOk == 0)
         ErrorLog("[DOOR] openDoor 0x297000 prologue mismatch - the OPENING edge is not named by its originator");
     else if (coop::AddHook((void*)(g_base + kOpenDoorRva), (void*)&detour_openDoor, (void**)&orig_openDoor) != coop::SUCCESS)
         ErrorLog("[DOOR] AddHook openDoor 0x297000 FAILED");
     else ++g_hooked;
 
-    if (PrologueMatches(kCloseDoorRva, kPrologueCloseDoor, 8) == 0)
+    if (closeBytesOk == 0)
         ErrorLog("[DOOR] closeDoor 0x298C10 prologue mismatch - the CLOSING edge is not named by its originator");
     else if (coop::AddHook((void*)(g_base + kCloseDoorRva), (void*)&detour_closeDoor, (void**)&orig_closeDoor) != coop::SUCCESS)
         ErrorLog("[DOOR] AddHook closeDoor 0x298C10 FAILED");
     else ++g_hooked;
 
+    /* T-160: THE CALLS THE APPLIER MAKES, each taken only when its prologue matched.  A refused open /
+       close leaves that direction SNAPPED (DoorApplyHow); a refused lock call leaves that step undone and
+       counted (doorLockNoCall). */
+    if (openBytesOk != 0) g_playOpen = (OpenCloseDoorFn)(g_base + kOpenDoorRva);
+    if (closeBytesOk != 0) g_playClose = (OpenCloseDoorFn)(g_base + kCloseDoorRva);
+    if (kUnlockDoorRva != 0 && PrologueMatches(kUnlockDoorRva, kPrologueUnlockDoor, 8) != 0) g_unlockDoor = (LockDoorFn)(g_base + kUnlockDoorRva);
+    else ErrorLog("[DOOR] unlockDoor 0x569940 prologue mismatch - the holder's unlock is not applied on this game");
+    if (kUpdateGateCodeRva != 0 && PrologueMatches(kUpdateGateCodeRva, kPrologueUpdateGateCode, 9) != 0) g_updateGateCode = (LockDoorFn)(g_base + kUpdateGateCodeRva);
+    else ErrorLog("[DOOR] updateGateCodeState 0x297250 prologue mismatch - a lock this game applies leaves the door's gate code as it was");
+
+    if (kLockDoorRva == 0 || PrologueMatches(kLockDoorRva, kPrologueLockDoor, 8) == 0)
+        ErrorLog("[DOOR] lockDoor 0x2969B0 prologue mismatch - the re-lock of a closing door is not seen and the holder's lock is not applied");
+    else
+    {
+        g_lockDoor = (LockDoorFn)(g_base + kLockDoorRva);
+        if (coop::AddHook((void*)(g_base + kLockDoorRva), (void*)&detour_lockDoor, (void**)&orig_lockDoor) != coop::SUCCESS)
+            ErrorLog("[DOOR] AddHook lockDoor 0x2969B0 FAILED - the re-lock of a closing door is not seen");
+        else ++g_hooked;
+    }
+    if (kLockButtonRva == 0 || PrologueMatches(kLockButtonRva, kPrologueLockButton, 8) == 0)
+        ErrorLog("[DOOR] lockButton 0x5465D0 prologue mismatch - a lock press is not seen");
+    else
+    {
+        g_lockButton = (LockButtonFn)(g_base + kLockButtonRva);
+        if (coop::AddHook((void*)(g_base + kLockButtonRva), (void*)&detour_lockButton, (void**)&orig_lockButton) != coop::SUCCESS)
+            ErrorLog("[DOOR] AddHook lockButton 0x5465D0 FAILED - a lock press is not seen");
+        else ++g_hooked;
+    }
+
     {
         char b[288];
-        _snprintf(b, 287, "[DOOR] E45 installed: %d of 3 detours armed, applier %s (decision 40 - a door's OPEN/CLOSED"
-                          " state belongs to the game that HOLDS its patch of map, never to the door's owner)",
-                  g_hooked, g_setterOk != 0 ? "ready" : "REFUSED");
+        _snprintf(b, 287, "[DOOR] E45 installed: %d of 5 detours armed, applier %s, swing calls %d/2, lock calls %d/2"
+                          " (decision 40 - a door belongs to the game that HOLDS its patch of map)",
+                  g_hooked, g_setterOk != 0 ? "ready" : "REFUSED",
+                  (g_playOpen != 0 ? 1 : 0) + (g_playClose != 0 ? 1 : 0),
+                  (g_lockDoor != 0 ? 1 : 0) + (g_unlockDoor != 0 ? 1 : 0));
         b[287] = 0;
         DebugLog(b);
     }
@@ -1467,6 +1910,7 @@ void DoorsWorldTeardown()
     std::memset(g_held, 0, sizeof(g_held));
     std::memset(g_out, 0, sizeof(g_out));
     ::InterlockedExchange(&g_dirty, 0);
+    ::InterlockedExchange(&g_doorLockSweepPending, 0);
     ::InterlockedExchange(&g_doorPurgePending, 0);   /* the rows it would have swept are gone with the world */
     ::InterlockedExchange(&g_doorChurnWatch, 0);     /* P8n-c: and no row survives to be re-armed */
 }
@@ -1489,7 +1933,7 @@ int DoorStateToBytes(const char* key, int state, int locked, std::vector<char>* 
     o += '\t';
     o += (state == coopdoor::kDoorOpen) ? '1' : '0';
     o += '\t';
-    o += (locked != 0) ? '1' : '0';
+    o += (char)('0' + (coopdoor::DoorLockWordValid(locked) != 0 ? locked : 0));
     out->assign(o.begin(), o.end());
     return 1;
 }
@@ -1504,7 +1948,7 @@ int DoorsQueueReplay(const std::vector<char>& payload)
         f.push_back(s.substr(at, t - at)); at = t + 1;
     }
     if (f.size() != 4 || f[0] != "d1" || f[1].empty() || f[1].size() >= (size_t)kDoorKeyCap
-        || (f[2] != "0" && f[2] != "1") || (f[3] != "0" && f[3] != "1"))
+        || (f[2] != "0" && f[2] != "1") || f[3].size() != 1 || f[3][0] < '0' || f[3][0] > '3')
     {
         ++g_doorQueuePayloadRefused;
         ErrorLog("[DOOR] outage queue: a journaled door change could not be read back and is DROPPED - that"
@@ -1532,12 +1976,12 @@ int DoorsQueueReplay(const std::vector<char>& payload)
         }
     }
     if (!net::SendDoorState(f[1], (f[2] == "1") ? coopdoor::kDoorOpen : coopdoor::kDoorClosed,
-                            (f[3] == "1") ? 1 : 0,
+                            (int)(f[3][0] - '0'),
                             (unsigned int)::InterlockedIncrement(&g_gen), coopdoor::kDoorOriginHolder,
                             0))   /* M7b slice 4 (C4): no position read here - WORLD on the notebook road (sideNoArea) */
         return 0;
     ++g_doorPublished;
-    DebugLog("[DOOR] outage queue: re-published '" + f[1] + "' state=" + f[2] + " locked=" + f[3]
+    DebugLog("[DOOR] outage queue: re-published '" + f[1] + "' state=" + f[2] + " lockWord=" + f[3]
              + " with a fresh generation - it was refused while the notebook was unreachable and is written"
              " now (decision 52)");
     return 1;
@@ -1562,7 +2006,8 @@ void DoorsOnLinkUp()
 void ApplyDoorState(const std::string& key, int state, int locked, unsigned int gen, unsigned int fromPeer,
                     int origin)
 {
-    if (key.empty() || key.size() >= (size_t)kDoorKeyCap || (state != 0 && state != 1))
+    if (key.empty() || key.size() >= (size_t)kDoorKeyCap || (state != 0 && state != 1)
+        || coopdoor::DoorLockWordValid(locked) == 0)
     { ++g_doorMsgMalformed; return; }
     {
         DoorHeldRow* h = HeldFor(key.c_str(), 1);
@@ -1576,7 +2021,10 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
         {
             /* P8n-c (review-p8n-b M-2b): the ordering state is taken by a message that is ACCEPTED.
                An actor report always is - the holder rule decides it later, in DoorsTick. */
-            h->locked = locked; h->gen = (long)gen; h->fromPeer = (long)net::PlayerKeyNow(fromPeer);
+            h->gen = (long)gen; h->fromPeer = (long)net::PlayerKeyNow(fromPeer);
+            /* ... and its lock word waits beside its state: it becomes this game's answer only if this
+               game holds the door and adopts the report. */
+            ::InterlockedExchange(&h->actorLocked, (long)locked);
             /* P8n: AN ACTOR REPORT DOES NOT BECOME THE HOLDER'S ANSWER HERE.  Whether this game holds
                the door needs the door's position - a virtual call through a stored pointer - so the
                question waits for DoorsTick, where the active-zone walk has already passed. */
@@ -1654,6 +2102,8 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
             {
                 ::InterlockedExchange(&rr->localWrite, 0);
                 ::InterlockedExchange(&rr->holderWord, 1);
+                ::InterlockedExchange(&rr->lockGaveUp, 0);
+                ::InterlockedExchange(&rr->lockStuck, 0);
             }
         }
         ::InterlockedExchange(&g_dirty, 1);
@@ -1662,6 +2112,8 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
 
 void DoorsTick()
 {
+    ::InterlockedExchangePointer((void* volatile*)&g_playLandedDoor, 0);
+    DoorClockAdvance();
     if (!g_on) return;
     /* THE LINK-UP EDGE IS ABOVE THE IDLE GATE, because a re-offer is exactly the work that has to
        happen when nothing local has changed - the peer has just arrived and has been told nothing. */
@@ -1727,6 +2179,15 @@ void DoorsTick()
             std::strncpy(g_doorWorstKey, g_rows[w].key, kDoorKeyCap - 1);
             g_doorWorstKey[kDoorKeyCap - 1] = 0;
         }
+    }
+
+    /* ---- THE LOCK SWEEP: the rows a no-op close marked (detour_closeDoor), before the publish so a lock found
+       here goes out this tick.  Left pending while engine writes are blocked; the apply step keeps the tick dirty. ---- */
+    if (!EngineWritesBlocked() && ::InterlockedExchange(&g_doorLockSweepPending, 0) != 0)
+    {
+        for (int q = 0; q < kDoorRows; ++q)
+            if (g_rows[q].door != 0 && g_rows[q].ready != 0 && ::InterlockedExchange(&g_rows[q].lockSweep, 0) != 0)
+                DoorLockSweepRow(&g_rows[q]);
     }
 
     /* ---- 1. PUBLISH.  The holder, and only the holder, puts a change on the wire. ---- */
@@ -1904,12 +2365,12 @@ void ReportDoors()
     {
         char b[3584];   /* P8o + B12: resolve[...] and doorOutageQueue[...] both ride here; grown so no token can truncate the tail (F172) */
         _snprintf(b, 3583,
-            "[DOOR] doors=%s hooks=%d/3 applier=%d doorPublished=%lld doorApplied=%lld"
+            "[DOOR] doors=%s hooks=%d/5 applier=%d doorPublished=%lld doorApplied=%lld"
             " applySpans[onArrival,reapplyAfterForcedOpen,appliedHolderWord]=%lld,%lld,%lld"
             " doorKeyUnbuildable=%lld keyBuilderRefusals=%lld keySidHashed=%lld"
             " seenChanges=%lld suppressedSameState=%lld selfWrite=%lld offThread=%lld readFault=%lld retUnreadable=%lld"
             " publish[notHolder,noLink,republishedOnLink]=%lld,%lld,%lld"
-            " apply[noSetter,blocked,unresolved,ineffective,gaveUp,lockDiffSeen,rowRecycled]=%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+            " apply[noSetter,blocked,unresolved,ineffective,gaveUp,rowRecycled]=%lld,%lld,%lld,%lld,%lld,%lld"
             " overflow[rows,held,out]=%lld,%lld,%lld msgMalformed=%lld p060Suppressed=%lld"
             " droppedInactive=%lld activeVia[door,owner]=%lld,%lld zoneDeactivations=%lld purgeSweeps=%lld"
             " lastActor[reported,received,adopted,adoptedLocal,ignoredNotHolder,unnameable,superseded,kept,midSwingSkipped,rowUnusable]"
@@ -1928,7 +2389,7 @@ void ReportDoors()
             g_doorSeenChanges, g_doorSuppressedSameState, g_doorSelfWrite, g_doorOffThread, g_doorReadFault, g_doorRetUnreadable,
             g_doorPublishNotHolder, g_doorPublishNoLink, g_doorRepublishedOnLink,
             g_doorApplyNoSetter, g_doorApplyBlocked, g_doorApplyUnresolved, g_doorApplyIneffective,
-            g_doorGaveUp, g_doorLockDiffSeen, g_doorRowRecycled,
+            g_doorGaveUp, g_doorRowRecycled,
             g_doorRowsOverflow, g_doorHeldOverflow, g_doorOutOverflow,
             g_doorMsgMalformed, g_doorLinesSuppressed,
             g_doorDroppedInactive, g_doorActiveViaDoor, g_doorActiveViaOwner,
@@ -1950,6 +2411,17 @@ void ReportDoors()
             g_doorQueuedNoNotebook, g_doorQueuePayloadRefused);
         b[3583] = 0;
         DebugLog(b);
+    }
+    {   /* T-160 */
+        char t1[480];
+        _snprintf(t1, 479, "[DOOR] swing[played,snapped,refused,landed,interrupted,overdue,frames,relockOurs,landReported]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                  " lock[applied,locks,unlocks,wantsCleared,lockedSet,ineffective,gaveUp,noLockObject,noCall,unseenLocal]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                  g_doorPlayStarted, g_doorSnapped, g_doorPlayRefused, g_doorPlayLanded, g_doorPlayInterrupted,
+                  g_doorPlayOverdue, g_doorPlayFrames, g_doorRelockOurs, g_doorPlayLandReported,
+                  g_doorLockApplied, g_doorLockLocks, g_doorLockUnlocks, g_doorLockWantsCleared, g_doorLockSetLocked,
+                  g_doorLockIneffective, g_doorLockGaveUp, g_doorLockNoLockObject, g_doorLockNoCall, g_doorLockUnseenLocal);
+        t1[479] = 0;
+        DebugLog(t1);
     }
     {   /* M7b slice 4 fold 1 (F8) */
         char f8[200];
@@ -1979,9 +2451,12 @@ void ReportDoors()
              " not extra buckets).  doorKeyUnbuildable is the door road's own count at the detour and"
              " keyBuilderRefusals is items.cpp's count of the same events split by the builder's five reasons -"
              " they measure the SAME event from two sides and are expected to agree.  E45 SHARES THE STATE AND NOT"
-             " THE CAUSE: OPENING and CLOSING never go on the wire, the applier SNAPS (no swing, no sound), and the"
-             " LOCK BIT IS CARRIED AND NOT APPLIED - doorLockDiffSeen is how often the two games disagree about it"
-             " and E37 owns that repair.  E45 IS STILL A COMPENSATION with a row in docs/parity-register.md, but"
+             " THE CAUSE: OPENING and CLOSING never go on the wire.  A holder's change to a settled door is PLAYED"
+             " with the engine's own openDoor / closeDoor (swing[played], the engine's own swing and sound) and"
+             " everything nobody watched move is SNAPPED (swing[snapped]): played + snapped = doorApplied.  The"
+             " holder's LOCK WORD (locked + wantsToLock) is applied once the states agree, with the engine's own"
+             " lockDoor / unlockDoor and the two direct writes the engine's own code makes (lock[...]), silently; a"
+             " live lock word no detour saw is this game's own (unseenLocal).  E45 IS STILL A COMPENSATION with a row in docs/parity-register.md, but"
              " P8n REWROTE THE RULE: the five AI task actions and the player's own click are let through locally"
              " and are NOT REVERTED BY THE APPLIER - the change is reported to the area holder, which adopts and"
              " republishes it (see the P8n footer below).  The span that counted the old revert is retired and absent from the"
@@ -2122,6 +2597,183 @@ int DoorOpenStatePod(void* door, int* state, int* openTenths)
 {
     int lk = 0, wants = 0, broken = 0;
     return DoorReadPod(door, state, openTenths, &lk, &wants, &broken);
+}
+
+/* ============ T-160: TEST LEVER `doortest` (TEST-ONLY) ============
+   doortest open|close|lock <nearest|last|key>  - this game moves one door the way its own world would: open / close
+       through the engine's DoorStuff::openDoor / closeDoor (the calls a character's open uses), lock through
+       DoorStuff::lockButton (the player's lock press - it flips the lock).  Not inside the applier's bracket, so the
+       detours see an ordinary change and the door road shares it exactly as it shares a character's.
+   doortest npclock <nearest|last|key>  - what the NPC lock action 0x337630 does: closeDoor, then DoorLock::locked = 1
+       written directly (wantsToLock untouched) - a lock no detour sees.  Its Character_Lock sound is not played.
+   doortest show <nearest|next|last|key|held>  - a read: the door's state, open amount and lock word; `held` lists
+       every holder word this game has received, beside the live state of its door here.
+   `nearest` = a door of the building nearest the watched player that has one (zones.cpp NearestBuildingWhere); `next`
+   = the same, skipping the building of the door the previous doortest named; `last` = the door the previous doortest
+   named, found again by its key in this game's active zones (as a key target is), never by a stored pointer.  MAIN
+   THREAD, behind EngineWritesBlocked(). */
+namespace {
+char  g_testKey[kDoorKeyCap] = { 0 };
+void* g_testSkipBuilding = 0;   /* `next`: set only for the length of its NearestBuildingWhere call */
+/* The building's first door that is a plausible DoorStuff naming this building as its parent, or 0. */
+void* DoorTestFirstDoor(void* building)
+{
+    void* elems[8];
+    int cnt = 0, raw = 0, k;
+    if (DoorArrayPod(building, elems, 8, &cnt, &raw) == 0) return 0;
+    for (k = 0; k < cnt; ++k)
+    {
+        void* parent = 0;
+        int s = 0, d = 0, l = 0, w = 0, b = 0;
+        if (DoorPlausible(elems[k]) == 0) continue;
+        if (DoorParentPod(elems[k], &parent) == 0 || parent != building) continue;
+        if (DoorReadPod(elems[k], &s, &d, &l, &w, &b) == 0) continue;
+        return elems[k];
+    }
+    return 0;
+}
+int DoorTestHasDoor(void* building) { return (DoorTestFirstDoor(building) != 0) ? 1 : 0; }
+int DoorTestHasOtherDoor(void* building) { return (building != g_testSkipBuilding && DoorTestHasDoor(building) != 0) ? 1 : 0; }
+/* The live row of a key in this game's active zones: the row the funnel made, or the parent-building walk's
+   (DoorResolveByKey); 0 when neither names it or its zone is no longer active. */
+DoorRow* DoorTestRowByKey(const char* key)
+{
+    DoorRow* r = RowByKey(key);
+    if (r == 0) r = DoorResolveByKey(key);
+    if (r == 0 || DoorRowStillActive(r) == 0) return 0;
+    return r;
+}
+void DoorTestPressLockPod(void* door)
+{
+    __try { g_lockButton(door, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+std::string DoorTestLine(const char* what, void* door, const char* key)
+{
+    int s = 0, d = 0, l = 0, w = 0, b = 0;
+    char o[320];
+    if (DoorReadPod(door, &s, &d, &l, &w, &b) == 0) return std::string("error doortest: the door read faulted");
+    _snprintf(o, 319, "%s key=%s state=%d doa=%d lockWord=%d (locked=%d wants=%d) broken=%d hold=%s",
+              what, key, s, d, coopdoor::DoorLockWord(l, w), l, w, b, HoldWord(door, 1));
+    o[319] = 0;
+    return std::string(o);
+}
+} // namespace
+
+std::string DoorTestCommand(const std::string& argIn)
+{
+    std::string op, target;
+    {
+        const size_t sp = argIn.find(' ');
+        op = argIn.substr(0, sp);
+        target = (sp == std::string::npos) ? std::string() : argIn.substr(sp + 1);
+        while (!target.empty() && target[0] == ' ') target.erase(0, 1);
+    }
+    if (op != "open" && op != "close" && op != "lock" && op != "npclock" && op != "show")
+        return "error doortest: usage `doortest open|close|lock|npclock|show <nearest|next|last|key>` or `doortest show held`";
+    if (::GetCurrentThreadId() != g_mainThread) return "error doortest: not on the main thread";
+    if (EngineWritesBlocked()) return "error doortest: engine writes blocked (a load or a teardown)";
+    if (op == "show" && target == "held")
+    {
+        int n = 0;
+        for (int i = 0; i < kDoorHeldCap; ++i)
+        {
+            if (g_held[i].used == 0) continue;
+            DoorRow* r = RowByKey(g_held[i].key);
+            char hb[200];
+            _snprintf(hb, 199, "[DOORTEST] held key=%s holderState=%ld holderLockWord=%ld", g_held[i].key,
+                      (long)g_held[i].state, (long)g_held[i].locked);
+            hb[199] = 0;
+            if (r != 0 && DoorRowStillActive(r) != 0) DebugLog(std::string(hb) + " | " + DoorTestLine("here", r->door, r->key));
+            else DebugLog(std::string(hb) + " | here: no live row");
+            ++n;
+        }
+        char nb[64];
+        _snprintf(nb, 63, "ok doortest show held: %d", n);
+        nb[63] = 0;
+        return std::string(nb);
+    }
+    void* door = 0;
+    std::string key;
+    if (target == "nearest")
+    {
+        std::string err;
+        double dist = -1;
+        void* b = NearestBuildingWhere(&DoorTestHasDoor, &dist, &err);
+        if (b == 0) return "error doortest nearest: " + err;
+        door = DoorTestFirstDoor(b);
+        if (door == 0) return "error doortest nearest: the building's door did not read back";
+    }
+    else if (target == "next")
+    {
+        std::string err;
+        double dist = -1;
+        void* b = 0;
+        DoorRow* r = (g_testKey[0] != 0) ? DoorTestRowByKey(g_testKey) : 0;
+        if (r == 0) return "error doortest next: no door named yet, or it is not in this game's active zones";
+        g_testSkipBuilding = r->owner;
+        b = NearestBuildingWhere(&DoorTestHasOtherDoor, &dist, &err);
+        g_testSkipBuilding = 0;
+        if (b == 0) return "error doortest next: " + err;
+        door = DoorTestFirstDoor(b);
+        if (door == 0) return "error doortest next: the building's door did not read back";
+    }
+    else
+    {
+        const std::string want = (target == "last") ? std::string(g_testKey) : target;
+        if (want.empty()) return "error doortest last: no door named yet";
+        DoorRow* r = DoorTestRowByKey(want.c_str());
+        if (r == 0) return "error doortest: no door with that key in this game's active zones: " + want;
+        door = r->door;
+        key = r->key;
+    }
+    if (DoorPlausible(door) == 0) return "error doortest: the door is not plausible";
+    {
+        char kb[kDoorKeyCap];
+        int gate = 0;
+        kb[0] = 0;
+        if (DoorKeyBuild(door, kb, kDoorKeyCap, &gate, 0) == 0) return "error doortest: the door's key could not be built";
+        if (!key.empty() && key != kb) return "error doortest: the door no longer carries the key " + key;
+        key = kb;
+    }
+    std::strncpy(g_testKey, key.c_str(), kDoorKeyCap - 1);
+    g_testKey[kDoorKeyCap - 1] = 0;
+    if (op == "show")
+    {
+        const std::string line = DoorTestLine("[DOORTEST] show", door, key.c_str());
+        DebugLog(line);
+        return "ok " + line;
+    }
+    {
+        const std::string before = DoorTestLine("before", door, key.c_str());
+        if (before.compare(0, 6, "error ") == 0) return before;
+        if (op == "open")
+        {
+            if (g_playOpen == 0) return "error doortest: openDoor did not pass its prologue check";
+            ApplyPlayPodInner(g_playOpen, door);
+        }
+        else if (op == "close")
+        {
+            if (g_playClose == 0) return "error doortest: closeDoor did not pass its prologue check";
+            ApplyPlayPodInner(g_playClose, door);
+        }
+        else if (op == "lock")
+        {
+            if (g_lockButton == 0 || DoorHasLockPod(door) == 0) return "error doortest: no lock button call, or the door has no lock";
+            DoorTestPressLockPod(door);
+        }
+        else
+        {
+            if (g_playClose == 0 || DoorHasLockPod(door) == 0) return "error doortest: no closeDoor call, or the door has no lock";
+            ApplyPlayPodInner(g_playClose, door);
+            ApplyLockPodInner(coopdoor::kDoorLockStepSetLocked, door);   /* outside the applier's bracket: the world's write */
+        }
+        {
+            const std::string line = "[DOORTEST] " + op + " " + before + " -> " + DoorTestLine("after", door, key.c_str());
+            DebugLog(line);
+            return "ok " + line;
+        }
+    }
 }
 
 /* P18 fold 1: the openDoor address (the table's OpenDoor row) for a bought house's doors (build.cpp); 0 = no row */

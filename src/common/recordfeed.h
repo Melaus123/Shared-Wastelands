@@ -36,7 +36,7 @@
 
 namespace coopfeed {
 
-const unsigned int kFeedProtocol = 69;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+const unsigned int kFeedProtocol = 87;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
 const unsigned int kMsgRecordFeed = 58;    /* 54/55 are effort/m11a's, 57 effort/m8's */
 const unsigned int kMsgRecord = 28, kMsgRecordGone = 32, kMsgDeletedBits = 33, kMsgUniqueState = 36;   /* the world server's numbers */
 enum { kFeedAsk = 1, kFeedOff = 2, kFeedBegin = 3, kFeedPageEnd = 4 };

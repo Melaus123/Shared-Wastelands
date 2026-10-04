@@ -209,6 +209,27 @@ void StatsNoteSpawnCarried(unsigned int uid, const unsigned int* raw44)
 void StatsNoteNoBlock()  { InterlockedIncrement64(&g_statsNoBlock); }
 void StatsNoteBadBlock() { InterlockedIncrement64(&g_statsBadBlock); }
 
+bool StatsApplyOwn(void* character, const unsigned int* raw44, int* rcOut)
+{
+    if (rcOut) *rcOut = 0;
+    if (character == 0 || raw44 == 0 || coopstats::StatsFirstBadFloat(raw44) >= 0) return false;
+    char* s = StatsObjPod(character);
+    if (!PlausibleHeap(s)) { InterlockedIncrement64(&g_statsFault); return false; }
+    float before = 0.0f, after = 0.0f;
+    if (!StatsWritePod(s, raw44, &before, &after)) { InterlockedIncrement64(&g_statsFault); return false; }
+    int rc = 0, animal = 0, bloodKept = 0;
+    float bloodBefore = 0.0f, bloodAfterPush = 0.0f;
+    if (kCharStatsVftRva != 0 && kMedicalVftRva != 0)
+    {
+        const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+        rc = StatsRecalcPod(s, base + (uintptr_t)kCharStatsVftRva,
+                            kCharStatsAnimalVftRva != 0 ? base + (uintptr_t)kCharStatsAnimalVftRva : 0,
+                            base + (uintptr_t)kMedicalVftRva, &animal, 0, &bloodBefore, &bloodAfterPush, &bloodKept);
+    }
+    if (rcOut) *rcOut = rc;
+    return rc == 1 || rc == 2;
+}
+
 bool ApplyRemoteStats(unsigned int uid, const unsigned int* raw44, const char* why)
 {
     if (raw44 == 0) return false;

@@ -47,6 +47,7 @@ namespace coop { void LimbsForgetUid(unsigned int uid); void LimbsWorldTeardown(
 #include "../common/ragdollrest.h"   // R3 (read-ragdoll): the pending rest moves the 0x7D38D0 detour takes
 #include "../common/getupcrawl.h"    // T-178 crawl1 (H050): owner up from the ragdoll / copy ready / MOVE drives prone 2
 #include "../common/sneakwire.h"     // the owner's stealth mode in STATE bit 7, and what the copy's game does with it
+#include "../common/kolook.h"        // the one bound on a copy's first look, and when the knockdown hold is live
 #include "../common/bedmatch.h"   /* BED1: which interior piece a bed key names */
 #include "../common/standinpurge.h"   /* inv7a: what happens to one stand-in character a loaded world carries */
 #include "../common/orphanpurge.h"    /* orphan1: what happens to one character created here in another game's area */
@@ -660,7 +661,7 @@ bool g_contextOn = true;    // M-B / H026 switch (`context on|off`), ON BY DEFAU
 bool CreateAt(unsigned int uid, const std::string& templateName,
               const Ogre::Vector3& worldPos, const char* who,
               const std::string& factionName, bool keepContainer,
-              RootObjectContainer* forceContainer, Building* homeBuilding, float age)
+              RootObjectContainer* forceContainer, Building* homeBuilding, float age, Faction* forceFaction = 0)
 {
     if (coop::GameWorldPtr() == 0) { ErrorLog("[M1] spawn refused: no GameWorld"); return false; }
 
@@ -710,7 +711,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
     // needs no reference at all; otherwise any live player-faction character this game owns stands in for the watched player
     // (SpawnFallbackReference). Counted: spawnRefFallback, spawnBuiltNoRef, spawnRefusedNoRef.
     Character* ref = GetTarget();
-    const bool needRef = factionName.empty() || (keepContainer && forceContainer == 0);
+    const bool needRef = (factionName.empty() && forceFaction == 0) || (keepContainer && forceContainer == 0);   /* T-556: a forced faction needs no reference */
     bool usedFallback = false, builtNoRef = false;   /* fold 1: counted only once the copy is registered (below MirrorAdd) */
     if (ref == 0 && needRef)
     {
@@ -780,6 +781,13 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
             DebugLog("[M1] spawning into faction '" + factionName
                      + "' (" + P(chosen) + "), container=reference platoon " + P(container));
         }
+    }
+
+    // T-556: a faction handed in by the caller (CreateOwnInSquad: this player's own) is the faction, whatever the reference's.
+    if (forceFaction != 0)
+    {
+        if (!PlausibleObject(forceFaction)) { ErrorLog("[M1] spawn refused: the forced faction " + P(forceFaction) + " failed validation"); return false; }
+        faction = forceFaction;
     }
 
     // M-B / H026: a context-built platoon overrides the reference/NULL container choice above.
@@ -925,7 +933,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
         Ogre::Vector3 rp = (ref != 0) ? ref->worldPosition() : Ogre::Vector3(0.0f, 0.0f, 0.0f);   // T-304 (3): a spawn may need no reference
         DebugLog("[P013] uid=" + S(uid) + " ref=" + P(ref)
                  + " refPos=" + F1(rp.x) + "," + F1(rp.y) + "," + F1(rp.z)
-                 + " platoon=" + P(container) + " faction=" + P(faction)
+                 + " refPlatoon=" + P(container) + " squadPassed=" + P(useContainer) + " faction=" + P(faction)   /* the reference's squad, and the one handed to create (0 = the engine chooses) */
                  + " factionName='" + (factionName.empty() ? std::string("<inherited>")
                                                            : factionName) + "'"
                  + " keepContainer=" + S(keepContainer ? 1 : 0)
@@ -1115,6 +1123,32 @@ bool SpawnTemplateNear(const std::string& templateName, unsigned int anchorUid, 
     net::SetLocalOwner(uid);
     net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z, factionName, keepContainer, FindSpawned(uid));
     WatchLocalRoll(uid);
+    if (uidOut) *uidOut = uid;
+    return true;
+}
+
+/* T-556 (resurrect.cpp): a new character of this player's own faction made at `pos` into `squad` (the shared creation core,
+   the faction from the reference character as `spawn`), owned by this game and NOT announced - the caller writes what it
+   carries first and then sends the SPAWN. The new uid is handed back. */
+bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut)
+{
+    if (uidOut) *uidOut = 0;
+    const unsigned int uid = AllocateUid();
+    if (uid == 0)
+    {
+        ErrorLog(std::string("[M1] spawn (own squad) refused: no uid could be minted - ") + coopuid::UidMintWords(g_uidMint.last)
+                 + ". Nothing was created.");
+        return false;
+    }
+    ::Faction* mine = LocalPlayerFaction();
+    if (mine == 0)
+    {
+        ErrorLog("[M1] spawn (own squad) refused: this game has no player faction");
+        return false;
+    }
+    if (!CreateAt(uid, templateName, pos, "own squad", std::string(), true, (RootObjectContainer*)squad, 0, age, mine))
+        return false;
+    net::SetLocalOwner(uid);
     if (uidOut) *uidOut = uid;
     return true;
 }
@@ -1398,16 +1432,15 @@ long long g_despawnApplied = 0;     // inbound: our copy removed on the peer's s
 // crash1 (T293 / F912): a knockdown of a STANDING copy - the owner's STATE saying unconscious / a wake-up clock (the latch,
 // which makes the copy's own engine knock it out, F439), or prone 2..4 - waits while KnockdownMustWait says so: a body
 // rebuild queued on the copy (never timed out: the rebuild on a limp body is the crash), or its appearance / worn items not
-// applied yet (at most kKnockdownLooksWaitMs from the first wait, g_knockHold). While it waits the latch is held back
+// applied yet (at most coopkolook::kFirstLookWaitMs from the first wait, g_knockHold). While it waits the latch is held back
 // (latchHeld) and the prone write parks (proneParkedRebuild, one per STATE while waiting), so the balance becomes
 // proneParked + proneParkedRebuild = the six terms on the right.
 struct ProneParkEntry { int prone; unsigned int peer; };
 std::map<unsigned int, ProneParkEntry> g_proneParkMap;
 long long g_proneParked            = 0;  // a prone write parked because CharacterProneSafe said no
 long long g_proneParkedRebuild     = 0;  // crash1: a knockdown parked because KnockdownMustWait said so
-long long g_proneLooksTimeout      = 0;  // crash1: knockdowns let through after waiting kKnockdownLooksWaitMs for the looks
+long long g_proneLooksTimeout      = 0;  // crash1: knockdowns let through after waiting coopkolook::kFirstLookWaitMs for the looks
 long long g_latchHeld              = 0;  // crash1: STATEs whose knock-out latch was held back (review-crash1 MEDIUM-2)
-const DWORD kKnockdownLooksWaitMs  = 5000;
 // crash1c (review-crash1b R3c): rebuildSeen/rebuildSince = when the rebuild flag (KnockdownWait 1) was first seen in this
 // hold; stuckNoted = the 10 s "rebuild flag stuck" line was written for this hold. The hold itself never ends on time.
 struct KnockHold { DWORD since; bool gaveUp; bool rebuildSeen; DWORD rebuildSince; bool stuckNoted; };
@@ -4227,9 +4260,11 @@ void GetupLogAfter(unsigned int uid, GetupWatch& w, ::Character* c)
 }   // namespace (G1 private)
 
 // crash1 (T293 / F912): true = a knockdown of this STANDING copy waits. KnockdownWait 1 (a body rebuild queued on the
-// copy) always waits; 2 (its appearance or worn items not applied yet) waits until kKnockdownLooksWaitMs after the first
-// wait, then goes ahead (counted once) - the looks then wait for the copy to stand instead (appearance.cpp). A copy that
-// is already LIMP (CopyLimpPod != 0 - crash1b: not merely flagged unconscious) never waits here: nothing rebuilds it while it lies there.
+// copy) always waits; 2 (its appearance or worn items not applied yet) waits until coopkolook::kFirstLookWaitMs after the first
+// wait, then goes ahead (counted once) - the looks then wait for the copy to stand instead (appearance.cpp). While it
+// holds, a copy whose owner says knocked out takes its first look standing (CopyKnockdownHeld, src/common/kolook.h). A copy that
+// is already LIMP (CopyLimpPod != 0 - crash1b: not merely flagged unconscious) never waits here: its looks wait until it stands
+// (appearance.cpp), and a body rebuild queued on it by another route is held by the createBody guard while it lies in ragdoll.
 static bool KnockdownMustWait(unsigned int uid, Character* c)
 {
     // crash1b (T323): only a copy that is ACTUALLY limp skips the wait - a copy merely flagged unconscious can still be
@@ -4266,10 +4301,19 @@ static bool KnockdownMustWait(unsigned int uid, Character* c)
     }
     h->second.rebuildSeen = false;   // crash1c: the rebuild flag cleared; a later one starts its own 10 s
     if (h->second.gaveUp) return false;
-    if (now - h->second.since < kKnockdownLooksWaitMs) return true;
+    if (now - h->second.since < (DWORD)coopkolook::kFirstLookWaitMs) return true;
     h->second.gaveUp = true;
     ++g_proneLooksTimeout;
+    NoteKnockLooksGaveUp(uid);   // counted when the copy's first look is still pending (lookKoArrival gaveUp)
     return false;
+}
+
+// The knockdown of this copy is held for its looks NOW (KnockdownMustWait's own record, read live). MAIN THREAD.
+bool CopyKnockdownHeld(unsigned int uid)
+{
+    std::map<unsigned int, KnockHold>::const_iterator h = g_knockHold.find(uid);
+    if (h == g_knockHold.end()) return false;
+    return coopkolook::KnockHoldLive(true, h->second.gaveUp, (unsigned long)(DWORD)(GetTickCount() - h->second.since));
 }
 
 static long long KnockHoldCount() { return (long long)g_knockHold.size(); }
@@ -8377,6 +8421,13 @@ bool NameApplyToCopy(unsigned int uid, ::Character* c, const std::string& name, 
 }
 } // namespace (names1)
 
+bool NameOf(const void* c, std::string* out) { return NameReadCut(c, out); }
+bool NameSetOwn(::Character* c, const std::string& name)
+{
+    if (g_nameEntry == 0 || c == 0) return false;
+    return NameCallSetterPod(c, &name);
+}
+
 void InstallNames()
 {
     if (kNameSetRva == 0)
@@ -10212,6 +10263,7 @@ bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos)
     TrackForLiveness(uid, c, true);   // a twin is our own save's character: authored
     ++g_twinAdopted;
     g_twinUids.insert(uid);
+    net::MarkReleasedHere(uid);   /* this game's own save-born body is now another game's copy IN PLACE: the squad holding it is this game's own, not one its engine formed around a copy (store.cpp BlockSquadWrite) */
     // User decision 2026-09-02: the shared character is taken over where THIS instance's AI had walked it during the
     // pre-sync window (same save, same start, ~40 s of independent simulation); place it at the authority's position
     // ONCE, at adoption, with the engine's own placement (the catch-up snap's call), so it does not run in from
@@ -10408,6 +10460,8 @@ void SpawnWorldTeardown()
     TagsWorldTeardown();   // tags1: every label is destroyed on the next main-thread tick
     coop::LimbsWorldTeardown();   // LIMBS: recorded limb blocks and per-limb marks name this world's copies
     MedicalForgetAllCopies();   // the owner's medical words per copy: every copy of this world is gone
+    DeadlookForgetAllCopies();  // the per-copy look marks (first look taken, dead-copy holds, createBody guard) go with them
+    g_knockHold.clear();        // and the knockdowns held for those copies' looks
 
     int mirrorSlots = 0, indexSlots = 0;
     MirrorRowLock();   // mirror1 fold (review-mirror1 #5): no RetireOnDestroy mark lands between these clears

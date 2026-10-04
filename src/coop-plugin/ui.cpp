@@ -110,6 +110,9 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "../common/datadir.h"           /* PP3d: IdentityRefusesHostJoin / IdentityMayReplace, the identity box's buttons */
 #include "soak.h"                         /* uishot: GameplayRunning - a title preview is refused in a world and back */
 #include "bugreport.h"                    /* T-461: REPORT A BUG - its ESC at the title and its pause-menu row */
+#include "playerstab.h"                   /* T-545: the PLAYERS tab's counters on the readout */
+#include "titleart.h"                     /* TitleArtNoteBand - the painted title's bottom row on the mod's art */
+#include "../common/titleart.h"          /* swtitle::MenuColumnPlan - the menu column on the mod's art */
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -135,7 +138,8 @@ static const char* const kExitSuffix = "ExitButton";                    // match
    IMPORT GAME, OPTIONS, CREDITS, EXIT.  NEW GAME is the anchor ours goes under; the five below it each move
    down one row.  Same suffix match as EXIT (the layout prefix is per-instance - see the header comment). */
 static const char* const kNewGameSuffix = "NewGameButton";
-/* U3-b: CONTINUE is read, never moved - its gap to NEW GAME is the live row pitch (UiLivePitch). */
+/* CONTINUE: on the game's art it is read, never moved - its gap to NEW GAME is the row pitch (UiLivePitch); on the mod's art
+   it heads the column the plan places (UiApplyColumn). */
 static const char* const kContinueSuffix = "ContinueButton";
 static const char* const kBelowSuffixes[5] = { "LoadGameButton", "ImportGameButton", "OptionsButton",
                                                "CreditsButton", "ExitButton" };
@@ -166,7 +170,8 @@ struct UiNames
     std::string dlgGroup, dlgText, dlgNameLabel, dlgNameEdit, dlgOk, dlgCancel;                         /* mp3 */
     std::string hostingGroup, homeAddr, copyBtn, routerHelp, playersBox, chooseBtn, homeAddrLabel;     /* mp4; ui5: homeAddrLabel */
     std::string netAddrLabel, netAddr, netShowBtn, netCopyBtn;                                         /* T-510: INTERNET ADDRESS */
-    std::string optGroup, optTab[coopui::kOptTabCount], optNote, optCoopNote, optDefaultsBtn, optDoneBtn; /* mp5 */
+    std::string optGroup, optTab[coopui::kOptTabCount], optNote, optDefaultsBtn, optDoneBtn; /* mp5 */
+    std::string optFeeEdit, optFeeNote;   /* T-556: the RESURRECTION FEE box and the FEE GROWTH line under the rows */
     std::string optLabel[coopui::kOptRowsShown], optDec[coopui::kOptRowsShown], optVal[coopui::kOptRowsShown];
     std::string optInc[coopui::kOptRowsShown], optTick[coopui::kOptRowsShown];
     std::string profGroup, profList, profPlay, profNew, profDelete;          /* prof3; ui2: one scrolling list */
@@ -240,7 +245,8 @@ struct UiNames
         hostProfLabel = "CoopHostProfLabel"; hostProfValue = "CoopHostProfValue"; hostProfChangeBtn = "CoopHostProfChangeBtn";   /* T-201 PP6' */
         /* mp5 (design-mpmenu1 section 5): the Game options screen - three tab buttons, nine rows of label / < / value / >
            or a tick box, two notes, Defaults and Done. */
-        optGroup = "CoopOptGroup"; optNote = "CoopOptNote"; optCoopNote = "CoopOptCoopNote";
+        optGroup = "CoopOptGroup"; optNote = "CoopOptNote";
+        optFeeEdit = "SWOptFeeEdit"; optFeeNote = "SWOptFeeNote";   /* T-556 (decision 509) */
         optDefaultsBtn = "CoopOptDefaultsBtn"; optDoneBtn = "CoopOptDoneBtn";
         for (int t = 0; t < coopui::kOptTabCount; ++t) optTab[t] = std::string("CoopOptTab") + (char)('0' + t);
         for (int r = 0; r < coopui::kOptRowsShown; ++r)
@@ -316,11 +322,23 @@ static const int   kUiBookMoved = 0, kUiBookReshift = 1, kUiBookRepitch = 2;   /
    pointers are only ever COMPARED, never followed: a restore touches a widget only when the live suffix walk
    finds it under the same parent at the same address.  Cleared when a put-back has used them, when our button
    is missing at the top of a tick, and when the title is gone (no EXIT found). */
-static MyGUI::Widget* g_uiOrigW[5]   = { 0, 0, 0, 0, 0 };
-static int            g_uiOrigL[5]   = { 0, 0, 0, 0, 0 };
-static int            g_uiOrigT[5]   = { 0, 0, 0, 0, 0 };
+static const int      kUiOrigSlots   = 7;   /* 0 CONTINUE, 1 NEW GAME, 2..6 LOAD GAME .. EXIT (UiOrigSuffix) */
+static MyGUI::Widget* g_uiOrigW[kUiOrigSlots]  = { 0, 0, 0, 0, 0, 0, 0 };
+static int            g_uiOrigL[kUiOrigSlots]  = { 0, 0, 0, 0, 0, 0, 0 };
+static int            g_uiOrigT[kUiOrigSlots]  = { 0, 0, 0, 0, 0, 0, 0 };
+static int            g_uiOrigWd[kUiOrigSlots] = { 0, 0, 0, 0, 0, 0, 0 };
+static int            g_uiOrigHt[kUiOrigSlots] = { 0, 0, 0, 0, 0, 0, 0 };
 static MyGUI::Widget* g_uiOrigParent = 0;
 static int            g_uiOrigHeld   = 0;
+/* 1 while the column stands where the plan for the mod's art put it (UiApplyColumn); the put-back lowers it. */
+static int            g_uiPutArt     = 0;
+/* THE MENU COLUMN ON THE MOD'S ART - on the ui[] readout: columnPlans = plan lines logged (one per screen size and number of
+   shown buttons), columnPlaced = checks that moved a button to the plan, columnNoPlan = checks with the mod's art up and no
+   room for the plan (the game's own column stays). */
+static volatile LONG64 g_uiColPlans  = 0;
+static volatile LONG64 g_uiColPlaced = 0;
+static volatile LONG64 g_uiColNoPlan = 0;
+static int             g_uiColLogW = 0, g_uiColLogH = 0, g_uiColLogShown = 0, g_uiColLogTop = -1;
 /* ui5c (user decision 40, 2026-09-27) - THE SUB-MENU REPLACES THE MAIN MENU.  Which title-column buttons WE
    hid while the MULTIPLAYER panel is up, by slot: 0 CONTINUE, 1 NEW GAME, 2 ours, 3..7 kBelowSuffixes (LOAD GAME
    .. EXIT).  0 in a slot = we did not hide that one (it was already hidden by the game, or not found).  Same rule
@@ -465,10 +483,20 @@ static volatile LONG   g_panelStatusState  = 0;   /* coopui::PanelLinkState, for
 
 /* THE NOTEBOOK PROCESS.  A PROCESS handle, not a widget pointer - the one rule at the top of this file
    is about widget pointers, and this handle is ours until we close it.  TITLE PUMP ONLY.
-   design-ui-panel 2.2, verbatim as a constraint: it is used for GetExitCodeProcess and NOTHING else.
-   There is no TerminateProcess in this file and there must not be one until the relay has a clean
-   shutdown message of its own. */
+   It is read with GetExitCodeProcess, and it is stopped whenever this game leaves a HOST without a world (HostLeave: CANCEL,
+   X / Escape, a failure box, a HOST cancelled at the title, a new press) - WM_CLOSE to its own hidden close window (it writes
+   every queued write, then ends), and TerminateProcess only when it has not ended within coopui::kNbStopGraceMs (the server's
+   own drain limit and 5 s). Never waited on: the 4 Hz poll asks. */
 static HANDLE g_nbProc      = 0;
+static DWORD  g_nbPid       = 0;   /* its process id (finds its close window) */
+static int    g_nbStopping  = 0;   /* 1 = a stop was asked and the process has not ended yet */
+static int    g_nbStopSent  = 0;   /* 1 = WM_CLOSE was posted to its close window */
+static DWORD  g_nbStopAtMs  = 0;
+static int    g_nbStopOthers = 0;  /* the other games on its roster when the stop was asked */
+static int    g_nbStopEndedIt = 0; /* 1 = TerminateProcess was called for this stop (its exit is seen on a later poll) */
+static DWORD  g_nbStopEndAtMs = 0;  /* when TerminateProcess was called */
+static int    g_nbStopFailedKept = 0;  /* 1 = a stop failed (TerminateProcess refused): the process is kept as this game's */
+static volatile LONG64 g_nbStopAsked = 0, g_nbStopClosed = 0, g_nbStopEnded = 0, g_nbStopFailed = 0;
 static int    g_nbState     = coopui::kNbNotOurs;
 static long   g_nbExitCode  = 0;
 static int    g_nbPort      = 0;
@@ -572,6 +600,8 @@ static long        g_optTab = 0;
 static std::string g_optWorld;                                    /* the world FOLDER the screen is showing */
 static std::string g_optVal[coopui::kOptCount];
 static std::string g_optBase[coopui::kOptCount];
+static std::string g_optFeeTyped;    /* T-556: the RESURRECTION FEE box's digits as typed (TITLE PUMP) */
+static std::string g_optFeeOpened;   /* ... and the amount the screen opened with - an empty box stands for it */
 static std::string g_optChosenWorld;                              /* the world the last Done was for ("" = none) */
 static std::vector<std::pair<std::string, std::string> > g_optChosen;   /* ... and the rows it changed */
 static volatile LONG64 g_optOpened = 0, g_optDoneCount = 0, g_optHandedOver = 0, g_optFileRead = 0;
@@ -921,6 +951,7 @@ static void LoadBegin(int mode);
 static const coopworld::WorldRow* PanelPickedRow();
 static int PanelHostProfChoice(coopprof::HostProfileChoice* c);
 static void PanelProfSelectLoad();
+static bool PanelReadProfilesFile(const std::string& folder, std::string* out);   /* T-368: CHANGE's NEW PROFILE reads the world's file */
 /* T-201 PP6' fold (review HIGH 1): SELECT mode ends on EVERY panel close and open - X, Escape, MULTIPLAYER, the engine's close, a box -
    not only on SELECT / OK / BACK; a JOIN after it sees PLAY and the world's list again. */
 static void PanelProfModeEnd(const char* why)
@@ -930,6 +961,8 @@ static void PanelProfModeEnd(const char* why)
     DebugLog(std::string("[UI] T-201 PP6': PROFILES leaves SELECT mode (") + why + ") - its main button is PLAY again");
 }
 static DWORD       g_pressAtMs       = 0;
+static int         g_pressWaitStop   = 0;   /* 1 = the press is busy until the world server this game is stopping has ended, then goes on */
+static void PanelGo();
 static DWORD       g_pressLinkedAtMs = 0;   /* JOIN: when the world-server link first came up after the press, 0 = not yet */
 static long long   g_pressArmGen     = 0;   /* ConfigArmGen() at the press */
 static int         g_pressBoxReturn  = 0;   /* 1 / 2: the screen a failure box's OK returns to */
@@ -937,6 +970,14 @@ static int         g_nameTakenBox    = 0;   /* T-201 N1b (owner 166): the box up
 static int         g_nameFocusWanted = 0;   /* T-201 N1b: JOIN GAME's PLAYER NAME box takes the key focus once the panel is up */
 static volatile LONG64 g_pressStarted = 0, g_pressDone = 0, g_pressFailed = 0, g_pressCancelled = 0, g_pressIgnored = 0;
 static std::string g_noticeTitle;           /* T-201 N1: the error box's title when its raiser names one ("" = coopui::NoticeTitle) */
+/* A PRESS PREPARES (owner 470, coopui::PrepStep): the phase of the last press's preparation - the role it armed is kept only into a
+   world; PrepTick cancels it when the title is back with no world on its way. */
+static int g_prepPhase = coopui::kPrepNone;
+static int g_prepMode = 0;        /* 1 HOST, 2 JOIN */
+static int g_prepUnreadSaid = 0;  /* the unreadable-request line, once per press */
+static DWORD g_prepAtMs = 0;      /* kPrepWindowWait: when the press opened the NEW GAME window */
+static volatile LONG64 g_prepArmed = 0, g_prepSeen = 0, g_prepCancelled = 0;
+static int UiNewGameWindowShown(MyGUI::Gui* gui);
 
 /* U2 / review-p8i M-2 - PUT A SENTENCE WHERE THE PLAYER CAN SEE IT WHEN THERE IS NO PANEL.
    Raised on the title pump; the widget is built and destroyed by the tick, exactly like the panel. */
@@ -1386,6 +1427,15 @@ static std::string PanelOptWorldName()
     for (size_t k = 0; k < g_worlds.size(); ++k) if (g_worlds[k].folder == g_optWorld) return g_worlds[k].name;
     return g_optWorld;
 }
+/* Greys a row's widget, or lights it back: Kenshi's skins draw a disabled box or label exactly as an enabled one (and the
+   text colour they report is not the colour they draw), so a greyed widget is drawn at half opacity - its box and its words. */
+static void UiGreyText(MyGUI::Widget* w, bool lit)
+{
+    if (w == 0) return;
+    const float a = lit ? 1.0f : 0.5f;
+    if (w->getAlpha() != a) w->setAlpha(a);
+}
+
 static void PanelPushOptions(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
@@ -1395,19 +1445,40 @@ static void PanelPushOptions(MyGUI::Gui* gui)
     {
         const int i = coopui::OptIndexOf((int)g_optTab, r);
         const bool on = i >= 0;
-        const bool tick = on && coopui::OptDefs()[i].kind == coopui::kOptKindTick;
-        const bool step = on && !tick;
+        const bool tick = on && coopui::OptIsTick(i);
+        const bool typed = on && coopui::OptDefs()[i].kind == coopui::kOptKindAmount;   /* T-556: the fee box stands in the value's place */
+        const bool step = on && !tick && !typed;
+        const bool lit = on && coopui::OptRowLit(i, g_optVal);   /* T-556: a row that depends on RESURRECTION greys with it */
         PanelSetTextBox(gui, n.optLabel[r], on ? std::string(coopui::OptDefs()[i].label) : std::string(), on);
         PanelSetTextBox(gui, n.optVal[r], step ? coopui::OptShown(i, g_optVal[i]) : std::string(), step);
-        b = UiBtn(gui, n.optDec[r]);  if (b) { b->setVisible(step); b->setEnabled(step && coopui::OptCanStep(i, g_optVal[i], -1)); }
-        b = UiBtn(gui, n.optInc[r]);  if (b) { b->setVisible(step); b->setEnabled(step && coopui::OptCanStep(i, g_optVal[i], 1)); }
-        b = UiBtn(gui, n.optTick[r]); if (b) { b->setVisible(tick); b->setStateSelected(tick && g_optVal[i] == "1"); }
+        MyGUI::Widget* w = UiFind(gui, n.optLabel[r]); if (w) { w->setEnabled(lit || !on); UiGreyText(w, lit || !on); }
+        w = UiFind(gui, n.optVal[r]);                  if (w) { w->setEnabled(lit || !on); UiGreyText(w, lit || !on); }
+        b = UiBtn(gui, n.optDec[r]);  if (b) { b->setVisible(step); b->setEnabled(step && lit && coopui::OptCanStep(i, g_optVal[i], -1)); }
+        b = UiBtn(gui, n.optInc[r]);  if (b) { b->setVisible(step); b->setEnabled(step && lit && coopui::OptCanStep(i, g_optVal[i], 1)); }
+        b = UiBtn(gui, n.optTick[r]); if (b) { b->setVisible(tick); b->setStateSelected(coopui::OptTickOn(i, on ? g_optVal[i] : std::string())); }
     }
     MyGUI::EditBox* e;
     e = UiEdit(gui, n.optNote);
-    if (e) { e->setCaption(MyGUI::UString(g_optTab == coopui::kOptTabDifficulty ? "Animal nests: only affects areas not yet visited." : "")); e->setVisible(g_optTab == coopui::kOptTabDifficulty); }
-    e = UiEdit(gui, n.optCoopNote);
-    if (e) { e->setCaption(MyGUI::UString("All players must use the same mods as the host.")); e->setVisible(g_optTab == coopui::kOptTabCoop); }
+    if (e) { const std::string note = coopui::OptNoteText((int)g_optTab); e->setCaption(MyGUI::UString(note.c_str())); e->setVisible(!note.empty()); }
+    /* T-556: the RESURRECTION FEE box - shown on the tab that holds it, greyed with its row; its text is set only when it
+       differs, so a push never moves the cursor of a box being typed in. */
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);
+    e = UiEdit(gui, n.optFeeEdit);
+    if (e && fee >= 0)
+    {
+        const bool shown = coopui::OptDefs()[fee].tab == (int)g_optTab;
+        e->setVisible(shown);
+        e->setEnabled(shown && coopui::OptRowLit(fee, g_optVal));
+        UiGreyText(e, coopui::OptRowLit(fee, g_optVal));
+        if (UiTextOf(e, 64) != g_optFeeTyped) e->setCaption(MyGUI::UString(g_optFeeTyped.c_str()));
+    }
+    e = UiEdit(gui, n.optFeeNote);
+    if (e && fee >= 0)
+    {
+        const std::string line = coopui::OptFeeExplain(g_optVal[coopui::OptIndexOfKey(swfee::kKeyOn)], g_optVal[fee], g_optVal[coopui::OptIndexOfKey(swfee::kKeyGrowth)]);
+        e->setCaption(MyGUI::UString(line.c_str()));
+        e->setVisible(coopui::OptDefs()[fee].tab == (int)g_optTab && !line.empty());
+    }
 }
 
 /* prof3 (design-mpmenu1 section 8) - [F] PROFILES (words1; was YOUR PROFILES IN THIS WORLD).  Shown after a connection this panel started, when
@@ -1567,9 +1638,12 @@ static void PanelProfDlgOk()
         DebugLog("[UI] T-201 PP6': Create pressed on PROFILES (CHANGE) for '" + name + "' - HOST GAME, made at the HOST press");
         std::string why;
         if (!coopworld::DisplayNameOk(name, &why)) { g_dlgText = why; return; }
-        for (size_t k = 0; k < g_profList.size(); ++k)
-            if (g_profList[k].name == name)   /* T-201 PP6' fold: exactly as the world's NewDecide compares (case counts) */
+        {
+            std::string text;
+            PanelReadProfilesFile(g_hostProfWorld, &text);
+            if (coopprof::PlayerNameTaken(coopprof::ActiveRowsOfFile(text), name))   /* T-368: anyone's profile in that world, as the world's NewDecide compares */
             { g_dlgText = "Couldn't do that: " + coopprof::VerdictText(coopprof::kRefusedNameTaken, 0) + "."; return; }   /* the world's own refusal words */
+        }
         g_profDlg = 0;
         g_hostProfNum = 0;
         g_hostProfNew = name;
@@ -1941,8 +2015,27 @@ static void PanelPush(MyGUI::Gui* gui)
    THE MOMENT OF COMMITMENT that SAVE needs; otherwise this is throttled to 4 Hz, which bounds its cost
    at the title pump's ~1 kHz.  The 250 ms is a throttle on cost, not a wait for an event: the condition
    is re-asked on every tick and nothing is timed against anything. */
+/* T-556: the RESURRECTION FEE box, read every tick while its tab is on screen: anything but digits (and a seventh digit)
+   is taken out at once, so such a key does nothing; the row's value follows the box (an empty box stands for the amount
+   the screen opened with), and the line under FEE GROWTH and its greying follow the value. */
+static void PanelOptFeeMirror(MyGUI::Gui* gui)
+{
+    if (g_panelScreen != 6) return;
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);
+    if (fee < 0 || coopui::OptDefs()[fee].tab != (int)g_optTab) return;
+    MyGUI::EditBox* e = UiEdit(gui, NM().optFeeEdit);
+    if (e == 0) return;
+    const std::string raw = UiTextOf(e, 64);
+    const std::string kept = coopui::OptFeeBoxFilter(raw);
+    if (kept != raw) e->setCaption(MyGUI::UString(kept.c_str()));
+    if (kept == g_optFeeTyped) return;
+    g_optFeeTyped = kept;
+    g_optVal[fee] = coopui::OptFeeBoxValue(kept, g_optFeeOpened);
+    PanelPushOptions(gui);
+}
 static void PanelMirror(MyGUI::Gui* gui, int force)
 {
+    PanelOptFeeMirror(gui);
     const DWORD now = ::GetTickCount();
     if (force == 0 && (DWORD)(now - g_panelLastMirrorMs) < kPanelMirrorMs) return;
     g_panelLastMirrorMs = now;
@@ -2119,10 +2212,11 @@ static int PanelStartNotebook(unsigned short port)
         if (::GetExitCodeProcess(g_nbProc, &code) != 0 && code == STILL_ACTIVE)
         {
             ::InterlockedIncrement64(&g_panelNbAlready);
-            return 2;   /* g_nbPort stays the port it really listens on (PanelGo rings that one) */
+            return 2;   /* only a server a stop could not end (g_nbStopFailedKept): g_nbPort stays the port it really listens on (PanelGo rings that one) */
         }
         ::CloseHandle(g_nbProc);
         g_nbProc = 0;
+        g_nbStopFailedKept = 0;
     }
     g_nbPort = (int)port;
 
@@ -2207,6 +2301,8 @@ static int PanelStartNotebook(unsigned short port)
 
     ::CloseHandle(pi.hThread);      /* design 2.2: the thread handle at once, the process handle kept */
     g_nbProc     = pi.hProcess;
+    g_nbPid      = pi.dwProcessId;
+    g_nbStopping = 0;
     g_nbState    = coopui::kNbStarting;
     g_nbWorld    = coopworld::WorldFolderName(worldArg);   /* mp3: the world this computer's helper now runs (F874 note, Delete refusal) */
     g_nbExitCode = 0;
@@ -2214,11 +2310,139 @@ static int PanelStartNotebook(unsigned short port)
     DebugLog("[UI] the MULTIPLAYER panel started the world's notebook: " + exe + " --world " + worldArg + " (its folder " + sdir + ")"
              + " (no console window, handles not inherited, working directory " + dir + "). Started is NOT"
              " running: the proof it is up is the notebook's own WELCOME, which the status area waits for."
-             " NOTHING in this plugin will ever kill it - see design-ui-panel 2.2.");
+             " It is stopped when this game leaves the HOST without a world.");
     return 1;
 }
 
-/* TITLE PUMP, and the in-world tick (UiHostingServerWatch) - both MAIN THREAD: has the notebook we started stopped?  The
+/* STOPPING THE WORLD SERVER THIS GAME STARTED (every way out of a HOST without a world - HostLeave). Its close window is the hidden top-level
+   window of class swnames::kServerQuitClass owned by its process id; WM_CLOSE there makes it write every queued write and end
+   (store_main.cpp QuitWindowProc). The outcome - closed by itself, ended, or could not be ended - is one log line, from
+   PanelStopNotebookStep (coopui::NbStopStep), asked by the 4 Hz poll at the title and in a world, and at once by a new press. The
+   router's port entry made at the press goes with the process (upnp.cpp watches the process handle). MAIN THREAD. */
+struct NbCloseFind { DWORD pid; HWND hwnd; };
+static BOOL CALLBACK NbCloseFindProc(HWND h, LPARAM lp)
+{
+    NbCloseFind* f = (NbCloseFind*)lp;
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(h, &pid);
+    if (pid != f->pid) return TRUE;
+    char cls[64];
+    cls[0] = 0;
+    if (::GetClassNameA(h, cls, (int)sizeof cls) > 0 && std::strcmp(cls, swnames::kServerQuitClass) == 0) { f->hwnd = h; return FALSE; }
+    return TRUE;
+}
+static std::string g_nbStopWhy;
+/* WM_CLOSE to the close window, when it can be found (the server makes it first; until then it is looked for again on each poll). */
+static void PanelStopNotebookSendClose()
+{
+    if (g_nbStopSent != 0 || g_nbPid == 0) return;
+    NbCloseFind f;
+    f.pid = g_nbPid;
+    f.hwnd = 0;
+    ::EnumWindows(NbCloseFindProc, (LPARAM)&f);
+    if (f.hwnd != 0 && ::PostMessageA(f.hwnd, WM_CLOSE, 0, 0) != 0) g_nbStopSent = 1;
+}
+/* One ask of a stop in flight (coopui::NbStopStep). 1 = no stop in flight any more. */
+static int PanelStopNotebookStep()
+{
+    if (g_nbStopping == 0 || g_nbProc == 0) { g_nbStopping = 0; return 1; }
+    const DWORD waited = (DWORD)(::GetTickCount() - g_nbStopAtMs);
+    DWORD code = 0;
+    const BOOL got = ::GetExitCodeProcess(g_nbProc, &code);
+    const int exited = (got != 0 && code != STILL_ACTIVE) ? 1 : 0;
+    if (exited == 0) PanelStopNotebookSendClose();
+    const int step = coopui::NbStopStep(exited, g_nbStopEndedIt, (unsigned)waited, (unsigned)(DWORD)(::GetTickCount() - g_nbStopEndAtMs));
+    if (step == coopui::kNbStopWait) return 0;
+    if (step == coopui::kNbStopGiveUp)   /* ended, and its exit still not seen: the handle goes and the stop is over - a waiting press goes on */
+    {
+        ::InterlockedIncrement64(&g_nbStopFailed);
+        ErrorLog("[UI] the world server this game started was ended (" + g_nbStopWhy + ") but its exit was not seen within "
+                 + coopui::PanelNum((long long)coopui::kNbStopEndWaitMs) + " ms - its handle is dropped and the stop is over; " + coopui::PanelNum((long long)g_nbStopOthers)
+                 + " other game(s) were connected to it (a port it still holds fails the next HOST into its failure box)");
+        ::CloseHandle(g_nbProc);
+        g_nbProc = 0;
+        g_nbPid = 0;
+        g_nbStopping = 0;
+        g_nbStopEndedIt = 0;
+        g_nbStopFailedKept = 0;
+        g_nbState = coopui::kNbNotOurs;
+        g_nbWorld.clear();
+        ++g_panelStatusSeq;
+        return 1;
+    }
+    if (step == coopui::kNbStopEnd)
+    {
+        if (::TerminateProcess(g_nbProc, 1) == 0)
+        {
+            const DWORD e = ::GetLastError();
+            ::InterlockedIncrement64(&g_nbStopFailed);
+            g_nbStopping = 0;
+            g_nbStopFailedKept = 1;
+            ErrorLog("[UI] the world server this game started could NOT be stopped (" + g_nbStopWhy + "): "
+                     + (g_nbStopSent != 0 ? std::string("it did not close") : std::string("its close window was never found")) + " within "
+                     + coopui::PanelNum((long long)waited) + " ms and TerminateProcess failed, Windows error " + coopui::PanelNum((long long)e)
+                     + "; " + coopui::PanelNum((long long)g_nbStopOthers) + " other game(s) were connected to it - it is kept as this game's and the next HOST uses it");
+            return 1;
+        }
+        g_nbStopEndedIt = 1;
+        g_nbStopEndAtMs = ::GetTickCount();
+        return 0;   /* its exit is seen on a later poll */
+    }
+    std::string how;
+    if (g_nbStopEndedIt == 0)
+    {
+        ::InterlockedIncrement64(&g_nbStopClosed);
+        how = "it closed itself after " + coopui::PanelNum((long long)waited) + " ms (its queued writes written), exit code " + coopui::PanelNum((long long)code);
+    }
+    else
+    {
+        ::InterlockedIncrement64(&g_nbStopEnded);
+        how = std::string("it was ended - ") + (g_nbStopSent != 0 ? "it did not close" : "its close window was never found") + " within "
+              + coopui::PanelNum((long long)coopui::kNbStopGraceMs) + " ms";
+    }
+    DebugLog("[UI] the world server this game started is stopped (" + g_nbStopWhy + "): " + how + "; " + coopui::PanelNum((long long)g_nbStopOthers)
+             + " other game(s) were connected to it; the router's port entry goes with it"
+             " (nbStop[asked,closed,ended,failed]=" + coopui::PanelNum((long long)g_nbStopAsked) + "," + coopui::PanelNum((long long)g_nbStopClosed) + ","
+             + coopui::PanelNum((long long)g_nbStopEnded) + "," + coopui::PanelNum((long long)g_nbStopFailed) + ")");
+    ::CloseHandle(g_nbProc);
+    g_nbProc = 0;
+    g_nbPid = 0;
+    g_nbStopping = 0;
+    g_nbStopEndedIt = 0;
+    g_nbStopFailedKept = 0;
+    g_nbState = coopui::kNbNotOurs;
+    g_nbWorld.clear();
+    ++g_panelStatusSeq;
+    return 1;
+}
+static void PanelStopNotebook(const char* why, int others)
+{
+    if (g_nbProc == 0 || g_nbStopping != 0) return;
+    DWORD code = 0;
+    if (::GetExitCodeProcess(g_nbProc, &code) == 0 || code != STILL_ACTIVE) return;   /* already ended: the poll records it */
+    g_nbStopOthers = others;
+    g_nbStopSent = 0;
+    g_nbStopEndedIt = 0;
+    g_nbStopping = 1;
+    g_nbStopAtMs = ::GetTickCount();
+    g_nbStopWhy = why;
+    ::InterlockedIncrement64(&g_nbStopAsked);
+    PanelStopNotebookStep();
+}
+/* EVERY WAY OUT OF A HOST WITHOUT A WORLD: the role and the link are left (ConfigLeave) and the world server this game started is
+   stopped, so the next HOST always starts its own. The other games on its roster are counted BEFORE the leave closes the link that
+   carries the roster; they are not waited for - the stop goes ahead and its line says how many there were. A server a stop could not
+   end (g_nbStopFailedKept) is not asked again. */
+static void HostLeave(const char* why)
+{
+    std::vector<std::string> others;
+    const int n = StoreRosterNames(&others);
+    ConfigLeave(why);
+    if (g_nbStopFailedKept == 0) PanelStopNotebook(why, n > 0 ? n : 0);
+}
+
+/* TITLE PUMP, and the in-world tick (UiHostingServerWatch) - both MAIN THREAD: has the notebook we started stopped - on its own, or
+   by a stop this game asked (PanelStopNotebookStep, which this poll asks too)?  The
    NEGATIVE proof of design 2.2.
    THROTTLED TO 4 Hz, and the throttle is on COST, not a wait for an event: the title pump runs at
    ~1,065 Hz (F655) and this would otherwise be a syscall per tick for the whole of a hosting session.
@@ -2230,10 +2454,12 @@ static void PanelPollNotebook()
     const DWORD nowMs = ::GetTickCount();
     if ((DWORD)(nowMs - g_nbLastPollMs) < kPanelStatusMs) return;
     g_nbLastPollMs = nowMs;
+    if (g_nbStopping != 0) { PanelStopNotebookStep(); return; }   /* a stop this game asked: its own outcome line, not "stopped early" */
     DWORD code = 0;
     if (::GetExitCodeProcess(g_nbProc, &code) == 0) return;
     if (code == STILL_ACTIVE) return;
     g_nbExitCode = (long)code;
+    g_nbStopFailedKept = 0;
     g_nbState    = coopui::kNbStoppedEarly;
     ::InterlockedIncrement64(&g_panelNbExited);
     ::CloseHandle(g_nbProc);
@@ -2520,10 +2746,11 @@ static void PressCancel(const char* how)
 {
     const int mode = g_pressBusy;
     g_pressBusy = 0;
+    g_pressWaitStop = 0;
     ::InterlockedIncrement64(&g_pressCancelled);
     DebugLog(std::string("[UI] T-201 N1: CANCEL (") + how + ") - the " + (mode == 1 ? "HOST" : "JOIN") + " in progress is stopped after "
              + coopui::PanelNum((long long)(DWORD)(::GetTickCount() - g_pressAtMs)) + " ms; back to the screen's opening line");
-    ConfigLeave(mode == 1 ? "CANCEL on HOST GAME" : "CANCEL on JOIN GAME");
+    if (mode == 1) HostLeave("CANCEL on HOST GAME"); else ConfigLeave("CANCEL on JOIN GAME");
     PanelIntro();
 }
 /* Title pump, every tick while a press is in progress. 1 = the screen changed and wants a push. */
@@ -2533,6 +2760,16 @@ static int PressTick()
     /* T-201 N1 fold (finding 2): whatever took the panel down - X, Escape, MULTIPLAYER or the engine's own close
        (UiCloseFromEngine) - a press with the panel no longer wanted is cancelled here, the one place every route passes. */
     if (::InterlockedCompareExchange(&g_panelWanted, 0, 0) == 0) { PressCancel("the panel was closed"); return 0; }
+    if (g_pressWaitStop != 0)   /* the press waits for the world server this game is stopping (PanelGo) - asked every tick */
+    {
+        if (g_nbStopping != 0) return 0;
+        g_pressWaitStop = 0;
+        g_pressBusy = 0;
+        DebugLog("[UI] the world server this game was stopping has ended after " + coopui::PanelNum((long long)(DWORD)(::GetTickCount() - g_pressAtMs))
+                 + " ms - the press goes on");
+        PanelGo();
+        return 1;
+    }
     const DWORD now = ::GetTickCount();
     coopui::PressFacts p;
     p.mode            = (g_pressBusy == 1) ? 0 : 1;
@@ -2580,7 +2817,7 @@ static int PressTick()
     }
     ::InterlockedIncrement64(&g_pressFailed);
     ErrorLog("[UI] T-201 N1: " + what + " FAILED after " + ms + " ms - the " + coopui::PressBoxTitle(p.mode) + " box: " + box);
-    ConfigLeave(mode == 1 ? "a failed HOST" : "a failed JOIN");
+    if (mode == 1) HostLeave("a failed HOST"); else ConfigLeave("a failed JOIN");
     ::InterlockedExchange(&g_panelWanted, 0);   /* the box shows once the panel is down; its OK brings the screen back */
     UiRaiseNoticeTitled(box, coopui::PressBoxTitle(p.mode));
     g_pressBoxReturn = mode;
@@ -2620,7 +2857,7 @@ static void LoadFail(const std::string& box, const char* title, const std::strin
     g_loadStage = 0; g_loadMode = 0; g_profBusy = 0;
     ErrorLog("[AUTOLOAD] T-201 PP6': " + std::string(mode == 1 ? "HOST" : "JOIN") + " FAILED - " + why
              + (box.empty() ? std::string(" (no box)") : " - the " + std::string(title) + " box: " + box));
-    ConfigLeave(mode == 1 ? "a HOST that could not load" : "a JOIN that could not load");
+    if (mode == 1) HostLeave("a HOST that could not load"); else ConfigLeave("a JOIN that could not load");
     ::InterlockedExchange(&g_panelWanted, 0);
     if (!box.empty()) UiRaiseNoticeTitled(box, title);
     g_pressBoxReturn = mode;
@@ -2635,7 +2872,7 @@ static void LoadCancel(const char* how)
     DebugLog(std::string("[AUTOLOAD] T-201 PP6': CANCEL (") + how + ") " + (stage == 2 ? "while the line waited for the engine (T-220: nothing was posted)" : "while the world admitted the profile")
              + " - left; back to "
              + (mode == 1 ? "HOST GAME" : "JOIN GAME") + "'s opening line");
-    ConfigLeave(mode == 1 ? "CANCEL on HOST GAME" : "CANCEL on PROFILES");
+    if (mode == 1) HostLeave("CANCEL on HOST GAME"); else ConfigLeave("CANCEL on PROFILES");
     g_panelMode = (mode == 1) ? 0 : 1;
     g_panelScreen = mode;
     PanelIntro();
@@ -2745,6 +2982,60 @@ static int LoadTick()
     return 1;
 }
 
+/* Title pump, every tick: the prepared role is cancelled when the panel and its steps are done and the title is back with no world on
+   its way (coopui::PrepStep) - the NEW GAME window closed, the panel closed, or the posted load refused. The window is looked for only
+   when nothing else decides. */
+static void PrepTick(MyGUI::Gui* gui)
+{
+    if (g_prepPhase == coopui::kPrepNone) return;
+    coopui::PrepFacts f;
+    f.phase       = g_prepPhase;
+    f.roleSingle  = ConfigRole() == kRoleSingle ? 1 : 0;
+    f.panelWanted = ::InterlockedCompareExchange(&g_panelWanted, 0, 0) != 0 ? 1 : 0;
+    f.pressBusy   = (g_pressBusy != 0 || g_loadStage != 0) ? 1 : 0;
+    f.waitedMs    = (unsigned)(DWORD)(::GetTickCount() - g_prepAtMs);
+    if (f.roleSingle == 0 && f.panelWanted == 0 && f.pressBusy == 0)
+    {
+        f.requestCode   = SaveRequestCodeNow();
+        f.reshowPending = StoreNewGameReshowPending();
+        if ((f.requestCode < 2 || f.requestCode > 4) && f.reshowPending == 0) f.windowShown = UiNewGameWindowShown(gui);
+    }
+    const int step = coopui::PrepStep(f);
+    if (step == coopui::kPrepKeep) return;
+    const std::string what = g_prepMode == 1 ? "HOST" : "JOIN";
+    if (step == coopui::kPrepForget) { g_prepPhase = coopui::kPrepNone; return; }
+    if (step == coopui::kPrepSeen)
+    {
+        g_prepPhase = coopui::kPrepWindowSeen;
+        ::InterlockedIncrement64(&g_prepSeen);
+        DebugLog("[UI] the NEW GAME window is up - the " + what + " stays prepared while it shows and is cancelled if it closes without starting a world");
+        return;
+    }
+    if (step == coopui::kPrepUnread)
+    {
+        if (g_prepUnreadSaid++ == 0)
+            ErrorLog("[UI] the " + what + " is kept at the title: the engine's pending request cannot be read (no SaveManager, or +0xA0 unreadable),"
+                     " so whether a world is on its way is unknown - asked again every tick");
+        return;
+    }
+    const int phase = g_prepPhase;
+    g_prepPhase = coopui::kPrepNone;
+    ::InterlockedIncrement64(&g_prepCancelled);
+    DebugLog("[UI] " + what + " cancelled at the title: " + (step == coopui::kPrepCancelForeign ? coopui::PrepForeignWhy(f.requestCode) : coopui::PrepCancelWhy(phase))
+             + " - the role goes back to single and the world"
+             " server's link closes" + (g_prepMode == 1 && g_nbProc != 0 ? std::string(", and the world server this game started is stopped") : std::string())
+             + "; the title menu is the normal one (prepCancelled " + coopui::PanelNum((long long)g_prepCancelled) + ")");
+    if (g_prepMode == 1) HostLeave("a HOST back at the title without a world"); else ConfigLeave("a JOIN back at the title without a world");
+    g_profSay.clear();
+}
+/* The press opened Kenshi's NEW GAME window: the prepared role waits for it to come up. */
+static void PrepWindowOpened()
+{
+    if (g_prepPhase == coopui::kPrepNone) return;
+    g_prepPhase = coopui::kPrepWindowWait;
+    g_prepAtMs = ::GetTickCount();
+}
+
 /* T-201 N1b (owner 166): after the name-taken box, JOIN GAME's PLAYER NAME box takes the key focus - looked up by name on the
    tick the panel is up, never kept across frames. */
 static void PanelNameFocusTick(MyGUI::Gui* gui)
@@ -2793,19 +3084,18 @@ static void PanelGo()
             PanelSetStatus(why);
             return;
         }
-        /* THE WORLD SERVER THIS GAME STARTED STILL RUNS ON ANOTHER PORT (HOST, CANCEL, the PORT box changed, HOST again): it keeps
-           that port, because nothing in this plugin may stop it (design-ui-panel 2.2 - no TerminateProcess, and the world server
-           has no stop message the game can send) and a second one for the same world cannot open it. So this press rings the
+        /* THE WORLD SERVER THIS GAME STARTED STILL RUNS ON ANOTHER PORT: only when it could not be stopped (HostLeave's stop failed -
+           its line says so). It keeps that port, and a second one for the same world cannot open it. So this press rings the
            running one's port, and the PORT box, the settings and the hosting screen are set to that port, so the number shown to
            the host - and passed on to the joiners - is the one that answers. A restart of Kenshi frees the port box again. */
-        if (g_panelNotebookMine != 0)
+        if (g_panelNotebookMine != 0 && g_nbStopFailedKept != 0)
         {
             const int running = PanelNotebookRunningPort();
             if (running > 0 && running != (int)port)
             {
                 DebugLog("[UI] HOST: the PORT box asks for port " + coopui::PanelNum((long long)port) + " but this computer's world server,"
-                         " started by this game, still runs on port " + coopui::PanelNum((long long)running) + " and cannot be stopped from here"
-                         " - this press hosts on port " + coopui::PanelNum((long long)running) + " and the PORT box is set back to it");
+                         " started by this game, could not be stopped and still runs on port " + coopui::PanelNum((long long)running)
+                         + " - this press hosts on port " + coopui::PanelNum((long long)running) + " and the PORT box is set back to it");
                 port = (unsigned short)running;
                 g_fPort = coopui::PanelNum((long long)running);
             }
@@ -2861,7 +3151,17 @@ static void PanelGo()
     /* T-201 N1 - THE "Already connected" / "Already connecting ... Restart Kenshi" REFUSALS ARE GONE: a press always starts
        clean. Whatever an earlier press (or a test settings file) opened is closed first - ConfigLeave - and this press arms
        from nothing through ConfigRearmFromFile and the next title tick, as a first press does. */
-    if (ConfigRole() != kRoleSingle || net::SessionLinked()) ConfigLeave("a new HOST / JOIN press");
+    if (ConfigRole() != kRoleSingle || net::SessionLinked() || (g_nbProc != 0 && g_nbStopping == 0 && g_nbStopFailedKept == 0)) HostLeave("a new HOST / JOIN press");
+    if (g_nbStopping != 0)   /* the press starts its own world server: it stays busy (its Starting / Connecting line, CANCEL) until the one being stopped has ended */
+    {
+        g_pressBusy = (f.role == coopcfg::kCfgHost) ? 1 : 2;
+        g_pressWaitStop = 1;
+        g_pressAtMs = ::GetTickCount();
+        PanelSetStatus(coopui::PressStatusText(g_pressBusy == 1 ? 0 : 1, g_fWorld, coopcfg::CfgTrim(g_fJoinAddr)));
+        DebugLog(std::string("[UI] ") + (g_pressBusy == 1 ? "HOST" : "JOIN") + " pressed - the world server this game is stopping has not ended yet;"
+                 " the press waits for it, then goes on by itself");
+        return;
+    }
 
     std::string armErr;
     if (!ConfigRearmFromFile("the MULTIPLAYER panel", &armErr))
@@ -2876,10 +3176,8 @@ static void PanelGo()
     ::InterlockedIncrement64(&g_panelArmRequested);
     StoreProfilesByPanel();   /* prof3: THE FLAG - this connection is the panel's, so its profile list waits for the player's pick */
 
-    /* U2-c (review-u2 M-2) - THE NOTEBOOK IS STARTED ONLY FOR AN ACCEPTED ARM.  It used to be spawned
-       above, BEFORE ConfigRearmFromFile could refuse, so a refused press left SharedWastelandsServer.exe running for
-       a session that never started and nothing in this build ever stops it (there is no
-       TerminateProcess anywhere - design 2.2).  It still runs before the arming itself happens, because
+    /* U2-c (review-u2 M-2) - THE NOTEBOOK IS STARTED ONLY FOR AN ACCEPTED ARM, so a refused press never leaves
+       SharedWastelandsServer.exe running for a session that never started.  It still runs before the arming itself happens, because
        ConfigRearmFromFile only clears the latch and the next title tick does the work - so the socket
        keeps the head start the old comment claimed.  Host only, and only when the player asked. */
     if (f.role == coopcfg::kCfgHost && g_panelNotebookMine != 0)
@@ -2895,6 +3193,12 @@ static void PanelGo()
         }
     }
 
+    g_prepPhase = coopui::kPrepArmed;
+    g_prepMode = (f.role == coopcfg::kCfgHost) ? 1 : 2;
+    g_prepUnreadSaid = 0;
+    ::InterlockedIncrement64(&g_prepArmed);
+    DebugLog(std::string("[UI] ") + (g_prepMode == 1 ? "HOST" : "JOIN") + " prepares: the role is armed for the world's answer and kept only into a world;"
+             " back at the title without one, it is cancelled (prepArmed " + coopui::PanelNum((long long)g_prepArmed) + ")");
     /* T-201 N1: the screen stays up, greyed, with CANCEL, saying Starting "<world>"... / Connecting to <address>... until PressTick decides. */
     PressBegin(f.role == coopcfg::kCfgHost ? 1 : 2, g_fWorld, coopcfg::CfgTrim(g_fJoinAddr));
 }
@@ -3039,6 +3343,8 @@ static void PanelOptOpen()
         for (size_t k = 0; k < g_optChosen.size(); ++k)
             for (int i = 0; i < coopui::kOptCount; ++i)
                 if (g_optChosen[k].first == coopui::OptDefs()[i].key) { g_optVal[i] = g_optChosen[k].second; ++shownChosen; }
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);   /* T-556: the box opens on the row's value */
+    if (fee >= 0) { g_optFeeOpened = g_optVal[fee]; g_optFeeTyped = g_optVal[fee]; }
     g_optTab = coopui::kOptTabDifficulty;
     g_panelScreen = 6;
     ::InterlockedIncrement64(&g_optOpened);
@@ -3052,6 +3358,8 @@ static void PanelOptDone()
        equals its base and OptChanged alone would drop it. Such a row stays chosen, at the value on screen. */
     std::vector<std::pair<std::string, std::string> > prev;
     if (g_optChosenWorld == g_optWorld) prev = g_optChosen;
+    const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);   /* T-556: an empty fee box goes back to the value it opened with */
+    if (fee >= 0) { g_optVal[fee] = coopui::OptFeeBoxValue(g_optFeeTyped, g_optFeeOpened); g_optFeeTyped = g_optVal[fee]; }
     g_optChosen = coopui::OptChanged(g_optVal, g_optBase);
     for (size_t k = 0; k < prev.size(); ++k)
     {
@@ -3101,6 +3409,7 @@ static void PanelOptAction(int act)
             if (d.tab != (int)g_optTab) continue;
             const std::string v = coopui::OptCanon(i, d.dflt[0] != 0 ? std::string(d.dflt) : SettingsLiveValue(d.key));
             if (!v.empty()) g_optVal[i] = v;
+            if (!v.empty() && d.kind == coopui::kOptKindAmount) g_optFeeTyped = v;   /* T-556: the box shows the default */
         }
         return;
     }
@@ -3596,9 +3905,10 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     }
 
     /* [6] GAME OPTIONS: the three tabs (plain buttons, never MyGUI's tab control), nine option slots (label, <, value, > - or
-       a tick box in the stepper's column), the nests note, DEFAULTS left and DONE right.  The window is as tall as the
-       longest tab, so it does not jump when tabs change.  The MULTIPLAYER tab's mods line sits after its four rows and a
-       blank one.  STEP BUTTONS, NOT A SLIDER: no new MyGUI import. */
+       a tick box in the stepper's column), the note under the rows (Difficulty's nests note, MULTIPLAYER's mods line), DEFAULTS
+       left and DONE right.  The window is as tall as the longest tab, so it does not jump when tabs change.  T-556: the
+       MULTIPLAYER tab's RESURRECTION FEE row holds a typing box from the < column to the > column, and the FEE GROWTH line
+       takes the two row spaces after its last row.  STEP BUTTONS, NOT A SLIDER: no new MyGUI import. */
     {
         MyGUI::Widget* og = Mk(c, n.typeWidget, n.skinPanel, 0, 0, W, H, n.optGroup);
         if (og == 0) { PanelBuildFailed(gui, raw, "the Game options screen's group could not be created"); return; }
@@ -3624,9 +3934,18 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
             Mk(og, n.typeButton, n.skinBtn1, incX, y,                    stepW, rh,    n.optInc[r]);
             Mk(og, n.typeButton, n.skinTick, decX, y + (rh - tickW) / 2, tickW, tickW, n.optTick[r]);   /* ui5: in the stepper's column */
         }
-        const int coopY = rb.top + (rb.h * 5) / coopui::kOptRowsShown;
+        {
+            const int fee = coopui::OptIndexOfKey(swfee::kKeyAmount);
+            const int fr  = fee < 0 ? 0 : coopui::OptRowOf(coopui::OptDefs()[fee].tab, fee);
+            const int fy  = rb.top + (rb.h * fr) / coopui::kOptRowsShown;
+            const int fh  = rb.top + (rb.h * (fr + 1)) / coopui::kOptRowsShown - fy;
+            Mk(og, n.typeEdit, n.skinEdit, decX, fy, W - decX, fh, n.optFeeEdit);   /* the PORT box's skin (HOST GAME) */
+            const int lr = coopui::OptTabRows(coopui::kOptTabCoop);
+            const int ly = rb.top + (rb.h * lr) / coopui::kOptRowsShown;
+            const int lh = rb.top + (rb.h * (lr + 2 < coopui::kOptRowsShown ? lr + 2 : coopui::kOptRowsShown)) / coopui::kOptRowsShown - ly;
+            Mk(og, n.typeEdit, n.skinWrap, 0, ly, W, lh, n.optFeeNote);
+        }
         Mk(og, n.typeEdit,   n.skinWrap, 0,        nb.top, W,    nb.h,                                   n.optNote);
-        Mk(og, n.typeEdit,   n.skinWrap, 0,        coopY,  W,    (rb.h * 2) / coopui::kOptRowsShown,     n.optCoopNote);
         Mk(og, n.typeButton, n.skinBtn1, 0,        bb.top, btnW, bb.h,                                   n.optDefaultsBtn);
         Mk(og, n.typeButton, n.skinBtn1, W - btnW, bb.top, btnW, bb.h,                                   n.optDoneBtn);
     }
@@ -3692,7 +4011,8 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     e = UiEdit(gui, n.routerHelp); if (e) { e->setEditStatic(true); e->setEditReadOnly(true); e->setEditMultiLine(true); e->setEditWordWrap(true); }   /* mp4 */
     e = UiEdit(gui, n.playersBox); if (e) { e->setEditStatic(true); e->setEditReadOnly(true); e->setEditMultiLine(true); e->setEditWordWrap(true); }   /* mp4 */
     e = UiEdit(gui, n.optNote);     if (e) { e->setEditStatic(true); e->setEditReadOnly(true); e->setEditMultiLine(true); e->setEditWordWrap(true); }   /* mp5 */
-    e = UiEdit(gui, n.optCoopNote); if (e) { e->setEditStatic(true); e->setEditReadOnly(true); e->setEditMultiLine(true); e->setEditWordWrap(true); }   /* mp5 */
+    e = UiEdit(gui, n.optFeeNote);  if (e) { e->setEditStatic(true); e->setEditReadOnly(true); e->setEditMultiLine(true); e->setEditWordWrap(true); }   /* T-556 */
+    e = UiEdit(gui, n.optFeeEdit);  if (e) { e->setEditMultiLine(false); e->setMaxTextLength(coopui::kFeeBoxDigits); e->setVisible(false); }   /* T-556 */
     e = UiEdit(gui, n.status);
     if (e == 0) { PanelBuildFailed(gui, raw, "the status area could not be found after it was created"); return; }
     e->setEditStatic(true);
@@ -3702,7 +4022,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     /* ui3 (ui3-title-panel-look item 7 / fix 4): body text in Kenshi's message-box colour (Kenshi_MessageBox.layout TextColour
        0.871 0.845 0.810), not the skin's near-black, which was unreadable on the dark panel. */
     {
-        const std::string* const bodies[] = { &n.status, &n.nameHint, &n.routerHelp, &n.playersBox, &n.optNote, &n.optCoopNote,
+        const std::string* const bodies[] = { &n.status, &n.nameHint, &n.routerHelp, &n.playersBox, &n.optNote, &n.optFeeNote,
                                               &n.dlgText, &n.worldEmpty };
         for (size_t bi = 0; bi < sizeof(bodies) / sizeof(bodies[0]); ++bi)
         { MyGUI::EditBox* be = UiEdit(gui, *bodies[bi]); if (be) be->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f)); }
@@ -4251,11 +4571,10 @@ static int UiFindColumn(MyGUI::Widget* parent, MyGUI::Widget* col[6], std::strin
     return 1;
 }
 
-/* U3-b (review-u3): the row step is the LIVE gap from CONTINUE's top to NEW GAME's top.  The game never moves
-   those two and neither do we, and every menu button is align="Default" (pixel coords), so this gap is the pitch
-   in BOTH states of the column and through a background resize - which U3's 0.111111 x parent height was not:
-   after a resize it re-spaced LOAD GAME..EXIT at a new pitch while CONTINUE and NEW GAME kept their pixels.
-   Returns 0 with `why` when either is missing or the gap is not a positive row. */
+/* THE GAME'S ROW STEP ON THE GAME'S ART: the live gap from CONTINUE's top to NEW GAME's top.  On the game's art neither is
+   moved, and every menu button is align="Default" (pixel coords), so this gap is the pitch in both states of the column
+   and through a background resize.  (On the mod's art the plan moves those two; it reads the game's step from the
+   remembered originals - UiGameRows.)  Returns 0 with `why` when either is missing or the gap is not a positive row. */
 static int UiLivePitch(MyGUI::Widget* parent, std::string& why)
 {
     MyGUI::Widget* c = FindByLayoutSuffix(parent, kContinueSuffix, 0);
@@ -4297,10 +4616,10 @@ static int UiColumnFits(MyGUI::Widget* parent, MyGUI::Widget* col[6], int pitch,
 /* U3 - THE MOVE, AND WHY IT CANNOT SHIFT TWICE.  Every button is put ONE ROW BELOW THE BUTTON ABOVE IT, read
    live: ours under NEW GAME, LOAD GAME under ours, IMPORT GAME under LOAD GAME, and so on down to EXIT.  A
    button already where that rule puts it is not touched, so running this on every check is a no-op at rest
-   and puts back only what the engine moved.  Each keeps its own left; only its top changes.
-   Widget::setPosition(const IntPoint&) is VIRTUAL in MyGUI_Widget.h (line 112), so this is a call through the
-   vtable and adds no MyGUI import (the (int,int) overload beside it is NOT virtual and is deliberately not
-   used).  Returns how many widgets it moved; `book` (kUiBook*) says which counter books the game buttons. */
+   and puts back only what the engine moved.  Each keeps its own left, width and height and only its top changes,
+   except ours, which takes EXIT's height.  Widget::setCoord(const IntCoord&) is VIRTUAL in MyGUI_Widget.h (line
+   116), so this is a call through the vtable and adds no MyGUI import.  The game's art only (UiApplyColumn).
+   Returns how many widgets it moved; `book` (kUiBook*) says which counter books the game buttons. */
 static int UiApplyOrder(MyGUI::Widget* ours, MyGUI::Widget* col[6], int pitch, int book)
 {
     int moved = 0;
@@ -4309,9 +4628,10 @@ static int UiApplyOrder(MyGUI::Widget* ours, MyGUI::Widget* col[6], int pitch, i
     {
         MyGUI::Widget* w = (k == 0) ? ours : col[k];
         const int want = above->getTop() + pitch;
-        if (w->getTop() != want)
+        const int wantH = (w == ours) ? col[5]->getHeight() : w->getHeight();
+        if (w->getTop() != want || w->getHeight() != wantH)
         {
-            w->setPosition(MyGUI::IntPoint(w->getLeft(), want));
+            w->setCoord(MyGUI::IntCoord(w->getLeft(), want, w->getWidth(), wantH));
             ++moved;
             if (w != ours)
                 ::InterlockedIncrement64(book == kUiBookReshift ? &g_uiBtnsReshifted : (book == kUiBookRepitch ? &g_uiBtnsRepitched : &g_uiBtnsMoved));
@@ -4343,43 +4663,190 @@ static void UiOrderNowOrdered()
                          " column fits again. Read buttonOrderRestored= in the ui[] readout."));
 }
 
-/* U3-b: remember the five engine buttons' own coords before the first shift.  Already held for THESE widgets
-   under THIS parent -> kept as they are (the column may be moved now, and must not be re-read as original). */
-static void UiRememberOriginals(MyGUI::Widget* parent, MyGUI::Widget* col[6])
+/* The layout suffix of originals slot k (0 CONTINUE, 1 NEW GAME, 2..6 LOAD GAME .. EXIT). */
+static const char* UiOrigSuffix(int k)
+{
+    return k == 0 ? kContinueSuffix : (k == 1 ? kNewGameSuffix : kBelowSuffixes[k - 2]);
+}
+
+static void UiRememberSlot(int k, MyGUI::Widget* w)
+{
+    g_uiOrigW[k] = w;
+    g_uiOrigL[k] = w != 0 ? w->getLeft() : 0;
+    g_uiOrigT[k] = w != 0 ? w->getTop() : 0;
+    g_uiOrigWd[k] = w != 0 ? w->getWidth() : 0;
+    g_uiOrigHt[k] = w != 0 ? w->getHeight() : 0;
+}
+
+/* Remember the seven game buttons' own coords (CONTINUE, NEW GAME, the five below; `cont` may be 0) before the first move.
+   Already held for THESE widgets under THIS parent -> kept as they are (the column may be moved now, and must not be
+   re-read as original); a CONTINUE missing from them is added while the column stands on the game's rows (which never
+   move CONTINUE). */
+static void UiRememberOriginals(MyGUI::Widget* parent, MyGUI::Widget* cont, MyGUI::Widget* col[6])
 {
     if (g_uiOrigHeld != 0 && g_uiOrigParent == parent)
     {
         int same = 1;
-        for (int k = 0; k < 5; ++k)
-            if (g_uiOrigW[k] != col[k + 1]) same = 0;
-        if (same != 0) return;
+        for (int k = 1; k < kUiOrigSlots; ++k)
+            if (g_uiOrigW[k] != col[k - 1]) same = 0;
+        if (same != 0)
+        {
+            if (g_uiOrigW[0] == 0 && cont != 0 && g_uiPutArt == 0) UiRememberSlot(0, cont);
+            return;
+        }
     }
-    for (int k = 0; k < 5; ++k)
-    {
-        g_uiOrigW[k] = col[k + 1];
-        g_uiOrigL[k] = col[k + 1]->getLeft();
-        g_uiOrigT[k] = col[k + 1]->getTop();
-    }
+    UiRememberSlot(0, cont);
+    for (int k = 1; k < kUiOrigSlots; ++k) UiRememberSlot(k, col[k - 1]);
     g_uiOrigParent = parent;
     g_uiOrigHeld = 1;
 }
 
-/* U3-b (review-u3): THE PUT-BACK RESTORES, IT DOES NOT RECOMPUTE.  Each engine button found live under this
-   parent at its remembered address goes back to exactly its remembered coords; one that is gone is skipped
-   (its pointer is compared, never followed).  The originals are spent either way. */
+/* THE PUT-BACK RESTORES, IT DOES NOT RECOMPUTE.  Each game button found live under this parent at its remembered address
+   goes back to exactly its remembered coords and size; one that is gone is skipped (its pointer is compared, never
+   followed).  The originals are spent either way, and the column no longer stands on the mod's art plan. */
 static void UiPutBack(MyGUI::Widget* parent)
 {
     if (g_uiOrigHeld != 0 && g_uiOrigParent == parent)
     {
-        for (int k = 0; k < 5; ++k)
+        for (int k = 0; k < kUiOrigSlots; ++k)
         {
-            MyGUI::Widget* w = FindByLayoutSuffix(parent, kBelowSuffixes[k], 0);
+            if (g_uiOrigW[k] == 0) continue;
+            MyGUI::Widget* w = FindByLayoutSuffix(parent, UiOrigSuffix(k), 0);
             if (w == 0 || w != g_uiOrigW[k] || w->getParent() != parent) continue;
-            if (w->getLeft() != g_uiOrigL[k] || w->getTop() != g_uiOrigT[k])
-                w->setPosition(MyGUI::IntPoint(g_uiOrigL[k], g_uiOrigT[k]));
+            if (w->getLeft() != g_uiOrigL[k] || w->getTop() != g_uiOrigT[k] || w->getWidth() != g_uiOrigWd[k] || w->getHeight() != g_uiOrigHt[k])
+                w->setCoord(MyGUI::IntCoord(g_uiOrigL[k], g_uiOrigT[k], g_uiOrigWd[k], g_uiOrigHt[k]));
         }
     }
     g_uiOrigHeld = 0;
+    g_uiPutArt = 0;
+}
+
+/* THE COLUMN ON THE MOD'S ART.  Slot order of the whole column, as the menu pass numbers it (UiMenuSlot): 0 CONTINUE,
+   1 NEW GAME, 2 ours, 3..7 LOAD GAME .. EXIT. */
+static void UiColumnSlots(MyGUI::Widget* cont, MyGUI::Widget* col[6], MyGUI::Widget* ours, MyGUI::Widget* slot[kUiMenuSlots])
+{
+    slot[0] = cont;
+    slot[1] = col[0];
+    slot[2] = ours;
+    for (int k = 1; k < 6; ++k) slot[k + 2] = col[k];
+}
+
+/* Does slot k's button count as shown: visible, or hidden by us under the open MULTIPLAYER panel (UiMenuColumnSync) - the
+   column keeps its place while the panel is up.  Ours not made yet counts: it is about to be. */
+static int UiColumnShown(MyGUI::Widget* parent, int k, MyGUI::Widget* w)
+{
+    if (w == 0) return k == 2 ? 1 : 0;
+    if (w->getVisible()) return 1;
+    return (g_uiMenuHeld != 0 && g_uiMenuParent == parent && g_uiMenuHidW[k] == w) ? 1 : 0;
+}
+
+/* The game's own row step and button height for the plan: from the remembered originals when they are held for these
+   buttons (the plan moves CONTINUE and NEW GAME), else from the live, unmoved buttons. */
+static void UiGameRows(MyGUI::Widget* parent, MyGUI::Widget* cont, MyGUI::Widget* col[6], int* pitch, int* height)
+{
+    if (g_uiOrigHeld != 0 && g_uiOrigParent == parent && g_uiOrigW[0] == cont && g_uiOrigW[1] == col[0])
+    {
+        *pitch = g_uiOrigT[1] - g_uiOrigT[0];
+        *height = g_uiOrigHt[1];
+        return;
+    }
+    *pitch = col[0]->getTop() - cont->getTop();
+    *height = col[0]->getHeight();
+}
+
+/* One line per screen size and number of shown buttons. */
+static void UiColumnLog(const swtitle::MenuColumn& m, int pw, int ph, int shown, int titleBottom, int gamePitch, int gameHeight)
+{
+    const int top = m.ok != 0 ? m.top : 0;
+    if (pw == g_uiColLogW && ph == g_uiColLogH && shown == g_uiColLogShown && top == g_uiColLogTop) return;
+    g_uiColLogW = pw;
+    g_uiColLogH = ph;
+    g_uiColLogShown = shown;
+    g_uiColLogTop = top;
+    ::InterlockedIncrement64(&g_uiColPlans);
+    std::stringstream ss;
+    ss.imbue(std::locale::classic());
+    if (m.ok != 0)
+        ss << "[UI] menu column: top=" << m.top << " pitch=" << m.pitch << " height=" << m.height << " for title bottom " << titleBottom
+           << " on " << pw << "x" << ph << " (" << shown << " buttons shown; the game's pitch " << gamePitch << ", height " << gameHeight
+           << "; the last button ends at " << (m.top + (shown - 1) * m.pitch + m.height) << ")";
+    else
+        ss << "[UI] menu column: no room under title bottom " << titleBottom << " on " << pw << "x" << ph << " for " << shown
+           << " buttons (the game's pitch " << gamePitch << ", height " << gameHeight << ") - the game's own column stays";
+    DebugLog(ss.str());
+}
+
+/* Where the column goes, read live.  `lay` (filled):  art 1 = the plan for the mod's art (swtitle::MenuColumnPlan: the first
+   shown button's top, the row step and every button's height); art 0 = the game's rows - ours and the five under NEW GAME
+   at the game's live pitch, CONTINUE and NEW GAME where the game put them.  The plan is used when the mod's art is on the
+   title screen at its present size (TitleArtNoteBand), CONTINUE and the six column buttons are all found, and it has room;
+   otherwise the game's rows, and a column standing on the plan is first put back to the game's own rows.  Returns 1 when
+   the chosen rows fit (col[] filled, *cont = CONTINUE or 0), else 0 with `why`.  lay->pitch is the game's live pitch on
+   the game's rows (0 when it cannot be read) - the fallback below EXIT uses it too. */
+struct UiColumnLay { int art, top, pitch, height; };
+static int UiColumnDecide(MyGUI::Widget* parent, MyGUI::Widget* ours, MyGUI::Widget* col[6], MyGUI::Widget** cont, UiColumnLay* lay, std::string& why)
+{
+    lay->art = 0;
+    lay->top = 0;
+    lay->pitch = 0;
+    lay->height = 0;
+    const int found = UiFindColumn(parent, col, why);
+    MyGUI::Widget* c = FindByLayoutSuffix(parent, kContinueSuffix, 0);
+    *cont = (c != 0 && c->getParent() == parent) ? c : 0;
+    int titleBottom = 0, bandBottom = 0;
+    if (found != 0 && *cont != 0 && TitleArtNoteBand(parent, &titleBottom, &bandBottom) != 0)
+    {
+        int gamePitch = 0, gameHeight = 0;
+        UiGameRows(parent, *cont, col, &gamePitch, &gameHeight);
+        MyGUI::Widget* slot[kUiMenuSlots];
+        UiColumnSlots(*cont, col, ours, slot);
+        int shown = 0;
+        for (int k = 0; k < kUiMenuSlots; ++k) shown += UiColumnShown(parent, k, slot[k]);
+        const swtitle::MenuColumn m = swtitle::MenuColumnPlan(parent->getHeight(), titleBottom, shown, gamePitch, gameHeight);
+        UiColumnLog(m, parent->getWidth(), parent->getHeight(), shown, titleBottom, gamePitch, gameHeight);
+        if (m.ok != 0)
+        {
+            lay->art = 1;
+            lay->top = m.top;
+            lay->pitch = m.pitch;
+            lay->height = m.height;
+            return 1;
+        }
+        ::InterlockedIncrement64(&g_uiColNoPlan);
+    }
+    if (g_uiPutArt != 0) UiPutBack(parent);
+    std::string whyPitch;
+    lay->pitch = UiLivePitch(parent, whyPitch);
+    if (found == 0) return 0;
+    if (lay->pitch <= 0) { why = whyPitch; return 0; }
+    return UiColumnFits(parent, col, lay->pitch, why);
+}
+
+/* Put the column where `lay` says.  The game's rows: UiApplyOrder.  The plan: every shown button (UiColumnShown), top to
+   bottom, at lay.top + row x lay.pitch and lay.height tall, its left and width kept; a hidden CONTINUE (no save) is left
+   where it is and takes no row.  A button already there is not touched, so this is a no-op at rest.  Returns how many
+   widgets it moved; `book` (kUiBook*) says which counter books the game buttons. */
+static int UiApplyColumn(MyGUI::Widget* parent, MyGUI::Widget* ours, MyGUI::Widget* cont, MyGUI::Widget* col[6], const UiColumnLay& lay, int book)
+{
+    if (lay.art == 0) return UiApplyOrder(ours, col, lay.pitch, book);
+    MyGUI::Widget* slot[kUiMenuSlots];
+    UiColumnSlots(cont, col, ours, slot);
+    int moved = 0, row = 0;
+    for (int k = 0; k < kUiMenuSlots; ++k)
+    {
+        MyGUI::Widget* w = slot[k];
+        if (w == 0 || UiColumnShown(parent, k, w) == 0) continue;
+        const int top = lay.top + row * lay.pitch;
+        ++row;
+        if (w->getTop() == top && w->getHeight() == lay.height) continue;
+        w->setCoord(MyGUI::IntCoord(w->getLeft(), top, w->getWidth(), lay.height));
+        ++moved;
+        if (w != ours)
+            ::InterlockedIncrement64(book == kUiBookReshift ? &g_uiBtnsReshifted : (book == kUiBookRepitch ? &g_uiBtnsRepitched : &g_uiBtnsMoved));
+    }
+    g_uiPutArt = 1;
+    if (moved != 0) ::InterlockedIncrement64(&g_uiColPlaced);
+    return moved;
 }
 
 /* ui5c (user decision 40, 2026-09-27) - THE SUB-MENU REPLACES THE MAIN MENU.  While the MULTIPLAYER panel is up
@@ -4680,46 +5147,50 @@ static void UiRefusedTipTick(MyGUI::Gui* gui, MyGUI::Widget* btn)
 
 static void UiCreateButton(MyGUI::Widget* parent, MyGUI::Widget* exitBtn)
 {
-    // U3 (user decision 2026-09-22) - RIGHT AFTER NEW GAME, AND THE FIVE BELOW IT MOVE DOWN ONE ROW.
-    // The column reads CONTINUE, NEW GAME, MULTIPLAYER, LOAD GAME, IMPORT GAME, OPTIONS, CREDITS, EXIT.  Ours
-    // takes the row LOAD GAME used to occupy (NEW GAME's top + one row pitch), and LOAD GAME, IMPORT GAME,
-    // OPTIONS, CREDITS and EXIT each move one row down (UiApplyOrder).  EXIT lands on y 0.916667..0.980556
-    // real - exactly the row P8a gave our button below EXIT - so against EVERY widget in
-    // data/gui/layout/Kenshi_MainMenu.layout the longer column overlaps nothing P8a's did not already clear:
+    // RIGHT AFTER NEW GAME: the column reads CONTINUE, NEW GAME, MULTIPLAYER, LOAD GAME, IMPORT GAME, OPTIONS,
+    // CREDITS, EXIT (UiColumnDecide picks the rows, UiApplyColumn puts them there).
+    // ON THE MOD'S ART (owner 464 a): the whole column is placed by swtitle::MenuColumnPlan - its first shown
+    // button 2% of the height under the painted title, the last one ending no lower than 97% of the height, left
+    // and width unchanged - so no button covers the lettering at any window shape.
+    // ON THE GAME'S ART: ours takes the row LOAD GAME used to occupy (NEW GAME's top + one row pitch), and LOAD
+    // GAME .. EXIT each move one row down (UiApplyOrder).  EXIT lands on y 0.916667..0.980556 real, so against
+    // EVERY widget in data/gui/layout/Kenshi_MainMenu.layout the column overlaps nothing:
     //   the column         x 0.2604..0.4167, y 0.138889..0.980556
     //   CreditsPanel       x 0.5203..0.8844                   - no x overlap
     //   VersionText        x 0.6047..0.9984                   - no x overlap
     //   the ImageBox       0 0 1 1                            - our PARENT, not a sibling
     //
-    // THE FALLBACK IS P8a's PLACEMENT, unchanged: if any of the six buttons is not found (or not a child of
-    // this parent), or the longer column would run off the parent's bottom, ours goes ONE ROW BELOW EXIT and
-    // nothing of the game's is moved; buttonOrderFallback counts it and one line says which.  Below that,
-    // P8a's own last resort - left of the column, else not created and noRoomTicks.
+    // THE FALLBACK: if any of the six buttons is not found (or not a child of this parent), or the game's longer
+    // column would run off the parent's bottom, ours goes ONE ROW BELOW EXIT and nothing of the game's is moved;
+    // buttonOrderFallback counts it and one line says which.  Below that, left of the column, else not created
+    // and noRoomTicks.
     //
     // P8a (review-p7z M-2) - WHY NOT TO THE RIGHT: P7z put us to the RIGHT of EXIT, which sat ON TOP of the
     // hidden CreditsPanel (x 0.520312..0.884374) once CREDITS was pressed, drawn over its text and keeping its
     // own mouse pick there.  A UI affordance that behaves differently from what the screen shows is a defect
     // in this project.  The row position is taken from the game's live buttons at run time (see below).
     //
-    // DERIVED FROM THE LIVE WIDGETS, never from the layout file: left/width/height from the EXIT button, the
-    // row from NEW GAME's live top, and the row pitch from the live gap CONTINUE -> NEW GAME (UiLivePitch, U3-b).
-    // U3-b (review-u3 LOW 1): a fallback first PUTS BACK a column that is already moved (a rebuild of an unwired
-    // button over an ordered column), and only then reads EXIT - "below EXIT" means below EXIT's own row.
+    // DERIVED FROM THE LIVE WIDGETS, never from the layout file: left/width from the EXIT button; on the game's
+    // rows the height from EXIT, the row from NEW GAME's live top and the row pitch from the live gap CONTINUE ->
+    // NEW GAME (UiLivePitch); on the mod's art the plan's row and height.  A fallback first PUTS BACK a column
+    // that is already moved (a rebuild of an unwired button over an ordered column), and only then reads EXIT -
+    // "below EXIT" means below EXIT's own row.
     const int parentH = parent->getHeight();
     MyGUI::Widget* col[6] = { 0, 0, 0, 0, 0, 0 };
+    MyGUI::Widget* cont = 0;
+    UiColumnLay lay;
     std::string why;
-    std::string whyPitch;
-    const int rowPitch = UiLivePitch(parent, whyPitch);
-    int ordered = 0;
-    if (UiFindColumn(parent, col, why) != 0)
-    {
-        if (rowPitch <= 0) why = whyPitch;
-        else if (UiColumnFits(parent, col, rowPitch, why) != 0) ordered = 1;
-    }
+    const int ordered = UiColumnDecide(parent, 0, col, &cont, &lay, why);
+    const int rowPitch = lay.pitch;
     if (ordered == 0) UiPutBack(parent);
     const MyGUI::IntCoord e = exitBtn->getCoord();
     MyGUI::IntCoord mine(e.left, e.top + rowPitch, e.width, e.height);
-    if (ordered != 0)
+    if (ordered != 0 && lay.art != 0)
+    {
+        const int above = UiColumnShown(parent, 0, cont) + UiColumnShown(parent, 1, col[0]);   /* CONTINUE and NEW GAME, when shown */
+        mine = MyGUI::IntCoord(e.left, lay.top + above * lay.pitch, e.width, lay.height);
+    }
+    else if (ordered != 0)
     {
         mine = MyGUI::IntCoord(e.left, col[0]->getTop() + rowPitch, e.width, e.height);
     }
@@ -4739,14 +5210,14 @@ static void UiCreateButton(MyGUI::Widget* parent, MyGUI::Widget* exitBtn)
     MyGUI::Button* b = parent->createWidget<MyGUI::Button>(kSkin, mine, MyGUI::Align::Default, kOurName);
     if (b == 0) { ::InterlockedIncrement64(&g_uiCreateNull); return; }
 
-    /* U3: the game's five move now, before either caption branch - the refusal caption sits in the same row.
+    /* The game's buttons move now, before either caption branch - the refusal caption sits in the same row.
        A throw in here leaves the wired flag down, the next tick rebuilds ours, and the move (idempotent by
        construction) touches only what is still out of place. */
     g_uiOrderMode = 2;
     if (ordered != 0)
     {
-        UiRememberOriginals(parent, col);
-        UiApplyOrder(b, col, rowPitch, kUiBookMoved);
+        UiRememberOriginals(parent, cont, col);
+        UiApplyColumn(parent, b, cont, col, lay, kUiBookMoved);
         g_uiPutPitch = rowPitch;
         g_uiOrderMode = 1;
         UiOrderNowOrdered();
@@ -4896,7 +5367,8 @@ static __declspec(noinline) void UiTitleTickInner()
     if (btn == 0)
     {
         if (::InterlockedCompareExchange(&g_uiBtnWired, 0, 0) != 0) ::InterlockedExchange(&g_uiBtnWired, 0);
-        g_uiOrigHeld = 0;   /* U3-b: our button is gone - a new title instance's buttons are not these originals */
+        g_uiOrigHeld = 0;   /* our button is gone - a new title instance's buttons are not these originals */
+        g_uiPutArt = 0;
         g_uiOrderLoggedMode = 1;   /* U3-c (re-check-u3b LOW): a new title starts in the expected mode, so its first ordered layout is not logged as a RESTORE and its first fallback is logged */
     }
     else if (::InterlockedCompareExchange(&g_uiBtnWired, 0, 0) == 0)
@@ -4992,6 +5464,7 @@ static __declspec(noinline) void UiTitleTickInner()
     if (PressTick() != 0 && panel != 0) PanelPush(gui);
     if (LoadTick() != 0 && panel != 0) PanelPush(gui);   /* T-201 PP6' */
     PressBoxReturnTick();
+    PrepTick(gui);   /* owner 470: a prepared role is kept only into a world */
     /* ui3b (review MED): an Overlapped error box made after the panel is drawn above it but asked for clicks after it, so its OK
        could not be clicked over the panel. While the panel is open the box is hidden (the panel's status area carries the
        message); it shows again once the panel closes.  ui6: set in UiBoxBlockTick, at the end of the tick, with the strips. */
@@ -5073,15 +5546,17 @@ static __declspec(noinline) void UiTitleTickInner()
         }
     }
 
-    /* U3 - THE ORDER IS RE-CHECKED, CHEAPLY; U3-b (review-u3) - AND NEVER AGAINST A SIZE STILL MOVING.  Checked
-       every kUiOrderCheckEveryMs, and on a parent-size change only once that size has held still for
-       coopui::kPanelResizeSettleMs - the panel's settle rule (U2-c), read on every tick - never per tick, because
-       it is seven suffix walks.  The pitch is the live CONTINUE -> NEW GAME gap, so a resize that moves no button
-       changes nothing.  ORDERED and it still fits: UiApplyOrder moves only a button not one row below the one
-       above it (buttonsReshifted at an unchanged pitch - the game moved it; buttonsRepitched when the pitch
-       itself changed).  ORDERED and it no longer fits: the five go back to their REMEMBERED originals, ours is
-       destroyed, and the build below re-decides - the fallback below EXIT.  FALLEN BACK and it fits again: ours
-       moves in place to under NEW GAME and the order is re-applied (buttonOrderRestored) - nothing latches. */
+    /* THE ORDER IS RE-CHECKED, CHEAPLY, AND NEVER AGAINST A SIZE STILL MOVING.  Checked every kUiOrderCheckEveryMs,
+       and on a parent-size change only once that size has held still for coopui::kPanelResizeSettleMs - the
+       panel's settle rule, read on every tick - never per tick, because it is a dozen suffix walks.  UiColumnDecide
+       picks the rows for the art on screen at this size: the plan on the mod's art (placed again for each new size
+       and each change in the shown buttons), the game's rows on the game's art (the live CONTINUE -> NEW GAME gap,
+       so a resize that moves no button changes nothing).  ORDERED and it still fits: UiApplyColumn moves only a
+       button not where the rows put it (buttonsReshifted at an unchanged pitch - the game moved it;
+       buttonsRepitched when the pitch itself changed).  ORDERED and it no longer fits: the game's buttons go back
+       to their REMEMBERED originals, ours is destroyed, and the build below re-decides - the fallback below EXIT.
+       FALLEN BACK and it fits again: ours moves into the column and the order is re-applied (buttonOrderRestored) -
+       nothing latches. */
     if (btn != 0 && (g_uiOrderMode == 1 || g_uiOrderMode == 2))
     {
         MyGUI::Widget* op = btn->getParent();
@@ -5117,17 +5592,15 @@ static __declspec(noinline) void UiTitleTickInner()
             g_uiOrderParentW = op->getWidth();
             g_uiOrderParentH = op->getHeight();
             MyGUI::Widget* col[6] = { 0, 0, 0, 0, 0, 0 };
+            MyGUI::Widget* cont = 0;
+            UiColumnLay lay;
             std::string why;
-            int pitch = 0;
-            int fits = 0;
-            if (UiFindColumn(op, col, why) != 0)
-            {
-                pitch = UiLivePitch(op, why);
-                if (pitch > 0 && UiColumnFits(op, col, pitch, why) != 0) fits = 1;
-            }
+            const int fits = UiColumnDecide(op, btn, col, &cont, &lay, why);
+            const int pitch = lay.pitch;
             if (g_uiOrderMode == 1 && fits != 0)
             {
-                UiApplyOrder(btn, col, pitch, pitch == g_uiPutPitch ? kUiBookReshift : kUiBookRepitch);
+                UiRememberOriginals(op, cont, col);
+                UiApplyColumn(op, btn, cont, col, lay, pitch == g_uiPutPitch ? kUiBookReshift : kUiBookRepitch);
                 g_uiPutPitch = pitch;
             }
             else if (g_uiOrderMode == 1)
@@ -5140,9 +5613,8 @@ static __declspec(noinline) void UiTitleTickInner()
             }
             else if (fits != 0)
             {
-                UiRememberOriginals(op, col);
-                btn->setPosition(MyGUI::IntPoint(col[5]->getLeft(), col[0]->getTop() + pitch));
-                UiApplyOrder(btn, col, pitch, kUiBookMoved);
+                UiRememberOriginals(op, cont, col);
+                UiApplyColumn(op, btn, cont, col, lay, kUiBookMoved);
                 g_uiPutPitch = pitch;
                 g_uiOrderMode = 1;
                 UiOrderNowOrdered();
@@ -5169,7 +5641,7 @@ static __declspec(noinline) void UiTitleTickInner()
         exitBtn = FindByLayoutSuffix(roots.current(), kExitSuffix, 0);
         if (exitBtn != 0) break;
     }
-    if (exitBtn == 0) { g_uiOrigHeld = 0; UiMenuForget("the title screen is gone"); UiBoxBlockGone(gui, "the title screen is gone"); ::InterlockedIncrement64(&g_uiNoExit); return; }   /* U3-b: title gone; ui5c: its buttons are not touched */
+    if (exitBtn == 0) { g_uiOrigHeld = 0; g_uiPutArt = 0; UiMenuForget("the title screen is gone"); UiBoxBlockGone(gui, "the title screen is gone"); ::InterlockedIncrement64(&g_uiNoExit); return; }   /* U3-b: title gone; ui5c: its buttons are not touched */
 
     // The parent is the title art ImageBox that holds all seven menu buttons - the sibling
     // relationship is what gives our button the same coordinate space and the same clipping.
@@ -6067,6 +6539,51 @@ static bool UiDriveType(MyGUI::Gui* gui, const std::string& field, const std::st
     DebugLog("[UI] uitype " + field + " FIRED (screen " + screen + ", '" + text + "' - the text change and a key press, as a player's keystroke fires them; the panel reads it through UiTextOf / CfgSanitiseTyped)");
     return true;
 }
+/* T-368 - TEST-ONLY `renamemyfaction tab <name>`: what a player's Enter in the FACTION tab's name box does. Kenshi's overview window
+   (Kenshi_OverviewWindow.layout) holds that box as FactionNameText; its FactionsScreen handler (0x491940) is bound to the box's
+   eventEditSelectAccept (+0x4B8, read from the binding at 0x493AB7). The lever puts the name in the box and raises that event, so the
+   engine's own handler runs - through the mod's check (playerfaction.cpp detour_factionNameEdited) - whether or not the window is open.
+   No injected input (F010). */
+bool UiFactionTabRename(const std::string& name)
+{
+    try
+    {
+        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+        if (gui == 0) return UiDriveRefuse("renamemyfaction tab", name, "no GUI yet");
+        std::string why;
+        MyGUI::Widget* w = UiDriveEngine(gui, "FactionNameText", 0, &why);
+        if (w == 0) return UiDriveRefuse("renamemyfaction tab", name, why);
+        MyGUI::EditBox* e = w->castType<MyGUI::EditBox>(false);
+        if (e == 0) return UiDriveRefuse("renamemyfaction tab", name, "the widget is not a text box");
+        const std::string widget = w->getName();
+        e->setCaption(MyGUI::UString(name.c_str()));
+        e->eventEditSelectAccept(e);
+        const char* now = e->getCaption().asUTF8_c_str();
+        DebugLog("[UI] renamemyfaction tab '" + name + "' FIRED (the FACTION tab's name box " + widget + ": its text set and its Enter raised; the box reads '"
+                 + std::string(now != 0 ? now : "") + "' after the engine's handler)");
+        return true;
+    }
+    catch (...) { DebugLog("[UI] renamemyfaction tab '" + name + "' - a C++ exception; nothing more done"); return false; }
+}
+/* T-368: the FACTION tab's name box (FactionNameText) shows `name` - called after the world gave this game's player faction a name, so
+   the box never keeps a name the world refused or replaced. MAIN THREAD. False = no GUI or no such box yet (nothing to update). */
+bool UiFactionTabCaption(const std::string& name)
+{
+    try
+    {
+        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+        if (gui == 0) return false;
+        std::string why;
+        MyGUI::Widget* w = UiDriveEngine(gui, "FactionNameText", 0, &why);
+        if (w == 0) { DebugLog("[UI] the FACTION tab's name box was not set to '" + name + "' (" + why + ")"); return false; }
+        MyGUI::EditBox* e = w->castType<MyGUI::EditBox>(false);
+        if (e == 0) { DebugLog("[UI] the FACTION tab's name box was not set to '" + name + "' (the widget is not a text box)"); return false; }
+        e->setCaption(MyGUI::UString(name.c_str()));
+        DebugLog("[UI] the FACTION tab's name box " + w->getName() + " shows '" + name + "'");
+        return true;
+    }
+    catch (...) { DebugLog("[UI] the FACTION tab's name box - a C++ exception setting '" + name + "'; nothing more done"); return false; }
+}
 static std::string UiDriveFlags(MyGUI::Widget* w)
 {
     if (w == 0) return "-";
@@ -6088,7 +6605,26 @@ static bool UiDriveState(MyGUI::Gui* gui)
         + " notice='" + (noticeOn != 0 ? g_noticeText : std::string()) + "'"
         + " press=" + (g_pressBusy == 1 ? "host" : g_pressBusy == 2 ? "join" : "idle")   /* T-201 N1 */
         + " load=" + coopui::PanelNum((long long)g_loadStage)   /* T-201 PP6': 0 none, 1 admitting, 2 Loading shown, 3 acting */
-        + " status='" + UiStateOneLine(g_panelStatusCaption) + "' buttons=";
+        + " role=" + ConfigRoleName() + " prep=" + coopui::PanelNum((long long)g_prepPhase)   /* owner 470: coopui::PrepPhase */
+        + " newGameWindow=" + coopui::PanelNum((long long)UiNewGameWindowShown(gui))
+        + " status='" + UiStateOneLine(g_panelStatusCaption) + "'";
+    if (g_panelScreen == 6)   /* T-556: GAME OPTIONS - the open tab's rows (key=value, * = greyed), the fee box and the line under FEE GROWTH */
+    {
+        line += " opttab=" + coopui::PanelNum((long long)g_optTab) + " optrows=";
+        for (int r = 0; r < coopui::kOptRowsShown; ++r)
+        {
+            const int i = coopui::OptIndexOf((int)g_optTab, r);
+            if (i < 0) break;
+            line += (r ? "," : "") + std::string(coopui::OptDefs()[i].key) + "=" + g_optVal[i] + (coopui::OptRowLit(i, g_optVal) ? "" : "*");
+        }
+        MyGUI::EditBox* fe = UiEdit(gui, NM().optFeeEdit);
+        MyGUI::EditBox* fn = UiEdit(gui, NM().optFeeNote);
+        line += " feebox='" + (fe ? UiTextOf(fe, 64) : std::string("?")) + "' feeboxShown=" + (fe && fe->getVisible() ? "1" : "0")
+              + " feeboxLit=" + (fe && fe->getEnabled() ? "1" : "0")
+              + " feeboxAlpha=" + (fe ? std::to_string((long long)(fe->getAlpha() * 100.0f + 0.5f)) : std::string("?"))
+              + " feeline='" + (fn && fn->getVisible() ? UiStateOneLine(UiTextOf(fn, 400)) : std::string()) + "'";
+    }
+    line += " buttons=";
     size_t n = 0;
     const coopui::UiDriveName* t = coopui::UiDriveTable(&n);
     int first = 1;
@@ -6673,10 +7209,47 @@ static bool UiEngineNewGameClick(const char* why)
     DebugLog(std::string("[UI] NewGameWindow shown by ") + why);
     return true;
 }
+/* IS KENSHI'S NEW GAME WINDOW UP? Its BEGIN button (a widget whose layout name ends in BeginButton) visible with every parent. The
+   root that held the button at the last look is remembered and compared with the live roots (never followed), so a look walks that
+   root alone while it stands; otherwise every root, bounded like UiDriveEngine. */
+static MyGUI::Widget* g_ngRoot = 0;
+static void UiBeginWalk(MyGUI::Widget* w, int depth, int* budget, int* found, int* shown)
+{
+    if (w == 0 || *shown != 0 || depth > 64 || *budget <= 0) return;
+    --*budget;
+    if (NameCarriesLayoutSuffix(w->getName(), "BeginButton"))
+    {
+        *found = 1;
+        if (w->getInheritedVisible()) { *shown = 1; return; }
+    }
+    const size_t n = w->getChildCount();
+    for (size_t i = 0; i < n && *shown == 0; ++i) UiBeginWalk(w->getChildAt(i), depth + 1, budget, found, shown);
+}
+static int UiNewGameWindowShown(MyGUI::Gui* gui)
+{
+    if (gui == 0) return 0;
+    int budget = 20000, found = 0, shown = 0;
+    if (g_ngRoot != 0)
+    {
+        MyGUI::EnumeratorWidgetPtr roots = gui->getEnumerator();
+        while (roots.next())
+            if (roots.current() == g_ngRoot) { UiBeginWalk(roots.current(), 0, &budget, &found, &shown); break; }
+        if (found != 0) return shown;
+        g_ngRoot = 0;
+    }
+    MyGUI::EnumeratorWidgetPtr all = gui->getEnumerator();
+    while (shown == 0 && all.next())
+    {
+        int here = 0;
+        UiBeginWalk(all.current(), 0, &budget, &here, &shown);
+        if (here != 0 && g_ngRoot == 0) g_ngRoot = all.current();
+    }
+    return shown;
+}
 /* atTitle: 1 = after the title's own update (coop.cpp's title hook), 0 = the in-world tail - which never posts: the title that decided is gone. */
 static void LoadTailAct(int atTitle)
 {
-    if (atTitle != 0 && StoreNewGameReshowTake() != 0) UiEngineNewGameClick("the refused NEW GAME (PP5 gate, F1)");
+    if (atTitle != 0 && StoreNewGameReshowTake() != 0 && UiEngineNewGameClick("the refused NEW GAME (PP5 gate, F1)")) PrepWindowOpened();
     if (g_loadStage != 3) return;
     if (atTitle == 0)   /* T-220: reachable - between the panel closing (stage 3) and this tail the title menu is live, so the engine's own
                            LOAD / CONTINUE can take the game in-world first. The press ends as any other failed press: box D, the world left. */
@@ -6689,6 +7262,7 @@ static void LoadTailAct(int atTitle)
         if (coopprof::OpenSaveIsDecidedFolder(openRead == 1, std::string(ob), g_loadFolder))
         {
             g_loadStage = 0; g_loadMode = 0; g_profBusy = 0;
+            if (g_prepPhase != coopui::kPrepNone) g_prepPhase = coopui::kPrepPosted;
             DebugLog("[AUTOLOAD] the game's own CONTINUE / LOAD took the decided save '" + std::string(ob) + "' (folder '" + g_loadFolder
                      + "') before the " + std::string(g_loadVerdict == coopprof::kAutoLoadLoad ? "load" : "NEW GAME window") + " was posted - the press is done, the world stays");
             return;
@@ -6718,6 +7292,7 @@ static void LoadTailAct(int atTitle)
         if (posted == 1)
         {
             g_loadStage = 0; g_loadMode = 0; g_profBusy = 0;
+            if (g_prepPhase != coopui::kPrepNone) g_prepPhase = coopui::kPrepPosted;
             DebugLog("[AUTOLOAD] load posted (code 2) folder='" + folder + "' profile='" + prof + "'");
             return;
         }
@@ -6734,12 +7309,14 @@ static void LoadTailAct(int atTitle)
     if (!UiEngineNewGameClick("autoload"))   /* the world's settings are locked in the window by settings.cpp (NgLock / detour_smNewGame) */
     { LoadFail(coopui::kLoadFailText, "CAN'T LOAD", "the NEW GAME button was not found"); return; }   /* owner 176 A: the world is left */
     g_loadStage = 0; g_loadMode = 0; g_profBusy = 0;
+    PrepWindowOpened();
 }
 void UiDriveEngineClickFlush(int atTitle)
 {
     if (atTitle == 0) UiHostingWorldTick();   /* T-524: the HOSTING window over the pause menu - this is the in-world pump's tail */
     try { LoadTailAct(atTitle); }
     catch (...) { DebugLog("[AUTOLOAD] a C++ exception at the end of the frame; nothing more done"); }
+    if (atTitle == 0) g_prepPhase = coopui::kPrepNone;   /* in a world: the press's preparation is over */
     if (g_driveEngineQueued.empty()) return;
     const std::string name = g_driveEngineQueued;
     g_driveEngineQueued.clear();   /* cleared FIRST: a handler that throws or re-enters never fires it twice */
@@ -6892,6 +7469,9 @@ std::string UiReportToken()
        << ",buttonsRepitched=" << (long long)g_uiBtnsRepitched
        << ",buttonOrderFallback=" << (long long)g_uiOrderFallback
        << ",buttonOrderRestored=" << (long long)g_uiOrderRestored
+       << ",columnPlans=" << (long long)g_uiColPlans
+       << ",columnPlaced=" << (long long)g_uiColPlaced
+       << ",columnNoPlan=" << (long long)g_uiColNoPlan
        << ",faulted=" << (long long)g_uiFaulted
        << ",uiCppThrow=" << (long long)g_uiCppThrow
        << ",softStrikes=" << (long long)g_uiSoftStrikes
@@ -6965,6 +7545,8 @@ std::string UiReportToken()
        << ",armLate=" << (long long)g_panelArmLate
        << ",press[started,done,failed,cancelled,ignored]=" << (long long)g_pressStarted << "," << (long long)g_pressDone << ","
        << (long long)g_pressFailed << "," << (long long)g_pressCancelled << "," << (long long)g_pressIgnored   /* T-201 N1 */
+       << ",prep[armed,windowSeen,cancelled,phase]=" << (long long)g_prepArmed << "," << (long long)g_prepSeen << ","
+       << (long long)g_prepCancelled << "," << g_prepPhase   /* owner 470 */
        << ",dials=" << (long long)ConfigDialCount()
        << ",nbSpawned=" << (long long)g_panelNbSpawned
        << ",nbSpawnFailed=" << (long long)g_panelNbSpawnFail
@@ -6973,6 +7555,8 @@ std::string UiReportToken()
        << ",nbAlready=" << (long long)g_panelNbAlready
        << ",nbExited=" << (long long)g_panelNbExited
        << ",nbExitCode=" << (long long)g_nbExitCode
+       << ",nbStop[asked,closed,ended,failed,inFlight]=" << (long long)g_nbStopAsked << "," << (long long)g_nbStopClosed << ","
+       << (long long)g_nbStopEnded << "," << (long long)g_nbStopFailed << "," << g_nbStopping
        << ",linkState=" << coopui::PanelLinkStateName((int)::InterlockedCompareExchange(&g_panelStatusState, 0, 0))
        /* mp3: the Host a game screen's worlds - listed/skipped at the last scan, the rest are events */
        << ",worldScans=" << (long long)g_worldScans
@@ -6991,6 +7575,9 @@ std::string UiReportToken()
        << ",refusedAtCap=" << (long long)g_profRefusedAtCap
        << ",refusedShown=" << (long long)g_profRefusedShown
        << ",panelOpen=" << (long)::InterlockedCompareExchange(&g_panelWanted, 0, 0)
+       << ",playersTab=" << PlayersTabOpened()   /* T-545: the PLAYERS tab (EVENTS) */
+       << ",stanceSet=" << PlayersTabStanceSet()
+       << ",hostileConfirmed=" << PlayersTabHostileConfirmed()
        << "]";
     return ss.str();
 }

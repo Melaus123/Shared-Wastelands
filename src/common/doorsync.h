@@ -368,4 +368,163 @@ inline int DoorResolveAccept(int plausible, int stateOk, int parentMatches, int 
     return (keyEqual != 0) ? kDoorResolveAccept : kDoorResolveNoMatch;
 }
 
+/* ============================ THE PLAYED SWING AND THE LOCK ============================
+   The holder's word is followed the way the holder's own player saw it happen: a door that goes from
+   one settled state to the other is moved by DoorStuff::openDoor 0x297000 / closeDoor 0x298C10 - the
+   calls a character's own open uses - so the copy swings at the engine's own speed and plays the
+   engine's own Door_Open / Door_Close / Door_Shut sounds.  setDoorState 0x298FC0 (a snap) is kept for
+   the cases where nobody watched the door move: a gate the engine's physics setup forced open, a door
+   this game is hearing about for the first time, a swing the engine refused, and a swing that never
+   landed. */
+
+/* Why the applier is writing this door - the three apply reasons doors.cpp books. */
+const int kDoorWhyArrival    = 1;   /* the first word this game has heard about the door since it last agreed */
+const int kDoorWhyForcedOpen = 2;   /* setupPhysicalUT forced this game's gate open under a holder that says shut */
+const int kDoorWhyHolderWord = 3;   /* the holder published a change (or adopted one) since the last agreement */
+
+const int kDoorApplySnap = 0;   /* DoorStuff::setDoorState - state, node, physics and navmesh in one write */
+const int kDoorApplyPlay = 1;   /* DoorStuff::openDoor / closeDoor - OPENING / CLOSING, and the ramp lands it */
+
+/* A swing is played only for a holder's word about a door that is settled in the OTHER terminal state,
+   and only when the engine's open / close call passed its prologue check at install. */
+inline int DoorApplyHow(int why, int liveState, int holderState, int playCallOk)
+{
+    if (playCallOk == 0 || why != kDoorWhyHolderWord) return kDoorApplySnap;
+    if (liveState == kDoorClosed && holderState == kDoorOpen) return kDoorApplyPlay;
+    if (liveState == kDoorOpen && holderState == kDoorClosed) return kDoorApplyPlay;
+    return kDoorApplySnap;
+}
+/* What the engine call must have left behind for the swing to count as started. */
+inline int DoorPlayStartedState(int target) { return (target == kDoorOpen) ? kDoorOpening : kDoorClosing; }
+
+/* A SWING THIS GAME PLAYED IS ITS OWN WRITE UNTIL IT LANDS.  openDoor / closeDoor only set OPENING /
+   CLOSING; the per-frame update then moves the door and writes the terminal state through the funnel
+   frames later, outside the applier's own call.  Each change the funnel sees on a door with a played
+   swing outstanding is classified here, so the swing's own frames are never reported back to the
+   holder as something this game's world did. */
+const int kDoorPlayNone   = 0;   /* no played swing on this door: an ordinary change */
+const int kDoorPlayOwned  = 1;   /* the swing's own in-between state */
+const int kDoorPlayLanded = 2;   /* the swing reached its target: still ours, and the swing is over */
+const int kDoorPlayBroken = 3;   /* something else moved the door: the swing is over and this change is not ours */
+inline int DoorPlayNote(int target, int newState)
+{
+    if (target != kDoorOpen && target != kDoorClosed) return kDoorPlayNone;
+    if (newState == target) return kDoorPlayLanded;
+    if (newState == DoorPlayStartedState(target)) return kDoorPlayOwned;
+    return kDoorPlayBroken;
+}
+/* A played swing that has not landed inside this bound is finished with a snap.  The engine's ramp is
+   0.5 of the door's travel per second (DoorStuff+0x388 from the constructor), so a swing takes about
+   two seconds of game time; the bound is generous so a slow frame rate or a low game speed never
+   reaches it, and it is what stops a swing the update never drives from leaving the door mid-way.  The
+   times are on doors.cpp's UNPAUSED clock: the engine's door update does not move a door while the pause
+   byte (0x2133969) is set, so time spent paused never uses the bound up. */
+const unsigned long kDoorPlayLandMs = 15000;
+inline int DoorPlayOverdue(int target, unsigned long startMs, unsigned long nowMs)
+{
+    if (target != kDoorOpen && target != kDoorClosed) return 0;
+    return ((unsigned long)(nowMs - startMs) >= kDoorPlayLandMs) ? 1 : 0;
+}
+
+/* THE LOCK WORD - what travels in the DOOR_STATE lock byte.  bit 0 is DoorLock::locked (+0x20), the
+   lock as it is now; bit 1 is DoorStuff::wantsToLock (+0x384), the lock the door's owner asked for,
+   which the engine re-applies itself every time the door finishes closing (DoorStuff::update 0x298FF0
+   calls lockDoor when it is set).  Both are needed: a door told to lock while it stands open has
+   wantsToLock 1 and locked 0 until it shuts. */
+inline int DoorLockWord(int locked, int wants) { return ((locked != 0) ? 1 : 0) | ((wants != 0) ? 2 : 0); }
+inline int DoorLockWordValid(int w) { return (w >= 0 && w <= 3) ? 1 : 0; }
+inline int DoorLockWordLocked(int w) { return w & 1; }
+inline int DoorLockWordWants(int w) { return (w >> 1) & 1; }
+
+/* With the two games agreeing about OPEN / CLOSED, does the lock need anything?  The same last-actor
+   rule as the state: a lock this game's own world changed is reported (or, on the holder, adopted),
+   never put back by the applier; otherwise the holder's lock word is applied. */
+const int kDoorActLock = 6;   /* apply the holder's lock word through the engine's own lock calls */
+inline int DoorLockDecide(int liveWord, int holderWord, int localWrite, int weHold)
+{
+    if (DoorLockWordValid(holderWord) == 0 || DoorLockWordValid(liveWord) == 0) return kDoorActNothing;
+    if (liveWord == holderWord) return kDoorActNothing;
+    if (localWrite != 0) return (weHold == 1) ? kDoorActAdoptLocal : kDoorActReport;
+    return kDoorActLock;
+}
+/* A LOCK WORD NO DETOUR SAW.  The NPC close-then-lock action 0x337630 calls closeDoor and then writes
+   DoorLock::locked = 1 itself (wantsToLock untouched); on a door that is already shut closeDoor does nothing,
+   so no detour sees the lock.  doors.cpp keeps on every row the lock word this game last SAW (through a
+   detour) or WROTE (an apply of its own records what it left), so a live word that differs from it is this
+   game's own world acting: a LOCAL write, reported (not holder) or adopted (holder) like a hooked one, never
+   undone.  A word outside 0..3 on either side says nothing. */
+inline int DoorLockUnseenWrite(int liveWord, int rowWord)
+{
+    if (DoorLockWordValid(liveWord) == 0 || DoorLockWordValid(rowWord) == 0) return 0;
+    return (liveWord != rowWord) ? 1 : 0;
+}
+/* A PLAYED SWING THAT LANDS WITH A CHANGE OF THIS GAME'S OWN INSIDE IT - a lock pressed (a hooked local
+   write, localWrite set) or written by the NPC lock action (a word no detour saw) while the door was mid-way.
+   Only a terminal state is queued, so the landing is where that change goes out. */
+inline int DoorPlayLandReport(int localWrite, int rowWord, int liveWord)
+{
+    if (localWrite != 0) return 1;
+    return DoorLockUnseenWrite(liveWord, rowWord);
+}
+/* THE SAME TEST ON THIS GAME'S LIVE ROWS, for a door no word from the other game has named.  A close that did
+   nothing marks the door (the NPC lock action's first call), and the next tick compares its live lock word with
+   the row's: a door at rest - terminal, and in the state the row last recorded - whose word moved with no detour
+   seeing it is this game's own change, queued as a hooked one is (the holder publishes it, a non-holder reports
+   it).  A door mid-swing is left to its landing, where the funnel sees the word with the state. */
+inline int DoorLockSweepQueues(int liveState, int rowState, int liveWord, int rowWord)
+{
+    if (DoorStateIsTerminal(liveState) == 0 || liveState != rowState) return 0;
+    return DoorLockUnseenWrite(liveWord, rowWord);
+}
+/* ONE WRITE AT A TIME toward the holder's lock word; doors.cpp re-reads the door after each and asks again.
+   Each write is one the engine's own code makes (Confirmed from the 1.0.65 bytes and build/decomp_*.txt):
+     lockDoor   0x2969B0  wantsToLock = 1, and locked = 1 if the door is CLOSED and settled;
+     unlockDoor 0x569940  locked = 0, then the gate code is recomputed; wantsToLock untouched;
+     wantsToLock = 0      written directly, as lockButton 0x5465D0 writes it - no engine call clears it alone;
+     locked = 1           written directly, as the NPC lock action 0x337630 writes it - no engine call makes a
+                          lock without the wish (word 1) or a lock on a door that is not shut.
+   lockButton is never called to mirror: it posts Building_Lock_Unlock on the fixed sound object 0x6E, which
+   is heard wherever the listener stands, so a mirrored lock is silent.  Every word 0..3 is reachable on a
+   door that has a DoorLock. */
+const int kDoorLockStepNone       = 0;
+const int kDoorLockStepClearWants = 1;   /* wantsToLock = 0 */
+const int kDoorLockStepLock       = 2;   /* lockDoor */
+const int kDoorLockStepUnlock     = 3;   /* unlockDoor */
+const int kDoorLockStepSetLocked  = 4;   /* DoorLock::locked = 1 */
+const int kDoorLockStepWait       = 5;   /* mid-swing: the lock is looked at again once the door settles */
+inline int DoorLockStep(int liveState, int liveWord, int holderWord)
+{
+    if (DoorLockWordValid(holderWord) == 0 || DoorLockWordValid(liveWord) == 0) return kDoorLockStepNone;
+    if (liveWord == holderWord) return kDoorLockStepNone;
+    if (DoorStateIsTerminal(liveState) == 0) return kDoorLockStepWait;
+    {
+        const int hw = DoorLockWordWants(holderWord), lw = DoorLockWordWants(liveWord);
+        if (hw != 0 && lw == 0) return kDoorLockStepLock;
+        if (hw == 0 && lw != 0) return kDoorLockStepClearWants;
+        if (DoorLockWordLocked(holderWord) == 0) return kDoorLockStepUnlock;
+        if (hw != 0 && liveState == kDoorClosed) return kDoorLockStepLock;
+        return kDoorLockStepSetLocked;
+    }
+}
+/* lockDoor 0x2969B0 makes the wish on any door but the lock only on a door that is CLOSED and settled (its open
+   amount at or below the engine's threshold).  A lockDoor step that left the word as it was on a CLOSED door was
+   therefore refused for the open amount, and the step after it is the direct locked = 1 write - the lock the
+   engine itself makes there once the door settles. */
+inline int DoorLockStepAfterRefusal(int step, int liveState, int lockRefused)
+{
+    if (step == kDoorLockStepLock && lockRefused != 0 && liveState == kDoorClosed) return kDoorLockStepSetLocked;
+    return step;
+}
+/* The bound on one visit: the wish, then the lock - two writes reach any word from any other. */
+const int kDoorLockStepsPerVisit = 3;
+/* Consecutive visits whose lock write did not move the word before this door stops being lock-corrected
+   until the two games agree about its lock again (lesson 14). */
+const int kDoorLockGiveUpN = 3;
+/* Why the applier could not bring the lock to the holder's word.  The open / closed state agrees, so the row
+   takes the agreement clears as for full agreement, and doors.cpp counts the event once (a row latch). */
+const int kDoorLockStuckNone   = 0;   /* applied, or still on its way (mid-swing, a step not yet effective) */
+const int kDoorLockStuckNoLock = 1;   /* the door has no DoorLock */
+const int kDoorLockStuckNoCall = 2;   /* lockDoor / unlockDoor did not pass its prologue check */
+const int kDoorLockStuckGaveUp = 3;   /* kDoorLockGiveUpN ineffective visits */
+
 }   /* namespace coopdoor */

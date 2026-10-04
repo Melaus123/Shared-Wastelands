@@ -27,6 +27,7 @@
 #include "peace.h"
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "playerfaction.h"
+#include "../common/teamally.h"   /* T-546 (owner 512): the team pair - ally / not-enemy as for one faction */
 #include "coop_log.h"
 #include "game/GameWorld.h"
 #include "game/Faction.h"
@@ -125,6 +126,7 @@ volatile LONG64 g_neitherSidePlayer = 0;    /* the gate was ASKED and answered n
    two melee finders - these are the only calls whose answer the lever can change); passedThrough counts ally
    calls from every OTHER site, which now get the engine's own answer. Their sum is allyCalls. */
 volatile LONG64 g_allyGatedByRet = 0, g_allyPassedThrough = 0;
+bool PlausiblePtrPod(const void* p) { return p != 0 && (uintptr_t)p > 0x10000 && (uintptr_t)p < 0x00007FFFFFFFFFFFull; }
 /* F618: the treatsAsEnemy flip measured against an engine with BOTH hooks bypassed on this thread. hostileSuppressed
    alone cannot say whether the lever flipped an answer or whether the ally hook had already done the work
    upstream - isEnemyOf calls isAllyOf twice through iShouldntAggravateThisTarget 0x855AD0 - and a zero
@@ -159,6 +161,42 @@ int PeaceAllyRetAnswered(const void* ret)
         for (i = 0; i < kAllyRetCount; ++i) if (kAllyRets[i] != 0 && rva == (uintptr_t)kAllyRets[i]) return 1;   /* an empty row is no caller */
     }
     return 0;
+}
+
+/* T-546 (owner 512): THE TEAM SET - this game's player faction and its teammates' factions (swteamally::CellsWrite), written by
+   the main thread at every write of the team cells (policy.cpp PolicyTeammateFactions, from team.cpp), read by any thread as
+   plain pointer compares; never followed. g_teamHeld 0 = this game's player is in no team: one load and the detours go on as
+   before. teamAlly / teamNotEnemy count the answers given for a team pair; teamDoubt a faction that would not read (the
+   engine's own answer stands). */
+void* volatile g_teamCells[swteamally::kCells];
+volatile LONG g_teamHeld = 0;
+volatile LONG64 g_teamAlly = 0, g_teamNotEnemy = 0, g_teamDoubt = 0, g_teamWrites = 0;
+
+/* The owner faction of a character through its own vtable slot +0x58 - the call isAllyOf / isEnemyOf make first. 1 read, 0 a
+   fault. AI-THREAD SAFE: no allocation, no string, no lock. */
+int OwnerFactionPod(void* obj, void** f)
+{
+    *f = 0;
+    __try
+    {
+        if (((uintptr_t)obj & 7) != 0) return 0;
+        void** vtbl = *(void***)obj;
+        if (!PlausiblePtrPod(vtbl)) return 0;
+        GetFactionFn gf = (GetFactionFn)vtbl[kGetFactionSlot];
+        if (!PlausiblePtrPod((const void*)gf)) return 0;
+        *f = gf(obj);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* 1 = self and who belong to two different factions both in this player's team (the engine's same-faction exit is answered for
+   them), 0 = they do not (or no team), -1 = a faction would not read. ANY THREAD. */
+int TeamPairPod(void* self, void* who)
+{
+    if (g_teamHeld == 0 || self == 0 || who == 0) return 0;
+    void* fa = 0; void* fb = 0;
+    if (OwnerFactionPod(self, &fa) == 0 || OwnerFactionPod(who, &fb) == 0) return -1;
+    return swteamally::TeamPair(fa, fb, g_teamCells, swteamally::kCells) ? 1 : 0;
 }
 
 bool g_installed = false;
@@ -228,6 +266,13 @@ char detour_isEnemy(void* self, void* who, char disguises)
        and while the bypass is up this detour is a pass-through as well - otherwise the probe would measure an
        engine we are still modifying, which is the very thing it exists to escape. */
     if (PeaceHooksBypassedHere() != 0) return orig_isEnemy(self, who, disguises);
+    if (g_teamHeld != 0)
+    {
+        /* T-546 (owner 512): a team pair is answered as the engine answers one faction - not an enemy, before anything else */
+        const int team = TeamPairPod(self, who);
+        if (team == 1) { ::InterlockedIncrement64(&g_teamNotEnemy); return 0; }
+        if (team < 0) ::InterlockedIncrement64(&g_teamDoubt);
+    }
     {
         const char engine = orig_isEnemy(self, who, disguises);   /* ask the ENGINE first: it does all the null and
                                                                      plausibility work, and how many answers the lever
@@ -272,6 +317,14 @@ char detour_isAlly(void* self, void* who, char disguises)
     /* THE RETURN ADDRESS IS TAKEN FIRST, before anything else can disturb the frame. */
     const void* const ret = _ReturnAddress();
     if (PeaceHooksBypassedHere() != 0) return orig_isAlly(self, who, disguises);
+    if (g_teamHeld != 0)
+    {
+        /* T-546 (owner 512): a team pair is answered as the engine answers one faction - an ally, before anything else, for
+           every caller (the fight pickers, rememberCharacter's mark, medics, carrying and the rest alike) */
+        const int team = TeamPairPod(self, who);
+        if (team == 1) { ::InterlockedIncrement64(&g_teamAlly); return 1; }
+        if (team < 0) ::InterlockedIncrement64(&g_teamDoubt);
+    }
     {
         const char engine = orig_isAlly(self, who, disguises);
         if (g_peaceOn == 0) return engine;
@@ -478,6 +531,30 @@ void InstallHooks()
 
 namespace coop {
 
+void PeaceTeamFactions(void* own, void* const* mates, int n)
+{
+    const int held = swteamally::CellsWrite(g_teamCells, swteamally::kCells, own, mates, n);
+    ::InterlockedExchange(&g_teamHeld, (LONG)held);
+    ::InterlockedIncrement64(&g_teamWrites);
+}
+
+bool PeaceTeamPairAnyThread(const void* a, const void* b)
+{
+    if (g_teamHeld == 0) return false;
+    return swteamally::TeamPair(a, b, g_teamCells, swteamally::kCells);
+}
+
+int PeaceTeamPairOfCharacters(void* a, void* b)
+{
+    return TeamPairPod(a, b);
+}
+
+std::string PeaceTeamTokens()
+{
+    return " team[held,ally,notEnemy,doubt,writes]=" + S((long long)g_teamHeld) + "," + S((long long)g_teamAlly) + "," + S((long long)g_teamNotEnemy)
+         + "," + S((long long)g_teamDoubt) + "," + S((long long)g_teamWrites);
+}
+
 void InstallPeace()
 {
     if (g_installed) return;
@@ -524,6 +601,9 @@ void ReportPeace()
              + " hooks(treatsAsEnemy,isAlly)=" + S((long long)g_enemyHook) + "," + S((long long)g_allyHook)
              + " onEdges=" + S(g_onEdges) + " offEdges=" + S(g_offEdges) + " walks=" + S(g_walks)
              + " walksWithNoWorld=" + S(g_walkNoWorld)
+             + PeaceTeamTokens()
+             + "  |  team[...]: this game's player faction and its teammates' factions are answered ally / not-enemy for each other"
+               " before the engine is asked, as it answers one faction (T-546, owner 512); held = factions in the team set (0 = no team)."
              + "  |  peace[on,queriesAnswered,hostileSuppressed,allyForced,fallthrough]."
                " queriesAnswered counts EVERY isEnemyOf/isAllyOf call made while the lever was on - including"
                " the ones it left to the engine (neitherSidePlayer + fallthrough) - and NOT the ones whose answer"

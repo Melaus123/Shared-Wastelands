@@ -33,6 +33,7 @@
 #include <cstdio>
 #include "gpoptions.h"   /* mp5: the notebook's own gp.* / gt.* range check */
 #include "diskformat.h"  /* the newer-format refusal words */
+#include "resurrectfee.h" /* T-556: the resurrection options' keys and the price rule the fee explanation shows */
 
 namespace coopui {
 
@@ -842,6 +843,14 @@ inline int BoxBlockStrips(int pw, int ph, int l, int t, int w, int h, int* out)
 /* PP6b - the name-taken box (title CAN'T JOIN by NoticeTitle). */
 inline std::string NameTakenText(const std::string& name)
 { return "The name \"" + name + "\" is already taken in this world. Change PLAYER NAME and try again."; }   /* T-201 N1: double quotes */
+/* T-368 (owner 270 a, exact words): the two boxes about this player's faction name, shown in the game world in Kenshi's own message box
+   with Kenshi's own "Faction Name" title and one OK. Back = a rename another player made at the same moment won the name; Moved = the
+   world loaded with a name another player of this world already uses. */
+const char* const kFactionBoxTitle = "Faction Name";
+inline std::string FactionBackText(const std::string& asked, const std::string& old)
+{ return "Your faction name \"" + asked + "\" is already taken in this world, so it was changed back to \"" + old + "\"."; }
+inline std::string FactionMovedText(const std::string& asked, const std::string& now)
+{ return "Another player in this world already uses the faction name \"" + asked + "\". Your faction is now called \"" + now + "\". You can rename it on the FACTION tab."; }
 /* PP6 - after PLAY on PROFILES: a played profile loads, a never-played one opens Kenshi's NEW GAME. */
 inline std::string ProfLoadingText(const std::string& name)     { return "Loading \"" + name + "\"..."; }   /* T-201 N1: double quotes */
 inline std::string ProfOpeningNewGameText(const std::string& name) { return "Opening NEW GAME for \"" + name + "\"..."; }
@@ -951,8 +960,9 @@ inline std::string PanelPlayersText(const std::string& me, const std::vector<std
    Attacks on your base 0-5 with 5 = off, limb loss 0-3: shown as numbers, the engine's own labels not read.
    gp.ae, gp.dh, gt.civ (no visible effect, design-settings1) and researchmode (hidden until L2c') are not rows. */
 enum { kOptTabDifficulty = 0, kOptTabWorld = 1, kOptTabCoop = 2, kOptTabCount = 3 };
-enum { kOptKindDifficulty = 0, kOptKindWorld = 1, kOptKindTick = 2, kOptKindPick = 3 };
-const int kOptCount = 19;   /* ui5: + PROFILES PER PLAYER */
+/* kOptKindSwitch: a tick box whose values are "on" / "off" (the world server's words); kOptKindAmount: a typing box of digits. */
+enum { kOptKindDifficulty = 0, kOptKindWorld = 1, kOptKindTick = 2, kOptKindPick = 3, kOptKindSwitch = 4, kOptKindAmount = 5 };
+const int kOptCount = 22;   /* ui5: + PROFILES PER PLAYER; T-556: + RESURRECTION, RESURRECTION FEE, FEE GROWTH */
 const int kOptRowsShown = 9;   /* the most rows one tab has (Difficulty) */
 struct OptDef { int tab; const char* key; const char* label; int kind; const char* dflt; };
 inline const OptDef* OptDefs()
@@ -978,11 +988,16 @@ inline const OptDef* OptDefs()
         { kOptTabCoop, "timemode", "GAME SPEED CONTROL", kOptKindPick, "fixed" },
         /* ui5 (approved 2026-09-27): the host option prof1 reads (profiles.h kCapMin..kCapMax, default kCapDefault); the
            world server accepts it from the host (store_main.cpp OptionValueOk "profilecap"). */
-        { kOptTabCoop, "profilecap", "PROFILES PER PLAYER", kOptKindPick, "3" } };
+        { kOptTabCoop, "profilecap", "PROFILES PER PLAYER", kOptKindPick, "3" },
+        /* T-556 (owner 485, 491, 497; the wording and layout approved in decision 509): the resurrection options the world
+           server keeps (resurrectfee.h) - off, 1000 and steep unless the host changes them. */
+        { kOptTabCoop, "resurrect", "RESURRECTION", kOptKindSwitch, "off" },
+        { kOptTabCoop, "resurrectfee", "RESURRECTION FEE", kOptKindAmount, "1000" },
+        { kOptTabCoop, "resurrectgrowth", "FEE GROWTH", kOptKindPick, "steep" } };
     return d;
 }
 struct OptChoice { const char* key; const char* wire; const char* shown; };
-const int kOptChoiceCount = 36;   /* ui5: + profilecap 1..16 */
+const int kOptChoiceCount = 38;   /* ui5: + profilecap 1..16; T-556: + resurrectgrowth */
 inline const OptChoice* OptChoices()
 {
     static const OptChoice c[kOptChoiceCount] = {
@@ -996,7 +1011,8 @@ inline const OptChoice* OptChoices()
         { "profilecap", "1", "1" }, { "profilecap", "2", "2" }, { "profilecap", "3", "3" }, { "profilecap", "4", "4" },
         { "profilecap", "5", "5" }, { "profilecap", "6", "6" }, { "profilecap", "7", "7" }, { "profilecap", "8", "8" },
         { "profilecap", "9", "9" }, { "profilecap", "10", "10" }, { "profilecap", "11", "11" }, { "profilecap", "12", "12" },
-        { "profilecap", "13", "13" }, { "profilecap", "14", "14" }, { "profilecap", "15", "15" }, { "profilecap", "16", "16" } };
+        { "profilecap", "13", "13" }, { "profilecap", "14", "14" }, { "profilecap", "15", "15" }, { "profilecap", "16", "16" },
+        { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" } };
     return c;
 }
 inline const double* OptLadder(int kind, int* n)
@@ -1020,6 +1036,104 @@ inline int OptIndexOf(int tab, int row)
     }
     return -1;
 }
+/* The option whose key is `key`, or -1. */
+inline int OptIndexOfKey(const char* key)
+{
+    for (int i = 0; i < kOptCount; ++i) if (std::string(OptDefs()[i].key) == key) return i;
+    return -1;
+}
+/* How many rows `tab` shows. */
+inline int OptTabRows(int tab)
+{
+    int k = 0;
+    for (int i = 0; i < kOptCount; ++i) if (OptDefs()[i].tab == tab) ++k;
+    return k;
+}
+/* The row `tab` shows option i on, or -1. */
+inline int OptRowOf(int tab, int i)
+{
+    for (int r = 0; r < kOptRowsShown; ++r) if (OptIndexOf(tab, r) == i) return r;
+    return -1;
+}
+/* A row drawn as a tick box (the stepper's column holds the box). */
+inline bool OptIsTick(int i) { return i >= 0 && i < kOptCount && (OptDefs()[i].kind == kOptKindTick || OptDefs()[i].kind == kOptKindSwitch); }
+inline bool OptTickOn(int i, const std::string& v) { return OptIsTick(i) && (v == "1" || v == "on"); }
+
+/* THE RESURRECTION FEE BOX (decision 509): digits only, at most 6 (0 to 999,999 cats). The world server accepts larger
+   amounts (resurrectfee.h AmountCode); the box keeps to the approved page's narrower range. */
+const int kFeeBoxDigits = 6;
+/* What the box keeps of a typed text: its digits, the first kFeeBoxDigits of them - any other key does nothing. */
+inline std::string OptFeeBoxFilter(const std::string& typed)
+{
+    std::string out;
+    for (size_t k = 0; k < typed.size() && (int)out.size() < kFeeBoxDigits; ++k)
+        if (typed[k] >= '0' && typed[k] <= '9') out += typed[k];
+    return out;
+}
+/* The amount the box's text stands for, without leading zeros ("0050" -> "50", "000" -> "0"); "" when it is empty, holds
+   anything but digits, or has more than kFeeBoxDigits digits. */
+inline std::string OptFeeCanon(const std::string& v)
+{
+    if (v.empty() || (int)v.size() > kFeeBoxDigits) return std::string();
+    for (size_t k = 0; k < v.size(); ++k) if (v[k] < '0' || v[k] > '9') return std::string();
+    const size_t nz = v.find_first_not_of('0');
+    return nz == std::string::npos ? std::string("0") : v.substr(nz);
+}
+/* The row's value for the box's text: the amount typed, or - for an empty box - the value it had when the screen opened. */
+inline std::string OptFeeBoxValue(const std::string& typed, const std::string& opened)
+{
+    const std::string c = OptFeeCanon(typed);
+    return c.empty() ? opened : c;
+}
+/* Kenshi's own money style: c.1,000 (its money bar). */
+inline std::string OptMoneyText(long long v)
+{
+    char b[32];
+    _snprintf(b, sizeof b - 1, "%lld", v < 0 ? 0LL : v);
+    b[sizeof b - 1] = 0;
+    const std::string d(b);
+    std::string out;
+    for (size_t k = 0; k < d.size(); ++k)
+    {
+        if (k > 0 && (d.size() - k) % 3 == 0) out += ',';
+        out += d[k];
+    }
+    return "c." + out;
+}
+/* The line under FEE GROWTH: what the growth means with the host's amount filled in - the prices with one to four of a
+   player's brought-back characters alive. Empty while RESURRECTION is not ticked. */
+inline std::string OptFeeExplain(const std::string& on, const std::string& amount, const std::string& growth)
+{
+    if (on != "on") return std::string();
+    const std::string a = OptFeeCanon(amount);
+    long long n = 0;
+    for (size_t k = 0; k < a.size(); ++k) n = n * 10 + (a[k] - '0');
+    if (n == 0) return "Bringing back a fallen character is free.";
+    const int g = swfee::GrowthCode(growth) == swfee::kGrowthSteady ? swfee::kGrowthSteady : swfee::kGrowthSteep;
+    std::string s = "The more of a player's brought-back characters are alive, the more the next costs: free with none, then ";
+    for (int alive = 1; alive <= 4; ++alive) s += OptMoneyText(swfee::PriceFor(n, g, alive).price) + (alive < 4 ? ", " : " ...");
+    return s;
+}
+/* Whether row i is lit (not greyed) with the screen's values `vals` (indexed like OptDefs): RESURRECTION FEE and FEE GROWTH
+   grey while RESURRECTION is not ticked; FEE GROWTH also greys at an amount of 0 (always free). Their values are kept. */
+inline bool OptRowLit(int i, const std::string* vals)
+{
+    if (i < 0 || i >= kOptCount) return false;
+    const std::string k = OptDefs()[i].key;
+    if (k != swfee::kKeyAmount && k != swfee::kKeyGrowth) return true;
+    const int on = OptIndexOfKey(swfee::kKeyOn);
+    if (on < 0 || vals[on] != "on") return false;
+    if (k == swfee::kKeyAmount) return true;
+    const int am = OptIndexOfKey(swfee::kKeyAmount);
+    return am >= 0 && OptFeeCanon(vals[am]) != "0";
+}
+/* The note under a tab's rows: the Difficulty tab's Animal nests note, the Multiplayer tab's mods line. */
+inline std::string OptNoteText(int tab)
+{
+    if (tab == kOptTabDifficulty) return "Animal nests: only affects areas not yet visited.";
+    if (tab == kOptTabCoop) return "All players must use the same mods as the host.";
+    return std::string();
+}
 /* The notebook's float text: the same %.9g of a float that settings.cpp writes, so the texts compare equal. */
 inline std::string OptFloatText(double d)
 {
@@ -1034,6 +1148,8 @@ inline std::string OptCanon(int i, const std::string& v)
     if (i < 0 || i >= kOptCount) return std::string();
     const OptDef& d = OptDefs()[i];
     if (d.kind == kOptKindTick) return (v == "0" || v == "1") ? v : std::string();
+    if (d.kind == kOptKindSwitch) return (v == "on" || v == "off") ? v : std::string();
+    if (d.kind == kOptKindAmount) return OptFeeCanon(v);
     if (d.kind == kOptKindPick)
     {
         for (int c = 0; c < kOptChoiceCount; ++c)
@@ -1044,13 +1160,15 @@ inline std::string OptCanon(int i, const std::string& v)
     if (!coopgp::GpKindValueOk(coopgp::kGpFloat, v, &x)) return std::string();
     return OptFloatText(x);
 }
-/* One step of row i: dir -1 down, +1 up (a tick box flips).  At an end the same value comes back.  A value between
-   two steps (a world recorded elsewhere) moves to the next step in that direction. */
+/* One step of row i: dir -1 down, +1 up (a tick box flips; a typing box does not step).  At an end the same value comes
+   back.  A value between two steps (a world recorded elsewhere) moves to the next step in that direction. */
 inline std::string OptStep(int i, const std::string& cur, int dir)
 {
     if (i < 0 || i >= kOptCount) return cur;
     const OptDef& d = OptDefs()[i];
     if (d.kind == kOptKindTick) return cur == "1" ? std::string("0") : std::string("1");
+    if (d.kind == kOptKindSwitch) return cur == "on" ? std::string("off") : std::string("on");
+    if (d.kind == kOptKindAmount) return cur;
     if (d.kind == kOptKindPick)
     {
         std::vector<std::string> w;
@@ -1070,12 +1188,14 @@ inline std::string OptStep(int i, const std::string& cur, int dir)
     return cur;
 }
 inline bool OptCanStep(int i, const std::string& cur, int dir) { return OptStep(i, cur, dir) != cur; }
-/* What row i shows for its value: "1.0x", "0.25x", a choice's words, or "Unknown".  A tick box shows nothing. */
+/* What row i shows for its value: "1.0x", "0.25x", a choice's words, or "Unknown".  A tick box shows nothing; a typing
+   box shows its digits. */
 inline std::string OptShown(int i, const std::string& cur)
 {
     if (i < 0 || i >= kOptCount) return std::string();
     const OptDef& d = OptDefs()[i];
-    if (d.kind == kOptKindTick) return std::string();
+    if (d.kind == kOptKindTick || d.kind == kOptKindSwitch) return std::string();
+    if (d.kind == kOptKindAmount) return cur;
     if (cur.empty()) return "Unknown";
     if (d.kind == kOptKindPick)
     {
@@ -1125,6 +1245,89 @@ inline std::vector<std::pair<std::string, std::string> > OptChanged(const std::s
         if (!c.empty() && c != OptCanon(i, was[i])) out.push_back(std::make_pair(std::string(OptDefs()[i].key), c));
     }
     return out;
+}
+
+/* A HOST / JOIN PRESS PREPARES; THE GAME KEEPS ITS ROLE ONLY INTO A WORLD (owner decision 470). The press arms the role at the
+   title because the world must answer before the world can start (its profile lobby, the profile admitted, the save folder decided).
+   Once the panel and its steps are done, the title pump asks this every tick and cancels the role when the title is back with no
+   world on its way, so a player never holds a host or joiner role while Kenshi's own CONTINUE / NEW GAME / LOAD GAME / IMPORT GAME
+   show. ui.cpp keeps the phase: kPrepArmed - a press armed the role (its panel steps run while the panel is open); kPrepWindowWait -
+   the press opened Kenshi's NEW GAME window and it has not been seen up yet; kPrepWindowSeen - that window has been seen up;
+   kPrepPosted - the press posted the load. */
+enum PrepPhase { kPrepNone = 0, kPrepArmed = 1, kPrepWindowWait = 2, kPrepWindowSeen = 3, kPrepPosted = 4 };
+struct PrepFacts
+{
+    int phase;          /* PrepPhase */
+    int roleSingle;     /* the role is single already (a CANCEL, a failure box or another leave came first) */
+    int panelWanted;    /* the MULTIPLAYER panel is open - its own CANCEL / X / Escape leave */
+    int pressBusy;      /* a press or its load steps are running */
+    int requestCode;    /* SaveManager+0xA0: 0 none, 1 save, 2 load, 3 import, 4 new game; -1 unreadable */
+    int reshowPending;  /* a refused NEW GAME's window comes back on the next title tick */
+    int windowShown;    /* Kenshi's NEW GAME window is up */
+    unsigned waitedMs;  /* kPrepWindowWait: ms since the press opened the NEW GAME window */
+    PrepFacts() : phase(0), roleSingle(0), panelWanted(0), pressBusy(0), requestCode(0), reshowPending(0), windowShown(0), waitedMs(0) {}
+};
+/* kPrepWindowWait's end: the NEW GAME window the press opened (or a request) appears within this; otherwise the role is cancelled
+   like a back-out. Asked every tick, never a one-shot wait. */
+const unsigned kPrepWindowWaitMs = 5000;
+/* kPrepKeep - nothing changes; kPrepCancel - leave (role single, the world server's link closed); kPrepSeen - the NEW GAME window is up
+   (the phase becomes kPrepWindowSeen); kPrepForget - the role is single already, the phase goes; kPrepUnread - the engine's pending
+   request cannot be read, so whether a world is on its way is unknown: the role is kept; kPrepCancelForeign - a load, import or new game
+   the press did not post (Kenshi's own CONTINUE / LOAD GAME / IMPORT GAME, which stay clickable beside the NEW GAME window): the role is
+   left before that request runs, so it runs as a single-player game. The press's own requests: kPrepPosted's load, and the new game
+   (code 4) from the NEW GAME window it opened. */
+enum PrepStepKind { kPrepKeep = 0, kPrepCancel = 1, kPrepSeen = 2, kPrepForget = 3, kPrepUnread = 4, kPrepCancelForeign = 5 };
+inline int PrepStep(const PrepFacts& f)
+{
+    if (f.phase == kPrepNone) return kPrepKeep;
+    if (f.roleSingle != 0) return kPrepForget;
+    if (f.panelWanted != 0 || f.pressBusy != 0) return kPrepKeep;
+    if (f.requestCode >= 2 && f.requestCode <= 4)
+    {
+        if (f.phase == kPrepPosted) return kPrepKeep;
+        if (f.requestCode == 4 && (f.phase == kPrepWindowWait || f.phase == kPrepWindowSeen)) return kPrepKeep;
+        return kPrepCancelForeign;
+    }
+    if (f.reshowPending != 0) return kPrepKeep;
+    if (f.phase == kPrepWindowWait)
+    {
+        if (f.windowShown != 0) return kPrepSeen;
+        if (f.waitedMs < kPrepWindowWaitMs) return kPrepKeep;   /* the window this press opened is not up yet */
+    }
+    else if (f.phase == kPrepWindowSeen && f.windowShown != 0) return kPrepKeep;
+    if (f.requestCode < 0) return kPrepUnread;
+    return kPrepCancel;
+}
+/* STOPPING THE WORLD SERVER THIS GAME STARTED, when this game leaves a HOST without a world: its hidden close window is sent WM_CLOSE
+   (looked for again until it is found - the server makes it first, and a close during its start-up waits for the step in hand); it then
+   writes every queued write and ends, the same quit as its own close button. It is ended outright only when it has not ended within
+   kNbStopGraceMs - the world server's own drain limit (store_main.cpp kQuitWaitMs, 60 s) and 5 s more. Asked every tick, never waited
+   on. kNbStopDone: the process has ended (by itself, or after the end); kNbStopEnd: end it now; kNbStopWait: ask again next tick;
+   kNbStopGiveUp: TerminateProcess was called kNbStopEndWaitMs ago and the exit is still not seen - the handle is dropped and the stop
+   is over (a port it still holds fails the next HOST into its own failure box). */
+const unsigned kNbStopGraceMs = 65000;
+const unsigned kNbStopEndWaitMs = 5000;
+enum NbStopStepKind { kNbStopWait = 0, kNbStopDone = 1, kNbStopEnd = 2, kNbStopGiveUp = 3 };
+inline int NbStopStep(int exited, int ended, unsigned waitedMs, unsigned sinceEndMs)
+{
+    if (exited != 0) return kNbStopDone;
+    if (ended != 0) return sinceEndMs >= kNbStopEndWaitMs ? kNbStopGiveUp : kNbStopWait;   /* the exit is normally seen on a later tick */
+    return waitedMs >= kNbStopGraceMs ? kNbStopEnd : kNbStopWait;
+}
+/* kPrepCancelForeign's reason, for its log line. */
+inline const char* PrepForeignWhy(int requestCode)
+{
+    if (requestCode == 2) return "Kenshi's own CONTINUE / LOAD GAME asked for a load the press did not post - it loads as a single-player game";
+    if (requestCode == 3) return "Kenshi's own IMPORT GAME asked for an import the press did not post - it runs as a single-player game";
+    return "a new game the press did not open was asked for - it starts as a single-player game";
+}
+/* The cancel's reason, for its log line. */
+inline const char* PrepCancelWhy(int phase)
+{
+    if (phase == kPrepWindowSeen) return "the NEW GAME window closed without starting a world";
+    if (phase == kPrepPosted) return "the load did not start a world";
+    if (phase == kPrepWindowWait) return "the NEW GAME window did not come up";
+    return "the MULTIPLAYER panel closed before a world started";
 }
 
 }   /* namespace coopui */

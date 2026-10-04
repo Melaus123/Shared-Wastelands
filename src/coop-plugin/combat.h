@@ -54,6 +54,10 @@ bool CombatModeResendOwned(unsigned int uid);
 // K2 safe point (combat.cpp detour_tsRagdollUpdates, MAIN THREAD, worker paused): each queued MSG_SHOT through the engine's
 // MedicalSystem::addWound on our own character - wounds, damage, blood, knock-out and death are the engine's.
 void ShotSafePointDrain();
+// T-546 (owner 512), MAIN THREAD, READ ONLY: `ffshow <uid1> <uid2>` - both directions' isAllyOf / isEnemyOf (through the hooked
+// entries), temporary-enemy / temporary-ally marks, attacker and threat lists, combat target and mode; one [FF] line at the next
+// K2 safe point. Returns the status.
+std::string FfShowLever(const std::string& args);
 
 // K2 (decision 61 follow-up) - a copy's fall starts on the SAME hit that knocked its owner down.
 // Owner side: medical.cpp's applyDamage detour calls this, on whatever thread applies the hit (the AI

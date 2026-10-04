@@ -987,7 +987,8 @@ void ConfigLeave(const char* why)
     g_lastDialMs = 0;
     DebugLog(std::string("[CFG] T-201 N1: LEFT (") + (why ? why : "?") + "): role " + RoleName(was) + " -> single, the session "
              + (linked ? "was linked and is closed (BYE sent)" : "is closed") + ", the store link is closed, the title-screen latch and the"
-             " dial count are reset - the next HOST / JOIN press arms from nothing, no restart. The world server process is left running.");
+             " dial count are reset - the next HOST / JOIN press arms from nothing, no restart. A world server this game started is stopped by"
+             " the HOST's leave (ui.cpp HostLeave), not here.");
 }
 
 void ConfigSetRole(int role, const char* why)

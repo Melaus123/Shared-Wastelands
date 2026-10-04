@@ -24,11 +24,23 @@
 // which ADOPTS it, applies it and republishes, so both games converge on the last actor.  Two actors inside
 // one round trip resolve to the holder's most recent adopted state.  The decisions are pure and live in
 // src/common/doorsync.h, swept offline by src/coop-test/test_main.cpp.
+//
+// HOW THE HOLDER'S WORD LANDS.  A holder's change to a door that is settled in the other state is PLAYED
+// with the engine's own DoorStuff::openDoor / closeDoor - the calls a character's open uses - so the copy
+// swings at the engine's speed with the engine's sounds, and the swing's frames are this game's own write
+// until it lands (never reported back).  A door nobody watched move - a gate physics setup forced open, a
+// first word about a door, a swing the engine refused or one that never landed - is SNAPPED with
+// setDoorState.  Once the two games agree about OPEN / CLOSED, the holder's LOCK WORD (DoorLock::locked
+// and DoorStuff::wantsToLock) is applied with the engine's own lockDoor / unlockDoor and, where no engine
+// call produces the word, the direct write the engine's own code makes - silently, because lockButton's sound
+// is heard everywhere - under the same last-actor rule.  A live lock word no detour saw (the NPC lock action
+// on a shut door) is this game's own change: reported or adopted, never undone.  The decisions are coopdoor::DoorApplyHow, DoorPlayNote, DoorLockDecide and
+// DoorLockStep.
 #pragma once
 #include <string>
 namespace coop {
 
-// PRELOAD, MAIN THREAD: the three detours (the funnel, openDoor, closeDoor), each PROLOGUE-CHECKED
+// PRELOAD, MAIN THREAD: the five detours (the funnel, openDoor, closeDoor, lockDoor, lockButton), each PROLOGUE-CHECKED
 // against the bytes read out of this build's own exe before it is hooked (F038/F530).
 void InstallDoors();
 // MAIN THREAD, every frame, and the idle cost is the session-link read plus one interlocked read:
@@ -39,7 +51,8 @@ void DoorsTick();
 // MAIN THREAD, from the store's teardown broadcast: the registry names doors in the world being
 // destroyed and the holder table names keys that belong to it.
 void DoorsWorldTeardown();
-// MAIN THREAD: one MSG_DOOR_STATE off the session link.  P8n: `origin` is the message's optional
+// MAIN THREAD: one MSG_DOOR_STATE off the session link.  `locked` is the lock word (bit 0 locked, bit 1
+// wantsToLock - coopdoor::DoorLockWord); a value outside 0..3 is malformed.  P8n: `origin` is the message's optional
 // trailing byte - coopdoor::kDoorOriginHolder (0, and what an absent byte means) is the area holder's
 // answer; kDoorOriginActor (1) is a non-holder telling the holder what its own world just did.  An
 // actor report is NOT stored as the holder's answer here: whether this game holds the door needs the
@@ -59,6 +72,8 @@ void DoorsOnZoneDeactivate();
 // recorded owner, or a door its door array lists right now - is dropped BEFORE the flip, so no row outlives the door it names. The
 // next funnel call on a new door re-registers it. Pointer compares and one POD read of the building; no virtual call.
 void DoorsForgetOwner(void* building);
+// MAIN THREAD, TEST-ONLY (T-160): `doortest open|close|lock|npclock|show <nearest|last|key>` / `doortest show held` - see doors.cpp.
+std::string DoorTestCommand(const std::string& arg);
 unsigned long long DoorsOpenDoorRva();   /* P18 fold 1: DoorStuff::openDoor (1.0.65 0x297000), 0 = no address row */
 // MAIN THREAD, from OnDoorState: the message's trailing origin byte was neither 0 nor 1, so the
 // message was IGNORED rather than taken as the area holder's word (P8n-b, review-p8n L-8).

@@ -351,6 +351,7 @@ bool PauseSnapshot(bool* paused, float* speedMul)
     // answering after a quit to menu, reporting the pause state of a world nobody is in.
     if (!GameplayRunning()) return false;      // no gameplay - say so, do not answer
     if (!PlausiblePtr(coop::GameWorldPtr())) return false;
+    if (!coop::GameWorldPtr()->frameSpeedScaleBound()) return false;   // T-573: an unbound speed row is no reading, not a speed of 0
     *paused   = coop::GameWorldPtr()->isPaused();
     *speedMul = coop::GameWorldPtr()->frameSpeedScale();
     return true;
@@ -634,6 +635,12 @@ int AnnouncedState(unsigned int uid)
 void NoteAnnouncedOnTake(unsigned int uid)
 {
     if (uid != 0) g_announced[uid] = 1;
+}
+/* T-556: a character this game made whose SPAWN did not go out - an explicit "not announced", so the 1 Hz announce pass sends
+   CONTEXT + SPAWN for it (AnnounceDecide kAnnSpawn) once another game holds its sector. */
+void NoteNotAnnounced(unsigned int uid)
+{
+    if (uid != 0) g_announced[uid] = 0;
 }
 int WithdrawReloadedCopy(unsigned int uid, bool wasAnnounced)
 {

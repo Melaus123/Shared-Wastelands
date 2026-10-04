@@ -139,7 +139,7 @@ void* WorldPtr();
 // advance this tick). A pointer test cannot answer this: `ou` is a static in the exe image and is
 // never null (F034/F333), and a cumulative `MainLoopFrames() > 0` answers "has gameplay EVER
 // started", which stays true forever after a quit to menu (F337). The caller prints the refusal as
-// itself rather than as a plausible zero.
+// itself rather than as a plausible zero. Also false when the frameSpeedScale row is unbound: its 0.0 is not a speed.
 bool PauseSnapshot(bool* paused, float* speedMul);
 
 // H030: true when this uid was announced to the peer (or predates the announce gate). The stream senders
@@ -173,6 +173,7 @@ bool AnnouncedExplicit(unsigned int uid);
 // gate), 0 an EXPLICIT withheld mark (the other games have no copy), 1 announced (coopsquad::kAnn*). MAIN THREAD.
 int AnnouncedState(unsigned int uid);
 void NoteAnnouncedOnTake(unsigned int uid);   /* M7a3f3 [m7a3f3-ws2] */
+void NoteNotAnnounced(unsigned int uid);      /* T-556: a SPAWN that did not go out - the announce pass sends it. MAIN THREAD */
 // inv7e2: a reloaded copy's character was retired - unregister it (tracking, adopted row, uid->object index) and withdraw
 // what this game announced for it. 1 = the peer's copy is withdrawn (now, or already by the unload-destroy path),
 // 0 = it was never announced, 2 = the send was declined and the P8m registry owes it. MAIN THREAD.

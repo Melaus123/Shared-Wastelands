@@ -1180,6 +1180,20 @@ std::string TownListCommand()
     t << "townlist towns=" << n << " listed=" << listed << " faults=" << faults << " rejected=" << rejected;
     DebugLog("[TOWNS] " + t.str()); return t.str();
 }
+bool TownDistances(float x, float z, std::vector<std::pair<std::string, float> >* out, unsigned* faults)
+{
+    out->clear(); *faults = 0;
+    void* countv = 0; void** ptrs = 0;
+    if (!ReadTownListPod(&countv, &ptrs)) return false;
+    const unsigned n = (unsigned)(size_t)countv;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        TownRow r; void* tp = 0;
+        if (!ReadTownPtrPod(ptrs, i, &tp) || tp == 0 || !TownRowPod(tp, &r)) { ++*faults; continue; }
+        out->push_back(std::make_pair(std::string(r.name), sqrtf((r.x - x) * (r.x - x) + (r.z - z) * (r.z - z))));
+    }
+    return true;
+}
 }
 
 namespace coop { void ZonesInitLocks() { HeldLockInit(); } }   // called from InstallTownGen (preload, main thread) before any worker can reach HostHoldsSectorTS

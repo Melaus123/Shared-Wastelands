@@ -153,11 +153,10 @@ inline int HandedOverWakeRefuse(int handedOver, int heldByOther, int othersPrese
 }
 /* THE STALE-SQUAD DROP QUEUE's first test (store.cpp T300DropTick). A drop of another game's file or of a squad this game handed over
    exists because another player runs those people live here, so it is cancelled while no other player is in this world
-   (othersPresent 0). A context platoon's drop (its wake was refused whoever holds the area: it would rebuild another game's people from
-   its own sleeping data) does not depend on who is present - it goes on to its own re-check either way. 1 = go on to the re-check. */
-inline int StaleDropGoesOn(int isContextDrop, int othersPresent)
+   (othersPresent 0). 1 = go on to the re-check. */
+inline int StaleDropGoesOn(int othersPresent)
 {
-    return (isContextDrop != 0 || othersPresent != 0) ? 1 : 0;
+    return othersPresent != 0 ? 1 : 0;
 }
 /* THE STALE-SQUAD SWEEP (store.cpp T300SweepTick), armed when another player enters this world (the arrival record: the world server's
    roster or the old link). armed: a sweep is owed; worldReady: a running world this game may write to; othersPresent: another player is
@@ -240,6 +239,26 @@ inline int ContextSleepWrite(int isContext, int isHandedOver, int known, int min
     if (isHandedOver != 0 && known > 0 && mine == 0) return kCtxSleepRefuseHandedOver;
     return kCtxSleepGo;
 }
+/* A squad numbered in THIS game's block that this game's engine FORMED around another game's people is not written or published as this
+   game's. Rule E2 (decision 31(a)) makes a squad numbered in this game's block this game's whatever its members' uids say, because at
+   many sleeps the uids are already gone (known == 0). But this game's engine can also form a squad of its own numbering around characters
+   another game runs (copies here): writing it would publish that game's people under this game's number, and every game that does not
+   hold the area would build a sleeping copy of them from the record. Refused (kBlockWriteRefuseOtherGame) only when ALL of:
+     - numbered in this game's block (mineByBlock);
+     - every member identified (known == chars, known > 0): a member whose uid did not resolve may be one of this game's own people;
+     - none of them run by this game (mine == 0; a person taken over or hired here counts as this game's);
+     - none of them a person this game ran and then released to another game (releasedHere == 0): such a squad is this game's own squad
+       whose people were handed over IN PLACE (a dual run's yield, a revoke that leaves a puppet, a hand-over's acknowledgement - the body
+       stays in its squad as the new owner's puppet); the other game never writes a squad of this game's numbering, so refusing it would
+       lose that squad's state. A squad formed around copies that arrived by SPAWN holds no such person.
+   Everything else goes on to the existing rules. Asked after ContextSleepWrite (a context platoon and a handed-over squad keep their own
+   refusal and counter) and after the player / peer / stand-in skips. The sleep write and the heartbeat publish (HbOwnedAwake) ask the same
+   question. */
+enum { kBlockWriteGo = 0, kBlockWriteRefuseOtherGame = 1 };
+inline int BlockSquadWrite(int mineByBlock, int chars, int known, int mine, int releasedHere)
+{
+    return (mineByBlock != 0 && known > 0 && known == chars && mine == 0 && releasedHere == 0) ? kBlockWriteRefuseOtherGame : kBlockWriteGo;
+}
 /* Wake: a context platoon is never woken by this game's engine, whoever holds the area - a wake rebuilds another game's people from the
    platoon's own sleeping data, as unregistered bodies the sweep would adopt beside that game's own. Refused (and dropped) unless its last
    sleep here held a person this game runs (lastSleepHeldMine - the sleep's kCtxSleepGoContextWithMine, e.g. a take-back): that one goes
@@ -249,6 +268,28 @@ inline int ContextWake(int isContext, int lastSleepHeldMine, int haveId)
 {
     if (isContext == 0 || lastSleepHeldMine != 0) return kCtxWakeGo;
     return haveId != 0 ? kCtxWakeRefuse : kCtxWakeNoId;
+}
+/* The context platoon's REMOVAL (store.cpp CtxDropTick). A context platoon whose sleep here held none of this game's people is never
+   woken here again (ContextWake refuses it) - but left asleep in an area this game has loaded, the engine wakes it each time its
+   activation countdown runs out and builds a body from it before any refusal can act. So it is removed from this game at that sleep:
+   1 = queue the removal. Kept: one whose sleep held a person this game runs (a take-back), which the existing rules decide. */
+inline int ContextSleepDrop(int isContext, int heldMine)
+{
+    return (isContext != 0 && heldMine == 0) ? 1 : 0;
+}
+/* One step of a queued removal, from fresh reads. stillContext: the context map still holds the platoon (an announcement that superseded,
+   retired or hired from it has taken it out); sleptMine: its last sleep here held a person this game runs; readable: its state and faction
+   were read; awake: it is awake (a wake the rule refused, or an announcement that reused it); asleepListed: asleep and found in its own
+   faction's sleeping list; knownMembers: awake members that are registered copies. Cancel = not this rule's any more; KeepLive = an
+   announcement filled it again; Retire = awake with no registered member - put on ice, then destroyed; Destroy = asleep - destroyed;
+   Retry = not readable or not found in its faction's list yet. */
+enum { kCtxDropCancel = 0, kCtxDropKeepLive = 1, kCtxDropRetire = 2, kCtxDropDestroy = 3, kCtxDropRetry = 4 };
+inline int ContextDropStep(int stillContext, int sleptMine, int readable, int awake, int asleepListed, int knownMembers)
+{
+    if (stillContext == 0 || sleptMine != 0) return kCtxDropCancel;
+    if (readable == 0) return kCtxDropRetry;
+    if (awake != 0) return knownMembers > 0 ? kCtxDropKeepLive : kCtxDropRetire;
+    return asleepListed != 0 ? kCtxDropDestroy : kCtxDropRetry;
 }
 
 }   /* namespace coopsquad */

@@ -159,7 +159,8 @@ enum MsgType
     // build1-b (docs/design-build1.md 2-3, session protocol 59): a construction the sender's OWN player faction placed; the
     // receiver creates a copy owned by coop-peer at its K2 safe point.  RELIABLE.
     //   kind(u8 1 PLACE) | len(u8) + key | len(u8) + sid | 3 x f32 pos | 4 x f32 rot | u8 complete | f32 progress
-    //   | f32 needed | len(u8) + host key      (src/common/buildwire.h)
+    //   | f32 needed | len(u8) + host key | u8 host form | i32 floor | u8 outside | u16 owner number [| u32 nonce]
+    //   (src/common/buildwire.h)
     // build1-c (protocol 60): kind(u8 2 STATE) | len(u8) + key | f32 progress | f32 needed | u8 complete | u8 n (<= 16)
     //   | n x f32 delivered materials - the builder's whole construction state, written onto the copy at the K2 safe point.
     MSG_BUILD         = 50,

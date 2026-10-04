@@ -44,7 +44,7 @@ namespace {
    Zero-initialised POD plus a plain int. Both are zero before ANY static constructor runs, so AddrReg's
    constructor is safe whatever order the linker picks (the static-initialisation-order problem does not
    apply to zero-initialised storage). */
-const int kMaxRegs = 512;
+const int kMaxRegs = kAddrMaxRegs;
 typedef AddrSlot RegSlot;   /* gog1 fold 2: addrtable.h's POD, so AddrSettleSlots binds and clears these very slots */
 RegSlot g_regs[kMaxRegs];
 int     g_regCount = 0;
@@ -510,6 +510,8 @@ static int AddrInitBody()
                                         (g_mismatch != 0 || g_regOverflow != 0) ? 1 : 0, byPattern ? 1 : 0,
                                         &missing, &firstMissing);   /* gog1 fold 2: bind; a pattern-road refusal clears every slot */
     g_bindMissing += missing;
+    if (g_regOverflow != 0 && g_firstMismatch.empty())
+        g_firstMismatch = "the plugin binds more addresses than its registry holds (" + N((long long)kMaxRegs) + ") - " + N((long long)g_regOverflow) + " left out";
     if (firstMissing >= 0 && g_firstMismatch.empty())
         g_firstMismatch = std::string(g_regs[firstMissing].name) + ": the plugin asks for this name and the table"
                           " does not carry it";

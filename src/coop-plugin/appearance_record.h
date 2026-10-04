@@ -80,6 +80,15 @@ bool ApplyAppearanceRecord(::Character* c, const RecordCopy& rec);
 // 1 called, 0 setAppearanceData unresolved, -1 no appearance object or record.
 int ReassertAppearanceData(::Character* c);
 
+// T-556 (appearance.cpp): apply `rec` to a character THIS game drives once its body can take it, then send APPEARANCE and
+// CLOTHING; within 60 s or else (apply / send failed, not applied in time) the character's own look and kit go out by the
+// settle send - a record that missed 60 s stays queued and is applied and sent when the body passes the gates.
+// OwnLookResult: 0 waiting, 1 applied and sent, 2 applied and a send failed, 3 not applied in time (still queued), 4 the
+// apply failed, -1 gone / unknown (a final answer is given once, then the row is dropped). MAIN THREAD.
+void OwnLookQueue(unsigned int uid, const RecordCopy& rec);
+int OwnLookResult(unsigned int uid);
+void OwnLookWorldTeardown();   // the queued records and results belong to the world being destroyed
+
 // Wire format. Self-describing lengths throughout so a truncated payload is REFUSED rather
 // than misparsed - the same rule the protocol version bump exists for.
 void SerialiseRecord(const RecordCopy& rec, std::vector<char>* out);

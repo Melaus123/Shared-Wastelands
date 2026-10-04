@@ -33,7 +33,13 @@ namespace coop {
 void InstallWorldState();     // preload, main thread: the FIVE hooks (declareDead, uniqueStateUpdate, the squad-unload writer, the shared setter, and the respawn clear)
 void WorldStateTick();        // MAIN THREAD, every frame: drains the detours' ring, reads the state map (E19: the only reader) and sends what changed
 void WorldStateWorldTeardown();   // MAIN THREAD, from the store's teardown broadcast: the shadow, the register and the ring all name the world being destroyed
-void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved);   // MAIN THREAD: a state from the notebook
+void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved, unsigned int back);   // MAIN THREAD: a state from the notebook; back = how many times the world server says that character was brought back
+
+// T-556 (owner 493) - MAIN THREAD: this game has just brought a named character back (resurrect.cpp, right after the new
+// character exists and the TAKE went to the world server). The map entry, which reads DEAD, is written ALIVE at once the way the
+// engine's own periodic update writes ALIVE into an existing entry, and until the world server confirms the bring-back (its
+// UNIQUE_STATE with back > 0) a DEAD it sends for that id does not kill the character here. Returns a line for the log.
+std::string WorldStateBroughtBack(const std::string& sid);
 
 // E27 / review-p5q HIGH-3 - MAIN THREAD: this game has just given a character's ownership away (handoff.cpp's ACK
 // path, immediately after net::ReleaseLocalOwner). The shadow's "we owned this record" flag is the ONLY thing the

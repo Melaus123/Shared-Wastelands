@@ -34,6 +34,8 @@
 #include "ui.h"       /* E43 / P7z: the MULTIPLAYER button on the title screen */
 #include "tags.h"     /* tags1: name labels over the other player's characters */
 #include "bugreport.h" /* T-461: REPORT A BUG */
+#include "playerstab.h" /* T-545: the PLAYERS tab, other players' factions on the FACTION tab */
+#include "fallentab.h"   /* T-556: the FALLEN tab */
 #include "titleart.h"  /* T-513: the mod's own title-screen art */
 #include "config.h"   /* E38 / decisions 42-43: shared_wastelands.cfg - the role and the addresses */
 #include "addresses.h" /* P8h: the executable fingerprint and its address table - the gate below */
@@ -224,6 +226,8 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
        UtilityT object the labels project with (build/decomp_787e70.txt:36), so running first used last frame's camera.
        Nothing in the tick has to precede the engine loop: it only reads positions and the camera and moves our own widgets. */
     coop::TagsTick();
+    coop::PlayersTabTick();   /* T-545: other players' factions made known; the PLAYERS tab's table kept current while it shows */
+    coop::FallenTabTick();    /* T-556: the FALLEN tab after PLAYERS, kept current while it shows; a confirmed bring-back runs */
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
 }
@@ -363,9 +367,11 @@ static void detour_titleUpdate(TitleScreen* thisptr)
        skipped without consequence: it caches nothing, owns no link and writes no file, so a frame it
        misses is a frame in which the button is simply not put back yet. It disables itself for the
        process on its first fault. */
+    coop::TitleArtTick();    /* T-513: the mod's own art as the title screen's background - before the menu column and the note are placed on it */
     coop::UiTitleTick();
-    coop::TitleArtTick();    /* T-513: the mod's own art as the title screen's background - before the note is placed on it */
     coop::BugReportTick(1);  /* T-461: REPORT A BUG - the title screen's button and its window */
+    coop::PlayersTabTitleTick();   /* T-545: a SET HOSTILE box left up from the world is taken down */
+    coop::FallenTabTitleTick();    /* T-556: a BRING BACK box left up from the world is taken down */
     coop::TagsTitleTick();   /* tags1: no world at the title - a name label still standing is destroyed */
     coop::SteamProbeTick();  /* T-290 S0 title: the first title frame looks Steam up (the game's SteamAPI_Init has run); later frames poll the relay status until it settles. Logs only. */
 
@@ -784,6 +790,7 @@ static void startPluginOn(const char* road)
     coop::InstallBuild();      /* build1-a: observe construction (P082); nothing is sent */
     coop::InstallSettings();   /* settings2 S2: GameplayOptions::load 0x3EEDE0 post-hook - the world's advanced options over the save's */
     coop::InstallNames();      /* names1: Character::setName 0x5CB840 - an owned character's rename is sent */
+    coop::InstallFactionNameHooks();   /* T-368: the FACTION tab refuses a faction name another player of this world holds (Kenshi's own box) */
     coop::InstallCapture();    /* P11: task bodies 0x35A9C0 / 0x34E750 + the strip / dress / owner / shave hooks */
     coop::InstallSlaves();     /* slave1: setSlaveState 0x5A3EB0 + StateBroadcastData::periodicUpdate 0x5A44C0 */
     coop::InstallHire();       /* recruit1 R0-a: Dialogue::_doActions 0x67FAD0, LOG ONLY */

@@ -149,12 +149,17 @@
 #include "../common/liveenvelope.h"   /* M5a (T-197 piece 4, protocol 59): LIVE (53) - the envelope, the route rule and the relayed sender id - the SAME header the plugin and the offline suite compile */
 #include "../common/preload.h"   /* T-346 slice 1 (protocol 67): the record INDEX and FETCH before a game's load - the SAME header the game and the offline suite compile */
 #include "../common/recordfeed.h"   /* T-313 (protocol 63): RECORD_FEED (58) - the ASK / OFF / BEGIN / PAGE_END wire, who gets a live forward, the page walk - the SAME header the plugin and the offline suite compile */
+#include "../common/teamwire.h"   /* T-546 step 3 (protocol 70): TEAM (60) - who is in whose faction - the SAME header the plugin and the offline suite compile */
+#include "../common/resurrectfee.h"   /* T-556: the resurrection host options (resurrect, resurrectfee, resurrectgrowth) - the SAME header the plugin and the offline suite compile */
+#include "../common/fallenwire.h"   /* T-556: FALLEN (61) - each profile's fallen list, and a named character brought back - the SAME header the plugin and the offline suite compile */
+#include "../common/owedpop.h"   /* T-581: OWED (63) - the owed town populations; the SAME header the game and the offline suite compile */
 #include "../common/storelink.h"   /* B10-b (review-b10 M-7): StoreHandshakeDecide and its words - the SAME decision the game makes, so the two sides of one handshake cannot disagree about when it is refused */
 
 namespace {
 
-const unsigned int kProtocol = 69;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
-enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_REPAIR = 50, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59 };   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* restore1c: REPAIR (50) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi}, sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
+const unsigned int kProtocol = 87;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_REPAIR = 50, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63 };   /* T-556: FALLEN (61) - src/common/fallenwire.h */   /* T-546 step 3 (protocol 72): TEAM (60) - src/common/teamwire.h */   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* restore1c: REPAIR (50) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi}, sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
+typedef char T581OwedNumbersAgree[(MSG_OWED == (int)owedpop::kMsgOwed && kProtocol == owedpop::kProtocol) ? 1 : -1];   /* T-581: a compile error here = owedpop.h and this file disagree */
 typedef char M13BundleNumbersAgree[(MSG_BUNDLE == (int)coopbundle::kMsgBundle && MSG_STORE_HELLO == (int)coopbundle::kMsgStoreHello && MSG_STORE_WELCOME == (int)coopbundle::kMsgStoreWelcome
     && MSG_STORE_REFUSE == (int)coopbundle::kMsgStoreRefuse) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 /* M13: sendbundle.h's size budget is ENet's own fragment threshold - its copies of ENet's wire sizes must be these. */
@@ -351,6 +356,9 @@ std::map<ENetPeer*, std::string> g_lobby;
 std::vector<coopprof::Row> g_profiles;
 long long g_profAdopted = 0;   /* prof1 fold */
 long long g_profFactionSet = 0, g_profFactionSame = 0, g_profFactionRefused = 0;   /* names2a: PROFILES kind 3 */
+long long g_profFactionBack = 0, g_profFactionMoved = 0, g_profFactionDefault = 0, g_takenSent = 0;   /* T-368: names the world changed; TAKEN answers sent */
+std::map<std::string, coopprof::FactionAnswer> g_facOwed;   /* T-368: per profile (its slot key), the FACTION answer its game has not acknowledged (kind 6) */
+long long g_facOwedResent = 0, g_facSeen = 0, g_facSeenStale = 0;
 /* restore1a (design s1; fold review-restore1a): world.gen - {profile -> highest worldGen} (owner ruling 1: per profile), ONE
    world-wide seqHigh (never raised above this notebook's own index high-water from a game's claim) and the epoch (0 until
    restore1b); never steps back. g_wgFileState: 0 absent, 1 read/written, 2 unreadable (treated as absent). */
@@ -430,7 +438,7 @@ bool PeerIsAuthority(ENetPeer* p)
 /* THE ONE WRITER, in clock.txt's shape (WriteClock, below): a temp file beside the real one, then
    MoveFileExA over it. Every caller counts its own failure, because a file that silently stops being
    written is this whole phase's defect wearing a different hat. */
-bool WriteWholeFile(const std::string& path, const std::string& body)
+bool WriteWholeFile(const std::string& path, const std::string& body, bool writeThrough = false)   /* writeThrough: the rename returns only once it is on the disk */
 {
     const std::string tmp = path + ".tmp";
     {
@@ -440,7 +448,14 @@ bool WriteWholeFile(const std::string& path, const std::string& body)
         f.flush();
         if (!f) { Log("B13: the write to " + tmp + " failed - " + path + " is unchanged"); return false; }
     }
-    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+    if (writeThrough)   /* the temp file's bytes are on the disk before the rename makes them the file */
+    {
+        HANDLE h = ::CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+        const BOOL flushed = h != INVALID_HANDLE_VALUE && ::FlushFileBuffers(h);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        if (!flushed) { Log("B13: " + tmp + " could not be flushed to the disk (GetLastError=" + N((long long)::GetLastError()) + ") - " + path + " is unchanged"); return false; }
+    }
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | (writeThrough ? MOVEFILE_WRITE_THROUGH : 0)))
     { Log("B13: could not replace " + path + " (MoveFileExA, GetLastError=" + N((long long)::GetLastError()) + ")"); return false; }
     return true;
 }
@@ -642,7 +657,8 @@ void RosterBroadcast(const char* why)
     }
     coopjoin::RosterSortBySlot(&rows);
     std::vector<char> b;
-    if (!coopjoin::RosterEncode(rows, &b)) { Log("PLAYERS roster NOT sent - over " + N((long long)coopjoin::kRosterMax) + " rows"); return; }
+    const unsigned worldPlayers = (unsigned)g_slotsUsed.size();   /* every number this world ever gave (slots.txt) */
+    if (!coopjoin::RosterEncode(rows, worldPlayers, &b)) { Log("PLAYERS roster NOT sent - over " + N((long long)coopjoin::kRosterMax) + " rows or " + N((long long)coopjoin::kWorldPlayersMax) + " players"); return; }
     ++g_rosterBroadcasts;
     long long sent = 0;
     for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
@@ -651,7 +667,7 @@ void RosterBroadcast(const char* why)
         SendMsg(it->first, MSG_PLAYERS, b); ++sent;
     }
     g_rosterFrames += sent;
-    Log(std::string("PLAYERS roster (") + why + ") sent to " + N(sent) + " game(s): " + coopjoin::RosterText(rows, -1));
+    Log(std::string("PLAYERS roster (") + why + ") sent to " + N(sent) + " game(s): " + coopjoin::RosterText(rows, -1) + " | world players " + N((long long)worldPlayers));
 }
 /* AREAS: the old road enters the world here, at its first AREAS that NAMES AREAS (S1 fold, review L8: a game's empty teardown report,
    zones.cpp, enters nobody); a world-road game's areas wait for its IN_WORLD. count = the report's area count. false = refused (counted). */
@@ -1245,11 +1261,12 @@ void PutStr(std::vector<char>* b, const std::string& s); void PutU32(std::vector
 std::vector<char> EncodeBits(const std::string& faction) { std::vector<char> m; PutStr(&m, faction); const std::vector<char>& b = g_bits[faction]; PutU32(&m, (unsigned)b.size()); m.insert(m.end(), b.begin(), b.end()); return m; }
 
 // decision 31(c): the unique-NPC states. One line per named character in uniques.txt, kept permanently for this world,
-// rewritten whole through a temp file the way the deleted-number bitmaps are, and pushed in full at WELCOME.
-struct UniqueRow { int state; int playerInvolved; UniqueRow() : state(1), playerInvolved(0) {} };
+// rewritten whole through a temp file the way the deleted-number bitmaps are, and pushed in full at WELCOME. T-556: a row also
+// counts how many times its character was brought back (src/common/fallenwire.h - the file line, and the rule).
+typedef swfallen::UniqueRow UniqueRow;
 std::map<std::string, UniqueRow> g_uniques;
 std::string UniquesFile() { return g_dir + "\\uniques.txt"; }
-std::vector<char> EncodeUnique(const std::string& sid, const UniqueRow& r) { std::vector<char> m; PutStr(&m, sid); PutU32(&m, (unsigned)r.state); PutU32(&m, (unsigned)r.playerInvolved); return m; }
+std::vector<char> EncodeUnique(const std::string& sid, const UniqueRow& r) { std::vector<char> m; PutStr(&m, sid); PutU32(&m, (unsigned)r.state); PutU32(&m, (unsigned)r.playerInvolved); PutU32(&m, r.back); return m; }
 bool WriteUniques()
 {
     /* P8l (review-p8d C-1). THE LOAD THAT NEVER HAPPENED IS NOT AN EMPTY FILE. This function rewrites
@@ -1273,11 +1290,12 @@ bool WriteUniques()
         }
         return false;
     }
-    const std::string tmp = UniquesFile() + ".tmp";
-    { std::ofstream f(tmp.c_str(), std::ios::trunc); if (!f) return false;
-      for (std::map<std::string, UniqueRow>::const_iterator it = g_uniques.begin(); it != g_uniques.end(); ++it)
-          f << "v1\t" << it->first << "\t" << it->second.state << "\t" << it->second.playerInvolved << "\n"; }
-    return MoveFileExA(tmp.c_str(), UniquesFile().c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    /* T-556: written whole through a temp file, flushed, and a write-through rename - the same as fallen.txt, which a named
+       character's bring-back writes right after this file */
+    std::string text;
+    for (std::map<std::string, UniqueRow>::const_iterator it = g_uniques.begin(); it != g_uniques.end(); ++it)
+        text += swfallen::UniqueFileLine(it->first, it->second);
+    return WriteWholeFile(UniquesFile(), text, true);
 }
 /* P8l: the ROWS out of already-probed bytes, so the load and the deferred-load retry cannot hold two ideas
    of what uniques.txt says (6a lesson 11 - remove the hand that keeps two copies in step). */
@@ -1288,13 +1306,9 @@ int UniquesParseInto(const FileProbe& up, std::map<std::string, UniqueRow>* into
     std::string line; int n = 0;
     while (std::getline(f, line))
     {
-        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-        std::vector<std::string> fld; size_t at = 0;
-        while (at <= line.size()) { size_t t = line.find('\t', at); if (t == std::string::npos) { fld.push_back(line.substr(at)); break; } fld.push_back(line.substr(at, t - at)); at = t + 1; }
-        if (fld.size() < 4 || fld[0] != "v1" || fld[1].empty()) continue;
-        UniqueRow r; r.state = atoi(fld[2].c_str()); r.playerInvolved = atoi(fld[3].c_str()) != 0 ? 1 : 0;
-        if (r.state < 0 || r.state > 2) continue;
-        (*into)[fld[1]] = r; ++n;
+        std::string sid; UniqueRow r;
+        if (!swfallen::UniqueParseFileLine(line, &sid, &r)) continue;
+        (*into)[sid] = r; ++n;
     }
     return n;
 }
@@ -1335,9 +1349,11 @@ void UniquesDeferredRetry(ENetHost* host)
     {
         std::map<std::string, UniqueRow>::const_iterator ex = onDisk.find(it->first);
         const int haveLoaded = (ex != onDisk.end()) ? 1 : 0;
-        const int d = coopmerge::UniqueMergeDecide(haveLoaded, haveLoaded ? ex->second.state : 1, it->second.state);
+        UniqueRow merged;
+        const int d = swfallen::UniqueMergeRows(haveLoaded != 0, haveLoaded ? ex->second : UniqueRow(), it->second, &merged);   /* T-556: a bring-back made this session wins; the file's count is never lowered */
         if (d == coopmerge::kMergeKeepLoaded)
         {
+            onDisk[it->first].back = merged.back;
             ++keptDead; corrected.push_back(it->first);
             Log("UNIQUE " + SanitizeForLog(it->first) + " stays DEAD - state " + N((long long)it->second.state)
                 + " was accepted while uniques.txt could not be read, and is REFUSED now that the file has"
@@ -1346,7 +1362,7 @@ void UniquesDeferredRetry(ENetHost* host)
             continue;
         }
         if (haveLoaded) ++took; else ++inserted;
-        onDisk[it->first] = it->second;
+        onDisk[it->first] = merged;
     }
     g_uniques = onDisk;
     g_uniquesLoadDeferred = 0;
@@ -1946,6 +1962,9 @@ bool OptionValueOk(const std::string& key, const std::string& value)
     /* prof1 (D5): a HOST option - how many active profiles one person may have in this world, 1-16 (absent = 3). Lowering it
        deletes nothing: NEW stays refused until the person is under it. */
     if (key == "profilecap") return coopprof::CapValueOk(value) != 0;
+    /* T-556 (owner 485, 491, 497): HOST options - resurrection on/off (absent = off), the fee amount (absent = 1000) and its growth
+       steady / steep (absent = steep); resurrectfee.h holds the legal values. */
+    if (swfee::IsOptionKey(key)) return swfee::OptionValueOk(key, value);
     if (key.compare(0, 3, "gp.") == 0) return coopgp::GpValueOk(key, value, 0);
     if (key.compare(0, 3, "gt.") == 0) return coopgp::GtValueOk(key, value);
     return false;
@@ -3251,6 +3270,8 @@ void LogStoreCounters()
         + " refused[samePerson]=" + N(g_profRefusedSamePerson) + " profileRefused[cap,name,unknown,inUse,other]=" + N(g_profRefusedCap) + "," + N(g_profRefusedName) + "," + N(g_profRefusedUnknown) + "," + N(g_profRefusedInUse) + "," + N(g_profRefusedOther)
         /* names2a: a playing game's faction name into its own profile's row (PROFILES kind 3). */
         + " profFaction[set,same,refused]=" + N(g_profFactionSet) + "," + N(g_profFactionSame) + "," + N(g_profFactionRefused)
+        + " profFactionWorld[back,moved,default,takenSent]=" + N(g_profFactionBack) + "," + N(g_profFactionMoved) + "," + N(g_profFactionDefault) + "," + N(g_takenSent)
+        + " factionAnswers[owed,resent,seen,stale]=" + N((long long)g_facOwed.size()) + "," + N(g_facOwedResent) + "," + N(g_facSeen) + "," + N(g_facSeenStale)
         /* restore1a (+ fold): world.gen and the operator's WORLD_SAVED stamps (stampedAcked = answers sent; gen = the highest profile's). */
         + " world[gen=" + N((long long)restoreguard::MaxGen(g_wg)) + ",profiles=" + N((long long)restoreguard::NumberedCount(g_wg)) + ",seqHigh=" + N((long long)WorldSeqHighNow())
         + ",stampedAcked=" + N(g_wgAnswered) + ",stampsIn=" + N(g_wgIn) + ",raised=" + N(g_wgRaised) + ",stale=" + N(g_wgStale) + ",notOperator=" + N(g_wgNotOperator)
@@ -3671,8 +3692,9 @@ int PositionRotateMode(const Record& r) { return r.len > 0 ? kRotateNone : kRota
      (2) A READ SEES THE QUEUED BYTES: every loop-side read of a record file either runs only while that key
          has no job out (OnRecordFrom's probe, PendingPosTick) or drains the queue first (WriterFlushAll -
          OnHello's push, OnRepair, OnWorldSaved).
-     (3) QUIT DRAINS THE QUEUE: QuitDrain, from StoreCtrlHandler (close button, Ctrl+C, Ctrl+Break) and from the
-         hidden window's WM_ENDSESSION (logoff, shutdown) - this process has no other quit path, its loop never ends.
+     (3) QUIT DRAINS THE QUEUE: QuitDrain, from StoreCtrlHandler (close button, Ctrl+C, Ctrl+Break), from the hidden
+         window's WM_ENDSESSION (logoff, shutdown) and WM_CLOSE (the Kenshi that started it left its HOST without a world), and from
+         the parent Kenshi's watch - its loop never ends.
      (4) A FAILURE IS LOGGED AS TODAY AND LOSES NOTHING AFTER IT: WriterMain / WriterApplyOne.
      (5) THE REPORT: WriteQueueToken, on the 60 s counters line.
    THE COUNTERS THE WRITER BUMPS (write[tempFailed,renameFailed], rotate[...]) are touched by that thread
@@ -3899,8 +3921,32 @@ void WriterHold(const std::string& id, unsigned char type, ENetPeer* peer, unsig
    seconds at a session end unless the user waits on the "still running" screen); a queue that takes longer is
    cut off there. Nothing cut off was ever announced: echoes, forwards and delete broadcasts follow a landed job. */
 const DWORD kQuitWaitMs = 60000;
+/* THE FINAL SAVE AT QUIT (coopwq::QuitSaveRoute): before the queue drains, the team records changed since the last save and the
+   world-relations file are saved by the main loop's thread - g_team and g_wrel are touched by no other. A quit door on another
+   thread raises g_quitSaveAsked and waits for g_quitSaveDone; the loop checks the flag at the top of every pass (QuitSaveCheck).
+   A pass lasts at most kPassBudgetUs (50 ms) plus the one piece of work in hand when it ends - one message, or the once-a-second
+   jobs; a message that waits for the write queue first (WriterFlushAll: OnHello's push, OnRepair, OnWorldSaved) holds it as
+   long as the disk does - so the wait is bounded by kQuitSaveWaitMs, and a loop that does not answer in time is logged and the
+   quit goes on. After the save the loop keeps its once-a-second saves until the process ends. */
+const DWORD kQuitSaveWaitMs = 3000;
+DWORD g_loopThreadId = 0;           /* main()'s thread: start-up, then the loop */
+volatile LONG g_loopRunning = 0;    /* the loop has started */
+volatile LONG g_quitSaveAsked = 0;  /* a quit door on another thread asks the loop for the final save */
+HANDLE g_quitSaveDone = 0;          /* manual-reset: the loop has made the final save */
+std::string QuitSaveNow();          /* LOOP THREAD ONLY - defined after the team code */
+void QuitSave()
+{
+    const int route = coopwq::QuitSaveRoute(::GetCurrentThreadId() == g_loopThreadId, InterlockedCompareExchange(&g_loopRunning, 0, 0) != 0);
+    if (route == coopwq::kQuitSaveHere) { Log("quit save (this thread is the main loop's): " + QuitSaveNow()); return; }
+    if (route == coopwq::kQuitSaveNone) { Log("quit save: the main loop has not started - no game has sent anything yet, nothing to save"); return; }
+    InterlockedExchange(&g_quitSaveAsked, 1);
+    if (g_quitSaveDone != 0 && WaitForSingleObject(g_quitSaveDone, kQuitSaveWaitMs) == WAIT_OBJECT_0) return;   /* the loop logged what it saved */
+    Log("quit save: the main loop did NOT answer within " + N((long long)kQuitSaveWaitMs) + " ms (one piece of its work held it) - team records and"
+        " world relations changed since its last once-a-second save may not be on disk");
+}
 void QuitDrain(const std::string& why)
 {
+    QuitSave();
     EnterCriticalSection(&g_wqLock.cs);
     g_wqClosing = 1;
     const long long left = g_wq.Depth();
@@ -3965,6 +4011,17 @@ BOOL WINAPI StoreCtrlHandler(DWORD type)
     QuitDrain("console event " + N((long long)type));
     return FALSE;   /* the default handler ends the process */
 }
+/* THE CLOSE FROM THE KENSHI THAT STARTED THIS HELPER: WM_CLOSE on the hidden window only raises this flag. The main thread acts on it
+   - between start-up steps (never inside one: a folder move, a format conversion or a load is finished first) and on every pass of its
+   loop - through QuitDrain (every queued write) and the process's end, the same quit as the close button. */
+volatile LONG g_closeAsked = 0;
+void CloseAskedCheck(const char* where)
+{
+    if (InterlockedCompareExchange(&g_closeAsked, 0, 0) == 0) return;
+    Log(std::string("[STORE] closing (asked by the Kenshi that started it) ") + where);
+    QuitDrain("closed by its Kenshi");
+    ExitProcess(0);
+}
 LRESULT CALLBACK QuitWindowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_QUERYENDSESSION)
@@ -3980,6 +4037,12 @@ LRESULT CALLBACK QuitWindowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     {
         if (wp != 0) QuitDrain(((unsigned long long)lp & 0x80000000ULL) != 0 ? "session end - logoff" : "session end - shutdown");
         return 0;   /* the system ends the process after this returns */
+    }
+    if (msg == WM_CLOSE)   /* the Kenshi that started this helper left its HOST without a world (ui.cpp HostLeave -> PanelStopNotebook) */
+    {
+        if (InterlockedExchange(&g_closeAsked, 1) == 0)
+            Log("[STORE] asked to close by the Kenshi that started it (its HOST ended without a world) - closing after the step in hand");
+        return 0;   /* the main thread closes (CloseAskedCheck): between start-up steps, or on its loop's next pass */
     }
     return DefWindowProcA(h, msg, wp, lp);
 }
@@ -5117,6 +5180,9 @@ bool IndexRecordFromMeta(const coopstore::MetaLine& m, bool isCurrentMeta, const
     PutInIndex(r);
     return true;
 }
+void LoadTeams();   /* T-546: defined with the membership table below */
+void LoadFallen();   /* T-556: defined with the fallen lists below */
+void LoadOwed();   /* T-581: defined with the owed rows below */
 void LoadIndex()
 {
     LoadBits();   /* decision 30 */
@@ -5124,7 +5190,10 @@ void LoadIndex()
     LoadResearch();   /* loot2b: research_boxes.txt */
     LoadTakes();      /* loot2c: research_takes.txt */
     LoadBars();   /* refill1: town_bars.txt */
+    LoadOwed();   /* T-581: owed_people.txt */
     LoadWorldRel();   /* par24: world_relations.txt */
+    LoadTeams();   /* T-546: teams.txt */
+    LoadFallen();   /* T-556: fallen.txt */
     LoadOptions();   /* E36 / decision 40: the session's option map, ALWAYS complete after this call */
     LoadClock();     /* E40 / decision 45: this world's time, if it has been given one; below LoadOptions because it logs the time mode */
     int n = 0;
@@ -5320,6 +5389,7 @@ void OnDeletedBits(ENetHost* host, ENetPeer* from, const std::vector<char>& payl
     std::vector<char> buf(5 + payload.size()); buf[0] = (char)MSG_DELETED_BITS; unsigned len = (unsigned)payload.size(); memcpy(&buf[1], &len, 4); memcpy(&buf[5], &payload[0], payload.size());
     for (size_t i = 0; i < host->peerCount; ++i) { ENetPeer* p = &host->peers[i]; if (p->state == ENET_PEER_STATE_CONNECTED && p != from) SbSendRel(p, buf); }
 }
+void UniqueBroadcast(ENetHost* host, ENetPeer* from, const std::string& sid, const UniqueRow& r);
 void OnUniqueState(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
 {
     std::string sid; size_t at = 0; unsigned st = 0, pi = 0;
@@ -5327,17 +5397,25 @@ void OnUniqueState(ENetHost* host, ENetPeer* from, const std::vector<char>& payl
     // review-p5j HIGH-2: DEAD IS TERMINAL. Nothing in the engine revives a dead entry (the shared setter refuses to
     // raise a stored 0 at all), so a later 1 or 2 for the same id can only be a game whose engine ERASED the entry -
     // and last-writer-wins would let that overwrite the permanent record every future joiner is given. Not stored,
-    // not forwarded.
-    std::map<std::string, UniqueRow>::const_iterator ex = g_uniques.find(sid);
-    if (ex != g_uniques.end() && ex->second.state == 0 && st != 0)
+    // not forwarded. T-556 (owner 493): the one road back is a TAKE of that character's fallen row (OnFallen), which
+    // makes the row ALIVE again; its later death is a game's DEAD like any other and is stored.
+    std::map<std::string, UniqueRow>::iterator ex = g_uniques.find(sid);
+    const bool have = ex != g_uniques.end();
+    UniqueRow r = have ? ex->second : UniqueRow();
+    if (swfallen::UniqueOnGameState(have, &r, (int)st, (int)pi) == swfallen::kUqRefusedDead)
     {
         Log("UNIQUE " + SanitizeForLog(sid) + " stays DEAD (ignored state " + N((long long)st) + " from " + PeerName(from) + ")");
         return;
     }
-    UniqueRow r; r.state = (int)st; r.playerInvolved = pi != 0 ? 1 : 0;
     g_uniques[sid] = r; WriteUniques();
-    Log("UNIQUE " + SanitizeForLog(sid) + " -> state " + N((long long)st) + " (from " + PeerName(from) + ")");
-    std::vector<char> buf(5 + payload.size()); buf[0] = (char)MSG_UNIQUE_STATE; unsigned n = (unsigned)payload.size(); memcpy(&buf[1], &n, 4); if (!payload.empty()) memcpy(&buf[5], &payload[0], payload.size());
+    Log("UNIQUE " + SanitizeForLog(sid) + " -> state " + N((long long)st) + (r.back ? " (brought back " + N((long long)r.back) + " time(s) before)" : std::string()) + " (from " + PeerName(from) + ")");
+    UniqueBroadcast(host, from, sid, r);
+}
+/* one stored row to every subscribed game but `from` (0 = every one) */
+void UniqueBroadcast(ENetHost* host, ENetPeer* from, const std::string& sid, const UniqueRow& r)
+{
+    const std::vector<char> payload = EncodeUnique(sid, r);
+    std::vector<char> buf(5 + payload.size()); buf[0] = (char)MSG_UNIQUE_STATE; unsigned n = (unsigned)payload.size(); memcpy(&buf[1], &n, 4); memcpy(&buf[5], &payload[0], payload.size());
     for (size_t i = 0; i < host->peerCount; ++i) { ENetPeer* p = &host->peers[i]; if (FeedForwardTo(p, from, MSG_UNIQUE_STATE)) SbSendRel(p, buf); }
 }
 // E36 / decision 40 - a game asks for an option to change. REFUSED unless this is the game the store calls the
@@ -5931,9 +6009,1038 @@ void PlayerGoneHoldTick()
     for (size_t i = 0; i < done.size(); ++i) g_playerGoneHolds.erase(done[i]);
 }
 
+typedef char T546TeamNumberAgrees[(MSG_TEAM == (int)swteam::kMsgTeam) ? 1 : -1];   /* a compile error here = teamwire.h and this file disagree */
+/* ================= T-546 step 3 (t546a): PLAYER FACTIONS - THE MEMBERSHIP TABLE (src/common/teamwire.h; protocol 70) =================
+   This process is the only writer of who is in whose faction. teams.txt in the world's folder holds the teams, each member's
+   pre-join standing (as the accepting game sent it) and the RESTORE rows owed to players who left, were removed or whose team
+   was disbanded. A change is decided on a copy of the table; the copy becomes the table only once teams.txt holds it (written
+   whole through a temp file and a write-through rename, and only when its text changed). A change that cannot be written - or
+   any change while a teams.txt that is on disk could not be read at start - is refused (not-saved) and nothing is pushed.
+   Every admitted game gets the whole table (TEAM kind TABLE) at its WELCOME, on every change and when it ASKs (its copy was
+   cleared by a world teardown while the link stayed); a player's owed RESTORE rows go to that player's game once per
+   connection - when the row is made (connected) or at its next WELCOME - and are kept until that game answers RESTORE_DONE.
+   Invitations live in memory only: they are for connected players and end after swteam::kInviteSeconds, when either player's
+   connection closes, or when the inviting founder's team ends (the same notice as an expiry). */
+swteam::Book g_team;
+int g_teamLoadDeferred = 0;
+std::string g_teamFileText;   /* the text teams.txt holds (as read at start, or as last written): a change that leaves it equal is not written */
+int g_teamNotSavedSaid = 0;   /* the not-saved line is said once per run of failures */
+unsigned long long g_teamConnNext = 0;
+std::map<ENetPeer*, unsigned long long> g_teamConn;   /* each admitted connection's serial (TeamWelcomePush): a restore row goes once per connection */
+long long g_teamIn = 0, g_teamRefused = 0, g_teamMalformed = 0, g_teamNotAdmitted = 0, g_teamNotSaved = 0, g_teamTables = 0, g_teamRestoresSent = 0, g_teamRestoresDone = 0, g_teamAsks = 0;
+std::string TeamsFile() { return g_dir + "\\teams.txt"; }
+std::string ProfileOfPeer(ENetPeer* p) { const std::string id = PeerIdOf(p); return id.empty() ? std::string() : coopprof::ProfileIdOfKey(id); }
+/* the slot this world gave a profile (slots.txt), or -1 */
+int SlotOfProfile(const std::string& prof)
+{
+    for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
+        if (coopprof::ProfileIdOfKey(it->second) == prof) { const int s = SlotOf(it->first); if (s >= 0) return s; }
+    for (std::map<std::string, int>::const_iterator it = g_slotById.begin(); it != g_slotById.end(); ++it)
+        if (coopprof::ProfileIdOfKey(it->first) == prof) return it->second;
+    return -1;
+}
+/* the profile a slot names, or "" */
+std::string ProfileOfSlot(int slot)
+{
+    for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
+        if (SlotOf(it->first) == slot) return coopprof::ProfileIdOfKey(it->second);
+    for (std::map<std::string, int>::const_iterator it = g_slotById.begin(); it != g_slotById.end(); ++it)
+        if (it->second == slot) return coopprof::ProfileIdOfKey(it->first);
+    return std::string();
+}
+/* the admitted, connected game of a profile, or 0 */
+ENetPeer* PeerOfProfile(const std::string& prof)
+{
+    for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
+        if (it->first->state == ENET_PEER_STATE_CONNECTED && coopprof::ProfileIdOfKey(it->second) == prof) return it->first;
+    return 0;
+}
+std::string TeamSlotText(const std::string& prof) { const int s = SlotOfProfile(prof); return s < 0 ? std::string("s?") : "s" + N((long long)s); }
+unsigned TeamWireSlot(const std::string& prof) { const int s = SlotOfProfile(prof); return s < 0 ? 0xFFFFFFFFu : (unsigned)s; }
+std::vector<swteam::WireTeam> TeamWire()
+{
+    std::map<std::string, unsigned> slots;
+    for (size_t t = 0; t < g_team.teams.size(); ++t)
+    {
+        int s = SlotOfProfile(g_team.teams[t].founder); if (s >= 0) slots[g_team.teams[t].founder] = (unsigned)s;
+        for (size_t m = 0; m < g_team.teams[t].members.size(); ++m) { s = SlotOfProfile(g_team.teams[t].members[m].id); if (s >= 0) slots[g_team.teams[t].members[m].id] = (unsigned)s; }
+    }
+    return swteam::ToWire(g_team, slots);
+}
+std::string TeamOwedText()
+{
+    if (g_team.owed.empty()) return "owed: none";
+    std::string s = "owed:";
+    for (size_t i = 0; i < g_team.owed.size(); ++i)
+        s += " #" + N((long long)g_team.owed[i].no) + " " + TeamSlotText(g_team.owed[i].id) + " " + swteam::WhyName(g_team.owed[i].why) + " from '"
+             + swteam::Clean(g_team.owed[i].teamName) + "'" + (g_team.owed[i].away ? " (while away)" : "") + " rows=" + N((long long)g_team.owed[i].snapRows);
+    return s;
+}
+/* a change could not be kept on disk: counted; said once until a write succeeds again */
+bool TeamNotSaved(const std::string& why)
+{
+    ++g_teamNotSaved;
+    if (!g_teamNotSavedSaid)
+    {
+        g_teamNotSavedSaid = 1;
+        Log("TEAM: " + why + " - every change to the membership table is REFUSED (not-saved) and the table is not pushed while this lasts;"
+            " said once (teamNotSaved counts each refusal)");
+    }
+    return false;
+}
+/* `next` (a changed copy of the table) becomes the table once teams.txt holds it. false = refused: g_team is unchanged. */
+bool TeamCommit(swteam::Book* next)
+{
+    if (g_teamLoadDeferred) return TeamNotSaved("teams.txt is on disk and could not be read at start, so it is not rewritten this session");
+    const std::string text = swteam::BookFile(*next);
+    if (text != g_teamFileText)
+    {
+        if (!WriteWholeFile(TeamsFile(), text, true)) return TeamNotSaved("teams.txt could not be written");
+        g_teamFileText = text;
+        g_teamNotSavedSaid = 0;
+    }
+    g_team.teams.swap(next->teams); g_team.owed.swap(next->owed); g_team.invites.swap(next->invites); g_team.declined.swap(next->declined);
+    g_team.nextTeam = next->nextTeam; g_team.nextOwed = next->nextOwed;
+    return true;
+}
+void LoadTeams()
+{
+    g_team = swteam::Book();
+    g_teamFileText.clear(); g_teamNotSavedSaid = 0;
+    const FileProbe rp = ProbeFile(TeamsFile());
+    if (rp.kind == coopstore::kFileUnreadable)
+    {
+        g_teamLoadDeferred = 1;
+        Log("TEAM: teams.txt is ON DISK (" + N(rp.attrLen) + " bytes) and could NOT BE READ (error " + N((long long)rp.err)
+            + ") - it is NOT rewritten this session, and every change to the membership table is refused (not-saved)");
+        return;
+    }
+    g_teamLoadDeferred = 0;
+    if (rp.kind != coopstore::kFileReadable) { Log("TEAM: no teams.txt yet - nobody in this world has joined another player's faction"); return; }
+    std::istringstream f(TextOf(rp));
+    std::string line; long long bad = 0, dup = 0;
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line == "\r") continue;
+        int why = swteam::kLineOk;
+        if (!swteam::BookParseLine(line, &g_team, &why)) { if (why == swteam::kLineDuplicate) ++dup; else ++bad; }
+    }
+    g_team.loadRefused.clear();
+    g_teamFileText = swteam::BookFile(g_team);
+    Log("TEAM: teams.txt loaded - " + N((long long)g_team.teams.size()) + " team(s), " + N((long long)g_team.owed.size()) + " restore row(s) owed, "
+        + N(bad) + " unusable line(s), " + N(dup) + " duplicate number(s) refused; next team " + N((long long)g_team.nextTeam) + ", next row "
+        + N((long long)g_team.nextOwed) + ": " + swteam::TableText(TeamWire()) + " | " + TeamOwedText());
+}
+/* the whole table to every admitted game (to = 0) or to one */
+void TeamTableSend(ENetPeer* to, const char* why)
+{
+    const std::vector<swteam::WireTeam> w = TeamWire();
+    std::vector<char> b; swteam::EncodeTable(&b, w);
+    long long sent = 0;
+    for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
+    {
+        if (it->first->state != ENET_PEER_STATE_CONNECTED || (to != 0 && it->first != to)) continue;
+        if (SendMsg(it->first, MSG_TEAM, b)) ++sent;
+    }
+    ++g_teamTables;
+    Log("TEAM table (" + std::string(why) + ") sent to " + N(sent) + " game(s): " + swteam::TableText(w) + " | " + TeamOwedText());
+}
+void TeamNotice(const std::string& toProf, unsigned ev, unsigned result, const std::string& actor, const std::string& subject, const std::string& teamName)
+{
+    ENetPeer* p = PeerOfProfile(toProf);
+    if (p == 0) return;
+    std::vector<char> b; swteam::EncodeNotice(&b, ev, result, TeamWireSlot(actor), TeamWireSlot(subject), teamName);
+    SendMsg(p, MSG_TEAM, b);
+}
+/* the RESTORE rows owed to this profile that its game's connection has not been sent yet */
+void TeamSendOwed(const std::string& prof, const char* when)
+{
+    ENetPeer* p = PeerOfProfile(prof);
+    if (p == 0) return;
+    std::map<ENetPeer*, unsigned long long>::iterator c = g_teamConn.find(p);
+    if (c == g_teamConn.end()) c = g_teamConn.insert(std::make_pair(p, ++g_teamConnNext)).first;
+    for (size_t i = 0; i < g_team.owed.size(); ++i)
+    {
+        swteam::Owed& o = g_team.owed[i];
+        if (o.id != prof || o.sentConn == c->second) continue;
+        std::vector<char> b; swteam::EncodeRestore(&b, o);
+        const bool sent = SendMsg(p, MSG_TEAM, b);
+        if (sent) { ++g_teamRestoresSent; o.sentConn = c->second; }
+        Log("TEAM restore #" + N((long long)o.no) + (sent ? " sent to " : " NOT sent to ") + TeamSlotText(prof) + " (" + when + "): " + swteam::WhyName(o.why)
+            + " from '" + swteam::Clean(o.teamName) + "'" + (o.away ? " while away" : "") + ", pre-join standing rows=" + N((long long)o.snapRows));
+    }
+}
+void TeamChanged(const char* why) { TeamTableSend(0, why); }
+/* the team's standing record (teamwire.h, step 5) to every connected player of team t (only = 0), or to one; sent only after
+   teams.txt holds it (every caller commits first) */
+long long g_teamRecordsSent = 0, g_teamRecordRefused = 0, g_teamSidesKept = 0, g_teamRecordSaves = 0, g_teamRecordSaveFails = 0;
+std::set<unsigned> g_teamRecDirty;   /* team numbers whose record took a DELTA / STANCE since the last save-then-send (TeamTick, 1 Hz) */
+void TeamRecordFlush();
+/* the profile ids connected now */
+std::vector<std::string> TeamOnlineIds()
+{
+    std::vector<std::string> online;
+    for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
+        if (it->first->state == ENET_PEER_STATE_CONNECTED) online.push_back(coopprof::ProfileIdOfKey(it->second));
+    return online;
+}
+std::string FloatText(float v) { std::ostringstream o; o << v; return o.str(); }
+void TeamRecordSend(int t, ENetPeer* only, const char* why)
+{
+    if (t < 0 || (size_t)t >= g_team.teams.size()) return;
+    const swteam::Team& team = g_team.teams[t];
+    if (!team.rec.seeded) return;
+    std::vector<char> b; swteam::EncodeRecord(&b, team.no, team.rec);
+    const std::vector<std::string> ids = swteam::TeamIds(team);
+    long long sent = 0;
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        ENetPeer* p = PeerOfProfile(ids[i]);
+        if (p == 0 || (only != 0 && p != only)) continue;
+        if (SendMsg(p, MSG_TEAM, b)) ++sent;
+    }
+    ++g_teamRecordsSent;
+    if (g_teamRecordsSent <= 60 || g_teamRecordsSent % 50 == 0)
+        Log("TEAM record of team " + N((long long)team.no) + " '" + swteam::Clean(team.name) + "' gen " + N((long long)team.rec.gen) + " (" + N((long long)team.rec.rows.size())
+            + " NPC factions, " + N((long long)team.rec.stances.size()) + " stances) sent to " + N(sent) + " game(s): " + why + " (records sent " + N(g_teamRecordsSent) + ")");
+}
+/* the team's research (teamwire.h RESEARCH, step 6) to its connected players: `only` = that game alone, `skip` = every member but
+   that game (0 = none); a whole list or techs, bySlot = the game a reply answers or the member who finished them (0xFFFFFFFF =
+   a whole research for all) */
+long long g_teamResearchIn = 0, g_teamResearchAdded = 0, g_teamResearchSent = 0, g_teamResearchRefused = 0;
+void TeamResearchSend(int t, ENetPeer* only, ENetPeer* skip, bool whole, unsigned bySlot, const std::vector<std::string>& techs, const char* why)
+{
+    if (t < 0 || (size_t)t >= g_team.teams.size()) return;
+    const swteam::Team& team = g_team.teams[t];
+    std::vector<char> b;
+    if (!swteam::EncodeResearchDown(&b, team.no, whole, bySlot, techs)) { Log("TEAM research of team " + N((long long)team.no) + " NOT sent: more than " + N((long long)swteam::kMaxTechs) + " techs"); return; }
+    const std::vector<std::string> ids = swteam::TeamIds(team);
+    long long sent = 0;
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        ENetPeer* p = PeerOfProfile(ids[i]);
+        if (p == 0 || (only != 0 && p != only) || (skip != 0 && p == skip)) continue;
+        if (SendMsg(p, MSG_TEAM, b)) ++sent;
+    }
+    ++g_teamResearchSent;
+    Log("TEAM research of team " + N((long long)team.no) + " '" + swteam::Clean(team.name) + "' " + (whole ? std::string("whole (") + N((long long)techs.size()) + " techs)" : N((long long)techs.size()) + " tech(s) of s" + N((long long)bySlot))
+        + " sent to " + N(sent) + " game(s): " + why);
+}
+/* a refused request: the requester hears it as a NOTICE whose actor and subject are its own slot */
+void TeamRefuse(ENetPeer* from, const std::string& prof, unsigned ev, int r, const std::string& what)
+{
+    ++g_teamRefused;
+    Log("TEAM " + what + " from " + TeamSlotText(prof) + " REFUSED: " + swteam::ResultName(r) + " (teamRefused=" + N(g_teamRefused) + ")");
+    const unsigned me = TeamWireSlot(prof);
+    std::vector<char> b; swteam::EncodeNotice(&b, ev, (unsigned)r, me, me, std::string());
+    SendMsg(from, MSG_TEAM, b);
+}
+/* invitations that ended unanswered (their time, or their founder's team ended): both players hear the expiry notice */
+void TeamInvitesEnded(const std::vector<swteam::Invite>& gone, const std::string& why)
+{
+    for (size_t i = 0; i < gone.size(); ++i)
+    {
+        Log("TEAM invite " + TeamSlotText(gone[i].from) + " -> " + TeamSlotText(gone[i].to) + " to '" + swteam::Clean(gone[i].name) + "' EXPIRED unanswered: " + why);
+        TeamNotice(gone[i].from, swteam::kEvExpired, swteam::kOk, gone[i].from, gone[i].to, gone[i].name);
+        TeamNotice(gone[i].to, swteam::kEvExpired, swteam::kOk, gone[i].from, gone[i].to, gone[i].name);
+    }
+}
+/* invitations that ended with their founder's team (the founder disbanded or left it, or its last member departed): both players
+   hear that it is gone - no "did not answer", nobody failed to answer */
+void TeamInvitesWithdrawn(const std::vector<swteam::Invite>& gone, const std::string& why)
+{
+    for (size_t i = 0; i < gone.size(); ++i)
+    {
+        Log("TEAM invite " + TeamSlotText(gone[i].from) + " -> " + TeamSlotText(gone[i].to) + " to '" + swteam::Clean(gone[i].name) + "' WITHDRAWN: " + why);
+        TeamNotice(gone[i].from, swteam::kEvInviteGone, swteam::kOk, gone[i].from, gone[i].to, gone[i].name);
+        TeamNotice(gone[i].to, swteam::kEvInviteGone, swteam::kOk, gone[i].from, gone[i].to, gone[i].name);
+    }
+}
+/* a team that ended with its last member's departure (teamwire.h TeamEnd): the founder, left alone, hears it disbanded (as a
+   disband), gets its own restore row when it holds one, and its invitations end */
+void TeamEnded(const swteam::TeamEnd& end, const std::string& why)
+{
+    if (!end.ended) return;
+    Log("TEAM team " + N((long long)end.teamNo) + " '" + swteam::Clean(end.teamName) + "' ENDED: " + why + " - its founder " + TeamSlotText(end.founder) + " was left alone"
+        + (end.row.no != 0 ? " (restore #" + N((long long)end.row.no) + (end.row.away ? " while away" : "") + ": the founder's own pre-join standing)"
+                           : end.rowSkipped ? std::string(" (the founder's restore row NOT made: its restore rows are full)") : std::string(" (no restore row: the founder made the team)")));
+    TeamNotice(end.founder, swteam::kEvDisbanded, swteam::kOk, end.founder, end.founder, end.teamName);
+    TeamInvitesWithdrawn(end.gone, "its team ended with its last member");
+}
+/* the founder's own restore row of a team that ended, sent AFTER the new table (as a disband does), so its game no longer counts
+   the departed member as a teammate when it writes its sides back */
+void TeamEndedOwed(const swteam::TeamEnd& end)
+{
+    if (end.ended && end.row.no != 0) TeamSendOwed(end.founder, "made now");
+}
+void OnTeam(ENetPeer* from, const std::vector<char>& payload)
+{
+    if (g_peerId.count(from) == 0) { ++g_teamNotAdmitted; return; }   /* a lobby connection is nobody yet */
+    swteam::Up u;
+    if (!swteam::DecodeUp(payload.empty() ? 0 : &payload[0], payload.size(), &u)) { ++g_teamMalformed; Log("malformed TEAM from " + PeerName(from) + " - ignored"); return; }
+    ++g_teamIn;
+    const std::string me = ProfileOfPeer(from);
+    const long long nowU = NowUnix();
+    const double now = NowSec();
+    if (u.kind == swteam::kUpAsk) { ++g_teamAsks; TeamTableSend(from, "asked: that game's copy was cleared"); return; }
+    if (u.kind == swteam::kUpInvite)
+    {
+        const std::string to = ProfileOfSlot((int)u.slot);
+        if (g_teamLoadDeferred) { TeamNotSaved("teams.txt is on disk and could not be read at start, so it is not rewritten this session"); TeamRefuse(from, me, swteam::kEvInvite, swteam::kRefNotSaved, "invite to s" + N((long long)u.slot)); return; }
+        const int r = swteam::InviteDecide(&g_team, me, to, !to.empty(), !to.empty() && PeerOfProfile(to) != 0, u.name, now);   /* memory only: an invitation is never in the file */
+        if (r != swteam::kOk) { TeamRefuse(from, me, swteam::kEvInvite, r, "invite to s" + N((long long)u.slot)); return; }
+        const swteam::Invite& v = g_team.invites[swteam::InviteTo(g_team, to)];
+        Log("TEAM invite " + TeamSlotText(me) + " -> " + TeamSlotText(to) + " to '" + swteam::Clean(v.name) + "' (ends in " + N((long long)swteam::kInviteSeconds) + " s)");
+        std::vector<char> b; swteam::EncodeInvited(&b, TeamWireSlot(me), v.name, swteam::kInviteSeconds);
+        SendMsg(PeerOfProfile(to), MSG_TEAM, b);
+        TeamNotice(me, swteam::kEvInvite, swteam::kOk, me, to, v.name);
+    }
+    else if (u.kind == swteam::kUpAnswer)
+    {
+        swteam::Book next = g_team;
+        swteam::Invite v; unsigned teamNo = 0; std::string teamName;
+        int r = swteam::AnswerDecide(&next, me, u.accept != 0, u.snapRows, u.snap, nowU, now, &v, &teamNo, &teamName);
+        if (r == swteam::kOk && u.accept)
+        {
+            const int tj = swteam::TeamOf(next, me);   /* towards a member the pin holds: the joiner's slot leaves the team's stances */
+            if (tj >= 0) swteam::DropStance(&next.teams[tj].rec, TeamWireSlot(me));
+            if (!TeamCommit(&next)) r = swteam::kRefNotSaved;
+        }
+        else { g_team.invites.swap(next.invites); g_team.declined.swap(next.declined); }   /* a decline or a refusal changes the invitations and the decline waits only (memory) */
+        if (r != swteam::kOk)
+        {
+            TeamRefuse(from, me, swteam::kEvAnswer, r, std::string(u.accept ? "accept" : "decline"));
+            if (!v.from.empty() && swteam::AnswerRefusalEndsInvite(r)) TeamNotice(v.from, swteam::kEvAnswer, (unsigned)r, me, v.from, v.name);
+            return;
+        }
+        if (!u.accept)
+        {
+            Log("TEAM decline " + TeamSlotText(me) + " of " + TeamSlotText(v.from) + "'s invitation to '" + swteam::Clean(v.name) + "'");
+            TeamNotice(v.from, swteam::kEvDeclined, swteam::kOk, me, me, v.name);
+            TeamNotice(me, swteam::kEvDeclined, swteam::kOk, me, me, v.name);
+            return;
+        }
+        Log("TEAM accept " + TeamSlotText(me) + " joined team " + N((long long)teamNo) + " '" + swteam::Clean(teamName) + "' (founder " + TeamSlotText(v.from)
+            + "); pre-join standing kept: rows=" + N((long long)u.snapRows) + " bytes=" + N((long long)u.snap.size()));
+        const int t = swteam::TeamOf(g_team, me);
+        if (t >= 0)
+        {
+            TeamNotice(g_team.teams[t].founder, swteam::kEvJoined, swteam::kOk, me, me, teamName);
+            for (size_t m = 0; m < g_team.teams[t].members.size(); ++m) TeamNotice(g_team.teams[t].members[m].id, swteam::kEvJoined, swteam::kOk, me, me, teamName);
+        }
+        TeamChanged("a player joined");
+        TeamRecordSend(swteam::TeamOf(g_team, me), 0, "a player joined");
+    }
+    else if (u.kind == swteam::kUpLeave || u.kind == swteam::kUpRemove)
+    {
+        const bool leave = u.kind == swteam::kUpLeave;
+        const std::string target = leave ? me : ProfileOfSlot((int)u.slot);
+        const int t0 = swteam::TeamOf(g_team, me);
+        const std::string teamName = t0 >= 0 ? g_team.teams[t0].name : std::string();
+        const unsigned teamNo0 = t0 >= 0 ? g_team.teams[t0].no : 0u;
+        const bool founderAlone = leave && t0 >= 0 && g_team.teams[t0].founder == me;   /* a founder may leave only alone: the team ends */
+        std::vector<std::string> others;   /* who hears it: the team as it was */
+        if (t0 >= 0) { others.push_back(g_team.teams[t0].founder); for (size_t m = 0; m < g_team.teams[t0].members.size(); ++m) others.push_back(g_team.teams[t0].members[m].id); }
+        swteam::Book next = g_team;
+        swteam::Owed o; std::vector<swteam::Invite> gone; std::vector<swteam::Owed> sideRows; std::vector<std::string> skipped; swteam::TeamEnd end;
+        const std::vector<std::string> online = TeamOnlineIds();
+        int r = leave ? swteam::LeaveDecide(&next, me, nowU, &o, &gone, &sideRows, &online, &skipped, &end)
+                      : swteam::RemoveDecide(&next, me, target, !target.empty(), !target.empty() && PeerOfProfile(target) != 0, nowU, &o, &sideRows, &online, &skipped, &end);
+        if (r == swteam::kOk && !TeamCommit(&next)) r = swteam::kRefNotSaved;
+        if (r != swteam::kOk) { TeamRefuse(from, me, leave ? swteam::kEvLeave : swteam::kEvRemove, r, leave ? std::string("leave") : "remove of s" + N((long long)u.slot)); return; }
+        Log("TEAM " + std::string(leave ? "leave " : "remove ") + TeamSlotText(target) + " from '" + swteam::Clean(teamName) + "'" + (leave ? std::string() : " by " + TeamSlotText(me))
+            + (o.away ? " while that player is away - the restore row waits for its next join" : std::string())
+            + (founderAlone ? std::string(" - the founder alone: the team ends") : std::string())
+            + (o.no != 0 ? " (restore #" + N((long long)o.no) + ")" : founderAlone ? std::string(" (no restore row: the founder made the team)") : std::string()));
+        for (size_t i = 0; i < others.size(); ++i) TeamNotice(others[i], leave ? swteam::kEvLeft : swteam::kEvRemoved, swteam::kOk, me, target, teamName);
+        TeamInvitesWithdrawn(gone, "its founder left and the team ended");
+        TeamEnded(end, leave ? "its last member left" : "its last member was removed");
+        TeamChanged(end.ended ? "a team ended with its last member" : leave ? "a member left" : "a member was removed");
+        TeamEndedOwed(end);
+        TeamSendOwed(target, "made now");
+        for (size_t i = 0; i < skipped.size(); ++i)
+            Log("TEAM restore NOT made for " + TeamSlotText(skipped[i]) + ": its side towards " + TeamSlotText(target) + " stays as it is - that player's restore rows are full ("
+                + N((long long)swteam::kMaxOwedEach) + "); the departure goes ahead");
+        for (size_t i = 0; i < sideRows.size(); ++i)
+        {
+            Log("TEAM restore #" + N((long long)sideRows[i].no) + " made for " + TeamSlotText(sideRows[i].id) + ": its side towards " + TeamSlotText(target) + " from before the pin ("
+                + N((long long)sideRows[i].sides.size()) + " side(s))");
+            TeamSendOwed(sideRows[i].id, "made now");
+        }
+        /* a team that stays (three players or more): its record - its stance towards the departed player now the founder's side from
+           before the pin (teamwire.h StanceBackOnDeparture) - goes to every connected member AFTER the departure's RESTORE rows; it is
+           every remaining member's side towards the departed player (they get no side row when it carries it - teamwire.h MemberOut),
+           and the founder's game fills no stance towards that player before it arrives */
+        if (!end.ended && teamNo0 != 0)
+            for (size_t t = 0; t < g_team.teams.size(); ++t)
+                if (g_team.teams[t].no == teamNo0) TeamRecordSend((int)t, 0, leave ? "a member left - the team stays" : "a member was removed - the team stays");
+    }
+    else if (u.kind == swteam::kUpDisband)
+    {
+        std::vector<std::string> online;
+        for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it)
+            if (it->first->state == ENET_PEER_STATE_CONNECTED) online.push_back(coopprof::ProfileIdOfKey(it->second));
+        swteam::Book next = g_team;
+        std::vector<swteam::Owed> made; std::string teamName; std::vector<swteam::Invite> gone;
+        int r = swteam::DisbandDecide(&next, me, online, nowU, &made, &teamName, &gone);
+        if (r == swteam::kOk && !TeamCommit(&next)) r = swteam::kRefNotSaved;
+        if (r != swteam::kOk) { TeamRefuse(from, me, swteam::kEvDisband, r, "disband"); return; }
+        size_t membersOut = 0; unsigned founderRow = 0;
+        for (size_t i = 0; i < made.size(); ++i) { if (made[i].id == me) founderRow = made[i].no; else ++membersOut; }
+        Log("TEAM disband '" + swteam::Clean(teamName) + "' by " + TeamSlotText(me) + " - " + N((long long)membersOut) + " member(s) out, a restore row each"
+            + (founderRow != 0 ? "; the founder's own pre-join standing too (restore #" + N((long long)founderRow) + ")" : std::string()));
+        TeamNotice(me, swteam::kEvDisbanded, swteam::kOk, me, me, teamName);
+        for (size_t i = 0; i < made.size(); ++i) if (made[i].id != me) TeamNotice(made[i].id, swteam::kEvDisbanded, swteam::kOk, me, made[i].id, teamName);
+        TeamInvitesWithdrawn(gone, "its founder disbanded the team");
+        TeamChanged("a team was disbanded");
+        for (size_t i = 0; i < made.size(); ++i) TeamSendOwed(made[i].id, "made now");
+    }
+    else if (u.kind == swteam::kUpSeed || u.kind == swteam::kUpDelta || u.kind == swteam::kUpStance)
+    {
+        /* the team's standing record (step 5). A SEED is saved and sent at once; DELTAs and STANCEs are taken into the record in
+           memory and the team's record is saved, then sent, at most once a second (TeamRecordFlush on the 1 Hz tick) - every
+           other change of the table saves them with it. A change that moves nothing is not a new generation. */
+        swteam::Book next = g_team;
+        int r = swteam::kOk; bool changed = true;
+        std::string what;
+        if (u.kind == swteam::kUpSeed) { r = swteam::SeedDecide(&next, me, u.rec); what = "seed (" + N((long long)u.rec.rows.size()) + " NPC factions, " + N((long long)u.rec.stances.size()) + " stances)"; }
+        else if (u.kind == swteam::kUpDelta) { r = swteam::DeltaDecide(&next, me, u.deltas, &changed); what = "delta (" + N((long long)u.deltas.size()) + " change(s))"; }
+        else
+        {
+            const std::string target = ProfileOfSlot((int)u.slot);
+            const int tm = swteam::TeamOf(next, me);
+            r = swteam::StanceDecide(&next, me, u.slot, tm >= 0 && !target.empty() && swteam::TeamOf(next, target) == tm, u.rel, u.flags, &changed);
+            what = "stance towards s" + N((long long)u.slot) + " = " + FloatText(u.rel);
+        }
+        if (r == swteam::kOk && u.kind == swteam::kUpSeed && !TeamCommit(&next)) r = swteam::kRefNotSaved;
+        if (r != swteam::kOk)
+        {
+            ++g_teamRecordRefused;
+            if (g_teamRecordRefused <= 20) Log("TEAM " + what + " from " + TeamSlotText(me) + " REFUSED: " + swteam::ResultName(r) + " (recordRefused=" + N(g_teamRecordRefused) + ")");
+            return;
+        }
+        if (!changed) return;
+        if (u.kind != swteam::kUpSeed) { g_team.teams.swap(next.teams); }
+        const int t = swteam::TeamOf(g_team, me);
+        if (u.kind != swteam::kUpDelta || g_teamRecordsSent < 60)
+            Log("TEAM " + what + " from " + TeamSlotText(me) + " taken into team " + N((long long)g_team.teams[t].no) + "'s record, gen " + N((long long)g_team.teams[t].rec.gen)
+                + (u.kind == swteam::kUpSeed ? std::string() : std::string(" - saved and sent within a second")));
+        if (u.kind == swteam::kUpSeed) TeamRecordSend(t, 0, "seeded by the founder");
+        else g_teamRecDirty.insert(g_team.teams[t].no);
+    }
+    else if (u.kind == swteam::kUpSide)
+    {
+        swteam::Book next = g_team; bool kept = false;
+        const std::string other = ProfileOfSlot((int)u.slot);
+        int r = swteam::SideDecide(&next, me, TeamWireSlot(me), other, u.slot, u.rel, u.flags, &kept);
+        if (r == swteam::kOk && kept && !TeamCommit(&next)) r = swteam::kRefNotSaved;
+        if (r != swteam::kOk) { Log("TEAM side of " + TeamSlotText(me) + " towards s" + N((long long)u.slot) + " REFUSED: " + swteam::ResultName(r)); return; }
+        if (kept) { ++g_teamSidesKept; Log("TEAM side of " + TeamSlotText(me) + " towards " + TeamSlotText(other) + " before the pin kept: " + FloatText(u.rel) + " flags " + N((long long)u.flags) + " (sides kept " + N(g_teamSidesKept) + ")"); }
+    }
+    else if (u.kind == swteam::kUpResearch)
+    {
+        /* the team's research (step 6): what the team lacks is added and saved first; the sender is answered - a whole list with
+           the team's whole research, its own finishes with the techs it sent (bySlot = the sender in both), a refusal with a
+           NOTICE research-whole / research-own (its game keeps the list and sends it again); when the union grew, every other
+           connected member gets the whole research again (after a whole list) or the new techs with the finisher's slot */
+        ++g_teamResearchIn;
+        swteam::Book next = g_team; std::vector<std::string> added;
+        int r = swteam::ResearchDecide(&next, me, u.techs, &added);
+        if (r == swteam::kOk && !added.empty() && !TeamCommit(&next)) r = swteam::kRefNotSaved;
+        if (r != swteam::kOk)
+        {
+            ++g_teamResearchRefused;
+            TeamRefuse(from, me, u.whole ? swteam::kEvResearchWhole : swteam::kEvResearchOwn, r,
+                       "research (" + std::string(u.whole ? "whole list" : "own finishes") + ", " + N((long long)u.techs.size()) + " techs; researchRefused=" + N(g_teamResearchRefused) + ")");
+            return;
+        }
+        g_teamResearchAdded += (long long)added.size();
+        const int t = swteam::TeamOf(g_team, me);
+        std::string names;
+        for (size_t i = 0; i < added.size() && i < 8; ++i) names += (i ? ", " : "") + SanitizeForLog(added[i]);
+        if (added.size() > 8) names += ", ...";
+        Log("TEAM research (" + std::string(u.whole ? "whole list" : "own finishes") + ", " + N((long long)u.techs.size()) + " techs) from " + TeamSlotText(me) + ": "
+            + N((long long)added.size()) + " new to team " + N((long long)g_team.teams[t].no) + (added.empty() ? std::string() : " (" + names + ") - saved") + "; the team holds "
+            + N((long long)g_team.teams[t].research.size()));
+        if (u.whole) TeamResearchSend(t, from, 0, true, TeamWireSlot(me), g_team.teams[t].research, "the answer to its whole list");
+        else
+        {
+            std::vector<std::string> sent(u.techs);
+            std::sort(sent.begin(), sent.end()); sent.erase(std::unique(sent.begin(), sent.end()), sent.end());
+            TeamResearchSend(t, from, 0, false, TeamWireSlot(me), sent, "the answer to its own finishes");
+        }
+        if (!added.empty())
+        {
+            if (u.whole) TeamResearchSend(t, 0, from, true, 0xFFFFFFFFu, g_team.teams[t].research, "the team's research grew");
+            else TeamResearchSend(t, 0, from, false, TeamWireSlot(me), added, "a member finished research");
+        }
+    }
+    else if (u.kind == swteam::kUpRestoreDone)
+    {
+        swteam::Book next = g_team;
+        if (!swteam::RestoreDone(&next, me, u.no)) { Log("TEAM restore #" + N((long long)u.no) + " done from " + TeamSlotText(me) + " - no such row for that player (already done)"); return; }
+        if (!TeamCommit(&next)) { Log("TEAM restore #" + N((long long)u.no) + " done from " + TeamSlotText(me) + " - the row is KEPT (not-saved): it goes again at that game's next join"); return; }
+        ++g_teamRestoresDone;
+        Log("TEAM restore #" + N((long long)u.no) + " applied by " + TeamSlotText(me) + " - the row is dropped (restoresDone=" + N(g_teamRestoresDone) + ")");
+    }
+}
+/* WELCOME: a new connection serial, the table to the new game, and every restore row owed to its player (a removal while away) */
+void TeamWelcomePush(ENetPeer* to)
+{
+    g_teamConn[to] = ++g_teamConnNext;
+    TeamTableSend(to, "a game was admitted");
+    TeamSendOwed(ProfileOfPeer(to), "at its join");
+    TeamRecordFlush();   /* the changes of this second saved first: what this member is sent is on the disk */
+    const int t = swteam::TeamOf(g_team, ProfileOfPeer(to));
+    if (t >= 0 && g_teamRecDirty.count(g_team.teams[t].no) != 0)
+    {
+        Log("TEAM record of team " + N((long long)g_team.teams[t].no) + " NOT sent to the admitted member: its latest changes could not be saved - it goes"
+            " to every connected member with the next save that succeeds");
+        return;
+    }
+    TeamRecordSend(t, to, "a member was admitted");
+}
+/* a connection closed: its serial goes; invitations from or to that player end; the other side hears it */
+void TeamPeerGone(ENetPeer* p)
+{
+    g_teamConn.erase(p);
+    const std::string prof = ProfileOfPeer(p);
+    if (prof.empty()) return;
+    std::vector<swteam::Invite> gone; swteam::DropInvitesOf(&g_team, prof, &gone);
+    for (size_t i = 0; i < gone.size(); ++i)
+    {
+        Log("TEAM invite " + TeamSlotText(gone[i].from) + " -> " + TeamSlotText(gone[i].to) + " ended: " + TeamSlotText(prof) + "'s connection closed");
+        const std::string other = gone[i].from == prof ? gone[i].to : gone[i].from;
+        TeamNotice(other, swteam::kEvInviteGone, swteam::kOk, gone[i].from, gone[i].to, gone[i].name);
+    }
+}
+/* a profile was deleted (owner 482 a; OnProfiles, and at start for profiles.txt rows deleted while this process was not running):
+   a member out with no restore row (a team that stays takes the founder's side from before the pin as its stance towards it), a
+   founder's role to the member who joined first, a founder alone's team ended (teamwire.h ProfileDeletedDecide). push = the table
+   to every game. */
+void TeamProfileDeleted(const std::string& prof, bool push)
+{
+    swteam::Book next = g_team; std::vector<swteam::Invite> gone; std::string name, newFounder; unsigned dropped = 0; swteam::TeamEnd end;
+    const int tWas = swteam::TeamOf(g_team, prof);
+    const unsigned teamNoWas = tWas >= 0 ? g_team.teams[tWas].no : 0u;
+    const std::vector<std::string> online = TeamOnlineIds();
+    const int k = swteam::ProfileDeletedDecide(&next, prof, &gone, &name, &newFounder, &dropped, NowUnix(), &online, &end);
+    if (k == swteam::kDelNone && dropped == 0 && gone.empty()) return;
+    if (!TeamCommit(&next))
+    {
+        Log("TEAM profile " + prof + " deleted - the membership table could NOT be saved (not-saved): it names that profile until the deletion is applied at the next start");
+        return;
+    }
+    const std::string what = k == swteam::kDelMember ? std::string("a member - taken out, no restore row")
+        : k == swteam::kDelFounderPassed ? "the founder - the founder role passes to " + TeamSlotText(newFounder) + " (" + newFounder + "), the member who joined first"
+        : k == swteam::kDelTeamEnded ? std::string("the founder with no members - the team ends")
+        : k == swteam::kDelLastEnded ? std::string("one of the team's two players - the other is left alone and the team ends as a disband") : std::string("in no team");
+    Log("TEAM profile " + prof + " deleted: " + what + (name.empty() ? std::string() : " of '" + swteam::Clean(name) + "'") + "; " + N((long long)dropped)
+        + " restore row(s) for it dropped, " + N((long long)gone.size()) + " invitation(s) ended");
+    TeamInvitesEnded(gone, "a player's profile was deleted");
+    TeamEnded(end, "a profile was deleted");
+    if (push) { TeamChanged("a profile was deleted"); TeamEndedOwed(end); }
+    if (push && (k == swteam::kDelMember || k == swteam::kDelFounderPassed))   /* the team stays: its members' games wait for the record after a departure */
+        for (size_t t = 0; t < g_team.teams.size(); ++t)
+            if (g_team.teams[t].no == teamNoWas) TeamRecordSend((int)t, 0, "a member's profile was deleted - the team stays");
+}
+/* the 1 Hz tick: invitations past their time end; the founder hears "did not answer" and the invitee that it is gone */
+/* the records that took changes since the last flush: saved (teams.txt), and only then sent to every connected member; a save
+   that fails keeps them waiting for the next second */
+void TeamRecordFlush()
+{
+    if (g_teamRecDirty.empty()) return;
+    swteam::Book next = g_team;
+    if (!TeamCommit(&next))
+    {
+        ++g_teamRecordSaveFails;
+        if (g_teamRecordSaveFails <= 5) Log("TEAM records NOT saved (" + N((long long)g_teamRecDirty.size()) + " team(s)) - not sent; tried again in a second");
+        return;
+    }
+    ++g_teamRecordSaves;
+    const std::set<unsigned> dirty = g_teamRecDirty;
+    g_teamRecDirty.clear();
+    for (std::set<unsigned>::const_iterator it = dirty.begin(); it != dirty.end(); ++it)
+        for (size_t t = 0; t < g_team.teams.size(); ++t) if (g_team.teams[t].no == *it) TeamRecordSend((int)t, 0, "members' changes and the founder's stances of the last second");
+}
+/* the final save at quit (QuitSave): the dirty team records saved (teams.txt only - not sent; the once-a-second tick still sends
+   them if the process lives that long) and the world-relations file when a row changed since its last write. LOOP THREAD ONLY. */
+std::string QuitSaveNow()
+{
+    std::string said;
+    if (coopwq::QuitSaveFile(!g_teamRecDirty.empty(), g_teamLoadDeferred != 0))
+    {
+        swteam::Book next = g_team;
+        said = TeamCommit(&next) ? "team records of " + N((long long)g_teamRecDirty.size()) + " team(s) saved to teams.txt"
+                                 : "team records of " + N((long long)g_teamRecDirty.size()) + " team(s) NOT saved (teams.txt could not be written)";
+    }
+    else said = g_teamRecDirty.empty() ? "team records: nothing unsaved" : "team records: teams.txt was unreadable at start - not rewritten";
+    if (coopwq::QuitSaveFile(g_wrelDirty != 0, g_wrelLoadDeferred != 0))
+    {
+        if (WriteWorldRel()) { ++g_wrelWrites; g_wrelDirty = 0; said += "; world_relations.txt saved (" + N((long long)g_wrel.size()) + " rows)"; }
+        else { ++g_wrelWriteFailed; said += "; world_relations.txt NOT saved (could not be written)"; }
+    }
+    else said += g_wrelDirty == 0 ? "; world relations: nothing unsaved" : "; world relations: world_relations.txt was unreadable at start - not rewritten";
+    return said;
+}
+/* the loop's side of the final save: asked by a quit door on another thread, made here, answered */
+void QuitSaveCheck()
+{
+    if (InterlockedExchange(&g_quitSaveAsked, 0) == 0) return;
+    Log("quit save (asked by the quitting thread): " + QuitSaveNow());
+    if (g_quitSaveDone != 0) SetEvent(g_quitSaveDone);
+}
+void TeamTick()
+{
+    TeamRecordFlush();
+    std::vector<swteam::Invite> gone; swteam::ExpireInvites(&g_team, NowSec(), &gone);
+    TeamInvitesEnded(gone, "after " + N((long long)swteam::kInviteSeconds) + " s");
+}
+
+typedef char T556FallenNumberAgrees[(MSG_FALLEN == (int)swfallen::kMsgFallen) ? 1 : -1];   /* a compile error here = fallenwire.h and this file disagree */
+/* ================= T-556: THE FALLEN LIST - each profile's last 40 dead characters (src/common/fallenwire.h) =================
+   This process is the only writer of every profile's fallen list. fallen.txt in the world's folder holds the listed rows and the
+   PENDING rows (brought back, not yet in that player's finished save). A change is decided on a copy of the book; the copy
+   becomes the book only once fallen.txt holds it (written whole through a temp file and a write-through rename, and only when its
+   text changed). A change that cannot be written - or any change while a fallen.txt that is on disk could not be read at start -
+   is refused (not-saved), and the game is sent the list as it stands, so its copy never shows a row this process does not keep.
+   The profile's game gets its whole list, its pending rows and its back rows (TABLE) at its WELCOME, after every message it
+   sends, and when it ASKs. The list follows the player's save: TAKE makes a row pending, SAVED makes it final (a back row, which
+   the game counts for the resurrection price while its character lives), UNDO puts it back on the list, ALIVE drops a row whose
+   character is alive in that game's loaded world (fallenwire.h).
+   A named character's row (unique, with a string id) also moves its uniques.txt row: TAKE marks it BROUGHT BACK (ALIVE, BACK + 1),
+   UNDO marks it DEAD again (BACK - 1). uniques.txt is written FIRST; if that write fails (and the file is not on a deferred load,
+   where memory keeps the change and the merge adds it later) the request is refused and nothing changes; if fallen.txt then
+   fails, the uniques row is put back and written again. The changed row goes to every subscribed game, the sender included. */
+swfallen::Book g_fallen;
+int g_fallenLoadDeferred = 0;
+std::string g_fallenFileText;   /* the text fallen.txt holds (as read at start, or as last written) */
+int g_fallenNotSavedSaid = 0;
+long long g_fallenAdds = 0, g_fallenTakes = 0, g_fallenTakeMissing = 0, g_fallenAsks = 0, g_fallenMalformed = 0, g_fallenNotAdmitted = 0, g_fallenNotSaved = 0, g_fallenTables = 0;
+long long g_fallenBroughtBackUniques = 0, g_fallenAlive = 0, g_fallenSaved = 0, g_fallenUndone = 0, g_fallenUniqueRefused = 0;
+std::string FallenFile() { return g_dir + "\\fallen.txt"; }
+std::string FallenRowText(const swfallen::Fallen& f)
+{
+    return "uid " + N((long long)f.uid) + " '" + SanitizeForLog(f.name) + "' template '" + SanitizeForLog(f.templateName) + "'"
+           + (f.unique ? " unique sid '" + SanitizeForLog(f.sid) + "'" : std::string()) + (f.animal ? " animal" : "")
+           + " place '" + SanitizeForLog(swfallen::PlaceWords(f.place)) + "'";
+}
+bool FallenNotSaved(const std::string& why)
+{
+    ++g_fallenNotSaved;
+    if (!g_fallenNotSavedSaid)
+    {
+        g_fallenNotSavedSaid = 1;
+        Log("FALLEN: " + why + " - every change to the fallen lists is REFUSED (not-saved) while this lasts; said once (fallenNotSaved counts each refusal)");
+    }
+    return false;
+}
+/* `next` (a changed copy of the book) becomes the book once fallen.txt holds it. false = refused: g_fallen is unchanged. */
+bool FallenCommit(swfallen::Book* next)
+{
+    if (g_fallenLoadDeferred) return FallenNotSaved("fallen.txt is on disk and could not be read at start, so it is not rewritten this session");
+    const std::string text = swfallen::BookFile(*next);
+    if (text != g_fallenFileText)
+    {
+        if (!WriteWholeFile(FallenFile(), text, true)) return FallenNotSaved("fallen.txt could not be written");
+        g_fallenFileText = text;
+        g_fallenNotSavedSaid = 0;
+    }
+    g_fallen.lists.swap(next->lists);
+    g_fallen.pending.swap(next->pending);
+    g_fallen.back.swap(next->back);
+    return true;
+}
+void LoadFallen()
+{
+    g_fallen = swfallen::Book();
+    g_fallenFileText.clear(); g_fallenNotSavedSaid = 0;
+    const FileProbe rp = ProbeFile(FallenFile());
+    if (rp.kind == coopstore::kFileUnreadable)
+    {
+        g_fallenLoadDeferred = 1;
+        Log("FALLEN: fallen.txt is ON DISK (" + N(rp.attrLen) + " bytes) and could NOT BE READ (error " + N((long long)rp.err)
+            + ") - it is NOT rewritten this session, and every change to the fallen lists is refused (not-saved)");
+        return;
+    }
+    g_fallenLoadDeferred = 0;
+    if (rp.kind != coopstore::kFileReadable) { Log("FALLEN: no fallen.txt yet - no character of any player has died in this world"); return; }
+    std::istringstream f(TextOf(rp));
+    std::string line; long long bad = 0, dup = 0, over = 0, overBack = 0;
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line == "\r") continue;
+        int why = swfallen::kLineOk;
+        if (!swfallen::BookParseLine(line, &g_fallen, &why)) { if (why == swfallen::kLineDuplicate) ++dup; else if (why == swfallen::kLineOverKeep) ++over; else if (why == swfallen::kLineOverBack) ++overBack; else ++bad; }
+    }
+    g_fallenFileText = swfallen::BookFile(g_fallen);
+    Log("FALLEN: fallen.txt loaded - " + N((long long)swfallen::BookRows(g_fallen)) + " listed, " + N((long long)swfallen::BookPendingRows(g_fallen))
+        + " pending (brought back, not yet saved) and " + N((long long)swfallen::BookBackRows(g_fallen)) + " back (brought back, in a save) row(s); " + N(bad) + " unusable line(s), " + N(dup) + " duplicate row(s), " + N(over)
+        + " row(s) past the " + N((long long)swfallen::kFallenKeep) + " a list (or its pending rows) keeps, " + N(overBack) + " back row(s) past the "
+        + N((long long)swfallen::kBackMax) + " a profile keeps - refused");
+}
+/* the profile's whole list, its pending rows and its back rows to its connected game */
+void FallenTableSend(const std::string& prof, const char* why)
+{
+    ENetPeer* p = PeerOfProfile(prof);
+    const std::vector<swfallen::Fallen> rows = swfallen::BookList(g_fallen, prof);
+    const std::vector<swfallen::Pend> pend = swfallen::BookPending(g_fallen, prof);
+    const std::vector<swfallen::BackRow> back = swfallen::BookBack(g_fallen, prof);
+    if (p == 0) { Log("FALLEN table for " + TeamSlotText(prof) + " (" + std::string(why) + ") NOT sent: that player's game is not connected"); return; }
+    std::vector<char> b; swfallen::EncodeTable(&b, rows, pend, back);
+    long long backDied = 0;
+    for (size_t i = 0; i < back.size(); ++i) if (back[i].diedUid != 0) ++backDied;
+    const bool sent = SendMsg(p, MSG_FALLEN, b);
+    ++g_fallenTables;
+    std::string names;
+    for (size_t i = 0; i < rows.size(); ++i) names += (i ? ", " : "") + std::string("'") + SanitizeForLog(rows[i].name) + "'";
+    std::string pnames;
+    for (size_t i = 0; i < pend.size(); ++i) pnames += (i ? ", " : "") + std::string("'") + SanitizeForLog(pend[i].row.name) + "'";
+    Log("FALLEN table (" + std::string(why) + ") " + (sent ? "sent to " : "NOT sent to ") + TeamSlotText(prof) + ": " + N((long long)rows.size()) + " row(s)"
+        + (rows.empty() ? std::string() : " [" + names + "]") + ", " + N((long long)pend.size()) + " pending" + (pend.empty() ? std::string() : " [" + pnames + "]")
+        + ", " + N((long long)back.size()) + " back (" + N(backDied) + " known dead)"
+        + ", " + N((long long)b.size()) + " bytes");
+}
+/* A named character's uniques.txt row moved by a TAKE (bringBack) or an UNDO, written BEFORE fallen.txt. *old = the row as it was
+   (have = it existed). false = refused: uniques.txt could not be written (memory is put back). */
+bool FallenUniqueMove(const swfallen::Fallen& f, bool bringBack, UniqueRow* old, bool* had, int* was)
+{
+    std::map<std::string, UniqueRow>::iterator ex = g_uniques.find(f.sid);
+    *had = ex != g_uniques.end();
+    *old = *had ? ex->second : UniqueRow();
+    UniqueRow r = *old;
+    *was = *had ? r.state : -1;
+    if (bringBack) swfallen::UniqueOnBringBack(*had, &r); else swfallen::UniqueOnUndo(&r);
+    g_uniques[f.sid] = r;
+    if (WriteUniques() || g_uniquesLoadDeferred) return true;   /* deferred: memory holds it, and the merge adds it to the file */
+    if (*had) g_uniques[f.sid] = *old; else g_uniques.erase(f.sid);
+    ++g_fallenUniqueRefused;
+    Log("UNIQUE " + SanitizeForLog(f.sid) + (bringBack ? " bring-back" : " undo") + " REFUSED: uniques.txt could not be written - nothing changed");
+    return false;
+}
+long long g_fallenUniquePutBackFailed = 0;
+void FallenUniquePutBack(const swfallen::Fallen& f, const UniqueRow& old, bool had)
+{
+    if (had) g_uniques[f.sid] = old; else g_uniques.erase(f.sid);
+    if (WriteUniques() || g_uniquesLoadDeferred) return;
+    ++g_fallenUniquePutBackFailed;
+    Log("UNIQUE " + SanitizeForLog(f.sid) + ": putting its row back after fallen.txt refused the change, uniques.txt could NOT be rewritten - the file"
+        " still holds the change until its next successful write (memory holds the row as it was; uniquePutBackFailed="
+        + N(g_fallenUniquePutBackFailed) + ")");
+}
+void FallenUniqueAnnounce(ENetHost* host, const swfallen::Fallen& f, bool bringBack, int was)
+{
+    const UniqueRow& r = g_uniques[f.sid];
+    if (bringBack) ++g_fallenBroughtBackUniques;
+    Log("UNIQUE " + SanitizeForLog(f.sid) + (bringBack ? " BROUGHT BACK (" : " bring-back UNDONE (")
+        + (was < 0 ? std::string("no row before - its death never reached this process") : "was state " + N((long long)was))
+        + ") -> state " + N((long long)r.state) + ", brought back " + N((long long)r.back) + " time(s)"
+        + (g_uniquesLoadDeferred ? "; uniques.txt is on a deferred load - held in memory and merged when it opens" : "; uniques.txt written")
+        + "; sent to every subscribed game");
+    UniqueBroadcast(host, 0, f.sid, r);
+}
+void OnFallen(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
+{
+    if (g_peerId.count(from) == 0) { ++g_fallenNotAdmitted; return; }   /* a lobby connection is nobody yet */
+    swfallen::Up u;
+    if (!swfallen::DecodeUp(payload.empty() ? 0 : &payload[0], payload.size(), &u)) { ++g_fallenMalformed; Log("malformed FALLEN from " + PeerName(from) + " (" + N((long long)payload.size()) + " bytes) - ignored"); return; }
+    const std::string me = ProfileOfPeer(from), who = TeamSlotText(me);
+    if (u.kind == swfallen::kUpAsk) { ++g_fallenAsks; FallenTableSend(me, "asked: that game's copy was cleared"); return; }
+    if (u.kind == swfallen::kUpAdd)
+    {
+        swfallen::Book next = g_fallen;
+        const int cut = swfallen::BookAdd(&next, me, u.snap);
+        long long diedNow = 0;   /* back rows this death marks dead (a brought-back character died again) */
+        { const std::vector<swfallen::BackRow> now = swfallen::BookBack(next, me);
+          for (size_t i = 0; i < now.size(); ++i) if (now[i].diedUid == u.snap.uid && u.snap.handSerial != 0 && now[i].newSerial == u.snap.handSerial) ++diedNow; }
+        if (!FallenCommit(&next)) { Log("FALLEN add from " + who + " REFUSED (not-saved): " + FallenRowText(u.snap)); FallenTableSend(me, "an add was refused"); return; }
+        ++g_fallenAdds;
+        Log("FALLEN add from " + who + ": " + FallenRowText(u.snap) + " died (cause " + swfallen::CauseWord(u.snap.cause) + ") - "
+            + N((long long)swfallen::BookList(g_fallen, me).size()) + "/" + N((long long)swfallen::kFallenKeep) + " kept, " + N((long long)cut) + " oldest cut"
+            + (diedNow ? "; a brought-back character (serial " + N((long long)u.snap.handSerial) + ") died again - its back row is marked dead" : std::string()));
+        FallenTableSend(me, "a character died");
+        return;
+    }
+    if (u.kind == swfallen::kUpAlive)
+    {
+        swfallen::Book next = g_fallen; swfallen::Fallen gone;
+        if (!swfallen::BookAlive(&next, me, u.uid, &gone)) { Log("FALLEN alive-in-save uid " + N((long long)u.uid) + " from " + who + " - no such listed row"); FallenTableSend(me, "an alive named no row"); return; }
+        if (!FallenCommit(&next)) { Log("FALLEN alive-in-save from " + who + " REFUSED (not-saved): " + FallenRowText(gone) + " stays listed"); FallenTableSend(me, "an alive was refused"); return; }
+        ++g_fallenAlive;
+        Log("FALLEN alive-in-save from " + who + ": " + FallenRowText(gone) + " is ALIVE in that player's loaded world (its save predates the death) - dropped (a back row it had marked dead is alive again)");
+        FallenTableSend(me, "a row's character is alive in the save");
+        return;
+    }
+    if (u.kind == swfallen::kUpSaved)
+    {
+        swfallen::Book next = g_fallen; std::vector<swfallen::Pend> done; long long missing = 0, livingDropped = 0;
+        for (size_t i = 0; i < u.uids.size(); ++i) { swfallen::Pend p; int ld = 0; if (swfallen::BookSavedFinal(&next, me, u.uids[i], &p, &ld)) { done.push_back(p); livingDropped += ld; } else ++missing; }
+        if (done.empty()) { Log("FALLEN saved from " + who + ": " + N((long long)u.uids.size()) + " bring-back(s) named, none pending (already final)"); return; }
+        if (!FallenCommit(&next)) { Log("FALLEN saved from " + who + " REFUSED (not-saved): " + N((long long)done.size()) + " bring-back(s) stay pending"); FallenTableSend(me, "a saved was refused"); return; }
+        g_fallenSaved += (long long)done.size();
+        for (size_t i = 0; i < done.size(); ++i)
+            Log("FALLEN saved from " + who + ": " + FallenRowText(done[i].row) + " brought back as serial " + N((long long)done[i].newSerial) + " - in that player's save, FINAL (kept as a back row: it counts toward that player's resurrection price while alive)"
+                + (done[i].diedUid != 0 ? "; already dead (death uid " + N((long long)done[i].diedUid) + ")" : std::string()));
+        if (livingDropped) Log("FALLEN saved from " + who + ": that player has more than " + N((long long)swfallen::kBackMax) + " back rows and no dead one left to drop - "
+                               + N(livingDropped) + " oldest LIVING back row(s) dropped (those characters no longer count toward the resurrection price)");
+        if (missing) Log("FALLEN saved from " + who + ": " + N(missing) + " more named, not pending (already final)");
+        FallenTableSend(me, "a bring-back is in a finished save");
+        return;
+    }
+    if (u.kind == swfallen::kUpUndo)
+    {
+        swfallen::Book next = g_fallen; swfallen::Pend p; int cut = 0; std::vector<swfallen::Fallen> samePerson;
+        if (!swfallen::BookUndo(&next, me, u.uid, &p, &cut, &samePerson)) { Log("FALLEN undo uid " + N((long long)u.uid) + " from " + who + " - no such pending row (already final)"); FallenTableSend(me, "an undo named no row"); return; }
+        const bool named = p.row.unique && !p.row.sid.empty();
+        UniqueRow old; bool had = false; int was = -1;
+        if (named && !FallenUniqueMove(p.row, false, &old, &had, &was)) { FallenTableSend(me, "an undo was refused"); return; }
+        if (!FallenCommit(&next))
+        {
+            if (named) FallenUniquePutBack(p.row, old, had);
+            Log("FALLEN undo from " + who + " REFUSED (not-saved): " + FallenRowText(p.row) + " stays pending");
+            FallenTableSend(me, "an undo was refused");
+            return;
+        }
+        ++g_fallenUndone;
+        Log("FALLEN undo from " + who + ": " + FallenRowText(p.row) + " - its bring-back (serial " + N((long long)p.newSerial)
+            + ") is not in that player's loaded world, so the row is back on the list" + (cut ? " (" + N((long long)cut) + " oldest cut)" : std::string()));
+        for (size_t i = 0; i < samePerson.size(); ++i)
+            Log("FALLEN undo from " + who + ": " + FallenRowText(samePerson[i]) + " was the brought-back character's own later death (serial "
+                + N((long long)p.newSerial) + ", never in that world) - dropped, one person keeps one row");
+        if (named) FallenUniqueAnnounce(host, p.row, false, was);
+        FallenTableSend(me, "a bring-back was undone");
+        return;
+    }
+    /* TAKE. A TAKE sent again for a row already pending is answered as already pending; otherwise it is refused while that player
+       already has kFallenKeep bring-backs waiting for a save (a game refuses first: resurrect.cpp). */
+    const std::vector<swfallen::Pend> pendNow = swfallen::BookPending(g_fallen, me);
+    for (size_t i = 0; i < pendNow.size(); ++i)
+        if (pendNow[i].row.uid == u.uid)
+        {
+            ++g_fallenTakeMissing;
+            Log("FALLEN take of uid " + N((long long)u.uid) + " from " + who + " - already pending (brought back as serial " + N((long long)pendNow[i].newSerial) + ")");
+            FallenTableSend(me, "a take named a row already pending");
+            return;
+        }
+    if ((int)pendNow.size() >= swfallen::kFallenKeep)
+    {
+        Log("FALLEN take of uid " + N((long long)u.uid) + " from " + who + " REFUSED: " + N((long long)swfallen::kFallenKeep)
+            + " bring-backs already wait for that player's save - the row stays on the list");
+        FallenTableSend(me, "a take was refused: too many pending");
+        return;
+    }
+    swfallen::Book next = g_fallen;
+    swfallen::Fallen taken;
+    if (!swfallen::BookTake(&next, me, u.uid, u.newSerial, &taken, u.takenUnix))
+    {
+        ++g_fallenTakeMissing;
+        Log("FALLEN take of uid " + N((long long)u.uid) + " from " + who + " - no such row in that player's list (already taken)");
+        FallenTableSend(me, "a take named no row");
+        return;
+    }
+    const bool named = taken.unique && !taken.sid.empty();
+    UniqueRow old; bool had = false; int was = -1;
+    if (named && !FallenUniqueMove(taken, true, &old, &had, &was)) { FallenTableSend(me, "a take was refused"); return; }
+    if (!FallenCommit(&next))
+    {
+        if (named) FallenUniquePutBack(taken, old, had);
+        Log("FALLEN take from " + who + " REFUSED (not-saved): " + FallenRowText(taken) + " stays on the list");
+        FallenTableSend(me, "a take was refused");
+        return;
+    }
+    ++g_fallenTakes;
+    Log("FALLEN take from " + who + ": " + FallenRowText(taken) + " was brought back as serial " + N((long long)u.newSerial)
+        + " - pending until that player's save has it; " + N((long long)swfallen::BookList(g_fallen, me).size()) + " row(s) left on the list");
+    if (named) FallenUniqueAnnounce(host, taken, true, was);
+    FallenTableSend(me, "a character was brought back");
+}
+void FallenWelcomePush(ENetPeer* to) { FallenTableSend(ProfileOfPeer(to), "a game was admitted"); }
+/* a deleted profile's list and pending rows go with it (OnProfiles, and at start for profiles.txt rows deleted while this process
+   was not running) */
+void FallenProfileDeleted(const std::string& prof)
+{
+    swfallen::Book next = g_fallen;
+    const size_t dropped = swfallen::BookProfileDeleted(&next, prof);
+    if (dropped == 0) return;
+    if (!FallenCommit(&next)) { Log("FALLEN profile " + prof + " deleted - its " + N((long long)dropped) + " row(s) could NOT be dropped (not-saved): dropped at the next start"); return; }
+    Log("FALLEN profile " + prof + " deleted - its " + N((long long)dropped) + " fallen row(s) dropped");
+}
+void FallenProfilesReconcile()
+{
+    for (size_t i = 0; i < g_profiles.size(); ++i) if (!g_profiles[i].active) FallenProfileDeleted(coopprof::ProfileId(g_profiles[i].person, g_profiles[i].num));
+}
+
+/* T-581 (src/common/owedpop.h; protocol 87): THE OWED TOWN POPULATIONS. owed_people.txt holds one line per piece of town work a game
+   set aside - one building's residents (keyed by the building's position key) or one town's first bar roll (keyed by the town's
+   stringID) - kept until a game makes it. A row is given to ONE game at a time (CLAIM), so two games never both make it; a game
+   that hands it back (RELEASE) or disconnects no longer holds it. It leaves at DONE: from the game holding it (made / gone /
+   fault) or from any game that sees the work already there (has). Rewritten whole through a temp file; pushed in full at WELCOME
+   with each row marked as the receiving game's own or not; every changed row and every removal broadcast. */
+owedpop::Table g_owedRows;
+int g_owedLoadDeferred = 0;
+long long g_owedAddsIn = 0, g_owedClaimsIn = 0, g_owedGiven = 0, g_owedHeldBack = 0, g_owedReleasedIn = 0, g_owedDoneIn = 0, g_owedDoneRefused = 0, g_owedWriteFailed = 0, g_owedBadIn = 0;
+long long g_owedCapRefused = 0, g_owedCounted = 0, g_owedMadeAsHas = 0;
+std::set<int> g_owedCapSaid;   /* slots whose refused ADD was logged (once per game) */
+std::string OwedFile() { return g_dir + "\\owed_people.txt"; }
+bool WriteOwed()
+{
+    if (g_owedLoadDeferred) return false;   /* the file is on disk and could not be read at start: rewriting it whole from memory would erase its rows */
+    const std::string tmp = OwedFile() + ".tmp";
+    { std::ofstream f(tmp.c_str(), std::ios::trunc); if (!f) return false;
+      for (owedpop::Table::const_iterator it = g_owedRows.begin(); it != g_owedRows.end(); ++it) f << owedpop::Line(it->second);
+      if (!f) return false; }
+    return MoveFileExA(tmp.c_str(), OwedFile().c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+void LoadOwed()
+{
+    g_owedRows.clear();
+    const FileProbe rp = ProbeFile(OwedFile());
+    if (rp.kind == coopstore::kFileUnreadable)
+    {
+        g_owedLoadDeferred = 1;
+        Log("owed: owed_people.txt is ON DISK (" + N(rp.attrLen) + " bytes) and could NOT BE READ (error " + N((long long)rp.err)
+            + ") - it is NOT rewritten this session; new rows are kept in memory and broadcast only (owedWriteFailed counts them)");
+        return;
+    }
+    g_owedLoadDeferred = 0;
+    if (rp.kind != coopstore::kFileReadable) { Log("owed: no owed_people.txt yet - no town population is owed in this world"); return; }
+    std::istringstream f(TextOf(rp));
+    std::string line; long long bad = 0;
+    while (std::getline(f, line)) { if (line.empty() || line == "\r") continue; if (owedpop::ParseLine(line, &g_owedRows) == 0) ++bad; }
+    Log("owed: " + N((long long)g_owedRows.size()) + " owed town population rows loaded from owed_people.txt (" + N(bad) + " unusable lines)");
+}
+std::string OwedRowText(unsigned kind, const std::string& key, const std::string& sid)
+{
+    return std::string(owedpop::KindName(kind)) + " town=" + SanitizeForLog(sid) + (kind == owedpop::kKindResidents ? " building=" + SanitizeForLog(key) : std::string());
+}
+/* one row to one game, its claim as that game sees it */
+void OwedSendRowTo(ENetPeer* to, const owedpop::Row& r)
+{
+    owedpop::Row w = r; w.claimant = owedpop::ClaimFor(r.claimant, SlotOf(to) + 1);
+    std::vector<owedpop::Row> one(1, w); std::vector<char> m;
+    if (owedpop::EncodeRows(&m, one)) SendMsg(to, MSG_OWED, m);
+}
+void OwedBroadcastRow(ENetHost* host, const owedpop::Row& r)
+{
+    if (host == 0) return;
+    for (size_t p = 0; p < host->peerCount; ++p) { ENetPeer* q = &host->peers[p]; if (q->state == ENET_PEER_STATE_CONNECTED && SlotOf(q) >= 0) OwedSendRowTo(q, r); }
+}
+void OwedSendGone(ENetPeer* to, unsigned kind, const std::string& key, unsigned why)
+{
+    std::vector<char> m;
+    if (owedpop::EncodeDone(&m, owedpop::kOpGone, kind, key, why)) SendMsg(to, MSG_OWED, m);
+}
+/* every row to one game, in chunks of 256, each marked as that game's own or not */
+void SendOwedPush(ENetPeer* to)
+{
+    const int me = SlotOf(to) + 1;
+    std::vector<owedpop::Row> chunk;
+    owedpop::Table::const_iterator it = g_owedRows.begin();
+    while (it != g_owedRows.end())
+    {
+        owedpop::Row w = it->second; w.claimant = owedpop::ClaimFor(it->second.claimant, me); chunk.push_back(w); ++it;
+        if (chunk.size() >= owedpop::kMaxRows || it == g_owedRows.end())
+        {
+            std::vector<char> m;
+            if (owedpop::EncodeRows(&m, chunk)) SendMsg(to, MSG_OWED, m);
+            else Log("owed: a WELCOME chunk of " + N((long long)chunk.size()) + " rows did not encode - not sent");
+            chunk.clear();
+        }
+    }
+}
+void OnOwed(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
+{
+    owedpop::Msg m;
+    if (owedpop::Decode(payload.empty() ? 0 : &payload[0], payload.size(), &m) == 0 || m.op == owedpop::kOpRows || m.op == owedpop::kOpGone)
+    { ++g_owedBadIn; Log("malformed OWED from " + PeerName(from) + " - ignored"); return; }
+    const int who = SlotOf(from) + 1;
+    if (who <= 0) { ++g_owedBadIn; Log("OWED from " + PeerName(from) + " before it was admitted - ignored"); return; }
+    const std::string tk = owedpop::TableKey(m.kind, m.key);
+    if (m.op == owedpop::kOpAdd)
+    {
+        ++g_owedAddsIn;
+        const int a = owedpop::TableAddFrom(&g_owedRows, m.row, who, owedpop::kRowsPerGame);
+        if (a == owedpop::kAddFull)
+        {
+            ++g_owedCapRefused;
+            if (g_owedCapSaid.insert(who).second)
+                Log("OWED ADD from slot " + N((long long)(who - 1)) + " REFUSED - that game already stored " + N((long long)owedpop::kRowsPerGame) + " owed rows (said once per game; owedCapRefused counts every refusal)");
+            OwedSendGone(from, m.row.kind, m.row.key, owedpop::kWhyFull);   /* the game keeps the work and makes it itself, as before */
+            return;
+        }
+        if (a != 1) return;   /* already owed: nothing changes */
+        if (!WriteOwed()) { ++g_owedWriteFailed; Log("owed: owed_people.txt could NOT be written - the row stays in memory and is broadcast (owedWriteFailed=" + N(g_owedWriteFailed) + ")"); }
+        Log("OWED stored " + OwedRowText(m.row.kind, m.row.key, m.row.sid) + " at " + F1(m.row.x) + "," + F1(m.row.z) + " from slot " + N((long long)(who - 1)) + " (rows=" + N((long long)g_owedRows.size()) + ")");
+        OwedBroadcastRow(host, g_owedRows[tk]);
+        return;
+    }
+    const owedpop::Table::const_iterator have = g_owedRows.find(tk);
+    const std::string text = (have != g_owedRows.end()) ? OwedRowText(have->second.kind, have->second.key, have->second.sid) : OwedRowText(m.kind, m.key, "?");
+    if (m.op == owedpop::kOpClaim)
+    {
+        ++g_owedClaimsIn;
+        const double nowC = NowSec();
+        const int c = owedpop::TableClaim(&g_owedRows, m.kind, m.key, who, nowC);
+        if (c == owedpop::kClaimAbsent) { Log("OWED claim " + text + " from slot " + N((long long)(who - 1)) + " - no such row (told it is gone)"); OwedSendGone(from, m.kind, m.key, owedpop::kWhyAway); return; }
+        const owedpop::Row& r = g_owedRows[tk];
+        if (c == owedpop::kClaimLater) { Log("OWED claim " + text + " from slot " + N((long long)(who - 1)) + " - spaced after a counted report, given again in " + N((long long)(r.retryAt - nowC)) + " s (no answer; the game asks again)"); return; }
+        if (c == owedpop::kClaimGranted) { ++g_owedGiven; Log("OWED given " + text + " to slot " + N((long long)(who - 1)) + " - only that game may make it"); OwedBroadcastRow(host, r); }
+        else { ++g_owedHeldBack; Log("OWED claim " + text + " from slot " + N((long long)(who - 1)) + " - held by slot " + N((long long)(r.claimant - 1)) + ", it waits"); OwedSendRowTo(from, r); }
+        return;
+    }
+    if (m.op == owedpop::kOpRelease)
+    {
+        if (owedpop::TableRelease(&g_owedRows, m.kind, m.key, who) == 0) return;
+        ++g_owedReleasedIn;
+        Log("OWED released " + text + " by slot " + N((long long)(who - 1)) + " - nobody's again");
+        OwedBroadcastRow(host, g_owedRows[tk]);
+        return;
+    }
+    ++g_owedDoneIn;   /* DONE */
+    const int d = owedpop::TableDone(&g_owedRows, m.kind, m.key, who, m.why, NowSec());
+    if (d == owedpop::kDoneAbsent) { Log("OWED done " + text + " why=" + owedpop::WhyName(m.why) + " from slot " + N((long long)(who - 1)) + " - no such row"); return; }
+    if (d == owedpop::kDoneRefused)
+    {
+        ++g_owedDoneRefused;
+        Log("OWED done " + text + " why=" + owedpop::WhyName(m.why) + " from slot " + N((long long)(who - 1)) + " REFUSED - only the game holding the row reports gone or fault (doneRefused=" + N(g_owedDoneRefused) + ")");
+        if (have != g_owedRows.end()) OwedSendRowTo(from, g_owedRows[tk]);
+        return;
+    }
+    if (d == owedpop::kDoneCounted)
+    {
+        ++g_owedCounted;
+        const owedpop::Row& r = g_owedRows[tk];
+        Log("OWED " + std::string(owedpop::WhyName(m.why)) + " " + text + " from slot " + N((long long)(who - 1)) + " - counted (gone " + N((long long)r.gones) + "/" + N((long long)owedpop::kTriesMax)
+            + ", fault " + N((long long)r.faults) + "/" + N((long long)owedpop::kTriesMax) + ", empty " + N((long long)r.empties) + "/" + N((long long)owedpop::kTriesMax) + "), handed back and kept - not given again for " + N((long long)owedpop::kRetrySpacingSec) + " s");
+        OwedBroadcastRow(host, r);
+        return;
+    }
+    const unsigned why = (d == owedpop::kDoneMadeAsHas) ? owedpop::kWhyHas : m.why;
+    if (d == owedpop::kDoneMadeAsHas) ++g_owedMadeAsHas;
+    if (!WriteOwed()) { ++g_owedWriteFailed; Log("owed: owed_people.txt could NOT be written - the removal holds in memory (owedWriteFailed=" + N(g_owedWriteFailed) + ")"); }
+    Log("OWED done " + text + " why=" + owedpop::WhyName(why) + (d == owedpop::kDoneMadeAsHas ? std::string(" (made by a game that no longer held the row - the people exist)") : std::string())
+        + " by slot " + N((long long)(who - 1)) + " (rows=" + N((long long)g_owedRows.size()) + ")");
+    if (host != 0)
+        for (size_t p = 0; p < host->peerCount; ++p) { ENetPeer* q = &host->peers[p]; if (q->state == ENET_PEER_STATE_CONNECTED && SlotOf(q) >= 0) OwedSendGone(q, m.kind, m.key, why); }
+}
+/* a game left: every row it held is nobody's again, and every remaining game hears it */
+void OwedPeerGone(ENetPeer* p)
+{
+    const int who = SlotOf(p) + 1;
+    const std::vector<std::string> rel = owedpop::TablePeerGone(&g_owedRows, who);
+    if (rel.empty()) return;
+    Log("OWED: slot " + N((long long)(who - 1)) + " left - the " + N((long long)rel.size()) + " owed row(s) it held are nobody's again");
+    for (size_t i = 0; i < rel.size(); ++i)
+    {
+        const owedpop::Table::const_iterator it = g_owedRows.find(rel[i]);
+        if (it == g_owedRows.end() || g_wqHost == 0) continue;
+        for (size_t q = 0; q < g_wqHost->peerCount; ++q) { ENetPeer* o = &g_wqHost->peers[q]; if (o != p && o->state == ENET_PEER_STATE_CONNECTED && SlotOf(o) >= 0) OwedSendRowTo(o, it->second); }
+    }
+}
 bool PeerGone(ENetPeer* p, const char* how)
 {
     Log(std::string(how) + ": " + PeerName(p));
+    OwedPeerGone(p);   /* T-581: the owed rows this game held are nobody's again (before its slot is forgotten) */
     g_peerMods.erase(p);   /* settings5 fold */
     g_modsProvisionalPeers.erase(p);   /* T-246 fold 2 */
     g_feedOn.erase(p);   /* T-313: the subscription goes with the connection - a returning game asks again */
@@ -5944,6 +7051,7 @@ bool PeerGone(ENetPeer* p, const char* how)
        touched here, which is the whole point - a player who logs off and comes back gets the same
        number, and the areas and records that carry it still name them. */
     { const std::string goneId = PeerIdOf(p); if (!goneId.empty()) { g_slotSeenAt[goneId] = NowUnix(); WriteSlots(); } }
+    TeamPeerGone(p);   /* T-546: invitations from or to that player end (before its id is forgotten below) */
     const bool wasAdmittedJ = g_peerId.count(p) != 0;   /* M11a S1: a roster change only when an admitted game leaves */
     g_join.erase(p);
     g_peerId.erase(p);
@@ -5998,6 +7106,23 @@ void HelloDeadlineTick()
    slots.txt and nothing binds it again), because reuse would hand a new profile the old one's records and base.
    THE LOBBY: a HELLO carrying profile 0 is answered with PROFILES instead of a WELCOME; the game then asks NEW / DELETE
    (PROFILES up) or picks by saying HELLO again with a number. The host's own game goes through the same door. */
+/* T-368: THE WORLD'S FACTION NAMES TO EVERY ADMITTED GAME. Each game gets every OTHER active profile's faction name (profiles.txt -
+   connected or not; a deleted profile's is free), so the FACTION tab can refuse a taken name before it applies. Sent at a game's
+   admission and to every admitted game after any change to a faction name or to which profiles are active. */
+void TakenSendTo(ENetPeer* p)
+{
+    const std::string key = PeerIdOf(p);
+    if (key.empty()) return;
+    std::vector<char> m;
+    coopprof::EncodeTaken(&m, coopprof::TakenFactionsFor(g_profiles, coopprof::PersonOfKey(key), coopprof::NumOfKey(key)));
+    SendMsg(p, MSG_PROFILES, m);
+    ++g_takenSent;
+}
+void TakenSendAll(const std::string& why)
+{
+    for (std::map<ENetPeer*, std::string>::const_iterator it = g_peerId.begin(); it != g_peerId.end(); ++it) TakenSendTo(it->first);
+    Log("profiles: the world's faction names went to " + N((long long)g_peerId.size()) + " game(s) - " + why);
+}
 std::string ProfilesFile() { return g_dir + "\\profiles.txt"; }
 unsigned ProfileCap()
 {
@@ -6042,6 +7167,7 @@ void ProfilesAdopt(const std::string& person)
     if (n <= 0) return;
     g_profAdopted += n;
     WriteProfiles();
+    TakenSendAll("profiles taken in from slots.txt");
     Log("profiles: took in " + N((long long)n) + " profile(s) of " + person + " from slots.txt that profiles.txt did not hold (a world from before"
         " profiles, or a lost write) - their numbers stay theirs. adopted=" + N(g_profAdopted));
 }
@@ -6079,7 +7205,7 @@ void ProfileBound(ENetPeer* from, const std::string& key, int slot)
     r.slot = slot; r.lastPlayed = NowUnix();
     WriteProfiles();
     ++g_profPicked;
-    Log("slot " + N((long long)slot) + " bound to " + coopprof::ProfileIdOfKey(key) + " ('" + r.name + "', faction '" + r.faction + "') - "
+    Log("slot " + N((long long)slot) + " bound to " + coopprof::ProfileIdOfKey(key) + " ('" + r.name + "', faction '" + SanitizeForLog(r.faction) + "') - "
         + PeerName(from) + (first ? " is admitted to it for the first time (played once a save of it finishes)" : " plays it again"));
     ProfilesSay(person);
 }
@@ -6090,16 +7216,21 @@ std::string ProfilePersonOf(ENetPeer* p)
     const std::string k = PeerIdOf(p);
     return k.empty() ? std::string() : coopprof::PersonOfKey(k);
 }
-/* names2a (investigations/names2-design.md Q3): PROFILES kind 3 - a PLAYING game's player faction name for its own profile's row
-   (the lobby's faction column). Only the connection admitted under that very profile may write it. No answer is sent. */
-void OnProfileFaction(ENetPeer* from, unsigned num, const std::string& name)
+/* names2a (investigations/names2-design.md Q3) + T-368: PROFILES kind 3 FACTION (rename 0: the name a PLAYING game's world loaded with)
+   or kind 5 RENAME (rename 1: the name its player just gave its faction) for its own profile's row. Only the connection admitted under
+   that very profile may write it. The world's faction names are unique (coopprof::FactionDecide): a name it changes - a rename another
+   player won (back), a load with a taken name (the lowest free "Nameless <n>") or a load with Kenshi's default "Nameless" (the
+   profile's own "Nameless <n>") - is answered to the sender;
+   every change of the row goes to every admitted game's list of taken names. */
+void OnProfileFaction(ENetPeer* from, unsigned num, const std::string& name, int rename)
 {
     const std::string key = PeerIdOf(from);
     if (!key.empty()) ProfilesAdopt(coopprof::PersonOfKey(key));   /* an old world's profile 1 gets its row first */
     int i = -1; std::string fac;
-    const int v = coopprof::FactionDecide(g_profiles, key, num, name, &i, &fac);
+    const int v = coopprof::FactionDecide(g_profiles, key, num, name, &i, &fac, rename);
+    if (coopprof::FactionOwedAfter(v) == coopprof::kFacOwedClear) g_facOwed.erase(key);   /* the world accepted the game's name: an older answer is never sent over it */
     if (v == coopprof::kFacSame) { ++g_profFactionSame; return; }   /* the once-per-world send of an unchanged name */
-    if (v != coopprof::kFacSet)
+    if (v == coopprof::kFacRefusedSender || v == coopprof::kFacRefusedUnknown || v == coopprof::kFacRefusedName)
     {
         ++g_profFactionRefused;
         Log("profiles: faction name '" + SanitizeForLog(name) + "' for profile number " + N((long long)num) + " from " + PeerName(from)
@@ -6108,11 +7239,52 @@ void OnProfileFaction(ENetPeer* from, unsigned num, const std::string& name)
     }
     coopprof::Row& r = g_profiles[(size_t)i];
     const std::string old = r.faction;
-    r.faction = fac;
-    WriteProfiles();
-    ++g_profFactionSet;
-    Log("profile " + coopprof::ProfileIdOfKey(key) + " faction '" + old + "' -> '" + fac + "'"
-        + (fac != name ? " (the game's name '" + SanitizeForLog(name) + "' was trimmed or cut to fit the row)" : std::string()));
+    std::string asked;
+    coopprof::FactionForRow(name, &asked);
+    if (v != coopprof::kFacBack)
+    {
+        r.faction = fac;
+        WriteProfiles();
+    }
+    if (v == coopprof::kFacSet) ++g_profFactionSet; else if (v == coopprof::kFacBack) ++g_profFactionBack;
+    else if (v == coopprof::kFacMoved) ++g_profFactionMoved; else ++g_profFactionDefault;
+    Log("profile " + coopprof::ProfileIdOfKey(key) + " faction '" + SanitizeForLog(old) + "' -> '" + SanitizeForLog(r.faction) + "' (" + (rename ? "RENAME" : "FACTION at a load") + " '"
+        + SanitizeForLog(name) + "': " + coopprof::FactionVerdictName(v)
+        + (v == coopprof::kFacBack ? " - another profile of this world holds that name; the game goes back to its own"
+           : v == coopprof::kFacMoved ? " - another profile of this world holds that name; the game takes the lowest free Nameless number"
+           : v == coopprof::kFacDefault ? " - Kenshi's default name: the faction takes this profile's own Nameless number"
+           : (asked != name ? " - the game's name was trimmed or cut to fit the row" : "")) + ")");
+    if (coopprof::FactionOwedAfter(v) == coopprof::kFacOwedReplace)
+    {
+        coopprof::FactionAnswer a; a.verdict = v; a.num = num; a.asked = asked; a.name = fac;
+        std::vector<char> m; coopprof::EncodeFactionAnswer(&m, a);
+        SendMsg(from, MSG_PROFILES, m);
+        g_facOwed[key] = a;   /* sent again at this profile's next admission until its game acknowledges it (kind 6) */
+    }
+    if (v != coopprof::kFacBack) TakenSendAll("profile " + coopprof::ProfileIdOfKey(key) + "'s faction is '" + SanitizeForLog(r.faction) + "' now");
+}
+/* T-368: PROFILES kind 6 FACTION SEEN - the game admitted under a profile has the FACTION answer that named `name`; it is not sent again.
+   An acknowledgement of an older answer (another name) leaves a newer one owed. */
+void OnProfileFactionSeen(ENetPeer* from, unsigned num, const std::string& name)
+{
+    const std::string key = PeerIdOf(from);
+    std::map<std::string, coopprof::FactionAnswer>::iterator it = g_facOwed.find(key);
+    if (key.empty() || it == g_facOwed.end() || it->second.num != num || it->second.name != name) { ++g_facSeenStale; return; }
+    g_facOwed.erase(it);
+    ++g_facSeen;
+    Log("profile " + coopprof::ProfileIdOfKey(key) + ": its game has the FACTION answer naming '" + SanitizeForLog(name) + "'");
+}
+/* T-368: at a profile's admission, the FACTION answer its game has not acknowledged goes again. */
+void FacOwedSendTo(ENetPeer* p)
+{
+    const std::string key = PeerIdOf(p);
+    std::map<std::string, coopprof::FactionAnswer>::const_iterator it = key.empty() ? g_facOwed.end() : g_facOwed.find(key);
+    if (it == g_facOwed.end()) return;
+    std::vector<char> m; coopprof::EncodeFactionAnswer(&m, it->second);
+    SendMsg(p, MSG_PROFILES, m);
+    ++g_facOwedResent;
+    Log("profile " + coopprof::ProfileIdOfKey(key) + ": the FACTION answer '" + SanitizeForLog(it->second.asked) + "' -> '" + SanitizeForLog(it->second.name)
+        + "' (" + coopprof::FactionVerdictName(it->second.verdict) + ") its game has not acknowledged is sent again");
 }
 /* T-201 PP6' (owner 175): A PROFILE COUNTS AS PLAYED ONLY AFTER ITS FIRST FINISHED SAVE. PROFILES kind 4 SAVED (any game, after its own
    save of that profile finished) and the operator's WORLD_SAVED both land here; only the connection admitted under that very profile may
@@ -6139,6 +7311,12 @@ void ProfilePlayedMark(ENetPeer* from, unsigned num, const char* why)
     Log("profile " + coopprof::ProfileIdOfKey(key) + " '" + g_profiles[(size_t)i].name + "' is PLAYED now - its first finished save reached this notebook ("
         + why + "); HOST / JOIN of it loads its save from here on");
 }
+/* T-546 (owner 482 a): at start, every profile profiles.txt marks deleted is taken out of the membership table (a deletion made
+   while this process was not running - the host's CHANGE DELETE - or one whose teams.txt write failed) */
+void TeamProfilesReconcile()
+{
+    for (size_t i = 0; i < g_profiles.size(); ++i) if (!g_profiles[i].active) TeamProfileDeleted(coopprof::ProfileId(g_profiles[i].person, g_profiles[i].num), false);
+}
 /* PROFILES up: NEW or DELETE, from a connection in the lobby or one already playing (a person may tidy their other profiles). */
 void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
 {
@@ -6150,7 +7328,8 @@ void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload
         Log("profiles: malformed PROFILES from " + PeerName(from) + " (" + N((long long)payload.size()) + " bytes) - ignored");
         return;
     }
-    if (kind == coopprof::kReqFaction) { OnProfileFaction(from, num, name); return; }   /* names2a */
+    if (kind == coopprof::kReqFaction || kind == coopprof::kReqRename) { OnProfileFaction(from, num, name, kind == coopprof::kReqRename ? 1 : 0); return; }   /* names2a; T-368: 5 RENAME */
+    if (kind == coopprof::kReqFactionSeen) { OnProfileFactionSeen(from, num, name); return; }   /* T-368: 6 FACTION SEEN */
     if (kind == coopprof::kReqSaved) { ProfilePlayedMark(from, num, "PROFILES SAVED"); return; }   /* T-201 PP6' (owner 175) */
     const std::string person = ProfilePersonOf(from);
     const int answers = kind == coopprof::kReqNew ? coopprof::kAnsNew : coopprof::kAnsDelete;
@@ -6167,11 +7346,13 @@ void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload
         const int v = coopprof::NewDecide(g_profiles, person, name, ProfileCap(), num, &made);
         if (v == coopprof::kOk)
         {
-            coopprof::Row r; r.person = person; r.num = made; r.slot = -1; r.created = NowUnix(); r.lastPlayed = 0; r.active = 1; r.name = name; r.faction = name;
+            coopprof::Row r; r.person = person; r.num = made; r.slot = -1; r.created = NowUnix(); r.lastPlayed = 0; r.active = 1; r.name = name;
+            r.faction = coopprof::NamelessFree(g_profiles, -1);   /* T-368 (owner 472): a new player's faction is the lowest free "Nameless <n>" */
             g_profiles.push_back(r);
             WriteProfiles();
             ++g_profMade;
-            Log("profiles: made " + coopprof::ProfileId(person, made) + " '" + name + "' for " + PeerName(from) + " - it has no slot until it is played");
+            Log("profiles: made " + coopprof::ProfileId(person, made) + " '" + name + "' (faction '" + SanitizeForLog(r.faction) + "') for " + PeerName(from) + " - it has no slot until it is played");
+            TakenSendAll("a new profile holds '" + SanitizeForLog(r.faction) + "'");
         }
         else Log("profiles: NEW '" + SanitizeForLog(name) + "' from " + PeerName(from) + " (person '" + person + "') refused["
                  + coopprof::VerdictName(v) + "]: " + coopprof::VerdictText(v, ProfileCap()));
@@ -6187,7 +7368,12 @@ void OnProfiles(ENetHost* host, ENetPeer* from, const std::vector<char>& payload
             WriteProfiles();
             ++g_profDeleted;
             Log("profile " + coopprof::ProfileId(person, num) + " deleted, slot " + (r.slot >= 0 ? N((long long)r.slot) + " retired" : std::string("none (never played)"))
-                + " - its number and its slot are never given out again; its buildings stay; the player's game moves its save folder to the Recycle Bin");
+                + " - its number and its slot are never given out again; its buildings stay; the player's game moves its save folder to the Recycle Bin;"
+                  " its player name '" + r.name + "' and faction name '" + SanitizeForLog(r.faction) + "' are free again");
+            TakenSendAll("a deleted profile's faction name '" + SanitizeForLog(r.faction) + "' is free");
+            g_facOwed.erase(coopprof::SlotKey(person, num));   /* T-368: nothing is owed to a deleted profile */
+            TeamProfileDeleted(coopprof::ProfileId(person, num), true);   /* T-546 (owner 482 a): its faction membership */
+            FallenProfileDeleted(coopprof::ProfileId(person, num));   /* T-556: its fallen list */
         }
         else Log("profiles: DELETE " + coopprof::ProfileId(person, num) + " from " + PeerName(from) + " refused[" + coopprof::VerdictName(v) + "]: "
                  + coopprof::VerdictText(v, ProfileCap()));
@@ -6522,6 +7708,8 @@ void OnHello(ENetPeer* from, const std::vector<char>& payload)
         ProfileBound(from, playerId, s);   /* prof1: slot N bound to <profile id> */
     }
     g_peerId[from] = playerId;
+    TakenSendTo(from);   /* T-368: the faction names this profile may not take */
+    FacOwedSendTo(from);   /* T-368: a FACTION answer this profile's game has not acknowledged */
     PlayerGoneHoldReturned(SlotOf(from), from);   /* M8 review F1: this player is back - a PLAYER_GONE held for it is cancelled, never sent */
     { JoinConn jc; jc.stage = coopjoin::kStageTitle; jc.road = helloTail.road; jc.liveProto = helloTail.liveProto; jc.name = coopworld::DisplayNameOk(helloTail.name, 0) ? helloTail.name : std::string(); jc.viewDist = helloTail.viewDist; g_join[from] = jc; }   /* M11a S1: admitted = TITLE (slot + seat); a LIVE destination only once in the world. S1 fold (review L1): a name that fails coopworld::DisplayNameOk is stored empty */
     if (PeerIsAuthority(from))   /* S1 fold (review M2): THE HOST'S VERSION WINS - an admitted game whose game-to-game protocol differs from the arriving operator's is refused with reason 7 (its existing sentence) and disconnected, as ModsRecheckAll does to a game whose mods no longer match: left in, it would misread the operator's live messages once both are in the world */
@@ -6578,7 +7766,7 @@ void OnHello(ENetPeer* from, const std::vector<char>& payload)
     bool known = false; for (size_t i = 0; i < g_order.size(); ++i) if (g_order[i] == from) known = true;
     if (!known) g_order.push_back(from);   /* M1: the slot was assigned above, where a full world can still refuse */
     const bool auth = PeerIsAuthority(from);   /* B13 / decision 49: the OPERATOR, out of owner.txt - not whoever dialled first */
-    Log("HELLO from " + PeerName(from) + " player='" + playerId + "' slot='" + SanitizeForLog(slot) + "' world='" + SanitizeForLog(world) + "' protocol=" + N(proto) + (proto == kProtocol ? "" : " (MISMATCH - store speaks " + N(kProtocol) + ")") + " authority=" + (auth ? "1" : "0")
+    Log("HELLO from " + PeerName(from) + " player='" + playerId + "' saveFolder='" + SanitizeForLog(slot) + "' world='" + SanitizeForLog(world) + "' protocol=" + N(proto) + (proto == kProtocol ? "" : " (MISMATCH - store speaks " + N(kProtocol) + ")") + " authority=" + (auth ? "1" : "0")
         + (helloHasClock ? (" clock=" + F3(helloHours) + " speed=" + F1(helloSpeed)) : std::string(" clock=(not carried - this game speaks an older protocol)"))
         + " live=" + N((long long)helloTail.liveProto) + " road=" + (helloTail.road == (unsigned)coopjoin::kRoadWorld ? "world" : "session") + " name='" + coopjoin::JsLogSafe(helloTail.name) + "'"
         + ((helloTail.name.empty() || coopworld::DisplayNameOk(helloTail.name, 0)) ? std::string() : std::string(" (not a usable display name - the roster carries none for it)")));   /* M11a S1; S1 fold (review L1) */
@@ -6632,11 +7820,14 @@ void OnHello(ENetPeer* from, const std::vector<char>& payload)
     SendTakesPush(from);      /* loot2c: every take row, right after the boxes (inside the opening push too) */
     SendWorldRelPush(from);   /* par24: every faction-vs-faction row, inside the opening push (the game counts WORLD_REL in it) */
     SendBarsPush(from);   /* refill1: every town bar row, after the research boxes and the take rows (the game counts TOWN_BAR inside its opening push) */
+    SendOwedPush(from);   /* T-581: every owed row, each marked as this game's own or not (inside the opening push) */
     /* T-313 (protocol 63): NO RECORDS HERE. They are paged by OnRecordFeed when this game asks - which it does once it has a world -
        so a game waiting at the title is not handed records it cannot apply. The WELCOME's record count stays, informational. */
     Log("welcomed " + PeerName(from) + " - its " + N((long long)g_records.size()) + " records and " + N((long long)g_uniques.size())
         + " unique states wait for its RECORD_FEED ASK (T-313)");
     RosterBroadcast("a game was admitted");   /* M11a S1: after its WELCOME (T-313: no record push here now) - every admitted game (this one too) hears the roster */
+    TeamWelcomePush(from);   /* T-546: the faction membership table, and every restore row owed to this player (removed while away) */
+    FallenWelcomePush(from);   /* T-556: this player's fallen list */
 }
 
 /* ================= W2a: ONE FOLDER PER WORLD - THE NOTEBOOK'S SIDE (decision 58; design-worlds sections 1 and 4) =====
@@ -6992,7 +8183,8 @@ int WorldFormatDecide(unsigned int* found, std::string* why)
     return swformat::FormatDecide(rs, *found, swformat::kWorldFolderFormat);
 }
 /* Each step from the found number to this build's, in order, then format.txt last. Step 0 -> 1: world.txt carries its id line
-   (CheckWorldTxt adds it before this runs; a world without one is not converted and is tried again at the next start). */
+   (CheckWorldTxt adds it before this runs; a world without one is not converted and is tried again at the next start). Step 1 -> 2:
+   the number alone - every row a build at 1 wrote reads unchanged; from 2 on a faction field may be '#' + hex. */
 bool ConvertWorldFolder(unsigned int from)
 {
     const std::vector<unsigned int> steps = swformat::FormatSteps(from, swformat::kWorldFolderFormat);
@@ -7128,7 +8320,7 @@ void PeriodicPass(ENetHost* host)
     if (skipped > 0)
         Log("M15: the once-a-second jobs ran " + N((late + 500) / 1000) + " ms late - " + N(skipped) + " slot(s) skipped, not caught up"
             " (one piece of work held the loop that long; loopGapMaxMs on the next counters line)");
-    AreaTick(host); ClockTick(host); PendingPosTick(); PendingPosCountTick(); OwnerWatchTick(); DeferredLoadTick(host); WorldRelFlushTick(host); StoreCountersTick(); HelloDeadlineTick(); PlayerGoneHoldTick();   /* E40 / decision 45: the world's clock advances on THIS process's wall clock, not on any game's frame rate */
+    AreaTick(host); ClockTick(host); PendingPosTick(); PendingPosCountTick(); OwnerWatchTick(); DeferredLoadTick(host); WorldRelFlushTick(host); TeamTick(); StoreCountersTick(); HelloDeadlineTick(); PlayerGoneHoldTick();   /* E40 / decision 45: the world's clock advances on THIS process's wall clock, not on any game's frame rate */
 }
 /* ONE MESSAGE FROM A GAME, by its type - a frame's own, or each message inside a BUNDLE in its order. `channel` is the one the
    packet arrived on (a bundle's messages share it). */
@@ -7143,7 +8335,10 @@ void OnGameMessage(ENetHost* host, ENetPeer* peer, unsigned char type, const std
     else if (type == MSG_UNIQUE_STATE) OnUniqueState(host, peer, payload);
     else if (type == MSG_RESEARCH_BOX) OnResearchBox(host, peer, payload);   /* loot2b */
     else if (type == MSG_TOWN_BAR) OnTownBar(host, peer, payload);   /* refill1 */
+    else if (type == MSG_OWED) OnOwed(host, peer, payload);   /* T-581: ADD / CLAIM / RELEASE / DONE */
     else if (type == MSG_WORLD_REL) OnWorldRel(host, peer, payload);   /* par24 */
+    else if (type == MSG_TEAM) OnTeam(peer, payload);   /* T-546 step 3: INVITE / ANSWER / LEAVE / REMOVE / DISBAND / RESTORE_DONE */
+    else if (type == MSG_FALLEN) OnFallen(host, peer, payload);   /* T-556: ADD / TAKE / ASK */
     else if (type == MSG_WORLD_SAVED) OnWorldSaved(peer, payload);   /* restore1a */
     else if (type == MSG_OWN_HIGH) OnOwnHigh(peer, payload);   /* restore1b1 */
     else if (type == MSG_UID_BLOCK) OnUidBlock(peer, payload);   /* M4 fold */
@@ -7182,6 +8377,8 @@ void OnBundle(ENetHost* host, ENetPeer* peer, const std::vector<char>& payload, 
 }
 int main(int argc, char** argv)
 {
+    g_loopThreadId = ::GetCurrentThreadId();               /* the final save at quit runs on this thread (QuitSave) */
+    g_quitSaveDone = CreateEventA(0, TRUE, FALSE, 0);
     unsigned short port = 27016;
     const char* la = getenv("LOCALAPPDATA");
     /* PP3 (manager 2026-09-27): the top folder is <data folder>\\worlds - %LOCALAPPDATA%\\kenshi\\Shared Wastelands\\worlds by
@@ -7257,6 +8454,9 @@ int main(int argc, char** argv)
         WriteUnmigrateLog(storeRoot);   /* W2-f (review-w2 F) */
         return rc;
     }
+    /* THE CLOSE WINDOW FIRST: a Kenshi that leaves its HOST while this helper is still starting reaches it here (WM_CLOSE raises
+       g_closeAsked; CloseAskedCheck acts between the steps below), and a logoff or shutdown is heard from here on too. */
+    if (!QuitWindowStart()) printf("M14: could not start the shutdown-window thread (GetLastError=%lu) - a logoff, shutdown or close from Kenshi may lose queued writes\n", (unsigned long)::GetLastError());
     /* THE FOLDER: --dir is the exact folder (the harness; it wins over --world and never migrates); --world is that
        world's folder; neither is coopworld::kDefaultWorld ('New World'). */
     g_worldName = worldGiven ? worldArg : (dirGiven ? std::string() : std::string(coopworld::kDefaultWorld));
@@ -7291,6 +8491,7 @@ int main(int argc, char** argv)
     _mkdir(g_dir.c_str());
     g_log = fopen((g_dir + "\\" + swnames::kServerLog).c_str(), "a");   /* the world server's own log (an old world's coop-store.log is only moved, never written) */
     FlushMigNotes(g_log);   /* W2a: what the migration said */
+    CloseAskedCheck("after the folder move");   /* after the log opens, so a close during the move is in the log */
     Log("coop-store starting: port " + N(port) + " dir " + g_dir + " protocol " + N(kProtocol) + " store-file format 7"
         + (g_ownerId.empty() ? std::string(" (no --owner given)") : " owner '" + g_ownerId + "' from --owner")
         + " max-connected " + N((long long)g_maxConnected) + " first-slot " + N((long long)g_firstSlot)
@@ -7314,6 +8515,7 @@ int main(int argc, char** argv)
         }
         Log("world lock taken: " + lockPath + " (held until this process ends)");
     }
+    CloseAskedCheck("after the world lock");
     CheckWorldTxt();
     SetWelcomeWorld();   /* W3: the WELCOME's world name, after world.txt is settled */
     if (formatVerdict == swformat::kFormatConvert) g_worldFormatState = ConvertWorldFolder(formatFound) ? "converted" : "convertFailed";
@@ -7321,15 +8523,19 @@ int main(int argc, char** argv)
     Log("format: world folder format " + N((long long)formatFound) + " (" + swformat::FormatVerdictName(formatVerdict) + "); this build writes "
         + N((long long)swformat::kWorldFolderFormat) + " - " + g_worldFormatState);
     for (size_t an = 0; an < argNotes.size(); ++an) Log("option: " + argNotes[an]);   /* M1-b: a bad --max-connected / --first-slot */
+    CloseAskedCheck("after world.txt and the format");
     if (enet_initialize() != 0) { Log("enet_initialize failed"); return 1; }
     ENetAddress addr; addr.host = ENET_HOST_ANY; addr.port = port;
     ENetHost* host = enet_host_create(&addr, (size_t)(kMaxConnected + kRefuseSeats), 2, 0, 0);   /* M1: design D1 - the connected limit plus seats to refuse in words */
     if (host == 0) { Log("enet_host_create failed (port busy?)"); return 1; }
+    CloseAskedCheck("after the port was opened");
     LoadIndex();
     /* B13: WHO, WHAT AND WHO'S IN CHARGE, before the socket is serviced - a HELLO that arrived before the
        restore would be given a new number and told it holds nothing, which is the defect itself. */
     LoadSlots();
     LoadProfiles();   /* prof1 */
+    TeamProfilesReconcile();   /* T-546 (owner 482 a): profiles deleted while this process was not running leave their factions */
+    FallenProfilesReconcile();   /* T-556: and their fallen lists go */
     LoadAreas();
     LoadOwner();
     LoadWorldGen();   /* restore1a: after LoadIndex, so the index's sequence high-water is known */
@@ -7337,14 +8543,15 @@ int main(int argc, char** argv)
     LoadUidBlocks();   /* M4 fold */
     LoadRepairList();   /* restore1c */
     LoadPendingPosCount();
+    CloseAskedCheck("after the record loads");
     /* M14 (T-197): THE WRITER THREAD STARTS HERE - after the startup load, whose recovery writes are made on
        this thread before any message is served - and the console's quit events drain it (rule 3,
        StoreCtrlHandler). There is no fallback to writing on the loop: a notebook that cannot start its
        writer does not serve. */
     if (!WriterStart(host)) { Log("M14: could not start the writer thread (GetLastError=" + N((long long)::GetLastError()) + ") - not serving"); return 1; }
     if (!SetConsoleCtrlHandler(StoreCtrlHandler, TRUE)) Log("M14: could not install the quit handler (GetLastError=" + N((long long)::GetLastError()) + ") - closing this window may lose queued writes");
-    if (!QuitWindowStart()) Log("M14: could not start the shutdown-window thread (GetLastError=" + N((long long)::GetLastError()) + ") - a logoff or shutdown may lose queued writes");   /* M14 fold (finding 1) */
-    ParentWatchStart();   /* owner decision 183: after the writer and both quit doors - its quit is the same QuitDrain */
+    ParentWatchStart();   /* owner decision 183: after the writer and the quit doors (the close window was started first) - its quit is the same QuitDrain */
+    CloseAskedCheck("after the writer started");
     g_restoredAtSec = NowSec();
     g_startedAt = NowSec();
     Log("M1 limits: " + N((long long)g_maxConnected) + " connected at once" + (g_maxConnected != kMaxConnected ? " (--max-connected)" : "")
@@ -7355,9 +8562,12 @@ int main(int argc, char** argv)
             " AREA MAPS after that many seconds and keep servicing its socket. TEST ONLY.");
     Log("listening");
     g_tick.Start(MonoUs());   /* M15: the first pass of the jobs is due at once */
+    InterlockedExchange(&g_loopRunning, 1);   /* a quit door on another thread now asks this loop for the final save */
     for (;;)
     {
         ENetEvent ev;
+        QuitSaveCheck();
+        CloseAskedCheck("from the loop");
         if (g_tick.Due(MonoUs())) PeriodicPass(host);   /* M15: on its fixed schedule - never waiting for a quiet network */
         { const long long passFrom = MonoUs(); g_pass.Begin(passFrom, g_tick.UsUntilDue(passFrom)); }
         while (LoopService(host, &ev, g_pass.WaitMs(MonoUs(), kIdleWaitMs)) > 0)   /* M14: the loop's one wait - completions applied and stalls measured there; M15: never past the pass's end */

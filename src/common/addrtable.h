@@ -118,6 +118,9 @@ const char* AddrKindName(int kind);
 /* gog1 fold 2 - THE REGISTRY'S SLOTS (addresses.cpp's AddrReg): a name the plugin asks for and where its RVA goes.
    POD, so a zero-initialised array of them is valid before any static constructor runs. */
 struct AddrSlot { const char* name; unsigned long long* slot; };
+/* How many AddrReg bindings the plugin can hold. One past it and the loader disables the whole mod ("addrRegOverflow"), so the
+   offline suite counts the plugin's bindings against it (t_address_bindings_fit). */
+const int kAddrMaxRegs = 2048;
 
 /* Every slot to 0: a refusal that leaves no address to anyone. */
 void AddrClearSlots(const AddrSlot* slots, int n);

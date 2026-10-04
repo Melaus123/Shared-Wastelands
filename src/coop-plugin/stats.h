@@ -31,6 +31,11 @@ void StatsNoteBadBlock();
 // names the caller in the log.
 bool ApplyRemoteStats(unsigned int uid, const unsigned int* raw44, const char* why);
 
+// T-556, MAIN THREAD. Write the 44 values into a character THIS game drives (a brought-back character) and run the same
+// recalculation (blood is not kept: the medical push sets it as for any fresh character). *rcOut: 1 recalc + medical,
+// 2 recalc only, 0 nothing recalculated (vftable not an expected one), -1 / -2 a fault. True when the recalculation ran.
+bool StatsApplyOwn(void* character, const unsigned int* raw44, int* rcOut);
+
 // MAIN THREAD, from the command-channel pump. The owner's sender: a character whose values changed (a whole
 // number, or by 0.05 or more) or were last sent 30 s ago goes out as MSG_STATS, at most kStatsMaxPerTick a tick.
 // Does nothing while EngineWritesBlocked() (load / teardown), counted statsTickBlocked.
