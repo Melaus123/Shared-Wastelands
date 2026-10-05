@@ -26,7 +26,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem --- Step 1: ENet (vendored, zlib licence - GPLv3-compatible) ---------------------
+rem --- Step 1: ENet (vendored, MIT licence) -------------------------------------------
 rem Compiled as C++ (/TP), NOT C: ENet 1.3.18 uses C99 for-loop declarations
 rem ("for (ENetPeer * p = ...)") which the VS2010 C compiler rejects (C89 only).
 rem enet.h carries extern "C" guards, so building the definitions as C++ keeps the
