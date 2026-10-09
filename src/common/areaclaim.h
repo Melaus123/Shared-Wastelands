@@ -132,6 +132,19 @@ inline int AreaClaimDecide(int restoredOwnerKnownNow, double ownerSilentSec, int
     return (reporterIsOwner == 0) ? kAreaTransfer : kAreaRelease;
 }
 
+/* A restored owner that says LOADING is loading a world from its save, so the world it held those areas in is gone
+   (a game re-dialling with its world still running says IN_WORLD, never LOADING - joinstage.h InWorldOwedDecide).
+   Its restored claims are released at that stage change, and each area's next report assigns it to a game that is
+   there instead of the area waiting out the restore grace.
+     isOwner  - 1 the row's owner id is the player whose stage changed.
+     restored - 1 the row came from areas.txt and its owner has not reported it since this process started.
+     loading  - 1 the new stage is LOADING.
+   Answers kAreaRelease or kAreaKeep. */
+inline int RestoredClaimOnStageDecide(int isOwner, int restored, int loading)
+{
+    return (isOwner != 0 && restored != 0 && loading != 0) ? kAreaRelease : kAreaKeep;
+}
+
 /* ================= THE SLOT NUMBER, KEYED ON THE ID =================
    A known id gets its old number back - even when a new id dialled first and would have taken it under
    AssignSlot's smallest-free rule. A new id gets the smallest number NO KNOWN ID holds, which is not the

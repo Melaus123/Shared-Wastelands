@@ -418,6 +418,20 @@ inline int TalkTestNameParse(const std::string& arg, std::string* name, unsigned
     return k == n ? 1 : 0;
 }
 
+/* `talktest nearestfaction <faction name> <targetUid> [event] [copy | mine]` (TEST-ONLY): as TalkTestNameParse, the faction name in
+   place of the NPC's name (*name = its TalkPersonKey). 1 parsed, 0 malformed. */
+inline int TalkTestFactionParse(const std::string& arg, std::string* name, unsigned int* targetUid, int* ev, int* own)
+{
+    const std::string w = "nearestfaction";
+    const size_t at = arg.find(w);
+    if (at == std::string::npos || arg.find_first_not_of(" \t") != at)
+    {
+        name->clear(); *targetUid = 0; *ev = kEvPlayerTalkToMe; *own = -1;
+        return 0;
+    }
+    return TalkTestNameParse("nearestname" + arg.substr(at + w.size()), name, targetUid, ev, own);
+}
+
 /* P25 T729: `playerteleport near name <npc name> <units> [maxdy <n>]` (TEST-ONLY): 1 parsed, 0 malformed. The name as
    TalkTestNameParse's (the word maxdy inside it is refused: units are missing); units 1..2000; *maxdy = n (1..500), else -1. */
 inline int TalkTeleportNearNameParse(const std::string& arg, std::string* name, int* units, int* maxdy)

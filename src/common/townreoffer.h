@@ -20,6 +20,7 @@ const int kDefNobody = 2;       // the map answered and nobody holds the area (a
 const int kDefNoNotebook = 3;   // no notebook link yet
 const int kDefTestLever = 4;   // T-581: the TEST-ONLY `owedtest aside on` - work this game would make now is set aside
 const int kDefOwed = 5;        // T-581: work this game would make now is an owed row it does not hold (made under a claim, owedpop.h)
+const int kDefPending = 6;    // a note of the town holds its creations (decision 34) - a building made here sets its residents aside
 inline int DeferCause(int linked, int may, int held)
 {
     if (linked == 0) return kDefNoNotebook;
@@ -34,6 +35,7 @@ inline const char* DeferCauseName(int c)
     if (c == kDefNoNotebook) return "no-notebook";
     if (c == kDefTestLever) return "test-lever";
     if (c == kDefOwed) return "owed";
+    if (c == kDefPending) return "notebook-pending";
     return "none";
 }
 
@@ -82,6 +84,17 @@ const int kSqSetAside = 1;
 inline int InBuildingSquad(int inBuilding, int aside)
 {
     return (inBuilding != 0 && aside != 0) ? kSqSetAside : kSqNormal;
+}
+// PendingSetsAside: a squad refused because a note of its town holds (decision 34, townpending::kTownHeld), inside a
+// populateBuilding on THIS thread that the residents gate let through to be made here (`gateMay` = the gate's area answer, 1 =
+// this game invents there), sets that building's residents ASIDE for the town's check-up instead of losing them: the engine
+// fills a building once per never-saved zone, and the notes are placed after the area loads. Not when the building is already
+// set aside (`aside`), not inside a residents re-run (`inRun` - the re-run's keep rule answers those), not outside a building fill
+// (a patrol or roaming group has no building to offer again; the engine's own spawner asks again), and not where another game
+// holds the area or the engine frees the world (gateMay 0 / -2: no squad there is this game's to make). 1 = set it aside.
+inline int PendingSetsAside(int inBuilding, int aside, int inRun, int gateMay)
+{
+    return (inBuilding != 0 && aside == 0 && inRun == 0 && gateMay == 1) ? 1 : 0;
 }
 // ReofferRunsPopulate (t438-a-townreoffer, manager 2026-10-02): does a residents re-offer run populateBuilding again? Only to
 // GENERATE. The set-aside run at load already switched the interior on and set the faction, so for kReOther (another game holds
@@ -144,6 +157,19 @@ inline int RerunStateSkips(int inRerunForBuilding, int atLoad)
 inline int RefusedSquadTakesState(int inBuilding, int hasBuilding, int teardown)
 {
     return (inBuilding != 0 && hasBuilding != 0 && teardown == 0) ? 1 : 0;
+}
+
+/* A GROUP MADE HERE FROM A RECORD THAT CARRIES NO HOME KEY (written before the key existed) has no home
+   building, so neither residents read names it and the building would be filled a second time. Such a group holds the building's
+   residents check at "could not be read - wait" when its squad template is the building's resident template and its record's
+   position is within `radius` of the building, or when a position is not known; a group template that could not be read holds it
+   too. 1 = holds (wait); 0 = not this building's group. */
+inline int KeylessHoldsBuilding(int tmplRead, const void* groupTmpl, const void* bldTmpl, int posKnown, float dx, float dz, float radius)
+{
+    if (tmplRead == 0) return 1;
+    if (bldTmpl == 0 || groupTmpl != bldTmpl) return 0;
+    if (posKnown == 0) return 1;
+    return (dx * dx + dz * dz <= radius * radius) ? 1 : 0;
 }
 
 }   // namespace townreoffer

@@ -7,8 +7,11 @@
 #include <string>
 class Faction;
 namespace coop {
-std::string WireFactionName(::Faction* f);                 // what a SPAWN carries for f (sender side)
-::Faction* ResolveWireFaction(const std::string& wire);    // receiver side: "@player:<name>" -> the peer faction (created), else by name
+std::string WireFactionName(::Faction* f, bool sending = false);   // what a SPAWN carries for f (sender side): "@slot:..." for mine, else FactionKey; sending: built for a SPAWN (counted, logged)
+::Faction* ResolveWireFaction(const std::string& wire);    // receiver side: "@slot:..." -> that player's faction (a stand-in, created), else FindFactionByKey
+std::string FactionKey(::Faction* f, bool* isCode = 0);    // factionkey.h: an NPC faction's stringID (*isCode true), a player's faction's name - ANY THREAD where getName is
+::Faction* FindFactionByKey(const std::string& key);       // factionkey.h: an NPC faction by stringID, else the faction of that name, else an NPC faction by its record's name - MAIN THREAD
+std::string RekeyFactionKey(const std::string& key);       // factionkey.h: a world-store row's key, an NPC faction's name replaced by its stringID - MAIN THREAD
 bool IsPlayerFaction(::Faction* f);                        // this game's own player faction (Faction+0x250 PlayerInterface* != 0)
 bool IsPeerFaction(::Faction* f);
 ::Faction* LocalPlayerFaction();

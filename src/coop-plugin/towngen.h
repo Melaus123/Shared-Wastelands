@@ -32,6 +32,22 @@ void RefillNoteRows(const std::vector<char>& payload);
    this game's copy of the table, OWED fills and changes it. The TEST-ONLY verb `owedtest aside on|off | show`. */
 void TownGenOwedReset();
 void TownGenOwedArrive(const std::vector<char>& payload);
+/* The world server's town loss rows (src/common/townrefill.h) - store.cpp's drain, MAIN THREAD: a WELCOME empties this game's copy
+   (the refills this game has not had taken yet stay in it), TOWN_LOSS fills it. */
+void TownLossReset();
+/* TEST-ONLY lever `townfill force | show` (towngen.cpp TownFillLeverImpl): force starts the refill of the next held town near this
+   game's player without the empty-town verdict and the buildings' home answers; show lists the refills running here. MAIN THREAD */
+std::string TownFillLever(const std::string& arg);
+void TownLossNoteRows(const std::vector<char>& payload);
+/* MAIN THREAD (store.cpp, the frame pump or the exit routine) - this game's own profile save, asked for as save request reqSeq
+   (StoreSaveRequestSeq's count), has finished with its own quick.save on disk: the owed rows whose people were made before that
+   request are settled (DONE made, owed until the world server's GONE). TownGenOwedNotThisSave counts a finished save whose quick.save
+   was an earlier save's; TownGenOwedSettling (ANY THREAD) = rows made here that no finished save holds yet; TownGenOwedCanSend =
+   1 while the world-server link is admitted with its opening push in (an owed DONE can go now). */
+void TownGenOwedSaveFinished(const std::string& saveName, long reqSeq);
+void TownGenOwedNotThisSave();
+int TownGenOwedSettling();
+int TownGenOwedCanSend();
 std::string TownGenOwedLever(const std::string& arg);
 void ReportTownGen();              // the [TG] report line
 void TownGenTick();                // MAIN THREAD: captures the main thread id on the first tick (review-p4a HIGH-2)
@@ -47,5 +63,14 @@ void TownGenResidentsDone(int ran);   /* T-392 fold: called when the original po
                                          set-aside flag; ran = 1 the engine call ran (a set-aside building's furniture line is logged), 0 it did not */
 int  WorldGenRerunPopulate(void* factory, void* building);
 void* TownOfBuilding(void* building);
+/* The group's home building, carried on its world record. TownGenPlatoonHomeKey: the position key (items.cpp ObjectPositionKey, the
+   residents table's own key form) of the building the group's Ownerships+0x38 names - 1 written to out, 0 the group has no home
+   building, -1 unreadable or a key a record line cannot hold. TownGenGiveHomeTo: Ownerships::setHomeBuilding for the group (spawn.cpp
+   PlatoonSetHomeBuildingPod) - 1 given and the building's residents hand names the group, 2 given and it does not, 0 the call faulted.
+   TownGenGiveHomeByKey: the same after resolving the key (items.cpp ObjectByPositionKey) - 3 the building is not loaded here.
+   MAIN THREAD. */
+int  TownGenPlatoonHomeKey(const void* platoon, char* out, int cap);
+int  TownGenGiveHomeTo(void* platoon, void* building);
+int  TownGenGiveHomeByKey(void* platoon, const char* key);
 int  TownGenTownSid(void* town, char* out, int cap);   /* decision 34: the town's string id (guarded), 1 ok 0 fault; any thread */       // forgets the refusal keys (town x cause) and their counts
 }

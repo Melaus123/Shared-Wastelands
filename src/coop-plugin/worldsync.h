@@ -216,6 +216,17 @@ std::string WorldsyncCatchupCounts();
    re-sent to those askers while it is still this game's. */
 void WorldsyncCatchupReverse(unsigned int askNo, const std::vector<int>& keys);
 void WorldsyncCatchupHandoverSettled(unsigned int uid);
+/* THE OWNER'S SIDE OF A RESEND ASK (net/session.cpp OnResend). MAIN THREAD, a running world. Each uid gets a verdict
+   (lostcopy::ResendOwnerVerdict); a SENT character's full state (the catch-up's CatchupSendState) goes to the asking game alone -
+   `streamSlot` >= 0: by LIVE SLOT to that game; -1: on the character stream's own road, which is the session link to the asker
+   (the caller passes -1 only then). A HELD character (a hand-over in flight) is re-sent to `askerSlot` alone when the hand-over
+   settles, on the road net::CharStreamSlotFor gives then. */
+void WorldsyncResendAsk(int streamSlot, int askerSlot, const std::vector<unsigned int>& uids, std::vector<int>* verdicts);
+/* May a SPAWN for `uid` replace the row this game still keeps for it (lostcopy::StaleRowGivesWay)? Asked by the creation core for
+   another game's uid whose row FindSpawned no longer answers: true only for a SPAWN this game asked for (a RESEND ask), when the
+   row's handle does not resolve to its object, the object is not in the engine's list of running characters, and the SPAWN's spot
+   is loaded here (the engine's zone byte). MAIN THREAD. */
+bool WorldsyncCopyRowStale(unsigned int uid, float x, float y, float z);
 /* M7a2 fold 1 item 8 [m7a2f-wh0]: WorldsyncCatchupReverse only QUEUES the sectors (the store pump calls it); this walks them - MAIN THREAD,
    net::SessionCatchupApplyTick (after the drain) [m7a2f-ap5], a running world with engine writes allowed, at most 64 characters a call. */
 void WorldsyncCatchupReverseTick();

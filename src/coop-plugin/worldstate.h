@@ -32,6 +32,10 @@
 namespace coop {
 void InstallWorldState();     // preload, main thread: the FIVE hooks (declareDead, uniqueStateUpdate, the squad-unload writer, the shared setter, and the respawn clear)
 void WorldStateTick();        // MAIN THREAD, every frame: drains the detours' ring, reads the state map (E19: the only reader) and sends what changed
+int WsTemplateIsUnique(void* gd);        // MAIN THREAD: 1 = the character template is flagged "unique", 0 = not or no such field (its bool-field table walked, nothing inserted), -1 = the read faulted
+int WsUniqueSlotPod(void* gd);           // MAIN THREAD: 1 = this game's unique-state entry for the template holds it (+8: the game's own 0x591720 refuses to make it); 0 = no entry or an empty slot; -1 = fault
+void* WsTemplateBySid(const char* sid);  // MAIN THREAD: the record with that stringID in the base game-data container, 0 if none
+long long WorldStateGeneration();   // MAIN THREAD: grows by one whenever a named character's state changes on this game (seen in the drain, or applied from the world); towns2 reads it
 void WorldStateWorldTeardown();   // MAIN THREAD, from the store's teardown broadcast: the shadow, the register and the ring all name the world being destroyed
 void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved, unsigned int back);   // MAIN THREAD: a state from the notebook; back = how many times the world server says that character was brought back
 
@@ -59,6 +63,10 @@ void WorldStateOnOwnershipReleased(unsigned int uid, const void* character);
 // teardown - but it does go when the notebook link drops, because the next notebook may be a different one with a
 // different key list, and the first-sight rule reads that list to decide whether a record is news.
 void WorldStateNotebookReset();
+// TEST-ONLY (`uniqueforce <sid> dead|alive|show`) - MAIN THREAD: this game's own table entry for that named character is
+// written DEAD or ALIVE the way the apply writes it and the shadow learns it, so nothing is sent; show reads the entry, the
+// slot, the template's unique flag and the two sets (dead, and alive in another game). Returns the status line.
+std::string WorldStateForceLocal(const std::string& sid, const std::string& what);
 std::string WorldStateReport();   // "sent,recv,applied,unknownSid,unchanged" - THE DRAIN'S SENDS ONLY (E27 gave the apply's re-assert its own counters): the wire total for unique states is sent + reassertSent, and a pre-E27 run's `sent` is not comparable with a later one's   // the [STORE] REPORT token
 std::string WorldStateDetail();   // the writer/ring detail that follows it
 }

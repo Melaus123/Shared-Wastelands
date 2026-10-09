@@ -59,6 +59,8 @@ const unsigned int kInnerEffect = 65;
 /* T-354 (protocol 130; 66 / 115 on its branch, renumbered at the merge of main 22ca5c91): MSG_NOT_SHOWN - the copy's game tells the owner its character is not shown there; answers nobody, and its
    handler counts it as ours only for a uid this game runs */
 const unsigned int kInnerNotShown = 73;
+/* MSG_RESEND - a copy's game asks the owner to send a lost copy again, and the owner answers (lostcopy.h) */
+const unsigned int kInnerResend = 74;
 /* M7a: the rest of a character's stream (net/transport.h numbers; store.cpp asserts each) */
 const unsigned int kInnerSpawn = 10, kInnerAppearance = 15, kInnerClothing = 16, kInnerCombatMode = 17, kInnerSwing = 19,
                    kInnerIntent = 21, kInnerContext = 22;
@@ -86,6 +88,9 @@ const unsigned int kInnerName = 51, kInnerSlave = 52, kInnerHire = 55;
 /* MOVESTOP: the owner's stated stop for one of its player-faction characters, on the character stream's road (AREA) like MOVE;
    its handler takes it only from the uid's owner (RemoteMayWrite, MOVE's test). net/transport.h number; store.cpp asserts it. */
 const unsigned int kInnerMoveStop = 72;
+/* TOWN_PRICES: one town's local trade multipliers from the world's price source, route WORLD / WORLD_EXCEPT the session peer;
+   items.cpp PtNote takes it only from the source (townprice::TakeFrom). net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerTownPrices = 75;
 
 struct LiveUp
 {
@@ -373,6 +378,7 @@ inline bool LiveInnerAccepted(unsigned int t)
         || t == kInnerShot
         || t == kInnerEffect   /* T-327 */
         || t == kInnerNotShown   /* T-354 */
+        || t == kInnerResend   /* a lost copy's ask / its answer */
         || t == kInnerSpawn || t == kInnerAppearance || t == kInnerClothing || t == kInnerCombatMode || t == kInnerSwing
         || t == kInnerIntent || t == kInnerContext   /* M7a */
         || t == kInnerInside   /* P25 fold 2 */
@@ -383,7 +389,8 @@ inline bool LiveInnerAccepted(unsigned int t)
         || t == kInnerParityReq || t == kInnerParityBox   /* M7b slice 2 */
         || t == kInnerBounty || t == kInnerTalk || t == kInnerBuild || t == kInnerDoorState   /* M7b slice 4 + DOOR_STATE */
         || t == kInnerName || t == kInnerSlave || t == kInnerHire
-        || t == kInnerMoveStop;   /* MOVE's owner test */
+        || t == kInnerMoveStop   /* MOVE's owner test */
+        || t == kInnerTownPrices;   /* taken only from the price source (items.cpp PtNote) */
 }
 
 /* M7b slice 2 fold 1: the relayed types that WAIT in the arrival queue while this game has no running world (store.cpp), as they
@@ -396,7 +403,9 @@ inline bool LiveInnerWaitsForWorld(unsigned int t)
     return t == kInnerItemMove || t == kInnerItemRequest || t == kInnerItemConfirm || t == kInnerItemPlaced || t == kInnerItemRevoke
         || t == kInnerParityReq || t == kInnerParityBox
         || t == kInnerTalk || t == kInnerBuild || t == kInnerDoorState   /* M7b slice 4 */
-        || t == kInnerName || t == kInnerSlave || t == kInnerHire;   /* a name and a slave state are kept pending, a HIRE queued, as on the session link */
+        || t == kInnerName || t == kInnerSlave || t == kInnerHire   /* a name and a slave state are kept pending, a HIRE queued, as on the session link */
+        || t == kInnerPrison || t == kInnerTreat   /* a caging / treatment request waits for the owner's new world, as on the session link */
+        || t == kInnerTownPrices;   /* a town table is filed after the load, not lost to it */
 }
 
 /* A repeating refusal line: the first 5, then every 100th. `count` is the refusal's own counter, already incremented. */

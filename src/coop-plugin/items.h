@@ -304,6 +304,7 @@ bool BuyTestKeeper(const std::string& pick, int sell, int cats);   /* T-164 B4-1
 std::string BoxListCommand(const std::string& arg);
 /* par1 (docs/design-loot2.md rev 2, 0.4): MSG_PARITY_REQ / MSG_PARITY_BOX arrived. MAIN THREAD (the session dispatcher). The
    holder queues the asked rows and answers kParityServeBudget per ItemsTick; the asker swaps a CONTENTS answer in at once. */
+void TownPricesNote(const char* p, size_t n, unsigned int fromPeer);   /* T-619, MAIN THREAD: a TOWN_PRICES payload, by the session link or relayed by the world server (fromPeer a relay key) */
 void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2: fromPeer = the asker, the answers go back to it
 void ParityNoteBox(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2 fold 1: a box's contents are taken only from its writer (parityBoxNotWriter)
 std::string BoxDigestCommand(const std::string& arg);   /* par1: `boxdigest [<x>,<y>|ring|all]` - read-only: [PARITY] box key=.. items=.. digest=.. per box (flat + furniture) and a total */
@@ -466,6 +467,15 @@ int  BuildingOwnerClass(void* bld, int* slot);
    the owner's game while it is online and holds the area, else the area holder; the owner's hand-back gate). 1 this game,
    2 another game, 0 no answer (then nobody is held: both engines run as before). */
 int  FarmWriterHere(void* b);
+/* MAIN THREAD: who runs the steps of this production building (a mining node, a machine) - the production gate's writer (the
+   owner's game while it is online and holds the area, else the area holder), kept per building key for 250 ms:
+   coopfarm::kProdWriterHere 1 this game, kProdWriterOther 2 another game, kProdWriterNone 0 no answer yet. */
+int  ProdStepWriterHere(void* pb);
+/* ANY THREAD: 1 when the building's operate slot is ProductionBuilding::operate (a mining node or a production machine). */
+int  ProductionBuildingIs(const void* b);
+/* MAIN THREAD (farm.cpp, MINE_OP work): the engine's own ProductionBuilding::operate(who, amount), unhooked, in a
+   fault guard. 1 ran; 0 not (the hook is not installed, or the engine faulted). */
+int  ProdOperateRun(void* pb, void* who, float amount);
 /* lever2 (TEST LEVER ONLY, buildtest farm): the farm's own box (ItBoxInventory) read the way ItParityContents reads a box:
    *stacks = the items in it, *quantity = their summed quantity. MAIN THREAD. 1 read; 0 not read (both -1). */
 int  FarmBoxItemCount(void* b, int* stacks, int* quantity);

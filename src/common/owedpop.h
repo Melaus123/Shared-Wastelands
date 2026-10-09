@@ -18,6 +18,13 @@
 // - DONE: the row leaves the table. From the game holding it: made, gone (the building no longer exists) or fault (the engine
 //   call faulted). Gone, fault and empty hand the row back and are tried again, 5 minutes apart; the third of a kind removes it. From ANY game: has (that game's engine shows the residents / the bar crowd already there).
 //   Every game hears GONE and forgets its own copy of the work.
+// - MADE WAITS FOR THE MAKER'S SAVE: people a game made live only in that game's memory until a save of its own holds them. So the
+//   maker keeps the row - and its claim, wherever its player goes - until its own profile save that was asked for after the make
+//   has finished - its quick.save written by that save (SaveIsThisOne) - and only then sends DONE made (SettleNote / SettleDue /
+//   SettleStep), again on every new link until the world server's GONE (DoneStep). A crash before that save: the world server sees
+//   the game leave, the row is nobody's again and the next holder makes the people. A world closed in the same process forgets its
+//   unsaved makes unless a save asked for after them is still being written (SettleKeep), so the row is made again there, once.
+//   A game does not say has for a row another game holds (Commit): the holder settles it.
 // - DOWN: ROWS (the whole table at WELCOME, in chunks of 256, then every changed row) and GONE.
 // WIRE (little-endian, as every world-server message): u32 op, then
 //   ADD     u32 kind, str key, str sid, f32 x, f32 z
@@ -37,7 +44,7 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 87;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 90;   /* the world-server protocol that carries OWED */
 
 const unsigned kKindResidents = 1, kKindBar = 2;
 const unsigned kOpAdd = 1, kOpClaim = 2, kOpRelease = 3, kOpDone = 4, kOpRows = 5, kOpGone = 6;
@@ -309,6 +316,8 @@ inline int LoadCause(int cause, int may, int owed, int lever)
 //   stored  0 = only this game knows it (never reached the world server); 1 = a row in the world server's table;
 //           2 = sent on this link and not yet back from the world server
 //   claim   kClaimNone / kClaimYou / kClaimOther (meaningful when stored == 1)
+// Work already there ends the row (DONE has) from any game, except a row another game holds: that game may have made the people
+// and not saved them yet, so it waits and the holder settles the row.
 const int kActWait = 0;       // keep it (asked again at the next check-up)
 const int kActMake = 1;       // make it now (the engine call)
 const int kActClaim = 2;      // ask the world server for the row
@@ -317,7 +326,11 @@ const int kActDoneHas = 4;    // DONE has: the work is already there
 const int kActDoneGone = 5;   // DONE gone (this game holds the row): the building no longer exists
 inline int Commit(int decide, int found, int has, int stored, int claim)
 {
-    if (has == 1) return stored == 0 ? kActForget : kActDoneHas;
+    if (has == 1)
+    {
+        if (stored == 0) return kActForget;
+        return (stored == 1 && claim == (int)kClaimOther) ? kActWait : kActDoneHas;
+    }
     if (decide != 1 && decide != 2) return kActWait;
     if (found == 0)
     {
@@ -382,6 +395,81 @@ inline int AfterRerun(long long made, int keep, int givenUp, int stored, long lo
 inline int KeepClaim(int zoneLive, int may, int lever)
 {
     return (zoneLive != 0 && may == 1 && lever == 0) ? 1 : 0;
+}
+
+// ---- made people wait for the maker's own save ----
+// A row whose people this game made is SETTLING on this game: the row stays in the world server's table, and this game's, until a
+// save of this game's own profile that was asked for AFTER the make has finished; then DONE made goes. seq = how many save requests
+// the engine had accepted when the make was noted (store.cpp counts them); a finished save covers the make when its own request
+// number is higher. held = this game held the row when it made it. closed = the world it was made in has closed; closeSeq = the
+// highest save request still being written at that moment - only a save numbered up to it can hold the make (SaveSettles).
+struct Settle { unsigned kind; std::string key; long seq, closeSeq; int held, closed; Settle() : kind(0), seq(0), closeSeq(0), held(0), closed(0) {} };
+typedef std::map<std::string, Settle> SettleSet;   /* keyed by TableKey(kind, key) */
+// a make noted; a second make of the same row keeps the later request count (the later make must be in the save) and held if either was
+inline void SettleNote(SettleSet* s, unsigned kind, const std::string& key, long seq, int held)
+{
+    Settle& e = (*s)[TableKey(kind, key)];
+    e.kind = kind; e.key = key;
+    if (seq > e.seq) e.seq = seq;
+    e.held = (e.held != 0 || held != 0) ? 1 : 0;
+}
+inline int SaveCovers(long noted, long saveReq) { return saveReq > noted ? 1 : 0; }
+// SaveIsThisOne: the folder's quick.save was written by the save asked for at requestFt (FILETIMEs, 100 ns units; 2 s of slack),
+// not left there by an earlier save of the same folder (a failed save leaves the old file). requestFt 0 = not known: never counts.
+inline int SaveIsThisOne(int fileRead, unsigned long long writeFt, unsigned long long requestFt)
+{
+    return (fileRead != 0 && requestFt != 0 && writeFt + 20000000ULL >= requestFt) ? 1 : 0;
+}
+// SaveCredit*: a save asked for again to the same folder while the first one is still being written shares that first save's
+// finish (one watch row per folder), so the row keeps the FIRST request's number and time; a make between the two requests then
+// waits for a later save. refreshed = the row was still waiting; old* = its values (0 = none).
+inline long SaveCreditSeq(int refreshed, long oldSeq, long newSeq) { return (refreshed != 0 && oldSeq > 0) ? oldSeq : newSeq; }
+inline unsigned long long SaveCreditFt(int refreshed, unsigned long long oldFt, unsigned long long newFt) { return (refreshed != 0 && oldFt != 0) ? oldFt : newFt; }
+// SettleKeep: a settling row stays while its world is open; once that world has closed, only while a save asked for after its
+// make is still being written (inFlightSeq = the highest request number still being watched, 0 = none) - that save settles it when
+// it finishes; otherwise the make is gone with the world and the entry is dropped (the row is made again).
+// (for a closed world's make the caller passes the highest request still watched that is not above its closeSeq)
+inline int SettleKeep(int closed, long noted, long inFlightSeq) { return closed == 0 ? 1 : SaveCovers(noted, inFlightSeq); }
+// SaveSettles: does the finished save asked for as `saveReq` hold this make? It must have been asked for after the make; for a make
+// whose world has closed, also no later than the close (a save asked for after the close is of another world)
+inline int SaveSettles(const Settle& e, long saveReq)
+{
+    return (SaveCovers(e.seq, saveReq) != 0 && (e.closed == 0 || saveReq <= e.closeSeq)) ? 1 : 0;
+}
+// DoneStep: a row whose save has finished is DONE-owed here until the world server's GONE. Sent once per link (sentGen = the link
+// it went out on, gen = this one); while it is owed the check-up leaves the row alone. A row absent from a new link's table was
+// settled while this game was away: the entry ends.
+const int kDoneKeep = 0, kDoneSend = 1, kDoneDrop = 2;
+inline int DoneStep(long sentGen, long gen, int inTable)
+{
+    if (sentGen == gen) return kDoneKeep;
+    return inTable != 0 ? kDoneSend : kDoneDrop;
+}
+// a save asked for as request `saveReq` has finished: the makes it covers leave the set and are returned (each is sent as DONE made)
+inline std::vector<Settle> SettleDue(SettleSet* s, long saveReq)
+{
+    std::vector<Settle> out;
+    for (SettleSet::iterator it = s->begin(); it != s->end(); )
+    {
+        if (SaveSettles(it->second, saveReq) != 0) { out.push_back(it->second); s->erase(it++); }
+        else ++it;
+    }
+    return out;
+}
+// Checkup: the town check-up's action for one item. A row held back here - settling, or DONE-owed - is left alone (no second
+// make, no has, no claim); everything else is Commit.
+inline int Checkup(int settling, int decide, int found, int has, int stored, int claim)
+{
+    return settling != 0 ? kActWait : Commit(decide, found, has, stored, claim);
+}
+// SettleStep: the once-a-second tick for a row this game made (or holds), by the row's claim as seen here
+const int kSetNone = 0;      // not settling: KeepClaim decides whether a held row is kept
+const int kSetHold = 1;      // settling: the row is kept wherever this game's player goes (never handed back)
+const int kSetReclaim = 2;   // settling, made under a claim, and the row reads nobody's (the world-server link dropped and came back): ask for it again
+inline int SettleStep(int settling, int held, int claim)
+{
+    if (settling == 0) return kSetNone;
+    return (held != 0 && claim == (int)kClaimNone) ? kSetReclaim : kSetHold;
 }
 
 }   // namespace owedpop

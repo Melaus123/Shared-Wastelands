@@ -113,6 +113,12 @@ void GarmentsNoteOwnerMove(unsigned int uid, const std::string& section, int op)
 // MAIN THREAD. The copy is removed (spawn.cpp RemoveLocalCopy): forget its dead-copy marks (review D3a) and its createBody-guard
 // marks (T-293 fold 2).
 void DeadlookForgetCopy(unsigned int uid);
+// MAIN THREAD (spawn.cpp RepeatSpawnAct): a stale copy is made again - the old body's 'owner's record applied' mark is forgotten.
+void AppearanceForgetCopyBody(unsigned int uid);
+// MAIN THREAD (off it: counted, never marked). Called right after a mod apply that may queue a body rebuild on
+// `uid` (look, kit, limb): a set rebuild-pending byte marks the uid, and the createBody guard holds that rebuild in ragdoll
+// even if the uid becomes this game's own before it runs.
+void CopyBodyNoteModApply(unsigned int uid, ::Character* c);
 // MAIN THREAD (spawn.cpp SpawnWorldTeardown): the world is going - every copy's marks DeadlookForgetCopy forgets one copy at a
 // time are forgotten at once, so a copy met in the next world with the same uid starts with none (its first look is its own).
 void DeadlookForgetAllCopies();

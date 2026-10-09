@@ -220,12 +220,17 @@ const unsigned int kInnerOwnerMoved = 202;   /* M7a2 item 3 [m7a2-lr1]: {u32 uid
    LOG_PART, route SLOT back to the asker (src/common/bugreport.h). Read by the receiving game's store layer and handed to
    bugreport.cpp; they touch no engine state. */
 const unsigned int kInnerLogAsk = 203, kInnerLogPart = 204;
+/* In-game text chat: one chat line - route WORLD (everyone) or SLOT (one player; a faction message is one SLOT copy
+   per other member in the world), src/common/chatwire.h. Read by the receiving game's store layer and handed to chat.cpp;
+   it touches no engine state. */
+const unsigned int kInnerChat = 205;
 inline bool LiveInnerRoadLocal(unsigned int innerType)
 {
     return innerType == kInnerLiveProbe || innerType == kInnerCatchupEnd
         || innerType == kInnerPing || innerType == kInnerPong || innerType == kInnerHostClosing   /* M11a S3 */
         || innerType == kInnerOwnerMoved   /* M7a2 item 3 [m7a2-lr2] */
-        || innerType == kInnerLogAsk || innerType == kInnerLogPart;   /* T-461 */
+        || innerType == kInnerLogAsk || innerType == kInnerLogPart   /* T-461 */
+        || innerType == kInnerChat;
 }
 
 /* M7a (T-197 piece 7a; game-to-game protocol 108; owner decisions 54(a), 57) - THE CHARACTER STREAM ON THE NOTEBOOK ROAD.
@@ -313,6 +318,19 @@ inline int AnnounceDecide(bool anyOtherLoaded, bool mineLoaded, bool announcedTo
     if (announcedToRelay && areaGainedReporter) return kAnnResend;
     if (!announcedToRelay && anyOtherLoaded && mineLoaded) return kAnnSpawn;
     return kAnnKeep;
+}
+/* T-650 fold 2 (T1056 F2: A withdrew its characters 1 s before its forced hand-over reached B, B deleted its copies and the hand-over
+   found nothing to take). The pass's rule with two more inputs: otherInWorldLoaded = an IN_WORLD game other than this one has the
+   character's area loaded (the world server's map); handoverRefused = this game's forced hand-over of it was refused (the back-off
+   record). An announced character this game no longer has loaded while another in-world game does is HELD (kAnnHoldForHandover:
+   nothing sent, it stays announced) - its withdrawal waits for the hand-over decision; it goes once no other in-world game has the
+   area loaded or the hand-over was refused. Every other answer is AnnounceDecide's. */
+enum { kAnnHoldForHandover = 4 };
+inline int AnnounceDecide(bool anyOtherLoaded, bool mineLoaded, bool announcedToRelay, bool areaGainedReporter, bool otherInWorldLoaded, bool handoverRefused)
+{
+    const int a = AnnounceDecide(anyOtherLoaded, mineLoaded, announcedToRelay, areaGainedReporter);
+    if (a == kAnnUnload && anyOtherLoaded && !mineLoaded && otherInWorldLoaded && !handoverRefused) return kAnnHoldForHandover;
+    return a;
 }
 /* THE RELAYED-OWNER GATE for the six stream types whose session handler has no owner test of its own (it applies only to a
    copy this game holds - fine for the one session peer, not for any number of games): a relayed one is refused when this game

@@ -62,6 +62,10 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
 // The session link came up: a game that joins late has been told nothing, so the holder re-offers
 // what it has (the weather pattern's "at WELCOME and on change").  Called from DoorsTick's own edge.
 void DoorsOnLinkUp();
+// MAIN THREAD. The world server asked this game to catch up another game (slot askerSlot) that has just come to have these n
+// sectors (sx[i], sy[i]) in its delivery area - worldsync.cpp's catch-up answer: every registered door of those sectors in a resting
+// state is re-offered once, and DoorsTick publishes it, routed by the door's sector, only where this game holds the door.  Queues only.
+void DoorsServeCatchup(const int* sx, const int* sy, int n, int askerSlot, unsigned int askNo);
 // ANY THREAD, inside the engine's own zone teardown: items.cpp's ZoneMapContent::deactivate detour
 // fans out to this (one hook, two subscribers).  It makes two interlocked integer writes and nothing
 // else - no walk, no log, no allocation - and the next main-thread DoorsTick drops every registry row

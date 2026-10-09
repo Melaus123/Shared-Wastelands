@@ -18,6 +18,13 @@
  *     (CharStats::getStat 0x883BF0, stat 0xC) x 0.01 into getYieldChancePerCrop 0xDFDD0 (0xE5A9F-0xE5AC8); uid 0 = no
  *     replicated worker, skill -1 = unknown (par16 fold #1). The writer runs the engine's own operate, so the crop is made
  *     ONCE, into the farm's own output box, and reaches the other game as an ordinary box move.
+ *   kind u8 (10 MINE_OP, non-writer -> writer) | u8 len + P7n key | u32 worker uid | f32 amount | f32 work
+ *     = the WORK a worker on a game that does not write a production building (a mining node, a machine) put into it:
+ *     ProductionBuilding::operate 0x2986C0 (who, amount) scales its step by amount and by the frame's g_dt, and its output
+ *     step updateOutput 0x298470 makes at most ONE item per call (the bar goes back to 0). So the non-writer sends the
+ *     amount it was called with and amount x ITS g_dt summed (0 < work <= kFarmOpMax); the writer calls the engine's own
+ *     operate with that amount, at most once per its own frame's worth of the work (FarmWorkSlice). The ore is made ONCE,
+ *     into the building's own box, and reaches every game as an ordinary box move. Kinds 8 / 9 are the building road's.
  *
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes and the same decisions. C++03 (VS2010 v100).
  */
@@ -31,9 +38,10 @@ namespace coopfarm {
 
 const unsigned char kFarmState = 6;
 const unsigned char kFarmOp = 7;
+const unsigned char kMineOp = 10;
 const unsigned int  kFarmMaxKey = 63;
 const unsigned int  kFarmMaxPlants = 512;   /* a farm's plant count; a bigger message is refused, never truncated */
-const float         kFarmOpMax = 60.0f;     /* one FARM_OP's work (operate amount x g_dt; the non-writer sends every 0.5 s) */
+const float         kFarmOpMax = 60.0f;     /* one FARM_OP's or MINE_OP's work (operate amount x g_dt; the non-writer sends every 0.5 s) */
 const unsigned int  kFarmMaxInputs = 16;    /* a farm's input records (water); a bigger message is refused */
 const float         kFarmHiddenAge = -1.0f; /* updatePlantInstance 0xDF320 draws nothing below this (DAT_141683fcc = -1.0) */
 const float         kFarmSkillUnknown = -1.0f;
@@ -54,10 +62,13 @@ struct FarmMsg
     std::vector<float> inStock, inRate;   /* FARM: the input records' water (same length) */
     unsigned int uid;   /* FARM_OP: the worker's uid, 0 = none */
     float skill;        /* FARM_OP: the worker's farming skill, kFarmSkillUnknown = unknown */
-    float work;         /* FARM_OP: operate amount x the sender's g_dt */
+    float work;         /* FARM_OP / MINE_OP: operate amount x the sender's g_dt */
+    float amount;       /* MINE_OP: the operate amount the worker's call carried (one engine call's worth) */
     FarmMsg() : kind(0), grown(0.0f), died(0.0f), cleared(0.0f), growStart(0.0f), harvested(0), prodState(0), hasProgress(0),
-                progress(0.0f), uid(0), skill(kFarmSkillUnknown), work(0.0f) { marker[0] = marker[1] = marker[2] = 0.0f; }
+                progress(0.0f), uid(0), skill(kFarmSkillUnknown), work(0.0f), amount(0.0f) { marker[0] = marker[1] = marker[2] = 0.0f; }
 };
+
+const float         kMineAmountMax = 1000.0f;   /* one MINE_OP's per-call operate amount */
 
 inline bool FarmFloatOk(float v, float lim) { return v == v && v > -lim && v < lim; }
 
@@ -66,6 +77,8 @@ inline bool FarmEncodable(const FarmMsg& m)
     if (m.key.empty() || m.key.size() > kFarmMaxKey) return false;
     if (m.kind == kFarmOp)
         return m.work == m.work && m.work > 0.0f && m.work <= kFarmOpMax && FarmFloatOk(m.skill, 1.0e4f) && m.skill >= kFarmSkillUnknown;
+    if (m.kind == kMineOp)
+        return m.work == m.work && m.work > 0.0f && m.work <= kFarmOpMax && m.amount == m.amount && m.amount > 0.0f && m.amount <= kMineAmountMax;
     if (m.kind != kFarmState) return false;
     if (m.ages.size() > kFarmMaxPlants || m.hasProgress > 1) return false;
     if (m.harvested < 0 || m.harvested > (int)m.ages.size() || m.prodState < 0 || m.prodState > 16) return false;
@@ -89,6 +102,7 @@ inline bool EncodeFarm(std::vector<char>* b, const FarmMsg& m)
     b->push_back((char)(unsigned char)m.key.size());
     b->insert(b->end(), m.key.begin(), m.key.end());
     if (m.kind == kFarmOp) { FarmPutI(b, (int)m.uid); FarmPutF(b, m.skill); FarmPutF(b, m.work); return true; }
+    if (m.kind == kMineOp) { FarmPutI(b, (int)m.uid); FarmPutF(b, m.amount); FarmPutF(b, m.work); return true; }
     FarmPutF(b, m.grown); FarmPutF(b, m.died); FarmPutF(b, m.cleared); FarmPutF(b, m.growStart);
     FarmPutI(b, m.harvested); FarmPutI(b, m.prodState);
     b->push_back((char)m.hasProgress);
@@ -102,15 +116,20 @@ inline bool EncodeFarm(std::vector<char>* b, const FarmMsg& m)
     return true;
 }
 
-/* 1 when the first byte names a farm kind - the session's peek before DecodeBuild. */
-inline int IsFarmKind(const char* p, size_t size) { return (p != 0 && size >= 1 && ((unsigned char)p[0] == kFarmState || (unsigned char)p[0] == kFarmOp)) ? 1 : 0; }
+/* 1 when the first byte names a kind this file decodes (FARM, FARM_OP, MINE_OP) - the session's peek before DecodeBuild. */
+inline int IsFarmKind(const char* p, size_t size)
+{
+    if (p == 0 || size < 1) return 0;
+    const unsigned char k = (unsigned char)p[0];
+    return (k == kFarmState || k == kFarmOp || k == kMineOp) ? 1 : 0;
+}
 
 inline int DecodeFarm(const char* p, size_t size, FarmMsg* out)
 {
     if (p == 0 || size < 2) return kFarmDecodeTooShort;
     FarmMsg m;
     m.kind = (unsigned char)p[0];
-    if (m.kind != kFarmState && m.kind != kFarmOp) return kFarmDecodeBadKind;
+    if (m.kind != kFarmState && m.kind != kFarmOp && m.kind != kMineOp) return kFarmDecodeBadKind;
     const unsigned int kl = (unsigned char)p[1];
     size_t off = 2;
     if (kl == 0 || kl > kFarmMaxKey) return kFarmDecodeBadKey;
@@ -120,6 +139,14 @@ inline int DecodeFarm(const char* p, size_t size, FarmMsg* out)
     {
         if (size - off != 12) return (size - off < 12) ? kFarmDecodeTooShort : kFarmDecodeBadValue;
         std::memcpy(&m.uid, p + off, 4); std::memcpy(&m.skill, p + off + 4, 4); std::memcpy(&m.work, p + off + 8, 4);
+        if (!FarmEncodable(m)) return kFarmDecodeBadValue;
+        if (out) *out = m;
+        return kFarmDecodeOk;
+    }
+    if (m.kind == kMineOp)
+    {
+        if (size - off != 12) return (size - off < 12) ? kFarmDecodeTooShort : kFarmDecodeBadValue;
+        std::memcpy(&m.uid, p + off, 4); std::memcpy(&m.amount, p + off + 4, 4); std::memcpy(&m.work, p + off + 8, 4);
         if (!FarmEncodable(m)) return kFarmDecodeBadValue;
         if (out) *out = m;
         return kFarmDecodeOk;
@@ -216,6 +243,35 @@ inline float FarmWorkSlice(float left, float dt, float chunkAmount, float* amoun
     if (amount) *amount = w / dt;
     return w;
 }
+
+/* THE PRODUCTION WRITER, three ways (items.cpp ProdStepWriterHere): 1 this game writes the building, 2 another game does,
+   0 no answer yet (the area map or the owner cannot be read now). */
+const int kProdWriterNone = 0, kProdWriterHere = 1, kProdWriterOther = 2;
+
+/* A WORKER'S STEP ON A PRODUCTION BUILDING (ProductionBuilding::operate with a worker): where it runs. single = a lone game;
+   linked = another player is in this world; writer = the three-way answer above. kMineRun: the engine's own step here.
+   kMineRelay: not here - the work is kept and goes to the writer as MINE_OP, and while nobody is named writer it waits (a
+   second game running it would put a second count of ore into its own copy of the box). */
+const int kMineRun = 0, kMineRelay = 1;
+inline int MineStepRoute(int single, int linked, int writer)
+{
+    if (single != 0 || linked == 0 || writer == kProdWriterHere) return kMineRun;
+    return kMineRelay;
+}
+
+/* MINE_OP work on this game (received, or kept by the worker's own game): run it (this game writes the building), wait (no
+   writer named yet - held up to kFmPendMs, as FARM_OP), or refuse / send on (another game writes it). */
+const int kMineAccRefuse = -1, kMineAccWait = 0, kMineAccRun = 1;
+inline int MineOpAccept(int writer)
+{
+    if (writer == kProdWriterHere) return kMineAccRun;
+    if (writer == kProdWriterOther) return kMineAccRefuse;
+    return kMineAccWait;
+}
+
+/* Kept work whose writer has stayed unnamed `undecidedMs` is dropped (0 = not waiting). */
+const unsigned int kMinePendMs = 60000;
+inline int MineHoldExpired(unsigned int undecidedMs) { return (undecidedMs > kMinePendMs) ? 1 : 0; }
 
 /* par16 fold #3. A plant whose age is below kFarmHiddenAge is drawn by nobody (updatePlantInstance 0xDF320 returns at once),
    so its parts' scale must be zeroed the way destroyAPlant 0xE47C0 does or the ripe plant stays on screen. */

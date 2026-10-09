@@ -35,6 +35,7 @@ namespace net {
 bool SessionHost(const std::string& backendName, unsigned short port);
 bool SessionJoin(const std::string& backendName, const std::string& address, unsigned short port);
 void SessionLeave();
+void SessionForgetRows(bool keepWorldRows, const char* why);   /* the owner rows a session's end takes (peergone.h SessionEndKeepsRow); false = every row */
 /* mmo5 (e47-mmo-design.md 6): the HOST, on a deliberate leave or exit, tells the joiner before it closes the link
    (MSG_SESSION_CLOSING, reliable, flushed). A no-op on a joiner or with the link down. MAIN THREAD. */
 void SessionSendClosing(const char* why);
@@ -163,14 +164,15 @@ bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, c
 bool SendRelSync();   // ask the peer to re-send its owned standings (after my world was rebuilt)
 bool SessionPeerRelayOk();   // M5a fold 1, MAIN THREAD: the session peer is KNOWN reachable through the notebook (a relayed standing stamped with its slot arrived on this session link and this welcomed notebook link)
 void SetRecordTownLookup(std::string (*fn)(const std::string&));   /* decision 34: the store supplies each note's home town to the encoder */
+void SetRecordHomeLookup(std::string (*fn)(const std::string&));   /* the store supplies each group's home building key to the encoder (after the flags byte) */
 /* M2 (decisions 32/44/54): SendRecord, SendRecordGone, SendWorldListed, SendDeletedBits, SendZones and SendSectorMap are
    DELETED - the notebook carries all six, and the session link drops any that still arrive (nbOnlyDropped). */
 bool SendRelation(const std::string& ownerSid, const std::string& otherSid, float relation, float trust, float trustNeg, unsigned int flags, unsigned int reason);   // P3 piece 2
 void EncodeRecordPayload(std::vector<char>* b, const std::string& worldId, const std::string& squadSid, const std::string& factionName, float x, float y, float z,
-                         long long writtenAt, int owner, const std::vector<char>& bytes);   /* the store link's RECORD payload - since M2 the only link that carries one */
+                         long long writtenAt, int owner, const std::vector<char>& bytes, unsigned flags = 0);   /* the store link's RECORD payload - since M2 the only link that carries one; flags: factionkey.h kRecFacCode */
 bool DecodeRecordPayload(const std::vector<char>& p, std::string* worldId, std::string* squadSid, std::string* factionName, float* x, float* y, float* z,
                          long long* writtenAt, int* owner, std::vector<char>* bytes, std::string* town,
-                         unsigned long long* seq);   /* B12 / store protocol 41: the NOTEBOOK'S sequence number for the record, or 0; `seq` may be null */
+                         unsigned long long* seq, unsigned* flags = 0, std::string* home = 0);   /* B12 / store protocol 41: the NOTEBOOK'S sequence number for the record, or 0; `seq` may be null; flags: the byte after it (factionkey.h), 0 when absent; home: the group's home building key after the flags byte, "" when absent */
 
 // M2b: replicate a task order. RELIABLE - unlike a position, a dropped order never
 // self-heals; the puppet would simply never do the thing.
@@ -228,6 +230,29 @@ int SendEffectRequest(unsigned int targetUid, const std::vector<char>& b);
 int SendEffectAnswer(unsigned int toKey, bool viaRelay, const std::vector<char>& b);
 /* T-354: MSG_NOT_SHOWN to the owner of a SPAWN this game's table refused, on the road the SPAWN came by. 0 = no road. */
 int SendNotShownToOwner(unsigned int uid, unsigned int ownerKey);
+/* A LOST COPY (src/common/lostcopy.h; net/session.cpp beside OnResend). MAIN THREAD, all of them.
+   LostCopyNote: this engine put away its copy of another game's character (spawn.cpp NotifyDespawn; the owner's last streamed spot
+   when known) - booked; the copy existed, so the uid is no longer one this game's table refused. LostCopyMove: a MOVE came for a uid
+   this game holds no copy of (replicate.cpp ApplyRemoteMove) - booked unless this game's table refused its SPAWN. A booked uid's owner
+   is asked to send it again while its spot is loaded here. LostCopyRefusedHere: OnSpawn's verdict on a SPAWN - no row was made for
+   the uid (refused: never booked) or one was. LostCopyArrived: after a SPAWN, a booked uid whose copy is here is BACK (its row
+   HERE, so no ask follows in this visit). LostCopyAsked: a RESEND ask for the uid awaits its SPAWN or its answer (the creation
+   core's stale-row rule). LostCopyForget / LostCopyForgetAll: the owner's UNLOAD / DESPAWN (`why` is written on the uid's
+   "forgotten" line, first 20 such lines); a world teardown or the session's owner records cleared. */
+void LostCopyNote(unsigned int uid, bool hasPos, float x, float y, float z);
+void LostCopyMove(unsigned int uid, float x, float y, float z);
+void LostCopyRefusedHere(unsigned int uid, bool refused);
+void LostCopyArrived(unsigned int uid);
+bool LostCopyAsked(unsigned int uid);
+void LostCopyForget(unsigned int uid, const char* why);
+void LostCopyForgetAll();
+/* A MOVE arrived for `uid` (replicate.cpp ApplyRemoteMove, before its puppet is looked up): a lost row whose copy is back counts it
+   (lostcopy::LostHereMoveSeen). */
+void LostCopyMoveSeen(unsigned int uid);
+/* The road to one asking game for a character's state (a RESEND ask, or one a hand-over held back): its slot while the character
+   stream rides the world road, -1 (the session link) while it rides that and the asker is the session peer, -2 for no road to that
+   game alone. MAIN THREAD. */
+int CharStreamSlotFor(int askerSlot);
 bool SendSlave(unsigned int uid, int state, unsigned int ownerUid, bool afterSpawn = false);   // slave1: MSG_SLAVE - the owner's SlaveStateEnum (0..3) for one of its characters
 bool SendTreat(const cooptreat::TreatMsg& m);
 // M7b slice 4 fold 1 (F6) + fold 2 (D1): a BUILD message to one player (HELP_WORK to the piece's owner, HAND_ACK to the placer).
@@ -326,6 +351,8 @@ bool SendItemMoveOnPlan(const ItemMoveMsg& m, const cooplive::ExceptPlan& plan, 
 // par1: MSG_PARITY_REQ / MSG_PARITY_BOX, already encoded (src/common/paritywire.h). False when the item road is down.
 // M7b slice 2: the ask to the holder of sector (sx, sy); the answer back to the asker's key; a push to every game covering (sx, sy).
 bool SendParityReq(const std::vector<char>& bytes, int sx, int sy);
+bool SendTownPrices(const std::vector<char>& bytes);   /* T-619: one town's local trade multipliers, the price source -> its session peer (session link, RELIABLE); false = not sent */
+int  SendTownPricesLive(const std::vector<char>& bytes);   /* the same through the world server to every other admitted game but the session peer; 0 = not sent, 1 = WORLD, 2 = WORLD_EXCEPT the session peer */
 bool SendParityBox(const std::vector<char>& bytes, unsigned int askerKey);
 bool SendParityPush(const std::vector<char>& bytes, int sx, int sy);
 
@@ -463,5 +490,6 @@ int PeerGoneSweepPending(const char* why);
 void PlayerGoneApply(const std::vector<char>& payload, const char* how);
 void PlayerGoneNoteRecv();
 std::string PlayerGoneCountsString();
+void PlayerGoneTakeOverTick();   /* a final leaver's NPCs held for the area's taker, looked at once a second after the drain (MAIN THREAD) */
 
 } // namespace coop

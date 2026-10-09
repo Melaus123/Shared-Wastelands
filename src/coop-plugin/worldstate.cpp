@@ -100,10 +100,22 @@
 #include "coop_log.h"
 #include "game/GameWorld.h"   // P5m: activeCharacters - the engine's own set of the characters it is updating
 #include "game/Character.h"   // T-556: hasDied - a living carrier is preferred, and a living carrier's map DEAD is not published
+#include "game/GameData.h"    // WsTemplateIsUnique: a template's bool-field table, walked
 #include "../common/fallenwire.h"   // T-556: BringBackWrite, DeadMayPublish
+#include "../common/uniqslot.h"     // FirstSightAlive, ElsewhereMember, DeadSetMember, MemberVerdict, DupDecide
+#include "../common/removalreason.h"   // kDuplicateNamedRemoved - the reason a second living body is destroyed with
+#include "zones.h"          // SectorOf, AreaHolderSlotTS - which game runs a body's area
+#include "handoff.h"        // HandoffPendingHas, ReleasePendingHas, SquadActivePlatoonOf
+#include "playerfaction.h"  // MySlotForWire
+#include "ai_spike.h"       // GetTarget - the watched player
+#include "game/GameSaveState.h"      // SavedObjectState - the record a group member is made from
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
+#include "worldgen.h"   // WorldGenDestroyHooked - the destroy detour that announces a removal is installed
 #include <Windows.h>
+namespace coop { bool AnyPlayersFaction(::Faction* f); }   // playerfaction.cpp: any player's faction - this game's own, a stand-in, a recorded stand-in
 #include <map>          // E19: g_wsShadow, the main-thread picture of the state map
+#include <vector>       // the dead set and the elsewhere set
+#include <algorithm>    // std::binary_search over those sets
 #include <set>
 #include <string>
 #include <cstring>
@@ -126,8 +138,20 @@ unsigned long long kIsUniqueRva = 0; static coop::AddrReg kIsUniqueRva_reg("IsUn
 unsigned long long kClearAllRva = 0; static coop::AddrReg kClearAllRva_reg("ClearAll", &kClearAllRva);   /* P8h: the address table fills this. Steam_1.0.65 0x4FECD0 */    // void ActivePlatoon::clearAllTheUniqueNPCStates(ActivePlatoon*) - respawn (decomp_4fecd0)
 unsigned long long kGdContainerRva = 0; static coop::AddrReg kGdContainerRva_reg("GdContainer", &kGdContainerRva);   /* P8h: the address table fills this. Steam_1.0.65 0x21330D0 */   // the base GameDataContainer OBJECT (every engine call site passes &DAT_1421330d0)
 unsigned long long kGdcGetDataRva = 0; static coop::AddrReg kGdcGetDataRva_reg("GdcGetData", &kGdcGetDataRva);   /* P8h: the address table fills this. Steam_1.0.65 0x6BD190 */    // GameData* GameDataContainer::getData(container, const std::string& sid) - find only
+// ActivePlatoon vt+0x38 - makes ONE member of a group loaded from its records, through RootObjectFactory::create
+// 0x582970, which never asks the engine's "may make" check 0x591720 (decomp_36f570). 0x36D6A0 (ActivePlatoon vt+0x30)
+// calls it once per saved entry on each pass over the group's entries (it passes over them twice when it is given a
+// filter); a group's load runs on the main thread or on a worker.
+unsigned long long kPlatoonLoadInstanceRva = 0; static coop::AddrReg kPlatoonLoadInstanceRva_reg("PlatoonLoadInstance", &kPlatoonLoadInstanceRva);   /* the address table fills this. Steam_1.0.65 0x36F570, Steam_1.0.68 0x36F6B0 */
+// The engine's "may make" check for a named character: bool fn(table, GameData* template) - 1 may make (no entry, or the
+// entry's made slot +8 is empty), 0 may not (decomp_591720). Its only callers (build/xrefs_591720.txt, through the jump
+// stub 0x50E20) are createRandomCharacter 0x582C50 (a 0 makes the template's "unique replacement spawn" instead, or
+// nothing) and FactionWarMgr::getAllTheForces 0x9C4170 (a 0 skips that character's squad).
+unsigned long long kMayMakeRva = 0; static coop::AddrReg kMayMakeRva_reg("UniqueMayMake", &kMayMakeRva);   /* the address table fills this. Steam_1.0.65 0x591720, Steam_1.0.68 0x5921B0 */
 // UniqueCharacterState, from the pair* the map hands back: +0x30 int state (0 DEAD / 1 ALIVE / 2 IMPRISONED), +0x34 bool playerInvolved.
 const int kStateOff = 0x30, kPlayerOff = 0x34;
+const int kUsedOff = 0x8;   // the entry's template (GameData*): set when the unique is made (createCharacter 0x582C50:109) and for every used unique at load (0x9A93A0:86); 0x591720 refuses to make a unique whose entry holds it
+long long g_wsStateGen = 0;   // MAIN THREAD: WorldStateGeneration
 const int kCharDataOff = 0x40;        // RootObjectBase::data - the GameData the map is keyed by (Character::declareDead uses this[8])
 const int kPlatoonCountOff = 0x58, kPlatoonArrayOff = 0x60;   // ActivePlatoon: active character count, Character* array (decomp_9a7250:33-36)
 
@@ -147,6 +171,11 @@ CharFn    orig_uniqueStateUpdate = 0;
 PlatoonFn orig_checkUniques = 0;
 SetImprisonedFn orig_setImprisoned = 0;
 PlatoonFn orig_clearAllUniqueStates = 0;
+// 0x36D6A0 passes seven arguments (its own third one last); the function reads six. All seven are passed through untouched.
+typedef void (*LoadInstanceFn)(void* self, void* state, void* a3, void* a4, void* a5, void* a6, void* a7);
+LoadInstanceFn orig_loadInstance = 0;
+typedef unsigned char (*MayMakeFn)(void* table, void* gd);   // the answer is the low byte; both callers test only that
+MayMakeFn orig_mayMake = 0;
 
 // The re-entrancy flag the design calls for, carried as the APPLYING THREAD's id rather than a bool: the apply runs on
 // the main thread while `uniqueStateUpdate` can be writing the same map on a worker, and a plain bool would swallow
@@ -231,6 +260,23 @@ long long g_sendSkippedUnknownUid = 0;
 // was not plausible - it can only come from a slot published without one, so it is expected to stay 0.
 long long g_shadowUnchanged = 0, g_shadowChanged = 0, g_drainBadGd = 0;
 long long g_teardowns = 0, g_teardownRingDropped = 0;
+// The drain's ALIVE first sights (uniqslot.h FirstSightAlive): published (sent / send failed), learned silently, deferred because the
+// world server's opening data is not applied yet.
+long long g_firstSightAliveSent = 0, g_firstSightAliveSendFailed = 0, g_firstSightAliveLearned = 0, g_firstSightAliveDeferred = 0;
+long long g_firstSightAliveLogged = 0;
+const long long kUniqLogMax = 20;
+// The engine's "may make" check (uniqslot.h ElsewhereMember): calls on the main thread / off it, and the "may not" answers given here
+// because the template is alive or imprisoned in another game. `mayMakeHook` 1 installed, 0 no address, -1 the hook failed.
+long long g_mayMakeMain = 0, g_mayMakeOff = 0, g_mayMakeRefused = 0;
+int g_mayMakeHook = 0;
+// The record-member maker (uniqslot.h MemberVerdict): calls on the main thread / off it, members whose template is in the dead set,
+// members skipped, those of them made fresh (the load's "first time" argument; no record read), members made because they
+// are dead bodies, members made because a read faulted or the set could not be asked. `memberHook` as `mayMakeHook`.
+long long g_memberMain = 0, g_memberOff = 0, g_memberDeadSet = 0, g_memberSkipped = 0, g_memberFirstTime = 0, g_memberBody = 0, g_memberFault = 0;
+int g_memberHook = 0;
+// The two sets: copies made, and copies refused because the loaded-character list was implausible (the sets
+// were kept as they were).
+long long g_setRebuilds = 0, g_setWalkRefused = 0;
 
 std::string N(long long v) { char b[32]; _snprintf(b, 31, "%lld", v); b[31] = 0; return b; }
 std::string Hex(unsigned long long v) { char b[32]; _snprintf(b, 31, "0x%llX", v); b[31] = 0; return b; }
@@ -483,6 +529,9 @@ int WsOwnedFlag(void* gd, int prev)
 // How many last-known-owner refreshes an UNCHANGED rung entry may cost per drain. Each one is a walk of the engine's
 // live character list, so it is budgeted rather than unbounded; a change or an apply always resolves, budget or not.
 const int kOwnRefreshPerDrain = 8;
+// How many ALIVE first sights may walk the live character list per drain; the rest are asked again on a later pass
+// (a first sight waits while its carrier is not registered, so the same record can be asked on many passes).
+const int kFirstSightWalksPerDrain = 16;
 
 // ---- E27 / review-p5q HIGH-2: WHAT THIS GAME LAST PUT ON THE WIRE, AND THE RE-ASSERT DAMPER ----
 // Keyed by the string id, because that is what goes on the wire and what the relay keys by. Bounded: past
@@ -545,6 +594,7 @@ int WsApplyPod(void* gd, int state, int playerInvolved)   // MAIN THREAD only: t
             if (!WsPlaus(node)) return 0;
             *(int*)((char*)node + kStateOff) = 0;
             if (playerInvolved) *(char*)((char*)node + kPlayerOff) = 1;
+            if (*(void**)((char*)node + kUsedOff) == 0) *(void**)((char*)node + kUsedOff) = gd;   /* a unique this game never made is now used here too, as a dead unique loaded from a save is: createCharacter 0x582C50 asks 0x591720, which then refuses it */
             return 1;
         }
         ((SetImprisonedFn)(g_base + kSetImprisonedRva))(map, gd, state == 2 ? (char)1 : (char)0, playerInvolved ? (char)1 : (char)0);
@@ -683,15 +733,197 @@ void WsNoteReported(void* gd, int state)
 // an unload or a respawn clear writes the table for a character that is GONE by the time the drain looks, so nobody
 // can be asked who owned it and the flag is the only answer left. It is refreshed on every change, on every apply,
 // and on a bounded number of unchanged rung entries per drain (see kOwnRefreshPerDrain).
-struct WsShadow { int state; int playerInvolved; int ownedHere; char sid[64]; };
+struct WsShadow { int state; int playerInvolved; int ownedHere; int remote; char sid[64]; };   // remote: 1 the row is a state received from another game and applied here, 0 this game's own
 std::map<void*, WsShadow> g_wsShadow;
+
+// ---- THE DEAD SET AND THE ELSEWHERE SET ----
+// The dead set (uniqslot.h DeadSetMember) is what the record-member detour asks; the elsewhere set (ElsewhereMember) is what the "may make"
+// detour asks. Both detours can run on a worker (a group's records can be loaded off the main thread; the character maker
+// and the war-party builder run on paths whose thread is not established), and the engine's table and the loaded-character
+// list are read on the main thread only (E19). So the main thread copies the sets out of the shadow into sorted arrays in
+// WorldStateTick - whenever the shadow changed, and at least once a second, because what this game carries changes without
+// the shadow changing - and the detours search those arrays under the lock. The detours allocate nothing: each searches,
+// and queues a template for the main thread's log line in a fixed array. Nothing here is saved: the sets live in memory
+// only and are made again from the world server's rows in every session.
+CRITICAL_SECTION g_wsSetCs;
+volatile LONG g_wsSetCsReady = 0;
+std::vector<void*> g_wsDead;          // sorted; guarded by g_wsSetCs
+std::vector<void*> g_wsElsewhere;     // sorted; guarded by g_wsSetCs
+bool g_wsSetsDirty = true;            // MAIN THREAD: the shadow changed since the last copy
+DWORD g_wsSetsAt = 0;                 // MAIN THREAD: GetTickCount at the last copy
+const DWORD kSetsRefreshMs = 1000;
+const int kLogQueue = 64;
+struct WsLogQueue { void* item[kLogQueue]; int n; long long full; };   // guarded by g_wsSetCs
+WsLogQueue g_wsSkipQueue;             // record members skipped
+WsLogQueue g_wsRefuseQueue;           // makes refused
+std::set<void*> g_wsSkipLogged;       // MAIN THREAD: templates whose skip has been logged
+std::set<void*> g_wsRefuseLogged;     // MAIN THREAD: templates whose refused make has been logged
+int WsSetHas(const std::vector<void*>& set, void* gd)   // ANY THREAD: 1 in the set, 0 not, -1 the sets are not made yet
+{
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) == 0) return -1;
+    ::EnterCriticalSection(&g_wsSetCs);
+    const int has = std::binary_search(set.begin(), set.end(), gd) ? 1 : 0;
+    ::LeaveCriticalSection(&g_wsSetCs);
+    return has;
+}
+int WsDeadSetHas(void* gd) { return WsSetHas(g_wsDead, gd); }
+int WsElsewhereHas(void* gd) { return WsSetHas(g_wsElsewhere, gd); }
+void WsLogQueuePush(WsLogQueue& q, void* gd)   // ANY THREAD
+{
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) == 0) return;
+    ::EnterCriticalSection(&g_wsSetCs);
+    bool have = false;
+    for (int i = 0; i < q.n; ++i) if (q.item[i] == gd) { have = true; break; }
+    if (!have)
+    {
+        if (q.n < kLogQueue) q.item[q.n++] = gd;
+        else ++q.full;
+    }
+    ::LeaveCriticalSection(&g_wsSetCs);
+}
+long long WsSetCount(const std::vector<void*>* set, const WsLogQueue* q)   // MAIN THREAD (the report): a set's size or a queue's overflow
+{
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) == 0) return 0;
+    ::EnterCriticalSection(&g_wsSetCs);
+    const long long n = (set != 0) ? (long long)set->size() : (q != 0 ? q->full : 0);
+    ::LeaveCriticalSection(&g_wsSetCs);
+    return n;
+}
+// ---- TWO LIVING BODIES OF ONE NAMED CHARACTER (uniqslot.h DupDecide). MAIN THREAD. ----
+// WsSetsRebuild's walk hands over, for every named template (a shadow row, or the memo's "named"), its living bodies; a template
+// with two or more is pending (at most kDupPendMax). It is decided once the same bodies - each one's uid, owner and its area's
+// runner - have been seen unchanged on consecutive walks for kDupSettleMs, and only right after a walk made in the same tick (the
+// body pointers are that walk's; g_wsDupNow is emptied by every rebuild that does not collect). At most one body is removed per
+// kDupRemoveGapMs, through the engine's own GameWorld::destroy with the reason kDuplicateNamedRemoved: the destroy detour then
+// sends DESPAWN (removalreason.h: a DEATH) and the other games remove their copies. No removal is made while the destroy detour
+// that announces it is not installed (WorldGenDestroyHooked). The engine's table is not written: the character lives on in the kept
+// body. When the body removed was the one whose squad the engine's table names, the template joins the no-make set while a
+// living body carries it here, and the "may make" detour refuses it (a respawn that clears the slot must not make him again).
+const DWORD kDupSettleMs = 5000, kDupRemoveGapMs = 1000;
+const int kDupPendMax = 16, kDupBodiesMax = 8, kDupLogMax = 20;
+struct WsDupKey { unsigned int uid; int owner; int runner; };
+inline bool operator==(const WsDupKey& a, const WsDupKey& b) { return a.uid == b.uid && a.owner == b.owner && a.runner == b.runner; }
+inline bool operator<(const WsDupKey& a, const WsDupKey& b) { return a.uid != b.uid ? a.uid < b.uid : (a.owner != b.owner ? a.owner < b.owner : a.runner < b.runner); }
+struct WsDupPend { std::vector<WsDupKey> keys; DWORD firstMs; unsigned walk; };
+std::map<void*, WsDupPend> g_wsDupPend;
+std::vector<std::pair<void*, std::vector< ::Character*> > > g_wsDupNow;   // the latest walk's templates with two or more living bodies (kDupBodiesMax + 1 = more than kDupBodiesMax)
+unsigned g_wsDupWalk = 0;
+DWORD g_wsDupRemovedAt = 0;
+bool g_wsDupRemovedOnce = false;
+long long g_dupFound = 0, g_dupRemoved = 0, g_dupProtectedKept = 0, g_dupCrossGame = 0, g_dupWaiting = 0, g_dupHandover = 0, g_dupFault = 0;
+long long g_dupNoHook = 0, g_dupTooMany = 0, g_dupNoMakeRefused = 0;
+int g_dupLogged = 0;
+std::set<std::pair<void*, int> > g_wsDupSaid;   // (template, result) refusals already logged
+std::set<void*> g_wsDupTableGone;               // templates whose table-named body this game removed (until world teardown)
+std::vector<void*> g_wsDupNoMake;               // sorted; guarded by g_wsSetCs: g_wsDupTableGone carried alive here
+/* a refused walk cannot say who still carries a template: the no-make set is emptied rather than kept stale */
+static void WsDupNoMakeClear()
+{
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) == 0) return;
+    ::EnterCriticalSection(&g_wsSetCs); g_wsDupNoMake.clear(); ::LeaveCriticalSection(&g_wsSetCs);
+}
+void WsDupKeyOf(::Character* c, WsDupKey* k);   // below, beside the duplicate check's reads
+void WsDupCollect(const std::map<void*, std::vector< ::Character*> >& living, DWORD now)
+{
+    ++g_wsDupWalk;
+    g_wsDupNow.clear();
+    std::map<void*, WsDupPend> next;
+    for (std::map<void*, std::vector< ::Character*> >::const_iterator it = living.begin(); it != living.end(); ++it)
+    {
+        if (it->second.size() < 2) continue;
+        if ((int)next.size() >= kDupPendMax) { ++g_dupFault; continue; }
+        WsDupPend p;
+        for (size_t i = 0; i < it->second.size(); ++i) { WsDupKey k; WsDupKeyOf(it->second[i], &k); p.keys.push_back(k); }
+        std::sort(p.keys.begin(), p.keys.end());
+        p.walk = g_wsDupWalk; p.firstMs = now;
+        const std::map<void*, WsDupPend>::const_iterator old = g_wsDupPend.find(it->first);
+        if (old == g_wsDupPend.end()) ++g_dupFound;
+        else if (old->second.walk + 1 == g_wsDupWalk && old->second.keys == p.keys) p.firstMs = old->second.firstMs;
+        next[it->first] = p;
+        g_wsDupNow.push_back(std::make_pair(it->first, it->second));
+    }
+    g_wsDupPend.swap(next);
+    std::vector<void*> noMake;   /* filled in g_wsDupTableGone's order, which is pointer order: sorted */
+    for (std::set<void*>::const_iterator g = g_wsDupTableGone.begin(); g != g_wsDupTableGone.end(); ++g)
+    {
+        const std::map<void*, std::vector< ::Character*> >::const_iterator lv = living.find(*g);
+        if (lv != living.end() && !lv->second.empty()) noMake.push_back(*g);
+    }
+    ::EnterCriticalSection(&g_wsSetCs);
+    g_wsDupNoMake.swap(noMake);
+    ::LeaveCriticalSection(&g_wsSetCs);
+}
+// MAIN THREAD. One walk of the engine's live character list answers, for each record the shadow names, whether a character
+// here carries it (1) and whether a living character this game owns does (2); each shadow row is then put in the sets by
+// uniqslot.h ElsewhereMember and DeadSetMember. An unusable world or an implausible list keeps the sets as they were (counted) and is
+// tried again on the next frame while a rebuild is owed, else a second later. The same walk collects every named template's
+// living bodies for the duplicate check (WsDupCollect). Returns 1 when the walk ran.
+int WsSetsRebuild()
+{
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) == 0) return 0;
+    const DWORD now = ::GetTickCount();   /* VS2010-era headers have no GetTickCount64; the unsigned difference is wrap-safe */
+    g_wsDupNow.clear();   /* a walk's body pointers are used only in that walk's tick */
+    if (!g_wsSetsDirty && (DWORD)(now - g_wsSetsAt) < kSetsRefreshMs) return 0;
+    g_wsSetsAt = now;
+    std::map<void*, int> carried;
+    std::map<void*, std::vector< ::Character*> > living;   // named templates' living bodies
+    const bool world = WsPlaus(coop::GameWorldPtr());
+    if (!g_wsShadow.empty() && !world) { ++g_setWalkRefused; WsDupNoMakeClear(); return 0; }
+    if (world)
+    {
+        const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+        if (all.size() > 20000) { if (!g_wsShadow.empty()) { ++g_setWalkRefused; WsDupNoMakeClear(); return 0; } }
+        else for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+        {
+            ::Character* c = *it;
+            if (!WsPlaus(c)) continue;
+            void* const gd = WsCharGameData(c);
+            if (gd == 0) continue;
+            const bool inShadow = g_wsShadow.find(gd) != g_wsShadow.end();
+            if (!inShadow && WsMemoGet(gd) != 1) continue;
+            const int dead = WsCharDeadPod(c);
+            if (dead == 0) { std::vector< ::Character*>& lv = living[gd]; if (lv.size() <= (size_t)kDupBodiesMax) lv.push_back(c); }   /* one past the cap marks "too many" */
+            if (!inShadow) continue;
+            int& v = carried[gd];
+            if (v < 1) v = 1;
+            if (v == 2 || dead != 0) continue;
+            const unsigned int uid = FindSpawnedUid(c);
+            if (uid != 0 && net::IsUidMine(uid)) v = 2;
+        }
+        WsDupCollect(living, now);
+    }
+    const int snap = (StoreSnapshotApplied() != 0) ? 1 : 0;
+    std::vector<void*> dead, elsewhere;   // filled in the shadow's key order, which is pointer order: sorted
+    for (std::map<void*, WsShadow>::const_iterator it = g_wsShadow.begin(); it != g_wsShadow.end(); ++it)
+    {
+        const std::map<void*, int>::const_iterator c = carried.find(it->first);
+        const int carry = (c != carried.end()) ? c->second : 0;
+        int confirmed = it->second.remote != 0 ? 1 : 0;   /* received from another game, or this game published DEAD as the owner */
+        if (confirmed == 0 && it->second.state == 0 && it->second.sid[0] != 0)
+        {
+            const std::map<std::string, WsLastSend>::const_iterator ls = g_lastSend.find(std::string(it->second.sid));
+            if (ls != g_lastSend.end() && ls->second.state == 0) confirmed = 1;
+        }
+        if (swuniq::DeadSetMember(it->second.state, confirmed, g_wsBackGd.count(it->first) != 0 ? 1 : 0, carry == 2 ? 1 : 0) == 1) dead.push_back(it->first);
+        if (swuniq::ElsewhereMember(snap, it->second.state, it->second.remote, carry != 0 ? 1 : 0) == 1) elsewhere.push_back(it->first);
+    }
+    ::EnterCriticalSection(&g_wsSetCs);
+    g_wsDead.swap(dead);
+    g_wsElsewhere.swap(elsewhere);
+    ::LeaveCriticalSection(&g_wsSetCs);
+    g_wsSetsDirty = false;
+    ++g_setRebuilds;
+    return 1;
+}
 
 // MAIN THREAD: what WE just made the map say is not news to send back. Recording it here is what stops a received
 // apply from coming back out of the drain as a change this game discovered. Both refusals below are already counted
 // elsewhere: `gd` is validated by whatever resolved it, and a negative state was booked in stateFault.
 // E20: `ownedHere` is passed as 1 (ours), 0 (a ghost) or -1 meaning "this call established nothing about ownership",
 // in which case the row keeps whatever it already knew rather than being told it is not ours.
-void WsShadowNote(void* gd, int state, int playerInvolved, const std::string& sid, int ownedHere)
+// `remote` is 1 when the state noted is one received from another game and applied here (the elsewhere set is made only
+// from such rows), 0 when it is this game's own (a refusal, a re-assert, a bring-back made here, a test write).
+void WsShadowNote(void* gd, int state, int playerInvolved, const std::string& sid, int ownedHere, int remote)
 {
     if (!WsPlaus(gd) || state < 0) return;
     // E24.5c (review-p5o MEDIUM-6): THE REGISTER IS FED FROM APPLIES AS WELL AS SENDS. The register is the list of
@@ -701,8 +933,9 @@ void WsShadowNote(void* gd, int state, int playerInvolved, const std::string& si
     // detour has nothing for U, rings nothing, and the IMPRISONED -> ALIVE transition is never published. Both games
     // keep IMPRISONED forever. One bounded scan of a 64-entry array on a rare path closes it.
     WsNoteReported(gd, state);
+    g_wsSetsDirty = true;   // the two sets are copied from the shadow
     std::map<void*, WsShadow>::iterator it = g_wsShadow.find(gd);
-    WsShadow ne; ne.state = state; ne.playerInvolved = playerInvolved;
+    WsShadow ne; ne.state = state; ne.playerInvolved = playerInvolved; ne.remote = (remote != 0) ? 1 : 0;
     ne.ownedHere = (ownedHere >= 0) ? ownedHere : (it != g_wsShadow.end() ? it->second.ownedHere : 0);
     std::memset(ne.sid, 0, 64);
     const size_t cn = sid.size() < (size_t)63 ? sid.size() : (size_t)63;
@@ -814,7 +1047,373 @@ std::set<std::string> g_unknownLogged;   // main thread only: one line per id we
 std::set<std::string> g_reassertLogged;  // E20, main thread only: one line per id we re-assert (the counter carries the rate)
 std::set<std::string> g_reassertDampLogged;  // E27, main thread only: one line per id whose re-assert was damped
 
+// ---- the record-member maker and the "may make" check ----
+// What it reads is under SEH and allocates nothing (C2712: no std::string is made here). The member's saved state is the
+// SavedObjectState 0x36D6A0 built on its own stack for this one call, so nothing else writes it while it is read. Its
+// record of type 0x39 is the medical record: Character::loadFromSerialise 0x6264C0 hands it to the medical load 0x64F0B0
+// (rcx = Character+0x458, rdx = that record; 0x626578-0x626588 on 1.0.65), which reads its bool "dead" into
+// MedicalSystem::dead (+0x164). No such record, or no such field, loads alive - the engine's lookup inserts false.
+const int kMedicalRecordType = 0x39;
+void* WsStateTemplatePod(void* st)    // the member's template (SavedObjectState::baseRecord), 0 when absent or unreadable
+{
+    if (!WsPlaus(st)) return 0;
+    __try { void* gd = ((const SavedObjectState*)st)->baseRecord; return WsPlaus(gd) ? gd : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int WsMemberDeadPod(void* st)         // 1 a dead body, 0 alive, -1 the read faulted
+{
+    if (!WsPlaus(st)) return -1;
+    __try
+    {
+        const GameHashMap<itemType, GameData*>::type& m = ((const SavedObjectState*)st)->states;
+        for (GameHashMap<itemType, GameData*>::type::const_iterator it = m.begin(); it != m.end(); ++it)
+        {
+            if ((int)it->first != kMedicalRecordType) continue;
+            const ::GameData* r = it->second;
+            if (r == 0) return 0;
+            if (!WsPlaus(r)) return -1;
+            const GameHashMap<std::string, bool>::type& b = r->boolFields;
+            for (GameHashMap<std::string, bool>::type::const_iterator f = b.begin(); f != b.end(); ++f)
+                if (f->first.size() == 4 && std::memcmp(f->first.c_str(), "dead", 4) == 0) return f->second ? 1 : 0;
+            return 0;
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// uniqslot.h MemberVerdict. The template is asked first against the dead set (a search under the lock); only a template in that set
+// has its "unique" flag read, and the member's own record only when the load is not the group's first time (with a non-zero
+// third argument the engine makes the member fresh from its template and never reads the record - decomp_36f570:65-77).
+// Skipping means the original is not called: that member is not made, and the group loads without it.
+void detour_loadInstance(void* self, void* st, void* a3, void* a4, void* a5, void* a6, void* a7)
+{
+    WsNoteThread(&g_memberMain, &g_memberOff);
+    void* const gd = WsStateTemplatePod(st);
+    const int inDead = (gd != 0) ? WsDeadSetHas(gd) : 0;
+    if (inDead != 0)
+    {
+        if (inDead == 1) ::InterlockedIncrement64(&g_memberDeadSet);
+        const int firstTime = ((unsigned char)(uintptr_t)a3 != 0) ? 1 : 0;   /* a char argument: its low byte only */
+        const int unique = (inDead == 1) ? WsTemplateIsUnique(gd) : -1;
+        const int body = (unique == 1 && firstTime == 0) ? WsMemberDeadPod(st) : 0;
+        if (swuniq::MemberVerdict(inDead, unique, firstTime, body) == swuniq::kMemberSkip)
+        {
+            ::InterlockedIncrement64(&g_memberSkipped);
+            if (firstTime != 0) ::InterlockedIncrement64(&g_memberFirstTime);
+            WsLogQueuePush(g_wsSkipQueue, gd);
+            return;
+        }
+        if (body == 1) ::InterlockedIncrement64(&g_memberBody);
+        else if (inDead < 0 || unique < 0 || body < 0) ::InterlockedIncrement64(&g_memberFault);
+    }
+    orig_loadInstance(self, st, a3, a4, a5, a6, a7);
+}
+// uniqslot.h ElsewhereMember. A template in the elsewhere set, or in the duplicate check's no-make set, is answered "may not
+// make" (0) without asking the original; every other call gets the original's answer. Any thread: a search under the lock, nothing allocated, nothing written to the
+// engine's table.
+unsigned char detour_mayMake(void* table, void* gd)
+{
+    WsNoteThread(&g_mayMakeMain, &g_mayMakeOff);
+    if (gd != 0 && WsSetHas(g_wsDupNoMake, gd) == 1)
+    {
+        ::InterlockedIncrement64(&g_dupNoMakeRefused);
+        WsLogQueuePush(g_wsRefuseQueue, gd);
+        return 0;
+    }
+    if (gd != 0 && WsElsewhereHas(gd) == 1)
+    {
+        ::InterlockedIncrement64(&g_mayMakeRefused);
+        WsLogQueuePush(g_wsRefuseQueue, gd);
+        return 0;
+    }
+    return orig_mayMake(table, gd);
+}
+// MAIN THREAD, from WorldStateTick: one line per template, the first 20 of each kind.
+void WsLogQueueDrain(WsLogQueue& q, std::set<void*>& logged, int refused)
+{
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) == 0) return;
+    void* got[kLogQueue]; int n = 0;
+    ::EnterCriticalSection(&g_wsSetCs);
+    for (int i = 0; i < q.n; ++i) got[n++] = q.item[i];
+    q.n = 0;
+    ::LeaveCriticalSection(&g_wsSetCs);
+    for (int i = 0; i < n; ++i)
+    {
+        if (logged.size() >= (size_t)kUniqLogMax || !logged.insert(got[i]).second) continue;
+        char sid[64];
+        if (WsSidPod(got[i], sid, 64) == 0) std::strcpy(sid, "?");
+        if (refused != 0) DebugLog("[UNIQ] make refused sid=" + std::string(sid) + " (alive in another game)");
+        else DebugLog("[UNIQ] record member skipped sid=" + std::string(sid) + " (dead in this world) skipped=" + N(g_memberSkipped));
+    }
+}
+
 } // namespace
+
+// The template's own bool field "unique", the one Character::isUnique 0x505ED0 reads (decomp_505ed0: *(GameData**)(this+0x40)
+// + 0xF8, boolFields); towns2's recipe check (towngen.cpp T2RecipeUnique) and the record-member detour ask it. The table is
+// WALKED and nothing is inserted here; a missing key is not unique, the engine's answer (items.cpp ItSquadIsTraderPod reads
+// "is trader" the same way). ANY THREAD: the record-member detour calls it off the main thread too, and the engine's own bool
+// lookup 0x6C780 inserts a missing key into this same table (createRandomCharacter 0x582C50 asks it for "unique"), so a walk
+// here can meet the table while another thread changes it; the fault guard is the backstop for that. No std::string here
+// (C2712).
+int WsTemplateIsUnique(void* gd)
+{
+    if (!WsPlaus(gd)) return -1;
+    __try
+    {
+        const GameHashMap<std::string, bool>::type& m = ((::GameData*)gd)->boolFields;
+        for (GameHashMap<std::string, bool>::type::const_iterator it = m.begin(); it != m.end(); ++it)
+            if (it->first.size() == 6 && std::memcmp(it->first.c_str(), "unique", 6) == 0) return it->second ? 1 : 0;
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// MAIN THREAD. The lookup is 0x591720's own (decomp_591720): the hash of the key pointer, the bucket walk (count +0x20,
+// bucket count +0x18, buckets +0x38; node: next +0, hash +8, key +0x10), and on a hit find_or_insert 0x3498F0 - which then
+// finds, never inserts - for the entry. 1 and *node when the table has an entry, 0 when it has none (or there is no table),
+// -1 on a fault.
+int WsEntryPod(void* gd, void** node)
+{
+    *node = 0;
+    void* map = WsMapPod();
+    if (map == 0) return 0;
+    if (kFindOrInsertRva == 0) return -1;
+    __try
+    {
+        const char* m = (const char*)map;
+        const unsigned long long k = (unsigned long long)(uintptr_t)gd;
+        unsigned long long h = (k >> 3) + k;
+        h = h * 0x200000ULL + ~h;
+        h = ((h >> 0x18) ^ h) * 0x109ULL;
+        h = ((h >> 0xE) ^ h) * 0x15ULL;
+        h = ((h >> 0x1C) ^ h) * 0x80000001ULL;
+        const unsigned long long mask = *(const unsigned long long*)(m + 0x18) - 1;
+        const unsigned long long at = mask & h;
+        if (*(const long long*)(m + 0x20) == 0) return 0;
+        const unsigned long long* nd = *(const unsigned long long* const*)(*(const char* const*)(m + 0x38) + at * 8);
+        if (nd != 0) nd = (const unsigned long long*)nd[0];
+        for (int guard = 0; nd != 0 && guard < 100000; ++guard, nd = (const unsigned long long*)nd[0])
+        {
+            if (h == nd[1])
+            {
+                if (nd[2] != k) continue;
+                void* key = gd;
+                void* e = ((FindOrInsertFn)(g_base + kFindOrInsertRva))(map, &key);
+                if (!WsPlaus(e)) return -1;
+                *node = e;
+                return 1;
+            }
+            if ((mask & nd[1]) != at) break;
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int WsUniqueSlotPod(void* gd)   // MAIN THREAD: 1 the entry's made slot holds a template, 0 empty or no entry, -1 a fault
+{
+    void* node = 0;
+    const int r = WsEntryPod(gd, &node);
+    if (r <= 0) return r;
+    __try { return (*(void* const*)((const char*)node + kUsedOff) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int WsEntryPlayerInvolvedPod(void* gd)   // MAIN THREAD: the entry's +0x34 (1/0); 0 with no entry (the engine's default) or a fault
+{
+    void* node = 0;
+    if (WsEntryPod(gd, &node) <= 0) return 0;
+    __try { return (*((const unsigned char*)node + kPlayerOff) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// ---- the duplicate check's reads and its action (see WsDupCollect). MAIN THREAD. ----
+namespace {
+int WsDupPosPod(::Character* c, float* x, float* z)   // 1 read, 0 faulted
+{
+    __try { const Ogre::Vector3 p = c->worldPosition(); *x = p.x; *z = p.z; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// One body's settle key: its uid, its owner's slot (this game's own slot when it is this game's) and the slot of the game that
+// runs its area (-1 none fresh, or its position unreadable).
+void WsDupKeyOf(::Character* c, WsDupKey* k)
+{
+    k->uid = FindSpawnedUid(c);
+    k->owner = (k->uid == 0) ? -1 : (net::IsUidMine(k->uid) ? coop::MySlotForWire() : net::OwnerSlotOf(k->uid));
+    float x = 0.0f, z = 0.0f;
+    k->runner = WsDupPosPod(c, &x, &z) != 0 ? coop::AreaHolderSlotTS(coop::SectorOf(x, z)) : -1;
+}
+// 1 protected by its own fields, 0 not, -1 a read faulted: any player's faction (playerfaction.cpp AnyPlayersFaction: this game's
+// own, a stand-in, a recorded stand-in), carried (+0x3D4), in a bed or a cage (+0x2F8 non-zero)
+int WsDupProtectedPod(::Character* c)
+{
+    __try
+    {
+        ::Faction* f = c->getOwnerFactionDirect();
+        if (f != 0 && coop::AnyPlayersFaction(f)) return 1;
+        if (*((const unsigned char*)c + 0x3D4) != 0) return 1;
+        if (*(const int*)((const char*)c + 0x2F8) != 0) return 1;
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// Does the engine's table entry name this squad? The entry keeps its squad's handle at +0x1C/+0x20 and 0x505D50 compares them
+// with the Platoon's handle (Platoon+0x58) fields +0xC/+0x10 (build/decomp_505d50.txt). 1 yes, 0 no or no entry, -1 a fault.
+int WsDupTableHoldsPod(void* gd, void* platoon)
+{
+    if (platoon == 0) return 0;
+    void* node = 0;
+    const int r = WsEntryPod(gd, &node);
+    if (r <= 0) return r;
+    __try
+    {
+        const char* h = (const char*)platoon + 0x58;
+        return (*(const int*)((const char*)node + 0x1C) == *(const int*)(h + 0xC) && *(const int*)((const char*)node + 0x20) == *(const int*)(h + 0x10)) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int WsClearSlotPod(void* gd)   // TEST-ONLY (uniqueforce clearslot): the entry's made slot emptied; 1 done, 0 no entry, -1 a fault
+{
+    void* node = 0;
+    const int r = WsEntryPod(gd, &node);
+    if (r <= 0) return r;
+    __try { *(void**)((char*)node + kUsedOff) = 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int WsDupDestroyPod(::Character* c)   // the engine's own (hooked) destroy; 1 called, 0 no world, -1 faulted
+{
+    ::GameWorld* w = coop::GameWorldPtr();
+    if (!WsPlaus(w)) return 0;
+    __try { w->destroy((RootObject*)c, false, coopremoval::kDuplicateNamedRemoved); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+// One body's inputs to DupDecide. A read that faults sets *faulted (the decision then waits).
+void WsDupBodyRead(::Character* c, void* gd, int imprisoned, int mySlot, swuniq::DupBody* b, int* faulted)
+{
+    WsDupKey k; WsDupKeyOf(c, &k);
+    b->uid = k.uid;
+    b->mine = (k.uid != 0 && net::IsUidMine(k.uid)) ? 1 : 0;
+    b->owner = b->mine != 0 ? mySlot : k.owner;
+    b->runner = k.runner;
+    float x = 0.0f, z = 0.0f;
+    const int posOk = WsDupPosPod(c, &x, &z);
+    const int p = WsDupProtectedPod(c);
+    SquadView sv;
+    const int sq = coop::ReadSquadOf(c, &sv);   /* 1 read, 0 no squad, -1 faulted */
+    void* const platoon = (sq == 1) ? sv.platoon : 0;
+    b->engineSquad = (platoon != 0 && coop::IsContextPlatoon(platoon) == 0) ? 1 : 0;
+    b->tableHolds = WsDupTableHoldsPod(gd, platoon);
+    if (posOk == 0 || p < 0 || sq < 0 || b->tableHolds < 0) *faulted = 1;
+    b->prot = (p != 0 || imprisoned != 0 || c == coop::GetTarget()) ? 1 : 0;
+}
+// The living bodies of one template, read now (for `uniqueforce <sid> show`); kDupBodiesMax + 1 = more than kDupBodiesMax
+void WsDupBodiesOf(void* gd, std::vector< ::Character*>& out)
+{
+    if (!WsPlaus(coop::GameWorldPtr())) return;
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) return;
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end() && out.size() <= (size_t)kDupBodiesMax; ++it)
+        if (WsPlaus(*it) && WsCharGameData(*it) == gd && WsCharDeadPod(*it) == 0) out.push_back(*it);
+}
+std::string WsDupSid(void* gd) { char sid[64]; return WsSidPod(gd, sid, 64) > 0 ? std::string(sid) : std::string("?"); }
+void WsDupSay(void* gd, int n, int result, const swuniq::DupBody* b, int keep, int keepWhy)
+{
+    if (g_dupLogged >= kDupLogMax || !g_wsDupSaid.insert(std::make_pair(gd, result)).second) return;
+    ++g_dupLogged;
+    DebugLog("[UNIQ] duplicate sid=" + WsDupSid(gd) + " bodies=" + N(n) + " keep uid=" + (keep >= 0 ? N((long long)b[keep].uid) : std::string("none"))
+             + " (" + swuniq::DupKeepWhyText(keepWhy) + ") remove none (" + swuniq::DupResultText(result) + ")");
+}
+// MAIN THREAD, from WorldStateTick right after a walk: each settled template is decided; at most one body is removed.
+void WsDupTick()
+{
+    if (g_wsDupNow.empty()) return;
+    if (coop::EngineWritesBlocked()) { ++g_dupWaiting; return; }
+    const DWORD now = ::GetTickCount();
+    const int mySlot = coop::MySlotForWire();
+    for (size_t k = 0; k < g_wsDupNow.size(); ++k)
+    {
+        void* const gd = g_wsDupNow[k].first;
+        const std::vector< ::Character*>& bodies = g_wsDupNow[k].second;
+        const std::map<void*, WsDupPend>::const_iterator pd = g_wsDupPend.find(gd);
+        if (pd == g_wsDupPend.end() || (DWORD)(now - pd->second.firstMs) < kDupSettleMs) continue;
+        const int n = (int)bodies.size();
+        if (n > kDupBodiesMax) { ++g_dupTooMany; ++g_dupWaiting; continue; }   /* never decided on a cut list */
+        swuniq::DupBody b[kDupBodiesMax];
+        int rm[kDupBodiesMax];
+        const int st = WsStateOf(gd);
+        int faulted = (st < 0) ? 1 : 0, unregistered = 0, handover = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            WsDupBodyRead(bodies[i], gd, st == 2 ? 1 : 0, mySlot, &b[i], &faulted);
+            if (b[i].uid == 0) unregistered = 1;
+            else if (coop::HandoffPendingHas(b[i].uid) || coop::ReleasePendingHas(b[i].uid)) handover = 1;
+        }
+        if (faulted != 0) { ++g_dupFault; continue; }
+        if (unregistered != 0) { ++g_dupWaiting; continue; }
+        if (handover != 0) { ++g_dupHandover; continue; }
+        int keep = -1, keepWhy = 0;
+        const int r = swuniq::DupDecide(b, n, mySlot, swuniq::kProtectedIsKept, &keep, &keepWhy, rm);
+        if (r == swuniq::kDupProtectedKept) { ++g_dupProtectedKept; WsDupSay(gd, n, r, b, keep, keepWhy); continue; }
+        if (r == swuniq::kDupCrossGame) { ++g_dupCrossGame; WsDupSay(gd, n, r, b, keep, keepWhy); continue; }
+        if (r != swuniq::kDupRemove) { ++g_dupWaiting; continue; }
+        if (!coop::WorldGenDestroyHooked()) { ++g_dupNoHook; ++g_dupWaiting; continue; }
+        if (g_wsDupRemovedOnce && (DWORD)(now - g_wsDupRemovedAt) < kDupRemoveGapMs) return;
+        for (int i = 0; i < n; ++i)
+        {
+            if (rm[i] == 0) continue;
+            ::Character* const c = bodies[i];
+            if (WsCharDeadPod(c) != 0 || FindSpawnedUid(c) != b[i].uid || !net::IsUidMine(b[i].uid)) { ++g_dupWaiting; return; }
+            g_wsDupRemovedAt = now; g_wsDupRemovedOnce = true;
+            const std::string sid = WsDupSid(gd);
+            const unsigned int keptUid = b[keep].uid, goneUid = b[i].uid;
+            const int goneRunner = b[i].runner, goneTable = b[i].tableHolds;
+            const int d = WsDupDestroyPod(c);
+            g_wsDupNow.clear();   /* the walk's pointers are not used again after an engine destroy */
+            if (d != 1) { ++g_dupFault; ErrorLog("[UNIQ] duplicate sid=" + sid + " remove uid=" + N((long long)goneUid) + " FAILED (the engine's destroy " + (d == 0 ? "had no world" : "faulted") + ")"); return; }
+            ++g_dupRemoved;
+            if (goneTable == 1) g_wsDupTableGone.insert(gd);   /* the no-make set takes it from the next walk */
+            if (g_dupLogged < kDupLogMax)
+            {
+                ++g_dupLogged;
+                DebugLog("[UNIQ] duplicate sid=" + sid + " bodies=" + N(n) + " keep uid=" + N((long long)keptUid) + " (" + swuniq::DupKeepWhyText(keepWhy)
+                         + ") remove uid=" + N((long long)goneUid) + " (this game's own, not protected, in an area this game runs (slot " + N(goneRunner) + ")"
+                         + (goneTable == 1 ? "; the engine's table named its squad - this game's makers now refuse him while he lives here" : "") + ")");
+            }
+            return;
+        }
+    }
+}
+// `uniqueforce <sid> show`: the living bodies with owner, runner and the decision as it would be taken now
+std::string WsDupShow(void* gd)
+{
+    std::vector< ::Character*> bodies;
+    WsDupBodiesOf(gd, bodies);
+    const int n = (int)bodies.size();
+    const int mySlot = coop::MySlotForWire();
+    std::string out = " living=" + N(n) + " mySlot=" + N(mySlot) + " destroyHooked=" + N(coop::WorldGenDestroyHooked() ? 1 : 0) + " noMake=" + N(WsSetHas(g_wsDupNoMake, gd));
+    if (n > kDupBodiesMax) return out + " dup=waiting (more than " + N(kDupBodiesMax) + " living bodies)";
+    swuniq::DupBody b[kDupBodiesMax];
+    int rm[kDupBodiesMax];
+    const int st = WsStateOf(gd);
+    int faulted = (st < 0) ? 1 : 0;
+    for (int i = 0; i < n; ++i)
+    {
+        WsDupBodyRead(bodies[i], gd, st == 2 ? 1 : 0, mySlot, &b[i], &faulted);
+        out += std::string(i == 0 ? " bodies=" : ";") + N((long long)b[i].uid) + ":owner=" + N(b[i].owner) + ",runner=" + N(b[i].runner) + ",protected=" + N(b[i].prot)
+             + ",table=" + N(b[i].tableHolds) + ",engineSquad=" + N(b[i].engineSquad);
+    }
+    if (faulted != 0) return out + " dup=waiting (a read faulted)";
+    int keep = -1, keepWhy = 0;
+    const int r = swuniq::DupDecide(b, n, mySlot, swuniq::kProtectedIsKept, &keep, &keepWhy, rm);
+    out += std::string(" dup=") + swuniq::DupResultText(r);
+    if (keep >= 0) out += " keep=" + N((long long)b[keep].uid) + " (" + swuniq::DupKeepWhyText(keepWhy) + ")";
+    for (int i = 0; i < n; ++i) if (rm[i] != 0) out += " remove=" + N((long long)b[i].uid);
+    return out;
+}
+} // namespace
+void* WsTemplateBySid(const char* sid)
+{
+    if (sid == 0 || sid[0] == 0) return 0;
+    const std::string s(sid);
+    return WsGetDataPod(&s);
+}
 
 void InstallWorldState()
 {
@@ -835,6 +1434,8 @@ void InstallWorldState()
         DebugLog("[WS] base game-data container +0x21330D0 first word = " + (okp ? Hex(w0) : std::string("unreadable"))
                  + " image=" + Hex((unsigned long long)g_base) + " -> " + (inImage ? "in-image (the container OBJECT is there, as assumed)" : "NOT in-image (the sid lookup will find nothing - watch uniqueState[...unknownSid])"));
     }
+    ::InitializeCriticalSection(&g_wsSetCs);   /* before the record-member and may-make detours below can run */
+    ::InterlockedExchange(&g_wsSetCsReady, 1);
     coop::HookStatus h1 = coop::AddHook((void*)(g_base + kSetImprisonedRva), (void*)&detour_setImprisoned, (void**)&orig_setImprisoned);
     if (h1 != coop::SUCCESS) ErrorLog("[WS] AddHook the shared setter 0x34ADC0 FAILED - setPrisonMode and dialogue outcomes are NOT carried");
     else DebugLog("[WS] hook installed: UniqueNPCManager setImprisoned 0x34ADC0 (setPrisonMode + Dialogue::_doActions)");
@@ -852,6 +1453,23 @@ void InstallWorldState()
     coop::HookStatus h5 = coop::AddHook((void*)(g_base + kClearAllRva), (void*)&detour_clearAllUniqueStates, (void**)&orig_clearAllUniqueStates);
     if (h5 != coop::SUCCESS) ErrorLog("[WS] AddHook ActivePlatoon::clearAllTheUniqueNPCStates 0x4FECD0 FAILED - a respawn's state clearing is NOT carried");
     else DebugLog("[WS] hook installed: ActivePlatoon::clearAllTheUniqueNPCStates 0x4FECD0 (respawn)");
+    // The record-member maker. Without it a dead named character can come back through a group made from a record.
+    if (kPlatoonLoadInstanceRva == 0) { g_memberHook = 0; ErrorLog("[UNIQ] no address for ActivePlatoon vt+0x38 - a group made from a record may bring back a dead named character"); }
+    else
+    {
+        coop::HookStatus h6 = coop::AddHook((void*)(g_base + kPlatoonLoadInstanceRva), (void*)&detour_loadInstance, (void**)&orig_loadInstance);
+        if (h6 != coop::SUCCESS) { g_memberHook = -1; ErrorLog("[UNIQ] AddHook ActivePlatoon vt+0x38 (record member) FAILED - a group made from a record may bring back a dead named character"); }
+        else { g_memberHook = 1; DebugLog("[UNIQ] hook installed: ActivePlatoon vt+0x38 (record member) at +" + Hex(kPlatoonLoadInstanceRva)); }
+    }
+    // The "may make" check. Without it this game's own makers can make a second copy of a named character that lives in
+    // another game.
+    if (kMayMakeRva == 0) { g_mayMakeHook = 0; ErrorLog("[UNIQ] no address for the may-make check 0x591720 - this game may make a second copy of a named character alive in another game"); }
+    else
+    {
+        coop::HookStatus h7 = coop::AddHook((void*)(g_base + kMayMakeRva), (void*)&detour_mayMake, (void**)&orig_mayMake);
+        if (h7 != coop::SUCCESS) { g_mayMakeHook = -1; ErrorLog("[UNIQ] AddHook the may-make check 0x591720 FAILED - this game may make a second copy of a named character alive in another game"); }
+        else { g_mayMakeHook = 1; DebugLog("[UNIQ] hook installed: the may-make check at +" + Hex(kMayMakeRva)); }
+    }
 }
 
 // MAIN THREAD: take every published slot, oldest ticket first. A dropped ticket leaves a hole in the ring, so the
@@ -862,9 +1480,13 @@ void InstallWorldState()
 // send. Only a change (or a first sight that is already non-ALIVE) reads playerInvolved, resolves the string id and
 // sends. A record can be rung many times between drains and still costs one read per rung entry, because what is
 // read is the map's CURRENT value rather than a before/after pair.
+long long WorldStateGeneration() { return g_wsStateGen; }
 void WorldStateTick()
 {
     if (g_base == 0) return;
+    if (WsSetsRebuild() == 1) WsDupTick();   // cheap unless the shadow changed or a second has passed; a walk is followed by the duplicate check
+    WsLogQueueDrain(g_wsSkipQueue, g_wsSkipLogged, 0);
+    WsLogQueueDrain(g_wsRefuseQueue, g_wsRefuseLogged, 1);
     int idx[kRing]; int n = 0;
     for (int i = 0; i < kRing; ++i) if (g_ring[i].ready != 0) idx[n++] = i;
     if (n == 0) return;
@@ -875,6 +1497,7 @@ void WorldStateTick()
         idx[b + 1] = v;
     }
     int ownBudget = kOwnRefreshPerDrain;   // E20: the unchanged path's last-known-owner refreshes, bounded per drain
+    int firstSightBudget = kFirstSightWalksPerDrain;
     for (int k = 0; k < n; ++k)
     {
         WsEntry& e = g_ring[idx[k]];
@@ -907,14 +1530,45 @@ void WorldStateTick()
         }
         if (!known && state == 1)
         {
-            // A first sight the map holds nothing on: 1 is what getState returns for an ABSENT key, so this is the
-            // baseline, not news. Learn it and send nothing. Its id is read later, if it ever changes.
-            WsShadow base; base.state = 1; base.playerInvolved = 0; base.ownedHere = 0; std::memset(base.sid, 0, 64);
-            if (ownBudget > 0) { --ownBudget; base.ownedHere = WsOwnedFlag(gd, 0); }
-            else ++g_ownRefreshSkipped;
+            // uniqslot.h FirstSightAlive: an ALIVE first sight is published when the world server's opening data for this world has
+            // been applied here and has named no state for this id, and the living character carrying it here is this
+            // game's own - so a game that has never met this character learns that it lives here and does not make a
+            // second one. Before the opening data is applied the question cannot be answered: no shadow row, asked again on
+            // the next pass (one map read, as the unchanged path). Otherwise the baseline is learned silently.
+            const int snap = (StoreSnapshotApplied() != 0) ? 1 : 0;
+            if (snap != 0 && firstSightBudget <= 0) { ++g_firstSightAliveDeferred; continue; }   // asked again on a later pass
+            if (snap != 0) --firstSightBudget;
+            ::Character* carrier = 0;
+            int own = kOwnNone, inFeed = 0, carrierAlive = -1;
+            char fsid[64]; std::memset(fsid, 0, 64);
+            if (snap != 0)
+            {
+                own = WsOwnershipOf(gd, &carrier);
+                if (carrier != 0) { const int d = WsCharDeadPod(carrier); carrierAlive = (d == 0) ? 1 : (d == 1 ? 0 : -1); }
+                if (own == kOwnMine)
+                {
+                    if (WsSidPod(gd, fsid, 64) == 0) { ::InterlockedIncrement64(&g_sidFault); continue; }   // no row: retried on the next pass
+                    inFeed = (g_wsNotebookSids.find(std::string(fsid)) != g_wsNotebookSids.end()) ? 1 : 0;
+                }
+            }
+            const int ownKind = own == kOwnMine ? swuniq::kFsOwnMine : (own == kOwnMirror || own == kOwnTwin) ? swuniq::kFsOwnOther
+                              : own == kOwnUnknown ? swuniq::kFsOwnUnknown : swuniq::kFsOwnNone;
+            const int fs = swuniq::FirstSightAlive(snap, inFeed, ownKind, carrierAlive);
+            if (fs == swuniq::kFirstSightDefer) { ++g_firstSightAliveDeferred; continue; }
+            const int fpi = (fs == swuniq::kFirstSightPublish) ? WsEntryPlayerInvolvedPod(gd) : 0;   /* what the engine's entry holds */
+            WsShadow base; base.state = 1; base.playerInvolved = fpi; base.ownedHere = WsOwnedFlagOf(own, 0); base.remote = 0;
+            std::memset(base.sid, 0, 64); std::memcpy(base.sid, fsid, 63);
             g_wsShadow.insert(std::make_pair(gd, base));
-            ++g_shadowUnchanged; continue;
+            if (fs != swuniq::kFirstSightPublish) { ++g_firstSightAliveLearned; ++g_shadowUnchanged; continue; }
+            if (StoreSendUniqueState(std::string(fsid), 1, fpi))
+            {
+                ++g_firstSightAliveSent; WsNoteSent(std::string(fsid), 1, false);
+                if (g_firstSightAliveLogged < kUniqLogMax) { ++g_firstSightAliveLogged; DebugLog("[UNIQ] published alive at first sight sid=" + std::string(fsid) + " (this game's own; the world server's feed holds nothing for it)"); }
+            }
+            else ++g_firstSightAliveSendFailed;
+            continue;
         }
+        if (known) ++g_wsStateGen;   /* a known record whose state changed (a first sight is this save's own history, not news) */
         const int pi = WsPlayerInvolvedOf(gd);
         char sid[64];
         if (known && it->second.sid[0] != 0) { std::memcpy(sid, it->second.sid, 64); sid[63] = 0; }
@@ -952,9 +1606,10 @@ void WorldStateTick()
             const int inNotebook = (g_wsNotebookSids.find(std::string(sid)) != g_wsNotebookSids.end()) ? 1 : 0;
             if (inNotebook != 0)
             {
-                WsShadow fs; fs.state = state; fs.playerInvolved = pi; fs.ownedHere = WsOwnedFlag(gd, 0);
+                WsShadow fs; fs.state = state; fs.playerInvolved = pi; fs.ownedHere = WsOwnedFlag(gd, 0); fs.remote = 0;
                 std::memset(fs.sid, 0, 64); std::memcpy(fs.sid, sid, 63); fs.sid[63] = 0;
                 g_wsShadow.insert(std::make_pair(gd, fs));
+                g_wsSetsDirty = true;        /* the two sets are copied from the shadow */
                 WsNoteReported(gd, state);   /* observed non-ALIVE, whether or not it was published - a respawn's clear is diffed against this */
                 ++g_firstSightSuppressed;
                 continue;
@@ -1004,9 +1659,10 @@ void WorldStateTick()
             else ++g_sendSkippedUnknownOwner;
         }
 
-        WsShadow ne; ne.state = state; ne.playerInvolved = pi; ne.ownedHere = ownedNow;
+        WsShadow ne; ne.state = state; ne.playerInvolved = pi; ne.ownedHere = ownedNow; ne.remote = 0;
         std::memcpy(ne.sid, sid, 64); ne.sid[63] = 0;
         if (known) it->second = ne; else g_wsShadow.insert(std::make_pair(gd, ne));
+        g_wsSetsDirty = true;   // the two sets are copied from the shadow
         // E27 / review-p5q MEDIUM-2 - THE DRAIN'S RECONCILIATION IDENTITY, and it is true from here on because
         // the apply's re-assert now has its OWN counters (`reassertSent` / `reassertSendFailed`) instead of adding
         // into `sent` / `sendFailed`. Read straight off the increments rather than assumed: past this line a rung
@@ -1021,6 +1677,7 @@ void WorldStateTick()
         // E24.1's first-sight branch `continue`s ABOVE this line, so a suppressed first sight never reaches
         // `shadowChanged` at all. The full account of one drained rung entry is the wider sum
         //     drained == shadowUnchanged + firstSightSuppressed + shadowChanged
+        //                + firstSightAliveDeferred + firstSightAliveSent + firstSightAliveSendFailed
         //                + drainBadGd + stateFault + stateRange + sidFault
         // of which only the last four are faults.
         ++g_shadowChanged;
@@ -1047,6 +1704,8 @@ void WorldStateTick()
 void WorldStateWorldTeardown()
 {
     ++g_teardowns;
+    g_wsDupPend.clear(); g_wsDupNow.clear(); g_wsDupSaid.clear(); g_wsDupTableGone.clear();   /* the bodies and templates of the world being destroyed */
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) != 0) { ::EnterCriticalSection(&g_wsSetCs); g_wsDupNoMake.clear(); ::LeaveCriticalSection(&g_wsSetCs); }
     for (int i = 0; i < kRing; ++i)
     {
         if (::InterlockedCompareExchange(&g_ring[i].ready, 0, 0) != 0) ++g_teardownRingDropped;
@@ -1070,6 +1729,19 @@ void WorldStateWorldTeardown()
     }
     const size_t had = g_wsShadow.size();
     g_wsShadow.clear();
+    g_wsSetsDirty = true;   /* the two sets name this world's records - emptied now, not at the next tick */
+    if (::InterlockedCompareExchange(&g_wsSetCsReady, 0, 0) != 0)
+    {
+        std::vector<void*> none, none2;
+        ::EnterCriticalSection(&g_wsSetCs);
+        g_wsDead.swap(none);
+        g_wsElsewhere.swap(none2);
+        g_wsSkipQueue.n = 0;
+        g_wsRefuseQueue.n = 0;
+        ::LeaveCriticalSection(&g_wsSetCs);
+    }
+    g_wsSkipLogged.clear();
+    g_wsRefuseLogged.clear();
     // E27: the last-sent register is keyed by a string id that names a character in THE WORLD BEING DESTROYED, so
     // it goes with the shadow (review-p5l MEDIUM-2's lesson: half a world's state left behind asserts things about
     // a world that is gone - here it would damp the first re-assert of the next world).
@@ -1125,7 +1797,13 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
     // replay of an already-agreed record lands here), and it used to pass -1 - "this call established nothing
     // about ownership" - at the one moment the character is most likely still loaded and the answer one walk away.
     // The file's own header claimed the flag was refreshed on every apply. Now it is.
-    if (before == state) { ++g_unchanged; WsShadowNote(gd, state, playerInvolved, sid, WsOwnedFlag(gd, -1)); return; }
+    if (before == state)
+    {   /* a replayed row whose last-known owner is this game (its own publish handed back by the world server) stays this game's own word */
+        ++g_unchanged;
+        const int own = WsOwnedFlag(gd, -1);
+        WsShadowNote(gd, state, playerInvolved, sid, own, own == 1 ? 0 : 1);
+        return;
+    }
 
     // E20 - THE APPLY RULES. Everything below turns on ONE question, asked here on the main thread: is this named
     // character loaded here, and if it is, is it OURS or a ghost of the other game's character?
@@ -1153,7 +1831,7 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
         if (g_wsBackPending.find(sid) != g_wsBackPending.end())
         {
             ++g_deadKillHeldBack;
-            WsShadowNote(gd, before, playerInvolved, sid, ownFlag);
+            WsShadowNote(gd, before, playerInvolved, sid, ownFlag, 0);
             DebugLog("[WS] '" + sid + "' is DEAD in the notebook but was brought back here and the world server has not confirmed it - NOT killed (deadKillHeld=" + N(g_deadKillHeldBack) + ")");
             return;
         }
@@ -1169,13 +1847,13 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
                map changed with the shadow unaware - and the next rung entry would then publish the notebook's own
                message straight back out as a local discovery. Re-read and record whatever the map says now. */
             ++g_applyFault;
-            WsShadowNote(gd, WsStateOf(gd), playerInvolved, sid, ownFlag);
+            { const int nowState = WsStateOf(gd); WsShadowNote(gd, nowState, playerInvolved, sid, ownFlag, nowState == state ? 1 : 0); }
             ErrorLog("[WS] killing loaded unique '" + sid + "' through the engine's declareDead faulted");
             return;
         }
         // A corrective measures the change it produced (project lesson 14).
         const int afterKill = WsStateOf(gd);
-        WsShadowNote(gd, afterKill, playerInvolved, sid, ownFlag);   // E19: what we just made the map say is not news
+        WsShadowNote(gd, afterKill, playerInvolved, sid, ownFlag, afterKill == state ? 1 : 0);   // E19: what we just made the map say is not news
         if (afterKill == 0)
         {
             if (isTwin) ++g_appliedDeadKillTwin; else ++g_appliedDeadKill;
@@ -1197,27 +1875,29 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
         if (localNow < 0)
         {
             ++g_applyFault;
-            WsShadowNote(gd, WsStateOf(gd), playerInvolved, sid, ownFlag);   /* E24.5b */
+            WsShadowNote(gd, WsStateOf(gd), playerInvolved, sid, ownFlag, 0);   /* E24.5b */
             ErrorLog("[WS] re-asserting '" + sid + "' failed: this game's own state read faulted");
             return;
         }
-        if (localNow == state) { ++g_unchanged; WsShadowNote(gd, localNow, playerInvolved, sid, ownFlag); return; }
+        if (localNow == state) { ++g_unchanged; WsShadowNote(gd, localNow, playerInvolved, sid, ownFlag, 0); return; }
         // T-556: the world server says this character was brought back and the living character carrying it here is ours - the
         // map's DEAD is the old body's, so the server's state is written (an own DEAD body keeps the re-assert below).
         if (swfallen::BringBackWrite(localNow, state, back, (live != 0 && WsCharDeadPod(live) == 0) ? 0 : 1))
         {
             ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
+            const int wsBeforeB = WsStateOf(gd);
             const int okb = WsBringBackPod(gd, state, playerInvolved);
+            if (okb != 0 && wsBeforeB != state) ++g_wsStateGen;
             ::InterlockedExchange(&g_wsApplyingThread, 0);
             const int afterB = WsStateOf(gd);
-            WsShadowNote(gd, afterB, playerInvolved, sid, ownFlag);
+            WsShadowNote(gd, afterB, playerInvolved, sid, ownFlag, 1);
             if (okb == 0) { ++g_applyFault; ErrorLog("[WS] writing brought-back '" + sid + "' -> " + N(state) + " faulted"); return; }
             ++g_appliedBroughtBack; ++g_applied;
             DebugLog("[WS] '" + sid + "' brought back (" + N((long long)back) + " time(s)) - written " + N(state) + " over this game's DEAD, carried here by a living character of ours (map now " + N(afterB) + ")");
             return;
         }
         const int localPi = WsPlayerInvolvedOf(gd);
-        WsShadowNote(gd, localNow, localPi, sid, ownFlag);   // what this game holds is not news for the drain to re-send
+        WsShadowNote(gd, localNow, localPi, sid, ownFlag, 0);   // what this game holds is not news for the drain to re-send
         // E27 / review-p5q HIGH-2 - THE DAMPER. During a hand-off both games own this uid for one round trip, and
         // two immediate re-assert reflexes answer each other at link speed with a rewrite of the relay's file per
         // lap. Refusing to re-send the state this game last sent for this id breaks that after ONE lap; the 5-s
@@ -1254,20 +1934,22 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
     /* T-556: a character the world server says was brought back is written past a stored DEAD (the setter alone would refuse) */
     const bool backWrite = swfallen::BringBackWrite(before, state, back, 0);
     ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
+    const int wsBefore = WsStateOf(gd);
     const int ok = backWrite ? WsBringBackPod(gd, state, playerInvolved) : WsApplyPod(gd, state, playerInvolved);
+    if (ok != 0 && wsBefore != state) ++g_wsStateGen;
     ::InterlockedExchange(&g_wsApplyingThread, 0);
     if (ok == 0)
     {
         /* E24.5b: the setter can fault after it has written, so the same rule as the kill path above. */
         ++g_applyFault;
-        WsShadowNote(gd, WsStateOf(gd), playerInvolved, sid, ownFlag);
+        { const int nowState = WsStateOf(gd); WsShadowNote(gd, nowState, playerInvolved, sid, ownFlag, nowState == state ? 1 : 0); }
         ErrorLog("[WS] applying '" + sid + "' -> " + N(state) + " faulted");
         return;
     }
     // A corrective measures the change it produced (project lesson 14): the map is re-read, and an apply the engine
     // refused (its setter never revives a DEAD entry) is booked as noEffect rather than as applied.
     const int after = WsStateOf(gd);
-    WsShadowNote(gd, after, playerInvolved, sid, ownFlag);   // E19: what we just made the map say is not news
+    WsShadowNote(gd, after, playerInvolved, sid, ownFlag, after == state ? 1 : 0);   // E19: what we just made the map say is not news
     if (after == state)
     {
         ++g_applied; if (backWrite) ++g_appliedBroughtBack;
@@ -1309,7 +1991,7 @@ std::string WorldStateBroughtBack(const std::string& sid)
         after = WsStateOf(gd);
         if (ok == 0) ++g_applyFault;
     }
-    WsShadowNote(gd, after, 0, sid, 1);   /* what this game just made the map say is not news for the drain */
+    WsShadowNote(gd, after, 0, sid, 1, 0);   /* what this game just made the map say is not news for the drain */
     ++g_broughtBackHere;
     const std::string line = "this game's map read " + N(before) + " -> " + N(after)
         + (before == 0 ? (ok ? " (written ALIVE)" : " (the write FAULTED)") : " (left as it was)")
@@ -1351,6 +2033,46 @@ void WorldStateNotebookReset()
     if (had != 0) DebugLog("[WS] notebook id list cleared (" + N((long long)had) + " ids) - the next WELCOME's push says what THIS notebook knows");
 }
 
+// TEST-ONLY (`uniqueforce <sid> dead|deadsend|alive|clearslot|show`): this game's own table entry for a named character is written
+// the way the apply writes it, and the shadow learns it so nothing is sent; `deadsend` also publishes DEAD to the world server as the
+// owner's drain would (the other games receive a death); `clearslot` empties the entry's made slot so this game's makers may make
+// the character again (a second living body, for the duplicate check); `show` reads the entry, the slot, the two sets and the
+// living bodies with each one's owner, its area's runner and the duplicate decision.
+std::string WorldStateForceLocal(const std::string& sid, const std::string& what)
+{
+    if (g_base == 0 || sid.empty()) return "error uniqueforce: no world or no id";
+    void* gd = WsGetDataPod(&sid);
+    if (gd == 0) return "error uniqueforce: '" + sid + "' is not in this game's data";
+    bool sent = false;
+    if (what == "dead" || what == "deadsend" || what == "alive")
+    {
+        const int want = (what == "alive") ? 1 : 0;
+        ::InterlockedExchange(&g_wsApplyingThread, (LONG)::GetCurrentThreadId());
+        const int ok = (want == 0) ? WsApplyPod(gd, 0, 0) : WsBringBackPod(gd, 1, 0);
+        ::InterlockedExchange(&g_wsApplyingThread, 0);
+        if (ok == 0) return "error uniqueforce: the write for '" + sid + "' faulted";
+        WsShadowNote(gd, WsStateOf(gd), 0, sid, -1, 0);
+        if (what == "deadsend")
+        {
+            if (!StoreSendUniqueState(sid, 0, 0)) return "error uniqueforce: '" + sid + "' written dead here but the send failed";
+            WsNoteSent(sid, 0, false);
+            sent = true;
+        }
+        g_wsSetsDirty = true;
+        WsSetsRebuild();
+    }
+    else if (what == "clearslot")
+    {
+        const int r = WsClearSlotPod(gd);
+        if (r <= 0) return "error uniqueforce: '" + sid + "' " + (r == 0 ? "has no entry in this game's table" : "- the write faulted");
+    }
+    else if (what != "show") return "error uniqueforce: dead|deadsend|alive|clearslot|show";
+    const std::map<void*, WsShadow>::const_iterator it = g_wsShadow.find(gd);
+    return "ok uniqueforce " + sid + " " + what + ": map=" + N(WsStateOf(gd)) + " slot=" + N(WsUniqueSlotPod(gd)) + " unique=" + N(WsTemplateIsUnique(gd))
+           + " deadSet=" + N(WsDeadSetHas(gd)) + " elsewhere=" + N(WsElsewhereHas(gd)) + " shadow=" + (it != g_wsShadow.end() ? N(it->second.state) : std::string("none"))
+           + WsDupShow(gd) + (sent ? " (DEAD sent to the world server)" : " (this game only, nothing sent)");
+}
+
 std::string WorldStateReport() { return N(g_sent) + "," + N(g_recv) + "," + N(g_applied) + "," + N(g_unknownSid) + "," + N(g_unchanged); }
 std::string WorldStateDetail()
 {
@@ -1366,6 +2088,12 @@ std::string WorldStateDetail()
          + " uniqueStateApply[deadKill,deadKillTwin,killNoEffect,deadMap,map,appliedMirrorMap,reassertedLocal,reassertDamped,walkRefused,reportedOverflow]=" + N(g_appliedDeadKill) + "," + N(g_appliedDeadKillTwin) + "," + N(g_killNoEffect) + "," + N(g_appliedDeadMap) + "," + N(g_appliedMap) + "," + N(g_appliedMirrorMap) + "," + N(g_reassertedLocal) + "," + N(g_reassertDamped) + "," + N(g_loadedWalkRefused) + "," + N(g_reportedOverflow)
          + " uniqueStateSend[sendSkippedNotOwned,sendSkippedUnknownOwner,sendSkippedUnknownUid,loadedNoUid,ownRefreshSkipped,ownedHereCleared,reassertSent,reassertSendFailed,lastSendCapped]=" + N(g_sendSkippedNotOwned) + "," + N(g_sendSkippedUnknownOwner) + "," + N(g_sendSkippedUnknownUid) + "," + N(g_loadedNoUid) + "," + N(g_ownRefreshSkipped) + "," + N(g_ownedHereCleared) + "," + N(g_reassertSent) + "," + N(g_reassertSendFailed) + "," + N(g_lastSendCapped)
          + " uniqueStateRing[queued,dropped,ringDeduped,ringSlotShared,badGd,sidFault,stateFault,unloadOverflow,sendFailed,noEffect,applyFault]=" + N(g_queued) + "," + N(g_ringDropped) + "," + N(g_ringDeduped) + "," + N(g_ringSlotShared) + "," + N(g_drainBadGd) + "," + N(g_sidFault) + "," + N(g_stateFault) + "," + N(g_unloadOverflow) + "," + N(g_sendFailed) + "," + N(g_noEffect) + "," + N(g_applyFault)
+         + " uniqueFirstSight[aliveSent,aliveSendFailed,aliveLearned,aliveDeferred]=" + N(g_firstSightAliveSent) + "," + N(g_firstSightAliveSendFailed) + "," + N(g_firstSightAliveLearned) + "," + N(g_firstSightAliveDeferred)
+         + " uniqueMayMake[hook,main,off,refused,elsewhereSize,refuseQueueFull]=" + N((long long)g_mayMakeHook) + "," + N(g_mayMakeMain) + "," + N(g_mayMakeOff) + "," + N(g_mayMakeRefused) + "," + N(WsSetCount(&g_wsElsewhere, 0)) + "," + N(WsSetCount(0, &g_wsRefuseQueue))
+         + " recordMember[hook,main,off,deadSet,skipped,firstTime,body,fault,deadSetSize,skipQueueFull]=" + N((long long)g_memberHook) + "," + N(g_memberMain) + "," + N(g_memberOff) + "," + N(g_memberDeadSet) + "," + N(g_memberSkipped) + "," + N(g_memberFirstTime) + "," + N(g_memberBody) + "," + N(g_memberFault) + "," + N(WsSetCount(&g_wsDead, 0)) + "," + N(WsSetCount(0, &g_wsSkipQueue))
+         + " uniqueSets[rebuilds,walkRefused]=" + N(g_setRebuilds) + "," + N(g_setWalkRefused)
+         + " uniqueDup[found,removed,protectedKept,crossGame,waiting,handover,fault]=" + N(g_dupFound) + "," + N(g_dupRemoved) + "," + N(g_dupProtectedKept) + "," + N(g_dupCrossGame) + "," + N(g_dupWaiting) + "," + N(g_dupHandover) + "," + N(g_dupFault)
+         + " uniqueDupMore[noHookYet,tooMany,noMakeSize,noMakeRefused]=" + N(g_dupNoHook) + "," + N(g_dupTooMany) + "," + N(WsSetCount(&g_wsDupNoMake, 0)) + "," + N(g_dupNoMakeRefused)
          + " uniqueStateBack[broughtBackHere,appliedBroughtBack,confirmed,deadKillHeld,deadLivingCarrier,pending]=" + N(g_broughtBackHere) + "," + N(g_appliedBroughtBack) + "," + N(g_backConfirmed) + "," + N(g_deadKillHeldBack) + "," + N(g_deadLivingCarrier) + "," + N((long long)g_wsBackPending.size());
 }
 

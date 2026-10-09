@@ -168,14 +168,15 @@ struct ReleaseRec
 {
     unsigned int id, keyUid; Sector sector; std::vector<RelMember> mem; std::vector<int> tried;
     int candidate; double sentAt, clock, lastTick; int sends, defers, flight, held;
+    float px, pz;   /* the squad's decision position at the put-away - the receivers' keep rule is asked there */
     long long nAdopted, nAsleep, nCancelled, nMoved;
     ReleaseRec() : id(0), keyUid(0), candidate(-1), sentAt(0.0), clock(0.0), lastTick(0.0), sends(0), defers(0), flight(0), held(0),
-                   nAdopted(0), nAsleep(0), nCancelled(0), nMoved(0) { sector.x = -1; sector.y = -1; }
+                   nAdopted(0), nAsleep(0), nCancelled(0), nMoved(0), px(0.0f), pz(0.0f) { sector.x = -1; sector.y = -1; }
 };
 std::map<unsigned int, ReleaseRec> g_release;   /* id -> open record */
 unsigned int g_releaseNextId = 0;
 /* the frame's put-aways per engine squad (NotifyDespawn's main-thread branch), opened by ReleaseFlush at the next frame */
-struct RelBatch { unsigned int keyUid; Sector sector; std::vector<RelMember> mem; RelBatch() : keyUid(0) { sector.x = -1; sector.y = -1; } };
+struct RelBatch { unsigned int keyUid; Sector sector; std::vector<RelMember> mem; float px, pz; RelBatch() : keyUid(0), px(0.0f), pz(0.0f) { sector.x = -1; sector.y = -1; } };
 std::map<void*, RelBatch> g_relBatch;
 /* late adopters of a uid whose later offer is still open - their REVOKE waits for the settle */
 struct RelLate { int slot; unsigned int peer, gen; };
@@ -190,7 +191,7 @@ const long long kRelLogCap = 5000;
    ACK verdicts read; resent = offers sent again; revoked = REVOKEs sent. */
 long long g_relSent = 0, g_relAdopted = 0, g_relDropped = 0, g_relDeferred = 0, g_relAsleep = 0, g_relResent = 0, g_relRevoked = 0, g_relCancelled = 0;
 long long g_relOffers = 0, g_relHeld = 0, g_relNext = 0, g_relLateAccepted = 0, g_relAckWrongSender = 0, g_relAckStale = 0, g_relAckUnknown = 0;
-long long g_relDupAck = 0, g_relNotMine = 0, g_relLogged = 0, g_relCornerGiver = 0, g_relCornerRecv = 0, g_relWorldCleared = 0;
+long long g_relDupAck = 0, g_relNotMine = 0, g_relLogged = 0, g_relWorldCleared = 0;   /* T-650 fold 1: cornerGiver / cornerRecv went with both corner rules */
 long long g_relSkipOffThread = 0, g_relSkipUnread = 0, g_relSkipPlayer = 0, g_relSkipNotAnnounced = 0, g_relSkipInFlight = 0, g_relFlightNotTaken = 0, g_relFlightAbandoned = 0;
 /* the receiver side: offers read and each member's verdict; REVOKEs read and what they did */
 long long g_relInOffers = 0, g_relInAdopted = 0, g_relInDup = 0, g_relInDropped = 0, g_relInStale = 0, g_relInDeferred = 0;
@@ -211,7 +212,29 @@ static long long g_relRevokeWaitWorldCleared = 0, g_relRevokeOwedWorldCleared = 
 static std::vector<int> g_relRevokeGoneSlots;   /* MAIN THREAD: players gone whose REVOKEs are still to drop (ReleaseForgetDrain) */
 static std::vector<int> g_idxGoneSlots;         /* MAIN THREAD: players gone whose squad-index rows (people handed to them) are still to drop (ReleaseForgetDrain) */
 static long long g_idxPlayerGoneSquads = 0, g_idxPlayerGonePeople = 0;   /* squads that left the index / people given to a player who left */
-std::set<unsigned int> g_cornerNoted;   /* forced-XFER squads (by key) whose corner refusal was logged once */
+/* T-650 fold 1: forced-XFER squads (by key) whose KEEP (it left this game's loaded list and no other in-world game has the area loaded, or
+   the map is not fresh) was logged / whose loaded-but-not-in-world game was counted - once per squad until it is back in the loaded list */
+std::set<unsigned int> g_keepNoted, g_niwNoted;
+/* T-650 fold 1 (review MED-1): the last forced hand-over of each squad (by key) - its receiver and the squad's sector at the send; refused =
+   the receiver's ACK kept a member. A refused one is not sent again to the same receiver while the squad stands in the same sector (an
+   event clears it: the sector or the receiver changes), so a receiver that cannot take is not offered the same squad every second. */
+struct ForcedTry { int target, x, y, refused; ForcedTry() : target(-1), x(-1), y(-1), refused(0) {} };
+std::map<unsigned int, ForcedTry> g_forcedTry;
+/* REPORT releaseHolder[offer,none,hold,keep,keepUnknown,leave,notInWorld,backoff]: offer = RELEASE offers to a game that has the area
+   loaded; none = releases that ended asleep with no game offered (no other in-world game has the area loaded); hold = releases held for a
+   fresh area map; keep / keepUnknown = squads that left this game's loaded list, kept because no other in-world game has the area loaded /
+   the map is not fresh (once per squad per departure); leave = forced hand-overs sent; notInWorld = a game with the area loaded skipped as
+   not IN_WORLD (RELEASE: per offer or asleep decision; forced: once per squad per departure); backoff = forced hand-overs refused (a member
+   kept) and backed off */
+long long g_holderOffer = 0, g_holderNone = 0, g_holderHold = 0, g_holderKeep = 0, g_holderKeepUnknown = 0, g_holderLeave = 0, g_holderNotInWorld = 0, g_holderBackoff = 0;
+/* T-650 fold 2 REPORT keep[notKeep,asleepNoKeep,readFailTake,readFailForced,forcedListed]: notKeep = offer / asleep / forced-keep decisions in
+   which a game with the area loaded was passed over because its engine would not keep the squad at its spot (cooplo::EngineKeepsAt);
+   asleepNoKeep = releases that ended asleep for that reason; readFailTake = takes whose live keep read was unreadable (refused);
+   readFailForced = forced passes skipped on an unreadable keep read (decided again next tick); forcedListed = forced hand-overs sent while
+   this game's loaded list still named the area (the squad stood in its edge strip) */
+long long g_keepNotKeep = 0, g_keepAsleepNoKeep = 0, g_keepReadFailTake = 0, g_keepReadFailForced = 0, g_keepForcedListed = 0;
+/* uid -> the squad key of a refused forced hand-over naming it (HandoffForcedRefusedFor reads g_forcedTry through it) */
+std::map<unsigned int, unsigned int> g_forcedRefusedUid;
 /* world teardown / the other player gone: interlocked requests (the teardown may run OFF the main thread inside a __finally - POD only);
    the main thread empties the state at its next use (ReleaseForgetDrain) */
 volatile LONG g_relForgetReq = 0, g_idxPeerGoneReq = 0;
@@ -550,7 +573,7 @@ static void ReleaseForgetDrain()
     const long long r = (long long)g_release.size(), b = (long long)g_relBatch.size(), s = (long long)g_squadIdx.size();
     for (std::map<unsigned int, ReleaseRec>::const_iterator it = g_release.begin(); it != g_release.end(); ++it)
         DebugLog("[RELEASE] id=" + N((long long)it->first) + " END cleared by the world teardown (" + N((long long)it->second.mem.size()) + " member(s) open)");
-    g_release.clear(); g_relBatch.clear(); g_relLate.clear(); g_squadIdx.clear(); g_idxOf.clear(); g_keptRecent.clear(); g_keyCache.clear();   /* [a1b2f1-hd3] */
+    g_release.clear(); g_relBatch.clear(); g_relLate.clear(); g_squadIdx.clear(); g_idxOf.clear(); g_keptRecent.clear(); g_keyCache.clear(); g_keepNoted.clear(); g_niwNoted.clear(); g_forcedTry.clear();   /* [a1b2f1-hd3]; T-650 fold 1: the forced hand-over's notes and back-offs */
     /* [a1b2f2-hd3] [review G2]: the REVOKEs waiting to be applied and owed to be sent name uids of the world being freed - never applied in the next */
     const long long rw = (long long)g_relRevokeWait.size(), ro = (long long)g_relRevokeOwed.size();
     g_relRevokeWait.clear(); g_relRevokeOwed.clear(); g_relRevokeWaitWorldCleared += rw; g_relRevokeOwedWorldCleared += ro;
@@ -756,33 +779,57 @@ static void PassHoldElsewhere(unsigned int key, std::vector<net::XferMember>* me
              + " (handoverOnce passHeld=" + N(g_passHeld) + " passHeldEmpty=" + N(g_passHeldEmpty) + ", once per person per holding flight; the first 20 logged, then counted)");
 }
 /* ==== M7a A1 build 2 [a1b2-hd2] (design 2.4, 2.5) - THE RECEIVERS AND THE RELEASE. The giver no longer predicts another game's engine: an
-   engine put-away of this game's own people is offered (RELEASE) to the IN_WORLD games whose player's 3x3 holds the squad, one at a time,
-   nearest first; the first that adopts at the CURRENT offer's gen runs them; nobody -> they sleep in this game's world data (their UNLOAD
-   goes then). A late adopter is revoked (it becomes the winner's puppet). MAIN THREAD, all of it. ==== */
-/* the receivers of sector s for this game's next offer, nearest first (cooplo::ReceiverRingPick over this link's fresh player-sector table,
-   IN_WORLD games only, kKeepMargin); -1 = no road to decide on (this game's notebook link down or the table stale - owner 334 a: no
-   hand-over without the world server). *cornerOnly: with none found, a game whose 3x3 has the sector only as a CORNER (-1 none). */
-static int ReceiversFor(const Sector& s, const std::vector<int>& tried, std::vector<int>* order, int* cornerOnly)
+   engine put-away of this game's own people is offered (RELEASE) to the IN_WORLD games the world server's area map shows with the squad's
+   area LOADED, one at a time - the area's holder first when it is one of them, then the lower slot (T-650 fold 1, owner decision 580); the
+   first that adopts at the CURRENT offer's gen runs them; nobody -> they sleep in this game's world data (their UNLOAD goes then). A late
+   adopter is revoked (it becomes the winner's puppet). MAIN THREAD, all of it. ==== */
+/* the receivers of sector s for this game's next offer, in offer order (cooplo::AreaReceiverOrder over ONE locked read of the area map,
+   AreaSquadViewTS - review L1). k >= 1 = order holds k slots; 0 = no other in-world game has the area loaded; -1 = no road to decide on
+   (this game's notebook link down, the area map not fresh, or this game has no slot yet: no hand-over without the world server).
+   *holderOut = the holder the map names (-1 none); *notInWorldOut = games with the area loaded skipped as not IN_WORLD. */
+/* T-650 fold 2 (T1056): (px, pz) = the squad's decision position; a game is a receiver only when its engine would KEEP the squad there -
+   cooplo::EngineKeepsAt over its map bits for the area and the area's four side neighbours, from the same locked read. *notKeepOut = games
+   with the area loaded passed over because they would not (the squad within kEngineEdgeStrip + kKeepMarginUnits of a side they have not
+   loaded: their engine would put it away 4 s after the take). */
+/* asSlot >= 0: the order asked in that slot's place (a final leaver's - HandoffGoneFirstReceiver): that slot is left out and this game
+   is one of the candidates, counted in world through this link's roster like every other game. */
+static int ReceiversFor(const Sector& s, float px, float pz, const std::vector<int>& tried, std::vector<int>* order, int* holderOut, int* notInWorldOut, int* notKeepOut, int asSlot = -1)
 {
     order->clear();
-    if (cornerOnly != 0) *cornerOnly = -1;
+    if (holderOut != 0) *holderOut = -1;
+    if (notInWorldOut != 0) *notInWorldOut = 0;
+    if (notKeepOut != 0) *notKeepOut = 0;
     if (!StoreLiveReady() || s.x < 0 || s.y < 0) return -1;
-    std::vector<int> sl(256), xs(256), ys(256);
-    const int n = PeerPlayerSectorsTS(&sl[0], &xs[0], &ys[0], 256);
-    if (n < 0) return -1;
-    std::vector<cooplo::RingRow> rows;
-    for (int i = 0; i < n; ++i) { cooplo::RingRow r; r.slot = sl[i]; r.x = xs[i]; r.y = ys[i]; r.inWorld = StoreRosterSlotInWorld(sl[i]) == 1 ? 1 : 0; rows.push_back(r); }
-    std::vector<int> ord(rows.size() + 1);
-    const int me = StoreMySlot();
-    const int k = cooplo::ReceiverRingPick(rows.empty() ? 0 : &rows[0], (int)rows.size(), s.x, s.y, me, kRing, cooplo::kKeepMargin,
-                                           tried.empty() ? 0 : &tried[0], (int)tried.size(), &ord[0], (int)ord.size());
-    for (int i = 0; i < k; ++i) order->push_back(ord[(size_t)i]);
-    if (k == 0 && cornerOnly != 0 && cooplo::kKeepMargin >= 1)
+    if (asSlot >= 0 && StoreRosterSlotInWorld(StoreMySlot()) < 0) return -1;   /* the leaver's order counts this game through this link's roster: none here yet is a hold */
+    std::vector<int> sl(256), bit(256), side(256 * 4);
+    int holder = -1, n = 0;
+    const int fresh = AreaSquadViewTS(s, &holder, &sl[0], &bit[0], (int)sl.size(), &n, &side[0]);
+    if (holderOut != 0) *holderOut = holder;
+    std::vector<cooplo::AreaRow> rows;
+    for (int i = 0; i < n; ++i)
     {
-        const int k0 = cooplo::ReceiverRingPick(rows.empty() ? 0 : &rows[0], (int)rows.size(), s.x, s.y, me, kRing, 0,
-                                                tried.empty() ? 0 : &tried[0], (int)tried.size(), &ord[0], (int)ord.size());
-        if (k0 > 0) *cornerOnly = ord[0];
+        cooplo::AreaRow r; r.slot = sl[(size_t)i]; r.loaded = bit[(size_t)i]; r.inWorld = StoreRosterSlotInWorld(sl[(size_t)i]) == 1 ? 1 : 0;
+        const size_t q = (size_t)i * 4;
+        r.keeps = cooplo::EngineKeepsAt(px, pz, cooplo::AreaMinUnits(s.x), cooplo::AreaMinUnits(s.y), cooplo::kAreaSizeUnits, r.loaded,
+                                        side[q], side[q + 1], side[q + 2], side[q + 3], cooplo::kKeepMarginUnits);
+        rows.push_back(r);
     }
+    std::vector<int> ord(rows.size() + 1);
+    int niw = 0, nkp = 0;
+    const int k = cooplo::AreaReceiverOrder(rows.empty() ? 0 : &rows[0], (int)rows.size(), fresh == 1 ? 1 : 0, holder, asSlot >= 0 ? asSlot : StoreMySlot(),
+                                            tried.empty() ? 0 : &tried[0], (int)tried.size(), &ord[0], (int)ord.size(), &niw, &nkp);
+    if (notInWorldOut != 0) *notInWorldOut = niw;
+    if (notKeepOut != 0) *notKeepOut = nkp;
+    if (k < 0) return -1;
+    for (int i = 0; i < k; ++i) order->push_back(ord[(size_t)i]);
+    return k;
+}
+/* the receiver's take test - this game's engine keeps the squad (or the member) at that spot, read live at the take;
+   unreadable = not taken (counted) - the giver's release moves on or ends asleep, never a take its engine puts away */
+static int KeepTakeAt(float x, float z)
+{
+    const int k = EngineKeepsHere(x, z);
+    if (k < 0) { ++g_keepReadFailTake; return 0; }
     return k;
 }
 static int PlayerTableFresh() { int a = 0, b = 0, c = 0; return PeerPlayerSectorsTS(&a, &b, &c, 0) >= 0 ? 1 : 0; }
@@ -1016,16 +1063,17 @@ static bool RelAdvance(ReleaseRec& r, double now)
             ++g_relNotMine; r.mem.erase(r.mem.begin() + (long)k);   /* no longer this game's (a hire, a dual run's yield): nothing to offer */
         }
         if (r.mem.empty()) { RelEnd(r, "emptied - no member is this game's any more"); return false; }
-        std::vector<int> order; int cornerOnly = -1;
-        const int nc = r.candidate < 0 ? ReceiversFor(r.sector, r.tried, &order, &cornerOnly) : 0;
+        std::vector<int> order; int holder = -1, niw = 0, nk = 0;
+        const int nc = r.candidate < 0 ? ReceiversFor(r.sector, r.px, r.pz, r.tried, &order, &holder, &niw, &nk) : 0;
         const int candIn = r.candidate >= 0 ? (StoreRosterSlotInWorld(r.candidate) == 1 ? 1 : 0) : 0;
         const int st = cooplo::ReleaseStep(r.candidate >= 0 ? 1 : 0, nc > 0 ? nc : 0, linkUp, r.candidate < 0 ? (nc >= 0 ? 1 : 0) : fresh, candIn, r.clock, r.defers, now - r.sentAt);
         if (st == cooplo::kRsHold)
         {
             if (r.held == 0)
             {
-                r.held = 1; ++g_relHeld;
-                RelLog("[RELEASE] id=" + N((long long)r.id) + " HELD - this game's notebook link is down or the player table is stale (owner 334 a: no candidate clock runs; its UNLOADs stay held)");
+                r.held = 1; ++g_relHeld; ++g_holderHold;
+                RelLog("[RELEASE] id=" + N((long long)r.id) + " key=" + N((long long)r.keyUid) + " HELD - this game's notebook link is down or the area map is not fresh (no candidate clock runs; its UNLOADs stay held; releaseHolder hold "
+                       + N(g_holderHold) + ")");
             }
             return true;
         }
@@ -1036,7 +1084,10 @@ static bool RelAdvance(ReleaseRec& r, double now)
         {
             r.candidate = order[0]; r.clock = 0.0; r.defers = 0; r.sends = 0; r.sentAt = now;
             const bool ok = RelSendOffer(r, 0);
+            ++g_holderOffer; if (niw > 0) ++g_holderNotInWorld; if (nk > 0) ++g_keepNotKeep;
             RelLog("[RELEASE] id=" + N((long long)r.id) + " -> " + SlotText(r.candidate) + " key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
+                   + (r.candidate == holder ? std::string(" (has the area loaded, the area's holder") : " (has the area loaded; holder " + (holder < 0 ? std::string("none") : SlotText(holder)))
+                   + "; releaseHolder offer " + N(g_holderOffer) + ")"
                    + " gen=" + N((long long)RelOfferGen(r, r.mem[0])) + " candidate " + N((long long)r.tried.size() + 1) + " of " + N((long long)(r.tried.size() + order.size()))
                    + (r.flight != 0 ? std::string(" (from an XFER flight)") : std::string()) + (ok ? std::string() : std::string(" - NOT SENT yet (no road to that slot; sent again on the clock)")));
             return true;
@@ -1049,13 +1100,23 @@ static bool RelAdvance(ReleaseRec& r, double now)
             continue;
         }
         /* kRsAsleep: no candidate (left) */
-        if (cornerOnly >= 0)
-        {
-            ++g_relCornerGiver;
-            RelLog("[RELEASE] id=" + N((long long)r.id) + " CORNER: sector " + SectorString(r.sector) + " is only a corner of " + SlotText(cornerOnly)
-                   + "'s 3x3 (keepMargin " + N((long long)cooplo::kKeepMargin) + ") - not offered (release cornerGiver " + N(g_relCornerGiver) + ")");
+        std::string why = "ASLEEP - every candidate dropped, deferred or stayed silent";
+        if (nk > 0)
+        {   /* games have the area loaded, but none would keep the squad at its spot - an offer would only be put away again by
+               that game's engine 4 s after the take (T1056's ~7 s bounce) */
+            ++g_keepNotKeep; ++g_keepAsleepNoKeep; if (r.tried.empty()) ++g_holderNone;
+            why = "ASLEEP - no game's engine keeps it at this spot (" + N((long long)nk) + " in-world game(s) with the area " + SectorString(r.sector) + " loaded; the squad at "
+                  + N((long long)r.px) + "," + N((long long)r.pz) + " is within " + N((long long)(cooplo::kEngineEdgeStrip + cooplo::kKeepMarginUnits))
+                  + " of a side they have not loaded; key=" + N((long long)r.keyUid) + "; keep asleepNoKeep " + N(g_keepAsleepNoKeep) + ")";
         }
-        RelSettleAll(r, 0, r.tried.empty() ? std::string("ASLEEP - no other player's 3x3 holds the sector") : std::string("ASLEEP - every candidate dropped, deferred or stayed silent"), 1);
+        else if (r.tried.empty())
+        {
+            ++g_holderNone; if (niw > 0) ++g_holderNotInWorld;
+            why = "ASLEEP - no other in-world game has the area " + SectorString(r.sector) + " loaded (holder " + (holder < 0 ? std::string("none") : SlotText(holder))
+                  + (niw > 0 ? ", " + N((long long)niw) + " game(s) with it loaded not in the world" : std::string()) + ")";
+            why += " (key=" + N((long long)r.keyUid) + "; releaseHolder none " + N(g_holderNone) + ")";
+        }
+        RelSettleAll(r, 0, why, 1);
         return false;
     }
     return true;
@@ -1089,7 +1150,7 @@ static void ReleaseFlush(double now)
         for (size_t at = 0; at < b.mem.size(); at += (size_t)cooplo::kReleaseMaxMembers)
         {
             const size_t to = (at + (size_t)cooplo::kReleaseMaxMembers < b.mem.size()) ? at + (size_t)cooplo::kReleaseMaxMembers : b.mem.size();
-            ReleaseRec r; r.id = RelNewId(); r.keyUid = b.keyUid; r.sector = b.sector;
+            ReleaseRec r; r.id = RelNewId(); r.keyUid = b.keyUid; r.sector = b.sector; r.px = b.px; r.pz = b.pz;
             for (size_t k = at; k < to; ++k) r.mem.push_back(b.mem[k]);
             g_relSent += (long long)r.mem.size();
             RelLog("[RELEASE] id=" + N((long long)r.id) + " OPEN key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
@@ -1134,7 +1195,7 @@ static void ReleaseOpenFromFlight(unsigned int leader, const Pending& p, const s
         r.mem.push_back(rm);
     }
     if (r.mem.empty()) return;
-    r.id = RelNewId(); r.keyUid = net::IsUidMine(leader) ? leader : r.mem[0].m.uid; r.sector = SectorOf(r.mem[0].m.x, r.mem[0].m.z);
+    r.id = RelNewId(); r.keyUid = net::IsUidMine(leader) ? leader : r.mem[0].m.uid; r.sector = SectorOf(r.mem[0].m.x, r.mem[0].m.z); r.px = r.mem[0].m.x; r.pz = r.mem[0].m.z;
     g_relSent += (long long)r.mem.size();
     if (abandoned != 0) g_relFlightAbandoned += (long long)r.mem.size(); else g_relFlightNotTaken += (long long)r.mem.size();
     RelLog("[RELEASE] id=" + N((long long)r.id) + " OPEN key=" + N((long long)r.keyUid) + " n=" + N((long long)r.mem.size()) + " sector=" + SectorString(r.sector)
@@ -1246,7 +1307,7 @@ void ApplyRemoteReleaseAck(const cooplo::ReleaseAckMsg& a, unsigned int fromPeer
         }
         else
         {   /* others deferred: the dropped ones move to a new record for the next candidate */
-            ReleaseRec nr; nr.id = RelNewId(); nr.keyUid = r.keyUid; nr.sector = r.sector; nr.mem = moved; nr.tried = r.tried; nr.tried.push_back(r.candidate); nr.flight = r.flight;
+            ReleaseRec nr; nr.id = RelNewId(); nr.keyUid = r.keyUid; nr.sector = r.sector; nr.px = r.px; nr.pz = r.pz; nr.mem = moved; nr.tried = r.tried; nr.tried.push_back(r.candidate); nr.flight = r.flight;
             r.nMoved += (long long)moved.size();
             RelLog("[RELEASE] id=" + N((long long)nr.id) + " OPEN split from id=" + N((long long)r.id) + " n=" + N((long long)nr.mem.size()) + " - dropped by " + SlotText(r.candidate) + " while others deferred");
             if (RelAdvance(nr, now)) g_release[nr.id] = nr;
@@ -1345,7 +1406,6 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
     if (msg.flags == cooplo::kRelFlagRevoke) { RelApplyRevoke(msg, fromPeer, from); return; }   /* [a1b2f1-hd16] [review F6]: the decoder admits exactly PUT_AWAY or REVOKE */
     ++g_relInOffers;
     const int writesBlocked = EngineWritesBlocked() ? 1 : 0, linkUp = StoreLiveReady() ? 1 : 0;
-    const Sector me = MyPlayerSector();
     std::vector<net::XferMember> mm(msg.rows.size());
     const unsigned int leader = msg.keyUid;
     int leaderTaking = 0; float tlx = 0, tlz = 0;
@@ -1362,7 +1422,7 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
         if (net::IsUidMine(leader) && Plaus(lc) && SquadDecisionPos(lc, &sqx, &sqz) == 1) squadKnown = 1;
         else if (leaderTaking != 0) { sqx = tlx; sqz = tlz; squadKnown = 1; }
     }
-    const int squadInRing = (squadKnown != 0 && SectorInMyRing(SectorOf(sqx, sqz), kRing)) ? 1 : 0;
+    const int squadInRing = (squadKnown != 0 && KeepTakeAt(sqx, sqz) == 1) ? 1 : 0;   /* this game's engine keeps the squad at its spot (live), not the once-a-second loaded list */
     cooplo::ReleaseAckMsg ack; ack.id = msg.id;
     int intents = 0, unresolved = 0; long long stale = 0;
     for (size_t i = 0; i < mm.size(); ++i)
@@ -1372,11 +1432,11 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
         const int mine = net::IsUidMine(uid) ? 1 : 0;
         const int have = (mine == 0 && Plaus(c)) ? 1 : 0;
         const unsigned int myGen = mine != 0 ? net::MineGenOf(uid) : net::CopyGenOf(uid);
-        const int memberInRing = SectorInMyRing(SectorOf(mm[i].x, mm[i].z), kRing) ? 1 : 0;
+        const int memberInRing = KeepTakeAt(mm[i].x, mm[i].z) == 1 ? 1 : 0;   /* the live keep read */
         const int takeRing = coopsquad::XferTakeMember(leaderHere, squadKnown, squadInRing, memberInRing);
-        const Sector ds = (leaderHere != 0 && squadKnown != 0) ? SectorOf(sqx, sqz) : SectorOf(mm[i].x, mm[i].z);
-        const int corner = (me.x >= 0 && cooplo::RingKind(me.x, me.y, ds.x, ds.y) == cooplo::kRingCorner) ? 1 : 0;
-        const int v = cooplo::AdoptDecide(have, net::IsRecordedOwner(uid, fromPeer) ? 1 : 0, mine, myGen, msg.rows[i].gen, takeRing, corner, linkUp, writesBlocked, cooplo::kKeepMargin);
+        /* T-650 fold 1 (manager decision on review L2): no corner refusal - takeRing reads this game's engine-loaded list, which is the
+           whole answer to "can this game run it"; a corner sector it has loaded is taken like any other (no corner, keepMargin 0) */
+        const int v = cooplo::AdoptDecide(have, net::IsRecordedOwner(uid, fromPeer) ? 1 : 0, mine, myGen, msg.rows[i].gen, takeRing, 0, linkUp, writesBlocked, 0);
         if (v == cooplo::kAdopt) { TakeMemberFromPeer(mm[i], msg.rows[i].gen, &intents, &unresolved); ack.adopted.push_back(uid); ++g_relInAdopted; continue; }
         if (v == cooplo::kAdoptDup)
         {
@@ -1387,12 +1447,6 @@ void ApplyRemoteRelease(const cooplo::ReleaseMsg& msg, unsigned int fromPeer)
         ack.dropped.push_back(uid);
         if (v == cooplo::kStale) { ++g_relInStale; ++stale; continue; }   /* refused - the copy is another game's (or newer): kept */
         ++g_relInDropped;
-        if (have != 0 && takeRing != 0 && corner != 0)
-        {
-            ++g_relCornerRecv;
-            RelLog("[RELEASE] <- id=" + N((long long)msg.id) + " uid=" + N((long long)uid) + " REFUSED: sector " + SectorString(ds) + " is a CORNER of this game's 3x3 (player "
-                   + SectorString(me) + ", keepMargin " + N((long long)cooplo::kKeepMargin) + ") - the copy goes; the giver offers it on or it sleeps there (release cornerRecv " + N(g_relCornerRecv) + ")");
-        }
         if (have != 0) { ApplyRemoteUnload(uid); net::ForgetCopyRecord(uid); }   /* dropped: this game's copy goes now */
     }
     std::vector<char> b;
@@ -1558,35 +1612,56 @@ void HandoffTick()
         }
         const Sector s = SectorOf(lx, lz);
         bool forced = true; const char* reason = "FORCED";
-        // Decision 15 (user, 2026-09-02): ownership is STICKY - a squad stays with whoever runs it for as long as that
-        // instance can simulate it, and moves only when the owner is about to lose it (outside the ring: the engine's
-        // 6-s unload countdown) and the other side holds the sector. No transfer inside an overlap - M-D step 2's
-        // crossing rule (T133-T136) is retired. Protocol 84: the wire's reason code is 1 (forced) here.
-        if (SectorInMyRing(s, kRing)) continue;          // still inside my loaded area: it stays mine
-        std::vector<int> rcv; int cornerOnly = -1;
-        const int nr = ReceiversFor(s, std::vector<int>(), &rcv, &cornerOnly);   /* [a1b2-hd3] design 2.4: the IN_WORLD game whose player's 3x3 holds the squad - its own acceptance rule */
-        if (nr <= 0)   /* -1: no road or a stale table (owner 334 a: no hand-over without the world server); 0: nobody's ring - this game's engine puts it away and the RELEASE decides */
+        // Decision 15 / owner decision 580 (2026-10-09): ownership is STICKY - a squad stays with the game that runs it while this game's
+        // engine keeps it at its spot (EngineKeepsHere). Only once it would not is it offered, and only to an IN_WORLD game the world server's
+        // loaded map shows with the area loaded (the area's holder first when it is one of them, then the lower slot); the receiver's own
+        // loaded-list rule decides the take. Nobody loaded there, or no fresh map: it stays, this game's engine puts it away and the
+        // RELEASE decides. The wire's reason code is 1 (forced) here.
+        /* T-650 fold 2 (T1056 F2): the question is whether THIS game's engine keeps the squad at its spot, read live (EngineKeepsHere: the
+           engine's own +0xB1/+0xB0 flags for the area and its side neighbours) - not the once-a-second loaded list, which still named the
+           area a second after the announce pass had withdrawn the people, and names areas whose edge strip the engine puts away.
+           -1 (unreadable): this pass skips the squad; the next tick decides. */
+        const int keepHere = EngineKeepsHere(lx, lz);
+        if (keepHere < 0) { ++g_keepReadFailForced; continue; }
+        if (keepHere == 1) { g_keepNoted.erase(key); g_niwNoted.erase(key); continue; }
+        const int listedHere = SectorLoadedHere(s) ? 1 : 0;   /* the loaded list still names the area (the squad stands in its edge strip): logged for the run's check */
+        std::vector<int> rcv; int holderSeen = -1, notInWorld = 0, notKeep = 0;
+        const int nr = ReceiversFor(s, lx, lz, std::vector<int>(), &rcv, &holderSeen, &notInWorld, &notKeep);
+        if (notInWorld > 0 && g_niwNoted.insert(key).second) ++g_holderNotInWorld;   /* a game with the area loaded but not IN_WORLD was passed over */
+        if (nr <= 0)
         {
-            if (nr == 0 && cornerOnly >= 0 && g_cornerNoted.insert(key).second)
+            if (g_keepNoted.insert(key).second)
             {
-                ++g_relCornerGiver;
-                RelLog("[RELEASE] forced XFER leader=" + N((long long)key) + " CORNER: sector " + SectorString(s) + " is only a corner of " + SlotText(cornerOnly)
-                       + "'s 3x3 (keepMargin " + N((long long)cooplo::kKeepMargin) + ") - not handed over (release cornerGiver " + N(g_relCornerGiver) + "; once per squad)");
+                if (nr == 0) ++g_holderKeep; else ++g_holderKeepUnknown;
+                if (nr == 0 && notKeep > 0) ++g_keepNotKeep;
+                RelLog("[RELEASE] forced XFER leader=" + N((long long)key) + " KEEP: this game's engine would not keep it at " + N((long long)lx) + "," + N((long long)lz) + " (sector " + SectorString(s)
+                       + (listedHere != 0 ? ", still listed" : ", not listed") + "; player " + SectorString(mine) + ") but "
+                       + (nr == 0 ? (notKeep > 0 ? "no other in-world game's engine would keep it there either (" + N((long long)notKeep) + " with the area loaded)" : std::string("no other in-world game has it loaded"))
+                                  : std::string("the area map is not fresh (or this game's link is down)"))
+                       + " - it stays here; this game's engine puts it away and the RELEASE decides (holder " + N((long long)holderSeen) + ", loaded but not in the world "
+                       + N((long long)notInWorld) + "; releaseHolder keep " + N(g_holderKeep) + " keepUnknown " + N(g_holderKeepUnknown) + "; once per squad)");
             }
             continue;
         }
         const int target = rcv[0];
+        std::map<unsigned int, ForcedTry>::iterator ftry = g_forcedTry.find(key);
+        if (ftry != g_forcedTry.end() && ftry->second.refused != 0)
+        {
+            if (ftry->second.target == target && ftry->second.x == s.x && ftry->second.y == s.y) continue;   /* review MED-1: backed off - that receiver refused it in this sector */
+            g_forcedTry.erase(ftry);   /* the squad's sector or its receiver changed: offered again */
+        }
         Pending p; p.reason = coopsquad::kXferReasonForced; p.sentAt = now; p.sends = 1; p.ap = it->first; p.logged = 1;
         BuildMembers(it->second, &p.members);
         PassHoldElsewhere(key, &p.members, "forced");   /* M7a2 fold 3 [m7a2h-hp2] (T807 GAP 1) */
         PendingKeysRead(&p);   /* [a1b2-hd8] */
         if (coopsquad::PassSendAfterHold((int)p.members.size()) != coopsquad::kPassSendGo) continue;
-        p.targetSlot = target;   /* [a1b2-hd3] design 2.4: the receiver ring pick's game */
+        p.targetSlot = target;   /* the first game with the area loaded (the holder first) */
         if (!net::SendXfer(key, p.reason, &p.members[0], (int)p.members.size(), p.targetSlot)) continue;
-        ++g_xferOut;
+        ++g_xferOut; ++g_holderLeave; if (listedHere != 0) ++g_keepForcedListed;
         g_pending[key] = p;
+        { ForcedTry f; f.target = target; f.x = s.x; f.y = s.y; f.refused = 0; g_forcedTry[key] = f; }   /* its ACK says whether to back off */
         const std::string q(1, (char)34);
-        DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target));
+        DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target) + " keepHere=0 listed=" + N((long long)listedHere));
         DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(key) + "," + q + "members" + q + ":" + N((long long)p.members.size())
                  + "," + q + "sector" + q + ":" + q + SectorString(s) + q + "," + q + "forced" + q + ":" + (forced ? "1" : "0") + "," + q + "reason" + q + ":" + q + reason + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
     }
@@ -1647,22 +1722,22 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
         if (Plaus(lc) && SquadDecisionPos(lc, &sqx, &sqz) == 1) squadKnown = 1;
         else if (leaderTaking != 0) { sqx = tlx; sqz = tlz; squadKnown = 1; }
     }
-    const int squadInRing = (squadKnown != 0 && SectorInMyRing(SectorOf(sqx, sqz), kRing)) ? 1 : 0;
+    const int squadInRing = (squadKnown != 0 && KeepTakeAt(sqx, sqz) == 1) ? 1 : 0;   /* this game's engine keeps the squad at its spot (live), not the once-a-second loaded list */
     const bool isFollow = reason == (unsigned int)coopsquad::kXferReasonFollowLeader;
     const bool logIn = !isFollow || FollowLogChanged(2, leader, (long long)count * 8 + leaderHere * 4 + squadKnown * 2 + squadInRing);   // review M1
     for (int i = 0; i < count; ++i)
     {
         ::Character* c = FindSpawned(m[i].uid);
         if (!Plaus(c)) { ++unknown; ++g_xferInUnknownUid; if (logIn) DebugLog("[XFER] member uid=" + N(m[i].uid) + " has no copy here - NOT taken (the sender keeps it)"); continue; }   /* M7a3f6 [m7a3f6-hb1] M7a3f7: no void here - an offer (even a forced one: the ordinary position hand-over is sent forced too, H1) says nothing of whether the sender still runs the person; only its RELEASE does (A1 build 2) */
-        const int memberInRing = SectorInMyRing(SectorOf(m[i].x, m[i].z), kRing) ? 1 : 0;
+        const int memberInRing = KeepTakeAt(m[i].x, m[i].z) == 1 ? 1 : 0;   /* the live keep read */
         if (coopsquad::XferTakeMember(leaderHere, squadKnown, squadInRing, memberInRing) == 0)
         {
             ++unknown; ++g_xferInOutsideRing;
             if (!logIn) continue;
             if (leaderHere != 0 && squadKnown != 0)
-                DebugLog("[XFER] member uid=" + N(m[i].uid) + " - its squad (leader " + N(leader) + ") stands in " + SectorString(SectorOf(sqx, sqz)) + ", outside my ring - NOT taken (my engine would sleep the squad)");
+                DebugLog("[XFER] member uid=" + N(m[i].uid) + " - its squad (leader " + N(leader) + ") stands in " + SectorString(SectorOf(sqx, sqz)) + ", at a spot this game's engine would not keep - NOT taken (my engine would sleep the squad)");
             else
-                DebugLog("[XFER] member uid=" + N(m[i].uid) + " stands in " + SectorString(SectorOf(m[i].x, m[i].z)) + ", outside my ring - NOT taken (my engine would unload it)");
+                DebugLog("[XFER] member uid=" + N(m[i].uid) + " stands in " + SectorString(SectorOf(m[i].x, m[i].z)) + ", at a spot this game's engine would not keep - NOT taken (my engine would unload it)");
             continue;
         }
         if (net::IsUidMine(m[i].uid)) { ++taken; takenUids.push_back(m[i].uid); continue; }   // duplicate XFER (resend after our ACK was lost): already ours
@@ -1702,7 +1777,8 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
     {
         const unsigned int uid = p.members[k].uid;
         // F447 (T134): the receiver takes only uids it has a live copy of; releasing an untaken uid left a character
-        // that nobody simulated. What the receiver did not name stays ours and is offered again after kUntakenRetrySec.
+        // that nobody simulated. What the receiver did not name stays ours: a forced hand-over then backs off from that receiver
+        // until the squad's sector or its receiver changes (g_forcedTry); a follow-leader one waits kFollowBackoffSec.
         bool taken = false;
         for (int i = 0; i < count; ++i) if (takenUids[i] == uid) { taken = true; break; }
         if (!taken) { WorldsyncCatchupHandoverSettled(uid); /* M7a2 item 2 [m7a2-ho1]: still ours - a catch-up that held it back is answered */ ++kept; ++g_keptUntaken; if (logAck) DebugLog("[XFER] member uid=" + N(uid) + " NOT taken by the receiver (no copy there) - still ours"); continue; }
@@ -1726,6 +1802,22 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
         ++g_released; ++released;
     }
     if (kept > 0 && p.reason == (unsigned int)coopsquad::kXferReasonFollowLeader) g_followBackoff[leader] = NowSec() + kFollowBackoffSec;   // T-1 B1
+    if (p.reason == (unsigned int)coopsquad::kXferReasonForced)   /* T-650 fold 1 (review MED-1): a refused forced hand-over backs off */
+    {
+        std::map<unsigned int, ForcedTry>::iterator ftry = g_forcedTry.find(leader);
+        if (ftry != g_forcedTry.end())
+        {
+            if (kept > 0 && ftry->second.target == p.targetSlot)
+            {
+                ftry->second.refused = 1; ++g_holderBackoff;
+                for (size_t fu = 0; fu < p.members.size(); ++fu) g_forcedRefusedUid[p.members[fu].uid] = leader;   /* the announce pass may withdraw them now */
+                DebugLog("[XFER] forced leader=" + N(leader) + " BACKED OFF from slot " + N((long long)p.targetSlot) + " - it kept " + N(kept) + " member(s) at sector "
+                         + N((long long)ftry->second.x) + "," + N((long long)ftry->second.y) + "; offered again only when the squad's sector or its receiver changes (releaseHolder backoff "
+                         + N(g_holderBackoff) + ")");
+            }
+            else g_forcedTry.erase(ftry);
+        }
+    }
     if (isFollow && kept == 0) { FollowLogReset(0, leader); FollowLogReset(1, leader); }   // settled: the next follow for it logs again
     if (logAck)
     {
@@ -1891,7 +1983,7 @@ void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole)
     }
     if (ap == 0) ap = (void*)c;
     RelBatch& b = g_relBatch[ap];
-    if (b.mem.empty()) { b.keyUid = (leaderUid != 0 && net::IsUidMine(leaderUid)) ? leaderUid : uid; b.sector = SectorOf(dx, dz); }
+    if (b.mem.empty()) { b.keyUid = (leaderUid != 0 && net::IsUidMine(leaderUid)) ? leaderUid : uid; b.sector = SectorOf(dx, dz); b.px = dx; b.pz = dz; }
     b.mem.push_back(rm);
 }
 /* the sweep met a rebuilt person of squad (faction, id) - this game's engine re-created it from its own world data: the squad's asleepHere
@@ -1969,9 +2061,11 @@ std::string HandoffReleaseReportToken()
     for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s) { given += (long long)s->second.given.size(); asleep += (long long)s->second.asleepHere.size(); }
     return "release[sent,adopted,dropped,deferred,asleep,resent,revoked,cancelled]=" + N(g_relSent) + "," + N(g_relAdopted) + "," + N(g_relDropped) + "," + N(g_relDeferred)
            + "," + N(g_relAsleep) + "," + N(g_relResent) + "," + N(g_relRevoked) + "," + N(g_relCancelled) + " releaseOpen=" + N((long long)g_release.size())
-           + " releaseMore[offers,held,next,lateAccepted,ackWrongSender,ackStale,ackUnknown,dupAck,notMine,cornerGiver,cornerRecv,worldCleared,logged]=" + N(g_relOffers) + "," + N(g_relHeld)
+           + " releaseMore[offers,held,next,lateAccepted,ackWrongSender,ackStale,ackUnknown,dupAck,notMine,worldCleared,logged]=" + N(g_relOffers) + "," + N(g_relHeld)
            + "," + N(g_relNext) + "," + N(g_relLateAccepted) + "," + N(g_relAckWrongSender) + "," + N(g_relAckStale) + "," + N(g_relAckUnknown) + "," + N(g_relDupAck) + "," + N(g_relNotMine)
-           + "," + N(g_relCornerGiver) + "," + N(g_relCornerRecv) + "," + N(g_relWorldCleared) + "," + N(g_relLogged)
+           + "," + N(g_relWorldCleared) + "," + N(g_relLogged)
+           + " releaseHolder[offer,none,hold,keep,keepUnknown,leave,notInWorld,backoff]=" + N(g_holderOffer) + "," + N(g_holderNone) + "," + N(g_holderHold) + "," + N(g_holderKeep)
+           + "," + N(g_holderKeepUnknown) + "," + N(g_holderLeave) + "," + N(g_holderNotInWorld) + "," + N(g_holderBackoff)
            + " releaseSkip[inFlight,offThread,unread,player,notAnnounced]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer) + "," + N(g_relSkipNotAnnounced)
            + " releaseFlight[notTaken,abandoned]=" + N(g_relFlightNotTaken) + "," + N(g_relFlightAbandoned)
            + " releaseIn[offers,adopted,dup,dropped,stale,deferred,revokes,puppeted,removed,revokeIgnored]=" + N(g_relInOffers) + "," + N(g_relInAdopted) + "," + N(g_relInDup) + "," + N(g_relInDropped)
@@ -1993,6 +2087,60 @@ std::string HandoffReleaseReportToken()
            + "," + N(g_relRevokeWaitPlayerGone) + "," + N(g_relRevokeOwedPlayerGone) + "," + N(g_relRevokeGoneSlotUnknown);   /* [a1b2f2-hd7] */
 }
 
+/* the announce pass's two inputs (handoff.h) */
+int HandoffOtherInWorldHasArea(float x, float z)
+{
+    std::vector<int> sl(256), bit(256);
+    int holder = -1, n = 0;
+    if (AreaSquadViewTS(SectorOf(x, z), &holder, &sl[0], &bit[0], (int)sl.size(), &n) != 1) return -1;
+    const int me = StoreMySlot();
+    for (int i = 0; i < n; ++i)
+        if (sl[(size_t)i] != me && bit[(size_t)i] == 1 && StoreRosterSlotInWorld(sl[(size_t)i]) == 1) return 1;
+    return 0;
+}
+bool HandoffForcedRefusedFor(unsigned int uid)
+{
+    std::map<unsigned int, unsigned int>::iterator u = g_forcedRefusedUid.find(uid);
+    if (u == g_forcedRefusedUid.end()) return false;
+    std::map<unsigned int, ForcedTry>::const_iterator f = g_forcedTry.find(u->second);
+    if (f != g_forcedTry.end() && f->second.refused != 0) return true;
+    g_forcedRefusedUid.erase(u);   /* the back-off ended (the squad's sector or receiver changed): it may be offered again */
+    return false;
+}
+
+/* A FINAL LEAVE'S NPC (net/session.cpp OnPlayerGone). HandoffGoneFirstReceiver: the area receiver order for this
+   game's copy of uid, asked in the leaver's place (liveowner.h AreaReceiverOrder: every other in-world game with the area loaded whose
+   engine would keep the NPC at its spot, the holder first, then the lower slot - this game among them). Returns k >= 1 (*firstOut =
+   the first slot), 0 = no game has the area loaded, -1 = no answer now (no readable copy, no slot of this game's own, no fresh map).
+   HandoffTakeGone: this game runs the copy from now on - the take a hand-over's receiver makes: the owner record at a gen above every
+   record here, the taker's OWNER_MOVED to every other game, the copy's later withdrawal owed by this game, the local AI drives it.
+   MAIN THREAD, engine writes allowed. */
+/* The order is decided at the squad's decision position (SquadDecisionPos - the leader's squad, as the live hand-over decides), so
+   every member of a squad reads one order and gets one verdict; a copy with no readable squad is decided at its own spot. `tried`:
+   the receivers already passed over (they did not take it in time) - the order is asked without them. */
+int HandoffGoneFirstReceiver(int goneSlot, unsigned int uid, const std::vector<int>& tried, int* firstOut)
+{
+    if (firstOut != 0) *firstOut = -1;
+    if (goneSlot < 0 || StoreMySlot() < 0) return -1;
+    ::Character* c = FindSpawned(uid);
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (!Plaus(c) || !ReadPos(c, &x, &y, &z)) return -1;
+    float px = x, pz = z;
+    if (SquadDecisionPos(c, &px, &pz) != 1) { px = x; pz = z; }
+    std::vector<int> order;
+    int holder = -1, niw = 0, nkp = 0;
+    const int k = ReceiversFor(SectorOf(px, pz), px, pz, tried, &order, &holder, &niw, &nkp, goneSlot);
+    if (k >= 1 && firstOut != 0 && !order.empty()) *firstOut = order[0];
+    return k;
+}
+void HandoffTakeGone(unsigned int uid)
+{
+    net::TakeLocalOwner(uid, 0);   /* 0: a gen above every record here, the leaver's last one included */
+    NoteAnnouncedOnTake(uid);      /* the other games keep their copies: this game's later withdrawal is owed to them */
+    ForgetSweepAdopt(uid);
+    UnpuppetForOwnership(uid);
+}
+
 void ReportHandoff()
 {
     const std::string q(1, (char)34);
@@ -2010,6 +2158,18 @@ void ReportHandoff()
              + N(g_squadLeadSent) + "," + N(g_squadLeadRecv) + "," + N(g_squadLeadApplied) + "," + N(g_squadLeadStale) + "," + N(g_crossingResolved) + "," + N(g_crossingRefused)
              + " myLeadSquads=" + N((long long)g_myLead.size()) + " peerLeadSquads=" + N((long long)g_peerLead.Squads()) + " peerLeadFull=" + N(g_squadLeadFull)
              + SquadCatsReport());   /* T-1 B3 restructure */
+    /* releaseMore / releaseHolder / releaseSkip ride the [net] REPORT token, which T1056's report lines did not show - printed
+       here as well, with the keep counters */
+    DebugLog("[XFER] REPORT releaseMore[offers,held,next,lateAccepted,ackWrongSender,ackStale,ackUnknown,dupAck,notMine,worldCleared,logged]=" + N(g_relOffers) + "," + N(g_relHeld)
+             + "," + N(g_relNext) + "," + N(g_relLateAccepted) + "," + N(g_relAckWrongSender) + "," + N(g_relAckStale) + "," + N(g_relAckUnknown) + "," + N(g_relDupAck) + "," + N(g_relNotMine)
+             + "," + N(g_relWorldCleared) + "," + N(g_relLogged)
+             + " releaseHolder[offer,none,hold,keep,keepUnknown,leave,notInWorld,backoff]=" + N(g_holderOffer) + "," + N(g_holderNone) + "," + N(g_holderHold) + "," + N(g_holderKeep)
+             + "," + N(g_holderKeepUnknown) + "," + N(g_holderLeave) + "," + N(g_holderNotInWorld) + "," + N(g_holderBackoff)
+             + " keep[notKeep,asleepNoKeep,readFailTake,readFailForced,forcedListed]=" + N(g_keepNotKeep) + "," + N(g_keepAsleepNoKeep) + "," + N(g_keepReadFailTake)
+             + "," + N(g_keepReadFailForced) + "," + N(g_keepForcedListed)
+             + " releaseSkip[inFlight,offThread,unread,player,notAnnounced]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer)
+             + "," + N(g_relSkipNotAnnounced)
+             + " release[sent,adopted,asleep]=" + N(g_relSent) + "," + N(g_relAdopted) + "," + N(g_relAsleep) + " releaseOpen=" + N((long long)g_release.size()));
     DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_report" + q + "," + q + "xferOut" + q + ":" + N(g_xferOut) + "," + q + "ackIn" + q + ":" + N(g_ackIn) + "," + q + "released" + q + ":" + N(g_released)
              + "," + q + "abandoned" + q + ":" + N(g_xferAbandoned) + "," + q + "xferIn" + q + ":" + N(g_xferIn) + "," + q + "taken" + q + ":" + N(g_taken) + "," + q + "ackOut" + q + ":" + N(g_ackOut) + "," + q + "pending" + q + ":" + N((long long)g_pending.size()) + "}");
 }

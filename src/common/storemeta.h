@@ -27,6 +27,13 @@
  * start with seq 0 - a sequence number cannot be invented for a record written before there were any, and 1
  * would be a guess that reads as fact. Field 14 is APPENDED, so every reader here still reads by field index.
  *
+ * AN OPTIONAL FIELD 15 ON A v7 LINE, `home`: the group's home building, as the building's position key (the key
+ * the game's residents table and its building resolver use). It is written only when the record has one, so a
+ * line without it is byte for byte the line before the field existed, and it is NOT a new tag: every v7 reader -
+ * this one and the game's index reader in the builds before it - reads by field index with a floor of 14 and
+ * ignores a field past the ones it knows, while a `v8` tag would be refused by all of them and the group would
+ * vanish from their index. A line without it, and every line below v7, reads back as no home.
+ *
  * STORE-FILE FORMAT 6 (B10, design-e46-store 3.5). The same line without the last field:
  *
  *   v6 <writtenAt> <owner> <x> <y> <z> <squadSid> <factionName> <worldId> <posAt> <town> <len> <crc32>
@@ -132,6 +139,7 @@ struct MetaLine
     long long    len;
     unsigned int crc;
     unsigned long long seq;   /* B12 (decision 52): the notebook's own sequence number; 0 below v7 */
+    std::string  home;        /* the group's home building key; "" = none (optional field 15 of a v7 line) */
     MetaLine();
 };
 
@@ -150,6 +158,17 @@ bool MetaEncodeV7(const MetaLine& m, std::string* out);   /* B12: the notebook w
    not digits, for an owner field MetaOwnerFieldValid refuses, and for an empty world id. A trailing CR (a line written on one machine and read
    after a text-mode round trip) is stripped from the last field, from worldId and from town. */
 bool MetaParse(const std::string& line, MetaLine* out);
+
+/* The home building key a record keeps when another write of it arrives: the arriving key when it has one a line can hold (not
+   empty, no TAB, CR or LF), else the one already kept - an older sender carries none, and a group made from its record has no home
+   building until it is given one, so its next record must not erase the key it was made from. */
+std::string MetaHomeMerge(const std::string& kept, const std::string& arriving);
+
+/* a home key as a record arrives on the wire is kept only when a line can hold it (no TAB, CR or LF) and it is no longer
+   than kMetaHomeCap - the game builds the key into a 48-byte box-key buffer (items.cpp kBoxKeyCap), so 47 characters; anything else
+   reads as no key (and MetaHomeMerge then keeps the key already held). */
+const size_t kMetaHomeCap = 47;
+std::string MetaHomeClean(const std::string& home);
 
 /* P8d. WHAT ONE FILE IS, IN THREE ANSWERS, AND THE ONLY THREE THERE ARE. Every reader in the notebook
    produces one of these and nothing else, so no caller can invent a fourth meaning by collapsing two.

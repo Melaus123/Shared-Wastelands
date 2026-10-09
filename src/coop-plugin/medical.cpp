@@ -43,6 +43,8 @@
 #include "../common/spawnage.h"     // T-303: kSpawnFlagDead / kSpawnFlagKo - the SPAWN's owner flags
 #include "../common/prisonwire.h"   // par6 fold (review-par6 #1): MSG_PRISON kind 4 DEATH - the death request to the owner
 #include "../common/uidslots.h"     // the per-copy word tables' slot bookkeeping (hunger, knocked out, dead)
+#include "../common/corpsedecay.h"   // a copy's dead body is held short of the rot limit
+#include "replicate.h"   // PuppetUidsSnapshot - the copies this game holds
 #include <intrin.h>        // C2-b: _ReturnAddress - which caller is applying the damage
 
 #include "coop_log.h"
@@ -63,6 +65,7 @@ static unsigned long long kMig3MedicalUpdate = 0; static coop::AddrReg kMig3Medi
 #include <sstream>
 #include <locale>
 #include <map>   // T-303: the SPAWN deaths still to land
+#include <set>   // the copies pinned
 #include "playerfaction.h"   /* re-check par6 #1: IsPlayerFaction - an unequip kill only happens to a non-player character */
 
 namespace coop {
@@ -946,6 +949,14 @@ struct SpawnDeadEntry
 };
 static std::map<unsigned int, SpawnDeadEntry> g_spawnDeadPending;   // uid -> its entry. MAIN THREAD only.
 
+// A stale copy made again (spawn.cpp RepeatSpawnAct, Rebuild): a waiting SPAWN death's entry describes the OLD body (when it was
+// seen built, whether its first look was applied) and is forgotten; the SPAWN that makes the new body adds its own entry after
+// the copy is made when it says dead (net/session.cpp OnSpawn). The owner's medical words are kept. MAIN THREAD.
+void SpawnDeathForgetCopy(unsigned int uid)
+{
+    g_spawnDeadPending.erase(uid);
+}
+
 bool CopyOwnerSaysDead(unsigned int uid)
 {
     return uid != 0 && OwnerSaysDead(uid);
@@ -1243,6 +1254,119 @@ std::string DestroyBodyLever(unsigned int uid)
     return "error " + head + " " + fail;
 }
 
+// A COPY'S DEAD BODY IS HELD SHORT OF THE GAME'S ROT LIMIT - its owner's DESPAWN is what removes it (see medical.h and
+// src/common/corpsedecay.h). The rot start is Character+0xD0, a float in in-game hours; `now` is the double at +0xA0 of the clock
+// object behind ClockOwnerPtr - the two reads Character::_NV_periodicUpdate makes (0x5CC300 / 1.0.68 0x5CCD90: MOVSS from
+// [RDI+0xD0]; CVTSD2SS of the double the clock accessor 0x66C170 / 0x66CC00 answers, `LEA RAX,[RCX+0xA0]`).
+static unsigned long long kDecayClockRva = 0; static coop::AddrReg kDecayClockRva_reg("ClockOwnerPtr", &kDecayClockRva);   /* a POINTER VARIABLE; Steam_1.0.65 0x212F3C0 */
+const size_t kRotStartOff   = 0xD0;    // Character: the corpse rot start (float, in-game hours; 0 = not started)
+const size_t kDecayClockNowOff = 0xA0; // the clock object: `now` (double, in-game hours)
+const long long kDecayLogFirst = 20;   // pin lines logged; the rest are counted
+static long long g_decayPinned = 0;           // rot starts written
+static long long g_decayUnread = 0;           // a copy whose dead state or rot start could not be read, or a write that faulted
+static std::set<unsigned int> g_decayUids;    // the copies pinned at least once (the count rides the REPORT)
+const size_t kDecayUidsCap = 4096;
+
+// 1 and *now = the game clock's `now`, 0 when the row is unbound or a read faults. No C++ object here (C2712).
+static int DecayClockNowPod(double* now)
+{
+    const unsigned long long at = (kDecayClockRva != 0) ? coop::AddrAbs(kDecayClockRva) : 0;
+    if (at == 0) return 0;
+    __try
+    {
+        void* clk = *(void**)(uintptr_t)at;
+        if (!PlausiblePtr(clk)) return 0;
+        *now = *(const double*)((const char*)clk + kDecayClockNowOff);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// 1 with *dead (hasDied's byte, 1 / 0) and *start (the rot start) read, 0 on a fault. No C++ object here (C2712).
+static int DecayReadPod(::Character* c, int* dead, float* start)
+{
+    if (!PlausiblePtr(c)) return 0;
+    __try
+    {
+        *dead = c->hasDied() ? 1 : 0;
+        *start = *(const float*)((const char*)c + kRotStartOff);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// 1 written, 0 on a fault. No C++ object here (C2712).
+static int DecayWritePod(::Character* c, float start)
+{
+    __try { *(float*)((char*)c + kRotStartOff) = start; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static std::string F3(double v)
+{
+    std::stringstream ss; ss.imbue(std::locale::classic());
+    ss.setf(std::ios::fixed); ss.precision(3); ss << v; return ss.str();
+}
+
+void CorpseDecayTick()
+{
+    if (EngineWritesBlocked()) return;   // no gameplay running, a load in progress or the store tearing down: nothing is written
+    std::vector<unsigned int> uids;
+    PuppetUidsSnapshot(&uids);
+    if (uids.empty()) return;
+    double now = 0.0;
+    if (DecayClockNowPod(&now) == 0) return;   // no clock: nothing is compared, nothing written
+    for (size_t i = 0; i < uids.size(); ++i)
+    {
+        const unsigned int uid = uids[i];
+        if (net::IsUidMine(uid)) continue;
+        ::Character* c = FindSpawned(uid);
+        if (c == 0) continue;
+        int dead = -1;
+        float start = 0.0f;
+        if (DecayReadPod(c, &dead, &start) == 0) { ++g_decayUnread; continue; }
+        float pinned = 0.0f;
+        if (corpsedecay::CopyDecayPin(1, dead, start, now, corpsedecay::kDecayHours, corpsedecay::kCopyMarginHours,
+                                      &pinned) == 0) continue;
+        if (DecayWritePod(c, pinned) == 0) { ++g_decayUnread; continue; }
+        if (g_decayUids.size() < kDecayUidsCap) g_decayUids.insert(uid);
+        if (g_decayPinned++ < kDecayLogFirst)
+            DebugLog("[DECAY] pin uid=" + N(uid) + " start=" + F3(start) + " -> " + F3(pinned) + " now=" + F3(now)
+                     + " (a copy; its owner decides)");
+    }
+}
+
+std::string DecaySoonLever(unsigned int uid, float hours)
+{
+    const std::string head = "decaysoon uid=" + N(uid) + " hours=" + F3(hours);
+    ::Character* c = FindSpawned(uid);
+    int dead = -1;
+    float start = 0.0f;
+    double now = 0.0;
+    const char* why = 0;
+    if (!(hours >= 0.0f && hours < corpsedecay::kDecayHours)) why = "hours must be at least 0 and under the 12-hour rot limit";
+    else if (c == 0) why = "no character for this uid is present on this game";
+    else if (DecayReadPod(c, &dead, &start) == 0) why = "the dead state or the rot start could not be read";
+    else if (dead != 1) why = "the character is not dead";
+    else if (DecayClockNowPod(&now) == 0) why = "the game clock (row ClockOwnerPtr) could not be read";
+    if (why != 0)
+    {
+        DebugLog("[DECAY] " + head + " -> REFUSED - " + why);
+        return "error " + head + " refused: " + why;
+    }
+    const float next = (float)(now - ((double)corpsedecay::kDecayHours - (double)hours));
+    if (DecayWritePod(c, next) == 0)
+    {
+        DebugLog("[DECAY] " + head + " -> NOT written - the write faulted");
+        return "error " + head + " the write faulted";
+    }
+    const std::string line = head + " mine=" + N(net::IsUidMine(uid) ? 1 : 0) + " start=" + F3(start) + " -> " + F3(next)
+                           + " now=" + F3(now) + " (TEST: the game rots it after " + F3(hours)
+                           + " in-game hours unless something moves the start)";
+    DebugLog("[DECAY] " + line);
+    return "ok " + line;
+}
+
 void InstallMedicalProbe()
 {
     // par6 fold (review-par6 #1), stage 7/9: the event-kill caller ranges are address-table rows - armed when every one is bound.
@@ -1440,6 +1564,7 @@ void ReportMedical()
        << " spawnDeadLookApplied=" << N(g_spawnDeadLookApplied)
        << " spawnDeadNoLook=" << N(g_spawnDeadNoLook)
        << " deathHeldForLook=" << N(g_deathHeldForLook)
+       << " decay[pinned,uids,unread]=" << N(g_decayPinned) << "," << N((long long)g_decayUids.size()) << "," << N(g_decayUnread)
        << " spawnDeadPending=" << N((long long)g_spawnDeadPending.size())
        << " copyDeathRefused=" << N(g_copyDeathRefused)
        << " copyDeathRefusedRebuild=" << N(g_copyDeathRefusedRebuild)

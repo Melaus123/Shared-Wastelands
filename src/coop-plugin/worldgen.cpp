@@ -492,7 +492,14 @@ bool detour_destroy(GameWorld* self, RootObject* obj, bool justUnloaded, const c
         const int removalDead = (!justUnloaded && coopremoval::EngineRemovalReasonClass(debugInfo) == coopremoval::kReasonAmbiguous) ? coop::StoreIsDeadPod((void*)obj) : -1;
         coop::NotifyDespawn(uid, obj, justUnloaded, debugInfo, removalDead);
     }
-    return orig_destroy(self, obj, justUnloaded, debugInfo);
+    /* A character whose destroy the engine accepts waits on the kill list; LiveCharacter refuses that address with that handle
+       (spawn.h DoomNote). Its handle is read while the object is whole, and noted only when the engine answered true (false =
+       postponed, still live). */
+    coop::DoomTicket doom;
+    const bool doomCaptured = coop::DoomCapture(obj, &doom);
+    const bool destroyed = orig_destroy(self, obj, justUnloaded, debugInfo);
+    if (destroyed && doomCaptured) coop::DoomNote(doom);
+    return destroyed;
 }
 
 void detour_createCharacterForBuilding(RootObjectFactory* self, Building* b)
@@ -599,6 +606,7 @@ long long WorldGenGatedHeldUnlinked() { return (long long)g_leafGatedHeldUnlinke
 //
 // MAIN THREAD ONLY. Returns false when the hook never installed or the world is not available -
 // the caller reports that case rather than assuming the object went away.
+bool WorldGenDestroyHooked() { return orig_destroy != 0; }
 bool DestroyLocalObject(void* obj)
 {
     if (obj == 0) return false;

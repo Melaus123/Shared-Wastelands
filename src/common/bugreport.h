@@ -1,7 +1,8 @@
 /* src/common/bugreport.h - REPORT A BUG: every pure decision behind the bug report (T-461; owner decisions 364-378).
  *
- * The player writes what happened; the game packs that text, its own current and previous launch logs, Kenshi's crash file
- * when the previous launch crashed, and each nearby player's current log into ONE zip file under kPackLimit bytes, with every
+ * The player writes what happened; the game packs that text, its own logs of this launch and the two launches before it,
+ * Kenshi's crash file when one of those two earlier launches crashed, and each nearby player's current log into ONE zip file
+ * under kPackLimit bytes, with every
  * IP address removed from every log, and posts it to the report relay (a Cloudflare Worker that forwards it to the
  * developers' Discord - tools/relay/bug-report-worker.js). This header holds what can be decided without a game, a window or
  * a network, so the offline suite (src/coop-test/test_main.cpp) can pin it:
@@ -11,11 +12,13 @@
  *   - the compressor: raw DEFLATE (RFC 1951) in independent segments of about kSegRaw raw bytes, each ending byte-aligned,
  *     so the oldest segments of a log can be dropped after compression without compressing again;
  *   - CRC-32 combination, so a log cut at a segment boundary still gets its exact zip CRC;
- *   - the size budget and its cutting order (372): the previous launch's log first, then nearby players' logs, then this
+ *   - the size budget and its cutting order (372, 581): the two earlier launches' logs first (the launch that crashed is
+ *     cut last of the two; with no crash, the log from two launches ago goes first), then nearby players' logs, then this
  *     launch's log, then the crash file, oldest part first within each log;
  *   - the zip and multipart/form-data layouts;
  *   - the nearby-log message pair LOG_ASK / LOG_PART (game-to-game, through the world server) and the bundle it carries;
- *   - which crash file counts as "the last session crashed" (367 a), and when the wait for nearby players ends.
+ *   - which crash file counts, and which of the two earlier launches it ended (367 a, 581), and when the wait for nearby
+ *     players ends.
  *
  * Pure: no global state, no OS call, no MyGUI. C++03 (VS2010 v100): no auto, no nullptr, no range-for.
  */
@@ -55,7 +58,7 @@ const unsigned int kAnswerSlotGapMs = 60000;            /* a game answers one as
 const unsigned int kRefusalLogGapMs = 10000;            /* a refused ask is logged at most once in this long (the rest are counted) */
 const unsigned int kNearbyFirstMs  = 5000;              /* a nearby game that has not started answering by then is left out */
 const unsigned int kNearbyTotalMs  = 20000;             /* and none is waited for longer than this */
-const unsigned int kCrashNearSec   = 600;               /* a crash file this close to the previous log's last line belongs to that launch */
+const unsigned int kCrashNearSec   = 600;               /* a crash file this close to an earlier launch's log's last line belongs to that launch */
 const unsigned int kNameMaxBytes   = 64;                /* a nearby player's name in a bundle */
 
 /* ---------------------------------------------------------------------------------------------------------------------
@@ -611,10 +614,19 @@ inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>*
    THE SIZE BUDGET (372). Each part of the zip is `fixed` bytes that are never cut (its headers, its final block, a whole
    crash file) plus its segments' bytes. While the total is over the limit: the oldest kept segment of the lowest-`order` part
    that still has one is dropped (among parts of equal order, the one with the most kept bytes); when no part has a segment
-   left to drop, a `droppable` part goes whole, lowest order first. Orders: kOrderPrevLog, kOrderNearby, kOrderThisLog,
-   kOrderCrash. The result says, per part, how many leading segments go and whether the part goes whole.
+   left to drop, a `droppable` part goes whole, lowest order first. Orders, cut first to last: kOrderOlderLog, kOrderPrevLog,
+   kOrderNearby, kOrderThisLog, kOrderCrash; kOrderKeep is never cut. The two earlier launches' logs take kOrderOlderLog and
+   kOrderPrevLog by EarlierLogOrder. The result says, per part, how many leading segments go and whether the part goes whole.
    ------------------------------------------------------------------------------------------------------------------ */
-enum { kOrderPrevLog = 0, kOrderNearby = 1, kOrderThisLog = 2, kOrderCrash = 3, kOrderKeep = 9 };
+enum { kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderNearby = 2, kOrderThisLog = 3, kOrderCrash = 4, kOrderKeep = 9 };
+/* The budget order of kept earlier launch `launch`'s log (1 = the previous launch, 2 = the one before it), given which of them
+   the attached crash file ended (`crashLaunch` 1, 2, or 0 = none): the crashed launch's log is cut after the other one; with no
+   crash, or a crash that ended launch 1, the log from two launches ago is cut first. */
+inline int EarlierLogOrder(int launch, int crashLaunch)
+{
+    const int keptLonger = crashLaunch == 2 ? 2 : 1;
+    return launch == keptLonger ? (int)kOrderPrevLog : (int)kOrderOlderLog;
+}
 struct BudgetPart
 {
     unsigned long long fixed;
@@ -777,17 +789,35 @@ inline std::vector<unsigned char> BuildMultipart(const std::string& boundary, co
 }
 
 /* ---------------------------------------------------------------------------------------------------------------------
-   KENSHI'S CRASH FILE (367 a). A crashDump*_x64.zip or .dmp in the game folder belongs to the previous launch when it was
-   written no later than this launch started and within kCrashNearSec of the previous launch's log's last line - the crash ended
-   that launch. Of those, one is attached: a .zip before a .dmp, the newest first. Times are seconds on one clock; `prevLogEnd`
-   0 = there is no previous log (nothing is attached).
+   KENSHI'S CRASH FILE (367 a, 581). The mod keeps the logs of the two launches before this one (copy 1 = launch 1, the
+   previous launch; copy 2 = launch 2, the one before it). A crashDump*_x64.zip or .dmp in the game folder ended kept launch n
+   when it was written within kCrashNearSec of copy n's last line and no later than the next launch began. For launch 1 that
+   bound is this launch's start. For launch 2 it is copy 1's last line (this launch's start when copy 1 is absent): the
+   tightest launch-1 time the mod can read, as its log lines carry no clock time and Windows can give a log re-created under
+   the same name the creation time of the file that had the name before. When both launches fit (launch 1 was shorter than
+   the window), the launch whose last line is closer to the crash file wins; a tie goes to launch 1.
+   Of the crash files that ended a kept launch, one is attached: launch 1's before launch 2's, then a .zip before a .dmp, the
+   newest first. Times are seconds on one clock; a log end of 0 = that copy is absent (no crash is placed in it).
    ------------------------------------------------------------------------------------------------------------------ */
+inline long long CrashDistance(long long crashAt, long long logEnd) { return crashAt >= logEnd ? crashAt - logEnd : logEnd - crashAt; }
+inline bool CrashNear(long long crashAt, long long logEnd)
+{
+    return logEnd > 0 && CrashDistance(crashAt, logEnd) <= (long long)kCrashNearSec;
+}
+/* Which kept earlier launch a crash file written at `crashAt` ended: 1, 2, or 0 = neither. */
+inline int CrashLaunch(long long crashAt, long long thisLaunchStart, long long log1End, long long log2End)
+{
+    if (crashAt <= 0 || crashAt > thisLaunchStart) return 0;
+    const long long launch1Bound = log1End > 0 ? log1End : thisLaunchStart;
+    const bool in1 = CrashNear(crashAt, log1End);
+    const bool in2 = crashAt <= launch1Bound && CrashNear(crashAt, log2End);
+    if (in1 && in2) return CrashDistance(crashAt, log2End) < CrashDistance(crashAt, log1End) ? 2 : 1;
+    return in1 ? 1 : (in2 ? 2 : 0);
+}
+/* Launch 1's test alone: did a crash file written at `crashAt` end the previous launch? */
 inline bool CrashFromLastLaunch(long long crashAt, long long prevLogEnd, long long thisLaunchStart)
 {
-    if (crashAt <= 0 || prevLogEnd <= 0) return false;
-    if (crashAt > thisLaunchStart) return false;
-    const long long d = crashAt - prevLogEnd;
-    return d <= (long long)kCrashNearSec && d >= -(long long)kCrashNearSec;
+    return CrashLaunch(crashAt, thisLaunchStart, prevLogEnd, 0) == 1;
 }
 /* "crashDump1.0.68_x64.zip" -> 2, "...dmp" -> 1, anything else 0 (a zip is preferred over a dump of the same crash). */
 inline int CrashFileKind(const std::string& name)

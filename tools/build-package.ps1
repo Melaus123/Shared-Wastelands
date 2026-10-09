@@ -109,7 +109,14 @@ try {
         while ($queue.Count -gt 0) {
             $r = $queue.Dequeue()
             foreach ($m in @(Select-String -LiteralPath (Join-Path $Tree $r) -Pattern '^\s*#\s*include\s+"([^"]+)"')) {
-                $c = 'src/common/' + (Split-Path $m.Matches[0].Groups[1].Value -Leaf)
+                # the include as written, beside the file that includes it (../coop-plugin/u8file.h from src/coop-store); else src/common/<name>
+                $inc = $m.Matches[0].Groups[1].Value -replace '\\', '/'
+                $parts = New-Object System.Collections.Generic.List[string]
+                foreach ($p in (((Split-Path $r -Parent) -replace '\\', '/') + '/' + $inc).Split('/')) {
+                    if ($p -eq '..') { if ($parts.Count -gt 0) { $parts.RemoveAt($parts.Count - 1) } } elseif ($p -ne '.' -and $p -ne '') { $parts.Add($p) }
+                }
+                $c = $parts -join '/'
+                if (-not (Test-Path -LiteralPath (Join-Path $Tree $c))) { $c = 'src/common/' + (Split-Path $inc -Leaf) }
                 if (-not $seen.ContainsKey($c) -and (Test-Path -LiteralPath (Join-Path $Tree $c))) { $seen[$c] = 1; $queue.Enqueue($c) }
             }
         }
@@ -132,11 +139,11 @@ try {
         if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { $problems.Add("MISSING: $($b.Src) is not built in this tree - run $($b.Build)"); continue }
         $inputs = @(Get-Tracked $b.Dirs | Where-Object { $_ -match $codeExt -and $_ -notlike 'src/coop-plugin/addresses/*' })
         if ($b.Walk) {
-            # what it compiles: its own folder's sources plus every ..\common\*.cpp its build.bat names (SharedWastelandsServer.exe
-            # compiles clockmath/storemeta/cfgtext), then every src\common header those reach through #include
+            # what it compiles: its own folder's sources plus every ..\common\*.cpp and ..\coop-plugin\*.cpp its build.bat names
+            # (SharedWastelandsServer.exe compiles clockmath/storemeta/cfgtext and the plugin's u8file.cpp), then every header those reach through #include
             $bat = Join-Path $Tree (($b.Dirs[0] -replace '/', '\') + '\build.bat')
             $seeds = @(if (Test-Path -LiteralPath $bat) {
-                    Select-String -LiteralPath $bat -Pattern '\.\.\\common\\([A-Za-z0-9_]+\.cpp)' -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { 'src/common/' + $_.Groups[1].Value } })
+                    Select-String -LiteralPath $bat -Pattern '\.\.\\(common|coop-plugin)\\([A-Za-z0-9_]+\.cpp)' -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { 'src/' + $_.Groups[1].Value + '/' + $_.Groups[2].Value } })
             $inputs = @($inputs + @($seeds | Select-Object -Unique | Where-Object { Test-Path -LiteralPath (Join-Path $Tree $_) }))
             $inputs = @($inputs + (Get-CommonIncludes @($inputs | Where-Object { $_ -match '\.(c|cc|cpp|h|hpp)$' })) | Select-Object -Unique)
         }

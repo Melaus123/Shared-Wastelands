@@ -21,4 +21,10 @@ void FarmForgetWorld();                               // world teardown (from Bu
 void FarmNoteRecv(const coopfarm::FarmMsg& m, unsigned int fromPeer);   // MAIN THREAD (session dispatch): a decoded FARM / FARM_OP, kept
 std::string FarmTestArm(const std::string& arg);      // MAIN THREAD: `buildtest farm list | grow <key-substring> <age> | harvest <key-substring> [amount]` (test-only)
 void ReportFarm();                                    // one [FARM] REPORT line (from ReportBuild)
+// ANY THREAD (items.cpp detour_prodOperate): a worker's step on a production building this game does not write (or whose
+// writer is not named yet) - its work is kept for FarmTick to send to the writer as MINE_OP. 1 kept (the caller does not run
+// the step); 0 not kept (no key, the table full, an unusable amount: the caller runs it).
+int  MineStepRelay(void* pb, void* who, float amount);
+// ANY THREAD: 1 while another player is in this world (FarmTick's link test)
+int  MineLinked();
 }

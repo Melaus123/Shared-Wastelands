@@ -163,7 +163,7 @@ static bool MetaEncodeTagged(const char* tag, int seqField, const MetaLine& m, s
     if (!out) return false;
     if (m.worldId.empty()) return false;
     if (!FieldIsClean(m.squadSid) || !FieldIsClean(m.factionName) ||
-        !FieldIsClean(m.worldId)  || !FieldIsClean(m.town)) return false;
+        !FieldIsClean(m.worldId)  || !FieldIsClean(m.town) || (seqField != 0 && !FieldIsClean(m.home))) return false;
 
     /* RE_Kenshi's locale mangles numbers (F030): the stream is imbued with the classic locale so a thousands
        separator can never reach a file another program parses with atof. */
@@ -176,6 +176,7 @@ static bool MetaEncodeTagged(const char* tag, int seqField, const MetaLine& m, s
     std::sprintf(hex, "%08x", (unsigned int)(m.len > 0 ? m.crc : 0u));
     o << hex;
     if (seqField != 0) o << "\t" << m.seq;   /* B12: field 14, appended - see storemeta.h */
+    if (seqField != 0 && !m.home.empty()) o << "\t" << m.home;   /* field 15, only when the record has a home - see storemeta.h */
     o << "\n";
     *out = o.str();
     return true;
@@ -183,6 +184,14 @@ static bool MetaEncodeTagged(const char* tag, int seqField, const MetaLine& m, s
 bool MetaEncodeV5(const MetaLine& m, std::string* out) { return MetaEncodeTagged("v5", 0, m, out); }
 bool MetaEncodeV6(const MetaLine& m, std::string* out) { return MetaEncodeTagged("v6", 0, m, out); }
 bool MetaEncodeV7(const MetaLine& m, std::string* out) { return MetaEncodeTagged("v7", 1, m, out); }
+std::string MetaHomeMerge(const std::string& kept, const std::string& arriving)
+{
+    return (!arriving.empty() && FieldIsClean(arriving)) ? arriving : kept;
+}
+std::string MetaHomeClean(const std::string& home)
+{
+    return (home.size() <= kMetaHomeCap && FieldIsClean(home)) ? home : std::string();
+}
 
 bool MetaParse(const std::string& line, MetaLine* out)
 {
@@ -246,6 +255,8 @@ bool MetaParse(const std::string& line, MetaLine* out)
             m.seq = m.seq * 10ULL + d;
         }
     }
+    /* field 15 of a v7 line: the home building key, optional (storemeta.h); StripCr above has run on it when it is the last field */
+    if (version >= 7 && f.size() >= 15) m.home = f[14];
     if (m.worldId.empty()) return false;
     *out = m;
     return true;

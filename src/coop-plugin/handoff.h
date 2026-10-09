@@ -45,6 +45,15 @@ void HandoffRevokesPlayerGone(int slot);   /* fold 2 [a1b2f2-hh0] [review G2]: M
 void HandedOverUnmark(void* faction, const std::string& id, int why);   /* why 0 = a member taken back by hand-over, 1 = adopted by the sweep */
 std::string HandoffReleaseReportToken();     /* [a1b2-hh2]: the release[...] / index[...] tokens of the [net] REPORT line */
 bool HandoffPendingHas(unsigned int uid);   /* M4 fold 2 (re-check L-C): this game's XFER naming uid awaits its ACK - MAIN THREAD */
+/* T-650 fold 2 (the announce pass's hold, worldsync.cpp): MAIN THREAD. HandoffOtherInWorldHasArea - an IN_WORLD game other than this one
+   has the area of (x, z) loaded on the world server's map (1 yes, 0 no, -1 no fresh map); HandoffForcedRefusedFor - this game's forced
+   hand-over of uid's squad was refused and is backed off now (the record ends when the squad's sector or receiver changes). */
+int HandoffOtherInWorldHasArea(float x, float z);
+bool HandoffForcedRefusedFor(unsigned int uid);
+/* a final leaver's NPC (handoff.cpp): the area receiver order asked in the leaver's place at the squad's decision position, without
+   the receivers already passed over (k, first slot), and this game's take */
+int HandoffGoneFirstReceiver(int goneSlot, unsigned int uid, const std::vector<int>& tried, int* firstOut);
+void HandoffTakeGone(unsigned int uid);
 void ReportHandoff();
 // `playerteleport dx dz`: move the watched player by (dx, dz) with the engine's own placement - the harness's way
 // to make the host's engine unload a sector while the client still holds it.

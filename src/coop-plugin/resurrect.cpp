@@ -1132,7 +1132,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     // 5. the SPAWN on the normal road
     ::Faction* f = c->getOwnerFactionDirect();
     SendContextFor(uid, c);   // CONTEXT before SPAWN, as every announce: the copy is built in the squad's context
-    const bool sent = net::SendSpawn(uid, s.templateName, pos.x, pos.y, pos.z, WireFactionName(f), false, c);
+    const bool sent = net::SendSpawn(uid, s.templateName, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c);
     if (sent) NoteAnnouncedOnTake(uid); else NoteNotAnnounced(uid);
     RecordCopy look;
     const bool haveLook = !s.look.empty() && DeserialiseRecord(s.look, 0, &look);

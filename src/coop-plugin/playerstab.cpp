@@ -27,6 +27,8 @@
 #include "relations.h"
 #include "store.h"
 #include "team.h"   /* T-546 step 4: TeamSameAnyThread - towards a teammate only ALLY */
+#include "chat.h"   /* MESSAGE opens the chat with TO set to the selected player */
+#include "../common/chatwire.h"   /* MESSAGE's word */
 #include "../common/teamscreens.h"   /* the faction screens: the bottom line's actions, the boxes' words */
 #include "soak.h"
 #include "net/session.h"
@@ -77,6 +79,7 @@ const char* const kLineName   = "SWPlayersStanceLine";
 const char* const kSelectName = "SWPlayersSelectLine";
 const char* const kBtnName[3] = { "SWPlayersAllyBtn", "SWPlayersNeutralBtn", "SWPlayersHostileBtn" };
 const char* const kActName[2] = { "SWPlayersLeftActBtn", "SWPlayersRightActBtn" };   /* the bottom line's action buttons */
+const char* const kMsgName = "SWPlayersMessageBtn";   /* MESSAGE: the chat with TO set to the selected player */
 /* the one box this module shows at a time: SET HOSTILE, FACTION INVITATION, LEAVE / REMOVE FROM / DISBAND FACTION, FACTION */
 const char* const kBoxName    = "SWFactionBox";
 const char* const kBoxText    = "SWFactionBoxText";
@@ -109,6 +112,8 @@ std::string g_boxTeam, g_boxWho, g_boxText;   /* the faction and the player the 
 /* the bottom line's two action buttons (left, right), the action each shows (teamscreen::kAct*), and the view last applied */
 MyGUI::Button* g_act[2] = { 0, 0 };
 int g_actShown[2] = { 0, 0 };
+MyGUI::Button* g_msg = 0;            /* MESSAGE, at the right end of the text line */
+int g_msgShown = -1;
 std::string g_shownView;
 teamscreen::View g_view;
 bool g_viewSelected = false;
@@ -185,6 +190,7 @@ public:
         if (g_select != 0 && Inside(g_select, w)) g_select = 0;
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0 && Inside(g_btn[k], w)) g_btn[k] = 0;
         for (int k = 0; k < 2; ++k) if (g_act[k] != 0 && Inside(g_act[k], w)) g_act[k] = 0;
+        if (g_msg != 0 && Inside(g_msg, w)) g_msg = 0;
     }
 };
 /* registered once, before our first widget is made; without it no tab is added. The listener is made once on the heap and
@@ -353,6 +359,7 @@ void ForgetTab()
 {
     g_act[0] = g_act[1] = 0; g_actShown[0] = g_actShown[1] = 0; g_shownView.clear(); g_view = teamscreen::View(); g_viewSelected = false;
     g_tabs = 0; g_item = 0; g_list = 0; g_line = 0; g_select = 0; g_btn[0] = g_btn[1] = g_btn[2] = 0;
+    g_msg = 0; g_msgShown = -1;
     g_rows.clear(); g_selSlot = -1; g_shownLine.clear(); g_shownSelect.clear(); g_shownTicked = -2; g_shownSelected = -1; g_shownLocked = -1; g_rowsEpoch = -1;
 }
 
@@ -362,6 +369,7 @@ void OnStanceClicked(MyGUI::Widget* w);
 void OnBoxCancel(MyGUI::Widget* w);
 void OnBoxConfirm(MyGUI::Widget* w);
 void OnActClicked(MyGUI::Widget* w);
+void OnMessageClicked(MyGUI::Widget* w);
 
 /* THE PAGE (mock-up A4.2): the table (Kenshi's own Kenshi_MultiListBox, as the Load Game list) over the tab's height, the
    stance line (painted text, the window's label face) and the three tick buttons (Kenshi_TickButton1) along the bottom. Sizes
@@ -430,6 +438,26 @@ bool BuildPage(MyGUI::TabItem* item)
         a->setCaption(MyGUI::UString(""));
         a->eventMouseButtonClick += MyGUI::newDelegate(OnActClicked);
         a->setVisible(false);
+    }
+    /* MESSAGE: at the right end of the text line above the buttons, the same place for every selected player (the bottom row is
+       full when the stance buttons show); the line's text ends a gap before it. The same style as the action buttons. */
+    {
+        const int msgW = Clamp(W * 14 / 100, 100, 200);
+        const int msgX = W - gap - msgW;
+        const int msgY = lineY + (lineH - btnH) / 2;
+        MyGUI::Widget* mw = Mk(item, "Button", "Kenshi_Button2", msgX, msgY, msgW, btnH, MyGUI::Align::Right | MyGUI::Align::Bottom, kMsgName);
+        MyGUI::Button* m = mw != 0 ? mw->castType<MyGUI::Button>(false) : 0;
+        if (m == 0) return false;
+        g_msg = m; g_msgShown = -1;
+        m->setTextColour(Lit());
+        m->setCaption(MyGUI::UString(chatwire::MessageWord()));
+        m->eventMouseButtonClick += MyGUI::newDelegate(OnMessageClicked);
+        m->setVisible(false);
+        const MyGUI::IntCoord lc = lt->getCoord();
+        const int lineW = msgX - gap - lc.left;
+        lt->setCoord(MyGUI::IntCoord(lc.left, lc.top, lineW > 1 ? lineW : 1, lc.height));
+        DebugLog("[UI] rect playerstab message x=" + S(msgX) + " y=" + S(msgY) + " w=" + S(msgW) + " h=" + S(btnH) + " on the text line (its text x="
+                 + S(lc.left) + " w=" + S(lineW) + "; clear of the bottom buttons: " + (msgY + btnH <= btnY ? "yes" : "NO") + ")");
     }
     DebugLog("[UI] rect playerstab actions w=" + S(actW) + " h=" + S(btnH) + " left x=" + S(gap) + " right x=" + S(W - actW - gap) + " y=" + S(btnY)
              + " stance buttons x=" + S(gap) + ".." + S(gap + 3 * btnW + 2 * gap) + " (clear of the right-hand button: " + (gap + 3 * btnW + 2 * gap <= W - actW - gap ? "yes" : "NO") + ")");
@@ -514,6 +542,27 @@ teamscreen::View ViewNow(const std::vector<playerstab::RowView>& rows, int selSl
     return teamscreen::ViewFor(i >= 0, s);
 }
 std::string Num(int v) { return S(v); }
+/* `s` on the line, cut at a whole character and ended with "..." when it is wider than the line (a long faction name runs up to
+   MESSAGE); a cut never leaves half of an escaped '#' ("##") */
+void FitCaption(MyGUI::TextBox* t, const std::string& s)
+{
+    t->setCaption(MyGUI::UString(s.c_str()));
+    const int w = t->getWidth();
+    if (w <= 1 || t->getTextSize().width <= w) return;
+    std::string cut = s;
+    while (!cut.empty())
+    {
+        size_t n = cut.size() - 1;
+        while (n > 0 && ((unsigned char)cut[n] & 0xC0) == 0x80) --n;   /* back to the start of the last character */
+        cut.erase(n);
+        size_t hashes = 0;
+        for (size_t k = cut.size(); k > 0 && cut[k - 1] == '#'; --k) ++hashes;
+        if (hashes % 2 == 1) cut.erase(cut.size() - 1);
+        t->setCaption(MyGUI::UString((cut + "...").c_str()));
+        if (t->getTextSize().width <= w) return;
+    }
+}
+
 void ApplyBottom(const std::vector<playerstab::RowView>& rows)
 {
     const playerstab::Bottom b = playerstab::BottomFor(rows, g_selSlot);
@@ -530,7 +579,7 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
         g_shownView = sig;
         lt->setVisible(b.selected && !line.empty());
         st->setVisible(!b.selected);
-        if (b.selected) lt->setCaption(MyGUI::UString(line.c_str()));
+        if (b.selected) FitCaption(lt, line);
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0) g_btn[k]->setVisible(b.selected && v.stance);
         const int acts[2] = { v.left, v.right };
         for (int k = 0; k < 2; ++k)
@@ -543,6 +592,7 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
         DebugLog("[PLAYERS] bottom line: '" + (b.selected ? line : std::string(playerstab::kSelectLine)) + "' stance buttons " + (b.selected && v.stance ? "shown" : "hidden")
                  + ", left '" + teamscreen::ActionCaption(v.left) + "', right '" + teamscreen::ActionCaption(v.right) + "' (selected slot " + S(g_selSlot) + ", role " + S(g_ctx.role) + ")");
     }
+    if (g_msg != 0 && (b.selected ? 1 : 0) != g_msgShown) { g_msgShown = b.selected ? 1 : 0; g_msg->setVisible(b.selected); }   /* MESSAGE: while a player is selected */
     if (b.ticked != g_shownTicked)
     {
         g_shownTicked = b.ticked;
@@ -989,6 +1039,14 @@ void OnStanceClicked(MyGUI::Widget* w) { __try { StanceCatching(w); } __except (
 void OnBoxCancel(MyGUI::Widget*) { g_boxPressedOn = g_box; ::InterlockedExchange(&g_boxPress, 1); }
 void ActCatching(MyGUI::Widget* w) { try { ActBody(w); } catch (...) { ++g_throws; } }
 void OnActClicked(MyGUI::Widget* w) { __try { ActCatching(w); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
+void MessageBody()
+{
+    if (g_selSlot < 0) return;
+    DebugLog("[PLAYERS] MESSAGE pressed for slot " + S(g_selSlot));
+    coop::ChatOpenTo(g_selSlot);
+}
+void MessageCatching() { try { MessageBody(); } catch (...) { ++g_throws; } }
+void OnMessageClicked(MyGUI::Widget*) { __try { MessageCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
 void OnBoxConfirm(MyGUI::Widget*) { g_boxPressedOn = g_box; ::InterlockedExchange(&g_boxPress, 2); }
 void RowCatching(MyGUI::MultiListBox* list, size_t index) { try { RowBody(list, index); } catch (...) { ++g_throws; } }
 void OnRowPicked(MyGUI::MultiListBox* list, size_t index) { __try { RowCatching(list, index); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
@@ -1030,6 +1088,15 @@ void ShownSeh() { __try { ShownCatching(); } __except (EXCEPTION_EXECUTE_HANDLER
 /* ---- the TEST-ONLY lever: each step fires the control's own handler, as a mouse would, and only where a mouse could ---- */
 std::string LeverBody(const std::string& args)
 {
+    /* the command channel hands over the rest of its line with the space after the verb: the word is compared without it */
+    const size_t first = args.find_first_not_of(" \t\r\n");
+    const std::string word = first == std::string::npos ? std::string() : args.substr(first, args.find_last_not_of(" \t\r\n") - first + 1);
+    if (word == "message")
+    {
+        if (!Reachable(g_msg)) { DebugLog("[PLAYERS] lever message REFUSED: no MESSAGE button on screen (no player selected?)"); return "error playerstab no-message"; }
+        g_msg->eventMouseButtonClick(g_msg);
+        return "ok playerstab message";
+    }
     const playerstab::Lever l = playerstab::ParseLever(args);
     if (l.kind == playerstab::kLeverBad) return "error playerstab usage";
     if (l.kind == playerstab::kLeverReport) { coop::ReportPlayersTab(); return "ok playerstab"; }
@@ -1099,6 +1166,38 @@ void PlayersTabForgetWorld()
 }
 
 std::string PlayersTabCommand(const std::string& args) { return LeverCatching(args); }
+
+bool PlayersTabPlayerWords(int slot, std::string* name, std::string* faction)
+{
+    name->clear(); faction->clear();
+    if (slot < 0) return false;
+    try
+    {
+        std::string nm;
+        if (StoreRosterNameOf(slot, &nm) == 1 && !nm.empty()) { *name = nm; g_names[slot] = nm; }
+        else
+        {
+            std::map<int, std::string>::const_iterator it = g_names.find(slot);
+            *name = it != g_names.end() ? it->second : TeamPlayerName(slot);
+        }
+        if (name->empty()) *name = coopslot::PlaceholderName(slot);
+        if (!g_uiDead)
+        {
+            const std::vector<Other> others = OtherPlayers();
+            for (size_t i = 0; i < others.size(); ++i)
+                if (others[i].slot == slot && Plaus(others[i].f))
+                {
+                    std::string line2;
+                    bool mate = false;
+                    TeamTagFor(slot, FactionWords(others[i].f), &line2, &mate);   /* in a faction of players: its name */
+                    *faction = line2;
+                    break;
+                }
+        }
+    }
+    catch (...) { ++g_throws; return false; }
+    return true;
+}
 
 void PlayersTabRemovedWhileAway(const std::string& teamName)
 {

@@ -16,7 +16,7 @@
      3.16 OrphanCopyAction    - a copy with no owner record: kept for 20 s of link-up time, then withdrawn
      3.15 codecs              - ROSTER (70; HASH / CHECK / ANSWER, chunked under the envelope cap), RECEIPT (71), UNLOAD / DESPAWN with
                                 seq + gen + expected receivers, OWNER_MOVED 16 bytes with gen, the XFER generation tail
-   BUILD 2 (the switch-over, [a1b2-lo0], the block at the end): 3.2 AdoptDecide, 3.3 ReceiverRingPick (+ RingKind), 3.4 ReleaseStep /
+   BUILD 2 (the switch-over, [a1b2-lo0], the block at the end): 3.2 AdoptDecide, 3.3 RingKind (ReceiverRingPick retired: T-650 AreaReceiverOrder), 3.4 ReleaseStep /
    PutAwayDuringFlight / ReleaseOfferGen, 3.10 GiverSettleOnAck, the late-adopter and REVOKE rules, 3.11 SquadGivenEffective and the
    RELEASE (68) / RELEASE_ACK (69) codecs. */
 #ifndef COOP_LIVEOWNER_H
@@ -420,7 +420,9 @@ inline int AnswerSlotOk(int status, unsigned int slot, unsigned int maxSlot) { r
 /* ==== M7a A1 BUILD 2 [a1b2-lo0] (design 2.4, 2.5, 3.2-3.4, 3.10, 3.11, 1.3) - THE SWITCH-OVER: RELEASE / adopt ======================== */
 /* keepMargin (manager decision 2026-10-02, design 7 item 7): run T821's P119 showed this game's engine putting squads away in a CORNER
    sector of its own player's 3x3 on both games (A 737.5 s: 44,11 side x2 and 44,10 corner; B 811.2-811.4 the same shape) - a corner is
-   neither offered (ReceiverRingPick) nor adopted (AdoptDecide). 0 would be the whole ring. */
+   neither offered nor adopted. 0 would be the whole ring. NO LONGER IN USE since the T-650 fold (manager, 2026-10-09): the giver
+   offers by the world server's loaded map (AreaReceiverOrder) and the receiver takes by its engine's loaded list, so the receiver
+   passes no corner and keepMargin 0 to AdoptDecide; the constant stays for AdoptDecide's offline tests. */
 const int kKeepMargin = 1;
 const double kReleaseCandidateSec = 5.0;    /* a candidate silent this long (link-up-and-fresh-table time only) is skipped [review F5] */
 const double kReleaseResendSec = 1.0;       /* an unanswered offer is sent again (same id: the receiver answers a repeat the same way) */
@@ -452,33 +454,6 @@ inline int RingKind(int px, int py, int sx, int sy)
     if (dx == 0 && dy == 0) return kRingSelf;
     if (dx <= 1 && dy <= 1) return (dx == 0 || dy == 0) ? kRingSide : kRingCorner;
     return kRingOut;
-}
-/* 3.3 the receivers of a squad standing in (sx, sy): every IN_WORLD game but this one whose published player sector is within `ring`
-   (Chebyshev) of it - with keepMargin 1 not as a corner - and that was not tried yet; nearest first, then the lower slot. The rows are
-   ONE fresh player-sector table (the caller passes none when it is not fresh). Returns how many slots were written to order (<= cap). */
-struct RingRow { int slot, x, y, inWorld; RingRow() : slot(-1), x(-1), y(-1), inWorld(0) {} };
-inline int ReceiverRingPick(const RingRow* rows, int n, int sx, int sy, int mySlot, int ring, int keepMargin, const int* tried, int nTried, int* order, int cap)
-{
-    std::vector<int> dist, slot;   /* every eligible game, kept sorted (distance, then slot); the first `cap` are returned */
-    for (int i = 0; i < n && rows != 0; ++i)
-    {
-        const RingRow& r = rows[i];
-        if (r.slot < 0 || r.slot == mySlot || r.inWorld == 0 || r.x < 0 || r.y < 0) continue;
-        bool skip = false;
-        for (int t = 0; t < nTried && tried != 0 && !skip; ++t) if (tried[t] == r.slot) skip = true;
-        for (size_t o = 0; o < slot.size() && !skip; ++o) if (slot[o] == r.slot) skip = true;
-        if (skip) continue;
-        const int c = Cheb(r.x, r.y, sx, sy);
-        if (c > ring) continue;
-        if (keepMargin >= 1 && RingKind(r.x, r.y, sx, sy) == kRingCorner) continue;
-        size_t at = slot.size();
-        while (at > 0 && (dist[at - 1] > c || (dist[at - 1] == c && slot[at - 1] > r.slot))) --at;
-        dist.insert(dist.begin() + (long)at, c);
-        slot.insert(slot.begin() + (long)at, r.slot);
-    }
-    int k = 0;
-    for (size_t i = 0; i < slot.size() && k < cap && order != 0; ++i) order[k++] = slot[i];
-    return k;
 }
 /* 3.4 one open release's next step (the giver, each pass). The candidate clock runs only while this game's notebook link is up AND the
    player table is fresh [review F5] - the caller adds time to it only then; with either down the release HOLDS (owner 334 a). */
@@ -635,6 +610,76 @@ inline bool ReleaseAckDecode(const char* p, size_t n, ReleaseAckMsg* out)
     for (unsigned int i = 0; i < nd; ++i, q += 4) out->dropped.push_back(GetU32(q));
     for (unsigned int i = 0; i < nf; ++i, q += 4) out->deferred.push_back(GetU32(q));
     return true;
+}
+
+/* T-650 fold 1 (owner decision 580, 2026-10-09: decision 15 kept - a squad is handed over only when it leaves its runner's engine-loaded
+   list, and only to a game that has the area loaded). AreaReceiverOrder - THE GAMES THAT MAY RUN A SQUAD STANDING IN AN AREA, in offer
+   order. Used by the forced hand-over (once the squad left this game's loaded list) and by the RELEASE after this game's engine put it away.
+   rows = one locked read of the world server's area map for the area (coop::AreaSquadViewTS): each seated slot, whether it is IN_WORLD on
+   this game's roster, and its bit in the effective loaded map (1 set, 0 clear, -1 read stale); mapFresh = that map is fresh; holderSlot =
+   the slot the map names as the area's holder (-1 none); tried = slots this release offered already.
+   Returns -1 = HOLD (no fresh map, a row read stale, or this game has no slot of its own yet - review L3: nobody can say who has the area);
+   else the number of slots written to order (<= cap): every other IN_WORLD game whose bit is set and that was not tried, the holder first
+   when it is one of them, then the lower slot first. 0 = no other in-world game has the area loaded (the forced hand-over keeps the squad;
+   the RELEASE ends asleep). Naming the holder alone never makes a receiver: the world server keeps a holder for a while after its game
+   stopped listing the area (review HIGH-1). *notInWorld (may be 0) = games skipped only because they are not IN_WORLD.
+   The receiver's own engine-loaded check stays the final say: a map lagging it costs one refused offer (the RELEASE adds it to tried). */
+/* T-650 fold 2 (T1056; Read from the engine's ActivePlatoon frame check 0x4FE140 and the keep-rectangle builder 0xA088A0, exe constants
+   Confirmed). THE ENGINE'S KEEP RULE: each frame a squad's CENTRE is tested against its area's square widened by 10 on every side, then
+   narrowed by 170 on each SIDE whose neighbour area is not loaded (the neighbour's ZoneMap +0xB1 and +0xB0 both clear; diagonal areas are
+   never read) - a centre within 160 of such a side is put away after a 4 s grace even inside a loaded area. EngineKeepsAt asks that
+   question with a margin: 1 = the area is loaded and, for each side, the neighbour is loaded or (x, z) is at least kEngineEdgeStrip +
+   margin from that side; 0 = not kept; -1 = the area's own flag, or a side flag that would decide, unreadable (< 0).
+   minX / minZ = the area's low corner, size = its side (AreaMinUnits / kAreaSizeUnits); W = low x, E = high x, S = low z, N = high z. */
+const float kEngineEdgeStrip = 160.0f;    /* 170 narrowed - 10 widened (the engine's own constants) */
+const float kKeepMarginUnits = 250.0f;    /* tuned from the run's P119 samples (manager decision 2026-10-09) */
+const float kAreaSizeUnits = 4608.0f, kAreaOriginUnits = 147456.0f;   /* zones.cpp kSectorSize / kSectorOrigin */
+inline float AreaMinUnits(int index) { return (float)index * kAreaSizeUnits - kAreaOriginUnits; }
+inline int EngineKeepsAt(float x, float z, float minX, float minZ, float size, int selfLoaded, int wLoaded, int eLoaded, int sLoaded, int nLoaded, float margin)
+{
+    if (selfLoaded <= 0) return selfLoaded < 0 ? -1 : 0;
+    const float strip = kEngineEdgeStrip + margin;
+    const float dist[4] = { x - minX, (minX + size) - x, z - minZ, (minZ + size) - z };
+    const int side[4] = { wLoaded, eLoaded, sLoaded, nLoaded };
+    int unknown = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (side[i] > 0 || dist[i] >= strip) continue;
+        if (side[i] < 0) unknown = 1; else return 0;
+    }
+    return unknown != 0 ? -1 : 1;
+}
+/* keeps = that game's engine would keep the squad at its spot (EngineKeepsAt over the game's map bits for the area and its
+   side neighbours; 1 by default - a caller without a position reads every loaded game as keeping). A row with keeps 0 is skipped and
+   counted in *notKeep (may be 0); keeps < 0 HOLDs like a stale bit. */
+struct AreaRow { int slot, inWorld, loaded, keeps; AreaRow() : slot(-1), inWorld(0), loaded(0), keeps(1) {} };
+inline int AreaReceiverOrder(const AreaRow* rows, int n, int mapFresh, int holderSlot, int mySlot, const int* tried, int nTried, int* order, int cap, int* notInWorld, int* notKeep = 0)
+{
+    if (notInWorld != 0) *notInWorld = 0;
+    if (notKeep != 0) *notKeep = 0;
+    if (mapFresh == 0 || mySlot < 0) return -1;
+    std::vector<int> pick;   /* the eligible slots, kept in ascending order */
+    for (int i = 0; i < n && rows != 0; ++i)
+    {
+        const AreaRow& r = rows[i];
+        if (r.loaded < 0) return -1;
+        if (r.slot < 0 || r.slot == mySlot || r.loaded == 0) continue;
+        bool skip = false;
+        for (int t = 0; t < nTried && tried != 0 && !skip; ++t) if (tried[t] == r.slot) skip = true;
+        for (size_t o = 0; o < pick.size() && !skip; ++o) if (pick[o] == r.slot) skip = true;
+        if (skip) continue;
+        if (r.inWorld == 0) { if (notInWorld != 0) ++*notInWorld; continue; }
+        if (r.keeps < 0) return -1;
+        if (r.keeps == 0) { if (notKeep != 0) ++*notKeep; continue; }   /* its engine would put the squad away at this spot */
+        size_t at = pick.size();
+        while (at > 0 && pick[at - 1] > r.slot) --at;
+        pick.insert(pick.begin() + (long)at, r.slot);
+    }
+    for (size_t i = 1; i < pick.size(); ++i)
+        if (pick[i] == holderSlot) { pick.erase(pick.begin() + (long)i); pick.insert(pick.begin(), holderSlot); break; }
+    int k = 0;
+    for (size_t i = 0; i < pick.size() && k < cap && order != 0; ++i) order[k++] = pick[i];
+    return k;
 }
 
 }   /* namespace cooplo */

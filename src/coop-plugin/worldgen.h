@@ -118,5 +118,7 @@ void WorldGenTick();
 // and our removal is counted beside the engine's. MAIN THREAD. false = not hooked or no world, in
 // which case the caller must NOT report the object as destroyed.
 bool DestroyLocalObject(void* obj);
+// The engine's GameWorld::destroy is hooked here (its detour retires the mod's rows and announces this game's removals). MAIN THREAD.
+bool WorldGenDestroyHooked();
 
 } // namespace coop

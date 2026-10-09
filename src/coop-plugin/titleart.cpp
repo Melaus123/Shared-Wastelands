@@ -31,6 +31,7 @@
 #include "ui.h"                    /* UiFindLayoutSuffix */
 #include "coop_log.h"
 #include "command_channel.h"       /* PathNextToDll - the mod folder */
+#include "u8file.h"                /* UTF-8 paths over the wide Windows calls */
 #include "../common/titleart.h"    /* kTitleArtFile, CoverCrop, ArtRowOnBox */
 
 /* The two members of Ogre's resource-group manager called here, declared as OgreMain_x64.dll exports them (the vendored
@@ -67,17 +68,30 @@ void Refuse(const std::string& why)
     ErrorLog("[UI] title art: the game's own title art stays - " + why);
 }
 
+/* A UTF-8 path (PathNextToDll's) in the ANSI code page, for an engine call that takes a narrow path; a letter the code page
+   lacks becomes '?', as it did when the folder was read in that code page. */
+std::string AnsiOf(const std::string& utf8)
+{
+    const std::wstring w = U8W(utf8.c_str());
+    if (w.empty()) return std::string();
+    const int n = ::WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), 0, 0, 0, 0);
+    if (n <= 0) return std::string();
+    std::string out((size_t)n, ' ');
+    ::WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), &out[0], n, 0, 0);
+    return out;
+}
+
 /* The file to a texture, once per process (tried once whatever the outcome). */
 void LoadOnce()
 {
     g_art = kArtFailed;
     const std::string name = swtitle::kTitleArtFile;
     const std::string path = PathNextToDll(swtitle::kTitleArtFile);
-    const DWORD at = ::GetFileAttributesA(path.c_str());
+    const DWORD at = U8GetFileAttributes(path.c_str());
     if (at == INVALID_FILE_ATTRIBUTES || (at & FILE_ATTRIBUTE_DIRECTORY) != 0) { Refuse("no " + name + " in the mod folder (" + path + ")"); return; }
     const size_t cut = path.find_last_of("\\/");
     if (cut == std::string::npos) { Refuse("the mod folder could not be told from " + path); return; }
-    const std::string dir = path.substr(0, cut);
+    const std::string dir = AnsiOf(path.substr(0, cut));   /* Ogre opens a narrow path in the ANSI code page */
     MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
     MyGUI::DataManager* dm = MyGUI::DataManager::getInstancePtr();
     if (rm == 0 || dm == 0) { Refuse("MyGUI's render or data manager is not up"); return; }

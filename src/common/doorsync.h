@@ -527,4 +527,203 @@ const int kDoorLockStuckNoLock = 1;   /* the door has no DoorLock */
 const int kDoorLockStuckNoCall = 2;   /* lockDoor / unlockDoor did not pass its prologue check */
 const int kDoorLockStuckGaveUp = 3;   /* kDoorLockGiveUpN ineffective visits */
 
+/* ============ A GAME THAT LOADS AN AREA TAKES THE HOLDER'S DOORS; IT DOES NOT PUSH ITS OWN ============
+   A door this game sees for the first time (its row is new: wasState -1) is in whatever state this game's own load built it in -
+   nothing acted on it.  Sent as an actor report, the area holder adopts it under the last-actor rule, so a game that (re)loads a
+   town would close on the holder's screen every door its load built closed.  So a change is an actor report only when an actor
+   made it:
+     - a write by one of the engine's load-time door writers (loadWriter, told by the caller's return address) is the load, not an
+       actor, whatever the row knew before: a re-offer;
+     - otherwise a call into openDoor / closeDoor / lockButton (actionEntry) is somebody acting on the door: an actor report, even
+       on a door whose row is new;
+     - otherwise a first sighting (wasState -1) is a re-offer and a change from a known state is an actor report.
+   A re-offer is published if this game holds the door and refused if it does not.  The value is the reportIfNotHolder argument of
+   the queue. */
+inline int DoorChangeReportsIfNotHolder(int wasState, int loadWriter, int actionEntry)
+{
+    if (loadWriter != 0) return 0;
+    if (actionEntry != 0) return 1;
+    return (wasState < 0) ? 0 : 1;
+}
+
+/* THE ENTRY POINTS THAT ARE AN ACT ON THE DOOR, by the `where` name the detour that saw the change hands NoteDoor.  openDoor and
+   closeDoor are the engine's door verbs (a player or an NPC using the door); lockButton is the player's lock press.  The funnel
+   (setDoorOpenAmount) and lockDoor (the re-lock when a closing door lands) are the engine following a door, not an act.
+   1 = an action. */
+inline int DoorNameIs(const char* a, const char* b)
+{
+    if (a == 0 || b == 0) return 0;
+    while (*a != 0 && *a == *b) { ++a; ++b; }
+    return (*a == *b) ? 1 : 0;
+}
+inline int DoorEntryIsAction(const char* where)
+{
+    return (DoorNameIs(where, "openDoor") || DoorNameIs(where, "closeDoor") || DoorNameIs(where, "lockButton")) ? 1 : 0;
+}
+
+/* A LOAD-TIME WRITER, BY RETURN ADDRESS.  `writers` are the address table's return addresses of the engine's load-time door writers
+   (0 = a row the table did not fill); `ret` is the detour's caller, 0 when it could not be read.  1 = `ret` is one of them. */
+inline int DoorRetIsLoadWriter(unsigned long long ret, const unsigned long long* writers, int n)
+{
+    int i;
+    if (ret == 0 || writers == 0) return 0;
+    for (i = 0; i < n; ++i)
+        if (writers[i] != 0 && writers[i] == ret) return 1;
+    return 0;
+}
+
+/* THE SECTOR A DOOR KEY NAMES.  A door key is "<record>@<sx>,<sy>@<position>" (ObjectPositionKey), so the sector is read off the
+   key without touching the door.  1 = parsed; anything else leaves *sx / *sy alone. */
+inline int DoorKeySector(const char* key, int* sx, int* sy)
+{
+    const char* p = key;
+    int x = 0, y = 0, nx = 0, ny = 0;
+    if (key == 0 || sx == 0 || sy == 0) return 0;
+    while (*p != 0 && *p != '@') ++p;
+    if (*p != '@') return 0;
+    ++p;
+    while (*p >= '0' && *p <= '9') { if (++nx > 4) return 0; x = x * 10 + (*p - '0'); ++p; }
+    if (nx == 0 || *p != ',') return 0;
+    ++p;
+    while (*p >= '0' && *p <= '9') { if (++ny > 4) return 0; y = y * 10 + (*p - '0'); ++p; }
+    if (ny == 0 || *p != '@') return 0;
+    *sx = x; *sy = y;
+    return 1;
+}
+
+/* ANOTHER GAME HAS JUST LOADED A SECTOR AND ASKED THIS GAME, ITS HOLDER, TO CATCH IT UP (the world server's catch-up ask).  Every door this
+   game has registered in that sector, in a resting state, is re-offered as the holder's word; the asker applies it when its own copy
+   of the door registers, so after any (re)load the holder's doors win.  1 = re-offer this row. */
+inline int DoorServesSectorAsk(int keyParsed, int rowSx, int rowSy, int askSx, int askSy, int state)
+{
+    if (keyParsed == 0) return 0;
+    if (rowSx != askSx || rowSy != askSy) return 0;
+    return (state == kDoorClosed || state == kDoorOpen) ? 1 : 0;
+}
+/* ONE CATCH-UP ASK NAMES SEVERAL SECTORS (askX[i], askY[i] are one sector): a resting door of any of them is re-offered. */
+inline int DoorServesCatchup(int keyParsed, int rowSx, int rowSy, const int* askX, const int* askY, int n, int state)
+{
+    int i;
+    if (askX == 0 || askY == 0) return 0;
+    for (i = 0; i < n; ++i)
+        if (DoorServesSectorAsk(keyParsed, rowSx, rowSy, askX[i], askY[i], state) != 0) return 1;
+    return 0;
+}
+
+/* A PLAYER WHO ENTERS THE WORLD MAY BE A RESTARTED GAME, whose door counter starts again from 1.  The newest-wins record this game
+   keeps per door would refuse every door message from that player until its new counter passed the old one, so the record is
+   forgotten when the player enters.  arrivedSlot -1 = the arrival names no single player: every publisher's record is forgotten
+   (the cost is at most one late message from a game that did not restart taken out of order).  1 = forget this held row's record. */
+inline int DoorGenForgetOnArrival(long heldGen, int heldSlot, int arrivedSlot)
+{
+    if (heldGen < 0) return 0;
+    if (arrivedSlot < 0) return 1;
+    return (heldSlot == arrivedSlot) ? 1 : 0;
+}
+/* IS A PUBLISHER ON RECORD FOR A HELD ROW.  The record is a player key (doors.cpp: net::PlayerKeyNow) - RelayPeerId(slot) =
+   0x80000000 | slot, which is NEGATIVE stored as a long, or a session peer's raw id - and -1 is the empty marker (no record, or
+   forgotten).  Keys top out at 0x8000FFFF, so -1 is never a key.  1 = a publisher is on record (its slot can be asked). */
+inline int DoorHeldPublisherKnown(long fromPeer)
+{
+    return (fromPeer != -1) ? 1 : 0;
+}
+
+/* A ROW THAT GAVE UP AFTER THREE CORRECTIONS THAT DID NOT TAKE IS TRIED AGAIN WHEN A NEW WORD FOR ITS DOOR IS ACCEPTED - the
+   holder's answer, or another game's report reaching the holder.  The give-up stops a correction repeating every tick; a new
+   message is a new event and buys at most three more tries.  A refused word re-arms nothing.  1 = clear the give-up. */
+inline int DoorWordReArmsGiveUp(int accepted, int gaveUp)
+{
+    return (accepted != 0 && gaveUp != 0) ? 1 : 0;
+}
+
+/* THE HELD TABLE IS FULL.  An entry may be taken for a new key only when no live door here carries its key and no report waits on
+   it: its stored word is then for a door this game has not loaded, and the holder sends it again when this game loads that sector
+   (DoorServesSectorAsk).  1 = evictable. */
+inline int DoorHeldEvictable(int used, int hasLiveRow, int pendingActor)
+{
+    return (used != 0 && hasLiveRow == 0 && pendingActor == 0) ? 1 : 0;
+}
+/* Of the evictable entries the one used longest ago is taken.  1 = `stamp` is older than the best so far (or there is none yet);
+   the stamps are a wrapping 32-bit use counter, compared by signed difference. */
+inline int DoorHeldOlder(unsigned long stamp, unsigned long bestStamp, int haveBest)
+{
+    if (haveBest == 0) return 1;
+    return ((long)(stamp - bestStamp) < 0) ? 1 : 0;
+}
+/* WHICH EVICTABLE ENTRY GIVES WAY: evicting an entry forgets its message counter and any word stored in it, so an entry holding no
+   holder word goes before one that holds one, and among equals the one used longest ago.  1 = the candidate is a better victim than
+   the best so far (or there is none yet). */
+inline int DoorHeldBetterVictim(int candHasWord, unsigned long candStamp, int bestHasWord, unsigned long bestStamp, int haveBest)
+{
+    if (haveBest == 0) return 1;
+    if ((candHasWord != 0) != (bestHasWord != 0)) return (candHasWord == 0) ? 1 : 0;
+    return DoorHeldOlder(candStamp, bestStamp, 1);
+}
+/* A ROW DROPPED BY THE ACTIVE-ZONE CHECK while the holder's word for its door is stored here: the word is marked to look its door up
+   again through the parent building when it is next due (doors.cpp DropRowKeepWord).  1 = mark. */
+inline int DoorDropMarksReFind(long heldState)
+{
+    return (heldState == kDoorClosed || heldState == kDoorOpen) ? 1 : 0;
+}
+/* A held entry with no row here is looked up through its building when a report waits on it or its word is marked (above). */
+inline int DoorHeldResolveDue(int pendingActor, int reFind)
+{
+    return (pendingActor != 0 || reFind != 0) ? 1 : 0;
+}
+/* A CATCH-UP ASK NAMES SECTORS (askX[i], askY[i] are one sector).  1 = the sector a door key names (DoorKeySector) is one of them. */
+inline int DoorKeyInAsk(int keyParsed, int sx, int sy, const int* askX, const int* askY, int n)
+{
+    int i;
+    if (keyParsed == 0 || askX == 0 || askY == 0) return 0;
+    for (i = 0; i < n; ++i)
+        if (sx == askX[i] && sy == askY[i]) return 1;
+    return 0;
+}
+/* A DOOR THIS GAME KNOWS ONLY BY KEY - a held entry with no row here (the row dropped by the active-zone check, the purge or the full
+   registry, and the engine has not moved the door since) - in a sector a catch-up ask names: the entry is marked, and the tick looks
+   its door up through its building (doors.cpp DoorResolveByKey, one look-up per tick) and re-offers it if found.  1 = mark. */
+inline int DoorServeMarksHeld(int inAsk, int hasRow)
+{
+    return (inAsk != 0 && hasRow == 0) ? 1 : 0;
+}
+/* A held entry with no row here is looked up through its building when a report waits on it, its word is marked (DoorDropMarksReFind)
+   or a catch-up ask marked it (DoorServeMarksHeld).  1 = look it up. */
+inline int DoorHeldLookupDue(int pendingActor, int reFind, int serveFind)
+{
+    return (DoorHeldResolveDue(pendingActor, reFind) != 0 || serveFind != 0) ? 1 : 0;
+}
+/* THE APPLY LOOP VISITS a held entry that holds the holder's word, carries an actor report or carries a catch-up mark.  1 = visit. */
+inline int DoorHeldVisited(long heldState, int pendingActor, int serveFind)
+{
+    return (heldState >= 0 || pendingActor != 0 || serveFind != 0) ? 1 : 0;
+}
+/* DOES A DOOR KEY NAME A GATE, for the holder-word line budget: the word "gate" anywhere in the key, in any case.  1 = it does. */
+inline int DoorKeyNamesGate(const char* key)
+{
+    const char* p;
+    if (key == 0) return 0;
+    for (p = key; *p != 0; ++p)
+    {
+        int i;
+        for (i = 0; i < 4; ++i)
+        {
+            char c = p[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != "gate"[i]) break;
+        }
+        if (i == 4) return 1;
+    }
+    return 0;
+}
+/* THE HOLDER-WORD LINE BUDGET (doors.cpp DoorWordLine).  A key with a held entry has its own budget of perKeyCap lines, so one
+   catch-up's doors cannot spend the line a gate needs; a gate key's lines print within that budget whatever the session total says;
+   every other line also needs room in the session total (claimed by the caller, totalCap).  hasSlot 0 = the key has no held entry,
+   and only the session total applies.  1 = print. */
+inline int DoorWordLinePrints(int hasSlot, long keyLines, long totalLines, int isGate, long perKeyCap, long totalCap)
+{
+    if (hasSlot != 0 && keyLines > perKeyCap) return 0;
+    if (hasSlot != 0 && isGate != 0) return 1;
+    return (totalLines <= totalCap) ? 1 : 0;
+}
+
 }   /* namespace coopdoor */

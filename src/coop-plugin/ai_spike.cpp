@@ -155,7 +155,7 @@ static bool LooksLikeObject(const void* p);
 // Reads the target's position. MAIN THREAD ONLY - never call this from the AI thread.
 std::string TargetPos()
 {
-    Character* t = (Character*)g_target;
+    Character* t = GetTarget();   /* the engine still knows it this frame */
     if (t == 0) return "n/a";
     // H030 (T131/F445): getPosition double-dereferences Character+0x448 (F316); a destroyed target read -1 here.
     if (!LooksLikeObject(*(void**)((char*)t + 0x448))) return "unreadable";
@@ -763,7 +763,7 @@ void ReportSuppression()
 
 bool DriveTarget(float dx, float dz, int frames)
 {
-    Character* t = (Character*)g_target;
+    Character* t = GetTarget();   /* the engine still knows it this frame */
     if (t == 0) { DebugLog("[P006] drive: no target captured"); return false; }
 
     CharMovement* mv = t->movement;
@@ -793,7 +793,7 @@ bool DriveTarget(float dx, float dz, int frames)
 
 bool MoveTarget(float dx, float dz)
 {
-    Character* t = (Character*)g_target;
+    Character* t = GetTarget();   /* the engine still knows it this frame */
     if (t == 0) { DebugLog("[P006] move: no target captured"); return false; }
 
     CharMovement* mv = t->movement;
@@ -833,9 +833,10 @@ bool MoveTarget(float dx, float dz)
     return true;
 }
 
+/* g_target is stored at capture and cleared by the destroy detour; the engine must also still know it this frame. */
 ::Character* GetTarget()
 {
-    return (Character*)g_target;
+    return LiveCharacter((Character*)g_target);
 }
 
 // H030: called from the destroy detour for EVERY destruction; clears the watch when it names the target, so no

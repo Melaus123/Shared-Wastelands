@@ -38,6 +38,7 @@
 namespace coopshop {
 
 const unsigned int kReqTag = 0x33524853u;   /* 'SHR3' little-endian (T-1 B5, protocol 121: 'SHR2' + u8 stock kind after the epoch) */
+const unsigned int kReqTagV4 = 0x34524853u; /* 'SHR4' (T-619): 'SHR3' + the requester's culture and local price multipliers (2 x f32) */
 const unsigned int kReqTagV2 = 0x32524853u; /* 'SHR2' (fold 2, protocol 96: + u32 epoch after entry; 'SHR1' was 92-94) - still decoded, as a home's stock */
 const unsigned int kCfTag = 0x31434853u;    /* 'SHC1' little-endian */
 const int kMaxStr = 96;                     /* a box key or a record sid; longer is refused */
@@ -63,7 +64,9 @@ struct ShopReq
     int entry;                /* kEntry* */
     unsigned int epoch;       /* fold 2 (item 12): the requester's per-process epoch (never 0) - the holder's record key */
     int stock;                /* T-1 B5: kStock* (an 'SHR2' block decodes as kStockHome) */
-    ShopReq() : has(0), keeperUid(0), n(0), unitPrice(0), entry(0), epoch(0), stock(kStockHome) {}
+    float cult;               /* T-619: the culture multiplier the requester's price used (0 = not sent: an 'SHR3' block) */
+    float local;              /* T-619: the local multiplier the requester's price used (0 = not sent) */
+    ShopReq() : has(0), keeperUid(0), n(0), unitPrice(0), entry(0), epoch(0), stock(kStockHome), cult(0.0f), local(0.0f) {}
 };
 struct ShopCf
 {
@@ -530,15 +533,19 @@ inline int StockKeyOk(int stock, const std::string& homeKey)
     return 0;
 }
 /* T-1 B5: a request block of either form starts at `at` ('SHR3', or the older 'SHR2'). */
-inline int ReqTagAt(const char* p, size_t size, size_t at) { return (TagAt(p, size, at, kReqTag) != 0 || TagAt(p, size, at, kReqTagV2) != 0) ? 1 : 0; }
+inline int ReqTagAt(const char* p, size_t size, size_t at) { return (TagAt(p, size, at, kReqTag) != 0 || TagAt(p, size, at, kReqTagV2) != 0 || TagAt(p, size, at, kReqTagV4) != 0) ? 1 : 0; }
 inline int EncodeReq(std::vector<char>* b, const ShopReq& r)
 {
     if (r.n <= 0 || r.n > kMaxUnits || r.unitPrice < 0 || r.entry < 0 || r.entry > kEntryDrag || StockKeyOk(r.stock, r.homeKey) == 0 || r.sid.empty() || r.epoch == 0) return 0;
+    /* T-619: an 'SHR4' block carries the two price legs when both are numbers above 0 and below 100; a missing, out-of-range or NaN
+       leg sends the 'SHR3' block - the trade goes on and the holder counts its legs unsent */
+    const int legs = (r.cult > 0.0f && r.cult < 100.0f && r.local > 0.0f && r.local < 100.0f) ? 1 : 0;
     std::vector<char> t;
-    PutU32(&t, kReqTag); PutU32(&t, r.keeperUid);
+    PutU32(&t, (legs != 0) ? kReqTagV4 : kReqTag); PutU32(&t, r.keeperUid);
     if (!PutS(&t, r.homeKey) || !PutS(&t, r.sid)) return 0;
     PutU32(&t, (unsigned int)r.n); PutU32(&t, (unsigned int)r.unitPrice); t.push_back((char)(unsigned char)r.entry); PutU32(&t, r.epoch);
     t.push_back((char)(unsigned char)r.stock);   /* T-1 B5 ('SHR3'): the stock kind */
+    if (legs != 0) { unsigned int cb = 0, lb = 0; std::memcpy(&cb, &r.cult, 4); std::memcpy(&lb, &r.local, 4); PutU32(&t, cb); PutU32(&t, lb); }   /* T-619 ('SHR4') */
     b->insert(b->end(), t.begin(), t.end());
     return 1;
 }
@@ -547,13 +554,20 @@ inline int EncodeReq(std::vector<char>* b, const ShopReq& r)
 inline int DecodeReq(const char* p, size_t size, size_t* at, ShopReq* r)
 {
     size_t a = *at; unsigned int tag = 0, n = 0, up = 0;
-    if (!GetU32(p, size, &a, &tag) || (tag != kReqTag && tag != kReqTagV2) || !GetU32(p, size, &a, &r->keeperUid)) return 0;
+    if (!GetU32(p, size, &a, &tag) || (tag != kReqTag && tag != kReqTagV2 && tag != kReqTagV4) || !GetU32(p, size, &a, &r->keeperUid)) return 0;
     if (!GetS(p, size, &a, &r->homeKey) || !GetS(p, size, &a, &r->sid) || r->sid.empty()) return 0;
     if (!GetU32(p, size, &a, &n) || !GetU32(p, size, &a, &up) || a + 1 > size) return 0;
     r->entry = (unsigned char)p[a]; ++a;
     if (!GetU32(p, size, &a, &r->epoch) || r->epoch == 0) return 0;   /* fold 2 (item 12): the epoch, never 0 */
-    r->stock = kStockHome;
-    if (tag == kReqTag) { if (a + 1 > size) return 0; r->stock = (unsigned char)p[a]; ++a; }
+    r->stock = kStockHome; r->cult = 0.0f; r->local = 0.0f;
+    if (tag == kReqTag || tag == kReqTagV4) { if (a + 1 > size) return 0; r->stock = (unsigned char)p[a]; ++a; }
+    if (tag == kReqTagV4)
+    {   /* T-619: the requester's two price legs, each a number above 0 and below 100 */
+        unsigned int cb = 0, lb = 0;
+        if (!GetU32(p, size, &a, &cb) || !GetU32(p, size, &a, &lb)) return 0;
+        std::memcpy(&r->cult, &cb, 4); std::memcpy(&r->local, &lb, 4);
+        if (!(r->cult > 0.0f && r->cult < 100.0f) || !(r->local > 0.0f && r->local < 100.0f)) return 0;
+    }
     if (StockKeyOk(r->stock, r->homeKey) == 0) return 0;   /* T-1 B5: an empty home key only for a caravan */
     if (n == 0 || n > (unsigned int)kMaxUnits || up > 0x7FFFFFFFu || r->entry > kEntryDrag) return 0;
     r->n = (int)n; r->unitPrice = (int)up; r->has = 1;

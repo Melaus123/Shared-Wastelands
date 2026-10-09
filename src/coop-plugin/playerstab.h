@@ -28,6 +28,11 @@ void PlayersTabForgetWorld();
 // line. MAIN THREAD (the command channel). Returns the status.
 std::string PlayersTabCommand(const std::string& args);
 
+// MAIN THREAD (the chat, chat.cpp): a player's name as the PLAYERS tab shows it (the roster's, else the one given earlier this
+// session, else "Player N") and the faction line under it (its faction of players' name when in one, else its Kenshi faction;
+// "" when this game has not seen that player's faction). false = nothing could be read.
+bool PlayersTabPlayerWords(int slot, std::string* name, std::string* faction);
+
 // MAIN THREAD (team.cpp, when a removal made while this player was away has been written back with the world loaded): the
 // FACTION box "You were removed from <team> while you were away. ..." is owed - shown once, when no other box is up.
 void PlayersTabRemovedWhileAway(const std::string& teamName);

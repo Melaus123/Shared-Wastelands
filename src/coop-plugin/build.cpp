@@ -93,6 +93,7 @@
 #include "net/session.h"    /* IsUidMine, SendBuild */
 #include "ownstore.h"        /* help1 fold: OwnWriterOn, OwnStoreCommittedSeq - pp.build landed (MED 4) */
 #include "../common/buildwire.h"   /* build1-b: the MSG_BUILD payload */
+#include "../common/boxowner.h"    /* ScanSkipsWorldNode - a world-placed production building is not an own piece */
 #include "../common/slotwire.h"    /* P18 fold 2: StandInSlotOfId / IsLegacyPeerId - a saved owner id read as a stand-in record */
 #include "../common/boxowner.h"    /* build1h: HouseOwnerOfNewPiece */
 #include "../common/ownrec.h"      /* mmo8a: pp.build rows (EncodeBuildRec / BuildRow) */
@@ -119,6 +120,7 @@
 #include <io.h>         /* house2 fold: _commit / _fileno */
 #include <sstream>
 #include <string>
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
 
@@ -315,6 +317,8 @@ long long g_rosterSent = 0, g_rosterStateSent = 0, g_rosterNotLive = 0, g_roster
 long long g_rosterNotMine = 0, g_rosterRounds = 0, g_rosterUnencodable = 0;
 long long g_scanRuns = 0, g_scanFound = 0, g_scanRegistered = 0, g_scanFurnitureSkipped = 0, g_scanInteriorSkipped = 0;
 long long g_scanDoorSkipped = 0, g_scanKnown = 0, g_scanNoKey = 0, g_scanNoPos = 0, g_scanDismantled = 0, g_scanTruncated = 0;
+long long g_scanWorldProduction = 0;   /* own-faction production buildings with no build record and no materials the scans left unregistered (world-placed) */
+long long g_scanPlayerProduction = 0;  /* own-faction production buildings with no build record but with materials the scans registered (player-built) */
 long long g_rosterReqSent = 0, g_rosterReqRecv = 0, g_rosterReqLinkDown = 0;   /* review-build1f H2 */
 long long g_rosterLines = 0, g_rosterSuppressed = 0, g_scanWalkMoved = 0;       /* review-build1f cap, C1 */
 /* T-274 (t274-zone-scan.md S3): the per-zone scan. Sector (sx * 64 + sy) -> 1 = its zone was walked in this world while it stayed
@@ -1795,7 +1799,7 @@ void BdOwedSave()
         return;
     }
     const std::string tmp = path + ".tmp";   /* house2 (item 2): written aside, then renamed over the file in one step */
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = U8fopen(tmp.c_str(), "wb");
     if (f == 0) { ++g_owedSaveFailed; return; }
     static const char hx[] = "0123456789abcdef";
     int bad = 0;
@@ -1811,10 +1815,10 @@ void BdOwedSave()
     if (std::fflush(f) != 0) bad = 1;
     if (::_commit(::_fileno(f)) != 0) bad = 1;   /* house2 fold (LOW b): on the disk before the rename */
     if (std::fclose(f) != 0) bad = 1;
-    if (bad != 0 || ::MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
+    if (bad != 0 || U8MoveFileEx(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
     {
         ++g_owedSaveFailed;   /* the old file stays whole */
-        ::DeleteFileA(tmp.c_str());
+        U8DeleteFile(tmp.c_str());
     }
 }
 int BdHexVal(char ch) { return (ch >= '0' && ch <= '9') ? ch - '0' : ((ch >= 'a' && ch <= 'f') ? ch - 'a' + 10 : -1); }
@@ -1838,10 +1842,10 @@ void BdOwedLoad()
         g_owedErasedUnread.clear();   /* house2 fold 2: another file */
     }
     g_owedFor.clear();   /* house2 (item 3): set only once the file is read or confirmed absent - BdOwedSave refuses otherwise */
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = U8fopen(path.c_str(), "rb");
     if (f == 0)
     {
-        const DWORD at = ::GetFileAttributesA(path.c_str());
+        const DWORD at = U8GetFileAttributes(path.c_str());
         const DWORD er = ::GetLastError();
         if (at == INVALID_FILE_ATTRIBUTES && (er == ERROR_FILE_NOT_FOUND || er == ERROR_PATH_NOT_FOUND)) { g_owedFor = path; return; }
         ++g_owedLoadUnread;
@@ -2102,7 +2106,7 @@ void BdHelpSave()
     g_helpSaveDirty = 1;   /* help1 fold (MED 8): cleared only by a save that landed - a failed one is tried again by BdHelpTick */
     if (path.empty() || path != g_helpFor) { ++g_helpSaveFailed; return; }
     const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = U8fopen(tmp.c_str(), "wb");
     if (f == 0) { ++g_helpSaveFailed; return; }
     int bad = 0;
     for (std::map<std::string, BdHelpRow>::const_iterator it = g_help.begin(); it != g_help.end(); ++it)
@@ -2120,10 +2124,10 @@ void BdHelpSave()
     if (std::fflush(f) != 0) bad = 1;
     if (::_commit(::_fileno(f)) != 0) bad = 1;
     if (std::fclose(f) != 0) bad = 1;
-    if (bad != 0 || ::MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
+    if (bad != 0 || U8MoveFileEx(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
     {
         ++g_helpSaveFailed;   /* the old file stays whole */
-        ::DeleteFileA(tmp.c_str());
+        U8DeleteFile(tmp.c_str());
         return;
     }
     g_helpSaveDirty = 0;   /* help1 fold (MED 8) */
@@ -2136,10 +2140,10 @@ void BdHelpLoad()
     const std::string path = BdHelpPath();
     if (path.empty() || path == g_helpFor) return;
     if (path != g_helpTried) { if (!g_helpTried.empty()) { g_help.clear(); g_helpOld.clear(); } g_helpTried = path; }   /* another world: its own work (fold 3: its replaced placements' rows too) */
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = U8fopen(path.c_str(), "rb");
     if (f == 0)
     {
-        const DWORD at = ::GetFileAttributesA(path.c_str());
+        const DWORD at = U8GetFileAttributes(path.c_str());
         const DWORD er = ::GetLastError();
         if (at == INVALID_FILE_ATTRIBUTES && (er == ERROR_FILE_NOT_FOUND || er == ERROR_PATH_NOT_FOUND)) { g_helpFor = path; return; }
         ++g_helpLoadUnread;
@@ -5641,6 +5645,40 @@ int BdScanPiece(void* b, ::Faction* mine, long long gen0, int zoneScan)   /* T-2
     char key[kKeyCap];
     key[0] = 0;
     if (ObjectPositionKey(b, key, kKeyCap, "", 3, 1) == 0) { if (zoneScan != 0) ++g_zsSkipped; else ++g_scanNoKey; return 0; }
+    if (ProductionBuildingIs(b) != 0)
+    {   /* a production building with no build record and no building materials is one the world placed (a mining node): its
+           faction mark is the engine's, read by each game on its own copy - never registered as this game's own piece (no PLACE;
+           its box stays on the area rule, items.cpp ItBoxOwnerOf). One WITH materials is a player-built machine the registry
+           lacks a row for - registered as before (coopown::ScanSkipsWorldNode). */
+        const int hasRow = (g_reg.find(std::string(key)) != g_reg.end() || BdRowByLiveKey(std::string(key)) != g_reg.end()) ? 1 : 0;
+        int matN = -1;
+        float matNone[1];
+        if (hasRow == 0) BdReadMats(b, matNone, 0, &matN);
+        if (coopown::ScanSkipsWorldNode(1, hasRow, matN) != 0)
+        {
+            if (zoneScan != 0) ++g_zsSkipped;
+            ++g_scanWorldProduction;
+            if (g_scanWorldProduction <= 20 || g_scanWorldProduction % 100 == 0)
+            {
+                char wl[300];
+                _snprintf_s(wl, sizeof(wl), _TRUNCATE, "[BUILD] %s key=%.63s: a production building with no build record and no building materials (world-placed) carries this game's faction - not registered as an own piece; scanWorldProduction=%lld",
+                            zoneScan != 0 ? "ZONESCAN" : "ROSTER scan", key, g_scanWorldProduction);
+                DebugLog(std::string(wl));
+            }
+            return 0;
+        }
+        if (hasRow == 0)
+        {
+            ++g_scanPlayerProduction;
+            if (g_scanPlayerProduction <= 20 || g_scanPlayerProduction % 100 == 0)
+            {
+                char pl[300];
+                _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[BUILD] %s key=%.63s: a production building with no build record and materials=%d (player-built) - registered as an own piece; scanPlayerProduction=%lld",
+                            zoneScan != 0 ? "ZONESCAN" : "ROSTER scan", key, matN, g_scanPlayerProduction);
+                DebugLog(std::string(pl));
+            }
+        }
+    }
     if (!g_copyList.empty() && BdCopyOwnRowAt(std::string(key)) == 0)
     {   /* P87 root (step 4): a listed key is ANOTHER game's copy the load gave this game's faction (a player town) - never registered as
            this game's own piece (its PLACE would go back to its owner as a new piece) */
@@ -8614,6 +8652,20 @@ void ReportBuild()
                 (long long)::InterlockedCompareExchange64(&g_rbFaults, 0, 0));
     DebugLog(std::string(p18r));
     ReportFarm();   /* par16 */
+}
+
+/* MAIN THREAD - another game's PLACE or STATE for this piece still waits here (a copy not made yet, its area not loaded, or a state -
+   an owner change such as a purchase - not applied yet): 1 yes, 0 no, -1 the piece's key is unreadable. The town refill
+   (towngen.cpp) leaves such a building alone. */
+int BuildRowPendingFor(void* b)
+{
+    char k[kKeyCap];
+    if (b == 0 || ObjectPositionKey(b, k, kKeyCap, "", 3, 0) == 0) return -1;
+    const std::string key(k);
+    if (g_pendState.find(key) != g_pendState.end()) return 1;
+    for (size_t i = 0; i < g_pend.size(); ++i) if (g_pend[i].m.key == key) return 1;
+    for (size_t i = 0; i < g_wait.size(); ++i) if (g_wait[i].m.key == key) return 1;
+    return 0;
 }
 
 } // namespace coop

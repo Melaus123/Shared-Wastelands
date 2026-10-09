@@ -161,6 +161,13 @@ int ZoneBuildingsInHereTri(float x, float y, float z);
    ZoneManager / faulted (counted as ZoneBuildingsInHereTri's are). ZoneBuildingsInHereTri is the sector arithmetic + this; build.cpp's
    per-zone scan (BdZoneScanTick) polls it for every active zone. */
 int ZoneLoadedSectorTri(int sx, int sy);
+/* MAIN THREAD. The engine's keep flags for one area: 1 when its ZoneMap +0xB1 or +0xB0 byte is set (the pair the engine's
+   own side-neighbour test reads, 0xA088A0), 0 neither or off the grid, -1 refused off the main thread / no ZoneManager / faulted. */
+int ZoneKeepSectorTri(int sx, int sy);
+/* MAIN THREAD. Would this game's engine keep a squad whose centre stands at (x, z): cooplo::EngineKeepsAt over the live
+   flags of the area and its four side neighbours (off the grid = no neighbour = no narrowing), with kKeepMarginUnits. 1 keeps, 0 not,
+   -1 unreadable (the caller retries next tick or refuses). */
+int EngineKeepsHere(float x, float z);
 void ZoneBuildingsGateRefusals(long long* offMain, long long* noZm);   /* mmo8a3: ZoneBuildingsInHereTri's -1s off the main thread / with no ZoneManager */
 Sector MyPlayerSector();
 // PROBE-START: P119 - MAIN THREAD: the engine's activation text for a sector; the distance to the nearest sector this game has not loaded
@@ -186,6 +193,7 @@ int  SectorLoadedHereTS(const Sector& s);   /* review-p5i CRASH-2: ANY THREAD - 
    this answers -1 and R2 does not decide. It is OtherLoadedTS except that out of range is -1, not 0. */
 int  PeerSectorLoadedTS(const Sector& s);
 int  SlotMapLoadedTS(const Sector& s, int slot);   /* inv4 fold: ANY THREAD - `slot`'s bit in the notebook's effective loaded map; 1 / 0 / -1 no fresh map */
+int  AreaSquadViewTS(const Sector& s, int* holderOut, int* slots, int* bits, int cap, int* nOut, int* sideBits = 0);   /* T-650 fold 1 (review L1): ANY THREAD - ONE locked read of the area's holder and every seated slot's loaded bit; 1 fresh, 0 not, -1 off the grid. sideBits (cap * 4, may be 0) = each row's bit in the W, E, S, N side neighbours (off the grid = 1) */
 double MyMapLoadedSinceTS(const Sector& s);       /* inv4 fold: ANY THREAD - when my bit appeared in that cell (0 = clear) */
 
 } // namespace coop

@@ -1,3 +1,4 @@
 # scan_hardcoded_rva.allow - numbers PROVEN not to be engine addresses that no rule in tools/scan_hardcoded_rva.py covers.
 # One per line:  <path from the repo root> | <literal as written> | <text on the code line> | <why it is not an address>
 # A line with no reason, or one that no longer matches a hit, fails the scan. Empty since stage 7/9 (2026-09-29).
+src/coop-plugin/towngen.cpp | 0x180F8 | (const char*)tl + 0x180F8 | a field offset inside the TownList object (FUN_140926470 returns *(TownList + 0x180F8), build/decomp_926470.txt), added to the TownList pointer read through the TownList table row - not an engine address

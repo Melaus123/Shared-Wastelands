@@ -12,13 +12,15 @@
 // number (374) and no limit on reports (376). In the pause menu ESC acts as CANCEL and the menu stays open: the engine's ESC
 // closes the menu first, and the tick opens it again through the engine's own show (ui.cpp UiPauseMenuReshow).
 //
-// WHAT IS SENT (365-367, 372): the description; this launch's and the previous launch's mod logs (src/common/logrotate.h);
-// Kenshi's crash file when the previous launch crashed (coopbug::CrashFromLastLaunch); and each nearby player's CURRENT log,
+// WHAT IS SENT (365-367, 372, 581): the description; the mod logs of this launch and the two launches before it
+// (src/common/logrotate.h); Kenshi's crash file when one of those two earlier launches crashed (coopbug::CrashLaunch); and each
+// nearby player's CURRENT log,
 // asked for by LOG_ASK through the world server (route AREA - the games that have this player's sector in their delivery area)
 // and answered in LOG_PARTs by slot, without telling that player (377). Every log has its IP addresses replaced and every
 // player identity code cut to its first 8 characters before it is compressed (coopbug::ScrubIps) - an answering game scrubs its
 // own. Everything goes into one zip under coopbug::kPackLimit,
-// the oldest part of the previous launch's log cut first (coopbug::PlanBudget), with report.txt saying what is in it and what
+// the earlier launches' logs cut first, oldest part first (coopbug::PlanBudget, coopbug::EarlierLogOrder), with report.txt
+// saying what is in it and what
 // was cut. The zip is posted (multipart/form-data, WinHTTP, HTTPS) to coopbug::kRelayUrl.
 //
 // THREADS. MyGUI, the world-server sends and the engine are touched on the main thread only (BugReportTick and the hooks that
@@ -53,6 +55,7 @@
 #include "config.h"                        /* ConfigFilePlayerName */
 #include "addresses.h"                     /* AddrTableName, AddrExeFingerprint */
 #include "soak.h"                          /* GameplayRunning */
+#include "doors.h"                         /* ReportDoors - the door totals go into the log a report packs */
 #include "net/session.h"                   /* SessionProtocolVersion */
 #include "../common/bugreport.h"
 #include "../common/titleart.h"          /* PlaceTitleNote */
@@ -287,17 +290,19 @@ std::wstring GameFolder()
     const std::wstring::size_type k = s.find_last_of(L"\\/");
     return k == std::wstring::npos ? std::wstring() : s.substr(0, k + 1);
 }
-/* Kenshi's newest crash file in the game folder (a .zip before a .dmp), if the previous launch ended in it. */
-bool FindCrash(const std::wstring& folder, long long prevLogEnd, std::string* name, std::vector<unsigned char>* bytes)
+/* Kenshi's crash file in the game folder that ended one of the two kept earlier launches (coopbug::CrashLaunch): launch 1's
+   before launch 2's, then a .zip before a .dmp, the newest first. Returns the launch it ended (1 = the previous launch, 2 = the
+   one before it), or 0 when none is attached. `log1End` / `log2End`: the kept copies' last-write times, 0 = that copy is absent. */
+int FindCrash(const std::wstring& folder, long long log1End, long long log2End, std::string* name, std::vector<unsigned char>* bytes)
 {
-    if (folder.empty()) return false;
+    if (folder.empty()) return 0;
     FILETIME ct, et, kt, ut;
-    if (!::GetProcessTimes(::GetCurrentProcess(), &ct, &et, &kt, &ut)) return false;
+    if (!::GetProcessTimes(::GetCurrentProcess(), &ct, &et, &kt, &ut)) return 0;
     const long long launch = FileTimeSec(ct);
     WIN32_FIND_DATAW fd;
     HANDLE f = ::FindFirstFileW((folder + L"crashDump*").c_str(), &fd);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    std::wstring best; int bestKind = 0; long long bestAt = 0;
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    std::wstring best; int bestKind = 0, bestLaunch = 0; long long bestAt = 0;
     do
     {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -305,16 +310,20 @@ bool FindCrash(const std::wstring& folder, long long prevLogEnd, std::string* na
         const long long t = FileTimeSec(fd.ftLastWriteTime);
         const unsigned long long size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         /* Kenshi's own file is about 0.3-0.6 MB; anything far bigger is not it (367 a: no Windows full dumps) */
-        if (kind == 0 || size > (4ull << 20) || !coopbug::CrashFromLastLaunch(t, prevLogEnd, launch)) continue;
-        if (kind > bestKind || (kind == bestKind && t > bestAt)) { best = fd.cFileName; bestKind = kind; bestAt = t; }
+        if (kind == 0 || size > (4ull << 20)) continue;
+        const int ended = coopbug::CrashLaunch(t, launch, log1End, log2End);
+        if (ended == 0) continue;
+        if (bestLaunch == 0 || ended < bestLaunch
+            || (ended == bestLaunch && (kind > bestKind || (kind == bestKind && t > bestAt))))
+        { best = fd.cFileName; bestKind = kind; bestLaunch = ended; bestAt = t; }
     } while (::FindNextFileW(f, &fd));
     ::FindClose(f);
-    if (bestKind == 0) return false;
+    if (bestLaunch == 0) return 0;
     std::string raw; unsigned long long total = 0, dropped = 0;
-    if (!ReadTail(folder + best, 4ull << 20, &raw, &total, &dropped, 0) || dropped != 0) return false;
+    if (!ReadTail(folder + best, 4ull << 20, &raw, &total, &dropped, 0) || dropped != 0) return 0;
     *name = Narrow(best);
     bytes->assign(raw.begin(), raw.end());
-    return true;
+    return bestLaunch;
 }
 
 /* =========================================================================================================================
@@ -414,7 +423,7 @@ struct Job
     std::string desc;       /* the player's words, as typed (MyGUI's tags removed) */
     std::string info;       /* one line: game, fingerprint, protocol, where */
     std::string where;
-    std::wstring log0, log1, gameFolder;
+    std::wstring log0, log1, log2, gameFolder;
 };
 struct ZipPart
 {
@@ -450,16 +459,19 @@ void RunJob(Job& j)
     else
     {
         volatile long* stop = StopOf(j.gen);
-        coopbug::LogPack cur, prev;
+        coopbug::LogPack cur, prev, older;
         std::string raw;
-        long long prevEnd = 0;
+        long long prevEnd = 0, olderEnd = 0;
         const bool haveCur = ReadTail(j.log0, coopbug::kRawLogWindow, &raw, &cur.rawTotal, &cur.rawDropped, 0);
         if (haveCur && !coopbug::PackLog(raw, &cur, stop)) return;
         const bool havePrev = ReadTail(j.log1, coopbug::kRawLogWindow, &raw, &prev.rawTotal, &prev.rawDropped, &prevEnd);
         if (havePrev && !coopbug::PackLog(raw, &prev, stop)) return;
+        const bool haveOlder = ReadTail(j.log2, coopbug::kRawLogWindow, &raw, &older.rawTotal, &older.rawDropped, &olderEnd);
+        if (haveOlder && !coopbug::PackLog(raw, &older, stop)) return;
         raw.clear();
         std::string crashName; std::vector<unsigned char> crash;
-        const bool haveCrash = FindCrash(j.gameFolder, havePrev ? prevEnd : 0, &crashName, &crash);
+        const int crashLaunch = FindCrash(j.gameFolder, havePrev ? prevEnd : 0, haveOlder ? olderEnd : 0, &crashName, &crash);
+        const bool haveCrash = crashLaunch != 0;
         /* the nearby players' logs: the main thread hands them over when its wait is over (coopbug::NearbyWaitOver) */
         std::vector<NearbyLog> nearby;
         std::string nearbyNote;
@@ -476,8 +488,25 @@ void RunJob(Job& j)
         /* the budget (372) */
         std::vector<ZipPart> parts;
         if (haveCur) { ZipPart p = { swnames::kLog, coopbug::kOrderThisLog, &cur, 0, "this launch's mod log" }; parts.push_back(p); }
-        if (havePrev) { ZipPart p = { swnames::kLogPrev, coopbug::kOrderPrevLog, &prev, 0, "the previous launch's mod log" }; parts.push_back(p); }
-        if (haveCrash) { ZipPart p = { crashName, coopbug::kOrderCrash, 0, &crash, "Kenshi's crash file from the previous launch" }; parts.push_back(p); }
+        if (havePrev)
+        {
+            ZipPart p = { swnames::kLogPrev, coopbug::EarlierLogOrder(1, crashLaunch), &prev, 0,
+                          crashLaunch == 1 ? "the mod log of the launch that crashed, the previous launch" : "the previous launch's mod log" };
+            parts.push_back(p);
+        }
+        if (haveOlder)
+        {
+            ZipPart p = { swnames::kLogPrev2, coopbug::EarlierLogOrder(2, crashLaunch), &older, 0,
+                          crashLaunch == 2 ? "the mod log of the launch that crashed, two launches ago" : "the mod log from two launches ago" };
+            parts.push_back(p);
+        }
+        if (haveCrash)
+        {
+            ZipPart p = { crashName, coopbug::kOrderCrash, 0, &crash,
+                          crashLaunch == 1 ? "Kenshi's crash file from the previous launch (it ended that launch)"
+                                           : "Kenshi's crash file from two launches ago (it ended that launch)" };
+            parts.push_back(p);
+        }
         for (size_t k = 0; k < nearby.size(); ++k)
         {
             ZipPart p = { "nearby/slot" + Num(nearby[k].slot) + "-" + coopbug::SafeName(nearby[k].name) + "/" + swnames::kLog,
@@ -536,7 +565,8 @@ void RunJob(Job& j)
         }
         if (!haveCur) m += std::string(swnames::kLog) + ": this launch's mod log could not be read\r\n";
         if (!havePrev) m += std::string(swnames::kLogPrev) + ": there is no previous launch's mod log\r\n";
-        if (!haveCrash) m += "No Kenshi crash file from the previous launch.\r\n";
+        if (!haveOlder) m += std::string(swnames::kLogPrev2) + ": there is no mod log from two launches ago\r\n";
+        if (!haveCrash) m += "No Kenshi crash file from the last two launches.\r\n";
         m += "\r\nNearby players: " + nearbyNote + "\r\n";
         es[0] = coopbug::StoredEntry("report.txt", m);
         SYSTEMTIME lt; ::GetLocalTime(&lt);
@@ -620,6 +650,7 @@ void AnswerStart(unsigned int askId, unsigned int slot, unsigned int maxBytes)
     { Lock l; g_ans.ready = 0; g_ans.bundle.clear(); }
     g_ans.askId = askId; g_ans.slot = slot; g_ans.next = 0; g_ans.parts = 0; g_ans.askAtMs = now;
     g_ans.state = 1;
+    coop::ReportDoors();   /* the door totals and reload[...] line go into the log this answer sends */
     const uintptr_t t = _beginthreadex(NULL, 0, &AnswerMain, a, 0, NULL);
     if (t == 0) { delete a; g_ans.state = 0; ErrorLog("[BUG] a nearby log ask from slot " + Num(slot) + " not answered: no worker thread"); return; }
     ::CloseHandle((HANDLE)t);
@@ -747,7 +778,8 @@ void StartJob(const std::string& desc, int sendOnly)
     j->where = WhereNow();
     j->info = "Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
               + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
-    j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->gameFolder = GameFolder();
+    j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->gameFolder = GameFolder();
+    if (!sendOnly) coop::ReportDoors();   /* the door totals and reload[...] line go into the log this report packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &JobMain, j, 0, NULL);
     if (t == 0)
     {

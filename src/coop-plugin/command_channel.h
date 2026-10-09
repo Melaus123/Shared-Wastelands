@@ -39,7 +39,8 @@ int LoadPostReady();   /* T-201 PP6' fold: 1 a load can be posted now, 0 a reque
 // Cheap: does real work only every kPollInterval calls.
 void CommandChannelTick();
 
-// Absolute path of a file sitting next to our DLL.
+// Absolute path of a file sitting next to our DLL, in UTF-8 - open it with the u8file.h calls, never an A-call.
+// `filename` alone when Windows cannot name the DLL's file.
 std::string PathNextToDll(const char* filename);
 
 // P008 (defined in coop.cpp): flip the engine's world-wide AI freeze flag (F064).

@@ -110,8 +110,8 @@ cl /nologo /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS 
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include /I third_party\minhook\include ^
    coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_channel.cpp ai_spike.cpp spawn.cpp replicate.cpp combat.cpp medical.cpp ^
-   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp ^
-   net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\steam_probe.cpp ^
+   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp u8file.cpp ^
+   net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\routerask.cpp net\steam_probe.cpp ^
    ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
    callbacks.obj compress.obj host.obj list.obj packet.obj peer.obj protocol.obj win32.obj ^
    obj\minhook\buffer.obj obj\minhook\hook.obj obj\minhook\trampoline.obj obj\minhook\hde32.obj obj\minhook\hde64.obj ^

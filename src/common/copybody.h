@@ -15,9 +15,16 @@
  * next ordinary update, so a held rebuild is retried until it runs and is never lost. A rebuild between frames is safe:
  * set-body cleans the blend up and the pass then skips the character.
  *
- * INPUTS (0 / nonzero): onMain = the call is on the main thread; copy = a replicated copy this game does not own;
- * entity = it has a body (app +0xD8); ragdoll = the ragdoll object exists; inPass = the main thread is inside the
- * engine's ragdoll pass now; fault = a read faulted. Off the main thread it never waits; on the main thread a fault waits.
+ * A HOLD OUTLIVES AN OWNERSHIP CHANGE. A copy held lying in ragdoll that becomes this game's own (an area hand-over) is still
+ * lying in ragdoll with the rebuild the mod queued while it was a copy, so its hold goes on (heldBefore); so does a rebuild the
+ * mod queued that has not run yet, hold or no hold (the caller's mark). A rebuild the engine
+ * queues on a body this game already owned, with no hold carried over, is left to the engine as in a game without the mod.
+ *
+ * INPUTS (0 / nonzero): onMain = the call is on the main thread; replicated = a character the mod replicates (it has a
+ * uid), whoever owns it; owned = this game owns that uid now; heldBefore = this uid's rebuild is already being held (its
+ * hold began while it was a copy, or the mod queued it and it has not run yet, or the caller is the mod's own look change); entity = it has a body (app +0xD8); ragdoll = the ragdoll object exists; inPass = the main
+ * thread is inside the engine's ragdoll pass now; fault = a read faulted. Off the main thread it never waits; on the main
+ * thread a fault waits.
  *
  * C++03 (VS2010 v100): no auto, no nullptr, no range-for.
  */
@@ -28,11 +35,15 @@ namespace coopbody {
 
 enum { kCopyBodyRun = 0, kCopyBodyWait = 1 };
 
-inline int CopyBodyDecide(int onMain, int copy, int entity, int ragdoll, int inPass, int fault)
+/* heldBefore: this uid's rebuild is already being held (its hold began while it was a copy, or the caller is the mod's own look
+   change). A body this game owns waits only then - the rebuild the mod queued while it was a copy outlives an ownership change;
+   a rebuild the engine queues on its own character is left to the engine, as in a game without the mod. */
+inline int CopyBodyDecide(int onMain, int replicated, int owned, int heldBefore, int entity, int ragdoll, int inPass, int fault)
 {
     if (onMain == 0) return kCopyBodyRun;
+    if (owned != 0 && heldBefore == 0) return kCopyBodyRun;          /* this game's own, no hold carried over */
     if (fault != 0) return kCopyBodyWait;
-    if (copy == 0 || entity == 0) return kCopyBodyRun;   /* not a copy, or no old body: nothing is destroyed */
+    if (replicated == 0 || entity == 0) return kCopyBodyRun;         /* not replicated, or no old body: nothing is destroyed */
     return (ragdoll != 0 || inPass != 0) ? kCopyBodyWait : kCopyBodyRun;
 }
 

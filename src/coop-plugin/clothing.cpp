@@ -1367,6 +1367,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
         }
         LimbLog(uid, i, step, cs, w.state[i], w.sid[i], fromPeer, outcome);
     }
+    CopyBodyNoteModApply(uid, c);   // a rebuild the limb apply queued is held in ragdoll whoever owns it
 }
 
 static std::string LimbF(float v)
@@ -1464,6 +1465,7 @@ static void LimbTestDrain()
             }
         }
     }
+    CopyBodyNoteModApply(t.uid, c);   // a rebuild the lever's limb change queued is held in ragdoll (TEST)
     DebugLog(head + " before=[" + before + "] after=[" + LimbStateText(c) + "] -> " + outcome);
 }
 

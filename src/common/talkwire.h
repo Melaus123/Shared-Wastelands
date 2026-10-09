@@ -6,7 +6,7 @@
  *
  *   u8 kind | u32 convId | u32 npcUid | u32 targetUid | the kind's fields:
  *     1 PROMPT  u8 event | s16 lineSid | s16 npcText | u8 n (<= 10) | n x (s16 replyId | s16 replyText) | u32 deadlineMs
- *     2 ANSWER  u8 result | i32 index | s16 replyId
+ *     2 ANSWER  u8 result | i32 index | s16 replyId | i32 purse (the talker's purse on its own game, -1 unknown)
  *     3 END     u8 reason
  *     4 ACT, 5 ACT_RESULT - P26 stage 5 (protocol 103), below the END reasons
  *     6 REQUEST - P25 (protocol 109), below; P25 also appends u32 reqId to PROMPT and u32 reqId | u8 why | u8 endsType to END
@@ -185,7 +185,8 @@ inline int TalkActEndsTalk(int type) { return (type == 1 || type == 11) ? 1 : 0;
    OWNS. The talker's game (B) does not run it: its click on the NPC's copy becomes a REQUEST, and the NPC's owner (A) starts the
    conversation on its REAL NPC with its copy of B's character - the P26 road from there (PROMPT / ANSWER / ACT / END), so the NPC's
    orders, locks, memory and campaigns change on A and B's own consequences come back to B as ACT.
-     6 REQUEST  u32 reqId | u8 event        (header: convId 0, npcUid = the NPC, targetUid = the talker - B's own character)
+     6 REQUEST  u32 reqId | u8 event | i32 purse   (header: convId 0, npcUid = the NPC, targetUid = the talker - B's own character;
+                purse: the talker's purse on its own game, -1 unknown - the NPC's game answers its money condition with it)
    PROMPT gains a last field u32 reqId (the REQUEST it answers; 0 = a conversation the NPC's game started itself). END gains
    u32 reqId | u8 why | u8 endsType: reason 7 NOT_STARTED (convId 0) names the REQUEST and why it was not started (kTalkWhy*);
    endsType 1 TRADE / 11 CHARACTER_EDITOR = the line that ended the conversation opens that window, which the talker's game opens
@@ -269,6 +270,38 @@ inline int TalkP25NotStartedWhy(int called, int endLater, int reached, int hadLi
 const int kTalkLocalNone = 0, kTalkLocalTrade = 1, kTalkLocalEditor = 2;
 inline int TalkEndsLocal(int endsType) { return endsType == 1 ? kTalkLocalTrade : (endsType == 11 ? kTalkLocalEditor : kTalkLocalNone); }
 
+/* The engine's money condition (DialogConditionEnum 2) as Dialogue's condition check answers it (0x670AA0, Read
+   build/decomp_670aa0.txt): compare 1 (less than) = purse < val; any other compare = val <= purse (an equal purse passes). */
+inline bool TalkMoneyCond(int cmp, int val, int purse)
+{
+    return cmp == 1 ? (purse < val) : (val <= purse);
+}
+
+/* The talker's purse after its game applies an ACT's actions {types, values} (speech.cpp TkApplyAct): that game refuses the whole
+   ACT when the line's TAKE_MONEY (8) total - a hire's price included - is more than its purse (NO_MONEY: unchanged); otherwise
+   TAKE_MONEY comes off and GIVE_MONEY (9) goes on. A TAKE_MONEY in a line with a hire (3 / 18) is the hire's price: it comes off
+   later on the hire road, only when the NPC's owner agrees - not counted here. 10 PAY_BOUNTY's reward is the carried person's
+   bounty, which the sender does not know - not counted. A result below 0 = -1 (unknown); above the int range = its top.
+   purse < 0 (unknown) is returned as it is. */
+inline int TalkPurseAfterAct(int purse, const std::vector<int>& types, const std::vector<int>& values)
+{
+    if (purse < 0) return purse;
+    const size_t n = types.size() < values.size() ? types.size() : values.size();
+    int hire = 0;
+    for (size_t i = 0; i < n; ++i) if (TalkActSide(types[i]) == kTalkSideHire) hire = 1;
+    long long take = 0, give = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (types[i] == 8) take += values[i];
+        else if (types[i] == 9) give += values[i];
+    }
+    if (take > (long long)purse) return purse;
+    const long long r = (long long)purse + give - (hire ? 0 : take);
+    if (r < 0) return -1;
+    if (r > (long long)0x7FFFFFFF) return 0x7FFFFFFF;
+    return (int)r;
+}
+
 /* P26s5 fold 1: ACT_RESULT anyApplied */
 const int kTalkAnyNone    = 0;   /* nothing of the ACT was applied there */
 const int kTalkAnyYes     = 1;   /* some part was applied there (whatever the result) */
@@ -305,9 +338,10 @@ struct TalkMsg
     int why;                                    /* P25: END NOT_STARTED - kTalkWhy* */
     int endsType;                               /* P25: END - 1 TRADE / 11 CHARACTER_EDITOR: the talker's game opens that window */
     unsigned int carriedUid;                    /* ACT: the person the addressed character carries on the sender's game, 0 none */
+    int purse;                                  /* REQUEST / ANSWER: the talker's purse on its own game, -1 unknown - the NPC's game answers its money condition with it */
     TalkMsg() : kind(0), convId(0), npcUid(0), targetUid(0), event(0), deadlineMs(0), result(0), index(-1), reason(0),
                 seq(0), detail(0), moneyBefore(-1), moneyAfter(-1), applied(0), unsupported(0), anyApplied(0),
-                reqId(0), why(0), endsType(0), carriedUid(0) {}
+                reqId(0), why(0), endsType(0), carriedUid(0), purse(-1) {}
 };
 
 inline const char* TalkKindName(int k)
@@ -415,6 +449,7 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         TalkPut8(&b, (unsigned int)m.result);
         TalkPut32(&b, (unsigned int)m.index);
         if (!TalkPutStr(&b, m.replyId, kTalkMaxId)) return false;
+        TalkPut32(&b, (unsigned int)m.purse);
     }
     else if (m.kind == kTalkAct)   /* P26 stage 5 */
     {
@@ -462,6 +497,7 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         if (m.event < 0 || m.event > 255) return false;
         TalkPut32(&b, m.reqId);
         TalkPut8(&b, (unsigned int)m.event);
+        TalkPut32(&b, (unsigned int)m.purse);
     }
     else
     {
@@ -550,6 +586,8 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
         if (!TalkGet32(&r, &v)) return r.err;
         t.index = (int)v;
         if (!TalkGetStr(&r, &t.replyId, kTalkMaxId)) return r.err;
+        if (!TalkGet32(&r, &v)) return r.err;
+        t.purse = (int)v;
     }
     else if (t.kind == kTalkAct)   /* P26 stage 5 */
     {
@@ -598,6 +636,8 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
     {
         if (!TalkGet32(&r, &t.reqId) || !TalkGet8(&r, &v)) return r.err;
         t.event = (int)v;
+        if (!TalkGet32(&r, &v)) return r.err;
+        t.purse = (int)v;
     }
     else
     {

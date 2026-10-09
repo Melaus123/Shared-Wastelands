@@ -157,6 +157,62 @@ inline int PlayerGoneHoldDecide(double heldAt, double now, double graceSec, bool
     if (admittedAgain) return kPgHoldCancel;
     return (now - heldAt >= graceSec) ? kPgHoldSend : kPgHoldWait;
 }
+/* THE HOLD AS A GAME KNOWS IT: the world server's kGraceSec (store_main.cpp), the same number. A game cannot read the world server's
+   constant; it uses this one where it must judge "away longer than the hold" itself (lostcopy.h ReturnGiveUpOwnerGone). */
+const double kPlayerGoneHoldSec = 10.0;
+/* The margin a game adds to that hold where it judges an absence by its own clock (the return check: its own link-down, another
+   player's time out of the world roster) - its reads come a little apart from the world server's own close and hold. */
+const double kReturnAwayMarginSec = 10.0;
+
+/* A FINAL LEAVE'S NPCs - PLAYER_GONE arrives only after the world server's hold (PlayerGoneHoldDecide), so a link
+   blip never reaches this. For each row of the leaver's that this game holds a copy of: the leaver's own player characters and the
+   people of a player faction go as before (kGtDrop); an NPC is taken over by the FIRST game of the area's receiver order - the order a
+   live hand-over offers in (liveowner.h AreaReceiverOrder, asked as the leaver: every other in-world game with the area loaded whose
+   engine would keep it at its spot, the area's holder first, then the lower slot). That game takes it (kGtTake); every other game keeps
+   its copy and the leaver's row (kGtWait) until the taker's OWNER_MOVED re-keys it. A map that cannot say now (stale, or this game has
+   no slot yet) is asked again at the next look (kGtHold); that hold ends after kGoneTakeLooksMax looks (one a second) and the copy
+   goes as before. A first receiver that has not taken it within kGoneTakeLooksMax looks is passed over (kGtNext): the caller adds that
+   slot to its tried list (GoneTakeTriedAdd) and asks the order again without it, as the live RELEASE walk does, so the next game in
+   line takes it; the copy goes only when no untried game is left (receivers 0). No copy here, or no game with the area loaded: as
+   before.
+   playerChar: 1 a player character or a person of a player faction, 0 an NPC, -1 unreadable (as before: it goes); receivers:
+   AreaReceiverOrder's answer asked as the leaver (-1 hold, 0 none, k >= 1); firstSlot: its first slot; mySlot: this game's slot (-1
+   not known yet); looks: the looks already made at this first receiver (or in this hold). */
+enum { kGtDrop = 0, kGtTake = 1, kGtWait = 2, kGtHold = 3, kGtNext = 4 };
+const int kGoneTakeLooksMax = 15;
+inline int GoneTakeOverDecide(int playerChar, int haveCopy, int receivers, int firstSlot, int mySlot, int looks)
+{
+    if (playerChar != 0 || haveCopy == 0) return kGtDrop;
+    const bool more = looks < kGoneTakeLooksMax;
+    if (mySlot < 0 || receivers < 0) return more ? kGtHold : kGtDrop;
+    if (receivers == 0) return kGtDrop;
+    if (firstSlot == mySlot) return kGtTake;
+    return more ? kGtWait : kGtNext;
+}
+/* A held or waiting row is settled once it no longer carries the leaver's key: the taker's OWNER_MOVED re-keyed it, this game took
+   it, or it went. */
+inline bool GoneTakeSettled(const OwnerMap& owners, const UidSet& local, unsigned int uid, unsigned int goneKey)
+{
+    return !PeerGoneStillTheirs(owners, local, uid, goneKey);
+}
+/* A passed-over receiver joins the tried list once (the order never names a tried slot again, so the walk ends). Answers 1 when it
+   was added. */
+inline int GoneTakeTriedAdd(std::vector<int>* tried, int slot)
+{
+    if (tried == 0 || slot < 0) return 0;
+    for (size_t i = 0; i < tried->size(); ++i) if ((*tried)[i] == slot) return 0;
+    tried->push_back(slot);
+    return 1;
+}
+
+/* THE SESSION'S END (net/session.cpp SessionLeave, SessionHost, SessionJoin): which owner rows go. With the world-server link up, a
+   row keyed to a world-road player (a slot key) that this game did not author stays - that player is still reached through the world
+   server and only the session ended; the session peer's own rows were taken at the link's DOWN edge before this. Every other row goes
+   (this game's own rows from the per-session view only: the authorship set keeps them), and with the world link down every row goes. */
+inline bool SessionEndKeepsRow(bool worldLinkUp, bool authoredHere, unsigned int key)
+{
+    return worldLinkUp && !authoredHere && cooplive::IsRelayPeer(key);
+}
 
 }   /* namespace cooppg */
 

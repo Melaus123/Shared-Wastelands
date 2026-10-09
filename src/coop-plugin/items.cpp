@@ -35,6 +35,8 @@
 // carries the APPLYING THREAD's id rather than a bool, exactly as worldstate.cpp's g_wsApplyingThread does, so
 // a genuine move on a worker thread is not swallowed as if it were our own echo.
 #include "items.h"
+#include "farm.h"              /* MineStepRelay / MineLinked - a worker's step on a building another game writes */
+#include "../common/farmwire.h"   /* coopfarm::MineStepRoute, the three-way production writer */
 #include "build.h"          /* build1h: BuildRecordedOwnerSlot - the shared build record */
 #include "../common/paritywire.h"   /* par1: MSG_PARITY_REQ / MSG_PARITY_BOX payloads and the box digest */
 #include "../common/snapdigest.h"   /* snap1 (user decision 2026-09-26): the snapshot verb's order-free inventory digest */
@@ -64,6 +66,8 @@
 #include "clothing.h"         /* T-1 B2: CaptureGarments / GarmentSummary - the pack wearers' MSG_CLOTHING after a wandering restock */
 #include "../common/tradecharge.h"   /* T-164 B4-1: the charge arithmetic and the keeper lever's affordable pick - shared with the offline suite */
 #include "../common/shopstock.h"   /* T-164 B4-4: shop recognition by the trader's home pieces, the piece by item record, the keeper's pot */
+#include "../common/townprices.h"   /* T-619: the host's town price tables and the holder's price-leg test */
+#include "../common/liveenvelope.h"   /* cooplive::IsRelayPeer / RelayPeerSlot - which road a TOWN_PRICES came by */
 #include "../common/keeperaim.h"   /* lev343-include (owner 343 b): where `buytest keeper` aims - shared with the offline suite */
 #include "../common/wanderrestock.h"   /* T-1 B2 (owner 109): who restocks a wandering trader - the pure rule, shared with the offline suite */
 #include "../common/reqserial.h"   /* T-336: the request counter's random base per launch - shared with the offline suite */
@@ -109,6 +113,7 @@
 #include "../common/joblever.h"   /* P17 / P43 TEST-ONLY levers: jobtest and `boxdigest ... players` argument shapes, the cage name test */
 #include "game/hand.h"   /* PROBE P085: an interior piece is a hand (as build.cpp build1-e / spawn.cpp BED1) */
 #include "towngen.h"            /* PROBE P085: TownGenP085Sector - this game's town generation per sector */
+#include "u8file.h"             /* UTF-8 paths over the wide Windows calls - the loot journal sits under the data folder */
 
 namespace coop {
 /* inv2a (user decision 2026-09-26): THE INVENTORY SAFETY NET - defined just above ItemsTick. EVERY ITEM_MOVE this file
@@ -1503,6 +1508,11 @@ long long g_restockSinglePlayer = 0;
    above the gate; `prodUnreadable` the building's position could not be read, so the step ran (fail open,
    exactly as the restock gate does). */
 long long g_prodRanHolder = 0, g_prodSkippedNotHolder = 0, g_prodWorkerPassed = 0, g_prodSinglePlayer = 0, g_prodUnreadable = 0;
+/* `prodWorkerRelayed` a worker's step NOT run here because this game does not write the building (another game does, or no
+   game is named yet) - its work was kept for the writer as MINE_OP; `prodWorkerUnrelayed` such a step run here anyway (no key,
+   the relay table full, an unusable amount). workerPassed counts the worker steps run here as the writer (or with nobody else
+   in the world). */
+long long g_prodWorkerRelayed = 0, g_prodWorkerUnrelayed = 0;
 // ---- P6k: the review-p6d folds ----
 // `rollbackPlaceFaulted` (M-1): ItPlacePod faulted inside the E22b-2 OWNER ROLLBACK. That is a real player
 // drag on its 10 s deadline with no lever anywhere near it, and it used to be printed inside
@@ -3896,6 +3906,7 @@ std::string g_shopLastBuySid;   /* T-1 B5 fold 1 TEST-ONLY (packbuytest sid=last
 ItemMoveMsg g_shopLastBuyDesc; int g_shopLastBuyHaveDesc = 0;   /* T-1 B5 fold 2 TEST-ONLY: that buy's full description (packfill template=created) */
 std::string ShopInterceptDetail();
 void ShopWorldTeardown();                                      /* B4-4 part 1 fold (review MED 5): from ItemsWorldTeardown */
+void PtWorldTeardown();                                        /* T-619: from ItemsWorldTeardown - the kept town price tables */
 int ShopRevokeApplied(unsigned int id, unsigned int fromPeer, unsigned int epoch, int kind); /* B4-4 fold 2 (MED 2): from ApplyShopTail - a shop revoke (kind 0) or ack (kind 1) naming {peer, epoch, id} */
 /* T-164 part 2 (design I2-I4): the drag's intercepts, defined with the shop block */
 int ShopPickupGate(void* gui, void* sectionStr);
@@ -6476,10 +6487,10 @@ int ItAreaVerdictAt(const float* pos, int forBox)
     const int pic = coop::StoreAreaPictureVerdict();
     if (pic == coop::kPicLoading)
     {
-        if (forBox == kAreaForGround) ++g_grArea[3]; else if (forBox == kAreaForDoor) ++g_doorLoadWindow; else if (forBox != 0) ++g_boxLoadWindow; else ++g_restockLoadWindow;
+        if (forBox == kAreaForGround) ++g_grArea[3]; else if (forBox == kAreaForDoor) ++g_doorLoadWindow; else if (forBox != 0) ++g_boxLoadWindow; else ::InterlockedIncrement64((volatile LONG64*)&g_restockLoadWindow);   /* forBox 0 is also asked from a worker's step off the main thread */
         return kBoxMine;
     }
-    if (pic == coop::kPicStale) { if (forBox == kAreaForGround) ++g_grArea[4]; else if (forBox == kAreaForDoor) ++g_doorStaleMap; else if (forBox != 0) ++g_boxStaleMap; else ++g_restockStaleMap; }
+    if (pic == coop::kPicStale) { if (forBox == kAreaForGround) ++g_grArea[4]; else if (forBox == kAreaForDoor) ++g_doorStaleMap; else if (forBox != 0) ++g_boxStaleMap; else ::InterlockedIncrement64((volatile LONG64*)&g_restockStaleMap); }
     if (pic == coop::kPicStale || pic == coop::kPicNoNotebook || !StoreRelayLinked())
     {
         /* P6y fold 5 (review-p6o HIGH-4). NO SESSION AT ALL -> FAIL OPEN, AND IT IS ABOVE EVERYTHING ELSE.
@@ -6501,7 +6512,7 @@ int ItAreaVerdictAt(const float* pos, int forBox)
            IN_WORLD (no roster at all = alone, the no-world fail-open, unchanged). PlayersPresent counts it (presence[] box). */
         if (!coop::PlayersPresent(mppresence::kSiteBoxArea))
         {
-            if (forBox == kAreaForGround) ++g_grArea[5]; else if (forBox == kAreaForDoor) ++g_doorNoSession; else if (forBox != 0) ++g_boxNoSession; else ++g_restockNoSession;
+            if (forBox == kAreaForGround) ++g_grArea[5]; else if (forBox == kAreaForDoor) ++g_doorNoSession; else if (forBox != 0) ++g_boxNoSession; else ::InterlockedIncrement64((volatile LONG64*)&g_restockNoSession);
             return kBoxMine;
         }
         /* ================== B9 LADDER (design-e46-store 2.2-2.5; audit C7 RETIRED) ==================
@@ -6716,6 +6727,26 @@ int ItFactionOwnerClass(void* bld, int* slot)
     }
     return cls;
 }
+/* 1 when the building's operate slot (vt+0x4B0) is ProductionBuilding::operate 0x2986C0 - a mining node or another
+   production machine (a farm's slot is FarmBuilding::operate and does not match). The slot holds the incremental-link jump
+   thunk, so up to two E9 jumps are followed to the function. */
+long long g_ownNodeMarkIgnored = 0;   /* a production building's own faction mark read as nobody's (coopown::MarkOnlyNodeClass) */
+int ItProdSlotIs(const void* b)
+{
+    if (g_base == 0 || kProductionOperateRva == 0 || !ItPlaus(b)) return 0;
+    const uintptr_t want = g_base + (uintptr_t)kProductionOperateRva;
+    __try
+    {
+        uintptr_t p = (uintptr_t)(*(void* const* const*)b)[0x4B0 / sizeof(void*)];
+        for (int i = 0; i < 2 && p != want; ++i)
+        {
+            if (p == 0 || *(const unsigned char*)p != 0xE9) break;
+            p = p + 5 + (intptr_t)*(const int*)(p + 1);
+        }
+        return (p == want) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 /* THE BOX'S OWNER (decision 2). Building+0x238 -> Layout+0x90 is the building whose layout the piece is in (LayoutOuterKey's
    two loads); when a player owns (or may own) that host, the host's owner is the box's owner (*via 1). Else the box's own
    (*via 0). A piece made with isIndoorsOf only (build1-e form 2) has no layout pointer and reads as its own. MAIN THREAD. */
@@ -6739,8 +6770,11 @@ int ItBoxOwnerOf(void* b, int* slot, int* via, int* disagree = 0)
     char rk[64];
     rk[0] = 0;
     const int recSlot = (ObjectPositionKey(b, rk, (int)sizeof rk, "", 0, 1) != 0) ? BuildRecordedOwnerSlot(rk) : -1;
-    const int cls = coopown::PickOwnerRec(recSlot >= 0 ? 1 : 0, recSlot, MySlotForWire(), hostFound, hostCls, hostSlot, selfCls, selfSlot,
-                                          slot, via);
+    const int picked = coopown::PickOwnerRec(recSlot >= 0 ? 1 : 0, recSlot, MySlotForWire(), hostFound, hostCls, hostSlot, selfCls, selfSlot,
+                                             slot, via);
+    /* a production building claimed only by its own faction mark is nobody's - the area rule writes it */
+    const int cls = coopown::MarkOnlyNodeClass((*via == 0 && picked != coopown::kOwnNone) ? ItProdSlotIs(b) : 0, *via, picked);
+    if (cls != picked) { *slot = -1; ++g_ownNodeMarkIgnored; }
     if (disagree != 0 && recSlot >= 0 && (cls != eCls || *slot != eSlot)) *disagree = 2 + eCls;
     return cls;
 }
@@ -6804,11 +6838,17 @@ std::string ItOwnWord(int cls, int slot)
     if (cls == coopown::kOwnUnreadable) return "unread";
     return "none";
 }
-std::string ItWriterWord(int v, int byOwner, int ownerSlot)
+std::string ItWriterWord(int v, int byOwner, int ownerSlot, const std::string& key)
 {
     std::string w;
     if (v == kBoxMine) w = "slot" + N((long long)MySlotForWire());
-    else if (v == kBoxHeld) w = "slot" + N((long long)(byOwner != 0 ? ownerSlot : LinkPeerSlot()));
+    else if (v == kBoxHeld && byOwner != 0) w = "slot" + N((long long)ownerSlot);
+    else if (v == kBoxHeld)
+    {   /* the area rule: the holder of the box's sector on the area map (the old link's peer only when the map names none) */
+        int sx = -1, sy = -1, h = -1;
+        if (ItemKeySector(key, &sx, &sy) != 0) h = ItemAreaWriterSlot(sx, sy);
+        w = "slot" + N((long long)(h >= 0 ? h : LinkPeerSlot()));
+    }
     else w = "none(v" + N((long long)v) + ")";
     return w + (byOwner != 0 ? " rule=owner" : " rule=area");
 }
@@ -6818,7 +6858,7 @@ void ItBoxOwnNote(const char* key, int cls, int slot, int via, int v, int byOwne
     if (key == 0 || key[0] == 0) return;
     if (force == 0 && cls != coopown::kOwnMe && cls != coopown::kOwnPeer && cls != coopown::kOwnShared) return;
     const std::string label = "owner=" + ItOwnWord(cls, slot) + " via=" + std::string(via == 2 ? "record" : (via != 0 ? "host" : "self"))
-                            + " writer=" + ItWriterWord(v, byOwner, slot);
+                            + " writer=" + ItWriterWord(v, byOwner, slot, std::string(key));
     const std::string k(key);
     if (force == 0)
     {
@@ -7744,28 +7784,65 @@ void detour_closeAllInventories(void* gui)
 // (loadWindow / staleMap / noSession / ring1Presumed and wrEntered's restock column) - stated, not hidden.
 // A SKIPPED STEP LOSES NOTHING ON THE HOLDER: the holder runs it and the made item reaches this game as an
 // ordinary box move.
-int ItProdHolder(void* pb)
+/* THE PRODUCTION WRITER, three ways (coopfarm::kProdWriter*): 1 this game, 2 another game holds it (by the owner or the area),
+   0 no answer now. An unreadable building answers 1 (fail open, as the restock gate). */
+int ItProdWriter(void* pb)
 {
-    if (g_base == 0 || !ItPlaus(pb)) { ++g_prodUnreadable; return 1; }
+    if (g_base == 0 || !ItPlaus(pb)) { ++g_prodUnreadable; return coopfarm::kProdWriterHere; }
     float p[3] = { 0.0f, 0.0f, 0.0f };
-    if (ItBoxPosPod(pb, p) == 0) { ++g_prodUnreadable; return 1; }
+    if (ItBoxPosPod(pb, p) == 0) { ++g_prodUnreadable; return coopfarm::kProdWriterHere; }
     /* inv4 P4 (decision 3, design site 12): the owner's game runs its machine while it is online and holds the area;
-       otherwise the area holder does (forBox 0: restock's area counters, as before) */
+       otherwise the area holder does (forBox 0: restock's area counters, as before). The ladder is asked WITH the building's
+       key: off the main thread (a worker's step) it then answers from the owner class the main thread recorded for that key -
+       a keyless ask off the main thread is always "no answer" - and on the main thread the ask records that class. */
+    char pk[kBoxKeyCap]; pk[0] = 0;
+    const int hasKey = (ItBoxKeyBuild(pb, pk, kBoxKeyCap, 0, 0) != 0 && pk[0] != 0) ? 1 : 0;
     int prodByO = 0;
-    int v = ItBoxWriterDecide(pb, p, 0, 0, &prodByO, "prod");
-    if (v == kBoxMine && prodByO != 0)
-    {   /* inv4b 4: the owner's own machine waits for its building's hand-back too (the gate needs the building's key; a key
-           that cannot be built leaves the step as before) */
-        char pk[kBoxKeyCap]; pk[0] = 0;
-        if (ItBoxKeyBuild(pb, pk, kBoxKeyCap, 0, 0) != 0 && pk[0] != 0) v = ItHandbackGate(pb, pk, p);
-    }
-    return (v == kBoxMine) ? 1 : 0;
+    /* inv4b 4: the owner's own machine waits for its building's hand-back too - with the key given, the ladder applies that
+       gate itself (ItBoxWriterDecide fold 4); a key that cannot be built leaves the step ungated, as before */
+    int v = ItBoxWriterDecide(pb, p, hasKey != 0 ? pk : 0, 0, &prodByO, "prod");
+    if (v == kBoxMine) return coopfarm::kProdWriterHere;
+    if (v == kBoxHeld) return coopfarm::kProdWriterOther;
+    return coopfarm::kProdWriterNone;
+}
+int ItProdHolder(void* pb) { return (ItProdWriter(pb) == coopfarm::kProdWriterHere) ? 1 : 0; }
+/* The worker path's answer, kept per building key for kProdWriterKeepMs on the main thread: a worker's step rings every frame,
+   and the writer ladder books its area counters on every ask. Off the main thread it is asked directly. */
+struct ItProdWriterMemo { int v; DWORD at; };
+std::map<std::string, ItProdWriterMemo> g_prodWriterMemo;
+const DWORD kProdWriterKeepMs = 250;
+const size_t kProdWriterMemoCap = 512;
+long long g_prodWriterMemoHit = 0;
+int ItProdWriterKept(void* pb)
+{
+    if (ItOnMainThread() == 0 || !ItPlaus(pb)) return ItProdWriter(pb);
+    char pk[kBoxKeyCap]; pk[0] = 0;
+    if (ItBoxKeyBuild(pb, pk, kBoxKeyCap, 0, 0) == 0 || pk[0] == 0) return ItProdWriter(pb);
+    const DWORD now = ::GetTickCount();
+    const std::string k(pk);
+    std::map<std::string, ItProdWriterMemo>::iterator it = g_prodWriterMemo.find(k);
+    if (it != g_prodWriterMemo.end() && now - it->second.at < kProdWriterKeepMs) { ++g_prodWriterMemoHit; return it->second.v; }
+    const int v = ItProdWriter(pb);
+    if (it == g_prodWriterMemo.end() && g_prodWriterMemo.size() >= kProdWriterMemoCap) g_prodWriterMemo.clear();
+    ItProdWriterMemo& m = g_prodWriterMemo[k];
+    m.v = v; m.at = now;
+    return v;
 }
 void detour_prodOperate(void* pb, void* who, float dt)
 {
     /* A lone game makes its own items, above every counter of the gate (decision 43, as the restock gate). */
     if (RoleIsSingle()) { ++g_prodSinglePlayer; orig_prodOperate(pb, who, dt); return; }
-    if (who != 0) { ++g_prodWorkerPassed; orig_prodOperate(pb, who, dt); return; }
+    if (who != 0)
+    {   /* a WORKER'S step (a character mining a node or working a machine) runs on the building's writer only; on any other
+           game its work is kept and goes to the writer as MINE_OP (farm.cpp) - waiting while no writer is named - and the ore
+           reaches this game as a box move */
+        const int writer = ItProdWriterKept(pb);
+        if (coopfarm::MineStepRoute(0, MineLinked(), writer) == coopfarm::kMineRun) { ++g_prodWorkerPassed; orig_prodOperate(pb, who, dt); return; }
+        if (MineStepRelay(pb, who, dt) != 0) { ++g_prodWorkerRelayed; return; }
+        ++g_prodWorkerUnrelayed;   /* no key, or the relay table is full: the step runs here, as before */
+        orig_prodOperate(pb, who, dt);
+        return;
+    }
     if (ItProdHolder(pb) == 0)
     {
         ++g_prodSkippedNotHolder;
@@ -16622,7 +16699,7 @@ bool BuyTestKeeper(const std::string& pick, int sell, int cats)
 
     /* AFTER */
     int purseAfter = 0;
-    const int havePurseAfter = (g_btKeeper.buyer != 0 && ItObj(g_btKeeper.buyer)) ? ItPurseRead(g_btKeeper.buyer, &purseAfter) : 0;
+    const int havePurseAfter = (LiveCharacter(g_btKeeper.buyer) != 0 && ItObj(g_btKeeper.buyer)) ? ItPurseRead(g_btKeeper.buyer, &purseAfter) : 0;
     const int havePotAfter = ItObj(k.leader) ? KeeperPot((void*)k.leader, &potOwn, &potAfter) : 0;
     std::string counts, moved;
     long long movedN = 0;
@@ -16750,6 +16827,7 @@ std::string ItWanderReport()
         + N((long long)g_wanderPacks.size()) + "," + N((long long)g_wanderResendUids.size()) + "," + N(g_wanderNoteOffMain);
 }
 
+namespace { void PtInstallHooks(); }   /* T-619: defined below, in the same unnamed namespace (C2668) */
 void InstallItems()
 {
     g_base = (uintptr_t)::GetModuleHandleA(0);
@@ -16788,6 +16866,7 @@ void InstallItems()
         else DebugLog("[ITEMS] hook installed: Inventory::buyItem 0x749AF0 (inv2c: a counter stack lowered by an NPC purchase)");
     }
     else ErrorLog("[ITEMS] inv2c: the address table has no BuyItem row - a unit an NPC buys off a counter stack is NOT carried");
+    PtInstallHooks();   /* T-619: one price for one trade on every game */
     // E22b-2 (P6b). Without these two a mouse drag is invisible to the pairing (review-p5y HIGH-1) and drag
     // looting duplicates exactly as it did before E22b, so a failure here is said in those terms.
     std::memset(&g_ownerPend, 0, sizeof(g_ownerPend));
@@ -18994,6 +19073,7 @@ void ItemsWorldTeardown()
             ErrorLog("[ITEMS] T-164 211 world teardown: " + N((long long)parked) + " give-back(s) still parked for a box this game did not"
                      " write - forgotten with the world (they were in no inventory). Counted itemBoxTaker boxBackAtTeardown.");
     }
+    PtWorldTeardown();   /* T-619: the town tables kept from a sender this game did not yet name as its source name that world too */
     ShopWorldTeardown();   /* B4-4 part 1 fold (review MED 5): the pending shop trades, kept buys and applied rows name that world too - forgotten as g_pend is */
     g_tradeWinChurnDepth = 0;
     /* E22b-2: the owner's held objects and the held remove name that world too. The kept Item* are NOT
@@ -20291,6 +20371,669 @@ int ShopUnitPricePod(void* item, int isPlayer, int qty, int* out)
     __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
     return ok;
 }
+/* T-619 - ONE PRICE FOR ONE TRADE ON EVERY GAME. A shop's unit price is the item's value times the window's multipliers; two of
+   them differed between the games:
+   CULTURE: the item's trade multiplier (0x79DB30) asks the WINDOW TRADER's current town (vt+0x78 0x5C7F20 -> the record its vt+0x70
+     returns, +0x88) and multiplies by that town's trade culture for the item; a null town skips the step. The engine's only writer of
+     that field is the AI's periodic step 0x5A4750, which this plugin does not run for a copy, so a copy trader has no town and the game
+     showing the copy priced every culture at x1.0. While a trade window is open with a COPY trader that has no current town, the town
+     0x5A4750 gives a character with a null town at the trader's position (PtTownAtPod: its three town searches in its order - NOT its
+     last step, the town of the building the character's squad names, because a copy's squad is this plugin's, not the trader's) is
+     written into that one field for the length of each call of the item's trade multiplier on the main thread and put back to null
+     after it, so the price step - and nothing else - sees it. The position is the trader's live body position, not the record's +0xC8
+     that 0x5A4750 reads: that record is kept by the AI step, which does not run for a copy.
+   LOCAL: Town::getLocalTradePriceMult 0x92C6C0 reads a table each game's engine rolls at random on every load. The world's ONE price
+     source (townprice::PriceSource, one rule on every game: the lowest IN_WORLD roster slot, else the session host) sends its tables
+     (TOWN_PRICES, src/common/townprices.h) to every other game, each by one road; every other game, while its world runs, answers
+     0x92C6C0 from the source's table for that town and item, else with the engine's own number. The engine's table is never written.
+   THE HOLDER: a shop request carries the two legs its price used ('SHR4'; 'SHR3' when a leg is unread or out of range); the holder
+     reads the same legs on its real keeper and counts any price they would change by more than a cat (said once per keeper and item).
+     Counted only - nothing is refused. */
+unsigned long long kPtLocalMultRva = 0; static coop::AddrReg kPtLocalMultRva_reg("TownLocalTradePriceMult", &kPtLocalMultRva);   /* Steam_1.0.65 0x92C6C0 Town::getLocalTradePriceMult(GameData*) */
+unsigned long long kPtItemMultRva = 0; static coop::AddrReg kPtItemMultRva_reg("ItemTradeMult", &kPtItemMultRva);   /* 0x79DB30: the item's whole trade multiplier (trader x stolen x culture) */
+unsigned long long kPtWinTraderRva = 0; static coop::AddrReg kPtWinTraderRva_reg("TradeWindowTrader", &kPtWinTraderRva);   /* 0x70D700: the trader the item's trade multiplier asks */
+unsigned long long kPtHandTownRva = 0; static coop::AddrReg kPtHandTownRva_reg("TradeTownOfHand", &kPtHandTownRva);   /* 0x70C5A0: the town the open trade window was opened in (the local leg's town) */
+unsigned long long kPtCultureRva = 0; static coop::AddrReg kPtCultureRva_reg("TownFactionTradeCultureMult", &kPtCultureRva);   /* 0x92AFF0 Town::getFactionTradeCultureMult(GameData*) */
+unsigned long long kPtNearestRva = 0; static coop::AddrReg kPtNearestRva_reg("TownListNearest", &kPtNearestRva);   /* 0x927040 (TownList*, pos, exceptFaction, exceptTown, 0, kind): the nearest town */
+unsigned long long kPtContainsRva = 0; static coop::AddrReg kPtContainsRva_reg("TownContainsPoint", &kPtContainsRva);   /* 0x925E80 (town, pos, scale): the position is in the town */
+unsigned long long kPtNearestFallbackRva = 0; static coop::AddrReg kPtNearestFallbackRva_reg("TownListNearestFallback", &kPtNearestFallbackRva);   /* 0x926C00 (TownList*, pos, faction, exceptTown): the nearest entry of the TownList's second array on the ground plane - 0x5A4750's third search */
+unsigned long long kPtTownListRva = 0; static coop::AddrReg kPtTownListRva_reg("TownList", &kPtTownListRva);   /* 0x21330A0 (var): a POINTER to the TownList */
+unsigned long long kPtPlayerIfaceRva = 0; static coop::AddrReg kPtPlayerIfaceRva_reg("PlayerInterfaceGlobal", &kPtPlayerIfaceRva);   /* 0x2133630 (var): PlayerInterface* */
+const int kPtVtTownRecord = 0x70;     /* the character's slot 0x5C7F20 calls: its result holds the current town at +0x88 */
+const int kPtRecTown = 0x88;
+const int kPtVtCurrentTown = 0x78;    /* getCurrentTownLocation: the slot the item's trade multiplier calls on the window trader */
+const int kPtVtIsTown = 0x268;        /* TownBase::isTown */
+const int kPtIfaceFaction = 0x2A0;    /* PlayerInterface: the player faction 0x5A4750 excludes from its town search */
+const int kPtListN = 0x58, kPtListArr = 0x60;   /* TownList: the towns' count and pointer array (0x927040's loop) */
+const int kPtKindAny = 0xA;           /* 0x927040's kind argument for "any town" (0x5A4750 passes it) */
+const float kPtScaleNotPlayer = 1.25f; /* the scale 0x5A4750 passes to 0x925E80 for the player-faction-excluded nearest town */
+const float kPtScaleAny = 1.0f;       /* the scale it passes for its other searches when the character has no current town */
+const float kPtNearRange2 = 90000.0f; /* its near-point test: the squared distance below which the nearest town is kept */
+const int kPtVtTownA = 0x230, kPtVtTownB = 0x2F0;   /* TownBase slots that must both answer true before the near-point test */
+const int kPtVtTownNear = 0x308;      /* TownBase slot (pos) -> the object whose slot +0x38 gives the near point */
+const int kPtVtNearPoint = 0x38;      /* that object's slot (out Vector3, pos) */
+const int kPtLocalTable = 0x4B0;      /* Town: the local multiplier table 0x92C6C0 reads - +0x18 bucket count (a power of two), +0x20 size,
+                                         +0x38 buckets; a bucket points at a link whose +0 is its first node; node +0 next, +8 hash, +0x10 GameData* */
+const int kPtKeysCap = 4096;
+const int kPtSaidCap = 256;
+typedef float (*PtTownItemFn)(void* town, void* gd);
+typedef float (*PtItemFn)(void* item);
+typedef void* (*PtObjFn)();
+typedef void* (*PtSelfFn)(void* self);
+typedef void* (*PtNearestFn)(void* list, const float* pos, void* exceptFaction, void* exceptTown, void* relation, int kind);
+typedef bool (*PtContainsFn)(void* town, const float* pos, float scale);
+typedef void* (*PtNearest2Fn)(void* list, const float* pos, void* faction, void* exceptTown);
+typedef bool (*PtBoolFn)(void* self);
+typedef void* (*PtObjPosFn)(void* self, const float* pos);
+typedef void* (*PtPointFn)(void* self, float* out, const float* pos);
+PtTownItemFn orig_townLocalMult = 0;
+PtItemFn orig_itemTradeMult = 0;
+struct PtWin { void* side; void* trader; unsigned int uid; void* town; };
+PtWin g_ptWin = { 0, 0, 0, 0 };   /* MAIN THREAD: the open window's copy trader and the town its prices use (trader 0 = none) */
+long long g_ptWinOpens = 0, g_ptWinTown = 0, g_ptWinOwnTown = 0, g_ptWinNoTown = 0, g_ptPriced = 0, g_ptPriceFault = 0;
+townprice::Book g_ptBook;
+CRITICAL_SECTION g_ptBookLock;   /* the book is filed on the main thread and read wherever the engine prices */
+volatile LONG g_ptBookHave = 0;
+volatile LONG64 g_ptAnswered = 0, g_ptItemMiss = 0, g_ptTownMiss = 0;
+long g_ptEmptyEpoch = -1, g_ptEmptyWorld = -1;
+long long g_ptBursts = 0, g_ptSentSession = 0, g_ptSentLive = 0, g_ptSentLiveExcept = 0, g_ptLiveFail = 0;   /* sends: per road (tables) */
+long long g_ptRecvSession = 0, g_ptRecvLive = 0, g_ptRecvOtherRoad = 0, g_ptRecvNotSource = 0;   /* receipts: taken per road; refused */
+long long g_ptSentTowns = 0, g_ptSentMsgs = 0, g_ptSendFail = 0, g_ptDupTown = 0, g_ptGatherFault = 0, g_ptWalkBad = 0;
+long long g_ptRecvTowns = 0, g_ptRecvGens = 0, g_ptRecvBad = 0, g_ptRecvOnHost = 0;
+long long g_ptLegsChecked = 0, g_ptLegsAgree = 0, g_ptLegsDisagree = 0, g_ptLegsUnread = 0, g_ptLegsUnsent = 0;
+std::set<std::string> g_ptLegsSaid;
+struct PtAns { float v; int kind; };   /* the book's answer for one (town, item): kind 1 the source's number, 2 the town's table lacks the item, 3 no table for the town, 0 a stringID unread */
+std::map<std::pair<const void*, const void*>, PtAns> g_ptMemo;   /* under g_ptBookLock: (Town*, item GameData*) -> the answer, for book version g_ptMemoVer and world load g_ptMemoWorld; a hit reads no stringID and builds no string */
+unsigned long g_ptMemoVer = 0;
+long g_ptMemoWorld = -1;
+const size_t kPtMemoCap = 65536;
+volatile LONG g_ptIAmSource = 0;   /* PtSourceTick (main thread, every frame): 1 = this game is the world's price source - the hook reads it on any thread */
+int g_ptSrcMe = -1;                /* MAIN THREAD: the same, -1 before the first frame */
+long g_ptSrcKey = townprice::kSrcNone;   /* MAIN THREAD: who the source is (townprice::SourceKey) - PtNote compares a sender with it */
+int g_ptSrcRoster = 0;                   /* MAIN THREAD: the roster state that answer used - PtNote keys a sender the same way (townprice::SenderKey) */
+long long g_ptSrcEdges = 0, g_ptRetries = 0, g_ptGaveUp = 0, g_ptEncodeBad = 0, g_ptLegsAskBad = 0;
+long long g_ptKept = 0, g_ptKeptFull = 0, g_ptKeptFiled = 0, g_ptKeptFiles = 0, g_ptKeptAtTeardown = 0;   /* townprice::Kept: tables kept, refused at its cap, filed, filings, forgotten at teardown */
+townprice::Kept g_ptKeptT;   /* MAIN THREAD: the last table refused per (sender, town) while this game named another source or itself (PtNote) - filed by PtSourceTick */
+townprice::Road g_ptRoadS, g_ptRoadL;   /* MAIN THREAD: the source's send on the session link and on the world server, per (epoch, world) */
+
+void* PtObjCall(unsigned long long rva)
+{
+    if (g_base == 0 || rva == 0) return 0;
+    __try { void* p = ((PtObjFn)(g_base + rva))(); return ItPlaus(p) ? p : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* `loc`'s isTown (slot +0x268): the Town, or 0 */
+void* PtIsTownPod(void* loc)
+{
+    if (!ItPlaus(loc)) return 0;
+    __try
+    {
+        PtSelfFn it = *(PtSelfFn*)(*(const char* const*)loc + kPtVtIsTown);
+        if (!ItPlaus((const void*)it)) return 0;
+        void* t = it(loc);
+        return ItPlaus(t) ? t : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the Town `obj`'s current town location is (vt+0x78 then isTown, the item trade multiplier's two calls): 1 read (*town may be 0),
+   -1 faulted */
+int PtTownOfPod(void* obj, void** town)
+{
+    *town = 0;
+    if (g_base == 0 || !ItPlaus(obj)) return -1;
+    void* loc = 0;
+    __try
+    {
+        PtSelfFn f = *(PtSelfFn*)(*(const char* const*)obj + kPtVtCurrentTown);
+        if (!ItPlaus((const void*)f)) return -1;
+        loc = f(obj);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (ItPlaus(loc)) *town = PtIsTownPod(loc);
+    return 1;
+}
+/* Town x GameData engine read (`rva` 0x92AFF0 or 0x92C6C0 - the latter through this game's hook): 1 read, -1 faulted, 0 not callable */
+int PtTownItemPod(unsigned long long rva, void* town, void* gd, float* v)
+{
+    *v = 0.0f;
+    if (g_base == 0 || rva == 0 || !ItPlaus(town) || !ItPlaus(gd)) return 0;
+    __try { *v = ((PtTownItemFn)(g_base + rva))(town, gd); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the engine's own local multiplier (the original, never the book): 1 read, -1 faulted */
+int PtOwnLocalPod(void* town, void* gd, float* v)
+{
+    *v = 0.0f;
+    if (orig_townLocalMult == 0) return 0;
+    __try { *v = orig_townLocalMult(town, gd); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* 0x5A4750's near-point test on the nearest town `t` (called only inside PtTownAtPod's __try): its slots +0x230 and +0x2F0 both
+   true, and the point its slot +0x308 object gives for `pos` (that object's slot +0x38) within the squared distance 90000 of `pos` */
+int PtNearPointIn(void* t, const float* pos)
+{
+    const char* const vt = *(const char* const*)t;
+    if (!((PtBoolFn)(*(void* const*)(vt + kPtVtTownA)))(t)) return 0;
+    if (!((PtBoolFn)(*(void* const*)(vt + kPtVtTownB)))(t)) return 0;
+    void* const o = ((PtObjPosFn)(*(void* const*)(vt + kPtVtTownNear)))(t, pos);
+    if (!ItPlaus(o)) return 0;
+    float q[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    ((PtPointFn)(*(void* const*)(*(const char* const*)o + kPtVtNearPoint)))(o, q, pos);
+    const float dx = q[0] - pos[0], dy = q[1] - pos[1], dz = q[2] - pos[2];
+    return (kPtNearRange2 > dx * dx + dy * dy + dz * dz) ? 1 : 0;
+}
+/* the town 0x5A4750 (the AI's periodic step) gives a character with no current town standing at `pos`, its searches in its order:
+   (1) the nearest town with the player faction excluded (0x927040, kind any), kept when `pos` is inside it at the scale 1.25;
+   (2) the nearest town of any faction (0x927040), kept when `pos` is inside it at the scale 1.0, or (3) by the near-point test;
+   (4) 0x926C00's nearest town, kept when `pos` is inside it at the scale 1.0.
+   Its last step (the town of the building the character's squad member +0x2F8 names: slot +0x1D8, hand::asBuilding 0x791D70, then
+   0xF6BE0) is not made: a copy's squad is this plugin's, not the trader's. The TownBase (what +0x88 holds), or 0; *step = the search
+   that gave it (1-4; 0 none, -1 faulted). */
+void* PtTownAtPod(const float* pos, int* step)
+{
+    *step = 0;
+    if (g_base == 0 || kPtNearestRva == 0 || kPtContainsRva == 0 || kPtTownListRva == 0) return 0;
+    __try
+    {
+        void* list = *(void* const*)(g_base + kPtTownListRva);
+        if (!ItPlaus(list)) return 0;
+        void* fac = 0;
+        if (kPtPlayerIfaceRva != 0)
+        {
+            void* pi = *(void* const*)(g_base + kPtPlayerIfaceRva);
+            if (ItPlaus(pi)) fac = *(void* const*)((const char*)pi + kPtIfaceFaction);
+        }
+        const PtNearestFn nearest = (PtNearestFn)(g_base + kPtNearestRva);
+        const PtContainsFn contains = (PtContainsFn)(g_base + kPtContainsRva);
+        void* const notPlayer = nearest(list, pos, fac, 0, 0, kPtKindAny);
+        if (ItPlaus(notPlayer) && contains(notPlayer, pos, kPtScaleNotPlayer)) { *step = 1; return notPlayer; }
+        void* const any = nearest(list, pos, 0, 0, 0, kPtKindAny);
+        if (ItPlaus(any))
+        {
+            if (contains(any, pos, kPtScaleAny)) { *step = 2; return any; }
+            if (PtNearPointIn(any, pos) != 0) { *step = 3; return any; }
+        }
+        if (kPtNearestFallbackRva != 0)
+        {
+            void* const third = ((PtNearest2Fn)(g_base + kPtNearestFallbackRva))(list, pos, 0, 0);
+            if (ItPlaus(third) && contains(third, pos, kPtScaleAny)) { *step = 4; return third; }
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *step = -1; return 0; }
+}
+std::string PtSidWords(void* obj)
+{
+    char sid[kSidCap]; sid[0] = 0;
+    void* gd = 0;
+    if (ItPlaus(obj) && ItPtrPod(obj, kObjData, &gd) != 0 && ItPlaus(gd)) ItGdSidPod(gd, sid, kSidCap);
+    return (sid[0] != 0) ? std::string(sid) : std::string("?");
+}
+/* MAIN THREAD, every tick (ShopPendExpire): a trade window opening with a new side. Its trader, when a COPY with no current town, gets
+   the town at its position for its prices while this window stays open; a closed window or another side ends it. */
+void PtWindowTick()
+{
+    if (ItOnMainThread() == 0) return;
+    void* side = 0;
+    if (ItTradeWindowSide(&side) != 1 || side == 0) { std::memset(&g_ptWin, 0, sizeof(g_ptWin)); return; }
+    if (side == g_ptWin.side) return;
+    std::memset(&g_ptWin, 0, sizeof(g_ptWin));
+    g_ptWin.side = side;
+    void* const keeper = (ItIsShopFacadeObj(side) == 1) ? ItShopFacadeTrader(side) : side;
+    unsigned int uid = 0;
+    if (keeper == 0 || ItCcIsCopy(keeper, &uid) == 0 || uid == 0) return;
+    ++g_ptWinOpens;
+    void* own = 0;
+    const int r = PtTownOfPod(keeper, &own);
+    if (r == 1 && own != 0) { ++g_ptWinOwnTown; return; }   /* the engine already has a town for it: its own */
+    Ogre::Vector3 p; int step = 0;
+    void* const town = (r == 1 && SafeReadPosition((::Character*)keeper, &p)) ? PtTownAtPod(&p.x, &step) : 0;
+    if (town == 0)
+    {
+        ++g_ptWinNoTown;
+        DebugLog("[SHOP] price town: the window's trader " + N((long long)uid) + " is a copy with no current town and no town reads at its"
+                 " position - its culture step stays skipped, as the engine leaves it. Counted priceTown noTown.");
+        return;
+    }
+    g_ptWin.trader = keeper; g_ptWin.uid = uid; g_ptWin.town = town;
+    ++g_ptWinTown;
+    DebugLog("[SHOP] price town: the window's trader " + N((long long)uid) + " is a copy with no current town - while this window is open"
+             " its prices use the town at its position, " + PtSidWords(town) + " (search " + N((long long)step) + ", at " + N((long long)p.x)
+             + "," + N((long long)p.z) + ")");
+}
+/* writes `want` into the trader's current-town field when it is null: 1 written (*rec = the record), 0 not (already set / unreadable),
+   -1 faulted */
+int PtSwapTownPod(void* trader, void* want, void** rec)
+{
+    *rec = 0;
+    __try
+    {
+        PtSelfFn f = *(PtSelfFn*)(*(const char* const*)trader + kPtVtTownRecord);
+        if (!ItPlaus((const void*)f)) return 0;
+        void* r = f(trader);
+        if (!ItPlaus(r)) return 0;
+        void** slot = (void**)((char*)r + kPtRecTown);
+        if (*slot != 0) return 0;
+        *slot = want; *rec = r;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void PtRestoreTownPod(void* rec, void* want)
+{
+    __try { void** slot = (void**)((char*)rec + kPtRecTown); if (*slot == want) *slot = 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+/* 0x79DB30, the item's trade multiplier. For the open window's copy trader the town at its position stands in its current-town
+   field for exactly this call (main thread), then the field is null again. */
+float detour_itemTradeMult(void* item)
+{
+    if (g_ptWin.trader == 0 || ItOnMainThread() == 0) return orig_itemTradeMult(item);
+    void* const w = PtObjCall(kPtWinTraderRva);
+    if (w == 0 || w != g_ptWin.trader) return orig_itemTradeMult(item);
+    void* rec = 0;
+    const int sw = PtSwapTownPod(w, g_ptWin.town, &rec);
+    if (sw != 1) { if (sw < 0) ++g_ptPriceFault; return orig_itemTradeMult(item); }
+    float v = 0.0f;
+    __try { v = orig_itemTradeMult(item); }
+    __finally { PtRestoreTownPod(rec, g_ptWin.town); }
+    ++g_ptPriced;
+    return v;
+}
+/* 0x92C6C0 on every game: on a game that is not the price source, with its world running and a book held (townprice::HookUsesBook),
+   the source's number for (town, item) when the source's table for that town names the item (townprice::Choose), else the engine's
+   own. The answer per (Town*, item GameData*) is kept in a memo for the book's version and this game's world load, so a repeated call
+   reads no stringID and builds no string. The source answers with its own number always. */
+float detour_townLocalMult(void* town, void* gd)
+{
+    const float own = orig_townLocalMult(town, gd);
+    if (townprice::HookUsesBook((int)::InterlockedCompareExchange(&g_ptIAmSource, 0, 0), EngineWritesBlocked() ? 1 : 0,
+                                (int)::InterlockedCompareExchange(&g_ptBookHave, 0, 0)) == 0) return own;
+    const std::pair<const void*, const void*> key((const void*)town, (const void*)gd);
+    const long world = StoreWorldGenNow();
+    PtAns a; a.v = 0.0f; a.kind = -1;
+    ::EnterCriticalSection(&g_ptBookLock);
+    if (g_ptMemoVer != g_ptBook.Version() || g_ptMemoWorld != world) { g_ptMemo.clear(); g_ptMemoVer = g_ptBook.Version(); g_ptMemoWorld = world; }
+    std::map<std::pair<const void*, const void*>, PtAns>::const_iterator m = g_ptMemo.find(key);
+    if (m != g_ptMemo.end()) a = m->second;
+    ::LeaveCriticalSection(&g_ptBookLock);
+    if (a.kind < 0)
+    {
+        char ts[kSidCap], is[kSidCap]; ts[0] = 0; is[0] = 0;
+        void* tgd = 0;
+        if (ItPtrPod(town, kObjData, &tgd) != 0 && ItPlaus(tgd)) ItGdSidPod(tgd, ts, kSidCap);
+        if (ItPlaus(gd)) ItGdSidPod(gd, is, kSidCap);
+        a.kind = 0;
+        if (ts[0] != 0 && is[0] != 0)
+        {
+            const std::string tsid(ts), isid(is);
+            int haveTown = 0; float v = 0.0f;
+            ::EnterCriticalSection(&g_ptBookLock);
+            const unsigned long ver = g_ptBook.Version();
+            const int haveItem = g_ptBook.Lookup(tsid, isid, &haveTown, &v);
+            if (townprice::Choose(haveTown, haveItem) == townprice::kUseSource) { a.v = v; a.kind = 1; }
+            else a.kind = (haveTown != 0) ? 2 : 3;
+            if (ver == g_ptMemoVer && world == g_ptMemoWorld) { if (g_ptMemo.size() >= kPtMemoCap) g_ptMemo.clear(); g_ptMemo[key] = a; }
+            ::LeaveCriticalSection(&g_ptBookLock);
+        }
+    }
+    if (a.kind == 1) { ::InterlockedIncrement64(&g_ptAnswered); return a.v; }
+    if (a.kind == 2) ::InterlockedIncrement64(&g_ptItemMiss);
+    else if (a.kind == 3) ::InterlockedIncrement64(&g_ptTownMiss);
+    return own;
+}
+void PtInstallHooks()
+{
+    ::InitializeCriticalSection(&g_ptBookLock);
+    if (g_base == 0 || kPtLocalMultRva == 0 || kPtItemMultRva == 0 || kPtWinTraderRva == 0)
+    {
+        ErrorLog("[ITEMS] T-619: the address table lacks TownLocalTradePriceMult / ItemTradeMult / TradeWindowTrader - each game prices"
+                 " shop trades with its own town multipliers");
+        return;
+    }
+    if (coop::AddHook((void*)(g_base + kPtLocalMultRva), (void*)&detour_townLocalMult, (void**)&orig_townLocalMult) != coop::SUCCESS)
+    { orig_townLocalMult = 0; ErrorLog("[ITEMS] AddHook Town::getLocalTradePriceMult 0x92C6C0 FAILED - every game prices with its own local multipliers"); }
+    else DebugLog("[ITEMS] hook installed: Town::getLocalTradePriceMult 0x92C6C0 (T-619: a game that is not the price source answers from the source's town tables)");
+    if (coop::AddHook((void*)(g_base + kPtItemMultRva), (void*)&detour_itemTradeMult, (void**)&orig_itemTradeMult) != coop::SUCCESS)
+    { orig_itemTradeMult = 0; ErrorLog("[ITEMS] AddHook item trade multiplier 0x79DB30 FAILED - a copy trader's culture step stays skipped"); }
+    else DebugLog("[ITEMS] hook installed: item trade multiplier 0x79DB30 (T-619: a copy trader's prices use the town at its position)");
+}
+/* the keys of `town`'s local multiplier table, walked as 0x92C6C0 reads it: 1 = all (*n = the table's size), 0 = the layout did not
+   read as expected (size and walk disagree, or a bad bucket count), -1 faulted */
+int PtTownKeysPod(void* town, void** keys, int cap, int* n)
+{
+    *n = 0;
+    __try
+    {
+        const char* m = (const char*)town + kPtLocalTable;
+        const unsigned long long bc = *(const unsigned long long*)(m + 0x18);
+        const unsigned long long sz = *(const unsigned long long*)(m + 0x20);
+        void* const* bk = *(void* const* const*)(m + 0x38);
+        if (sz == 0) return 1;
+        if (bc == 0 || (bc & (bc - 1)) != 0 || bc > 0x100000ull || sz > (unsigned long long)cap || !ItPlaus(bk)) return 0;
+        int k = 0;
+        for (unsigned long long i = 0; i < bc; ++i)
+        {
+            void* const* b = (void* const*)bk[i];
+            if (b == 0) continue;
+            const void* node = *b;
+            while (node != 0)
+            {
+                const unsigned long long h = *(const unsigned long long*)((const char*)node + 8);
+                if ((h & (bc - 1)) != i) break;
+                if (k >= cap) return 0;
+                keys[k++] = *(void* const*)((const char*)node + 0x10);
+                node = *(const void* const*)node;
+            }
+        }
+        if ((unsigned long long)k != sz) return 0;
+        *n = k;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int PtTownListPod(void* const** arr, unsigned int* n)
+{
+    *arr = 0; *n = 0;
+    if (g_base == 0 || kPtTownListRva == 0) return 0;
+    __try
+    {
+        void* list = *(void* const*)(g_base + kPtTownListRva);
+        if (!ItPlaus(list)) return 0;
+        const unsigned int c = *(const unsigned int*)((const char*)list + kPtListN);
+        void* const* a = *(void* const* const*)((const char*)list + kPtListArr);
+        if (c > 4096 || (c != 0 && !ItPlaus(a))) return 0;
+        *arr = a; *n = c;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void* PtArrAtPod(void* const* arr, unsigned int i) { __try { return arr[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+/* MAIN THREAD: every Town's table with its engine numbers; a town stringID two towns share is sent by neither */
+void PtGatherTables(unsigned int gen, std::vector<townprice::Table>* out)
+{
+    out->clear();
+    void* const* arr = 0; unsigned int n = 0;
+    if (PtTownListPod(&arr, &n) == 0) { ++g_ptGatherFault; return; }
+    std::vector<void*> keys(kPtKeysCap, (void*)0);
+    std::set<std::string> seen, dup;
+    for (unsigned int i = 0; i < n; ++i)
+    {
+        void* const town = PtIsTownPod(PtArrAtPod(arr, i));
+        if (town == 0) continue;
+        const std::string ts = PtSidWords(town);
+        if (ts == "?") continue;
+        int k = 0;
+        const int w = PtTownKeysPod(town, &keys[0], kPtKeysCap, &k);
+        if (w != 1) { ++g_ptWalkBad; continue; }
+        townprice::Table t; t.gen = gen; t.town = ts;
+        for (int j = 0; j < k; ++j)
+        {
+            char is[kSidCap]; is[0] = 0;
+            if (ItPlaus(keys[j])) ItGdSidPod(keys[j], is, kSidCap);
+            float v = 0.0f;
+            if (is[0] == 0 || PtOwnLocalPod(town, keys[j], &v) != 1 || townprice::ValueOk(v) == 0) continue;
+            t.rows.push_back(std::make_pair(std::string(is), v));
+        }
+        if (t.rows.empty()) continue;
+        if (!seen.insert(t.town).second) { dup.insert(t.town); continue; }
+        out->push_back(t);
+    }
+    for (size_t i = out->size(); i > 0; --i)
+        if (dup.count((*out)[i - 1].town) != 0) out->erase(out->begin() + (std::ptrdiff_t)(i - 1));
+    g_ptDupTown += (long long)dup.size();
+}
+/* MAIN THREAD, every frame (the first step of PtHostSendTick, before its world test): who the world's price source is, by the rule
+   every game shares (townprice::PriceSource / SourceKey), into g_ptIAmSource (the hook reads it on any thread), g_ptSrcMe,
+   g_ptSrcKey and g_ptSrcRoster (PtNote keys a sender the same way and compares it). When this game becomes the source, or the source
+   changes, the book and its memo are emptied; on becoming the source both roads of its own send are due again; on naming another game
+   the tables this game kept from that sender (refused while it named another source or itself - townprice::Kept, PtNote) are filed in
+   the book. The source-change line is logged for the first edges and then every 100th (LiveLogThis). 1 = this game is the source. */
+int PtSourceTick()
+{
+    const int haveRoster = (StoreRosterOtherInWorldTS() >= 0) ? 1 : 0;
+    const int lowest = StoreRosterLowestInWorldTS();
+    const int linkUp = StorePresenceOldLinkTS();
+    const int isHost = net::SessionIsHost() ? 1 : 0;
+    const int me = townprice::PriceSource(haveRoster, lowest, StoreMySlot(), linkUp, isHost);
+    const long key = townprice::SourceKey(haveRoster, lowest, linkUp, isHost, net::SessionLinkGen());
+    g_ptSrcRoster = haveRoster;
+    if (me == g_ptSrcMe && key == g_ptSrcKey) return me;
+    ::InterlockedExchange(&g_ptBookHave, 0);
+    ::EnterCriticalSection(&g_ptBookLock);
+    const size_t had = g_ptBook.Towns();
+    g_ptBook.Clear(); g_ptMemo.clear();
+    ::LeaveCriticalSection(&g_ptBookLock);
+    ::InterlockedExchange(&g_ptIAmSource, (LONG)me);
+    if (me != 0 && g_ptSrcMe != 1) { g_ptRoadS.Clear(); g_ptRoadL.Clear(); g_ptEmptyEpoch = -1; g_ptEmptyWorld = -1; }
+    g_ptSrcMe = me; g_ptSrcKey = key; ++g_ptSrcEdges;
+    std::string who;
+    if (me != 0) who = "THIS game";
+    else if (key >= 0) who = "slot " + N((long long)key);
+    else if (key == townprice::kSrcNone) who = "none";
+    else who = "the session host";
+    const std::string why = (haveRoster != 0) ? "the lowest IN_WORLD slot on the world server's roster, " + N((long long)lowest)
+                                              : std::string(linkUp != 0 ? "no roster - the session host" : "no roster and no session link");
+    if (cooplive::LiveLogThis(g_ptSrcEdges))
+        DebugLog("[SHOP] town prices: the world's price source is " + who + " (" + why + "; my slot " + N((long long)StoreMySlot()) + "; "
+             + N((long long)had) + " towns of the earlier source's tables dropped; townSource edges " + N(g_ptSrcEdges) + ")");
+    std::vector<townprice::Table> kept;
+    if (me == 0 && g_ptKeptT.TakeFor(key, &kept) != 0)
+    {
+        int fresh = 0;
+        ::EnterCriticalSection(&g_ptBookLock);
+        for (size_t i = 0; i < kept.size(); ++i) fresh |= g_ptBook.Apply(key, kept[i]);
+        ::LeaveCriticalSection(&g_ptBookLock);
+        ::InterlockedExchange(&g_ptBookHave, 1);
+        g_ptKeptFiled += (long long)kept.size(); ++g_ptKeptFiles;
+        if (fresh != 0) ++g_ptRecvGens;
+        DebugLog("[SHOP] town prices: " + N((long long)kept.size()) + " town tables kept from sender " + N((long long)key) + " (its world "
+                 + N((long long)kept[0].gen) + "), refused while this game named another source, are filed now that it names that sender (townSource keptFiled "
+                 + N(g_ptKeptFiled) + ")");
+    }
+    return me;
+}
+/* MAIN THREAD, every tick: the world's price source sends every town's table once per (arrival epoch, world load) on each road (a
+   game whose own answer to "who is the source" names this game only after a copy arrived keeps the copy it refused and files it then -
+   PtNote, PtSourceTick). StorePeerEpoch moves at each arrival of another player and when the session link goes down, so a game that
+   newly enters the world gets the tables, and every game gets them again after each of the source's loads (EngineWritesBlocked clear:
+   the world runs). Two roads, each game reached by exactly one: the session link to its peer, once that peer's ready edge is seen
+   (with the link up and the edge not yet seen the whole send waits), and the world server to every other admitted game but the
+   session peer (net::SendTownPricesLive). Each road keeps its own state (townprice::Road g_ptRoadS / g_ptRoadL): a road where a table
+   did not go sends again only on that road, on its next ready edge - the session link's ready edge (g_escReadyEdges), the world
+   server's new welcomed link (StoreLiveGen) - at most townprice::kRoadTries times per (epoch, world) (townSource retries; gaveUp
+   after the cap). sentTowns counts the tables that went by at least one road. */
+static std::string PtRoadSay(const char* road, int due, long long fail, int res, int tries)
+{
+    if (due == 0 || fail == 0) return std::string();
+    return ", " + N(fail) + " NOT sent on the " + road
+           + (res == townprice::kRoadWait ? std::string(" - sent again on that road's next ready edge (try ") + N((long long)tries) + " of " + N((long long)townprice::kRoadTries) + ")"
+                                          : std::string(" - no more tries (townSource gaveUp)"));
+}
+void PtHostSendTick()
+{
+    const int iAm = PtSourceTick();
+    if (orig_townLocalMult == 0 || EngineWritesBlocked() || iAm == 0) return;
+    const int linkUp = StorePresenceOldLinkTS();
+    const int sessionGo = (linkUp != 0 && g_escReadyGen >= 0 && g_escReadyGen == s_escLinkSeen && StorePeerHereAs(0u, 1) != 0) ? 1 : 0;
+    if (linkUp != 0 && sessionGo == 0) return;
+    const int liveGo = (StoreLiveReady() && (linkUp != 0 ? StoreOtherBeyondLinkInWorld() : StoreRosterOtherInWorldTS()) == 1) ? 1 : 0;
+    if (sessionGo == 0 && liveGo == 0) return;
+    const long epoch = StorePeerEpoch();
+    const long world = StoreWorldGenNow();
+    if (g_ptEmptyEpoch == epoch && g_ptEmptyWorld == world) return;
+    const long long sEdge = (long long)g_escReadyEdges, lEdge = (long long)StoreLiveGen();
+    const int sDue = g_ptRoadS.Due(sessionGo, epoch, world, sEdge);
+    const int lDue = g_ptRoadL.Due(liveGo, epoch, world, lEdge);
+    if (sDue == 0 && lDue == 0) return;
+    const int sRetry = (sDue != 0 && g_ptRoadS.Retrying() != 0) ? 1 : 0;
+    const int lRetry = (lDue != 0 && g_ptRoadL.Retrying() != 0) ? 1 : 0;
+    std::vector<townprice::Table> tables;
+    PtGatherTables((unsigned int)world, &tables);
+    if (tables.empty())
+    {
+        g_ptEmptyEpoch = epoch; g_ptEmptyWorld = world;
+        ErrorLog("[SHOP] town prices: no town table read on the price source (towns walked badly " + N(g_ptWalkBad) + ", list faults " + N(g_ptGatherFault)
+                 + ") - nothing sent; every other game prices with its own local multipliers");
+        return;
+    }
+    long long sent = 0, failed = 0, rows = 0, bySession = 0, byLive = 0, sessFail = 0, liveFail = 0, encodeBad = 0;
+    int liveRoute = 0;
+    for (size_t i = 0; i < tables.size(); ++i)
+    {
+        std::vector<char> b;
+        if (townprice::Encode(&b, tables[i]) == 0) { ++encodeBad; continue; }
+        const bool bs = sDue != 0 && net::SendTownPrices(b);
+        if (sDue != 0 && !bs) ++sessFail;
+        int bl = 0;
+        if (lDue != 0) { bl = net::SendTownPricesLive(b); if (bl == 0) ++liveFail; else liveRoute = bl; }
+        if (bs) ++bySession;
+        if (bl != 0) ++byLive;
+        if (!bs && bl == 0) { ++failed; continue; }
+        ++sent; rows += (long long)tables[i].rows.size();
+    }
+    ++g_ptBursts;
+    g_ptSentTowns += sent; g_ptSentMsgs += sent; g_ptSendFail += failed; g_ptEncodeBad += encodeBad;
+    g_ptSentSession += bySession; g_ptSentLive += byLive; g_ptLiveFail += liveFail;
+    if (liveRoute == 2) g_ptSentLiveExcept += byLive;
+    g_ptRetries += (long long)(sRetry + lRetry);
+    const int sRes = (sDue != 0) ? g_ptRoadS.Result(sessFail, sEdge) : townprice::kRoadSent;
+    const int lRes = (lDue != 0) ? g_ptRoadL.Result(liveFail, lEdge) : townprice::kRoadSent;
+    if (sRes == townprice::kRoadGaveUp) ++g_ptGaveUp;
+    if (lRes == townprice::kRoadGaveUp) ++g_ptGaveUp;
+    DebugLog("[SHOP] town prices: sent " + N(sent) + " town tables (" + N(rows) + " item numbers, source world " + N((long long)world) + ", epoch " + N((long long)epoch)
+             + ") - session link " + N(bySession) + (sRetry != 0 ? " (a re-attempt)" : "") + ", world server " + N(byLive) + (lRetry != 0 ? " (a re-attempt)" : "")
+             + (liveRoute == 2 ? " (all but the session peer)" : (liveRoute == 1 ? " (every other game)" : ""))
+             + PtRoadSay("session link", sDue, sessFail, sRes, g_ptRoadS.Tries())
+             + PtRoadSay("world server", lDue, liveFail, lRes, g_ptRoadL.Tries())
+             + (encodeBad != 0 ? ", " + N(encodeBad) + " tables not encodable (townSource encodeBad)" : std::string())
+             + (g_ptDupTown != 0 ? " (towns sharing a stringID, not sent: " + N(g_ptDupTown) + ")" : std::string()));
+}
+/* MAIN THREAD (the session dispatcher): one TOWN_PRICES, by the session link or relayed by the world server. Its sender is keyed
+   the way this frame's source answer was (townprice::SenderKey with g_ptSrcRoster) and compared with it (TakeFrom against g_ptSrcKey);
+   the source's table is filed in the book under its sender. A table refused - another sender's, no source named yet, or this game
+   itself was the source - is decoded and kept, the last per sender and town (townprice::KeepRefused / Kept), and PtSourceTick files it
+   when this game names that sender as its source. */
+static std::string PtKeptSay(int kept)
+{
+    return (kept != 0) ? "kept, filed when this game names that sender as its source (townSource kept " + N(g_ptKept) + ")"
+                       : "not kept (no sender key, or townSource keptFull " + N(g_ptKeptFull) + ")";
+}
+void PtNote(const char* p, size_t n, unsigned int fromPeer)
+{
+    const int linkUp = StorePresenceOldLinkTS();
+    const int relayed = cooplive::IsRelayPeer(fromPeer) ? 1 : 0;
+    const int origin = (relayed != 0) ? (int)cooplive::RelayPeerSlot(fromPeer) : -1;
+    const int peerSlot = LinkPeerSlot();
+    const long sender = townprice::SenderKey(g_ptSrcRoster, relayed, origin, peerSlot, net::SessionLinkGen());
+    const int take = townprice::TakeFrom(g_ptSrcMe == 1 ? 1 : 0, g_ptSrcKey, sender, relayed, linkUp, peerSlot);
+    if (take == townprice::kTakeOtherRoad) { ++g_ptRecvOtherRoad; return; }   /* the session link brings this game the same table */
+    townprice::Table t;
+    if (townprice::Decode(p, n, &t) == 0)
+    {
+        ++g_ptRecvBad;
+        ErrorLog("[SHOP] town prices: a malformed TOWN_PRICES (" + N((long long)n) + " bytes) from peer " + N((long long)fromPeer) + " - refused whole");
+        return;
+    }
+    if (take != townprice::kTake)
+    {
+        int kept = 0;
+        if (townprice::KeepRefused(take, sender) != 0) { kept = g_ptKeptT.Keep(sender, t); if (kept != 0) ++g_ptKept; else ++g_ptKeptFull; }
+        if (take == townprice::kTakeOnSource)
+        {
+            ++g_ptRecvOnHost;
+            if (cooplive::LiveLogThis(g_ptRecvOnHost))
+                ErrorLog("[SHOP] town prices: a TOWN_PRICES from sender " + N((long long)sender) + " (peer " + N((long long)fromPeer) + ") reached the price source - not taken, it"
+                         " prices with its own (townPrice recvOnHost " + N(g_ptRecvOnHost) + "); " + PtKeptSay(kept));
+            return;
+        }
+        ++g_ptRecvNotSource;
+        if (cooplive::LiveLogThis(g_ptRecvNotSource))
+            ErrorLog("[SHOP] town prices: a TOWN_PRICES from sender " + N((long long)sender) + std::string(relayed != 0 ? " (relayed)" : " (session link)")
+                     + " - this game's price source is " + N((long long)g_ptSrcKey) + ", refused (townRoad recvNotSource " + N(g_ptRecvNotSource) + "); " + PtKeptSay(kept));
+        return;
+    }
+    ::EnterCriticalSection(&g_ptBookLock);
+    const int fresh = g_ptBook.Apply(sender, t);
+    ::LeaveCriticalSection(&g_ptBookLock);
+    ::InterlockedExchange(&g_ptBookHave, 1);
+    ++g_ptRecvTowns;
+    if (relayed != 0) ++g_ptRecvLive; else ++g_ptRecvSession;
+    if (fresh != 0)
+    {
+        ++g_ptRecvGens;
+        DebugLog("[SHOP] town prices: the source's tables arrive (sender " + N((long long)sender) + ", its world " + N((long long)t.gen) + ", first town " + t.town + " with "
+                 + N((long long)t.rows.size()) + " items) - this game's local trade multipliers come from them from now on");
+    }
+}
+/* the two legs the requester's price used for `item`: the culture of the window trader's town (or of the town its prices use, for a
+   copy) and the local multiplier of the hand's town. A null town is x1.0 (the engine skips that step). 0, 0 = unread, or a leg that is
+   not a number above 0 and below 100 (counted priceLegs askBad): the request then goes as 'SHR3' and the trade goes on. */
+void PtRequesterLegs(void* item, float* cult, float* local)
+{
+    *cult = 0.0f; *local = 0.0f;
+    void* gd = 0;
+    if (!ItPlaus(item) || ItPtrPod(item, kObjData, &gd) == 0 || !ItPlaus(gd)) return;
+    void* const win = PtObjCall(kPtWinTraderRva);
+    void* wt = 0;
+    if (win != 0 && PtTownOfPod(win, &wt) != 1) return;
+    if (win != 0 && wt == 0 && win == g_ptWin.trader) wt = PtIsTownPod(g_ptWin.town);
+    void* const hand = PtObjCall(kPtHandTownRva);
+    float c = 1.0f, l = 1.0f;
+    if (wt != 0 && PtTownItemPod(kPtCultureRva, wt, gd, &c) != 1) return;
+    if (hand != 0 && PtTownItemPod(kPtLocalMultRva, hand, gd, &l) != 1) return;
+    if (townprice::ValueOk(c) == 0 || townprice::ValueOk(l) == 0) { ++g_ptLegsAskBad; return; }
+    *cult = c; *local = l;
+}
+::GameData* PtGdBySid(const std::string& sid)
+{
+    if (sid.empty() || coop::GameWorldPtr() == 0) return 0;
+    ::GameData* gd = coop::GameWorldPtr()->gamedata.getData(sid);
+    return ItPlaus(gd) ? gd : 0;
+}
+/* MAIN THREAD, the holder applying a shop request: the same two legs read on its keeper's town (its current town, or for a copy keeper
+   with none the town at its position, as PtWindowTick gives a copy trader; no town reads as unread, never x1.0), compared with the
+   legs the request carries. Counted always; a disagreement is said once per keeper and item. Nothing is refused. */
+void PtHolderLegsCheck(const ItemRequestMsg& r, void* keeper, unsigned int fromPeer)
+{
+    ++g_ptLegsChecked;
+    if (r.shop.cult <= 0.0f || r.shop.local <= 0.0f) { ++g_ptLegsUnsent; return; }
+    ::GameData* const gd = PtGdBySid(r.shop.sid);
+    void* town = 0;
+    float c = 0.0f, l = 0.0f;
+    int ok = (gd != 0 && PtTownOfPod(keeper, &town) == 1) ? 1 : 0;
+    unsigned int kuid = 0;
+    if (ok != 0 && town == 0 && ItCcIsCopy(keeper, &kuid) != 0)
+    {
+        Ogre::Vector3 kp; int step = 0;
+        if (SafeReadPosition((::Character*)keeper, &kp)) town = PtIsTownPod(PtTownAtPod(&kp.x, &step));
+    }
+    if (town == 0) ok = 0;
+    if (ok != 0) ok = (PtTownItemPod(kPtCultureRva, town, gd, &c) == 1 && PtTownItemPod(kPtLocalMultRva, town, gd, &l) == 1) ? 1 : 0;
+    int expected = -1;
+    const int v = (ok != 0) ? townprice::LegsVerdict(r.shop.unitPrice, r.shop.cult, r.shop.local, c, l, &expected) : townprice::kLegsUnread;
+    if (v == townprice::kLegsAgree) { ++g_ptLegsAgree; return; }
+    if (v == townprice::kLegsUnread) { ++g_ptLegsUnread; return; }
+    ++g_ptLegsDisagree;
+    const std::string key = N((long long)r.shop.keeperUid) + "|" + r.shop.sid;
+    if (g_ptLegsSaid.count(key) != 0 || g_ptLegsSaid.size() >= (size_t)kPtSaidCap) return;
+    g_ptLegsSaid.insert(key);
+    char cb[96]; _snprintf(cb, 95, "asked culture %.4f local %.4f, here culture %.4f local %.4f", (double)r.shop.cult, (double)r.shop.local, (double)c, (double)l); cb[95] = 0;
+    ErrorLog("[SHOP] holder price legs DISAGREE: peer " + N((long long)fromPeer) + " " + std::string(r.dir == 0 ? "BUY" : "SELL") + " keeper "
+             + N((long long)r.shop.keeperUid) + " item " + r.shop.sid + " unit " + N((long long)r.shop.unitPrice) + " - this keeper's legs give "
+             + N((long long)expected) + " (" + std::string(cb) + ", town " + (town != 0 ? PtSidWords(town) : std::string("none"))
+             + "). Applied as asked; counted priceLegs disagree (said once per keeper and item).");
+}
+/* MAIN THREAD, ItemsWorldTeardown: the town tables kept from a sender this game did not yet name as its source (PtNote) are forgotten
+   with the world, counted (townSource keptAtTeardown) */
+void PtWorldTeardown()
+{
+    g_ptKeptAtTeardown += (long long)g_ptKeptT.Size();
+    g_ptKeptT.Clear();
+}
+}   /* the unnamed namespace, closed for TownPricesNote (items.h) */
+void TownPricesNote(const char* p, size_t n, unsigned int fromPeer) { PtNote(p, n, fromPeer); }
+namespace {   /* the same unnamed namespace, reopened (T-619) */
 /* Inventory::takeItemOut 0x749E10: howmany -1 = the whole stack (the same object), else a clone of that many. */
 void* ShopRemovePod(void* inv, void* item, int howmany)
 {
@@ -21070,6 +21813,8 @@ int ShopSettle(ShopPend* p, int ok, const ItemConfirmMsg* cf, const char* why, i
 void ShopPendExpire()
 {
     ++g_shopFrame;
+    PtWindowTick();   /* T-619: a copy trader's price town */
+    PtHostSendTick();   /* T-619: the price source's town tables to every other game */
     const unsigned int now = ::GetTickCount();
     /* MED 6 / 7 fold: a rebuild that waited for the cursor - done once it is empty and the same stand-in is still on screen */
     if (g_shopRebuildDefer != 0 && ItParityCursorBusy() == 0)
@@ -21367,6 +22112,7 @@ int ShopSendTrade(const ShopSendArgs& a, int* mark)
     rq.quantity = a.n; rq.takerUid = a.mineUid; rq.price = a.price;
     rq.shop.has = 1; rq.shop.keeperUid = a.keeperUid; rq.shop.homeKey = (a.caravan != 0) ? "" : a.hk; rq.shop.sid = a.sid; rq.shop.n = a.n;
     rq.shop.unitPrice = a.unit; rq.shop.entry = a.entry; rq.shop.stock = p->stock;
+    PtRequesterLegs(a.item, &rq.shop.cult, &rq.shop.local);   /* T-619: the two legs this price used, for the holder's check */
     rq.shop.epoch = ShopEpoch();   /* fold 2 (item 12): the holder keys its record on {peer, epoch, id} - ids restart with this process */
     if (a.dir == 0) ++g_shopIcBuy; else ++g_shopIcSell;
     if (a.caravan != 0) ++g_shopCarSent;   /* T-1 B5 */
@@ -21993,6 +22739,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     void* const home = stock.home;
     void* const keeper = stock.keeper;
     const int policyOk = (caravan != 0) ? 1 : ((home != 0 && BoxAccessAllowed(home, fromPeer, false)) ? 1 : 0);   /* E36 is a building's; a caravan has none */
+    if (keeper != 0) PtHolderLegsCheck(r, keeper, fromPeer);   /* T-619: the price legs on the real keeper - counted and said, never refused */
     int refuseNext = 0;
     int common = coopshop::HolderCommon(stockFound, heldHere, keeperOk, policyOk, 0, blockOk);
     if (common == coopshop::kVOk && g_refuseNextLeft > 0 && r.price > 0)
@@ -22216,6 +22963,20 @@ std::string ShopInterceptDetail()
            + " shopRec[ackSent,ackUnsent,ackRecv,ackMissed,revokeMissed,appliedFull,appliedStale,appliedAtTeardown,held]="
            + N(g_shopAckSent) + "," + N(g_shopAckUnsent) + "," + N(g_shopAckRecv) + "," + N(g_shopAckMissed) + "," + N(g_shopRevokeMissed) + ","
            + N(g_shopAppliedFull) + "," + N(g_shopAppliedStale) + "," + N(g_shopAppliedAtTeardown) + "," + N((long long)g_shopApplied.size())
+           + " priceTown[opens,town,ownTown,noTown,priced,fault]=" + N(g_ptWinOpens) + "," + N(g_ptWinTown) + "," + N(g_ptWinOwnTown) + ","
+           + N(g_ptWinNoTown) + "," + N(g_ptPriced) + "," + N(g_ptPriceFault)
+           + " townPrice[sentTowns,sendFail,dupTown,walkBad,listFault,recvTowns,recvGens,recvBad,recvOnHost,answered,itemMiss,townMiss]="
+           + N(g_ptSentTowns) + "," + N(g_ptSendFail) + "," + N(g_ptDupTown) + "," + N(g_ptWalkBad) + "," + N(g_ptGatherFault) + ","
+           + N(g_ptRecvTowns) + "," + N(g_ptRecvGens) + "," + N(g_ptRecvBad) + "," + N(g_ptRecvOnHost) + "," + N((long long)g_ptAnswered) + ","
+           + N((long long)g_ptItemMiss) + "," + N((long long)g_ptTownMiss)
+           + " townRoad[bursts,session,live,liveAllButPeer,liveFail,recvSession,recvLive,recvOtherRoad,recvNotSource]=" + N(g_ptBursts) + ","
+           + N(g_ptSentSession) + "," + N(g_ptSentLive) + "," + N(g_ptSentLiveExcept) + "," + N(g_ptLiveFail) + "," + N(g_ptRecvSession) + ","
+           + N(g_ptRecvLive) + "," + N(g_ptRecvOtherRoad) + "," + N(g_ptRecvNotSource)
+           + " priceLegs[checked,agree,disagree,unread,unsent,askBad]=" + N(g_ptLegsChecked) + "," + N(g_ptLegsAgree) + "," + N(g_ptLegsDisagree) + ","
+           + N(g_ptLegsUnread) + "," + N(g_ptLegsUnsent) + "," + N(g_ptLegsAskBad)
+           + " townSource[me,key,edges,retries,gaveUp,encodeBad,kept,keptFull,keptFiled,keptFiles,keptAtTeardown]=" + N((long long)g_ptSrcMe) + "," + N((long long)g_ptSrcKey) + "," + N(g_ptSrcEdges) + ","
+           + N(g_ptRetries) + "," + N(g_ptGaveUp) + "," + N(g_ptEncodeBad) + "," + N(g_ptKept) + "," + N(g_ptKeptFull) + ","
+           + N(g_ptKeptFiled) + "," + N(g_ptKeptFiles) + "," + N(g_ptKeptAtTeardown)
            + " shopUndo2[undoShort,undoUnpaid,undoKept,undoKeptFiled,undoKeptLost,undoOwnerSkip,undoBackSource,undoBackOther]="
            + N(g_shopUndoShort) + "," + N(g_shopUndoUnpaid) + "," + N(g_shopUndoKeptCount) + "," + N(g_shopUndoKeptFiled) + ","
            + N(g_shopUndoKeptLost) + "," + N(g_shopUndoOwnerSkip) + "," + N(g_shopUndoBackSource) + "," + N(g_shopUndoBackOther)
@@ -23671,6 +24432,8 @@ std::string ItemsDetail()
          + " production[prodRanHolder,prodSkippedNotHolder,workerPassed,singlePlayer,unreadable]="
          + N(g_prodRanHolder) + "," + N(g_prodSkippedNotHolder) + "," + N(g_prodWorkerPassed) + ","
          + N(g_prodSinglePlayer) + "," + N(g_prodUnreadable)
+         + " productionWorker[relayed,unrelayed,nodeMarkIgnored,writerKept]=" + N(g_prodWorkerRelayed) + "," + N(g_prodWorkerUnrelayed) + ","
+         + N(g_ownNodeMarkIgnored) + "," + N(g_prodWriterMemoHit)
          /* P7f (review-p6z H-3): the load window, and it is expected to be NON-ZERO on a client - every trader
             stocked during the world load passes through it. Zero on a client with a session means the window is
             not being seen at all, which is the shape this fold exists to fix. */
@@ -23868,6 +24631,21 @@ int BoxKeyNearKey(const char* have, const char* want)
     ItBoxKeyParts a, b;
     if (ItBoxKeyParse(have, &a) == 0 || ItBoxKeyParse(want, &b) == 0) return 0;
     return ItBoxKeyNear(a, b);
+}
+/* declared in items.h: the production gate's three-way writer, the production-building test and the engine's own worker step
+   for MINE_OP work */
+int ProdStepWriterHere(void* pb)
+{
+    if (g_base == 0 || !ItPlaus(pb)) return coopfarm::kProdWriterNone;
+    return ItProdWriterKept(pb);
+}
+int ProductionBuildingIs(const void* b) { return ItProdSlotIs(b); }
+int ProdOperateRun(void* pb, void* who, float amount)
+{
+    if (orig_prodOperate == 0 || !ItPlaus(pb)) return 0;
+    __try { orig_prodOperate(pb, who, amount); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
 }
 /* par16: declared in items.h. THE FARM'S WRITER is the production machines' writer, asked exactly as ItProdHolder asks it
    (forBox 0, the restock family's area counters; "farm" names the asker in the owner rung's lines) - without ItProdHolder's own
@@ -25802,7 +26580,7 @@ int ItLootJournalAppend(const coopres::ResearchTake& t)
 {
     const std::string path = ItLootJournalPath();
     if (path.empty()) { ++g_lootJournalFailed; return 0; }
-    std::FILE* f = std::fopen(path.c_str(), "ab");
+    std::FILE* f = U8fopen(path.c_str(), "ab");
     if (f == 0) { ++g_lootJournalFailed; return 0; }
     const std::string line = coopres::ResearchTakeLine(t);
     const size_t w = std::fwrite(line.data(), 1, line.size(), f);
@@ -25817,9 +26595,9 @@ void ItLootJournalWrite()
     if (g_lootJournalReady == 0) return;   /* fold (4b): after a teardown and before the next WELCOME's read-back, an empty list must not delete the journal */
     const std::string path = ItLootJournalPath();
     if (path.empty()) return;
-    if (g_lootUnconf.empty()) { ::DeleteFileA(path.c_str()); return; }
+    if (g_lootUnconf.empty()) { U8DeleteFile(path.c_str()); return; }
     const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = U8fopen(tmp.c_str(), "wb");
     if (f == 0) { ++g_lootJournalFailed; return; }
     int ok = 1;
     for (size_t i = 0; i < g_lootUnconf.size(); ++i)
@@ -25829,7 +26607,7 @@ void ItLootJournalWrite()
     }
     if (std::fflush(f) != 0) ok = 0;
     std::fclose(f);
-    if (ok == 0 || ::MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) { ++g_lootJournalFailed; ::DeleteFileA(tmp.c_str()); }
+    if (ok == 0 || U8MoveFileEx(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) { ++g_lootJournalFailed; U8DeleteFile(tmp.c_str()); }
 }
 int ItLootUnconfHas(const coopres::ResearchTake& t)
 {
@@ -25848,7 +26626,7 @@ void ItLootTakesReset()
     g_lootUnconf.swap(keep);
     const std::string path = ItLootJournalPath();
     long long loaded = 0;
-    std::FILE* f = path.empty() ? 0 : std::fopen(path.c_str(), "rb");
+    std::FILE* f = path.empty() ? 0 : U8fopen(path.c_str(), "rb");
     if (f != 0)
     {
         char buf[2048];
@@ -28373,7 +29151,7 @@ int InvNetCharStep(unsigned int now)
         if (n == 0) return 0;
     }
     const InvNetCharRef r = g_invNetChars[g_invNetCharIdx++];
-    if (FindSpawnedUid(r.ch) != r.uid || !net::IsUidMine(r.uid))
+    if (FindSpawnedUid(r.ch) != r.uid || !net::IsUidMine(r.uid) || LiveCharacter((::Character*)r.ch) == 0)   /* the list is kept across frames: the engine must still know it */
     { if (g_invNetBase.erase(InvNetKey(r.uid, std::string())) != 0) ++g_invNetNotHeld; return 0; }
     ::Inventory* inv = ItInventoryOf(r.ch);
     if (inv == 0) { ++g_invNetUnreadable; return 0; }

@@ -111,6 +111,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "soak.h"                         /* uishot: GameplayRunning - a title preview is refused in a world and back */
 #include "bugreport.h"                    /* T-461: REPORT A BUG - its ESC at the title and its pause-menu row */
 #include "playerstab.h"                   /* T-545: the PLAYERS tab's counters on the readout */
+#include "chat.h"                         /* the open chat window takes ESC before the pause menu's show */
 #include "titleart.h"                     /* TitleArtNoteBand - the painted title's bottom row on the mod's art */
 #include "../common/titleart.h"          /* swtitle::MenuColumnPlan - the menu column on the mod's art */
 
@@ -129,6 +130,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include <locale>
 #include <string>
 #include <cstdio>   // P8a: _snprintf for the fault line (no C++ object in a frame that must stay simple)
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
 
@@ -170,6 +172,7 @@ struct UiNames
     std::string dlgGroup, dlgText, dlgNameLabel, dlgNameEdit, dlgOk, dlgCancel;                         /* mp3 */
     std::string hostingGroup, homeAddr, copyBtn, routerHelp, playersBox, chooseBtn, homeAddrLabel;     /* mp4; ui5: homeAddrLabel */
     std::string netAddrLabel, netAddr, netShowBtn, netCopyBtn;                                         /* T-510: INTERNET ADDRESS */
+    std::string vpnAddrLabel, vpnAddr, vpnCopyBtn;                                                     /* T-631: RADMIN / HAMACHI ADDRESS */
     std::string optGroup, optTab[coopui::kOptTabCount], optNote, optDefaultsBtn, optDoneBtn; /* mp5 */
     std::string optFeeEdit, optFeeNote;   /* T-556: the RESURRECTION FEE box and the FEE GROWTH line under the rows */
     std::string optLabel[coopui::kOptRowsShown], optDec[coopui::kOptRowsShown], optVal[coopui::kOptRowsShown];
@@ -238,6 +241,7 @@ struct UiNames
         /* T-510: INTERNET ADDRESS under it - the label, the value, SHOW / HIDE and its own COPY.  The one rule a name of ours
            follows is no '_' (RE_Kenshi's suffix test, the note at the top of this file); new names start "SW". */
         netAddrLabel = "SWNetAddrLabel"; netAddr = "SWNetAddrText"; netShowBtn = "SWNetAddrShowBtn"; netCopyBtn = "SWNetAddrCopyBtn";
+        vpnAddrLabel = "SWVpnAddrLabel"; vpnAddr = "SWVpnAddrText"; vpnCopyBtn = "SWVpnAddrCopyBtn";   /* T-631: between the two */
         /* prof3 (design-mpmenu1 section 8): the Your profiles screen - the list (ui2: one scrolling list with NAME / FACTION /
            LAST PLAYED columns, in place of a hand-spaced heads line, Up / Down and four row buttons), Play / New profile / Delete. */
         profGroup = "CoopProfGroup"; profList = "CoopProfList";
@@ -530,7 +534,8 @@ enum UiActionCode
     kActProfPick = 53 /* ui2: a row of the profiles list was picked (54..58 were the row buttons and Up / Down) */, kActProfPlay = 59, kActProfNew = 60, kActProfDelete = 61,
     kActChooseProfile = 62,
     kActHostProfChange = 63,  /* T-201 PP6': HOST GAME's PROFILE row CHANGE */
-    kActNetShow = 64, kActNetCopy = 65   /* T-510: HOSTING's INTERNET ADDRESS row SHOW / HIDE and COPY */
+    kActNetShow = 64, kActNetCopy = 65,  /* T-510: HOSTING's INTERNET ADDRESS row SHOW / HIDE and COPY */
+    kActVpnCopy = 66                     /* T-631: HOSTING's RADMIN / HAMACHI ADDRESS row COPY */
 };
 
 /* TITLE PUMP ONLY, and deliberately NOT behind a lock.  design-ui-panel 1.4.3 asks for a CRITICAL_SECTION.
@@ -577,6 +582,12 @@ static volatile LONG64  g_worldsDeleted = 0, g_worldDeleteRefused = 0, g_worldDe
 /* mp4 (design-mpmenu1 section 6) - the Hosting screen.  The address is read from Windows when the screen opens, never
    per tick; the players list is rebuilt with the status area (4 Hz) and pushed only when its words change. */
 static std::string     g_hostHomeAddr;        /* this computer's home-network IPv4 ("" = none found) */
+/* T-631 (owner 570): the game VPN found when HOSTING opened (coopui::kGameVpn*) and this computer's address on it, shown in
+   the open on its own row and never written to the log (only "vpn=radmin|hamachi|none").  g_hostVpnHelpDue: the address
+   note above the router help follows a VPN changed while HOSTING is up (TEST-ONLY hostaddr vpn). */
+static int             g_hostVpnKind = coopui::kGameVpnNone;
+static std::string     g_hostVpnAddr;
+static int             g_hostVpnHelpDue = 0;
 static std::string     g_hostCopyNote;        /* what the last Copy did, in words ("" = no Copy yet) */
 static std::string     g_hostingPlayersShown; /* the players list as last pushed */
 static volatile LONG64 g_hostingShown = 0, g_homeAddrFound = 0, g_homeAddrMissing = 0, g_addrCopied = 0, g_addrCopyFailed = 0;
@@ -649,6 +660,7 @@ static void OnCoopPasteClicked(MyGUI::Widget*)        { UiQueue(kActPaste); }
 static void OnCoopCopyClicked(MyGUI::Widget*)         { UiQueue(kActCopy); }   /* mp4 */
 static void OnNetAddrShowClicked(MyGUI::Widget*)      { UiQueue(kActNetShow); }   /* T-510 */
 static void OnNetAddrCopyClicked(MyGUI::Widget*)      { UiQueue(kActNetCopy); }   /* T-510 */
+static void OnVpnAddrCopyClicked(MyGUI::Widget*)      { UiQueue(kActVpnCopy); }   /* T-631 */
 static void OnCoopModeHostClicked(MyGUI::Widget*)     { UiQueue(kActModeHost); }
 static void OnCoopModeJoinClicked(MyGUI::Widget*)     { UiQueue(kActModeJoin); }
 /* ui2: the worlds list's pick (mouse or keys).  No index is carried: the tick reads the list's selected row back on the
@@ -1171,6 +1183,27 @@ static std::string PanelNetAddrShownText()
     if (g.rowH <= 0) return line;
     return coopui::PanelWrapText(line, coopui::PanelNetAddrValueW(g.innerW, coopui::PanelGapOf(g.rowH)) / coopui::kPanelTextCharW);
 }
+/* T-631 (owner 570) - THE RADMIN / HAMACHI ADDRESS ROW'S WIDGETS from g_hostVpn*: the label names the VPN found, the value
+   is its address and the game port in the open (friends on that network type it, as LOCAL ADDRESS), COPY greyed with none.
+   PanelLayout shows the row only while a VPN was found.  The address is never logged. */
+static std::string PanelHostingHelpText(int gamePort)
+{
+    return coopui::PanelAddrNoteFor(g_hostVpnKind) + "\n" + coopui::PanelRouterHelpText(gamePort);
+}
+static void PanelVpnRowPush(MyGUI::Gui* gui)
+{
+    const UiNames& n = NM();
+    MyGUI::Widget* w = UiFind(gui, n.vpnAddrLabel);
+    MyGUI::TextBox* t = w ? w->castType<MyGUI::TextBox>(false) : 0;
+    if (t) t->setCaption(MyGUI::UString(coopui::PanelGameVpnLabel(g_hostVpnKind)));
+    else if (w) ::InterlockedIncrement64(&g_panelCastNull);
+    w = UiFind(gui, n.vpnAddr);
+    t = w ? w->castType<MyGUI::TextBox>(false) : 0;
+    if (t) t->setCaption(MyGUI::UString(coopui::PanelHostCopyText(g_hostVpnAddr, PanelHostingGamePort()).c_str()));
+    else if (w) ::InterlockedIncrement64(&g_panelCastNull);
+    MyGUI::Button* b = UiBtn(gui, n.vpnCopyBtn);
+    if (b) b->setEnabled(g_hostVpnKind != coopui::kGameVpnNone && !g_hostVpnAddr.empty());
+}
 static void PanelNetAddrPush(MyGUI::Gui* gui)
 {
     const UiNames& n = NM();
@@ -1183,6 +1216,7 @@ static void PanelNetAddrPush(MyGUI::Gui* gui)
     if (b) { b->setCaption(MyGUI::UString(coopui::PanelNetAddrShowCaption(g_netAddrState, g_netAddrIp, g_netAddrShown).c_str())); b->setEnabled(on); }
     b = UiBtn(gui, n.netCopyBtn);
     if (b) b->setEnabled(on);
+    PanelVpnRowPush(gui);   /* T-631 */
     g_netAddrPushed = 1;
 }
 static void PanelCopy(int netRow);
@@ -1197,7 +1231,9 @@ static void PanelNetAddrDo(const coopui::PanelNetStep& s)
     {
         g_netAddrLookId = coop::UpnpLookupAsk();
         ::InterlockedIncrement64(&g_netAddrLookAsked);
-        DebugLog("[UI] internet address: the router gave none - asking the lookup websites (" + std::string(g_netAddrPending == coopui::kNetPressCopy ? "COPY" : "SHOW") + " pressed)");
+        DebugLog("[UI] internet address: " + std::string(s.state == coopui::kNetAddrRacing ? "the router has not answered yet - asking the lookup websites beside it"
+                                                                                           : "the router gave none - asking the lookup websites")
+                 + " (" + std::string(g_netAddrPending == coopui::kNetPressCopy ? "COPY" : "SHOW") + " pressed)");
         if (g_netAddrLookId <= 0)
         {
             ::InterlockedIncrement64(&g_netAddrLookFailed);
@@ -1211,10 +1247,11 @@ static void PanelNetAddrDo(const coopui::PanelNetStep& s)
     if (s.copyNow != 0) PanelCopy(1);
 }
 /* THE ROUTER'S AND THE WEBSITES' ANSWERS, picked up by the HOSTING status build (4 Hz): one [UI] line when an ask finishes -
-   found (and from which source) or not found and why, NEVER the address (logs go into bug reports). */
+   found (and from which source) or not found and why, NEVER the address (logs go into bug reports).  The router's answer
+   is read first, so when both are in hand in the same poll the router's address is the one taken. */
 static void PanelNetAddrPoll(MyGUI::Gui* gui)
 {
-    if (g_netAddrState == coopui::kNetAddrAsking)
+    if (g_netAddrState == coopui::kNetAddrAsking || g_netAddrState == coopui::kNetAddrRacing || g_netAddrState == coopui::kNetAddrRouterOnly)
     {
         std::string ip, why;
         const int got = (g_netAddrAskId > 0) ? coop::UpnpAddrResult(g_netAddrAskId, &ip, &why) : 2;
@@ -1233,7 +1270,7 @@ static void PanelNetAddrPoll(MyGUI::Gui* gui)
         }
         if (got != 0) PanelNetAddrDo(coopui::PanelNetRouterAnswer(g_netAddrState, g_netAddrPending, got == 1 ? 1 : 0));
     }
-    else if (g_netAddrState == coopui::kNetAddrLooking)
+    if (g_netAddrState == coopui::kNetAddrLooking || g_netAddrState == coopui::kNetAddrRacing)
     {
         std::string ip, source, why;
         const int got = coop::UpnpLookupResult(g_netAddrLookId, &ip, &source, &why);
@@ -1247,7 +1284,8 @@ static void PanelNetAddrPoll(MyGUI::Gui* gui)
         {
             g_netAddrIp.clear();
             ::InterlockedIncrement64(&g_netAddrLookFailed);
-            DebugLog("[UI] internet address: not found by the lookup websites (" + why + ") - SHOW / COPY greyed until the window opens again");
+            DebugLog("[UI] internet address: not found by the lookup websites (" + why + ")" + (g_netAddrState == coopui::kNetAddrRacing
+                     ? std::string(" - the router's answer decides") : std::string(" - SHOW / COPY greyed until the window opens again")));
         }
         if (got != 0) PanelNetAddrDo(coopui::PanelNetLookupAnswer(g_netAddrState, g_netAddrPending, got == 1 ? 1 : 0));
     }
@@ -1771,11 +1809,19 @@ static void PanelLayout(MyGUI::Gui* gui)
 {
     const coopui::PanelGeom& g = g_layGeom;
     if (g.rowH <= 0) return;
-    const int lay  = coopui::PanelLayoutOf((int)g_panelScreen, (int)g_profDlg, g_panelNameHintShown.empty() ? 0 : 1);   /* ui5b */
+    const int lay  = coopui::PanelLayoutOf((int)g_panelScreen, (int)g_profDlg, g_panelNameHintShown.empty() ? 0 : 1,
+                                           g_hostVpnKind != coopui::kGameVpnNone ? 1 : 0);   /* ui5b; T-631: the VPN row */
     const int addr = g_hostHomeAddr.empty() ? 0 : 1;
     coopui::PanelLive live(PanelLiveTextHalves(gui, lay, g.innerW, g.rowH));   /* ui5c: -1 = no text area on this screen */
-    if (lay == coopui::kLayHosting)
+    if (coopui::PanelLayIsHosting(lay) != 0)
     {
+        if (g_hostVpnHelpDue != 0 && !g_hostingHelpShown.empty())   /* T-631: the note follows a VPN changed while HOSTING is up */
+        {
+            g_hostingHelpShown = PanelHostingHelpText(PanelHostingGamePort());
+            MyGUI::EditBox* he = UiEdit(gui, NM().routerHelp);
+            if (he) he->setCaption(MyGUI::UString(g_hostingHelpShown.c_str()));
+        }
+        g_hostVpnHelpDue = 0;
         /* ui5d: the router help and PLAYERS areas as tall as their texts (ui7: measured); -1 (the list's value) until each is pushed */
         live.help    = g_hostingHelpShown.empty() ? -1
                      : PanelTextAreaHalves(gui, NM().routerHelp, 2, "routerhelp", lay, g_hostingHelpShown, g.innerW, g.rowH);
@@ -1806,10 +1852,10 @@ static void PanelLayout(MyGUI::Gui* gui)
     PanelPlace(gui, n.dlgCancel,    0,         bb.top, btnW,      bb.h);   /* CANCEL bottom-left */
     PanelPlace(gui, n.dlgOk,        W - btnW,  bb.top, btnW,      bb.h);   /* CREATE / DELETE ... bottom-right */
     /* ui5c: the two bottom-right buttons PanelBuild placed at the list's fixed row follow the text too. */
-    if (lay == coopui::kLayHosting)  PanelPlace(gui, n.chooseBtn, W - btnW, bb.top, btnW, bb.h);   /* CHOOSE PROFILE */
+    if (coopui::PanelLayIsHosting(lay) != 0)  PanelPlace(gui, n.chooseBtn, W - btnW, bb.top, btnW, bb.h);   /* CHOOSE PROFILE */
     if (lay == coopui::kLayProfiles) PanelPlace(gui, n.profPlay,  W - btnW, bb.top, btnW, bb.h);   /* PLAY */
     /* ui5d: HOSTING's router help and PLAYERS boxes at their live bands (PanelBuild made them at the list's values). */
-    if (lay == coopui::kLayHosting)
+    if (coopui::PanelLayIsHosting(lay) != 0)
     {
         const coopui::PanelBand hb = coopui::PanelSlotBand(lay, coopui::kSlotRouterHelp, rowH, live);
         const coopui::PanelBand pb = coopui::PanelSlotBand(lay, coopui::kSlotPlayers, rowH, live);
@@ -1820,12 +1866,13 @@ static void PanelLayout(MyGUI::Gui* gui)
        T-510: INTERNET ADDRESS under it - its label level with its value in the same label column, SHOW then COPY at the
        right, each button the width of LOCAL ADDRESS's COPY (PanelAddrBtnW). */
     const int addrBtnW = coopui::PanelAddrBtnW(W);
+    const int hostingLay = coopui::PanelLayIsHosting(lay) != 0 ? lay : coopui::kLayHosting;   /* HOSTING's layout: the VPN row's while it shows */
     const coopui::PanelPairRect ar = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(coopui::kLayHosting, coopui::kSlotHomeAddr, rowH),
                                                              0, addrBtnW + gap);
     PanelPlace(gui, n.homeAddr, addr != 0 ? ar.boxX : 0, ar.top, addr != 0 ? ar.boxW : ar.boxX + ar.boxW, ar.h);
     PanelPlace(gui, n.copyBtn, W - addrBtnW, ar.top, addrBtnW, ar.h);
     {
-        const coopui::PanelPairRect nr2 = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(coopui::kLayHosting, coopui::kSlotNetAddr, rowH, live),
+        const coopui::PanelPairRect nr2 = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(hostingLay, coopui::kSlotNetAddr, rowH, live),
                                                                   0, 2 * (addrBtnW + gap));
         PanelPlace(gui, n.netAddrLabel, nr2.labelX,                  nr2.top, nr2.labelW, nr2.h);
         PanelPlace(gui, n.netAddr,      nr2.boxX,                    nr2.top, nr2.boxW,   nr2.h);
@@ -1834,6 +1881,26 @@ static void PanelLayout(MyGUI::Gui* gui)
     }
     MyGUI::Widget* al = UiFind(gui, n.homeAddrLabel);
     if (al != 0) al->setVisible(addr != 0);
+    /* T-631 (owner 570): RADMIN / HAMACHI ADDRESS between LOCAL ADDRESS and INTERNET ADDRESS, only while that VPN was found -
+       LOCAL ADDRESS's row exactly: the label in the label column, the value after it, COPY at the right at the address
+       buttons' width (PanelAddrBtnW). */
+    {
+        const int vpnOn = (hostingLay == coopui::kLayHostingVpn) ? 1 : 0;
+        if (vpnOn != 0)
+        {
+            const coopui::PanelPairRect vr = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(hostingLay, coopui::kSlotVpnAddr, rowH, live),
+                                                                     0, addrBtnW + gap);
+            PanelPlace(gui, n.vpnAddrLabel, vr.labelX,    vr.top, vr.labelW, vr.h);
+            PanelPlace(gui, n.vpnAddr,      vr.boxX,      vr.top, vr.boxW,   vr.h);
+            PanelPlace(gui, n.vpnCopyBtn,   W - addrBtnW, vr.top, addrBtnW,  vr.h);
+        }
+        const std::string* const vn[] = { &n.vpnAddrLabel, &n.vpnAddr, &n.vpnCopyBtn };
+        for (size_t vi = 0; vi < sizeof(vn) / sizeof(vn[0]); ++vi)
+        {
+            MyGUI::Widget* vw = UiFind(gui, *vn[vi]);
+            if (vw != 0) vw->setVisible(vpnOn != 0);
+        }
+    }
     /* T-201 N1b (owner 166): MULTIPLAYER - HOST GAME, JOIN GAME and BACK, a full row each. */
     if (lay == coopui::kLayLanding)
     {
@@ -1949,7 +2016,7 @@ static void PanelPush(MyGUI::Gui* gui)
         b = UiBtn(gui, n.copyBtn); if (b) b->setEnabled(!g_hostHomeAddr.empty());
         PanelNetAddrPush(gui);   /* T-510 */
         /* ui5d: PanelLayout sizes the area to it.  T-510: the address note above the router help. */
-        g_hostingHelpShown = coopui::PanelAddrNoteText() + "\n" + coopui::PanelRouterHelpText(gamePort);
+        g_hostingHelpShown = PanelHostingHelpText(gamePort);   /* T-631: the VPN's sentence while one was found */
         e = UiEdit(gui, n.routerHelp); if (e) e->setCaption(MyGUI::UString(g_hostingHelpShown.c_str()));
         g_hostingPlayersShown = "\x01";   /* never a real list: the next status build pushes it */
     }
@@ -2107,9 +2174,10 @@ static int PanelClipMark(const char* format, DWORD value)
 
 static void PanelCopy(int netRow)
 {
-    /* ui5d: the port LOCAL ADDRESS shows, never 0.  T-510: netRow 1 = INTERNET ADDRESS's COPY - the address whether hidden or shown. */
-    const std::string text = coopui::PanelHostCopyText(netRow != 0 ? (coopui::PanelNetAddrHave(g_netAddrState, g_netAddrIp) != 0 ? g_netAddrIp : std::string())
-                                                                   : g_hostHomeAddr, PanelHostingGamePort());
+    /* ui5d: the port LOCAL ADDRESS shows, never 0.  T-510: netRow 1 = INTERNET ADDRESS's COPY - the address whether hidden or shown.
+       T-631: netRow 2 = the RADMIN / HAMACHI ADDRESS row's COPY - shown in the open, so copied and noted as LOCAL ADDRESS's. */
+    const std::string text = coopui::PanelHostCopyText(netRow == 1 ? (coopui::PanelNetAddrHave(g_netAddrState, g_netAddrIp) != 0 ? g_netAddrIp : std::string())
+                                                                   : (netRow == 2 ? g_hostVpnAddr : g_hostHomeAddr), PanelHostingGamePort());
     int ok = 0, marks = 0;
     if (!text.empty() && ::OpenClipboard(::GetActiveWindow()))
     {
@@ -2130,22 +2198,30 @@ static void PanelCopy(int netRow)
             }
         }
         /* T-510: the internet address stays out of clipboard history and cloud sync (a mark that fails leaves the copy as it is) */
-        if (ok != 0 && netRow != 0)
+        if (ok != 0 && netRow == 1)
             marks = PanelClipMark("ExcludeClipboardContentFromMonitorProcessing", 0) + PanelClipMark("CanIncludeInClipboardHistory", 0)
                   + PanelClipMark("CanUploadToCloudClipboard", 0);
         ::CloseClipboard();
     }
     ::InterlockedIncrement64(ok != 0 ? &g_addrCopied : &g_addrCopyFailed);
-    g_hostCopyNote = coopui::PanelCopyNote(netRow, ok, text);
-    DebugLog(std::string("[UI] COPY ") + (netRow != 0 ? "internet" : "local") + " address: " + (ok != 0 ? "copied" : "not copied")
-             + ((ok != 0 && netRow != 0) ? " (kept out of clipboard history: " + coopui::PanelNum((long long)marks) + " of 3 marks set)" : std::string()));
+    g_hostCopyNote = coopui::PanelCopyNote(netRow == 1 ? 1 : 0, ok, text);
+    DebugLog(std::string("[UI] COPY ") + (netRow == 1 ? "internet" : (netRow == 2 ? "vpn" : "local")) + " address: " + (ok != 0 ? "copied" : "not copied")
+             + ((ok != 0 && netRow == 1) ? " (kept out of clipboard history: " + coopui::PanelNum((long long)marks) + " of 3 marks set)" : std::string()));
 }
 
 /* mp4 - OPEN THE HOSTING SCREEN: read the home-network address once, from Windows (no outside service). */
 static void PanelHostingOpen()
 {
     std::string how;
-    g_hostHomeAddr = net::HomeNetworkAddress(&how);
+    {
+        net::HomeNet hn;   /* T-631: one adapter walk gives the home address and the game VPN (homeaddr.cpp) */
+        net::HomeNetwork(&hn);
+        g_hostHomeAddr = hn.ip;
+        how = hn.how;
+        g_hostVpnKind = hn.vpnKind;
+        g_hostVpnAddr = hn.vpnIp;
+        g_hostVpnHelpDue = 0;
+    }
     g_hostCopyNote.clear();
     /* The INTERNET ADDRESS row opens hidden and asks the router again (upnp.cpp, on its own thread); the lookup websites wait
        for a SHOW or COPY press. */
@@ -2170,7 +2246,8 @@ static void PanelHostingOpen()
     ::InterlockedIncrement64(&g_hostingShown);
     ::InterlockedIncrement64(g_hostHomeAddr.empty() ? &g_homeAddrMissing : &g_homeAddrFound);
     DebugLog("[UI] mp4: Hosting screen for '" + g_fWorld + "' - home-network address "
-             + (g_hostHomeAddr.empty() ? std::string("NOT FOUND") : g_hostHomeAddr) + " (" + how + ")");
+             + (g_hostHomeAddr.empty() ? std::string("NOT FOUND") : std::string("found (not written to the log)")) + " (" + how + ")"
+             + " vpn=" + coopui::PanelGameVpnWord(g_hostVpnKind));   /* T-631: the word only, never the VPN address */
     g_panelScreen = 5;
 }
 
@@ -2221,7 +2298,7 @@ static int PanelStartNotebook(unsigned short port)
     g_nbPort = (int)port;
 
     const std::string exe = PathNextToDll(swnames::kServerExe);
-    if (::GetFileAttributesA(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
+    if (U8GetFileAttributes(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         ::InterlockedIncrement64(&g_panelNbNoExe);
         g_nbState = coopui::kNbNoExe;
@@ -2231,7 +2308,7 @@ static int PanelStartNotebook(unsigned short port)
         return 0;
     }
 
-    /* PathNextToDll("") ends in a separator; CreateProcessA accepts that for lpCurrentDirectory, and it
+    /* PathNextToDll("") ends in a separator; CreateProcessW accepts that for lpCurrentDirectory, and it
        is trimmed anyway so the log line names the folder the way a person writes it. */
     std::string dir = PathNextToDll("");
     if (!dir.empty() && (dir[dir.size() - 1] == '\\' || dir[dir.size() - 1] == '/'))
@@ -2242,6 +2319,8 @@ static int PanelStartNotebook(unsigned short port)
     std::string worldArg = coopworld::WorldOrDefault(ConfigWorldKey(), 0);
     /* PP3: the notebook's TOP folder is this game's own (store.cpp BaseDir: storedir=, else <data folder>\worlds), passed
        with --root so the two can never differ - the data folder may be a TEST datadir= the notebook cannot know. */
+    /* the world server reads its arguments as UTF-16 (wmain) and hands them on as UTF-8, the encoding of this plugin's paths and
+       names; the command line goes over wide (CreateProcessW below), so both name the same folder under any user or world name */
     const std::string rootArg = StoreTopDir();
 
     /* B13 (decision 49) - THE NOTEBOOK IS STARTED FOR A PLAYER, AND IT IS TOLD WHICH ONE. The relay's
@@ -2254,17 +2333,20 @@ static int PanelStartNotebook(unsigned short port)
     std::string ownerArg;
     if (!ownerId.empty()) ownerArg = " --owner " + ownerId;
 
-    /* CreateProcessA MUTATES lpCommandLine, so it is never a string literal and never a c_str().
+    /* CreateProcessW MUTATES lpCommandLine, so it is never a string literal and never a c_str().
        B13-b (review-b13, LOW): the line grew by --owner's 42 characters, and a TRUNCATED command line is
        worse than none - it would start the notebook on the wrong world, or without its operator, and the
-       run would then look like a different fault entirely. _snprintf returns negative when it did not fit,
+       run would then look like a different fault entirely. _snwprintf returns negative when it did not fit,
        and this refuses in words instead of launching something it cannot describe. */
-    char cmd[1024];
+    wchar_t cmd[1024];
     /* owner decision 183: --parent <this Kenshi's pid> - the helper closes itself (its normal quit: every queued write, then the world
        lock goes with the process) when this Kenshi is gone, crashed or not, so a crash never leaves the lock and the port held. */
-    const int cmdLen = _snprintf(cmd, sizeof(cmd) - 1, "\"%s\" --port %u --world \"%s\" --root \"%s\"%s --parent %lu", exe.c_str(), (unsigned)port, worldArg.c_str(), rootArg.c_str(), ownerArg.c_str(),
-                                 (unsigned long)::GetCurrentProcessId());
-    cmd[sizeof(cmd) - 1] = 0;
+    /* each piece converted on its own: exe and dir (this DLL's folder, from PathNextToDll), the world name and the top folder are
+       all UTF-8 - U8W reads well-formed UTF-8 as UTF-8 (anything else in the ANSI code page, counted as g_u8AnsiFallback) */
+    const std::wstring wExe = U8W(exe.c_str()), wDir = U8W(dir.c_str()), wWorld = U8W(worldArg.c_str()), wRoot = U8W(rootArg.c_str()), wOwner = U8W(ownerArg.c_str());
+    const int cmdLen = _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1, L"\"%ls\" --port %u --world \"%ls\" --root \"%ls\"%ls --parent %lu", wExe.c_str(), (unsigned)port, wWorld.c_str(), wRoot.c_str(), wOwner.c_str(),
+                                  (unsigned long)::GetCurrentProcessId());
+    cmd[sizeof(cmd) / sizeof(cmd[0]) - 1] = 0;
     if (cmdLen < 0)
     {
         ::InterlockedIncrement64(&g_panelNbCmdTooLong);
@@ -2277,15 +2359,15 @@ static int PanelStartNotebook(unsigned short port)
         return 0;
     }
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     ::ZeroMemory(&si, sizeof si);
     si.cb = sizeof si;
     PROCESS_INFORMATION pi;
     ::ZeroMemory(&pi, sizeof pi);
 
-    const BOOL ok = ::CreateProcessA(exe.c_str(), cmd, 0, 0, FALSE,
+    const BOOL ok = ::CreateProcessW(wExe.c_str(), cmd, 0, 0, FALSE,
                                      CREATE_NO_WINDOW | DETACHED_PROCESS,
-                                     0, dir.c_str(), &si, &pi);
+                                     0, wDir.c_str(), &si, &pi);
     if (ok == FALSE)
     {
         const DWORD e = ::GetLastError();
@@ -2476,7 +2558,7 @@ static void PanelPollNotebook()
    ------------------------------------------------------------------------------------------------ */
 static bool PanelReadSmall(const std::string& path, std::string* out)
 {
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = U8fopen(path.c_str(), "rb");
     if (f == 0) return false;
     char buf[512];
     const size_t got = std::fread(buf, 1, sizeof buf, f);
@@ -2501,8 +2583,8 @@ static void PanelScanWorlds()
     const std::string top = StoreTopDir();
     std::vector<coopworld::WorldFolderInput> in;
     std::map<std::string, int> freshByFolder;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = ::FindFirstFileA((top + "\\*").c_str(), &fd);
+    U8FindData fd;
+    HANDLE h = U8FindFirstFile((top + "\\*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE)
     {
         do
@@ -2516,8 +2598,8 @@ static void PanelScanWorlds()
             if (!PanelReadSmall(dir + "\\world.txt", &w.worldTxt)) w.worldTxt.clear();
             long long newest = 0;
             int others = 0;
-            WIN32_FIND_DATAA fe;
-            HANDLE g = ::FindFirstFileA((dir + "\\*").c_str(), &fe);
+            U8FindData fe;
+            HANDLE g = U8FindFirstFile((dir + "\\*").c_str(), &fe);
             if (g != INVALID_HANDLE_VALUE)
             {
                 do
@@ -2526,13 +2608,13 @@ static void PanelScanWorlds()
                     if (coopcfg::CfgLower(std::string(fe.cFileName)) != "world.txt") ++others;
                     const long long t = PanelUnixOf(fe.ftLastWriteTime);
                     if (t > newest) newest = t;
-                } while (::FindNextFileA(g, &fe));
+                } while (U8FindNextFile(g, &fe));
                 ::FindClose(g);
             }
             if (newest > 0) w.lastPlayed = coopui::PanelNum(newest);
             freshByFolder[coopworld::WorldFolderName(name)] = (others == 0) ? 1 : 0;
             in.push_back(w);
-        } while (::FindNextFileA(h, &fd));
+        } while (U8FindNextFile(h, &fd));
         ::FindClose(h);
     }
     std::vector<std::string> skipped;
@@ -2586,9 +2668,9 @@ static void PanelCreateWorld()
         return;
     }
     const std::string top = StoreTopDir();
-    ::CreateDirectoryA(top.c_str(), 0);   /* the first world on this computer: the top folder may not be there yet */
+    U8CreateDirectory(top.c_str(), 0);   /* the first world on this computer: the top folder may not be there yet */
     const std::string dir = top + "\\" + folder;
-    if (::CreateDirectoryA(dir.c_str(), 0) == 0)
+    if (U8CreateDirectory(dir.c_str(), 0) == 0)
     {
         const DWORD e = ::GetLastError();
         std::string had;
@@ -2614,14 +2696,14 @@ static void PanelCreateWorld()
     bool ok = false;
     {   /* a temp file, flushed to the disk, then renamed - the road every identity file takes */
         const std::string wt = dir + "\\world.txt", tmp = wt + ".tmp";
-        HANDLE h = ::CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        HANDLE h = U8CreateFile(tmp.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
         if (h != INVALID_HANDLE_VALUE)
         {
             DWORD put = 0;
             ok = ::WriteFile(h, txt.data(), (DWORD)txt.size(), &put, 0) != 0 && put == (DWORD)txt.size() && ::FlushFileBuffers(h) != 0;
             ::CloseHandle(h);
-            ok = ok && ::MoveFileExA(tmp.c_str(), wt.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-            if (!ok) ::DeleteFileA(tmp.c_str());
+            ok = ok && U8MoveFileEx(tmp.c_str(), wt.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            if (!ok) U8DeleteFile(tmp.c_str());
         }
     }
     if (!ok)
@@ -2683,7 +2765,7 @@ static void PanelDeleteConfirmed()
     { std::string t; bool up = false; if (PanelReadSmall(path + "\\world.txt", &t)) coopworld::WorldTxtParseId(t, &worldId, &up); }
     {
         char full[MAX_PATH * 2];
-        const DWORD got = ::GetFullPathNameA(path.c_str(), (DWORD)sizeof full, full, 0);
+        const DWORD got = U8GetFullPathName(path.c_str(), (DWORD)sizeof full, full, 0);
         if (got > 0 && got < (DWORD)sizeof full) path = full;   /* the Recycle Bin needs a full path */
     }
     std::vector<char> from(path.begin(), path.end());
@@ -2695,8 +2777,8 @@ static void PanelDeleteConfirmed()
     op.wFunc  = FO_DELETE;
     op.pFrom  = &from[0];
     op.fFlags = (FILEOP_FLAGS)(FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING);
-    const int rc = ::SHFileOperationA(&op);
-    const bool gone = (::GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES);
+    const int rc = U8SHFileOperation(&op);
+    const bool gone = (U8GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES);
     if (rc != 0 || op.fAnyOperationsAborted || !gone)
     {
         ::InterlockedIncrement64(&g_worldDeleteFailed);
@@ -3217,7 +3299,7 @@ static bool PanelHostingSame()
 static bool PanelReadWorldFile(const std::string& folder, const char* file, std::string* out)
 {
     out->clear();
-    FILE* f = std::fopen((StoreTopDir() + "\\" + folder + "\\" + file).c_str(), "rb");
+    FILE* f = U8fopen((StoreTopDir() + "\\" + folder + "\\" + file).c_str(), "rb");
     if (f == 0) return false;
     char buf[4096];
     size_t got;
@@ -3233,7 +3315,7 @@ static int PanelHostProfChoice(coopprof::HostProfileChoice* c)
     if (g_hostProfWorld != r->folder) { g_hostProfWorld = r->folder; g_hostProfNum = 0; g_hostProfNew.clear(); }
     std::string text;
     PanelReadProfilesFile(r->folder, &text);
-    *c = coopprof::HostProfileChoose(coopprof::PersonActiveRows(text, ConfigPlayerId()), g_hostProfNum, g_hostProfNew, coopcfg::CfgTrim(g_fName));
+    *c = coopprof::HostProfileChoose(coopprof::PersonActiveRows(text, StoreWorldPlayerId(r->folder)), g_hostProfNum, g_hostProfNew, coopcfg::CfgTrim(g_fName));   /* the id through the world's aliases.txt */
     return 1;
 }
 /* CHANGE's list: this player's profiles in the picked world (its profiles.txt) and the world's profile limit (its options.txt
@@ -3242,7 +3324,7 @@ static void PanelProfSelectLoad()
 {
     std::string text;
     PanelReadProfilesFile(g_hostProfWorld, &text);
-    const std::vector<coopprof::Row> mine = coopprof::PersonActiveRows(text, ConfigPlayerId());
+    const std::vector<coopprof::Row> mine = coopprof::PersonActiveRows(text, StoreWorldPlayerId(g_hostProfWorld));   /* the id through the world's aliases.txt */
     g_profList.clear();
     for (size_t k = 0; k < mine.size(); ++k)
     { StoreProfRow p; p.num = mine[k].num; p.name = mine[k].name; p.faction = mine[k].faction; p.lastPlayed = mine[k].lastPlayed; g_profList.push_back(p); }
@@ -3281,7 +3363,7 @@ static void PanelHostPress()
     }
     {   /* owner 429: a world folder a newer build wrote is not hosted - nothing is started and nothing in it is written (M4) */
         const std::string fp = StoreTopDir() + "\\" + r->folder + "\\" + swnames::kFormatFile;
-        const bool exists = ::GetFileAttributesA(fp.c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool exists = U8GetFileAttributes(fp.c_str()) != INVALID_FILE_ATTRIBUTES;
         std::string t, why; unsigned int found = 0;
         if (exists) PanelReadSmall(fp, &t);
         const int v = swformat::FormatDecide(swformat::FormatParse(exists, t, swformat::kKindWorld, &found, &why), found, swformat::kWorldFolderFormat);
@@ -3309,7 +3391,7 @@ static void PanelHostPress()
    fold: a HOST press on the world already hosted, same port, arms nothing and only shows HOSTING, so Done is the way there. */
 static bool PanelReadOptionsFile(const std::string& path, std::string* out)
 {
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = U8fopen(path.c_str(), "rb");
     if (f == 0) return false;
     char buf[8192];
     const size_t got = std::fread(buf, 1, sizeof buf, f);
@@ -3523,6 +3605,7 @@ static void PanelApply(MyGUI::Gui* gui, int act, int havePanel)
             return;
         case kActPaste:        PanelPaste();            if (havePanel) PanelPush(gui); return;
         case kActCopy:         if (g_panelScreen == 5) PanelCopy(0); if (havePanel) PanelPush(gui); return;   /* mp4 */
+        case kActVpnCopy:      if (g_panelScreen == 5 && g_hostVpnKind != coopui::kGameVpnNone) PanelCopy(2); if (havePanel) PanelPush(gui); return;   /* T-631 */
         case kActNetCopy:      /* INTERNET ADDRESS's COPY: copied now with an address; otherwise it waits for the router / the websites */
         case kActNetShow:      /* SHOW / HIDE: the same */
             if (g_panelScreen == 5 && coopui::PanelNetAddrButtonsOn(g_netAddrState) != 0)
@@ -3899,6 +3982,17 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         Mk(sg, n.typeText,   std::string("Kenshi_TextboxStandardText"), nr2.boxX, nr2.top, nr2.boxW, nr2.h, n.netAddr);
         Mk(sg, n.typeButton, n.skinBtn1,    W - 2 * addrBtnW - gap, nr2.top, addrBtnW, nr2.h, n.netShowBtn);
         Mk(sg, n.typeButton, n.skinBtn1,    W - addrBtnW, nr2.top, addrBtnW, nr2.h, n.netCopyBtn);
+        {
+            /* T-631 (owner 570): RADMIN / HAMACHI ADDRESS - LOCAL ADDRESS's row exactly, made hidden; PanelLayout shows it
+               while a game VPN was found */
+            const coopui::PanelPairRect vr = coopui::PanelLabelBoxIn(W, gap, coopui::PanelSlotBand(coopui::kLayHostingVpn, coopui::kSlotVpnAddr, rowH),
+                                                                     0, addrBtnW + gap);
+            MyGUI::Widget* vw[3];
+            vw[0] = Mk(sg, n.typeText,   std::string("Kenshi_TextboxStandardText"), vr.labelX, vr.top, vr.labelW, vr.h, n.vpnAddrLabel);
+            vw[1] = Mk(sg, n.typeText,   std::string("Kenshi_TextboxStandardText"), vr.boxX, vr.top, vr.boxW, vr.h, n.vpnAddr);
+            vw[2] = Mk(sg, n.typeButton, n.skinBtn1,    W - addrBtnW, vr.top, addrBtnW, vr.h, n.vpnCopyBtn);
+            for (int vi = 0; vi < 3; ++vi) if (vw[vi] != 0) vw[vi]->setVisible(false);
+        }
         Mk(sg, n.typeEdit,   n.skinWrap,    0,         hb.top, W,         hb.h, n.routerHelp);
         Mk(sg, n.typeEdit,   n.skinWrap,    0,         pb.top, W,         pb.h, n.playersBox);   /* ui5d: both re-placed at their texts' heights by PanelLayout */
         Mk(c,  n.typeButton, n.skinBtn1,    W - btnW,  bb.top, btnW,      bb.h, n.chooseBtn);
@@ -4042,7 +4136,8 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
        the call ui3's title row already made (no new import). */
     {
         const std::string* const labs[] = { &n.nameLabel, &n.portLabel, &n.joinLabel, &n.dlgNameLabel, &n.homeAddrLabel, &n.homeAddr,
-                                            &n.hostProfLabel, &n.hostProfValue, &n.netAddrLabel, &n.netAddr };   /* T-201 PP6'; T-510 */
+                                            &n.hostProfLabel, &n.hostProfValue, &n.netAddrLabel, &n.netAddr,
+                                            &n.vpnAddrLabel, &n.vpnAddr };   /* T-201 PP6'; T-510; T-631 */
         for (size_t li = 0; li < sizeof(labs) / sizeof(labs[0]); ++li)
         { w = UiFind(gui, *labs[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); }
         for (int li = 0; li < coopui::kOptRowsShown; ++li)
@@ -4093,6 +4188,7 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
     b = UiBtn(gui, n.copyBtn);    if (b) { b->setCaption(MyGUI::UString("COPY")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopCopyClicked); }
     b = UiBtn(gui, n.netShowBtn); if (b) { b->setCaption(MyGUI::UString("SHOW")); b->eventMouseButtonClick += MyGUI::newDelegate(OnNetAddrShowClicked); }   /* T-510 */
     b = UiBtn(gui, n.netCopyBtn); if (b) { b->setCaption(MyGUI::UString("COPY")); b->eventMouseButtonClick += MyGUI::newDelegate(OnNetAddrCopyClicked); }
+    b = UiBtn(gui, n.vpnCopyBtn); if (b) { b->setCaption(MyGUI::UString("COPY")); b->eventMouseButtonClick += MyGUI::newDelegate(OnVpnAddrCopyClicked); }   /* T-631 */
     b = UiBtn(gui, n.chooseBtn);  if (b) { b->setCaption(MyGUI::UString("CHOOSE PROFILE")); b->setEnabled(false); b->setVisible(false); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopChooseProfileClicked); }   /* prof3: wired */
     /* prof3: the Your profiles screen's buttons and column heads. */
     b = UiBtn(gui, n.profPlay);   if (b) { b->setCaption(MyGUI::UString("PLAY")); b->eventMouseButtonClick += MyGUI::newDelegate(OnCoopProfPlayClicked); }
@@ -6846,6 +6942,7 @@ int UiPauseMenuArrange(void* panel)
 }
 static void* detour_pauseMenuShow(void* panel)
 {
+    if (panel != 0 && ChatTakesEscape() != 0) return 0;   /* ESC while the chat is open closes the chat (its tick), and the ESC that just closed it is the chat's too: the menu stays shut */
     void* ret = orig_pauseMenuShow(panel);
     if (panel == 0) return ret;
     if (HandSaveBlocked()) ++g_hiddenOpens;
@@ -7160,7 +7257,8 @@ static bool UiMenuCommandBody(const std::string& args)
 /* T-510 - TEST-ONLY `hostaddr fake <ip>` | `hostaddr show` | `hostaddr hide`.  fake: the INTERNET ADDRESS row takes <ip> as if
    the router had reported it (a bench's router may not answer), so a screenshot run can show the SHOW state; it replaces an
    ask still running.  show / hide: SHOW / HIDE without a click (`uiclick hostaddrshow` is the player's road).  The address
-   is never logged. */
+   is never logged.  T-631: `hostaddr vpn radmin <ip>` | `hostaddr vpn hamachi <ip>` | `hostaddr vpn none` - the RADMIN /
+   HAMACHI ADDRESS row as if that adapter were found (a bench may have neither VPN); its address is never logged either. */
 bool UiHostAddrCommand(const std::string& args)
 {
     std::string a, rest;
@@ -7187,7 +7285,29 @@ bool UiHostAddrCommand(const std::string& args)
         DebugLog("[UI] internet address " + std::string(g_netAddrShown != 0 ? "shown" : "hidden") + " (TEST-ONLY hostaddr " + a + ")");
         return true;
     }
-    DebugLog("[UI] hostaddr REFUSED - usage: hostaddr fake <ip> | hostaddr show | hostaddr hide");
+    if (a == "vpn")   /* T-631 */
+    {
+        std::string kindWord, ipText, clean;
+        coopui::UiDriveSplit(rest, &kindWord, &ipText);
+        int kind = -1;
+        if (kindWord == "radmin") kind = coopui::kGameVpnRadmin;
+        else if (kindWord == "hamachi") kind = coopui::kGameVpnHamachi;
+        else if (kindWord == "none" && ipText.empty()) kind = coopui::kGameVpnNone;
+        if (kind > coopui::kGameVpnNone)
+        {
+            std::string addrKind;
+            coopupnp::RouterAddressPublic(ipText, &addrKind, &clean);
+            if (addrKind == "unreadable") kind = -1;
+        }
+        if (kind < 0) { DebugLog("[UI] hostaddr vpn REFUSED - usage: hostaddr vpn radmin <ip> | hostaddr vpn hamachi <ip> | hostaddr vpn none"); return false; }
+        g_hostVpnKind = kind;
+        g_hostVpnAddr = clean;
+        g_netAddrPushed = 0;    /* the row's widgets (PanelNetAddrPush -> PanelVpnRowPush) */
+        g_hostVpnHelpDue = 1;   /* the note above the router help (PanelLayout) */
+        DebugLog(std::string("[UI] vpn=") + coopui::PanelGameVpnWord(kind) + " (TEST-ONLY hostaddr vpn)");
+        return true;
+    }
+    DebugLog("[UI] hostaddr REFUSED - usage: hostaddr fake <ip> | hostaddr show | hostaddr hide | hostaddr vpn radmin|hamachi <ip> | hostaddr vpn none");
     return false;
 }
 

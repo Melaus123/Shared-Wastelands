@@ -36,7 +36,7 @@
 
 namespace coopfeed {
 
-const unsigned int kFeedProtocol = 87;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+const unsigned int kFeedProtocol = 90;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
 const unsigned int kMsgRecordFeed = 58;    /* 54/55 are effort/m11a's, 57 effort/m8's */
 const unsigned int kMsgRecord = 28, kMsgRecordGone = 32, kMsgDeletedBits = 33, kMsgUniqueState = 36;   /* the world server's numbers */
 enum { kFeedAsk = 1, kFeedOff = 2, kFeedBegin = 3, kFeedPageEnd = 4 };
@@ -209,6 +209,14 @@ inline int FeedOffTaken(FeedAskState* s)
     const int was = s->asked;
     s->asked = 0; s->paging = 0; s->wantNext = 0; s->nextKey.clear(); ++s->epoch;
     return was;
+}
+
+/* the link to the world server dropped: the world server erased this game's subscription with the connection, so nothing is
+   asked any more and no OFF is owed for it (an OFF now would reach the next connection before its WELCOME). The next ASK is a
+   first page, on the next welcomed link. */
+inline void FeedLinkDropped(FeedAskState* s)
+{
+    s->asked = 0; s->paging = 0; s->wantNext = 0; s->nextKey.clear();
 }
 
 /* Review L4: a BEGIN arrived on link `linkGen` - 1 when it answers the LATEST ask (it comes before that ask's PAGE_END), 0 when

@@ -73,6 +73,26 @@ inline bool ClothingMissedKoHold(int dead, int downed, bool ownerKo, bool ownerD
         && !ClothingThroughKoHold(dead, downed, ownerKo, ownerDead, lookWentThrough, knockHeld);
 }
 
+/* T-601 D1: a wake-up clock held back with a parked knockdown (spawn.cpp ProneParkTick) goes on when the hold ends, less the
+   time it waited: koTimer - waitedMs / 1000, never below 0. A value outside the range ApplyLatch writes (0 or below, 3600 and
+   above, or not a number: no clock running) comes back unchanged, so ApplyLatch treats it exactly as the owner sent it. */
+inline float HeldKoTimerLeft(float koTimer, unsigned long waitedMs)
+{
+    if (!(koTimer > 0.0f) || !(koTimer < 3600.0f)) return koTimer;
+    const float left = koTimer - (float)waitedMs / 1000.0f;
+    return left > 0.0f ? left : 0.0f;
+}
+
+/* A knock-out pose written onto a copy that stands and is not a ragdoll is stood straight back up by the copy's own engine,
+   which then lays it down itself with the ragdoll, because the same STATE gave it the owner's unconscious flag or wake-up
+   clock. So the pose is left to that engine; when the next STATE still finds the copy standing it is written (leftBefore),
+   so a standing copy is written by every other such STATE. leftBefore: already left once and the copy still stands -
+   the owner's next STATE writes it. ragdoll / limp: 1 yes, 0 no, -1 unreadable (unreadable writes, as before). */
+inline bool LeaveKoPoseToEngine(int prone, bool latchDowns, int ragdoll, int limp, bool leftBefore)
+{
+    return prone == 4 && latchDowns && ragdoll == 0 && limp == 0 && !leftBefore;
+}
+
 }   /* namespace coopkolook */
 
 #endif

@@ -56,10 +56,12 @@ const char*    const kFormatFile      = "format.txt";
 const char*    const kTestCfg         = "shared_wastelands.cfg";
 #define SW_TEST_CFG_HEADER "# shared_wastelands.cfg - written by"
 
-/* Files beside the plugin DLL: its log, the previous launch's kept copy, and the test harness's status and command files. */
+/* Files beside the plugin DLL: its log, the kept copies of the two launches before this one (logrotate.h: copy 1 the
+   previous launch, copy 2 the one before it), and the test harness's status and command files. */
 const char*    const kLog             = "shared_wastelands_log.txt";
 const wchar_t* const kLogW            = L"shared_wastelands_log.txt";
 const char*    const kLogPrev         = "shared_wastelands_log.1.txt";
+const char*    const kLogPrev2        = "shared_wastelands_log.2.txt";
 const char*    const kStatusFile      = "shared_wastelands_status.txt";
 const char*    const kCmdFile         = "shared_wastelands_cmd.txt";
 
@@ -68,6 +70,7 @@ const wchar_t* const kSetupTitleW     = SW_NAME_W L" Setup";
 const char*    const kBugReportTitle  = SW_NAME " bug report";
 const wchar_t* const kBugReportAgentW = L"SharedWastelands-BugReport/1";
 const wchar_t* const kAddrLookupAgentW = L"SharedWastelands-AddressLookup/1";
+const wchar_t* const kRouterAgentW   = L"SharedWastelands-Router/1";   /* the HTTP user agent of the router ask (upnp.cpp) */
 
 }  /* namespace swnames */
 

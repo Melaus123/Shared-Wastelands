@@ -16,7 +16,7 @@
 
 namespace coopsquad {
 /* M7a A1 build 2 [a1b2-sw0]: the put-away / owed / hand-back / mark decisions are RETIRED (design 2.2) - their replacements are in
-   liveowner.h (AdoptDecide, ReceiverRingPick, ReleaseStep, GiverSettleOnAck, SquadGivenEffective). */
+   liveowner.h (AdoptDecide, AreaReceiverOrder, ReleaseStep, GiverSettleOnAck, SquadGivenEffective). */
 
 enum { kXferReasonNone = 0, kXferReasonForced = 1, kXferReasonFollowLeader = 2 };
 
@@ -149,6 +149,7 @@ inline int SupersedeOwnIdAfterHandover(int ownBlock, int handedOver)
    1 = refuse. */
 inline int HandedOverWakeRefuse(int handedOver, int heldByOther, int othersPresent, int worldFaction)
 {
+    if (handedOver != 0 && heldByOther == -2 && worldFaction != 0) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - nothing of its area wakes here, whoever is present */
     return (handedOver != 0 && heldByOther == 1 && othersPresent != 0 && worldFaction != 0) ? 1 : 0;
 }
 /* THE STALE-SQUAD DROP QUEUE's first test (store.cpp T300DropTick). A drop of another game's file or of a squad this game handed over
@@ -249,8 +250,9 @@ inline int ContextSleepWrite(int isContext, int isHandedOver, int known, int min
      - none of them run by this game (mine == 0; a person taken over or hired here counts as this game's);
      - none of them a person this game ran and then released to another game (releasedHere == 0): such a squad is this game's own squad
        whose people were handed over IN PLACE (a dual run's yield, a revoke that leaves a puppet, a hand-over's acknowledgement - the body
-       stays in its squad as the new owner's puppet); the other game never writes a squad of this game's numbering, so refusing it would
-       lose that squad's state. A squad formed around copies that arrived by SPAWN holds no such person.
+       stays in its squad as the new owner's puppet); another game writes a squad of this game's numbering only while it holds the squad's
+       area and runs its people (NpcSquadWriter), so outside that, refusing it would lose that squad's state. A squad formed around copies
+       that arrived by SPAWN holds no such person.
    Everything else goes on to the existing rules. Asked after ContextSleepWrite (a context platoon and a handed-over squad keep their own
    refusal and counter) and after the player / peer / stand-in skips. The sleep write and the heartbeat publish (HbOwnedAwake) ask the same
    question. */
@@ -290,6 +292,125 @@ inline int ContextDropStep(int stillContext, int sleptMine, int readable, int aw
     if (readable == 0) return kCtxDropRetry;
     if (awake != 0) return knownMembers > 0 ? kCtxDropKeepLive : kCtxDropRetire;
     return asleepListed != 0 ? kCtxDropDestroy : kCtxDropRetry;
+}
+
+/* WHO WRITES A WORLD NPC SQUAD'S RECORD: whoever runs the squad's area keeps its record current, and the world's version wins. The sleep
+   write, the heartbeat's publish and the wipe-out delete ask this first (store.cpp NpcWriterAsk), then NpcCopyFresh.
+     npcSquad     - a world faction's squad: not a player's, a peer's or a stand-in record's faction, not a context platoon (another game's
+                    announced people) and not a zone record. Anything else: kNpcWriteToday.
+     livePos      - a member's position was read; the area is judged there.
+     mineHeld     - MineHeldTS at that position: 1 this game holds the area, 0 it does not, -1 no fresh map.
+     heldByOther  - HeldByOtherTS there: 1 another game holds it, 0 not, -1 no fresh map.
+     mine         - the squad's members this game runs.
+     releasedHere - the squad's members this game ran and released in place to another game (store.cpp MembersReleasedHere).
+     otherNewer   - NpcRecordOtherNewer: the newest record was written by another game and is newer than this copy's stamp.
+   kNpcWriteHolder: this game holds the area and runs some of the squad's people - written whatever block numbered the squad.
+   kNpcWriteRefuseStray: another game holds the area and none of the squad's people is this game's - never written, published or deleted
+     here (a copy this game's engine woke in another game's area is not the world's version). A squad holding people released in place
+     here is this game's own squad and not a stray - unless otherNewer: then the game that wrote that record writes it and this game
+     stays out.
+   kNpcWriteToday: no position, no fresh answer, nobody holds the area, this game holds it but runs none of the people, or another game
+     holds it while this game runs some of them or holds people released in place here - the block and member rules decide. */
+enum { kNpcWriteToday = 0, kNpcWriteHolder = 1, kNpcWriteRefuseStray = 2 };
+inline int NpcSquadWriter(int npcSquad, int livePos, int mineHeld, int heldByOther, int mine, int releasedHere, int otherNewer)
+{
+    if (npcSquad == 0 || livePos == 0) return kNpcWriteToday;
+    if (mineHeld == 1) return mine > 0 ? kNpcWriteHolder : kNpcWriteToday;
+    if (heldByOther == -2 && mine == 0) return kNpcWriteRefuseStray;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world and none of the people is this game's - not written here */
+    if (heldByOther == 1 && mine == 0) return (releasedHere == 0 || otherNewer != 0) ? kNpcWriteRefuseStray : kNpcWriteToday;
+    return kNpcWriteToday;
+}
+/* The wake: a world NPC squad woken while another game holds its area (heldByOther 1, at its sleeping position) gets no record applied
+   at that wake - the holder's people are the live ones, and loading the record would build a second set beside them. 1 = skip the load. */
+inline int NpcWakeSkipLoad(int npcSquad, int heldByOther)
+{
+    return (npcSquad != 0 && (heldByOther == 1 || heldByOther == -2)) ? 1 : 0;   /* -2 frozen (coopdrop::kAreaFrozen): the holder is a player not in the world */
+}
+/* A wake loads a world NPC squad's record only when it is newer than the stamp this game last wrote or applied for that copy (store.cpp
+   g_localWrittenAt). The stamp is forgotten only when the orphan purge emptied the copy: purgeTouched - the purge took people out of it;
+   members - its member count read now (0 empty, -1 unread). Its next wake then loads the world's record whatever its age. A copy that
+   still holds people keeps its stamp: a sleep or wake that writes nothing must not let an older record load over a newer snapshot (it
+   would bring the dead back). 1 = forget the stamp. */
+inline int NpcPurgeForgetStamp(int npcSquad, int purgeTouched, int members)
+{
+    return (npcSquad != 0 && purgeTouched != 0 && members == 0) ? 1 : 0;
+}
+/* The world's version of a world NPC squad. haveRecord - a full record of it is known (writtenAt > 0); owner - the slot that wrote the
+   newest record (-1 none); recordAt - its writtenAt; haveStamp / stamp - the newest record this copy wrote or loaded (g_localWrittenAt).
+   NpcCopyFresh: 1 = this copy may write, publish or wipe-out-mark the squad - there is no record, the newest record is this game's own,
+     or this copy wrote or loaded it (stamp >= recordAt); no slot of my own: 1. Else 0 - refused, and the copy loads the record at its next
+     wake. Asked after NpcSquadWriter, so it also stops a stale copy this game adopts when an area changes hands (its stamp bump would
+     otherwise win) and one of two drifted copies of one squad.
+   NpcRecordOtherNewer: 1 = the newest record was written by another game (a real slot, not mine) and is newer than this copy's stamp (no
+     stamp: newer). */
+inline int NpcCopyFresh(int mySlot, int haveRecord, int owner, long long recordAt, int haveStamp, long long stamp)
+{
+    if (mySlot < 0 || haveRecord == 0 || owner == mySlot) return 1;
+    return (haveStamp != 0 && stamp >= recordAt) ? 1 : 0;
+}
+inline int NpcRecordOtherNewer(int mySlot, int haveRecord, int owner, long long recordAt, int haveStamp, long long stamp)
+{
+    if (mySlot < 0 || haveRecord == 0 || owner < 0 || owner == mySlot) return 0;
+    return (haveStamp == 0 || recordAt > stamp) ? 1 : 0;
+}
+/* "Another game's file" (store.cpp T300OtherHeld - the wake refusal, the RECV refusal, the orphan purge's and the arrival sweep's drops
+   that throw this game's copy away): a record another game wrote (owner a real slot, not mine) of a squad NOT numbered in my block
+   (blockOwner: the slot whose block numbered it, -1 unknown). A squad numbered in my block is my own squad whoever wrote its latest
+   record - the holder of its area writes it - and my copy is kept: the orphan sweep takes the holder's people out of it, and it loads the
+   world's record at its first wake after that game lets go. No slot of my own: 0. 1 = another game's file. */
+inline int OtherGameFile(int mySlot, int owner, int blockOwner)
+{
+    if (mySlot < 0 || owner < 0 || owner == mySlot) return 0;
+    return blockOwner == mySlot ? 0 : 1;
+}
+/* A full record another game wrote (owner a real slot, not mine) of a squad numbered in MY block (blockOwner == mySlot), asleep here at a
+   position loaded here, with another player present, in an area another game holds (heldByOther 1), of a world faction's squad
+   (worldFaction 1): the squad is left asleep where it is - not moved into that area and woken (the orphan purge would empty the woken
+   copy), not thrown away (OtherGameFile keeps it: it is my own squad). The record is kept; the squad's wake loads it once that game lets
+   go. No slot of my own: 0. 1 = leave it asleep. */
+inline int OwnBlockRecvHold(int mySlot, int owner, int blockOwner, int playersPresent, int heldByOther, int worldFaction)
+{
+    if (mySlot < 0 || owner < 0 || owner == mySlot || blockOwner != mySlot) return 0;
+    if (heldByOther == -2 && worldFaction == 1) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - left asleep, whoever is present */
+    return (playersPresent != 0 && heldByOther == 1 && worldFaction == 1) ? 1 : 0;
+}
+
+/* The store authority's 1 Hz walk of sleeping squads (PublishSleepingPositions) sends a sleeping squad's position as the
+   position of its world record. A copy that is not the world's version (NpcCopyFresh 0: another game wrote a newer record, which
+   this copy loads at its next wake) sends nothing - its sleeping position is older than that record. A sleeping position the
+   engine never wrote (SquadPosUsable 0) is no position and is never sent. Else a squad with no record here is sent, and one with
+   a record is sent when it lies kTravelStepUnits or more from it (movedFar). */
+const int kSleepPosKeep = 0;       // not sent: it lies near its record's position
+const int kSleepPosSend = 1;       // sent
+const int kSleepPosStale = 2;      // not sent: another game's newer record is the world's version
+const int kSleepPosUnusable = 3;   // not sent: the engine never wrote a sleeping position
+inline int SleepPosPublish(int copyFresh, int posUsable, int haveRecord, int movedFar)
+{
+    if (copyFresh == 0) return kSleepPosStale;
+    if (posUsable == 0) return kSleepPosUnusable;
+    if (haveRecord == 0) return kSleepPosSend;
+    return movedFar != 0 ? kSleepPosSend : kSleepPosKeep;
+}
+/* A NEWER RECORD GOES INTO A WAKING SQUAD ONCE. Read (1.0.65): the engine's wake reads the squad's own file into its record
+   container only while the container's "already read" byte (+8) is 0 (DataObjectContainer::_NV_loadFromDisk 0x36B490), which is the
+   case at the first wake after a save load (the UnloadedPlatoon hands the byte to the ActivePlatoon, base ctor 0x7EB7E0). The engine's
+   container load (0x6C0800) never empties the container: a record whose string id is already there is updated (0x6BD190), any other is
+   added (0x6BF430). A store reload (LoadPod) carries other string ids than the save's file, so a reload before that read wakes every
+   person twice. So with the byte at 0 the store does not reload: the load hook hands the engine the record's file for that read.
+   newer: the record is newer than this copy's stamp; gone: the group was wiped out; heldElsewhere: another game holds the squad's
+   area; ctx: a context platoon; alreadyRead: the sleeping container's +8 (1 read, 0 not yet, -1 could not be read). A byte that could
+   not be read keeps the reload, as before this rule: whether the engine also reads its own file at that wake is then not known. */
+const int kWakeRoadNone = 0;       // no newer record to apply
+const int kWakeRoadLoad = 1;       // the store reloads the container now: its byte says already read, or could not be read
+const int kWakeRoadSwap = 2;       // left to the engine's own read: the load hook swaps in the record's file and stamps it on success
+const int kWakeRoadSkipCtx = 3;    // not applied: a context platoon (its people arrive by SPAWN)
+const int kWakeRoadSkipHeld = 4;   // not applied: another game holds the squad's area (a later wake loads it)
+inline int WakeLoadRoad(bool newer, bool gone, bool heldElsewhere, bool ctx, int alreadyRead)
+{
+    if (!newer || gone) return kWakeRoadNone;
+    if (ctx) return kWakeRoadSkipCtx;
+    if (heldElsewhere) return kWakeRoadSkipHeld;
+    return alreadyRead == 0 ? kWakeRoadSwap : kWakeRoadLoad;
 }
 
 }   /* namespace coopsquad */

@@ -11,6 +11,8 @@
 #include "../common/orphanhold.h"   /* T-306 (owner decision 226; fold 1): when an orphaned zone tick sends its player sector as unknown, swept by the offline suite */
 #include "../common/presence.h"   /* M11 C1: is another player in this world - the old link or the roster (PresenceDecide) */
 #include "../common/peergone.h"   /* M8 review F9: the loaded-bit rule of a departure (PeerGoneMaskBits), swept by the offline suite */
+#include "../common/loadedzones.h"   /* the loaded set from the engine's active-zone list (SectorOfZoneAt, Normalise, CountSources), swept by the offline suite */
+#include "../common/liveowner.h"   /* EngineKeepsAt - the engine's keep rule, swept by the offline suite */
 #include "coop_log.h"
 #include "game/Character.h"
 #include "game/RootObjectBase.h"
@@ -36,7 +38,7 @@ const float kSectorSize   = 4608.0f;
 const float kSectorOrigin = 147456.0f;   // 4608 * 32
 unsigned long long kZoneManagerPtrRva = 0; static coop::AddrReg kZoneManagerPtrRva_reg("ZoneManagerPtr", &kZoneManagerPtrRva);   /* P8h: the address table fills this. Steam_1.0.65 0x2133960 */   // DAT_142133960: ZoneManager*
 unsigned long long kIsZoneLoadedTRva = 0; static coop::AddrReg kIsZoneLoadedTRva_reg("IsZoneLoadedT", &kIsZoneLoadedTRva);   /* P8h: the address table fills this. Steam_1.0.65 0xA0D560 */    // bool ZoneManager::isZoneLoadedT(const Ogre::Vector3&) - resolver-verified
-const int kRing = 3;                               // 7x7 sectors probed around the player's sector each second
+const int kRing = 3;                               // the 7x7 block around the watched character: probed only when the engine's zone list cannot be read, and the 'outside' count of the loaded-set line
 const int kTickEvery = 118;                        // retired by P4s: the report is gated by the clock (review-p4o Q5: 118 frames is 10 s below 12 fps)
 
 typedef bool (*IsZoneLoadedFn)(void* zoneManager, const Ogre::Vector3& pos);
@@ -281,6 +283,7 @@ bool ReadPosition(::Character* c, float* x, float* y, float* z)
 
 long long g_tick = 0;
 std::vector<Sector> g_loaded;              // this instance's loaded set, last computed
+std::string g_zonesListShown;              /* the loaded list the last [ZONES] summary printed - it prints again on a change */
 Sector g_playerSector = { -1, -1 };
 long long g_ticks = 0, g_probes = 0, g_probeFaults = 0, g_noZoneManager = 0, g_noPlayer = 0;   /* M2 (decisions 32/44/54): sent / recv, the session-link ZONES counters, are retired with the message - a readout writes ABSENT */
 // review-p5j MEDIUM-4: IsPositionLoadedHere answered "not loaded" for a probe that FAULTED, and E15 wired that answer
@@ -293,8 +296,8 @@ long long g_posLoadedFault = 0, g_posLoadedNoZm = 0;
    DESTROYS that character (T674: the corpse was eaten, log-A.txt:21277), and the tick used to bail out from then on with no
    AREAS report at all - so the notebook released every area this game held after its 10 s lease (log-store 09:00:07
    "AREA 43,11 slot 0 -> 1") and the other game adopted everything standing in it. A dead body that still exists was never the
-   problem (it stays the watch and its position still reads). Now a tick with no readable watched character keeps probing
-   around the LAST position it read and reports EXACTLY what a live tick would: every area that reads loaded there (fold 1,
+   problem (it stays the watch and its position still reads). Now a tick with no readable watched character keeps the LAST
+   position it read as its centre and reports EXACTLY what a live tick would: every area the engine has loaded (fold 1,
    manager ruling on the review of 584c3b71 - a dead or spectating player's game keeps streaming what its camera sees, like a
    live one; worldsync reads this report as "the areas I can see", and the notebook's own lease and hand-over rules decide who
    holds what, exactly as for a live player whose camera moves). It differs from a live tick in two things only: the ring-1
@@ -306,6 +309,70 @@ int g_orphanRun = 0;   /* consecutive orphaned ticks in the current spell, this 
 long long g_orphanTicks = 0, g_orphanEntered = 0, g_orphanEnded = 0, g_orphanSentUnknown = 0;
 int g_areasLastNonEmpty = 0; volatile LONG g_areasLeaveOwed = 0; long long g_areasLeaveSent = 0;   /* M6 fold 1: the last AREAS sent listed sectors / a teardown owes one empty AREAS / how many went (ZonesAreasLeave) */
 int g_lastSentAny = 0, g_lastSentX = 0, g_lastSentY = 0;   /* the player sector the last AREAS that reached the wire carried (x < 0 = unknown) */
+/* THE LOADED SET, FROM THE ENGINE'S OWN LIST. ZoneManager::getAllActiveZones (FillActiveZonesPod) copies every ZoneMap of the
+   manager's active set - the areas its engine keeps for any player character, the camera or a town; ZoneManager::deactivateZone
+   removes an area from that set in the same call that unloads it. Each listed ZoneMap's area is where it sits in the manager's
+   fixed 64x64 array (loadedzones::SectorOfZoneAt - the lookup ZoneManager::isZoneLoadedT itself makes), or its header's
+   +0x18 / +0x1C when the pointer is not in that array; the area counts as loaded when the engine's loaded test at its centre
+   (IsLoadedAt) says so - the same test the 7x7 probe makes. The reasons each area is kept (camera / player character / town) go
+   to the loaded-set line only. Returns 1 when the list was read (out = its loaded areas in row order), 0 when it could not be
+   (no address row, or the call faulted). Bounded by the 64x64 grid; one pass a second. MAIN THREAD. */
+long long g_zlReads = 0, g_zlFaults = 0, g_zlListed = 0, g_zlNotLoaded = 0, g_zlNotInArray = 0, g_zlHeaderDiffers = 0, g_zlUnplaced = 0, g_zlProbeFaults = 0, g_zlChanges = 0;
+int ReadZoneHeaderSectorPod(void* m, int* x, int* y)
+{
+    __try { *x = *(int*)((char*)m + 0x18); *y = *(int*)((char*)m + 0x1C); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int ReadZoneWhyPod(void* m)   /* loadedzones::kWhy* bits; 0 when no reason holds or none can be read */
+{
+    if (kZnIsActivationTypeRva == 0) return 0;
+    __try
+    {
+        IsActivationTypeFn isType = (IsActivationTypeFn)coop::AddrAbs(kZnIsActivationTypeRva);
+        return (isType(m, 0) ? loadedzones::kWhyCamera : 0) | (isType(m, 1) ? loadedzones::kWhyPlayer : 0) | (isType(m, 2) ? loadedzones::kWhyTown : 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int EngineLoadedAreas(void* zm, float py, std::vector<loadedzones::Area>* out)
+{
+    out->clear();
+    static lektor<void*> zones;   /* one reused list, as ActiveZoneReasons keeps: the engine's grow allocates it, the mod never frees it */
+    zones.clear();
+    if (!FillActiveZonesPod(zm, &zones)) { ++g_zlFaults; return 0; }
+    ++g_zlReads;
+    unsigned char seen[loadedzones::kGrid][loadedzones::kGrid];
+    std::memset(seen, 0, sizeof(seen));
+    const unsigned n = zones.size(), cap = (unsigned)(loadedzones::kGrid * loadedzones::kGrid);
+    for (unsigned i = 0; i < n && i < cap; ++i)
+    {
+        void* m = zones[i];
+        if (!PlausiblePod(m)) { ++g_zlUnplaced; continue; }
+        ++g_zlListed;
+        int sx = -1, sy = -1, hx = -1, hy = -1;
+        const int header = ReadZoneHeaderSectorPod(m, &hx, &hy);
+        if (loadedzones::SectorOfZoneAt((unsigned long long)(uintptr_t)zm, (unsigned long long)(uintptr_t)m, &sx, &sy) == 1)
+        {
+            if (header == 1 && (hx != sx || hy != sy)) ++g_zlHeaderDiffers;
+        }
+        else
+        {
+            ++g_zlNotInArray;
+            if (header != 1 || loadedzones::InGrid(hx, hy) == 0) { ++g_zlUnplaced; continue; }
+            sx = hx; sy = hy;
+        }
+        if (seen[sx][sy] != 0) continue;
+        seen[sx][sy] = 1;
+        const float cx = (sx + 0.5f) * kSectorSize - kSectorOrigin, cz = (sy + 0.5f) * kSectorSize - kSectorOrigin;
+        ++g_probes;
+        const int r = IsLoadedAt(zm, cx, py, cz);
+        if (r < 0) { ++g_probeFaults; ++g_zlProbeFaults; continue; }
+        if (r == 0) { ++g_zlNotLoaded; continue; }
+        loadedzones::Area a; a.x = sx; a.y = sy; a.why = ReadZoneWhyPod(m);
+        out->push_back(a);
+    }
+    loadedzones::Normalise(out);
+    return 1;
+}
 
 /* M2: THE NO-NOTEBOOK FEEDS ARE DELETED - the A6 first-loader owner map (OwnerRow / g_map / HostNote and its claims
    counters), the host's copy of the peer's MSG_ZONES set (g_peerLoaded), both games' B9 grid of it (g_peerLoadedGrid)
@@ -347,7 +414,12 @@ unsigned char g_mineHeld[64][64];
 // -2 = the map carried no row for this area at all, -1 = a row that names nobody, >= 0 = the slot. Same lock, same clock
 // (g_hostHeldAt) as g_hostHeld/g_mineHeld.
 int g_ownerSlot[64][64];
-static void OwnerSlotClear() { for (int x = 0; x < 64; ++x) for (int y = 0; y < 64; ++y) g_ownerSlot[x][y] = -2; }
+/* 1 = the map names this area for another player who is not in the world on this link's roster (coopdrop::AreaFrozenDecide):
+   HostHoldsSectorTS, MineHeldTS, AreaViewTS (held, mine) and AreaHolderSlotTS answer coopdrop::kAreaFrozen there. Same lock, same
+   clock (g_hostHeldAt) as g_ownerSlot, and cleared with it. */
+unsigned char g_areaFrozen[64][64];
+long long g_areaFrozenCells = 0, g_areaFrozenMaps = 0, g_areaFrozenAnswers = 0;   /* the latest map's frozen areas; maps with any; area queries answered frozen. Under g_heldLock */
+static void OwnerSlotClear() { for (int x = 0; x < 64; ++x) for (int y = 0; y < 64; ++y) g_ownerSlot[x][y] = -2; std::memset(g_areaFrozen, 0, sizeof(g_areaFrozen)); }
 // decision 37 AMENDED (review-p5g HIGH-2): the FOURTH grid - the areas THIS GAME has loaded, as a lockable copy of g_loaded.
 // The three grids above all come from the relay's map, and an area the relay's map does not mention at all reads held=0 and
 // mine=0 on both games: MayInventHereTS then answered 0 to everyone, so every town outside both games' loaded rings was refused
@@ -759,6 +831,33 @@ void ZonesAreasLeave(const char* why)
     DebugLog(std::string("[ZONES] M6 fold 1: one empty AREAS sent (") + (why != 0 ? why : "?") + ") - the world server stops sending this game AREA traffic now (areasLeaveSent "
              + N(g_areasLeaveSent) + ")");
 }
+/* One line each time the loaded set names different areas or comes from a different source: how many areas, by the engine's
+   reasons (or the 7x7 probe when the engine's list could not be read), and how many lie outside the watched character's 7x7.
+   Each listed area carries its reasons [camera, player character, town]. MAIN THREAD. */
+static void ZonesLogLoadedChange(const std::vector<loadedzones::Area>& areas, int fromList)
+{
+    static std::vector<loadedzones::Area> s_last; static int s_lastFromList = -1;
+    if (fromList == s_lastFromList && loadedzones::SameAreas(areas, s_last)) return;
+    s_last = areas; s_lastFromList = fromList; ++g_zlChanges;
+    loadedzones::Sources src; loadedzones::CountSources(areas, g_playerSector.x, g_playerSector.y, kRing, &src);
+    std::string list;
+    for (size_t i = 0; i < areas.size(); ++i)
+    {
+        if (i != 0) list += " ";
+        list += N((long long)areas[i].x) + "," + N((long long)areas[i].y);
+        if (fromList == 1)
+        {
+            list += "["; list += (areas[i].why & loadedzones::kWhyCamera) ? "c" : "-"; list += (areas[i].why & loadedzones::kWhyPlayer) ? "p" : "-";
+            list += (areas[i].why & loadedzones::kWhyTown) ? "t" : "-"; list += "]";
+        }
+    }
+    const std::string from = (fromList == 1)
+        ? "the engine's active-zone list - by reason (an area can have several): camera " + N((long long)src.camera) + ", player characters " + N((long long)src.player)
+          + ", towns " + N((long long)src.town) + ", none now (lease running out) " + N((long long)src.leaseOnly)
+        : std::string("the 7x7 probe around the watched character (the engine's list could not be read)");
+    DebugLog("[ZONES] loaded set: " + N((long long)src.total) + " area(s) from " + from + "; outside the watched character's 7x7 around "
+             + SectorString(g_playerSector) + ": " + N((long long)src.outsideRing) + " list=" + list);
+}
 void ZonesTick()
 {
     ++g_tick;
@@ -795,19 +894,30 @@ void ZonesTick()
     ++g_ticks;   /* review-p5a MEDIUM-3: the clock is spent here, so the count belongs here too - g_ticks is REPORTS again, not frames spent inside a bail-out window (the bail-out counters below stay frames, which is what they are) */
     g_playerSector = SectorOf(px, pz);
     std::vector<Sector> loaded;
-    for (int dy = -kRing; dy <= kRing; ++dy)
-        for (int dx = -kRing; dx <= kRing; ++dx)
-        {
-            Sector s; s.x = g_playerSector.x + dx; s.y = g_playerSector.y + dy;
-            if (s.x < 0 || s.x > 63 || s.y < 0 || s.y > 63) continue;
-            // the sector's centre in world units
-            const float cx = (s.x + 0.5f) * kSectorSize - kSectorOrigin;
-            const float cz = (s.y + 0.5f) * kSectorSize - kSectorOrigin;
-            ++g_probes;
-            const int r = IsLoadedAt(zm, cx, py, cz);
-            if (r < 0) { ++g_probeFaults; continue; }
-            if (r == 1) loaded.push_back(s);
-        }
+    /* The loaded set is every area this game's engine has loaded - around each of its player characters, its camera and its
+       towns - read from the engine's own active-zone list (EngineLoadedAreas). Only when that list cannot be read does the tick
+       probe the 7x7 block around the watched character instead. */
+    std::vector<loadedzones::Area> areas;
+    const int fromList = EngineLoadedAreas(zm, py, &areas);
+    if (fromList == 0)
+    {
+        for (int dy = -kRing; dy <= kRing; ++dy)
+            for (int dx = -kRing; dx <= kRing; ++dx)
+            {
+                Sector s; s.x = g_playerSector.x + dx; s.y = g_playerSector.y + dy;
+                if (s.x < 0 || s.x > 63 || s.y < 0 || s.y > 63) continue;
+                // the sector's centre in world units
+                const float cx = (s.x + 0.5f) * kSectorSize - kSectorOrigin;
+                const float cz = (s.y + 0.5f) * kSectorSize - kSectorOrigin;
+                ++g_probes;
+                const int r = IsLoadedAt(zm, cx, py, cz);
+                if (r < 0) { ++g_probeFaults; continue; }
+                if (r == 1) { loadedzones::Area a; a.x = s.x; a.y = s.y; a.why = 0; areas.push_back(a); }
+            }
+        loadedzones::Normalise(&areas);
+    }
+    for (size_t ai = 0; ai < areas.size(); ++ai) { Sector s; s.x = areas[ai].x; s.y = areas[ai].y; loaded.push_back(s); }
+    ZonesLogLoadedChange(areas, fromList);
     /* T-306 fold 1: WHAT GOES ON THE WIRE is the loaded set, live or orphaned - the same areas a live tick reports. Orphaned,
        only the player sector differs, and only from the second consecutive orphaned tick (cooporphan::OrphanSendUnknownSector). */
     if (orphan != 0)
@@ -816,8 +926,8 @@ void ZonesTick()
         if (g_orphanRun == 1)
         {
             ++g_orphanEntered;
-            DebugLog("[ZONES] T-306 ORPHAN: no live watched character - this game keeps reporting every area loaded around its last known position (sector "
-                     + SectorString(g_playerSector) + "), as a live tick would; the player sector goes out as unknown from orphaned tick "
+            DebugLog("[ZONES] T-306 ORPHAN: no live watched character - this game keeps reporting every area its engine has loaded, with its last known position (sector "
+                     + SectorString(g_playerSector) + ") as the centre, as a live tick would; the player sector goes out as unknown from orphaned tick "
                      + N((long long)cooporphan::kOrphanUnknownAfterTicks));
         }
     }
@@ -878,8 +988,9 @@ void ZonesTick()
     // PROBE-END: P025
     std::string list;
     for (size_t i = 0; i < loaded.size(); ++i) { if (i) list += " "; list += SectorString(loaded[i]); }
-    if (g_ticks % 5 == 1)   // one line every ~5 s; the [VERDICT] at report carries the set
+    if (g_ticks % 5 == 1 || list != g_zonesListShown)   // one line every ~5 s and whenever the list changes; the [VERDICT] at report carries the set
     {
+        g_zonesListShown = list;
         DebugLog("[ZONES] player sector=" + SectorString(g_playerSector) + " loaded(" + N((long long)loaded.size()) + ")=" + list
                  + (orphan != 0 ? " orphan=1 (last known position, no live watched character; orphaned tick " + N((long long)g_orphanRun)
                                   + ") sent=" + SentSectorString(sendX, sendY) : std::string()));   /* T-306 fold 1: what actually went out while orphaned */
@@ -959,6 +1070,35 @@ int ZoneLoadedSectorTri(int sx, int sy)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* the engine's side-neighbour test (0xA088A0) counts a neighbour as loaded when its ZoneMap +0xB1 OR +0xB0 byte is set (Read);
+   the same thread test, ZoneManager test, bounds and guarded read as ZoneLoadedSectorTri above, reading both bytes */
+int ZoneKeepSectorTri(int sx, int sy)
+{
+    const unsigned long mt = StoreMainThreadId();
+    if (mt == 0 || ::GetCurrentThreadId() != (DWORD)mt) { ++g_zbOffMain; return -1; }
+    void* zm = ZoneManagerPtr();
+    if (!PlausiblePod(zm)) { ++g_zbNoZm; return -1; }
+    if (sx < 0 || sx >= 64 || sy < 0 || sy >= 64) return 0;
+    __try
+    {
+        const unsigned char* zone = (const unsigned char*)((uintptr_t)zm + 0xC8 + (uintptr_t)(sx * 64 + sy) * 0x168);
+        return (zone[0xB1] != 0 || zone[0xB0] != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the live keep question at a squad's centre - asked at the moment of each hand-over decision and each take */
+int EngineKeepsHere(float x, float z)
+{
+    const int sx = (int)floorf((kSectorOrigin + x) / kSectorSize);
+    const int sy = (int)floorf((kSectorOrigin + z) / kSectorSize);
+    const int self = ZoneKeepSectorTri(sx, sy);
+    if (self <= 0) return self;
+    const int w = sx > 0 ? ZoneKeepSectorTri(sx - 1, sy) : 1;   /* off the grid: the engine has no neighbour there to narrow by */
+    const int e = sx < 63 ? ZoneKeepSectorTri(sx + 1, sy) : 1;
+    const int so = sy > 0 ? ZoneKeepSectorTri(sx, sy - 1) : 1;
+    const int no = sy < 63 ? ZoneKeepSectorTri(sx, sy + 1) : 1;
+    return cooplo::EngineKeepsAt(x, z, sx * kSectorSize - kSectorOrigin, sy * kSectorSize - kSectorOrigin, kSectorSize, self, w, e, so, no, cooplo::kKeepMarginUnits);
+}
 int ZoneBuildingsInHereTri(float x, float y, float z)
 {
     (void)y;
@@ -978,6 +1118,8 @@ void ReportZones()
     for (size_t i = 0; i < g_loaded.size(); ++i) { if (i) list += " "; list += SectorString(g_loaded[i]); }
     DebugLog("[ZONES] REPORT ticks=" + N(g_ticks) + " probes=" + N(g_probes) + " probeFaults=" + N(g_probeFaults)
              + " noZoneManager=" + N(g_noZoneManager) + " noPlayer=" + N(g_noPlayer) + " orphan[entered,ticks,ended,sentUnknown,runNow]=" + N(g_orphanEntered) + "," + N(g_orphanTicks) + "," + N(g_orphanEnded) + "," + N(g_orphanSentUnknown) + "," + N((long long)g_orphanRun) + " posLoadedFault=" + N(g_posLoadedFault) + " posLoadedNoZm=" + N(g_posLoadedNoZm)
+             + " zoneList[reads,faults,listed,notLoaded,notInArray,headerDiffers,unplaced,probeFaults,changes]=" + N(g_zlReads) + "," + N(g_zlFaults) + "," + N(g_zlListed)
+             + "," + N(g_zlNotLoaded) + "," + N(g_zlNotInArray) + "," + N(g_zlHeaderDiffers) + "," + N(g_zlUnplaced) + "," + N(g_zlProbeFaults) + "," + N(g_zlChanges)
              + " playerSector=" + SectorString(g_playerSector) + " loaded=" + N((long long)g_loaded.size())
              + " yieldedStale=" + N((long long)g_yieldedStale) + " peerSect[recv,valid,ring1Relay,ring1Puppet,presumedEmptyGranted,preWelcomeIgnored]=" + N((long long)g_peerSectRecv) + "," + N((long long)g_peerSectValid) + "," + N((long long)g_peerSectRing1Relay) + "," + N((long long)g_peerSectRing1Puppet) + "," + N((long long)g_peerSectPresumedEmpty) + "," + N((long long)g_peerSectPreWelcomeIgnored) + "   (P6q: presumedEmptyGranted is NOT the old presumedEmpty - it counts ring-1 presumptions actually GRANTED, where the old name counted views on which one was on offer; preWelcomeIgnored is PLAYERSECTORS tables dropped because this link's WELCOME had not been processed yet)"
              + " areasSent=" + N(g_areasSent) + " areasSentEmpty=" + N(g_areasSentEmpty) + " areasLeaveSent=" + N(g_areasLeaveSent) + " inventRefusedTeardown=" + N((long long)g_inventRefusedTeardown)
@@ -1001,9 +1143,10 @@ int HostHoldsSectorTS(const Sector& s)
     if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return 0;
     HeldLockInit();
     ::EnterCriticalSection(&g_heldLock);
-    const int held = (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) ? (int)g_hostHeld[s.x][s.y] : -1;
+    int held = (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) ? (int)g_hostHeld[s.x][s.y] : -1;
+    if (held >= 0 && g_areaFrozen[s.x][s.y] != 0) { held = coopdrop::kAreaFrozen; ++g_areaFrozenAnswers; }
     ::LeaveCriticalSection(&g_heldLock);
-    return held;   // 1 held, 0 not held, -1 no fresh map
+    return held;   // 1 held, 0 not held, -1 no fresh map, -2 frozen (the holder is a player not in the world)
 }
 // T215: "does ANOTHER game have this area loaded" - the same lock and the same 5-s freshness rule, over the grid the relay's
 // loadedMask fills. This is the announce question; holding is a different one (HostHoldsSectorTS above).
@@ -1025,9 +1168,10 @@ int MineHeldTS(const Sector& s)
     if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return 0;
     HeldLockInit();
     ::EnterCriticalSection(&g_heldLock);
-    const int mine = (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) ? (int)g_mineHeld[s.x][s.y] : -1;
+    int mine = (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) ? (int)g_mineHeld[s.x][s.y] : -1;
+    if (mine >= 0 && g_areaFrozen[s.x][s.y] != 0) { mine = coopdrop::kAreaFrozen; ++g_areaFrozenAnswers; }
     ::LeaveCriticalSection(&g_heldLock);
-    return mine;   // 1 I hold it, 0 I do not, -1 no fresh map
+    return mine;   // 1 I hold it, 0 I do not, -1 no fresh map, -2 frozen (the holder is a player not in the world)
 }
 // review-p5i CRASH-2: THE LOADED-HERE QUESTION, ASKABLE FROM A WORKER. SectorLoadedHere (above) walks g_loaded, and ZonesTick
 // reassigns that whole vector on the main thread every second - the assignment frees the old buffer, so a worker that has
@@ -1279,6 +1423,7 @@ void AreaViewTS(const Sector& s, int* held, int* mine, int* otherLoaded, int* lo
         const bool loadedFresh = (g_otherLoadedAt > 0.0 && now - g_otherLoadedAt <= 5.0);
         h = heldFresh ? (int)g_hostHeld[s.x][s.y] : -1;
         m = heldFresh ? (int)g_mineHeld[s.x][s.y] : -1;
+        if (heldFresh && g_areaFrozen[s.x][s.y] != 0) { h = coopdrop::kAreaFrozen; m = coopdrop::kAreaFrozen; ++g_areaFrozenAnswers; }   /* frozen: the holder is a player not in the world - no answer anything acts on */
         o = loadedFresh ? (int)g_otherLoaded[s.x][s.y] : -1;
         l = (int)g_loadedHere[s.x][s.y];   /* decision 37 amended: no clock - my own loaded set is never "stale", only empty */
         /* E13 attempt 2: Chebyshev distance <= 1 from THIS game's own player, off the locked copy of the sector so it
@@ -1375,14 +1520,16 @@ void AreaProbeTS(const Sector& s, int* owner, double* heldAge)
    freshness every other area answer has (a map no older than 5 s). -1 = unknown. */
 int AreaHolderSlotTS(const Sector& s)
 {
-    int o = -1;
+    int o = -1, frozen = 0;
     if (s.x >= 0 && s.x < 64 && s.y >= 0 && s.y < 64)
     {
         HeldLockInit();
         ::EnterCriticalSection(&g_heldLock);
         if (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) o = g_ownerSlot[s.x][s.y];
+        if (o >= 0 && g_areaFrozen[s.x][s.y] != 0) { frozen = 1; ++g_areaFrozenAnswers; }
         ::LeaveCriticalSection(&g_heldLock);
     }
+    if (frozen != 0) return coopdrop::kAreaFrozen;   /* -2 frozen: the holder is a player not in the world */
     return (o >= 0) ? o : -1;
 }
 // THE RULE ITSELF, over a view somebody else has already read. One copy, called from the wrapper below AND from every gate
@@ -1630,7 +1777,8 @@ std::string ZonesAreaMapCounters()   /* M9 (T-197): areaMap[rows,seats,rekeyed,b
     HeldLockInit(); ::EnterCriticalSection(&g_heldLock);
     const std::string v = N(g_areaMapRows) + "," + N(g_areaMapSeats) + "," + N(g_areaMapRekeyed) + "," + N(g_areaMapBytes)
         + " areaMapOdd[rekeyDropped,malformed,pendingArmed,pendingDropped,pendingExpired]=" + N(g_areaMapRekeyDropped) + "," + N(g_areaMapMalformed)
-        + "," + N(g_areaMapPendingArmed) + "," + N(g_areaMapPendingDropped) + "," + N(g_areaMapPendingExpired);   /* M9f1 */
+        + "," + N(g_areaMapPendingArmed) + "," + N(g_areaMapPendingDropped) + "," + N(g_areaMapPendingExpired)   /* M9f1 */
+        + " areaFrozen[cells,maps,answers]=" + N(g_areaFrozenCells) + "," + N(g_areaFrozenMaps) + "," + N(g_areaFrozenAnswers);
     ::LeaveCriticalSection(&g_heldLock);
     return v;
 }
@@ -1639,6 +1787,19 @@ int ZonesEffCarriedCells() { HeldLockInit(); ::EnterCriticalSection(&g_heldLock)
 // decision 32: the relay's owner map (x, y, slot triples). The locked grid becomes "held by a slot other than mine"; while the relay
 // is present its map wins over the host-computed one (both games see the same map from one clock).
 double g_mySince[64][64];   /* inv4 fold 4: when my slot's bit appeared in each cell's effective mask (0 = clear); under g_heldLock */
+/* MAIN THREAD (ApplyRelayAreaMap): one line each time the set of frozen areas changes - x, y, holder triples. */
+static std::string g_areaFrozenSaid;
+static void AreaFrozenSay(const std::vector<int>& cells)
+{
+    std::string t;
+    for (size_t i = 0; i + 2 < cells.size() && t.size() < 400; i += 3) t += " " + N((long long)cells[i]) + "," + N((long long)cells[i + 1]) + "(slot " + N((long long)cells[i + 2]) + ")";
+    const std::string key = N((long long)(cells.size() / 3)) + t;
+    if (key == g_areaFrozenSaid) return;
+    g_areaFrozenSaid = key;
+    if (cells.empty()) DebugLog("[ZONES] no area is frozen now - every holder the area map names is in the world on this link's roster");
+    else DebugLog("[ZONES] AREAS FROZEN: " + N((long long)(cells.size() / 3)) + " area(s) named for a player who is not in the world on this link's roster"
+                  " - nothing is created, adopted, removed, woken or loaded from a record there until that player is in the world:" + t);
+}
 int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
 {
     /* M9 (T-197; world-server protocol 65; design-many D6 (a)): the map is {seat table, rows} (coopdrop::AreaMapLayout) and every
@@ -1646,6 +1807,21 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
        ages out on its own 5 s clock, as a lost one does). */
     int listed[coopdrop::kAreaSeats]; int seatCount = 0, count = 0; size_t rowsAt = 0;
     const int ok = (msg != 0 && bytes > 0) ? coopdrop::AreaMapLayout((const unsigned char*)msg, (size_t)bytes, listed, &seatCount, &rowsAt, &count) : 0;
+    /* THE FROZEN AREAS: each slot the map names other than mine is looked up on this link's PLAYERS roster now, before the lock (the
+       roster is main-thread state), and an area whose holder is not in the world is frozen with its row below (coopdrop::AreaFrozenDecide). */
+    std::map<int, int> frozenOfSlot; std::vector<int> frozenCells;
+    if (ok && count > 0)
+    {
+        size_t fAt = rowsAt;
+        for (int i = 0; i < count; ++i)
+        {
+            int fx = 0, fy = 0, fo = -1; unsigned fMask[coopdrop::kAreaMaskWords];
+            if (!coopdrop::AreaMapNextRow((const unsigned char*)msg, (size_t)bytes, &fAt, &fx, &fy, &fo, fMask)) break;
+            if (fo < 0 || fo == mySlot || frozenOfSlot.find(fo) != frozenOfSlot.end()) continue;
+            const int inWorld = StoreRosterSlotInWorld(fo);   /* 1 in the world, 0 not, -1 no roster on this link */
+            frozenOfSlot[fo] = coopdrop::AreaFrozenDecide(fo, mySlot, inWorld >= 0 ? 1 : 0, inWorld == 1 ? 1 : 0);
+        }
+    }
     HeldLockInit();
     ::EnterCriticalSection(&g_heldLock);
     if (!ok) { ++g_areaMapMalformed; ::LeaveCriticalSection(&g_heldLock); return 0; }
@@ -1664,7 +1840,9 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
         g_areaMapPendingExpired += coopdrop::AreaBookExpirePending(&g_areaBook, nowSec);
         g_hostHeldAt = 0.0;
         g_otherLoadedAt = 0.0;
+        g_areaFrozenCells = 0;
         ::LeaveCriticalSection(&g_heldLock);
+        AreaFrozenSay(frozenCells);
         return 1;
     }
     /* M9f1 (M9 review M2): rows are variable length - walked with a cursor over the payload AreaMapLayout has already walked */
@@ -1678,6 +1856,11 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
         if (o >= 0 && o != mySlot) g_hostHeld[x][y] = 1;
         if (o >= 0 && mySlot >= 0 && o == mySlot) g_mineHeld[x][y] = 1;   /* decision 35: the areas I hold, read back out of the same owner column */
         g_ownerSlot[x][y] = (o >= 0) ? o : -1;   /* M7b slice 2: this row's owner column verbatim, any slot (S2-67); -1 = the row names nobody */
+        if (o >= 0 && o != mySlot)
+        {
+            const std::map<int, int>::const_iterator fz = frozenOfSlot.find(o);
+            if (fz != frozenOfSlot.end() && fz->second != 0) { g_areaFrozen[x][y] = 1; frozenCells.push_back(x); frozenCells.push_back(y); frozenCells.push_back(o); }
+        }
         for (int w = 0; w < coopdrop::kAreaMaskWords; ++w) g_areaNewMask[x][y][w] |= mask[w];   /* W1-b: g_otherLoaded is written from the EFFECTIVE map below, not from this row */
     }
     /* M9f1 (M9 review LOW "apply core"): THE REKEY, the pending slots, my own seat, every cell (W1-b: a present reporter is taken
@@ -1701,7 +1884,10 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
     g_hostHeldAt = NowSec();
     g_otherLoadedAt = g_hostHeldAt;
     ++g_areaMapApplySeq;   /* M7a3-owed: a new fresh map - what the owed hand-overs wait for */
+    g_areaFrozenCells = (long long)(frozenCells.size() / 3);
+    if (!frozenCells.empty()) ++g_areaFrozenMaps;
     ::LeaveCriticalSection(&g_heldLock);
+    AreaFrozenSay(frozenCells);
     return 1;
 }
 /* inv4 fold (review-inv4 fold 1): THE ONE INPUT BOTH GAMES SHARE for a player-owned box - is `slot`'s bit set in the
@@ -1716,6 +1902,43 @@ int SlotMapLoadedTS(const Sector& s, int slot)
     const int on = (g_otherLoadedAt > 0.0 && NowSec() - g_otherLoadedAt <= 5.0) ? coopdrop::AreaMaskTest(g_effMask[s.x][s.y], coopdrop::AreaSeatOfSlot(g_areaBook.slotOfSeat, slot)) : -1;   /* M9 (T-197): 0 for a slot with no column */
     ::LeaveCriticalSection(&g_heldLock);
     return on;
+}
+/* T-650 fold 1 (review L1): ONE locked read of everything a squad hand-over decides on for sector s, so the holder and the loaded bits
+   come from the same moment: *holderOut = the area's holder on the holder map's 5 s clock (-1 none, not fresh, or frozen - a frozen
+   holder is a player not in the world); slots[i] / bits[i] = every seated slot and its bit in the effective loaded map (at most cap rows,
+   *nOut of them). Returns 1 = the loaded map is fresh, 0 = it is not (no rows: the caller keeps or holds), -1 = s off the grid. ANY THREAD. */
+int AreaSquadViewTS(const Sector& s, int* holderOut, int* slots, int* bits, int cap, int* nOut, int* sideBits)
+{
+    if (holderOut != 0) *holderOut = -1;
+    if (nOut != 0) *nOut = 0;
+    if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return -1;
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    const double t = NowSec();
+    int h = (g_hostHeldAt > 0.0 && t - g_hostHeldAt <= 5.0) ? g_ownerSlot[s.x][s.y] : -1;
+    if (h >= 0 && g_areaFrozen[s.x][s.y] != 0) { h = -1; ++g_areaFrozenAnswers; }
+    const int fresh = (g_otherLoadedAt > 0.0 && t - g_otherLoadedAt <= 5.0) ? 1 : 0;
+    int n = 0;
+    if (fresh != 0)
+        for (int j = 0; j < coopdrop::kAreaSeats && n < cap; ++j)
+        {
+            const int sl = g_areaBook.slotOfSeat[j];
+            if (sl < 0) continue;
+            if (slots != 0) slots[n] = sl;
+            if (bits != 0) bits[n] = coopdrop::AreaMaskTest(g_effMask[s.x][s.y], j);
+            if (sideBits != 0)
+            {   /* the same seat in the four SIDE neighbours (W, E, S, N) - the engine's keep rule reads only those; off the grid = 1 */
+                sideBits[n * 4 + 0] = s.x > 0 ? coopdrop::AreaMaskTest(g_effMask[s.x - 1][s.y], j) : 1;
+                sideBits[n * 4 + 1] = s.x < 63 ? coopdrop::AreaMaskTest(g_effMask[s.x + 1][s.y], j) : 1;
+                sideBits[n * 4 + 2] = s.y > 0 ? coopdrop::AreaMaskTest(g_effMask[s.x][s.y - 1], j) : 1;
+                sideBits[n * 4 + 3] = s.y < 63 ? coopdrop::AreaMaskTest(g_effMask[s.x][s.y + 1], j) : 1;
+            }
+            ++n;
+        }
+    ::LeaveCriticalSection(&g_heldLock);
+    if (holderOut != 0) *holderOut = h < 0 ? -1 : h;
+    if (nOut != 0) *nOut = n;
+    return fresh;
 }
 /* inv4 fold 4: when this game's own bit last APPEARED in this sector's effective map (0 = not set now). ANY THREAD. */
 double MyMapLoadedSinceTS(const Sector& s)

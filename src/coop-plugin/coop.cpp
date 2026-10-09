@@ -36,6 +36,7 @@
 #include "bugreport.h" /* T-461: REPORT A BUG */
 #include "playerstab.h" /* T-545: the PLAYERS tab, other players' factions on the FACTION tab */
 #include "fallentab.h"   /* T-556: the FALLEN tab */
+#include "chat.h"        /* in-game text chat */
 #include "titleart.h"  /* T-513: the mod's own title-screen art */
 #include "config.h"   /* E38 / decisions 42-43: shared_wastelands.cfg - the role and the addresses */
 #include "addresses.h" /* P8h: the executable fingerprint and its address table - the gate below */
@@ -195,6 +196,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     // menu. Costs nothing while no watch is active, and logs only on change (F111).
     coop::WatchTaskTick();
     coop::AppearanceTick();   // H010a: send/apply appearance rolls once they settle (F157)
+    coop::CorpseDecayTick();  // a dead copy of another game's character is held short of the rot limit; its owner decides
     coop::ProneParkTick();    // R1-a/R1-a-b: parked prone writes, once CharacterProneSafe says yes
     coop::CarryWatchTick();   // K1 (read-carry): an owned carrier's carry edge -> STATE at once
     coop::CarryApplyTick();   // K1: copies carry what their owners' STATE says, once both are built
@@ -229,6 +231,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::PlayersTabTick();   /* T-545: other players' factions made known; the PLAYERS tab's table kept current while it shows */
     coop::FallenTabTick();    /* T-556: the FALLEN tab after PLAYERS, kept current while it shows; a confirmed bring-back runs */
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
+    coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
 }
 
@@ -371,6 +374,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
     coop::UiTitleTick();
     coop::BugReportTick(1);  /* T-461: REPORT A BUG - the title screen's button and its window */
     coop::PlayersTabTitleTick();   /* T-545: a SET HOSTILE box left up from the world is taken down */
+    coop::ChatTitleTick();         /* the chat of the world just left is taken down */
     coop::FallenTabTitleTick();    /* T-556: a BRING BACK box left up from the world is taken down */
     coop::TagsTitleTick();   /* tags1: no world at the title - a name label still standing is destroyed */
     coop::SteamProbeTick();  /* T-290 S0 title: the first title frame looks Steam up (the game's SteamAPI_Init has run); later frames poll the relay status until it settles. Logs only. */

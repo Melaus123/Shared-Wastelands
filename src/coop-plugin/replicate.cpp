@@ -25,8 +25,10 @@
 #include "worldsync.h"   // H030: AnnouncedToPeer
 #include "playerfaction.h"   // E25: PeerFaction - whose copies are the OTHER PLAYER's own characters
 #include "spawn.h"
+#include "../common/livechar.h"   /* DropPuppet: the reason a stored pointer is not written through */
 #include "stats.h"   // T-189 runboost: RunCeilingRead / RunCeilingWrite / RunCeilingRestore
 #include "zones.h"   // review-r2 item 7: IsPositionLoadedHere - the far snap never places a copy into an area this game has not loaded
+#include "../common/stalecopy.h"   // a copy whose owner's target is in an area not loaded here is retired, not walked
 #include "ai_spike.h"
 #include "net/session.h"
 
@@ -334,6 +336,10 @@ const int    kSnapRateMax       = 5;
 const double kSnapRateWindowSec = 60.0;
 // review-r2 item 8: no snap on an owner sample this old - the target is where the owner WAS.
 const double kSnapMaxSampleAgeSec = 3.0;
+// Copies whose owner's target lies in an area not loaded here, found by DrivePuppet's far branch this frame; retired after
+// the drive walk (RetireCopyOwnerUnloaded drops the puppet, so never inside it).
+struct FarUnloadedRow { unsigned int uid; float x, y, z; };
+std::vector<FarUnloadedRow> g_farUnloadedQueue;
 // review-r2 item 3: a not-closing window is a stall only when the copy moved mostly SIDEWAYS - its displacement
 // projected on the direction to the window-start target, over the distance moved, is below this. A copy sliding
 // along an obstacle scores ~0; a copy chasing straight at its owner's speed scores ~1 and is not stalled.
@@ -372,6 +378,7 @@ struct Puppet
 {
     Character* ch;
     float tx, ty, tz;      // last streamed target position
+    double ownerSampleAt;  // NowSeconds() of the last owner MOVE / MOVE_STOP written to tx/ty/tz; 0 = none since the puppet was made
     // F350 - THE AUTHORITY'S VELOCITY, in world units per second. These two floats used to be
     // called `dirX/dirZ`, were documented as "last streamed facing, unused until M2b, carried for
     // fidelity", and **every sender passed 0.0f into them**. So the peer has never been told
@@ -873,6 +880,7 @@ long long g_dropStopped     = 0;
 long long g_dropNoMovement  = 0;   // its CharMovement could not be read - could not be stopped
 long long g_dropStopSkipped = 0;   // stale-uid path: the address may belong to a stranger (F338)
 long long g_dropNoChar      = 0;   // F355: the character itself was unreadable - the T090 cohort
+long long g_dropNotLive = 0; long long g_dropNotLiveLogged[livechar::kVerdicts] = { 0 };   /* DropPuppet: the engine no longer knows the copy this frame - nothing written through it; first of each reason logged */
 long long g_dropStopFaulted = 0;   // F355: the stop itself faulted and SEH caught it
 long long g_dropNoPuppet    = 0;   // F357: called for a uid we hold no puppet for - counted nowhere before
 
@@ -1500,14 +1508,14 @@ long long g_rbEaseFrames = 0, g_rbRetryOk = 0;   // runboost2: eased-ceiling fra
 static bool RunBoostWritable(unsigned int uid, const Puppet& p)
 {
     return PlausibleObj(p.ch) && !IsRetiredObject(p.ch) && coopuid::DriveDecision(FindSpawnedUid(p.ch), uid)
-        && PlausibleObj(*(void**)((char*)p.ch + kAnimationClassOff));
+        && LiveCharacter(p.ch) != 0 && PlausibleObj(*(void**)((char*)p.ch + kAnimationClassOff));
 }
 
 // runboost2 (T-195 R2): put the engine's ceiling back NOW. A failed write keeps the ceiling ours (rbCeiling) with rbFailed
 // set; RunBoostSettle retries it every frame until it succeeds (retryOk) or the copy can no longer be written.
 static void RunBoostRestoreNow(Puppet& p)
 {
-    if (RunCeilingRestore(p.ch))
+    if (LiveCharacter(p.ch) != 0 && RunCeilingRestore(p.ch))   // the engine still knows it this frame; otherwise a failed write, retried
     {
         ++g_rbRestored;
         if (p.rbFailed) ++g_rbRetryOk;
@@ -3330,6 +3338,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
     // become a GameData (PlausibleObj passes a GameData), and the prone snap below crashed in
     // setPositionAndTeleport. Asked before any read through p.ch beyond the vtable probe above.
     if (!coopuid::DriveDecision(FindSpawnedUid(p.ch), uid)) { ++g_driveSkippedUnregistered; if (p.nativeWindow) p.rcVisPrimed = false; return; }
+    if (LiveCharacter(p.ch) == 0) { if (p.nativeWindow) p.rcVisPrimed = false; return; }   // the engine still knows it this frame (counted on [M1] REPORT liveCharSkip)
 
     // `Character::getPosition()` itself double-dereferences `Character+0x448` (the
     // AnimationClass) with no null check of its own - the predicate at 0x7D08A0 does
@@ -4165,10 +4174,21 @@ void DrivePuppet(unsigned int uid, Puppet& p)
         if (whyNot == 0 && windowRolled && !p.catchupPending)
         {
             // Asked only here, at a window edge, so the engine is not queried every frame a copy is lost.
-            if (!IsPositionLoadedHere(p.tx, p.ty, p.tz))
+            const int targetLoaded = IsPositionLoadedHereTri(p.tx, p.ty, p.tz);
+            if (targetLoaded != 1)
             {
                 ++g_snapFarSkippedUnloaded;
                 whyNot = "the owner's target is in an area this game has not loaded (review-r2 7)";
+                // The copy cannot be placed there, and walking it there leaves this game's characters following a body that
+                // is not where its owner is: it is retired and booked lost at the owner's target (stalecopy.h).
+                CharDbg cd;
+                const int attached = (!ReadCharDbgFields(p.ch, &cd) || cd.carried != 0 || cd.inSomething != 0) ? 1 : 0;
+                if (stalecopy::FarUnloadedRetire(1, targetLoaded, ageSec < kSnapMaxSampleAgeSec ? 1 : 0, attached) != 0)
+                {
+                    FarUnloadedRow row; row.uid = uid; row.x = p.tx; row.y = p.ty; row.z = p.tz;
+                    g_farUnloadedQueue.push_back(row);
+                    whyNot = "the owner's target is in an area this game has not loaded - the copy is retired and booked lost at that spot";
+                }
             }
             else whyNot = SnapSharedGate(p, ageSec);
         }
@@ -4253,6 +4273,28 @@ void DrivePuppet(unsigned int uid, Puppet& p)
 
 } // namespace
 
+// See replicate.h. The prone word is read under a guard here: the copy is not being driven this frame, so nothing above has
+// read it already. No C++ object in this function (C2712).
+static int ReadProneWordPod(const void* c, int* out)
+{
+    __try { *out = *(const int*)((const char*)c + kProneStateOff); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+int StaleCopyKeepReason(unsigned int uid, Character* c)
+{
+    if (!PlausibleObj(c)) return stalecopy::kKeepAttached;   // unreadable: kept, as the far branch keeps an unread copy
+    int prone = 0;
+    if (!ReadProneWordPod(c, &prone)) return stalecopy::kKeepAttached;
+    const bool ragdolled = SafeIsRagdoll(c);   // fails closed: unreadable reads as ragdolled, so the copy is kept
+    const bool moveDrives = coopgetup::MoveDrivesProne(prone, prone == coopgetup::kProneCrawling && ragdolled);
+    std::map<unsigned int, Puppet>::const_iterator it = g_puppets.find(uid);
+    const int gaveUp = (it != g_puppets.end() && it->second.catchupGaveUp) ? 1 : 0;
+    CharDbg cd;
+    const int attached = (!ReadCharDbgFields(c, &cd) || cd.carried != 0 || cd.inSomething != 0) ? 1 : 0;
+    return stalecopy::StaleCopyKeep(moveDrives ? 1 : 0, ragdolled ? 1 : 0, gaveUp, attached);
+}
+
 bool ReplicateStart(unsigned int uid)
 {
     Character* c = GetTarget();
@@ -4322,6 +4364,7 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
         }
     }
 
+    net::LostCopyMoveSeen(uid);   /* a copy that came back is trusted again after enough of its owner's MOVEs (lostcopy.h) */
     std::map<unsigned int, Puppet>::iterator it = g_puppets.find(uid);
     if (it == g_puppets.end())
     {
@@ -4358,10 +4401,11 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
                                " F341."
                              : " and we have never held it."));
             }
+            net::LostCopyMove(uid, x, y, z);   /* booked (unless this game's table refused its SPAWN); its owner is asked to send it again while this spot is loaded here */
             return;
         }
         Puppet p;
-        p.ch = c; p.tx = x; p.ty = y; p.tz = z; p.velX = velX; p.velZ = velZ;
+        p.ch = c; p.tx = x; p.ty = y; p.tz = z; p.velX = velX; p.velZ = velZ; p.ownerSampleAt = 0.0;   // set below with the sample
         p.lastMoveAt = NowSeconds(); p.moveIntervalSec = 0.0; p.lagSampleAt = 0.0;
         p.driving = false; p.everDriven = false; p.lastDrift = 0.0f; p.maxDrift = 0.0f;
         p.lastDriftY = 0.0f; p.maxDriftY = 0.0f; p.applied = 0; p.pronedAt = 0;
@@ -4498,7 +4542,7 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
             }
         }
     }
-    p.tx = x; p.ty = y; p.tz = z;
+    p.tx = x; p.ty = y; p.tz = z; p.ownerSampleAt = NowSeconds();
     p.velX = velX; p.velZ = velZ;
     if (Finite(authDesiredSpeed) && authDesiredSpeed >= 0.0f) p.authDesired = authDesiredSpeed;   // 0 is a real level; -1 = the authority could not read it
     if (Finite(faceX) && Finite(faceZ) && (faceX != 0.0f || faceZ != 0.0f)) { p.faceX = faceX; p.faceZ = faceZ; }   // H024
@@ -4908,7 +4952,7 @@ void ApplyRemoteMoveStop(unsigned int uid, float x, float y, float z, unsigned i
     followplay::Sample sm;
     sm.x = x; sm.y = y; sm.z = z; sm.vx = 0.0f; sm.vz = 0.0f; sm.t = stopT; sm.still = true;
     if (followplay::Push(&p.trk, sm) == 0) ++g_followOutOfOrder;
-    p.tx = x; p.ty = y; p.tz = z; p.velX = 0.0f; p.velZ = 0.0f;   // what a standing report at the stop point would set
+    p.tx = x; p.ty = y; p.tz = z; p.velX = 0.0f; p.velZ = 0.0f; p.ownerSampleAt = NowSeconds();   // what a standing report at the stop point would set
     p.ownSpd = 0.0f;   // the smoothed speed restarts from the owner's real one when it moves again
     if (p.goalHave) { p.goalSpent = true; p.goalSpentX = p.goalX; p.goalSpentZ = p.goalZ; }
     p.goalHave = false;
@@ -4946,7 +4990,7 @@ int HandoffAuto(int maxCount)
         if (p.orderActive)     { ++g_handoffSkippedOrderDrive; continue; }   // H021 owns it: its goal is our Move order
         if (IsAttackTaskType(p.intentType)) { ++g_handoffSkippedAttack; continue; }   // the native window owns fights
         ::Character* c = p.ch;
-        if (!PlausibleObj(c) || IsRetiredObject(c)) continue;
+        if (!PlausibleObj(c) || IsRetiredObject(c) || LiveCharacter(c) == 0) continue;   /* HandoffAuto - the engine still knows it this frame */
         void* ai = GetCharacterAI(c);
         if (!PlausibleObj(ai)) continue;
         AITaskSytem* ts = *(AITaskSytem**)((char*)ai + 0x20);
@@ -4990,7 +5034,7 @@ static void ProcessPendingHandoffs()
         std::string after = "UNREADABLE"; int ordersAfter = -1, needGoap = -1, taskInstalled = -1;
         std::map<unsigned int, Puppet>::iterator it = g_puppets.find(hnd.uid);
         ::Character* c = (it != g_puppets.end()) ? it->second.ch : 0;
-        if (PlausibleObj(c) && !IsRetiredObject(c))
+        if (PlausibleObj(c) && !IsRetiredObject(c) && LiveCharacter(c) != 0)   /* the engine still knows it this frame */
         {
             void* ai = GetCharacterAI(c);
             AITaskSytem* ts = PlausibleObj(ai) ? *(AITaskSytem**)((char*)ai + 0x20) : 0;
@@ -5825,6 +5869,12 @@ void ReplicateTick()
         DrivePuppet(it->first, it->second);
         RunBoostSettle(it->first, it->second);   // T-189 runboost: a raise the drive did not renew this frame ends
     }
+    if (!g_farUnloadedQueue.empty())   // the far branch's copies whose owner is in an area not loaded here, after the walk
+    {
+        std::vector<FarUnloadedRow> q;
+        q.swap(g_farUnloadedQueue);
+        for (size_t i = 0; i < q.size(); ++i) RetireCopyOwnerUnloaded(q[i].uid, q[i].x, q[i].y, q[i].z);
+    }
     ProcessPendingHandoffs();   // H019: score handoffs whose pass has had time to run
     FollowOwnerStopFrame();   // every frame: the stated stop of this game's armed (walking) characters
     P115Frame();   // PROBE P115: owner move order / arrival lines, copy settle / overshoot lines (reads only)
@@ -5981,7 +6031,7 @@ void AdoptRemotePuppet(unsigned int uid)
             return;
         }
         Puppet p;
-        p.ch = c; p.tx = here.x; p.ty = here.y; p.tz = here.z;
+        p.ch = c; p.tx = here.x; p.ty = here.y; p.tz = here.z; p.ownerSampleAt = 0.0;   // the copy's own spot, not an owner sample
         // F350 - a puppet adopted from a SPAWN has never received a MOVE, so it has no velocity
         // and no sample time. Both are set explicitly: `lastMoveAt` left uninitialised would
         // make the first frames compute a nonsense lead age against stack garbage, and although
@@ -6251,6 +6301,20 @@ void DropPuppet(unsigned int uid, bool restoreSpeed)
     if (it == g_puppets.end()) { ++g_dropNoPuppet; return; }
 
     Puppet& p = it->second;
+    // A pointer the engine no longer knows this frame takes the path that writes nothing through it (as the stale-uid path):
+    // counted (dropNotLive) and the first of each reason logged.
+    if (restoreSpeed)
+    {
+        const int lv = LiveCharacterVerdict(p.ch);
+        if (!livechar::Usable(lv))
+        {
+            restoreSpeed = false;
+            ++g_dropNotLive;
+            if (lv >= 0 && lv < livechar::kVerdicts && g_dropNotLiveLogged[lv]++ == 0)
+                DebugLog("[NC] DROP uid=" + N2(uid) + " writes nothing through the character - the engine's answer this frame: "
+                         + livechar::VerdictName(lv) + " (first of this reason; dropNotLive counts them)");
+        }
+    }
 
     // H015 / P059 - a puppet dropped mid-window would leave its AI RELEASED with nobody to close
     // the window: a free-running clone with no owner. Re-gate before forgetting it.
@@ -6349,7 +6413,7 @@ bool SetPuppetNativeWindow(unsigned int uid, bool on)
         p.rcSteps = 0; p.rcMaxStep = 0.0f; p.rcSumStep = 0.0f; p.rcLastTickAt = 0.0; p.rcReqMax = 0.0f; p.rcVisMaxStep = 0.0f; p.rcVisMaxRate = 0.0f; p.rcVisMaxRateDowned = 0.0f; p.rcVisMaxRateAny = 0.0f; p.rcVisLastX = p.rcVisLastY = p.rcVisLastZ = 0.0f; p.rcVisPrimed = false; p.rcLayerGapMax = 0.0f; p.rcLayerGapLast = 0.0f; p.rcDriftSum = 0.0; p.rcDriftN = 0; p.rcSatSteps = 0; p.rcBoostedSteps = 0;   // review 4 item 9: authDesired is NOT reset here - it is protocol state
         // F062/F353: ceasing to push does not stop a driven character. Zero the last vector so the
         // AI starts from a standing body rather than one still walking our stale push.
-        if (PlausibleObj(p.ch) && PlausibleObj(p.ch->movement)) SafeStopMovement(p.ch->movement);
+        if (LiveCharacter(p.ch) != 0 && PlausibleObj(p.ch->movement)) SafeStopMovement(p.ch->movement);   // the engine still knows it this frame
         p.driving = false;
     }
     p.nativeWindow = on;
@@ -6612,7 +6676,7 @@ void InteriorKeepTick()
     {
         ::Character* c = it->second.ch;
         /* review fold 1: the same liveness question every other call through p.ch asks (RunBoostWritable) - the table must still hold this uid for this object */
-        if (!PlausibleObj(c) || IsRetiredObject(c) || !coopuid::DriveDecision(FindSpawnedUid(c), it->first) || PeerFactionPod(c) != 1) continue;
+        if (!PlausibleObj(c) || IsRetiredObject(c) || !coopuid::DriveDecision(FindSpawnedUid(c), it->first) || LiveCharacter(c) == 0 || PeerFactionPod(c) != 1) continue;
         ++g_ikCopies;
         /* P25 fold 2: THE OWNER'S WORD decides (insidewire.h InsideVerdict): no word, "outside", no key, or nothing heard for more
            than 15 s -> not in a building (the keep is released below); else the building its key names here. */
@@ -6771,6 +6835,21 @@ bool PuppetAuthorityPos(unsigned int uid, float* x, float* y, float* z)
     return true;
 }
 
+// See replicate.h. Fresh = rule 2's own test (the far branch's sample age < kSnapMaxSampleAgeSec, read as the drive reads it).
+bool PuppetFreshAuthorityPos(unsigned int uid, float* x, float* z)
+{
+    std::map<unsigned int, Puppet>::const_iterator it = g_puppets.find(uid);
+    if (it == g_puppets.end()) return false;
+    const Puppet& p = it->second;
+    if (p.ownerSampleAt <= 0.0) return false;   // no owner sample since the puppet was made: tx/tz is the copy's own spot
+    if (!Finite(p.tx) || !Finite(p.tz)) return false;
+    double ageSec = NowSeconds() - p.lastMoveAt;
+    if (ageSec < 0.0) ageSec = 0.0;
+    if (ageSec >= kSnapMaxSampleAgeSec) return false;
+    *x = p.tx; *z = p.tz;
+    return true;
+}
+
 float PuppetWindowMaxDrift(unsigned int uid)
 {
 
@@ -6792,6 +6871,7 @@ int SnapPuppetToAuthority(unsigned int uid, float* driftBefore, float* driftSame
     // ("not retired" is not "registered": T487's puppet had no row). Asked before any read through p.ch beyond the vtable
     // probe, and answered 2, the stranger code the caller already handles.
     if (!coopuid::DriveDecision(FindSpawnedUid(p.ch), uid)) return 2;
+    if (LiveCharacter(p.ch) == 0) return 2;   /* SnapPuppetToAuthority - the engine no longer knows it this frame: the stranger answer */
     if (!PlausibleObj(*(void**)((char*)p.ch + kAnimationClassOff))) return 3;
     CharMovement* mv = p.ch->movement;
     if (!PlausibleObj(mv)) return 4;
@@ -6863,7 +6943,7 @@ void SetDriveSpeed(float v)
         {
             Puppet& p = it->second;
             if (!p.speedSaved) continue;
-            if (PlausibleObj(p.ch) && RestoreDesiredSpeed(p.ch->movement, p.speedOriginal))
+            if (LiveCharacter(p.ch) != 0 && RestoreDesiredSpeed(p.ch->movement, p.speedOriginal))
             {
                 p.speedSaved = false;
                 ++restored;
@@ -6945,7 +7025,7 @@ void SetPathDrive(bool on)
             {
                 Puppet& q = it->second;
                 q.pathMode = false; PathForgetDest(q); q.pathWantIssue = false; q.pathGrant = false; ++released;
-                if (PlausibleObj(q.ch) && PlausibleObj(q.ch->movement) && !SafeLeavePath(q.ch->movement)) ++g_pathLeaveFaulted;
+                if (LiveCharacter(q.ch) != 0 && PlausibleObj(q.ch->movement) && !SafeLeavePath(q.ch->movement)) ++g_pathLeaveFaulted;
             }
     DebugLog(std::string("[D1] pathdrive ") + (on ? "ON" : "OFF") + " - path beyond " + F2(kPathEnter) + " (or stalled), push within "
              + F2(kPathLeave) + " once the owner stopped " + F2((float)kPathOwnerStillSec) + " s; owner moving: destination max(owner, copy speed) x " + F2(kPathLeadSec) + " s + " + F2(cooppath::kLeadPad) + " ahead of it (" + F2(kPathLeadMin) + "-" + F2(kPathLeadMax) + "), re-planned within max(" + F2(kPathNearEndMin) + ", copy speed x " + F2(kPathNearEndSec) + " s) of its end / on a > 30 deg turn / aim > " + F2(kPathOffLineMax) + " off its line, a too-close aim pushed forward, exact aim once when the owner stops; owner still: re-issue when the aim moved " + F2(kPathReissueDist) + " (next issue once the last path landed, at least " + F2((float)cooppath::kMinIssueGapSec) + " s apart, else floor " + F2((float)kPathIssueFloorSec) + " s per copy; " + N2((long long)kPathBudgetPerFrame) + " per frame)"
@@ -7088,7 +7168,7 @@ void ReportReplication()
        << " dropStopped=" << N2(g_dropStopped)
        << " dropNoMovement=" << N2(g_dropNoMovement)
        << " dropStopSkipped=" << N2(g_dropStopSkipped)
-       << " dropNoChar=" << N2(g_dropNoChar)
+       << " dropNoChar=" << N2(g_dropNoChar) << " dropNotLive=" << N2(g_dropNotLive)
        << " dropStopFaulted=" << N2(g_dropStopFaulted)
        << " dropNoPuppet=" << N2(g_dropNoPuppet)
        // THE P-20 NUMBER. `arriveStoppedFrames` is the old behaviour firing - a real stop because
@@ -7177,7 +7257,7 @@ void ReportReplication()
            //   desiredSpeed == 0                        -> our drive did not stick at all
            //   speedCap == 0                            -> the character is clamped to stationary
            //   currentlyMoving / officiallyStopped      -> what the engine believes it is doing
-           << MovementDebug(p.ch)
+           << (LiveCharacter(p.ch) != 0 ? MovementDebug(p.ch) : std::string(" engine=notKnownThisFrame"))
            // F257 - RENAMED. This is `pronedAt`: the PoseState recorded at the last DRIVE, not
            // the character's state now. T077 caught the two disagreeing - `[M2] REPORT` said
            // `prone=4` for a character that `[M5]` had already recorded standing up, and the
@@ -7195,7 +7275,7 @@ void ReportReplication()
            // quantity.
            << " everDriven=" << (p.everDriven ? "yes" : "no")
            << " pronedAtLastDrive=" << N2(p.pronedAt)
-           << " proneNow=" << N2(PlausibleObj(p.ch)
+           << " proneNow=" << N2(LiveCharacter(p.ch) != 0
                                  ? *(int*)((char*)p.ch + kProneStateOff) : -1)
            << " here=" << F2(cur.x) << "," << F2(cur.y) << "," << F2(cur.z)
            << " want=" << F2(p.tx) << "," << F2(p.ty) << "," << F2(p.tz);

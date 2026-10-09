@@ -13,6 +13,7 @@ void CopyNoteSpawnFlags(unsigned int uid, unsigned int flags);   // T-303 fold 1
 bool SpawnDeathLookWanted(unsigned int uid);   // T-303 fold 1 (decision 223): a SPAWN-dead copy still waits for its first APPEARANCE. MAIN THREAD.
 void SpawnDeathNoteLookApplied(unsigned int uid, bool ok);   // T-303 fold 1 (decision 223): the look apply ran for uid. MAIN THREAD.
 void ApplyOwnerDeathAtSpawn(unsigned int uid);   // T-303 COPY: the SPAWN says dead - kill the new copy now (ApplyOwnerDeath). MAIN THREAD.
+void SpawnDeathForgetCopy(unsigned int uid);   // a stale copy made again: the old body's waiting SPAWN-death entry goes. MAIN THREAD.
 void SpawnDeathRetryTick();   // T-303 COPY: retries a SPAWN death that could not land at once, ~0.25 s, up to 30 s. MAIN THREAD.
 bool CopyOwnerSaysKo(unsigned int uid);   // crash1b: the owner's last STATE said knocked out
 // par5 (parity P5): the owner's {hunger, fed} from its STATE. has 0 = not carried. Written on the copy at once, and
@@ -50,6 +51,14 @@ std::string KillLever(unsigned int uid);
 // MedicalSystem 0x64F8E0 makes when an animal has eaten a body - so the mod's destroy hook sees what it sees then.
 // Refuses (and says why) a uid not present here, not ours, or not dead. MAIN THREAD (the command channel).
 std::string DestroyBodyLever(unsigned int uid);
+// A copy's dead body never rots on its own. For each DEAD copy of another game's character in the copy-control list, the game's corpse rot start (Character+0xD0) is held so the body is never more than 11.75 of the game's 12
+// in-game hours into its rot (src/common/corpsedecay.h): the owner's DESPAWN (or the owner's departure) is what removes it. Every frame, skipped while EngineWritesBlocked().
+// [DECAY] pin lines (the first 20), decay[pinned,uids,unread] on the [P014] REPORT line. MAIN THREAD.
+void CorpseDecayTick();
+// TEST-ONLY lever (`decaysoon <uid> <hours>`): a DEAD body on this game (own or a copy) has its rot start set so the
+// game rots it after `hours` in-game hours (0 <= hours < 12); logs the start before and after. A copy's start is held again
+// by CorpseDecayTick. MAIN THREAD (the command channel).
+std::string DecaySoonLever(unsigned int uid, float hours);
 // P10 TEST-ONLY lever (`bodydown`): the engine's own MedicalSystem::knockout on a character THIS game drives, then its
 // STATE at once. 1 unconscious after the call, 0 called but not unconscious yet (P10 fold 1 (T633): the call only sets
 // the wake-up clock; the lever checks again after a tick), -1 not ours / no character / unreadable / knockout unresolved.

@@ -75,6 +75,10 @@ std::string MirrorTestCapLever(int cap);   // `mirrorcap <n>` - TEST-ONLY
 // dereferenced by the caller; P034 compares it with a liveness row's address to tell a current row from an out-of-date one.
 // MAIN THREAD.
 const void* SpawnedRawObject(unsigned int uid);
+/* The last lasting refusal of the creation core (lostcopy::kCr*: a template or faction not in this game's data, the TEST-ONLY table
+   cap), kCrNone when none since the reset. net/session.cpp OnSpawn resets it before a SPAWN and reads it after. MAIN THREAD. */
+void CreateRefusalReset();
+int  CreateLastRefusal();
 
 // M-B / P064 (H025) - the authority's CONTEXT for a replicated character (squad template, SquadType, home town,
 // home building handle, member type). SendContextFor reads it off the live character and sends it (once, after
@@ -96,6 +100,31 @@ void SetContextApply(bool on);
 // read at all. Doing this by hand crashed the host in T086; do not write the raw call again.
 // Returns false and leaves `out` untouched when the position cannot be read safely.
 bool SafeReadPosition(::Character* c, Ogre::Vector3* out);
+
+// THE ONE WAY TO CALL INTO A CHARACTER POINTER THE MOD STORED EARLIER (a table, a map, a member, a queue). Asks the engine
+// in the same frame, before any call that dereferences the character: the object's own handle must resolve through the
+// engine's registry to this very address (or the address must be in the engine's active-character set, the second witness
+// P034 uses), the handle must be the one the mod's registry stored for this address, and the engine must not have accepted
+// a destroy of it (it waits on the kill list). Returns the pointer when the engine still knows it, 0 otherwise; every answer
+// is counted (liveCharSkip on the [M1] REPORT line).
+// Off the main thread (the engine's combat / hit / medical detours) the registry cannot be asked: a pointer that passes the
+// other checks and the destroy table is used (counted liveCharUnasked). The main thread's answers are kept for the frame.
+// The decision is livechar::Judge (src/common/livechar.h, offline-tested). SafeReadPosition, FindSpawned and MirrorSlot (when
+// it hands out the pointer) go through it, so every caller of the character registry gets the engine's word.
+::Character* LiveCharacter(::Character* stored);
+// The same question, answered as a livechar::Verdict, for a caller that acts differently by reason.
+int LiveCharacterVerdict(::Character* stored);
+// The engine's factory handed this character to the mod in THIS frame (MAIN THREAD): LiveCharacter answers live for it until
+// the frame ends, whether or not the engine's registry has filled its handle yet; from the next frame it asks.
+void LiveCharacterBorn(::Character* c);
+// The destroy detour (any thread): DoomCapture reads a CHARACTER's handle while the object is whole, before the engine's
+// destroy runs (false = not a character with a handle); DoomNote records it once the engine accepted the destroy.
+// LiveCharacter refuses that address with that handle until the main thread's per-frame sweep sees neither the handle nor
+// the engine's update list name it any more (livechar::DoomEnds) - the kill list has freed it. A 4096-slot table hashed by
+// address; a full probe window overwrites its oldest entry, counted doomOverwrote.
+struct DoomTicket { const void* obj; unsigned int index; unsigned int serial; unsigned int container; unsigned int containerStamp; };
+bool DoomCapture(const void* obj, DoomTicket* t);
+void DoomNote(const DoomTicket& t);
 
 // F316 - has this pointer been withdrawn by P034's stale-pointer detection?
 bool IsRetiredObject(const void* obj);
@@ -139,6 +168,7 @@ void ApplyRemoteUnload(unsigned int uid);
 // peer's own player characters are peer-faction copies here and are ordinary puppets.
 // Returns 1 destroyed, 0 withdrawn, -1 we hold no copy for that uid. MAIN THREAD.
 int DropPeerOwnedCopy(unsigned int uid);
+int CopyIsPlayerCharacter(unsigned int uid);   /* a final leave's copy: 1 a player character / player-faction person, 0 an NPC, -1 unreadable, -2 no copy here */
 // inv7a (e47-inv7-replan.md 3.1): once per world generation, at the first frame engine writes are allowed, every stand-in
 // character (coop-p<n> / coop-peer by RECORD id) no mirror row knows is destroyed by DropPeerOwnedCopy's route - a caged one
 // leaves its cage first (K2 safe point), a carried one is put down, a bedded one gets up; what cannot be handled safely is
@@ -193,6 +223,19 @@ unsigned int FindSpawnedUid(const void* obj);
 // SAME INDIVIDUAL, and rules that exist to stop us destroying a copy the peer built do not apply to it.
 // MAIN THREAD (a std::set find over the twin registry).
 bool IsTwinUid(unsigned int uid);
+// A copy of another game's character that no longer stands where its owner's character is (src/common/stalecopy.h). MAIN THREAD.
+// RepeatSpawnAct: ApplyRemoteSpawn asks it first, for a uid this game holds a row of - returns stalecopy::kSpawn*: Ignore (a
+// repeat; a far copy its owner's fresh MOVE sample says stands where its owner is - the SPAWN came late; the watched player or a
+// player-faction character; or a stale copy one of the far branch's checks keeps - knocked down, ragdolled, given up, carried,
+// in a cage, bed or building slot; the copy stays), Rebuild (the stale copy was destroyed, the owner's medical words kept, the
+// old body's applied-look, SPAWN-death and prison marks forgotten; the SPAWN makes the copy
+// at its spot as any fresh copy is made), Retire (nothing is made: the stale copy was destroyed and booked lost at the SPAWN's
+// spot, which is not loaded here - or the engine refused the destroy / H030 kept the body, which stands, and nothing is booked).
+// RetireCopyOwnerUnloaded: the puppet drive found the owner's target in an area not loaded here - the copy is retired, and booked
+// lost at that target only when it was destroyed. Returns RemoveLocalCopy's result, or -2 when nothing was retired (this game's
+// own, a twin, a player-faction character, no live copy).
+int RepeatSpawnAct(unsigned int uid, float x, float y, float z);
+int RetireCopyOwnerUnloaded(unsigned int uid, float x, float y, float z);
 
 // F332 - the same lookup for the DESTROY detour, which needs an identity rather than permission to
 // dereference. Answers for a RETIRED slot (withdrawn, still that character) and refuses a DESTROYED
@@ -382,6 +425,17 @@ std::string BedTestCommand(const std::string& arg);
 /* P43 TEST LEVER `cagetest <copyUid> nearest`: this game's engine cages the other game's character's copy in the nearest free cage
    (setPrisonMode at the K2 safe point, as a guard's task does); PrisonWatchCopies then tells the owner. [ARREST] cagetest lines. */
 std::string CageTestCommand(const std::string& arg);
+/* TEST LEVER `treattest <copyUid> <part|all> <bandage 0..1>`: raises the other game's character's copy's bandage values at the K2 safe
+   point as a medic's work does; TreatTick then sends MSG_TREAT to the owner. [HEAL] treattest lines. */
+std::string TreatTestCommand(const std::string& arg);
+/* TEST LEVER `bailtest <copyUid>`: the bail confirm's own steps for one caged copy of another game's character at the K2 safe
+   point (setSlaveState 0 inside the bail context, clearBounty with no faction, the walk-out order 0x85; no money taken), then the
+   owner is told as after a real bail. [PRISON] bailtest lines. MAIN THREAD. */
+std::string BailTestCommand(const std::string& arg);
+/* TEST LEVER `slavetest <uid> <state 0..3>`: the engine's setSlaveState on that character through the hooked entry, as a task
+   would call it - our own character: MSG_SLAVE follows; a copy: refused here and the owner asked when this game runs its area.
+   [SLAVE] slavetest line. MAIN THREAD. */
+std::string SlaveTestCommand(const std::string& arg);
 // P42 TEST-ONLY lever `locktest read <uid> | open|close <uid> shackles|cage | escape <uid>` (spawn.cpp): a prisoner's shackle and
 // cage locks read, opened or closed as a pick's result at the K2 safe point, or our caged character ordered to escape. [LOCK] lines.
 std::string LockTestCommand(const std::string& arg);
@@ -435,6 +489,7 @@ std::string SlaveReportLine();                                    // "[SLAVE] RE
 void TreatTick();
 std::string TreatReportToken();   // " heal1[...]" for the [P014] REPORT line
 void PrisonNoteDropped();   // malformed, or arrived while the world is being rebuilt
+void PrisonNoteDeathDroppedLoad();   // a death request that arrived while engine writes are blocked - dropped, never run in the new world
 // MAIN THREAD, every in-game frame: (a) a COPY this game's engine caged (a guard's task) is reported to the game that drives
 // it; (b) a queued MSG_PRISON cages this game's own character.
 void PrisonTick();

@@ -247,6 +247,15 @@ inline std::string PanelNotebookText(int state, int port, long exitCode)
             return std::string();   /* words1 (wording audit 9): "running" is nothing the player can act on - no line */
         case kNbStoppedEarly:
             if (exitCode == swformat::kServerExitFormatRefused) return swformat::FormatHostRefusedText();   /* its folder was written by a newer build */
+            if (exitCode == swformat::kServerExitSlotsShrunk)   /* slots.txt is shorter than its .1 backup: the world server will not start on it */
+                return "Couldn't host: this world's list of players is shorter than its last backup."
+                       " Starting it could give some players' characters to the wrong player. Nothing was changed.";
+            if (exitCode == swformat::kServerExitWorldAside)    /* an unfinished import left the world folder missing */
+                return "Couldn't host: moving this world to this computer didn't finish."
+                       " Starting it now would make a new, empty world in its place. Nothing was changed.";
+            if (exitCode == swformat::kServerExitWorldLocked)   /* the world's lock is held: another world server runs this world */
+                return "Couldn't host: this world is already running in another program on this computer (another Kenshi, or one left"
+                       " over after a crash). Close it or restart your computer, then try again.";
             return "The world couldn't start (error " + PanelNum((long long)exitCode)
                  + "). Close other programs that may be using port " + PanelNum((long long)port) + ", or restart your computer.";   /* words1b (owner 2026-09-27) */
         case kNbNoExe:
@@ -438,13 +447,41 @@ inline std::string PanelProfileCapLine(unsigned have, unsigned cap)
 const int kNicEthernet = 6;
 const int kNicWifi     = 71;
 
-/* One network adapter as Windows lists it (GetAdaptersAddresses order). ipv4 holds a.b.c.d as (a<<24)|(b<<16)|(c<<8)|d. */
+/* Windows' adapter types that never carry the home network: loopback (IF_TYPE_SOFTWARE_LOOPBACK), IPv6-over-IPv4
+   tunnels (IF_TYPE_TUNNEL) and PPP (IF_TYPE_PPP - Windows' own built-in VPN connections, under any name the user gave
+   them, and a dial-up straight to the provider, which has no home router to ask); net/homeaddr.cpp asserts all three. */
+const int kNicLoopback = 24;
+const int kNicTunnel   = 131;
+const int kNicPpp      = 23;
+
+/* One network adapter as Windows lists it (GetAdaptersAddresses order). ipv4 holds a.b.c.d as (a<<24)|(b<<16)|(c<<8)|d.
+   best: this is the adapter Windows sends internet traffic through (GetBestInterface towards a public address).
+   vpn: its name or description marks it a VPN (PanelVpnKind). */
 struct PanelNic
 {
-    int ifType, up, hasGateway;
+    int ifType, up, hasGateway, best, vpn;
     std::vector<unsigned long> ipv4;
-    PanelNic() : ifType(0), up(0), hasGateway(0) {}
+    PanelNic() : ifType(0), up(0), hasGateway(0), best(0), vpn(0) {}
 };
+
+/* IS THIS ADAPTER A VPN?  name: the adapter's name as Windows shows it ("Radmin VPN", "Ethernet 2"); desc: its
+   description (the driver's name, "Famatech Radmin VPN Ethernet Adapter").  Both are searched without case for the VPN
+   programs players use for games and for the word "VPN".  Returns the program's display word ("Radmin", "Hamachi",
+   "ZeroTier", "Tailscale", "WireGuard", "OpenVPN", ...; "VPN" for any other), or 0 when it is not a VPN.  A VPN adapter
+   is never the home network: a router ask through it reaches no home router, and its address is no home address. */
+inline const char* PanelVpnKind(const std::string& name, const std::string& desc)
+{
+    std::string t = name + " | " + desc;
+    for (size_t i = 0; i < t.size(); ++i) if (t[i] >= 'A' && t[i] <= 'Z') t[i] = (char)(t[i] - 'A' + 'a');
+    static const char* const marks[][2] = {
+        { "radmin", "Radmin" }, { "hamachi", "Hamachi" }, { "zerotier", "ZeroTier" }, { "tailscale", "Tailscale" },
+        { "wireguard", "WireGuard" }, { "wintun", "WireGuard" }, { "openvpn", "OpenVPN" }, { "tap-windows", "OpenVPN" },
+        { "tap-win32", "OpenVPN" }, { "nordlynx", "NordVPN" }, { "softether", "SoftEther" }, { "pangp", "GlobalProtect" },
+        { "anyconnect", "AnyConnect" }, { "cloudflare warp", "WARP" }, { "vpn", "VPN" } };
+    for (size_t k = 0; k < sizeof(marks) / sizeof(marks[0]); ++k)
+        if (t.find(marks[k][0]) != std::string::npos) return marks[k][1];
+    return 0;
+}
 
 /* An address a friend on the same home network could reach: not nothing, not loopback (127.x), not "this network"
    (0.x), not multicast or reserved (224 and up), and not 169.254.x (Windows gives itself that when no router answered). */
@@ -462,30 +499,107 @@ inline std::string PanelIpv4Text(unsigned long a)
          + PanelNum((long long)((a >> 8) & 0xFFul)) + "." + PanelNum((long long)(a & 0xFFul));
 }
 
-/* THE PICK: the first usable IPv4 address of the first adapter that is UP, is Ethernet or Wi-Fi, and HAS A ROUTER (a
-   default gateway) - the router is what tells the home network's adapter apart from a virtual one (Hyper-V, VirtualBox,
-   a VPN's switch), which is Ethernet too but has none.  If no such adapter has one, the first up Ethernet / Wi-Fi
-   adapter's usable address.  "" = none.  *pickedNic = the adapter's index, -1 = none. */
-inline std::string PanelPickHomeAddr(const std::vector<PanelNic>& nics, int* pickedNic)
+/* Why the home adapter was picked (PanelPickHomeNic's *why). */
+enum { kPickNone = 0, kPickBestRoute = 1, kPickGateway = 2, kPickAny = 3 };
+inline const char* PanelPickWhyText(int why)
+{
+    switch (why)
+    {
+    case kPickBestRoute: return "the adapter Windows sends internet traffic through";
+    case kPickGateway:   return "the first switched-on Ethernet or Wi-Fi adapter with a router (the adapter Windows sends internet traffic through is a VPN, has no usable address, or was not named)";
+    case kPickAny:       return "the first switched-on Ethernet or Wi-Fi adapter (none has a router)";
+    default:             return "none is switched on, Ethernet or Wi-Fi, not a VPN, with a usable IPv4 address";
+    }
+}
+
+/* THE HOME NETWORK'S ADAPTER - the one LOCAL ADDRESS shows and the router is asked through.  Never an adapter that is
+   down or a VPN, never loopback or a tunnel, and only a usable IPv4 address (PanelIpv4Usable) counts.  In order:
+     1. the adapter Windows sends internet traffic through (best) - whatever its kind, since that is where the router is;
+     2. the first Ethernet / Wi-Fi adapter that HAS A ROUTER (a default gateway) - the router tells the home network's
+        adapter apart from a virtual one (Hyper-V, VirtualBox), which is Ethernet too but has none;
+     3. the first Ethernet / Wi-Fi adapter.
+   "" = none.  *pickedNic = the adapter's index, -1 = none.  *why (may be 0) = which step picked it (kPick*). */
+inline std::string PanelPickHomeNic(const std::vector<PanelNic>& nics, int* pickedNic, int* why)
 {
     if (pickedNic) *pickedNic = -1;
-    for (int pass = 0; pass < 2; ++pass)
+    if (why) *why = kPickNone;
+    for (int pass = 0; pass < 3; ++pass)
     {
         for (size_t i = 0; i < nics.size(); ++i)
         {
             const PanelNic& n = nics[i];
-            if (n.up == 0 || (n.ifType != kNicEthernet && n.ifType != kNicWifi)) continue;
-            if (pass == 0 && n.hasGateway == 0) continue;
+            if (n.up == 0 || n.vpn != 0 || n.ifType == kNicLoopback || n.ifType == kNicTunnel || n.ifType == kNicPpp) continue;
+            if (pass == 0 && n.best == 0) continue;
+            if (pass > 0 && n.ifType != kNicEthernet && n.ifType != kNicWifi) continue;
+            if (pass == 1 && n.hasGateway == 0) continue;
             for (size_t k = 0; k < n.ipv4.size(); ++k)
             {
                 if (PanelIpv4Usable(n.ipv4[k]) == 0) continue;
                 if (pickedNic) *pickedNic = (int)i;
+                if (why) *why = (pass == 0) ? kPickBestRoute : (pass == 1 ? kPickGateway : kPickAny);
                 return PanelIpv4Text(n.ipv4[k]);
             }
         }
     }
     return std::string();
 }
+
+inline std::string PanelPickHomeAddr(const std::vector<PanelNic>& nics, int* pickedNic)
+{
+    return PanelPickHomeNic(nics, pickedNic, 0);
+}
+
+/* T-631 (owner 570) - THE GAME VPN THIS COMPUTER IS ON, for HOSTING's RADMIN ADDRESS / HAMACHI ADDRESS row: friends on the
+   same Radmin VPN or Hamachi network join on this computer's address there (players on a VPN typed the internet address
+   because HOSTING did not show this one).  An adapter is Radmin VPN when its description (the driver's name, "Famatech
+   Radmin VPN Ethernet Adapter") holds "Radmin VPN" or it has an address in 26.0.0.0/8 (the range Radmin VPN hands out);
+   Hamachi when its description holds "Hamachi" ("LogMeIn Hamachi Virtual Ethernet Adapter") or it has an address in
+   25.0.0.0/8 (Hamachi's).  Descriptions are read without case.  Only switched-on adapters and usable addresses
+   (PanelIpv4Usable) count; an adapter named by its description comes before an address found by its range alone.  With
+   both on this computer RADMIN is shown (the mock-up has one VPN row; Radmin is checked first).  The address is never
+   logged - only the word (PanelGameVpnWord). */
+enum { kGameVpnNone = 0, kGameVpnRadmin = 1, kGameVpnHamachi = 2 };
+struct PanelVpnNic
+{
+    std::string desc;                  /* the adapter's description as Windows lists it */
+    int up;                            /* 1 = switched on (Windows' IfOperStatusUp) */
+    std::vector<unsigned long> ipv4;   /* a.b.c.d as (a<<24)|(b<<16)|(c<<8)|d, as PanelNic */
+    PanelVpnNic() : up(0) {}
+};
+inline int PanelTextHasNoCase(const std::string& text, const char* lowerMark)
+{
+    std::string t = text;
+    for (size_t i = 0; i < t.size(); ++i) if (t[i] >= 'A' && t[i] <= 'Z') t[i] = (char)(t[i] - 'A' + 'a');
+    return t.find(lowerMark) != std::string::npos ? 1 : 0;
+}
+/* kGameVpn*; *ip (may be 0) = this computer's dotted address on it, "" with none. */
+inline int PanelGameVpnFind(const std::vector<PanelVpnNic>& nics, std::string* ip)
+{
+    static const int kinds[2] = { kGameVpnRadmin, kGameVpnHamachi };
+    static const char* const marks[2] = { "radmin vpn", "hamachi" };
+    static const unsigned long tops[2] = { 26ul, 25ul };
+    if (ip) ip->clear();
+    for (int v = 0; v < 2; ++v)
+        for (int pass = 0; pass < 2; ++pass)   /* 0: the description names the VPN; 1: an address in its range */
+            for (size_t i = 0; i < nics.size(); ++i)
+            {
+                const PanelVpnNic& n = nics[i];
+                if (n.up == 0) continue;
+                if (pass == 0 && PanelTextHasNoCase(n.desc, marks[v]) == 0) continue;
+                for (size_t k = 0; k < n.ipv4.size(); ++k)
+                {
+                    const unsigned long a = n.ipv4[k];
+                    if (PanelIpv4Usable(a) == 0) continue;
+                    if (pass == 1 && ((a >> 24) & 0xFFul) != tops[v]) continue;
+                    if (ip) *ip = PanelIpv4Text(a);
+                    return kinds[v];
+                }
+            }
+    return kGameVpnNone;
+}
+/* The log's word ("vpn=radmin|hamachi|none") and the row's label (owner 570's mock-up). */
+inline const char* PanelGameVpnWord(int kind)  { return kind == kGameVpnRadmin ? "radmin" : (kind == kGameVpnHamachi ? "hamachi" : "none"); }
+inline const char* PanelGameVpnLabel(int kind) { return kind == kGameVpnRadmin ? "RADMIN ADDRESS" : (kind == kGameVpnHamachi ? "HAMACHI ADDRESS" : ""); }
 
 /* What Copy puts on the clipboard: "192.168.1.20:7777", "" with no address. */
 inline std::string PanelHostCopyText(const std::string& ip, int port)
@@ -508,8 +622,11 @@ inline std::string PanelHomeAddrLine(const std::string& ip, int port)
    the mask is asterisks.
    The states: ASKING the router is being asked; FOUND an address (the router's or a website's); MISSING the router gave
    none and no website has been asked yet; LOOKING the websites are being asked; FAILED no website answered - SHOW and COPY
-   stay greyed until the window is opened again. */
-enum PanelNetAddrState { kNetAddrAsking = 0, kNetAddrFound = 1, kNetAddrMissing = 2, kNetAddrLooking = 3, kNetAddrFailed = 4 };
+   stay greyed until the window is opened again; RACING a press came while the router was still being asked, so the
+   websites are asked beside it and the first address wins (the router's when both are in hand at once) - a press never
+   waits on the router longer than on the websites; ROUTERONLY the websites gave none while the router is still asked. */
+enum PanelNetAddrState { kNetAddrAsking = 0, kNetAddrFound = 1, kNetAddrMissing = 2, kNetAddrLooking = 3, kNetAddrFailed = 4,
+                         kNetAddrRacing = 5, kNetAddrRouterOnly = 6 };
 /* A SHOW or COPY press waiting for an address (none = nothing waits). */
 enum PanelNetPress { kNetPressNone = 0, kNetPressShow = 1, kNetPressCopy = 2 };
 inline std::string PanelNetAddrMask(int port)
@@ -525,7 +642,8 @@ inline std::string PanelNetAddrLine(int state, const std::string& ip, int port, 
 {
     if (state == kNetAddrFound) return ip.empty() ? std::string("Couldn't find your internet address.")
                                                   : (shown != 0 ? PanelHostCopyText(ip, port) : PanelNetAddrMask(port));
-    if (state == kNetAddrLooking || (state == kNetAddrAsking && pending != kNetPressNone)) return "Finding your internet address...";
+    if (state == kNetAddrLooking || state == kNetAddrRacing || state == kNetAddrRouterOnly
+        || (state == kNetAddrAsking && pending != kNetPressNone)) return "Finding your internet address...";
     if (state == kNetAddrAsking || state == kNetAddrMissing) return PanelNetAddrMask(port);
     return "Couldn't find your internet address.";
 }
@@ -547,8 +665,9 @@ inline PanelNetStep PanelNetFoundFor(int pending)
     return s;
 }
 /* SHOW or COPY pressed (press = kNetPressShow / kNetPressCopy).  With an address: SHOW flips SHOW / HIDE, COPY copies.
-   While the router is asked: the press waits for its answer.  The router gave none: the websites are asked and the press
-   waits.  While they are asked: the newest press waits.  None answered: nothing (the buttons are greyed). */
+   While the router is asked: the websites are asked beside it (RACING) and the press waits for the first address.  The
+   router gave none: the websites are asked and the press waits.  While anything is asked: the newest press waits.  None
+   answered: nothing (the buttons are greyed). */
 inline PanelNetStep PanelNetAddrPress(int state, int pending, int press)
 {
     if (press != kNetPressShow && press != kNetPressCopy) return PanelNetStepNone(state, pending);
@@ -558,7 +677,13 @@ inline PanelNetStep PanelNetAddrPress(int state, int pending, int press)
         if (press == kNetPressShow) s.toggleShown = 1; else s.copyNow = 1;
         return s;
     }
-    if (state == kNetAddrAsking || state == kNetAddrLooking) return PanelNetStepNone(state, press);
+    if (state == kNetAddrAsking)
+    {
+        PanelNetStep s = PanelNetStepNone(kNetAddrRacing, press);
+        s.startLookup = 1;
+        return s;
+    }
+    if (state == kNetAddrLooking || state == kNetAddrRacing || state == kNetAddrRouterOnly) return PanelNetStepNone(state, press);
     if (state == kNetAddrMissing)
     {
         PanelNetStep s = PanelNetStepNone(kNetAddrLooking, press);
@@ -567,10 +692,17 @@ inline PanelNetStep PanelNetAddrPress(int state, int pending, int press)
     }
     return PanelNetStepNone(state, pending);
 }
-/* The router answered (found 1 = an address).  Found: the waiting press is done.  None: with a press waiting the websites
-   are asked; without one the row waits for a press.  An answer in any other state is an old one and changes nothing. */
+/* The router answered (found 1 = an address).  Found: the waiting press is done (also while the websites are asked beside
+   it - their later answer is then an old one).  None: with a press waiting the websites are asked; without one the row
+   waits for a press; while they are already asked, the row waits for them; after they gave none, FAILED.  An answer in
+   any other state is an old one and changes nothing. */
 inline PanelNetStep PanelNetRouterAnswer(int state, int pending, int found)
 {
+    if (state == kNetAddrRacing || state == kNetAddrRouterOnly)
+    {
+        if (found != 0) return PanelNetFoundFor(pending);
+        return PanelNetStepNone(state == kNetAddrRacing ? kNetAddrLooking : kNetAddrFailed, state == kNetAddrRacing ? pending : kNetPressNone);
+    }
     if (state != kNetAddrAsking) return PanelNetStepNone(state, pending);
     if (found != 0) return PanelNetFoundFor(pending);
     if (pending == kNetPressNone) return PanelNetStepNone(kNetAddrMissing, kNetPressNone);
@@ -578,9 +710,15 @@ inline PanelNetStep PanelNetRouterAnswer(int state, int pending, int found)
     s.startLookup = 1;
     return s;
 }
-/* The websites answered (found 1 = one gave a usable address).  None: FAILED, until the window opens again. */
+/* The websites answered (found 1 = one gave a usable address).  None: FAILED, until the window opens again - or, while
+   the router is still asked beside them, ROUTERONLY (its answer decides). */
 inline PanelNetStep PanelNetLookupAnswer(int state, int pending, int found)
 {
+    if (state == kNetAddrRacing)
+    {
+        if (found != 0) return PanelNetFoundFor(pending);
+        return PanelNetStepNone(kNetAddrRouterOnly, pending);
+    }
     if (state != kNetAddrLooking) return PanelNetStepNone(state, pending);
     if (found != 0) return PanelNetFoundFor(pending);
     return PanelNetStepNone(kNetAddrFailed, kNetPressNone);
@@ -617,6 +755,15 @@ inline std::string PanelNetAddrShowCaption(int state, const std::string& ip, int
 inline std::string PanelAddrNoteText()
 {
     return "Players in your home use the local address. Everyone else uses the internet address.";
+}
+/* T-631 (owner 570): the same line while a game VPN was found - its own network's friends use its address. */
+inline std::string PanelAddrNoteFor(int vpnKind)
+{
+    if (vpnKind == kGameVpnRadmin)
+        return "Players in your home use the local address. Friends on your Radmin network use the Radmin address. Everyone else uses the internet address.";
+    if (vpnKind == kGameVpnHamachi)
+        return "Players in your home use the local address. Friends on your Hamachi network use the Hamachi address. Everyone else uses the internet address.";
+    return PanelAddrNoteText();
 }
 /* What a COPY press says (the HOSTING status area).  netRow 0 = LOCAL ADDRESS, 1 = INTERNET ADDRESS; text = what was put on
    (or failed to reach) the clipboard.  A failed internet copy never prints the address - it may be hidden on screen. */

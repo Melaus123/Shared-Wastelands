@@ -41,6 +41,7 @@
 #include "soak.h"    /* GameplayRunning */
 #include "store.h"   /* EngineWritesBlocked */
 #include "config.h"  /* settings5 S5: ConfigModFingerprintSalt */
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
 namespace {
@@ -127,8 +128,8 @@ std::string Lower(std::string s) { for (size_t i = 0; i < s.size(); ++i) if (s[i
 std::string BaseName(const std::string& p) { const size_t k = p.find_last_of("\\/"); return k == std::string::npos ? p : p.substr(k + 1); }
 std::string DirName(const std::string& p) { const size_t k = p.find_last_of("\\/"); return k == std::string::npos ? std::string() : p.substr(0, k); }
 std::string Join(const std::string& a, const std::string& b) { if (a.empty()) return b; const char c = a[a.size() - 1]; return (c == '\\' || c == '/') ? a + b : a + "\\" + b; }
-int IsFile(const std::string& p) { if (p.empty()) return 0; const DWORD a = ::GetFileAttributesA(p.c_str()); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0; }
-int IsDir(const std::string& p) { if (p.empty()) return 0; const DWORD a = ::GetFileAttributesA(p.c_str()); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0; }
+int IsFile(const std::string& p) { if (p.empty()) return 0; const DWORD a = U8GetFileAttributes(p.c_str()); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0; }
+int IsDir(const std::string& p) { if (p.empty()) return 0; const DWORD a = U8GetFileAttributes(p.c_str()); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0; }
 
 unsigned int g_crcTab[256];
 int g_crcInit = 0;
@@ -139,7 +140,7 @@ int FileCrc32(const std::string& path, unsigned int* crc)
         for (unsigned int i = 0; i < 256; ++i) { unsigned int c = i; for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); g_crcTab[i] = c; }
         g_crcInit = 1;
     }
-    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, 0);
+    HANDLE h = U8CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, 0);
     if (h == INVALID_HANDLE_VALUE) return 0;
     /* review-settings1 (stall): NOT the whole file - the full read froze the main thread for seconds on a large mod list,
        in the middle of the link-up. The fingerprint covers the file SIZE plus its first and last 64 KB: identical on two
@@ -169,7 +170,7 @@ int FileCrc32(const std::string& path, unsigned int* crc)
 
 int ReadText(const std::string& path, std::string* out)
 {
-    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    HANDLE h = U8CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) return 0;
     char b[4096]; DWORD got = 0;
     out->clear();

@@ -99,7 +99,77 @@ double ClockSharedHoursAt(double srvHours, double srvAtMs, double nowMs,
 
 int ClockSpeedIsValid(float speed)
 {
+    /* NaN fails both comparisons; +infinity fails the upper bound; negatives fail the lower one. */
+    return (speed >= 0.0f && speed <= kClockSpeedMax) ? 1 : 0;
+}
+
+int ClockSpeedIsBuiltIn(float speed)
+{
     return (speed == 0.0f || speed == 1.0f || speed == 2.0f || speed == 5.0f) ? 1 : 0;
+}
+
+void LiveSpeedMemoReset(LiveSpeedMemo* m)
+{
+    m->lastSeen = -1.0f; m->appliedFor = -1.0f; m->pending = -1.0f;
+    m->adoptAt = 0u; m->holdAt = 0u; m->adopted = 0; m->held = 0; m->holding = 0;
+}
+
+void LiveSpeedNoteSeen(LiveSpeedMemo* m, float seen)
+{
+    m->lastSeen = seen;
+    m->appliedFor = -1.0f;   /* the last recorded change is no longer this game's own apply */
+    m->holding = 0;
+}
+
+void LiveSpeedNoteApplied(LiveSpeedMemo* m, float seenAfter, float srv)
+{
+    LiveSpeedNoteSeen(m, seenAfter);
+    m->appliedFor = srv;
+}
+
+void LiveSpeedNoteWaited(LiveSpeedMemo* m, float live)
+{
+    m->pending = live;
+}
+
+void LiveSpeedNoteAdopted(LiveSpeedMemo* m, float seenNow, unsigned int nowMs, int voteCounts)
+{
+    m->lastSeen = seenNow;
+    m->appliedFor = -1.0f;
+    m->pending = -1.0f;
+    m->adoptAt = nowMs; m->adopted = 1;
+    m->holding = (voteCounts && (!m->held || (unsigned int)(nowMs - m->holdAt) >= kClockSpeedRevoteMs)) ? 1 : 0;
+    if (m->holding) { m->holdAt = nowMs; m->held = 1; }
+}
+
+static int LiveSpeedUnaccountedPace(const LiveSpeedMemo& m, float live)
+{
+    return (m.lastSeen >= 0.0f && live != m.lastSeen && live > 0.0f && ClockSpeedIsValid(live)) ? 1 : 0;
+}
+
+float LiveSpeedAdoptValue(const LiveSpeedMemo& m, float live)
+{
+    if (LiveSpeedUnaccountedPace(m, live)) return live;
+    return (m.pending >= 0.0f) ? m.pending : live;
+}
+
+int ClockLiveSpeedDecide(const LiveSpeedMemo& m, float live, float srv, float myVote, unsigned int nowMs, int answered)
+{
+    const unsigned int sinceAdopt = m.adopted ? (unsigned int)(nowMs - m.adoptAt) : 0u;
+    const int gapPassed = (!m.adopted || sinceAdopt >= kClockSpeedAdoptGapMs) ? 1 : 0;
+    const int revoteDue = (!m.adopted || sinceAdopt >= kClockSpeedRevoteMs) ? 1 : 0;
+    const int pace = (live > 0.0f && ClockSpeedIsValid(live)) ? 1 : 0;
+    if (LiveSpeedUnaccountedPace(m, live) && (live != myVote || revoteDue)) return gapPassed ? kLiveSpeedAdopt : kLiveSpeedWait;
+    if (m.pending >= 0.0f && gapPassed) return kLiveSpeedAdopt;
+    if (live == srv) return kLiveSpeedNothing;
+    if (m.holding && !answered && pace && live == myVote && m.adopted && sinceAdopt < kClockSpeedVoteHoldMs) return kLiveSpeedHold;
+    if (m.appliedFor >= 0.0f && m.appliedFor == srv && live == m.lastSeen) return kLiveSpeedNothing;
+    return kLiveSpeedApply;
+}
+
+int ClockSetterCallAccounted(int callerInGameImage, int callerThisMod, float speed, int engineHeldBefore)
+{
+    return (callerInGameImage || callerThisMod || !(speed > 0.0f) || engineHeldBefore) ? 1 : 0;
 }
 
 void ClockEncodeDown(char out14[14], double hours, float speed,

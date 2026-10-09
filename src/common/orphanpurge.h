@@ -35,7 +35,8 @@ namespace coopor {
 /* (1) THE LEAF GATE'S UNLINKED ARM.  heldByOther is HeldByOtherTS's answer: 1 another game holds the area,
    0 it does not (unclaimed or this game's), -1 no live notebook map. */
 const int kLeafAllowUnlinked = 0, kLeafGatedHeldUnlinked = 1;
-inline int LeafUnlinked(int heldByOther) { return heldByOther == 1 ? kLeafGatedHeldUnlinked : kLeafAllowUnlinked; }
+/* -2 (coopdrop::kAreaFrozen): the area's holder is a player not in the world - nothing is created there until it is back. */
+inline int LeafUnlinked(int heldByOther) { return (heldByOther == 1 || heldByOther == -2) ? kLeafGatedHeldUnlinked : kLeafAllowUnlinked; }
 
 /* (1b) p97-op - P97 (owner 334 a / 337 a): THE LEAF GATE'S LINKED ARM.  `may` is MayInventFromView's answer:
    > 0 this game invents here, 0 it does not, < 0 no fresh area map (the caller takes the teardown answer apart

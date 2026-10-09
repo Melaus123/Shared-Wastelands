@@ -28,6 +28,7 @@
 #include <locale>
 #include <string>
 #include <cstdlib>
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace {
 
@@ -128,21 +129,21 @@ bool WriteFileAtomic(const std::string& path, const std::string& body, std::stri
     char pidb[32]; sprintf(pidb, ".new.%lu", (unsigned long)::GetCurrentProcessId());
     const std::string tmpPath = path + pidb;   /* PP3b (review LOW): unique per process - two games never share one temp file */
     {
-        HANDLE h = ::CreateFileA(tmpPath.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        HANDLE h = U8CreateFile(tmpPath.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
         if (h == INVALID_HANDLE_VALUE) { if (err) *err = "could not open " + tmpPath + " for writing"; return false; }
         DWORD wrote = 0;
         const BOOL wok = body.empty() ? TRUE : ::WriteFile(h, body.data(), (DWORD)body.size(), &wrote, 0);
         /* PP3b (review MED): the bytes reach the disk BEFORE the rename, so a power cut cannot leave a renamed-but-empty file. */
         const BOOL fok = ::FlushFileBuffers(h);
         ::CloseHandle(h);
-        if (!wok || wrote != (DWORD)body.size() || !fok) { if (err) *err = "the write to " + tmpPath + " failed - the disk may be full"; ::DeleteFileA(tmpPath.c_str()); return false; }
+        if (!wok || wrote != (DWORD)body.size() || !fok) { if (err) *err = "the write to " + tmpPath + " failed - the disk may be full"; U8DeleteFile(tmpPath.c_str()); return false; }
     }
-    if (!::MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    if (!U8MoveFileEx(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {
         const DWORD e = ::GetLastError();
         char nb[32]; sprintf(nb, "%lu", (unsigned long)e);
         if (err) *err = "could not replace " + path + " (Windows error " + nb + ")";
-        ::DeleteFileA(tmpPath.c_str());
+        U8DeleteFile(tmpPath.c_str());
         return false;
     }
     return true;
@@ -153,7 +154,7 @@ void EnsureDirTree(const std::string& dir)
 {
     for (size_t i = 3; i <= dir.size(); ++i)
         if (i == dir.size() || dir[i] == '\\' || dir[i] == '/')
-            ::CreateDirectoryA(dir.substr(0, i).c_str(), 0);
+            U8CreateDirectory(dir.substr(0, i).c_str(), 0);
 }
 
 /* PP3: one settings file's text, bounded exactly as before (kCfgMaxReadBytes). false = no such file (or no path). */
@@ -161,7 +162,7 @@ bool ReadCfgTextAt(const std::string& path, std::string* text)
 {
     text->clear();
     if (path.empty()) return false;
-    std::ifstream f(path.c_str());
+    std::ifstream f(U8W(path.c_str()).c_str());
     if (!f) return false;
     std::vector<char> buf(4096);
     while (text->size() < coopcfg::kCfgMaxReadBytes && f)
@@ -207,7 +208,10 @@ void FallBackToSingle(const std::string& why)
    %LOCALAPPDATA% and would otherwise share one identity), else the default; see coopdata::DataDirChoose. */
 void DataDirLatch(const std::string& overrideDir)
 {
-    g_dataDirSource = coopdata::DataDirChoose(overrideDir, getenv("LOCALAPPDATA"), getenv("USERPROFILE"), &g_dataDir);
+    /* read as UTF-16 and kept as UTF-8, like every path the game hands the mod: a user folder named outside plain ASCII
+       stays one string the file calls (u8file.h) and the game's own paths agree on */
+    const std::string envLa = U8GetEnv("LOCALAPPDATA"), envUp = U8GetEnv("USERPROFILE");
+    g_dataDirSource = coopdata::DataDirChoose(overrideDir, envLa.empty() ? 0 : envLa.c_str(), envUp.empty() ? 0 : envUp.c_str(), &g_dataDir);
     if (g_dataDir.empty())
         ErrorLog("[CFG] PP3: NO data folder - neither LOCALAPPDATA nor USERPROFILE is an absolute folder. This game's identity"
                  " lives in memory only this session (a new one at every start) and the panel's settings cannot be saved.");
@@ -236,7 +240,7 @@ int PlayerCfgProbe(const std::string& path, std::string* text)
     if (path.empty()) return coopdata::kPcAbsent;
     for (int attempt = 0; attempt < 5; ++attempt)
     {
-        const DWORD a = ::GetFileAttributesA(path.c_str());
+        const DWORD a = U8GetFileAttributes(path.c_str());
         if (a == INVALID_FILE_ATTRIBUTES)
         {
             const DWORD e = ::GetLastError();
@@ -312,7 +316,7 @@ void IdentityLoad(const coopcfg::CfgFields& oldFields)
         sprintf(ts, ".bad-%04u%02u%02u-%02u%02u%02u", (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
                 (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
         const std::string aside = path + ts;
-        if (::MoveFileExA(path.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH)) asideNote = " It was moved aside to " + aside + ".";
+        if (U8MoveFileEx(path.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH)) asideNote = " It was moved aside to " + aside + ".";
         else
         {
             asideFailed = true;
@@ -487,7 +491,7 @@ int IdentityReplaceByChoice()
             if (!fromCfg && cfgState == coopdata::kPcInvalid)
             {
                 const std::string aside = path + ts;
-                if (::MoveFileExA(path.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH)) note = " The damaged player.cfg was moved aside to " + aside + ".";
+                if (U8MoveFileEx(path.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH)) note = " The damaged player.cfg was moved aside to " + aside + ".";
                 else
                 {
                     char nb[32]; sprintf(nb, "%lu", (unsigned long)::GetLastError());
@@ -511,7 +515,7 @@ int IdentityReplaceByChoice()
     for (int i = 0; i < 2; ++i)
     {
         const std::string p = path + suffix[i];
-        if (::GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES)
+        if (U8GetFileAttributes(p.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
             /* PP3e (review 2026-09-27 LOW): only "no such file" is absent; any other error = present but unreadable, never written over. */
             const DWORD e = ::GetLastError();
@@ -523,7 +527,7 @@ int IdentityReplaceByChoice()
             return 0;
         }
         const std::string aside = p + ts;
-        if (!::MoveFileExA(p.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH))
+        if (!U8MoveFileEx(p.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH))
         {
             char nb[32]; sprintf(nb, "%lu", (unsigned long)::GetLastError());
             ErrorLog("[CFG] PP3d: CONTINUE AS NEW PLAYER stopped - " + p + " could NOT be renamed aside (Windows error " + nb
@@ -979,6 +983,7 @@ void ConfigLeave(const char* why)
     const bool linked = net::SessionLinked();
     net::SessionLeave();                    /* BYE on a live link; "[net] session closed" when there was a session */
     SetStoreServer(std::string(), 0);       /* the store link closed and its re-dial target cleared */
+    net::SessionForgetRows(false, "the game left the world server");   /* the world-road rows the session's end kept go with the world link */
     StoreLeftAtTitle();                     /* the last link's refusal and profile lobby go with it - and the profile's save folder (T-201 PP5) */
     g_slotProfile.clear(); g_slot = g_slotFile;   /* T-201 PP5: the picked profile's folder goes with the session; the next pick decides it again */
     ::InterlockedExchange(&g_role, (long)kRoleSingle);

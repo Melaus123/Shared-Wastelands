@@ -70,4 +70,29 @@ inline int DecodeTreat(const char* p, size_t size, TreatMsg* m)
     return kTreatDecodeOk;
 }
 
+/* The medic's game keeps a sent treatment PENDING until the owner's STATE carries it (TreatConfirmedBy on every value it raised).
+   Each owner STATE that does not show it is counted (an event, never a clock); after kTreatOwnerStates of them the same TREAT is
+   sent again, and after kTreatSendsMax sends the treatment is given up (the owner's word stands). */
+const int kTreatOwnerStates = 2;
+const int kTreatSendsMax    = 3;
+
+const int kTreatAskNone   = 0;   /* nothing pending */
+const int kTreatAskWait   = 1;
+const int kTreatAskResend = 2;
+const int kTreatAskGiveUp = 3;
+
+inline int TreatAskStep(bool pending, int ownerStatesSinceSend, int sends)
+{
+    if (!pending) return kTreatAskNone;
+    if (ownerStatesSinceSend < kTreatOwnerStates) return kTreatAskWait;
+    if (sends < kTreatSendsMax) return kTreatAskResend;
+    return kTreatAskGiveUp;
+}
+
+/* The owner's value carries the held one (a held 0 is "not raised here" and always carried). */
+inline bool TreatConfirmedBy(float owner, float held, float eps)
+{
+    return !(owner + eps < held);
+}
+
 } // namespace cooptreat

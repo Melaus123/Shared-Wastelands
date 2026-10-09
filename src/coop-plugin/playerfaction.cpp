@@ -14,6 +14,7 @@
 #include "store.h"        /* stand1: StoreMySlot / StoreLastKnownSlot - my slot for the wire */
 #include "config.h"       /* RoleIsSingle */
 #include "../common/slotwire.h"   /* stand1: coop-p<n>, @slot:<n> */
+#include "../common/factionkey.h"   /* an NPC faction travels by its stringID */
 #include "../common/profiles.h"   /* T-368: FactionApplyDecide, kEngineFactionDefault */
 #include "../common/panelstatus.h"   /* T-368: the Faction Name boxes' approved words */
 #include "hooks.h"        /* T-368: coop::AddHook */
@@ -50,6 +51,7 @@ volatile LONG g_slotHeld = 0; LONG g_slotHeldSeen = 0; long long g_slotReleases 
 bool g_anyMiss = false; long g_anyMissLinkGen = -1; long long g_anyMissCached = 0;   /* stand1 fold (6c): PeerFactionAny's negative answer, per world/link/table */
 bool g_tickLinked = false;   /* stand1 fold (6b): the link edge that forgets the other game's slot */
 unsigned g_wireSent = 0, g_wireResolved = 0, g_created = 0, g_byName = 0, g_byNameMissed = 0, g_mgrMissing = 0, g_renamed = 0, g_createFailed = 0;
+unsigned g_keySidSent = 0, g_keyById = 0, g_keyByName = 0, g_keyByRecord = 0, g_keyMissed = 0, g_keyRekeyed = 0;   /* factionkey: SPAWN faction keys sent as a stringID; keys found here by stringID, by name, by a record's name, not at all; world-store rows re-keyed */
 float g_relationAtCreate = 0.0f; int g_relationRead = 0; unsigned g_renameRefused = 0;
 std::string g_lastSeenName; ::Faction* g_lastSeenFaction = 0; bool g_worldWasTornDown = false, g_nameBaselined = false; long long g_worldRebasedLinked = 0; long long g_nameChanges = 0, g_renameVerb = 0, g_nameTickNoFaction = 0, g_nameTickBaseline = 0;   // the rename-as-state-change check (declared here: used by the verb and the tick)
 
@@ -515,12 +517,71 @@ std::string PeerFactionDisplayName() { return StandInDisplayName(PeerFaction());
 
 bool PeerFactionExists() { return PeerFactionAny() != 0; }
 
-std::string WireFactionName(::Faction* f)
+/* a player's faction: this game's own, a stand-in, or a stand-in's record the save carries (StandInRecordSlot); an unreadable kind or
+   record id counts as a player's, so such a faction is named by its name (factionkey.h) */
+bool AnyPlayersFaction(::Faction* f) { return IsPlayerPod(f) != 0 || IsStandInFaction(f) || StandInRecordSlot(f) != -1; }
+
+std::string FactionKey(::Faction* f, bool* isCode)
 {
+    if (isCode) *isCode = false;
     if (!Plaus(f)) return std::string();
     const std::string name = f->getName();
-    if (IsPlayerPod(f) == 1) { ++g_wireSent; return coopslot::SlotWire(MySlotForWire(), name); }   /* stand1: "@slot:<my slot>:<name>" ("@slot:?:<name>" before I have one) */
-    return name;
+    const bool npc = !AnyPlayersFaction(f);
+    char sid[factionkey::kMaxSid + 2]; sid[0] = 0;
+    const bool read = npc && ReadSidPod(f, sid, (int)sizeof(sid)) == 1;
+    const std::string sidS = read ? std::string(sid) : std::string();
+    if (isCode) *isCode = npc && factionkey::SidUsable(sidS);
+    return factionkey::KeyOf(npc, sidS, name);
+}
+
+::Faction* FindFactionByKey(const std::string& key)
+{
+    if (key.empty() || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory)) return 0;
+    if (factionkey::TryAsSid(key))
+    {
+        ::Faction* f = coop::GameWorldPtr()->factionDirectory->findFactionById(key);
+        const bool found = PlausibleObject(f);
+        if (factionkey::TakeIdMatch(found, found && AnyPlayersFaction(f)))
+        {
+            if (++g_keyById <= 20) DebugLog("[PF] faction key '" + key + "' found by its stringID: '" + f->getName() + "' on this game (logged 20x)");
+            return f;
+        }
+    }
+    ::Faction* f = coop::GameWorldPtr()->factionDirectory->findFactionByName(key);
+    if (PlausibleObject(f)) { ++g_keyByName; return f; }
+    ::GameData* gd = coop::GameWorldPtr()->gamedata.findRecordByName(key, FACTION);
+    if (PlausibleObject(gd) && factionkey::SidUsable(gd->stringID))
+    {
+        ::Faction* r = coop::GameWorldPtr()->factionDirectory->findFactionById(gd->stringID);
+        const bool found = PlausibleObject(r);
+        if (factionkey::TakeIdMatch(found, found && AnyPlayersFaction(r)))
+        {
+            if (++g_keyByRecord <= 20) DebugLog("[PF] faction key '" + key + "' found by its record's name: '" + gd->stringID + "' '" + r->getName() + "' on this game (logged 20x)");
+            return r;
+        }
+    }
+    if (++g_keyMissed <= 20) DebugLog("[PF] faction key '" + key + "' names no faction on this game, by stringID, by name or by record name (logged 20x)");
+    return 0;
+}
+
+std::string RekeyFactionKey(const std::string& key)
+{
+    ::Faction* f = FindFactionByKey(key);
+    bool code = false;
+    const std::string sid = (PlausibleObject(f) && !AnyPlayersFaction(f)) ? FactionKey(f, &code) : std::string();
+    if (!factionkey::Rekey(code, key, sid)) return key;
+    if (++g_keyRekeyed <= 20) DebugLog("[PF] world-store faction '" + key + "' re-keyed to its game-data code '" + sid + "' (logged 20x)");
+    return sid;
+}
+
+std::string WireFactionName(::Faction* f, bool sending)
+{
+    if (!Plaus(f)) return std::string();
+    if (IsPlayerPod(f) == 1) { ++g_wireSent; return coopslot::SlotWire(MySlotForWire(), f->getName()); }   /* stand1: "@slot:<my slot>:<name>" ("@slot:?:<name>" before I have one) */
+    const std::string key = FactionKey(f);
+    if (sending && factionkey::TryAsSid(key) && !AnyPlayersFaction(f) && key != f->getName() && ++g_keySidSent <= 20)
+        DebugLog("[PF] SPAWN faction '" + f->getName() + "' travels as its stringID '" + key + "' (logged 20x)");
+    return key;
 }
 
 ::Faction* ResolveWireFaction(const std::string& wire)
@@ -530,7 +591,7 @@ std::string WireFactionName(::Faction* f)
     int slot = -1; std::string name;
     if (!coopslot::ParseSlotWire(wire, &slot, &name, 0))
     {
-        ::Faction* f = coop::GameWorldPtr()->factionDirectory->findFactionByName(wire);
+        ::Faction* f = FindFactionByKey(wire);   /* an NPC faction's stringID, or a stand-in's name */
         if (PlausibleObject(f)) ++g_byName; else ++g_byNameMissed;
         return f;
     }
@@ -823,6 +884,7 @@ void ReportPlayerFaction()
 {
     DebugLog("[PF] REPORT peer=" + StandInsText() + " created=" + S(g_created)
              + " wireSent=" + S(g_wireSent) + " wireResolved=" + S(g_wireResolved) + " byName=" + S(g_byName) + " byNameMissed=" + S(g_byNameMissed)
+             + " keySidSent=" + S(g_keySidSent) + " keyById=" + S(g_keyById) + " keyByName=" + S(g_keyByName) + " keyByRecord=" + S(g_keyByRecord) + " keyMissed=" + S(g_keyMissed) + " keyRekeyed=" + S(g_keyRekeyed)
              + " mgrMissing=" + S(g_mgrMissing) + " renamed=" + S(g_renamed) + " nameChanges=" + S(g_nameChanges) + " renameVerb=" + S(g_renameVerb) + " nameTickBaseline=" + S(g_nameTickBaseline) + " nameTickNoFaction=" + S(g_nameTickNoFaction) + " worldRebasedLinked=" + S(g_worldRebasedLinked) + " createFailed=" + S(g_createFailed) + " mySlot=" + S(MySlotForWire()) + " linkPeerSlot=" + S(g_linkPeerSlot) + " wireSelfSlot=" + S(g_wireSelfSlot) + " wireNoSlot=" + S(g_wireNoSlot) + " wireLegacy=" + S(g_wireLegacy) + " tableFull=" + S(g_tableFull) + " placeholders[made,named,clashRenamed]=" + S(g_placeholderMade) + "," + S(g_placeholderNamed) + "," + S(g_clashRenamed) + " slotHeld=" + S((long)g_slotHeld) + " slotReleases=" + S(g_slotReleases) + " anyMissCached=" + S(g_anyMissCached) + " legacyPeer=" + S((const void*)g_legacyPeer) + " relationAtCreate=" + (g_relationRead == 1 ? S(g_relationAtCreate) : std::string("unread")));
     ::Faction* mine = LocalPlayerFactionImpl();
     DebugLog("[PF] REPORT names: mine='" + (mine != 0 ? mine->getName() : std::string("-")) + "' tab[calls,refused]=" + S(g_tabCalls) + "," + S(g_tabRefused)

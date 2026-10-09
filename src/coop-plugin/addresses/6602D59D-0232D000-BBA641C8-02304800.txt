@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 477
+!count 491
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -56,6 +56,7 @@ AppearanceHuman_rebuildLook               code 005338F0 005338F0 488BC4555741544
 AppearanceHuman_rebuildShape              code 0052E6C0 0052E6C0 488BC4554154415541564157488DA8F8
 ApplyDamage                                    code 0064F300 0064F300 48895C240848896C2410488974241857
 ApplyDamageHitRet                              ret  0065109C 00651097 E822809DFF
+BailoutConfirm                                 code 006AE170 006AE170 488BC4554154415541564157488D68A1
 BarBuildingPick                                code 0038B000 0038B000 488BC44C894018574154415541564157
 BountyMapErase                                 code 00861660 00861660 40554883EC204883792000488BE97508
 BountyMapIndex                                 code 005E7EE0 005E7EE0 40565741544883EC4048C7442420FEFF
@@ -403,6 +404,9 @@ SetRelation                                    code 006B4D80 006B4D80 4889542410
 SetSlaveAIJob                                  code 0032E0D0 0032E0D0 48895C24084889742410574883EC300F
 SetSquadType                                   code 009C44B0 009C44B0 48895C2410574883EC208BDA488BF983
 SetupForcedOpenRet                             ret  0029D212 0029D20D E8FAAFDAFF
+DoorInitialStateRet                            ret  0055347E 00553479 E8C5D9AFFF
+SetupOpenAmountRet                             ret  0029D22F 0029D22A E8DDAFDAFF
+DoorLoadFromSaveRet                            ret  002A082D 002A0828 E8DF79DAFF
 SetupWeather                                   code 009DCF60 009DCF60 4C8BDC574881EC9000000048C7442428
 SfsReadFile                                    code 00470FC0 00470FC0 48895C24105556574883EC20488BDA48
 ShaveHead                                      code 005B24A0 005B24A0 488B8948040000488B89E8000000E91C
@@ -489,3 +493,13 @@ ContextMenu_showContextMenu                    code 007A6BC0 007A6BC0 4055565741
 ContextMenu_fill                               code 007A7FE0 007A7FE0 488BC45556574154415541564157488D
 ShowMenuIsEnemyRet                             ret  007A782E 007A7829 E88F948AFF
 Character_isTagged                             code 00678960 00678960 48895C24084889742410574883EC2048
+TradeTownOfHand                                code 0070D170 0070D170 4883EC284C8B0515ABB301488D151EC5
+TownLocalTradePriceMult                        code 0092D590 0092D590 4889542410534883EC20488D99B00400
+TownFactionTradeCultureMult                    code 0092BEC0 0092BEC0 40534883EC204C8B91A8040000488BDA
+TradeWindowTrader                              code 0070E2D0 0070E2D0 4883EC2848833D1449A20102730733C0
+ItemTradeMult                                  code 0079E6D0 0079E6D0 40574883EC300F29742420488BF9E81E
+TownListNearest                                code 00927F10 00927F10 488BC44C894820488950105541544155
+TownContainsPoint                              code 00926D50 00926D50 48895C2408574883EC3083B9D8000000
+TownListNearestFallback                        code 00927AD0 00927AD0 48896C24185641544155415641574883
+PlatoonLoadInstance                            code 0036F6B0 0036F6B0 405556574154415541564157488D6C24
+UniqueMayMake                                  code 005921B0 005921B0 4889542410534883EC20488BD9488BC2

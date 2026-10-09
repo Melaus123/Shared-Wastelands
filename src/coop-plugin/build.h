@@ -22,6 +22,7 @@ std::string StandInCommand(const std::string& arg);     // TEST-ONLY, MAIN THREA
 std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction
 std::string BuyHouseCommand(const std::string& arg);   /* P18 fold 1: TEST LEVER `buyhouse <buildingKey|nearest> [cats=<n>]` / `buyhouse show <buildingKey|last>` */
 int BuildRecordedOwnerSlot(const char* key);          // build1h, MAIN THREAD: the owner slot the build registry recorded for the piece at this P7n key (own rows: my slot); -1 none                       // MAIN THREAD, read-only: `buildlist` - the registry with live values
+int  BuildRowPendingFor(void* building);              // MAIN THREAD: another game's PLACE or STATE (a copy, or an owner change such as a purchase) for this piece still waits here - 1 yes, 0 no, -1 key unreadable
 void ReportBuild();                                   // one [BUILD] REPORT line (the `report` fan-out)
 /* mmo8a (mmo8-buildings-read.md 5): the buildings this player owns, kept in the own-records store as pp.build (store.cpp writes it) */
 void BuildOwnRows(std::vector<coopown::BuildRow>* rows, std::vector<std::string>* retired, int* skipped);   // MAIN THREAD: own rows (own, not a copy, not removed) as PLACE + STATE bytes; retired = own keys taken down here

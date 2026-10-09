@@ -31,6 +31,16 @@
  * key nothing (shackles) or the cage's building key; after the outer key: u8 flags (kLockFlagLocked | kLockFlagBroken, no other
  * bit) and i32 lock level (0..kLockLevelMax).
  *
+ * kind kPrisonSlaveAsk (copy's game -> owner): this game's engine changed the slave state of its COPY of `uid`
+ * (StateBroadcastData::setSlaveState 0x5A3EB0, refused on the copy). No keys; after the outer key: u8 from (the copy's state when
+ * the change was made) and u8 want (the state the engine set), each 0..3 (SlaveStateEnum) and different. The owner applies it to its
+ * own character through the same setter only when the sender runs the character's area (slavewire.h SlaveAskOwnerDecide).
+ *
+ * A kPrisonRelease whose cage key is kPrisonBailKey ("@bail") is a bail paid on the sender's game
+ * (CharacterTrading_PrisonerBailout's confirm, 1.0.68 0x6AE170): the owner releases its own character as that confirm does - every
+ * bounty cleared, no pardon, slave state 0, the walk-out order (PrisonReleaseModeOf below). A game that does not know the marker
+ * looks it up as a faction, finds none and releases with the cage's faction.
+ *
  * The keys are the POSE bed keys (spawn.cpp PoseBedKeyFromHand): the cage's own P7n building key and, when the cage is
  * interior furniture, the key of the building whose layout made it (BED1). Pure: no engine memory, no Windows; the offline
  * suite hits the same bytes. C++03 (VS2010 v100).
@@ -54,6 +64,8 @@ const unsigned char kPrisonBedIn = 5;      /* the sender's game put its knocked-
 const unsigned char kPrisonBedRefused = 6; /* the owner could not put `uid` in that bed; the sender takes its copy out */
 const unsigned char kPrisonShackleLock = 7; /* P42: the lock of the shackles `uid` wears - the owner's word, or a copy's game's request */
 const unsigned char kPrisonCageLock = 8;    /* P42: the lock of the cage `uid` sits in - the owner's word, or a copy's game's request */
+const unsigned char kPrisonSlaveAsk = 9;    /* a slave-state change this game's engine made on its copy of `uid`, to the owner */
+const int kPrisonSlaveStateMax = 3;         /* SlaveStateEnum: 0 NOT_SLAVE, 1 IS_SLAVE, 2 ESCAPING_SLAVE, 3 EX_SLAVE (slavewire.h) */
 const unsigned int  kPrisonMaxKey = 48;  /* as coopstate::kPoseStrMax */
 
 const int kPrisonDecodeOk       = 0;
@@ -63,6 +75,11 @@ const int kPrisonDecodeBadKey   = 3;   /* kPrisonIn / kPrisonBedIn with an empty
 const int kPrisonDecodeBadPos   = 5;   /* kPrisonBedIn with a position that is not a finite number */
 const int kPrisonDecodeBadFlag  = 6;   /* kPrisonBedRefused with a permanent byte other than 0 or 1 */
 const int kPrisonDecodeBadLock  = 7;   /* kPrisonShackleLock / kPrisonCageLock with an unknown flag bit or a level outside 0..100 */
+const int kPrisonDecodeBadSlave = 8;   /* kPrisonSlaveAsk with a state outside 0..3, or from == want */
+inline bool PrisonSlaveAskOk(unsigned char from, unsigned char want)
+{
+    return from <= kPrisonSlaveStateMax && want <= kPrisonSlaveStateMax && from != want;
+}
 
 /* P42: a DoorLock as it travels - +0x20 locked, +0x21 broken, +0x00 lockLevel (build/read-locks.md 2.1, Confirmed there) */
 const unsigned char kLockFlagLocked = 1;
@@ -84,7 +101,10 @@ struct PrisonMsg
     unsigned char permanent;  /* kPrisonBedRefused only: 1 the bed or a death refused it (not asked again), 0 it may pass */
     unsigned char lockFlags;  /* kPrisonShackleLock / kPrisonCageLock only: kLockFlag* */
     int lockLevel;            /* kPrisonShackleLock / kPrisonCageLock only: 0..kLockLevelMax */
-    PrisonMsg() : uid(0), kind(0), sentence(2), permanent(0), lockFlags(0), lockLevel(0) { pos[0] = 0.0f; pos[1] = 0.0f; pos[2] = 0.0f; }
+    unsigned char slaveFrom;  /* kPrisonSlaveAsk only: the copy's slave state when its engine changed it */
+    unsigned char slaveWant;  /* kPrisonSlaveAsk only: the slave state that engine set */
+    PrisonMsg() : uid(0), kind(0), sentence(2), permanent(0), lockFlags(0), lockLevel(0), slaveFrom(0), slaveWant(0)
+    { pos[0] = 0.0f; pos[1] = 0.0f; pos[2] = 0.0f; }
 };
 
 /* P11 f3 (review M6): Task_PutInSomething 0x358610 starts a sentence only when GetActualBounty 0x8531B0(victim +0xF0, the cage's
@@ -95,7 +115,7 @@ const int kPrisonDecodeBadSentence = 4;   /* kPrisonIn with a sentence byte abov
 inline bool PrisonKindOk(unsigned char k)
 {
     return k == kPrisonIn || k == kPrisonRelease || k == kPrisonRefused || k == kPrisonDeath || k == kPrisonBedIn || k == kPrisonBedRefused
-        || k == kPrisonShackleLock || k == kPrisonCageLock;
+        || k == kPrisonShackleLock || k == kPrisonCageLock || k == kPrisonSlaveAsk;
 }
 /* a float whose exponent bits are not all set (not an infinity, not a NaN) - read by its bits, whatever the floating-point mode */
 inline bool PrisonPosFinite(float f) { unsigned int u; std::memcpy(&u, &f, 4); return (u & 0x7F800000u) != 0x7F800000u; }
@@ -112,9 +132,10 @@ inline bool EncodePrison(std::vector<char>* b, const PrisonMsg& m)
     if (m.kind == kPrisonBedIn && !(PrisonPosFinite(m.pos[0]) && PrisonPosFinite(m.pos[1]) && PrisonPosFinite(m.pos[2]))) return false;
     if (m.kind == kPrisonBedRefused && m.permanent > 1) return false;
     if (PrisonIsLockKind(m.kind) && !LockBitsOk(m.lockFlags, m.lockLevel)) return false;
+    if (m.kind == kPrisonSlaveAsk && !PrisonSlaveAskOk(m.slaveFrom, m.slaveWant)) return false;
     const size_t at = b->size();
     b->resize(at + 4 + 1 + 1 + m.cageKey.size() + 1 + m.outerKey.size() + (m.kind == kPrisonIn ? 1 : 0) + (m.kind == kPrisonBedIn ? 12 : 0)
-              + (m.kind == kPrisonBedRefused ? 1 : 0) + (PrisonIsLockKind(m.kind) ? 5 : 0));
+              + (m.kind == kPrisonBedRefused ? 1 : 0) + (PrisonIsLockKind(m.kind) ? 5 : 0) + (m.kind == kPrisonSlaveAsk ? 2 : 0));
     char* p = &(*b)[at];
     std::memcpy(p, &m.uid, 4); p += 4;
     *p++ = (char)m.kind;
@@ -126,7 +147,14 @@ inline bool EncodePrison(std::vector<char>* b, const PrisonMsg& m)
     if (m.kind == kPrisonBedIn) std::memcpy(p + m.outerKey.size(), m.pos, 12);   /* x, y, z after the outer key */
     if (m.kind == kPrisonBedRefused) p[m.outerKey.size()] = (char)m.permanent;
     if (PrisonIsLockKind(m.kind)) { p[m.outerKey.size()] = (char)m.lockFlags; std::memcpy(p + m.outerKey.size() + 1, &m.lockLevel, 4); }
+    if (m.kind == kPrisonSlaveAsk) { p[m.outerKey.size()] = (char)m.slaveFrom; p[m.outerKey.size() + 1] = (char)m.slaveWant; }
     return true;
+}
+
+/* The kind byte of a MSG_PRISON payload read without decoding the rest: true for a death request (kPrisonDeath). */
+inline bool PrisonPayloadIsDeath(const char* p, size_t size)
+{
+    return p != 0 && size >= 5 && (unsigned char)p[4] == kPrisonDeath;
 }
 
 /* Every length test is `size - off < n` with off already <= size. */
@@ -172,8 +200,64 @@ inline int DecodePrison(const char* p, size_t size, PrisonMsg* out)
         std::memcpy(&m.lockLevel, p + off + 1, 4);
         if (!LockBitsOk(m.lockFlags, m.lockLevel)) return kPrisonDecodeBadLock;
     }
+    if (m.kind == kPrisonSlaveAsk)   /* the copy's state and the state its engine set */
+    {
+        if (size - off < 2) return kPrisonDecodeTooShort;
+        m.slaveFrom = (unsigned char)p[off];
+        m.slaveWant = (unsigned char)p[off + 1];
+        if (!PrisonSlaveAskOk(m.slaveFrom, m.slaveWant)) return kPrisonDecodeBadSlave;
+    }
     if (out) *out = m;
     return kPrisonDecodeOk;
+}
+
+/* ---- a bail paid on one game for another game's character, as pure decisions (spawn.cpp bail block, PrisonTick) ---- */
+
+/* The marker a kPrisonRelease carries in its cage key for a bail (see the header comment). */
+const char* const kPrisonBailKey = "@bail";
+
+/* How the owner releases its character on a kPrisonRelease, from the cage key as sent and whether a named faction was found here:
+   2 "@player" (a player freed it: no bounty cleared), 3 "@bail" (every bounty cleared, no pardon, slave state 0 - the engine's bail
+   confirm), 1 a stringID that names a faction here, 0 anything else (the cage's faction). */
+const int kReleaseModeCage = 0, kReleaseModeNamed = 1, kReleaseModePlayer = 2, kReleaseModeBail = 3;
+inline bool PrisonReleaseKeyIsMarker(const std::string& key) { return key == "@player" || key == kPrisonBailKey; }
+inline int PrisonReleaseModeOf(const std::string& key, bool namedFound)
+{
+    if (key == "@player") return kReleaseModePlayer;
+    if (key == kPrisonBailKey) return kReleaseModeBail;
+    return (!key.empty() && namedFound) ? kReleaseModeNamed : kReleaseModeCage;
+}
+inline bool PrisonReleaseClearsEveryBounty(int mode) { return mode == kReleaseModeBail; }   /* clearBounty(manager, no faction), as the bail */
+inline bool PrisonReleasePardons(int mode) { return mode != kReleaseModeBail; }              /* the bail writes no pardon */
+inline bool PrisonReleaseFreesSlave(int mode) { return mode == kReleaseModeBail; }           /* the bail sets slave state 0 */
+
+/* The payer's game, one prisoner the bail confirm just freed: told to its owner only when it is a replicated character this game
+   does not own (uid 0 = not replicated: the engine's own business; this game's own character was freed by this engine). */
+inline bool BailTellsOwner(unsigned int uid, bool mine) { return uid != 0 && !mine; }
+
+/* The owner: a "@bail" release is taken from the game that runs the character's area (where the prison and its keeper are run),
+   or from any game when the owner runs that area itself (the payer paid on its own copy there), as this game's area map says;
+   -1 (not known) refuses. */
+inline bool PrisonBailFromRunner(int holderSlot, int senderSlot, int mySlot)
+{
+    return holderSlot >= 0 && senderSlot >= 0 && (holderSlot == senderSlot || holderSlot == mySlot);
+}
+
+/* The payer's game keeps a bail it told an owner about until the owner's word shows the character out of its cage: the release is
+   sent again every kBailResendMs (the owner drops one it cannot apply yet - not caged there, its queue full, writes blocked), and
+   the copy's release hold is renewed with each send. The copy gone (or now ours) ends it; after kBailTriesMax sends with the owner
+   still saying caged it ends too, logged once, and the copy follows its owner's word again. */
+const unsigned int kBailResendMs = 3000;
+const int kBailTriesMax = 20;
+const int kBailDone = 0, kBailGone = 1, kBailWait = 2, kBailResend = 3, kBailGiveUp = 4;
+/* A bail paid before the owner's word shows the cage (the owner's own caging still queued) is done only once the owner's word has
+   shown the character caged and then out: until then it is sent again on the same timer (the owner drops it while not caged). */
+inline int BailPendingStep(bool copyHere, bool ownerSaysCaged, bool ownerSeenCaged, unsigned int msSinceSend, int tries)
+{
+    if (!copyHere) return kBailGone;
+    if (!ownerSaysCaged && ownerSeenCaged) return kBailDone;
+    if (msSinceSend < kBailResendMs) return kBailWait;
+    return tries >= kBailTriesMax ? kBailGiveUp : kBailResend;
 }
 
 /* ---- P42: who decides a prisoner's restraint lock, as pure decisions (spawn.cpp RestraintWatch / RestraintSafePointDrain) ---- */

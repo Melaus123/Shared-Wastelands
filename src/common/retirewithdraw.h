@@ -18,9 +18,10 @@
  * is the whole premise - so the fix cannot be undone by the lookup that caused the hole.
  *
  * RECURRENCE-COVERED.  A pending uid stays pending until the send ACTUALLY happens.  A link that is
- * down defers it and counts the deferral; it does not consume it.  Only three things end a pending
- * entry: the send succeeded, the peer was never told about this uid in the first place, or the
- * character came back (restore), which CANCELS the withdrawal.  Retire-then-restore inside one tick is
+ * down defers it and counts the deferral; it does not consume it.  Only four things end a pending
+ * entry: the send succeeded, the peer was never told about this uid in the first place, this game no
+ * longer runs the uid (it was handed to another game, whose copies are that game's to answer for), or
+ * the character came back (restore), which CANCELS the withdrawal.  Retire-then-restore inside one tick is
  * therefore two steps over the same entry and the FINAL state is what the drain sees - nothing is sent.
  *
  * C++03 (VS2010 v100): no auto, no nullptr, no range-for.
@@ -40,7 +41,8 @@ enum {
     kEvSent         = 2,   /* the UNLOAD went out on the wire */
     kEvSendFailed   = 3,   /* the transport declined - link down.  NOT a resolution */
     kEvNotAnnounced = 4,   /* the peer was never told about this uid, so there is nothing to withdraw */
-    kEvRestore      = 5    /* the handle resolves again: the character came back */
+    kEvRestore      = 5,   /* the handle resolves again: the character came back */
+    kEvNotMine      = 6    /* this game no longer runs the uid: another game does, and nothing is withdrawn */
 };
 
 /* WHICH COUNTER THE CALLER MUST MOVE.  Named rather than returned as a bool pair, because
@@ -52,7 +54,8 @@ enum {
     kCountSent               = 1,
     kCountDeferredLinkDown   = 2,
     kCountCancelledByRestore = 3,
-    kCountNotAnnounced       = 4
+    kCountNotAnnounced       = 4,
+    kCountNotMine            = 5
 };
 
 /* ONE TRANSITION.  Returns the new state; *countOut names the counter to move (kCountNone for most).
@@ -82,6 +85,10 @@ inline int RetireWithdrawStep(int state, int ev, int* countOut)
     {
         if (state == kPending) { next = kWithdrawn; count = kCountNotAnnounced; }
     }
+    else if (ev == kEvNotMine)
+    {
+        if (state == kPending) { next = kWithdrawn; count = kCountNotMine; }
+    }
     else if (ev == kEvRestore)
     {
         /* Pending: the withdrawal is CANCELLED before it ever reached the wire.
@@ -99,6 +106,17 @@ inline int RetireWithdrawStep(int state, int ev, int* countOut)
 /* THE DRAIN'S QUESTION, asked of the state and of nothing else.  It deliberately does NOT take an
    object, a pointer or a handle: the object is gone, which is why we are here. */
 inline int RetireWithdrawShouldSend(int state) { return (state == kPending) ? 1 : 0; }
+
+/* WHAT THE DRAIN DOES WITH A PENDING ENTRY, in order: a uid this game no longer runs settles with
+   nothing sent (kEvNotMine - its new owner answers for the copies); then a uid the peer was never told
+   about (kEvNotAnnounced); else the UNLOAD is owed. */
+enum { kGateNotMine = 0, kGateNotAnnounced = 1, kGateOwed = 2 };
+inline int RetireWithdrawGate(int stillMine, int announced)
+{
+    if (stillMine == 0) return kGateNotMine;
+    if (announced == 0) return kGateNotAnnounced;
+    return kGateOwed;
+}
 
 /* May the caller forget this entry?  Only kAbsent; kWithdrawn is kept so a later retire of the same
    uid is a fresh event rather than a duplicate send. */

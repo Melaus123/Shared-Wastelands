@@ -600,7 +600,8 @@ int RebuildInFlightGuarded(::Character* c)
 // AppearanceAnimal::createBody (one argument, this = the appearance object; AppearanceBase::update calls them through vtable
 // slot +0x58 while +0x143 is set) are the only appearance steps that replace the body entity, so every road that rebuilds a
 // body - the APPEARANCE apply, a clothing apply that queues a rebuild, a limb or race change, the engine's own - arrives
-// here. On the MAIN thread a replicated copy we do not own, with a body (app +0xD8), does not rebuild while it lies in
+// here. On the MAIN thread a replicated character with a body (app +0xD8) - a copy or this game's own: the body decides, not
+// the owner - does not rebuild while it lies in
 // ragdoll (anim +0x2E8, anim = app +0x138) or while the main thread is inside the engine's ragdoll pass (the K2 detour on
 // ThreadSafeRagdollUpdates counts the depth: the get-up blend's last update reaches AppearanceBase::update from inside the
 // pass, and a rebuild there deletes the running blend and leaves it reading the destroyed node). coopbody::CopyBodyDecide
@@ -811,20 +812,22 @@ static void P091ReportLine()
 // PROBE-END: P091
 
 // crash2: the guard's reads. POD only - no C++ object with a destructor in a frame with __try (C2712). MAIN THREAD.
-struct CopyBodyRead { unsigned int uid; int copy; int entity; int ragdoll; int fault; };
+struct CopyBodyRead { unsigned int uid; int replicated; int owned; int entity; int ragdoll; int fault; };
 
 static void CopyBodyReadPod(void* app, CopyBodyRead* r)
 {
-    r->uid = 0; r->copy = 0; r->entity = 0; r->ragdoll = 0; r->fault = 0;
+    r->uid = 0; r->replicated = 0; r->owned = 0; r->entity = 0; r->ragdoll = 0; r->fault = 0;
     __try
     {
         if (app == 0) { r->fault = 1; return; }
         ::Character* c = *(::Character**)((char*)app + kCopyBodyAppCharOff);
         const unsigned int uid = FindSpawnedUid(c);
         r->uid = uid;
-        // the copy test the knockdown gates use (PuppetKoAllowed): a replicated uid this game does not own
-        if (uid == 0 || net::IsUidMineAnyThread(uid)) return;
-        r->copy = 1;
+        // uid 0: a character the mod never replicated (a game's own creature the mod never touched) or a retired row - never held.
+        // Every replicated uid has its body read, whoever owns it now: an owner change does not end a ragdoll.
+        if (uid == 0) return;
+        r->replicated = 1;
+        r->owned = net::IsUidMineAnyThread(uid) ? 1 : 0;
         r->entity = (*(void**)((char*)app + kAppearanceEntOff) != 0) ? 1 : 0;
         if (r->entity == 0) return;   // manager fold: no old body = nothing destroyed, so a first build (anim not read) never waits
         void* anim = *(void**)((char*)app + kAppearanceAnimOff);
@@ -835,9 +838,37 @@ static void CopyBodyReadPod(void* app, CopyBodyRead* r)
 }
 
 // MAIN THREAD only: the uids whose rebuild is deferred now (the episode), and every uid ever deferred.
-struct CopyBodyEpisode { DWORD since; long calls; bool longLogged; };
+struct CopyBodyEpisode { DWORD since; long calls; bool longLogged; bool ownedSeen; };
 static std::map<unsigned int, CopyBodyEpisode> g_copyBodyEpisodes;
 static std::map<unsigned int, char> g_copyBodyUidsEver;
+// The uids whose body rebuild the MOD queued (a look, kit or limb apply left +0x143 set on a replicated
+// character) and whose createBody has not run since. The guard holds such a rebuild as it holds a carried-over one
+// (heldBefore), so a rebuild queued on a copy that becomes this game's own before its createBody comes (an area hand-over, a
+// RELEASE adopt, a hire) is still held while the body lies in ragdoll - without the mark the guard read "owned, no hold" and
+// ran it on the ragdolled body (F986). Cleared when the guard lets that uid's createBody run, when the uid is forgotten, and at
+// a world load / teardown. MAIN THREAD.
+static std::map<unsigned int, char> g_copyBodyModQueued;
+static LONG g_copyBodyModMarks = 0;                      // marks placed (main thread)
+static volatile LONG g_copyBodyModMarkOffMain = 0;       // mark requests off the main thread: not placed (expected 0)
+// createBody calls the guard RAN for a body this game owns, with a body, lying in ragdoll or inside the ragdoll pass, with no
+// hold and no mod mark: the engine's own rebuilds of an owned body in the crash's state (are there any at all?). MAIN THREAD.
+static LONG g_copyBodyOwnedRanInRagdoll = 0;
+static LONG g_copyBodyOwnedRanLines = 0;
+static const LONG kCopyBodyOwnedRanLineCap = 10;
+
+// Holds (episodes, both classes) in which the guard held a body this game owns at that call - once per episode, also when the
+// uid became this game's own while already held (an area hand-over). The first kCopyBodyOwnedLineCap are written. MAIN THREAD.
+static volatile LONG g_copyBodyHeldOwned = 0;
+static LONG g_copyBodyOwnedLines = 0;
+static const LONG kCopyBodyOwnedLineCap = 20;
+static void CopyBodyHeldOwnedNote(unsigned int uid, const char* cls, const char* why, CopyBodyEpisode* ep)
+{
+    ep->ownedSeen = true;
+    ::InterlockedIncrement(&g_copyBodyHeldOwned);
+    if (g_copyBodyOwnedLines >= kCopyBodyOwnedLineCap) return;
+    ++g_copyBodyOwnedLines;
+    DebugLog("[COPY] body rebuild of uid=" + S((long long)uid) + " held while this game owns it: " + why + cls);
+}
 
 // T-293 fold 2 (F2-A): the uids of the episode map (the copies whose createBody the guard holds now), mirrored for ANY thread -
 // the knockout / death gates run on engine threads and the maps are main-thread only. One writer (the main thread); a slot
@@ -891,6 +922,7 @@ static void CopyBodyForgetUid(unsigned int uid)
 {
     g_copyBodyEpisodes.erase(uid);
     g_copyBodyUidsEver.erase(uid);
+    g_copyBodyModQueued.erase(uid);   // a rebuild the mod queued on the gone body is gone with it
     CopyBodyHeldRemove(uid);
 }
 
@@ -899,6 +931,7 @@ static void CopyBodyForgetAll()
 {
     g_copyBodyEpisodes.clear();
     g_copyBodyUidsEver.clear();
+    g_copyBodyModQueued.clear();   // the mod's queued-rebuild marks describe the old world's bodies
     for (int i = 0; i < kCopyBodyHeldSlots; ++i) ::InterlockedExchange(&g_copyBodyHeldUid[i], 0);
 }
 
@@ -909,6 +942,15 @@ static void CopyBodyWorldCheck()
     if (gen == g_copyBodyMapsGen) return;
     CopyBodyForgetAll();
     g_copyBodyMapsGen = gen;
+}
+
+// MAIN THREAD. the mod has just queued a body rebuild on `uid` - marked until that uid's createBody runs. The
+// world check comes first, so a mark placed early in a new world is not wiped by the guard's first check of that world.
+static void CopyBodyModMark(unsigned int uid)
+{
+    if (uid == 0) return;
+    CopyBodyWorldCheck();
+    if (g_copyBodyModQueued.insert(std::make_pair(uid, (char)1)).second) ++g_copyBodyModMarks;
 }
 
 // bodytest pending <copyUid> - TEST-ONLY lever on the game that holds the COPY: it forces the window in which a copy's queued
@@ -1037,6 +1079,7 @@ static void BodyTestPassBefore()
     BodyTestReadPod(c, &r);
     if (r.ok == 0 || r.blend == 0 || r.running == 0 || r.pending != 0) return;
     if (BodyTestWritePendingPod(r.app, 1) == 0) return;
+    CopyBodyModMark(g_bodyTestUid);   // the lever queued this rebuild - held as the mod's own if the uid changes owner first
     g_bodyTestSetThisPass = true;
     if (++g_bodyTestPassesSet == 1)
         DebugLog("[BODYTEST] pending (TEST) uid=" + S((long long)g_bodyTestUid) + " set +0x143 at a pass start: the get-up blend"
@@ -1106,14 +1149,35 @@ static bool AnimalBodyMustWait(void* app, int human)
     const DWORD now = ::GetTickCount();
     std::map<unsigned int, CopyBodyEpisode>::iterator e = (r.uid != 0) ? g_copyBodyEpisodes.find(r.uid) : g_copyBodyEpisodes.end();
     const bool inEpisode = (e != g_copyBodyEpisodes.end());
-    if (coopbody::CopyBodyDecide(1, r.copy, r.entity, r.ragdoll, inPass, r.fault) == coopbody::kCopyBodyRun)
+    std::map<unsigned int, char>::iterator mk = (r.uid != 0) ? g_copyBodyModQueued.find(r.uid) : g_copyBodyModQueued.end();
+    const bool modMarked = (mk != g_copyBodyModQueued.end());
+    // held before = an open hold for this uid, or a rebuild the mod queued that has not run yet - whoever owns the
+    // uid now, so a rebuild queued on a copy that became this game's own before this call still waits out the ragdoll
+    const int heldBefore = (inEpisode || modMarked) ? 1 : 0;
+    if (coopbody::CopyBodyDecide(1, r.replicated, r.owned, heldBefore, r.entity, r.ragdoll, inPass, r.fault) == coopbody::kCopyBodyRun)
     {
-        if (!inEpisode) return false;
+        if (modMarked) g_copyBodyModQueued.erase(mk);   // the rebuild the mod queued runs now
+        if (!inEpisode)
+        {
+            if (!modMarked && r.owned != 0 && r.fault == 0 && r.entity != 0 && (r.ragdoll != 0 || inPass != 0))
+            {
+                ++g_copyBodyOwnedRanInRagdoll;
+                if (g_copyBodyOwnedRanLines < kCopyBodyOwnedRanLineCap)
+                {
+                    ++g_copyBodyOwnedRanLines;
+                    DebugLog("[COPY] body rebuild of uid=" + S((long long)r.uid) + cls + " RAN on a body this game owns "
+                             + (r.ragdoll != 0 ? "lying in ragdoll" : "inside the engine's ragdoll pass")
+                             + " - no hold, no mod mark: the engine queued it (ownedRanInRagdoll="
+                             + S((long long)g_copyBodyOwnedRanInRagdoll) + ")");
+                }
+            }
+            return false;
+        }
         ::InterlockedIncrement(cResumed);
         if (g_copyBodyLines < kCopyBodyLineCap)
         {
             ++g_copyBodyLines;
-            DebugLog("[COPY] body rebuild of copy uid=" + S((long long)r.uid) + cls + " rebuilt after deferral (ms="
+            DebugLog("[COPY] body rebuild of uid=" + S((long long)r.uid) + cls + " rebuilt after deferral (ms="
                      + S((long long)(DWORD)(now - e->second.since)) + " deferredCalls=" + S((long long)e->second.calls) + ")");
         }
         CopyBodyHeldRemove(r.uid);
@@ -1129,25 +1193,28 @@ static bool AnimalBodyMustWait(void* app, int human)
     if (inEpisode)
     {
         ++e->second.calls;
+        if (r.owned != 0 && !e->second.ownedSeen) CopyBodyHeldOwnedNote(r.uid, cls, why, &e->second);
         if (!e->second.longLogged && (DWORD)(now - e->second.since) >= kCopyBodyLongHoldMs)
         {
             e->second.longLogged = true;
             ::InterlockedIncrement(byPass ? &g_copyBodyLongHolds : &g_copyBodyLongHoldsLimp);
-            DebugLog("[COPY] body rebuild of copy uid=" + S((long long)r.uid) + cls + " still deferred after "
+            DebugLog("[COPY] body rebuild of uid=" + S((long long)r.uid) + cls + " still deferred after "
                      + S((long long)(DWORD)(now - e->second.since)) + " ms: " + why + " (deferredCalls="
                      + S((long long)e->second.calls) + ")");
         }
         return true;
     }
     if (g_copyBodyUidsEver.insert(std::make_pair(r.uid, (char)1)).second) ::InterlockedIncrement(cDeferredUids);
-    CopyBodyEpisode ep; ep.since = now; ep.calls = 1; ep.longLogged = false;
+    CopyBodyEpisode ep; ep.since = now; ep.calls = 1; ep.longLogged = false; ep.ownedSeen = false;
     g_copyBodyEpisodes[r.uid] = ep;
+    // a body this game owns opens a hold here only with a rebuild the mod queued (heldBefore from the mark)
+    if (r.owned != 0) CopyBodyHeldOwnedNote(r.uid, cls, why, &g_copyBodyEpisodes[r.uid]);
     CopyBodyHeldAdd(r.uid);   // the gates' any-thread view of the episode
     if (byPass) ::InterlockedIncrement(&g_copyBodyPassEpisodes);
     if (g_copyBodyLines < kCopyBodyLineCap)
     {
         ++g_copyBodyLines;
-        DebugLog("[COPY] body rebuild of copy uid=" + S((long long)r.uid) + cls + " deferred: " + why
+        DebugLog("[COPY] body rebuild of uid=" + S((long long)r.uid) + cls + " deferred: " + why
                  + " - the engine retries each update");
     }
     return true;
@@ -1171,7 +1238,7 @@ static int CopyBodyHeldNowPod(::Character* c, int needRagdoll)
         CopyBodyRead r;
         CopyBodyReadPod(app, &r);
         if (r.fault != 0 || r.uid == 0) return 0;
-        if (r.copy == 0 || r.entity == 0) return 0;
+        if (r.replicated == 0 || r.owned != 0 || r.entity == 0) return 0;   // the gates ask about copies only (their old answer)
         if (needRagdoll != 0 && r.ragdoll == 0) return 0;
         return CopyBodyHeldHas(r.uid);
     }
@@ -1815,6 +1882,24 @@ void DeadlookForgetCopy(unsigned int uid)
     CopyBodyForgetUid(uid);   // T-293 fold 2 (F3-b): the createBody guard's marks describe this copy only
 }
 
+// MAIN THREAD (spawn.cpp RepeatSpawnAct, a stale copy made again): the new body has had no owner's record applied - the old
+// body's mark goes, so its clothing waits for its own APPEARANCE as a fresh copy's does.
+void AppearanceForgetCopyBody(unsigned int uid)
+{
+    g_appearanceDone.erase(uid);
+}
+
+// MAIN THREAD (off it: counted, never marked). The mod has just made an apply that may queue a body rebuild on
+// `uid` (a look, kit or limb apply): when the rebuild-pending byte (+0x143) reads set now - or cannot be read - the uid is
+// marked, so the createBody guard holds that rebuild in ragdoll even if the uid becomes this game's own before it runs.
+void CopyBodyNoteModApply(unsigned int uid, ::Character* c)
+{
+    const unsigned long m = StoreMainThreadId();
+    if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) { ::InterlockedIncrement(&g_copyBodyModMarkOffMain); return; }
+    if (uid == 0 || c == 0) return;
+    if (CreateBodyPendingPod(c) != 0) CopyBodyModMark(uid);
+}
+
 // MAIN THREAD (spawn.cpp SpawnWorldTeardown): the marks above, for every copy at once - the world's copies all go with it.
 void DeadlookForgetAllCopies()
 {
@@ -2283,14 +2368,16 @@ static void LookTestTick()
     const DWORD now = P10Now();
     int ragdoll = 0, fault = 0;
     OwnBodyHoldPod(c, &ragdoll, &fault);
-    if (coopbody::CopyBodyDecide(1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) return;   // the tick is outside the pass
-    // The guard does not cover this game's own character: a rebuild queued while its get-up blend runs could meet the blend's
-    // last update inside the next ragdoll pass, so the own apply also waits for the blend to end.
+    if (coopbody::CopyBodyDecide(1, 1, 1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) return;   // the tick is outside the pass
+    // The guard holds this game's own character's rebuild only when the mod queued it (this apply marks it below) or a hold
+    // carried over, and then only in ragdoll and inside the ragdoll pass: a rebuild queued while its get-up blend runs would be
+    // held until the blend ends, so the own apply also waits for the blend to end.
     BodyTestRead br;
     BodyTestReadPod(c, &br);
     if (br.ok == 0 || (br.blend != 0 && br.running != 0)) return;
     if (CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0)) return;
     const bool ok = ApplyAppearanceRecord(c, g_lookTestRec);
+    CopyBodyNoteModApply(g_lookTestUid, c);   // a rebuild this apply queued is held in ragdoll
     if (ok) ::InterlockedIncrement(&g_lookTestSelfApplied);
     DebugLog("[LOOK] looktest own apply (TEST) uid=" + S((long long)g_lookTestUid) + " waitedMs="
              + S((long long)(DWORD)(now - g_lookTestAt)) + (ok ? " applied" : " FAILED") + " calls,sent,selfApplied="
@@ -2353,15 +2440,16 @@ static void P10LeverTick()
         if (d > g_p10RangeSq) continue;
         CopyBodyRead r;
         CopyBodyReadPod(GetAppearance(c), &r);
-        if (r.copy == 0 || r.entity == 0 || r.ragdoll == 0 || r.fault != 0) continue;   // the guard's ragdoll hold
+        if (r.replicated == 0 || r.owned != 0 || r.entity == 0 || r.ragdoll == 0 || r.fault != 0) continue;   // the guard's ragdoll hold, on a copy
         P10Down dn;
         P10DownPod(c, &dn);
         const int called = ReassertAppearanceData(c);
+        CopyBodyNoteModApply(u, c);   // the lever queued this rebuild (TEST)
         const int pending = CreateBodyPendingPod(c);
         ::InterlockedIncrement(&g_p10Requests);
         DebugLog("[P10] lever bodydown createBody requested on animal copy uid=" + S((long long)u) + " atM=" + P10M(d)
                  + " animalVt=" + Hex((unsigned long long)avt) + P10DownLine(c, dn)
-                 + " guardRead[copy,entity,ragdoll,fault]=" + S((long long)r.copy) + "," + S((long long)r.entity) + ","
+                 + " guardRead[copy,entity,ragdoll,fault]=" + S((long long)((r.replicated != 0 && r.owned == 0) ? 1 : 0)) + "," + S((long long)r.entity) + ","
                  + S((long long)r.ragdoll) + "," + S((long long)r.fault)
                  + " setAppearanceData=" + S((long long)called) + " pending143=" + S((long long)pending) + P10GuardCounts());
         if (called == 1) { g_p10FiredUid = u; g_p10FiredAt = now; }
@@ -2446,12 +2534,14 @@ static void OwnLookTick()
         int ragdoll = 0, fault = 0;
         OwnBodyHoldPod(c, &ragdoll, &fault);
         BodyTestRead br;
-        if (coopbody::CopyBodyDecide(1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) { ++it; continue; }
+        if (coopbody::CopyBodyDecide(1, 1, 1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) { ++it; continue; }
         BodyTestReadPod(c, &br);
         if (br.ok == 0 || (br.blend != 0 && br.running != 0)) { ++it; continue; }
         if (CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0)) { ++it; continue; }
         int r = 4;
-        if (ApplyAppearanceRecord(c, it->second.rec))
+        const bool applied = ApplyAppearanceRecord(c, it->second.rec);
+        CopyBodyNoteModApply(uid, c);   // a rebuild this apply queued is held in ragdoll
+        if (applied)
         {
             r = net::SendAppearance(uid, it->second.rec) ? 1 : 2;
             GarmentSet worn;
@@ -2577,6 +2667,7 @@ void AppearanceTick()
 
             std::string before = AppearanceString(c);
             bool ok = ApplyAppearanceRecord(c, it->second);
+            CopyBodyNoteModApply(uid, c);   // held in ragdoll even if the uid becomes this game's own first
             if (ok) { ++g_c.applied; g_appearanceDone[uid] = true; g_copyLookApplied[uid] = true; }
             else    ++g_c.applyFailed;
             if (ok && lookKoThrough)
@@ -2733,6 +2824,7 @@ void ApplyPendingGarments()
         std::string before = GearString(c);
         // deadlook1 fold 1: a dead copy gets its WORN slots only (clothing.cpp ApplyWornGarments); everything else stays.
         bool ok = deadApply ? ApplyWornGarments(c, it->second) : ApplyGarments(c, it->second);
+        CopyBodyNoteModApply(uid, c);   // a rebuild the kit apply queued is held in ragdoll whoever owns it
         if (deadApply && ok)
         {
             ++g_deadClothingApplied;
@@ -2850,10 +2942,16 @@ void ReportAppearanceCounters()
              + S(g_deadClothingApplied) + "," + S(g_deadLooted) + "," + S(g_deadAnimalHeld)
              + "," + S(g_deadNotHuman) + "," + S(g_deadCarriedHeld) + "," + S(g_deadRebuildQueued)
              // crash2: animal copy createBody calls skipped in ragdoll (per call / distinct uids), deferred uids later
-             // rebuilt, calls off the main thread (never skipped), skips because a read faulted.
-             + " copyBody[deferred,deferredUids,resumed,offMain,readFault]="
+             // rebuilt, calls off the main thread (never skipped), skips because a read faulted; holds of a body this game
+             // owns (both classes, once per hold - also one that became this game's own while held).
+             + " copyBody[deferred,deferredUids,resumed,offMain,readFault,heldOwned,ownedRanInRagdoll]="
              + S((long long)g_copyBodyDeferred) + "," + S((long long)g_copyBodyDeferredUids) + "," + S((long long)g_copyBodyResumed)
-             + "," + S((long long)g_copyBodyOffMain) + "," + S((long long)g_copyBodyReadFault)
+             + "," + S((long long)g_copyBodyOffMain) + "," + S((long long)g_copyBodyReadFault) + "," + S((long long)g_copyBodyHeldOwned)
+             + "," + S((long long)g_copyBodyOwnedRanInRagdoll)
+             // ownedRanInRagdoll = createBody calls run for an owned body in ragdoll / the pass with no hold and no
+             // mod mark (the engine's own); mod marks placed, marks waiting now, mark requests off the main thread (not placed)
+             + " copyBodyModMark[marks,now,offMain]=" + S((long long)g_copyBodyModMarks) + ","
+             + S((long long)g_copyBodyModQueued.size()) + "," + S((long long)g_copyBodyModMarkOffMain)
              // T-293 fold 1 (review F2): the same for HUMAN copies (AppearanceHuman::createBody), plus that hook (1 on, -1 failed, 0 no row)
              + " copyBodyHuman[deferred,deferredUids,resumed,offMain,readFault,hook]="
              + S((long long)g_copyBodyHumanDeferred) + "," + S((long long)g_copyBodyHumanDeferredUids) + "," + S((long long)g_copyBodyHumanResumed)

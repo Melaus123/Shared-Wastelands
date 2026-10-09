@@ -51,6 +51,18 @@ inline int StateCreateDecide(int have1E, int made22, int copyOk)
     return (have1E && made22 && copyOk) ? 1 : 0;
 }
 
+/* T-632 (T1028 / T1029 / T736): the sleeping position of a squad CreateUnknownSquad built must be its record's position. The
+   Platoon constructor (0x7ED730) stores the position argument at Platoon+0x48 and then loadStateData (0x7EC550:237-247)
+   overwrites it with the state record's vector field "position" (looked up with insert), and Platoon::deactivate (0x7EE910)
+   copies Platoon+0x48 into UnloadedPlatoon+0x64/+0x6C, the only position the wake check (0x7EB390) reads. A squad file's
+   state record carries no "position", so the record's position is written into the 0x22 record before addUnloadedSquad.
+   CreatePosAgrees: 1 when the sleeping x/z is within 1 unit of the record's x/z (a NaN never agrees). */
+inline int CreatePosAgrees(float sleepX, float sleepZ, float recX, float recZ)
+{
+    const float dx = sleepX - recX, dz = sleepZ - recZ;
+    return (dx <= 1.0f && dx >= -1.0f && dz <= 1.0f && dz >= -1.0f) ? 1 : 0;
+}
+
 inline const char* StateActionWord(int a)
 {
     switch (a)

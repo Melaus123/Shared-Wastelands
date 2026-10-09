@@ -25,6 +25,7 @@
 #include "tags.h"   /* tags1: `tags on|off|lift <n>` */
 #include "relations.h"
 #include "playerstab.h"   /* T-545: the TEST-ONLY playerstab lever, [PLAYERS] REPORT */
+#include "chat.h"   /* the TEST-ONLY chat lever */
 #include "peace.h"
 #include "towngen.h"
 #include "../common/recruitmult.h"   /* recruit3: the recruitmult values */
@@ -53,6 +54,7 @@ namespace coop { bool GroundFindLastPick(bool target, float* x, float* z, long l
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls - PathNextToDll's answer is UTF-8 */
 
 #include <fstream>
 #include <sstream>
@@ -83,7 +85,7 @@ std::string Trim(const std::string& s)
 
 void WriteStatus(const std::string& text)
 {
-    std::ofstream f(PathNextToDll(swnames::kStatusFile).c_str(), std::ios::trunc);
+    std::ofstream f(U8W(PathNextToDll(swnames::kStatusFile).c_str()).c_str(), std::ios::trunc);   /* the path is UTF-8: opened through the wide name */
     if (f) f << text << std::endl;
 }
 
@@ -275,13 +277,21 @@ void ReportEverything()
 
 std::string PathNextToDll(const char* filename)
 {
-    char path[MAX_PATH] = {0};
+    /* The DLL's own file name through the wide call, handed back as UTF-8: an install folder holding letters outside the ANSI
+       code page is named exactly, and every caller opens the result through the u8file.h calls. The buffer is on the stack
+       (this runs on every command poll) and holds four times MAX_PATH; an answer of 0 (failed) or the whole buffer (cut short)
+       gives `filename` alone, the answer
+       this always gave when the DLL's file could not be named. */
+    wchar_t path[MAX_PATH * 4];
     HMODULE self = 0;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&PathNextToDll, &self);
-    GetModuleFileNameA(self, path, MAX_PATH);
-    std::string s(path);
+                       (LPCWSTR)&PathNextToDll, &self);
+    const DWORD cap = (DWORD)(sizeof(path) / sizeof(path[0]));
+    const DWORD n = GetModuleFileNameW(self, path, cap);
+    if (n == 0 || n >= cap) return std::string(filename);
+    path[n] = 0;
+    std::string s = U8FromW(path);
     std::string::size_type slash = s.find_last_of("\\/");
     if (slash != std::string::npos) s.erase(slash + 1);
     return s + filename;
@@ -391,7 +401,7 @@ void CommandChannelTick()
 
     // Cheap change detection: only read the file when its write time moves.
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(cmdPath.c_str(), GetFileExInfoStandard, &fad))
+    if (!U8GetFileAttributesEx(cmdPath.c_str(), GetFileExInfoStandard, &fad))
         return;   // no command file - nothing to do
 
     unsigned long long writeTime =
@@ -403,7 +413,7 @@ void CommandChannelTick()
     if (writeTime != g_lastWriteTime)
     {
         g_lastWriteTime = writeTime;
-        std::ifstream f(cmdPath.c_str());
+        std::ifstream f(U8W(cmdPath.c_str()).c_str());   /* the path is UTF-8: opened through the wide name */
         std::string line;
         if (f && std::getline(f, line))
         {
@@ -1040,6 +1050,14 @@ void CommandChannelTick()
         else WriteStatus(coop::KillLever(uid));
         finished = true;
     }
+    else if (verb == "decaysoon")   /* TEST-ONLY: decaysoon <uid> <hours> - that dead body's rot start is set so the game rots it after <hours> in-game hours on this game (own or a copy; medical.cpp DecaySoonLever) */
+    {
+        unsigned int uid = 0;
+        float hours = -1.0f;
+        if (!(is >> uid >> hours) || uid == 0) WriteStatus("error decaysoon: usage decaysoon <uid> <hours>");
+        else WriteStatus(coop::DecaySoonLever(uid, hours));
+        finished = true;
+    }
     else if (verb == "destroybody")   /* T-306 TEST verb: destroybody <uid> - a DEAD character this game owns has its body destroyed through GameWorld::destroy 0x798F50 'eaten', the engine's own call when an animal has eaten a body */
     {
         unsigned int uid = 0;
@@ -1055,6 +1073,11 @@ void CommandChannelTick()
         else if (uid == 0) WriteStatus("error copysquad: usage copysquad <uid> | nearest");
         else WriteStatus(coop::CopySquadLever(uid));
         finished = true;
+    }
+    else if (verb == "townfill")   /* TEST-ONLY verb: townfill force | show - force starts the building-by-building refill of the next town this game holds near its player, without the empty-town verdict and the buildings' home answers; show lists the refills running here (towngen.cpp TownFillLeverImpl) */
+    {
+        std::string a1; is >> a1;
+        WriteStatus(coop::TownFillLever(a1)); finished = true;
     }
     else if (verb == "owedtest")   /* TEST-ONLY verb: owedtest aside on|off | show - while on, this game sets aside every building's residents and bar roll it would make, and its town check-up makes none (towngen.cpp OwedLever); show logs the owed rows as this game sees them */
     {
@@ -1303,6 +1326,17 @@ void CommandChannelTick()
         WriteStatus(coop::UiMenuCommand(rest) ? "ok uimenu" : "error uimenu");
         finished = true;
     }
+    else if (verb == "chat")
+    {
+        // chat open everyone|faction|<slot> | send everyone|faction|<slot> sample <1-4> | fill sample <1-4> | tolist [search <letters>]
+        //      | tab | click <line, 1 = newest> | opacity <0-100> | move <x> <y> <w> <h> | esc | close | state   - TEST-ONLY:
+        // drives the chat window as the keys and clicks do (chat.cpp ChatCommand). It never takes free text - every command is
+        // logged, and chat words never are - only the four fixed sample sentences; a command with more words than its form
+        // is refused.
+        std::string rest; std::getline(is, rest); rest = Trim(rest);
+        WriteStatus(coop::ChatCommand(rest));
+        finished = true;
+    }
     else if (verb == "quitmenu")
     {
         // quitmenu   - E30-3 (P6p) lever: end this game through the GAME'S OWN pause-menu exit, not the
@@ -1316,6 +1350,17 @@ void CommandChannelTick()
         // loudly and with a reason, when the hook is not armed or no world is running.
         WriteStatus("ok quitmenu");
         if (!coop::QuitViaMenu()) WriteStatus("error quitmenu");
+        finished = true;
+    }
+    else if (verb == "uniqueforce")
+    {
+        // uniqueforce <sid> dead|deadsend|alive|clearslot|show   - TEST-ONLY: this game's own unique-state entry for that named character is
+        // written (deadsend also publishes DEAD to the world server, as a death would); clearslot empties its made slot so this game may
+        // make the character again; show reads it, its made slot, whether the record-member filter holds it dead, whether the may-make
+        // check holds it alive in another game, and its living bodies here with each one's owner, its area's runner and the duplicate decision.
+        std::string sid, what; is >> sid >> what;
+        const std::string line = coop::WorldStateForceLocal(sid, what);
+        WriteStatus(line); if (line.compare(0, 3, "ok ") == 0) DebugLog("[UNIQ] " + line);
         finished = true;
     }
     else if (verb == "killnamed")
@@ -1874,7 +1919,8 @@ void CommandChannelTick()
         /* P25 T729: `talktest nearestname <npc name> <targetUid> [event] [copy | mine]` (P25 T729b) - the NPC picked by name when the command runs
            (speech.cpp TalkTestNameArm; waits up to 60 s for it to load) */
         const std::string ta = Trim(arg);
-        const bool byName = (ta == "nearestname" || ta.compare(0, 12, "nearestname ") == 0 || ta.compare(0, 12, "nearestname\t") == 0);
+        const bool byName = (ta == "nearestname" || ta.compare(0, 12, "nearestname ") == 0 || ta.compare(0, 12, "nearestname\t") == 0
+                             || ta == "nearestfaction" || ta.compare(0, 15, "nearestfaction ") == 0 || ta.compare(0, 15, "nearestfaction\t") == 0);   /* nearestfaction: the same pick by faction name */
         WriteStatus(byName ? coop::TalkTestNameArm(ta) : coop::TalkTestArm(ta)); finished = true;
     }
     else if (verb == "talksight")
@@ -1975,11 +2021,11 @@ void CommandChannelTick()
     }
     else if (verb == "buildings") { WriteStatus(coop::BuildingsCommand()); finished = true; }
     else if (verb == "towns") { WriteStatus(coop::TownsCommand()); finished = true; }
-    else if (verb == "pendnote")   /* TEST-ONLY verb (T-580): pendnote add <townSid> <x> <z> | clear | show <townSid> <x> <z> - a test note of a town at a world position in decision 34's pending set (store.cpp StorePendNoteCommand) */
+    else if (verb == "pendnote")   /* TEST-ONLY verb (T-580): pendnote add <townSid> <x> <z> [stale|asleep] | clear | show <townSid> <x> <z> - a test note of a town at a world position in decision 34's pending set (store.cpp StorePendNoteCommand) */
     {
-        std::string op, town; float x = 0.0f, z = 0.0f; is >> op;
+        std::string op, town, kind; float x = 0.0f, z = 0.0f; is >> op;
         if (op != "clear" && !(is >> town >> x >> z)) WriteStatus("error pendnote: add / show need <townSid> <x> <z> (numbers) - nothing added");
-        else WriteStatus(coop::StorePendNoteCommand(op, town, x, z));
+        else { if (op == "add") is >> kind; WriteStatus(coop::StorePendNoteCommand(op, town, x, z, kind)); }
         finished = true;
     }
     else if (verb == "townlist") { WriteStatus(coop::TownListCommand()); finished = true; }   // towns1: read-only, every town with name and position
@@ -2002,6 +2048,28 @@ void CommandChannelTick()
         // sends the owner MSG_PRISON IN as for a guard's caging. [ARREST] cagetest lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::CageTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "treattest")
+    {
+        // treattest <copyUid> <part|all> <bandage 0..1>   - TEST-ONLY lever (spawn.cpp TreatTestCommand): the other game's character's
+        // copy's bandage values are raised at the K2 safe point as a medic's work does; TreatTick then sends the owner MSG_TREAT.
+        // [HEAL] treattest lines.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::TreatTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "bailtest")
+    {
+        // bailtest <copyUid>   - TEST-ONLY lever (spawn.cpp BailTestCommand): the bail confirm's own steps for one caged copy of
+        // another game's character at the K2 safe point (no money taken), then its owner is told as after a real bail. [PRISON] lines.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BailTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "slavetest")
+    {
+        // slavetest <uid> <state 0..3>   - TEST-ONLY lever (spawn.cpp SlaveTestCommand): the engine's setSlaveState on that
+        // character as a task would call it; on a copy the owner is asked when this game runs its area. [SLAVE] lines.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::SlaveTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "locktest")
     {
@@ -2047,17 +2115,44 @@ void CommandChannelTick()
     }
     else if (verb == "speedvote")
     {
-        // speedvote <0|1|2|5> - E40 / decision 45. This player's OWN setting, as a vote. Under `timemode
+        // speedvote <speed> - E40 / decision 45. This player's OWN setting, as a vote: 0 pauses, any pace up to
+        // coopclock::kClockSpeedMax (the buttons' 1, 2, 5, or a speed mod's 3, 10 ...) is accepted. Under `timemode
         // consensus` the slowest vote wins and 0 pauses the whole world; under `timemode fixed` only the host's
         // vote counts and a client's is recorded and ignored. It does NOT set this game's speed - the notebook's
         // broadcast does that, on every game at once - so `speedvote 0` followed by a report is how a run
         // measures a deliberate pause without a human touching the keyboard (the engine ignores injected input,
         // F010, so there is no other way to press the key).
         std::string n; is >> n;
-        if (n.empty()) WriteStatus("error speedvote: 0|1|2|5");
-        else if (n != "0" && n != "1" && n != "2" && n != "5") WriteStatus("error speedvote: 0|1|2|5 (the four speeds the game's own buttons set)");
-        else if (!coop::SpeedVoteCommand((float)atof(n.c_str()))) WriteStatus("error speedvote: refused");
+        if (n.empty()) WriteStatus("error speedvote: <speed> (0 = pause, up to 50)");
+        else if (!coop::SpeedVoteCommand((float)atof(n.c_str()))) WriteStatus("error speedvote: refused (0 = pause, or a pace above 0 up to 50)");
         else WriteStatus(std::string("ok speedvote ") + n);
+        finished = true;
+    }
+    else if (verb == "gamespeed")
+    {
+        // gamespeed <x> - a test-only lever. Writes x straight into the engine's speed global, as a speed mod's own
+        // code does: no button, no key, no setter call, no vote. The mod's clock tick then sees a change it did not
+        // make and takes it as this player's vote. x is any number 0..1000, so a run can also write a speed the mod
+        // refuses (above 50). `gamespeed sweep <from> <to> <step> <everyMs>` repeats the write from the clock tick every
+        // everyMs (16..5000) from `from` to `to`, at most 100 writes - a speed mod's slider.
+        std::string n; is >> n;
+        if (n == "sweep")
+        {
+            float a = -1.0f, z = -1.0f, st = 0.0f; unsigned int ms = 0;
+            is >> a >> z >> st >> ms;
+            const float steps = (st != 0.0f) ? (z - a) / st : -1.0f;
+            if (!(a >= 0.0f && a <= 1000.0f && z >= 0.0f && z <= 1000.0f) || !(steps >= 0.0f && steps <= 99.0f) || ms < 16 || ms > 5000)
+                WriteStatus("error gamespeed sweep: <from 0..1000> <to 0..1000> <step towards to> <everyMs 16..5000>, at most 100 writes");
+            else if (coop::GameSpeedTestSweep(a, z, st, ms) != 0) WriteStatus("error gamespeed: no speed global on this build");
+            else WriteStatus("ok gamespeed sweep");
+            finished = true;
+        }
+        const float x = n.empty() ? -1.0f : (float)atof(n.c_str());
+        float was = -1.0f; int rc = 0;
+        if (finished) {}
+        else if (n.empty() || !(x >= 0.0f && x <= 1000.0f)) WriteStatus("error gamespeed: <x> (0..1000)");
+        else if ((rc = coop::GameSpeedTestWrite(x, &was)) != 0) WriteStatus(rc == -1 ? "error gamespeed: no speed global on this build" : "error gamespeed: the write faulted");
+        else { std::ostringstream o; o << "ok gamespeed " << n << " was " << was; WriteStatus(o.str()); }
         finished = true;
     }
     else if (verb == "timemode")

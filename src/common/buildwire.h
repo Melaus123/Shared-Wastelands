@@ -37,7 +37,7 @@ const unsigned char kBuildState = 2;     /* build1-c */
 const unsigned char kBuildRemove = 3;    /* build1-d */
 const unsigned char kBuildRosterRequest = 4;
 const unsigned char kBuildHandAck = 5;         /* house1b (protocol 75): the house owner holds a piece handed to it - the key only */   /* build1-f fold (review-build1f H2): the kind byte only */
-const unsigned char kBuildHelpWork = 8;        /* help1 (owner 172, protocol 90): a helper's work on its copy of another player's piece, to the owner's game (6 / 7 are the farm's);
+const unsigned char kBuildHelpWork = 8;        /* help1 (owner 172, protocol 90): a helper's work on its copy of another player's piece, to the owner's game (6 / 7 are the farm's, 10 MINE_OP);
                                                   help1 fold 3 (protocol 95): + a trailing u32 nonce - the owner's placement the work was done on */
 const unsigned char kBuildHelpGone = 9;        /* help1 fold (review MED 3, protocol 91): the owner's answer to work for a piece it no longer holds as its own (removed, dismantled,
                                                   handed, its removed row swept) - key | u32 seq: the helper drops every entry at or below seq and hands their materials back.

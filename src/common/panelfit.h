@@ -258,7 +258,9 @@ inline PanelInnerPad PanelInnerPadOf(int clientW, int clientH)
 enum PanelLayoutId
 {
     kLayLanding = 0, kLayHost = 1, kLayJoin = 2, kLayNewWorld = 3, kLayDeleteWorld = 4, kLayHosting = 5,
-    kLayOptions = 6, kLayProfiles = 7, kLayNewProfile = 8, kLayDeleteProfile = 9, kLayHostHint = 10, kLayJoinHint = 11, kLayCount = 12
+    kLayOptions = 6, kLayProfiles = 7, kLayNewProfile = 8, kLayDeleteProfile = 9, kLayHostHint = 10, kLayJoinHint = 11,
+    kLayHostingVpn = 12,   /* T-631: HOSTING with the RADMIN / HAMACHI ADDRESS row (a game VPN was found) */
+    kLayCount = 13
 };
 /* What a slot holds.  kSlotGap is blank space between groups (the mock-ups' empty lines). */
 enum PanelSlotId
@@ -266,23 +268,27 @@ enum PanelSlotId
     kSlotGap = 0, kSlotNameRow, kSlotNameHint, kSlotHostBtn, kSlotJoinBtn, kSlotList, kSlotListBtns, kSlotPortRow,
     kSlotStatus, kSlotAddrRow, kSlotDlgText, kSlotDlgName, kSlotHomeAddr, kSlotRouterHelp, kSlotPlayers, kSlotTabs,
     kSlotOptRows, kSlotNote, kSlotButtons, kSlotProfRow,  /* T-201 PP6': HOST GAME's PROFILE row, under PORT */
-    kSlotNetAddr                                          /* T-510: HOSTING's INTERNET ADDRESS row, under LOCAL ADDRESS */
+    kSlotNetAddr,                                         /* T-510: HOSTING's INTERNET ADDRESS row, under LOCAL ADDRESS */
+    kSlotVpnAddr                                          /* T-631: HOSTING's RADMIN / HAMACHI ADDRESS row, between the two */
 };
 struct PanelSlot { int slot; int halves; };
 const int kPanelMaxHalves = kPanelRows * 2;
 
 /* The layout a screen shows: the panel's screen number (ui.cpp g_panelScreen: 0 MULTIPLAYER, 1 HOST GAME, 2 JOIN GAME,
    3 NEW WORLD, 4 DELETE WORLD?, 5 HOSTING, 6 GAME OPTIONS, 7 PROFILES) and, on PROFILES, which of its dialogs is up. */
-inline int PanelLayoutOf(int screen, int profDlg, int nameHint = 0)
+inline int PanelLayoutOf(int screen, int profDlg, int nameHint = 0, int vpnRow = 0)
 {
     if (screen == 7) return profDlg == 1 ? kLayNewProfile : profDlg == 2 ? kLayDeleteProfile : kLayProfiles;
     /* T-201 N1b (owner 166): PLAYER NAME is the top row of HOST GAME and JOIN GAME; its hint's row exists only while it has a
        sentence (ui5b's rule, moved with the box).  MULTIPLAYER has no name row now. */
     if (screen == 1) return nameHint != 0 ? kLayHostHint : kLayHost;
     if (screen == 2) return nameHint != 0 ? kLayJoinHint : kLayJoin;
+    if (screen == 5 && vpnRow != 0) return kLayHostingVpn;   /* T-631: HOSTING with its VPN row */
     if (screen >= 3 && screen <= 6) return screen;
     return kLayLanding;
 }
+/* T-631: either HOSTING layout (with or without the VPN row). */
+inline int PanelLayIsHosting(int layout) { return (layout == kLayHosting || layout == kLayHostingVpn) ? 1 : 0; }
 
 /* ui5b - THE PANEL'S TEXT ESTIMATE (ui7: now only the FALLBACK when MyGUI reports no text size).  A status / text area holds one line per HALF-ROW (17 px at 1280x720; the T479 shots
    show Kenshi's body lines about 14 px apart - Inferred from the cropped shots) and wraps at kPanelTextCharW px a character
@@ -328,6 +334,13 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     static const PanelSlot hosting[]  = { { kSlotHomeAddr, 2 }, { kSlotNetAddr, 4 }, { kSlotGap, 1 }, { kSlotRouterHelp, 6 },
                                           { kSlotPlayers, 4 }, { kSlotStatus, 6 }, { kSlotGap, 1 },
                                           { kSlotButtons, 2 } };
+    /* T-631 (owner 570): with a game VPN found, its RADMIN / HAMACHI ADDRESS row (one row, LOCAL ADDRESS's height) between
+       LOCAL ADDRESS and INTERNET ADDRESS.  HOSTING already fills thirteen rows at its ceilings, so the row's two half-rows
+       come off the status area's ceiling here (6 -> 4: its usual lines - the hosting line, a blank, a COPY note - fit 4 at
+       1280x720; the longest set, with the profile line and the port-in-use line, is cut).  Without a VPN nothing moves. */
+    static const PanelSlot hostingVpn[] = { { kSlotHomeAddr, 2 }, { kSlotVpnAddr, 2 }, { kSlotNetAddr, 4 }, { kSlotGap, 1 },
+                                            { kSlotRouterHelp, 6 }, { kSlotPlayers, 4 }, { kSlotStatus, 4 }, { kSlotGap, 1 },
+                                            { kSlotButtons, 2 } };
     static const PanelSlot options[]  = { { kSlotTabs, 2 }, { kSlotGap, 1 }, { kSlotOptRows, 18 }, { kSlotGap, 1 },
                                           { kSlotNote, 2 }, { kSlotButtons, 2 } };
     static const PanelSlot profiles[] = { { kSlotList, 8 }, { kSlotGap, 1 }, { kSlotListBtns, 2 }, { kSlotGap, 1 },
@@ -348,6 +361,7 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     case kLayDeleteProfile: s = delProf;  n = (int)(sizeof(delProf) / sizeof(delProf[0]));   break;
     case kLayHostHint:      s = hostHint; n = (int)(sizeof(hostHint) / sizeof(hostHint[0])); break;   /* T-201 N1b */
     case kLayJoinHint:      s = joinHint; n = (int)(sizeof(joinHint) / sizeof(joinHint[0])); break;   /* T-201 N1b */
+    case kLayHostingVpn:    s = hostingVpn; n = (int)(sizeof(hostingVpn) / sizeof(hostingVpn[0])); break;   /* T-631 */
     default: break;
     }
     if (count != 0) *count = n;

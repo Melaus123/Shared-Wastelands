@@ -48,6 +48,7 @@
 #include "replicate.h"      /* pvp1: AttackLocal - `crimetest attackplayer` */
 #include "coop_log.h"
 #include "game/Character.h"   /* crimetest: Character::getOwnerFactionDirect */
+#include "game/Faction.h"     /* talktest nearestfaction: Faction::getName */
 #include "game/GameWorld.h"   /* rel3 (T317): attacknear walks ou->activeCharacters() */
 #include "game/hand.h"   /* crimetest: the victim's hand, rebuilt locally from its five id fields */
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
@@ -1030,6 +1031,8 @@ std::string TkU(unsigned int v) { char b[16]; std::sprintf(b, "%u", v); return s
 std::string TkI(long long v) { char b[24]; std::sprintf(b, "%lld", v); return std::string(b); }
 std::string TkNameStr(void* c) { char n[48]; TalkName((::Character*)c, n); return std::string(n); }
 
+void TkPurseTalkEnded(unsigned int uid);   /* below, with the purse table */
+
 /* A, MAIN THREAD: end THIS game's side of a forwarded (or not-forwarded) conversation. The mark is kept through the engine's
    endDialogue (so its setInDialog(false) leaves the window alone), then dropped; END goes to the peer when sendReason != 0 and
    the conversation had been forwarded. callEnd 0 = the engine has already ended it. */
@@ -1040,6 +1043,7 @@ void TkEndOwn(void* dlg, void* me, int sendReason, const char* why, int callEnd,
     std::memset(&c, 0, sizeof(c));
     int had = 0;
     if (it != g_tkConvs.end()) { c = it->second; had = 1; g_tkConvs.erase(it); }
+    if (had) TkPurseTalkEnded(c.targetUid);   /* a later talk never judges money replies by this talk's purse */
     if (had && c.engineEnded) callEnd = 0;   /* P26s5 fold 3: the engine already ended it - not again */
     if (me == 0 && had) me = c.me;
     const int i = TkMarkFind(dlg);
@@ -1180,9 +1184,11 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
     }
     TkCancelEndLater(dlg);   /* P26s1 fold 1: the new start replaced a not-forwarded one still waiting to be ended */
     ::InterlockedExchange(&g_tkMarks[mark].gen, g_tkGen);
+    unsigned int oldTarget = 0;   /* the replaced talk's target: its purse goes once this start has ended or replaced it */
     if (old != g_tkConvs.end())
     {
         const TkConv o = old->second;
+        oldTarget = o.targetUid;
         g_tkConvs.erase(old);
         ++g_tkRestarted;
         cooptalk::TalkMsg e;
@@ -1212,7 +1218,13 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
         if (c.convId == 0) c.convId = ++g_tkNextConv;
         built = TkBuildPrompt(dlg, c, ev, &p);
         if (built == 1 && dlg == g_p25StartDlg) p.reqId = g_p25ReqIdNow;   /* P25: the REQUEST this start answers */
-        if (built == 0) { ++g_tkPromptNoReply; TkMarkDrop(mark); TkLog("[TALK] A start toward uid=" + TkU(tuid) + " ended inside the engine (no current line) - nothing to forward"); return; }
+        if (built == 0)
+        {
+            ++g_tkPromptNoReply; TkMarkDrop(mark);
+            if (oldTarget != 0) TkPurseTalkEnded(oldTarget);
+            TkLog("[TALK] A start toward uid=" + TkU(tuid) + " ended inside the engine (no current line) - nothing to forward");
+            return;
+        }
         if (built == -1) why = "the line has no reply the target could give";
         else if (built == -2) why = "the line's string id is unreadable or longer than 128 bytes";
         else if (built == -3) why = "a reply's string id is longer than 128 bytes (the other game could not name it back)";
@@ -1226,6 +1238,7 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
     }
     if (why != 0)
     {
+        if (oldTarget != 0) TkPurseTalkEnded(oldTarget);   /* the replaced talk ended and nothing took its place */
         if (!TkMarkMove(mark, 1))   /* P26s1 fold 2 N5: released (5) / ending (3) - not this start's to keep shut; the safe point finishes it */
         {
             TkLogFail("[TALK] A start npc uid=" + TkU(nuid) + " -> target uid=" + TkU(tuid) + " NOT forwarded: " + why
@@ -1240,6 +1253,7 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
     }
     c.line = SayReadPtr(dlg, kDlgCurLine); c.seq = 1; c.sentTick = ::GetTickCount(); c.ev = p.event;   /* P26 stage 4 */
     g_tkConvs[dlg] = c;
+    if (oldTarget != 0 && oldTarget != c.targetUid) TkPurseTalkEnded(oldTarget);   /* after the new talk is in the table: the replaced target's purse */
     ++g_tkPromptSent;
     std::string rs;
     for (size_t k = 0; k < p.replyIds.size(); ++k) rs += (k ? " | " : "") + p.replyIds[k] + ":'" + p.replyTexts[k].substr(0, 60) + "'";
@@ -1301,6 +1315,24 @@ void TkMirrorClosed(void* dlg, const char* why)
           + (m.answered ? " (after this game's reply - the NPC's game ends its side)" : ""));
 }
 
+/* A character's faction's purse - Faction (+0x10) -> Ownerships (+0x80) -> money (+0x88): hire.cpp MoneyPod's reads (Confirmed
+   there), the object _doActions' TAKE_MONEY / GIVE_MONEY write (67fad0:1636, 1688) and the one the engine's money condition reads
+   for the local player (0x670AA0). 1 read, 0 not. ANY THREAD, no C++ object. */
+int TkPurseMoneyPod(void* c, int* out)
+{
+    if (c == 0) return 0;
+    __try
+    {
+        const char* f = *(const char* const*)((const char*)c + kRootFaction);
+        if (f == 0) return 0;
+        const char* o = *(const char* const*)(f + 0x80);
+        if (o == 0) return 0;
+        *out = *(const int*)(o + 0x88);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 /* B, MAIN THREAD: the player clicked reply `index` in the mirrored window - ANSWER, the engine's own reply is NOT run here. */
 void TkMirrorAnswer(int index)
 {
@@ -1312,6 +1344,11 @@ void TkMirrorAnswer(int index)
     a.kind = cooptalk::kTalkAnswer; a.convId = g_tkMirror.convId; a.npcUid = g_tkMirror.npcUid; a.targetUid = g_tkMirror.targetUid;
     a.result = cooptalk::kTalkAnsReply; a.index = index;
     a.replyId = (index >= 0 && (size_t)index < ids.size()) ? ids[(size_t)index] : std::string();
+    {   /* the talker's purse: the NPC's game judges the next line's money replies by it */
+        int pv = -1;
+        ::Character* const me = FindSpawned(g_tkMirror.targetUid);
+        a.purse = (me != 0 && TkPurseMoneyPod(me, &pv)) ? pv : -1;
+    }
     const int sent = net::SendTalk(a) ? 1 : 0;
     if (sent) { ++g_tkAnsSent; g_tkMirror.answered = 1; }
     TkLog("[TALK] B ANSWER " + std::string(sent ? "sent" : "FAILED (link down)") + " conv=" + TkU(a.convId) + " index=" + TkI(index)
@@ -1755,6 +1792,7 @@ S6GetSpeakerFn orig_s6GetSpeaker = 0;
 int g_s6CondHook = 0, g_s6SpkHook = 0;   /* 1 installed, -1 AddHook FAILED, -2 no table address, 0 not tried */
 int g_s6On = 0;                          /* both hooks and forwarding (g_tkOn) - set once at install */
 const int kS6DcIsPlayer = 0x24;          /* DialogConditionEnum DC_IS_PLAYER */
+const int kS6DcMoney = 2;                /* DialogConditionEnum: the money condition 0x670AA0 answers from THIS game's player's purse */
 const int kS6TalkerTarget = 1, kS6TalkerTargetIfPlayer = 2;   /* TalkerEnum T_TARGET / T_TARGET_IF_PLAYER */
 const int kS6ActTalkToLeader = 2;        /* DialogActionEnum DA_TALK_TO_LEADER (67fad0:1541) */
 const int kS6TaskSeekTalk = 0x66;        /* SEEK_AND_TALK_AND_SEND_SIGNAL: lea r8d, [rbx + 0x64] with rbx = 2 (0x6823F6) */
@@ -1769,6 +1807,112 @@ volatile LONG64 g_s6CondPeer = 0, g_s6CondNotOurs = 0, g_s6SpkPeer = 0, g_s6SpkN
    17, 29, 34, 40, 52 - 67fad0 cases that call issueOrder, Read); viewLead - orders given from the router's NPC-side run. */
 volatile LONG64 g_s6NoUid = 0, g_s6SpkActsRefused = 0, g_s6SpkNoDlg = 0, g_s6LeadLeaderNotOurs = 0, g_s6LeadLeaderNoUid = 0,
                 g_s6LeadFlagFault = 0, g_s6OrderMix = 0, g_s6ViewLead = 0;
+
+/* The other player's purse as its game last reported it (REQUEST, ANSWER REPLY, ACT_RESULT's purse after the act), moved by an ACT's
+   money actions when this game sends it (TkPurseActSent) and dropped when this game's side of the talk ends (TkPurseTalkEnded): the engine's money
+   condition reads only THIS game's player's purse, so an NPC this game drives judges that player's money replies by this table.
+   Written on the MAIN THREAD, read from any thread (detour_s6CheckCond): a slot's uid and purse travel together in one interlocked
+   64-bit value (uid high half, purse low half, 0 = empty); peer and when are main-thread only (when: the slot reused is the oldest). */
+const int kTkPurseSlots = 8;
+struct TkPurseSlot { volatile LONG64 v; unsigned int peer; unsigned long when; };
+TkPurseSlot g_tkPurse[kTkPurseSlots];
+volatile LONG64 g_s6MoneyAnswered = 0, g_s6MoneyNoPurse = 0;
+volatile LONG64 g_s6MoneyDiffers = 0;   /* answers by the talker's purse that differ from the engine's own (this game's player's purse) */
+long long g_tkPurseSet = 0, g_tkPurseCleared = 0;   /* MAIN THREAD */
+long long g_tkPurseActMoved = 0;   /* MAIN THREAD: saved purses moved by an ACT's money actions when it was sent */
+
+/* MAIN THREAD: the uid's purse; purse < 0 (unknown) forgets the uid's value. */
+void TkPurseNote(unsigned int uid, int purse, unsigned int peer)
+{
+    if (uid == 0) return;
+    int at = -1, empty = -1, oldest = 0;
+    for (int i = 0; i < kTkPurseSlots; ++i)
+    {
+        const LONG64 v = ::InterlockedCompareExchange64(&g_tkPurse[i].v, 0, 0);
+        if (v != 0 && (unsigned int)((unsigned long long)v >> 32) == uid) { at = i; break; }
+        if (v == 0 && empty < 0) empty = i;
+        if ((long)(g_tkPurse[i].when - g_tkPurse[oldest].when) < 0) oldest = i;
+    }
+    if (purse < 0)
+    {
+        if (at >= 0) { ::InterlockedExchange64(&g_tkPurse[at].v, 0); ++g_tkPurseCleared; }
+        return;
+    }
+    if (at < 0) at = (empty >= 0) ? empty : oldest;
+    g_tkPurse[at].peer = peer;
+    g_tkPurse[at].when = ::GetTickCount();
+    ::InterlockedExchange64(&g_tkPurse[at].v, (LONG64)(((unsigned long long)uid << 32) | (unsigned long long)(unsigned int)purse));
+    ++g_tkPurseSet;
+}
+
+/* ANY THREAD: 1 and *out = the uid's last reported purse, 0 none. No C++ object. */
+int TkPurseFind(unsigned int uid, int* out)
+{
+    if (uid == 0) return 0;
+    for (int i = 0; i < kTkPurseSlots; ++i)
+    {
+        const LONG64 v = ::InterlockedCompareExchange64(&g_tkPurse[i].v, 0, 0);
+        if (v != 0 && (unsigned int)((unsigned long long)v >> 32) == uid)
+        {
+            *out = (int)(unsigned int)((unsigned long long)v & 0xFFFFFFFFull);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* MAIN THREAD: 1 = a forwarded conversation this game runs is open with the character uid. */
+int TkTalkerInConv(unsigned int uid)
+{
+    if (uid == 0) return 0;
+    for (std::map<void*, TkConv>::const_iterator it = g_tkConvs.begin(); it != g_tkConvs.end(); ++it)
+        if (it->second.targetUid == uid) return 1;
+    return 0;
+}
+
+/* MAIN THREAD: this game's side of a talk with uid ended (or a REQUEST started nothing): its saved purse is dropped unless another
+   conversation with that character is still open here - with no entry the engine's own answer applies. */
+void TkPurseTalkEnded(unsigned int uid)
+{
+    if (uid == 0 || TkTalkerInConv(uid)) return;
+    TkPurseNote(uid, -1, 0);
+}
+
+/* MAIN THREAD: an ACT with money actions just went to the talker's game, which applies them before its window shows the next line,
+   while this game's engine may choose that line's money replies before the ACT_RESULT comes back: the talker's saved purse moves
+   by the line's money now (TalkPurseAfterAct); the ACT_RESULT's purse after the act replaces it. Only a saved purse is moved.
+   1 moved (*before / *after), 0 not. */
+int TkPurseActSent(unsigned int uid, const std::vector<int>& types, const std::vector<int>& values, int* before, int* after)
+{
+    if (uid == 0) return 0;
+    for (int i = 0; i < kTkPurseSlots; ++i)
+    {
+        const LONG64 v = ::InterlockedCompareExchange64(&g_tkPurse[i].v, 0, 0);
+        if (v == 0 || (unsigned int)((unsigned long long)v >> 32) != uid) continue;
+        *before = (int)(unsigned int)((unsigned long long)v & 0xFFFFFFFFull);
+        *after = cooptalk::TalkPurseAfterAct(*before, types, values);
+        if (*after == *before) return 0;
+        TkPurseNote(uid, *after, g_tkPurse[i].peer);
+        ++g_tkPurseActMoved;
+        return 1;
+    }
+    return 0;
+}
+
+/* A reply-list mismatch's two id lists, for the first kTkIdsLogCap mismatches (then nothing). MAIN THREAD. */
+const int kTkIdsLogCap = 16;
+int g_tkIdsLogged = 0;
+std::string TkIdsMismatch(const std::vector<std::string>& here, const std::vector<std::string>& prompt)
+{
+    if (g_tkIdsLogged >= kTkIdsLogCap) return std::string();
+    ++g_tkIdsLogged;
+    std::string s = "; ids here [";
+    for (size_t k = 0; k < here.size(); ++k) { if (k) s += ","; s += here[k]; }
+    s += "] in the PROMPT [";
+    for (size_t k = 0; k < prompt.size(); ++k) { if (k) s += ","; s += prompt[k]; }
+    s += "]";
+    return s;
+}
 
 /* P26s6: 1 = the Dialogue's speaker (+0x150) is a replicated character THIS game drives. ANY THREAD: one guarded read, the uid index
    (FindSpawnedUid - address compares, spawn.h) and net::IsUidMineAnyThread (the owned mirror; "not mine" while it may miss a uid -
@@ -1801,11 +1945,38 @@ int TkS6LineHasActs(const void* line)
     __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
 }
 
-/* P26s6 S6-1 (any thread, hot): the original always runs with the same arguments; only DC_IS_PLAYER toward the other player's
-   character, asked by an NPC this game drives, is answered as for a player. */
+/* The money condition toward the other player's character (the conversation target first, then the target), asked by an NPC this
+   game drives: answered with that player's purse as its game last reported it (TkPurseFind); none reported = the engine's answer.
+   ANY THREAD: guarded reads, the uid index, the interlocked table, Interlocked counters. No C++ object. */
+bool TkS6MoneyCond(void* dlg, int cmp, int val, void* target, void* convTarget, bool engine)
+{
+    void* const who = TkPeerTarget(convTarget) ? convTarget : (TkPeerTarget(target) ? target : 0);
+    if (who == 0 || TkS6NpcOurs(dlg) != 1) return engine;
+    const unsigned int uid = FindSpawnedUid(who);
+    int purse = -1;
+    if (!TkPurseFind(uid, &purse)) { ::InterlockedIncrement64(&g_s6MoneyNoPurse); return engine; }
+    ::InterlockedIncrement64(&g_s6MoneyAnswered);
+    const bool ans = cooptalk::TalkMoneyCond(cmp, val, purse);
+    if (ans != engine)
+    {   /* the first 20, then every 100th; DebugLog takes the log's own lock, so a line from any thread is safe */
+        const LONG64 n = ::InterlockedIncrement64(&g_s6MoneyDiffers);
+        if (n <= 20 || n % 100 == 0)
+        {
+            char b[160];
+            std::sprintf(b, "[TALK] money check uid=%u price=%d purse=%d engine=%d answered=%d", uid, val, purse, engine ? 1 : 0, ans ? 1 : 0);
+            DebugLog(b);
+        }
+    }
+    return ans;
+}
+
+/* P26s6 S6-1 (any thread, hot): the original always runs with the same arguments; two conditions asked by an NPC this game drives
+   toward the other player's character are answered for that player: DC_IS_PLAYER (as for a player) and the money condition (by
+   that player's saved purse, TkS6MoneyCond). */
 bool detour_s6CheckCond(void* dlg, int cond, int cmp, int val, void* target, void* convTarget)
 {
     const bool r = orig_s6CheckCond(dlg, cond, cmp, val, target, convTarget);
+    if (cond == kS6DcMoney && g_s6On) return TkS6MoneyCond(dlg, cmp, val, target, convTarget, r);
     if (cond != kS6DcIsPlayer || !g_s6On || !TkPeerTarget(target)) return r;
     const int own = TkS6NpcOurs(dlg);   /* P26s6 fold 1: -1 no uid, counted apart */
     if (own != 1) { ::InterlockedIncrement64(own < 0 ? &g_s6NoUid : &g_s6CondNotOurs); return r; }
@@ -2470,7 +2641,7 @@ static void TkApplyNextPrompt(const cooptalk::TalkMsg& m, unsigned int peer)
                       + (win == 0 ? "no conversation" : "another conversation") + ")";
             else if (nids != m.replyIds)
                 why = "the window's reply ids are not the PROMPT's (" + TkI((long long)nids.size()) + " here, "
-                      + TkI((long long)m.replyIds.size()) + " in the PROMPT)";
+                      + TkI((long long)m.replyIds.size()) + " in the PROMPT" + TkIdsMismatch(nids, m.replyIds) + ")";
         }
         g_tkApplyDlg = 0;
     }
@@ -2644,7 +2815,8 @@ static void TkApplyPrompt(const cooptalk::TalkMsg& m, unsigned int peer)
     ++g_tkShown;
     TkLog("[TALK] B PROMPT shown conv=" + TkU(m.convId) + " npc uid=" + TkU(m.npcUid) + " '" + TkNameStr(npc) + "' -> my uid="
           + TkU(m.targetUid) + " '" + TkNameStr(tgt) + "' line=" + m.lineSid + " sameLine=" + TkI(sameLine) + " replies=" + TkI(replies)
-          + " (prompt " + TkI((long long)m.replyIds.size()) + ") idsMatch=" + TkI(idsMatch) + " - this game's own dialogue window is open");
+          + " (prompt " + TkI((long long)m.replyIds.size()) + ") idsMatch=" + TkI(idsMatch) + " - this game's own dialogue window is open"
+          + (idsMatch ? std::string() : TkIdsMismatch(ids, m.replyIds)));
 }
 
 /* P26 stage 4: A, after replyClicked returned - the engine's next line goes out as the next PROMPT (same convId), or this side ends.
@@ -2794,6 +2966,7 @@ static void TkApplyAnswer(const cooptalk::TalkMsg& m, unsigned int peer)
         TkEndOwn(dlg, c.me, cooptalk::kTalkEndNotForwardable, why, 1);
         return;
     }
+    TkPurseNote(c.targetUid, m.purse, peer);   /* the next line's money replies are judged by the talker's purse */
     TkLog(head + " - applied through the engine's replyClicked (the NPC answers as for a local player)");
     g_tkApplyA = dlg;
     const int called = TkApplyReplyPod(fn, dlg, mapped);
@@ -2876,23 +3049,6 @@ static std::string TkGdSid(const void* gd)
     char b[cooptalk::kTalkMaxId + 1];
     const int n = TkGdSidPod(gd, b, (int)cooptalk::kTalkMaxId);
     return n > 0 ? std::string(b, (size_t)n) : std::string();
-}
-
-/* P26 stage 5: a character's faction's purse - Faction (+0x10) -> Ownerships (+0x80) -> money (+0x88): hire.cpp MoneyPod's reads
-   (Confirmed there) and the same object _doActions' TAKE_MONEY / GIVE_MONEY write (67fad0:1636, 1688). 1 read, 0 not. */
-static int TkPurseMoneyPod(void* c, int* out)
-{
-    if (c == 0) return 0;
-    __try
-    {
-        const char* f = *(const char* const*)((const char*)c + kRootFaction);
-        if (f == 0) return 0;
-        const char* o = *(const char* const*)(f + 0x80);
-        if (o == 0) return 0;
-        *out = *(const int*)(o + 0x88);
-        return 1;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
 /* P26 stage 5: the engine's own _doActions (hire.cpp HireCallDoActions - the trampoline) on a VIEW of the line: its action list
@@ -3181,6 +3337,8 @@ static void TkApplyActResult(const cooptalk::TalkMsg& m, unsigned int peer)
     ::Character* copy = FindSpawned(m.targetUid);
     int here = -1;
     if (copy != 0 && !TkPurseMoneyPod(copy, &here)) here = -1;
+    if (m.moneyAfter >= 0 && net::UidOwnedByPeer(m.targetUid, peer) && TkTalkerInConv(m.targetUid))
+        TkPurseNote(m.targetUid, m.moneyAfter, peer);   /* the talker's purse after the act; a talk already over keeps none */
     int hi = -1;
     for (size_t k = 0; k < g_tkActHolds.size(); ++k)
         if (g_tkActHolds[k].seq == m.seq && cooplive::SamePlayer(g_tkActHolds[k].peer, peer, coop::LinkPeerSlot()) && g_tkActHolds[k].convId == m.convId) { hi = (int)k; break; }
@@ -3383,6 +3541,7 @@ static void TkApplyRequest(const cooptalk::TalkMsg& m, unsigned int peer)
     g_p25StartSeen = 0; g_p25StartHadLine = 0;   /* P25 fold 2 [p25f2-b2] */
     const long long gateRef0 = (long long)g_p25GateRefused;
     int res = 0;
+    TkPurseNote(m.targetUid, m.purse, peer);   /* the first line's money replies are judged by the talker's purse */
     const int called = TalkSendPod((SendEventFn)(g_base + (uintptr_t)kDialogueSendEventRva), dlg, cp, 1, &res);   /* its start is scoped (detour_startPlayerConv) */
     g_p25StartDlg = 0; g_p25ReqIdNow = 0;
     g_talkCurEvent = -1;   /* a fault inside would have skipped detour_sendEvent's restore */
@@ -3402,6 +3561,7 @@ static void TkApplyRequest(const cooptalk::TalkMsg& m, unsigned int peer)
         const int gateNo = ((!subst && g_p25ViewHook != 1) || (long long)g_p25GateRefused > gateRef0) ? 1 : 0;
         const int why = cooptalk::TalkP25NotStartedWhy(called, endLater, g_p25StartSeen, g_p25StartHadLine, gateNo);
         if (first != 0) ++g_p25FirstLineDropped;
+        TkPurseTalkEnded(m.targetUid);   /* nothing started: the purse saved for it is not kept */
         TkP25NotStarted(m, peer, why, std::string(d) + "; sendEvent called=" + TkI(called) + " result=" + TkI(res)
                         + "; startPlayerConversation reached=" + TkI(g_p25StartSeen) + " with a line=" + TkI(g_p25StartHadLine) + "; " + vb
                         + (first != 0 ? "; its held first line never ran" : ""));
@@ -3483,6 +3643,10 @@ static void TkP25Drain()
         {
             cooptalk::TalkMsg q;
             q.kind = cooptalk::kTalkRequest; q.convId = 0; q.npcUid = nuid; q.targetUid = tuid; q.event = 1;
+            {   /* the talker's purse: the NPC's game judges the first line's money replies by it */
+                int pv = -1;
+                q.purse = TkPurseMoneyPod(who, &pv) ? pv : -1;
+            }
             q.reqId = ++g_p25NextReq;
             if (q.reqId == 0) q.reqId = ++g_p25NextReq;
             if (!net::SendTalk(q)) { why = cooptalk::kTalkWhyLink; detail = "the REQUEST could not be sent (link down)"; }
@@ -4176,16 +4340,19 @@ static std::string TkCountsString()
                  g_tkCarriedApplied, g_tkCarriedTalkerEngine, g_tkCarriedNoCarry);
     char s5f4[64];   /* P26s5 fold 4 */
     std::sprintf(s5f4, " talkP26s5f4[endReused]=%lld", (long long)g_tkEndReused);
-    char s6[980];   /* P26s6 (+ fold 1): ~290 literal bytes + 19 numbers of at most 20 + two hook states of at most 12 */
+    char s6[1200];   /* ~370 literal bytes + 25 numbers of at most 20 + two hook states of at most 12 */
     std::sprintf(s6, " talkP26s6[condPeer,condNotOurs,spkPeer,spkNotOurs,leadSeen,leadOrdered,leadNotOurs,leadNoTarget,leadFault,leadNoAddr,chainTgt]"
                  "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                  " talkP26s6f1[noUid,spkActsRefused,spkNoDlg,leaderNotOurs,leaderNoUid,flagFault,orderMix,viewLead]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkP26s6money[answered,noPurse,set,cleared,actMoved,differs]=%lld,%lld,%lld,%lld,%lld,%lld"
                  " talkP26s6Hooks=cond:%s,spk:%s,on:%d",
                  (long long)g_s6CondPeer, (long long)g_s6CondNotOurs, (long long)g_s6SpkPeer, (long long)g_s6SpkNotOurs,
                  (long long)g_s6LeadSeen, (long long)g_s6LeadOrdered, (long long)g_s6LeadNotOurs, (long long)g_s6LeadNoTarget,
                  (long long)g_s6LeadFault, (long long)g_s6LeadNoAddr, (long long)g_s6ChainTgt,
                  (long long)g_s6NoUid, (long long)g_s6SpkActsRefused, (long long)g_s6SpkNoDlg, (long long)g_s6LeadLeaderNotOurs,
                  (long long)g_s6LeadLeaderNoUid, (long long)g_s6LeadFlagFault, (long long)g_s6OrderMix, (long long)g_s6ViewLead,
+                 (long long)g_s6MoneyAnswered, (long long)g_s6MoneyNoPurse, g_tkPurseSet, g_tkPurseCleared,
+                 g_tkPurseActMoved, (long long)g_s6MoneyDiffers,
                  TalkHookState(g_s6CondHook), TalkHookState(g_s6SpkHook), g_s6On);
     char p25[2100];   /* P25: ~520 literal bytes + 42 numbers of at most 20 + a hook state; fold 1 [p25f1-rep]: ~100 + 6 numbers */
     const long long* wa = g_p25WhyA;
@@ -4496,6 +4663,12 @@ bool TalkDeferTargetActs(void* dlg, void* line)
         return true;
     }
     ++g_tkActSent;
+    {   /* the talker's game applies the line's money before showing the next line; this game may choose that line's money replies first */
+        int before = -1, after = -1;
+        if (TkPurseActSent(c.targetUid, a.actTypes, a.actValues, &before, &after))
+            TkLog("[TALK] A ACT seq=" + TkU(a.seq) + " conv=" + TkU(c.convId) + " the talker's saved purse " + TkI(before) + " -> " + TkI(after)
+                  + " (the line's TAKE_MONEY / GIVE_MONEY, for the next line's money replies; the ACT_RESULT's purse replaces it)");
+    }
     TkActHold h;
     std::memset(&h, 0, sizeof(h));
     h.seq = a.seq; h.convId = c.convId; h.peer = c.peer; h.n = nKeep; h.dlg = dlg; h.me = c.me; h.line = line;
@@ -4545,6 +4718,13 @@ void TalkForgetPeer(unsigned int peer)
        gone) also ends the not-forwarded ones still waiting */
     const int blocked = EngineWritesBlocked() ? 1 : 0;
     const int all = (peer == kTalkAllPeers) ? 1 : 0;
+    for (int i = 0; i < kTkPurseSlots; ++i)   /* that player's reported purses are not used again */
+        if (::InterlockedCompareExchange64(&g_tkPurse[i].v, 0, 0) != 0
+            && (all || cooplive::SamePlayer(g_tkPurse[i].peer, peer, coop::LinkPeerSlot())))
+        {
+            ::InterlockedExchange64(&g_tkPurse[i].v, 0);
+            ++g_tkPurseCleared;
+        }
     if (g_p25Pend.active && (all || cooplive::SamePlayer(g_p25Pend.peer, peer, coop::LinkPeerSlot())))   /* P25: the waiting REQUEST opens nothing */
     {
         g_p25Pend.active = 0;
@@ -4582,7 +4762,12 @@ void TalkForgetPeer(unsigned int peer)
         ++g_tkLinkEnded;
         std::map<void*, TkConv>::iterator lk = g_tkConvs.find(own[k].dlg);
         const int engEnded = (lk != g_tkConvs.end() && lk->second.engineEnded) ? 1 : 0;   /* P26s5 fold 4: nothing to call - TkEndOwn never calls the engine again */
-        if (blocked && !engEnded) { g_tkConvs.erase(own[k].dlg); g_tkLinkLaterA.push_back(own[k]); ++g_tkLinkLater; }   /* P26 stage 4: the mark stays (window shut); TkLinkLaterRun ends it */
+        if (blocked && !engEnded)
+        {   /* the mark stays (window shut) and TkLinkLaterRun ends it; the talk is gone from the table now, so its purse goes now */
+            const unsigned int tuid = lk != g_tkConvs.end() ? lk->second.targetUid : 0;
+            g_tkConvs.erase(own[k].dlg); g_tkLinkLaterA.push_back(own[k]); ++g_tkLinkLater;
+            if (tuid != 0) TkPurseTalkEnded(tuid);
+        }
         else TkEndOwn(own[k].dlg, own[k].me, 0, "the link to the other game was lost", 1);
     }
     if (g_tkMirror.active && (all || cooplive::SamePlayer(g_tkMirror.peer, peer, coop::LinkPeerSlot())))
@@ -5423,6 +5608,30 @@ static ::Character* TsNearestNamed(const std::string& nameKey, float x, float z,
     return best;
 }
 
+/* TEST-ONLY (talktest nearestfaction): as TsNearestNamed, matched on the candidate's faction name (its TalkPersonKey) instead of its
+   own name - bar recruits carry random names. MAIN THREAD. */
+static ::Character* TsNearestFaction(const std::string& facKey, float x, float z, float maxDist, int own, float* dist, int* count)
+{
+    *dist = -1.0f; *count = 0;
+    if (coop::GameWorldPtr() == 0 || facKey.empty()) return 0;
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) return 0;
+    ::Character* best = 0; float bd = maxDist;
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+    {
+        ::Character* ch = *it; Ogre::Vector3 q; ::Faction* f = 0;
+        if (!TsCandidate(ch) || FindSpawnedUid(ch) == 0 || (own >= 0 && TkS6Owner(ch) != own)) continue;
+        if (!CrimeFactionOf(ch, &f) || f == 0 || SayPlausiblePtr(f) == 0) continue;
+        if (coopsay::TalkPersonKey(f->getName()) != facKey || !SafeReadPosition(ch, &q)) continue;
+        ++*count;
+        const float dx = q.x - x, dz = q.z - z, d = sqrtf(dx * dx + dz * dz);
+        if (d >= bd) continue;
+        bd = d; best = ch;
+    }
+    if (best != 0) *dist = bd;
+    return best;
+}
+
 /* The carried hand-in fixture's TEST-ONLY name pick (crimetest bountyset, koself name, capturetest carry name) - see speech.h.
    MAIN THREAD. */
 ::Character* LeverNearestNamed(const std::string& nameKey, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
@@ -5587,14 +5796,22 @@ int TalkNearPoint(const std::string& arg, float* x, float* z, std::string* why)
     return 2;
 }
 
+/* The lever's verb as the command named it: nearestfaction, else nearestname. */
+static const char* TsVerb(const std::string& arg)
+{
+    const size_t at = arg.find_first_not_of(" \t");
+    return (at != std::string::npos && arg.compare(at, 14, "nearestfaction") == 0) ? "nearestfaction" : "nearestname";
+}
+
 /* P25 T729 (TEST-ONLY): `talktest nearestname <npc name> <targetUid> [event]` - the check. 1 = picked: *armArg = "<uid> <target>
    <event>" for TalkTestArm and the pick (uid, owner, where, how far from the target) is logged; 0 = refused (*why); g_tsNotLoaded
    = 1 when no such character is loaded yet. No distance limit (talktest by uid has none). MAIN THREAD (the command channel). */
 static int TsNameCheck(const std::string& arg, std::string* armArg, std::string* why)
 {
     std::string nameKey; unsigned int tu = 0; int ev = 1, own = -1;
-    if (!coopsay::TalkTestNameParse(arg, &nameKey, &tu, &ev, &own))   /* P25 T729b: [copy | mine] */
-    { *why = "usage talktest nearestname <npc name: the words up to the first number, '_' = a space> <targetUid> [event 0..255, default 1] [copy | mine]"; return 0; }
+    const bool byFac = coopsay::TalkTestFactionParse(arg, &nameKey, &tu, &ev, &own) != 0;   /* nearestfaction: the same pick by faction name */
+    if (!byFac && !coopsay::TalkTestNameParse(arg, &nameKey, &tu, &ev, &own))   /* P25 T729b: [copy | mine] */
+    { *why = "usage talktest nearestname|nearestfaction <npc name | faction name: the words up to the first number, '_' = a space> <targetUid> [event 0..255, default 1] [copy | mine]"; return 0; }
     if (coop::GameWorldPtr() == 0 || EngineWritesBlocked()) { *why = "no world"; return 0; }
     char b[400];
     ::Character* tc = FindSpawned(tu);
@@ -5602,10 +5819,11 @@ static int TsNameCheck(const std::string& arg, std::string* armArg, std::string*
     if (tc == 0 || SayPlausiblePtr(tc) == 0 || !SafeReadPosition(tc, &tp))
     { std::sprintf(b, "the target uid %u is not here (or its position is unreadable)", tu); *why = b; return 0; }
     float d = -1.0f; int named = 0;
-    ::Character* ch = TsNearestNamed(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named);
+    ::Character* ch = byFac ? TsNearestFaction(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named)
+                            : TsNearestNamed(nameKey, tp.x, tp.z, 1.0e30f, own, &d, &named);
     if (ch == 0)
     {
-        *why = "no living, conscious non-player character named '" + nameKey + "'" + (own == 0 ? " that is a copy the other game drives" : (own == 1 ? " that is this game's own" : "")) + " is loaded";   /* P25 T729b */
+        *why = std::string("no living, conscious non-player character ") + (byFac ? "of the faction '" : "named '") + nameKey + "'" + (own == 0 ? " that is a copy the other game drives" : (own == 1 ? " that is this game's own" : "")) + " is loaded";   /* P25 T729b */
         g_tsNotLoaded = 1;
         return 0;
     }
@@ -5615,9 +5833,10 @@ static int TsNameCheck(const std::string& arg, std::string* armArg, std::string*
     SafeReadPosition(ch, &cp);
     char nn[48];
     TalkName(ch, nn);
-    std::sprintf(b, "[TALK] talktest nearestname: picked uid=%u %s '%s' at %.0f,%.0f = %.0f units from target uid=%u at %.0f,%.0f (%d loaded with that name) ev=0x%X",
-                 uid, TsOwnerName(TkS6Owner(ch)), nn, cp.x, cp.z, d, tu, tp.x, tp.z, named, (unsigned int)ev);
-    DebugLog(std::string(b) + " name='" + nameKey + "'" + (own == 0 ? " only=copy" : (own == 1 ? " only=mine" : "")));   /* P25 T729b */
+    std::sprintf(b, "[TALK] talktest %s: picked uid=%u %s '%s' at %.0f,%.0f = %.0f units from target uid=%u at %.0f,%.0f (%d loaded with that %s) ev=0x%X",
+                 byFac ? "nearestfaction" : "nearestname", uid, TsOwnerName(TkS6Owner(ch)), nn, cp.x, cp.z, d, tu, tp.x, tp.z, named,
+                 byFac ? "faction" : "name", (unsigned int)ev);
+    DebugLog(std::string(b) + (byFac ? " faction='" : " name='") + nameKey + "'" + (own == 0 ? " only=copy" : (own == 1 ? " only=mine" : "")));   /* P25 T729b */
     std::sprintf(b, "%u %u %d", uid, tu, ev);
     *armArg = b;
     return 1;
@@ -5628,23 +5847,24 @@ static int TsNameCheck(const std::string& arg, std::string* armArg, std::string*
    new call replaces a pending wait (logged). */
 std::string TalkTestNameArm(const std::string& arg)
 {
+    const std::string verb = TsVerb(arg);
     if (g_twName.on)
     {
         g_twName.on = 0;
-        DebugLog("[TALK] talktest nearestname: the pending wait for '" + g_twName.arg + "' is REPLACED by a new talktest nearestname");
+        DebugLog("[TALK] talktest " + std::string(TsVerb(g_twName.arg)) + ": the pending wait for '" + g_twName.arg + "' is REPLACED by a new talktest " + verb);
     }
     g_tsNotLoaded = 0;
     std::string armArg, why;
     if (TsNameCheck(arg, &armArg, &why)) return TalkTestArm(armArg);
     if (!g_tsNotLoaded)
     {
-        DebugLog("[TALK] talktest nearestname REFUSED: " + why);
-        return "error talktest nearestname: " + why;
+        DebugLog("[TALK] talktest " + verb + " REFUSED: " + why);
+        return "error talktest " + verb + ": " + why;
     }
     const DWORD now = ::GetTickCount();
     g_twName.on = 1; g_twName.arg = arg; g_twName.startMs = now; g_twName.waitMs = kTwNearMs; g_twName.lastTryMs = now;
-    DebugLog("[TALK] talktest nearestname WAITING: " + why + " - re-checking every 500 ms for up to 60 s");
-    return "ok talktest nearestname: waiting up to 60 s for the NPC to load";
+    DebugLog("[TALK] talktest " + verb + " WAITING: " + why + " - re-checking every 500 ms for up to 60 s");
+    return "ok talktest " + verb + ": waiting up to 60 s for the NPC to load";
 }
 
 /* MAIN THREAD (the command channel). T718: the talksight check; when it fails only because the NPC is not loaded yet, a wait of
@@ -5690,7 +5910,7 @@ int TalkWaitTick(float* x, float* z, unsigned long* waitedMs)
     {
         if (g_twNear.on) { g_twNear.on = 0; TwLogEnd("[TALKSIGHT] playerteleport near: the wait ENDED", (DWORD)(now - g_twNear.startMs), "the world is gone, loading or tearing down"); }
         if (g_twSight.on) { g_twSight.on = 0; TwLogEnd("[TALKSIGHT] talksight: the wait ENDED", (DWORD)(now - g_twSight.startMs), "the world is gone, loading or tearing down"); }
-        if (g_twName.on) { g_twName.on = 0; TwLogEnd("[TALK] talktest nearestname: the wait ENDED", (DWORD)(now - g_twName.startMs), "the world is gone, loading or tearing down"); }   /* P25 T729 */
+        if (g_twName.on) { g_twName.on = 0; TwLogEnd(("[TALK] talktest " + std::string(TsVerb(g_twName.arg)) + ": the wait ENDED").c_str(), (DWORD)(now - g_twName.startMs), "the world is gone, loading or tearing down"); }   /* P25 T729 */
         return 0;
     }
     int rc = 0;
@@ -5740,15 +5960,15 @@ int TalkWaitTick(float* x, float* z, unsigned long* waitedMs)
         {
             g_twName.on = 0;
             char b[96];
-            std::sprintf(b, "[TALK] talktest nearestname: picked after %lu ms of waiting", (unsigned long)waited);
+            std::sprintf(b, "[TALK] talktest %s: picked after %lu ms of waiting", TsVerb(g_twName.arg), (unsigned long)waited);
             DebugLog(std::string(b));
             TalkTestArm(armArg);
         }
-        else if (!g_tsNotLoaded) { g_twName.on = 0; TwLogEnd("[TALK] talktest nearestname REFUSED", waited, why); }
+        else if (!g_tsNotLoaded) { g_twName.on = 0; TwLogEnd(("[TALK] talktest " + std::string(TsVerb(g_twName.arg)) + " REFUSED").c_str(), waited, why); }
         else if (waited >= g_twName.waitMs)
         {
             g_twName.on = 0;
-            TwLogEnd("[TALK] talktest nearestname REFUSED", waited, why + " (the 60 s wait ran out)");
+            TwLogEnd(("[TALK] talktest " + std::string(TsVerb(g_twName.arg)) + " REFUSED").c_str(), waited, why + " (the 60 s wait ran out)");
         }
     }
     return rc;

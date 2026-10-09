@@ -25,6 +25,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls - the executable and the address tables */
 
 #include <cstdio>
 #include <cstring>
@@ -104,11 +105,13 @@ int ReadPtrPod(const void* p, unsigned long long* out)
 /* ---- the executable's own path and first 64 KB ---------------------------------------------------------- */
 int ExePath(std::string* out)
 {
-    char buf[MAX_PATH * 2];
-    const DWORD n = ::GetModuleFileNameA(NULL, buf, (DWORD)(sizeof(buf) - 1));
-    if (n == 0 || n >= sizeof(buf) - 1) return 0;
-    buf[n] = 0;
-    *out = buf;
+    /* through the wide call, as UTF-8 (ReadHead and the signature search open it through the wide name): a game folder holding
+       letters outside the ANSI code page is named exactly. 32768 UTF-16 units is the longest path Windows has. */
+    std::wstring buf(32768, L'\0');
+    const DWORD n = ::GetModuleFileNameW(NULL, &buf[0], (DWORD)buf.size());
+    if (n == 0 || n >= (DWORD)buf.size()) return 0;
+    buf.resize((size_t)n);
+    *out = U8FromW(buf.c_str());
     return 1;
 }
 
@@ -117,7 +120,7 @@ int ExePath(std::string* out)
    file cannot change under us and is what the table's author fingerprinted offline. */
 int ReadHead(const std::string& path, std::vector<unsigned char>* head, unsigned long long* fileSize)
 {
-    std::ifstream f(path.c_str(), std::ios::binary);
+    std::ifstream f(U8W(path.c_str()).c_str(), std::ios::binary);   /* the path is UTF-8 (ExePath): opened through the wide name */
     if (!f) return 0;
     f.seekg(0, std::ios::end);
     const std::ifstream::pos_type endPos = f.tellg();
@@ -134,7 +137,7 @@ int ReadHead(const std::string& path, std::vector<unsigned char>* head, unsigned
 
 int ReadWholeFile(const std::string& path, std::string* out)
 {
-    std::ifstream f(path.c_str(), std::ios::binary);
+    std::ifstream f(U8W(path.c_str()).c_str(), std::ios::binary);   /* the path is UTF-8 (PathNextToDll): opened through the wide name */
     if (!f) return 0;
     std::ostringstream ss;
     ss << f.rdbuf();
@@ -341,7 +344,7 @@ static int PatternResolve(const std::string& exe, std::string* why)
 
     std::vector<unsigned char> img;
     {
-        std::ifstream f(exe.c_str(), std::ios::binary);
+        std::ifstream f(U8W(exe.c_str()).c_str(), std::ios::binary);   /* UTF-8, from ExePath */
         if (!f) { *why = "the executable file could not be opened for the signature search"; return 0; }
         f.seekg(0, std::ios::end);
         const std::ifstream::pos_type endPos = f.tellg();

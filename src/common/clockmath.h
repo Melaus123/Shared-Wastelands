@@ -80,9 +80,77 @@ ClockAct ClockDecide(double localAbs, double sharedAbs, double prevLocalAbs,
 double ClockSharedHoursAt(double srvHours, double srvAtMs, double nowMs,
                           float srvSpeed, float hourRealSeconds);
 
-/* The four speeds the engine's own buttons set. THREE call sites used to write this set out by hand
-   (store.cpp's vote note, the speedvote lever, the relay's OnSpeedVote) - one predicate removes the hand. */
+/* THE GAME SPEEDS A WORLD MAY RUN AT. 0 is pause; any finite multiplier above 0 up to kClockSpeedMax is a pace.
+   The engine's own buttons set 0, 1, 2 and 5; a speed mod sets others (3, 10, 0.5 ...), and every one of them is
+   a vote like a button's. What the range still protects: the value arrives as a raw f32 from the wire (the vote
+   up, the CLOCK down) and from the engine's speed global, so NaN, infinities, negatives and absurd tempos are
+   refused - a negative pace would run the shared clock backward and a huge one would leap it by days per second.
+   ONE predicate, used by store.cpp's vote note, the speedvote lever and the world server's OnSpeedVote. */
+const float kClockSpeedMax = 50.0f;
 int ClockSpeedIsValid(float speed);
+/* 1 for the four speeds the engine's own buttons set (0, 1, 2, 5) - for log text only; nothing is refused by it. */
+int ClockSpeedIsBuiltIn(float speed);
+
+/* A SPEED CHANGE NO GAME BUTTON MADE (a speed mod). The memory the main-thread tick keeps about the engine's speed
+   global, and the transitions that change it - pure, so every path that moves it is an offline test. */
+struct LiveSpeedMemo
+{
+    float        lastSeen;     /* the global after the last change this mod accounts for; < 0 = nothing recorded */
+    float        appliedFor;   /* the world speed of this game's own apply, kept ONLY while that apply is the last
+                                  recorded change (any later note clears it); < 0 = none */
+    float        pending;      /* the latest speed-mod value that had to wait for the adoption gap; < 0 = none */
+    unsigned int adoptAt;      /* tick ms (GetTickCount, wraps at 49.7 days - only differences are taken) of the last adoption */
+    unsigned int holdAt;       /* tick ms the last hold began */
+    int          adopted;      /* adoptAt is set */
+    int          held;         /* holdAt is set */
+    int          holding;      /* 1 = the last adoption is held until the world answers */
+};
+/* Nothing recorded: the next note starts the memory. At a link drop, a world teardown and process start. */
+void LiveSpeedMemoReset(LiveSpeedMemo* m);
+/* A change this mod accounts for (an engine setter call, an engine-held pause, a resync while no decision runs). */
+void LiveSpeedNoteSeen(LiveSpeedMemo* m, float seen);
+/* This game set the engine to the world's speed `srv`; `seenAfter` is the global read straight after. */
+void LiveSpeedNoteApplied(LiveSpeedMemo* m, float seenAfter, float srv);
+/* A speed-mod value arrived inside the adoption gap: it is kept as the value the next adoption sends. */
+void LiveSpeedNoteWaited(LiveSpeedMemo* m, float live);
+/* An adoption was made at nowMs; `seenNow` is the global at that moment. It is HELD (left on the engine until the world
+   answers) only when this game's vote counts (`voteCounts`: consensus, or this game is the authority under fixed) and no
+   other hold began within kClockSpeedRevoteMs. */
+void LiveSpeedNoteAdopted(LiveSpeedMemo* m, float seenNow, unsigned int nowMs, int voteCounts);
+/* The value an adoption sends: the global itself when it holds a speed-mod change nothing accounts for, else the kept one. */
+float LiveSpeedAdoptValue(const LiveSpeedMemo& m, float live);
+
+/* What the tick does with the global this frame, while linked, in a live world, with no engine-held pause:
+     live        the speed global now
+     srv         the world's speed from the notebook's CLOCK (0 = the world is paused)
+     myVote      this player's standing vote
+     nowMs       tick ms (wrapping; only differences are taken)
+     answered    1 = a CLOCK arrived after the vote the last adoption sent went out
+   kLiveSpeedAdopt   - the global moved to a valid non-zero speed nothing here accounts for and it is a NEW setting (or the
+                       same setting restated after kClockSpeedRevoteMs), or a kept value is waiting, and the adoption gap
+                       has passed: LiveSpeedAdoptValue becomes this player's vote, sent as a button press is.
+   kLiveSpeedWait    - such a change came inside kClockSpeedAdoptGapMs of the last adoption: the caller keeps the value
+                       (LiveSpeedNoteWaited) for the next adoption and, unless a hold is running, sets the world's speed -
+                       a mod that keeps changing never keeps this game off the world's speed for longer than one hold.
+   kLiveSpeedHold    - a held adoption is waiting for the world's answer (no CLOCK since its vote went out, and at most
+                       kClockSpeedVoteHoldMs) and the global still holds it: nothing is done.
+   kLiveSpeedApply   - the global differs from the world's speed and none of the above holds: the world's speed is set
+                       again (the notebook's answer won, the vote does not count, a pause nobody voted for, a speed
+                       outside 0..kClockSpeedMax, or an accounted change such as a button press while unlinked).
+   kLiveSpeedNothing - the global holds the world's speed; or the last recorded change was this game's own apply of this
+                       same world speed and the engine kept a different value - setting it again would change nothing. */
+enum ClockLiveSpeedAct { kLiveSpeedNothing = 0, kLiveSpeedApply = 1, kLiveSpeedAdopt = 2, kLiveSpeedHold = 3, kLiveSpeedWait = 4 };
+const unsigned int kClockSpeedVoteHoldMs = 2000;    /* a hold's ceiling when no CLOCK comes back (the notebook answers at once) */
+const unsigned int kClockSpeedRevoteMs   = 10000;   /* a restated refused speed is re-sent, and a new hold may begin, at most this often */
+const unsigned int kClockSpeedAdoptGapMs = 250;     /* adoptions are at least this far apart */
+int ClockLiveSpeedDecide(const LiveSpeedMemo& m, float live, float srv, float myVote, unsigned int nowMs, int answered);
+/* Does an engine setter call that passed through to the engine count as accounted (lastSeen follows it)? A call from
+   inside the game's own image is the engine (a window, a load, the character editor); a call from this mod's own module is
+   this mod's own write and never a vote; a pause, or a call that ends an engine-held pause, is the engine's or another
+   mod's own window and never a pace. Only a non-zero speed set from ANOTHER module with no engine pause up - a speed mod's
+   own code - is left for ClockLiveSpeedDecide to adopt. (This mod's own writes go through the trampoline and never reach
+   the detour; they are recorded where they are made - store.cpp ClockOwnSpeedWrite.) */
+int ClockSetterCallAccounted(int callerInGameImage, int callerThisMod, float speed, int engineHeldBefore);
 
 /* MSG_CLOCK down the link, both ends. 14 bytes - THE SHAPE DOES NOT CHANGE (design-clock46 6).
    ClockParseDown returns 0 for n < 13 and writes NONE of its out-parameters in that case; 1 for n >= 13,

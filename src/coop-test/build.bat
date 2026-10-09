@@ -24,9 +24,11 @@ rem Run it by FULL PATH: this environment has NoDefaultCurrentDirectoryInExePath
 rem `coop_test.exe` reports "is not recognized" (errorlevel 9009) and would fail the build for the
 rem wrong reason - a build gate that cannot tell "a test failed" from "the runner was not found" is
 rem worse than none.
+rem `if errorlevel 1` is true only for codes of 1 and above: a crash ends the runner with a negative code
+rem (0xC0000005 = -1073741819), so the gate tests for any code other than 0.
 "%~dp0coop_test.exe"
-if errorlevel 1 (
-    echo BUILD FAILED ^(tests: a test FAILED - the DLL was NOT relinked^)
+if not "%errorlevel%"=="0" (
+    echo BUILD FAILED ^(tests: a test FAILED or the runner crashed, exit %errorlevel% - the DLL was NOT relinked^)
     exit /b 1
 )
 endlocal

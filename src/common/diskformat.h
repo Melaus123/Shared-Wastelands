@@ -86,6 +86,14 @@ inline std::vector<unsigned int> FormatSteps(unsigned int from, unsigned int kno
 
 /* The world server's exit code when its world folder's format refuses it (the panel says the host refusal). */
 const int kServerExitFormatRefused = 5;
+/* ... when slots.txt is shorter than its .1 backup (worldkeep.h's start-up shrink check), and when its world folder is missing while
+   an import's "<world>.importing" and "<world>.before-import-<time>" folders are both beside it (worldkeep::WorldAsideRefuses).
+   Kept here, beside exit 5, so the panel's header (panelstatus.h) words them without pulling in worldkeep.h. */
+const int kServerExitSlotsShrunk = 33;
+const int kServerExitWorldAside = 34;
+/* ... when the world's lock (server.lock) is held: another world server already runs this world (another Kenshi on this computer, or
+   one left over after a crash). */
+const int kServerExitWorldLocked = 4;
 
 /* The refusal words (owner, approved): the host's (CAN'T HOST), the joiner's (CAN'T JOIN) and the load's (CAN'T LOAD). */
 inline const char* FormatHostRefusedText()

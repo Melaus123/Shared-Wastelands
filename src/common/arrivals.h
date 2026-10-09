@@ -91,6 +91,8 @@ struct Book
     std::vector<int> held;       /* roster arrivals held: the link's own arrival counted with its slot not known yet */
     unsigned int heldSince, linkPendSince;
     int linkUp, linkSlot, lastLinkSlot, linkState;
+    int linkEverUp;              /* 1 once BookLink has seen the old link come up in this process; a session left while the link was
+                                    down moves the generation (downs) but never sets it */
     long linkGen, seq, downs;
     std::map<int, long> perSlot; /* arrivals counted per slot (the one-particular-player epoch) */
     Arrival ring[kRingCap];
@@ -98,7 +100,7 @@ struct Book
     long long seen, left, linkMerged, viaRoster, viaLink, bindTimeouts, linkDropped;
     long long lateBindSame;      /* [m11c2f1-3] a PEER_SLOT that came after a hold was decided named a slot whose roster arrival was
                                     counted on its own: two arrivals for one player (both already served - declared, not undone) */
-    Book() : heldSince(0), linkPendSince(0), linkUp(0), linkSlot(-1), lastLinkSlot(-1), linkState(0), linkGen(-1), seq(0), downs(0),
+    Book() : heldSince(0), linkPendSince(0), linkUp(0), linkSlot(-1), lastLinkSlot(-1), linkState(0), linkEverUp(0), linkGen(-1), seq(0), downs(0),
              seen(0), left(0), linkMerged(0), viaRoster(0), viaLink(0), bindTimeouts(0), linkDropped(0), lateBindSame(0) {}
 };
 
@@ -188,7 +190,7 @@ inline int BookLink(Book* b, int up, long gen, int peerSlot, unsigned int nowMs)
     if (b->linkUp == 0 || gen != b->linkGen)
     {
         if (b->linkUp != 0) BookLinkDownEdge(b);   /* down and up again between two ticks */
-        b->linkUp = 1; b->linkGen = gen; b->linkSlot = peerSlot >= 0 ? peerSlot : -1;
+        b->linkUp = 1; b->linkEverUp = 1; b->linkGen = gen; b->linkSlot = peerSlot >= 0 ? peerSlot : -1;
         if (b->linkSlot >= 0)
         {
             b->lastLinkSlot = b->linkSlot;
@@ -255,7 +257,8 @@ inline long BookSlotArrivals(const Book& b, int slot)
 }
 
 /* (4) ONE PARTICULAR PLAYER: 1 = the counterpart is the session peer and is judged by the old link exactly as before; 0 = it is
-   another player, judged by the roster. isRelay/peerSlot: the counterpart's id is a relayed sender id carrying a slot. */
+   another player, judged by the roster. isRelay/peerSlot: the counterpart's id is a relayed sender id carrying a slot. linkEverUp:
+   Book::linkEverUp - the old link has really come up in this process (sessions left while it was down do not count). */
 inline int PeerByLink(int isRelay, int peerSlot, int linkUp, int linkSlot, int lastLinkSlot, int linkEverUp)
 {
     if (isRelay == 0 || peerSlot < 0) return 1;                   /* the raw link id: the session peer */

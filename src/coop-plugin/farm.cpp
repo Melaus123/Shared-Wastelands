@@ -256,6 +256,83 @@ float FmSkillOf(void* who)
     return v;
 }
 
+/* ---- MINE_OP - a worker's step on a production building (a mining node, a machine) this game does not write ----
+   items.cpp detour_prodOperate hands the step here instead of running it (coopfarm::MineStepRoute); the work is kept per
+   (building key, worker) and FarmTick sends it to the writer every 500 ms - while no writer is named it waits, up to
+   coopfarm::kMinePendMs; the writer runs the engine's own
+   ProductionBuilding::operate at K2 (FarmDrain), so the ore is made once, into the building's own box, and reaches every game
+   as a box move. The table is POD under g_fmcs (the detour may run on any thread). */
+const int   kMnCap = 256;            /* (building, worker) pairs a game relays at once; a pair past it runs its step here (counted) */
+const DWORD kMnForgetMs = 30000;     /* a pair with no work and no step this long is dropped */
+const int   kMnSayCap = 12;
+struct MnRow { char key[64]; unsigned int hash; unsigned int uid; float amount; float work; DWORD seenAt; int used;
+               DWORD undecidedAt; /* when this row's writer was first found unnamed, 0 = named */ };
+MnRow g_mn[kMnCap];
+int g_mnHigh = 0;                    /* under g_fmcs */
+struct MnWork { unsigned int uid; float amount; float work; };
+struct MnIn { std::vector<MnWork> w; DWORD at; unsigned int from; };
+std::map<std::string, MnIn> g_inMine;   /* MAIN THREAD: received (or handed to self) work per building key, run at K2 */
+volatile LONG64 g_mnHeld = 0, g_mnNoKey = 0, g_mnFull = 0;
+volatile LONG64 g_mnBadAmount = 0;
+long long g_mnSent = 0, g_mnSendFail = 0, g_mnToSelf = 0, g_mnRecv = 0, g_mnRan = 0, g_mnCalls = 0, g_mnRefused = 0, g_mnDropped = 0,
+          g_mnFault = 0, g_mnPaused = 0, g_mnWithCopy = 0, g_mnNoWorker = 0, g_mnDroppedLink = 0, g_mnForgot = 0,
+          g_mnKeptUndecided = 0, g_mnDroppedUndecided = 0, g_mnWaitWriter = 0, g_mnNotProduction = 0;
+int g_mnSaid = 0;
+void MnSay(const std::string& s) { if (g_mnSaid < kMnSayCap) { ++g_mnSaid; DebugLog(s); } }
+
+/* ANY THREAD. Work for (key, uid) into the table; amount = the operate amount of the worker's call. 1 kept, 0 the table full,
+   -1 a new row whose amount is unusable (dropped at once - its work could never be sent). */
+int MnAdd(const char* key, unsigned int uid, float amount, float work)
+{
+    const unsigned int h = FmHash(key);
+    int kept = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    int i = -1, free = -1;
+    for (int j = 0; j < g_mnHigh; ++j)
+    {
+        if (g_mn[j].used == 0) { if (free < 0) free = j; continue; }
+        if (g_mn[j].hash == h && g_mn[j].uid == uid && std::strcmp(g_mn[j].key, key) == 0) { i = j; break; }
+    }
+    if (i < 0 && free < 0 && g_mnHigh < kMnCap) free = g_mnHigh;
+    if (i < 0 && free >= 0)
+    {
+        MnRow& r = g_mn[free];
+        std::memset(&r, 0, sizeof(r));
+        std::strncpy(r.key, key, sizeof(r.key) - 1);
+        r.key[sizeof(r.key) - 1] = 0;
+        r.hash = h; r.uid = uid; r.used = 1;
+        if (free >= g_mnHigh) g_mnHigh = free + 1;
+        i = free;
+    }
+    if (i >= 0)
+    {
+        MnRow& r = g_mn[i];
+        r.seenAt = ::GetTickCount();
+        if (amount > 0.0f && amount <= coopfarm::kMineAmountMax) r.amount = amount;
+        if (work > 0.0f && work < 1.0e6f) { r.work += work; if (r.work > kFmOpCap) r.work = kFmOpCap; }
+        kept = 1;
+        if (!(r.amount > 0.0f)) { r.used = 0; kept = -1; }
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+    return kept;
+}
+
+/* MAIN THREAD: (uid, amount, work) merged into a building's received work */
+void MnMerge(MnIn* in, unsigned int uid, float amount, float work)
+{
+    for (size_t k = 0; k < in->w.size(); ++k)
+        if (in->w[k].uid == uid)
+        {
+            in->w[k].work += work;
+            if (in->w[k].work > kFmOpCap) in->w[k].work = kFmOpCap;
+            in->w[k].amount = amount;
+            return;
+        }
+    if ((int)in->w.size() >= kFmOpInCap) { in->w.back().work += work; return; }
+    MnWork x; x.uid = uid; x.amount = amount; x.work = work;
+    in->w.push_back(x);
+}
+
 /* The engine's own early-out: the tail call alone (0xE5540 lines 22-27). */
 void FmTail(void* f)
 {
@@ -772,6 +849,76 @@ void InstallFarm()
         DebugLog("[FARM] par16 fold: getYieldChancePerCrop hook not installed - a forwarded worker the writer has no copy of harvests at the engine's no-worker yield (skill 1)");
 }
 
+/* MAIN THREAD (FarmTick, every 500 ms): every kept worker's work goes to the building's writer as MINE_OP, at most kFarmOpMax
+   per message (the rest next round); a building this game writes NOW takes the work itself (run at K2); a building with no
+   writer named keeps its work, dropped once it has waited coopfarm::kMinePendMs. */
+void MnSendRound(DWORD now)
+{
+    static MnRow cand[kMnCap];
+    static int candV[kMnCap];
+    static MnRow out[kMnCap];
+    static int outV[kMnCap];
+    int nCand = 0, nOut = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    for (int j = 0; j < g_mnHigh; ++j)
+    {
+        MnRow& r = g_mn[j];
+        if (r.used == 0) continue;
+        if (r.work > 0.0f && r.amount > 0.0f) cand[nCand++] = r;
+        else if (now - r.seenAt > kMnForgetMs) { r.used = 0; ++g_mnForgot; }
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+    for (int k = 0; k < nCand; ++k)   /* the writer, asked outside the lock (engine reads on the main thread) */
+    {
+        void* b = FmResolve(std::string(cand[k].key));
+        candV[k] = (b != 0) ? ProdStepWriterHere(b) : coopfarm::kProdWriterNone;
+    }
+    ::EnterCriticalSection(&g_fmcs);
+    for (int k = 0; k < nCand; ++k)
+    {
+        MnRow* r = 0;
+        for (int j = 0; j < g_mnHigh; ++j)
+            if (g_mn[j].used != 0 && g_mn[j].hash == cand[k].hash && g_mn[j].uid == cand[k].uid && std::strcmp(g_mn[j].key, cand[k].key) == 0)
+            { r = &g_mn[j]; break; }
+        if (r == 0) continue;
+        if (coopfarm::MineOpAccept(candV[k]) == coopfarm::kMineAccWait)
+        {
+            if (r->undecidedAt == 0) { r->undecidedAt = (now != 0) ? now : 1; ++g_mnKeptUndecided; }
+            else if (coopfarm::MineHoldExpired(now - r->undecidedAt) != 0) { r->work = 0.0f; r->undecidedAt = 0; ++g_mnDroppedUndecided; }
+            continue;
+        }
+        r->undecidedAt = 0;
+        out[nOut] = *r;
+        outV[nOut] = candV[k];
+        out[nOut].work = coopfarm::FarmOpTake(&r->work);
+        if (out[nOut].work > 0.0f) ++nOut;
+    }
+    ::LeaveCriticalSection(&g_fmcs);
+    for (int k = 0; k < nOut; ++k)
+    {
+        const MnRow& o = out[k];
+        if (coopfarm::MineOpAccept(outV[k]) == coopfarm::kMineAccRun)
+        {   /* this game writes the building now: the work runs here, never sent to a game that would refuse it */
+            MnIn& in = g_inMine[std::string(o.key)];
+            MnMerge(&in, o.uid, o.amount, o.work);
+            in.at = now; in.from = 0;
+            ++g_mnToSelf;
+            continue;
+        }
+        coopfarm::FarmMsg m;
+        m.kind = coopfarm::kMineOp; m.key = o.key; m.uid = o.uid; m.amount = o.amount; m.work = o.work;
+        if (net::SendFarm(m))
+        {
+            ++g_mnSent;
+            char h[200];
+            std::sprintf(h, " uid=%u amount=%.3f work=%.4f - this game does not write that building; the worker's step goes to its writer",
+                         o.uid, o.amount, o.work);
+            MnSay(std::string("[MINE] MINE_OP sent key=") + o.key + h);
+        }
+        else { ++g_mnSendFail; MnAdd(o.key, o.uid, o.amount, o.work); }   /* not sent: kept for the next round */
+    }
+}
+
 void FarmTick()
 {
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
@@ -792,6 +939,9 @@ void FarmTick()
                 /* re-check #1: every farm runs its own engine again - a held catch-up is this game's own */
                 if (g_fm[i].used != 0 && g_fm[i].tsPend == 1) { g_fm[i].tsPend = 2; ::InterlockedExchange(&g_tsDue, 1); }
             }
+            for (int j = 0; j < g_mnHigh; ++j)   /* no writer to send a worker's step to - nothing is owed */
+                if (g_mn[j].used != 0) { if (g_mn[j].work > 0.0f) ++g_mnDroppedLink; g_mn[j].used = 0; }
+            g_mnHigh = 0;
             ::LeaveCriticalSection(&g_fmcs);
             g_last.clear(); g_hint.clear();
         }
@@ -808,6 +958,7 @@ void FarmTick()
         std::sprintf(h, "[FARM] the farm table is FULL (%d rows): a farm past it is HELD on this game (nobody grows it here) - fold #8", kFmCap);
         ErrorLog(std::string(h));
     }
+    MnSendRound(now);
     const int n = FmSnapshot(g_cp);
     for (int i = 0; i < n; ++i)
     {
@@ -889,7 +1040,7 @@ void FarmTick()
 void FarmDrain()
 {
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
-    if (g_ftKind == 0 && g_inFarm.empty() && g_inOp.empty() && ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0
+    if (g_ftKind == 0 && g_inFarm.empty() && g_inOp.empty() && g_inMine.empty() && ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0
         && ::InterlockedCompareExchange(&g_tsDue, 0, 0) == 0) return;
     if (EngineWritesBlocked()) { ++g_blocked; return; }
     FmRunLever();
@@ -1043,6 +1194,76 @@ void FarmDrain()
         if (ws.empty()) g_inOp.erase(it++);
         else { it->second.at = now; ++it; }   /* past the per-drain call cap: the rest runs next drain */
     }
+    /* MINE_OP: the writer runs a worker's step it was sent through the engine's own ProductionBuilding::operate, at most one
+       sender's call amount per call at this game's frame (updateOutput makes at most one item a call), at most kFmCallsPerDrain
+       calls per building per drain; a game another game's writer holds refuses it; with no writer named it waits kFmPendMs
+       (as FARM_OP); a key that resolves to something that is not a production building is refused. */
+    const float mdt = FmDt();
+    for (std::map<std::string, MnIn>::iterator it = g_inMine.begin(); it != g_inMine.end(); )
+    {
+        void* b = FmResolve(it->first);
+        if (b == 0)
+        {
+            if (now - it->second.at > kFmPendMs) { ++g_mnDropped; g_inMine.erase(it++); }
+            else ++it;
+            continue;
+        }
+        if (ProductionBuildingIs(b) == 0)
+        {
+            ++g_mnNotProduction;
+            MnSay("[MINE] MINE_OP refused key=" + it->first + ": that key names no production building here");
+            g_inMine.erase(it++);
+            continue;
+        }
+        const int acc = coopfarm::MineOpAccept(ProdStepWriterHere(b));
+        if (acc == coopfarm::kMineAccRefuse)
+        {
+            ++g_mnRefused;
+            MnSay("[MINE] MINE_OP refused key=" + it->first + ": another game writes that building");
+            g_inMine.erase(it++);
+            continue;
+        }
+        if (acc == coopfarm::kMineAccWait)
+        {
+            ++g_mnWaitWriter;
+            if (now - it->second.at > kFmPendMs) { ++g_mnDropped; g_inMine.erase(it++); }
+            else ++it;
+            continue;
+        }
+        if (!(mdt > 0.0f)) { ++g_mnPaused; it->second.at = now; ++it; continue; }   /* paused: the work is held */
+        int calls = 0;
+        std::vector<MnWork>& ws = it->second.w;
+        for (size_t k = 0; k < ws.size() && calls < kFmCallsPerDrain; ++k)
+        {
+            void* who = (ws[k].uid != 0) ? (void*)FindSpawned(ws[k].uid) : 0;
+            if (who != 0) ++g_mnWithCopy; else ++g_mnNoWorker;
+            while (calls < kFmCallsPerDrain)
+            {
+                float amt = 0.0f;
+                const float w = coopfarm::FarmWorkSlice(ws[k].work, mdt, ws[k].amount, &amt);
+                if (!(w > 0.0f)) break;
+                if (ProdOperateRun(b, who, amt) == 0)
+                {
+                    ++g_mnFault; ws[k].work = 0.0f;
+                    MnSay("[MINE] MINE_OP key=" + it->first + ": the engine's operate did not run (faulted or no hook) - that worker's work dropped");
+                    break;
+                }
+                ws[k].work -= w;
+                if (ws[k].work < 1.0e-7f) ws[k].work = 0.0f;
+                ++calls;
+            }
+        }
+        if (calls > 0)
+        {
+            if (g_mnRan == 0) MnSay("[MINE] first MINE_OP run key=" + it->first + " - the worker's step ran here, on the building's writer");
+            ++g_mnRan; g_mnCalls += calls;
+        }
+        size_t keep = 0;
+        for (size_t k = 0; k < ws.size(); ++k) if (ws[k].work > 0.0f) ws[keep++] = ws[k];
+        ws.resize(keep);
+        if (ws.empty()) g_inMine.erase(it++);
+        else { it->second.at = now; ++it; }   /* past the per-drain call cap: the rest runs next drain */
+    }
     /* 3. the writer publishes to every linked game: every 500 ms, at most kFmPubPerDrain farms, each at most every 2 s
        (coopfarm::FarmPublishDue) */
     if (::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0 || now - g_pubAt < 500) return;
@@ -1076,11 +1297,14 @@ void FarmDrain()
 void FarmForgetWorld()
 {
     g_inFarm.clear(); g_inOp.clear(); g_last.clear(); g_hint.clear(); g_ftKind = 0; g_said = 0; g_saidFull = 0; g_saidNoWorker = 0;
+    g_inMine.clear(); g_mnSaid = 0;
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
     ::EnterCriticalSection(&g_fmcs);
     for (int i = 0; i < g_fmHigh; ++i) if (g_fm[i].used != 0 && g_fm[i].tsPend != 0) ::InterlockedIncrement64(&g_tsDropped);
     std::memset(g_fm, 0, sizeof(g_fm));
     g_fmHigh = 0;
+    std::memset(g_mn, 0, sizeof(g_mn));
+    g_mnHigh = 0;
     ::LeaveCriticalSection(&g_fmcs);
     ::InterlockedExchange(&g_fmFullFlag, 0);
     ::InterlockedExchange(&g_tsDue, 0);
@@ -1094,6 +1318,14 @@ void FarmNoteRecv(const coopfarm::FarmMsg& m, unsigned int fromPeer)
         ++g_recvState;
         FmIn& in = g_inFarm[m.key];
         in.m = m; in.at = now; in.from = fromPeer;
+        return;
+    }
+    if (m.kind == coopfarm::kMineOp)
+    {   /* a worker's step on a production building, run at K2 when this game writes it */
+        ++g_mnRecv;
+        MnIn& in = g_inMine[m.key];
+        MnMerge(&in, m.uid, m.amount, m.work);
+        in.at = now; in.from = fromPeer;
         return;
     }
     ++g_recvOp;
@@ -1183,6 +1415,38 @@ void ReportFarm()
                  (long long)g_opMerged, g_opPaused, g_opWaitWriter, g_opHandedToSelf, g_opDroppedStale, g_opDroppedLink, (long long)g_opZeroWork,
                  (long long)g_dtMissing, g_opFault, g_hkTimeSkip, g_hkYield, high, kFmCap);
     DebugLog(std::string(b));
+    int mnUsed = 0;
+    if (::InterlockedCompareExchange(&g_fmInit, 0, 0) != 0)
+    {
+        ::EnterCriticalSection(&g_fmcs);
+        for (int i = 0; i < g_mnHigh; ++i) if (g_mn[i].used != 0) ++mnUsed;
+        ::LeaveCriticalSection(&g_fmcs);
+    }
+    char mb[900];
+    std::sprintf(mb, "[MINE] REPORT relay[held,noKey,full,badAmount,sent,sendFail,toSelf,keptUndecided,droppedUndecided,droppedLink,forgot]"
+                 "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " run[recv,ran,calls,refused,notProduction,waitWriter,dropped,fault,paused,withCopy,noWorker]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " pairs=%d",
+                 (long long)g_mnHeld, (long long)g_mnNoKey, (long long)g_mnFull, (long long)g_mnBadAmount, g_mnSent, g_mnSendFail, g_mnToSelf,
+                 g_mnKeptUndecided, g_mnDroppedUndecided, g_mnDroppedLink, g_mnForgot,
+                 g_mnRecv, g_mnRan, g_mnCalls, g_mnRefused, g_mnNotProduction, g_mnWaitWriter, g_mnDropped, g_mnFault, g_mnPaused,
+                 g_mnWithCopy, g_mnNoWorker, mnUsed);
+    DebugLog(std::string(mb));
+}
+
+int MineLinked() { return (::InterlockedCompareExchange(&g_fmLinked, 0, 0) != 0) ? 1 : 0; }
+
+int MineStepRelay(void* pb, void* who, float amount)
+{
+    if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return 0;
+    char key[64];
+    if (pb == 0 || ObjectPositionKey(pb, key, (int)sizeof(key), 0, 3, 0) == 0) { ::InterlockedIncrement64(&g_mnNoKey); return 0; }
+    const float work = amount * FmDt();   /* paused (g_dt 0): nothing is owed and nothing runs here */
+    const int r = MnAdd(key, (who != 0) ? FindSpawnedUid(who) : 0u, amount, work);
+    if (r == 0) { ::InterlockedIncrement64(&g_mnFull); return 0; }
+    if (r < 0) { ::InterlockedIncrement64(&g_mnBadAmount); return 0; }
+    ::InterlockedIncrement64(&g_mnHeld);
+    return 1;
 }
 
 }   // namespace coop

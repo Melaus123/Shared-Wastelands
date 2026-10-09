@@ -50,6 +50,7 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "hostaddrshow",  kDriveButton, "SWNetAddrShowBtn",      0 },
         { "hosting",       kDriveButton, "SWHostingPauseButton",  0 },   /* T-524: HOSTING on the host's pause menu */
         { "hostaddrcopy",  kDriveButton, "SWNetAddrCopyBtn",      0 },
+        { "hostvpncopy",   kDriveButton, "SWVpnAddrCopyBtn",      0 },   /* T-631: the RADMIN / HAMACHI ADDRESS row's COPY */
         /* Host a game: the worlds list's buttons and the New world / Delete world? dialog */
         { "newworld",      kDriveButton, "CoopNewWorldBtn",       0 },
         { "deleteworld",   kDriveButton, "CoopDeleteWorldBtn",    0 },

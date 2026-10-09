@@ -404,6 +404,23 @@ inline void AreaApplyMapCore(AreaBook* b, const int* listed, int mySlot, double 
         if (b->slotOfSeat[j] >= 0 && listed[j] < 0 && !AreaMaskTest(newAny, j)) { b->slotOfSeat[j] = -1; ++t->freed; }
 }
 
+/* AN AREA WHOSE HOLDER IS AWAY IS FROZEN. The world server keeps a restored claim for its holder through the restore grace and names
+   that holder in the area map; a still-running game re-dialling after a world-server restart is such a holder until its IN_WORLD
+   reaches the world server again. Read as unclaimed, its areas would be populated, adopted and record-loaded here (the crowd doubles
+   when it returns); read as held, this game would remove its people there in favour of a world that is not on the world server. So
+   every area query answers kAreaFrozen for it and every action there refuses.
+     owner        - the slot the map names for the area (-1 nobody).
+     mySlot       - this game's slot (-1 none).
+     rosterKnown  - 1 this link's PLAYERS roster has arrived (store.cpp StoreRosterSlotInWorld answered 0 or 1).
+     ownerInWorld - 1 that roster shows the owner IN_WORLD.
+   No roster on this link: frozen for every other-slot owner. 1 = frozen. */
+const int kAreaFrozen = -2;
+inline int AreaFrozenDecide(int owner, int mySlot, int rosterKnown, int ownerInWorld)
+{
+    if (owner < 0 || owner == mySlot) return 0;
+    return (rosterKnown == 0 || ownerInWorld == 0) ? 1 : 0;
+}
+
 }   /* namespace coopdrop */
 
 #endif

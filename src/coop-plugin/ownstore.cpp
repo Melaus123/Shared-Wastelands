@@ -28,6 +28,7 @@
 #include "coop_log.h"
 
 #include <map>
+#include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
 
@@ -85,7 +86,7 @@ void OwnCsInit()
 
 bool WriteAllFlushed(const std::string& path, const char* p, size_t n)
 {
-    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    HANDLE h = U8CreateFile(path.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) return false;
     bool ok = true;
     size_t done = 0;
@@ -98,14 +99,14 @@ bool WriteAllFlushed(const std::string& path, const char* p, size_t n)
     }
     if (ok && !::FlushFileBuffers(h)) ok = false;
     ::CloseHandle(h);
-    if (!ok) ::DeleteFileA(path.c_str());
+    if (!ok) U8DeleteFile(path.c_str());
     return ok;
 }
 
 bool ReadAll(const std::string& path, std::vector<char>* out)
 {
     out->clear();
-    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    HANDLE h = U8CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER sz; sz.QuadPart = 0;
     bool ok = ::GetFileSizeEx(h, &sz) != 0 && sz.QuadPart >= 0 && sz.QuadPart < (64LL << 20);
@@ -121,7 +122,7 @@ bool ReadAll(const std::string& path, std::vector<char>* out)
 
 bool MoveReplace(const std::string& from, const std::string& to)
 {
-    return ::MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    return U8MoveFileEx(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
 std::string Join(const std::string& dir, const std::string& name) { return dir + "\\" + name; }
@@ -169,7 +170,7 @@ bool WriteIndex(const std::string& dir)
     char pid[24]; _snprintf(pid, 23, "%lu", (unsigned long)::GetCurrentProcessId()); pid[23] = 0;
     const std::string tmp = Join(dir, std::string(coopown::IndexFile()) + "." + pid + ".tmp");
     if (!WriteAllFlushed(tmp, all.data(), all.size())) return false;
-    if (!MoveReplace(tmp, Join(dir, coopown::IndexFile()))) { ::DeleteFileA(tmp.c_str()); return false; }
+    if (!MoveReplace(tmp, Join(dir, coopown::IndexFile()))) { U8DeleteFile(tmp.c_str()); return false; }
     return true;
 }
 
@@ -187,7 +188,7 @@ void CommitOne(const std::string& dir, const std::string& key, const OwnJob& j)
     {
         /* mmo1b (review-mmo1 item 3): ONLY THE INDEXED VERSION IS ROTATED ONTO .prev. A live file that is not what the
            index names (a failed verify/index step left it) is replaced, and .prev - the indexed version - is kept. */
-        if (::GetFileAttributesA(live.c_str()) != INVALID_FILE_ATTRIBUTES)
+        if (U8GetFileAttributes(live.c_str()) != INVALID_FILE_ATTRIBUTES)
         {
             std::map<std::string, coopown::IndexLine>::const_iterator ix = g_ownIndex.find(key);
             const bool haveIx = ix != g_ownIndex.end();
@@ -202,7 +203,7 @@ void CommitOne(const std::string& dir, const std::string& key, const OwnJob& j)
             else ::InterlockedIncrement64(&g_osRotateSkipped);
         }
         if (written && !MoveReplace(tmp, live)) { written = false; err = ::GetLastError(); }
-        if (!written) ::DeleteFileA(tmp.c_str());
+        if (!written) U8DeleteFile(tmp.c_str());
     }
     std::vector<char> back;
     const bool readBack = written && ReadAll(live, &back);
@@ -290,11 +291,11 @@ bool MakeDirs(const std::string& dir)
         if (i == dir.size() || dir[i] == '\\' || dir[i] == '/')
         {
             const std::string part = dir.substr(0, i);
-            if (::GetFileAttributesA(part.c_str()) == INVALID_FILE_ATTRIBUTES && !::CreateDirectoryA(part.c_str(), 0)
+            if (U8GetFileAttributes(part.c_str()) == INVALID_FILE_ATTRIBUTES && !U8CreateDirectory(part.c_str(), 0)
                 && ::GetLastError() != ERROR_ALREADY_EXISTS) return false;
         }
     }
-    const DWORD a = ::GetFileAttributesA(dir.c_str());
+    const DWORD a = U8GetFileAttributes(dir.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
@@ -315,8 +316,8 @@ bool PidAliveOther(unsigned long pid)
    selection. A name carrying the id of ANOTHER running process (a dot-separated all-digit part) is left alone. */
 void CleanTmp(const std::string& dir)
 {
-    WIN32_FIND_DATAA fd;
-    HANDLE h = ::FindFirstFileA(Join(dir, "*.tmp").c_str(), &fd);
+    U8FindData fd;
+    HANDLE h = U8FindFirstFile(Join(dir, "*.tmp").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do
     {
@@ -331,8 +332,8 @@ void CleanTmp(const std::string& dir)
             else { ++n; if (ch >= '0' && ch <= '9') { if (v < 100000000UL) v = v * 10 + (unsigned long)(ch - '0'); } else allDig = false; }
         }
         if (other) ::InterlockedIncrement64(&g_osTmpKept);
-        else if (::DeleteFileA(Join(dir, name).c_str())) ::InterlockedIncrement64(&g_osTmpDeleted);
-    } while (::FindNextFileA(h, &fd));
+        else if (U8DeleteFile(Join(dir, name).c_str())) ::InterlockedIncrement64(&g_osTmpDeleted);
+    } while (U8FindNextFile(h, &fd));
     ::FindClose(h);
 }
 
@@ -383,7 +384,7 @@ bool OwnStoreOpen(const std::string& dir, unsigned long long* maxSeq, int* badLi
 int OwnStoreFormatCheck(const std::string& dir, unsigned int* found, std::string* why)
 {
     const std::string p = Join(dir, swnames::kFormatFile);
-    const bool exists = ::GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool exists = U8GetFileAttributes(p.c_str()) != INVALID_FILE_ATTRIBUTES;
     std::vector<char> b; std::string t;
     if (exists && ReadAll(p, &b)) t.assign(b.begin(), b.end());
     const int rs = swformat::FormatParse(exists, t, swformat::kKindRecords, found, why);
@@ -517,7 +518,7 @@ bool OwnLedgerAppend(const std::string& line, unsigned int cap, int* linesNow)
     std::vector<std::string> lines;
     std::vector<char> b;
     /* mmo6 fold (review-mmo6 MED 4): only "not found" is an empty ledger; an existing file that cannot be read refuses */
-    const DWORD attr = ::GetFileAttributesA(path.c_str());
+    const DWORD attr = U8GetFileAttributes(path.c_str());
     const DWORD aerr = (attr == INVALID_FILE_ATTRIBUTES) ? ::GetLastError() : 0;
     const bool notFound = attr == INVALID_FILE_ATTRIBUTES && (aerr == ERROR_FILE_NOT_FOUND || aerr == ERROR_PATH_NOT_FOUND);
     const bool readOk = !notFound && ReadAll(path, &b);
@@ -535,14 +536,14 @@ bool OwnLedgerAppend(const std::string& line, unsigned int cap, int* linesNow)
     char pid[16];
     std::sprintf(pid, "%lu", (unsigned long)::GetCurrentProcessId());
     const std::string tmp = path + "." + pid + ".tmp";   /* CleanTmp's pid rule leaves a live process's temp alone */
-    if (!WriteAllFlushed(tmp, all.data(), all.size())) { ::DeleteFileA(tmp.c_str()); return false; }
+    if (!WriteAllFlushed(tmp, all.data(), all.size())) { U8DeleteFile(tmp.c_str()); return false; }
     bool moved = MoveReplace(tmp, path);
     if (!moved)   /* restore1b1 fold 2 (recheck item 2): once more after a sharing/access error (a checkpoint copy was reading it) */
     {
         const DWORD e = ::GetLastError();
         if (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) { ::Sleep(20); moved = MoveReplace(tmp, path); }
     }
-    if (!moved) { ::DeleteFileA(tmp.c_str()); return false; }
+    if (!moved) { U8DeleteFile(tmp.c_str()); return false; }
     if (linesNow != 0) *linesNow = (int)lines.size();
     return true;
 }
@@ -580,9 +581,9 @@ unsigned long long OwnStoreCommittedHigh()
 namespace {
 bool CheckpointCopyFile(const std::string& from, const std::string& to, long long* bytes)
 {
-    if (!::CopyFileA(from.c_str(), to.c_str(), FALSE)) return false;
+    if (!U8CopyFile(from.c_str(), to.c_str(), FALSE)) return false;
     WIN32_FILE_ATTRIBUTE_DATA a;
-    if (::GetFileAttributesExA(to.c_str(), GetFileExInfoStandard, &a)) *bytes += ((long long)a.nFileSizeHigh << 32) | (long long)a.nFileSizeLow;
+    if (U8GetFileAttributesEx(to.c_str(), GetFileExInfoStandard, &a)) *bytes += ((long long)a.nFileSizeHigh << 32) | (long long)a.nFileSizeLow;
     return true;
 }
 /* THE PLUGIN'S RECYCLE CALL (store.cpp's deleted-profile folder): FO_DELETE with FOF_ALLOWUNDO - the Recycle Bin, never a hard delete. */
@@ -592,7 +593,7 @@ bool CheckpointRecycle(const std::string& dir)
     SHFILEOPSTRUCTA op; std::memset(&op, 0, sizeof(op));
     op.wFunc = FO_DELETE; op.pFrom = &from[0];
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI;
-    return ::SHFileOperationA(&op) == 0 && !op.fAnyOperationsAborted;
+    return U8SHFileOperation(&op) == 0 && !op.fAnyOperationsAborted;
 }
 }   // namespace
 
@@ -600,10 +601,10 @@ namespace {
 unsigned long long CheckpointFolderBytes(const std::string& dir)   /* a checkpoint folder is flat: its files' sizes */
 {
     unsigned long long n = 0ULL;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = ::FindFirstFileA(Join(dir, "*").c_str(), &fd);
+    U8FindData fd;
+    HANDLE h = U8FindFirstFile(Join(dir, "*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return 0ULL;
-    do { if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) n += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow; } while (::FindNextFileA(h, &fd));
+    do { if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) n += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow; } while (U8FindNextFile(h, &fd));
     ::FindClose(h);
     return n;
 }
@@ -637,9 +638,9 @@ bool BinPolicyRead(const std::string& root, unsigned long* nuke, unsigned long* 
    asked BEFORE any recycle. */
 bool CheckpointBinCanTake(const std::string& dirIn)
 {
-    char full[MAX_PATH]; full[0] = 0;
-    const DWORD fn = ::GetFullPathNameA(dirIn.c_str(), MAX_PATH, full, 0);
-    if (fn == 0 || fn >= MAX_PATH) return false;
+    char full[MAX_PATH * 4]; full[0] = 0;   /* UTF-8: a 260-character path takes up to 780 bytes */
+    const DWORD fn = U8GetFullPathName(dirIn.c_str(), (DWORD)sizeof(full), full, 0);
+    if (fn == 0 || fn >= (DWORD)sizeof(full)) return false;
     const std::string dir(full);
     if (dir.size() < 3 || dir[1] != ':' || (dir[2] != '\\' && dir[2] != '/')) return false;
     const std::string root = dir.substr(0, 2) + "\\";
@@ -652,12 +653,12 @@ bool CheckpointBinCanTake(const std::string& dirIn)
     if (bin && !::GetDiskFreeSpaceExA(root.c_str(), &fr, &tot, &all)) tot.QuadPart = 0;
     return restoreguard::RecycleBinCanTake(fixed, bin, CheckpointFolderBytes(dir), tot.QuadPart);
 }
-bool PathThere(const std::string& p) { return ::GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+bool PathThere(const std::string& p) { return U8GetFileAttributes(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 /* fold 2 (recheck item 2): pp.ledger is written by the MAIN thread (temp + rename) - read it sharing read, write and delete, so
    this copy never blocks that rename. */
 bool CheckpointCopyShared(const std::string& from, const std::string& to, long long* bytes)
 {
-    HANDLE h = ::CreateFileA(from.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    HANDLE h = U8CreateFile(from.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) return false;
     std::vector<char> b; LARGE_INTEGER sz; sz.QuadPart = 0;
     bool ok = ::GetFileSizeEx(h, &sz) != 0 && sz.QuadPart >= 0 && sz.QuadPart < (64LL << 20);
@@ -687,9 +688,9 @@ void CheckpointRunOnWriter(const std::string& dir, const OwnCpJob& j)
     {
         /* own.index FIRST: every record it names is then the live .rec or the kept .rec.prev, both copied after it */
         const std::string idx(coopown::IndexFile());
-        if (::GetFileAttributesA(Join(dir, idx).c_str()) != INVALID_FILE_ATTRIBUTES && !CheckpointCopyFile(Join(dir, idx), Join(part, idx), bytes)) rc = -3;
-        WIN32_FIND_DATAA fd;
-        HANDLE h = rc == 1 ? ::FindFirstFileA(Join(dir, "*").c_str(), &fd) : INVALID_HANDLE_VALUE;
+        if (U8GetFileAttributes(Join(dir, idx).c_str()) != INVALID_FILE_ATTRIBUTES && !CheckpointCopyFile(Join(dir, idx), Join(part, idx), bytes)) rc = -3;
+        U8FindData fd;
+        HANDLE h = rc == 1 ? U8FindFirstFile(Join(dir, "*").c_str(), &fd) : INVALID_HANDLE_VALUE;
         if (h != INVALID_HANDLE_VALUE)
         {
             do
@@ -701,25 +702,25 @@ void CheckpointRunOnWriter(const std::string& dir, const OwnCpJob& j)
                 const bool copied = name == coopown::LedgerFile() ? CheckpointCopyShared(Join(dir, name), Join(part, name), bytes)   /* fold 2 (recheck item 2) */
                                                             : CheckpointCopyFile(Join(dir, name), Join(part, name), bytes);
                 if (!copied) { rc = -3; break; }
-            } while (::FindNextFileA(h, &fd));
+            } while (U8FindNextFile(h, &fd));
             ::FindClose(h);
         }
-        if (rc == 1 && !::MoveFileExA(part.c_str(), done.c_str(), 0)) rc = -3;
+        if (rc == 1 && !U8MoveFileEx(part.c_str(), done.c_str(), 0)) rc = -3;
         if (rc != 1 && PathThere(part) && CheckpointBinCanTake(part)) CheckpointRecycle(part);
     }
     r.rc = rc;
     if (rc == 1)
     {
         std::vector<std::string> names;
-        WIN32_FIND_DATAA fd;
-        HANDLE h = ::FindFirstFileA(Join(root, "*").c_str(), &fd);
+        U8FindData fd;
+        HANDLE h = U8FindFirstFile(Join(root, "*").c_str(), &fd);
         if (h != INVALID_HANDLE_VALUE)
         {
             do
             {
                 const std::string n(fd.cFileName);
                 if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 && n != "." && n != "..") names.push_back(n);
-            } while (::FindNextFileA(h, &fd));
+            } while (U8FindNextFile(h, &fd));
             ::FindClose(h);
         }
         const std::vector<std::string> out = restoreguard::PruneSelect(names, j.cap);
@@ -833,7 +834,7 @@ bool RpRecycleFiles(const std::vector<std::string>& files)
     SHFILEOPSTRUCTA op; memset(&op, 0, sizeof(op));
     op.wFunc = FO_DELETE; op.pFrom = &from[0];
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI;
-    return ::SHFileOperationA(&op) == 0 && !op.fAnyOperationsAborted;
+    return U8SHFileOperation(&op) == 0 && !op.fAnyOperationsAborted;
 }
 }   // namespace
 
@@ -858,7 +859,7 @@ void OwnStoreRepairApply(const std::vector<restoreguard::RepairRow>& rows, const
     std::vector<restoreguard::CpView> cps; std::vector<std::string> cpDirs; std::vector<std::map<std::string, coopown::IndexLine> > cpLines;
     {
         const std::string root = Join(Join(dir, "checkpoint"), world);
-        WIN32_FIND_DATAA fd; HANDLE h = ::FindFirstFileA(Join(root, "*").c_str(), &fd);
+        U8FindData fd; HANDLE h = U8FindFirstFile(Join(root, "*").c_str(), &fd);
         if (h != INVALID_HANDLE_VALUE)
         {
             do
@@ -877,7 +878,7 @@ void OwnStoreRepairApply(const std::vector<restoreguard::RepairRow>& rows, const
                     v.lines[it->first] = sv;
                 }
                 cps.push_back(v); cpDirs.push_back(Join(root, fd.cFileName)); cpLines.push_back(ls);
-            } while (::FindNextFileA(h, &fd));
+            } while (U8FindNextFile(h, &fd));
             ::FindClose(h);
         }
     }
@@ -924,7 +925,7 @@ void OwnStoreRepairApply(const std::vector<restoreguard::RepairRow>& rows, const
             std::string from;
             if (k != cl.end() && RpFileMatches(src, k->second.len, k->second.crc)) from = src;
             else if (k != cl.end() && RpFileMatches(srcPrev, k->second.len, k->second.crc)) from = srcPrev;
-            if (from.empty() || !::CopyFileA(from.c_str(), Join(dir, coopown::RecFile(it->first)).c_str(), FALSE)) { ++r.copyFailed; ++r.dropped; continue; }
+            if (from.empty() || !U8CopyFile(from.c_str(), Join(dir, coopown::RecFile(it->first)).c_str(), FALSE)) { ++r.copyFailed; ++r.dropped; continue; }
             l = k->second; l.seq = ++maxSeq; l.stamped = true; l.epoch = it->second.stamp.epoch; l.nbSeq = it->second.stamp.nbSeq;
             ++r.fromCheckpoint;
         }
@@ -935,18 +936,18 @@ void OwnStoreRepairApply(const std::vector<restoreguard::RepairRow>& rows, const
     if (ledgerCp >= 0)
     {
         const std::string cl = Join(cpDirs[(size_t)ledgerCp], coopown::LedgerFile());
-        if (PathThere(cl) && ::CopyFileA(cl.c_str(), ledger.c_str(), FALSE)) r.ledgerFromCheckpoint = 1;
+        if (PathThere(cl) && U8CopyFile(cl.c_str(), ledger.c_str(), FALSE)) r.ledgerFromCheckpoint = 1;
     }
     char pid[24]; _snprintf(pid, 23, "%lu", (unsigned long)::GetCurrentProcessId()); pid[23] = 0;
     if (changed > 0)
     {
         const std::string tmp = Join(dir, std::string(coopown::IndexFile()) + "." + pid + ".tmp");
-        if (!WriteAllFlushed(tmp, all.data(), all.size()) || !MoveReplace(tmp, Join(dir, coopown::IndexFile()))) { ::DeleteFileA(tmp.c_str()); r.rc = -4; *out = r; return; }
+        if (!WriteAllFlushed(tmp, all.data(), all.size()) || !MoveReplace(tmp, Join(dir, coopown::IndexFile()))) { U8DeleteFile(tmp.c_str()); r.rc = -4; *out = r; return; }
     }
     {
         const std::string seen = restoreguard::OwnRepairSeenFormat(top);
         const std::string tmp = Join(dir, std::string(kOwnRepairFile) + "." + pid + ".tmp");
-        if (!WriteAllFlushed(tmp, seen.data(), seen.size()) || !MoveReplace(tmp, Join(dir, kOwnRepairFile))) { ::DeleteFileA(tmp.c_str()); r.rc = -4; *out = r; return; }
+        if (!WriteAllFlushed(tmp, seen.data(), seen.size()) || !MoveReplace(tmp, Join(dir, kOwnRepairFile))) { U8DeleteFile(tmp.c_str()); r.rc = -4; *out = r; return; }
     }
     unsigned long long ms = 0ULL; int bad = 0;
     OwnStoreOpen(dir, &ms, &bad);   /* the index, the committed maps and the counter, as the folder now says */

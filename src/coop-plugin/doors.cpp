@@ -44,6 +44,9 @@ unsigned long long kUnlockDoorRva = 0; static coop::AddrReg kUnlockDoorRva_reg("
 unsigned long long kUpdateGateCodeRva = 0; static coop::AddrReg kUpdateGateCodeRva_reg("UpdateGateCodeState", &kUpdateGateCodeRva);   /* Steam_1.0.65 0x297250: the door's gate code recomputed (the route-finding's view of its lock).  lockButton calls it after its lock; unlockDoor ends in it */
 unsigned long long kLockButtonRva = 0; static coop::AddrReg kLockButtonRva_reg("LockButton", &kLockButtonRva);   /* Steam_1.0.65 0x5465D0: the player's lock button - sound, wantsToLock flipped, the lock follows it */
 static unsigned long long kSetupForcedOpenRet = 0; static coop::AddrReg kSetupForcedOpenRet_reg("SetupForcedOpenRet", &kSetupForcedOpenRet);   /* stage 7/9: the address table fills this. Steam_1.0.65 0x29D1D2 */
+static unsigned long long kSetupOpenAmountRet = 0; static coop::AddrReg kSetupOpenAmountRet_reg("SetupOpenAmountRet", &kSetupOpenAmountRet);   /* physics setup's second open-amount write (open amount = 1 if the state is open, else 0), just after the forced open. Steam_1.0.65 0x29D1EF */
+static unsigned long long kDoorInitialStateRet = 0; static coop::AddrReg kDoorInitialStateRet_reg("DoorInitialStateRet", &kDoorInitialStateRet);   /* a building's "initial door state" pass: its door loop ends each door with SetDoorState(door, 0). Steam_1.0.65 0x5529EE */
+static unsigned long long kDoorLoadFromSaveRet = 0; static coop::AddrReg kDoorLoadFromSaveRet_reg("DoorLoadFromSaveRet", &kDoorLoadFromSaveRet);   /* DoorStuff::_loadFromSerialise: the saved state written, then its open amount. Steam_1.0.65 0x2A07ED */
 
 const size_t kDoorState   = 0x380;   /* int  DoorState */
 const size_t kDoorOpenAmt = 0x37C;   /* float 0.0 shut .. 1.0 open */
@@ -245,6 +248,32 @@ volatile LONG g_doorChurnWatch = 0;
 volatile LONG g_doorLockSweepPending = 0;    /* some row's lockSweep is set (detour_closeDoor); DoorsTick takes it */
 volatile LONG g_dirty = 0;                   /* the tick's whole pre-check: nothing to do while this is 0 */
 volatile LONG g_gen = 0;                     /* this game's monotonic publish generation */
+/* What a (re)loading game's doors cost and get, printed on the reload[...] report line:
+   firstSightingOffered - a door seen for the first time, queued as a re-offer instead of an actor report;
+   sectorAsks / sectorServed - sectors named by the catch-up asks this game answered, and doors queued as re-offers in them;
+   loadWriteOffered - a known door written by an engine load-time writer, queued as a re-offer instead of an actor report;
+   genForgotten - held newest-wins records forgotten because their publisher entered the world;
+   genRefused - door messages refused as not newer than the record kept for their publisher (DoorGenStale);
+   giveUpReArmed - rows given up on ineffective corrections, tried again on a new accepted word;
+   heldEvicted - held-table entries taken for a new key while the table was full. */
+long long g_doorFirstSightingOffered = 0, g_doorSectorAsks = 0, g_doorSectorServed = 0, g_doorGenForgotten = 0;
+long long g_doorGiveUpReArmed = 0, g_doorHeldEvicted = 0;
+long long g_doorGenRefused = 0;
+long long g_doorLoadWriteOffered = 0;
+/* A holder word on this game, on the reload line as word[...]: storedNoRow - a word stored for a door with no row here;
+   droppedWithRow - a row whose door has a stored word, dropped by the active-zone check; reFindAsked / reFound / reFindMissed - such
+   a word's door looked up again through its building when the word was next due, and whether it was found; linesSuppressed - the
+   holder-word lines past their key's own budget or the session total (DoorWordLine). */
+long long g_doorWordStoredNoRow = 0, g_doorWordDroppedWithRow = 0;
+long long g_doorWordReFindAsked = 0, g_doorWordReFound = 0, g_doorWordReFindMissed = 0, g_doorWordLinesSuppressed = 0;
+/* A catch-up ask's doors, on the reload line as serve[...]: noRow - a door of an asked sector this game knows only by key (a held
+   entry, no row here), marked to be looked up through its building; reFound / missed - such a door found (or with a row again) when
+   its mark was taken, and then re-offered if it rests, or not found; overflow - a re-offer the full send queue refused (sectorServed
+   counts only the queued ones). */
+long long g_doorServeNoRow = 0, g_doorServeReFound = 0, g_doorServeMissed = 0, g_doorServeOverflow = 0;
+volatile LONG g_doorWordLines = 0;
+unsigned long g_doorHeldStamp = 0;           /* the held table's use counter (DoorHeldRow::lastUse) */
+volatile LONG g_doorServeLines = 0;          /* the sector-serve line's budget */
 /* B12-a / B12 (decision 52): THE DOOR ROAD'S OWN NO-NOTEBOOK NUMBERS, which did not exist before this
    build - the verdict was collapsed into "nobody holds it" and an actor report went out anyway.
    queued is a change written into the outage journal; payloadRefused is one the journal would not take, and
@@ -362,6 +391,10 @@ struct DoorHeldRow
     volatile long pendingActor;
     volatile long actorState;
     volatile long actorLocked;   /* the reporting game's lock word - it becomes `locked` only if this game adopts the report */
+    volatile long lastUse;       /* g_doorHeldStamp when this key was last looked up - the eviction order */
+    volatile long reFind;        /* 1 = the row of this word's door was dropped by the active-zone check: look the door up again */
+    volatile long serveFind;     /* 1 = a catch-up ask named this key's sector while it had no row here: look the door up, re-offer it */
+    volatile long wordLines;     /* holder-word lines spent on THIS key (DoorWordLine's per-key budget) */
 };
 DoorHeldRow g_held[kDoorHeldCap];
 
@@ -679,22 +712,41 @@ int DoorKeyIsGate(const char* key)
 }
 DoorHeldRow* HeldFor(const char* key, int makeIt)
 {
-    int i;
+    int i, take = -1, haveBest = 0, bestHasWord = 0;
+    unsigned long best = 0;
     for (i = 0; i < kDoorHeldCap; ++i)
-        if (g_held[i].used != 0 && std::strcmp(g_held[i].key, key) == 0) return &g_held[i];
+        if (g_held[i].used != 0 && std::strcmp(g_held[i].key, key) == 0)
+        { g_held[i].lastUse = (long)++g_doorHeldStamp; return &g_held[i]; }
     if (makeIt == 0) return 0;
     for (i = 0; i < kDoorHeldCap; ++i)
+        if (g_held[i].used == 0) { take = i; break; }
+    if (take < 0)
     {
-        if (g_held[i].used != 0) continue;
-        std::strncpy(g_held[i].key, key, kDoorKeyCap - 1);
-        g_held[i].key[kDoorKeyCap - 1] = 0;
-        g_held[i].state = -1; g_held[i].locked = -1; g_held[i].gen = -1; g_held[i].fromPeer = -1;
-        g_held[i].pendingActor = 0; g_held[i].actorState = -1; g_held[i].actorLocked = -1;
-        g_held[i].used = 1;
-        return &g_held[i];
+        /* FULL: of the entries whose door is not loaded here and that have no report waiting (coopdoor::DoorHeldEvictable),
+           one holding no holder word is taken before one that holds one, and among equals the one used longest ago
+           (coopdoor::DoorHeldBetterVictim) - so a stored word and its message counter are forgotten only when every candidate
+           holds one.  The rank test runs first, so the row lookup is asked only of a candidate better than the best so far. */
+        for (i = 0; i < kDoorHeldCap; ++i)
+        {
+            const int hasWord = (g_held[i].state >= 0) ? 1 : 0;
+            if (coopdoor::DoorHeldBetterVictim(hasWord, (unsigned long)g_held[i].lastUse, bestHasWord, best, haveBest) == 0) continue;
+            if (coopdoor::DoorHeldEvictable((int)g_held[i].used, RowByKey(g_held[i].key) != 0 ? 1 : 0,
+                                            (int)g_held[i].pendingActor) == 0) continue;
+            take = i; best = (unsigned long)g_held[i].lastUse; bestHasWord = hasWord; haveBest = 1;
+        }
+        if (take < 0) { ++g_doorHeldOverflow; return 0; }
+        ++g_doorHeldEvicted;
     }
-    ++g_doorHeldOverflow;
-    return 0;
+    i = take;
+    std::strncpy(g_held[i].key, key, kDoorKeyCap - 1);
+    g_held[i].key[kDoorKeyCap - 1] = 0;
+    g_held[i].state = -1; g_held[i].locked = -1; g_held[i].gen = -1; g_held[i].fromPeer = -1;
+    g_held[i].pendingActor = 0; g_held[i].actorState = -1; g_held[i].actorLocked = -1;
+    g_held[i].reFind = 0;
+    g_held[i].serveFind = 0; g_held[i].wordLines = 0;
+    g_held[i].lastUse = (long)++g_doorHeldStamp;
+    g_held[i].used = 1;
+    return &g_held[i];
 }
 /* M7b slice 4 fold 1 (review 2026-10-02 F8): AN ACTOR REPORT THAT WAS NOT SENT STAYS QUEUED. The drain frees an entry before it
    sends; an actor report SendDoorState refused (the holder's game not in the world, no road) is queued again with its retry count,
@@ -728,7 +780,8 @@ void DoorOutRetry(const char* key, long st, long lk, long rep, long tries, unsig
     }
     ++g_doorReportRetryFull;
 }
-void QueueOut(const char* key, int state, int locked, int reportIfNotHolder)
+/* 1 = queued for the sender; 0 = the send queue is full, the change is dropped and overflow[out] counts it. */
+int QueueOut(const char* key, int state, int locked, int reportIfNotHolder)
 {
     for (int i = 0; i < kDoorOutCap; ++i)
     {
@@ -740,9 +793,10 @@ void QueueOut(const char* key, int state, int locked, int reportIfNotHolder)
         g_out[i].reportIfNotHolder = reportIfNotHolder;
         g_out[i].retries = 0; g_out[i].firstFailMs = 0;   /* fold 1 (F8) */
         ::InterlockedExchange(&g_dirty, 1);
-        return;
+        return 1;
     }
     ::InterlockedIncrement64(&g_doorOutOverflow);
+    return 0;
 }
 
 /* ============================ P060 ============================
@@ -799,6 +853,20 @@ const char* HoldWord(void* door, int onMain)
             return "none";
         }
     }
+}
+
+/* THE ENGINE'S LOAD-TIME DOOR WRITERS, by the return address the detours read (RetRva): their writes are this game's load, never an
+   actor (coopdoor::DoorChangeReportsIfNotHolder).  The list is the address table's return-address rows for them: physics setup's
+   forced open and its open-amount write, a building's initial door state pass, and a door's load from the save.  A row the table
+   did not fill reads 0 and matches nothing. */
+int DoorRetIsLoadWriter(uintptr_t retRva)
+{
+    unsigned long long writers[4];
+    writers[0] = kSetupForcedOpenRet;
+    writers[1] = kSetupOpenAmountRet;
+    writers[2] = kDoorInitialStateRet;
+    writers[3] = kDoorLoadFromSaveRet;
+    return coopdoor::DoorRetIsLoadWriter((unsigned long long)retRva, writers, 4);
 }
 
 /* THE ONE PLACE A CHANGE IS RECORDED, so the funnel and the two edge detours cannot drift apart. */
@@ -963,10 +1031,16 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where, int ours)
                        re-created by the door's next funnel call with was = -1, and the shipped code
                        booked that as a local writer - so an apply that was this game hearing about the
                        door for the first time was attributed to "a local writer moved it". ---- */
-                    if (coopdoor::DoorSightingIsLocalWrite(was) == 0)
+                    /* WHO MADE THE CHANGE decides what it is (coopdoor::DoorChangeReportsIfNotHolder): a write by an engine
+                       load-time writer, or a first sighting, is this game's load - a re-offer and not a local writer; a call
+                       into openDoor / closeDoor / lockButton is an act on the door - an actor report and a local write, even
+                       on a row that is new. */
+                    const int rep = coopdoor::DoorChangeReportsIfNotHolder(was, DoorRetIsLoadWriter(retRva),
+                                                                            coopdoor::DoorEntryIsAction(where));
+                    if (rep == 0)
                     {
                         ::InterlockedExchange(&r->src, 0);
-                        ::InterlockedIncrement64(&g_doorFirstSighting);
+                        if (was < 0) ::InterlockedIncrement64(&g_doorFirstSighting);
                     }
                     else
                     {
@@ -979,7 +1053,17 @@ void NoteDoor(void* door, uintptr_t retRva, const char* where, int ours)
                        derives them.  Only a terminal state is queued, and under the last-actor rule
                        that queued change is ALSO the actor report a non-holder sends to the holder:
                        the drain asks who holds the door at the moment it sends. */
-                    if (state == 0 || state == 1) QueueOut(key, state, word, 1);
+                    /* A change that is this game's load (rep 0, above) goes as a re-offer, published only if this game
+                       holds the door. */
+                    if (state == 0 || state == 1)
+                    {
+                        if (rep == 0)
+                        {
+                            if (was < 0) ::InterlockedIncrement64(&g_doorFirstSightingOffered);
+                            else ::InterlockedIncrement64(&g_doorLoadWriteOffered);
+                        }
+                        QueueOut(key, state, word, rep);
+                    }
                     else ::InterlockedExchange(&g_dirty, 1);
                 }
             }
@@ -1094,6 +1178,53 @@ void DropRow(DoorRow* r)
     ::InterlockedExchange(&r->ready, 0);
     ::InterlockedExchangePointer(&r->door, 0);
     r->owner = 0;
+}
+/* The held entry for a key, without touching its eviction stamp. */
+DoorHeldRow* HeldPeek(const char* key)
+{
+    for (int i = 0; i < kDoorHeldCap; ++i)
+        if (g_held[i].used != 0 && std::strcmp(g_held[i].key, key) == 0) return &g_held[i];
+    return 0;
+}
+/* WHAT HAPPENS TO A HOLDER WORD ON THIS GAME, one line per event naming the door.  THE BUDGET IS PER KEY, as P060's is: a key with a
+   held entry prints at most kDoorWordLinePerKey lines, so one catch-up's doors cannot spend the line a gate needs; a key naming a gate
+   (coopdoor::DoorKeyNamesGate) prints within that budget whatever the session total says and does not spend the total; every other
+   line also needs room in the session total of kDoorWordLineBudget (coopdoor::DoorWordLinePrints).  What is refused is counted
+   (word[...linesSuppressed] on the reload line).  The call is claimed as the give-up line's is, because DebugLog is not thread-safe. */
+const LONG kDoorWordLineBudget = 40;
+const LONG kDoorWordLinePerKey = 4;
+void DoorWordLine(const char* key, int state, const char* what)
+{
+    DoorHeldRow* h = HeldPeek(key);
+    const int isGate = coopdoor::DoorKeyNamesGate(key);
+    const long keyLines = (h != 0) ? (long)::InterlockedIncrement(&h->wordLines) : 0;
+    const long total = (h != 0 && isGate != 0) ? 0 : (long)::InterlockedIncrement(&g_doorWordLines);
+    if (coopdoor::DoorWordLinePrints((h != 0) ? 1 : 0, keyLines, total, isGate, kDoorWordLinePerKey, kDoorWordLineBudget) == 0
+        || ::InterlockedCompareExchange(&g_doorLogInFlight, 1, 0) != 0)
+    { ::InterlockedIncrement64(&g_doorWordLinesSuppressed); return; }
+    {
+        char b[320];
+        _snprintf(b, 319, "[DOOR] holder word key=%s state=%d: %s", key, state, what);
+        b[319] = 0;
+        DebugLog(b);
+    }
+    ::InterlockedExchange(&g_doorLogInFlight, 0);
+}
+/* A ROW THE ACTIVE-ZONE CHECK REFUSED IS DROPPED - and when the holder's word for its door is stored here, the word is marked to look
+   its door up again through the parent building (DoorResolveByKey) when it is next due: the check can refuse a door that is still
+   loaded (a truncated walk), and unmarked the word would wait for the engine to move the door before it applied. */
+void DropRowKeepWord(DoorRow* r)
+{
+    DoorHeldRow* h = HeldPeek(r->key);
+    if (h != 0 && coopdoor::DoorDropMarksReFind((long)h->state) != 0)
+    {
+        ::InterlockedExchange(&h->reFind, 1);
+        ++g_doorWordDroppedWithRow;
+        DoorWordLine(r->key, (int)h->state, "its door row was dropped by the active-zone check - the door is looked up again when"
+                     " the word is next due");
+        ::InterlockedExchange(&g_dirty, 1);
+    }
+    DropRow(r);
 }
 
 /* ============================ P8o: KEY -> DOOR, THE LONG WAY ROUND (T236g) ============================
@@ -1357,7 +1488,7 @@ int DoorApplyLock(DoorRow* r, DoorHeldRow* h)
 void DoorLockSweepRow(DoorRow* r)
 {
     int state = 0, doa = 0, locked = 0, wants = 0, broken = 0, word;
-    if (DoorRowStillActive(r) == 0) { ++g_doorDroppedInactive; DropRow(r); return; }
+    if (DoorRowStillActive(r) == 0) { ++g_doorDroppedInactive; DropRowKeepWord(r); return; }
     if (DoorPlausible(r->door) == 0) return;
     if (DoorReadPod(r->door, &state, &doa, &locked, &wants, &broken) == 0) { ++g_doorReadFault; return; }
     word = coopdoor::DoorLockWord(locked, wants);
@@ -1387,7 +1518,7 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
     {
         ++g_doorDroppedInactive;
         if (DoorTakePending(h) != 0) ++g_doorActorUnnameable;
-        DropRow(r);
+        DropRowKeepWord(r);
         return 0;
     }
     if (DoorPlausible(r->door) == 0)
@@ -1700,6 +1831,9 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
         if (reason == 2) ++g_doorReapplyAfterForcedOpen;
         else if (reason == 3) ++g_doorAppliedHolderWord;
         else ++g_doorAppliedOnArrival;
+        DoorWordLine(r->key, (h != 0) ? (int)h->state : -1,
+                     reason == 2 ? "applied to its door (after a forced open)"
+                                 : (reason == 3 ? "applied to its door (a new holder word)" : "applied to its door (the door registered here)"));
         ::InterlockedIncrement(&r->applies);
         /* P8n: THE CORRECTION IS NOW ON THE RECORD AS A CORRECTION.  If a non-self writer moves this
            door before the two games agree, NoteDoor consumes this flag and counts an `undone` - which
@@ -2003,6 +2137,100 @@ void DoorsOnLinkUp()
     }
 }
 
+/* A DOOR A CATCH-UP ASK NAMED WHILE IT HAD NO ROW HERE, and now with one (DoorsTick, serveFind): re-offered once, as DoorsServeCatchup
+   re-offers a registered door.  A row the resolver has just made has no state yet (RowFor writes -1), so for freshRow the door's own
+   state and lock word are read - DoorPlausible first, then a guarded plain read, no virtual call.  MAIN THREAD.  1 = queued; 0 = not
+   resting, unreadable, or the send queue was full (serve[...overflow]). */
+int DoorServeReOffer(DoorRow* r, int freshRow)
+{
+    int st = (int)r->state, lk = (int)r->locked;
+    if (freshRow != 0)
+    {
+        int s = 0, d = 0, l = 0, w = 0, b = 0;
+        if (DoorPlausible(r->door) == 0 || DoorReadPod(r->door, &s, &d, &l, &w, &b) == 0) return 0;
+        st = s; lk = coopdoor::DoorLockWord(l, w);
+    }
+    if (coopdoor::DoorStateIsTerminal(st) == 0) return 0;
+    if (QueueOut(r->key, st, lk, 0) == 0) { ++g_doorServeOverflow; return 0; }
+    ++g_doorSectorServed;
+    return 1;
+}
+
+/* THE CATCH-UP ANSWER'S DOORS.  The world server asks the games that have these sectors LOADED to catch up a game that has just come
+   to have them in its delivery area - so the area's holder is asked, and from this moment the asker is in the sectors' delivery set.
+   Every registered door of those sectors in a resting state is re-offered once (reportIfNotHolder 0): the drain publishes it, routed
+   by the door's sector so it reaches the asker, only if this game holds the door when it sends.  The asker stores the word and
+   applies it to its own copy of the door - the holder's state wins after any (re)load.  A re-offer the full send queue refuses is
+   counted as overflow, not as served.  A door of those sectors this game knows only by key - a held entry with no row here, its row
+   dropped by the active-zone check, the purge or the full registry while the engine has not moved it since - is MARKED (serveFind):
+   DoorsTick looks it up through its building out of its one-look-up-per-tick allowance and re-offers it if found.  Only the asked
+   sectors' keys, once per ask; no door that is not loaded is searched.  MAIN THREAD (worldsync.cpp's catch-up answer); it only reads
+   the registry and the held table, marks and queues. */
+void DoorsServeCatchup(const int* sx, const int* sy, int n, int askerSlot, unsigned int askNo)
+{
+    int served = 0, overflow = 0, noRow = 0;
+    if (!g_on || sx == 0 || sy == 0 || n <= 0) return;
+    g_doorSectorAsks += n;
+    for (int i = 0; i < kDoorRows; ++i)
+    {
+        int rx = -1, ry = -1, parsed;
+        if (g_rows[i].door == 0 || g_rows[i].ready == 0) continue;
+        parsed = coopdoor::DoorKeySector(g_rows[i].key, &rx, &ry);
+        if (coopdoor::DoorServesCatchup(parsed, rx, ry, sx, sy, n, (int)g_rows[i].state) == 0) continue;
+        if (QueueOut(g_rows[i].key, (int)g_rows[i].state, (int)g_rows[i].locked, 0) != 0) ++served; else ++overflow;
+    }
+    for (int k = 0; k < kDoorHeldCap; ++k)
+    {
+        int hx = -1, hy = -1, inAsk;
+        if (g_held[k].used == 0) continue;
+        inAsk = coopdoor::DoorKeyInAsk(coopdoor::DoorKeySector(g_held[k].key, &hx, &hy), hx, hy, sx, sy, n);
+        if (inAsk == 0) continue;
+        if (coopdoor::DoorServeMarksHeld(inAsk, RowByKey(g_held[k].key) != 0 ? 1 : 0) == 0) continue;
+        ::InterlockedExchange(&g_held[k].serveFind, 1);
+        ++noRow;
+    }
+    if (noRow > 0) ::InterlockedExchange(&g_dirty, 1);
+    g_doorSectorServed += served;
+    g_doorServeOverflow += overflow;
+    g_doorServeNoRow += noRow;
+    if ((served > 0 || overflow > 0 || noRow > 0) && ::InterlockedIncrement(&g_doorServeLines) <= 64)
+    {
+        char b[384];
+        _snprintf(b, 383, "[DOOR] catch-up #%u for slot %d: %d sector(s), %d door(s) re-offered, %d not queued (send queue full), %d known"
+                  " by key only marked to be looked up through their building - published as the holder's word only where this game"
+                  " holds them (the first 64 are logged; the totals are on the reload line)", askNo, askerSlot, n, served, overflow, noRow);
+        b[383] = 0;
+        DebugLog(b);
+    }
+}
+
+/* A PLAYER ENTERED THE WORLD: the newest-wins record kept for its door messages is forgotten, so a restarted game's new counter
+   is not refused (coopdoor::DoorGenForgetOnArrival).  arrivedSlot -1 = the arrival names no single player.  The publisher on record
+   is a player key (negative as a long); -1 is the empty marker (coopdoor::DoorHeldPublisherKnown). */
+void DoorsForgetPublisherGen(int arrivedSlot)
+{
+    for (int i = 0; i < kDoorHeldCap; ++i)
+    {
+        int heldSlot;
+        if (g_held[i].used == 0) continue;
+        heldSlot = (coopdoor::DoorHeldPublisherKnown((long)g_held[i].fromPeer) != 0)
+                   ? net::PlayerSlotOfKey((unsigned int)g_held[i].fromPeer) : -1;
+        if (coopdoor::DoorGenForgetOnArrival((long)g_held[i].gen, heldSlot, arrivedSlot) == 0) continue;
+        g_held[i].gen = -1;
+        g_held[i].fromPeer = -1;
+        ++g_doorGenForgotten;
+    }
+}
+
+/* AN ACCEPTED WORD FOR A DOOR WHOSE ROW GAVE UP ON INEFFECTIVE CORRECTIONS tries the row again (coopdoor::DoorWordReArmsGiveUp). */
+void DoorReArmGiveUp(DoorRow* r)
+{
+    if (r == 0 || coopdoor::DoorWordReArmsGiveUp(1, (int)r->gaveUp) == 0) return;
+    ::InterlockedExchange(&r->ineffective, 0);
+    ::InterlockedExchange(&r->gaveUp, 0);
+    ++g_doorGiveUpReArmed;
+}
+
 void ApplyDoorState(const std::string& key, int state, int locked, unsigned int gen, unsigned int fromPeer,
                     int origin)
 {
@@ -2016,7 +2244,7 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
            the new holder's own counter is not the old one's.  Actor reports and holder publishes come
            off the SAME per-game counter, so one ordering covers both. */
         /* M7b slice 4 fold 1 (F2): the publisher keyed as a PLAYER - a road switch keeps the age check */
-        if (coopdoor::DoorGenStale(h->fromPeer, h->gen, (long)net::PlayerKeyNow(fromPeer), (long)gen) != 0) return;
+        if (coopdoor::DoorGenStale(h->fromPeer, h->gen, (long)net::PlayerKeyNow(fromPeer), (long)gen) != 0) { ++g_doorGenRefused; return; }
         if (origin == coopdoor::kDoorOriginActor)
         {
             /* P8n-c (review-p8n-b M-2b): the ordering state is taken by a message that is ACCEPTED.
@@ -2025,6 +2253,7 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
             /* ... and its lock word waits beside its state: it becomes this game's answer only if this
                game holds the door and adopts the report. */
             ::InterlockedExchange(&h->actorLocked, (long)locked);
+            DoorReArmGiveUp(RowByKey(key.c_str()));   /* a holder whose row gave up adopts the report instead of dropping it */
             /* P8n: AN ACTOR REPORT DOES NOT BECOME THE HOLDER'S ANSWER HERE.  Whether this game holds
                the door needs the door's position - a virtual call through a stored pointer - so the
                question waits for DoorsTick, where the active-zone walk has already passed. */
@@ -2104,6 +2333,16 @@ void ApplyDoorState(const std::string& key, int state, int locked, unsigned int 
                 ::InterlockedExchange(&rr->holderWord, 1);
                 ::InterlockedExchange(&rr->lockGaveUp, 0);
                 ::InterlockedExchange(&rr->lockStuck, 0);
+                DoorReArmGiveUp(rr);
+            }
+            else
+            {
+                ++g_doorWordStoredNoRow;
+                /* The word is marked to look its door up through its building (reFind, DoorResolveByKey, the one look-up per tick):
+                   unmarked it would wait until the engine moved the door. */
+                ::InterlockedExchange(&h->reFind, 1);
+                DoorWordLine(key.c_str(), state, "stored - this game has no row for the door; the door is looked up through its building"
+                             " when the word is next due");
             }
         }
         ::InterlockedExchange(&g_dirty, 1);
@@ -2119,7 +2358,12 @@ void DoorsTick()
        happen when nothing local has changed - the peer has just arrived and has been told nothing. */
     {
         static long s_arrCursor = 0;   /* M11 C2: a player ENTERING THE WORLD (the old link's up edge is the session peer's) - every door re-offered */
-        if (StoreArrivalsSince(kArrServeDoors, &s_arrCursor, 0) > 0) DoorsOnLinkUp();
+        int arrivedSlot = -1;
+        if (StoreArrivalsSince(kArrServeDoors, &s_arrCursor, &arrivedSlot) > 0)
+        {
+            DoorsForgetPublisherGen(arrivedSlot);
+            DoorsOnLinkUp();
+        }
     }
     /* ---- P8n-c (review-p8n-b M-3, MANAGER RULING): THE CHURN RE-ARM CLOCK, JUDGED ONCE A SECOND.
        It sits ABOVE the idle gate because a row that has given up produces no events at all - that is
@@ -2162,7 +2406,7 @@ void DoorsTick()
             if (g_rows[p].door == 0 || g_rows[p].ready == 0) continue;
             if (DoorRowStillActive(&g_rows[p]) != 0) continue;
             ++g_doorDroppedInactive;
-            DropRow(&g_rows[p]);
+            DropRowKeepWord(&g_rows[p]);   /* a stored holder word's door is looked up again through its building */
         }
     }
 
@@ -2218,7 +2462,9 @@ void DoorsTick()
                    and only droppedInactive - which also covers the apply and the sweep - said so.
                    58 of the holder's ~98 terminal changes went this way in T236d. */
                 if (DoorRowStillActive(r) == 0)
-                { ++g_doorDroppedInactive; ++g_doorPublishDroppedInactive; DropRow(r); continue; }
+                {
+                    ++g_doorDroppedInactive; ++g_doorPublishDroppedInactive; DropRowKeepWord(r); continue;
+                }
                 if (DoorPosPod(r->door, pos) == 0) { ++g_doorPublishNotHolder; continue; }
                 {
                     /* P8n: the holder question is asked LIVE, at the moment of commitment (principle
@@ -2309,10 +2555,17 @@ void DoorsTick()
         if (g_held[i].used == 0) continue;
         /* P8n: a row whose holder state is still unknown is visited ONLY when it carries an actor
            report waiting to be adopted - which is the ordinary first event on a door the holder has
-           never published about, and which the old gate would have left pending for ever. */
-        if (g_held[i].state < 0 && g_held[i].pendingActor == 0) continue;
+           never published about, and which the old gate would have left pending for ever.  It is also
+           visited for a catch-up mark (serveFind), and then only to look its door up and re-offer it. */
+        if (coopdoor::DoorHeldVisited((long)g_held[i].state, (int)g_held[i].pendingActor, (int)g_held[i].serveFind) == 0) continue;
         {
             DoorRow* r = RowByKey(g_held[i].key);
+            /* A CATCH-UP MARK ON AN ENTRY WHOSE DOOR HAS A ROW AGAIN: the mark is taken and the door re-offered from its row. */
+            if (r != 0 && g_held[i].serveFind != 0 && ::InterlockedExchange(&g_held[i].serveFind, 0) != 0)
+            {
+                ++g_doorServeReFound;
+                DoorServeReOffer(r, 0);
+            }
             /* P8o (T236g): BEFORE GIVING UP ON THE NAME, ASK THE PARENT BUILDING.  A row is created by
                this game's own setDoorState detours, so a reloaded zone leaves the holder unable to
                name a door its peer keeps reporting - 24 reports dropped here and about 100 s of
@@ -2323,8 +2576,12 @@ void DoorsTick()
                consumed and nothing is booked unnameable for them - and the tick is left dirty so a
                later one tries them.  The pending-report consume below is what bounds a key to one
                attempt per report, so no latch is needed (review-p8o L-1). */
-            if (r == 0 && g_held[i].pendingActor != 0)
+            /* A STORED HOLDER WORD WHOSE ROW THE ACTIVE-ZONE CHECK DROPPED (reFind, DropRowKeepWord) is looked up the same way,
+               once per drop, out of the same one-per-tick budget; a look-up deferred by the budget keeps its mark.  So is a key a
+               catch-up ask marked (serveFind, DoorsServeCatchup), once per ask; a door found for it is re-offered once (DoorServeReOffer). */
+            if (r == 0 && coopdoor::DoorHeldLookupDue((int)g_held[i].pendingActor, (int)g_held[i].reFind, (int)g_held[i].serveFind) != 0)
             {
+                const int reFinding = (g_held[i].pendingActor == 0) ? 1 : 0;
                 if (resolvedThisTick != 0)
                 {
                     ++g_doorResolveDeferred;
@@ -2333,8 +2590,29 @@ void DoorsTick()
                 }
                 resolvedThisTick = 1;
                 s_heldCursor = (i + 1) % kDoorHeldCap;   /* P8o-c: next tick starts past this slot */
+                const long hadReFind = ::InterlockedExchange(&g_held[i].reFind, 0);
+                const long hadServe = ::InterlockedExchange(&g_held[i].serveFind, 0);
                 r = DoorResolveByKey(g_held[i].key);
+                if (reFinding != 0 && hadReFind != 0)
+                {
+                    ++g_doorWordReFindAsked;
+                    if (r != 0) ++g_doorWordReFound; else ++g_doorWordReFindMissed;
+                    DoorWordLine(g_held[i].key, (int)g_held[i].state,
+                                 r != 0 ? "its door was found again through its building"
+                                        : "its door was not found among the loaded buildings - the word waits for the door to register");
+                }
+                if (hadServe != 0)
+                {
+                    if (r != 0) { ++g_doorServeReFound; DoorServeReOffer(r, 1); } else ++g_doorServeMissed;
+                    DoorWordLine(g_held[i].key, (int)g_held[i].state,
+                                 r != 0 ? "a catch-up ask named its sector while it had no row here - its door was found again through its"
+                                          " building and is re-offered if it rests"
+                                        : "a catch-up ask named its sector while it had no row here - its door was not found among the"
+                                          " loaded buildings");
+                }
             }
+            /* An entry visited only for its catch-up mark (no holder word, no actor report) has nothing to apply. */
+            if (g_held[i].state < 0 && g_held[i].pendingActor == 0) continue;
             if (r == 0)
             {
                 ++g_doorApplyUnresolved;
@@ -2411,6 +2689,20 @@ void ReportDoors()
             g_doorQueuedNoNotebook, g_doorQueuePayloadRefused);
         b[3583] = 0;
         DebugLog(b);
+    }
+    {
+        char t0[896];
+        _snprintf(t0, 895, "[DOOR] reload[firstSightingOffered,sectorAsks,sectorServed,genForgotten,giveUpReArmed,heldEvicted]"
+                  "=%lld,%lld,%lld,%lld,%lld,%lld loadWriteOffered=%lld genRefused=%lld"
+                  " word[storedNoRow,droppedWithRow,reFindAsked,reFound,reFindMissed,linesSuppressed]=%lld,%lld,%lld,%lld,%lld,%lld"
+                  " serve[noRow,reFound,missed,overflow]=%lld,%lld,%lld,%lld",
+                  g_doorFirstSightingOffered, g_doorSectorAsks, g_doorSectorServed, g_doorGenForgotten,
+                  g_doorGiveUpReArmed, g_doorHeldEvicted, g_doorLoadWriteOffered, g_doorGenRefused,
+                  g_doorWordStoredNoRow, g_doorWordDroppedWithRow, g_doorWordReFindAsked, g_doorWordReFound,
+                  g_doorWordReFindMissed, g_doorWordLinesSuppressed,
+                  g_doorServeNoRow, g_doorServeReFound, g_doorServeMissed, g_doorServeOverflow);
+        t0[895] = 0;
+        DebugLog(t0);
     }
     {   /* T-160 */
         char t1[480];

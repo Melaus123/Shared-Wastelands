@@ -87,6 +87,27 @@ inline int PickOwnerRec(int recFound, int recSlot, int mySlot, int hostFound, in
     return PickOwner(hostFound, hostCls, hostSlot, selfCls, selfSlot, slot, via);
 }
 
+/* A PRODUCTION BUILDING WHOSE ONLY PLAYER CLAIM IS ITS OWN FACTION MARK (via 0: no build record names an owner and no
+   player's house holds it) - a wild resource node the engine marked for a worker - is NOBODY'S: the area rule writes it. That
+   mark is read by each game on its own copy and the two copies can carry different marks, so it is not one input both games
+   share; the build record (via 2) and a player's house (via 1) are, and keep the owner rule. isProduction = the building's
+   operate slot is ProductionBuilding::operate. */
+inline int MarkOnlyNodeClass(int isProduction, int via, int cls)
+{
+    if (isProduction != 0 && via == 0 && cls != kOwnUnreadable) return kOwnNone;
+    return cls;
+}
+
+/* THE BUILD SCAN'S WORLD-NODE TEST. A production building with no build record whose construction state lists NO building
+   materials is one the world placed (a mining node - every piece a player builds costs materials): the scan never registers it
+   as this game's own piece, whatever faction mark it carries. A production building with materials (a player-built machine
+   the registry has no row for) and one whose list cannot be read are registered as before. matCount = the engine's
+   construction-materials count (ConstructionState +0x18), -1 unreadable. */
+inline int ScanSkipsWorldNode(int isProduction, int hasRow, int matCount)
+{
+    return (isProduction != 0 && hasRow == 0 && matCount == 0) ? 1 : 0;
+}
+
 const int kRungArea = -1;   /* the owner rung steps aside: the area rule decides */
 const int kRungMine = 1;    /* == items.cpp kBoxMine: this game writes */
 const int kRungHeld = 2;    /* == items.cpp kBoxHeld: the owner's (other) game writes */

@@ -10,6 +10,8 @@
  *   UNLOAD    - the reason's own test is "the zone is not loaded" (the character stays in the engine's world data);
  *   DEATH     - the character ends: eaten (decomp_64f8e0.txt:192), the corpse decayed (decomp_5cc300.txt:81), a squad member
  *               created and discarded before it ever stood in the world (decomp_582f80.txt:1430, decomp_79b620.txt:126);
+ *               the plugin's own removal of a second living body of a named character (kDuplicateNamedRemoved, worldstate.cpp)
+ *               is a DEATH too: that body ends for good and the other games remove their copies of it.
  *   AMBIGUOUS - every other reason, and an unknown one: a DEATH only when the engine's own Character::hasDied says dead.
  */
 #ifndef COOP_COMMON_REMOVALREASON_H
@@ -18,6 +20,9 @@
 namespace coopremoval {
 
 enum { kReasonDeath = 0, kReasonUnload = 1, kReasonAmbiguous = 2 };
+
+/* the reason the plugin passes to GameWorld::destroy when it removes a second living body of a named character this game owns */
+static const char* const kDuplicateNamedRemoved = "duplicate named character removed";
 
 inline int ReasonIs(const char* r, const char* lit)
 {
@@ -30,7 +35,7 @@ inline int EngineRemovalReasonClass(const char* r)
 {
     if (r == 0) return kReasonAmbiguous;
     if (ReasonIs(r, "corpse unloaded") || ReasonIs(r, "ZoneMapContent::deactivate") || ReasonIs(r, "delayedSpawningChecks")) return kReasonUnload;
-    if (ReasonIs(r, "eaten") || ReasonIs(r, "corpse decayed") || ReasonIs(r, "createRandomSquad") || ReasonIs(r, "_putTheSpecialCharactersInNewSquads")) return kReasonDeath;
+    if (ReasonIs(r, "eaten") || ReasonIs(r, "corpse decayed") || ReasonIs(r, "createRandomSquad") || ReasonIs(r, "_putTheSpecialCharactersInNewSquads") || ReasonIs(r, kDuplicateNamedRemoved)) return kReasonDeath;
     return kReasonAmbiguous;
 }
 

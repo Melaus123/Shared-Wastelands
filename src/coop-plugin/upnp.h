@@ -1,6 +1,8 @@
-/* upnp.h - T-53: the home router is asked to forward the world server's one UDP port while this game hosts.
-   The router work runs on its own background thread (upnp.cpp); the decisions are src/common/upnpplan.h. Nothing is
-   shown to the player (owner decision 382) - [UPNP] log lines and the REPORT's upnp[...] field only. */
+/* upnp.h - T-53: the home router is asked to forward the world server's one UDP port while this game hosts (the mod's
+   own UPnP IGD ask, then PCP / NAT-PMP, then Windows' NATUPnP), with a lease renewed while hosting lasts.
+   The router work runs on its own background thread (upnp.cpp); the decisions are src/common/upnpplan.h, the wire texts
+   src/common/routerwire.h. Nothing is shown to the player (owner decision 382) - [UPNP] log lines and the REPORT's
+   upnp[...] fields only. */
 #ifndef COOP_UPNP_H
 #define COOP_UPNP_H
 
@@ -24,9 +26,10 @@ void UpnpQuitBegin();
 void UpnpQuitWait();
 
 /* THE INTERNET ADDRESS, FROM THE ROUTER (nothing outside the home is contacted by this ask).  MAIN THREAD, when
-   the HOSTING window opens: the router thread is asked for the address the router reports (get_ExternalIPAddress on our
-   port's entry for `port`, else on any entry the router lists).  Never waits; returns the ask's number (> 0), or 0 when the
-   router thread could not be started (the answer is then "not found").  A newer ask replaces an older one. */
+   the HOSTING window opens: the router thread is asked for the address the router reports (UPnP IGD GetExternalIPAddress,
+   then NAT-PMP's address request, then NATUPnP's get_ExternalIPAddress on our port's entry for `port`, else on any entry
+   the router lists).  Never waits; returns the ask's number (> 0), or 0 when the router thread could not be started (the
+   answer is then "not found").  A newer ask replaces an older one. */
 long UpnpAddrAsk(unsigned short port);
 
 /* MAIN THREAD, polled: 0 = ask `askId` is not answered yet (or a newer ask replaced it), 1 = found (*ip set: a public IPv4
@@ -45,7 +48,9 @@ long UpnpLookupAsk();
    (*why names each website and why it gave none - never an address). */
 int UpnpLookupResult(long askId, std::string* ip, std::string* source, std::string* why);
 
-/* "upnp[asked,mapped,already,failed,removed,noRouter,off]=..." for the [net] REPORT line. */
+/* "upnp[asked,mapped,already,failed,removed,noRouter,off]=... upnpRoute[igd,pcp,natpmp,windows,renewed,renewFailed]=...
+   upnpLast=<route>/<lease seconds>" for the [net] REPORT line: the asks' outcomes, which route settled each, the lease
+   renewals, and the route and lease of the newest ask. */
 std::string UpnpReportToken();
 
 }   /* namespace coop */

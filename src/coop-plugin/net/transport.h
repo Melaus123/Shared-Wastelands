@@ -249,7 +249,21 @@ enum MsgType
     // (the copy's game -> the character's owner, on the road the SPAWN came by): this game's character table refused the copy, so the
     // character is not shown here. The owner counts it; nothing else changes.
     // RELIABLE.  uid u32 | reason u8 | the sender's refusal count u32      (src/common/uidtable.h H)
-    MSG_NOT_SHOWN     = 73
+    MSG_NOT_SHOWN     = 73,
+    // RESEND (a copy's game <-> the character's owner). ASK: this game lost its copy of the owner's
+    // character (or never got one) while the character stands in an area loaded here - send it again. ANSWER: the owner's verdict per
+    // uid; for SENT the full state went to the asking game alone first. The ask goes by the owner's road (effectwire.h
+    // EffectRequestRoad), the answer back on the road the ask came by.
+    // RELIABLE.  kind u8 | n u8 | n x (uid u32 | verdict u8)      (src/common/lostcopy.h)
+    MSG_RESEND        = 74,
+    // T-619: TOWN_PRICES (the world's ONE price source - townprice::PriceSource: the lowest IN_WORLD roster slot, or the session host
+    // with no roster - to every other game, each by one road: the session link to its session peer, the world server to the rest):
+    // one town's per-item local trade multipliers as the source's engine rolled them, once per (arrival epoch, world load) of the
+    // source (a game whose own source answer names the sender only after a copy arrived keeps that copy and files it then).
+    // Every other game answers Town::getLocalTradePriceMult from the source's tables,
+    // so every game quotes one price at one counter. RELIABLE.
+    //   'TPR1' | u32 the source's world generation | u8 len + town stringID | u16 n | n x {u8 len + item stringID, f32}   (src/common/townprices.h)
+    MSG_TOWN_PRICES   = 75
 };
 
 enum Channel

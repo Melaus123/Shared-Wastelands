@@ -17,6 +17,7 @@
 #include "../common/slotwire.h"   /* stand1 fold (1d): WireLacksSlot */
 #include "../common/liverelay.h"   /* M6 (T-197 piece 6): CATCHUP ASK / CATCHUP_END and the sector key */
 #include "medical.h"   /* M7a: StatePush - the catch-up's STATE */
+#include "../common/spawnage.h"   /* kSpawnFlagKo - a SPAWN of a knocked-out character */
 #include "combat.h"    /* M7a: CombatModeResendOwned - the catch-up's COMBATMODE */
 #include "replicate.h"   /* M7a2 item 9 [m7a2-ws0]: IntentResendOwned - the catch-up's INTENT */
 #include "playerfaction.h"   // P3: the player faction travels as "@player:<name>" (decision 23)
@@ -27,7 +28,9 @@
 
 #include "coop_log.h"
 #include "handoff.h"   /* T-1 B1: SquadDecisionPos - a squad member is decided by its squad's position */
+#include "doors.h"   /* DoorsServeCatchup - the catch-up answer re-offers the doors this game holds there */
 #include "../common/squadwriter.h"   /* M7a3f3 [m7a3f3-ws0]: kAnn* and HandedOverSweepAction */
+#include "../common/lostcopy.h"   /* ResendOwnerVerdict, StaleRowGivesWay */
 #include "game/Character.h"
 #include "addresses.h"   /* mig3: coop::GameWorldPtr() / OptionsPtr() - our rows for what `ou` / `options` imported */
 #include "game/GameWorld.h"
@@ -159,6 +162,10 @@ Adopted g_adoptedRows[kMaxAdopted] = {0};
 // and to the session peer only while the notebook road is down.
 std::map<unsigned int, int> g_announced;
 long long g_withheld = 0, g_unloadsSent = 0, g_reannouncedOnReload = 0, g_announceTicks = 0, g_announceStale = 0, g_announceSkippedHandover = 0, g_streamGateWithheld = 0;
+/* announceHeldForHandover = announce passes that held a uid's withdrawal for its hand-over (cooplive::kAnnHoldForHandover, per
+   uid per pass); g_annHeld = the uids held now (each logged once when held and once when the hold ends, the first 60 lines) */
+long long g_announceHeldForHandover = 0, g_annHeldLogged = 0;
+std::map<unsigned int, int> g_annHeld;
 long long g_withdrawnOwnUnload = 0;   /* E9: UNLOADs sent because WE no longer have the sector loaded - the half of decision 35 that the peer-held test cannot see. A subset of g_unloadsSent, never an addition to it. */
 bool PeerHoldsSectorOf(const Ogre::Vector3& pos) { return OtherHasSector(SectorOf(pos.x, pos.z)); }
 int  g_adoptedCount = 0;
@@ -485,6 +492,7 @@ long long g_rwSent = 0;                 /* UNLOADs this mechanism put on the wir
 long long g_rwDeferredLinkDown = 0;     /* ATTEMPTS the transport declined - one entry can produce many */
 long long g_rwCancelledByRestore = 0;   /* the character came back before the send: nothing was sent */
 long long g_rwNotAnnounced = 0;         /* the peer was never told about this uid: nothing to withdraw */
+long long g_rwNotMine = 0;              /* this game no longer runs the uid (handed to another game): nothing withdrawn */
 static const int kMaxWithdrawPerPass = 64;
 
 /* THE ONE PLACE THE COUNTERS MOVE, so the identity below cannot drift from the transitions. */
@@ -494,6 +502,7 @@ static void RetireWithdrawCount(int count)
     else if (count == cooprw::kCountDeferredLinkDown) ++g_rwDeferredLinkDown;
     else if (count == cooprw::kCountCancelledByRestore) ++g_rwCancelledByRestore;
     else if (count == cooprw::kCountNotAnnounced) ++g_rwNotAnnounced;
+    else if (count == cooprw::kCountNotMine) ++g_rwNotMine;
 }
 
 /* Called from the retire and restore edges of ValidateAdopted.  MAIN THREAD (ValidateAdopted is). */
@@ -545,7 +554,16 @@ static void RetireWithdrawDrain()
         const unsigned int uid = it->first;
         int count = cooprw::kCountNone;
         std::map<unsigned int, int>::iterator a = g_announced.find(uid);
-        if (a == g_announced.end() || a->second != 1)
+        const int gate = cooprw::RetireWithdrawGate(net::IsUidMine(uid) ? 1 : 0, (a != g_announced.end() && a->second == 1) ? 1 : 0);
+        if (gate == cooprw::kGateNotMine)   /* handed to another game: the copies are its new owner's to answer for */
+        {
+            it->second = cooprw::RetireWithdrawStep(it->second, cooprw::kEvNotMine, &count);
+            RetireWithdrawCount(count);
+            if (a != g_announced.end()) g_announced.erase(a);   /* T-650 fold 1 (review L4): ERASED, not written 0 - a 0 is T-556's "not announced: send its SPAWN once another game holds the area". The announce passes skip a uid this game does not run (net::IsUidMine) and a take back writes 1 (NoteAnnouncedOnTake), so absent (read as announced) is the honest state */
+            ++resolved;
+            continue;
+        }
+        if (gate == cooprw::kGateNotAnnounced)
         {
             it->second = cooprw::RetireWithdrawStep(it->second, cooprw::kEvNotAnnounced, &count);
             RetireWithdrawCount(count);
@@ -590,6 +608,21 @@ bool AnnouncedToPeer(unsigned int uid)
     if (it == g_announced.end() || it->second == 1) return true;
     ++g_streamGateWithheld;
     return false;
+}
+
+/* A copy of a character that is not standing lies down only when its owner's STATE reaches it: the SPAWN's knocked-out word
+   holds its looks but does not lay it down, and it covers only unconscious or a running wake clock (one playing dead, crippled
+   or staying low reads ko=0 there). So the SPAWN of a character whose pose is not NORMAL (PoseState 0), or whose SPAWN word
+   says knocked out or dead, is followed by its STATE at once instead of at its turn in the periodic refresh (a dead copy's kill
+   from that STATE still waits for its first look: ApplyOwnerDeath holds while SpawnDeathLookWanted). Called after
+   g_announced[uid] = 1: StatePush sends only for an announced character. MAIN THREAD. */
+static long long g_downStatePushed = 0;
+static void PushStateIfDown(unsigned int uid, ::Character* c)
+{
+    if (c == 0) return;
+    const bool down = (int)c->poseState() != 0
+                   || (SpawnOwnerFlags(c) & (coopspawn::kSpawnFlagKo | coopspawn::kSpawnFlagDead)) != 0;
+    if (down && StatePush(uid)) ++g_downStatePushed;
 }
 
 // E9 - called from spawn.cpp's NotifyDespawn on an unload-destroy, while the uid is still in hand. Deliberately
@@ -660,8 +693,17 @@ int WithdrawReloadedCopy(unsigned int uid, bool wasAnnounced)
 
 /* M7a3 P3: the owed hand-over was dropped because no game holds the sector - the UNLOAD it held goes now; a send that fails is
    owed to the P8m drain (its second chance), exactly as a declined own-unload withdrawal. */
+/* a held uid's hold has ended - logged once */
+static void AnnHoldEnds(unsigned int uid, const char* how)
+{
+    if (g_annHeld.erase(uid) == 0) return;
+    if (g_annHeldLogged >= 60) return;
+    ++g_annHeldLogged;
+    DebugLog("[P033] announce HOLD ends uid=" + S(uid) + " - " + how);
+}
 bool WithdrawHeldUnload(unsigned int uid)
 {
+    AnnHoldEnds(uid, "its RELEASE settled (the held UNLOAD goes now)");
     if (WithdrawAnnouncedOnOwnUnload(uid, kUnloadWhyHeldSettled)) return true;
     if (AnnouncedExplicit(uid)) RetireWithdrawNote(uid, cooprw::kEvRetire);
     return false;
@@ -687,7 +729,7 @@ static void AnnouncePass()
     for (int i = 0; i < g_adoptedCount; ++i)
     {
         const unsigned int uid = g_adoptedRows[i].uid;
-        if (!net::IsUidMine(uid)) continue;                 // handed off: not ours to announce
+        if (!net::IsUidMine(uid)) { AnnHoldEnds(uid, "no longer this game's (handed over)"); continue; }   /* handed off: not ours to announce */
         /* M4 fold 2 (re-check L-C): a hand-over of this uid is in flight (XFER sent, no ACK yet). The receiver may already have
            taken it, so a SPAWN (or UNLOAD) now would reach a game that runs it - its own-uid SPAWN refusal (session.cpp) is the
            backstop, not the rule. Skipped and counted; the next pass after the ACK or the abandon decides. */
@@ -705,8 +747,8 @@ static void AnnouncePass()
            longer drive, whoever else holds it. SectorLoadedHere reads g_loaded, the same set the relay is told about
            (zones.cpp:421), so the peer is being told to drop exactly what I have stopped reporting. */
         /* E15 (review-p5h HIGH-1, T221): both legs now ask the ENGINE whether this game has that position loaded -
-           coop::IsPositionLoadedHere - instead of the cached g_loaded set. g_loaded is a 7x7 ring probed at sector
-           CENTRES and refreshed at most once a second, and it lagged a teleport by ~19 s in T219; a character of mine
+           coop::IsPositionLoadedHere - instead of the cached g_loaded set. g_loaded is refreshed at most once a
+           second, and it lagged a teleport by ~19 s in T219; a character of mine
            standing just outside it read !mineLoaded while the peer still held its sector, so the withdraw leg fired
            and the re-announce leg (which did not test mineLoaded at all) undid it on the next pass - 26 SPAWNs and 26
            UNLOADs per uid in T221. The two legs now use the SAME predicate, read live. */
@@ -714,14 +756,33 @@ static void AnnouncePass()
         std::map<unsigned int, int>::iterator it = g_announced.find(uid);
         const int state = (it == g_announced.end()) ? 1 : it->second;   // rows adopted before this code: assume announced
         /* M7a: the pass's rule is cooplive::AnnounceDecide with no reporter gained (the catch-up is the one caller that has one) */
-        const int ann = cooplive::AnnounceDecide(held, mineLoaded, state == 1, false);
+        /* T-650 fold 2 (T1056 F2): an announced character this game no longer has loaded while another IN_WORLD game does is HELD - its
+           withdrawal waits for the hand-over decision (the forced hand-over or this game's RELEASE) so the receiver still has the copy to
+           take; it goes once no other in-world game has the area loaded or this game's forced hand-over of it was refused */
+        const bool handoverCase = state == 1 && held && !mineLoaded;
+        const int ann = cooplive::AnnounceDecide(held, mineLoaded, state == 1, false,
+                                                 handoverCase && HandoffOtherInWorldHasArea(pos.x, pos.z) == 1, handoverCase && HandoffForcedRefusedFor(uid));
+        if (ann == cooplive::kAnnHoldForHandover)
+        {
+            if (it == g_announced.end()) g_announced[uid] = 1;   /* stays marked announced: ReleaseOnPutAway opens its RELEASE and WithdrawHeldUnload sends its UNLOAD */
+            ++g_announceHeldForHandover;
+            if (g_annHeld.insert(std::make_pair(uid, 1)).second && g_annHeldLogged < 60)
+            {
+                ++g_annHeldLogged;
+                DebugLog("[P033] announce HOLD uid=" + S(uid) + " - not loaded here, another in-world game has its area loaded: its UNLOAD waits for the hand-over decision (announceHeldForHandover "
+                         + S(g_announceHeldForHandover) + ")");
+            }
+            continue;
+        }
+        if (ann == cooplive::kAnnUnload && !ReleasePendingHas(uid))
+            AnnHoldEnds(uid, handoverCase && HandoffForcedRefusedFor(uid) ? "withdrawn: its forced hand-over was refused" : "withdrawn: no other in-world game has its area loaded");
         if (ann == cooplive::kAnnUnload) { if (ReleasePendingHas(uid)) { /* M7a3f1 #8: HELD - its squad's hand-over is owed; the owed outcome decides */ } else if (net::SendUnload(uid, 1)) { g_announced[uid] = 0; ++g_unloadsSent; UnloadSentNote(uid, kUnloadWhyAnnounce); if (held) ++g_withdrawnOwnUnload; } }   /* held == true here means !mineLoaded is the reason, i.e. this is a withdrawal the old rule would NOT have made */
         else if (ann == cooplive::kAnnSpawn)
         {
             GameData* gd = c->getRecordDirect(); Faction* f = c->getOwnerFactionDirect();
             if (!PlausibleObject(gd) || !PlausibleObject(f)) continue;
             SendContextFor(uid, c);
-            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++g_reannouncedOnReload; }
+            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++g_reannouncedOnReload; PushStateIfDown(uid, c); }
         }
     }
 }
@@ -815,7 +876,7 @@ void WorldSyncTick()
             if (coopslot::WireLacksSlot(WireFactionName(f))) { coop::NoteHeldForSlot(); g_announced[row.uid] = 0; continue; }   /* stand1 fold (1d): held, not dropped */
             if (!PeerHoldsSectorOf(pos)) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
             SendContextFor(row.uid, c);   // M-B: CONTEXT before SPAWN, same reliable channel, so the copy is created with it
-            if (net::SendSpawn(row.uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f), false, c))
+            if (net::SendSpawn(row.uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c))
             {
                 WatchLocalRoll(row.uid);
                 ++g_reannounced; g_announced[row.uid] = 1;
@@ -1088,7 +1149,7 @@ void WorldSyncTick()
 
         Faction* f = best->getOwnerFactionDirect();
         if (!PlausibleObject(f)) { ++g_noFaction; continue; }
-        std::string factionName = WireFactionName(f);   // P3: "@player:<name>" for our own player faction
+        std::string factionName = WireFactionName(f, true);   // P3: "@player:<name>" for our own player faction
 
         if (!PlausibleObject(*(void**)((char*)best + 0x448))) { ++g_unreadable; continue; }
         Ogre::Vector3 pos = best->worldPosition();
@@ -1167,7 +1228,7 @@ void WorldSyncTick()
         // fresh spawn. For an ADOPTED character it settled long ago, but the same watcher is used
         // rather than a second path: one mechanism, already measured 4/4 on sex, mesh, hair and
         // height, is worth more than a shortcut that is probably fine.
-        if (peerHolds) { WatchLocalRoll(uid); g_announced[uid] = 1; }
+        if (peerHolds) { WatchLocalRoll(uid); g_announced[uid] = 1; PushStateIfDown(uid, best); }
 
         // Record the row for P034. Capture failure is counted rather than ignored: a character we
         // cannot handle-check is a character this probe is BLIND to, and a blind spot that reads as
@@ -1472,7 +1533,7 @@ void ReportWorldSync()
              + " retired=" + S(g_retired)
              + " restored=" + S(g_restored)
              + " unloadSent[putAway,reloaded,heldSettled,retire,announce]=" + S(g_unloadSentWhy[0]) + "," + S(g_unloadSentWhy[1]) + "," + S(g_unloadSentWhy[2]) + "," + S(g_unloadSentWhy[3]) + "," + S(g_unloadSentWhy[4])
-             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " p22[stale,real]=" + S(g_p22Stale) + "," + S(g_p22Real) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
+             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " p22[stale,real]=" + S(g_p22Stale) + "," + S(g_p22Real) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
              + " falseGone=" + S(g_falseGone)
              + " sweepStandInSkipped=" + S(g_sweepStandInSkipped)   /* inv7a-b */
              + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
@@ -1489,18 +1550,19 @@ void ReportWorldSync()
              + " staleUidRetired=" + S(StaleUidRetiredCount())
              /* P8m (H-ghost) - THE WITHDRAWAL OF A RETIRED CHARACTER, and the identity a readout can check.
                 Every retirement edge in ValidateAdopted increments `retired` and queues exactly one entry, and
-                every entry ends in exactly one of three resolutions or is still pending, so:
+                every entry ends in exactly one of four resolutions (sent, notAnnounced, cancelledByRestore, notMine) or is still pending, so:
 
                     retired == retireWithdraw[sent] + retireWithdraw[notAnnounced]
-                             + retireWithdraw[cancelledByRestore] + retireWithdraw[pending]
+                             + retireWithdraw[cancelledByRestore] + retireWithdraw[pending] + rwNotMine
 
-                `pending` is a GAUGE (entries owed right now); the other three are cumulative resolutions.
+                `pending` is a GAUGE (entries owed right now); the other four are cumulative resolutions.
                 `deferredLinkDown` is an ATTEMPT count - one entry can be deferred many times - so it is NOT
                 a term in the identity and must never be subtracted from it.  `retireWithdraw[sent]` is a
                 SUBSET of `unloadsSent`, never an addition to it, exactly as withdrawnOwnUnload is. */
              + " retireWithdraw[pending,sent,deferredLinkDown,cancelledByRestore,notAnnounced]="
              + S(RetireWithdrawPending()) + "," + S(g_rwSent) + "," + S(g_rwDeferredLinkDown) + ","
-             + S(g_rwCancelledByRestore) + "," + S(g_rwNotAnnounced)
+             + S(g_rwCancelledByRestore) + "," + S(g_rwNotAnnounced) + " rwNotMine=" + S(g_rwNotMine)
+             + " downStatePushed=" + S(g_downStatePushed)   /* STATEs sent right after the SPAWN of a character that is not standing */
              + " | radius=" + F1(g_adoptRadius)
              // F302 - the SOURCE by name, not a bool. DEFAULT-unlimited is the compiled-in default
              // (0 = unlimited, decision 36) and says so; "client-viewDistance" is the only correct
@@ -1552,6 +1614,7 @@ void WorldsyncWorldTeardown()
     g_adoptedCount   = 0;
     g_validateCursor = 0;
     g_reannounceAt   = -1;   // a re-announce walking the rows must not carry on over an empty table
+    net::LostCopyForgetAll();   // the lost copies booked were of this world
 
     const size_t announced = g_announced.size();
     g_announced.clear();
@@ -1566,11 +1629,25 @@ void WorldsyncWorldTeardown()
 }
 
 int AreaKeyAt(float x, float z) { const Sector s = SectorOf(x, z); return cooplive::AreaKey(s.x, s.y); }
+/* A character's area is read only from a checked body. Character::worldPosition goes through the AnimationClass at
+   Character+0x448 without checking it, and a character being torn down or re-bodied keeps a valid vtable while that member
+   is already freed, so PlausibleObject(c) alone does not make the read safe. SafeReadPosition refuses a retired row and an
+   implausible AnimationClass; the SEH frame catches a member freed between that check and the read. Both refusals answer
+   -1, the "not live here" answer every caller already handles, and are counted on the catchUpState line (areaKey[...]). */
+static long long g_areaKeyNoBody = 0, g_areaKeyFault = 0;
+static long long g_rsAskUids = 0, g_rsSent = 0, g_rsHeld = 0, g_rsRefused = 0, g_rsFailed = 0;   /* WorldsyncResendAsk's uids asked, sent, held, refused, failed */
+static int CharAreaPosPod(::Character* c, Ogre::Vector3* out)   /* 1 read, 0 refused (no body), -1 faulted */
+{
+    __try { return SafeReadPosition(c, out) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 int CharAreaKeyNow(unsigned int uid)
 {
     ::Character* c = FindSpawned(uid);
     if (!PlausibleObject(c)) return -1;
-    Ogre::Vector3 pos = c->worldPosition();
+    Ogre::Vector3 pos;
+    const int rd = CharAreaPosPod(c, &pos);
+    if (rd != 1) { if (rd == 0) ++g_areaKeyNoBody; else ++g_areaKeyFault; return -1; }
     return AreaKeyAt(pos.x, pos.z);
 }
 static long long g_cuResent = 0, g_cuAnnounced = 0, g_cuLooks = 0, g_cuState = 0, g_cuCombat = 0, g_cuFailed = 0, g_cuKept = 0;
@@ -1595,14 +1672,18 @@ std::string WorldsyncCatchupCounts()
         + S(g_cuResent) + "," + S(g_cuAnnounced) + "," + S(g_cuLooks) + "," + S(g_cuState) + "," + S(g_cuCombat) + "," + S(g_cuFailed) + "," + S(g_cuKept)
         + "," + S(g_cuIntent) + "," + S(g_cuDedup) + "," + S(g_cuHeld) + "," + S(g_cuHeldResent) + "," + S(g_cuHeldReleased) + "," + S(g_cuHeldFull)
         + "," + S(g_cuReverse) + "," + S(g_cuReverseChars) + "," + S(g_cuReverseAnnounced)
-        + "," + S(g_cuRevQueued) + "," + S(g_cuRevBudgetHit) + "," + S(g_cuRevDropped) + "," + S(g_cuWireReadFailed);   /* [m7a2f-ws2] */
+        + "," + S(g_cuRevQueued) + "," + S(g_cuRevBudgetHit) + "," + S(g_cuRevDropped) + "," + S(g_cuWireReadFailed)   /* [m7a2f-ws2] */
+        + " areaKey[noBody,fault]=" + S(g_areaKeyNoBody) + "," + S(g_areaKeyFault)   /* CharAreaKeyNow's refused reads */
+        + " resendAsk[uids,sent,held,refused,failed]=" + S(g_rsAskUids) + "," + S(g_rsSent) + "," + S(g_rsHeld) + "," + S(g_rsRefused) + "," + S(g_rsFailed);   /* a RESEND ask answered here */
 }
 /* M7a2: the live reads the catch-up takes of one row (AnnouncePass's plausibility tests), and the wire's faction. */
 static bool CatchupCharReads(unsigned int uid, ::Character** c, Ogre::Vector3* pos, int* key)
 {
     ::Character* ch = FindSpawned(uid);
-    if (!PlausibleObject(ch) || !PlausibleObject(*(void**)((char*)ch + 0x448))) return false;
-    *pos = ch->worldPosition();
+    if (!PlausibleObject(ch)) return false;
+    /* the checked read CharAreaKeyNow uses: retired row and body (Character+0x448) refused, a body freed mid-read caught */
+    const int rd = CharAreaPosPod(ch, pos);
+    if (rd != 1) { if (rd == 0) ++g_areaKeyNoBody; else ++g_areaKeyFault; return false; }
     const Sector s = SectorOf(pos->x, pos->z);
     *key = cooplive::AreaKey(s.x, s.y); *c = ch;
     return true;
@@ -1617,7 +1698,7 @@ static bool CatchupWire(::Character* c, GameData** gd, Faction** f)
 static bool CatchupSendState(unsigned int uid, ::Character* c, GameData* gd, Faction* f, const Ogre::Vector3& pos)
 {
     SendContextFor(uid, c);
-    if (!net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f), false, c)) return false;
+    if (!net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) return false;
     if (AppearanceResendOwned(uid)) ++g_cuLooks;
     if (StatePush(uid)) ++g_cuState;
     if (CombatModeResendOwned(uid)) ++g_cuCombat;
@@ -1648,6 +1729,16 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
         return;
     }
     SquadLeadReannounce(a.keys);   /* M7a A1 build 1 [a1b1-ws0] [review F7]: a game that newly has the area hears the leaders of the squads there again (handoff.cpp; fold 1 [a1b1f1-ws0] [F5]: only those) */
+    {   /* the asker is in these sectors' delivery set from now: the resting doors this game holds there are re-offered to it once */
+        std::vector<int> dx, dy;
+        for (size_t k = 0; k < a.keys.size(); ++k)
+        {
+            const int key = (int)a.keys[k];
+            if (key < 0 || key >= cooplive::kAreaKeyCount) continue;
+            dx.push_back(cooplive::AreaKeyX(key)); dy.push_back(cooplive::AreaKeyY(key));
+        }
+        if (!dx.empty()) coop::DoorsServeCatchup(&dx[0], &dy[0], (int)dx.size(), (int)a.slot, (unsigned int)a.askNo);
+    }
     std::set<int> want(a.keys.begin(), a.keys.end());
     long long mine = 0, resent = 0, announced = 0, failed = 0, held = 0;
     cooplive::CatchupEndMsg end; end.askNo = a.askNo; end.keys = a.keys;
@@ -1674,7 +1765,7 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
         if (ann == cooplive::kAnnSpawn)
         {
             SendContextFor(uid, c);
-            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++announced; ++g_cuAnnounced; }
+            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++announced; ++g_cuAnnounced; PushStateIfDown(uid, c); }
             else { ++failed; ++g_cuFailed; }
             continue;
         }
@@ -1738,7 +1829,7 @@ void WorldsyncCatchupReverseTick()
         if (ann == cooplive::kAnnSpawn)
         {
             SendContextFor(uid, c);
-            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++g_cuRevPassAnnounced; }
+            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++g_cuRevPassAnnounced; PushStateIfDown(uid, c); }
             else ++g_cuRevPassFailed;
             continue;
         }
@@ -1767,12 +1858,81 @@ void WorldsyncCatchupHandoverSettled(unsigned int uid)
     long long sentN = 0;
     for (std::set<int>::const_iterator s = slots.begin(); s != slots.end(); ++s)
     {
-        net::CharStreamToSlot(*s);
+        const int to = net::CharStreamSlotFor(*s);   /* the asker alone: LIVE SLOT, or the session link when that is the road and the asker its peer */
+        if (to == -2) { ++g_cuFailed; continue; }
+        net::CharStreamToSlot(to);
         if (CatchupSendState(uid, c, gd, f, pos)) { ++sentN; ++g_cuHeldResent; } else ++g_cuFailed;
         net::CharStreamToSlot(-1);
     }
     DebugLog("[P033] catch-up: uid=" + S((long long)uid) + " held back by a hand-over in flight - the hand-over settled, its state re-sent to "
              + S(sentN) + " of " + S((long long)slots.size()) + " askers (M7a2)");
+}
+
+/* A RESEND ASK, THE OWNER'S SIDE. Another game lost its copy of these characters of mine (its engine put the copy away) or
+   never got one, and the character stands in an area loaded there. The announce mark here still reads "sent", so neither the
+   announce pass nor a catch-up (which fires only for sectors newly in that game's delivery area) would send it again: each uid is
+   decided by lostcopy::ResendOwnerVerdict, and a SENT one's full state goes to that game alone. Counted on the catchUpState line
+   (resendAsk[...]); the caller logs the round. */
+/* (its counters g_rsAskUids .. g_rsFailed are defined beside CharAreaKeyNow, before the catchUpState line that prints them) */
+void WorldsyncResendAsk(int streamSlot, int askerSlot, const std::vector<unsigned int>& uids, std::vector<int>* verdicts)
+{
+    if (verdicts == 0) return;
+    verdicts->clear();
+    for (size_t i = 0; i < uids.size(); ++i)
+    {
+        const unsigned int uid = uids[i];
+        ++g_rsAskUids;
+        const bool mine = net::IsUidMine(uid);
+        std::map<unsigned int, int>::const_iterator an = g_announced.find(uid);
+        const bool announced = an == g_announced.end() || an->second == 1;   /* an absent uid reads as announced (AnnouncedToPeer's rule) */
+        ::Character* c = 0; Ogre::Vector3 pos; int key = -1; GameData* gd = 0; Faction* f = 0;
+        const bool reads = mine && CatchupCharReads(uid, &c, &pos, &key) && CatchupWire(c, &gd, &f);
+        int v = lostcopy::ResendOwnerVerdict(mine ? 1 : 0, mine && HandoffPendingHas(uid) ? 1 : 0, announced ? 1 : 0, reads ? 1 : 0);
+        if (v == lostcopy::kRvHeld)
+        {
+            ++g_rsHeld;
+            /* re-sent to the asker alone when the hand-over settles (WorldsyncCatchupHandoverSettled) */
+            if (g_cuHeldFor.size() < kCuHeldForMax || g_cuHeldFor.count(uid) != 0) g_cuHeldFor[uid].insert(askerSlot); else ++g_cuHeldFull;
+        }
+        else if (v == lostcopy::kRvSent)
+        {
+            net::CharStreamToSlot(streamSlot);
+            const bool ok = CatchupSendState(uid, c, gd, f, pos);
+            net::CharStreamToSlot(-1);
+            if (ok) ++g_rsSent; else { ++g_rsFailed; v = lostcopy::kRvFailed; }
+        }
+        else ++g_rsRefused;
+        verdicts->push_back(v);
+    }
+    net::CharStreamToSlot(-1);
+}
+
+/* A ROW THAT NO LONGER NAMES A COPY. The creation core keeps a SPAWN from making a twin while the uid has a row; a copy whose area
+   streamed out keeps its row (retired) and comes back through P034's restore. A row gives way (lostcopy::StaleRowGivesWay) only for
+   the SPAWN this game asked for, when two witnesses agree the object is gone - its handle does not resolve to it, and it is not in
+   the engine's list of running characters (P034's own pair) - and the SPAWN's spot is loaded here by the engine's zone byte. */
+bool WorldsyncCopyRowStale(unsigned int uid, float x, float y, float z)
+{
+    if (!net::LostCopyAsked(uid) || net::IsUidMine(uid)) return false;   /* only the SPAWN this game asked for, of another game's uid */
+    if (!PlausiblePtr(coop::GameWorldPtr())) return false;
+    const void* raw = SpawnedRawObject(uid);
+    if (raw == 0) return false;
+    bool resolves = true, found = false;
+    for (int i = 0; i < g_adoptedCount && i < kMaxAdopted; ++i)
+    {
+        const Adopted& row = g_adoptedRows[i];
+        if (row.uid != uid || row.obj != raw) continue;
+        found = true;
+        resolves = !ObjIdValid(row.id) || (const void*)ResolveObjId(row.id) == raw;   /* a row that never had a handle cannot be judged: kept */
+        break;
+    }
+    if (!found) return false;   /* no liveness row to judge by: kept */
+    bool running = false;
+    const GameHashSet< ::Character*>::type& live = coop::GameWorldPtr()->activeCharacters();
+    for (GameHashSet< ::Character*>::type::const_iterator li = live.begin(); li != live.end(); ++li)
+        if ((const void*)*li == raw) { running = true; break; }
+    return lostcopy::StaleRowGivesWay(1, 0, IsRetiredObject(raw) ? 1 : 0, resolves ? 1 : 0,
+                                      running ? 1 : 0, ZoneBuildingsInHereTri(x, y, z) == 1 ? 1 : 0) != 0;
 }
 
 // review-session S6 - THE PEER IS GONE; NOTHING HERE HAS BEEN TOLD ANYTHING ANY MORE.

@@ -107,6 +107,7 @@ int ZoneWriterDecide(int roleIsSingle, int held, int mine, int loadedHereSector,
     if (roleIsSingle != 0) { if (pathOut != 0) *pathOut = kZonePathSingle;      return kWrMine; }
     if (mine == 1)         { if (pathOut != 0) *pathOut = kZonePathHolderMine;  return kWrMine; }
     if (held == 1)         { if (pathOut != 0) *pathOut = kZonePathHolderOther; return kWrHeld; }
+    if (held == -2)        { if (pathOut != 0) *pathOut = kZonePathHolderOther; return kWrHeld; }   /* a frozen area (its holder is not in the world): its holder's file stands */
     if (pathOut != 0) *pathOut = kZonePathLadder;
     return WriterLadder(loadedHereSector, peerSectorLoaded, mySlotLower, slotDecided,
                         notebookDownMs, refuseAfterMs, 1, rungOut, spansOut);
