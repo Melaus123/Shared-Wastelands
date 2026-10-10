@@ -50,6 +50,7 @@
 #include "game/AITaskSystem.h"  /* inv5: AITaskSytem::issueOrder */
 #include "../common/holdwire.h"    /* P105 build 2: HOLD / LAND - the trailers, the absorb rule, where a LAND goes, the answers */
 #include "../common/groundshow.h"   /* p105g-items: P105g - a ground pickup by a game that does not hold the area shows at once */
+#include "../common/groundname.h"   /* ground items' shared names - the table, the lookup, the removed-name memory */
 #include "../common/ownpick.h"      /* an item this game's own player lifts out of a container this game writes: its removal goes out at once */
 #include "../common/givelate.h"   /* give1: the late-give removal, the cancel refunds and the confirmdelay lever's parse */
 #include "../common/showmove.h"   /* T-164 non-shop road: a move with the other game's character / box / pack shows at once */
@@ -1274,6 +1275,7 @@ long long g_boxResolveAtTitle = 0;
 // deactivation - ON ANY THREAD (P7a, review-p6t MEDIUM-1) - so a list used for the liveness test can never
 // span either.
 volatile LONG64 g_boxWalkGen = 0;
+volatile LONG64 g_grZoneTornGen = 0;   /* T-693: one more each time ZoneMapContent::deactivate returns (either thread) - the ground names' re-bind pass hands rows on only after a zone was taken apart */
 // `boxHeldRestale` (MEDIUM, stale verdict): how often the area verdict re-read AT THE DROP disagreed with the
 // one taken when the item went onto the cursor. A player can hold an item indefinitely, so the pickup answer
 // has no bound on its age; this counts the times that mattered.
@@ -3769,7 +3771,7 @@ void detour_zoneDeactivate(void* content, char saveFirst)
         ::InterlockedIncrement64(&g_zoneDeactivateOffThread);
         ItemsLootZoneOffThread();   /* loot2c fold (review 1f): live research copies cannot be taken out off the main thread - counted (retractMissedOffThread), said loudly at the next tick */
         __try { orig_zoneDeactivate(content, saveFirst); }
-        __finally { ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); DoorsOnZoneDeactivate(); }
+        __finally { ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); ::InterlockedIncrement64(&g_grZoneTornGen); DoorsOnZoneDeactivate(); }
         return;
     }
     ItemsLootRetractAll(kLootWhyUnload);   /* loot2c: research copies leave their boxes BEFORE the original writes the zone record (a no-op with none registered) */
@@ -3783,7 +3785,7 @@ void detour_zoneDeactivate(void* content, char saveFirst)
        these cover a main-thread resolve that ran DURING the original call and re-filled the memo behind us. */
     __try { orig_zoneDeactivate(content, saveFirst); }
     __finally { if (g_zoneUnloadDepth > 0) --g_zoneUnloadDepth;
-                ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); DoorsOnZoneDeactivate(); }
+                ::InterlockedExchange(&g_boxCachePurgePending, 1); ::InterlockedIncrement64(&g_boxWalkGen); ::InterlockedIncrement64(&g_furnStale); ::InterlockedIncrement64(&g_grZoneTornGen); DoorsOnZoneDeactivate(); }
 }
 
 // ---- T-164 B4-1 charge: THE REAL CHARGE OF EVERY PLAYER TRADE, measured at the moment the engine makes it ----
@@ -10703,6 +10705,7 @@ struct ItOwnerPend
     int isGround;
     float groundPos[3];
     char groundKey[coopground::kGroundKeyCap];   /* P14 fold 1: the ground item's key - its placed answer (ok 1) is a ledger escape of the other player */
+    char groundAskId[coopground::kGroundKeyCap];   /* the granted TAKE's own id (a bare key that landed on a named item: groundKey is that name) - a repeat matches either */
     /* a ground TAKE: goneTold - GROUND GONE went out to the other games at the grant; goneRoad / goneRoute / goneTarget - the road,
        route and excepted slot it took (cooplive::ExceptPlan), which an undo's ADD must take too */
     int goneTold;
@@ -11190,7 +11193,7 @@ void ItOwnerPendExpire()
             if (op->isGround != 0)
             {   /* p105g-f2-1 (row T-435) */
                 ++g_escGroundHeld;
-                DebugLog("[GROUND] TAKE " + N((long long)op->id) + " key=" + std::string(op->groundKey) + " - granted, no PLACED within 10 s"
+                DebugLog("[GROUND] TAKE " + N((long long)op->id) + " name=" + std::string(op->groundKey) + " - granted, no PLACED within 10 s"
                          + " after our ok CONFIRM: HELD IN ESCROW, not put back on the ground (the picker shows it already)");
             }
             DebugLog("[ITEMS] inv7c: TAKE " + N((long long)op->id) + " uid=" + N((long long)op->uid)
@@ -19964,6 +19967,7 @@ static void ItOwnHandOver(unsigned int uid, const char* sid, int qty, int dirIn,
     ::Character* c = FindSpawned(uid);
     if (ItObj(c)) coop::OwnMarkCharDirtyNow((void*)c);
 }
+void GrNameForgetAddr(void* item);   /* T-693: the ground names - defined with them below, in coop itself (not the unnamed namespace: C2668) */
 
 // MAIN THREAD: the taker's answer about a TAKE we granted (E22b-2 / review-p5y HIGH-3).
 void ApplyItemPlaced(unsigned int id, int ok, unsigned int fromPeer)
@@ -20017,6 +20021,7 @@ void ApplyItemPlaced(unsigned int id, int ok, unsigned int fromPeer)
             ItIntPod(p->item, kItemQuantity, &gq);
             BuildRefundTaken(p->groundKey, gq > 0 ? gq : 1, 0, 1);
         }
+        if (p->isGround != 0 && p->item != 0) GrNameForgetAddr(p->item);   /* destroyed: no name row may stand for its address */
         if (p->item != 0) ItDestroyPod(p->item, "coop E22b-2 take placed");
         p->item = 0;
         p->used = 0;
@@ -24579,6 +24584,16 @@ int BoxKeySector(const char* key, int* sx, int* sy)
     ItBoxKeyParts kp;
     if (ItBoxKeyParse(key, &kp) == 0) return 0;
     *sx = kp.sx; *sy = kp.sy;
+    return 1;
+}
+/* declared in items.h - the position a P7n key carries (ItBoxKeyParse - no building is touched): x and z, and y when the key holds
+   one (else 0), in world units. 1 = parsed. ANY THREAD (the key's text only). */
+int BoxKeyPosition(const char* key, float* x, float* y, float* z)
+{
+    if (key == 0 || x == 0 || y == 0 || z == 0) return 0;
+    ItBoxKeyParts kp;
+    if (ItBoxKeyParse(key, &kp) == 0) return 0;
+    *x = (float)kp.x10 / 10.0f; *y = kp.haveY != 0 ? (float)kp.y10 / 10.0f : 0.0f; *z = (float)kp.z10 / 10.0f;
     return 1;
 }
 /* M7b slice 2: declared in items.h. A box / shop key: the building it finds, through ItBoxDecidePos (a trader home's piece - the
@@ -32870,6 +32885,9 @@ struct GrEvent
     int took;           /* P105g: ASK - the units that went in (qty is the stack as it lay) */
     char sid[kSidCap];  /* P105g: ASK - the item's base record, read before the pickup (to take it back out on a GONE) */
     int afterUnread;    /* p105g-f1-5b: ASK - the detour could not read the item after the pickup (a copy may still lie here) */
+    char name[coopground::kGroundKeyCap];   /* ASK / GONE / PART - the item's shared name (its key when it carries none); addr is the item (compared only) */
+    int named;          /* ASK / GONE / PART - 1 = the item carries a shared name on this game */
+    int frozen;         /* ASK - 1 = that name is published (the TAKE names it by NAME; else by its BARE key) */
 };
 const int kGrEvCap = 256;
 GrEvent g_grEv[kGrEvCap];
@@ -32940,6 +32958,10 @@ struct GrClaim { int used; DWORD at; char key[coopground::kGroundKeyCap]; };
 const DWORD kGrClaimMaxMs = 30000;
 const int kGrClaimCap = 32;
 GrClaim g_grClaim[kGrClaimCap];
+/* THE SHARED NAMES of the ground items this game knows (coopgname, groundname.h): per item its address, its name and its
+   current key. Written on the MAIN THREAD under g_gpLock; the pickup detour reads it under the lock (fixed size, nothing
+   allocated); main-thread reads take no lock (there is no other writer). */
+coopgname::NameTable g_grName;
 /* lock held. 1 = claimed now, 0 = already claimed (or no free row). */
 int GrClaimLocked(const char* key)
 {
@@ -33356,11 +33378,14 @@ void detour_gpPickupBody(void* task, void* ctx)
     unsigned int uid = 0;
     GpLock();
     ++g_grPickSeen;
+    e.named = coopgname::NameOfEx(g_grName, item, parts, e.name, (int)sizeof e.name, &e.frozen);   /* the item's shared name, copied under the lock */
     const int sv = GrSecVerdictLocked(parts.sx, parts.sy);
     const int own = GrOwnLocked(picker, &uid);
     const int claimed = (sv == 1) ? GrClaimLocked(e.key) : 0;   /* review-inv5p1 6: the holder's pickup runs only with the key claimed */
     GpUnlock();
     e.who = picker; e.uid = uid;
+    e.addr = item;   /* compared only - the name row this item is */
+    if (e.named == 0) coopgname::NameCopy(e.name, (int)sizeof e.name, e.key);   /* no shared name: the current key names it, as before */
     if (sv == 1 && claimed == 0)
     {   /* the main thread is handing this very item to the other game (or the claim table is full): not picked up here */
         const int fin = GrFinishTaskPod(ctx);
@@ -33704,6 +33729,114 @@ void* GrFind(const char* key, int wantQty, float wantQ, int exactOnly, int* fuzz
     if (best >= 0) { ++g_grKeyFuzzy; if (fuzzyOut != 0) *fuzzyOut = 1; return rows[(size_t)best].item; }
     return 0;
 }
+/* ---- THE SHARED NAMES, MAIN THREAD (writes under g_gpLock: the pickup detour reads the table) ---- */
+coopgname::GoneMemory g_grGone;   /* the names (and unnamed keys) this game removed or announced gone: the holder's reason 2 or 5 */
+int g_grGoneInit = 0;
+long long g_gnTakeName = 0, g_gnTakeKey = 0, g_gnTakeNear = 0, g_gnTakeGone = 0, g_gnTakeUnknown = 0;
+long long g_gnGoneName = 0, g_gnGoneKey = 0, g_gnGoneNear = 0, g_gnGoneKept = 0, g_gnPickUnknown = 0, g_gnNudge = 0;
+long long g_gnRebound = 0, g_gnForgot = 0, g_grRoadAdded = 0;
+long long g_gnDetached = 0, g_gnMarked = 0, g_gnAddNamedHere = 0, g_gnCatchNameSent = 0, g_gnCatchNamed = 0, g_gnCatchNameMissed = 0;
+long long g_gnRebindRuns = 0, g_gnRebindUsMax = 0, g_gnRebindUsTotal = 0, g_gnTakeBareNamed = 0, g_gnGoneBareNamed = 0;
+long long g_gnCatchNameRefused = 0, g_gnOrphanExpired = 0;
+DWORD g_gnRebindAt = 0;
+const char* GrHowName(int how)
+{
+    return how == coopgname::kHowName ? "by name" : how == coopgname::kHowKey ? "by key" : how == coopgname::kHowNear ? "near" : "none";
+}
+/* the item's key parts (and key) as it lies now; 0 = unreadable */
+int GrPartsOf(void* item, coopground::GroundKeyParts* parts, std::string* keyOut)
+{
+    char k[coopground::kGroundKeyCap];
+    std::memset(parts, 0, sizeof *parts);
+    if (!ItPlaus(item) || GpItemKey(item, k, coopground::kGroundKeyCap, parts, 0, 0) == 0) return 0;
+    if (keyOut != 0) *keyOut = std::string(k);
+    return 1;
+}
+/* the item's shared name, "" when it carries none */
+std::string GrNameOf(void* item)
+{
+    coopground::GroundKeyParts p;
+    if (GrPartsOf(item, &p, 0) == 0) return std::string();
+    const int i = coopgname::NameAt(g_grName, item, p);
+    return (i >= 0) ? std::string(g_grName.row[i].name) : std::string();
+}
+/* what names the item to the other games: its shared name, else its current key ("" = unreadable) */
+std::string GrIdOf(void* item)
+{
+    coopground::GroundKeyParts p;
+    std::string k;
+    if (GrPartsOf(item, &p, &k) == 0) return std::string();
+    const int i = coopgname::NameAt(g_grName, item, p);
+    return (i >= 0) ? std::string(g_grName.row[i].name) : k;
+}
+/* The item bound to `name` (freeze 1 = published now: frozen from then on). A frozen name wins over `name`. Returns the name the
+   item carries now (`name` itself when the item cannot be read). */
+std::string GrNameBind(void* item, const std::string& name, int freeze)
+{
+    coopground::GroundKeyParts p;
+    if (name.empty() || GrPartsOf(item, &p, 0) == 0) return name;
+    char out[coopground::kGroundKeyCap];
+    out[0] = 0;
+    GpLock();
+    const int n0 = g_grName.n;
+    const long long d0 = g_grName.dropped;
+    const int i = coopgname::NameBind(&g_grName, item, name.c_str(), p, freeze);
+    if (i >= 0) coopgname::NameCopy(out, (int)sizeof out, g_grName.row[i].name);
+    const int added = (g_grName.n > n0 || g_grName.dropped > d0) ? 1 : 0;
+    GpUnlock();
+    if (added != 0) ++g_grRoadAdded;
+    return (out[0] != 0) ? std::string(out) : name;
+}
+void GrNameForgetAddr(void* item)
+{
+    if (item == 0) return;
+    GpLock();
+    const int f = coopgname::NameForgetAddr(&g_grName, item);
+    GpUnlock();
+    if (f != 0) ++g_gnForgot;
+}
+void GrGoneNote(const std::string& name, int named)
+{
+    if (g_grGoneInit == 0) { coopgname::GoneClear(&g_grGone); g_grGoneInit = 1; }
+    coopgname::GoneNote(&g_grGone, name.c_str(), named, (unsigned int)::GetTickCount());
+}
+int GrGoneHas(const std::string& name)
+{
+    if (g_grGoneInit == 0) return 0;
+    return coopgname::GoneHas(g_grGone, name.c_str(), (unsigned int)::GetTickCount());
+}
+/* MAIN THREAD. The local ground item `name` stands for (coopgname::NameLookup over every loaded ground item of its sid): the items
+   carrying that name (the bag match); else, among items carrying NO name, the exact key, then - unless exactOnly - the nearest
+   within 0.5 units flat (counted fuzzy). An item carrying another name is never returned. *howOut coopgname::kHow*; *rowOut (may
+   be 0) the live row. 0 = none. */
+void* GrFindName(const std::string& name, int wantQty, float wantQ, int exactOnly, int* howOut, GpRow* rowOut, int bare = 0)
+{
+    if (howOut != 0) *howOut = coopgname::kHowNone;
+    coopground::GroundKeyParts want;
+    std::memset(&want, 0, sizeof want);
+    if (coopground::GroundKeyParse(name.c_str(), &want) != 1) return 0;
+    float cp[3]; coopground::GroundKeyPos(want, cp);
+    std::vector<GpRow> rows;
+    int walked = 0, zones = 0, trunc = 0;
+    GpCollect(0.0f, cp, &rows, &walked, &zones, &trunc);
+    std::vector<coopgname::LiveItem> live;
+    std::vector<size_t> at;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (rows[i].key.empty() || coopground::GroundSidEqual(rows[i].parts.sid, want.sid) == 0) continue;
+        coopgname::LiveItem li;
+        li.addr = rows[i].item; li.cur = rows[i].parts; li.qty = rows[i].qty; li.q100 = coopground::GroundQ100(rows[i].q);
+        live.push_back(li); at.push_back(i);
+    }
+    if (live.empty()) return 0;
+    int how = coopgname::kHowNone;
+    const int k = coopgname::NameLookup(g_grName, &live[0], (int)live.size(), name.c_str(), wantQty, coopground::GroundQ100(wantQ), exactOnly, &how, bare);   /* bare 1: the id is a key, never refused on a named item */
+    if (k < 0) return 0;
+    if (how == coopgname::kHowNear) ++g_grKeyFuzzy;
+    if (howOut != 0) *howOut = how;
+    if (rowOut != 0) *rowOut = rows[at[(size_t)k]];
+    return rows[at[(size_t)k]].item;
+}
 /* inv5p1b 3: GrRemoveLocal is defined below GrKeyOf (it claims the item's key first). */
 /* MAIN THREAD. Build an item from move fields (+ a pack's rows) in no inventory. The owner is left unset (phase 1, counted). */
 int g_grCreateLogN = 0;
@@ -33728,6 +33861,7 @@ const char* GrActWhy(int a) { return a == 0 ? "Item::activate slot (vt +0x228) u
     }
     if (bag != 0 && !bag->empty() && ItBagFill(item, bag, c, 1) == 0) { *why = "create: the pack would not fill"; ItDestroyPod(item, "coop inv5 ground: the pack would not fill"); return 0; }
     if (mm.owner.kind == 0) ++g_grOwnerUnset;   /* items9: a marked ground item now keeps its mark (ItCreateItem wrote it) */
+    GrNameForgetAddr((void*)item);   /* a fresh object - a name row at its address named a freed one */
     return item;
 }
 void GrFieldsToMove(const ItEntry& fe, ItemMoveMsg* m)
@@ -33766,8 +33900,9 @@ struct GrRow
        own unconfirmed drop when asked (its first PUT id): a "no such item" then stands, it is never taken back out. */
     int capTries, afterUnread, ownDrop;
     unsigned int ownSerial;
+    int named;   /* TAKE: 1 = key is a published name, 0 = the bare current key (this game knows no published name for the item) */
     GrRow() : id(0), kind(0), uid(0), qty(0), q(0.0f), sentAt(0), shown(0), took(0), tries(0), inFlight(0), reaskAt(0),
-              capTries(0), afterUnread(0), ownDrop(0), ownSerial(0) {}
+              capTries(0), afterUnread(0), ownDrop(0), ownSerial(0), named(0) {}
 };
 std::vector<GrRow> g_grRows;
 
@@ -33861,7 +33996,7 @@ int GrRemoveLocal(void* item, const char* why)
         return -1;
     }
     const int og = GpOnGround(item);
-    if (og == 1) { GrDeactivatePod(item); ItDestroyPod(item, why); }
+    if (og == 1) { GrNameForgetAddr(item); GrDeactivatePod(item); ItDestroyPod(item, why); }   /* its name row goes with it */
     else ++g_grRemoveOffGround;
     GpLock(); GrReleaseLocked(ik.c_str()); GpUnlock();
     return og == 1 ? 1 : 0;
@@ -33897,6 +34032,7 @@ int GrAddMsg(void* item, const std::string& key, int qty, ItemMoveMsg* out)
     m.uid = 0; m.op = 0; m.x = 0; m.y = 0; m.quantity = qty > 0 ? qty : 1;
     GrFieldsToMove(fe, &m);
     m.boxKey = key;
+    m.idKind = coopgname::kIdName;   /* an ADD publishes the item's name */
     /* items9 (gap 2): the stolen mark lies on the ground with the item (OWN1 on the ADD). */
     ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &m.owner);
     /* items9 (gap 3): a dropped pack's contents ride the ADD (BAG1), so the pack is not empty on the other game while it lies there.
@@ -33920,90 +34056,105 @@ int GrAddMsg(void* item, const std::string& key, int qty, ItemMoveMsg* out)
    registered address within kGrAddrWindowTenths flat of the entry (the entry's key is then refreshed - the item settles after it
    is registered), else when an entry of its sid lies within kGroundNearTenths of it measured flat (after its zone was unloaded
    and loaded again the item has a new address but lies at its saved place). An entry is removed when this game sends or applies a
-   GROUND GONE for it; the oldest is dropped past kGrRoadCap (counted) and all are forgotten at world teardown. A game started
+   GROUND GONE for it; the oldest is dropped past coopgname::kNameCap (counted) and all are forgotten at world teardown. A game started
    again knows none of its earlier road items: they then lie as world loot there - the catch-up never sends them as ADDs and
    lists them as not road, so the holder's road item lying there pairs with them (no ADD) and they are never sent a GONE. */
-struct GrRoadItem { void* addr; std::string key; coopground::GroundKeyParts parts; };
-std::vector<GrRoadItem> g_grRoad;
-const size_t kGrRoadCap = 4096;
-long long g_grRoadAdded = 0, g_grRoadRefreshed = 0, g_grRoadRemoved = 0, g_grRoadDropped = 0;
+/* the registry IS the shared-name table (g_grName): a row is the item's address, its name and its current key. */
+long long g_grRoadRefreshed = 0, g_grRoadRemoved = 0;
 long long g_grCatchKeysWorld = 0, g_grCatchHolderWorld = 0;   /* world loot listed as not road (asker) / never sent as an ADD (holder) */
 long long g_grCatchAddHeldCut = 0;   /* holder: unpaired road items not sent as ADDs because the asker's listing was cut at its cap */
 long long g_grApplyAdoptRoad = 0;    /* asker: ADDs built fresh because every item of their key here already stands for an announced item */
-void GrRoadNote(void* item, const std::string& key)
+/* the name row the live ground row is, -1 = not a road item: the row at its address (its key refreshed; *byAddrOut 1), else the row
+   of its sid within kGroundNearTenths measured flat with the smallest height difference, then the nearest flat */
+int GrRoadMatch(const GpRow& r, int* byAddrOut)
 {
-    if (item == 0 || key.empty()) return;
-    coopground::GroundKeyParts kp;
-    std::memset(&kp, 0, sizeof kp);
-    if (coopground::GroundKeyParse(key.c_str(), &kp) != 1) return;
-    for (size_t i = 0; i < g_grRoad.size(); ++i)
-        if (g_grRoad[i].addr == item) { g_grRoad[i].key = key; g_grRoad[i].parts = kp; return; }
-    if (g_grRoad.size() >= kGrRoadCap) { g_grRoad.erase(g_grRoad.begin()); ++g_grRoadDropped; }
-    GrRoadItem r; r.addr = item; r.key = key; r.parts = kp;
-    g_grRoad.push_back(r);
-    ++g_grRoadAdded;
-}
-/* the registry entry the live ground row is, -1 = not a road item: the entry at its address, else the entry of its sid within
-   kGroundNearTenths measured flat with the smallest height difference, then the nearest flat (the registry holds no quantity or
-   quality to rank by) */
-int GrRoadMatch(const GpRow& r)
-{
+    if (byAddrOut != 0) *byAddrOut = 0;
     if (r.key.empty()) return -1;
+    const int a = coopgname::NameAt(g_grName, r.item, r.parts);
+    if (a >= 0)
+    {
+        if (coopground::GroundKeySame(g_grName.row[a].cur, r.parts) == 0)
+        {
+            GpLock(); coopgname::NameRefresh(&g_grName, a, r.parts); GpUnlock();
+            ++g_grRoadRefreshed;
+        }
+        if (byAddrOut != 0) *byAddrOut = 1;
+        return a;
+    }
     const long long nearMax = (long long)coopground::kGroundNearTenths * coopground::kGroundNearTenths;
     int best = -1;
     long long bestD = -1, bestDy = 0;
-    for (size_t i = 0; i < g_grRoad.size(); ++i)
+    for (int i = 0; i < coopgname::kNameCap; ++i)
     {
-        const long long d2 = coopground::GroundKeyDist2XZ(g_grRoad[i].parts, r.parts);   /* -1 = another sid */
-        if (d2 < 0) continue;
-        if (g_grRoad[i].addr == r.item && d2 <= kGrAddrWindowTenths * kGrAddrWindowTenths)
-        {
-            if (g_grRoad[i].key != r.key) { g_grRoad[i].key = r.key; g_grRoad[i].parts = r.parts; ++g_grRoadRefreshed; }
-            return (int)i;
-        }
-        if (d2 > nearMax) continue;
-        const long long dy = coopground::GroundKeyDy(g_grRoad[i].parts, r.parts);
-        if (best < 0 || coopground::GroundNearBetter(0, dy, d2, 0, bestDy, bestD) != 0) { bestD = d2; bestDy = dy; best = (int)i; }
+        if (g_grName.row[i].used == 0) continue;
+        const long long d2 = coopground::GroundKeyDist2XZ(g_grName.row[i].cur, r.parts);   /* -1 = another sid */
+        if (d2 < 0 || d2 > nearMax) continue;
+        const long long dy = coopground::GroundKeyDy(g_grName.row[i].cur, r.parts);
+        if (best < 0 || coopground::GroundNearBetter(0, dy, d2, 0, bestDy, bestD) != 0) { bestD = d2; bestDy = dy; best = i; }
     }
     return best;
 }
 void GrRoadForgetItem(void* item)
 {
-    for (size_t i = 0; i < g_grRoad.size(); )
-    {
-        if (g_grRoad[i].addr == item) { g_grRoad.erase(g_grRoad.begin() + (long)i); ++g_grRoadRemoved; continue; }
-        ++i;
-    }
+    GpLock();
+    const int f = coopgname::NameForgetAddr(&g_grName, item);
+    GpUnlock();
+    if (f != 0) ++g_grRoadRemoved;
 }
-/* the entry nearest `key` measured flat within kGroundNearTenths (the same sid) */
-void GrRoadForgetKey(const std::string& key)
+/* 1 = the item is known to be off this game's ground (read so, or no longer a plausible object); 0 = on it, or unreadable */
+int GrOffGroundSure(void* item)
+{
+    if (item == 0 || !ItPlaus(item)) return 1;
+    return (GpOnGround(item) == 0) ? 1 : 0;
+}
+/* the name row at `addr` forgotten when it still stands for an item of key `key` (an address another object took keeps its row) */
+void GrRoadForgetAt(void* addr, const std::string& key)
 {
     coopground::GroundKeyParts kp;
-    std::memset(&kp, 0, sizeof kp);
-    if (coopground::GroundKeyParse(key.c_str(), &kp) != 1) return;
-    const long long nearMax = (long long)coopground::kGroundNearTenths * coopground::kGroundNearTenths;
-    size_t best = g_grRoad.size();
-    long long bestD = -1;
-    for (size_t i = 0; i < g_grRoad.size(); ++i)
-    {
-        const long long d2 = coopground::GroundKeyDist2XZ(g_grRoad[i].parts, kp);
-        if (d2 >= 0 && d2 <= nearMax && (bestD < 0 || d2 < bestD)) { bestD = d2; best = i; }
-    }
-    if (best < g_grRoad.size()) { g_grRoad.erase(g_grRoad.begin() + (long)best); ++g_grRoadRemoved; }
+    if (addr == 0 || coopground::GroundKeyParse(key.c_str(), &kp) != 1) return;
+    GpLock();
+    const int i = coopgname::NameAt(g_grName, addr, kp);
+    if (i >= 0) coopgname::NameForgetRow(&g_grName, i);
+    GpUnlock();
+    if (i >= 0) ++g_grRoadRemoved;
+}
+/* the addresses the shared names never re-bind, never orphan and never rename by a catch-up: a pending drop's item, an overflow drop
+   not yet PUT (allUnconf 1: every unconfirmed drop's item), a removal waiting for its claim, an item held for a granted TAKE or kept
+   in escrow */
+void GrNameSkipList(std::vector<const void*>* skip, int allUnconf)
+{
+    for (size_t i = 0; i < g_grDropPend.size(); ++i) skip->push_back(g_grDropPend[i].e.addr);
+    for (size_t i = 0; i < g_grUnconf.size(); ++i) if (g_grUnconf[i].addr != 0 && (allUnconf != 0 || g_grUnconf[i].tries == 0)) skip->push_back(g_grUnconf[i].addr);
+    for (size_t i = 0; i < g_grRemPend.size(); ++i) if (g_grRemPend[i].addr != 0) skip->push_back(g_grRemPend[i].addr);
+    for (int i = 0; i < kOwnerPendCap; ++i) if (g_ownerPend[i].used != 0 && g_ownerPend[i].isGround != 0 && g_ownerPend[i].item != 0) skip->push_back((const void*)g_ownerPend[i].item);
 }
 void GrSendAdd(void* item, const std::string& key, int qty)
 {
-    GrRoadNote(item, key);   /* an item this game announces lies on its ground as a road item */
+    const std::string nm = GrNameBind(item, key, 1);   /* an item this game announces carries its name from now on (a frozen one wins) */
     ItemMoveMsg m;
-    if (GrAddMsg(item, key, qty, &m) == 0) return;
+    if (GrAddMsg(item, nm, qty, &m) == 0) return;
     if (!net::SendItemMove(m)) ++g_grDropSendFailed;
 }
-void GrSendGone(const std::string& key, int qty)
+/* `key` is the item's name (its key when it carries none); `addr` the item (compared only, 0 = not known): its name row is
+   forgotten - by address, else the row carrying that name - and the name joins the removed-name memory */
+void GrSendGone(const std::string& key, int qty, void* addr)
 {
-    GrRoadForgetKey(key);
+    int named = 0, forgot = 0;
+    GpLock();
+    const int ni = coopgname::NameAtAddr(g_grName, addr);
+    if (ni >= 0) { named = g_grName.row[ni].frozen; coopgname::NameForgetRow(&g_grName, ni); forgot = 1; }
+    else
+    {   /* no address: no row is forgotten (a row carrying the name may be a twin still on the ground) */
+        int at = -1;
+        if (coopgname::NameFindName(g_grName, key.c_str(), &at, 1) > 0) named = g_grName.row[at].frozen;
+    }
+    GpUnlock();
+    if (forgot != 0) ++g_grRoadRemoved;
+    GrGoneNote(key, named);
     ItemMoveMsg m;
     m.uid = 0; m.op = 1; m.x = 0; m.y = 0; m.quantity = qty;
     m.boxKey = key;
+    m.idKind = (named != 0) ? coopgname::kIdName : coopgname::kIdBare;   /* a published name, or the key of an item no game named */
     if (!net::SendItemMove(m)) ++g_grSendFailGone;
 }
 /* THE HOLDER'S WORD TO THE OTHER GAMES about ground it holds, after it served one game's TAKE / PUT: to every game but that one
@@ -34038,23 +34189,29 @@ std::string GrTellSaid(int sent, int why)
 }
 int GrSendGoneExcept(void* item, const std::string& key, int qty, unsigned int exceptPeer, int* whyOut, cooplive::ExceptPlan* planOut)
 {
+    const int ni = coopgname::NameAtAddr(g_grName, item);
+    const int frozen = (ni >= 0) ? g_grName.row[ni].frozen : 0;
     ItemMoveMsg m;
     m.uid = 0; m.op = 1; m.x = 0; m.y = 0; m.quantity = qty;
     m.boxKey = key;
+    m.idKind = (frozen != 0) ? coopgname::kIdName : coopgname::kIdBare;
     int why = cooplive::kExceptWhyNoRoad;
     const int sent = net::SendItemMoveExcept(m, exceptPeer, &why, planOut) ? 1 : 0;
     GrTellCount(sent, why);
     if (sent != 0) ++g_grTellGone;
-    if (sent != 0) GrRoadForgetItem(item);   /* no longer a road item here; an undo notes it again with its ADD */
+    GrGoneNote(key, frozen);   /* the name left this ground (an undo binds it again) */
+    /* the item left this ground whether or not a game was told (on a two-game link the asker is the only other game): it is held,
+       kept in escrow, then destroyed or put back - its row never stays behind to be handed to a neighbour; an undo binds it again */
+    GrRoadForgetItem(item);
     *whyOut = why;
     return sent;
 }
 int GrSendAddExcept(void* item, const std::string& key, int qty, unsigned int exceptPeer, int undo, int* whyOut)
 {
     *whyOut = cooplive::kExceptWhyOk;
-    GrRoadNote(item, key);   /* an item this game announces lies on its ground as a road item */
+    const std::string nm = GrNameBind(item, key, 1);   /* announced under its name (a frozen one wins) */
     ItemMoveMsg m;
-    if (GrAddMsg(item, key, qty, &m) == 0) { ++g_grTellFailed; return 0; }
+    if (GrAddMsg(item, nm, qty, &m) == 0) { ++g_grTellFailed; return 0; }
     int why = cooplive::kExceptWhyNoRoad;
     const int sent = net::SendItemMoveExcept(m, exceptPeer, &why, 0) ? 1 : 0;
     GrTellCount(sent, why);
@@ -34066,9 +34223,9 @@ int GrSendAddExcept(void* item, const std::string& key, int qty, unsigned int ex
 int GrSendAddOnPlan(void* item, const std::string& key, int qty, const cooplive::ExceptPlan& plan, int* whyOut)
 {
     *whyOut = cooplive::kExceptWhyOk;
-    GrRoadNote(item, key);   /* an item this game announces lies on its ground as a road item */
+    const std::string nm = GrNameBind(item, key, 1);   /* announced under its name (a frozen one wins) */
     ItemMoveMsg m;
-    if (GrAddMsg(item, key, qty, &m) == 0) { ++g_grTellFailed; return 0; }
+    if (GrAddMsg(item, nm, qty, &m) == 0) { ++g_grTellFailed; return 0; }
     int why = cooplive::kExceptWhyNoRoad;
     const int sent = net::SendItemMoveOnPlan(m, plan, &why) ? 1 : 0;
     if (sent != 0) ++g_grTellUndoAdd;
@@ -34109,6 +34266,7 @@ unsigned int GrUnconfSend(GrUnconf& u, void* item, DWORD now, int* bagRows)
     GrClearPlayerMarks(&put.owner, &put.bag);   /* decision 396: a player's mark does not lie on the ground */
     ++u.tries;
     if (!net::SendItemRequest(put)) { ++g_grDropSendFailed; return 0; }
+    GrNameBind(item, u.key, 1);   /* the PUT published the name - frozen from now on */
     GrRow row;
     row.id = put.id; row.kind = kGrRowPut; row.uid = u.uid; row.key = u.key; row.qty = u.qty; row.q = u.q; row.sentAt = now;
     g_grRows.push_back(row);
@@ -34120,10 +34278,10 @@ unsigned int GrUnconfSend(GrUnconf& u, void* item, DWORD now, int* bagRows)
    stack): track it as unconfirmed and PUT it to the holder. `what` names it in the log. */
 void GrUnconfStart(void* item, const std::string& key, int qty, float q, unsigned int uid, const std::string& what)
 {
-    GrRoadNote(item, key);   /* this game's own item on ground another game holds: a road item here */
+    const std::string nm = GrNameBind(item, key, 0);   /* named by the key of its first PUT (it follows the item until then; a frozen name wins) */
     const DWORD now = ::GetTickCount();
     GrUnconf n;
-    n.key = key; n.qty = qty; n.q = q; n.uid = uid; n.tries = 0; n.waiting = 0; n.localOnly = 0; n.nextAt = now; n.addr = 0; n.serial = 0;
+    n.key = nm; n.qty = qty; n.q = q; n.uid = uid; n.tries = 0; n.waiting = 0; n.localOnly = 0; n.nextAt = now; n.addr = 0; n.serial = 0;
     g_grUnconf.push_back(n);
     ++g_grUnconfAdded;
     GrUnconf& u = g_grUnconf.back();
@@ -34189,6 +34347,7 @@ int GrEvOwn(const GrEvent& e, unsigned int* du)
    between the drop and the drain - T402 ...10510 -> ...10512, T406 ...10522 -> ...10534). */
 void GrOnDropFound(const GrEvent& e, void* item)
 {
+    GrNameForgetAddr(item);   /* a fresh drop - a name row at its address named another object */
     const std::string key = GrKeyOf(item);
     if (key.empty()) { ++g_grDropNoKey; return; }
     int qty = e.qty; ItIntPod(item, kItemQuantity, &qty);
@@ -34232,6 +34391,7 @@ void GrOnDropFound(const GrEvent& e, void* item)
     }
     /* 3b: this game's own source put it on ground another game holds - ask the holder to put the same item there */
     if (e.world != 0) ++g_grDropWorldPut;   /* ground5 fold 2: a world spill / refund only this game made - PUT with no taker */
+    if (e.from == coopground::kGroundFromRefund && e.own != 0) GrNameBind(item, key, 1);   /* a refund item keeps the key its ledger entry was written under: never re-named before its PUT */
     GrUnconfStart(item, key, qty, e.q, du, GrDropWhat(e));
 }
 /* inv5p1c (MAIN THREAD): a pending drop not found by its address within kGrDropRetryMs (or not taken by the full retry list).
@@ -34276,6 +34436,7 @@ void GrDropGiveUp(const GrEvent& e, const char* lastKey, const char* why)
 void GrForgetAddr(void* obj)
 {
     if (obj == 0) return;
+    GrNameForgetAddr(obj);   /* the name row too */
     for (size_t i = 0; i < g_grDropPend.size(); )
     {
         if (g_grDropPend[i].e.addr == obj) { g_grDropPend.erase(g_grDropPend.begin() + (long)i); ++g_grAddrForgotten; continue; }
@@ -34378,16 +34539,16 @@ void GrDropRetryTick(DWORD now)
 /* MAIN THREAD. A pickup the detour saw complete on this game (3c) - GROUND GONE if this game holds the area. */
 void GrOnGone(const GrEvent& e)
 {
-    if (BuildRefundTaken(e.key, e.qty, e.who, 0) != 0) GrPickHoldDrop(e.hold);   /* P14 fold 1: a refund item - the ledger entry to the writer BEFORE the squad write */
+    if (BuildRefundTaken(e.name, e.qty, e.who, 0) != 0) GrPickHoldDrop(e.hold);   /* P14 fold 1: a refund item - the ledger entry to the writer BEFORE the squad write */
     else GrPickHoldPark(e.hold);   /* P14 fold 2 (D5): not handed - the squad writes keep waiting */
-    if (ItAreaVerdictAt(e.pos, kAreaForGround) != kBoxMine) { ++g_grPickGoneNotMine; return; }
-    GrSendGone(e.key, e.qty);
-    DebugLog("[GROUND] pick by " + GpWho(e.who) + " key=" + std::string(e.key) + " -> this game holds the area: GROUND GONE sent");
+    if (ItAreaVerdictAt(e.pos, kAreaForGround) != kBoxMine) { ++g_grPickGoneNotMine; GrNameForgetAddr(e.addr); return; }
+    GrSendGone(std::string(e.name), e.qty, e.addr);   /* by its name */
+    DebugLog("[GROUND] pick by " + GpWho(e.who) + " key=" + std::string(e.key) + " name=" + std::string(e.name) + " -> this game holds the area: GROUND GONE sent");
 }
 /* P14 fold 1, MAIN THREAD: a partial pickup the detour saw on ground this game holds (the item stays with less) - a ledger escape */
 void GrOnPart(const GrEvent& e)
 {
-    if (BuildRefundTaken(e.key, e.qty, e.who, 0) != 0) GrPickHoldDrop(e.hold);
+    if (BuildRefundTaken(e.name, e.qty, e.who, 0) != 0) GrPickHoldDrop(e.hold);   /* the ledger matches by the name */
     else GrPickHoldPark(e.hold);   /* P14 fold 2 (D5) */
 }
 /* ==== P105g (row P105, owner 344 a / S2-65): THE SHOWN GROUND PICKUP, MAIN THREAD ====================================
@@ -34464,6 +34625,7 @@ int GrShowSendTake(GrRow& row)
     const DWORD now = ::GetTickCount();
     ItemRequestMsg r;
     r.id = row.id; r.dir = 0; r.ownerUid = 0; r.ownerBoxKey = row.key; r.ownerX = 0; r.ownerY = 0; r.quantity = row.qty; r.takerUid = row.uid; r.takerX = 0; r.takerY = 0;
+    r.ownerIdKind = (row.named != 0) ? coopgname::kIdName : coopgname::kIdBare;   /* a bare key lets the holder find a named item by key, then near */
     coopground::GroundKeyParts gk;
     if (coopground::GroundKeyParse(row.key.c_str(), &gk) == 1) r.baseSid = std::string(gk.sid);
     if (r.baseSid.empty() || !net::SendItemRequest(r))
@@ -34480,8 +34642,8 @@ int GrShowSendTake(GrRow& row)
 /* The pickup ran here (GrEvent.shown): the ledger now, then GONE (held here after all), nothing (our own unconfirmed drop) or a TAKE. */
 void GrShowAsk(const GrEvent& e)
 {
-    const std::string key(e.key);
-    if (BuildRefundTaken(e.key, e.took, e.who, 0) != 0) GrPickHoldDrop(e.hold);   /* P14 (P105g: at pickup time) */
+    const std::string key(e.name);   /* the TAKE, the row and the ledger carry the item's name */
+    if (BuildRefundTaken(e.name, e.took, e.who, 0) != 0) GrPickHoldDrop(e.hold);   /* P14 (P105g: at pickup time) */
     else GrPickHoldPark(e.hold);
     GrUnconf* u = GrUnconfOf(key);
     const int mine = (ItAreaVerdictAt(e.pos, kAreaForGround) == kBoxMine) ? 1 : 0;
@@ -34490,16 +34652,17 @@ void GrShowAsk(const GrEvent& e)
     if (act == coopgshow::kAkHeldHere)
     {
         ++g_showGround[10];
-        if (e.took >= e.qty) GrSendGone(key, e.qty);
-        DebugLog("[GROUND] pick by " + GpWho(e.who) + " key=" + key + " took=" + N((long long)e.took) + " of " + N((long long)e.qty)
+        if (e.took >= e.qty) GrSendGone(key, e.qty, e.addr);
+        DebugLog("[GROUND] pick by " + GpWho(e.who) + " name=" + key + " took=" + N((long long)e.took) + " of " + N((long long)e.qty)
                  + " -> this game holds the area after all: " + std::string(e.took >= e.qty ? "GROUND GONE sent" : "a partial pickup, nothing to announce"));
         return;
     }
+    if (e.took >= e.qty || (e.afterUnread != 0 && GrOffGroundSure(e.addr) != 0)) GrNameForgetAddr(e.addr);   /* the whole item left this ground, or it could not be read after the pickup and is no longer on it - its row goes (the row below keeps the name; a copy still lying here is found by its key); the rest of a stack still lying here keeps it */
     if (act == coopgshow::kAkOwnDrop)
     {
         ++g_showGround[11];
         GrUnconfEraseAt(u);
-        DebugLog("[GROUND] pick by " + GpWho(e.who) + " key=" + key + " -> this game's own drop no PUT ever left for (the only copy): the pickup stands, nothing asked");   /* p105g-f1-2 */
+        DebugLog("[GROUND] pick by " + GpWho(e.who) + " name=" + key + " -> this game's own drop no PUT ever left for (the only copy): the pickup stands, nothing asked");   /* p105g-f1-2 */
         return;
     }
     for (size_t i = 0; i < g_grRows.size(); ++i)
@@ -34508,13 +34671,14 @@ void GrShowAsk(const GrEvent& e)
             g_grRows[i].took += e.took;
             if (e.afterUnread != 0) g_grRows[i].afterUnread = 1;   /* p105g-f1-5b */
             ++g_showGround[14];
-            DebugLog("[GROUND] pick by " + GpWho(e.who) + " key=" + key + " took=" + N((long long)e.took) + " more - added to the open TAKE " + N((long long)g_grRows[i].id));
+            DebugLog("[GROUND] pick by " + GpWho(e.who) + " name=" + key + " took=" + N((long long)e.took) + " more - added to the open TAKE " + N((long long)g_grRows[i].id));
             return;
         }
     GrRow row;
     row.kind = kGrRowTake; row.uid = e.uid; row.key = key; row.qty = e.qty; row.q = e.q;
     row.shown = 1; row.took = e.took; row.sid = std::string(e.sid);
     row.afterUnread = e.afterUnread;   /* p105g-f1-5b */
+    row.named = (e.named != 0 && e.frozen != 0) ? 1 : 0;
     if (u != 0)
     {   /* p105g-f1-2: our own unconfirmed drop whose PUT went out (its answer never came, or is still due): asked, and the row keeps
            that it was ours - a "no such item" then stands. A whole pickup leaves nothing of the drop on this game's ground, so its
@@ -34527,7 +34691,7 @@ void GrShowAsk(const GrEvent& e)
     ++g_grPickAsked; ++g_showGround[2];
     const int sent = GrShowSendTake(row);
     g_grRows.push_back(row);
-    DebugLog("[GROUND] pick by " + GpWho(e.who) + " key=" + key + " took=" + N((long long)e.took) + " of " + N((long long)e.qty)
+    DebugLog("[GROUND] pick by " + GpWho(e.who) + " name=" + key + " took=" + N((long long)e.took) + " of " + N((long long)e.qty)
              + " -> another game holds the area: SHOWN AT ONCE (in the inventory, off this game's ground), TAKE " + N((long long)row.id)
              + (sent != 0 ? " sent" : " NOT sent (link) - asked again after the delay")
              + std::string(row.ownDrop != 0 ? " (this game's own drop whose PUT went unanswered - a 'no such item' leaves it with the picker)" : ""));
@@ -34556,7 +34720,7 @@ int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
     const int ownHere = (row.ownDrop != 0 || u != 0) ? 1 : 0;
     const int ownWaiting = (ownPutOpen != 0 || (u != 0 && u->waiting != 0)) ? 1 : 0;
     const int act = coopgshow::SettleAction(cf.ok, cf.reason, ownHere, ownWaiting, mine, row.capTries);   /* p105g-f1-5c: capTries */
-    const std::string tag = "[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key;
+    const std::string tag = "[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key;
     if (act == coopgshow::kSgGranted)
     {
         ++g_grPickGranted; ++g_showGround[3];
@@ -34566,14 +34730,14 @@ int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
         if (rest == 0)
         {   /* the whole stack: a copy still lying here under the same key goes - p105g-f1-5b: only after an unreadable after-read in
                the detour (the case it exists for); otherwise an item at that key is another item and stays */
-            void* left = (coopgshow::LeftoverRemove(1, row.afterUnread, 0) != 0) ? GrFind(row.key.c_str(), row.qty, row.q, 1, 0) : 0;
-            if (left != 0 && GrKeyOf(left) == row.key) { ++g_showGround[18]; GrRemoveLocal(left, "coop P105g ground: the picked item's copy still on the ground"); }
+            void* left = (coopgshow::LeftoverRemove(1, row.afterUnread, 0) != 0) ? GrFindName(row.key, row.qty, row.q, 1, 0, 0) : 0;
+            if (left != 0 && GrIdOf(left) == row.key) { ++g_showGround[18]; GrRemoveLocal(left, "coop P105g ground: the picked item's copy still on the ground"); }
             DebugLog(tag + " GRANTED - already in " + GpWho(picker) + "'s inventory (shown at pickup), nothing built, PLACED ok=1");
             return 1;
         }
         /* a partial pickup: the holder handed its whole stack; what still lies here becomes this game's own drop */
-        void* local = GrFind(row.key.c_str(), rest, row.q, 1, 0);
-        if (local != 0 && GrKeyOf(local) == row.key)
+        void* local = GrFindName(row.key, rest, row.q, 1, 0, 0);   /* by its name */
+        if (local != 0 && GrIdOf(local) == row.key)
         {
             int lq = rest;
             ItIntPod(local, kItemQuantity, &lq);
@@ -34619,8 +34783,8 @@ int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
         if (picker == 0) ++g_showGround[19];
         g_showGround[5] += shortBy;
         /* the rest of a partial pickup (the holder has none - stale here too), or a copy an unreadable after-read left (p105g-f1-5b) */
-        void* it = (coopgshow::LeftoverRemove(0, row.afterUnread, row.took < row.qty ? 1 : 0) != 0) ? GrFind(row.key.c_str(), row.qty, row.q, 1, 0) : 0;
-        if (it != 0 && GrKeyOf(it) == row.key) GrRemoveLocal(it, "coop P105g ground: the holder has no such item");
+        void* it = (coopgshow::LeftoverRemove(0, row.afterUnread, row.took < row.qty ? 1 : 0) != 0) ? GrFindName(row.key, row.qty, row.q, 1, 0, 0) : 0;
+        if (it != 0 && GrIdOf(it) == row.key) GrRemoveLocal(it, "coop P105g ground: the holder has no such item");
         const std::string line = tag + " REFUSED reason=2 (another game took it first) - the pickup is taken back: removed " + N((long long)removed)
                  + " of " + N((long long)row.took) + " " + row.sid + " from " + GpWho(picker) + "'s inventory (it never happened here)";
         if (shortBy > 0 || fault != 0)
@@ -34639,7 +34803,7 @@ int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
     if (act == coopgshow::kSgHeldHere)
     {
         ++g_showGround[10];
-        if (row.took >= row.qty) GrSendGone(row.key, row.qty);
+        if (row.took >= row.qty) GrSendGone(row.key, row.qty, 0);
         DebugLog(tag + " REFUSED reason=1 and this game holds the area now - the pickup stands" + std::string(row.took >= row.qty ? ", GROUND GONE sent" : ""));
         return 1;
     }
@@ -34655,6 +34819,7 @@ int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
     else if (cf.reason == coopground::kGroundReasonBusy) { ++g_grPickBusy; ++g_showGround[9]; }
     else if (cf.reason == coopground::kGroundReasonUnreadable) ++g_grPickUnreadable;
     else if (cf.reason == coopground::kGroundReasonNotFound) ++g_grPickUnconfKept;
+    else if (cf.reason == coopground::kGroundReasonUnknownName) ++g_gnPickUnknown;   /* the holder does not know the name - kept, asked again */
     else ++g_grPickRefused;
     ++row.tries; if (coopgshow::CapCounts(cf.reason) != 0) ++row.capTries;   /* p105g-f1-5c */
     row.inFlight = 0; row.reaskAt = now + coopgshow::ReaskDelayMs(row.tries);
@@ -34673,13 +34838,14 @@ void GrOnAsk(const GrEvent& e)
 }
 /* MAIN THREAD. The local ground item a key names, for REMOVAL: exact, else the fuzzy match - but a fuzzy match that is one of
    this game's own unconfirmed drops is never returned (review-inv5p1 3). *keptOut 1 = that refusal happened. */
-void* GrFindRemovable(const std::string& key, int qty, float q, int* keptOut)
+void* GrFindRemovable(const std::string& key, int qty, float q, int* keptOut, int* howOut, int bare = 0)
 {
     *keptOut = 0;
-    int fuzzy = 0;
-    void* it = GrFind(key.c_str(), qty, q, 0, &fuzzy);
+    int how = coopgname::kHowNone;
+    void* it = GrFindName(key, qty, q, 0, &how, 0, bare);   /* by name; a near match never lands on an item named otherwise (a bare key may) */
+    if (howOut != 0) *howOut = how;
     if (it == 0) return 0;
-    if (fuzzy != 0 && GrUnconfOf(GrKeyOf(it)) != 0) { *keptOut = 1; return 0; }
+    if (how == coopgname::kHowNear && GrUnconfOf(GrIdOf(it)) != 0) { *keptOut = 1; return 0; }
     return it;
 }
 /* MAIN THREAD, from ApplyItemConfirm. 1 = the id was one of ours (handled here). */
@@ -34704,20 +34870,21 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
                        again after the delay (a localOnly pack stays here) */
                     ++g_grPickUnconfKept;
                     if (u->waiting == 0 && u->localOnly == 0 && (int)(u->nextAt - now) > (int)kGrRetryFirstMs) u->nextAt = now + kGrRetryFirstMs;   /* at most 5 s from now - never at once */
-                    DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + " REFUSED reason=2 - the item is this game's own unconfirmed drop"
+                    DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + " REFUSED reason=2 - the item is this game's own unconfirmed drop"
                              " (the only copy): kept, nothing is picked up" + std::string(u->localOnly != 0 ? " (local-only pack)" : "; PUT again after the delay"));
                     return 1;
                 }
                 /* the holder has no such item: our copy is stale - it disappears here too (the player sees it vanish) */
                 ++g_grPickGone;
-                void* it = GrFind(row.key.c_str(), row.qty, row.q, 1, 0);
-                if (it != 0 && GrKeyOf(it) == row.key) GrRemoveLocal(it, "coop inv5 ground: the holder has no such item");
+                void* it = GrFindName(row.key, row.qty, row.q, 1, 0, 0);
+                if (it != 0 && GrIdOf(it) == row.key) GrRemoveLocal(it, "coop inv5 ground: the holder has no such item");
             }
             else if (cf.reason == coopground::kGroundReasonNotHolder) ++g_grPickNotHolder;
             else if (cf.reason == coopground::kGroundReasonBusy) ++g_grPickBusy;
             else if (cf.reason == coopground::kGroundReasonUnreadable) ++g_grPickUnreadable;
+            else if (cf.reason == coopground::kGroundReasonUnknownName) ++g_gnPickUnknown;
             else ++g_grPickRefused;
-            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + " REFUSED reason=" + N((long long)cf.reason) + " - nothing is picked up");
+            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + " REFUSED reason=" + N((long long)cf.reason) + " - nothing is picked up");
             return 1;
         }
         void* picker = GrPickerByUid(row.uid);
@@ -34728,7 +34895,7 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
         if (cf.owner.kind != 0) mm.owner = cf.owner;   /* items9 (gap 2): picked up from the ground, still stolen */
         const char* bwhy = "";
         ::Item* built = (picker != 0) ? GrBuild(mm, &cf.bag, (::Character*)picker, &bwhy) : 0;
-        if (picker != 0 && built == 0) GrCreateSay("TAKE " + N((long long)cf.id) + " key=" + row.key + " sid=" + mm.baseSid + " granted but NOT built: " + bwhy);
+        if (picker != 0 && built == 0) GrCreateSay("TAKE " + N((long long)cf.id) + " name=" + row.key + " sid=" + mm.baseSid + " granted but NOT built: " + bwhy);
         int left = 0;
         const int g = (built != 0) ? GrGivePod(picker, built, 0, &left) : -1;
         if (g != 1 && g != 2)
@@ -34736,15 +34903,15 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
             ++g_grPickGrantGiveFailed;
             if (built != 0) ItDestroyPod(built, "coop inv5 ground: the picker could not take it");
             GrSendPlaced(cf.id, 0);   /* p105g-f2-2: listed for re-send */
-            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + " granted but the picker could not take it (picker="
+            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + " granted but the picker could not take it (picker="
                      + std::string(picker != 0 ? "alive" : "gone") + " built=" + (built != 0 ? "1" : "0") + ") - PLACED ok=0, the holder puts it back");
             return 1;
         }
         ++g_grPickGranted;   /* review-inv5p1 9: booked only once the give went in */
         /* the local ground copy goes (found again by its key - review-inv5p1 1): the holder's item is the one the picker now carries */
         /* inv5p1b 2: the TAKE's key was read from the item itself, so only an EXACT key match is that item - no near match here */
-        void* local = GrFind(row.key.c_str(), row.qty, row.q, 1, 0);
-        if (local != 0 && GrKeyOf(local) == row.key) GrRemoveLocal(local, "coop inv5 ground: picked up through the holder");
+        void* local = GrFindName(row.key, row.qty, row.q, 1, 0, 0);
+        if (local != 0 && GrIdOf(local) == row.key) GrRemoveLocal(local, "coop inv5 ground: picked up through the holder");
         else ++g_grGrantNoExact;
         GrUnconfEraseAt(GrUnconfOf(row.key));   /* the holder had it after all */
         GrSendPlaced(cf.id, 1);   /* p105g-f2-2: listed for re-send */
@@ -34752,7 +34919,7 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
             GrPickHoldPark(GrPickHoldTake());   /* P14 fold 2 (D5): pp.build not handed - own squad writes wait */
         if (g == 1)
         {
-            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + " GRANTED - the item is in " + GpWho(picker) + "'s inventory, PLACED ok=1");
+            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + " GRANTED - the item is in " + GpWho(picker) + "'s inventory, PLACED ok=1");
             return 1;
         }
         /* review-inv5p1 2: PART of the stack went in. The holder's whole item goes on PLACED ok=1 (sent above); the rest, still in
@@ -34766,7 +34933,7 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
             if (!rk.empty() && ItAreaVerdictAt(kp, kAreaForGround) == kBoxMine) { ++g_grDropMine; GrSendAdd(built, rk, left); }
             else if (!rk.empty()) GrUnconfStart(built, rk, left, cf.quality, row.uid, "rest of TAKE " + N((long long)cf.id));
             else ++g_grPickPartialNoGround;
-            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + " GRANTED IN PART - " + N((long long)left) + " did not fit and lie on the ground again, PLACED ok=1");
+            DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + " GRANTED IN PART - " + N((long long)left) + " did not fit and lie on the ground again, PLACED ok=1");
         }
         else if (left <= 0) ItDestroyPod(built, "coop inv5 ground: the empty rest of a partly granted stack");
         else
@@ -34780,7 +34947,7 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
             if (g2 == 1)
             {
                 ++g_grLeftoverKept;
-                DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + " GRANTED IN PART - the rest could not go back on the ground; it went into the picker's inventory");
+                DebugLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + " GRANTED IN PART - the rest could not go back on the ground; it went into the picker's inventory");
             }
             else if (ItBoxPosPod(picker, pp) != 0 && GrActivatePod(built, pp) == 1)
             {
@@ -34789,12 +34956,12 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
                 ++g_grLeftoverDropped;
                 if (!rk.empty() && ItAreaVerdictAt(pp, kAreaForGround) == kBoxMine) { ++g_grDropMine; GrSendAdd(built, rk, rest); }
                 else if (!rk.empty()) GrUnconfStart(built, rk, rest, cf.quality, row.uid, "rest of TAKE " + N((long long)cf.id) + " at the picker");
-                ErrorLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + ": " + N((long long)rest) + " that did not fit could not go back where it lay - left at the picker's position as the picker's own drop");
+                ErrorLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + ": " + N((long long)rest) + " that did not fit could not go back where it lay - left at the picker's position as the picker's own drop");
             }
             else
             {
                 ++g_grLeftoverDestroyed;
-                ErrorLog("[GROUND] TAKE " + N((long long)cf.id) + " key=" + row.key + ": " + N((long long)left) + " that did not fit could NOT be put on the ground or into the inventory - destroyed");
+                ErrorLog("[GROUND] TAKE " + N((long long)cf.id) + " name=" + row.key + ": " + N((long long)left) + " that did not fit could NOT be put on the ground or into the inventory - destroyed");
                 ItDestroyPod(built, "coop inv5 ground: the rest of a partly granted stack");
             }
         }
@@ -34809,7 +34976,7 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
         ++g_grPutOk;
         if (u != 0) { ++g_grUnconfConfirmed; GrUnconfEraseAt(u); }
         BuildRefundHanded(row.key.c_str(), row.qty);   /* P14 fold 5 (T732): a refund item now on the holder's ground - its ledger escape */
-        DebugLog("[GROUND] PUT " + N((long long)cf.id) + " key=" + row.key + " applied by the holder");
+        DebugLog("[GROUND] PUT " + N((long long)cf.id) + " name=" + row.key + " applied by the holder");
         return 1;
     }
     if (cf.reason == coopground::kGroundReasonNotHolder)
@@ -34817,15 +34984,15 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
         float pos[3];
         if (GrKeyPos(row.key, pos) != 0 && ItAreaVerdictAt(pos, kAreaForGround) == kBoxMine)
         {
-            void* it = GrFind(row.key.c_str(), row.qty, row.q, 1, 0);
+            void* it = GrFindName(row.key, row.qty, row.q, 1, 0, 0);
             if (it != 0) { ++g_grPutBecameAdd; GrSendAdd(it, row.key, row.qty); if (u != 0) GrUnconfEraseAt(u); return 1; }
         }
         ++g_grPutNoHolder;
-        DebugLog("[GROUND] PUT " + N((long long)cf.id) + " key=" + row.key + " REFUSED: that game does not hold the area - the item stays on THIS game's ground (kept, PUT again after the delay)");
+        DebugLog("[GROUND] PUT " + N((long long)cf.id) + " name=" + row.key + " REFUSED: that game does not hold the area - the item stays on THIS game's ground (kept, PUT again after the delay)");
         return 1;
     }
     ++g_grPutRefused;
-    ErrorLog("[GROUND] PUT " + N((long long)cf.id) + " key=" + row.key + " REFUSED by the holder (reason " + N((long long)cf.reason) + ") - the item stays on THIS game's ground (kept, PUT again after the delay)");
+    ErrorLog("[GROUND] PUT " + N((long long)cf.id) + " name=" + row.key + " REFUSED by the holder (reason " + N((long long)cf.reason) + ") - the item stays on THIS game's ground (kept, PUT again after the delay)");
     return 1;
 }
 
@@ -34947,7 +35114,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         ++g_grServePutAdopt;
         cf.ok = 1;
         if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-        DebugLog("[GROUND] PUT " + N((long long)r.id) + " key=" + r.ownerBoxKey + " served: a repeat of a PUT already applied here (same drop serial from this player) - confirmed before the holder test, nothing built");
+        DebugLog("[GROUND] PUT " + N((long long)r.id) + " name=" + r.ownerBoxKey + " served: a repeat of a PUT already applied here (same drop serial from this player) - confirmed before the holder test, nothing built");
         return;
     }
     /* P105g (p105g-items-2: BEFORE the holder test - a holder that lost the area since still keeps the object, and a "not holder"
@@ -34964,7 +35131,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
             const int same = (kc->peer == fromPeer) ? 1 : 0;
             if (pass == 0 && same == 0) continue;
             const int relinked = (kc->relinked != 0 || kc->grantGen != net::SessionLinkGen()) ? 1 : 0;   /* a link edge since the grant */
-            if (coopgshow::RepeatMatch(same, (r.ownerBoxKey == std::string(kc->groundKey)) ? 1 : 0, relinked) == 0) continue;
+            if (coopgshow::RepeatMatch(same, coopgname::KeptIdMatch(r.ownerBoxKey.c_str(), kc->groundKey, kc->groundAskId), relinked) == 0) continue;
             kpd = kc; keyOnly = (same == 0) ? 1 : 0;
         }
     if (kpd != 0)
@@ -34997,7 +35164,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         const bool rcf = ItSendConfirm(cf);
         if (!rcf) ++g_reqConfirmSendFailed;
         kpd->cfSent = coopgshow::KeptCfSent(kpd->cfSent, 1, rcf ? 1 : 0);   /* p105g-f2-4: an answered repeat marks it as the grant does */
-        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " key=" + r.ownerBoxKey + " served again: a repeat of a TAKE already granted - answered from the kept item (qty="
+        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " served again: a repeat of a TAKE already granted - answered from the kept item (qty="
                  + N((long long)rq) + std::string(kpd->escrow != 0 ? ", in escrow" : "")
                  + std::string(keyOnly != 0 ? ", matched by key: the requester was renumbered at a link edge" : "") + "; its 10 s PLACED wait restarted)");
         return;
@@ -35029,7 +35196,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                 ++g_grServePutAdopt;
                 cf.ok = 1;
                 if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-                DebugLog("[GROUND] PUT " + N((long long)r.id) + " key=" + r.ownerBoxKey + " served: a repeat of a PUT already applied (same drop serial from this peer) - confirmed, nothing built");
+                DebugLog("[GROUND] PUT " + N((long long)r.id) + " name=" + r.ownerBoxKey + " served: a repeat of a PUT already applied (same drop serial from this peer) - confirmed, nothing built");
                 return;
             }
         ItemMoveMsg mm;
@@ -35043,14 +35210,14 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         if (item == 0 || act != 1)
         {
             ++g_grServePutFailed;
-            GrCreateSay("PUT " + N((long long)r.id) + " key=" + r.ownerBoxKey + " sid=" + mm.baseSid + " NOT served: " + (item == 0 ? std::string(why) : std::string(GrActWhy(act))));
+            GrCreateSay("PUT " + N((long long)r.id) + " name=" + r.ownerBoxKey + " sid=" + mm.baseSid + " NOT served: " + (item == 0 ? std::string(why) : std::string(GrActWhy(act))));
             if (item != 0) ItDestroyPod(item, "coop inv5 ground: PUT activate failed");
             if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
             return;
         }
         GrForgetAddr(item);   /* ground5 fold 2 (re-check LOW 4): an entry naming this address named a freed object */
         ++g_grServePutOk;
-        { const std::string bk = GrKeyOf(item); GrRoadNote(item, bk.empty() ? r.ownerBoxKey : bk); }   /* a road item on this game's ground */
+        GrNameBind(item, r.ownerBoxKey, 1);   /* a road item on this game's ground under the DROPPER's name, not this game's re-read key */
         {   /* inv5p1b 6: remembered (bounded: 10 min, 512 rows) */
             GrServed sv; sv.peer = fromPeer; sv.serial = r.id; sv.at = ::GetTickCount();
             if (g_grServed.size() >= kGrServedCap) g_grServed.erase(g_grServed.begin());
@@ -35061,20 +35228,46 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         const std::string ak = GrKeyOf(item);
         int aq = mm.quantity; ItIntPod(item, kItemQuantity, &aq);
         int awhy = 0;
-        const int told = GrSendAddExcept(item, ak.empty() ? r.ownerBoxKey : ak, aq, fromPeer, 0, &awhy);   /* the other games show it too */
-        DebugLog("[GROUND] PUT " + N((long long)r.id) + " key=" + r.ownerBoxKey + " served: the item is on this game's ground (bagRows="
-                 + N((long long)r.bag.size()) + "); GROUND ADD key=" + (ak.empty() ? r.ownerBoxKey : ak) + " to the other games: " + GrTellSaid(told, awhy));
+        const int told = GrSendAddExcept(item, r.ownerBoxKey, aq, fromPeer, 0, &awhy);   /* the other games show it too, under the dropper's name */
+        DebugLog("[GROUND] PUT " + N((long long)r.id) + " name=" + r.ownerBoxKey + " served: the item is on this game's ground (bagRows="
+                 + N((long long)r.bag.size()) + "); GROUND ADD name=" + r.ownerBoxKey + " (current key here " + (ak.empty() ? std::string("<unreadable>") : ak)
+                 + ") to the other games: " + GrTellSaid(told, awhy));
         return;
     }
-    /* TAKE: first come, first served on this main thread - a second TAKE for the same item finds nothing (3d.3) */
-    void* item = GrFind(r.ownerBoxKey.c_str(), r.quantity, 0.0f, 0, 0);
+    /* TAKE: first come, first served on this main thread - a second TAKE for the same item finds nothing (3d.3). The TAKE
+       carries the item's name - found by name first; an item carrying no name by its key, then near; never an item named otherwise.
+       No match: reason 2 only when that name (or an unnamed item beside it) left this ground in the last 10 minutes, else reason 5. */
+    int thow = coopgname::kHowNone;
+    GpRow trow;
+    const int tbare = (r.ownerIdKind == coopgname::kIdBare) ? 1 : 0;   /* the requester knows no name for it: its key, matched as before names */
+    void* item = GrFindName(r.ownerBoxKey, r.quantity, 0.0f, 0, &thow, &trow, tbare);
     if (item == 0)
     {
+        const int gh = GrGoneHas(r.ownerBoxKey);
         ++g_grServeNotFound;
-        cf.reason = coopground::kGroundReasonNotFound;
+        cf.reason = coopgname::TakeMissReason(gh);
+        if (cf.reason == coopground::kGroundReasonNotFound) ++g_gnTakeGone; else ++g_gnTakeUnknown;
         if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " key=" + r.ownerBoxKey + " refused: no such item on this game's ground (reason 2)");
+        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " refused (reason " + N((long long)cf.reason) + "): no item carries that name here - "
+                 + std::string(gh == 1 ? "that name left this ground within 10 min" : gh == 2 ? "an unnamed item of that sid beside it left this ground within 10 min"
+                   : "the name is not known here (the requester asks again and keeps its copy)"));
         return;
+    }
+    {
+        coopground::GroundKeyParts np;
+        std::memset(&np, 0, sizeof np);
+        const long long nd2 = (coopground::GroundKeyParse(r.ownerBoxKey.c_str(), &np) == 1) ? coopground::GroundKeyDist2XZ(trow.parts, np) : -1;
+        char du[32]; du[0] = 0;
+        sprintf_s(du, sizeof(du), "%.1f", nd2 >= 0 ? std::sqrt((double)nd2) / 10.0 : -1.0);
+        if (thow == coopgname::kHowName) ++g_gnTakeName; else if (thow == coopgname::kHowKey) ++g_gnTakeKey; else ++g_gnTakeNear;
+        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " matched " + GrHowName(thow) + " (current key " + trow.key + ", "
+                 + std::string(du) + " units from the name)");
+    }
+    std::string tid = r.ownerBoxKey;   /* what the item is called from here on (kept row, ledger, GONE): the TAKE's id, or the name of the named item a bare key landed on */
+    if (tbare != 0)
+    {
+        const std::string tnm = GrNameOf(item);
+        if (!tnm.empty() && tnm != tid) { tid = tnm; ++g_gnTakeBareNamed; DebugLog("[GROUND] TAKE " + N((long long)r.id) + " bare key=" + r.ownerBoxKey + " landed on the item named " + tnm + " - called by that name from here on"); }
     }
     ItEntry fe; ItClear(&fe);
     std::vector<coopbag::BagRow> bag;
@@ -35085,7 +35278,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         ++g_grServeUnreadable;
         cf.reason = coopground::kGroundReasonUnreadable;
         if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " key=" + r.ownerBoxKey + " refused: the item's fields or pack cannot be read (reason 4)");
+        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " refused: the item's fields or pack cannot be read (reason 4)");
         return;
     }
     /* review-inv5p1 6: the item's claim first - an off-main engine pickup of it may be running right now */
@@ -35096,7 +35289,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         ++g_grServeBusy;
         cf.reason = coopground::kGroundReasonBusy;
         if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " key=" + r.ownerBoxKey + " refused: the item is being picked up here right now (reason 3)");
+        DebugLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " refused: the item is being picked up here right now (reason 3)");
         return;
     }
     if (GpOnGround(item) != 1)
@@ -35129,13 +35322,15 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         ++g_grServeDeactFailed;
         cf.reason = coopground::kGroundReasonBusy;
         if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
-        ErrorLog("[GROUND] TAKE " + N((long long)r.id) + " key=" + r.ownerBoxKey + " refused: Item::deactivate faulted (reason 3)");
+        ErrorLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " refused: Item::deactivate faulted (reason 3)");
         return;
     }
     op->id = r.id; op->peer = fromPeer; op->dir = 0; op->item = item; op->uid = 0;
     op->grantGen = net::SessionLinkGen();   /* p105g-f1-5a */
     op->isGround = 1; op->groundPos[0] = kpos[0]; op->groundPos[1] = kpos[1]; op->groundPos[2] = kpos[2];
-    _snprintf_s(op->groundKey, sizeof(op->groundKey), _TRUNCATE, "%s", ik.c_str());   /* P14 fold 1 */
+    _snprintf_s(op->groundKey, sizeof(op->groundKey), _TRUNCATE, "%s", tid.c_str());   /* P14 fold 1: the item's name (the undo's ADD, the ledger, a repeat's match) */
+    _snprintf_s(op->groundAskId, sizeof(op->groundAskId), _TRUNCATE, "%s", r.ownerBoxKey.c_str());   /* the TAKE's own id: a repeat from a renumbered requester names the item by it */
+    if (tid != r.ownerBoxKey) GrGoneNote(r.ownerBoxKey, 0);   /* the bare key that landed on a named item left this ground too */
     op->sentAt = ::GetTickCount();
     ++g_grServeTakeOk;
     cf.ok = 1; cf.quantity = qty;
@@ -35149,13 +35344,13 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     op->cfSent = coopgshow::KeptCfSent(op->cfSent, 1, gcf ? 1 : 0);   /* p105g-f2-1 (row T-435): from here 10 s of silence is escrow */
     int gwhy = 0;
     cooplive::ExceptPlan gplan;
-    const int gtold = GrSendGoneExcept(item, ik, qty, fromPeer, &gwhy, &gplan);   /* the item left this ground: the other games stop showing it */
+    const int gtold = GrSendGoneExcept(item, tid, qty, fromPeer, &gwhy, &gplan);   /* the item left this ground: the other games stop showing it (by its name) */
     op->goneTold = cooplive::ExceptToldBy(gplan, gtold != 0);
     op->goneRoad = gplan.road; op->goneRoute = gplan.route; op->goneTarget = gplan.target;
-    DebugLog("[GROUND] TAKE " + N((long long)r.id) + " key=" + r.ownerBoxKey + " granted: kept until PLACED (qty=" + N((long long)qty)
+    DebugLog("[GROUND] TAKE " + N((long long)r.id) + " name=" + r.ownerBoxKey + " granted: kept until PLACED (qty=" + N((long long)qty)
              + " bagRows=" + N((long long)bag.size())
              + (gcf ? "; ok CONFIRM out - no PLACED in 10 s holds it in escrow" : "; the CONFIRM could NOT be sent - no PLACED in 10 s puts it back")
-             + "); GROUND GONE key=" + ik + " to the other games: " + GrTellSaid(gtold, gwhy));
+             + "); GROUND GONE name=" + tid + " (current key here " + ik + ") to the other games: " + GrTellSaid(gtold, gwhy));
 }
 /* MAIN THREAD, from ItRollbackTake (PLACED ok 0; no PLACED in 10 s after a CONFIRM that never went out; or - p105g-f2-3 - an escrow
    that ended with no PLACED, D6): the kept ground item goes back where it lay. */
@@ -35222,8 +35417,7 @@ void GrUndoRetryTick(DWORD now)
             DebugLog("[GROUND] TAKE " + N((long long)e.id) + " undone: its GROUND ADD is no longer retried - the item left this ground");
             continue;
         }
-        const std::string k0 = GrKeyOf(it);
-        const std::string k = k0.empty() ? e.key : k0;
+        const std::string k = e.key;   /* the item's name, never a re-read key */
         float ip[3];
         if (ItBoxPosPodRaw(it, ip) == 1 && ItAreaVerdictAt(ip, kAreaForGround) != kBoxMine)
         {
@@ -35236,7 +35430,7 @@ void GrUndoRetryTick(DWORD now)
         {
             g_grUndoRetry.erase(g_grUndoRetry.begin() + (long)i);
             ++g_grUndoRetryExpired;
-            DebugLog("[GROUND] TAKE " + N((long long)e.id) + " undone: its GROUND ADD key=" + k + " was not sent within "
+            DebugLog("[GROUND] TAKE " + N((long long)e.id) + " undone: its GROUND ADD name=" + k + " was not sent within "
                      + N((long long)(kGrUndoRetryMs / 1000)) + " s on the road its GONE took - dropped (counted undoRetry expired)");
             continue;
         }
@@ -35246,7 +35440,7 @@ void GrUndoRetryTick(DWORD now)
         {
             g_grUndoRetry.erase(g_grUndoRetry.begin() + (long)i);
             ++g_grUndoRetrySent;
-            DebugLog("[GROUND] TAKE " + N((long long)e.id) + " undone: GROUND ADD key=" + k + " sent to the other games on the retry, "
+            DebugLog("[GROUND] TAKE " + N((long long)e.id) + " undone: GROUND ADD name=" + k + " sent to the other games on the retry, "
                      + N((long long)(now - e.since)) + " ms after the undo");
             continue;
         }
@@ -35263,8 +35457,8 @@ void GroundUndoTake(void* item, const float* pos, const char* key, int goneTold,
     if (ItPlaus(item)) ItIntPod(item, kItemQuantity, &qty);
     const int back = GroundPutBackOk(item, pos, why);
     const int holderNow = (ItAreaVerdictAt(pos, kAreaForGround) == kBoxMine) ? 1 : 0;
-    const std::string k0 = (back != 0) ? GrKeyOf(item) : std::string();
-    const std::string k = k0.empty() ? std::string(key) : k0;
+    const std::string k = (key != 0 && key[0] != 0) ? std::string(key) : ((back != 0) ? GrKeyOf(item) : std::string());   /* the kept row's name */
+    if (back != 0 && !k.empty()) GrNameBind(item, k, 1);   /* back on the ground under its name (its row went when the TAKE was granted) */
     if (goneTold != 0 && back != 0 && holderNow == 0) { GrUndoToHolder(item, k, id, "put back"); return; }
     if (coopground::GroundUndoTell(goneTold, back, holderNow) == 0)
     {
@@ -35285,7 +35479,7 @@ void GroundUndoTake(void* item, const float* pos, const char* key, int goneTold,
         else ++g_grTellFailed;
         GrUndoRetryAdd(item, k, plan, id);
     }
-    DebugLog("[GROUND] TAKE " + N((long long)id) + " undone: the item is back on this game's ground; GROUND ADD key=" + k
+    DebugLog("[GROUND] TAKE " + N((long long)id) + " undone: the item is back on this game's ground; GROUND ADD name=" + k
              + " to the other games on the road its GONE took: " + GrTellSaid(told, w) + (told == 0 ? " - retried each ground tick for up to 60 s" : ""));
 }
 void GroundNoteKeptPlaced() { ++g_grKeptPlaced; }
@@ -35340,13 +35534,17 @@ unsigned int GrCatchUpKeys(int sx, int sy, std::vector<cooppar::ParityGroundRow>
     GpCollect(0.0f, cp, &rows, &walked, &zones, &trunc);
     std::vector<size_t> at;   /* this sector's listable rows */
     std::vector<unsigned char> road;   /* per listable row: 1 = a road item here */
+    std::vector<std::string> ids;   /* per listable row what it is listed as - its name when it carries one, else its key */
     for (size_t i = 0; i < rows.size(); ++i)
     {
         const GpRow& r = rows[i];
         if (r.key.empty() || r.parts.sx != sx || r.parts.sy != sy) continue;
         if (GrSpillRemovalPending(r.item) != 0) continue;
         at.push_back(i);
-        road.push_back(GrRoadMatch(r) >= 0 ? 1 : 0);
+        int byAddr = 0;
+        const int rm = GrRoadMatch(r, &byAddr);
+        road.push_back(rm >= 0 ? 1 : 0);
+        ids.push_back(byAddr != 0 ? std::string(g_grName.row[rm].name) : r.key);
     }
     std::vector<unsigned char> unconf(at.size(), 0);
     /* the records with an address first, so a record matched by nearness cannot take an item another record holds by address */
@@ -35369,7 +35567,7 @@ unsigned int GrCatchUpKeys(int sx, int sy, std::vector<cooppar::ParityGroundRow>
         {
             if (unconf[j] != 0) continue;
             const GpRow& r = rows[at[j]];
-            if (coopground::GroundKeySame(r.parts, kp) != 0) { best = j; bestD = 0; break; }
+            if (ids[j] == g_grUnconf[k].key || coopground::GroundKeySame(r.parts, kp) != 0) { best = j; bestD = 0; break; }   /* its name, or its key */
             const long long d2 = coopground::GroundKeyDist2XZ(r.parts, kp);   /* -1 = another sid */
             if (d2 < 0 || d2 > nearMax) continue;
             if (bestD < 0 || d2 < bestD) { best = j; bestD = d2; }
@@ -35386,7 +35584,7 @@ unsigned int GrCatchUpKeys(int sx, int sy, std::vector<cooppar::ParityGroundRow>
             if (out->size() >= (size_t)cooppar::kParityMaxGroundKeys) { ++g_grCatchKeysCut; ++left; continue; }
             const GpRow& r = rows[at[j]];
             if (road[j] == 0) ++g_grCatchKeysWorld;
-            cooppar::ParityGroundRow g; g.key = r.key; g.qty = r.qty; g.q100 = coopground::GroundQ100(r.q); g.road = isRoad;
+            cooppar::ParityGroundRow g; g.key = ids[j]; g.qty = r.qty; g.q100 = coopground::GroundQ100(r.q); g.road = isRoad;
             out->push_back(g);
         }
     }
@@ -35436,17 +35634,23 @@ void GrCatchUpServe(int sx, int sy, const std::vector<cooppar::ParityGroundRow>&
     const int whole = (trunc == 0 && walked < 4096) ? 1 : 0;   /* GpCollect's walk holds at most 4096 items */
     std::vector<size_t> at;
     std::vector<cooppar::ParityGroundRow> holder;
+    std::vector<int> hNamed;   /* per holder row: 1 = it carries a published name */
     for (size_t i = 0; i < rows.size(); ++i)
     {
         if (rows[i].key.empty() || rows[i].parts.sx != sx || rows[i].parts.sy != sy) continue;
         if (GrSpillRemovalPending(rows[i].item) != 0) continue;   /* removed here soon: not this game's ground */
-        const int isRoad = (GrRoadMatch(rows[i]) >= 0) ? 1 : 0;
+        int byAddr = 0;
+        const int rm = GrRoadMatch(rows[i], &byAddr);
+        const int isRoad = (rm >= 0) ? 1 : 0;
         if (isRoad == 0) ++g_grCatchHolderWorld;
-        cooppar::ParityGroundRow h; h.key = rows[i].key; h.qty = rows[i].qty; h.q100 = coopground::GroundQ100(rows[i].q); h.road = isRoad;
+        cooppar::ParityGroundRow h; h.qty = rows[i].qty; h.q100 = coopground::GroundQ100(rows[i].q); h.road = isRoad;
+        h.key = (byAddr != 0) ? std::string(g_grName.row[rm].name) : rows[i].key;   /* its name when it carries one */
+        hNamed.push_back((byAddr != 0 && g_grName.row[rm].frozen != 0) ? 1 : 0);
         at.push_back(i); holder.push_back(h);
     }
     std::vector<size_t> add, gone;
-    const size_t held = cooppar::ParityGroundPlan(holder, asked, listedLeft != 0 ? 1 : 0, &add, &gone);
+    std::vector<std::pair<size_t, size_t> > pairs;
+    const size_t held = cooppar::ParityGroundPlan(holder, asked, listedLeft != 0 ? 1 : 0, &add, &gone, &pairs);
     g_grCatchAddHeldCut += (long long)held;
     long long a = 0, g = 0, cut = 0;
     for (size_t i = 0; i < add.size(); ++i)
@@ -35454,7 +35658,7 @@ void GrCatchUpServe(int sx, int sy, const std::vector<cooppar::ParityGroundRow>&
         if ((size_t)(a + g) >= kGrCatchUpCap) { ++cut; continue; }
         const GpRow& r = rows[at[add[i]]];
         ItemMoveMsg m;
-        if (GrAddMsg(r.item, r.key, r.qty, &m) == 0) continue;   /* counted in GrAddMsg */
+        if (GrAddMsg(r.item, holder[add[i]].key, r.qty, &m) == 0) continue;   /* counted in GrAddMsg; under its name */
         if (net::SendItemMoveTo(m, asker)) ++a; else ++g_grDropSendFailed;
     }
     if (whole == 0) { cut += (long long)gone.size(); gone.clear(); }
@@ -35469,15 +35673,29 @@ void GrCatchUpServe(int sx, int sy, const std::vector<cooppar::ParityGroundRow>&
         ItemMoveMsg m;
         m.uid = 0; m.op = 1; m.x = 0; m.y = 0; m.quantity = gr.qty;
         m.boxKey = gr.key;
+        m.idKind = coopgname::kIdName;   /* the asker's own id: its name, or the key of an item it has no name for (a name lookup falls back to it) */
         if (net::SendItemMoveTo(m, asker)) ++g; else ++g_grSendFailGone;
     }
+    long long nmd = 0;
+    for (size_t p = 0; p < pairs.size(); ++p)
+    {   /* a pair whose ids differ: the asker's copy (listed by its key, or another name) takes this item's name - an ADD that builds nothing */
+        const size_t hi = pairs[p].first, aj = pairs[p].second;
+        if (hi >= hNamed.size() || aj >= asked.size() || hNamed[hi] == 0 || holder[hi].key == asked[aj].key) continue;
+        if ((size_t)(a + g + nmd) >= kGrCatchUpCap) { ++cut; continue; }
+        const GpRow& r = rows[at[hi]];
+        ItemMoveMsg m;
+        if (GrAddMsg(r.item, holder[hi].key, r.qty, &m) == 0) continue;
+        m.idKind = coopgname::kIdNameFor; m.idFor = asked[aj].key;
+        if (net::SendItemMoveTo(m, asker)) ++nmd; else ++g_grDropSendFailed;
+    }
+    g_gnCatchNameSent += nmd;
     g_grCatchServedAdd += a; g_grCatchServedGone += g; g_grCatchServedCut += cut;
     static int s_lines = 0;
     if (s_lines < 200)
     {
         ++s_lines;
         DebugLog("[GROUND] catch-up for slot " + N((long long)net::PlayerSlotOfKey(asker)) + " sector=" + N((long long)sx) + "," + N((long long)sy)
-                 + ": " + N(a) + " added, " + N(g) + " gone (asker listed " + N((long long)asked.size()) + ")"
+                 + ": " + N(a) + " added, " + N(g) + " gone, " + N(nmd) + " named (asker listed " + N((long long)asked.size()) + ")"
                  + (cut != 0 ? " cut=" + N(cut) : std::string())
                  + (allowGone == 0 ? std::string(" - the sector's ground did not settle here in time: no GONE sent") : std::string())
                  + (held != 0 ? " - the listing was cut at its cap (" + N((long long)listedLeft) + " left out): " + N((long long)held)
@@ -35517,8 +35735,7 @@ void* GrFindAdoptable(const char* key, int wantQty, float wantQ, int* spillOut, 
     {
         if (rows[i].key.empty() || coopground::GroundKeySame(rows[i].parts, want) == 0) continue;
         if (GrSpillRemovalPending(rows[i].item) != 0) { if (spillOut != 0) ++*spillOut; continue; }
-        int held = 0;
-        for (size_t k = 0; k < g_grRoad.size() && held == 0; ++k) if (g_grRoad[k].addr == rows[i].item) held = 1;
+        const int held = (coopgname::NameAtAddr(g_grName, rows[i].item) >= 0) ? 1 : 0;   /* an item carrying a name stands for an announced item */
         if (held != 0) { if (roadOut != 0) ++*roadOut; continue; }
         qty[n] = rows[i].qty; q100[n] = coopground::GroundQ100(rows[i].q); idx[n] = (int)i; ++n;
     }
@@ -35532,7 +35749,7 @@ void GroundApplyMove(const ItemMoveMsg& m)
     float pos[3];
     if (GrKeyPos(m.boxKey, pos) == 0) { ++g_grApplyBadKey; return; }
     if (StoreTearingDown() != 0) { ++g_grTeardownSkipped; return; }
-    if (ItAreaVerdictAt(pos, kAreaForGround) == kBoxMine) { ++g_grApplyNotHolder; DebugLog("[GROUND] apply op=" + N((long long)m.op) + " key=" + m.boxKey + " REFUSED: this game holds that area"); return; }
+    if (ItAreaVerdictAt(pos, kAreaForGround) == kBoxMine) { ++g_grApplyNotHolder; DebugLog("[GROUND] apply op=" + N((long long)m.op) + " name=" + m.boxKey + " REFUSED: this game holds that area"); return; }
     /* loaded: the position test, and the engine's own zone-loaded byte (the position test can read a stale "loaded") */
     if (ItLoadedHereLive(pos, kAreaForGround) == 0 || GrZoneLoadedAt(pos) == 0)
     {   /* the arrival's ground listing catches it up (GrCatchUpServe). One line per burst - a catch-up answer arrives as one batch */
@@ -35541,7 +35758,7 @@ void GroundApplyMove(const ItemMoveMsg& m)
         static long long s_nlQuiet = 0;
         const DWORD nlNow = ::GetTickCount();
         if (s_nlAt != 0 && (DWORD)(nlNow - s_nlAt) < 2000) { ++s_nlQuiet; return; }
-        DebugLog("[GROUND] apply op=" + N((long long)m.op) + " key=" + m.boxKey + " REFUSED: that area is not loaded on this game"
+        DebugLog("[GROUND] apply op=" + N((long long)m.op) + " name=" + m.boxKey + " REFUSED: that area is not loaded on this game"
                  + (s_nlQuiet != 0 ? " (" + N(s_nlQuiet) + " more refused the same way since the last such line)" : std::string())
                  + " - counted apply notLoaded=" + N(g_grApplyNotLoaded) + "; at most one such line every 2 s");
         s_nlAt = nlNow; s_nlQuiet = 0;
@@ -35549,16 +35766,62 @@ void GroundApplyMove(const ItemMoveMsg& m)
     }
     GrRecentInit();
     const DWORD rnow = ::GetTickCount();
+    if (m.op == 0 && m.idKind == coopgname::kIdNameFor)
+    {   /* the holder's catch-up: the item this game listed as m.idFor is the holder's item named m.boxKey - it takes that name, nothing is built */
+        int lh = coopgname::kHowNone;
+        void* it = GrFindName(m.idFor, m.quantity, m.quality, 1, &lh, 0, 1);   /* exact: the id this game listed (its name, or its key) */
+        if (it == 0) { ++g_gnCatchNameMissed; DebugLog("[GROUND] catch-up name=" + m.boxKey + " for listed id " + m.idFor + " - no item here carries that id now: nothing named"); return; }
+        {   /* never renamed by a catch-up: this game's own drop not yet confirmed (pending or unconfirmed - a refund item frozen at its
+               ledger key among them), a removal waiting, an item held for a granted TAKE; nor an item carrying another name, nor with a
+               name another item here already carries */
+            coopground::GroundKeyParts ip;
+            std::vector<const void*> sk;
+            GrNameSkipList(&sk, 1);
+            const int ownDrop = (GrUnconfOf(GrIdOf(it)) != 0) ? 1 : 0;
+            const int nf = (GrPartsOf(it, &ip, 0) == 0) ? coopgname::kNfUnreadable
+                         : coopgname::NameForCheck(g_grName, it, ip, m.boxKey.c_str(), m.idFor.c_str(), sk.empty() ? 0 : &sk[0], (int)sk.size(), ownDrop);
+            if (nf != coopgname::kNfOk)
+            {
+                ++g_gnCatchNameRefused;
+                static int s_nfLines = 0;
+                if (s_nfLines < 20)
+                {
+                    ++s_nfLines;
+                    DebugLog("[GROUND] catch-up name=" + m.boxKey + " for listed id " + m.idFor + " REFUSED: " + std::string(coopgname::NameForWhy(nf))
+                             + " - nothing named (counted catchNameRefused; at most 20 such lines)");
+                }
+                return;
+            }
+        }
+        GrRoadForgetItem(it);
+        GrNameBind(it, m.boxKey, 1);
+        ++g_gnCatchNamed;
+        GrCatchUpNote(m.boxKey);
+        DebugLog("[GROUND] catch-up name=" + m.boxKey + " given to the item listed as " + m.idFor + " (" + GrHowName(lh) + ")");
+        return;
+    }
     if (m.op == 0)
     {
         const int addedRecently = coopground::GroundRecentHas(g_grRecentAdd, m.boxKey.c_str(), (unsigned int)rnow);
-        const int present = (addedRecently != 0 && GrFind(m.boxKey.c_str(), m.quantity, m.quality, 0, 0) != 0) ? 1 : 0;
+        const int present = (addedRecently != 0 && GrFindName(m.boxKey, m.quantity, m.quality, 0, 0, 0) != 0) ? 1 : 0;
         if (coopground::GroundRecentDecide(0, addedRecently, present, 0) == coopground::kGroundRecentKeepAdd)
         {   /* a repeat of an ADD applied here moments ago (a second announcer after the area's holder changed): no second copy */
             ++g_grApplyAddRecentKept;
             DebugLog("[GROUND] apply ADD key=" + m.boxKey + " - that key was added here within " + N((long long)(coopground::kGroundRecentMs / 1000))
                      + " s and its item is still here: kept, no second copy");
             return;
+        }
+        {   /* an item here already carries that name: it is present - no second copy */
+            int nh = coopgname::kHowNone;
+            void* named = GrFindName(m.boxKey, m.quantity, m.quality, 1, &nh, 0);
+            if (named != 0 && nh == coopgname::kHowName)
+            {
+                ++g_gnAddNamedHere;
+                coopground::GroundRecentNote(&g_grRecentAdd, m.boxKey.c_str(), (unsigned int)rnow);
+                coopground::GroundRecentForget(&g_grRecentGone, m.boxKey.c_str());
+                DebugLog("[GROUND] apply ADD name=" + m.boxKey + " - an item here already carries that name: kept, no second copy");
+                return;
+            }
         }
         int passedSpill = 0, passedRoad = 0;
         void* have = GrFindAdoptable(m.boxKey.c_str(), m.quantity, m.quality, &passedSpill, &passedRoad);
@@ -35575,7 +35838,7 @@ void GroundApplyMove(const ItemMoveMsg& m)
         }
         if (have != 0)
         {
-            ++g_grApplyAdopt; GrRoadNote(have, GrKeyOf(have));
+            ++g_grApplyAdopt; GrNameBind(have, m.boxKey, 1);   /* the announced name */
             coopground::GroundRecentNote(&g_grRecentAdd, m.boxKey.c_str(), (unsigned int)rnow);
             coopground::GroundRecentForget(&g_grRecentGone, m.boxKey.c_str());
             DebugLog("[GROUND] apply ADD key=" + m.boxKey + " adopted (this game already has it)");
@@ -35593,7 +35856,7 @@ void GroundApplyMove(const ItemMoveMsg& m)
             return;
         }
         GrForgetAddr(item);   /* ground5 fold 2 (re-check LOW 4): an entry naming this address named a freed object */
-        { const std::string bk = GrKeyOf(item); GrRoadNote(item, bk.empty() ? m.boxKey : bk); }   /* the holder's road item, here */
+        GrNameBind(item, m.boxKey, 1);   /* the holder's road item, here, under the announced name */
         ++g_grApplyAdd;
         coopground::GroundRecentNote(&g_grRecentAdd, m.boxKey.c_str(), (unsigned int)rnow);
         coopground::GroundRecentForget(&g_grRecentGone, m.boxKey.c_str());
@@ -35611,23 +35874,28 @@ void GroundApplyMove(const ItemMoveMsg& m)
                      + " s: ignored, no near match");
             return;
         }
-        int kept = 0;
-        void* item = GrFindRemovable(m.boxKey, m.quantity, 0.0f, &kept);
+        int kept = 0, how = coopgname::kHowNone;
+        void* item = GrFindRemovable(m.boxKey, m.quantity, 0.0f, &kept, &how, m.idKind == coopgname::kIdBare ? 1 : 0);   /* by name, then (unnamed items only - any item for a bare key) by key, then near */
         if (kept != 0)
         {   /* review-inv5p1 3: the only near match is this game's own unconfirmed drop (its only copy) - never removed by a near match */
             ++g_grApplyGoneUnconfKept;
-            DebugLog("[GROUND] apply GONE key=" + m.boxKey + " - the only near match is this game's own unconfirmed drop: kept");
+            DebugLog("[GROUND] apply GONE name=" + m.boxKey + " kept: the only near match is this game's own unconfirmed drop");
             return;
         }
-        if (item == 0) { ++g_grApplyMissing; DebugLog("[GROUND] apply GONE key=" + m.boxKey + " - no such item here"); return; }
-        GrUnconfEraseAt(GrUnconfOf(GrKeyOf(item)));   /* an exact match: the holder had it after all */
-        GrRoadForgetItem(item);
-        GrRemoveLocal(item, "coop inv5 ground: GROUND GONE");
+        if (item == 0) { ++g_grApplyMissing; ++g_gnGoneKept; DebugLog("[GROUND] apply GONE name=" + m.boxKey + " kept: no item carries that name"); return; }
+        GrUnconfEraseAt(GrUnconfOf(GrIdOf(item)));   /* the holder had it after all */
+        GrGoneNote(m.boxKey, how == coopgname::kHowName ? 1 : 0);
+        {   /* a bare key that landed on a named item: that name left too */
+            const std::string inm = GrNameOf(item);
+            if (!inm.empty() && inm != m.boxKey) { GrGoneNote(inm, 1); ++g_gnGoneBareNamed; }
+        }
+        if (GrRemoveLocal(item, "coop inv5 ground: GROUND GONE") == 0 && GrOffGroundSure(item) != 0) GrRoadForgetItem(item);   /* removed: its row went with it; deferred (the claim is busy): kept until the retry removes it; not on the ground: the row goes; unreadable and still lying here: kept */
         ++g_grApplyGone;
+        if (how == coopgname::kHowName) ++g_gnGoneName; else if (how == coopgname::kHowKey) ++g_gnGoneKey; else ++g_gnGoneNear;
         coopground::GroundRecentNote(&g_grRecentGone, m.boxKey.c_str(), (unsigned int)rnow);
         coopground::GroundRecentForget(&g_grRecentAdd, m.boxKey.c_str());
         GrCatchUpNote(m.boxKey);
-        DebugLog("[GROUND] apply GONE key=" + m.boxKey + " - removed from this game's ground");
+        DebugLog("[GROUND] apply GONE name=" + m.boxKey + " removed (" + GrHowName(how) + ")");
         return;
     }
     ++g_grApplyQty;   /* op 2 / 3: phase 2 */
@@ -35642,7 +35910,8 @@ void GroundWorldTeardown()
     g_grTeardownRows += (long long)(g_grRows.size() + g_grUnconf.size());
     g_grRows.clear();
     g_grUnconf.clear();
-    g_grRoad.clear();   /* the road registry names the world that is going */
+    GpLock(); coopgname::NameClear(&g_grName); GpUnlock();   /* the shared names name the world that is going */
+    g_grGoneInit = 0;
     g_grRemPend.clear(); g_grServed.clear();   /* inv5p1b 3/6 */
     g_grUndoRetry.clear();   /* names items of the world that is going */
     g_grRecentInit = 0;      /* the recent ADD / GONE keys are of the world that is going */
@@ -35656,6 +35925,68 @@ void GroundWorldTeardown()
     GpUnlock();
 }
 
+/* (MAIN THREAD, every kGrNameRebindMs from GroundDrain, and only when a zone was taken apart since the previous pass or an orphan
+   row waits): the shared-name table follows this game's live ground (coopgname::NameRebindPlan) - keys refreshed; a row whose
+   address another object holds detached; a row whose item went missing becomes an orphan only after a zone was taken apart; held,
+   escrowed and pending items' rows never are; the orphans go to the items carrying no name at their places (the same place on THIS
+   game, within 0.5 units flat), the nearest pair first. The plan is made outside the lock (it allocates); the lock only covers
+   writing it. Timed: groundName rebindRuns / rebindUsMax / rebindUsTotal. */
+const DWORD kGrNameRebindMs = 2000;
+LONG64 g_gnZoneGenSeen = 0;
+void GrNameRebindTick()
+{
+    const LONG64 zg = g_grZoneTornGen;
+    const int unloadedNow = (zg != g_gnZoneGenSeen) ? 1 : 0;   /* a zone was taken apart since the previous pass */
+    g_gnZoneGenSeen = zg;
+    if (g_grName.n == 0) return;
+    if (coopgname::NameOrphanCount(g_grName) != 0)
+    {   /* an orphan nobody took back within 10 minutes (its zone may never load again) is forgotten, so the walk below stops */
+        GpLock();
+        const int ex = coopgname::NameExpireOrphans(&g_grName, (unsigned int)::GetTickCount());
+        GpUnlock();
+        if (ex > 0)
+        {
+            g_gnOrphanExpired += ex;
+            DebugLog("[GROUND] names: " + N((long long)ex) + " orphan row(s) nobody took back within 10 min forgotten (counted orphansExpired)");
+        }
+    }
+    if (unloadedNow == 0 && coopgname::NameOrphanCount(g_grName) == 0) return;   /* nothing taken apart, nothing to hand back: no ground walk */
+    LARGE_INTEGER qf, q0, q1;
+    qf.QuadPart = 0; q0.QuadPart = 0; q1.QuadPart = 0;
+    ::QueryPerformanceFrequency(&qf); ::QueryPerformanceCounter(&q0);
+    std::vector<GpRow> rows;
+    int walked = 0, zones = 0, trunc = 0;
+    float cp[3]; cp[0] = 0; cp[1] = 0; cp[2] = 0;
+    GpCollect(0.0f, cp, &rows, &walked, &zones, &trunc);
+    std::vector<coopgname::LiveItem> live;
+    live.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (rows[i].key.empty()) continue;
+        coopgname::LiveItem li;
+        li.addr = rows[i].item; li.cur = rows[i].parts; li.qty = rows[i].qty; li.q100 = coopground::GroundQ100(rows[i].q);
+        live.push_back(li);
+    }
+    std::vector<const void*> skip;   /* never re-bound and never orphans (GrNameSkipList) */
+    GrNameSkipList(&skip, 0);
+    std::vector<coopgname::NameChange> ch;
+    const int rb = coopgname::NameRebindPlan(g_grName, live.empty() ? 0 : &live[0], (int)live.size(), skip.empty() ? 0 : &skip[0], (int)skip.size(), unloadedNow, &ch);
+    long long det = 0, mk = 0;
+    for (size_t i = 0; i < ch.size(); ++i) { if (ch[i].act == coopgname::kChDetach) ++det; else if (ch[i].act == coopgname::kChMark) ++mk; }
+    if (!ch.empty())
+    {
+        GpLock();
+        coopgname::NameApply(&g_grName, &ch[0], (int)ch.size(), (unsigned int)::GetTickCount());
+        GpUnlock();
+    }
+    g_gnRebound += rb; g_gnDetached += det; g_gnMarked += mk;
+    ::QueryPerformanceCounter(&q1);
+    const long long us = (qf.QuadPart > 0) ? (long long)((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart) : 0;
+    ++g_gnRebindRuns; g_gnRebindUsTotal += us;
+    if (us > g_gnRebindUsMax) g_gnRebindUsMax = us;
+    if (rb > 0 || det > 0) DebugLog("[GROUND] names: " + N((long long)rb) + " item(s) back with a new address took their names again (the same place on this game); "
+                                    + N(det) + " row(s) detached from an address another object holds; " + N(us) + " us");
+}
 /* MAIN THREAD (ItemsTickDrain): the snapshot the off-thread gate reads, the detours' queue, the requester's timeouts and the
    unconfirmed drops' delayed re-sends. */
 void GroundDrain()
@@ -35751,7 +36082,7 @@ void GroundDrain()
             if (GrKeyPos(sr.key, sp) != 0 && ItAreaVerdictAt(sp, kAreaForGround) == kBoxMine)
             {
                 ++g_showGround[10];
-                if (sr.took >= sr.qty) GrSendGone(sr.key, sr.qty);
+                if (sr.took >= sr.qty) GrSendGone(sr.key, sr.qty, 0);
                 DebugLog("[GROUND] TAKE " + N((long long)sr.id) + " key=" + sr.key + " - this game holds the area now: the pickup stands, not asked again");
                 g_grRows.erase(g_grRows.begin() + (long)i);
                 continue;
@@ -35784,14 +36115,14 @@ void GroundDrain()
         if (GrKeyPos(u.key, pos) == 0) { g_grUnconf.erase(g_grUnconf.begin() + (long)i); continue; }
         if (ItLoadedHereLive(pos, kAreaForGround) == 0) { u.nextAt = now + kGrRetryMaxMs; ++i; continue; }   /* not loaded here: kept, looked at later */
         /* never sent yet: an overflow key taken before the item settled - found by its ADDRESS (inv5p1b 1), never a neighbour */
-        void* it = (u.tries == 0 && u.addr != 0) ? GrFindAt(u.addr, u.key.c_str()) : GrFind(u.key.c_str(), u.qty, u.q, u.tries == 0 ? 0 : 1, 0);
-        if (it != 0 && u.tries == 0) { const std::string k2 = GrKeyOf(it); if (!k2.empty()) u.key = k2; }
+        void* it = (u.tries == 0 && u.addr != 0) ? GrFindAt(u.addr, u.key.c_str()) : GrFindName(u.key, u.qty, u.q, u.tries == 0 ? 0 : 1, 0, 0);   /* by its name */
+        if (it != 0 && u.tries == 0) { const std::string k2 = GrKeyOf(it); if (!k2.empty()) u.key = GrNameBind(it, k2, 0); }   /* before its first PUT the name follows the item */
         if (it == 0) { ++g_grUnconfGone; g_grUnconf.erase(g_grUnconf.begin() + (long)i); continue; }   /* it left this game's ground */
         if (ItAreaVerdictAt(pos, kAreaForGround) == kBoxMine)
         {   /* this game holds the area now: the item is announced like the holder's own drop */
             ++g_grUnconfBecameAdd;
             GrSendAdd(it, u.key, u.qty);
-            DebugLog("[GROUND] unconfirmed drop key=" + u.key + " - this game holds the area now: GROUND ADD sent");
+            DebugLog("[GROUND] unconfirmed drop name=" + u.key + " - this game holds the area now: GROUND ADD sent");
             g_grUnconf.erase(g_grUnconf.begin() + (long)i);
             continue;
         }
@@ -35812,14 +36143,16 @@ void GroundDrain()
     for (size_t i = 0; i < g_grRemPend.size(); )
     {
         const GrRemPend p = g_grRemPend[i];
-        if (now - p.since > kGrClaimMaxMs) { ++g_grRemoveGaveUp; g_grRemPend.erase(g_grRemPend.begin() + (long)i); continue; }
+        if (now - p.since > kGrClaimMaxMs) { ++g_grRemoveGaveUp; GrRoadForgetAt(p.addr, p.key); g_grRemPend.erase(g_grRemPend.begin() + (long)i); continue; }   /* the removal is dropped: so is its name row */
         void* it = GrFindAt(p.addr, p.key.c_str());
-        if (it == 0) { ++g_grRemoveOffGround; g_grRemPend.erase(g_grRemPend.begin() + (long)i); continue; }
+        if (it == 0) { ++g_grRemoveOffGround; GrRoadForgetAt(p.addr, p.key); g_grRemPend.erase(g_grRemPend.begin() + (long)i); continue; }
         const int r = GrRemoveLocal(it, p.why);
         if (r == -1) { ++i; continue; }
         if (r == 1) ++g_grRemoveRetried;
+        else if (GrOffGroundSure(it) != 0) GrRoadForgetItem(it);   /* not removed, and no longer on the ground: its row goes */
         g_grRemPend.erase(g_grRemPend.begin() + (long)i);
     }
+    if (g_gnRebindAt == 0 || now - g_gnRebindAt >= kGrNameRebindMs) { g_gnRebindAt = (now != 0) ? now : 1; GrNameRebindTick(); }
 }
 
 const char* GpVerdictName(int v)
@@ -35856,8 +36189,10 @@ std::string GpList(float r)
         _snprintf(tail, 159, " q=%.2f pos=%.1f,%.1f,%.1f dist=%.1f", rows[i].q, rows[i].pos[0], rows[i].pos[1], rows[i].pos[2], std::sqrt(rows[i].d2));
         tail[159] = 0;
         /* review-inv5p0 LOW: the verdict is asked as kAreaForGround, so a listing is booked in the ground's own counters */
+        const std::string lnm = GrNameOf(rows[i].item);
         DebugLog("[GROUND] item key=" + (rows[i].key.empty() ? std::string("<none>") : rows[i].key) + " qty=" + N((long long)rows[i].qty)
-                 + std::string(tail) + " verdict=" + GpVerdictName(ItAreaVerdictAt(rows[i].pos, kAreaForGround)));
+                 + std::string(tail) + " verdict=" + GpVerdictName(ItAreaVerdictAt(rows[i].pos, kAreaForGround))
+                 + " name=" + (lnm.empty() ? std::string("<none>") : lnm));
     }
     char rr[32]; _snprintf(rr, 31, "%.1f", r); rr[31] = 0;
     const std::string line = "list n=" + N((long long)rows.size()) + " dup=" + N((long long)dup) + " fuzzy=" + N((long long)fuzzy)
@@ -35933,6 +36268,33 @@ std::string GpDropSid(const std::string& sid)
         }
     return "error groundtest dropsid: no item " + sid + " in the character's inventory";
 }
+/* TEST levers (pick, nudge): nothing of `sid` within r of the character - one game-log line saying so, with the nearest one loaded
+   here (the walk of every loaded ground item), so a lever that missed is never silent. Returns the line. */
+std::string GpNothingNear(const char* lever, const std::string& sid, float r, const float* cp)
+{
+    std::vector<GpRow> all;
+    int walked = 0, zones = 0, trunc = 0;
+    GpCollect(0.0f, cp, &all, &walked, &zones, &trunc);
+    int best = -1;
+    for (size_t i = 0; i < all.size(); ++i)
+    {
+        char s2[kSidCap]; s2[0] = 0;
+        if (ItBaseSidWhy(all[i].item, s2, kSidCap) != 1 || sid != s2) continue;
+        if (best < 0 || all[i].d2 < all[(size_t)best].d2) best = (int)i;
+    }
+    char b[160]; b[0] = 0;
+    sprintf_s(b, sizeof(b), " nothing within %.1f units of (%.1f, %.1f, %.1f)", r, cp[0], cp[1], cp[2]);
+    std::string nearText = "(no " + sid + " on this game's loaded ground)";
+    if (best >= 0)
+    {
+        char d[48]; d[0] = 0;
+        sprintf_s(d, sizeof(d), "%.1f", std::sqrt((double)all[(size_t)best].d2));
+        nearText = "(nearest " + sid + " at " + std::string(d) + " units, key " + (all[(size_t)best].key.empty() ? std::string("<unreadable>") : all[(size_t)best].key) + ")";
+    }
+    const std::string line = std::string(lever) + " sid=" + sid + b + " " + nearText;
+    DebugLog("[GROUND] " + line);
+    return line;
+}
 std::string GpPick(const std::string& sid, float r)
 {
     ++g_grPickCmds;
@@ -35949,7 +36311,7 @@ std::string GpPick(const std::string& sid, float r)
         if (ItBaseSidWhy(rows[i].item, s2, kSidCap) != 1 || sid != s2) continue;
         if (best < 0 || rows[i].d2 < rows[(size_t)best].d2) best = (int)i;
     }
-    if (best < 0) return "error groundtest pick: no ground item " + sid + " within r of the character (listed " + N((long long)rows.size()) + ")";
+    if (best < 0) return "error groundtest " + GpNothingNear("pick", sid, r, cp);
     const GpRow& row = rows[(size_t)best];
     void* ai = GetCharacterAI(me);
     if (!ItPlaus(ai)) return "error groundtest pick: the character has no AI";
@@ -36145,6 +36507,55 @@ std::string GpOverflow(unsigned int anchorUid, const std::string& sid, int n)
     DebugLog("[GROUND] lever overflow anchor=" + N((long long)anchorUid) + " sid=" + sid + " n=" + N((long long)n) + " -> " + s);
     return s;
 }
+/* TEST-ONLY lever `groundtest nudge <sid> <dx> <dz> [<r>]`: on THIS game only, the nearest ground item of that sid within r
+   (default 30 units) of the character is taken off the ground and put down again dx, dz units away at the same height with the
+   mod's own take-off / put-down (GrDeactivatePod / GrActivatePod), under the item's claim - so two games key it differently, as
+   when each game's physics settles a drop on its own. Nothing is announced; the object (its address) is the same, so its name is
+   kept and its current key refreshed. MAIN THREAD (the command channel). */
+std::string GpNudge(const std::string& sid, float dx, float dz, float r)
+{
+    ++g_gnNudge;
+    ::Character* me = ItBoxOpenOpener();
+    float cp[3]; cp[0] = 0; cp[1] = 0; cp[2] = 0;
+    if (me == 0 || ItBoxPosPod(me, cp) == 0) return "error groundtest nudge: no player-faction character with a uid this game owns";
+    std::vector<GpRow> rows;
+    int walked = 0, zones = 0, trunc = 0;
+    GpCollect(r, cp, &rows, &walked, &zones, &trunc);
+    int best = -1;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        char s2[kSidCap]; s2[0] = 0;
+        if (rows[i].key.empty() || ItBaseSidWhy(rows[i].item, s2, kSidCap) != 1 || sid != s2) continue;
+        if (best < 0 || rows[i].d2 < rows[(size_t)best].d2) best = (int)i;
+    }
+    if (best < 0) return "error groundtest " + GpNothingNear("nudge", sid, r, cp);
+    const GpRow row = rows[(size_t)best];
+    const std::string name = GrNameOf(row.item);
+    int claimed = 0;
+    GpLock(); claimed = GrClaimLocked(row.key.c_str()); GpUnlock();
+    if (claimed == 0) return "error groundtest nudge: the item is being picked up or handed over right now - try again";
+    float to[3]; to[0] = row.pos[0] + dx; to[1] = row.pos[1]; to[2] = row.pos[2] + dz;
+    const int de = GrDeactivatePod(row.item);
+    const int act = (de == 1) ? GrActivatePod(row.item, to) : 0;
+    if (de == 1 && act != 1) GrActivatePod(row.item, row.pos);   /* not put down where asked: back where it lay */
+    GpLock(); GrReleaseLocked(row.key.c_str()); GpUnlock();
+    if (de != 1) return "error groundtest nudge: Item::deactivate faulted - the item was not moved";
+    if (act != 1) return "error groundtest nudge: " + std::string(GrActWhy(act)) + " - put back where it lay";
+    coopground::GroundKeyParts np;
+    std::string nk;
+    GrPartsOf(row.item, &np, &nk);
+    if (!name.empty() && !nk.empty())
+    {   /* the same object, moved by this game: its name stays, its current key follows */
+        GpLock();
+        const int ri = coopgname::NameAtAddr(g_grName, row.item);
+        if (ri >= 0) coopgname::NameRefresh(&g_grName, ri, np);
+        GpUnlock();
+    }
+    const std::string line = "nudge sid=" + sid + " item=" + GpPtr(row.item) + " from " + row.key + " to " + (nk.empty() ? std::string("<unreadable>") : nk)
+        + " name=" + (name.empty() ? std::string("<none>") : name) + " (this game only, nothing announced)";
+    DebugLog("[GROUND] " + line);
+    return "ok groundtest " + line;
+}
 std::string GroundTestCommand(const std::string& arg)
 {
     char verb[16]; verb[0] = 0;
@@ -36179,6 +36590,14 @@ std::string GroundTestCommand(const std::string& arg)
         if (got < 1 || !(r > 0.0f && r <= 20000.0f)) return "error groundtest pick: usage groundtest pick <sid> [<r>]";
         return GpPick(sid, r);
     }
+    if (v == "nudge")
+    {   /* TEST lever: groundtest nudge <sid> <dx> <dz> [<r>] */
+        char sid[96]; sid[0] = 0; float dx = 0.0f, dz = 0.0f, r = 30.0f;
+        const int got = std::sscanf(arg.c_str(), "%*s %95s %f %f %f", sid, &dx, &dz, &r);
+        if (got < 3 || !(r > 0.0f && r <= 20000.0f) || !(dx > -1000.0f && dx < 1000.0f) || !(dz > -1000.0f && dz < 1000.0f))
+            return "error groundtest nudge: usage groundtest nudge <sid> <dx> <dz> [<r>]";
+        return GpNudge(std::string(sid), dx, dz, r);
+    }
     if (v == "animaldrop")
     {   /* ground5 fold 2 TEST lever (T629 leg 1): groundtest animaldrop <anchorUid> [<sid>|- [<r>]] */
         unsigned int au = 0; char sid[96]; sid[0] = 0; float r = 1000.0f;
@@ -36194,7 +36613,7 @@ std::string GroundTestCommand(const std::string& arg)
             return "error groundtest overflow: usage groundtest overflow <anchorUid> <sid> <n 1..200>";
         return GpOverflow(au, std::string(sid), n);
     }
-    return "error groundtest: usage groundtest list [<r>] | drop <section> <x> <y> | dropsid <sid> | pick <sid> [<r>] | animaldrop <anchorUid> [<sid>|- [<r>]] | overflow <anchorUid> <sid> <n>";
+    return "error groundtest: usage groundtest list [<r>] | drop <section> <x> <y> | dropsid <sid> | pick <sid> [<r>] | animaldrop <anchorUid> [<sid>|- [<r>]] | overflow <anchorUid> <sid> <n> | nudge <sid> <dx> <dz> [<r>]";
 }
 
 void ReportGround()
@@ -36248,7 +36667,14 @@ void ReportGround()
         + " groundSettle[askWaited,askGaveUp,serveWaited,serveNoGone,cappedOnTime,notLoadedPolls]=" + N(g_grSettleAskWaited) + "," + N(g_grSettleAskGaveUp) + ","
         + N(g_grSettleServeWaited) + "," + N(g_grSettleServeNoGone) + "," + N(g_grSettleCapped) + "," + N(g_grSettleNotLoaded) + " groundKeysUnconf=" + N(g_grCatchKeysUnconf)
         + " groundRoad[added,refreshed,removed,dropped,held,worldListed,worldNotSent]=" + N(g_grRoadAdded) + "," + N(g_grRoadRefreshed) + ","
-        + N(g_grRoadRemoved) + "," + N(g_grRoadDropped) + "," + N((long long)g_grRoad.size()) + "," + N(g_grCatchKeysWorld) + "," + N(g_grCatchHolderWorld)
+        + N(g_grRoadRemoved) + "," + N(g_grName.dropped) + "," + N((long long)g_grName.n) + "," + N(g_grCatchKeysWorld) + "," + N(g_grCatchHolderWorld)
+        + " groundName[takeByName,takeByKey,takeNear,takeRefused2,takeRefused5,goneByName,goneByKey,goneNear,goneKeptNoItem,pickReason5,rebound,forgot,nudge,goneMemOverwritten,detached,marked,orphansNow,addNamedHere,catchNameSent,catchNamed,catchNameMissed,takeBareNamed,goneBareNamed,rebindRuns,rebindUsMax,rebindUsTotal,catchNameRefused,orphansExpired]="
+        + N(g_gnTakeName) + "," + N(g_gnTakeKey) + "," + N(g_gnTakeNear) + "," + N(g_gnTakeGone) + "," + N(g_gnTakeUnknown) + "," + N(g_gnGoneName) + ","
+        + N(g_gnGoneKey) + "," + N(g_gnGoneNear) + "," + N(g_gnGoneKept) + "," + N(g_gnPickUnknown) + "," + N(g_gnRebound) + "," + N(g_gnForgot) + ","
+        + N(g_gnNudge) + "," + N(g_grGoneInit != 0 ? g_grGone.overwritten : 0) + "," + N(g_gnDetached) + "," + N(g_gnMarked) + ","
+        + N((long long)coopgname::NameOrphanCount(g_grName)) + "," + N(g_gnAddNamedHere) + "," + N(g_gnCatchNameSent) + "," + N(g_gnCatchNamed) + ","
+        + N(g_gnCatchNameMissed) + "," + N(g_gnTakeBareNamed) + "," + N(g_gnGoneBareNamed) + "," + N(g_gnRebindRuns) + "," + N(g_gnRebindUsMax) + "," + N(g_gnRebindUsTotal)
+        + "," + N(g_gnCatchNameRefused) + "," + N(g_gnOrphanExpired)
         + " serve[take,takeOk,put,putOk,putFailed,notHolder,notFound,keptFull,badKey,unreadable,busy,deactFailed,putAdopt]=" + N(g_grServeTake) + "," + N(g_grServeTakeOk) + ","
         + N(g_grServePut) + "," + N(g_grServePutOk) + "," + N(g_grServePutFailed) + "," + N(g_grServeNotHolder) + "," + N(g_grServeNotFound) + "," + N(g_grServeKeptFull) + ","
         + N(g_grServeBadKey) + "," + N(g_grServeUnreadable) + "," + N(g_grServeBusy) + "," + N(g_grServeDeactFailed) + "," + N(g_grServePutAdopt)

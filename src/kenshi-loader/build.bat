@@ -27,7 +27,14 @@ rem --- THE LOADER GATE, AFTER THE LINK ----------------------------------------
 rem The game loads this DLL itself, on every start, before anything of the mod exists: its import list must be
 rem KERNEL32.dll and NOTHING else (a C runtime or any other DLL coming back onto the link would put a dependency into
 rem every game start), and it must export dllStartPlugin and dllStopPlugin by those exact names (Ogre looks both up).
-set LGATE=%TEMP%\kenshicoop_loadergate_%RANDOM%_%RANDOM%
+rem A unique name per build, a fresh random id from Python: cmd's %RANDOM% is seeded from the clock, so two builds started
+rem in the same second would share these files and read each other's half-written lists.
+for /f "delims=" %%G in ('python -c "import uuid;print(uuid.uuid4().hex)"') do set LGATEID=%%G
+if "%LGATEID%"=="" (
+    echo BUILD FAILED ^(could not make a unique temp name: python did not answer^)
+    exit /b 1
+)
+set LGATE=%TEMP%\sw_loadergate_%LGATEID%
 dumpbin /nologo /imports SharedWastelandsLoader.dll > "%LGATE%_imports.txt"
 if errorlevel 1 (
     echo BUILD FAILED ^(loader gate: dumpbin /imports failed^)

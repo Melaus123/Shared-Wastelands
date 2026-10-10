@@ -136,7 +136,14 @@ if not exist "%GAMEMYGUI%" (
 )
 rem Each build gets its own gate files: two compile slots can build at once, and a shared %%TEMP%% name let one build read
 rem the other's half-written export list (T490, 2026-09-28: "no exports parsed").
-set GATETMP=%TEMP%\kenshicoop_gate_%RANDOM%_%RANDOM%
+rem A unique name per build, a fresh random id from Python: cmd's %RANDOM% is seeded from the clock, so two builds started
+rem in the same second would share these files and read each other's half-written lists.
+for /f "delims=" %%G in ('python -c "import uuid;print(uuid.uuid4().hex)"') do set GATETMPID=%%G
+if "%GATETMPID%"=="" (
+    echo BUILD FAILED ^(could not make a unique temp name: python did not answer^)
+    exit /b 1
+)
+set GATETMP=%TEMP%\sw_gate_%GATETMPID%
 dumpbin /nologo /imports SharedWastelands.dll > "%GATETMP%_imports.txt"
 if errorlevel 1 (
     echo BUILD FAILED ^(import gate: dumpbin /imports failed^)

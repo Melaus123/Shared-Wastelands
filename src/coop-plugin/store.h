@@ -66,6 +66,7 @@ int StoreTownGoneUnsent(const std::string& townSid);   /* MAIN THREAD - this gam
 int StoreRecordsHomedAt(const std::string& buildingKey);   /* MAIN THREAD - living world records whose group's home building is this key (the town refill's home test) */
 int StoreTownGoneThisLaunch(const std::string& townSid);   /* MAIN THREAD - groups of this town this game deleted since it started */
 std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id */
+std::string StoreTestCommand(const std::string& arg);   /* TEST-ONLY (storetest verb), main thread: storetest nopos <worldId or part of one> | storetest nopos off */
 void NoteTownPeople(const std::string& worldId, const std::string& town);   /* main thread: a received note names its home town ("" = none) */
 std::string StoreWorldIdOf(void* platoon);   /* P4p: the group's id string (Platoon+0x78), "" if unreadable */
 // P1b (b): the platoon is being destroyed by us (a live announcement superseded a sleeping copy) - forget it.
@@ -435,6 +436,11 @@ void InQueueEnqueue(int type, int origin, int scope, int cls, unsigned int subje
    from StoreTick just below PumpLink - which is ONE function over ONE FIFO with ONE head cursor, and it
    preserves today's latency exactly: a message polled this frame is still applied this frame. */
 void InQueueDrain();
+/* MAIN THREAD, the first statement of each frame (CommandChannelTick): closes the last frame's copy-budget tally into the burst
+   book (one [SPAWNPACE] line per burst) and starts the next; the frame's two drains share one budget (spawnpace.h). */
+void SpawnPaceFrameStart();
+/* the copy budget's counts, for the spawn REPORT line */
+std::string SpawnPaceToken();
 /* BACK-PRESSURE, MAIN THREAD: has this origin passed the high-water mark? The pump stops polling that origin's
    socket while it has (ENet then buffers, and reliable channels retransmit - which is precisely the pre-P7h
    behaviour that lost nothing), and both load gates stop waiting on a saturated queue, because the thing they

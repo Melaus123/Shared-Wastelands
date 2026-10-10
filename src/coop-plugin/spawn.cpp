@@ -3422,6 +3422,7 @@ void ReportSpawns()
        << " despawnNotOurs=" << S(g_despawnNotOurs) << " spawnStaleRowReplaced=" << S(g_spawnStaleRowReplaced)
        << " spawnStaleCopyRetired=" << S(g_spawnStaleCopyRetired) << " spawnStaleCopyKept=" << S(g_spawnStaleCopyKept)
        << " spawnStaleCopyFreshKept=" << S(g_spawnStaleCopyFreshKept)
+       << " " << SpawnPaceToken()   /* copies made under the frame budget: the arrival queue's counts (store.cpp) */
        << " farUnloadedRetired=" << S(g_farUnloadedRetired)
        << " despawnOffThread=" << S(g_despawnOffThread)
        << " despawnNoUid=" << S(g_despawnNoUid)

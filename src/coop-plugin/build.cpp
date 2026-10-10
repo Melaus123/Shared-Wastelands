@@ -2487,13 +2487,14 @@ void BdHelpSendRow(const std::string& key, BdHelpRow& h, int edge, DWORD now)
     }
 }
 /* help1, MAIN THREAD (BuildTick): the recorded work becomes entries (each second, each 1% of needed, or at a reset); unsent entries go
-   while the link is up (all of them again at link-up, and any left unconfirmed for kHelpResendMs). help1 fold (review MED 5/6): a new
+   while a road to another game is open - net::SideRoadOpen, the world server's or the session link (all of them again when one
+   opens, and any left unconfirmed for kHelpResendMs; the owner applies each seq once, so a re-send is answered as a dup). help1 fold (review MED 5/6): a new
    entry is made only once the owner's STATE told this session its last applied seq (the copy row's tail) - its seq is past that, past
    this row's own and past pp.help's (BuildHelpStartSeq). help1 fold (MED 8): the owed file is saved at most every kHelpSaveMs and at
    link-down, not at every new entry. */
 void BdHelpTick()
 {
-    const int up = net::LinkIsUp() ? 1 : 0;
+    const int up = net::SideRoadOpen() ? 1 : 0;   /* the road SendBuildToSlot itself needs - the world server's or the session link; a game joined through the world server has no session link */
     const int edge = (up != 0 && g_helpLinkWasUp == 0) ? 1 : 0;
     const int down = (up == 0 && g_helpLinkWasUp != 0) ? 1 : 0;
     g_helpLinkWasUp = up;
@@ -2552,7 +2553,7 @@ void BdHelpTick()
                     ++g_helpWorkOwed;
                     float ms = 0.0f;
                     for (int i = 0; i < (int)e->n; ++i) ms += e->d[i];
-                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help work key=%.63s owner=slot%d seq=%u dP=%.3f dMats=%.2f owed unacked=%u (link down - sent at link-up)",
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help work key=%.63s owner=slot%d seq=%u dP=%.3f dMats=%.2f owed unacked=%u (no road to another game - sent when one opens)",
                                 it->first.c_str(), h.ownerSlot, e->seq, e->dP, ms, (unsigned int)h.owed.size());
                     BdLogHelpFreq(line);
                 }

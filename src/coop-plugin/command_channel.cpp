@@ -330,6 +330,7 @@ void CommandChannelTick()
        session pump included, now reads a CURRENT "is a world running", not last frame's answer. */
     coop::SoakRefreshRunning();
     coop::NoteMainThread();
+    coop::SpawnPaceFrameStart();   /* the copy budget is per frame: both drains below share it */
 
     // Network servicing runs EVERY tick, not on the command throttle: a 300-tick delay
     // on packet handling would add latency to every replicated event. Main thread only,
@@ -2027,6 +2028,13 @@ void CommandChannelTick()
         if (op != "clear" && !(is >> town >> x >> z)) WriteStatus("error pendnote: add / show need <townSid> <x> <z> (numbers) - nothing added");
         else { if (op == "add") is >> kind; WriteStatus(coop::StorePendNoteCommand(op, town, x, z, kind)); }
         finished = true;
+    }
+    else if (verb == "storetest")
+    {
+        // storetest nopos <worldId or part of one> | storetest nopos off   - TEST-ONLY lever: that group's next SLEEP write reads as if
+        // none of its members were in the world and its platoon stood at 0,0 (store.cpp StoreTestCommand, RecordPosChoose).
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::StoreTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "townlist") { WriteStatus(coop::TownListCommand()); finished = true; }   // towns1: read-only, every town with name and position
     else if (verb == "ownbuilding") { WriteStatus(coop::OwnBuildingCommand()); finished = true; }

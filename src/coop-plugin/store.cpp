@@ -46,6 +46,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "../common/liveenvelope.h"   /* M5a (T-197 piece 4, store protocol 59): LIVE (53) - the SAME header the notebook and the offline suite compile */
 #include "../common/liveowner.h"   /* M7a A1 build 1 [a1b1-st6]: the OWNER_MOVED road gate */
 #include "../common/townpending.h"   /* T-580: which notebook notes hold a town's creation back - the SAME header towngen and the offline suite compile */
+#include "../common/recordpos.h"   /* T-694: which known position a record this game writes takes - the SAME header the offline suite compiles */
 #include "../common/preload.h"   /* T-346 slice 1 (store protocol 67): the records before the load - the wire, the want rule, the flow and the wait's exit rule, the SAME header the world server and the offline suite compile */
 #include "../common/recordfeed.h"   /* T-313 (store protocol 63): RECORD_FEED (58) - the ASK decision, the wire and the END marker, the SAME header the notebook and the offline suite compile */
 #include "items.h"        /* E22a: the item-move counters, printed on the same [STORE] REPORT line */
@@ -107,6 +108,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include <iterator>
 #include <new>
 #include <locale>
+#include "../common/spawnpace.h"   /* copies of other games' characters made under a frame budget, each copy's messages in order */
 #include <map>
 #include <set>
 #include <sstream>
@@ -792,6 +794,46 @@ std::string PlatoonTownSid(const void* platoon)
     if (town == 0 || !Plaus(town)) { ++g_townNone; return std::string("-"); }   /* a genuine wilderness group - no home town (F503) */   /* review-p5a MEDIUM-1: THREE states on the wire - "-" = no home town, "" = the read faulted or an old sender, anything else = the town */
     if (TownGenTownSid(town, b, 128) == 0) { ++g_faultTownRead; return std::string(); }   /* the sid read faulted or the name did not fit */
     return std::string(b);
+}
+/* WHERE A RECORD THIS GAME WRITES PUTS ITS GROUP (recordpos.h Pick): the first known of a living member's position; the platoon's
+   own; the group's last record here; its home building's (the position its home key carries - RecordHomeOf, else read off the group
+   now); its town's (the group's home town, TownGenTownPos). A record at 0,0 is "no position": no area wake places it and, as a
+   pending note, it holds its whole town back - so a later source is asked only when every earlier one is none. Fills r's position
+   (the platoon's own values when nothing is known, as before) and books the source; one line for each write that needed a source
+   past the platoon's own, the first 40 logged. MAIN THREAD. */
+long long g_recPosSrc[recordpos::kSrcCount] = { 0, 0, 0, 0, 0, 0 };
+long long g_recPosLogged = 0;
+std::string g_recPosNoPosArmed;   /* storetest nopos: the worldId whose next SLEEP write reads as if it had no living member and no position; "*" = the next SLEEP write of any group */
+void RecordPosChoose(void* platoon, const std::string& worldId, int haveMember, float mx, float my, float mz, float px, float py, float pz, const char* site, Record* r)
+{
+    recordpos::Cand c[5];
+    for (int i = 0; i < 5; ++i) { c[i].have = 0; c[i].x = 0.0f; c[i].y = 0.0f; c[i].z = 0.0f; }
+    c[recordpos::kSrcMember].have = haveMember != 0 ? 1 : 0; c[recordpos::kSrcMember].x = mx; c[recordpos::kSrcMember].y = my; c[recordpos::kSrcMember].z = mz;
+    c[recordpos::kSrcPlatoon].have = 1; c[recordpos::kSrcPlatoon].x = px; c[recordpos::kSrcPlatoon].y = py; c[recordpos::kSrcPlatoon].z = pz;
+    int src = recordpos::Pick(c);
+    if (src == recordpos::kSrcNone)
+    {
+        std::map<std::string, Record>::const_iterator pr = g_records.find(worldId);
+        if (pr != g_records.end()) { recordpos::Cand& l = c[recordpos::kSrcLast]; l.have = 1; l.x = pr->second.x; l.y = pr->second.y; l.z = pr->second.z; }
+        std::string hk = RecordHomeOf(worldId);
+        if (hk.empty() && platoon != 0) { char b[128]; if (TownGenPlatoonHomeKey(platoon, b, 128) == 1) hk = b; }
+        { recordpos::Cand& h = c[recordpos::kSrcHome]; if (!hk.empty() && BoxKeyPosition(hk.c_str(), &h.x, &h.y, &h.z) == 1) h.have = 1; }
+        src = recordpos::Pick(c);
+        if (src == recordpos::kSrcNone && platoon != 0)
+        {
+            void* town = 0; float tp[3] = { 0.0f, 0.0f, 0.0f };
+            if (PlatoonTownPod(platoon, &town) && town != 0 && Plaus(town) && TownGenTownPos(town, tp) == 1)
+            { recordpos::Cand& t = c[recordpos::kSrcTown]; t.have = 1; t.x = tp[0]; t.y = tp[1]; t.z = tp[2]; }
+            src = recordpos::Pick(c);
+        }
+    }
+    ++g_recPosSrc[src];
+    if (src != recordpos::kSrcNone) { r->x = c[src].x; r->y = c[src].y; r->z = c[src].z; }
+    else { r->x = px; r->y = py; r->z = pz; }
+    if (src >= recordpos::kSrcLast && ++g_recPosLogged <= 40)
+        DebugLog("[STORE] record " + worldId + " had no position: " + std::string(recordpos::SrcText(src)) + " pos=" + F1(r->x) + "," + F1(r->y) + "," + F1(r->z)
+                 + " (" + std::string(site) + " write; recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2])
+                 + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + "; the first 40 logged, then counted)");
 }
 int PlatoonSidPod(const void* platoon, std::string* out)
 {
@@ -3637,6 +3679,7 @@ int StoreRecordCreatedImpl(void* platoon)
     if (worldId.empty()) { ++g_createdRecordFailed; return -1; }
     Record r; r.worldId = worldId; r.x = q.x; r.y = q.y; r.z = q.z; r.writtenAt = (long long)time(0); r.posAt = r.writtenAt; r.owner = (int)StoreOwnerField();   /* B10 (audit C13) site 1 of 6 */
     { char buf[160]; if (Plaus(q.squadGd) && CopyStdStringPod((const char*)q.squadGd + 0x58, buf, 160)) r.squadSid = buf; r.factionName = Plaus(q.faction) ? FactionKey((Faction*)q.faction) : std::string(); }   /* factionkey.h: an NPC faction's stringID */
+    RecordPosChoose(platoon, worldId, 0, 0.0f, 0.0f, 0.0f, q.x, q.y, q.z, "CREATED", &r);   /* the platoon's own position, else the last record's, its home building's or its town's */
     r.file = MirrorFile(worldId);   /* B10 (audit C8): the notebook owns the canonical folder; this is this process's own mirror */
     g_saveExcCode = 0; g_saveExcAddr = 0;   /* review-p5w MEDIUM-2: both SavePod sites share these, so both clear them - otherwise this call's fault is still readable at the other site's failure line long afterwards */
     const int sv = SavePod(q.unloadedContainer, &r.file);
@@ -3986,6 +4029,15 @@ void detour_deactivate(void* platoon, void* container)
     char buf[160];
     if (Plaus(after.squadGd) && CopyStdStringPod((const char*)after.squadGd + 0x58, buf, 160)) r.squadSid = buf;
     if (Plaus(after.faction)) { Faction* f = (Faction*)after.faction; r.factionName = FactionKey(f); }   /* factionkey.h */
+    {   /* the record's position: a living member's, else the platoon's own, the last record's, its home building's or its town's */
+        int noPos = 0;
+        if (!g_recPosNoPosArmed.empty() && (g_recPosNoPosArmed == worldId || g_recPosNoPosArmed == "*"))
+        {
+            noPos = 1; g_recPosNoPosArmed.clear();
+            DebugLog("[STORE] storetest nopos: the SLEEP write of " + worldId + " reads as if no member were in the world and its platoon stood at 0,0");
+        }
+        RecordPosChoose(platoon, worldId, noPos != 0 ? 0 : haveMember, mx, my, mz, noPos != 0 ? 0.0f : after.x, noPos != 0 ? 0.0f : after.y, noPos != 0 ? 0.0f : after.z, "SLEEP", &r);
+    }
     r.file = MirrorFile(worldId);   /* B10 (audit C8): the notebook owns the canonical folder; this is this process's own mirror */
     if (!mineByBlock && mine == 0 && HeldByOtherTS(SectorOf(r.x, r.z)) == 1) { ++g_sleepSkippedOtherHeld; return; }   /* review-p4q HIGH-1 / review-p4s HIGH-3: an UNOWNED group in another player's area is not my note; a group I own is, wherever it sleeps. E2: `mine` is the test that stops working at sleep time, so the block answer - when there is one - decides "a group I own" here too, exactly as this line's own rule intends (T219's residents slept in 23,33 while the host held it) */
     // E26 (F533): THE PROCESS IS QUITTING - DO NOT CALL THE ENGINE'S SAVE. The fault measured in T223/T225/T226 is a
@@ -12139,6 +12191,77 @@ void GoneBitBeforeDrop(const std::vector<char>& payload)
     std::string wid; size_t at = 0;
     if (GetStrS(payload, &at, &wid) && !wid.empty() && DeletedBitSet(wid)) ++g_goneBitAtDrop;
 }
+/* THE COPY BUDGET (spawnpace.h). One tally per frame, shared by the frame's two drains; SpawnPaceFrameStart, the first statement
+   of CommandChannelTick, closes the last frame into the burst book and starts the next. The held list keeps what the budget held
+   back: a SPAWN; the messages naming a character that a held row names (spawnpace.h MessageSubjects, per type); a sender-scoped
+   message (a ROSTER HASH, a catch-up's END, a cut or implausible list) behind its sender's held SPAWNs, with that sender's later
+   messages behind it; PLAYER_GONE behind every held SPAWN. The SPAWNs a held hand-over names are made first (PaceHeldPass).
+   Their payloads wait in g_paceHeldMsg under the row's ticket and count in the arrival queue's back-pressure.
+   THE COUNTS ADD UP: SPAWN messages arrived = applied + staleSpawns (discarded: link or world moved on) + stillHeld, whenever the
+   arrival queue itself is empty. */
+typedef char SpawnPaceTypeNumbersMatch[(spawnpace::kMsgSpawn == (int)net::MSG_SPAWN && spawnpace::kMsgTask == (int)net::MSG_TASK
+    && spawnpace::kMsgMove == (int)net::MSG_MOVE && spawnpace::kMsgHit == (int)net::MSG_HIT && spawnpace::kMsgState == (int)net::MSG_STATE
+    && spawnpace::kMsgAppearance == (int)net::MSG_APPEARANCE && spawnpace::kMsgClothing == (int)net::MSG_CLOTHING
+    && spawnpace::kMsgCombatMode == (int)net::MSG_COMBATMODE && spawnpace::kMsgDespawn == (int)net::MSG_DESPAWN && spawnpace::kMsgSwing == (int)net::MSG_SWING
+    && spawnpace::kMsgIntent == (int)net::MSG_INTENT && spawnpace::kMsgContext == (int)net::MSG_CONTEXT && spawnpace::kMsgXfer == (int)net::MSG_XFER
+    && spawnpace::kMsgXferAck == (int)net::MSG_XFER_ACK && spawnpace::kMsgUnload == (int)net::MSG_UNLOAD && spawnpace::kMsgItemMove == (int)net::MSG_ITEM_MOVE
+    && spawnpace::kMsgItemRequest == (int)net::MSG_ITEM_REQUEST && spawnpace::kMsgItemConfirm == (int)net::MSG_ITEM_CONFIRM
+    && spawnpace::kMsgItemPlaced == (int)net::MSG_ITEM_PLACED && spawnpace::kMsgItemRevoke == (int)net::MSG_ITEM_REVOKE && spawnpace::kMsgSay == (int)net::MSG_SAY
+    && spawnpace::kMsgStats == (int)net::MSG_STATS && spawnpace::kMsgCrime == (int)net::MSG_CRIME && spawnpace::kMsgBounty == (int)net::MSG_BOUNTY
+    && spawnpace::kMsgCarryBreak == (int)net::MSG_CARRY_BREAK && spawnpace::kMsgPrison == (int)net::MSG_PRISON && spawnpace::kMsgTreat == (int)net::MSG_TREAT
+    && spawnpace::kMsgName == (int)net::MSG_NAME && spawnpace::kMsgSlave == (int)net::MSG_SLAVE && spawnpace::kMsgHire == (int)net::MSG_HIRE
+    && spawnpace::kMsgSquadLead == (int)net::MSG_SQUAD_LEAD && spawnpace::kMsgTalk == (int)net::MSG_TALK && spawnpace::kMsgCapture == (int)net::MSG_CAPTURE
+    && spawnpace::kMsgCaptureDone == (int)net::MSG_CAPTURE_DONE && spawnpace::kMsgCapturePlaced == (int)net::MSG_CAPTURE_PLACED
+    && spawnpace::kMsgShot == (int)net::MSG_SHOT && spawnpace::kMsgEffect == (int)net::MSG_EFFECT && spawnpace::kMsgInside == (int)net::MSG_INSIDE
+    && spawnpace::kMsgRelease == (int)net::MSG_RELEASE && spawnpace::kMsgReleaseAck == (int)net::MSG_RELEASE_ACK && spawnpace::kMsgRoster == (int)net::MSG_ROSTER
+    && spawnpace::kMsgMoveStop == (int)net::MSG_MOVESTOP && spawnpace::kMsgOwnerMoved == (int)cooplive::kInnerOwnerMoved) ? 1 : -1];
+struct PaceHeldMsg
+{
+    int type, origin, scope, cls;
+    unsigned int peer;
+    long linkGen, worldGen;
+    std::vector<char> pay;
+};
+static spawnpace::HeldBook g_paceBook;
+static std::map<long long, PaceHeldMsg> g_paceHeldMsg;
+static std::map<std::pair<int, unsigned int>, long long> g_paceLevelAt;   /* a held LEVEL (a MOVE) per (origin, type, uid): a newer one overwrites it */
+static long long g_paceTicket = 0;
+static size_t g_paceHeldCount[4] = { 0, 0, 0, 0 }, g_paceHeldBytes[4] = { 0, 0, 0, 0 };   /* per origin, for InQueueSaturated */
+static spawnpace::PaceFrame g_paceFrame;
+static spawnpace::Burst g_paceBurst;
+static long long g_paceArrived = 0, g_paceApplied = 0, g_paceMade = 0, g_paceRepeat = 0, g_paceNotMade = 0, g_paceStaleSpawns = 0, g_paceStillHeld = 0;
+static long long g_paceHeld = 0, g_paceFollowsHeld = 0, g_paceBarrierWaits = 0, g_pacePassedWhileHeld = 0, g_paceHeldDropped = 0;
+static long long g_paceLevelsCollapsed = 0, g_paceHeldMax = 0, g_paceWaitFrames = 0, g_paceBursts = 0, g_paceWorstUs = 0;
+static std::string PaceMs(long long us) { if (us < 0) us = 0; return N(us / 1000) + "." + N((us % 1000) / 100); }
+void SpawnPaceFrameStart()
+{
+    const spawnpace::PaceFrame f = g_paceFrame;
+    spawnpace::FrameReset(&g_paceFrame);
+    g_paceApplied += f.applied; g_paceMade += f.made; g_paceRepeat += f.repeat; g_paceNotMade += f.notMade;
+    if (f.waited != 0) ++g_paceWaitFrames;
+    if ((f.made > 0 || f.waited != 0) && f.usedUs > g_paceWorstUs) g_paceWorstUs = f.usedUs;
+    if (spawnpace::BurstFrame(&g_paceBurst, f) == 0) return;
+    ++g_paceBursts;
+    if (g_paceBurst.made >= 2 || g_paceBurst.waits > 0)
+        DebugLog("[SPAWNPACE] burst ended: " + N(g_paceBurst.arrived) + " SPAWNs queued since the last burst, " + N(g_paceBurst.applied)
+                 + " applied in it - " + N(g_paceBurst.made) + " copies made, " + N(g_paceBurst.repeat) + " already here, " + N(g_paceBurst.notMade)
+                 + " not made; over " + N(g_paceBurst.frames) + " frames, " + N(g_paceBurst.waits) + " of them held a SPAWN to a later frame;"
+                 " the most one frame's drains spent " + PaceMs(g_paceBurst.worstUs) + " ms (budget " + PaceMs(spawnpace::kFrameBudgetUs)
+                 + " ms; bursts " + N(g_paceBursts) + "; so far: SPAWNs arrived " + N(g_paceArrived) + " = applied " + N(g_paceApplied)
+                 + " + stale " + N(g_paceStaleSpawns) + " + still held " + N(g_paceStillHeld) + "; SPAWNs held " + N(g_paceHeld)
+                 + ", messages held behind their characters' SPAWNs " + N(g_paceFollowsHeld) + ", messages held behind SPAWNs before them " + N(g_paceBarrierWaits)
+                 + ", messages applied at once while SPAWNs were held " + N(g_pacePassedWhileHeld) + ", held rows dropped at a link or world change " + N(g_paceHeldDropped)
+                 + ", the most rows held " + N(g_paceHeldMax) + ")");
+    spawnpace::BurstReset(&g_paceBurst);
+}
+std::string SpawnPaceToken()
+{
+    return "spawnPace[arrived,applied,made,repeat,notMade,staleSpawns,stillHeld,held,followsHeld,barrierWaits,passedWhileHeld,heldDropped,levelsCollapsed,heldMax,waitFrames,bursts,worstUs]="
+           + N(g_paceArrived) + "," + N(g_paceApplied + g_paceFrame.applied) + "," + N(g_paceMade + g_paceFrame.made) + ","
+           + N(g_paceRepeat + g_paceFrame.repeat) + "," + N(g_paceNotMade + g_paceFrame.notMade) + "," + N(g_paceStaleSpawns) + "," + N(g_paceStillHeld) + ","
+           + N(g_paceHeld) + "," + N(g_paceFollowsHeld) + "," + N(g_paceBarrierWaits) + "," + N(g_pacePassedWhileHeld) + "," + N(g_paceHeldDropped) + ","
+           + N(g_paceLevelsCollapsed) + "," + N(g_paceHeldMax) + "," + N(g_paceWaitFrames) + "," + N(g_paceBursts) + "," + N(g_paceWorstUs);
+}
 void InQueueEnqueue(int type, int origin, int scope, int cls, unsigned int subject, unsigned int peer, const std::vector<char>& payload)
 {
     if (origin < kOriginNotebook || origin > kOriginRelay) origin = kOriginLocal;   /* M5a: four origins */
@@ -12204,6 +12327,7 @@ void InQueueEnqueue(int type, int origin, int scope, int cls, unsigned int subje
     g_inCount[origin] += 1;
     g_inBytes[origin] += payload.size();
     ++g_inQueued[origin];
+    if ((origin == kOriginSession || origin == kOriginRelay) && type == (int)net::MSG_SPAWN) { ++g_paceArrived; ++g_paceBurst.arrived; }
     if (cls == kClassLevel && subject != 0) g_levelAt[std::make_pair(origin * 4096 + type, subject)] = g_inQueue.size() - 1;
     if (g_inSeq == 1)
         DebugLog("[STORE] the ARRIVAL QUEUE has its first entry (P7v). Every inbound message that could touch"
@@ -12215,8 +12339,8 @@ void InQueueEnqueue(int type, int origin, int scope, int cls, unsigned int subje
 int InQueueSaturated(int origin)
 {
     if (origin < kOriginNotebook || origin > kOriginRelay) return 0;   /* M5a: four origins */
-    return (g_inCount[origin] * 4 >= kInQueueMaxEntriesPerOrigin * 3
-            || g_inBytes[origin] * 4 >= kInQueueMaxBytesPerOrigin * 3) ? 1 : 0;
+    return ((g_inCount[origin] + g_paceHeldCount[origin]) * 4 >= kInQueueMaxEntriesPerOrigin * 3
+            || (g_inBytes[origin] + g_paceHeldBytes[origin]) * 4 >= kInQueueMaxBytesPerOrigin * 3) ? 1 : 0;   /* the held list counts too */
 }
 /* BACK-PRESSURE AND THE LOUD REFUSAL, once a tick from StoreTick. A saturated origin whose queue cannot
    drain is a peer whose edges we cannot accept, and under decision 47 that is a peer whose persistent state
@@ -12238,7 +12362,8 @@ void InQueuePressureTick()
                 g_inSaturatedSince[o] = 0;
                 ErrorLog("[STORE] the arrival queue for " + std::string(o == kOriginNotebook ? "the NOTEBOOK link" : (o == kOriginRelay ? "games RELAYED by the notebook (the notebook link is refused)" : "the GAME link"))
                          + " has been saturated for " + N((long long)kSaturationRefuseMs) + " ms of BLOCKED time ("
-                         + N((long long)g_inCount[o]) + " entries, " + N((long long)g_inBytes[o]) + " bytes held)."
+                         + N((long long)g_inCount[o]) + " entries, " + N((long long)g_inBytes[o]) + " bytes queued; "
+                         + N((long long)g_paceHeldCount[o]) + " entries, " + N((long long)g_paceHeldBytes[o]) + " bytes held behind copies not yet made)."
                          " THE LINK IS REFUSED. A peer whose edges this game cannot accept is a peer whose"
                          " persistent state can no longer be made identical (decision 47), and a visible refusal"
                          " is better than a silent divergence (inQueueRefusedLink).");
@@ -12390,8 +12515,185 @@ void AreaOwnerScanTick()
         AreaNamedSlotsOf(id, sw, &slots);
     }
 }
+/* One entry leaving the arrival queue or the held list: discarded when its link or world moved on since it arrived (0),
+   otherwise applied by its origin's handler (1). */
+static int InQueueApplyOne(int type, int origin, int scope, unsigned int peer, long entryLinkGen, long entryWorldGen, long genAtStart, std::vector<char>& pay)
+{
+    /* P7w (F599): kOriginLocal reads the LIVE session generation like every other origin. The old form
+       substituted the entry's own stamp for the current one, which is a comparison that cannot fail. */
+    const long curLinkGen = (origin == kOriginNotebook || origin == kOriginRelay) ? StoreNotebookLinkGen() : net::SessionLinkGen();   /* M5a: the relayed origin is judged by the notebook link it came on */
+    int stale = 0;
+    if (entryLinkGen != curLinkGen) stale = 1;
+    else if (scope == kScopeWorld && entryWorldGen != genAtStart) stale = 2;
+    if (stale != 0)
+    {
+        /* THE PERMANENT BIT FIRST, ON EVERY DISCARD PATH. */
+        if (origin == kOriginNotebook && type == (int)kStoreMsgGone) GoneBitBeforeDrop(pay);   /* M2: the session link no longer queues RECORD_GONE (notebook only), so its arm is gone */
+        if (origin == kOriginNotebook && type == (int)kStoreMsgPlayerGone && !g_storeProtoMismatch) coop::PlayerGoneApply(pay, "its notebook link moved before the drain - applied anyway: it names one player's rows, not the link's");   /* M8: engine writes are allowed here (asked at the top of this entry); M8 review F6: a notebook this game does not speak is not read (B10-b), as on the live path */
+        if (stale == 1) ++g_droppedStaleLinkGen[origin]; else ++g_droppedStaleWorldGen;
+        if (origin == kOriginLocal)
+        {
+            if (type >= kActPeerGone && type <= kActResendHello) ++g_droppedStaleAction[type];
+            /* AND THE LATCH THE ACTION CARRIED MUST DIE WITH IT. g_sessionLeavePending is cleared only
+               INSIDE SessionLeave, and while it is set the session poll loop breaks - so discarding a
+               stale kActSessionLeave without clearing it would latch the pump shut for the life of the
+               process. Every discard tells the session layer which kind went. */
+            net::SessionActionDiscarded(type);
+        }
+        return 0;
+    }
+    if (origin == kOriginNotebook)     ApplyRecordClassMessage(type, pay);
+    else if (origin == kOriginSession || origin == kOriginRelay) net::SessionDispatchQueued(type, peer, pay);   /* M5a: a relayed message runs the session layer's own handler, sender 0x80000000 | slot */
+    else                               net::SessionPerformAction(type, pay);   /* M8: kActPeerGone carries the departed link peer's slot */
+    return 1;
+}
+/* what a message with batch meaning waits for: a catch-up's END for its sender's SPAWNs before it, PLAYER_GONE for every SPAWN
+   before it (it names a slot, not a road). The session peer's departure (kActPeerGone) applies at once. */
+static int PaceBarrierScope(int type, int origin)
+{
+    if (origin == kOriginRelay && type == (int)cooplive::kInnerCatchupEnd) return spawnpace::kScopeSender;
+    if (origin == kOriginNotebook && type == (int)kStoreMsgPlayerGone) return spawnpace::kScopeAll;
+    return spawnpace::kScopeNone;
+}
+static int PaceIsSpawnMsg(int type, int origin)
+{
+    return ((origin == kOriginSession || origin == kOriginRelay) && type == (int)net::MSG_SPAWN) ? 1 : 0;
+}
+/* A message the budget holds back goes to the held list; a held LEVEL (a MOVE) for the same character overwrites the earlier one
+   in its slot, as the arrival queue collapses its levels. */
+static void PaceHold(int route, const std::vector<unsigned int>& names, int barrierScope, int type, int origin, int scope, int cls,
+                     unsigned int peer, long linkGen, long worldGen, std::vector<char>& pay)
+{
+    const unsigned int first = names.empty() ? 0u : names[0];
+    const std::pair<int, unsigned int> lkey(origin * 4096 + type, first);
+    if (route == spawnpace::kRouteFollow && cls == kClassLevel && first != 0)
+    {
+        std::map<std::pair<int, unsigned int>, long long>::iterator lv = g_paceLevelAt.find(lkey);
+        if (lv != g_paceLevelAt.end())
+        {
+            std::map<long long, PaceHeldMsg>::iterator hm = g_paceHeldMsg.find(lv->second);
+            if (hm != g_paceHeldMsg.end())
+            {
+                const size_t o = (size_t)origin & 3u;
+                g_paceHeldBytes[o] = g_paceHeldBytes[o] >= hm->second.pay.size() ? g_paceHeldBytes[o] - hm->second.pay.size() : 0;
+                hm->second.pay.swap(pay); hm->second.peer = peer; hm->second.linkGen = linkGen; hm->second.worldGen = worldGen;
+                g_paceHeldBytes[o] += hm->second.pay.size();
+                ++g_paceLevelsCollapsed;
+                return;
+            }
+            g_paceLevelAt.erase(lv);
+        }
+    }
+    const long long t = ++g_paceTicket;
+    PaceHeldMsg& h = g_paceHeldMsg[t];
+    h.type = type; h.origin = origin; h.scope = scope; h.cls = cls; h.peer = peer; h.linkGen = linkGen; h.worldGen = worldGen;
+    h.pay.swap(pay);
+    g_paceHeldCount[(size_t)origin & 3u] += 1; g_paceHeldBytes[(size_t)origin & 3u] += h.pay.size();
+    const int kind = route == spawnpace::kRouteHoldSpawn ? spawnpace::kKindSpawn : (route == spawnpace::kRouteFollow ? spawnpace::kKindFollow : spawnpace::kKindBarrier);
+    const std::vector<unsigned int> none;
+    const int charRoad = (origin == kOriginSession || origin == kOriginRelay) ? 1 : 0;
+    spawnpace::HeldPutRow(&g_paceBook, kind, kind == spawnpace::kKindBarrier ? barrierScope : spawnpace::kScopeNone, charRoad != 0 ? peer : spawnpace::kNoSender,
+                          kind == spawnpace::kKindBarrier ? none : names, t,
+                          (charRoad != 0 && kind == spawnpace::kKindFollow) ? spawnpace::UrgentType((unsigned int)type) : 0);   /* a held hand-over: the SPAWNs it names are made first */
+    if (kind == spawnpace::kKindSpawn) { ++g_paceHeld; g_paceFrame.waited = 1; }
+    else if (kind == spawnpace::kKindFollow) ++g_paceFollowsHeld;
+    else ++g_paceBarrierWaits;
+    if (PaceIsSpawnMsg(type, origin) != 0) ++g_paceStillHeld;
+    if (kind == spawnpace::kKindFollow && cls == kClassLevel && first != 0) g_paceLevelAt[lkey] = t;
+    if ((long long)g_paceBook.rows.size() > g_paceHeldMax) g_paceHeldMax = (long long)g_paceBook.rows.size();
+}
+/* Takes a held message out of the store (its row is already out of the book). */
+static bool PaceTakeMsg(long long ticket, unsigned int rowUid, PaceHeldMsg* out)
+{
+    std::map<long long, PaceHeldMsg>::iterator hm = g_paceHeldMsg.find(ticket);
+    if (hm == g_paceHeldMsg.end()) return false;
+    out->type = hm->second.type; out->origin = hm->second.origin; out->scope = hm->second.scope; out->cls = hm->second.cls;
+    out->peer = hm->second.peer; out->linkGen = hm->second.linkGen; out->worldGen = hm->second.worldGen;
+    out->pay.swap(hm->second.pay);
+    g_paceHeldMsg.erase(hm);
+    const size_t o = (size_t)out->origin & 3u;
+    if (g_paceHeldCount[o] > 0) --g_paceHeldCount[o];
+    g_paceHeldBytes[o] = g_paceHeldBytes[o] >= out->pay.size() ? g_paceHeldBytes[o] - out->pay.size() : 0;
+    if (out->cls == kClassLevel)
+    {
+        std::map<std::pair<int, unsigned int>, long long>::iterator lv = g_paceLevelAt.find(std::make_pair(out->origin * 4096 + out->type, rowUid));
+        if (lv != g_paceLevelAt.end() && lv->second == ticket) g_paceLevelAt.erase(lv);
+    }
+    if (PaceIsSpawnMsg(out->type, out->origin) != 0 && g_paceStillHeld > 0) --g_paceStillHeld;
+    return true;
+}
+/* A held row whose link or world moved on is discarded at once, through the same stale path as a queued one (so a PLAYER_GONE is
+   still applied, a stale local action still releases its latch); asked when a generation changes, not every frame. */
+static long g_paceSeenSessionGen = -1, g_paceSeenNotebookGen = -1, g_paceSeenWorldGen = -1;
+static void PaceDropStale(long genAtStart)
+{
+    const long sg = net::SessionLinkGen(), ng = StoreNotebookLinkGen();
+    if (sg == g_paceSeenSessionGen && ng == g_paceSeenNotebookGen && genAtStart == g_paceSeenWorldGen) return;
+    g_paceSeenSessionGen = sg; g_paceSeenNotebookGen = ng; g_paceSeenWorldGen = genAtStart;
+    size_t i = 0;
+    while (i < g_paceBook.rows.size())
+    {
+        const spawnpace::HeldRow& r = g_paceBook.rows[i];
+        std::map<long long, PaceHeldMsg>::const_iterator hm = g_paceHeldMsg.find(r.ticket);
+        if (hm == g_paceHeldMsg.end()) { spawnpace::HeldTake(&g_paceBook, i); continue; }
+        const long cur = (hm->second.origin == kOriginNotebook || hm->second.origin == kOriginRelay) ? ng : sg;
+        if (hm->second.linkGen == cur && !(hm->second.scope == kScopeWorld && hm->second.worldGen != genAtStart)) { ++i; continue; }
+        const long long ticket = r.ticket;
+        const unsigned int rowUid = r.names.empty() ? 0u : r.names[0];
+        spawnpace::HeldTake(&g_paceBook, i);
+        PaceHeldMsg h;
+        if (!PaceTakeMsg(ticket, rowUid, &h)) continue;
+        InQueueApplyOne(h.type, h.origin, h.scope, h.peer, h.linkGen, h.worldGen, genAtStart, h.pay);
+        ++g_paceHeldDropped;
+        if (PaceIsSpawnMsg(h.type, h.origin) != 0) ++g_paceStaleSpawns;
+    }
+}
+/* THE HELD LIST FIRST, each frame, oldest first, under the frame's budget, in two sweeps. While a held hand-over (XFER, XFER_ACK,
+   RELEASE, RELEASE_ACK) names a held SPAWN, the first sweep (spawnpace.h HeldUrgentStep) makes those SPAWNs ahead of older ones:
+   the giver abandons a hand-over left unanswered for 10 s, and a member at the back of a burst of hundreds would wait longer. The
+   second (HeldStep) works every row: a SPAWN is made while the budget allows (at least one a frame), the messages held behind it
+   apply in the same pass, a barrier once the SPAWNs it waits for are made. The clock is read only for a SPAWN row the sweep may
+   make. */
+static void PaceHeldPass(long long t0, long genAtStart)
+{
+    for (int sweep = 0; sweep < 2; ++sweep)
+    {
+        if (sweep == 0 && g_paceBook.urgentNamed.empty()) continue;
+        spawnpace::HeldPassState st;
+        size_t i = 0;
+        while (i < g_paceBook.rows.size())
+        {
+            if (EngineWritesBlocked() || ::InterlockedCompareExchange(&g_worldGen, 0, 0) != genAtStart) break;
+            if (sweep == 0 && st.budgetHit != 0) break;   /* the budget is spent: nothing more is made ahead */
+            const spawnpace::HeldRow& r = g_paceBook.rows[i];
+            const int timed = (r.kind == spawnpace::kKindSpawn && (sweep != 0 || spawnpace::UrgentSpawnRow(g_paceBook, r))) ? 1 : 0;
+            const long long used = timed != 0 ? g_paceFrame.usedUs + QpcUsSince(t0) : 0;
+            const int step = sweep == 0 ? spawnpace::HeldUrgentStep(g_paceBook, r, &st, g_paceFrame.made, used, spawnpace::kFrameBudgetUs)
+                                        : spawnpace::HeldStep(g_paceBook, r, &st, g_paceFrame.made, used, spawnpace::kFrameBudgetUs);
+            if (step != spawnpace::kHeldApply) { ++i; continue; }
+            const long long ticket = r.ticket;
+            const unsigned int rowUid = r.names.empty() ? 0u : r.names[0];
+            spawnpace::HeldTake(&g_paceBook, i);
+            PaceHeldMsg h;
+            if (!PaceTakeMsg(ticket, rowUid, &h)) continue;
+            const int isSpawnMsg = PaceIsSpawnMsg(h.type, h.origin);
+            unsigned int su = 0;
+            if (isSpawnMsg != 0 && h.pay.size() >= 4) std::memcpy(&su, &h.pay[0], 4);
+            const int had = (su != 0 && SpawnedRawObject(su) != 0) ? 1 : 0;
+            if (InQueueApplyOne(h.type, h.origin, h.scope, h.peer, h.linkGen, h.worldGen, genAtStart, h.pay) == 0)
+            {
+                if (isSpawnMsg != 0) ++g_paceStaleSpawns;
+                continue;
+            }
+            ++g_inDrained;
+            if (isSpawnMsg != 0) spawnpace::FrameNoteSpawn(&g_paceFrame, had, (su != 0 && SpawnedRawObject(su) != 0) ? 1 : 0);
+        }
+        if (sweep != 0 && st.anySpawnKept != 0) g_paceFrame.waited = 1;
+    }
+}
 void InQueueDrain()
 {
+    g_paceFrame.left = (g_inHead < g_inQueue.size() || !g_paceBook.rows.empty()) ? 1 : 0;   /* a drain that returns early below leaves the burst open while anything waits */
     /* inv7a (e47-inv7-replan.md 3.1): the stand-in purge runs once per world generation BEFORE anything queued is applied,
        so before the first peer SPAWN; it holds the queue only while a cage-out is still waiting (<= 5 s). */
     /* inv7a2 (run T412): the purge is re-armed by EVENTS, asked here, BEFORE anything queued is applied: a stand-in
@@ -12404,7 +12706,7 @@ void InQueueDrain()
     { static long s_sessionGen = -1; const long sg = net::SessionLinkGen(); if (sg != s_sessionGen) { if (net::LinkIsUp()) StandinPurgeOnLinkUp(sg); s_sessionGen = sg; } }
     if (StandinPurgeTick(::InterlockedCompareExchange(&g_worldGen, 0, 0)) != 0) return;
     OrphanPurgeTick(::InterlockedCompareExchange(&g_worldGen, 0, 0));   /* orphan1: people created here in another game's area while unlinked (decision 37) */
-    if (g_inHead >= g_inQueue.size()) return;
+    if (g_inHead >= g_inQueue.size() && g_paceBook.rows.empty()) return;
     /* review-p7p M-3: the one early return P7p left uncounted. `held` climbing with no budget stops used to
        read identically to "no messages are arriving". */
     if (EngineWritesBlocked()) { ++g_drainRefusedBlocked; return; }
@@ -12412,6 +12714,8 @@ void InQueueDrain()
     const long long t0 = QpcTicks();
     const long genAtStart = ::InterlockedCompareExchange(&g_worldGen, 0, 0);
     long long deferredApplied = 0;
+    PaceDropStale(genAtStart);      /* held rows of a link or world that moved on go first */
+    PaceHeldPass(t0, genAtStart);   /* then the held list, under this frame's budget */
     while (g_inHead < g_inQueue.size())
     {
         /* THE PREDICATE AND THE GENERATION ARE RE-ASKED AT THE TOP OF EVERY ENTRY (design principle 2), not
@@ -12429,38 +12733,42 @@ void InQueueDrain()
         const unsigned int peer = g_inQueue[g_inHead].peer;
         const long entryLinkGen = g_inQueue[g_inHead].linkGen;
         const long entryWorldGen = g_inQueue[g_inHead].worldGen;
+        const int paceCls = g_inQueue[g_inHead].cls;
         std::vector<char> pay;
         pay.swap(g_inQueue[g_inHead].payload);
         if (g_inBytes[origin] >= pay.size()) g_inBytes[origin] -= pay.size(); else g_inBytes[origin] = 0;
         if (g_inCount[origin] > 0) --g_inCount[origin];
         ++g_inHead;
 
-        /* P7w (F599): kOriginLocal reads the LIVE session generation like every other origin. The old form
-           substituted the entry's own stamp for the current one, which is a comparison that cannot fail. */
-        const long curLinkGen = (origin == kOriginNotebook || origin == kOriginRelay) ? StoreNotebookLinkGen() : net::SessionLinkGen();   /* M5a: the relayed origin is judged by the notebook link it came on */
-        int stale = 0;
-        if (entryLinkGen != curLinkGen) stale = 1;
-        else if (scope == kScopeWorld && entryWorldGen != genAtStart) stale = 2;
-        if (stale != 0)
+        /* THE COPY BUDGET (spawnpace.h): a SPAWN for a character with no copy here is held once this frame has made a copy and spent
+           the budget, or while older SPAWNs are held; a message naming a character a held row names is held behind that row; a
+           sender-scoped message waits for its sender's held SPAWNs and sender-scoped rows and holds that sender's later messages
+           behind it; PLAYER_GONE waits for every held SPAWN. Everything else applies now: pacing never
+           delays a copy already shown, nor one sender's messages behind another sender's copies. */
+        std::vector<unsigned int> paceNames;
+        const int paceCharRoad = (origin == kOriginSession || origin == kOriginRelay) ? 1 : 0;
+        int paceScope = PaceBarrierScope(type, origin);
+        if (paceCharRoad != 0 && paceScope == spawnpace::kScopeNone && !pay.empty()
+            && spawnpace::MessageSubjects((unsigned int)type, (const unsigned char*)&pay[0], pay.size(), &paceNames) == spawnpace::kSubjectsSender)
+            paceScope = spawnpace::kScopeSender;
+        const int paceIsSpawn = (paceCharRoad != 0 && type == (int)net::MSG_SPAWN) ? 1 : 0;
+        const unsigned int paceUid = (paceIsSpawn != 0 && !paceNames.empty()) ? paceNames[0] : 0u;
+        const int paceHad = (paceUid != 0 && SpawnedRawObject(paceUid) != 0) ? 1 : 0;
+        const int paceNew = (paceUid != 0 && paceHad == 0) ? 1 : 0;
+        const int paceRoute = spawnpace::RouteNames(g_paceBook, paceNew, paceNames, paceScope, paceCharRoad != 0 ? peer : spawnpace::kNoSender, g_paceFrame.made,
+                                                    paceNew != 0 ? g_paceFrame.usedUs + QpcUsSince(t0) : 0, spawnpace::kFrameBudgetUs);
+        if (paceRoute != spawnpace::kRouteApply)
         {
-            /* THE PERMANENT BIT FIRST, ON EVERY DISCARD PATH. */
-            if (origin == kOriginNotebook && type == (int)kStoreMsgGone) GoneBitBeforeDrop(pay);   /* M2: the session link no longer queues RECORD_GONE (notebook only), so its arm is gone */
-            if (origin == kOriginNotebook && type == (int)kStoreMsgPlayerGone && !g_storeProtoMismatch) coop::PlayerGoneApply(pay, "its notebook link moved before the drain - applied anyway: it names one player's rows, not the link's");   /* M8: engine writes are allowed here (asked at the top of this entry); M8 review F6: a notebook this game does not speak is not read (B10-b), as on the live path */
-            if (stale == 1) ++g_droppedStaleLinkGen[origin]; else ++g_droppedStaleWorldGen;
-            if (origin == kOriginLocal)
-            {
-                if (type >= kActPeerGone && type <= kActResendHello) ++g_droppedStaleAction[type];
-                /* AND THE LATCH THE ACTION CARRIED MUST DIE WITH IT. g_sessionLeavePending is cleared only
-                   INSIDE SessionLeave, and while it is set the session poll loop breaks - so discarding a
-                   stale kActSessionLeave without clearing it would latch the pump shut for the life of the
-                   process. Every discard tells the session layer which kind went. */
-                net::SessionActionDiscarded(type);
-            }
+            PaceHold(paceRoute, paceNames, paceScope, type, origin, scope, paceCls, peer, entryLinkGen, entryWorldGen, pay);
             continue;
         }
-        if (origin == kOriginNotebook)     ApplyRecordClassMessage(type, pay);
-        else if (origin == kOriginSession || origin == kOriginRelay) net::SessionDispatchQueued(type, peer, pay);   /* M5a: a relayed message runs the session layer's own handler, sender 0x80000000 | slot */
-        else                               net::SessionPerformAction(type, pay);   /* M8: kActPeerGone carries the departed link peer's slot */
+        if (g_paceBook.spawns > 0) ++g_pacePassedWhileHeld;
+        if (InQueueApplyOne(type, origin, scope, peer, entryLinkGen, entryWorldGen, genAtStart, pay) == 0)
+        {
+            if (paceIsSpawn != 0) ++g_paceStaleSpawns;
+            continue;
+        }
+        if (paceIsSpawn != 0) spawnpace::FrameNoteSpawn(&g_paceFrame, paceHad, (paceUid != 0 && SpawnedRawObject(paceUid) != 0) ? 1 : 0);
         ++g_inDrained;
         if (wasDeferred != 0)
         {
@@ -12481,6 +12789,8 @@ void InQueueDrain()
     AreaWriterStandInsTick();   /* again after the queue: a record applied in this drain gets its stand-in before the engine's frame */
     const long long us = QpcUsSince(t0);
     if (us > g_drainUsMax) g_drainUsMax = us;
+    g_paceFrame.usedUs += us;
+    g_paceFrame.left = (g_inHead < g_inQueue.size() || !g_paceBook.rows.empty()) ? 1 : 0;
     if (g_inHead >= g_inQueue.size())
     {
         g_inQueue.clear(); g_inHead = 0; g_levelAt.clear();
@@ -18743,6 +19053,7 @@ int HbPublishOne(void* platoon, DWORD now, bool wasDirty)
     char buf[160];
     if (Plaus(q.squadGd) && CopyStdStringPod((const char*)q.squadGd + 0x58, buf, 160)) r.squadSid = buf;
     if (Plaus(q.faction)) { Faction* f = (Faction*)q.faction; r.factionName = FactionKey(f); }   /* factionkey.h */
+    RecordPosChoose(platoon, worldId, haveMember, mx, my, mz, q.x, q.y, q.z, "HEARTBEAT", &r);   /* a living member's position, else the platoon's own, the last record's, its home building's or its town's */
     r.file = MirrorFile(worldId);
     if (!mineByBlock && mine == 0 && HeldByOtherTS(SectorOf(r.x, r.z)) == 1) { ++g_hbHeldByOther; return 0; }   /* unreachable while the member rule refuses mine == 0 first; kept in the sleep path's order */
     std::vector<char> bytes;
@@ -19786,7 +20097,7 @@ void ReportStore()
              + " sleeps=" + N(g_sleeps) + " written=" + N(g_written) + " sent=" + N(g_sent) + " pushed=" + N(g_pushed) + " recv=" + N(g_recv)
              + " wakes=" + N(g_wakes) + " applied=" + N(g_applied) + " notNewer=" + N(g_notNewer) + " repositioned=" + N(g_repositioned) + " placed=" + N(g_placed) + " placeTimedOut=" + N(g_placeTimedOut) + " ignoredAwake=" + N(g_ignoredAwake)
              + " unknownDeferred=" + N(g_unknownDeferred) + " created=" + N(g_created) + " createNoRefs=" + N(g_createNoRefs) + " createLoadFailed=" + N(g_createLoadFailed) + " createNoState=" + N(g_createNoState) + " createNoPlatoon=" + N(g_createNoPlatoon) + " deferredLoadedHere=" + N(g_createDeferredLoadedHere)
-             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
+             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
              + " destroyedForgotten=" + N(g_destroyedForgotten) + " recvFoundInList=" + N(g_recvFoundInList) + " recvNotLoadedHere=" + N(g_recvNotLoadedHere) + " recvCacheDisagreed=" + N(g_recvCacheDisagreed)
              + " | faultSid=" + N(g_faultSid) + " faultSleepPod=" + N(g_faultSleepPod) + " faultSleepContainer=" + N(g_faultSleepContainer) + " faultWakePod=" + N(g_faultWakePod) + " | skippedEmpty=" + N(g_skippedEmpty) + " skippedNotMine=" + N(g_skippedNotMine) + " skippedNoUid=" + N(g_skippedNoUid) + " block[writtenByBlock,skippedOtherBlock]=" + N(g_writtenByBlock) + "," + N(g_skippedOtherBlock) + " skippedPlayerFaction=" + N(g_skippedPlayerFaction) + " skippedStandInRecord=" + N(g_sleepSkippedStandInRecord) + " | ZONE saves=" + N(g_zoneSaves) + " zoneSave[applied,notMine,staleCopyRefused,ownStore,readFail,writeFail,skippedOff,skippedSingle;viaFlush]=" + N(g_zoneWritten) + "," + N(g_zoneSkippedNotMine) + "," + N(g_zoneStaleCopyRefused) + "," + N(g_zoneOwnStore) + "," + N(g_zoneReadFail) + "," + N(g_zoneWriteFail) + "," + N(g_zoneSkippedOff) + "," + N(g_zoneSkippedSingle) + ";" + N(g_zoneSaveViaFlush) + "   (P6q: the first EIGHT are ZoneSaveApply's eight counted exits and sum to ZONE saves= above; viaFlush is a SPAN over all eight, not a ninth bucket - saves counted at entry while the post-teardown flush was running, of which zoneWriteAfterTeardownFlush were written) written=" + N(g_zoneWritten) + " skippedNotMine=" + N(g_zoneSkippedNotMine) + " zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + " recvOff=" + N(g_zoneRecvOff) + " loadOk=" + N(g_zoneLoadOk) + " loadFailed=" + N(g_zoneLoadFailed) + " zoneReadOffMain=" + N((long long)g_zoneReadOffMain) + " zoneSwapNoPeerFaction=" + N(g_zoneSwapNoPeerFaction) + " areaStandIns[made,failed]=" + N(g_areaStandInsMade) + "," + N(g_areaStandInsFailed)
              + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
@@ -20909,6 +21220,30 @@ int StoreTownPeoplePending(const char* townSid, int askSx, int askSy, char* hold
         return townpending::TownAnswer((int)areas.size(), 1);
     }
     return townpending::TownAnswer((int)areas.size(), 0);
+}
+/* TEST-ONLY (storetest verb), MAIN THREAD: storetest nopos <worldId or part of one> - the next SLEEP write of that group reads as if
+   no member of it were in the world and its platoon stood at 0,0, so a run can watch the record take a known position
+   (RecordPosChoose); storetest nopos next arms the next SLEEP write of any group. An exact worldId wins; else the first record here (in worldId order) whose id contains the text, else the
+   first group bound here. storetest nopos off disarms. [STORE] storetest lines. */
+std::string StoreTestCommand(const std::string& arg)
+{
+    const size_t sp = arg.find(' ');
+    const std::string op = sp == std::string::npos ? arg : arg.substr(0, sp);
+    std::string rest = sp == std::string::npos ? std::string() : arg.substr(sp + 1);
+    while (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+    if (op != "nopos" || rest.empty()) return "error storetest usage: storetest nopos <worldId or part of one> | storetest nopos off";
+    if (rest == "off") { g_recPosNoPosArmed.clear(); DebugLog("[STORE] storetest nopos off: nothing armed"); return "ok storetest nopos off"; }
+    if (rest == "next") { g_recPosNoPosArmed = "*"; DebugLog("[STORE] storetest nopos armed for the next SLEEP write of any group"); return "ok storetest nopos armed for the next SLEEP write"; }
+    std::string found;
+    if (g_records.count(rest) != 0) found = rest;
+    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); found.empty() && it != g_records.end(); ++it)
+        if (it->first.find(rest) != std::string::npos) found = it->first;
+    for (std::map<void*, std::string>::const_iterator bi = g_bind.begin(); found.empty() && bi != g_bind.end(); ++bi)
+        if (bi->second.find(rest) != std::string::npos) found = bi->second;
+    if (found.empty()) { DebugLog("[STORE] storetest nopos: no group here matches '" + rest + "' - nothing armed"); return "error storetest nopos: no group matches"; }
+    g_recPosNoPosArmed = found;
+    DebugLog("[STORE] storetest nopos armed for " + found);
+    return "ok storetest nopos armed for " + found;
 }
 /* TEST-ONLY (pendnote verb, T-580), MAIN THREAD: pendnote add <townSid> <x> <z> [stale|asleep] lists a test note of that town at world
    position (x, z) in decision 34's pending set, asked and listed as a notebook note this game has not placed is. Its id: none given -

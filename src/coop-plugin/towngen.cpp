@@ -4096,6 +4096,7 @@ void ReportTownGen()
 }
 } // namespace coop
 namespace coop { int TownGenTownSid(void* town, char* out, int cap) { return TownSidPod(town, out, cap); } }
+namespace coop { int TownGenTownPos(void* town, float* pos) { return (town == 0 || pos == 0) ? 0 : TownPosPod(town, pos); } }   /* see towngen.h */
 namespace coop { int TownGenResidentsGate(void* factory, void* building) { return T392ResidentsGate(factory, building); } }   /* T-392 (owner 335 a): see towngen.h */
 namespace coop { int TownGenPlatoonHomeKey(const void* platoon, char* out, int cap) { return T591HomeKey(platoon, out, cap); } }   /* see towngen.h */
 namespace coop { int TownGenGiveHomeTo(void* platoon, void* building) { return T591GiveHomeTo(platoon, building); } }   /* see towngen.h */

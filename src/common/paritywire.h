@@ -30,6 +30,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 #include "ownerwire.h"   /* inv6 phase 2: the owner tail after the items */
 #include "bagwire.h"    /* bag23 part 2: packs' contents after the owner tail (the BAGK form) */
 #include "groundkey.h"  /* the ground listing's keys, paired by ParityGroundPlan */
@@ -309,10 +310,12 @@ inline int DecodeParityReq(const char* p, size_t size, ParityReq* out)
    nothing listed pairs with (each is sent as a GROUND ADD; world loot never is) - left empty when `listingCut` != 0 (the asker
    left items out at its cap, so an unpaired holder item may be one it has); *gone: the listed ROAD rows nothing of the holder's
    pairs with (each is sent as a GROUND GONE; a listed row that is not road never is). A key that does not parse as a ground key
-   is in neither list. Returns the holder road items left unpaired that were kept out of *add because the listing was cut. */
+   is in neither list. Returns the holder road items left unpaired that were kept out of *add because the listing was cut.
+   *pairsOut (may be 0): every pair made, (holder index, asked index) - the holder tells the asker the name of a pair whose ids differ. */
 inline size_t ParityGroundPlan(const std::vector<ParityGroundRow>& holder, const std::vector<ParityGroundRow>& asked, int listingCut,
-                               std::vector<size_t>* add, std::vector<size_t>* gone)
+                               std::vector<size_t>* add, std::vector<size_t>* gone, std::vector<std::pair<size_t, size_t> >* pairsOut = 0)
 {
+    if (pairsOut != 0) pairsOut->clear();
     if (add == 0 || gone == 0) return 0;
     add->clear(); gone->clear();
     const size_t hn = holder.size(), an = asked.size();
@@ -351,7 +354,7 @@ inline size_t ParityGroundPlan(const std::vector<ParityGroundRow>& holder, const
                 const long long dy = coopground::GroundKeyDy(hp[i], ap[j]);
                 if (best == hn || coopground::GroundNearBetter(rk, dy, d, bestRank, bestDy, bestD) != 0) { best = i; bestRank = rk; bestDy = dy; bestD = d; }
             }
-            if (best < hn) { hUsed[best] = 1; aUsed[j] = 1; }
+            if (best < hn) { hUsed[best] = 1; aUsed[j] = 1; if (pairsOut != 0) pairsOut->push_back(std::make_pair(best, j)); }
         }
     }
     size_t held = 0;

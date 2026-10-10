@@ -12,6 +12,7 @@
 
 #include "session.h"
 #include "../handoff.h" // M-D: ApplyRemoteXfer / Ack
+#include "../../common/groundname.h"   /* T-693: the id kind on the ground item messages (IdKindPut / IdKindGet) */
 #include "../../common/holdwire.h"   /* P105 build 2 (protocol 126): HOLD / LAND, the 'HLD1' / 'LND1' / 'RQT1' trailers */
 #include "../../common/squadlead.h"   /* T-1 B1 restructure: MSG_SQUAD_LEAD encode / decode */
 /* T-1 B3 restructure (protocol 89): MSG_KEEPER and src/common/keeperwire.h retired - the squad's money rides MSG_SQUAD_LEAD */
@@ -159,7 +160,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 148;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 149;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 
 // A body has 7 parts in this build (T032/T033/T034, every character, both instances). The
 // cap is a bound on a network-supplied count, not a belief about anatomy - a peer claiming
@@ -2912,7 +2913,7 @@ static bool ItemMoveBytes(const coop::ItemMoveMsg& m, std::vector<char>& b, bool
     // E22c-2 (P7n): the key, then the instance id BESIDE it. The id is allowed to be empty - that is the
     // ordinary state in a shipped town - and the receiver never keys on it; it counts whether it agrees with
     // the building the position key found. Both fields sit before the op-2 base sid so that block stays last.
-    if (m.uid == 0) { PutStr(&b, m.boxKey); PutStr(&b, m.boxId); }
+    if (m.uid == 0) { PutStr(&b, m.boxKey); PutStr(&b, m.boxId); coopgname::IdKindPut(&b, m.idKind, m.idFor); }   /* T-693 (protocol 149): what the key is - bare, a name, or a name for the receiver's listed id */
     /* inv6 (protocol 71) + items9 (protocol 78): an ADD ends with [BAG1 - a pack's contents, a holder's GROUND ADD] [OWN1 - the stolen
        mark], each only when there is something (coopistat::EncodeAddTail; op 0 has no op-2 sid, so this tail is last). A block that
        will not encode is dropped - the item goes without it - rather than the move lost. */
@@ -3115,6 +3116,9 @@ static void OnItemMoveBody(const Message& m, const coophold::ReqTag* hdTag)
         // but a field that is not there at all is, because every protocol-41 sender writes it.
         if (!GetStr(m.payload, &at, &im.boxId))
         { ErrorLog("[net] ITEM_MOVE with owner uid 0 and no container id field - REFUSED"); return; }
+        /* T-693 (protocol 149): the id kind - cut, unknown, or a NAME FOR on anything but an ADD: REFUSED whole */
+        if (!coopgname::IdKindGet(m.payload, &at, &im.idKind, &im.idFor) || (im.idKind == coopgname::kIdNameFor && im.op != 0))
+        { ErrorLog("[net] ITEM_MOVE with owner uid 0 and a missing or bad id kind - REFUSED"); return; }
     }
     /* P7a fold 1: the op-2 base sid, if the sender put one there. OPTIONAL BY CONSTRUCTION - a sender that
        did not append it, or an entry whose fields could not be read, leaves this empty and the receiver's
@@ -3225,7 +3229,7 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
                   r.quality, r.charges, r.functionKind, r.level, r.unique);
     // E22c (P6e), as in SendItemMove: the owner half is a STORAGE BOX when its uid is 0, and its instance id
     // is the LAST thing in the payload so the give-fields block keeps the position protocol 37 gave it.
-    if (r.ownerUid == 0) { PutStr(&b, r.ownerBoxKey); PutStr(&b, r.ownerBoxId); }   /* E22c-2 (P7n): key, then the id beside it */
+    if (r.ownerUid == 0) { PutStr(&b, r.ownerBoxKey); PutStr(&b, r.ownerBoxId); coopgname::IdKindPut(&b, r.ownerIdKind == coopgname::kIdName ? coopgname::kIdName : coopgname::kIdBare, std::string()); }   /* E22c-2 (P7n): key, then the id beside it; T-693 (protocol 149): then whether the key is a name */
     if (r.takerUid == 0) PutStr(&b, r.takerBoxKey);   /* T-164 211 (protocol 98): the taker BOX's key (empty = no taker) */
     // E35 (P6o) / decision 41: AFTER the optional container key, so the key keeps the position protocol 38
     // gave it and this block is simply two more fields at the end. Both are UNCONDITIONAL - a trade flag of 0
@@ -4519,6 +4523,10 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
         // E22c-2 (P7n): the instance id beside it, empty allowed and absent not.
         if (!GetStr(m.payload, &at, &r.ownerBoxId))
         { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and no container id field - REFUSED"); return; }
+        /* T-693 (protocol 149): the id kind - bare or a name; anything else REFUSED whole */
+        std::string idFor;
+        if (!coopgname::IdKindGet(m.payload, &at, &r.ownerIdKind, &idFor) || r.ownerIdKind == coopgname::kIdNameFor)
+        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and a missing or bad id kind - REFUSED"); return; }
     }
     /* T-164 211 (protocol 98): a taker uid of 0 carries the taker BOX's key next - empty = no taker (a ground put that names none) */
     if (r.takerUid == 0 && !GetStr(m.payload, &at, &r.takerBoxKey))
@@ -4673,7 +4681,8 @@ static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand
             c.reason = (int)(unsigned char)m.payload[at + 4];
             at += 5;
             if (c.reason != coopground::kGroundReasonNotHolder && c.reason != coopground::kGroundReasonNotFound
-                && c.reason != coopground::kGroundReasonBusy && c.reason != coopground::kGroundReasonUnreadable)   /* inv5p1 fold: 3 busy, 4 unreadable */
+                && c.reason != coopground::kGroundReasonBusy && c.reason != coopground::kGroundReasonUnreadable   /* inv5p1 fold: 3 busy, 4 unreadable */
+                && c.reason != coopground::kGroundReasonUnknownName)   /* 5 the name is not known on the holder */
             { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with an unknown ground reason " + N((long long)c.reason) + " - REFUSED"); return; }
         }
     }

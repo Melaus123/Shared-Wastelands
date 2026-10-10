@@ -267,6 +267,9 @@ const int kGroundReasonNotHolder = 1, kGroundReasonNotFound = 2;
 /* inv5p1 fold (review-inv5p1 6/7): 3 = the holder is handing that item over (or picking it up) right now - ask again later;
    4 = the holder has the item but cannot read its fields or pack. Neither ever removes the requester's copy. */
 const int kGroundReasonBusy = 3, kGroundReasonUnreadable = 4;
+/* 5 = no item on the holder's ground carries the TAKE's name and the holder does not know that name left (a game started
+   again keeps no names) - the requester asks again and then keeps its copy; it never removes it (coopgshow::SettleAction). */
+const int kGroundReasonUnknownName = 5;
 
 /* P2/P3/P4 (inv5 phase 2): every engine road that puts an item on the ground goes through the ONE drop road (items.cpp GrNoteDrop ->
    the drain's GrOnDropFound). `from` names the road, for the counters and the log; the route is the same for all of them. */

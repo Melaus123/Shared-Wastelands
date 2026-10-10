@@ -54,9 +54,11 @@
 #include "../common/livechar.h"    /* may the mod call into a stored Character pointer */
 #include "../common/p124stop.h"   /* PROBE P124: a non-player copy's stop - the report reading and the overshoot measure */
 #include "../common/loadedzones.h"   /* the loaded set from the engine's active-zone list */
+#include "../common/recordpos.h"   /* T-694: which known position a record this game writes takes */
 #include "../common/lostcopy.h"   /* MSG_RESEND's bytes, the owner's verdict, the lost-copy book, the stale-row rule */
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
 #include "../common/chatwire.h"   /* in-game text chat - the message bytes, the words, Tab, search, the kept lines, chat.cfg */
+#include "../common/dupsquad.h"   /* the duplicate report over one squad record's engine bytes */
 #include "joinstage.h"        /* M11a S1 (T-197 piece #10): the join stage, the join gate, PLAYERS and JOIN_STAGE */
 #include "presence.h"         /* M11 C1 (T-197, to-do M11): is another player in this world; the area tie-break with no host */
 #include "arrivals.h"         /* M11 C2 (T-197, row M11): which other player has just entered the world */
@@ -140,6 +142,7 @@
 #include "givelate.h"     /* give1: the late-give removal, the cancel refunds, the confirmdelay parse */
 #include "itemescrow.h"   /* inv7c: the escrow state machine */
 #include "groundshow.h"   /* p105g-test: P105g - the shown ground pickup */
+#include "groundname.h"   /* ground items' shared names */
 #include "holdwire.h"     /* P105 build 2: HOLD / LAND - the trailers, the absorb rule, where a LAND goes, the answers */
 #include "ownpick.h"      /* P105: an own pickup out of a container this game writes - its removal published at once */
 #include "showmove.h"     /* T-164 non-shop road: the show-at-once decisions */
@@ -182,6 +185,7 @@
 #include "factionkey.h"   /* an NPC faction travels by its stringID */
 #include "u8path.h"   /* UTF-8 <-> UTF-16 for the wide file calls */
 #include "corpsedecay.h"   /* T-653: a copy's dead body is held short of the rot limit; its owner decides */
+#include "spawnpace.h"   /* T-599: copies made under a frame budget, in arrival order */
 
 #include <cstdio>
 #include <limits>   /* par24 */
@@ -23226,6 +23230,422 @@ void t_p25f2_inside_verdict()
     volatile double zero = 0.0; const double qn = zero / zero;
     if (InsideVerdict(1, 5, qn, 100.0) != kSaidStale) Fail("P25f2: an unreadable clock must be stale, never a keep");
 }
+/* ground items' shared names (groundname.h) */
+coopgname::NameTable g_t693Tab;
+coopgname::GoneMemory g_t693Gone;
+std::string T693Key(float x, float z, float y, coopground::GroundKeyParts* parts)
+{
+    char k[coopground::kGroundKeyCap]; k[0] = 0;
+    coopground::GroundKeyParts p;
+    std::memset(&p, 0, sizeof p);
+    coopground::GroundKeyCompose(k, (int)sizeof k, "2292-gamedata.base", 26, 40, x, y, z, &p);
+    if (parts != 0) *parts = p;
+    return std::string(k);
+}
+const void* T693Addr(int i) { return (const void*)(size_t)(0x10000 + (size_t)i * 16); }
+coopgname::LiveItem T693Live(int a, float x, float z, float y, int qty)
+{
+    coopgname::LiveItem li;
+    li.addr = T693Addr(a);
+    T693Key(x, z, y, &li.cur);
+    li.qty = qty; li.q100 = 100;
+    return li;
+}
+void t_t693_name_freeze_at_publish()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    coopground::GroundKeyParts p1, p2, p3;
+    const std::string k1 = T693Key(5460.0f, -9360.0f, 10.0f, &p1);
+    const std::string k2 = T693Key(5460.4f, -9360.0f, 10.2f, &p2);
+    const std::string k3 = T693Key(5461.0f, -9360.0f, 10.1f, &p3);
+    char out[coopground::kGroundKeyCap];
+    NameBind(&t, T693Addr(1), k1.c_str(), p1, 0);
+    if (NameOf(t, T693Addr(1), p1, out, (int)sizeof out) != 1 || k1 != out) Fail("T-693: an own drop is named by its key");
+    NameBind(&t, T693Addr(1), k2.c_str(), p2, 0);
+    if (NameOf(t, T693Addr(1), p2, out, (int)sizeof out) != 1 || k2 != out) Fail("T-693: before its first publish the name follows the item");
+    NameBind(&t, T693Addr(1), k2.c_str(), p2, 1);
+    NameBind(&t, T693Addr(1), k3.c_str(), p3, 1);
+    if (NameOf(t, T693Addr(1), p3, out, (int)sizeof out) != 1 || k2 != out) Fail("T-693: a published name is frozen - a later announce never renames");
+    NameBind(&t, T693Addr(1), k3.c_str(), p3, 0);
+    if (NameOf(t, T693Addr(1), p3, out, (int)sizeof out) != 1 || k2 != out) Fail("T-693: a frozen name survives an unfrozen bind");
+    if (t.n != 1) Fail("T-693: one item, one row");
+    coopground::GroundKeyParts far;
+    T693Key(5480.0f, -9360.0f, 10.0f, &far);
+    if (NameOf(t, T693Addr(1), far, out, (int)sizeof out) != 0) Fail("T-693: an address past the window names nothing (a reused address)");
+    NameBind(&t, T693Addr(1), T693Key(5480.0f, -9360.0f, 10.0f, 0).c_str(), far, 0);
+    if (NameOf(t, T693Addr(1), far, out, (int)sizeof out) != 1 || T693Key(5480.0f, -9360.0f, 10.0f, 0) != out) Fail("T-693: a reused address takes a fresh row, not the old name");
+}
+void t_t693_lookup_by_name_twins()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    coopground::GroundKeyParts pn, pm;
+    const std::string n = T693Key(5460.0f, -9360.0f, 10.0f, &pn);
+    const std::string m = T693Key(5470.0f, -9360.0f, 10.0f, &pm);
+    LiveItem live[4];
+    live[0] = T693Live(1, 5461.0f, -9360.0f, 10.0f, 1);   /* named n, settled 1 unit away */
+    live[1] = T693Live(2, 5459.5f, -9360.0f, 10.0f, 3);   /* named n too (a twin) */
+    live[2] = T693Live(3, 5470.0f, -9360.0f, 10.0f, 1);   /* named m */
+    live[3] = T693Live(4, 5460.0f, -9360.0f, 10.0f, 1);   /* unnamed, exactly at n's key */
+    NameBind(&t, live[0].addr, n.c_str(), live[0].cur, 1);
+    NameBind(&t, live[1].addr, n.c_str(), live[1].cur, 1);
+    NameBind(&t, live[2].addr, m.c_str(), live[2].cur, 1);
+    int how = 0;
+    if (NameLookup(t, live, 4, n.c_str(), 3, 100, 0, &how) != 1 || how != kHowName) Fail("T-693: twins under one name - the bag match picks the quantity");
+    if (NameLookup(t, live, 4, n.c_str(), 1, 100, 0, &how) != 0 || how != kHowName) Fail("T-693: twins under one name - quantity 1 picks the other");
+    if (NameLookup(t, live, 4, m.c_str(), 1, 100, 1, &how) != 2 || how != kHowName) Fail("T-693: found by name exactly, even exact-only");
+    int idx[4];
+    if (NameFindName(t, n.c_str(), idx, 4) != 2) Fail("T-693: two rows carry the twins' name");
+}
+void t_t693_near_refuses_other_name()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const std::string k = T693Key(5460.0f, -9360.0f, 10.0f, 0);
+    LiveItem live[3];
+    live[0] = T693Live(1, 5460.3f, -9360.0f, 10.0f, 1);   /* named otherwise, 0.3 units from k */
+    live[1] = T693Live(2, 5480.0f, -9360.0f, 10.0f, 1);   /* named otherwise, exactly at k2 */
+    NameBind(&t, live[0].addr, T693Key(5450.0f, -9360.0f, 10.0f, 0).c_str(), live[0].cur, 1);
+    NameBind(&t, live[1].addr, T693Key(5490.0f, -9360.0f, 10.0f, 0).c_str(), live[1].cur, 1);
+    int how = 9;
+    if (NameLookup(t, live, 2, k.c_str(), 1, 100, 0, &how) != -1 || how != kHowNone) Fail("T-693: a near match never lands on an item named otherwise");
+    if (NameLookup(t, live, 2, T693Key(5480.0f, -9360.0f, 10.0f, 0).c_str(), 1, 100, 0, &how) != -1) Fail("T-693: nor does an exact-key match");
+    live[2] = T693Live(3, 5460.4f, -9360.0f, 12.0f, 1);   /* unnamed, 0.4 units from k */
+    if (NameLookup(t, live, 3, k.c_str(), 1, 100, 0, &how) != 2 || how != kHowNear) Fail("T-693: an unnamed item near the key is found near");
+    if (NameLookup(t, live, 3, k.c_str(), 1, 100, 1, &how) != -1) Fail("T-693: exact-only finds no near item");
+}
+void t_t693_rebind_after_address_change()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    LiveItem was = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1);
+    const std::string n = T693Key(5459.0f, -9360.0f, 10.0f, 0);
+    NameBind(&t, was.addr, n.c_str(), was.cur, 1);
+    LiveItem live[2];
+    live[0] = T693Live(7, 5460.2f, -9360.0f, 10.0f, 1);   /* the same item after its zone loaded again: a new address, its place */
+    live[1] = T693Live(8, 5460.1f, -9360.1f, 10.0f, 1);   /* a fresh drop beside it - skipped */
+    const void* skip[1]; skip[0] = live[1].addr;
+    std::vector<NameChange> ch;
+    if (NameRebindPlan(t, live, 2, skip, 1, 1, &ch) != 1) Fail("T-693: one orphan, one re-bind");
+    if (!ch.empty()) NameApply(&t, &ch[0], (int)ch.size());
+    char out[coopground::kGroundKeyCap];
+    if (NameOf(t, live[0].addr, live[0].cur, out, (int)sizeof out) != 1 || n != out) Fail("T-693: the re-bound item carries its old name");
+    if (NameOf(t, live[1].addr, live[1].cur, out, (int)sizeof out) != 0) Fail("T-693: a pending drop is never re-bound");
+    /* another object at a bound address (another sid): its row is forgotten */
+    LiveItem other = live[0];
+    std::memset(&other.cur, 0, sizeof other.cur);
+    coopground::GroundKeyCompose(out, (int)sizeof out, "99-other.base", 26, 40, 5460.2f, 10.0f, -9360.0f, &other.cur);
+    NameRebindPlan(t, &other, 1, 0, 0, 0, &ch);
+    if (!ch.empty()) NameApply(&t, &ch[0], (int)ch.size());
+    if (NameAtAddr(t, live[0].addr) != -1) Fail("T-693: a bound address now holding another sid no longer names it");
+    if (NameOrphanCount(t) != 1) Fail("T-693: that row is an orphan (detached), offered to the item at its place");
+}
+void t_t693_table_overflow()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    t.dropped = 0;
+    coopground::GroundKeyParts p;
+    const std::string k = T693Key(5460.0f, -9360.0f, 10.0f, &p);
+    for (int i = 0; i <= kNameCap; ++i) NameBind(&t, T693Addr(100 + i), k.c_str(), p, 1);
+    if (t.n != kNameCap) Fail("T-693: the table holds kNameCap rows");
+    if (t.dropped != 1) Fail("T-693: one row dropped to make room, counted");
+    if (NameAtAddr(t, T693Addr(100)) != -1) Fail("T-693: the oldest row is the one dropped");
+    if (NameAtAddr(t, T693Addr(100 + kNameCap)) < 0 || NameAtAddr(t, T693Addr(101)) < 0) Fail("T-693: the newest and the second oldest stay");
+}
+void t_t693_reason_by_gone_memory()
+{
+    using namespace coopgname;
+    GoneMemory& m = g_t693Gone;
+    GoneClear(&m);
+    const std::string n = T693Key(5460.0f, -9360.0f, 10.0f, 0);
+    const std::string u = T693Key(5470.0f, -9360.0f, 10.0f, 0);
+    GoneNote(&m, n.c_str(), 1, 1000u);
+    GoneNote(&m, u.c_str(), 0, 1000u);
+    if (TakeMissReason(GoneHas(m, n.c_str(), 2000u)) != coopground::kGroundReasonNotFound) Fail("T-693: a name that left - reason 2");
+    if (TakeMissReason(GoneHas(m, T693Key(5460.3f, -9360.0f, 10.0f, 0).c_str(), 2000u)) != coopground::kGroundReasonUnknownName)
+        Fail("T-693: a named entry is matched exactly only - near it is reason 5");
+    if (TakeMissReason(GoneHas(m, T693Key(5470.3f, -9360.0f, 11.0f, 0).c_str(), 2000u)) != coopground::kGroundReasonNotFound)
+        Fail("T-693: an unnamed item that left is matched near, as before names - reason 2");
+    if (TakeMissReason(GoneHas(m, T693Key(5500.0f, -9360.0f, 10.0f, 0).c_str(), 2000u)) != coopground::kGroundReasonUnknownName)
+        Fail("T-693: a name not known here - reason 5");
+    if (GoneHas(m, n.c_str(), 1000u + kGoneKeepMs + 1u) != 0) Fail("T-693: the memory forgets after 10 minutes");
+    for (int i = 0; i < kGoneCap + 3; ++i) GoneNote(&m, T693Key(6000.0f + (float)i, -9360.0f, 10.0f, 0).c_str(), 1, 3000u);
+    if (m.overwritten != 5) Fail("T-693: a full memory overwrites the oldest, counted");
+}
+std::string T693NameOf(const coopgname::NameTable& t, const coopgname::LiveItem& li)
+{
+    char out[coopground::kGroundKeyCap];
+    if (coopgname::NameOf(t, li.addr, li.cur, out, (int)sizeof out) != 1) return std::string();
+    return std::string(out);
+}
+void T693Apply(coopgname::NameTable* t, const std::vector<coopgname::NameChange>& ch)
+{
+    if (!ch.empty()) coopgname::NameApply(t, &ch[0], (int)ch.size());
+}
+void t_t693_dead_name_never_rebinds()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const LiveItem dead = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1);
+    const std::string n = T693Key(5460.0f, -9360.0f, 10.0f, 0);
+    NameBind(&t, dead.addr, n.c_str(), dead.cur, 1);
+    LiveItem nb = T693Live(2, 5460.3f, -9360.0f, 10.0f, 1);   /* an unnamed neighbour of the same sid 0.3 units away */
+    std::vector<NameChange> ch;
+    if (NameRebindPlan(t, &nb, 1, 0, 0, 0, &ch) != 0) Fail("T-693: a row whose item left the ground (no zone taken apart) is never handed to a neighbour");
+    T693Apply(&t, ch);
+    if (NameOrphanCount(t) != 0 || !T693NameOf(t, nb).empty()) Fail("T-693: such a row is no orphan; the neighbour stays unnamed");
+    const void* held[1]; held[0] = dead.addr;
+    if (NameRebindPlan(t, &nb, 1, held, 1, 1, &ch) != 0) Fail("T-693: a held / escrowed item's row is never an orphan, even after a zone was taken apart");
+    T693Apply(&t, ch);
+    if (NameOrphanCount(t) != 0) Fail("T-693: a held item's row is not marked");
+    NameForgetAddr(&t, dead.addr);   /* the road that took the item off this ground for good forgets its row */
+    if (NameRebindPlan(t, &nb, 1, 0, 0, 1, &ch) != 0) Fail("T-693: a forgotten (dead) name never re-binds, whatever was taken apart");
+    /* control: the same row, missing when a zone was taken apart - an orphan, marked in one pass and handed on in a later one */
+    NameBind(&t, dead.addr, n.c_str(), dead.cur, 1);
+    if (NameRebindPlan(t, 0, 0, 0, 0, 1, &ch) != 0) Fail("T-693: nothing live: nothing re-bound");
+    T693Apply(&t, ch);
+    if (NameOrphanCount(t) != 1) Fail("T-693: a row missing after a zone was taken apart is marked an orphan");
+    if (NameRebindPlan(t, &nb, 1, 0, 0, 0, &ch) != 1) Fail("T-693: a marked orphan is handed on when its zone loads again");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, nb) != n || NameOrphanCount(t) != 0) Fail("T-693: the item back at a new address carries the old name; no orphan left");
+}
+void t_t693_bare_key_reaches_named()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const std::string cur = T693Key(5470.0f, -9360.0f, 10.0f, 0);    /* the key the item has where it lies here */
+    const std::string nm = T693Key(5455.0f, -9360.0f, 10.0f, 0);     /* its name: published 15 units away */
+    const std::string nearK = T693Key(5470.3f, -9360.0f, 10.4f, 0);  /* another game's key for it: 0.3 flat, 0.4 up */
+    LiveItem live[2];
+    live[0] = T693Live(1, 5470.0f, -9360.0f, 10.0f, 1);
+    NameBind(&t, live[0].addr, nm.c_str(), live[0].cur, 1);
+    int how = -1;
+    if (NameLookup(t, live, 1, cur.c_str(), 1, 100, 0, &how) != -1) Fail("T-693: a NAME id never lands on an item named otherwise");
+    if (NameLookup(t, live, 1, cur.c_str(), 1, 100, 0, &how, 1) != 0 || how != kHowKey) Fail("T-693: a bare-key TAKE reaches the named item by its exact key");
+    if (NameLookup(t, live, 1, nearK.c_str(), 1, 100, 0, &how, 1) != 0 || how != kHowNear) Fail("T-693: a bare-key TAKE reaches the named item within 0.5 flat");
+    if (NameLookup(t, live, 1, nearK.c_str(), 1, 100, 1, &how, 1) != -1) Fail("T-693: exact-only, a bare key finds no near item");
+    if (NameLookup(t, live, 1, nm.c_str(), 1, 100, 1, &how, 1) != 0 || how != kHowName) Fail("T-693: a bare id that is the item's name finds it by name");
+    if (T693NameOf(t, live[0]) != nm) Fail("T-693: the matched item's name is what names it from there on (kept row, GONE)");
+    /* a bare-key GONE from a holder that knows no names removes the named copy (GrFindRemovable runs this lookup, bare) */
+    if (NameLookup(t, live, 1, nearK.c_str(), 1, 100, 0, &how, 1) != 0) Fail("T-693: a bare-key GONE finds the named copy");
+    if (NameLookup(t, live, 1, nearK.c_str(), 1, 100, 0, &how, 0) != -1) Fail("T-693: the same key as a NAME does not");
+    live[1] = T693Live(2, 5470.0f, -9360.0f, 10.0f, 1);   /* an unnamed item at the very key */
+    if (NameLookup(t, live, 2, cur.c_str(), 1, 100, 0, &how, 1) != 1 || how != kHowKey) Fail("T-693: a bare key prefers the item carrying no name");
+    if (NameLookup(t, live, 2, nearK.c_str(), 1, 100, 0, &how, 1) != 1 || how != kHowNear) Fail("T-693: near too, the unnamed item first");
+}
+void t_t693_address_swap()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const LiveItem x = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1), y = T693Live(2, 5470.0f, -9360.0f, 10.0f, 1);
+    const std::string nx = T693Key(5459.0f, -9360.0f, 10.0f, 0), ny = T693Key(5469.0f, -9360.0f, 10.0f, 0);
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    NameBind(&t, y.addr, ny.c_str(), y.cur, 1);
+    LiveItem live[2];
+    live[0] = T693Live(1, 5470.0f, -9360.0f, 10.0f, 1);   /* the zone loaded again: x's old address now holds y */
+    live[1] = T693Live(2, 5460.0f, -9360.0f, 10.0f, 1);   /* and y's holds x */
+    std::vector<NameChange> ch;
+    if (NameRebindPlan(t, live, 2, 0, 0, 1, &ch) != 2) Fail("T-693: two swapped addresses: both re-bound");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, live[0]) != ny || T693NameOf(t, live[1]) != nx) Fail("T-693: after the swap each item carries its own name");
+    /* another sid at a bound address: the row is detached and offered to the item lying at its place */
+    NameClear(&t);
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    LiveItem l2[2];
+    l2[0] = x;
+    char kb[coopground::kGroundKeyCap];
+    coopground::GroundKeyCompose(kb, (int)sizeof kb, "99-other.base", 26, 40, 5460.0f, 10.0f, -9360.0f, &l2[0].cur);
+    l2[1] = T693Live(3, 5460.1f, -9360.0f, 10.0f, 1);
+    if (NameRebindPlan(t, l2, 2, 0, 0, 0, &ch) != 1) Fail("T-693: a row pushed off its address by another sid re-binds to its item");
+    T693Apply(&t, ch);
+    if (!T693NameOf(t, l2[0]).empty() || T693NameOf(t, l2[1]) != nx) Fail("T-693: the other-sid object carries nothing, the item at the place its name");
+    /* the same sid at the address 2 units off after the row's own address went missing (marked an orphan): the 0.5 fit detaches it */
+    NameClear(&t);
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    LiveItem l3[2];
+    l3[0] = T693Live(1, 5462.0f, -9360.0f, 10.0f, 1);
+    l3[1] = T693Live(4, 5460.2f, -9360.0f, 10.0f, 1);
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);
+    T693Apply(&t, ch);
+    if (NameOrphanCount(t) != 1) Fail("T-693: the row whose address went missing is marked an orphan");
+    if (NameRebindPlan(t, l3, 2, 0, 0, 0, &ch) != 1) Fail("T-693: a row whose own address went missing must fit within 0.5 units");
+    T693Apply(&t, ch);
+    if (!T693NameOf(t, l3[0]).empty() || T693NameOf(t, l3[1]) != nx) Fail("T-693: the name went to the item at its place, not the address");
+    /* an unrelated zone unload: a row whose address stayed live keeps the 5-unit window, and the pass refreshes its key */
+    NameClear(&t);
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    if (NameRebindPlan(t, l3, 2, 0, 0, 1, &ch) != 0) Fail("T-693: an unrelated unload: a live-address row 2 units off is not handed on");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, l3[0]) != nx || !T693NameOf(t, l3[1]).empty()) Fail("T-693: an unrelated unload: the live-address row keeps the 5-unit window");
+    {
+        const int ri = NameAtAddr(t, x.addr);
+        if (ri < 0 || coopground::GroundKeySame(t.row[ri].cur, l3[0].cur) == 0) Fail("T-693: the pass refreshed the live row's current key");
+    }
+    /* no zone taken apart: the 5-unit window keeps the item that rolled */
+    NameClear(&t);
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    if (NameRebindPlan(t, l3, 2, 0, 0, 0, &ch) != 0) Fail("T-693: nothing taken apart: no re-bind");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, l3[0]) != nx || !T693NameOf(t, l3[1]).empty()) Fail("T-693: nothing taken apart: the item that rolled 2 units keeps its name");
+}
+void t_t693_orphan_expiry()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const LiveItem x = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1);
+    const std::string nx = T693Key(5460.0f, -9360.0f, 10.0f, 0);
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    std::vector<NameChange> ch;
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);   /* its zone was taken apart and never loads again */
+    if (ch.size() != 1) { Fail("T-693: one row marked"); return; }
+    NameApply(&t, &ch[0], (int)ch.size(), 1000u);
+    if (NameOrphanCount(t) != 1) Fail("T-693: the row is an orphan");
+    if (NameExpireOrphans(&t, 1000u + kOrphanKeepMs - 1u) != 0 || NameOrphanCount(t) != 1) Fail("T-693: an orphan is kept for 10 minutes");
+    if (NameExpireOrphans(&t, 1000u + kOrphanKeepMs) != 1 || NameOrphanCount(t) != 0 || t.n != 0) Fail("T-693: an orphan nobody took back in 10 minutes is forgotten");
+    NameBind(&t, x.addr, nx.c_str(), x.cur, 1);
+    if (NameExpireOrphans(&t, 0xFFFFFFF0u) != 0 || t.n != 1) Fail("T-693: a row that is no orphan never expires");
+}
+void t_t693_name_for_check()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const LiveItem a = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1), b = T693Live(2, 5470.0f, -9360.0f, 10.0f, 1);
+    const std::string listed = T693Key(5460.0f, -9360.0f, 10.0f, 0), nm = T693Key(5459.5f, -9360.0f, 10.0f, 0), other = T693Key(5461.0f, -9360.0f, 10.0f, 0);
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 0) != kNfOk) Fail("T-693: NAME FOR an unnamed item, the name free: given");
+    const void* sk[2]; sk[0] = b.addr; sk[1] = a.addr;
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), sk, 2, 0) != kNfSkipped) Fail("T-693: NAME FOR refused on a skip-list address");
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), sk, 1, 0) != kNfOk) Fail("T-693: another address on the skip list does not refuse");
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 1) != kNfSkipped) Fail("T-693: NAME FOR refused on this game's own unconfirmed drop");
+    NameBind(&t, b.addr, nm.c_str(), b.cur, 1);
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 0) != kNfNameTaken) Fail("T-693: NAME FOR refused when another row carries the name (no second row with one name)");
+    NameClear(&t);
+    NameBind(&t, a.addr, other.c_str(), a.cur, 1);
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 0) != kNfOtherName) Fail("T-693: NAME FOR refused when the item carries a name other than the listed id");
+    NameClear(&t);
+    NameBind(&t, a.addr, listed.c_str(), a.cur, 1);
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 0) != kNfOk) Fail("T-693: NAME FOR an item carrying the listed id: given");
+    NameClear(&t);
+    NameBind(&t, a.addr, nm.c_str(), a.cur, 1);
+    if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 0) != kNfOk) Fail("T-693: NAME FOR an item already carrying that name: given (its own row)");
+}
+void t_t693_kept_id_match()
+{
+    using namespace coopgname;
+    const std::string nm = T693Key(5459.0f, -9360.0f, 10.0f, 0), bare = T693Key(5460.0f, -9360.0f, 10.0f, 0), far2 = T693Key(5480.0f, -9360.0f, 10.0f, 0);
+    char kn[coopground::kGroundKeyCap], ka[coopground::kGroundKeyCap];
+    NameCopy(kn, (int)sizeof kn, nm.c_str());
+    NameCopy(ka, (int)sizeof ka, bare.c_str());
+    if (KeptIdMatch(bare.c_str(), kn, ka) != 1) Fail("T-693: a bare repeat matches the kept row by the TAKE's own id");
+    if (KeptIdMatch(nm.c_str(), kn, ka) != 1) Fail("T-693: a repeat by name matches the kept row's name");
+    if (KeptIdMatch(far2.c_str(), kn, ka) != 0) Fail("T-693: another id matches neither");
+    ka[0] = 0;
+    if (KeptIdMatch(bare.c_str(), kn, ka) != 0) Fail("T-693: no own id kept: only the name matches");
+}
+void t_t693_nearest_pair_first()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    const LiveItem o1 = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1), o2 = T693Live(2, 5460.5f, -9360.0f, 10.0f, 1);
+    const std::string n1 = T693Key(5460.0f, -9360.0f, 10.0f, 0), n2 = T693Key(5460.5f, -9360.0f, 10.0f, 0);
+    NameBind(&t, o1.addr, n1.c_str(), o1.cur, 1);
+    NameBind(&t, o2.addr, n2.c_str(), o2.cur, 1);
+    LiveItem live[2];
+    live[0] = T693Live(11, 5460.3f, -9360.0f, 10.0f, 1);   /* 0.3 from o1, 0.2 from o2 - listed first */
+    live[1] = T693Live(12, 5460.6f, -9360.0f, 10.0f, 1);   /* 0.1 from o2, 0.6 from o1 (out of reach) */
+    std::vector<NameChange> ch;
+    if (NameRebindPlan(t, live, 2, 0, 0, 1, &ch) != 2) Fail("T-693: the nearest pair first - both items re-bound");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, live[1]) != n2 || T693NameOf(t, live[0]) != n1) Fail("T-693: the nearest pair is assigned first, not the first item listed");
+}
+void t_t693_more_than_16_twins()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    LiveItem live[20];
+    const std::string k = T693Key(5460.0f, -9360.0f, 10.0f, 0);
+    for (int i = 0; i < 20; ++i) live[i] = T693Live(10 + i, 5460.0f, -9360.0f, 10.0f, i + 1);
+    int how = -1;
+    int r = NameLookup(t, live, 20, k.c_str(), 5, 100, 0, &how);
+    if (r < 0 || r >= 20 || how != kHowKey || live[r].qty != 5) Fail("T-693: 20 unnamed twins - the exact key's bag match");
+    r = NameLookup(t, live, 20, k.c_str(), 19, 100, 0, &how);
+    if (r < 0 || r >= 16 || how != kHowKey) Fail("T-693: past 16 twins only the first 16 are weighed, one is still found");
+    for (int i = 0; i < 20; ++i) NameBind(&t, live[i].addr, k.c_str(), live[i].cur, 1);
+    r = NameLookup(t, live, 20, k.c_str(), 7, 100, 1, &how);
+    if (r < 0 || r >= 20 || how != kHowName || live[r].qty != 7) Fail("T-693: 20 twins under one name - the name's bag match");
+    r = NameLookup(t, live, 20, k.c_str(), 7, 100, 0, &how, 1);
+    if (r < 0 || how != kHowName) Fail("T-693: 20 twins - a bare id that is their name finds them by name");
+    std::vector<NameChange> ch;
+    if (NameRebindPlan(t, live, 20, 0, 0, 1, &ch) != 0) Fail("T-693: 20 named twins, all live: nothing to re-bind");
+}
+void t_t693_id_kind_wire()
+{
+    using namespace coopgname;
+    const std::string listed = T693Key(5460.0f, -9360.0f, 10.0f, 0);
+    std::vector<char> b;
+    IdKindPut(&b, kIdBare, std::string());
+    IdKindPut(&b, kIdName, std::string());
+    IdKindPut(&b, kIdNameFor, listed);
+    IdKindPut(&b, kIdNameFor, std::string());   /* a NAME FOR with nothing listed goes as a NAME */
+    if (b.size() != (size_t)(1 + 1 + 1 + 4 + listed.size() + 1)) Fail("T-693: the id kind's bytes");
+    size_t at = 0; int k = -1; std::string f;
+    if (IdKindGet(b, &at, &k, &f) != 1 || k != kIdBare || !f.empty()) Fail("T-693: BARE read back");
+    if (IdKindGet(b, &at, &k, &f) != 1 || k != kIdName || !f.empty()) Fail("T-693: NAME read back");
+    if (IdKindGet(b, &at, &k, &f) != 1 || k != kIdNameFor || f != listed) Fail("T-693: NAME FOR read back with its listed id");
+    if (IdKindGet(b, &at, &k, &f) != 1 || k != kIdName || at != b.size()) Fail("T-693: an empty NAME FOR read back as NAME, at the end");
+    if (IdKindGet(b, &at, &k, &f) != 0) Fail("T-693: no byte left: malformed");
+    std::vector<char> bad(1, (char)3);
+    at = 0;
+    if (IdKindGet(bad, &at, &k, &f) != 0 || at != 0) Fail("T-693: an unknown kind is malformed and reads nothing");
+    std::vector<char> cut;
+    IdKindPut(&cut, kIdNameFor, listed);
+    cut.pop_back();
+    at = 0;
+    if (IdKindGet(cut, &at, &k, &f) != 0) Fail("T-693: a cut NAME FOR is malformed");
+    std::vector<char> zero(5, (char)0);
+    zero[0] = (char)kIdNameFor;
+    at = 0;
+    if (IdKindGet(zero, &at, &k, &f) != 0) Fail("T-693: a NAME FOR with an empty listed id is malformed");
+}
+void t_t693_catchup_pairs_named()
+{
+    std::vector<cooppar::ParityGroundRow> holder(1), asked(1);
+    holder[0].key = T693Key(5455.0f, -9360.0f, 10.0f, 0); holder[0].qty = 1; holder[0].q100 = 100; holder[0].road = 1;   /* the holder's name */
+    asked[0].key = T693Key(5455.3f, -9360.0f, 10.4f, 0); asked[0].qty = 1; asked[0].q100 = 100; asked[0].road = 0;     /* a rejoined game's key for it */
+    std::vector<size_t> add, gone;
+    std::vector<std::pair<size_t, size_t> > pairs;
+    cooppar::ParityGroundPlan(holder, asked, 0, &add, &gone, &pairs);
+    if (!add.empty() || !gone.empty()) Fail("T-693: catch-up - the pair needs no ADD and no GONE");
+    if (pairs.size() != 1 || pairs[0].first != 0 || pairs[0].second != 0) Fail("T-693: catch-up - the pair is reported, so the holder can name the asker's copy");
+    if (holder[0].key == asked[0].key) Fail("T-693: catch-up - the pair's ids differ (the case that is named)");
+}
+void t_t693_reason5_never_removes()
+{
+    using namespace coopgshow;
+    using namespace coopground;
+    for (int tries = 0; tries <= 20; ++tries)
+        for (int uh = 0; uh < 2; ++uh)
+            for (int uw = 0; uw < 2; ++uw)
+                for (int mn = 0; mn < 2; ++mn)
+                    if (SettleAction(0, kGroundReasonUnknownName, uh, uw, mn, tries) == kSgRemove) Fail("T-693: reason 5 never takes the picker's copy back out");
+    if (SettleAction(0, kGroundReasonUnknownName, 0, 0, 0, 0) != kSgReask) Fail("T-693: reason 5 is asked again");
+    if (SettleAction(0, kGroundReasonUnknownName, 0, 0, 0, kReaskMax) != kSgKeepStop) Fail("T-693: reason 5 past the cap - the picker keeps it");
+    if (CapCounts(kGroundReasonUnknownName) != 1) Fail("T-693: reason 5 counts toward the cap, as reason 4");
+}
+
 /* P105g: the shown ground pickup (groundshow.h) */
 void t_p105g_pick_took()
 {
@@ -35720,6 +36140,689 @@ void t_t677_purse_after_act()
     if (TalkPurseAfterAct(250, two, one) != 150) Fail("more types than values: only the pairs count");
 }
 
+/* ===== the duplicate report (src/common/dupsquad.h) ===== */
+struct DupW
+{
+    std::vector<unsigned char> b;
+    void I(int v) { unsigned char t[4]; std::memcpy(t, &v, 4); b.insert(b.end(), t, t + 4); }
+    void F(float v) { unsigned char t[4]; std::memcpy(t, &v, 4); b.insert(b.end(), t, t + 4); }
+    void S(const std::string& v) { I((int)v.size()); b.insert(b.end(), v.begin(), v.end()); }
+};
+typedef std::vector<std::pair<std::string, int> > DupInts;
+typedef std::vector<std::pair<std::string, std::string> > DupStrs;
+/* One record in the engine's layout: bools and ints as given, a Skin Tone when skin >= 0, strings, a race
+   reference when race is not empty, and one instance per entry (the squad's member entries). */
+void DupRec(DupW& w, int type, const std::string& sid, const DupInts& bools, const DupInts& ints, float skin, const DupStrs& strs,
+            const std::string& race, const std::vector<std::vector<std::string> >& entries)
+{
+    size_t k;
+    w.I((int)entries.size()); w.I(type); w.I(0); w.S("0"); w.S(sid); w.I(0);
+    w.I((int)bools.size()); for (k = 0; k < bools.size(); ++k) { w.S(bools[k].first); w.b.push_back((unsigned char)bools[k].second); }
+    w.I(0);
+    w.I((int)ints.size()); for (k = 0; k < ints.size(); ++k) { w.S(ints[k].first); w.I(ints[k].second); }
+    if (skin >= 0.0f) { w.I(1); w.S("Skin Tone"); w.F(skin); w.F(skin); w.F(skin); } else w.I(0);
+    w.I(0);
+    w.I((int)strs.size()); for (k = 0; k < strs.size(); ++k) { w.S(strs[k].first); w.S(strs[k].second); }
+    w.I(0);
+    if (!race.empty()) { w.I(1); w.S("race"); w.I(1); w.S(race); w.I(0); w.I(0); w.I(0); } else w.I(0);
+    w.I((int)entries.size());
+    for (k = 0; k < entries.size(); ++k)
+    {
+        w.S("e"); w.S("template"); for (int f = 0; f < 7; ++f) w.F(0.0f);
+        w.I((int)entries[k].size()); for (size_t q = 0; q < entries[k].size(); ++q) w.S(entries[k][q]);
+    }
+}
+void DupHandle(DupInts* ints, const std::string& pre, int s, int i)
+{
+    ints->push_back(std::make_pair(pre + "TYPE", 1)); ints->push_back(std::make_pair(pre + "C", 92));
+    ints->push_back(std::make_pair(pre + "CS", 7)); ints->push_back(std::make_pair(pre + "S", s)); ints->push_back(std::make_pair(pre + "I", i));
+}
+/* A member: its character (36) and appearance (66) records; returns its entry (the two record ids). */
+std::vector<std::string> DupMember(DupW& w, int no, const std::string& name, int portrait, const std::string& head, int hs, int hi, bool leader,
+                                   const std::string& slaverOf, int slS, int slI)
+{
+    char a[32], b[32]; std::sprintf(a, "%d--INGAME", 100 + 2 * no); std::sprintf(b, "%d--INGAME", 101 + 2 * no);
+    DupInts bools; bools.push_back(std::make_pair(std::string("is leader"), leader ? 1 : 0));
+    DupInts ints; ints.push_back(std::make_pair(std::string("portrait_serial"), portrait)); DupHandle(&ints, "handle", hs, hi);
+    DupHandle(&ints, "slaver", slaverOf.empty() ? 0 : slS, slaverOf.empty() ? 0 : slI);
+    DupStrs strs; strs.push_back(std::make_pair(std::string("name"), name));
+    DupRec(w, 36, a, bools, ints, -1.0f, strs, "", std::vector<std::vector<std::string> >());
+    DupInts ab; ab.push_back(std::make_pair(std::string("sex female"), 0));
+    DupStrs as; as.push_back(std::make_pair(std::string("head"), head)); as.push_back(std::make_pair(std::string("hair style"), std::string("2172-gamedata.base")));
+    DupRec(w, 66, b, ab, DupInts(), 0.5f, as, "5276-chareditor.mod", std::vector<std::vector<std::string> >());
+    std::vector<std::string> e; e.push_back(a); e.push_back(b); return e;
+}
+/* A whole file: the header, the given records, then the squad record. */
+std::vector<unsigned char> DupFile(DupW& recs, int nrecs, const std::vector<std::vector<std::string> >& entries)
+{
+    DupW sq; DupRec(sq, 30, "99--INGAME", DupInts(), DupInts(), -1.0f, DupStrs(), "", entries);
+    DupW f; f.I(15); f.I(200); f.I(nrecs + 1);
+    f.b.insert(f.b.end(), recs.b.begin(), recs.b.end()); f.b.insert(f.b.end(), sq.b.begin(), sq.b.end());
+    return f.b;
+}
+/* A member with all six records (character 36, AI 67, inventory 41, medical 57, stats 25, appearance 66) and one
+   item (42) in its inventory, owned by the member's own handle. `at` is its place in the squad (its record ids and
+   handle index), `who` picks one of four invented people; copies of one person differ only in those. */
+std::vector<std::string> DupMember6(DupW& w, int at, int who, bool leader)
+{
+    char id[7][32];
+    for (int k = 0; k < 7; ++k) std::sprintf(id[k], "%d--INGAME", 300 + 10 * at + k);
+    const char* names[4] = { "Test Person A", "Test Person B", "Test Person C", "Test Person D" };
+    char head[32]; std::sprintf(head, "%d-test.mod", 10 + who);
+    const std::vector<std::vector<std::string> > none;
+    DupInts bools; bools.push_back(std::make_pair(std::string("is leader"), leader ? 1 : 0));
+    DupInts ints; ints.push_back(std::make_pair(std::string("portrait_serial"), 1000 + who)); DupHandle(&ints, "handle", 4000 + who, at + 1);
+    DupHandle(&ints, "slaver", 0, 0);
+    DupStrs strs; strs.push_back(std::make_pair(std::string("name"), std::string(names[who])));
+    strs.push_back(std::make_pair(std::string("owner faction ID"), std::string("1-test.mod")));
+    DupRec(w, 36, id[0], bools, ints, -1.0f, strs, "", none);
+    DupInts ai; ai.push_back(std::make_pair(std::string("jobs"), 1));
+    DupRec(w, 67, id[1], ai, DupInts(), -1.0f, DupStrs(), "", none);
+    std::vector<std::vector<std::string> > bag(1, std::vector<std::string>(1, std::string(id[6])));
+    DupRec(w, 41, id[2], DupInts(), DupInts(), -1.0f, DupStrs(), "", bag);
+    DupInts med; med.push_back(std::make_pair(std::string("dead"), 0));
+    DupRec(w, 57, id[3], med, DupInts(), -1.0f, DupStrs(), "", none);
+    DupRec(w, 25, id[4], DupInts(), DupInts(), -1.0f, DupStrs(), "", none);
+    DupInts ab; ab.push_back(std::make_pair(std::string("sex female"), who == 1 ? 1 : 0));
+    DupStrs as; as.push_back(std::make_pair(std::string("head"), std::string(head))); as.push_back(std::make_pair(std::string("hair style"), std::string("2-test.mod")));
+    DupRec(w, 66, id[5], ab, DupInts(), 0.25f + 0.1f * (float)who, as, "3-test.mod", none);
+    DupInts item; DupHandle(&item, "ownedby", 4000 + who, at + 1);
+    DupStrs is; is.push_back(std::make_pair(std::string("base data sid"), std::string("4-test.mod")));
+    DupRec(w, 42, id[6], DupInts(), item, -1.0f, is, "", none);
+    std::vector<std::string> e;
+    for (int k = 0; k < 6; ++k) e.push_back(id[k]);   /* in the engine's order: 36, 67, 41, 57, 25, 66 */
+    return e;
+}
+void t_t676_dup_report()
+{
+    using namespace dupsquad;
+    /* The doubled shape: 4 people written twice, the copies interleaved at (0,1), (2,5), (3,6), (4,7) - so keeping
+       the first half would be wrong - and only copy 0 of the first pair is the squad's leader. Each member has all
+       six records, and its inventory holds an item owned by the member itself (not a link from elsewhere). */
+    std::vector<unsigned char> fx;
+    {
+        const int person[8] = { 0, 0, 1, 2, 3, 1, 2, 3 };
+        DupW w; std::vector<std::vector<std::string> > e;
+        for (int at = 0; at < 8; ++at) e.push_back(DupMember6(w, at, person[at], at == 0));
+        fx = DupFile(w, 8 * 7, e);
+    }
+    Report r;
+    Analyse(&fx[0], fx.size(), &r);
+    if (r.state != kSquad) { Fail("dup: the doubled squad did not read"); return; }
+    if (r.members != 8 || r.groups != 4 || r.wouldRemove != 4 || r.cleanK != 2 || r.largest != 2)
+        Fail("dup: the doubled squad must read members=8 groups=4 would remove=4 clean 2x");
+    if (r.leaderLinks != 1 || r.linkedCopies != 1 || r.linkedRemoved != 0 || r.handleLinks != 0 || r.idLinks != 0)
+        Fail("dup: the doubled squad's one link is its leader copy, which a trim can keep");
+    Totals t; Add(&t, r);
+    std::string line;
+    if (!RecordLine("Test_Squad", r, &line) || line.find("[DUP] Test_Squad: members=8 groups=4 would remove=4 shape=clean 2x referred=0") != 0)
+        Fail("dup: the record line is " + line);
+    SummaryLine(t, &line);
+    if (line.find("[DUP] report: 1 squad records read, 1 have duplicate members (1 clean (2x: 1), 0 partial), 4 members a trim would remove,"
+                  " 0 of them referred to inside their own record, 0 unreadable") != 0)
+        Fail("dup: the summary line is " + line);
+    /* Any damage reads as unreadable and reports nothing. */
+    Analyse(&fx[0], fx.size() - 1, &r);
+    if (r.state != kUnreadable || r.members != 0 || r.groups != 0) Fail("dup: a buffer one byte short was not unreadable");
+    Analyse(&fx[0], fx.size() / 2, &r);
+    if (r.state != kUnreadable) Fail("dup: a buffer cut in half was not unreadable");
+    { std::vector<unsigned char> more(fx); more.push_back(0); Analyse(&more[0], more.size(), &r); if (r.state != kUnreadable) Fail("dup: a byte left over was not unreadable"); }
+    Analyse(&fx[0], 0, &r);
+    if (r.state != kUnreadable) Fail("dup: an empty buffer was not unreadable");
+    {
+        /* a zone file's closing list (a count, then that many ints) is read; a list one int short is not */
+        DupW z; z.b = fx; z.I(3); z.I(1); z.I(2); z.I(3);
+        Analyse(&z.b[0], z.b.size(), &r);
+        if (r.state != kSquad || r.groups != 4) Fail("dup: a file with a zone's closing list did not read");
+        Analyse(&z.b[0], z.b.size() - 4, &r);
+        if (r.state != kUnreadable) Fail("dup: a closing list one int short was not unreadable");
+    }
+    Add(&t, r);
+    if (t.unreadable != 1 || t.squads != 1) Fail("dup: an unreadable record was counted as read");
+    if (!RecordLine("x", r, &line) || line.find("unreadable") == std::string::npos) Fail("dup: an unreadable record has no line");
+
+    /* Two different people sharing one portrait_serial never group. */
+    {
+        DupW w; std::vector<std::vector<std::string> > e;
+        e.push_back(DupMember(w, 0, "Ana", 555, "5345-chareditor.mod", 10, 1, false, "", 0, 0));
+        e.push_back(DupMember(w, 1, "Bo", 555, "5345-chareditor.mod", 10, 2, false, "", 0, 0));
+        e.push_back(DupMember(w, 2, "Ana", 555, "5338-chareditor.mod", 10, 3, false, "", 0, 0));
+        const std::vector<unsigned char> b = DupFile(w, 6, e);
+        Analyse(&b[0], b.size(), &r);
+        if (r.state != kSquad || r.members != 3) Fail("dup: the synthetic squad did not read");
+        else if (r.groups != 0 || r.wouldRemove != 0) Fail("dup: people sharing only a portrait_serial (or a name and portrait) were grouped");
+        if (RecordLine("s", r, &line)) Fail("dup: a record with no duplicates has a line");
+    }
+    /* A partial shape, and the links: B's slaver handle names A's second copy; then A's first copy leads. */
+    for (int lead = 0; lead < 2; ++lead)
+    {
+        DupW w; std::vector<std::vector<std::string> > e;
+        e.push_back(DupMember(w, 0, "Ana", 555, "5345-chareditor.mod", 10, 1, lead == 1, "", 0, 0));
+        e.push_back(DupMember(w, 1, "Ana", 555, "5345-chareditor.mod", 10, 2, false, "", 0, 0));
+        e.push_back(DupMember(w, 2, "Bo", 777, "5345-chareditor.mod", 10, 3, false, "slaver", 10, 2));
+        const std::vector<unsigned char> b = DupFile(w, 6, e);
+        Analyse(&b[0], b.size(), &r);
+        if (r.state != kSquad || r.members != 3 || r.groups != 1 || r.wouldRemove != 1 || r.cleanK != 0) Fail("dup: a 2+1 squad is not one group, partial");
+        if (r.handleLinks != 1) Fail("dup: a slaver handle naming a copy was not seen");
+        if (lead == 0 && (r.linkedCopies != 1 || r.linkedRemoved != 0)) Fail("dup: one linked copy - a trim keeps it");
+        if (lead == 1 && (r.linkedCopies != 2 || r.linkedRemoved != 1 || r.leaderLinks != 1)) Fail("dup: two linked copies - a trim must remove one");
+        if (lead == 1 && (!RecordLine("p", r, &line) || line.find("shape=partial referred=1") == std::string::npos)) Fail("dup: the partial line is " + line);
+    }
+    /* A record id named by another record links; a readable file with no squad record is not a squad. */
+    {
+        DupW w; std::vector<std::vector<std::string> > e;
+        e.push_back(DupMember(w, 0, "Ana", 555, "5345-chareditor.mod", 10, 1, false, "", 0, 0));
+        e.push_back(DupMember(w, 1, "Ana", 555, "5345-chareditor.mod", 10, 2, false, "", 0, 0));
+        DupStrs st; st.push_back(std::make_pair(std::string("carrier"), std::string("102--INGAME")));
+        DupRec(w, 42, "150--INGAME", DupInts(), DupInts(), -1.0f, st, "", std::vector<std::vector<std::string> >());
+        const std::vector<unsigned char> b = DupFile(w, 5, e);
+        Analyse(&b[0], b.size(), &r);
+        if (r.state != kSquad || r.cleanK != 2 || r.idLinks != 1 || r.linkedCopies != 1) Fail("dup: a record id naming a copy was not seen");
+        DupW n; n.I(15); n.I(1); n.I(1);
+        DupRec(n, 35, "1--INGAME", DupInts(), DupInts(), -1.0f, DupStrs(), "", std::vector<std::vector<std::string> >());
+        Analyse(&n.b[0], n.b.size(), &r);
+        if (r.state != kNotSquad) Fail("dup: a building record read as a squad");
+        DupW z; z.I(15); z.I(2); z.I(2);
+        DupRec(z, 4, "1--INGAME", DupInts(), DupInts(), -1.0f, DupStrs(), "", std::vector<std::vector<std::string> >());
+        DupRec(z, 30, "2--INGAME", DupInts(), DupInts(), -1.0f, DupStrs(), "", std::vector<std::vector<std::string> >(1, std::vector<std::string>(1, "1--INGAME")));
+        Analyse(&z.b[0], z.b.size(), &r);
+        if (r.state != kNotSquad) Fail("dup: a squad record naming no character read as a squad");
+    }
+}
+
+/* T-599 PaceDecide: only a SPAWN that makes a new copy is ever held; never before the frame's first copy; held once the
+   frame's drain time reaches the budget. */
+void t_t599_pace_decide()
+{
+    using namespace spawnpace;
+    if (PaceDecide(0, 5, 99999, kFrameBudgetUs) != kPaceGo) Fail("a repeat SPAWN or another message is never held");
+    if (PaceDecide(1, 0, 99999, kFrameBudgetUs) != kPaceGo) Fail("the frame's first copy is always made, however long the frame");
+    if (PaceDecide(1, 1, kFrameBudgetUs - 1, kFrameBudgetUs) != kPaceGo) Fail("under the budget: made");
+    if (PaceDecide(1, 1, kFrameBudgetUs, kFrameBudgetUs) != kPaceWait) Fail("at the budget: held");
+    if (PaceDecide(1, 3, kFrameBudgetUs + 500, kFrameBudgetUs) != kPaceWait) Fail("over the budget: held");
+    if (PaceDecide(1, 1, 0, -5) != kPaceWait) Fail("a negative budget reads as 0: one copy a frame");
+    if (kFrameBudgetUs != 4000) Fail("the budget is 4 ms");
+}
+
+/* T-599 the burst book: FrameNoteSpawn classifies; a burst opens on a made copy, holds while entries wait, ends on the first
+   empty frame without counting it, and counts a trailing frame that applied only repeats. */
+void t_t599_pace_burst()
+{
+    using namespace spawnpace;
+    PaceFrame f; FrameReset(&f);
+    FrameNoteSpawn(&f, 0, 1); FrameNoteSpawn(&f, 1, 1); FrameNoteSpawn(&f, 0, 0); FrameNoteSpawn(&f, 0, 1);
+    if (f.applied != 4 || f.made != 2 || f.repeat != 1 || f.notMade != 1) Fail("FrameNoteSpawn tallies");
+    Burst b; BurstReset(&b);
+    PaceFrame idle; FrameReset(&idle);
+    if (BurstFrame(&b, idle) != 0 || b.open != 0) Fail("an idle frame opens nothing");
+    PaceFrame rep; FrameReset(&rep); FrameNoteSpawn(&rep, 1, 1);
+    if (BurstFrame(&b, rep) != 0 || b.open != 0) Fail("a frame of repeats alone opens nothing");
+    f.usedUs = 4100; f.waited = 1; f.left = 1;
+    if (BurstFrame(&b, f) != 0 || b.open != 1 || b.frames != 1 || b.waits != 1 || b.worstUs != 4100) Fail("a frame that made copies and held one opens the burst");
+    PaceFrame g; FrameReset(&g); g.left = 1; g.usedUs = 300;
+    if (BurstFrame(&b, g) != 0 || b.frames != 2) Fail("a frame with entries still queued keeps it open");
+    PaceFrame h; FrameReset(&h); FrameNoteSpawn(&h, 0, 1); h.usedUs = 5000;
+    if (BurstFrame(&b, h) != 0 || b.made != 3 || b.worstUs != 5000) Fail("the last copy's frame");
+    if (BurstFrame(&b, idle) != 1 || b.frames != 3) Fail("the first empty frame ends it, uncounted");
+    if (b.applied != 5 || b.repeat != 1 || b.notMade != 1) Fail("burst totals");
+    BurstReset(&b);
+    PaceFrame one; FrameReset(&one); FrameNoteSpawn(&one, 0, 1);
+    if (BurstFrame(&b, one) != 0) Fail("one copy, queue empty: open until the next frame");
+    if (BurstFrame(&b, rep) != 1 || b.frames != 2 || b.repeat != 1) Fail("a trailing frame of repeats that empties the queue ends it, counted");
+}
+
+/* T-599 the held list, simulated: 830 SPAWNs arrive in one frame with a MOVE for an already-made copy among them, a STATE and
+   a DESPAWN for a held character, a catch-up END after the last SPAWN, and one MOVE for the made copy every later frame. Each copy
+   costs 2 ms. The MOVEs apply in the frame they arrive (before the held SPAWNs); the STATE and DESPAWN apply right after their
+   character's SPAWN, in the same frame; the END applies after every SPAWN that came before it; every copy is made, at least
+   one a frame. */
+struct T599Msg { int kind; unsigned int uid; };
+struct T599Ev { int frame; int kind; unsigned int uid; };
+void t_t599_pace_held()
+{
+    using namespace spawnpace;
+    enum { kSpawn = 0, kMove = 1, kState = 2, kDespawn = 3, kEnd = 4 };
+    std::vector<T599Msg> first;
+    unsigned int u;
+    { T599Msg m; m.kind = kMove; m.uid = 1; first.push_back(m); }
+    for (u = 1001; u <= 1830; ++u)
+    {
+        T599Msg m; m.kind = kSpawn; m.uid = u; first.push_back(m);
+        if (u == 1100) { T599Msg mv; mv.kind = kMove; mv.uid = 1; first.push_back(mv); }
+        if (u == 1600) { T599Msg st; st.kind = kState; st.uid = 1500; first.push_back(st); T599Msg de; de.kind = kDespawn; de.uid = 1500; first.push_back(de); }
+    }
+    { T599Msg m; m.kind = kEnd; m.uid = 0; first.push_back(m); }
+    { T599Msg m; m.kind = kMove; m.uid = 1; first.push_back(m); }
+    std::map<unsigned int, int> exists; exists[1] = 1;
+    std::vector<T599Msg> store; std::vector<T599Ev> log;
+    HeldBook book;
+    int frame = 0, made = 0, frameNoCopyWhileHeld = 0;
+    long long worst = 0;
+    for (frame = 1; frame <= 2000; ++frame)
+    {
+        long long used = 0, madeNow = 0;
+        HeldPassState st;
+        size_t i = 0;
+        while (i < book.rows.size())
+        {
+            const HeldRow r = book.rows[i];
+            if (HeldStep(book, r, &st, madeNow, used, kFrameBudgetUs) != kHeldApply) { ++i; continue; }
+            HeldTake(&book, i);
+            const T599Msg m = store[(size_t)r.ticket];
+            if (m.kind == kSpawn) { exists[m.uid] = 1; used += 2000; ++madeNow; ++made; }
+            if (m.kind == kDespawn) exists.erase(m.uid);
+            T599Ev e; e.frame = frame; e.kind = m.kind; e.uid = m.uid; log.push_back(e);
+        }
+        std::vector<T599Msg> in;
+        if (frame == 1) in = first;
+        else if (frame <= 500) { T599Msg m; m.kind = kMove; m.uid = 1; in.push_back(m); }
+        for (i = 0; i < in.size(); ++i)
+        {
+            const T599Msg m = in[i];
+            const int newCopy = (m.kind == kSpawn && exists.find(m.uid) == exists.end()) ? 1 : 0;
+            const int route = Route(book, newCopy, m.kind == kEnd ? 0u : m.uid, m.kind == kEnd ? 1 : 0, madeNow, used, kFrameBudgetUs);
+            if (route != kRouteApply)
+            {
+                store.push_back(m);
+                HeldPut(&book, route == kRouteHoldSpawn ? kKindSpawn : (route == kRouteFollow ? kKindFollow : kKindBarrier), m.kind == kEnd ? 0u : m.uid, (long long)store.size() - 1);
+                continue;
+            }
+            if (m.kind == kSpawn) { exists[m.uid] = 1; used += 2000; ++madeNow; ++made; }
+            if (m.kind == kDespawn) exists.erase(m.uid);
+            T599Ev e; e.frame = frame; e.kind = m.kind; e.uid = m.uid; log.push_back(e);
+        }
+        if (madeNow < 1 && book.spawns > 0) frameNoCopyWhileHeld = 1;
+        if (used > worst) worst = used;
+        if (frame > 500 && book.rows.empty()) break;
+    }
+    if (made != 830) Fail("every copy made: " + I(made));
+    if (!book.rows.empty()) Fail("nothing left held");
+    if (frameNoCopyWhileHeld) Fail("a frame made no copy while SPAWNs were held");
+    if (worst > kFrameBudgetUs) Fail("a frame over the budget at 2 ms a copy: " + I((int)worst));
+    int moves = 0, lastSpawnAt = -1, endAt = -1, spawn1500At = -1, state1500At = -1, despawn1500At = -1, lastSpawnFrame = 0, endFrame = 0, s1500Frame = 0, d1500Frame = 0;
+    size_t k;
+    for (k = 0; k < log.size(); ++k)
+    {
+        const T599Ev& e = log[k];
+        if (e.kind == kMove)
+        {
+            ++moves;
+            if (e.frame == 1 && moves <= 3) {}
+            else if (e.frame != moves - 2) Fail("a MOVE for the made copy waited: move " + I(moves) + " applied in frame " + I(e.frame));
+        }
+        if (e.kind == kSpawn) { lastSpawnAt = (int)k; lastSpawnFrame = e.frame; }
+        if (e.kind == kSpawn && e.uid == 1500) { spawn1500At = (int)k; s1500Frame = e.frame; }
+        if (e.kind == kState) state1500At = (int)k;
+        if (e.kind == kDespawn) { despawn1500At = (int)k; d1500Frame = e.frame; }
+        if (e.kind == kEnd) { endAt = (int)k; endFrame = e.frame; }
+    }
+    if (moves != 3 + 499) Fail("every MOVE applied: " + I(moves));
+    if (!(spawn1500At >= 0 && state1500At == spawn1500At + 1 && despawn1500At == spawn1500At + 2)) Fail("the held character's STATE then DESPAWN apply right after its SPAWN");
+    if (d1500Frame != s1500Frame) Fail("...in the same frame as its SPAWN");
+    if (exists.find(1500) != exists.end()) Fail("the DESPAWN removed the copy its SPAWN made");
+    if (!(endAt > lastSpawnAt)) Fail("the END applies after every earlier SPAWN");
+    if (endFrame != lastSpawnFrame) Fail("the END applies in the frame of the last SPAWN: " + I(endFrame) + " vs " + I(lastSpawnFrame));
+    if (lastSpawnFrame != 415) Fail("830 copies at 2 a frame: the last in frame 415, got " + I(lastSpawnFrame));
+    /* a barrier with nothing held applies at once; a SPAWN after a waiting barrier waits for it */
+    HeldBook b2;
+    if (Route(b2, 0, 0, 1, 0, 0, kFrameBudgetUs) != kRouteApply) Fail("a barrier with nothing held applies");
+    HeldPut(&b2, kKindSpawn, 7, 0); HeldPut(&b2, kKindBarrier, 0, 1); HeldPut(&b2, kKindSpawn, 8, 2); HeldPut(&b2, kKindFollow, 9, 3);
+    if (Route(b2, 1, 10, 0, 0, 0, kFrameBudgetUs) != kRouteHoldSpawn) Fail("a new SPAWN behind held SPAWNs is held (oldest first)");
+    if (Route(b2, 0, 7, 0, 0, 0, kFrameBudgetUs) != kRouteFollow) Fail("a message naming a held character follows it");
+    if (Route(b2, 0, 11, 0, 5, 99999, kFrameBudgetUs) != kRouteApply) Fail("a message for a copy that exists applies at once");
+    HeldPassState s2;
+    if (HeldStep(b2, b2.rows[0], &s2, 1, kFrameBudgetUs, kFrameBudgetUs) != kHeldKeep) Fail("over the budget: the SPAWN is kept");
+    if (HeldStep(b2, b2.rows[1], &s2, 1, 0, kFrameBudgetUs) != kHeldKeep || s2.barrierKept != 1) Fail("the barrier waits for the kept SPAWN");
+    if (HeldStep(b2, b2.rows[2], &s2, 0, 0, kFrameBudgetUs) != kHeldKeep) Fail("a SPAWN after a waiting barrier waits");
+    if (HeldStep(b2, b2.rows[3], &s2, 0, 0, kFrameBudgetUs) != kHeldApply) Fail("a held message whose character is no longer held applies");
+    HeldTake(&b2, 0);
+    if (b2.spawns != 1 || b2.uids.find(7) != b2.uids.end()) Fail("HeldTake releases the character");
+}
+
+/* T-599 MessageSubjects. FROM THE SHARED ENCODERS: SPAWN, STATE, STATS, SAY, NAME, SLAVE, INSIDE, PRISON, TREAT, SHOT, CRIME,
+   BOUNTY, HIRE, TALK, EFFECT, CAPTURE / CAPTURE_DONE / CAPTURE_PLACED, OWNER_MOVED, DESPAWN and UNLOAD (both fed the WITHDRAW
+   encoder's bytes), RELEASE, RELEASE_ACK, SQUAD_LEAD, ROSTER HASH / CHECK / ANSWER. HAND-BUILT here to the layout the test author
+   read in the plugin's sender (net/session.cpp), so a change to that sender is NOT caught: HIT, SWING, CARRY_BREAK, COMBATMODE,
+   INTENT, MOVESTOP, MOVE, TASK, APPEARANCE, CLOTHING, CONTEXT, ITEM_MOVE, ITEM_REQUEST, ITEM_CONFIRM / PLACED / REVOKE, XFER and
+   XFER_ACK. For each message: the characters read are exactly the ones it carries; with any one of them held the message follows
+   that SPAWN and applies once the SPAWN is applied; with none held it applies at once. */
+typedef char T599LayoutsMatch[(spawnpace::kSubjRelHead == cooplo::kReleaseHead && spawnpace::kSubjRelRow == cooplo::kReleaseRowSize
+    && spawnpace::kSubjRelAckHead == cooplo::kReleaseAckHead && spawnpace::kSubjRelMax == (unsigned int)cooplo::kReleaseMaxMembers
+    && spawnpace::kSubjLeadHead == coopsquad::kSquadLeadHead && spawnpace::kSubjLeadMax == coopsquad::kSquadLeadMaxMembers
+    && (int)spawnpace::kSubjRosterCheck == (int)cooplo::kRosterCheck && (int)spawnpace::kSubjRosterAnswer == (int)cooplo::kRosterAnswer
+    && (size_t)spawnpace::kSubjCheckMax == cooplo::kRosterCheckPerChunk && (size_t)spawnpace::kSubjAnswerMax == cooplo::kRosterAnswerPerChunk) ? 1 : -1];
+void T599PutU32(std::vector<char>* b, size_t at, unsigned int v)
+{
+    if (b->size() < at + 4) b->resize(at + 4, 0);
+    std::memcpy(&(*b)[at], &v, 4);
+}
+void T599Expect(const char* what, unsigned int type, const std::vector<char>& b, unsigned int u1, unsigned int u2)
+{
+    using namespace spawnpace;
+    std::vector<unsigned int> want; if (u1 != 0) want.push_back(u1); if (u2 != 0 && u2 != u1) want.push_back(u2);
+    std::vector<unsigned int> got;
+    const int n = b.empty() ? MessageSubjects(type, 0, 0, &got) : MessageSubjects(type, (const unsigned char*)&b[0], b.size(), &got);
+    if (n != (int)want.size() || got != want) { Fail(std::string(what) + ": the characters read are not the ones it carries (" + I(n) + " read)"); return; }
+    size_t k;
+    for (k = 0; k < want.size(); ++k)
+    {
+        HeldBook bk;
+        std::vector<unsigned int> one(1, want[k]);
+        HeldPutNames(&bk, kKindSpawn, kScopeNone, 5u, one, 0);
+        if (RouteNames(bk, 0, got, kScopeNone, 6u, 0, 0, kFrameBudgetUs) != kRouteFollow) { Fail(std::string(what) + ": with character " + I((int)k) + " held, it does not follow"); continue; }
+        HeldPutNames(&bk, kKindFollow, kScopeNone, 6u, got, 1);
+        HeldPassState st;
+        if (HeldStep(bk, bk.rows[0], &st, 1, kFrameBudgetUs, kFrameBudgetUs) != kHeldKeep) Fail(std::string(what) + ": its SPAWN is not kept over the budget");
+        if (HeldStep(bk, bk.rows[1], &st, 0, 0, kFrameBudgetUs) != kHeldKeep) Fail(std::string(what) + ": not kept while its SPAWN is held");
+        HeldTake(&bk, 0);
+        HeldPassState st2;
+        if (HeldStep(bk, bk.rows[0], &st2, 0, 0, kFrameBudgetUs) != kHeldApply) Fail(std::string(what) + ": not applied once its SPAWN is");
+    }
+    HeldBook other;
+    std::vector<unsigned int> stranger(1, 0x7FFF0001u);
+    HeldPutNames(&other, kKindSpawn, kScopeNone, 6u, stranger, 0);
+    if (RouteNames(other, 0, got, kScopeNone, 6u, 9, 999999, kFrameBudgetUs) != kRouteApply) Fail(std::string(what) + ": held although none of its characters is");
+}
+void T599Sender(const char* what, unsigned int type, const std::vector<char>& b)
+{
+    std::vector<unsigned int> got;
+    const int n = b.empty() ? spawnpace::MessageSubjects(type, 0, 0, &got) : spawnpace::MessageSubjects(type, (const unsigned char*)&b[0], b.size(), &got);
+    if (n != spawnpace::kSubjectsSender || !got.empty()) Fail(std::string(what) + ": not scoped to its sender");
+}
+void t_t599_pace_subjects_encoders()
+{
+    using namespace spawnpace;
+    const unsigned int A = 4194308u, B = 4194359u;
+    { std::vector<char> b; coopspawn::EncodeSpawn(&b, A, 1.5f, -2.25f, 300.0f, "Bonedog", "Bounty Hunters", false, 0.625f); T599Expect("SPAWN", kMsgSpawn, b, A, 0); }
+    { float parts[2 * 8]; for (int i = 0; i < 16; ++i) parts[i] = 1.0f;
+      std::vector<char> b; coopstate::EncodeState(&b, A, parts, 2u, 8u, 12.5f, 4, 0, 0x21u, 3.25f, 9.0f, B);
+      T599Expect("STATE (the carried body is applied by the carry tick once both copies exist)", kMsgState, b, A, 0); }
+    { unsigned int raw[coopstats::kStatsCount]; for (int i = 0; i < coopstats::kStatsCount; ++i) raw[i] = 0x41200000u;
+      std::vector<char> b; coopstats::EncodeStatsMsg(&b, A, raw); T599Expect("STATS", kMsgStats, b, A, 0); }
+    { std::vector<char> b; if (!coopsay::EncodeSay(&b, A, "hi", 2)) Fail("SAY encode"); T599Expect("SAY", kMsgSay, b, A, 0); }
+    { std::vector<char> b; if (!coopname::EncodeName(&b, A, "Bob")) Fail("NAME encode"); T599Expect("NAME", kMsgName, b, A, 0); }
+    { std::vector<char> b; if (!coopslave::EncodeSlave(&b, A, 1, B)) Fail("SLAVE encode"); T599Expect("SLAVE", kMsgSlave, b, A, B); }
+    { std::vector<char> b; if (!p25inside::EncodeInside(&b, A, 1, "abc", 3)) Fail("INSIDE encode"); T599Expect("INSIDE", kMsgInside, b, A, 0); }
+    { cooprison::PrisonMsg m; m.uid = A; m.kind = cooprison::kPrisonSlaveAsk; m.slaveFrom = 1; m.slaveWant = 2;
+      std::vector<char> b; if (!cooprison::EncodePrison(&b, m)) Fail("PRISON encode"); T599Expect("PRISON", kMsgPrison, b, A, 0); }
+    { cooptreat::TreatMsg m; m.uid = A; m.n = 1; m.bandageLevel[0] = 5.0f; m.splintLevel[0] = 0.0f;
+      std::vector<char> b; if (!cooptreat::EncodeTreat(&b, m)) Fail("TREAT encode"); T599Expect("TREAT", kMsgTreat, b, A, 0); }
+    { coopshot::ShotMsg m; m.victimUid = A; m.shooterUid = B; for (int i = 0; i < 4; ++i) m.rec[i] = 1.0f; m.onPurpose = false;
+      std::vector<char> b; if (!coopshot::EncodeShot(&b, m)) Fail("SHOT encode"); T599Expect("SHOT", kMsgShot, b, A, B); }
+    { coopcrime::CrimeState c; c.crime = 3; c.expiry = 20.0f; c.victimUid = B; c.factionSid = "17-gamedata.base";
+      std::vector<char> b; if (!coopcrime::EncodeCrime(&b, A, c)) Fail("CRIME encode"); T599Expect("CRIME", kMsgCrime, b, A, B); }
+    { coopbounty::BountyList l; coopbounty::BountyEntry e; e.sid = "17-gamedata.base"; e.amount = 300; e.crimes = 8; e.claimed = 0; e.time = 1.0; l.push_back(e);
+      std::vector<char> b; if (!coopbounty::EncodeBounty(&b, A, coopbounty::kBountyKindList, l)) Fail("BOUNTY encode"); T599Expect("BOUNTY", kMsgBounty, b, A, 0); }
+    { coophire::HireMsg m; m.kind = coophire::kHireReq; m.reqId = 7; m.uid = A; m.hirerUid = B; m.price = 100; m.joinType = 18; m.faction = "Drifters";
+      std::vector<char> b; if (!coophire::EncodeHire(&b, m)) Fail("HIRE encode"); T599Expect("HIRE", kMsgHire, b, A, B); }
+    { cooptalk::TalkMsg p; p.kind = cooptalk::kTalkPrompt; p.convId = 7; p.npcUid = A; p.targetUid = B; p.event = 1;
+      p.lineSid = "1234-rebirth.mod"; p.npcText = "Hand over your stuff."; p.replyIds.push_back("r1"); p.replyTexts.push_back("No."); p.deadlineMs = 30000;
+      std::vector<char> b; if (!cooptalk::EncodeTalk(&b, p)) Fail("TALK encode"); T599Expect("TALK", kMsgTalk, b, A, B); }
+    { const cooffect::EffectMsg m = T327Req();
+      std::vector<char> b; if (!cooffect::EncodeEffect(&b, m)) Fail("EFFECT encode"); T599Expect("EFFECT", kMsgEffect, b, m.targetUid, m.actorUid); }
+    { coopcapture::CaptureReq q; q.reqId = 11; q.victimUid = A; q.slaverUid = B; q.taskType = 166; q.flags = coopcapture::kCapFlagChain;
+      std::vector<char> b; if (!coopcapture::EncodeCapture(&b, q)) Fail("CAPTURE encode"); T599Expect("CAPTURE", kMsgCapture, b, A, B); }
+    { coopcapture::CaptureDone d; d.reqId = 11; d.victimUid = A; d.result = coopcapture::kCapApplied; d.stateNow = 1; d.ownerUidNow = 249; d.shavedNow = 0;
+      d.chainedNow = 0; d.shacklesLocked = 0;
+      std::vector<char> b; if (!coopcapture::EncodeCaptureDone(&b, d)) Fail("CAPTURE_DONE encode"); T599Expect("CAPTURE_DONE", kMsgCaptureDone, b, A, 0); }
+    { coopcapture::CapturePlaced pl; pl.reqId = 7; pl.victimUid = A; pl.nRows = 2; pl.placedMask = 1u;
+      std::vector<char> b; if (!coopcapture::EncodeCapturePlaced(&b, pl)) Fail("CAPTURE_PLACED encode"); T599Expect("CAPTURE_PLACED", kMsgCapturePlaced, b, A, 0); }
+    { std::vector<char> b; cooplo::OwnerMovedEncode16(&b, A, 3, 4, 5); T599Expect("OWNER_MOVED (slots are not characters)", kMsgOwnerMoved, b, A, 0); }
+    { cooplo::WithdrawMsg w; w.uid = A; w.seq = 9; w.gen = 3; w.sectorKey = 715; w.expect.push_back(4); w.why = cooplo::kWdWhyAnnounce;
+      std::vector<char> b; if (!cooplo::WithdrawEncode(&b, w)) Fail("DESPAWN encode");
+      T599Expect("DESPAWN", kMsgDespawn, b, A, 0); T599Expect("UNLOAD", kMsgUnload, b, A, 0); }
+    /* the session-only layouts */
+    { std::vector<char> b(48, 0); T599PutU32(&b, 0, A); T599PutU32(&b, 4, B); T599Expect("HIT", kMsgHit, b, A, B); }
+    { std::vector<char> b; T599PutU32(&b, 0, A); T599PutU32(&b, 4, B); T599Expect("SWING", kMsgSwing, b, A, B); T599Expect("CARRY_BREAK", kMsgCarryBreak, b, A, B); }
+    { std::vector<char> b; T599PutU32(&b, 0, A); T599PutU32(&b, 4, 1); T599PutU32(&b, 8, B); T599Expect("COMBATMODE", kMsgCombatMode, b, A, B); }
+    { std::vector<char> b(28, 0); T599PutU32(&b, 0, A); T599PutU32(&b, 4, 7); T599PutU32(&b, 8, B); T599Expect("INTENT", kMsgIntent, b, A, B); }
+    { std::vector<char> b(20, 0); T599PutU32(&b, 0, A); T599Expect("MOVESTOP", kMsgMoveStop, b, A, 0); }
+    { std::vector<char> b(36, 0); T599PutU32(&b, 0, A); T599Expect("MOVE", kMsgMove, b, A, 0); T599Expect("TASK", kMsgTask, b, A, 0);
+      T599Expect("APPEARANCE", kMsgAppearance, b, A, 0); T599Expect("CLOTHING", kMsgClothing, b, A, 0); T599Expect("CONTEXT", kMsgContext, b, A, 0); }
+    { std::vector<char> b; T599PutU32(&b, 0, A); b.push_back(0); T599PutU32(&b, 5, 4); b.insert(b.end(), "main", "main" + 4);
+      T599Expect("ITEM_MOVE", kMsgItemMove, b, A, 0); }
+    { std::vector<char> b; T599PutU32(&b, 0, 77); b.push_back(0); T599PutU32(&b, 5, A); T599PutU32(&b, 9, 4); b.insert(b.end(), "main", "main" + 4);
+      const size_t at = b.size(); T599PutU32(&b, at, 1); T599PutU32(&b, at + 4, 2); T599PutU32(&b, at + 8, 3); T599PutU32(&b, at + 12, B);
+      T599Expect("ITEM_REQUEST", kMsgItemRequest, b, A, B); }
+    { std::vector<char> b(13, 0); T599PutU32(&b, 0, A);
+      T599Expect("ITEM_CONFIRM (a request id only)", kMsgItemConfirm, b, 0, 0); T599Expect("ITEM_PLACED", kMsgItemPlaced, b, 0, 0); T599Expect("ITEM_REVOKE", kMsgItemRevoke, b, 0, 0); }
+    /* XFER: leader | reason | count | members of 48 bytes, uid at 0; the intent subject at 28 is not read */
+    { std::vector<char> b(12 + 2 * 48, 0); T599PutU32(&b, 0, A); T599PutU32(&b, 8, 2); T599PutU32(&b, 12, A); T599PutU32(&b, 12 + 48, B); T599PutU32(&b, 12 + 48 + 28, 0x00400009u);
+      std::vector<unsigned int> got; const int n = MessageSubjects(kMsgXfer, (const unsigned char*)&b[0], b.size(), &got);
+      if (n != 2 || got[0] != A || got[1] != B) Fail("XFER: the leader and its members, not an intent's subject (the taker skips an intent whose subject has no copy)");
+      std::vector<char> cut(b.begin(), b.end() - 1);
+      if (MessageSubjects(kMsgXfer, (const unsigned char*)&cut[0], cut.size(), &got) != kSubjectsSender) Fail("a cut XFER is scoped to its sender"); }
+    { std::vector<char> b; T599PutU32(&b, 0, A); T599PutU32(&b, 4, 2); T599PutU32(&b, 8, B); T599PutU32(&b, 12, 0x0040000Au);
+      std::vector<unsigned int> got; const int n = MessageSubjects(kMsgXferAck, (const unsigned char*)&b[0], b.size(), &got);
+      if (n != 3 || got[2] != 0x0040000Au) Fail("XFER_ACK: the leader and every taken uid");
+      T599PutU32(&b, 4, 300);
+      if (MessageSubjects(kMsgXferAck, (const unsigned char*)&b[0], b.size(), &got) != kSubjectsSender) Fail("an XFER_ACK whose list cannot be read is scoped to its sender"); }
+    /* the fixed-offset lists, from the shared encoders; a cut list or one counting more than its type allows is scoped to its sender */
+    { cooplo::ReleaseMsg m; m.id = 5; m.keyUid = A; m.flags = cooplo::kRelFlagPutAway;
+      cooplo::ReleaseRow r1; r1.uid = A; r1.gen = 3; cooplo::ReleaseRow r2; r2.uid = B; r2.gen = 4; m.rows.push_back(r1); m.rows.push_back(r2);
+      std::vector<char> b; if (!cooplo::ReleaseEncode(&b, m)) Fail("RELEASE encode");
+      T599Expect("RELEASE (the key character and each row's)", kMsgRelease, b, A, B);
+      T599Sender("a cut RELEASE", kMsgRelease, std::vector<char>(b.begin(), b.end() - 1));
+      std::vector<char> big = b; big[11] = (char)65; T599Sender("a RELEASE counting 65 rows", kMsgRelease, big);
+      m.keyUid = 0x00400077u; std::vector<char> k; if (!cooplo::ReleaseEncode(&k, m)) Fail("RELEASE encode 2");
+      std::vector<unsigned int> got; if (MessageSubjects(kMsgRelease, (const unsigned char*)&k[0], k.size(), &got) != 3 || got[0] != 0x00400077u) Fail("RELEASE: the key character first, then the rows"); }
+    { cooplo::ReleaseAckMsg m; m.id = 5; m.adopted.push_back(A); m.deferred.push_back(B);
+      std::vector<char> b; if (!cooplo::ReleaseAckEncode(&b, m)) Fail("RELEASE_ACK encode");
+      T599Expect("RELEASE_ACK (the adopted, dropped and deferred uids)", kMsgReleaseAck, b, A, B);
+      T599Sender("a cut RELEASE_ACK", kMsgReleaseAck, std::vector<char>(b.begin(), b.end() - 1));
+      std::vector<char> big = b; T599PutU32(&big, 4, 70u); T599Sender("a RELEASE_ACK counting 70 uids", kMsgReleaseAck, big); }
+    { coopsquad::SquadLeadMsg m; m.squadKey = 9; m.acting = A; m.formal = 0; m.seq = 1; m.members.push_back(B);
+      std::vector<char> b; if (!coopsquad::EncodeSquadLead(&b, m)) Fail("SQUAD_LEAD encode");
+      T599Expect("SQUAD_LEAD (acting, formal and the members)", kMsgSquadLead, b, A, B);
+      T599Sender("a cut SQUAD_LEAD", kMsgSquadLead, std::vector<char>(b.begin(), b.end() - 1)); }
+    { std::vector<cooplo::CheckRow> rows(2); rows[0].uid = A; rows[0].gen = 1; rows[1].uid = B; rows[1].gen = 2;
+      std::vector<std::vector<char> > ch;
+      if (!cooplo::RosterCheckEncode(&ch, 7, cooplo::kRosterListed, rows) || ch.size() != 1) Fail("ROSTER CHECK encode");
+      else { T599Expect("ROSTER CHECK", kMsgRoster, ch[0], A, B); T599Sender("a cut ROSTER CHECK", kMsgRoster, std::vector<char>(ch[0].begin(), ch[0].end() - 1)); } }
+    { std::vector<cooplo::AnswerRow> rows(2); rows[0].uid = A; rows[0].status = cooplo::kAnsLive; rows[0].gen = 1; rows[1].uid = B; rows[1].status = cooplo::kAnsLive; rows[1].gen = 2;
+      std::vector<std::vector<char> > ch;
+      if (!cooplo::RosterAnswerEncode(&ch, 7, 3, rows) || ch.size() != 1) Fail("ROSTER ANSWER encode");
+      else { T599Expect("ROSTER ANSWER", kMsgRoster, ch[0], A, B); T599Sender("a cut ROSTER ANSWER", kMsgRoster, std::vector<char>(ch[0].begin(), ch[0].end() - 1)); } }
+    { std::vector<cooplo::HashRow> rows(1); rows[0].sectorKey = 715; rows[0].count = 2; rows[0].hash = 99;
+      std::vector<std::vector<char> > ch;
+      if (!cooplo::RosterHashEncode(&ch, 4, rows) || ch.size() != 1) Fail("ROSTER HASH encode");
+      else T599Sender("a ROSTER HASH (it sums its sender's characters by area)", kMsgRoster, ch[0]); }
+    { static const unsigned int kNone[] = { 1u, 2u, 3u, 4u, 20u, 23u, 24u, 32u, 33u, 42u, 50u, 53u, 54u, 56u, 64u, 71u, 73u, 74u, 75u, 201u, 205u };
+      std::vector<char> b(40, 0); T599PutU32(&b, 0, A); std::vector<unsigned int> got;
+      for (size_t i = 0; i < sizeof(kNone) / sizeof(kNone[0]); ++i) if (MessageSubjects(kNone[i], (const unsigned char*)&b[0], b.size(), &got) != 0 || !got.empty()) Fail("type " + I((int)kNone[i]) + ": names no character"); }
+    { std::vector<char> b(3, 0); std::vector<unsigned int> got;
+      if (MessageSubjects(kMsgName, (const unsigned char*)&b[0], b.size(), &got) != 0) Fail("a message too short for its character reads nothing"); }
+}
+
+/* T-599 sender scope: a sender-scoped message waits only for its own sender's held SPAWNs; in the held pass a sender's kept
+   barrier holds that sender's later SPAWNs and nobody else's. */
+void t_t599_pace_sender_scope()
+{
+    using namespace spawnpace;
+    HeldBook b;
+    std::vector<unsigned int> one(1, 500u), none;
+    HeldPutNames(&b, kKindSpawn, kScopeNone, 1u, one, 0);
+    if (RouteNames(b, 0, none, kScopeSender, 1u, 0, 0, kFrameBudgetUs) != kRouteBarrier) Fail("the same sender's message waits for its held SPAWN");
+    if (RouteNames(b, 0, none, kScopeSender, 2u, 0, 0, kFrameBudgetUs) != kRouteApply) Fail("another sender's message is not held behind it");
+    if (RouteNames(b, 0, none, kScopeAll, 2u, 0, 0, kFrameBudgetUs) != kRouteBarrier) Fail("a message waiting for every SPAWN waits");
+    HeldPassState st; st.spawnKeptFrom.insert(1u); st.anySpawnKept = 1;
+    HeldRow r1; r1.kind = kKindBarrier; r1.scope = kScopeSender; r1.sender = 1u; r1.ticket = 1;
+    HeldRow r2 = r1; r2.sender = 2u;
+    if (HeldStep(b, r1, &st, 0, 0, kFrameBudgetUs) != kHeldKeep) Fail("a barrier behind its sender's kept SPAWN is kept");
+    if (HeldStep(b, r2, &st, 0, 0, kFrameBudgetUs) != kHeldApply) Fail("another sender's barrier applies");
+    HeldRow s1; s1.kind = kKindSpawn; s1.scope = kScopeNone; s1.sender = 1u; s1.names.push_back(600u); s1.ticket = 2;
+    HeldRow s2 = s1; s2.sender = 2u; s2.names[0] = 601u;
+    if (HeldStep(b, s1, &st, 0, 0, kFrameBudgetUs) != kHeldKeep) Fail("a SPAWN after its sender's kept barrier waits");
+    if (HeldStep(b, s2, &st, 0, 0, kFrameBudgetUs) != kHeldApply) Fail("another sender's SPAWN is made under the budget");
+    HeldTake(&b, 0);
+    if (SpawnsFrom(b, 1u) != 0 || b.spawns != 0 || !b.spawnsFrom.empty()) Fail("HeldTake forgets the sender's count");
+}
+
+/* One frame over a held book as the plugin works it (store.cpp PaceHeldPass): the hand-over sweep, then the full pass; each copy
+   costs 2 ms. Returns the tickets applied, in order. */
+void T599Frame(spawnpace::HeldBook* b, long long startUs, long long startMade, std::vector<long long>* applied)
+{
+    using namespace spawnpace;
+    long long used = startUs, made = startMade;
+    for (int sweep = 0; sweep < 2; ++sweep)
+    {
+        if (sweep == 0 && b->urgentNamed.empty()) continue;
+        HeldPassState st;
+        size_t i = 0;
+        while (i < b->rows.size())
+        {
+            if (sweep == 0 && st.budgetHit != 0) break;
+            const HeldRow r = b->rows[i];
+            const int step = sweep == 0 ? HeldUrgentStep(*b, r, &st, made, used, kFrameBudgetUs) : HeldStep(*b, r, &st, made, used, kFrameBudgetUs);
+            if (step != kHeldApply) { ++i; continue; }
+            HeldTake(b, i);
+            if (r.kind == kKindSpawn) { used += 2000; ++made; }
+            applied->push_back(r.ticket);
+        }
+    }
+}
+bool T599Empty(const spawnpace::HeldBook& b)
+{
+    return b.rows.empty() && b.uids.empty() && b.spawnsFrom.empty() && b.spawns == 0 && b.named.empty() && b.urgentNamed.empty() && b.senderRows.empty();
+}
+
+/* T-599: the SPAWNs a held hand-over names are made first, ahead of older SPAWNs, under the same budget (at least one copy a
+   frame), and the hand-over applies in that frame; a row before such a SPAWN that must apply first still does. */
+void t_t599_pace_handover_first()
+{
+    using namespace spawnpace;
+    HeldBook b;
+    unsigned int u;
+    for (u = 100; u < 110; ++u) { std::vector<unsigned int> one(1, u); HeldPutRow(&b, kKindSpawn, kScopeNone, 1u, one, (long long)u, 0); }
+    { std::vector<unsigned int> n(1, 103u); HeldPutRow(&b, kKindFollow, kScopeNone, 1u, n, 1103, 0); }
+    { std::vector<unsigned int> n; n.push_back(108u); n.push_back(105u); HeldPutRow(&b, kKindFollow, kScopeNone, 1u, n, 2000, UrgentType(kMsgXfer)); }
+    if (!UrgentSpawnRow(b, b.rows[8]) || !UrgentSpawnRow(b, b.rows[5]) || UrgentSpawnRow(b, b.rows[0])) Fail("the SPAWNs a held XFER names are marked, no other");
+    if (UrgentType(kMsgXferAck) != 1 || UrgentType(kMsgRelease) != 1 || UrgentType(kMsgReleaseAck) != 1 || UrgentType(kMsgMove) != 0) Fail("the hand-over types");
+    std::vector<long long> a;
+    T599Frame(&b, 0, 0, &a);
+    if (a.size() != 3 || a[0] != 105 || a[1] != 108 || a[2] != 2000) Fail("the XFER's two SPAWNs are made first and the XFER applies in the same frame (" + I((int)a.size()) + " applied)");
+    a.clear(); T599Frame(&b, 0, 0, &a);
+    if (a.size() != 2 || a[0] != 100 || a[1] != 101) Fail("then the older SPAWNs, oldest first");
+    if (!b.urgentNamed.empty()) Fail("the hand-over's names are forgotten once it applies");
+    for (int f = 0; f < 10 && !b.rows.empty(); ++f) T599Frame(&b, 0, 0, &a);
+    if (!T599Empty(b)) Fail("every count returns to nothing");
+    /* at least one copy a frame: a frame whose budget an earlier drain spent still makes the oldest named SPAWN */
+    HeldBook c;
+    for (u = 200; u < 204; ++u) { std::vector<unsigned int> one(1, u); HeldPutRow(&c, kKindSpawn, kScopeNone, 1u, one, (long long)u, 0); }
+    { std::vector<unsigned int> n; n.push_back(203u); n.push_back(202u); HeldPutRow(&c, kKindFollow, kScopeNone, 1u, n, 3000, UrgentType(kMsgRelease)); }
+    a.clear(); T599Frame(&c, kFrameBudgetUs * 2, 0, &a);
+    if (a.size() != 1 || a[0] != 202) Fail("over the budget: one named SPAWN, the oldest named first");
+    a.clear(); T599Frame(&c, 0, 0, &a);
+    if (a.size() != 3 || a[0] != 203 || a[1] != 200 || a[2] != 3000) Fail("next frame: the other named SPAWN, one older SPAWN, then the RELEASE");
+    /* rows that must apply first: an older row naming the same character, a sender's sender-scoped row, a barrier for every SPAWN */
+    HeldBook d;
+    std::vector<unsigned int> none;
+    { std::vector<unsigned int> n; n.push_back(401u); n.push_back(400u); HeldPutRow(&d, kKindFollow, kScopeNone, 1u, n, 1, 0); }
+    { std::vector<unsigned int> one(1, 401u); HeldPutRow(&d, kKindSpawn, kScopeNone, 1u, one, 2, 0); }
+    { std::vector<unsigned int> one(1, 402u); HeldPutRow(&d, kKindSpawn, kScopeNone, 2u, one, 3, 0); }
+    HeldPutRow(&d, kKindBarrier, kScopeSender, 2u, none, 4, 0);
+    { std::vector<unsigned int> one(1, 403u); HeldPutRow(&d, kKindSpawn, kScopeNone, 2u, one, 5, 0); }
+    HeldPutRow(&d, kKindBarrier, kScopeAll, kNoSender, none, 6, 0);
+    { std::vector<unsigned int> one(1, 404u); HeldPutRow(&d, kKindSpawn, kScopeNone, 3u, one, 7, 0); }
+    { std::vector<unsigned int> n; n.push_back(401u); n.push_back(402u); n.push_back(403u); n.push_back(404u); HeldPutRow(&d, kKindFollow, kScopeNone, 1u, n, 8, UrgentType(kMsgXfer)); }
+    HeldPassState st;
+    static const int kWant[] = { kHeldKeep, kHeldKeep, kHeldApply, kHeldKeep, kHeldKeep, kHeldKeep, kHeldKeep, kHeldKeep };
+    for (size_t k = 0; k < d.rows.size(); ++k)
+        if (HeldUrgentStep(d, d.rows[k], &st, 0, 0, kFrameBudgetUs) != kWant[k]) Fail("hand-over sweep, row " + I((int)k) + ": only the SPAWN nothing before it orders is made ahead");
+    if (SenderRows(d, 2u) != 1 || SenderRows(d, kNoSender) != 0) Fail("the sender-scoped row is counted per sender");
+    while (!d.rows.empty()) HeldTake(&d, 0);
+    if (!T599Empty(d)) Fail("taking every row returns every count to nothing");
+}
+
+/* T-599 order through held messages, not only held SPAWNs. (a) a message naming X held behind Y's SPAWN holds a later message
+   naming only X; (b) in the pass a kept message naming X and Y keeps a later one naming X and Z; (c) a held sender-scoped row
+   holds its sender's later messages, of one character or none. */
+void t_t694_record_pos_order()
+{
+    using namespace recordpos;
+    if (NoPos(0.0f, 0.0f) != 1) Fail("x and z both 0 is no position");
+    if (NoPos(0.0f, 5.0f) != 0 || NoPos(5.0f, 0.0f) != 0 || NoPos(-1.0f, 3.0f) != 0) Fail("one of x or z not 0 is a position");
+    Cand c[5];
+    int i;
+    for (i = 0; i < 5; ++i) { c[i].have = 0; c[i].x = 0.0f; c[i].y = 0.0f; c[i].z = 0.0f; }
+    if (Pick(c) != kSrcNone) Fail("nothing read: none");
+    if (Pick(0) != kSrcNone) Fail("no inputs: none");
+    c[kSrcPlatoon].have = 1;   /* the platoon read 0,0 */
+    if (Pick(c) != kSrcNone) Fail("only the platoon's own 0,0: none");
+    c[kSrcTown].have = 1; c[kSrcTown].x = 300.0f; c[kSrcTown].z = -400.0f;
+    if (Pick(c) != kSrcTown) Fail("the town wins when member, platoon, last record and home are none");
+    c[kSrcHome].have = 1;   /* the home key parsed to 0,0 */
+    if (Pick(c) != kSrcTown) Fail("a home at 0,0 is none: the town wins");
+    c[kSrcHome].x = 200.0f; c[kSrcHome].y = 9.0f; c[kSrcHome].z = 0.0f;
+    if (Pick(c) != kSrcHome) Fail("the home wins over the town when it holds a position (z 0 alone is a position)");
+    c[kSrcLast].have = 1;   /* the last record was at 0,0 */
+    if (Pick(c) != kSrcHome) Fail("a last record at 0,0 is none: the home wins");
+    c[kSrcLast].x = 0.0f; c[kSrcLast].y = 50.0f; c[kSrcLast].z = 0.0f;
+    if (Pick(c) != kSrcHome) Fail("y alone does not make a position");
+    c[kSrcLast].z = 7.0f;
+    if (Pick(c) != kSrcLast) Fail("the last record wins over home and town");
+    c[kSrcPlatoon].x = -10.0f; c[kSrcPlatoon].z = 20.0f;
+    if (Pick(c) != kSrcPlatoon) Fail("the platoon's own position wins when it is one");
+    c[kSrcMember].have = 1;
+    if (Pick(c) != kSrcMember) Fail("a living member's position wins whenever one was read, even at 0,0");
+    c[kSrcMember].x = 1.0f;
+    if (Pick(c) != kSrcMember) Fail("a living member's position wins");
+    for (i = 0; i < 5; ++i) { c[i].have = 0; c[i].x = 11.0f; c[i].z = 12.0f; }
+    if (Pick(c) != kSrcNone) Fail("a position not read does not count");
+    c[kSrcLast].have = 1;
+    if (Pick(c) != kSrcLast) Fail("only the last record read: it wins");
+    if (std::string(SrcText(kSrcLast)) != "kept the last record's" || std::string(SrcText(kSrcHome)) != "used its home building's"
+        || std::string(SrcText(kSrcTown)) != "used its town's" || std::string(SrcText(kSrcNone)) != "none") Fail("the log words");
+}
+void t_t599_pace_order_through_held()
+{
+    using namespace spawnpace;
+    const unsigned int X = 4194308u, Y = 4194359u, Z = 4194400u;
+    std::vector<unsigned int> none, onlyX(1, X), onlyY(1, Y), onlyZ(1, Z), xy, xz;
+    xy.push_back(X); xy.push_back(Y); xz.push_back(X); xz.push_back(Z);
+    HeldBook a;
+    HeldPutRow(&a, kKindSpawn, kScopeNone, 1u, onlyY, 0, 0);
+    if (RouteNames(a, 0, xy, kScopeNone, 1u, 0, 0, kFrameBudgetUs) != kRouteFollow) Fail("(a) a message naming X and the held Y follows Y");
+    HeldPutRow(&a, kKindFollow, kScopeNone, 1u, xy, 1, 0);
+    if (RouteNames(a, 0, onlyX, kScopeNone, 1u, 0, 0, kFrameBudgetUs) != kRouteFollow) Fail("(a) a later message naming only X waits behind it");
+    if (RouteNames(a, 1, onlyX, kScopeNone, 1u, 0, 0, kFrameBudgetUs) != kRouteHoldSpawn) Fail("(a) a SPAWN making X's copy behind it is held as a SPAWN");
+    if (RouteNames(a, 0, onlyZ, kScopeNone, 1u, 0, 0, kFrameBudgetUs) != kRouteApply) Fail("(a) a message naming nothing held applies");
+    HeldTake(&a, 0); HeldTake(&a, 0);
+    if (!T599Empty(a)) Fail("(a) the counts return to nothing");
+    HeldBook b;
+    HeldPutRow(&b, kKindSpawn, kScopeNone, 2u, onlyZ, 0, 0);
+    HeldPutRow(&b, kKindSpawn, kScopeNone, 1u, onlyY, 1, 0);
+    HeldPutRow(&b, kKindFollow, kScopeNone, 1u, xy, 2, 0);
+    HeldPutRow(&b, kKindFollow, kScopeNone, 2u, xz, 3, 0);
+    std::vector<long long> got;
+    T599Frame(&b, kFrameBudgetUs - 1000, 0, &got);
+    if (got.size() != 1 || got[0] != 0) Fail("(b) Z is made, Y kept for the budget, and the message naming X and Z waits behind the one naming X and Y");
+    got.clear(); T599Frame(&b, 0, 0, &got);
+    if (got.size() != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3) Fail("(b) then Y and the two messages in arrival order");
+    if (!T599Empty(b)) Fail("(b) the counts return to nothing");
+    HeldBook c;
+    std::vector<unsigned int> s500(1, 500u);
+    HeldPutRow(&c, kKindSpawn, kScopeNone, 1u, s500, 0, 0);
+    if (RouteNames(c, 0, none, kScopeSender, 1u, 0, 0, kFrameBudgetUs) != kRouteBarrier) Fail("(c) a sender-scoped message waits for its sender's SPAWN");
+    HeldPutRow(&c, kKindBarrier, kScopeSender, 1u, none, 1, 0);
+    if (RouteNames(c, 0, onlyX, kScopeNone, 1u, 0, 0, kFrameBudgetUs) != kRouteFollow) Fail("(c) that sender's later message naming one character waits behind it");
+    if (RouteNames(c, 0, none, kScopeNone, 1u, 0, 0, kFrameBudgetUs) != kRouteFollow) Fail("(c) ...and one naming none");
+    if (RouteNames(c, 0, onlyX, kScopeNone, 2u, 0, 0, kFrameBudgetUs) != kRouteApply) Fail("(c) another sender's message applies");
+    if (RouteNames(c, 0, onlyX, kScopeNone, kNoSender, 0, 0, kFrameBudgetUs) != kRouteApply) Fail("(c) a message on no game's road applies");
+    HeldPutRow(&c, kKindFollow, kScopeNone, 1u, onlyX, 2, 0);
+    HeldPutRow(&c, kKindFollow, kScopeNone, 1u, none, 3, 0);
+    got.clear(); T599Frame(&c, kFrameBudgetUs, 1, &got);
+    if (!got.empty()) Fail("(c) with the sender's SPAWN kept, its sender-scoped row and the messages behind it are kept");
+    got.clear(); T599Frame(&c, 0, 0, &got);
+    if (got.size() != 4 || got[0] != 0 || got[1] != 1 || got[2] != 2 || got[3] != 3) Fail("(c) then all four in arrival order");
+    if (!T599Empty(c)) Fail("(c) the counts return to nothing");
+    HeldBook e;
+    HeldPutRow(&e, kKindBarrier, kScopeSender, 1u, none, 0, 0);
+    if (RouteNames(e, 0, none, kScopeSender, 1u, 0, 0, kFrameBudgetUs) != kRouteBarrier) Fail("(c) a sender-scoped message waits behind its sender's held sender-scoped row");
+    HeldTake(&e, 0);
+    if (!T599Empty(e)) Fail("(c) HeldTake forgets the sender-scoped row");
+}
+
 const TestRow kTests[] =
 {
     { "clock_decide_never_writes_below_current",              t_clock_decide_never_writes_below_current },
@@ -36731,7 +37834,33 @@ const TestRow kTests[] =
     { "t607_treat_ask_step",                                          t_t607_treat_ask_step },
     { "t607_treat_confirmed_by",                                      t_t607_treat_confirmed_by },
     { "t677_talk_purse",                                              t_t677_talk_purse },
-    { "t677_purse_after_act",                                         t_t677_purse_after_act }
+    { "t677_purse_after_act",                                         t_t677_purse_after_act },
+    { "t676_dup_report",                                              t_t676_dup_report },
+    { "t599_pace_decide",                                             t_t599_pace_decide },
+    { "t599_pace_burst",                                              t_t599_pace_burst },
+    { "t599_pace_held",                                               t_t599_pace_held },
+    { "t599_pace_subjects_encoders", t_t599_pace_subjects_encoders },
+    { "t599_pace_sender_scope", t_t599_pace_sender_scope },
+    { "t599_pace_handover_first", t_t599_pace_handover_first },
+    { "t599_pace_order_through_held", t_t599_pace_order_through_held },
+    { "t694_record_pos_order", t_t694_record_pos_order },
+    { "t693_name_freeze_at_publish",                                  t_t693_name_freeze_at_publish },
+    { "t693_lookup_by_name_twins",                                    t_t693_lookup_by_name_twins },
+    { "t693_near_refuses_other_name",                                 t_t693_near_refuses_other_name },
+    { "t693_rebind_after_address_change",                             t_t693_rebind_after_address_change },
+    { "t693_table_overflow",                                          t_t693_table_overflow },
+    { "t693_reason_by_gone_memory",                                   t_t693_reason_by_gone_memory },
+    { "t693_reason5_never_removes",                                   t_t693_reason5_never_removes },
+    { "t693_dead_name_never_rebinds", t_t693_dead_name_never_rebinds },
+    { "t693_bare_key_reaches_named", t_t693_bare_key_reaches_named },
+    { "t693_address_swap", t_t693_address_swap },
+    { "t693_orphan_expiry", t_t693_orphan_expiry },
+    { "t693_name_for_check", t_t693_name_for_check },
+    { "t693_kept_id_match", t_t693_kept_id_match },
+    { "t693_nearest_pair_first", t_t693_nearest_pair_first },
+    { "t693_more_than_16_twins", t_t693_more_than_16_twins },
+    { "t693_id_kind_wire", t_t693_id_kind_wire },
+    { "t693_catchup_pairs_named", t_t693_catchup_pairs_named }
 };
 
 }   /* anonymous namespace */

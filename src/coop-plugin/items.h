@@ -62,6 +62,11 @@ struct ItemMoveMsg
     // never been serialised), and where both sides do have one the receiver counts agreement and
     // disagreement against the positional match - which is the cheapest thing that could refute the key.
     std::string boxId;
+    // T-693 (protocol 149): owner uid 0 only - what boxKey is: coopgname::kIdBare (the sender's current key: it knows no name for the
+    // item), kIdName (a published name) or kIdNameFor (a ground catch-up ADD: idFor is the id the RECEIVER listed for that item, which
+    // takes the name - nothing is built). On the wire right after boxId (groundname.h IdKindPut / IdKindGet); 0 for a storage box.
+    int idKind;
+    std::string idFor;
     // inv6 (protocol 71): ADD only - the stolen mark as an identity (src/common/ownerwire.h), kind 0 = clean (nothing on the wire).
     coopmark::OwnerId owner;
     // items9 (protocol 78): ADD only - a backpack's contents (BAG1 rows), sent on a holder's GROUND ADD so a dropped pack is not
@@ -88,7 +93,7 @@ struct ItemMoveMsg
     unsigned int rqtId;
     int rqtSlot;
     ItemMoveMsg() : uid(0), op(0), x(0), y(0), quantity(0), quality(0.0f), charges(0.0f),
-                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); }
+                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); }
 };
 
 // E22b / decision 38 part (2). A player touched an inventory this game does NOT own. The local half of the
@@ -111,6 +116,7 @@ struct ItemRequestMsg
     unsigned int ownerUid;      // the character the REQUESTER does not own; the RECEIVER must own it
     std::string ownerBoxKey;    // E22c-2 (P7n): the owning building's POSITION KEY, when ownerUid == 0
     std::string ownerBoxId;     // E22c-2 (P7n): its instance id when it has one - a cross-check, never the name
+    int ownerIdKind;            // T-693 (protocol 149): a ground TAKE's ownerBoxKey is a published name (coopgname::kIdName) or the bare current key (kIdBare); after ownerBoxId on the wire
     std::string ownerSection;
     int ownerX, ownerY;
     int quantity;
@@ -159,7 +165,7 @@ struct ItemRequestMsg
     unsigned int holdId;
     int holdHow;
     int holdSlot;
-    ItemRequestMsg() : id(0), dir(0), ownerUid(0), ownerX(0), ownerY(0), quantity(0), takerUid(0),
+    ItemRequestMsg() : id(0), dir(0), ownerUid(0), ownerIdKind(0), ownerX(0), ownerY(0), quantity(0), takerUid(0),
                        takerX(0), takerY(0), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0),
                        trade(0), price(0), ownerBagDone(0), ownerBagShadowed(0), holdId(0u), holdHow(0), holdSlot(-1) {}
 };
@@ -501,6 +507,8 @@ int ObjectByPositionKeyVerdict();
 int BoxKeyCap();
 /* P87 fold 1, MAIN THREAD: the sector a P7n key names (ItBoxKeyParse - no building is touched). 1 = parsed */
 int  BoxKeySector(const char* key, int* sx, int* sy);
+/* ANY THREAD: the position a P7n key carries (x, z, and y when the key holds one, else 0). 1 = parsed */
+int  BoxKeyPosition(const char* key, float* x, float* y, float* z);
 /* M7b slice 2 (T-197). MAIN THREAD: the sector a box / shop / ground key's thing is DECIDED in (a trader home's piece: the home's
    area; the ground: its key's sector), 1 = found. ANY THREAD: the relay map's holder of a sector, never this game (-1 unknown).
    MAIN THREAD: the player a box / shop / ground request goes to - a player-owned box's owner, else the area holder (-1 none). */

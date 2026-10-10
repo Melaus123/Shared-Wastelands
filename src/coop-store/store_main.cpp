@@ -163,6 +163,7 @@
 #include "../common/factionkey.h"   /* a position update re-keys a row's faction from a displayed name to its game-data code */
 #include "../common/worldkeep.h"   /* the rolling .1 backups, the start-up slots.txt shrink check, the world export manifest and the alias table */
 #include "../common/storelink.h"   /* B10-b (review-b10 M-7): StoreHandshakeDecide and its words - the SAME decision the game makes, so the two sides of one handshake cannot disagree about when it is refused */
+#include "../common/dupsquad.h"   /* the duplicate report: each squad record's members grouped by the strict key, read only */
 
 namespace {
 
@@ -4078,6 +4079,51 @@ void RecyclePrunePass(bool atStart)
 double g_recycleNextPruneAt = 0.0;
 void RecycleHourTick() { const double now = NowSec(); if (now < g_recycleNextPruneAt) return; g_recycleNextPruneAt = now + 3600.0; RecyclePrunePass(false); }
 
+/* THE DUPLICATE REPORT - READ ONLY, once per start, the first thing the writer thread does. Every <id>.platoon in
+   the folder is read and each squad's members are grouped by the strict key (src/common/dupsquad.h), so squads an
+   older build doubled are counted, with what inside each file links to the copies, before any trim is decided.
+   It runs on the writer because once the server serves, the writer is the only thread that changes record files:
+   here no file is read half-written and none is held open while a write renames it. Connections are accepted
+   meanwhile; a write queued during the walk waits for it, and the walk's time is in the summary line. */
+const size_t kDupLinesMax = 200;
+void DupReportRun()
+{
+    const long long t0 = MonoUs();
+    dupsquad::Totals tot;
+    std::vector<std::string> lines;
+    long long beyond = 0;
+    const size_t sn = 8;   /* strlen(".platoon") */
+    U8FindData fd; HANDLE h = U8FindFirstFile((g_dir + "\\*.platoon").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const std::string name = fd.cFileName;
+            /* the real suffix: the pattern also matches <id>.platoon.prev through an 8.3 short name */
+            if (name.size() <= sn || _stricmp(name.c_str() + (name.size() - sn), ".platoon") != 0) continue;
+            const FileProbe p = ProbeFile(g_dir + "\\" + name);
+            if (p.kind == coopstore::kFileAbsent) continue;   /* removed between the listing and the read */
+            dupsquad::Report r;
+            if (p.kind == coopstore::kFileReadable && !p.bytes.empty()) dupsquad::Analyse((const unsigned char*)&p.bytes[0], p.bytes.size(), &r);
+            else dupsquad::Clear(&r);   /* could not be read, or holds no bytes: counted unreadable */
+            dupsquad::Add(&tot, r);
+            std::string line;
+            if (dupsquad::RecordLine(SanitizeForLog(name.substr(0, name.size() - sn)), r, &line))
+            {
+                if (lines.size() < kDupLinesMax) lines.push_back(line);
+                else ++beyond;
+            }
+        } while (U8FindNextFile(h, &fd));
+        FindClose(h);
+    }
+    std::string summary;
+    dupsquad::SummaryLine(tot, &summary);
+    Log(summary + "; " + N((MonoUs() - t0) / 1000) + " ms on the writer thread");
+    for (size_t k = 0; k < lines.size(); ++k) Log(lines[k]);
+    if (beyond > 0) Log("[DUP] and " + N(beyond) + " more record(s) with duplicates or unreadable, not listed");
+}
+
 /* WRITER THREAD. The calls the loop made before M14, unchanged, so every failure is counted and logged by the
    same lines (WriteTempFile / RotatePair / SwapIn / WriteMeta; Log() is locked for this). */
 void RunJob(WriteJob* j)
@@ -4094,6 +4140,7 @@ void RunJob(WriteJob* j)
 }
 DWORD WINAPI WriterMain(LPVOID)
 {
+    DupReportRun();   /* read only, before the first job */
     for (;;)
     {
         WaitForSingleObject(g_wqWork, INFINITE);
