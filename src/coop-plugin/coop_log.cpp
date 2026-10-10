@@ -17,6 +17,7 @@
 #include "coop_log.h"
 #include "../common/logrotate.h"   /* the names of the kept copies of earlier launches' logs */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
+#include "../common/modversion.h"   /* the mod's version, the log's first line */
 
 namespace
 {
@@ -63,6 +64,7 @@ namespace
        failed, written into the new log by the first line that finds the file open */
     int  g_rotateDone = 0;
     char g_rotateNote[320];
+    int  g_versionSaid = 0;   /* guarded by g_lock: the version line is this log's first line */
 
     /* The file part of a path, each wchar_t truncated to a char (the names here are ASCII). Allocates nothing. */
     void NarrowFilePart(const std::wstring& path, char* out, size_t outSize)
@@ -274,6 +276,15 @@ namespace
             char timeStr[48];
             FormatTime(timeStr, sizeof(timeStr));
             EnsureFile();
+            if (g_fileState == 1 && g_versionSaid == 0)
+            {
+                /* every log starts with the mod's version */
+                g_versionSaid = 1;
+                char ver[96];
+                _snprintf_s(ver, sizeof(ver), _TRUNCATE, "%s KenshiCoop: Shared Wastelands %s\r\n", timeStr, modversion::kName);
+                DWORD verWritten = 0;
+                ::WriteFile(g_file, ver, (DWORD)strlen(ver), &verWritten, NULL);
+            }
             if (g_fileState == 1 && g_rotateNote[0])
             {
                 /* a failed start-up rotation is said once, as this log's first line */

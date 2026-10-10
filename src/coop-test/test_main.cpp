@@ -55,6 +55,7 @@
 #include "../common/p124stop.h"   /* PROBE P124: a non-player copy's stop - the report reading and the overshoot measure */
 #include "../common/loadedzones.h"   /* the loaded set from the engine's active-zone list */
 #include "../common/recordpos.h"   /* T-694: which known position a record this game writes takes */
+#include "../common/modversion.h"   /* the mod's version */
 #include "../common/lostcopy.h"   /* MSG_RESEND's bytes, the owner's verdict, the lost-copy book, the stale-row rule */
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
 #include "../common/chatwire.h"   /* in-game text chat - the message bytes, the words, Tab, search, the kept lines, chat.cfg */
@@ -36823,6 +36824,15 @@ void t_t599_pace_order_through_held()
     if (!T599Empty(e)) Fail("(c) HeldTake forgets the sender-scoped row");
 }
 
+/* the mod's version: the name is major.minor.patch of its numbers, and the Workshop upload number reads back as the version */
+void t_t700_mod_version()
+{
+    char b[32]; _snprintf_s(b, sizeof(b), _TRUNCATE, "%d.%d.%d", modversion::kMajor, modversion::kMinor, modversion::kPatch);
+    if (std::string(b) != modversion::kName) Fail("the version name is not major.minor.patch of its numbers");
+    if (modversion::UploadNumber() != modversion::kMajor * 10000 + modversion::kMinor * 100 + modversion::kPatch) Fail("upload number formula");
+    if (modversion::kMinor > 99 || modversion::kPatch > 99) Fail("minor and patch must stay below 100 for the upload number to read back");
+}
+
 const TestRow kTests[] =
 {
     { "clock_decide_never_writes_below_current",              t_clock_decide_never_writes_below_current },
@@ -37860,7 +37870,8 @@ const TestRow kTests[] =
     { "t693_nearest_pair_first", t_t693_nearest_pair_first },
     { "t693_more_than_16_twins", t_t693_more_than_16_twins },
     { "t693_id_kind_wire", t_t693_id_kind_wire },
-    { "t693_catchup_pairs_named", t_t693_catchup_pairs_named }
+    { "t693_catchup_pairs_named", t_t693_catchup_pairs_named },
+    { "t700_mod_version", t_t700_mod_version }
 };
 
 }   /* anonymous namespace */

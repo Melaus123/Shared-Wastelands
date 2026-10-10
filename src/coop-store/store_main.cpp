@@ -110,6 +110,7 @@
 #pragma comment(lib, "user32.lib")   /* M14 fold: the hidden window that hears logoff/shutdown (QuitWindowMain) */
 #include <direct.h>
 #include <ctime>
+#include "../common/modversion.h"   /* the mod's version, the log's first line */
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -9267,6 +9268,7 @@ int ServerMain(int argc, char** argv)
     g_log = U8fopen((g_dir + "\\" + swnames::kServerLog).c_str(), "a");   /* the world server's own log (an old world's coop-store.log is only moved, never written) */
     FlushMigNotes(g_log);   /* W2a: what the migration said */
     CloseAskedCheck("after the folder move");   /* after the log opens, so a close during the move is in the log */
+    Log(std::string("Shared Wastelands ") + modversion::kName + " world server");
     Log("coop-store starting: port " + N(port) + " dir " + g_dir + " protocol " + N(kProtocol) + " store-file format 7"
         + (g_ownerId.empty() ? std::string(" (no --owner given)") : " owner '" + g_ownerId + "' from --owner")
         + " max-connected " + N((long long)g_maxConnected) + " first-slot " + N((long long)g_firstSlot)

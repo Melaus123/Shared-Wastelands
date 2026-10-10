@@ -54,6 +54,7 @@
 #include "zones.h"                         /* MyPlayerSector */
 #include "config.h"                        /* ConfigFilePlayerName */
 #include "addresses.h"                     /* AddrTableName, AddrExeFingerprint */
+#include "../common/modversion.h"           /* the mod's version: the report's info line and the title screen's version line */
 #include "soak.h"                          /* GameplayRunning */
 #include "doors.h"                         /* ReportDoors - the door totals go into the log a report packs */
 #include "net/session.h"                   /* SessionProtocolVersion */
@@ -99,6 +100,7 @@ const char* const kTitleBtn  = "BugReportTitleButton";
 const char* const kTitleNoteP = "BugReportTitleNote";
 const char* const kTitleNoteH = "BugReportTitleNoteHead";
 const char* const kTitleNoteB = "BugReportTitleNoteBody";
+const char* const kTitleVer = "SharedWastelandsTitleVersion";
 const char* const kAbout1    = "BugReportAbout1";
 const char* const kAbout2    = "BugReportAbout2";
 const char* const kPauseBtn  = pausemenu::kBugButtonName;
@@ -776,7 +778,7 @@ void StartJob(const std::string& desc, int sendOnly)
     j->gen = gen; j->sendOnly = sendOnly; j->desc = desc;
     const std::string table = AddrTableName(), fp = AddrExeFingerprint();
     j->where = WhereNow();
-    j->info = "Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
+    j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
               + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
     j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->gameFolder = GameFolder();
     if (!sendOnly) coop::ReportDoors();   /* the door totals and reload[...] line go into the log this report packs */
@@ -1227,6 +1229,47 @@ void TitleNoteBuild(MyGUI::Widget* art, int pw, int ph, int margin, const MyGUI:
              + ", in " + fonts + ", on " + where + ")");
 }
 
+/* THE TITLE SCREEN'S VERSION LINE (owner 629): "Shared Wastelands <version>" in the bottom-right corner, directly above the game's own
+   version text, in its font and colour, the two lines ending at the same right edge; not clickable. Without the game's version text:
+   the bottom-right corner, `margin` from both edges, in the game's standard text. A child of the title art, built and taken down with
+   the title button. */
+void TitleVersionBuild(MyGUI::Widget* art, int pw, int ph, int margin)
+{
+    MyGUI::TextBox* t = As<MyGUI::TextBox>(Mk(art, "TextBox", "Kenshi_TextboxStandardText", 0, 0, 10, 10, kTitleVer));
+    if (t == 0) return;
+    t->setNeedMouseFocus(false);
+    t->setCaption(MyGUI::UString(std::string("Shared Wastelands ") + modversion::kName));
+    t->setTextAlign(MyGUI::Align::Right | MyGUI::Align::Bottom);
+    MyGUI::Widget* verW = UiFindLayoutSuffix(art, "VersionText");
+    MyGUI::TextBox* ver = verW != 0 ? As<MyGUI::TextBox>(verW) : 0;
+    if (ver != 0)
+    {
+        t->setFontName(ver->getFontName());
+        t->setTextColour(ver->getTextColour());
+        t->setTextShadow(ver->getTextShadow());
+        t->setTextShadowColour(ver->getTextShadowColour());
+    }
+    t->setSize(pw, ph);
+    const MyGUI::IntSize ts = t->getTextSize();
+    const int w = ts.width + 4, h = ts.height + 2;
+    int right = pw - margin, bottom = ph - margin;
+    if (ver != 0)
+    {
+        /* the right end of the game's version text, wherever its box aligns it */
+        const int vl = ver->getAbsoluteLeft() - art->getAbsoluteLeft(), vt = ver->getAbsoluteTop() - art->getAbsoluteTop();
+        const int vw = ver->getWidth(), tw = ver->getTextSize().width;
+        const MyGUI::Align va = ver->getTextAlign();
+        right = va.isRight() ? vl + vw : (va.isHCenter() ? vl + (vw + tw) / 2 : vl + tw);
+        if (right > pw - 2) right = pw - 2;
+        bottom = vt + (ver->getHeight() - ver->getTextSize().height) / 2;
+    }
+    if (right - w < 0) right = w;
+    if (bottom - h < 0) bottom = h;
+    t->setCoord(right - w, bottom - h, w, h);
+    DebugLog("[UI] title version line \"Shared Wastelands " + std::string(modversion::kName) + "\" at x=" + NumI(right - w) + " y=" + NumI(bottom - h)
+             + " w=" + NumI(w) + " h=" + NumI(h) + (ver != 0 ? " above the game's version text" : " in the corner (no game version text found)"));
+}
+
 /* The note is hidden while Kenshi's CREDITS panel (the main menu layout's CreditsPanel, a child of the title art) is up, and shown
    again when it closes. */
 void NoteCreditsSync(MyGUI::Gui* gui, MyGUI::Widget* art)
@@ -1262,6 +1305,7 @@ void TitleButtonTick(MyGUI::Gui* gui)
     {
         gui->destroyWidget(b); b = 0;
         MyGUI::Widget* np = Find(gui, kTitleNoteP); if (np != 0) gui->destroyWidget(np);
+        MyGUI::Widget* vp = Find(gui, kTitleVer); if (vp != 0) gui->destroyWidget(vp);
     }
     g_titleWired = 0;
     const DWORD now = ::GetTickCount();
@@ -1290,6 +1334,7 @@ void TitleButtonTick(MyGUI::Gui* gui)
     g_titleW = pw;
     g_titleH = ph;
     TitleNoteBuild(art, pw, ph, margin, btn->getCoord());
+    TitleVersionBuild(art, pw, ph, margin);
     NoteCreditsSync(gui, art);
     if (!g_titleLogged)
     {
@@ -1446,6 +1491,8 @@ __declspec(noinline) void TakeDownInner()
     if (t != 0) gui->destroyWidget(t);
     MyGUI::Widget* np = Find(gui, kTitleNoteP);
     if (np != 0) gui->destroyWidget(np);
+    MyGUI::Widget* vp = Find(gui, kTitleVer);
+    if (vp != 0) gui->destroyWidget(vp);
 }
 int TakeDownGuarded()
 {
