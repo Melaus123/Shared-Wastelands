@@ -28,12 +28,14 @@
 
 #include <string>
 #include <vector>   /* mp4: the Hosting screen's adapters and players */
+#include "relaybridge.h"   /* AddrPortForPlayer: a steam:<id> address shows without a port */
 #include <map>      /* mp5: the Game options screen reads the world's options.txt rows */
 #include <utility>
 #include <cstdio>
 #include "gpoptions.h"   /* mp5: the notebook's own gp.* / gt.* range check */
 #include "diskformat.h"  /* the newer-format refusal words */
 #include "resurrectfee.h" /* T-556: the resurrection options' keys and the price rule the fee explanation shows */
+#include "panelfit.h"    /* kWorldDlgReset: which dialog the world dialog screen shows */
 
 namespace coopui {
 
@@ -87,7 +89,7 @@ inline std::string PanelNum(long long v)
 inline std::string PanelAddrText(const std::string& addr, int port)
 {
     if (addr.empty() || port == 0) return std::string("none");
-    return addr + ":" + PanelNum((long long)port);
+    return relaybridge::AddrPortForPlayer(addr, (unsigned int)port);   /* a steam:<id> shows without the route's stand-in port */
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -105,12 +107,10 @@ struct PanelLinkFacts
     long long dialCap;           /* ConfigDialCap() - read rather than repeated */
     int       mySlot;            /* StoreMySlot(), -1 = the notebook has not numbered us */
     long long worldKeyMismatch;  /* ConfigWorldKeyMismatches() */
-    int       hostStartFailed;   /* a host's listen port did not bind - nothing in the game sets it now (a busy port stops the world
-                                    server, which says so in PanelNotebookText's kNbStoppedEarly line), so its words are not shown */
 
     PanelLinkFacts()
         : role(kPanelRoleSingle), worldLinked(0), peers(0), notebookUp(0),
-          dials(0), dialCap(60), mySlot(-1), worldKeyMismatch(0), hostStartFailed(0)
+          dials(0), dialCap(60), mySlot(-1), worldKeyMismatch(0)
     {
     }
 };
@@ -152,24 +152,45 @@ inline const char* PanelLinkStateName(int state)
 const unsigned kPressHostStartMs = 60000u;   /* HOST: the world must answer within this after the press */
 const unsigned kPressJoinWorldMs = 60000u;   /* JOIN: the host's world must answer within this after the host did */
 inline std::string PressQuoted(const std::string& name) { return "\"" + name + "\""; }
-inline std::string PressIntroText(int mode)
+/* T-290 - THE PASSWORD ON SCREEN.  HOST GAME's PASSWORD box (empty = no password).  PASSWORD
+   REQUIRED, the screen a JOIN refused for its password shows in place of the CAN'T JOIN box, opens on kPwNeededLine and after a
+   wrong password reads kPwWrongLine.  The other password and access-list refusals are CAN'T JOIN / CAN'T HOST boxes
+   (PanelRefusalText).  Every sentence here is approved; kPwNeededLine, kPwFileBadText and kAccessFileBadText stay one constant
+   each so each changes in one place (kPwNeededLine names no host: a joiner on the address route does not know the host's name
+   before the WELCOME). */
+const unsigned kPanelPwFieldMax = 64;   /* the most characters either PASSWORD box takes */
+const char* const kPwNeededLine    = "This game needs a password.";
+const char* const kPwWrongLine     = "Wrong password.";
+const char* const kPwBlockedText   = "The host has blocked you from this world.";
+const char* const kPwTooManyText   = "Too many wrong passwords. Joining is blocked for a minute.";
+const char* const kPwFileBadText   = "Couldn't check the password.";
+const char* const kPwNotOnListText = "This world only lets in players the host has added.";
+const char* const kAccessFileBadText = "Couldn't check the host's player list.";
+/* Which PASSWORD REQUIRED line a finished press shows in place of its box: 1 kPwNeededLine (the world needs a password, refusal 8),
+   2 kPwWrongLine (the password was wrong, 9); 0 = the box as for any other refusal - and always for a HOST press.  `pressMode` is
+   PressFacts::mode (0 HOST, 1 JOIN), `refusal` StoreRefusedReason() (-1 none). */
+inline int PressPasswordAsk(int pressMode, int refusal)
 {
-    return mode == 0 ? std::string("Select a world and press HOST.")
-                     : std::string("Enter the host's address (for example 81.2.3.4:7777) and press JOIN.");
+    if (pressMode != 1) return 0;
+    return refusal == 8 ? 1 : refusal == 9 ? 2 : 0;
+}
+inline const char* PressPasswordLine(int ask) { return ask == 2 ? kPwWrongLine : kPwNeededLine; }
+/* A PASSWORD box's text as its MyGUI caption: MyGUI reads '#' as the start of a text tag, so a typed '#' is held as "##" (read back
+   with coopbug::CaptionToPlain, src/common/bugreport.h). */
+inline std::string PanelPwCaption(const std::string& plain)
+{
+    std::string out;
+    for (size_t i = 0; i < plain.size(); ++i) { if (plain[i] == '#') out += '#'; out += plain[i]; }
+    return out;
 }
 inline std::string PressStatusText(int mode, const std::string& world, const std::string& addr)
 {
     return mode == 0 ? "Starting " + PressQuoted(world) + "..." : "Connecting to " + addr + "...";
 }
 inline const char* PressBoxTitle(int mode) { return mode == 0 ? "CAN'T HOST" : "CAN'T JOIN"; }
-inline std::string PressHostPortText(int port)
-{
-    return "Couldn't host on port " + PanelNum((long long)port)
-         + ". It may be in use or blocked by a firewall. Choose a different port and try again.";
-}
-const char* const kPressHostLateText     = "The world didn't start in time. Try again.";
-const char* const kPressJoinNoAnswerText = "The host isn't responding. Check the address and make sure the host is hosting, then try again.";
-const char* const kPressJoinLateText     = "The host's world didn't respond in time. Try again.";
+const char* const kPressHostLateText     = "The world didn't start in time.";
+const char* const kPressJoinNoAnswerText = "The host isn't responding.";
+const char* const kPressJoinLateText     = "The host's world didn't respond in time.";
 
 /* THE SENTENCE.  `addr`/`port` are what this game is set up to reach: the LISTEN port for a host, the
    host's address for a client.  `timeMode` is TimeModeName() and may be null. */
@@ -186,11 +207,6 @@ inline std::string PanelStatusText(const PanelLinkFacts& f, const std::string& a
 
     if (state == kPanelHostWaiting)
     {
-        if (f.hostStartFailed != 0)
-        {
-            s = PressHostPortText(port);   /* T-201 N1: the CAN'T HOST box's words */
-            return s;
-        }
         s = "Hosting on port " + PanelNum((long long)port) + ". Waiting for players...";
     }
     else if (state == kPanelWaitingHost)
@@ -229,8 +245,7 @@ inline std::string PanelStatusText(const PanelLinkFacts& f, const std::string& a
     }
 
     if (f.worldKeyMismatch > 0)
-        s += "\n\nWorld mismatch: you and the host have different worlds selected. One of you must change the world"
-             " name.";
+        s += "\n\nWorld mismatch: you and the host have different worlds selected.";
 
     return s;
 }
@@ -255,13 +270,13 @@ inline std::string PanelNotebookText(int state, int port, long exitCode)
                        " Starting it now would make a new, empty world in its place. Nothing was changed.";
             if (exitCode == swformat::kServerExitWorldLocked)   /* the world's lock is held: another world server runs this world */
                 return "Couldn't host: this world is already running in another program on this computer (another Kenshi, or one left"
-                       " over after a crash). Close it or restart your computer, then try again.";
+                       " over after a crash).";
             return "The world couldn't start (error " + PanelNum((long long)exitCode)
-                 + "). Close other programs that may be using port " + PanelNum((long long)port) + ", or restart your computer.";   /* words1b (owner 2026-09-27) */
+                 + "). Port " + PanelNum((long long)port) + " may be in use.";
         case kNbNoExe:
-            return "A multiplayer file is missing. Reinstall the mod.";
+            return "A multiplayer file is missing.";
         case kNbSpawnFailed:
-            return "The world couldn't start. Try again, or reinstall the mod.";
+            return "The world couldn't start.";
         default:
             return std::string();
     }
@@ -269,27 +284,34 @@ inline std::string PanelNotebookText(int state, int port, long exitCode)
 
 /* mp1 (design-mpmenu1 section 7) - WHY THE SHARED WORLD SAID NO, in the Join screen's words. `reason` is
    coopstore::StoreRefuseReason (src/common/storelink.h: 0 versions, 1 no player id, 2 already in, 3 full, 4 lifetime
-   full, 5 mods) - a pure header may not include it, so the offline suite ties the numbers. -1 = not refused. The mods
+   full, 5 mods, 8-14 the password and the access list) - a pure header may not include it, so the offline suite ties the numbers. -1 = not refused. The mods
    sentence is store.cpp's own (it names what differs) and is passed in; empty falls back to the design's words. */
 inline std::string PanelRefusalText(int reason, const std::string& modsText, int hostMode = 0)   /* T-201 N1b: hostMode 1 = under CAN'T HOST */
 {
     switch (reason)
     {
         case -1: return std::string();
-        case 1:  return hostMode != 0 ? std::string("Couldn't host: your player ID couldn't be sent. Try again.")   /* T-201 N1b (owner 165) */
-                                      : std::string("Couldn't join: your player ID couldn't be sent. Restart Kenshi and try again.");
-        case 2:  return "You're already in this world from another Kenshi window. Close it first.";
-        case 3:  return "This world is full. Try again when someone leaves.";
+        case 1:  return hostMode != 0 ? std::string("Couldn't host: your player ID couldn't be sent.")   /* T-201 N1b (owner 165) */
+                                      : std::string("Couldn't join: your player ID couldn't be sent.");
+        case 2:  return "You're already in this world from another Kenshi window.";
+        case 3:  return "This world is full.";
         case 4:  return "This world has reached its player limit.";
-        case 6:  return "You're already playing in this world from another Kenshi window. Close it first.";   /* prof1: kRefuseSamePerson */
+        case 6:  return "You're already playing in this world from another Kenshi window.";   /* prof1: kRefuseSamePerson */
         case 100: return !modsText.empty() ? modsText
-                       : hostMode != 0 ? std::string("Couldn't host: no profile is available. Try again.")   /* T-201 N1b (owner 165) */
+                       : hostMode != 0 ? std::string("Couldn't host: no profile is available.")   /* T-201 N1b (owner 165) */
                        : std::string("Couldn't join: no profile is available.");   /* prof1 fold: this game's own profile dead end; store.cpp's sentence */
         case 5:  return !modsText.empty() ? modsText
-                      : std::string("Mod mismatch: use the same mods as the host, in the same order, then restart"
-                                    " Kenshi and join again.");
-        default: return "Version mismatch: this multiplayer mod is a different version from the one running the world. Every"
-                         " player needs the same version.";   /* words1b: host-neutral - the host's own game can see it too */
+                      : std::string("Mod mismatch: your mods are different from the host's.");
+        /* T-290: the password and the access list - the same sentence under CAN'T JOIN and CAN'T HOST.  A JOIN refused with 8 or 9
+           shows PASSWORD REQUIRED instead (PressPasswordAsk); these two are its lines. */
+        case 8:  return kPwNeededLine;
+        case 9:  return kPwWrongLine;
+        case 10: return kPwBlockedText;
+        case 11: return kPwTooManyText;
+        case 12: return kPwFileBadText;
+        case 13: return kPwNotOnListText;
+        case 14: return kAccessFileBadText;
+        default: return "Version mismatch: this multiplayer mod is a different version from the one running the world.";   /* words1b: host-neutral - the host's own game can see it too */
     }
 }
 
@@ -299,7 +321,6 @@ struct PressFacts
 {
     int       mode;             /* 0 HOST, 1 JOIN */
     int       armed;            /* the title tick has opened the links since the press (ConfigArmGen moved) */
-    int       hostStartFailed;  /* a host's listen port did not bind - nothing in the game sets it now (see PanelLinkFacts) */
     int       nbState;          /* the world server process we started (kNb*) */
     long      nbExit;           /* its exit code when it stopped */
     int       nbPort;           /* its port */
@@ -314,19 +335,20 @@ struct PressFacts
     std::string openedWorld, theirWorld;   /* ... the world this game already opened, and the one the WELCOME named */
     long      lobbyGen;         /* T552: the store link generation the world's profile LOBBY list arrived on (StoreLobbyAnswerGen), -1 none */
     long      linkGen;          /* T552: the store link's current generation (StoreLinkGen) - a lobby list counts only when the two agree */
-    PressFacts() : mode(0), armed(0), hostStartFailed(0), nbState(kNbNotOurs), nbExit(0), nbPort(27016), port(7777),
+    PressFacts() : mode(0), armed(0), nbState(kNbNotOurs), nbExit(0), nbPort(27016), port(7777),
                    worldLinked(0), notebookUp(0), dials(0), dialCap(60), refusal(-1), elapsedMs(0), linkedMs(0), wrongWorld(0),
                    lobbyGen(-1), linkGen(0) {}
 };
 /* T-201 N1 fold - config.cpp ConfigWorldSwitchRefused's sentence, word for word (already approved). */
 inline std::string PressWrongWorldText(const std::string& opened, const std::string& wanted)
 {
-    return "This game already opened world \"" + opened + "\". Restart Kenshi to play world \"" + wanted + "\".";
+    (void)wanted;   /* the sentence names only the world already opened */
+    return "This game already opened world \"" + opened + "\". Another world needs a restart.";
 }
 /* T-490 (owner, approved) - the world this game opened was deleted and made again under its name: the new one needs a restart. */
 inline std::string PressRemadeWorldText(const std::string& world)
 {
-    return "This game already opened an earlier world named \"" + world + "\". Restart Kenshi to play the new one.";
+    return "This game already opened an earlier world named \"" + world + "\". The new one needs a restart.";
 }
 /* Why a WELCOME was refused (StoreWrongWorldRefusal): another world's name; the same name remade; this computer's copy of the world
    written by a newer build. */
@@ -357,7 +379,6 @@ inline int PressVerdictOf(const PressFacts& f, const std::string& modsText, std:
     {
         if (f.nbState == kNbNoExe || f.nbState == kNbSpawnFailed || f.nbState == kNbStoppedEarly)
             b = PanelNotebookText(f.nbState, f.nbPort, f.nbExit);
-        else if (f.armed != 0 && f.hostStartFailed != 0) b = PressHostPortText(f.port);
         else if (f.armed != 0 && (f.notebookUp != 0 || lobbyAnswered != 0)) return kPressDone;   /* T552: WELCOME or lobby */
         else if (f.elapsedMs >= kPressHostStartMs) b = kPressHostLateText;
     }
@@ -382,7 +403,7 @@ inline int PressVerdictOf(const PressFacts& f, const std::string& modsText, std:
 inline std::string PanelGiveUpMessage(long cap)
 {
     (void)cap;
-    return "The multiplayer menu couldn't open. Press MULTIPLAYER to try again.";
+    return "The multiplayer menu couldn't open.";
 }
 
 /* mp3: WHEN A WORLD WAS LAST PLAYED, in words for the Host a game list.  lastUnix 0 = unknown; fresh = the folder holds
@@ -436,7 +457,7 @@ inline std::string PanelProfileCapLine(unsigned have, unsigned cap)
 {
     if (PanelProfileNewAllowed(have, cap)) return std::string();
     return "Profile limit reached (" + PanelNum((long long)have) + " of " + PanelNum((long long)cap)
-         + "). Delete a profile to create a new one.";
+         + ").";
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -751,27 +772,13 @@ inline int PanelNetAddrHalves(const std::string& wrapped) { return wrapped.find(
 inline int PanelNetAddrButtonsOn(int state) { return state != kNetAddrFailed ? 1 : 0; }
 /* HIDE only while the address is on screen. */
 inline std::string PanelNetAddrShowCaption(int state, const std::string& ip, int shown) { return (PanelNetAddrHave(state, ip) != 0 && shown != 0) ? "HIDE" : "SHOW"; }
-/* The line under the two address rows. */
-inline std::string PanelAddrNoteText()
-{
-    return "Players in your home use the local address. Everyone else uses the internet address.";
-}
-/* T-631 (owner 570): the same line while a game VPN was found - its own network's friends use its address. */
-inline std::string PanelAddrNoteFor(int vpnKind)
-{
-    if (vpnKind == kGameVpnRadmin)
-        return "Players in your home use the local address. Friends on your Radmin network use the Radmin address. Everyone else uses the internet address.";
-    if (vpnKind == kGameVpnHamachi)
-        return "Players in your home use the local address. Friends on your Hamachi network use the Hamachi address. Everyone else uses the internet address.";
-    return PanelAddrNoteText();
-}
 /* What a COPY press says (the HOSTING status area).  netRow 0 = LOCAL ADDRESS, 1 = INTERNET ADDRESS; text = what was put on
    (or failed to reach) the clipboard.  A failed internet copy never prints the address - it may be hidden on screen. */
 inline std::string PanelCopyNote(int netRow, int copied, const std::string& text)
 {
-    if (copied != 0) return "Address copied. Players paste it on the JOIN GAME screen.";
+    if (copied != 0) return "Address copied.";
     if (text.empty()) return "There is no address to copy.";
-    if (netRow != 0) return "Couldn't copy. Press SHOW to see the address.";
+    if (netRow != 0) return "Couldn't copy.";
     return "Couldn't copy. Your address is " + text + ".";
 }
 
@@ -785,9 +792,11 @@ inline std::string PanelScreenTitle(int screen, int profDlg, int hostMode, const
         if (profDlg == 2) return "DELETE PROFILE?";
         return (hostMode != 0 && !hostWorld.empty()) ? "PROFILES: " + hostWorld : std::string("PROFILES");   /* NEW WORDING: was "PROFILES - " */
     }
+    if (screen == 8) return "PASSWORD REQUIRED";   /* T-290 */
+    if (screen == 9) return "INVITE FRIENDS";
     if (screen == 6) return "GAME OPTIONS: " + optWorld;
     if (screen == 5) return "HOSTING: " + hostWorld;
-    if (screen == 4) return "DELETE WORLD?";
+    if (screen == 4) return profDlg == kWorldDlgReset ? "RESET WORLD?" : "DELETE WORLD?";
     if (screen == 3) return "NEW WORLD";
     if (screen == 2) return "JOIN GAME";
     if (screen == 1) return "HOST GAME";
@@ -818,22 +827,13 @@ inline int PanelHostingPort(int livePort, int fieldPort)
     return kPanelDefaultGamePort;
 }
 
-/* The router help: the one port to forward by hand when the router does not open it itself. */
-inline std::string PanelRouterHelpText(int port)   /* the world server's one port: every game joins on it */
-{
-    return "To play over the internet, forward UDP port " + PanelNum((long long)port)
-         + " on your router. If Windows Firewall asks, allow access.";
-}
-
 /* The first line of the Hosting screen's status area.  isHost: this game is set up to host; nbState: this computer's
    shared-world program (kNb*). */
-inline std::string PanelHostingText(int isHost, int hostStartFailed, int nbState, int port)
+inline std::string PanelHostingText(int isHost, int nbState)
 {
-    if (isHost == 0) return "Not hosting. Press BACK, select a world and press HOST.";
-    if (hostStartFailed != 0)
-        return "Port " + PanelNum((long long)port) + " is in use. Press BACK, change the port and press HOST.";
+    if (isHost == 0) return "Not hosting.";
     if (nbState == kNbStoppedEarly || nbState == kNbNoExe || nbState == kNbSpawnFailed)
-        return "The world couldn't start. Try again.";
+        return "The world couldn't start.";
     return "Hosting.";   /* words1b (owner 2026-09-27): the PLAYERS box says "Waiting for players..."; the joiner's give-up line says "the host is hosting" - change together */
 }
 
@@ -846,7 +846,7 @@ inline std::string PanelHostingText(int isHost, int hostStartFailed, int nbState
    player's identity is unusable (coopdata::IdentitySessionOnlyKindOf: 1 UNREADABLE, 2 DAMAGED). */
 const char* const kIdBox1Title    = "CAN'T START MULTIPLAYER";
 const char* const kIdBox1Text     = "Kenshi couldn't read your multiplayer data. Another program (such as antivirus or a backup tool)"
-                                    " may be using it. Restart Kenshi and try again.";
+                                    " may be using it.";
 const char* const kIdBox1Ok       = "OK";
 const char* const kIdBox2Title    = "MULTIPLAYER DATA DAMAGED";
 const char* const kIdBox2Text     = "Your multiplayer data is damaged and couldn't be recovered. You can continue as a new player,"
@@ -989,7 +989,7 @@ inline int BoxBlockStrips(int pw, int ph, int l, int t, int w, int h, int* out)
    so those efforts use these exact words; NOTHING in this effort shows them yet. */
 /* PP6b - the name-taken box (title CAN'T JOIN by NoticeTitle). */
 inline std::string NameTakenText(const std::string& name)
-{ return "The name \"" + name + "\" is already taken in this world. Change PLAYER NAME and try again."; }   /* T-201 N1: double quotes */
+{ return "The name \"" + name + "\" is already taken in this world."; }   /* T-201 N1: double quotes */
 /* T-368 (owner 270 a, exact words): the two boxes about this player's faction name, shown in the game world in Kenshi's own message box
    with Kenshi's own "Faction Name" title and one OK. Back = a rename another player made at the same moment won the name; Moved = the
    world loaded with a name another player of this world already uses. */
@@ -997,9 +997,10 @@ const char* const kFactionBoxTitle = "Faction Name";
 inline std::string FactionBackText(const std::string& asked, const std::string& old)
 { return "Your faction name \"" + asked + "\" is already taken in this world, so it was changed back to \"" + old + "\"."; }
 inline std::string FactionMovedText(const std::string& asked, const std::string& now)
-{ return "Another player in this world already uses the faction name \"" + asked + "\". Your faction is now called \"" + now + "\". You can rename it on the FACTION tab."; }
+{ return "Another player in this world already uses the faction name \"" + asked + "\". Your faction is now called \"" + now + "\"."; }
 /* PP6 - after PLAY on PROFILES: a played profile loads, a never-played one opens Kenshi's NEW GAME. */
 inline std::string ProfLoadingText(const std::string& name)     { return "Loading \"" + name + "\"..."; }   /* T-201 N1: double quotes */
+const char* const kResetMovingText = "Moving your characters into the reset world...";   /* the HOST GAME / JOIN line while the profile is carried into a reset world */
 inline std::string ProfOpeningNewGameText(const std::string& name) { return "Opening NEW GAME for \"" + name + "\"..."; }
 /* T-201 PP6' (approved 2026-09-29): a profile made on PROFILES - PLAY (or the HOST press) loads it by itself now, so the line
    names nothing more to press. */
@@ -1034,14 +1035,72 @@ inline std::string HostProfileValue(const std::string& name, int isNew, int worl
    (ui.cpp LoadFail, which also leaves the world). A: CAN'T LOAD - the load could not be posted / the panel did not close / NEW GAME's
    button was not found. B: CAN'T LOAD - the profile's save is not on this computer (played before and no folder, or a folder with no
    quick.save). C: CAN'T HOST - the host's pick could not be sent. D: CAN'T LOAD - the link or the pick changed while loading. */
-const char* const kLoadFailText     = "Couldn't load your game. Try again.";
+const char* const kLoadFailText     = "Couldn't load your game.";
 /* T-220 (owner 180, approved 2026-09-29): HOST GAME -> CHANGE's DELETE could not edit the world's file - CAN'T DELETE, one OK. */
-const char* const kProfDeleteFailText  = "Couldn't delete that profile. Try again.";
+const char* const kProfDeleteFailText  = "Couldn't delete that profile.";
 const char* const kProfDeleteFailTitle = "CAN'T DELETE";
-const char* const kSaveNotHereText  = "This profile's save couldn't be found on this computer. Copy your save folder from the other computer,"
-                                      " or start a new profile.";
-const char* const kHostPickFailText = "Couldn't host: your profile couldn't be picked. Try again.";
-const char* const kLoadLinkLostText = "The connection to the world was lost while loading. Try again.";
+/* what DELETE WORLD and DELETE PROFILE say once their confirm box is answered - the
+   delete is for good. A failure line is said when Windows will not let a file go (another program has it open); what was
+   deleted before that stays deleted. */
+inline std::string WorldDeletedText(const std::string& world) { return "\"" + world + "\" deleted."; }
+inline std::string WorldDeleteFailText(const std::string& world)
+{ return "Couldn't delete \"" + world + "\": another program is using its files."; }
+/* RESET WORLD (HOST GAME): the confirm dialog's words, in two pieces around its keep-buildings tick box (kResetKeepLabel, unticked
+   each time the dialog opens): ResetWorldDlgHead above it - the question, what starts over and what every player keeps - and
+   ResetWorldDlgTail under it, oldName being the name the world as it was keeps ("<name> - before reset <n>"); then the status line
+   while the world server's --reset-world runs, and the line its exit code gives (exitCode -1 = it was not started). */
+inline std::string ResetWorldDlgHead(const std::string& world)
+{
+    return "Reset \"" + world + "\"?\n\n"
+           "The world goes back to how it was at the start, for every player.\n\n"
+           "Starts over:\n"
+           "  Towns, outposts and the people living in them\n"
+           "  Named characters who died, and who rules each town\n"
+           "  How the factions feel about each other\n"
+           "  The day and time\n"
+           "  Ruins, loot and everything left on the ground\n"
+           "  Buildings and what is stored in them, unless kept below\n\n"
+           "Kept for every player:\n"
+           "  Characters, with their skills, health and equipment\n"
+           "  Money and research\n"
+           "  What each player's map shows\n"
+           "  How each player's faction stands with others";
+}
+const char* const kResetKeepLabel = "Keep players' buildings, furniture and stored items";
+inline std::string ResetWorldDlgTail(const std::string& oldName)
+{
+    return "Players who aren't here now are moved into the reset world the next time they join. The old world is kept as \""
+           + oldName + "\".";
+}
+inline std::string ResetWorldBusyText(const std::string& world)  { return "Resetting \"" + world + "\"..."; }
+inline std::string ResetWorldDoneText(const std::string& world)  { return "\"" + world + "\" was reset."; }
+inline std::string ResetWorldInUseText(const std::string& world) { return "Couldn't reset \"" + world + "\" - its files are in use."; }
+inline std::string ResetWorldFailText(const std::string& world)  { return "Couldn't reset \"" + world + "\"."; }
+/* 0 = the world was split; swformat::kServerExitWorldLocked = a world server holds the world's lock; anything else (a refusal, a
+   failed copy or rename, a crash code such as 3221225477 = 0xC0000005, or -1 = no start at all) = the plain failure line. The code
+   is a long long: Windows gives a DWORD, and a crash code cast to long would turn negative and read as "not started". */
+inline std::string ResetWorldOutcomeText(const std::string& world, long long exitCode)
+{
+    if (exitCode == 0) return ResetWorldDoneText(world);
+    if (exitCode == swformat::kServerExitWorldLocked) return ResetWorldInUseText(world);
+    return ResetWorldFailText(world);
+}
+/* RESET WORLD is lit only for a picked world, while this game neither hosts nor has opened a world (its world server and files
+   would hold the world), the picked world is not in use by this game, and no reset is running. */
+inline int ResetWorldLit(int picked, int hostingNow, int worldOpened, int pickedInUse, int resetRunning)
+{
+    return (picked != 0 && hostingNow == 0 && worldOpened == 0 && pickedInUse == 0 && resetRunning == 0) ? 1 : 0;
+}
+/* HOST GAME's HOST, NEW WORLD, GAME OPTIONS and DELETE WORLD while a reset runs: greyed whatever their own rule (`lit`) says - the
+   reset's world server has the world's files open and is rewriting them, and makes the old world's folder. Each press checks it
+   again (ui.cpp), so a press that arrives before the greying is refused too. */
+inline int WorldButtonLit(int lit, int resetRunning) { return (lit != 0 && resetRunning == 0) ? 1 : 0; }
+inline std::string ProfileDeletedText(const std::string& name) { return "Profile '" + name + "' deleted."; }
+inline std::string ProfileDeleteFailText(const std::string& name)
+{ return "Couldn't delete profile '" + name + "': another program is using its save."; }
+const char* const kSaveNotHereText  = "This profile's save couldn't be found on this computer.";
+const char* const kHostPickFailText = "Couldn't host: your profile couldn't be picked.";
+const char* const kLoadLinkLostText = "The connection to the world was lost while loading.";
 /* T-201 PP6' fold (item 6) - THE LOAD'S POST, AS A PURE STEP (ui.cpp LoadTick stage 2 and LoadTailAct). ready: 1 = the engine takes a
    request now (SaveManager+0xA0 reads 0); 0 = a request is pending (+0xA0 != 0 - readable, and the engine clears it when that request
    is done); -1 = never on this title (no SaveManager, anySavesExist() false, or the post was tried and nothing was posted). A pending
@@ -1067,7 +1126,7 @@ inline std::string SaveDamagedText(const std::string& whenWords)
     return "This profile's save is damaged and can't be loaded. Load the backup from " + whenWords
            + " instead? Progress the world has kept since then is added back after loading.";
 }
-const char* const kSaveNoBackupText = "This profile's save is damaged and there is no backup. Start a new profile.";
+const char* const kSaveNoBackupText = "This profile's save is damaged and there is no backup.";
 /* ui4 - the PLAYERS window (Escape menu). */
 const char* const kPlayersTitle       = "PLAYERS";
 const char* const kPlayersColPlayer   = "PLAYER";
@@ -1247,9 +1306,10 @@ inline std::string OptMoneyText(long long v)
     }
     return "c." + out;
 }
-/* The line under FEE GROWTH: what the growth means with the host's amount filled in - the prices with one to four of a
-   player's brought-back characters alive. Empty while RESURRECTION is not ticked. */
-inline std::string OptFeeExplain(const std::string& on, const std::string& amount, const std::string& growth)
+/* The hover note of RESURRECTION FEE and FEE GROWTH: the prices a player pays with none to four of their brought-back
+   characters alive, the host's amount and growth filled in - or, at an amount of 0, that it is free. Empty while
+   RESURRECTION is not ticked. */
+inline std::string OptFeeNoteText(const std::string& on, const std::string& amount, const std::string& growth)
 {
     if (on != "on") return std::string();
     const std::string a = OptFeeCanon(amount);
@@ -1257,9 +1317,9 @@ inline std::string OptFeeExplain(const std::string& on, const std::string& amoun
     for (size_t k = 0; k < a.size(); ++k) n = n * 10 + (a[k] - '0');
     if (n == 0) return "Bringing back a fallen character is free.";
     const int g = swfee::GrowthCode(growth) == swfee::kGrowthSteady ? swfee::kGrowthSteady : swfee::kGrowthSteep;
-    std::string s = "The more of a player's brought-back characters are alive, the more the next costs: free with none, then ";
-    for (int alive = 1; alive <= 4; ++alive) s += OptMoneyText(swfee::PriceFor(n, g, alive).price) + (alive < 4 ? ", " : " ...");
-    return s;
+    std::string s = "PRICES: free";
+    for (int alive = 1; alive <= 4; ++alive) s += ", " + OptMoneyText(swfee::PriceFor(n, g, alive).price);
+    return s + " ...";
 }
 /* Whether row i is lit (not greyed) with the screen's values `vals` (indexed like OptDefs): RESURRECTION FEE and FEE GROWTH
    grey while RESURRECTION is not ticked; FEE GROWTH also greys at an amount of 0 (always free). Their values are kept. */
@@ -1274,12 +1334,23 @@ inline bool OptRowLit(int i, const std::string* vals)
     const int am = OptIndexOfKey(swfee::kKeyAmount);
     return am >= 0 && OptFeeCanon(vals[am]) != "0";
 }
-/* The note under a tab's rows: the Difficulty tab's Animal nests note, the Multiplayer tab's mods line. */
-inline std::string OptNoteText(int tab)
+/* Whether row i has a hover note on GAME OPTIONS (shown only while the mouse is over its label or its control): ANIMAL
+   NESTS, RESURRECTION FEE and FEE GROWTH. */
+inline bool OptHasHoverNote(int i)
 {
-    if (tab == kOptTabDifficulty) return "Animal nests: only affects areas not yet visited.";
-    if (tab == kOptTabCoop) return "All players must use the same mods as the host.";
-    return std::string();
+    if (i < 0 || i >= kOptCount) return false;
+    const std::string k = OptDefs()[i].key;
+    return k == "gp.nnm" || k == swfee::kKeyAmount || k == swfee::kKeyGrowth;
+}
+/* Row i's hover note with the screen's values `vals` (indexed like OptDefs), or "" for none: ANIMAL NESTS' note, and for
+   both RESURRECTION FEE and FEE GROWTH the same OptFeeNoteText. */
+inline std::string OptHoverText(int i, const std::string* vals)
+{
+    if (!OptHasHoverNote(i)) return std::string();
+    if (std::string(OptDefs()[i].key) == "gp.nnm") return "Animal nests: only affects areas not yet visited.";
+    const int on = OptIndexOfKey(swfee::kKeyOn), am = OptIndexOfKey(swfee::kKeyAmount), gr = OptIndexOfKey(swfee::kKeyGrowth);
+    if (on < 0 || am < 0 || gr < 0) return std::string();
+    return OptFeeNoteText(vals[on], vals[am], vals[gr]);
 }
 /* The notebook's float text: the same %.9g of a float that settings.cpp writes, so the texts compare equal. */
 inline std::string OptFloatText(double d)

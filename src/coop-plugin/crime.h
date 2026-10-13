@@ -31,6 +31,12 @@ void CrimeTick();
 void ApplyRemoteCrime(unsigned int uid, const coopcrime::CrimeState& s, unsigned int fromPeer);
 void CrimeNoteMalformed();
 void CrimeNoteDroppedBlocked();
+// MSG_CRIME kind 1, MAIN THREAD (the session drain): a crime another game's engine recorded on its copy of a character THIS game
+// drives - queued for the K2 safe point, where it is recorded on this game's own character (CrimeApplyDrain).
+void ApplyRemoteCopyWrite(unsigned int uid, const coopcrime::CrimeState& s, unsigned int fromPeer);
+// ANY THREAD (Dialogue::sendEvent's detour, speech.cpp): counts the crime witness events 0x29, 0x2A, 8 and 0x11 this game's
+// engine raises, and those about a replicated character. Address compares and interlocked counts only.
+void CrimeNoteWitnessEvent(int what, const void* who);
 
 // crime5 (docs/design-crime.md 3 C): MAIN THREAD (the session drain). A decoded MSG_BOUNTY: kind 0 = the owner's whole list for
 // a copy here (accepted only from the uid's owner), kind 1 = what a guard on the other game added to its copy of a character

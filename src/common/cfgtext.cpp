@@ -1,5 +1,6 @@
 /* src/common/cfgtext.cpp - see cfgtext.h.  PURE: no Windows.h, no Debug.h, no globals, no I/O. */
 #include "cfgtext.h"
+#include "relaybridge.h"   /* the steam:<id> address form */
 #include "names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "worlddir.h"    /* W1w: coopworld::DisplayNameOk - the playername key's one rule */
 #include "areaclaim.h"   /* B13: coopstore::PlayerIdOk - the notebook refuses a malformed id too, so the shape rule lives in ONE place */
@@ -9,7 +10,9 @@
 namespace coopcfg {
 
 CfgFields::CfgFields()
-    : role(kCfgSingle), hostPort(0), storePort(0), slot("s1"), modSalt(0), profileTest(0), ownSave(1), joinViaWorld(0), routerPort(1)
+    : role(kCfgSingle), hostPort(0), storePort(0), slot("s1"), modSalt(0), profileTest(0), ownSave(1), joinViaWorld(0), routerPort(1),
+      relayTestMode(kRelayTestNone), relayTestPort(0), relayLagMs(0), relayLossPct(0), relayTestCap(0), relayTestDials(0),
+      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0)
 {
     /* B13: playerId is deliberately EMPTY by default and never invented here. This is a text layer; the
        thing that generates an id is config.cpp, once, and it writes the file back when it does. */
@@ -44,6 +47,7 @@ bool CfgPortTextOk(const std::string& p, unsigned short* port)
 
 bool CfgSplitAddr(const std::string& v, std::string* addr, unsigned short* port)
 {
+    if (relaybridge::SplitSteamValue(v, addr, port)) return true;   /* steam:<id> alone: the Steam route needs no port */
     const std::string::size_type c = v.find_last_of(':');
     if (c == std::string::npos || c == 0 || c + 1 >= v.size()) return false;
     unsigned short p = 0;
@@ -114,12 +118,12 @@ bool CfgPortFieldOk(const std::string& text, unsigned short* port, std::string* 
     const std::string t = CfgTrim(text);
     if (t.empty())
     {
-        if (why != 0) *why = "Enter a port (1-65535). The default is 7777.";
+        if (why != 0) *why = "No port entered.";
         return false;
     }
     if (!CfgPortTextOk(t, port))
     {
-        if (why != 0) *why = "\"" + t + "\" isn't a valid port. Use a number from 1 to 65535.";
+        if (why != 0) *why = "\"" + t + "\" isn't a valid port.";
         return false;
     }
     return true;
@@ -132,14 +136,14 @@ bool CfgAddrFieldOk(const std::string& text, const char* what,
     const std::string t = CfgTrim(text);
     if (t.empty())
     {
-        if (why != 0) *why = "Enter the host's address, for example 192.168.1.20:7777.";
+        if (why != 0) *why = "No host address entered.";
         return false;
     }
     std::string a;
     unsigned short p = 0;
     if (!CfgSplitAddr(t, &a, &p))
     {
-        if (why != 0) *why = "\"" + t + "\" isn't a valid " + label + ". Use the form 192.168.1.20:7777.";
+        if (why != 0) *why = "\"" + t + "\" isn't a valid " + label + ".";
         return false;
     }
     if (!CfgHostTextPlausible(a))
@@ -149,7 +153,7 @@ bool CfgAddrFieldOk(const std::string& text, const char* what,
     }
     if (a == "0.0.0.0")
     {
-        if (why != 0) *why = "0.0.0.0 can't be joined. Enter the host's IP address.";   /* it is what a host listens on */
+        if (why != 0) *why = "0.0.0.0 can't be joined.";   /* it is what a host listens on */
         return false;
     }
     if (addr != 0) *addr = a;
@@ -163,12 +167,12 @@ bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, st
     const std::string t = CfgTrim(text);
     if (t.empty())
     {
-        if (why != 0) *why = "Enter a " + label + ".";
+        if (why != 0) *why = "No " + label + " entered.";
         return false;
     }
     if (t.size() > maxLen)
     {
-        if (why != 0) *why = "The " + label + " is too long. Keep it to " + NumText((unsigned long)maxLen) + " characters or fewer.";
+        if (why != 0) *why = "The " + label + " is too long (" + NumText((unsigned long)maxLen) + " characters max).";
         return false;
     }
     for (std::string::size_type i = 0; i < t.size(); ++i)
@@ -179,13 +183,13 @@ bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, st
                        || (unsigned char)ch < 0x20);
         if (bad)
         {
-            if (why != 0) *why = "The " + label + " can't contain '" + std::string(1, ch) + "'. Use letters, numbers, spaces, - and _ only.";
+            if (why != 0) *why = "The " + label + " can't contain '" + std::string(1, ch) + "'.";
             return false;
         }
         /* owner decision 249 a: a space is allowed inside the name, never two in a row (the ends were trimmed off above) */
         if (ch == ' ' && i + 1 < t.size() && t[i + 1] == ' ')
         {
-            if (why != 0) *why = "Use letters, numbers, spaces, - and _ only.";
+            if (why != 0) *why = "That name has a character that can't be used.";
             return false;
         }
     }
@@ -326,6 +330,77 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "profile='" + val + "' is not a number 0-9999 - ignored"; notes->push_back(nt); }
             }
         }
+        else if (key == "relaytest")   /* TEST ONLY - see CfgFields::relayTestMode; a value it cannot read runs nothing */
+        {
+            int m = kRelayTestNone; unsigned short p = 0;
+            if (CfgRelayTestOk(val, &m, &p))
+            {
+                f.relayTestMode = m; f.relayTestPort = p; f.relayTestCap = 0; f.relayTestDials = 0;
+                if (m == kRelayTestMany) CfgRelayManyOk(val, 0, &f.relayTestCap, &f.relayTestDials);
+            }
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "relaytest='" + val + "' is not listen:<port>, dial:127.0.0.1:<port>, pair or many:<port>:<cap>:<dials> - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "relaylag" || key == "relayloss")   /* TEST ONLY - fake lag ms 0-1000 / loss percent 0-50 */
+        {
+            const bool lag = (key == "relaylag");
+            const std::string v = CfgTrim(val);
+            int n = 0; bool ok = !v.empty() && v.size() <= 4;
+            for (size_t i = 0; ok && i < v.size(); ++i) { if (v[i] < '0' || v[i] > '9') ok = false; else n = n * 10 + (v[i] - '0'); }
+            if (ok && n > (lag ? 1000 : 50)) ok = false;
+            if (ok) { if (lag) f.relayLagMs = n; else f.relayLossPct = n; }
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = key + "='" + val + "' is not a number 0-" + (lag ? "1000" : "50") + " - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "relaybridge")   /* TEST ONLY - see CfgFields::relayBridgeMode */
+        {
+            int m = kRelayBridgeOn; unsigned short p = 0;
+            if (CfgRelayBridgeOk(val, &m, &p)) { f.relayBridgeMode = m; f.relayBridgePort = p; }
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "relaybridge='" + val + "' is not on, off or ip:<port> - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "relayvia")   /* TEST ONLY - see CfgFields::relayViaPort */
+        {
+            unsigned short p = 0;
+            if (CfgRelayViaOk(val, &p)) f.relayViaPort = p;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "relayvia='" + val + "' is not ip:<port> - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "relaycap")   /* TEST ONLY - see CfgFields::relayCap */
+        {
+            int c = 0;
+            if (CfgRelayCapOk(val, &c)) f.relayCap = c;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "relaycap='" + val + "' is not a number 1-32 - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "parityholdsec")   /* T-734 TEST ONLY - see CfgFields::parityHoldSec; seconds 0-600, one to three digits */
+        {
+            const std::string v = CfgTrim(val);
+            int n = 0; bool ok = !v.empty() && v.size() <= 3;
+            for (size_t i = 0; ok && i < v.size(); ++i) { if (v[i] < '0' || v[i] > '9') ok = false; else n = n * 10 + (v[i] - '0'); }
+            if (ok && n > 600) ok = false;
+            if (ok) f.parityHoldSec = n;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "parityholdsec='" + val + "' is not a number 0-600 - ignored"; notes->push_back(nt); }
+            }
+        }
         else if (key == "modfingerprint_salt")   /* settings5 S5: TEST ONLY; the fold reads false/off/no as off too */
         { const std::string lv = CfgLower(CfgTrim(val)); f.modSalt = (lv.empty() || lv == "0" || lv == "false" || lv == "off" || lv == "no") ? 0 : 1; }
         else if (key == "joinvia")   /* M11a S1: TEST ONLY - world = the world road; anything else is the session road */
@@ -422,6 +497,102 @@ int CfgIncompleteReason(const CfgFields& f)
     if (f.hostPort == 0) return 1;
     if (f.role == kCfgClient && f.hostAddr.empty()) return 2;
     return 0;
+}
+
+bool CfgRelayTestOk(const std::string& text, int* mode, unsigned short* port)
+{
+    const std::string v = CfgLower(CfgTrim(text));
+    int m = kRelayTestNone;
+    unsigned short p = 0;
+    if (v == "pair")
+        m = kRelayTestPair;
+    else if (v.size() > 7 && v.compare(0, 7, "listen:") == 0)
+    {
+        if (!CfgPortTextOk(v.substr(7), &p)) return false;
+        m = kRelayTestListen;
+    }
+    else if (v.size() > 15 && v.compare(0, 15, "dial:127.0.0.1:") == 0)
+    {
+        if (!CfgPortTextOk(v.substr(15), &p)) return false;
+        m = kRelayTestDial;
+    }
+    else if (v.size() > 5 && v.compare(0, 5, "many:") == 0)
+    {
+        if (!CfgRelayManyOk(v, &p, 0, 0)) return false;
+        m = kRelayTestMany;
+    }
+    else
+        return false;
+    if (mode != 0) *mode = m;
+    if (port != 0) *port = p;
+    return true;
+}
+
+bool CfgRelayManyOk(const std::string& text, unsigned short* port, int* cap, int* dials)
+{
+    const std::string v = CfgLower(CfgTrim(text));
+    if (v.size() <= 5 || v.compare(0, 5, "many:") != 0) return false;
+    const std::string rest = v.substr(5);
+    const size_t c1 = rest.find(':');
+    if (c1 == std::string::npos) return false;
+    const size_t c2 = rest.find(':', c1 + 1);
+    if (c2 == std::string::npos || rest.find(':', c2 + 1) != std::string::npos) return false;
+    unsigned short p = 0;
+    if (!CfgPortTextOk(rest.substr(0, c1), &p)) return false;
+    const std::string parts[2] = { rest.substr(c1 + 1, c2 - c1 - 1), rest.substr(c2 + 1) };
+    int n[2] = { 0, 0 };
+    for (int k = 0; k < 2; ++k)
+    {
+        if (parts[k].empty() || parts[k].size() > 2) return false;
+        for (size_t i = 0; i < parts[k].size(); ++i)
+        {
+            if (parts[k][i] < '0' || parts[k][i] > '9') return false;
+            n[k] = n[k] * 10 + (parts[k][i] - '0');
+        }
+    }
+    if (n[0] < 1 || n[0] > kRelayManyCapMax || n[1] < 1 || n[1] > kRelayManyDialsMax) return false;
+    if (port != 0) *port = p;
+    if (cap != 0) *cap = n[0];
+    if (dials != 0) *dials = n[1];
+    return true;
+}
+
+bool CfgRelayBridgeOk(const std::string& text, int* mode, unsigned short* port)
+{
+    const std::string v = CfgLower(CfgTrim(text));
+    int m = kRelayBridgeOn;
+    unsigned short p = 0;
+    if (v == "on") m = kRelayBridgeOn;
+    else if (v == "off") m = kRelayBridgeOff;
+    else if (v.size() > 3 && v.compare(0, 3, "ip:") == 0 && CfgPortTextOk(v.substr(3), &p)) m = kRelayBridgeIp;
+    else return false;
+    if (mode != 0) *mode = m;
+    if (port != 0) *port = p;
+    return true;
+}
+
+bool CfgRelayViaOk(const std::string& text, unsigned short* port)
+{
+    const std::string v = CfgLower(CfgTrim(text));
+    unsigned short p = 0;
+    if (v.size() <= 3 || v.compare(0, 3, "ip:") != 0 || !CfgPortTextOk(v.substr(3), &p)) return false;
+    if (port != 0) *port = p;
+    return true;
+}
+
+bool CfgRelayCapOk(const std::string& text, int* cap)
+{
+    const std::string v = CfgTrim(text);
+    if (v.empty() || v.size() > 2) return false;
+    int n = 0;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (v[i] < '0' || v[i] > '9') return false;
+        n = n * 10 + (v[i] - '0');
+    }
+    if (n < 1 || n > kRelayCapMax) return false;
+    if (cap != 0) *cap = n;
+    return true;
 }
 
 }   /* namespace coopcfg */

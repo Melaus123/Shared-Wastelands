@@ -68,7 +68,7 @@ inline std::string PlayerStoreName(const std::string& worldKey, const std::strin
     return "mp-" + part + "-" + Hex8(h);
 }
 /* Every records store name for these world spellings and these profile ids (PlayerStoreName of each pair), each once and never "" -
-   the stores a deleted world leaves on this computer (coopprof::WorldLeftoversFind gives the two lists). */
+   the stores a deleted world leaves on this computer (swdel::WorldDeleteFind gives the two lists). */
 inline std::vector<std::string> PlayerStoreNamesFor(const std::vector<std::string>& worldKeys, const std::vector<std::string>& profileIds,
                                                     const std::string& worldId = std::string())
 {
@@ -81,8 +81,67 @@ inline std::vector<std::string> PlayerStoreNamesFor(const std::vector<std::strin
         }
     return out;
 }
+/* T-36: THIS WORLD'S STORE UNDER AN EARLIER NAME OF THE WORLD. A world keeps its id when its name changes (the world as it was before
+   a reset), and a records store keeps the name it was made under. The names to look for, in order, when the store named for the
+   current name (currentKey) is not there: PlayerStoreName of each other name this world had (otherKeys) with this profile and the
+   world's id - each once, never the current name's store, never "". No id = none (a store named before ids carries no id). The id is
+   in every one of them, so any that exists is this world's and this profile's. */
+inline std::vector<std::string> PlayerStoreNamesById(const std::string& currentKey, const std::vector<std::string>& otherKeys,
+                                                     const std::string& profileId, const std::string& worldId)
+{
+    std::vector<std::string> out;
+    if (worldId.empty()) return out;
+    const std::string cur = PlayerStoreName(currentKey, profileId, worldId);
+    for (size_t i = 0; i < otherKeys.size(); ++i)
+    {
+        const std::string s = PlayerStoreName(otherKeys[i], profileId, worldId);
+        if (!s.empty() && s != cur && std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+    }
+    return out;
+}
+/* T-36: THE RECORDS STORE OF THE WORLD AS IT WAS, FOR THE RESET WORLD'S CARRY - named for the earlier id oldId under the name it was
+   made under. The names to look for, in order: the one named for carriedKey (the world name the carried save folder's key file holds -
+   the name that save, and so its store, was last made under), then for each of otherKeys (the other names a save folder of oldId
+   carried, the world's current name, the name before " - before reset <n>"), each once, never "". No oldId = none. */
+inline std::vector<std::string> CarryOldStoreNames(const std::string& carriedKey, const std::vector<std::string>& otherKeys,
+                                                   const std::string& profileId, const std::string& oldId)
+{
+    std::vector<std::string> out;
+    if (oldId.empty()) return out;
+    const std::string first = PlayerStoreName(carriedKey, profileId, oldId);
+    if (!first.empty()) out.push_back(first);
+    const std::vector<std::string> more = PlayerStoreNamesById(carriedKey, otherKeys, profileId, oldId);
+    out.insert(out.end(), more.begin(), more.end());
+    return out;
+}
+inline std::string StoreNameFold(const std::string& s)
+{
+    std::string o(s);
+    for (size_t i = 0; i < o.size(); ++i) if (o[i] >= 'A' && o[i] <= 'Z') o[i] = (char)(o[i] - 'A' + 'a');
+    return o;
+}
+/* T-36: THE STORE A SAVE'S MARK NAMES (multiplayer.mark: the store its last save's records went to), taken for world id worldId when
+   the save folder is that world's and profile's (found by its key file's id): only a player's own store ("mp-"), the mark's own
+   profile, never the current name's store (looked for first) and never the store named before world ids (named / legacy, case
+   ignored) - and only a store named for this world: PlayerStoreName of one of worldKeys (the names this world's id was saved under)
+   with this profile and worldId, or with no id when the world was upgraded to an id (upgraded: the rule that lets such a world take
+   its store from before ids). */
+inline bool MarkStoreTakeById(const std::string& store, const std::string& markProfile, const std::string& profileId,
+                              const std::string& named, const std::string& legacy, const std::vector<std::string>& worldKeys,
+                              const std::string& worldId, bool upgraded)
+{
+    if (store.size() < 4 || store.compare(0, 3, "mp-") != 0 || profileId.empty() || markProfile != profileId) return false;
+    const std::string s = StoreNameFold(store);
+    if (s == StoreNameFold(named) || s == StoreNameFold(legacy)) return false;
+    for (size_t i = 0; i < worldKeys.size(); ++i)
+    {
+        if (!worldId.empty() && s == StoreNameFold(PlayerStoreName(worldKeys[i], profileId, worldId))) return true;
+        if (upgraded && s == StoreNameFold(PlayerStoreName(worldKeys[i], profileId))) return true;
+    }
+    return false;
+}
 /* T-251: OPEN THE PLAYER'S STORE NOW? The cfg lever on (the default), the profile's save folder decided (SaveRedirectWanted:
-   multiplayer, a picked profile, its folder), nothing holding the records off (this store refused, a repaired world's restart,
+   multiplayer, a picked profile, its folder), nothing holding the records off (this store refused,
    a writer fault), a name to open - and either no store open yet, or the open store is one this opened by itself for another
    world or profile. A store a test chose with `ownsave <name>` is never replaced.
    T-251 fold item 1: NO LIVE WORLD IS NEEDED. The store opens at the title as soon as the folder is decided (the WELCOME that
@@ -164,7 +223,7 @@ struct IndexLine
     unsigned int       crc;        /* CRC-32 (storemeta's) of those bytes */
     long long          writtenAt;  /* unix seconds, this PC's clock */
     int                chars;      /* characters in the squad when it was written */
-    bool               stamped;    /* restore1c: o2 - the repair epoch and the notebook seq this game had seen at the write */
+    bool               stamped;    /* o2 - the epoch and notebook seq stamped at the write by the builds that had the world repair (removed in T-716); read and kept, used by nothing */
     unsigned int       epoch;
     unsigned long long nbSeq;
     IndexLine() : seq(0), len(0), crc(0), writtenAt(0), chars(0), stamped(false), epoch(0), nbSeq(0) {}
@@ -275,6 +334,13 @@ inline bool ParseIndexHeader(const std::string& lineIn, std::string* world, std:
 inline bool IdentityMatches(const std::string& aw, const std::string& ap, const std::string& bw, const std::string& bp)
 {
     return !aw.empty() && aw == bw && ap == bp;
+}
+/* T-36: THE SAME, FOR A STORE NAMED FOR THIS WORLD'S ID (byId): the profile must match; the world name may differ - the store's own
+   name carries the id, and its own.index or a save's mark may name the world by the name it had then (the world as it was before a
+   reset keeps its id under a new name). */
+inline bool IdentityMatchesWorld(const std::string& aw, const std::string& ap, const std::string& bw, const std::string& bp, bool byId)
+{
+    return IdentityMatches(aw, ap, bw, bp) || (byId && !aw.empty() && ap == bp);
 }
 
 /* THE SEQUENCE COUNTER SURVIVES A CRASH WITHOUT A FILE OF ITS OWN: at open it is the highest seq in the index. Lines
@@ -1021,7 +1087,6 @@ inline std::string HostLeftFallbackLine(int kind, int saveState, bool exiting, b
     std::string s = kind == kHlLost ? std::string("Connection lost. Reconnecting to host...") : std::string(HostLeftSentence(kind));
     if (exiting) s += " Closing the game...";
     else if (saveState == kHlSaving) s += " Saving your game...";
-    else if (kind == kHlLost) s += " Press Escape to open the menu and quit.";   /* ui1 review MED: say how to leave when nothing closes on its own; ui1c: Escape opens the pause menu, the player still chooses quit */
     else if (kind == kHlAnnounced && !harnessDriven) s += " Kenshi will close in 20 seconds.";
     return s;
 }
@@ -1597,6 +1662,43 @@ inline void MergeBuildRows(const std::vector<BuildRow>& file, const std::vector<
    help1 fold 3 (finding 2): a key may carry one row per placement nonce (the rows of a replaced placement settle apart) - (key, nonce)
    is what must not repeat. */
 inline std::string HelpRecKey() { return "pp.help"; }
+/* THE RECORDS CARRIED INTO A RESET WORLD (store.cpp ResetCarryRekey copies the player's store): every record but the player's buildings
+   (pp.build) and help rows (pp.help) - in the reset world a player's buildings come only from the world server's area records. */
+inline bool CarryKeyDropped(const std::string& key) { return key == BuildRecKey() || key == HelpRecKey(); }
+/* A file of the store, by name (any case): <key>.rec, <key>.rec.prev or <key>.rec.<pid>.tmp of a record left behind. */
+inline bool CarryFileDropped(const std::string& name)
+{
+    std::string l(name);
+    for (std::string::size_type i = 0; i < l.size(); ++i) if (l[i] >= 'A' && l[i] <= 'Z') l[i] = (char)(l[i] - 'A' + 'a');
+    const std::string keys[2] = { BuildRecKey(), HelpRecKey() };
+    for (int k = 0; k < 2; ++k)
+    {
+        const std::string r = RecFile(keys[k]);
+        if (l == r || (l.size() > r.size() && l.compare(0, r.size(), r) == 0 && l[r.size()] == '.')) return true;
+    }
+    return false;
+}
+/* own.index without the lines of the records left behind, so the copy's index names only records it holds: the identity line and every
+   other line byte for byte (a line that does not parse is kept). *dropped (may be 0) = the keys left out, each once, in order seen. */
+inline std::string CarryIndexText(const std::string& text, std::vector<std::string>* dropped)
+{
+    std::string out;
+    std::string::size_type from = 0;
+    while (from < text.size())
+    {
+        const std::string::size_type nl = text.find('\n', from);
+        const std::string seg = text.substr(from, nl == std::string::npos ? std::string::npos : nl - from + 1);
+        from = (nl == std::string::npos) ? text.size() : nl + 1;
+        IndexLine l;
+        if (!IsIndexHeader(seg) && ParseIndexLine(seg, &l) && CarryKeyDropped(l.key))
+        {
+            if (dropped != 0 && std::find(dropped->begin(), dropped->end(), l.key) == dropped->end()) dropped->push_back(l.key);
+            continue;
+        }
+        out += seg;
+    }
+    return out;
+}
 const unsigned int kHelpRecMats = 16;   /* buildwire.h kBuildMaxMats */
 const int kHelpRecSlotMax = 1023;        /* the notebook's slots 0..1023 (buildwire.h kBuildOwnerSlotMax) */
 struct HelpRecRow

@@ -15,6 +15,7 @@
 #include <cstring>
 #include <vector>
 #include "modlist.h"   /* T-246 (store protocol 57): the world's mod list rides in a kModsDiffers WELCOME */
+#include "relaybridge.h"   /* AddrForLog: a reason names a steam:<id> host without its id */
 
 namespace coopstore {
 
@@ -87,7 +88,14 @@ enum StoreRefuseReason
     kRefuseLifetimeFull = 4,  /* M1 (protocol 43): this id is new and the world has admitted its lifetime limit of players; word 4 = the limit */
     kRefuseMods        = 5,  /* settings5 S5 (protocol 46): this game's mod list is not the world's (src/common/modlist.h); words 4-5 are 0 and the world's list follows them. T-246: sent for a differing list only under coopmods::kModsMismatchRefuse (T-247); under the warn default the game is admitted with kModsDiffers */
     kRefuseSamePerson  = 6,  /* prof1 (protocol 48): this PERSON already plays in this world (any of their profiles) on a connection that is live right now; words 4-5 are 0 */
-    kRefuseLiveProtocol = 7   /* M11a S1 (protocol 61; manager decision 1(a)): this game's GAME-TO-GAME protocol (the STORE_HELLO's tail, src/common/joinstage.h) differs from the games already in this world; words 4-5 = theirs, this game's. A game that does not know 7 reads it as the protocol refusal, which names the same fix (the same mod version) */
+    kRefuseLiveProtocol = 7,  /* M11a S1 (protocol 61; manager decision 1(a)): this game's GAME-TO-GAME protocol (the STORE_HELLO's tail, src/common/joinstage.h) differs from the games already in this world; words 4-5 = theirs, this game's. A game that does not know 7 reads it as the protocol refusal, which names the same fix (the same mod version) */
+    kRefusePasswordNeeded = 8,  /* the world has a password (auth.txt) and this game showed none - it has no password for this world; words 4-5 are 0 */
+    kRefuseWrongPassword  = 9,  /* this game's proof did not match the world's password; counts toward the player's wait (authlock.h) */
+    kRefuseNotAllowed     = 10, /* access.txt: this player is blocked - accessrule.h */
+    kRefuseTooManyWrong   = 11, /* too many wrong passwords in a row: this player waits out its minute (authlock.h) - the password was not checked */
+    kRefuseAuthFileBad    = 12, /* the world's auth.txt is there but holds no readable key: nobody is let in until the host hosts again and writes it anew */
+    kRefuseNotOnList      = 13, /* access.txt in allow-list mode: this player is not on the list (an address joiner has no Steam-checked id, so never is) - accessrule.h */
+    kRefuseAccessUnreadable = 14  /* access.txt is there but could not be read: nobody but the owner is let in until it can be (it fails closed) */
 };
 
 /* A count with thousands commas, so the sentence reads "65,520" as the limit is named everywhere else. */
@@ -105,6 +113,13 @@ inline std::string StoreRefuseCount(unsigned int v)
 inline std::string StoreRefuseReasonText(unsigned int reason, unsigned int storeProtocol, unsigned int gameProtocol,
                                          unsigned int n1 = 0, unsigned int n2 = 0)
 {
+    if (reason == (unsigned int)kRefusePasswordNeeded) return std::string("the world needs a password");
+    if (reason == (unsigned int)kRefuseWrongPassword)  return std::string("the password was wrong");
+    if (reason == (unsigned int)kRefuseNotAllowed)     return std::string("this world does not let you in (the host's access list)");
+    if (reason == (unsigned int)kRefuseTooManyWrong)   return std::string("too many wrong passwords - wait a minute");
+    if (reason == (unsigned int)kRefuseAuthFileBad)    return std::string("the world's password file is damaged - the host must host again");
+    if (reason == (unsigned int)kRefuseNotOnList)      return std::string("this world only lets in players the host has added (the host's access list)");
+    if (reason == (unsigned int)kRefuseAccessUnreadable) return std::string("the host's player list could not be read - the host must host again");
     if (reason == (unsigned int)kRefuseFull)
     {
         const unsigned int lim = n2 ? n2 : 256u;
@@ -138,6 +153,14 @@ inline std::string StoreRefuseReasonText(unsigned int reason, unsigned int store
                            " connection this same player left behind is silent, and the notebook drops it for the"
                            " new one instead of refusing - B13-c.)");
     return StoreHandshakeRefusalText(storeProtocol, gameProtocol);
+}
+
+/* A REFUSAL THE PLAYER MUST ANSWER. The password and access refusals, and a damaged password file, are not an outage and not a full
+   world: dialling again gets the same answer (and wrong passwords lead to the wait), so the join stops dialling until the player
+   acts. */
+inline bool StoreRefuseStopsJoin(unsigned int reason)
+{
+    return reason >= (unsigned int)kRefusePasswordNeeded && reason <= (unsigned int)kRefuseAccessUnreadable;
 }
 
 /* ---- IS THE NOTEBOOK LINK TO BE RE-DIALLED ON THIS TICK (B12-e / B12-f, T238) ----
@@ -245,6 +268,25 @@ const unsigned int kStoreWelcomeWorldMax = 256;
 const unsigned int kStoreWelcomeIdSince     = 69;
 const unsigned int kStoreWelcomeWorldIdMax  = 40;
 const unsigned int kStoreWelcomeIdUpgraded  = 1u;
+/* Store protocol 91: right after the world id field's flags, {u32 len, len bytes} - the player id the world server knows this game by
+   (the HELLO's id through the world's aliases.txt; len 0 = none). Written and read on every WELCOME of protocol kStoreWelcomePersonSince
+   or later that carries a world; a field longer than kStoreWelcomePersonMax or running past the payload is not read (personMalformed)
+   and neither is anything after it. It sits before the mods because the world guard's tail has no length and runs to the end. */
+const unsigned int kStoreWelcomePersonSince = 91;
+const unsigned int kStoreWelcomePersonMax   = 64;
+/* Store protocol 93: right after the player id field, the world's reset history - {u32 count, then per earlier id {u32 len, len bytes,
+   u32 flags, u64 reset unix time}} (world.txt lines 3 and 4, oldest first; flags bit 0 = the reset that replaced that id kept the
+   players' buildings). Written and read on every WELCOME of protocol kStoreWelcomeHistorySince or later that carries a world; a count
+   above kStoreWelcomeHistoryMax, an id longer than kStoreWelcomeWorldIdMax or a field running past the payload is not read
+   (historyMalformed) and neither is anything after it. Over the cap the encoder keeps the newest. */
+const unsigned int kStoreWelcomeHistorySince = 93;
+const unsigned int kStoreWelcomeHistoryMax   = 64;   /* coopworld::kWorldEarlierIdsMax */
+const unsigned int kStoreWelcomeResetKept    = 1u;
+struct StoreWelcomeReset
+{
+    std::string id; unsigned int flags; unsigned long long at;
+    StoreWelcomeReset() : flags(0), at(0ULL) {}
+};
 enum StoreModsVerdict { kModsNotChecked = 0, kModsMatch = 1, kModsRecorded = 2, kModsDiffers = 3 };
 struct StoreWelcome
 {
@@ -252,11 +294,13 @@ struct StoreWelcome
     bool hasSlot, hasWorld, worldMalformed;
     std::string world;
     bool hasWorldId, worldIdMalformed, worldIdUpgraded; std::string worldId;   /* T-490 (store protocol 69) */
+    bool hasPerson, personMalformed; std::string person;   /* store protocol 91: the player id the world knows this game by */
+    bool hasHistory, historyMalformed; std::vector<StoreWelcomeReset> history;   /* store protocol 93: the world's earlier ids, oldest first */
     bool hasMods; unsigned int modsVerdict, modsActive, modsPlugins;   /* settings5 S5 */
     bool hasModsWorld; coopmods::ModList modsWorld;   /* T-246 (store protocol 57): the world's list - written and read only when modsVerdict is kModsDiffers */
     bool hasWorldGen; std::vector<char> worldTail;   /* restore1a (store protocol 52): the world guard's tail after the mods - restoreguard::WorldMsg bytes (src/common/restoreguard.h) */
     StoreWelcome() : protocol(0), authority(0), recordCount(0), slot(0), hasSlot(false), hasWorld(false), worldMalformed(false),
-                     hasWorldId(false), worldIdMalformed(false), worldIdUpgraded(false), hasMods(false), modsVerdict(0), modsActive(0), modsPlugins(0), hasModsWorld(false), hasWorldGen(false) {}   /* T-246: hasModsWorld */
+                     hasWorldId(false), worldIdMalformed(false), worldIdUpgraded(false), hasPerson(false), personMalformed(false), hasHistory(false), historyMalformed(false), hasMods(false), modsVerdict(0), modsActive(0), modsPlugins(0), hasModsWorld(false), hasWorldGen(false) {}   /* T-246: hasModsWorld */
 };
 inline void StoreWelcomePutU32(std::vector<char>* out, unsigned int v)
 {
@@ -277,6 +321,25 @@ inline void StoreWelcomeEncode(const StoreWelcome& w, std::vector<char>* out)
         StoreWelcomePutU32(out, (unsigned int)id.size());
         out->insert(out->end(), id.begin(), id.end());
         StoreWelcomePutU32(out, w.worldIdUpgraded ? kStoreWelcomeIdUpgraded : 0u);
+        if (w.protocol >= kStoreWelcomePersonSince)   /* the player id the world knows this game by */
+        {
+            const std::string pid = w.hasPerson ? w.person.substr(0, kStoreWelcomePersonMax) : std::string();
+            StoreWelcomePutU32(out, (unsigned int)pid.size());
+            out->insert(out->end(), pid.begin(), pid.end());
+            if (w.protocol >= kStoreWelcomeHistorySince)   /* the world's reset history */
+            {
+                const size_t hn = w.hasHistory ? (w.history.size() > kStoreWelcomeHistoryMax ? (size_t)kStoreWelcomeHistoryMax : w.history.size()) : 0;
+                StoreWelcomePutU32(out, (unsigned int)hn);
+                for (size_t i = w.history.size() - hn; i < w.history.size(); ++i)
+                {
+                    const std::string hid = w.history[i].id.substr(0, kStoreWelcomeWorldIdMax);
+                    StoreWelcomePutU32(out, (unsigned int)hid.size());
+                    out->insert(out->end(), hid.begin(), hid.end());
+                    StoreWelcomePutU32(out, w.history[i].flags);
+                    char t[8]; std::memcpy(t, &w.history[i].at, 8); out->insert(out->end(), t, t + 8);
+                }
+            }
+        }
     }
     if (!w.hasMods) return;   /* settings5 S5 */
     StoreWelcomePutU32(out, w.modsVerdict); StoreWelcomePutU32(out, w.modsActive); StoreWelcomePutU32(out, w.modsPlugins);
@@ -307,6 +370,39 @@ inline bool StoreWelcomeDecode(const std::vector<char>& p, StoreWelcome* w)
             std::memcpy(&flags, &p[mo + 4 + idn], 4);
             w->hasWorldId = idn > 0; w->worldIdUpgraded = (flags & kStoreWelcomeIdUpgraded) != 0;
             mo += 8 + (size_t)idn;
+            if (w->protocol >= kStoreWelcomePersonSince)   /* the player id the world knows this game by */
+            {
+                unsigned int pn = 0;
+                if (p.size() < mo + 4) { w->personMalformed = true; return true; }
+                std::memcpy(&pn, &p[mo], 4);
+                if (pn > kStoreWelcomePersonMax || p.size() < mo + 4 + (size_t)pn) { w->personMalformed = true; return true; }
+                w->person.assign(p.begin() + mo + 4, p.begin() + mo + 4 + pn);
+                w->hasPerson = pn > 0;
+                mo += 4 + (size_t)pn;
+                if (w->protocol >= kStoreWelcomeHistorySince)   /* the world's reset history */
+                {
+                    unsigned int hn = 0;
+                    if (p.size() < mo + 4) { w->historyMalformed = true; return true; }
+                    std::memcpy(&hn, &p[mo], 4);
+                    if (hn > kStoreWelcomeHistoryMax) { w->historyMalformed = true; return true; }
+                    mo += 4;
+                    std::vector<StoreWelcomeReset> got;
+                    for (unsigned int k = 0; k < hn; ++k)
+                    {
+                        unsigned int ln = 0;
+                        if (p.size() < mo + 4) { w->historyMalformed = true; return true; }
+                        std::memcpy(&ln, &p[mo], 4);
+                        if (ln > kStoreWelcomeWorldIdMax || p.size() < mo + 16 + (size_t)ln) { w->historyMalformed = true; return true; }
+                        StoreWelcomeReset r;
+                        r.id.assign(p.begin() + mo + 4, p.begin() + mo + 4 + ln);
+                        std::memcpy(&r.flags, &p[mo + 4 + ln], 4);
+                        std::memcpy(&r.at, &p[mo + 8 + ln], 8);
+                        got.push_back(r);
+                        mo += 16 + (size_t)ln;
+                    }
+                    w->history.swap(got); w->hasHistory = true;
+                }
+            }
         }
         if (p.size() >= mo + 12)
         { std::memcpy(&w->modsVerdict, &p[mo], 4); std::memcpy(&w->modsActive, &p[mo + 4], 4); std::memcpy(&w->modsPlugins, &p[mo + 8], 4); w->hasMods = true; }
@@ -348,7 +444,8 @@ inline std::string NotebookAddrForJoiner(const std::string& named, const std::st
    session link actually reached (the ENet peer, already resolved); `dialled` is the address the join was dialled at
    (the panel's typed address or a `join` verb's); `cfgHost` is shared_wastelands.cfg's host= (the older join1 source, which a
    `join` verb does not update). The first non-empty, specified one wins. Loopback reached at loopback stays loopback,
-   so two games on one computer are unchanged. *reason gets a short plain explanation for the [STORE] log line. */
+   so two games on one computer are unchanged. *reason gets a short plain explanation for the [STORE] log line; a steam:<id>
+   host shows there as steam:<id>, never its id (relaybridge::AddrForLog). */
 inline std::string NotebookDialFromWelcome(const std::string& named, const std::string& peerIp, const std::string& dialled,
                                            const std::string& cfgHost, int* swapped, std::string* reason)
 {
@@ -362,9 +459,9 @@ inline std::string NotebookDialFromWelcome(const std::string& named, const std::
     if (reason)
     {
         if (!IsLoopbackOrAnyAddr(named)) *reason = "a real address - used as the host gave it";
-        else if (sw) *reason = "loopback on the host's computer - the host was reached at " + host + " (" + source + ")";
+        else if (sw) *reason = "loopback on the host's computer - the host was reached at " + relaybridge::AddrForLog(host) + " (" + source + ")";
         else if (host.empty()) *reason = "loopback, and no host address is known to use instead - kept";
-        else *reason = "loopback, and the host was reached at loopback " + host + " - both games on this computer";
+        else *reason = "loopback, and the host was reached at loopback " + relaybridge::AddrForLog(host) + " - both games on this computer";
     }
     return used;
 }

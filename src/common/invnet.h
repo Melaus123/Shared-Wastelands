@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <map>
 
 namespace coopinv {
 
@@ -198,6 +199,173 @@ inline int ConsumePartial(const int* qty, int n, int need, int* after)
         need -= qty[i];
     }
     return -1;
+}
+
+/* A hand-back answered with contents: the holder's rows go in and the moves this game made on the box while the hand-back
+   waited are laid on top, never erased. Per item record (sid) the local difference is its count now less its count in the
+   baseline saved when the hand-back asked.
+   - more now: this game's rows of the record that the baseline has not at that cell go in first (each at its own cell, up to the
+     difference); what is left grows a holder row of the record; with none, this game's other rows of the record are used.
+   - fewer now: taken from the holder's rows of the record, last rows first, never below zero (a record the holder has not is
+     simply not there to take).
+   out, in laying order: the holder's rows (from 0, index into holder) with their counts first - one layout, so they fit together;
+   a holder row taken to zero is left out - then this game's rows (from 1, index into now), each laid at its own cell or, when that
+   is taken, a free one (HandbackLayout). 1 = there was a local difference, 0 = none (out is the holder's rows as they are). */
+struct MergeRow { int from; size_t index; int qty; };
+inline int HandbackMerge(const std::vector<Slot>& holder, const std::vector<Slot>& base, const std::vector<Slot>& now,
+                         std::vector<MergeRow>* out)
+{
+    out->clear();
+    std::map<std::string, long long> delta;
+    for (size_t j = 0; j < now.size(); ++j) delta[now[j].sid] += now[j].qty;
+    for (size_t i = 0; i < base.size(); ++i) delta[base[i].sid] -= base[i].qty;
+    std::vector<int> hq(holder.size());
+    for (size_t i = 0; i < holder.size(); ++i) hq[i] = holder[i].qty;
+    std::vector<MergeRow> adds;
+    int changed = 0;
+    for (std::map<std::string, long long>::const_iterator d = delta.begin(); d != delta.end(); ++d)
+    {
+        if (d->second == 0) continue;
+        changed = 1;
+        if (d->second < 0)
+        {
+            long long take = -d->second;
+            for (size_t k = holder.size(); k > 0 && take > 0; --k)
+            {
+                const size_t i = k - 1;
+                if (holder[i].sid != d->first || hq[i] <= 0) continue;
+                const int t = (take < (long long)hq[i]) ? (int)take : hq[i];
+                hq[i] -= t; take -= t;
+            }
+            continue;
+        }
+        long long give = d->second;
+        for (int pass = 0; pass < 2 && give > 0; ++pass)
+        {
+            for (size_t j = 0; j < now.size() && give > 0; ++j)
+            {
+                if (now[j].sid != d->first || now[j].qty <= 0) continue;
+                int inBase = 0;
+                for (size_t i = 0; i < base.size(); ++i)
+                    if (base[i].sid == now[j].sid && base[i].section == now[j].section && base[i].x == now[j].x && base[i].y == now[j].y) { inBase = 1; break; }
+                if ((pass == 0) != (inBase == 0)) continue;   /* the first pass takes rows new since the ask, the second the others */
+                const int g = (give < (long long)now[j].qty) ? (int)give : now[j].qty;
+                MergeRow r; r.from = 1; r.index = j; r.qty = g;
+                adds.push_back(r); give -= g;
+            }
+            if (pass == 0)
+                for (size_t i = 0; i < holder.size() && give > 0; ++i)
+                    if (holder[i].sid == d->first && hq[i] > 0) { hq[i] += (int)give; give = 0; }
+        }
+    }
+    for (size_t i = 0; i < holder.size(); ++i)
+        if (hq[i] > 0) { MergeRow r; r.from = 0; r.index = i; r.qty = hq[i]; out->push_back(r); }
+    out->insert(out->end(), adds.begin(), adds.end());
+    return changed;
+}
+
+/* A move this game made on a box before it saved the box's baseline for a hand-back is already in that baseline; it is taken back
+   out here, so the merge and the safety net see it as a move made during the wait. Each op as the drain's ring holds it:
+     op 0 ADD     - the row at the cell (same record) leaves the baseline;
+     op 1 REMOVE  - the removed stack (record, count) comes back at its cell, which must be free in the baseline;
+     op 2 QTY     - the row's count goes back by the change (qtyBefore = the stack's count before it, 0 = not read);
+     op 3 SPLIT   - the units taken out go back onto the row;
+     op 4 CHARGES - nothing to take back (the merge counts items, not charges).
+   1 = taken back; 0 = it could not be (the caller then does not trust the baseline for a merge). */
+inline int UnapplyOp(std::vector<Slot>* base, int op, const std::string& section, int x, int y, const std::string& sid, int qty,
+                     int qtyBefore)
+{
+    const int k = FindSlot(*base, section, x, y);
+    if (op == kOpAdd)
+    {
+        if (k < 0 || (*base)[(size_t)k].sid != sid) return 0;
+        base->erase(base->begin() + k);
+        return 1;
+    }
+    if (op == kOpRemove)
+    {
+        if (k >= 0 || sid.empty() || qty <= 0) return 0;
+        Slot s; s.section = section; s.x = x; s.y = y; s.sid = sid; s.qty = qty;
+        base->push_back(s);
+        return 1;
+    }
+    if (op == kOpQty)
+    {
+        if (k < 0 || qtyBefore <= 0) return 0;
+        const int q = (*base)[(size_t)k].qty - qty + qtyBefore;
+        if (q <= 0) return 0;
+        (*base)[(size_t)k].qty = q;
+        return 1;
+    }
+    if (op == kOpSplit)
+    {
+        if (k < 0 || qty <= 0) return 0;
+        (*base)[(size_t)k].qty += qty;
+        return 1;
+    }
+    return (op == kOpCharges) ? 1 : 0;
+}
+
+/* THE MERGED BOX LAID OUT BEFORE ANYTHING IS REMOVED. secs: the box's sections with their grids (w x h cells); holder: the holder's
+   rows at their own cells; ours: this game's rows in laying order, each with its footprint (w x h). The holder's rows go in first
+   and must all fit where they are (one layout); each of ours then goes at its own cell when that is free, else at the first free
+   cell of its section in the engine's own order (y outer, x inner), and its x,y are set to where it goes.
+   1 = the whole set fits; 0 = it does not (a row off its grid, a section the box has not, an overlap among the holder's rows, or
+   no free cell for one of ours) - the caller removes nothing. */
+struct LaySec { std::string name; int w, h; LaySec() : w(0), h(0) {} };
+struct LayItem { std::string section; int x, y, w, h; LayItem() : x(0), y(0), w(0), h(0) {} };
+inline int LaySecIndex(const std::vector<LaySec>& secs, const std::string& name)
+{
+    for (size_t s = 0; s < secs.size(); ++s)
+        if (secs[s].name == name) return (int)s;
+    return -1;
+}
+inline int LayFree(const std::vector<char>& g, int gw, int gh, int x, int y, int w, int h)
+{
+    if (x < 0 || y < 0 || w < 1 || h < 1 || x + w > gw || y + h > gh) return 0;
+    for (int j = 0; j < h; ++j)
+        for (int i = 0; i < w; ++i)
+            if (g[(size_t)((y + j) * gw + (x + i))] != 0) return 0;
+    return 1;
+}
+inline void LayMark(std::vector<char>* g, int gw, int x, int y, int w, int h)
+{
+    for (int j = 0; j < h; ++j)
+        for (int i = 0; i < w; ++i) (*g)[(size_t)((y + j) * gw + (x + i))] = 1;
+}
+inline int HandbackLayout(const std::vector<LaySec>& secs, const std::vector<LayItem>& holder, std::vector<LayItem>* ours)
+{
+    std::vector<std::vector<char> > grid(secs.size());
+    for (size_t s = 0; s < secs.size(); ++s)
+    {
+        if (secs[s].w < 1 || secs[s].h < 1 || secs[s].w > 256 || secs[s].h > 256 || secs[s].w * secs[s].h > 4096) return 0;
+        grid[s].assign((size_t)(secs[s].w * secs[s].h), 0);
+    }
+    for (size_t i = 0; i < holder.size(); ++i)
+    {
+        const LayItem& it = holder[i];
+        const int s = LaySecIndex(secs, it.section);
+        if (s < 0) return 0;
+        const LaySec& sc = secs[(size_t)s];
+        if (LayFree(grid[(size_t)s], sc.w, sc.h, it.x, it.y, it.w, it.h) == 0) return 0;
+        LayMark(&grid[(size_t)s], sc.w, it.x, it.y, it.w, it.h);
+    }
+    for (size_t i = 0; i < ours->size(); ++i)
+    {
+        LayItem& o = (*ours)[i];
+        const int s = LaySecIndex(secs, o.section);
+        if (s < 0) return 0;
+        const LaySec& sc = secs[(size_t)s];
+        int fx = -1, fy = -1;
+        if (LayFree(grid[(size_t)s], sc.w, sc.h, o.x, o.y, o.w, o.h) != 0) { fx = o.x; fy = o.y; }
+        for (int y = 0; fx < 0 && y < sc.h; ++y)
+            for (int x = 0; fx < 0 && x < sc.w; ++x)
+                if (LayFree(grid[(size_t)s], sc.w, sc.h, x, y, o.w, o.h) != 0) { fx = x; fy = y; }
+        if (fx < 0) return 0;
+        o.x = fx; o.y = fy;
+        LayMark(&grid[(size_t)s], sc.w, fx, fy, o.w, o.h);
+    }
+    return 1;
 }
 
 }   /* namespace coopinv */

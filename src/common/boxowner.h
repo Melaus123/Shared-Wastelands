@@ -98,14 +98,20 @@ inline int MarkOnlyNodeClass(int isProduction, int via, int cls)
     return cls;
 }
 
-/* THE BUILD SCAN'S WORLD-NODE TEST. A production building with no build record whose construction state lists NO building
-   materials is one the world placed (a mining node - every piece a player builds costs materials): the scan never registers it
-   as this game's own piece, whatever faction mark it carries. A production building with materials (a player-built machine
-   the registry has no row for) and one whose list cannot be read are registered as before. matCount = the engine's
-   construction-materials count (ConstructionState +0x18), -1 unreadable. */
-inline int ScanSkipsWorldNode(int isProduction, int hasRow, int matCount)
+/* THE WORLD RESOURCE NODE (an ore rock - Iron Resource, Copper Resource, Stone Resource). The base game's data marks the
+   world's rocks' records "is foliage" (templates 42248, 42249, 42250) and leaves that mark clear on the mines and wells players
+   build (Ore Mine, Stone Mine, Well). Those are production buildings a worker operates that take no inputs too, so being
+   operated with no inputs does not say the world placed a piece; the foliage mark does. A world node is a production building
+   whose game-data record is marked foliage, that a worker operates (the needs-operating flag +0x3A9 set:
+   ProductionBuilding::update 0x29AD50 runs the step itself only while it is clear), that takes no inputs (input count +0x480 is
+   0) and that has no build record. It is nobody's piece: the build scan never registers it as this game's own, a saved row of it
+   is dropped from the player's records, a copy-list row of it is retired and a PLACE naming it is refused (build.cpp), whatever
+   faction mark it carries. Its construction materials are no test - a rock's construction list has one entry. isProd /
+   needsOperating / hasRow / isFoliage are 1 or 0, inputCount the count; -1 = unreadable. Anything unreadable or out of range
+   answers 0: the piece is not a world node (a player's mine or well keeps its row and is registered). */
+inline int WorldNodeOf(int isProd, int needsOperating, int inputCount, int hasRow, int isFoliage)
 {
-    return (isProduction != 0 && hasRow == 0 && matCount == 0) ? 1 : 0;
+    return (isProd == 1 && needsOperating == 1 && inputCount == 0 && hasRow == 0 && isFoliage == 1) ? 1 : 0;
 }
 
 const int kRungArea = -1;   /* the owner rung steps aside: the area rule decides */
@@ -181,6 +187,66 @@ inline int HandbackAnswer(int state, int contents, int* counted)
 
 /* inv4b 5: the hand-back table is full - only a done entry may go; a pending one is never dropped */
 inline int HandbackEvictable(int state) { return (state == 1) ? 1 : 0; }
+
+/* an arrival that would ask (kHbAsk) on a box with no hand-back on record, which this game placed itself (the commit or the placing
+   lever) while the area's "loaded since" stamp was the one it has now (placedSince == nowSince): from that placement on this game
+   has held the area without a break and written its own box itself, so no other game can have written it - nothing is asked and
+   the hand-back is recorded done. A different stamp (the area was left and loaded again, so another game may have written the box
+   meanwhile), no stamp at the placement (0), or a hand-back table too full to record the skip (tableFull): asked as usual. */
+inline int HandbackMadeHereSkip(int start, int haveRecord, int madeHere, double placedSince, double nowSince, int tableFull)
+{
+    return (start == kHbAsk && haveRecord == 0 && madeHere != 0 && placedSince != 0.0 && placedSince == nowSince && tableFull == 0)
+           ? 1 : 0;
+}
+
+/* an arrival that would ask (kHbAsk) on a box with no hand-back on record, which this game last wrote BY THE AREA RULE (wroteByArea:
+   the area rule answered this game for the box and no later area answer for it said another game holds the area) while the area's
+   "loaded since" stamp was the one it has now (wroteSince == nowSince), in an area this game holds now (areaMineNow): only the area's
+   holder writes such a box, so no other game has written it since, and no other game could answer the ask with contents (it answers
+   only for an area it holds now, HandbackServes) - nothing is asked and the hand-back is recorded done. A different stamp (the area
+   was left and loaded again), no stamp at the write (0), the area held by another game now, or a table too full to record the
+   skip (tableFull): asked as usual. */
+inline int HandbackAreaWroteSkip(int start, int haveRecord, int wroteByArea, double wroteSince, double nowSince, int areaMineNow,
+                                 int tableFull)
+{
+    return (start == kHbAsk && haveRecord == 0 && wroteByArea != 0 && wroteSince != 0.0 && wroteSince == nowSince
+            && areaMineNow != 0 && tableFull == 0) ? 1 : 0;
+}
+
+/* a hand-back that has not ended: asked with no answer yet (0), or contents on the way to the swap (2); done (1) is not waiting */
+inline int HandbackWaiting(int state) { return (state == 0 || state == 2) ? 1 : 0; }
+
+/* a move rung into the drain's ring with ticket moveSeq before this game saved a box's baseline for a hand-back (holdSeq = the
+   ring's next ticket at the save) is already in that baseline. Tickets wrap: compared as a 32-bit distance. */
+inline int HandbackMoveBeforeHold(long moveSeq, long holdSeq)
+{
+    return ((unsigned int)moveSeq - (unsigned int)holdSeq >= 0x80000000u) ? 1 : 0;
+}
+
+/* a merged hand-back swap (this game's moves since the ask laid on the holder's rows) removes this game's items, then lays the set.
+   precheckOk: every item was found at its own cell before anything left; removeFailed: removes that did not work (the swap stops at
+   the first). kHbSwapNotRun = nothing left the box; kHbSwapPutBack = nothing of the answer is laid and the items that left are put
+   back at their own cells; kHbSwapGo = every item left, the set is laid. */
+const int kHbSwapGo = 0, kHbSwapNotRun = 1, kHbSwapPutBack = 2;
+inline int HandbackSwapRemoveOutcome(int precheckOk, int removeFailed)
+{
+    if (precheckOk == 0) return kHbSwapNotRun;
+    return (removeFailed > 0) ? kHbSwapPutBack : kHbSwapGo;
+}
+
+/* a swap whose re-digest differs from the holder's: a plain swap is asked once more (tries = asks already made); a merged swap is not
+   asked again - the answer could be swapped in plain over this game's rows before the safety net has sent them */
+inline int HandbackReaskAfterMismatch(int merged, int tries)
+{
+    return (merged == 0 && tries < 1) ? 1 : 0;
+}
+
+/* an answer for a box: a live pull lets it be swapped in over this game's own box only while the box owes no rows to the other games
+   (owed = rows laid by a merged swap, or a box kept over the holder's answer, the safety net has not sent yet) */
+inline int HandbackPullStands(int owed, int pullLive)
+{
+    return (owed == 0 && pullLive != 0) ? 1 : 0;
+}
 
 }   /* namespace coopown */
 

@@ -44,6 +44,8 @@
 #include "net/session.h"    /* IsUidMine, OwnedUidsSnapshot, SendStats */
 #include "../common/statswire.h"
 #include "../common/copykeep.h"   /* copy1: BloodRestoreWanted, BloodPushDelta */
+#include "../common/squadtest.h"  /* statstest: the argument shape and the values it sets */
+#include "hire.h"                 /* statstest: OwnSquadUids */
 #include "coop_log.h"
 #include <Windows.h>
 #include <algorithm>
@@ -324,6 +326,65 @@ void StatsTick()
         InterlockedIncrement64(&g_statsSent);
         ++sent;
     }
+}
+
+std::string StatsTestLever(const std::string& args)
+{
+    int level = 0;
+    unsigned int showUid = 0;
+    const int kind = swsquad::StatsTestParse(args, &level, &showUid);
+    if (kind == swsquad::kStatsTestBad)
+    {
+        DebugLog("[cmd] usage: statstest squad <level 1.." + L(swsquad::kStatsLevelMax) + "> | statstest show <uid>");
+        return "error statstest usage";
+    }
+    if (kind == swsquad::kStatsTestShow)
+    {
+        ::Character* c = FindSpawned(showUid);
+        char* s = c != 0 ? StatsObjPod(c) : 0;
+        unsigned int raw[coopstats::kStatsCount];
+        const std::string head = "[STATS] statstest show uid=" + L((long long)showUid) + (net::IsUidMine(showUid) ? " own" : " copy");
+        if (!PlausibleHeap(s) || !StatsReadPod(s, raw)) { DebugLog(head + " unreadable (no character, or no stats object)"); return "error statstest show: unreadable"; }
+        DebugLog(head + " strength=" + F(coopstats::StatsBitsToFloat(raw[swsquad::kStatsIdxStrength]))
+                 + " dexterity=" + F(coopstats::StatsBitsToFloat(raw[swsquad::kStatsIdxDexterity]))
+                 + " toughness=" + F(coopstats::StatsBitsToFloat(raw[swsquad::kStatsIdxToughness]))
+                 + " katana=" + F(coopstats::StatsBitsToFloat(raw[swsquad::kStatsIdxKatana]))
+                 + " attack=" + F(coopstats::StatsBitsToFloat(raw[swsquad::kStatsIdxAttack]))
+                 + " defence=" + F(coopstats::StatsBitsToFloat(raw[swsquad::kStatsIdxDefence]))
+                 + " athletics=" + F(coopstats::StatsBitsToFloat(raw[coopstats::kStatsAthleticsIndex])));
+        return "ok statstest show";
+    }
+    if (EngineWritesBlocked()) { DebugLog("[STATS] statstest squad refused: a world is loading or tearing down"); return "error statstest: engine writes blocked"; }
+    std::vector<unsigned int> squad;
+    OwnSquadUids(&squad);
+    if (squad.empty()) { DebugLog("[STATS] statstest squad refused: this game drives no character in its player faction"); return "error statstest: no squad"; }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    int set = 0;
+    for (size_t k = 0; k < squad.size(); ++k)
+    {
+        const unsigned int uid = squad[k];
+        const std::string head = "[STATS] statstest squad uid=" + L((long long)uid) + " level=" + L(level);
+        ::Character* c = FindSpawned(uid);
+        char* s = c != 0 ? StatsObjPod(c) : 0;
+        unsigned int raw[coopstats::kStatsCount];
+        if (!PlausibleHeap(s) || !StatsReadPod(s, raw)) { DebugLog(head + " refused: stats unreadable"); continue; }
+        const float strengthWas = coopstats::StatsBitsToFloat(raw[0]);
+        swsquad::StatsLevelApply(raw, level);
+        float athBefore = 0.0f, athAfter = 0.0f;
+        if (!StatsWritePod(s, raw, &athBefore, &athAfter)) { InterlockedIncrement64(&g_statsFault); DebugLog(head + " write FAULTED"); continue; }
+        int rc = 0, animal = 0, bloodKept = 0;
+        float bloodBefore = 0.0f, bloodAfterPush = 0.0f;
+        if (kCharStatsVftRva != 0 && kMedicalVftRva != 0)
+            rc = StatsRecalcPod(s, base + (uintptr_t)kCharStatsVftRva,
+                                kCharStatsAnimalVftRva != 0 ? base + (uintptr_t)kCharStatsAnimalVftRva : 0,
+                                base + (uintptr_t)kMedicalVftRva, &animal, 0, &bloodBefore, &bloodAfterPush, &bloodKept);
+        ++set;
+        DebugLog(head + " strength " + F(strengthWas) + " -> " + F(coopstats::StatsBitsToFloat(raw[0])) + " athletics " + F(athBefore)
+                 + " -> " + F(athAfter) + " values=" + L(swsquad::kStatsLevelCount)
+                 + (rc == 1 ? " recalc+medical" : rc == 2 ? " recalc only" : rc == 0 ? " fields only, NOT recalculated" : rc == -2 ? " recalc ran, MEDICAL PUSH FAULTED" : " RECALC FAULTED"));
+    }
+    DebugLog("[STATS] statstest squad level=" + L(level) + " set=" + L(set) + " of " + L((long long)squad.size()));
+    return "ok statstest squad " + L(set);
 }
 
 std::string StatsReportFields()

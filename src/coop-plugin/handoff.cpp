@@ -29,6 +29,9 @@
 namespace coop { int KeeperPot(void* character, void** ownOut, int* catsOut); int KeeperPotWritePod(void* own, int cats);
                  int KeeperPotsInFlight(std::vector<void*>* pots, int* unresolved); }   /* T-1 B3 restructure: items.cpp - the squad's pot */
 namespace coop { int KeeperPotAnnounced(void* character, void** ownOut, int* catsOut); }
+// PROBE-START: P133 - items.cpp: a copy write that changes a keeper group's money is logged
+namespace coop { void P133KeeperCopyWrite(unsigned int leader, int from, int to); }
+// PROBE-END: P133
 namespace coop { std::string StoreWorldIdOf(void* platoon); }   /* M7a3f3 T-425 [m7a3f3-hc0]: store.cpp (store.h) - the squad's engine id, "" if unreadable */
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* P25 fold 2: combat.cpp - 1 height, 0 no terrain, -1 no row / faulted. MAIN THREAD */
 namespace coop { int ItTraderHomePos(void* ap, void* platoon, void* leader, float* x, float* z); }   /* T-164 B4-3 (M4): items.cpp - a trader squad's home building position */   /* T-1 B3 fold (M2): items.cpp - net of this game's in-flight predictions */
@@ -2551,6 +2554,9 @@ void SquadCatsSafePointDrain()
         if (act == coopsquad::kPotHold) { ++g_catsHeld; continue; }   /* F5: written by the first pass after they settle */
         if (KeeperPotWritePod(p.own, p.cats) == 0) { CatsPotUnread(p.leader, p.seq); continue; }
         ++g_catsApplied; ++g_catsLogIn;
+        // PROBE-START: P133 - this copy write changed the keeper group's money
+        P133KeeperCopyWrite(p.leader, p.cur, p.cats);
+        // PROBE-END: P133
         if (g_catsLogIn <= 40 || g_catsLogIn % 20 == 0)
             DebugLog("[KEEPER] <- squad cats leader=" + N(p.leader) + " cats=" + N((long long)p.cats) + " applied was=" + N((long long)p.cur)
                      + " seq=" + N(p.seq));

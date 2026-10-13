@@ -66,16 +66,12 @@ const unsigned int kNameMaxBytes   = 64;                /* a nearby player's nam
    ------------------------------------------------------------------------------------------------------------------ */
 const char* const kButtonCaption   = "REPORT A BUG";    /* the pause-menu button, the title-screen button and the window's title */
 const char* const kLabelText       = "WHAT HAPPENED?";
-const char* const kAboutLine1      = "This report goes to the Shared Wastelands modder.";   /* two lines under the title (owner 425) */
-const char* const kAboutLine2      = "It's for problems with the multiplayer mod.";
 /* the title screen's note, right side (owner 425) */
 const char* const kTitleNoteHead   = "SHARED WASTELANDS - EXPERIMENTAL";
 const char* const kTitleNoteBody   = "This multiplayer mod is still in testing, so expect bugs.\n"
                                      "If something goes wrong, please report it:\n"
                                      "press Esc in game and choose REPORT A BUG,\n"
                                      "or use the REPORT A BUG button on this screen.";
-const char* const kBoxHintText     = "Describe what you were doing and what went wrong.";
-const char* const kNeedTextLine    = "Describe what happened to send a report.";
 const char* const kCancelCaption   = "CANCEL";
 const char* const kSendCaption     = "SEND";
 const char* const kPreparingLine   = "Preparing your report...";
@@ -169,10 +165,10 @@ inline int FailKindOf(int winErr, int httpStatus)
 inline int FailCodeOf(int winErr, int httpStatus) { return winErr != 0 ? winErr : httpStatus; }
 inline std::string FailText(int kind, int code)
 {
-    if (kind == kFailNoInternet) return "Couldn't send your report. Check your internet connection and try again.";
-    if (kind == kFailServer) return "The report server isn't responding. Try again later.";
+    if (kind == kFailNoInternet) return "Couldn't send your report: no internet connection.";
+    if (kind == kFailServer) return "The report server isn't responding.";
     char b[96];
-    std::sprintf(b, "Couldn't send your report (error %d). Try again later.", code);
+    std::sprintf(b, "Couldn't send your report (error %d).", code);
     return b;
 }
 inline bool SendSucceeded(int winErr, int httpStatus) { return winErr == 0 && httpStatus >= 200 && httpStatus <= 299; }

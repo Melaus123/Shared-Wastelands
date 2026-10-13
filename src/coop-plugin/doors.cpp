@@ -3071,4 +3071,69 @@ std::string DoorTestCommand(const std::string& argIn)
 /* P18 fold 1: the openDoor address (the table's OpenDoor row) for a bought house's doors (build.cpp); 0 = no row */
 unsigned long long DoorsOpenDoorRva() { return kOpenDoorRva; }
 
+/* KEPT (build.cpp's kept lay and keptlist), MAIN THREAD: door `index` of the building's own door list - a plausible door that names
+   the building as its parent - or 0 */
+void* DoorsKeptDoorAt(void* building, int index)
+{
+    void* elems[32];
+    int cnt = 0, raw = 0;
+    if (building == 0 || index < 0 || index >= 32 || DoorArrayPod(building, elems, 32, &cnt, &raw) == 0 || index >= cnt) return 0;
+    void* parent = 0;
+    int s = 0, d = 0, l = 0, w = 0, b = 0;
+    if (DoorPlausible(elems[index]) == 0 || DoorParentPod(elems[index], &parent) == 0 || parent != building) return 0;
+    if (DoorReadPod(elems[index], &s, &d, &l, &w, &b) == 0) return 0;
+    return elems[index];
+}
+/* a door's state, lock and wants-to-lock as keptlist prints them */
+std::string DoorsKeptRead(void* door)
+{
+    int s = 0, d = 0, l = 0, w = 0, b = 0;
+    char o[96];
+    if (door == 0 || DoorReadPod(door, &s, &d, &l, &w, &b) == 0) return std::string("unreadable");
+    _snprintf(o, 95, "state=%d locked=%d wants=%d", s, l, w);
+    o[95] = 0;
+    return std::string(o);
+}
+/* KEPT: a door laid back as it was kept, through the engine's own calls outside the applier's bracket (as doortest moves a door), so
+   the door road shares the result like any change on this game. Locked: closeDoor first when it is not closed, then lockDoor (it locks
+   a closed, settled door and otherwise sets wants-to-lock, so a door still swinging shut locks as it lands) and the engine's gate-code
+   update. Not locked: unlockDoor when it is locked, lockDoor for a kept wants-to-lock, then openDoor / closeDoor to the kept state
+   (a door kept opening is laid open, one kept closing closed).
+   The words returned name each call made and the door's state after them. */
+std::string DoorsKeptApply(void* door, int state, int locked, int wants)
+{
+    int s = 0, d = 0, l = 0, w = 0, b = 0;
+    if (DoorReadPod(door, &s, &d, &l, &w, &b) == 0) return std::string("the door read faulted - nothing laid");
+    std::string did;
+    const int hasLock = DoorHasLockPod(door);
+    if (locked != 0)
+    {
+        if (s != coopdoor::kDoorClosed && g_playClose != 0) { ApplyPlayPodInner(g_playClose, door); did += " closeDoor"; }
+        if (l == 0 && g_lockDoor != 0 && hasLock != 0) { ApplyLockPodInner(coopdoor::kDoorLockStepLock, door); DoorGateCodePod(door); did += " lockDoor gateCode"; }
+        else if (l == 0) did += " (no lock call or no lock on the door)";
+    }
+    else
+    {
+        if (l != 0 && g_unlockDoor != 0 && hasLock != 0) { ApplyLockPodInner(coopdoor::kDoorLockStepUnlock, door); did += " unlockDoor"; }
+        if (wants != 0 && w == 0 && g_lockDoor != 0 && hasLock != 0) { ApplyLockPodInner(coopdoor::kDoorLockStepLock, door); did += " lockDoor(wants)"; }
+        int s1 = s, d1 = 0, l1 = 0, w1 = 0, b1 = 0;
+        DoorReadPod(door, &s1, &d1, &l1, &w1, &b1);
+        const int wantOpen = (state == coopdoor::kDoorOpen || state == coopdoor::kDoorOpening) ? 1 : 0;
+        if (wantOpen != 0 && s1 != coopdoor::kDoorOpen && s1 != coopdoor::kDoorOpening && g_playOpen != 0) { ApplyPlayPodInner(g_playOpen, door); did += " openDoor"; }
+        else if (wantOpen == 0 && s1 != coopdoor::kDoorClosed && s1 != coopdoor::kDoorClosing && g_playClose != 0) { ApplyPlayPodInner(g_playClose, door); did += " closeDoor"; }
+    }
+    DoorReadPod(door, &s, &d, &l, &w, &b);
+    char o[200];
+    _snprintf(o, 199, "calls:%s - now state=%d locked=%d wants=%d", did.empty() ? " none" : did.c_str(), s, l, w);
+    o[199] = 0;
+    return std::string(o);
+}
+/* KEPT / TEST-ONLY (build.cpp's kept lay, bldstate, bldset): the door's DoorLock (+0x370); 0 = none or unreadable */
+void* DoorsLockOf(void* door)
+{
+    if (door == 0) return 0;
+    __try { return *(void* const*)((const char*)door + kDoorLockPtr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 } // namespace coop

@@ -12,6 +12,7 @@
 class Faction;
 namespace coopown { struct FactionRec; }   /* mmo3 */
 namespace swteam { struct PlayerSide; struct TeamRec; struct Delta; }   /* T-546 step 5 */
+namespace coopcrime { struct CrimeRelEvent; }   /* MSG_CRIME kind 2 (src/common/crimewire.h) */
 namespace coop {
 void InstallRelations();
 void RelationsTick();          // MAIN THREAD, every frame (cheap): link-up snapshot + the periodic re-send
@@ -33,6 +34,18 @@ void RelationsStanceLevels(::Faction* mine, ::Faction* theirs, int* you, int* th
 // changer, a write from the wire, a put-back) - the PLAYERS tab rebuilds its rows when it moves.
 long long RelationsPlayerPairEpoch();
 ::Faction* RelationsFactionFromWire(const std::string& sid);
+// MSG_CRIME kind 2. A by-event standing change this game's engine made on a world faction towards ANOTHER player's stand-in
+// (FactionRelations::affectRelations 0x6B29D0; this game still puts that pair back - it is the other player's) goes to that
+// player, whose engine makes the same event against its own faction. ApplyRemoteRelEvent: MAIN THREAD (the session drain),
+// queued; RelationsEvApplyDrain: MAIN THREAD at the K2 safe point (crime.cpp CrimeApplyDrain), duplicates refused by (sender,
+// seq). RelationsEvText: the counters for the [CRIME] REPORT; RelationsEvAppliedCount: events applied here.
+void ApplyRemoteRelEvent(const coopcrime::CrimeRelEvent& e, unsigned int fromPeer);
+void RelationsEvApplyDrain();
+// A copy's own declareDead (worldstate.cpp detour_declareDead) runs inside this mark: the standing event 5 it raises is not this
+// game's to make or to send (coopcrime::CopyDeathEvDecide). ANY THREAD (a thread-local flag); returns the previous mark.
+int RelationsCopyDeathMark(int on);
+std::string RelationsEvText();
+long long RelationsEvAppliedCount();
 // P079 (rel2, read-only probe): logs one faction's standing with this game's player faction and with the peer faction, both
 // directions. MAIN THREAD. Returns the command status.
 std::string RelationProbe(const std::string& sid);

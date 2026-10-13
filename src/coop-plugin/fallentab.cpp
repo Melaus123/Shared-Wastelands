@@ -63,7 +63,7 @@ const int kEngine = playerstab::kEngineTabCount;
 /* our widgets: "SW" names, no '_' (ui.cpp's rule) */
 const char* const kListName    = "SWFallenList";
 const char* const kEmptyName   = "SWFallenEmpty";
-const char* const kPriceName[3] = { "SWFallenPriceA", "SWFallenPriceB", "SWFallenPriceC" };
+const char* const kPriceName[swtab::kPriceLines] = { "SWFallenPriceA", "SWFallenPriceB" };
 const char* const kCaptionName = "SWFallenCaption";
 const char* const kLabelName   = "SWFallenBesideLabel";
 const char* const kPickName    = "SWFallenMatePick";
@@ -79,7 +79,7 @@ MyGUI::TabControl* g_tabs = 0;       /* the tab control our tab was added to, an
 MyGUI::TabItem* g_item = 0;
 MyGUI::MultiListBox* g_list = 0;
 MyGUI::TextBox* g_empty = 0;
-MyGUI::TextBox* g_price[3] = { 0, 0, 0 };
+MyGUI::TextBox* g_price[swtab::kPriceLines] = { 0, 0 };
 MyGUI::TextBox* g_caption = 0;
 MyGUI::TextBox* g_label = 0;
 MyGUI::ComboBox* g_pick = 0;
@@ -107,7 +107,7 @@ int g_busy = 0;                           /* a confirmed bring-back waits for th
 unsigned int g_busyDead = 0, g_busyMate = 0;
 long long g_busyPrice = -1;
 std::string g_busyName, g_busyMateName;
-std::string g_shownPrice[3], g_shownCaption, g_shownLabel, g_shownBtn;
+std::string g_shownPrice[swtab::kPriceLines], g_shownCaption, g_shownLabel, g_shownBtn;
 int g_shownBtnOn = -1;
 long long g_inserted = 0, g_removed = 0, g_insertRefused = 0, g_tabOpened = 0, g_looks = 0, g_tabEvents = 0, g_rebuilds = 0, g_mateRebuilds = 0,
           g_selects = 0, g_matePicks = 0, g_presses = 0, g_pressGreyed = 0, g_boxOpened = 0, g_boxCancelled = 0, g_boxClosedByChange = 0,
@@ -137,7 +137,7 @@ public:
         if (g_item != 0 && Inside(g_item, w)) { ForgetTab(); return; }
         if (g_list != 0 && Inside(g_list, w)) g_list = 0;
         if (g_empty != 0 && Inside(g_empty, w)) g_empty = 0;
-        for (int k = 0; k < 3; ++k) if (g_price[k] != 0 && Inside(g_price[k], w)) g_price[k] = 0;
+        for (int k = 0; k < swtab::kPriceLines; ++k) if (g_price[k] != 0 && Inside(g_price[k], w)) g_price[k] = 0;
         if (g_caption != 0 && Inside(g_caption, w)) g_caption = 0;
         if (g_label != 0 && Inside(g_label, w)) g_label = 0;
         if (g_pick != 0 && Inside(g_pick, w)) g_pick = 0;
@@ -155,7 +155,7 @@ bool UnlinkerOn()
 }
 bool PageWhole()
 {
-    return g_list != 0 && g_empty != 0 && g_price[0] != 0 && g_price[1] != 0 && g_price[2] != 0 && g_caption != 0 && g_label != 0
+    return g_list != 0 && g_empty != 0 && g_price[0] != 0 && g_price[1] != 0 && g_caption != 0 && g_label != 0
         && g_pick != 0 && g_btn != 0;
 }
 MyGUI::TabControl* FindTabs()
@@ -194,9 +194,9 @@ int OurIndex()
 }
 void ForgetTab()
 {
-    g_tabs = 0; g_item = 0; g_list = 0; g_empty = 0; g_price[0] = g_price[1] = g_price[2] = 0; g_caption = 0; g_label = 0; g_pick = 0; g_btn = 0;
+    g_tabs = 0; g_item = 0; g_list = 0; g_empty = 0; g_price[0] = g_price[1] = 0; g_caption = 0; g_label = 0; g_pick = 0; g_btn = 0;
     g_rows.clear(); g_rowsEsc.clear(); g_mates.clear(); g_pickSet = MyGUI::ITEM_NONE;
-    for (int k = 0; k < 3; ++k) g_shownPrice[k].clear();
+    for (int k = 0; k < swtab::kPriceLines; ++k) g_shownPrice[k].clear();
     g_shownCaption.clear(); g_shownLabel.clear(); g_shownBtn.clear(); g_shownBtnOn = -1;
 }
 void SetText(MyGUI::TextBox* t, const std::string& s, std::string* shown)
@@ -229,30 +229,30 @@ bool BuildPage(MyGUI::TabItem* item)
     const int btnY = H - pad - btnH;
     const int labelY = btnY - pad / 2 - lineH;
     const int capY = labelY - lineH;
-    const int priceY = capY - pad - 3 * lineH;
+    const int priceY = capY - pad - swtab::kPriceLines * lineH;
     const int listY = pad, listH = priceY - pad - listY;
     const int inset = Clamp(W * 12 / 1000, 4, 12);   /* where the list's own row text starts (T985 / T957 shots: 5 px at 418, 10 at ~830) */
     if (listH < 60 || pickW + btnW + pad > W) return false;
     const MyGUI::Align low = MyGUI::Align::HStretch | MyGUI::Align::Bottom;
     MyGUI::Widget* lw = Mk(item, "MultiListBox", "Kenshi_MultiListBox", 0, listY, W, listH, MyGUI::Align::Stretch, kListName);
     MyGUI::Widget* ew = Mk(item, "TextBox", "Kenshi_TextboxStandardText", 0, listY + listH / 2 - lineH / 2, W, lineH, MyGUI::Align::HStretch | MyGUI::Align::VCenter, kEmptyName);
-    MyGUI::Widget* pw[3];
-    for (int k = 0; k < 3; ++k) pw[k] = Mk(item, "TextBox", "Kenshi_TextboxStandardText", inset, priceY + k * lineH, W - inset, lineH, low, kPriceName[k]);
+    MyGUI::Widget* pw[swtab::kPriceLines];
+    for (int k = 0; k < swtab::kPriceLines; ++k) pw[k] = Mk(item, "TextBox", "Kenshi_TextboxStandardText", inset, priceY + k * lineH, W - inset, lineH, low, kPriceName[k]);
     MyGUI::Widget* cw = Mk(item, "TextBox", "Kenshi_TextboxStandardText", inset, capY, W - inset, lineH, low, kCaptionName);
     MyGUI::Widget* lb = Mk(item, "TextBox", "Kenshi_TextboxPaintedText", inset, labelY, W - inset, lineH, low, kLabelName);
     MyGUI::Widget* kw = Mk(item, "ComboBox", "Kenshi_ComboBox", 0, btnY, pickW, btnH, MyGUI::Align::Left | MyGUI::Align::Bottom, kPickName);
     MyGUI::Widget* bw = Mk(item, "Button", "Kenshi_Button2", W - btnW, btnY, btnW, btnH, MyGUI::Align::Right | MyGUI::Align::Bottom, kBtnName);
     MyGUI::MultiListBox* list = lw != 0 ? lw->castType<MyGUI::MultiListBox>(false) : 0;
     MyGUI::TextBox* empty = ew != 0 ? ew->castType<MyGUI::TextBox>(false) : 0;
-    MyGUI::TextBox* price[3];
-    for (int k = 0; k < 3; ++k) price[k] = pw[k] != 0 ? pw[k]->castType<MyGUI::TextBox>(false) : 0;
+    MyGUI::TextBox* price[swtab::kPriceLines];
+    for (int k = 0; k < swtab::kPriceLines; ++k) price[k] = pw[k] != 0 ? pw[k]->castType<MyGUI::TextBox>(false) : 0;
     MyGUI::TextBox* cap = cw != 0 ? cw->castType<MyGUI::TextBox>(false) : 0;
     MyGUI::TextBox* label = lb != 0 ? lb->castType<MyGUI::TextBox>(false) : 0;
     MyGUI::ComboBox* pick = kw != 0 ? kw->castType<MyGUI::ComboBox>(false) : 0;
     MyGUI::Button* btn = bw != 0 ? bw->castType<MyGUI::Button>(false) : 0;
-    if (list == 0 || empty == 0 || price[0] == 0 || price[1] == 0 || price[2] == 0 || cap == 0 || label == 0 || pick == 0 || btn == 0) return false;
+    if (list == 0 || empty == 0 || price[0] == 0 || price[1] == 0 || cap == 0 || label == 0 || pick == 0 || btn == 0) return false;
     g_list = list; g_empty = empty; g_caption = cap; g_label = label; g_pick = pick; g_btn = btn;
-    for (int k = 0; k < 3; ++k) g_price[k] = price[k];
+    for (int k = 0; k < swtab::kPriceLines; ++k) g_price[k] = price[k];
     int widths[swtab::kColumns];
     swtab::ColumnWidths(W - 32 > 0 ? W - 32 : 0, widths);   /* the inner width: less the skin's frame and its scroll bar (ui.cpp's lists) */
     for (int c = 0; c < swtab::kColumns; ++c) list->addColumn(MyGUI::UString(swtab::ColumnHead(c)), widths[c]);
@@ -262,7 +262,7 @@ bool BuildPage(MyGUI::TabItem* item)
     empty->setTextColour(Lit());
     empty->setCaption(U(swtab::kEmptyLine));
     empty->setVisible(false);
-    for (int k = 0; k < 3; ++k) { price[k]->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); price[k]->setTextColour(Lit()); price[k]->setCaption(MyGUI::UString("")); }
+    for (int k = 0; k < swtab::kPriceLines; ++k) { price[k]->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); price[k]->setTextColour(Lit()); price[k]->setCaption(MyGUI::UString("")); }
     cap->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
     cap->setTextColour(Lit());
     cap->setCaption(MyGUI::UString(""));
@@ -374,13 +374,13 @@ void ApplyView()
     in.busy = g_busy; in.note = g_note; in.price = g_read.price; in.money = g_read.money; in.moneyRead = g_read.moneyRead; in.boxUp = g_box != 0 ? 1 : 0;
     const swtab::View v = swtab::ViewFor(in);
     const swtab::PriceLines pl = swtab::PriceLinesFor(g_read.on, g_read.amount, g_read.growth, g_read.alive);
-    const std::string before = g_shownPrice[0] + " | " + g_shownPrice[1] + " | " + g_shownPrice[2];
-    for (int k = 0; k < 3; ++k)
+    const std::string before = g_shownPrice[0] + " | " + g_shownPrice[1];
+    for (int k = 0; k < swtab::kPriceLines; ++k)
     {
         SetText(g_price[k], pl.shown ? pl.line[k] : std::string(), &g_shownPrice[k]);
         if (g_price[k]->getVisible() != (pl.shown != 0)) g_price[k]->setVisible(pl.shown != 0);
     }
-    const std::string after = g_shownPrice[0] + " | " + g_shownPrice[1] + " | " + g_shownPrice[2];
+    const std::string after = g_shownPrice[0] + " | " + g_shownPrice[1];
     if (after != before) DebugLog("[FALLEN] tab price lines: '" + after + "'");
     if (g_empty->getVisible() != (v.emptyShown != 0)) g_empty->setVisible(v.emptyShown != 0);
     std::string cap;
@@ -807,7 +807,7 @@ void FallenTabForgetWorld()
     g_refusedThisWorld = 0;
     g_rows.clear(); g_rowsEsc.clear(); g_mates.clear(); g_selUid = 0; g_mateUid = 0; g_pickSet = MyGUI::ITEM_NONE; ClearNote(); g_busy = 0;
     g_read = FallenTabRead(); g_readMs = 0;
-    for (int k = 0; k < 3; ++k) g_shownPrice[k].clear();
+    for (int k = 0; k < swtab::kPriceLines; ++k) g_shownPrice[k].clear();
     g_shownCaption.clear(); g_shownLabel.clear(); g_shownBtn.clear(); g_shownBtnOn = -1;
     if (g_box != 0) DropBoxSeh();   /* a box asks about a character of the world being left */
 }

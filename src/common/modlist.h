@@ -173,7 +173,7 @@ inline std::string ModRefusalText(const ModDiff& d)
     if (parts.empty()) parts.push_back("the two mod lists are not the same");
     std::string s = "Mod mismatch:";   /* words1: NoticeTitle keys MOD MISMATCH on this start */
     for (size_t i = 0; i < parts.size(); ++i) s += (i ? "; " : " ") + parts[i];
-    s += ". Use the same mods as the host, in the same order, then restart Kenshi and join again.";
+    s += ".";
     return s;
 }
 
@@ -208,7 +208,7 @@ inline std::string ModDetailPlayerText(const ModDiff& d)
 /* settings5 fold (review-settings5 4): the sentence for a game that could not read its OWN list, when the world has one. */
 inline std::string ModUnreadableText()
 {
-    return "Your game could not read its own mod list, so it can't be checked against the host's. Restart Kenshi and try again.";
+    return "Your game could not read its own mod list, so it can't be checked against the host's.";
 }
 
 /* ---- settings5 fold (review-settings5 1a/1b/4): THE NOTEBOOK'S DECISION AT A GREETING ----

@@ -28,14 +28,15 @@
 #include <algorithm>
 #include <sstream>
 #include <cmath>
+#include "../common/poskey.h"   /* the sector formula, shared with the world server's kept pieces */
 #include <cstdlib>
 #include <cstdio>
 
 namespace coop {
 namespace {
 
-const float kSectorSize   = 4608.0f;
-const float kSectorOrigin = 147456.0f;   // 4608 * 32
+const float kSectorSize   = poskey::kSectorSize;     /* 4608 */
+const float kSectorOrigin = poskey::kSectorOrigin;   /* 4608 * 32 */
 unsigned long long kZoneManagerPtrRva = 0; static coop::AddrReg kZoneManagerPtrRva_reg("ZoneManagerPtr", &kZoneManagerPtrRva);   /* P8h: the address table fills this. Steam_1.0.65 0x2133960 */   // DAT_142133960: ZoneManager*
 unsigned long long kIsZoneLoadedTRva = 0; static coop::AddrReg kIsZoneLoadedTRva_reg("IsZoneLoadedT", &kIsZoneLoadedTRva);   /* P8h: the address table fills this. Steam_1.0.65 0xA0D560 */    // bool ZoneManager::isZoneLoadedT(const Ogre::Vector3&) - resolver-verified
 const int kRing = 3;                               // the 7x7 block around the watched character: probed only when the engine's zone list cannot be read, and the 'outside' count of the loaded-set line
@@ -800,9 +801,7 @@ int LoadedGroundItems(void** out, int cap, int* zonesSeen, int* truncated)
 Sector SectorOf(float x, float z)
 {
     Sector s;
-    s.x = (int)floorf((kSectorOrigin + x) / kSectorSize);
-    s.y = (int)floorf((kSectorOrigin + z) / kSectorSize);
-    if (s.x < 0) s.x = 0; if (s.x > 63) s.x = 63; if (s.y < 0) s.y = 0; if (s.y > 63) s.y = 63;
+    poskey::SectorOf(x, z, &s.x, &s.y);
     return s;
 }
 std::string SectorString(const Sector& s) { return N(s.x) + "," + N(s.y); }

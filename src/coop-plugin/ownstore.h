@@ -16,7 +16,7 @@
 
 #include <string>
 #include <vector>
-#include "../common/restoreguard.h"   /* restore1c: the repair rows */
+#include "../common/restoreguard.h"
 
 namespace coopown { struct LedgerEntry; }   /* mmo6: ownrec.h */
 
@@ -72,6 +72,7 @@ void BuildSaveTrackNote(void* saveMgr, const void* nameStr, int before, int afte
 void BuildSaveTrackTick();                        /* P87 rf1, MAIN THREAD, every frame (from OwnMarkSaveTick): a tracked save landed -> BuildSaveLanded */
 void OwnBuildCopyListFeed();                      /* P87 rf1, MAIN THREAD: the copy list from the pp.build base when the load edge does not hand it */
 void OwnOverlayPrepare(const void* folderStr, const void* nameStr);   /* MAIN THREAD: loadGame, before orig - the overlay set + roster check */
+void OwnResetImportRestoreArm(const std::string& carriedFolder, const std::string& oldStore);   /* T-36, MAIN THREAD: the load gate let the reset world's import through - money, research, map and faction armed as at a load */
 /* ANY THREAD (detour_loadFromDisk): 0..n = this container's file was swapped to its own record (put it back with
    OwnOverlayDone after the engine's load); -1 = not an overlaid squad. */
 int  OwnOverlayClaim(void* container, unsigned char force, std::string** name, std::string* was);
@@ -137,24 +138,9 @@ bool OwnStoreCheckpointSettled();                 /* fold 2: ANY THREAD - no che
 long long OwnStoreCheckpointNotesDropped();       /* fold 2: results lost because 32 were already waiting */
 void OwnStoreCheckpointResults(std::vector<OwnCpResult>* out);   /* MAIN THREAD: the finished jobs' results since the last call (appended) */
 
-/* ---- restore1c (design s4): THE REPAIR on this game ---- */
 bool OwnStoreIdleNow();                           /* ANY THREAD: no record or checkpoint job waiting and the writer idle */
-void OwnStoreSetStamp(unsigned int epoch, unsigned long long nbSeq, bool known);   /* MAIN THREAD: stamped on each record queued from now (o2) */
-/* rc: 1 applied, 0 nothing to apply, -1 no records store, -2 the writer is busy, -3 the Recycle Bin cannot take the files, -4 a file
-   step failed (said by the caller). recycled = records whose post-R files went to the Recycle Bin (fromCheckpoint + dropped). */
-struct OwnRepairResult
-{
-    int rc, applied, recycled, fromCheckpoint, dropped, copyFailed, ledgerFromCheckpoint, ledgerRecycled; unsigned int epoch; unsigned long long maxSeq;
-    OwnRepairResult() : rc(0), applied(0), recycled(0), fromCheckpoint(0), dropped(0), copyFailed(0), ledgerFromCheckpoint(0), ledgerRecycled(0), epoch(0), maxSeq(0ULL) {}
-};
-void OwnStoreRepairApply(const std::vector<restoreguard::RepairRow>& rows, const std::string& world, OwnRepairResult* out);   /* MAIN THREAD, writer idle */
 /* store.cpp */
-int  RepairWorldCommand(const std::string& name, std::string* status);   /* MAIN THREAD, the `repairworld` TEST verb: 0 again, 1 done, 2 load now */
-void RepairOnNotebook(const std::vector<char>& payload);                 /* MAIN THREAD: REPAIR down */
-void RepairOnWelcome(const std::vector<char>& payload);                  /* MAIN THREAD: the WELCOME's repair rows */
-int  OwnRepairGate(const std::string& name);                             /* MAIN THREAD, the load gate: 1 = refuse the load */
 std::string OwnAutoStoreWant();                                          /* T-490: MAIN THREAD - the player's records store name for this link's world */
 void OwnAutoStoreBeforeLoad();                                           /* T-251 fold 2: MAIN THREAD, the load gate and loadGame - the player's store opened before the load */
-std::string RepairReportToken();
 
 }   // namespace coop

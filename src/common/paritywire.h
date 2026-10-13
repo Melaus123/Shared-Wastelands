@@ -32,6 +32,7 @@
 #include <vector>
 #include <utility>
 #include "ownerwire.h"   /* inv6 phase 2: the owner tail after the items */
+#include "gearwire.h"    /* the gear tail after the owner tail */
 #include "bagwire.h"    /* bag23 part 2: packs' contents after the owner tail (the BAGK form) */
 #include "groundkey.h"  /* the ground listing's keys, paired by ParityGroundPlan */
 
@@ -64,6 +65,14 @@ const int kParityDecodeBadOwner  = 6;   /* inv6 phase 2: an OWNL owner tail that
 const int kParityDecodeBadKind   = 8;   /* P109: a PRQK tail naming no known kind */
 const int kParityDecodeBadBag    = 7;   /* bag23 part 2: a BAGK packs block that is there but cut, out of range or naming no item */
 const int kParityDecodeBadFlag   = 9;   /* a PRQG listing row whose road flag is neither 0 nor 1 */
+const int kParityDecodeBadNest   = 11;  /* a pack's rows in the BAGK block whose BAGN tail is cut, out of range or too deep */
+const int kParityDecodeBadGear   = 10;  /* a GEML gear tail (the items', or a pack's rows' in the BAGK block) that is there but cut or out of range */
+
+/* the answer's reason for a BAGK block whose pack rows were refused: a bad gear tail and a bad pack-inside-pack tail have their own */
+inline int ParityBagRowWhy(int rowWhy)
+{
+    return rowWhy == coopbag::kBagBadGear ? kParityDecodeBadGear : rowWhy == coopbag::kBagBadNest ? kParityDecodeBadNest : kParityDecodeBadBag;
+}
 
 struct ParityBoxRow { std::string key; unsigned int digest; unsigned int items; int kind; ParityBoxRow() : digest(0), items(0), kind(0) {} };   /* P109: kind is not on the wire per row - the decoder stamps the ask's */
 /* one ground item in a sector (a `G|` key): a row of the asker's listing, or one of the holder's own items for ParityGroundPlan.
@@ -83,6 +92,7 @@ struct ParityItem
     std::string baseSid, companySid, materialSid, colorSid;
     float quality, charges; int functionKind, level, unique;
     coopmark::OwnerId owner;   /* inv6 phase 2 (R4): the stolen mark - in the OWNL tail, NOT in the digest */
+    gearwire::GearMarks gear;  /* the uniform and crafter - in the GEML tail after the owner tail, NOT in the digest */
     std::vector<coopbag::BagRow> bag;   /* bag23 part 2: a pack's contents - in the trailing BAGK block, NOT in the digest; empty = none */
     ParityItem() : x(0), y(0), quantity(0), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0) {}
 };
@@ -121,6 +131,13 @@ inline std::vector<coopmark::OwnerId> ParityOwners(const std::vector<ParityItem>
     return o;
 }
 inline unsigned int ParityMarkedCount(const std::vector<ParityItem>& items) { return coopmark::OwnerTailMarked(ParityOwners(items)); }
+/* the items' uniforms and crafters as one list, index for index (the gear tail's input) */
+inline std::vector<gearwire::GearMarks> ParityGear(const std::vector<ParityItem>& items)
+{
+    std::vector<gearwire::GearMarks> g(items.size());
+    for (size_t i = 0; i < items.size(); ++i) g[i] = items[i].gear;
+    return g;
+}
 /* P94 / P109 (owner 219): MAY THE HOLDER ANSWER AN ASKED BOX FROM ITS OWN CONTENTS? Not a non-player box of a sector this
    game once had loaded as the NON-holder (the engine never stocked its copy there) when it has neither received the holder's
    contents of that box nor stocked it itself since. 1 = answer from the contents, 0 = the contents are unknown here. */
@@ -144,6 +161,53 @@ inline int ParityPullAnswer(int kind, int heldByOtherArea, int trusted)
 inline int ParityPullOnRefusal(int refusedKind) { return (refusedKind != kParityAskPull) ? 1 : 0; }
 /* P109: an answer for a box this game writes now is not swapped in (ours stands) - unless it answers this game's own pull. */
 inline int ParityApplyOverOwn(int writerMine, int pulling) { return (writerMine == 0 || pulling != 0) ? 1 : 0; }
+/* AN ANSWER'S ITEMS ARE MADE IN A BORROWED SCRATCH CONTAINER (an active character's squad container) BY THE GAME'S ITEM
+   MAKER (the world's object factory). canMake = both are there now. With either missing - a game still loading - an answer
+   that carries items is HELD whole: nothing leaves the box, and its mismatch retry is not spent. An empty answer makes
+   nothing and applies. */
+const int kParityGateApply = 0;
+const int kParityGateHold  = 1;
+inline int ParityApplyGate(long long itemsN, int canMake)
+{
+    return (itemsN > 0 && canMake == 0) ? kParityGateHold : kParityGateApply;
+}
+/* A held box is asked again only on a pass that can make items (tested afresh each pass), outside the closed-box re-ask cap -
+   holding never spends a re-ask. Every other deferred box is re-asked as before, whether or not items can be made. */
+inline int ParityHeldReask(int canMake) { return (canMake != 0) ? 1 : 0; }
+/* WHERE A HOLDER'S FINISHED FILL GOES. peerState = this game's map of the other games' loaded areas for the box's sector (1 a
+   game has it loaded, 0 none, -1 no fresh map); askersOffMap = the games that asked this game for that sector and that the
+   map does not show there (ParityAskerCaughtUp ended the records of those it shows). A game whose ask was answered before
+   the fill ended holds the pre-fill contents, and the map can lag its load: such a game gets an addressed copy - also when
+   the map shows another game there (three or more games). */
+const int kParityPushPeer         = 0;   /* by area, to every game covering the sector */
+const int kParityPushAsker        = 1;   /* to each asker, addressed (the map shows nobody there) */
+const int kParityPushDrop         = 2;   /* nobody has it loaded and nobody asked: its first-sight ask covers it */
+const int kParityPushWait         = 3;   /* the map is stale: the box waits a drain */
+const int kParityPushPeerAndAsker = 4;   /* by area, and addressed to each asker the map does not show there */
+inline int ParityPushTarget(int peerState, int askersOffMap)
+{
+    if (peerState < 0) return kParityPushWait;
+    if (peerState > 0) return (askersOffMap > 0) ? kParityPushPeerAndAsker : kParityPushPeer;
+    return (askersOffMap > 0) ? kParityPushAsker : kParityPushDrop;
+}
+/* AN ASKER RECORD'S END (the holder's record of a game that asked it for a sector).
+   ParityAskerCaughtUp, read where the fill push reads the map: recordedSlot = that game's player slot when it asked (-1 not
+   known); slotLoaded = that slot's bit in this game's FRESH map of the loaded areas for the sector (1 set, 0 clear, -1 no
+   fresh map); peerState as ParityPushTarget. A game the map shows there gets the push by area from now on, so its record
+   ends - only when the same read also says some game has the sector (peerState > 0), so a map update landing between the
+   two reads never ends a record before the push it was kept for; a record with no slot cannot be found on the map and ends
+   once the map shows any other game there.
+   ParityAskerForget: a player's link ended (goneSlot, -1 not known) - that game's records end; every record when the slot
+   is not known, and any record whose own slot was not known. */
+inline int ParityAskerCaughtUp(int recordedSlot, int slotLoaded, int peerState)
+{
+    if (recordedSlot >= 0) return (slotLoaded > 0 && peerState > 0) ? 1 : 0;
+    return (peerState > 0) ? 1 : 0;
+}
+inline int ParityAskerForget(int goneSlot, int recordedSlot)
+{
+    return (goneSlot < 0 || recordedSlot < 0 || recordedSlot == goneSlot) ? 1 : 0;
+}
 /* P109 R3: A SECTOR'S MARK (this game's copies there are the non-holder's, never stocked by the engine). Owned = this game had
    the sector as its own (verdict mine) at an arrival before any arrival marked it - its copies there are real, and a later
    return as the non-holder keeps them trusted. Holding a sector after it was marked never makes its copies real (a gave-up
@@ -389,6 +453,7 @@ inline bool EncodeParityBox(std::vector<char>* b, const ParityBox& m)
         o.push_back((char)(unsigned char)(it.unique != 0 ? 1 : 0));
     }
     coopmark::EncodeOwnerTail(&o, ParityOwners(m.items), 0);   /* inv6 phase 2: nothing when no item is marked */
+    gearwire::EncodeGearTail(&o, ParityGear(m.items), 0);   /* the items' uniforms and crafters after the owner tail: nothing when none has one */
     {   /* bag23 part 2 (protocol 81): packs' contents LAST, in the kit's BAGK form keyed by item index - nothing when no pack holds
            anything. A block that will not encode (a pack over the cap, a bad row) refuses the whole answer: a box whose pack would
            be rebuilt EMPTY is the loss this block exists to end. The digest is unchanged (packs' rows are not in it). */
@@ -431,6 +496,13 @@ inline int DecodeParityBox(const char* p, size_t size, ParityBox* out)
         for (size_t i = 0; i < own.size(); ++i) m.items[i].owner = own[i];
         c.at = oe;
     }
+    if (n != 0 && c.at < size && gearwire::GearTailAt(p, size, c.at))   /* the gear tail, after the owner tail */
+    {
+        std::vector<gearwire::GearMarks> gear; size_t ge = 0;
+        if (gearwire::DecodeGearTail(p, size, c.at, m.items.size(), &gear, &ge) != gearwire::kGearOk) return kParityDecodeBadGear;
+        for (size_t i = 0; i < gear.size(); ++i) m.items[i].gear = gear[i];
+        c.at = ge;
+    }
     if (n != 0 && c.at < size)   /* bag23 part 2: the optional BAGK packs block, LAST (absent = no pack holds anything) */
     {
         size_t o2 = c.at;
@@ -439,7 +511,9 @@ inline int DecodeParityBox(const char* p, size_t size, ParityBox* out)
         {
             std::vector<coopbag::KitBag> kb;
             size_t ke = 0;
-            if (coopbag::DecodeKitBags(p, size, c.at, m.items.size(), &kb, &ke, 0) != coopbag::kKitBagOk) return kParityDecodeBadBag;
+            int rowWhy = coopbag::kBagOk;
+            if (coopbag::DecodeKitBags(p, size, c.at, m.items.size(), &kb, &ke, &rowWhy) != coopbag::kKitBagOk)
+                return ParityBagRowWhy(rowWhy);   /* a pack's rows' bad gear tail or bad BAGN tail has its own reason */
             for (size_t i = 0; i < kb.size(); ++i) m.items[kb[i].kitIndex].bag.swap(kb[i].rows);
             c.at = ke;
         }
@@ -447,6 +521,36 @@ inline int DecodeParityBox(const char* p, size_t size, ParityBox* out)
     if (c.at != size) return kParityDecodeTrailing;
     *out = m;
     return kParityDecodeOk;
+}
+
+/* A BOX answer longer than `limit` that carries uniforms / crafters (the items' GEML tail, or a pack's rows' in the BAGK block),
+   encoded again WITHOUT them when that brings it within `limit`. The world server's road refuses a message over its limit
+   (cooplive::kLiveInnerMax) whole; this keeps the contents arriving with the marks left off. 1 = *out is the shorter answer and
+   *fields the fields left off; 0 = within the limit already, not a readable answer, no marks, or still over the limit without them
+   (*out and *fields untouched). The digest is unchanged (the marks are not in it). */
+inline int ParityBoxFitWithoutGear(const char* p, size_t size, size_t limit, std::vector<char>* out, unsigned int* fields)
+{
+    if (p == 0 || out == 0 || size <= limit) return 0;
+    ParityBox m;
+    if (DecodeParityBox(p, size, &m) != kParityDecodeOk) return 0;
+    unsigned int n = 0;
+    for (size_t i = 0; i < m.items.size(); ++i)
+    {
+        ParityItem& it = m.items[i];
+        n += (it.gear.uniformSid.empty() ? 0u : 1u) + (it.gear.crafter.empty() ? 0u : 1u);
+        it.gear = gearwire::GearMarks();
+        for (size_t k = 0; k < it.bag.size(); ++k)
+        {
+            n += (it.bag[k].gear.uniformSid.empty() ? 0u : 1u) + (it.bag[k].gear.crafter.empty() ? 0u : 1u);
+            it.bag[k].gear = gearwire::GearMarks();
+        }
+    }
+    if (n == 0) return 0;
+    std::vector<char> b;
+    if (!EncodeParityBox(&b, m) || b.size() > limit) return 0;
+    out->swap(b);
+    if (fields) *fields = n;
+    return 1;
 }
 
 /* THE GROUND SETTLE STEP: one zone poll's ground item count for a sector into its settle record. *state: 0 = not counted since

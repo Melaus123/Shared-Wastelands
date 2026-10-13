@@ -19,6 +19,7 @@
 #include "../third_party/enet/include/enet/enet.h"
 #include "../../common/sendbound.h"   /* M16 (T-197): what waits to be sent on this link is bounded */
 #include "../../common/sendbundle.h"   /* M13: what is handed to ENet for the world server during one pass leaves as one packet per lane */
+#include "steam_transport.h"   /* the factory's Steam backend */
 
 #include <sstream>
 #include <locale>
@@ -61,7 +62,7 @@ public:
         : host_(0), peer_(0), state_(LINK_DOWN), sent_(0), recv_(0),
           nextPeerId_(1), hosting_(false), connectGen_(0), tLimit_(0), tMinMs_(0), tMaxMs_(0),
           sbDirect_(0), sbWaited_(0), sbCoalesced_(0), sbEpisodes_(0), sbDropped_(0), sbSendFailed_(0), sbWaitMax_(0), liveDir_(coopsb::kDirNoLive),
-          bundle_(false), bnSendFailed_(0), bnRecvBundles_(0), bnRecvBundled_(0), bnRecvBad_(0), bnLinksOn_(0), udpPackets_(0), udpBytes_(0)
+          bundle_(false), bnSendFailed_(0), bnRecvBundles_(0), bnRecvBundled_(0), bnRecvBad_(0), bnLinksOn_(0), udpPackets_(0), udpBytes_(0), bytesOut_(0), bytesIn_(0)
     {
     }
 
@@ -346,6 +347,7 @@ public:
             return false;
         }
         ++sent_;
+        bytesOut_ += (unsigned long long)len;   /* ByteCounts: every packet handed to ENet, a bundle once */
         return true;
     }
     void SbDrain()
@@ -497,6 +499,12 @@ public:
     }
     unsigned long long SentCount() const { return sent_; }
     unsigned long long RecvCount() const { return recv_; }
+    bool ByteCounts(unsigned long long* sent, unsigned long long* recv) const
+    {
+        if (sent != 0) *sent = bytesOut_;
+        if (recv != 0) *recv = bytesIn_;
+        return true;
+    }
 
 private:
     // ENet's global init is process-wide and must happen exactly once.
@@ -524,6 +532,7 @@ private:
     void Decode(ENetEvent* ev, std::vector<Message>* out)
     {
         const ENetPacket* p = ev->packet;
+        bytesIn_ += (unsigned long long)p->dataLength;   /* ByteCounts: every packet ENet delivered, a runt or a bundle included */
         if (p->dataLength < kHeaderBytes)
         {
             ErrorLog("[net] dropped runt packet, len=" + N((long long)p->dataLength));
@@ -561,6 +570,7 @@ private:
                 Message e;
                 e.type = (MsgType)es[i].type;
                 e.peer = (unsigned int)(size_t)ev->peer->data;
+                e.lane = (ev->channelID == (enet_uint8)CH_UNRELIABLE) ? CH_UNRELIABLE : CH_RELIABLE;   /* a bundle's messages arrived on its lane */
                 if (es[i].len) e.payload.assign(body + es[i].at, body + es[i].at + es[i].len);
                 out->push_back(e);
                 ++recv_;
@@ -570,6 +580,7 @@ private:
         Message m;
         m.type = (MsgType)p->data[0];
         m.peer = (unsigned int)(size_t)ev->peer->data;
+        m.lane = (ev->channelID == (enet_uint8)CH_UNRELIABLE) ? CH_UNRELIABLE : CH_RELIABLE;
         if (declared)
             m.payload.assign((const char*)p->data + kHeaderBytes,
                              (const char*)p->data + kHeaderBytes + declared);
@@ -595,6 +606,7 @@ private:
     coopbundle::Tally bnTally_;    /* M13: what the collector did */
     long long bnSendFailed_, bnRecvBundles_, bnRecvBundled_, bnRecvBad_, bnLinksOn_;
     long long udpPackets_, udpBytes_;   /* M13: ENet's datagram counters, harvested (UdpHarvest) */
+    unsigned long long bytesOut_, bytesIn_;   /* ByteCounts */
 };
 
 } // namespace
@@ -609,8 +621,7 @@ ITransport* CreateTransport(BackendId which)
         // Deliberately not silently falling back to direct: the player chose Steam, and
         // quietly substituting a different backend would be exactly the kind of hidden
         // behaviour the "no default" amendment exists to prevent.
-        ErrorLog("[net] Steam backend is not implemented yet (post-PoC) - refusing");
-        return 0;
+        return NewSteamTransport();   /* net/steam_transport.cpp; its Host / Join refuse with a reason where Steam is absent */
     default:
         return 0;
     }

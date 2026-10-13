@@ -29,7 +29,7 @@ enum UiDriveKind { kDriveButton = 1, kDriveList = 2, kDriveEdit = 3,
    the first of the two that is visible. */
 struct UiDriveName { const char* name; int kind; const char* w1; const char* w2; const char* caption; };
 /* pp1b (review 2026-09-27): `caption` = the text the button must READ for this name to press it (0 = any) - the one dialog
-   confirm button reads CREATE, DELETE WORLD or DELETE PROFILE, and `create` must never press a delete. */
+   confirm button reads CREATE, DELETE WORLD, RESET WORLD or DELETE PROFILE, and `create` must never press a delete. */
 
 inline const UiDriveName* UiDriveTable(size_t* count)
 {
@@ -51,9 +51,20 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "hosting",       kDriveButton, "SWHostingPauseButton",  0 },   /* T-524: HOSTING on the host's pause menu */
         { "hostaddrcopy",  kDriveButton, "SWNetAddrCopyBtn",      0 },
         { "hostvpncopy",   kDriveButton, "SWVpnAddrCopyBtn",      0 },   /* T-631: the RADMIN / HAMACHI ADDRESS row's COPY */
+        { "hostpwshow",    kDriveButton, "SWHostPwShowBtn",       0 },   /* T-290: HOST GAME's PASSWORD row SHOW / HIDE (one button) */
+        /* JOIN GAME's friends list REFRESH; HOSTING's INVITE FRIENDS; INVITE FRIENDS' INVITE and its BACK (the panel's one BACK) */
+        { "refresh",       kDriveButton, "SWFriendRefreshBtn",    0 },
+        { "invitefriends", kDriveButton, "SWInviteOpenBtn",       0 },
+        { "invite",        kDriveButton, "SWInviteSendBtn",       0 },
+        { "inviteback",    kDriveButton, "CoopCloseBtn",          0 },
         /* Host a game: the worlds list's buttons and the New world / Delete world? dialog */
         { "newworld",      kDriveButton, "CoopNewWorldBtn",       0 },
         { "deleteworld",   kDriveButton, "CoopDeleteWorldBtn",    0 },
+        { "resetworld",    kDriveButton, "SWResetWorldBtn",       0 },
+        /* the RESET WORLD? dialog's CANCEL and RESET WORLD - each pressed only while it reads that - and its keep-buildings tick box */
+        { "resetcancel",   kDriveButton, "CoopDlgCancelBtn",      0, "CANCEL" },
+        { "resetok",       kDriveButton, "CoopDlgOkBtn",          0, "RESET WORLD" },
+        { "resetkeep",     kDriveButton, "SWResetKeepTick",       0 },
         { "options",       kDriveButton, "CoopGameOptionsBtn",    0 },
         { "optdefaults",   kDriveButton, "CoopOptDefaultsBtn",    0 },
         { "optdone",       kDriveButton, "CoopOptDoneBtn",        0 },
@@ -61,6 +72,9 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "create",        kDriveButton, "CoopDlgOkBtn",          0, "CREATE" },  /* only while it reads CREATE (new world / profile) */
         { "cancel",        kDriveButton, "CoopDlgCancelBtn",      "CoopCloseBtn", "CANCEL" },   /* T-201 N1: also BACK while it reads CANCEL (a HOST / JOIN in progress) */
         { "boxok",         kDriveButton, "CoopNoticeOk",          0 },            /* T-201 N1: the error box's OK (CAN'T HOST / CAN'T JOIN) */
+        /* T-290: PASSWORD REQUIRED's own JOIN and CANCEL (a JOIN refused for its password) */
+        { "pwjoin",        kDriveButton, "SWPwJoinBtn",           0 },
+        { "pwcancel",      kDriveButton, "SWPwCancelBtn",         0 },
         /* Hosting and Your profiles */
         { "chooseprofile", kDriveButton, "CoopChooseProfileBtn",  0 },
         { "play",          kDriveButton, "CoopProfPlayBtn",       0 },
@@ -109,6 +123,8 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         /* the two lists */
         { "worlds",        kDriveList,   "CoopWorldList",         0 },
         { "profiles",      kDriveList,   "CoopProfList",          0 },
+        { "friends",       kDriveList,   "SWFriendList",          0 },   /* JOIN GAME's friends list: a row by the friend's name */
+        { "invitelist",    kDriveList,   "SWInviteList",          0 },   /* INVITE FRIENDS' list: a row by the friend's name */
         /* the typed boxes (New world and New profile share the one dialog box) */
         { "name",          kDriveEdit,   "CoopNameEdit",          0 },   /* T-201 N1b: PLAYER NAME - ONE box, on HOST GAME and JOIN GAME */
         { "address",       kDriveEdit,   "CoopJoinAddrEdit",      0 },
@@ -116,6 +132,8 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "worldname",     kDriveEdit,   "CoopDlgNameEdit",       0 },
         { "profilename",   kDriveEdit,   "CoopDlgNameEdit",       0 },
         { "fee",           kDriveEdit,   "SWOptFeeEdit",          0 },   /* T-556: GAME OPTIONS' RESURRECTION FEE box */
+        { "password",      kDriveEdit,   "SWPwEdit",              0 },   /* T-290: PASSWORD REQUIRED's box (UiDriveTypedHidden) */
+        { "hostpassword",  kDriveEdit,   "SWHostPwEdit",          0 },   /* T-290: HOST GAME's PASSWORD box (UiDriveTypedHidden) */
         /* the bug report window (bugreport.cpp): REPORT A BUG on the title screen, or in the Esc menu */
         { "bugreport",     kDriveButton, "BugReportTitleButton",  "BugReportPauseButton" },
         { "bugsend",       kDriveButton, "BugReportSend",         0 },
@@ -155,6 +173,8 @@ inline int UiDriveEngineName(const std::string& name, std::string* suffix)
 }
 
 /* The four driver verbs. They are NOT counted as harness verbs (player-path-plan section 0 item 6: g_cmdVerbsRun). */
+/* T-290: a box whose typed text is a password - `uitype`'s log line names the box and shows <hidden> in place of the text. */
+inline int UiDriveTypedHidden(const std::string& field) { return (field == "password" || field == "hostpassword") ? 1 : 0; }
 inline int UiDriveIsVerb(const std::string& verb)
 {
     return (verb == "uiclick" || verb == "uipick" || verb == "uitype" || verb == "uistate") ? 1 : 0;
@@ -192,6 +212,15 @@ inline void UiDriveSplit(const std::string& args, std::string* first, std::strin
     size_t z = args.size();
     while (z > r && (args[z - 1] == ' ' || args[z - 1] == '\t' || args[z - 1] == '\r' || args[z - 1] == '\n')) --z;
     if (rest != 0) *rest = args.substr(r, z - r);
+}
+/* T-290: a driver command's arguments as a log line shows them - `uitype <field> <text>` into a password box (UiDriveTypedHidden)
+   shows the field and <hidden>; everything else whole. */
+inline std::string UiDriveArgsForLog(const std::string& verb, const std::string& args)
+{
+    if (verb != "uitype") return args;
+    std::string field, text;
+    UiDriveSplit(args, &field, &text);
+    return UiDriveTypedHidden(field) != 0 ? field + " <hidden>" : args;
 }
 
 /* The usage error for one verb's arguments, or "" when the shape is right (the widget itself is checked live). */

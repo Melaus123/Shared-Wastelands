@@ -227,6 +227,10 @@ void WorldsyncResendAsk(int streamSlot, int askerSlot, const std::vector<unsigne
    row's handle does not resolve to its object, the object is not in the engine's list of running characters, and the SPAWN's spot
    is loaded here (the engine's zone byte). MAIN THREAD. */
 bool WorldsyncCopyRowStale(unsigned int uid, float x, float y, float z);
+/* T-758: CreateAt's just-built body sits at an address a row of ANOTHER uid (oldUid) still holds - that row is stale.  P034's
+   stale-pointer step for it: liveness rows settled, mirror row marked destroyed, oldUid retired (RetireStaleUid) unless the registry
+   names another object for it.  Returns 1 retired, 0 spared.  MAIN THREAD. */
+int WorldsyncRetireReusedAddress(const void* obj, unsigned int oldUid);
 /* M7a2 fold 1 item 8 [m7a2f-wh0]: WorldsyncCatchupReverse only QUEUES the sectors (the store pump calls it); this walks them - MAIN THREAD,
    net::SessionCatchupApplyTick (after the drain) [m7a2f-ap5], a running world with engine writes allowed, at most 64 characters a call. */
 void WorldsyncCatchupReverseTick();

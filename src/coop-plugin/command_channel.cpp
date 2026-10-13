@@ -15,6 +15,7 @@
 #include "replicate.h"
 #include "combat.h"
 #include "effect.h"   /* T-327: EffectTick, ReportEffect, eatbite */
+#include "fontguard.h"   /* T-730: ReportFontGuard */
 #include "medical.h"
 #include "stats.h"   /* S1: StatsTick */
 #include "resurrect.h"   /* T-556: ResurrectTick and the TEST-ONLY `resurrect` lever */
@@ -50,6 +51,7 @@ namespace coop { bool GroundFindLastPick(bool target, float* x, float* z, long l
 #include "appearance.h"
 #include "clothing.h"
 #include "ui.h"   /* uishot: the TEST-ONLY uipreview verb */
+#include "net/steam_friends.h"   /* the TEST-ONLY steamfriends and steamjoin levers */
 #include "../common/uidrive.h"   /* pp1: the TEST-ONLY UI driver verbs (uiclick / uipick / uitype / uistate) */
 
 #define WIN32_LEAN_AND_MEAN
@@ -81,6 +83,43 @@ std::string Trim(const std::string& s)
     if (b == std::string::npos) return "";
     std::string::size_type e = s.find_last_not_of(ws);
     return s.substr(b, e - b + 1);
+}
+
+/* A command line as the log shows it. hostpw and joinpw carry a password, so for them the verb alone is shown, then <hidden>; so does
+   `uitype <field> <text>` into a password box (coopui::UiDriveTypedHidden), shown as `uitype <field> <hidden>` (a nonce before the bar
+   stays: it names the write, not the password). Every other line is shown whole. */
+static bool CmdIsPasswordVerb(const std::string& body)
+{
+    const std::string t = Trim(body);
+    const std::string::size_type sp = t.find_first_of(" \t");
+    const std::string verb = sp == std::string::npos ? t : t.substr(0, sp);
+    return verb == "hostpw" || verb == "joinpw" || verb == "steamjoin";   /* steamjoin: its connect string carries a Steam id */
+}
+static std::string CmdVerbOnly(const std::string& body)
+{
+    const std::string t = Trim(body);
+    const std::string::size_type sp = t.find_first_of(" \t");
+    return (sp == std::string::npos ? t : t.substr(0, sp)) + " <hidden>";
+}
+static bool CmdIsHiddenType(const std::string& body, std::string* shown)
+{
+    std::string verb, args, field, text;
+    coopui::UiDriveSplit(body, &verb, &args);
+    if (verb != "uitype") return false;
+    coopui::UiDriveSplit(args, &field, &text);
+    if (coopui::UiDriveTypedHidden(field) == 0) return false;
+    if (shown != 0) *shown = "uitype " + field + " <hidden>";
+    return true;
+}
+std::string CmdForLog(const std::string& line)
+{
+    std::string typed;
+    if (CmdIsPasswordVerb(line)) return CmdVerbOnly(line);   /* the verb first: a password may itself hold a bar */
+    if (CmdIsHiddenType(line, &typed)) return typed;
+    const std::string::size_type bar = line.find('|');   /* a nonce before the first bar, then the verb */
+    if (bar != std::string::npos && CmdIsPasswordVerb(line.substr(bar + 1))) return line.substr(0, bar + 1) + CmdVerbOnly(line.substr(bar + 1));
+    if (bar != std::string::npos && CmdIsHiddenType(line.substr(bar + 1), &typed)) return line.substr(0, bar + 1) + typed;
+    return line;
 }
 
 void WriteStatus(const std::string& text)
@@ -137,7 +176,6 @@ std::string g_saveWatchName;     // the test save being watched to completion ("
 DWORD g_saveWatchAt = 0;
 DWORD g_saveFirstTryAt = 0;      // review-save2: when this save command was first tried (retries stop after 60 s)
 bool  g_saveTrying = false;      // F924: g_saveFirstTryAt holds a real time (the `| 1u` marker put it 1 ms in the future)
-int   g_rwLoadPhase = 0;         // restore1c: `repairworld` - the notebook repaired the world; the load of the save is being retried
 bool SaveNameAllowed(const std::string& n)
 {
     if (n.empty() || n.size() > 48) return false;   /* T-251: no cooptest-* prefix rule */
@@ -258,6 +296,7 @@ void ReportEverything()
     coop::ReportBuild();   /* build1-a */
     coop::ReportParity();  /* par1: [PARITY] REPORT and [ITEMS] REPORT */
     coop::ReportGround();  /* inv5 phase 1: [GROUND] REPORT */
+    coop::ReportFontGuard();   /* T-730: the [FONTGUARD] line - texts with no font answered */
 
     // P025/F200 - the world population, not just our own spawns. Added HERE rather than behind
     // a new verb for the reason this function exists at all: a probe reachable from only one
@@ -331,6 +370,7 @@ void CommandChannelTick()
     coop::SoakRefreshRunning();
     coop::NoteMainThread();
     coop::SpawnPaceFrameStart();   /* the copy budget is per frame: both drains below share it */
+    coop::ItemOwnParkFrameStart();   /* a stolen mark's item is never held by address from one frame to the next */
 
     // Network servicing runs EVERY tick, not on the command throttle: a 300-tick delay
     // on packet handling would add latency to every replicated event. Main thread only,
@@ -452,13 +492,13 @@ void CommandChannelTick()
                 g_lastRaw  = raw;
                 g_deferrals = 0;
                 g_saveTrying = false;   // F924: a new command starts its own 60 s
-                DebugLog("[cmd] new command: " + cmd);
+                DebugLog("[cmd] new command: " + CmdForLog(cmd));
             }
             else if (!cmd.empty())
             {
                 // Say so rather than going quiet. A silent no-op is what cost T064 two minutes;
                 // a line saying "I ignored this and why" costs nothing.
-                DebugLog("[cmd] ignored duplicate of last RAW line: " + raw
+                DebugLog("[cmd] ignored duplicate of last RAW line: " + CmdForLog(raw)
                          + " (the harness must write a UNIQUE nonce before the bar)");
             }
         }
@@ -507,24 +547,6 @@ void CommandChannelTick()
         coop::OwnSaveCommand(arg, &st);
         WriteStatus(st);
         finished = true;
-    }
-    else if (verb == "repairworld")   /* restore1c TEST verb: the host's "Repair a broken world" without the click */
-    {
-        std::string name;
-        is >> name;
-        if (name.empty() || !SaveNameAllowed(name))
-        {
-            ErrorLog("[cmd] repairworld REFUSED: '" + name + "' is not a save name (1..48 of letters/digits/-/_)");
-            WriteStatus("error repairworld refused-name " + name); finished = true; g_rwLoadPhase = 0;
-        }
-        else if (g_rwLoadPhase == 1) { finished = DoLoad(name); if (finished) g_rwLoadPhase = 0; }
-        else
-        {
-            std::string st;
-            const int rc = coop::RepairWorldCommand(name, &st);
-            if (rc == 2) { g_rwLoadPhase = 1; finished = DoLoad(name); if (finished) g_rwLoadPhase = 0; }
-            else if (rc == 1) { WriteStatus(st); finished = true; }
-        }
     }
     else if (verb == "save")   /* save2 */
     {
@@ -606,6 +628,20 @@ void CommandChannelTick()
         WriteStatus(ok ? "ok move" : "error move");
         finished = true;
     }
+    else if (verb == "playerorder")
+    {
+        // playerorder <medicUid> <patientUid> [25|60]   TEST-ONLY. This game's own character <medicUid> is given the player's own
+        // treatment order on <patientUid> (default 60, robot repair; 25 = first aid) through the entry a player's right-click on a
+        // patient reaches (medical.cpp PlayerOrderLever), after a guarded read of the patient's needs, the medic's kits and the
+        // treatment score the medic's AI keeps or drops the order by. No decision pass is forced and no gate is opened. The patient
+        // may be a copy. One [HEAL] playerorder line.
+        unsigned int medicUid = 0, patientUid = 0; int task = 60;
+        is >> medicUid >> patientUid;
+        int t = 0; if (is >> t) task = t;
+        const bool ok = coop::PlayerOrderLever(medicUid, patientUid, task);
+        WriteStatus(ok ? "ok playerorder" : "error playerorder");
+        finished = true;
+    }
     else if (verb == "moveorder")
     {
         // moveorder <dx> <dz>   TEST-ONLY. The captured player character (the one `move` walks) gets the game's own
@@ -618,11 +654,18 @@ void CommandChannelTick()
         // its squad (the squad reader ReadSquadOf: Character+0x658 -> the ActivePlatoon's member array), each to its OWN
         // position + (dx, dz), as a box-selected group's click-to-move gives each selected character its own Move order.
         // One `[cmd] moveorder uid=` line per character, then `[cmd] moveorder squad members= ordered=`.
+        // moveorder abs <x> <z> <y>   TEST-ONLY (T-424). The same order for the captured character alone, at the absolute
+        // point (x, z) at height y - a goal on another floor, so a player can be walked up or down stairs. Its line adds
+        // ` abs=1 y=`.
         const int kMoveOrderTask = 29;   // 'Move order' (.modding/03-systems/taskdata-table.md)
-        double dx = 0, dz = 0;
-        is >> dx >> dz;
+        double dx = 0, dz = 0, absY = 0;
+        std::string first;
+        is >> first;
+        const bool absGoal = (first == "abs");
+        if (absGoal) is >> dx >> dz >> absY;
+        else { std::istringstream fs(first); fs.imbue(std::locale::classic()); fs >> dx; is >> dz; }
         std::string mode;
-        is >> mode;
+        if (!absGoal) is >> mode;
         const bool squad = (mode == "squad");
         ::Character* c = coop::GetTarget();
         std::vector< ::Character*> who;
@@ -654,7 +697,8 @@ void CommandChannelTick()
         {
             ::Character* m = who[i];
             Ogre::Vector3 p = m->worldPosition();
-            Ogre::Vector3 goal(p.x + (float)dx, p.y, p.z + (float)dz);
+            const Ogre::Vector3 goal = absGoal ? Ogre::Vector3((float)dx, (float)absY, (float)dz)
+                                               : Ogre::Vector3(p.x + (float)dx, p.y, p.z + (float)dz);
             const unsigned int uid = coop::FindSpawnedUid(m);
             const bool ok = coop::InjectOrder(m, kMoveOrderTask, 0, goal);   // a gated puppet also gets its one decision pass; an owned character adopts it on its own next pass
             if (ok) ++ordered;
@@ -662,6 +706,7 @@ void CommandChannelTick()
             ss.imbue(std::locale::classic());
             ss.setf(std::ios::fixed); ss.precision(1);
             ss << "[cmd] moveorder uid=" << uid << " to=" << goal.x << "," << goal.z << " task=" << kMoveOrderTask << " ok=" << (ok ? 1 : 0);
+            if (absGoal) ss << " abs=1 y=" << goal.y;
             DebugLog(ss.str());
         }
         if (c == 0 && !squad) DebugLog("[cmd] moveorder uid=0 to=0.0,0.0 task=29 ok=0");
@@ -736,6 +781,13 @@ void CommandChannelTick()
         long long n = -1; is >> n;
         if (n < 0 || n > 600) { DebugLog("[cmd] malformed: 'livemove' requires a count 0..600"); WriteStatus("error livemove usage"); }
         else { coop::net::SessionMoveViaLive((int)n); WriteStatus("ok livemove"); }
+        finished = true;
+    }
+    else if (verb == "pumpcap")   /* TEST-ONLY: pumpcap <n> - each world-server intake call (PumpLink) handles at most n messages and ignores its 2 ms budget, to push a bench crowd past the limit; 0 restores the normal rule */
+    {
+        long long n = -1; is >> n;
+        if (n < 0 || n > 100000) { DebugLog("[cmd] malformed: 'pumpcap' requires a count 0..100000"); WriteStatus("error pumpcap usage"); }
+        else { coop::StorePumpCapSet((int)n); std::ostringstream o; o << "[cmd] pumpcap n=" << n; DebugLog(o.str()); WriteStatus("ok pumpcap"); }
         finished = true;
     }
     else if (verb == "liveprobe")   /* M6 TEST-ONLY: one LIVE AREA probe for this game's player sector - only the games with that sector loaded or one ring from it receive it */
@@ -965,6 +1017,36 @@ void CommandChannelTick()
             const bool ok = coop::SetStoreServer(addr, (unsigned short)port);
             WriteStatus(ok ? "ok join" : "error join");
         }
+        finished = true;
+    }
+    else if (verb == "hostpw" || verb == "joinpw")   /* TEST-ONLY: hostpw <text>|none - the password this game hosts with; joinpw <text>|none - the
+                                                        password for this join (what the HOST and PASSWORD boxes will set). The text is never logged. */
+    {
+        std::string rest; std::getline(is, rest); rest = Trim(rest);
+        const std::string pw = rest == "none" ? std::string() : rest;
+        if (verb == "hostpw") coop::SetHostPassword(pw); else { coop::SetJoinPassword(pw); coop::UiJoinPasswordFromLeverOnce(); }   /* JOIN GAME's next press keeps it */
+        DebugLog("[ACCESS] TEST-ONLY " + verb + ": " + (pw.empty() ? std::string("no password") : std::string("a password is set")));
+        WriteStatus("ok " + verb);
+        finished = true;
+    }
+    else if (verb == "steamfriends")   /* TEST-ONLY: steamfriends fake <1-8> | off - JOIN GAME's friends list shows that many sample rows (the
+                                          first with a password, the second a different version), or Steam's own list again */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::SteamFriendsLever(Trim(rest)));
+        finished = true;
+    }
+    else if (verb == "steamjoin")   /* TEST-ONLY: steamjoin +mpjoin steam:<id> - the handler of Steam's join request (callback 337) runs with
+                                       that connect string (the log shows the verb alone) */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::SteamJoinLever(Trim(rest)));
+        finished = true;
+    }
+    else if (verb == "accesstest")   /* TEST-ONLY: accesstest mode open|mode allowlist|clear - the hosting game writes its world's access.txt ([ACCESS] line) */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::StoreAccessTest(Trim(rest)));
         finished = true;
     }
     else if (verb == "worldaway")   /* T-546 step 8 TEST verb: worldaway <seconds 5-600> - this game's world-server link closed here and the
@@ -1510,6 +1592,7 @@ void CommandChannelTick()
         // counter's trade window (the player's right-click, as packbuytest sell); the sid then picks the SELLER's item.
         // sell goes alone: with npc or stack it is refused as usage.
         int buytestNpc = 0, buytestStack = 0, buytestSell = 0;
+        int buytestPack = 0;   /* T-736 TEST-ONLY: `pack` (buytest keeper ... sell only) - the sale leaves from the worn backpack's window */
         int buytestCats = -1, buytestCatsBad = 0;   /* T-164 B4-1: `cats=<n>` (buytest keeper only) */
         std::vector<std::string> arg;
         for (size_t bi = 0; bi < tok.size(); ++bi)
@@ -1518,6 +1601,7 @@ void CommandChannelTick()
             if (tok[bi] == "npc") { buytestNpc = 1; continue; }
             if (tok[bi] == "stack") { buytestStack = 1; continue; }
             if (tok[bi] == "sell") { buytestSell = 1; continue; }
+            if (tok[bi] == "pack") { buytestPack = 1; continue; }
             arg.push_back(tok[bi]);
         }
         // T-164 B4-0 (TEST LEVER): `buytest keeper <n|ghost|own|counter=<key text>> [sell] [cats=<n>]` - the FIRST key token being
@@ -1527,12 +1611,35 @@ void CommandChannelTick()
         // aims only at a counter the trade can take stock from (BuyTest's own stock-grid test) and chooses by squad id and leader
         // uid, never load order (src/common/keeperaim.h). The buyer is walked to the keeper first (B4-0b). The word `keeper` alone
         // therefore can no longer be a key substring for the old form.
-        if (!arg.empty() && arg[0] == "keeper")
+        // T-736 (TEST LEVER): `buytest keeper <...> sell pack` - the sale leaves from the window of the backpack the buyer wears (the
+        // window the engine opens beside the buyer's own when the trade window opens), through the same right-click call; refused out
+        // loud when no backpack is worn or its window is not open. `pack` goes only with `sell`, so the word cannot be a key for the old form.
+        // `buytest char <uid|name=<text>> sell [cats=<n>]` (TEST LEVER): the buyer is put beside that character and sells it one item
+        // through the player's right-click with no home or pack test (items.cpp BuyTestChar) - a keeper with no home building, or
+        // another game's copy of one. name=<text>: the nearest loaded character outside the player's faction whose name contains <text>
+        // ('_' reads as a space), for runs where the uid is not known beforehand. The word `char` can no longer be a key for the old form.
+        if (!arg.empty() && arg[0] == "char")
         {
-            if (arg.size() != 2 || buytestNpc != 0 || buytestStack != 0 || buytestCatsBad != 0) WriteStatus("error buytest keeper usage: buytest keeper <n|ghost|own|counter=<key text>> [sell] [cats=<n>]");
-            else WriteStatus(coop::BuyTestKeeper(arg[1], buytestSell, buytestCats) ? "ok buytest keeper" : "error buytest keeper");
+            int cbad = (arg.size() != 2 || buytestSell == 0 || buytestNpc != 0 || buytestStack != 0 || buytestPack != 0 || buytestCatsBad != 0) ? 1 : 0;
+            unsigned long long cu = 0;
+            std::string cname;
+            if (cbad == 0 && arg[1].compare(0, 5, "name=") == 0) { cname = arg[1].substr(5); if (cname.empty()) cbad = 1; }
+            else if (cbad == 0)
+            {
+                for (size_t d = 0; d < arg[1].size() && cbad == 0; ++d)
+                { if (arg[1][d] < '0' || arg[1][d] > '9' || d >= 10) cbad = 1; else cu = cu * 10 + (unsigned long long)(arg[1][d] - '0'); }
+                if (cbad == 0 && (cu == 0 || cu > 0xFFFFFFFFull)) cbad = 1;
+            }
+            for (size_t d = 0; d < cname.size(); ++d) if (cname[d] == '_') cname[d] = ' ';
+            if (cbad != 0) WriteStatus("error buytest char usage: buytest char <uid|name=<text>> sell [cats=<n>]");
+            else WriteStatus(coop::BuyTestChar((unsigned int)cu, cname, 1, buytestCats) ? "ok buytest char" : "error buytest char");
         }
-        else if (arg.empty() || arg.size() > 2 || buytestCats >= 0 || buytestCatsBad != 0 || (buytestSell != 0 && (buytestNpc != 0 || buytestStack != 0))) { WriteStatus("error buytest usage"); }
+        else if (!arg.empty() && arg[0] == "keeper")
+        {
+            if (arg.size() != 2 || buytestNpc != 0 || buytestStack != 0 || buytestCatsBad != 0 || (buytestPack != 0 && buytestSell == 0)) WriteStatus("error buytest keeper usage: buytest keeper <n|ghost|own|counter=<key text>> [sell [pack]] [cats=<n>]");
+            else WriteStatus(coop::BuyTestKeeper(arg[1], (buytestSell != 0) ? ((buytestPack != 0) ? 2 : 1) : 0, buytestCats) ? "ok buytest keeper" : "error buytest keeper");
+        }
+        else if (arg.empty() || arg.size() > 2 || buytestCats >= 0 || buytestCatsBad != 0 || buytestPack != 0 || (buytestSell != 0 && (buytestNpc != 0 || buytestStack != 0))) { WriteStatus("error buytest usage"); }
         else
         {
             const std::string want = (arg.size() > 1) ? arg[1] : std::string();
@@ -1570,6 +1677,8 @@ void CommandChannelTick()
     {
         // bagtest wear <who> <packSid|auto> | put <who> <sid> [count] | list <who> | out <who> <x> <y> | take <ghost> <x> <y>
         // | out <who> sid <baseSid> | take <ghost> sid <baseSid> | unwear <who> | wearback <who>   (bag23 lever: by record; a pack move with its contents)
+        // | wear <who> <packSid|auto> <sid> [count] (worn and filled) | tobox <who> <boxKey> (a new pack holding the worn pack's rows, put
+        // into that box; the worn pack untouched) | inbox <boxKey> [who] (read-only: every pack in that box and its rows, then who's pack)
         // (out / take: bag23 part 2 - one inner item of a pack to main, on our own character / out of the other game's)   - inv3a TEST lever (inv3-backpack-design.md
         // phase 1 test): create and wear a backpack on THIS game's own character, put items into it, or list any loaded
         // character's pack (read-only). <who> is `me`, `peer` or a name substring (coop::BagTestCommand).
@@ -1693,7 +1802,7 @@ void CommandChannelTick()
     if (verb == "profile")
     {
         /* prof1 (TEST, until the profile screen): `profile new <name>` asks the world for a new profile of this player;
-           `profile delete <n>` deletes one - its save folder goes to the Recycle Bin when the world's answer comes back. */
+           `profile delete <n>` deletes one - its save folder and records store are deleted for good when the world's answer comes back. */
         std::string sub; is >> sub;
         std::string rest; std::getline(is, rest); size_t s0 = rest.find_first_not_of(" \t"); rest = (s0 == std::string::npos) ? std::string() : rest.substr(s0);
         bool ok = false;
@@ -1764,6 +1873,22 @@ void CommandChannelTick()
         // line (F627). Read-only: it creates, moves and sends nothing.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::ResearchListCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "carryread")
+    {
+        // carryread [<tag>] [full] - TEST-ONLY, read-only (store.cpp CarryReadCommand): this player's finished research, map
+        // knowledge and faction standings, each as a count and an exact sum on a [CARRY] line, so a read before RESET WORLD and
+        // one after it compare; full adds every row.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::CarryReadCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "carryset")
+    {
+        // carryset research <techStringID|any> | map <townStringID|town name|any> [explored] | standing <faction> - TEST-ONLY
+        // lever (store.cpp CarrySetCommand): one change of each through the engine's own setter, made before the reset so that
+        // carryread's before and after are not a new game's defaults. [CARRY] set lines (standing: the [REL] change line).
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::CarrySetCommand(Trim(arg))); finished = true;
     }
     else if (verb == "researchmode")
     {
@@ -1957,6 +2082,23 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::TalkPromptArm(Trim(arg))); finished = true;
     }
+    else if (verb == "talkcursor")
+    {
+        /* talkcursor show <npcUid>   - TEST-ONLY, READ-ONLY (T-737, speech.cpp 'TALK CURSOR'): the talk cursor's cached answer for
+           that NPC and the talker a hover would use, and what the hover would answer now. Nothing is sent or changed.
+           talkcursor hover <npcUid>  - TEST-ONLY: the engine's own characterSelected runs once as a hover on that character (the click
+           byte held at 0), as a mouse hover does - it may queue the hover's ASK; then the show line.
+           talkcursor show name <Name> | talkcursor hover name <Name>  - TEST-ONLY: the same, on the loaded character whose name keys
+           as <Name> (any case, '_' and a space alike; the name runs to the end of the line), nearest at any distance to this game's
+           first own player character (speech.cpp TcNamePick, LeverNearestNamed); the pick is logged ([TALK] talkcursor show|hover
+           npc uid=<n> name '<Name>' ...). */
+        std::string sub; is >> sub;
+        std::string arg; std::getline(is, arg);
+        if (sub == "show") WriteStatus(coop::TalkCursorShow(Trim(arg)));
+        else if (sub == "hover") WriteStatus(coop::TalkCursorHover(Trim(arg)));
+        else WriteStatus("error talkcursor usage: talkcursor show|hover <npcUid> | talkcursor show|hover name <Name>");
+        finished = true;
+    }
     else if (verb == "hiretest")
     {
         /* hiretest near|uid <n> [price]   - TEST-ONLY lever (recruit1 R0-a, docs/design-recruit1.md 5): my first player character
@@ -1970,6 +2112,7 @@ void CommandChannelTick()
     else if (verb == "buildtest")
     {
         // buildtest place <sid> [dx dz] | progress <key-substring> <amount> | dismantle <key-substring>   - TEST-ONLY lever
+        // (also mats / destroy / into, and broken <key-substring> 0|1: the engine's own setBroken on the piece)
         // (build1-a, docs/design-build1.md s3): armed here, run at the K2 safe point (build.cpp BuildTestDrain).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildTestArm(Trim(arg))); finished = true;
@@ -1992,6 +2135,41 @@ void CommandChannelTick()
     {
         // buildlist - read-only: the build1 registry (position key -> sid, owner, progress) with live values
         WriteStatus(coop::BuildListCommand()); finished = true;
+    }
+    else if (verb == "bldstate")
+    {
+        // bldstate <key-substring|key> - TEST-ONLY, read-only: the piece's own state as a reset keeping the buildings lays it back - its
+        // class, name and layout names, pause, power, gets battery, battery, broken, destroyed; a production machine's bar and input
+        // stocks; a farm's growth, death, start and plants harvested; its own lock; each door's lock and state. [BUILD] bldstate lines.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BuildStateCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "bldset")
+    {
+        // bldset <key-substring|key> pause|power 0|1 | battery|progress|stock <value> | locklvl|doorlvl <0-100> - TEST-ONLY lever: one
+        // field of the piece written as the kept lay writes it (power through the engine's setPowerOn; stock = input record 0; locklvl =
+        // the piece's own lock, doorlvl = door 0's lock), at the K2 safe point. [BUILD] bldset line with the value before and after.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BuildSetArm(Trim(arg))); finished = true;
+    }
+    else if (verb == "keptlist")
+    {
+        // keptlist - TEST-ONLY, read-only: one [KEPT] line per kept row this game was sent (a reset that kept the buildings) - its
+        // state, claims, the key search here (found / none / ambiguous / not loaded), the live owner, the box's items against the kept
+        // ones - then a summary. It creates, claims and sends nothing. Per row also the kept and live destroyed / broken flags, the kept
+        // packs, and each kept door beside the live one.
+        WriteStatus(coop::BuildKeptListCommand()); finished = true;
+    }
+    else if (verb == "outposttest")
+    {
+        // outposttest found <name> [dx dz] | link <key-substring> | list - TEST-ONLY lever (outposts, build.cpp). found: a player
+        // outpost founded the engine's way (TownFoundPlayer) at this player's character + (dx, dz), named <name> (the rest of the
+        // line; the last two words are dx dz when both are numbers); link: one own registered piece (key or key substring) linked to
+        // this player's nearest outpost (Building +0x90, the field the placement writes); both run at the K2 safe point, one
+        // [BUILD] outposttest line each. list (read-only, now): one [BUILD] outposttest list line per player town - name, centre,
+        // handle words, faction, own=0|1, the registered pieces linked to it (first 8 keys) - then a summary line.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::OutpostTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "nearlist")
     {
@@ -2064,6 +2242,13 @@ void CommandChannelTick()
         // [HEAL] treattest lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::TreatTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "kitgive")
+    {
+        // kitgive <ownUid> <itemSid> [n 1..5]   - TEST-ONLY lever (spawn.cpp KitGiveCommand): n items made from the record sid are added
+        // to this game's own character at the K2 safe point through the engine's whole-inventory add. [HEAL] kitgive lines.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::KitGiveCommand(Trim(arg))); finished = true;
     }
     else if (verb == "bailtest")
     {
@@ -2425,19 +2610,80 @@ void CommandChannelTick()
     {
         // attack <attackerUid> <victimUid> [taskType]   - LOCAL, no session needed.
         // Default 5 = TASK_MELEE_FOCUSED (a deliberate duel rather than opportunistic).
-        unsigned int a = 0, v = 0; int type = 5;
-        is >> a >> v;
-        if (!(is >> type)) type = 5;
-        if (a == 0 || v == 0)
+        // attack <attackerUid> name <Name> [taskType]   - TEST-ONLY: the victim is the loaded character on THIS game whose name keys
+        // as <Name> (coopsay::TalkPersonKey: case-insensitive, '_' and a space alike), nearest to the attacker at any distance
+        // (speech.cpp LeverNearestNamed, kLeverPickAny). The name runs to the end of the line, except that a last word made only
+        // of digits, after at least one name word, is the task type. The picked uid is logged ([M3] attack name) before the
+        // [M3] attack ordered line, because a spawned or town character's uid is not known before the run.
+        std::string rest; std::getline(is, rest);
+        std::istringstream ws(rest);
+        std::string w0, w1;
+        ws >> w0 >> w1;
+        if (w1 == "name")
         {
-            DebugLog("[cmd] usage: attack <attackerUid> <victimUid> [taskType]"
-                     "   (4=MELEE_ATTACK, 5=TASK_MELEE_FOCUSED, 61=UNPROVOKED_FOCUSED)");
-            WriteStatus("error attack usage");
+            unsigned int a = 0; int type = 5;
+            { std::istringstream us(w0); us >> a; }
+            std::string words, last, w; int nw = 0;
+            while (ws >> w)
+            {
+                if (nw > 0) { if (!words.empty()) words += " "; words += last; }
+                last = w; ++nw;
+            }
+            if (nw >= 2 && last.find_first_not_of("0123456789") == std::string::npos) { std::istringstream ts(last); ts >> type; }
+            else if (nw >= 1) { if (!words.empty()) words += " "; words += last; }
+            const std::string nameKey = coopsay::TalkPersonKey(words);
+            ::Character* ac = (a != 0) ? coop::FindSpawned(a) : 0;
+            if (a == 0 || nameKey.empty())
+            {
+                DebugLog("[cmd] usage: attack <attackerUid> name <Name> [taskType]   ('_' = a space; a last word of digits is the task type)");
+                WriteStatus("error attack usage");
+            }
+            else if (ac == 0)
+            {
+                DebugLog("[M3] attack name '" + nameKey + "' refused: the attacker uid " + w0 + " is not on this game");
+                WriteStatus("error attack name: the attacker is not here");
+            }
+            else
+            {
+                unsigned int vu = 0; float vd = -1.0f; std::string vn, why;
+                if (coop::LeverNearestNamed(nameKey, coop::kLeverPickAny, ac, 1.0e30f, &vu, &vd, &vn, &why) == 0)
+                {
+                    DebugLog("[M3] attack name '" + nameKey + "' refused: " + why);
+                    WriteStatus("error attack name: " + why);
+                }
+                else if (vu == 0)
+                {
+                    DebugLog("[M3] attack name '" + nameKey + "' refused: the nearest such character ('" + vn + "') has no uid on this game");
+                    WriteStatus("error attack name: the character has no uid");
+                }
+                else
+                {
+                    std::ostringstream pk;
+                    pk << "[M3] attack name '" << nameKey << "' -> victim uid=" << vu << " '" << vn << "' dist=" << (int)vd
+                       << " (nearest to attacker uid=" << a << ") taskType=" << type;
+                    DebugLog(pk.str());
+                    bool ok = coop::AttackLocal(a, vu, type);
+                    WriteStatus(ok ? "ok attack" : "error attack");
+                }
+            }
         }
         else
         {
-            bool ok = coop::AttackLocal(a, v, type);
-            WriteStatus(ok ? "ok attack" : "error attack");
+            std::istringstream ns(rest);
+            unsigned int a = 0, v = 0; int type = 5;
+            ns >> a >> v;
+            if (!(ns >> type)) type = 5;
+            if (a == 0 || v == 0)
+            {
+                DebugLog("[cmd] usage: attack <attackerUid> <victimUid> [taskType] | attack <attackerUid> name <Name> [taskType]"
+                         "   (4=MELEE_ATTACK, 5=TASK_MELEE_FOCUSED, 61=UNPROVOKED_FOCUSED)");
+                WriteStatus("error attack usage");
+            }
+            else
+            {
+                bool ok = coop::AttackLocal(a, v, type);
+                WriteStatus(ok ? "ok attack" : "error attack");
+            }
         }
         finished = true;
     }
@@ -2485,6 +2731,16 @@ void CommandChannelTick()
             bool ok = coop::WoundPart(uid, part, (float)stun, (float)cut);
             WriteStatus(ok ? "ok wound" : "error wound");
         }
+        finished = true;
+    }
+    else if (verb == "bedhold")
+    {
+        // bedhold on|off   - TEST-ONLY lever (spawn.cpp BedHoldLever), on the body's own game: while on, BED requests from other
+        // games wait untouched and hold no carry drop, so the rescuer's "carrying nothing" is applied first (the reversed
+        // order); off lets them be acted on. [BED] TEST-ONLY bedhold line.
+        std::string arg;
+        is >> arg;
+        WriteStatus(coop::BedHoldLever(arg));
         finished = true;
     }
     else if (verb == "mirrorcap")
@@ -2536,6 +2792,16 @@ void CommandChannelTick()
         // character's four limbs, read now. Limb 0 left arm, 1 right arm, 2 left leg, 3 right leg. [LIMB] limbtest lines.
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::LimbTestLever(rest));
+        finished = true;
+    }
+    else if (verb == "statstest")
+    {
+        // statstest squad <level 1..100> | statstest show <uid>  - TEST-ONLY lever (stats.cpp StatsTestLever): every character
+        // of this game's own squad gets its skills, attributes, attack and defence set to level and the engine's stat
+        // recalculation run; the stats sender carries the new values to the copies. [STATS] lines, one per member. show: a
+        // character's main combat values here (own or copy), read now.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::StatsTestLever(Trim(rest)));
         finished = true;
     }
     else if (verb == "sneaktest")
@@ -2622,17 +2888,60 @@ void CommandChannelTick()
     else if (verb == "ko")
     {
         // ko <uid>  - M4 state readout: PoseState, hasDied, blood, bleed rate, ownership
-        unsigned int uid = 0;
-        is >> uid;
-        if (uid == 0)
+        // ko name <Name>  - TEST-ONLY: the uid is the loaded character on THIS game whose name keys as <Name> (coopsay::TalkPersonKey:
+        // case-insensitive, '_' and a space alike; the name runs to the end of the line), nearest at any distance to this game's
+        // first own player character (speech.cpp LeverNearestNamed, kLeverPickAny: standing, down or dead). The pick is logged
+        // ([M4] ko name), then the same readout.
+        std::string rest; std::getline(is, rest);
+        std::istringstream ws(rest);
+        std::string w0;
+        ws >> w0;
+        if (w0 == "name")
         {
-            DebugLog("[cmd] usage: ko <uid>");
-            WriteStatus("error ko usage");
+            std::string words, w;
+            while (ws >> w) { if (!words.empty()) words += " "; words += w; }
+            const std::string nameKey = coopsay::TalkPersonKey(words);
+            unsigned int nu = 0; float nd = -1.0f; std::string nn, why;
+            if (nameKey.empty())
+            {
+                DebugLog("[cmd] usage: ko <uid> | ko name <Name>   ('_' = a space)");
+                WriteStatus("error ko usage");
+            }
+            else if (coop::LeverNearestNamed(nameKey, coop::kLeverPickAny, 0, 1.0e30f, &nu, &nd, &nn, &why) == 0)
+            {
+                DebugLog("[M4] ko name '" + nameKey + "' refused: " + why);
+                WriteStatus("error ko name: " + why);
+            }
+            else if (nu == 0)
+            {
+                DebugLog("[M4] ko name '" + nameKey + "' refused: the nearest such character ('" + nn + "') has no uid on this game");
+                WriteStatus("error ko name: the character has no uid");
+            }
+            else
+            {
+                std::ostringstream pk;
+                pk << "[M4] ko name '" << nameKey << "' -> uid=" << nu << " '" << nn << "' dist=" << (int)nd
+                   << " (nearest to this game's first own player character)";
+                DebugLog(pk.str());
+                coop::ReportKO(nu);
+                WriteStatus("ok ko");
+            }
         }
         else
         {
-            coop::ReportKO(uid);
-            WriteStatus("ok ko");
+            std::istringstream ns(rest);
+            unsigned int uid = 0;
+            ns >> uid;
+            if (uid == 0)
+            {
+                DebugLog("[cmd] usage: ko <uid> | ko name <Name>");
+                WriteStatus("error ko usage");
+            }
+            else
+            {
+                coop::ReportKO(uid);
+                WriteStatus("ok ko");
+            }
         }
         finished = true;
     }

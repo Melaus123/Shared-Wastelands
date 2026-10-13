@@ -98,17 +98,17 @@ const int kServerExitWorldLocked = 4;
 /* The refusal words (owner, approved): the host's (CAN'T HOST), the joiner's (CAN'T JOIN) and the load's (CAN'T LOAD). */
 inline const char* FormatHostRefusedText()
 {
-    return "Couldn't host: this world was saved by a newer version of " SW_NAME ". Update the mod, then try again.";
+    return "Couldn't host: this world was saved by a newer version of " SW_NAME ".";
 }
 inline const char* FormatJoinRefusedText()
 {
-    return "Couldn't join: your copy of this world was saved by a newer version of " SW_NAME ". Update the mod, then try again.";
+    return "Couldn't join: your copy of this world was saved by a newer version of " SW_NAME ".";
 }
 /* The load refusal's words without the opening sentence and the last full stop: the panel line is these words and a full stop,
    the notice FormatLoadRefusedText. */
 inline const char* FormatLoadRefusedWords()
 {
-    return "It was made by a newer version of " SW_NAME ". Update the mod, then try again";
+    return "It was made by a newer version of " SW_NAME;
 }
 inline std::string FormatLoadRefusedText() { return std::string("You could not load that save. ") + FormatLoadRefusedWords() + "."; }
 

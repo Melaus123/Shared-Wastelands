@@ -17,6 +17,7 @@
 class Faction;
 namespace coop {
 void InstallStore();                         // hooks Platoon::deactivate (post) and Platoon::activate (pre)
+void InstallFontGuard();                     // T-730 (fontguard.cpp, fontguard.h): InstallStore calls it before the title screen is built
 void StoreTick();                            // MAIN THREAD, 1 Hz: link-up edge -> index load + push to the peer
 // E24.1 (review-p5o HIGH-1): has the notebook finished handing this game its opening picture of the world?
 // 0 = no relay link, or the WELCOME's push is still arriving; 1 = the push is over and the notebook has said
@@ -27,6 +28,7 @@ int  StoreWelcomePushDone();
 // until then; reset at every load, quit to menu and new link. Until it is 1, "the notebook does not know this id" is unanswerable.
 int  StoreSnapshotApplied();
 void ReportStore();
+void StorePumpCapSet(int n);                 // TEST-ONLY (verb pumpcap): n > 0 = each world-server intake call handles at most n messages, no time budget; 0 = the normal rule
 // T-239 (owner 191 A / 192): true while the player may not save, load or start a new game by hand - the title is down AND this is a
 // multiplayer world (SaveRedirectWanted). Every hand-save road asks this one function (store.cpp: the save funnel, the quickload
 // hook, the new-game pump refusal; ui.cpp: the pause menu greying). MAIN THREAD.
@@ -57,6 +59,7 @@ void StoreRoleLeftSingle();                         /* E38 / decision 43: a `joi
 struct KeylessGroup { void* platoon; float x, z; int posKnown; KeylessGroup() : platoon(0), x(0.0f), z(0.0f), posKnown(0) {} };
 int StoreKeylessRecordGroups(const std::string& townSid, KeylessGroup* out, int cap);   /* MAIN THREAD - those still bound here whose record names this town or names none ("" = every town); -1 = more than cap. One whose record has gained a key since leaves the list and its home is owed (StoreGiveOwedHomes) */
 int StoreGiveOwedHomes(const char* buildingKey, void* building);   /* MAIN THREAD - the groups made from their world records while this building (its position key) was not loaded here are given it as their home now (towngen.cpp TownGenGiveHomeTo); returns how many the building's residents hand now names */
+void StoreNoteCopyHome(void* platoon, const std::string& worldId, const unsigned char* handRaw32, int buildingSent, int buildingResolved);   /* MAIN THREAD - a copy just built (spawn.cpp PrepareContextForSpawn): a building sent that did not resolve here leaves its home owed, given by the store's once-a-second owed-home check (store.cpp CopyHomeOwedTick) once that building is loaded here [t755-copyhome-owe] */
 std::string StoreHomeReport();   /* the home[...] counts for the [TG] report line (plain counter reads) */
 int StoreTownPeoplePending(const char* townSid, int askSx, int askSy, char* holderOut, int holderCap);   /* decision 34 / T-580, ANY thread: does the notebook hold this town's creation back - townpending::kTownNotListed / kTownElsewhere / kTownHeld (src/common/townpending.h). (askSx, askSy) = the area the creation is for (-1 unread); holderOut (may be 0) names the note that holds it */
 int StoreTownRecordTally(const std::string& townSid, townrefill::Tally* out);   /* MAIN THREAD - what this world's records say about one town's groups (deleted, or living: placed here, waiting here, elsewhere, unplaceable, creation failed); 1 = counted */
@@ -116,6 +119,8 @@ int  StoreLobbyAnswerGen();        /* T552, MAIN THREAD: the link generation the
 long long StoreProfilesPanel(std::vector<StoreProfRow>* rows, unsigned* cap, unsigned* select, std::string* say, int* verdict);   /* the last answer handed to the screen; returns its change number (0 = none yet) */
 int  StoreOpenSaveName(char* out, int cap);   /* PP6 fold-2 F2, MAIN THREAD: SaveFileSystem+0x120, the open save's name (the PP5 redirect's read) - 1 = read into out, 0 = unreadable */
 int  StoreAutoLoadFacts(std::string* folder, int* found, int* quickSave, int* neverPlayed, std::string* profName);   /* T-201 PP6': MAIN THREAD - 1 = the pick is admitted and its folder decided */
+int  StoreResetCarryPost(const std::string& folder);   /* T-36 S2, MAIN THREAD: PostLoadChecked(folder), or Kenshi's IMPORT GAME in its place when the pick is carried into the reset world - the same return codes */
+int  StoreResetCarryMoving();   /* T-36, MAIN THREAD: 1 while this pick is carried into the reset world (decided, its own save not yet made) - the HOST GAME / JOIN line says so */
 int  StoreNewGameReshowTake();
 int  StoreNewGameReshowPending();   /* 1 = a refused NEW GAME's window is shown again on the next title tick (not taken) - MAIN THREAD */
 int  StoreSaveRequestCode(const void* saveMgr);   /* T-201 PP6': SaveManager+0xA0, the pending request code (-1 unreadable) - MAIN THREAD */   /* T-201 PP6' fold (F1): 1 once after a refused NEW GAME - the title pump shows the NEW GAME window again */
@@ -200,6 +205,13 @@ int  StoreOtherBeyondLinkInWorld();      // 1 = this link's roster shows another
 int  StorePlayerReachable(int slot);     // 1 = a send meant for that player (-1 = any other game) can go now: the session peer by the old link, another by the world-server road (mparrive::Reachable); session link up -> 1 for -1. Off the main thread: the old link's per-frame copy
 int  StoreArrivalRoundTarget(int to, int owedOrActive);   // whom a round owed for an arrival goes to: `to`, or -1 = every game (mparrive::RoundTarget)
 int StoreRefusedReason();                      // mp1, MAIN THREAD: why the notebook refuses this game (coopstore::StoreRefuseReason), -1 = not refused
+void SetHostPassword(const std::string& password);       // MAIN THREAD: the password this game hosts with ("" = none) - memory only, never logged
+int  StoreHostHasPassword();                             // MAIN THREAD: 1 = SetHostPassword's password is not empty (whether, never what)
+void SetJoinPassword(const std::string& password);       // MAIN THREAD: the password for the current join ("" = none) - memory only, never logged; a password refusal's stop ends
+bool StoreWriteWorldAuth(const std::string& worldDir);   // MAIN THREAD, before the world server starts: auth.txt from SetHostPassword's password (removed for none)
+bool StoreNewHostToken(std::string* hex);                // MAIN THREAD, before the world server starts: this hosting's new secret, as hex for its --host-token - never logged
+bool StoreHostToken(unsigned char out[32]);              // MAIN THREAD: this hosting's secret (HOST_TOKEN / the bridge's STEAM_ID); false = this game started no world server
+std::string StoreAccessTest(const std::string& args);    // TEST-ONLY `accesstest`: the hosting game writes its world's access.txt
 int  StoreMySlot();                                      // decision 32: my slot in the relay's order (-1 unknown)
 /* B9 (design-e46-store 2.2, decision 44). ANY THREAD: how many milliseconds this game has been unable to
    see the notebook process. 0 while the link is up. The clock starts at the store's FIRST tick, so a game
@@ -260,21 +272,51 @@ std::string StoreNotebookDir();
 /* mp3, MAIN THREAD: the shared-world helper's TOP folder - storedir= when present, else <save root>\coop-store - with one
    folder per world inside it. The MULTIPLAYER panel's Host a game screen lists, makes and deletes worlds there. */
 std::string StoreTopDir();
-/* MAIN THREAD (the title panel): the world's saves on this computer to the Recycle Bin - every save folder in Kenshi's save root whose
-   key file names worldName (any profile; coopprof::WorldLeftoversFind) and each matching records store in <data>\\players. Called by
-   DELETE WORLD only, after the world folder went. The save folder this game plays from, its profile's records stores and any store open
-   now stay (in use). A folder Windows could not recycle is kept, never deleted. Returns how many could NOT be moved (the in-use ones are
-   not counted); *summary = what was recycled, how many stayed in use and how many could not be moved. */
-int StoreWorldRecycleLeftovers(const std::string& worldName, const std::string& worldId, std::string* summary);   /* T-490: worldId = world.txt line 2 ("" = none: nothing recycled) */
-/* T-201 PP6' (owner 178a): DELETE on HOST GAME -> CHANGE, the world not running - its profiles.txt edited here (coopprof::DeleteApply) and the
-   profile's save folder to the Recycle Bin as the DELETE answer does. MAIN THREAD. coopprof::kOk = deleted; *say = the PROFILES line. */
-int  StoreProfileDeleteOffline(const std::string& folder, const std::string& worldKey, unsigned num, std::string* say, int* box);   /* T-220: box 1 = the CAN'T DELETE box (say empty) */
+/* MAIN THREAD (the title panel): a deleted world's saves on this computer, deleted for good - every save folder in Kenshi's
+   save root whose key file carries worldId whatever world name it carries, or names worldName with no id (saves from before world
+   ids; swdel::WorldDeleteFind) and
+   each records store named for those profiles in <data>\\players, by id and as named before ids. Called by DELETE WORLD before the
+   world folder. The save folder this game plays from, its profile's records stores and any store open now stay (in use). Stops at
+   the first folder Windows will not let go: 1, else 0; *summary = what was deleted, what stayed in use and where it stopped. */
+int StoreWorldDeleteLeftovers(const std::string& worldName, const std::string& worldId, const std::string& person, std::string* summary);   /* worldId = world.txt line 2 ("" = none: only saves and stores with no id go); person = this player's id as the world knows it (StoreWorldPlayerId, read before anything is deleted; "" = ConfigPlayerId()) */
+/* MAIN THREAD: one folder deleted for good, never through the Recycle Bin. path must lie strictly inside root (both made full
+   paths first, swdel::PathInside); a link or junction inside is removed, never followed; lastName = a file of the top folder deleted
+   after everything else (0 = none); mark = 1: the being-deleted marker (swdel::kDeleteMarkFile) is written first and deleted last,
+   so a delete that stops leaves a folder NEW WORLD and the next title-screen start finish. 1 = deleted, 0 = stopped or refused
+   (*failPath / *failErr = where, and Windows' error - 0 when refused before anything was touched; what was deleted before a stop
+   stays deleted), -1 = no such folder. The counts go to the log under tag. */
+int StoreDeleteTree(const std::string& path, const std::string& root, const std::string& tag, const char* lastName, int mark, std::string* failPath, unsigned long* failErr);
+/* MAIN THREAD: a deleted profile's save folder(s) and records store(s) in the world worldKey (id worldId), deleted for good -
+   person = the id that world knows this player by, num = the profile's number. The folder this game plays from and a store this
+   game has open stay (in use). Its line in the unfinished-deletes list (<data folder>\unfinished-deletes.txt) is written before
+   anything is deleted and dropped once all of it is gone, so a delete that stops is finished at the next title-screen start.
+   false = stopped at a folder Windows would not let go (said in the log). */
+bool StoreProfileDeleteSave(const std::string& worldKey, const std::string& worldId, const std::string& person, unsigned num);
+/* MAIN THREAD: does this folder carry the being-deleted marker - a world folder whose delete stopped? */
+bool StoreWorldFolderUnfinished(const std::string& dir);
+/* MAIN THREAD, the title pump, every frame (it does its work once, when the title screen is up): each world-store folder carrying
+   the being-deleted marker and no world.txt is deleted (one that still holds world.txt is still listed and left for DELETE WORLD),
+   and each profile delete in the unfinished-deletes list is run again. Log lines only. */
+void StoreUnfinishedDeletesFinish();
+/* MAIN THREAD: DELETE WORLD's world lock - <world store>\<folder>\ coopprof::kWorldLockFile, opened with no sharing and tried once.
+   0 = held by a world server in another process, or not takeable (said in the log under name); else the lock, held until
+   StoreWorldLockGive. */
+void* StoreWorldLockTake(const std::string& folder, const std::string& name);
+void  StoreWorldLockGive(void* lock);
+/* T-201 PP6' (owner 178a): DELETE on HOST GAME -> CHANGE, the world not running - its profiles.txt edited here (coopprof::DeleteApply),
+   then the profile's save and records store deleted for good (StoreProfileDeleteSave). MAIN THREAD. coopprof::kOk = deleted;
+   *say = the PROFILES line, naming the profile by name. */
+int  StoreProfileDeleteOffline(const std::string& folder, const std::string& worldKey, unsigned num, const std::string& name, std::string* say, int* box);   /* T-220: box 1 = the CAN'T DELETE box (say empty) */
 /* MAIN THREAD: this player's id as the world in <worlds>\<folder> knows it - ConfigPlayerId() through that world's aliases.txt (itself when none). */
 std::string StoreWorldPlayerId(const std::string& folder);
 /* loot2c x prof1 merge, MAIN THREAD: the id the notebook knows THIS connection by - coopprof::SlotKey(person, picked profile)
    (profile 1 = the bare person id, n >= 2 = "<person>.<n>"; the notebook's g_peerId), or the person id while no profile is
    picked. A research take row must name it, or the notebook refuses the row (takesIdMismatch). */
 std::string StorePlayerKey();
+/* MAIN THREAD: this player's id as the linked world knows it - the WELCOME's player id when the world's aliases.txt maps this
+   install's id to an older one (store protocol 91), else ConfigPlayerId(). The profile id, the profile save folder, StorePlayerKey
+   and the per-player world files use it; the HELLO always sends ConfigPlayerId(). */
+std::string MyPersonId();
 /* W2b, MAIN THREAD: the folder name of the world whose record index this game has read, "" while none is read.
    A settings re-read naming another world is refused while this is set (config.cpp ConfigRearmFromFile). */
 std::string StoreIndexWorld();
@@ -414,6 +456,12 @@ bool StoreResearchOff();
 bool StoreResearchQueue(std::vector<std::pair<std::string, float> >* q, std::string* text, std::string* why);
 std::string StoreResearchQueueTech(const std::string& sid, std::string* name, std::string* detail);
 std::string StoreResearchNameOf(const std::string& sid);
+/* TEST-ONLY (src/common/carrycheck.h; store.cpp): `carryread [<tag>] [full]` - read-only, this player's finished research, map
+   knowledge and faction standings, each as a count and an exact sum on a [CARRY] line, so a read before RESET WORLD and one after
+   it compare; `carryset research <techStringID|any> | map <townStringID|town name|any> [explored] | standing <faction>` - one
+   change of each through the engine's own setter, made before the reset. The command status. MAIN THREAD. */
+std::string CarryReadCommand(const std::string& args);
+std::string CarrySetCommand(const std::string& args);
 /* crime6 / crime10: this game's own absolute world hours - the double at clock+0xA0 the bounty map's times are measured
    against (crime9 answer 1) - -1 when unreadable. crime.cpp logs it and clamps every bounty time it writes to it.
    MAIN THREAD. */

@@ -663,15 +663,63 @@ inline bool MoveHoldTake(MoveHoldBook* b, unsigned int uid, std::vector<char>* p
     b->rows.erase(it);
     return true;
 }
-inline size_t MoveHoldExpire(MoveHoldBook* b, double now, double sec)
+/* A WITHDRAWAL (UNLOAD / DESPAWN) of a held uid by the game whose MOVEs are held: the hold goes, so its expiry does not book a
+   character that game no longer runs here. A hold from another sender stays. Answers true when the hold went. */
+inline bool MoveHoldWithdraw(MoveHoldBook* b, unsigned int uid, unsigned int sender)
+{
+    if (b == 0) return false;
+    std::map<unsigned int, MoveHeld>::iterator it = b->rows.find(uid);
+    if (it == b->rows.end() || it->second.sender != sender) return false;
+    b->rows.erase(it);
+    return true;
+}
+/* A HOLD THAT RUNS OUT: its character is still unknown here while its owner streams it - the owner never sent it to this game. Each
+   row erased is handed back once in `gone` (appended; 0 = not wanted) with its owner key and the latest held MOVE's position (bytes
+   4..15; a non-finite one is not taken), so the caller can book the character where its owner last put it. */
+struct MoveHoldGone
+{
+    unsigned int uid, sender;   /* sender = the owner key of the held MOVEs */
+    int hasPos;                 /* x, y, z read from the latest held MOVE */
+    float x, y, z;
+    MoveHoldGone() : uid(0), sender(0), hasPos(0), x(0.0f), y(0.0f), z(0.0f) {}
+};
+/* a float that is neither infinite nor NaN, read from its bits (no floating-point compare to fold away) */
+inline bool MoveHoldFinite(float f) { unsigned int u = 0; std::memcpy(&u, &f, 4); return (u & 0x7F800000u) != 0x7F800000u; }
+inline size_t MoveHoldExpire(MoveHoldBook* b, double now, double sec, std::vector<MoveHoldGone>* gone = 0)
 {
     size_t n = 0;
     for (std::map<unsigned int, MoveHeld>::iterator it = b->rows.begin(); it != b->rows.end(); )
     {
-        if (now - it->second.at > sec) { b->rows.erase(it++); ++n; } else ++it;
+        if (now - it->second.at > sec)
+        {
+            if (gone != 0)
+            {
+                MoveHoldGone g;
+                g.uid = it->first; g.sender = it->second.sender;
+                if (it->second.payload.size() >= 16)
+                {
+                    float p[3] = { 0.0f, 0.0f, 0.0f };
+                    std::memcpy(p, &it->second.payload[4], 12);
+                    if (MoveHoldFinite(p[0]) && MoveHoldFinite(p[1]) && MoveHoldFinite(p[2])) { g.hasPos = 1; g.x = p[0]; g.y = p[1]; g.z = p[2]; }
+                }
+                gone->push_back(g);
+            }
+            b->rows.erase(it++); ++n;
+        }
+        else ++it;
     }
     return n;
 }
+/* AN EXPIRED HOLD, DECIDED WHEN IT IS HANDED BACK: BOOK the uid in the lost-copy book under the held MOVEs' sender (the owner; the
+   book asks it for the character when the spot is kept here), or SKIP it - this game runs the uid, an owner record arrived meanwhile
+   (its SPAWN came: the record's own roads book it), or no sender is known. */
+enum { kMoveHoldGoneBook = 0, kMoveHoldGoneSkip = 1 };
+inline int MoveHoldGoneDecide(bool ownedHere, bool ownerKnown, unsigned int sender)
+{
+    return (ownedHere || ownerKnown || sender == 0) ? (int)kMoveHoldGoneSkip : (int)kMoveHoldGoneBook;
+}
+/* The booked-hold line's budget: the first 20, then every 50th. */
+inline bool MoveHoldExpiredLogThis(long long n) { return n >= 1 && (n <= 20 || (n % 50) == 0); }
 /* item 8 (the notebook, store_main.cpp OnLive): THE 'MISSED' STAMP. An AREA message about a sector that a game has NOT in its delivery
    set now, but had within kCatchupRejoinSec (it still holds a stamp), was dropped for that game: the stamp is erased, so when the sector
    comes back it is newly delivered and caught up - not taken for an edge flicker that missed nothing. */

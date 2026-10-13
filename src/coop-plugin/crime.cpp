@@ -10,8 +10,10 @@
 //   showed the engine accepts (effective=1 x2); a cleared crime with setCrime 0x851DB0 (crime 0, no faction, the null hand),
 //   the engine's own clear (_doActions CLEAR_BOUNTY, crime1 answer). Both are read back: "applied" means the copy's
 //   +0x148 now holds the crime sent.
-// A witness-side write on a copy (DA_CRIME_ALARM may set TRESPASSING on the offender, crime1 answer) is not sent back: only
-// owned characters are sampled. A copy's own countdown may not run (its AI is gated); the owner's clear ends it.
+// COPY-SIDE WRITES (MSG_CRIME kind 1): a crime this game's engine records on a copy - its own witnesses saw the copy act (a guard
+// hit, a trespass its senses caught, DA_CRIME_ALARM) - goes to the character's owner, which records it on its own character;
+// the owner's next state then reaches every game. A copy's own countdown may not run (its AI is gated); the owner's clear ends
+// it, except while a crime recorded here has not yet come back in the owner's state.
 //
 // C++03 (VS2010 v100). Every __try lives in a function with no C++ object that has a destructor (C2712).
 
@@ -19,6 +21,7 @@
 #include "spawn.h"          /* FindSpawned, MirrorSlot, MirrorCapacity */
 #include "speech.h"         /* crimetest bountyset: LeverNearestNamed */
 #include "store.h"          /* EngineWritesBlocked */
+#include <cstddef>          /* offsetof - the looker refusal counter's place */
 #include "worldsync.h"      /* AnnouncedToPeerQuiet (H030) */
 #include "addresses.h"      /* NotifyCrimeWitnessed / SetCrime come from the address table */
 #include "relations.h"      /* RelationsWireSid / RelationsFactionFromWire */
@@ -124,6 +127,11 @@ int CrCallSet(CrSetFn fn, void* c, const hand* h)
     __try { fn((char*)c + kCrBountyMgr, 0, 0, *h); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+
+/* Where a copy-side crime (kind 1) was seen: the engine's setCrime write, the owner's state refused because the copy held
+   another crime, a guard's bounty added to the copy here. */
+const int kCapSrcSet = 0, kCapSrcRefused = 1, kCapSrcBounty = 2;
+void CopyNoteLive(::Character* c, unsigned int uid, int src);   /* defined with the copy-side writes below */
 
 int CrFactionOf(::Character* c, ::Faction** out)
 {
@@ -456,6 +464,7 @@ void BountySample()
             if (!clr.empty()) BountyEnqueue(u, coopbounty::kBountyKindClear, clr);
             known = cur;   /* forwarded once; the owner's next list is the truth */
             if (!add.empty()) BountyLog("[BOUNTY] copy uid=" + S(u) + " a guard here added " + BountyListText(add) + " - sent to the owner");
+            if (!add.empty()) CopyNoteLive(c, u, kCapSrcBounty);   /* the crime the copy holds now goes to the owner as a copy-side write when the owner's state lacks it */
             if (!clr.empty()) BountyLog("[BOUNTY] copy uid=" + S(u) + " taken off here " + BountyListText(clr) + " - sent to the owner (par20)");
         }
     }
@@ -650,6 +659,65 @@ bool PvpRefuse(void* bountyManager, int crime, void* againstFaction)
     return CrOffenderFactionPod(bountyManager, &off) && PlayerSide(off);
 }
 
+/* COPY-SIDE WRITES (kind 1). Every crime the engine records goes through the two detours below; each one recorded on a
+   REPLICATED character is noted here (its uid by address compare, the crime) unless this game is writing the owner's state onto
+   that copy right now. CrimeTick decides on the main thread whether it was a copy and sends it to the owner. ANY THREAD. */
+struct CopyCap { unsigned int uid; int crime; int src; };   /* src: kCapSrc* */
+const size_t kCopyCapMax = 256;
+CopyCap g_copyCap[kCopyCapMax];
+size_t g_copyCapN = 0;
+CRITICAL_SECTION g_copyCapLock;
+volatile LONG g_copyCapLockInit = 0;
+volatile LONG64 g_copyCaptured = 0, g_copyCapOverflow = 0;
+long long g_copyLiveNote[2] = { 0, 0 };              /* copy crimes noted held (main thread): the owner's state refused for one, a guard's bounty added */
+volatile LONG64 g_trespassSet[4] = { 0, 0, 0, 0 };   /* setCrime TRESPASSING: calls, recorded, on another player's character, recorded on one */
+volatile DWORD g_crApplyingThread = 0;   /* the thread writing the owner's state onto a copy right now (CrimeApplyDrain); 0 none */
+
+int CrBmCharPod(const void* bountyManager, const void** c)
+{
+    *c = 0;
+    __try { *c = *(const void* const*)((const char*)bountyManager + 0x40); return 1; }   /* the BountyManager's character */
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* The crime the BountyManager holds now (+0x58, setCrime's own write). setCrime records 9, not the 5 it was given, when the
+   victim hand resolves to a character the 0x7956A0 test passes for (decomp_851db0); the capture notes what was recorded. */
+int CrBmCrimePod(const void* bountyManager, int* crime)
+{
+    *crime = 0;
+    __try { *crime = *(const int*)((const char*)bountyManager + 0x58); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int CrRecordedCrime(const void* bountyManager)
+{
+    int c = 0;
+    return CrBmCrimePod(bountyManager, &c) ? c : 0;
+}
+void CopyCapNote(void* bountyManager, int crime)
+{
+    if (crime == 0 || g_copyCapLockInit == 0) return;
+    if (g_crApplyingThread != 0 && g_crApplyingThread == ::GetCurrentThreadId()) return;   /* the owner's state, from the wire */
+    const void* c = 0;
+    if (!CrBmCharPod(bountyManager, &c) || c == 0) return;
+    const unsigned int uid = FindSpawnedUid(c);
+    if (uid == 0) return;
+    ::EnterCriticalSection(&g_copyCapLock);
+    if (g_copyCapN < kCopyCapMax) { g_copyCap[g_copyCapN].uid = uid; g_copyCap[g_copyCapN].crime = crime; g_copyCap[g_copyCapN].src = kCapSrcSet; ++g_copyCapN; ::InterlockedIncrement64(&g_copyCaptured); }
+    else ::InterlockedIncrement64(&g_copyCapOverflow);
+    ::LeaveCriticalSection(&g_copyCapLock);
+}
+
+/* ANY THREAD. Every TRESPASSING write the engine asks for, and whether it recorded it - on any character, and on another player's
+   character (its faction is a stand-in) - so the REPORT shows whether the senses' trespass write reaches this entry at all. */
+void TrespassSetNote(void* bountyManager, bool recorded)
+{
+    ::InterlockedIncrement64(&g_trespassSet[0]);
+    if (recorded) ::InterlockedIncrement64(&g_trespassSet[1]);
+    void* f = 0;
+    if (!CrOffenderFactionPod(bountyManager, &f) || f == 0 || !(f == g_crimePeer || IsPeerFaction((::Faction*)f))) return;
+    ::InterlockedIncrement64(&g_trespassSet[2]);
+    if (recorded) ::InterlockedIncrement64(&g_trespassSet[3]);
+}
+
 bool detour_setCrime(void* bountyManager, int crime, void* againstFaction, const void* againstWho)
 {
     if (PvpRefuse(bountyManager, crime, againstFaction))
@@ -657,12 +725,15 @@ bool detour_setCrime(void* bountyManager, int crime, void* againstFaction, const
         ::InterlockedIncrement64(&g_pvpRefused);
         return false;   /* player against player: the engine never records it (user decision pvp1) */
     }
-    return orig_setCrime(bountyManager, crime, againstFaction, againstWho);
+    const bool r = orig_setCrime(bountyManager, crime, againstFaction, againstWho);
+    if (crime == 11) TrespassSetNote(bountyManager, r);   /* TRESPASSING */
+    if (r) CopyCapNote(bountyManager, CrRecordedCrime(bountyManager));   /* what the engine recorded (5 may become 9) */
+    return r;
 }
 void detour_notify(void* bountyManager, void* againstFaction, const void* againstWho, int expirySeconds, int crime)
 {
     if (PvpRefuse(bountyManager, crime, againstFaction)) { ::InterlockedIncrement64(&g_pvpRefused); return; }
-    orig_notify(bountyManager, againstFaction, againstWho, expirySeconds, crime);
+    orig_notify(bountyManager, againstFaction, againstWho, expirySeconds, crime);   /* its own setCrime call (0x851DB0) goes through detour_setCrime, which notes what was recorded */
 }
 
 // sight1 (docs/design-arrest.md 3 "sight1"; F899; user decision 3 = full parity, recognition on sight included). A guard's
@@ -682,15 +753,36 @@ unsigned long long kCrSightRva = 0; static AddrReg kCrSightRva_reg("BountySightT
 const unsigned char kSightOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x0E };
 const unsigned int kSightBack  = 0x08;    /* 0x856365 - the je, left in place */
 const size_t kSightCellsOff    = 0x400;   /* review-sight1 LOW: the cells are kept off the code's cache line; T-356: past the longer stub */
-struct SightCells { volatile LONG64 hits; void* volatile peer[coopcrime::kSightCellCap]; };   /* T-356: hits at +0, cell k at +8+8k */
+struct SightCells { volatile LONG64 hits; void* volatile peer[coopcrime::kSightCellCap]; volatile LONG64 lookerRefused; };   /* hits at +0, cell k at +8+8k; the trespass stub's looker refusals after the last cell */
 /* T-356: every stand-in the table can hold, plus an old save's coop-peer, has a cell; the stub ends before the cells; the cells fit the page */
 typedef char kSightCellsCoverStandIns[(coopcrime::kSightCellCap >= kStandInTableCap + 1) ? 1 : -1];
 typedef char kSightStubBeforeCells[(coopcrime::kSightStubLen <= (int)kSightCellsOff) ? 1 : -1];
-typedef char kSightCellsInPage[((int)kSightCellsOff + 8 + 8 * coopcrime::kSightCellCap <= 0x1000) ? 1 : -1];
+typedef char kSightCellsInPage[((int)kSightCellsOff + 8 + 8 * coopcrime::kSightCellCap + 8 <= 0x1000) ? 1 : -1];
+typedef char kTrespassStubBeforeCells[(coopcrime::kTrespassStubLen <= (int)kSightCellsOff) ? 1 : -1];
+typedef char kLookerRefusedAfterCells[(sizeof(void*) != 8 || offsetof(SightCells, lookerRefused) == 8 + 8 * coopcrime::kSightCellCap) ? 1 : -1];
 int g_sightHeld = 0, g_sightDropped = 0;   /* T-356: the cells in use at the last tick; other players' factions that found no cell */
 SightCells* g_sightCells = 0;
 volatile LONG g_sightState = 0;   /* 0 not tried, 1 patched, -1 refused / failed */
 const char* g_sightWhy = "not tried";
+
+// The trespass test (P56). In the same senses function a TARGET reaches the building-intruder check (isIntruder_Building 0x851480
+// -> setCrime TRESPASSING on the target with the looker's faction and hand, then event 0x11 on the looker) only when its faction is
+// a player faction:
+//   0x858D13  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0    (rax = the target's faction, vt+0x58)
+//   0x858D1B  74 51                     je 0x858D6E                 (not a player: the intruder check is skipped)
+// A copy of another player's character is in that player's stand-in faction, so this game's NPCs never caught it trespassing. The
+// sight1 stub (SightStubBuild) on its own page, its cells holding the same factions as sight1's, makes such a copy a player-faction
+// target for this test only; the TRESPASSING the engine then writes on the copy goes to its owner as a copy-side write (kind 1).
+// The test sits outside the senses' 'the looker is not a player' gate (decomp_8587b0: the gate at 0x858B16.., the test after it),
+// and past setCrime the engine raises 0x684CA0(looker, target, 0x11) and 0x672F90(looker, target, 1) whatever setCrime returned
+// - so a looker of THIS game's player faction would react to another player's copy as an intruder, which a player's own
+// characters never do in single player (pvp1 refuses only the crime). The trespass stub (coopcrime::TrespassStubBuild) passes a
+// cell hit only when the looker ([rbp+0x148] at the site) is not of this game's player faction; its refusals are counted.
+unsigned long long kCrTrespassRva = 0; static AddrReg kCrTrespassRva_reg("BountyTrespassTargetTest", &kCrTrespassRva);   /* Steam_1.0.65 0x858D13 - a patch site, not a function */
+const unsigned char kTrespassOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x51 };
+SightCells* g_trespassCells = 0;
+volatile LONG g_trespassState = 0;   /* 0 not tried, 1 patched, -1 refused / failed */
+const char* g_trespassWhy = "not tried";
 
 // sight1 answers 1 (Inferred, the one open point): a looker of THIS game's player faction never passes the bounty gate because
 // its faction has no law key (+0x38 myLawEnforcementFaction == 0 and +0x40 isALawEnforcementFaction == 0), so the patch cannot
@@ -725,21 +817,24 @@ void* SightAllocNear(uintptr_t site)
 /* T-356: the stub's bytes (one compare per sight cell) are built by the pure coopcrime::SightStubBuild (crimewire.h, the layout
    drawn there), which the offline suite checks byte for byte. */
 
-// 1 patched; 0 refused (the reason in g_sightWhy). MAIN THREAD, at start (the preload stage: no world, no AI worker).
-int SightPatch(uintptr_t site)
+// 1 patched; 0 refused (the reason in *why). MAIN THREAD, at start (the preload stage: no world, no AI worker).
+int SightPatch(uintptr_t site, const unsigned char* orig, SightCells** out, const char** why, bool lookerGate)
 {
     unsigned char now[10];
-    if (!SightReadPod((const void*)site, now, 10)) { g_sightWhy = "the site could not be read"; return 0; }
-    if (std::memcmp(now, kSightOrig, 10) != 0) { g_sightWhy = "the 10 bytes at the site are not the expected test (another mod?)"; return 0; }
+    if (!SightReadPod((const void*)site, now, 10)) { *why = "the site could not be read"; return 0; }
+    if (std::memcmp(now, orig, 10) != 0) { *why = "the 10 bytes at the site are not the expected test (another mod?)"; return 0; }
     unsigned char* stub = (unsigned char*)SightAllocNear(site);
-    if (stub == 0) { g_sightWhy = "no page for the stub within a jump of the site"; return 0; }
+    if (stub == 0) { *why = "no page for the stub within a jump of the site"; return 0; }
     const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
-    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_sightWhy = "the stub page is out of jump range"; return 0; }
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); *why = "the stub page is out of jump range"; return 0; }
     SightCells* cells = (SightCells*)(stub + kSightCellsOff);
     for (int k = 0; k < coopcrime::kSightCellCap; ++k) cells->peer[k] = 0;   /* T-356 */
     cells->hits = 0;
-    if (coopcrime::SightStubBuild(stub, (unsigned long long)site, coopcrime::kSightCellCap, (int)kSightCellsOff) != coopcrime::kSightStubLen)
-    { ::VirtualFree(stub, 0, MEM_RELEASE); g_sightWhy = "the stub came out at an unexpected length"; return 0; }
+    cells->lookerRefused = 0;
+    const int built = lookerGate ? coopcrime::TrespassStubBuild(stub, (unsigned long long)site, coopcrime::kSightCellCap, (int)kSightCellsOff)
+                                 : coopcrime::SightStubBuild(stub, (unsigned long long)site, coopcrime::kSightCellCap, (int)kSightCellsOff);
+    if (built != (lookerGate ? coopcrime::kTrespassStubLen : coopcrime::kSightStubLen))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); *why = "the stub came out at an unexpected length"; return 0; }
     ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
 
     unsigned char patch[8];
@@ -749,14 +844,255 @@ int SightPatch(uintptr_t site)
     patch[5] = patch[6] = patch[7] = 0x90;
     DWORD oldProt = 0;
     if (!::VirtualProtect((void*)site, 8, PAGE_EXECUTE_READWRITE, &oldProt))
-    { ::VirtualFree(stub, 0, MEM_RELEASE); g_sightWhy = "VirtualProtect refused"; return 0; }
+    { ::VirtualFree(stub, 0, MEM_RELEASE); *why = "VirtualProtect refused"; return 0; }
     std::memcpy((void*)site, patch, 8);
     DWORD ignored = 0;
     ::VirtualProtect((void*)site, 8, oldProt, &ignored);
     ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, 8);
-    g_sightCells = cells;
-    g_sightWhy = "patched";
+    *out = cells;
+    *why = "patched";
     return 1;
+}
+
+/* COPY-SIDE WRITES (kind 1), MAIN THREAD. g_copyMark: copies holding a crime recorded here and sent to the owner, not yet in
+   its state (coopcrime::CopyClearKeep); g_ownerKnown: the crime of the owner's last state applied to each copy; g_copyOut: kind-1
+   sends waiting for a road (latest per uid). */
+struct CopyMark { int crime; DWORD ms; DWORD runOutMs; };
+std::map<unsigned int, CopyMark> g_copyMark;
+std::map<unsigned int, int> g_ownerKnown;
+struct OwnerAt { float expiry; DWORD ms; };
+std::map<unsigned int, OwnerAt> g_ownerKnownAt;   /* the owner's last state's expiry for each copy, and when it was applied here */
+long long g_copyReSent = 0;                        /* kind 1 sent again: re-recorded here while the owner's was near its end */
+std::map<unsigned int, coopcrime::CrimeState> g_copyOut;
+struct K1In { unsigned int uid; coopcrime::CrimeState s; unsigned int fromPeer; };
+std::vector<K1In> g_k1In;                      /* owner: kind-1 arrivals for the K2 safe point */
+const size_t kK1InCap = 64;
+const float kCopyDefaultExpiry = 20.0f;        /* the expiry the engine sets (crimewire.h), when the copy's own does not read */
+long long g_copyQueued = 0, g_copySent = 0, g_copyNotRecorded = 0, g_copyAlready = 0, g_copyPlayerVictim = 0, g_copyGone = 0,
+          g_copyDropped = 0, g_copySendRetry = 0, g_copySidTooLong = 0;
+long long g_ownerK1Recv = 0, g_ownerK1Applied = 0, g_ownerK1Refused = 0, g_ownerK1NotMine = 0, g_ownerK1PlayerVictim = 0,
+          g_ownerK1Bad = 0, g_ownerK1Engine = 0, g_ownerK1NoChar = 0, g_ownerK1Overflow = 0, g_ownerK1Dropped = 0, g_ownerK1NoFaction = 0;
+long long g_clearsKeptLocal = 0, g_localCrimeEnded = 0;
+long long g_k1Lines = 0;
+const long long kK1LineCap = 40;
+volatile LONG64 g_witnessEv[4] = { 0, 0, 0, 0 }, g_witnessEvRepl[4] = { 0, 0, 0, 0 };   /* 0x29, 0x2A, 8, 0x11 */
+
+void K1Log(const char* what, unsigned int uid, const coopcrime::CrimeState& s, const char* extra)
+{
+    if (g_k1Lines >= kK1LineCap) return;
+    ++g_k1Lines;
+    char b[400];
+    std::sprintf(b, "[CRIME] %s uid=%u crime=%d expiry=%.1f victim=%u faction='%.96s' %s", what, uid, s.crime, s.expiry, s.victimUid,
+                 s.factionSid.c_str(), extra ? extra : "");
+    DebugLog(std::string(b));
+}
+
+bool MarkRunOut(const CopyMark& m, DWORD now) { return (DWORD)(now - m.ms) >= m.runOutMs; }
+
+void CopyForget()
+{
+    g_copyMark.clear(); g_ownerKnown.clear(); g_ownerKnownAt.clear(); g_copyOut.clear(); g_k1In.clear();
+    if (g_copyCapLockInit != 0) { ::EnterCriticalSection(&g_copyCapLock); g_copyCapN = 0; ::LeaveCriticalSection(&g_copyCapLock); }
+}
+
+/* MAIN THREAD. The crime a copy holds now, read at a moment this game's engine acted on that copy (the owner's state refused for
+   it, a guard's bounty added to it here), joins the writes the setCrime detour noted; CopyWriteDrain decides on it as on those
+   (the owner already holds it or was already sent it: nothing goes). */
+void CopyNoteLive(::Character* c, unsigned int uid, int src)
+{
+    int crime = 0; float e = 0.0f;
+    if (c == 0 || uid == 0 || g_copyCapLockInit == 0 || !CrReadCrime(c, &crime, &e) || crime == 0) return;
+    ::EnterCriticalSection(&g_copyCapLock);
+    if (g_copyCapN < kCopyCapMax)
+    {
+        g_copyCap[g_copyCapN].uid = uid; g_copyCap[g_copyCapN].crime = crime; g_copyCap[g_copyCapN].src = src; ++g_copyCapN;
+        ++g_copyLiveNote[src == kCapSrcBounty ? 1 : 0];
+    }
+    else ::InterlockedIncrement64(&g_copyCapOverflow);
+    ::LeaveCriticalSection(&g_copyCapLock);
+}
+
+/* One line per copy-side crime the drain decides on (bounded): where it was seen, what the owner's state holds, the verdict. */
+long long g_capLines = 0;
+const long long kCapLineCap = 30;
+void CapLog(unsigned int uid, int crime, int src, int known, int pending, float ownerLeft, int toSend)
+{
+    if (g_capLines >= kCapLineCap) return;
+    ++g_capLines;
+    const char* from = src == kCapSrcRefused ? "the owner's state refused for it" : (src == kCapSrcBounty ? "a guard's bounty added here" : "setCrime");
+    char b[320];
+    std::sprintf(b, "[CRIME] copy-capture uid=%u crime=%d seen=%s ownerKnown=%d pending=%d ownerLeft=%.1f -> %s", uid, crime, from,
+                 known, pending, CrClampForLog(ownerLeft), toSend ? "send" : "already (the owner holds it or was sent it)");
+    DebugLog(std::string(b));
+}
+
+/* MAIN THREAD (CrimeTick). The writes the detours noted: a copy's crime, read live now, that the owner neither holds nor has been
+   told of is queued for its owner (and marked); then the queue is sent - kept while there is no road, dropped when the owner is
+   unknown or the crime would have run out. */
+void CopyWriteDrain()
+{
+    CopyCap local[kCopyCapMax];
+    size_t n = 0;
+    if (g_copyCapLockInit != 0)
+    {
+        ::EnterCriticalSection(&g_copyCapLock);
+        n = g_copyCapN;
+        if (n > 0) std::memcpy(local, g_copyCap, n * sizeof(CopyCap));
+        g_copyCapN = 0;
+        ::LeaveCriticalSection(&g_copyCapLock);
+    }
+    const DWORD now = ::GetTickCount();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const unsigned int uid = local[i].uid;
+        if (net::IsUidMine(uid)) continue;   /* this game's own character: its owner sampler sends it */
+        ::Character* c = FindSpawned(uid);
+        if (c == 0) { ++g_copyGone; continue; }
+        int crime = 0; void* fac = 0; unsigned int hand5[5]; float expiry = 0.0f;
+        if (!CrReadOwner(c, &crime, &fac, hand5, &expiry)) continue;
+        if (crime != local[i].crime) { ++g_copyNotRecorded; continue; }   /* refused by the engine, or replaced since: the live crime wins */
+        int pending = 0;
+        std::map<unsigned int, CopyMark>::iterator mk = g_copyMark.find(uid);
+        if (mk != g_copyMark.end())
+        {
+            if (!MarkRunOut(mk->second, now)) pending = mk->second.crime;   /* one that ran out is ended below */
+        }
+        std::map<unsigned int, int>::const_iterator ok = g_ownerKnown.find(uid);
+        const int known = ok != g_ownerKnown.end() ? ok->second : 0;
+        float ownerLeft = 1.0e9f;   /* no owner state: nothing is running out */
+        std::map<unsigned int, OwnerAt>::const_iterator oa = g_ownerKnownAt.find(uid);
+        if (oa != g_ownerKnownAt.end()) ownerLeft = oa->second.expiry - (float)(DWORD)(now - oa->second.ms) / 1000.0f;
+        const int toSend = coopcrime::CopyWriteShouldSend(crime, known, pending, ownerLeft);
+        CapLog(uid, crime, local[i].src, known, pending, ownerLeft, toSend);
+        if (!toSend) { ++g_copyAlready; continue; }
+        if (crime == known) ++g_copyReSent;
+        ::Faction* f = (::Faction*)fac;
+        bool victimIsPlayer = false;
+        const unsigned int victim = VictimUidOf(hand5, &victimIsPlayer);
+        if ((f != 0 && (IsPlayerFaction(f) || IsPeerFaction(f))) || victimIsPlayer) { ++g_copyPlayerVictim; continue; }   /* decision 4 */
+        coopcrime::CrimeState s;
+        s.crime = crime;
+        s.expiry = (coopcrime::CrimeExpiryOk(expiry) && expiry > 0.0f) ? expiry : kCopyDefaultExpiry;
+        if (s.expiry > (float)kCrimeExpiryMax) s.expiry = (float)kCrimeExpiryMax;
+        s.victimUid = victim;
+        s.factionSid = (f != 0) ? RelationsWireSid(f) : std::string();
+        if (s.factionSid.size() > (size_t)coopcrime::kCrimeMaxSid) { ++g_copySidTooLong; continue; }
+        g_copyOut[uid] = s;
+        ++g_copyQueued;
+        CopyMark m; m.crime = crime; m.ms = now; m.runOutMs = (DWORD)(s.expiry * 1000.0f);
+        g_copyMark[uid] = m;
+    }
+    /* a mark that ran out ends. If the copy still holds that crime and the owner's last state here is no crime, the crime recorded
+       here never came back (the owner refused it, or it was lost): the owner's clear is applied now - a clear kept while the mark
+       was live, or none ever coming because the owner's state never changed (a copy's own countdown may not run) */
+    for (std::map<unsigned int, CopyMark>::iterator mk = g_copyMark.begin(); mk != g_copyMark.end(); )
+    {
+        if (!MarkRunOut(mk->second, now)) { ++mk; continue; }
+        const unsigned int uid = mk->first;
+        std::map<unsigned int, int>::const_iterator k = g_ownerKnown.find(uid);
+        ::Character* c = FindSpawned(uid);
+        int live = 0; float le = 0.0f; unsigned int ownerPeer = 0;
+        if ((k == g_ownerKnown.end() || k->second == 0) && c != 0 && CrReadCrime(c, &live, &le) && live == mk->second.crime
+            && g_queue.find(uid) == g_queue.end() && g_queue.size() < kCrimeQueueCap && net::UidOwnerPeer(uid, &ownerPeer))
+        {
+            Pending p; p.s = coopcrime::CrimeState(); p.fromPeer = ownerPeer;
+            g_queue[uid] = p;
+            ++g_localCrimeEnded;
+            K1Log("copy-write", uid, p.s, "ran out unconfirmed: the owner's clear applied to the copy");
+        }
+        g_copyMark.erase(mk++);
+    }
+    int sent = 0;
+    for (std::map<unsigned int, coopcrime::CrimeState>::iterator it = g_copyOut.begin(); it != g_copyOut.end() && sent < kCrimeMaxPerTick; )
+    {
+        std::map<unsigned int, CopyMark>::iterator mk = g_copyMark.find(it->first);
+        if (mk == g_copyMark.end() || mk->second.crime != it->second.crime || MarkRunOut(mk->second, now))
+        { ++g_copyDropped; g_copyOut.erase(it++); continue; }   /* its crime would have run out (or was replaced) before a road came */
+        const int r = net::SendCrimeToOwner(it->first, it->second);
+        if (r == 0) { ++g_copySendRetry; ++it; continue; }   /* no road now: kept for the next tick */
+        if (r > 0) { ++g_copySent; ++sent; K1Log("copy-write ->", it->first, it->second, "recorded here on the copy - sent to its owner (kind 1)"); }
+        else { ++g_copyDropped; g_copyMark.erase(it->first); }   /* no owner on record */
+        g_copyOut.erase(it++);
+    }
+}
+
+/* MAIN THREAD, K2 safe point (CrimeApplyDrain). Kind 1 on the owner: the crime another game's witnesses recorded on its copy is
+   recorded on this game's own character through notifyCrimeWitnessed (the hooked entry: pvp1 applies); the owner sampler's next
+   state carries it to every game. */
+void OwnerCopyWriteDrain()
+{
+    if (g_k1In.empty()) return;
+    std::vector<K1In> work;
+    work.swap(g_k1In);
+    if (EngineWritesBlocked()) { g_ownerK1Dropped += (long long)work.size(); return; }
+    if (kCrNotifyRva == 0) { g_noAddr += (long long)work.size(); return; }
+    const CrNotifyFn notify = (CrNotifyFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kCrNotifyRva);
+    for (size_t i = 0; i < work.size(); ++i)
+    {
+        const K1In& in = work[i];
+        const coopcrime::CrimeState& s = in.s;
+        const bool mine = net::IsUidMine(in.uid);
+        ::Character* c = mine ? FindSpawned(in.uid) : 0;
+        if (mine && c == 0) { ++g_ownerK1NoChar; continue; }
+        ::Faction* f = s.factionSid.empty() ? 0 : RelationsFactionFromWire(s.factionSid);
+        if (!s.factionSid.empty() && f == 0) ++g_ownerK1NoFaction;
+        const bool facPlayer = f != 0 && (IsPlayerFaction(f) || IsPeerFaction(f));
+        unsigned int w[5] = { 0, 0, 0, 0, 0 };
+        bool victimIsPlayer = false;
+        ::Character* v = (s.victimUid != 0) ? FindSpawned(s.victimUid) : 0;
+        if (v != 0)
+        {
+            ::Faction* vf = 0;
+            if (CrFactionOf(v, &vf) && vf != 0 && (IsPlayerFaction(vf) || IsPeerFaction(vf))) victimIsPlayer = true;
+            if (!CrReadOwnHand(v, w)) std::memset(w, 0, sizeof(w));
+        }
+        char extra[200];
+        const int d = coopcrime::OwnerCopyWriteDecide(mine, s.crime, facPlayer, victimIsPlayer);
+        if (d != coopcrime::kOwnerWriteApply)
+        {
+            ++g_ownerK1Refused;
+            if (d == coopcrime::kOwnerWriteNotMine) ++g_ownerK1NotMine;
+            else if (d == coopcrime::kOwnerWritePlayerVictim) ++g_ownerK1PlayerVictim;
+            else ++g_ownerK1Bad;
+            std::sprintf(extra, "from=%u REFUSED (%s)", in.fromPeer, d == coopcrime::kOwnerWriteNotMine ? "not this game's character"
+                         : (d == coopcrime::kOwnerWritePlayerVictim ? "a crime against a player: decision 4" : "not a crime"));
+            K1Log("copy-write <-", in.uid, s, extra);
+            continue;
+        }
+        const hand h(w[3], w[4], (itemType)w[0], w[1], w[2]);
+        int exp = (int)(s.expiry + 0.5f);
+        if (exp < 1) exp = 1;
+        if (exp > kCrimeExpiryMax) exp = kCrimeExpiryMax;
+        int before = -1, after = -1; float eb = -1.0f, ea = -1.0f;
+        CrReadCrime(c, &before, &eb);
+        const int ok = CrCallNotify(notify, c, (void*)f, &h, exp, s.crime);
+        CrReadCrime(c, &after, &ea);
+        if (ok && after == s.crime) ++g_ownerK1Applied;
+        else { ++g_ownerK1Refused; ++g_ownerK1Engine; }
+        std::sprintf(extra, "from=%u %s crime %d->%d factionResolved=%d victimHere=%d - recorded on our own character (notifyCrimeWitnessed)",
+                     in.fromPeer, !ok ? "FAULTED" : (after == s.crime ? "applied" : "REFUSED by the engine or pvp1"), before, after,
+                     f != 0 ? 1 : 0, v != 0 ? 1 : 0);
+        K1Log("copy-write <-", in.uid, s, extra);
+    }
+}
+
+/* MAIN THREAD, K2 safe point: the owner's CLEAR for a copy. true = kept: a crime recorded here is still waiting for the owner's
+   state (coopcrime::CopyClearKeep). A mark that ran out, or whose crime the copy no longer holds, ends here. */
+bool CopyClearKept(unsigned int uid, int liveCrime, const coopcrime::CrimeState& s)
+{
+    std::map<unsigned int, CopyMark>::iterator mk = g_copyMark.find(uid);
+    if (mk == g_copyMark.end()) return false;
+    const bool runOut = MarkRunOut(mk->second, ::GetTickCount());
+    if (coopcrime::CopyClearKeep(true, mk->second.crime, runOut, liveCrime))
+    {
+        ++g_clearsKeptLocal;
+        char extra[160];
+        std::sprintf(extra, "CLEAR KEPT: crime %d recorded here is not in the owner's state yet (sent as kind 1)", liveCrime);
+        K1Log("<-", uid, s, extra);
+        return true;
+    }
+    g_copyMark.erase(mk);
+    return false;
 }
 
 } // namespace
@@ -770,13 +1106,16 @@ void CrimeTick()
         if (g_sightCells != 0)   /* sight1; T-356: every cell */
             for (int k = 0; k < coopcrime::kSightCellCap; ++k) if (g_sightCells->peer[k] != 0) g_sightCells->peer[k] = 0;
         g_sightHeld = 0;
+        if (g_trespassCells != 0)   /* the trespass test's cells */
+            for (int k = 0; k < coopcrime::kSightCellCap; ++k) if (g_trespassCells->peer[k] != 0) g_trespassCells->peer[k] = 0;
+        CopyForget();   /* kind 1: the world is going - its copies with it */
         /* review-crime5 7: a load re-makes every character - both sides start over */
         if (!g_bWasBlocked) { g_bSent.clear(); g_bKnown.clear(); g_bWasBlocked = true; }
         return;
     }
     g_bWasBlocked = false;
     g_crimePeer = (void*)PeerFactionAny();   /* review-pvp1 4: MAIN THREAD, world loaded - a save's coop-peer counts before the first SPAWN */
-    if (g_sightCells != 0)
+    if (g_sightCells != 0 || g_trespassCells != 0)
     {   /* T-356: one sight cell per other player's faction - every stand-in in the table and the session peer's (or an old save's
            coop-peer); this game's own slot never. Each cell is written only when it changes. */
         int slots[coopcrime::kSightCellCap + 1];
@@ -790,7 +1129,10 @@ void CrimeTick()
         g_sightHeld = coopcrime::SightCellsFill(slots, facs, n, MySlotForWire(), want, coopcrime::kSightCellCap, &dropped);
         g_sightDropped = dropped;
         for (int k = 0; k < coopcrime::kSightCellCap; ++k)
-            if (g_sightCells->peer[k] != want[k]) g_sightCells->peer[k] = (void*)want[k];
+        {
+            if (g_sightCells != 0 && g_sightCells->peer[k] != want[k]) g_sightCells->peer[k] = (void*)want[k];
+            if (g_trespassCells != 0 && g_trespassCells->peer[k] != want[k]) g_trespassCells->peer[k] = (void*)want[k];   /* the trespass test: the same factions */
+        }
     }
     if (!g_sightLawLogged)   /* sight1 answers 1: confirm a player looker has no law key */
     {
@@ -828,7 +1170,8 @@ void CrimeTick()
         ++bsent;
     }
     const long gen = StorePeerEpoch();   /* M11 C2: moves at every arrival and every old-link down (two games: exactly as the link generation) */
-    if (gen != g_lastLinkGen) { g_last.clear(); g_bKnown.clear(); if (g_lastLinkGen != -1) StoreArrivalNoteServed(kArrServeCrime); g_lastLinkGen = gen; }   /* review-crime3 4; crime5: copies are re-made */
+    if (gen != g_lastLinkGen) { g_last.clear(); g_bKnown.clear(); CopyForget(); if (g_lastLinkGen != -1) StoreArrivalNoteServed(kArrServeCrime); g_lastLinkGen = gen; }   /* review-crime3 4; crime5: copies are re-made */
+    CopyWriteDrain();   /* kind 1: crimes this game's witnesses recorded on copies, to their owners */
     if (g_scanPos >= g_scan.size())
     {
         net::OwnedUidsSnapshot(&g_scan);
@@ -908,6 +1251,28 @@ void ApplyRemoteCrime(unsigned int uid, const coopcrime::CrimeState& s, unsigned
     if (it == g_queue.end() && g_queue.size() >= kCrimeQueueCap) { ++g_queueDropped; return; }
     Pending p; p.s = s; p.fromPeer = fromPeer;
     g_queue[uid] = p;
+}
+
+void ApplyRemoteCopyWrite(unsigned int uid, const coopcrime::CrimeState& s, unsigned int fromPeer)
+{
+    ++g_ownerK1Recv;
+    /* only for a character THIS game drives; any game holding a copy may send it */
+    if (!net::IsUidMine(uid)) { ++g_ownerK1Refused; ++g_ownerK1NotMine; return; }
+    if (g_k1In.size() >= kK1InCap) { ++g_ownerK1Overflow; return; }
+    K1In in; in.uid = uid; in.s = s; in.fromPeer = fromPeer;
+    g_k1In.push_back(in);
+}
+
+void CrimeNoteWitnessEvent(int what, const void* who)
+{
+    int i = -1;
+    if (what == 0x29) i = 0; else if (what == 0x2A) i = 1; else if (what == 8) i = 2; else if (what == 0x11) i = 3;
+    if (i < 0) return;
+    ::InterlockedIncrement64(&g_witnessEv[i]);
+    /* `who` is the character the event is about (the offender); counted when it is another player's character's copy */
+    ::Faction* of = 0;
+    if (who != 0 && CrFactionOf((::Character*)who, &of) && of != 0 && ((void*)of == g_crimePeer || IsPeerFaction(of)))
+        ::InterlockedIncrement64(&g_witnessEvRepl[i]);
 }
 
 void CrimeNoteMalformed() { ++g_malformed; }
@@ -1046,6 +1411,8 @@ void CrimeApplyDrain()
     if (!EngineWritesBlocked()) { BountyTestClearDrain(); BountyTestSetDrain(); BountyApply(); BountySample(); }   /* the levers first */
     else if (!g_bIn.empty()) { g_bIn.clear(); }
     CrimeHeldDrain();   /* M7b slice 4 fold 1 (F5) */
+    OwnerCopyWriteDrain();     /* kind 1: crimes other games' witnesses recorded on their copies of this game's characters */
+    RelationsEvApplyDrain();   /* kind 2: standing events against this game's player raised on another game */
     if (g_queue.empty()) return;
     if (EngineWritesBlocked()) { g_applyBlocked += (long long)g_queue.size(); g_queue.clear(); return; }
     if (kCrNotifyRva == 0 || kCrSetRva == 0) { g_noAddr += (long long)g_queue.size(); g_queue.clear(); return; }
@@ -1082,10 +1449,17 @@ void CrimeApplyDrain()
         int before = -1, after = -1; float expBefore = -1.0f, expAfter = -1.0f;
         CrReadCrime(c, &before, &expBefore);
         char extra[256];
+        std::map<unsigned int, int>::const_iterator pk = g_ownerKnown.find(uid);
+        const int prevKnown = pk != g_ownerKnown.end() ? pk->second : 0;   /* the owner's previous state for this copy */
+        g_ownerKnown[uid] = s.crime;   /* kind 1: what the owner holds for this copy */
+        { OwnerAt at; at.expiry = s.expiry; at.ms = ::GetTickCount(); g_ownerKnownAt[uid] = at; }   /* and how long it has left */
         if (s.crime == 0)
         {
+            if (CopyClearKept(uid, before, s)) continue;   /* a crime recorded here, not yet in the owner's state */
             const hand nh(0, 0, (itemType)0, 0, 0);
+            g_crApplyingThread = ::GetCurrentThreadId();
             const int ok = CrCallSet(setCrime, c, &nh);
+            g_crApplyingThread = 0;
             CrReadCrime(c, &after, &expAfter);
             const int refused = (ok && after != 0) ? 1 : 0;
             int forced = 0;
@@ -1111,11 +1485,22 @@ void CrimeApplyDrain()
         int exp = (int)(s.expiry + 0.5f);
         if (exp < 1) exp = 1;
         if (exp > kCrimeExpiryMax) exp = kCrimeExpiryMax;
+        {   /* kind 1: the owner's state now holds a crime recorded here - its mark ends */
+            std::map<unsigned int, CopyMark>::iterator mk = g_copyMark.find(uid);
+            if (mk != g_copyMark.end() && coopcrime::CopyMarkMet(mk->second.crime, s.crime)) g_copyMark.erase(mk);
+        }
+        g_crApplyingThread = ::GetCurrentThreadId();
         const int ok = CrCallNotify(notify, c, (void*)f, &h, exp, s.crime);
+        g_crApplyingThread = 0;
         CrReadCrime(c, &after, &expAfter);
         if (!ok) ++g_faulted;
         else if (after == s.crime) ++g_applied;
-        else ++g_engineRefused;
+        else
+        {
+            ++g_engineRefused;
+            /* the engine kept the crime the copy held: one recorded here, not in the owner's previous state, goes to the owner */
+            if (coopcrime::CopyHeldNotOwners(before, after, s.crime, prevKnown)) CopyNoteLive(c, uid, kCapSrcRefused);
+        }
         std::sprintf(extra, "%s crime %d->%d expiry %.1f->%.1f factionResolved=%d victimHere=%d (notifyCrimeWitnessed 0x851F40)",
                      ok ? "called" : "FAULTED", before, after, CrClampForLog(expBefore), CrClampForLog(expAfter), f != 0 ? 1 : 0, v != 0 ? 1 : 0);
         CrLog("<-", uid, s, extra);
@@ -1124,6 +1509,7 @@ void CrimeApplyDrain()
 
 void InstallCrime()
 {
+    if (g_copyCapLockInit == 0) { ::InitializeCriticalSection(&g_copyCapLock); g_copyCapLockInit = 1; }   /* before the detours note a write */
     if (g_pvpHook != 0) return;
     if (kCrSetRva == 0) { g_pvpHook = -1; ErrorLog("[CRIME] pvp1: SetCrime is not in the address table - player-vs-player crimes are NOT suppressed"); return; }
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -1142,9 +1528,17 @@ void InstallCrime()
     if (g_sightState == 0)
     {
         if (kCrSightRva == 0) { g_sightState = -1; g_sightWhy = "BountySightTargetTest is not in the address table"; }
-        else g_sightState = SightPatch(base + (uintptr_t)kCrSightRva) ? 1 : -1;
+        else g_sightState = SightPatch(base + (uintptr_t)kCrSightRva, kSightOrig, &g_sightCells, &g_sightWhy, false) ? 1 : -1;
         if (g_sightState == 1) DebugLog("[CRIME] sight1 patched the senses' player test 0x85635D (the other players' characters are recognised as wanted on sight)");
         else ErrorLog(std::string("[CRIME] sight1 NOT patched: ") + g_sightWhy + " - the other players' characters are recognised only by the guards' AI search (F899)");
+    }
+    /* the trespass test also passes for every other player's faction (a copy of their character can be caught trespassing) */
+    if (g_trespassState == 0)
+    {
+        if (kCrTrespassRva == 0) { g_trespassState = -1; g_trespassWhy = "BountyTrespassTargetTest is not in the address table"; }
+        else g_trespassState = SightPatch(base + (uintptr_t)kCrTrespassRva, kTrespassOrig, &g_trespassCells, &g_trespassWhy, true) ? 1 : -1;
+        if (g_trespassState == 1) DebugLog("[CRIME] trespass test patched 0x858D13 (the other players' characters can be caught trespassing here, by lookers not of this game's player faction)");
+        else ErrorLog(std::string("[CRIME] trespass test NOT patched: ") + g_trespassWhy + " - the other players' characters are never caught trespassing on this game");
     }
 }
 
@@ -1165,7 +1559,25 @@ void ReportCrime()
     std::sprintf(hv, " held[new,applied,superseded,expired,full,dropped,now]=%lld,%lld,%lld,%lld,%lld,%lld,%u withSpawn[sent,failed]=%lld,%lld bountyUnsent=%lld",
                  g_heldNew, g_heldApplied, g_heldSuperseded, g_heldExpired, g_heldFull, g_heldDropped, (unsigned int)g_held.size(),
                  g_withSpawnSent, g_withSpawnFailed, g_bOutUnsent);
-    DebugLog(std::string(b) + " " + PeerFactionCopies() + pv + hv);
+    char cw[1600];
+    std::sprintf(cw, " copySideWrites[queued,sent,applied,refused]=%lld,%lld,%lld,%lld"
+                 " copySide[captured,capOverflow,notRecorded,already,playerVictim,gone,dropped,sendRetry,sidTooLong,marks,waiting]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u,%u"
+                 " ownerApplied[kind1,kind2]=%lld,%lld ownerKind1[recv,notMine,playerVictim,bad,engine,noChar,noFaction,overflow,dropped]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " clearsKeptLocal=%lld localCrimeEnded=%lld reSent=%lld trespassSite[state,hits,lookerRefused]=%ld,%lld,%lld witnessEvents[0x29,0x2A,8,0x11]=%lld,%lld,%lld,%lld"
+                 " witnessEventsAboutReplicated[0x29,0x2A,8,0x11]=%lld,%lld,%lld,%lld"
+                 " trespassSetCrime[calls,recorded,onOtherPlayer,recordedOnOtherPlayer]=%lld,%lld,%lld,%lld copyHeldNotes[ownerRefused,bountyAdded]=%lld,%lld",
+                 g_copyQueued, g_copySent, g_ownerK1Applied, g_ownerK1Refused,
+                 (long long)g_copyCaptured, (long long)g_copyCapOverflow, g_copyNotRecorded, g_copyAlready, g_copyPlayerVictim, g_copyGone,
+                 g_copyDropped, g_copySendRetry, g_copySidTooLong, (unsigned int)g_copyMark.size(), (unsigned int)g_copyOut.size(),
+                 g_ownerK1Applied, RelationsEvAppliedCount(), g_ownerK1Recv, g_ownerK1NotMine, g_ownerK1PlayerVictim, g_ownerK1Bad,
+                 g_ownerK1Engine, g_ownerK1NoChar, g_ownerK1NoFaction, g_ownerK1Overflow, g_ownerK1Dropped,
+                 g_clearsKeptLocal, g_localCrimeEnded, g_copyReSent, (long)g_trespassState, g_trespassCells != 0 ? (long long)g_trespassCells->hits : -1LL,
+                 g_trespassCells != 0 ? (long long)g_trespassCells->lookerRefused : -1LL,
+                 (long long)g_witnessEv[0], (long long)g_witnessEv[1], (long long)g_witnessEv[2], (long long)g_witnessEv[3],
+                 (long long)g_witnessEvRepl[0], (long long)g_witnessEvRepl[1], (long long)g_witnessEvRepl[2], (long long)g_witnessEvRepl[3],
+                 (long long)g_trespassSet[0], (long long)g_trespassSet[1], (long long)g_trespassSet[2], (long long)g_trespassSet[3],
+                 g_copyLiveNote[0], g_copyLiveNote[1]);
+    DebugLog(std::string(b) + " " + PeerFactionCopies() + pv + hv + cw + RelationsEvText());
     char bb[640];
     std::sprintf(bb, "[BOUNTY] REPORT sent[lists,adds,preApplyAdds]=%lld,%lld,%lld applied[lists,adds,addsGated,erased]=%lld,%lld,%lld,%lld"
                  " refused[notOwner,noCopy,noFaction,readFault,writeFault,malformed,queueDropped,noAddr,droppedBlocked]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"

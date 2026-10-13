@@ -86,7 +86,7 @@ inline bool WorldNameOk(const std::string& name, std::string* why)
         const unsigned char ch = (unsigned char)name[i];
         if (ch < 0x20)
         {
-            if (why != 0) *why = "Use letters, numbers, spaces, - and _ only.";
+            if (why != 0) *why = "The world name has a character that can't be used.";
             return false;
         }
         if (ch == '~')
@@ -111,7 +111,7 @@ inline bool WorldNameOk(const std::string& name, std::string* why)
            case would be one folder on disk and two worlds in the list. */
         if (ch >= 0x7F)
         {
-            if (why != 0) *why = "Use letters, numbers, spaces, - and _ only.";
+            if (why != 0) *why = "The world name has a character that can't be used.";
             return false;
         }
     }
@@ -225,7 +225,7 @@ inline bool DisplayNameOk(const std::string& name, std::string* why)
 {
     if (name.empty())
     {
-        if (why != 0) *why = "Enter a player name.";
+        if (why != 0) *why = "No name entered.";
         return false;
     }
     if (name.size() > coopcfg::kCfgPlayerNameFieldMax)
@@ -243,7 +243,7 @@ inline bool DisplayNameOk(const std::string& name, std::string* why)
         const unsigned char ch = (unsigned char)name[i];
         if (ch < 0x20 || ch > 0x7E)
         {
-            if (why != 0) *why = "Use letters, numbers, spaces and simple punctuation only.";
+            if (why != 0) *why = "The name has a character that can't be used.";
             return false;
         }
         if (ch == '#' || ch == ';')
@@ -361,6 +361,195 @@ inline bool WorldTxtParseId(const std::string& text, std::string* id, bool* upgr
     if (upgraded != 0) *upgraded = (how == "upgraded");
     return true;
 }
+/* THE WORLD'S EARLIER IDS: world.txt line 3, written when the world is reset (the world server's --reset-world):
+     earlier<TAB><id>,<id>,...<TAB><reset, unix seconds><TAB><kept-buildings|reset-buildings>
+   oldest first; the last is the id the latest reset replaced. At most kWorldEarlierIdsMax (the newest are kept). Readers of lines
+   1 and 2 (WorldTxtParse, WorldTxtParseId) read a three-line file exactly as a two-line one. False = no line 3, or not one. */
+const size_t kWorldEarlierIdsMax = 64;
+inline bool WorldTxtParseEarlier(const std::string& text, std::vector<std::string>* ids, long long* resetUnix, bool* keptBuildings)
+{
+    std::string::size_type nl = text.find('\n');
+    if (nl == std::string::npos) return false;
+    nl = text.find('\n', nl + 1);
+    if (nl == std::string::npos) return false;
+    std::string line = text.substr(nl + 1);
+    line = line.substr(0, line.find_first_of("\r\n"));
+    if (line.compare(0, 8, "earlier\t") != 0) return false;
+    line.erase(0, 8);
+    const std::string::size_type t1 = line.find('\t');
+    if (t1 == std::string::npos) return false;
+    const std::string::size_type t2 = line.find('\t', t1 + 1);
+    if (t2 == std::string::npos) return false;
+    const std::string list = line.substr(0, t1), when = line.substr(t1 + 1, t2 - t1 - 1), how = line.substr(t2 + 1);
+    if (how != "kept-buildings" && how != "reset-buildings") return false;
+    if (when.empty() || when.size() > 18 || when.find_first_not_of("0123456789") != std::string::npos) return false;
+    std::vector<std::string> got;
+    std::string::size_type from = 0;
+    for (;;)
+    {
+        const std::string::size_type c = list.find(',', from);
+        const std::string one = list.substr(from, c == std::string::npos ? std::string::npos : c - from);
+        if (!WorldIdOk(one) || got.size() >= kWorldEarlierIdsMax) return false;
+        got.push_back(one);
+        if (c == std::string::npos) break;
+        from = c + 1;
+    }
+    if (ids != 0) *ids = got;
+    if (resetUnix != 0) *resetUnix = WorldDecimal(when);
+    if (keptBuildings != 0) *keptBuildings = (how == "kept-buildings");
+    return true;
+}
+inline std::string WorldTxtEarlierLine(const std::vector<std::string>& ids, long long resetUnix, bool keptBuildings)
+{
+    std::string list;
+    for (size_t i = 0; i < ids.size(); ++i) list += (i == 0 ? std::string() : std::string(",")) + ids[i];
+    char b[32]; std::sprintf(b, "%lld", resetUnix < 0 ? 0LL : resetUnix);
+    return "earlier\t" + list + "\t" + b + "\t" + (keptBuildings ? "kept-buildings" : "reset-buildings") + "\n";
+}
+/* THE KEEP CHOICE AND TIME OF EACH EARLIER ID: world.txt line 4, written beside line 3 by every reset:
+     resets<TAB><reset, unix seconds>:<kept|reset>,...
+   one entry per id of line 3, in its order: the reset that replaced that id - its time and whether it kept the players' buildings.
+   A world.txt with line 3 and no line 4 this build can read gives each id "not kept" and time 0, but the last id: line 3's own time and
+   choice are that id's reset. */
+struct WorldResetEntry
+{
+    std::string id; bool kept; long long at;
+    WorldResetEntry() : kept(false), at(0) {}
+};
+/* Line n (0 = line 1) without its CR/LF. False = the text has no such line. */
+inline bool WorldTxtLineAt(const std::string& text, int n, std::string* line)
+{
+    std::string::size_type from = 0;
+    for (int k = 0; k < n; ++k)
+    {
+        const std::string::size_type nl = text.find('\n', from);
+        if (nl == std::string::npos) return false;
+        from = nl + 1;
+    }
+    std::string l = text.substr(from);
+    l = l.substr(0, l.find_first_of("\r\n"));
+    if (line != 0) *line = l;
+    return true;
+}
+/* Line 4 alone: exactly count entries (at most kWorldEarlierIdsMax). False = no line 4, or not one, or another count. */
+inline bool WorldTxtParseResets(const std::string& text, size_t count, std::vector<WorldResetEntry>* out)
+{
+    std::string line;
+    if (!WorldTxtLineAt(text, 3, &line) || line.compare(0, 7, "resets\t") != 0) return false;
+    line.erase(0, 7);
+    std::vector<WorldResetEntry> got;
+    std::string::size_type from = 0;
+    for (;;)
+    {
+        const std::string::size_type c = line.find(',', from);
+        const std::string one = line.substr(from, c == std::string::npos ? std::string::npos : c - from);
+        const std::string::size_type colon = one.find(':');
+        if (colon == std::string::npos || got.size() >= kWorldEarlierIdsMax) return false;
+        const std::string when = one.substr(0, colon), how = one.substr(colon + 1);
+        if (when.empty() || when.size() > 18 || when.find_first_not_of("0123456789") != std::string::npos || (how != "kept" && how != "reset")) return false;
+        WorldResetEntry e; e.at = WorldDecimal(when); e.kept = (how == "kept");
+        got.push_back(e);
+        if (c == std::string::npos) break;
+        from = c + 1;
+    }
+    if (got.size() != count) return false;
+    if (out != 0) *out = got;
+    return true;
+}
+inline std::string WorldTxtResetsLine(const std::vector<WorldResetEntry>& e)
+{
+    std::string s = "resets\t";
+    for (size_t i = 0; i < e.size(); ++i)
+    {
+        char b[32]; std::sprintf(b, "%lld", e[i].at < 0 ? 0LL : e[i].at);
+        s += (i == 0 ? std::string() : std::string(",")) + b + ":" + (e[i].kept ? "kept" : "reset");
+    }
+    return s + "\n";
+}
+/* THE WORLD'S RESET HISTORY: each earlier id of line 3, oldest first, with its reset's time and keep choice (line 4, or the rule above
+   when there is none). False = no line 3 this build can read (no earlier ids). */
+inline bool WorldTxtParseHistory(const std::string& text, std::vector<WorldResetEntry>* out)
+{
+    std::vector<std::string> ids; long long at3 = 0; bool kept3 = false;
+    if (!WorldTxtParseEarlier(text, &ids, &at3, &kept3)) return false;
+    std::vector<WorldResetEntry> e(ids.size()), l4;
+    const bool four = WorldTxtParseResets(text, ids.size(), &l4);
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        e[i].id = ids[i];
+        if (four) { e[i].kept = l4[i].kept; e[i].at = l4[i].at; }
+        else if (i + 1 == ids.size()) { e[i].kept = kept3; e[i].at = at3; }
+    }
+    if (out != 0) *out = e;
+    return true;
+}
+/* Is id one of the ids this world had before a reset (line 3)? */
+inline bool WorldIdIsEarlier(const std::string& text, const std::string& id)
+{
+    std::vector<std::string> ids;
+    if (!WorldIdOk(id) || !WorldTxtParseEarlier(text, &ids, 0, 0)) return false;
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+/* WORLD.TXT AFTER A RESET: line 1 as it is; line 2 newId, born (no save made before it carries it, and an id-less save is another
+   world's - SaveIdentityDecide); line 3 the earlier ids - those line 3 listed, then the id line 2 held - with the reset's time and the
+   buildings choice, and line 4 each earlier id's own reset time and choice (no line 3 or 4 when the world never had an id). *oldId = the id line 2 held ("" = none). newId must be an id the
+   world has never had (SameId otherwise: the caller makes another). */
+enum { kResetTxtOk = 0, kResetTxtUnreadable = 1, kResetTxtBadNewId = 2, kResetTxtSameId = 3 };
+inline const char* ResetTxtVerdictName(int v)
+{
+    return v == kResetTxtOk ? "ok" : v == kResetTxtUnreadable ? "world.txt unreadable" : v == kResetTxtBadNewId ? "the new id is not an id"
+         : v == kResetTxtSameId ? "the new id is one the world has had" : "?";
+}
+inline int WorldTxtAfterReset(const std::string& text, const std::string& newId, long long resetUnix, bool keptBuildings, std::string* out,
+                              std::string* oldId)
+{
+    if (!WorldTxtParse(text, 0, 0)) return kResetTxtUnreadable;
+    if (!WorldIdOk(newId)) return kResetTxtBadNewId;
+    std::vector<std::string> ids;
+    WorldTxtParseEarlier(text, &ids, 0, 0);   /* none, or not readable (WorldTxtLine3Unreadable - the caller says so): the list starts with the current id */
+    std::vector<WorldResetEntry> hist;
+    if (!WorldTxtParseHistory(text, &hist) || hist.size() != ids.size()) hist.assign(ids.size(), WorldResetEntry());   /* line 4: one entry per id of line 3 */
+    std::string cur; bool up = false;
+    if (!WorldTxtParseId(text, &cur, &up)) cur.clear();
+    if (!cur.empty() && std::find(ids.begin(), ids.end(), cur) == ids.end())
+    {
+        ids.push_back(cur);
+        WorldResetEntry e; e.id = cur; e.kept = keptBuildings; e.at = resetUnix < 0 ? 0 : resetUnix;   /* this reset replaces cur */
+        hist.push_back(e);
+    }
+    if (newId == cur || std::find(ids.begin(), ids.end(), newId) != ids.end()) return kResetTxtSameId;
+    while (ids.size() > kWorldEarlierIdsMax) { ids.erase(ids.begin()); hist.erase(hist.begin()); }
+    if (oldId != 0) *oldId = cur;
+    if (out != 0)
+        *out = text.substr(0, text.find_first_of("\r\n")) + "\n" + WorldTxtIdLine(newId, false)
+             + (ids.empty() ? std::string() : WorldTxtEarlierLine(ids, resetUnix, keptBuildings) + WorldTxtResetsLine(hist));
+    return kResetTxtOk;
+}
+/* A line 3 that is there but is not a list of earlier ids WorldTxtParseEarlier can read: WorldTxtAfterReset drops it and starts the
+   list again from the current id, so the reset says so. *line = that line, its CR/LF off. An empty or absent line 3 is not one. */
+inline bool WorldTxtLine3Unreadable(const std::string& text, std::string* line)
+{
+    std::string::size_type nl = text.find('\n');
+    if (nl == std::string::npos) return false;
+    nl = text.find('\n', nl + 1);
+    if (nl == std::string::npos) return false;
+    std::string l = text.substr(nl + 1);
+    l = l.substr(0, l.find_first_of("\r\n"));
+    if (l.empty() || WorldTxtParseEarlier(text, 0, 0, 0)) return false;
+    if (line != 0) *line = l;
+    return true;
+}
+/* WORLD.TXT UNDER ANOTHER NAME (the world a reset keeps as it was, worldreset::ResetOldWorldName): line 1 names newName, its created
+   time as written; every other line - the id, the earlier ids - byte for byte as it is. "" = text is not a world.txt, or newName is
+   not a world name. */
+inline std::string WorldTxtRenamed(const std::string& text, const std::string& newName)
+{
+    if (!WorldTxtParse(text, 0, 0) || !WorldNameOk(newName, 0)) return std::string();
+    const std::string::size_type end = text.find_first_of("\r\n");
+    const std::string line = text.substr(0, end);
+    const std::string::size_type tab = line.find('\t', 3);   /* WorldTxtParse: "v1<TAB><name><TAB><created>", and a name holds no tab */
+    return "v1\t" + newName + line.substr(tab) + (end == std::string::npos ? std::string() : text.substr(end));
+}
 /* THE CREATION TIME A NEW WORLD ID CARRIES, and whether the id is upgraded. No world.txt: the oldest record file's time when the folder
    already holds records (a world older than this start - upgraded), else now (born). A world.txt from before ids: its line-1 created
    time, or the oldest record's when that is earlier (a migrated folder's line 1 can postdate its records) - upgraded. 0 = unknown. */
@@ -411,6 +600,10 @@ inline int SaveIdentityDecide(const std::string& saveId, long long saveTimeUnix,
     return kIdOther;
 }
 inline bool SaveIdentityMayUse(int v) { return v != kIdOther; }
+/* T-36: THE SAME WORLD BY ITS ID: a save's id and the world's, both there and equal. Then the world's name is not compared - a world
+   keeps its id when its name changes (the world as it was before a reset is renamed "<name> - before reset <n>"), and a key file
+   carries the name the world had when the save was made. */
+inline bool SaveIdSameWorld(const std::string& saveId, const std::string& worldId) { return !saveId.empty() && saveId == worldId; }
 inline const char* SaveIdentityName(int v)
 {
     return v == kIdSame ? "same" : v == kIdOther ? "other" : v == kIdAdoptLegacy ? "adoptLegacy" : "unknown";

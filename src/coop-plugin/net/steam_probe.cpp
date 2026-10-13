@@ -37,16 +37,33 @@
 
    SAFETY. Every call into Steam is inside __try in a function that holds no C++ object (C2712); a fault is counted,
    logged once as "failed <reason>", and the probe stops for the process. Handles and pointers are null-checked before
-   use. The own Steam ID is not read and nothing identifying is logged.
+   use. The probe reads no Steam ID (net/steam_friends.cpp reads the own one for the host's presence and never logs it) and nothing
+   identifying is logged.
 
    VTABLE SLOTS (ISteamNetworkingUtils, SteamNetworkingUtils004, isteamnetworkingutils.h, no virtual destructor):
      0 AllocateMessage, 1 GetRelayNetworkStatus, 2 GetLocalPingLocation, 3 EstimatePingTimeBetweenTwoLocations,
-     4 EstimatePingTimeFromLocalHost, 5 ConvertPingLocationToString, 6 ParsePingLocationString, 7 CheckPingDataUpToDate. */
+     4 EstimatePingTimeFromLocalHost, 5 ConvertPingLocationToString, 6 ParsePingLocationString, 7 CheckPingDataUpToDate.
+
+   STEAM LINKS. The probe also keeps the sockets and utils objects for the Steam transport (net/steam_transport.cpp):
+   SteamProbeSockets() / SteamProbeUtils() hand them out while no Steam call in this game has faulted - any fault, the
+   transport's included (SteamNoteFault), is counted here and ends every Steam use. The probe is the ONE caller of
+   SteamAPI_RunCallbacks for those links: from the first Steam link or listener made (SteamPumpForSession) it calls it once per tick
+   for the rest of the session - not only while a link is open - unless the relay wait above already did this tick. The residual risk
+   above is the same: another DLL's Steam handlers run from this pump. A fault inside it (Steam's or another DLL's handler) is caught,
+   counted (steamPumpFaults), logged once, and ends every Steam use in this game like any other Steam fault (g_faults): Steam's
+   dispatcher may be left mid-call holding one of Steam's own locks, and any further Steam call could then freeze the game. Each tick
+   ends with the relay echo test's tick (net/relay_test.cpp), which
+   returns at once unless the TEST key relaytest= is set. */
 #include <windows.h>
 
 #include "steam_probe.h"
+#include "steam_transport.h"   /* the Steam links' REPORT token and the relay echo test's tick */
+#include "relay_bridge.h"      /* the host's Steam bridge: ticked here, its REPORT token printed here */
+#include "steam_friends.h"     /* friends' games, this game's rich presence and Steam's join requests: ticked here after the pump */
 #include "../coop_log.h"
 #include "../../common/steamprobe.h"
+#include "../../common/relaysplit.h"   /* HideIdNumbers: Steam's relay status text without ids or addresses */
+#include "../../common/steamlisten.h"  /* PumpThisTick: the session pump's per-frame rule */
 
 #include <cstring>
 #include <sstream>
@@ -103,6 +120,20 @@ DWORD       g_startMs  = 0;      /* GetTickCount at probe start; elapsed = (DWOR
 long long   g_pumpFrom = -1;     /* elapsed ms when callback pumping started; -1 = never */
 int         g_pumpAsked = 0;     /* 1 = the pump decision was taken (once per process) */
 FnRunCallbacks g_runCallbacks = 0;   /* non-zero while pumping */
+void*       g_sockets  = 0;      /* SteamNetworkingSockets012 as Steam handed it back, kept for the Steam links */
+void*       g_utilsAny = 0;      /* SteamNetworkingUtils004 as Steam handed it back (g_utils is set only once the relay init ran) */
+int         g_pumpSession = 0;   /* 1 = SteamPumpForSession was asked (a Steam link or listener, or the friends callbacks): the pump runs every tick from then on */
+long long   g_pumpFaults = 0;    /* faults caught inside SteamAPI_RunCallbacks for the links (the pump stops at the first) */
+int         g_linkPumpAsked = 0; /* 1 = SteamAPI_RunCallbacks was looked up for the links (once per process) */
+int         g_linkPumpOff = 0;   /* 1 = a fault in it: never called again */
+FnRunCallbacks g_linkPump = 0;   /* SteamAPI_RunCallbacks for the links */
+long long   g_linkPumps = 0;     /* calls made for the links */
+int         g_probePumped = 0;   /* 1 = the relay wait called SteamAPI_RunCallbacks during this tick */
+int         g_shutDown = 0;      /* 1 = the game's exit shut Steam down: no Steam call from here on */
+FnGenericInterface g_generic = 0;   /* SteamAPI_ISteamClient_GetISteamGenericInterface, kept for SteamProbeInterface */
+void*       g_client   = 0;      /* ISteamClient (SteamClient017) */
+int         g_user     = 0;      /* the user and pipe handles every interface is asked with */
+int         g_pipe     = 0;
 
 /* ---- the only frames that call into Steam; no C++ objects below this line until the next marker ---- */
 
@@ -252,6 +283,12 @@ void Start()
     if (!SehGenericInterface(fnGeneric, client, user, pipe, kUtilsVersion, &utils)) ++g_faults;
     if (!SehGenericInterface(fnGeneric, client, user, pipe, kMessagesVersion, &messages)) ++g_faults;
     g_ifaces = (sockets != 0 ? 1 : 0) + (utils != 0 ? 1 : 0) + (messages != 0 ? 1 : 0);
+    g_sockets = sockets;
+    g_utilsAny = utils;
+    g_generic = fnGeneric;   /* SteamProbeInterface asks for more interfaces the same way */
+    g_client = client;
+    g_user = user;
+    g_pipe = pipe;
 
     DebugLog(head + ", signed in; interfaces " + kSocketsVersion + "=" + (sockets != 0 ? "yes" : "no")
              + " " + kUtilsVersion + "=" + (utils != 0 ? "yes" : "no")
@@ -279,6 +316,7 @@ void Start()
 void Poll()
 {
     ++g_polls;
+    if (g_faults != 0) { RelayFailed("a Steam call in this game faulted"); return; }   /* a caught fault may leave Steam's own lock held: no further Steam call */
     const long long elapsed = (long long)(DWORD)(::GetTickCount() - g_startMs);
     RelayStatus st;
     std::memset(&st, 0, sizeof(st));
@@ -310,6 +348,7 @@ void Poll()
                                           g_runCallbacks != 0,
                                           coopsteam::CleanDebugText(st.debugMsg, sizeof(st.debugMsg), 160)));
     }
+    if (g_runCallbacks != 0) g_probePumped = 1;
     if (g_runCallbacks != 0 && !SehRunCallbacks(g_runCallbacks))
     {
         ++g_faults;
@@ -318,24 +357,104 @@ void Poll()
     }
 }
 
+/* SteamAPI_RunCallbacks once per tick from the first Steam link or listener on, for the rest of the session (the relay wait's own pump
+   counts for its tick; steamlisten::PumpThisTick). A fault inside it is counted and logged, the pump is not called again, and every
+   Steam use in this game ends (no further Steam call). */
+void LinkPump()
+{
+    if (g_pumpSession == 0 || g_linkPumpOff != 0)
+        return;
+    if (g_linkPumpAsked == 0)
+    {
+        g_linkPumpAsked = 1;
+        HMODULE mod = ::GetModuleHandleW(L"steam_api64.dll");   /* never LoadLibrary */
+        g_linkPump = mod != 0 ? (FnRunCallbacks)::GetProcAddress(mod, "SteamAPI_RunCallbacks") : 0;
+        if (g_dll != 0)   /* no Steam DLL (GOG): a Steam link refuses at Host / Join, nothing is pumped and nothing is said here */
+            DebugLog(std::string("[NET] steam: Steam is in use this session - SteamAPI_RunCallbacks ")
+                     + (g_linkPump != 0 ? "is called every frame from now until the game closes" : "was NOT found; the links rely on the sockets interface's own RunCallbacks"));
+    }
+    if (!steamlisten::PumpThisTick(g_pumpSession != 0, g_linkPumpOff != 0, g_linkPump != 0, g_probePumped != 0, g_faults != 0))
+        return;   /* after any Steam fault in this game: no further Steam call */
+    if (!SehRunCallbacks(g_linkPump))
+    {
+        ++g_pumpFaults;
+        ++g_faults;   /* a caught fault can leave one of Steam's own locks held: no further Steam call in this game */
+        g_linkPumpOff = 1;
+        DebugLog("[NET] steam: FAULT inside SteamAPI_RunCallbacks (Steam's callback pump, which also runs any other mod's Steam handlers)"
+                 " after " + N(g_linkPumps) + " calls - caught and counted (steamPumpFaults " + N(g_pumpFaults) + "); the pump is not"
+                 " called again this session, and every Steam link and listener stops (faults " + N(g_faults) + ")");
+        return;
+    }
+    ++g_linkPumps;
+}
+
 }   /* anonymous namespace */
+
+namespace net {
+
+/* Read at the moment a Steam link ended before connecting: whether the relay network was reachable then is the first question. */
+std::string SteamRelayStatusText()
+{
+    if (SteamProbeUtils() == 0) return "relay status unavailable (no Steam networking, or a Steam call faulted)";
+    RelayStatus st;
+    std::memset(&st, 0, sizeof(st));
+    int avail = coopsteam::kAvailUnknown;
+    if (!SehGetRelayNetworkStatus(g_utilsAny, &st, &avail))
+    {
+        ++g_faults;
+        DebugLog("[NET] steam: fault in GetRelayNetworkStatus for a Steam link's end line - every Steam link stops (faults " + N(g_faults) + ")");
+        return "fault reading the relay status";
+    }
+    return "relay avail=" + N(avail) + " config=" + N(st.availNetworkConfig) + " anyRelay=" + N(st.availAnyRelay) + " '"
+           + relaysplit::HideIdNumbers(coopsteam::CleanDebugText(st.debugMsg, sizeof(st.debugMsg), 160)) + "'";
+}
+
+}   /* namespace net */
 
 void SteamProbeTick()
 {
-    if (g_phase == PHASE_DONE)
-        return;
+    g_probePumped = 0;
     if (g_phase == PHASE_START)
-    {
         Start();
-        return;
+    else if (g_phase == PHASE_POLL)
+        Poll();
+    LinkPump();
+    SteamFriendsTick();   /* after the pump, so this frame's Steam callbacks are in */
+    net::RelayTestTick();
+    net::RelayBridgeTick();   /* after the pump, so this frame's Steam events are in */
+}
+
+bool SteamProbeStarted() { return g_phase != PHASE_START; }
+void* SteamProbeSockets() { return (g_signedIn != 0 && g_faults == 0 && g_shutDown == 0) ? g_sockets : 0; }
+void* SteamProbeUtils() { return (g_signedIn != 0 && g_faults == 0 && g_shutDown == 0) ? g_utilsAny : 0; }
+void SteamNoteFault() { ++g_faults; }
+void SteamNoteShutDown() { g_shutDown = 1; }   /* the exit hook: WinMain shut Steam down before exit() ran it */
+bool SteamProbeShutDown() { return g_shutDown != 0; }
+int SteamProbeHasDll() { return g_dll; }
+bool SteamProbeRunning() { return g_signedIn != 0 && g_faults == 0 && g_shutDown == 0; }
+void* SteamProbeInterface(const char* version)
+{
+    if (!SteamProbeRunning() || g_generic == 0 || g_client == 0 || version == 0) return 0;
+    void* out = 0;
+    if (!SehGenericInterface(g_generic, g_client, g_user, g_pipe, version, &out))
+    {
+        ++g_faults;   /* a caught fault may leave Steam's own lock held: no further Steam call */
+        DebugLog(std::string("[NET] steam: fault asking Steam for ") + version + " - every Steam use stops (faults " + N(g_faults) + ")");
+        return 0;
     }
-    Poll();
+    return out;
+}
+
+void SteamPumpForSession()
+{
+    g_pumpSession = 1;   /* no way back: the pump runs every tick for the rest of the session */
 }
 
 std::string SteamProbeReportToken()
 {
     return "steamNet[dll,signedIn,ifaces,polls,faults]=" + N(g_dll) + "," + N(g_signedIn) + "," + N(g_ifaces)
-           + "," + N(g_polls) + "," + N(g_faults) + " relay=" + g_relay;
+           + "," + N(g_polls) + "," + N(g_faults) + " relay=" + g_relay + " " + net::SteamLinkReportToken()
+           + " steamPump=" + N(g_linkPumps) + " steamPumpFaults=" + N(g_pumpFaults) + " relayTest=" + net::RelayTestWord() + " " + net::RelayBridgeReportToken();
 }
 
 }   /* namespace coop */

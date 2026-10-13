@@ -35,14 +35,14 @@ namespace {
 
 /* ---- THE APPROVED WORDS (decision 119) - the only text this program draws ---- */
 const wchar_t* const kTitle        = swnames::kSetupTitleW;
-const wchar_t* const kMsgInstall   = SW_NAME_W L" needs to add one small file to your Kenshi folder so the game can start it.";
+const wchar_t* const kMsgInstall   = L"";   /* the install screen: the folder row and Install only */
 const wchar_t* const kLabelFolder  = L"Kenshi folder:";
 const wchar_t* const kMsgInstalled = SW_NAME_W L" is installed.";
 const wchar_t* const kMsgAlready   = SW_NAME_W L" is already installed.";
 const wchar_t* const kMsgRemoved   = SW_NAME_W L" has been removed from your Kenshi folder. Your saves are not affected.";
-const wchar_t* const kMsgNotFound  = L"Kenshi wasn't found in this folder. Choose the folder that contains kenshi_x64.exe.";
-const wchar_t* const kMsgRunning   = L"Kenshi is running. Close Kenshi, then try again.";
-const wchar_t* const kMsgNoWrite   = L"Setup couldn't change files in the Kenshi folder. Right-click Setup and choose Run as administrator.";
+const wchar_t* const kMsgNotFound  = L"Kenshi (kenshi_x64.exe) wasn't found in this folder.";
+const wchar_t* const kMsgRunning   = L"Kenshi is running.";
+const wchar_t* const kMsgNoWrite   = L"Setup couldn't change files in the Kenshi folder (administrator rights needed).";
 const wchar_t* const kBtnCancel    = L"Cancel";
 const wchar_t* const kBtnInstall   = L"Install";
 const wchar_t* const kBtnFinish    = L"Finish";
@@ -341,12 +341,14 @@ void Show(HWND dlg, Screen s)
     SelectObject(dc, old);
     ReleaseDC(dlg, dc);
     int y = mv;
-    Place(dlg, IDC_MSG, m, y, W, tr.bottom, true);
+    const bool hasMsg = (msg[0] != 0);   /* no message: the folder row starts at the top */
+    if (!hasMsg) tr.bottom = 0;
+    Place(dlg, IDC_MSG, m, y, W, tr.bottom, hasMsg);
     y += tr.bottom;
     const bool folderRow = (s == kScrInstall);
     if (folderRow)
     {
-        y += Dlu(dlg, 7, false);
+        if (hasMsg) y += Dlu(dlg, 7, false);
         Place(dlg, IDC_LABEL, m, y, W, Dlu(dlg, 8, false), true);
         y += Dlu(dlg, 11, false);
         Place(dlg, IDC_PATH, m, y, W - bw - gap, bh, true);

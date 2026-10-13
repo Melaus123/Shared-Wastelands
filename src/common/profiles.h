@@ -517,14 +517,14 @@ struct SaveDirSeen
     std::string name;
     bool keyed;
     std::string world;            /* the key file's world key */
-    std::string profile;          /* its profile id; "" = a kcworld1 file, profile 1's (as RecycleDecide / LoadProfileMismatch read it) */
+    std::string profile;          /* its profile id; "" = a kcworld1 file, profile 1's (as LoadProfileMismatch and the delete read it) */
     std::string worldId;          /* T-490: field 8, the world id ("" = none) */
     bool hasGen; unsigned gen;    /* restore1a field 5, the save number */
     unsigned long long saveTime;  /* T-201 PP5 fold (M1): the folder's quick.save last write (FILETIME), 0 = none - the twin ranking */
     SaveDirSeen() : keyed(false), hasGen(false), gen(0), saveTime(0ULL) {}
 };
 /* THIS WORLD'S FOLDER? Its key file names the world, compared as folder names (case ignored). The one world test of the key scan
-   below and of a world's leftovers (WorldLeftoversFind), so a folder the scan would load for a world is a folder its delete takes. */
+   below and of a deleted world's saves (swdel::WorldDeleteFind), so a folder the scan would load for a world is a folder its delete takes. */
 /* T-490: WHICH WORLD OF THIS NAME the link is to - the id its WELCOME carried ("" = none: the name alone decides), whether that
    world was upgraded, and the slack for adopting saves made before ids (coopworld::SaveIdentityDecide). */
 struct WorldIdent
@@ -543,14 +543,24 @@ inline bool SaveDirNamesWorld(const SaveDirSeen& d, const std::string& worldKey)
 {
     return d.keyed && coopworld::WorldFolderName(d.world) == coopworld::WorldFolderName(worldKey);
 }
-/* ident = the link's world identity (0 = the name alone). A same-name folder of another world is not this world's. */
+/* ident = the link's world identity (0 = the name alone). A same-name folder of another world is not this world's. T-36: a folder
+   carrying the link's world id is this world's whatever world name its key file carries (coopworld::SaveIdSameWorld - the name the
+   world had when the save was made); without that id the name decides, as before. */
 inline bool SaveDirIsWorlds(const SaveDirSeen& d, const std::string& worldKey, const WorldIdent* ident = 0)
 {
+    if (ident != 0 && d.keyed && coopworld::SaveIdSameWorld(d.worldId, ident->id)) return true;
     return SaveDirNamesWorld(d, worldKey) && coopworld::SaveIdentityMayUse(SaveDirIdentity(d, ident));
 }
 inline bool SaveDirIsProfiles(const SaveDirSeen& d, const std::string& worldKey, const std::string& profileId, unsigned num, const WorldIdent* ident = 0)
 {
     if (!SaveDirIsWorlds(d, worldKey, ident)) return false;
+    return d.profile.empty() ? num == 1 : d.profile == profileId;
+}
+/* T-36: THIS PROFILE'S FOLDER CARRYING A WORLD ID, under any world name - the reset carry's candidates (worldreset::ResetCarryPick),
+   whose ids the world's earlier-id list then judges. A folder with no id or no key file is never one. */
+inline bool SaveDirIsProfilesWithId(const SaveDirSeen& d, const std::string& profileId, unsigned num)
+{
+    if (!d.keyed || d.worldId.empty()) return false;
     return d.profile.empty() ? num == 1 : d.profile == profileId;
 }
 /* THE KEY SCAN: the index of this (world, profile)'s folder, or -1 (none: the name rule makes one). *owned = how many folders carry
@@ -582,69 +592,23 @@ inline int SaveFolderScanChoose(const std::vector<SaveDirSeen>& dirs, const std:
     if (otherWorld != 0) *otherWorld = other;
     return best;
 }
-/* A WORLD'S LEFTOVERS ON THIS COMPUTER - what DELETE WORLD sends to the Recycle Bin with the world. A world's saves are found by its
-   NAME alone (the key scan above), so a later world given the same name would load them and be refused as older than the world.
-   folders = every save folder whose key file names this world, any profile and any folder name; playing = such a folder that is the
-   one this game plays from (keep: the settings' slot, the picked profile's folder), never moved; playingIds = those folders' profiles,
-   whose records stores are in use with them and are never moved either (same id rule as below).
-   worldKeys = the name asked for, then each other spelling a key file carries; profileIds = each folder's profile (a key
-   file naming none = this person's profile 1, as the key scan reads it), then this person's numbers 1..sweep, so a records store whose
-   save folder is already gone is still found (coopown::PlayerStoreNamesFor makes the store names). No world name = nothing. */
+/* A DELETED WORLD'S SAVES ON THIS COMPUTER - the lists swdel::WorldDeleteFind (permdelete.h) fills for DELETE WORLD: the save
+   folders that go, the ones left because this game plays from them, and the world spellings and profile ids its records stores are
+   named from (coopown::PlayerStoreNamesFor). */
 const unsigned kWorldLeftoverSweep = 64;   /* this person's profile numbers tried for records stores - numbers are never reused, so it reaches past the cap */
 struct WorldLeftovers
 {
-    std::vector<size_t> folders;          /* indexes into the scan: to the Recycle Bin */
+    std::vector<size_t> folders;          /* indexes into the scan: deleted with the world */
     std::vector<size_t> playing;          /* indexes into the scan: this world's, but the folder this game plays from */
     std::vector<std::string> playingIds;  /* each playing folder's profile once, never "": its records stores stay with it */
     std::vector<std::string> worldKeys;   /* each spelling once, never "" */
     std::vector<std::string> profileIds;  /* each id once, never "" */
-    std::vector<size_t> keptNoId;         /* T-490, by id: folders of this name whose key file carries no world id - kept, the caller logs them */
 };
 inline void LeftoverAddOnce(std::vector<std::string>* v, const std::string& s)
 {
     if (s.empty()) return;
     for (size_t i = 0; i < v->size(); ++i) if ((*v)[i] == s) return;
     v->push_back(s);
-}
-/* T-490: worldId given (non-null) = BY ID - only folders whose key file carries that id are the world's; a folder of this name with no
-   id is kept (keptNoId) and one with another id is another world's, untouched. An empty id then takes no folder. The records stores
-   are then named from the id (coopown::PlayerStoreNamesFor with it); stores named before ids are kept. */
-inline WorldLeftovers WorldLeftoversFind(const std::vector<SaveDirSeen>& dirs, const std::string& worldName, const std::vector<std::string>& keep,
-                                         const std::string& person, unsigned sweep, const std::string* worldId = 0)
-{
-    WorldLeftovers o;
-    if (worldName.empty()) return o;
-    LeftoverAddOnce(&o.worldKeys, worldName);
-    for (size_t i = 0; i < dirs.size(); ++i)
-    {
-        if (!SaveDirNamesWorld(dirs[i], worldName)) continue;
-        if (worldId != 0 && dirs[i].worldId.empty()) { o.keptNoId.push_back(i); continue; }
-        if (worldId != 0 && (worldId->empty() || dirs[i].worldId != *worldId)) continue;
-        bool played = false;
-        for (size_t k = 0; k < keep.size() && !played; ++k) if (!keep[k].empty() && SameFolderName(dirs[i].name, keep[k])) played = true;
-        const std::string id = !dirs[i].profile.empty() ? dirs[i].profile : (person.empty() ? std::string() : ProfileId(person, 1));
-        if (played) { o.playing.push_back(i); LeftoverAddOnce(&o.playingIds, id); } else o.folders.push_back(i);
-        LeftoverAddOnce(&o.worldKeys, dirs[i].world);
-        LeftoverAddOnce(&o.profileIds, id);
-    }
-    if (!person.empty()) for (unsigned n = 1; n <= sweep; ++n) LeftoverAddOnce(&o.profileIds, ProfileId(person, n));
-    return o;
-}
-/* T-490: A PROFILE DELETE'S VIEW OF THE SAVE ROOT - only folders carrying this world's id stay this world's. A same-name folder with no
-   id (listed in *keptNoId, kept - the DELETE WORLD rule) or with another id reads as unkeyed here, so the key scan never picks it. An
-   empty id leaves no folder this world's. */
-inline std::vector<SaveDirSeen> SaveDirsOfWorldId(const std::vector<SaveDirSeen>& dirs, const std::string& worldKey, const std::string& worldId,
-                                                  std::vector<size_t>* keptNoId)
-{
-    std::vector<SaveDirSeen> out(dirs);
-    for (size_t i = 0; i < out.size(); ++i)
-    {
-        if (!SaveDirNamesWorld(out[i], worldKey)) continue;
-        if (!worldId.empty() && out[i].worldId == worldId) continue;
-        if (out[i].worldId.empty() && keptNoId != 0) keptNoId->push_back(i);
-        out[i].keyed = false;
-    }
-    return out;
 }
 /* THE NAME RULE (owner 167) - the name a NEW folder gets. */
 inline std::string ProfileSaveFolderDecide(const std::string& worldDisplay, const std::string& profileName, const std::vector<SaveDirSeen>& dirs,
@@ -689,8 +653,18 @@ inline int ProfileLoadDecide(bool roleSingle, const std::string& folder, int kin
     if (kind == kProfReqLoad && SameFolderName(SaveNameLastPart(name), folder)) return kProfLoadAllow;
     return kProfLoadRefuse;
 }
+/* T-36: THE RESET WORLD'S IMPORT IS LET THROUGH - the one IMPORT GAME the carry decided for this pick (ResetCarryAtWelcome): it reads
+   the save folder the carry recorded (carryFrom) while the decided folder is the reset world's folder the carry named (carryFor), in
+   the reset world the carry was decided for (carryWorldId = the world held now). Its saves go to the decided folder like any save.
+   Every other import, load and NEW GAME is decided by ProfileLoadDecide alone. carryLive = a carry is decided for the pick now picked. */
+inline bool ProfileResetImportPass(int kind, const std::string& name, const std::string& folder, bool carryLive, const std::string& carryFrom,
+                                   const std::string& carryFor, const std::string& carryWorldId, const std::string& worldId)
+{
+    if (!carryLive || kind != kProfReqImport || folder.empty() || carryFrom.empty() || carryWorldId.empty()) return false;
+    return SameFolderName(SaveNameLastPart(name), carryFrom) && SameFolderName(carryFor, folder) && carryWorldId == worldId;
+}
 /* The refusal's words (approved; the title box is CAN'T LOAD - panelstatus.h NoticeTitle). */
-const char* const kLoadAutoText = "In multiplayer your game loads automatically. Use HOST GAME or JOIN GAME in the MULTIPLAYER menu.";
+const char* const kLoadAutoText = "In multiplayer your game loads automatically.";
 /* T-201 PP5 fold (H1, second guard): A SAVE IS REDIRECTED ONLY ONTO THE OPEN SAVE. openName = SaveFileSystem+0x120, the save
    the world was loaded from ("" = none open: a new game). Do = the open save is the profile folder, or none is open; OwnName =
    another save is open - the save keeps the name it asked for; Refuse = another (or an unreadable) open save asked to be written
@@ -804,26 +778,6 @@ inline int SaveFolderRenameDecide(const std::string& current, const std::string&
     }
     for (size_t i = 0; i < dirs.size(); ++i) if (SameFolderName(dirs[i].name, target)) return kRenameKeepTaken;
     return kRenameDo;
-}
-
-/* A deleted profile's save folder goes to the Recycle Bin (owner rule D7) only when it is plainly that profile's - it exists,
-   its key file names THIS world and THIS profile (a kcworld1 file, which names no profile, only for profile 1), it is not the
-   folder this game plays from - and only where Windows really recycles: a local fixed drive with a Recycle Bin and a folder
-   small enough for it (review-prof1 1). Windows DELETES FOR GOOD where it cannot recycle, so anything else keeps the folder. */
-enum RecycleVerdict { kRecycleOk = 0, kRecycleNoFolder, kRecycleNoKey, kRecycleOtherWorld, kRecycleOtherProfile, kRecyclePlaying,
-                      kRecycleNoBin, kRecycleTooBig };
-inline int RecycleDecide(bool folderExists, bool keyFileRead, const std::string& keyInFile, const std::string& myWorld,
-                         const std::string& profileInFile, const std::string& deletedProfileId, unsigned deletedNum,
-                         const std::string& folder, const std::string& playingFolder, bool binOk, bool sizeOk)
-{
-    if (!folderExists) return kRecycleNoFolder;
-    if (!keyFileRead) return kRecycleNoKey;
-    if (myWorld.empty() || keyInFile != myWorld) return kRecycleOtherWorld;
-    if (profileInFile.empty() ? deletedNum != 1 : profileInFile != deletedProfileId) return kRecycleOtherProfile;
-    if (folder == playingFolder) return kRecyclePlaying;
-    if (!binOk) return kRecycleNoBin;
-    if (!sizeOk) return kRecycleTooBig;
-    return kRecycleOk;
 }
 
 /* THE LOAD CHECK (design s5, review-prof1 3): a save whose key file names ANOTHER profile is refused - loading it would put one
@@ -1011,13 +965,13 @@ inline std::string VerdictText(int v, unsigned cap)
     switch (v)
     {
     case kOk:               return "done";
-    case kRefusedCap:       return "you already have " + PNum((long long)cap) + " profiles in this world, which is the most the host allows - delete one before making a new one";
-    case kRefusedName:      return "that profile name cannot be used - use 1 to 24 plain characters";
+    case kRefusedCap:       return "you already have " + PNum((long long)cap) + " profiles in this world, the most the host allows";
+    case kRefusedName:      return "that profile name cannot be used";
     case kRefusedNameTaken: return "that name is already taken in this world";   /* T-368 (owner 270 a) */
     case kRefusedUnknown:   return "that profile is not in this world any more";
     case kRefusedInUse:     return "that profile is being played right now, so it cannot be deleted";
     case kRefusedNumUsed:   return "that profile can't be reused";
-    case kRefusedNotReady:  return "still connecting - try again in a moment";
+    case kRefusedNotReady:  return "still connecting";
     default:                return "the world is running a different version of the mod";   /* words1b: host-neutral - the host sees it too */
     }
 }

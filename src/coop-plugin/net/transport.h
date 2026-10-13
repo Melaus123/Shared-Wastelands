@@ -218,7 +218,7 @@ enum MsgType
     // T-327 (session protocol 111; effect-on-copy-design-2026-09-30.md): EFFECT - an effect on another game's character is a
     // request to its owner. REQUEST (the actor's owner -> the target's owner, routed by the target's owner slot: LIVE route SLOT
     // when the notebook road is up, else the session link) / ANSWER (back on the road the request came by). RELIABLE.
-    //   dir u8 | kind u8 | reqId u32 | target u32 | actor u32 | kind fields   (src/common/effectwire.h; kind 1 EAT only so far)
+    //   dir u8 | kind u8 | reqId u32 | target u32 | actor u32 | kind fields   (src/common/effectwire.h; kinds 1 EAT and 3 KO)
     MSG_EFFECT        = 65,
     // P25 fold 2 (session protocol 115; T776 FAIL): INSIDE (the owner -> every game holding a copy, the character stream's road:
     // AREA on the notebook, the session link while it is down): whether the owner's OWN player-faction character is in a
@@ -278,6 +278,8 @@ struct Message
     MsgType           type;
     unsigned int      peer;      // sender's peer id (host is always 0)
     std::vector<char> payload;   // message body, no header
+    Channel           lane;      // the lane it arrived on, set by the transport that received it (the host's Steam bridge hands it on on the same lane); CH_RELIABLE for one made in code
+    Message() : type((MsgType)0), peer(0), lane(CH_RELIABLE) {}
 };
 
 // Connection state, reported to the user rather than inferred.
@@ -386,6 +388,10 @@ public:
        and guaranteed ones sent but not yet acknowledged - `packets` pieces (a large message travels in several) of `bytes` in all. A sender of bulk data that can
        wait reads it to send only while the link is nearly idle. false = no peer is up or the backend cannot say. */
     virtual bool SendQueued(long long* /*packets*/, long long* /*bytes*/) const { return false; }
+    /* The bytes this link handed to its backend (sent) and took from it (recv) since the transport was made: ENet counts each packet
+       (a bundle once, with its header), Steam each whole frame (5-byte header included) before it is split / after it is rejoined.
+       false = the backend cannot say. */
+    virtual bool ByteCounts(unsigned long long* /*sent*/, unsigned long long* /*recv*/) const { return false; }
 
     // Diagnostics for the netstat command (round-trip ms, counts).
     virtual unsigned int RoundTripMs() const = 0;

@@ -96,6 +96,7 @@
 #include "spawn.h"          // E20: FindSpawnedUid - which uid, if any, this loaded character is registered under
 #include "net/session.h"    // E20: net::IsUidMine - is that uid one this game owns (the authority map)
 #include "medical.h"        // par6 (parity P6): CopyDeathAllowed - a copy dies only when its owner says so
+#include "relations.h"      // RelationsCopyDeathMark - a copy's own death raises no standing event of its own
 #include <intrin.h>         // par6 fold (review-par6 #1): _ReturnAddress - which engine caller is killing a copy
 #include "coop_log.h"
 #include "game/GameWorld.h"   // P5m: activeCharacters - the engine's own set of the characters it is updating
@@ -963,7 +964,13 @@ void detour_declareDead(void* self)
     // character from its squad and ragdolls it, and this is a POD read of the character, not of the map.
     void* gd = 0;
     const int unique = WsPlaus(self) ? WsUniqueGate(self, &gd) : 0;
+    /* a COPY's death (its owner's state says dead): the owner's engine raised this death's standing events already, so the event 5
+       this call raises against the killer hand's faction (+0x2C0) is neither made on this game's player pair nor sent (kind 2) */
+    const unsigned int deadUid = FindSpawnedUid(self);
+    const bool copyDeath = deadUid != 0 && !net::IsUidMineAnyThread(deadUid);
+    const int deathMarkWas = copyDeath ? RelationsCopyDeathMark(1) : 0;
     orig_declareDead(self);
+    if (copyDeath) RelationsCopyDeathMark(deathMarkWas);
     coop::ResurrectNoteDeath(self, ret, unique != 0 ? 1 : 0);   /* T-556: this game's own dead are snapshotted on the main thread */
     if (unique == 0) return;
     if (gd != 0 && !WsApplying()) WsQueue(gd);

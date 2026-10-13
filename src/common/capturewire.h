@@ -30,6 +30,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "ownerwire.h"   /* a taken row's OWN1 block */
+#include "gearwire.h"    /* a taken row's GEM1 block */
 
 namespace coopcapture {
 
@@ -131,6 +133,8 @@ struct CapItem
     float quality, charges;
     int functionKind, level, unique, quantity;
     CapItem() : quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0), quantity(0) {}
+    coopmark::OwnerId owner;    /* the taken item's stolen mark: an OWN1 block after the row's record, kind 0 = none (nothing on the wire) */
+    gearwire::GearMarks gear;   /* its uniform and crafter: a GEM1 block after that, none = nothing on the wire */
 };
 
 struct CapDoneRow
@@ -280,6 +284,15 @@ inline bool EncodeCaptureDone(std::vector<char>* b, const CaptureDone& d)
         CapPutF32(&o, it.quality); CapPutF32(&o, it.charges);
         CapPutU32(&o, (unsigned int)it.functionKind); CapPutU32(&o, (unsigned int)it.level);
         CapPutU32(&o, (unsigned int)it.unique); CapPutU32(&o, (unsigned int)it.quantity);
+        /* the taken item's OWN1 block and GEM1 block, each only when there is one; an owner that will not encode is left off. They are
+           read back by marker: after a row comes the next row's outcome (0..3) or dressAdded and then stateNow (0..3 or 0xFF), and
+           neither marker's second byte ('W', 'E') is a state, so a clean row's bytes are unchanged and never read as a block. */
+        if (it.owner.kind != coopmark::kOwnNone)
+        {
+            std::vector<char> ob;
+            if (coopmark::EncodeOwner(&ob, it.owner)) o.insert(o.end(), ob.begin(), ob.end());
+        }
+        gearwire::EncodeGear(&o, it.gear, 0);
     }
     CapPutU8(&o, (unsigned int)d.dressAdded);
     CapPutU8(&o, d.stateNow < 0 ? 0xFFu : (unsigned int)d.stateNow);
@@ -318,6 +331,19 @@ inline int DecodeCaptureDone(const char* p, size_t size, CaptureDone* d)
             it.quality = q.F32(); it.charges = q.F32();
             it.functionKind = (int)q.U32(); it.level = (int)q.U32(); it.unique = (int)q.U32(); it.quantity = (int)q.U32();
             if (!q.ok) return kCapDecodeTooShort;
+            const char* const raw = (const char*)q.p;
+            if (coopmark::OwnerBlockAt(raw, q.n, q.at))   /* the row's OWN1 block */
+            {
+                size_t oe = 0;
+                if (coopmark::DecodeOwner(raw, q.n, q.at, &it.owner, &oe) != coopmark::kOwnOk) return kCapDecodeBadValue;
+                q.at = oe;
+            }
+            if (gearwire::GearBlockAt(raw, q.n, q.at))   /* the row's GEM1 block */
+            {
+                size_t ge = 0;
+                if (gearwire::DecodeGear(raw, q.n, q.at, &it.gear, &ge) != gearwire::kGearOk) return kCapDecodeBadValue;
+                q.at = ge;
+            }
         }
         t.rows.push_back(w);
     }

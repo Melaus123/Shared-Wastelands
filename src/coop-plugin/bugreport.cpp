@@ -3,9 +3,9 @@
 // WHAT THE PLAYER SEES. A small REPORT A BUG button in the title screen's bottom-left corner (369, Kenshi's message-box button
 // style), and REPORT A BUG on its own row of Kenshi's pause menu between EXIT GAME and RESUME, set apart by the menu's own gap
 // and lettered in the menu buttons' own highlight colour (378 d). Either opens the REPORT A BUG window: Kenshi's framed window
-// with a close X, centred, and modal (nothing behind it takes a click). WHAT HAPPENED?, the typed box (a grey hint while it is
-// empty; Enter is a new line; at most 1000 characters, 371), the counter "n / 1000", the line "Describe what happened to send a
-// report." while the box is empty (SEND is greyed then, 370), CANCEL left and SEND right. SEND greys the box and shows
+// with a close X, centred, and modal (nothing behind it takes a click). WHAT HAPPENED?, the typed box (Enter is a new
+// line; at most 1000 characters, 371), the counter "n / 1000", SEND greyed while the box is empty (370), CANCEL left and SEND
+// right. SEND greys the box and shows
 // "Preparing your report..." then "Sending your report... n%"; CANCEL, X or ESC stop it and give the window back with the text.
 // A send that works replaces the window with REPORT SENT (OK); one that fails puts CAN'T SEND REPORT over the window (BACK /
 // TRY AGAIN). The text stays until Kenshi closes (375) unless it was sent. Nothing is written to disk (373), there is no report
@@ -57,6 +57,7 @@
 #include "../common/modversion.h"           /* the mod's version: the report's info line and the title screen's version line */
 #include "soak.h"                          /* GameplayRunning */
 #include "doors.h"                         /* ReportDoors - the door totals go into the log a report packs */
+#include "farm.h"                          /* ReportFarm - the [FARM] / [MINE] totals go into the log a report packs */
 #include "net/session.h"                   /* SessionProtocolVersion */
 #include "../common/bugreport.h"
 #include "../common/titleart.h"          /* PlaceTitleNote */
@@ -101,13 +102,10 @@ const char* const kTitleNoteP = "BugReportTitleNote";
 const char* const kTitleNoteH = "BugReportTitleNoteHead";
 const char* const kTitleNoteB = "BugReportTitleNoteBody";
 const char* const kTitleVer = "SharedWastelandsTitleVersion";
-const char* const kAbout1    = "BugReportAbout1";
-const char* const kAbout2    = "BugReportAbout2";
 const char* const kPauseBtn  = pausemenu::kBugButtonName;
 const char* const kWin       = "BugReportWindow";
 const char* const kLabel     = "BugReportLabel";
 const char* const kText      = "BugReportText";
-const char* const kTextHint  = "BugReportTextHint";
 const char* const kCounter   = "BugReportCounter";
 const char* const kStatus    = "BugReportStatus";
 const char* const kCancelBtn = "BugReportCancel";
@@ -123,8 +121,6 @@ const char* const kFailRetry = "BugReportFailRetry";
 /* ---- colours ---- */
 /* Kenshi_MessageBox.layout's MessageText colour, which every box of the mod uses for its text and its Kenshi_Button2 captions */
 MyGUI::Colour Lit() { return MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f); }
-/* the dim caption ui.cpp gives a greyed Kenshi_Button2 and a hint */
-MyGUI::Colour Dim() { return MyGUI::Colour(0.50f, 0.48f, 0.46f, 1.0f); }
 /* Kenshi_Button1Skin's "highlighted" text colour (data/gui/skins/kenshi_skins.xml) - the colour the menu's own buttons take under
    the mouse - so REPORT A BUG stands out in a colour the menu already uses (378 d) */
 MyGUI::Colour Highlight() { return MyGUI::Colour(0.505882f, 0.4f, 0.207843f, 1.0f); }
@@ -653,6 +649,7 @@ void AnswerStart(unsigned int askId, unsigned int slot, unsigned int maxBytes)
     g_ans.askId = askId; g_ans.slot = slot; g_ans.next = 0; g_ans.parts = 0; g_ans.askAtMs = now;
     g_ans.state = 1;
     coop::ReportDoors();   /* the door totals and reload[...] line go into the log this answer sends */
+    coop::ReportFarm();    /* the [FARM] / [MINE] totals too */
     const uintptr_t t = _beginthreadex(NULL, 0, &AnswerMain, a, 0, NULL);
     if (t == 0) { delete a; g_ans.state = 0; ErrorLog("[BUG] a nearby log ask from slot " + Num(slot) + " not answered: no worker thread"); return; }
     ::CloseHandle((HANDLE)t);
@@ -781,7 +778,7 @@ void StartJob(const std::string& desc, int sendOnly)
     j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
               + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
     j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->gameFolder = GameFolder();
-    if (!sendOnly) coop::ReportDoors();   /* the door totals and reload[...] line go into the log this report packs */
+    if (!sendOnly) { coop::ReportDoors(); coop::ReportFarm(); }   /* the door totals, reload[...] and the [FARM] / [MINE] totals go into the log this report packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &JobMain, j, 0, NULL);
     if (t == 0)
     {
@@ -869,14 +866,11 @@ bool BuildWindow(MyGUI::Gui* gui)
     win->eventWindowButtonPressed += MyGUI::newDelegate(OnWinButton);
     win->eventKeyButtonPressed += MyGUI::newDelegate(OnKey);
     win->setNeedKeyFocus(true);
-    /* the rows: the two about lines, WHAT HAPPENED? with the counter, the box, then CANCEL - the status line - SEND */
+    /* the rows: WHAT HAPPENED? with the counter, the box, then CANCEL - the status line - SEND */
     const int frameH = raw->getHeight() - cl->getHeight();
     const int pad = Clamp(W * 3 / 100, 10, 24);
     const int innerW = cl->getWidth() - 2 * pad;
     int y = pad;
-    const int aboutLineH = rowH * 3 / 4;
-    const int about1Y = y;  y += aboutLineH;
-    const int about2Y = y;  y += aboutLineH + rowH / 4;
     const int labelY = y;   y += rowH;   /* WHAT HAPPENED? on the left, the character counter on the right of the same row */
     const int editY = y;    const int editH = rowH * 3;   y += editH + rowH / 4;
     const int countY = labelY;   const int countH = rowH;
@@ -886,11 +880,8 @@ bool BuildWindow(MyGUI::Gui* gui)
     const int btnW = Clamp(innerW / 4, 120, innerW / 2 - 8);
     const int statusX = pad + btnW + pad / 2;   /* between CANCEL and SEND, as tall as they are */
     const int statusW = innerW - 2 * (btnW + pad / 2);
-    MyGUI::Widget* about1 = Mk(cl, "TextBox", "Kenshi_TextboxStandardText", pad, about1Y, innerW, aboutLineH, kAbout1);
-    MyGUI::Widget* about2 = Mk(cl, "TextBox", "Kenshi_TextboxStandardText", pad, about2Y, innerW, aboutLineH, kAbout2);
     MyGUI::Widget* label  = Mk(cl, "TextBox", "Kenshi_TextboxPaintedText", pad, labelY, innerW, rowH, kLabel);
     MyGUI::Widget* text   = Mk(cl, "EditBox", "Kenshi_EditBox", pad, editY, innerW, editH, kText);
-    MyGUI::Widget* hint   = Mk(cl, "TextBox", "Kenshi_TextboxStandardText", pad + 8, editY + 4, innerW - 16, rowH, kTextHint);
     MyGUI::Widget* count  = Mk(cl, "TextBox", "Kenshi_TextboxStandardText", pad, countY, innerW, countH, kCounter);
     MyGUI::Widget* status = Mk(cl, "TextBox", "Kenshi_TextboxStandardText", statusX, btnY, statusW, btnH, kStatus);
     MyGUI::Widget* cancel = Mk(cl, "Button", "Kenshi_Button1", pad, btnY, btnW, btnH, kCancelBtn);
@@ -898,8 +889,7 @@ bool BuildWindow(MyGUI::Gui* gui)
     MyGUI::EditBox* e = As<MyGUI::EditBox>(text);
     MyGUI::Button* cb = As<MyGUI::Button>(cancel);
     MyGUI::Button* sb = As<MyGUI::Button>(send);
-    if (As<MyGUI::TextBox>(about1) == 0 || As<MyGUI::TextBox>(about2) == 0
-        || As<MyGUI::TextBox>(label) == 0 || e == 0 || As<MyGUI::TextBox>(hint) == 0 || As<MyGUI::TextBox>(count) == 0
+    if (As<MyGUI::TextBox>(label) == 0 || e == 0 || As<MyGUI::TextBox>(count) == 0
         || As<MyGUI::TextBox>(status) == 0 || cb == 0 || sb == 0)
     { gui->destroyWidget(raw); return false; }
     {   /* Kenshi's painted caption text in its own colour, as the panel's PORT and PLAYER NAME labels */
@@ -907,10 +897,6 @@ bool BuildWindow(MyGUI::Gui* gui)
         lt->setCaption(MyGUI::UString(coopbug::kLabelText));
         lt->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
     }
-    StyleText(about1, coopbug::kAboutLine1, MyGUI::Align::Left | MyGUI::Align::VCenter, Lit());
-    StyleText(about2, coopbug::kAboutLine2, MyGUI::Align::Left | MyGUI::Align::VCenter, Lit());
-    StyleText(hint, coopbug::kBoxHintText, MyGUI::Align::Left | MyGUI::Align::Top, Dim());
-    hint->setNeedMouseFocus(false);   /* a click on the hint reaches the box under it */
     StyleText(count, "", MyGUI::Align::Right | MyGUI::Align::VCenter, Lit());
     StyleText(status, "", MyGUI::Align::Center, Lit());
     {   /* Kenshi_EditBox's skin holds its typing area one line tall and centred in the box (Client, align HStretch VCenter, 5 px
@@ -1033,15 +1019,12 @@ void SyncWindow(MyGUI::Gui* gui)
         { Lock l; if (g_sh.gen == g_gen) { phase = g_sh.phase; pct = g_sh.pct; } }
         status = phase == kPhPreparing ? std::string(coopbug::kPreparingLine) : coopbug::SendingLine(pct);
     }
-    else if (!sendOk) status = coopbug::kNeedTextLine;   /* the line says why SEND is greyed: nothing but spaces yet (370) */
     if (len != g_shownLen)
     {
         g_shownLen = len;
         MyGUI::TextBox* c = As<MyGUI::TextBox>(Find(gui, kCounter));
         if (c != 0) c->setCaption(MyGUI::UString(coopbug::CounterText((unsigned int)len).c_str()));
     }
-    MyGUI::Widget* hint = Find(gui, kTextHint);
-    if (hint != 0) hint->setVisible(len == 0 && !busy);
     if (status != g_shownStatus)
     {
         g_shownStatus = status;

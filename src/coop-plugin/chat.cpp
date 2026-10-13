@@ -105,7 +105,7 @@ std::string N(long long v) { char b[32]; _snprintf(b, 31, "%lld", v); b[31] = 0;
 int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /* ---- what the player pressed: written by the handlers, taken by the tick ---- */
-enum { kActNone = 0, kActSend = 1, kActClose = 2, kActToList = 3, kActSearchPick = 4 };
+enum { kActNone = 0, kActSend = 1, kActClose = 2, kActToList = 3, kActSearchPick = 4, kActAccept = 5 };   /* kActAccept: Enter in the typing line; kActSend: the SEND button */
 volatile LONG g_act = kActNone;
 volatile LONG g_esc = 0;          /* an ESC meant for the open window */
 volatile LONG g_tabN = 0;         /* Tab presses while typing */
@@ -122,7 +122,7 @@ volatile LONG g_escClosedTick = 0;
 const DWORD kEscHoldMs = 500;
 
 void OnSend(MyGUI::Widget*)          { ::InterlockedExchange(&g_act, kActSend); }
-void OnAccept(MyGUI::EditBox*)       { ::InterlockedExchange(&g_act, kActSend); }
+void OnAccept(MyGUI::EditBox*)       { ::InterlockedExchange(&g_act, kActAccept); }
 void OnClose(MyGUI::Widget*)         { ::InterlockedExchange(&g_act, kActClose); }
 void OnToBtn(MyGUI::Widget*)         { ::InterlockedExchange(&g_act, kActToList); }
 void OnSearchAccept(MyGUI::EditBox*) { ::InterlockedExchange(&g_act, kActSearchPick); }
@@ -178,6 +178,11 @@ std::vector<int> g_in;            /* the other players in the world at the last 
 bool g_needSeed = true;
 long long g_inMs = 0;
 bool g_enterWas = false;
+/* The box was opened by an Enter press and no later Enter press has been seen. The game can hand that same press to the
+   typing line a frame later, once the line has the keys; taken as a send of an empty line it would close the box at once.
+   While this is set, an Enter in an EMPTY typing line does nothing; the next real Enter press clears it. */
+bool g_enterOpenHeld = false;
+long long g_enterOpenSwallowed = 0;
 long long g_fadeMs = 0;
 LONG g_escSeen = 0, g_dragSeen = 0;
 chatwire::Cfg g_dragFrom;
@@ -821,6 +826,7 @@ void Open(MyGUI::Gui* gui, const char* how, int to, long long now)
 }
 void Close(MyGUI::Gui* gui, const char* why, bool clearText)
 {
+    g_enterOpenHeld = false;
     DropPop(gui);
     if (clearText) { MyGUI::EditBox* e = As<MyGUI::EditBox>(Find(gui, kEdit)); if (e != 0) e->setCaption(MyGUI::UString("")); }
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
@@ -931,11 +937,16 @@ bool EnterPressed()
     g_enterWas = down;
     return edge;
 }
-/* another text field has the keys, or a modal window is up */
+/* a text box the player can type into has the keys, or a modal window is up. The game's own screen widget ('Root') holds the
+   keys during ordinary play, so key focus alone is not typing: only an editable EditBox counts. */
 bool OtherBusy()
 {
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
-    return im != 0 && (im->isFocusKey() || im->isModalAny());
+    if (im == 0) return false;
+    if (im->isModalAny()) return true;
+    MyGUI::Widget* w = im->getKeyFocusWidget();
+    MyGUI::EditBox* e = w != 0 ? w->castType<MyGUI::EditBox>(false) : 0;
+    return e != 0 && !e->getEditReadOnly();
 }
 bool EnterMayOpen()
 {
@@ -1065,10 +1076,11 @@ void TickBody()
     const int pickHas = (int)::InterlockedExchange(&g_pickHas, 0);
     const int openReq = (int)::InterlockedExchange(&g_openReq, 0);
     const bool enter = EnterPressed();   /* every frame, so a held key is one press */
+    if (enter && g_st == kStOpen) g_enterOpenHeld = false;   /* a new press while the box is open is the player's own Enter */
     if (g_st != kStOpen)
     {
         if (openReq) Open(gui, "players-tab", (int)g_openSlot, now);
-        else if (enter && EnterMayOpen()) Open(gui, "enter", g_to, now);
+        else if (enter && EnterMayOpen()) { Open(gui, "enter", g_to, now); g_enterOpenHeld = (g_st == kStOpen); }
     }
     else
     {
@@ -1079,6 +1091,16 @@ void TickBody()
         if (act == kActToList) { if (g_pop) DropPop(gui); else OpenPop(gui, now); }
         else if (act == kActSearchPick) PickFirst(gui, now);
         else if (act == kActSend) SendFromBox(gui, now);
+        else if (act == kActAccept)
+        {
+            MyGUI::EditBox* line = As<MyGUI::EditBox>(Find(gui, kEdit));
+            const bool empty = line == 0 || chatwire::CleanTyped(coopbug::CaptionToPlain(line->getCaption().asUTF8())).empty();
+            if (g_enterOpenHeld && empty)
+            {
+                if (++g_enterOpenSwallowed <= 5) DebugLog("[CHAT] the Enter that opened the box reached the typing line - not taken as a send (" + N(g_enterOpenSwallowed) + ")");
+            }
+            else SendFromBox(gui, now);
+        }
         else if (act == kActClose) Close(gui, "close", true);
         if (esc && g_st == kStOpen) { if (g_pop) { DropPop(gui); FocusEdit(gui); } else { Close(gui, "esc", true); EscHoldStart(); } }
     }

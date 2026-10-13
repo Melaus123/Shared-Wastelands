@@ -27,8 +27,10 @@
        false (sendEventBlocked) - P3-c: NO LONGER; the event now runs and is only COUNTED (sendEventWouldBlock), see detour_sendEvent.  That keeps the copy from reaching sayLine at all, so it is never left half
        way through a chain whose lines were dropped.
      - THE BACKSTOP.  A copy's own say() is still dropped; when the dropped call carries the Dialogue's
-       currentLine (+0x198, which sayLine 0x682F10 sets before it says), currentLine is cleared so update
-       ends the chat instead of advancing a dead chain (dropClearedLine).
+       currentLine (+0x198, which sayLine 0x682F10 sets before it says), currentLine is cleared so no dead
+       line is advanced from (dropClearedLine). Dialogue::update 0x684600 ends the chat on a cleared line only
+       while a bubble shows; a copy's own conversation with no bubble is ended at the safe point (T-719,
+       CopyOwnEndDrain).
      - REPLAYS ARE CHECKED, NOT TRUSTED.  A parked-line replay counts as already handled only if the plugin
        handled THAT text on THAT Dialogue (sent it, or applied it) - a small main-thread table.  An unhandled
        replay is a NEW line: sent on the owner (replaySent), dropped on a copy (replayDropped).
@@ -54,6 +56,8 @@
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 #include "ai_spike.h"   /* P26 stage 0 fold 1: EngineThreadNameOf - which engine thread the off-thread starts run on */
 #include "../common/talkwire.h"     /* P26 stages 1-3: MSG_TALK */
+#include "../common/talkcursor.h"   /* T-737: the talk cursor's decisions */
+#include "soak.h"                     /* T-737: MainLoopFrames - the frame a hover was seen on */
 #include "../common/liveenvelope.h" /* P25 fold re-check: cooplive::SamePlayer (a waiting request's owner key vs the PROMPT/END sender) */
 #include "game/GameData.h"          /* P26 stages 1-3: a dialogue line's GameData string id */
 #include "game/GameDataManager.h"   /* P26 stages 1-3: gamedata.getData / listRecordsOfType */
@@ -157,7 +161,9 @@ void SayMarkIfParked(void* dlg, const std::string& text)
 }
 
 /* A copy's say was dropped. If it was saying the Dialogue's currentLine (sayLine set it just before), that
-   line was never shown and must not be advanced from - clear it so Dialogue::update ends the chat. */
+   line was never shown and must not be advanced from - clear it. Dialogue::update 0x684600 ends the chat on the
+   cleared line only while a bubble shows; with no bubble the conversation stays open until CopyOwnEndDrain ends it
+   (T-719). Called for a main-thread drop only (kSayActDrop); a dropped parked-line replay leaves the line. */
 void SayDropClearLine(void* dlg, void* line)
 {
     if (line == 0) return;
@@ -256,6 +262,10 @@ const int    kCrimeStealing   = 3;
 const int    kCrimeExpirySec  = 20;
 const float  kCrimeVictimMaxDist = 500.0f;
 const float  kCrimeVictimMaxDistFiltered = 3000.0f;   /* crime8: T282 found no victim of any kind within 500 u on either game */
+const float  kCrimeWitnessSightUnits = 400.0f;   /* T-746 (fold 3): stealnear's witness test - another character of the victim's
+                                                  faction within this distance of the victim counts as in sight of it. 40 m at 10 world
+                                                  units a metre (the project's Inferred scale); the engine's own sight range is not read
+                                                  (a Guess to tune in a run) */
 volatile LONG g_crimeTestPending = 0;    /* armed by the verb (main thread), drained at the safe point (main thread): 1 steal, 2 stealnear, 3 stealplayer, 4 attackplayer, 5 attacknear */
 long long g_crimeTestArmed = 0, g_crimeTestDone = 0, g_crimeTestNoOffender = 0, g_crimeTestNoVictim = 0, g_crimeTestNoAddr = 0,
           g_crimeTestFaulted = 0, g_crimeTestBlocked = 0, g_crimeTestEffective = 0;   /* effective: the read-back shows STEALING with a fresh expiry */
@@ -271,6 +281,13 @@ int CrimeFactionOf(::Character* c, ::Faction** out)
 int CrimeIsDead(::Character* c)
 {
     __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-746 (fold 3): Character +0x2F8 inSomething (1 bed, 2 cage; nonzero = in a bed, cage or building slot - spawn.cpp
+   kCarryInSomethingOff); -1 the read faulted */
+int CrimeInSomethingPod(::Character* c)
+{
+    __try { return *(const int*)((const char*)c + 0x2F8); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 int CrimeReadHandFields(::Character* c, unsigned int* w7)
@@ -399,10 +416,61 @@ static void TkArrNote(void* dlg, void* who, int what, bool r, void* ret)
     ::InterlockedExchange(&g_arrBusy, 0);
 }
 
-/* P3-b: a copy the other game drives never starts a chat of its own - only the player talking to it. */
-bool detour_sendEvent(void* dlg, void* who, int what)
+/* T-726: ONE TALK ORDER of this game's player - Dialogue::sendEvent event 1 with this game's own player-faction character as `who`
+   (the test TkP25Intercept makes) - and what became of it. detour_sendEvent points this thread's TLS slot at a TkOrderCtx on its
+   stack for the call (SendEventOrder); the road the click takes writes into it: detour_startPlayerConv (reached, with a line or not,
+   started, or refused by this game's camera gate) and TkP25Intercept / TkP25Queue (taken for the NPC's game as a REQUEST, the click
+   ring full, the same click already waiting). After the call the plain values go into a fixed lock-free ring (no lock, no
+   allocation, no log) and the K2 safe point writes one throttled line per order (TalkOrderDrain). */
+struct TkOrderCtx { void* dlg; int set; int reached; int hadLine; int started; float gateDist; };   /* set: a cooptalk::kTalkOrder* the road wrote, 0 none */
+volatile DWORD g_tkOrderTls = TLS_OUT_OF_INDEXES;
+const LONG kTkOrderRing = 32;   /* a power of two */
+struct TkOrderEntry { volatile LONG state; void* dlg; void* me; void* who; unsigned int nuid, tuid; unsigned long tid;
+                      int set, reached, hadLine, started, busyCopy, convEv; float gateDist; unsigned long long site; };   /* state: 0 free, 1 writing, 2 ready */
+struct TkOrderItem { void* dlg; void* me; void* who; unsigned int nuid, tuid; unsigned long tid;
+                     int set, reached, hadLine, started, busyCopy, convEv; float gateDist; unsigned long long site; };   /* one drained entry (MAIN THREAD) */
+TkOrderEntry g_tkOrderRing[kTkOrderRing];
+volatile LONG g_tkOrderHead = 0, g_tkOrderPending = 0;
+volatile LONG64 g_tkOrders = 0, g_tkOrderDropped = 0;
+/* what TkP25Drain did with the clicks of the current safe point (MAIN THREAD): kind 1 REQUEST sent (reqId), 2 not requested (why),
+   3 the NPC was this game's after all - the engine's own start ran (started) */
+struct TkOrderP25 { void* dlg; int kind; unsigned int reqId; int why; int started; };
+const int kTkOrderP25Max = 8;
+TkOrderP25 g_tkOrderP25[kTkOrderP25Max];
+int g_tkOrderP25N = 0;
+int TkOrderIsMine(void* who);                                     /* below, beside TkWindowDlg */
+void TkOrderFinish(const TkOrderCtx* oc, void* dlg, void* who, void* ret);   /* below, beside TkWindowDlg */
+
+/* T-726: this thread's running talk order, 0 none. ANY THREAD; the thread's last error kept. */
+TkOrderCtx* TkOrderCur()
 {
-    void* const arrRet = _ReturnAddress();   /* P26s6 arrival probe: the engine call site (the thunk is a plain jmp) */
+    const DWORD ti = g_tkOrderTls;
+    if (ti == TLS_OUT_OF_INDEXES) return 0;
+    const DWORD le = ::GetLastError();
+    TkOrderCtx* const x = (TkOrderCtx*)::TlsGetValue(ti);
+    ::SetLastError(le);
+    return x;
+}
+
+/* T-726: the click's road names its outcome on the running order of this Dialogue (the first one written stands). ANY THREAD. */
+void TkOrderSetFor(void* dlg, int outcome, float dist)
+{
+    TkOrderCtx* const oc = TkOrderCur();
+    if (oc != 0 && oc->dlg == dlg && oc->set == 0) { oc->set = outcome; oc->gateDist = dist; }
+}
+
+/* T-726: TkP25Drain keeps what it did with a click, for the talk-order line of the same safe point. MAIN THREAD. */
+void TkOrderP25Note(void* dlg, int kind, unsigned int reqId, int why, int started)
+{
+    if (g_tkOrderP25N >= kTkOrderP25Max) return;
+    TkOrderP25& p = g_tkOrderP25[g_tkOrderP25N++];
+    p.dlg = dlg; p.kind = kind; p.reqId = reqId; p.why = why; p.started = started;
+}
+
+/* P3-b, now P3-c below: a copy's own sendEvent runs and is counted (sendEventWouldBlock), never blocked. T-726: the body of
+   detour_sendEvent; arrRet = the engine call site detour_sendEvent read. */
+static bool SendEventRun(void* dlg, void* who, int what, void* arrRet)
+{
     if (SayOnMainThread() != 0)
     {
         void* me = SayReadPtr(dlg, kDlgMe);
@@ -412,8 +480,10 @@ bool detour_sendEvent(void* dlg, void* who, int what)
            gameplay on this game - a guard's reaction to the local player's theft or trespass (events 8/9/0x11/0x29-0x2c:
            _doActions 0x67FAD0 -> sendEvent 0x42 to the squad, 0x5D1640(...,0x1d,who)) and event 0xd's cage unlock
            (0x672EA0 / 0x673870) - and the owner game never learns of a crime committed here. Blocking them silently
-           removed those reactions. The copy's LINE is still dropped at say() (the backstop) and its current line
-           cleared, so it neither invents a bubble nor sticks mid-chat. The counter keeps its name and now measures
+           removed those reactions. The copy's LINE is still dropped at say() (the backstop) - its current line
+           cleared when the dropped say is sayLine's own main-thread call (a dropped parked-line replay leaves it) - so it
+           does not invent a bubble; the conversation it leaves open is ended at the next safe point (T-719,
+           CopyOwnEndDrain - the engine ends one only by a showing bubble's timers). The counter keeps its name and now measures
            the events the rule WOULD block, so a run can size the question 'report crimes to the owner' (open). */
         if (!coopsay::SendEventAllowed(puppet, what))
         {
@@ -447,6 +517,39 @@ bool detour_sendEvent(void* dlg, void* who, int what)
     ::SetLastError(le);
     TkArrNote(dlg, who, what, r, arrRet);   /* P26s6 arrival probe (keeps the last-error value) */
     return r;
+}
+
+/* T-726: a talk order of this game's player runs with this thread's order context set and ALWAYS restored (__finally: a fault inside
+   the engine's call propagates exactly as before and never leaves the slot pointing at a dead stack frame); its plain values go to
+   the ring after the call. ANY THREAD; no C++ object (C2712); the thread's last error kept. */
+static bool SendEventOrder(void* dlg, void* who, int what, void* arrRet)
+{
+    TkOrderCtx oc;
+    oc.dlg = dlg; oc.set = 0; oc.reached = 0; oc.hadLine = 0; oc.started = 0; oc.gateDist = -1.0f;
+    const DWORD ti = g_tkOrderTls;
+    const DWORD le0 = ::GetLastError();
+    void* const prevOc = ::TlsGetValue(ti);
+    ::TlsSetValue(ti, &oc);
+    ::SetLastError(le0);
+    bool r = false;
+    __try { r = SendEventRun(dlg, who, what, arrRet); }
+    __finally
+    {
+        const DWORD le1 = ::GetLastError();
+        ::TlsSetValue(ti, prevOc);
+        ::SetLastError(le1);
+    }
+    TkOrderFinish(&oc, dlg, who, arrRet);
+    return r;
+}
+
+bool detour_sendEvent(void* dlg, void* who, int what)
+{
+    void* const arrRet = _ReturnAddress();   /* P26s6 arrival probe: the engine call site (the thunk is a plain jmp) */
+    coop::CrimeNoteWitnessEvent(what, who);   /* [CRIME] REPORT witnessEvents: the crime witness events this game's engine raises */
+    if (what == 1 && dlg != 0 && who != 0 && g_tkOrderTls != TLS_OUT_OF_INDEXES && TkOrderIsMine(who))   /* T-726: this game's player's talk order */
+        return SendEventOrder(dlg, who, what, arrRet);
+    return SendEventRun(dlg, who, what, arrRet);
 }
 
 /* P26 stage 0: the character's display name (at most 47 bytes) into out[48]; '-' no character, '?' unreadable. No C++ object
@@ -493,7 +596,48 @@ int TalkReplyCount(void* dlg)
     return (int)(bytes / sizeof(std::string));
 }
 
-/* P26 stage 0: one start, AFTER the original ran. player = startPlayerConversation. MAIN THREAD. Reads and counts only. */
+/* T-719: A COPY'S OWN CONVERSATION. A copy (an NPC the other game drives, or the other player's character) that starts a conversation
+   by itself - a crime witness's reaction, usually on the AI thread - has its line dropped by say() here (the owner's game shows it),
+   so no bubble shows, and the engine, which ends a conversation only by the line timers of a showing bubble (Dialogue::update,
+   +0x228), never ends it: the Dialogue stays busy for good, refuses every later event but 1, and refuses the owner's forwarded PROMPT.
+   Each such start is queued here (MAIN THREAD: TalkNote, TalkOffDrain) and ended with the engine's own endDialogue(dlg, true) at the
+   next safe point while live reads still show that conversation and nothing of ours holds it (CopyOwnEndDrain). The start itself
+   always runs - a copy's reactions (crime witnessing and the rest) still happen on this game. */
+struct CopyOwnEntry { void* dlg; void* me; unsigned int uid; int ev; unsigned int queuedMs; int bubbleSeen; };   /* queuedMs: when its start was queued (GetTickCount); bubbleSeen: already kept once for a showing bubble */
+const size_t kCopyOwnCap = 64;
+std::vector<CopyOwnEntry> g_copyOwn;   /* MAIN THREAD */
+long long g_copyOwnQueued = 0, g_copyOwnEnded = 0, g_copyOwnNotBusy = 0, g_copyOwnBubble = 0, g_copyOwnChanged = 0, g_copyOwnHeld = 0,
+          g_copyOwnGone = 0, g_copyOwnFull = 0, g_copyOwnPromptYield = 0, g_copyOwnBubbleWait = 0, g_copyOwnTeardown = 0;
+/* MAIN THREAD. A newer start on a Dialogue already waiting replaces that entry (its age starts again); a full list counts the new one
+   (full) and drops it. */
+static void CopyOwnQueue(void* dlg, void* me, unsigned int uid, int ev)
+{
+    for (size_t k = 0; k < g_copyOwn.size(); ++k)
+        if (g_copyOwn[k].dlg == dlg)
+        {
+            g_copyOwn[k].me = me; g_copyOwn[k].uid = uid; g_copyOwn[k].ev = ev;
+            g_copyOwn[k].queuedMs = (unsigned int)::GetTickCount(); g_copyOwn[k].bubbleSeen = 0;
+            ++g_copyOwnQueued;
+            return;
+        }
+    if (g_copyOwn.size() >= kCopyOwnCap) { ++g_copyOwnFull; return; }
+    CopyOwnEntry e;
+    e.dlg = dlg; e.me = me; e.uid = uid; e.ev = ev; e.queuedMs = (unsigned int)::GetTickCount(); e.bubbleSeen = 0;
+    g_copyOwn.push_back(e);
+    ++g_copyOwnQueued;
+}
+/* MAIN THREAD (CopyOwnEndDrain). An entry kept for a showing bubble goes back on the list - unless a newer start on the same Dialogue
+   was queued meanwhile (that one stands) or the list is full (counted as full, dropped). */
+static void CopyOwnRequeue(const CopyOwnEntry& e)
+{
+    for (size_t k = 0; k < g_copyOwn.size(); ++k)
+        if (g_copyOwn[k].dlg == e.dlg) return;
+    if (g_copyOwn.size() >= kCopyOwnCap) { ++g_copyOwnFull; return; }
+    g_copyOwn.push_back(e);
+}
+
+/* P26 stage 0: one start, AFTER the original ran. player = startPlayerConversation. MAIN THREAD. Reads and counts; T-719: a copy's own
+   start is queued for the safe point's end (CopyOwnQueue). */
 void TalkNote(int player, void* dlg, void* who, void* line, int ev, unsigned long long ret)
 {
     const int started = (ret & 0xFF) != 0 ? 1 : 0;
@@ -523,6 +667,7 @@ void TalkNote(int player, void* dlg, void* who, void* line, int ev, unsigned lon
         if (sk == coopsay::kTalkTargetNpcCopy) ++g_talkBySpeakerCopy;
         if (window) ++g_talkWindow;
         if (ev < 0) ++g_talkDirect; else ++g_talkByEvent[coopsay::TalkEventBucket(ev)];
+        if (!player && me != 0 && (sk == coopsay::kTalkTargetNpcCopy || sk == coopsay::kTalkTargetPartnerCopy)) CopyOwnQueue(dlg, me, suid, ev);   /* T-719 */
         if (g_talkStartLogged >= kTalkStartLogLimit && !g_talkLever && !g_talkSightCall) return;   /* P26 stage 6: talksight's starts always logged */
         if (!g_talkLever && !g_talkSightCall) ++g_talkStartLogged;
     }
@@ -827,6 +972,22 @@ void TkLogFail(const std::string& s)
     if (g_tkFailLogged >= kTkFailLogCap) return;
     ++g_tkFailLogged;
     DebugLog(s);
+}
+
+/* T-726: the P25 request lines (request sent, NOT requested, NOT started on either game, no answer) - a throttle per kind (the first 5,
+   then every 100th, the line saying which one it is) instead of the lifetime caps above, so a long session keeps saying what became
+   of the clicks. */
+const int kTkP25LogSent = 0, kTkP25LogNotRequested = 1, kTkP25LogNotStartedB = 2, kTkP25LogNotStartedA = 3, kTkP25LogNoAnswer = 4,
+          kTkP25LogKinds = 5;
+long long g_tkP25LogN[kTkP25LogKinds];
+void TkLogP25(int kind, const std::string& s)
+{
+    const long long n = ++g_tkP25LogN[kind];
+    if (!cooptalk::TalkLogNthDue(n)) return;
+    if (n <= 5) { DebugLog(s); return; }
+    char t[64];
+    std::sprintf(t, " (line %lld of this kind)", n);
+    DebugLog(s + t);
 }
 
 /* 1 = who is a character of a peer's stand-in faction (a copy the other player drives). ANY THREAD: one guarded read, then
@@ -1145,6 +1306,40 @@ void* TkWindowDlg()
     if (kDialogueWindowRva == 0 || g_base == 0) return (void*)1;
     void* w = SayReadPtr((void*)(g_base + (uintptr_t)kDialogueWindowRva), 0);
     return (w != 0) ? SayReadPtr(w, kWinDialogue) : 0;
+}
+
+/* T-726: 1 = who is this game's own player-faction character - the test TkP25Intercept makes (the uid registry, the any-thread owned
+   mirror, the faction's player flag). ANY THREAD: one guarded read and address compares; no C++ object. */
+int TkOrderIsMine(void* who)
+{
+    const unsigned int wu = FindSpawnedUid(who);
+    if (wu == 0 || !net::IsUidMineAnyThread(wu)) return 0;
+    ::Faction* const wf = (::Faction*)SayReadPtr(who, kRootFaction);
+    return (wf != 0 && IsPlayerFaction(wf)) ? 1 : 0;
+}
+
+/* T-726: one talk order's plain values into the ring, after its sendEvent returned. ANY THREAD: guarded reads of the Dialogue the
+   engine has just used, address compares, Interlocked ops; no lock, no allocation, no log; the thread's last error kept. busyCopy:
+   not reached while the NPC is a copy whose Dialogue reads busy (the engine's own test) - not a cause of its own (sendEvent goes
+   on to startPlayerConversation for event 1 whether the Dialogue is busy or not), shown beside the refusal line; site = the engine call site (an NPC's own
+   walk-over arrival, Task_TalktoPlayer, also sends event 1 toward this game's player). A full slot is counted, never waited on. */
+void TkOrderFinish(const TkOrderCtx* oc, void* dlg, void* who, void* ret)
+{
+    const DWORD le = ::GetLastError();
+    ::InterlockedIncrement64(&g_tkOrders);
+    void* const me = SayReadPtr(dlg, kDlgMe);
+    const unsigned int nuid = (me != 0) ? FindSpawnedUid(me) : 0;
+    const int busyCopy = (!oc->reached && nuid != 0 && !net::IsUidMineAnyThread(nuid) && TkDlgBusy(dlg)) ? 1 : 0;
+    const unsigned long slot = (unsigned long)::InterlockedIncrement(&g_tkOrderHead) & (unsigned long)(kTkOrderRing - 1);
+    TkOrderEntry& e = g_tkOrderRing[slot];
+    if (::InterlockedCompareExchange(&e.state, 1, 0) != 0) { ::InterlockedIncrement64(&g_tkOrderDropped); ::SetLastError(le); return; }
+    e.dlg = dlg; e.me = me; e.who = who; e.nuid = nuid; e.tuid = FindSpawnedUid(who); e.tid = ::GetCurrentThreadId();
+    e.set = oc->set; e.reached = oc->reached; e.hadLine = oc->hadLine; e.started = oc->started; e.busyCopy = busyCopy;
+    e.convEv = TkReadIntPod(dlg, kDlgConvEvent); e.gateDist = oc->gateDist;
+    e.site = (g_base != 0 && (uintptr_t)ret > g_base) ? (unsigned long long)((uintptr_t)ret - g_base) : 0;
+    ::InterlockedExchange(&e.state, 2);   /* a full barrier: the fields above are visible before 'ready' */
+    ::InterlockedIncrement(&g_tkOrderPending);
+    ::SetLastError(le);
 }
 
 /* A, MAIN THREAD: the PROMPT for the conversation now on dlg. 1 built; 0 no current line (the engine already ended it); -1 a
@@ -1553,8 +1748,9 @@ void* detour_p25ViewPoint(void* pi, void* out)
 
 /* P25: B - the engine's own talk gate for who, as startPlayerConversation makes it (683890:31-34): who's position (vt +0x40) within
    the gate float (0x16FF49C) of this game's view point (0x7F1DC0 on the PlayerInterface). 1 passes, 0 not (the engine would not
-   start either), -1 cannot be told (a fault / no row). ANY THREAD, no C++ object. */
-int TkP25GatePod(void* who)
+   start either), -1 cannot be told (a fault / no row). ANY THREAD, no C++ object. T-726: *distOut (when given) = who's distance from
+   the view point. */
+int TkP25GatePod(void* who, float* distOut = 0)
 {
     if (who == 0 || g_base == 0 || kP25ViewPointRva == 0 || kP25GateDistRva == 0 || kP25PlayerIfaceRva == 0) return -1;
     __try
@@ -1569,25 +1765,29 @@ int TkP25GatePod(void* who)
         ((P25GetPosFn)vt[0x40 / sizeof(void*)])(who, w);
         const float gate = *(const float*)(g_base + (uintptr_t)kP25GateDistRva);
         const float dx = w[0] - v[0], dy = w[1] - v[1], dz = w[2] - v[2];
+        if (distOut != 0) *distOut = sqrtf(dx * dx + dy * dy + dz * dz);
         return (dx * dx + dy * dy + dz * dz <= gate * gate) ? 1 : 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
 /* P25: B - one intercepted click into the ring (a click already waiting on the same Dialogue is not queued twice). ANY THREAD:
-   Interlocked only, no allocation, no log. 1 queued (or already waiting), 0 the ring is full (the click does nothing). */
+   Interlocked only, no allocation, no log. 1 queued (or already waiting), 0 the ring is full (the click does nothing). T-726: the
+   running talk order is told which. */
 int TkP25Queue(void* dlg, void* me, void* who, void* line)
 {
     for (int i = 0; i < kTkReqSlots; ++i)
-        if (g_tkReqSlots[i].state == 2 && g_tkReqSlots[i].dlg == dlg) { ::InterlockedIncrement64(&g_p25Dup); return 1; }
+        if (g_tkReqSlots[i].state == 2 && g_tkReqSlots[i].dlg == dlg) { ::InterlockedIncrement64(&g_p25Dup); TkOrderSetFor(dlg, cooptalk::kTalkOrderDup, -1.0f); return 1; }
     for (int i = 0; i < kTkReqSlots; ++i)
     {
         if (::InterlockedCompareExchange(&g_tkReqSlots[i].state, 1, 0) != 0) continue;
         g_tkReqSlots[i].dlg = dlg; g_tkReqSlots[i].me = me; g_tkReqSlots[i].who = who; g_tkReqSlots[i].line = line;
         ::InterlockedExchange(&g_tkReqSlots[i].state, 2);
+        TkOrderSetFor(dlg, cooptalk::kTalkOrderIntercepted, -1.0f);
         return 1;
     }
     ::InterlockedIncrement64(&g_p25RingFull);
+    TkOrderSetFor(dlg, cooptalk::kTalkOrderRingFull, -1.0f);
     return 0;
 }
 
@@ -1618,8 +1818,14 @@ int TkP25Intercept(void* dlg, void* who, void* line)
         ::InterlockedExchange(&g_p25MissUid, (LONG)wu);
     }
     if (!cooptalk::TalkP25Intercept(1, own, spk, TkPeerTarget(me), 0)) return 0;
-    const int gate = TkP25GatePod(who);
-    if (gate == 0) { ::InterlockedIncrement64(&g_p25GateLocal); return 0; }   /* the engine's own gate refuses it here too: as before */
+    float gateDist = -1.0f;
+    const int gate = TkP25GatePod(who, &gateDist);
+    if (gate == 0)   /* the engine's own gate refuses it here too: as before */
+    {
+        ::InterlockedIncrement64(&g_p25GateLocal);
+        TkOrderSetFor(dlg, cooptalk::kTalkOrderGate, gateDist);   /* T-726 */
+        return 0;
+    }
     if (gate < 0) ::InterlockedIncrement64(&g_p25GateUnread);
     ::InterlockedIncrement64(&g_p25LocalHeld);
     TkP25Queue(dlg, me, who, line);
@@ -1687,6 +1893,8 @@ unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)
        with no free mark the start is refused (the NPC simply does not start - never a window for the other player's character) */
     /* P26s1 fold 1 H1: a start on a MARKED Dialogue toward anyone else releases the mark first (TkRelease). */
     int mark = -1, created = 0;
+    TkOrderCtx* const oc = TkOrderCur();   /* T-726: this game's player's talk order on this Dialogue reached the start, with a line or not */
+    if (oc != 0 && oc->dlg == dlg && !oc->reached) { oc->reached = 1; oc->hadLine = (line != 0) ? 1 : 0; }
     if (g_tkOn && dlg != 0)
     {
         if (TkPeerTarget(who))
@@ -1728,6 +1936,12 @@ unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)
     const int scoped = (mark >= 0 && g_p25ViewHook == 1 && gti != TLS_OUT_OF_INDEXES && TkS6Owner(SayReadPtr(dlg, kDlgMe)) == 1) ? 1 : 0;
     /* P25 fold 1 C1/L3 [p25f1-C1b]: the slot, the armed count and g_tkStartingDlg are set, cleared and restored in TkP25CallStart */
     const unsigned long long r = TkP25CallStart(dlg, who, line, scoped ? &gx : 0, onMain);
+    if (oc != 0 && oc->dlg == dlg && oc->set == 0)   /* T-726: the start ran here - started, or (a line in hand) this game's camera gate refused it */
+    {
+        oc->started = (r & 0xFF) != 0 ? 1 : 0;
+        float od = -1.0f;
+        if (!oc->started && line != 0 && TkP25GatePod(who, &od) == 0) { oc->set = cooptalk::kTalkOrderGate; oc->gateDist = od; }
+    }
     if (scoped)
     {
         const float gate = (g_base != 0 && kP25GateDistRva != 0) ? *(const float*)(g_base + (uintptr_t)kP25GateDistRva) : 0.0f;
@@ -2013,6 +2227,7 @@ void InstallTalkStarters()
     /* P26 stage 0 fold 1: the off-thread event slot, allocated before InstallSpeech hooks sendEvent */
     if (g_talkTls == TLS_OUT_OF_INDEXES) g_talkTls = ::TlsAlloc();
     if (g_p25GateTls == TLS_OUT_OF_INDEXES) g_p25GateTls = ::TlsAlloc();   /* P25: the scoped camera gate's per-thread context */
+    if (g_tkOrderTls == TLS_OUT_OF_INDEXES) g_tkOrderTls = ::TlsAlloc();   /* T-726: a talk order's per-thread outcome slot (none: orders are not recorded) */
     if (g_talkTls == TLS_OUT_OF_INDEXES)
         ErrorLog("[TALK] P26 stage 0 fold 1: TlsAlloc failed - an off-thread startPlayerConversation logs ev=direct");
     if (kDialogueStartConvRva == 0) g_startConvHook = -2;
@@ -2101,6 +2316,7 @@ void InstallSpeech()
 {
     g_base = (uintptr_t)::GetModuleHandleA(0);
     InstallTalkStarters();   /* P26 stage 0: log-only starters, independent of the say / sendEvent hooks below */
+    TalkCursorInstall();     /* T-737: after InstallTalkStarters, which decides whether the P25 road is on */
     if (kDialogueSayRva == 0)
     {
         ErrorLog("[SAY] the address table gave Dialogue::say no address - NPC speech bubbles are NOT carried between"
@@ -2248,6 +2464,24 @@ static void CrimeTestSkip(LONG kind, const std::string& why)
     DebugLog(std::string(kind == 5 ? "[CRIME] crimetest attacknear NOT ORDERED: " : "[CRIME] crimetest skipped: ") + why);
 }
 
+/* T-746 (fold 3): how many other living, conscious characters of faction `f`, not in a bed, cage or furniture, stand within
+   kCrimeWitnessSightUnits of `at` (the victim's position) - the registered characters the lever's own walk visits. MAIN THREAD. */
+static int CrimeWitnessesNear(::Character* victim, ::Faction* f, const Ogre::Vector3& at, int cap)
+{
+    int n = 0;
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int u = 0; ::Character* c = 0; ::Faction* wf = 0; Ogre::Vector3 q;
+        if (!MirrorSlot(i, &u, &c) || u == 0 || c == victim) continue;
+        if (!CrimeFactionOf(c, &wf) || wf != f) continue;
+        if (CrimeIsDead(c) != 0 || IsDownedCharacter(c) || CrimeInSomethingPod(c) != 0) continue;
+        if (!SafeReadPosition(c, &q)) continue;
+        const float dx = q.x - at.x, dz = q.z - at.z;
+        if (dx * dx + dz * dz <= kCrimeWitnessSightUnits * kCrimeWitnessSightUnits) ++n;
+    }
+    return n;
+}
+
 // MAIN THREAD, worker paused (called from combat.cpp detour_tsRagdollUpdates, before the engine's own drain).
 void CrimeTestDrain()
 {
@@ -2269,6 +2503,7 @@ void CrimeTestDrain()
     const float maxDist = g_crimeTestFactionSid.empty() ? kCrimeVictimMaxDist : kCrimeVictimMaxDistFiltered;
     ::Character* victim = 0; unsigned int vuid = 0; ::Faction* vf = 0; float best = maxDist;
     long long nSeen = 0, nPlayer = 0, nWrongFac = 0, nDead = 0, nDeadFault = 0, nDowned = 0, nUnread = 0, nFar = 0, nNoUid = 0;
+    long long nInSome = 0, nNoWit = 0; int vWit = 0;   /* T-746 (fold 3): stealnear's victim filter - in a bed / cage / furniture, no witness; the pick's witnesses */
     int walkRan = 1;
     if (kind == 5)
     {
@@ -2312,7 +2547,21 @@ void CrimeTestDrain()
         if (!SafeReadPosition(c, &q)) continue;
         const float dx = q.x - opos.x, dz = q.z - opos.z;
         const float d = sqrtf(dx * dx + dz * dz);
-        if (d < best) { best = d; victim = c; vuid = u; vf = f; }
+        if (kind == 2)
+        {
+            /* T-746 (fold 3): T1154's stealnear victim was in a bed on its owner's game and the theft read crime 0->0 - stealnear
+               takes only a living, conscious victim not in a bed, cage or furniture, with a witness of its faction in sight of it */
+            if (d >= maxDist) continue;
+            if (CrimeIsDead(c) != 0) { ++nDead; continue; }
+            if (IsDownedCharacter(c)) { ++nDowned; continue; }
+            if (CrimeInSomethingPod(c) != 0) { ++nInSome; continue; }
+            if (d >= best) continue;
+            const int wit = CrimeWitnessesNear(c, f, q, cap);
+            if (wit <= 0) { ++nNoWit; continue; }
+            vWit = wit;
+        }
+        else if (d >= best) continue;
+        best = d; victim = c; vuid = u; vf = f;
     }
     if (victim == 0 && kind == 5)
     {
@@ -2323,6 +2572,18 @@ void CrimeTestDrain()
                      " unreadable=%lld deadUnreadable=%lld far=%lld noUid=%lld) - walk: the engine's character update list%s",
                      g_crimeTestFactionSid.c_str(), maxDist, nSeen, nWrongFac, nPlayer, nDead, nDowned, nUnread, nDeadFault, nFar, nNoUid,
                      walkRan ? "" : " DID NOT RUN (no GameWorld or an implausible list size)");
+        CrimeTestSkip(kind, std::string(nb));
+        return;
+    }
+    if (victim == 0 && kind == 2)
+    {
+        /* T-746 (fold 3): which filter rejected them; no theft is attempted */
+        ++g_crimeTestNoVictim;
+        char nb[480];
+        std::sprintf(nb, "stealnear: no awake non-player%s%.60s within %.0f u (not in a bed, cage or furniture) with another character of"
+                     " its faction within %.0f u - no theft attempted (rejected: dead=%lld downed=%lld inBedCageOrFurniture=%lld"
+                     " noWitness=%lld)", g_crimeTestFactionSid.empty() ? "" : " of faction ", g_crimeTestFactionSid.c_str(), maxDist,
+                     kCrimeWitnessSightUnits, nDead, nDowned, nInSome, nNoWit);
         CrimeTestSkip(kind, std::string(nb));
         return;
     }
@@ -2352,6 +2613,14 @@ void CrimeTestDrain()
         if (ok4) ++g_crimeTestDone; else ++g_crimeTestFaulted;
         return;
     }
+    std::string vstate;   /* T-746 (fold 3): stealnear's chosen victim as this game sees it before the theft (on a copy: the copy's) */
+    if (kind == 2)
+    {
+        char vs[200];
+        std::sprintf(vs, " victimState[inSomething=%d downed=%d witnesses=%d within %.0f u] ", CrimeInSomethingPod(victim),
+                     IsDownedCharacter(victim) ? 1 : 0, vWit, kCrimeWitnessSightUnits);
+        vstate = std::string(vs) + BehaviourString(victim);
+    }
     unsigned int w[7];
     if (!CrimeReadHandFields(victim, w)) { ++g_crimeTestFaulted; DebugLog("[CRIME] crimetest skipped: the victim's hand could not be read"); return; }
     const hand h(w[5] /*index*/, w[6] /*serial*/, (itemType)w[2] /*type*/, w[3] /*container*/, w[4] /*containerStamp*/);
@@ -2371,7 +2640,7 @@ void CrimeTestDrain()
                  " crime %d->%d expiry %.1f->%.1f (notifyCrimeWitnessed 0x851F40, expiry %d, STEALING)",
                  kind == 2 ? "stealnear" : (kind == 3 ? "stealplayer" : "steal"), ok ? "CALLED" : "FAULTED", effective ? 1 : 0, ouid, vuid, net::IsUidMine(vuid) ? "mine" : "copy",
                  best, (void*)vf, w[2], w[5], w[6], before, after, expBefore, expAfter, kCrimeExpirySec);
-    DebugLog(std::string(b));
+    DebugLog(std::string(b) + vstate);   /* vstate: stealnear only */
 }
 
 std::string CrimeTestCounts()
@@ -2533,6 +2802,7 @@ static void TalkOffDrain()
         if (sk == stale || tk == stale) ++g_talkOffStale;
         ++g_talkOffBySpeaker[sk];
         ++g_talkOffByTarget[tk];
+        if (!b.player && b.me != 0 && (sk == coopsay::kTalkTargetNpcCopy || sk == coopsay::kTalkTargetPartnerCopy)) CopyOwnQueue(b.dlg, b.me, suid, b.ev);   /* T-719 */
         if (b.player) TkFromRing(b.dlg, b.who, b.ev, (b.me != 0 && sk != stale && tk != stale) ? 1 : 0);   /* P26 stages 1-3 */
         if (g_talkOffStartLogged >= kTalkOffStartLogLimit) continue;
         ++g_talkOffStartLogged;
@@ -2677,6 +2947,31 @@ static void TkApplyNextPrompt(const cooptalk::TalkMsg& m, unsigned int peer)
           + (m.deadlineMs == 0 ? std::string("no answer deadline") : "answer due within " + TkU(m.deadlineMs / 1000) + " s"));   /* P26s5 fold 5 */
 }
 
+/* T-719: B - the owner's PROMPT finds the NPC copy's Dialogue busy with a conversation of the copy's OWN (its event is not the player's
+   talk-to (1), no mark of ours, not this game's window): a leftover the engine never ends here (its bubble was dropped - the owner's
+   game shows the line). It gives way - the engine's own endDialogue(dlg, true) - and the PROMPT is shown when that freed the Dialogue.
+   1 freed, 0 not; *tried = 1 when the end was called. MAIN THREAD, K2 safe point, the world not blocked (TkSafePoint). */
+long long g_copyOwnPromptLogN = 0;
+static int TkCopyOwnYield(const cooptalk::TalkMsg& m, void* dlg, int* tried)
+{
+    *tried = 0;
+    const int ev = TkReadIntPod(dlg, kDlgConvEvent);
+    if (ev == 1 || TkMarkFind(dlg) >= 0 || TkWindowDlg() == dlg) return 0;
+    const int hadLine = (SayReadPtr(dlg, kDlgCurLine) != 0) ? 1 : 0;
+    *tried = 1;
+    TkEndPod(dlg);
+    if (TkDlgBusy(dlg)) return 0;
+    ++g_copyOwnPromptYield;
+    if (cooptalk::TalkLogNthDue(++g_copyOwnPromptLogN))
+    {
+        char b[320];
+        std::sprintf(b, "[TALK] B PROMPT conv=%u npc uid=%u: the NPC copy was still in its own conversation here (ev=0x%X, currentLine %s)"
+                     " - ended it; the NPC's game decides", m.convId, m.npcUid, (unsigned int)ev, hadLine ? "set" : "none");
+        DebugLog(std::string(b));
+    }
+    return 1;
+}
+
 /* B: the PROMPT - show the NPC copy's line to this game's own character in this game's own window, or answer why not. */
 static void TkApplyPrompt(const cooptalk::TalkMsg& m, unsigned int peer)
 {
@@ -2734,6 +3029,7 @@ static void TkApplyPrompt(const cooptalk::TalkMsg& m, unsigned int peer)
     void* line = 0;
     void* win = 0;
     void* tdlg = 0;
+    int yieldTried = 0;   /* T-719 */
     if (why.empty())
     {
         if (npc == 0 || !net::UidOwnedByPeer(m.npcUid, peer)) { res = cooptalk::kTalkAnsNoChar; why = "no copy of that NPC from the sending game here"; }
@@ -2743,11 +3039,12 @@ static void TkApplyPrompt(const cooptalk::TalkMsg& m, unsigned int peer)
         else if ((win = TkWindowDlg()) != 0 && win != (void*)1
                  && !(g_tkMirror.active && win == g_tkMirror.dlg && cooplive::SamePlayer(g_tkMirror.peer, peer, coop::LinkPeerSlot()) && g_tkMirror.convId == m.convId))   /* P26s1 fold 2: stage 4's next-line PROMPT */
         { res = cooptalk::kTalkAnsBusy; why = "this game's dialogue window already shows a conversation"; }
-        else if (TkDlgBusy(dlg))
+        else if (TkDlgBusy(dlg) && !TkCopyOwnYield(m, dlg, &yieldTried))   /* T-719: a leftover of the copy's own gives way first */
         {
             res = cooptalk::kTalkAnsBusy;
             why = "the NPC copy is already in a conversation here (currentLine " + std::string(SayReadPtr(dlg, kDlgCurLine) != 0 ? "set" : "none")
-                  + ", event +0x188=" + TkI(TkReadIntPod(dlg, kDlgConvEvent)) + ")";
+                  + ", event +0x188=" + TkI(TkReadIntPod(dlg, kDlgConvEvent)) + ")"
+                  + (yieldTried ? " - ending the copy's own conversation did not free it" : "");
         }
         else if ((tdlg = TkDialogueOf(tgt)) != 0 && TkDlgBusy(tdlg))
         {
@@ -3461,7 +3758,7 @@ static void TkApplyEnd(const cooptalk::TalkMsg& m, unsigned int peer)
         {
             g_p25Pend.active = 0;
             ++g_p25WhyB[(m.why > 0 && m.why < cooptalk::kTalkWhyCount) ? m.why : 0];
-            TkLogFail("[TALK] P25 req=" + TkU(m.reqId) + " npc uid=" + TkU(m.npcUid) + " NOT started on the NPC's game: "
+            TkLogP25(kTkP25LogNotStartedB, "[TALK] P25 req=" + TkU(m.reqId) + " npc uid=" + TkU(m.npcUid) + " NOT started on the NPC's game: "
                       + cooptalk::TalkWhyName(m.why) + " - the click does nothing here (one world: no local-only conversation)");
         }
         else
@@ -3499,7 +3796,7 @@ static void TkP25NotStarted(const cooptalk::TalkMsg& m, unsigned int peer, int w
     e.kind = cooptalk::kTalkEnd; e.convId = 0; e.npcUid = m.npcUid; e.targetUid = m.targetUid;
     e.reason = cooptalk::kTalkEndNotStarted; e.reqId = m.reqId; e.why = why;
     const int sent = net::SendTalk(e) ? 1 : 0;
-    TkLogFail("[TALK] P25 request req=" + TkU(m.reqId) + " npc uid=" + TkU(m.npcUid) + " <- talker uid=" + TkU(m.targetUid) + " from peer "
+    TkLogP25(kTkP25LogNotStartedA, "[TALK] P25 request req=" + TkU(m.reqId) + " npc uid=" + TkU(m.npcUid) + " <- talker uid=" + TkU(m.targetUid) + " from peer "
               + TkU(peer) + " NOT started: " + cooptalk::TalkWhyName(why) + " (" + detail + ") - END NOT_STARTED " + (sent ? "sent" : "FAILED (link down)"));
 }
 
@@ -3595,6 +3892,7 @@ static void TkP25Drain()
         TkLogFail("[TALK] P25 my uid=" + TkU(missUid) + " clicked an NPC copy the other game drives while the any-thread owned mirror did not list"
                   " that uid - the conversation ran HERE, locally (no REQUEST)");
     }
+    g_tkOrderP25N = 0;   /* T-726: this safe point's clicks, for TalkOrderDrain */
     TkReqSlot got[kTkReqSlots];
     int n = 0;
     for (int i = 0; i < kTkReqSlots; ++i)
@@ -3625,6 +3923,7 @@ static void TkP25Drain()
                     ? TkStartPod((StartPlayerConvFn)(g_base + (uintptr_t)kDialogueStartPlayerConvRva), dlg, who, got[k].line, &st) : 0;
                 g_p25NoIntercept = 0;
                 ++g_p25Relocal;
+                TkOrderP25Note(dlg, 3, 0, 0, st);   /* T-726 */
                 TkLog("[TALK] P25 click on npc uid=" + TkU(nuid) + " '" + TkNameStr(me) + "': the NPC is this game's after all - the engine's own"
                       " start runs here (called=" + TkI(called) + " started=" + TkI(st) + ")");
                 continue;
@@ -3655,9 +3954,10 @@ static void TkP25Drain()
                 g_p25Pend.active = 1; g_p25Pend.reqId = q.reqId; g_p25Pend.peer = peer; g_p25Pend.npcUid = nuid; g_p25Pend.targetUid = tuid;
                 g_p25Pend.tick = ::GetTickCount();
                 ++g_p25ReqSent;
+                TkOrderP25Note(dlg, 1, q.reqId, 0, 0);   /* T-726 */
                 if (got[k].line == 0) ++g_p25ReqNoLine;   /* P25 fold 2 [p25f2-b4] */
                 const std::string copyLine = (got[k].line != 0) ? TkLineSid(got[k].line) : std::string();
-                TkLog("[TALK] P25 request sent req=" + TkU(q.reqId) + " npc uid=" + TkU(nuid) + " '" + TkNameStr(me) + "' (a copy peer " + TkU(peer)
+                TkLogP25(kTkP25LogSent, "[TALK] P25 request sent req=" + TkU(q.reqId) + " npc uid=" + TkU(nuid) + " '" + TkNameStr(me) + "' (a copy peer " + TkU(peer)
                       + " drives) <- my uid=" + TkU(tuid) + " '" + TkNameStr(who) + "' - no local window: the NPC's game runs the conversation"
                       + "; the copy's line here=" + (got[k].line == 0 ? std::string("none (the NPC's game decides)")
                                                      : (copyLine.empty() ? std::string("? (unreadable)") : copyLine)));
@@ -3665,7 +3965,8 @@ static void TkP25Drain()
             }
         }
         ++g_p25WhyB[why];
-        TkLogFail("[TALK] P25 click on npc uid=" + TkU(nuid) + " by my uid=" + TkU(tuid) + " NOT requested: " + cooptalk::TalkWhyName(why) + " ("
+        TkOrderP25Note(dlg, 2, 0, why, 0);   /* T-726 */
+        TkLogP25(kTkP25LogNotRequested, "[TALK] P25 click on npc uid=" + TkU(nuid) + " by my uid=" + TkU(tuid) + " NOT requested: " + cooptalk::TalkWhyName(why) + " ("
                   + detail + ") - the click does nothing (one world: no local-only conversation)");
     }
 }
@@ -3676,7 +3977,7 @@ static void TkP25Timeouts()
     if (!g_p25Pend.active || (unsigned long)(::GetTickCount() - g_p25Pend.tick) < (unsigned long)cooptalk::kTalkReqWaitMs) return;
     g_p25Pend.active = 0;
     ++g_p25WhyB[cooptalk::kTalkWhyNoAnswer];
-    TkLogFail("[TALK] P25 req=" + TkU(g_p25Pend.reqId) + " npc uid=" + TkU(g_p25Pend.npcUid) + " got no answer from the NPC's game within 30 s"
+    TkLogP25(kTkP25LogNoAnswer, "[TALK] P25 req=" + TkU(g_p25Pend.reqId) + " npc uid=" + TkU(g_p25Pend.npcUid) + " got no answer from the NPC's game within 30 s"
               " - the click does nothing");
 }
 
@@ -4237,9 +4538,17 @@ static void TkLinkLaterRun()
           + TkI(ended) + ")");
 }
 
+/* T-737: the talk cursor ('TALK CURSOR' below) */
+void TalkCursorApplyAsk(const cooptalk::TalkMsg& m, unsigned int peer);
+void TalkCursorApplyAnswer(const cooptalk::TalkMsg& m, unsigned int peer);
+void TalkCursorDrain();
+void TalkCursorForgetPeer(unsigned int peer);
+std::string TalkCursorCountsString();
+
 static void TkSafePoint()
 {
     ::InterlockedIncrement(&g_tkGen);
+    g_tkOrderP25N = 0;   /* T-726: TkP25Drain (below) writes this safe point's notes; cleared first, so a return before it leaves no note of an earlier safe point for TalkOrderDrain to match */
     if (EngineWritesBlocked()) return;   /* held: the inbound queue and the lever wait for the world */
     TkLinkLaterRun();   /* P26 stage 4 */
     TkRunEndLater();
@@ -4280,6 +4589,8 @@ static void TkSafePoint()
         else if (m.kind == cooptalk::kTalkAct) TkApplyAct(m, in[k].peer);               /* P26 stage 5: B */
         else if (m.kind == cooptalk::kTalkActResult) TkApplyActResult(m, in[k].peer);   /* P26 stage 5: A */
         else if (m.kind == cooptalk::kTalkRequest) TkApplyRequest(m, in[k].peer);       /* P25: A */
+        else if (m.kind == cooptalk::kTalkCursorAsk) TalkCursorApplyAsk(m, in[k].peer);         /* T-737: the NPC's game */
+        else if (m.kind == cooptalk::kTalkCursorAnswer) TalkCursorApplyAnswer(m, in[k].peer);   /* T-737: the asker */
         else ++g_tkBad;
     }
     TkP25Drain();      /* P25: B - this game's clicks on the other game's NPCs */
@@ -4718,6 +5029,7 @@ void TalkForgetPeer(unsigned int peer)
        gone) also ends the not-forwarded ones still waiting */
     const int blocked = EngineWritesBlocked() ? 1 : 0;
     const int all = (peer == kTalkAllPeers) ? 1 : 0;
+    TalkCursorForgetPeer(peer);   /* T-737: that player's talk-cursor answers */
     for (int i = 0; i < kTkPurseSlots; ++i)   /* that player's reported purses are not used again */
         if (::InterlockedCompareExchange64(&g_tkPurse[i].v, 0, 0) != 0
             && (all || cooplive::SamePlayer(g_tkPurse[i].peer, peer, coop::LinkPeerSlot())))
@@ -6085,10 +6397,318 @@ static void P114GateLine(void* dlg, void* npc, void* talker, unsigned int nuid, 
                  ownCls, ownSlot, (ownCls == 1) ? 1 : 0);
 }
 /* PROBE-END: P114 */
+
+/* T-719: the copy's-own-conversation queue, at the K2 safe point (MAIN THREAD, worker paused). Every entry is judged by live reads now
+   (coopsay::CopyOwnEndAction): the copy and its Dialogue still there (TkLiveOwner), its uid still not this game's, the engine's busy
+   test, +0x188 still the start's event, no bubble (+0x228), nothing of ours holding it (the P26 mirror, a P26 mark, this game's
+   dialogue window). End = the engine's own endDialogue(dlg, true). An entry with a bubble showing is kept for the next safe point
+   (when the bubble goes the engine can go on to the copy's next line, which is dropped here) and dropped only once
+   coopsay::kCopyOwnBubbleWaitMs have passed since its start (bubbleWait counts the entries kept, bubble the ones dropped). With no
+   world, or while the engine tears it down, the list is emptied (teardown: every pointer in it goes with the world); while the
+   world is otherwise blocked the entries wait for the next safe point. Lines: the first 5 of each kind, then every 100th. */
+long long g_copyOwnLogN[6];   /* by CopyOwnEndAction result: [kCopyOwnEnd] ended, the rest left to the engine */
+static const char* CopyOwnSkipText(int a)
+{
+    switch (a)
+    {
+    case coopsay::kCopyOwnSkipBubble:  return "a bubble kept showing for 30 s after the start - no longer watched";   /* kCopyOwnBubbleWaitMs */
+    case coopsay::kCopyOwnSkipChanged: return "a newer conversation";
+    case coopsay::kCopyOwnSkipHeld:    return "held by a forwarded or mirrored talk";
+    case coopsay::kCopyOwnSkipGone:    return "the copy is gone";
+    default:                           return "no longer busy";
+    }
+}
+static void CopyOwnEndDrain()
+{
+    if (g_copyOwn.empty()) return;
+    if (coop::GameWorldPtr() == 0 || StoreTearingDown() != 0)   /* no world, or the engine is freeing it: every queued pointer goes with it */
+    {
+        g_copyOwnTeardown += (long long)g_copyOwn.size();
+        g_copyOwn.clear();
+        return;
+    }
+    if (EngineWritesBlocked()) return;   /* loading: the entries wait for the next safe point */
+    const unsigned int now = (unsigned int)::GetTickCount();
+    std::vector<CopyOwnEntry> q;
+    q.swap(g_copyOwn);
+    for (size_t k = 0; k < q.size(); ++k)
+    {
+        const CopyOwnEntry& e = q[k];
+        const int live = TkLiveOwner(e.dlg, e.me);
+        const int stillCopy = (live && (e.uid != 0 ? (FindSpawnedUid(e.me) == e.uid && !net::IsUidMine(e.uid)) : TkPeerTarget(e.me) != 0)) ? 1 : 0;
+        const int busy = live ? TkDlgBusy(e.dlg) : 0;
+        const int evNow = live ? TkReadIntPod(e.dlg, kDlgConvEvent) : 0;
+        const int bubble = (live && SayReadPtr(e.dlg, 0x228) != 0) ? 1 : 0;   /* Dialogue::speechBubblePanel */
+        const int held = (live && ((g_tkMirror.active && e.dlg == g_tkMirror.dlg) || TkMarkFind(e.dlg) >= 0 || TkWindowDlg() == e.dlg)) ? 1 : 0;
+        const int act = coopsay::CopyOwnEndAction(live, stillCopy, busy, evNow, e.ev, bubble, held);
+        if (act == coopsay::kCopyOwnEnd)
+        {
+            const int called = TkEndPod(e.dlg);
+            const int freed = (called && !TkDlgBusy(e.dlg)) ? 1 : 0;
+            if (called) ++g_copyOwnEnded;
+            if (!cooptalk::TalkLogNthDue(++g_copyOwnLogN[coopsay::kCopyOwnEnd])) continue;
+            char nb[48], b[400];
+            TalkName((::Character*)e.me, nb);
+            if (!called)
+                std::sprintf(b, "[TALK] copy uid=%u '%s' own conversation ev=0x%X NOT ended: the engine's endDialogue could not be called (no address, or it faulted)",
+                             e.uid, nb, (unsigned int)evNow);
+            else
+                std::sprintf(b, "[TALK] copy uid=%u '%s' own conversation ev=0x%X ended at the safe point (no bubble here; the owner's game shows its line) - %s",
+                             e.uid, nb, (unsigned int)evNow, freed ? "the Dialogue is free" : "the Dialogue still reads busy");
+            DebugLog(std::string(b));
+            continue;
+        }
+        if (act == coopsay::kCopyOwnSkipGone) ++g_copyOwnGone;
+        else if (act == coopsay::kCopyOwnSkipNotBusy) ++g_copyOwnNotBusy;
+        else if (act == coopsay::kCopyOwnSkipBubble)
+        {
+            if (coopsay::CopyOwnBubbleKeep(e.queuedMs, now))   /* the bubble's own timers run: judged again at the next safe point */
+            {
+                if (!e.bubbleSeen) ++g_copyOwnBubbleWait;
+                CopyOwnEntry r = e;
+                r.bubbleSeen = 1;
+                CopyOwnRequeue(r);
+                continue;
+            }
+            ++g_copyOwnBubble;
+        }
+        else if (act == coopsay::kCopyOwnSkipChanged) ++g_copyOwnChanged;
+        else ++g_copyOwnHeld;
+        if (act < 0 || act > 5 || !cooptalk::TalkLogNthDue(++g_copyOwnLogN[act])) continue;
+        char b[240];
+        std::sprintf(b, "[TALK] copy uid=%u own conversation ev=0x%X left to the engine: %s", e.uid, (unsigned int)e.ev, CopyOwnSkipText(act));
+        DebugLog(std::string(b));
+    }
+}
+
+static std::string CopyOwnCountsString()
+{
+    char b[400];
+    std::sprintf(b, " copyOwnEnd[queued,ended,notBusy,bubble,changed,held,gone,full,promptYield,bubbleWait,teardown]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_copyOwnQueued, g_copyOwnEnded, g_copyOwnNotBusy, g_copyOwnBubble, g_copyOwnChanged, g_copyOwnHeld, g_copyOwnGone,
+                 g_copyOwnFull, g_copyOwnPromptYield, g_copyOwnBubbleWait, g_copyOwnTeardown);
+    return std::string(b);
+}
+
+/* T-726: the engine's own refusals of event 1 before it chooses a line, in the order Dialogue::sendEvent makes them, read from the
+   fields it tests (decomp_683f00): repeat = this event's repeat timer at +0xD0 (TkOrdRepeatTimer; refused while above the engine's
+   constant, 0.0 in the 1.0.65 exe); died = hasDied(me), the byte +0x5BC (the Character_hasDied row's whole body is that read);
+   leadBusy = no current conversation (+0x190), no parked interrupt (+0xC8), and the conversation master (hand +0x2A0) a character
+   whose own Dialogue (+0x280) has not ended (conversationHasEnded 0x6711D0 replayed); down = unconscious (+0x5B9) or dead (+0x5BC);
+   indoorsTest = the indoors test refuses (the hand type at +0x88 not 0xB, and not inside a building whose interior +0x1F0 -> +0x10
+   is set). busy = a current conversation (+0x190): NOT a refusal of its own - when set it only switches the lead test off. Not
+   read: the war-campaign test 0x9C3CC0(who) (no address row; it runs only when +0xC8 is empty). -1 = unreadable. MAIN THREAD
+   (hand lookups); no C++ object (C2712). */
+static int TkOrdRd(const void* base, size_t off, void* out, size_t n)
+{
+    if (base == 0) return 0;
+    __try { std::memcpy(out, (const char*)base + off, n); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void* TkOrdHandChar(const void* h)
+{
+    __try { return (void*)((const ::hand*)h)->getCharacter(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void* TkOrdHandBuilding(const void* h)
+{
+    __try { return (void*)((const ::hand*)h)->asBuilding(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* conversationHasEnded 0x6711D0 replayed on a Dialogue: 1 ended, 0 running, -1 unreadable. */
+static int TkOrdEnded(const void* d)
+{
+    unsigned char he = 0; unsigned long long p228 = 0, b = 0, e = 0; int t2c8 = 0;
+    if (!TkOrdRd(d, 0x148, &he, 1) || !TkOrdRd(d, 0x228, &p228, 8) || !TkOrdRd(d, 0x2C8, &t2c8, 4)) return -1;
+    if (he != 0 && p228 == 0 && t2c8 == 0xB) return 1;
+    if (!TkOrdRd(d, 0x80, &b, 8) || !TkOrdRd(d, 0x88, &e, 8)) return -1;
+    if (e < b || e - b > 4 * 256) return -1;
+    for (unsigned long long q = b; q < e; q += 4) { int v = 0; if (!TkOrdRd((const void*)q, 0, &v, 4)) return -1; if (v == 1) return 1; }
+    return 0;
+}
+/* Dialogue +0xD0: the per-event repeat timer, a tree map (event int -> float) that sendEvent looks up first through 0x6A3C10 - which
+   inserts a missing key, so it is never called here. Walked as that lookup walks it (Confirmed bytes, 1.0.65 0x6A3C10): the head
+   node at map +0x8, the root at head +0x8; a node's left / right at +0x0 / +0x10, key at +0x18, value at +0x1C, 'is nil' byte at
+   +0x21. 1 = found (*t), 0 = no entry (the engine would insert 0.0, which passes), -1 = unreadable or deeper than 64. */
+static int TkOrdRepeatTimer(const void* dlg, int ev, float* t)
+{
+    void* head = 0; void* x = 0;
+    if (!TkOrdRd(dlg, 0xD0 + 0x8, &head, 8) || head == 0 || !TkOrdRd(head, 0x8, &x, 8)) return -1;
+    void* best = head;
+    int k = 0;
+    for (; k < 64; ++k)
+    {
+        unsigned char nil = 1; int key = 0; void* nx = 0;
+        if (x == 0 || !TkOrdRd(x, 0x21, &nil, 1)) return -1;
+        if (nil != 0) break;
+        if (!TkOrdRd(x, 0x18, &key, 4)) return -1;
+        if (key < ev) { if (!TkOrdRd(x, 0x10, &nx, 8)) return -1; }
+        else { best = x; if (!TkOrdRd(x, 0x0, &nx, 8)) return -1; }
+        x = nx;
+    }
+    if (k == 64) return -1;
+    if (best == head) return 0;
+    int bk = 0;
+    if (!TkOrdRd(best, 0x18, &bk, 4)) return -1;
+    if (ev < bk) return 0;
+    return TkOrdRd(best, 0x1C, t, 4) ? 1 : -1;
+}
+static void TkOrderGates(void* dlg, void* me, int* repeat, float* repeatT, int* died, int* busy, int* leadBusy, int* down, int* indoors)
+{
+    *repeat = TkOrdRepeatTimer(dlg, 1, repeatT);
+    void* cur = 0; void* intr = 0; void* leadDlg = 0;
+    *busy = TkOrdRd(dlg, 0x190, &cur, 8) ? (cur != 0 ? 1 : 0) : -1;
+    const int intrOk = TkOrdRd(dlg, 0xC8, &intr, 8);
+    void* const lead = TkOrdHandChar((const char*)dlg + 0x2A0);
+    const int leadEnded = (lead != 0 && TkOrdRd(lead, 0x280, &leadDlg, 8) && leadDlg != 0) ? TkOrdEnded(leadDlg) : -2;
+    *leadBusy = (*busy < 0 || !intrOk) ? -1 : ((cur == 0 && intr == 0 && lead != 0 && leadEnded == 0) ? 1 : 0);
+    unsigned char ko = 0xFF, dead = 0xFF;
+    *down = (me != 0 && TkOrdRd(me, 0x5B9, &ko, 1) && TkOrdRd(me, 0x5BC, &dead, 1)) ? ((ko == 1 || dead == 1) ? 1 : 0) : -1;
+    *died = (me != 0 && TkOrdRd(me, 0x5BC, &dead, 1)) ? (dead != 0 ? 1 : 0) : -1;   /* hasDied: the byte non-zero */
+    int inType = -1;
+    if (me == 0 || !TkOrdRd(me, 0x88, &inType, 4)) { *indoors = -1; return; }
+    void* bld = 0; void* b1f0 = 0; void* b10 = 0;
+    if (inType == 0)
+    {
+        bld = TkOrdHandBuilding((const char*)me + 0x80);
+        if (bld != 0 && TkOrdRd(bld, 0x1F0, &b1f0, 8) && b1f0 != 0) TkOrdRd(b1f0, 0x10, &b10, 8);
+    }
+    *indoors = (inType != 0xB && (inType != 0 || bld == 0 || b1f0 == 0 || b10 == 0)) ? 1 : 0;   /* event 1 is not one of the exempt events 0x27 / 6 / 0xB */
+}
+
+/* T-726: the talk orders of this game's player, at the K2 safe point after TkSafePoint (so a click sent on as a REQUEST at this safe
+   point names its req). MAIN THREAD. A pointer is read only after it checks out as a live character (TkLiveOwner / TkLiveChar).
+   Lines: the first 5 always, then one per NPC per 10 s with the orders skipped since (cooptalk::TalkOrderLogDue). */
+struct TkOrderSeen { unsigned int lastMs; unsigned int skipped; };
+std::map<unsigned int, TkOrderSeen> g_tkOrderSeen;   /* MAIN THREAD: by NPC uid (the Dialogue's address bits when unreplicated) */
+unsigned int g_tkOrderLogged = 0;
+long long g_tkOrderDrained = 0, g_tkOrderStale = 0, g_tkOrderBlocked = 0;
+long long g_tkOrderByOutcome[cooptalk::kTalkOrderKinds];
+long long g_tkOrderNotReachedBusy = 0;   /* not reached while the copy was also busy in its own conversation */
+static void TalkOrderDrain()
+{
+    if (g_tkOrderPending == 0) return;
+    TkOrderItem got[kTkOrderRing];
+    int n = 0;
+    for (LONG i = 0; i < kTkOrderRing; ++i)
+    {
+        TkOrderEntry& e = g_tkOrderRing[i];
+        if (::InterlockedCompareExchange(&e.state, 2, 2) != 2) continue;
+        TkOrderItem& o = got[n++];
+        o.dlg = e.dlg; o.me = e.me; o.who = e.who; o.nuid = e.nuid; o.tuid = e.tuid; o.tid = e.tid; o.set = e.set; o.reached = e.reached;
+        o.hadLine = e.hadLine; o.started = e.started; o.busyCopy = e.busyCopy; o.convEv = e.convEv; o.gateDist = e.gateDist; o.site = e.site;
+        ::InterlockedExchange(&e.state, 0);
+    }
+    ::InterlockedExchangeAdd(&g_tkOrderPending, -(LONG)n);
+    if (n == 0) return;
+    g_tkOrderDrained += n;
+    if (EngineWritesBlocked()) { g_tkOrderBlocked += n; return; }   /* loading / tearing down: every pointer may be stale - counted only */
+    const unsigned int now = (unsigned int)::GetTickCount();
+    for (int k = 0; k < n; ++k)
+    {
+        const TkOrderItem& o = got[k];
+        const int outcome = cooptalk::TalkOrderOutcome(o.set, o.reached, o.hadLine, o.started);
+        if (outcome >= 0 && outcome < cooptalk::kTalkOrderKinds) ++g_tkOrderByOutcome[outcome];
+        if (outcome == cooptalk::kTalkOrderNotReached && o.busyCopy) ++g_tkOrderNotReachedBusy;
+        const int liveNpc = TkLiveOwner(o.dlg, o.me);
+        const int liveMine = TkLiveChar(o.who);
+        if (!liveNpc || !liveMine) ++g_tkOrderStale;
+        const unsigned int key = (o.nuid != 0) ? o.nuid : (unsigned int)(uintptr_t)o.dlg;
+        std::map<unsigned int, TkOrderSeen>::iterator it = g_tkOrderSeen.find(key);
+        const unsigned int last = (it != g_tkOrderSeen.end()) ? it->second.lastMs : 0;
+        if (!cooptalk::TalkOrderLogDue(last, now, g_tkOrderLogged)) { if (it != g_tkOrderSeen.end()) ++it->second.skipped; continue; }
+        if (it == g_tkOrderSeen.end() && g_tkOrderSeen.size() >= 256) g_tkOrderSeen.clear();   /* bounded: a long session's NPCs start over */
+        TkOrderSeen& seen = g_tkOrderSeen[key];
+        const unsigned int more = seen.skipped;
+        seen.skipped = 0;
+        seen.lastMs = (now == 0) ? 1 : now;
+        ++g_tkOrderLogged;
+        char mn[48], nn[48];
+        if (liveMine) TalkName((::Character*)o.who, mn); else std::strcpy(mn, "gone");
+        if (liveNpc) TalkName((::Character*)o.me, nn); else std::strcpy(nn, "gone");
+        float dist = -1.0f;
+        Ogre::Vector3 pa, pb;
+        if (liveNpc && liveMine && SafeReadPosition((::Character*)o.who, &pa) && SafeReadPosition((::Character*)o.me, &pb))
+        {
+            const float dx = pa.x - pb.x, dy = pa.y - pb.y, dz = pa.z - pb.z;
+            dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        }
+        char whose[64];
+        unsigned int peer = 0;
+        if (o.nuid == 0) std::strcpy(whose, "unreplicated");
+        else if (net::IsUidMine(o.nuid)) std::strcpy(whose, "this game's NPC");
+        else if (net::UidOwnerPeer(o.nuid, &peer)) std::sprintf(whose, "a copy game %u drives", peer);
+        else std::strcpy(whose, "a copy no game has claimed");
+        char res[420];
+        switch (outcome)
+        {
+        case cooptalk::kTalkOrderStarted: std::strcpy(res, "started here (window)"); break;
+        case cooptalk::kTalkOrderIntercepted:
+        {
+            int p = -1;
+            for (int j = 0; j < g_tkOrderP25N; ++j) if (g_tkOrderP25[j].dlg == o.dlg) { p = j; break; }
+            if (p < 0) std::strcpy(res, "taken for the NPC's game - no request went out for it at this safe point (see the P25 lines)");
+            else if (g_tkOrderP25[p].kind == 1) std::sprintf(res, "sent to the NPC's game as request req=%u", g_tkOrderP25[p].reqId);
+            else if (g_tkOrderP25[p].kind == 2) std::sprintf(res, "NOT started: not sent to the NPC's game (%s)", cooptalk::TalkWhyName(g_tkOrderP25[p].why));
+            else std::sprintf(res, "the NPC is this game's after all - the engine's own start ran here (started=%d)", g_tkOrderP25[p].started);
+            break;
+        }
+        case cooptalk::kTalkOrderNoLine: std::strcpy(res, "NOT started: the NPC has nothing to say to this character (no line)"); break;
+        case cooptalk::kTalkOrderGate:
+        {
+            const float gate = (g_base != 0 && kP25GateDistRva != 0) ? *(const float*)(g_base + (uintptr_t)kP25GateDistRva) : 9216.0f;
+            std::sprintf(res, "NOT started: out of range of this game's camera (%.0f u, gate %.0f)", (double)o.gateDist, (double)gate);
+            break;
+        }
+        case cooptalk::kTalkOrderRingFull: std::strcpy(res, "NOT started: the click queue was full"); break;
+        case cooptalk::kTalkOrderDup: std::strcpy(res, "NOT started: the same click already waits to be sent (duplicate)"); break;
+        case cooptalk::kTalkOrderLineNotStarted: std::strcpy(res, "NOT started: the NPC had a line, the camera gate passed, and the engine still did not start it"); break;
+        default:
+        {
+            int gb = -1, gl = -1, gd = -1, gi = -1, gr = -1, gx = -1;
+            float rt = 0.0f;
+            if (liveNpc) TkOrderGates(o.dlg, o.me, &gr, &rt, &gx, &gb, &gl, &gd, &gi);
+            char rs[32];
+            if (gr > 0) std::sprintf(rs, "%.3g", (double)rt); else std::strcpy(rs, gr == 0 ? "none" : "?");
+            std::sprintf(res, "NOT started: the engine refused before choosing a line (repeatTimer=%s died=%d leadBusy=%d down=%d indoorsTest=%d currentConv=%d warCampaign=unread)",
+                         rs, gx, gl, gd, gi, gb);
+            if (o.busyCopy)
+            {
+                char cb[96];
+                std::sprintf(cb, " (the copy is also busy in its own conversation: ev=0x%X)", (unsigned int)o.convEv);
+                std::strcat(res, cb);
+            }
+            break;
+        }
+        }
+        char b[900];
+        std::sprintf(b, "[TALK] talk order: my uid=%u '%s' -> npc uid=%u '%s' (%s) dist=%.0f -> %s", o.tuid, mn, o.nuid, nn, whose, (double)dist, res);
+        std::string line(b);
+        if (more != 0) { char mb[48]; std::sprintf(mb, " (%u more since)", more); line += mb; }
+        { char sb[48]; std::sprintf(sb, " (call site +0x%llX)", o.site); line += sb; }
+        DebugLog(line);
+    }
+}
+
+static std::string TalkOrderCountsString()
+{
+    const long long* o = g_tkOrderByOutcome;
+    char b[600];
+    std::sprintf(b, " talkOrder[orders,dropped,drained,blocked,stale,logged]=%lld,%lld,%lld,%lld,%lld,%u"
+                 " talkOrderBy[notReached,started,noLine,request,gate,ringFull,dup,lineNotStarted]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkOrderNotReachedCopyBusy=%lld",
+                 (long long)g_tkOrders, (long long)g_tkOrderDropped, g_tkOrderDrained, g_tkOrderBlocked, g_tkOrderStale, g_tkOrderLogged,
+                 o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], g_tkOrderNotReachedBusy);
+    return std::string(b);
+}
+
 void TalkTestDrain()
 {
     TalkOffDrain();   /* P26 stage 0 fold 1: the off-thread starts, every K2 safe point */
+    CopyOwnEndDrain();   /* T-719: a copy's own conversation ends here (before an arrived PROMPT looks at its Dialogue) */
+    TalkCursorDrain();   /* T-737: the talk cursor's preloads and queued ASKs (it tests teardown and a blocked world itself) */
     TkSafePoint();    /* P26 stages 1-3: every K2 safe point */
+    TalkOrderDrain();   /* T-726: this game's player's talk orders (after TkP25Drain, so a click sent as a REQUEST names its req) */
     TalkSightTick();  /* P26 stage 6 talksight: one try per K2 safe point while armed */
     TkArrWatchTick(); /* P26s6 arrival probe: the leader's walk and the event-1 arrival */
     if (::InterlockedExchange(&g_talkTestPending, 0) == 0) return;
@@ -6221,6 +6841,621 @@ static std::string TalkOffCountsString()
     return std::string(b) + " offStartedByEvent=[" + TalkByEventString(se) + "] offNotStartedByEvent=[" + TalkByEventString(ne) + "]";
 }
 
+// ===========================================================================================
+// T-737 - THE TALK CURSOR (src/common/talkcursor.h). A player sees the talk cursor on another game's NPC where a single-player game
+// would show it. The hover's test Dialogue 0x679FC0 (characterSelected -> 0x67A170 / 0x67A190; the same test decides the click's talk
+// order) answers, for an NPC another game drives, with THAT game's last answer for this talker - never the copy's own line pick, which
+// runs over the copy's out-of-date state (the click itself already goes to the NPC's game as a P25 REQUEST).
+// The asker, MAIN THREAD, only while characterSelected or the order menu's build (showContextMenu) runs on this thread (policy.cpp's
+//   TalkHoverScope) and only for an
+//   NPC whose click would become a P25 REQUEST (the road on; another game drives it; not a player's character; a talker of this game's
+//   own player faction with a uid - otherwise the click runs here and the engine's own answer stands, localKept):
+//   - it never talks now (no event-1 list, dead, a player faction - 0x679FC0's own tests, read): false, nothing sent (filteredNever);
+//   - the talker is the speaker the engine itself picks: 0x679FC0 runs with a capture set, and its _chooseDialog call 0x679630 hands
+//     the speaker back and picks nothing; a copy holding a parked line answers before that pick - then the talker the last hover
+//     used (else the first own player-faction character) is asked about;
+//   - the answer is the cache's (npcUid, talkerUid) entry: talk / talk(parked) = true (talk(parked) shown as the plain talk cursor:
+//     s_talk is read from the copy's own parked-line field, which the engine also replays as a line); no = false; none yet, or
+//     unknown (the NPC's game has no copy of the talker) = false for a hover (the ordinary cursor) and the engine's own answer for a
+//     click or the order menu (as before the talk cursor: the click becomes the P25 REQUEST and the NPC's game decides);
+//   - ASK on events only: a fresh hover (another character, or the same one not seen on the frame before - the mouse left and came
+//     back; the mod's main-loop frame count) asks even with a cached answer, which shows meanwhile; a pair with no answer at all is
+//     asked; never while an ASK for that pair is queued or waiting. A copy made here that may talk queues one preload ASK (the same
+//     talker), sent at most 4 per 500 ms. An ASK that cannot be sent stays queued and the others are tried; an ASK unanswered after
+//     30 s is dropped (the cache keeps what it had).
+//   - the cache forgets an NPC when its copy is removed (DESPAWN), a peer's answers when that peer goes, everything at world teardown.
+// The NPC's game, the K2 safe point: an ASK for its own NPC and the asker's copy of the talker is answered as a REQUEST's start would
+//   decide it - the parked line, the never-talks tests, then _chooseDialog over the event-1 list with the talker's copy, under the same
+//   corrections (the _checkCondition hook answers DC_IS_PLAYER and the money condition by the ASK's purse, noted as a REQUEST's is).
+// A game speaking another protocol is never asked: it is refused at HELLO / WELCOME (net/session.cpp kProtocolVersion).
+// ===========================================================================================
+namespace {
+unsigned long long kTcCanTalkRva = 0; static coop::AddrReg kTcCanTalkRva_reg("DialoguePlayerCanTalk", &kTcCanTalkRva);   /* Steam_1.0.65 0x679FC0 (1.0.68 0x67AA50): bool (Dialogue*) - the hover's talk test */
+unsigned long long kTcChooseRva = 0;  static coop::AddrReg kTcChooseRva_reg("DialogueChooseDialog", &kTcChooseRva);       /* Steam_1.0.65 0x679630 (1.0.68 0x67A0C0): DialogLineData* (Dialogue*, DialogChoiceList*, Character* speaker, bool) */
+const size_t kTcDlgParked = 0xC8;   /* Dialogue: the parked interrupt line - 0x679FC0's first test; characterSelected's s_talk test */
+typedef bool (*TcCanTalkFn)(void* dlg);
+typedef void* (*TcChooseFn)(void* dlg, void* list, void* speaker, char flag);
+TcCanTalkFn orig_tcCanTalk = 0;
+TcChooseFn orig_tcChoose = 0;
+int g_tcCanHook = 0, g_tcChooseHook = 0, g_tcOn = 0;
+volatile DWORD g_tcCsTid = 0;        /* the thread inside characterSelected now (policy.cpp's scope), 0 none */
+void* volatile g_tcCsWho = 0;        /* ... and the character it is about */
+void* g_tcLastHover = 0;             /* MAIN THREAD: the character the last characterSelected was about */
+volatile LONG g_tcCsKind = 0;        /* ... and its kind (coop::kTalkScope*: a hover, a click, the order menu's build) */
+long long g_tcLastHoverFrame = -10;  /* MAIN THREAD: the main-loop frame of the last characterSelected call (g_tcLastHover) */
+int g_tcHoverFresh = 0;              /* MAIN THREAD: the hover reached g_tcLastHover and has not asked for it yet */
+volatile DWORD g_tcCapTid = 0;       /* the thread whose 0x679FC0 call hands its speaker back instead of picking a line, 0 none */
+void* volatile g_tcCapDlg = 0;
+void* volatile g_tcCapSpeaker = 0;
+volatile LONG g_tcCapHit = 0;
+unsigned int g_tcLastTalker = 0;     /* MAIN THREAD: the talker uid the last hover's engine picked (the preload's talker) */
+struct TcEntry { int answer; unsigned long tick; unsigned int peer; };
+std::map<unsigned long long, TcEntry> g_tcCache;   /* MAIN THREAD: TalkCursorKey(npc, talker) -> the NPC's game's last answer */
+struct TcAsk { unsigned int askId, npcUid, talkerUid, peer; unsigned long tick; int preload; };
+std::vector<TcAsk> g_tcWaiting;      /* MAIN THREAD: ASKs sent, waiting for their ANSWER */
+struct TcQueued { unsigned int npcUid, talkerUid; int preload; };
+std::vector<TcQueued> g_tcQueue;     /* MAIN THREAD: ASKs not yet sent - the hover's first, then the preloads */
+std::vector<unsigned int> g_tcPreload;   /* MAIN THREAD: copies made here, not yet looked at for a preload */
+unsigned int g_tcNextAsk = 0;
+unsigned long g_tcWinStart = 0;
+int g_tcWinSent = 0;
+long long g_tcAsked = 0, g_tcPreloadAsked = 0, g_tcAnswered = 0, g_tcYes = 0, g_tcNo = 0, g_tcUnknown = 0, g_tcCacheUsed = 0,
+          g_tcNoAnswerYet = 0, g_tcFilteredNever = 0, g_tcQueuedMax = 0;
+volatile LONG64 g_tcLocalKept = 0;
+long long g_tcClickEngine = 0, g_tcSendSkipped = 0;   /* MAIN THREAD: a click / menu with no answer yet given the engine's own; an ASK not sent this pass */
+const int kTcLogAsk = 0, kTcLogAnswer = 1, kTcLogAsked = 2, kTcLogOther = 3, kTcLogKinds = 4;
+long long g_tcLogN[kTcLogKinds];
+
+/* a throttle per kind (the first 5, then every 100th, the line saying which one it is) */
+void TcLog(int kind, const std::string& s)
+{
+    const long long n = ++g_tcLogN[kind];
+    if (!cooptalk::TalkLogNthDue(n)) return;
+    if (n <= 5) { DebugLog(s); return; }
+    char t[64];
+    std::sprintf(t, " (line %lld of this kind)", n);
+    DebugLog(s + t);
+}
+
+/* 0x679FC0's never-talks tests, read-only, in its order: the event-1 conversation list (a missing key reads as none - the engine's
+   operator[] would insert an empty one), the NPC's vt +0x30 (dead), its vt +0x58 faction's +0x250 (a player faction). 1 read, 0
+   unreadable. No C++ object. */
+int TcNeverPod(void* dlg, void* npc, int* hasList, void** list, int* dead, int* playerFac)
+{
+    long long ms = 0;
+    void* const l = TkConvListPod(dlg, 1, &ms);
+    if (ms < 0 || npc == 0) return 0;
+    *list = l;
+    *hasList = (l != 0) ? 1 : 0;
+    __try
+    {
+        void* const* vt = *(void* const* const*)npc;
+        *dead = (((char (*)(void*))vt[0x30 / sizeof(void*)])(npc) != 0) ? 1 : 0;
+        const char* const f = (const char*)((void* (*)(void*))vt[0x58 / sizeof(void*)])(npc);
+        if (f == 0) return 0;
+        *playerFac = (*(void* const*)(f + 0x250) != 0) ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* The NPC's game: the engine's line pick for that talker. 1 called (*line, 0 = none), 0 faulted. No C++ object. */
+int TcChoosePod(void* dlg, void* list, void* who, void** line)
+{
+    *line = 0;
+    const TcChooseFn fn = (orig_tcChoose != 0) ? orig_tcChoose : (TcChooseFn)(g_base + (uintptr_t)kTcChooseRva);
+    __try { *line = fn(dlg, list, who, 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *line = 0; return 0; }
+}
+
+/* the speaker capture for one 0x679FC0 call on this thread, cleared on every exit */
+struct TcCapScope
+{
+    explicit TcCapScope(void* dlg) { g_tcCapSpeaker = 0; g_tcCapHit = 0; g_tcCapDlg = dlg; g_tcCapTid = ::GetCurrentThreadId(); }
+    ~TcCapScope() { g_tcCapTid = 0; g_tcCapDlg = 0; }
+};
+
+/* The speaker the engine's own 0x679FC0 picks for this Dialogue (its 0x7F4000 / 0x7F4B70 reads), with no line pick: 1 = it reached
+   its _chooseDialog (*speaker, 0 = none), 0 = it answered before (the copy's parked line). MAIN THREAD. */
+int TcEngineSpeaker(void* dlg, void** speaker)
+{
+    TcCapScope cap(dlg);
+    orig_tcCanTalk(dlg);
+    *speaker = g_tcCapSpeaker;
+    return g_tcCapHit != 0 ? 1 : 0;
+}
+
+/* the uid of c when it is this game's own player-faction character with a uid (a talker whose click becomes a REQUEST), else 0 */
+unsigned int TcOwnUid(void* c)
+{
+    if (c == 0) return 0;
+    const unsigned int u = FindSpawnedUid(c);
+    if (u == 0 || !net::IsUidMine(u)) return 0;
+    ::Faction* const f = (::Faction*)SayReadPtr(c, kRootFaction);
+    return (f != 0 && IsPlayerFaction(f)) ? u : 0;
+}
+
+/* the talker of a preload: the one the last hover's engine picked while it is still this game's, else the first own player-faction
+   character with a uid; 0 none yet */
+unsigned int TcPreloadTalker()
+{
+    if (g_tcLastTalker != 0 && TcOwnUid(FindSpawned(g_tcLastTalker)) == g_tcLastTalker) return g_tcLastTalker;
+    Ogre::Vector3 p;
+    const unsigned int u = TcOwnUid(TsOwnPlayer(&p));
+    if (u != 0) g_tcLastTalker = u;
+    return u;
+}
+
+void TcNoteQueued()
+{
+    const long long n = (long long)g_tcQueue.size() + (long long)g_tcPreload.size();
+    if (n > g_tcQueuedMax) g_tcQueuedMax = n;
+}
+
+/* One ASK into the send queue: the hover's goes first and replaces an unsent hover ASK for another NPC; a preload goes last. A pair
+   already queued is not queued twice. 0 = the preload queue is full (the caller keeps its trigger). */
+int TcQueue(unsigned int nu, unsigned int tu, int preload)
+{
+    for (size_t i = 0; i < g_tcQueue.size(); ++i)
+        if (g_tcQueue[i].npcUid == nu && g_tcQueue[i].talkerUid == tu)
+        {
+            if (!preload && g_tcQueue[i].preload)
+            {
+                g_tcQueue.erase(g_tcQueue.begin() + i);
+                break;
+            }
+            return 1;
+        }
+    TcQueued q;
+    q.npcUid = nu; q.talkerUid = tu; q.preload = preload;
+    if (!preload)
+    {
+        for (size_t i = 0; i < g_tcQueue.size(); ++i)
+            if (!g_tcQueue[i].preload) { g_tcQueue.erase(g_tcQueue.begin() + i); break; }
+        g_tcQueue.insert(g_tcQueue.begin(), q);
+    }
+    else
+    {
+        if (g_tcQueue.size() >= (size_t)cooptalk::kTalkCursorQueueCap) return 0;
+        g_tcQueue.push_back(q);
+    }
+    TcNoteQueued();
+    return 1;
+}
+
+/* 1 = an ASK for this (NPC, talker) is queued as a hover ask or waiting for its ANSWER; a queued PRELOAD ask does not count, so a
+   hover still queues its own ask, which TcQueue moves to the front in place of the preload */
+int TcPending(unsigned int nu, unsigned int tu)
+{
+    for (size_t i = 0; i < g_tcQueue.size(); ++i) if (!g_tcQueue[i].preload && g_tcQueue[i].npcUid == nu && g_tcQueue[i].talkerUid == tu) return 1;
+    for (size_t i = 0; i < g_tcWaiting.size(); ++i) if (g_tcWaiting[i].npcUid == nu && g_tcWaiting[i].talkerUid == tu) return 1;
+    return 0;
+}
+
+/* An NPC another game drives, inside characterSelected or the order menu's build. MAIN THREAD. */
+bool TcHover(void* dlg, void* npc)
+{
+    int hasList = 0, dead = 0, pf = 0;
+    void* list = 0;
+    if (!TcNeverPod(dlg, npc, &hasList, &list, &dead, &pf)) { ::InterlockedIncrement64(&g_tcLocalKept); return orig_tcCanTalk(dlg); }
+    if (!cooptalk::TalkCursorMayTalk(hasList, dead, pf)) { ++g_tcFilteredNever; return false; }
+    void* talker = 0;
+    const unsigned int tu = TcEngineSpeaker(dlg, &talker) ? TcOwnUid(talker) : TcPreloadTalker();
+    if (tu == 0) { ::InterlockedIncrement64(&g_tcLocalKept); return orig_tcCanTalk(dlg); }   /* the click would run here: the engine's own answer */
+    const unsigned int nu = FindSpawnedUid(npc);
+    g_tcLastTalker = tu;
+    const int fresh = (g_tcHoverFresh && npc == g_tcLastHover) ? 1 : 0;
+    if (fresh) g_tcHoverFresh = 0;
+    std::map<unsigned long long, TcEntry>::const_iterator it = g_tcCache.find(cooptalk::TalkCursorKey(nu, tu));
+    const int have = (it != g_tcCache.end()) ? 1 : 0;
+    if (cooptalk::TalkCursorShouldAsk(fresh, have, TcPending(nu, tu))) TcQueue(nu, tu, 0);
+    const int h = cooptalk::TalkCursorHover(1, have, have ? it->second.answer : cooptalk::kTalkCursorNo);
+    if (h == cooptalk::kTalkHoverNoAnswer) ++g_tcNoAnswerYet; else ++g_tcCacheUsed;
+    const int use = cooptalk::TalkCursorUse(h, g_tcCsKind != coop::kTalkScopeHover ? 1 : 0);
+    if (use == cooptalk::kTalkUseEngine) { ++g_tcClickEngine; return orig_tcCanTalk(dlg); }   /* a click with no answer yet: as before */
+    return use == cooptalk::kTalkUseTrue;
+}
+
+/* Dialogue 0x679FC0 (ANY THREAD): passed through untouched except inside characterSelected or the order menu's build on this thread
+   for an NPC another game drives (TkS6Owner 0, not a player's character). */
+bool detour_tcCanTalk(void* dlg)
+{
+    if (g_tcCsTid == 0 || g_tcCsTid != ::GetCurrentThreadId() || g_tcCapTid != 0) return orig_tcCanTalk(dlg);
+    void* const npc = SayReadPtr(dlg, kDlgMe);
+    if (npc == 0 || TkS6Owner(npc) != 0 || TkPeerTarget(npc)) return orig_tcCanTalk(dlg);
+    if (!g_tcOn || SayOnMainThread() == 0) { ::InterlockedIncrement64(&g_tcLocalKept); return orig_tcCanTalk(dlg); }
+    return TcHover(dlg, npc);
+}
+
+/* _chooseDialog 0x679630 (ANY THREAD): inside a capture on this thread for its Dialogue it hands back the speaker and picks nothing;
+   every other call is the engine's. */
+void* detour_tcChoose(void* dlg, void* list, void* speaker, char flag)
+{
+    if (g_tcCapTid != 0 && g_tcCapTid == ::GetCurrentThreadId() && dlg == g_tcCapDlg)
+    {
+        g_tcCapSpeaker = speaker;
+        g_tcCapHit = 1;
+        return 0;
+    }
+    return orig_tcChoose(dlg, list, speaker, flag);
+}
+
+void TcForgetAll()
+{
+    g_tcCache.clear(); g_tcWaiting.clear(); g_tcQueue.clear(); g_tcPreload.clear();
+    g_tcLastHover = 0; g_tcHoverFresh = 0; g_tcLastTalker = 0; g_tcLastHoverFrame = -10;
+}
+}   /* anonymous namespace */
+
+void TalkCursorInstall()
+{
+    if (kTcCanTalkRva == 0) g_tcCanHook = -2;
+    else g_tcCanHook = (coop::AddHook((void*)(g_base + kTcCanTalkRva), (void*)&detour_tcCanTalk, (void**)&orig_tcCanTalk) == coop::SUCCESS) ? 1 : -1;
+    if (kTcChooseRva == 0) g_tcChooseHook = -2;
+    else g_tcChooseHook = (coop::AddHook((void*)(g_base + kTcChooseRva), (void*)&detour_tcChoose, (void**)&orig_tcChoose) == coop::SUCCESS) ? 1 : -1;
+    g_tcOn = (g_p25On && g_tcCanHook == 1 && g_tcChooseHook == 1) ? 1 : 0;
+    const std::string s = std::string("[TALK] talk cursor: 0x679FC0=") + TalkHookState(g_tcCanHook) + " _chooseDialog 0x679630="
+        + TalkHookState(g_tcChooseHook) + " - the hover on another game's NPC shows that game's answer: "
+        + (g_tcOn ? "ON" : "OFF (the copy's own answer stands)");
+    if (g_tcOn) DebugLog(s); else ErrorLog(s);
+}
+
+void TalkCursorHoverEnter(void* who, int kind, unsigned long* prevTid, void** prevWho, int* prevKind)
+{
+    *prevTid = g_tcCsTid;
+    *prevWho = g_tcCsWho;
+    *prevKind = (int)g_tcCsKind;
+    g_tcCsWho = who;
+    g_tcCsKind = kind;
+    g_tcCsTid = ::GetCurrentThreadId();
+    if (kind != kTalkScopeMenu && SayOnMainThread() != 0)   /* a characterSelected call: is it a fresh hover? */
+    {
+        const long long f = MainLoopFrames();
+        if (cooptalk::TalkCursorFreshHover(who == g_tcLastHover ? 1 : 0, g_tcLastHoverFrame, f)) g_tcHoverFresh = 1;
+        g_tcLastHover = who;
+        g_tcLastHoverFrame = f;
+    }
+}
+
+void TalkCursorHoverLeave(unsigned long prevTid, void* prevWho, int prevKind)
+{
+    g_tcCsTid = prevTid;
+    g_tcCsWho = prevWho;
+    g_tcCsKind = prevKind;
+}
+
+void TalkCursorFaultReset()
+{
+    g_tcCsTid = 0; g_tcCsWho = 0; g_tcCsKind = 0;
+    g_tcCapTid = 0; g_tcCapDlg = 0;
+}
+
+void TalkCursorCopyReady(unsigned int uid)
+{
+    if (uid == 0 || !g_tcOn || g_tcPreload.size() >= (size_t)cooptalk::kTalkCursorPreloadCap) return;
+    for (size_t i = 0; i < g_tcPreload.size(); ++i) if (g_tcPreload[i] == uid) return;
+    g_tcPreload.push_back(uid);
+    TcNoteQueued();
+}
+
+void TalkCursorForgetNpc(unsigned int uid)
+{
+    if (uid == 0) return;
+    g_tcCache.erase(g_tcCache.lower_bound(cooptalk::TalkCursorKey(uid, 0)), g_tcCache.upper_bound(cooptalk::TalkCursorKey(uid, 0xFFFFFFFFu)));
+    for (size_t i = 0; i < g_tcWaiting.size();) { if (g_tcWaiting[i].npcUid == uid) g_tcWaiting.erase(g_tcWaiting.begin() + i); else ++i; }
+    for (size_t i = 0; i < g_tcQueue.size();) { if (g_tcQueue[i].npcUid == uid) g_tcQueue.erase(g_tcQueue.begin() + i); else ++i; }
+    for (size_t i = 0; i < g_tcPreload.size();) { if (g_tcPreload[i] == uid) g_tcPreload.erase(g_tcPreload.begin() + i); else ++i; }
+}
+
+void TalkCursorForgetPeer(unsigned int peer)
+{
+    const int all = (peer == kTalkAllPeers) ? 1 : 0;
+    for (std::map<unsigned long long, TcEntry>::iterator it = g_tcCache.begin(); it != g_tcCache.end();)
+    {
+        if (all || cooplive::SamePlayer(it->second.peer, peer, coop::LinkPeerSlot())) g_tcCache.erase(it++);
+        else ++it;
+    }
+    for (size_t i = 0; i < g_tcWaiting.size();)
+    {
+        if (all || cooplive::SamePlayer(g_tcWaiting[i].peer, peer, coop::LinkPeerSlot())) g_tcWaiting.erase(g_tcWaiting.begin() + i);
+        else ++i;
+    }
+}
+
+/* The asker, every K2 safe point: the world's teardown empties everything; the preloads become queued ASKs; the queue is sent - the
+   hover's ASK at once, the preloads at the rate cap; what cannot be sent stays queued. MAIN THREAD. */
+void TalkCursorDrain()
+{
+    if (coop::GameWorldPtr() == 0 || StoreTearingDown() != 0) { TcForgetAll(); return; }
+    if (EngineWritesBlocked() || !g_tcOn) return;
+    const unsigned long now = ::GetTickCount();
+    for (size_t i = 0; i < g_tcWaiting.size();)
+    {
+        if ((unsigned long)(now - g_tcWaiting[i].tick) >= (unsigned long)cooptalk::kTalkReqWaitMs) g_tcWaiting.erase(g_tcWaiting.begin() + i);
+        else ++i;
+    }
+    if (!g_tcPreload.empty())
+    {
+        const unsigned int tu = TcPreloadTalker();
+        if (tu != 0)
+        {
+            std::vector<unsigned int> keep;
+            for (size_t i = 0; i < g_tcPreload.size(); ++i)
+            {
+                const unsigned int uid = g_tcPreload[i];
+                ::Character* const c = FindSpawned(uid);
+                if (c == 0 || net::IsUidMine(uid) || TkPeerTarget(c)) continue;   /* gone, this game's own, or a player's character */
+                void* const dlg = TkDialogueOf(c);
+                int hasList = 0, dead = 0, pf = 0;
+                void* list = 0;
+                if (dlg == 0 || !TcNeverPod(dlg, c, &hasList, &list, &dead, &pf) || !cooptalk::TalkCursorMayTalk(hasList, dead, pf)) continue;
+                if (!TcQueue(uid, tu, 1)) keep.push_back(uid);
+            }
+            g_tcPreload.swap(keep);
+        }
+    }
+    for (size_t i = 0; i < g_tcQueue.size();)
+    {
+        const TcQueued q = g_tcQueue[i];
+        if (FindSpawned(q.npcUid) == 0) { g_tcQueue.erase(g_tcQueue.begin() + i); continue; }   /* the copy is gone */
+        unsigned int peer = 0;
+        if (!net::UidOwnerPeer(q.npcUid, &peer) || coop::StorePeerHere(peer) == 0) { ++i; continue; }   /* its game is not reachable now: kept */
+        if (q.preload && !cooptalk::TalkCursorPreloadMay(&g_tcWinStart, &g_tcWinSent, now)) break;
+        cooptalk::TalkMsg m;
+        m.kind = cooptalk::kTalkCursorAsk; m.convId = 0; m.npcUid = q.npcUid; m.targetUid = q.talkerUid;
+        {
+            int pv = -1;
+            ::Character* const me = FindSpawned(q.talkerUid);
+            m.purse = (me != 0 && TkPurseMoneyPod(me, &pv)) ? pv : -1;
+        }
+        m.reqId = ++g_tcNextAsk;
+        if (m.reqId == 0) m.reqId = ++g_tcNextAsk;
+        if (!net::SendTalk(m)) { ++g_tcSendSkipped; ++i; continue; }   /* not sent: it stays queued for the next pass; the others are tried */
+        if (g_tcWaiting.size() >= (size_t)cooptalk::kTalkCursorWaitCap) g_tcWaiting.erase(g_tcWaiting.begin());
+        TcAsk a;
+        a.askId = m.reqId; a.npcUid = q.npcUid; a.talkerUid = q.talkerUid; a.peer = peer; a.tick = now; a.preload = q.preload;
+        g_tcWaiting.push_back(a);
+        ++g_tcAsked;
+        if (q.preload) ++g_tcPreloadAsked;
+        TcLog(kTcLogAsk, "[TALK] cursor ask npc uid=" + TkU(q.npcUid) + " talker uid=" + TkU(q.talkerUid) + " why=" + (q.preload ? "preload" : "hover"));
+        g_tcQueue.erase(g_tcQueue.begin() + i);
+    }
+}
+
+/* The NPC's game: an ASK answered as a REQUEST's start would decide it. MAIN THREAD (the K2 drain), the world not blocked. */
+void TalkCursorApplyAsk(const cooptalk::TalkMsg& m, unsigned int peer)
+{
+    ::Character* const npc = FindSpawned(m.npcUid);
+    ::Character* const cp = FindSpawned(m.targetUid);
+    void* const dlg = (npc != 0) ? TkDialogueOf(npc) : 0;
+    const int npcOurs = (npc != 0 && dlg != 0 && net::IsUidMine(m.npcUid) && !TkPeerTarget(npc)) ? 1 : 0;
+    const int copyOk = (cp != 0 && net::UidOwnedByPeer(m.targetUid, peer) && TkPeerTarget(cp)) ? 1 : 0;
+    int answer = cooptalk::kTalkCursorUnknown;
+    void* line = 0;
+    if (npcOurs && copyOk && g_p25On && kTcChooseRva != 0 && g_base != 0)
+    {
+        int hasList = 0, dead = 0, pf = 0;
+        void* list = 0;
+        const int parked = (SayReadPtr(dlg, kTcDlgParked) != 0) ? 1 : 0;
+        if (TcNeverPod(dlg, npc, &hasList, &list, &dead, &pf))
+        {
+            int called = 1;
+            if (!parked && cooptalk::TalkCursorMayTalk(hasList, dead, pf))
+            {
+                if (m.purse >= 0) TkPurseNote(m.targetUid, m.purse, peer);   /* the money condition is answered by the talker's purse */
+                called = TcChoosePod(dlg, list, cp, &line);
+                TkPurseTalkEnded(m.targetUid);   /* kept only while a conversation with that character is open here */
+            }
+            if (called) answer = cooptalk::TalkCursorNpcAnswer(parked, hasList, dead, pf, line != 0 ? 1 : 0);
+        }
+    }
+    cooptalk::TalkMsg a;
+    a.kind = cooptalk::kTalkCursorAnswer; a.convId = 0; a.npcUid = m.npcUid; a.targetUid = m.targetUid; a.reqId = m.reqId; a.result = answer;
+    const int sent = net::SendTalk(a) ? 1 : 0;
+    TcLog(kTcLogAsked, "[TALK] cursor asked npc uid=" + TkU(m.npcUid) + " by talker uid=" + TkU(m.targetUid) + " -> "
+          + cooptalk::TalkCursorAnswerName(answer) + " (line " + (line != 0 ? TkLineSid(line) : std::string("none")) + ")"
+          + (sent ? "" : " - the ANSWER could not be sent (link down)"));
+}
+
+/* The asker: the NPC's game's answer replaces the cache's entry. MAIN THREAD. */
+void TalkCursorApplyAnswer(const cooptalk::TalkMsg& m, unsigned int peer)
+{
+    size_t w = 0;
+    while (w < g_tcWaiting.size() && !(g_tcWaiting[w].askId == m.reqId && cooplive::SamePlayer(g_tcWaiting[w].peer, peer, coop::LinkPeerSlot()))) ++w;
+    if (w == g_tcWaiting.size() || g_tcWaiting[w].npcUid != m.npcUid || g_tcWaiting[w].talkerUid != m.targetUid)
+    {
+        TcLog(kTcLogOther, "[TALK] cursor ANSWER ask=" + TkU(m.reqId) + " npc uid=" + TkU(m.npcUid) + " from peer " + TkU(peer) + " names no ask waiting here - ignored");
+        return;
+    }
+    const TcAsk a = g_tcWaiting[w];
+    g_tcWaiting.erase(g_tcWaiting.begin() + w);
+    const unsigned long now = ::GetTickCount();
+    const unsigned long long key = cooptalk::TalkCursorKey(m.npcUid, m.targetUid);
+    if (g_tcCache.find(key) == g_tcCache.end() && g_tcCache.size() >= (size_t)cooptalk::kTalkCursorCacheCap)
+    {
+        std::map<unsigned long long, TcEntry>::iterator old = g_tcCache.begin();
+        for (std::map<unsigned long long, TcEntry>::iterator it = g_tcCache.begin(); it != g_tcCache.end(); ++it)
+            if ((long)(it->second.tick - old->second.tick) < 0) old = it;
+        g_tcCache.erase(old);
+    }
+    TcEntry e;
+    e.answer = m.result; e.tick = now; e.peer = a.peer;
+    g_tcCache[key] = e;
+    ++g_tcAnswered;
+    if (m.result == cooptalk::kTalkCursorTalk || m.result == cooptalk::kTalkCursorParked) ++g_tcYes;
+    else if (m.result == cooptalk::kTalkCursorNo) ++g_tcNo;
+    else ++g_tcUnknown;
+    TcLog(kTcLogAnswer, "[TALK] cursor answer npc uid=" + TkU(m.npcUid) + " talker uid=" + TkU(m.targetUid) + " -> "
+          + cooptalk::TalkCursorAnswerName(m.result) + " (asked " + TkU((unsigned int)(now - a.tick)) + " ms ago)");
+}
+
+/* TEST-ONLY: the name form of `talkcursor show|hover` - `name <Name>` picks the loaded character on this game whose name keys as
+   <Name> (coopsay::TalkPersonKey: any case, '_' and a space alike; the name runs to the end of the line), nearest at any distance
+   to this game's first own player character (LeverNearestNamed, kLeverPickAny), because a town NPC's uid is not known before a
+   run. 0 = not the name form (arg is a uid); 1 = *nu is the picked uid, logged as `[TALK] talkcursor <verb> npc uid=<n> name
+   '<Name>' -> '<display name>' dist=<d>`; -1 = refused, *err is the status line. MAIN THREAD. */
+static int TcNamePick(const char* verb, const std::string& arg, unsigned int* nu, std::string* err)
+{
+    size_t i = 0;
+    while (i < arg.size() && (arg[i] == ' ' || arg[i] == '\t')) ++i;
+    if (arg.compare(i, 4, "name") != 0 || (i + 4 < arg.size() && arg[i + 4] != ' ' && arg[i + 4] != '\t')) return 0;
+    const std::string nameKey = coopsay::TalkPersonKey(arg.substr(i + 4));
+    if (nameKey.empty()) { *err = std::string("error talkcursor usage: talkcursor ") + verb + " name <Name>"; return -1; }
+    float nd = -1.0f;
+    std::string nn, why;
+    *nu = 0;
+    if (LeverNearestNamed(nameKey, kLeverPickAny, 0, 1.0e30f, nu, &nd, &nn, &why) == 0)
+    {
+        DebugLog(std::string("[TALK] talkcursor ") + verb + " name '" + nameKey + "' refused: " + why);
+        *err = std::string("error talkcursor ") + verb + " name: " + why;
+        return -1;
+    }
+    if (*nu == 0)
+    {
+        DebugLog(std::string("[TALK] talkcursor ") + verb + " name '" + nameKey + "' refused: the nearest such character ('" + nn
+                 + "') has no uid on this game");
+        *err = std::string("error talkcursor ") + verb + " name: the character has no uid";
+        return -1;
+    }
+    char d[32];
+    std::sprintf(d, "%d", (int)nd);
+    DebugLog(std::string("[TALK] talkcursor ") + verb + " npc uid=" + TkU(*nu) + " name '" + nameKey + "' -> '" + nn + "' dist=" + d
+             + " (nearest to this game's first own player character)");
+    return 1;
+}
+
+/* TEST-ONLY, READ-ONLY lever `talkcursor show <npcUid>` (or `show name <Name>`, TcNamePick): the cache entry for that NPC with the
+   talker a hover would use, and what the hover would answer now (the filter read and the cache; no engine call, nothing sent).
+   MAIN THREAD. */
+std::string TalkCursorShow(const std::string& arg)
+{
+    unsigned int nu = 0;
+    char extra = 0;
+    std::string nameErr;
+    const int byName = TcNamePick("show", arg, &nu, &nameErr);
+    if (byName < 0) return nameErr;
+    if (byName == 0 && (std::sscanf(arg.c_str(), "%u %c", &nu, &extra) != 1 || nu == 0))
+        return "error talkcursor usage: talkcursor show <npcUid> | talkcursor show name <Name>";
+    if (EngineWritesBlocked()) return "error talkcursor: no world loaded";
+    ::Character* const npc = FindSpawned(nu);
+    if (npc == 0) return "error talkcursor: no character uid=" + TkU(nu) + " here";
+    const int own = TkS6Owner(npc);
+    const int player = TkPeerTarget(npc);
+    void* const dlg = TkDialogueOf(npc);
+    int hasList = 0, dead = 0, pf = 0;
+    void* list = 0;
+    const int read = (dlg != 0 && TcNeverPod(dlg, npc, &hasList, &list, &dead, &pf)) ? 1 : 0;
+    const int may = read ? cooptalk::TalkCursorMayTalk(hasList, dead, pf) : 0;
+    const unsigned int tu = TcPreloadTalker();
+    std::map<unsigned long long, TcEntry>::const_iterator it = g_tcCache.find(cooptalk::TalkCursorKey(nu, tu));
+    const int have = (it != g_tcCache.end()) ? 1 : 0;
+    int waiting = 0, queued = 0;
+    for (size_t i = 0; i < g_tcWaiting.size(); ++i) if (g_tcWaiting[i].npcUid == nu) ++waiting;
+    for (size_t i = 0; i < g_tcQueue.size(); ++i) if (g_tcQueue[i].npcUid == nu) ++queued;
+    std::string hover;
+    if (own != 0 || player) hover = "the engine's own (not another game's NPC)";
+    else if (!g_tcOn) hover = "the engine's own (the talk cursor is off)";
+    else if (!read) hover = "the engine's own (unreadable)";
+    else if (tu == 0) hover = "the engine's own (no talker of this game's player)";
+    else
+    {
+        const int h = cooptalk::TalkCursorHover(may, have, have ? it->second.answer : cooptalk::kTalkCursorNo);
+        hover = std::string(cooptalk::TalkCursorHoverTrue(h) ? "true " : "false ") + cooptalk::TalkCursorHoverName(h);
+    }
+    char f[160];
+    std::sprintf(f, "list=%d dead=%d playerFaction=%d", hasList, dead, pf);
+    const std::string out = "ok talkcursor npc uid=" + TkU(nu) + " '" + TkNameStr(npc) + "' driven=" + (own == 1 ? "here" : (own == 0 ? "other" : "noUid"))
+        + " playerCharacter=" + TkI(player) + " on=" + TkI(g_tcOn) + " filter=" + (read ? (may ? std::string("may ") : std::string("never ")) + f : std::string("unreadable"))
+        + " talker uid=" + TkU(tu) + " cache=" + (have ? std::string(cooptalk::TalkCursorAnswerName(it->second.answer)) + " age="
+        + TkU((unsigned int)(::GetTickCount() - it->second.tick)) + "ms" : std::string("none"))
+        + " waiting=" + TkI(waiting) + " queued=" + TkI(queued) + " hover=" + hover;
+    DebugLog("[TALK] cursor show: " + out);
+    return out;
+}
+
+/* TEST-ONLY lever `talkcursor hover <npcUid>`: the engine's own characterSelected runs once as a HOVER on that character, as
+   policy.cpp's OrdHoverPod makes it - through its hook, so the characterSelected scope and the 0x679FC0 detour run as for a mouse
+   hover. The click byte is held at 0 for the call and put back; refused while the player interface is picking a target (there
+   characterSelected hands the character to its target-picking call, which gives an order whatever the click byte says), or when the
+   uid is not a loaded character. The PlayerInterface is the engine's own global (the one 0x679FC0 reads). Then the `talkcursor show`
+   line for that NPC. MAIN THREAD (the command channel tick). */
+namespace {
+unsigned long long kTcCharSelectedRva = 0; static coop::AddrReg kTcCharSelectedRva_reg("PlayerInterface_characterSelected", &kTcCharSelectedRva);   /* Steam_1.0.65 0x7FA870 - policy.cpp binds the same row and hooks it */
+const size_t kTcPiTargetMode = 0x2F1;   /* PlayerInterface: set while picking a target (policy.cpp kPiTargetMode) */
+const size_t kTcPiClickByte = 0x2F3;    /* PlayerInterface: the click byte - 0 = characterSelected only picks the cursor (policy.cpp kPiClickByte) */
+typedef void (*TcCharSelectedFn)(void* pi, void* who);
+/* 1 made, 0 faulted, 2 not made (picking a target); the click byte is put back either way. No C++ object. */
+int TcHoverPod(void* pi, void* ch)
+{
+    unsigned char* const clickByte = (unsigned char*)pi + kTcPiClickByte;
+    unsigned char was = 0;
+    __try
+    {
+        if (*((unsigned char*)pi + kTcPiTargetMode) != 0) return 2;
+        was = *clickByte;
+        *clickByte = 0;
+        ((TcCharSelectedFn)(g_base + (uintptr_t)kTcCharSelectedRva))(pi, ch);
+        *clickByte = was;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        __try { *clickByte = was; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        TalkCursorFaultReset();   /* the characterSelected scope's destructor did not run */
+        return 0;
+    }
+}
+void* TcPlayerIfacePod()
+{
+    if (g_base == 0 || kP25PlayerIfaceRva == 0) return 0;
+    __try { return *(void* const*)(g_base + (uintptr_t)kP25PlayerIfaceRva); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+}   /* anonymous namespace */
+
+std::string TalkCursorHover(const std::string& arg)
+{
+    unsigned int nu = 0;
+    char extra = 0;
+    std::string nameErr;
+    const int byName = TcNamePick("hover", arg, &nu, &nameErr);
+    if (byName < 0) return nameErr;
+    if (byName == 0 && (std::sscanf(arg.c_str(), "%u %c", &nu, &extra) != 1 || nu == 0))
+        return "error talkcursor usage: talkcursor hover <npcUid> | talkcursor hover name <Name>";
+    std::string why;
+    int made = 0;
+    if (EngineWritesBlocked()) why = "no world loaded";
+    else if (kTcCharSelectedRva == 0 || g_base == 0) why = "characterSelected has no address row";
+    else
+    {
+        ::Character* const ch = FindSpawned(nu);
+        void* const pi = TcPlayerIfacePod();
+        if (ch == 0 || !TkLiveChar(ch)) why = "uid " + TkU(nu) + " is not a loaded character";
+        else if (pi == 0) why = "no player interface";
+        else
+        {
+            const int h = TcHoverPod(pi, ch);
+            if (h == 1) made = 1;
+            else why = (h == 2) ? "the player interface is picking a target" : "characterSelected faulted";
+        }
+    }
+    DebugLog("[TALK] talkcursor hover npc uid=" + TkU(nu) + " -> " + (made ? std::string("made") : "refused (" + why + ")"));
+    const std::string show = TalkCursorShow(TkU(nu));
+    return made ? "ok talkcursor hover made; " + show : "error talkcursor hover refused (" + why + "); " + show;
+}
+
+std::string TalkCursorCountsString()
+{
+    char b[640];
+    std::sprintf(b, " talkCursor[asked,preloadAsked,answered,yes,no,unknown,cacheUsed,noAnswerYet,filteredNever,localKept,queuedMax]="
+                 "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld talkCursorHooks=canTalk:%s,choose:%s,on:%d",
+                 g_tcAsked, g_tcPreloadAsked, g_tcAnswered, g_tcYes, g_tcNo, g_tcUnknown, g_tcCacheUsed, g_tcNoAnswerYet,
+                 g_tcFilteredNever, (long long)g_tcLocalKept, g_tcQueuedMax, TalkHookState(g_tcCanHook), TalkHookState(g_tcChooseHook), g_tcOn);
+    char c[96];
+    std::sprintf(c, " talkCursor2[clickEngine,sendSkipped]=%lld,%lld", g_tcClickEngine, g_tcSendSkipped);
+    return std::string(b) + c;
+}
+
 std::string TalkCountsString()
 {
     char b[640];
@@ -6235,7 +7470,22 @@ std::string TalkCountsString()
                  g_talkTestArmed, g_talkTestRan, g_talkTestSkipped, g_talkTestFaulted);
     return std::string(b) + " talkByEvent=[" + TalkByEventString(g_talkByEvent) + "] sendEventWouldBlockByEvent=["
            + TalkByEventString(g_copyEvByEvent) + "]" + h + TalkOffCountsString() + TkCountsString() + TalkSightCounts()   /* P26 stage 0 fold 1; P26 stages 1-3; P26 stage 6 talksight */
-           + " " + InteriorKeepToken();   /* P25 interior keep (replicate.cpp) */
+           + " " + InteriorKeepToken()   /* P25 interior keep (replicate.cpp) */
+           + CopyOwnCountsString()   /* T-719 */
+           + TalkCursorCountsString();   /* T-737 */
+}
+
+/* T-726: a [TALK] REPORT line every 60 s in this game's own log while a world runs (not while loading or tearing down), so a bug
+   report carries the talk counters (talk[...], the P25 counters and whys, the arrival counters tpEv[...], copyOwnEnd[...]) without
+   the harness's report verb. MAIN THREAD (StoreTick, 1 Hz). */
+void TalkReportTick()
+{
+    static DWORD last = 0;
+    if (EngineWritesBlocked()) return;
+    const DWORD now = ::GetTickCount();
+    if (last != 0 && now - last < 60000) return;
+    last = (now == 0) ? 1 : now;
+    DebugLog("[TALK] REPORT " + TalkCountsString() + TalkOrderCountsString());
 }
 
 std::string SayCountsString()

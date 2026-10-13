@@ -533,4 +533,36 @@ inline int TalkCarriersOptParse(const std::string& rest, int* ev, int* act)
     return 1;
 }
 
+/* T-719: A COPY'S OWN CONVERSATION (speech.cpp CopyOwnEndDrain). A copy - an NPC the other game drives, or the other player's
+   character - that starts a conversation by itself (a crime witness's reaction, usually on the AI thread) has its line dropped by
+   say() here (the owner's game shows it), so no bubble shows; the engine ends a conversation only by the line timers of a showing
+   bubble (Dialogue::update, +0x228), so the copy's Dialogue would stay busy for good. Each such start is queued at its start and
+   judged again at the next safe point with live reads: live (the copy and its Dialogue are still there), stillCopy (its uid is still
+   not this game's), busy (the engine's own busy test), evNow (+0x188 now) against evQueued (the start's event; < 0 = not known, not
+   compared), bubble (+0x228 set: the engine's own timer ends it), heldByTalk (a P26 mirror, a P26 mark or this game's dialogue
+   window shows that Dialogue). The order: gone, held, not busy, a newer conversation, a bubble - then end it. A bubble: the caller keeps the
+   entry for the next safe point while CopyOwnBubbleKeep says so, and drops it after. */
+const int kCopyOwnEnd = 0, kCopyOwnSkipGone = 1, kCopyOwnSkipNotBusy = 2, kCopyOwnSkipBubble = 3, kCopyOwnSkipChanged = 4,
+          kCopyOwnSkipHeld = 5;
+inline int CopyOwnEndAction(int live, int stillCopy, int busy, int evNow, int evQueued, int bubble, int heldByTalk)
+{
+    if (!live || !stillCopy) return kCopyOwnSkipGone;
+    if (heldByTalk) return kCopyOwnSkipHeld;
+    if (!busy) return kCopyOwnSkipNotBusy;
+    if (evQueued >= 0 && evNow != evQueued) return kCopyOwnSkipChanged;
+    if (bubble) return kCopyOwnSkipBubble;
+    return kCopyOwnEnd;
+}
+
+/* T-719: an entry judged kCopyOwnSkipBubble stays queued (judged again at the next safe point) while less than
+   kCopyOwnBubbleWaitMs have passed since its start was queued, and is dropped after. A bubble shows only while a line's timers run
+   (seconds per line); when it goes the engine can go on to the copy's next line, which say() drops here, leaving the conversation
+   open with no bubble - the entry still queued then ends it. The limit keeps a bubble that never goes from holding an entry for
+   good. queuedMs / nowMs are GetTickCount values; wrap-safe. 1 keep, 0 drop. */
+const unsigned int kCopyOwnBubbleWaitMs = 30000;
+inline int CopyOwnBubbleKeep(unsigned int queuedMs, unsigned int nowMs)
+{
+    return (nowMs - queuedMs) < kCopyOwnBubbleWaitMs ? 1 : 0;
+}
+
 }   /* namespace coopsay */

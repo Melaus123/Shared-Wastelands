@@ -6,21 +6,22 @@
    A copy is LOST when this game's engine put away its copy of another game's character (the area the copy stood in went to sleep
    here; the copy's temporary group is not saved, so the copy is gone) while the owner still runs the character, or when the owner
    streams a character this game holds no copy of. The owner's announce mark still says "sent", so nothing on the owner's side would
-   send it again. This game keeps a row per lost uid (who owns it, where it last stood) and, while that spot is in an area loaded
-   here, ASKS the owner to send the character again. The owner sends its full state (CONTEXT, SPAWN, looks, STATE, COMBATMODE,
+   send it again. This game keeps a row per lost uid (who owns it, where it last stood) and, while that spot is kept
+   here (see VISIT), ASKS the owner to send the character again. The owner sends its full state (CONTEXT, SPAWN, looks, STATE, COMBATMODE,
    INTENT) to this game alone and ANSWERS with a verdict per uid. A uid whose SPAWN this game's own table refused is never booked
    (the owner was told by NOT_SHOWN; a re-send would be refused the same way).
 
-   The asks are limited by state, not by a clock. A VISIT is an unbroken stretch in which the row's spot reads as loaded here and
-   stays in one sector (the owner moving the character into another sector starts a new visit); the row lives for the whole
+   The asks are limited by state, not by a clock. A VISIT is an unbroken stretch in which the row's spot reads as KEPT here (its
+   area loaded and not within the engine's edge strip of a side whose neighbour area is not loaded) and stays in one sector (the owner moving the character into another sector starts a new visit); the row lives for the whole
    visit, also while the copy is back (HERE). An ask goes out only while no copy is here (the same test that writes the BACK
-   line), never while an earlier ask of the same visit awaits its answer, and inside a visit only from a row
-   that is WAITING: an answer of SENT, a refusal (a hand-over in flight, not announced, not the owner's) and a copy that came back
-   in this visit all wait for the next visit, because a copy the engine puts away again on the same loaded ground would be put away
+   line), never while an earlier ask of the same visit awaits its answer (an answer not here after kLostAnswerLooks looks is taken
+   as lost, and the row asks again), and inside a visit only from a row that is WAITING, or BACKING OFF for kLostBackoffLooks looks
+   after an answer that sent nothing for a passing reason (HELD, NO BODY, FAILED, NO ROAD; NOT IN AREA, which this build never
+   sends). An answer of SENT, NOT ANNOUNCED or NOT MINE, and a copy that came back in this visit, wait for the next visit, because a copy the engine puts away again on the same kept ground would be put away
    again at once, and the owner's own paths (the hand-over's settle re-send, the announce pass, OWNER_MOVED) send it then. The
    SPAWN that makes the copy marks the row HERE at once (LostArrived), before any look. At most kLostAsksPerVisit asks a visit, an
-   ask whose send found no road counted like a sent one, once per road outage. A spot that is not loaded here is never asked for:
-   a copy made in a sleeping area would be put away again at once.
+   ask whose send found no road counted like a sent one, once per road outage. A spot that is not kept here is never asked for:
+   a copy made there would be put away again at once.
 
    WIRE: kind u8 (kRsAsk / kRsAnswer) | n u8 (1..kResendMax) | n x (uid u32 | verdict u8)      2 + 5n bytes, little-endian.
    In an ASK every verdict is kRvAsk (0). */
@@ -31,7 +32,7 @@ namespace lostcopy {
 
 enum { kRsAsk = 1, kRsAnswer = 2 };
 const unsigned int kResendMax = 32;
-enum { kRvAsk = 0, kRvSent = 1, kRvHeld = 2, kRvNotAnnounced = 3, kRvNotMine = 4, kRvNoBody = 5, kRvFailed = 6, kRvNoRoad = 7, kRvMax = 7 };
+enum { kRvAsk = 0, kRvSent = 1, kRvHeld = 2, kRvNotAnnounced = 3, kRvNotMine = 4, kRvNoBody = 5, kRvFailed = 6, kRvNoRoad = 7, kRvNotInArea = 8, kRvMax = 8 };
 enum { kRsDecodeOk = 0, kRsDecodeShort = 1, kRsDecodeBadKind = 2, kRsDecodeBadCount = 3, kRsDecodeBadUid = 4, kRsDecodeBadVerdict = 5 };
 
 inline const char* ResendVerdictName(int v)
@@ -46,6 +47,7 @@ inline const char* ResendVerdictName(int v)
     case kRvNoBody:       return "no readable body on its owner";
     case kRvFailed:       return "its send failed";
     case kRvNoRoad:       return "no road to the asking game";
+    case kRvNotInArea:    return "not where the asking game's engine keeps it (an older build's answer; nothing sent)";
     default:              return "?";
     }
 }
@@ -95,7 +97,10 @@ inline int DecodeResend(const unsigned char* p, size_t size, int* kind, std::vec
 }
 
 /* THE OWNER: what an ask for one uid gets. SENT means "send its full state to the asker now"; HELD means the hand-over's settle
-   sends it; every other verdict sends nothing. */
+   sends it; every other verdict sends nothing. Where the character stands is not tested here: the asker's own SPAWN check reads its
+   live engine when the state arrives and books the uid instead of making a copy that engine would not keep (SpawnKeepDecide), while
+   this game's map of the asker can lag it - a keep test here would only cost the asker visits. kRvNotInArea stays decodable (an
+   older build's answer); this build never gives it. */
 inline int ResendOwnerVerdict(int uidMine, int handoverPending, int announced, int readsOk)
 {
     if (!uidMine) return kRvNotMine;
@@ -111,23 +116,71 @@ inline int LostNoteAllowed(int uidMine, int ownerKnown, int refusedHere)
 {
     return (!uidMine && ownerKnown && !refusedHere) ? 1 : 0;
 }
+/* THE OWNER A ROW ASKS: this game's owner record of the uid when it has one (recordKnown, recordKey); otherwise, for a row booked from
+   a held MOVE (rowFromMove: its SPAWN never reached this game, so no record exists), the key of the game that streams it (rowKey).
+   Answers 1 with *key set; 0 when no owner is known (the row goes). */
+inline int LostRowOwner(int recordKnown, unsigned int recordKey, int rowFromMove, unsigned int rowKey, unsigned int* key)
+{
+    if (recordKnown) { if (key) *key = recordKey; return 1; }
+    if (rowFromMove && rowKey != 0) { if (key) *key = rowKey; return 1; }
+    return 0;
+}
+/* THE KEEP MARGIN of the lost-copy reads (the SPAWN gate and the book's look): how far beyond the engine's own 160-unit edge strip
+   (cooplo::kEngineEdgeStrip) a centre must stand from an area side whose neighbour area is not loaded here to read as kept. 0 is the
+   engine's own rule. A copy made just outside the strip that walks into it is put away after the engine's 4 s grace and booked again
+   with its spot (NotifyDespawn), asked for at its next visit; any margin would hide a character this engine keeps, with nothing to
+   correct it while the character stands still. (The hand-over's cooplo::kKeepMarginUnits, 250, is a different question: whether a
+   squad handed over stays kept while it walks on.) */
+const float kLostKeepMarginUnits = 0.0f;
+/* A SPAWN FOR ANOTHER GAME'S CHARACTER, ON THE RECEIVER: is the copy made, or the uid booked at the SPAWN's spot? A copy made where
+   this game's engine will not keep it (its area not loaded, or within the edge strip of a side whose neighbour area is not loaded,
+   widened by kLostKeepMarginUnits) is put away by that engine 4 s later, so the uid is BOOKED instead and its owner asked for it when the
+   spot is kept here. spotRead (LostSpawnSpotRead): 1 kept, 0 not kept, -1 no live read - the copy is made as before and the creation
+   core decides. A uid this game runs, one whose copy is here already (a repeat: the creation core's own rules), or one this game
+   holds a body of its own world for (twinHere: the creation core adopts that body as the copy, spawn.cpp AdoptExistingTwin - no new
+   copy is made) goes on as before. */
+enum { kSkMake = 0, kSkBook = 1 };
+inline int SpawnKeepDecide(int uidMine, int copyHere, int spotRead, int twinHere = 0)
+{
+    if (uidMine || copyHere || twinHere) return kSkMake;
+    return spotRead == 0 ? (int)kSkBook : (int)kSkMake;
+}
+/* spotRead from the live reads a lost-copy look takes: worldUp = a running world with engine writes allowed; zoneLoaded = the engine's
+   zone byte at the spot (1 / 0 / -1); engineKeeps = the engine's keep test at the spot with kLostKeepMarginUnits (1 / 0 / -1; read only
+   when zoneLoaded is 1). */
+inline int LostSpawnSpotRead(int worldUp, int zoneLoaded, int engineKeeps)
+{
+    if (!worldUp) return -1;
+    if (zoneLoaded == 0) return 0;
+    if (zoneLoaded != 1) return -1;
+    return engineKeeps == 1 ? 1 : (engineKeeps == 0 ? 0 : -1);
+}
 
 /* THE ASKER'S BOOK. */
-enum { kLcWaiting = 0, kLcAsked = 1, kLcAnswered = 2, kLcRefused = 3, kLcHere = 4 };
+enum { kLcWaiting = 0, kLcAsked = 1, kLcAnswered = 2, kLcRefused = 3, kLcHere = 4, kLcBackoff = 5 };
 const int kLostAsksPerVisit = 3;
-const size_t kLostBookMax = 256;
+const int kLostAnswerLooks = 5;    /* once-a-second looks an ASKED row waits for its answer before it is taken as lost and asked again */
+const int kLostBackoffLooks = 3;   /* once-a-second looks a row waits after an answer that sent nothing for a passing reason */
+/* 2048 rows of 64 bytes (128 KB): every character of another game near this game's area but where this engine does not keep it can
+   hold a row (its SPAWN was booked, not made); LostFind and the once-a-second look walk the rows. */
+const size_t kLostBookMax = 2048;
 struct LostRow
 {
     unsigned int uid, ownerKey;
     float x, y, z;
     int hasPos;
     int state;            /* kLc* */
-    int asksThisVisit;    /* asks made (sent or not) since the spot last became loaded here */
-    int loadedPrev;       /* the spot read as loaded here at the last look */
+    int asksThisVisit;    /* asks made (sent or not) since the spot last became kept here */
+    int loadedPrev;       /* the spot read as kept here at the last look */
     int asksTotal;        /* asks sent over the row's life */
     int noRoad;           /* the last ask found no road: further no-road asks in the same outage are not counted again */
     int hereMoves;        /* MOVEs seen for the copy since it came back (HERE) */
     int backThisVisit;    /* the copy came back during this visit: a loss in the same visit is not asked for */
+    int edgeWaitLine;     /* the caller wrote its edge-strip WAIT line for this waiting stretch (no decision here reads it) */
+    int ownerFromMove;    /* booked from a held MOVE: no owner record here, ownerKey is the MOVEs' sender (LostRowOwner) */
+    int waitLooks;        /* once-a-second looks since the last ask went out (ASKED) or the last passing refusal (BACKOFF) */
+    LostRow() : uid(0), ownerKey(0), x(0.0f), y(0.0f), z(0.0f), hasPos(0), state(kLcWaiting), asksThisVisit(0), loadedPrev(0), asksTotal(0),
+                noRoad(0), hereMoves(0), backThisVisit(0), edgeWaitLine(0), ownerFromMove(0), waitLooks(0) {}
 };
 struct LostBook
 {
@@ -143,25 +196,39 @@ inline int LostSectorOf(float c)
     if ((float)s > v) --s;
     return s;
 }
+/* Is the row's spot KEPT here: its area loaded (zoneLoaded, the engine's zone byte) and the engine keeping a squad at that spot
+   (engineKeeps: not within the edge strip of a side whose neighbour area is not loaded). Each reads 1 yes, 0 no, -1 unreadable;
+   only 1 and 1 is kept. */
+inline int LostSpotKept(int zoneLoaded, int engineKeeps) { return (zoneLoaded == 1 && engineKeeps == 1) ? 1 : 0; }
 inline int LostFind(const LostBook& b, unsigned int uid)
 {
     for (size_t i = 0; i < b.rows.size(); ++i) if (b.rows[i].uid == uid) return (int)i;
     return -1;
 }
+/* The row that makes room when the book is full: the oldest HERE row (its copy is here, so nothing is lost - the engine putting the
+   copy away books it again, with its spot), else the oldest row (a row of a uid with an owner record is booked again by its owner's
+   next MOVE, at that MOVE's spot - replicate.cpp ApplyRemoteMove; one booked from held MOVEs by the next held MOVE's expiry). */
+inline size_t LostEvictIndex(const LostBook& b)
+{
+    for (size_t i = 0; i < b.rows.size(); ++i) if (b.rows[i].state == kLcHere) return i;
+    return 0;
+}
 /* Note (or refresh) a lost uid: its owner and, when known, where it stands now. A new row starts WAITING with no visit; a refreshed
-   row keeps its visit and its count (a copy lost again on the same loaded ground spends the same budget) unless its new spot is in
-   another sector (the next loaded look starts a new visit), and a HERE row is lost again (WAITING); a row whose owner changed
-   starts again (the new owner was never asked). Past kLostBookMax the oldest row goes
-   (counted in `full`). Answers 1 for a new row, 0 for a refreshed one, -1 for uid 0. */
-inline int LostNote(LostBook* b, unsigned int uid, unsigned int ownerKey, int hasPos, float x, float y, float z)
+   row keeps its visit and its count (a copy lost again on the same kept ground spends the same budget) unless its new spot is in
+   another sector (the next kept look starts a new visit), and a HERE row is lost again (WAITING); a row whose owner changed
+   starts again (the new owner was never asked). Past kLostBookMax a row makes room (LostEvictIndex)
+   (counted in `full`). fromMove: this booking names the owner by a held MOVE's sender, not by an owner record (the row's
+   ownerFromMove takes the latest booking's word). Answers 1 for a new row, 0 for a refreshed one, -1 for uid 0. */
+inline int LostNote(LostBook* b, unsigned int uid, unsigned int ownerKey, int hasPos, float x, float y, float z, int fromMove = 0)
 {
     if (b == 0 || uid == 0) return -1;
     const int i = LostFind(*b, uid);
     if (i >= 0)
     {
         LostRow& r = b->rows[(size_t)i];
-        if (r.ownerKey != ownerKey) { r.ownerKey = ownerKey; r.state = kLcWaiting; r.asksThisVisit = 0; r.loadedPrev = 0; r.backThisVisit = 0; }
+        if (r.ownerKey != ownerKey) { r.ownerKey = ownerKey; r.state = kLcWaiting; r.asksThisVisit = 0; r.loadedPrev = 0; r.backThisVisit = 0; r.waitLooks = 0; }
         if (r.state == kLcHere) r.state = kLcWaiting;
+        r.ownerFromMove = fromMove ? 1 : 0;
         if (hasPos)
         {
             if (r.hasPos && (LostSectorOf(r.x) != LostSectorOf(x) || LostSectorOf(r.z) != LostSectorOf(z))) r.loadedPrev = 0;
@@ -169,21 +236,22 @@ inline int LostNote(LostBook* b, unsigned int uid, unsigned int ownerKey, int ha
         }
         return 0;
     }
-    if (b->rows.size() >= kLostBookMax) { b->rows.erase(b->rows.begin()); ++b->full; }
+    if (b->rows.size() >= kLostBookMax) { b->rows.erase(b->rows.begin() + (std::ptrdiff_t)LostEvictIndex(*b)); ++b->full; }
     LostRow r;
     r.uid = uid; r.ownerKey = ownerKey; r.x = hasPos ? x : 0.0f; r.y = hasPos ? y : 0.0f; r.z = hasPos ? z : 0.0f;
     r.hasPos = hasPos ? 1 : 0; r.state = kLcWaiting; r.asksThisVisit = 0; r.loadedPrev = 0; r.asksTotal = 0; r.noRoad = 0; r.hereMoves = 0;
-    r.backThisVisit = 0;
+    r.backThisVisit = 0; r.edgeWaitLine = 0; r.ownerFromMove = fromMove ? 1 : 0;
     b->rows.push_back(r);
     return 1;
 }
 
 /* One look at a row: DROP it, KEEP it while the copy is here, WAIT, or ASK. `haveCopy`: the copy exists here now; `ownerOk`: its
-   owner is on record and is not this game; `loadedHere`: the row's spot reads as loaded here now (a row with no spot is never
-   loaded). A copy that is here keeps its row until the visit ends (HERE); the row goes when the copy is here and the visit is
-   over, or when the owner record is gone. With no copy here on loaded ground: a new visit asks; an ask that awaits its answer
-   waits for the rest of its visit; inside a visit only a WAITING row whose copy has not come back in this visit asks, within the budget. The
-   caller then applies LostLookApply to a row it did not drop. */
+   owner is on record and is not this game; `loadedHere`: the row's spot reads as KEPT here now (LostSpotKept; a row with no spot is
+   never kept). A copy that is here keeps its row until the visit ends (HERE); the row goes when the copy is here and the visit
+   is over, or when the owner record is gone. With no copy here on kept ground: a new visit asks; inside a visit, within the
+   budget and not after the copy came back in this visit, a WAITING row asks, an ASKED row asks again once kLostAnswerLooks
+   once-a-second looks passed without its answer (taken as lost), a BACKOFF row once kLostBackoffLooks passed; ANSWERED (SENT) and
+   REFUSED (NOT ANNOUNCED, NOT MINE) wait for the next visit. The caller then applies LostLookApply to a row it did not drop. */
 enum { kLaWait = 0, kLaAsk = 1, kLaDrop = 2, kLaHere = 3 };
 inline int LostLookDecide(int haveCopy, int ownerOk, int loadedHere, const LostRow& r)
 {
@@ -191,16 +259,19 @@ inline int LostLookDecide(int haveCopy, int ownerOk, int loadedHere, const LostR
     if (!ownerOk) return kLaDrop;
     if (haveCopy) return (loaded && r.loadedPrev) ? kLaHere : kLaDrop;
     if (!loaded) return kLaWait;
-    if (!r.loadedPrev) return kLaAsk;                                    /* a new visit: every earlier answer is history (an answer lost on the way is covered here) */
-    if (r.state == kLcAsked) return kLaWait;                             /* the answer is owed */
-    if (r.state != kLcWaiting || r.backThisVisit) return kLaWait;        /* answered, refused, or back in this visit: the next visit */
-    return r.asksThisVisit < kLostAsksPerVisit ? kLaAsk : kLaWait;
+    if (!r.loadedPrev) return kLaAsk;                                    /* a new visit: every earlier answer is history */
+    if (r.backThisVisit || r.asksThisVisit >= kLostAsksPerVisit) return kLaWait;
+    if (r.state == kLcAsked) return r.waitLooks >= kLostAnswerLooks ? kLaAsk : kLaWait;     /* the answer is owed until then */
+    if (r.state == kLcBackoff) return r.waitLooks >= kLostBackoffLooks ? kLaAsk : kLaWait;
+    return r.state == kLcWaiting ? kLaAsk : kLaWait;                     /* ANSWERED, REFUSED: the next visit */
 }
-/* The row after a look that did not drop it. A sent ASK counts against the visit (ASKED). An ASK that found no road leaves the row
-   WAITING for the next look and counts once per road outage: the first no-road ask of an outage is counted, the ones after it are
-   not, until an ask goes out again. A copy that comes back (HERE) starts counting its MOVEs from 0 and marks the visit. A new visit
-   starts the count and the mark again; an ask that awaits its answer stays ASKED. */
-inline void LostLookApply(LostRow* r, int loadedHere, int action, int sent)
+/* The row after a look that did not drop it. A sent ASK counts against the visit (ASKED) and starts its wait from 0. An ASK that
+   found no road leaves the row's state for the next look and counts once per road outage: the first no-road ask of an outage is
+   counted, the ones after it are not, until an ask goes out again. A copy that comes back (HERE) starts counting its MOVEs from 0
+   and marks the visit. A new visit starts the count and the mark again; an ask that awaits its answer stays ASKED. `loadedHere`: as
+   LostLookDecide's (kept here). `tick`: the once-a-second look (LostCopyTick) - only those run down an ASKED row's wait and a
+   BACKOFF row's back-off (a look at a MOVE is not a second). */
+inline void LostLookApply(LostRow* r, int loadedHere, int action, int sent, int tick = 0)
 {
     if (r == 0) return;
     const int loaded = (loadedHere && r->hasPos) ? 1 : 0;
@@ -209,9 +280,10 @@ inline void LostLookApply(LostRow* r, int loadedHere, int action, int sent)
     r->loadedPrev = loaded;
     if (action == kLaAsk)
     {
-        if (sent) { ++r->asksThisVisit; r->state = kLcAsked; ++r->asksTotal; r->noRoad = 0; }
+        if (sent) { ++r->asksThisVisit; r->state = kLcAsked; ++r->asksTotal; r->noRoad = 0; r->waitLooks = 0; }
         else if (!r->noRoad) { ++r->asksThisVisit; r->noRoad = 1; }
     }
+    else if (tick && (r->state == kLcAsked || r->state == kLcBackoff)) ++r->waitLooks;
 }
 /* Did this no-road ask start an outage (the first of it - the one worth a line)? Read BEFORE LostLookApply. */
 inline int LostNoRoadFirst(const LostRow& r) { return r.noRoad ? 0 : 1; }
@@ -232,11 +304,17 @@ inline int LostAnswerFromOwner(unsigned int rowOwnerKey, unsigned int senderKey)
     return (rowOwnerKey != 0 && rowOwnerKey == senderKey) ? 1 : 0;
 }
 /* The owner's answer for one row (only when LostAnswerFromOwner said so). Only a row that awaits it (ASKED) takes it; a row whose
-   copy is already back (HERE) or that was booked again keeps its state. */
+   copy is already back (HERE) or that was booked again keeps its state. SENT: ANSWERED (its state is on the way; the next visit asks
+   if no copy came). NOT ANNOUNCED or NOT MINE (LostAnswerParks): REFUSED for the rest of the visit - the owner's announce pass, or
+   the roster's MOVED word, decides. Any other (a hand-over in flight, no body, a failed send, no road, an older build's NOT IN AREA):
+   BACKOFF - asked again after kLostBackoffLooks once-a-second looks, within the visit's kLostAsksPerVisit asks. */
+inline int LostAnswerParks(int verdict) { return (verdict == kRvNotAnnounced || verdict == kRvNotMine) ? 1 : 0; }
 inline void LostAnswerApply(LostRow* r, int verdict)
 {
     if (r == 0 || r->state != kLcAsked) return;
-    r->state = (verdict == kRvSent) ? kLcAnswered : kLcRefused;
+    if (verdict == kRvSent) r->state = kLcAnswered;
+    else if (LostAnswerParks(verdict)) r->state = kLcRefused;
+    else { r->state = kLcBackoff; r->waitLooks = 0; }
 }
 /* A SPAWN made the copy of a booked uid (or found it live): the row is HERE at once and the visit is marked, so no look after it
    asks while the copy is here or after it is put away again in the same visit. Answers 1 when the row was not HERE (the copy is

@@ -45,6 +45,7 @@
 #include "../common/uidslots.h"     // the per-copy word tables' slot bookkeeping (hunger, knocked out, dead)
 #include "../common/corpsedecay.h"   // a copy's dead body is held short of the rot limit
 #include "replicate.h"   // PuppetUidsSnapshot - the copies this game holds
+#include "effect.h"      // EffectKoAwaitingReq: a sneak knockout whose victim's owner applies the knockout
 #include <intrin.h>        // C2-b: _ReturnAddress - which caller is applying the damage
 
 #include "coop_log.h"
@@ -65,6 +66,7 @@ static unsigned long long kMig3MedicalUpdate = 0; static coop::AddrReg kMig3Medi
 #include <sstream>
 #include <locale>
 #include <map>   // T-303: the SPAWN deaths still to land
+#include <stdio.h>   /* _snprintf: the [HEAL] playerorder line */
 #include <set>   // the copies pinned
 #include "playerfaction.h"   /* re-check par6 #1: IsPlayerFaction - an unequip kill only happens to a non-player character */
 
@@ -330,7 +332,8 @@ void detour_medicalUpdate(MedicalSystem* self, float frameTime)
 //   - the owner's latest STATE says it is knocked out (the latch ApplyLatch applied: `unconcious` set, or a
 //     wake-up clock still running), or
 //   - this very thread is inside ApplyState applying the owner's STATE (ApplyingOwnerState).
-// Otherwise the call returns without starting anything and is counted (puppetKoRefused). Characters this game
+// Otherwise the call returns without starting anything and is counted (puppetKoRefused; puppetKoAwaitingOwner for a sneak
+// knockout whose victim's own game applies the knockout). Characters this game
 // drives, and every character in a lone game (no uid), take the engine's path untouched.
 // ApplyLatch itself calls NEITHER function - it writes `unconcious` and `knockoutClock` directly - so the
 // owner's own knockout still reaches the copy exactly as before. Nothing here writes a medical field or a prone
@@ -362,13 +365,15 @@ volatile LONG64 g_puppetKoRefused         = 0;
 volatile LONG64 g_puppetKoAllowedOwner    = 0;   // the owner's latest STATE says knocked out
 volatile LONG64 g_puppetKoAllowedApplying = 0;   // called from inside ApplyState itself
 volatile LONG64 g_puppetKoRefusedRebuild  = 0;   // crash1c (R2c): refused because a body rebuild is in flight on the copy
+volatile LONG64 g_puppetKoAwaitingOwner   = 0;   // refused too: a sneak knockout's own knockout of a copy whose owner applies it
 
 // The first kKoRefusalLog refusals, for the main thread to log: uid, which function, its argument, and the clock
 // as it stood. The engine computes the timer INSIDE these functions (floor 3.0 s) - startKnockoutTimer takes no
 // argument and knockout takes a 0..1 skill - so the timer it would have set does not exist before the call;
 // the argument and the current clock are what a refusal can honestly show.
 const int kKoRefusalLog = 16;
-struct KoRefusal { volatile LONG ready; unsigned int uid; int fn; float arg; float timerNow; };
+// A sneak knockout's own knockout of a copy (awaitReq != 0) is logged AWAITING STATE instead.
+struct KoRefusal { volatile LONG ready; unsigned int uid; int fn; float arg; float timerNow; unsigned int awaitReq; };
 KoRefusal g_koRefusal[kKoRefusalLog];
 volatile LONG g_koRefusalTaken  = 0;
 int           g_koRefusalLogged = 0;   // main thread only
@@ -389,9 +394,10 @@ bool OwnerSaysKo(unsigned int uid)
     return ko && (unsigned int)g_ownerKo[at].uid == uid;   // released (or reused) while it was read: not knocked out
 }
 
-// true = let the engine start its clock. fn: 1 = startKnockoutTimer(), 2 = knockout(float).
+// true = let the engine start its clock. fn: 1 = startKnockoutTimer(), 2 = knockout(float). ret: the engine caller's return
+// address (0 when not known).
 // The puppet test is the one detour_medicalUpdate uses: a replicated uid that this game does not own.
-bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg)
+bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg, unsigned long long ret)
 {
     const void* owner = (const void*)((const char*)self - kMedicalOffset);
     unsigned int uid = FindSpawnedUid(owner);
@@ -415,12 +421,16 @@ bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg)
         return true;
     }
 
-    InterlockedIncrement64(&g_puppetKoRefused);
+    // A sneak knockout this game rolled (or was told) KNOCKED OUT: the victim's own game applies the knockout and its STATE brings
+    // the copy down - refused here too, counted and logged apart from a refusal.
+    const unsigned int awaitReq = (fn == 2) ? EffectKoAwaitingReq(ret, uid) : 0u;
+    if (awaitReq != 0) InterlockedIncrement64(&g_puppetKoAwaitingOwner);
+    else InterlockedIncrement64(&g_puppetKoRefused);
     LONG slot = InterlockedIncrement(&g_koRefusalTaken) - 1;
     if (slot < kKoRefusalLog)
     {
         KoRefusal& r = g_koRefusal[slot];
-        r.uid = uid; r.fn = fn; r.arg = arg; r.timerNow = self->knockoutClock;
+        r.uid = uid; r.fn = fn; r.arg = arg; r.timerNow = self->knockoutClock; r.awaitReq = awaitReq;
         InterlockedExchange(&r.ready, 1);
     }
     return false;
@@ -428,13 +438,14 @@ bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg)
 
 void detour_startKnockoutTimer(MedicalSystem* self)
 {
-    if (!PuppetKoAllowed(self, 1, 0.0f)) return;   // refused: no clock started on this copy
+    if (!PuppetKoAllowed(self, 1, 0.0f, 0)) return;   // refused: no clock started on this copy
     orig_startKnockoutTimer(self);
 }
 
 void detour_knockout(MedicalSystem* self, float skill01)
 {
-    if (!PuppetKoAllowed(self, 2, skill01)) return;   // refused: no clock started on this copy
+    const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();   // first: which engine call is knocking out
+    if (!PuppetKoAllowed(self, 2, skill01, ret)) return;   // refused: no clock started on this copy
     orig_knockout(self, skill01);
 }
 
@@ -532,6 +543,93 @@ void InstallCopyDamageSkip()
     DebugLog(std::string("[C2-b] copy damage skip: applyDamage 0x64E870 AddHook ")
              + (st == coop::SUCCESS ? "SUCCESS" : "FAILED")
              + " (skipped only for a copy, only on the hit path, return 0x65060C)");
+}
+
+// A MEDIC'S WORK ON A COPY, AS THE ENGINE DOES IT. The per-part treatment step (table row MedTreatParts; applyFirstAid calls it at
+// 0x64D970, the medic task after its applyFirstAid call - Steam 1.0.68 addresses) raises each treated part's bandageLevel
+// (HealthPartStatus +0x48). A robotic part turns bandage into health about 250x faster than flesh, so the half-second sample in
+// spawn.cpp TreatTick can miss a robotic part's repair, which turns into health within a frame or two. This hook records what each
+// call added, per part, when the PATIENT is a copy (a replicated character this game does not own) and the MEDIC is this game's own
+// (a replicated character this game owns); TreatTick sends a part the sample did not see rise as that amount alone, once. The
+// engine's drain does not run inside this step, so after - before is the treatment itself.
+// Signature: bool (al) step(MedicalSystem* rcx, float skill xmm1, Item* kit r8, float timeStep xmm3, Character* medic [rsp+0x28]) -
+// applyFirstAid's call site loads exactly these (0x64D95E-0x64D96B), the step reads the 5th argument at [rsp+0xD0] after its
+// 0xA8-byte frame and calls a virtual on it, and items.cpp CcFirstAidFn (applyFirstAid itself) has the same shape.
+// DETOUR-THREAD RULES: a medic's work can run on an AI worker - address compares, guarded reads, the any-thread owner tests and
+// TreatNoteAdded's own lock only; no allocation, no string, no log.
+static unsigned long long kMedTreatPartsRva = 0; static coop::AddrReg kMedTreatPartsRva_reg("MedTreatParts", &kMedTreatPartsRva);   /* Steam_1.0.65 0x648F70, Steam_1.0.68 0x649A00 */
+typedef bool (*TreatPartsFn)(void* ms, float skill, void* kit, float timeStep, void* medic);
+TreatPartsFn orig_treatParts = 0;
+const int kTreatHookParts = 32;          /* as cooptreat::kTreatMaxParts: a record with more parts is not recorded */
+const size_t kMsPartCount = 0x198;       /* MedicalSystem: part count (partAt 0x2AA600 and the step's own loop bound read it) */
+const size_t kMsPartArray = 0x1A0;       /* MedicalSystem: the HealthPartStatus* array, 8 bytes a part */
+const size_t kPartBandage = 0x48;        /* HealthPartStatus::bandageLevel, the value the step raises */
+
+/* Each part's bandageLevel into out[] (-1 for a part with no record); the part count, or -1 when the record cannot be read or holds
+   more than cap parts. Guarded: a fault reads as -1. */
+int TreatPartsRead(const void* ms, float* out, int cap)
+{
+    __try
+    {
+        const unsigned int n = *(const unsigned int*)((const char*)ms + kMsPartCount);
+        if (n > (unsigned int)cap) return -1;
+        const char* const* parts = *(const char* const* const*)((const char*)ms + kMsPartArray);
+        if (n > 0 && parts == 0) return -1;
+        for (unsigned int i = 0; i < n; ++i)
+            out[i] = parts[i] != 0 ? *(const float*)(parts[i] + kPartBandage) : -1.0f;
+        return (int)n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* 1 = the record's character is a copy: a replicated uid this game does not own, with the owned mirror exact (while it may be
+   missing an owned uid, "not mine" is no proof and the treatment is left to the sampled road). The tests PuppetKoAllowed and
+   items.cpp ItCcIsCopy use. Any thread. */
+int TreatPatientIsCopy(void* ms, unsigned int* uid)
+{
+    const void* owner = (const void*)((const char*)ms - kMedicalOffset);
+    *uid = FindSpawnedUid(owner);
+    if (*uid == 0 || net::IsUidMineAnyThread(*uid)) return 0;
+    return net::OwnedMirrorExactAnyThread() ? 1 : 0;
+}
+
+/* 1 = the medic is this game's own: a replicated character this game owns. A medic with no uid (a town character each game runs on
+   its own) is not - the patient's owner's game runs that medic's treatment itself. Asked after TreatPatientIsCopy, so the owned
+   mirror is exact. No medic: 0 (nobody to credit). Any thread. */
+int TreatMedicIsOwn(void* medic)
+{
+    if (medic == 0 || !PlausiblePtr(medic)) return 0;
+    const unsigned int m = FindSpawnedUid(medic);
+    return (m != 0 && net::IsUidMineAnyThread(m)) ? 1 : 0;
+}
+
+bool detour_treatParts(void* ms, float skill, void* kit, float timeStep, void* medic)
+{
+    unsigned int uid = 0;
+    if (ms == 0 || !PlausiblePtr(ms) || TreatPatientIsCopy(ms, &uid) == 0 || TreatMedicIsOwn(medic) == 0)
+        return orig_treatParts(ms, skill, kit, timeStep, medic);
+    float before[kTreatHookParts], after[kTreatHookParts];
+    const int n = TreatPartsRead(ms, before, kTreatHookParts);
+    const bool r = orig_treatParts(ms, skill, kit, timeStep, medic);
+    if (n > 0 && TreatPartsRead(ms, after, kTreatHookParts) == n)
+        for (int i = 0; i < n; ++i)
+            if (before[i] >= 0.0f && after[i] > before[i])
+                coop::TreatNoteAdded(uid, i, after[i] - before[i]);
+    return r;
+}
+
+void InstallCopyTreatCatch()
+{
+    if (kMedTreatPartsRva == 0)
+    {
+        ErrorLog("[HEAL] treat catch: MedTreatParts not in the address table - per-part treatment hook OFF (a copy's treatment is only sampled)");
+        return;
+    }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    coop::HookStatus st = coop::AddHook((void*)(base + (uintptr_t)kMedTreatPartsRva),
+                                        (void*)&detour_treatParts, (void**)&orig_treatParts);
+    DebugLog(std::string("[HEAL] treat catch: per-part treatment hook ") + (st == coop::SUCCESS ? "SUCCESS" : "FAILED")
+             + " (records a copy's treatment by a medic that is not a copy)");
 }
 
 // par6 (parity P6; parity-audit-characters row 16) - A COPY DIES ONLY WHEN ITS OWNER SAYS IT IS DEAD.
@@ -692,6 +790,11 @@ void DrainKoRefusals()
     {
         const KoRefusal& r = g_koRefusal[g_koRefusalLogged];
         ++g_koRefusalLogged;
+        if (r.awaitReq != 0)
+        {
+            DebugLog("[C2] puppet knockout AWAITING STATE uid=" + N(r.uid) + " via StealthKO (req=" + N(r.awaitReq) + ")");
+            continue;
+        }
         DebugLog("[C2] puppet knockout timer REFUSED #" + N(g_koRefusalLogged) + " uid=" + N(r.uid)
                  + (r.fn == 1 ? std::string(" via startKnockoutTimer()")
                               : std::string(" via knockout(skill01=") + F2(r.arg) + ")")
@@ -755,6 +858,21 @@ int KnockOutOwned(unsigned int uid)
              + " koTimer=" + F2(med->knockoutClock) + " prone=" + N((int)c->poseState())
              + " pushed=" + N(pushed ? 1 : 0));
     return unc;
+}
+
+// See medical.h. The victim's owner applying a sneak knockout's success: the engine's own knockout(float) through the knockout
+// gate (it lets a character this game drives through), as KnockOutOwned does. `unconcious` follows at the medical update.
+int StealthKnockOutOwned(unsigned int uid, float skill01, float* koTimerOut)
+{
+    if (koTimerOut != 0) *koTimerOut = 0.0f;
+    if (!net::IsUidMine(uid)) return -1;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0) return -1;
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
+    if (!PlausiblePtr(med) || orig_knockout == 0) return -1;
+    detour_knockout(med, skill01);
+    if (koTimerOut != 0) *koTimerOut = med->knockoutClock;
+    return med->unconcious ? 1 : 0;
 }
 
 // P11 fold 1 (T652) TEST-ONLY lever (`koself`, appearance.cpp KoSelfLever): after KnockOutOwned, hold the wake-up clock
@@ -1379,6 +1497,7 @@ void InstallMedicalProbe()
     InstallPuppetKoGate();   // C2 (read-KO): independent of the probe below
     InstallCopyDamageSkip();   // C2-b (read-damage): a copy's hit-path applyDamage is skipped
     InstallCopyAmputateGate();   // LIMBS: a copy loses a limb only when its owner's STATE says so
+    InstallCopyTreatCatch();   // a medic's per-part treatment of a copy is recorded for spawn.cpp TreatTick
     InstallRagdollRest();   // R3 (read-ragdoll): a copy's settled ragdoll is moved to its owner's rest, inside 0x7D38D0
     DebugLog("[P014] resolving MedicalSystem::medicalUpdate ...");
     intptr_t fn = (intptr_t)coop::AddrAbs(kMig3MedicalUpdate);
@@ -1536,6 +1655,7 @@ void ReportMedical()
        << " puppetKoAllowedOwner=" << N(g_puppetKoAllowedOwner)
        << " puppetKoAllowedApplying=" << N(g_puppetKoAllowedApplying)
        << " koRefusedRebuild=" << N(g_puppetKoRefusedRebuild)          // crash1c (R2c)
+       << " puppetKoAwaitingOwner=" << N(g_puppetKoAwaitingOwner)   /* a sneak knockout's knockout of a copy, applied by its owner */
        << " ownerKoTableFull=" << N(g_ownerKoTableFull)
        << " hungerCarried=" << N(g_hungerCarried)          /* par5 (parity P5) */
        << " hungerApplied=" << N(g_hungerApplied)
@@ -1718,6 +1838,139 @@ void ReportKO(unsigned int uid)
              + " vital=" + N(VitalPartIndex(med, 0)) + "," + N(VitalPartIndex(med, 1))
              + " mine=" + N(net::IsUidMine(uid) ? 1 : 0)
              + " " + LatchString(c));
+}
+
+// THE PLAYER'S OWN TREATMENT ORDER (TEST-ONLY lever `playerorder`). A right-click on a patient runs the selection handler (address
+// table: AddOrderSelectedCharacters), which runs the refusal check and then Character's player-order entry (AddOrder) with
+// (character, 0, task, target, shift, clear, &Ogre::Vector3::ZERO); the engine's callers load that last pointer from the import slot
+// of Ogre::Vector3::ZERO (AddOrderArgGlobal). Task 25 is first aid, task 60 robot repair. The medic's AI pops a treatment order whose
+// score is 0 or below, so before the order the lever reads what the score is made of: the patient's needs (MedicalSystem embedded at
+// Character +0x458: +0xAC first aid, +0xA8 repair, +0x164 dead - the engine's need reader returns exactly these), the medic's kits
+// (Inventory* at Character +0x2E8: item count +0x18, Item* array +0x20, item type +0x124; type 1 first-aid kit, 0xC robot repair
+// kit - the engine's has-item-of-type reads the same) and the score itself (AI_treatScore: float(medic, patient, useFirstAidKit,
+// useRepairKit); a player-faction medic scores a need only with its kit flag set). Every read and both engine calls are guarded:
+// a wrong offset prints garbage or '?', never a crash.
+static unsigned long long kPoAddOrderRva = 0; static coop::AddrReg kPoAddOrderRva_reg("AddOrder", &kPoAddOrderRva);   /* Steam_1.0.65 0x5D1640, Steam_1.0.68 0x5D20D0 */
+static unsigned long long kPoZeroSlotRva = 0; static coop::AddrReg kPoZeroSlotRva_reg("AddOrderArgGlobal", &kPoZeroSlotRva);   /* Steam_1.0.65 0x2246C68, Steam_1.0.68 0x2247C90 */
+static unsigned long long kPoTreatScoreRva = 0; static coop::AddrReg kPoTreatScoreRva_reg("AI_treatScore", &kPoTreatScoreRva);   /* Steam_1.0.65 0x997330, Steam_1.0.68 0x998200 */
+typedef void (*PoAddOrderFn)(void* who, void* a2, int taskType, void* target, char shift, char clearOld, unsigned long long zeroVec);
+typedef float (*PoTreatScoreFn)(void* medic, void* patient, bool useFirstAidKit, bool useRepairKit);
+static const size_t kPoMedical = 0x458, kPoNeedRepair = 0xA8, kPoNeedAid = 0xAC, kPoDead = 0x164;
+static const size_t kPoInventory = 0x2E8, kPoInvCount = 0x18, kPoInvArray = 0x20, kPoItemType = 0x124;
+static const int kPoKitFirstAid = 1, kPoKitRepair = 0xC;
+static const unsigned int kPoInvMax = 4096;   /* a count above this is not a real inventory: the walk is not made */
+
+struct PlayerOrderRead
+{
+    int needsOk; float needAid; float needRepair; int dead;
+    int kitsOk; int kit1; int kitC;
+    int scoreOk; float score;
+};
+
+static void PlayerOrderNeedsPod(const char* patient, PlayerOrderRead* r)
+{
+    __try
+    {
+        const char* ms = patient + kPoMedical;
+        r->needAid = *(const float*)(ms + kPoNeedAid);
+        r->needRepair = *(const float*)(ms + kPoNeedRepair);
+        r->dead = *(const unsigned char*)(ms + kPoDead) != 0 ? 1 : 0;
+        r->needsOk = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r->needsOk = 0; }
+}
+
+static void PlayerOrderKitsPod(const char* medic, PlayerOrderRead* r)
+{
+    __try
+    {
+        r->kit1 = 0; r->kitC = 0;
+        const char* inv = *(const char* const*)(medic + kPoInventory);
+        if (inv == 0) { r->kitsOk = 1; return; }   /* no inventory: no kit */
+        const unsigned int n = *(const unsigned int*)(inv + kPoInvCount);
+        const char* const* arr = *(const char* const* const*)(inv + kPoInvArray);
+        if (n > kPoInvMax || (n != 0 && arr == 0)) return;   /* kitsOk stays 0: printed as '?' */
+        for (unsigned int i = 0; i < n; ++i)
+        {
+            const char* it = arr[i];
+            if (it == 0) continue;
+            const int type = *(const int*)(it + kPoItemType);
+            if (type == kPoKitFirstAid) ++r->kit1;
+            else if (type == kPoKitRepair) ++r->kitC;
+        }
+        r->kitsOk = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r->kitsOk = 0; r->kit1 = 0; r->kitC = 0; }
+}
+
+static void PlayerOrderScorePod(void* medic, void* patient, bool useKit1, bool useKitC, PlayerOrderRead* r)
+{
+    if (kPoTreatScoreRva == 0) return;   /* scoreOk stays 0: printed as '?' */
+    const PoTreatScoreFn fn = (PoTreatScoreFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kPoTreatScoreRva);
+    __try { r->score = fn(medic, patient, useKit1, useKitC); r->scoreOk = 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r->scoreOk = 0; }
+}
+
+static int PlayerOrderGivePod(void* medic, void* patient, int task)   /* 1 given, 0 no address, -1 faulted */
+{
+    if (kPoAddOrderRva == 0 || kPoZeroSlotRva == 0) return 0;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const PoAddOrderFn fn = (PoAddOrderFn)(base + (uintptr_t)kPoAddOrderRva);
+    __try
+    {
+        const unsigned long long zeroVec = *(const unsigned long long*)(base + (uintptr_t)kPoZeroSlotRva);
+        fn(medic, 0, task, patient, 0, 1, zeroVec);   /* shift 0, clear the old orders 1, as a plain right-click */
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static void PlayerOrderFloat(char* out, size_t cap, int ok, float v)
+{
+    if (ok) _snprintf(out, cap, "%.3f", v); else _snprintf(out, cap, "?");
+    out[cap - 1] = 0;
+}
+
+bool PlayerOrderLever(unsigned int medicUid, unsigned int patientUid, int task)
+{
+    ::Character* medic = medicUid != 0 ? FindSpawned(medicUid) : 0;
+    ::Character* patient = patientUid != 0 ? FindSpawned(patientUid) : 0;
+    const bool mine = medicUid != 0 && net::IsUidMine(medicUid);
+    const bool taskOk = task == 25 || task == 60;
+    PlayerOrderRead r;
+    r.needsOk = 0; r.needAid = 0.0f; r.needRepair = 0.0f; r.dead = 0;
+    r.kitsOk = 0; r.kit1 = 0; r.kitC = 0;
+    r.scoreOk = 0; r.score = 0.0f;
+    if (patient != 0) PlayerOrderNeedsPod((const char*)patient, &r);
+    if (medic != 0) PlayerOrderKitsPod((const char*)medic, &r);
+    if (medic != 0 && patient != 0 && taskOk)
+        PlayerOrderScorePod(medic, patient, task == 25 && r.kit1 > 0, task == 60 && r.kitC > 0, &r);
+    const char* why = 0;
+    if (!taskOk) why = "task";
+    else if (medic == 0) why = "medic-not-found";
+    else if (patient == 0) why = "patient-not-found";
+    else if (!mine) why = "medic-not-mine";
+    int called = 0;
+    if (why == 0)
+    {
+        const int g = PlayerOrderGivePod(medic, patient, task);
+        if (g == 1) called = 1;
+        else why = g == 0 ? "no-address" : "fault";
+    }
+    char fAid[32], fRep[32], fScore[32], fDead[8], fK1[16], fKc[16];
+    PlayerOrderFloat(fAid, sizeof(fAid), r.needsOk, r.needAid);
+    PlayerOrderFloat(fRep, sizeof(fRep), r.needsOk, r.needRepair);
+    PlayerOrderFloat(fScore, sizeof(fScore), r.scoreOk, r.score);
+    if (r.needsOk) _snprintf(fDead, sizeof(fDead), "%d", r.dead); else _snprintf(fDead, sizeof(fDead), "?");
+    if (r.kitsOk) { _snprintf(fK1, sizeof(fK1), "%d", r.kit1); _snprintf(fKc, sizeof(fKc), "%d", r.kitC); }
+    else { _snprintf(fK1, sizeof(fK1), "?"); _snprintf(fKc, sizeof(fKc), "?"); }
+    fDead[sizeof(fDead) - 1] = 0; fK1[sizeof(fK1) - 1] = 0; fKc[sizeof(fKc) - 1] = 0;
+    char line[512];
+    _snprintf(line, sizeof(line), "[HEAL] playerorder medic=%u patient=%u task=%d needAid=%s needRepair=%s dead=%s kit1=%s kitC=%s score=%s called=%d%s%s",
+              medicUid, patientUid, task, fAid, fRep, fDead, fK1, fKc, fScore, called, why != 0 ? " why=" : "", why != 0 ? why : "");
+    line[sizeof(line) - 1] = 0;
+    DebugLog(line);
+    return called != 0;
 }
 
 } // namespace coop

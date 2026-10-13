@@ -16,7 +16,7 @@
      - not numbered and no field 5 / no key file                     -> allow, the feature is new       (kAllowNoGen, fail open)
      - a joiner                                                      -> never refused by this arm       (kAllowJoiner)
    An allowed save whose number is ABOVE the notebook's (a lost WORLD_SAVED) is adopted, so a number is never handed out twice.
-   repairEpoch is fixed at 0 until restore1b (the repair). */
+   repairEpoch is the notebook's epoch: 0 in every world no repair ever touched (the repair itself was removed in T-716). */
 #ifndef KENSHI_COOP_RESTOREGUARD_H
 #define KENSHI_COOP_RESTOREGUARD_H
 
@@ -43,9 +43,9 @@ struct WorldState
 };
 
 enum Verdict { kAllow = 0, kAllowJoiner = 1, kAllowNoGen = 2, kAllowNoTail = 3, kRefuseOlderWorld = 4, kRefuseNotebookBehind = 5,
-               kRefuseUnnumbered = 6, kRefuseKeyless = 7, kRefuseUndone = 8 };   /* restore1c: 8 = a save from a timeline a repair undid */
+               kRefuseUnnumbered = 6, kRefuseKeyless = 7 };
 
-inline bool IsRefusal(int v) { return v == kRefuseOlderWorld || v == kRefuseNotebookBehind || v == kRefuseUnnumbered || v == kRefuseKeyless || v == kRefuseUndone; }
+inline bool IsRefusal(int v) { return v == kRefuseOlderWorld || v == kRefuseNotebookBehind || v == kRefuseUnnumbered || v == kRefuseKeyless; }
 inline const char* VerdictName(int v)
 {
     switch (v)
@@ -58,7 +58,6 @@ inline const char* VerdictName(int v)
     case kRefuseNotebookBehind: return "refuseNotebookBehind";
     case kRefuseUnnumbered: return "refuseUnnumbered";
     case kRefuseKeyless: return "refuseKeyless";
-    case kRefuseUndone: return "refuseUndone";
     }
     return "?";
 }
@@ -305,7 +304,7 @@ inline WorldMsg RowOf(const WorldBook& b, const std::string& profile)
    (profile, store) in own_high.txt, never steps back, answers every report with its number and pushes every row of the
    connecting profile right after the WELCOME. A game whose records are BELOW the notebook's number (an old records folder copied
    back in) is refused: its records writer stays off and its loads are refused. No number (0) fails open. Joiners and the
-   operator alike. Only the host's repair (restore1b part 2) may lower a number.
+   operator alike. Nothing lowers a number.
    CHECKPOINTS: a folder per tag - a world save "g<gen>-s<nbSeq>-<profile>" (the OPERATOR's profile and stamp: numbers are per
    profile since the restore1a fold), a leave "l-s<nbSeq>-o<ownHigh>". The prune keeps the newest kCheckpointCap world tags per
    profile and the newest kCheckpointCap leave tags; a name that is not a tag (a ".part" folder, anything else) is never touched.
@@ -323,19 +322,19 @@ inline int OwnHighDecide(bool storeChosen, unsigned long long ownHigh, unsigned 
 }
 inline const char* OwnHighRefusalWords()
 {
-    return "This game's records are older than the world remembers for you - an old records folder was put back. Start a new profile, or ask the host to repair the world";
+    return "This game's records are older than the world remembers for you - an old records folder was put back";
 }
 /* ui1 (ui-polish-audit 3.2; the owner's wording): what the PLAYER reads for the same refusal - no "records" jargon. The
    log keeps OwnHighRefusalWords. No full stop: the callers add it. */
 inline const char* OwnHighRefusalPlayerWords()
 {
-    return "Your save is older than the host's world. Start a new profile, or ask the host to restore the world";
+    return "Your save is older than the host's world";
 }
 /* words1b (owner 2026-09-27): the same refusal on the HOST's own game names no host (store.cpp OwnHighWordsForRole picks). No
    full stop: the callers add it. */
 inline const char* OwnHighRefusalHostWords()
 {
-    return "Your save is older than the world. Start a new profile, or restore the world";
+    return "Your save is older than the world";
 }
 /* A records store's name as it crosses the wire and names a book row: 1..48 of [A-Za-z0-9_-]. */
 inline bool OwnStoreNameOk(const std::string& s)
@@ -531,7 +530,7 @@ inline bool CheckpointWorldOk(const std::string& w)
     return true;
 }
 /* fold (review item 6): THE RECYCLE BIN CAN TAKE THE FOLDER - a local fixed drive whose bin answered SHQueryRecycleBinA, and the
-   folder within 1% of the drive and never above 1 GiB (the profile-delete rule, store.cpp ProfileRecycleSave). Otherwise the
+   folder within 1% of the drive and never above 1 GiB (under the smallest bin Windows sets up by itself). Otherwise the
    caller moves nothing: never a hard delete, never a prompt. */
 inline bool RecycleBinCanTake(bool fixedDrive, bool binAnswered, unsigned long long folderBytes, unsigned long long driveBytes)
 {
@@ -586,231 +585,6 @@ inline bool IsWorldBroadcast(const char* p, size_t n)
     unsigned int w = 0; std::memcpy(&w, p + at, 4);
     return w == kWorldBroadcastWord;
 }
-
-/* ==== restore1c (design s4 "Repair a broken world", s5 Run W; owner rules: the host-only repair rolls the WHOLE world back, every
-   player's records included, never partially; running players restart; records always win otherwise) ====
-   repair.txt (the notebook): one `rp1<TAB>epoch<TAB>restoreGen<TAB>restoreSeq<TAB>profile<TAB>unix time` row per repair.
-   REPAIR (store message 50, store protocol 53 - nothing at 53 shipped): {u32 kind, u32 epoch, u32 gen, u32 seq lo, u32 seq hi,
-   u32 recycled, u32 result, u32 len + profile}. Up (kind 0): the operator's request {gR, sR, its profile}. Down (kind 1): the answer
-   and the broadcast to every linked game {new epoch, gR, sR, notebook records recycled, result 0} or a refusal to the sender alone.
-   The WELCOME's world tail gains the repair rows after the WorldMsg: {u32 count, count x (u32 epoch, u32 gen, u32 seq lo, u32 hi)}.
-   A SAVE OR A RECORD STAMPED (epoch e, seq s) IS UNDONE when some repair with a later epoch restored to a seq below s. */
-struct RepairRow
-{
-    unsigned int epoch, gen; unsigned long long seq; std::string profile; long long at;
-    RepairRow() : epoch(0), gen(0), seq(0ULL), at(0) {}
-};
-/* The restore seq of the FIRST repair (in epoch order) after `epoch` that undoes seq; false = every later repair keeps it. */
-inline bool FirstUndoing(const std::vector<RepairRow>& rows, unsigned int epoch, unsigned long long seq, unsigned long long* sR)
-{
-    bool found = false; unsigned int best = 0;
-    for (size_t i = 0; i < rows.size(); ++i)
-        if (rows[i].epoch > epoch && seq > rows[i].seq && (!found || rows[i].epoch < best)) { found = true; best = rows[i].epoch; *sR = rows[i].seq; }
-    return found;
-}
-inline bool UndoneBy(const std::vector<RepairRow>& rows, unsigned int epoch, unsigned long long seq)
-{
-    unsigned long long sR = 0ULL;
-    return FirstUndoing(rows, epoch, seq, &sR);
-}
-/* The load gate with the repair list: an otherwise allowed OPERATOR save from an undone timeline is refused. */
-inline int DecideRepaired(bool isOperator, const SaveStamp& s, const WorldState& w, const std::vector<RepairRow>& rows)
-{
-    const int v = Decide(isOperator, s, w);
-    if (v == kAllow && s.hasGen && UndoneBy(rows, s.epoch, s.seq)) return kRefuseUndone;
-    return v;
-}
-/* THE NOTEBOOK'S RULE FOR ONE RECORD: seq <= sR keeps it; otherwise its previous version comes back only if that version's seq
-   is <= sR; otherwise the record goes to the Recycle Bin (its key then loads from the host's save R). */
-enum { kNbKeep = 0, kNbRevert = 1, kNbRecycle = 2 };
-inline int RepairRecordAction(unsigned long long curSeq, bool havePrev, unsigned long long prevSeq, unsigned long long sR)
-{
-    if (curSeq <= sR) return kNbKeep;
-    if (havePrev && prevSeq <= sR) return kNbRevert;
-    return kNbRecycle;
-}
-/* The request's numbers must be ones this notebook has seen for that profile. */
-enum { kRpOk = 0, kRpNotOperator = 1, kRpProfile = 2, kRpNumbers = 3, kRpNoCopy = 4, kRpNoBin = 5 };
-inline const char* RepairResultName(unsigned int r)
-{
-    switch (r)
-    {
-    case kRpOk: return "ok";
-    case kRpNotOperator: return "notOperator";
-    case kRpProfile: return "profile";
-    case kRpNumbers: return "numbers";
-    case kRpNoCopy: return "noRepairCopy";
-    case kRpNoBin: return "recycleBinCannotTake";
-    }
-    return "?";
-}
-inline int RepairValidate(unsigned int bookGen, unsigned long long seqHigh, unsigned int gR, unsigned long long sR)
-{
-    if (gR == 0 || gR > bookGen || sR > seqHigh) return kRpNumbers;
-    return kRpOk;
-}
-/* The non-record files the repair puts back from repair\<tag>\ - world.gen is not: the book keeps every other profile's number,
-   lowers the repairing profile's to gR and raises the epoch. A file absent from the copy did not exist at R (it goes to the bin). */
-inline std::vector<std::string> RepairPutBackFiles()
-{
-    std::vector<std::string> all = RepairCopyFiles(), out;
-    for (size_t i = 0; i < all.size(); ++i) if (all[i] != "world.gen") out.push_back(all[i]);
-    return out;
-}
-inline std::string RepairRowFormat(const RepairRow& r)
-{
-    return "rp1\t" + U64Text(r.epoch) + "\t" + U64Text(r.gen) + "\t" + U64Text(r.seq) + "\t" + r.profile + "\t" + U64Text(r.at < 0 ? 0ULL : (unsigned long long)r.at) + "\n";
-}
-inline std::string RepairsFormat(const std::vector<RepairRow>& rows)
-{
-    std::string s;
-    for (size_t i = 0; i < rows.size(); ++i) s += RepairRowFormat(rows[i]);
-    return s;
-}
-/* Rows in epoch order, one per epoch (the first kept); a line that does not read is skipped and counted (the return). */
-inline int RepairsParse(const std::string& text, std::vector<RepairRow>* out)
-{
-    std::map<unsigned int, RepairRow> byEpoch; int bad = 0;
-    std::string::size_type at = 0;
-    while (at < text.size())
-    {
-        std::string::size_type nl = text.find('\n', at);
-        std::string line = text.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
-        at = (nl == std::string::npos) ? text.size() : nl + 1;
-        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-        if (line.empty()) continue;
-        const std::vector<std::string> f = SplitTabs(line);
-        RepairRow r; unsigned long long t = 0ULL;
-        if (f.size() != 6 || f[0] != "rp1" || !ParseU32(f[1], &r.epoch) || r.epoch == 0 || !ParseU32(f[2], &r.gen) || !ParseU64(f[3], &r.seq)
-            || !ProfileIdOk(f[4]) || !ParseU64(f[5], &t)) { ++bad; continue; }
-        r.profile = f[4]; r.at = (long long)t;
-        if (byEpoch.find(r.epoch) == byEpoch.end()) byEpoch[r.epoch] = r;
-    }
-    out->clear();
-    for (std::map<unsigned int, RepairRow>::const_iterator it = byEpoch.begin(); it != byEpoch.end(); ++it) out->push_back(it->second);
-    return bad;
-}
-/* A game's list: insert a row it has not seen (epoch order). True = new. */
-inline bool RepairLearn(std::vector<RepairRow>* rows, const RepairRow& r)
-{
-    for (size_t i = 0; i < rows->size(); ++i) if ((*rows)[i].epoch == r.epoch) return false;
-    size_t at = 0;
-    while (at < rows->size() && (*rows)[at].epoch < r.epoch) ++at;
-    rows->insert(rows->begin() + (std::vector<RepairRow>::difference_type)at, r);
-    return true;
-}
-const unsigned int kRpUp = 0, kRpDown = 1;
-const size_t kRpWireMin = 32;
-struct RepairMsg
-{
-    unsigned int kind, epoch, gen; unsigned long long seq; unsigned int recycled, result; std::string profile;
-    RepairMsg() : kind(0), epoch(0), gen(0), seq(0ULL), recycled(0), result(0) {}
-};
-inline void EncodeRepairMsg(std::vector<char>* out, const RepairMsg& m)   /* APPENDS */
-{
-    const size_t n = m.profile.size() > 64 ? 64 : m.profile.size();
-    PutU32(out, m.kind); PutU32(out, m.epoch); PutU32(out, m.gen); PutU32(out, (unsigned int)(m.seq & 0xFFFFFFFFULL)); PutU32(out, (unsigned int)(m.seq >> 32));
-    PutU32(out, m.recycled); PutU32(out, m.result); PutU32(out, (unsigned int)n);
-    out->insert(out->end(), m.profile.begin(), m.profile.begin() + n);
-}
-inline bool DecodeRepairMsg(const char* p, size_t n, RepairMsg* out)
-{
-    if (p == 0 || n < kRpWireMin) return false;
-    unsigned int w[8];
-    for (int i = 0; i < 8; ++i) std::memcpy(&w[i], p + 4 * i, 4);
-    if (w[0] > kRpDown || w[7] > 64 || n != kRpWireMin + (size_t)w[7]) return false;
-    RepairMsg m; m.kind = w[0]; m.epoch = w[1]; m.gen = w[2]; m.seq = ((unsigned long long)w[4] << 32) | w[3]; m.recycled = w[5]; m.result = w[6];
-    m.profile.assign(p + kRpWireMin, p + kRpWireMin + w[7]);
-    *out = m; return true;
-}
-/* The WELCOME tail's repair rows (the newest 64), APPENDED after the WorldMsg. */
-inline void EncodeRepairRows(std::vector<char>* out, const std::vector<RepairRow>& rows)
-{
-    const size_t from = rows.size() > 64 ? rows.size() - 64 : 0;
-    PutU32(out, (unsigned int)(rows.size() - from));
-    for (size_t i = from; i < rows.size(); ++i)
-    {
-        PutU32(out, rows[i].epoch); PutU32(out, rows[i].gen);
-        PutU32(out, (unsigned int)(rows[i].seq & 0xFFFFFFFFULL)); PutU32(out, (unsigned int)(rows[i].seq >> 32));
-    }
-}
-/* The rows after the tail's WorldMsg. No rows at all (a restore1b1 notebook) reads as an empty list; anything else malformed is false. */
-inline bool DecodeRepairTail(const char* p, size_t n, std::vector<RepairRow>* rows)
-{
-    rows->clear();
-    WorldMsg m;
-    if (!DecodeWorldMsg(p, n, &m)) return false;
-    const size_t at = kWireMin + m.profile.size();
-    if (n == at) return true;
-    if (n < at + 4) return false;
-    unsigned int c = 0; std::memcpy(&c, p + at, 4);
-    if (c > 64 || n != at + 4 + (size_t)c * 16) return false;
-    for (unsigned int i = 0; i < c; ++i)
-    {
-        const char* q = p + at + 4 + (size_t)i * 16;
-        unsigned int e = 0, g = 0, lo = 0, hi = 0;
-        std::memcpy(&e, q, 4); std::memcpy(&g, q + 4, 4); std::memcpy(&lo, q + 8, 4); std::memcpy(&hi, q + 12, 4);
-        RepairRow r; r.epoch = e; r.gen = g; r.seq = ((unsigned long long)hi << 32) | lo;
-        if (e == 0) return false;
-        RepairLearn(rows, r);
-    }
-    return true;
-}
-/* ---- THE RULE ON A PLAYER'S PC (own records) ----
-   A record with an older epoch survives only if its nbSeq is <= the restore seq of each later repair, applied in order. Otherwise
-   the squad is taken from the newest checkpoint tagged <= the restore seq of the first repair that undoes it, whose own copy
-   survives every repair; with no such copy the squad did not exist at R and is dropped. A checkpoint copy's nbSeq is its line's
-   nbSeq capped by the checkpoint's tag seq (an o1 line: the tag seq, epoch 0). */
-struct OwnStampView { unsigned int epoch; unsigned long long nbSeq; OwnStampView() : epoch(0), nbSeq(0ULL) {} };
-struct CpView { unsigned long long tagSeq; std::map<std::string, OwnStampView> lines; CpView() : tagSeq(0ULL) {} };
-enum { kOrKeep = 0, kOrFromCheckpoint = 1, kOrDrop = 2 };
-struct OwnRepairStep { int action; int cp; OwnStampView stamp; OwnRepairStep() : action(kOrKeep), cp(-1) {} };
-inline std::map<std::string, OwnRepairStep> OwnRepairPlan(const std::vector<RepairRow>& rows, const std::map<std::string, OwnStampView>& cur,
-                                                           const std::vector<CpView>& cps)
-{
-    std::map<std::string, OwnRepairStep> out;
-    for (std::map<std::string, OwnStampView>::const_iterator it = cur.begin(); it != cur.end(); ++it)
-    {
-        OwnRepairStep st; unsigned long long sR = 0ULL;
-        if (!FirstUndoing(rows, it->second.epoch, it->second.nbSeq, &sR)) { st.stamp = it->second; out[it->first] = st; continue; }
-        int best = -1; OwnStampView bv;
-        for (size_t i = 0; i < cps.size(); ++i)
-        {
-            if (cps[i].tagSeq > sR) continue;
-            std::map<std::string, OwnStampView>::const_iterator c = cps[i].lines.find(it->first);
-            if (c == cps[i].lines.end() || UndoneBy(rows, c->second.epoch, c->second.nbSeq)) continue;
-            const bool better = best < 0 || cps[i].tagSeq > cps[best].tagSeq
-                || (cps[i].tagSeq == cps[best].tagSeq && (c->second.epoch > bv.epoch || (c->second.epoch == bv.epoch && c->second.nbSeq > bv.nbSeq)));
-            if (better) { best = (int)i; bv = c->second; }
-        }
-        if (best >= 0) { st.action = kOrFromCheckpoint; st.cp = best; st.stamp = bv; }
-        else st.action = kOrDrop;
-        out[it->first] = st;
-    }
-    return out;
-}
-/* The ledger's base when a player's records roll back: the newest checkpoint tagged <= the lowest restore seq of the repairs this
-   store has not applied (-1 = none: the ledger just goes to the bin). */
-inline int LedgerBaseCheckpoint(const std::vector<RepairRow>& rows, unsigned int appliedEpoch, const std::vector<CpView>& cps)
-{
-    bool any = false; unsigned long long lo = 0ULL;
-    for (size_t i = 0; i < rows.size(); ++i) if (rows[i].epoch > appliedEpoch && (!any || rows[i].seq < lo)) { any = true; lo = rows[i].seq; }
-    if (!any) return -1;
-    int best = -1;
-    for (size_t i = 0; i < cps.size(); ++i) if (cps[i].tagSeq <= lo && (best < 0 || cps[i].tagSeq > cps[best].tagSeq)) best = (int)i;
-    return best;
-}
-/* own.repair in a records store: `rs1<TAB>epoch` - the highest repair epoch this store has applied. */
-inline std::string OwnRepairSeenFormat(unsigned int epoch) { return "rs1\t" + U64Text(epoch) + "\n"; }
-inline bool OwnRepairSeenParse(const std::string& text, unsigned int* epoch)
-{
-    std::string line = text.substr(0, text.find('\n'));
-    if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-    const std::vector<std::string> f = SplitTabs(line);
-    return f.size() == 2 && f[0] == "rs1" && ParseU32(f[1], epoch);
-}
-inline const char* RepairStaleWords() { return "The host repaired the world - restart to continue"; }
-inline const char* RepairStalePlayerWords() { return "The host has restored the world. Restart Kenshi to continue"; }   /* ui1: the player's words; the log keeps RepairStaleWords */
 
 }   // namespace restoreguard
 

@@ -1,7 +1,7 @@
 /* src/common/bedmatch.h - BED1 (T263/T264 poseBedUnresolved): WHICH INTERIOR PIECE A BED KEY NAMES.
  *
- * The owner names its bed by the P7n position key "<sid>@<sx>,<sy>@<x10>,<z10>,<y10>" (items.cpp ItBoxKeyCompose,
- * through ObjectPositionKey). A bed that a building's interior LAYOUT created is not on the zone list ItBoxResolve
+ * The owner names its bed by the P7n position key "<sid>@<sx>,<sy>@<x10>,<z10>,<y10>" (src/common/poskey.h, through items.cpp
+ * ObjectPositionKey). A bed that a building's interior LAYOUT created is not on the zone list ItBoxResolve
  * walks, so the copy builds the key of every piece of the OUTER building's interior with the same builder and asks
  * this helper which one the owner meant. Pure - no engine, no allocation - so the offline suite runs the code the
  * plugin runs (src/coop-test/test_main.cpp).

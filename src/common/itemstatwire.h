@@ -11,6 +11,7 @@
  * 2-3. THE GROUND (gaps 2 and 3). The area holder's GROUND ADD (ITEM_MOVE op 0 with a ground key) now carries, after the box key
  *    and id, an optional BAG1 block (bagwire.h - a dropped backpack's contents, rows + OWNL tail) and then the optional OWN1
  *    block (ownerwire.h - the stolen mark), both only when there is something to say. The same tail is legal on every op 0.
+ *    The optional GEM1 block (gearwire.h - a gear item's uniform and crafter) follows the OWN1 block.
  * 4. `snapshot ... detail` item lines gain the stats (DetailStats) and `itemtest set` reads its arguments here (ParseSetArgs).
  *
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes. C++03 (VS2010 v100).
@@ -24,6 +25,7 @@
 #include <vector>
 #include "bagwire.h"
 #include "ownerwire.h"
+#include "gearwire.h"   /* op 0's GEM1 block after OWN1 */
 
 namespace coopistat {
 
@@ -36,12 +38,15 @@ const int kTailBadValue = 2;    /* charges not finite / negative / huge, or an e
 const int kTailBadBag = 3;      /* a BAG1 block that is there but not whole and in range */
 const int kTailBadOwner = 4;    /* an OWN1 block that is cut or out of range */
 const int kTailTrailing = 5;    /* bytes left after the last block */
+const int kTailBadGear = 6;     /* a GEM1 block, or the BAG1 rows' GEML tail, that is cut or not valid */
+const int kTailBadNest = 7;     /* the BAG1 rows' BAGN tail (packs inside the pack) that is cut, out of range or too deep */
 
 inline const char* TailWhy(int why)
 {
     return why == kTailOk ? "ok" : why == kTailCut ? "cut" : why == kTailBadValue ? "a bad value"
          : why == kTailBadBag ? "a bad backpack block" : why == kTailBadOwner ? "a bad owner block"
-         : why == kTailTrailing ? "trailing bytes" : "unknown";
+         : why == kTailTrailing ? "trailing bytes" : why == kTailBadGear ? "a bad gear block"
+         : why == kTailBadNest ? "a bad pack-inside-pack tail" : "unknown";
 }
 
 inline bool ChargesOk(float f) { return f == f && f >= 0.0f && f <= kChargesMax; }
@@ -93,31 +98,55 @@ inline bool EncodeAddTail(std::vector<char>* b, const std::vector<coopbag::BagRo
     }
     return true;
 }
-/* op 0's tail at `at` (right after the box key/id, or the item record for a character). Nothing left = kTailOk with nothing set.
-   `bag` / `owner` are written only on kTailOk. */
+/* op 0's tail with the gear block: [BAG1 rows] [OWN1] [GEM1], each only when there is something. `*gearSent` 1 written / 0 none;
+   `*gearDropped` (may be 0) the fields that could not travel and went empty (the caller counts them). Always returns true. */
+inline bool EncodeAddTail(std::vector<char>* b, const std::vector<coopbag::BagRow>& bag, const coopmark::OwnerId& owner,
+                          const gearwire::GearMarks& gear, int* bagSent, int* ownSent, int* gearSent, unsigned int* gearDropped)
+{
+    EncodeAddTail(b, bag, owner, bagSent, ownSent);
+    *gearSent = gearwire::EncodeGear(b, gear, gearDropped);
+    return true;
+}
+/* op 0's tail at `at` (right after the box key/id, or the item record for a character): [BAG1 rows] [OWN1] [GEM1], each optional.
+   Nothing left = kTailOk with nothing set. A trailing BAGP block (the pack path) is left for the caller: `*end` stops before it.
+   `bag` / `owner` / `gear` (may be 0) are written only on kTailOk. */
 inline int DecodeAddTail(const char* p, size_t size, size_t at, std::vector<coopbag::BagRow>* bag, coopmark::OwnerId* owner,
-                         size_t* end)
+                         gearwire::GearMarks* gear, size_t* end)
 {
     size_t off = at;
     std::vector<coopbag::BagRow> rows;
     coopmark::OwnerId o;
-    if (p != 0 && off < size && !coopmark::OwnerBlockAt(p, size, off) && !coopbag::BagPathAt(p, size, off))   /* bag23 part 2: a BAGP block is the caller's */
+    gearwire::GearMarks g;
+    if (p != 0 && off < size && !coopmark::OwnerBlockAt(p, size, off) && !gearwire::GearBlockAt(p, size, off) && !coopbag::BagPathAt(p, size, off))
     {
         size_t be = 0;
-        if (coopbag::DecodeBagRows(p, size, off, &rows, &be) != coopbag::kBagOk) return kTailBadBag;
+        const int bw = coopbag::DecodeBagRows(p, size, off, &rows, &be);
+        if (bw == coopbag::kBagBadGear) return kTailBadGear;   /* the rows' GEML tail: a bad gear tail (counted as itemGear badRecv) */
+        if (bw == coopbag::kBagBadNest) return kTailBadNest;   /* the rows' BAGN tail: counted as bagNest badRecv */
+        if (bw != coopbag::kBagOk) return kTailBadBag;
         off = be;
     }
-    if (p != 0 && off < size && !coopbag::BagPathAt(p, size, off))
+    if (p != 0 && off < size && coopmark::OwnerBlockAt(p, size, off))
     {
         size_t oe = 0;
-        const int ow = coopmark::DecodeOwner(p, size, off, &o, &oe);
-        if (ow == coopmark::kOwnBad) return kTailBadOwner;
-        if (ow != coopmark::kOwnOk) return kTailTrailing;
+        if (coopmark::DecodeOwner(p, size, off, &o, &oe) != coopmark::kOwnOk) return kTailBadOwner;
         off = oe;
     }
-    if (off != size && !coopbag::BagPathAt(p, size, off)) return kTailTrailing;   /* bag23 part 2: a trailing BAGP (pack path) is left for the caller; `*end` stops before it */
-    bag->swap(rows); *owner = o; *end = off;
+    if (p != 0 && off < size && gearwire::GearBlockAt(p, size, off))
+    {
+        size_t ge = 0;
+        if (gearwire::DecodeGear(p, size, off, &g, &ge) != gearwire::kGearOk) return kTailBadGear;
+        off = ge;
+    }
+    if (off != size && !coopbag::BagPathAt(p, size, off)) return kTailTrailing;
+    bag->swap(rows); *owner = o; if (gear) *gear = g; *end = off;
     return kTailOk;
+}
+/* The same tail read without keeping the gear block (it is still checked). */
+inline int DecodeAddTail(const char* p, size_t size, size_t at, std::vector<coopbag::BagRow>* bag, coopmark::OwnerId* owner,
+                         size_t* end)
+{
+    return DecodeAddTail(p, size, at, bag, owner, (gearwire::GearMarks*)0, end);
 }
 
 /* ---- `snapshot <tag> detail <uid>`: the stats appended to each item line (both games print the same text for the same item) ---- */

@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 491
+!count 509
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -33,6 +33,7 @@ AI_treatsAsEnemy                                     code 005993A0 005993A0 4889
 AI_periodicTick                              code 00510820 00510820 48895C240848896C2410488974241848
 AI_frameTick4                                code 00595B20 00595B20 40534883EC4048837910000F29742430
 AI_beingShotAt                           code 00998E80 00998E80 48896C2418564883EC30488BEA488BF1
+AI_treatScore                            code 00997330 00997330 48896C2410488974241848897C242041
 AITaskSytem_describeCurrentGoal               code 0050E930 0050E930 40574881ECE000000048C7442428FEFF
 AiThreadBusy                                   code 0025C690 0025C690 4883EC284C8BC14885C9746F80794500
 AllyRet1                                       ret  00608ED3 00608ECD FF90F0030000
@@ -60,7 +61,10 @@ BarBuildingPick                                code 0038AEC0 0038AEC0 488BC44C89
 BountyMapErase                                 code 00860790 00860790 40554883EC204883792000488BE97508
 BountyMapIndex                                 code 005E7450 005E7450 40565741544883EC4048C7442420FEFF
 BountySightTargetTest                          code 0085635D 0085635D 4883B85002000000740EF3440F101DD0
+BountyTrespassTargetTest                       code 00858D13 00858D13 4883B850020000007451488BD6488BCD
 BuildingSelectedBoxOwnerTest                   code 007FC241 007FC241 4883B85002000000755F488D15EE98E9
+FactionHostileEntry                            code 00854960 00854960 4883EC28483B91480100007507B00148
+FactionMarkHostile                             code 00858070 00858070 48895C24104889742418574883EC20F3
 PlayerInterfaceBuildingSelected                code 007FBB40 007FBB40 488BC45556574154415541564157488D
 BuildingDropItem                               code 0054DBA0 0054DBA0 4889742418574883EC70488BFA488BF1
 BuildingRegistryGlobal                         var  02133568 02133568 -
@@ -209,6 +213,7 @@ GameplayOptionsGlobal                          var  02132528 02132528 -
 GameplayOptionsLoad                            code 003EEDE0 003EEDE0 405556574154415541564157488BEC48
 LockButton                                     code 005465D0 005465D0 48895C2408574883EC4080B984030000
 LockDoor                                       code 002969B0 002969B0 83B98003000000751CF30F1005FB283F
+RandomRange                                    code 009B0DB0 009B0DB0 4883EC480F297424300F297C24200F28
 SavedObjectState_savedPosition                           code 0037DA00 0037DA00 8B412089028B41248942048B41288942
 SavedObjectState_stateCount                        code 0037F5D0 0037F5D0 8B8188000000C3CCCCCCCCCCCCCCCCCC
 GameWorld_activeCharacters               code 006638D0 006638D0 488D8150070000C3CCCCCCCCCCCCCCCC
@@ -290,6 +295,7 @@ MainMenuPopup_get                              code 0047A0B0 0047A0B0 4883EC3848
 MainMenuPopup_show                             code 00913250 00913250 40574883EC40488BF9488D0DF0F48101
 MapPtr                                         var  0212DAF0 0212DAF0 -
 MedApplyFirstAid                                code 0064CD70 0064CD70 48895C2420564881EC8000000080B964
+MedTreatParts                                   code 00648F70 00648F70 4056574881EC9800000080B964010000
 MedicalSystem_amputate                         code 0064E330 0064E330 83FA040F842F050000488BC455535657
 MedicalSystem_partAt                          code 002AA5C0 002AA5C0 8B8198010000483BD0730F488B81A001
 MedicalSystem_countBodyParts                     code 002AA5B0 002AA5B0 8B8198010000C3CCCCCCCCCCCCCCCCCC
@@ -382,6 +388,14 @@ SaveManager_anySavesExist                         code 0036B540 0036B540 4057488
 SaveManagerNewGame                             code 0047A930 0047A930 40534883EC2048833DD27FCB0100488B
 SaveManagerRequestPump                         code 0047BAA0 0047BAA0 488BC455574154488DA868FAFFFF4881
 SaveManagerSave                                code 0047B0B0 0047B0B0 40574881EC0001000048C7442420FEFF
+StealthKoChance                                code 00884420 00884420 48895C24085556574881EC8000000048
+StealthKoChanceRet                             ret  0034D02B 0034D026 E883D9CEFF
+StealthKoFailAlert                             code 00684BD0 00684BD0 48895C240848896C2410488974241857
+StealthKoFailAttack                            code 005CA610 005CA610 4885D20F849900000048895C24085748
+StealthKoFailReact                             code 005C8800 005C8800 488B8950060000E9448AA6FFCCCCCCCC
+StealthKoKnockoutRet                           ret  0034D493 0034D48E E89244CFFF
+StealthKoRollMax                               ro   01682250 01682250 0000C842000000004579652073706163
+StealthKoSkillScale                            ro   01681AD8 01681AD8 0AD7233C00000000626F6479426C656E
 StringFieldIndex                                     code 0006D150 0006D150 488BC4565741544881EC9000000048C7
 SecAddItem                                     code 00748BE0 00748BE0 4885D20F84EA02000053555657415441
 SecRemoveItem                                  code 00748EE0 00748EE0 48895C2420574883EC20488BFA488BD9
@@ -423,12 +437,14 @@ StopAction                                     code 0051D510 0051D510 40534883EC
 TakeOneItemOnly                                code 00749FF0 00749FF0 488974242041544883EC204C8BE2488B
 TaskDataByType                                 code 00283F40 00283F40 894C24084883EC28488D542430488D0D
 TaskProcessSlaveBody                           code 0035A9C0 0035A9C0 405556574154415541564157488D6C24
+TaskStealthKO_update                           code 0034CD20 0034CD20 488BC45556574154415541564157488D
 TaskStripWeaponsBody                           code 0034E750 0034E750 4C8BDC55565741544155415641574883
 ThreadSafeRagdollUpdates                       code 007D17E0 007D17E0 48895C2410574883EC204883B9700700
 TitleExit                                      code 009142B0 009142B0 4883EC48E800D76FFF33C0488D0DD666
 TitleScreen_closePanels                  code 00913BC0 00913BC0 40574883EC3048C7442420FEFFFFFF48
 TitleScreen_ctor                               code 00918020 00918020 488BC4554154415541564157488DA818
 TitleScreen_update                             code 009129B0 009129B0 40574883EC5048C7442420FEFFFFFF48
+TownFoundPlayer                                code 00933F40 00933F40 4C8BDC5556574881EC9000000048C744
 TownHand                                       var  01F38690 01F38690 -
 TownInitialiseResidentData                     code 00935F90 00935F90 488BC455488BEC4883EC6048C745C0FE
 TownList                                       var  021330A0 021330A0 -
@@ -502,3 +518,5 @@ TownContainsPoint                              code 00925E80 00925E80 48895C2408
 TownListNearestFallback                        code 00926C00 00926C00 48896C24185641544155415641574883
 PlatoonLoadInstance                            code 0036F570 0036F570 405556574154415541564157488D6C24
 UniqueMayMake                                  code 00591720 00591720 4889542410534883EC20488BD9488BC2
+DialoguePlayerCanTalk                          code 00679FC0 00679FC0 40574883EC304883B9C800000000488B
+DialogueChooseDialog                           code 00679630 00679630 44884C24204C89442418488954241048

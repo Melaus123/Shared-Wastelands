@@ -1317,6 +1317,34 @@ static void RetireStaleUidIfThisRow(const Adopted& row)
     RetireStaleUid(row.uid);
 }
 
+/* T-758 - CreateAt's factory has just built a body at `obj`, an address a row of `oldUid` still holds: that row's object was freed
+   without the destroy hook and the address reused.  P034's STALE POINTER CONFIRMED step for that address: every current liveness
+   row of oldUid at obj is settled (permanent; retired with its withdrawal noted if it was not already), the mirror row is marked
+   destroyed under oldUid (F334, F336), and oldUid is retired as F337 retires a uid whose address went to another uid - unless the
+   registry names another object for oldUid (stale1), then it is spared.  Returns 1 retired, 0 spared.  MAIN THREAD (the pump). */
+int WorldsyncRetireReusedAddress(const void* obj, unsigned int oldUid)
+{
+    if (obj == 0 || oldUid == 0) return 0;
+    /* the registry naming another object for oldUid means oldUid lives on there: its rows at this address are settled, but no
+       withdrawal is queued for it and nothing about it is forgotten */
+    const void* current = SpawnedRawObject(oldUid);
+    const bool spared = current != 0 && current != obj;
+    for (int i = 0; i < g_adoptedCount; ++i)
+    {
+        Adopted& row = g_adoptedRows[i];
+        if (row.obj != obj || row.uid != oldUid || row.permanent) continue;
+        row.permanent = true;
+        if (!row.retired) { row.retired = true; ++g_retired; if (!spared) RetireWithdrawNote(row.uid, cooprw::kEvRetire); }
+    }
+    MirrorMarkDestroyed(obj, oldUid);
+    ReleaseGateForObject(obj);   /* the old body's AI switch-off is keyed by this address: the new body here starts with its AI on */
+    if (spared) { ++g_staleUidSpared; return 0; }
+    SoakForgetUid(oldUid);
+    DeadlookForgetCopy(oldUid);   /* a copy of oldUid made again later starts with no look marks of this one */
+    RetireStaleUid(oldUid);
+    return 1;
+}
+
 void ValidateAdopted(int howMany)
 {
     if (g_adoptedCount == 0) return;
@@ -1685,7 +1713,8 @@ static bool CatchupCharReads(unsigned int uid, ::Character** c, Ogre::Vector3* p
     const int rd = CharAreaPosPod(ch, pos);
     if (rd != 1) { if (rd == 0) ++g_areaKeyNoBody; else ++g_areaKeyFault; return false; }
     const Sector s = SectorOf(pos->x, pos->z);
-    *key = cooplive::AreaKey(s.x, s.y); *c = ch;
+    if (key != 0) *key = cooplive::AreaKey(s.x, s.y);
+    *c = ch;
     return true;
 }
 static bool CatchupWire(::Character* c, GameData** gd, Faction** f)
@@ -1871,8 +1900,9 @@ void WorldsyncCatchupHandoverSettled(unsigned int uid)
 /* A RESEND ASK, THE OWNER'S SIDE. Another game lost its copy of these characters of mine (its engine put the copy away) or
    never got one, and the character stands in an area loaded there. The announce mark here still reads "sent", so neither the
    announce pass nor a catch-up (which fires only for sectors newly in that game's delivery area) would send it again: each uid is
-   decided by lostcopy::ResendOwnerVerdict, and a SENT one's full state goes to that game alone. Counted on the catchUpState line
-   (resendAsk[...]); the caller logs the round. */
+   decided by lostcopy::ResendOwnerVerdict, and a SENT one's full state goes to that game alone (that game's SPAWN check decides by its
+   live engine whether the copy is made or the uid booked). Counted on the catchUpState line (resendAsk[...]); the caller logs the
+   round. */
 /* (its counters g_rsAskUids .. g_rsFailed are defined beside CharAreaKeyNow, before the catchUpState line that prints them) */
 void WorldsyncResendAsk(int streamSlot, int askerSlot, const std::vector<unsigned int>& uids, std::vector<int>* verdicts)
 {
@@ -1885,8 +1915,8 @@ void WorldsyncResendAsk(int streamSlot, int askerSlot, const std::vector<unsigne
         const bool mine = net::IsUidMine(uid);
         std::map<unsigned int, int>::const_iterator an = g_announced.find(uid);
         const bool announced = an == g_announced.end() || an->second == 1;   /* an absent uid reads as announced (AnnouncedToPeer's rule) */
-        ::Character* c = 0; Ogre::Vector3 pos; int key = -1; GameData* gd = 0; Faction* f = 0;
-        const bool reads = mine && CatchupCharReads(uid, &c, &pos, &key) && CatchupWire(c, &gd, &f);
+        ::Character* c = 0; Ogre::Vector3 pos; GameData* gd = 0; Faction* f = 0;
+        const bool reads = mine && CatchupCharReads(uid, &c, &pos, 0) && CatchupWire(c, &gd, &f);
         int v = lostcopy::ResendOwnerVerdict(mine ? 1 : 0, mine && HandoffPendingHas(uid) ? 1 : 0, announced ? 1 : 0, reads ? 1 : 0);
         if (v == lostcopy::kRvHeld)
         {

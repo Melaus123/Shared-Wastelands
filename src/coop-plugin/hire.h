@@ -6,6 +6,7 @@
 // TEST-ONLY lever `hiretest near [price] | near same [<x> <z> [price]] | uid <n> [price]` drives the same flow.
 #pragma once
 #include <string>
+#include <vector>
 #include "../common/hirewire.h"
 class Character;   // T-556: HireRecruitNoEdit / HireSetFaction
 class Faction;
@@ -16,6 +17,7 @@ void HireNoteBad();                                                       // a M
 void HireSafePointDrain();                                                // MAIN THREAD, worker paused (combat.cpp K2)
 void HireForgetPeer(int slot);                                            // the player in `slot` left: my requests to it, my promises to it and its undrained messages dropped (-1: every row)
 std::string HireTestArm(const std::string& arg);                          // `hiretest near [price] | near same [<x> <z> [price]] | uid <n> [price]` (TEST-ONLY)
+void OwnSquadUids(std::vector<unsigned int>* out);                        // MAIN THREAD: every character this game drives in its player faction (the test levers' squad)
 void ReportHire();                                                        // one [HIRE] REPORT line
 int HireRecruitNoEdit(::Character* c);                                   // T-556: PlayerInterface::recruit(c, edit=false); 1 joined, 0 refused, <0 not called / fault
 int HireSetFaction(::Character* c, ::Faction* f, void* platoon);         // T-556: Character vt+0xA0 setFaction; 1 called, 0 fault

@@ -17,7 +17,7 @@
 // (HireForgetPeer: the requests this game made of it, the promises this game made to it, its messages not yet drained).
 #include "hire.h"
 #include "addresses.h"
-#include "spawn.h"          // FindSpawned, FindSpawnedUid, MirrorSlot, SafeReadPosition, ForgetContextPlatoon
+#include "spawn.h"          // FindSpawned, FindSpawnedUid, MirrorSlot, SafeReadPosition, ForgetContextPlatoon, CopySquadIdCheckHired
 #include "tags.h"           // TagsNoteCopy - a recruit of another player gets that player's name tag
 #include "store.h"          // EngineWritesBlocked, StoreMainThreadId, StoreUnbindPlatoon
 #include "net/session.h"    // IsUidMine, TakeLocalOwner, ReleaseLocalOwner, SendHire
@@ -25,6 +25,7 @@
 #include "replicate.h"      // UnpuppetForOwnership, AdoptRemotePuppet, IsDownedCharacter
 #include "worldstate.h"     // WorldStateOnOwnershipReleased
 #include "speech.h"         // SayOnCopy (the refusal line)
+#include "handoff.h"        // SquadActivePlatoonOf - reads a character's squad without making one
 #include "coop_log.h"
 #include "../common/peergone.h"   // PlayerGoneTakesRow: a player who leaves takes only its own rows
 #include "game/Character.h"
@@ -421,7 +422,12 @@ void Finish(const coophire::HireMsg& m, unsigned int peer)
             // squad and its notebook entry still lists the person - unbinding it would bring the person back as a copy
             // later. On a copy's game (taken=0, joined=1) the emptied copy squad stays recorded; if the engine frees it,
             // store.cpp's removeSquad detour forgets it (review-p3o H1).
-            if (SetFactionPod(c, peerFac, Plaus(platoon) ? platoon : 0)) { factionSet = 1; ++g_factionSet; TagsNoteCopy(m.uid); }
+            if (SetFactionPod(c, peerFac, Plaus(platoon) ? platoon : 0))
+            {
+                factionSet = 1; ++g_factionSet; TagsNoteCopy(m.uid);
+                /* no squad given: the stand-in's addMember made a NEW squad, numbered by the stand-in's own counter */
+                if (!Plaus(platoon)) CopySquadIdCheckHired(peerFac, coop::SquadActivePlatoonOf(c));
+            }
             else ++g_setFactionFault;
         }
         if (m.taken == 0) ++g_joinedApplied;
@@ -692,6 +698,18 @@ std::string HireTestArm(const std::string& arg)
     DebugLog("[HIRE] hiretest " + mode + (uid ? " " + N(uid) : std::string()) + (same ? " same point=(" + N((long long)sx) + "," + N((long long)sz) + ")" : std::string())
              + " price=" + N(price) + " ARMED - runs at the next safe point");
     return "ok hiretest armed";
+}
+
+void OwnSquadUids(std::vector<unsigned int>* out)
+{
+    out->clear();
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int u = 0; ::Character* c = 0;
+        if (!MirrorSlot(i, &u, &c) || u == 0 || !net::IsUidMine(u) || !Plaus(c)) continue;
+        if (IsPlayerFaction(FactionOfPod(c))) out->push_back(u);
+    }
 }
 
 std::string OtherActTypes()   // "type:count,..." of the held lines' other actions

@@ -27,4 +27,12 @@ void ReportFarm();                                    // one [FARM] REPORT line 
 int  MineStepRelay(void* pb, void* who, float amount);
 // ANY THREAD: 1 while another player is in this world (FarmTick's link test)
 int  MineLinked();
+// ANY THREAD (items.cpp detour_prodOperate): a worker's step ran here on a production building this game writes - its bar and
+// state go to the other games (MINE_STATE, FarmTick) while the work goes on, and once when it stops.
+void MineWorkedNote(void* pb);
+// ANY THREAD, crash-guarded, read-only: a production building's bar *(+0x448) and state +0x468. 1 both read, 2 the state
+// only (no output record), 0 unreadable.
+int  MineBarReadPod(void* b, float* progress, int* state);
+int  FarmKeptLay(void* b, float growth, float death, float start, int harvested, int* plants);   // KEPT, K2: a kept farm onto the live one
+int  FarmKeptRead(void* b, float* growth, float* death, float* start, int* harvested, int* plants);   // KEPT / bldstate: read-only
 }

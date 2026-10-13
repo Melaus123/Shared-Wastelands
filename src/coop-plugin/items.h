@@ -22,6 +22,7 @@
 #include <vector>   /* B12: ItQueueReplayBox takes a journal entry's saved bytes */
 #include "../common/bagwire.h"   /* inv3a: ItemRequestMsg / ItemConfirmMsg carry a handed-over backpack's contents */
 #include "../common/ownerwire.h"   /* inv6: the stolen mark (item owner) as an identity both games understand */
+#include "../common/gearwire.h"   /* an item's uniform and crafter as words both games understand (GEM1 / GEML) */
 #include "../common/groundkey.h"   /* inv5 phase 1: the ground key and ITEM_CONFIRM's refusal reason block */
 #include "../common/itemstatwire.h"   /* items9: ITEM_MOVE op 4 CHARGES, op 0's [BAG1][OWN1] tail, snapshot detail stats */
 #include "../common/shopwire.h"   /* T-164 B4-4: the shop block on ITEM_REQUEST / ITEM_CONFIRM (intercept at the trade call) */
@@ -69,6 +70,14 @@ struct ItemMoveMsg
     std::string idFor;
     // inv6 (protocol 71): ADD only - the stolen mark as an identity (src/common/ownerwire.h), kind 0 = clean (nothing on the wire).
     coopmark::OwnerId owner;
+    // ADD only - a gear item's uniform and crafter (src/common/gearwire.h), a 'GEM1' block after the OWN1 block; empty = nothing on the wire.
+    gearwire::GearMarks gear;
+    // NEVER ON THE WIRE - the undo's LOCAL re-create (ItCreateItem): 1 = put back the item's own uniform pointer and crafter text as
+    // they were read off it (gearLocalUniform / gearLocalCrafter) instead of `gear`, so a uniform with no wire name or a crafter longer
+    // than the wire carries is kept (ItGearApplyLocal).
+    int gearLocal;
+    void* gearLocalUniform;
+    std::string gearLocalCrafter;
     // items9 (protocol 78): ADD only - a backpack's contents (BAG1 rows), sent on a holder's GROUND ADD so a dropped pack is not
     // empty on the other game; empty = nothing on the wire.
     std::vector<coopbag::BagRow> bag;
@@ -93,7 +102,7 @@ struct ItemMoveMsg
     unsigned int rqtId;
     int rqtSlot;
     ItemMoveMsg() : uid(0), op(0), x(0), y(0), quantity(0), quality(0.0f), charges(0.0f),
-                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); }
+                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; }
 };
 
 // E22b / decision 38 part (2). A player touched an inventory this game does NOT own. The local half of the
@@ -149,6 +158,8 @@ struct ItemRequestMsg
     std::vector<coopbag::BagRow> bag;
     // inv6 (protocol 71): GIVE only - the given item's stolen mark, an 'OWN1' block after the optional BAG1 block; kind 0 = clean.
     coopmark::OwnerId owner;
+    // GIVE only - the given item's uniform and crafter, a 'GEM1' block after the optional OWN1 block; empty = nothing on the wire.
+    gearwire::GearMarks gear;
     // bag23 part 2 (inv3 phase 3, protocol 81): the OWNER half is INSIDE A PACK - `ownerSection`/`ownerX`/`ownerY` name the cell in the
     // pack, this names the pack on the owner's character / box; `ownerBag.sid` is the record (S2-66: the owner looks for the same
     // record in the same pack when that cell no longer holds it). A trailing 'BAGP' block after the OWN1 block; has 0 = none.
@@ -193,6 +204,8 @@ struct ItemConfirmMsg
     std::vector<coopbag::BagRow> bag;
     // inv6 (protocol 71): TAKE with ok 1 only - the mark the owner's item carried, an 'OWN1' block after the optional BAG1 block.
     coopmark::OwnerId owner;
+    // TAKE with ok 1 only - the uniform and crafter the owner's item carried, a 'GEM1' block after the optional OWN1 block.
+    gearwire::GearMarks gear;
     // inv5 (protocol 72): ok 0 only - WHY a ground request was refused (coopground::kGroundReasonNotHolder 1 / NotFound 2), a
     // 'GND1' block after the trade block; 0 = no reason given (every non-ground refusal).
     int reason;
@@ -294,6 +307,7 @@ bool PackBuyTest(const std::string& mode);   // par23 (parity P23): TEST LEVER -
 bool TraderList();   // T-1 B0: TEST, read-only - every loaded trader squad, who runs each member, pack digests ([TRADER] lines)
 std::string KeeperListCommand(const std::string& arg);   // T-164 B4-0: TEST, read-only - `keeperlist [<x>,<y>|all] [<page>]`: NPC squads with a home building, each indoor piece with an inventory ([KEEPER] lines)
 bool BuyTestKeeper(const std::string& pick, int sell, int cats);   /* T-164 B4-1: cats = the purse set first (-1 = not asked) */   // T-164 B4-0: TEST LEVER - `buytest keeper <n|ghost|own> [sell]`: BuyTest aimed at a keeperlist keeper, buyer walked to it first; ghost = home area held by the other game ([BUYTEST] keeper line)
+bool BuyTestChar(unsigned int uid, const std::string& nameText, int sell, int cats);   /* TEST LEVER: `buytest char <uid|name=<text>> sell [cats=<n>]` - sell one item to that character, no home or pack test ([STORE] buytest char line) */
 
 // P7i (T232 section 2/section 3) READ-ONLY LEVERS, MAIN THREAD, command channel only. T232's `boxtest rebirth ...` and
 // `buytest rebirth` both MISSED, and no verb in that build could say what the loaded buildings were called -
@@ -313,6 +327,7 @@ std::string BoxListCommand(const std::string& arg);
 void TownPricesNote(const char* p, size_t n, unsigned int fromPeer);   /* T-619, MAIN THREAD: a TOWN_PRICES payload, by the session link or relayed by the world server (fromPeer a relay key) */
 void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2: fromPeer = the asker, the answers go back to it
 void ParityNoteBox(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2 fold 1: a box's contents are taken only from its writer (parityBoxNotWriter)
+void ItParityForgetAsker(int slot);   // MAIN THREAD: that player's link ended - its recorded sector asks no longer route fill pushes to it (slot -1: every game's)
 std::string BoxDigestCommand(const std::string& arg);   /* par1: `boxdigest [<x>,<y>|ring|all]` - read-only: [PARITY] box key=.. items=.. digest=.. per box (flat + furniture) and a total */
 std::string RestockNowCommand(const std::string& arg);   /* par2: TEST-ONLY `restocknow <x>,<y>` - arms the lever; holder squads only. T-1 B2: `restocknow wander near` */
 std::string TraderSpawnCommand(const std::string& arg);   /* T-1 TEST-ONLY `traderspawn [dist]` - arms the lever: one wandering trader caravan beside this game's player through the engine's own createRandomSquad */
@@ -403,6 +418,13 @@ long ItemApplyingPeek();   /* kit3 (kit2 review + T522, review D4): the marker's
 int ItemPlaceInSection(void* sec, void* item, int x, int y);
 int ItemOwnerApplyTo(void* item, const coopmark::OwnerId& o, const std::string& sid);   /* inv6 phase 2, MAIN THREAD: onto a fresh item; 1 applied */
 void ItemOwnerNoteBadBlock();  /* inv6: session.cpp - an owner that would not encode (the item went clean) */
+void ItemGearOf(void* item, gearwire::GearMarks* out);   /* MAIN THREAD: a gear item's uniform and crafter as they travel (none for any other item) */
+int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid);   /* MAIN THREAD: onto a fresh item, gear items only; 1 written */
+void ItemGearNoteSent(int blocks, unsigned int dropped);   /* session.cpp: GEM1 blocks written, fields that went empty */
+void ItemGearNoteBadRecv();   /* session.cpp: a RECEIVED GEM1 block that was malformed */
+void ItemBagNestNoteBadRecv();   /* session.cpp / clothing.cpp: a RECEIVED pack-row BAGN tail that was malformed */
+void ItemOwnParkNoteUid(unsigned int uid);   /* spawn.cpp, ANY THREAD: a uid registered here - stolen marks parked for it are tried at the next ItemsTick */
+void ItemOwnParkFrameStart();   /* command_channel.cpp, MAIN THREAD, first in the frame: a fresh park entry left from the last frame is dropped unread */
 void BoxTakeDrain();                                        /* the boxtake move itself, at the K2 safe point (combat.cpp) */
 /* loot2c internals shared by several regions of items.cpp - declared once here so every region names the one coop:: definition */
 const int kLootWhyClose = 0, kLootWhyUnload = 1, kLootWhyAnswer = 2, kLootWhyServe = 3, kLootWhyPush = 4, kLootWhySave = 5;
@@ -537,6 +559,11 @@ long long BoxWalkGen();
    on this game or flipped to complete. Sets the mark only; the rebuild stays lazy (ItFurnEnsure at the next lookup, at most once
    per drain). why: 1 placed (or a restore recreated it), 2 a copy made or adopted, 3 complete 0 -> 1. */
 void ItFurnMarkStale(int why);
+/* MAIN THREAD (build.cpp): a building copy that can hold items has its contents asked of the area's writer once the zone list finds
+   it - ItParityCopyMade for the copy createBuilding just made, ItParityCopyCompleted when the owner's STATE completes a copy (a
+   box still being built has no inventory until then). */
+void ItParityCopyMade(void* b, const char* key);
+void ItParityCopyCompleted(void* b, const char* key);
 /* BED1-b (review M2): the five ids of a root object's OWN handle (RootObjectBase::handle +0x58: game/RootObjectBase.h, and
    0x54E940 / 0x9FD150 read obj+0x58 as the hand) - POD, no engine call. 1 read. */
 int  ObjectHandIds(void* obj, unsigned int* ids5);

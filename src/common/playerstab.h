@@ -4,7 +4,7 @@
  * table has the columns PLAYER / FACTION / YOU / THEM / STATUS; the PLAYER text is drawn in that player's name-tag
  * colour (nametag.h: the worse of the two directions). Under the table, with a row selected: "YOUR STANCE TOWARDS <FACTION>"
  * and three tick buttons ALLY / NEUTRAL / HOSTILE, exactly one ticked (this player's own side); with none selected the line
- * reads "Select a player." and the buttons are hidden. HOSTILE asks first (SET HOSTILE, CANCEL left, HOSTILE right).
+ * is empty and the buttons are hidden. HOSTILE asks first (SET HOSTILE, CANCEL left, HOSTILE right).
  * Each player sets only their own side; the other game shows the engine's own sentences (FactionRelations 0x6B25A0's four,
  * in its order) when that side changes level by the one rule the table and the name tag use (nametag::LevelOf), once per
  * change of level however many roads bring it (NoticeBook).
@@ -181,7 +181,7 @@ inline int RowOfSlot(const std::vector<RowView>& rows, int slot)
 }
 
 /* the line under the table and whether the buttons show */
-const char* const kSelectLine = "Select a player.";
+const char* const kSelectLine = "";   /* nothing selected: no line */
 inline std::string Upper(const std::string& s)
 {
     std::string o(s);

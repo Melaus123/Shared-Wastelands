@@ -260,22 +260,39 @@ enum PanelLayoutId
     kLayLanding = 0, kLayHost = 1, kLayJoin = 2, kLayNewWorld = 3, kLayDeleteWorld = 4, kLayHosting = 5,
     kLayOptions = 6, kLayProfiles = 7, kLayNewProfile = 8, kLayDeleteProfile = 9, kLayHostHint = 10, kLayJoinHint = 11,
     kLayHostingVpn = 12,   /* T-631: HOSTING with the RADMIN / HAMACHI ADDRESS row (a game VPN was found) */
-    kLayCount = 13
+    kLayPassword = 13,     /* T-290: PASSWORD REQUIRED - a JOIN refused for its password; NEW WORLD's rows (its line, PASSWORD, CANCEL / JOIN) */
+    kLayInvite = 14,       /* INVITE FRIENDS, over HOSTING: the friends online, the status line, BACK / INVITE */
+    kLayResetWorld = 15,   /* RESET WORLD?: HOST GAME's reset confirm - its text, the keep-buildings tick box, the last paragraph, CANCEL / RESET WORLD */
+    kLayCount = 16
 };
+/* Screen 4 (the world dialog) is RESET WORLD? while its dialog number (PanelLayoutOf's profDlg on that screen) is this, else DELETE WORLD?. */
+const int kWorldDlgReset = 3;
+/* Whether the point (px, py) is inside the rectangle left l, top t, width w, height h - its left and top edges in, its right
+   and bottom edges out: the hover notes' test of the mouse pointer against a widget's on-screen rectangle. */
+inline bool PanelPointIn(int px, int py, int l, int t, int w, int h)
+{
+    return px >= l && py >= t && px < l + w && py < t + h;
+}
 /* What a slot holds.  kSlotGap is blank space between groups (the mock-ups' empty lines). */
 enum PanelSlotId
 {
     kSlotGap = 0, kSlotNameRow, kSlotNameHint, kSlotHostBtn, kSlotJoinBtn, kSlotList, kSlotListBtns, kSlotPortRow,
-    kSlotStatus, kSlotAddrRow, kSlotDlgText, kSlotDlgName, kSlotHomeAddr, kSlotRouterHelp, kSlotPlayers, kSlotTabs,
-    kSlotOptRows, kSlotNote, kSlotButtons, kSlotProfRow,  /* T-201 PP6': HOST GAME's PROFILE row, under PORT */
+    kSlotStatus, kSlotAddrRow, kSlotDlgText, kSlotDlgName, kSlotHomeAddr, kSlotPlayers, kSlotTabs,
+    kSlotOptRows, kSlotButtons, kSlotProfRow,  /* T-201 PP6': HOST GAME's PROFILE row, under PORT */
     kSlotNetAddr,                                         /* T-510: HOSTING's INTERNET ADDRESS row, under LOCAL ADDRESS */
-    kSlotVpnAddr                                          /* T-631: HOSTING's RADMIN / HAMACHI ADDRESS row, between the two */
+    kSlotVpnAddr,                                         /* T-631: HOSTING's RADMIN / HAMACHI ADDRESS row, between the two */
+    kSlotPwRow,                                           /* T-290: HOST GAME's PASSWORD row (label, box, SHOW / HIDE), above PORT */
+    kSlotJoinByAddr,                                      /* JOIN BY ADDRESS: JOIN GAME's line between the friends list and IP ADDRESS */
+    kSlotSteamRow,                                        /* HOSTING's STEAM row: its label, INVITE FRIENDS at the right and, without Steam, its line */
+    kSlotDlgTick,                                         /* RESET WORLD?'s keep-buildings tick box and its label, between its text and its last paragraph */
+    kSlotDlgTail                                          /* RESET WORLD?'s last paragraph, under the tick box (PanelLive::tail) */
 };
 struct PanelSlot { int slot; int halves; };
 const int kPanelMaxHalves = kPanelRows * 2;
 
 /* The layout a screen shows: the panel's screen number (ui.cpp g_panelScreen: 0 MULTIPLAYER, 1 HOST GAME, 2 JOIN GAME,
-   3 NEW WORLD, 4 DELETE WORLD?, 5 HOSTING, 6 GAME OPTIONS, 7 PROFILES) and, on PROFILES, which of its dialogs is up. */
+   3 NEW WORLD, 4 DELETE WORLD?, 5 HOSTING, 6 GAME OPTIONS, 7 PROFILES, 8 PASSWORD REQUIRED) and, on PROFILES, which of its
+   dialogs is up. */
 inline int PanelLayoutOf(int screen, int profDlg, int nameHint = 0, int vpnRow = 0)
 {
     if (screen == 7) return profDlg == 1 ? kLayNewProfile : profDlg == 2 ? kLayDeleteProfile : kLayProfiles;
@@ -284,6 +301,9 @@ inline int PanelLayoutOf(int screen, int profDlg, int nameHint = 0, int vpnRow =
     if (screen == 1) return nameHint != 0 ? kLayHostHint : kLayHost;
     if (screen == 2) return nameHint != 0 ? kLayJoinHint : kLayJoin;
     if (screen == 5 && vpnRow != 0) return kLayHostingVpn;   /* T-631: HOSTING with its VPN row */
+    if (screen == 8) return kLayPassword;   /* T-290: PASSWORD REQUIRED */
+    if (screen == 9) return kLayInvite;     /* INVITE FRIENDS, over HOSTING */
+    if (screen == 4 && profDlg == kWorldDlgReset) return kLayResetWorld;   /* RESET WORLD? */
     if (screen >= 3 && screen <= 6) return screen;
     return kLayLanding;
 }
@@ -299,7 +319,7 @@ const int kPanelTextCharW = 7;
 /* THE ROW LISTS, read off panel-mockups.md sections 2-9.  A status area is sized for the most lines it carries at once
    (the intro, a blank line, the live line and a refusal paragraph); a list for its head and a few rows; a text line for
    one wrap at 1280x720 (ui7: the live areas are MEASURED on screen - PanelTextHalvesPx).  ui5c: a status / text area's value here is its
-   CEILING - on screen it is as tall as its live text (PanelSlotHalves); ui5d: so are HOSTING's router help and PLAYERS. */
+   CEILING - on screen it is as tall as its live text (PanelSlotHalves); ui5d: so is HOSTING's PLAYERS list; its STEAM row follows Steam (PanelLive::steam). */
 inline const PanelSlot* PanelRowsOf(int layout, int* count)
 {
     /* T-201 N1b (owner 166): MULTIPLAYER - HOST GAME, JOIN GAME and BACK only, a full row each (the bottom buttons' height). */
@@ -307,45 +327,57 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
                                           { kSlotButtons, 2 } };
     /* T-201 N1b (owner 166): PLAYER NAME the top row of HOST GAME and JOIN GAME; while the hint has a sentence its row (one
        line at the box's width, 1280x720 - swept in test_main.cpp) takes the gap under the box, as ui5b's MULTIPLAYER did.
-       HOST GAME's status ceiling is 7 (was 9): it says only its own lines now (T-201 N1 - failures are boxes) - the switch
-       note, the opening line and, during a press, the name-not-saved line - and thirteen rows hold the name row.  With the
-       hint up it is 6: the name box is greyed during a press, so the name-not-saved line is never up with the hint. */
-    /* T-201 PP6' (owner 141): the PROFILE row sits right under PORT (a form's second row, no gap between); the worlds list gave
-       one half-row for it and the gap between the list's buttons and PORT went (PORT and PROFILE are one group), so the status
-       ceilings (7 / 6, swept against its sentences) are unchanged. */
-    static const PanelSlot host[]     = { { kSlotNameRow, 2 }, { kSlotGap, 1 }, { kSlotList, 5 }, { kSlotGap, 1 },
-                                          { kSlotListBtns, 2 }, { kSlotPortRow, 2 }, { kSlotProfRow, 2 }, { kSlotGap, 1 },
-                                          { kSlotStatus, 7 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
-    static const PanelSlot hostHint[] = { { kSlotNameRow, 2 }, { kSlotNameHint, 2 }, { kSlotList, 5 }, { kSlotGap, 1 },
-                                          { kSlotListBtns, 2 }, { kSlotPortRow, 2 }, { kSlotProfRow, 2 }, { kSlotGap, 1 },
-                                          { kSlotStatus, 6 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
-    static const PanelSlot join[]     = { { kSlotNameRow, 2 }, { kSlotGap, 1 }, { kSlotAddrRow, 2 }, { kSlotGap, 1 },
-                                          { kSlotStatus, 9 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
-    static const PanelSlot joinHint[] = { { kSlotNameRow, 2 }, { kSlotNameHint, 2 }, { kSlotAddrRow, 2 }, { kSlotGap, 1 },
-                                          { kSlotStatus, 9 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
+       HOST GAME's status says only its own lines (T-201 N1 - failures are boxes): the switch note and the opening line, or
+       during a press its line and the name-not-saved line. */
+    /* HOST GAME's rows: the worlds list and its buttons, then one group with no gap inside - PASSWORD (label, box, SHOW / HIDE)
+       (T-290), PORT, PROFILE (T-201 PP6') - then the status area.  Twelve rows hold them with the
+       list at 4 half-rows and no gap between PLAYER NAME and the list's head; the status ceiling is 5: a press's line with the name-not-saved line is
+       four lines at 1280x720 (swept).  With the name's hint up (its row between the name and the list) the ceiling is 3:
+       HOST is greyed while the hint shows, so no press line is up. */
+    static const PanelSlot host[]     = { { kSlotNameRow, 2 }, { kSlotList, 4 }, { kSlotGap, 1 },
+                                          { kSlotListBtns, 2 }, { kSlotPwRow, 2 }, { kSlotPortRow, 2 },
+                                          { kSlotProfRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 5 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
+    static const PanelSlot hostHint[] = { { kSlotNameRow, 2 }, { kSlotNameHint, 2 }, { kSlotList, 4 }, { kSlotGap, 1 },
+                                          { kSlotListBtns, 2 }, { kSlotPwRow, 2 }, { kSlotPortRow, 2 },
+                                          { kSlotProfRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 3 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
+    /* JOIN GAME's rows: PLAYER NAME, the friends list (its heads and rows, or the line in its place - kSlotList) with REFRESH under it at
+       the right (kSlotListBtns), JOIN BY ADDRESS, IP ADDRESS, then the status area.  Thirteen rows hold them with the list at 5
+       half-rows; with the name's hint up the status ceiling is 7 - the opening line alone, JOIN is greyed while the hint shows.
+       No gap row between the status area and BACK / JOIN: the status area's own spare under its last line is that gap, so the
+       help line sits one gap above the bottom row and the window is no taller than its rows. */
+    static const PanelSlot join[]     = { { kSlotNameRow, 2 }, { kSlotList, 5 }, { kSlotListBtns, 2 }, { kSlotJoinByAddr, 2 },
+                                          { kSlotAddrRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 9 }, { kSlotButtons, 2 } };
+    static const PanelSlot joinHint[] = { { kSlotNameRow, 2 }, { kSlotNameHint, 2 }, { kSlotList, 5 }, { kSlotListBtns, 2 },
+                                          { kSlotJoinByAddr, 2 }, { kSlotAddrRow, 2 }, { kSlotGap, 1 }, { kSlotStatus, 7 },
+                                          { kSlotButtons, 2 } };
     static const PanelSlot nameDlg[]  = { { kSlotDlgText, 3 }, { kSlotGap, 1 }, { kSlotDlgName, 2 }, { kSlotGap, 1 },
                                           { kSlotButtons, 2 } };
     static const PanelSlot delWorld[] = { { kSlotDlgText, 10 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };   /* ui5b: one row more at 1280x720 */
-    /* ui5d (manager decision 2026-09-28): no gap row after the router help or PLAYERS - the area under each is text too,
-       and each text area's spare (kPanelTextSparePx under its last line; the ceilings include it) is the gap.  T-510: the
-       INTERNET ADDRESS row straight under LOCAL ADDRESS (one group) - one row for an address, two while its sentence wraps
-       (PanelLive::net); the router help area carries the address note above the router help (its ceiling holds both at
-       800x600). */
-    static const PanelSlot hosting[]  = { { kSlotHomeAddr, 2 }, { kSlotNetAddr, 4 }, { kSlotGap, 1 }, { kSlotRouterHelp, 6 },
-                                          { kSlotPlayers, 4 }, { kSlotStatus, 6 }, { kSlotGap, 1 },
-                                          { kSlotButtons, 2 } };
-    /* T-631 (owner 570): with a game VPN found, its RADMIN / HAMACHI ADDRESS row (one row, LOCAL ADDRESS's height) between
-       LOCAL ADDRESS and INTERNET ADDRESS.  HOSTING already fills thirteen rows at its ceilings, so the row's two half-rows
-       come off the status area's ceiling here (6 -> 4: its usual lines - the hosting line, a blank, a COPY note - fit 4 at
-       1280x720; the longest set, with the profile line and the port-in-use line, is cut).  Without a VPN nothing moves. */
-    static const PanelSlot hostingVpn[] = { { kSlotHomeAddr, 2 }, { kSlotVpnAddr, 2 }, { kSlotNetAddr, 4 }, { kSlotGap, 1 },
-                                            { kSlotRouterHelp, 6 }, { kSlotPlayers, 4 }, { kSlotStatus, 4 }, { kSlotGap, 1 },
-                                            { kSlotButtons, 2 } };
+    /* HOSTING's rows: the STEAM row - its label, INVITE FRIENDS at the right level with it and, only while Steam is not running,
+       its line wrapped between them (two lines at 1280x720 and 1920x1080: the row is two rows tall then, one row while Steam
+       runs - PanelLive::steam) - then the PLAYERS list, LOCAL ADDRESS, INTERNET ADDRESS (one row for an address, two while its sentence wraps -
+       PanelLive::net), the status area and BACK.  No gap rows: each text area's spare under its last line is the gap.  22
+       half-rows at the ceilings; the status ceiling is 6 (the profile line, the hosting line and the copy note at 1280x720). */
+    static const PanelSlot hosting[]  = { { kSlotSteamRow, 4 }, { kSlotPlayers, 4 }, { kSlotHomeAddr, 2 }, { kSlotNetAddr, 4 },
+                                          { kSlotStatus, 6 }, { kSlotButtons, 2 } };
+    /* With a game VPN found, its RADMIN / HAMACHI ADDRESS row (one row, LOCAL ADDRESS's height) between LOCAL ADDRESS and INTERNET
+       ADDRESS; the status ceiling is 4 there, so the window at its ceilings is as tall as HOSTING's. */
+    static const PanelSlot hostingVpn[] = { { kSlotSteamRow, 4 }, { kSlotPlayers, 4 }, { kSlotHomeAddr, 2 }, { kSlotVpnAddr, 2 },
+                                            { kSlotNetAddr, 4 }, { kSlotStatus, 4 }, { kSlotButtons, 2 } };
+    /* INVITE FRIENDS: the friends list (FRIEND / STATUS, or the line in its place), the status line, BACK / INVITE. */
+    static const PanelSlot invite[]   = { { kSlotList, 8 }, { kSlotGap, 1 }, { kSlotStatus, 3 }, { kSlotButtons, 2 } };
     static const PanelSlot options[]  = { { kSlotTabs, 2 }, { kSlotGap, 1 }, { kSlotOptRows, 18 }, { kSlotGap, 1 },
-                                          { kSlotNote, 2 }, { kSlotButtons, 2 } };
+                                          { kSlotButtons, 2 } };
     static const PanelSlot profiles[] = { { kSlotList, 8 }, { kSlotGap, 1 }, { kSlotListBtns, 2 }, { kSlotGap, 1 },
                                           { kSlotStatus, 8 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
     static const PanelSlot delProf[]  = { { kSlotDlgText, 4 }, { kSlotGap, 1 }, { kSlotButtons, 2 } };
+    /* RESET WORLD?: its text down to what every player keeps, the keep-buildings tick box (one row, as GAME OPTIONS' ticks), the last
+       paragraph (the old world's name), then CANCEL / RESET WORLD - no gap row: the last paragraph's own spare under its last line is
+       that gap (as JOIN GAME's status area).  At the panel's width with a 48-character world name the text above the tick box
+       is 17 lines and the last paragraph 3 at 1280x720 (rowH 34): Kenshi's own line of about 14 px needs 15 and 3 half-rows; the
+       fallback estimate's 18 px lines fill the 18 and 4 here exactly, without its 9 px spare.  The list is the 26 half-rows the
+       window has.  Swept in test_main.cpp at 1280x720 and 1920x1080. */
+    static const PanelSlot resetWorld[] = { { kSlotDlgText, 18 }, { kSlotDlgTick, 2 }, { kSlotDlgTail, 4 }, { kSlotButtons, 2 } };
     const PanelSlot* s = landing;
     int n = (int)(sizeof(landing) / sizeof(landing[0]));
     switch (layout)
@@ -353,6 +385,7 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     case kLayHost:          s = host;     n = (int)(sizeof(host) / sizeof(host[0]));         break;
     case kLayJoin:          s = join;     n = (int)(sizeof(join) / sizeof(join[0]));         break;
     case kLayNewWorld:
+    case kLayPassword:      /* T-290: PASSWORD REQUIRED is built like NEW WORLD */
     case kLayNewProfile:    s = nameDlg;  n = (int)(sizeof(nameDlg) / sizeof(nameDlg[0]));   break;
     case kLayDeleteWorld:   s = delWorld; n = (int)(sizeof(delWorld) / sizeof(delWorld[0])); break;
     case kLayHosting:       s = hosting;  n = (int)(sizeof(hosting) / sizeof(hosting[0]));   break;
@@ -362,6 +395,8 @@ inline const PanelSlot* PanelRowsOf(int layout, int* count)
     case kLayHostHint:      s = hostHint; n = (int)(sizeof(hostHint) / sizeof(hostHint[0])); break;   /* T-201 N1b */
     case kLayJoinHint:      s = joinHint; n = (int)(sizeof(joinHint) / sizeof(joinHint[0])); break;   /* T-201 N1b */
     case kLayHostingVpn:    s = hostingVpn; n = (int)(sizeof(hostingVpn) / sizeof(hostingVpn[0])); break;   /* T-631 */
+    case kLayInvite:        s = invite;   n = (int)(sizeof(invite) / sizeof(invite[0]));     break;
+    case kLayResetWorld:    s = resetWorld; n = (int)(sizeof(resetWorld) / sizeof(resetWorld[0])); break;
     default: break;
     }
     if (count != 0) *count = n;
@@ -402,25 +437,27 @@ inline int PanelTextHalves(int lines, int rowH)
 }
 /* ui5d (T485 at 1280x720: HOSTING's router help and PLAYERS areas kept their fixed rows) - EVERY TEXT AREA'S LIVE HEIGHT.
    PanelLive carries one live height per text area a screen can have, each -1 (= the list's value) until set: `text` the
-   status area / a dialog's text (ui5c's liveHalves - an int converts to it, so every ui5c call reads as before), `help`
-   HOSTING's router help (kSlotRouterHelp), `players` its PLAYERS list (kSlotPlayers).  ui.cpp fills each from the text on
+   status area / a dialog's text (ui5c's liveHalves - an int converts to it, so every ui5c call reads as before), `players`
+   HOSTING's PLAYERS list (kSlotPlayers), `steam` its STEAM row (kSlotSteamRow, PanelSteamRowHalves).  ui.cpp fills each from the text on
    screen by the same rule (PanelTextAreaHalves: ui7's measured height, PanelTextHalvesPx), and the list's value stays the CEILING.  GAME OPTIONS'
-   note row (kSlotNote) is not live: that screen is as tall as its longest tab so its tabs never move under the mouse. */
+   rows are not live: that screen is as tall as its longest tab so its tabs never move under the mouse. */
 struct PanelLive
 {
     int text;
-    int help;
     int players;
     int net;   /* T-510: HOSTING's INTERNET ADDRESS row (kSlotNetAddr) - 2 for one line, 4 for a value wrapped in two */
-    PanelLive(int textHalves = -1) : text(textHalves), help(-1), players(-1), net(-1) {}
+    int steam; /* HOSTING's STEAM row (kSlotSteamRow): PanelSteamRowHalves */
+    int tail;  /* RESET WORLD?'s last paragraph (kSlotDlgTail), under its tick box */
+    PanelLive(int textHalves = -1) : text(textHalves), players(-1), net(-1), steam(-1), tail(-1) {}
 };
 inline int PanelSlotHalves(const PanelSlot& s, const PanelLive& live)
 {
     int v = -1;
     if (s.slot == kSlotStatus || s.slot == kSlotDlgText) v = live.text;
-    else if (s.slot == kSlotRouterHelp) v = live.help;
+    else if (s.slot == kSlotSteamRow) v = live.steam;
     else if (s.slot == kSlotPlayers) v = live.players;
     else if (s.slot == kSlotNetAddr) v = live.net;
+    else if (s.slot == kSlotDlgTail) v = live.tail;
     if (v >= 0) return v < s.halves ? v : s.halves;
     return s.halves;
 }
@@ -479,6 +516,8 @@ inline PanelPairRect PanelLabelBoxIn(int innerW, int gap, PanelBand band, int bo
 /* BACK / CANCEL (left) and the action (right) share one width; PASTE / COPY one; the port box a five-digit width. */
 inline int PanelBottomBtnW(int innerW) { return (innerW * 38) / 100; }
 inline int PanelSideBtnW(int innerW)   { return (innerW * 20) / 100; }
+/* HOST GAME's four world buttons (NEW WORLD, GAME OPTIONS, RESET WORLD, DELETE WORLD): one width, a gap between each two. */
+inline int PanelQuarterBtnW(int innerW, int gap) { return (innerW - 3 * gap) / 4; }
 /* T-510: HOSTING's address-row buttons - LOCAL ADDRESS's COPY and INTERNET ADDRESS's SHOW and COPY, one width - narrower than
    PanelSideBtnW so the internet row's value (between the label column and its two buttons) has room; never narrower than a
    four-letter caption (SHOW / HIDE / COPY) at kPanelTextCharW plus kPanelAddrBtnPadPx each side. */
@@ -488,6 +527,20 @@ inline int PanelAddrBtnW(int innerW)
     const int w = (innerW * 11) / 100, least = 4 * kPanelTextCharW + 2 * kPanelAddrBtnPadPx;
     return w < least ? least : w;
 }
+/* HOSTING's INVITE FRIENDS, at the right of the STEAM row: about a quarter of the width, so the Steam line keeps two lines'
+   room between the label column and it, never narrower than its caption at kPanelTextCharW plus kPanelAddrBtnPadPx each side. */
+inline int PanelInviteBtnW(int innerW)
+{
+    const int w = (innerW * 24) / 100, least = 14 * kPanelTextCharW + 2 * kPanelAddrBtnPadPx;
+    return w < least ? least : w;
+}
+/* How far the Steam line's text area starts below the STEAM row's top, so its first line is level with the label and INVITE
+   FRIENDS (one row tall, text centred): Kenshi's body line is about 0.4 of a row at 1280x720 and a third at 1920x1080
+   ([UI] measured lineH 14 at rowH 34, 17 at rowH 52). */
+inline int PanelSteamLineDy(int rowH) { return (rowH * 3) / 10; }
+/* The STEAM row's height in half-rows: one row while Steam runs (its label and INVITE FRIENDS only), two while the line
+   saying Steam is not running wraps beside them (the list's value). */
+inline int PanelSteamRowHalves(int steamRunning) { return steamRunning != 0 ? 2 : 4; }
 inline int PanelPortBoxW(int innerW)   { const int w = (innerW * 20) / 100; return w < kPanelMinFieldW ? kPanelMinFieldW : w; }
 inline int PanelGapOf(int rowH)        { return rowH / 6 + 1; }
 /* T-510: the INTERNET ADDRESS row's value width - from the label column to its two buttons (SHOW, COPY). */

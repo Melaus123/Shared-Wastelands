@@ -13,7 +13,7 @@
  *     right while that player is online and in no faction of players.
  *   - anyone else, this player a member: "STANCE TOWARDS <FACTION>: <STANCE> (SET BY <FOUNDER>)" (owner 476: the founder sets
  *     it) and LEAVE FACTION right; no stance buttons.
- *   - nothing selected: "Select a player."; a member keeps LEAVE FACTION right (it is on a member's line whatever is selected).
+ *   - nothing selected: no line; a member keeps LEAVE FACTION right (it is on a member's line whatever is selected).
  *
  * Pure: no engine memory, no MyGUI, no Windows; the offline suite runs the same code. C++03 (VS2010 v100).
  */

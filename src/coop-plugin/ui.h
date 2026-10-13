@@ -43,6 +43,9 @@ const char* UiHostLeftLayer();
 int UiModsWarnShow(const char* text);
 int UiModsWarnOkClicked();
 int UiModsWarnClose();
+int UiResetBoxShow(const char* title, const char* text);   /* T-36: the reset box in the reset world, MAIN THREAD (store.cpp ResetBoxTick) - 1 built */
+int UiResetBoxOkClicked();                                  /* T-36: 1 = its OK was pressed since the last ask */
+int UiResetBoxClose();                                      /* T-36: taken down - 1 = it was there */
 int UiModsWarnHide();
 // ui1 (connection trouble step 2): the small non-blocking notice - on 1 shows `text`, on 0 takes it down. 1 done, 0 refused,
 // -1 a MyGUI throw, -2 a fault. MAIN THREAD only.
@@ -66,6 +69,16 @@ bool UiPreviewCommand(const std::string& args);
 // change event, the box's caption + change event) and REFUSE a hidden or disabled one - a mouse could not reach it either.
 // true = fired / said, false = refused (logged `[UI] <verb> ... REFUSED - <why>`).
 bool UiDriveCommand(const std::string& verb, const std::string& args);
+// T-290 - TEST-ONLY: the `joinpw` lever just set the join password (MAIN THREAD). JOIN GAME's next JOIN press keeps it instead of
+// starting the join with no password; one press only.
+void UiJoinPasswordFromLeverOnce();
+// MAIN THREAD: 1 = this game hosts a world now (the rule that shows HOSTING); *world = that world's name as listed. Read by the Steam
+// rich presence (net/steam_friends.cpp).
+int  UiHostingNow(std::string* world);
+// MAIN THREAD: CAN'T JOIN drawn in a RUNNING WORLD (the MODS DON'T MATCH notice's recipe, one OK) for a Steam join request that came
+// while in a world. 1 shown, 0 refused, -1 a MyGUI throw, -2 a fault. The tick closes it on its OK or when the world goes.
+int  UiJoinRefuseShow(const char* text);
+void UiJoinRefuseTick();
 // T-510 - TEST-ONLY `hostaddr fake <ip>` | `hostaddr show` | `hostaddr hide` from the command channel (MAIN THREAD): the HOSTING
 // screen's INTERNET ADDRESS row as if the router had reported <ip>, and SHOW / HIDE without a click. true = done, false = refused.
 bool UiHostAddrCommand(const std::string& args);

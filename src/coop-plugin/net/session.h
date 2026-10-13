@@ -5,7 +5,7 @@
 
 namespace coopstate { struct PoseWire; }   /* POSE (read-poses): src/common/statewire.h */
 namespace cooplimb { struct LimbsWire; }   /* LIMBS: src/common/limbwire.h */
-namespace coopcrime { struct CrimeState; }   /* crime3: src/common/crimewire.h */
+namespace coopcrime { struct CrimeState; struct CrimeRelEvent; }   /* crime3: src/common/crimewire.h */
 namespace coopbounty { struct BountyEntry; }   /* crime5: src/common/bountywire.h */
 namespace cooprison { struct PrisonMsg; }   /* arrest2: src/common/prisonwire.h */
 namespace cooptreat { struct TreatMsg; }    /* heal1: src/common/treatwire.h */
@@ -201,6 +201,12 @@ bool SendCrime(unsigned int uid, const coopcrime::CrimeState& s);
 // M7b slice 4 fold 1 (F5): the crime state that follows a SPAWN of `uid` on the very road (and route) that SPAWN just took; false
 // when the last character-stream send was not that SPAWN or the send failed. MAIN THREAD (crime.cpp CrimeSendWithSpawn).
 bool SendCrimeAfterSpawn(unsigned int uid, const coopcrime::CrimeState& s);
+// MSG_CRIME kind 1: a crime this game's engine recorded on its copy of `uid`, to that character's OWNER only. RELIABLE.
+// 1 sent; 0 no road now (keep it); -1 never sendable (no owner on record, or it does not encode). MAIN THREAD (CrimeTick).
+int SendCrimeToOwner(unsigned int uid, const coopcrime::CrimeState& s);
+// MSG_CRIME kind 2: a standing event this game's engine raised against player `toSlot`'s stand-in, to that player only
+// (toSlot < 0: the session peer). RELIABLE. 1 sent; 0 no road now (keep it); -1 never sendable. MAIN THREAD (RelationsTick).
+int SendCrimeRelEvent(const coopcrime::CrimeRelEvent& e, int toSlot);
 // crime5: a character's bounty list (kind 0, owner) or a copy's additions (kind 1) - src/common/bountywire.h. RELIABLE; false
 // when the link is down or the list does not encode. MAIN THREAD (CrimeTick).
 bool SendBounty(unsigned int uid, unsigned char kind, const std::vector<coopbounty::BountyEntry>& list,
@@ -269,6 +275,8 @@ int PlayerAddrOfKey(unsigned int key);
 bool SendBuild(const coopbuild::BuildMsg& m);
 // par16: a farm's growth state (writer -> other, kind 6) or a held game's harvest (kind 7), on MSG_BUILD. False when the link is down.
 bool SendFarm(const coopfarm::FarmMsg& m);
+// The farm messages SendFarm could not encode (dropped, never sent; each counted and said) - for [MINE] REPORT. MAIN THREAD.
+long long FarmUnencodableCount();
 
 // P-15 / F220 - tell the peer this character ENTERED or LEFT combat, and against whom.
 //

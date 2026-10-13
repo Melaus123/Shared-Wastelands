@@ -997,7 +997,7 @@ int NgNote(void* mainW, int allLocked, int host)
         }
         MyGUI::TextBox* tb = x != 0 ? x->castType<MyGUI::TextBox>(false) : 0;
         if (tb == 0) return 0;
-        if (host) tb->setCaption(MyGUI::UString("Set in MULTIPLAYER > GAME OPTIONS."));   /* ui2: owner 2026-09-27 wording */
+        if (host) tb->setCaption(MyGUI::UString("Set by the world's game options."));   /* ui2: owner 2026-09-27 wording */
         else tb->setCaption(MyGUI::UString(allLocked ? "Set by the host." : "Set by the host - changes here won't be used."));
         tb->setVisible(true);
         return 1;

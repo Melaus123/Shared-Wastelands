@@ -31,6 +31,18 @@ namespace coopcfg {
 /* THESE THREE VALUES ARE THE SAME NUMBERS coop::RoleId USES, and config.cpp asserts it at compile
    time so the two enums can never drift apart. */
 enum CfgRoleId { kCfgSingle = 0, kCfgHost = 1, kCfgClient = 2 };
+/* relaytest= (TEST ONLY): which end of the Steam link's echo test this game runs; kRelayTestNone = absent = nothing runs. */
+enum CfgRelayTestMode { kRelayTestNone = 0, kRelayTestListen = 1, kRelayTestDial = 2, kRelayTestPair = 3, kRelayTestMany = 4 };
+/* relaybridge=: the hosting game's Steam bridge (net/relay_bridge.cpp) - absent or on = open while this game hosts a world server on
+   this PC (Steam P2P, relay only); off = closed (a player's switch); ip:<port> (TEST ONLY) = its listener on 127.0.0.1:<port> over
+   Steam's plain UDP. */
+enum CfgRelayBridgeMode { kRelayBridgeOn = 0, kRelayBridgeOff = 1, kRelayBridgeIp = 2 };
+/* relaycap=<n> (TEST ONLY): the bridge's cap for new arrivals, 1..kRelayCapMax (steamlisten::kLinkCap). */
+const int kRelayCapMax = 32;
+/* relaytest=many:<port>:<cap>:<dials>: the listener's cap 1..kRelayManyCapMax (a host's cap, steamlisten::kLinkCap), the dials
+   1..kRelayManyDialsMax. */
+const int kRelayManyCapMax = 32;
+const int kRelayManyDialsMax = 36;
 
 /* The parser's own bounds, unchanged from ConfigLoad's inline loop: a file that is not a config
    file cannot make this loop long or this process fat. */
@@ -105,6 +117,28 @@ struct CfgFields
        router alone. Also on/off, true/false, yes/no; anything else is a bad line and the field stays 1. No writer
        carries it, like ownSave. */
     int            routerPort;
+    /* relaytest= - TEST ONLY: the Steam link's echo test (net/relay_test.cpp). listen:<port> opens a Steam IP listener on
+       127.0.0.1:<port> and echoes; dial:127.0.0.1:<port> dials one and runs the sweep; pair runs both ends in this game;
+       many:<port>:<cap>:<dials> opens a Steam listener with its cap forced to <cap> and dials it <dials> times from this game.
+       kRelayTestNone = absent = nothing runs. relaylag=<ms> (0-1000) / relayloss=<percent> (0-50): Steam's global fake lag / loss
+       on this game's sends during the test, 0 = absent. No writer carries any of them, like modSalt. */
+    int            relayTestMode;   /* kRelayTest* */
+    unsigned short relayTestPort;   /* listen / dial port; 0 for pair */
+    int            relayLagMs;
+    int            relayLossPct;
+    int            relayTestCap;    /* many: the listener's cap; 0 otherwise */
+    int            relayTestDials;  /* many: the dials; 0 otherwise */
+    /* T-290 S2 - TEST ONLY, no writer carries them (net/relay_bridge.cpp reads them): relaybridge= (kRelayBridge*, its port for ip:),
+       relayvia=ip:<port> (every world-server dial of this game goes over Steam's plain UDP to 127.0.0.1:<port>; 0 = absent) and
+       relaycap=<n> (the bridge's cap for new arrivals; 0 = absent = kRelayCapMax). */
+    int            relayBridgeMode;
+    unsigned short relayBridgePort;
+    unsigned short relayViaPort;
+    int            relayCap;
+    /* T-734 - TEST ONLY, no writer carries it (items.cpp ItCanMakeItems reads it): parityholdsec=<n> (0-600) - this game answers
+       'items cannot be made yet' for <n> s from the first time it asks, so a test can see an incoming box answer HELD.
+       0 = absent = off. */
+    int            parityHoldSec;
     CfgFields();      /* role=single, slot="s1", ports 0, no playerId - ConfigLoad's own defaults */
 };
 
@@ -128,6 +162,7 @@ bool CfgPortTextOk(const std::string& text, unsigned short* port);
 /* THE ADDRESS RULE, moved out of config.cpp's SplitAddr with its behaviour unchanged: the LAST colon
    separates address from port, so a bracketed or bare IPv6 literal does not silently lose its tail
    to the first one.  Writes nothing on a refusal. */
+/* A whole steam:<id> (src/common/relaybridge.h) is that id's dial form with relaybridge::kSteamRoutePort: the Steam route dials no port. */
 bool CfgSplitAddr(const std::string& v, std::string* addr, unsigned short* port);
 
 /* Does the address HALF look like something a resolver could be handed?  NO DNS LOOKUP IS DONE and
@@ -164,6 +199,19 @@ bool CfgNameFieldOk(const std::string& text, const char* what, size_t maxLen, st
    notes receives one entry per line the old loop logged; lines, unknownKeys and badLines are the same
    three numbers its summary line printed.  Any out pointer may be null.
    ------------------------------------------------------------------------------------------------ */
+/* THE relaytest= RULE: listen:<port>, dial:127.0.0.1:<port> (loopback only - the test's allow-without-auth is for 127.0.0.1), pair or
+   many:<port>:<cap>:<dials> (CfgRelayManyOk),
+   any case, the port by CfgPortTextOk. *mode / *port are written only on a yes; either may be null. */
+bool CfgRelayTestOk(const std::string& text, int* mode, unsigned short* port);
+/* many:<port>:<cap>:<dials>, any case: the port by CfgPortTextOk, cap 1..kRelayManyCapMax and dials 1..kRelayManyDialsMax, one or two
+   digits each. The outs are written only on a yes; any may be null. */
+bool CfgRelayManyOk(const std::string& text, unsigned short* port, int* cap, int* dials);
+/* T-290 S2 test keys: relaybridge= on | off | ip:<port>; relayvia= ip:<port>; relaycap= 1..kRelayCapMax (one or two digits). Any case,
+   the port by CfgPortTextOk. The outs are written only on a yes; any may be null. */
+bool CfgRelayBridgeOk(const std::string& text, int* mode, unsigned short* port);
+bool CfgRelayViaOk(const std::string& text, unsigned short* port);
+bool CfgRelayCapOk(const std::string& text, int* cap);
+
 void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>* notes,
                   int* lines, long long* unknownKeys, long long* badLines);
 

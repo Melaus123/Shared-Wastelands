@@ -13,6 +13,8 @@
 #include "../common/standinpurge.h"   /* inv7a-b: IsStandInRecord - the purge's own stand-in test */
 #include "../common/squadwriter.h"   /* M7a3f3 T-425 [m7a3f3-st0]: HandedOverWakeRefuse */
 namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
+namespace coop { void* SpawnBuildingFromSentHand(const unsigned char* handRaw32); int PlatoonHomeHandPod(const void* platoon, unsigned char* out32); int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32); }   /* spawn.cpp: a sent building handle resolved here; a squad's home-building hand read and given back [t755-copyhome-decl] */
+namespace coop { void KeptNoteRows(const char* p, size_t n); void KeptSaveFinished(long reqSeq); void KeptAreaWritten(const std::string& zoneId); void KeptAreaEcho(const std::string& worldId, int hasStamp, long long stamp); void KeptAreaSent(const std::string& zoneId, int sent, long long stamp); void KeptAreaStampSent(const std::string& zoneId, long long stamp); }   /* KEPT (src/common/keptwire.h): the rows and their state, and what settles a lay - defined in the kept block at the end of this file */
 namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps skipped because the squad's faction RECORD is a stand-in */
 #include "../common/queuejournal.h"   /* B12 (decision 52): the outage queue's two pure decisions - the conflict rule and the journal line */
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
@@ -22,17 +24,23 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "identity.h"       // PROBE P120: CaptureObjId - a member's handle (index, serial)
 #include "net/session.h"    // IsUidMine, SessionIsHost, EncodeRecordPayload
 #include "net/transport.h"  // P2 item 1: a second ENet link, to SharedWastelandsServer.exe
+#include "net/relay_bridge.h"   /* the route a world-server dial takes: steam:<id> over Steam, else direct */
+#include "net/steam_probe.h"   /* the exit hook tells the probe the game has shut Steam down */
+#include "../common/relaybridge.h"   /* AddrForLog (a Steam id is never logged), RouteWord, a Steam dial's connect budget */
 #include "upnp.h"           /* T-53: UpnpQuitBegin / UpnpQuitWait - the router entry is removed at the game's exit */
 #include "zones.h"          // IsPositionLoadedHere
 #include "playerfaction.h"  // P3: player/peer factions are not world state
 #include "../common/factionkey.h"   /* PositionTakesKey, kRecFacCode: a row's faction re-keyed by a marked position update */
 #include "build.h"          /* build1-c: BuildForgetWorld at world teardown */
 #include "relations.h"      // RelationsForgetQueue at world teardown
+#include "../common/carrycheck.h"   /* carryread / carryset: RESET WORLD's carry as counts and exact sums */
 #include "playerstab.h"     /* T-545: PlayersTabForgetWorld at world teardown */
 #include "fallentab.h"      /* T-556: FallenTabForgetWorld at world teardown */
 #include "team.h"           /* T-546 step 3: TeamArrive - the faction membership table */
 #include "../common/teamwire.h"   /* T-546 step 3: TEAM (60) */
 #include "../common/fallenwire.h"   /* T-556: FALLEN (61) */
+#include "../common/keptwire.h"   /* KEPT (69): the players' kept pieces laid back into a reset world */
+#include "../common/townkeep.h"   /* TOWNS (70): the players' outposts carried into a reset world */
 // review-p3o H2: the other modules' world-teardown resets, all called from detour_worldTeardown
 #include "replicate.h"
 #include "ai_spike.h"   /* PROBE P113: GetTarget - the lever places its squad near it */
@@ -42,6 +50,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "../common/arrivals.h"   /* M11 C2: which other player has just entered the world - the roster diff and the link merge */
 #include "../common/joinstage.h"   /* M11a S1 (store protocol 61): the join STAGE, the join gate, PLAYERS (54) and JOIN_STAGE (55) - the SAME header the notebook and the offline suite compile */
 #include "../common/liverelay.h"   /* M6 (T-197 piece 6, store protocol 60): the AREA target, CATCHUP (56) and the notebook road's own inner types - the SAME header the notebook and the offline suite compile */
+#include "../common/pumpcarry.h"   /* the world-server link's carry: arrival order, a waiting relayed MOVE overwritten by a newer one */
 #include "../common/prisonwire.h"   /* a relayed PRISON's kind: a death request is dropped during a load */
 #include "../common/liveenvelope.h"   /* M5a (T-197 piece 4, store protocol 59): LIVE (53) - the SAME header the notebook and the offline suite compile */
 #include "../common/liveowner.h"   /* M7a A1 build 1 [a1b1-st6]: the OWNER_MOVED road gate */
@@ -57,11 +66,13 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "config.h"   /* E38 / decisions 42-43: RoleIsSingle, ConfigSlot, ConfigWorldKey */
 #include "../common/datadir.h"   /* PP3: <data folder>\worlds and records\ */
 #include "../common/worlddir.h"   /* W2b / decision 58: WorldDir, WorldFolderName, DirEntry, NeedsMigration - the world folder is built in ONE place */
+#include "../common/worldreset.h"   /* T-36 S2: the reset world's import flags, which save it imports, the records store's re-key */
 #include "../common/loadlatch.h"   /* P7y (F610): WorldGenBumpDecide - the world-generation latch as a pure function, swept by the same offline suite */
 #include "../common/stateptr.h"   /* T-296 fix 2 (H055): coopstate::StateWakeDecide / StateReloadAllowed / StateCreateDecide - a platoon's state record (+0x40) lives outside its own container; the offline suite sweeps the same header */
 #include "../common/slotwire.h"   /* stand1: coop-p<n> ids and the N-party zone owner swap */
 #include "../common/storemeta.h"   /* B10 (audit C13): kOwnerUnknown, OwnerFieldFromSlot and OwnerTranslateDecide - the SAME translation unit the notebook and the offline test exe compile, so three programs cannot hold three ideas of what the RECORD owner field means. */
 #include "../common/modlist.h"   /* settings5 S5: the mod list on the store HELLO and in the mods REFUSE */
+#include "../common/permdelete.h"   /* DELETE WORLD / DELETE PROFILE delete for good - the path-inside check and which saves go */
 #include "../common/profiles.h"      /* prof1: the lobby's wire, the automatic pick and the save-folder rule - the SAME header the notebook and the offline suite compile */
 #include "../common/diskformat.h"   /* owner 429: the joined-world and records folders' format number */
 #include "../common/worldkeep.h"   /* the .1 backup name (BackupOf) and the alias table (aliases.txt) the world server reads */
@@ -69,6 +80,8 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "../common/restoreguard.h"   /* restore1a: the world guard - its pure decision, key-file fields 5-7 and the WORLD_SAVED wire - the SAME header the notebook and the offline suite compile */
 #include "../common/areadrop.h"   /* M9 (T-197; world-server protocol 65): the AREAMAP layout (seat table + 256-wide rows) - the SAME header the world server and the offline suite compile */
 #include "../common/storelink.h"   /* B10-b (review-b10 M-3 / M-7): coopstore::RepushDecide and StoreHandshakeDecide - the store link's two pure decisions, in the SAME translation unit the notebook and the offline test exe compile. */
+#include "../common/authproof.h"   /* the world's password: the proof, auth.txt's line - the SAME header the world server and the offline suite compile */
+#include "../common/accessrule.h"   /* TEST-ONLY accesstest: access.txt's shape */
 #include "../common/sendbundle.h"   /* M13: BUNDLE (59) - the messages of one pass as one packet per lane; the SAME header the world server and the offline suite compile */
 #include "../common/writerladder.h"   /* B10 (audit C11): coopwriter::ZoneWriterDecide - ZoneWriteIsMine takes THE SAME ladder items.cpp takes for a box, a door and a shop, and the offline suite sweeps the whole rule without a game. */
 #include "settings.h"   /* settings2 S2: the OPTIONS handler hands the gp.* keys to settings.cpp */
@@ -93,7 +106,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 
 #include <Windows.h>
-#include <shellapi.h>   /* prof1: SHFileOperationA - a deleted profile's save folder goes to the Recycle Bin */
+#include <shellapi.h>   /* SHFileOperationA - the outage journal from before joined folders goes to the Recycle Bin (no player delete uses it) */
 #pragma comment(lib, "shell32.lib")
 #include <direct.h>
 #include <errno.h>   /* tickwait: EnsureDir tells EEXIST from a missing parent */
@@ -125,6 +138,157 @@ void StoreDrainCreated(); void StoreCreatedLockInit();   /* P4e: defined at coop
    inside the anonymous namespace below (that would declare different functions: C2668). */
 void HbRegister(void* platoon); void HbForget(void* platoon); void HbMarkDirty(void* platoon, int cause); void HbWorldTeardown(); void HeartbeatTick(); void StoreSaveFaultBoth(const char* where);   /* fold 2 (recheck-s2hb) */
 long long g_sleepStampBumped = 0;   /* review-s2hb fold: a sleep record stamped past a same-second record (the notebook refuses an equal stamp) */
+/* THE WORLD'S PASSWORD ON THIS GAME (src/common/authproof.h). Both are kept in memory only and never logged: SetHostPassword's for
+   this hosting session (written nowhere but as the world's salted key, StoreWriteWorldAuth), SetJoinPassword's for the current join.
+   g_storeAuthStop: the world server refused this join for its password or its access list (coopstore::StoreRefuseStopsJoin), so
+   neither re-dial dials it again (StoreLinkSockState reads it as refused) until the player acts - a password, or leaving. */
+std::string g_hostPassword, g_joinPassword;
+int g_storeAuthStop = 0;
+long long g_storeAuthAnswered = 0, g_storeAuthNoPassword = 0, g_storeAuthBadChallenge = 0, g_storeRefusedAuth = 0;
+long long g_storeAuthExtra = 0, g_storeHostTokenSent = 0, g_storeHostTokenFailed = 0;
+int g_storeAuthAnsweredLink = 0;   /* this connection's one AUTH_CHALLENGE has been taken (answered or not); each new link clears it */
+int g_storeRefusalSayAgain = 0;    /* a new join password: the next password or access refusal is said even when its reason was said before */
+/* THIS HOSTING'S SECRET: 32 random bytes made each time this game starts its world server (StoreNewHostToken) and handed to that
+   server on its command line. This game shows it in HOST_TOKEN ahead of its HELLO (it is the world's owner), its Steam bridge in each
+   STEAM_ID (StoreHostToken). Memory only; never logged. */
+unsigned char g_hostToken[authproof::kTokenBytes];
+bool g_hostTokenSet = false;
+/* a new host password is a new hosting's: a refusal of the old one (reason 11 included) no longer stops this game's join */
+void SetHostPassword(const std::string& password) { g_hostPassword = password; g_storeAuthStop = 0; }
+int StoreHostHasPassword() { return g_hostPassword.empty() ? 0 : 1; }
+void SetJoinPassword(const std::string& password) { g_joinPassword = password; g_storeAuthStop = 0; g_storeRefusalSayAgain = 1; }
+
+/* n bytes from Windows' own random source (RtlGenRandom, advapi32's SystemFunction036, looked up so the DLL's imports stay as they are) */
+static bool StoreAuthRandom(unsigned char* out, size_t n)
+{
+    typedef BOOLEAN (WINAPI* FnGenRandom)(PVOID, ULONG);
+    static FnGenRandom fn = 0;
+    if (fn == 0)
+    {
+        HMODULE m = ::LoadLibraryA("advapi32.dll");
+        if (m != 0) fn = (FnGenRandom)::GetProcAddress(m, "SystemFunction036");
+    }
+    return fn != 0 && fn(out, (ULONG)n) != FALSE;
+}
+
+bool StoreNewHostToken(std::string* hex)
+{
+    unsigned char t[authproof::kTokenBytes];
+    hex->clear();
+    if (!StoreAuthRandom(t, sizeof(t))) { g_hostTokenSet = false; return false; }
+    memcpy(g_hostToken, t, sizeof(t));
+    g_hostTokenSet = true;
+    *hex = authproof::Hex(t, sizeof(t));
+    return true;
+}
+
+bool StoreHostToken(unsigned char out[32])
+{
+    if (!g_hostTokenSet) return false;
+    memcpy(out, g_hostToken, authproof::kTokenBytes);
+    return true;
+}
+
+/* The answer to one AUTH_CHALLENGE, made from the password this game hosts with (the host's own game) or the one given for this
+   join. 1 = *proof made; 0 = this game has no password for it (nothing is sent: the world server refuses it in words); -1 = the
+   challenge is malformed. */
+int StoreAuthAnswer(const std::vector<char>& challenge, bool hosting, std::vector<char>* proof)
+{
+    unsigned char nonce[authproof::kNonceBytes], salt[authproof::kSaltBytes], key[authproof::kKeyBytes], pr[authproof::kProofBytes];
+    if (!authproof::ChallengeDecode(challenge, nonce, salt)) return -1;
+    const std::string& pw = hosting ? g_hostPassword : g_joinPassword;
+    if (pw.empty()) return 0;
+    authproof::DeriveKey(pw, salt, key);
+    authproof::MakeProof(key, nonce, pr);
+    proof->assign((const char*)pr, (const char*)pr + authproof::kProofBytes);
+    return 1;
+}
+
+/* A whole small file written beside its final name and moved over it, so a reader never sees half of one. */
+static bool StoreAuthWriteFile(const std::string& path, const std::string& text)
+{
+    const std::string tmp = path + ".tmp";
+    FILE* f = U8fopen(tmp.c_str(), "wb");
+    if (f == 0) return false;
+    const bool wrote = fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool closed = fclose(f) == 0;
+    if (!wrote || !closed || !U8MoveFileEx(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) { U8DeleteFile(tmp.c_str()); return false; }
+    return true;
+}
+
+static std::string StoreAuthErr()
+{
+    char b[24]; sprintf(b, "%lu", (unsigned long)::GetLastError());
+    return b;
+}
+
+bool StoreWriteWorldAuth(const std::string& worldDir)
+{
+    if (worldDir.empty() || worldDir[worldDir.size() - 1] == '\\' || worldDir[worldDir.size() - 1] == '/')
+    {
+        ErrorLog("[AUTH] the world's folder has no name (its path is empty or ends in a separator) - auth.txt is neither written nor removed,"
+                 " because it would land outside any world's folder, and the world server is not started");
+        return false;
+    }
+    const std::string path = worldDir + "\\" + authproof::kAuthFile;
+    if (g_hostPassword.empty())
+    {
+        const bool there = U8GetFileAttributes(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (there && !U8DeleteFile(path.c_str()))
+        {
+            ErrorLog("[AUTH] this world is hosted with no password, but its auth.txt from an earlier hosting could not be removed (Windows error "
+                     + StoreAuthErr() + ") - the world server would still ask for the old password");
+            return false;
+        }
+        DebugLog(std::string("[AUTH] hosting with no password: the world's auth.txt ") + (there ? "is removed" : "is absent") + " - the world server asks nobody for one");
+        return true;
+    }
+    unsigned char salt[authproof::kSaltBytes], key[authproof::kKeyBytes];
+    if (!StoreAuthRandom(salt, sizeof(salt)))
+    {
+        ErrorLog("[AUTH] the world's password could not be written: Windows gave no random numbers for its salt");
+        return false;
+    }
+    authproof::DeriveKey(g_hostPassword, salt, key);
+    const size_t cut = worldDir.find_last_of("\\/");
+    if (cut != std::string::npos) U8CreateDirectory(worldDir.substr(0, cut).c_str(), 0);   /* the top folder and a new world's own folder: the world server makes the rest */
+    U8CreateDirectory(worldDir.c_str(), 0);
+    const std::string text = "# the world's password as a salted key - written each time this world is hosted with a password; the password itself is in no file\r\n"
+                             + authproof::AuthLine(salt, key) + "\r\n";
+    if (!StoreAuthWriteFile(path, text))
+    {
+        ErrorLog("[AUTH] the world's password could not be written to its auth.txt (Windows error " + StoreAuthErr() + ")");
+        return false;
+    }
+    DebugLog("[AUTH] hosting with a password: the world's auth.txt holds its salted key; the password itself is kept in this game's memory only");
+    return true;
+}
+
+/* TEST-ONLY `accesstest mode open|mode allowlist|clear`: the world folder's access.txt, written on the hosting game. */
+std::string StoreAccessTest(const std::string& args)
+{
+    if (ConfigRole() != kRoleHost) return "error accesstest: only the hosting game writes its world's access.txt";
+    int action = -1;
+    if (args == "mode open") action = accessrule::kTestModeOpen;
+    else if (args == "mode allowlist") action = accessrule::kTestModeAllowlist;
+    else if (args == "clear") action = accessrule::kTestClear;
+    if (action < 0) return "error accesstest usage: accesstest mode open|mode allowlist|clear";
+    const std::string dir = StoreNotebookDir();
+    const std::string path = dir + "\\" + accessrule::kAccessFile;
+    std::string text;
+    FILE* f = U8fopen(path.c_str(), "rb");
+    if (f != 0) { char buf[4096]; size_t got; while (text.size() <= 65536 && (got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got); fclose(f); }
+    int entryNo = 0;
+    const accessrule::Rules r = accessrule::TestApply(accessrule::Parse(text), action, &entryNo);
+    U8CreateDirectory(dir.c_str(), 0);
+    if (!StoreAuthWriteFile(path, accessrule::Text(r))) return "error accesstest: access.txt could not be written (Windows error " + StoreAuthErr() + ")";
+    char n[64]; sprintf(n, "%d entries", (int)r.entries.size());
+    char e[32]; sprintf(e, "entry #%d", entryNo);
+    DebugLog("[ACCESS] TEST-ONLY access.txt: " + args + " (" + (entryNo > 0 ? std::string(e) : std::string("no entry written")) + "; now mode "
+             + accessrule::ModeWord(r.mode) + ", " + n + ")");
+    return "ok accesstest " + args;
+}
+
 namespace {
 void WriteBitsFile(const std::string& faction);   /* W2-f: LoadIndex writes the bits held before the index was read */
 void LoadBitsFiles();   /* decision 30: defined further down in this namespace; used by LoadIndex above it */
@@ -262,7 +426,7 @@ const int kSaveRequestLoad = 2;
 unsigned long long kSaveFileSystemGlobalRva = 0; static coop::AddrReg kSaveFileSystemGlobalRva_reg("SaveFileSystemGlobal", &kSaveFileSystemGlobalRva);   /* P8h: the address table fills this. Steam_1.0.65 0x212DC08 */
 const unsigned int kSfsBusyOff = 0x1E0;
 unsigned long long kResetGameRva = 0; static coop::AddrReg kResetGameRva_reg("ResetGame", &kResetGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x36CA40 */   // F489: GameWorld::resetGame - what SaveManager::loadGame calls to clear the world mid-session (FactionDirectory::clearAndFree, the global container, the player faction)
-const unsigned int kStoreProtocol = 90;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kStoreProtocol = 95;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 typedef bool (*GdcLoadFn)(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag);
 GdcLoadFn orig_gdcLoad = 0;
 /* Z1-b (review-z1 item 1): the readFile -> load handshake. It was two bare strings any thread overwrote; it is now a
@@ -367,6 +531,28 @@ std::map<void*, HomeOwed> g_homeKeyless;
 long long g_homeKeylessMade = 0, g_homeKeylessKeyed = 0, g_homeKeylessGone = 0;
 volatile LONG g_homeOwedNow = 0;
 long long g_homeAsked = 0, g_homeSetCreate = 0, g_homeSetLater = 0, g_homeNotLoaded = 0, g_homeNotResident = 0, g_homeFault = 0, g_homeOwedGone = 0, g_homeLines = 0;
+/* the squads owed a home building here, given by CopyHomeOwedTick once a second: copies of another game's groups built while the building
+   their sender named was not loaded here (NoteCopyHomeImpl), and squads a LOAD-OVERRIDE left without a home. platoon -> the world id and
+   bind stamp it was listed under (stamp 0: it was not bound here then), the building handle it was sent with (or the save's own) and the
+   home key known then (either may be empty), the gives that did not take, and whether a key/handle disagreement was logged. MAIN THREAD,
+   world state [t755-copyhome-owelist] */
+struct CopyHomeOwed { std::string worldId, key; unsigned long long bindGen; unsigned char hand[32]; int tries, mismatchLogged; DWORD nextLookAt; CopyHomeOwed() : bindGen(0), tries(0), mismatchLogged(0), nextLookAt(0) { std::memset(hand, 0, sizeof hand); } };
+std::map<void*, CopyHomeOwed> g_copyHomeOwedMap;
+void* g_copyHomeCursor = 0;   /* where the next once-a-second walk starts (round-robin) */
+long long g_copyHomeOwed = 0, g_copyHomeGiven = 0, g_copyHomeNotResident = 0, g_copyHomeHad = 0, g_copyHomeRetried = 0, g_copyHomeGiveFailed = 0, g_copyHomeMismatch = 0, g_copyHomeGone = 0, g_copyHomeNoId = 0;
+long long g_copyHomeOwedLines = 0, g_copyHomeGivenLines = 0, g_copyHomeRetryLines = 0, g_copyHomeMismatchLines = 0;
+/* LOAD-OVERRIDE and the squad's home after the engine's read: the squads already logged, and what was done */
+std::set<std::string> g_loHomeSeen; long long g_loHomeKept = 0, g_loHomeRestored = 0, g_loHomeRestoreFailed = 0, g_loHomeOwedByKey = 0, g_loHomeNoneAnywhere = 0;
+/* lists a squad as owed its home: with the bind stamp it holds under worldId now (0 when it is not bound here under that id) */
+void CopyHomeOweAdd(void* p, const std::string& worldId, const unsigned char* hand32, const std::string& key)
+{
+    CopyHomeOwed o; o.worldId = worldId; o.key = key;
+    const std::map<void*, std::string>::const_iterator b = g_bind.find(p);
+    const std::map<void*, unsigned long long>::const_iterator g = g_bindGenOf.find(p);
+    o.bindGen = (b != g_bind.end() && b->second == worldId && g != g_bindGenOf.end()) ? g->second : 0;
+    if (hand32 != 0) std::memcpy(o.hand, hand32, sizeof o.hand);
+    g_copyHomeOwedMap[p] = o;
+}
 // decision 34: worldId -> home town for every live note known here (main thread); published once a second as the locked map of
 // towns to the AREAS of their listed notes (townpending::NoteRole: live, not deleted, no platoon here, a known position) - read by
 // towngen on any thread through StoreTownPeoplePending, which decides which of those areas hold the town (townpending::Holds).
@@ -506,8 +692,7 @@ int g_basePolicy = coop::kPolicyUnknown;
 volatile long g_relayLinkedCached = 0;
 // review-p5d CRASH-1: net::SessionLinked() is `g_transport != 0 && g_transport->State() == LINK_UP` - a null test and a virtual call as two separate operations, over a pointer the MAIN thread deletes (net/session.cpp). The two detours below (detour_unloadedUpdate, detour_gdcSave -> ZoneWriteIsMine) carry no OnMainThread() guard, so they read this flag instead. Same shape as g_relayLinkedCached above and as towngen.cpp:40 / worldgen.cpp's g_wgLinkedCached.
 volatile long g_sessionLinkedCached = 0;
-int g_repairStale = 0;   /* restore1c: the host repaired the world while this game's world ran - nothing more is read or written on this link; restart */
-bool LinkUp() { return g_link != 0 && g_link->State() == net::LINK_UP && g_storeWelcomed && !g_storeProtoMismatch && !g_storeWrongWorld && g_repairStale == 0; }   /* MAIN THREAD ONLY - off-thread callers read StoreRelayLinked() */
+bool LinkUp() { return g_link != 0 && g_link->State() == net::LINK_UP && g_storeWelcomed && !g_storeProtoMismatch && !g_storeWrongWorld; }   /* MAIN THREAD ONLY - off-thread callers read StoreRelayLinked() */
 /* B9: THE MOMENT THE NOTEBOOK WAS LAST REACHABLE, as a GetTickCount stamp. Written on the main thread in
    StoreTick (every tick while the link is up, and once on the first tick so a game that never links still
    has a start for its outage), read from any thread as a plain aligned long. Unsigned subtraction, so it
@@ -2585,9 +2770,10 @@ const unsigned int kStoreMsgUniqueState = 36;   /* E5 / decision 31(c): a named 
 const unsigned int kStoreMsgClock = 39;
 const unsigned int kStoreMsgSpeedVote = 40;
 const unsigned int kStoreMsgRefuse = 42;   /* B10-b (review-b10 M-7): the notebook REFUSING this game's handshake - {u32 store protocol, u32 the protocol this game sent}. No WELCOME follows it and no records do. A notebook older than B10-b never sends it; the WELCOME's own protocol test below still catches that case. */
+const unsigned int kStoreMsgAuthChallenge = 65, kStoreMsgAuthProof = 66, kStoreMsgHostToken = 68;   /* HOST_TOKEN up {token}, ahead of the HELLO */   /* the world's password: CHALLENGE down {nonce, salt}, PROOF up {proof} (src/common/authproof.h) */
+typedef char StoreAuthNumbersAgree[(kStoreMsgAuthChallenge == authproof::kMsgAuthChallenge && kStoreMsgAuthProof == authproof::kMsgAuthProof && kStoreMsgHostToken == authproof::kMsgHostToken && kStoreProtocol == authproof::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgWeather = 41;   // decision 32: my loaded areas -> the relay; the relay's owner map -> me
 const unsigned int kStoreMsgProfiles = 45;   /* prof1 (store protocol 48): PROFILES - up {kind NEW/DELETE, number, name}, down {answers, verdict, cap, subject, active rows} (src/common/profiles.h) */
-const unsigned int kStoreMsgRepair = 50;   /* restore1c (store protocol 53): REPAIR - up the operator's {gR, sR}, down the answer and the broadcast (src/common/restoreguard.h) */
 const unsigned int kStoreMsgCatchup = 56;   /* M6 (store protocol 60): CATCHUP - down only: ASK {requester slot, ask number, sectors} / ASKED {owners asked, ask number, sectors} (src/common/liverelay.h) */
 const unsigned int kStoreMsgPlayerGone = 57;   /* M8 (store protocol 62): PLAYER_GONE - down only, {u16 slot} (src/common/peergone.h); queued, scope SAVE */
 const unsigned int kStoreMsgRecordFeed = 58;   /* T-313 (store protocol 63): RECORD_FEED - up ASK {after key} / OFF, down BEGIN {records, uniques, seqHigh} / PAGE_END {last key, sent, last, seqHigh} (src/common/recordfeed.h) */
@@ -2605,13 +2791,15 @@ const unsigned int kStoreMsgOwed = 63;   /* T-581: OWED - up ADD / CLAIM / RELEA
 typedef char T581StoreOwedNumberAgrees[(kStoreMsgOwed == owedpop::kMsgOwed && kStoreProtocol == owedpop::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgTownLoss = 64;   /* TOWN_LOSS - up REFILLED, down ROWS (src/common/townrefill.h) */
 typedef char StoreTownLossNumberAgrees[(kStoreMsgTownLoss == townrefill::kMsgTownLoss && kStoreProtocol == townrefill::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
+const unsigned int kStoreMsgKept = 69;   /* KEPT - up CLAIM / RELEASE / LAID / SETTLED, down ROWS / STATE (src/common/keptwire.h) */
+typedef char StoreKeptNumberAgrees[(kStoreMsgKept == keptwire::kMsgKept && kStoreProtocol == keptwire::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgFallen = 61;   /* T-556: FALLEN - up ADD / TAKE / ASK, down TABLE (src/common/fallenwire.h) */
 typedef char T556StoreFallenNumberAgrees[(kStoreMsgFallen == swfallen::kMsgFallen) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgWorldRel = 51;   /* par24 (store protocol 54; 55 since re-check D): WORLD_REL - world-vs-world standing rows (src/common/worldrelwire.h); up SEED / CHANGE / SEED_END, down every row at WELCOME, each row the notebook took, and ECHO (this game's own CHANGE rows answered) */
 const unsigned int kStoreMsgTownBar = 47;   /* refill1 (store protocol 50): TOWN_BAR - town bar rows (src/common/barwire.h); up this game's writes, down every row at WELCOME and each changed one. 46 is loot2c's RESEARCH_TAKE */
 const unsigned int kStoreMsgResearchTake = 46;   /* loot2c (store protocol 49; 45 before the prof1 merge): RESEARCH_TAKE - take rows (src/common/researchwire.h); up one take, down every row at WELCOME and each new one */
 const unsigned int kStoreMsgResearch = 44;   /* loot2b (store protocol 47): RESEARCH_BOX - research rows (src/common/researchwire.h); up one lifted box, down every box at WELCOME and each new one */
-const unsigned int kStoreMsgRecordSeq = 43;   /* B12-b (decision 52, store protocol 41 - no further bump): the notebook telling THIS GAME the sequence number it stamped on a record this game just wrote - {str worldId, u32 seq lo, u32 seq hi}. It carries no payload and never creates a record here; see StoreApplyRecordSeq for why the write is the seq field and nothing else. */
+const unsigned int kStoreMsgRecordSeq = 43;   /* B12-b (decision 52, store protocol 41 - no further bump): the notebook telling THIS GAME the sequence number it stamped on a record this game just wrote - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi}, the stamp being the writtenAt of the write it answers (KEPT matches a lay's write by it). It carries no payload and never creates a record here; see StoreApplyRecordSeq for why the write is the seq field and nothing else. */
 int g_mySlot = -1; long long g_areasSent = 0, g_areaMapRecv = 0;
 /* B10 (audit C13, design-e46-store 3.5) - THIS GAME'S OWN `owner` FIELD, AND THE ONLY MAKER OF ONE.
    ANY THREAD: g_mySlot is a plain aligned int the main thread writes once per WELCOME, which is the
@@ -2943,6 +3131,36 @@ int VerifyQuitSite(uintptr_t addr, const unsigned char* sig, unsigned int sigLen
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* STEAM AT A DELIBERATE QUIT. The game shuts Steam down in WinMain (0x744A6D) before exit() runs the GameWorld destructor
+   hook, so a Steam close made in that hook finds Steam gone. The three deliberate quit sites - the pause menu's EXIT GAME accept
+   (reached only after the leave save finished), the title screen's exit and the window close - are the last point where this
+   game knows it is quitting while Steam still runs, so this game's Steam use is closed here: the host's Steam bridge (its Steam
+   joiners see the close at once) and the world-server link when it runs over Steam (gracefully: Steam keeps sending what it
+   holds, and NoteQuitting has just drained the outbox onto it). A direct link is left alone: it closes in the exit hook, after
+   the final saves that hook waits for. The tick, sleep and teardown sites are left out: there the engine's quit byte can still
+   be withdrawn (an ESC release clears it), and a game that goes on keeps its links. Main thread; one shot. */
+int g_quitSteamClosed = 0;       /* QuitSteamClose ran */
+int g_quitSteamLinkClosed = 0;   /* ... and closed the world-server link over Steam: it is not pumped, re-dialled or closed again */
+static void QuitSteamClose(const char* where)
+{
+    if (g_quitSteamClosed != 0) return;
+    if (std::strcmp(where, "menu") != 0 && std::strcmp(where, "title") != 0 && std::strcmp(where, "close") != 0) return;
+    if (!OnMainThread() || QuitFlagSet() == 0) return;
+    g_quitSteamClosed = 1;
+    std::string linkWord = "not in use (no world-server link, or a direct one, which closes at exit)";
+    if (g_link != 0 && g_link->Backend() == net::BACKEND_STEAM)
+    {
+        net::RelayRouteNoteEnd(g_link);
+        const bool up = g_link->State() == net::LINK_UP;
+        if (up) g_link->Disconnect(); else g_link->Abort();
+        g_quitSteamLinkClosed = 1;
+        linkWord = up ? "closed (it was up; Steam still sends what it holds)" : "closed (it was not up)";
+    }
+    DebugLog("[EXIT] Steam closed at the quit (" + std::string(where) + " route), while Steam still runs - the game shuts Steam down before"
+             " the exit hook: world-server link over Steam " + linkWord + "; the host's Steam bridge for joiners closes now (its own line"
+             " follows when one was open)");
+    net::RelayBridgeShutdown();
+}
 // The latch, and the only place the outbox is flushed at quit. Called from the frame tick and from the sleep detour's
 // main-thread path - the second because F533 shows the faulting sleeps arrive during shutdown, when the frame pump may
 // already have stopped, and a latch that only the pump could set would then never be set at all.
@@ -2970,7 +3188,7 @@ int VerifyQuitSite(uintptr_t addr, const unsigned char* sig, unsigned int sigLen
 // exactly nothing and would otherwise be indistinguishable from the first.
 int NoteQuitting(const char* where)
 {
-    if (g_quitting != 0) return 0;
+    if (g_quitting != 0) { QuitSteamClose(where); return 0; }   /* a deliberate site after a fallback latched: Steam still closes now */
     if (QuitFlagSet() == 0) return 0;
     ::InterlockedExchange(&g_quitting, 1);
     if (OnMainThread()) coop::net::SessionSendClosing("exit");   /* mmo5: a HOST's deliberate exit tells the joiner before the process takes the link away (a no-op on a joiner or with the link down) */
@@ -3020,6 +3238,7 @@ int NoteQuitting(const char* where)
               (g_closeHookOn ? 1 : 0), (g_menuHookOn ? 1 : 0), (g_titleHookOn ? 1 : 0));
     qv[511] = 0;
     DebugLog(std::string(qv) + (took > 0 ? (" flushed=" + N(took)) : std::string()));
+    QuitSteamClose(where);   /* after the drain and the flush above, so what they put on a Steam link goes before its close */
     return 1;
 }
 // E30-2: THE DEFERRED HALF. Called from every main-thread entry that still runs during a shutdown - the frame tick,
@@ -3350,16 +3569,6 @@ void WorldGenNoteGen(unsigned int g) { if (g > g_wgHighGen) g_wgHighGen = g; }
    row and its WORLD_SAVED answers, never by this game's own saves or adoptions, and reset when the profile changes. */
 unsigned int g_wgAckedGen = 0; std::string g_wgAckedProfile, g_wgScannedProfile;
 long long g_wgScanAdopted = 0;
-/* restore1c (design s4): THE REPAIR ON THIS GAME. g_repairRows = every repair this game knows (the WELCOME's rows and REPAIR
-   broadcasts), in epoch order. g_repairApplyPending = this game's own records wait for the repair apply (OwnRestore1bTick, writer idle;
-   the load gate applies too). */
-std::vector<restoreguard::RepairRow> g_repairRows;
-int g_repairApplyPending = 0, g_rpBaselineSet = 0;
-long long g_rpSeen = 0, g_rpWelcomes = 0, g_rpOwnRecycled = 0, g_rpFromCheckpoint = 0, g_rpDropped = 0, g_rpApplied = 0, g_rpApplyFailed = 0;
-long long g_rpNotebookRecycled = 0, g_rpPurged = 0, g_rpMalformed = 0, g_rpGateRefused = 0, g_rpRefusedUndone = 0, g_rpQueueDropped = 0, g_rpLedgerCut = 0;
-/* the TEST verb's state (RepairWorldCommand) */
-std::string g_rwName; int g_rwPhase = 0, g_rwResult = -1; DWORD g_rwAt = 0; unsigned int g_rwGen = 0, g_rwEpoch = 0; unsigned long long g_rwSeq = 0ULL;
-long long g_rwWelcomesAt = 0, g_rwDone = 0;
 /* restore1b1 (design s2 Q1, s4 first bullet): THIS GAME'S RECORDS HIGH-WATER AND ITS CHECKPOINT QUEUE. PumpLink's drain only
    writes these tables; OwnRestore1bTick (OwnTick, main thread) judges, sends and copies. g_ohNotebook = the notebook's number per
    records store for this profile (cleared at each WELCOME). g_ohStore mirrors the chosen store (OwnSaveCommand). g_ohBlocked = an
@@ -3443,6 +3652,11 @@ void StoreApplyRecordSeq(const std::vector<char>& payload)
         return;
     }
     {
+        unsigned int slo = 0, shi = 0;
+        const int hasStamp = (GetU32S(payload, at + 8, &slo) && GetU32S(payload, at + 12, &shi)) ? 1 : 0;
+        coop::KeptAreaEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* KEPT: the world server holds this game's write of that record with this stamp - a lay written into it may settle */
+    }
+    {
         std::map<std::string, Record>::iterator it = g_records.find(worldId);
         WorldGenNoteSeq(((unsigned long long)hi << 32) | lo);   /* restore1a: the notebook's number, whatever key it names */
         if (coopqueue::QueueSeqEchoDecide((it != g_records.end()) ? 1 : 0) == coopqueue::kSeqEchoUnknownKey)
@@ -3475,7 +3689,7 @@ void StoreNoteRecordSeq(const std::string& worldId, unsigned long long seq)
     if (it == g_records.end()) { ++g_queueSeqNoRecord; return; }
     /* T-313 review M1: a feed page waits in the arrival queue while the RECORD_SEQ echo of this game's own later write is applied
        at once in PumpLink - the page's drain must not wind the number back. It only rises within one notebook link; a lower one
-       is taken only across links (a REPAIR drops the link). */
+       is taken only across links. */
     const long curLink = coop::StoreNotebookLinkGen();
     if (coopfeed::FeedSeqNoteDecide(it->second.seq, it->second.seqLinkGen, seq, curLink) == 0) { ++g_queueSeqKeptNewer; return; }
     it->second.seq = seq; it->second.seqLinkGen = curLink; ZoneSwapPublish(worldId);   /* Z1-b: the table carries seq too */
@@ -3533,6 +3747,7 @@ int QueueSendEntry(const coopqueue::QueueEntry& e)
        not go out left this game's mirror holding bytes the index entry beside it - still the previous record, possibly
        another writer's - did not describe, and the readFile swap serves that path under that record. */
     if (!SendRecordAny(e.key, "", "", 0.0f, 0.0f, 0.0f, r.writtenAt, r.owner, e.payload)) return 0;
+    coop::KeptAreaStampSent(e.key, r.writtenAt);   /* KEPT: this re-sent write's stamp - a lay's later write must be newer than it before an echo settles the lay */
     /* Z1-c (recheck-z1b item 2): the write, the record, the republish, the restamp and the line are ZoneMirrorCommit's now;
        while a worker's load of this mirror path is in flight the write waits (parked, retried every StoreTick) and all of
        them happen when it does. The send above went out either way, so the entry leaves the journal (answer 1). */
@@ -3655,6 +3870,7 @@ void StoreRepushUpTick()
         if (!SendRecordAny(it->second.worldId, it->second.squadSid, it->second.factionName,
                            it->second.x, it->second.y, it->second.z, it->second.writtenAt, it->second.owner, b)) continue;
         ++n; bytes += (long long)b.size();
+        if (IsZoneId(it->first)) coop::KeptAreaStampSent(it->first, it->second.writtenAt);   /* KEPT: the re-pushed write's stamp, so its echo is never taken for a later lay's write */
     }
     g_welcomeRepushed += n; g_welcomeRepushSkippedZoneOff += skipped; g_welcomeRepushBytes += bytes;
     DebugLog("[STORE] record feed: the notebook's snapshot is applied - " + N(g_welcomePushDownReceived)
@@ -4335,6 +4551,36 @@ void WakeWaitTick()
         g_wakeWait.erase(it++);
     }
 }
+/* A PLAYER SQUAD'S PLATOON: its faction (+0x10) is player-like (Faction +0x250 set, the IsPlayerPod test). 1 = yes, 0 = no or
+   unreadable. No string here (C2712). */
+static int PlayerPlatoonPod(void* platoon)
+{
+    __try { const char* f = *(const char* const*)((const char*)platoon + 0x10); return (f != 0 && *(void* const*)(f + 0x250) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* THE PLAYER SQUADS READ IN SINCE THE IMPORT (worldreset::SquadReadSet): the load hook notes a platoon when the engine's load of a
+   player squad's character container (an ActivePlatoon, its platoon at +0x78) returns success. The hook runs on the main thread and
+   also off it, so every touch of the list is under this spin lock. Emptied when the reset import is let through (the load gate) and
+   at every world load (StoreWorldLoadBegan); a freed platoon leaves it (ForgetPlatoon). The save after the import counts it
+   (PlayerSquadsReadNow). */
+worldreset::SquadReadSet g_sqRead; volatile LONG g_sqReadLock = 0;
+static void SqReadLock() { while (::InterlockedCompareExchange(&g_sqReadLock, 1, 0) != 0) ::Sleep(0); }
+static void SqReadUnlock() { ::InterlockedExchange(&g_sqReadLock, 0); }
+/* the platoon of a player squad's character container about to be loaded, 0 = not one */
+static void* SquadReadCandidate(void* container)
+{
+    LoadCtx lp; lp.platoon = 0; lp.isActivePlatoon = 0; lp.alreadyLoaded = 0; lp.noTarget = 0;
+    if (!ReadLoadPod(container, &lp) || !lp.isActivePlatoon || !Plaus(lp.platoon)) return 0;
+    return PlayerPlatoonPod(lp.platoon) == 1 ? lp.platoon : 0;
+}
+static void SquadReadNoteLoad(void* platoon, unsigned char r)
+{
+    if (platoon == 0 || r == 0) return;
+    SqReadLock(); worldreset::SquadReadNote(&g_sqRead, platoon); SqReadUnlock();
+}
+static void SquadReadClearAll() { SqReadLock(); worldreset::SquadReadClear(&g_sqRead); SqReadUnlock(); }
+static void SquadReadForgetOne(void* platoon) { SqReadLock(); worldreset::SquadReadForget(&g_sqRead, platoon); SqReadUnlock(); }
+static bool SquadReadHasNow(void* platoon) { SqReadLock(); const bool h = worldreset::SquadReadHas(&g_sqRead, platoon); SqReadUnlock(); return h; }
 unsigned char detour_loadFromDisk(void* container, unsigned char force, void* moreData)
 {
     ++g_loadSeen; g_tearingDown = false;   // the next world is loading: destroys are the engine's own again
@@ -4367,7 +4613,9 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
     if (!OnMainThread())
     {
         ++g_offThreadDetours; ++g_loadOverrideOffThread;
+        void* const sqRead0 = SquadReadCandidate(container);   /* a player squad's character container: noted read in when the load succeeds */
         const unsigned char r0 = orig_loadFromDisk(container, force, moreData);
+        SquadReadNoteLoad(sqRead0, r0);
         OwnOverlayDone(ownSlot, ownName, ownWas, r0);   /* mmo2: no-op for slot -1 */
         return r0;
     }
@@ -4375,6 +4623,8 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
     // review-store S7: the swap is only for THIS load - the name is put back afterwards (the engine's own save would otherwise write the
     // platoon into the store's file), and the record counts as applied only when the engine's load succeeded.
     std::string* name = 0; std::string was; long long applyStamp = 0; void* applyPlatoon = 0; std::string applyId;
+    unsigned char loHand[32]; int loHad = 0; std::string loKey;   /* the squad's own home-building hand before a swap, and the home key known for its world id [t755-lohome-key] */
+    std::memset(loHand, 0, sizeof loHand);
     /* E38 (e) / read-e38 Q3 - A LONE GAME LOADS ITS OWN CONTAINERS. This swap was gated on g_on and g_dirReady
        and on NO link of any kind, so a single-player launch with leftover files in coop-store swapped the
        engine's squad container for a store record: a save silently loading somebody else's people. `RoleIsSingle`
@@ -4410,6 +4660,8 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
                 was = *name;
                 *name = it->second.file;
                 applyStamp = it->second.writtenAt; applyPlatoon = lp.platoon; applyId = worldId;
+                loKey = RecordHomeOf(worldId); if (loKey.empty()) loKey = it->second.home;   /* the last key known here (the merge keeps it), else the record's own [t755-lohome-keyread] */
+                loHad = (PlatoonHomeHandPod(lp.platoon, loHand) == 1) ? 1 : 0;   /* the save's own home, read before the engine reads the record's file [t755-lohome-before] */
                 { PendingPlace pp; pp.x = it->second.x; pp.y = it->second.y; pp.z = it->second.z; pp.ticks = 0; g_pendingPlace[lp.platoon] = pp; }   // measure, never place (F463)
                 DebugLog("[STORE] LOAD-OVERRIDE worldId=" + worldId + " squad='" + it->second.squadSid + "' file '" + was + "' -> '" + it->second.file + "' (record writtenAt=" + N(it->second.writtenAt) + ")");
             }
@@ -4433,7 +4685,9 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
             }
         }
     }
+    void* const sqRead = SquadReadCandidate(container);   /* a player squad's character container: noted read in when the load succeeds */
     const unsigned char r = orig_loadFromDisk(container, force, moreData);
+    SquadReadNoteLoad(sqRead, r);
     OwnOverlayDone(ownSlot, ownName, ownWas, r);   /* mmo2: the container's own name again, and the result noted */
     if (name != 0)
     {
@@ -4442,6 +4696,37 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
         if (r != 0)
         {
             g_localWrittenAt[applyPlatoon] = applyStamp; ++g_loadOverrides;
+            {   /* A SQUAD THE SWAPPED-IN RECORD LEFT WITHOUT A HOME BUILDING, judged after the engine's read by the squad's own home: one it
+                   has is left as it is; with none, the save's own home read before the read is given back, else the home key known for its
+                   world id puts it on the owed-home list and CopyHomeOwedTick gives that building once it is loaded here - so a world saved
+                   homeless gets its homes back when a home key survived in its records. With no key anywhere it stays without a home and the
+                   line says so. A keeper with no home restocks only as a travelling trader. [t755-lohome-judge] */
+                unsigned char loAfter[32];
+                const int loHas = (PlatoonHomeHandPod(applyPlatoon, loAfter) == 1) ? 1 : 0;
+                const int lod = coopstore::LoadOverrideHomeDecide(loHas, loHad, loKey.empty() ? 0 : 1);
+                std::string loWhat;
+                if (lod == coopstore::kLoHomeKept) ++g_loHomeKept;
+                else if (lod == coopstore::kLoHomeRestore)
+                {
+                    const int took = (PlatoonSetHomeHandPod(applyPlatoon, loHand) == 1 && PlatoonHomeHandPod(applyPlatoon, loAfter) == 1) ? 1 : 0;   /* read back: given back only when the home is set */
+                    std::string bt; { char hk[128]; if (took != 0 && TownGenPlatoonHomeKey(applyPlatoon, hk, 128) == 1) bt = hk; else { const unsigned int* w = (const unsigned int*)loHand; bt = "handle " + N((long long)w[5]) + ":" + N((long long)w[6]) + ", not loaded here"; } }
+                    if (took != 0) { ++g_loHomeRestored; loWhat = "the squad has no home after the engine's read - the save's own home " + bt + " is given back"; }
+                    else
+                    {   /* owed instead: by its key when one is known, else by the save's own handle */
+                        ++g_loHomeRestoreFailed; CopyHomeOweAdd(applyPlatoon, applyId, loHand, loKey);
+                        loWhat = "the squad has no home after the engine's read - giving back the save's own home " + bt + " did not take; owed by " + (loKey.empty() ? std::string("that handle") : "the home key " + loKey) + ", given when that building is loaded here";
+                    }
+                }
+                else if (lod == coopstore::kLoHomeOweByKey)
+                {
+                    ++g_loHomeOwedByKey; CopyHomeOweAdd(applyPlatoon, applyId, 0, loKey);
+                    loWhat = "the squad has no home after the engine's read and the save's own had none - owed by the home key " + loKey + ", given when that building is loaded here";
+                }
+                else { ++g_loHomeNoneAnywhere; loWhat = "the squad has no home after the engine's read, the save's own had none and no home key is known for it - no home known for this squad anywhere"; }
+                if (!loWhat.empty() && g_loHomeSeen.insert(applyId).second)
+                    DebugLog("[STORE] LOAD-OVERRIDE " + applyId + ": " + loWhat + " (loadOverrideHome kept=" + N(g_loHomeKept) + " restored=" + N(g_loHomeRestored) + " restoreFailed=" + N(g_loHomeRestoreFailed)
+                             + " owedByKey=" + N(g_loHomeOwedByKey) + " noneAnywhere=" + N(g_loHomeNoneAnywhere) + ")");
+            }
             std::map<void*, WakeWait>::iterator ww = g_wakeWait.find(applyPlatoon);
             if (ww != g_wakeWait.end() && ww->second.road == coopsquad::kWakeRoadSwap && ww->second.taken == 0)
             {   /* the record left to the engine's read at this squad's wake went in: applied now (WakeWaitTick logs the count once the people are built) */
@@ -4457,6 +4742,7 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
            wake reloads the record. */
         ++g_loadOverrideFailed; g_pendingPlace.erase(applyPlatoon);
         const unsigned char r2 = orig_loadFromDisk(container, force, moreData);
+        SquadReadNoteLoad(sqRead, r2);
         ++g_loadOverrideRetried; if (r2 == 0) ++g_loadOverrideRetryFailed;
         {
             std::map<void*, WakeWait>::iterator ww = g_wakeWait.find(applyPlatoon);
@@ -4481,7 +4767,9 @@ void ForgetPlatoon(void* platoon)
     g_localWrittenAt.erase(platoon); g_pendingPlace.erase(platoon); g_npcStampErased.erase(platoon); g_npcPurged.erase(platoon); WakeWaitForget(platoon);
     g_bindGenOf.erase(platoon);   /* E23: the stamp is part of the binding - it goes when the binding goes, or the map grows by one entry per platoon the engine ever frees */
     HbForget(platoon);   /* E47-S2 exit edge: destroyed / retired */
+    SquadReadForgetOne(platoon);   /* the read-in mark goes with the platoon (the address can be reused) */
     if (g_stCreated.erase(platoon) != 0) ++g_stForgotten;   /* T-296 fix 2: the origin mark goes with the platoon (the address can be reused) */
+    if (g_copyHomeOwedMap.erase(platoon) != 0) ++g_copyHomeGone;   /* a copy freed before its building loaded here: its owed home goes with it [t755-copyhome-forget] */
 }
 // E18.1 (review-p5l CRASH-1): THE MAIN THREAD'S HALF OF AN OFF-THREAD DESTROY. Everything the hook below would have done is
 // done here instead, one tick later at the latest, on the thread that owns these containers. The only case that matters is
@@ -5972,6 +6260,7 @@ int ZoneMirrorCommit(int kind, const Record& r, const std::vector<char>& bytes, 
     ++g_zoneWritten;   /* E22c: the line reports the outcome, not the intent */
     if (g_postTeardownFlush) ++g_zoneWriteAfterTeardownFlush;   /* P6c (p5z MEDIUM-5): the one number that says E33's re-ordering did what it was for */
     const bool sent = SendRecordAny(r.worldId, "", "", 0.0f, 0.0f, 0.0f, r.writtenAt, r.owner, bytes);
+    coop::KeptAreaSent(r.worldId, sent ? 1 : 0, r.writtenAt);   /* KEPT: the write's stamp - the echo that answers it carries the same stamp */
     DebugLog("[ZONE] WROTE " + r.worldId + " bytes=" + N((long long)bytes.size()) + " from '" + src + "' -> " + r.file + (sent ? " (sent)" : " (not sent - no link)") + (deferred ? " - after waiting for a load of that path" : ""));
     }
     else if (kind == kZoneWriteReplay)
@@ -6109,7 +6398,7 @@ void ZoneSaveApply(const std::string& path)
     /* Z1-c (recheck-z1b item 2): the write, the record, the mark, the send and the WROTE line are ZoneMirrorCommit's now;
        while a worker's load of this mirror path is in flight the write waits (parked, retried every StoreTick) and they
        happen when it does - this save's line then says written=0 and its exit is counted when the retry settles it. */
-    if (ZoneMirrorWriteOrPark(kZoneWriteSave, r, bytes, path) == 1) zline.written = 1;   /* E22c: the line reports the outcome, not the intent */
+    if (ZoneMirrorWriteOrPark(kZoneWriteSave, r, bytes, path) == 1) { zline.written = 1; coop::KeptAreaWritten(zoneId); }   /* E22c: the line reports the outcome, not the intent; KEPT: a lay in this area may now be in its record */
 }
 /* loot2c part A (docs/design-loot2.md section 2 step 4; .modding/investigations/loot2c-touch-take.md S1): THE TAKE-OUT
    BEFORE ANYTHING IS SERIALISED. saveGame 0x375220 serialises every active zone's boxes (saveActiveZoneStates ->
@@ -8155,7 +8444,7 @@ void TeardownBroadcast(const char* why)
     coop::TeamForget("the world was torn down - leaving to the title, or another load", false);   /* T-546: asked again once a world is loaded */
     g_ctxSleptMine.clear(); g_ctxDrops.clear();   /* the context wake rule's platoons belong to the freed world */
     coop::BuildForgetWorld();   /* build1-c (review-build1b M2): the other game's pending PLACEs / STATEs and copy rows die with the world */
-    g_homeOf.clear(); g_homeOwed.clear(); g_homeOwedNow = 0; g_homeKeyless.clear();   /* the groups' home building keys and the homes owed are world state */
+    g_homeOf.clear(); g_homeOwed.clear(); g_homeOwedNow = 0; g_homeKeyless.clear(); g_copyHomeOwedMap.clear(); g_loHomeSeen.clear(); /* [t755-copyhome-clear] */   /* the groups' home building keys and the homes owed are world state */
     g_pendingTown.clear(); g_goneTownLaunch.clear(); g_testPendNotes.clear(); g_noteEngineHas.clear(); g_noteUnplaceLogged.clear(); g_notePlaceFailed.clear(); g_noteRaiseDone = false; g_sleepPosStaleIds.clear(); g_sleepPosUnusableIds.clear(); PublishPendingTowns();   /* decision 34 */
     /* review-p5d CRASH-2: THE TEARDOWN MUST NOT CLEAR g_relayLinkedCached HERE, and P5d's clear is deleted.
        The flag decides which branch OtherHasSector (zones.cpp) takes: with it SET the answer comes from the LOCKED
@@ -8455,12 +8744,48 @@ const char kWorldKeyTag2[]     = "kcworld2";
 std::vector<char> g_profHelloBase;          /* the link-up HELLO without its trailing profile number: PICK sends it again with one */
 unsigned int g_profPickedNum = 0;          /* this run's profile number, 0 = none picked yet */
 std::string g_profPickedId, g_profPickedName, g_profPickedFaction;
+/* The player id the world server knows this player by, from the WELCOME (store protocol 91), when it is not this install's own id
+   (the world's aliases.txt). MyPersonId returns it. Cleared back at the title screen; a link drop keeps it, so writes queued in an
+   outage keep their key. MAIN THREAD. */
+std::string g_worldPersonId;
+long long g_welcomePersonAdopted = 0, g_welcomePersonHeld = 0, g_welcomePersonBad = 0;   /* WELCOMEs whose player id was adopted / kept back while a world was in play / not a player id */
+std::set<std::string> g_personOwnFilesSaid;   /* per-player world files under this install's own key, each said once */
+/* The id the last WELCOME of a world named ("" when it named this install's own), with that world's id: kept past the title screen so a
+   profile deleted in that world's lobby, before its next WELCOME, recycles the save folder of the id the world knows. MAIN THREAD. */
+std::string g_personWorldId, g_personForWorld;
 int g_profPickedNeverPlayed = 0;   /* T-201 PP6' (owner 175): the picked row is not marked played (no finished save of it reached the world) - AutoLoadDecide */
 int g_profSavedOwed = 0;           /* T-220: this pick's own save finished and the world's list does not show it played yet (ProfileSavedTell) */
 long g_profSavedSentGen = -1;      /* T-220: the g_linkGen SAVED was last queued on - told once per link while owed */
 long long g_profSavedSends = 0;    /* T-220: SAVED queued, all picks */
 bool ProfileFolderSaved();         /* defined below, beside the load gate */
 int g_profSaveFolderFound = 0;     /* T-201 PP6': the decided save folder was FOUND by its key file (0 = the name rule's new name) */
+/* T-36 S2: THIS PICK IS CARRIED INTO THE RESET WORLD (ResetCarryAtWelcome): the save folder of the world as it was that Kenshi's IMPORT
+   GAME runs from and the earlier id it carries, with the pick and the new save folder they were decided for ("" = no carry). MAIN THREAD. */
+std::string g_resetCarryFolder, g_resetCarryOldId, g_resetCarryForFolder;
+unsigned int g_resetCarryForPick = 0;
+long long g_resetCarryDecided = 0, g_resetCarryPosted = 0, g_resetCarryPostFailed = 0, g_resetCarryRekeyed = 0;
+std::string g_resetCarryKey, g_resetCarryNewId;   /* the world key and the reset world's id the records store is copied for */
+std::string g_resetCarryOldKey;                   /* the world name the carried save folder's key file holds: the old store's name (ResetCarryRekey) */
+std::vector<std::string> g_resetCarryOldNames;    /* every world name a save folder of the carried earlier id holds: the old store's lookup by id */
+int g_resetCarryRekeyOwed = 0;                    /* the records store's copy is still to do for this carry (ResetCarryRekey) */
+int g_resetCarryArmOwed = 0;                      /* the import the load gate let through is owed the save right after it (OwnCreatedSaveTick) */
+long g_resetCarryArmWorld = 0;                    /* the world load count when the import was posted: the import's own load moves it */
+long long g_resetCarryGatePassed = 0, g_resetCarryArmed = 0;
+long long g_resetCarryArmWaits = 0; int g_resetCarryArmWaitLogged = 0;   /* ticks the save after the import has waited for the player's squads to be read in; its first wait said */
+bool ResetCarryLive();                            /* defined below, beside ResetCarryAtWelcome */
+std::vector<coopstore::StoreWelcomeReset> g_resetHistory;   /* T-36: the world's earlier ids with each reset's keep choice, from the WELCOME that admitted this pick */
+std::string g_resetHistoryWorld;                  /* the world id that history is for */
+std::string g_resetCarryOldStore;                 /* the records store of the world as it was that the carry copies from (ResetCarryRekey) */
+int g_resetImportHoldSaid = 0;                    /* the import's wait for the world server's current records is said once per post */
+int g_resetBoxOwed = 0, g_resetBoxUp = 0;          /* the reset box: wanted on screen / on screen now (ResetBoxTick) */
+long g_resetBoxDecidedFor = -1;                   /* the import (its world load count at the post) the box was decided for */
+std::string g_resetBoxText, g_resetBoxWorld;      /* its words and the reset world id it is for */
+DWORD g_resetBoxFirstTry = 0;
+long long g_resetBoxShown = 0, g_resetBoxAlready = 0, g_resetBoxFailed = 0, g_resetRestoreArmed = 0;
+void ResetCarryEndIfSaved(const char* why);       /* T-36: defined below, beside ResetCarryLive */
+/* T-36: every world name a save folder of this world's id carries in its key file, read when the pick's folder is decided - before this
+   game's key write gives the folder the world's current name - for the records store's lookup (OwnStoreByIdElsewhere). MAIN THREAD. */
+std::vector<std::string> g_profIdWorldNames;
 int g_profLobby = 0, g_profAutoSteps = 0, g_profLastVerdict = -1;
 std::vector<coopprof::Row> g_profRows; unsigned int g_profCap = 0;
 /* prof3: the Your profiles screen (ProfileByPanel / ProfilePanelHand / StoreProfilesPanel). */
@@ -8476,12 +8801,12 @@ long long g_profAnswers = 0, g_profMalformed = 0, g_profRefused = 0, g_profNewSe
 std::vector<std::string> g_takenFactions;
 long long g_takenAnswers = 0, g_takenMalformed = 0, g_facAnswers = 0, g_facAnswerMalformed = 0, g_facAnswerOtherPick = 0;
 std::string g_profAutoNewName;   /* T-368: the name this game's own automatic NEW asked for ("" = none outstanding) - a refusal names it */
-long long g_profRecycled = 0, g_profRecycleSkipped = 0, g_profRecycleFailed = 0;
-/* prof1 fold (review-prof1). kept = a deleted profile's folder left in place because Windows could not recycle it; deadEnds =
+long long g_profDeleted = 0, g_profDeleteFailed = 0;   /* profile deletes whose saves and records stores went for good / that stopped part-way */
+/* prof1 fold (review-prof1). deadEnds =
    lobbies that ended with no profile (said on the title screen); fallbacks = refused picks answered with the automatic rule;
    loadRefusedOtherProfile = saves of another profile refused at load; samePerson = REFUSE reason 6; keyUpgraded = kcworld1 files
    rewritten as kcworld2. g_profNotice is the title screen's sentence (ui.cpp reads it through StoreModsRefusal). */
-long long g_profRecycleKept = 0, g_profDeadEnds = 0, g_profFallbacks = 0, g_loadRefusedOtherProfile = 0, g_storeRefusedSamePerson = 0, g_worldKeyUpgraded = 0;
+long long g_profDeadEnds = 0, g_profFallbacks = 0, g_loadRefusedOtherProfile = 0, g_storeRefusedSamePerson = 0, g_worldKeyUpgraded = 0;
 std::string g_profNotice; long long g_profNoticeSeq = 0;
 /* T-201 PP5 (owner 167/168/17): THE PICKED PROFILE'S ONE SAVE FOLDER - decided when that pick is admitted (its WELCOME,
    ProfileSaveFolderAtWelcome), cleared at every new pick and when the game leaves (StoreLeftAtTitle), so a folder from an earlier
@@ -8890,7 +9215,7 @@ bool WorldGenStampWanted()
 bool WorldSavedSend(unsigned int gen, unsigned long long seq)
 {
     if (g_link == 0 || !LinkUp()) return false;
-    restoreguard::WorldMsg m; m.gen = gen; m.seq = seq; m.epoch = g_wgNotebook.epoch; m.profile = ProfileForKey();   /* restore1c: the epoch this game knows */
+    restoreguard::WorldMsg m; m.gen = gen; m.seq = seq; m.epoch = g_wgNotebook.epoch; m.profile = ProfileForKey();   /* the notebook's epoch as this game last heard it */
     std::vector<char> b; restoreguard::EncodeWorldMsg(&b, m);
     return g_link->Send(0, (net::MsgType)kStoreMsgWorldSaved, &b[0], b.size(), net::CH_RELIABLE) ? true : false;
 }
@@ -8916,10 +9241,11 @@ void WorldGenScanKeys()
     for (size_t i = 0; i < es.size(); ++i)
     {
         if (!es[i].isDir) continue;
-        std::string k, prof; restoreguard::SaveStamp st;
-        if (!ReadWorldKeyFile(JoinPathA(root, es[i].name), &k, &prof, &st)) continue;
+        std::string k, prof, kid; restoreguard::SaveStamp st;
+        if (!ReadWorldKeyFile(JoinPathA(root, es[i].name), &k, &prof, &st, &kid)) continue;
         ++read;
-        if (st.hasGen && prof == g_wgScannedProfile && coopworld::WorldFolderName(k) == world && !restoreguard::UndoneBy(g_repairRows, st.epoch, st.seq)) found.push_back(st);   /* restore1c: never a save a repair undid */
+        /* T-36: this world's save by its name, or by its id under an earlier name of the world */
+        if (st.hasGen && prof == g_wgScannedProfile && (coopworld::WorldFolderName(k) == world || coopworld::SaveIdSameWorld(kid, HeldWorldId()))) found.push_back(st);
     }
     const unsigned int before = g_wgPendGen;
     const unsigned int top = restoreguard::ScanAdopt(found, &g_wgPendGen, &g_wgPendSeq);
@@ -9028,6 +9354,7 @@ static void OwedSettleOnSave(const std::string& saveName, const std::string& sav
         return;
     }
     coop::TownGenOwedSaveFinished(saveName, reqSeq);
+    coop::KeptSaveFinished(reqSeq);   /* KEPT: this game's lays waiting for a save of its own */
 }
 void ProfileSavedTell(const std::string& saveName, const std::string& saveDir, long reqSeq, unsigned long long reqFt)
 {
@@ -9042,6 +9369,7 @@ void ProfileSavedTell(const std::string& saveName, const std::string& saveDir, l
     }
     coop::ResurrectSaveFinished(saveName);   /* T-556: the bring-backs made since the last save are in this one - final on the world server */
     OwedSettleOnSave(saveName, saveDir, reqSeq, reqFt);   /* the town populations made before this save was asked for are in it - their owed rows are settled */
+    ResetCarryEndIfSaved("its own save finished");       /* T-36: the reset world's folder is saved - the import is done for this pick */
     if (g_profSavedOwed == 0 && g_profPickedNeverPlayed == 0) return;   /* the world's list already showed it played at the pick */
     g_profSavedOwed = 1;
     ProfileSavedSend("its own save finished");
@@ -9093,7 +9421,7 @@ void ProfilePick(unsigned num)
     const coopprof::Row* row = 0;
     for (size_t i = 0; i < g_profRows.size(); ++i) if (g_profRows[i].num == num) row = &g_profRows[i];
     g_profPickedNum = num;
-    g_profPickedId = coopprof::ProfileId(ConfigPlayerId(), num); g_profLastPickedId = g_profPickedId;   /* restore1a fold */
+    g_profPickedId = coopprof::ProfileId(MyPersonId(), num); g_profLastPickedId = g_profPickedId;   /* restore1a fold */
     g_profPickedName = row ? row->name : std::string("?");
     g_profPickedFaction = row ? row->faction : std::string("?");
     g_profPickedNeverPlayed = (row != 0 && row->played == 0) ? 1 : 0;   /* T-201 PP6' (owner 175): no FINISHED save of it reached the world - being admitted is not playing */
@@ -9112,129 +9440,16 @@ void ProfilePick(unsigned num)
     DebugLog("[PROF] picked profile " + g_profPickedId + " '" + g_profPickedName + "' (faction '" + g_profPickedFaction + "') - its save folder is"
              " decided when the WELCOME admits it; HELLO " + std::string(sent ? "sent" : "NOT SENT - the notebook link is down") + " with it");
 }
-/* prof1 fold (review-prof1 1): the bytes under a folder, to judge whether the Recycle Bin can take it. */
-unsigned long long FolderBytes(const std::string& dir, int depth)
+/* A DELETED PROFILE'S SAVE, for this game's own world (the DELETE answer): StoreProfileDeleteSave with the id this world
+   knows the player by - in the lobby no WELCOME has named it yet: the id this world's last WELCOME named, while this game still
+   holds that world. false = the delete stopped (said in the log); the caller says the failure line. */
+static bool ProfileDeleteSave(unsigned num)
 {
-    unsigned long long total = 0;
-    if (depth > 8) return total;
-    U8FindData fd;
-    HANDLE h = U8FindFirstFile(JoinPathA(dir, "*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return total;
-    do
-    {
-        if (std::strcmp(fd.cFileName, ".") == 0 || std::strcmp(fd.cFileName, "..") == 0) continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;   /* recheck-prof1: never follow a junction/link out of the save */
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) total += FolderBytes(JoinPathA(dir, fd.cFileName), depth + 1);
-        else total += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-    } while (U8FindNextFile(h, &fd));
-    ::FindClose(h);
-    return total;
+    const std::string held = HeldWorldId();
+    const std::string person = !g_worldPersonId.empty() ? g_worldPersonId
+                             : (!g_personForWorld.empty() && !held.empty() && held == g_personWorldId ? g_personForWorld : MyPersonId());
+    return StoreProfileDeleteSave(ConfigWorldKey(), held, person, num);
 }
-/* A deleted profile's save goes to the Recycle Bin (D7), never erased - and only a folder that is plainly that profile's, on a
-   drive where Windows really recycles (review-prof1 1). Where it cannot, Windows would delete for good, so the folder is KEPT and
-   the player is told where it is. Runs once per DELETE answer on the main thread: a recycle on the same drive is a move and the
-   size check is one folder listing, so the pause is a one-off and short (accepted, not moved off the frame). */
-/* words1b: the sentence for a save folder left where it is - the title-screen notice and the PROFILES screen's line share it. */
-static std::string g_profRecycleTail;   /* set by the last ProfileRecycleSave only when its folder was left where it is */
-static std::string ProfileKeptTail(const std::string& dir) { return "Its save couldn't be moved to the Recycle Bin and is still at " + dir + "."; }
-/* CAN WINDOWS RECYCLE THIS FOLDER? A local fixed drive with a Recycle Bin (binOk), and a folder well inside the smallest bin Windows
-   would give it (sizeOk; bytes = its size, limit = 1% of the drive, never above 1 GiB). Anything else Windows would delete for good,
-   so the callers keep the folder. Shared by a deleted profile's save and a deleted world's leftovers. */
-static void RecycleBinFits(const std::string& dir, bool* binOk, bool* sizeOk, unsigned long long* bytes, unsigned long long* limit)
-{
-    *binOk = false; *sizeOk = false; *bytes = 0; *limit = 0;
-    if (dir.size() >= 3 && dir[1] == ':' && (dir[2] == '\\' || dir[2] == '/'))
-    {
-        const std::string root = dir.substr(0, 2) + "\\";
-        SHQUERYRBINFO qi; std::memset(&qi, 0, sizeof(qi)); qi.cbSize = sizeof(qi);
-        *binOk = ::GetDriveTypeA(root.c_str()) == DRIVE_FIXED && SUCCEEDED(::SHQueryRecycleBinA(root.c_str(), &qi));
-        ULARGE_INTEGER freeB, totalB, freeAll; freeB.QuadPart = totalB.QuadPart = freeAll.QuadPart = 0;
-        if (*binOk && ::GetDiskFreeSpaceExA(root.c_str(), &freeB, &totalB, &freeAll))
-        {
-            *limit = totalB.QuadPart / 100;   /* 1% of the drive, and never above 1 GiB: under the smallest bin Windows sets up by itself */
-            if (*limit > (1ull << 30)) *limit = 1ull << 30;
-            *bytes = FolderBytes(dir, 0);
-            *sizeOk = *bytes <= *limit;
-        }
-    }
-}
-/* THE MOVE: the folder to the Recycle Bin, never a delete. Returns SHFileOperation's code; *aborted = it stopped part-way. */
-static int RecycleMoveToBin(const std::string& dir, bool* aborted)
-{
-    std::vector<char> from(dir.begin(), dir.end()); from.push_back(0); from.push_back(0);   /* SHFileOperation wants a double-NUL list */
-    SHFILEOPSTRUCTA op; std::memset(&op, 0, sizeof(op));
-    op.wFunc = FO_DELETE; op.pFrom = &from[0];
-    /* ALLOWUNDO = the Recycle Bin; WANTNUKEWARNING = should Windows still decide it cannot recycle, it ASKS rather than deleting for good */
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI;
-    const int rc = U8SHFileOperation(&op);
-    *aborted = op.fAnyOperationsAborted != 0;
-    return rc;
-}
-/* T-201 PP6' (owner 178a): the world named by worldKey - this game's own (ProfileRecycleSave) or the one HOST GAME's CHANGE edits.
-   notice 0 (T-220, 6b): a folder left in place is said only by the caller's PROFILES line (g_profRecycleTail), not also on the title screen. */
-void ProfileRecycleSaveIn(const std::string& worldKey, const std::string& worldId, const std::string& person, unsigned num, int notice)
-{
-    g_profRecycleTail.clear();
-    /* T-201 PP5: the deleted profile's folder is FOUND by its key file (this world + that profile), whatever it is called. T-490: and by the
-       world's id (worldId) - another same-name world's folder is never taken; a folder with no id is kept, as DELETE WORLD keeps it. */
-    const std::string deletedId = coopprof::ProfileId(person, num);   /* person: the id the world knows this player by */
-    std::vector<size_t> keptNoId;
-    const std::vector<coopprof::SaveDirSeen> seen = coopprof::SaveDirsOfWorldId(SaveRootScan(SaveRootDefault()), worldKey, worldId, &keptNoId);
-    for (size_t i = 0; i < keptNoId.size(); ++i)
-        DebugLog("[PROF] deleted profile " + N((long long)num) + ": save folder '" + seen[keptNoId[i]].name + "' carries no world id - kept (another world of"
-                 " this name, or one from before ids)");
-    if (worldId.empty())
-        DebugLog("[PROF] deleted profile " + N((long long)num) + ": this world has no id, so its save folders cannot be told from another world's of that name - none is moved");
-    int owned = 0;
-    const int at = coopprof::SaveFolderScanChoose(seen, worldKey, deletedId, num, &owned);
-    const std::string folder = at >= 0 ? seen[(size_t)at].name : std::string();
-    const std::string dir = folder.empty() ? std::string() : JoinPathA(SaveRootDefault(), folder);
-    if (owned > 1)
-        DebugLog("[PROF] deleted profile " + N((long long)num) + ": " + N((long long)owned) + " save folders carry its key - only '" + folder
-                 + "' (the one it played) is handled; the others are left as they are");
-    std::string key, prof;
-    const bool exists = !folder.empty() && DirExistsA(dir);
-    const bool read = exists && ReadWorldKeyFile(dir, &key, &prof);
-    /* the drive: a local fixed drive with a Recycle Bin, and a folder well inside the smallest bin Windows would give it */
-    bool binOk = false, sizeOk = false; unsigned long long bytes = 0, limit = 0;
-    if (exists) RecycleBinFits(dir, &binOk, &sizeOk, &bytes, &limit);
-    const int v = coopprof::RecycleDecide(exists, read, key, worldKey, prof, deletedId, num, folder, ConfigSlot(), binOk, sizeOk);
-    if (v == coopprof::kRecycleNoBin || v == coopprof::kRecycleTooBig)
-    {
-        ++g_profRecycleKept;
-        ErrorLog("[PROF] deleted profile " + N((long long)num) + ": its save folder '" + dir + "' was KEPT - "
-                 + std::string(v == coopprof::kRecycleNoBin ? "that drive has no Recycle Bin (or is not a local fixed drive)" : "it is too big for the Recycle Bin (")
-                 + (v == coopprof::kRecycleTooBig ? N((long long)(bytes >> 20)) + " MB, limit " + N((long long)(limit >> 20)) + " MB)" : std::string())
-                 + ", and Windows would delete it for good there. Nothing was deleted.");
-        g_profRecycleTail = ProfileKeptTail(dir);
-        if (notice != 0) ProfileNotice("Profile deleted. " + g_profRecycleTail);
-        return;
-    }
-    if (v != coopprof::kRecycleOk)
-    {
-        static const char* const kWhy[] = { "", "there is no such folder on this computer", "it carries no world key", "its world key names another world",
-                                            "its key file names another profile", "it is the folder this game plays from", "", "" };
-        ++g_profRecycleSkipped;
-        DebugLog("[PROF] deleted profile " + N((long long)num) + ": its save folder '" + dir + "' was NOT moved - " + std::string(kWhy[v]));
-        return;
-    }
-    bool aborted = false;
-    const int rc = RecycleMoveToBin(dir, &aborted);
-    if (rc == 0 && !aborted)
-    {
-        ++g_profRecycled;
-        DebugLog("[PROF] deleted profile " + N((long long)num) + ": its save folder '" + dir + "' (" + N((long long)(bytes >> 20)) + " MB) was moved to the Recycle Bin");
-    }
-    else
-    {
-        ++g_profRecycleFailed;
-        ErrorLog("[PROF] deleted profile " + N((long long)num) + ": moving its save folder '" + dir + "' to the Recycle Bin FAILED (code "
-                 + N((long long)rc) + ") - the folder is left where it is");
-        g_profRecycleTail = ProfileKeptTail(dir);
-        if (notice != 0) ProfileNotice("Profile deleted. " + g_profRecycleTail);   /* words1 */
-    }
-}
-void ProfileRecycleSave(unsigned num) { ProfileRecycleSaveIn(ConfigWorldKey(), HeldWorldId(), ConfigPlayerId(), num, 1); }   /* T-490: the world whose index this game read */
 /* prof1 fold (review-prof1 5): A LOBBY NEVER STALLS. With no profile to play, the link is marked refused (nothing more is sent or
    read; a lobby connection holds no slot and is not counted against the world's limit), and the reason goes on the title screen. */
 void ProfileDeadEnd(const std::string& why)
@@ -9262,9 +9477,8 @@ void ProfilePanelHand(const coopprof::Answer& a, const std::vector<coopprof::Row
     {
         std::string name = "?";
         for (size_t i = 0; i < before.size(); ++i) if (before[i].num == a.subject) name = before[i].name;
-        ProfileRecycleSave(a.subject);
-        say = "Profile '" + name + "' deleted.";
-        if (!g_profRecycleTail.empty()) say += " " + g_profRecycleTail;   /* words1b: the tail only - the whole notice said "Profile deleted." twice */
+        const bool gone = ProfileDeleteSave(a.subject);
+        say = gone ? coopui::ProfileDeletedText(name) : coopui::ProfileDeleteFailText(name);
     }
     else if (a.answers == coopprof::kAnsNew)
     {
@@ -9347,7 +9561,7 @@ void StoreOnProfiles(const std::vector<char>& p)
                      " the player's records store stops and closes once its writes drain");
             g_profSaveFolder.clear();
         }
-        if (GameplayRunning()) { ProfileDeadEnd("the profile you were playing was deleted from this world. Restart Kenshi to choose another"); return; }
+        if (GameplayRunning()) { ProfileDeadEnd("the profile you were playing was deleted from this world"); return; }
         if (ProfileByPanel()) return;   /* prof3: no automatic fallback - the player picks again on the screen */
         /* the automatic rule over the list that came back: the profile played last, other than the one just refused */
         std::vector<coopprof::Row> others;
@@ -9370,14 +9584,19 @@ void StoreOnProfiles(const std::vector<char>& p)
             ProfileNotice(coopui::NameTakenText(taken));
             return;
         }
-        ProfileDeadEnd(a.verdict == coopprof::kRefusedNotReady ? std::string("still connecting. Restart Kenshi and try again")   /* words1b: a dead end - waiting won't help */
+        ProfileDeadEnd(a.verdict == coopprof::kRefusedNotReady ? std::string("still connecting")   /* a dead end: waiting won't help */
                                                               : coopprof::VerdictText(a.verdict, a.cap));
         return;
     }
     if (ProfileByPanel()) { ProfilePanelHand(a, before); return; }   /* prof3: list / new / delete go to the screen; the player's PLAY picks */
     if (a.answers == coopprof::kAnsDelete)
     {
-        ProfileRecycleSave(a.subject);
+        if (!ProfileDeleteSave(a.subject))   /* the failure line on the title screen, naming the profile */
+        {
+            std::string name = "?";
+            for (size_t i = 0; i < before.size(); ++i) if (before[i].num == a.subject) name = before[i].name;
+            ProfileNotice(coopui::ProfileDeleteFailText(name));
+        }
         if (g_profAutoOwed) { g_profAutoOwed = 0; ProfileAutoFrom(a.rows, "a delete from the screen was answered after the screen gave up the pick"); }   /* recheck-prof3 */
         return;
     }
@@ -9459,7 +9678,7 @@ int ShowGameMessagePod(const void* stdStr)
 void SayRefusedOnScreen()
 {
     if (g_loadRefuseQuiet != 0) { g_loadRefuseQuiet = 0; g_loadRefuseLine.clear(); return; }   /* a held load: background work shows the player nothing */
-    std::string line(g_loadRefuseLine.empty() ? std::string("This save belongs to a multiplayer world. Load it from MULTIPLAYER on the title screen.") : g_loadRefuseLine);   /* prof1 fold: a refusal with its own words */
+    std::string line(g_loadRefuseLine.empty() ? std::string("This save belongs to a multiplayer world.") : g_loadRefuseLine);   /* prof1 fold: a refusal with its own words */
     g_loadRefuseLine.clear();
     const int r = ShowGameMessagePod(&line);
     if (r == 1) ++g_loadMsgShown;
@@ -9515,6 +9734,61 @@ static bool StoreWelcomeFormatOk(const std::string& world, const std::string& wo
                  + swformat::FormatVerdictName(v) + "); this build writes " + N((long long)swformat::FolderFormatKnown(joined ? swformat::kKindJoined : swformat::kKindWorld))
                  + ". Nothing in that folder is read or written. formatRefused=" + N(g_formatRefused));
     return false;
+}
+/* THE ID THE WORLD KNOWS THIS PLAYER BY (store protocol 91). The world server resolves the HELLO's id through its aliases.txt and
+   names the result in the WELCOME. When it differs from this install's id, the profile id, the profile save folder, the records
+   store key and the per-player world files follow it from here on (MyPersonId); the HELLO keeps sending this install's own id and
+   the world server resolves it again each time. Run right after StoreWelcomeWorld and before the index, the tables, the repair
+   rows, the world numbers and the save folder are read for this WELCOME. MAIN THREAD (PumpLink's drain). */
+static void StoreWelcomePerson(const std::vector<char>& payload)
+{
+    coopstore::StoreWelcome w;
+    if (!coopstore::StoreWelcomeDecode(payload, &w)) return;
+    const std::string own = ConfigPlayerId();
+    const bool inPlay = ClockWorldLive() != 0 || !g_profSaveFolder.empty();
+    const int v = worldkeep::WelcomePersonDecide(own, w.hasPerson, w.person, coopstore::PlayerIdOk(w.person) != 0, g_worldPersonId, inPlay);
+    if (w.hasPerson && v != worldkeep::kPersonBad)   /* what this world calls the player now, for a lobby delete before its next WELCOME */
+    { g_personWorldId = w.hasWorldId ? w.worldId : std::string(); g_personForWorld = w.person == own ? std::string() : w.person; }
+    if (v == worldkeep::kPersonSame) return;
+    if (v == worldkeep::kPersonBad)
+    {
+        if (++g_welcomePersonBad == 1)
+            ErrorLog("[STORE] WELCOME: the world server names this player by " + N((long long)w.person.size()) + " characters that are not a player id"
+                     " - this game keeps the id it has (" + MyPersonId().substr(0, 6) + "...). personId bad=" + N(g_welcomePersonBad));
+        return;
+    }
+    if (v == worldkeep::kPersonHeld)
+    {
+        if (++g_welcomePersonHeld == 1)
+            DebugLog("[STORE] WELCOME: the world now knows this player as " + w.person.substr(0, 6) + "... while a world is in play under "
+                     + MyPersonId().substr(0, 6) + "... - the id in play is kept until the player is back at the title screen; until then the"
+                     " world server files this player's new work under the new id (a profile mismatch line on each WELCOME is expected). personId held="
+                     + N(g_welcomePersonHeld));
+        return;
+    }
+    ++g_welcomePersonAdopted;
+    if (w.person == own) g_worldPersonId.clear(); else g_worldPersonId = w.person;
+    if (g_profPickedNum >= 1) { g_profPickedId = coopprof::ProfileId(MyPersonId(), g_profPickedNum); g_profLastPickedId = g_profPickedId; }   /* as ProfilePick builds them */
+    if (w.person == own)
+    {
+        DebugLog("[STORE] WELCOME: this world knows this player by this install's own id " + own.substr(0, 6)
+                 + "... again - its profile, save folder, records store and take journal follow that id");
+        return;
+    }
+    DebugLog("[STORE] WELCOME: this world knows this player as " + w.person.substr(0, 6) + "... (this install's id " + own.substr(0, 6)
+             + "..., the world's aliases.txt) - its profile, save folder, records store and take journal follow that id");
+    /* A per-player file this install wrote in this world under its own id is left where it is (no move): said once per file. */
+    const std::string dir = StoreNotebookDir();
+    if (dir.empty()) return;
+    const std::string ownKey = g_profPickedNum >= 1 ? coopprof::SlotKey(own, g_profPickedNum) : own, key = StorePlayerKey();
+    const char* const names[3] = { "research_takes_pending_", "build_handoffs_owed_", "build_help_owed_" };
+    for (int i = 0; i < 3; ++i)
+    {
+        const std::string path = dir + "\\" + names[i] + ownKey + ".txt";
+        if (!StoreFileThere(path) || !g_personOwnFilesSaid.insert(path).second) continue;
+        DebugLog("[STORE] WELCOME: " + std::string(names[i]) + ownKey.substr(0, 6) + "... (this install's own id) is in this world's folder"
+                 " and is not moved; this game now reads and writes " + names[i] + key.substr(0, 6) + "...");
+    }
 }
 static bool StoreWelcomeWorld(unsigned int proto, const std::vector<char>& payload)
 {
@@ -9652,7 +9926,9 @@ void WorldKeyMarkSlot()
         ++g_worldKeyWritten;
         if (had && cur == key && curId.empty() && !KeyIdForWrite(curId).empty()) ++g_keyIdStamped;   /* T-490: a save from before ids, adopted, now carries the id */
         DebugLog("[STORE] world key written " + key + " in " + slot
-                 + (had ? (" (it held '" + cur + "' before - this save has changed worlds, and decision 32 says"
+                 + (had && cur != key && coopworld::SaveIdSameWorld(curId, KeyIdForWrite(curId))
+                    ? (" (it held '" + cur + "', this world's earlier name - the world id " + curId + " is the same, so only the name changed)")
+                    : had ? (" (it held '" + cur + "' before - this save has changed worlds, and decision 32 says"
                            " those two worlds can never agree again; the key on disk now names the notebook this"
                            " install is linked to)") : std::string(" (first WELCOME for this world - from here on"
                            " this save refuses to load without its notebook, decision 44)")));
@@ -9816,7 +10092,7 @@ void WorldKeySaveTickRow(int slot)
     if (keySame && !wgStamp) { ++g_worldKeyCopiedOnSave; WorldKeyPendClearAt(slot); return; }
     if (had && cur == key && !keySame) ++g_worldKeyUpgraded;   /* prof1 fold: a kcworld1 file gains the profile id */
     const unsigned long long wgSeq = g_wgSeqSeen;
-    if (WriteWorldKeyFile(dir, key, ConfigSlot(), wgStamp ? restoreguard::StampTail(wgGen, wgSeq, g_wgNotebook.epoch) : std::string()))   /* restore1c: field 7 = the repair epoch */
+    if (WriteWorldKeyFile(dir, key, ConfigSlot(), wgStamp ? restoreguard::StampTail(wgGen, wgSeq, g_wgNotebook.epoch) : std::string()))   /* field 7 = the notebook's epoch as this game last heard it */
     {
         if (had && cur == key && curId.empty() && !KeyIdForWrite(curId).empty()) ++g_keyIdStamped;   /* T-490 */
         ++g_worldKeyCopiedOnSave;
@@ -10003,6 +10279,28 @@ int ProfileLoadGate(int kind, const std::string& name)
        let it through - that send is what owes the IN_WORLD that moves this game to in-world on the world server. */
     const char* joinWhere = kind == coopprof::kProfReqNewGame ? "a NEW GAME asked" : "a load asked";
     if (g_profSaveFolder.empty()) return (StoreJoinViaWorld() && JoinGateCheck(joinWhere, true) != 0) ? 1 : 0;
+    ResetCarryEndIfSaved("a load or import asked");   /* T-36: a reset world folder saved since ends the carry before the gate asks */
+    if (coopprof::ProfileResetImportPass(kind, name, g_profSaveFolder, ResetCarryLive(), g_resetCarryFolder, g_resetCarryForFolder, g_resetCarryNewId, HeldWorldId()))
+    {   /* T-36: the import the reset decided (ResetCarryAtWelcome, posted by StoreResetCarryPost) - its saves go to the decided folder */
+        ++g_resetCarryGatePassed;
+        g_resetCarryArmOwed = 1;   /* the reset world's folder is saved once the import's world runs and the player's squads are read in (OwnCreatedSaveTick) */
+        g_resetCarryArmWaits = 0; g_resetCarryArmWaitLogged = 0;   /* a new import's wait is counted and said from the start */
+        SquadReadClearAll();   /* the squads read in are counted from this import's loads on (PlayerSquadsReadNow) */
+        static std::string s_passSaid;
+        const std::string said = g_resetCarryFolder + "|" + g_resetCarryNewId + "|" + g_profSaveFolder;
+        if (s_passSaid != said)
+        {
+            s_passSaid = said;
+            DebugLog("[RESET] load gate: the import of '" + name + "' is the one the reset decided - let through; its saves go to profile save folder '"
+                     + g_profSaveFolder + "' (reset world " + coopworld::WorldIdHex(g_resetCarryNewId) + "); every other import or load is refused as before."
+                     " resetCarryGatePassed=" + N(g_resetCarryGatePassed));
+        }
+        const int joinRefused = (StoreJoinViaWorld() && JoinGateCheck(joinWhere, true) != 0) ? 1 : 0;
+        /* T-36: money, research, map and faction standings laid back at the import's first frame, as at a load - armed only for an
+           import that goes, so an import the world-road check refuses leaves no restore waiting */
+        if (joinRefused == 0) OwnResetImportRestoreArm(g_resetCarryFolder, g_resetCarryOldStore);
+        return joinRefused;
+    }
     const bool saved = ProfileFolderSaved();
     if (coopprof::ProfileLoadDecide(RoleIsSingle(), g_profSaveFolder, kind, name, saved) == coopprof::kProfLoadAllow)
     {
@@ -10246,8 +10544,10 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
        rule every world comparison uses (coopworld::WorldFolderName): 'NorthLands' and 'northlands' are one world. */
     const std::string mine = ConfigWorldKey();
     /* W3-g (recheck-w3f item 3): a shared_wastelands.cfg with no world= line follows the DEFAULT world, exactly as its folder does
-       (coopworld::WorldOrDefault), so an empty name is compared as that world instead of refusing every keyed save. */
-    if (coopworld::WorldFolderName(coopworld::WorldOrDefault(mine, 0)) != coopworld::WorldFolderName(fileKey))
+       (coopworld::WorldOrDefault), so an empty name is compared as that world instead of refusing every keyed save.
+       T-36: a save carrying this world's id is this world's whatever name its key file carries (the name the world had when it was
+       saved - the world as it was before a reset keeps its id under a new name); without that id the name decides. */
+    if (!coopworld::SaveIdSameWorld(fileWorldId, HeldWorldId()) && coopworld::WorldFolderName(coopworld::WorldOrDefault(mine, 0)) != coopworld::WorldFolderName(fileKey))
     {
         ++g_loadRefusedWrongWorld;
         ErrorLog("[STORE] LOAD REFUSED (wrong world): '" + name + "' carries world key '" + fileKey + "' and this"
@@ -10287,9 +10587,9 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
     {
         ++g_loadRefusedOtherProfile;
         const bool mine = coopprof::PersonOfKey(fileProfile) == coopprof::PersonOfKey(g_profPickedId);
-        const std::string words = mine ? "This save belongs to your profile " + N((long long)coopprof::NumOfKey(fileProfile)) + ". Load a save for profile "
+        const std::string words = mine ? "This save belongs to your profile " + N((long long)coopprof::NumOfKey(fileProfile)) + ", not profile "
                                          + N((long long)coopprof::NumOfKey(g_profPickedId))
-                                       : std::string("This save belongs to another player's profile - load one of your own saves");   /* ui1 */
+                                       : std::string("This save belongs to another player's profile");   /* ui1 */
         ErrorLog("[STORE] LOAD REFUSED (another profile): '" + name + "' carries profile " + fileProfile + " and this game plays " + g_profPickedId
                  + ". loadRefusedOtherProfile=" + N(g_loadRefusedOtherProfile));
         g_loadRefuseLine = words + ".";   /* ui1: no tag */
@@ -10302,11 +10602,11 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
        numbered world (ruling 2), or a save the notebook is behind is refused with the other-profile refusal's line and
        title-panel notice. No override in restore1a. An allowed save numbered ABOVE the notebook is adopted (review a). */
     {
-        const int wv = restoreguard::DecideRepaired(g_storeAuthority, fileStamp, g_wgNotebook, g_repairRows);   /* restore1c: a save a repair undid is refused too */
+        const int wv = restoreguard::Decide(g_storeAuthority, fileStamp, g_wgNotebook);
         if (wv == restoreguard::kAllowNoGen || wv == restoreguard::kAllowNoTail) ++g_wgNoGen;
-        if (wv == restoreguard::kRefuseOlderWorld || wv == restoreguard::kRefuseUnnumbered || wv == restoreguard::kRefuseUndone)
+        if (wv == restoreguard::kRefuseOlderWorld || wv == restoreguard::kRefuseUnnumbered)
         {
-            if (wv == restoreguard::kRefuseOlderWorld) ++g_loadRefusedOlderWorld; else if (wv == restoreguard::kRefuseUndone) ++g_rpRefusedUndone; else ++g_loadRefusedUnnumbered;
+            if (wv == restoreguard::kRefuseOlderWorld) ++g_loadRefusedOlderWorld; else ++g_loadRefusedUnnumbered;
             ErrorLog("[STORE] LOAD REFUSED (older world save): '" + name + "' profile " + fileProfile + " saveGen=" + N((long long)(fileStamp.hasGen ? fileStamp.gen : 0u))
                      + (fileStamp.hasGen ? std::string() : std::string(" (no world save number in a numbered world - older than every numbered save)"))
                      + " latestGen=" + N((long long)g_wgNotebook.gen) + " - loading it would roll the world back. loadRefusedOlderWorld="
@@ -10324,10 +10624,10 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
                      + " notebookEpoch=" + N((long long)g_wgNotebook.epoch) + " - the world's notebook folder looks like an older copy."
                      " loadRefusedNotebookBehind=" + N(g_loadRefusedNotebookBehind));
             const bool onHost = ConfigRole() == kRoleHost;   /* words1b: the host's own game names no host */
-            g_loadRefuseLine = onHost ? "This save is newer than the world, so it can't be loaded. Restore the world, then try again."
-                                      : "This save is newer than the host's world, so it can't be loaded. Ask the host to restore the world.";   /* ui1 */
-            ProfileNotice(onHost ? "You could not load that save. This save is newer than the world. Restore the world, then try again."
-                                 : "You could not load that save. This save is newer than the host's world. Ask the host to restore the world.");
+            g_loadRefuseLine = onHost ? "This save is newer than the world, so it can't be loaded."
+                                      : "This save is newer than the host's world, so it can't be loaded.";   /* ui1; T-716: the fact only */
+            ProfileNotice(onHost ? "You could not load that save. This save is newer than the world."
+                                 : "You could not load that save. This save is newer than the host's world.");
             return 1;
         }
         if (g_storeAuthority && g_wgNotebook.known && restoreguard::AdoptHigher(fileStamp, g_wgNotebook, &g_wgPendGen, &g_wgPendSeq))
@@ -10340,7 +10640,6 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
                      + (sent ? std::string("sent") : std::string("owed to the next WELCOME")) + " (adopted=" + N(g_wgAdopted) + ")");
         }
     }
-    if (OwnRepairGate(name) != 0) return 1;   /* restore1c: a repair this game's records have not applied is applied HERE, before the world loads */
     OwnAutoStoreBeforeLoad();   /* T-251 fold 2 (re-check item 2): the player's store is opened HERE when the load came first, so the older-records check below judges it - a refusing verdict refuses this load exactly as for a store already open */
     /* owner 429: THE PLAYER'S RECORDS STORE WRITTEN BY A NEWER BUILD is not opened (OwnStoreChoose), so this load is refused (M6). */
     if (!g_ownFormatRefusedStore.empty() && g_ownFormatRefusedStore == OwnAutoStoreWant())
@@ -10362,7 +10661,7 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
                  + N((long long)OwnStoreCommittedHigh()) + " and the notebook remembers seq=" + N((long long)OwnHighNotebookFor(g_ohStore))
                  + (g_ohBlocked != 0 ? std::string(" (this records store was refused on this link - re-judged at the next WELCOME)") : std::string())
                  + ". ownHigh refused=" + N(g_ohRefused));
-        const std::string ohWords = OwnHighRejudgeWaiting() ? std::string("Checking your save... Try again in a few seconds")
+        const std::string ohWords = OwnHighRejudgeWaiting() ? std::string("Your save is still being checked")
                                                             : std::string(OwnHighWordsForRole());   /* fold 2 (recheck item 4); ui1: the player's words; words1b: host-neutral on the host */
         g_loadRefuseLine = ohWords + ".";
         ProfileNotice("You could not load that save. " + ohWords + ".");
@@ -10393,6 +10692,121 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
    for a joiner too), cleared at a new pick and at leave. Every SaveManager::save call - the save dialog, F5, the engine's autosave,
    the save verb, the leave save - is redirected there (decision 17: no name exemptions). */
 int TitleScreenUpPod();   /* defined below, beside the pump gate */
+/* T-36: THE EARLIER IDS OF THE WORLD THE WELCOME NAMED - its reset history (store protocol 93, g_resetHistory), for a hosting and a
+   joining game alike. Only when that history is empty: this game's own world.txt line 3, when this game's data folder is that world's
+   own folder and its world.txt names the WELCOME's id (a joining game has no copy of the world's world.txt and gets none there). *from
+   says which. */
+static bool ResetEarlierIdsHere(const std::string& worldId, std::vector<std::string>* ids, const char** from)
+{
+    ids->clear();
+    *from = "none";
+    if (worldId.empty()) return false;
+    if (!g_resetHistory.empty() && g_resetHistoryWorld == worldId)
+    {
+        for (size_t i = 0; i < g_resetHistory.size(); ++i) ids->push_back(g_resetHistory[i].id);
+        *from = "the world server's WELCOME";
+        return true;
+    }
+    if (g_dirJoined || g_dirCanonical.empty()) return false;
+    std::vector<char> b;
+    if (!ReadFileBytes(g_dirCanonical + "\\world.txt", &b)) return false;
+    const std::string txt(b.begin(), b.end());
+    std::string id;
+    bool up = false;
+    if (!coopworld::WorldTxtParseId(txt, &id, &up) || id != worldId) return false;
+    if (!coopworld::WorldTxtParseEarlier(txt, ids, 0, 0)) return false;
+    *from = "this computer's world.txt";
+    return true;
+}
+/* Is this pick's carry decided, for the pick and the save folder decided now? MAIN THREAD. */
+bool ResetCarryLive()
+{
+    return !g_resetCarryFolder.empty() && g_resetCarryForPick != 0 && g_resetCarryForPick == g_profPickedNum && g_resetCarryForFolder == g_profSaveFolder;
+}
+/* T-36: THE CARRY ENDS once the reset world's own folder holds a save of its own - the save armed right after the import, or any save
+   of that folder (worldreset::ResetCarryEnds): cleared as at a WELCOME, so a second automatic load, or an IMPORT GAME of the same save
+   in this pick, is refused by the load gate (coopprof::ProfileResetImportPass) instead of importing over the reset world's progress.
+   The folder's key file is read once per quick.save write time. MAIN THREAD. */
+long long g_resetCarryEnded = 0;
+void ResetCarryEndIfSaved(const char* why)
+{
+    if (!ResetCarryLive() || !ProfileFolderSaved()) return;
+    const std::string root = SaveRootDefault();
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    const unsigned long long mt = U8GetFileAttributesEx(JoinPathA(JoinPathA(root, g_profSaveFolder), "quick.save").c_str(), GetFileExInfoStandard, &fa)
+        ? (((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32) | (unsigned long long)fa.ftLastWriteTime.dwLowDateTime) : 0ULL;
+    static std::string s_otherIdSaid;
+    const std::string memo = g_profSaveFolder + "|" + g_resetCarryNewId + "|" + N((long long)mt);
+    if (mt != 0ULL && s_otherIdSaid == memo) return;   /* this quick.save was read already: its key file names another world id */
+    std::string keyId;
+    const std::vector<coopprof::SaveDirSeen> seen = SaveRootScan(root);
+    for (size_t i = 0; i < seen.size(); ++i)
+        if (coopprof::SameFolderName(seen[i].name, g_profSaveFolder)) { if (seen[i].keyed) keyId = seen[i].worldId; break; }
+    if (!worldreset::ResetCarryEnds(true, true, keyId, g_resetCarryNewId))
+    {
+        if (s_otherIdSaid != memo)
+        {
+            s_otherIdSaid = memo;
+            DebugLog("[RESET] the reset world's folder '" + g_profSaveFolder + "' holds a save whose key file names another world id - the import from '"
+                     + g_resetCarryFolder + "' stays decided for this pick");
+        }
+        return;
+    }
+    const std::string from = g_resetCarryFolder;
+    g_resetCarryFolder.clear(); g_resetCarryOldId.clear(); g_resetCarryForFolder.clear(); g_resetCarryForPick = 0; g_resetCarryRekeyOwed = 0; g_resetCarryOldKey.clear(); g_resetCarryOldNames.clear(); g_resetCarryArmOwed = 0;   /* as at a WELCOME */
+    ++g_resetCarryEnded;
+    DebugLog("[RESET] the reset world's folder '" + g_profSaveFolder + "' holds its own save (" + why + ") - the import from '" + from + "' is done for this"
+             " pick: a second automatic load or an IMPORT GAME of that save is refused like any other import. resetCarryEnded=" + N(g_resetCarryEnded));
+}
+/* T-36 S2: AT THE WELCOME THAT ADMITS THE PICK, when no save folder of this world's id was found for it (ProfileSaveFolderAtWelcome):
+   a folder of this world's name and this profile whose id the world had before a reset (worldreset::ResetCarryPick) is the save the
+   reset world imports - the automatic load posts Kenshi's IMPORT GAME from it (StoreResetCarryPost) and every save of the reset world
+   goes to the profile's new folder. The player's records store is copied to the reset world's id before it opens at the title
+   (ResetCarryRekey, from OwnAutoStoreWant). With no such folder nothing changes: a played profile with no save here gets today's
+   can't-load box (decision 666). MAIN THREAD. */
+void ResetCarryAtWelcome(const std::vector<coopprof::SaveDirSeen>& seen, const std::string& worldKey, const std::string& worldId)
+{
+    std::vector<std::string> earlier;
+    const char* earlierFrom = "none";
+    const bool listed = ResetEarlierIdsHere(worldId, &earlier, &earlierFrom);
+    std::vector<worldreset::ResetCarryCand> cands;
+    std::vector<size_t> where;
+    long long sameName = 0;
+    for (size_t i = 0; i < seen.size(); ++i)
+    {
+        /* T-36: this profile's folders carrying any world id under any world name - the world's earlier ids (ResetCarryPick) decide
+           which are this world's; a save of the world as it was may carry a later name of that world */
+        if (!coopprof::SaveDirIsProfilesWithId(seen[i], g_profPickedId, g_profPickedNum)) continue;
+        if (coopprof::SaveDirNamesWorld(seen[i], worldKey)) ++sameName;
+        worldreset::ResetCarryCand c;
+        c.worldId = seen[i].worldId; c.saveTime = seen[i].saveTime; c.quickSave = seen[i].saveTime != 0ULL;
+        cands.push_back(c); where.push_back(i);
+    }
+    const std::string prof = (g_profPickedName.empty() || g_profPickedName == "?") ? "Profile " + N((long long)g_profPickedNum) : g_profPickedName;
+    const int pick = worldreset::ResetCarryPick(false, earlier, cands);
+    if (pick < 0)
+    {
+        static std::string s_said;
+        if (!listed && g_dirJoined && sameName > 0 && s_said != worldId)
+        {
+            s_said = worldId;
+            DebugLog("[RESET] profile='" + prof + "': " + N(sameName) + " save folder(s) of world '" + worldKey + "' carry another id - this joining"
+                     " game cannot tell whether that is this world before a reset (its WELCOME names no earlier ids), so nothing is imported");
+        }
+        return;
+    }
+    const coopprof::SaveDirSeen& d = seen[where[(size_t)pick]];
+    g_resetCarryFolder = d.name; g_resetCarryOldId = d.worldId; g_resetCarryForFolder = g_profSaveFolder; g_resetCarryForPick = g_profPickedNum;
+    g_resetCarryKey = worldKey; g_resetCarryNewId = worldId; g_resetCarryRekeyOwed = 1;
+    g_resetCarryOldKey = d.world; g_resetCarryOldNames.clear();   /* the old store keeps the name it was made under, not the world's current one */
+    for (size_t i = 0; i < seen.size(); ++i)
+        if (seen[i].keyed && coopworld::SaveIdSameWorld(seen[i].worldId, d.worldId)) coopprof::LeftoverAddOnce(&g_resetCarryOldNames, seen[i].world);
+    ++g_resetCarryDecided;
+    DebugLog("[RESET] start: profile='" + prof + "' save of the previous world " + coopworld::WorldIdHex(d.worldId) + " -> importing into the reset world "
+             + coopworld::WorldIdHex(worldId) + " (research kept, buildings from the world's records later, relations from this player's records)");
+    DebugLog("[RESET] the import reads save folder '" + d.name + "'; the reset world's saves go to '" + g_profSaveFolder + "'. resetCarryDecided="
+             + N(g_resetCarryDecided) + " (the world's earlier ids came from " + earlierFrom + ")");
+}
 bool SaveRedirectWanted() { return coopprof::SaveRedirectDecide(RoleIsSingle(), g_profPickedNum != 0, g_profSaveFolder); }
 /* The folder a save asked for as `asked` really goes to - StoreTestSaveDone checks there. */
 std::string SaveTargetFor(const std::string& asked) { return SaveRedirectWanted() ? g_profSaveFolder : asked; }
@@ -10414,6 +10828,17 @@ bool ProfileSaveFolderAtWelcome(const std::vector<char>& payload)
     if (!g_profSaveFolder.empty()) return true;      /* already decided for this pick: a re-link */
     coopstore::StoreWelcome wel;
     coopstore::StoreWelcomeDecode(payload, &wel);
+    g_resetHistory.clear(); g_resetHistoryWorld.clear();
+    if (wel.hasHistory && wel.hasWorldId)
+    {   /* T-36: the world's reset history - the ids this world had before a reset, and whether each reset kept the buildings */
+        g_resetHistory = wel.history; g_resetHistoryWorld = wel.worldId;
+        std::string said;
+        for (size_t i = 0; i < wel.history.size(); ++i)
+            said += (i == 0 ? std::string() : std::string(", ")) + coopworld::WorldIdHex(wel.history[i].id)
+                  + ((wel.history[i].flags & coopstore::kStoreWelcomeResetKept) != 0 ? " (buildings kept)" : " (buildings not kept)");
+        DebugLog("[RESET] the WELCOME's reset history for world " + coopworld::WorldIdHex(wel.worldId) + ": " + N((long long)wel.history.size())
+                 + " earlier id(s), oldest first" + (said.empty() ? std::string(" - this world was never reset") : ": " + said));
+    }
     const std::string worldKey = coopworld::WorldOrDefault(ConfigWorldKey(), 0);
     /* the world's name as its notebook shows it (world.txt), when that is this world; else this game's own name for it */
     const std::string worldShown = (wel.hasWorld && !wel.world.empty() && coopworld::WorldNamesCollide(wel.world, worldKey)) ? wel.world : worldKey;
@@ -10423,17 +10848,36 @@ bool ProfileSaveFolderAtWelcome(const std::vector<char>& payload)
     coopprof::WorldIdent ident; ident.id = HeldWorldId(); ident.upgraded = HeldWorldUpgraded();   /* T-490: which world of this name */
     int owned = 0, otherWorld = 0;
     const int at = coopprof::SaveFolderScanChoose(seen, worldKey, g_profPickedId, g_profPickedNum, &owned, &ident, &otherWorld);
+    g_profIdWorldNames.clear();   /* T-36: the names this world's id was saved under, before this game's key write renames them */
+    for (size_t i = 0; i < seen.size(); ++i)
+        if (seen[i].keyed && coopworld::SaveIdSameWorld(seen[i].worldId, ident.id)) coopprof::LeftoverAddOnce(&g_profIdWorldNames, seen[i].world);
     if (otherWorld > 0)
-    {
-        g_saveScanOtherWorld += otherWorld;
-        std::string names;
+    {   /* T-36: a folder whose id the world's reset history lists is this world as it was before a reset, not another world */
+        std::string names, before;
+        long long nOther = 0, nBefore = 0;
         for (size_t i = 0; i < seen.size(); ++i)
             if (coopprof::SaveDirIsProfiles(seen[i], worldKey, g_profPickedId, g_profPickedNum) && !coopprof::SaveDirIsProfiles(seen[i], worldKey, g_profPickedId, g_profPickedNum, &ident))
-                names += " '" + seen[i].name + "' (world id " + (seen[i].worldId.empty() ? std::string("none") : seen[i].worldId) + ")";
-        DebugLog("[SAVE] T-490: " + N((long long)otherWorld) + " save folder(s) of another world named '" + worldKey + "' for profile " + g_profPickedId
-                 + " set aside - this world's id is " + ident.id + (ident.upgraded ? " (upgraded)" : " (born)") + "; they stay on this computer and"
-                 " are never loaded here:" + names + ". saveScanOtherWorld=" + N(g_saveScanOtherWorld));
+            {
+                bool earlierId = false;
+                if (g_resetHistoryWorld == ident.id)
+                    for (size_t k = 0; k < g_resetHistory.size() && !earlierId; ++k) earlierId = coopworld::SaveIdSameWorld(seen[i].worldId, g_resetHistory[k].id);
+                const std::string one = " '" + seen[i].name + "' (world id " + (seen[i].worldId.empty() ? std::string("none") : seen[i].worldId) + ")";
+                if (earlierId) { before += one; ++nBefore; } else { names += one; ++nOther; }
+            }
+        if (nOther > 0 || nBefore == 0)
+        {
+            const long long nSaid = nBefore == 0 ? (long long)otherWorld : nOther;
+            g_saveScanOtherWorld += nSaid;
+            DebugLog("[SAVE] T-490: " + N(nSaid) + " save folder(s) of another world named '" + worldKey + "' for profile " + g_profPickedId
+                     + " set aside - this world's id is " + ident.id + (ident.upgraded ? " (upgraded)" : " (born)") + "; they stay on this computer and"
+                     " are never loaded here:" + names + ". saveScanOtherWorld=" + N(g_saveScanOtherWorld));
+        }
+        if (nBefore > 0)
+            DebugLog("[SAVE] " + N(nBefore) + " save folder(s) of world '" + worldKey + "' for profile " + g_profPickedId + " are this world before a reset"
+                     " (ids its reset history lists; its id now is " + ident.id + ") - they stay on this computer and are never loaded here; the reset"
+                     " world imports the newest of them while it has no save of its own:" + before);
     }
+    g_resetCarryFolder.clear(); g_resetCarryOldId.clear(); g_resetCarryForFolder.clear(); g_resetCarryForPick = 0; g_resetCarryRekeyOwed = 0; g_resetCarryOldKey.clear(); g_resetCarryOldNames.clear(); g_resetCarryArmOwed = 0;   /* T-36 S2: decided again for this pick below */
     std::string folder, how;
     if (at < 0)
     {
@@ -10492,6 +10936,8 @@ bool ProfileSaveFolderAtWelcome(const std::vector<char>& payload)
     }
     g_profSaveFolder = folder;
     g_profSaveFolderFound = (at >= 0) ? 1 : 0;   /* T-201 PP6' */
+    if (worldreset::ResetCarryWanted(at >= 0, at >= 0 && seen[(size_t)at].saveTime != 0ULL))
+        ResetCarryAtWelcome(seen, worldKey, ident.id);   /* T-36: no saved folder of this world's id - a save of the world before its reset is imported, at every start until the reset world's own folder is saved */
     ConfigSetSlotForProfile(folder);
     DebugLog("[SAVE] profile save folder for world '" + worldShown + "' profile " + g_profPickedId + " '" + profName + "': '" + folder + "' (" + how
              + ") - every save goes there until this game leaves");
@@ -10836,6 +11282,21 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
     {
         char qb[260]; qb[0] = 0;
         CopyStdStringPod((const char*)self + kSaveRequestNameOff, qb, 260); qb[259] = 0;
+        if (reqCode == coopprof::kProfReqImport) ResetCarryEndIfSaved("a load or import asked");   /* as the load gate does before its test */
+        if (reqCode == coopprof::kProfReqImport
+            && coopprof::ProfileResetImportPass(reqCode, std::string(qb), g_profSaveFolder, ResetCarryLive(), g_resetCarryFolder, g_resetCarryForFolder,
+                                                g_resetCarryNewId, HeldWorldId())
+            && PreloadHoldsTitleLoad() != 0)
+        {   /* T-36: the reset world's import - the one the load gate lets through (the same test) - waits as a load does, so its first
+               areas load after the world server's current area records; any other IMPORT GAME is not held and the gate decides it now */
+            if (g_resetImportHoldSaid == 0)
+            {
+                g_resetImportHoldSaid = 1;
+                DebugLog("[RESET] the import of '" + std::string(qb) + "' WAITS under the loading screen for the world server's current records (the"
+                         " hold a load gets: until they are in, its link fails, or 60 s pass) - asked again every frame");
+            }
+            return;
+        }
         if (ProfileLoadGate(reqCode, std::string(qb)) != 0)
         {
             ++g_loadRefusedAtPump;
@@ -10851,6 +11312,9 @@ void SaveRequestPumpBody(void* self, void* a2, void* a3, void* a4)
             }
             return;
         }
+        /* an import the gate lets go: a held import's exchange is counted done / stale now, as a held load's is when its verdict lets
+           it go (a refused one is dropped by PreloadNoRequest once its request is cleared); nothing when no exchange held it */
+        if (reqCode == coopprof::kProfReqImport) PreloadReleased();
     }
     if (SaveRequestCodePod(self) == kSaveRequestLoad && TitleScreenUpPod() == 1 && PumpWillDispatchPod(self) != 0)
     {
@@ -11028,7 +11492,7 @@ static const unsigned int kExitSaveWaitMs = 60000;   /* T-206 fold: the window i
 static const unsigned int kExitFlushAllWaitMs = 2000;
 static const UINT kExitCode = 1;   /* Kenshi's normal exit code on both roads (Confirmed, harness logs) */
 /* each __try helper below has its own frame with no C++ object in it (C2712) */
-/* 2 = disconnected (link was UP: Disconnect() - delivery confirmed or, after ~300 ms, reset; the [net] line says which),
+/* 3 = closed at the quit (a Steam link, QuitSteamClose: no Steam call now), 2 = disconnected (link was UP: Disconnect() - delivery confirmed or, after ~300 ms, reset; the [net] line says which),
    1 = flushed (a link object that is not UP), 0 = no link, -1 = faulted */
 /* 1 = the store link is UP, 0 = not, -1 = faulted */
 static int ExitLinkUpPod()
@@ -11090,6 +11554,7 @@ static int ExitLinkPod()
     __try
     {
         if (g_link == 0) return 0;
+        if (g_quitSteamLinkClosed != 0) return 3;
         if (g_link->State() == net::LINK_UP) { g_link->Disconnect(); return 2; }
         g_link->Flush();
         return 1;
@@ -11120,6 +11585,7 @@ static int ExitFlushAllBounded()
 void detour_gameWorldDtor(void* gameWorld)
 {
     (void)gameWorld;
+    SteamNoteShutDown();    /* WinMain shut Steam down before exit() ran this hook: every Steam close below is skipped, not faulted */
     coop::UpnpQuitBegin();  /* T-53: hosting ends with the process - the router thread starts removing its entry now, beside the waits below */
     BuildHelpQuitFlush();   /* help1 fold (review MED 8): the helper's batched owed-file save */
     OwnHelpQuitFlush();     /* help1 fold (MED 5/6): pp.help to the writer - the wait below drains it */
@@ -11138,7 +11604,11 @@ void detour_gameWorldDtor(void* gameWorld)
     ExitOwedSettle(&owedWaited);
     /* 2. the store link */
     const int linkDone = ExitLinkPod();
-    const char* const linkWord = (linkDone == 2) ? "disconnected" : (linkDone == 1) ? "flushed" : (linkDone == 0) ? "none" : "faulted";
+    /* 2b. this game's Steam bridge: normally closed already at the quit (QuitSteamClose), and then nothing is done here. Reached
+       with a bridge open only when the quit came through a fallback site; Steam is down by now, so its Steam closes are skipped
+       and its world-server connections still close (bounded: relaybridge.h CloseGracefully) */
+    coop::net::RelayBridgeShutdown();
+    const char* const linkWord = (linkDone == 3) ? "closed-at-quit" : (linkDone == 2) ? "disconnected" : (linkDone == 1) ? "flushed" : (linkDone == 0) ? "none" : "faulted";
     /* 3. Kenshi's own save thread: 1 = running (wait), 2 = thread done but sync's main-thread tidy-up not yet run (it never
        will now: no frame runs after exit), 0 = idle, -1 = unreadable (skipped) */
     int sfs = SaveFileSystemBusyPod();
@@ -11333,6 +11803,7 @@ void InstallStore()
                          " rva 0x373DC0. Decision 44 is NOT enforced this run.");
         }
         Pp7Install(base);   /* PP7 (owner 162): LOAD GAME / CONTINUE show single-player saves only */
+        InstallFontGuard();   /* T-730: a MyGUI text with no font answers an empty font name; installed before the title screen is built */
         /* L1: the pump gate - the one that refuses at the title screen BEFORE the title is deleted. If it cannot be
            installed the loadGame gate still refuses at the title, and that refusal is the T243 crash; nothing
            here pretends otherwise. */
@@ -11796,14 +12267,14 @@ bool StoreFeedSendOff(const char* why)
              " and unique states (deletes still come) until this game has a world again and asks");
     return true;
 }
-/* Welcomed on the connection that is up now. Not LinkUp(): a stale repair (g_repairStale) keeps the connection and its
-   record-feed subscription open while LinkUp() reads false, and the OFF must still reach it. */
+/* Welcomed on the connection that is up now. Not LinkUp(): this asks only for an up, welcomed connection (LinkUp() also needs the
+   protocol and the world to match), and the OFF must reach any such connection. */
 bool StoreWelcomedOnConnection() { return g_link != 0 && g_link->State() == net::LINK_UP && g_storeWelcomed; }
 void StoreFeedOffAtLoad(const char* why)
 {
     g_snapshotApplied = false;
     if (coopfeed::FeedOffTaken(&g_feed) == 0) return;
-    if (!StoreWelcomedOnConnection()) return;   /* an OFF before the WELCOME is refused by the world server; a stale repair still sends it */
+    if (!StoreWelcomedOnConnection()) return;   /* an OFF before the WELCOME is refused by the world server */
     g_feedOffOwedLink = StoreNotebookLinkGen();   /* review L1: owed on this link until it is out - StoreFeedTick retries it */
     StoreFeedSendOff(why);
 }
@@ -12103,6 +12574,7 @@ volatile long g_ownWorldReset = 0;   /* mmo1b (review-mmo1 item 5): +1 per world
 void StoreWorldLoadBegan(const char* why)
 {
     ::InterlockedIncrement(&g_ownWorldReset);   /* mmo1b: squads are tracked by address - a new world may reuse one */
+    SquadReadClearAll();   /* a new world's squads are read in afresh: an address noted in the last world may be reused */
     g_joinedWorldRoad = coopjoin::JoinRoadStep(g_joinedWorldRoad, coopjoin::kJrWorldLoad);   /* M11a S3 review fold (F1): a new world (or none) is not the one joined through the world road */
     JoinHoldDrop("another load started");   /* a load held for the operator never follows a world the player started some other way */
     /* THE WORLD GENERATION IS BUMPED HERE and nowhere else - one interlocked increment at the one place that
@@ -12805,7 +13277,7 @@ void InQueueDrain()
         g_levelAt.clear();   /* the indices are absolute; compaction moves every one of them */
     }
 }
-/* ============ P7h (review-p6z H-2) - ONE PUMP CALL APPLIES AT MOST kPumpBatchMax MESSAGES ============
+/* ============ P7h (review-p6z H-2) - ONE PUMP CALL HANDLES kPumpBatchMax MESSAGES, THEN MORE ONLY WHILE ITS 2 MS BUDGET LASTS ============
    `g_link->Poll(&in)` hands back everything the socket has, and this drain applied ALL of it before returning.
    review-p6z H-2 measured what that costs the load gate: the gate tested its 8 s cap AFTER PumpLink had run to
    completion, so the true stall was `8000 ms + one unbounded drain` while the number the report printed said
@@ -12814,7 +13286,8 @@ void InQueueDrain()
    pushes its WHOLE index in one burst after the WELCOME.
    THE TAIL IS CARRIED, NOT DROPPED. Poll has already consumed it and the relay pushes its index exactly once
    per link, so a dropped record is a record lost for the life of that link. The remainder is held here, in
-   arrival order, and prepended to the next call.
+   arrival order (src/common/pumpcarry.h), and the next call takes from its front. A relayed MOVE that finds an earlier
+   MOVE of the same character from the same game still waiting overwrites it in its place instead of queuing behind it.
    A GENERATION EDGE DROPS THE CARRY. Messages polled before the link went down (or came up) belong to a
    numbering that no longer exists - P6q's whole point is that nothing keyed to the previous generation is read
    after it - so they are dropped there, counted, and never applied to the new link.
@@ -12824,8 +13297,15 @@ void InQueueDrain()
    record still cannot echo itself straight back out. P7f's deferred push queue is unaffected: it defers by
    "is there a world", which no batch boundary touches.
    MAIN THREAD ONLY, like the rest of this function. */
-const size_t kPumpBatchMax = 64;
-std::vector<net::Message> g_linkCarry;
+const size_t kPumpBatchMax = pumpcarry::kBatchMin;   /* pumpcarry::Stop applies it */
+/* Past kPumpBatchMax a call keeps handling waiting messages until this much time has passed since the drain began
+   (pumpcarry::Stop): a crowd's relayed MOVEs can arrive faster than a fixed count per frame, and a fixed count alone
+   would let the carry grow every frame. */
+const long long kPumpBudgetUs = 2000;
+pumpcarry::Carry<net::Message> g_linkCarry;
+/* TEST-ONLY (command verb `pumpcap <n>`): n > 0 = each PumpLink call handles at most n messages and ignores the time
+   budget, so a bench crowd can push the intake past its limit; 0 = the normal rule. */
+int g_pumpCapTest = 0;
 long long g_pumpBatchesCapped = 0, g_pumpCarried = 0, g_pumpCarryDropped = 0;
 /* ---- settings5 S5 (docs/design-settings1.md section 4): THE MOD CHECK AT JOIN, this game's half ----
    The HELLO carries this game's list (g_modsSent). A notebook whose world list differs answers REFUSE kRefuseMods with the
@@ -12847,7 +13327,7 @@ void StoreModsRefused(const std::vector<char>& payload)
     const coopmods::ModDiff d = haveWorld ? coopmods::ModListDiff(world, g_modsSent) : coopmods::ModDiff();
     const bool ownUnreadable = (g_modsSent.known == 0);   /* settings5 fold (review-settings5 4): refused because THIS list was unreadable */
     const std::string headline = ownUnreadable ? coopmods::ModUnreadableText() : haveWorld ? coopmods::ModRefusalText(d)
-        : std::string("Mod mismatch: use the same mods as the host, in the same order, then restart Kenshi and join again.");
+        : std::string("Mod mismatch: your mods are different from the host's.");
     const std::string detail = ownUnreadable ? std::string("Details: this game could not read its own mod list (see the [MODS] detail lines)")
                              : haveWorld ? coopmods::ModDetailText(d) : std::string("Details: the notebook sent no list to compare with");
     /* words1 (owner wording audit 2026-09-27, section 10): the player reads the differences as plain lines, and none when
@@ -12986,21 +13466,21 @@ void StoreWelcomeMods(const std::vector<char>& payload)
    undropped carry was applied to the NEXT link). MAIN THREAD. */
 void LinkCarryDrop()
 {
-    if (g_linkCarry.empty()) return;
+    if (g_linkCarry.Empty()) return;
     /* P7w, folding review-p7v M-7. THE PERMANENT BIT FIRST, ON THIS PATH TOO. Three headers in this
        build state the invariant as "any gone-mark discarded on ANY path sets decision 30's bit first",
        and this was the one path that did not - the carry holds messages Poll already handed us that
        kPumpBatchMax deferred, and a link edge dropped the whole carry. Decision 30 held in practice
        because the relay re-pushes DELETED_BITS ahead of the records on relink; it did not hold as
        written. Booked as goneBitAtDrop, the same number every other discard path books. */
-    for (size_t ci = 0; ci < g_linkCarry.size(); ++ci)
-        if ((unsigned int)g_linkCarry[ci].type == kStoreMsgGone)   /* M2-b (review-m2 LOW): net::MSG_RECORD_GONE is a SESSION message and never arrives on the notebook link */
-            GoneBitBeforeDrop(g_linkCarry[ci].payload);
-    g_pumpCarryDropped += (long long)g_linkCarry.size();
-    DebugLog("[STORE] the link changed state with " + N((long long)g_linkCarry.size()) + " carried message(s)"
+    for (size_t ci = 0; ci < g_linkCarry.Size(); ++ci)
+        if ((unsigned int)g_linkCarry.At(ci).type == kStoreMsgGone)   /* M2-b (review-m2 LOW): net::MSG_RECORD_GONE is a SESSION message and never arrives on the notebook link */
+            GoneBitBeforeDrop(g_linkCarry.At(ci).payload);
+    g_pumpCarryDropped += (long long)g_linkCarry.Size();
+    DebugLog("[STORE] the link changed state with " + N((long long)g_linkCarry.Size()) + " carried message(s)"
              " still unapplied (P7h) - they belong to the previous link generation and are dropped, not"
              " applied to the new one.");
-    g_linkCarry.clear();
+    g_linkCarry.Clear();
 }
 /* M4 fold 2 (re-check H-A): THE ONE NOTEBOOK LINK-DOWN STEP. Everything that belongs to the link that ended - the WELCOME and
    its authority, the slot, the uid seat and blocks, the carried-down id set, the no-map clock, the peer-sector table, the
@@ -13244,6 +13724,7 @@ void StoreFeedMarkLastDeferred()
 void PumpLink()
 {
     if (g_link == 0) return;
+    if (g_quitSteamLinkClosed != 0) return;   /* closed at the quit: its down edge is not run while the game exits */
     /* P7v (design-noworld-queue 1.4) - BACK-PRESSURE. Past the high-water mark with the predicate blocked,
        this origin's socket is NOT POLLED. ENet then buffers and retransmits reliable channels, which is
        precisely the pre-P7h behaviour that lost nothing; the alternative - polling and then dropping - is
@@ -13253,7 +13734,15 @@ void PumpLink()
     g_link->Poll(&in);
     const bool up = g_link->State() == net::LINK_UP;
     if (up != g_linkWasUp) LinkCarryDrop();   /* M4 fold 2: factored - SetStoreServer's teardown drops the carry the same way */
-    if (!g_linkCarry.empty()) { in.insert(in.begin(), g_linkCarry.begin(), g_linkCarry.end()); g_linkCarry.clear(); }
+    /* Everything polled joins the BACK of the carry (after the drop above, so it belongs to this link) and the loop below
+       takes from the front. A relayed MOVE whose character's earlier MOVE still waits overwrites that one in its place. */
+    for (size_t pi = 0; pi < in.size(); ++pi)
+    {
+        pumpcarry::Key key;
+        const bool level = in[pi].type == (net::MsgType)kStoreMsgLive
+                           && pumpcarry::LiveLevelKey(in[pi].payload.empty() ? 0 : &in[pi].payload[0], in[pi].payload.size(), &key);
+        g_linkCarry.Append(&in[pi], level, key);
+    }
     if (up && !g_linkWasUp)
     {
         /* E38 / decision 43 - THE SLOT IS REAL NOW. It was the literal "s1" for the whole life of this link, which
@@ -13300,6 +13789,14 @@ void PumpLink()
         g_profLobby = (g_profPickedNum == 0) ? 1 : 0; g_profAutoSteps = 0;
         g_profPanelReqOut = 0; g_profAutoOwed = 0; g_profListThisLink = 0;   /* recheck-prof3: a new link, a new list */
         ++g_helloPlayerIdSent;
+        g_storeAuthAnsweredLink = 0;   /* a new connection: its world server may ask for the password once */
+        if (ConfigRole() == kRoleHost && g_hostTokenSet)
+        {
+            /* the host's own game shows this hosting's secret ahead of its HELLO, on the same ordered lane: it is the world's owner */
+            std::vector<char> tb; authproof::HostTokenEncode(g_hostToken, &tb);
+            if (g_link->Send(0, (net::MsgType)kStoreMsgHostToken, &tb[0], tb.size(), net::CH_RELIABLE)) ++g_storeHostTokenSent;
+            else ++g_storeHostTokenFailed;
+        }
         g_linkHello = g_link->Send(0, net::MSG_STORE_HELLO, &b[0], b.size(), net::CH_RELIABLE);
         /* P6q (review-p6j MEDIUM-1): A NEW LINK IS A NEW NUMBERING, and it is stamped here, on the edge, before any
            message of the new link can be drained below. Everything keyed to the previous generation - most of all
@@ -13310,7 +13807,7 @@ void PumpLink()
            only and is what the WELCOME/AREAMAP slot comparisons key on; an entry queued before a DROP has to
            be able to see that drop, so it cannot share that counter. */
         ::InterlockedIncrement(&g_notebookLinkGen);
-        DebugLog(std::string("[STORE] link up to ") + g_linkAddr + " - HELLO " + (g_linkHello ? "sent" : "FAILED") + " (link generation " + N((long long)g_linkGen) + ", saveFolder='" + slot + "', world='" + world + "', clock=" + F1((float)helloHours) + ", speed=" + F1(helloSpeed) + ")");
+        DebugLog(std::string("[STORE] link up to ") + relaybridge::AddrForLog(g_linkAddr) + " (route used: " + net::RelayRouteNoteUp(g_link) + ") - HELLO " + (g_linkHello ? "sent" : "FAILED") + " (link generation " + N((long long)g_linkGen) + ", saveFolder='" + slot + "', world='" + world + "', clock=" + F1((float)helloHours) + ", speed=" + F1(helloSpeed) + ")");
         /* P7u: THE LINK-UP ARM HAS MOVED into ClockNoteEpoch, which runs every frame above ClockTick's LinkUp()
            return and compares g_linkGen against the generation it last armed on. Three arm sites written out by
            hand in three files is the shape this project keeps paying for (6a lesson 11); one function that owns
@@ -13326,21 +13823,59 @@ void PumpLink()
     if (!up && g_linkWasUp) NotebookLinkDown("back to the in-game store (B12-e: with a notebook address configured, a host or client role and a world running, StoreRedialTick now re-dials it every 5 s from here until it answers)");   /* M4 fold 2 (re-check H-A): THE ONE LINK-DOWN STEP - SetStoreServer's teardown runs it too */   /* E24.1: a dropped link un-answers "does the notebook know this id" until the next WELCOME's push finishes */
     g_linkWasUp = up;
     StoreJoinStageTick();   /* M11a S1: the world road's gate line at its WELCOME and its JOIN_STAGE IN_WORLD (a no-op on the session road) */
-    g_publishSuppressed = true;   /* review-p5a MEDIUM-2: burst 2 - the relay's whole index (and a link-up push of records) arrives in ONE drain. P7h (review-p6z H-2): at most kPumpBatchMax of it per call - the suppression still spans each batch, which is what that comment is about. */
+    g_publishSuppressed = true;   /* the relay's whole index (and a link-up push of records) can arrive in one poll. Each call handles 64 messages, then more until 2 ms of handling has passed or the arrival queue is near full while engine writes are blocked, plus the message in hand; the suppression spans each call's share, so an applied record cannot echo itself straight back out. */
     size_t handled = 0;
-    for (size_t i = 0; i < in.size(); ++i)
+    if (g_qpcFreq.QuadPart == 0) ::QueryPerformanceFrequency(&g_qpcFreq);
+    const long long pumpT0 = QpcTicks();
+    while (!g_linkCarry.Empty())
     {
-        if (handled >= kPumpBatchMax)
+        /* Defensive: no handler in this loop tears the link down; if one ever does, the drain stops here. */
+        if (g_link == 0) break;
+        /* WORK PER CALL (pumpcarry::Stop): 64 messages always, then more until kPumpBudgetUs of handling has passed, so a
+           steady stream above 64 a frame is drained instead of piling up - but not past 64 while the arrival queue is
+           near full and engine writes are blocked (the brake at the top of this function), so a load does not push
+           more than 64 a call into a nearly full queue. Both kinds of stop count in g_pumpBatchesCapped. What is left
+           waits at the front. */
+        const bool satBlocked = handled >= kPumpBatchMax
+                             && (InQueueSaturated(kOriginNotebook) != 0 || InQueueSaturated(kOriginRelay) != 0) && EngineWritesBlocked();
+        const bool stop = pumpcarry::Stop(handled, g_pumpCapTest, QpcUsSince(pumpT0), kPumpBudgetUs, satBlocked);
+        if (stop)
         {
-            /* P7h (review-p6z H-2): the cap is on WORK PER CALL, so the tail is carried to the next one. */
-            g_linkCarry.assign(in.begin() + i, in.end());
-            g_pumpCarried += (long long)(in.size() - i);
+            g_pumpCarried += (long long)g_linkCarry.Size();
             ++g_pumpBatchesCapped;
             break;
         }
         ++handled;
-        const net::Message& m = in[i];
+        net::Message m;
+        g_linkCarry.PopFront(&m);
         ++g_linkRecv;
+        /* THE WORLD'S PASSWORD: the world server asks before its WELCOME, so the question is answered whatever else is going on. */
+        if (m.type == (net::MsgType)kStoreMsgAuthChallenge)
+        {
+            if (g_storeAuthAnsweredLink != 0 || g_storeWelcomed)
+            {
+                ++g_storeAuthExtra;   /* one challenge per connection, before its WELCOME: any other is not answered */
+                continue;
+            }
+            g_storeAuthAnsweredLink = 1;
+            std::vector<char> proof;
+            const bool hosting = ConfigRole() == kRoleHost;
+            const int a = StoreAuthAnswer(m.payload, hosting, &proof);
+            if (a > 0 && g_link != 0 && g_link->Send(0, (net::MsgType)kStoreMsgAuthProof, &proof[0], proof.size(), net::CH_RELIABLE))
+            {
+                ++g_storeAuthAnswered;
+                DebugLog(std::string("[STORE] the world server asked for the world's password - answered with a proof made from ")
+                         + (hosting ? "the password this game hosts with" : "the password given for this join"));
+            }
+            else if (a == 0)
+            {
+                ++g_storeAuthNoPassword;
+                ErrorLog(std::string("[STORE] the world server asked for the world's password and this game has none ")
+                         + (hosting ? "(it hosts with none)" : "for this join") + " - nothing is sent; the world server refuses this game in words");
+            }
+            else ++g_storeAuthBadChallenge;   /* malformed, or the link would not take the proof: the world server's HELLO deadline refuses it */
+            continue;
+        }
         /* W3: a notebook of ANOTHER world, refused at its WELCOME, is not read - not its options, clock, sky, bitmaps or
            records (the opening push behind the WELCOME). Only a new WELCOME or a REFUSE is looked at. */
         if (g_storeWrongWorld && m.type != net::MSG_STORE_WELCOME && m.type != (net::MsgType)kStoreMsgRefuse) { ++g_storeWrongWorldIgnored; continue; }
@@ -13350,7 +13885,7 @@ void PumpLink()
         /* E24.1: the end of the WELCOME's push, as an event. The bitmaps and the unique states ARE the push; the
            first message of any other type after the WELCOME is the relay having moved on to the records (or to its
            next per-second AREAMAP, which is why a notebook holding nothing still ends its push). */
-        if (g_welcomePush == 1 && m.type != net::MSG_STORE_WELCOME && m.type != kStoreMsgDeletedBits && m.type != kStoreMsgUniqueState && m.type != kStoreMsgOptions && m.type != (net::MsgType)kStoreMsgClock && m.type != (net::MsgType)kStoreMsgWeather && m.type != (net::MsgType)kStoreMsgResearch && m.type != (net::MsgType)kStoreMsgResearchTake && m.type != (net::MsgType)kStoreMsgTownBar && m.type != (net::MsgType)kStoreMsgOwed && m.type != (net::MsgType)kStoreMsgTownLoss && m.type != (net::MsgType)kStoreMsgWorldRel && m.type != (net::MsgType)kStoreMsgOwnHigh && m.type != (net::MsgType)kStoreMsgUidBlock && m.type != (net::MsgType)kStoreMsgLive && m.type != (net::MsgType)kStoreMsgCatchup && m.type != (net::MsgType)kStoreMsgPlayerGone)   /* M8: a PLAYER_GONE can land inside the push too */   /* M6: a CATCHUP can land inside the push too */   /* M5a: a LIVE from another game can land inside the push - it is not the relay moving on */   /* M4 fold: a UID_BLOCK answer can land inside the push - it is not the relay moving on */   /* restore1b1: the OWN_HIGH rows ride right after the WELCOME */   /* loot2b: the research boxes ride inside it too (after the unique states); loot2c: and the take rows after them; refill1: and the town bar rows after those */   /* E40: the CLOCK and the weather rows ride INSIDE the opening push (the relay sends them right after the options), so neither of them is the relay having moved on */
+        if (g_welcomePush == 1 && m.type != net::MSG_STORE_WELCOME && m.type != kStoreMsgDeletedBits && m.type != kStoreMsgUniqueState && m.type != kStoreMsgOptions && m.type != (net::MsgType)kStoreMsgClock && m.type != (net::MsgType)kStoreMsgWeather && m.type != (net::MsgType)kStoreMsgResearch && m.type != (net::MsgType)kStoreMsgResearchTake && m.type != (net::MsgType)kStoreMsgTownBar && m.type != (net::MsgType)kStoreMsgOwed && m.type != (net::MsgType)kStoreMsgTownLoss && m.type != (net::MsgType)kStoreMsgWorldRel && m.type != (net::MsgType)kStoreMsgOwnHigh && m.type != (net::MsgType)kStoreMsgUidBlock && m.type != (net::MsgType)kStoreMsgLive && m.type != (net::MsgType)kStoreMsgCatchup && m.type != (net::MsgType)kStoreMsgPlayerGone && m.type != (net::MsgType)kStoreMsgKept && m.type != (net::MsgType)townkeep::kMsgTowns)   /* TOWNS: the kept outposts can land inside the push too */   /* KEPT: a STATE broadcast (another game's claim or lay) can land inside the push too */   /* M8: a PLAYER_GONE can land inside the push too */   /* M6: a CATCHUP can land inside the push too */   /* M5a: a LIVE from another game can land inside the push - it is not the relay moving on */   /* M4 fold: a UID_BLOCK answer can land inside the push - it is not the relay moving on */   /* restore1b1: the OWN_HIGH rows ride right after the WELCOME */   /* loot2b: the research boxes ride inside it too (after the unique states); loot2c: and the take rows after them; refill1: and the town bar rows after those */   /* E40: the CLOCK and the weather rows ride INSIDE the opening push (the relay sends them right after the options), so neither of them is the relay having moved on */
         {
             g_welcomePush = 2;
             DebugLog("[STORE] the notebook's opening push is complete - a locally first-seen unique state may now be published");
@@ -13376,9 +13911,21 @@ void PumpLink()
             else if (reason == (unsigned int)coopstore::kRefuseMods)        ++g_storeRefusedMods;   /* settings5 S5 */
             else if (reason == (unsigned int)coopstore::kRefuseSamePerson)  ++g_storeRefusedSamePerson;   /* prof1 fold */
             else if (reason == (unsigned int)coopstore::kRefuseLiveProtocol) ++g_storeRefusedLiveProto;   /* M11a S1 fold (review L5) */
+            else if (coopstore::StoreRefuseStopsJoin(reason))               ++g_storeRefusedAuth;   /* the password or the access list */
             else                                                           ++g_storeRefusedProtocol;
             if (reason == (unsigned int)coopstore::kRefuseMods) StoreModsRefused(m.payload);   /* settings5 S5: the words on the title screen */
-            if (reason != g_storeRefusedLoggedReason)
+            if (coopstore::StoreRefuseStopsJoin(reason))
+            {
+                g_storeAuthStop = 1;   /* the player has to act (a password, or leaving): this join dials no more until then */
+                if (g_storeRefusalSayAgain != 0) { g_storeRefusalSayAgain = 0; g_storeRefusedLoggedReason = 0xFFFFFFFFu; }   /* a new join password: said again */
+                if (reason != g_storeRefusedLoggedReason)
+                {
+                    g_storeRefusedLoggedReason = reason;
+                    ErrorLog("[STORE] the world server refused this game: " + coopstore::StoreRefuseReasonText(reason, sp, gp, n1, n2)
+                             + ". This join stops dialling it until the player gives a password or leaves.");
+                }
+            }
+            else if (reason != g_storeRefusedLoggedReason)
             {
                 g_storeRefusedLoggedReason = reason;
                 /* THE DIAGNOSIS MATCHES THE CAUSE (review-b13 M-1). B13 sent all three of the notebook's
@@ -13407,13 +13954,13 @@ void PumpLink()
             unsigned int proto = 0, auth = 0, count = 0; std::memcpy(&proto, &m.payload[0], 4); std::memcpy(&auth, &m.payload[4], 4); std::memcpy(&count, &m.payload[8], 4);
             /* T-490: a WELCOME of this protocol whose world id field is malformed is refused exactly as a protocol mismatch - never let in
                without its identity */
-            bool welcomeTorn = false;
-            if (proto == kStoreProtocol) { coopstore::StoreWelcome tw; coopstore::StoreWelcomeDecode(m.payload, &tw); welcomeTorn = tw.worldIdMalformed; }
+            bool welcomeTorn = false, personTorn = false, historyTorn = false;
+            if (proto == kStoreProtocol) { coopstore::StoreWelcome tw; coopstore::StoreWelcomeDecode(m.payload, &tw); welcomeTorn = tw.worldIdMalformed || tw.personMalformed || tw.historyMalformed; personTorn = tw.personMalformed; historyTorn = tw.historyMalformed; }
             if (welcomeTorn)
             {
                 ++g_welcomeIdTorn;
                 if (g_welcomeIdTorn == 1 || g_welcomeIdTorn % 20 == 0)
-                    ErrorLog("[STORE] T-490: the world server's WELCOME (protocol " + N(proto) + ") carries a malformed world id field - refused as a protocol"
+                    ErrorLog("[STORE] T-490: the world server's WELCOME (protocol " + N(proto) + ") carries a malformed " + std::string(personTorn ? "player id (person)" : historyTorn ? "reset history" : "world id") + " field - refused as a protocol"
                              " mismatch; nothing is read from it and nothing is written to it. welcomeIdTorn=" + N(g_welcomeIdTorn));
             }
             const bool protoOk = proto == kStoreProtocol && !welcomeTorn;
@@ -13426,6 +13973,7 @@ void PumpLink()
             if (protoOk)
             {
                 if (!StoreWelcomeWorld(proto, m.payload)) continue;
+                StoreWelcomePerson(m.payload);   /* the id the world knows this player by - before the index, the tables and the save folder below */
                 StoreWelcomeMods(m.payload);   /* settings5 S5: [MODS] world list matches (N mods) */
                 if (!RoleIsSingle()) { StoreArmWorldIndex("storeLink"); JoinedFolderRetry(); }
             }
@@ -13487,7 +14035,6 @@ void PumpLink()
                configured slot belongs to that world and must never load without it again. Idempotent: it reads
                the file first and writes only when it is absent or names a different world, so the WELCOME of every
                later reconnection costs one small read. Main thread - PumpLink's drain. */
-            if (protoOk) RepairOnWelcome(m.payload);   /* restore1c: the repair rows first - the key scan below skips undone saves */
             if (protoOk) WorldGenOnWelcome(m.payload, auth != 0);   /* restore1a: the notebook's world numbers (the WELCOME tail) */
             OwnHighOnWelcome();   /* restore1b1: this notebook's numbers for this game's records arrive right behind the WELCOME */
             /* T-201 PP5 fold (L1): the slot is marked only when the profile's folder is decided for THIS WELCOME (or confirmed on a
@@ -13605,6 +14152,8 @@ void PumpLink()
             coop::RefillNoteRows(m.payload);
         }
         else if (m.type == (net::MsgType)kStoreMsgOwed) coop::TownGenOwedArrive(m.payload);   /* T-581: the owed rows - a table write only; the town check-up acts on it */
+        else if (m.type == (net::MsgType)kStoreMsgKept) coop::KeptNoteRows(m.payload.empty() ? 0 : &m.payload[0], m.payload.size());   /* the kept pieces' rows and their state */
+        else if (m.type == (net::MsgType)townkeep::kMsgTowns) coop::BuildTownsNote(m.payload.empty() ? 0 : &m.payload[0], m.payload.size());   /* the kept outposts (before the first kept rows of the link) */
         else if (m.type == (net::MsgType)kStoreMsgTownLoss) coop::TownLossNoteRows(m.payload);   /* each town's recorded losses and refilled flag - a table write only; the town check-up acts on it */
         else if (m.type == (net::MsgType)kStoreMsgResearch)
         {
@@ -13629,10 +14178,6 @@ void PumpLink()
         else if (m.type == (net::MsgType)kStoreMsgUidBlock)
         {
             UidBlockOnNotebook(m.payload);   /* M4 fold: a block of uid counters for this game's slot, or why none - a minter-table write */
-        }
-        else if (m.type == (net::MsgType)kStoreMsgRepair)
-        {
-            RepairOnNotebook(m.payload);   /* restore1c: the host repaired the world */
         }
         else if (m.type == (net::MsgType)kStoreMsgRecordSeq)
         {
@@ -13732,8 +14277,9 @@ long long g_loadGateNoAddressYet = 0, g_loadGateWaitOverEnetTimeout = 0;
    every wait has that condition, and (from a load whose session is not up) not every one of those becomes a
    wait. `loadGateNotLinked` is now what its log line always claimed: NO LINK OF ANY KIND IS ARMED.
    `loadGateBatchesPumped` counts PumpLink calls made by the gate, which is why H-2's cap can be enforced at
-   all: with the drain bounded at kPumpBatchMax messages, "check the deadline, then do one batch" is a real
-   bound on the stall instead of a bound on the loop. `loadGateSessionPumps` is the session side of the same
+   all: with each drain bounded (64 messages, then more until 2 ms of handling has passed or the arrival queue
+   is near full while engine writes are blocked, plus the message in hand), "check the deadline, then do one
+   batch" is a real bound on the stall instead of a bound on the loop. `loadGateSessionPumps` is the session side of the same
    loop. `loadGateStoreLinkSessionLost` is the wait giving up early because the thing that was going to hand it
    the address has gone. */
 long long g_loadGateWaitedForStoreLink = 0, g_loadGateBatchesPumped = 0, g_loadGateSessionPumps = 0;
@@ -13830,9 +14376,10 @@ void E38LoadGate()
     {
         /* P7h (review-p6z H-2) - THE CAP IS TESTED BEFORE THE WORK, NOT AFTER IT. It used to be evaluated once
            PumpLink had already run to completion, and PumpLink drained everything the socket had: the stall
-           was `8000 ms + one unbounded drain` and the printed number said 8000. With the drain now bounded at
-           kPumpBatchMax messages per call (see PumpLink's header), testing the deadline here makes 8 s a real
-           bound on the stall rather than a bound on the number of loop passes. */
+           was `8000 ms + one unbounded drain` and the printed number said 8000. With each drain bounded per call
+           at 64 messages, then more until 2 ms of handling has passed or the arrival queue is near full while
+           engine writes are blocked, plus the message in hand (see PumpLink's header), testing the deadline here
+           makes 8 s a real bound on the stall rather than a bound on the number of loop passes. */
         waited = ::GetTickCount() - t0;   /* unsigned subtraction: correct across the 49-day tick wrap */
         if (waited >= 8000) { timedOut = 1; break; }
         /* P7v (design-noworld-queue 1.4 step 2): a saturated arrival queue is a terminating condition, not a
@@ -14531,6 +15078,7 @@ void RedialClearAndDial(const std::string& addr, unsigned short port, int dialAg
    Joins. MAIN THREAD (it reads g_link, which SetStoreServer deletes): this tick, and config.cpp ConfigTitleTick's title re-dial. */
 int StoreLinkSockState()
 {
+    if (g_storeAuthStop != 0) return coopstore::kSockUpRefused;   /* refused for its password or the access list - answered in words, so neither re-dial dials until the player acts */
     int sock = coopstore::kSockDownOrFailed;
     if (g_link != 0)
     {
@@ -14558,7 +15106,7 @@ std::string StoreWorldAwayLever(const std::string& args)
     const std::string keepAddr = g_storeTargetAddr;
     const unsigned short keepPort = g_storeTargetPort;
     g_awayOn = 1; g_awayUntilMs = ::GetTickCount() + (DWORD)(sec * 1000); ++g_awayLevers;
-    DebugLog("[STORE] worldaway (TEST): this game's world-server link to " + keepAddr + ":" + N((long long)keepPort) + " is closed here and the re-dial held "
+    DebugLog("[STORE] worldaway (TEST): this game's world-server link to " + relaybridge::AddrForLog(keepAddr) + ":" + N((long long)keepPort) + " is closed here and the re-dial held "
              + N(sec) + " s - the world server sees this player leave; the world stays loaded (levers " + N(g_awayLevers) + ")");
     RedialClearAndDial(std::string(), 0, 0);
     g_storeTargetAddr = keepAddr;
@@ -14569,6 +15117,7 @@ std::string StoreWorldAwayLever(const std::string& args)
 
 void StoreRedialTick()
 {
+    if (g_quitSteamLinkClosed != 0) return;   /* the world-server link over Steam was closed at the quit: no re-dial */
     if (g_awayOn != 0)   /* TEST-ONLY `worldaway`: this game stays out of the world until its time is over, then dials at once */
     {
         if ((LONG)(::GetTickCount() - g_awayUntilMs) < 0) return;
@@ -14586,7 +15135,7 @@ void StoreRedialTick()
     {
         ++g_storeWrongWorldClosed;
         if (g_redialWrongWorldBackoff == 0)
-            ErrorLog("[STORE] W3-g: closing the link to the notebook at " + g_linkAddr + ":" + N((long long)g_linkPort) + " - it keeps"
+            ErrorLog("[STORE] W3-g: closing the link to the notebook at " + relaybridge::AddrForLog(g_linkAddr) + ":" + N((long long)g_linkPort) + " - it keeps"
                      " world '" + g_storeWrongWorldTheirs + "' and this game already opened world '" + StoreIndexWorld() + "'. The"
                      " address is kept and that notebook is dialled again every 30 s; each WELCOME decides again, so a notebook"
                      " restarted on world '" + StoreIndexWorld() + "' links. To join world '" + g_storeWrongWorldTheirs + "', restart Kenshi.");
@@ -14609,7 +15158,7 @@ void StoreRedialTick()
                                                  (unsigned int)(now - g_redialLastMs),
                                                  (unsigned int)(g_redialWrongWorldBackoff ? kStoreRedialWrongWorldMs : kStoreRedialMs),
                                                  (unsigned int)(now - g_redialDialAtMs),
-                                                 (unsigned int)kStoreConnectBudgetMs,
+                                                 relaybridge::ConnectBudgetMs(net::RelayRouteFor(g_storeTargetAddr), (unsigned int)kStoreConnectBudgetMs),   /* a Steam dial outlasts Steam's own first-connect timeout */
                                                  (unsigned int)kStoreWelcomeBudgetMs);
 
     /* B12-f (review-b12e L-1): a skip is booked when its CAUSE CHANGES, so the three numbers read as events.
@@ -14668,7 +15217,7 @@ void StoreRedialTick()
     if (!g_redialAnnounced)
     {
         g_redialAnnounced = 1;
-        DebugLog("[STORE] link is down - re-dialling " + addr + ":" + N((long long)port) + " every "
+        DebugLog("[STORE] link is down - re-dialling " + relaybridge::AddrForLog(addr) + ":" + N((long long)port) + " every "
                  + std::string(g_redialWrongWorldBackoff ? "30 s (the notebook refused this game's world; W3-g)" : "5 s") + " until it"
                  " answers (decision 52 needs the notebook back to replay the queue). ONE line per outage: the"
                  " attempts themselves are silent and are counted in storeRedial[] on the REPORT line, and the"
@@ -14706,6 +15255,10 @@ void StoreRedialTick()
 int                g_ownOn = 0;             /* the lever */
 int                g_ownFaultOff = 0;       /* a fault switched the writer off for this process */
 std::string        g_ownStoreName;          /* the open records store (T-251: the player's own, coopown::PlayerStoreName, or a test's); "" = none */
+std::string        g_ownStoreById;          /* T-36: the store OwnAutoStoreWant named for this world's id - the current name's, or one under an earlier name of the world; "" = none */
+/* T-36: the open records store is the one named for this world's id: its own.index and a save's mark may name the world by an earlier
+   name (the store's own name carries the id); the profile must still match (coopown::IdentityMatchesWorld). */
+static bool OwnStoreIsById() { return !g_ownStoreById.empty() && !g_ownStoreName.empty() && coopprof::SameFolderName(g_ownStoreById, g_ownStoreName); }
 int                g_ownStoreAuto = 0;      /* T-251: the open store is the player's own, opened by OwnAutoStoreTick (0 = a test's, or none) */
 int                g_ownAutoOnOwed = 0;     /* T-251: the writer was paused (another world/profile) or re-allowed - switch it on again when it fits */
 DWORD              g_ownAutoTryAt = 0;      /* T-251: the last failed open (retried every 2 s) */
@@ -15510,12 +16063,9 @@ void OwnCheckpointDrainNotes()   /* MAIN THREAD: what the writer thread did */
         }
     }
 }
-int OwnRepairRun(const char* why);   /* restore1c: defined below, the same namespace (coop) */
 void OwnRestore1bTick()
 {
     OwnCheckpointDrainNotes();   /* fold (item 4): the writer thread's checkpoint results */
-    OwnStoreSetStamp(g_wgNotebook.epoch, g_wgSeqSeen, g_wgNotebook.known);   /* restore1c: every record queued from now carries (epoch, nbSeq) */
-    if (g_repairApplyPending != 0 && OwnStoreIdleNow()) { g_repairApplyPending = 0; OwnRepairRun("a repair"); }   /* restore1c */
     if (g_ohCheckDue != 0 && !OwnHighRejudgeWaiting())   /* fold 2 (recheck item 4): a re-judge waits for this store's row (<= 10 s) */
     {
         g_ohCheckDue = 0;
@@ -15564,195 +16114,6 @@ std::string OwnRestore1bToken()
          + " ownHigh[sent,notebook,refused]=" + N(g_ohSent) + "," + N((long long)OwnHighNotebookFor(g_ohStore)) + "," + N(g_ohRefused)
          + " ownHighx[answers,malformed,blocked,lastSent,committed]=" + N(g_ohAnswers) + "," + N(g_ohMalformed) + "," + N((long long)g_ohBlocked)
          + "," + N((long long)g_ohLastSent) + "," + N((long long)OwnStoreCommittedHigh());
-}
-/* ======================= restore1c (design s4 "Repair a broken world", s5 Run W) - THE REPAIR ON THIS GAME =======================
-   MAIN THREAD. The host's action (the TEST verb `repairworld <save name>`; the panel button and its warning are on the hands-on
-   list) sends REPAIR {gR, sR} up; the notebook rolls its world back, answers every game and drops every link. Each game: forgets the
-   notebook records the repair undid (so no re-push re-creates them), learns the epoch, and applies the repair to its own records
-   (writer idle, or in the load gate before a world loads). A game whose world is RUNNING goes stale: writer off, nothing more read or
-   written on the link, "The host repaired the world - restart to continue". */
-long long RepairPurgeRecords(unsigned long long sR)
-{
-    long long n = 0;
-    std::vector<std::string> ids;
-    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it) if (it->second.seq > sR) ids.push_back(it->first);
-    for (size_t i = 0; i < ids.size(); ++i) { g_records.erase(ids[i]); g_facCheck.erase(ids[i]); ZoneSwapPublish(ids[i]); ++n; }
-    g_rpPurged += n;
-    return n;
-}
-void RepairGoStale(const std::string& why)
-{
-    if (g_repairStale != 0) return;
-    g_repairStale = 1; g_ownOn = 0;
-    const long long q = (long long)g_queue.size();
-    if (q > 0) { g_queue.clear(); QueueSave(); g_rpQueueDropped += q; }
-    ::InterlockedExchange(&g_relayLinkedCached, 0);
-    ErrorLog("[STORE] REPAIR: the host repaired the world (" + why + ") while this game's world was running - the records writer is OFF, this game's"
-             " own post-repair records are recycled, nothing more is read from or written to the notebook on this link, and "
-             + N(q) + " queued outage write(s) were dropped. " + std::string(restoreguard::RepairStaleWords()) + ".");
-    ProfileNotice(std::string(restoreguard::RepairStalePlayerWords()) + ".");
-}
-int OwnRepairRun(const char* why)
-{
-    if (g_repairRows.empty()) return 0;
-    OwnRepairResult r;
-    const std::string world = coopworld::WorldFolderName(coopworld::WorldOrDefault(ConfigWorldKey(), 0));
-    OwnStoreRepairApply(g_repairRows, world, &r);
-    if (r.rc == 1)
-    {
-        g_rpOwnRecycled += r.recycled; g_rpFromCheckpoint += r.fromCheckpoint; g_rpDropped += r.dropped; g_rpApplied += r.applied; g_rpLedgerCut += r.ledgerRecycled;
-        if (r.maxSeq > g_ownSeq) g_ownSeq = r.maxSeq;
-        g_ohLastSent = 0ULL; g_ohCheckDue = 1;
-        DebugLog("[OWNSAVE] REPAIR applied (" + std::string(why) + ") to records store '" + g_ohStore + "': " + N((long long)r.applied) + " repair(s), up to epoch "
-                 + N((long long)r.epoch) + " - " + N((long long)r.recycled) + " squad record(s) to the Recycle Bin, " + N((long long)r.fromCheckpoint)
-                 + " taken from a checkpoint, " + N((long long)r.dropped) + " dropped (no checkpoint at the restore point"
-                 + (r.copyFailed != 0 ? ", " + N((long long)r.copyFailed) + " of them because the checkpoint copy failed" : std::string()) + "); ledger "
-                 + (r.ledgerFromCheckpoint != 0 ? "from its checkpoint" : (r.ledgerRecycled != 0 ? "to the Recycle Bin" : "untouched")));
-    }
-    else if (r.rc < -1)
-    {
-        ++g_rpApplyFailed;
-        ErrorLog("[OWNSAVE] REPAIR NOT applied (" + std::string(why) + ") to records store '" + g_ohStore + "': "
-                 + (r.rc == -2 ? std::string("the records writer is busy - tried again") : r.rc == -3 ? std::string("this drive's Recycle Bin cannot take the undone records (nothing was touched; nothing is ever deleted for good)")
-                                                                                        : std::string("a file step failed (see the records folder)")));
-    }
-    return r.rc;
-}
-int OwnRepairGate(const std::string& name)
-{
-    if (g_repairStale != 0)
-    {
-        ++g_rpGateRefused;
-        ErrorLog("[STORE] LOAD REFUSED (repaired - restart): '" + name + "' - " + std::string(restoreguard::RepairStaleWords()) + ".");
-        g_loadRefuseLine = std::string(restoreguard::RepairStalePlayerWords()) + ".";   /* ui1 */
-        ProfileNotice(std::string(restoreguard::RepairStalePlayerWords()) + ".");
-        return 1;
-    }
-    if (g_repairRows.empty()) return 0;
-    const int rc = OwnRepairRun("load gate");
-    if (rc == 1) g_repairApplyPending = 0;
-    if (rc >= -1) return 0;
-    ++g_rpGateRefused;
-    const std::string words = rc == -2 ? std::string("This game's records are still being brought back to the repaired world - try the load again in a few seconds")
-                                       : std::string("This game's records could not be brought back to the repaired world (see the log) - nothing was deleted");
-    ErrorLog("[STORE] LOAD REFUSED (repair not applied): '" + name + "' - " + words + ". gateRefused=" + N(g_rpGateRefused));
-    const std::string playerWords = rc == -2 ? std::string("Updating your save for the restored world... Try again in a few seconds")
-                                             : std::string("Your save couldn't be updated for the restored world. Nothing was deleted - tell the host");   /* ui1: the player's words; the log keeps the old */
-    g_loadRefuseLine = playerWords + ".";
-    ProfileNotice("You could not load that save. " + playerWords + ".");
-    return 1;
-}
-void RepairOnNotebook(const std::vector<char>& payload)
-{
-    restoreguard::RepairMsg m;
-    if (!restoreguard::DecodeRepairMsg(payload.empty() ? 0 : &payload[0], payload.size(), &m) || m.kind != restoreguard::kRpDown) { ++g_rpMalformed; return; }
-    const bool mine = g_rwPhase == 2 && m.gen == g_rwGen && m.seq == g_rwSeq && m.profile == ProfileForKey();
-    if (m.result != restoreguard::kRpOk)
-    {
-        if (mine) g_rwResult = (int)m.result;
-        ErrorLog("[STORE] REPAIR REFUSED by the notebook: restore to worldGen=" + N((long long)m.gen) + " nbSeq=" + N((long long)m.seq) + " - "
-                 + restoreguard::RepairResultName(m.result) + ". Nothing was changed.");
-        return;
-    }
-    if (mine) { g_rwResult = 0; g_rwEpoch = m.epoch; g_rwWelcomesAt = g_rpWelcomes; }
-    restoreguard::RepairRow row; row.epoch = m.epoch; row.gen = m.gen; row.seq = m.seq; row.profile = m.profile;
-    g_rpNotebookRecycled = (long long)m.recycled;
-    if (!restoreguard::RepairLearn(&g_repairRows, row)) return;   /* already known */
-    ++g_rpSeen;
-    const long long purged = RepairPurgeRecords(m.seq);
-    g_ohNotebook.clear(); g_ohLastSent = 0ULL;   /* the notebook cleared its records numbers - only the repair lowers them */
-    if (m.epoch > g_wgNotebook.epoch) g_wgNotebook.epoch = m.epoch;
-    if (m.profile == ProfileForKey()) { g_wgNotebook.gen = m.gen; g_wgAckedGen = m.gen; g_wgPendGen = 0; g_wgPendSeq = 0ULL; }   /* the repairing profile's number is R's again */
-    DebugLog("[STORE] REPAIR: the host repaired the world - epoch " + N((long long)m.epoch) + ", back to world save gen=" + N((long long)m.gen) + " nbSeq="
-             + N((long long)m.seq) + " (profile " + m.profile + "); the notebook recycled " + N((long long)m.recycled) + " record(s); this game forgot "
-             + N(purged) + " undone record(s)" + (mine ? std::string(" - THIS game asked for it") : std::string()));
-    if (!mine && GameplayRunning()) RepairGoStale("REPAIR broadcast");
-    g_repairApplyPending = 1;
-}
-void RepairOnWelcome(const std::vector<char>& payload)
-{
-    ++g_rpWelcomes;
-    coopstore::StoreWelcome w; restoreguard::WorldMsg m; std::vector<restoreguard::RepairRow> rows;
-    if (!coopstore::StoreWelcomeDecode(payload, &w) || !w.hasWorldGen || w.worldTail.empty() || !restoreguard::DecodeWorldMsg(&w.worldTail[0], w.worldTail.size(), &m)) return;
-    if (!restoreguard::DecodeRepairTail(&w.worldTail[0], w.worldTail.size(), &rows)) { ++g_rpMalformed; return; }
-    const bool baseline = g_rpBaselineSet == 0;   /* this process's first WELCOME: its record index came from the notebook's own folder */
-    g_rpBaselineSet = 1;
-    int fresh = 0; long long purged = 0;
-    for (size_t i = 0; i < rows.size(); ++i)
-    {
-        if (!restoreguard::RepairLearn(&g_repairRows, rows[i])) continue;
-        ++fresh; ++g_rpSeen;
-        if (!baseline) purged += RepairPurgeRecords(rows[i].seq);   /* a relink after a repair this game missed: no re-push of undone records */
-    }
-    if (fresh > 0)
-    {
-        g_ohNotebook.clear(); g_ohLastSent = 0ULL;
-        DebugLog("[STORE] REPAIR: this WELCOME names " + N((long long)fresh) + " repair(s) new to this game (latest epoch " + N((long long)g_repairRows.back().epoch)
-                 + ", back to nbSeq=" + N((long long)g_repairRows.back().seq) + "); " + N(purged) + " undone record(s) forgotten; own records are repaired before any world loads");
-        if (!baseline && GameplayRunning()) RepairGoStale("a WELCOME after a repair");
-    }
-    if (!g_repairRows.empty()) g_repairApplyPending = 1;
-}
-int RepairWorldCommand(const std::string& name, std::string* status)
-{
-    const DWORD now = ::GetTickCount();
-    if (name != g_rwName || g_rwPhase == 0) { g_rwName = name; g_rwPhase = 1; g_rwAt = now; g_rwResult = -1; g_rwEpoch = 0; }
-    if (g_rwPhase == 1)
-    {
-        if (GameplayRunning())
-        {
-            g_rwPhase = 0; ErrorLog("[STORE] repairworld REFUSED: a world is running - leave it first (the repair rolls back the world this game would still hold)");
-            *status = "error repairworld world-running"; return 1;
-        }
-        if (!LinkUp())
-        {
-            if ((DWORD)(now - g_rwAt) < 45000u) return 0;
-            g_rwPhase = 0; ErrorLog("[STORE] repairworld REFUSED: no notebook link after 45 s"); *status = "error repairworld no-link"; return 1;
-        }
-        if (!g_storeAuthority) { g_rwPhase = 0; ErrorLog("[STORE] repairworld REFUSED: only the world's operator (the host) repairs it"); *status = "error repairworld not-operator"; return 1; }
-        std::string k, prof; restoreguard::SaveStamp st;
-        if (!ReadWorldKeyFile(JoinPathA(SaveRootDefault(), name), &k, &prof, &st) || !st.hasGen)
-        { g_rwPhase = 0; ErrorLog("[STORE] repairworld REFUSED: '" + name + "' carries no world save number (not an operator-stamped save)"); *status = "error repairworld no-stamp"; return 1; }
-        if (prof != ProfileForKey())
-        { g_rwPhase = 0; ErrorLog("[STORE] repairworld REFUSED: '" + name + "' belongs to profile " + prof + " and this game plays " + ProfileForKey()); *status = "error repairworld other-profile"; return 1; }
-        restoreguard::RepairMsg m; m.kind = restoreguard::kRpUp; m.gen = st.gen; m.seq = st.seq; m.profile = prof;
-        std::vector<char> b; restoreguard::EncodeRepairMsg(&b, m);
-        if (!g_link->Send(0, (net::MsgType)kStoreMsgRepair, &b[0], b.size(), net::CH_RELIABLE)) return 0;
-        g_rwGen = st.gen; g_rwSeq = st.seq; g_rwPhase = 2; g_rwAt = now; g_rwResult = -1;
-        ErrorLog("[STORE] repairworld: asked the notebook to roll the WHOLE world back to '" + name + "' (worldGen=" + N((long long)st.gen) + " nbSeq=" + N((long long)st.seq)
-                 + ") - every player loses everything since that save (TEST verb; the panel's warning is on the hands-on list)");
-        return 0;
-    }
-    if (g_rwPhase == 2)
-    {
-        if (g_rwResult < 0)
-        {
-            if ((DWORD)(now - g_rwAt) < 30000u) return 0;
-            g_rwPhase = 0; ErrorLog("[STORE] repairworld: the notebook did not answer in 30 s"); *status = "error repairworld no-answer"; return 1;
-        }
-        if (g_rwResult != 0) { g_rwPhase = 0; *status = std::string("error repairworld ") + restoreguard::RepairResultName((unsigned int)g_rwResult); return 1; }
-        g_rwPhase = 3; g_rwAt = now;
-        return 0;
-    }
-    if (g_rwPhase == 3)   /* the notebook drops every link after a repair: wait for the new WELCOME, then load */
-    {
-        const bool relinked = LinkUp() && g_rpWelcomes > g_rwWelcomesAt && !OwnHighRejudgeWaiting();
-        if (!relinked && (DWORD)(now - g_rwAt) < 45000u) return 0;
-        g_rwPhase = 0; ++g_rwDone;
-        DebugLog("[STORE] repairworld: the world is repaired (epoch " + N((long long)g_rwEpoch) + ")" + (relinked ? std::string(" and the link is back") : std::string(" - no new WELCOME in 45 s"))
-                 + " - loading '" + name + "' now");
-        return 2;
-    }
-    g_rwPhase = 0; *status = "error repairworld state"; return 1;
-}
-std::string RepairReportToken()
-{
-    const unsigned int rg = g_repairRows.empty() ? 0u : g_repairRows.back().gen;
-    return " repair[epoch,restoreGen,notebookRecycled,seen,ownRecycled,fromCheckpoint,stale]=" + N((long long)g_wgNotebook.epoch) + "," + N((long long)rg)
-         + "," + N(g_rpNotebookRecycled) + "," + N(g_rpSeen) + "," + N(g_rpOwnRecycled) + "," + N(g_rpFromCheckpoint) + "," + N((long long)g_repairStale)
-         + " repairx[dropped,applied,applyFailed,purged,gateRefused,refusedUndone,malformed,queueDropped,ledgerCut,verbDone]=" + N(g_rpDropped) + "," + N(g_rpApplied)
-         + "," + N(g_rpApplyFailed) + "," + N(g_rpPurged) + "," + N(g_rpGateRefused) + "," + N(g_rpRefusedUndone) + "," + N(g_rpMalformed) + "," + N(g_rpQueueDropped)
-         + "," + N(g_rpLedgerCut) + "," + N(g_rwDone);
 }
 /* THE RECORDS STORES' FOLDER: <data folder>\\players, or <save root>\\Shared Wastelands\\players without a data folder; "" = neither.
    One construction for opening a store and for a deleted world's leftovers. */
@@ -15808,7 +16169,6 @@ int OwnStoreChoose(const std::string& name, bool isAuto, std::string* status)
              + " cfgOwnsave=" + N(ConfigOwnSave()) + " on=" + N(g_ownOn)
              + (isAuto ? " (T-251: the player's own store for profile save folder '" + g_profSaveFolder + "', opened by itself)" : std::string(" (chosen by ownsave)")));
     g_ohStore = name; g_ohLastSent = 0ULL; g_ohBlocked = 0; g_ohRejudge = 0;   /* restore1b1: this store's records are judged against the notebook's number for it */
-    if (!g_repairRows.empty()) g_repairApplyPending = 1;   /* restore1c: a store opened after a repair applies it (writer idle) */
     if (OwnHighVerdictNow() == restoreguard::kOhRefuseOlderRecords)
     {
         OwnHighRefuseNow(isAuto ? "the player's own store" : "ownsave store");
@@ -15823,7 +16183,6 @@ int OwnSaveCommand(const std::string& arg, std::string* status)
     if (arg == "on")
     {
         if (g_ownStoreName.empty()) { ErrorLog("[OWNSAVE] ownsave on REFUSED: no records store open - a multiplayer world opens the player's own; a test runs `ownsave <name>`"); *status = "error ownsave no-store"; return 1; }
-        if (g_repairStale != 0) { ErrorLog("[OWNSAVE] ownsave on REFUSED: " + std::string(restoreguard::RepairStaleWords())); *status = "error ownsave repaired-restart"; return 1; }   /* restore1c */
         if (g_ownFaultOff) { ErrorLog("[OWNSAVE] ownsave on REFUSED: a fault switched the writer off for this process (" + g_ownFaultArm + ")"); *status = "error ownsave faulted"; return 1; }
         if (!g_ownOn) { g_ownOn = 1; g_ownOnAt = ::GetTickCount(); g_ownBytesSinceOn = 0; }
         std::string mods = "(no address)";
@@ -15900,14 +16259,14 @@ void OwnAutoStoreTick()
     }
     const bool live = OwnWorldLive();
     if (g_ownAutoOnOwed != 0 && g_ownStoreAuto != 0 && !want.empty() && g_ownStoreName == want && live && ConfigOwnSave() == 1
-        && g_ownFaultOff == 0 && g_repairStale == 0)
+        && g_ownFaultOff == 0)
     {
         g_ownAutoOnOwed = 0;
         if (!g_ownOn) { g_ownOn = 1; g_ownOnAt = ::GetTickCount(); g_ownBytesSinceOn = 0; }
         DebugLog("[OWNSAVE] the player's records store '" + want + "' is written again (records writer on)");
         return;
     }
-    const bool heldOff = g_ownFaultOff != 0 || g_repairStale != 0 || (g_ohBlocked != 0 && g_ohStore == want)
+    const bool heldOff = g_ownFaultOff != 0 || (g_ohBlocked != 0 && g_ohStore == want)
                          || coopown::AutoStoreLoadHeld(g_ownAutoLoadHeld);   /* T-251 fold 2: a failed load-time open - never opened mid-world over newer records */
     if (!coopown::AutoStoreOpenWanted(ConfigOwnSave() == 1, folder, heldOff, want, g_ownStoreName, g_ownStoreAuto != 0)) return;   /* fold item 1: no live world needed */
     const DWORD now = ::GetTickCount();
@@ -16401,7 +16760,7 @@ int OwnBuildLoadBase()
     bool haveHead = false; std::string hw, hp;
     if (!OwnReadIndexLines(sdir, &lines, &haveHead, &hw, &hp) && U8GetFileAttributes((sdir + "\\" + coopown::IndexFile()).c_str()) != INVALID_FILE_ATTRIBUTES) return 0;
     std::vector<coopown::BuildRow> rows; std::string why;
-    if ((haveHead && !coopown::IdentityMatches(hw, hp, ConfigWorldKey(), ProfileForKey())) || (!haveHead && !lines.empty()))
+    if ((haveHead && !coopown::IdentityMatchesWorld(hw, hp, ConfigWorldKey(), ProfileForKey(), OwnStoreIsById())) || (!haveHead && !lines.empty()))
     {
         ++g_ownBuildBaseOther;
         why = "the index names world '" + hw + "' profile '" + hp + "', not this one - an empty base";
@@ -16524,7 +16883,7 @@ int OwnHelpLoadBase()
     if (!OwnReadIndexLines(sdir, &lines, &haveHead, &hw, &hp) && U8GetFileAttributes((sdir + "\\" + coopown::IndexFile()).c_str()) != INVALID_FILE_ATTRIBUTES) return 0;
     std::vector<coopown::HelpRecRow> rows;
     std::string why = "none";
-    if ((haveHead && !coopown::IdentityMatches(hw, hp, ConfigWorldKey(), ProfileForKey())) || (!haveHead && !lines.empty()))
+    if ((haveHead && !coopown::IdentityMatchesWorld(hw, hp, ConfigWorldKey(), ProfileForKey(), OwnStoreIsById())) || (!haveHead && !lines.empty()))
         why = "the index names world '" + hw + "' profile '" + hp + "', not this one - no row of this one";
     else
     {
@@ -16636,7 +16995,7 @@ void OwnRestoreArmAll(const char* why)
     g_ownRsPending = 1; g_ownRsWhyAll = why;
     g_ownBuildRsState = std::string("refused:") + why;   /* mmo8a: no building is re-made either */
 }
-void OwnRestoreArm(int rule, unsigned long long markSeq, long long saveTime, const std::vector<coopown::IndexLine>& lines, const std::string& sdir)
+void OwnRestoreArm(int rule, unsigned long long markSeq, long long saveTime, const std::vector<coopown::IndexLine>& lines, const std::string& sdir, int allRuleCat = -1)
 {
     OwnRestoreArmReset();
     if (g_ownStoreName.empty()) return;
@@ -16645,17 +17004,18 @@ void OwnRestoreArm(int rule, unsigned long long markSeq, long long saveTime, con
     for (int c = 0; c < coopown::kCatCount; ++c)
     {
         const std::string key = coopown::CatKey(c);
+        const int cr = (c == allRuleCat) ? (int)coopown::kRuleAll : rule;   /* a category the import does not carry is laid back whatever its age */
         bool have = false; coopown::IndexLine l;
         for (size_t i = 0; i < lines.size(); ++i) if (lines[i].key == key) { l = lines[i]; have = true; }
         std::vector<char> b;
         bool ok = false;
-        if (have && coopown::OverlayCandidate(rule, markSeq, saveTime, l.seq, l.writtenAt))
+        if (have && coopown::OverlayCandidate(cr, markSeq, saveTime, l.seq, l.writtenAt))
         {
             ok = ReadFileBytes(sdir + "\\" + coopown::RecFile(key), &b) && !b.empty() && (long long)b.size() == l.len && coopstore::Crc32(&b[0], b.size()) == l.crc;
             if (!ok)   /* the design's CRC rule: the previous version when the live file is not the indexed one */
                 ok = ReadFileBytes(sdir + "\\" + coopown::PrevFile(key), &b) && !b.empty() && (long long)b.size() == l.len && coopstore::Crc32(&b[0], b.size()) == l.crc;
         }
-        g_ownRsGate[c] = coopown::RestoreGate(have, rule, markSeq, saveTime, l.seq, l.writtenAt, ok);
+        g_ownRsGate[c] = coopown::RestoreGate(have, cr, markSeq, saveTime, l.seq, l.writtenAt, ok);
         if (g_ownRsGate[c] == coopown::kRsRestore) { g_ownRsBytes[c].swap(b); g_ownRsSeq[c] = l.seq; }
     }
     {   /* mmo8a: pp.build - read and CRC-checked here, NOT judged by the mark rule (a row stays until its key is retired, so the
@@ -17052,6 +17412,195 @@ std::string StoreResearchQueueTech(const std::string& sid, std::string* name, st
     return std::string();
 }
 
+/* ==================================================================================================================
+   TEST-ONLY `carryread [<tag>] [full]` / `carryset ...` (src/common/carrycheck.h): what RESET WORLD carries for this player -
+   research, map knowledge, faction standings - read so that a line written before the reset and one written after it compare
+   exactly, and one change of each made in the first world, so the two reads do not compare a new game's defaults with
+   themselves. The carry itself is the engine's IMPORT GAME at the reset; these levers only read it and, before the reset, move
+   it. MAIN THREAD (the command channel).
+     research   the finished techs as Research::save 0x8301E0 writes them ("finished<i>"; Research* = *(PI+0x38), the set at
+                Research+0xF0) - the read the pp.research record makes (StoreResearchFinished).
+     map        each town's discovered / explored byte, TownBase+0x180 / +0x181, over the TownList (OwnMapRead) - all the map
+                knowledge the engine keeps for its player; a save carries exactly these two bytes per town.
+     standings  this player faction's standing with every NPC faction, both directions (RelationsOwnRecord, the pp.faction read).
+   carryset research <techStringID|any>: the engine's Research::setResearched through the hooked entry, as this player's own
+     finish (StoreResearchApply - the `team research finish` road, with its "Research complete" toast and sound); any = the
+     first RESEARCH record by stringID that this game has neither finished nor queued.
+   carryset map <townStringID|town name|any> [explored]: the town's own setters, vt+0x330 (discovered) and with `explored` also
+     vt+0x348 - the calls the engine's discovery sweep 0x92E7E0 makes on a town a player's character comes near (the sweep's
+     "Discovered" toast is not shown); any = the first undiscovered town by stringID.
+   carryset standing <faction stringID or name>: `relation change crime` - the engine's affectRelations(-20) on that faction's
+     relations towards this player's faction.
+   ================================================================================================================== */
+const size_t kCarryRowsMax = 40;   /* standings rows printed without `full` */
+const size_t kCarryTownVtDiscovered = 0x330, kCarryTownVtExplored = 0x348;   /* TownBase vtable: setDiscovered / setExplored (loadStateDiscovery 0x372420, the sweep 0x92E7E0) */
+typedef void (*CarryTownByteFn)(void* town, char value);
+int CarryTownNamePod(void* t, char* name, int cap)
+{
+    __try
+    {
+        name[0] = 0;
+        if (!Plaus(t)) return 0;
+        void* gd = ((RootObjectBase*)t)->getRecord();
+        if (!Plaus(gd)) return 0;
+        return CopyStdStringPod((const char*)gd + 0x28, name, cap);   /* GameData name +0x28 */
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* one of the town's own byte setters called with 1, then both bytes read back */
+int CarryTownSetPod(void* t, size_t slot, unsigned char* d, unsigned char* e)
+{
+    __try
+    {
+        if (!Plaus(t)) return 0;
+        void** vt = *(void***)t;
+        if (!Plaus(vt) || !Plaus(vt[slot / sizeof(void*)])) return 0;
+        ((CarryTownByteFn)vt[slot / sizeof(void*)])(t, (char)1);
+        *d = *((const unsigned char*)t + 0x180); *e = *((const unsigned char*)t + 0x181);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void CarryLog(const std::string& tag, const std::string& s) { DebugLog("[CARRY] " + tag + " " + s); }
+std::string CarryResearchRead(const std::string& tag, int full)
+{
+    std::vector<std::string> sids; long long queued = 0; std::string why;
+    if (!StoreResearchFinished(&sids, &queued, &why)) { CarryLog(tag, "research UNREADABLE (" + why + ")"); return "research=unreadable(" + why + ")"; }
+    std::sort(sids.begin(), sids.end());
+    const std::string sum = swcarry::CarryHex(swcarry::CarrySum(sids));
+    CarryLog(tag, "research finished=" + N((long long)sids.size()) + " sum=" + sum + " queued=" + N(queued) + " list=" + swcarry::CarryList(sids));
+    if (full) for (size_t i = 0; i < sids.size(); ++i) CarryLog(tag, "research row " + sids[i] + " (" + StoreResearchNameOf(sids[i]) + ")");
+    return "research=" + N((long long)sids.size()) + "/" + sum;
+}
+std::string CarryMapRead(const std::string& tag, int full)
+{
+    std::vector<coopown::MapRow> rows; std::string why;
+    if (!OwnMapRead(&rows, 0, &why)) { CarryLog(tag, "map UNREADABLE (" + why + ")"); return "map=unreadable(" + why + ")"; }
+    std::vector<std::string> lines; long long d = 0, e = 0;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (rows[i].disc != 0) ++d;
+        if (rows[i].expl != 0) ++e;
+        if (rows[i].disc != 0 || rows[i].expl != 0) lines.push_back(swcarry::CarryMapLine(rows[i].sid, rows[i].disc, rows[i].expl));
+    }
+    std::sort(lines.begin(), lines.end());
+    const std::string sum = swcarry::CarryHex(swcarry::CarrySum(lines));
+    CarryLog(tag, "map towns=" + N((long long)rows.size()) + " discovered=" + N(d) + " explored=" + N(e) + " sum=" + sum
+             + " (TownBase+0x180 discovered / +0x181 explored over the TownList; the sum over the towns with either set)");
+    if (full) for (size_t i = 0; i < lines.size(); ++i) CarryLog(tag, "map row " + lines[i]);
+    return "map=" + N(d) + "/" + N(e) + "/" + sum;
+}
+std::string CarryStandingsRead(const std::string& tag, int full)
+{
+    coopown::FactionRec f; std::string why;
+    if (!RelationsOwnRecord(&f, &why)) { CarryLog(tag, "standings UNREADABLE (" + why + ")"); return "standings=unreadable(" + why + ")"; }
+    std::vector<std::string> lines, shown; long long nz = 0;
+    for (size_t i = 0; i < f.rows.size(); ++i)
+    {
+        const coopown::FacRow& r = f.rows[i];
+        swcarry::CarryFac c;
+        c.sid = r.sid; c.rel = r.rel; c.trust = r.trust; c.trustNeg = r.trustNeg; c.relBack = r.relBack; c.trustBack = r.trustBack;
+        c.trustNegBack = r.trustNegBack; c.flags = r.flags; c.flagsBack = r.flagsBack;
+        lines.push_back(swcarry::CarryFacSumLine(c));
+        const int z = swcarry::CarryFacNonZero(c);
+        if (z) ++nz;
+        if (full || (z && shown.size() < kCarryRowsMax)) shown.push_back(swcarry::CarryFacText(c));
+    }
+    const std::string sum = swcarry::CarryHex(swcarry::CarrySum(lines));
+    CarryLog(tag, "standings faction='" + f.name + "' factions=" + N((long long)f.rows.size()) + " sum=" + sum + " nonzero=" + N(nz)
+             + " rowsShown=" + N((long long)shown.size()) + (full ? " (every row)" : " (rows with a value or flag not zero)"));
+    for (size_t i = 0; i < shown.size(); ++i) CarryLog(tag, "standings row " + shown[i]);
+    return "standings=" + N((long long)f.rows.size()) + "/" + sum;
+}
+std::string CarryReadCommand(const std::string& args)
+{
+    std::string tag; int full = 0;
+    if (!swcarry::CarryReadParse(args, &tag, &full)) return "error carryread usage: carryread [<tag>] [full] (tag: 1-32 of A-Z a-z 0-9 _ - .)";
+    if (!GameplayRunning() || EngineWritesBlocked()) return "error carryread: no world running";
+    const std::string r = CarryResearchRead(tag, full), m = CarryMapRead(tag, full), s = CarryStandingsRead(tag, full);
+    return "ok carryread " + tag + " " + r + " " + m + " " + s;
+}
+/* every RESEARCH (0x15) record's stringID in this game's data */
+void CarryResearchSids(std::vector<std::string>* out)
+{
+    out->clear();
+    if (!Plaus(coop::GameWorldPtr())) return;
+    lektor<GameData*> list;
+    coop::GameWorldPtr()->gamedata.listRecordsOfType(list, (itemType)0x15);
+    char sid[256];
+    for (unsigned i = 0; i < (unsigned)list.size(); ++i)
+        if (OwnTechSidPod(list[i], sid, (int)sizeof(sid)) == 1 && sid[0] != 0) out->push_back(std::string(sid));
+}
+std::string CarrySetResearch(const std::string& want)
+{
+    std::string sid = want;
+    std::vector<std::string> before; long long q0 = 0; std::string w0;
+    if (!StoreResearchFinished(&before, &q0, &w0)) return "error carryset research: the finished techs are unreadable (" + w0 + ")";
+    if (want == "any")
+    {
+        std::vector<std::pair<std::string, float> > queue; std::string qt, qw;
+        if (!StoreResearchQueue(&queue, &qt, &qw)) return "error carryset research: the queue is unreadable (" + qw + ")";
+        std::set<std::string> skip(before.begin(), before.end());
+        for (size_t i = 0; i < queue.size(); ++i) skip.insert(queue[i].first);
+        std::vector<std::string> all;
+        CarryResearchSids(&all);
+        std::sort(all.begin(), all.end());
+        sid.clear();
+        for (size_t i = 0; i < all.size(); ++i) if (skip.count(all[i]) == 0) { sid = all[i]; break; }
+        if (sid.empty()) return "error carryset research any: every RESEARCH record here (" + N((long long)all.size()) + ") is finished or queued";
+    }
+    std::string name, why; int route = 0;
+    const int k = StoreResearchApply(sid, true, &name, &why, &route);
+    std::vector<std::string> after; long long q1 = 0; std::string w1;
+    const bool readAfter = StoreResearchFinished(&after, &q1, &w1);
+    DebugLog("[CARRY] set research " + sid + " (" + name + ") through the engine's Research::setResearched (the hooked entry, as this player's own finish) - "
+             + (k == 1 ? std::string("applied") : "NOT applied (" + why + ")") + "; finished " + N((long long)before.size()) + " -> "
+             + (readAfter ? N((long long)after.size()) : "unreadable (" + w1 + ")"));
+    return k == 1 ? "ok carryset research " + sid : "error carryset research: " + why;
+}
+std::string CarrySetMap(const std::string& want, int explored)
+{
+    std::vector<coopown::MapRow> rows; std::vector<void*> towns; std::string why;
+    if (!OwnMapRead(&rows, &towns, &why)) return "error carryset map: the town list is unreadable (" + why + ")";
+    int pick = -1;
+    if (want == "any")
+    {
+        for (size_t i = 0; i < rows.size(); ++i) if (rows[i].disc == 0 && (pick < 0 || rows[i].sid < rows[pick].sid)) pick = (int)i;
+        if (pick < 0) return "error carryset map any: every town is discovered here";
+    }
+    else
+    {
+        for (size_t i = 0; i < rows.size(); ++i)
+            if (rows[i].sid == want) { if (pick >= 0) return "error carryset map: two towns hold the stringID '" + want + "' - name one by its name"; pick = (int)i; }
+        char nm[160];
+        if (pick < 0)
+            for (size_t i = 0; i < towns.size(); ++i)
+                if (CarryTownNamePod(towns[i], nm, (int)sizeof(nm)) == 1 && want == nm) { if (pick >= 0) return "error carryset map: two towns are named '" + want + "'"; pick = (int)i; }
+        if (pick < 0) return "error carryset map: no town '" + want + "' here by stringID or name";
+    }
+    char name[160]; name[0] = 0;
+    CarryTownNamePod(towns[pick], name, (int)sizeof(name));
+    const int d0 = rows[pick].disc, e0 = rows[pick].expl;
+    unsigned char d = 0, e = 0;
+    int r = CarryTownSetPod(towns[pick], kCarryTownVtDiscovered, &d, &e);
+    if (r == 1 && explored) r = CarryTownSetPod(towns[pick], kCarryTownVtExplored, &d, &e);
+    DebugLog("[CARRY] set map " + rows[pick].sid + " '" + name + "' through the town's own setDiscovered vt+0x330" + (explored ? " and setExplored vt+0x348" : "")
+             + (r == 1 ? std::string(" - discovered ") + N((long long)d0) + " -> " + N((long long)d) + " explored " + N((long long)e0) + " -> " + N((long long)e)
+                       : std::string(r == -1 ? " - FAULTED" : " - the town or its vtable did not read")));
+    if (r != 1) return r == -1 ? "error carryset map: the setter faulted" : "error carryset map: the town did not read";
+    return d != 0 ? "ok carryset map " + rows[pick].sid : "error carryset map: the discovered byte did not move";
+}
+std::string CarrySetCommand(const std::string& args)
+{
+    std::string target; int explored = 0;
+    const int k = swcarry::CarrySetParse(args, &target, &explored);
+    if (k == swcarry::kCarrySetBad) return "error carryset usage: carryset research <techStringID|any> | map <townStringID|town name|any> [explored] | standing <faction stringID or name>";
+    if (!GameplayRunning() || EngineWritesBlocked()) return "error carryset: no world running";
+    if (k == swcarry::kCarrySetResearch) return CarrySetResearch(target);
+    if (k == swcarry::kCarrySetMap) return CarrySetMap(target, explored);
+    return RelationChangeLever("crime", target);
+}
+
 int OwnPokeMoney(int money, std::string* status)
 {
     if (g_ownStoreName.empty()) { ErrorLog("[OWNSAVE] ownsave poke money REFUSED: no records store open (TEST verb)"); *status = "error ownsave no-store"; return 1; }
@@ -17370,14 +17919,215 @@ void OwnMarkSaveTick()
    worlds of one name keep apart stores ("" without a profile folder). A world upgraded to an id takes over its store from before ids:
    renamed once (same drive) when the id-named one is missing and the old one is not open; if that rename fails the old store is used
    for this session, logged. MAIN THREAD. */
+/* T-36: A SYMBOLIC LINK OR A MOUNT POINT (junction) - the one kind of reparse point the store copy skips. Any other reparse point (a
+   cloud placeholder file or folder: OneDrive's carry one) is an ordinary file or folder here, so it is copied, or the copy fails
+   loudly. The tag is read from the entry itself (FindFirstFileW on its exact path gives it in dwReserved0); an entry that cannot be
+   queried is not called a link. MAIN THREAD. */
+static bool CarryIsLink(const std::string& path)
+{
+    WIN32_FIND_DATAW w;
+    HANDLE h = ::FindFirstFileW(U8W(path.c_str()).c_str(), &w);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    ::FindClose(h);
+    return (w.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && (w.dwReserved0 == IO_REPARSE_TAG_SYMLINK || w.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT);
+}
+/* T-36: ONE RECORDS STORE COPIED for the reset world - every file and folder under from into to (made here) but the buildings and help records (coopown::CarryFileDropped), own.index without their lines (coopown::CarryIndexText); a symbolic link or
+   junction (CarryIsLink) is neither followed nor copied, counted in *links. false = stopped: *failPath and *err say where. MAIN THREAD. */
+static bool ResetCarryCopyTree(const std::string& from, const std::string& to, int depth, long long* files, long long* links, std::string* failPath, DWORD* err,
+                               long long* dropped, std::vector<std::string>* droppedKeys)
+{
+    if (depth > 8) { *failPath = from; *err = 0; return false; }   /* a store is two levels deep (its checkpoints); deeper is not a store */
+    if (!U8CreateDirectory(to.c_str(), 0))
+    {
+        const DWORD e = ::GetLastError();
+        if (e != ERROR_ALREADY_EXISTS) { *failPath = to; *err = e; return false; }
+    }
+    U8FindData fd;
+    HANDLE h = U8FindFirstFile((from + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { *failPath = from; *err = ::GetLastError(); return false; }
+    bool ok = true;
+    do
+    {
+        const std::string n = fd.cFileName;
+        if (n == "." || n == "..") continue;
+        const std::string a = from + "\\" + n, b = to + "\\" + n;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && CarryIsLink(a)) { ++*links; continue; }
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) ok = ResetCarryCopyTree(a, b, depth + 1, files, links, failPath, err, dropped, droppedKeys);
+        else if (coopown::CarryFileDropped(n)) ++*dropped;   /* the buildings and help records stay with the world as it was */
+        else if (_stricmp(n.c_str(), coopown::IndexFile()) == 0)
+        {   /* the index without the lines of the records left behind, so it names only records the copy holds */
+            std::vector<char> ib;
+            if (!ReadFileBytes(a, &ib)) { *failPath = a; *err = ::GetLastError(); ok = false; }
+            else
+            {
+                const std::string keptIndex = coopown::CarryIndexText(std::string(ib.begin(), ib.end()), droppedKeys);
+                if (WriteFileBytes(b, std::vector<char>(keptIndex.begin(), keptIndex.end()), true)) ++*files;
+                else { *failPath = b; *err = ::GetLastError(); ok = false; }
+            }
+        }
+        else if (U8CopyFile(a.c_str(), b.c_str(), FALSE)) ++*files;
+        else { *failPath = a; *err = ::GetLastError(); ok = false; }
+    } while (ok && U8FindNextFile(h, &fd));
+    ::FindClose(h);
+    return ok;
+}
+/* T-36: A RECORDS STORE OF WORLD ID worldId UNDER A NAME THE WORLD HAD, read where it is: the first of names (stores named for that id)
+   that is there, else the store the multiplayer.mark of save folder markFolder names, when coopown::MarkStoreTakeById takes it as this
+   world's (named for one of worldKeys with that id, or with no id for a world upgraded to an id) and it is there. "" = none; *how says
+   which. MAIN THREAD. */
+static std::string OwnStoreFindById(const std::string& top, const std::vector<std::string>& names, const std::vector<std::string>& worldKeys,
+                                    const std::string& worldId, bool upgraded, const std::string& markFolder, const std::string& named,
+                                    const std::string& legacy, std::string* how)
+{
+    for (size_t i = 0; i < names.size(); ++i)
+        if (DirExistsA(top + "\\" + names[i])) { *how = "named for an earlier name of this world"; return names[i]; }
+    if (markFolder.empty()) return std::string();
+    std::vector<char> mb;
+    coopown::MarkInfo mi;
+    if (ReadFileBytes(JoinPathA(JoinPathA(SaveRootDefault(), markFolder), coopown::MarkFile()), &mb) && !mb.empty()
+        && coopown::ParseMarkLine(std::string(mb.begin(), mb.end()), &mi)
+        && coopown::MarkStoreTakeById(mi.store, mi.profile, g_profPickedId, named, legacy, worldKeys, worldId, upgraded)
+        && DirExistsA(top + "\\" + mi.store))
+    {
+        *how = "named by the multiplayer.mark of save folder '" + markFolder + "'";
+        return mi.store;
+    }
+    return std::string();
+}
+/* T-36: THE PLAYER'S RECORDS STORE IS COPIED INTO THE RESET WORLD - once per carry (ResetCarryAtWelcome), before the store is first
+   named for this pick (OwnAutoStoreWant, which the title's automatic open and the load both ask): the store of the earlier id is
+   copied, the whole folder, to the one named for the reset world's id. The old store is named for the world name the carried save
+   folder's key file holds (a store keeps the name it was made under, not the world's current name); when that one is not there it is
+   found by the earlier id under every name a save folder of that id held, the world's current name and the names before
+   " - before reset <n>", then by the carried folder's multiplayer.mark (OwnStoreFindById). The world as it was keeps its own store, so
+   its players' records are there when it is played again. The copy is made under a temporary name and renamed into place, so a copy
+   that stopped is never taken for the reset world's store; a temporary folder an earlier copy left is moved aside first (never
+   deleted). MAIN THREAD. */
+void ResetCarryRekey()
+{
+    if (g_resetCarryRekeyOwed == 0 || !ResetCarryLive()) return;
+    g_resetCarryRekeyOwed = 0;
+    const std::string top = OwnStoresTop();
+    const std::string carried = g_resetCarryOldKey.empty() ? g_resetCarryKey : g_resetCarryOldKey;
+    std::string oldName = coopown::PlayerStoreName(carried, g_profPickedId, g_resetCarryOldId);
+    const std::string newName = coopown::PlayerStoreName(g_resetCarryKey, g_profPickedId, g_resetCarryNewId);
+    if (!top.empty() && !oldName.empty() && !DirExistsA(top + "\\" + oldName))
+    {
+        std::vector<std::string> keys = g_resetCarryOldNames;
+        coopprof::LeftoverAddOnce(&keys, g_resetCarryKey);
+        for (size_t i = 0, n = keys.size(); i < n; ++i)
+        {
+            const std::vector<std::string> bases = worldreset::ResetOldWorldBases(keys[i]);   /* every ' - before reset <n>' taken off in turn */
+            for (size_t b = 0; b < bases.size(); ++b) coopprof::LeftoverAddOnce(&keys, bases[b]);
+        }
+        std::string how;
+        const std::string found = OwnStoreFindById(top, coopown::CarryOldStoreNames(carried, keys, g_profPickedId, g_resetCarryOldId), keys,
+                                                   g_resetCarryOldId, false, g_resetCarryFolder, oldName,
+                                                   coopown::PlayerStoreName(carried, g_profPickedId), &how);
+        if (!found.empty())
+        {
+            DebugLog("[RESET] records store of the world as it was: '" + oldName + "' (named for '" + carried + "', the carried save's world name) is"
+                     " not there - '" + found + "' is (" + how + ", id " + g_resetCarryOldId + "); copied from there");
+            oldName = found;
+        }
+    }
+    g_resetCarryOldStore = oldName;   /* the import's restore reads the carried save's mark against this store's numbers */
+    const bool oldThere = !top.empty() && !oldName.empty() && DirExistsA(top + "\\" + oldName);
+    const bool newThere = !top.empty() && !newName.empty() && DirExistsA(top + "\\" + newName);
+    const bool oldOpen = !g_ownStoreName.empty() && coopprof::SameFolderName(g_ownStoreName, oldName);
+    const int rv = worldreset::ResetRekeyDecide(oldName, newName, oldThere, newThere, oldOpen);
+    if (rv != worldreset::kRekeyCopy)
+    {
+        DebugLog("[RESET] records carried: 0 rows copied (" + std::string(worldreset::ResetRekeyName(rv)) + ")");
+        return;
+    }
+    std::vector<coopown::IndexLine> lines;
+    long long rows = 0;
+    if (OwnReadIndexLines(top + "\\" + oldName, &lines))
+        for (size_t i = 0; i < lines.size(); ++i) if (!coopown::CarryKeyDropped(lines[i].key)) ++rows;   /* the rows the copy keeps */
+    const std::string tmp = top + "\\" + newName + ".carrying";
+    if (DirExistsA(tmp))
+    {   /* a copy that stopped earlier: moved aside whole, so nothing of it is mixed into this copy */
+        const std::string aside = tmp + ".stale-" + N((long long)time(0));
+        if (!U8MoveFileEx(tmp.c_str(), aside.c_str(), 0))
+        {
+            ErrorLog("[RESET] records carried: 0 rows copied - a copy that stopped earlier is in '" + tmp + "' and could NOT be moved aside (Windows"
+                     " error " + N((long long)::GetLastError()) + "); the reset world opens a store of its own, the old one is untouched");
+            return;
+        }
+        DebugLog("[RESET] records carry: the copy that stopped earlier, '" + tmp + "', moved aside to '" + aside + "' (kept, never deleted)");
+    }
+    long long files = 0, links = 0;
+    std::string failPath;
+    DWORD err = 0;
+    long long droppedFiles = 0;
+    std::vector<std::string> droppedKeys;
+    const bool copied = ResetCarryCopyTree(top + "\\" + oldName, tmp, 0, &files, &links, &failPath, &err, &droppedFiles, &droppedKeys);
+    std::string droppedSaid;
+    for (size_t i = 0; i < droppedKeys.size(); ++i) droppedSaid += (i == 0 ? std::string() : std::string(" and ")) + droppedKeys[i];
+    droppedSaid = (droppedKeys.empty() && droppedFiles == 0) ? std::string("with no buildings or help record in it to leave behind")
+                : "but the buildings and help records (" + (droppedSaid.empty() ? std::string("no index line") : droppedSaid) + ", " + N(droppedFiles)
+                  + " file(s)) - left behind: the player's buildings come back only from the world server's area records";
+    const BOOL placed = copied ? U8MoveFileEx(tmp.c_str(), (top + "\\" + newName).c_str(), 0) : FALSE;   /* no REPLACE: never onto another store */
+    if (copied && !placed) { err = ::GetLastError(); failPath = tmp; }
+    if (placed)
+    {
+        ++g_resetCarryRekeyed;
+        DebugLog("[RESET] records carried: " + N(rows) + " rows copied (records store '" + oldName + "' copied to '" + newName + "', the whole folder "
+                 + droppedSaid + ", "
+                 + N(files) + " files" + (links > 0 ? ", " + N(links) + " symbolic link(s) or junction(s) not copied" : std::string())
+                 + "; the world as it was keeps its own). resetCarryCopied=" + N(g_resetCarryRekeyed));
+    }
+    else
+        ErrorLog("[RESET] records carried: 0 rows copied - records store '" + oldName + "' could NOT be copied to '" + newName + "' (stopped at '"
+                 + failPath + "', Windows error " + N((long long)err) + "); the reset world opens a store of its own, the old one is untouched, and"
+                 " the part copied stays in '" + tmp + "' (nothing reads it)");
+}
+/* T-36: THIS WORLD'S STORE UNDER AN EARLIER NAME OF THE WORLD. A world keeps its id when its name changes (the world as it was before a
+   reset is renamed "<name> - before reset <n>"), and its players' records stores keep the names they were made under: read where they
+   are, never renamed (a save's multiplayer.mark names its store, and the world server's numbers are kept per store name). When the
+   store named for the current name is not there: the store named for each name a save folder of this id carried at the WELCOME
+   (g_profIdWorldNames), then for each name before " - before reset <n>" (worldreset::ResetOldWorldBases, taken off in turn), then the store the decided
+   save folder's multiplayer.mark names when it is a store named for this world (OwnStoreFindById, coopown::MarkStoreTakeById). "" = none:
+   the current name's store is used. Decided once per
+   store name and save folder. MAIN THREAD. */
+long long g_ownStoreByIdElsewhere = 0;
+static std::string OwnStoreByIdElsewhere(const std::string& key, const std::string& named, const std::string& legacy)
+{
+    static std::string s_for, s_found;
+    const std::string forKey = named + "\n" + g_profSaveFolder;
+    if (s_for == forKey) return s_found;
+    const std::string top = OwnStoresTop();
+    if (top.empty()) return std::string();
+    s_for = forKey; s_found.clear();
+    if (DirExistsA(top + "\\" + named)) return s_found;
+    std::vector<std::string> keys = g_profIdWorldNames;
+    const std::vector<std::string> bases = worldreset::ResetOldWorldBases(key);
+    for (size_t i = 0; i < bases.size(); ++i) coopprof::LeftoverAddOnce(&keys, bases[i]);
+    const std::vector<std::string> cands = coopown::PlayerStoreNamesById(key, keys, g_profPickedId, HeldWorldId());
+    std::string how;
+    s_found = OwnStoreFindById(top, cands, keys, HeldWorldId(), HeldWorldUpgraded(), g_profSaveFolder, named, legacy, &how);
+    if (!s_found.empty())
+    {
+        ++g_ownStoreByIdElsewhere;
+        DebugLog("[OWNSAVE] records store '" + s_found + "' is this world's (id " + HeldWorldId() + ", profile " + g_profPickedId + ") under an earlier"
+                 " name of the world - " + how + "; read where it is (the store for the current name, '" + named + "', is not there)."
+                 " ownStoreByIdElsewhere=" + N(g_ownStoreByIdElsewhere));
+    }
+    return s_found;
+}
 std::string OwnAutoStoreWant()
 {
-    if (!SaveRedirectWanted()) return std::string();
+    if (!SaveRedirectWanted()) { g_ownStoreById.clear(); return std::string(); }
+    ResetCarryRekey();   /* T-36: a store carried into the reset world is copied before its name is used */
     const std::string key = coopworld::WorldOrDefault(ConfigWorldKey(), 0);
     const std::string legacy = coopown::PlayerStoreName(key, g_profPickedId);
     const std::string& held = HeldWorldId();
-    if (held.empty()) return legacy;
+    if (held.empty()) { g_ownStoreById.clear(); return legacy; }
     const std::string named = coopown::PlayerStoreName(key, g_profPickedId, held);
+    g_ownStoreById = named;
+    const std::string elsewhere = OwnStoreByIdElsewhere(key, named, legacy);   /* T-36: this world's store under an earlier name of the world */
+    if (!elsewhere.empty()) { g_ownStoreById = elsewhere; return elsewhere; }
     if (!HeldWorldUpgraded()) return named;
     static std::string s_tried, s_kept;
     if (s_kept == named) return legacy;
@@ -17423,7 +18173,7 @@ void OwnAutoStoreBeforeLoad()
     const bool folder = SaveRedirectWanted();
     const std::string want = folder ? OwnAutoStoreWant() : std::string();
     g_ownAutoLoadHeld = coopown::AutoStoreHoldKept(g_ownAutoLoadHeld, want, true);   /* T-251 fold 2: a new load - any hold ends, the open is tried again here */
-    const bool heldOff = g_ownFaultOff != 0 || g_repairStale != 0 || (g_ohBlocked != 0 && g_ohStore == want);
+    const bool heldOff = g_ownFaultOff != 0 || (g_ohBlocked != 0 && g_ohStore == want);
     if (!coopown::AutoStoreOpenWanted(ConfigOwnSave() == 1, folder, heldOff, want, g_ownStoreName, g_ownStoreAuto != 0)) return;
     const DWORD w0 = ::GetTickCount();
     bool idle = false;
@@ -17446,6 +18196,72 @@ void OwnAutoStoreBeforeLoad()
         " for this world (never opened mid-world over the newer records) until the next load or the title; the engine's timed autosave stays on."
         " autoLoadHolds=" + N(g_ownAutoLoadHolds)));
     if (ok) DebugLog(line); else ErrorLog(line);
+}
+/* T-36: THE RESTORE AT THE RESET WORLD'S IMPORT. Kenshi's IMPORT GAME is not a load, so OwnOverlayPrepare never runs for it; this arms the
+   same restore (OwnRestoreArm) when the load gate lets the import through, before the import builds its world, so money, research, map
+   knowledge and faction standings are laid back at its first frame with engine writes allowed, and the records writer waits until they
+   are. The rule is a load's: the carried save's multiplayer.mark (its numbers are those of the old store the reset world's store is a
+   copy of), else that save's quick.save time - except faction standings, which the import does not carry (its relations box is off):
+   the player's record is laid back whatever its age. No building is made from the player's records at an import: the reset world's
+   buildings come only from the world server's area records. MAIN THREAD. */
+void OwnResetImportRestoreArm(const std::string& carriedFolder, const std::string& oldStore)
+{
+    OwnRestoreArmReset();
+    if (RoleIsSingle()) return;
+    OwnAutoStoreBeforeLoad();   /* the reset world's store open (copied at the title by ResetCarryRekey) */
+    if (g_ownStoreName.empty())
+    {
+        DebugLog("[RESET] restore at the import: no records store is open - the save's money, research and map stay as imported; faction standings are Kenshi's own");
+        return;
+    }
+    const std::string sdir = OwnStoreDir();
+    std::vector<coopown::IndexLine> lines;
+    bool haveHead = false; std::string headWorld, headProf;
+    const std::string curWorld = ConfigWorldKey(), curProf = ProfileForKey();
+    if (!OwnReadIndexLines(sdir, &lines, &haveHead, &headWorld, &headProf) || !haveHead
+        || !coopown::IdentityMatchesWorld(headWorld, headProf, curWorld, curProf, OwnStoreIsById()))
+    {
+        OwnRestoreArmAll("identity");
+        ErrorLog("[RESET] restore at the import REFUSED: records store '" + g_ownStoreName + "' " + (haveHead ? "names world '" + headWorld + "' profile '" + headProf + "'"
+                 : std::string("has no readable identity line")) + ", this game is world '" + curWorld + "' profile '" + curProf + "' - nothing is laid back");
+        return;
+    }
+    const std::string saveDir = JoinPathA(SaveRootDefault(), carriedFolder);
+    bool haveMark = false, pending = false;
+    coopown::MarkInfo mi;
+    {
+        std::vector<char> mb;
+        if (ReadFileBytes(saveDir + "\\" + coopown::MarkFile(), &mb) && !mb.empty())
+        {
+            const std::string text(mb.begin(), mb.end());
+            if (coopown::IsMarkPending(text)) pending = true;
+            else if (coopown::ParseMarkLine(text, &mi) && coopown::IdentityMatchesWorld(mi.world, mi.profile, curWorld, curProf, true)
+                     && (_stricmp(mi.store.c_str(), oldStore.c_str()) == 0 || _stricmp(mi.store.c_str(), g_ownStoreName.c_str()) == 0))
+                haveMark = true;
+        }
+    }
+    bool haveSaveTime = false; long long saveTime = 0;
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (U8GetFileAttributesEx((saveDir + "\\quick.save").c_str(), GetFileExInfoStandard, &fa) != 0)
+        {
+            ULARGE_INTEGER u; u.LowPart = fa.ftLastWriteTime.dwLowDateTime; u.HighPart = fa.ftLastWriteTime.dwHighDateTime;
+            saveTime = coopown::FileTimeToUnix(u.QuadPart); haveSaveTime = true;
+        }
+    }
+    const int rule = coopown::OverlayRule(haveMark, haveSaveTime);
+    OwnRestoreArm(rule, haveMark ? mi.seq : 0ULL, saveTime, lines, sdir, coopown::kCatFaction);
+    const size_t buildRows = g_ownBuildRs.size();
+    g_ownBuildRs.clear(); g_ownBuildRsState = "import";   /* no building from the player's records at an import */
+    ++g_resetRestoreArmed;
+    std::string gates;
+    for (int c = 0; c < coopown::kCatCount; ++c)
+        gates += std::string(c == 0 ? "" : ", ") + coopown::CatName(c) + "=" + coopown::RestoreWhyName(g_ownRsGate[c]);
+    DebugLog("[RESET] restore at the import ARMED: records store '" + g_ownStoreName + "', rule=" + g_ownRsRuleText + " (the carried save '" + carriedFolder
+             + "': mark " + (haveMark ? N((long long)mi.seq) : std::string(pending ? "pending" : "none")) + ", quick.save " + (haveSaveTime ? N(saveTime) : std::string("none"))
+             + "; faction standings whatever their age - the import does not carry them) - " + gates + "; laid back at the import's first frame"
+             + (buildRows > 0 ? " (" + N((long long)buildRows) + " building row(s) in the store are NOT made: buildings come from the world's area records)" : std::string())
+             + ". resetRestoreArmed=" + N(g_resetRestoreArmed));
 }
 void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
 {
@@ -17518,7 +18334,7 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
         }
     }
     const std::string curWorld = ConfigWorldKey(), curProf = ProfileForKey();
-    if (!haveHead || !coopown::IdentityMatches(headWorld, headProf, curWorld, curProf))
+    if (!haveHead || !coopown::IdentityMatchesWorld(headWorld, headProf, curWorld, curProf, OwnStoreIsById()))   /* T-36: a store named for this world's id may name an earlier name of the world */
     {
         ++g_ownOvIdentityRefused;
         ErrorLog("[OWNSAVE] overlay REFUSED (the whole store): its own.index " + std::string(haveHead ? "names" : "has NO identity line -")
@@ -17538,7 +18354,7 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
             if (coopown::IsMarkPending(text)) pending = true;
             else if (coopown::ParseMarkLine(text, &mi))
             {
-                if (!coopown::IdentityMatches(mi.world, mi.profile, curWorld, curProf))
+                if (!coopown::IdentityMatchesWorld(mi.world, mi.profile, curWorld, curProf, OwnStoreIsById()))
                 {
                     ++g_ownOvIdentityRefused;
                     ErrorLog("[OWNSAVE] overlay REFUSED (the whole store): the save's mark names world '" + mi.world + "' profile '" + mi.profile
@@ -17590,6 +18406,26 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
             } while (U8FindNextFile(h, &fd));
             ::FindClose(h);
         }
+    }
+    /* which characters each squad file of the save holds: the file's stem (the id the save filed the squad under) and its
+       character count, the first 40 by stem; unparsed = files the scan could not read */
+    {
+        std::string files;
+        long long shown = 0;
+        for (std::map<std::string, coopown::GdcScanOut>::const_iterator it = scans.begin(); it != scans.end() && shown < 40; ++it, ++shown)
+            files += " " + it->first + "(" + N((long long)it->second.chars.size()) + ")";
+        if ((long long)scans.size() > shown) files += " +" + N((long long)scans.size() - shown) + " more";
+        /* focus: every file whose id was renamed for a copy squad ("<id>-c<k>") and the file of the id it was renamed from,
+           wherever they sort - the first 40 by name are mostly the world's own squads */
+        std::string focus;
+        for (std::map<std::string, coopown::GdcScanOut>::const_iterator it = scans.begin(); it != scans.end(); ++it)
+        {
+            const std::string pre = it->first + "-c";
+            std::map<std::string, coopown::GdcScanOut>::const_iterator nx = scans.lower_bound(pre);
+            const bool root = nx != scans.end() && nx->first.compare(0, pre.size(), pre) == 0;
+            if (root || it->first.find("-c") != std::string::npos) focus += " " + it->first + "(" + N((long long)it->second.chars.size()) + ")";
+        }
+        DebugLog("[OWNSAVE] save squad files n=" + N((long long)scans.size()) + " unparsed=" + N(saveParseFail) + ":" + files + " | focus:" + (focus.empty() ? std::string(" none") : focus));
     }
     /* the candidates: record checked, capped and COPIED before the roster check (fold item 3) */
     std::vector<coopown::RosterSquad> sq;
@@ -18188,6 +19024,119 @@ void OwnLeaveSaveTick()
    review fold L1), and is dropped only on a world change or when the game is stopping. Confidence: Read (not yet seen
    running). MAIN THREAD.
    ================================================================================================================== */
+/* An awake squad's character container is the platoon's ActivePlatoon (+0x1D8, ReadPod's active), its platoon at +0x78. Whether
+   Kenshi has read it in is the load hook's own record (g_sqRead: the engine's load of that squad's container returned success),
+   not this container's +8 byte, which was seen still clear long after the hook saw the squad's load succeed. A container with no
+   target (+0x10 = 0) is never read by Kenshi's loader (0x36B490 returns without reading) and counts as read in.
+   1 = no target, 0 = a target, -1 = unreadable (a fault, or the object is not this platoon's ActivePlatoon). No string here (C2712). */
+static int SquadContainerNoTargetPod(void* platoon, void* active)
+{
+    __try
+    {
+        const char* c = (const char*)active;
+        if (*(void* const*)c != (void*)(Base() + kActivePlatoonVtRva) || *(void* const*)(c + 0x78) != platoon) return -1;
+        return *(void* const*)(c + 0x10) == 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* The player's awake squads and how many of them are read in: every squad on each player faction's own list (Faction +0x218 /
+   count +0x210), peers' factions left out; a squad with no active record (+0x1D8) is asleep and not counted. Read in = the load hook
+   saw its character container's load succeed since the import (g_sqRead), or its container has no target to read. unreadable =
+   awake squads not read in whose container could not be read, and squads that could not be read at all. 0 = no faction list or a
+   squad list unreadable. MAIN THREAD. */
+static int PlayerSquadsReadNow(int* awake, int* read, int* unreadable)
+{
+    *awake = 0; *read = 0; *unreadable = 0;
+    FmPod fm;
+    if (!Plaus(coop::GameWorldPtr()) || !ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) || !Plaus(fm.factions) || fm.count > 4096) return 0;
+    int lists = 1;
+    for (unsigned fi = 0; fi < fm.count; ++fi)
+    {
+        Faction* f = (Faction*)fm.factions[fi];
+        if (!Plaus(f) || !IsPlayerFaction(f) || IsPeerFaction(f)) continue;
+        ActiveListPod ap;
+        if (!ReadActiveListPod((void*)f, &ap) || !Plaus(ap.items) || ap.count > 4096) { lists = 0; continue; }
+        for (unsigned i = 0; i < ap.count; ++i)
+        {
+            void* p = ap.items[i]; Pod q;
+            if (!Plaus(p)) continue;
+            if (!ReadPod(p, &q)) { ++*unreadable; continue; }
+            if (!Plaus(q.active)) continue;
+            ++*awake;
+            if (SquadReadHasNow(p)) { ++*read; continue; }   /* the load hook saw its character container read in */
+            const int r = SquadContainerNoTargetPod(p, q.active);
+            if (r < 0) ++*unreadable; else if (r > 0) ++*read;
+        }
+    }
+    return lists;
+}
+/* T-36: THE RESET BOX - once per player per reset world, in the world, after the import built it: what came across and what started over
+   (worldreset::ResetBoxText; buildings "kept" only when every reset from the carried save's world id on kept them - ResetBoxKept over the
+   WELCOME's history). Remembered in the player's records store of the reset world (worldreset::kResetBoxMemo), so a second start does
+   not show it again. The host sees the same words. MAIN THREAD. */
+void ResetBoxDecide()
+{
+    std::vector<std::string> ids; std::vector<int> kept;
+    if (g_resetHistoryWorld == g_resetCarryNewId)
+        for (size_t i = 0; i < g_resetHistory.size(); ++i)
+        { ids.push_back(g_resetHistory[i].id); kept.push_back((g_resetHistory[i].flags & coopstore::kStoreWelcomeResetKept) != 0 ? 1 : 0); }
+    const bool k = worldreset::ResetBoxKept(ids, kept, g_resetCarryOldId);
+    std::string said;
+    for (size_t i = 0; i < ids.size(); ++i) said += std::string(i == 0 ? "" : ", ") + coopworld::WorldIdHex(ids[i]) + (kept[i] != 0 ? ":kept" : ":not kept");
+    g_resetBoxText = worldreset::ResetBoxText(k); g_resetBoxWorld = g_resetCarryNewId;
+    const std::string memo = g_ownStoreName.empty() ? std::string() : OwnStoreDir() + "\\" + worldreset::kResetBoxMemo;
+    std::vector<char> mb;
+    if (!memo.empty() && ReadFileBytes(memo, &mb) && worldreset::ResetBoxShownIn(std::string(mb.begin(), mb.end()), g_resetBoxWorld))
+    {
+        g_resetBoxOwed = 0; ++g_resetBoxAlready;
+        DebugLog("[RESET] reset box already shown to this player in reset world " + coopworld::WorldIdHex(g_resetBoxWorld) + " - not shown again."
+                 " resetBoxAlready=" + N(g_resetBoxAlready));
+        return;
+    }
+    g_resetBoxOwed = 1; g_resetBoxFirstTry = 0;
+    DebugLog("[RESET] reset box wanted once the reset world runs: buildings " + std::string(k ? "kept" : "NOT kept") + " (every reset from the carried save's id "
+             + coopworld::WorldIdHex(g_resetCarryOldId) + " on: " + (said.empty() ? std::string("no history from the WELCOME") : said) + ")"
+             + (memo.empty() ? std::string(" - no records store is open, so it cannot be remembered") : std::string()));
+}
+void ResetBoxTick()
+{
+    if (g_resetBoxUp != 0)
+    {
+        const bool inWorld = GameplayRunning();
+        if (UiResetBoxOkClicked() == 0 && inWorld) return;
+        const int r = UiResetBoxClose();
+        g_resetBoxUp = 0;
+        DebugLog("[RESET] reset box closed (" + std::string(inWorld ? "OK" : "the world went") + ", rc=" + N((long long)r) + ")");
+        return;
+    }
+    if (g_resetBoxOwed == 0 || !GameplayRunning() || EngineWritesBlocked()) return;
+    const DWORD now = ::GetTickCount();
+    if (g_resetBoxFirstTry == 0) g_resetBoxFirstTry = (now == 0) ? 1 : now;
+    const int r = UiResetBoxShow(worldreset::ResetBoxTitle(), g_resetBoxText.c_str());
+    if (r == 1)
+    {
+        g_resetBoxOwed = 0; g_resetBoxUp = 1; ++g_resetBoxShown;
+        bool remembered = false;
+        if (!g_ownStoreName.empty())
+        {
+            const std::string memo = OwnStoreDir() + "\\" + worldreset::kResetBoxMemo;
+            std::vector<char> mb;
+            ReadFileBytes(memo, &mb);
+            const std::string next = worldreset::ResetBoxShownAdd(std::string(mb.begin(), mb.end()), g_resetBoxWorld);
+            remembered = WriteFileBytes(memo, std::vector<char>(next.begin(), next.end()), true);
+        }
+        DebugLog("[RESET] reset box shown, once for this player in reset world " + coopworld::WorldIdHex(g_resetBoxWorld) + ": \"" + g_resetBoxText + "\""
+                 + (remembered ? std::string(" (remembered in the records store)") : std::string(" (could NOT be remembered - a later start may show it again)"))
+                 + " resetBoxShown=" + N(g_resetBoxShown));
+        return;
+    }
+    if ((DWORD)(now - g_resetBoxFirstTry) >= 10000)
+    {
+        g_resetBoxOwed = 0; ++g_resetBoxFailed;
+        ErrorLog("[RESET] reset box could not be built for 10 s (rc=" + N((long long)r) + ") - it has stopped trying; the player was NOT shown: \""
+                 + g_resetBoxText + "\" resetBoxFailed=" + N(g_resetBoxFailed));
+    }
+}
 coopown::CreatedSave g_ownCr;
 long long g_ownCrArmed = 0, g_ownCrStarted = 0, g_ownCrCompleted = 0, g_ownCrRearmed = 0, g_ownCrDroppedWorld = 0,
           g_ownCrDroppedStopping = 0, g_ownCrGaveUp = 0, g_ownCrNotArmed = 0, g_ownCrInGame = 0,
@@ -18195,6 +19144,7 @@ long long g_ownCrArmed = 0, g_ownCrStarted = 0, g_ownCrCompleted = 0, g_ownCrRea
 void OwnCreatedSaveTick()
 {
     if (!OnMainThread()) return;
+    ResetBoxTick();   /* T-36: the reset box, once the reset world runs */
     coopown::CreatedSave& C = g_ownCr;
     const long world = ::InterlockedCompareExchange(&g_ownWorldReset, 0, 0);
     unsigned long long win = 0ULL; int mode = 0, aiOff = 0;
@@ -18216,6 +19166,43 @@ void OwnCreatedSaveTick()
             DebugLog(std::string("[OWNSAVE] the new-game character editor closed but the save after character creation is NOT armed (")
                      + (e == coopown::kCrEdgeWorldChanged ? "a world load came between its opening and its close" : "the AI is still off")
                      + ") notArmed=" + N(g_ownCrNotArmed));
+        }
+    }
+    if (g_resetCarryArmOwed != 0)
+    {   /* T-36: the import the load gate let through has built its world - the reset world's folder is saved now, by this trigger */
+        const bool live = ResetCarryLive();
+        const bool running = Plaus(coop::GameWorldPtr()) && GameplayRunning() && !EngineWritesBlocked();
+        int sqAwake = 0, sqRead = 0, sqBad = 0;
+        const bool arm = worldreset::ResetImportSaveArm(true, live, g_resetCarryArmWorld, world, running);
+        if (arm && g_resetBoxDecidedFor != g_resetCarryArmWorld) { g_resetBoxDecidedFor = g_resetCarryArmWorld; ResetBoxDecide(); }   /* the import's world is up: the box decided once */
+        const bool sqList = arm && PlayerSquadsReadNow(&sqAwake, &sqRead, &sqBad) != 0;
+        if (!arm)
+        {
+            if (!live) g_resetCarryArmOwed = 0;
+        }
+        else if (!worldreset::ResetImportSquadsRead(sqList, sqAwake, sqRead, sqBad))
+        {   /* the import's world runs, but Kenshi reads the player's squads' characters in a few seconds after its first frame: a save
+               before that read stores the squad with no characters and the read does not come after it. The save stays owed and is
+               decided again each tick until every awake player squad's character container has been read. */
+            ++g_resetCarryArmWaits;
+            if (g_resetCarryArmWaitLogged == 0)
+            {
+                g_resetCarryArmWaitLogged = 1;
+                DebugLog("[RESET] the import's world is up - the save of the reset world's folder '" + g_profSaveFolder + "' WAITS for the player's"
+                         " squads to be read in (" + N((long long)sqRead) + " of " + N((long long)sqAwake) + " awake squads read"
+                         + (sqList ? std::string() : std::string("; a player squad list is not readable"))
+                         + (sqBad > 0 ? "; " + N((long long)sqBad) + " squad(s) unreadable" : std::string()) + ") - decided again each tick");
+            }
+        }
+        else
+        {
+            g_resetCarryArmOwed = 0;
+            const std::string sqSaid = " Squads: " + N((long long)sqRead) + " of " + N((long long)sqAwake) + " awake squads read, after "
+                                     + N(g_resetCarryArmWaits) + " ticks waiting.";
+            C.pending = 1; C.worldArmed = world; C.waitLogged = 0; C.tries = 0;
+            ++g_resetCarryArmed;
+            DebugLog("[RESET] the import's world is up - the save of the reset world's folder '" + g_profSaveFolder + "' is ARMED (the save after"
+                     " character creation's trigger: it starts as soon as the leave save is wanted)." + sqSaid + " resetCarryArmed=" + N(g_resetCarryArmed));
         }
     }
     if (C.running != 0)
@@ -19289,12 +20276,93 @@ void StoreMarkSquadDirtyByUid(unsigned int uid, int cause)
     ++g_hbDirtyLookupMiss;   /* most item moves are the player's own characters, which are never in this registry */
 }
 
+/* THE OWED HOMES, ONCE A SECOND (StoreTick, MAIN THREAD) [t755-copyhome-tick]. A copy of another game's group built while the building its
+   sender named was not loaded here, or a squad a LOAD-OVERRIDE left without a home, is owed that home. Each entry's building is looked up
+   again - by the group's home key when one is known (the store's own record: RecordHomeOf, else the key noted with the entry; a handle that
+   names another loaded building is logged once and not used), else by the handle it was sent with (ResolveBuilding) - and once it is loaded
+   here it is given with Ownerships::setHomeBuilding, the call a copy built near its building gets (TownGenGiveHomeTo, which also lists the
+   group on the building's residents hand). The squad's home is then read back: the entry leaves the list only when the home is set; a give
+   that did not take is tried again at the next check, kCopyHomeMaxTries in all, then dropped and counted. At most kCopyHomePerTick entries a
+   second, round-robin, as the key lookup is not free. */
+const int kCopyHomePerTick = 16;
+void CopyHomeOwedTick()
+{
+    if (g_copyHomeOwedMap.empty() || !OnMainThread()) return;
+    if (EngineWritesBlocked()) return;   /* a load or a teardown: the owed homes wait for a tick with a world */
+    const DWORD now = ::GetTickCount();
+    int n = (int)g_copyHomeOwedMap.size(); if (n > kCopyHomePerTick) n = kCopyHomePerTick;
+    std::map<void*, CopyHomeOwed>::iterator it = g_copyHomeOwedMap.lower_bound(g_copyHomeCursor);
+    for (int i = 0; i < n && !g_copyHomeOwedMap.empty(); ++i)
+    {
+        if (it == g_copyHomeOwedMap.end()) it = g_copyHomeOwedMap.begin();
+        void* const p = it->first;
+        CopyHomeOwed& e = it->second;
+        int bound = 0;
+        {   /* still the squad it was listed as: bound under the same world id (and the same bind stamp, when it had one), or - listed while
+               not bound here - still the platoon this world id names here */
+            const std::map<void*, std::string>::const_iterator b = g_bind.find(p);
+            const std::map<void*, unsigned long long>::const_iterator g = g_bindGenOf.find(p);
+            if (b != g_bind.end()) bound = (b->second == e.worldId && (e.bindGen == 0 || (g != g_bindGenOf.end() && g->second == e.bindGen))) ? 1 : 0;
+            else { const std::map<std::string, void*>::const_iterator w = g_byWorldId.find(e.worldId); bound = (e.bindGen == 0 && w != g_byWorldId.end() && w->second == p) ? 1 : 0; }
+        }
+        unsigned char h32[32];
+        const int hasHome = (bound != 0 && PlatoonHomeHandPod(p, h32) == 1) ? 1 : 0;
+        std::string key = RecordHomeOf(e.worldId); if (key.empty()) key = e.key;
+        /* a building that was not loaded at the last look is looked for again after 10 s: a key that misses walks every loaded zone */
+        if (bound != 0 && hasHome == 0 && e.nextLookAt != 0 && (LONG)(now - e.nextLookAt) < 0) { ++it; continue; }
+        void* bld = 0;
+        if (bound != 0 && hasHome == 0) bld = !key.empty() ? ObjectByPositionKey(key.c_str()) : SpawnBuildingFromSentHand(e.hand);
+        const int v = coopstore::CopyHomeBefore(bound, hasHome, bld != 0 ? 1 : 0);
+        if (v == coopstore::kCopyHomeDrop) { ++g_copyHomeGone; g_copyHomeOwedMap.erase(it++); continue; }
+        if (v == coopstore::kCopyHomeDone) { ++g_copyHomeHad; g_copyHomeOwedMap.erase(it++); continue; }
+        if (v == coopstore::kCopyHomeWait) { e.nextLookAt = now + 10000; if (e.nextLookAt == 0) e.nextLookAt = 1; ++it; continue; }
+        if (!key.empty() && e.mismatchLogged == 0)
+        {   /* the key and the sent handle name different loaded buildings: the key is the store's own record, so it is the one used */
+            void* const hb = SpawnBuildingFromSentHand(e.hand);
+            if (hb != 0 && hb != bld)
+            {
+                e.mismatchLogged = 1; ++g_copyHomeMismatch;
+                if (++g_copyHomeMismatchLines <= 20)
+                    DebugLog("[STORE] home of " + e.worldId + ": its home key names building " + key + " and the handle it was sent with names another loaded building - the key (the store's record) is used (copyHomeMismatch=" + N(g_copyHomeMismatch) + ", first 20 lines)");
+            }
+        }
+        const int r = TownGenGiveHomeTo(p, bld);
+        const int took = (r != 0 && PlatoonHomeHandPod(p, h32) == 1) ? 1 : 0;   /* the squad's home read back */
+        const int a = coopstore::CopyHomeAfter(took, &e.tries, coopstore::kCopyHomeMaxTries);
+        std::string bk = key;
+        if (bk.empty()) { char hk[128]; bk = (took != 0 && TownGenPlatoonHomeKey(p, hk, 128) == 1) ? std::string(hk) : std::string("?"); }
+        if (a == coopstore::kCopyHomeDone)
+        {
+            ++g_copyHomeGiven; if (r == 2) ++g_copyHomeNotResident;
+            if (++g_copyHomeGivenLines <= 40)
+                DebugLog("[STORE] home of " + e.worldId + " (building " + bk + "): given by the owed-home check now that the building is loaded here (it was not when the squad was built or loaded"
+                         + (key.empty() ? std::string("; found by the handle it was sent with") : std::string())
+                         + (r == 2 ? std::string("; the building's residents hand does not name it") : std::string())
+                         + "; its home read back is set; copyHomeGiven=" + N(g_copyHomeGiven) + ", first 40 lines)");
+            g_copyHomeOwedMap.erase(it++); continue;
+        }
+        if (a == coopstore::kCopyHomeRetry)
+        {
+            ++g_copyHomeRetried;
+            if (++g_copyHomeRetryLines <= 40)
+                DebugLog("[STORE] home of " + e.worldId + " (building " + bk + "): the give did not take (" + std::string(r == 0 ? "the engine call faulted" : "its home read back is not set")
+                         + ") - tried again at the next check, " + N((long long)e.tries) + " of " + N((long long)coopstore::kCopyHomeMaxTries) + " (copyHomeRetried=" + N(g_copyHomeRetried) + ", first 40 lines)");
+            ++it; continue;
+        }
+        ++g_copyHomeGiveFailed;
+        DebugLog("[STORE] home of " + e.worldId + " (building " + bk + "): the give did not take " + N((long long)coopstore::kCopyHomeMaxTries) + " times - dropped from the owed list; the squad stays without a home here (copyHomeGiveFailed=" + N(g_copyHomeGiveFailed) + ")");
+        g_copyHomeOwedMap.erase(it++);
+    }
+    g_copyHomeCursor = (it == g_copyHomeOwedMap.end()) ? 0 : it->first;
+}
 void PlaceUnplacedNotes();   /* defined beside CreateUnknownSquad, below */
 void RaiseOwnRecordCounters();   /* defined beside PlaceUnplacedNotes, below */
+void TalkReportTick();   /* T-726: speech.cpp - the same namespace (coop) */
 void StoreTick()
 {
     ::InterlockedExchange(&g_relayLinkedCached, LinkUp() ? 1 : 0);   /* review-p5b CRASH-2: the any-thread flag is refreshed here, on the main thread, before anything else runs */
     P113Tick(); P113LeverTick();   /* PROBE P113 */
+    TalkReportTick();   /* T-726: a [TALK] REPORT every 60 s while a world runs */
     /* B9 (decision 44): the outage clock, refreshed from the SAME LinkUp() read the flag above came from,
        so the two can never disagree about whether the notebook was reachable on this tick. The `== 0` arm
        is what starts the clock for a game that has never linked at all. */
@@ -19392,6 +20460,7 @@ void StoreTick()
     T300SweepTick();   /* T-300 fix 3: the arrival sweep (armed below when another player enters this world) - before the drop, so what it queues goes this tick */
     T300DropTick();   /* T-300: another game's file-built squads in areas another game holds, thrown away (1 Hz) */
     CtxDropTick();   /* H067: context platoons that slept holding none of this game's people (or whose wake was refused), removed (1 Hz) */
+    CopyHomeOwedTick();   /* the owed homes: a squad whose home building was not loaded here is given it once it is (1 Hz, at most 16 a second) [t755-copyhome-tick-call] */
     DeathWatchTick();   /* decision 28/30: an awake world group whose members are ALL dead is a wipe-out (1 Hz; review-p4e5) */
     HeartbeatTick();   /* E47-S2: BELOW DeathWatchTick, so a wipe-out this second is a delete and never a heartbeat record first */
     /* B10 (audit C14, design-e46-store 3.3): as C10 - the notebook's authority peer publishes sleeping
@@ -19485,7 +20554,7 @@ bool SetStoreServer(const std::string& address, unsigned short port)
        "the address matches" would turn every re-dial attempt into a silent no-op and give T238's defect back. */
     if (g_link != 0 && !address.empty() && port != 0 && g_linkAddr == address && g_linkPort == port)
     {
-        DebugLog("[STORE] server " + address + ":" + N((long long)port) + " is the one already open - kept (E38: the config file opened it at the title screen). Link is " + (LinkUp() ? std::string("up") : std::string("still connecting")) + ".");
+        DebugLog("[STORE] server " + relaybridge::AddrForLog(address) + ":" + N((long long)port) + " is the one already open - kept (E38: the config file opened it at the title screen). Link is " + (LinkUp() ? std::string("up") : std::string("still connecting")) + ".");
         return true;
     }
     /* W3-g (recheck-w3f item 1): no address is refused here after a wrong-world refusal - W3-f's latch is gone; the re-dial's
@@ -19500,13 +20569,14 @@ bool SetStoreServer(const std::string& address, unsigned short port)
        Abort() is the same teardown without the wait. */
     if (g_link != 0)
     {
+        net::RelayRouteNoteEnd(g_link);   /* owner 592: a Steam route closed here says its state and Steam's last end reason */
         if (g_link->State() == net::LINK_UP) g_link->Disconnect(); else g_link->Abort();
         delete g_link; g_link = 0;
         /* M4 fold 2 (re-check H-A): THE SAME LINK-DOWN STEP AS PUMPLINK'S DOWN EDGE, for a link whose UP edge ran (g_linkWasUp) -
            the slot, the uid seat and blocks, the peer-sector table and the notebook's id list go with it, and g_notebookLinkGen
            moves. A connecting link never had an UP edge, so nothing of it is undone. The carry goes either way. */
         LinkCarryDrop();
-        if (g_linkWasUp) NotebookLinkDown(std::string("closed here (") + (address.empty() ? std::string("cleared") : "re-pointed to " + address + ":" + N((long long)port))
+        if (g_linkWasUp) NotebookLinkDown(std::string("closed here (") + (address.empty() ? std::string("cleared") : "re-pointed to " + relaybridge::AddrForLog(address) + ":" + N((long long)port))
                                           + ") - a leave, a notebook the host named, `store server` or the arrival-queue refusal");
         g_linkWasUp = false; g_storeWelcomed = false; g_storeAuthority = false; g_storeWrongWorld = false; g_linkWelcomeWorld = -1;
     }   /* W3-f (review-w3 item 8): a wrong-world refusal belongs to the link torn down here, like g_linkWasUp */
@@ -19529,19 +20599,24 @@ bool SetStoreServer(const std::string& address, unsigned short port)
     /* B12-e: SET BEFORE THE JOIN, so a join that fails outright still leaves a target for the re-dial to keep
        trying - a refused connect is the ordinary shape of "the notebook is not running yet". */
     g_storeTargetAddr = address; g_storeTargetPort = port;
-    g_link = net::CreateTransport(net::BACKEND_DIRECT);
+    const int route = net::RelayRouteFor(address);   /* steam:<id> = Steam (Valve's relay only), else direct; TEST relayvia=ip: every dial over Steam's plain UDP */
+    g_link = net::RelayRouteMake(route);
     if (g_link == 0) return false;
     g_link->SetStoreLink();   /* M16 fold 2: type 53 is a LIVE envelope on this link only */
     g_link->SetPeerTimeouts(coopgl::kGameLinkTimeoutLimit, coopgl::kGameLinkTimeoutMinimumMs, coopgl::kGameLinkTimeoutMaximumMs);   /* M11a S3 (manager decision 6(a)): link1's terms on the world-server link too, applied at its CONNECT (the transport logs them); coop-store.exe sets the same on its end */
     std::string err;
-    if (!g_link->Join(address, port, &err)) { if (!g_redialQuiet) ErrorLog("[STORE] server join failed: " + err); delete g_link; g_link = 0; ::InterlockedExchange(&g_relayLinkedCached, 0); return false; }   /* B12-f (M-3): a re-dial's failed join is counted, not printed - the notebook not being there is the ordinary case for 720 of them */
+    std::string dialAddr = address;
+    unsigned short dialPort = port;
+    net::RelayRouteTarget(route, &dialAddr, &dialPort);   /* g_linkAddr keeps the address as given, so every re-dial takes the same route */
+    net::RelayRouteNoteDial(route);
+    if (!g_link->Join(dialAddr, dialPort, &err)) { if (!g_redialQuiet) ErrorLog("[STORE] server join failed (route " + std::string(relaybridge::RouteWord(route)) + "): " + err); delete g_link; g_link = 0; ::InterlockedExchange(&g_relayLinkedCached, 0); return false; }   /* B12-f (M-3): a re-dial's failed join is counted, not printed - the notebook not being there is the ordinary case for 720 of them */
     g_linkAddr = address; g_linkPort = port;
     /* B12-f (review-b12e H-3): THE MOMENT THE SOCKET ENTERED ITS CONNECT. Stamped here rather than in the
        re-dial, so EVERY dial - the title tick's, the verb's and the re-dial's - gives the connect budget and
        the handshake budget a stamp to measure from, and a title dial that hangs CONNECTING into a loaded
        world is judged by its own age instead of by a zero. */
     g_redialDialAtMs = ::GetTickCount();
-    if (!g_redialQuiet) DebugLog("[STORE] connecting to the store at " + address + ":" + N((long long)port));
+    if (!g_redialQuiet) DebugLog("[STORE] connecting to the store at " + relaybridge::AddrForLog(address) + ":" + N((long long)port) + " - route tried: " + relaybridge::RouteWord(route));
     return true;
 }
 
@@ -19588,11 +20663,31 @@ static void GiveHomeOnCreate(void* p, const std::string& worldId)
                     : std::string("the engine call faulted - tried again when the building's residents are next checked"))
                  + " (first 40 lines; home[...] on the [TG] line counts every one)");
 }
+/* A COPY OF ANOTHER GAME'S GROUP BUILT WHILE ITS HOME BUILDING WAS NOT LOADED HERE (spawn.cpp PrepareContextForSpawn: the sender's
+   building handle did not resolve, so the copy was made with no home building). Its home is owed: listed with that handle and the home key
+   its world record carries, and given by CopyHomeOwedTick once that building is loaded here. MAIN THREAD [t755-copyhome-note] */
+static void NoteCopyHomeImpl(void* p, const std::string& worldId, const unsigned char* hand32, int sent, int resolved)
+{
+    if (p == 0 || hand32 == 0) return;
+    const std::map<void*, std::string>::const_iterator b = g_bind.find(p);
+    const int bound = (!worldId.empty() && b != g_bind.end() && b->second == worldId) ? 1 : 0;
+    const int d = coopstore::CopyHomeOwe(sent, resolved, bound);
+    if (d == coopstore::kCopyHomeNone) return;
+    if (d == coopstore::kCopyHomeUntracked)
+    {
+        ++g_copyHomeNoId;
+        if (++g_copyHomeOwedLines <= 40) DebugLog("[STORE] home of copy " + P(p) + ": the building it was sent with is not loaded here and the copy is bound under no world id - it stays without a home (copyHome noId=" + N(g_copyHomeNoId) + ")");
+        return;
+    }
+    CopyHomeOweAdd(p, worldId, hand32, RecordHomeOf(worldId)); ++g_copyHomeOwed;
+    if (++g_copyHomeOwedLines <= 40)
+        DebugLog("[STORE] home of copy " + worldId + ": the building it was sent with is not loaded here - owed, given by the once-a-second owed-home check when that building is loaded here (copyHomeOwed=" + N(g_copyHomeOwed) + "; first 40 lines)");
+}
 /* MAIN THREAD (towngen.cpp T392BuildingHasResidents) - see store.h. An entry whose platoon is no longer bound to its world id under
    the same bind stamp is a group that is gone (or an address that names another group now) and is dropped unread. */
 static int GiveOwedHomesImpl(const char* key, void* building)
 {
-    if (key == 0 || key[0] == 0 || building == 0 || g_homeOwed.empty()) return 0;
+    if (key == 0 || key[0] == 0 || building == 0 || g_homeOwed.empty()) return 0;   /* groups made from their records only: owed copy homes are given by CopyHomeOwedTick [t755-copyhome-nocheck] */
     int given = 0;
     std::map<void*, HomeOwed>::iterator it = g_homeOwed.begin();
     while (it != g_homeOwed.end())
@@ -19648,7 +20743,11 @@ static std::string HomeReportImpl()
 {
     return " home[asked,givenAtCreate,givenLater,notLoadedAtCreate,notResident,fault,owedGone,owedNow]=" + N(g_homeAsked) + "," + N(g_homeSetCreate) + "," + N(g_homeSetLater)
            + "," + N(g_homeNotLoaded) + "," + N(g_homeNotResident) + "," + N(g_homeFault) + "," + N(g_homeOwedGone) + "," + N((long long)::InterlockedCompareExchange(&g_homeOwedNow, 0, 0))
-           + " homeKeyless[made,keyed,gone,now]=" + N(g_homeKeylessMade) + "," + N(g_homeKeylessKeyed) + "," + N(g_homeKeylessGone) + "," + N((long long)g_homeKeyless.size());
+           + " homeKeyless[made,keyed,gone,now]=" + N(g_homeKeylessMade) + "," + N(g_homeKeylessKeyed) + "," + N(g_homeKeylessGone) + "," + N((long long)g_homeKeyless.size())
+           + " copyHome[owed,given,notResident,hadHome,retried,giveFailed,keyHandleMismatch,gone,noId,now]=" + N(g_copyHomeOwed) + "," + N(g_copyHomeGiven) + "," + N(g_copyHomeNotResident)
+           + "," + N(g_copyHomeHad) + "," + N(g_copyHomeRetried) + "," + N(g_copyHomeGiveFailed) + "," + N(g_copyHomeMismatch) + "," + N(g_copyHomeGone) + "," + N(g_copyHomeNoId)
+           + "," + N((long long)g_copyHomeOwedMap.size())   /* [t755-copyhome-report2] */
+           + " loadOverrideHome[kept,restored,restoreFailed,owedByKey,noneAnywhere]=" + N(g_loHomeKept) + "," + N(g_loHomeRestored) + "," + N(g_loHomeRestoreFailed) + "," + N(g_loHomeOwedByKey) + "," + N(g_loHomeNoneAnywhere);
 }
 // P1b (a): a squad this instance has never seen - build a sleeping platoon from the record with the engine's own path
 // (F451: addUnloadedSquad = platoon shell + deactivate(records) + the unloaded list; the engine wakes it when its zone
@@ -19971,7 +21070,7 @@ void ReportStore()
                  + " testProfile=" + N((long long)ConfigProfileTest()) + " cap=" + N((long long)g_profCap) + " active=" + N((long long)g_profRows.size())
                  + " answers=" + N(g_profAnswers) + " newSent=" + N(g_profNewSent) + " deleteSent=" + N(g_profDeleteSent) + " pickSent=" + N(g_profPickSent) + " factionSent=" + N(g_profFactionSent)
                  + " refused=" + N(g_profRefused) + " lastVerdict=" + N((long long)g_profLastVerdict) + " malformed=" + N(g_profMalformed)
-                 + " lobbyIgnored=" + N(g_profLobbyIgnored) + " recycled[done,skipped,failed,kept]=" + N(g_profRecycled) + "," + N(g_profRecycleSkipped) + "," + N(g_profRecycleFailed) + "," + N(g_profRecycleKept)
+                 + " lobbyIgnored=" + N(g_profLobbyIgnored) + " deleted[done,failed]=" + N(g_profDeleted) + "," + N(g_profDeleteFailed)
                  + " fallbacks=" + N(g_profFallbacks) + " deadEnds=" + N(g_profDeadEnds) + " loadRefusedOtherProfile=" + N(g_loadRefusedOtherProfile)
                  + " storeRefused[samePerson]=" + N(g_storeRefusedSamePerson) + " storeRefused[liveProto]=" + N(g_storeRefusedLiveProto) + " keyUpgraded=" + N(g_worldKeyUpgraded)
                  + " profileSaveFolder='" + g_profSaveFolder + "' saveFolder[found,new,twins,renamed,renameKept]=" + N(g_saveFolderFound) + "," + N(g_saveFolderNew)
@@ -19987,6 +21086,7 @@ void ReportStore()
                 once in this install's life; a 1 at every start means the settings file is not being written,
                 and the notebook is renaming this game at every restart. */
              + " playerId[generated,loaded,sentInHello]=" + N(ConfigPlayerIdGenerated()) + "," + N(ConfigPlayerIdLoaded()) + "," + N(g_helloPlayerIdSent)
+             + " personId[adopted,held,bad]=" + N(g_welcomePersonAdopted) + "," + N(g_welcomePersonHeld) + "," + N(g_welcomePersonBad)
              + " storeRefused[protocol,noPlayerId,duplicateId,full,lifetimeFull]=" + N(g_storeRefusedProtocol) + "," + N(g_storeRefusedNoPlayerId) + "," + N(g_storeRefusedDuplicateId) + "," + N(g_storeRefusedFull) + "," + N(g_storeRefusedLifetimeFull)
              + " worldKey=" + wkWord
              /* W2b (decision 58): the world folder the store names, where the record index was read, how often it waited
@@ -20005,7 +21105,6 @@ void ReportStore()
              + ",refusedOlder=" + N(g_loadRefusedOlderWorld) + ",refusedNotebookBehind=" + N(g_loadRefusedNotebookBehind) + ",noGen=" + N(g_wgNoGen)
              + ",refusedUnnumbered=" + N(g_loadRefusedUnnumbered) + ",refusedKeyless=" + N(g_loadRefusedKeyless) + ",adopted=" + N(g_wgAdopted)
              + ",notebookBehindLive=" + N(g_wgNotebookBehindLive) + ",numbered=" + N((long long)(g_wgNotebook.numbered ? 1 : 0)) + "]"
-             + RepairReportToken()   /* restore1c */
              + " worldStamp[stamped,pendingGen,reserved,highGen,skipped,sendFailed,resent,seqSeen,operator,known,answerMalformed,profileMismatch,markSkippedNumbered,ackedGen,scanAdopted]="
              + N(g_wgStamped) + "," + N((long long)g_wgPendGen) + "," + N((long long)g_wgReserved) + "," + N((long long)g_wgHighGen)
              + "," + N(g_wgStampSkipped) + "," + N(g_wgStampSendFailed) + "," + N(g_wgStampResent) + "," + N((long long)g_wgSeqSeen) + "," + N((long long)g_wgOperator)
@@ -20034,7 +21133,7 @@ void ReportStore()
                 batchesPumped is how many bounded drains the gate did (it is >= runs, and > runs is the case H-2
                 said was invisible); drainMsMax is the single most expensive of them. */
              + " loadGateP7h[waitedForStoreLink,addressArrivedInGate,storeLinkSessionLost,batchesPumped,sessionPumps,drainMsMax]=" + N(g_loadGateWaitedForStoreLink) + "," + N(g_loadGateAddressArrivedInGate) + "," + N(g_loadGateStoreLinkSessionLost) + "," + N(g_loadGateBatchesPumped) + "," + N(g_loadGateSessionPumps) + "," + N(g_loadGateDrainMsMax)
-             + " pumpBatch[capped,carried,carryDropped,held]=" + N(g_pumpBatchesCapped) + "," + N(g_pumpCarried) + "," + N(g_pumpCarryDropped) + "," + N((long long)g_linkCarry.size())
+             + " pumpBatch[capped,carried,carryDropped,held,collapsed,carryMax]=" + N(g_pumpBatchesCapped) + "," + N(g_pumpCarried) + "," + N(g_pumpCarryDropped) + "," + N((long long)g_linkCarry.Size()) + "," + N(g_linkCarry.Collapsed()) + "," + N((long long)g_linkCarry.MaxSize())
              /* P7f (review-p6z C-1 and H-3), CORRECTED BY P7p (review-p7f M-1). TWO NUMBERS, AND ONLY ONE OF
                 THEM IS THE ACCEPTANCE TOKEN.
                   arrivedNoWorld     - a record-class message ARRIVED with no world (or during a load). It is
@@ -20121,6 +21220,9 @@ void ReportStore()
              + " outageQueueSeqEcho[received,appliedToKnownKey,unknownKey]=" + N(g_queueSeqEchoReceived) + "," + N(g_queueSeqEchoApplied) + "," + N(g_queueSeqEchoUnknownKey) + " outageQueueSeqEchoMalformed=" + N(g_queueSeqEchoMalformed)
              + " zoneOutageQueue[queued,queueRefused,replayWriteFailed]=" + N(g_zoneQueuedNoNotebook) + "," + N(g_zoneQueueRefused) + "," + N(g_queueZoneWriteFailed)
              + "   (B12 / decision 52, counters restated by B12-c: THE IDENTITY IS queued == replayed + droppedNewerWriter + droppedUnknown + droppedBadPayload + droppedNotMineNow + superseded + pending, and a LOADED entry counts as queued on load so it closes across a restart of the game. OUTSIDE the identity, because neither was ever a queued entry of this session: droppedFull is a write the cap refused (256 entries / 4 MB) and outageQueueBadLines is a journal line that would not parse. journalWriteFailed means QUEUED IN MEMORY ONLY - the entries replay this session and do not survive a restart - and is a defect, as offThread and badKey are. superseded is an entry replaced in place by a later one for the same key, which only the zone and door families do; a box move is an event and every one is kept. seqZeroIgnored is an arriving RECORD with no sequence number in it, which is left alone rather than written in. Family counts are QUEUED counts and sum to queued. THE VERDICT: in the outage leg queued >= 1 and replayed >= 1 after the relay restarts, and droppedNewerWriter == 0 when nobody else wrote the same record)"
+             + " storeAuth[answered,noPassword,badChallenge,refused,stopped,extra,hostTokenSent,hostTokenFailed]=" + N(g_storeAuthAnswered) + ","
+               + N(g_storeAuthNoPassword) + "," + N(g_storeAuthBadChallenge) + "," + N(g_storeRefusedAuth) + "," + N((long long)g_storeAuthStop)
+               + "," + N(g_storeAuthExtra) + "," + N(g_storeHostTokenSent) + "," + N(g_storeHostTokenFailed)
              + " storeProto[mismatch,ignoredMessages]=" + N((long long)(g_storeProtoMismatch ? 1 : 0)) + "," + N(g_storeMismatchIgnored)
              + " u8AnsiFallback=" + N((long long)g_u8AnsiFallback)   /* paths read in the ANSI code page because they were not UTF-8 (u8file.h) */
              + StoreSendBoundToken() + StoreBundleToken() + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
@@ -20593,108 +21695,580 @@ int StoreOpenSaveName(char* out, int cap) { return OpenSaveNamePod(out, cap); }
 int StoreAutoLoadFacts(std::string* folder, int* found, int* quickSave, int* neverPlayed, std::string* profName)
 {
     if (g_profPickedNum == 0 || g_profSaveFolder.empty() || StoreWelcomedThisLink() == 0 || !LinkUp()) return 0;
-    *folder = g_profSaveFolder;
-    *found = g_profSaveFolderFound;
-    *quickSave = ProfileFolderSaved() ? 1 : 0;
+    ResetCarryEndIfSaved("the automatic load");   /* T-36: once the reset world's folder is saved, the automatic load loads it */
+    if (ResetCarryLive())   /* T-36 S2: the save the reset world imports - its folder, found by its key file, and its quick.save now */
+    {
+        *folder = g_resetCarryFolder;
+        *found = 1;
+        const DWORD qa = U8GetFileAttributes(JoinPathA(JoinPathA(SaveRootDefault(), g_resetCarryFolder), "quick.save").c_str());
+        *quickSave = (qa != INVALID_FILE_ATTRIBUTES && (qa & FILE_ATTRIBUTE_DIRECTORY) == 0) ? 1 : 0;
+    }
+    else
+    {
+        *folder = g_profSaveFolder;
+        *found = g_profSaveFolderFound;
+        *quickSave = ProfileFolderSaved() ? 1 : 0;
+    }
     *neverPlayed = g_profPickedNeverPlayed;
     *profName = g_profPickedName;
     return 1;
 }
-/* ONE LEFTOVER TO THE RECYCLE BIN, through the same drive and size checks and the same move as a deleted profile's save: where Windows
-   would delete for good it is KEPT. 1 = moved, 0 = kept or the move failed (said in the log), -1 = no such folder. */
-static int WorldLeftoverRecycle(const std::string& worldName, const std::string& path, const char* what)
+/* T-36 S2: THE IMPORT REQUEST, in its own frame with no C++ object in it (C2712): a load request the engine's load post has just
+   written (SaveManager+0xA0 = 2, its save name at +0xB0 and folder at +0xD8 - 0x47A9A0) becomes the request the import screen's post
+   writes (0x47AA80: +0xA0 = 3, the flags at +0xA4, the same two name fields). 1 = written, 0 = declined (implausible object, or no
+   load request pending), -1 = raised. */
+const int kResetLoadRequest = 2, kResetImportRequest = 3;
+const int kResetImportFlagsOff = 0xA4;   /* SaveManager+0xA4: the request's flags (decomp_47aa80.txt) */
+int ResetImportRequestPod(void* saveMgr, unsigned int flags)
 {
-    std::string dir = path;
+    __try
     {
-        char full[MAX_PATH * 2];
-        const DWORD got = U8GetFullPathName(path.c_str(), (DWORD)sizeof full, full, 0);
-        if (got > 0 && got < (DWORD)sizeof full) dir = full;   /* the drive check and the Recycle Bin need a full path */
-    }
-    if (!DirExistsA(dir)) return -1;
-    bool binOk = false, sizeOk = false; unsigned long long bytes = 0, limit = 0;
-    RecycleBinFits(dir, &binOk, &sizeOk, &bytes, &limit);
-    if (!binOk || !sizeOk)
-    {
-        ErrorLog("[WORLD] '" + worldName + "': " + what + " '" + dir + "' was KEPT - "
-                 + (!binOk ? std::string("that drive has no Recycle Bin (or is not a local fixed drive)")
-                           : "it is too big for the Recycle Bin (" + N((long long)(bytes >> 20)) + " MB, limit " + N((long long)(limit >> 20)) + " MB)")
-                 + ", and Windows would delete it for good there. Nothing was deleted.");
-        return 0;
-    }
-    bool aborted = false;
-    const int rc = RecycleMoveToBin(dir, &aborted);
-    if (rc == 0 && !aborted && !DirExistsA(dir))
-    {
-        DebugLog("[WORLD] '" + worldName + "': " + what + " '" + dir + "' (" + N((long long)(bytes >> 20)) + " MB) moved to the Recycle Bin");
+        if (!Plaus(saveMgr)) return 0;
+        if (*(const int*)((const char*)saveMgr + kSaveRequestCodeOff) != kResetLoadRequest) return 0;
+        *(unsigned int*)((char*)saveMgr + kResetImportFlagsOff) = flags;
+        *(int*)((char*)saveMgr + kSaveRequestCodeOff) = kResetImportRequest;
         return 1;
     }
-    ErrorLog("[WORLD] '" + worldName + "': moving " + what + " '" + dir + "' to the Recycle Bin FAILED (code " + N((long long)rc)
-             + (aborted ? ", aborted" : "") + ") - it is left where it is");
-    return 0;
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-/* A DELETED WORLD'S SAVES ON THIS COMPUTER (see store.h). A world's saves live outside its world folder - one folder per profile in
-   Kenshi's save root, one records store per profile in <data>\\players - and both are found by the world NAME alone, so a later world
-   given the same name would load them and its first host would be refused as older than the world. They go to the Recycle Bin here.
-   In use, never touched, and counted apart from a real failure: the folder this game plays from, the records stores of that folder's
-   profile (every spelling of the world), and the records store this game has open (g_ownStoreName) or has chosen and judges its
-   records by (g_ohStore, kept across a leave). MAIN THREAD (the title panel): each move is a same-drive rename and the size check one
-   listing per folder, so the pause is short and one-off - the same cost a profile DELETE accepts, still on the frame rather than a worker. */
-int StoreWorldRecycleLeftovers(const std::string& worldName, const std::string& worldId, std::string* summary)
+/* T-36 S2: THE AUTOMATIC LOAD'S POST - or, when this pick is carried into the reset world, Kenshi's IMPORT GAME in its place, posted
+   exactly as the import screen posts it: the engine's own load post (PostLoadChecked) writes the save's name and folder, then the
+   request and its flags are set in the same frame, before the engine's request pump (0x47BAA0) reads them; the pump then calls
+   importGame 0x3788F0 with that folder and name. Returns PostLoadChecked's codes (1 = posted). The import is not a load, so the key-file
+   gate and the records overlay (both at loadGame) do not run for it; the profile-folder gate at the request pump lets it through
+   (coopprof::ProfileResetImportPass). MAIN THREAD, title pump. */
+int StoreResetCarryPost(const std::string& folder)
 {
-    int folders = 0, stores = 0, inUse = 0, failed = 0;
+    if (!ResetCarryLive() || folder != g_resetCarryFolder) return PostLoadChecked(folder);
+    const int posted = PostLoadChecked(folder);
+    if (posted != 1) return posted;   /* a pending request (0) is waited on by the caller; -1 / -2: its own box */
+    const unsigned int flags = worldreset::ResetImportFlags();
+    char fx[16]; _snprintf(fx, sizeof(fx), "0x%02X", flags); fx[15] = 0;
+    const int conv = ResetImportRequestPod(OwnSaveManagerPtr(), flags);
+    if (conv == 1)
+    {
+        ++g_resetCarryPosted;
+        g_resetCarryArmWorld = ::InterlockedCompareExchange(&g_ownWorldReset, 0, 0);   /* T-36: the world load count the import's own load moves (OwnCreatedSaveTick) */
+        g_resetImportHoldSaid = 0;   /* this import's wait for the world server's records is said once */
+        DebugLog("[RESET] import posted: Kenshi's IMPORT GAME from save folder '" + folder + "' with flags " + fx + " (research kept; squad positions,"
+                 " dead named characters, buildings and relations not imported) - the reset world's saves go to '" + g_resetCarryForFolder
+                 + "'. resetCarryPosted=" + N(g_resetCarryPosted));
+        return 1;
+    }
+    ++g_resetCarryPostFailed;
+    ErrorLog("[RESET] import NOT posted: the load request for '" + folder + "' could not be turned into an import (" + N((long long)conv)
+             + ") - the load stays posted and the load gate refuses a save of the world as it was. resetCarryPostFailed=" + N(g_resetCarryPostFailed));
+    return -2;
+}
+/* T-36: 1 while this pick is carried into the reset world (decided, its own save not yet made) - the HOST GAME / JOIN line says so
+   (ui.cpp LoadTick). MAIN THREAD. */
+int StoreResetCarryMoving() { return ResetCarryLive() ? 1 : 0; }
+/* PERMANENT DELETE (DELETE WORLD and DELETE PROFILE delete for good, never through the Recycle Bin). One folder
+   tree: it must lie strictly inside its root (swdel::PathInside on the full paths: the world store, the save root or the records
+   stores' folder); a link or junction inside it is removed itself and never entered (swdel::EntryKindOf), so nothing outside the
+   tree is touched. The first file or folder Windows will not remove (another program has it open) stops the delete there and is
+   reported; what was deleted before it stays deleted - a permanent delete has nothing to put back. */
+struct PermDelCount { long long files, folders, links; PermDelCount() : files(0), folders(0), links(0) {} };
+static std::string PermDelFullPath(const std::string& p)
+{
+    char full[MAX_PATH * 2];
+    const DWORD got = U8GetFullPathName(p.c_str(), (DWORD)sizeof full, full, 0);
+    return (got > 0 && got < (DWORD)sizeof full) ? std::string(full) : p;   /* not resolved: PathInside refuses a relative path */
+}
+/* a read-only file or folder is deleted too: the flag is taken off first - never on a link or junction (swdel::ClearReadOnlyFirst) */
+static void PermDelWritable(const std::string& p, DWORD attrs)
+{
+    if (!swdel::ClearReadOnlyFirst((unsigned long)attrs)) return;
+    const DWORD keep = attrs & (DWORD)(FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+    ::SetFileAttributesW(U8W(p.c_str()).c_str(), keep != 0 ? keep : (DWORD)FILE_ATTRIBUTE_NORMAL);
+}
+/* one file, or one link (a folder link or junction with the folder call, a file link with the file call - the link, never its target) */
+static bool PermDelEntry(const std::string& p, int kind, DWORD attrs, PermDelCount* c, std::string* failPath, DWORD* failErr)
+{
+    PermDelWritable(p, attrs);
+    const bool asDir = kind == swdel::kEntryLink && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    const BOOL ok = asDir ? U8RemoveDirectory(p.c_str()) : U8DeleteFile(p.c_str());
+    if (ok == 0) { *failPath = p; *failErr = ::GetLastError(); return false; }
+    if (kind == swdel::kEntryLink) ++c->links; else ++c->files;
+    return true;
+}
+/* the being-deleted marker (swdel::kDeleteMarkFile) written into dir: 0 = written, else Windows' error */
+static DWORD PermDelMarkWrite(const std::string& dir)
+{
+    HANDLE h = U8CreateFile(JoinPathA(dir, swdel::kDeleteMarkFile).c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return ::GetLastError() != 0 ? ::GetLastError() : (DWORD)ERROR_WRITE_FAULT;
+    static const char kText[] = "This folder is being deleted for good; the delete is finished at the next start.\r\n";
+    DWORD put = 0;
+    const BOOL wrote = ::WriteFile(h, kText, (DWORD)(sizeof kText - 1), &put, 0);
+    const BOOL flushed = wrote != 0 ? ::FlushFileBuffers(h) : FALSE;
+    DWORD err = 0;
+    if (wrote == 0 || flushed == 0 || put != (DWORD)(sizeof kText - 1)) { err = ::GetLastError(); if (err == 0) err = ERROR_WRITE_FAULT; }
+    ::CloseHandle(h);
+    return err;
+}
+/* one real folder: listed first (the listing closed before anything is deleted), then each entry, then the folder itself.
+   lastName (top folder only) = a file deleted after everything else in it; the being-deleted marker goes after that, the very
+   last. Should the top folder itself not go, a marker it held is written again, so the delete is still finished later. */
+static bool PermDelTree(const std::string& dir, DWORD dirAttrs, const char* lastName, int depth, PermDelCount* c, std::string* failPath, DWORD* failErr)
+{
+    if (depth > 64) { *failPath = dir; *failErr = ERROR_FILENAME_EXCED_RANGE; return false; }   /* deeper than any save or store is built */
+    std::vector<std::string> names;
+    std::vector<DWORD> attrs;
+    {
+        U8FindData fd;
+        HANDLE h = U8FindFirstFile(JoinPathA(dir, "*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) { *failPath = dir; *failErr = ::GetLastError(); return false; }
+        do { names.push_back(fd.cFileName); attrs.push_back(fd.dwFileAttributes); } while (U8FindNextFile(h, &fd));
+        ::FindClose(h);
+    }
+    size_t last = names.size(), mark = names.size();
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        const int k = swdel::EntryKindOf(names[i], (unsigned long)attrs[i]);
+        if (k == swdel::kEntrySkip) continue;
+        const int rank = k == swdel::kEntryFile ? swdel::LastRank(names[i], lastName, depth) : 0;
+        if (rank == 1) { last = i; continue; }
+        if (rank == 2) { mark = i; continue; }
+        const std::string p = JoinPathA(dir, names[i]);
+        if (k == swdel::kEntryDir) { if (!PermDelTree(p, attrs[i], 0, depth + 1, c, failPath, failErr)) return false; }
+        else if (!PermDelEntry(p, k, attrs[i], c, failPath, failErr)) return false;
+    }
+    if (last < names.size() && !PermDelEntry(JoinPathA(dir, names[last]), swdel::kEntryFile, attrs[last], c, failPath, failErr)) return false;
+    if (mark < names.size() && !PermDelEntry(JoinPathA(dir, names[mark]), swdel::kEntryFile, attrs[mark], c, failPath, failErr)) return false;
+    PermDelWritable(dir, dirAttrs);
+    if (U8RemoveDirectory(dir.c_str()) == 0)
+    {
+        *failPath = dir;
+        *failErr = ::GetLastError();
+        if (mark < names.size())
+        {
+            const DWORD mErr = PermDelMarkWrite(dir);
+            if (mErr != 0) ErrorLog("[DEL] '" + dir + "': its being-deleted marker could NOT be written again (Windows error " + N((long long)mErr)
+                                    + ") - the emptied folder is left unmarked");
+        }
+        return false;
+    }
+    ++c->folders;
+    return true;
+}
+/* 1 = deleted, 0 = stopped or refused (*failPath / *failErr; err 0 = refused, nothing touched), -1 = no such folder (its attributes
+   not read with "file not found" or "path not found"; any other failure to read them is a stop). mark = 1: the being-deleted marker
+   is written into a real folder before its walk (not written = a stop, nothing touched). One log line each. */
+static int PermDelFolder(const std::string& path, const std::string& root, const std::string& tag, const char* lastName, int mark, std::string* failPath, DWORD* failErr)
+{
+    failPath->clear();
+    *failErr = 0;
+    const std::string dir = PermDelFullPath(path), top = PermDelFullPath(root);
+    const DWORD a = U8GetFileAttributes(dir.c_str());
+    const DWORD aErr = a == INVALID_FILE_ATTRIBUTES ? ::GetLastError() : 0;
+    const int state = swdel::TopStateOf(a != INVALID_FILE_ATTRIBUTES, (unsigned long)aErr);
+    if (state == swdel::kTopGone) return -1;
+    if (!swdel::PathInside(dir, top))
+    {
+        *failPath = dir;
+        ErrorLog(tag + " '" + dir + "' NOT deleted: it is not inside '" + top + "' - nothing was touched");
+        return 0;
+    }
+    if (state != swdel::kTopPresent)
+    {
+        *failPath = dir;
+        *failErr = aErr;
+        ErrorLog(tag + " '" + dir + "' delete STOPPED before it began: its attributes could not be read (Windows error " + N((long long)aErr)
+                 + ") - nothing was touched");
+        return 0;
+    }
+    if (mark != 0 && (a & FILE_ATTRIBUTE_REPARSE_POINT) == 0 && (a & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        const DWORD mErr = PermDelMarkWrite(dir);
+        if (mErr != 0)
+        {
+            *failPath = JoinPathA(dir, swdel::kDeleteMarkFile);
+            *failErr = mErr;
+            ErrorLog(tag + " '" + dir + "' delete STOPPED before it began: its being-deleted marker could not be written (Windows error "
+                     + N((long long)mErr) + ") - nothing was touched");
+            return 0;
+        }
+    }
+    const DWORD t0 = ::GetTickCount();
+    PermDelCount c;
+    bool ok;
+    if ((a & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (a & FILE_ATTRIBUTE_DIRECTORY) == 0)   /* the path itself is a link (removed, its target untouched) or a lone file */
+        ok = PermDelEntry(dir, (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ? (int)swdel::kEntryLink : (int)swdel::kEntryFile, a, &c, failPath, failErr);
+    else
+        ok = PermDelTree(dir, a, lastName, 0, &c, failPath, failErr);
+    const std::string counts = N(c.files) + " file(s), " + N(c.folders) + " folder(s), " + N(c.links) + " link(s) removed without following, in "
+                             + N((long long)(::GetTickCount() - t0)) + " ms";
+    if (ok) DebugLog(tag + " '" + dir + "' deleted for good: " + counts);
+    else ErrorLog(tag + " '" + dir + "' delete STOPPED at '" + *failPath + "' (Windows error " + N((long long)*failErr) + ") after " + counts
+                  + " - what was deleted before it stays deleted");
+    return ok ? 1 : 0;
+}
+int StoreDeleteTree(const std::string& path, const std::string& root, const std::string& tag, const char* lastName, int mark, std::string* failPath, unsigned long* failErr)
+{
+    DWORD e = 0;
+    const int r = PermDelFolder(path, root, tag, lastName, mark, failPath, &e);
+    *failErr = (unsigned long)e;
+    return r;
+}
+/* T-36: THE WORLDS RESET FROM ONE BEING DELETED (world id worldId): each world folder whose world.txt lists that id among its earlier
+   ids (line 3) - a save of the deleted world such a world still imports from stays (swdel::SaveDirCarriedOnward) until that world has a
+   save of its own. A world.txt that is there but cannot be read (held by the world server, a read error) may be such a world: it is
+   listed as unread, and every save that could be an import source stays (one line under tag). No world id = none. MAIN THREAD. */
+static std::vector<swdel::ResetChildWorld> ResetChildWorldsOf(const std::string& worldId, const std::string& tag)
+{
+    std::vector<swdel::ResetChildWorld> children;
+    const std::string wtop = StoreTopDir();
+    if (wtop.empty() || worldId.empty()) return children;
+    std::vector<std::string> wdirs;
+    U8FindData wfd;
+    HANDLE wh = U8FindFirstFile(JoinPathA(wtop, "*").c_str(), &wfd);
+    if (wh != INVALID_HANDLE_VALUE)
+    {
+        do { if (swdel::EntryKindOf(wfd.cFileName, (unsigned long)wfd.dwFileAttributes) == swdel::kEntryDir) wdirs.push_back(wfd.cFileName); } while (U8FindNextFile(wh, &wfd));
+        ::FindClose(wh);
+    }
+    std::string unreadFirst;
+    DWORD unreadErr = 0;
+    int unread = 0;
+    for (size_t i = 0; i < wdirs.size(); ++i)
+    {
+        const std::string wtxt = JoinPathA(JoinPathA(wtop, wdirs[i]), "world.txt");
+        std::vector<char> b;
+        if (!ReadFileBytes(wtxt, &b))
+        {
+            const DWORD a = U8GetFileAttributes(wtxt.c_str());
+            const DWORD aErr = (a == INVALID_FILE_ATTRIBUTES) ? ::GetLastError() : 0;
+            if (a == INVALID_FILE_ATTRIBUTES ? (aErr == ERROR_FILE_NOT_FOUND || aErr == ERROR_PATH_NOT_FOUND) : (a & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;   /* no world.txt */
+            swdel::ResetChildWorld u;
+            u.unread = true;
+            children.push_back(u);
+            if (unread++ == 0) { unreadFirst = wdirs[i]; unreadErr = aErr; }
+            continue;
+        }
+        const std::string txt(b.begin(), b.end());
+        swdel::ResetChildWorld c;
+        bool up = false;
+        if (!coopworld::WorldTxtParseId(txt, &c.id, &up) || c.id == worldId || !coopworld::WorldTxtParseEarlier(txt, &c.earlier, 0, 0)) continue;
+        bool listed = false;
+        for (size_t k = 0; k < c.earlier.size() && !listed; ++k) if (c.earlier[k] == worldId) listed = true;
+        if (listed) children.push_back(c);
+    }
+    if (unread > 0)
+        DebugLog(tag + " " + N((long long)unread) + " world folder(s) hold a world.txt that could not be read (first: '" + unreadFirst + "'"
+                 + (unreadErr != 0 ? ", Windows error " + N((long long)unreadErr) : std::string()) + ") - each may be a world reset from this one, so every"
+                 " save of it such a world could import the player's characters from is left where it is");
+    return children;
+}
+/* A DELETED PROFILE'S SAVE AND RECORDS STORE, deleted for good: every save folder of this profile whose key file carries the
+   world's id under any world name, or names this world with no id (swdel::SaveDirGoesWithProfile; its key file goes last, so a folder whose delete
+   stopped is found again by the same search), then each records store named for that profile in this world, by id and as named
+   before ids (swdel::StoreNamesToDelete; found again by name). In use and left: the folder this game plays from, and a store this
+   game has open (g_ownStoreName) or judges its records by (g_ohStore). false = stopped; *stoppedAt = the save folder it stopped
+   at ("" = a records store). */
+static bool ProfileDeleteRun(const std::string& worldKey, const std::string& worldId, const std::string& person, unsigned num, std::string* stoppedAt)
+{
+    const std::string deletedId = coopprof::ProfileId(person, num);   /* person: the id the world knows this player by */
+    const std::string tag = "[PROF] deleted profile " + N((long long)num) + ":";
+    const std::string root = SaveRootDefault();
+    std::vector<coopprof::SaveDirSeen> seen;
+    if (!root.empty()) seen = SaveRootScan(root);
+    std::vector<std::string> keys;
+    coopprof::LeftoverAddOnce(&keys, worldKey);
+    int saves = 0, stores = 0, carriedKept = 0;
+    /* T-36: the worlds reset from this one - this profile's save such a world still imports from stays until that world has a save of
+       its own for this profile (swdel::SaveDirCarriedOnward), with this profile's records stores; a world.txt that could not be read
+       keeps it too */
+    const std::vector<swdel::ResetChildWorld> children = ResetChildWorldsOf(worldId, tag);
+    std::string failPath;
+    DWORD failErr = 0;
+    for (size_t i = 0; i < seen.size(); ++i)
+    {
+        if (!swdel::SaveDirGoesWithProfile(seen[i], worldKey, worldId, deletedId, num)) continue;
+        coopprof::LeftoverAddOnce(&keys, seen[i].world);
+        if (coopprof::SameFolderName(seen[i].name, ConfigSlot()))
+        {
+            DebugLog(tag + " save folder '" + seen[i].name + "' is the one this game plays from - left where it is");
+            continue;
+        }
+        if (swdel::SaveDirCarriedOnward(seen, i, children))
+        {
+            ++carriedKept;
+            DebugLog(tag + " save folder '" + seen[i].name + "' is the save a world reset from this one still imports the player's characters from"
+                     " (that world has no save of its own for this profile yet) - left where it is");
+            continue;
+        }
+        const int r = PermDelFolder(JoinPathA(root, seen[i].name), root, tag + " save folder", kWorldKeyFileName, 0, &failPath, &failErr);
+        if (r == 0) { *stoppedAt = PermDelFullPath(JoinPathA(root, seen[i].name)); return false; }
+        if (r > 0) ++saves;
+    }
+    const std::string top = OwnStoresTop();
+    const std::vector<std::string> ids(1, deletedId);
+    const std::vector<std::string> names = top.empty() ? std::vector<std::string>() : swdel::StoreNamesToDelete(keys, ids, worldId);
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        const std::string dir = top + "\\" + names[i];
+        if (!DirExistsA(dir)) continue;
+        if ((!g_ownStoreName.empty() && coopprof::SameFolderName(g_ownStoreName, names[i])) || (!g_ohStore.empty() && coopprof::SameFolderName(g_ohStore, names[i])))
+        {
+            DebugLog(tag + " records store '" + dir + "' is in use by this game - left where it is");
+            continue;
+        }
+        if (carriedKept > 0)
+        {
+            DebugLog(tag + " records store '" + dir + "' goes with the save a world reset from this one still imports from - left where it is");
+            continue;
+        }
+        const int r = PermDelFolder(dir, top, tag + " records store", 0, 0, &failPath, &failErr);
+        if (r == 0) return false;
+        if (r > 0) ++stores;
+    }
+    DebugLog(tag + " " + N((long long)saves) + " save folder(s) and " + N((long long)stores) + " records store(s) deleted for good"
+             + (carriedKept > 0 ? "; " + N((long long)carriedKept) + " save folder(s) kept for a world reset from this one" : std::string())
+             + (worldId.empty() ? std::string(" (this world has no id: only saves and stores with no id were matched)") : std::string()));
+    return true;
+}
+/* THE UNFINISHED-DELETES LIST (swdel::PendingLine): <data folder>\\unfinished-deletes.txt (<save root>\\Shared Wastelands\\ without
+   a data folder). One small file beside the records stores rather than a marker in each folder: a profile's delete reaches two
+   roots and several folders, the row that named the profile is already gone, and one line (world, world id, person, number) lets
+   the next start run the same search again - reaching folders the first try never got to - without putting a file of ours into
+   Kenshi's save folders or the records stores. */
+static std::string PendingDeletesPath()
+{
+    const std::string base = !ConfigDataDir().empty() ? ConfigDataDir()
+                           : (SaveRootDefault().empty() ? std::string() : SaveRootDefault() + "\\" + swnames::kSaveRootSub);
+    return base.empty() ? std::string() : base + "\\" + swdel::kPendingDeletesFile;
+}
+static std::vector<std::string> PendingDeletesRead()
+{
+    const std::string path = PendingDeletesPath();
+    std::vector<char> b;
+    if (path.empty() || !ReadFileBytes(path, &b)) return std::vector<std::string>();
+    return swdel::PendingSplit(std::string(b.begin(), b.end()));
+}
+/* the whole list written (flushed, by rename); an empty list removes the file */
+static bool PendingDeletesWrite(const std::vector<std::string>& lines)
+{
+    const std::string path = PendingDeletesPath();
+    if (path.empty()) return false;
+    if (lines.empty())
+    {
+        if (U8DeleteFile(path.c_str()) != 0) return true;
+        const DWORD e = ::GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
+    std::string text;
+    for (size_t i = 0; i < lines.size(); ++i) text += lines[i] + "\r\n";
+    return WriteFileBytes(path, std::vector<char>(text.begin(), text.end()), true);
+}
+static void PendingDeletesSet(const swdel::PendingProfileDelete& p, bool keep, const char* when)
+{
+    if (!PendingDeletesWrite(swdel::PendingListSet(PendingDeletesRead(), p, keep)))
+        ErrorLog("[PROF] the unfinished-deletes list '" + PendingDeletesPath() + "' could NOT be written " + when
+                 + " - a delete that stops now is not finished at the next start");
+}
+/* A DELETED PROFILE'S SAVE AND RECORDS STORE (see store.h): its line in the unfinished-deletes list first, then the delete
+   (ProfileDeleteRun); done = the line dropped, stopped = the line kept with the save folder it stopped at. */
+bool StoreProfileDeleteSave(const std::string& worldKey, const std::string& worldId, const std::string& person, unsigned num)
+{
+    swdel::PendingProfileDelete p;
+    p.worldKey = worldKey; p.worldId = worldId; p.person = person; p.num = num;
+    if (swdel::PendingLine(p).empty())
+        ErrorLog("[PROF] deleted profile " + N((long long)num) + ": it cannot be written to the unfinished-deletes list (no world or person, or a tab"
+                 " or line break in one) - a stop is not finished at the next start");
+    else PendingDeletesSet(p, true, "before the delete");
+    std::string stoppedAt;
+    if (!ProfileDeleteRun(worldKey, worldId, person, num, &stoppedAt))
+    {
+        ++g_profDeleteFailed;
+        p.stoppedAt = stoppedAt;
+        if (!swdel::PendingLine(p).empty()) PendingDeletesSet(p, true, "after the stop");
+        return false;
+    }
+    ++g_profDeleted;
+    if (!swdel::PendingLine(p).empty()) PendingDeletesSet(p, false, "after the delete");
+    return true;
+}
+bool StoreWorldFolderUnfinished(const std::string& dir)
+{
+    const DWORD d = U8GetFileAttributes(dir.c_str());
+    const DWORD m = U8GetFileAttributes(JoinPathA(dir, swdel::kDeleteMarkFile).c_str());
+    return swdel::UnfinishedDeleteFolder(d != INVALID_FILE_ATTRIBUTES, (unsigned long)d, m != INVALID_FILE_ATTRIBUTES, (unsigned long)m);
+}
+/* AT THE TITLE SCREEN, ONCE PER START (see store.h): (1) each folder of the world store carrying the being-deleted marker is
+   deleted - strictly inside the world store, world.txt and then the marker last; (2) each line of the unfinished-deletes list: the
+   emptied save folder it stopped at is removed when it is still empty and directly in the save root, then the same search the
+   delete made runs again; a line is dropped once its delete is done. Log lines only. MAIN THREAD (the title pump). */
+void StoreUnfinishedDeletesFinish()
+{
+    static int done = 0;
+    if (done != 0 || TitleScreenUpPod() != 1) return;
+    done = 1;
+    long long worlds = 0, worldsLeft = 0, worldsListed = 0, profs = 0, profsLeft = 0, unreadable = 0;
+    const std::string top = StoreTopDir();
+    if (!top.empty())
+    {
+        std::vector<std::string> dirs;
+        U8FindData fd;
+        HANDLE h = U8FindFirstFile(JoinPathA(top, "*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            do { if (swdel::EntryKindOf(fd.cFileName, (unsigned long)fd.dwFileAttributes) == swdel::kEntryDir) dirs.push_back(fd.cFileName); } while (U8FindNextFile(h, &fd));
+            ::FindClose(h);
+        }
+        for (size_t i = 0; i < dirs.size(); ++i)
+        {
+            const std::string dir = JoinPathA(top, dirs[i]);
+            if (!StoreWorldFolderUnfinished(dir)) continue;
+            if (U8GetFileAttributes(JoinPathA(dir, "world.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                /* its world.txt is still there: the world is still listed and may have been played since the delete stopped -
+                   only DELETE WORLD (which takes the world lock) finishes it */
+                ++worldsListed;
+                DebugLog("[WORLD] unfinished delete: world folder '" + dir + "' still holds world.txt - left for DELETE WORLD (still listed)");
+                continue;
+            }
+            std::string failPath;
+            DWORD failErr = 0;
+            if (PermDelFolder(dir, top, "[WORLD] unfinished delete: world folder", "world.txt", 0, &failPath, &failErr) == 0) ++worldsLeft; else ++worlds;
+        }
+    }
+    const std::vector<std::string> lines = PendingDeletesRead();
+    std::vector<std::string> next;
+    const std::string saveRoot = SaveRootDefault();
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        swdel::PendingProfileDelete p;
+        if (!swdel::PendingParse(lines[i], &p)) { ++unreadable; continue; }
+        const std::string tag = "[PROF] unfinished delete of profile " + N((long long)p.num) + " in '" + p.worldKey + "':";
+        if (!p.stoppedAt.empty() && !saveRoot.empty() && swdel::PathDirectChild(p.stoppedAt, PermDelFullPath(saveRoot)))
+        {
+            if (U8RemoveDirectory(p.stoppedAt.c_str()) != 0) DebugLog(tag + " the emptied save folder '" + p.stoppedAt + "' removed");
+            else DebugLog(tag + " save folder '" + p.stoppedAt + "' not removed as empty (Windows error " + N((long long)::GetLastError()) + ") - the search below handles it");
+        }
+        std::string at;
+        if (ProfileDeleteRun(p.worldKey, p.worldId, p.person, p.num, &at)) { ++profs; continue; }
+        ++profsLeft;
+        p.stoppedAt = at;
+        const std::string l = swdel::PendingLine(p);
+        if (!l.empty()) next.push_back(l);
+    }
+    if (!lines.empty() && !PendingDeletesWrite(next))
+        ErrorLog("[DEL] the unfinished-deletes list '" + PendingDeletesPath() + "' could NOT be rewritten at the title screen");
+    if (worlds + worldsLeft + worldsListed + profs + profsLeft + unreadable > 0)
+        DebugLog("[DEL] unfinished deletes at the title screen: " + N(worlds) + " world folder(s) finished, " + N(worldsLeft) + " stopped again, "
+                 + N(worldsListed) + " still listed (left for DELETE WORLD); "
+                 + N(profs) + " profile delete(s) finished, " + N(profsLeft) + " stopped again (kept for the next start); " + N(unreadable)
+                 + " unreadable list line(s) dropped");
+}
+/* DELETE WORLD's WORLD LOCK (see store.h): the same open as the CHANGE delete's - a world server running that world in any
+   process holds it; tried once, never waited for. */
+void* StoreWorldLockTake(const std::string& folder, const std::string& name)
+{
+    const std::string lockPath = StoreTopDir() + "\\" + folder + "\\" + coopprof::kWorldLockFile;
+    HANDLE lock = U8CreateFile(lockPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    const DWORD lockErr = lock == INVALID_HANDLE_VALUE ? ::GetLastError() : 0;
+    const int lv = coopprof::WorldLockDecide(lock != INVALID_HANDLE_VALUE, (unsigned long)lockErr);
+    if (lv != coopprof::kLockTaken)
+    {
+        if (lock != INVALID_HANDLE_VALUE) ::CloseHandle(lock);
+        ErrorLog("[UI] mp3: world '" + name + "' delete REFUSED - the world lock '" + lockPath + "' is " + coopprof::WorldLockVerdictName(lv)
+                 + " (Windows error " + N((long long)lockErr) + (lv == coopprof::kLockHeld ? ": that world's server is running in another process" : "")
+                 + ") - nothing was deleted");
+        return 0;
+    }
+    return (void*)lock;
+}
+void StoreWorldLockGive(void* lock)
+{
+    if (lock != 0) ::CloseHandle((HANDLE)lock);
+}
+/* A DELETED WORLD'S SAVES ON THIS COMPUTER, deleted for good (see store.h). A world's saves live outside its world folder - one
+   folder per profile in Kenshi's save root, one records store per profile in <data>\\players - and a later world given the same
+   name would otherwise meet them. In use, never touched, and counted apart: the folder this game plays from, the records stores
+   of that folder's profile, and the store this game has open (g_ownStoreName) or judges its records by (g_ohStore, kept across a
+   leave). MAIN THREAD (the title panel). */
+int StoreWorldDeleteLeftovers(const std::string& worldName, const std::string& worldId, const std::string& person, std::string* summary)
+{
+    int folders = 0, noId = 0, stores = 0, inUse = 0, carriedKept = 0;
     const std::string root = SaveRootDefault();
     std::vector<coopprof::SaveDirSeen> seen;
     if (!root.empty()) seen = SaveRootScan(root);
     std::vector<std::string> keep;
     keep.push_back(ConfigSlot()); keep.push_back(g_profSaveFolder);
-    const coopprof::WorldLeftovers lo = coopprof::WorldLeftoversFind(seen, worldName, keep, ConfigPlayerId(), coopprof::kWorldLeftoverSweep, &worldId);   /* T-490: by id */
-    if (worldId.empty())
-        DebugLog("[WORLD] '" + worldName + "': its world.txt carried no world id, so its saves cannot be told from another world's of that name - none is recycled");
-    for (size_t i = 0; i < lo.keptNoId.size(); ++i)
-        DebugLog("[WORLD] '" + worldName + "': save folder '" + seen[lo.keptNoId[i]].name + "' carries no world id (another world of that name, or one from"
-                 " before ids) - kept on this computer");
+    /* T-36: the worlds reset from this one (ResetChildWorldsOf) - a save of this world such a world still imports from stays
+       (swdel::SaveDirCarriedOnward) until that world has a save of its own; a world.txt that could not be read keeps every such save. */
+    const std::vector<swdel::ResetChildWorld> children = ResetChildWorldsOf(worldId, "[WORLD] '" + worldName + "':");
+    std::vector<size_t> carried;
+    const coopprof::WorldLeftovers lo = swdel::WorldDeleteFind(seen, worldName, worldId, keep, person.empty() ? ConfigPlayerId() : person, coopprof::kWorldLeftoverSweep,
+                                                               &children, &carried);
+    const std::string tag = "[WORLD] '" + worldName + "':";
+    const std::string who = person.empty() ? ConfigPlayerId() : person;
+    std::vector<std::string> playedIds;   /* the profiles of the kept folders this game plays from (not those kept for a reset world) */
     for (size_t i = 0; i < lo.playing.size(); ++i)
     {
-        ++inUse;
-        DebugLog("[WORLD] '" + worldName + "': save folder '" + seen[lo.playing[i]].name + "' is the one this game plays from - left where it is");
+        bool carriedHere = false;
+        for (size_t k = 0; k < carried.size() && !carriedHere; ++k) if (carried[k] == lo.playing[i]) carriedHere = true;
+        if (carriedHere) ++carriedKept;
+        else
+        {
+            ++inUse;
+            coopprof::LeftoverAddOnce(&playedIds, !seen[lo.playing[i]].profile.empty() ? seen[lo.playing[i]].profile
+                                                  : (who.empty() ? std::string() : coopprof::ProfileId(who, 1)));
+        }
+        DebugLog(tag + " save folder '" + seen[lo.playing[i]].name + (carriedHere ? "' is the save a world reset from this one still imports the player's"
+                 " characters from (that world has no save of its own for this profile yet) - left where it is" : "' is the one this game plays from - left where it is"));
     }
-    for (size_t i = 0; i < lo.folders.size(); ++i)
+    std::string failPath;
+    DWORD failErr = 0;
+    bool stopped = false;
+    for (size_t i = 0; i < lo.folders.size() && !stopped; ++i)
     {
-        const int r = WorldLeftoverRecycle(worldName, JoinPathA(root, seen[lo.folders[i]].name), "save folder");
-        if (r > 0) ++folders; else if (r == 0) ++failed;
+        const coopprof::SaveDirSeen& d = seen[lo.folders[i]];
+        const int r = PermDelFolder(JoinPathA(root, d.name), root, tag + " save folder", kWorldKeyFileName, 0, &failPath, &failErr);   /* its key file last: a retry finds it again */
+        if (r == 0) stopped = true;
+        else if (r > 0) { ++folders; if (d.worldId.empty()) ++noId; }
     }
     const std::string top = OwnStoresTop();
-    /* T-490: the stores named from this world's id; stores named before ids are kept (another world's of that name could be among them) */
-    const std::vector<std::string> names = worldId.empty() ? std::vector<std::string>() : coopown::PlayerStoreNamesFor(lo.worldKeys, lo.profileIds, worldId);
-    const std::vector<std::string> playingStores = worldId.empty() ? std::vector<std::string>() : coopown::PlayerStoreNamesFor(lo.worldKeys, lo.playingIds, worldId);
-    for (size_t i = 0; i < names.size() && !top.empty(); ++i)
+    const std::vector<std::string> names = (stopped || top.empty()) ? std::vector<std::string>() : swdel::StoreNamesToDelete(lo.worldKeys, lo.profileIds, worldId);
+    const std::vector<std::string> playingStores = swdel::StoreNamesToDelete(lo.worldKeys, lo.playingIds, worldId);
+    const std::vector<std::string> playedStores = swdel::StoreNamesToDelete(lo.worldKeys, playedIds, worldId);   /* of those, the played folders' */
+    for (size_t i = 0; i < names.size() && !stopped; ++i)
     {
         const std::string dir = top + "\\" + names[i];
         if (!DirExistsA(dir)) continue;
         const char* held = 0;
         if (!g_ownStoreName.empty() && coopprof::SameFolderName(g_ownStoreName, names[i])) held = "is open in this game";
         else if (!g_ohStore.empty() && coopprof::SameFolderName(g_ohStore, names[i])) held = "is the one this game chose for its records";
+        bool heldForReset = false;
         for (size_t k = 0; k < playingStores.size() && held == 0; ++k)
-            if (coopprof::SameFolderName(playingStores[k], names[i])) held = "belongs to the save folder this game plays from";
+            if (coopprof::SameFolderName(playingStores[k], names[i]))
+            {
+                held = "belongs to the save folder this game plays from";
+                bool played = false;
+                for (size_t m = 0; m < playedStores.size() && !played; ++m) if (coopprof::SameFolderName(playedStores[m], names[i])) played = true;
+                if (!played) { heldForReset = true; held = "belongs to a save a world reset from this one still imports from"; }
+            }
         if (held != 0)
         {
-            ++inUse;
-            DebugLog("[WORLD] '" + worldName + "': records store '" + dir + "' " + held + " - left where it is");
+            if (heldForReset) ++carriedKept; else ++inUse;
+            DebugLog(tag + " records store '" + dir + "' " + held + " - left where it is");
             continue;
         }
-        const int r = WorldLeftoverRecycle(worldName, dir, "records store");
-        if (r > 0) ++stores; else if (r == 0) ++failed;
+        const int r = PermDelFolder(dir, top, tag + " records store", 0, 0, &failPath, &failErr);
+        if (r == 0) stopped = true;
+        else if (r > 0) ++stores;
     }
-    *summary = "recycled " + N((long long)folders) + " save folder(s), " + N((long long)stores) + " records store(s); "
-             + N((long long)inUse) + " left in place because this game uses them; " + N((long long)lo.keptNoId.size()) + " save folder(s) with no world id kept; "
-             + N((long long)failed) + " could NOT be moved"
-             + (failed > 0 ? std::string(" (said above)") : std::string());
-    return failed;
+    *summary = "deleted for good " + N((long long)folders) + " save folder(s) (" + N((long long)noId) + " of them with no world id), "
+             + N((long long)stores) + " records store(s); " + N((long long)inUse) + " left in place because this game uses them; "
+             + N((long long)carriedKept) + " kept because a world reset from this one still imports the player's characters from them"
+             + (stopped ? "; STOPPED at '" + failPath + "' (Windows error " + N((long long)failErr) + ") - what was deleted before it stays deleted"
+                        : std::string());
+    return stopped ? 1 : 0;
 }
 /* T-201 PP6' (owner 178a): DELETE on HOST GAME -> CHANGE. The world is not running, so this game edits the picked world's profiles.txt
    with the notebook's own delete (coopprof::DeleteApply - the same rules; nobody plays it now) in the notebook's own file shape
-   (RowsParseFile / RowsFormatFile), and moves the profile's save folder to the Recycle Bin exactly as the DELETE answer does
-   (ProfileRecycleSaveIn). Records and buildings stay, as they do for the notebook's DELETE. MAIN THREAD (the title pump). */
+   (RowsParseFile / RowsFormatFile), then deletes the profile's save and records store for good exactly as the DELETE answer
+   does (StoreProfileDeleteSave). Its buildings stay in the world, as they do for the notebook's DELETE. MAIN THREAD. */
 /* The id this player has in a world's files: ConfigPlayerId() followed through that world's aliases.txt - the table the world server
    applies to every HELLO - so a host whose reinstall made a new id sees, and can delete, the profiles the world knows them by. No
    aliases.txt, or one that cannot be read, = ConfigPlayerId(). Said once per world and result, with only the ids' first 6 characters. */
@@ -20730,7 +22304,7 @@ std::string StoreWorldPlayerId(const std::string& folder)
     }
     return known;
 }
-int StoreProfileDeleteOffline(const std::string& folder, const std::string& worldKey, unsigned num, std::string* say, int* box)
+int StoreProfileDeleteOffline(const std::string& folder, const std::string& worldKey, unsigned num, const std::string& name, std::string* say, int* box)
 {
     *box = 0;
     const std::string dir = StoreTopDir() + "\\" + folder;
@@ -20751,7 +22325,7 @@ int StoreProfileDeleteOffline(const std::string& folder, const std::string& worl
     { std::vector<char> b; bool up = false; if (ReadFileBytes(dir + "\\world.txt", &b)) coopworld::WorldTxtParseId(std::string(b.begin(), b.end()), &offlineWorldId, &up); }
     /* T-220: THE WORLD LOCK - a helper running that world in ANY process (another Kenshi on this PC, or one left running after a crash)
        holds it; tried once, never waited for. Held or not takeable = the CAN'T DELETE box, nothing changed. Kept across the whole
-       read-modify-write, so no helper can start on the file in between; given back before the save folder is recycled. */
+       read-modify-write, so no helper can start on the file in between; given back before the save is deleted. */
     const std::string lockPath = dir + "\\" + coopprof::kWorldLockFile;
     HANDLE lock = U8CreateFile(lockPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     const DWORD lockErr = lock == INVALID_HANDLE_VALUE ? ::GetLastError() : 0;
@@ -20815,9 +22389,9 @@ int StoreProfileDeleteOffline(const std::string& folder, const std::string& worl
     }
     ++g_profDeleteSent;
     DebugLog("[PROF] CHANGE: profile " + coopprof::ProfileId(me, num) + " deleted in '" + path + "' (the world lock held for the edit; "
-             + N((long long)dropped) + " unreadable line(s) dropped, as the notebook drops them) - its save folder follows the DELETE answer's rule");
-    ProfileRecycleSaveIn(worldKey, offlineWorldId, me, num, 0);   /* T-220 (6b): no title-screen notice - the PROFILES line below says it all, once */
-    *say = "Profile deleted." + (g_profRecycleTail.empty() ? std::string() : " " + g_profRecycleTail);
+             + N((long long)dropped) + " unreadable line(s) dropped, as the notebook drops them) - its save and records store are deleted next");
+    const bool gone = StoreProfileDeleteSave(worldKey, offlineWorldId, me, num);   /* no title-screen notice - the PROFILES line below says it, once */
+    *say = gone ? coopui::ProfileDeletedText(name) : coopui::ProfileDeleteFailText(name);
     return coopprof::kOk;
 }
 int StoreNewGameReshowPending() { return g_newGameReshowWanted; }
@@ -20947,7 +22521,9 @@ std::string StoreModsRefusal(long long* seq) { if (seq) *seq = g_modsRefusalSeq 
 void StoreLeftAtTitle()   /* T-201 N1: the next press starts clean (the next link-up sets the lobby again, :8524) */
 {
     g_storeProtoMismatch = false; g_storeRefusedLoggedReason = 0xFFFFFFFFu; g_profLobby = 0;
+    g_storeAuthStop = 0;   /* a password refusal belongs to the join just left */
     g_profPickedNum = 0; g_profPickedId.clear();   /* T-201 N1 fold: a rejoin (maybe to another host) makes its own pick */
+    g_worldPersonId.clear();   /* the world's id for this player belongs to the stay just left (a link drop alone keeps it) */
     g_takenFactions.clear(); g_profAutoNewName.clear();   /* T-368: the list belongs to the world just left */
     coop::PlayerFactionWorldAnswerForget();
     g_joinedWorldRoad = coopjoin::JoinRoadStep(g_joinedWorldRoad, coopjoin::kJrTitle);   /* M11a S3 review fold (F1): back at the title - no longer joined through the world road */
@@ -20974,7 +22550,8 @@ bool StoreLinkIsUp() { return LinkUp(); }                 /* U2: see store.h - M
 bool StoreLinkConnected() { return g_link != 0 && g_link->State() == net::LINK_UP && !g_storeProtoMismatch && !g_storeWrongWorld; }   /* see store.h - MAIN THREAD ONLY */
 std::string StoreNotebookDir() { return coopworld::WorldDirIn(BaseDir(), ConfigWorldKey()); }   /* P8J-B2: the notebook's top folder may be storedir= */   /* U2 / W2b: this game's world folder, through the ONE construction (coopworld::WorldDir) the notebook also uses */
 std::string StoreTopDir() { return BaseDir(); }                                         /* mp3: see store.h */
-std::string StorePlayerKey() { return g_profPickedNum >= 1 ? coopprof::SlotKey(ConfigPlayerId(), g_profPickedNum) : ConfigPlayerId(); }   /* loot2c x prof1 merge: see store.h */
+std::string MyPersonId() { return g_worldPersonId.empty() ? ConfigPlayerId() : g_worldPersonId; }   /* see store.h */
+std::string StorePlayerKey() { return g_profPickedNum >= 1 ? coopprof::SlotKey(MyPersonId(), g_profPickedNum) : MyPersonId(); }   /* loot2c x prof1 merge: see store.h */
 std::string StoreIndexWorld() { return g_indexLoaded ? g_dirWorld : std::string(); }   /* W2b: see store.h */
 void StoreNoteWorldSwitchRefused() { ++g_worldSwitchNeedsRestart; }                     /* W2b: see store.h */
 /* B9 (design-e46-store 2.2). ANY THREAD. 0 while the notebook link is up. Before the first StoreTick the
@@ -21174,7 +22751,7 @@ void StoreLinkFromWelcome(const std::string& address, unsigned short port)
 {
     if (address.empty() || port == 0) return;
     if (g_link != 0 && g_linkAddr == address && g_linkPort == port) return;   /* already there - logged by SetStoreServer's own guard if it is reached */
-    DebugLog("[STORE] E38: the host's session welcome names the notebook at " + address + ":" + N((long long)port)
+    DebugLog("[STORE] E38: the host's session welcome names the notebook at " + relaybridge::AddrForLog(address) + ":" + N((long long)port)
              + " - opening it now, at the title screen, so this game's world load can wait for its first area map.");
     SetStoreServer(address, port);
 }
@@ -21414,8 +22991,10 @@ void StoreOrphanEmptiedSquad(void* faction, void* active)
 namespace coop { int StoreShowPlayerLine(const std::string& line) { std::string l(line); return ShowGameMessagePod(&l); } }   /* loot2c part B: the one on-screen line a touched book routed into its player's own pack gets */
 namespace coop { int StoreGameDay() { ClockPod c; return (g_clkBase != 0 && ReadClockPod(g_clkBase, &c) && c.day >= 0) ? c.day : -1; } }   /* T-556: the FALLEN tab's DIED column */
 namespace coop { int StoreGiveOwedHomes(const char* buildingKey, void* building) { return GiveOwedHomesImpl(buildingKey, building); } }   /* store.h */
+namespace coop { void StoreNoteCopyHome(void* platoon, const std::string& worldId, const unsigned char* handRaw32, int buildingSent, int buildingResolved) { NoteCopyHomeImpl(platoon, worldId, handRaw32, buildingSent, buildingResolved); } }   /* store.h [t755-copyhome-api] */
 namespace coop { int StoreKeylessRecordGroups(const std::string& townSid, KeylessGroup* out, int cap) { return KeylessRecordGroupsImpl(townSid, out, cap); } }   /* store.h */
 namespace coop { std::string StoreHomeReport() { return HomeReportImpl(); } }   /* store.h */
+namespace coop { void StorePumpCapSet(int n) { g_pumpCapTest = n > 0 ? n : 0; } }   /* store.h: TEST-ONLY, the command verb pumpcap */
 
 // PROBE-START: P113 (lever) - p113squad: the store builds a sleeping squad near the player from a record (CreateUnknownSquad, the
 // T729 path), reloads its container once as the wake hook does (LoadPod), waits for the engine to wake it, then the engine's own
@@ -21563,3 +23142,346 @@ void P113LeverTick()
 }
 } // namespace coop
 // PROBE-END: P113 (lever)
+/* KEPT (src/common/keptwire.h): THE PLAYERS' KEPT PIECES, LAID BACK INTO A RESET WORLD. MAIN THREAD (PumpLink, the build drain,
+   the save and record hooks).
+   This block holds the rows the world server sent for the link's world (ROWS; a part that is new again is announced only by STATE,
+   never by a second ROWS). A row leaves the table once every part this game could act on is done (the piece, the items, and the
+   owner part when the piece is this player's); its key stays known for the world, so the overlap check names no kept piece of the
+   same player. It sends what build.cpp's kept drain asks (CLAIM / RELEASE / LAID) and settles this game's own lays: a lay is SETTLED
+   once (i) a save of this game finished after the lay, (ii) a save after the lay wrote that area's record (ZoneSaveApply) and (iii)
+   the world server's sequence echo of THAT write came back (the echo carries the stamp of the write it
+   answers: that write or a later one of this game's settles the lay, an earlier one never - keptwire::EchoAnswersWrite). The world server takes a SETTLED only for a lay it saw on its own run, so on a new link
+   a lay is reported again (LAID) before its SETTLED. Nothing crosses worlds: the lays waiting to settle go at a world teardown
+   (build.cpp BdKeptForgetWorld), and the rows, the keys and the lays all go when a WELCOME names another world than theirs. */
+namespace coop {
+int BdKeptRowWorkLeft(unsigned row);              /* build.cpp: this game still has work on the row, whatever its state */
+int BdKeptItemsWaitLeft(unsigned row);            /* build.cpp: items this game laid in that row's box still wait for a place */
+void BdKeptHereSaveFinished(long reqSeq);         /* build.cpp: this game's laid-here record takes the changes that save holds */
+namespace {
+std::map<unsigned, keptwire::Row> g_keptRows;   /* row number -> the row as the world server last described it (this link's) */
+std::map<std::string, int> g_keptKeys;          /* every key this world's rows named -> its owner slot (kept when a row leaves) */
+long g_keptLinkGen = -1, g_keptCountGen = -1;   /* the link the rows came on; the link the lays' armed writes went on */
+std::string g_keptWorldId;                      /* the world (the WELCOME's id) the tables hold */
+int g_keptWorldSet = 0;
+long g_keptWorldGen = 0;                        /* raised when the tables are dropped for another world (build.cpp drops its own) */
+struct KeptSettle
+{
+    unsigned row, part, how; std::string area, liveKey; long laidSeq, laidGen; long long needStamp, priorStamp; int wrote, echo, saved; long sentGen;   /* needStamp: the armed write's stamp; priorStamp: the newest stamp of that area sent before it */
+    KeptSettle() : row(0), part(0), how(0), laidSeq(0), laidGen(-1), needStamp(0), priorStamp(0), wrote(0), echo(0), saved(0), sentGen(-1) {}
+};
+std::map<std::pair<unsigned, unsigned>, KeptSettle> g_keptSettle;
+std::map<std::string, long long> g_keptAreaSentMax;   /* the newest stamp (writtenAt) of this game's writes of each area record sent, by any road */
+std::string g_keptJustSent;                     /* the area whose save write ZoneMirrorCommit sent last ("" = its last one was not sent) */
+long long g_keptJustStamp = 0, g_keptJustPrior = 0;   /* that write's stamp, and the newest stamp of that area this game had sent before it */
+long long g_keptRowsIn = 0, g_keptStatesIn = 0, g_keptBad = 0, g_keptUpSent = 0, g_keptUpNotSent = 0, g_keptSettledSent = 0, g_keptStateLines = 0;
+long long g_keptRowsLeft = 0, g_keptLaidAgain = 0, g_keptWorldDrops = 0;
+bool KeptSendBytes(const std::vector<char>& b)
+{
+    if (!LinkUp() || b.empty()) return false;
+    return g_link->Send(0, (net::MsgType)kStoreMsgKept, &b[0], b.size(), net::CH_RELIABLE);
+}
+/* a row with a part this game could still act on: the piece or the items not done, the owner part when the piece is this player's
+   (an unknown slot keeps every row), or work this game still has on it whatever its state (BdKeptRowWorkLeft) */
+int KeptRowOpenForMe(const keptwire::Row& w, int mySlot)
+{
+    if (keptwire::PartState(w.flags, keptwire::kPartPiece) != keptwire::kStDone || keptwire::PartState(w.flags, keptwire::kPartItems) != keptwire::kStDone) return 1;
+    if (BdKeptRowWorkLeft(w.row) != 0) return 1;
+    return (mySlot < 0 || (w.p.ownerSlot == mySlot && (w.flags & keptwire::kFlagOwnerTook) == 0)) ? 1 : 0;
+}
+/* a row the build drain may do something with now: a part new or claimed by this game, a part laid by this game (claimed again
+   when its record does not list it), a laid piece whose own state any game lays on its copy (not present), work this game still has
+   on the row (BdKeptRowWorkLeft), or this player's owner part */
+int KeptRowWantsMe(const keptwire::Row& w, int mySlot)
+{
+    const unsigned me = (unsigned)mySlot + 1u;
+    const unsigned ps = keptwire::PartState(w.flags, keptwire::kPartPiece), is = keptwire::PartState(w.flags, keptwire::kPartItems);
+    if (ps == keptwire::kStNew || (ps == keptwire::kStClaimed && w.claimPiece == me)) return 1;
+    if (!w.p.items.empty() && (is == keptwire::kStNew || (is == keptwire::kStClaimed && w.claimItems == me))) return 1;
+    if (ps == keptwire::kStLaid && (w.claimPiece == me || (w.flags & keptwire::kFlagPiecePresent) == 0)) return 1;
+    if (!w.p.items.empty() && is == keptwire::kStLaid && w.claimItems == me) return 1;
+    if (BdKeptRowWorkLeft(w.row) != 0) return 1;
+    return (w.p.ownerSlot == mySlot && (w.flags & keptwire::kFlagOwnerTook) == 0) ? 1 : 0;
+}
+void KeptDropAll(const std::string& why)
+{
+    if (!g_keptRows.empty() || !g_keptSettle.empty() || !g_keptKeys.empty())
+        DebugLog("[KEPT] " + why + ": the " + N((long long)g_keptRows.size()) + " kept row(s), " + N((long long)g_keptKeys.size()) + " kept key(s) and "
+                 + N((long long)g_keptSettle.size()) + " lay(s) waiting to be settled are dropped - they belong to the world they came from");
+    g_keptRows.clear(); g_keptKeys.clear(); g_keptSettle.clear();
+    ++g_keptWorldGen;
+}
+/* the link's WELCOME named another world than the one the tables hold: everything goes (build.cpp sees KeptWorldGen move) */
+void KeptWorldCheck()
+{
+    if (!LinkUp()) return;
+    if (g_keptWorldSet != 0 && g_keptWorldId == g_linkWorldId) return;
+    if (g_keptWorldSet != 0) { ++g_keptWorldDrops; KeptDropAll("the world server's WELCOME names another world ('" + g_linkWorldId + "') than the kept rows' ('" + g_keptWorldId + "')"); }
+    g_keptWorldId = g_linkWorldId; g_keptWorldSet = 1;
+}
+/* a new link: an armed write is answered on the link it went on or not at all, so a lay whose echo had not come back is armed again
+   by a later save's write on the new link (the stamps sent stay: they tell an earlier write's echo apart) */
+void KeptCountLinkCheck()
+{
+    const long gen = StoreNotebookLinkGen();
+    if (gen == g_keptCountGen) return;
+    g_keptCountGen = gen;
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it)
+        if (it->second.wrote != 0 && it->second.echo == 0) it->second.wrote = 0;
+}
+void KeptSettleTry()
+{
+    if (!LinkUp()) return;
+    const long gen = StoreNotebookLinkGen();
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it)
+    {
+        KeptSettle& s = it->second;
+        if (s.wrote == 0 || s.echo == 0 || s.saved == 0 || s.sentGen == gen) continue;
+        if (s.part == keptwire::kPartItems && BdKeptItemsWaitLeft(s.row) != 0) continue;   /* items of the lay wait for a place: settled once none does */
+        if (s.laidGen != gen)
+        {   /* LAID first on this link: a part this link's rows show laid gets it here; a part new or claimed gets it from the drain's
+               claim and report road (KeptSendLaid) */
+            std::map<unsigned, keptwire::Row>::const_iterator r = g_keptRows.find(s.row);
+            if (r == g_keptRows.end() || keptwire::PartState(r->second.flags, s.part) != keptwire::kStLaid) continue;
+            std::vector<char> lb;
+            if (!keptwire::EncodeLaid(&lb, s.row, s.part, s.how, s.liveKey) || !KeptSendBytes(lb)) continue;
+            s.laidGen = gen; ++g_keptUpSent; ++g_keptLaidAgain;
+            DebugLog("[KEPT] row " + N((long long)s.row) + " " + keptwire::PartName(s.part) + " LAID sent again (how=" + keptwire::HowName(s.how) + ") on this link, before its SETTLED");
+        }
+        std::vector<char> b;
+        if (!keptwire::EncodePart(&b, keptwire::kOpSettled, s.row, s.part) || !KeptSendBytes(b)) continue;
+        s.sentGen = gen; ++g_keptSettledSent;
+        DebugLog("[KEPT] row " + N((long long)s.row) + " " + keptwire::PartName(s.part) + " SETTLED sent: a save of this game finished after the lay, a save after the lay wrote "
+                 + s.area + " and the world server's echo of that write or a later one of that area came back (its LAID went first on this link; sent again on every new link until the row's state shows the part done)");
+    }
+}
+/* a new world-server link: the last link's rows are dropped (the world server sends ROWS again as this game's areas are reported),
+   and every settled lay is owed its LAID and SETTLED again */
+void KeptLinkCheck()
+{
+    KeptWorldCheck();
+    KeptCountLinkCheck();
+    const long gen = StoreNotebookLinkGen();
+    if (gen == g_keptLinkGen) return;
+    if (!g_keptRows.empty())
+        DebugLog("[KEPT] the world-server link changed: the " + N((long long)g_keptRows.size()) + " kept row(s) of the last link are dropped - the world server sends them again as this game's areas are reported");
+    g_keptRows.clear();
+    g_keptLinkGen = gen;
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it) it->second.sentGen = -1;
+}
+}   /* namespace (KEPT) */
+
+/* this game's slot on the world-server link, -1 while the link is not up */
+int KeptMySlot() { return LinkUp() ? g_mySlot : -1; }
+/* TOWNS up (build.cpp BdTownsSayTick: this game's own outposts) on the world-server link; false = not sent (no link) */
+bool TownsSendUp(const std::vector<char>& b)
+{
+    if (!LinkUp() || b.empty()) return false;
+    return g_link->Send(0, (net::MsgType)townkeep::kMsgTowns, &b[0], b.size(), net::CH_RELIABLE);
+}
+void KeptNoteRows(const char* p, size_t n)
+{
+    KeptLinkCheck();
+    keptwire::Msg m;
+    if (keptwire::Decode(p, n, &m) == 0 || (m.op != keptwire::kOpRows && m.op != keptwire::kOpState))
+    {
+        ++g_keptBad;
+        ErrorLog("[KEPT] a KEPT message from the world server could not be read (" + N((long long)n) + " bytes) - ignored; keptBad=" + N(g_keptBad));
+        return;
+    }
+    const int mySlot = KeptMySlot();
+    if (m.op == keptwire::kOpRows)
+    {
+        long long left = 0;
+        for (size_t i = 0; i < m.rows.size(); ++i)
+        {
+            const keptwire::Row& w = m.rows[i];
+            g_keptKeys[w.p.key] = w.p.ownerSlot;
+            ++g_keptRowsIn;
+            if (KeptRowOpenForMe(w, mySlot) == 0) { ++left; ++g_keptRowsLeft; continue; }   /* nothing here for this game: not held */
+            g_keptRows[w.row] = w;
+        }
+        DebugLog("[KEPT] rows for area " + N((long long)m.sx) + "," + N((long long)m.sy) + ": " + N((long long)m.rows.size()) + " kept piece(s) not finished yet (rows "
+                 + N((long long)m.rows.front().row) + " .. " + N((long long)m.rows.back().row) + "; " + N(left) + " with nothing left for this game, not held); rows held=" + N((long long)g_keptRows.size()));
+        KeptSettleTry();
+        return;
+    }
+    ++g_keptStatesIn;
+    std::map<unsigned, keptwire::Row>::iterator it = g_keptRows.find(m.row);
+    const bool held = it != g_keptRows.end();
+    if (held) { it->second.flags = m.flags; it->second.claimPiece = m.claimPiece; it->second.claimItems = m.claimItems; }
+    for (unsigned part = keptwire::kPartPiece; part <= keptwire::kPartItems; ++part)
+        if (keptwire::PartState(m.flags, part) == keptwire::kStDone) g_keptSettle.erase(std::make_pair(m.row, part));
+    const bool leaves = held && KeptRowOpenForMe(it->second, mySlot) == 0;
+    if (leaves) { g_keptRows.erase(it); ++g_keptRowsLeft; }
+    ++g_keptStateLines;
+    if (g_keptStateLines <= 400 || g_keptStateLines % 100 == 0)
+        DebugLog("[KEPT] state row=" + N((long long)m.row) + " piece=" + keptwire::StateName(keptwire::PartState(m.flags, keptwire::kPartPiece))
+                 + " items=" + keptwire::StateName(keptwire::PartState(m.flags, keptwire::kPartItems)) + " owner=" + ((m.flags & keptwire::kFlagOwnerTook) != 0 ? "took" : "not yet")
+                 + " claim piece=" + (m.claimPiece == 0 ? std::string("nobody") : "slot " + N((long long)m.claimPiece - 1))
+                 + " claim items=" + (m.claimItems == 0 ? std::string("nobody") : "slot " + N((long long)m.claimItems - 1))
+                 + (!held ? " (a row not held here)" : (leaves ? " - every part this game could act on is done: the row leaves this game's table" : "")));
+    KeptSettleTry();
+}
+/* the rows held now, copied (TEST-ONLY keptlist; MAIN THREAD) */
+void KeptRowsCopy(std::vector<keptwire::Row>* out)
+{
+    KeptLinkCheck();
+    out->clear();
+    for (std::map<unsigned, keptwire::Row>::const_iterator it = g_keptRows.begin(); it != g_keptRows.end(); ++it) out->push_back(it->second);
+}
+size_t KeptRowsHeld() { return g_keptRows.size(); }
+/* the rows the build drain may act on now (its early exit; MAIN THREAD) */
+size_t KeptRowsActive()
+{
+    KeptLinkCheck();
+    const int mySlot = KeptMySlot();
+    if (mySlot < 0) return 0;
+    size_t n = 0;
+    for (std::map<unsigned, keptwire::Row>::const_iterator it = g_keptRows.begin(); it != g_keptRows.end(); ++it) n += (size_t)KeptRowWantsMe(it->second, mySlot);
+    return n;
+}
+/* the row numbers held, for the drain to find one by one (no row, no item copied) */
+void KeptRowNumbers(std::vector<unsigned>* out)
+{
+    KeptLinkCheck();
+    out->clear();
+    for (std::map<unsigned, keptwire::Row>::const_iterator it = g_keptRows.begin(); it != g_keptRows.end(); ++it) out->push_back(it->first);
+}
+/* one held row, 0 = not held. The pointer lives until the next KEPT message or link check: the caller uses it within one step */
+const keptwire::Row* KeptRowFind(unsigned row)
+{
+    std::map<unsigned, keptwire::Row>::const_iterator it = g_keptRows.find(row);
+    return it == g_keptRows.end() ? 0 : &it->second;
+}
+/* every key this world's rows named, with its owner slot (the overlap check) */
+const std::map<std::string, int>& KeptKeys() { return g_keptKeys; }
+long KeptWorldGen() { return g_keptWorldGen; }
+/* the world is torn down: a lay of it waiting to be settled is never settled (a reload may not hold it; the area's record still
+   closes it on the world server). The rows stay with the link, whose world they describe. */
+void KeptForgetWorld()
+{
+    if (!g_keptSettle.empty())
+        DebugLog("[KEPT] world teardown: " + N((long long)g_keptSettle.size()) + " lay(s) of this world waiting to be settled are dropped - never settled from here (the area's record still closes them)");
+    g_keptSettle.clear();
+}
+/* the drain's tick: a link change, the SETTLEDs owed */
+void KeptStoreTick() { KeptLinkCheck(); KeptSettleTry(); }
+/* THIS GAME'S RECORD OF WHAT IT LAID IN THIS WORLD (build.cpp BdKeptHereLoad / BdKeptHereSave): kept-laid-here.txt in the player's
+   open records store (OwnStoreDir - the store is this profile's for this world), written whole through WriteFileBytes (a temp file,
+   flushed, moved over the old one) */
+const char* const kKeptHereFile = "kept-laid-here.txt";
+/* the world (the WELCOME's id) the kept rows belong to; "" = none yet */
+std::string KeptWorldIdNow() { return g_keptWorldSet != 0 ? g_keptWorldId : std::string(); }
+/* 1 = read into *text, 0 = no file there yet, -2 = the file is there and could not be read, -1 = no records store is open; *where =
+   the file */
+int KeptHereRead(std::string* text, std::string* where)
+{
+    text->clear(); where->clear();
+    if (g_ownStoreName.empty()) return -1;
+    *where = OwnStoreDir() + "\\" + kKeptHereFile;
+    const DWORD a = U8GetFileAttributes(where->c_str());
+    const DWORD e = ::GetLastError();
+    if (a == INVALID_FILE_ATTRIBUTES && (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)) return 0;
+    std::vector<char> b;
+    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY) != 0 || !ReadFileBytes(*where, &b)) return -2;
+    text->assign(b.begin(), b.end());
+    return 1;
+}
+/* 1 = written, 0 = the write failed, -1 = no records store is open */
+int KeptHereWrite(const std::string& text)
+{
+    if (g_ownStoreName.empty()) return -1;
+    return WriteFileBytes(OwnStoreDir() + "\\" + kKeptHereFile, std::vector<char>(text.begin(), text.end()), true) ? 1 : 0;
+}
+/* CLAIM / RELEASE (piece or items) */
+bool KeptSendPart(unsigned op, unsigned row, unsigned part)
+{
+    std::vector<char> b;
+    if (op == keptwire::kOpSettled || !keptwire::EncodePart(&b, op, row, part)) return false;
+    const bool ok = KeptSendBytes(b);
+    if (ok) ++g_keptUpSent; else ++g_keptUpNotSent;
+    return ok;
+}
+/* LAID. A lay (anything but refused, and not the owner part) waits to be settled: it is in the area record of sector (sx, sy). The
+   same lay reported again (the claim and report road on a new link) keeps its settling and counts as this link's LAID. */
+bool KeptSendLaid(unsigned row, unsigned part, unsigned how, const std::string& liveKey, int sx, int sy)
+{
+    KeptCountLinkCheck();
+    std::vector<char> b;
+    if (!keptwire::EncodeLaid(&b, row, part, how, liveKey)) return false;
+    const bool ok = KeptSendBytes(b);
+    if (ok) ++g_keptUpSent; else ++g_keptUpNotSent;
+    if (ok && how != keptwire::kHowRefused && (part == keptwire::kPartPiece || part == keptwire::kPartItems))
+    {
+        const long gen = StoreNotebookLinkGen();
+        std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator f = g_keptSettle.find(std::make_pair(row, part));
+        if (f != g_keptSettle.end()) { f->second.laidGen = gen; f->second.how = how; f->second.liveKey = liveKey; }
+        else
+        {
+            KeptSettle& s = g_keptSettle[std::make_pair(row, part)];
+            s.row = row; s.part = part; s.how = how; s.liveKey = liveKey; s.area = keptwire::AreaIdOfSector(sx, sy);
+            s.laidSeq = StoreSaveRequestSeq(); s.laidGen = gen;
+        }
+        KeptSettleTry();
+    }
+    return ok;
+}
+/* ZoneMirrorCommit wrote an area record here: sent = it went to the world server, stamped `stamp` (its writtenAt) */
+void KeptAreaSent(const std::string& zoneId, int sent, long long stamp)
+{
+    KeptCountLinkCheck();
+    if (sent == 0) { g_keptJustSent.clear(); return; }
+    long long& top = g_keptAreaSentMax[zoneId];
+    g_keptJustSent = zoneId; g_keptJustStamp = stamp; g_keptJustPrior = top;
+    if (stamp > top) top = stamp;
+}
+/* an area record sent by another road (an outage replay, the WELCOME's re-push): its stamp is noted, so its echo is never taken for
+   a later lay's write */
+void KeptAreaStampSent(const std::string& zoneId, long long stamp)
+{
+    long long& top = g_keptAreaSentMax[zoneId];
+    if (stamp > top) top = stamp;
+}
+/* ZoneSaveApply wrote and sent an area's record: a lay in it not armed yet is armed by this write when the write came from a save
+   after the lay. The echo of this write, or of any later write of that area, settles it; a write the world server refuses or cannot
+   put on disk gets no echo, and the next write's echo does it. */
+void KeptAreaWritten(const std::string& zoneId)
+{
+    KeptCountLinkCheck();
+    if (g_keptJustSent != zoneId) return;   /* this save's write was not sent: no echo answers it */
+    g_keptJustSent.clear();
+    const long req = StoreSaveRequestSeq();
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it)
+        if (it->second.area == zoneId && it->second.wrote == 0 && it->second.echo == 0 && req > it->second.laidSeq)
+        { it->second.wrote = 1; it->second.needStamp = g_keptJustStamp; it->second.priorStamp = g_keptJustPrior; }
+}
+/* the world server's sequence echo for a record this game wrote, with the stamp of the write it answers (sent only for a write it
+   took and put on disk) */
+void KeptAreaEcho(const std::string& worldId, int hasStamp, long long stamp)
+{
+    KeptCountLinkCheck();
+    int any = 0;
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it)
+        if (it->second.area == worldId && it->second.wrote != 0 && it->second.echo == 0
+            && keptwire::EchoAnswersWrite(hasStamp, stamp, it->second.needStamp, it->second.priorStamp) != 0) { it->second.echo = 1; any = 1; }
+    if (any != 0) KeptSettleTry();
+}
+/* a profile save of this game's own (save request reqSeq) finished with its quick.save on disk */
+void KeptSaveFinished(long reqSeq)
+{
+    int any = 0;
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it)
+        if (reqSeq > it->second.laidSeq) { it->second.saved = 1; any = 1; }
+    if (any != 0) KeptSettleTry();
+    BdKeptHereSaveFinished(reqSeq);   /* this game's laid-here record takes the changes this save holds */
+}
+/* the store's numbers for keptlist */
+std::string KeptStoreText()
+{
+    long long waiting = 0;
+    for (std::map<std::pair<unsigned, unsigned>, KeptSettle>::const_iterator it = g_keptSettle.begin(); it != g_keptSettle.end(); ++it) if (it->second.sentGen < 0) ++waiting;
+    return "rowsIn=" + N(g_keptRowsIn) + " statesIn=" + N(g_keptStatesIn) + " bad=" + N(g_keptBad) + " upSent=" + N(g_keptUpSent) + " upNotSent=" + N(g_keptUpNotSent)
+           + " settling=" + N((long long)g_keptSettle.size()) + " notSentOnThisLink=" + N(waiting) + " settledSent=" + N(g_keptSettledSent)
+           + " laidAgain=" + N(g_keptLaidAgain) + " rowsLeft=" + N(g_keptRowsLeft) + " keys=" + N((long long)g_keptKeys.size()) + " worldDrops=" + N(g_keptWorldDrops);
+}
+} // namespace coop

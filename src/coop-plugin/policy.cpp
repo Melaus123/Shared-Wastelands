@@ -116,6 +116,7 @@
 #include "game/GameWorld.h"       /* T-546 step 7: the `team orders` lever walks activeCharacters() */
 #include "coop_log.h"
 #include "hooks.h"   /* coop::AddHook (own MinHook) / HookStatus - same include items.cpp uses for its four hooks */
+#include "speech.h"  /* T-737: TalkCursorHoverEnter / Leave - the talk cursor's test runs only inside characterSelected */
 #include <Windows.h>
 #include <intrin.h>   /* _ReturnAddress: which of OwnedByAPlayerFaction's sixteen callers is asking */
 #include <sstream>
@@ -845,6 +846,7 @@ void* volatile g_ordCells[kOrdCells];
 volatile LONG g_ordHeld = 0;
 const size_t kPiMenu = 0x48;                     /* the ContextMenu inside PlayerInterface (newPlayerTask 0x7F9AB0 closes it as showContextMenu(pi + 0x48, 0, 0)) */
 const size_t kPiTargetMode = 0x2F1;              /* PlayerInterface: set, characterSelected hands the character to its target-picking call 0x7F8460 and returns */
+const size_t kPiClickByte = 0x2F3;               /* PlayerInterface: the click byte - set, characterSelected / buildingSelected give the order; 0, they only pick the cursor */
 const size_t kListCount = 8, kListData = 0x10;   /* the menu's order list (lektor<int>): count +8, array +0x10 */
 const size_t kOrdInSomething = 0x2F8;            /* Character: int inSomething, 1 bed, 2 cage */
 const size_t kOrdFurnHandType = 0x308;           /* Character: the furniture hand +0x300's type (+8); 0 = a building's */
@@ -946,8 +948,24 @@ struct ClickScope   /* characterSelected's flags, put back on every exit */
     ClickScope() : mate(g_clickMate), tid(g_clickTid) {}
     ~ClickScope() { g_clickMate = mate; g_clickTid = tid; }
 };
+/* T-737: 1 = the player interface's click byte is set (characterSelected gives the order now), 0 = a hover (or unreadable). No C++ object. */
+int PiClickPod(void* pi)
+{
+    __try { return (*((const unsigned char*)pi + kPiClickByte) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* T-737: on this thread characterSelected (a hover, or a click when the click byte is set - the TEST-ONLY hover levers' calls included)
+   or showContextMenu (the order menu's build, which asks 0x679FC0 for its Talk entry) is running for `who` - the talk cursor's test
+   (speech.cpp) acts only inside one; the previous mark is put back on every exit. */
+struct TalkHoverScope
+{
+    unsigned long tid; void* who; int kind;
+    TalkHoverScope(void* w, int k) : tid(0), who(0), kind(0) { coop::TalkCursorHoverEnter(w, k, &tid, &who, &kind); }
+    ~TalkHoverScope() { coop::TalkCursorHoverLeave(tid, who, kind); }
+};
 void detour_charSelected(void* pi, void* who)
 {
+    TalkHoverScope talk(who, PiClickPod(pi) ? coop::kTalkScopeClick : coop::kTalkScopeHover);
     if (g_ordHeld == 0 || TeammateObjPod(who, 1) == 0) { orig_charSelected(pi, who); return; }
     ClickScope keep;
     g_clickTid = ::GetCurrentThreadId(); g_clickMate = 1;
@@ -976,6 +994,7 @@ struct MenuScope    /* showContextMenu's build state, put back on every exit (a 
 };
 void detour_showMenu(void* menu, char show, void* target)
 {
+    TalkHoverScope talk(target, coop::kTalkScopeMenu);   /* T-737: the menu's Talk entry follows the talk cursor's answer, as a click */
     MenuScope keep;
     g_menuOrdMark = 0; g_menuForTarget = 0; g_menuForOcc = 0; g_menuTargetCage = 0; g_menuOccCage = 0;
     if (show != 0 && target != 0 && g_ordHeld != 0)
@@ -1405,7 +1424,7 @@ std::string PolicyTeamAccessProbe(int ownerSlot, const std::string& cls)
 namespace {
 unsigned long long kBuildingSelectedRva = 0; static AddrReg kBuildingSelectedRva_reg("PlayerInterfaceBuildingSelected", &kBuildingSelectedRva);   /* Steam_1.0.65 0x7FBB40 */
 typedef char (*BuildingSelectedFn)(void* pi, void* building, const float* pos, char flag);
-const size_t kFacPlayerInterface = 0x250, kPiClickByte = 0x2F3;
+const size_t kFacPlayerInterface = 0x250;
 typedef void (*GetPosFn)(void*, float*);
 int BuildingPosPod(void* b, float* pos)
 {
@@ -1511,7 +1530,7 @@ int OrdMenuPod(void* pi, void* ch)
         ((ShowMenuFn)(g_base + (uintptr_t)kShowMenuRva))((char*)pi + kPiMenu, 0, 0);
         return 1;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { coop::TalkCursorFaultReset(); return 0; }   /* T-737: the scope's destructor did not run */
 }
 /* The hover: 1 made, 0 faulted, 2 not made - the player interface is picking a target (+0x2F1 set), where characterSelected hands the
    character to its target-picking call, which gives an order whatever the click byte says. */
@@ -1531,6 +1550,7 @@ int OrdHoverPod(void* pi, void* ch)
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         __try { *clickByte = was; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        coop::TalkCursorFaultReset();   /* T-737: the characterSelected scope's destructor did not run */
         return 0;
     }
 }

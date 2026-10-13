@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "ownerwire.h"   /* inv6 phase 2: the kit's owner tail */
+#include "gearwire.h"    /* the kit's gear tail */
 
 namespace coopgarment {
 
@@ -33,6 +34,10 @@ const int kDetailOk      = 0;
 const int kDetailAbsent  = 1;   /* nothing after the list, or a different marker: an older sender */
 const int kDetailBadOwner = 3;  /* inv6 phase 2: the entries are whole but the OWNL tail after them is cut or out of range - the
                                    details are KEPT (the quality1 rule protects them), only the marks are dropped */
+const int kDetailBadGear = 4;   /* the entries and their owners are whole but the GEML tail after them is cut or out of range - the
+                                   details and owners are KEPT, every uniform and crafter is dropped, and `*end` is past the tail
+                                   (gearwire::GearTailSkip) so the kit's packs and cells after it are still read; a tail whose
+                                   shape itself is cut or out of range sets `*end` to the end of the bytes (nothing after it is read) */
 const int kDetailBad     = 2;   /* the marker is there but an entry is cut short or out of range - the block is refused */
 
 struct GarmentDetail
@@ -44,6 +49,7 @@ struct GarmentDetail
     unsigned char unique;      /* Item +0x12A */
     std::string colorSid;
     coopmark::OwnerId owner;   /* inv6 phase 2 (R6): the item's stolen mark - in the OWNL tail, not in the entry */
+    gearwire::GearMarks gear;  /* the item's uniform and crafter - in the GEML tail after the owner tail, not in the entry */
     GarmentDetail() : quality(0.0f), charges(0.0f), quantity(1), functionKind(0), unique(0), colorSid() {}
 };
 
@@ -84,12 +90,16 @@ inline void EncodeGarmentDetails(std::vector<char>* b, const std::vector<Garment
     std::vector<coopmark::OwnerId> own(d.size());
     for (size_t i = 0; i < d.size(); ++i) own[i] = d[i].owner;
     coopmark::EncodeOwnerTail(b, own, 0);   /* inv6 phase 2 (R6): nothing when no item is marked */
+    std::vector<gearwire::GearMarks> gear(d.size());
+    for (size_t i = 0; i < d.size(); ++i) gear[i] = d[i].gear;
+    gearwire::EncodeGearTail(b, gear, 0);   /* nothing when no item has a uniform or a crafter */
 }
 
 /* Reads the block at `at` for `count` items. Every test is `size - off < n` with off already <= size.
    bag23 part 1 (inv3 phase 2): `*end` is the offset just after the block AND its OWNL tail on kDetailOk, and `at` itself on
    kDetailAbsent (the kit's packs block then follows the item list directly); on kDetailBad / kDetailBadOwner the end is not
-   known and `*end` stays `at` - a caller must not look for anything after a block it could not read. */
+   known and `*end` stays `at` - a caller must not look for anything after a block it could not read. On kDetailBadGear `*end` is
+   past the gear tail it dropped (see kDetailBadGear). */
 inline int DecodeGarmentDetailsEnd(const char* p, size_t size, size_t at, size_t count, std::vector<GarmentDetail>* out, size_t* end)
 {
     if (end) *end = at;
@@ -124,6 +134,20 @@ inline int DecodeGarmentDetailsEnd(const char* p, size_t size, size_t at, size_t
         if (coopmark::DecodeOwnerTail(p, size, off, d.size(), &own, &oe) != coopmark::kOwnOk) { if (out) out->swap(d); return kDetailBadOwner; }
         for (size_t i = 0; i < own.size(); ++i) d[i].owner = own[i];
         off = oe;
+    }
+    if (count != 0 && off < size && gearwire::GearTailAt(p, size, off))   /* the gear tail, after the owner tail */
+    {
+        std::vector<gearwire::GearMarks> gear; size_t ge = 0;
+        if (gearwire::DecodeGearTail(p, size, off, d.size(), &gear, &ge) != gearwire::kGearOk)
+        {   /* the details and the owners are kept, the uniforms and crafters dropped, and what follows the tail is still read */
+            for (size_t i = 0; i < d.size(); ++i) d[i].gear = gearwire::GearMarks();
+            size_t se = 0;
+            if (end) *end = gearwire::GearTailSkip(p, size, off, &se) ? se : size;
+            if (out) out->swap(d);
+            return kDetailBadGear;
+        }
+        for (size_t i = 0; i < gear.size(); ++i) d[i].gear = gear[i];
+        off = ge;
     }
     if (out) out->swap(d);
     if (end) *end = off;

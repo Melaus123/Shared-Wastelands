@@ -248,6 +248,7 @@ static coopgarment::GarmentDetail CaptureDetail(Item* item, const std::string& c
     else ++g_c.detailsReadFault;
     d.colorSid = colorSid;
     coop::ItemOwnerOf((void*)item, &d.owner);   /* inv6 phase 2 (R6): MAIN THREAD (appearance.cpp's settle send) */
+    coop::ItemGearOf((void*)item, &d.gear);   /* a gear item's uniform and crafter (the kit's GEML tail): MAIN THREAD */
     return d;
 }
 
@@ -645,6 +646,8 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
         }
         /* inv6 phase 2 (R6): the owner's stolen mark on the copy's item, before it enters the inventory (ItOwnerApply's rule). */
         if (haveDetail && set.details[i].owner.kind != coopmark::kOwnNone) coop::ItemOwnerApplyTo((void*)item, set.details[i].owner, set.baseSids[i]);
+        /* the owner's uniform and crafter on the copy's gear item, before it enters the inventory (ItCreateItem's rule) */
+        if (haveDetail && !gearwire::GearEmpty(set.details[i].gear)) coop::ItemGearApplyTo((void*)item, set.details[i].gear, set.baseSids[i]);
         /* bag23 part 1 (inv3 phase 2, D3(b)): a pack is FILLED BEFORE IT IS PLACED, from the kit's rows for this index - after its
            own mark above, so rows that arrived clean or with their own exact marks keep them (review-inv6p2 MEDIUM's rule). A dead
            copy (wornOnly) skips pack rows: its pack is left where it is (the backpack section is skipped above anyway). */
@@ -873,11 +876,12 @@ bool DeserialiseGarments(const std::vector<char>& b, size_t at, GarmentSet* out)
     if (dr == coopgarment::kDetailAbsent) ++g_c.detailsAbsent;
     else if (dr == coopgarment::kDetailBad) { ++g_c.detailsBad; out->details.clear(); }
     else if (dr == coopgarment::kDetailBadOwner) coop::ItemOwnerNoteBadRecv();   /* inv6 phase 2: details kept, the marks dropped */
+    else if (dr == coopgarment::kDetailBadGear) coop::ItemGearNoteBadRecv();   /* details and owners kept, the uniforms and crafters dropped; the packs and cells below are still read */
     /* bag23 part 1 (inv3 phase 2, protocol 81): the packs' contents after the details and their OWNL tail. Absent = an older
        sender, or no pack holding anything. Malformed: the garments above still apply and every pack stays EMPTY - dropped whole,
        counted (bagRows lost +1, the block's own row count cannot be trusted; bagKitBad) and logged, never a crash. When the
        details block itself could not be read its end is unknown, so a packs block after it cannot be found: said, not guessed. */
-    if (dr == coopgarment::kDetailOk || dr == coopgarment::kDetailAbsent)
+    if (dr == coopgarment::kDetailOk || dr == coopgarment::kDetailAbsent || dr == coopgarment::kDetailBadGear)
     {
         int rowWhy = coopbag::kBagOk;
         size_t kitEnd = 0;
@@ -889,6 +893,8 @@ bool DeserialiseGarments(const std::vector<char>& b, size_t at, GarmentSet* out)
             out->bags.clear();
             ++g_bagKitBad; ++g_bagRowsLost;
             if (rowWhy == coopbag::kBagBadOwner) coop::ItemOwnerNoteBadRecv();
+            else if (rowWhy == coopbag::kBagBadGear) coop::ItemGearNoteBadRecv();   /* a pack's rows with a bad gear tail */
+            else if (rowWhy == coopbag::kBagBadNest) coop::ItemBagNestNoteBadRecv();   /* a pack's rows with a bad pack-inside-pack tail */
             ErrorLog("[P022] CLOTHING packs block malformed (" + std::string(rowWhy == coopbag::kBagOk ? "its wrapper" : coopbag::BagDecodeWhy(rowWhy))
                      + ") - the garments apply, the copy's packs stay EMPTY (bagRows lost, bagKitBad)");
         }

@@ -30,11 +30,15 @@
 // Threads: the detour runs on whatever thread the task update runs (the AI worker is assumed - F124 rules: no allocation, lock
 // or log; interlocked fields of a fixed 32-slot table). Everything else is the MAIN THREAD. The [EFFECT] REPORT prints the
 // detour's thread id beside the main thread's.
+//
+// A SNEAK KNOCKOUT (MSG_EFFECT kind 3 KO; the block 'A SNEAK KNOCKOUT' below) takes the same road for Task_StealthKO: the assassin's
+// game holds its task and sends one request; the victim's owner decides, applies the outcome on its own character and answers it.
 
 #include "effect.h"
 #include "spawn.h"
 #include "store.h"         // EngineWritesBlocked, StoreIsDeadPod, StoreWorldGenNow
-#include "replicate.h"     // nothing used here since T-327 fold 2 (IsDownedCharacter fed the removed standing-victim refusal)
+#include "replicate.h"     // IsDownedCharacter: a sneak knockout of a victim already down is answered ALREADY
+#include "medical.h"       // StatePush, StealthKnockOutOwned: the owner's side of a sneak knockout
 #include "addresses.h"
 #include "hooks.h"
 #include "net/session.h"
@@ -45,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <intrin.h>        // _ReturnAddress: the sneak knockout's chance hook acts only for the task's own roll
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -338,6 +343,849 @@ void EatOnAnswer(const cooffect::EffectMsg& m, unsigned int fromKey)
     ++g_eqAnsStale;
 }
 
+// ==== A SNEAK KNOCKOUT (Task_StealthKO) OF ANOTHER GAME'S CHARACTER ====
+//
+// The engine road (1.0.65 disassembly of TaskStealthKO_update; build/decomp_34cd20.txt): the task walks the assassin up (stage 0),
+// plays the knockout animation (stage 1) and, past the animation's threshold, rolls once (stage 2): chance =
+// StealthKoChance(assassin, victim, 1), roll = RandomRange(0, StealthKoRollMax = 100); success when chance > roll. Success:
+// "*Thunk*", experience, MedicalSystem::knockout(victim medical, skill 0x16 x StealthKoSkillScale) (return StealthKoKnockoutRet).
+// Failure: "Failed!", the victim's AI alerted (0x38), the victim made to see the assassin (5 s), both remember each other, the victim turns on
+// the assassin.
+// Who decides: the VICTIM's game, for an NPC and for another player's character alike - it holds the victim's senses (whether it
+// sees the assassin), the victim's true position and the victim itself, and its copy of the assassin carries the owner's stats
+// (stats.cpp, MSG_STATS: the 44 saved values, the knockout skill - stat 0x16, CharStats +0xB8 - among them). The chance it rolls
+// is the engine's own StealthKoChance(its copy of the assassin, its victim, 1).
+// On the assassin's game the task's update is skipped in stage 1 while the victim is a copy (the knockout animation is not
+// re-requested and the assassin is not turned to the victim meanwhile; the check repeats each frame) until the main thread has
+// classified the victim and sent ONE KO request (decided 0 a player character, 4 an NPC: [STEALTHKO] ATTEMPT). The victim's
+// game, at its next K2 safe point, refuses when the victim sees the assassin (the engine ends the task without a roll then:
+// REFUSED STATE) or the two stand more than kFarUnits apart there (REFUSED FAR), answers ALREADY when the victim is down, else
+// rolls, applies the outcome through the engine's own calls on its own character, answers APPLIED with it and pushes STATE
+// ([STEALTHKO] DECIDE). The assassin's game then runs its task with the chance hook answering above or below every roll, so the
+// engine's own branch, text, experience and failure reaction follow the verdict ([STEALTHKO] RESULT);
+//   a refusal, ALREADY, 3 s with no answer, no road to the victim's owner, its kind unreadable, a world load, a link change, the
+//                         copy gone -> the task ends through its own exit (no text, no experience), the engine's own quiet end.
+// The engine's knockout of the copy stays refused by the knockout gate (medical.cpp, counted AWAITING STATE): the copy falls on its
+// owner's STATE. The owner applies the outcome at the K2 safe point through the engine's own calls on its own character and
+// pushes STATE.
+// While a verdict is awaited or not yet read by the task (NEW, HELD, FORCED), the copy's knockdown from its owner's STATE waits
+// (EffectKoHoldsKnockdown): the task ends without text or experience when it finds its victim down. The owner sends its APPLIED
+// answer before pushing the STATE that carries the outcome; the two ride different roads (STATE unreliable), so the order they
+// arrive in is not guaranteed - the knockdown hold is what keeps the task's verdict.
+// Threads: the task and chance hooks run on the AI worker, the sight-check hook (FactionHostileEntry, acting only for the task's own
+// call) on any thread - a fixed 32-slot interlocked table; no allocation, lock, log or main-thread call there.
+unsigned long long kKoTaskRva = 0;       static AddrReg kKoTaskRva_reg("TaskStealthKO_update", &kKoTaskRva);         /* Steam_1.0.65 0x34CD20 */
+unsigned long long kKoChanceRva = 0;     static AddrReg kKoChanceRva_reg("StealthKoChance", &kKoChanceRva);           /* Steam_1.0.65 0x884420 */
+unsigned long long kKoChanceRet = 0;     static AddrReg kKoChanceRet_reg("StealthKoChanceRet", &kKoChanceRet);        /* Steam_1.0.65 0x34D02B */
+unsigned long long kKoKnockRet = 0;      static AddrReg kKoKnockRet_reg("StealthKoKnockoutRet", &kKoKnockRet);        /* Steam_1.0.65 0x34D493 */
+unsigned long long kKoRollRva = 0;       static AddrReg kKoRollRva_reg("RandomRange", &kKoRollRva);                   /* Steam_1.0.65 0x9B0DB0 */
+unsigned long long kKoAlertRva = 0;      static AddrReg kKoAlertRva_reg("StealthKoFailAlert", &kKoAlertRva);          /* Steam_1.0.65 0x684BD0 */
+unsigned long long kKoMarkRva = 0;       static AddrReg kKoMarkRva_reg("FactionMarkHostile", &kKoMarkRva);            /* Steam_1.0.65 0x858070: a character's senses record of another set to "sees it" (5 s) */
+unsigned long long kKoHostileRva = 0;    static AddrReg kKoHostileRva_reg("FactionHostileEntry", &kKoHostileRva);     /* Steam_1.0.65 0x854960: a character's senses say it sees the other (record +0x38) */
+unsigned long long kKoReactRva = 0;      static AddrReg kKoReactRva_reg("StealthKoFailReact", &kKoReactRva);          /* Steam_1.0.65 0x5C8800 */
+unsigned long long kKoAttackRva = 0;     static AddrReg kKoAttackRva_reg("StealthKoFailAttack", &kKoAttackRva);       /* Steam_1.0.65 0x5CA610 */
+unsigned long long kKoRollMaxRva = 0;    static AddrReg kKoRollMaxRva_reg("StealthKoRollMax", &kKoRollMaxRva);        /* Steam_1.0.65 0x1682250 (100.0) */
+unsigned long long kKoSkillScaleRva = 0; static AddrReg kKoSkillScaleRva_reg("StealthKoSkillScale", &kKoSkillScaleRva); /* Steam_1.0.65 0x1681AD8 (0.01) */
+unsigned long long kKoRememberRva = 0;   static AddrReg kKoRememberRva_reg("Character_remember", &kKoRememberRva);    /* Steam_1.0.65 0x673A10 */
+unsigned long long kKoGetStatRva = 0;    static AddrReg kKoGetStatRva_reg("CharStatsGetStat", &kKoGetStatRva);       /* Steam_1.0.65 0x883BF0 */
+unsigned long long kKoHandCharRva = 0;   static AddrReg kKoHandCharRva_reg("Hand_asCharacter", &kKoHandCharRva);      /* Steam_1.0.65 0x7974F0 */
+
+typedef void  (*KoTaskFn)(void* task, void* ai);
+typedef float (*KoChanceFn)(::Character* assassin, ::Character* victim, char flag);
+typedef float (*KoRollFn)(float lo, float hi);
+typedef ::Character* (*KoHandCharFn)(const void* hand);
+typedef ::Character* (*KoAiCharFn)(void* ai);
+typedef void  (*KoAiEndFn)(void* ai);
+typedef void* (*KoFactionFn)(::Character* c);
+typedef bool  (*KoHostileFn)(void* faction, ::Character* who);
+typedef void* (*KoRecordFn)(void* senses, ::Character* who);
+typedef void  (*KoMarkFn)(void* faction, ::Character* who, char on);
+typedef unsigned long long (*KoAlertFn)(void* ai, ::Character* who, unsigned int what, char flag);
+typedef void  (*KoRememberFn)(::Character* c, ::Character* who, int what);
+typedef void  (*KoReactFn)(::Character* c, ::Character* who, char on, int zero);
+typedef void  (*KoAttackFn)(::Character* c, ::Character* who);
+typedef float (*KoGetStatFn)(void* stats, int stat, bool flag);
+
+const size_t kKoTaskStage   = 0x78;    /* the task's stage, -1..3 */
+const size_t kKoTaskHand    = 0x10;    /* the task's victim hand */
+const size_t kKoAiChar      = 0x48;    /* the task owner's vtable: its character (the assassin) */
+const size_t kKoAiEnd       = 0x28;    /* the task owner's vtable: the task's own exit (no text, no experience) */
+const size_t kKoCharSenses = 0x68;    /* Character vtable: its senses (what it sees and hears of others) */
+const size_t kKoCharAi      = 0x280;   /* Character: the object the alert is given to (the engine passes the pointer stored here) */
+const size_t kKoCharStats   = 0x450;   /* Character: its stats */
+const int    kKoStatSkill   = 0x16;    /* the skill the knockout scales by */
+
+KoTaskFn     orig_ko_task = 0;
+KoChanceFn   orig_ko_chance = 0;
+KoChanceFn   g_koChanceFn = 0;         /* the chance as the owner calls it: the hook's trampoline, or the entry when not hooked */
+KoRollFn     g_koRoll = 0;
+KoHandCharFn g_koHandChar = 0;
+KoHostileFn  g_koHostile = 0;
+KoMarkFn     g_koMark = 0;
+KoAlertFn    g_koAlert = 0;
+KoRememberFn g_koRemember = 0;
+KoReactFn    g_koReact = 0;
+KoAttackFn   g_koAttack = 0;
+KoGetStatFn  g_koGetStat = 0;
+float g_koRollMax = 100.0f, g_koSkillScale = 0.01f;   /* read from the image at install */
+bool g_koOn = false;                   /* the assassin's side: both hooks in and every row it needs */
+bool g_koOwnOn = false;                /* the owner's side: every engine call it makes has its row (OFF after a caught fault) */
+unsigned long long g_koChanceRetAbs = 0, g_koKnockRetAbs = 0;
+KoHostileFn  orig_ko_hostile = 0;      /* the sight check's trampoline (the sees hook) */
+KoRecordFn   g_koRecord = 0;           /* a senses' record of another (the call FactionHostileEntry makes at +0x14); 0 when not found */
+unsigned long long g_koSeesRetAbs = 0; /* the return address of the task's own sight check (found in the task's code at install); 0 none */
+bool g_koSeesOn = false;               /* the sees hook is in */
+volatile LONG64 g_koSeesForced = 0;    /* the task's sight checks answered "does not see" for a slot holding its verdict (FORCED) */
+
+/* ANY THREAD (interlocked) */
+volatile LONG64 g_koStage1 = 0, g_koForced = 0, g_koTableFull = 0, g_koEndCalls = 0;
+volatile LONG   g_koThread = 0;
+/* MAIN THREAD */
+long long g_koHeld = 0, g_koClassified = 0, g_koSent = 0, g_koKo = 0, g_koNoticed = 0, g_koEnded = 0, g_koReleased = 0;
+long long g_koStale = 0, g_koAnsIn = 0, g_koAnsStale = 0, g_koLogged = 0;
+long long g_koOwnIn = 0, g_koOwnRolled = 0, g_koOwnApplied = 0, g_koOwnKo = 0, g_koOwnNoticed = 0, g_koOwnRefused = 0, g_koOwnAlready = 0,
+          g_koOwnClassDiffer = 0;
+long long g_koOwnFault = 0;
+/* an NPC victim: the assassin's game's attempts and their results; the victim's game's decisions */
+long long g_koAttempt = 0, g_koResKo = 0, g_koResFailed = 0, g_koResRefused = 0, g_koResNone = 0;
+long long g_koDecide = 0, g_koDecideKo = 0, g_koDecideFailed = 0, g_koDecideRefused = 0;
+long long g_koStateHeld = 0;           /* slots that held the copy's knockdown for their verdict (once per slot) */
+unsigned int g_koNextReq = 0;
+const long long kKoLogLimit = 200;
+bool KoLog() { if (g_koLogged >= kKoLogLimit) return false; ++g_koLogged; return true; }
+
+struct KoSlot
+{
+    volatile LONG state;                   /* cooffect::kKo* */
+    volatile unsigned int victim, assassin;
+    volatile LONG lastSeen;                /* GetTickCount of the task update's last visit while the slot is live */
+    volatile LONG outcome;                 /* kKoOutcome*: the verdict the victim's game answered (FORCED / FORCED_DONE) */
+    volatile LONG reqId;                   /* set by the main thread before the slot leaves NEW */
+    void* volatile senses;                 /* FORCED: the victim copy's senses and the assassin, stamped by the task's update before */
+    ::Character* volatile assassinChar;    /* the engine's update runs - the sees hook matches the task's sight check on them */
+    /* MAIN THREAD only */
+    int pc;
+    DWORD opened, sentAt;
+    int ans;
+    unsigned char ansOutcome, ansReason;
+    bool stateHeld;                        /* this slot has held the copy's knockdown for its verdict (counted once) */
+};
+const int kKoSlots = 32;
+KoSlot g_ko[kKoSlots];
+
+bool KoLive(LONG st)
+{
+    return st == cooffect::kKoNew || st == cooffect::kKoHeld || st == cooffect::kKoForced || st == cooffect::kKoEnd;
+}
+
+/* ANY THREAD: the pair's LIVE slot (NEW, HELD, FORCED, END). A finished slot (ENDED, FORCED_DONE) never
+   matches: a new attempt on the same pair (the task back in stage 1) takes a slot of its own. */
+int KoFind(unsigned int vu, unsigned int au)
+{
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        const LONG st = g_ko[i].state;
+        if (KoLive(st) && g_ko[i].victim == vu && g_ko[i].assassin == au) return i;
+    }
+    return -1;
+}
+
+int KoClaim(unsigned int vu, unsigned int au, LONG now)   /* ANY THREAD */
+{
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        KoSlot& s = g_ko[i];
+        if (::InterlockedCompareExchange(&s.state, cooffect::kKoClaiming, cooffect::kKoFree) != cooffect::kKoFree) continue;
+        s.victim = vu;
+        s.assassin = au;
+        ::InterlockedExchange(&s.reqId, 0);
+        ::InterlockedExchange(&s.outcome, 0);
+        s.senses = 0;
+        s.assassinChar = 0;
+        ::InterlockedExchange(&s.lastSeen, now);   /* claimed: no verdict yet */
+        ::InterlockedExchange(&s.state, cooffect::kKoNew);
+        return i;
+    }
+    return -1;
+}
+
+void KoEndTask(void* ai) { ((KoAiEndFn)((*(void***)ai)[kKoAiEnd / sizeof(void*)]))(ai); }
+
+void* KoSensesOf(::Character* c);
+
+// DETOUR, the AI worker: TaskStealthKO_update(task, its owner).
+void detour_ko_task(void* task, void* ai)
+{
+    if (!g_koOn || task == 0 || ai == 0 || *(const volatile int*)((const char*)task + kKoTaskStage) != 1) { orig_ko_task(task, ai); return; }
+    ::InterlockedIncrement64(&g_koStage1);
+    if (g_koThread == 0) ::InterlockedExchange(&g_koThread, (LONG)::GetCurrentThreadId());
+    ::Character* victim = g_koHandChar((const char*)task + kKoTaskHand);
+    ::Character* assassin = ((KoAiCharFn)((*(void***)ai)[kKoAiChar / sizeof(void*)]))(ai);
+    unsigned int vu = 0, au = 0;
+    const int vOwn = (victim != 0) ? EffOwn(victim, &vu) : -1;
+    if (victim == 0 || assassin == 0 || vOwn < 0 || EffOwn(assassin, &au) != 1) { orig_ko_task(task, ai); return; }
+    const LONG now = (LONG)::GetTickCount();
+    int i = KoFind(vu, au);
+    /* a victim driven here: only a slot already open for the pair (the victim was handed over while its attempt waited) steers the
+       task - its request is out, so this game does not roll a second time; with no slot the engine's own task runs */
+    if (i < 0 && vOwn != 0) { orig_ko_task(task, ai); return; }
+    if (i < 0) i = KoClaim(vu, au, now);
+    if (i < 0) { ::InterlockedIncrement64(&g_koTableFull); KoEndTask(ai); return; }   /* 32 held at once: no roll anyone can stand behind */
+    KoSlot& s = g_ko[i];
+    const LONG st = s.state;
+    if (KoLive(st)) ::InterlockedExchange(&s.lastSeen, now);
+    const int act = cooffect::KoHookAct((int)st);
+    if (act == cooffect::kKoActHold) return;
+    if (act == cooffect::kKoActEndTask)
+    {
+        if (::InterlockedCompareExchange(&s.state, cooffect::kKoEnded, cooffect::kKoEnd) == cooffect::kKoEnd)
+        {
+            ::InterlockedIncrement64(&g_koEndCalls);
+            KoEndTask(ai);
+        }
+        return;
+    }
+    /* FORCED: the sees hook answers this pair's sight check "does not see" until the chance hook has read the verdict */
+    s.senses = KoSensesOf(victim);
+    s.assassinChar = assassin;
+    orig_ko_task(task, ai);
+}
+
+// DETOUR, the AI worker: StealthKoChance(assassin, victim, flag) - acts only for the task's own roll (StealthKoChanceRet).
+float detour_ko_chance(::Character* assassin, ::Character* victim, char flag)
+{
+    const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();   /* first, before anything can disturb the frame */
+    if (!g_koOn || ret != g_koChanceRetAbs) return orig_ko_chance(assassin, victim, flag);
+    unsigned int vu = 0, au = 0;
+    const int vOwn = EffOwn(victim, &vu);
+    const int aOwn = EffOwn(assassin, &au);
+    const int i = (vu != 0 && au != 0) ? KoFind(vu, au) : -1;
+    /* the slot acts while the assassin is still driven here; a victim handed to this game after the request went out keeps its slot
+       (the task's update steers it the same way): one attempt, one roll */
+    if (i < 0 || vOwn < 0 || aOwn != 1) return orig_ko_chance(assassin, victim, flag);
+    KoSlot& s = g_ko[i];
+    if (::InterlockedCompareExchange(&s.state, cooffect::kKoForcedDone, cooffect::kKoForced) == cooffect::kKoForced)
+    {
+        ::InterlockedIncrement64(&g_koForced);
+        return cooffect::KoForcedChance((unsigned char)s.outcome);
+    }
+    return orig_ko_chance(assassin, victim, flag);   /* not this slot's forced roll: the engine's own chance */
+}
+
+// DETOUR, any thread: FactionHostileEntry(senses, who) - acts only for the task's own sight check (g_koSeesRetAbs). While a slot holds
+// the victim's game's verdict for the pair (FORCED), the task's copy of the victim does not see the assassin, so the task reaches its
+// stage 2 and reads the verdict there; otherwise the engine's task ends quietly when its copy sees the assassin (decomp_34cd20.txt:81,
+// the exit at :266) - no text, no experience, no crime - while the victim's game has already applied the verdict.
+bool detour_ko_hostile(void* senses, ::Character* who)
+{
+    const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();   /* first, before anything can disturb the frame */
+    if (g_koSeesRetAbs != 0 && ret == g_koSeesRetAbs && senses != 0 && who != 0)
+    {
+        for (int i = 0; i < kKoSlots; ++i)
+        {
+            const KoSlot& s = g_ko[i];
+            if (s.state == cooffect::kKoForced && s.senses == senses && s.assassinChar == who)
+            {
+                ::InterlockedIncrement64(&g_koSeesForced);
+                return false;
+            }
+        }
+    }
+    return orig_ko_hostile(senses, who);
+}
+
+const char* KoRoadName(int road) { return road == cooffect::kRoadLive ? "the notebook (LIVE SLOT)" : "the session link"; }
+const char* KoOutcomeName(int oc)
+{
+    return oc == cooffect::kKoOutcomeKnockedOut ? "KNOCKED OUT" : (oc == cooffect::kKoOutcomeNoticed ? "NOTICED" : "?");
+}
+
+// MAIN THREAD: frees the slot unless a hook moved it meanwhile.
+void KoFree(KoSlot& s, LONG expect)
+{
+    if (::InterlockedCompareExchange(&s.state, cooffect::kKoClaiming, expect) != expect) return;
+    s.victim = 0; s.assassin = 0; s.pc = cooffect::kKoPcUnknown; s.opened = 0; s.sentAt = 0;
+    s.ans = cooffect::kKoAnsNone; s.ansOutcome = 0; s.ansReason = 0; s.stateHeld = false;
+    ::InterlockedExchange(&s.reqId, 0);
+    ::InterlockedExchange(&s.outcome, 0);
+    ::InterlockedExchange(&s.state, cooffect::kKoFree);
+}
+
+// A slot's request id for a log line; a request not sent (yet) says so.
+std::string KoReqText(const KoSlot& s, bool notSent)
+{
+    const LONG rq = s.reqId;
+    if (rq == 0) return "none (not sent yet)";
+    return EffN((long long)rq) + (notSent ? " (not sent yet)" : "");
+}
+
+// MAIN THREAD: the task ends through its own exit at its next update.
+void KoEnd(KoSlot& s, LONG expect, const std::string& why)
+{
+    if (::InterlockedCompareExchange(&s.state, cooffect::kKoEnd, expect) != expect) return;
+    ++g_koEnded;
+    if (KoLog()) DebugLog("[STEALTHKO] END req=" + KoReqText(s, expect == cooffect::kKoNew) + " why=" + why + " - task ended through the engine's own exit");
+}
+
+// Why a task is ended (the END line's why=): already, refused:<reason>, handed over, copy gone, unreadable, timeout - and, from their own callers,
+// no road, world load, link change.
+std::string KoEndWhy(const KoSlot& s, bool here)
+{
+    if (s.ans == cooffect::kKoAnsAlready) return "already";
+    if (s.ans == cooffect::kKoAnsRefused) return std::string("refused:") + cooffect::ReasonName(s.ansReason);
+    if (net::IsUidMine(s.victim)) return "handed over (the victim is driven here now; its request is out - no second roll)";
+    if (!here || s.pc == -2) return "copy gone";
+    if (s.pc == -1) return "unreadable";
+    return "timeout";
+}
+
+// The knockout skill (stat 0x16: the one StealthKoChance and the knockout scale by) as this game reads it on `c`;
+// kKoSkillUnread when it cannot. POD, __try (C2712).
+float KoSkillPod(::Character* c)
+{
+    if (c == 0 || g_koGetStat == 0) return cooffect::kKoSkillUnread;
+    __try
+    {
+        void* stats = *(void* const*)((const char*)c + kKoCharStats);
+        if (stats == 0) return cooffect::kKoSkillUnread;
+        const float k = g_koGetStat(stats, kKoStatSkill, false);
+        return (k >= 0.0f && k <= cooffect::kKoSkillMax) ? k : cooffect::kKoSkillUnread;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return cooffect::kKoSkillUnread; }
+}
+
+// The DECIDE line's measurements (an NPC victim): sees / dist / chance / roll, '-' for a step not reached.
+std::string KoDecideText(int sees, float distSq, bool rolled, float chance, float roll)
+{
+    return "sees=" + (sees < 0 ? std::string("-") : EffN(sees)) + " dist=" + (distSq >= 0.0f ? EffF3(std::sqrt(distSq)) : std::string("?"))
+           + " chance=" + (rolled ? EffF3(chance) : std::string("-")) + " roll=" + (rolled ? EffF3(roll) : std::string("-")) + " ";
+}
+
+// The DECIDE line's zero-chance inputs (KoZeroInputsPod) and whether they put the engine's chance at 0: zeroBranch=1 when the victim
+// is in melee combat mode, holds a senses record of the assassin and the copy's +0xE8 is not 1; 0 when one of them rules it out; '-'
+// when a value was not read.
+std::string KoZeroText(int e8, bool e8Ok, int melee, int record)
+{
+    int z = -1;
+    if (melee == 0 || record == 0 || (e8Ok && e8 == 1)) z = 0;
+    else if (melee == 1 && record == 1 && e8Ok) z = 1;
+    return "e8=" + (e8Ok ? EffN((long long)e8) : std::string("-")) + " melee=" + (melee < 0 ? std::string("-") : EffN((long long)melee))
+           + " record=" + (record < 0 ? std::string("-") : EffN((long long)record)) + " zeroBranch=" + (z < 0 ? std::string("-") : EffN((long long)z)) + " ";
+}
+
+int KoSend(const KoSlot& s, unsigned char decided, float skill)   /* MAIN THREAD: the road it went by, 0 none */
+{
+    cooffect::EffectMsg m;
+    m.dir = cooffect::kDirRequest; m.kind = cooffect::kKindKo; m.reqId = (unsigned int)s.reqId; m.targetUid = s.victim;
+    m.actorUid = s.assassin; m.source = cooffect::kKoSourceStealth; m.decided = decided; m.skill = skill;
+    std::vector<char> b;
+    if (!cooffect::EncodeEffect(&b, m)) return 0;
+    const int road = net::SendEffectRequest(s.victim, b);
+    if (road != 0) ++g_koSent;
+    return road;
+}
+
+struct KoJob { unsigned int victim, actor, key, reqId; bool viaRelay; unsigned char decided; DWORD at; float skill; };
+std::vector<KoJob> g_koJobs;          /* the owner's accepted requests, acted at the K2 safe point */
+struct KoPending { unsigned int victim, actor, key, reqId; bool viaRelay; unsigned char result, reason, outcome; };
+std::vector<KoPending> g_koAnsQ;      /* the K2 safe point's refusals and ALREADY answers, sent by EffectTick (an APPLIED answer is sent at once, before its STATE) */
+
+void KoAnswer(const KoPending& p)
+{
+    cooffect::EffectMsg a;
+    a.dir = cooffect::kDirAnswer; a.kind = cooffect::kKindKo; a.reqId = p.reqId; a.targetUid = p.victim; a.actorUid = p.actor;
+    a.result = p.result; a.reason = p.reason; a.outcome = p.outcome;
+    std::vector<char> b;
+    if (!cooffect::EncodeEffect(&b, a)) { ++g_eqAnsFail; return; }
+    if (net::SendEffectAnswer(p.key, p.viaRelay, b) != 0) ++g_eqAnsSent; else ++g_eqAnsFail;
+}
+
+void KoReply(const KoJob& j, bool queue, unsigned char result, unsigned char reason, unsigned char outcome)
+{
+    KoPending p = { j.victim, j.actor, j.key, j.reqId, j.viaRelay, result, reason, outcome };
+    if (queue) g_koAnsQ.push_back(p); else KoAnswer(p);
+}
+
+// The owner's line: DECIDE for an NPC (the tail starts with KoDecideText), ROLL for a player character.
+void KoOwnerLog(const KoJob& j, const std::string& tail)
+{
+    if (!KoLog()) return;
+    if (j.decided == cooffect::kKoDecidedNpc)
+        DebugLog("[STEALTHKO] DECIDE uid=" + EffN(j.victim) + " req=" + EffN(j.reqId) + " " + tail + " assassin uid=" + EffN(j.actor) + " (copy)");
+    else
+        DebugLog("[STEALTHKO] ROLL (owner's game, a player character) req=" + EffN(j.reqId) + " victim uid=" + EffN(j.victim)
+                 + " (mine) assassin uid=" + EffN(j.actor) + " (copy) " + tail);
+}
+
+// mid: the DECIDE line's measurements (an NPC victim; not printed for a player character).
+void KoOwnRefuse(const KoJob& j, int why, bool queue, const std::string& mid, const std::string& detail)
+{
+    ++g_koOwnRefused;
+    ++g_eqRefusedWhy[why];
+    const bool npc = (j.decided == cooffect::kKoDecidedNpc);
+    if (npc) ++g_koDecideRefused;
+    const bool answered = cooffect::ReasonAnswered(why);
+    if (answered) KoReply(j, queue, cooffect::kResultRefused, (unsigned char)why, cooffect::kKoOutcomeNone);
+    KoOwnerLog(j, (npc ? mid + "-> REFUSED " : std::string("-> REFUSED why=")) + cooffect::ReasonName(why) + detail
+                  + (answered ? std::string() : std::string(" (not answered: the sender does not drive that assassin)")));
+}
+
+// MAIN THREAD (EffectOnNet): the victim's owner takes a KO request; it is decided at the K2 safe point.
+void KoOnRequest(const cooffect::EffectMsg& m, unsigned int fromKey, bool viaRelay)
+{
+    ++g_koOwnIn;
+    KoJob j;
+    j.victim = m.targetUid; j.actor = m.actorUid; j.key = fromKey; j.reqId = m.reqId; j.viaRelay = viaRelay; j.decided = m.decided;
+    j.at = ::GetTickCount(); j.skill = m.skill;
+    if (j.decided == cooffect::kKoDecidedNpc) ++g_koDecide;
+    ::Character* v = FindSpawned(m.targetUid);
+    ::Character* a = FindSpawned(m.actorUid);
+    const float dsq = EffDistSq(v, a);
+    int why = cooffect::EffectValidate(net::IsUidMine(m.targetUid), net::RemoteMayWriteStill(m.actorUid, fromKey), v != 0, a != 0,
+                                       EngineWritesBlocked(), dsq);
+    const bool off = (why == cooffect::kReasonNone && !g_koOwnOn);
+    if (off) why = cooffect::kReasonState;
+    if (why != cooffect::kReasonNone)
+    {
+        KoOwnRefuse(j, why, false, KoDecideText(-1, dsq, false, 0.0f, 0.0f),
+                    off ? std::string(" (the sneak knockout is OFF on this game: see the [STEALTHKO] install or FAULTED line)") : std::string());
+        return;
+    }
+    g_koJobs.push_back(j);
+}
+
+// MAIN THREAD (EffectOnNet): the victim's owner answered this game's KO request; EffectTick acts on it.
+void KoOnAnswer(const cooffect::EffectMsg& m, unsigned int fromKey)
+{
+    ++g_koAnsIn;
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        KoSlot& s = g_ko[i];
+        const LONG st = s.state;
+        if (st != cooffect::kKoHeld || (unsigned int)s.reqId != m.reqId || s.victim != m.targetUid
+            || s.assassin != m.actorUid) continue;
+        if (!net::RemoteMayWriteStill(m.targetUid, fromKey)) break;   /* only the victim's owner answers for it */
+        s.ansOutcome = m.outcome;
+        s.ansReason = m.reason;
+        s.ans = cooffect::KoAnswerKind(m.result, m.outcome);
+        return;
+    }
+    ++g_koAnsStale;
+}
+
+// MAIN THREAD: the RESULT line of an NPC victim's held attempt that ends without a verdict (refused, ALREADY, no answer).
+void KoResultEnd(const KoSlot& s, const std::string& why)
+{
+    if (s.pc != 0) return;
+    if (s.ans == cooffect::kKoAnsRefused || s.ans == cooffect::kKoAnsAlready) ++g_koResRefused; else ++g_koResNone;
+    if (KoLog()) DebugLog("[STEALTHKO] RESULT <- req=" + EffN((long long)s.reqId) + " "
+                          + (s.ans == cooffect::kKoAnsRefused ? std::string("REFUSED ") + cooffect::ReasonName(s.ansReason)
+                             : (s.ans == cooffect::kKoAnsAlready ? std::string("ALREADY") : "NONE " + why))
+                          + " - the task ends through the engine's own exit (no roll)");
+}
+
+// MAIN THREAD, every frame: classify, send, hold, release and end the assassin's slots; send the safe point's answers.
+void KoTick(DWORD now)
+{
+    for (size_t k = 0; k < g_koAnsQ.size(); ++k) KoAnswer(g_koAnsQ[k]);
+    g_koAnsQ.clear();
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        KoSlot& s = g_ko[i];
+        const LONG st = s.state;
+        if (st < cooffect::kKoNew) continue;
+        if (st == cooffect::kKoNew && s.reqId == 0)
+        {
+            if (++g_koNextReq == 0) ++g_koNextReq;
+            s.pc = cooffect::kKoPcUnknown; s.opened = now; s.sentAt = 0; s.ans = cooffect::kKoAnsNone; s.ansOutcome = 0; s.ansReason = 0;
+            ::InterlockedExchange(&s.reqId, (LONG)g_koNextReq);
+        }
+        /* lastSeen may be stamped by the task's update after `now` was read: that counts as 0 ms, never as a wrapped ~49 days */
+        if (cooffect::KoSlotDone((int)st, cooffect::EffSinceMs((unsigned int)now, (unsigned int)s.lastSeen)))
+        {
+            if (st == cooffect::kKoForced || st == cooffect::kKoEnd) ++g_koStale;
+            KoFree(s, st);
+            continue;
+        }
+        const bool mine = net::IsUidMine(s.victim);
+        const bool here = FindSpawned(s.victim) != 0;
+        const unsigned int waited = (s.sentAt != 0) ? (unsigned int)(now - s.sentAt) : 0u;
+        int d = cooffect::KoActorDecide((int)st, s.pc, mine, here, s.ans, waited);
+        if (d == cooffect::kKoActClassify)
+        {
+            s.pc = CopyIsPlayerCharacter(s.victim);
+            ++g_koClassified;
+            d = cooffect::KoActorDecide((int)st, s.pc, mine, here, s.ans, waited);
+        }
+        if (d == cooffect::kKoActHold) continue;
+        if (d == cooffect::kKoActRunEngine)
+        {
+            ++g_koReleased;
+            if (KoLog()) DebugLog("[STEALTHKO] RELEASED req=" + EffN((long long)s.reqId) + " - the victim is driven HERE now: the engine's own roll");
+            KoFree(s, st);
+            continue;
+        }
+        if (d == cooffect::kKoActEndTask)
+        {
+            const std::string why = KoEndWhy(s, here);
+            if (st == cooffect::kKoHeld) KoResultEnd(s, why);
+            KoEnd(s, st, why);
+            continue;
+        }
+        if (d == cooffect::kKoActRunForced)
+        {
+            ::InterlockedExchange(&s.outcome, (LONG)s.ansOutcome);
+            if (::InterlockedCompareExchange(&s.state, cooffect::kKoForced, st) != st) continue;
+            const bool ko = (s.ansOutcome == cooffect::kKoOutcomeKnockedOut);
+            if (ko) ++g_koKo; else ++g_koNoticed;
+            if (s.pc == 0)
+            {
+                if (ko) ++g_koResKo; else ++g_koResFailed;
+                if (KoLog()) DebugLog("[STEALTHKO] RESULT <- req=" + EffN((long long)s.reqId) + " " + (ko ? "KNOCKED OUT" : "FAILED") + " held="
+                                      + EffN((long long)(now - s.opened)) + " ms - the engine's own task shows it");
+            }
+            else if (KoLog()) DebugLog("[STEALTHKO] VERDICT req=" + EffN((long long)s.reqId) + " -> " + KoOutcomeName(s.ansOutcome) + " held="
+                                       + EffN((long long)(now - s.opened)) + " ms - the engine's own task shows it");
+            continue;
+        }
+        if (d != cooffect::kKoActSend) continue;
+        const unsigned char decided = cooffect::KoRequestDecided(s.pc);
+        const float skill = KoSkillPod(FindSpawned(s.assassin));
+        const int road = KoSend(s, decided, skill);
+        if (road == 0) { KoEnd(s, st, "no road"); continue; }
+        s.sentAt = now;
+        if (::InterlockedCompareExchange(&s.state, cooffect::kKoHeld, st) != st) continue;
+        ++g_koHeld;
+        if (decided == cooffect::kKoDecidedNpc)
+        {
+            ++g_koAttempt;
+            if (KoLog()) DebugLog("[STEALTHKO] ATTEMPT -> uid=" + EffN(s.victim) + " req=" + EffN((long long)s.reqId) + " assassin uid="
+                                  + EffN(s.assassin) + " (mine) skill=" + EffF3(skill) + " - the knockout animation started; the victim's game decides"
+                                  + " (via " + KoRoadName(road) + ")");
+            continue;
+        }
+        if (KoLog()) DebugLog("[STEALTHKO] HOLD req=" + EffN((long long)s.reqId) + " victim uid=" + EffN(s.victim)
+                              + " (a COPY here, player character) assassin uid=" + EffN(s.assassin)
+                              + " (mine) - the knockout animation started; the victim's game rolls (via " + KoRoadName(road) + ")");
+    }
+}
+
+// MAIN THREAD (EffClearTables): a world load or a link change - a held task ends; every other slot and the owner's jobs go.
+void KoClearTables(const char* why)
+{
+    const char* w = (why != 0 && std::strstr(why, "world") != 0) ? "world load" : "link change";
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        KoSlot& s = g_ko[i];
+        const LONG st = s.state;
+        if (st == cooffect::kKoNew || st == cooffect::kKoHeld)
+        {
+            if (st == cooffect::kKoHeld) KoResultEnd(s, w);
+            KoEnd(s, st, w);
+        }
+        else if (st >= cooffect::kKoNew && st != cooffect::kKoEnd && st != cooffect::kKoEnded) KoFree(s, st);
+    }
+    g_koJobs.clear();
+    g_koAnsQ.clear();
+}
+
+// ---- THE OWNER'S ENGINE CALLS (K2 safe point, worker paused). POD, __try (C2712): -1 a caught fault. ----
+void* KoSensesOf(::Character* c) { return ((KoFactionFn)((*(void***)c)[kKoCharSenses / sizeof(void*)]))(c); }
+
+int KoHostilePod(::Character* v, ::Character* a)   /* 1 the victim sees the assassin (the engine's task then ends without a roll), 0 not */
+{
+    __try
+    {
+        void* f = KoSensesOf(v);
+        if (f == 0) return -1;
+        return g_koHostile(f, a) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int KoRollPod(::Character* a, ::Character* v, float* chance, float* roll)
+{
+    __try
+    {
+        *chance = g_koChanceFn(a, v, 1);
+        *roll = g_koRoll(0.0f, g_koRollMax);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// The inputs of the engine's zero-chance branch (decomp_884420.txt:22-24,78-82: the chance is 0 when the victim is in melee combat
+// mode, its senses hold a record of the assassin and the assassin's +0xE8 is not 1), read on this game's own victim and its copy of the
+// assassin: e8 the copy's +0xE8; melee the victim's combat object's +0x130 (the byte 0x436270 tests for melee: Character +0x648, +8);
+// record 1 when the victim's senses hold a record of the assassin (g_koRecord; -1 when it was not found). Logging only; -1 / e8Ok
+// false for a value not read. POD, __try (C2712).
+const size_t kKoCharE8 = 0xE8, kKoCharBody = 0x648, kKoBodyCombat = 0x8, kKoCombatMelee = 0x130;
+int KoZeroInputsPod(::Character* v, ::Character* a, int* e8, bool* e8Ok, int* melee, int* record)
+{
+    *e8 = 0; *e8Ok = false; *melee = -1; *record = -1;
+    __try
+    {
+        *e8 = *(const int*)((const char*)a + kKoCharE8);
+        *e8Ok = true;
+        const char* body = *(const char* const*)((const char*)v + kKoCharBody);
+        const char* cc = (body != 0) ? *(const char* const*)(body + kKoBodyCombat) : 0;
+        if (cc != 0) *melee = (*(const unsigned char*)(cc + kKoCombatMelee) != 0) ? 1 : 0;
+        if (g_koRecord != 0)
+        {
+            void* f = KoSensesOf(v);
+            if (f != 0) *record = (g_koRecord(f, a) != 0) ? 1 : 0;
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int KoKnockOutPod(unsigned int vuid, ::Character* a, float* skill01, int* unc, float* koTimer)   /* 0 = not applied (unreadable) */
+{
+    __try
+    {
+        void* stats = *(void* const*)((const char*)a + kKoCharStats);
+        const float k = g_koGetStat(stats, kKoStatSkill, false) * g_koSkillScale;
+        *skill01 = k;
+        *unc = StealthKnockOutOwned(vuid, k, koTimer);
+        return (*unc >= 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int KoNoticedPod(::Character* v, ::Character* a)   /* the engine's failure reaction on the victim, in its order */
+{
+    __try
+    {
+        void* ai = *(void* const*)((const char*)v + kKoCharAi);
+        if (ai != 0) g_koAlert(ai, a, 0x38, 0);
+        void* f = KoSensesOf(v);
+        if (f != 0) g_koMark(f, a, 1);
+        g_koRemember(v, a, 4);
+        g_koReact(v, a, 1, 0);
+        g_koAttack(v, a);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+void KoOwnerFault(const KoJob& j, const char* what)
+{
+    ++g_koOwnFault;
+    g_koOwnOn = false;
+    ErrorLog(std::string("[STEALTHKO] the owner's ") + what + " FAULTED req=" + EffN(j.reqId) + " victim uid=" + EffN(j.victim)
+             + " - caught; the owner's side of the sneak knockout is now OFF until the game closes (later requests are refused STATE)");
+    KoOwnRefuse(j, cooffect::kReasonState, true, std::string(), std::string(" (a caught fault)"));
+}
+
+// K2 safe point (MAIN THREAD, worker paused): the victim's game decides each accepted request on its own character - the request's
+// own check (FAR from its copy of the assassin), the victim down (ALREADY), the victim seeing the assassin (REFUSED STATE), then
+// the engine's own chance and roll with its copy of the assassin - applies the outcome and answers it.
+void KoOwnerDrain()
+{
+    if (g_koJobs.empty()) return;
+    std::vector<KoJob> jobs;
+    jobs.swap(g_koJobs);
+    const DWORD now = ::GetTickCount();
+    for (size_t k = 0; k < jobs.size(); ++k)
+    {
+        KoJob j = jobs[k];
+        const bool npc = (j.decided == cooffect::kKoDecidedNpc);
+        ::Character* v = FindSpawned(j.victim);
+        ::Character* a = FindSpawned(j.actor);
+        const float dsq = EffDistSq(v, a);
+        int why = cooffect::EffectValidate(net::IsUidMine(j.victim), net::RemoteMayWriteStill(j.actor, j.key), v != 0, a != 0, false, dsq);
+        if (why == cooffect::kReasonNone && !g_koOwnOn) why = cooffect::kReasonState;
+        /* past the cut (1.5 s after it arrived here): an outcome applied now could reach the assassin's game after its 3 s wait
+           (counted from its send) has ended its task - refused BUSY, never applied */
+        if (why == cooffect::kReasonNone && cooffect::KoOwnerPastCut(cooffect::EffSinceMs((unsigned int)now, (unsigned int)j.at))) why = cooffect::kReasonBusy;
+        /* This game decides the same way whichever kind the assassin's game saw; a difference in how the two games classify the
+           victim is said and counted. CopyIsPlayerCharacter reads this game's own character the same way: 1 = the watched player or
+           a person of a player faction. */
+        const int differ = (why == cooffect::kReasonNone) ? cooffect::KoClassDiffer(j.decided, CopyIsPlayerCharacter(j.victim))
+                                                          : (int)cooffect::kKoClassSame;
+        if (differ != cooffect::kKoClassSame) ++g_koOwnClassDiffer;
+        const std::string note = (differ == cooffect::kKoClassOwnerSaysPc)
+            ? std::string(" (the games disagree: the assassin's game called it an NPC; this game's own character is a player character - decided here all the same)")
+            : (differ == cooffect::kKoClassOwnerSaysNpc)
+            ? std::string(" (the games disagree: the assassin's game called it a player character; this game's own character is an NPC - rolled here)")
+            : std::string();
+        const bool down = (why == cooffect::kReasonNone) && (IsDownedCharacter(v) || StoreIsDeadPod(v) == 1);
+        int sees = -1;
+        if (why == cooffect::kReasonNone && !down)
+        {
+            sees = KoHostilePod(v, a);
+            if (sees < 0) { KoOwnerFault(j, "hostile-entry check"); continue; }
+        }
+        const int check = cooffect::KoOwnerCheck(down, sees == 1, why);
+        if (check == cooffect::kKoOwnAlready)
+        {
+            ++g_koOwnAlready;
+            if (npc) ++g_koDecideRefused;
+            KoReply(j, true, cooffect::kResultAlready, cooffect::kReasonNone, cooffect::kKoOutcomeNone);
+            KoOwnerLog(j, (npc ? KoDecideText(sees, dsq, false, 0.0f, 0.0f) : std::string()) + "-> ALREADY" + note);
+            continue;
+        }
+        if (check != cooffect::kKoOwnRoll)
+        {
+            KoOwnRefuse(j, check, true, KoDecideText(sees, dsq, false, 0.0f, 0.0f),
+                        (sees == 1 ? std::string(" (the victim sees the assassin: the engine's task ends without a roll)") : std::string()) + note);
+            continue;
+        }
+        int zE8 = 0, zMelee = -1, zRecord = -1;
+        bool zE8Ok = false;
+        if (npc) KoZeroInputsPod(v, a, &zE8, &zE8Ok, &zMelee, &zRecord);   /* logging only: a value not read says '-' */
+        float ch = 0.0f, rl = 0.0f;
+        if (KoRollPod(a, v, &ch, &rl) < 0) { KoOwnerFault(j, "roll"); continue; }
+        ++g_koOwnRolled;
+        const unsigned char oc = cooffect::KoDecidedOutcome(cooffect::KoDecide(check, ch, rl));
+        const std::string rollText = npc ? (KoDecideText(sees, dsq, true, ch, rl) + KoZeroText(zE8, zE8Ok, zMelee, zRecord)) : ("chance=" + EffF3(ch) + " roll=" + EffF3(rl) + " ");
+        std::string applied;
+        if (oc == cooffect::kKoOutcomeKnockedOut)
+        {
+            float s01 = 0.0f, kt = 0.0f;
+            int unc = -1;
+            const int kr = KoKnockOutPod(j.victim, a, &s01, &unc, &kt);
+            if (kr < 0) { KoOwnerFault(j, "knockout"); continue; }
+            if (kr == 0) { KoOwnRefuse(j, cooffect::kReasonState, true, rollText, std::string(" (the knockout could not be applied: the medical system is unreadable)")); continue; }
+            /* the answer first, sent from here (StatePush sends from this same safe point); the answer and the STATE ride different roads,
+               so the assassin's game cannot count on the order - it holds the copy's knockdown until its task has read the verdict
+               (EffectKoHoldsKnockdown) */
+            KoReply(j, false, cooffect::kResultApplied, cooffect::kReasonNone, oc);
+            const bool pushedKo = StatePush(j.victim);
+            ++g_koOwnKo;
+            if (npc) ++g_koDecideKo;
+            applied = "-> KNOCKED OUT knockout(skill01=" + EffF3(s01) + ") unconcious=" + EffN(unc) + " koTimer=" + EffF3(kt)
+                      + " pushed=" + EffN(pushedKo ? 1 : 0);
+        }
+        else
+        {
+            if (KoNoticedPod(v, a) < 0) { KoOwnerFault(j, "failure reaction"); continue; }
+            KoReply(j, false, cooffect::kResultApplied, cooffect::kReasonNone, oc);   /* the answer first, as above */
+            const bool pushedNo = StatePush(j.victim);
+            ++g_koOwnNoticed;
+            if (npc) ++g_koDecideFailed;
+            applied = std::string(npc ? "-> FAILED" : "-> NOTICED") + ": AI alerted (0x38), the victim sees the assassin, attackingYou pushed="
+                      + EffN(pushedNo ? 1 : 0);
+        }
+        ++g_koOwnApplied;
+        /* the assassin's knockout skill as its own game read it, beside this game's copy of it (the copy carries the owner's stats) */
+        const std::string skillText = npc ? (" skill sent=" + EffF3(j.skill) + " copy=" + EffF3(KoSkillPod(a))) : std::string();
+        KoOwnerLog(j, rollText + applied + skillText + note);
+    }
+}
+
+// INSTALL (main thread). POD, __try (C2712): the image's code bytes at `at`; 0 when unreadable.
+int KoReadCode(uintptr_t at, unsigned char* out, int n)
+{
+    __try { for (int i = 0; i < n; ++i) out[i] = *(const unsigned char*)(at + i); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// The target of the rel32 CALL/JMP whose opcode is at `at` (its five bytes in b).
+uintptr_t KoRel32(uintptr_t at, const unsigned char* b) { int rel = 0; std::memcpy(&rel, b + 1, 4); return at + 5 + (intptr_t)rel; }
+// 1 when `target`, or one of up to two E9 stubs it starts, lands on `want`.
+int KoReaches(uintptr_t target, uintptr_t want)
+{
+    for (int hop = 0; hop < 3 && target != 0; ++hop)
+    {
+        if (target == want) return 1;
+        unsigned char b[5];
+        if (!KoReadCode(target, b, 5) || b[0] != 0xE9) return 0;
+        target = KoRel32(target, b);
+    }
+    return 0;
+}
+// The task's own sight check: the one CALL in TaskStealthKO_update before its chance call's return (StealthKoChanceRet) that reaches
+// FactionHostileEntry; its return address, or 0 (none, or more than one). Read before the task's entry is hooked.
+uintptr_t KoFindSeesRet(uintptr_t task, uintptr_t chanceRet, uintptr_t hostile)
+{
+    if (task == 0 || hostile == 0 || chanceRet <= task + 5 || chanceRet - task > 0x1000) return 0;
+    const int n = (int)(chanceRet - task);
+    unsigned char code[0x1000];
+    if (!KoReadCode(task, code, n)) return 0;
+    uintptr_t found = 0;
+    int hits = 0;
+    for (int i = 0; i + 5 <= n; ++i)
+    {
+        if (code[i] != 0xE8) continue;
+        if (!KoReaches(KoRel32(task + (uintptr_t)i, code + i), hostile)) continue;
+        ++hits;
+        found = task + (uintptr_t)i + 5;
+    }
+    return (hits == 1) ? found : 0;
+}
+// The senses-record lookup FactionHostileEntry calls: its CALL at +0x14, followed by TEST RAX,RAX (the row's own signature
+// pattern); the call's target, or 0 when the bytes differ.
+uintptr_t KoFindRecordFn(uintptr_t hostile)
+{
+    unsigned char b[0x1C];
+    if (hostile == 0 || !KoReadCode(hostile, b, (int)sizeof(b))) return 0;
+    if (b[0x14] != 0xE8 || b[0x19] != 0x48 || b[0x1A] != 0x85 || b[0x1B] != 0xC0) return 0;
+    return KoRel32(hostile + 0x14, b + 0x14);
+}
+
+void InstallStealthKoHooks()
+{
+    std::string missing;
+    if (kKoTaskRva == 0) missing += " TaskStealthKO_update";
+    if (kKoChanceRva == 0) missing += " StealthKoChance";
+    if (kKoChanceRet == 0) missing += " StealthKoChanceRet";
+    if (kKoKnockRet == 0) missing += " StealthKoKnockoutRet";
+    if (kKoRollRva == 0) missing += " RandomRange";
+    if (kKoAlertRva == 0) missing += " StealthKoFailAlert";
+    if (kKoMarkRva == 0) missing += " FactionMarkHostile";
+    if (kKoHostileRva == 0) missing += " FactionHostileEntry";
+    if (kKoReactRva == 0) missing += " StealthKoFailReact";
+    if (kKoAttackRva == 0) missing += " StealthKoFailAttack";
+    if (kKoRollMaxRva == 0) missing += " StealthKoRollMax";
+    if (kKoSkillScaleRva == 0) missing += " StealthKoSkillScale";
+    if (kKoRememberRva == 0) missing += " Character_remember";
+    if (kKoGetStatRva == 0) missing += " CharStatsGetStat";
+    if (kKoHandCharRva == 0) missing += " Hand_asCharacter";
+    if (!missing.empty())
+    {
+        ErrorLog("[STEALTHKO] address rows missing:" + missing + " - a sneak knockout of another game's character is OFF on this game");
+        return;
+    }
+    g_koRollMax = *(const float*)(uintptr_t)AddrAbs(kKoRollMaxRva);
+    g_koSkillScale = *(const float*)(uintptr_t)AddrAbs(kKoSkillScaleRva);
+    g_koRoll = (KoRollFn)(uintptr_t)AddrAbs(kKoRollRva);
+    g_koHandChar = (KoHandCharFn)(uintptr_t)AddrAbs(kKoHandCharRva);
+    g_koHostile = (KoHostileFn)(uintptr_t)AddrAbs(kKoHostileRva);
+    g_koMark = (KoMarkFn)(uintptr_t)AddrAbs(kKoMarkRva);
+    g_koAlert = (KoAlertFn)(uintptr_t)AddrAbs(kKoAlertRva);
+    g_koRemember = (KoRememberFn)(uintptr_t)AddrAbs(kKoRememberRva);
+    g_koReact = (KoReactFn)(uintptr_t)AddrAbs(kKoReactRva);
+    g_koAttack = (KoAttackFn)(uintptr_t)AddrAbs(kKoAttackRva);
+    g_koGetStat = (KoGetStatFn)(uintptr_t)AddrAbs(kKoGetStatRva);
+    g_koChanceRetAbs = AddrAbs(kKoChanceRet);
+    g_koKnockRetAbs = AddrAbs(kKoKnockRet);
+    /* the sees hook's call site and the record lookup, read from the image before any entry here is hooked */
+    const uintptr_t koTaskAbs = (uintptr_t)AddrAbs(kKoTaskRva);
+    const uintptr_t seesRet = KoFindSeesRet(koTaskAbs, (uintptr_t)g_koChanceRetAbs, (uintptr_t)AddrAbs(kKoHostileRva));
+    g_koRecord = (KoRecordFn)KoFindRecordFn((uintptr_t)AddrAbs(kKoHostileRva));
+    const HookStatus hc = AddHook((void*)(uintptr_t)AddrAbs(kKoChanceRva), (void*)&detour_ko_chance, (void**)&orig_ko_chance);
+    const bool okChance = (hc == SUCCESS);
+    bool okTask = false;
+    if (okChance) okTask = (AddHook((void*)(uintptr_t)AddrAbs(kKoTaskRva), (void*)&detour_ko_task, (void**)&orig_ko_task) == SUCCESS);
+    g_koChanceFn = okChance ? orig_ko_chance : (KoChanceFn)(uintptr_t)AddrAbs(kKoChanceRva);
+    g_koOn = okChance && okTask;
+    /* the task's sight check answers "does not see" for a pair whose verdict waits to be read (FORCED); without it the task can end
+       quietly before it reads the verdict the victim's game has already applied */
+    if (g_koOn && seesRet != 0)
+        g_koSeesOn = (AddHook((void*)(uintptr_t)AddrAbs(kKoHostileRva), (void*)&detour_ko_hostile, (void**)&orig_ko_hostile) == SUCCESS);
+    if (g_koSeesOn) { g_koHostile = orig_ko_hostile; g_koSeesRetAbs = (unsigned long long)seesRet; }
+    DebugLog(std::string("[STEALTHKO] sight-check AddHook ")
+             + (!g_koOn ? "not tried (the assassin's side is OFF)"
+                : (seesRet == 0 ? "not tried (the task's sight-check call was not found exactly once)" : (g_koSeesOn ? "SUCCESS" : "FAILED")))
+             + (seesRet != 0 ? " callRet=task+" + EffN((long long)(seesRet - koTaskAbs)) : std::string())
+             + " recordLookup=" + (g_koRecord != 0 ? "found" : "NOT found (the DECIDE line says record=-)"));
+    g_koOwnOn = true;
+    DebugLog(std::string("[STEALTHKO] chance AddHook ") + (okChance ? "SUCCESS" : "FAILED") + ", Task_StealthKO update AddHook "
+             + (okTask ? "SUCCESS" : (okChance ? "FAILED" : "not tried")) + " rollMax=" + EffF3(g_koRollMax) + " skillScale=" + EffF3(g_koSkillScale)
+             + " - a sneak knockout of another game's character: assassin's side " + (g_koOn ? "ON" : "OFF") + ", owner's side ON");
+}
+
 // ---- THE eatbite LEVER (TEST-ONLY) ----
 unsigned int g_ebEater = 0, g_ebVictim = 0;
 DWORD g_ebStart = 0, g_ebForMs = 0;
@@ -372,6 +1220,7 @@ void EffClearTables(const char* why)
         const LONG st = g_eat[i].state;
         if (st == 2 || st == 3) { EatFree(g_eat[i]); ++e; }
     }
+    KoClearTables(why);
     const long long o = (long long)g_own.size();
     g_own.clear();
     g_ansQ.clear();
@@ -385,6 +1234,7 @@ void EffClearTables(const char* why)
 
 void InstallEffectHook()
 {
+    InstallStealthKoHooks();   /* the sneak knockout's two hooks: independent of the eating hook below */
     const unsigned long long fn = (kEffEatRva != 0) ? AddrAbs(kEffEatRva) : 0;
     if (fn == 0)
     {
@@ -412,6 +1262,7 @@ void EffectTick()
         EffAnswer(p.target, p.actor, p.reqId, p.key, p.viaRelay, p.result, p.reason);
     }
     g_ansQ.clear();
+    KoTick(now);   /* the sneak knockout: the assassin's slots and the owner's queued answers */
     for (int i = 0; i < kEatSlots; ++i)
     {
         EatSlot& s = g_eat[i];
@@ -488,6 +1339,7 @@ void EffectSafePointDrain()
 {
     if (EngineWritesBlocked()) return;   /* review fold L2: the eatbite lever respects blocked writes too */
     EatBiteStep();
+    KoOwnerDrain();   /* the sneak knockouts asked of this game's characters */
     if (g_own.empty()) return;
     const float dt = EffDt();
     for (size_t i = 0; i < g_own.size();)
@@ -551,6 +1403,12 @@ void EffectOnNet(const char* p, size_t n, unsigned int fromKey, bool viaRelay)
         if (EqLog()) ErrorLog("[EFFECT] malformed EFFECT (decode " + EffN(dc) + ", " + EffN((long long)n) + " bytes) from " + EffN(fromKey) + " - ignored");
         return;
     }
+    if (m.kind == cooffect::kKindKo)
+    {
+        if (m.dir == cooffect::kDirAnswer) KoOnAnswer(m, fromKey);
+        else KoOnRequest(m, fromKey, viaRelay);
+        return;
+    }
     if (m.dir == cooffect::kDirAnswer) EatOnAnswer(m, fromKey);
     else EatOnRequest(m, fromKey, viaRelay);
 }
@@ -580,10 +1438,61 @@ void ReportEffect()
        << " deadFlagDisagree=" << g_eqDeadDisagree << " tablesCleared=" << g_eqTablesCleared
        << " malformed=" << g_eqMalformed
        << " lever[runs,calls]=" << g_ebRuns << "," << g_ebCalls
+       << " ko[held,classified,sent,ko,noticed,ended,released,forced]=" << g_koHeld << "," << g_koClassified << "," << g_koSent
+       << "," << g_koKo << "," << g_koNoticed << "," << g_koEnded << "," << g_koReleased << "," << g_koForced
+       << " koOwn[in,rolled,applied,ko,noticed,refused,already,classDiffer]=" << g_koOwnIn << "," << g_koOwnRolled << "," << g_koOwnApplied << ","
+       << g_koOwnKo << "," << g_koOwnNoticed << "," << g_koOwnRefused << "," << g_koOwnAlready << "," << g_koOwnClassDiffer
+       << " koMore[stage1Calls,taskEnds,tableFull,stale,answersIn,answersStale,ownerFaults,stateHeldForVerdict]=" << g_koStage1
+       << "," << g_koEndCalls << "," << g_koTableFull << "," << g_koStale << "," << g_koAnsIn << "," << g_koAnsStale << ","
+       << g_koOwnFault << "," << g_koStateHeld
+       << " koNpc[attempts,resultKo,resultFailed,resultRefused,resultNone,decided,decideKo,decideFailed,decideRefused]=" << g_koAttempt
+       << "," << g_koResKo << "," << g_koResFailed << "," << g_koResRefused << "," << g_koResNone << "," << g_koDecide << "," << g_koDecideKo
+       << "," << g_koDecideFailed << "," << g_koDecideRefused
+       << " koHook=" << (g_koOn ? "on" : "OFF") << " koSees[hook,forced]=" << (g_koSeesOn ? "on" : "OFF") << "," << (long long)g_koSeesForced << " koOwner=" << (g_koOwnOn ? "on" : "OFF") << " koThread=" << (long long)g_koThread
        << " hook=" << (g_eqInstalled ? "on" : "OFF")
        << " thread[detour,main]=" << (long long)g_eatThread << "," << (long long)g_mainThread
        << (g_eatThread == 0 ? " (no call yet)" : ((DWORD)g_eatThread == g_mainThread ? " (the main thread)" : " (another thread)"));
     DebugLog(ss.str());
+}
+
+unsigned int EffectKoAwaitingReq(unsigned long long ret, unsigned int victimUid)
+{
+    if (!g_koOn || ret == 0 || ret != g_koKnockRetAbs || victimUid == 0) return 0;
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        const LONG st = g_ko[i].state;
+        if (st == cooffect::kKoForcedDone && g_ko[i].victim == victimUid
+            && g_ko[i].outcome == cooffect::kKoOutcomeKnockedOut)
+            return (unsigned int)g_ko[i].reqId;
+    }
+    return 0;
+}
+
+// MAIN THREAD (spawn.cpp KnockdownWaitsNow - the owner's STATE on a copy): true while a sneak knockout of this copy waits for its
+// verdict or holds it unread (NEW, HELD, FORCED). The engine's task ends without text or experience when it finds its victim down
+// (its victim-down test runs before stage 1's animation), so the owner's knockdown of the copy waits until the forced chance has been
+// read; the slot's own limits end the wait (3 s for an answer, 2 s with no visit from the task), and the hold itself never lasts
+// longer than kKoHoldKnockdownMaxMs from the slot's opening (a task kept in stage 1 without its animation moving on).
+// Logged once per slot.
+const unsigned int kKoHoldKnockdownMaxMs = 8000;   /* 3 s for the answer plus a knockout animation's length, with room */
+bool EffectKoHoldsKnockdown(unsigned int victimUid)
+{
+    if (victimUid == 0) return false;
+    bool held = false;
+    for (int i = 0; i < kKoSlots; ++i)
+    {
+        KoSlot& s = g_ko[i];
+        const LONG st = s.state;
+        if ((st != cooffect::kKoNew && st != cooffect::kKoHeld && st != cooffect::kKoForced) || s.victim != victimUid) continue;
+        if (s.opened != 0 && cooffect::EffSinceMs(::GetTickCount(), s.opened) > kKoHoldKnockdownMaxMs) continue;   /* past the hold's own limit: the knockdown shows */
+        held = true;
+        if (s.stateHeld) continue;
+        s.stateHeld = true;
+        ++g_koStateHeld;
+        if (KoLog()) DebugLog("[STEALTHKO] HOLD KNOCKDOWN req=" + KoReqText(s, st == cooffect::kKoNew) + " victim uid=" + EffN(victimUid)
+                              + " (a COPY here) - the owner's knockdown of the copy waits until the engine's task has read the verdict");
+    }
+    return held;
 }
 
 std::string EatBiteLever(const std::string& eaterArg, unsigned int victimUid, float seconds)

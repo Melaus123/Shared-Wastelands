@@ -64,6 +64,10 @@ std::string DecaySoonLever(unsigned int uid, float hours);
 // the wake-up clock; the lever checks again after a tick), -1 not ours / no character / unreadable / knockout unresolved.
 // MAIN THREAD.
 int KnockOutOwned(unsigned int uid);
+// A sneak knockout's success on a character this game drives: the engine's own knockout(skill01) through the knockout gate, as
+// KnockOutOwned does; the caller pushes STATE. Returns `unconcious` as read right after (-1 not driven here / unreadable);
+// *koTimerOut = the wake-up clock it set.
+int StealthKnockOutOwned(unsigned int uid, float skill01, float* koTimerOut);
 // P11 fold 1 (T652) TEST-ONLY (`koself`): hold an owned character's wake-up clock at least `seconds` (never shorter),
 // then push its STATE. The clock after, -1 = not ours / no character / unreadable. MAIN THREAD.
 float KnockClockAtLeastOwned(unsigned int uid, float seconds);
@@ -189,5 +193,10 @@ bool WoundPart(unsigned int uid, int part, float stun, float cut);
 
 // T-556: how Character::declareDead was reached, from the caller's return address (swfallen::kCause*). ANY THREAD.
 int DeathCallerCause(unsigned long long ret);
+
+// TEST-ONLY lever `playerorder`: this game's own character medicUid is given the player's own treatment order on patientUid (task
+// 25 first aid, 60 robot repair) through the entry a player's right-click reaches, after a guarded read of the patient's needs,
+// the medic's kits and the treatment score. Logs one [HEAL] playerorder line; true when the order was given. MAIN THREAD.
+bool PlayerOrderLever(unsigned int medicUid, unsigned int patientUid, int task);
 
 } // namespace coop

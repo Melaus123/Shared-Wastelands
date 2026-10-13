@@ -135,6 +135,19 @@ inline int ExistingRowAction(unsigned int askUid, unsigned int rowUid, int dead,
     return dead ? kRowUnretire : kRowAlready;
 }
 
+/* D2. T-758 - A BODY THE FACTORY HAS JUST BUILT MEETS A ROW AT ITS ADDRESS.  `justBuilt` is 1 only at CreateAt, right after
+   factory->create: a just-built object is never a character a row already describes, so a live or retired (not destroyed) row of
+   ANOTHER uid at that address is stale - its body was freed without the destroy hook and the engine gave the address to the new
+   body.  That row is retired as P034's stale-pointer path retires one, and the new uid takes it (kRowRetireOtherAndRebind).  An
+   existing body (adoption of a twin or of a world character: justBuilt 0) keeps ExistingRowAction's answer - a row of another
+   uid is refused.  Every other answer is ExistingRowAction's. */
+enum { kRowRetireOtherAndRebind = 5 };
+inline int NewBodyRowAction(unsigned int askUid, unsigned int rowUid, int dead, int destroyed, int justBuilt)
+{
+    const int act = ExistingRowAction(askUid, rowUid, dead, destroyed);
+    return (justBuilt && act == kRowRefuseOtherUid) ? kRowRetireOtherAndRebind : act;
+}
+
 /* E. RATE LIMIT OF A REPEATING REFUSAL LINE (review-mirror1 #12): the first 5, then every 100th.  `count` is the refusal's
    own counter, already incremented. */
 inline int LogRefusal(long long count)

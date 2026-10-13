@@ -12,6 +12,15 @@
  * inv6 phase 2 (protocol 73): an optional 'OWNL' owner tail (ownerwire.h) follows the rows, naming the marked rows by index - absent
  * when none is marked; the pack's own OWN1 block (if any) comes after it. BagRowsDigest leaves the marks out.
  *
+ * PACKS INSIDE PACKS: the rows list every level to kBagMaxDepth, each pack's own rows straight after its row, so a receiver always
+ * makes a pack before what goes into it. An optional 'BAGN' tail after the GEML tail gives each row's parent (0 = the outer pack,
+ * else the 1-based index of the earlier pack row it sits in):
+ *   marker u32 'BAGN' | n u32 (= the row count) | n x u16 parent
+ * It is written only when some row sits in an inner pack, so a pack with no pack in it travels byte for byte as before. The owner
+ * and gear tails index the same rows (every level). The 256-row cap counts the rows of every level. A tail that is cut, names a
+ * later row or goes past kBagMaxDepth levels refuses the block (kBagBadNest). BagRowsDigest counts every level's rows; the
+ * parents are not in it.
+ *
  * It rides MSG_ITEM_REQUEST (a GIVE: the giver's pack) and MSG_ITEM_CONFIRM (a TAKE: the owner's pack), after the trade
  * block, and only when the pack holds something. THE CAP IS A REFUSAL, NEVER A TRUNCATION: an encoder handed more than
  * kBagMaxRows rows, or a row out of range, writes nothing and says so, and a decoder that meets one refuses the block - a
@@ -26,6 +35,7 @@
 #include <string>
 #include <vector>
 #include "ownerwire.h"   /* inv6 phase 2: the rows' owner tail */
+#include "gearwire.h"    /* the rows' gear tail after the owner tail */
 
 namespace coopbag {
 
@@ -41,6 +51,11 @@ const int kBagAbsent  = 1;   /* nothing at all after the message's last fixed fi
 const int kBagBad     = 2;   /* bytes are there but they are not a whole, in-range BAG1 block (wrong marker, cut, a bad row) */
 const int kBagOverCap = 3;   /* the count says more than kBagMaxRows */
 const int kBagBadOwner = 4;  /* inv6 phase 2: the rows are whole but the OWNL tail after them is cut or out of range */
+const int kBagBadGear = 5;    /* the rows are whole but the GEML tail after them is cut or out of range */
+const int kBagBadNest = 6;    /* the rows are whole but the BAGN tail after them is cut, out of range or deeper than kBagMaxDepth */
+
+const unsigned int kBagNestMarker = 0x4E474142u;   /* 'B','A','G','N' little-endian */
+const int kBagMaxDepth = 4;   /* pack levels under the outer pack (its own rows are level 1) - the kept list's bound (zonekeep.h) */
 
 struct BagRow
 {
@@ -52,7 +67,9 @@ struct BagRow
     int functionKind, level;
     unsigned char unique;
     coopmark::OwnerId owner;   /* inv6 phase 2 (R5): the row item's stolen mark - in the OWNL tail, not in the row */
-    BagRow() : x(0), y(0), qty(1), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0) {}
+    gearwire::GearMarks gear;  /* the row item's uniform and crafter - in the GEML tail after the owner tail, not in the row */
+    unsigned int parent;       /* 0 = in the outer pack, else the 1-based index of the (earlier) pack row it sits in - in the BAGN tail */
+    BagRow() : x(0), y(0), qty(1), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0), parent(0) {}
 };
 
 inline bool BagFloatOk(float f)
@@ -80,12 +97,43 @@ inline void BagPutStr(std::vector<char>* b, const std::string& s)
     BagPutU32(b, (unsigned int)s.size());
     if (!s.empty()) b->insert(b->end(), s.begin(), s.end());
 }
+inline void BagPutU16(std::vector<char>* b, unsigned short v) { const size_t at = b->size(); b->resize(at + 2); std::memcpy(&(*b)[at], &v, 2); }
+
+/* The parents both ends accept: each names 0 or an EARLIER row, and no row is more than kBagMaxDepth levels down. */
+inline bool BagNestValid(const std::vector<BagRow>& rows)
+{
+    if (rows.size() > kBagMaxRows) return false;
+    std::vector<int> depth(rows.size(), 1);
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        const unsigned int p = rows[i].parent;
+        if (p == 0) continue;
+        if ((size_t)p > i) return false;
+        depth[i] = depth[p - 1] + 1;
+        if (depth[i] > kBagMaxDepth) return false;
+    }
+    return true;
+}
+/* the deepest level among the rows (0 = no rows); meaningful for rows BagNestValid accepts */
+inline int BagNestDepth(const std::vector<BagRow>& rows)
+{
+    std::vector<int> depth(rows.size(), 1);
+    int most = 0;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        const unsigned int p = rows[i].parent;
+        if (p != 0 && (size_t)p <= i) depth[i] = depth[p - 1] + 1;
+        if (depth[i] > most) most = depth[i];
+    }
+    return most;
+}
 
 /* Appends the block. false = NOTHING WAS WRITTEN: more than kBagMaxRows rows, or a row BagRowValid refuses. */
 inline bool EncodeBagRows(std::vector<char>* b, const std::vector<BagRow>& rows)
 {
     if (b == 0 || rows.size() > kBagMaxRows) return false;
     for (size_t i = 0; i < rows.size(); ++i) if (!BagRowValid(rows[i])) return false;
+    if (!BagNestValid(rows)) return false;   /* a parent that is not an earlier row, or more than kBagMaxDepth levels */
     BagPutU32(b, kBagMarker);
     BagPutU32(b, (unsigned int)rows.size());
     for (size_t i = 0; i < rows.size(); ++i)
@@ -105,6 +153,17 @@ inline bool EncodeBagRows(std::vector<char>* b, const std::vector<BagRow>& rows)
     std::vector<coopmark::OwnerId> own(rows.size());
     for (size_t i = 0; i < rows.size(); ++i) own[i] = rows[i].owner;
     coopmark::EncodeOwnerTail(b, own, 0);   /* inv6 phase 2: nothing when no row is marked */
+    std::vector<gearwire::GearMarks> gear(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) gear[i] = rows[i].gear;
+    gearwire::EncodeGearTail(b, gear, 0);   /* the rows' uniforms and crafters: nothing when no row has one */
+    bool nested = false;
+    for (size_t i = 0; i < rows.size() && !nested; ++i) nested = (rows[i].parent != 0);
+    if (nested)
+    {   /* the rows' parents: only when a row sits in an inner pack */
+        BagPutU32(b, kBagNestMarker);
+        BagPutU32(b, (unsigned int)rows.size());
+        for (size_t i = 0; i < rows.size(); ++i) BagPutU16(b, (unsigned short)rows[i].parent);
+    }
     return true;
 }
 
@@ -124,6 +183,12 @@ inline bool BagGetStr(const char* p, size_t size, size_t* off, unsigned int cap,
     s->assign(p + *off, len);
     *off += len;
     return true;
+}
+inline bool BagNestAt(const char* p, size_t size, size_t at)
+{
+    size_t o = at;
+    unsigned int mk = 0;
+    return p != 0 && at < size && BagGetU32(p, size, &o, &mk) && mk == kBagNestMarker;
 }
 
 /* Reads the block at `at`. On kBagOk `*end` is the offset just after it and `*out` holds the rows; on anything else `*out`
@@ -163,6 +228,29 @@ inline int DecodeBagRows(const char* p, size_t size, size_t at, std::vector<BagR
         for (size_t i = 0; i < own.size(); ++i) rows[i].owner = own[i];
         off = oe;
     }
+    if (off < size && gearwire::GearTailAt(p, size, off))   /* the rows' gear tail, after the owner tail */
+    {
+        std::vector<gearwire::GearMarks> gear; size_t ge = 0;
+        if (n == 0 || gearwire::DecodeGearTail(p, size, off, rows.size(), &gear, &ge) != gearwire::kGearOk) return kBagBadGear;
+        for (size_t i = 0; i < gear.size(); ++i) rows[i].gear = gear[i];
+        off = ge;
+    }
+    if (off < size && BagNestAt(p, size, off))   /* the rows' parents, after the gear tail */
+    {
+        size_t o2 = off;
+        unsigned int mk = 0, cnt = 0;
+        if (!BagGetU32(p, size, &o2, &mk) || n == 0 || !BagGetU32(p, size, &o2, &cnt) || cnt != n || size - o2 < (size_t)cnt * 2)
+            return kBagBadNest;
+        for (unsigned int i = 0; i < cnt; ++i)
+        {
+            unsigned short v = 0;
+            std::memcpy(&v, p + o2, 2);
+            o2 += 2;
+            rows[i].parent = v;
+        }
+        if (!BagNestValid(rows)) return kBagBadNest;
+        off = o2;
+    }
     if (out) out->swap(rows);
     if (end) *end = off;
     return kBagOk;
@@ -170,7 +258,7 @@ inline int DecodeBagRows(const char* p, size_t size, size_t at, std::vector<BagR
 
 inline const char* BagDecodeWhy(int why)
 {
-    return why == kBagOk ? "ok" : why == kBagAbsent ? "absent" : why == kBagOverCap ? "over the 256-row cap" : why == kBagBadOwner ? "carrying a malformed owner tail" : "malformed";
+    return why == kBagOk ? "ok" : why == kBagAbsent ? "absent" : why == kBagOverCap ? "over the 256-row cap" : why == kBagBadOwner ? "carrying a malformed owner tail" : why == kBagBadGear ? "carrying a malformed gear tail" : why == kBagBadNest ? "carrying a malformed pack-inside-pack tail" : "malformed";
 }
 
 /* inv6 phase 2: how many rows would travel marked (the OWNL tail's entry count). */
@@ -204,7 +292,8 @@ inline unsigned int BagRowsDigest(const std::vector<BagRow>& rows)
         std::memcpy(&qb, &r.quality, 4);
         std::memcpy(&cb, &r.charges, 4);
         char more[96];
-        std::sprintf(more, "|%08x|%08x|%d|%d|%u", qb, cb, r.functionKind, r.level, (unsigned int)r.unique);
+        std::sprintf(more, "|%08x|%08x|%d|%d|%u|%u", qb, cb, r.functionKind, r.level, (unsigned int)r.unique,
+                     r.parent);   /* the parent too: the same row moved into another inner pack is a changed pack */
         keys.push_back(r.section + num + r.baseSid + "|" + r.companySid + "|" + r.materialSid + "|" + r.colorSid + more);
     }
     std::sort(keys.begin(), keys.end());
@@ -361,6 +450,28 @@ inline int DecodeBagPath(const char* p, size_t size, size_t at, BagPath* out, si
     if (out) *out = r;
     if (end) *end = off;
     return kBagOk;
+}
+
+/* A MOVE RUNG INSIDE A PACK THAT ITSELF SITS INSIDE A PACK (two or more levels down). The item road names a pack only at its
+   parent's top level, so such a move is never sent item by item; the game that saw it does one of these instead:
+     push     - this game writes the BOX it is in, and the box of a tagged other half here too (partnerPush): the move stands and the
+                whole box is pushed (the push's rows carry every level). A tagged other half in a box another game writes, or on a
+                character, is sent by no one, so such a move takes the undo road (both halves put back);
+     undo     - its other half is in the same drain: both halves are put back;
+     undoHeld - an ADD whose removal is the item held on the cursor: put back where it was lifted from;
+     park     - a REMOVE onto the cursor: kept until it lands, then put back;
+     stands   - nothing to put it back against (a count change, a split, no other half here): counted and logged.
+   A character's writer is put back like any other game: the box push is the only whole re-send this road has, and nothing
+   re-sends a character's inner packs after a move inside them. op: 0 add, 1 remove, 2 count, 3 split. */
+const int kNestRoadPush = 1, kNestRoadUndo = 2, kNestRoadUndoHeld = 3, kNestRoadPark = 4, kNestRoadStands = 5;
+inline int NestMoveRoad(int rootIsBox, int writerHere, int op, int partnerHere, int heldSourceHere, int onCursor, int partnerPush = 1)
+{
+    if (rootIsBox != 0 && writerHere != 0 && (partnerHere == 0 || partnerPush != 0 || (op != 0 && op != 1))) return kNestRoadPush;
+    if (op != 0 && op != 1) return kNestRoadStands;
+    if (partnerHere != 0) return kNestRoadUndo;
+    if (op == 0 && heldSourceHere != 0) return kNestRoadUndoHeld;
+    if (op == 1 && onCursor != 0) return kNestRoadPark;
+    return kNestRoadStands;
 }
 
 } // namespace coopbag

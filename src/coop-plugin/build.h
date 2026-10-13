@@ -12,16 +12,23 @@ namespace coop {
 void InstallBuild();                                  // preload: the observe hooks (address table names below)
 void BuildTick();                                     // MAIN THREAD, every frame: drains the detours' POD queue into the log and the registry
 std::string BuildTestArm(const std::string& arg);     // MAIN THREAD: `buildtest place <sid> [dx dz] | progress <key-substring> <amount> | dismantle <key-substring> | into <near|host-key-substring> <sid> [indoors]`
+void* BuildTestPlacedLive(std::string* why);         /* TEST-ONLY, MAIN THREAD: the piece the last `buildtest place` made while it is loaded, else 0 and why */
 void BuildCopyDrain();                                // build1-b, K2 safe point next to BuildTestDrain: pending PLACEs -> coop-peer copies
 void BuildNoteRecv(const coopbuild::BuildMsg& m, unsigned int fromPeer);   // build1-b/c/d, MAIN THREAD (session dispatch): a decoded PLACE, STATE or REMOVE (build1-d), queued
 void BuildForgetWorld();                              // build1-c (review-build1b M2): world teardown - pending PLACEs / STATEs and the copy rows
 void BuildNoteBad();                                  // build1-b: a MSG_BUILD that did not decode
 void BuildTestDrain();                                // K2 safe point (combat.cpp detour_tsRagdollUpdates): runs the armed request
 std::string BuildListCommand();
+std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it
+std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
+std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | link <key-substring> | list` - found / link armed for the K2 safe point, list read now
+void BuildTownsNote(const char* p, size_t n);            // OUTPOSTS, MAIN THREAD (store.cpp): a TOWNS LIST from the world server - the kept outposts and their pieces' keys
+std::string BuildKeptListCommand();                  // KEPT, TEST-ONLY, MAIN THREAD, read-only: `keptlist` - the kept rows this game holds, their state, claims and the key search here
 std::string StandInCommand(const std::string& arg);     // TEST-ONLY, MAIN THREAD: `standin <slot> [read]` - make (or take into the table) / read back that player's stand-in and the loaded buildings it owns
 std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction
 std::string BuyHouseCommand(const std::string& arg);   /* P18 fold 1: TEST LEVER `buyhouse <buildingKey|nearest> [cats=<n>]` / `buyhouse show <buildingKey|last>` */
 int BuildRecordedOwnerSlot(const char* key);          // build1h, MAIN THREAD: the owner slot the build registry recorded for the piece at this P7n key (own rows: my slot); -1 none                       // MAIN THREAD, read-only: `buildlist` - the registry with live values
+int  BuildMadeHere(const char* key, double* placedSince);   // MAIN THREAD: 1 = this game placed the piece at this key itself in the world now loaded and it is still its own; *placedSince = the area's "loaded since" stamp at the placement
 int  BuildRowPendingFor(void* building);              // MAIN THREAD: another game's PLACE or STATE (a copy, or an owner change such as a purchase) for this piece still waits here - 1 yes, 0 no, -1 key unreadable
 void ReportBuild();                                   // one [BUILD] REPORT line (the `report` fan-out)
 /* mmo8a (mmo8-buildings-read.md 5): the buildings this player owns, kept in the own-records store as pp.build (store.cpp writes it) */

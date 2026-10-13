@@ -10,6 +10,7 @@
  *     3 END     u8 reason
  *     4 ACT, 5 ACT_RESULT - P26 stage 5 (protocol 103), below the END reasons
  *     6 REQUEST - P25 (protocol 109), below; P25 also appends u32 reqId to PROMPT and u32 reqId | u8 why | u8 endsType to END
+ *     7 CURSOR_ASK, 8 CURSOR_ANSWER - T-737, the talk cursor (talkcursor.h), below REQUEST
  *   s16 = u16 length + that many bytes: a string id (line, reply) at most 128 bytes, a text at most 512 bytes.
  *
  * convId is the PROMPT sender's own number (never 0); the receiver keys a conversation on {peer, convId}. event 255 = the start
@@ -194,6 +195,20 @@ inline int TalkActEndsTalk(int type) { return (type == 1 || type == 11) ? 1 : 0;
 const int kTalkRequest = 6;
 const unsigned int kTalkReqWaitMs = 30000;   /* B: a REQUEST with no PROMPT / END within this is given up (noAnswer; nothing opens) */
 
+/* T-737 - THE TALK CURSOR (talkcursor.h): the hover on an NPC another game drives asks that game whether its NPC would talk to the
+   asker's character now; the answer decides the cursor and the click's talk order there.
+     7 CURSOR_ASK     u32 askId | i32 purse   (header: convId 0, npcUid = the NPC, targetUid = the talker - the asker's own character;
+                      purse: the talker's purse on its own game, -1 unknown - the NPC's game answers its money condition with it)
+     8 CURSOR_ANSWER  u32 askId | u8 answer   (header: convId 0, npcUid and targetUid as the ASK's; answer kTalkCursor* below)
+   askId (TalkMsg::reqId) is the asker's own number, never 0; the answer rides TalkMsg::result. */
+const int kTalkCursorAsk    = 7;
+const int kTalkCursorAnswer = 8;
+const int kTalkCursorNo      = 0;   /* nothing to say: the ordinary cursor, and the click gives no talk order */
+const int kTalkCursorTalk    = 1;   /* a line was found: the talk cursor */
+const int kTalkCursorParked  = 2;   /* the NPC holds a parked interrupt line: the s_talk cursor */
+const int kTalkCursorUnknown = 3;   /* the NPC or the talker's copy is not there */
+const int kTalkCursorAnswerMax = 3;
+
 /* Why a REQUEST did not start - END NOT_STARTED's why (A), and B's own refusals (link, busy, noAnswer). 0 = started. */
 const int kTalkWhyBusy = 1, kTalkWhyNotOurs = 2, kTalkWhyFar = 3, kTalkWhyGate = 4, kTalkWhyNoCopy = 5, kTalkWhyLink = 6,
           kTalkWhyDown = 7, kTalkWhyEngine = 8, kTalkWhyNotForwarded = 9, kTalkWhyOff = 10, kTalkWhyNoAnswer = 11,
@@ -313,6 +328,7 @@ const int kTalkDecodeBadKind  = 2;  /* kind is not 1..6 (4 ACT / 5 ACT_RESULT: P
 const int kTalkDecodeTooLong  = 3;  /* a string's length field is over its cap */
 const int kTalkDecodeTrunc    = 4;  /* the payload ends inside a field */
 const int kTalkDecodeTooMany  = 5;  /* a PROMPT names more than 10 replies; an ACT more than 32 actions / 16 items / 16 relation effects */
+const int kTalkDecodeBadValue = 6;  /* T-737: a CURSOR_ASK / CURSOR_ANSWER with askId 0 or no NPC / talker uid, or an answer over 3 */
 
 struct TalkMsg
 {
@@ -347,7 +363,8 @@ struct TalkMsg
 inline const char* TalkKindName(int k)
 {
     return k == kTalkPrompt ? "PROMPT" : (k == kTalkAnswer ? "ANSWER" : (k == kTalkEnd ? "END"
-         : (k == kTalkAct ? "ACT" : (k == kTalkActResult ? "ACT_RESULT" : (k == kTalkRequest ? "REQUEST" : "?")))));   /* ACT / ACT_RESULT: P26 stage 5; REQUEST: P25 */
+         : (k == kTalkAct ? "ACT" : (k == kTalkActResult ? "ACT_RESULT" : (k == kTalkRequest ? "REQUEST"
+         : (k == kTalkCursorAsk ? "CURSOR_ASK" : (k == kTalkCursorAnswer ? "CURSOR_ANSWER" : "?")))))));   /* ACT / ACT_RESULT: P26 stage 5; REQUEST: P25; CURSOR_*: T-737 */
 }
 
 inline const char* TalkAnswerName(int r)
@@ -427,7 +444,7 @@ inline bool TalkPutStr(std::vector<char>* b, const std::string& s, unsigned int 
    id and text lists differ in length. */
 inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
 {
-    if (out == 0 || m.kind < kTalkPrompt || m.kind > kTalkRequest) return false;   /* 1..6 (4 / 5: P26 stage 5; 6 REQUEST: P25) */
+    if (out == 0 || m.kind < kTalkPrompt || m.kind > kTalkCursorAnswer) return false;   /* 1..8 (4 / 5: P26 stage 5; 6 REQUEST: P25; 7 / 8: T-737) */
     std::vector<char> b;
     TalkPut8(&b, (unsigned int)m.kind);
     TalkPut32(&b, m.convId);
@@ -499,6 +516,14 @@ inline bool EncodeTalk(std::vector<char>* out, const TalkMsg& m)
         TalkPut8(&b, (unsigned int)m.event);
         TalkPut32(&b, (unsigned int)m.purse);
     }
+    else if (m.kind == kTalkCursorAsk || m.kind == kTalkCursorAnswer)   /* T-737 */
+    {
+        if (m.reqId == 0 || m.npcUid == 0 || m.targetUid == 0) return false;
+        if (m.kind == kTalkCursorAnswer && (m.result < 0 || m.result > kTalkCursorAnswerMax)) return false;
+        TalkPut32(&b, m.reqId);
+        if (m.kind == kTalkCursorAsk) TalkPut32(&b, (unsigned int)m.purse);
+        else TalkPut8(&b, (unsigned int)m.result);
+    }
     else
     {
         if (m.why < 0 || m.why > 255 || m.endsType < 0 || m.endsType > 255) return false;   /* P25 */
@@ -556,7 +581,7 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
     TalkMsg t;
     unsigned int kind = 0, v = 0;
     TalkGet8(&r, &kind);
-    if (kind < (unsigned int)kTalkPrompt || kind > (unsigned int)kTalkRequest) return kTalkDecodeBadKind;   /* 1..6 (4 / 5: P26 stage 5; 6: P25) */
+    if (kind < (unsigned int)kTalkPrompt || kind > (unsigned int)kTalkCursorAnswer) return kTalkDecodeBadKind;   /* 1..8 (4 / 5: P26 stage 5; 6: P25; 7 / 8: T-737) */
     t.kind = (int)kind;
     TalkGet32(&r, &t.convId);
     TalkGet32(&r, &t.npcUid);
@@ -638,6 +663,14 @@ inline int DecodeTalk(const char* p, size_t n, TalkMsg* m)
         t.event = (int)v;
         if (!TalkGet32(&r, &v)) return r.err;
         t.purse = (int)v;
+    }
+    else if (t.kind == kTalkCursorAsk || t.kind == kTalkCursorAnswer)   /* T-737 */
+    {
+        if (!TalkGet32(&r, &t.reqId)) return r.err;
+        if (t.kind == kTalkCursorAsk) { if (!TalkGet32(&r, &v)) return r.err; t.purse = (int)v; }
+        else { if (!TalkGet8(&r, &v)) return r.err; t.result = (int)v; }
+        if (t.reqId == 0 || t.npcUid == 0 || t.targetUid == 0 || (t.kind == kTalkCursorAnswer && t.result > kTalkCursorAnswerMax))
+            return kTalkDecodeBadValue;
     }
     else
     {
@@ -733,5 +766,36 @@ inline int TalkPromptParse(const std::string& arg, int* mode, unsigned int* npcU
     }
     return 1;
 }
+
+/* T-726: what became of one talk order this game's player gave (speech.cpp's talk-order ring, TalkOrderDrain). set = an outcome the
+   click's own road wrote (taken for the NPC's game as a REQUEST, the click ring full, the same click already waiting, this game's
+   camera gate refused it; 0 none); reached = startPlayerConversation ran on the NPC's Dialogue inside that sendEvent; hadLine =
+   _chooseDialog handed it a line; started = it returned true. Not reached = the engine refused before startPlayerConversation: sendEvent goes on to it for
+   event 1 whether or not the NPC's Dialogue is busy, so a busy Dialogue is never the cause by itself (the caller shows it beside
+   the refusal). */
+const int kTalkOrderNotReached = 0, kTalkOrderStarted = 1, kTalkOrderNoLine = 2, kTalkOrderIntercepted = 3, kTalkOrderGate = 4,
+          kTalkOrderRingFull = 5, kTalkOrderDup = 6, kTalkOrderLineNotStarted = 7, kTalkOrderKinds = 8;
+inline int TalkOrderOutcome(int set, int reached, int hadLine, int started)
+{
+    if (set != 0) return set;
+    if (!reached) return kTalkOrderNotReached;
+    if (started) return kTalkOrderStarted;
+    if (!hadLine) return kTalkOrderNoLine;
+    return kTalkOrderLineNotStarted;
+}
+
+/* T-726: 1 = write this talk order's line. The first 5 lines of a session always; after that one per NPC per 10 s. lastMs = when
+   this NPC's last line was written (0 = never - the caller stores 1 for a tick of 0); nLogged = the lines written so far. The caller
+   counts the orders it skipped and writes "(n more since)" on the next line. Wrap-safe. */
+const unsigned int kTalkOrderLogFirst = 5, kTalkOrderLogGapMs = 10000;
+inline int TalkOrderLogDue(unsigned lastMs, unsigned nowMs, unsigned nLogged)
+{
+    if (nLogged < kTalkOrderLogFirst) return 1;
+    if (lastMs == 0) return 1;
+    return (unsigned)(nowMs - lastMs) >= kTalkOrderLogGapMs ? 1 : 0;
+}
+
+/* T-719 / T-726: 1 = the n-th line of one kind is written (n counts from 1): the first 5, then every 100th. */
+inline int TalkLogNthDue(long long n) { return (n >= 1 && (n <= 5 || n % 100 == 0)) ? 1 : 0; }
 
 }   /* namespace cooptalk */

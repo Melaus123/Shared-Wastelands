@@ -95,4 +95,40 @@ inline bool TreatConfirmedBy(float owner, float held, float eps)
     return !(owner + eps < held);
 }
 
+/* A medic's work on a copy, decided per part from two readings of its bandage: `sampledNow`, the copy's own bandage now, against the
+   baseline `base`; and `hookedAdded`, what the per-part treatment hook saw the engine add since the last send.
+   VISIBLE: the copy's bandage rose above the baseline (a flesh part keeps its bandage) - the copy's value travels; the hook's amount
+     is used up, since the sampled value includes it. The sender holds it for re-send only when the hook saw nothing (amountUsed 0).
+   HOOK-ONLY: no visible rise, but the hook saw more than the tolerance added - the engine has already turned it into health on the
+     copy (a robotic part, within a frame or two), and the owner's own bandage of that part drains just as fast, so a held value
+     would be applied again by every re-send. The amount alone travels (no baseline, no leftover bandage), once: never held.
+   NONE: nothing travels; an amount within the tolerance stays for a later send. */
+const int kTreatPartNone     = 0;
+const int kTreatPartVisible  = 1;
+const int kTreatPartHookOnly = 2;
+struct TreatPartSend
+{
+    float value;       /* the bandage value sent for the part; 0 = no change */
+    int kind;          /* kTreatPartNone / kTreatPartVisible / kTreatPartHookOnly */
+    float amountUsed;  /* what the send uses up of the hook's running amount */
+};
+inline TreatPartSend TreatPartDecide(float base, float hookedAdded, float sampledNow, float eps)
+{
+    TreatPartSend d;
+    d.value = 0.0f; d.kind = kTreatPartNone; d.amountUsed = 0.0f;
+    if (sampledNow > base + eps)
+    { d.value = sampledNow; d.kind = kTreatPartVisible; d.amountUsed = hookedAdded > 0.0f ? hookedAdded : 0.0f; }
+    else if (hookedAdded > eps)
+    { d.value = hookedAdded; d.kind = kTreatPartHookOnly; d.amountUsed = hookedAdded; }
+    return d;
+}
+
+/* The hook's running amount `now` after a send that carried `used` of it: subtracted, never zeroed - the hook may have added more on
+   another thread since the amounts were read. Never below 0. */
+inline float TreatAddedAfterSend(float now, float used)
+{
+    const float left = now - used;
+    return left > 0.0f ? left : 0.0f;
+}
+
 } // namespace cooptreat

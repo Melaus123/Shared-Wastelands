@@ -190,7 +190,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     // save loads (T008), so without this the channel would go dead exactly when in-game
     // testing begins. Both pumps are main-thread, and the tick is internally throttled.
     coop::CommandChannelTick();
-    coop::SteamProbeTick();   /* T-290 S0 mainloop: a save loaded before the relay status settled keeps being polled here (returns at once when done) */
+    coop::SteamProbeTick();   /* the Steam relay status, polled here too while a save loaded before it settled; and every frame the host's Steam bridge (net/relay_bridge.cpp RelayBridgeTick) */
 
     // P011 order-lifecycle watch. In-game pump only - there are no characters at the
     // menu. Costs nothing while no watch is active, and logs only on change (F111).
@@ -360,6 +360,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
        below services the link it just opened in this same tick rather than the next one. Self-latched: it does
        its work once and returns immediately every frame after. */
     coop::ConfigTitleTick();
+    coop::StoreUnfinishedDeletesFinish();   /* once, with the title screen up: deletes a stop left unfinished are finished (log lines only) */
 
     // Command channel rides this pump: it is the only main-thread function known to
     // run at the menu (F040), and Kenshi ignores injected input (F010).

@@ -180,9 +180,9 @@ inline int RowOfUid(const std::vector<Row>& rows, unsigned int uid)
     return -1;
 }
 const char* const kEmptyLine = "None of your characters has fallen.";
-inline std::string SelectLine() { return "Select a fallen character to bring them back. Your last " + Num(swfallen::kFallenKeep) + " are kept."; }
+inline std::string SelectLine() { return std::string(); }   /* nothing selected: no line */
 
-/* ---- the price lines (owner 497, 501): the price and its sum, who is counted, and why ---- */
+/* ---- the price lines (owner 497, 501): the price and its sum, who is counted ---- */
 /* the rule's sum: "c.1,000 x 2 x 2" (steep), "c.1,000 x 2" (steady) */
 inline std::string RuleSum(const swfee::Price& p)
 {
@@ -206,8 +206,8 @@ inline std::string AliveClause(int alive)
 {
     return Num(alive) + (alive == 1 ? " character you brought back is alive" : " characters you brought back are alive");
 }
-const char* const kEachLine = "Each one alive makes the next cost more.";
-struct PriceLines { int shown; std::string line[3]; PriceLines() : shown(0) {} };
+const int kPriceLines = 2;   /* the price, and who is counted */
+struct PriceLines { int shown; std::string line[kPriceLines]; PriceLines() : shown(0) {} };
 /* `names` = the brought-back characters alive now (their count is A). Hidden while the host has resurrection off. */
 inline PriceLines PriceLinesFor(int on, long long amount, int growth, const std::vector<std::string>& names)
 {
@@ -216,10 +216,9 @@ inline PriceLines PriceLinesFor(int on, long long amount, int growth, const std:
     out.shown = 1;
     const swfee::Price p = swfee::PriceFor(amount, growth, (int)names.size());
     if (p.amount == 0) { out.line[0] = "PRICE: free"; out.line[1] = "The host has made bringing back free."; return out; }
-    if (p.alive == 0) { out.line[0] = "PRICE: free"; out.line[1] = "None of the characters you brought back is alive."; out.line[2] = kEachLine; return out; }
+    if (p.alive == 0) { out.line[0] = "PRICE: free"; out.line[1] = "None of the characters you brought back is alive."; return out; }
     out.line[0] = "PRICE " + Money(p.price) + " (the host's " + swfee::GrowthName(p.growth) + " rule: " + RuleSum(p) + ")";
     out.line[1] = AliveClause(p.alive) + ": " + AliveNames(names) + ".";
-    out.line[2] = kEachLine;
     return out;
 }
 
@@ -285,11 +284,11 @@ inline std::string RefusalWords(int code, const std::string& name, const std::st
     case kRefOff:          return "The host has turned off resurrection in this world.";
     case kRefShort:        return "You need " + Money(price) + " to bring back " + name + ". You have " + Money(money) + ".";
     case kRefNoMate:       return "You need a living character for " + name + " to come back beside.";
-    case kRefEnemy:        return "Enemies are near " + mate + ". Pick someone else, or try again when it's safe.";
-    case kRefPriceChanged: return "The price is now " + (price > 0 ? Money(price) : std::string("free")) + ". Check it and press BRING BACK again.";
-    case kRefMateGone:     return mate + " can't be picked any more. Pick someone else.";
-    case kRefNoWorld:      return "Couldn't reach the world. " + name + " was not brought back and nothing was paid. Try again in a moment.";
-    case kRefFailed:       return name + " was not brought back and nothing was paid. Try again in a moment.";
+    case kRefEnemy:        return "Enemies are near " + mate + ".";
+    case kRefPriceChanged: return "The price is now " + (price > 0 ? Money(price) : std::string("free")) + ".";
+    case kRefMateGone:     return mate + " can't be picked any more.";
+    case kRefNoWorld:      return "Couldn't reach the world. " + name + " was not brought back and nothing was paid.";
+    case kRefFailed:       return name + " was not brought back and nothing was paid.";
     default:               return std::string();
     }
 }

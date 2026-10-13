@@ -22,6 +22,7 @@
 #include "../common/ownrec.h"   /* mmo3: the pp.faction record */
 #include "../common/slotwire.h"   /* stand1: @slot:<n> wire names */
 #include "../common/worldrelwire.h"   /* par24: the notebook's world-vs-world table (WORLD_REL) */
+#include "../common/crimewire.h"   /* MSG_CRIME kind 2: standing events against another player */
 #include "../common/relside.h"   /* the entry a changer wrote: on the player faction's relations, the other faction's side */
 #include "net/session.h"
 #include "../common/liveenvelope.h"   /* M7a fold F1: PeerInWorldAskDue */
@@ -499,9 +500,94 @@ void P083Log(void* self, ::Faction* f, int ev, float mult, int rdB, const Entry&
    the engine, as the player's own relations take none (PlayerFactionRelations' slot +0x28 is empty, H071): no move, no notice, no
    forward, no revert. ANY THREAD (an interlocked count). */
 volatile LONG64 g_teamEvSkipped = 0;
+/* MSG_CRIME kind 2. A by-event change this game's engine makes on a WORLD faction's standing towards ANOTHER player's stand-in
+   (that player's character - a copy here - hit, knocked down or killed one of the faction's people, gave first aid, captured one)
+   is that player's: this game puts the pair back as before (Forward), and the event goes to that player's game, whose engine
+   makes it against its own faction (its value, its clamp, its notice). g_evCap: ANY THREAD, under g_queueLock (sids as POD
+   strings, as QueueOffThread); g_evPend: MAIN THREAD, numbered, kept while there is no road. */
+struct EvCap { std::string ownerSid, otherSid; int ev; float mult; };
+std::vector<EvCap> g_evCap;
+struct EvPend { coopcrime::CrimeRelEvent e; int slot; };
+std::vector<EvPend> g_evPend;
+struct EvIn { coopcrime::CrimeRelEvent e; unsigned int fromPeer; };
+std::vector<EvIn> g_evIn;
+coopcrime::RelEvSeen g_evSeen;
+unsigned int g_evSeq = 0;
+const size_t kEvCap = 1024, kEvInCap = 256;
+volatile LONG64 g_evCaptured = 0, g_evCapDropped = 0;
+long long g_evSent = 0, g_evNoRoad = 0, g_evDropped = 0, g_evRecv = 0, g_evApplied = 0, g_evRefused = 0, g_evDup = 0, g_evDeferred = 0,
+          g_evInDropped = 0, g_evFaulted = 0;
+int g_evLines = 0;
+const int kEvLineCap = 40;
+void EvLog(const std::string& line) { if (g_evLines >= kEvLineCap) return; ++g_evLines; DebugLog(line); }
+
+/* A copy's own declareDead: a thread-local mark (TlsAlloc - the DLL is loaded after the process started), allocated at install. */
+volatile LONG g_copyDeathTls = (LONG)TLS_OUT_OF_INDEXES;
+volatile LONG64 g_evCopyDeathSkipped = 0, g_evCopyDeathNotSent = 0;
+bool InCopyDeath()
+{
+    const DWORD i = (DWORD)g_copyDeathTls;
+    return i != TLS_OUT_OF_INDEXES && ::TlsGetValue(i) != 0;
+}
+
+/* ANY THREAD (the detour, after the engine's call): guarded reads and string work on the plugin's heap, as QueueOffThread */
+void RelEvCapture(void* self, ::Faction* f, int ev, float mult)
+{
+    if (!g_on || !coopcrime::RelEventForwarded(ev) || !Plaus(self) || !Plaus(f)) return;
+    if (!OtherPlayersFaction(f)) return;
+    ::Faction* owner = OwnerOf(self);
+    if (!Plaus(owner) || !FacSide(owner).world) return;
+    EvCap c; c.ownerSid = SidOf(owner); c.otherSid = SidOf(f); c.ev = ev; c.mult = mult;
+    if (c.ownerSid.empty() || c.otherSid.empty() || !g_queueLockInit || !coopcrime::RelEvMultOk(mult)) { ::InterlockedIncrement64(&g_evCapDropped); return; }
+    ::EnterCriticalSection(&g_queueLock);
+    if (g_evCap.size() < kEvCap) { g_evCap.push_back(c); ::InterlockedIncrement64(&g_evCaptured); } else ::InterlockedIncrement64(&g_evCapDropped);
+    ::LeaveCriticalSection(&g_queueLock);
+}
+
+/* MAIN THREAD (RelationsTick): number the captured events and send them to their players; one with no road stays for the next tick */
+void RelEvTick()
+{
+    std::vector<EvCap> cap;
+    if (g_queueLockInit) { ::EnterCriticalSection(&g_queueLock); cap.swap(g_evCap); ::LeaveCriticalSection(&g_queueLock); }
+    for (size_t i = 0; i < cap.size(); ++i)
+    {
+        if (g_evPend.size() >= kEvCap) { ++g_evDropped; continue; }
+        if (g_evSeq == 0) g_evSeq = (unsigned int)::GetTickCount() * 2654435761u;   /* a fresh start differs from the last run's numbers */
+        if (++g_evSeq == 0) ++g_evSeq;
+        EvPend p;
+        p.e.seq = g_evSeq; p.e.ev = cap[i].ev; p.e.mult = cap[i].mult; p.e.ownerSid = cap[i].ownerSid; p.e.otherSid = cap[i].otherSid;
+        int slot = -1; bool hasName = false;
+        if (!coopslot::ParseSlotWire(p.e.otherSid, &slot, 0, &hasName)) slot = -1;
+        p.slot = slot;
+        g_evPend.push_back(p);
+    }
+    if (g_evPend.empty()) return;
+    std::vector<EvPend> kept;
+    for (size_t i = 0; i < g_evPend.size(); ++i)
+    {
+        const EvPend& p = g_evPend[i];
+        const int r = coop::net::SendCrimeRelEvent(p.e, p.slot);
+        if (r == 0) { ++g_evNoRoad; kept.push_back(p); continue; }
+        if (r < 0) { ++g_evDropped; continue; }
+        ++g_evSent;
+        EvLog("[REL] standing event -> slot " + S(p.slot) + ": " + p.e.ownerSid + " towards " + p.e.otherSid + " ev=" + S(p.e.ev) + " mult=" + S(p.e.mult)
+              + " seq=" + S(p.e.seq) + " (this game's engine raised it against that player's stand-in; kind 2)");
+    }
+    g_evPend.swap(kept);
+}
+
+int RelEvCallPod(AffectEvFn fn, void* rel, ::Faction* me, int ev, float mult)
+{
+    __try { fn(rel, me, ev, mult); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 void detour_affectEv(void* self, ::Faction* f, int ev, float mult)
 {
     if (coop::PeaceTeamPairAnyThread(Plaus(self) ? OwnerOf(self) : 0, f)) { ::InterlockedIncrement64(&g_teamEvSkipped); return; }
+    /* a copy's own death: event 5 towards this game's player is the owner's to raise (its kind 2 moves this pair) */
+    const int copyDeath = coopcrime::CopyDeathEvDecide(InCopyDeath(), ev, Plaus(f) && coop::IsPlayerFaction(f));
+    if (copyDeath == coopcrime::kDeathEvSkipEngine) { ::InterlockedIncrement64(&g_evCopyDeathSkipped); return; }
     // PROBE-START: P083
     const bool p083 = P083Match(self, f);
     const bool p083Main = p083 && (g_mainThread == 0 || ::GetCurrentThreadId() == g_mainThread);   // as Forward decides it
@@ -518,6 +604,8 @@ void detour_affectEv(void* self, ::Faction* f, int ev, float mult)
     // PROBE-START: P083
     if (p083Main) { Entry p083A = {0, 0, 0, 0}; const int p083RdA = p083Read ? ReadEntry(self, f, &p083A) : 0; P083Log(self, f, ev, mult, p083RdB, p083B, p083RdA, p083A); }
     // PROBE-END: P083
+    if (copyDeath == coopcrime::kDeathEvNotSent) ::InterlockedIncrement64(&g_evCopyDeathNotSent);   /* the owner raised it already */
+    else RelEvCapture(self, f, ev, mult);   /* kind 2: an event against another player's stand-in goes to that player */
     Forward(self, f, 0, true, relside::kAffectEvent);
 }
 void detour_declareWar(void* self, ::Faction* f) { orig_declareWar(self, f); Forward(self, f, 0, true, relside::kDeclareWar); }
@@ -755,6 +843,7 @@ void InstallRelations()
 {
     if (g_installed) return;
     if (!g_queueLockInit) { ::InitializeCriticalSection(&g_queueLock); g_queueLockInit = true; }
+    if (g_copyDeathTls == (LONG)TLS_OUT_OF_INDEXES) g_copyDeathTls = (LONG)::TlsAlloc();   /* the copy's-own-death mark */
     const uintptr_t base = Base();
     coop::HookStatus s[7];
     s[0] = coop::AddHook((void*)(base + kAffectRva), (void*)&detour_affect, (void**)&orig_affect);
@@ -775,6 +864,7 @@ void RelationsTick()
     if (!g_queueLockInit) { ::InitializeCriticalSection(&g_queueLock); g_queueLockInit = true; }
     DrainQueue();
     WorldRelTick();   /* par24: world pairs up to the notebook */
+    RelEvTick();      /* MSG_CRIME kind 2: standing events against other players' stand-ins, to those players */
     /* E38 - RECURRENCE-COVERED, NOT AN EDGE. Under decision 42 the session link comes up at the TITLE SCREEN, so
        the old link-up edge fired with no world and no player faction, Snapshot() returned at its second line, and
        the standings were never sent for the rest of the session. This is not a timer and not a periodic re-send:
@@ -849,6 +939,70 @@ void RelationsTick()
 
 /* T-546 step 5 (the shared standing block below RelationsOwnRestore): another player's side towards this game's team */
 int TeamFoldTheirs(::Faction* theirs, int level);
+
+void ApplyRemoteRelEvent(const coopcrime::CrimeRelEvent& e, unsigned int fromPeer)
+{
+    ++g_evRecv;
+    if (g_evIn.size() >= kEvInCap) { ++g_evInDropped; return; }
+    EvIn in; in.e = e; in.fromPeer = fromPeer;
+    g_evIn.push_back(in);
+}
+
+/* MAIN THREAD, K2 safe point (the AI worker paused). Each event: a duplicate (sender, seq) is refused; the faction must be a world
+   faction here and the named player this game's own; then the HOOKED by-event affectRelations runs on that faction's relations
+   towards this game's player faction - the detour forwards the new value to every game as any change of an owned pair (never
+   under g_applying). Kept while no world is running. */
+void RelationsEvApplyDrain()
+{
+    if (g_evIn.empty()) return;
+    if (!GameplayRunning() || EngineWritesBlocked()) { ++g_evDeferred; return; }
+    std::vector<EvIn> work;
+    work.swap(g_evIn);
+    const AffectEvFn hooked = (kAffectEvRva != 0) ? (AffectEvFn)(Base() + (uintptr_t)kAffectEvRva) : 0;
+    for (size_t i = 0; i < work.size(); ++i)
+    {
+        const coopcrime::CrimeRelEvent& e = work[i].e;
+        if (g_evSeen.Has(work[i].fromPeer, e.seq)) { ++g_evDup; continue; }
+        g_evSeen.Add(work[i].fromPeer, e.seq);
+        ::Faction* t = FactionOfLocal(e.ownerSid);
+        ::Faction* me = FactionOfLocal(e.otherSid);
+        void* rel = Plaus(t) ? RelationsOfPod(t) : 0;
+        if (hooked == 0 || !g_on || !Plaus(t) || !Plaus(me) || !coop::IsPlayerFaction(me) || !FacSide(t).world || !Plaus(rel))
+        {
+            ++g_evRefused;
+            EvLog("[REL] standing event <- " + e.ownerSid + " towards " + e.otherSid + " ev=" + S(e.ev) + " seq=" + S(e.seq) + " REFUSED ("
+                  + std::string(hooked == 0 ? "no AffectEv address" : (!g_on ? "relations off" : (!Plaus(t) || !FacSide(t).world ? "not a world faction here"
+                  : (!Plaus(me) || !coop::IsPlayerFaction(me) ? "not this game's player" : "no relations")))) + ")");
+            continue;
+        }
+        Entry b = { 0, 0, 0, 0 }, a = { 0, 0, 0, 0 };
+        const int rb = ReadEntry(rel, me, &b);
+        if (!RelEvCallPod(hooked, rel, me, e.ev, e.mult)) { ++g_evFaulted; continue; }
+        const int ra = ReadEntry(rel, me, &a);
+        ++g_evApplied;
+        EvLog("[REL] standing event <- " + e.ownerSid + " towards this game's player ev=" + S(e.ev) + " mult=" + S(e.mult) + " seq=" + S(e.seq)
+              + ": " + (rb == 1 ? S(b.relation) : std::string("n/a")) + " -> " + (ra == 1 ? S(a.relation) : std::string("n/a"))
+              + " (this game's engine made the event the other game raised; kind 2)");
+    }
+}
+
+std::string RelationsEvText()
+{
+    return " relEvents[captured,capDropped,sent,noRoad,dropped,pending,recv,applied,refused,dup,deferred,inDropped,faulted]="
+           + S((long long)g_evCaptured) + "," + S((long long)g_evCapDropped) + "," + S(g_evSent) + "," + S(g_evNoRoad) + "," + S(g_evDropped) + ","
+           + S((long long)g_evPend.size()) + "," + S(g_evRecv) + "," + S(g_evApplied) + "," + S(g_evRefused) + "," + S(g_evDup) + ","
+           + S(g_evDeferred) + "," + S(g_evInDropped) + "," + S(g_evFaulted)
+           + " copyDeathEv5[engineSkipped,notSent]=" + S((long long)g_evCopyDeathSkipped) + "," + S((long long)g_evCopyDeathNotSent);
+}
+int RelationsCopyDeathMark(int on)
+{
+    const DWORD i = (DWORD)g_copyDeathTls;
+    if (i == TLS_OUT_OF_INDEXES) return 0;
+    const int was = ::TlsGetValue(i) != 0 ? 1 : 0;
+    ::TlsSetValue(i, on ? (LPVOID)1 : (LPVOID)0);
+    return was;
+}
+long long RelationsEvAppliedCount() { return g_evApplied; }
 
 void SetRelationsOn(bool on) { g_on = on; DebugLog(std::string("[REL] ") + (on ? "ON" : "OFF")); }
 void RelationsSendSnapshot() { Snapshot(); }

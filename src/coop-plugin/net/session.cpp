@@ -30,8 +30,9 @@
 #include "../../common/uidlayout.h"   /* M4 fold: SpawnUidDecide - a SPAWN naming a uid this game runs is refused */
 #include "../../common/uidtable.h"    /* T-354: MSG_NOT_SHOWN's bytes and decisions */
 #include "../../common/lostcopy.h"    /* MSG_RESEND's bytes and the lost-copy book */
-#include "../zones.h"                 /* ZoneBuildingsInHereTri - a lost copy is asked for only where the engine's zone is loaded */
+#include "../zones.h"                 /* ZoneBuildingsInHereTri, ZoneKeepSectorTri - a lost copy is asked for only where the engine keeps it */
 #include <deque>
+#include "../../common/paritywire.h"   /* a box answer refit to the world server road's limit (ParityBoxFitWithoutGear) */
 #include "../../common/liveenvelope.h"   /* M5a: the notebook road's route and the relayed sender id */
 #include "../../common/liverelay.h"   /* M7a: the character stream's road, route and AREA target */
 #include "../../common/liveowner.h"   /* M7a A1 build 1 [a1b1-sp1i]: generations, receipts, ROSTER, the road to one game */
@@ -59,6 +60,7 @@
 #include "../../common/doorsync.h"   /* P8n-b (review-p8n L-8): DoorParseOrigin - the trailing byte is parsed by ONE pure function, and that function is in the offline suite */
 #include "../../common/storelink.h"   /* join1: NotebookAddrForJoiner - a loopback notebook address in the WELCOME means the host's machine */
 #include "../../common/gamelink.h"   /* link1 (T416): the game link's ENet timeouts and the joiner's in-world re-dial */
+#include "../../common/relaybridge.h"   /* AddrForLog: a log line never shows what follows steam: */
 #include "../soak.h"   /* link1: GameplayRunning - the re-dial never runs at the title screen */
 #include "../relations.h"   // P3 piece 2: ApplyRemoteRelation
 #include "../playerfaction.h"   /* stand1 fold (1d): NoteHeldForSlot */
@@ -88,6 +90,7 @@ namespace coop { int PeerPlayerSectorsTS(int* slots, int* xs, int* ys, int cap);
 namespace coop { void WorldStateOnOwnershipReleased(unsigned int uid, const void* character); }   /* worldstate.cpp - a dual run's yield is a release */
 namespace coop { void OnPlayerGone(unsigned int slot, const char* how, int standIn); }   /* below, in coop: the return check handles a leave it missed as PLAYER_GONE's (standIn 1: no take here) */
 namespace coop { int CopyIsPlayerCharacter(unsigned int uid); }   /* spawn.cpp: 1 the player character / a player-faction person, 0 an NPC, -1 unreadable, -2 no body */
+namespace coop { bool SpawnTwinHeld(unsigned int uid); }   /* spawn.cpp: a body of this game's own world the creation core adopts as the uid's copy (AdoptExistingTwin's lookups) */
 namespace coop {
 namespace net {
 
@@ -95,6 +98,14 @@ namespace net {
 // reads it - an anonymous-namespace global has internal linkage and cannot be reached from another file. Declared in
 // session.h, so the increments below (which come first in this file) already have it in scope.
 volatile __int64 g_remoteMayWriteRefused = 0;
+
+/* the lost-copy book's other roads, defined beside it (below): a SPAWN not made because this game's engine would not keep its copy;
+   the expired MOVE holds of uids never sent here; a held MOVE of such a booked uid (its spot); the streaming game's withdrawal of one */
+bool LostCopySpawnNotKept(unsigned int uid, float x, float y, float z);
+void LostCopyHoldBook(const std::vector<cooplive::MoveHoldGone>& gone);
+void LostCopyHeldMove(unsigned int uid, unsigned int senderKey, float x, float y, float z);
+bool LostCopyHoldWithdrawn(unsigned int uid, unsigned int senderKey, const char* why);
+void MoveHoldWithdrawn(unsigned int uid, unsigned int senderKey);   /* an UNLOAD / DESPAWN drops the withdrawing game's held MOVEs of the uid */
 
 namespace {
 
@@ -160,7 +171,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 149;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 157;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 
 // A body has 7 parts in this build (T032/T033/T034, every character, both instances). The
 // cap is a bound on a network-supplied count, not a belief about anatomy - a peer claiming
@@ -521,13 +532,14 @@ void OnWelcome(const Message& m)
         const std::string peerIp = (g_transport != 0) ? g_transport->PeerHostIp() : std::string();
         const std::string dialAddr = coopstore::NotebookDialFromWelcome(storeAddr, peerIp, g_joinAddr, coop::ConfigHostAddr(),
                                                                         &swapped, &why);
-        DebugLog("[STORE] notebook address from WELCOME '" + storeAddr + ":" + N(storePort) + "' -> using '" + dialAddr + ":"
+        DebugLog("[STORE] notebook address from WELCOME '" + relaybridge::AddrForLog(storeAddr) + ":" + N(storePort) + "' -> using '"
+                 + relaybridge::AddrForLog(dialAddr) + ":"
                  + N(storePort) + "' (" + why + ")");
         if (swapped)
         {
             ++g_welcomeNotebookSwapped;
-            DebugLog("[net] WELCOME named the notebook at " + storeAddr + ":" + N(storePort) + " - a loopback address, which on"
-                     " this computer is this computer; dialling the host's own address " + dialAddr + " instead (join1)");
+            DebugLog("[net] WELCOME named the notebook at " + relaybridge::AddrForLog(storeAddr) + ":" + N(storePort) + " - a loopback address, which on"
+                     " this computer is this computer; dialling the host's own address " + relaybridge::AddrForLog(dialAddr) + " instead (join1)");
         }
         coop::StoreLinkFromWelcome(dialAddr, (unsigned short)storePort);
     }
@@ -742,6 +754,10 @@ void OnSpawn(const Message& m)
              + " age=" + (sm.ageAbsent ? std::string("<absent>") : ageText.str()) + (sm.ageClamped ? " (clamped)" : "")
              + " dead=" + (sm.flagsAbsent ? std::string("<absent>") : N((sm.ownerFlags & coopspawn::kSpawnFlagDead) != 0 ? 1 : 0))
              + " ko=" + (sm.flagsAbsent ? std::string("<absent>") : N((sm.ownerFlags & coopspawn::kSpawnFlagKo) != 0 ? 1 : 0)));   /* T-303 */
+    /* a copy this game's engine would not keep at the SPAWN's spot is not made (that engine would put it away 4 s later): the owner
+       record above stays, the uid is booked in the lost-copy book at the spot, and its owner is asked for it when the spot is kept here;
+       its later MOVEs move the booked spot (ApplyRemoteMove -> LostCopyMove), its owner's UNLOAD / DESPAWN forgets the row */
+    if (LostCopySpawnNotKept(sm.uid, sm.x, sm.y, sm.z)) return;
     /* T-303 (protocol 102): the owner's word is noted BEFORE the copy exists - its appearance and clothing wait on it (a
        knocked-out one: crash1b, until the owner's STATE lays it down; a dead one: until its death below lands). A dead one
        needs no KO word. T-303 fold 1: a present flags byte is written WHOLE - dead or alive, KO or not - so an alive SPAWN
@@ -751,6 +767,7 @@ void OnSpawn(const Message& m)
     coop::CreateRefusalReset();   /* the creation core's lasting refusal, read after the SPAWN */
     coop::ApplyRemoteSpawn(sm.uid, sm.templateName, sm.x, sm.y, sm.z, sm.factionName, sm.keepContainer, sm.age,
                            sm.statsState == coopspawn::kSpawnStatsOk ? sm.stats : 0);   /* S1: the owner's 44 stat values */
+    if (coop::FindSpawned(sm.uid) != 0) coop::TalkCursorCopyReady(sm.uid);   /* T-737: the copy is here - one preload ASK of its talk cursor */
     /* T-354: our character table refused this copy - the owner is told, so it is counted on both games. T-354 fold 1: only
        when the character really is not shown - a twin refused, then built fresh by CreateAt, is shown */
     if (coopuid::SpawnRefusedByTable(nsBefore, coop::MirrorPeerRefusals()) && coop::FindSpawned(sm.uid) == 0)
@@ -997,8 +1014,10 @@ void OnDespawn(const Message& m)
     const unsigned int uid = w.uid;
     WithdrawReceiptNote(m.peer, w);   /* listed: acknowledged whatever happens below */
     if (WithdrawStaleHere(uid, w.gen, "DESPAWN")) return;
+    MoveHoldWithdrawn(uid, OwnerKeyOf(m.peer));   /* its held MOVEs from this game go: their expiry would book a character it no longer runs here */
     if (!RemoteMayWrite(uid, m.peer))
     {
+        if (g_owner.find(uid) == g_owner.end() && LostCopyHoldWithdrawn(uid, OwnerKeyOf(m.peer), "the game streaming it removed it (DESPAWN) before it was sent here")) return;
         DebugLog("[net] <- DESPAWN uid=" + N(uid) + " REFUSED - we author this uid, or the sender"
                  " is not its authority");
         return;
@@ -1006,6 +1025,7 @@ void OnDespawn(const Message& m)
     DebugLog("[net] <- DESPAWN uid=" + N(uid));
     coop::SquadIdxOwnerWithdrew(uid, 0);   /* M7a A1 build 2 [a1b2-sp1] (design 2.3): its recorded owner says it died - out of the squad index's given */
     coop::ApplyRemoteDespawn(uid);
+    coop::TalkCursorForgetNpc(uid);   /* T-737: its talk-cursor answers go with the copy */
     LostCopyForget(uid, "the owner removed it (DESPAWN)");   /* nothing to ask for */
 }
 
@@ -1472,12 +1492,14 @@ static long long g_relaySpawnForeign = 0;
    cuAsk (item 7): asks booked, ENDs in, asks ended by every owner, ENDs of no booked ask (late / repeated), asks ended by the timeout.
    ownerMoved (item 3): sent, send refused, no slot for the new owner, in, taken, for an unknown uid, for one this game runs, refused.
    moveHold (item 6): MOVEs held, replaced by a newer one, refused (the hold is full), applied after the SPAWN, dropped (another sender),
-   expired. */
+   expired, booked (an expired hold's uid booked in the lost-copy book under the held MOVEs' sender), bookSkipped (an expired hold not
+   booked: an owner record arrived meanwhile, this game runs it, no sender, or the book refused it). */
 static cooplive::CatchupAskBook g_cuAsks;
 static long long g_cuAsksOpened = 0, g_cuAskEnds = 0, g_cuAsksDone = 0, g_cuAskEndsLate = 0, g_cuAsksTimedOut = 0;
 static long long g_ownerMovedSent = 0, g_ownerMovedSendFailed = 0, g_ownerMovedNoSlot = 0, g_ownerMovedIn = 0, g_ownerMovedTaken = 0, g_ownerMovedUnknown = 0, g_ownerMovedMine = 0, g_ownerMovedRefused = 0;
 static cooplive::MoveHoldBook g_moveHold;
 static long long g_moveHeld = 0, g_moveHeldReplaced = 0, g_moveHeldFull = 0, g_moveHeldApplied = 0, g_moveHeldDropped = 0, g_moveHeldExpired = 0;
+static long long g_moveHeldBooked = 0, g_moveHeldBookSkipped = 0, g_moveHoldBookLines = 0;
 /* M7a2 fold 1 [m7a2f-sp0]. ownerMoved: deferred (item 1 - the old owner's word owed while its world link was down), sentLate (owed, sent
    once the link was ready - also counted in sent), owedDropped (no longer owed: this game runs it again, no record, or the owed set full),
    announced / announceSkipped (item 2 - the taker's word; skipped: no previous owner with a slot, no slot of its own, or no world link),
@@ -1512,6 +1534,9 @@ static bool MoveHoldIfUnknown(unsigned int peer, const std::vector<char>& payloa
     if (cooplive::RelayedMoveHoldDecide(true, g_localOwned.find(uid) != g_localOwned.end(), g_owner.find(uid) != g_owner.end()) != cooplive::kMoveHoldHold) return false;
     const int r = cooplive::MoveHoldPut(&g_moveHold, uid, OwnerKeyOf(peer), payload, CuNowSec());
     if (r == cooplive::kMoveHoldPutFull) ++g_moveHeldFull; else if (r == cooplive::kMoveHoldPutReplaced) ++g_moveHeldReplaced; else ++g_moveHeld;
+    float at[3] = { 0.0f, 0.0f, 0.0f };
+    std::memcpy(at, &payload[4], 12);
+    LostCopyHeldMove(uid, OwnerKeyOf(peer), at[0], at[1], at[2]);   /* a uid booked from its earlier held MOVEs: its booked spot follows the stream */
     return true;
 }
 static void MoveHoldReplayAfterSpawn(const std::vector<char>& spawn)
@@ -1646,7 +1671,7 @@ static void SessionCatchupTick()
                      + " s - ended by the clock (cuAsk timedOut " + N(g_cuAsksTimedOut) + "; the first 5 and every 100th are logged)");
     }
     /* M7a A1 build 1 [a1b1-sp26]: the OWNER_MOVED words owed go out from the outbox tick (OutboxTick) */
-    g_moveHeldExpired += (long long)cooplive::MoveHoldExpire(&g_moveHold, now, cooplive::kMoveHoldSec);
+    /* the MOVE holds run out in SessionCatchupApplyTick, where the lost-copy book's looks read the engine */
 }
 /* M7a2 fold 1, manager ruling [m7a2f-ap1] - THE CATCH-UP'S ENGINE WRITES. CommandChannelTick calls this right AFTER coop::InQueueDrain() -
    the main thread, the same moment as the drain's own SPAWN / DESPAWN applies - so SessionTick stays POLLS AND ENQUEUES. (1) the reverse
@@ -1660,6 +1685,14 @@ std::string LostCopyCountsString();   /* defined beside OnResend */
 void SessionCatchupApplyTick()
 {
     coop::WorldsyncCatchupReverseTick();
+    {
+        /* a MOVE hold that runs out with its character still unknown here: the owner streams a character this game was never sent -
+           booked in the lost-copy book at its latest held spot (its look reads the engine: here, after the drain), asked for when that
+           spot is kept here */
+        std::vector<cooplive::MoveHoldGone> gone;
+        g_moveHeldExpired += (long long)cooplive::MoveHoldExpire(&g_moveHold, CuNowSec(), cooplive::kMoveHoldSec, &gone);
+        if (!gone.empty()) LostCopyHoldBook(gone);
+    }
     LostCopyTick();   /* once a second, every lost copy is looked at (asked for while its spot is loaded here) */
     ReturnCheckTick();   /* after this game's world link came back: each copy its owner has not streamed since is asked of its owner */
     coop::PlayerGoneTakeOverTick();   /* a final leaver's NPCs held for the area's taker */
@@ -1741,8 +1774,8 @@ std::string CharStreamCountsString()
         + "," + N(g_ownerMovedDeferred) + "," + N(g_ownerMovedSentLate) + "," + N(g_ownerMovedOwedDropped) + "," + N(g_ownerMovedAnnounced)
         + "," + N(g_ownerMovedAnnounceSkipped) + "," + N(g_ownerMovedNoop) + "," + N(g_ownerMovedTakenAnnounce)   /* fold 1 [m7a2f-sp10] */
         + "," + N(g_ownerMovedOwedFull)   /* fold 2 [m7a2f2-sp12] */
-        + " moveHold[held,replaced,full,applied,dropped,expired]=" + N(g_moveHeld) + "," + N(g_moveHeldReplaced) + "," + N(g_moveHeldFull)
-        + "," + N(g_moveHeldApplied) + "," + N(g_moveHeldDropped) + "," + N(g_moveHeldExpired)
+        + " moveHold[held,replaced,full,applied,dropped,expired,booked,bookSkipped]=" + N(g_moveHeld) + "," + N(g_moveHeldReplaced) + "," + N(g_moveHeldFull)
+        + "," + N(g_moveHeldApplied) + "," + N(g_moveHeldDropped) + "," + N(g_moveHeldExpired) + "," + N(g_moveHeldBooked) + "," + N(g_moveHeldBookSkipped)
         + " moveStop[sentSession,sentLive,recvSession,recvLive,short,refused]=" + N(g_moveStopSent[0]) + "," + N(g_moveStopSent[1])
         + "," + N(g_moveStopRecv[0]) + "," + N(g_moveStopRecv[1]) + "," + N(g_moveStopShort) + "," + N(g_moveStopRefused);
 }
@@ -2519,7 +2552,12 @@ void OnUnload(const Message& m)
     const unsigned int uid = w.uid;
     WithdrawReceiptNote(m.peer, w);   /* listed: acknowledged whatever happens below */
     if (WithdrawStaleHere(uid, w.gen, "UNLOAD")) return;
-    if (!RemoteMayWrite(uid, m.peer)) return;   // only the character's owner may unload our copy
+    MoveHoldWithdrawn(uid, OwnerKeyOf(m.peer));   /* its held MOVEs from this game go: their expiry would book a character it no longer runs here */
+    if (!RemoteMayWrite(uid, m.peer))   // only the character's owner may unload our copy
+    {
+        if (g_owner.find(uid) == g_owner.end()) LostCopyHoldWithdrawn(uid, OwnerKeyOf(m.peer), "the game streaming it withdrew it (UNLOAD) before it was sent here");
+        return;
+    }
     if (cooplo::UnloadClearsGiven(w.why) == 1) coop::SquadIdxOwnerWithdrew(uid, 1);   /* its recorded owner runs it nowhere (put away asleep, reloaded, retired) - out of the squad index */
     else coop::SquadIdxOwnerStillRuns(uid);   /* the owner's announce pass (this game's player left the area; the owner still runs the person): `given` stays, so this game never re-wakes the squad from its own world data */
     coop::ApplyRemoteUnload(uid);
@@ -2817,6 +2855,20 @@ int ItemAskedSlot(unsigned int id)
     return PlayerSlotOfKey(key);
 }
 /* One item message to one player (toSlot: ItemAddrDecide's answer). *sentKey: the key naming the player it went to. */
+/* A BOX answer the world server's road would refuse for its length (cooplive::kLiveInnerMax) goes without its uniforms and crafters
+   when that makes it fit (cooppar::ParityBoxFitWithoutGear): the contents arrive, the fields left off are counted (itemGear dropped)
+   and logged. Only that road has this limit; the session link carries up to 32 MiB. */
+static void ParityFitLive(MsgType type, std::vector<char>* v)
+{
+    if (type != MSG_PARITY_BOX || v->size() <= (size_t)cooplive::kLiveInnerMax) return;
+    std::vector<char> s;
+    unsigned int fields = 0;
+    if (cooppar::ParityBoxFitWithoutGear(&(*v)[0], v->size(), (size_t)cooplive::kLiveInnerMax, &s, &fields) == 0) return;
+    DebugLog("[GEAR] send: a box answer of " + N((long long)v->size()) + " bytes is over the world server road's " + N((long long)cooplive::kLiveInnerMax)
+             + "-byte limit - sent as " + N((long long)s.size()) + " bytes with " + N((long long)fields) + " uniform / crafter field(s) left off");
+    v->swap(s);
+    coop::ItemGearNoteSent(0, fields);
+}
 static bool ItemSendTo(MsgType type, int toSlot, const char* p, size_t n, unsigned int uid, unsigned int* sentKey, int* whyOut = 0)
 {
     if (whyOut != 0) *whyOut = cooplive::kAddrWhyOk;   /* fold 2 (D4): why it was not sent (kAddrWhyOk = the send itself failed) */
@@ -2842,7 +2894,8 @@ static bool ItemSendTo(MsgType type, int toSlot, const char* p, size_t n, unsign
     }
     if (a.road == cooplive::kAddrLive)
     {
-        const std::vector<char> v(p, p + n);
+        std::vector<char> v(p, p + n);
+        ParityFitLive(type, &v);   /* a box answer over the road's limit goes without its uniforms and crafters when that fits */
         const bool ok = coop::StoreSendLive(cooplive::kRouteSlot, a.slot, (unsigned int)type, v, true);
         AddrCount(type, ok ? kAddrColLive : kAddrColNoSlot);
         if (ok && sentKey != 0) *sentKey = cooplive::RelayPeerId(a.slot);
@@ -2882,7 +2935,8 @@ static bool ItemSendArea(MsgType type, int areaKey, int prevKey, const char* p, 
     if (at != cooplive::kAreaTargetNone) { route = cooplive::kRouteArea; target = at; }
     else if (cooplive::AddrGroupOf((unsigned int)type) == cooplive::kAddrGroupItem) ++g_itemNoArea;
     else ++g_sideNoArea;   /* M7b slice 4 */
-    const std::vector<char> v(p, p + n);
+    std::vector<char> v(p, p + n);
+    ParityFitLive(type, &v);   /* the same for a box push to an area */
     const bool ok = coop::StoreSendLive(route, target, (unsigned int)type, v, true);
     AddrCount(type, ok ? kAddrColLive : kAddrColNoSlot);
     return ok;
@@ -2921,8 +2975,10 @@ static bool ItemMoveBytes(const coop::ItemMoveMsg& m, std::vector<char>& b, bool
     if (m.op == 0)
     {
         int bs = 0, os = 0;
-        coopistat::EncodeAddTail(&b, m.bag, m.owner, &bs, &os);
+        int gs = 0; unsigned int gd = 0;
+        coopistat::EncodeAddTail(&b, m.bag, m.owner, m.gear, &bs, &os, &gs, &gd);   /* then the GEM1 block: the uniform and crafter */
         ownSent = (os == 1); bagSent = (bs == 1);
+        if (gs != 0 || gd != 0) coop::ItemGearNoteSent(gs, gd);
         if (os < 0) coop::ItemOwnerNoteBadBlock();
     }
     /* items9 (protocol 78): op 4 CHARGES ends with the uses left and the item's base sid; one that will not encode is not sent. */
@@ -3131,10 +3187,12 @@ static void OnItemMoveBody(const Message& m, const coophold::ReqTag* hdTag)
     if (im.op == 0 && at < m.payload.size())
     {
         size_t te = 0;
-        const int tw = coopistat::DecodeAddTail(&m.payload[0], m.payload.size(), at, &im.bag, &im.owner, &te);
+        const int tw = coopistat::DecodeAddTail(&m.payload[0], m.payload.size(), at, &im.bag, &im.owner, &im.gear, &te);
         if (tw != coopistat::kTailOk)
         {
             if (tw == coopistat::kTailBadOwner) coop::ItemOwnerNoteBadRecv();
+            if (tw == coopistat::kTailBadGear) coop::ItemGearNoteBadRecv();
+            if (tw == coopistat::kTailBadNest) coop::ItemBagNestNoteBadRecv();   /* the backpack rows' pack-inside-pack tail (ITEM_MOVE add) */
             ErrorLog("[net] ITEM_MOVE add with " + std::string(coopistat::TailWhy(tw)) + " after its record - REFUSED");
             return;
         }
@@ -3255,6 +3313,9 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
         if (coopmark::EncodeOwner(&ob, r.owner)) { b.insert(b.end(), ob.begin(), ob.end()); ownSent = true; }
         else coop::ItemOwnerNoteBadBlock();
     }
+    /* the GEM1 block after the owner block: a GIVE's uniform and crafter, only when there is one (a field that cannot travel goes empty, counted) */
+    if (r.dir != 0 && !gearwire::GearEmpty(r.gear))
+    { unsigned int gd = 0; const int gs = gearwire::EncodeGear(&b, r.gear, &gd); coop::ItemGearNoteSent(gs, gd); }
     /* bag23 part 2 (protocol 81): the owner half INSIDE A PACK - its path, LAST. One that will not encode is not sent. */
     if (r.ownerBag.has != 0 && !coopbag::EncodeBagPath(&b, r.ownerBag))
     { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": its pack path would not encode - NOT SENT"); return false; }
@@ -3326,6 +3387,9 @@ bool SendItemConfirm(const coop::ItemConfirmMsg& c)
         if (coopmark::EncodeOwner(&ob, c.owner)) { b.insert(b.end(), ob.begin(), ob.end()); ownSent = true; }
         else coop::ItemOwnerNoteBadBlock();
     }
+    /* the GEM1 block after the owner block: a TAKE answer's uniform and crafter (ok 1), only when there is one */
+    if (c.ok != 0 && !gearwire::GearEmpty(c.gear))
+    { unsigned int gd = 0; const int gs = gearwire::EncodeGear(&b, c.gear, &gd); coop::ItemGearNoteSent(gs, gd); }
     /* P105 build 2 (protocol 126): a LAND's answer ends with where the writer put the item - the 'LND1' trailer, LAST of all */
     if (c.ok != 0 && c.landHas != 0) { coophold::LandTail lt; lt.where = c.landWhere; lt.x = c.landX; lt.y = c.landY; coophold::PutLandTail(&b, lt); }
     const bool sent = ItemSendTo(MSG_ITEM_CONFIRM, ItemToAsker(c.toHave != 0, c.toKey), &b[0], b.size(), 0u, 0);   /* M7b slice 2: back to the asker */
@@ -3488,21 +3552,46 @@ bool SendCrimeAfterSpawn(unsigned int uid, const coopcrime::CrimeState& s)
     if (!coopcrime::EncodeCrime(&b, uid, s)) return false;
     return SendAfterSpawn(MSG_CRIME, uid, b);
 }
+/* kind 1: by slot to the character's owner (SideSendToOwnerOf, as a BOUNTY addition) */
+int SendCrimeToOwner(unsigned int uid, const coopcrime::CrimeState& s)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return 0;
+    std::vector<char> b;
+    if (!coopcrime::EncodeCrimeKind(&b, uid, s, coopcrime::kCrimeKindCopyWrite)) return -1;
+    int to = cooplive::kAddrOwnerUnknown, why = cooplive::kAddrWhyOk;
+    if (SideSendToOwnerOf(MSG_CRIME, uid, &b[0], b.size(), &to, &why)) return 1;
+    return (to == cooplive::kAddrOwnerNone) ? -1 : 0;
+}
+/* kind 2: by slot to the player whose stand-in the event named */
+int SendCrimeRelEvent(const coopcrime::CrimeRelEvent& e, int toSlot)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return 0;
+    std::vector<char> b;
+    if (!coopcrime::EncodeCrimeRelEvent(&b, e)) return -1;
+    int why = cooplive::kAddrWhyOk;
+    if (ItemSendTo(MSG_CRIME, toSlot >= 0 ? toSlot : cooplive::kAddrOwnerUnknown, &b[0], b.size(), 0u, 0, &why)) return 1;
+    return (why == cooplive::kAddrWhyNoOwner) ? -1 : 0;
+}
 /* crime3 - MSG_CRIME: refused whole when it does not decode; only the uid's owner may send it (checked in ApplyRemoteCrime);
    queued for the K2 safe point, where the copy is written. */
 void OnCrime(const Message& m)
 {
-    if (coop::EngineWritesBlocked()) { coop::CrimeNoteDroppedBlocked(); return; }
+    if (coop::EngineWritesBlocked() && (m.payload.empty() || !coopcrime::CrimeMsgKeptThroughLoad(&m.payload[0], m.payload.size())))
+    { coop::CrimeNoteDroppedBlocked(); return; }   /* kind 2 is kept through a load: ApplyRemoteRelEvent queues it (bounded) */
     unsigned int uid = 0;
     coopcrime::CrimeState s;
+    unsigned char kind = coopcrime::kCrimeKindState;
+    coopcrime::CrimeRelEvent rel;
     const int r = m.payload.empty() ? coopcrime::kCrimeDecodeTooShort
-                                    : coopcrime::DecodeCrime(&m.payload[0], m.payload.size(), &uid, &s);
+                                    : coopcrime::DecodeCrimeMsg(&m.payload[0], m.payload.size(), &uid, &s, &kind, &rel);
     if (r != coopcrime::kCrimeDecodeOk)
     {
         coop::CrimeNoteMalformed();
         DebugLog("[net] <- CRIME malformed (reason " + N((long long)r) + ") - ignored");
         return;
     }
+    if (kind == coopcrime::kCrimeKindCopyWrite) { coop::ApplyRemoteCopyWrite(uid, s, m.peer); return; }   /* a copy's crime, to us the owner */
+    if (kind == coopcrime::kCrimeKindRelEvent) { coop::ApplyRemoteRelEvent(rel, m.peer); return; }       /* a standing event against our player */
     coop::ApplyRemoteCrime(uid, s, m.peer);
 }
 
@@ -3669,16 +3758,30 @@ int BuildSlotTarget(int slot)   /* M7b slice 4 fold 2 (D1): ownerroute.h BuildAd
     return cooplive::BuildAddrTarget(slot, coop::LinkPeerSlot(), coop::StoreLiveReady(), sessionUp, targetInWorld);
 }
 int PlayerAddrOfKey(unsigned int key) { return cooplive::AddrOwnerSlotOf(key, coop::LinkPeerSlot()); }   /* fold 2 (D1): -2 kept */
+long long g_farmUnencodable = 0, g_buildUnencodable = 0;   /* MAIN THREAD: messages SendFarm / SendBuildToSlot could not encode - dropped, never sent */
+long long FarmUnencodableCount() { return g_farmUnencodable; }
 bool SendBuildToSlot(const coopbuild::BuildMsg& m, int slot)   /* M7b slice 4 fold 1 (F6); fold 2 (D1): the raw session peer when needed */
 {
     if (CharRoadNow() == cooplive::kCharRoadNone) return false;
     const int to = BuildSlotTarget(slot);
     if (to == cooplive::kAddrOwnerNone) return false;   /* nobody reachable now: the caller holds it */
     std::vector<char> b;
-    if (!coopbuild::EncodeBuild(&b, m)) return true;   /* not encodable: dropped, never retried forever */
+    if (!coopbuild::EncodeBuild(&b, m))
+    {   /* not encodable: dropped, never retried forever - counted and said */
+        ++g_buildUnencodable;
+        if (coopfarm::MineSayDue(g_buildUnencodable) != 0)
+        {
+            std::ostringstream s; s.imbue(std::locale::classic());
+            s << "[BUILD] a building message (kind " << (int)m.kind << ", key " << m.key.substr(0, 63)
+              << ") could not be encoded - dropped, never sent; buildUnencodable=" << g_buildUnencodable;
+            DebugLog(s.str());
+        }
+        return true;
+    }
     return ItemSendTo(MSG_BUILD, to, &b[0], b.size(), 0u, 0);
 }
-/* par16.  Reliable, on MSG_BUILD: the writer's farm state (farm.cpp FarmDrain) and a held game's harvest work (FarmTick).
+/* par16.  Reliable, on MSG_BUILD: the writer's farm state (farm.cpp FarmDrain), a held game's harvest work and a worker's step
+   (FarmTick), and the writer's bar and state of a worked production building (MINE_STATE, FarmTick).
    par16 fold #8: meant for EVERY linked game - M7b slice 4: on the notebook road it goes WORLD (every game), on the session link
    to its one peer; the receiver accepts a FARM only while its own ladder names another game the writer, and a FARM_OP only while it
    is the writer itself (farm.cpp FarmDrain). Counted in addr.build. */
@@ -3686,7 +3789,18 @@ bool SendFarm(const coopfarm::FarmMsg& m)
 {
     if (CharRoadNow() == cooplive::kCharRoadNone) return false;   /* M7b slice 4: the character stream's road */
     std::vector<char> b;
-    if (!coopfarm::EncodeFarm(&b, m)) return true;   /* not encodable: dropped, never retried forever */
+    if (!coopfarm::EncodeFarm(&b, m))
+    {   /* not encodable: dropped, never retried forever - counted and said */
+        ++g_farmUnencodable;
+        if (coopfarm::MineSayDue(g_farmUnencodable) != 0)
+        {
+            std::ostringstream s; s.imbue(std::locale::classic());
+            s << "[FARM] a farm message (kind " << (int)m.kind << ", key " << m.key.substr(0, 63)
+              << ") could not be encoded - dropped, never sent; farmUnencodable=" << g_farmUnencodable;
+            DebugLog(s.str());
+        }
+        return true;
+    }
     return SideSendWorld(MSG_BUILD, &b[0], b.size());   /* M7b slice 4: WORLD */
 }
 /* build1-b - MSG_BUILD: refused whole when it does not decode. It is a whole state and is NOT dropped during a load
@@ -3831,16 +3945,19 @@ int SendNotShownToOwner(unsigned int uid, unsigned int ownerKey)
    NotifyDespawn: an engine unload of a copy, not the owner's own UNLOAD or DESPAWN), or the owner streams a MOVE for a uid this game
    holds no copy of (replicate.cpp ApplyRemoteMove): the uid is booked with its owner and its last spot - never a uid whose SPAWN made
    no row here (g_lostRefused, from OnSpawn). A look at a row - at the event itself, and once a second for every row (LostCopyTick) -
-   asks the owner to send the character again while that spot reads as loaded here by the engine's own zone byte
-   (ZoneBuildingsInHereTri), within the row's visit budget (lostcopy::LostLookDecide); "no copy here" is LostCopyHereNow, the same
+   asks the owner to send the character again while that spot reads as KEPT here: its area loaded by the engine's own zone byte
+   (ZoneBuildingsInHereTri) and not within the engine's edge strip of a side whose neighbour area is not loaded (LostEngineKeepsHere, the engine's own edge rule;
+   a copy made in that strip would be put away again at once), within the row's visit budget (lostcopy::LostLookDecide); "no copy here" is LostCopyHereNow, the same
    test that writes the BACK line. A SPAWN that makes the copy marks the row HERE and writes BACK at once (LostCopyArrived, from
    OnSpawn), so a look right after it never asks. The row stays while the copy is back and its
-   spot (the owner's last streamed spot) is still loaded; it goes after that, when the owner record is gone, at the owner's UNLOAD /
+   spot (the owner's last streamed spot) is still kept here; it goes after that, when the owner record is gone, at the owner's UNLOAD /
    DESPAWN, at a world teardown and when the session's owner records are cleared. The owner sends the state to this game alone
    (coop::WorldsyncResendAsk) and then answers (OnResend); an answer counts only from the row's owner. Every line names its uid and
    is written for that uid's first 12 events, then every 100th (lostcopy::LostUidLogThis); a row forgotten or dropped writes
-   one line naming its uid and the reason, the first 20 such lines in the process (LostGoneLine).
-   lostCopy[noted,asks,askFailed,answers,refused,back,dropped,full,open,refusedSkip,answerForeign,forgot] and
+   one line naming its uid and the reason, the first 20 such lines in the process (LostGoneLine). A row with no copy here whose
+   area is loaded but whose spot is within the edge strip writes one WAIT line per such stretch (the row's edgeWaitLine, cleared
+   when the spot reads kept again).
+   lostCopy[noted,asks,askFailed,answers,refused,back,dropped,full,open,refusedSkip,answerForeign,forgot,edgeWait,notInArea,spawnNotKept] and
    resendIn[asks,answered,answerFailed,noRoad,malformed] on the [net] REPORT line. MAIN THREAD. */
 static lostcopy::LostBook g_lost;
 static std::map<unsigned int, unsigned long long> g_lostRefused;                 /* uid whose SPAWN was refused for good -> its mark's stamp */
@@ -3850,7 +3967,9 @@ const size_t kLostRefusedMax = 8192;
 static std::map<unsigned int, long long> g_lostUidLines;   /* uid -> its events so far (the per-uid log budget) */
 const size_t kLostUidLinesMax = 4096;
 static long long g_lcNoted = 0, g_lcAsks = 0, g_lcAskFailed = 0, g_lcAnswers = 0, g_lcRefused = 0, g_lcBack = 0, g_lcDropped = 0;
-static long long g_lcRefusedSkip = 0, g_lcAnswerForeign = 0, g_lcForgot = 0;
+static long long g_lcRefusedSkip = 0, g_lcAnswerForeign = 0, g_lcForgot = 0, g_lcEdgeWait = 0;
+static long long g_lcNotInArea = 0;   /* RESEND answers NOT IN AREA - an older build's answer; this build's owner never gives it (also counted in refused) */
+static long long g_lcSpawnNotKept = 0;   /* SPAWNs not made: this game's engine would not keep a copy at the spot - booked instead (LostCopySpawnNotKept) */
 static long long g_rsInAsks = 0, g_rsInAnswered = 0, g_rsInAnswerFailed = 0, g_rsInNoRoad = 0, g_rsInMalformed = 0;
 static bool LostLineDue(unsigned int uid)
 {
@@ -3891,20 +4010,44 @@ static bool LostCopyHereNow(unsigned int uid)
     const void* o = coop::SpawnedRawObject(uid);
     return o != 0 && coop::FindSpawnedUid(o) == uid;
 }
-/* One look at row i; true when the row was removed. */
-static bool LostLook(size_t i)
+/* Would this game's engine keep a copy whose centre stands at (x, z): the engine's own edge rule - cooplo::EngineKeepsAt over the
+   live keep flags of the area and its four side neighbours (ZoneKeepSectorTri; off the grid no neighbour narrows) with
+   lostcopy::kLostKeepMarginUnits, not the hand-over's wider margin (zones.cpp EngineKeepsHere). 1 keeps, 0 not, -1 unreadable.
+   MAIN THREAD. */
+static int LostEngineKeepsHere(float x, float z)
 {
-    unsigned int key = 0;
+    const int sx = lostcopy::LostSectorOf(x), sy = lostcopy::LostSectorOf(z);
+    const int self = coop::ZoneKeepSectorTri(sx, sy);
+    if (self <= 0) return self;
+    const int w = sx > 0 ? coop::ZoneKeepSectorTri(sx - 1, sy) : 1;
+    const int e = sx < 63 ? coop::ZoneKeepSectorTri(sx + 1, sy) : 1;
+    const int so = sy > 0 ? coop::ZoneKeepSectorTri(sx, sy - 1) : 1;
+    const int no = sy < 63 ? coop::ZoneKeepSectorTri(sx, sy + 1) : 1;
+    return cooplo::EngineKeepsAt(x, z, cooplo::AreaMinUnits(sx), cooplo::AreaMinUnits(sy), cooplo::kAreaSizeUnits, self, w, e, so, no,
+                                 lostcopy::kLostKeepMarginUnits);
+}
+/* One look at row i; true when the row was removed. tick: the once-a-second pass (LostCopyTick) - only its looks run down an owed
+   answer's wait and a back-off. */
+static bool LostLook(size_t i, bool tick = false)
+{
+    unsigned int key = 0, recordKey = 0;
     const unsigned int uid = g_lost.rows[i].uid;
-    const bool ownerOk = lostcopy::LostNoteAllowed(IsUidMine(uid) ? 1 : 0, UidOwnerPeer(uid, &key) ? 1 : 0, g_lostRefused.count(uid) != 0 ? 1 : 0) != 0;
+    const bool recordKnown = UidOwnerPeer(uid, &recordKey);
+    /* the owner record when there is one; a row booked from a held MOVE (no record: its SPAWN never came) asks the game that streams it */
+    const bool ownerKnown = lostcopy::LostRowOwner(recordKnown ? 1 : 0, recordKey, g_lost.rows[i].ownerFromMove, g_lost.rows[i].ownerKey, &key) != 0;
+    const bool ownerOk = lostcopy::LostNoteAllowed(IsUidMine(uid) ? 1 : 0, ownerKnown ? 1 : 0, g_lostRefused.count(uid) != 0 ? 1 : 0) != 0;
+    if (recordKnown) g_lost.rows[i].ownerFromMove = 0;   /* the record governs from now on */
     if (ownerOk && key != g_lost.rows[i].ownerKey) lostcopy::LostNote(&g_lost, uid, key, 0, 0.0f, 0.0f, 0.0f);   /* a new owner was never asked */
     lostcopy::LostRow& r = g_lost.rows[i];
     const bool haveCopy = LostCopyHereNow(uid);
     if (haveCopy) { float px = 0.0f, py = 0.0f, pz = 0.0f; if (coop::PuppetAuthorityPos(uid, &px, &py, &pz)) { r.x = px; r.y = py; r.z = pz; r.hasPos = 1; } }
     /* a running world with engine writes allowed (a copy asked for inside a load gate would be made into a world being torn down or
-       built), and the engine's own "zone loaded" byte, which never reads a stale yes */
-    const bool loaded = r.hasPos != 0 && coop::GameplayRunning() && !coop::EngineWritesBlocked() && coop::ZoneBuildingsInHereTri(r.x, r.y, r.z) == 1;
-    const int a = lostcopy::LostLookDecide(haveCopy ? 1 : 0, ownerOk ? 1 : 0, loaded ? 1 : 0, r);
+       built), the engine's own "zone loaded" byte, which never reads a stale yes, and the engine's keep test at the spot: a copy
+       within the edge strip of a side whose neighbour area is not loaded is put away by the engine again at once */
+    const int zoneLoaded = (r.hasPos != 0 && coop::GameplayRunning() && !coop::EngineWritesBlocked()) ? coop::ZoneBuildingsInHereTri(r.x, r.y, r.z) : 0;
+    const int keeps = zoneLoaded == 1 ? LostEngineKeepsHere(r.x, r.z) : 0;
+    const bool kept = lostcopy::LostSpotKept(zoneLoaded == 1 ? 1 : 0, keeps) != 0;
+    const int a = lostcopy::LostLookDecide(haveCopy ? 1 : 0, ownerOk ? 1 : 0, kept ? 1 : 0, r);
     if (haveCopy && r.state != lostcopy::kLcHere && (a == lostcopy::kLaHere || a == lostcopy::kLaDrop))
     {
         ++g_lcBack;
@@ -3920,6 +4063,15 @@ static bool LostLook(size_t i)
         LostRowErase(i);
         return true;
     }
+    if (kept) r.edgeWaitLine = 0;
+    else if (!haveCopy && zoneLoaded == 1 && keeps == 0 && !r.edgeWaitLine)   /* the first look of a stretch in the edge strip */
+    {
+        r.edgeWaitLine = 1;
+        ++g_lcEdgeWait;
+        if (LostLineDue(uid))
+            DebugLog("[net] lost copy uid=" + N(uid) + " waits: it stands within the edge strip of an area side this game has not loaded"
+                     " - a copy there would be put away again (asked for when it stands further in) (lostCopy edgeWait " + N(g_lcEdgeWait) + ")");
+    }
     int sent = 0;
     const int noRoadFirst = lostcopy::LostNoRoadFirst(r);
     if (a == lostcopy::kLaAsk)
@@ -3931,18 +4083,25 @@ static bool LostLook(size_t i)
         if (sent) ++g_lcAsks; else ++g_lcAskFailed;
         if ((sent || noRoadFirst) && LostLineDue(uid))   /* a road outage is written once */
             DebugLog("[net] -> RESEND ask uid=" + N(uid) + " to its owner (player key " + N(r.ownerKey) + ")" + std::string(sent ? "" : " NOT SENT (no road)")
-                     + ": no copy here and it stands in an area loaded here (ask " + N((long long)((loaded && !r.loadedPrev) ? 1 : r.asksThisVisit + 1)) + " of "
+                     + ": no copy here and it stands where this game's engine keeps it (its area loaded, away from an unloaded side)"
+                     + std::string(!r.loadedPrev ? "" : (r.state == lostcopy::kLcAsked ? " - its last ask got no answer"
+                                                         : (r.state == lostcopy::kLcBackoff ? " - again after an answer that sent nothing" : "")))
+                     + " (ask " + N((long long)((kept && !r.loadedPrev) ? 1 : r.asksThisVisit + 1)) + " of "
                      + N((long long)lostcopy::kLostAsksPerVisit) + " this visit; lostCopy asks " + N(g_lcAsks) + ")");
     }
-    lostcopy::LostLookApply(&r, loaded ? 1 : 0, a, sent);
+    lostcopy::LostLookApply(&r, kept ? 1 : 0, a, sent, tick ? 1 : 0);
     return false;
 }
-static void LostBookUid(unsigned int uid, bool hasPos, float x, float y, float z)
+/* moveKey != 0: the sender of the held MOVEs that name the uid - the owner when no owner record exists (the row is ownerFromMove).
+   quiet: the caller writes its own line. */
+static void LostBookUid(unsigned int uid, bool hasPos, float x, float y, float z, unsigned int moveKey = 0, bool quiet = false)
 {
     unsigned int key = 0;
     if (uid == 0) return;
     if (LostCopyHereNow(uid)) return;   /* the uid table holds a live copy (one made this frame too): nothing is lost */
-    const bool known = UidOwnerPeer(uid, &key);
+    bool known = UidOwnerPeer(uid, &key);
+    const bool fromMove = !known && moveKey != 0;
+    if (fromMove) { known = true; key = moveKey; }
     const bool refused = g_lostRefused.count(uid) != 0;
     if (!lostcopy::LostNoteAllowed(IsUidMine(uid) ? 1 : 0, known ? 1 : 0, refused ? 1 : 0))
     {
@@ -3956,10 +4115,10 @@ static void LostBookUid(unsigned int uid, bool hasPos, float x, float y, float z
     }
     const int at = lostcopy::LostFind(g_lost, uid);
     const bool wasHere = at >= 0 && g_lost.rows[(size_t)at].state == lostcopy::kLcHere;
-    if (lostcopy::LostNote(&g_lost, uid, key, hasPos ? 1 : 0, x, y, z) == 1 || wasHere)
+    if (lostcopy::LostNote(&g_lost, uid, key, hasPos ? 1 : 0, x, y, z, fromMove ? 1 : 0) == 1 || wasHere)
     {
         ++g_lcNoted;
-        if (LostLineDue(uid))
+        if (!quiet && LostLineDue(uid))
             DebugLog("[net] lost copy uid=" + N(uid) + " of player key " + N(key) + (wasHere ? " LOST AGAIN in the same visit" : " booked")
                      + ": no copy here while its owner runs it" + std::string(hasPos ? "" : " (no spot known yet)") + " (lostCopy noted " + N(g_lcNoted) + ")");
     }
@@ -4019,7 +4178,8 @@ int CharStreamSlotFor(int askerSlot)
 bool LostCopyAsked(unsigned int uid)
 {
     const int i = lostcopy::LostFind(g_lost, uid);
-    return i >= 0 && (g_lost.rows[(size_t)i].state == lostcopy::kLcAsked || g_lost.rows[(size_t)i].state == lostcopy::kLcAnswered);
+    return i >= 0 && (g_lost.rows[(size_t)i].state == lostcopy::kLcAsked || g_lost.rows[(size_t)i].state == lostcopy::kLcAnswered
+                      || g_lost.rows[(size_t)i].state == lostcopy::kLcBackoff);   /* BACKOFF: a HELD answer's settle re-send answers this ask */
 }
 void LostCopyForget(unsigned int uid, const char* why)
 {
@@ -4028,10 +4188,14 @@ void LostCopyForget(unsigned int uid, const char* why)
     LostRowErase((size_t)i); ++g_lcForgot;
     LostGoneLine(uid, (std::string("forgotten - ") + (why ? why : "?")).c_str());
 }
+/* THE MOVE HOLDS belong to one session and one world: a hold left over would book a character of a world this game has left.
+   Emptied with the lost-copy book, at both of that book's clears (the session reset and the world teardown). */
+static void MoveHoldForgetAll() { g_moveHold.rows.clear(); }
 void LostCopyForgetAll()
 {
     g_lcForgot += (long long)g_lost.rows.size();
     g_lost.rows.clear(); g_lostRefused.clear(); g_lostRefusedOrder.clear(); g_lostUidLines.clear();
+    MoveHoldForgetAll();
 }
 void LostCopyTick()
 {
@@ -4040,7 +4204,77 @@ void LostCopyTick()
     const long long sec = (long long)CuNowSec();
     if (sec == s_lastSec) return;
     s_lastSec = sec;
-    for (size_t i = 0; i < g_lost.rows.size(); ) { if (!LostLook(i)) ++i; }
+    for (size_t i = 0; i < g_lost.rows.size(); ) { if (!LostLook(i, true)) ++i; }
+}
+/* A SPAWN THIS GAME'S ENGINE WOULD NOT KEEP (OnSpawn, after the owner record is written). The spot is read live as a lost-copy look
+   reads it - the engine's zone byte and its own edge rule (LostEngineKeepsHere), in a running world with engine writes allowed - and
+   lostcopy::SpawnKeepDecide answers: a copy that engine would put away 4 s later is not made; the uid is booked at the SPAWN's spot
+   (quietly: this line is the record) and its owner asked for it when the spot is kept here (LostLook). Answers true when the copy is
+   not made. A uid this game's table refuses for good, a uid this game runs, a copy already here, a body of this game's own world the
+   creation core adopts as the copy (coop::SpawnTwinHeld), or no live read: false - the SPAWN
+   goes on as before. MAIN THREAD (the drain). */
+bool LostCopySpawnNotKept(unsigned int uid, float x, float y, float z)
+{
+    if (uid == 0 || g_lostRefused.count(uid) != 0) return false;   /* refused for good: the creation core refuses it again as before */
+    const bool worldUp = coop::GameplayRunning() && !coop::EngineWritesBlocked();
+    const int zone = worldUp ? coop::ZoneBuildingsInHereTri(x, y, z) : -1;
+    const int keeps = zone == 1 ? LostEngineKeepsHere(x, z) : -1;
+    const int spot = lostcopy::LostSpawnSpotRead(worldUp ? 1 : 0, zone, keeps);
+    if (lostcopy::SpawnKeepDecide(IsUidMine(uid) ? 1 : 0, LostCopyHereNow(uid) ? 1 : 0, spot, coop::SpawnTwinHeld(uid) ? 1 : 0) != lostcopy::kSkBook) return false;
+    ++g_lcSpawnNotKept;
+    if (LostLineDue(uid))
+        DebugLog("[net] SPAWN uid=" + N(uid) + " not made here: its spot " + N((long long)x) + "," + N((long long)z) + " is not kept by this game's engine ("
+                 + std::string(zone == 0 ? "its area is not loaded here" : "within the edge strip of an area side this game has not loaded")
+                 + ") - booked; asked when the spot is kept (lostCopy spawnNotKept " + N(g_lcSpawnNotKept) + ")");
+    LostBookUid(uid, true, x, y, z, 0, true);
+    return true;
+}
+/* THE EXPIRED MOVE HOLDS (SessionCatchupApplyTick, after the drain; MAIN THREAD). A relayed MOVE held for a uid with no owner record whose
+   hold ran out with the uid still unknown here means its owner streams a character this game was never sent (its SPAWN reached only
+   the games whose area held its square then). The uid is booked in the lost-copy book under the held MOVEs' sender, at the latest
+   held MOVE's spot (cooplive::MoveHoldGoneDecide: never a uid this game runs or one whose owner record arrived meanwhile), and the
+   book's own look asks that game for it when the spot is kept here - the one road that asks. One line per uid newly booked, the first
+   20 and every 50th (cooplive::MoveHoldExpiredLogThis). */
+void LostCopyHoldBook(const std::vector<cooplive::MoveHoldGone>& gone)
+{
+    for (size_t i = 0; i < gone.size(); ++i)
+    {
+        const cooplive::MoveHoldGone& g = gone[i];
+        if (cooplive::MoveHoldGoneDecide(g_localOwned.find(g.uid) != g_localOwned.end(), g_owner.find(g.uid) != g_owner.end(), g.sender) != cooplive::kMoveHoldGoneBook)
+        { ++g_moveHeldBookSkipped; continue; }
+        const bool before = lostcopy::LostFind(g_lost, g.uid) >= 0;
+        LostBookUid(g.uid, g.hasPos != 0, g.x, g.y, g.z, g.sender, true);
+        if (lostcopy::LostFind(g_lost, g.uid) < 0) { ++g_moveHeldBookSkipped; continue; }   /* refused here for good, or a copy is here */
+        if (before) continue;   /* booked already: its spot is refreshed */
+        ++g_moveHeldBooked;
+        if (cooplive::MoveHoldExpiredLogThis(++g_moveHoldBookLines))
+            DebugLog("[net] MOVE hold expired uid=" + N(g.uid) + " (player key " + N(g.sender) + "): its owner streams it but never sent it here - booked in the lost-copy book at its spot "
+                     + (g.hasPos ? N((long long)g.x) + "," + N((long long)g.z) : std::string("(none known yet)"))
+                     + "; asked when the spot is kept here (moveHold booked " + N(g_moveHeldBooked) + "; the first 20 and every 50th are logged)");
+    }
+}
+/* A held MOVE of a uid booked from its earlier held MOVEs, from the same sender: the booked spot follows the owner's stream, so the
+   book asks as soon as the character stands where this game's engine keeps it. A non-finite position is not taken. MAIN THREAD. */
+void LostCopyHeldMove(unsigned int uid, unsigned int senderKey, float x, float y, float z)
+{
+    if (g_lost.rows.empty()) return;
+    if (!cooplive::MoveHoldFinite(x) || !cooplive::MoveHoldFinite(y) || !cooplive::MoveHoldFinite(z)) return;
+    const int i = lostcopy::LostFind(g_lost, uid);
+    if (i < 0 || !g_lost.rows[(size_t)i].ownerFromMove || g_lost.rows[(size_t)i].ownerKey != senderKey) return;
+    LostBookUid(uid, true, x, y, z, senderKey, true);
+}
+/* An UNLOAD / DESPAWN for a uid with no owner record, from the game whose held MOVEs booked it: that game no longer runs it here -
+   the row is forgotten (nothing to ask for). Answers true when a row went. MAIN THREAD. */
+bool LostCopyHoldWithdrawn(unsigned int uid, unsigned int senderKey, const char* why)
+{
+    const int i = lostcopy::LostFind(g_lost, uid);
+    if (i < 0 || !g_lost.rows[(size_t)i].ownerFromMove || g_lost.rows[(size_t)i].ownerKey != senderKey) return false;
+    LostCopyForget(uid, why);
+    return true;
+}
+void MoveHoldWithdrawn(unsigned int uid, unsigned int senderKey)
+{
+    if (uid != 0) cooplive::MoveHoldWithdraw(&g_moveHold, uid, senderKey);
 }
 /* THE RETURN CHECK (src/common/lostcopy.h ReturnLookDecide). MAIN THREAD, after the drain (SessionCatchupApplyTick). */
 static std::vector<lostcopy::ReturnRow> g_rtBook;
@@ -4200,7 +4434,8 @@ void ReturnCheckTick()
                   " (returnCheck gaveUp " + N(g_rtGaveUp) + ")");
             continue;
         }
-        /* kRtaWithdraw: the owner runs it but has not announced it to this game - its withdrawal went while this game was away */
+        /* kRtaWithdraw: NOT ANNOUNCED - the owner runs it but has not announced it to this game (its withdrawal went while this game was
+           away) */
         coop::SquadIdxOwnerWithdrew(r.uid, 1);   /* its recorded owner runs it nowhere here - out of the squad index, as the roster's withdrawal does */
         coop::ApplyRemoteUnload(r.uid); g_owner.erase(r.uid); g_copyGen.erase(r.uid); g_roLastStreamAt.erase(r.uid); g_roConflictCount.erase(r.uid);
         ++g_rtWithdrawn;
@@ -4265,9 +4500,10 @@ static std::string ReturnCheckCountsString()
 }
 std::string LostCopyCountsString()
 {
-    return " lostCopy[noted,asks,askFailed,answers,refused,back,dropped,full,open,refusedSkip,answerForeign,forgot]=" + N(g_lcNoted) + "," + N(g_lcAsks) + ","
+    return " lostCopy[noted,asks,askFailed,answers,refused,back,dropped,full,open,refusedSkip,answerForeign,forgot,edgeWait,notInArea,spawnNotKept]=" + N(g_lcNoted) + "," + N(g_lcAsks) + ","
         + N(g_lcAskFailed) + "," + N(g_lcAnswers) + "," + N(g_lcRefused) + "," + N(g_lcBack) + "," + N(g_lcDropped) + "," + N(g_lost.full) + ","
-        + N((long long)g_lost.rows.size()) + "," + N(g_lcRefusedSkip) + "," + N(g_lcAnswerForeign) + "," + N(g_lcForgot)
+        + N((long long)g_lost.rows.size()) + "," + N(g_lcRefusedSkip) + "," + N(g_lcAnswerForeign) + "," + N(g_lcForgot) + "," + N(g_lcEdgeWait)
+        + "," + N(g_lcNotInArea) + "," + N(g_lcSpawnNotKept)
         + " resendIn[asks,answered,answerFailed,noRoad,malformed]=" + N(g_rsInAsks) + "," + N(g_rsInAnswered) + "," + N(g_rsInAnswerFailed) + ","
         + N(g_rsInNoRoad) + "," + N(g_rsInMalformed) + ReturnCheckCountsString();
 }
@@ -4301,6 +4537,7 @@ void OnResend(const Message& m)
             }
             ++g_lcAnswers;
             if (verdicts[i] != lostcopy::kRvSent) ++g_lcRefused;
+            if (verdicts[i] == lostcopy::kRvNotInArea) ++g_lcNotInArea;
             if (at >= 0) lostcopy::LostAnswerApply(&g_lost.rows[(size_t)at], verdicts[i]);
             if (LostLineDue(uids[i]))
                 DebugLog("[net] <- RESEND answer uid=" + N(uids[i]) + " from player key " + N(m.peer) + ": " + std::string(lostcopy::ResendVerdictName(verdicts[i]))
@@ -4558,13 +4795,15 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
         size_t bagEnd = 0;
         const int bw = coopbag::DecodeBagRows(&m.payload[0], m.payload.size(), at, &r.bag, &bagEnd);
         if (bw == coopbag::kBagBadOwner) coop::ItemOwnerNoteBadRecv();   /* inv6 phase 2 */
+        if (bw == coopbag::kBagBadGear) coop::ItemGearNoteBadRecv();   /* the backpack rows' gear tail (ITEM_REQUEST) */
+        if (bw == coopbag::kBagBadNest) coop::ItemBagNestNoteBadRecv();   /* the backpack rows' pack-inside-pack tail (ITEM_REQUEST) */
         if (bw != coopbag::kBagOk)
         { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a backpack block that is " + std::string(coopbag::BagDecodeWhy(bw)) + " - REFUSED"); return; }
         if (r.dir == 0 && !r.bag.empty()) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no backpack rows - REFUSED"); return; }
         at = bagEnd;
     }
     /* inv6 (protocol 71): the optional OWN1 block, LAST. Anything else left over, or a cut block, REFUSES the message. */
-    if (at < m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at))
+    if (at < m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at) && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at))   /* a GEM1 block straight after the rows: a request with no owner block */
     {
         size_t oe = 0;
         const int ow = coopmark::DecodeOwner(&m.payload[0], m.payload.size(), at, &r.owner, &oe);
@@ -4572,7 +4811,18 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
         { coop::ItemOwnerNoteBadRecv(); ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with trailing bytes that are not a whole owner block (" + std::string(coopmark::OwnerDecodeWhy(ow)) + ") - REFUSED"); return; }
         if (r.dir == 0) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no owner block - REFUSED"); return; }
         at = oe;
-        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its owner block - REFUSED"); return; }
+        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at) && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its owner block - REFUSED"); return; }
+    }
+    /* the optional GEM1 block after the owner block (gearwire.h): a GIVE's uniform and crafter. Cut or not valid: REFUSED. */
+    if (at < m.payload.size() && gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at))
+    {
+        size_t ge = 0;
+        const int gw = gearwire::DecodeGear(&m.payload[0], m.payload.size(), at, &r.gear, &ge);
+        if (gw != gearwire::kGearOk)
+        { coop::ItemGearNoteBadRecv(); ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a gear block that is " + std::string(gearwire::GearDecodeWhy(gw)) + " - REFUSED"); return; }
+        if (r.dir == 0) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no gear block - REFUSED"); return; }
+        at = ge;
+        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its gear block - REFUSED"); return; }
     }
     /* bag23 part 2 (protocol 81): the optional BAGP block, LAST - the owner half is inside a pack. Anything else, cut or out of range:
        REFUSED (a request is never applied to a guessed inventory). */
@@ -4693,6 +4943,8 @@ static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand
         size_t bagEnd = 0;
         const int bw = coopbag::DecodeBagRows(&m.payload[0], m.payload.size(), at, &c.bag, &bagEnd);
         if (bw == coopbag::kBagBadOwner) coop::ItemOwnerNoteBadRecv();   /* inv6 phase 2 */
+        if (bw == coopbag::kBagBadGear) coop::ItemGearNoteBadRecv();   /* the backpack rows' gear tail (ITEM_CONFIRM) */
+        if (bw == coopbag::kBagBadNest) coop::ItemBagNestNoteBadRecv();   /* the backpack rows' pack-inside-pack tail (ITEM_CONFIRM) */
         if (bw != coopbag::kBagOk)
         { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with a backpack block that is " + std::string(coopbag::BagDecodeWhy(bw)) + " - REFUSED"); return; }
         if (c.ok == 0 && !c.bag.empty()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no backpack rows - REFUSED"); return; }
@@ -4700,7 +4952,7 @@ static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand
     }
     /* inv6 (protocol 71): the optional OWN1 block, LAST, ok 1 only. Anything else left over, or a cut block, REFUSES the message
        (the owner's ten-second timeout then rolls its kept item back). */
-    if (at < m.payload.size())
+    if (at < m.payload.size() && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at))   /* a GEM1 block straight after the rows: an answer with no owner block */
     {
         size_t oe = 0;
         const int ow = coopmark::DecodeOwner(&m.payload[0], m.payload.size(), at, &c.owner, &oe);
@@ -4708,7 +4960,22 @@ static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand
         { coop::ItemOwnerNoteBadRecv(); ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with trailing bytes that are not a whole owner block (" + std::string(coopmark::OwnerDecodeWhy(ow)) + ") - REFUSED"); return; }
         if (c.ok == 0) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no owner block - REFUSED"); return; }
         at = oe;
-        if (at != m.payload.size()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its owner block - REFUSED"); return; }
+        if (at != m.payload.size() && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its owner block - REFUSED"); return; }
+    }
+    /* the optional GEM1 block after the owner block, ok 1 only: the taken item's uniform and crafter. Cut or not valid: REFUSED. */
+    if (at < m.payload.size())
+    {
+        size_t ge = 0;
+        const int gw = gearwire::DecodeGear(&m.payload[0], m.payload.size(), at, &c.gear, &ge);
+        if (gw != gearwire::kGearOk)
+        {
+            if (gw == gearwire::kGearBad) coop::ItemGearNoteBadRecv();
+            ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with trailing bytes that are not a whole gear block (" + std::string(gearwire::GearDecodeWhy(gw)) + ") - REFUSED");
+            return;
+        }
+        if (c.ok == 0) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no gear block - REFUSED"); return; }
+        at = ge;
+        if (at != m.payload.size()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its gear block - REFUSED"); return; }
     }
     if (hdLand != 0) { c.landHas = 1; c.landWhere = hdLand->where; c.landX = hdLand->x; c.landY = hdLand->y; }   /* P105 build 2 */
     coop::ApplyItemConfirm(c, m.peer);   /* M7b slice 2: taken only from the game the request was asked of */
@@ -4900,7 +5167,7 @@ bool SessionJoin(const std::string& backendName, const std::string& address, uns
        not listening yet, and re-dialling it is the behaviour every run before E38 relied on. */
     if (g_transport != 0 && !g_isHost && g_joinAddr == address && g_joinPort == port && g_transport->State() == LINK_UP)
     {
-        DebugLog("[net] already JOINED to " + address + ":" + N(port) + " and the link is UP - nothing is torn down (E38: the config file joined at the title screen)");
+        DebugLog("[net] already JOINED to " + relaybridge::AddrForLog(address) + ":" + N(port) + " and the link is UP - nothing is torn down (E38: the config file joined at the title screen)");
         return true;
     }
 
@@ -4920,7 +5187,7 @@ bool SessionJoin(const std::string& backendName, const std::string& address, uns
     g_joinAddr = address; g_joinPort = port; g_hostBackend = id; g_hostPort = 0;   /* E38: what "already joined" means */
     SessionForgetRows(coop::StoreLiveReady(), "a new join");   /* the world-road rows stay while the world link is up */
     g_departedPending.clear();   /* M8 review F4: a previous session's captured marks are no one's in this one */
-    DebugLog(std::string("[net] session JOINING ") + address + ":" + N(port)
+    DebugLog(std::string("[net] session JOINING ") + relaybridge::AddrForLog(address) + ":" + N(port)
              + " on " + g_transport->BackendName());
     return true;
 }
@@ -5340,8 +5607,10 @@ bool SessionPollAndQueue()
         /* P3-b (review-p3 LOW): a speech line is a moment, not a state - one arriving during a load is dropped
            and counted, never queued to be shown late over a world that has moved on. */
         if (m.type == MSG_SAY && coop::EngineWritesBlocked()) { coop::SayNoteDroppedBlocked(); continue; }
-        /* crime3: a crime arriving during a load names a world that is being rebuilt - dropped and counted like SAY. */
-        if (m.type == MSG_CRIME && coop::EngineWritesBlocked()) { coop::CrimeNoteDroppedBlocked(); continue; }
+        /* crime3: a crime arriving during a load names a world that is being rebuilt - dropped and counted like SAY; a standing
+           event (kind 2) is the other player's act and is kept (relations.cpp holds it until a world runs) */
+        if (m.type == MSG_CRIME && coop::EngineWritesBlocked()
+            && (m.payload.empty() || !coopcrime::CrimeMsgKeptThroughLoad(&m.payload[0], m.payload.size()))) { coop::CrimeNoteDroppedBlocked(); continue; }
         if (m.type == MSG_BOUNTY && coop::EngineWritesBlocked()) { coop::BountyNoteDroppedBlocked(); continue; }   /* crime5 */
         if (m.type == MSG_CARRY_BREAK && coop::EngineWritesBlocked()) { coop::CarryBreakNoteDropped(); continue; }   /* arrest1 */
         /* A death request (PRISON kind DEATH) arriving during a load is dropped and counted: a kill made against the old world must
@@ -5408,7 +5677,7 @@ static void GameLinkRedialTick()
     if (!g_glSeriesOpen)
     {
         g_glSeriesOpen = 1; g_glAttempts = 0; g_glLastMs = now; ++g_glSeries;
-        DebugLog("[net] link1: the game link to " + g_joinAddr + ":" + N((long long)g_joinPort) + " is DOWN in a running world -"
+        DebugLog("[net] link1: the game link to " + relaybridge::AddrForLog(g_joinAddr) + ":" + N((long long)g_joinPort) + " is DOWN in a running world -"
                  " re-dialling it 2, 4, 8 and 16 s apart, then every 30 s, until it answers or this game leaves (series "
                  + N(g_glSeries) + "; attempts are counted on the [net] REPORT line as gameRedial[...], not logged one by one)");
         return;
@@ -5596,6 +5865,7 @@ void OnPeerGone(int goneSlot)
     coop::NameForgetPeer(goneSlot);   /* names1: names held for copies the gone peer never had built here (every one while its slot is unknown) */
     coop::SlaveForgetPeer(goneSlot);  /* slave1: slave states held for copies the gone peer never had built here */
     coop::HireForgetPeer(goneSlot);   /* recruit1: requests in flight to the gone peer and promises to it are dropped */
+    coop::ItParityForgetAsker(goneSlot);   /* the gone peer's sector asks no longer route fill pushes to it (every game's while its slot is unknown) */
 
     const int platoons = RetirePeerContextPlatoons(goneSlot);
 
@@ -5809,6 +6079,7 @@ void OnPlayerGone(unsigned int slot, const char* how, int standIn)
     coop::NameForgetPeer((int)slot);   /* names held for copies that player never had built here */
     coop::SlaveForgetPeer((int)slot);  /* slave states held for that player's copies */
     coop::HireForgetPeer((int)slot);   /* hire requests to that player cancelled, promises to it released, its undrained hire messages dropped */
+    coop::ItParityForgetAsker((int)slot);   /* that player's sector asks no longer route fill pushes to it */
     const int platoons = RetirePeerContextPlatoons((int)slot);   /* after its copies went: the platoons built here for its characters */
     for (size_t i = 0; i < uids.size(); ++i) { cleared += (long long)net::g_owner.erase(uids[i]); net::g_copyGen.erase(uids[i]); coop::net::RosterStreamForget(uids[i]); /* [a1b1-sp11] [F9] */ net::g_peerGoneAlreadyGone += (long long)net::g_departedPending.erase(uids[i]); }   /* M8 review F5: a captured row PLAYER_GONE removed first is counted peerGoneM8 alreadyGone HERE - its mark is spent, so the session road never sees it */
     ReplicateForgetUids(uids.empty() ? 0 : &uids[0], (int)uids.size());

@@ -15,6 +15,8 @@
 #include "../common/worlddir.h"   /* W2b: WorldFolderName / WorldOrDefault - a world switch is compared by folder name */
 #include "../common/joinstage.h"   /* WorldDoorPick: the world server a game dials */
 #include "../common/storelink.h"   /* TitleRedialDecide and the world-server link states (kSock*) */
+#include "../common/relaybridge.h"   /* AddrForLog (a Steam id is never logged) and a Steam dial's connect budget */
+#include "net/relay_bridge.h"        /* RelayRouteFor: the route the title dial takes */
 #include "../common/areaclaim.h"   /* B13: coopstore::PlayerIdOk and kPlayerIdLen - the notebook refuses a malformed id, so the shape rule is read from ONE place */
 #include "command_channel.h"   // PathNextToDll - the same directory the command channel already uses
 #include "net/session.h"
@@ -57,6 +59,10 @@ std::string g_lastAddr; unsigned short g_lastPort = 0;   /* PP3: player.cfg's ho
 bool g_cfgRootsLatched = false;             /* P8J-B2: set by the first ConfigLoad; the two above never change after */
 std::string g_playerId;                      /* B13: this install's stable name; empty until a settings file is read */
 int g_profileTest = 0;                       /* prof1 TEST ONLY: profile= */
+int g_relayTestMode = 0; unsigned short g_relayTestPort = 0; int g_relayLagMs = 0, g_relayLossPct = 0;   /* TEST ONLY: relaytest= / relaylag= / relayloss= */
+int g_relayTestCap = 0, g_relayTestDials = 0;   /* TEST ONLY: relaytest=many's cap and dials */
+int g_relayBridgeMode = 0; unsigned short g_relayBridgePort = 0, g_relayViaPort = 0; int g_relayCap = 0;   /* relaybridge= / relayvia= / relaycap= */
+int g_parityHoldSec = 0;                    /* T-734 TEST ONLY: parityholdsec= */
 std::string g_slotProfile;                   /* prof1 fold (review-prof1 4): the picked profile's save folder - a re-arm keeps it over the file's slot= */
 std::string g_slotFile;                      /* T-201 PP5: the settings' own slot= as last armed - what ConfigLeave puts back when the profile's folder goes */
 int g_ownSaveCfg = 1;                        /* mmo1: ownsave= (T-251: default on) */
@@ -180,7 +186,7 @@ std::string TestCfgPath() { return coop::PathNextToDll(swnames::kTestCfg); }   /
 std::string DataFile(const char* name) { return g_dataDir.empty() ? std::string() : g_dataDir + "\\" + name; }
 
 const char* RoleName(int r) { return r == coop::kRoleHost ? "host" : (r == coop::kRoleClient ? "client" : "single"); }
-std::string AddrText(const std::string& a, unsigned short p) { return a.empty() || p == 0 ? std::string("none") : a + ":" + N((long long)p); }
+std::string AddrText(const std::string& a, unsigned short p) { return a.empty() || p == 0 ? std::string("none") : relaybridge::AddrForLog(a) + ":" + N((long long)p); }   /* a Steam id is never logged */
 
 /* P8i (U1): Trim, Lower and SplitAddr WERE HERE.  They are now CfgTrim / CfgLower / CfgSplitAddr in
    src/common/cfgtext.cpp, with their rules unchanged, and this file calls them.  They moved because the
@@ -440,6 +446,17 @@ int            ConfigRouterPort() { return g_routerPortCfg; }
 int            ConfigModFingerprintSalt() { return g_modSalt; }
 int            ConfigJoinViaWorld() { return g_joinViaWorld; }   /* M11a S1 */
 int            ConfigProfileTest() { return g_profileTest; }
+int            ConfigRelayTestMode() { return g_relayTestMode; }
+unsigned short ConfigRelayTestPort() { return g_relayTestPort; }
+int            ConfigRelayLagMs()    { return g_relayLagMs; }
+int            ConfigRelayLossPct()  { return g_relayLossPct; }
+int            ConfigRelayTestCap()  { return g_relayTestCap; }
+int            ConfigRelayTestDials() { return g_relayTestDials; }
+int            ConfigRelayBridgeMode() { return g_relayBridgeMode; }
+unsigned short ConfigRelayBridgePort() { return g_relayBridgePort; }
+unsigned short ConfigRelayViaPort()    { return g_relayViaPort; }
+int            ConfigRelayCap()        { return g_relayCap; }
+int            ConfigParityHoldSec()   { return g_parityHoldSec; }
 void           ConfigSetSlotForProfile(const std::string& slot) { g_slot = slot; g_slotProfile = slot; }
 std::string    ConfigPlayerId()  { EnsurePlayerId("asked for before one existed"); return g_playerId; }
 
@@ -671,7 +688,7 @@ bool ConfigPanelPrefill(coopcfg::CfgFields* out)
 std::string ConfigLastJoinAddr()
 {
     if (g_lastAddr.empty() || g_lastPort == 0 || g_lastAddr == "0.0.0.0") return std::string();
-    return g_lastAddr + ":" + N((long long)g_lastPort);
+    return relaybridge::AddrPortForPlayer(g_lastAddr, g_lastPort);   /* a steam:<id> without the route's stand-in port */
 }
 bool ConfigWritePlayerName(const std::string& name, std::string* err)
 {
@@ -816,6 +833,36 @@ static int ConfigReadFileInto(std::string* whyOut)
         DebugLog(pb);
     }
     g_profileTest = fields.profileTest;
+    if (fields.relayTestMode != coopcfg::kRelayTestNone && (fields.relayTestMode != g_relayTestMode || fields.relayTestPort != g_relayTestPort
+                                                            || fields.relayTestCap != g_relayTestCap || fields.relayTestDials != g_relayTestDials))
+        DebugLog("[CFG] TEST ONLY: relaytest= asks for the Steam link's echo test ("
+                 + std::string(fields.relayTestMode == coopcfg::kRelayTestListen ? "listen" : fields.relayTestMode == coopcfg::kRelayTestDial ? "dial"
+                               : fields.relayTestMode == coopcfg::kRelayTestMany ? "many" : "pair")
+                 + (fields.relayTestPort != 0 ? " port " + N((long long)fields.relayTestPort) : std::string())
+                 + (fields.relayTestMode == coopcfg::kRelayTestMany ? ", listener cap " + N((long long)fields.relayTestCap) + ", "
+                    + N((long long)fields.relayTestDials) + " dials" : std::string())
+                 + ", fake lag " + N((long long)fields.relayLagMs)
+                 + " ms, loss " + N((long long)fields.relayLossPct) + " %) - it starts once Steam has been looked up; the first reading is the one it uses");
+    g_relayTestMode = fields.relayTestMode; g_relayTestPort = fields.relayTestPort;
+    g_relayTestCap = fields.relayTestCap; g_relayTestDials = fields.relayTestDials;
+    g_relayLagMs = fields.relayLagMs; g_relayLossPct = fields.relayLossPct;
+    if (fields.relayBridgeMode != g_relayBridgeMode || fields.relayBridgePort != g_relayBridgePort)
+        DebugLog(std::string("[CFG] relaybridge=")
+                 + (fields.relayBridgeMode == coopcfg::kRelayBridgeOff ? std::string("off - a hosting game opens no Steam bridge")
+                    : fields.relayBridgeMode == coopcfg::kRelayBridgeIp ? "ip:" + N((long long)fields.relayBridgePort) + " (TEST ONLY) - a hosting game's Steam bridge listens on 127.0.0.1:"
+                                                                          + N((long long)fields.relayBridgePort) + " over Steam's plain UDP instead of Steam P2P"
+                    : std::string("on - a hosting game bridges Steam joiners to its world server")));
+    if (fields.relayViaPort != g_relayViaPort && fields.relayViaPort != 0)
+        DebugLog("[CFG] TEST ONLY: relayvia=ip:" + N((long long)fields.relayViaPort) + " - every world-server dial of this game goes over Steam's plain UDP to 127.0.0.1:"
+                 + N((long long)fields.relayViaPort) + " (the one-PC stand-in for Valve's relay)");
+    if (fields.relayCap != g_relayCap && fields.relayCap != 0)
+        DebugLog("[CFG] TEST ONLY: relaycap=" + N((long long)fields.relayCap) + " - a hosting game's Steam bridge takes at most " + N((long long)fields.relayCap) + " joiner(s)");
+    g_relayBridgeMode = fields.relayBridgeMode; g_relayBridgePort = fields.relayBridgePort;
+    g_relayViaPort = fields.relayViaPort; g_relayCap = fields.relayCap;
+    if (fields.parityHoldSec != g_parityHoldSec && fields.parityHoldSec != 0)
+        DebugLog("[CFG] TEST ONLY: parityholdsec=" + N((long long)fields.parityHoldSec) + " - this game answers 'items cannot be made yet' for "
+                 + N((long long)fields.parityHoldSec) + " s from the first time it asks (the town-box hold test)");
+    g_parityHoldSec = fields.parityHoldSec;
     g_modSalt   = fields.modSalt;
     g_ownSaveCfg = fields.ownSave;   /* mmo1 */
     if (fields.routerPort != g_routerPortCfg)
@@ -861,7 +908,7 @@ bool ConfigWorldSwitchRefused(const std::string& fileWorld, const char* why, std
     if (coopworld::WorldFolderName(coopworld::WorldOrDefault(coopworld::WorldForRole(fileWorld, g_adoptedWorld), 0)) == indexWorld) return false;
     const std::string wanted = fileWorld.empty() ? std::string(coopworld::kDefaultWorld) : fileWorld;
     StoreNoteWorldSwitchRefused();
-    if (err) *err = "This game already opened world \"" + indexWorld + "\". Restart Kenshi to play world \"" + wanted + "\".";
+    if (err) *err = "This game already opened world \"" + indexWorld + "\". Another world needs a restart.";
     ErrorLog(std::string("[CFG] W2b re-arm by ") + (why ? why : "?") + " REFUSED: the settings name world '" + wanted
              + "' but this game already read world '" + indexWorld + "'s record index - a restart is needed to change world.");
     return true;
@@ -960,7 +1007,7 @@ void ConfigTitleTick()
     const DWORD now = ::GetTickCount();
     const int act = coopstore::TitleRedialDecide(role == kRoleClient ? 1 : 0, (!g_doorAddr.empty() && g_doorPort != 0) ? 1 : 0,
                                                  StoreLinkSockState(), g_dials, kDialCap, (unsigned int)(now - g_lastDialMs),
-                                                 (unsigned int)kTitleRedialPaceMs, (unsigned int)kTitleConnectBudgetMs);
+                                                 (unsigned int)kTitleRedialPaceMs, relaybridge::ConnectBudgetMs(net::RelayRouteFor(g_doorAddr), (unsigned int)kTitleConnectBudgetMs));   /* a Steam dial outlasts Steam's own first-connect timeout */
     if (act != coopstore::kTitleRedialAgain && act != coopstore::kTitleRedialLast) return;
     ++g_dials;
     if (act == coopstore::kTitleRedialLast)
@@ -1011,7 +1058,7 @@ void ConfigSetRole(int role, const char* why)
 // ------------------------------------------------------------------------------------------------
 std::string ConfigFilePath() { return DataFile(coopdata::kSessionCfg); }   /* PP3: session.cfg in the data folder */
 
-bool ConfigWrite(const coopcfg::CfgFields& fields, std::string* err)
+bool ConfigWrite(const coopcfg::CfgFields& fields, std::string* err, bool keepLastAddr)
 {
     const std::string finalPath = DataFile(coopdata::kSessionCfg);
     if (finalPath.empty())
@@ -1036,7 +1083,7 @@ bool ConfigWrite(const coopcfg::CfgFields& fields, std::string* err)
         bool change = false;
         if (!fields.playerName.empty() && fields.playerName != g_playerName && coopworld::DisplayNameOk(fields.playerName, 0))
         { g_playerName = fields.playerName; change = true; }
-        if (fields.hostPort != 0 && coopdata::LastAddrRecordable(fields.role, fields.hostAddr)   /* PP3b: a host's 0.0.0.0 is not an address */
+        if (!keepLastAddr && fields.hostPort != 0 && coopdata::LastAddrRecordable(fields.role, fields.hostAddr)   /* PP3b: a host's 0.0.0.0 is not an address; a friend's game keeps the typed one */
             && (fields.hostAddr != g_lastAddr || fields.hostPort != g_lastPort))
         { g_lastAddr = fields.hostAddr; g_lastPort = fields.hostPort; change = true; }
         std::string perr;

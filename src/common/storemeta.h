@@ -170,6 +170,31 @@ std::string MetaHomeMerge(const std::string& kept, const std::string& arriving);
 const size_t kMetaHomeCap = 47;
 std::string MetaHomeClean(const std::string& home);
 
+/* A COPY OF ANOTHER GAME'S GROUP AND ITS HOME BUILDING [t755-copyhome-decide]. A copy is given the building its sender named only when
+   that building resolves here, and it resolves only while it is loaded. CopyHomeOwe: kCopyHomeNone - no building was sent, or it
+   resolved (the copy was built with it); kCopyHomeOwe - sent and not resolved, and the copy is bound here under its world id: the home is
+   owed until that building is loaded; kCopyHomeUntracked - sent and not resolved, but the copy is bound under no world id, so whether a
+   later platoon at that address is still the same copy could not be told: counted, never listed. */
+const int kCopyHomeNone = 0, kCopyHomeOwe = 1, kCopyHomeUntracked = 2;
+int CopyHomeOwe(int buildingSent, int buildingResolved, int bound);
+/* An owed home at the store's once-a-second check (store.cpp CopyHomeOwedTick), one list entry at a time [t755-copyhome-walk].
+   CopyHomeBefore: kCopyHomeDrop - the squad is no longer the one listed (gone, or its address holds another group now); kCopyHomeDone - it
+   has a home already (nothing to give; it leaves the list); kCopyHomeWait - its building is not loaded here; kCopyHomeGive - give it now.
+   CopyHomeAfter, once the give was made and the squad's home read back: kCopyHomeDone - the home is set (it leaves the list);
+   kCopyHomeRetry - not set, counted in *tries, and it stays for the next check; kCopyHomeFailed - not set for the maxTries-th time (it
+   leaves the list, counted). */
+const int kCopyHomeWait = 0, kCopyHomeGive = 1, kCopyHomeDrop = 2, kCopyHomeDone = 3, kCopyHomeRetry = 4, kCopyHomeFailed = 5;
+const int kCopyHomeMaxTries = 5;
+int CopyHomeBefore(int stillBound, int hasHomeNow, int buildingLoaded);
+int CopyHomeAfter(int homeAfter, int* tries, int maxTries);
+/* A record swapped in at the engine's read (store.cpp LOAD-OVERRIDE), judged after that read by the squad's own home building:
+   kLoHomeKept - it has one (nothing to do); kLoHomeRestore - none, and the save's own squad had one before the read (it is given back);
+   kLoHomeOweByKey - none either way, but a home key is known for its world id (the last one known here, or the record's own): owed by that
+   key and given once that building is loaded here, so a world saved homeless gets its homes back when a key survived in the records;
+   kLoHomeNoneAnywhere - no home known anywhere. */
+const int kLoHomeKept = 1, kLoHomeRestore = 2, kLoHomeOweByKey = 3, kLoHomeNoneAnywhere = 4;
+int LoadOverrideHomeDecide(int homeAfterRead, int saveHadHome, int keyKnown);
+
 /* P8d. WHAT ONE FILE IS, IN THREE ANSWERS, AND THE ONLY THREE THERE ARE. Every reader in the notebook
    produces one of these and nothing else, so no caller can invent a fourth meaning by collapsing two.
    The last one is the trap this enum exists to remove: a file of ZERO BYTES is READABLE with a length of

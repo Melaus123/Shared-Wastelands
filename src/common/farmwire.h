@@ -25,6 +25,11 @@
  *     amount it was called with and amount x ITS g_dt summed (0 < work <= kFarmOpMax); the writer calls the engine's own
  *     operate with that amount, at most once per its own frame's worth of the work (FarmWorkSlice). The ore is made ONCE,
  *     into the building's own box, and reaches every game as an ordinary box move. Kinds 8 / 9 are the building road's.
+ *   kind u8 (11 MINE_STATE, writer -> every game) | u8 len + P7n key | i32 productionState | f32 progress
+ *     = a production building's state +0x468 (2 working, 1 blocked) and its bar *(+0x448) (the output step updateOutput
+ *     0x298470 adds to it and sets it back at an item). A game that does not write the building never runs its step, so the
+ *     bar moves there only through this: the writer sends them while a worker works the building on its game, and every
+ *     game another game writes it for writes them onto its copy (farm.cpp).
  *
  * Pure: no engine memory, no Windows; the offline suite hits the same bytes and the same decisions. C++03 (VS2010 v100).
  */
@@ -39,6 +44,7 @@ namespace coopfarm {
 const unsigned char kFarmState = 6;
 const unsigned char kFarmOp = 7;
 const unsigned char kMineOp = 10;
+const unsigned char kMineState = 11;
 const unsigned int  kFarmMaxKey = 63;
 const unsigned int  kFarmMaxPlants = 512;   /* a farm's plant count; a bigger message is refused, never truncated */
 const float         kFarmOpMax = 60.0f;     /* one FARM_OP's or MINE_OP's work (operate amount x g_dt; the non-writer sends every 0.5 s) */
@@ -77,6 +83,8 @@ inline bool FarmEncodable(const FarmMsg& m)
     if (m.key.empty() || m.key.size() > kFarmMaxKey) return false;
     if (m.kind == kFarmOp)
         return m.work == m.work && m.work > 0.0f && m.work <= kFarmOpMax && FarmFloatOk(m.skill, 1.0e4f) && m.skill >= kFarmSkillUnknown;
+    if (m.kind == kMineState)   /* the state is one the game writes (0, 1 or 2); the bar as a FARM's is checked (finite, below kFarmAgeLimit), never below 0 */
+        return m.prodState >= 0 && m.prodState <= 2 && FarmFloatOk(m.progress, kFarmAgeLimit) && m.progress >= 0.0f;
     if (m.kind == kMineOp)
         return m.work == m.work && m.work > 0.0f && m.work <= kFarmOpMax && m.amount == m.amount && m.amount > 0.0f && m.amount <= kMineAmountMax;
     if (m.kind != kFarmState) return false;
@@ -103,6 +111,7 @@ inline bool EncodeFarm(std::vector<char>* b, const FarmMsg& m)
     b->insert(b->end(), m.key.begin(), m.key.end());
     if (m.kind == kFarmOp) { FarmPutI(b, (int)m.uid); FarmPutF(b, m.skill); FarmPutF(b, m.work); return true; }
     if (m.kind == kMineOp) { FarmPutI(b, (int)m.uid); FarmPutF(b, m.amount); FarmPutF(b, m.work); return true; }
+    if (m.kind == kMineState) { FarmPutI(b, m.prodState); FarmPutF(b, m.progress); return true; }
     FarmPutF(b, m.grown); FarmPutF(b, m.died); FarmPutF(b, m.cleared); FarmPutF(b, m.growStart);
     FarmPutI(b, m.harvested); FarmPutI(b, m.prodState);
     b->push_back((char)m.hasProgress);
@@ -116,12 +125,12 @@ inline bool EncodeFarm(std::vector<char>* b, const FarmMsg& m)
     return true;
 }
 
-/* 1 when the first byte names a kind this file decodes (FARM, FARM_OP, MINE_OP) - the session's peek before DecodeBuild. */
+/* 1 when the first byte names a kind this file decodes (FARM, FARM_OP, MINE_OP, MINE_STATE) - the session's peek before DecodeBuild. */
 inline int IsFarmKind(const char* p, size_t size)
 {
     if (p == 0 || size < 1) return 0;
     const unsigned char k = (unsigned char)p[0];
-    return (k == kFarmState || k == kFarmOp || k == kMineOp) ? 1 : 0;
+    return (k == kFarmState || k == kFarmOp || k == kMineOp || k == kMineState) ? 1 : 0;
 }
 
 inline int DecodeFarm(const char* p, size_t size, FarmMsg* out)
@@ -129,7 +138,7 @@ inline int DecodeFarm(const char* p, size_t size, FarmMsg* out)
     if (p == 0 || size < 2) return kFarmDecodeTooShort;
     FarmMsg m;
     m.kind = (unsigned char)p[0];
-    if (m.kind != kFarmState && m.kind != kFarmOp && m.kind != kMineOp) return kFarmDecodeBadKind;
+    if (m.kind != kFarmState && m.kind != kFarmOp && m.kind != kMineOp && m.kind != kMineState) return kFarmDecodeBadKind;
     const unsigned int kl = (unsigned char)p[1];
     size_t off = 2;
     if (kl == 0 || kl > kFarmMaxKey) return kFarmDecodeBadKey;
@@ -147,6 +156,14 @@ inline int DecodeFarm(const char* p, size_t size, FarmMsg* out)
     {
         if (size - off != 12) return (size - off < 12) ? kFarmDecodeTooShort : kFarmDecodeBadValue;
         std::memcpy(&m.uid, p + off, 4); std::memcpy(&m.amount, p + off + 4, 4); std::memcpy(&m.work, p + off + 8, 4);
+        if (!FarmEncodable(m)) return kFarmDecodeBadValue;
+        if (out) *out = m;
+        return kFarmDecodeOk;
+    }
+    if (m.kind == kMineState)
+    {
+        if (size - off != 8) return (size - off < 8) ? kFarmDecodeTooShort : kFarmDecodeBadValue;
+        std::memcpy(&m.prodState, p + off, 4); std::memcpy(&m.progress, p + off + 4, 4);
         if (!FarmEncodable(m)) return kFarmDecodeBadValue;
         if (out) *out = m;
         return kFarmDecodeOk;
@@ -272,6 +289,29 @@ inline int MineOpAccept(int writer)
 /* Kept work whose writer has stayed unnamed `undecidedMs` is dropped (0 = not waiting). */
 const unsigned int kMinePendMs = 60000;
 inline int MineHoldExpired(unsigned int undecidedMs) { return (undecidedMs > kMinePendMs) ? 1 : 0; }
+
+/* MINE_STATE ON THE WRITER: whether a node's bar and state go out now. msSinceWorked = since a worker's step last ran on it
+   here; everSent / msSinceSent / lastProgress / lastState = its last send; finalSent = the send that closed its last spell of
+   work. Sent while it was worked in the last kMineStateWorkedMs, at most once per kMineStateGapMs, on a move of kFarmBarStep or
+   a state change (the first one at once); once the work stops, one last send with what it holds then. */
+const unsigned int kMineStateWorkedMs = 5000, kMineStateGapMs = 1000;
+const int kMineStateNone = 0, kMineStateSend = 1, kMineStateFinal = 2;
+inline int MineStatePublishDue(unsigned int msSinceWorked, int everSent, unsigned int msSinceSent, float lastProgress, int lastState,
+                               float progress, int state, int finalSent)
+{
+    if (everSent != 0 && msSinceSent < kMineStateGapMs) return kMineStateNone;
+    if (msSinceWorked > kMineStateWorkedMs) return (everSent != 0 && finalSent == 0) ? kMineStateFinal : kMineStateNone;
+    if (everSent == 0) return kMineStateSend;
+    if (state != lastState || FarmAbs(progress - lastProgress) >= kFarmBarStep) return kMineStateSend;
+    return kMineStateNone;
+}
+
+/* MINE_STATE ON A RECEIVER: written onto this game's copy only while this game's own answer is "another game writes it"
+   (writerHere = ProdStepWriterHere). This game writing it, or no writer named, keeps its own bar. 1 apply, 0 refuse. */
+inline int MineStateAccept(int writerHere) { return (writerHere == kProdWriterOther) ? 1 : 0; }
+
+/* A [MINE] line of a counted kind is written for the first 5 of that kind, then every 100th (n = the count with this one). */
+inline int MineSayDue(long long n) { return (n >= 1 && (n <= 5 || n % 100 == 0)) ? 1 : 0; }
 
 /* par16 fold #3. A plant whose age is below kFarmHiddenAge is drawn by nobody (updatePlantInstance 0xDF320 returns at once),
    so its parts' scale must be zeroed the way destroyAPlant 0xE47C0 does or the ripe plant stays on screen. */

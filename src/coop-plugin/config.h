@@ -66,6 +66,17 @@ std::string    ConfigWorldKey();    // MAIN THREAD - the shared world's name; ev
    never changed after (the folders are named from them once). "" = the key is absent = today's folder. */
 std::string    ConfigSaveRoot();
 int            ConfigProfileTest();          /* prof1 TEST ONLY: shared_wastelands.cfg profile=<n>, 0 = absent */
+int            ConfigRelayTestMode();        /* TEST ONLY: relaytest= - coopcfg::kRelayTest*, 0 = absent = the Steam link's echo test does not run */
+unsigned short ConfigRelayTestPort();        /* TEST ONLY: relaytest='s port (listen / dial), 0 for pair */
+int            ConfigRelayLagMs();           /* TEST ONLY: relaylag= (ms, 0-1000), 0 = absent */
+int            ConfigRelayLossPct();         /* TEST ONLY: relayloss= (percent, 0-50), 0 = absent */
+int            ConfigRelayTestCap();         /* TEST ONLY: relaytest=many's listener cap (1-32), 0 otherwise */
+int            ConfigRelayTestDials();       /* TEST ONLY: relaytest=many's dials (1-36), 0 otherwise */
+int            ConfigRelayBridgeMode();      /* relaybridge= - coopcfg::kRelayBridge*; absent = on (net/relay_bridge.cpp) */
+unsigned short ConfigRelayBridgePort();      /* TEST ONLY: relaybridge=ip:<port>'s port, 0 otherwise */
+unsigned short ConfigRelayViaPort();         /* TEST ONLY: relayvia=ip:<port>'s port - every world-server dial over Steam's plain UDP to 127.0.0.1:<port>; 0 = absent */
+int            ConfigRelayCap();             /* TEST ONLY: relaycap= (1-32), 0 = absent = the bridge's full cap */
+int            ConfigParityHoldSec();        /* T-734 TEST ONLY: parityholdsec= (0-600 s) - ItCanMakeItems answers 0 that long from its first ask; 0 = absent = off */
 void           ConfigSetSlotForProfile(const std::string& slot);   /* prof1: the picked profile's save folder, IN MEMORY ONLY (never written to shared_wastelands.cfg). MAIN THREAD */
 int            ConfigModFingerprintSalt();   /* settings5 S5 TEST ONLY: 1 = shared_wastelands.cfg says modfingerprint_salt=1 */
 std::string    ConfigStoreDir();
@@ -129,7 +140,7 @@ long long   ConfigWorldAdoptedEarly();  // adoptions made from the host's sessio
 // the damage class the notebook's own S1 ladder is repairing.
 //
 // Returns false and fills `err` (may be null) with a sentence a player can read.
-bool ConfigWrite(const coopcfg::CfgFields& fields, std::string* err);
+bool ConfigWrite(const coopcfg::CfgFields& fields, std::string* err, bool keepLastAddr = false);   // keepLastAddr: player.cfg's last address is left as it is (a friend's game)
 
 // PP3: where that file is now - `<data folder>\session.cfg` ("" = no data folder).  MAIN THREAD.
 std::string ConfigFilePath();

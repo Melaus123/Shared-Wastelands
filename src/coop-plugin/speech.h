@@ -107,4 +107,21 @@ int HireCallDoActions(void* dlg, void* line);
 int HireForTalk(unsigned int npcUid, unsigned int hirerUid, int price, int joinType, std::string* why);
 std::string TalkPromptArm(const std::string& arg);
 
+/* T-737 - the talk cursor of an NPC another game drives (speech.cpp 'TALK CURSOR'). TalkCursorInstall: its two hooks (InstallSpeech).
+   TalkCursorHoverEnter / Leave: policy.cpp's characterSelected and showContextMenu detours mark this thread as inside them for `who`
+   (kind: a hover, a click - the click byte set - or the order menu's build) and put the previous mark back on every exit (ANY THREAD);
+   TalkCursorFaultReset clears the marks and the speaker capture after a fault caught around an engine call (the scopes' destructors
+   do not run then). TalkCursorCopyReady: a copy was made here (net/session.cpp OnSpawn) - one preload
+   ASK; TalkCursorForgetNpc: its copy was removed (OnDespawn) - its answers go. TalkCursorShow: the TEST-ONLY read-only lever
+   `talkcursor show <npcUid>` (command_channel.cpp). MAIN THREAD unless said. */
+void TalkCursorInstall();
+const int kTalkScopeHover = 0, kTalkScopeClick = 1, kTalkScopeMenu = 2;
+void TalkCursorHoverEnter(void* who, int kind, unsigned long* prevTid, void** prevWho, int* prevKind);
+void TalkCursorHoverLeave(unsigned long prevTid, void* prevWho, int prevKind);
+void TalkCursorFaultReset();
+void TalkCursorCopyReady(unsigned int uid);
+void TalkCursorForgetNpc(unsigned int uid);
+std::string TalkCursorShow(const std::string& arg);
+std::string TalkCursorHover(const std::string& arg);   /* the TEST-ONLY lever `talkcursor hover <npcUid>` - one engine hover, then the show line */
+
 } // namespace coop

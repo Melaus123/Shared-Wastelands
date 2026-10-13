@@ -54,8 +54,10 @@ enum { kShrinkNone = 0, kShrinkNoBackup = 1, kShrinkRefuse = 2, kShrinkAccepted 
 struct ShrinkReport
 {
     int lost, moved, backupRows, currentRows;
+    int aliased;             /* backup rows left out of the check: ids aliases.txt maps to another id that hold nothing (ShrinkBackupLessAliased) */
+    int aliasedHeld;         /* backup rows of such ids gone from slots.txt that still hold something: kept in the check */
     std::string firstLost;   /* the first id lost or moved, for the message */
-    ShrinkReport() : lost(0), moved(0), backupRows(0), currentRows(0) {}
+    ShrinkReport() : lost(0), moved(0), backupRows(0), currentRows(0), aliased(0), aliasedHeld(0) {}
 };
 
 /* backupThere: slots.txt.1 could be read. A slots.txt that could not be read is passed as empty: every player the backup
@@ -119,12 +121,14 @@ inline std::string Lower(const std::string& s)
 }
 
 /* Does this entry of a world folder travel with the world? rel is its path below the world folder ('/'-joined). Everything
-   does except the world lock, the logs, temp files, a manifest.txt at the top and the recycle folder (removed records). */
+   does except the world lock, the world's password key at the top (auth.txt: the host's game writes it anew each time it hosts, so
+   a copy would only carry the key away; access.txt, the host's list, travels), the logs, temp files, a manifest.txt at the top and
+   the recycle folder (removed records). */
 inline int ExportTakes(const std::string& rel, int isDir)
 {
     const std::string l = Lower(rel);
     if (isDir) return l == "recycle" ? 0 : 1;
-    if (l.find('/') == std::string::npos && (l == "server.lock" || l == kManifestFile)) return 0;
+    if (l.find('/') == std::string::npos && (l == "server.lock" || l == kManifestFile || l == "auth.txt")) return 0;
     if (EndsWith(l, ".log") || EndsWith(l, ".tmp")) return 0;
     return 1;
 }
@@ -349,6 +353,107 @@ inline int AliasArgParse(const std::string& arg, std::string* from, std::string*
     if (e == std::string::npos) return 0;
     *from = arg.substr(0, e); *to = arg.substr(e + 1);
     return coopstore::PlayerIdOk(*from) && coopstore::PlayerIdOk(*to);
+}
+
+/* --unalias id: id's alias goes, and every alias that pointed to id now points where id pointed (A -> B -> C without B is A -> C),
+   so a player aliased onto id still reaches the id the world knows them by. *repointed = the ids re-pointed. 0 = id had no alias
+   and nothing changed. */
+inline int AliasRemoveApply(std::map<std::string, Alias>* t, const std::string& id, std::vector<std::string>* repointed)
+{
+    std::map<std::string, Alias>::iterator at = t->find(id);
+    if (at == t->end()) return 0;
+    const std::string to = at->second.to;
+    t->erase(at);
+    for (std::map<std::string, Alias>::iterator it = t->begin(); it != t->end(); ++it)
+        if (it->second.to == id && it->first != to) { it->second.to = to; repointed->push_back(it->first); }
+    return 1;
+}
+
+/* --alias new=old: new's slots.txt rows are dropped only when new holds nothing in this world - no profiles.txt row (deleted ones
+   count) and no record written under any of its slot numbers, with every record's index line read (an unreadable one could be its).
+   A dropped row's number is free again: the lifetime limit counts the numbers slots.txt names. A kept row keeps its number, so no
+   number that a profile or a record names is handed to the next new player. */
+inline int AliasNewIdDropRows(int slotRows, int profileRows, long long records, long long recordsUnread)
+{
+    return slotRows > 0 && profileRows == 0 && records == 0 && recordsUnread == 0;
+}
+
+/* slots.txt's lines without the rows of person (any of its profile keys), and without every readable line LoadSlots does not use
+   (a later line naming an id or a number an earlier readable line names - SlotRowsParse's first-line rule), so dropping a row never
+   lets such a line take effect. Every other non-empty line, readable or not, is kept as it is. *dropped = person's rows left out;
+   *shadowed = the lines not in effect left out. */
+inline std::string SlotLinesWithoutPerson(const std::vector<std::string>& lines, const std::string& person, int* dropped, int* shadowed)
+{
+    std::string o;
+    std::map<std::string, int> ids; std::map<int, int> used;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        std::string id; int slot = -1; long long seen = 0;
+        if (coopstore::SlotsLineParse(lines[i], &id, &slot, &seen))
+        {
+            if (ids.count(id) || used.count(slot)) { ++*shadowed; continue; }
+            ids[id] = 1; used[slot] = 1;
+            if (coopprof::PersonOfKey(id) == person) { ++*dropped; continue; }
+        }
+        if (!lines[i].empty()) o += lines[i] + "\n";
+    }
+    return o;
+}
+
+/* A backup row that slots.txt no longer names, whose person aliases.txt maps to another id: a row --alias may have dropped. */
+inline int ShrinkRowAliasedGone(const std::string& id, const std::map<std::string, int>& current, const std::map<std::string, Alias>& t)
+{
+    const std::string person = coopprof::PersonOfKey(id);
+    return !current.count(id) && AliasResolve(t, person) != person;
+}
+
+/* The start-up shrink check leaves out a backup row that slots.txt no longer names when aliases.txt maps that row's person to another
+   id AND the row holds nothing: --alias drops an id's rows only when the id holds nothing, and a game saying HELLO as that id plays as
+   the other one. holds: for each such row, 1 = it holds something (a profiles.txt row naming its person, a record under its slot
+   number, or a profiles.txt line naming the person or a record index that cannot be read), 0 = nothing. A row missing from holds
+   counts as holding something, so the loss of a row that still holds a profile or records is refused like any other lost row and its
+   number is not handed to the next new player. *out = the backup less the rows left out; *held += the aliased rows gone from
+   slots.txt kept in the check; returns how many were left out. */
+inline int ShrinkBackupLessAliased(const std::map<std::string, int>& backup, const std::map<std::string, int>& current,
+                                   const std::map<std::string, Alias>& t, const std::map<std::string, int>& holds,
+                                   std::map<std::string, int>* out, int* held)
+{
+    int n = 0;
+    for (std::map<std::string, int>::const_iterator it = backup.begin(); it != backup.end(); ++it)
+    {
+        if (ShrinkRowAliasedGone(it->first, current, t))
+        {
+            const std::map<std::string, int>::const_iterator h = holds.find(it->first);
+            if (h != holds.end() && h->second == 0) { ++n; continue; }
+            ++*held;
+        }
+        (*out)[it->first] = it->second;
+    }
+    return n;
+}
+
+/* Where an exit-34 refusal's sentence is written (server-refused.txt): the import's "<world>.importing" folder, there whenever exit 34
+   is taken, or else the folder the world folder would be in - never the world folder, which must not be made. "" = no folder. */
+inline std::string WorldAsideRefusedDir(const std::string& worldDir, bool stagingIsDir)
+{
+    if (stagingIsDir) return worldDir + ".importing";
+    const size_t cut = worldDir.find_last_of("\\/");
+    return cut == std::string::npos ? std::string() : worldDir.substr(0, cut);
+}
+
+/* What a game does with the player id its WELCOME names (store protocol 91). own = this install's id; current = the id adopted
+   earlier in this stay ("" = none); worldInPlay = a world is in play now. The id in use is current, or own when nothing is
+   adopted. same: no id, or the id in use. bad: the id fails the player id check - the game keeps the id it has. held: a world is
+   in play and the WELCOME names another id - the id in play is kept until the title screen, so a save folder chosen under one id
+   never gets records under another. adopt: the game uses the id. */
+enum { kPersonSame = 0, kPersonAdopt = 1, kPersonHeld = 2, kPersonBad = 3 };
+inline int WelcomePersonDecide(const std::string& own, bool hasPerson, const std::string& person, bool idOk, const std::string& current, bool worldInPlay)
+{
+    const std::string& inUse = current.empty() ? own : current;
+    if (!hasPerson || person == inUse) return kPersonSame;
+    if (!idOk) return kPersonBad;
+    if (worldInPlay) return kPersonHeld;
+    return kPersonAdopt;
 }
 
 }   /* namespace worldkeep */

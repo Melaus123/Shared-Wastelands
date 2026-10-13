@@ -192,6 +192,32 @@ std::string MetaHomeClean(const std::string& home)
 {
     return (home.size() <= kMetaHomeCap && FieldIsClean(home)) ? home : std::string();
 }
+/* see storemeta.h [t755-copyhome-decide] */
+int CopyHomeOwe(int buildingSent, int buildingResolved, int bound)
+{
+    if (buildingSent == 0 || buildingResolved != 0) return kCopyHomeNone;
+    return bound != 0 ? kCopyHomeOwe : kCopyHomeUntracked;
+}
+/* see storemeta.h [t755-copyhome-walk] */
+int CopyHomeBefore(int stillBound, int hasHomeNow, int buildingLoaded)
+{
+    if (stillBound == 0) return kCopyHomeDrop;
+    if (hasHomeNow != 0) return kCopyHomeDone;
+    return buildingLoaded != 0 ? kCopyHomeGive : kCopyHomeWait;
+}
+int CopyHomeAfter(int homeAfter, int* tries, int maxTries)
+{
+    if (homeAfter != 0) return kCopyHomeDone;
+    const int t = (tries != 0 ? *tries : 0) + 1;
+    if (tries != 0) *tries = t;
+    return t >= maxTries ? kCopyHomeFailed : kCopyHomeRetry;
+}
+int LoadOverrideHomeDecide(int homeAfterRead, int saveHadHome, int keyKnown)
+{
+    if (homeAfterRead != 0) return kLoHomeKept;
+    if (saveHadHome != 0) return kLoHomeRestore;
+    return keyKnown != 0 ? kLoHomeOweByKey : kLoHomeNoneAnywhere;
+}
 
 bool MetaParse(const std::string& line, MetaLine* out)
 {

@@ -9,8 +9,8 @@
  *   createBuilding's floor / outsideFurniture; pos / rot are then in the HOST'S LOCAL frame)
  *   kind u8 (2 STATE, build1-c) | u8 len + P7n key | f32 progress | f32 needed | u8 complete (0/1)
  *   | u8 n (<= 16) | n x f32 delivered (ConstructionState mats[i]+0xC, in the engine's own material order)
- *   P15 (protocol 98): the STATE's complete byte carries bit 1 = DESTROYED (the owner's piece is a ruin, Building +0x1A1); any
- *   other bit is refused
+ *   P15 (protocol 98): the STATE's complete byte carries bit 1 = DESTROYED (the owner's piece is a ruin, Building +0x1A1); bit 2 =
+ *   BROKEN (Building +0x3B6, game-to-game protocol 156); any other bit is refused
  *   kind u8 (3 REMOVE, build1-d) | u8 len + P7n key | u8 reason (1 dismantled, 2 destroyed): the builder's piece is gone,
  *   and the other game removes its copy (zeroed delivered mats, then the engine's vt+0x248(FLT_MAX))
  *   kind u8 (4 ROSTER_REQUEST, build1-f fold, protocol 63) and nothing else: the sender's world runs and the link is up;
@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstring>
+#include <cstdlib>    /* strtod: the into lever's offset (BuildIntoOffsetParse) */
 #include <string>
 #include <map>        /* house2 fold: BuildOwedMergeRow */
 #include <set>        /* house2 fold 2: the keys erased while the owed file was unread */
@@ -54,6 +55,7 @@ const float         kBuildHelpMax = 1.0e6f;    /* help1: a HELP_WORK progress or
 const unsigned char kBuildReasonDismantled = 1;   /* build1-d REMOVE reasons */
 const unsigned char kBuildReasonDestroyed = 2;
 const unsigned char kBuildStateDestroyedBit = 2;   /* P15 (protocol 98): a STATE's complete byte, bit 1 = destroyed */
+const unsigned char kBuildStateBrokenBit = 4;      /* a STATE's complete byte, bit 2 = broken (+0x3B6) */
 const unsigned char kBuildHostPlain = 0;        /* build1-e: furnitureOf = *(host+0x1F0)+0x30 (the host's interior layout) */
 const unsigned char kBuildHostSub = 1;          /* build1-e: that layout's vt+0x40 (the commit's other branch, 4d6810:176) */
 const unsigned char kBuildHostIndoorsOnly = 2;  /* build1-e: no furnitureOf, isIndoorsOf = host only */
@@ -95,6 +97,7 @@ struct BuildMsg
     float rot[4];
     unsigned char complete;
     unsigned char destroyed;        /* P15 (protocol 98) STATE: 1 = the owner's piece is a ruin (+0x1A1) - the complete byte's bit 1 */
+    unsigned char broken;           /* STATE: 1 = the owner's piece is broken (+0x3B6) - the complete byte's bit 2 */
     float progress, needed;
     unsigned char nMats;            /* build1-c STATE: how many of mats[] are carried */
     unsigned char reason;           /* build1-d REMOVE: kBuildReasonDismantled / kBuildReasonDestroyed */
@@ -109,7 +112,7 @@ struct BuildMsg
     unsigned char rmFlags;          /* P87 fold 1 REMOVE: kBuildRm* (0 = none); nonce = the placement it ends, hostKey = a furniture tombstone's host */
     std::vector<BuildHelpAck> helpAcks;   /* help1 STATE: the confirmation tail (empty = not written); fold 3: each row landed seq + live */
     float mats[kBuildMaxMats];
-    BuildMsg() : kind(0), complete(0), destroyed(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFFFF),
+    BuildMsg() : kind(0), complete(0), destroyed(0), broken(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFFFF),
                  nonce(0), seq(0), reset(0), applied(0), rmFlags(0)
     {
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
@@ -169,7 +172,7 @@ inline bool BuildEncodable(const BuildMsg& m)
             && ((m.rmFlags & kBuildRmFurniture) == 0 || m.hostKey.size() <= kBuildMaxKey);
     if (m.kind == kBuildState)
     {
-        if (m.key.empty() || m.key.size() > kBuildMaxKey || m.complete > 1 || m.destroyed > 1 || m.nMats > kBuildMaxMats) return false;
+        if (m.key.empty() || m.key.size() > kBuildMaxKey || m.complete > 1 || m.destroyed > 1 || m.broken > 1 || m.nMats > kBuildMaxMats) return false;
         for (unsigned int i = 0; i < m.nMats; ++i) if (!BuildFloatOk(m.mats[i])) return false;
         if (!BuildHelpAcksOk(m.helpAcks)) return false;   /* help1 */
         return BuildFloatOk(m.progress) && BuildFloatOk(m.needed);
@@ -265,7 +268,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         BuildPutS(&q, m.key);
         BuildPutF(&q, m.progress);
         BuildPutF(&q, m.needed);
-        *q++ = (char)(m.complete | (m.destroyed != 0 ? kBuildStateDestroyedBit : 0));   /* P15: bit 1 = destroyed */
+        *q++ = (char)(m.complete | (m.destroyed != 0 ? kBuildStateDestroyedBit : 0) | (m.broken != 0 ? kBuildStateBrokenBit : 0));   /* bit 1 destroyed, bit 2 broken */
         *q++ = (char)m.nMats;
         for (unsigned int i = 0; i < m.nMats; ++i) BuildPutF(&q, m.mats[i]);
         if (tail != 0)
@@ -406,10 +409,11 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
         if (size - off < (size_t)(4 + 4 + 1 + 1)) return kBuildDecodeTooShort;
         std::memcpy(&m.progress, p + off, 4); off += 4;
         std::memcpy(&m.needed, p + off, 4); off += 4;
-        const unsigned int cb = (unsigned char)p[off]; off += 1;   /* P15: bit 0 complete, bit 1 destroyed; any other bit is refused */
-        if ((cb & ~(1u | (unsigned int)kBuildStateDestroyedBit)) != 0) return kBuildDecodeBadValue;
+        const unsigned int cb = (unsigned char)p[off]; off += 1;   /* bit 0 complete, bit 1 destroyed, bit 2 broken; any other bit is refused */
+        if ((cb & ~(1u | (unsigned int)kBuildStateDestroyedBit | (unsigned int)kBuildStateBrokenBit)) != 0) return kBuildDecodeBadValue;
         m.complete = (unsigned char)(cb & 1u);
         m.destroyed = (unsigned char)((cb & kBuildStateDestroyedBit) != 0 ? 1 : 0);
+        m.broken = (unsigned char)((cb & kBuildStateBrokenBit) != 0 ? 1 : 0);
         const unsigned int n = (unsigned char)p[off]; off += 1;
         if (n > kBuildMaxMats) return kBuildDecodeBadValue;
         if (size - off < (size_t)(4 * n)) return kBuildDecodeTooShort;
@@ -641,11 +645,26 @@ inline unsigned int BuildOwnNonceRestore(unsigned int rowNonce, int own, int cop
 const int kBuildRsPresentNothing = 0;
 const int kBuildRsPresentNonce = 1;
 const int kBuildRsPresentRegister = 2;
-inline int BuildRestorePresentAct(int mineLive, int rowExists, int own, int copyHere)
+const int kBuildRsPresentDropWorld = 3;   /* the piece standing mine is a world resource node (coopown::WorldNodeOf): its saved row goes */
+inline int BuildRestorePresentAct(int mineLive, int rowExists, int own, int copyHere, int worldNode = 0)
 {
     if (mineLive == 0) return kBuildRsPresentNothing;
+    if (worldNode != 0) return kBuildRsPresentDropWorld;
     if (rowExists == 0) return kBuildRsPresentRegister;
     return (own != 0 && copyHere == 0) ? kBuildRsPresentNonce : kBuildRsPresentNothing;
+}
+/* What a present act writes. A world node's saved row is only retired from this player's records (pp.build): no tombstone (the
+   next load would take the rock down here) and no REMOVE (the other game would dismantle its own copy of the rock - a REMOVE
+   zeroes its materials). The other acts take the PLACE's nonce or register the live piece, and never write either. */
+struct BuildRsPresentPlan { int retireRow; int tombstone; int sendRemove; int registerLive; int takeNonce; };
+inline BuildRsPresentPlan BuildRsPresentPlanOf(int act)
+{
+    BuildRsPresentPlan p;
+    p.retireRow = 0; p.tombstone = 0; p.sendRemove = 0; p.registerLive = 0; p.takeNonce = 0;
+    if (act == kBuildRsPresentDropWorld) p.retireRow = 1;
+    else if (act == kBuildRsPresentRegister) p.registerLive = 1;
+    else if (act == kBuildRsPresentNonce) p.takeNonce = 1;
+    return p;
 }
 /* T-274 (t274-zone-scan.md S3): the per-zone scan's table - one byte per map sector (index sx * 64 + sy, 64 x 64), 1 = that sector's
    zone was walked in this world while it stayed active. The plugin passes the active sectors (ActiveZoneSectors) and each one's engine
@@ -1859,6 +1878,23 @@ inline bool BuildLedgerDecode(const std::string& in, BuildLedger* L)
     if (!r.ok || r.at != in.size()) return false;
     *L = x;
     return true;
+}
+
+/* TEST LEVER ONLY (`buildtest into <host> <sid> <dx>,<dz>`): "<dx>,<dz>" read as two numbers, each within +/-kBuildIntoOffsetMax. 1 = read */
+const double kBuildIntoOffsetMax = 5000.0;
+inline int BuildIntoOffsetParse(const std::string& s, float* dx, float* dz)
+{
+    const size_t c = s.find(',');
+    if (c == std::string::npos || c == 0 || c + 1 >= s.size() || s.find(',', c + 1) != std::string::npos) return 0;
+    const std::string a = s.substr(0, c), b = s.substr(c + 1);
+    char* e = 0;
+    const double x = std::strtod(a.c_str(), &e);
+    if (e == a.c_str() || *e != 0) return 0;
+    const double z = std::strtod(b.c_str(), &e);
+    if (e == b.c_str() || *e != 0) return 0;
+    if (!(x >= -kBuildIntoOffsetMax && x <= kBuildIntoOffsetMax) || !(z >= -kBuildIntoOffsetMax && z <= kBuildIntoOffsetMax)) return 0;   /* NaN fails too */
+    *dx = (float)x; *dz = (float)z;
+    return 1;
 }
 
 } // namespace coopbuild

@@ -41,8 +41,7 @@ struct OwnJob
     unsigned long long seq;
     long long          writtenAt;
     int                chars;
-    unsigned int       epoch; unsigned long long nbSeq; bool stamped;   /* restore1c: o2 */
-    OwnJob() : crc(0), seq(0), writtenAt(0), chars(0), epoch(0), nbSeq(0), stamped(false) {}
+    OwnJob() : crc(0), seq(0), writtenAt(0), chars(0) {}
 };
 
 CRITICAL_SECTION g_ownCs;
@@ -59,7 +58,6 @@ struct OwnCpJob { std::string tag, world; unsigned int cap; OwnCpJob() : cap(0) 
 std::vector<OwnCpJob>    g_ownCpJobs;    /* under g_ownCs */
 std::vector<OwnCpResult> g_ownCpNotes;   /* under g_ownCs; drained by OwnStoreCheckpointResults (main thread) */
 volatile LONG64 g_osCpNotesDropped = 0;   /* fold 2 */
-unsigned int g_ownStampEpoch = 0; unsigned long long g_ownStampSeq = 0; bool g_ownStampKnown = false;   /* restore1c: under g_ownCs */
 void CheckpointRunOnWriter(const std::string& dir, const OwnCpJob& j);   /* WRITER THREAD; defined at the end of this file, the same (anonymous) namespace */
 volatile LONG64  g_osCommitted = 0, g_osWriteFail = 0, g_osVerifyFail = 0, g_osIndexFail = 0, g_osReplaced = 0,
                  g_osBytes = 0, g_osDiskUsMax = 0, g_osDiskUsSum = 0;
@@ -223,7 +221,6 @@ void CommitOne(const std::string& dir, const std::string& key, const OwnJob& j)
     }
     coopown::IndexLine l;
     l.key = key; l.seq = j.seq; l.len = (long long)j.bytes.size(); l.crc = j.crc; l.writtenAt = j.writtenAt; l.chars = j.chars;
-    l.stamped = j.stamped; l.epoch = j.epoch; l.nbSeq = j.nbSeq;   /* restore1c: o2 */
     /* mmo1b: a squad with no line before this write gets NO line back on failure (operator[] used to leave an empty one) */
     std::map<std::string, coopown::IndexLine>::iterator had = g_ownIndex.find(key);
     const bool existed = had != g_ownIndex.end();
@@ -407,7 +404,6 @@ void OwnStoreEnqueue(const std::string& key, const std::vector<char>& bytes, uns
     OwnJob& j = g_ownQ[key];
     if (!j.bytes.empty()) ::InterlockedIncrement64(&g_osReplaced);
     j.bytes = bytes; j.crc = crc; j.seq = seq; j.writtenAt = writtenAt; j.chars = chars;
-    j.epoch = g_ownStampEpoch; j.nbSeq = g_ownStampSeq; j.stamped = g_ownStampKnown;   /* restore1c */
     ::LeaveCriticalSection(&g_ownCs);
     if (g_ownEvent) ::SetEvent(g_ownEvent);
 }
@@ -586,7 +582,7 @@ bool CheckpointCopyFile(const std::string& from, const std::string& to, long lon
     if (U8GetFileAttributesEx(to.c_str(), GetFileExInfoStandard, &a)) *bytes += ((long long)a.nFileSizeHigh << 32) | (long long)a.nFileSizeLow;
     return true;
 }
-/* THE PLUGIN'S RECYCLE CALL (store.cpp's deleted-profile folder): FO_DELETE with FOF_ALLOWUNDO - the Recycle Bin, never a hard delete. */
+/* THE PLUGIN'S RECYCLE CALL (a pruned checkpoint): FO_DELETE with FOF_ALLOWUNDO - the Recycle Bin, never a hard delete. */
 bool CheckpointRecycle(const std::string& dir)
 {
     std::vector<char> from(dir.begin(), dir.end()); from.push_back(0); from.push_back(0);   /* SHFileOperation wants a double-NUL list */
@@ -772,11 +768,7 @@ void OwnStoreCheckpointResults(std::vector<OwnCpResult>* out)
     ::LeaveCriticalSection(&g_ownCs);
 }
 
-/* ======================= restore1c (design s4): THE REPAIR ON A PLAYER'S PC =======================
-   MAIN THREAD with the writer idle (nothing queued, nothing in hand): own.index, the checkpoints and own.repair are read, the pure
-   plan (restoreguard::OwnRepairPlan) decides each squad, every post-R file goes to the Recycle Bin in ONE call (never a hard delete,
-   never a prompt: the bin policy is asked first, and nothing is touched when it cannot take them), the checkpoint copies are put
-   in, the ledger is cut back to its base checkpoint, the index is rewritten (temp + rename) and the store re-opened. */
+/* THE WRITER IS IDLE: no record or checkpoint job waiting and nothing in hand (the quit path waits for it). */
 bool OwnStoreIdleNow()
 {
     OwnCsInit();
@@ -784,175 +776,6 @@ bool OwnStoreIdleNow()
     const bool idle = g_ownQ.empty() && g_ownCpJobs.empty() && ::InterlockedCompareExchange(&g_ownBusy, 0, 0) == 0;
     ::LeaveCriticalSection(&g_ownCs);
     return idle;
-}
-void OwnStoreSetStamp(unsigned int epoch, unsigned long long nbSeq, bool known)
-{
-    OwnCsInit();
-    ::EnterCriticalSection(&g_ownCs);
-    g_ownStampEpoch = epoch; g_ownStampSeq = nbSeq; g_ownStampKnown = known;
-    ::LeaveCriticalSection(&g_ownCs);
-}
-namespace {
-const char* kOwnRepairFile = "own.repair";
-void RpLines(const std::vector<char>& b, std::vector<std::string>* lines)
-{
-    std::string cur;
-    for (size_t i = 0; i < b.size(); ++i)
-    {
-        if (b[i] == '\n') { if (!cur.empty() && cur[cur.size() - 1] == '\r') cur.erase(cur.size() - 1); lines->push_back(cur); cur.clear(); }
-        else cur += b[i];
-    }
-    if (!cur.empty()) lines->push_back(cur);
-}
-/* The index of a folder: its identity line (kept as found) and its record lines. False = no index file. */
-bool RpReadIndex(const std::string& dir, std::string* header, std::map<std::string, coopown::IndexLine>* out)
-{
-    std::vector<char> b;
-    if (!ReadAll(Join(dir, coopown::IndexFile()), &b)) return false;
-    std::vector<std::string> lines; RpLines(b, &lines);
-    for (size_t i = 0; i < lines.size(); ++i)
-    {
-        if (coopown::IsIndexHeader(lines[i])) { if (header != 0) *header = lines[i] + "\n"; continue; }
-        coopown::IndexLine l;
-        if (coopown::ParseIndexLine(lines[i], &l)) (*out)[l.key] = l;
-    }
-    return true;
-}
-bool RpFileMatches(const std::string& path, long long len, unsigned int crc)
-{
-    std::vector<char> b;
-    if (!ReadAll(path, &b)) return false;
-    return (long long)b.size() == len && (b.empty() ? 0u : coopstore::Crc32(&b[0], b.size())) == crc;
-}
-/* ONE Recycle Bin call for every file (FO_DELETE + FOF_ALLOWUNDO, the plugin's recycle flags). */
-bool RpRecycleFiles(const std::vector<std::string>& files)
-{
-    if (files.empty()) return true;
-    std::vector<char> from;
-    for (size_t i = 0; i < files.size(); ++i) { from.insert(from.end(), files[i].begin(), files[i].end()); from.push_back(0); }
-    from.push_back(0);
-    SHFILEOPSTRUCTA op; memset(&op, 0, sizeof(op));
-    op.wFunc = FO_DELETE; op.pFrom = &from[0];
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI;
-    return U8SHFileOperation(&op) == 0 && !op.fAnyOperationsAborted;
-}
-}   // namespace
-
-void OwnStoreRepairApply(const std::vector<restoreguard::RepairRow>& rows, const std::string& world, OwnRepairResult* out)
-{
-    OwnRepairResult r;
-    const std::string dir = OwnStoreDir();
-    if (dir.empty()) { r.rc = -1; *out = r; return; }
-    if (!OwnStoreIdleNow()) { r.rc = -2; *out = r; return; }
-    unsigned int applied = 0;
-    {
-        std::vector<char> b;
-        if (ReadAll(Join(dir, kOwnRepairFile), &b) && !b.empty()) restoreguard::OwnRepairSeenParse(std::string(b.begin(), b.end()), &applied);
-    }
-    unsigned int top = applied;
-    for (size_t i = 0; i < rows.size(); ++i) if (rows[i].epoch > applied) { ++r.applied; if (rows[i].epoch > top) top = rows[i].epoch; }
-    r.epoch = top;
-    if (r.applied == 0) { r.rc = 0; *out = r; return; }
-    std::string header; std::map<std::string, coopown::IndexLine> cur;
-    RpReadIndex(dir, &header, &cur);
-    /* the checkpoints of THIS world: <store>\checkpoint\<world>\<tag> */
-    std::vector<restoreguard::CpView> cps; std::vector<std::string> cpDirs; std::vector<std::map<std::string, coopown::IndexLine> > cpLines;
-    {
-        const std::string root = Join(Join(dir, "checkpoint"), world);
-        U8FindData fd; HANDLE h = U8FindFirstFile(Join(root, "*").c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE)
-        {
-            do
-            {
-                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
-                restoreguard::CheckpointTag t;
-                if (!restoreguard::ParseCheckpointTag(std::string(fd.cFileName), &t)) continue;
-                std::map<std::string, coopown::IndexLine> ls;
-                if (!RpReadIndex(Join(root, fd.cFileName), 0, &ls)) continue;
-                restoreguard::CpView v; v.tagSeq = t.seq;
-                for (std::map<std::string, coopown::IndexLine>::const_iterator it = ls.begin(); it != ls.end(); ++it)
-                {
-                    restoreguard::OwnStampView sv;
-                    sv.epoch = it->second.stamped ? it->second.epoch : 0u;
-                    sv.nbSeq = (it->second.stamped && it->second.nbSeq < t.seq) ? it->second.nbSeq : t.seq;
-                    v.lines[it->first] = sv;
-                }
-                cps.push_back(v); cpDirs.push_back(Join(root, fd.cFileName)); cpLines.push_back(ls);
-            } while (U8FindNextFile(h, &fd));
-            ::FindClose(h);
-        }
-    }
-    std::map<std::string, restoreguard::OwnStampView> stamps;
-    unsigned long long maxSeq = 0ULL;
-    for (std::map<std::string, coopown::IndexLine>::const_iterator it = cur.begin(); it != cur.end(); ++it)
-    {
-        restoreguard::OwnStampView sv;
-        if (it->second.stamped) { sv.epoch = it->second.epoch; sv.nbSeq = it->second.nbSeq; }   /* an o1 line predates the numbers: it survives */
-        stamps[it->first] = sv;
-        if (it->second.seq > maxSeq) maxSeq = it->second.seq;
-    }
-    const std::map<std::string, restoreguard::OwnRepairStep> plan = restoreguard::OwnRepairPlan(rows, stamps, cps);
-    std::vector<std::string> bin; int changed = 0;
-    for (std::map<std::string, restoreguard::OwnRepairStep>::const_iterator it = plan.begin(); it != plan.end(); ++it)
-    {
-        if (it->second.action == restoreguard::kOrKeep) continue;
-        ++changed;
-        const std::string live = Join(dir, coopown::RecFile(it->first)), prev = Join(dir, coopown::PrevFile(it->first));
-        if (PathThere(live)) bin.push_back(live);
-        if (PathThere(prev)) bin.push_back(prev);
-    }
-    const std::string ledger = Join(dir, coopown::LedgerFile());
-    const int ledgerCp = changed > 0 ? restoreguard::LedgerBaseCheckpoint(rows, applied, cps) : -1;
-    if (changed > 0 && PathThere(ledger)) { bin.push_back(ledger); r.ledgerRecycled = 1; }
-    if (!bin.empty())
-    {
-        if (!CheckpointBinCanTake(dir)) { r.rc = -3; *out = r; return; }   /* nothing touched: never a hard delete */
-        if (!RpRecycleFiles(bin)) { r.rc = -4; *out = r; return; }
-    }
-    std::string all = header;
-    for (std::map<std::string, restoreguard::OwnRepairStep>::const_iterator it = plan.begin(); it != plan.end(); ++it)
-    {
-        const std::map<std::string, coopown::IndexLine>::const_iterator c = cur.find(it->first);
-        if (c == cur.end()) continue;
-        coopown::IndexLine l = c->second;
-        if (it->second.action == restoreguard::kOrDrop) { ++r.dropped; continue; }
-        if (it->second.action == restoreguard::kOrFromCheckpoint)
-        {
-            const std::map<std::string, coopown::IndexLine>& cl = cpLines[(size_t)it->second.cp];
-            const std::map<std::string, coopown::IndexLine>::const_iterator k = cl.find(it->first);
-            const std::string src = Join(cpDirs[(size_t)it->second.cp], coopown::RecFile(it->first));
-            const std::string srcPrev = Join(cpDirs[(size_t)it->second.cp], coopown::PrevFile(it->first));
-            std::string from;
-            if (k != cl.end() && RpFileMatches(src, k->second.len, k->second.crc)) from = src;
-            else if (k != cl.end() && RpFileMatches(srcPrev, k->second.len, k->second.crc)) from = srcPrev;
-            if (from.empty() || !U8CopyFile(from.c_str(), Join(dir, coopown::RecFile(it->first)).c_str(), FALSE)) { ++r.copyFailed; ++r.dropped; continue; }
-            l = k->second; l.seq = ++maxSeq; l.stamped = true; l.epoch = it->second.stamp.epoch; l.nbSeq = it->second.stamp.nbSeq;
-            ++r.fromCheckpoint;
-        }
-        std::string line;
-        if (coopown::EncodeIndexLine(l, &line)) all += line;
-    }
-    r.recycled = changed;
-    if (ledgerCp >= 0)
-    {
-        const std::string cl = Join(cpDirs[(size_t)ledgerCp], coopown::LedgerFile());
-        if (PathThere(cl) && U8CopyFile(cl.c_str(), ledger.c_str(), FALSE)) r.ledgerFromCheckpoint = 1;
-    }
-    char pid[24]; _snprintf(pid, 23, "%lu", (unsigned long)::GetCurrentProcessId()); pid[23] = 0;
-    if (changed > 0)
-    {
-        const std::string tmp = Join(dir, std::string(coopown::IndexFile()) + "." + pid + ".tmp");
-        if (!WriteAllFlushed(tmp, all.data(), all.size()) || !MoveReplace(tmp, Join(dir, coopown::IndexFile()))) { U8DeleteFile(tmp.c_str()); r.rc = -4; *out = r; return; }
-    }
-    {
-        const std::string seen = restoreguard::OwnRepairSeenFormat(top);
-        const std::string tmp = Join(dir, std::string(kOwnRepairFile) + "." + pid + ".tmp");
-        if (!WriteAllFlushed(tmp, seen.data(), seen.size()) || !MoveReplace(tmp, Join(dir, kOwnRepairFile))) { U8DeleteFile(tmp.c_str()); r.rc = -4; *out = r; return; }
-    }
-    unsigned long long ms = 0ULL; int bad = 0;
-    OwnStoreOpen(dir, &ms, &bad);   /* the index, the committed maps and the counter, as the folder now says */
-    r.maxSeq = ms > maxSeq ? ms : maxSeq;
-    r.rc = 1; *out = r;
 }
 
 }   // namespace coop

@@ -39,11 +39,14 @@
 #include "../common/farmwire.h"   /* coopfarm::MineStepRoute, the three-way production writer */
 #include "build.h"          /* build1h: BuildRecordedOwnerSlot - the shared build record */
 #include "../common/paritywire.h"   /* par1: MSG_PARITY_REQ / MSG_PARITY_BOX payloads and the box digest */
+#include "../common/ownpark.h"   /* a stolen mark parked until its owner is on this game: the pure decisions */
 #include "../common/snapdigest.h"   /* snap1 (user decision 2026-09-26): the snapshot verb's order-free inventory digest */
 #include "../common/researchwire.h"   /* loot2b: RESEARCH_BOX rows (research_boxes.txt) */
 #include "../common/lootroute.h"   /* loot2c part B: the materialise / give routes' pure decisions */
 #include "../common/invnet.h"   /* inv2a: the inventory safety net's pure diff / baseline follow */
 #include "../common/groundkey.h"   /* inv5 phase 1: the ground key, shared with the offline suite */
+#include "../common/poskey.h"   /* the position key's arithmetic, shared with the world server (RESET WORLD's kept pieces) */
+#include "../common/keptwire.h"   /* KEPT: the kept box contents and where each kept item goes (ItKeptLayItems) */
 #include "../common/ownerroute.h"  /* M7b slice 2: ItemMoveSenderOk, AddrOwnerSlotOf */
 #include "../common/copykeep.h"    /* cell1: KitFirstFreeCell - the engine's first-free-cell rule, shared with clothing.cpp */
 #include "ai_spike.h"                /* inv5: GetCharacterAI - groundtest pick's order */
@@ -120,11 +123,19 @@ namespace coop {
 /* inv2a (user decision 2026-09-26): THE INVENTORY SAFETY NET - defined just above ItemsTick. EVERY ITEM_MOVE this file
    publishes goes through ItNetSendMove, so the net's baseline (the last-announced contents) follows every normal publish. */
 bool ItNetSendMove(const ItemMoveMsg& m);
+// PROBE-START: P133 - the restock line counts the keeper's shop stock (ItInvItemCount is defined in coop, outside the unnamed namespace)
+long long ItInvItemCount(::Inventory* inv);
+// PROBE-END: P133
 /* P105 build 2: defined beside the drain (coop, not the unnamed namespace), called from the cursor rows' release and the escrow edges above it */
 void HdCursorEnded(unsigned int holdId);
 void HdEdge(const char* edge);
 void InvNetNoteHook(unsigned int uid, const char* boxKey, int op);
 void InvNetForget(unsigned int uid, const std::string& boxKey);
+void InvNetHoldBase(void* b, const std::string& boxKey);
+void InvNetHoldEnd(const std::string& boxKey);
+int InvNetHoldMove(const std::string& key, long seq, const ItemMoveMsg& m, int qtyBefore);
+std::string InvNetHoldSay(int hm);
+void InvNetHoldFollow(const ItemMoveMsg& m, int ok);
 void InvNetSnapshotBox(const std::string& key, ::Inventory* inv);
 void InvNetClearAll();
 void InvNetTick();
@@ -2447,7 +2458,10 @@ const int kKindBag = 2;
 /* bag23 part 2: THE PATH TO A PACK, as POD (ring entries are memcpy'd): the parent's section and the pack's cell there. has 0 = the
    entry is not inside a pack. The wire form is coopbag::BagPath (ItBagPathToWire / ItBagPathFromWire). */
 struct ItBagPath { int has; char section[kSecCap]; int x, y; };
-const int kBoxKeyCap = 48;
+const int kBoxKeyCap = poskey::kKeyCap;   /* 48: the position key's room, closing zero included */
+const int kItCrafterCap = 256;   /* a crafter's name read off an item: up to 255 bytes and the closing zero - more than the wire's 95
+                                    (gearwire::kGearMaxCrafter): a longer name travels empty (counted, ItGearOfRaw) and the undo's local
+                                    re-create keeps it (ItGearApplyLocal) */
 struct ItEntry
 {
     int kind;             // E22c: 0 the entry names a Character, 1 a storage box
@@ -2469,6 +2483,7 @@ struct ItEntry
                           // _addItem as two halves of ONE transfer rather than two unrelated events.
     long seq;
     int op, x, y, quantity;
+    int qtyBefore;        // op 2: the stack's count before the change (0 = not read) - InvNetHoldMove takes the change back out of a saved baseline with it
     int fields;           // 1 = the 0x2A block below was read (ADD only)
     char section[kSecCap];
     char baseSid[kSidCap], companySid[kSidCap], materialSid[kSidCap], colorSid[kSidCap];
@@ -2481,6 +2496,13 @@ struct ItEntry
     int ownerHave;
     // review-inv6 LOW: 1 = the drain already translated (and counted) this entry's owner, so ItMsgFromEntry does not count it again.
     int ownerBooked;
+    // the gear marks (ItGearReadPod), read with the 0x2A block by ItReadFields on ANY thread: the uniform's Faction* (named only on
+    // the MAIN THREAD, ItGearOf), the crafter's name, and gearState 0 not a gear item / unread, 1 read, 2 the crafter is
+    // kItCrafterCap bytes or longer (gearCrafter is then empty: it travels empty, counted, and an undo cannot put it back). A name
+    // that fits here but is over the wire's 95 bytes travels empty too (ItGearOfRaw); an undo's local re-create keeps it.
+    void* gearUniform;
+    char gearCrafter[kItCrafterCap];
+    int gearState;
     // review-p6a M-4: 1 = this entry was rung by the `itemtake` TEST LEVER'S OWN engine calls. An unmatched
     // REMOVE carrying this mark is the lever refusing and putting the item back, not a transfer E22b failed
     // to pair, and it is kept out of `unpaired` for exactly that reason.
@@ -2656,6 +2678,7 @@ void ItQueue(const ItEntry& src)
     ItEntry& e = g_ring[(unsigned long)t & (unsigned long)(kRing - 1)];
     if (::InterlockedCompareExchange(&e.ready, 0, 0) != 0) { ::InterlockedIncrement64(&g_ringDropped); return; }
     e.ch = src.ch; e.item = src.item; e.op = src.op; e.x = src.x; e.y = src.y; e.quantity = src.quantity; e.fields = src.fields;
+    e.qtyBefore = src.qtyBefore;
     e.kind = src.kind; e.box = src.box;
     std::memcpy(e.boxKey, src.boxKey, kBoxKeyCap);
     std::memcpy(e.boxId, src.boxId, kBoxKeyCap);                        // E22c-2 (P7n): the cross-check rides along
@@ -2729,8 +2752,8 @@ int ItSecNameInto(const void* stdstr, char* out)
 // The engine's "belongs to" note is a hand at Item+0x140 (properOwner); a hand's ticket (index/serial) means something only on
 // the game that issued it, so it travels as an identity (src/common/ownerwire.h): kind, the character's (or squad leader's) uid,
 // and the faction's wire name. The receiver turns it back into ITS OWN hand before the item enters any inventory. An owner it
-// cannot find leaves the item CLEAN and is counted (`ownerUnresolved`) - the design's interim rule until the resolver 0x2844D0 is
-// read on a never-issued ticket (the tombstone gate, design Q1 step 3).
+// cannot find is counted (`ownerUnresolved`); when it names a character or squad by uid the item is held clean and PARKED until that
+// uid is on this game, then marked (ItOwnPark*, src/common/ownpark.h - up to 120 s); any other owner leaves the item CLEAN.
 const size_t kItemOwnerHand      = 0x148;   // Item::properOwner +0x140; its five id words from +0x148
 const size_t kRootHandFields     = 0x60;    // RootObjectBase::handle +0x58; its five id words from +0x60 (crime.cpp kCrOwnHandFields)
 const size_t kPlatoonLeaderHand  = 0x130;   // Platoon::squadleader, a hand at +0x128 (Platoon.h:199); its five id words from +0x130
@@ -2743,6 +2766,8 @@ volatile LONG64 g_markUnreadable = 0;         // ANY THREAD: the owner words cou
 long long g_markCarried = 0, g_markReceived = 0, g_markApplied = 0, g_markUnresolved = 0, g_markLocalApplied = 0;
 long long g_markRowCarried = 0, g_markRowReceived = 0, g_markRowApplied = 0, g_markRowUnresolved = 0, g_markUndoKept = 0;   /* inv6 phase 2 */
 long long g_markBadRecv = 0, g_markJournalInvalid = 0;   /* review-inv6 LOWs */
+long long g_gearCarried = 0, g_gearDropped = 0, g_gearReceived = 0, g_gearApplied = 0, g_gearUnknownFaction = 0, g_gearNotGear = 0,
+          g_gearFault = 0, g_gearBadRecv = 0, g_gearJournaled = 0;   /* the gear marks (gearwire.h): the itemGear stats */
 long long g_markSenderUnknown = 0, g_markApplyFault = 0, g_markBadBlock = 0, g_markJournaled = 0, g_markTranslated = 0;
 int g_markSayLines = 0;
 const int kOwnSayCap = 40;
@@ -2758,9 +2783,76 @@ int ItRawHandAtPod(const void* obj, size_t off, unsigned int* w5)
 // legitimately absent on many items and an absent one is carried as "".
 // Returns 1 read, 0 something essential could not be read, 2 the base sid is longer than kSidCap - which is
 // counted HERE (sidTooLong) so the caller does not book it as a memory fault (MEDIUM-3).
+/* THE GEAR MARKS: an item's uniform (the uniform's Faction* at +0x1E8) and crafter (an engine std::string at +0x1F8). Only the gear
+   family has these fields - the classes whose save (vtable +0x258) is the gear save (Gear, Armour, Weapon, Sword, Crossbow) or
+   LockedArmour's, as build/vtable_*.txt read them. Any other item (a plain Item, a backpack - ContainerItem - and the rest) has other
+   data there, so every read and write of them goes through ItGearMarksPod. */
+const size_t kItUniform = 0x1E8;   /* Item: the uniform's Faction* (gear items only) */
+const size_t kItCrafter = 0x1F8;   /* Item: the crafter's name, an engine std::string (gear items only) */
+/* 1 = a gear item. The class is read from the item's RTTI name, which holds on every supported game version. Each vtable's answer
+   is remembered once its name has been read (g_gearVtYes / g_gearVtNo: learned at run time, no address is written in here), so an
+   item of a class already seen is answered by comparing its vtable against those small sets; the name is read only for a vtable not
+   seen yet (or every time once its set is full). ANY THREAD: a slot is claimed once by compare-exchange and the sets fill in order,
+   so a reader that stops at the first empty slot at worst reads the name again. */
+static volatile LONG g_gearVtYes[8];    /* the gear classes' vtables seen (six classes) */
+static volatile LONG g_gearVtNo[64];    /* other item classes' vtables seen */
+static int ItGearVtSeen(volatile LONG* set, int n, LONG vt)
+{
+    for (int i = 0; i < n; ++i) { const LONG s = set[i]; if (s == 0) return 0; if (s == vt) return 1; }
+    return 0;
+}
+static void ItGearVtRemember(volatile LONG* set, int n, LONG vt)
+{
+    for (int i = 0; i < n; ++i) { const LONG s = ::InterlockedCompareExchange(&set[i], vt, 0); if (s == 0 || s == vt) return; }
+}
+int ItGearMarksPod(const void* item)
+{
+    if (item == 0) return 0;
+    const unsigned int vt = coop::PolicyVtableRvaPod((void*)item);
+    if (vt == 0) return 0;
+    const LONG key = (LONG)vt;
+    if (ItGearVtSeen(g_gearVtYes, 8, key)) return 1;
+    if (ItGearVtSeen(g_gearVtNo, 64, key)) return 0;
+    char cls[96];
+    cls[0] = 0;
+    if (coop::PolicyClassNamePod(vt, cls, (int)sizeof cls) == 0) return 0;   /* unreadable: not remembered, read again next time */
+    static const char* const k[] = { ".?AVGear@@", ".?AVArmour@@", ".?AVWeapon@@", ".?AVSword@@", ".?AVCrossbow@@", ".?AVLockedArmour@@" };
+    for (size_t n = 0; n < sizeof k / sizeof k[0]; ++n)
+        if (std::strcmp(cls, k[n]) == 0) { ItGearVtRemember(g_gearVtYes, 8, key); return 1; }
+    ItGearVtRemember(g_gearVtNo, 64, key);
+    return 0;
+}
+/* the uniform and crafter written - only on a gear item (ItGearMarksPod); on any other nothing is written and 0 comes back */
+int ItKeptMarksPod(void* item, void* faction, int setUniform, const char* crafter, size_t n)
+{
+    if (ItGearMarksPod(item) == 0) return 0;
+    __try
+    {
+        char* c = (char*)item;
+        if (setUniform != 0) *(void**)(c + kItUniform) = faction;
+        if (crafter != 0) ((std::string*)(c + kItCrafter))->assign(crafter, n);   /* the mod's own string code, as P105MakeStr */
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ANY THREAD. A gear item's uniform and crafter, read-only: 0 not a gear item or unreadable (*uni 0, cr ""), 1 read, 2 read but the
+   crafter is `cap` bytes or longer (cr "": it travels empty and is counted). The uniform stays a pointer here; it is named on the
+   MAIN THREAD (ItGearOfRaw). */
+int ItGearReadPod(const void* item, void** uni, char* cr, int cap)
+{
+    *uni = 0; cr[0] = 0;
+    if (ItGearMarksPod(item) == 0) return 0;
+    void* f = 0;
+    if (ItPtrPod(item, kItUniform, &f) == 0) return 0;
+    const int w = ItStrPodWhy((const char*)item + kItCrafter, cr, cap);
+    if (w != 1) cr[0] = 0;
+    *uni = f;
+    return w == 2 ? 2 : 1;
+}
 int ItReadFields(void* item, ItEntry* e)
 {
     char base[kSidCap];
+    e->gearUniform = 0; e->gearCrafter[0] = 0; e->gearState = 0;   /* the gear marks: none until they are read below */
     void* gd = 0;
     if (ItPtrPod(item, kObjData, &gd) == 0 || !ItPlaus(gd)) return 0;
     const int baseWhy = ItStrPodWhy((const char*)gd + kGdStringId, base, kSidCap);
@@ -2778,6 +2870,7 @@ int ItReadFields(void* item, ItEntry* e)
     /* inv6: the raw owner hand. A failed read never fails the field read - the item travels clean and it is counted. */
     if (ItRawHandAtPod(item, kItemOwnerHand, e->ownerRaw) == 0) { ::InterlockedIncrement64(&g_markUnreadable); e->ownerHave = 0; }
     else e->ownerHave = coopmark::RawHandIsOwner(e->ownerRaw) ? 1 : 0;
+    e->gearState = ItGearReadPod(item, &e->gearUniform, e->gearCrafter, kItCrafterCap);   /* gear items only; a failed read never fails the field read */
     e->fields = 1;
     return 1;
 }
@@ -2828,57 +2921,12 @@ int ItReadFields(void* item, ItEntry* e)
 // So NO parent-interior prefix is built into the key. PROBE P030 measures it in a run instead of leaving it
 // asserted, and `boxWalkIndoorSeen` says whether the walk sees indoor buildings at all.
 
-// ANY THREAD, NO CRT. Tenths of a world unit, rounded half away from zero. `*okOut` 0 means the float was
-// not a plausible world coordinate - SectorOf's own constants put one inside +-147456, so +-1e7 is a
-// generous bad-read test and not a rounding decision (a NaN fails both comparisons and lands here too).
-long ItTenthsOfAUnit(float v, int* okOut)
-{
-    if (!(v > -1.0e7f && v < 1.0e7f)) { *okOut = 0; return 0; }
-    const double t = (double)v * 10.0;
-    *okOut = 1;
-    return (long)(t >= 0.0 ? (t + 0.5) : (t - 0.5));
-}
-// ANY THREAD, NO CRT. FNV-1a, 32 bits, over the sid's own bytes. Used ONLY when the whole key would not fit
-// the 48-byte wire field: the sid is then replaced by "#" + 8 hex digits. Both games run this code on the
-// same record name and get the same digits, so the key still agrees. It is not a security hash.
-unsigned int ItSidHash32(const char* s)
-{
-    unsigned int h = 2166136261u;
-    for (; *s != 0; ++s) { h ^= (unsigned int)(unsigned char)*s; h *= 16777619u; }
-    return h;
-}
-// ANY THREAD, NO CRT. The three appenders. Each returns the new length, or -1 when the text would not fit -
-// and -1 is CARRIED FORWARD by every later call, so one overflow test at the end covers the whole compose.
-int ItKeyAppendStr(char* out, int cap, int at, const char* s)
-{
-    if (at < 0) return -1;
-    while (*s != 0) { if (at >= cap - 1) return -1; out[at++] = *s++; }
-    out[at] = 0;
-    return at;
-}
-int ItKeyAppendLong(char* out, int cap, int at, long v)
-{
-    if (at < 0) return -1;
-    char tmp[24];
-    int n = 0;
-    unsigned long u = (v < 0) ? (unsigned long)(0 - (unsigned long)v) : (unsigned long)v;
-    if (v < 0) { at = ItKeyAppendStr(out, cap, at, "-"); if (at < 0) return -1; }
-    do { tmp[n++] = (char)('0' + (int)(u % 10u)); u /= 10u; } while (u != 0 && n < 20);
-    while (n > 0) { if (at >= cap - 1) return -1; out[at++] = tmp[--n]; }
-    out[at] = 0;
-    return at;
-}
-int ItKeyAppendHex8(char* out, int cap, int at, unsigned int v)
-{
-    if (at < 0) return -1;
-    const char* const hex = "0123456789abcdef";
-    for (int i = 7; i >= 0; --i) { if (at >= cap - 1) return -1; out[at++] = hex[(v >> (i * 4)) & 0xFu]; }
-    out[at] = 0;
-    return at;
-}
+// THE KEY'S ARITHMETIC - tenths of a world unit, the sector, the sid hash for a key that would not fit, the appenders and the
+// compose - is in src/common/poskey.h. The world server compiles the same header and builds the same key from an area record's
+// stored position at RESET WORLD, so a game and the world server name one piece with the same bytes.
 // A working buffer for a base record sid - deliberately larger than the 48-byte key field, because a sid
 // that does not fit the KEY is still readable and still hashable; only a sid that does not fit THIS is lost.
-const int kBoxSidRoom = 96;
+const int kBoxSidRoom = poskey::kSidRoom;   /* 96 */
 // The pieces of a key, whichever end they came from: built from a live building, or parsed off the wire.
 struct ItBoxKeyParts
 {
@@ -2899,25 +2947,6 @@ int ItBaseSidWhy(const void* obj, char* out, int cap)
     out[0] = 0;
     if (ItPtrPod(obj, kObjData, &gd) == 0 || !ItPlaus(gd)) return 0;
     return ItStrPodWhy((const char*)gd + kGdStringId, out, cap);
-}
-// ANY THREAD, NO CRT. Lay the pieces out. 1 = it fitted, 0 = it did not (and `out` holds a partial string
-// the caller must not use).
-int ItBoxKeyCompose(char* out, int cap, const char* sidField, const ItBoxKeyParts& p)
-{
-    int at = 0;
-    out[0] = 0;
-    at = ItKeyAppendStr(out, cap, at, sidField);
-    at = ItKeyAppendStr(out, cap, at, "@");
-    at = ItKeyAppendLong(out, cap, at, (long)p.sx);
-    at = ItKeyAppendStr(out, cap, at, ",");
-    at = ItKeyAppendLong(out, cap, at, (long)p.sy);
-    at = ItKeyAppendStr(out, cap, at, "@");
-    at = ItKeyAppendLong(out, cap, at, p.x10);
-    at = ItKeyAppendStr(out, cap, at, ",");
-    at = ItKeyAppendLong(out, cap, at, p.z10);
-    at = ItKeyAppendStr(out, cap, at, ",");
-    at = ItKeyAppendLong(out, cap, at, p.y10);
-    return (at < 0) ? 0 : 1;
 }
 // ANY THREAD. BUILD A BOX'S NAME FROM A LIVE BUILDING. 1 = `keyOut` holds it and `partsOut` (when given)
 // holds the pieces; 0 = it could not be built AND THE REASON IS ALREADY COUNTED. This is THE ONE PLACE a key
@@ -2959,9 +2988,9 @@ int ItBoxKeyBuildMode(void* building, char* keyOut, int keyCap, ItBoxKeyParts* p
     if ((podPos != 0 ? ItBoxPosPodRaw(building, pos) : ItBoxPosPod(building, pos)) == 0)
     { ItKeyFailBook(countIt, &g_boxKeyPosUnreadable); return 0; }
     int okx = 0, oky = 0, okz = 0;
-    p.x10 = ItTenthsOfAUnit(pos[0], &okx);
-    p.y10 = ItTenthsOfAUnit(pos[1], &oky);
-    p.z10 = ItTenthsOfAUnit(pos[2], &okz);
+    p.x10 = poskey::TenthsOfAUnit(pos[0], &okx);
+    p.y10 = poskey::TenthsOfAUnit(pos[1], &oky);
+    p.z10 = poskey::TenthsOfAUnit(pos[2], &okz);
     if (okx == 0 || oky == 0 || okz == 0) { ItKeyFailBook(countIt, &g_boxKeyPosImplausible); return 0; }
     p.px = pos[0]; p.py = pos[1]; p.pz = pos[2];
     p.haveY = 1;
@@ -2974,28 +3003,19 @@ int ItBoxKeyBuildMode(void* building, char* keyOut, int keyCap, ItBoxKeyParts* p
         ItKeyFailBook(countIt, sidWhy == 2 ? &g_boxKeySidTooLong : &g_boxKeySidMissing);
         return 0;
     }
-    if (ItBoxKeyCompose(keyOut, keyCap, sid, p) == 0)
+    char sidField[kBoxSidRoom];
+    const int composed = poskey::ComposeOrHash(keyOut, keyCap, sid, p.sx, p.sy, p.x10, p.z10, p.y10, sidField, kBoxSidRoom);
+    if (composed == 0) { keyOut[0] = 0; ItKeyFailBook(countIt, &g_boxKeyTooLong); return 0; }
+    if (composed == 2)
     {
-        /* THE RECORD NAME DOES NOT FIT, SO IT IS HASHED - and the answer is still the same on both games,
-           because the digits come from the record's own bytes and both installs carry the same record. This
-           is the branch that makes the 48-byte field a BOUND rather than a hope: the hashed form is
-           "#" + 8 hex + "@" + at most 5 + "@" + at most 26 = 41 characters at the very edge of the map, so
-           it cannot fail by arithmetic and `boxKeyTooLong` below should stay 0 forever. */
-        char hashed[16];
-        int hat = 0;
-        hat = ItKeyAppendStr(hashed, (int)sizeof hashed, hat, "#");
-        hat = ItKeyAppendHex8(hashed, (int)sizeof hashed, hat, ItSidHash32(sid));
-        if (hat < 0) { ItKeyFailBook(countIt, &g_boxKeyTooLong); return 0; }
-        /* NOT a failure - a state, and it is the one T236a saw move for 110 walked buildings. It follows the
-           same population rule: a lever walk does not put it up. */
+        /* THE RECORD NAME DID NOT FIT, SO IT WAS HASHED - and the answer is still the same on both games, because the digits come
+           from the record's own bytes and both installs carry the same record. The hashed form is at most 41 characters at the very
+           edge of the map, so boxKeyTooLong above should stay 0 forever. NOT a failure - a state, and it follows the same population
+           rule: a lever walk does not put it up. */
         if (countIt == 1) ::InterlockedIncrement64(&g_boxKeySidHashed);
         else if (countIt == 2) ::InterlockedIncrement64(&g_doorKeySidHashed);
-        std::strncpy(sid, hashed, kBoxSidRoom - 1);
-        sid[kBoxSidRoom - 1] = 0;
-        if (ItBoxKeyCompose(keyOut, keyCap, sid, p) == 0)
-        { keyOut[0] = 0; ItKeyFailBook(countIt, &g_boxKeyTooLong); return 0; }
     }
-    std::strncpy(p.sidField, sid, kBoxSidRoom - 1);
+    std::strncpy(p.sidField, sidField, kBoxSidRoom - 1);
     p.sidField[kBoxSidRoom - 1] = 0;
     if (partsOut != 0) std::memcpy(partsOut, &p, sizeof p);
     return 1;
@@ -3060,22 +3080,12 @@ int ItBoxKeyParse(const char* key, ItBoxKeyParts* out)
 // recalculated), not for parsing noise: positions that come from the same file bytes are bit-identical.
 const long kBoxKeyTenthsWindow = 1;
 // MAIN THREAD. Does this building answer to that key on SECTOR, X, Z and BASE RECORD? y is deliberately
-// absent - see the tiebreak in ItBoxResolve. The sid comparison is a plain string compare, so the verbatim
-// form and the "#<hex>" form can never be confused with one another.
+// absent - see the tiebreak in ItBoxResolve. The record is compared in either sid form (poskey::SidFieldsSame): a key composed in a
+// 64-byte buffer names a record verbatim where this game's box keys hash it, and the two are the same record.
 int ItBoxKeyNear(const ItBoxKeyParts& have, const ItBoxKeyParts& want)
 {
-    if (have.sx != want.sx || have.sy != want.sy) return 0;
-    {
-        long dx = have.x10 - want.x10;
-        if (dx < 0) dx = -dx;
-        if (dx > kBoxKeyTenthsWindow) return 0;
-    }
-    {
-        long dz = have.z10 - want.z10;
-        if (dz < 0) dz = -dz;
-        if (dz > kBoxKeyTenthsWindow) return 0;
-    }
-    return (std::strcmp(have.sidField, want.sidField) == 0) ? 1 : 0;
+    return poskey::SameSpotSameRecord(have.sidField, have.sx, have.sy, have.x10, have.z10,
+                                      want.sidField, want.sx, want.sy, want.x10, want.z10, kBoxKeyTenthsWindow);
 }
 // MAIN THREAD. THE MEASUREMENT THAT COULD REFUTE THE POSITION KEY. When the message carried an instance id
 // AND the building the position found carries one, they should be the same string. Agreement and
@@ -3389,6 +3399,7 @@ void detour_addQuantity(void* self, int* amount, void* added, void* section)
     ItEntry e; ItClear(&e);
     if (ItAddressee(inv, &e) == 0) return;   /* a character, a box, or dropped with its reason already counted */
     e.item = self; e.op = 2;
+    e.qtyBefore = before;
     e.quantity = after;   // ABSOLUTE, not the delta - see items.h's table and ApplyItemMove's op 2
     if (ItIntPod(self, kItemX, &e.x) == 0 || ItIntPod(self, kItemY, &e.y) == 0) { ::InterlockedIncrement64(&g_itemReadFault); return; }
     if (ItSecNameInto((const char*)section + kSecName, e.section) == 0) return;   // already counted
@@ -3630,6 +3641,7 @@ void* detour_takeOneItemOnly(void* inv, void* data)
     ItemsLootTouch(src, kLootTouchPartial);   /* loot2c part A: part of a copy taken off - what detour D says for a split */
     if (ItAddressee(inv, &e) == 0) return ret;   /* a character, a box, or dropped with its reason already counted */
     e.item = src; e.op = 2; e.quantity = q1;   /* ABSOLUTE, as detour C's op 2 */
+    e.qtyBefore = q0;   /* the stack's count before the take (a hand-back wait takes the change back out of its baseline with it) */
     e.takeOneClone = ret;   /* par1 (parity P1): the unit handed out - on a box the other game writes the drain routes it (PASS 2f) */
     ItQueue(e);
     ::InterlockedIncrement64(&g_takeOneRung);
@@ -3666,6 +3678,7 @@ void* detour_buyItem(void* inv, void* item, void* buyer)
     ItemsLootTouch(item, kLootTouchPartial);   /* part of a stack taken off - what detour_takeOneItemOnly says */
     if (ItAddressee(inv, &e) == 0) return ret;   /* a character, a box, or dropped with its reason already counted */
     e.item = item; e.op = 2; e.quantity = q1;   /* ABSOLUTE, as detour C's op 2 */
+    e.qtyBefore = q0;   /* the stack's count before the purchase (a hand-back wait takes the change back out of its baseline with it) */
     ItQueue(e);
     ::InterlockedIncrement64(&g_buyRung);
     return ret;
@@ -3719,6 +3732,7 @@ void detour_researchConsume(void* research, void* data, int need)
     ItemsLootTouch(item, kLootTouchPartial);
     if (ItAddressee(invs[k], &e) == 0) return;   /* a character, a box, or dropped with its reason already counted */
     e.item = item; e.op = 2; e.quantity = q1;
+    e.qtyBefore = qty[k];   /* the stack's count before the consume, read when it was fetched (a hand-back wait takes the change back out of its baseline with it) */
     ItQueue(e);
     ::InterlockedIncrement64(&g_rcRung);
 }
@@ -3826,16 +3840,36 @@ long long g_chargeSeq = 0;              /* test lever: bumps on every recorded c
 int g_chargeLast = 0;                   /* test lever: the last recorded charge */
 struct ItChargeArm { int armed; int route; void* ch; unsigned int uid; int haveBefore; int before; int forMoney; LONG lo; };
 
-/* The character WE own whose own inventory the (live) window `gui` shows, or 0. */
+/* The character WE own whose own inventory the (live) window `gui` shows, or 0.
+   A BACKPACK'S WINDOW BELONGS TO THE CHARACTER CARRYING IT. Its inventory is the backpack's own, whose owner is the backpack item
+   (kOwnBackpack), not a character - so the answer is read from the window the backpack's window was opened from: InventoryGUI
+   +0x38, the parent window the engine's own trade-partner lookup 0x70D100 steps to from a backpack's window (it reads `this+0x38`
+   and the partner's +0x38 directly, decomp_70d100 :23-25 and :73-75). A backpack inside a backpack steps again, at most
+   kGuiParentSteps times. Only a backpack's window is stepped: no other window's +0x38 has been read. The pointer reads are
+   guarded (ItPtrPod / ItPlaus); the inventory call goes through the window's own function table, which a guard cannot make safe
+   on a freed window - the callers run on the main thread, which is what closes windows, and the engine's own 0x70D100 reads +0x38
+   of any open window unchecked, so a live window's +0x38 is 0 or a live window. */
+const size_t kGuiParentWin = 0x38;   /* InventoryGUI: the window this one was opened from (0 for a top-level window) */
+const int kGuiParentSteps = 4;
 void* ItChargeMineOfGui(void* gui, unsigned int* uid)
 {
     *uid = 0;
     if (gui == 0) return 0;
-    void* inv = 0;
-    if (ItGuiInventoryCall(gui, &inv) == 0 || inv == 0) return 0;
-    int why = kOwnUnknown;
-    void* ch = ItOwnerOf(inv, &why);
-    if (why != kOwnChar || ch == 0) return 0;
+    void* ch = 0;
+    for (int step = 0; step <= kGuiParentSteps; ++step)
+    {
+        void* inv = 0;
+        if (ItGuiInventoryCall(gui, &inv) == 0 || inv == 0) return 0;
+        int why = kOwnUnknown;
+        ch = ItOwnerOf(inv, &why);
+        if (why == kOwnChar) break;
+        ch = 0;
+        if (why != kOwnBackpack) return 0;
+        void* parent = 0;
+        if (ItPtrPod(gui, kGuiParentWin, &parent) == 0 || parent == 0 || parent == gui || !ItPlaus(parent)) return 0;
+        gui = parent;
+    }
+    if (ch == 0) return 0;
     const unsigned int u = FindSpawnedUid(ch);
     if (u == 0 || !net::IsUidMineAnyThread(u)) return 0;
     *uid = u;
@@ -3847,6 +3881,77 @@ void ItChargeNotePickup(void* gui)
     void* ch = ItChargeMineOfGui(gui, &u);
     g_chargePickChar = ch; g_chargePickUid = u;
 }
+// PROBE-START: P133 - every trade-charge end: who the trader is, who runs it, what the right-click intercept answered (T-755)
+// Diagnostic only: reads, never writes. Every line `[PROBE] P133`; the first 60 per kind, then every 20th.
+long long g_p133ChargeLines = 0, g_p133RestockLines[4] = { 0, 0, 0, 0 }, g_p133CopyLines = 0;
+void* g_p133ChargeOther = 0;   /* the window on the other side from the buyer's, in the armed trade step (read through its own call only) */
+int g_p133IcGate = -2;         /* ShopInterceptRClick's gate for the current right-click: -1 not a shop window, -2 not asked (drag) */
+int P133CapOk(long long* n) { ++*n; return (*n <= 60 || (*n % 20) == 0) ? 1 : 0; }
+std::string P133D(double v) { char b[48]; _snprintf(b, 47, "%.1f", v); b[47] = 0; return b; }
+std::string P133YN(int v) { return (v < 0) ? std::string("?") : std::string(v != 0 ? "y" : "n"); }
+const char* P133GateWord(int g)
+{
+    if (g == -2) return "n/a";
+    if (g == -1) return "not-a-shop-window";
+    if (g == coopshop::kGateOriginal) return "original(no home, no packs behind the window)";
+    if (g == coopshop::kGateHeldHere) return "held-here(original runs)";
+    if (g == coopshop::kGateIntercept) return "intercept";
+    if (g == coopshop::kGateRefuse) return "refuse";
+    return "other";
+}
+void P133ChargeLine(const ItChargeArm* a, int haveAfter, int after, int charge, int measured, int result)
+{
+    const int recorded = (measured != 0 || tradecharge::KeepUnmeasured(a->route, a->haveBefore, haveAfter, a->forMoney) != 0) ? 1 : 0;
+    const LONG hi = ::InterlockedCompareExchange(&g_ticket, 0, 0);
+    if (P133CapOk(&g_p133ChargeLines) == 0) return;
+    std::string kind = "?";
+    unsigned int tu = 0, lu = 0;
+    int tRun = -1, gRun = -1;
+    void* inv = 0;
+    if (g_p133ChargeOther != 0 && ItGuiInventoryCall(g_p133ChargeOther, &inv) != 0 && inv != 0)
+    {
+        int why = kOwnUnknown;
+        void* ch = ItOwnerOf(inv, &why);
+        if (why == kOwnShopFacade)
+        {
+            void* owner = 0;
+            kind = "shop-window";
+            ch = (ItPtrPod(inv, kInvOwner, &owner) != 0 && ItPlaus(owner)) ? ItShopFacadeTrader(owner) : 0;
+        }
+        else if (why == kOwnChar) kind = "character";
+        else if (why == kOwnBuilding) { kind = "counter"; ch = 0; }
+        else if (why == kOwnBackpack) { kind = "backpack"; ch = 0; }
+        else { kind = "other"; ch = 0; }
+        if (ch != 0 && ItPlaus(ch))
+        {
+            tu = FindSpawnedUid(ch);
+            if (tu != 0) tRun = net::IsUidMineAnyThread(tu) ? 1 : 0;
+            void* ap = coop::SquadActivePlatoonOf((::Character*)ch);
+            void* leader = 0;
+            if (ap != 0 && ItPtrPod(ap, kApSquadLeader, &leader) != 0 && ItPlaus(leader))
+            {
+                lu = FindSpawnedUid(leader);
+                if (lu != 0) gRun = net::IsUidMineAnyThread(lu) ? 1 : 0;
+            }
+        }
+    }
+    DebugLog("[PROBE] P133 charge-end #" + N(g_p133ChargeLines)
+             + " route=" + std::string(a->route == tradecharge::kRouteDrag ? "drag" : "rclick")
+             + " icGate=" + std::string(a->route == tradecharge::kRouteDrag ? "n/a" : P133GateWord(g_p133IcGate))
+             + " buyer=" + N((long long)a->uid)
+             + " trader=" + kind + " traderUid=" + (tu != 0 ? N((long long)tu) : std::string("?"))
+             + " traderRunHere=" + P133YN(tRun)
+             + " groupLeader=" + (lu != 0 ? N((long long)lu) : std::string("?")) + " groupRunHere=" + P133YN(gRun)
+             + " itemEvents=" + N((long long)(hi - a->lo))
+             + " purseBefore=" + (a->haveBefore != 0 ? N((long long)a->before) : std::string("?"))
+             + " purseAfter=" + (haveAfter != 0 ? N((long long)after) : std::string("?"))
+             + " charge=" + (measured != 0 ? N((long long)charge) : std::string("unmeasured"))
+             + " forMoney=" + N((long long)a->forMoney) + " result=" + N((long long)result)
+             + " recorded=" + P133YN(recorded)
+             + " pending=" + std::string(recorded != 0 ? "later(the next [TRADE] charge line of this route names it; none = no request)"
+                                                       : "none(not recorded: no request can carry it)"));
+}
+// PROBE-END: P133
 void ItChargeBegin(ItChargeArm* a, int route, void* guiA, void* guiB, void* pickCh, unsigned int pickUid)
 {
     a->armed = 0; a->route = route; a->ch = 0; a->uid = 0; a->haveBefore = 0; a->before = 0; a->forMoney = -1;
@@ -3859,6 +3964,9 @@ void ItChargeBegin(ItChargeArm* a, int route, void* guiA, void* guiB, void* pick
     a->haveBefore = ItPurseRead(a->ch, &a->before);
     /* the engine's own money question, on the pair the call passes (this, sendingTo) - a trade it refuses still logs, charge 0 */
     if (route == tradecharge::kRouteRClick && guiA != 0 && guiB != 0) ItTradingForMoneyPair(guiA, guiB, &a->forMoney);
+    // PROBE-START: P133 - the window on the other side from the buyer's
+    { unsigned int p133u = 0; void* p133a = ItChargeMineOfGui(guiA, &p133u); g_p133ChargeOther = (p133a != 0 && p133a == a->ch) ? guiB : guiA; }
+    // PROBE-END: P133
     a->armed = 1;
 }
 void ItChargeEnd(const ItChargeArm* a, int result)
@@ -3870,6 +3978,9 @@ void ItChargeEnd(const ItChargeArm* a, int result)
     /* T-164 B4-2: a right-click money trade whose purse could not be read is kept UNMEASURED, so its refusal can still give back
        the carried price (tradecharge::RefundPick); everything else IsTrade does not record stays unrecorded, as in B4-1. */
     const int measured = tradecharge::IsTrade(a->haveBefore, haveAfter, charge, a->forMoney);
+    // PROBE-START: P133 - every armed trade-charge end
+    P133ChargeLine(a, haveAfter, after, charge, measured, result);
+    // PROBE-END: P133
     if (measured == 0 && tradecharge::KeepUnmeasured(a->route, a->haveBefore, haveAfter, a->forMoney) == 0) return;
     const LONG hi = ::InterlockedCompareExchange(&g_ticket, 0, 0);
     if (measured != 0) { ++g_chargeSeq; g_chargeLast = charge; }
@@ -3925,6 +4036,9 @@ int* detour_rclickTrade(void* gui, int* ret, const void* sectionStr, int x, int 
 {
     ItNoteThread(&g_thrRclickTradeMain, &g_thrRclickTradeOff);
     int shadow = kShopNoShadow;
+    // PROBE-START: P133 - the intercept's gate for this click (set inside ShopInterceptRClick)
+    g_p133IcGate = -1;
+    // PROBE-END: P133
     if (ShopInterceptRClick(gui, ret, sectionStr, x, y, sendingTo, first, &shadow) != 0) return ret;
     const long long seqBefore = g_chargeSeq;
     ItChargeArm a;
@@ -4539,10 +4653,29 @@ void ItFurnCandidates(const ItBoxKeyParts& want, void** cand, long* candY10, int
     }
 }
 
+/* ItBoxResolve's wire-form look-ups (a key that arrived with its record name verbatim where this game's box keys hash it) */
+long long g_boxKeyWireFormed = 0;
+int g_boxKeyWireSaid = 0;
 void* ItBoxResolve(const char* key)
 {
     g_boxLastVerdict = kObjKeyRefused;   /* build1-e (recheck-build1d F2): every exit below says why it returned */
     if (key == 0 || key[0] == 0) return 0;
+    /* the key in its wire form - the text this game's own box key builder (kBoxKeyCap) gives the same piece. A key of kBoxKeyCap..63
+       characters composed in a 64-byte buffer (pp.build rows and PLACE keys, doors, farms) names its record verbatim where the builder
+       hashes it; the cache, the walk, the near-miss diagnosis and the cache row below all work on the wire form. */
+    char wireKey[kBoxKeyCap];
+    if (poskey::WireForm(key, wireKey, kBoxKeyCap) == 2)
+    {
+        ++g_boxKeyWireFormed;
+        if (g_boxKeyWireSaid < 20)
+        {
+            ++g_boxKeyWireSaid;
+            DebugLog("[ITEMS] box key '" + std::string(key) + "' is looked up as '" + std::string(wireKey) + "': the same piece's key with"
+                     " its record name hashed, the form this game's box keys take for a key that long (wireFormed="
+                     + N(g_boxKeyWireFormed) + ")");
+        }
+        key = wireKey;
+    }
     /* review-p6e MEDIUM-6: THE WALK STOPS WHILE THE ENGINE IS TEARING THE WORLD DOWN. It makes three virtual
        calls per object in every active zone, and at P6e it stopped being lever-only and became
        inbound-message-driven. SEH catches a fault; it does not catch a virtual call into freed-but-committed
@@ -4660,8 +4793,8 @@ void* ItBoxResolve(const char* key)
                ItBoxKeyNear no longer makes; a prefilter that is tighter than the matcher would refuse rows
                the matcher would have taken. */
             int pokx = 0, pokz = 0;
-            const long hx10 = ItTenthsOfAUnit(p[0], &pokx);
-            const long hz10 = ItTenthsOfAUnit(p[2], &pokz);
+            const long hx10 = poskey::TenthsOfAUnit(p[0], &pokx);
+            const long hz10 = poskey::TenthsOfAUnit(p[2], &pokz);
             if (pokx == 0 || pokz == 0) continue;
             {
                 long pdx = hx10 - want.x10; if (pdx < 0) pdx = -pdx;
@@ -4788,11 +4921,13 @@ void* ItBoxResolve(const char* key)
 // in it is consumed by createItem immediately, and clothing.cpp:163-169's caveat is unchanged and still
 // applies - the container is BORROWED and its records are dropped when the engine next serialises that
 // platoon. A sync layer that owns its own container is still not built and is still not claimed to be.
-::GameDataContainer* ItAnyScratchContainer()
+/* The walk itself, counting nothing - also half of ItCanMakeItems ("can an item be made here now?"): a game still loading
+   may have no active character with a squad container yet. */
+::GameDataContainer* ItScratchWalk()
 {
-    if (!ItPlaus(coop::GameWorldPtr())) { ++g_boxNoScratch; return 0; }
+    if (!ItPlaus(coop::GameWorldPtr())) return 0;
     const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
-    if (all.size() > 20000) { ++g_boxNoScratch; return 0; }
+    if (all.size() > 20000) return 0;
     int looked = 0;
     for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
     {
@@ -4800,8 +4935,43 @@ void* ItBoxResolve(const char* key)
         ::GameDataContainer* g = ItScratchContainer(*it);
         if (g != 0) return g;
     }
-    ++g_boxNoScratch;
     return 0;
+}
+::GameDataContainer* ItAnyScratchContainer()
+{
+    ::GameDataContainer* g = ItScratchWalk();
+    if (g == 0) ++g_boxNoScratch;
+    return g;
+}
+/* Can an item be made here now? ItCreateItem needs both a scratch container (ItScratchWalk) and the game's item maker (the
+   world's object factory); a game still loading may have either missing. 1 / 0; counts nothing. The parity apply's and the
+   swap's gate, and the held boxes' re-ask (ItParityTick step 3a). */
+int ItCanMakeItems()
+{
+    /* T-734 TEST-ONLY lever parityholdsec=<n>: answers 0 for <n> s from the first ask made while the key is set, so a test
+       sees an incoming box answer HELD and re-asked afterwards; then the real answer below. Key absent (0): nothing here acts.
+       0 not started, 1 holding, 2 ended. Elapsed time is unsigned subtraction, safe across GetTickCount's wrap. */
+    static int s_testHoldState = 0;
+    static unsigned int s_testHoldStart = 0;
+    if (s_testHoldState != 2)
+    {
+        const int holdSec = ConfigParityHoldSec();
+        if (s_testHoldState == 0 && holdSec > 0)
+        {
+            s_testHoldState = 1;
+            s_testHoldStart = ::GetTickCount();
+            DebugLog("[PARITY] TEST-ONLY parityholdsec=" + N((long long)holdSec) + ": this game answers 'items cannot be made yet' for "
+                     + N((long long)holdSec) + " s from now");
+        }
+        if (s_testHoldState == 1)
+        {
+            if (holdSec > 0 && (unsigned int)(::GetTickCount() - s_testHoldStart) < (unsigned int)holdSec * 1000u) return 0;
+            s_testHoldState = 2;
+            DebugLog("[PARITY] TEST-ONLY parityholdsec hold ended - items can be made again (when the game can)");
+        }
+    }
+    if (ItScratchWalk() == 0) return 0;
+    return (coop::GameWorldPtr() != 0 && ItPlaus(coop::GameWorldPtr()->objectFactory)) ? 1 : 0;
 }
 
 // Does this section HAVE the cell the wire named? This is InventorySection::getItemAt's own test, for the
@@ -4968,6 +5138,202 @@ int ItSetOwnerPod(void* item, const hand* h, unsigned int wantType)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* A STOLEN MARK WAITING FOR ITS OWNER (src/common/ownpark.h). ItOwnerApply runs on a fresh item BEFORE it enters any inventory;
+   when the mark names a character or squad by a uid that is not on this game yet, the item is held:
+   FRESH  - by address only, and only until this frame's ItemsTick ends (ItOwnParkSettle): by then the item has been placed, so its
+            own engine hand (RootObjectBase::handle) and its place are read, and the hand must name it through the engine's own
+            lookup (hand::getItem). The destroy notice (ItemsLootNoteDestroy -> ItOwnParkForget) clears an entry whose item is
+            destroyed first; an entry made after this frame's ItemsTick is dropped unread when the next frame starts
+            (ItemOwnParkFrameStart), so no item address is kept from one frame to the next.
+   PARKED - by hand, record and place only. Tried at the ItemsTick after a uid is registered here (spawn.cpp -> ItemOwnParkNoteUid)
+            and every ownpark::kParkRetryMs; the mark goes on (ItOwnerResolve + ItSetOwnerPod, booked as an arrival's apply) only
+            when the hand still names an item of the same record, still clean, at the same place (ownpark::Judge) - anything else
+            drops the entry, counted. Given up after ownpark::kParkLimitMs, counted and said. A PACK is never parked: setProperOwner
+            on a filled pack spreads the mark to its clean rows, which an arrival's mark never does.
+   At most ownpark::kParkCap of each; both lists are emptied at world teardown. MAIN THREAD, except ItOwnParkForget and
+   ItemOwnParkNoteUid (any thread, interlocked). */
+struct ItOwnFresh { void* volatile item; coopmark::OwnerId owner; std::string sid; int row; };
+struct ItOwnParked { int used; unsigned int w5[5]; coopmark::OwnerId owner; std::string sid; ownpark::Place at; int row; DWORD since; };
+ItOwnFresh g_ownParkFresh[ownpark::kParkCap];
+ItOwnParked g_ownParkList[ownpark::kParkCap];
+volatile LONG g_ownParkFreshN = 0;   /* fresh entries made since the last settle (lets the any-thread forget skip its walk) */
+int g_ownParkUsed = 0;
+volatile LONG g_ownParkNoted[ownpark::kNotedCap];
+volatile LONG g_ownParkNotedAt = 0;
+DWORD g_ownParkLastTry = 0;
+volatile LONG64 g_ownParkDestroyed = 0;   /* ANY THREAD: a fresh item destroyed before it settled */
+long long g_ownParkParked = 0, g_ownParkApplied = 0, g_ownParkExpired = 0, g_ownParkGone = 0, g_ownParkChanged = 0, g_ownParkMoved = 0,
+          g_ownParkFull = 0, g_ownParkOutside = 0, g_ownParkPack = 0, g_ownParkHandLost = 0, g_ownParkTeardown = 0;
+/* MAIN THREAD, ItOwnerApply: the fresh item and its unresolved mark, until this frame's settle. 1 held. */
+int ItOwnParkFresh(::Item* item, const ItemMoveMsg& m)
+{
+    if (item == 0 || !ownpark::ShouldPark(m.owner)) return 0;
+    for (int i = 0; i < ownpark::kParkCap; ++i)
+    {
+        ItOwnFresh& f = g_ownParkFresh[i];
+        if (::InterlockedCompareExchangePointer(&f.item, 0, 0) != 0) continue;
+        f.owner = m.owner; f.sid = m.baseSid; f.row = (m.ownerFrom == 1) ? 1 : 0;
+        ::InterlockedExchangePointer(&f.item, (void*)item);
+        ::InterlockedIncrement(&g_ownParkFreshN);
+        return 1;
+    }
+    ++g_ownParkFull;
+    return 0;
+}
+/* ANY THREAD (the engine's destroy notice): a fresh entry naming this object is cleared - pointer compare only. */
+void ItOwnParkForget(const void* obj)
+{
+    if (::InterlockedCompareExchange(&g_ownParkFreshN, 0, 0) == 0) return;
+    for (int i = 0; i < ownpark::kParkCap; ++i)
+        if (::InterlockedCompareExchangePointer(&g_ownParkFresh[i].item, 0, (void*)obj) == obj) ::InterlockedIncrement64(&g_ownParkDestroyed);
+}
+/* The item a hand names on THIS game, through the engine's own lookup (a stale hand answers null). */
+static void* ItItemByHandPod(const hand* h)
+{
+    __try { return (void*)h->getItem(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* an item's record, whether it is clean, and where it stands. 1 read. */
+static int ItOwnParkLook(void* it, std::string* sid, bool* clean, ownpark::Place* at)
+{
+    ItEntry e; ItClear(&e);
+    char sec[kSecCap]; sec[0] = 0;
+    int inInv = 0, x = -1, y = -1;
+    if (ItReadFields(it, &e) != 1) return 0;
+    if (ItBytePod(it, kItemInInv, &inInv) == 0 || ItIntPod(it, kItemX, &x) == 0 || ItIntPod(it, kItemY, &y) == 0) return 0;
+    if (inInv != 0 && ItStrPod((const char*)it + kItemSection, sec, kSecCap) == 0) return 0;
+    *sid = e.baseSid;
+    *clean = (e.ownerHave == 0 || !coopmark::RawHandIsOwner(e.ownerRaw));
+    at->inInv = inInv; at->x = x; at->y = y; at->section = (inInv != 0) ? std::string(sec) : std::string();
+    return 1;
+}
+static void ItOwnParkDrop(int i)
+{
+    g_ownParkList[i].used = 0;
+    g_ownParkList[i].sid.clear();
+    if (g_ownParkUsed > 0) --g_ownParkUsed;
+}
+/* MAIN THREAD, the end of ItemsTick: each fresh item has been placed - its hand and place are read and it is parked. */
+static void ItOwnParkSettle()
+{
+    if (::InterlockedCompareExchange(&g_ownParkFreshN, 0, 0) == 0) return;
+    const DWORD now = ::GetTickCount();
+    for (int i = 0; i < ownpark::kParkCap; ++i)
+    {
+        ItOwnFresh& f = g_ownParkFresh[i];
+        void* it = ::InterlockedExchangePointer(&f.item, 0);
+        if (it == 0) continue;
+        unsigned int w[5]; std::memset(w, 0, sizeof(w));
+        std::string sidNow; bool clean = false;
+        ownpark::Place at;
+        int ok = (ItRawHandAtPod(it, kRootHandFields, w) != 0) ? 1 : 0;
+        if (ok != 0) { const hand h = ItHandFromRaw(w); ok = (ItItemByHandPod(&h) == it) ? 1 : 0; }
+        if (ok != 0) ok = ItOwnParkLook(it, &sidNow, &clean, &at);
+        if (ok == 0)
+        {
+            ++g_ownParkHandLost;
+            ItOwnSay("[OWN] park sid=" + f.sid + " owner=" + ItOwnerText(f.owner) + " - its own hand or place would not read once placed; it stays clean (handLost=" + N(g_ownParkHandLost) + ")");
+            continue;
+        }
+        void* bag = 0; void* bagOwner = 0;
+        if (ItPtrPod(it, kBagInventory, &bag) != 0 && ItPlaus(bag) && ItPtrPod(bag, kInvOwner, &bagOwner) != 0 && bagOwner == it)
+        {
+            ++g_ownParkPack;
+            ItOwnSay("[OWN] park sid=" + f.sid + " owner=" + ItOwnerText(f.owner) + " - a pack: not parked (a later mark would spread to its clean rows); it stays clean (pack=" + N(g_ownParkPack) + ")");
+            continue;
+        }
+        if (sidNow != f.sid || !clean)
+        {
+            ++g_ownParkChanged;
+            ItOwnSay("[OWN] park sid=" + f.sid + " owner=" + ItOwnerText(f.owner) + " - the placed item is another record or carries a mark already; not parked (changed=" + N(g_ownParkChanged) + ")");
+            continue;
+        }
+        int slot = -1;
+        for (int j = 0; j < ownpark::kParkCap && slot < 0; ++j) if (g_ownParkList[j].used == 0) slot = j;
+        if (slot < 0)
+        {
+            ++g_ownParkFull;
+            ItOwnSay("[OWN] park sid=" + f.sid + " owner=" + ItOwnerText(f.owner) + " - the park list is full (" + N((long long)ownpark::kParkCap) + "); it stays clean (full=" + N(g_ownParkFull) + ")");
+            continue;
+        }
+        ItOwnParked& p = g_ownParkList[slot];
+        p.used = 1; std::memcpy(p.w5, w, sizeof(w)); p.owner = f.owner; p.sid = f.sid; p.at = at; p.row = f.row; p.since = now;
+        ++g_ownParkUsed; ++g_ownParkParked;
+        ItOwnSay("[OWN] park sid=" + f.sid + " owner=" + ItOwnerText(f.owner) + " PARKED at " + (at.inInv != 0 ? at.section : std::string("(not in an inventory)"))
+                 + ":" + N((long long)at.x) + "," + N((long long)at.y) + " until that owner is on this game (parked=" + N(g_ownParkParked) + ")");
+    }
+    ::InterlockedExchange(&g_ownParkFreshN, 0);
+}
+/* MAIN THREAD. One parked mark: 1 = done with (applied, or dropped counted), 0 = its owner is still not here. */
+static int ItOwnParkTry(ItOwnParked& p, DWORD now)
+{
+    if (ownpark::Expired((unsigned int)now, (unsigned int)p.since))
+    {
+        ++g_ownParkExpired;
+        ItOwnSay("[OWN] park sid=" + p.sid + " owner=" + ItOwnerText(p.owner) + " - the owner did not come in " + N((long long)(ownpark::kParkLimitMs / 1000))
+                 + " s; given up, the item stays clean (expired=" + N(g_ownParkExpired) + ")");
+        return 1;
+    }
+    unsigned int w[5]; std::memset(w, 0, sizeof(w));
+    if (ItOwnerResolve(p.owner, w) == 0) return 0;
+    const hand ih = ItHandFromRaw(p.w5);
+    void* it = ItItemByHandPod(&ih);
+    std::string sidNow; bool clean = false;
+    ownpark::Place at;
+    const bool found = (it != 0 && ItPlaus(it) && ItOwnParkLook(it, &sidNow, &clean, &at) != 0);
+    const int j = ownpark::Judge(found, p.sid, p.at, sidNow, clean, at);
+    if (j != ownpark::kFoundApply)
+    {
+        long long& c = (j == ownpark::kFoundGone) ? g_ownParkGone : (j == ownpark::kFoundMoved) ? g_ownParkMoved : g_ownParkChanged;
+        ++c;
+        ItOwnSay("[OWN] park sid=" + p.sid + " owner=" + ItOwnerText(p.owner) + " - the owner is here but the item "
+                 + (j == ownpark::kFoundGone ? std::string("is gone") : j == ownpark::kFoundMoved ? std::string("has moved") : std::string("changed"))
+                 + "; dropped, nothing marked (" + N(c) + ")");
+        return 1;
+    }
+    const hand oh = ItHandFromRaw(w);
+    const int r = ItSetOwnerPod(it, &oh, w[0]);
+    if (r == 1) { if (p.row != 0) ++g_markRowApplied; else ++g_markApplied; ++g_ownParkApplied; }
+    else ++g_markApplyFault;
+    ItOwnSay("[OWN] park sid=" + p.sid + " owner=" + ItOwnerText(p.owner) + " type=" + N((long long)w[0])
+             + (r == 1 ? std::string(" APPLIED (the owner is on this game now; applied=") + N(g_ownParkApplied) + ")"
+                       : r == 2 ? std::string(" set but read back different") : std::string(" FAULTED")));
+    return 1;
+}
+/* MAIN THREAD, the end of every ItemsTick: settle the fresh items, try the marks of uids registered since, and the slow retry. */
+static void ItOwnParkTick()
+{
+    ItOwnParkSettle();
+    if (g_ownParkUsed == 0)
+    {   /* nothing parked: the uids noted since are drained all the same, so none waits to match an entry parked later */
+        for (int k = 0; k < ownpark::kNotedCap; ++k) ::InterlockedExchange(&g_ownParkNoted[k], 0);
+        return;
+    }
+    const DWORD now = ::GetTickCount();
+    for (int k = 0; k < ownpark::kNotedCap; ++k)
+    {
+        const unsigned int uid = (unsigned int)::InterlockedExchange(&g_ownParkNoted[k], 0);
+        if (uid == 0) continue;
+        for (int i = 0; i < ownpark::kParkCap; ++i)
+            if (g_ownParkList[i].used != 0 && g_ownParkList[i].owner.uid == uid && ItOwnParkTry(g_ownParkList[i], now) != 0) ItOwnParkDrop(i);
+    }
+    if (!ownpark::RetryDue((unsigned int)now, (unsigned int)g_ownParkLastTry)) return;
+    g_ownParkLastTry = now;
+    for (int i = 0; i < ownpark::kParkCap; ++i)
+        if (g_ownParkList[i].used != 0 && ItOwnParkTry(g_ownParkList[i], now) != 0) ItOwnParkDrop(i);
+}
+/* MAIN THREAD, world teardown: every entry names the world that is going - forgotten, counted. */
+static void ItOwnParkClearAll()
+{
+    for (int i = 0; i < ownpark::kParkCap; ++i)
+    {
+        ::InterlockedExchangePointer(&g_ownParkFresh[i].item, 0);
+        if (g_ownParkList[i].used != 0) { ++g_ownParkTeardown; ItOwnParkDrop(i); }
+    }
+    for (int k = 0; k < ownpark::kNotedCap; ++k) ::InterlockedExchange(&g_ownParkNoted[k], 0);
+    ::InterlockedExchange(&g_ownParkFreshN, 0);
+    g_ownParkUsed = 0;
+}
 /* MAIN THREAD, from ItCreateItem (setFields 1): the mark goes on BEFORE the item enters any inventory. The wire's owner first; a
    TAKE's local D5-2 hand when the confirm carried none. */
 void ItOwnerApply(::Item* item, const ItemMoveMsg& m)
@@ -4979,10 +5345,13 @@ void ItOwnerApply(::Item* item, const ItemMoveMsg& m)
         if (m.ownerFrom == 1) ++g_markRowReceived; else ++g_markReceived;   /* inv6 phase 2: a list row is counted apart */
         if (m.ownerFrom != 1 && g_markReceived == 1) DebugLog("[OWN] received first OWN1 this session sid=" + m.baseSid + " owner=" + ItOwnerText(m.owner));   /* inv6b */
         if (ItOwnerResolve(m.owner, w) == 0)
-        {
+        {   /* the owner is not on this game: a character or squad named by uid is waited for (ItOwnParkFresh), the item clean meanwhile */
             if (m.ownerFrom == 1) ++g_markRowUnresolved; else ++g_markUnresolved;
-            ItOwnSay("[OWN] arrive sid=" + m.baseSid + " owner=" + ItOwnerText(m.owner) + " UNRESOLVED here - the item stays clean (interim rule; "
-                     + (m.ownerFrom == 1 ? "rowUnresolved=" + N(g_markRowUnresolved) : "ownerUnresolved=" + N(g_markUnresolved)) + ")");   /* review-inv6p2 LOW: a row names its own counter */
+            const int parked = ItOwnParkFresh(item, m);
+            ItOwnSay("[OWN] arrive sid=" + m.baseSid + " owner=" + ItOwnerText(m.owner)
+                     + (parked != 0 ? " UNRESOLVED here - held clean until that owner is on this game (up to " + N((long long)(ownpark::kParkLimitMs / 1000)) + " s; "
+                                    : std::string(" UNRESOLVED here - the item stays clean (no owner uid to wait for, or no room to wait; "))
+                     + (m.ownerFrom == 1 ? "rowUnresolved=" + N(g_markRowUnresolved) : "ownerUnresolved=" + N(g_markUnresolved)) + ")");   /* a row names its own counter */
             return;
         }
     }
@@ -5002,6 +5371,106 @@ void ItOwnerApply(::Item* item, const ItemMoveMsg& m)
              + " type=" + N((long long)w[0]) + (r == 1 ? std::string(" APPLIED") : r == 2 ? std::string(" set but read back different") : std::string(" FAULTED")));
 }
 
+/* the [GEAR] lines: the first 40 of a session, then one in 200 */
+void ItGearSay(const std::string& line)
+{
+    static long long said = 0;
+    ++said;
+    if (said <= 40 || said % 200 == 0) DebugLog(line);
+}
+/* SENDER, MAIN THREAD: gear marks read off an item (ItGearReadPod's state, uniform pointer and crafter) as they travel - the uniform's
+   faction by its wire name (RelationsWireSid: an FCS stringID, or a player faction's "@slot:<n>[:<name>]"), the crafter's text. A
+   field that cannot travel (no wire name, over its bound, a control byte) is left empty and counted (itemGear dropped); book 0: not
+   counted (a list row read again, a comparison, a print). */
+void ItGearOfRaw(int state, void* uniform, const char* crafter, gearwire::GearMarks* out, int book)
+{
+    *out = gearwire::GearMarks();
+    if (state == 0) return;
+    long long dropped = 0;
+    if (uniform != 0)
+    {
+        std::string sid;
+        if (ItPlaus(uniform)) sid = RelationsWireSid((::Faction*)uniform);
+        if (!sid.empty() && gearwire::GearTextOk(sid, gearwire::kGearMaxSid)) out->uniformSid = sid;
+        else ++dropped;
+    }
+    if (state == 2) ++dropped;
+    else if (crafter != 0 && crafter[0] != 0)
+    {
+        const std::string cr(crafter);
+        if (gearwire::GearTextOk(cr, gearwire::kGearMaxCrafter)) out->crafter = cr;
+        else ++dropped;
+    }
+    if (dropped != 0 && book != 0)
+    {
+        g_gearDropped += dropped;
+        ItGearSay("[GEAR] send: " + N(dropped) + " field(s) of an item's uniform / crafter cannot travel - sent empty (dropped=" + N(g_gearDropped) + ")");
+    }
+}
+/* the same from an entry ItReadFields filled */
+void ItGearOf(const ItEntry& e, gearwire::GearMarks* out, int book = 1)
+{
+    ItGearOfRaw(e.gearState, e.gearUniform, e.gearCrafter, out, book);
+}
+/* RECEIVER, MAIN THREAD, from ItCreateItem (setFields 1) and the kit's copy: a fresh item (in no inventory yet) takes its gear marks -
+   the uniform's faction found by its wire name (RelationsFactionFromWire; one not in this game is logged and counted, the uniform left
+   off), the crafter's text. Written only on a gear item (ItKeptMarksPod); marks for any other item are counted and dropped. 1 written. */
+int ItGearApply(::Item* item, const gearwire::GearMarks& g, const std::string& sid)
+{
+    if (item == 0 || gearwire::GearEmpty(g)) return 0;
+    ++g_gearReceived;
+    if (ItGearMarksPod((void*)item) == 0)
+    {
+        ++g_gearNotGear;
+        ItGearSay("[GEAR] arrive sid=" + sid + " " + gearwire::GearWords(g) + " - not a gear item here: the marks are dropped (notGear=" + N(g_gearNotGear) + ")");
+        return 0;
+    }
+    ::Faction* f = 0;
+    if (!g.uniformSid.empty())
+    {
+        f = RelationsFactionFromWire(g.uniformSid);
+        if (f == 0)
+        {
+            ++g_gearUnknownFaction;
+            ItGearSay("[GEAR] arrive sid=" + sid + " uniform=" + g.uniformSid + " - no such faction in this game: the uniform is left off (unknownFaction="
+                      + N(g_gearUnknownFaction) + ")");
+        }
+    }
+    if (f == 0 && g.crafter.empty()) return 0;
+    if (ItKeptMarksPod((void*)item, (void*)f, f != 0 ? 1 : 0, g.crafter.empty() ? 0 : g.crafter.c_str(), g.crafter.size()) == 0)
+    {
+        ++g_gearFault;
+        ItGearSay("[GEAR] arrive sid=" + sid + " - writing the uniform / crafter FAULTED (fault=" + N(g_gearFault) + ")");
+        return 0;
+    }
+    ++g_gearApplied;
+    ItGearSay("[GEAR] arrive sid=" + sid + " " + gearwire::GearWords(g) + (f == 0 && !g.uniformSid.empty() ? std::string(" (uniform left off)") : std::string())
+              + " APPLIED (applied=" + N(g_gearApplied) + ")");
+    return 1;
+}
+/* MAIN THREAD, the undo's LOCAL re-create (ItCreateItem with gearLocal 1): the item's own uniform pointer and crafter text, as they
+   were read off it, go back as they were - no wire-name round trip, so a uniform with no wire name or a crafter longer than the wire
+   carries is not lost, and nothing is booked as received or applied. A uniform pointer that no longer looks like an object is left
+   off. 1 written. */
+int ItGearApplyLocal(::Item* item, const ItemMoveMsg& m)
+{
+    void* f = (m.gearLocalUniform != 0 && ItPlaus(m.gearLocalUniform)) ? m.gearLocalUniform : 0;
+    if (item == 0 || (f == 0 && m.gearLocalCrafter.empty())) return 0;
+    if (ItGearMarksPod((const void*)item) == 0)
+    {
+        ++g_gearNotGear;
+        ItGearSay("[GEAR] undo sid=" + m.baseSid + " - not a gear item here: its own uniform / crafter are left off (notGear=" + N(g_gearNotGear) + ")");
+        return 0;
+    }
+    if (ItKeptMarksPod((void*)item, f, f != 0 ? 1 : 0, m.gearLocalCrafter.empty() ? 0 : m.gearLocalCrafter.c_str(), m.gearLocalCrafter.size()) == 0)
+    {
+        ++g_gearFault;
+        ItGearSay("[GEAR] undo sid=" + m.baseSid + " - putting the item's own uniform / crafter back FAULTED (fault=" + N(g_gearFault) + ")");
+        return 0;
+    }
+    ItGearSay("[GEAR] undo sid=" + m.baseSid + " - the item's own uniform / crafter put back on the re-created item");
+    return 1;
+}
 ::Item* ItCreateItem(::Character* c, const ItemMoveMsg& m, int setFields, int ownerAfterFill = 0)
 {
     ::GameDataContainer* container = (c != 0) ? ItScratchContainer(c) : 0;
@@ -5041,6 +5510,8 @@ void ItOwnerApply(::Item* item, const ItemMoveMsg& m)
        spreads it to the clean rows (the take itself is the theft). review-inv6p2 MEDIUM: a mark from the WIRE goes on HERE, onto the
        still-empty pack, so rows that arrived clean or with their own exact marks keep them (coopmark::OwnerPackMarkAfterFill). */
     if (setFields != 0 && ownerAfterFill == 0) ItOwnerApply(item, m);
+    if (setFields != 0 && m.gearLocal != 0) ItGearApplyLocal(item, m);   /* the undo's local re-create: the item's own uniform and crafter back */
+    else if (setFields != 0) ItGearApply(item, m.gear, m.baseSid);   /* the uniform and crafter, before the item enters any inventory (gear items only) */
     return item;
 }
 
@@ -5665,7 +6136,11 @@ int ItBoxMoveToBytes(const ItemMoveMsg& m, std::vector<char>* out)
     /* inv6: a MARKED item's line is "b2" - the "b1" fields plus the owner's kind, uid and faction (ownerwire.h). */
     const int withOwner = (m.owner.kind != 0 && coopmark::OwnerValid(m.owner)) ? 1 : 0;
     if (m.owner.kind != 0 && withOwner == 0) ++g_markJournalInvalid;   /* review-inv6 LOW: a mark that could only be journaled as b1 */
-    std::string o = (withOwner != 0) ? "b2\t" : "b1\t";
+    /* the uniform and crafter (gearwire.h): a line with either is "b3" - b2's three owner fields (kind 0 = none) plus the two */
+    gearwire::GearMarks gear;
+    gearwire::GearClean(m.gear, &gear);
+    const int withGear = gearwire::GearEmpty(gear) ? 0 : 1;
+    std::string o = (withGear != 0) ? "b3\t" : (withOwner != 0) ? "b2\t" : "b1\t";
     ItQPutNum(&o, (long long)m.uid); ItQPutNum(&o, m.op); ItQPutStr(&o, m.section);
     ItQPutNum(&o, m.x); ItQPutNum(&o, m.y); ItQPutNum(&o, m.quantity);
     ItQPutStr(&o, m.baseSid); ItQPutStr(&o, m.companySid); ItQPutStr(&o, m.materialSid); ItQPutStr(&o, m.colorSid);
@@ -5673,7 +6148,12 @@ int ItBoxMoveToBytes(const ItemMoveMsg& m, std::vector<char>* out)
     ItQPutNum(&o, m.functionKind); ItQPutNum(&o, m.level); ItQPutNum(&o, m.unique);
     ItQPutStr(&o, m.boxKey);
     o += m.boxId;
-    if (withOwner != 0) { o += "\t"; o += coopmark::OwnerJournalTail(m.owner); ++g_markJournaled; }
+    if (withGear != 0)
+    {
+        o += "\t"; o += gearwire::GearJournalTail(withOwner != 0 ? m.owner : coopmark::OwnerId(), gear); ++g_gearJournaled;
+        if (withOwner != 0) ++g_markJournaled;
+    }
+    else if (withOwner != 0) { o += "\t"; o += coopmark::OwnerJournalTail(m.owner); ++g_markJournaled; }
     out->assign(o.begin(), o.end());
     return 1;
 }
@@ -5689,7 +6169,8 @@ int ItBoxMoveFromBytes(const std::vector<char>& b, ItemMoveMsg* m)
         f.push_back(s.substr(at, t - at)); at = t + 1;
     }
     const int isB2 = (f.size() == 21 && f[0] == "b2") ? 1 : 0;   /* inv6: b2 = b1 + the owner; b1 reads as no owner */
-    if (isB2 == 0 && (f.size() != 18 || f[0] != "b1")) return 0;
+    const int isB3 = (f.size() == 23 && f[0] == "b3") ? 1 : 0;   /* b3 = b2's owner fields (kind 0 = none) + the uniform and the crafter */
+    if (isB2 == 0 && isB3 == 0 && (f.size() != 18 || f[0] != "b1")) return 0;
     int ok = 1;
     ItemMoveMsg o;
     o.uid          = (unsigned int)ItQToNum(f[1], &ok);
@@ -5710,6 +6191,7 @@ int ItBoxMoveFromBytes(const std::vector<char>& b, ItemMoveMsg* m)
     o.boxKey       = f[16];
     o.boxId        = f[17];
     if (isB2 != 0 && !coopmark::OwnerFromJournal(f[18], f[19], f[20], &o.owner)) return 0;
+    if (isB3 != 0 && !gearwire::GearFromJournal(f[18], f[19], f[20], f[21], f[22], &o.owner, &o.gear)) return 0;
     if (ok == 0) return 0;
     *m = o;
     return 1;
@@ -6891,7 +7373,7 @@ long long g_handbackChangedReask = 0, g_arriveWarnLines = 0;   /* inv7d fold: re
    not since seen another game hold that area (item 2: only such a game hands the box back; cleared when the area rule answers
    held, or when a serve finds this game no longer holds the area). Every change holds g_ownKeyLock (a reader may be off the main
    thread); the main thread, the only writer, reads without it. */
-struct ItOwnKeyRec { int cls; int areaMine; };
+struct ItOwnKeyRec { int cls; int areaMine; double areaSince; };   /* areaSince: the area's "loaded since" stamp at this game's latest area-rule write (0 = none) */
 std::map<std::string, ItOwnKeyRec> g_ownKeyRec;
 volatile LONG g_ownKeyLock = 0;
 const size_t kOwnKeyRecCap = 4096;
@@ -6914,12 +7396,13 @@ void ItOwnKeyNote(const char* key, int cls, int v, int byO)
 {
     if (key == 0 || key[0] == 0) return;
     const std::string k(key);
-    ItOwnKeyRec r; r.cls = cls; r.areaMine = 0;
+    ItOwnKeyRec r; r.cls = cls; r.areaMine = 0; r.areaSince = 0.0;
     std::map<std::string, ItOwnKeyRec>::iterator it = g_ownKeyRec.find(k);
     const int had = (it != g_ownKeyRec.end()) ? 1 : 0;
-    if (had != 0) r.areaMine = it->second.areaMine;
+    if (had != 0) { r.areaMine = it->second.areaMine; r.areaSince = it->second.areaSince; }
     if (byO == 0 && v == kBoxMine) r.areaMine = 1;
     else if (byO == 0 && v == kBoxHeld) r.areaMine = 0;
+    if (r.areaMine == 0) r.areaSince = 0.0;
     if (had != 0 && it->second.cls == r.cls && it->second.areaMine == r.areaMine) return;
     ItOwnKeyLockTake();
     if (had == 0 && g_ownKeyRec.size() >= kOwnKeyRecCap) g_ownKeyRec.clear();
@@ -6940,7 +7423,26 @@ void ItOwnAreaWroteClear(const char* key)
     if (it == g_ownKeyRec.end()) return;
     ItOwnKeyLockTake();
     it->second.areaMine = 0;
+    it->second.areaSince = 0.0;   /* its stamp goes with it: a later area-rule write stamps it again */
     ItOwnKeyLockDrop();
+}
+/* MAIN THREAD: the area's "loaded since" stamp at this game's latest write of the box by the area rule (ItBoxWriterDecide, after
+   ItOwnKeyNote booked that write) */
+void ItOwnAreaStamp(const char* key, double since)
+{
+    if (key == 0 || key[0] == 0) return;
+    std::map<std::string, ItOwnKeyRec>::iterator it = g_ownKeyRec.find(std::string(key));
+    if (it == g_ownKeyRec.end() || it->second.areaMine == 0 || it->second.areaSince == since) return;
+    ItOwnKeyLockTake();
+    it->second.areaSince = since;
+    ItOwnKeyLockDrop();
+}
+/* MAIN THREAD: that stamp while this game is still the box's last area-rule writer (ItOwnAreaWrote), else 0 */
+double ItOwnAreaWroteSince(const char* key)
+{
+    if (key == 0 || key[0] == 0) return 0.0;
+    std::map<std::string, ItOwnKeyRec>::const_iterator it = g_ownKeyRec.find(std::string(key));
+    return (it != g_ownKeyRec.end() && it->second.areaMine != 0) ? it->second.areaSince : 0.0;
 }
 /* world teardown: the records name the world that is going */
 void ItOwnKeyReset()
@@ -6958,7 +7460,7 @@ int ItHandbackPending(ItHandback& h, const std::string& k)
     {
         if (timedOut != 0)
         {
-            h.state = 1; h.timedOut = 1; ++g_handbackTimeout;
+            h.state = 1; h.timedOut = 1; ++g_handbackTimeout; InvNetHoldEnd(k);
             if (g_arriveWarnLines < kOwnUnpairedLineCap)
             {
                 ++g_arriveWarnLines;
@@ -6972,6 +7474,13 @@ int ItHandbackPending(ItHandback& h, const std::string& k)
     ++g_handbackDeferred;
     return kBoxNoAnswer;
 }
+/* 1 = this game's hand-back for the key has not ended (coopown::HandbackWaiting): asked with no answer yet, or contents on the way */
+int ItHandbackWaiting(const std::string& key)
+{
+    std::map<std::string, ItHandback>::const_iterator it = g_ownHandback.find(key);
+    return (it != g_ownHandback.end() && coopown::HandbackWaiting(it->second.state) != 0) ? 1 : 0;
+}
+const float* ItBoxDecidePos(const char* key, const float* pos, float* buf);   /* defined below (ItHandbackGate's area-wrote skip) */
 int ItHandbackGate(void* b, const char* key, const float* pos)
 {
     const double since = MyMapLoadedSinceTS(SectorOf(pos[0], pos[2]));
@@ -6993,6 +7502,54 @@ int ItHandbackGate(void* b, const char* key, const float* pos)
         ++g_handbackSkipFlap;
         return kBoxMine;
     }
+    double madeSince = 0.0;
+    /* the build registry names a piece by ObjectPositionKey in a 64-byte buffer: for a key of kBoxKeyCap..63 characters that text
+       keeps the record name verbatim where `key` hashes it */
+    char regKey[64]; regKey[0] = 0;
+    const char* const regKeyUse = (b != 0 && ObjectPositionKey(b, regKey, (int)sizeof regKey, "", 3, 1) != 0 && regKey[0] != 0) ? regKey : key;
+    const int madeHere = BuildMadeHere(regKeyUse, &madeSince);
+    if (coopown::HandbackMadeHereSkip(start, have, madeHere, madeSince, since, (have == 0 && g_ownHandback.size() >= kHandbackCap) ? 1 : 0) != 0)
+    {   /* a box this game placed itself while the area's "loaded since" stamp was the one it has now: it has written its own box from
+           the placement on, so no other game can have written it and nothing is asked. Recorded done, so a later stamp on this same
+           live building is skipped and one on a reloaded building asks (coopown::HandbackStart) */
+        if (g_ownHandback.size() < kHandbackCap)
+        {
+            ItHandback h; h.since = since; h.state = 1; h.askedAt = ::GetTickCount(); h.b = b; h.timedOut = 0;
+            h.askHave = 0; h.askDigest = 0;
+            g_ownHandback[k] = h;
+        }
+        if (g_handbackLines < kOwnUnpairedLineCap)
+        {
+            ++g_handbackLines;
+            DebugLog("[BOXOWN] handback skipped key=" + k + " - this game placed the box itself and has held its area since, so no other game"
+                     " wrote it; this game writes it now without asking");
+        }
+        return kBoxMine;
+    }
+    {   /* a box this game last wrote BY THE AREA RULE at the "loaded since" stamp it has now, in an area it holds now
+           (HandbackAreaWroteSkip, boxowner.h): no other game has written it since and none could answer the ask with contents -
+           recorded done as the made-here skip is, and written without asking */
+        float hdBuf[3];
+        const double wroteSince = ItOwnAreaWroteSince(key);
+        const int areaNow = (wroteSince != 0.0 && ItAreaVerdictAt(ItBoxDecidePos(key, pos, hdBuf), kAreaForBox) == kBoxMine) ? 1 : 0;
+        if (coopown::HandbackAreaWroteSkip(start, have, (wroteSince != 0.0) ? 1 : 0, wroteSince, since, areaNow,
+                                           (have == 0 && g_ownHandback.size() >= kHandbackCap) ? 1 : 0) != 0)
+        {
+            if (g_ownHandback.size() < kHandbackCap)
+            {
+                ItHandback h; h.since = since; h.state = 1; h.askedAt = ::GetTickCount(); h.b = b; h.timedOut = 0;
+                h.askHave = 0; h.askDigest = 0;
+                g_ownHandback[k] = h;
+            }
+            if (g_handbackLines < kOwnUnpairedLineCap)
+            {
+                ++g_handbackLines;
+                DebugLog("[BOXOWN] handback skipped key=" + k + " - this game last wrote the box by the area rule, has held its area"
+                         " without a break since and holds it now, so no other game wrote it; this game writes it now without asking");
+            }
+            return kBoxMine;
+        }
+    }
     if (have == 0 && g_ownHandback.size() >= kHandbackCap)
     {   /* inv4b 5: only done entries go; a pending hand-back is never dropped (pending ones may pass the cap until they end) */
         for (std::map<std::string, ItHandback>::iterator e = g_ownHandback.begin(); e != g_ownHandback.end(); )
@@ -7012,6 +7569,7 @@ int ItHandbackGate(void* b, const char* key, const float* pos)
         DebugLog("[BOXOWN] handback key=" + k + " - this game now writes its own box; the current contents are asked of the"
                  " previous writer first, and moves on it wait for the answer");
     }
+    InvNetHoldBase(b, k);   /* the box as the wait begins: a move made on it during the wait is sent when the hand-back ends */
     ItParityAskOne(k);
     return kBoxNoAnswer;
 }
@@ -7031,7 +7589,7 @@ void ItHandbackAnswered(const std::string& key, int contents)
     it->second.state = coopown::HandbackAnswer(it->second.state, contents, &counted);
     if (counted != 0) ++g_handbackAnswered;
 }
-void ItHandbackApplied(const std::string& key, int swapped)
+void ItHandbackApplied(const std::string& key, int swapped, int keepBase)
 {
     std::map<std::string, ItHandback>::iterator it = g_ownHandback.find(key);
     if (it == g_ownHandback.end()) return;
@@ -7041,7 +7599,30 @@ void ItHandbackApplied(const std::string& key, int swapped)
         if (swapped == 1 && g_arriveLines < kOwnUnpairedLineCap)   /* inv7d fold: logged only when the swap verified */
         { ++g_arriveLines; DebugLog("[BOXOWN] ownerArrive applied key=" + key + " - the holder's contents are in; this game writes the box now"); }
     }
+    /* the swapped-in contents are what the other games have: the safety net's baseline is read again from them. After a merged
+       swap (keepBase) ItHandbackMergeDone sets it from the rows the swap laid, so the moves laid on top are sent. */
+    if (keepBase == 0) InvNetForget(0, key);
+    InvNetHoldEnd(key);
     it->second.state = 1;
+}
+long long g_handbackKeptOwn = 0, g_handbackKeptLines = 0;
+/* MAIN THREAD: a hand-back answer with contents that this game does not swap in (ItHandbackMergeBuild: the merged box would not
+   fit, a footprint or this game's box could not be read, or a move made before the wait began could not be taken out of the saved
+   baseline). Ended as at a timeout: nothing is removed, this game's own box stands, and the safety net's next visit sends what
+   changed since the baseline saved for the wait. */
+void ItHandbackKeepOwn(const std::string& key, const std::string& why)
+{
+    std::map<std::string, ItHandback>::iterator it = g_ownHandback.find(key);
+    if (it != g_ownHandback.end()) { it->second.state = 1; it->second.timedOut = 1; }
+    InvNetHoldEnd(key);
+    ++g_handbackKeptOwn;
+    if (g_handbackKeptLines < 40)
+    {
+        ++g_handbackKeptLines;
+        DebugLog("[BOXOWN] handback KEPT OWN key=" + key + " - " + why + "; nothing is removed: this game's box stands as at a"
+                 " timeout, the moves since the saved baseline are sent, and the holder's changes made while this game was away"
+                 " stay only in the other games' copies (handbackKeptOwn=" + N(g_handbackKeptOwn) + ")");
+    }
 }
 /* inv7d fold: FROM THE ASK ITSELF (ItParityAskOne) - this game's own digest of the box when a waiting hand-back asked */
 void ItHandbackNoteAsk(const std::string& key, unsigned int digest)
@@ -7342,6 +7923,8 @@ int ItBoxWriterDecide(void* b, const float* pos, const char* key, int forBox, in
     if (byO != 0) g_ownVerdictSlot = slot;
     if (key != 0 && onMain != 0) ItBoxOwnNote(key, cls, slot, via, v, byO, 0, from);
     if (key != 0 && onMain != 0 && b != 0) ItOwnKeyNote(key, cls, v, byO);   /* inv4b: cls for items 3, area writer for item 2 */
+    if (key != 0 && onMain != 0 && b != 0 && pos != 0 && byO == 0 && v == kBoxMine)
+        ItOwnAreaStamp(key, MyMapLoadedSinceTS(SectorOf(pos[0], pos[2])));   /* the stamp ItHandbackGate compares (its own sector) */
     return v;
 }
 /* design W3 `ItBoxWriterAt`: every live-box site (parity open/apply, fill push, safety net, research lift) asks this */
@@ -7563,6 +8146,89 @@ void ItRestockDefer(void* ap, int shortStep = 0)   /* T-1 B2 fold: shortStep 1 =
     if (shortStep != 0) ++g_restockDeferredShort; else ++g_restockDeferred;
 }
 
+// PROBE-START: P133 - every restock call for a group with a leader uid: who runs it, the gate's answer, the leader's money, the
+// shop's stock (item stacks over the home's pieces - keeperlist's walk and count), the deadline (T-755). Reads only, never writes.
+struct P133Pre { unsigned int uid; void* home; int homePos; int haveBefore; int before; long long stockBefore; };
+struct P133Last { char outcome[64]; int ran; int haveBefore, before, haveAfter, after; long long stockBefore, stockAfter; unsigned long tick; };
+std::map<unsigned int, P133Last> g_p133Last;
+long long P133Stock(void* home)   /* -2 no home, -1 not read (off the main thread / no interior / a piece unreadable) */
+{
+    if (home == 0) return -2;
+    if (ItOnMainThread() == 0) return -1;
+    std::vector<void*> pieces;
+    if (ItHomePieces(home, &pieces, 0) <= 0) return -1;
+    long long total = 0;
+    for (size_t i = 0; i < pieces.size(); ++i)
+    {
+        const long long c = ItInvItemCount(ItBoxInventory(pieces[i]));
+        if (c < 0) return -1;
+        total += c;
+    }
+    return total;
+}
+std::string P133StockWord(long long v) { return (v == -2) ? std::string("n/a(no home)") : (v < 0) ? std::string("?") : N(v); }
+void P133RestockBefore(void* ap, P133Pre* p)
+{
+    p->uid = 0; p->home = 0; p->homePos = 0; p->haveBefore = 0; p->before = 0; p->stockBefore = -2;
+    if (g_base == 0 || !ItPlaus(ap)) return;
+    void* leader = 0;
+    if (ItPtrPod(ap, kApSquadLeader, &leader) == 0 || !ItPlaus(leader)) return;
+    p->uid = FindSpawnedUid(leader);
+    if (p->uid == 0) return;
+    p->home = ItHomeBuildingPod(leader);
+    if (p->home != 0) { float hp[3] = { 0.0f, 0.0f, 0.0f }; p->homePos = ItBoxPosPod(p->home, hp); }
+    p->haveBefore = ItPurseRead(leader, &p->before);
+    p->stockBefore = P133Stock(p->home);
+}
+/* skip: 0 the original ran, 1 skipped (not the holder of the shop's area), 2 skipped (a wandering trader) */
+void P133RestockAfter(void* ap, const P133Pre& p, int skip, int wander, char force)
+{
+    if (p.uid == 0) return;
+    std::string outcome;
+    int kind = 0;
+    if (skip == 2)
+    {
+        kind = 2;
+        outcome = (wander == coopwander::kWanderSkipNotWriter) ? "skipped-as-wanderer(the other game runs its pack wearers)"
+                : (wander == coopwander::kWanderSkipUnrun) ? "skipped-as-wanderer(unrun, the other game holds the area)"
+                : "skipped-as-wanderer(split)";
+    }
+    else if (skip == 1) { kind = 1; outcome = "skipped-not-holder"; }
+    else if (wander == coopwander::kWanderRun) outcome = "ran(wanderer this game runs)";
+    else if (wander == coopwander::kWanderRunUnrunArea) outcome = "ran(unrun wanderer, area held here)";
+    else if (wander >= 0) { kind = 3; outcome = "other(ran: wanderer answer " + N((long long)wander) + ")"; }
+    else if (p.home != 0 && p.homePos != 0) outcome = "ran(holder of the shop's area)";
+    else { kind = 3; outcome = "other(ran: a gate read failed - the gate fails open)"; }
+    void* leader = 0;
+    int haveAfter = 0, after = 0;
+    long long stockAfter = -1;
+    if (skip == 0)
+    {
+        if (ItPtrPod(ap, kApSquadLeader, &leader) != 0 && ItPlaus(leader)) haveAfter = ItPurseRead(leader, &after);
+        stockAfter = P133Stock(p.home);
+    }
+    double now = 0.0, dl = 0.0;
+    void* platoon = 0; void* clockOwner = 0;
+    const int haveDl = (ItPtrPod(ap, kApPlatoon, &platoon) != 0 && ItPlaus(platoon) && ItDoublePod(platoon, kPlatoonRefresh, &dl) != 0) ? 1 : 0;
+    const int haveNow = (kClockOwnerPtrRva != 0 && ItPtrPod((const void*)(g_base + kClockOwnerPtrRva), 0, &clockOwner) != 0
+                         && ItPlaus(clockOwner) && ItDoublePod(clockOwner, kClockNowOff, &now) != 0) ? 1 : 0;
+    const int runHere = (ItOnMainThread() != 0) ? (net::IsUidMine(p.uid) ? 1 : 0) : (net::IsUidMineAnyThread(p.uid) ? 1 : 0);
+    P133Last& L = g_p133Last[p.uid];
+    std::memset(&L, 0, sizeof(L));
+    _snprintf(L.outcome, sizeof(L.outcome) - 1, "%s", outcome.c_str());
+    L.ran = (skip == 0) ? 1 : 0; L.haveBefore = p.haveBefore; L.before = p.before; L.haveAfter = haveAfter; L.after = after;
+    L.stockBefore = p.stockBefore; L.stockAfter = stockAfter; L.tick = ::GetTickCount();
+    if (P133CapOk(&g_p133RestockLines[kind]) == 0) return;
+    DebugLog("[PROBE] P133 restock #" + N(g_p133RestockLines[kind]) + " leader=" + N((long long)p.uid)
+             + " runHere=" + P133YN(runHere) + " home=" + P133YN(p.home != 0 ? 1 : 0)
+             + " outcome=" + outcome + " wander=" + N((long long)wander) + " force=" + N((long long)force)
+             + " money=" + (p.haveBefore != 0 ? N((long long)p.before) : std::string("?")) + "->"
+             + (skip != 0 ? std::string("not run") : (haveAfter != 0 ? N((long long)after) : std::string("?")))
+             + " stock=" + P133StockWord(p.stockBefore) + "->" + (skip != 0 ? std::string("not run") : P133StockWord(stockAfter))
+             + " deadline=" + (haveDl != 0 ? P133D(dl) : std::string("?")) + " now=" + (haveNow != 0 ? P133D(now) : std::string("?"))
+             + " in=" + ((haveDl != 0 && haveNow != 0) ? P133D(dl - now) : std::string("?")));
+}
+// PROBE-END: P133
 // MAIN THREAD in every reachable case: refreshInventory's only two callers are ActivePlatoon::update 0x4FF930
 // (the timer) and RootObjectFactory::createRandomSquad 0x582F80 (the initial stocking), both of which run on
 // the engine's own update (read-shops 4, xrefs, thunk-aware). No thread probe is added for a claim nothing
@@ -7594,6 +8260,10 @@ void detour_refreshInventory(void* ap, char force)
         orig_refreshInventory(ap, force);
         return;
     }
+    // PROBE-START: P133 - the leader, its money, its home and its stock before the gate answers
+    P133Pre p133;
+    P133RestockBefore(ap, &p133);
+    // PROBE-END: P133
     int wander = -1;
     if (ItRestockHolder(ap, &wander) == 0)
     {
@@ -7638,6 +8308,9 @@ void detour_refreshInventory(void* ap, char force)
             }
             if (coopwander::WanderRestockFullDefer(wander) != 0) ItRestockDefer(ap);   /* P6y: re-ask at the NORMAL cadence */
             else ItRestockDefer(ap, 1);                                                 /* fold F1/F3: the short step */
+            // PROBE-START: P133 - a wandering trader's skip
+            P133RestockAfter(ap, p133, 2, wander, force);
+            // PROBE-END: P133
             return;                               /* NO orig */
         }
         ++g_restockSkippedNotHolder;
@@ -7651,6 +8324,9 @@ void detour_refreshInventory(void* ap, char force)
                  " forward by the engine's own refresh interval on each skip, so it is now roughly ONE PER"
                  " REFRESH PERIOD PER TRADER SQUAD rather than one per update pass.");
         ItRestockDefer(ap);                       /* review-p6o HIGH-4: re-ask at the NORMAL cadence */
+        // PROBE-START: P133 - a shop restock this game is not the area holder of
+        P133RestockAfter(ap, p133, 1, wander, force);
+        // PROBE-END: P133
         return;                                   /* NO orig - that is the whole of the gate */
     }
     ++g_restockRan;
@@ -7665,9 +8341,15 @@ void detour_refreshInventory(void* ap, char force)
         ItWanderRestockNote(ap);
         ItRestockAsFill(ap, force);
         ItWanderRestockNote(ap);
+        // PROBE-START: P133 - a wandering trader's restock ran here
+        P133RestockAfter(ap, p133, 0, wander, force);   /* wandering ran */
+        // PROBE-END: P133
         return;
     }
     ItRestockAsFill(ap, force);                   /* par2: the restock is a fill - its box moves are folded and pushed whole */
+    // PROBE-START: P133 - a shop restock ran here (or a gate read failed open)
+    P133RestockAfter(ap, p133, 0, wander, force);   /* shop ran */
+    // PROBE-END: P133
 }
 
 // par2 (docs/design-loot2.md rev 2, 0.5): THE TWO OTHER FILLS. Neither is gated - both only raise this thread's fill depth
@@ -7837,9 +8519,15 @@ void detour_prodOperate(void* pb, void* who, float dt)
     if (who != 0)
     {   /* a WORKER'S step (a character mining a node or working a machine) runs on the building's writer only; on any other
            game its work is kept and goes to the writer as MINE_OP (farm.cpp) - waiting while no writer is named - and the ore
-           reaches this game as a box move */
+           reaches this game as a box move; the writer's game sends the node's bar and state to the others (MINE_STATE) */
         const int writer = ItProdWriterKept(pb);
-        if (coopfarm::MineStepRoute(0, MineLinked(), writer) == coopfarm::kMineRun) { ++g_prodWorkerPassed; orig_prodOperate(pb, who, dt); return; }
+        if (coopfarm::MineStepRoute(0, MineLinked(), writer) == coopfarm::kMineRun)
+        {
+            ++g_prodWorkerPassed;
+            orig_prodOperate(pb, who, dt);
+            if (writer == coopfarm::kProdWriterHere && MineLinked() != 0) MineWorkedNote(pb);
+            return;
+        }
         if (MineStepRelay(pb, who, dt) != 0) { ++g_prodWorkerRelayed; return; }
         ++g_prodWorkerUnrelayed;   /* no key, or the relay table is full: the step runs here, as before */
         orig_prodOperate(pb, who, dt);
@@ -7942,6 +8630,7 @@ void ItMsgFromEntry(const ItEntry& e, ItemMoveMsg* m)
     m->functionKind = e.functionKind; m->level = e.level; m->unique = e.unique;
     m->quantity = e.quantity > 0 ? e.quantity : 1;
     ItOwnerTranslate(e.ownerRaw, e.ownerHave, &m->owner, e.ownerBooked == 0 ? 1 : 0);   /* inv6: MAIN THREAD - every caller is (review-inv6 LOW: once per item) */
+    ItGearOf(e, &m->gear, e.ownerBooked == 0 ? 1 : 0);   /* the uniform and crafter, named on this (main) thread */
 }
 
 // MAIN THREAD. THE REVERT. Take the object back out of the DESTINATION slot and put it where it came from,
@@ -8355,6 +9044,8 @@ long long g_bagRefusedFill = 0;   /* review-inv3a 1c/1d: a row could not be crea
 long long g_bagGiveChanged = 0;   /* review-inv3a 1b: at confirm the giver's pack was not the same object / not the same rows - give cancelled */
 long long g_bagRefUnread = 0, g_bagRefCap = 0, g_bagRefNested = 0;
 const int kBagWhyUnread = 1, kBagWhyCap = 2, kBagWhyNested = 3;
+const int kBagWhyDeep = 4;   /* items more than coopbag::kBagMaxDepth levels down (the kept list's bound) */
+long long g_bagRefDeep = 0, g_bagNestPlaced = 0, g_bagNestChildLost = 0, g_bagNestBadRecv = 0;
 
 /* ANY THREAD, POD. 1 when `item` is a backpack: its ContainerItem::inventory (+0x290) is plausible and that inventory's owner
    (+0x88) points back at the item - the equality SnapInvRows and ItAddressee already use. `*invOut` is that inventory. */
@@ -8371,13 +9062,14 @@ int ItBagInvPod(void* item, void** invOut)
 
 const char* ItBagWhyName(int why)
 {
-    return why == kBagWhyCap ? "over the 256-row cap" : why == kBagWhyNested ? "a pack inside the pack" : "unreadable";
+    return why == kBagWhyCap ? "over the 256-row cap" : why == kBagWhyNested ? "a pack inside the pack" : why == kBagWhyDeep ? "a pack more than 4 levels deep" : "unreadable";
 }
 
 void ItBagCountRefused(int why)
 {
     if (why == kBagWhyCap) ++g_bagRefCap;
     else if (why == kBagWhyNested) ++g_bagRefNested;
+    else if (why == kBagWhyDeep) ++g_bagRefDeep;
     else ++g_bagRefUnread;
 }
 
@@ -8392,50 +9084,62 @@ static int ItItemCellPod(void* item, int* x, int* y)
     return 1;
 }
 
-/* MAIN THREAD. The pack's contents as rows, depth 1. The section map and item lists are walked by direct member reads, exactly
-   as SnapInvRows walks a worn pack (the same trust the box digest places in a live Inventory on the main thread); every
-   per-item read goes through the guarded Pod readers (ItReadFields, ItIntPod). Returns 1 a pack (rows filled - possibly none),
-   0 not a pack, -1 REFUSED with `*why` (unreadable / over the cap / a pack inside it) and `rows` cleared. */
+/* MAIN THREAD. One inventory's items as rows, each pack's own rows straight after its row - `parent` 0 for the outer pack's own
+   rows, else the 1-based index of the pack row they sit in - so a receiver always makes a pack before what goes into it. `depth` is
+   the level of the rows read here (the outer pack's own rows are level 1); an item past coopbag::kBagMaxDepth refuses the whole pack
+   (kBagWhyDeep - the kept list's bound), and the 256-row cap counts every level. The section map and item lists are walked by
+   direct member reads, exactly as SnapInvRows walks a worn pack (the same trust the box digest places in a live Inventory on the
+   main thread); every per-item read goes through the guarded Pod readers (ItReadFields, ItIntPod). 1 read; -1 refused (`*why`). */
+static int ItBagRowsWalk(void* inv, unsigned int parent, int depth, std::vector<coopbag::BagRow>* rows, int* why)
+{
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) { *why = kBagWhyUnread; return -1; }
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) { *why = kBagWhyUnread; return -1; }   /* refused whole, never skipped */
+        char secName[kSecCap]; secName[0] = 0;
+        if (ItStrPod(&it->first, secName, kSecCap) == 0) { *why = kBagWhyUnread; return -1; }
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) { *why = kBagWhyUnread; return -1; }
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            void* inner = 0;
+            if (!ItPlaus(item)) { *why = kBagWhyUnread; return -1; }
+            if (depth > coopbag::kBagMaxDepth) { *why = kBagWhyDeep; return -1; }
+            if (rows->size() >= (size_t)coopbag::kBagMaxRows) { *why = kBagWhyCap; return -1; }
+            ItEntry e; ItClear(&e);
+            int q = 0;
+            int cx = -1, cy = -1;
+            if (ItReadFields(item, &e) != 1 || ItIntPod(item, kItemQuantity, &q) == 0 || q <= 0 || ItItemCellPod(item, &cx, &cy) == 0)
+            { *why = kBagWhyUnread; return -1; }
+            coopbag::BagRow r;
+            r.section = secName;
+            r.x = (unsigned int)cx; r.y = (unsigned int)cy;   /* the item's own cell (+0xDC/+0xE0), never SectionItem x,y */
+            r.qty = (unsigned int)q;
+            r.baseSid = e.baseSid; r.companySid = e.companySid; r.materialSid = e.materialSid; r.colorSid = e.colorSid;
+            r.quality = e.quality; r.charges = e.charges;
+            r.functionKind = e.functionKind; r.level = e.level; r.unique = (unsigned char)(e.unique ? 1 : 0);
+            ItOwnerTranslate(e.ownerRaw, e.ownerHave, &r.owner, 0);   /* the row's mark (uncounted: rows are re-read) */
+            ItGearOf(e, &r.gear, 0);   /* the row's uniform and crafter (uncounted: rows are re-read) */
+            r.parent = parent;
+            if (!coopbag::BagRowValid(r)) { *why = kBagWhyUnread; return -1; }
+            rows->push_back(r);
+            if (ItBagInvPod(item, &inner) != 0 && ItBagRowsWalk(inner, (unsigned int)rows->size(), depth + 1, rows, why) < 0) return -1;
+        }
+    }
+    return 1;
+}
+/* MAIN THREAD. The pack's contents as rows, every level to coopbag::kBagMaxDepth (ItBagRowsWalk). Returns 1 a pack (rows filled -
+   possibly none), 0 not a pack, -1 REFUSED with `*why` (unreadable / over the cap / too deep) and `rows` cleared. */
 int ItBagRowsOf(void* pack, std::vector<coopbag::BagRow>* rows, int* why)
 {
     rows->clear();
     *why = 0;
     void* inv = 0;
     if (ItBagInvPod(pack, &inv) == 0) return 0;
-    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
-    if (secs.size() > 64) { *why = kBagWhyUnread; return -1; }
-    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
-    {
-        ::InventorySection* sec = it->second;
-        if (!ItObj(sec)) { *why = kBagWhyUnread; rows->clear(); return -1; }   /* review-inv3a 2c: refused whole, never skipped */
-        char secName[kSecCap]; secName[0] = 0;
-        if (ItStrPod(&it->first, secName, kSecCap) == 0) { *why = kBagWhyUnread; rows->clear(); return -1; }
-        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
-        if (si.size() > 4096) { *why = kBagWhyUnread; rows->clear(); return -1; }
-        for (size_t k = 0; k < si.size(); ++k)
-        {
-            void* item = (void*)si[k].item;
-            void* inner = 0;
-            if (!ItPlaus(item)) { *why = kBagWhyUnread; rows->clear(); return -1; }
-            if (ItBagInvPod(item, &inner) != 0) { *why = kBagWhyNested; rows->clear(); return -1; }
-            if (rows->size() >= (size_t)coopbag::kBagMaxRows) { *why = kBagWhyCap; rows->clear(); return -1; }
-            ItEntry e; ItClear(&e);
-            int q = 0;
-            int cx = -1, cy = -1;
-            if (ItReadFields(item, &e) != 1 || ItIntPod(item, kItemQuantity, &q) == 0 || q <= 0 || ItItemCellPod(item, &cx, &cy) == 0)
-            { *why = kBagWhyUnread; rows->clear(); return -1; }
-            coopbag::BagRow r;
-            r.section = secName;
-            r.x = (unsigned int)cx; r.y = (unsigned int)cy;   /* bag23 fix: the item's own cell (+0xDC/+0xE0), never SectionItem x,y */
-            r.qty = (unsigned int)q;
-            r.baseSid = e.baseSid; r.companySid = e.companySid; r.materialSid = e.materialSid; r.colorSid = e.colorSid;
-            r.quality = e.quality; r.charges = e.charges;
-            r.functionKind = e.functionKind; r.level = e.level; r.unique = (unsigned char)(e.unique ? 1 : 0);
-            ItOwnerTranslate(e.ownerRaw, e.ownerHave, &r.owner, 0);   /* inv6 phase 2 (R5): the row's mark (uncounted: rows are re-read) */
-            if (!coopbag::BagRowValid(r)) { *why = kBagWhyUnread; rows->clear(); return -1; }
-            rows->push_back(r);
-        }
-    }
+    if (ItBagRowsWalk(inv, 0, 1, rows, why) < 0) { rows->clear(); return -1; }
     return 1;
 }
 
@@ -8449,6 +9153,13 @@ int ItBagRowsOf(void* pack, std::vector<coopbag::BagRow>* rows, int* why)
    destroys it (Inferred: the design's D3(c) reading - destroying a pack takes its contents - is what used to lose them).
    A row whose add FAULTED is left alone (F536(b): a destroy refuses an item whose isInInventory is set).
    Called from inside ItTakerAdd's / ItOwnerGive's __try; this frame holds strings, that one does not (C2712). */
+/* A refused fill: the items it made (and `cur`, the row being placed) go with the pack, so their park entries go now - pointer
+   compares only. */
+void ItBagFillForget(const std::vector<void*>& made, void* cur)
+{
+    if (cur != 0) ItOwnParkForget(cur);
+    for (size_t i = 0; i < made.size(); ++i) if (made[i] != 0) ItOwnParkForget(made[i]);
+}
 int ItBagFill(void* pack, const std::vector<coopbag::BagRow>* rows, ::Character* c, int fromConfirm)
 {
     if (rows == 0 || rows->empty()) return 1;
@@ -8463,6 +9174,14 @@ int ItBagFill(void* pack, const std::vector<coopbag::BagRow>* rows, ::Character*
     }
     size_t created = 0, placedIn = 0;
     long long relocated = 0;
+    if (!coopbag::BagNestValid(*rows))
+    {
+        ++g_bagRefusedFill;
+        ErrorLog("[ITEMS] bag carry: " + dir + " REFUSED - the rows name a pack that is not an earlier row, or one more than "
+                 + N((long long)coopbag::kBagMaxDepth) + " levels down; the pack stays whole with its owner");
+        return 0;
+    }
+    std::vector<void*> made(rows->size(), (void*)0);   /* each row's new item, so a row inside an inner pack finds that pack */
     for (size_t i = 0; i < rows->size() && i < (size_t)coopbag::kBagMaxRows; ++i)
     {
         const coopbag::BagRow& r = (*rows)[i];
@@ -8472,16 +9191,28 @@ int ItBagFill(void* pack, const std::vector<coopbag::BagRow>* rows, ::Character*
         mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = (int)r.unique;
         mm.quantity = (int)r.qty;
         if (r.owner.kind != coopmark::kOwnNone) { mm.owner = r.owner; mm.ownerFrom = 1; }   /* inv6 phase 2 (R5): the row's own exact mark; review-inv6p2 MEDIUM: the pack's wire mark is already on, a local D5-2 one goes on after the fill */
+        mm.gear = r.gear;   /* the row's own uniform and crafter */
         ::Item* item = ItCreateItem(c, mm, 1);
         if (item == 0)
         {
+            ItBagFillForget(made, 0);
             ++g_bagRefusedFill;
             ErrorLog("[ITEMS] bag carry: " + dir + " REFUSED - row " + N((long long)i) + " " + r.baseSid + " x" + N((long long)r.qty)
                      + " could not be created here; the whole handover is refused and the pack stays whole with its owner");
             return 0;
         }
         ++created;
-        ::InventorySection* sec = ((::Inventory*)inv)->getSection(r.section);
+        void* rowInv = inv;   /* the outer pack's inventory, or the inner pack's its parent row names (parents come first) */
+        if (r.parent != 0 && (made[r.parent - 1] == 0 || ItBagInvPod(made[r.parent - 1], &rowInv) == 0))
+        {
+            ItBagFillForget(made, (void*)item);
+            ++g_bagRefusedFill;
+            ItDestroyPod((void*)item, "bag row: the inner pack it belongs in is not a pack here");
+            ErrorLog("[ITEMS] bag carry: " + dir + " REFUSED - row " + N((long long)i) + " " + r.baseSid + " belongs in row "
+                     + N((long long)(r.parent - 1)) + ", which is not a pack here; the whole handover is refused and the pack stays whole with its owner");
+            return 0;
+        }
+        ::InventorySection* sec = ((::Inventory*)rowInv)->getSection(r.section);
         int placed = 0;
         if (ItObj(sec))
         {
@@ -8494,10 +9225,13 @@ int ItBagFill(void* pack, const std::vector<coopbag::BagRow>* rows, ::Character*
         }
         if (placed == 1 || placed == 2)
         {
+            made[i] = (void*)item;
+            if (r.parent != 0) ++g_bagNestPlaced;
             ++placedIn;
             if (placed == 2) ++relocated;
             continue;
         }
+        ItBagFillForget(made, (void*)item);
         ++g_bagRefusedFill;
         if (placed != -1) ItDestroyPod((void*)item, "coop inv3a bag row: not placed in the new pack");
         ErrorLog("[ITEMS] bag carry: " + dir + " REFUSED - row " + N((long long)i) + " " + r.baseSid + " x" + N((long long)r.qty)
@@ -8508,6 +9242,7 @@ int ItBagFill(void* pack, const std::vector<coopbag::BagRow>* rows, ::Character*
     }
     if (!coopbag::BagFillComplete(rows->size(), created, placedIn))
     {
+        ItBagFillForget(made, 0);
         ++g_bagRefusedFill;
         ErrorLog("[ITEMS] bag carry: " + dir + " REFUSED - " + N((long long)placedIn) + " of " + N((long long)rows->size())
                  + " rows placed; the whole handover is refused");
@@ -9898,6 +10633,10 @@ void ItCrossTransfer(int dir, const ItEntry& src, unsigned int srcUid, const ItE
     revFields.owner = coopmark::OwnerId(); revFields.ownerLocal = 0; revFields.ownerFrom = 2;
     if (dst.ownerHave != 0 && coopmark::RawHandIsOwner(dst.ownerRaw))
     { revFields.ownerLocal = 1; std::memcpy(revFields.ownerLocalRaw, dst.ownerRaw, sizeof(revFields.ownerLocalRaw)); }
+    /* the same for the gear marks: the local re-create puts back the item's own uniform pointer and crafter text (ItGearApplyLocal) */
+    revFields.gear = gearwire::GearMarks(); revFields.gearLocal = 0; revFields.gearLocalUniform = 0; revFields.gearLocalCrafter.clear();
+    if (dst.gearState != 0)
+    { revFields.gearLocal = 1; revFields.gearLocalUniform = dst.gearUniform; revFields.gearLocalCrafter = dst.gearCrafter; }
     int landedX = src.x, landedY = src.y;
     // Relocation on the way back is allowed only when the SOURCE is our own character (a GIVE).
     const int allowRelocate = (dir == 0) ? 0 : 1;
@@ -9921,6 +10660,7 @@ void ItCrossTransfer(int dir, const ItEntry& src, unsigned int srcUid, const ItE
     const int mergeRest = (dir != 0 && isSplit == 0 && mergedGive != 0 && dst.fields != 0) ? 1 : 0;
     ItemMoveMsg restFields = revFields;
     restFields.owner = coopmark::OwnerId(); restFields.ownerLocal = 0; restFields.ownerFrom = 2;
+    restFields.gearLocal = 0;   /* nor a uniform or crafter: revFields carries none in `gear` and its own go only on the moved item */
     const int undone = (isSplit != 0)
         ? ItRevertSplit(dstInv, dstSec, dst.item, dst.x, dst.y, srcInv, srcSec, src.x, src.y, src.item,
                         src.quantity,   /* HIGH-1: the units the fifth hook recorded, never the clone's count */
@@ -10208,6 +10948,7 @@ void ItCrossTransfer(int dir, const ItEntry& src, unsigned int srcUid, const ItE
         if (rq.baseSid.empty() || ItRefuseHere(tradecharge::kGateNoItemName, priced) != 0)
         { ItRefundTrade(*p, "noItemName", "a give whose item record could not be read was not sent"); p->used = 0; ++g_revertFailed; return; }
         rq.owner = fields.owner;   /* inv6 (R2): the given item's stolen mark, translated on this (main) thread */
+        rq.gear = fields.gear;   /* the given item's uniform and crafter */
     }
     if (rq.baseSid.empty() || (dir == 0 && ItRefuseHere(tradecharge::kGateNoItemName, priced) != 0))   /* cell1 fold (R3): a TAKE that cannot name its item is not sent (the undo above already put it back) */
     { ItRefundTrade(*p, "noItemName", "a request whose item record could not be read was not sent");   /* T-164 B4-2 */
@@ -10521,6 +11262,7 @@ int ItOwnerGive(::Character* c, ::InventorySection* sec, const ItemMoveMsg* m, i
         else if (ItBagFill(item, bagRows, c, 0) == 0)
         {
             *reason = kRefBag;
+            ItOwnParkForget(item);   /* the new pack goes: its park entry goes with it */
             if (coop::GameWorldPtr() != 0) coop::GameWorldPtr()->destroy(item, false, "coop inv3a give: a backpack row could not be placed in the new pack");
         }
         // Our OWN character, so relocation is allowed: the hook rings wherever it actually landed and the
@@ -10571,7 +11313,10 @@ int ItTakerAdd(::Character* c, ::InventorySection* sec, const ItemMoveMsg* m, in
                the new pack makes this a take that could NOT be placed: the new pack goes, ok stays 0, and ITEM_PLACED ok=0 has
                the owner put its kept pack back whole. */
             if (ItBagFill(item, bagRows, c, 1) == 0)
-            { if (coop::GameWorldPtr() != 0) coop::GameWorldPtr()->destroy(item, false, "coop inv3a take: a backpack row could not be placed in the new pack"); }
+            {
+                ItOwnParkForget(item);   /* the new pack goes: its park entry goes with it */
+                if (coop::GameWorldPtr() != 0) coop::GameWorldPtr()->destroy(item, false, "coop inv3a take: a backpack row could not be placed in the new pack");
+            }
             else
             {
                 if (packAfter != 0) ItOwnerApply(item, *m);   /* inv6 fold (T401): filled - now the local D5-2 mark, before the place (take) */
@@ -11448,6 +12193,80 @@ int ItBagScanInv(::Inventory* inv, void* pack, char* secOut, int* xOut, int* yOu
     }
     return 0;
 }
+/* ================ A MOVE INSIDE A PACK THAT SITS INSIDE ANOTHER PACK ================
+   The item road names a pack only at its parent's top level (ItBagResolveEntry), so a move whose pack is two or more levels down
+   cannot be published item by item. It is never silent: ItBagResolveEntry tags it (bagPath.has 2) and ItBagNestDrain refuses it
+   and puts it back locally with the item road's own undo (ItRevert), unless this game writes the box it is in - then the move stands
+   and the whole box is pushed, whose rows carry every level. A split this deep is counted and logged (ItBagNestSplitSay). */
+long long g_bagNestSeen = 0, g_bagNestUndone = 0, g_bagNestUndoFailed = 0, g_bagNestPushed = 0, g_bagNestParked = 0;
+long long g_bagNestLapsed = 0, g_bagNestStands = 0, g_bagNestSplit = 0;
+struct ItBagNestHit { int depth; int rootIsBox; void* root; ::Inventory* packInv; };
+/* MAIN THREAD. How deep `pack` sits inside one of `inv`'s packs (2 or more), 0 = inside none of them. `level` is the depth of inv's
+   own items (1 = a character's or a box's top level). Pointer compares only, bounded by the deepest level pack rows carry. */
+int ItBagNestIn(::Inventory* inv, void* pack, int level)
+{
+    if (!ItObj(inv) || level >= coopbag::kBagMaxDepth) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* const held = (void*)si[k].item;
+            void* sub = 0;
+            if (held == 0 || held == pack || ItBagInvPod(held, &sub) == 0) continue;
+            char sb[kSecCap];
+            int sx = 0, sy = 0;
+            if (ItBagScanInv((::Inventory*)sub, pack, sb, &sx, &sy) != 0) return level + 1;
+            const int d = ItBagNestIn((::Inventory*)sub, pack, level + 1);
+            if (d != 0) return d;
+        }
+    }
+    return 0;
+}
+/* MAIN THREAD. Is `pack` (a pointer a detour rang - COMPARED, never read until found) inside a pack on a loaded character or a live
+   box, two or more levels down? 1 = yes: the root, the depth, and the pack's own inventory (read only once the compare found it). */
+int ItBagNestFind(void* pack, ItBagNestHit* h)
+{
+    h->depth = 0; h->rootIsBox = 0; h->root = 0; h->packInv = 0;
+    if (pack == 0 || !ItPlaus(coop::GameWorldPtr())) return 0;
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() <= 20000)
+        for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end() && h->depth == 0; ++it)
+        {
+            ::Character* ch = *it;
+            if (!ItObj(ch)) continue;
+            ::Inventory* inv = ItInventoryOf(ch);
+            if (inv == 0) continue;
+            const int d = ItBagNestIn(inv, pack, 1);
+            if (d != 0) { h->depth = d; h->root = (void*)ch; }
+        }
+    const int wn = (h->depth == 0) ? ItBoxWalkForLiveness() : 0;
+    for (int w = 0; w < wn && h->depth == 0; ++w)
+    {
+        ::Inventory* inv = ItBoxInventory(g_boxWalkList[w]);
+        if (inv == 0) continue;
+        const int d = ItBagNestIn(inv, pack, 1);
+        if (d != 0) { h->depth = d; h->root = g_boxWalkList[w]; h->rootIsBox = 1; }
+    }
+    if (h->depth == 0) return 0;
+    void* pinv = 0;
+    if (ItBagInvPod(pack, &pinv) == 0) { h->depth = 0; return 0; }
+    h->packInv = (::Inventory*)pinv;
+    return 1;
+}
+/* MAIN THREAD. Units split off a stack inside a pack two or more levels down: a split this deep is not put back here. */
+void ItBagNestSplitSay(const ItEntry& se)
+{
+    ++g_bagNestSplit;
+    ErrorLog("[ITEMS] bag nested split: units split off a stack at " + std::string(se.section) + " " + N((long long)se.x) + ","
+             + N((long long)se.y) + " inside a pack that sits inside another pack - a split this deep is not put back here; where the units"
+               " land is handled as usual and the pack's writer may still show them in the pack (bagNestMove split)");
+}
 /* 1 = converted (or not a bag entry), 0 = no parent (counted, logged - drop the entry). */
 int ItBagResolveEntry(ItEntry* e)
 {
@@ -11515,6 +12334,12 @@ int ItBagResolveEntry(ItEntry* e)
     }
     if (found == 0)
     {
+        ItBagNestHit nest;
+        if (ItBagNestFind(pack, &nest) != 0)
+        {   /* the pack sits inside another pack: tagged, and the drain (ItBagNestDrain) or the split (ItBagNestSplitSay) decides it */
+            e->bagPath.has = 2;
+            return 0;
+        }
         ++g_bagNoParent;
         ErrorLog("[ITEMS] bag noParent: a move inside a pack (op " + N((long long)e->op) + " " + std::string(e->section) + " "
                  + N((long long)e->x) + "," + N((long long)e->y) + " item '" + std::string(e->baseSid) + "', the pack rang at "
@@ -11552,7 +12377,11 @@ void ItSplitAcquire()
     ::InterlockedExchange(&g_itSplit.ready, 0);   // consumed exactly once, whatever the verdict below is
     g_itSplit.cloneItem = 0;
     if (cln == 0) return;
-    if (se.kind == kKindBag && ItBagResolveEntry(&se) == 0) return;   /* bag23 part 2: a split inside a pack names the pack's parent */
+    if (se.kind == kKindBag && ItBagResolveEntry(&se) == 0)   /* bag23 part 2: a split inside a pack names the pack's parent */
+    {
+        if (se.bagPath.has == 2) ItBagNestSplitSay(se);   /* two or more levels down: counted and logged */
+        return;
+    }
     if (se.kind == kKindBox && ItLootSplitTake(se.item) != 0) { ItLootWatchSplit(se.item, cln); return; }   /* loot2c fold (review 3): a split off a live research copy is the TAKE of the whole row - the split row is dropped; the clone and the remainder are watched until settled (fold 3a) */
     if (ItLootWatchSplit(se.item, cln) != 0) return;   /* loot2c fold (review-loot2c-restructure 3a): a split off a watched book the other games do not know there - the clone is watched too and the split row is dropped (no take request to a holder that never had the source) */
     if (ItHeldLive() != cln) ++g_splitMissed;   /* the drag ended before the first drain; the row still stands */
@@ -11660,6 +12489,31 @@ std::string RangedTestGive(unsigned int uid, const std::string& sid, int count)
     DebugLog("[P104] rangedtest give uid=" + N((long long)uid) + " " + sid + " (weapon) tried=" + (tried.empty() ? std::string("-") : tried)
              + " -> " + out + (r == 1 && equip != 1 ? " - NOT IN AN EQUIP SLOT: the character cannot draw it" : ""));
     return out;
+}
+
+/* kitgive (TEST-ONLY, spawn.cpp KitGiveCommand), MAIN THREAD at the K2 safe point: n items of base data sid `sid`, made one at a time
+   as rangedtest makes its weapon (ItCreateItem), each added to this game's own character `uid` through the engine's whole-inventory
+   add (Inventory::addItem - the engine chooses the section); an item no section takes is destroyed (made here, held by no one).
+   Stops at the first item that cannot be made, is refused or faults. "" or why it stopped. */
+std::string KitGiveItems(unsigned int uid, const std::string& sid, int n, int* made, int* added)
+{
+    *made = 0; *added = 0;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !net::IsUidMine(uid)) return "not this game's own character";
+    ::Inventory* inv = ItInventoryOf(c);
+    if (inv == 0) return "no inventory";
+    for (int k = 0; k < n; ++k)
+    {
+        ItemMoveMsg m; m.baseSid = sid; m.quantity = 1;
+        ::Item* item = ItCreateItem(c, m, 0);
+        if (item == 0) return "the sid makes no item here";
+        ++*made;
+        const int r = ItAddAnywherePod(0, inv, item);
+        if (r == -1) { ++g_testLeverAddFaulted; ErrorLog("[HEAL] kitgive: THE ENGINE'S OWN ADD FAULTED (" + sid + ") - nothing retried"); return "the engine's add faulted"; }
+        if (r == 0) { ItDestroyPod((void*)item, "kitgive: no section took the made item"); return "the inventory refused the item"; }
+        ++*added;
+    }
+    return "";
 }
 
 /* P104f1 (T657): AMMO. Kenshi ammo does not stack - the engine's stack limit (0x75D550) is 1 for it, so ONE item of quantity 30
@@ -11903,33 +12757,32 @@ void* ItBagFirstPack(::Inventory* inv, std::string* secOut, int* x, int* y)
 }
 
 
-/* bag23 lever fix (TEST-ONLY): each pack row's REAL cell - the item's own inventoryPos (+0xDC/+0xE0, the cell every item hook and
-   SnapInvRows read) - in exactly ItBagRowsOf's walk order (section map, then each section's items; that walk refuses whole
-   rather than skip, so index i here is row i there). T510: the SectionItem x,y that ItBagRowsOf copies printed 0,0 for every
-   row. -1,-1 = that item's cell could not be read. MAIN THREAD. */
-static void ItBagLeverCells(void* pack, std::vector<int>* xs, std::vector<int>* ys)
+/* TEST-ONLY: quality and charges as their float bits in hex, and the function kind - the digest fields no other word of a row line shows */
+std::string ItBagFieldWords(float quality, float charges, int functionKind)
 {
-    xs->clear(); ys->clear();
-    void* inv = 0;
-    if (ItBagInvPod(pack, &inv) == 0) return;
-    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
-    if (secs.size() > 64) return;
-    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
-    {
-        ::InventorySection* sec = it->second;
-        if (!ItObj(sec)) return;
-        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
-        if (si.size() > 4096) return;
-        for (size_t k = 0; k < si.size(); ++k)
-        {
-            int x = -1, y = -1;
-            void* item = (void*)si[k].item;
-            if (!ItPlaus(item) || ItIntPod(item, kItemX, &x) == 0 || ItIntPod(item, kItemY, &y) == 0) { x = -1; y = -1; }
-            xs->push_back(x); ys->push_back(y);
-        }
-    }
+    unsigned int qb = 0, cb = 0;
+    std::memcpy(&qb, &quality, 4);
+    std::memcpy(&cb, &charges, 4);
+    char t[64];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, " q=%08x ch=%08x fn=%d", qb, cb, functionKind);
+    return std::string(t);
 }
-
+/* TEST-ONLY: what this game gives a NEW item of record `sid` for quality, charges and function kind - an item made from a bare state
+   record (ItCreateItem without its field writes), read, then destroyed; written into *it. 0 = not made or not read (*it untouched) */
+int ItRecordDefaults(const std::string& sid, zonekeep::KeptItem* it)
+{
+    ItemMoveMsg mm;
+    mm.baseSid = sid; mm.quantity = 1;
+    ::Item* probe = ItCreateItem(0, mm, 0);
+    if (probe == 0) return 0;
+    float q = 0.0f, ch = 0.0f;
+    int fn = 0;
+    const int ok = (ItFloatPod((void*)probe, kItemQuality, &q) != 0 && ItFloatPod((void*)probe, kItemCharges, &ch) != 0 && ItIntPod((void*)probe, kItemFunction, &fn) != 0) ? 1 : 0;
+    ItDestroyPod((void*)probe, "bagtest nest: the record-defaults probe");
+    if (ok == 0) return 0;
+    it->quality = q; it->charges = ch; it->function = fn;
+    return 1;
+}
 /* bag23 lever (TEST-ONLY): the first item in `sec` whose base record is `sid`; its own cell (+0xDC/+0xE0) in *x,*y. 0 = none.
    MAIN THREAD. */
 static void* ItBagLeverFindSid(::InventorySection* sec, const std::string& sid, int* x, int* y)
@@ -11951,6 +12804,492 @@ static void* ItBagLeverFindSid(::InventorySection* sec, const std::string& sid, 
 
 /* MAIN THREAD. `bagtest wear <who> <packSid|auto>` / `put <who> <sid> [count]` / `list <who>`. wear and put act only on THIS
    game's own character; list reads any loaded character and changes nothing. */
+/* ---- KEPT: A KEPT ITEM LAID BACK, NEVER DESTROYED (ItKeptLayItems). MAIN THREAD ---- */
+/* one item into an inventory: its own cell of its section, else anywhere in that section, else anywhere in the inventory (an empty
+   section name goes straight to the last). 1 placed, 0 refused everywhere, -1 the engine's add faulted (the item is left alone) */
+int ItKeptPutInto(::Inventory* inv, ::Item* item, const std::string& section, int x, int y)
+{
+    if (inv == 0 || item == 0) return 0;
+    ::InventorySection* sec = section.empty() ? 0 : inv->getSection(section);
+    if (ItObj(sec))
+    {
+        int r = ItPlacePod(sec, item, x, y, 0);
+        if (r == 0) r = ItAddAnywherePod(sec, 0, item);
+        if (r != 0) return r > 0 ? 1 : -1;
+    }
+    const int any = ItAddAnywherePod(0, inv, item);
+    return any == 1 ? 1 : (any == -1 ? -1 : 0);
+}
+/* KEPT: an item's uniform and crafter (save 0x7610C0 'uniform' = the faction's record id, 'crafter' = a name; load 0x761240 finds the
+   faction by id and sets +0x1E8) */
+/* kItUniform, kItCrafter, ItGearMarksPod and ItKeptMarksPod are defined before ItReadFields, which reads the gear marks too */
+const size_t kItFacData = 0x240;   /* Faction: its GameData (the save reads +0x58 of it, the record id) */
+const size_t kItGdSid = 0x58;
+const char* const kItNestUniform = "1088-gamedata.base";   /* bagtest nest: the uniform it marks its items with (traderspawn's guild) */
+/* the kept uniform (the faction found by its record id here; one not found is named and left off) and crafter onto a kept item just made */
+void ItKeptMarks(::Item* item, const zonekeep::KeptItem& it)
+{
+    if (item == 0 || (it.uniform.empty() && it.crafter.empty())) return;
+    if (ItGearMarksPod((void*)item) == 0)
+    {
+        static long long said = 0;
+        ++said;
+        if (said <= 20 || said % 100 == 0)
+            ErrorLog("[KEPT] kept item " + it.tmpl + ": not a gear item - uniform / crafter left off (said " + N(said) + " time(s))");
+        return;
+    }
+    void* f = 0;
+    if (!it.uniform.empty())
+    {
+        ::FactionDirectory* fm = (coop::GameWorldPtr() != 0) ? coop::GameWorldPtr()->factionDirectory : 0;
+        if (ItPlaus(fm)) f = (void*)fm->findFactionById(it.uniform);
+        if (f == 0) ErrorLog("[KEPT] kept item " + it.tmpl + ": its uniform's faction " + it.uniform + " is not in this game - the item is laid without its uniform");
+    }
+    if (ItKeptMarksPod((void*)item, f, f != 0 ? 1 : 0, it.crafter.empty() ? 0 : it.crafter.c_str(), it.crafter.size()) == 0)
+        ErrorLog("[KEPT] kept item " + it.tmpl + ": writing its uniform / crafter FAULTED - laid without them");
+}
+/* ANY THREAD. The five id words of the hand whose words start at obj+off, written raw. */
+int ItRawHandWritePod(void* obj, size_t off, const unsigned int* w5)
+{
+    __try { for (int i = 0; i < 5; ++i) ((unsigned int*)((char*)obj + off))[i] = w5[i]; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the five words as text: type/container/stamp/index/serial */
+std::string ItHandWords(const unsigned int* w5)
+{
+    char t[80];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, "%d/%d/%d/%d/%d", (int)w5[0], (int)w5[1], (int)w5[2], (int)w5[3], (int)w5[4]);
+    return std::string(t);
+}
+/* THE STOLEN MARK KEPT: the record's owner ticket written raw onto a kept item just made, unchanged. What was read: the engine's
+   resolver (0x2844D0) returns 0 for a ticket it does not hold, and the callers of it that were sampled check for 0. A ticket that
+   names nobody already (coopmark::RawHandIsOwner) is not written. */
+void ItKeptOwnerTicket(::Item* item, const zonekeep::KeptItem& it)
+{
+    if (item == 0 || it.hasOwner == 0) return;
+    unsigned int w[5];
+    for (int i = 0; i < 5; ++i) w[i] = (unsigned int)it.owner[i];
+    if (!coopmark::RawHandIsOwner(w)) return;
+    if (ItRawHandWritePod((void*)item, kItemOwnerHand, w) == 0) ErrorLog("[KEPT] kept item " + it.tmpl + ": writing its owner ticket " + ItHandWords(w) + " FAULTED - laid without its stolen mark");
+}
+/* an item's uniform (its faction's record id; "" = none) and crafter, read-only */
+void ItKeptMarksRead(void* item, char* uni, int ucap, char* cr, int ccap)
+{
+    uni[0] = 0; cr[0] = 0;
+    if (ItGearMarksPod(item) == 0) return;   /* only the gear family has these fields */
+    void* f = 0;
+    void* gd = 0;
+    if (ItPtrPod(item, kItUniform, &f) != 0 && f != 0 && ItPlaus(f) && ItPtrPod(f, kItFacData, &gd) != 0 && ItPlaus(gd)) ItStrPod((const char*)gd + kItGdSid, uni, ucap);
+    ItStrPod((const char*)item + kItCrafter, cr, ccap);
+}
+/* a kept item made with all its fields, in no inventory; 0 = not made */
+::Item* ItKeptMake(const zonekeep::KeptItem& it)
+{
+    ItemMoveMsg mm;
+    mm.baseSid = it.tmpl; mm.companySid = it.company; mm.materialSid = it.material; mm.colorSid = it.color;
+    mm.quality = it.quality; mm.charges = it.charges;
+    mm.functionKind = it.function; mm.level = it.level; mm.unique = it.unique;
+    mm.quantity = it.quantity > 0 ? it.quantity : 1;
+    ::Item* item = ItCreateItem(0, mm, 1);
+    if (item != 0) ItKeptMarks(item, it);   /* the uniform and the crafter ItemMoveMsg does not carry */
+    if (item != 0) ItKeptOwnerTicket(item, it);   /* the stolen mark, raw */
+    return item;
+}
+/* a kept item made here that no place took: kept alive in no inventory and tried again (ItKeptLayItems) */
+struct ItKeptWaitItem
+{
+    ::Item* item; zonekeep::KeptItem it; int isInner; std::string packTmpl;
+    std::string path;   /* its path in the row's items (keptwire::ItemPathSplit) */
+    int dead;           /* it no longer reads as alive (ItObj): never used again, still named in the laid-here record */
+    ItKeptWaitItem() : item(0), isInner(0), dead(0) {}
+};
+/* where one lay's items went, for its LAID line; left counts each time an item went nowhere, wait holds those items, elsewhere the
+   paths of pack items placed outside their pack */
+struct ItKeptTally
+{
+    int box, packIn, packToBox, ground, left, faulted, notMade;
+    std::vector<ItKeptWaitItem> wait;
+    std::vector<std::string> elsewhere;
+    ItKeptTally() : box(0), packIn(0), packToBox(0), ground(0), left(0), faulted(0), notMade(0) {}
+};
+/* a made item from place `where` on, in keptwire::KeptPutNext's order, until one takes it: counted, and named in an error line when
+   it is not its first place (a pack's item outside its pack, anything on the ground); one that no place takes goes into t->wait */
+void ItKeptPlace(::Item* item, const zonekeep::KeptItem& it, int isInner, int where, void* packInv, ::Inventory* boxInv, void* box, const float* boxPos,
+                 const char* key, const std::string& packTmpl, ItKeptTally* t, const std::string& path)
+{
+    int r = 0;
+    while (where != keptwire::kPutLeft)
+    {
+        if (where == keptwire::kPutPack) r = ItKeptPutInto((::Inventory*)packInv, item, it.section, it.slotX, it.slotY);
+        else if (where == keptwire::kPutBox) r = ItKeptPutInto(boxInv, item, isInner != 0 ? std::string() : it.section, it.slotX, it.slotY);
+        else r = ItBoxBackDrop((void*)item, boxPos, box);
+        if (r != 0) break;
+        where = keptwire::KeptPutNext(where);
+    }
+    const std::string what = "[KEPT] box " + std::string(key) + ": kept item " + it.tmpl + (isInner != 0 ? " of the pack " + packTmpl : std::string())
+                             + " x" + N((long long)(it.quantity > 0 ? it.quantity : 1));
+    if (r < 0)
+    {
+        ++t->faulted;
+        if (isInner != 0) t->elsewhere.push_back(path);
+        ErrorLog(what + " - the engine's add FAULTED; left where that put it (never added again or destroyed)");
+        return;
+    }
+    if (where == keptwire::kPutLeft)
+    {
+        ++t->left;
+        ItKeptWaitItem wi;
+        wi.item = item; wi.it = it; wi.it.inner.clear(); wi.isInner = isInner; wi.packTmpl = packTmpl; wi.path = path;
+        t->wait.push_back(wi);
+        DebugLog(what + " went nowhere (not into the box, not onto the ground) - kept alive in no inventory and tried again on the next pass");
+        return;
+    }
+    if (where == keptwire::kPutPack) { ++t->packIn; return; }
+    if (where == keptwire::kPutBox)
+    {
+        if (isInner == 0) { ++t->box; return; }
+        ++t->packToBox;
+        t->elsewhere.push_back(path);
+        ErrorLog(what + (packInv != 0 ? " would not go into its pack" : " has no pack here to go into") + " - put into the box");
+        return;
+    }
+    ++t->ground;
+    if (isInner != 0) t->elsewhere.push_back(path);
+    ErrorLog(what + " would not go into " + (isInner != 0 ? "its pack or " : "") + "the box - dropped on the ground beside the box");
+}
+std::string BagTestCommand(const std::string& arg);
+/* TEST-ONLY levers (bagtest tobox / inbox): the first loaded building whose position key or instance id holds `needle` and that
+   carries an inventory, or 0; *key = its position key */
+void* ItLeverBox(const std::string& needle, std::string* key)
+{
+    if (StoreTearingDown() != 0 || needle.empty()) return 0;
+    if (needle == "placed")
+    {   /* the exact piece the last `buildtest place` made (build.cpp), found by its address among the loaded buildings */
+        std::string why;
+        void* pb = BuildTestPlacedLive(&why);
+        if (pb == 0) { DebugLog("[ITEMS] bagtest box 'placed' REFUSED: " + why); return 0; }
+        if (ItBoxInventory(pb) == 0) { DebugLog("[ITEMS] bagtest box 'placed' REFUSED: the piece buildtest place made carries no inventory"); return 0; }
+        char pk[kBoxKeyCap]; pk[0] = 0;
+        *key = (ItBoxKeyBuild(pb, pk, kBoxKeyCap, 0, 0) != 0) ? std::string(pk) : std::string();
+        return pb;
+    }
+    static void* list[kBoxWalkCap];
+    int zones = 0;
+    const int n = LoadedBuildings(list, kBoxWalkCap, &zones);
+    for (int i = 0; i < n; ++i)
+    {
+        char pk[kBoxKeyCap]; pk[0] = 0;
+        const std::string k(ItBoxKeyBuild(list[i], pk, kBoxKeyCap, 0, 0) != 0 ? pk : "");
+        char id[kBoxKeyCap]; id[0] = 0;
+        const int idOk = (ItStrPodWhy((const char*)list[i] + kBldInstanceUid, id, kBoxKeyCap) == 1) ? 1 : 0;
+        if ((k.empty() || k.find(needle) == std::string::npos) && (idOk == 0 || std::string(id).find(needle) == std::string::npos)) continue;
+        if (ItBoxInventory(list[i]) == 0) continue;
+        *key = k;
+        return list[i];
+    }
+    /* a chest inside a building is on the furniture list only: a live entry whose key holds the text and that has an inventory */
+    ItFurnEnsure();
+    if (ItFurnValid() != 0)
+        for (int f = 0; f < g_furnN; ++f)
+        {
+            if (ItFurnRowLive(g_furn[f]) == 0) continue;
+            void* const b = g_furn[f].b;
+            char fk[kBoxKeyCap]; fk[0] = 0;
+            if (ItBoxKeyBuild(b, fk, kBoxKeyCap, 0, 0) == 0 || std::string(fk).find(needle) == std::string::npos) continue;
+            if (ItBoxInventory(b) == 0) continue;
+            *key = fk;
+            return b;
+        }
+    return 0;
+}
+/* one [ITEMS] line per pack row, in bagtest list's words after `row N` (the before / after comparison reads them): each row's own
+   stored cell (the item's inventoryPos ItBagRowsWalk read, at every level), and at the end its quality, charges and function kind */
+void ItBagRowLines(const std::string& lead, void* pack, const std::vector<coopbag::BagRow>& rows)
+{
+    (void)pack;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        DebugLog(lead + " row " + N((long long)i) + " " + rows[i].section + ":" + N((long long)rows[i].x) + "," + N((long long)rows[i].y) + " sid=" + rows[i].baseSid
+                 + " qty=" + N((long long)rows[i].qty) + " co=" + rows[i].companySid + " mat=" + rows[i].materialSid + " col=" + rows[i].colorSid
+                 + " lvl=" + N((long long)rows[i].level) + " unique=" + N((long long)rows[i].unique)
+                 + " (row record x,y=" + N((long long)rows[i].x) + "," + N((long long)rows[i].y) + ")"
+                 + ItBagFieldWords(rows[i].quality, rows[i].charges, rows[i].functionKind));
+    }
+}
+/* TEST-ONLY `bagtest tobox <me|name> <box key substring>`: a NEW pack of the worn pack's record, holding the worn pack's rows (made
+   and placed the way a kept pack is laid back: ItKeptMake, ItKeptPutInto), put into that box; the worn pack is not touched */
+std::string ItBagToBoxLever(::Character* c, void* pack, const std::string& packAt, const std::string& who, const std::string& needle)
+{
+    (void)c;
+    if (needle.empty()) return "error bagtest tobox usage: bagtest tobox <me|name> <box key substring>";
+    if (pack == 0) { DebugLog("[ITEMS] bagtest tobox" + who + " -> wears NO backpack - bagtest wear first"); return "error bagtest tobox nopack"; }
+    std::vector<coopbag::BagRow> rows; int why = 0;
+    if (ItBagRowsOf(pack, &rows, &why) < 0) { DebugLog("[ITEMS] bagtest tobox" + who + " pack=" + packAt + " -> its contents are " + std::string(ItBagWhyName(why))); return "error bagtest tobox " + std::string(ItBagWhyName(why)); }
+    std::string key;
+    void* box = ItLeverBox(needle, &key);
+    if (box == 0) { DebugLog("[ITEMS] bagtest tobox '" + needle + "' -> no loaded building with an inventory matches"); return "error bagtest tobox no such box"; }
+    char psid[kSidCap]; psid[0] = 0;
+    ItBaseSidPod(pack, psid, kSidCap);
+    zonekeep::KeptItem kp; kp.tmpl = psid; kp.quantity = 1;
+    ::Item* np = ItKeptMake(kp);
+    void* pinv = 0;
+    if (np == 0 || ItBagInvPod((void*)np, &pinv) == 0)
+    {
+        if (np != 0) ItDestroyPod((void*)np, "bagtest tobox: not a pack");
+        DebugLog("[ITEMS] bagtest tobox" + who + " -> a pack of " + std::string(psid) + " could not be made here");
+        return "error bagtest tobox make";
+    }
+    size_t in = 0;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        zonekeep::KeptItem r;
+        r.tmpl = rows[i].baseSid; r.company = rows[i].companySid; r.material = rows[i].materialSid; r.color = rows[i].colorSid; r.section = rows[i].section;
+        r.quality = rows[i].quality; r.charges = rows[i].charges; r.quantity = (int)rows[i].qty; r.level = rows[i].level; r.function = rows[i].functionKind;
+        r.unique = (int)rows[i].unique; r.slotX = (int)rows[i].x; r.slotY = (int)rows[i].y;
+        ::Item* x = ItKeptMake(r);
+        const int put = (x != 0) ? ItKeptPutInto((::Inventory*)pinv, x, r.section, r.slotX, r.slotY) : 0;
+        if (put == 1) { ++in; continue; }
+        if (x != 0 && put == 0) ItDestroyPod((void*)x, "bagtest tobox: a row not placed");
+    }
+    if (in != rows.size())
+    {
+        ItDestroyPod((void*)np, "bagtest tobox: the copy could not be filled");
+        DebugLog("[ITEMS] bagtest tobox" + who + " -> only " + N((long long)in) + " of " + N((long long)rows.size()) + " rows went into the new pack - nothing put in the box");
+        return "error bagtest tobox fill";
+    }
+    const int put = ItKeptPutInto(ItBoxInventory(box), np, std::string(), 0, 0);
+    if (put != 1)
+    {
+        if (put == 0) ItDestroyPod((void*)np, "bagtest tobox: the box refused the pack");
+        DebugLog("[ITEMS] bagtest tobox" + who + " -> box key=" + key + (put == 0 ? " refused the pack" : " - the engine's add FAULTED"));
+        return "error bagtest tobox box";
+    }
+    std::vector<coopbag::BagRow> back; int w2 = 0;
+    ItBagRowsOf((void*)np, &back, &w2);
+    const std::string dg = ItBagHex(coopbag::BagRowsDigest(back));
+    DebugLog("[ITEMS] bagtest tobox" + who + " pack=" + packAt + " -> a new " + std::string(psid) + " holding " + N((long long)back.size())
+             + " row(s) (the worn pack's rows; the worn pack is unchanged) put into box key=" + key + " digest=" + dg);
+    ItBagRowLines("[ITEMS] bagtest tobox", (void*)np, back);
+    return "ok bagtest tobox rows=" + N((long long)back.size()) + " digest=" + dg;
+}
+/* a kept item made but not taken by its pack: placed after the outer pack, from the box on (keptwire::KeptPutNext after the pack) */
+struct ItKeptOver { ::Item* item; const zonekeep::KeptItem* it; std::string packTmpl; void* packInv; std::string path; };
+/* FILL BEFORE PLACE, AT ANY DEPTH: a made pack's own kept items go into it while it is in no inventory (as ItBagFill fills a pack), each
+   pack among them filled the same way before it goes in. pack = 0 (the pack could not be made): its items are still made, their own
+   filled, and they go to the box. What a pack refuses is pushed onto *over. path = the pack's path in the row's items; an item whose
+   path *skip names (keptwire::HereNamed: made again on its own, or placed elsewhere) is not made. */
+void ItKeptFillPack(::Item* pack, const zonekeep::KeptItem& it, const char* key, ItKeptTally* t, std::vector<ItKeptOver>* over,
+                    const std::string& path = std::string(), const std::vector<std::string>* skip = 0)
+{
+    void* packInv = 0;
+    if (pack != 0 && !it.inner.empty() && ItBagInvPod((void*)pack, &packInv) == 0)
+    {
+        packInv = 0;
+        ErrorLog("[KEPT] box " + std::string(key) + ": kept item " + it.tmpl + " held " + N((long long)it.inner.size()) + " item(s) but is not a pack here - they go into the box");
+    }
+    for (size_t k = 0; k < it.inner.size(); ++k)
+    {
+        const zonekeep::KeptItem& ik = it.inner[k];
+        const std::string cp = keptwire::ItemPathChild(path, k);
+        if (skip != 0 && keptwire::HereNamed(*skip, cp)) continue;
+        ::Item* in = ItKeptMake(ik);
+        if (in == 0)
+        {
+            ++t->notMade;
+            ErrorLog("[KEPT] box " + std::string(key) + ": kept item " + ik.tmpl + " of the pack " + it.tmpl + " could not be made here - not laid"
+                     + (ik.inner.empty() ? std::string() : " (the " + N((long long)ik.inner.size()) + " item(s) it held are made and go into the box)"));
+            ItKeptFillPack(0, ik, key, t, over, cp, skip);
+            continue;
+        }
+        ItKeptFillPack(in, ik, key, t, over, cp, skip);
+        if (packInv != 0)
+        {
+            const int r = ItKeptPutInto((::Inventory*)packInv, in, ik.section, ik.slotX, ik.slotY);
+            if (r == 1) { ++t->packIn; continue; }
+            if (r < 0)
+            {
+                ++t->faulted;
+                t->elsewhere.push_back(cp);
+                ErrorLog("[KEPT] box " + std::string(key) + ": kept item " + ik.tmpl + " of the pack " + it.tmpl + " - the engine's add FAULTED; left where that put it (never added again or destroyed)");
+                continue;
+            }
+        }
+        ItKeptOver o; o.item = in; o.it = &ik; o.packTmpl = it.tmpl; o.packInv = packInv; o.path = cp;
+        over->push_back(o);
+    }
+}
+/* TEST-ONLY, read-only: every item of an inventory with each pack's own items after it, at every depth (6 levels at most) - one line per
+   item: its depth, the record of the pack it is in ("box" at depth 1), its record, quantity, section and cell, its uniform's faction
+   record id ("-" = none) and its crafter */
+void ItBoxTreeLines(const std::string& lead, ::Inventory* inv, int depth, const std::string& in)
+{
+    if (inv == 0 || depth > 6) return;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) { DebugLog(lead + " item d=" + N((long long)depth) + " in=" + in + " - its sections are unreadable"); return; }
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        char secName[kSecCap]; secName[0] = 0;
+        if (ItStrPod(&it->first, secName, kSecCap) == 0) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            if (!ItPlaus(item)) continue;
+            char sid[kSidCap]; sid[0] = 0;
+            ItBaseSidPod(item, sid, kSidCap);
+            int q = -1, cx = -1, cy = -1;
+            ItIntPod(item, kItemQuantity, &q);
+            ItItemCellPod(item, &cx, &cy);
+            char uni[kSidCap], cr[96];
+            ItKeptMarksRead(item, uni, kSidCap, cr, (int)sizeof cr);
+            unsigned int w5[5] = { 0, 0, 0, 0, 0 };
+            const int hr = ItRawHandAtPod(item, kItemOwnerHand, w5);
+            DebugLog(lead + " item d=" + N((long long)depth) + " in=" + in + " " + std::string(sid) + " x" + N((long long)q) + " at " + secName + ":" + N((long long)cx) + "," + N((long long)cy)
+                     + " uniform=" + (uni[0] != 0 ? std::string(uni) : std::string("-")) + " crafter='" + std::string(cr) + "' owner=" + (hr != 0 ? ItHandWords(w5) : std::string("unreadable"))
+                     + (hr != 0 && coopmark::RawHandIsOwner(w5) ? " (stolen mark)" : ""));
+            void* pinv = 0;
+            if (ItBagInvPod(item, &pinv) != 0 && pinv != 0) ItBoxTreeLines(lead, (::Inventory*)pinv, depth + 1, std::string(sid));
+        }
+    }
+}
+/* TEST-ONLY `bagtest nest <me|name> <box key substring> <itemSid> <n 1..20>`: a NEW pack of the worn pack's record holding a second pack
+   of that record (itself holding itemSid x n) and itemSid x 1, the items (never a pack) with the character's name as their crafter and
+   kItNestUniform as their uniform - written only on a gear item (ItKeptMarks) - put into that box - made and filled the way the kept lay makes a pack in a pack
+   (ItKeptMake, ItKeptFillPack, ItKeptPutInto); then the box's items as bagtest inbox lists them */
+std::string ItBagNestLever(const std::string& packSid, const std::string& who, const std::string& crafter, const std::string& needle, const std::string& itemSid, int n)
+{
+    if (packSid.empty()) { DebugLog("[ITEMS] bagtest nest" + who + " -> wears NO backpack - bagtest wear first (the packs are made of its record)"); return "error bagtest nest nopack"; }
+    std::string key;
+    void* box = ItLeverBox(needle, &key);
+    if (box == 0) { DebugLog("[ITEMS] bagtest nest '" + needle + "' -> no loaded building with an inventory matches"); return "error bagtest nest no such box"; }
+    ::Inventory* binv = ItBoxInventory(box);
+    if (binv == 0) return "error bagtest nest no inventory";
+    zonekeep::KeptItem leaf; leaf.tmpl = itemSid; leaf.quantity = n; leaf.section = "backpack_content"; leaf.crafter = crafter; leaf.uniform = kItNestUniform;
+    const int leafDef = ItRecordDefaults(itemSid, &leaf);   /* quality, charges and function kind as the game gives a new item of the record */
+    zonekeep::KeptItem mid; mid.tmpl = packSid; mid.quantity = 1; mid.section = "backpack_content";
+    const int packDef = ItRecordDefaults(packSid, &mid);
+    mid.inner.push_back(leaf);   /* a pack is never marked */
+    zonekeep::KeptItem top; top.tmpl = packSid; top.quantity = 1; top.quality = mid.quality; top.charges = mid.charges; top.function = mid.function; top.inner.push_back(mid);
+    DebugLog("[ITEMS] bagtest nest record defaults: " + itemSid + (leafDef != 0 ? ItBagFieldWords(leaf.quality, leaf.charges, leaf.function) : std::string(" not read - 0s"))
+             + ", " + packSid + (packDef != 0 ? ItBagFieldWords(mid.quality, mid.charges, mid.function) : std::string(" not read - 0s")));
+    leaf.quantity = 1;
+    top.inner.push_back(leaf);
+    ItKeptTally t;
+    std::vector<ItKeptOver> over;
+    ::Item* outer = ItKeptMake(top);
+    if (outer == 0) { DebugLog("[ITEMS] bagtest nest" + who + " -> the pack " + packSid + " could not be made"); return "error bagtest nest notmade"; }
+    ItKeptFillPack(outer, top, key.c_str(), &t, &over);
+    const int put = ItKeptPutInto(binv, outer, std::string(), 0, 0);
+    int overPut = 0;
+    for (size_t k = 0; k < over.size(); ++k) if (ItKeptPutInto(binv, over[k].item, std::string(), 0, 0) == 1) ++overPut;
+    DebugLog("[ITEMS] bagtest nest" + who + " -> a new " + packSid + " holding a " + packSid + " (holding " + itemSid + " x" + N((long long)n) + ") and " + itemSid + " x1, crafter '"
+             + crafter + "', uniform " + kItNestUniform + " - put into box key=" + key + " put=" + N((long long)put) + " inside their packs=" + N((long long)t.packIn)
+             + " refused by a pack=" + N((long long)over.size()) + " (" + N((long long)overPut) + " into the box) not made=" + N((long long)t.notMade));
+    ItBoxTreeLines("[ITEMS] bagtest nest key=" + key, binv, 1, "box");
+    return "ok bagtest nest key=" + key;
+}
+/* the first item of record `sid` in an inventory, each pack's own items searched after it (6 levels at most); 0 = none */
+void* ItFindInTree(::Inventory* inv, const std::string& sid, int depth)
+{
+    if (inv == 0 || depth > 6) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            if (!ItPlaus(item)) continue;
+            char s2[kSidCap]; s2[0] = 0;
+            ItBaseSidPod(item, s2, kSidCap);
+            if (sid == s2) return item;
+            void* pinv = 0;
+            if (ItBagInvPod(item, &pinv) != 0 && pinv != 0) { void* f = ItFindInTree((::Inventory*)pinv, sid, depth + 1); if (f != 0) return f; }
+        }
+    }
+    return 0;
+}
+/* TEST-ONLY `bagtest mark <me|name> <box key substring> <itemSid>`: the first item of that record in that box, at any depth, gets the
+   named character's own hand (RootObjectBase +0x58, its words from +0x60) as its owner ticket - written raw at +0x148, as the kept lay
+   writes a kept ticket; then the box's items as bagtest inbox lists them. Game A only in playerpath runs. With `gear` last, the item also gets kItNestUniform as its uniform and the character's name as
+   its crafter (ItKeptMarks: written on a gear item only). */
+std::string ItBagMarkLever(::Character* c, const std::string& who, const std::string& needle, const std::string& sid, const std::string& gearCrafter)
+{
+    std::string key;
+    void* box = ItLeverBox(needle, &key);
+    if (box == 0) { DebugLog("[ITEMS] bagtest mark '" + needle + "' -> no loaded building with an inventory matches"); return "error bagtest mark no such box"; }
+    ::Inventory* binv = ItBoxInventory(box);
+    unsigned int w5[5], before[5] = { 0, 0, 0, 0, 0 }, after[5] = { 0, 0, 0, 0, 0 };
+    if (c == 0 || ItRawHandAtPod((void*)c, kRootHandFields, w5) == 0) { DebugLog("[ITEMS] bagtest mark" + who + " -> the character's own hand could not be read"); return "error bagtest mark nohand"; }
+    void* item = ItFindInTree(binv, sid, 1);
+    if (item == 0) { DebugLog("[ITEMS] bagtest mark" + who + " -> box key=" + key + " holds no " + sid + " at any depth"); return "error bagtest mark no such item"; }
+    ItRawHandAtPod(item, kItemOwnerHand, before);
+    const int ok = ItRawHandWritePod(item, kItemOwnerHand, w5);
+    if (!gearCrafter.empty())
+    {
+        zonekeep::KeptItem k; k.tmpl = sid; k.uniform = kItNestUniform; k.crafter = gearCrafter;
+        ItKeptMarks((::Item*)item, k);
+        DebugLog("[ITEMS] bagtest mark" + who + " -> item " + sid + " in box key=" + key + " uniform " + kItNestUniform + " and crafter '" + gearCrafter + "' written (gear items only)");
+    }
+    ItRawHandAtPod(item, kItemOwnerHand, after);
+    DebugLog("[ITEMS] bagtest mark" + who + " -> item " + sid + " in box key=" + key + " owner ticket " + ItHandWords(before) + " -> " + ItHandWords(after) + (ok != 0 ? "" : " (the write FAULTED)"));
+    ItBoxTreeLines("[ITEMS] bagtest mark key=" + key, binv, 1, "box");
+    return ok != 0 ? "ok bagtest mark key=" + key : "error bagtest mark faulted";
+}
+/* TEST-ONLY, read-only `bagtest inbox <box key substring> [me|name]`: every pack in that box with its rows (bagtest list's words),
+   then - with a character named - that character's worn pack as `bagtest list` gives it */
+std::string ItBagInBoxLever(const std::string& needle, const std::string& alsoWho)
+{
+    std::string key;
+    void* box = ItLeverBox(needle, &key);
+    if (box == 0) { DebugLog("[ITEMS] bagtest inbox '" + needle + "' -> no loaded building with an inventory matches"); return "error bagtest inbox no such box"; }
+    ::Inventory* inv = ItBoxInventory(box);
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return "error bagtest inbox unreadable";
+    long long packs = 0, rowsAll = 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        char secName[kSecCap]; secName[0] = 0;
+        if (ItStrPod(&it->first, secName, kSecCap) == 0) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            void* pinv = 0;
+            if (!ItPlaus(item) || ItBagInvPod(item, &pinv) == 0) continue;
+            std::vector<coopbag::BagRow> rows; int why = 0;
+            char sid[kSidCap]; sid[0] = 0;
+            ItBaseSidPod(item, sid, kSidCap);
+            int cx = -1, cy = -1;
+            ItItemCellPod(item, &cx, &cy);
+            const int rr = ItBagRowsOf(item, &rows, &why);
+            ++packs;
+            if (rr < 0)
+            {
+                DebugLog("[ITEMS] bagtest inbox key=" + key + " pack " + N(packs) + " " + std::string(sid) + " at " + secName + ":" + N((long long)cx) + "," + N((long long)cy)
+                         + " -> its contents are " + std::string(ItBagWhyName(why)));
+                continue;
+            }
+            rowsAll += (long long)rows.size();
+            DebugLog("[ITEMS] bagtest inbox key=" + key + " pack " + N(packs) + " " + std::string(sid) + " at " + secName + ":" + N((long long)cx) + "," + N((long long)cy)
+                     + " rows=" + N((long long)rows.size()) + " digest=" + ItBagHex(coopbag::BagRowsDigest(rows)));
+            ItBagRowLines("[ITEMS] bagtest inbox", item, rows);
+        }
+    }
+    ItBoxTreeLines("[ITEMS] bagtest inbox key=" + key, inv, 1, "box");   /* every item at every depth, with its uniform and crafter */
+    if (!alsoWho.empty()) BagTestCommand("list " + alsoWho);
+    return "ok bagtest inbox key=" + key + " packs=" + N(packs) + " rows=" + N(rowsAll);
+}
 std::string BagTestCommand(const std::string& arg)
 {
     std::vector<std::string> tok;
@@ -11962,10 +13301,11 @@ std::string BagTestCommand(const std::string& arg)
             else t += arg[i];
         }
     }
-    const std::string usage = "error bagtest usage: bagtest wear <me|name> <packSid|auto> | put <me|name> <sid> [count] | list <me|peer|name> | out <me|name> <x> <y> | out <me|name> sid <baseSid> | take <peer|name> <x> <y> | take <peer|name> sid <baseSid> | unwear <me|name> | wearback <me|name>";
+    const std::string usage = "error bagtest usage: bagtest wear <me|name> <packSid|auto> [<sid> [count]] | put <me|name> <sid> [count] | list <me|peer|name> | out <me|name> <x> <y> | out <me|name> sid <baseSid> | take <peer|name> <x> <y> | take <peer|name> sid <baseSid> | unwear <me|name> | wearback <me|name> | tobox <me|name> <box key substring> | inbox <box key substring> [me|name] | nest <me|name> <box key substring> <itemSid> <n 1..20> | mark <me|name> <box key substring> <itemSid> [gear]";
     if (tok.size() < 2) return usage;
     const std::string mode = tok[0];
-    if (mode != "wear" && mode != "put" && mode != "list" && mode != "out" && mode != "take" && mode != "unwear" && mode != "wearback") return usage;
+    if (mode != "wear" && mode != "put" && mode != "list" && mode != "out" && mode != "take" && mode != "unwear" && mode != "wearback" && mode != "tobox" && mode != "inbox" && mode != "nest" && mode != "mark") return usage;
+    if (mode == "inbox") return ItBagInBoxLever(tok[1], tok.size() >= 3 ? tok[2] : std::string());
     ::Character* c = 0; unsigned int uid = 0; std::string name; long long hits = 0;
     if (ItLeverPick(tok[1], &c, &uid, &name, &hits) == 0)
     {
@@ -11982,6 +13322,22 @@ std::string BagTestCommand(const std::string& arg)
     if (pack != 0) ItBaseSidPod(pack, psid, kSidCap);
     const std::string packAt = std::string(psid) + " at " + packSec + ":" + N((long long)px) + "," + N((long long)py);
 
+    if (mode == "nest")
+    {
+        const int n = tok.size() >= 5 ? std::atoi(tok[4].c_str()) : 0;
+        if (tok.size() < 5 || n < 1 || n > 20) return "error bagtest nest usage: bagtest nest <me|name> <box key substring> <itemSid> <n 1..20>";
+        return ItBagNestLever(std::string(psid), who, name, tok[2], tok[3], n);
+    }
+    if (mode == "mark")
+    {
+        if (tok.size() < 4) return "error bagtest mark usage: bagtest mark <me|name> <box key substring> <itemSid> [gear]";
+        return ItBagMarkLever(c, who, tok[2], tok[3], (tok.size() >= 5 && tok[4] == "gear") ? name : std::string());
+    }
+    if (mode == "tobox")
+    {
+        BagTestCommand("list " + tok[1]);   /* the worn pack's rows first, in bagtest list's words */
+        return ItBagToBoxLever(c, pack, packAt, who, tok.size() >= 3 ? tok[2] : std::string());
+    }
     if (mode == "list")
     {
         if (pack == 0) { DebugLog("[ITEMS] bagtest list" + who + " -> wears NO backpack (no top-level item with its own inventory)"); return "ok bagtest list nopack"; }
@@ -11993,17 +13349,7 @@ std::string BagTestCommand(const std::string& arg)
         }
         const std::string dg = ItBagHex(coopbag::BagRowsDigest(rows));
         DebugLog("[ITEMS] bagtest list" + who + " pack=" + packAt + " rows=" + N((long long)rows.size()) + " digest=" + dg);
-        std::vector<int> cx, cy;
-        ItBagLeverCells(pack, &cx, &cy);   /* bag23 lever fix: each row's REAL cell (the item's own inventoryPos) */
-        for (size_t i = 0; i < rows.size(); ++i)
-        {
-            const int rx = (i < cx.size()) ? cx[i] : -1, ry = (i < cy.size()) ? cy[i] : -1;
-            DebugLog("[ITEMS] bagtest list row " + N((long long)i) + " " + rows[i].section + ":" + N((long long)rx) + ","
-                     + N((long long)ry) + " sid=" + rows[i].baseSid + " qty=" + N((long long)rows[i].qty)
-                     + " co=" + rows[i].companySid + " mat=" + rows[i].materialSid + " col=" + rows[i].colorSid
-                     + " lvl=" + N((long long)rows[i].level) + " unique=" + N((long long)rows[i].unique)
-                     + " (row record x,y=" + N((long long)rows[i].x) + "," + N((long long)rows[i].y) + ")");
-        }
+        ItBagRowLines("[ITEMS] bagtest list", pack, rows);   /* each row's own cell at every level, with quality, charges and function kind */
         return "ok bagtest list rows=" + N((long long)rows.size()) + " digest=" + dg;
     }
     if (mode == "out" || mode == "take")
@@ -12168,6 +13514,7 @@ std::string BagTestCommand(const std::string& arg)
             DebugLog("[ITEMS] bagtest wear" + who + tried + " -> CREATED AND WORN at backpack_attach:" + N((long long)x) + ","
                      + N((long long)y) + " (candidate " + N((long long)(i + 1)) + " of " + N((long long)cands.size())
                      + "; the item hooks rang an op-0 ADD on our own character, published as usual - the other game's copy gets an EMPTY pack until phase 2)");
+            if (tok.size() >= 4) return "ok bagtest wear " + cands[i] + "; " + BagTestCommand("put " + tok[1] + " " + tok[3] + (tok.size() >= 5 ? " " + tok[4] : std::string()));   /* worn and filled in one line */
             return "ok bagtest wear " + cands[i];
         }
         DebugLog("[ITEMS] bagtest wear" + who + " -> NO candidate could be worn (" + N((long long)cands.size()) + " tried)");
@@ -12723,9 +14070,9 @@ std::string ItP030Fields(void* building, int countIt)
         parentStr = (ItBaseSidWhy(parent, psid, kBoxSidRoom) == 1) ? std::string(psid) : std::string("?");
     }
     int okx = 0, oky = 0, okz = 0;
-    const long x10 = havePos != 0 ? ItTenthsOfAUnit(pos[0], &okx) : 0;
-    const long y10 = havePos != 0 ? ItTenthsOfAUnit(pos[1], &oky) : 0;
-    const long z10 = havePos != 0 ? ItTenthsOfAUnit(pos[2], &okz) : 0;
+    const long x10 = havePos != 0 ? poskey::TenthsOfAUnit(pos[0], &okx) : 0;
+    const long y10 = havePos != 0 ? poskey::TenthsOfAUnit(pos[1], &oky) : 0;
+    const long z10 = havePos != 0 ? poskey::TenthsOfAUnit(pos[2], &okz) : 0;
     const int posOk = (havePos != 0 && okx != 0 && oky != 0 && okz != 0) ? 1 : 0;
     char keybuf[kBoxKeyCap];
     keybuf[0] = 0;
@@ -12784,6 +14131,203 @@ std::string ItBoxTestFields(void* building, const std::string& idStr, int buildi
            " 0 = the drain would drop this move as boxZoneGone, 1 = loaded here)"
          + ItP029Fields(vtRva)
          + ItP030Fields(building, 0);
+}
+
+/* KEPT (src/common/keptwire.h), MAIN THREAD (build.cpp's kept drain): THE KEPT BOX CONTENTS LAID BACK into the live box b at key, in
+   full and once: the world server never offers laid box contents to another game, and this game lays them again only when the save
+   it runs on does not hold its lay (build.cpp's laid-here record). Only the box's writer lays (ItBoxWriterAt == kBoxMine). Each item is
+   made with all its fields (ItCreateItem); a kept backpack is filled with its own items while it is in no inventory, then placed. No
+   item is destroyed: each goes where keptwire::KeptPutFirst / KeptPutNext say (its own cell, else anywhere in its section, else the
+   engine's whole-inventory add; what a pack refuses goes into the box, what the box refuses onto the ground beside it) and every item
+   that does not go to its first place is named in an error line. An item no place takes is kept alive in no inventory
+   (g_itKeptWait, with its path in the row's items) and tried again by ItKeptRetryWaits. 1 = laid (*laid = how many of the box's own
+   items went into it; *why counts the rest), 3 = laid, some items wait for a place, 0 = not now (this game is not the writer, or items
+   of this box still wait here - nothing made), -1 = refused (the piece carries no inventory here). */
+int ItParityContents(::Inventory* inv, std::vector<cooppar::ParityItem>* out, int* secUnread = 0);   /* defined further down this file, in coop as here */
+struct ItKeptWaitBox { int passes; ItKeptTally t; ItKeptWaitBox() : passes(0) {} };
+std::map<std::string, ItKeptWaitBox> g_itKeptWait;   /* box key -> its kept items made here and waiting for a place (MAIN THREAD; this world's) */
+std::string ItKeptTallyText(const ItKeptTally& t)
+{
+    const int off = t.packToBox + t.ground + (int)t.wait.size() + t.faulted + t.notMade;
+    if (t.packIn + off == 0) return std::string();
+    return N((long long)t.packIn) + " pack item(s) inside their packs, " + N((long long)t.packToBox) + " put into the box instead of their pack, "
+           + N((long long)t.ground) + " dropped on the ground beside the box, " + N((long long)t.wait.size()) + " in no inventory, "
+           + N((long long)t.faulted) + " faulted, " + N((long long)t.notMade) + " not made" + (off != 0 ? " (error lines above)" : "");
+}
+int ItKeptLayItems(void* b, const float* pos, const char* key, const std::vector<zonekeep::KeptItem>& items, int* laid, std::string* why)
+{
+    *laid = 0;
+    why->clear();
+    if (g_itKeptWait.find(key) != g_itKeptWait.end()) { *why = "kept items of this box still wait for a place here - nothing laid again"; return 0; }
+    if (ItBoxWriterAt(b, pos, key) != kBoxMine) { *why = "this game does not write that box now"; return 0; }
+    ::Inventory* inv = ItBoxInventory(b);
+    if (inv == 0) { *why = "the piece carries no inventory here"; return -1; }
+    ItKeptTally t;
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        const zonekeep::KeptItem& it = items[i];
+        const std::string path = keptwire::ItemPathChild(std::string(), i);
+        const std::string at = "[KEPT] box " + std::string(key) + ": kept item " + it.tmpl + " x" + N((long long)(it.quantity > 0 ? it.quantity : 1));
+        ::Item* item = ItKeptMake(it);
+        if (item == 0)
+        {
+            ++t.notMade;
+            ErrorLog(at + " could not be made here - not laid" + (it.inner.empty() ? std::string() : " (the " + N((long long)it.inner.size()) + " item(s) it held are made and go into the box)"));
+        }
+        /* FILL BEFORE PLACE, at every depth (ItKeptFillPack); what a pack refuses waits until the outer pack itself is placed, then goes
+           into the box or beside it */
+        std::vector<ItKeptOver> over;
+        ItKeptFillPack(item, it, key, &t, &over, path);
+        if (item != 0) ItKeptPlace(item, it, 0, keptwire::KeptPutFirst(0, 0), 0, inv, b, pos, key, std::string(), &t, path);
+        for (size_t k = 0; k < over.size(); ++k)
+            ItKeptPlace(over[k].item, *over[k].it, 1, keptwire::KeptPutNext(keptwire::kPutPack), over[k].packInv, inv, b, pos, key, over[k].packTmpl, &t, over[k].path);
+    }
+    *laid = t.box;
+    *why = ItKeptTallyText(t);
+    if (!t.wait.empty())
+    {
+        g_itKeptWait[key].t = t;
+        *why = N((long long)t.wait.size()) + " kept item(s) wait for a place - tried again by this game" + (why->empty() ? std::string() : "; " + *why);
+        return 3;
+    }
+    return 1;
+}
+/* KEPT ITEMS WAITING FOR A PLACE in box b at key (build.cpp BdKeptWaitTick, while the box is loaded here): each one still alive (ItObj)
+   is tried from the box on while this game writes it, else from the ground beside it. Every keptwire::kKeptItemWaitPasses passes each
+   one still waiting is dropped at the box's position (the ground road with no building); one that even that does not take waits on,
+   named in an error line every kKeptItemWaitPasses passes - never forgotten while the world stands. An item that no longer reads as
+   alive is never used again; it stays named among the waiting items, so the laid-here record has it made again after a reload.
+   Returns the items still waiting (-1 = none waited for that box); *why names what changed, or the wait every kKeptItemWaitPasses
+   passes. */
+int ItKeptRetryWaits(void* b, const float* pos, const char* key, std::string* why)
+{
+    why->clear();
+    std::map<std::string, ItKeptWaitBox>::iterator wt = g_itKeptWait.find(key);
+    if (wt == g_itKeptWait.end()) return -1;
+    ItKeptWaitBox& wb = wt->second;
+    ++wb.passes;
+    ::Inventory* winv = ItBoxInventory(b);
+    const int from = (ItBoxWriterAt(b, pos, key) == kBoxMine) ? keptwire::kPutBox : keptwire::kPutGround;   /* another game writes the box now: the ground */
+    const size_t before = wb.t.wait.size();
+    std::vector<ItKeptWaitItem> again;
+    again.swap(wb.t.wait);
+    for (size_t k = 0; k < again.size(); ++k)
+    {
+        ItKeptWaitItem& wi = again[k];
+        if (wi.dead == 0 && !ItObj((void*)wi.item))
+        {
+            wi.dead = 1;
+            ErrorLog("[KEPT] box " + std::string(key) + ": kept item " + wi.it.tmpl + " (item " + wi.path + ") waiting in no inventory no longer reads as alive - never used again; "
+                     "this game's laid-here record names it, so a reload of a save that does not hold it makes it again from the row");
+        }
+        if (wi.dead != 0) { wb.t.wait.push_back(wi); continue; }
+        ItKeptPlace(wi.item, wi.it, wi.isInner, from, 0, winv, b, pos, key, wi.packTmpl, &wb.t, wi.path);
+    }
+    int dropped = 0, still = 0;
+    if (!wb.t.wait.empty() && keptwire::KeptWaitEnds(wb.passes) != 0)
+    {
+        wb.passes = 0;
+        std::vector<ItKeptWaitItem> left;
+        left.swap(wb.t.wait);
+        for (size_t k = 0; k < left.size(); ++k)
+        {
+            ItKeptWaitItem& wi = left[k];
+            if (wi.dead != 0) { wb.t.wait.push_back(wi); continue; }
+            const int d = ItBoxBackDrop((void*)wi.item, pos, 0);   /* a drop at the box's position, not as a spill of a building */
+            const std::string what = "[KEPT] box " + std::string(key) + ": kept item " + wi.it.tmpl + " (item " + wi.path + ")";
+            if (d == 1) { ++wb.t.ground; ++dropped; if (wi.isInner != 0) wb.t.elsewhere.push_back(wi.path); ErrorLog(what + " went nowhere for " + N((long long)keptwire::kKeptItemWaitPasses) + " passes - dropped on the ground at the box's position"); continue; }
+            if (d < 0) { ++wb.t.faulted; if (wi.isInner != 0) wb.t.elsewhere.push_back(wi.path); ErrorLog(what + " - the drop at the box's position FAULTED; left where that put it (never added again or destroyed)"); continue; }
+            ++still;
+            wb.t.wait.push_back(wi);
+            ErrorLog(what + " still goes nowhere (not into the box, not onto the ground, not dropped at the box's position) - it waits on in no inventory and is tried again; named again every "
+                     + N((long long)keptwire::kKeptItemWaitPasses) + " passes");
+        }
+    }
+    if (wb.t.wait.empty())
+    {
+        *why = "every kept item that waited for a place is placed" + (ItKeptTallyText(wb.t).empty() ? std::string() : ": " + ItKeptTallyText(wb.t));
+        g_itKeptWait.erase(wt);
+        return 0;
+    }
+    if (wb.t.wait.size() != before || dropped != 0 || still != 0)
+        *why = N((long long)wb.t.wait.size()) + " kept item(s) still wait for a place (pass " + N((long long)wb.passes) + " of " + N((long long)keptwire::kKeptItemWaitPasses) + ")";
+    return (int)wb.t.wait.size();
+}
+/* the box's waiting items as the laid-here record names them (keptwire::HereWaitTokens): each one's path, and "x" and the path of each
+   pack item placed outside a waiting pack */
+void ItKeptWaitTokens(const char* key, std::vector<std::string>* out)
+{
+    out->clear();
+    std::map<std::string, ItKeptWaitBox>::const_iterator wt = g_itKeptWait.find(key);
+    if (wt == g_itKeptWait.end()) return;
+    std::vector<std::string> waiting;
+    for (size_t k = 0; k < wt->second.t.wait.size(); ++k) if (!wt->second.t.wait[k].path.empty()) waiting.push_back(wt->second.t.wait[k].path);
+    *out = keptwire::HereWaitTokens(waiting, wt->second.t.elsewhere);
+}
+/* AFTER A RELOAD: the kept items the laid-here record names as waiting (the save this game runs on does not hold them) made again
+   from the row's items - each with its own items, less every item the record names (keptwire::HereNamed) - and placed as a lay places
+   them, from the box on while this game writes it, else from the ground; those no place takes wait again (ItKeptRetryWaits). Returns
+   the items made. */
+int ItKeptRemake(void* b, const float* pos, const char* key, const std::vector<zonekeep::KeptItem>& items, const std::vector<std::string>& names, std::string* why)
+{
+    why->clear();
+    if (g_itKeptWait.find(key) != g_itKeptWait.end()) { *why = "kept items of this box already wait here - none made again"; return 0; }
+    ::Inventory* inv = ItBoxInventory(b);
+    const int from = (inv != 0 && ItBoxWriterAt(b, pos, key) == kBoxMine) ? keptwire::kPutBox : keptwire::kPutGround;
+    ItKeptTally t;
+    int made = 0;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        const std::string& p = names[i];
+        if (p.empty() || p[0] == 'x') continue;
+        const zonekeep::KeptItem* it = keptwire::ItemAtPath(items, p);
+        if (it == 0) { ErrorLog("[KEPT] box " + std::string(key) + ": the laid-here record names kept item " + p + ", which the row does not hold - not made"); continue; }
+        ::Item* item = ItKeptMake(*it);
+        if (item == 0) { ++t.notMade; ErrorLog("[KEPT] box " + std::string(key) + ": kept item " + it->tmpl + " (item " + p + ") could not be made again here"); continue; }
+        ++made;
+        std::vector<ItKeptOver> over;
+        ItKeptFillPack(item, *it, key, &t, &over, p, &names);
+        ItKeptPlace(item, *it, p.find('.') != std::string::npos ? 1 : 0, from, 0, inv, b, pos, key, std::string(), &t, p);
+        for (size_t k = 0; k < over.size(); ++k)
+            ItKeptPlace(over[k].item, *over[k].it, 1, from, over[k].packInv, inv, b, pos, key, over[k].packTmpl, &t, over[k].path);
+    }
+    *why = ItKeptTallyText(t);
+    if (!t.wait.empty())
+    {
+        g_itKeptWait[key].t = t;
+        *why = N((long long)t.wait.size()) + " kept item(s) wait for a place again - tried again by this game" + (why->empty() ? std::string() : "; " + *why);
+    }
+    return made;
+}
+/* a world teardown, or another world's rows replace this one's: the kept items still waiting for a place are left (named with their
+   paths in an error line, never destroyed by this mod); this game's laid-here record names them while its last finished save does not
+   hold them, so a reload makes them again from the row */
+void ItKeptForget(const char* why)
+{
+    size_t n = 0;
+    std::string paths;
+    for (std::map<std::string, ItKeptWaitBox>::const_iterator it = g_itKeptWait.begin(); it != g_itKeptWait.end(); ++it)
+        for (size_t k = 0; k < it->second.t.wait.size(); ++k)
+        {
+            ++n;
+            if (paths.size() < 400) paths += " " + it->first + "#" + it->second.t.wait[k].path;
+        }
+    if (n > 0)
+        ErrorLog("[KEPT] " + std::string(why) + ": " + N((long long)n) + " kept item(s) made here still waited for a place in no inventory -" + paths
+                 + " - left (never destroyed by this mod); the laid-here record names them, so a reload makes them again from the row");
+    g_itKeptWait.clear();
+}
+/* 1 = this game writes box b now (ItBoxWriterAt == kBoxMine). MAIN THREAD */
+int ItKeptBoxMine(void* b, const float* pos, const char* key) { return ItBoxWriterAt(b, pos, key) == kBoxMine ? 1 : 0; }
+/* the number of item stacks in box b, -1 = no inventory or not read - a section that did not read too, since it may hold items
+   (keptlist). MAIN THREAD */
+int ItKeptBoxCount(void* b)
+{
+    ::Inventory* inv = ItBoxInventory(b);
+    if (inv == 0) return -1;
+    std::vector<cooppar::ParityItem> have;
+    int skipped = 0;   /* sections that did not read */
+    return (ItParityContents(inv, &have, &skipped) != 0 && skipped == 0) ? (int)have.size() : -1;
 }
 
 bool BoxTest(const std::string& needle, const std::string& baseSid, int count) { return BoxTestIn(needle, baseSid, count, std::string()); }
@@ -14520,6 +16064,7 @@ struct BtKeeperAim
     int moveState; const char* moveWhy; float moveBefore; float moveAfter;   /* T-164 B4-0b: -1 not tried, 0 failed, 1 moved */
     /* T-164 B4-1: the affordable pick and the cats=<n> purse set (cats -1 = not asked; catsSet = ItPursePay's answer, -9 not tried) */
     const char* pickWhy; int pickValue; int pickPurse; int cats; int catsSet; int catsBefore;
+    int fromPack;   /* T-736: 1 = `sell pack` - the sale leaves from the window of the backpack the seller wears */
 };
 static BtKeeperAim g_btKeeper;
 static const float kBtKeeperMoveOffset = 15.0f;  /* T-164 B4-0b: world units from the keeper leader the buyer is put at - 15 as packbuytest goto (about 1.5 m), a distance runs have already traded from; 3 would stand inside the keeper */
@@ -15344,6 +16889,69 @@ bool BuyTest(const std::string& needle, const std::string& sidWanted, int npcPat
    from its own general grid through InventoryGUI::RClickAutoTrade 0x713150 - the player's right-click, on the SELLER's
    window towards the shop's (packbuytest sell's call). The ring is drained while the window is open (BuyTest's
    load-bearing line), then the window is closed. The line carries the purse before and after and mode=sell. */
+/* T-736 (TEST LEVER ONLY). The backpack the seller WEARS: the first item with its own inventory in its backpack_attach section (the
+   section bagtest wears a pack into). 0 = none. */
+static void* BtWornPack(::Inventory* inv)
+{
+    if (!ItObj(inv)) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        char nm[kSecCap]; nm[0] = 0;
+        if (ItStrPod(&it->first, nm, kSecCap) == 0 || std::strcmp(nm, "backpack_attach") != 0) continue;
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) return 0;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return 0;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* bi = 0;
+            if (ItBagInvPod((void*)si[k].item, &bi) != 0) return (void*)si[k].item;
+        }
+        return 0;
+    }
+    return 0;
+}
+/* T-736 (TEST LEVER ONLY). The window of the worn backpack, as the player has it in a trade. The engine opens it itself whenever it
+   makes its carrier's inventory window: 0x6E6080 (the call the trade window's opening makes for each side) calls 0x70D550, which
+   asks the carrier's window for its inventory (vtable +0x70), takes the item in the backpack slot (section type 0xC) and opens that
+   item's window beside the carrier's (0x6E6770), remembering it at the carrier's window +0x40. So the lever opens nothing: it finds
+   the window the engine made and refuses out loud when there is none. Empty *why = found. One log line names the window and the
+   pack, the window it was opened from (+0x38) and whose character the mod's own lookup says the window is. */
+static void BtSellPackWindow(::Character* seller, unsigned int sellerUid, void* sellerGui, ::Inventory** invOut, void** guiOut,
+                             std::string* why, std::string* words)
+{
+    *invOut = 0; *guiOut = 0; why->clear(); words->clear();
+    void* pack = BtWornPack(ItInventoryOf(seller));
+    void* bagInv = 0;
+    if (pack == 0 || ItBagInvPod(pack, &bagInv) == 0)
+    {
+        *why = "the seller wears no backpack (no item with its own inventory in backpack_attach) - there is no backpack window to sell from";
+        DebugLog("[STORE] buytest pack step=window window=backpack item=(none) - " + *why);
+        return;
+    }
+    char psid[kSidCap];
+    std::memset(psid, 0, sizeof(psid));
+    ItBaseSidPod(pack, psid, kSidCap);
+    void* g = 0;
+    ItInventoryGuiPod(bagInv, &g);
+    if (g != 0 && ItSameWindow(g, bagInv) == 0) g = 0;
+    void* parent = 0;
+    if (g != 0 && ItPtrPod(g, kGuiParentWin, &parent) == 0) parent = 0;
+    unsigned int mineUid = 0;
+    void* mineCh = (g != 0) ? ItChargeMineOfGui(g, &mineUid) : 0;
+    *words = "pack=" + std::string(psid) + " packWindow=" + std::string(g != 0 ? "open" : "none")
+           + " openedFromSellerWindow=" + N((long long)((g != 0 && parent != 0 && parent == sellerGui) ? 1 : 0))
+           + " windowIsSellers=" + N((long long)((mineCh != 0 && mineCh == (void*)seller && mineUid == sellerUid) ? 1 : 0))
+           + " windowOwnerUid=" + N((long long)mineUid);
+    if (g == 0)
+        *why = "the worn backpack's window is not open - the engine opens it with its carrier's window (0x6E6080 -> 0x70D550) and did not here";
+    DebugLog("[STORE] buytest pack step=window window=backpack item=" + std::string(psid) + " " + *words
+             + (why->empty() ? std::string(" - found") : " - " + *why));
+    if (g == 0) return;
+    *invOut = (::Inventory*)bagInv; *guiOut = g;
+}
 static bool BtSellAfterOpen(const std::string& needle, const std::string& sidWanted, ::Character* buyer,
                             unsigned int buyerUid, ::Inventory* counterInv, int* townSaved, int haveTown,
                             const std::string& fields, const std::string& who)
@@ -15357,11 +16965,22 @@ static bool BtSellAfterOpen(const std::string& needle, const std::string& sidWan
     if (sellerInv != 0) ItInventoryGuiPod(sellerInv, &g2);
     if (g1 != 0 && ItSameWindow(g1, shopInv) == 0) g1 = 0;
     if (g2 != 0 && ItSameWindow(g2, sellerInv) == 0) g2 = 0;
+    /* T-736 (TEST LEVER ONLY): `sell pack` - the sale leaves from the worn backpack's window instead of the seller's own: the
+       same right-click call below, with that window as the window the item leaves. */
+    const int fromPack = (g_btKeeper.active != 0 && g_btKeeper.fromPack != 0) ? 1 : 0;
+    std::string packWhy, packWords;
+    if (fromPack != 0 && g2 != 0)
+    {
+        ::Inventory* packInv = 0; void* gPack = 0;
+        BtSellPackWindow(buyer, buyerUid, g2, &packInv, &gPack, &packWhy, &packWords);
+        if (packWhy.empty()) { sellerInv = packInv; g2 = gPack; }
+    }
     /* asked in the order the trade call passes it: the SELLER's window as `this`, the shop's as `sendingTo`; the
        other order is printed beside it (0x70F340 is asymmetric - read, not observed) */
     int forMoney = -1, forMoneyShopFirst = -1;
     std::string why;
-    if (g1 == 0) why = "no open inventory window shows the shop side (facade or counter)";
+    if (!packWhy.empty()) why = packWhy;
+    else if (g1 == 0) why = "no open inventory window shows the shop side (facade or counter)";
     else if (g2 == 0) why = "no open inventory window shows the seller's own inventory";
     else if (g1 == g2) why = "both sides resolve to the SAME window, and RClickAutoTrade moves BETWEEN two";
     else
@@ -15380,8 +16999,14 @@ static bool BtSellAfterOpen(const std::string& needle, const std::string& sidWan
     std::memset(sid, 0, sizeof(sid));
     if (why.empty())
     {
-        bSec = ItGeneralSection(sellerInv, &bSecName, &bLim);
-        if (bSec == 0) why = "the seller's inventory has no general grid";
+        if (fromPack != 0)   /* T-736: the pack's own grid is named backpack_content; the general-grid rule only if it is not there */
+        {
+            bSecName = "backpack_content";
+            bSec = sellerInv->getSection(bSecName);
+            if (!ItObj(bSec)) { bSec = 0; bSecName.clear(); }
+        }
+        if (bSec == 0) bSec = ItGeneralSection(sellerInv, &bSecName, &bLim);
+        if (bSec == 0) why = (fromPack != 0) ? "the worn backpack's inventory has no grid" : "the seller's inventory has no general grid";
     }
     if (why.empty())
     {
@@ -15402,9 +17027,12 @@ static bool BtSellAfterOpen(const std::string& needle, const std::string& sidWan
             std::memcpy(sid, cs, kSidCap);
         }
         if (sold == 0)
-            why = "the seller's general grid holds no single non-money item" + std::string(sidWanted.empty() ? "" : " with that base record id")
+            why = std::string(fromPack != 0 ? "the worn backpack's grid" : "the seller's general grid") + " holds no single non-money item" + std::string(sidWanted.empty() ? "" : " with that base record id")
                 + " (items=" + N(seen) + " money=" + N(money) + " stackedOrUnread=" + N(stacked) + ")";
     }
+    if (fromPack != 0 && why.empty())
+        DebugLog("[STORE] buytest pack step=pick window=backpack item=" + std::string(sid) + " at " + bSecName + " " + N((long long)bx) + ","
+                 + N((long long)by) + " " + packWords);
     if (!why.empty())
     {
         ItCloseTradeWindow(townSaved, haveTown);
@@ -15437,7 +17065,8 @@ static bool BtSellAfterOpen(const std::string& needle, const std::string& sidWan
              + " forMoney=" + N((long long)forMoney) + " forMoneyShopFirst=" + N((long long)forMoneyShopFirst)
              + " delta[shopSells,reqSent,tradeAddUnpaired]=" + N(g_shopSells - b_sells) + "," + N(g_reqSent - b_reqSent) + ","
              + N(g_shopTradeAddUnpaired - b_addUnpaired)
-             + " windowClosed=" + N((long long)closed) + fields + who);
+             + " windowClosed=" + N((long long)closed)
+             + (fromPack != 0 ? " window=backpack " + packWords : std::string(" window=own")) + fields + who);
     return called != 0 && tradeResult == 0;
 }
 
@@ -15485,6 +17114,7 @@ struct PbProbe
     ::Item* pItem; int pX, pY, forMoney; char sid[kSidCap];
     int stackQ; ::InventorySection* bSec; std::string bSecName;   /* T-1 B0: the item's units; the buyer's grid (sell) */
     std::string bWhere;   /* T-1 B5 fold 2 (sell): general:<sec> | pack:<wearSec:x,y>/<sec> (g2 is then that pack's window) | section:<sec> */
+    std::string sideKind;   /* buytest char (PbProbeTrader anySide): facade+packs | facade | character | inventory | other - the trader side the window showed */
 };
 /* T-1 B5 (TEST ONLY): the clicked variant's full description equal - coopshop::SameDesc's fields, read from two ItEntry */
 static int PbSameDesc(const ItEntry& a, const ItEntry& b)
@@ -15555,7 +17185,7 @@ static int PbSellPick(::InventorySection* sec, ::InventorySection* tSec, int mat
    buyer's item must / must not match a stack in the trader's grid exactly (PbSameDesc); anyQty (`all`, sell) = a sold item of any
    quantity; sidWant = only items of that base record. */
 static int PbProbeTrader(::Character* buyer, ::Character* keeper, PbProbe* p, std::string* why, int want, int match = 0, int anyQty = 0,
-                         const std::string& sidWant = std::string(), int fit = 0)
+                         const std::string& sidWant = std::string(), int fit = 0, int anySide = 0)
 {
     for (int ts = 0; ts < kTownHandDwords; ++ts) p->townSaved[ts] = 0;
     p->haveTown = ItSaveTownHand(p->townSaved);
@@ -15565,11 +17195,25 @@ static int PbProbeTrader(::Character* buyer, ::Character* keeper, PbProbe* p, st
     const int opened = ItOpenTradeWindow(buyer, keeper);
     void* side = 0; void* fv = 0;
     const int open = ItTradeWindowSide(&side);
-    if (opened == 0 || open != 1 || ItIsShopFacadeObj(side) != 1
-        || ItPtrPod(side, kShopTraderInv, &fv) == 0 || !ItObj((::Inventory*)fv) || ItFacadePackBehind(fv) == 0)
+    /* buytest char (anySide 1): no home and no pack test - the trader side is the window's own facade (packs behind it or not), or
+       the character itself / its own inventory when the window answers with either; sideKind says which */
+    p->sideKind.clear();
+    if (anySide != 0 && opened != 0 && open == 1)
+    {
+        if (ItIsShopFacadeObj(side) == 1 && ItPtrPod(side, kShopTraderInv, &fv) != 0 && ItObj((::Inventory*)fv))
+            p->sideKind = (ItFacadePackBehind(fv) != 0) ? "facade+packs" : "facade";
+        else if (side == (void*)keeper) { fv = (void*)ItInventoryOf(keeper); p->sideKind = "character"; }
+        else if (side == (void*)ItInventoryOf(keeper)) { fv = side; p->sideKind = "inventory"; }
+        else { fv = 0; p->sideKind = "other"; }
+    }
+    if (anySide != 0 ? (fv == 0 || !ItObj((::Inventory*)fv))
+                     : (opened == 0 || open != 1 || ItIsShopFacadeObj(side) != 1
+                        || ItPtrPod(side, kShopTraderInv, &fv) == 0 || !ItObj((::Inventory*)fv) || ItFacadePackBehind(fv) == 0))
     {
         ItCloseTradeWindow(p->townSaved, p->haveTown);
-        *why = "no pack-backed trade window opened (opened=" + N((long long)opened) + " open=" + N((long long)open) + ")";
+        *why = std::string(anySide != 0 ? "no trade window with a readable trader side opened" : "no pack-backed trade window opened")
+             + " (opened=" + N((long long)opened) + " open=" + N((long long)open)
+             + (anySide != 0 ? " side=" + (p->sideKind.empty() ? std::string("none") : p->sideKind) : std::string()) + ")";
         return 0;
     }
     ::Inventory* facade = (::Inventory*)fv;
@@ -16141,6 +17785,129 @@ bool PackBuyTest(const std::string& mode)
     return ret != 0;
 }
 
+/* buytest char <uid|name=<text>> sell [cats=<n>] (TEST-ONLY LEVER). The buyer - this game's own player character with the lowest uid,
+   as packbuytest picks it - is put beside the target with the engine's teleport (TeleportCharacter, as buytest keeper and packbuytest
+   goto do), the engine's trade window is opened on the target and ONE single non-money item of the buyer's is sold to it through the
+   player's right-click (ItRClickAutoTradePod) - with NO home and NO pack test (PbProbeTrader anySide), so a keeper character with no
+   home building, or another game's copy of one, can be sold to. The buyer is put back where it stood. The target: the loaded
+   character with that uid, or (name=) the nearest loaded character outside the player's faction whose name contains the text - a
+   keeper's uid is not known before a run. One `[STORE] buytest char` line: the target, own (this game writes it) or copy, its home
+   building yes/no, which trader side the window showed, and both purses before -> after. MAIN THREAD */
+bool BuyTestChar(unsigned int uid, const std::string& nameText, int sell, int cats)
+{
+    if (StoreTearingDown() != 0) { DebugLog("[STORE] buytest char: the engine is tearing the world down - try again"); return false; }
+    const std::string ask = (uid != 0) ? ("uid=" + N((long long)uid)) : ("name='" + nameText + "'");
+    if (sell == 0 || (uid == 0 && nameText.empty())) { DebugLog("[STORE] buytest char usage: buytest char <uid|name=<text>> sell [cats=<n>]"); return false; }
+    if (ItHeldLive() != 0)
+    {
+        DebugLog("[STORE] buytest char REFUSED " + ask + " reason=something is on the cursor; opening a trade window can destroy it. Nothing was opened");
+        return false;
+    }
+    ::Faction* mineF = LocalPlayerFaction();
+    if (!ItPlaus(coop::GameWorldPtr()) || mineF == 0) { DebugLog("[STORE] buytest char MISSED " + ask + " reason=no world or no player faction"); return false; }
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) { DebugLog("[STORE] buytest char MISSED " + ask + " reason=implausible character count"); return false; }
+    ::Character* buyer = 0; unsigned int buyerUid = 0;
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+    {
+        ::Character* c = *it;
+        if (!ItObj(c)) continue;
+        void* f = 0;
+        if (ItFactionPod(c, &f) == 0 || f != (void*)mineF) continue;
+        const unsigned int u = FindSpawnedUid(c);
+        if (u != 0 && net::IsUidMine(u) && (buyerUid == 0 || u < buyerUid)) { buyer = c; buyerUid = u; }
+    }
+    if (buyer == 0) { DebugLog("[STORE] buytest char MISSED " + ask + " reason=no player-faction character carries a uid this game owns"); return false; }
+    Ogre::Vector3 bp, kp;
+    if (!SafeReadPosition(buyer, &bp)) { DebugLog("[STORE] buytest char MISSED " + ask + " reason=the buyer's position did not read"); return false; }
+    ::Character* target = 0; unsigned int targetUid = 0; long long nameHits = 0; float best = -1.0f;
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+    {
+        ::Character* c = *it;
+        if (!ItObj(c) || c == buyer) continue;
+        if (uid != 0) { if (FindSpawnedUid(c) == uid) { target = c; targetUid = uid; break; } continue; }
+        void* f = 0;
+        if (ItFactionPod(c, &f) == 0 || f == (void*)mineF) continue;
+        char nm[96]; nm[0] = 0;
+        if (ItNamePod(c, nm, (int)sizeof(nm)) != 1 || std::strstr(nm, nameText.c_str()) == 0) continue;
+        ++nameHits;
+        const float d = PbDistXZ(buyer, c);
+        if (d < 0.0f) continue;
+        if (best < 0.0f || d < best) { best = d; target = c; }
+    }
+    if (target == 0)
+    {
+        DebugLog("[STORE] buytest char MISSED " + ask + " reason="
+                 + (uid != 0 ? std::string("no loaded character carries that uid on this game")
+                             : "no loaded character outside the player's faction with that text in its name has a readable position (matches=" + N(nameHits) + ")"));
+        return false;
+    }
+    if (uid == 0) targetUid = FindSpawnedUid(target);
+    const std::string whose = (targetUid == 0) ? std::string("none(no uid here)") : (net::IsUidMine(targetUid) ? std::string("own") : std::string("copy"));
+    char tName[96]; tName[0] = 0;
+    const int haveTName = ItNamePod(target, tName, (int)sizeof(tName));
+    const int hasHome = (ItHomeBuildingPod(target) != 0) ? 1 : 0;
+    int catsFrom = 0, catsSet = -9;   /* cats=<n>: the buyer's purse set first, as buytest keeper does (ItPursePay + tradecharge::PayToSet) */
+    if (cats >= 0)
+    {
+        int cur = 0;
+        if (ItPurseRead(buyer, &cur) != 0) { catsFrom = cur; catsSet = ItPursePay(buyer, tradecharge::PayToSet(cur, cats)); }
+        else catsSet = -2;
+    }
+    int bpBefore = 0, bpAfter = 0, tpBefore = 0, tpAfter = 0;
+    const int haveBpb = ItPurseRead(buyer, &bpBefore);
+    const int haveTpb = ItPurseRead(target, &tpBefore);
+    const std::string head = "[STORE] buytest char target=" + N((long long)targetUid) + " name='" + (haveTName == 1 ? std::string(tName) : std::string("?"))
+                           + "' whose=" + whose + " home=" + (hasHome != 0 ? "yes" : "no") + " buyer=" + N((long long)buyerUid) + " asked=" + ask
+                           + (uid == 0 ? " nameMatches=" + N(nameHits) : std::string());
+    if (!SafeReadPosition(target, &kp)) { DebugLog(head + " MISSED reason=the target's position did not read. Nothing was opened"); return false; }
+    float ux = bp.x - kp.x, uz = bp.z - kp.z;
+    const float moveBefore = std::sqrt(ux * ux + uz * uz);
+    if (moveBefore < 0.01f) { ux = 1.0f; uz = 0.0f; } else { ux /= moveBefore; uz /= moveBefore; }
+    if (!TeleportCharacter(buyer, kp.x + ux * kPbGotoOffset, kp.y, kp.z + uz * kPbGotoOffset))
+    { DebugLog(head + " MISSED reason=the engine's teleport 0x5C9BF0 faulted. Nothing was opened"); return false; }
+    PbProbe pr; std::string why;
+    const int st = PbProbeTrader(buyer, target, &pr, &why, 2, 0, 0, std::string(), 0, 1);
+    if (st != 3)
+    {
+        const int back = TeleportCharacter(buyer, bp.x, bp.y, bp.z) ? 1 : 0;
+        DebugLog(head + " MISSED reason=" + why + " side=" + (pr.sideKind.empty() ? std::string("none") : pr.sideKind)
+                 + " moved=" + PbF1(moveBefore) + " putBack=" + N((long long)back) + ". Nothing was traded");
+        return false;
+    }
+    long long sn0[16], sn1[16];
+    const int snN = ShopPbSnap(sn0, 16);
+    const long long b8 = g_shopTradeAddUnpaired;
+    const unsigned int reqBefore = g_reqNextId;
+    int tradeResult = -1;
+    const float tradeDist = PbDistXZ(buyer, target);
+    const std::string bSecName = pr.bSecName;
+    const int called = ItRClickAutoTradePod(pr.g2, (const void*)&bSecName, pr.pX, pr.pY, pr.g1, &tradeResult);
+    ItemsTick();   /* drained while the window is still open, as packbuytest does */
+    ShopPbSnap(sn1, 16);
+    int backX = -1, backY = -1;
+    ItSlotOfInSection(pr.bSec, pr.pItem, &backX, &backY);
+    const int haveBpa = ItPurseRead(buyer, &bpAfter);
+    const int haveTpa = ItPurseRead(target, &tpAfter);
+    ItCloseTradeWindow(pr.townSaved, pr.haveTown);
+    const int back = TeleportCharacter(buyer, bp.x, bp.y, bp.z) ? 1 : 0;
+    DebugLog(head + " side=" + pr.sideKind + " item=" + std::string(pr.sid) + " sellFrom=" + (pr.bWhere.empty() ? std::string("?") : pr.bWhere)
+             + " called=" + N((long long)called) + " tradeResult=" + N((long long)tradeResult) + "(" + PbResultWords(called != 0 ? tradeResult : -1) + ")"
+             + " dist=" + (tradeDist >= 0.0f ? PbF1(tradeDist) : std::string("?"))
+             + " buyerPurse=" + (haveBpb != 0 ? N((long long)bpBefore) : std::string("?")) + "->" + (haveBpa != 0 ? N((long long)bpAfter) : std::string("?"))
+             + " targetPurse=" + (haveTpb != 0 ? N((long long)tpBefore) : std::string("?")) + "->" + (haveTpa != 0 ? N((long long)tpAfter) : std::string("?"))
+             + " itemBackInWindow=" + N((long long)(backX >= 0 ? 1 : 0))
+             + " shopXDelta[buy,sell,heldHere,refusedGate,pre,short,unreadable]=" + PbDeltas(sn0, sn1, 0, 7, snN)
+             + " shopCfDelta[ok,refused,lapsed]=" + PbDeltas(sn0, sn1, 7, 3, snN)
+             + " shopHoldDelta[buyOk,sellOk,refused]=" + PbDeltas(sn0, sn1, 10, 3, snN)
+             + " shopCarDelta[sent,heldHere,refusedGate]=" + PbDeltas(sn0, sn1, 13, 3, snN)
+             + " tradeAddUnpaired=" + N(g_shopTradeAddUnpaired - b8)
+             + " reqId=" + ((sn1[0] + sn1[1] > sn0[0] + sn0[1]) ? N((long long)reqBefore) : std::string("none"))
+             + " moved=" + PbF1(moveBefore) + " putBack=" + N((long long)back)
+             + (cats >= 0 ? " cats=" + N((long long)cats) + "(from=" + N((long long)catsFrom) + " set=" + N((long long)catsSet) + ")" : std::string()));
+    return called != 0 && tradeResult == 0;
+}
+
 // T-1 B0 (TEST, READ-ONLY). `traderlist`: every loaded trader squad (TlSquads), one [TRADER] squad line and one line per member.
 // T-1 B1: the squad line adds worldId='<id>' (what platoonnudge takes) and squadSector=<x,y> (the squad position the engine and
 // now the mod decide by); each member line adds sector=<x,y>; split=1 when the members fall in two or more of me / peer / none.
@@ -16599,7 +18366,7 @@ static std::string KlF1(float v) { char b[48]; _snprintf(b, 47, "%.1f", v); b[47
    keeper's pot and every piece's item count. `piece=` is the piece whose count MOVED (bought: fell; sold: rose). */
 bool BuyTestKeeper(const std::string& pick, int sell, int cats)
 {
-    const std::string head = "[BUYTEST] keeper pick=" + pick + " mode=" + (sell != 0 ? "sell" : "buy");
+    const std::string head = "[BUYTEST] keeper pick=" + pick + " mode=" + (sell == 2 ? "sell-pack" : sell != 0 ? "sell" : "buy");   /* sell 2 = from the worn backpack (T-736) */
     if (StoreTearingDown() != 0) { DebugLog(head + " MISSED why=tearing-down"); return false; }
     ::Faction* mineF = LocalPlayerFaction();
     if (!ItPlaus(coop::GameWorldPtr()) || mineF == 0) { DebugLog(head + " MISSED why=no-world-or-faction"); return false; }
@@ -16695,10 +18462,11 @@ bool BuyTestKeeper(const std::string& pick, int sell, int cats)
     g_btKeeper.moveState = -1; g_btKeeper.moveWhy = ""; g_btKeeper.moveBefore = -1.0f; g_btKeeper.moveAfter = -1.0f;   /* T-164 B4-0b */
     g_btKeeper.pickWhy = "(not asked)"; g_btKeeper.pickValue = -1; g_btKeeper.pickPurse = -1;   /* T-164 B4-1 */
     g_btKeeper.cats = cats; g_btKeeper.catsSet = -9; g_btKeeper.catsBefore = 0;
+    g_btKeeper.fromPack = (sell == 2) ? 1 : 0;   /* T-736 TEST-ONLY: read by BtSellAfterOpen */
     const long long chargeSeqBefore = g_chargeSeq;
     const bool ok = BuyTest(std::string(aim.key), std::string(), 0, 0, sell);
     const int chargeRecorded = (g_chargeSeq != chargeSeqBefore) ? 1 : 0;
-    g_btKeeper.active = 0;
+    g_btKeeper.active = 0; g_btKeeper.fromPack = 0;
 
     /* AFTER */
     int purseAfter = 0;
@@ -17693,6 +19461,7 @@ void HdPublish(int hi, int op, const std::string& section, int x, int y, int qty
         m.baseSid = fe.baseSid; m.companySid = fe.companySid; m.materialSid = fe.materialSid; m.colorSid = fe.colorSid;
         m.quality = fe.quality; m.charges = fe.charges; m.functionKind = fe.functionKind; m.level = fe.level; m.unique = fe.unique;
         ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &m.owner);
+        ItGearOf(fe, &m.gear);   /* the uniform and crafter with the mark */
     }
     if (op == 2) m.baseSid = fe.baseSid;
     if (tagId != 0) { m.rqtHas = 1; m.rqtId = tagId; m.rqtSlot = h.slot; }
@@ -18282,6 +20051,269 @@ std::string HoldTestCommand(const std::string& arg)
 }
 // ==== end P105 build 2 =================================================================================================================
 
+/* A removal out of a pack two or more levels down that went onto the cursor: kept until its ADD shows (then put back), or until the
+   cursor stops naming it with no ADD (lapsed - counted and logged). The engine holds one cursor item at a time. */
+struct ItBagNestPark { int used; void* item; void* pack; char section[kSecCap]; int x, y; };
+ItBagNestPark g_bagNestPark[2];
+/* MAIN THREAD. A pack's own section, the pack found again by a pointer compare before anything in it is read. */
+::InventorySection* ItBagNestPackSec(void* pack, const char* section, ::Inventory** invOut)
+{
+    *invOut = 0;
+    ItBagNestHit hit;
+    if (section == 0 || section[0] == 0 || ItBagNestFind(pack, &hit) == 0) return 0;
+    ::InventorySection* s = hit.packInv->getSection(std::string(section));
+    if (!ItObj(s)) return 0;
+    *invOut = hit.packInv;
+    return s;
+}
+/* MAIN THREAD. The section one half of a move names now: a tagged half through its own pack, any other through ItHalfResolve. */
+::InventorySection* ItBagNestHalfSec(const ItEntry& h, unsigned int uid, ::Inventory** invOut)
+{
+    *invOut = 0;
+    if (h.kind == kKindBag) return (h.bagPath.has == 2) ? ItBagNestPackSec(h.bag, h.section, invOut) : 0;
+    ::Character* c = 0;
+    return ItHalfResolve(h, uid, &c, invOut);
+}
+/* MAIN THREAD. The item where it landed (dstSec) goes back to (srcSec, sx, sy) through the item road's own undo, behind the applying
+   guard so nothing it does rings. Never relocated and never re-created: a taken square leaves the move standing. 1 = put back. */
+int ItBagNestUndo(::Inventory* dstInv, ::InventorySection* dstSec, void* item, int dx, int dy, ::InventorySection* srcSec, int sx, int sy,
+                  int* lx, int* ly)
+{
+    *lx = sx; *ly = sy;
+    if (dstInv == 0 || dstSec == 0 || srcSec == 0 || item == 0) return 0;
+    return ItRevert(dstInv, dstSec, item, dx, dy, 0, srcSec, sx, sy, 0, 0, 0, lx, ly);
+}
+/* MAIN THREAD. 1 = this game writes `box` (the same verdict a box entry gets); its key is written either way when it builds. */
+int ItBagNestBoxMine(void* box, char* keyOut)
+{
+    keyOut[0] = 0;
+    ItEntry be; ItClear(&be);
+    ItBoxKeyParts kp;
+    if (ItBoxKeyBuild(box, be.boxKey, kBoxKeyCap, &kp, 0) == 0) return 0;
+    std::memcpy(keyOut, be.boxKey, kBoxKeyCap);
+    keyOut[kBoxKeyCap - 1] = 0;
+    be.kind = kKindBox; be.box = box; be.ch = 0;
+    be.boxPos[0] = kp.px; be.boxPos[1] = kp.py; be.boxPos[2] = kp.pz;
+    be.boxId[0] = 0;
+    be.rungSectorLoaded = 1;   /* the box is live now: the walk that found it is this drain's */
+    be.boxVtRva = coop::PolicyVtableRvaPod(box);
+    return (ItBoxVerdict(be) == kBoxMine) ? 1 : 0;
+}
+std::string ItBagNestWhere(const ItEntry& e)
+{
+    return "'" + std::string(e.baseSid) + "' op " + N((long long)e.op) + " at " + std::string(e.section) + " " + N((long long)e.x) + ","
+           + N((long long)e.y);
+}
+/* MAIN THREAD: a parked removal whose item left the cursor with no landing seen - dropped, counted and logged */
+void ItBagNestParkLapsed(ItBagNestPark& pk)
+{
+    ++g_bagNestLapsed;
+    ErrorLog("[ITEMS] bag nested: an item taken out of a pack inside another pack (" + std::string(pk.section) + " "
+             + N((long long)pk.x) + "," + N((long long)pk.y) + ") left the cursor with no landing this game could see (dropped on the"
+               " ground, or destroyed) - it was not put back and the pack's writer still shows it in the pack (bagNestMove lapsed)");
+    pk.used = 0;
+}
+/* MAIN THREAD, a drain with no entries: a parked removal whose item is no longer on the cursor has no landing to wait for */
+void ItBagNestParksLapse()
+{
+    for (int p = 0; p < 2; ++p)
+        if (g_bagNestPark[p].used != 0 && ItHeldLive() != g_bagNestPark[p].item) ItBagNestParkLapsed(g_bagNestPark[p]);
+}
+/* MAIN THREAD, the drain, right after PASS 1 (which already keeps every tagged entry off the wire). A parked removal whose ADD is in
+   this drain is put back; then each move rung two or more pack levels down takes the road NestMoveRoad (bagwire.h) names. An ordinary
+   half put back with its tagged half is marked consumed, so it is never published. */
+void ItBagNestDrain(const int* idx, int n, int* consumed, const unsigned int* uids)
+{
+    static int done[kRing];
+    int any = (g_bagNestPark[0].used != 0 || g_bagNestPark[1].used != 0) ? 1 : 0;
+    for (int i = 0; i < n; ++i)
+    {
+        done[i] = 0;
+        if (g_ring[idx[i]].kind == kKindBag && g_ring[idx[i]].bagPath.has == 2) any = 1;
+    }
+    if (any == 0) return;
+    for (int p = 0; p < 2; ++p)
+    {
+        ItBagNestPark& pk = g_bagNestPark[p];
+        if (pk.used == 0) continue;
+        int at = -1;
+        for (int i = 0; i < n && at < 0; ++i)
+        {
+            const ItEntry& a = g_ring[idx[i]];
+            const int tagged = (a.kind == kKindBag && a.bagPath.has == 2) ? 1 : 0;
+            if (done[i] == 0 && a.op == 0 && a.item == pk.item && (consumed[i] == 0 || tagged != 0)) at = i;
+        }
+        if (at < 0)
+        {
+            if (ItHeldLive() == pk.item) continue;   /* still on the cursor */
+            ItBagNestParkLapsed(pk);
+            continue;
+        }
+        const ItEntry& a = g_ring[idx[at]];
+        done[at] = 1;
+        pk.used = 0;
+        if (a.kind == kKindBag && a.bag == pk.pack && std::strcmp(a.section, pk.section) == 0 && a.x == pk.x && a.y == pk.y)
+        {   /* dropped back on its own square: nothing moved */
+            ++g_bagNestUndone;
+            continue;
+        }
+        ::Inventory *si = 0, *di = 0;
+        ::InventorySection* ss = ItBagNestPackSec(pk.pack, pk.section, &si);
+        ::InventorySection* ds = ItBagNestHalfSec(a, uids[at], &di);
+        int lx = 0, ly = 0;
+        if (ItBagNestUndo(di, ds, pk.item, a.x, a.y, ss, pk.x, pk.y, &lx, &ly) != 0)
+        {
+            consumed[at] = 1;
+            ++g_bagNestUndone;
+            ErrorLog("[ITEMS] bag nested: REFUSED - " + ItBagNestWhere(a) + " is the landing of an item taken out of a pack inside another"
+                     " pack; such a move cannot be sent to the other games, so it was put back where it was taken from (bagNestMove undone)");
+        }
+        else
+        {
+            ++g_bagNestUndoFailed;
+            ErrorLog("[ITEMS] bag nested: an item taken out of a pack inside another pack and landed at " + ItBagNestWhere(a)
+                     + " could NOT be put back (its square is taken, or a side is no longer loaded) - the move stands on this game and its"
+                       " landing is handled as an ordinary move, so the item may now be on two games (bagNestMove undoFailed)");
+        }
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        const ItEntry& e = g_ring[idx[i]];
+        if (done[i] != 0 || e.kind != kKindBag || e.bagPath.has != 2) continue;
+        done[i] = 1;
+        ++g_bagNestSeen;
+        ItBagNestHit hit;
+        if (ItBagNestFind(e.bag, &hit) == 0)
+        {
+            ++g_bagNestStands;
+            ErrorLog("[ITEMS] bag nested: " + ItBagNestWhere(e) + " inside a pack inside another pack - that pack is no longer found, so"
+                     " nothing was put back and nothing was sent (bagNestMove stands)");
+            continue;
+        }
+        char key[kBoxKeyCap];
+        key[0] = 0;
+        const int writer = (hit.rootIsBox != 0) ? ItBagNestBoxMine(hit.root, key) : 0;
+        int partner = -1;
+        if (e.item != 0 && (e.op == 0 || e.op == 1))
+            for (int j = 0; j < n && partner < 0; ++j)
+            {
+                if (j == i || done[j] != 0) continue;
+                const ItEntry& p = g_ring[idx[j]];
+                const int tagged = (p.kind == kKindBag && p.bagPath.has == 2) ? 1 : 0;
+                if (p.item == e.item && p.op == 1 - e.op && (consumed[j] == 0 || tagged != 0)) partner = j;
+            }
+        const int heldSource = (e.op == 0 && e.item != 0 && g_heldPend.used != 0 && g_heldPend.re.item == e.item) ? 1 : 0;
+        const int onCursor = (e.op == 1 && e.item != 0 && ItHeldLive() == e.item) ? 1 : 0;
+        int partnerPush = 1;   /* a tagged other half is sent only by a push of the box it sits in: asked when this half would be pushed */
+        if (partner >= 0 && hit.rootIsBox != 0 && writer != 0)
+        {
+            const ItEntry& pe = g_ring[idx[partner]];
+            if (pe.kind == kKindBag && pe.bagPath.has == 2)
+            {
+                ItBagNestHit ph;
+                char pkey[kBoxKeyCap];
+                pkey[0] = 0;
+                partnerPush = (ItBagNestFind(pe.bag, &ph) != 0 && ph.rootIsBox != 0 && ItBagNestBoxMine(ph.root, pkey) != 0) ? 1 : 0;
+            }
+        }
+        const int road = coopbag::NestMoveRoad(hit.rootIsBox, writer, e.op, partner >= 0 ? 1 : 0, heldSource, onCursor, partnerPush);
+        const std::string where = ItBagNestWhere(e) + " (a pack " + N((long long)hit.depth) + " levels down in "
+            + (hit.rootIsBox != 0 ? "box '" + std::string(key) + "'" : "character uid " + N((long long)FindSpawnedUid(hit.root))) + ")";
+        if (road == coopbag::kNestRoadPush)
+        {
+            const std::string k(key);
+            int queued = 0;
+            if (k.empty()) ++g_fillKeyless;
+            else if (g_fillDirty.size() < kFillDirtyCap || g_fillDirty.count(k) != 0) { g_fillDirty.insert(std::make_pair(k, ItFillDirty())); queued = 1; }
+            else ++g_fillDirtyFull;
+            ++g_bagNestPushed;
+            if (queued != 0)
+                DebugLog("[ITEMS] bag nested: " + where + " - this game writes that box: the move stands and the whole box is pushed"
+                         " (bagNestMove pushed)");
+            else
+                ErrorLog("[ITEMS] bag nested: " + where + " - this game writes that box, but its push could NOT be queued (no key, or the"
+                         " push list is full): the other games keep the box as it was until it is next asked (bagNestMove pushed)");
+            continue;
+        }
+        if (road == coopbag::kNestRoadUndo)
+        {
+            const ItEntry& p = g_ring[idx[partner]];
+            const ItEntry& src = (e.op == 1) ? e : p;
+            const ItEntry& dst = (e.op == 1) ? p : e;
+            const unsigned int srcUid = (e.op == 1) ? uids[i] : uids[partner];
+            const unsigned int dstUid = (e.op == 1) ? uids[partner] : uids[i];
+            ::Inventory *si = 0, *di = 0;
+            ::InventorySection* ss = ItBagNestHalfSec(src, srcUid, &si);
+            ::InventorySection* ds = ItBagNestHalfSec(dst, dstUid, &di);
+            int lx = 0, ly = 0;
+            done[partner] = 1;
+            if (ItBagNestUndo(di, ds, e.item, dst.x, dst.y, ss, src.x, src.y, &lx, &ly) != 0)
+            {
+                consumed[partner] = 1;
+                ++g_bagNestUndone;
+                ErrorLog("[ITEMS] bag nested: REFUSED - " + where + ": a move inside a pack inside another pack cannot be sent to the"
+                         " other games, so it was put back where it came from (bagNestMove undone)");
+            }
+            else
+            {
+                ++g_bagNestUndoFailed;
+                ErrorLog("[ITEMS] bag nested: " + where + " could NOT be put back (the square it came from is taken, or a side is no"
+                         " longer loaded) - the move stands on this game and its other half is handled as an ordinary move, so the item"
+                         " may now be on two games or on none (bagNestMove undoFailed)");
+            }
+            continue;
+        }
+        if (road == coopbag::kNestRoadUndoHeld)
+        {
+            const ItHeldPend& hp = g_heldPend;   /* only read below; clearing g_heldPend.used leaves the fields read after it as they were */
+            ::Inventory *si = 0, *di = 0;
+            ::InventorySection* ss = ItBagNestHalfSec(hp.re, hp.uid, &si);
+            ::InventorySection* ds = ItBagNestHalfSec(e, uids[i], &di);
+            int lx = 0, ly = 0;
+            if (ItBagNestUndo(di, ds, e.item, e.x, e.y, ss, hp.re.x, hp.re.y, &lx, &ly) != 0)
+            {
+                g_heldPend.used = 0;   /* the item is back where it was lifted from: its parked removal closes with it */
+                if (hp.hdHold != 0) HdCursorEnded(hp.hdHold);   /* lifted from a container another game writes: that writer is told it went back */
+                if (hp.pubAtPick != 0)
+                {   /* its removal went out when it was lifted: the item back in our container is published back */
+                    g_ctBack.sec = ss; g_ctBack.x = lx; g_ctBack.y = ly; g_ctBack.obj = 0; g_ctBack.used = 0;
+                    if (ItGetAtPod(ss, lx, ly, &g_ctBack.obj) != 0 && g_ctBack.obj != 0) g_ctBack.used = 1;
+                    ItOwnPickBackAdd(1, hp.re, hp.uid, hp.pubAtPick);
+                }
+                ++g_bagNestUndone;
+                ErrorLog("[ITEMS] bag nested: REFUSED - " + where + ": an item dropped into a pack inside another pack cannot be sent to the"
+                         " other games, so it was put back where it was lifted from (bagNestMove undone)");
+            }
+            else
+            {
+                ++g_bagNestUndoFailed;
+                ErrorLog("[ITEMS] bag nested: " + where + " (dropped there from the cursor) could NOT be put back where it was lifted from -"
+                         " the move stands on this game only; the lift is handled as usual (bagNestMove undoFailed)");
+            }
+            continue;
+        }
+        if (road == coopbag::kNestRoadPark)
+        {
+            int slot = -1;
+            for (int p = 0; p < 2 && slot < 0; ++p) if (g_bagNestPark[p].used == 0) slot = p;
+            if (slot >= 0)
+            {
+                ItBagNestPark& pk = g_bagNestPark[slot];
+                pk.used = 1; pk.item = e.item; pk.pack = e.bag; pk.x = e.x; pk.y = e.y;
+                std::strncpy(pk.section, e.section, kSecCap - 1);
+                pk.section[kSecCap - 1] = 0;
+                ++g_bagNestParked;
+                DebugLog("[ITEMS] bag nested: " + where + " - taken onto the cursor; kept until it lands, then put back (bagNestMove parked)");
+                continue;
+            }
+        }
+        ++g_bagNestStands;
+        ErrorLog("[ITEMS] bag nested: " + where + " - a move inside a pack inside another pack with nothing here to put it back against ("
+                 + std::string(e.op == 2 ? "a count change" : e.op == 3 ? "a split" : road == coopbag::kNestRoadPark ? "no room to keep it"
+                               : "its other half is not on this game") + ") - it stands on this game only and is not sent (bagNestMove stands)");
+    }
+}
+
 void ItemsTickDrain()
 {
     if (g_base == 0) return;
@@ -18317,7 +20349,7 @@ void ItemsTickDrain()
     HdTick(); HdSplitPickup();   /* P105 build 2: answers' re-asks, the writer's kept requests / hold edges, then a HOLD for units just lifted */
     int idx[kRing]; int n = 0;
     for (int i = 0; i < kRing; ++i) if (g_ring[i].ready != 0) idx[n++] = i;
-    if (n == 0) { ItHeldRelease(); ItSplitRelease(); ItOwnSplitRelease(); ItOwnSplitFlush(); ItChargeRelease(); return; }
+    if (n == 0) { ItBagNestParksLapse(); ItHeldRelease(); ItSplitRelease(); ItOwnSplitRelease(); ItOwnSplitFlush(); ItChargeRelease(); return; }
     for (int a = 1; a < n; ++a)
     {
         const int v = idx[a]; int b = a - 1;
@@ -18326,7 +20358,7 @@ void ItemsTickDrain()
     }
     /* par2: a fill's box moves are folded into dirty boxes before any pairing sees them */
     n = ItFillFold(idx, n);
-    if (n == 0) { ItHeldRelease(); ItSplitRelease(); ItOwnSplitRelease(); ItOwnSplitFlush(); ItChargeRelease(); return; }
+    if (n == 0) { ItBagNestParksLapse(); ItHeldRelease(); ItSplitRelease(); ItOwnSplitRelease(); ItOwnSplitFlush(); ItChargeRelease(); return; }
     // E22b PASS 1 - WHOSE character is each rung move on. Asked once per entry and remembered, because the
     // pairing below has to ask it about entries other than the one it is standing on. `static` rather than
     // stack arrays: ItemsTick is main-thread-only and four 512-entry arrays do not belong on the frame.
@@ -18358,6 +20390,7 @@ void ItemsTickDrain()
         if (ce.kind == kKindBag) { s_consumed[c0] = 1; s_addr[c0] = 0; continue; }   /* bag23 part 2: no parent (bag noParent, logged) - dropped */
         InvNetNoteHook((ce.kind == kKindBox) ? 0u : s_uid[c0], (ce.kind == kKindBox) ? ce.boxKey : "", ce.op);   /* inv2a: the lastHook of a later catch */
     }
+    ItBagNestDrain(idx, n, s_consumed, s_uid);   /* a move two or more pack levels down: refused and put back, or its box pushed whole */
     /* loot2c (docs/design-loot2.md section 2 step 5): THE REGISTRY BYPASS, BEFORE ANY PAIRING. A move of one of this game's
        registered research copies (local-only, never in the world's box) is never a cross-transfer and never published.
        PART A (user decision 2026-09-26, YOURS ON FIRST TOUCH): the detour that saw the engine call has already marked the copy
@@ -18714,6 +20747,7 @@ void ItemsTickDrain()
             m.functionKind = e.functionKind; m.level = e.level; m.unique = e.unique;
             /* review-inv6p2 LOW: the ADD half of a pair (consumed) is translated - and counted - once, by ItCrossTransfer at its REMOVE */
             if (e.op == 0 && s_consumed[k] == 0) ItOwnerTranslate(e.ownerRaw, e.ownerHave, &m.owner);   /* inv6 (R1): the ADD carries the mark */
+            if (e.op == 0 && s_consumed[k] == 0) ItGearOf(e, &m.gear);   /* the ADD carries the uniform and crafter */
         }
         // E22b - both halves of a pair must be read while they are still IN the ring, so the partner is copied
         // out here, before any slot is freed. The copies are plain bytes; nothing in them is dereferenced.
@@ -18993,7 +21027,15 @@ void ItemsTickDrain()
             else if (v == kBoxNoAnswer)
             {
                 ++g_boxRefusedNoAnswer;
-                if (ItBoxSayForKey(cur.boxKey) != 0)
+                if (ItHandbackWaiting(std::string(cur.boxKey)) != 0)
+                {   /* the move stands in the box; InvNetHoldMove squares it with the baseline saved for the wait */
+                    const int hm = InvNetHoldMove(std::string(cur.boxKey), (long)cur.seq, m, cur.qtyBefore);
+                    if (ItBoxSayForKey(cur.boxKey) != 0)
+                        DebugLog("[ITEMS] box move held '" + std::string(cur.boxKey) + "' op=" + N((long long)m.op) + ": this game's"
+                                 " hand-back of the box waits for the previous writer's answer; the move stays in the box - "
+                                 + InvNetHoldSay(hm));
+                }
+                else if (ItBoxSayForKey(cur.boxKey) != 0)
                     DebugLog("[ITEMS] box refused '" + std::string(cur.boxKey) + "': no area map has landed for"
                              " its sector within the relay's window, so no game can be said to hold it");
             }
@@ -19052,6 +21094,7 @@ void ItemsWorldTeardown()
     HdTeardown();   /* P105 build 2: the hold rows name the world that is going */
     GroundWorldTeardown();   /* inv5p1 fold (review-inv5p1 1): the ground's request rows, unconfirmed drops and queue name the world that is going */
     InvNetClearAll();   /* inv2a: the net's lists hold raw pointers into the world that is going */
+    ItOwnParkClearAll();   /* the parked stolen marks name items of the world that is going */
     ItLootWorldTeardown();   /* loot2c fold (4b): the unconfirmed takes, the watch list and the request ring name the world that is going (the journal file stays in its world folder) */
     for (int i = 0; i < kRing; ++i)
     {
@@ -19354,7 +21397,10 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     if (m.uid == 0 && GrIsGroundKey(m.boxKey.c_str()) != 0) { GroundApplyMove(m); return; }   /* inv5 phase 1: a GROUND ADD / GONE from the holder */
     if (m.uid == 0 && !m.boxKey.empty()) ItParityNoteBoxMove(m.boxKey);   /* review-par1 6b: a queued parity answer for this box is now older than this move */
     if (HdAbsorb(m) != 0) return;   /* P105 build 2 (design 3.4): the writer's effect of OUR HOLD / LAND - already shown here, never applied */
-    InvNetForget(m.uid, m.boxKey);   /* inv2a: the other game moved it, so it is that game's to write - the net stops speaking for it */
+    /* inv2a: the other game moved it, so it is that game's to write - the net stops speaking for it. While this game's hand-back of
+       the box waits, the move is laid on the baseline saved for the wait instead, once it is applied here (InvNetHoldFollow). */
+    const int hbWait = (m.uid == 0 && !m.boxKey.empty() && ItHandbackWaiting(m.boxKey) != 0) ? 1 : 0;
+    if (hbWait == 0) InvNetForget(m.uid, m.boxKey);
     ++g_recv;
     if (g_base == 0) { ++g_refused; return; }
     if (m.op < 0 || m.op > 4) { ++g_applyBadOp; ++g_refused; return; }   /* items9: op 4 CHARGES */
@@ -19459,6 +21505,7 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     if (ItShowAbsorbSplit(m, sec) != 0) return;   /* t338-f2-apply: the holder's own split of units we hold - shown already, not applied twice */
     ItShowNoteHolderMove(m, sec);   /* T-164 fold (H2): a take held off this cell - the holder's own move is marked before it lands */
     const int ok = ItApplyMoveTo(inv, sec, c, m, desc);
+    if (hbWait != 0) InvNetHoldFollow(m, ok);
     if (m.bagPath.has != 0 && ok != 0) { ++g_bagApplied; ShopCaravanMoveApplied((void*)inv); }   /* bag23 part 2; T-1 B5: the caravan window behind this pack follows */
     /* deadlook1 fold 3: an APPLIED owner move on a copy - in a worn section of a dead copy it marks the copy looted. bag23 part 2: a
        move inside a pack is not a worn section. */
@@ -19797,6 +21844,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                 cf.materialSid = fe.materialSid; cf.colorSid = fe.colorSid;
                 cf.quality = fe.quality; cf.charges = fe.charges;
                 cf.functionKind = fe.functionKind; cf.level = fe.level; cf.unique = fe.unique; ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &cf.owner);   /* inv6 (R3) */
+                ItGearOf(fe, &cf.gear);   /* the uniform and crafter ride the answer (GEM1) */
             }
         }
         else
@@ -19806,6 +21854,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
             mm.quality = r.quality; mm.charges = r.charges;
             mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = r.unique;
             mm.quantity = r.quantity > 0 ? r.quantity : 1; mm.owner = r.owner;   /* inv6 (R2): the giver's mark, resolved by ItCreateItem */
+            mm.gear = r.gear;   /* the giver's uniform and crafter, written by ItCreateItem */
             // `c` is 0 - a box has no platoon - and ItOwnerGive passes it straight to ItCreateItem, which
             // finds a scratch container elsewhere for exactly this case.
             ok = ItOwnerGive(0, sec, &mm, r.ownerX, r.ownerY, &landedX, &landedY, &reason, &r.bag);
@@ -19832,6 +21881,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
             cf.materialSid = fe.materialSid; cf.colorSid = fe.colorSid;
             cf.quality = fe.quality; cf.charges = fe.charges;
             cf.functionKind = fe.functionKind; cf.level = fe.level; cf.unique = fe.unique; ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &cf.owner);   /* inv6 (R3) */
+            ItGearOf(fe, &cf.gear);   /* the uniform and crafter ride the take answer (GEM1) */
         }
     }
     else
@@ -19841,6 +21891,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         mm.quality = r.quality; mm.charges = r.charges;
         mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = r.unique;
         mm.quantity = r.quantity > 0 ? r.quantity : 1; mm.owner = r.owner;   /* inv6 (R2): the giver's mark, resolved by ItCreateItem */
+        mm.gear = r.gear;   /* the given item's uniform and crafter, written by ItCreateItem */
         ok = ItOwnerGive(c, sec, &mm, r.ownerX, r.ownerY, &landedX, &landedY, &reason, &r.bag);
         if (ok != 0)
         {
@@ -20223,6 +22274,7 @@ static void ItLateTakePlace(const ItLapsed* lpIn, const ItemConfirmMsg& cf)
     const int ownChoice = coopmark::OwnerTakerChoice(cf.owner, wireRes, lp.ownerLocal != 0);   /* inv7c fold: as the live path */
     if (ownChoice == coopmark::kTakerOwnWire) mm.owner = cf.owner;
     else if (ownChoice == coopmark::kTakerOwnLocal) { mm.ownerLocal = 1; std::memcpy(mm.ownerLocalRaw, lp.ownerLocalRaw, sizeof(mm.ownerLocalRaw)); }
+    mm.gear = cf.gear;   /* the holder's uniform and crafter of the taken item */
     const int ok = (sec != 0) ? ItTakerAdd(c, sec, &mm, lp.localX, lp.localY, &cf.bag, lp.showMerge) : 0;   /* T-164 fold (LOW-a): owner 212 */
     if (ok != 0) ++g_escLateTakePlaced; else ++g_escLateTakePlaceFailed;
     ItOwnHandOver(lp.mineUid, cf.baseSid.c_str(), mm.quantity, coop::kHandIn, cf.id, ok != 0 ? 1 : 0, coop::kHandRequester);
@@ -21658,6 +23710,7 @@ int ShopSettle(ShopPend* p, int ok, const ItemConfirmMsg* cf, const char* why, i
         mm.baseSid = cf->baseSid; mm.companySid = cf->companySid; mm.materialSid = cf->materialSid; mm.colorSid = cf->colorSid;
         mm.quality = cf->quality; mm.charges = cf->charges; mm.functionKind = cf->functionKind; mm.level = cf->level; mm.unique = cf->unique;
         mm.quantity = (cf->shop.n > 0) ? cf->shop.n : p->n; mm.owner = cf->owner;
+        mm.gear = cf->gear;   /* the bought item's uniform and crafter */
         g_shopLastBuySid = mm.baseSid;   /* T-1 B5 fold 1 TEST-ONLY (packbuytest sid=lastbuy): the asker settled this buy */
         g_shopLastBuyDesc = mm; g_shopLastBuyHaveDesc = 1;   /* T-1 B5 fold 2 TEST-ONLY: its full description (packfill template=created) */
         ::Item* it = ItCreateItem(mine, mm, 1);   /* fold: created even with the character away - it is kept for the pack below */
@@ -22102,6 +24155,7 @@ int ShopSendTrade(const ShopSendArgs& a, int* mark)
         rq.baseSid = fe.baseSid; rq.companySid = fe.companySid; rq.materialSid = fe.materialSid; rq.colorSid = fe.colorSid;
         rq.quality = fe.quality; rq.charges = fe.charges; rq.functionKind = fe.functionKind; rq.level = fe.level; rq.unique = fe.unique;
         ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &rq.owner);   /* the stolen mark travels with it (inv6) */
+        ItGearOf(fe, &rq.gear);   /* the uniform and crafter travel with it too */
         if (a.sound != 0) ShopSoundPod(a.soundGui, "Sell_Item", a.item);
         void* esc = ShopRemovePod(a.srcInv, a.item, (a.n >= a.q) ? -1 : a.n);   /* NOT behind the guard: the pack's removal is published */
         if (esc == 0) { ++g_shopIcUnreadable; return coopshop::kTrQuiet; }
@@ -22165,6 +24219,9 @@ int ShopInterceptRClick(void* gui, int* ret, const void* sectionStr, int x, int 
     const char* const hk = sg.hk;
     const int holder = sg.holder;
     int gate = sg.gate;
+    // PROBE-START: P133 - the gate this click was answered by
+    g_p133IcGate = gate;
+    // PROBE-END: P133
     if (gate == coopshop::kGateOriginal) return 0;   /* no stock behind the window (no home, no packs): the engine's own road */
     void* item = 0;
     char secName[kSecCap];
@@ -22812,6 +24869,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                         cf.baseSid = fe.baseSid; cf.companySid = fe.companySid; cf.materialSid = fe.materialSid; cf.colorSid = fe.colorSid;
                         cf.quality = fe.quality; cf.charges = fe.charges; cf.functionKind = fe.functionKind; cf.level = fe.level; cf.unique = fe.unique;
                         ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &cf.owner);
+                        ItGearOf(fe, &cf.gear);   /* the sold item's uniform and crafter */
                     }
                 }
                 ItDestroyPod(gone, "coop T-164 B4-4 holder: units bought by the other game's player out of this shop");
@@ -22845,6 +24903,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
             mm.baseSid = r.baseSid; mm.companySid = r.companySid; mm.materialSid = r.materialSid; mm.colorSid = r.colorSid;
             mm.quality = r.quality; mm.charges = r.charges; mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = r.unique;
             mm.quantity = n; mm.owner = r.owner;
+            mm.gear = r.gear;   /* the sold item's uniform and crafter on this game's copy */
             ::Item* it = ItCreateItem(0, mm, 1);
             /* T-447 leftover 1: a piece may absorb part of the stack into its own stacks and refuse the rest; the next piece is then
                offered only the rest. `got` = the units the shop's pieces took; every piece that took units is named (asked again).
@@ -22928,6 +24987,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         a.mm.baseSid = cf.baseSid; a.mm.companySid = cf.companySid; a.mm.materialSid = cf.materialSid; a.mm.colorSid = cf.colorSid;
         a.mm.quality = cf.quality; a.mm.charges = cf.charges; a.mm.functionKind = cf.functionKind; a.mm.level = cf.level; a.mm.unique = cf.unique;
         a.mm.quantity = soldN; a.mm.owner = (r.dir == 0) ? cf.owner : r.owner;
+        a.mm.gear = (r.dir == 0) ? cf.gear : r.gear;   /* the traded item's uniform and crafter, kept for an undo */
         g_shopApplied.push_back(a);   /* fold 2 (MED 2): never evicted - admitted above only while the table had room; the ack drops it */
         if (r.dir == 0) { g_shopLastBuyDesc = a.mm; g_shopLastBuyHaveDesc = 1; }   /* T-1 B5 fold 2 TEST-ONLY: packfill template=created */
     }
@@ -23599,6 +25659,7 @@ void ApplyItemConfirm(const ItemConfirmMsg& cf, unsigned int fromPeer)
         const int ownChoice = coopmark::OwnerTakerChoice(cf.owner, wireResolves, p.ownerLocal != 0);
         if (ownChoice == coopmark::kTakerOwnWire) mm.owner = cf.owner;
         else if (ownChoice == coopmark::kTakerOwnLocal) { mm.ownerLocal = 1; std::memcpy(mm.ownerLocalRaw, p.ownerLocalRaw, sizeof(mm.ownerLocalRaw)); }
+        mm.gear = cf.gear;   /* the holder's uniform and crafter of the take's rebuilt item */
         if (ownChoice == coopmark::kTakerOwnLocal && cf.owner.kind != coopmark::kOwnNone)
         {   /* review-inv6p2 LOW: the wire mark that yielded to the local one still ARRIVED, and did not resolve here */
             ++g_markReceived; ++g_markUnresolved;
@@ -23674,6 +25735,27 @@ void ItemOwnerNoteCarried(const char* msg, const coopmark::OwnerId& o)
 }
 void ItemOwnerNoteBadBlock() { ++g_markBadBlock; }
 void ItemOwnerNoteBadRecv() { ++g_markBadRecv; }
+void ItemBagNestNoteBadRecv() { ++g_bagNestBadRecv; }
+/* ANY THREAD (spawn.cpp, a uid registered here): parked marks naming it are tried at the next ItemsTick. */
+void ItemOwnParkNoteUid(unsigned int uid)
+{
+    if (uid == 0) return;
+    const LONG at = ::InterlockedIncrement(&g_ownParkNotedAt);
+    ::InterlockedExchange(&g_ownParkNoted[(unsigned int)at % (unsigned int)ownpark::kNotedCap], (LONG)uid);
+}
+/* MAIN THREAD, first in the frame: a fresh entry still here was made after the last frame's ItemsTick - dropped unread, counted. */
+void ItemOwnParkFrameStart()
+{
+    if (::InterlockedCompareExchange(&g_ownParkFreshN, 0, 0) == 0) return;
+    for (int i = 0; i < ownpark::kParkCap; ++i)
+    {
+        if (::InterlockedExchangePointer(&g_ownParkFresh[i].item, 0) == 0) continue;
+        ++g_ownParkOutside;
+        ItOwnSay("[OWN] park sid=" + g_ownParkFresh[i].sid + " owner=" + ItOwnerText(g_ownParkFresh[i].owner)
+                 + " - made after this frame's item tick, so not parked; it stays clean (outside=" + N(g_ownParkOutside) + ")");
+    }
+    ::InterlockedExchange(&g_ownParkFreshN, 0);
+}
 void ItemOwnerNoteRowsCarried(unsigned int n, unsigned int unknown) { g_markRowCarried += (long long)n; g_markSenderUnknown += (long long)unknown; }   /* review-inv6p2 LOW */
 /* inv6 phase 2 (R6), MAIN THREAD: the item's raw hand -> an identity, uncounted in ownerTranslated (a list row). */
 /* bag23 part 1 (inv3 phase 2): clothing.cpp's door to the pack reader (the kit captures its packs' rows with it). MAIN THREAD. */
@@ -23700,15 +25782,31 @@ void ItemBagFillCopy(void* pack, const std::vector<coopbag::BagRow>& rows, void*
                  " pack here (its +0x290 inventory does not point back) - all LOST on this copy (bagRows lost)");
         return;
     }
+    if (!coopbag::BagNestValid(rows))
+    {
+        *lost = (int)rows.size();
+        ErrorLog("[ITEMS] bag copy (" + by + "): " + N((long long)rows.size()) + " backpack row(s) name a pack that is not an earlier row,"
+                 " or one more than " + N((long long)coopbag::kBagMaxDepth) + " levels down - all LOST on this copy (bagRows lost)");
+        return;
+    }
+    std::vector<void*> made(rows.size(), (void*)0);   /* each row's new item, so a row inside an inner pack finds that pack */
     for (size_t i = 0; i < rows.size(); ++i)
     {
         const coopbag::BagRow& r = rows[i];
+        if (r.parent != 0 && made[r.parent - 1] == 0)
+        {   /* its inner pack was not made or not placed: nothing to put it in */
+            ++*lost; ++g_bagNestChildLost;
+            ErrorLog("[ITEMS] bag copy (" + by + "): row " + N((long long)i) + " " + r.baseSid + " x" + N((long long)r.qty) + " belongs in row "
+                     + N((long long)(r.parent - 1)) + ", which is not in the new pack - LOST on this copy (bagRows lost)");
+            continue;
+        }
         ItemMoveMsg mm;
         mm.baseSid = r.baseSid; mm.companySid = r.companySid; mm.materialSid = r.materialSid; mm.colorSid = r.colorSid;
         mm.quality = r.quality; mm.charges = r.charges;
         mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = (int)r.unique;
         mm.quantity = (int)r.qty;
         if (r.owner.kind != coopmark::kOwnNone) { mm.owner = r.owner; mm.ownerFrom = 1; }   /* the row's own exact mark (inv6 phase 2 R5) */
+        mm.gear = r.gear;   /* the copied row's uniform and crafter */
         ::Item* item = ItCreateItem((::Character*)character, mm, 1);
         if (item == 0)
         {
@@ -23717,7 +25815,16 @@ void ItemBagFillCopy(void* pack, const std::vector<coopbag::BagRow>& rows, void*
                      + " could not be created here - LOST on this copy (bagRows lost)");
             continue;
         }
-        ::InventorySection* sec = ((::Inventory*)inv)->getSection(r.section);
+        void* rowInv = inv;   /* the outer pack's inventory, or the inner pack's its parent row names (parents come first) */
+        if (r.parent != 0 && ItBagInvPod(made[r.parent - 1], &rowInv) == 0)
+        {
+            ++*lost; ++g_bagNestChildLost;
+            ItDestroyPod((void*)item, "bag copy row: the inner pack it belongs in is not a pack here");
+            ErrorLog("[ITEMS] bag copy (" + by + "): row " + N((long long)i) + " " + r.baseSid + " x" + N((long long)r.qty) + " belongs in row "
+                     + N((long long)(r.parent - 1)) + ", which is not a pack here - LOST on this copy (bagRows lost)");
+            continue;
+        }
+        ::InventorySection* sec = ((::Inventory*)rowInv)->getSection(r.section);
         int placed = 0;
         if (ItObj(sec))
         {
@@ -23730,6 +25837,8 @@ void ItemBagFillCopy(void* pack, const std::vector<coopbag::BagRow>& rows, void*
         }
         if (placed == 1 || placed == 2)
         {
+            made[i] = (void*)item;
+            if (r.parent != 0) ++g_bagNestPlaced;
             ++*applied;
             if (placed == 2) ++*relocated;
             continue;
@@ -23770,6 +25879,20 @@ int ItemOwnerApplyTo(void* item, const coopmark::OwnerId& o, const std::string& 
     ItOwnerApply((::Item*)item, m);
     return (g_markRowApplied > before) ? 1 : 0;
 }
+/* MAIN THREAD: an item's uniform and crafter as they travel (none when it is not a gear item) */
+void ItemGearOf(void* item, gearwire::GearMarks* out)
+{
+    *out = gearwire::GearMarks();
+    if (item == 0 || !ItPlaus(item)) return;
+    void* uni = 0;
+    char cr[kItCrafterCap];
+    const int st = ItGearReadPod(item, &uni, cr, kItCrafterCap);
+    ItGearOfRaw(st, uni, cr, out, 1);
+}
+/* MAIN THREAD: a fresh item (in no inventory yet) takes a list row's uniform and crafter (ItGearApply). 1 written. */
+int ItemGearApplyTo(void* item, const gearwire::GearMarks& g, const std::string& sid) { return ItGearApply((::Item*)item, g, sid); }
+void ItemGearNoteSent(int blocks, unsigned int dropped) { g_gearCarried += blocks; g_gearDropped += (long long)dropped; }
+void ItemGearNoteBadRecv() { ++g_gearBadRecv; }
 
 /* give1: TEST-ONLY `itemtest confirmdelay <0..30>` (command channel). Defined here, in namespace coop itself, beside the
    declaration's namespace (items.h). */
@@ -24504,7 +26627,7 @@ std::string ItemsDetail()
          + N(g_lateGiveConfirm) + "," + N(g_lateGiveRemoved) + "," + N(g_lateGiveItemGone) + "," + N(g_lateGiveItemChanged) + ","
          + N(g_cancelSaleDebited) + "," + N(g_cancelBuyRefunded) + "," + N(g_cfHeldCount) + "," + N(g_cfHeldUnsent)
          /* inv6 phase 1: the stolen mark. carried = messages SENT with an OWN1 block; received = arrivals with one; applied = set on the
-            new item (wire); unresolved = the owner not found here, the item stays CLEAN (interim rule); localApplied = D5-2; unreadable =
+            new item (wire); unresolved = the owner not found here on arrival (parked when it names a uid - itemOwnPark); localApplied = D5-2; unreadable =
             owner words not readable (any thread); senderUnknown = our own owner not found at send; badBlock = would not encode. */
          + " itemOwn1[ownerCarried,ownerReceived,ownerApplied,ownerUnresolved,ownerLocalApplied,ownerUnreadable,ownerSenderUnknown,ownerApplyFault,ownerBadBlock,ownerJournaled,ownerTranslated]="
          + N(g_markCarried) + "," + N(g_markReceived) + "," + N(g_markApplied) + "," + N(g_markUnresolved) + "," + N(g_markLocalApplied) + ","
@@ -24515,6 +26638,31 @@ std::string ItemsDetail()
          + " itemOwn2[rowCarried,rowReceived,rowApplied,rowUnresolved,undoKept,badRecv,journalInvalid]="
          + N(g_markRowCarried) + "," + N(g_markRowReceived) + "," + N(g_markRowApplied) + "," + N(g_markRowUnresolved) + ","
          + N(g_markUndoKept) + "," + N(g_markBadRecv) + "," + N(g_markJournalInvalid)
+         /* stolen marks waiting for their owner (ownpark.h): parked = held by hand and place; applied = put on once the owner came;
+            expired = the owner did not come in time; gone / changed / moved = the item was not the parked one any more (dropped); full
+            = no room (left clean); outside = made after the frame's item tick (dropped unread); pack = a pack (never parked); handLost
+            = its hand or place would not read; destroyed = destroyed before it settled; teardown = dropped with the world. */
+         + " itemOwnPark[parked,applied,expired,gone,changed,moved,full,outside,pack,handLost,destroyed,teardown]="
+         + N(g_ownParkParked) + "," + N(g_ownParkApplied) + "," + N(g_ownParkExpired) + "," + N(g_ownParkGone) + "," + N(g_ownParkChanged) + ","
+         + N(g_ownParkMoved) + "," + N(g_ownParkFull) + "," + N(g_ownParkOutside) + "," + N(g_ownParkPack) + "," + N(g_ownParkHandLost) + ","
+         + N((long long)g_ownParkDestroyed) + "," + N(g_ownParkTeardown)
+         /* packs inside packs: placed = rows put into an inner pack on arrival; refDeep = a pack refused for holding items more than
+            4 levels down; childLost = a copy's row lost because its inner pack was; badRecv = a malformed BAGN tail received. */
+         + " bagNest[placed,refDeep,childLost,badRecv]=" + N(g_bagNestPlaced) + "," + N(g_bagRefDeep) + "," + N(g_bagNestChildLost) + ","
+         + N(g_bagNestBadRecv)
+         /* moves two or more pack levels down (ItBagNestDrain): seen; undone = put back; undoFailed = could not be; pushed = this game
+            writes the box, pushed whole; parked = taken onto the cursor; lapsed = left the cursor with no landing; stands = nothing to
+            put back against; split = a split this deep. */
+         + " bagNestMove[seen,undone,undoFailed,pushed,parked,lapsed,stands,split]=" + N(g_bagNestSeen) + "," + N(g_bagNestUndone) + ","
+         + N(g_bagNestUndoFailed) + "," + N(g_bagNestPushed) + "," + N(g_bagNestParked) + "," + N(g_bagNestLapsed) + ","
+         + N(g_bagNestStands) + "," + N(g_bagNestSplit)
+         /* the gear marks (gearwire.h): carried = GEM1 blocks written; dropped = fields sent empty (no wire name, over the bound, a
+            control byte); received / applied = marks put on a fresh item; unknownFaction = a uniform whose faction is not in this game
+            (left off); notGear = marks for an item that is not a gear item here (dropped); fault = the write faulted; badRecv = a
+            malformed GEM1 block or GEML tail; journaled = b3 journal lines. */
+         + " itemGear[carried,dropped,received,applied,unknownFaction,notGear,fault,badRecv,journaled]="
+         + N(g_gearCarried) + "," + N(g_gearDropped) + "," + N(g_gearReceived) + "," + N(g_gearApplied) + "," + N(g_gearUnknownFaction) + ","
+         + N(g_gearNotGear) + "," + N(g_gearFault) + "," + N(g_gearBadRecv) + "," + N(g_gearJournaled)
          /* P8e (E45): the door road's share of the two shared answers, kept apart from the box and
             restock numbers beside them so a door refusal is never read as an item-layer one. */
          /* B9-b (review-b9 H-1/M-2): `noNotebook` is GONE from this list, not zeroed - the arm it counted
@@ -24536,7 +26684,7 @@ int ObjectPositionKey(void* obj, char* out, int cap, const char* suffix, int cou
     if (suffix != 0 && suffix[0] != 0)
     {
         const int at = (int)std::strlen(out);
-        if (ItKeyAppendStr(out, cap, at, suffix) < 0)
+        if (poskey::AppendStr(out, cap, at, suffix) < 0)
         { out[0] = 0; ItKeyFailBook(countIt, &g_boxKeyTooLong); return 0; }
     }
     return 1;
@@ -24558,7 +26706,9 @@ void* ObjectByPositionKeyHint(const char* key, void* hint)
         if (!(fr >= 0 && ItFurnRowLive(g_furn[fr]) == 0))
         {
             char again[kBoxKeyCap]; again[0] = 0;
-            if (ItBoxKeyBuildMode(hint, again, kBoxKeyCap, 0, 1, 1) != 0 && std::strcmp(again, key) == 0)
+            char hintWire[kBoxKeyCap]; hintWire[0] = 0;
+            const char* hintKey = (poskey::WireForm(key, hintWire, kBoxKeyCap) == 2) ? hintWire : key;   /* the wire form, as ItBoxResolve */
+            if (ItBoxKeyBuildMode(hint, again, kBoxKeyCap, 0, 1, 1) != 0 && std::strcmp(again, hintKey) == 0)
             {
                 const int wn = ItBoxWalkForLiveness();
                 for (int w = 0; w < wn; ++w)
@@ -24967,6 +27117,23 @@ std::map<std::string, int> g_parityClosedReaskN; long long g_parityClosedReasked
 const int kParityClosedReaskCap = 3;    /* re-asks per key before it is dropped (`deferDropped`); reset when its contents arrive */
 const int kParityClosedReaskTick = 8;   /* closed boxes re-asked per drain */
 std::map<std::string, int> g_parityRetryN;          /* asker: mismatch re-asks per key since the last sector departure */
+/* asker: answers with items held while no item can be made (ItCanMakeItems: no active character with a squad container, or
+   the game's item maker not ready) - ItParityHoldNoMaker, `parityNoScratch[held]`. Their keys wait HERE, on a list of their
+   own with its own cap (kParityNoScratchCap; past it `parityNoScratch[lost]`), not on the shared deferral list, and
+   ItParityTick step 3a re-asks them on the first pass that can make items (`parityNoScratch[reasked]`), outside the
+   closed-box re-ask cap; a key whose box no longer resolves leaves (`parityNoScratch[gone]`). Cleared at world teardown. */
+const size_t kParityNoScratchCap = 4096;
+const int kParityHeldTryTick = 64;   /* held boxes looked at a drain (asks sent are capped by kParityClosedReaskTick) */
+std::string g_parityHeldCursor;   /* the held box the last pass looked at last; the next pass starts after it */
+std::set<std::string> g_parityNoScratchKeys;
+long long g_parityNoScratchHeld = 0, g_parityNoScratchReasked = 0, g_parityNoScratchLost = 0, g_parityNoScratchGone = 0;
+int g_parityNoScratchLines = 0, g_parityAddRefusedLines = 0, g_parityNoScratchLostLines = 0;
+/* holder: sector index (sx * 64 + sy) -> the games that asked this game for that sector (a plain or open ask; a pull is not
+   recorded), as player key (net::PlayerKeyNow: one game asking by the session link and by the world server's road is one
+   record) -> its player slot when it asked (-1 unknown). The fill push sends an addressed copy to each one this game's map
+   of the other games' loaded areas does not show there (ItParityFillPush). A record ends when that map shows the game there
+   (ItParityAskersCatchUp), when that game's link ends (ItParityForgetAsker) and at world teardown. */
+std::map<int, std::map<unsigned int, int> > g_paritySecAskers;
 ItParityBoxRef g_parityRefs[kParityRefCap];
 /* P94 (owner decision 219, 2026-09-30; it replaces parity3's "Loot fetched on open" of 2026-09-26): A BOX'S CONTENTS ARE SENT
    TO EVERY GAME THAT HAS ITS AREA LOADED WHEN THE AREA LOADS, AND KEPT IN STEP AFTER. The arrival ask (a sector's arrival lists
@@ -25087,9 +27254,12 @@ int ItParityDigest(::Inventory* inv, unsigned int* digest, long long* count, lon
 }
 /* MAIN THREAD, holder. The whole contents, read live: the ITEM_MOVE add fields (ItReadFields, the drain's own reader) plus
    section / x / y / quantity. 1 read; 0 an item would not read, or the box is over cooppar::kParityMaxItems. */
-int ItParityContents(::Inventory* inv, std::vector<cooppar::ParityItem>* out)
+/* *secUnread (may be 0): the sections whose pointer did not read - skipped, as every caller has always had it; ItKeptBoxCount
+   treats one as a box it cannot count. */
+int ItParityContents(::Inventory* inv, std::vector<cooppar::ParityItem>* out, int* secUnread)
 {
     out->clear();
+    if (secUnread != 0) *secUnread = 0;
     if (!ItObj(inv)) return 0;
     const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
     if (secs.size() > 64) return 0;
@@ -25097,7 +27267,7 @@ int ItParityContents(::Inventory* inv, std::vector<cooppar::ParityItem>* out)
     for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
     {
         ::InventorySection* sec = it->second;
-        if (!ItObj(sec)) continue;
+        if (!ItObj(sec)) { if (secUnread != 0) ++*secUnread; continue; }
         char secName[kSecCap]; secName[0] = 0;
         if (ItStrPod(&it->first, secName, kSecCap) == 0) return 0;
         const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
@@ -25114,6 +27284,7 @@ int ItParityContents(::Inventory* inv, std::vector<cooppar::ParityItem>* out)
             p.baseSid = e.baseSid; p.companySid = e.companySid; p.materialSid = e.materialSid; p.colorSid = e.colorSid;
             p.quality = e.quality; p.charges = e.charges; p.functionKind = e.functionKind; p.level = e.level; p.unique = e.unique;
             ItOwnerTranslate(e.ownerRaw, e.ownerHave, &p.owner, 0);   /* inv6 phase 2 (R4): the item's mark rides the answer / the push */
+            ItGearOf(e, &p.gear, 0);   /* the item's uniform and crafter ride the answer / the push (GEML) */
             out->push_back(p);
             {   /* bag23 part 2: a PACK's contents ride with it (paritywire.h BAGK block), so a parity swap never rebuilds it empty.
                    Contents that cannot travel whole make the box unreadable for this answer - refused, never truncated. */
@@ -25293,6 +27464,53 @@ int ItParityRowFor(const std::string& key, cooppar::ParityBoxRow* row)
     row->key = key; row->digest = d; row->items = (unsigned int)c;
     return 1;
 }
+/* MAIN THREAD: boxes whose rows this game laid on top of a hand-back answer (a merged swap) or kept over it (this game's box stood),
+   not yet sent by the safety net. While a box is here no pull of it is started and a live one is ended, so no answer is swapped in
+   plain over those rows before the other games have them; the safety net's visit that sends every difference (or finds none) takes
+   the box off (InvNetOwedPaid). A full table (kHandbackNetOwedCap) leaves a box off it, logged. */
+std::set<std::string> g_handbackNetOwed;
+const size_t kHandbackNetOwedCap = 1024;
+long long g_handbackNetOwedFull = 0, g_handbackNetOwedPaid = 0, g_handbackPullEnded = 0, g_handbackPullHeld = 0,
+          g_handbackOwedLines = 0;
+long long g_handbackSwapNotAtCell = 0, g_handbackRemoveFailed = 0, g_handbackPutBack = 0, g_handbackPutBackLost = 0,
+          g_handbackProbeCacheFull = 0;
+void ItHandbackOweNet(const std::string& key, const char* why)
+{
+    if (g_handbackNetOwed.count(key) == 0 && g_handbackNetOwed.size() >= kHandbackNetOwedCap)
+    {
+        ++g_handbackNetOwedFull;
+        if (g_handbackNetOwedFull <= 5)
+            ErrorLog("[BOXOWN] handback rows owed key=" + key + " NOT RECORDED - the table is full (" + N((long long)kHandbackNetOwedCap)
+                     + "); a pull of the box is not held back until the safety net has sent this game's rows (handbackOwedFull="
+                     + N(g_handbackNetOwedFull) + ")");
+        return;
+    }
+    g_handbackNetOwed.insert(key);
+    const int ended = (g_parityPull.erase(key) != 0) ? 1 : 0;
+    if (ended != 0) ++g_handbackPullEnded;
+    if (g_handbackOwedLines < 40)
+    {
+        ++g_handbackOwedLines;
+        DebugLog("[BOXOWN] handback rows owed key=" + key + " - " + std::string(why) + "; no pull of the box runs until the safety net"
+                 " has sent this game's rows" + (ended != 0 ? std::string(" (the live pull is ended)") : std::string()));
+    }
+}
+int ItHandbackNetOwed(const std::string& key)
+{
+    return (g_handbackNetOwed.count(key) != 0) ? 1 : 0;
+}
+/* MAIN THREAD, the safety net: a box's visit sent every difference from its baseline, or found none */
+void InvNetOwedPaid(const std::string& key)
+{
+    if (g_handbackNetOwed.erase(key) == 0) return;
+    ++g_handbackNetOwedPaid;
+    if (g_handbackOwedLines < 40)
+    {
+        ++g_handbackOwedLines;
+        DebugLog("[BOXOWN] handback rows sent key=" + key + " - the safety net has sent this game's rows (or found none to send); a"
+                 " pull of the box may run again (handbackOwedPaid=" + N(g_handbackNetOwedPaid) + ")");
+    }
+}
 /* P109 fold 1 (F6): 1 = a pull for `key` is out and younger than kOpenAskLostMs (the ask's own lost time); a stale entry is
    dropped here and counted lost. MAIN THREAD. */
 int ItParityPullLive(const std::string& key)
@@ -25329,6 +27547,7 @@ void ItParityAskOne(const std::string& key)
 void ItParityPullOne(const std::string& key)
 {
     const DWORD now = ::GetTickCount();
+    if (ItHandbackNetOwed(key) != 0) { ++g_handbackPullHeld; return; }   /* this game's rows on the box are not sent yet: no pull swaps an answer in over them */
     if (ItParityPullLive(key) != 0) return;   /* in flight (fold 1, F6: a stale one was dropped and counted lost there) */
     if (g_parityPull.size() >= kParityPullCap) { ++g_parityQueueFull; return; }
     g_parityPull[key] = now;
@@ -25341,11 +27560,125 @@ void ItParityDefer(const std::string& key)
     ++g_parityDeferred;
     if (g_parityDeferKeys.size() < kParityDeferCap) g_parityDeferKeys.insert(key); else ++g_parityQueueFull;
 }
-/* MAIN THREAD, asker. (1) every item now in the box leaves by op 1 at its own slot, (2) every answered item arrives by op 0
-   at its exact slot, (3) digest again. 1 = the re-digest equals the holder's. */
-int ItParitySwap(::Inventory* inv, const cooppar::ParityBox& a)
+/* asker: boxes among the building copies this game made, each with the time it was made, waiting for the zone list to find
+   them. ItParityTick puts each one it finds on the re-ask list above, so the area's writer is asked for its contents (the
+   area's arrival ask can come before the copy exists); one not found within kParityCopyWaitMs is let go. */
+struct ItParityCopyWait { std::string key; DWORD at; };
+std::deque<ItParityCopyWait> g_parityCopyQ;
+const size_t kParityCopyCap = 256, kParityCopyTick = 4;
+const DWORD kParityCopyWaitMs = 20000;
+long long g_parityCopyLines = 0, g_parityCopyDropped = 0;
+/* MAIN THREAD: a building copy with an inventory waits for its ask; one without (any other piece, or a box still being built -
+   ItParityCopyCompleted queues it when the STATE that completes it lands) is left out. `why` names the event in the log. */
+void ItParityCopyQueue(void* b, const char* key, const char* why)
 {
+    if (b == 0 || ItBoxInventory(b) == 0) return;
+    char bk[kBoxKeyCap];
+    bk[0] = 0;
+    const std::string k = (ItBoxKeyBuild(b, bk, kBoxKeyCap, 0, 0) != 0 && bk[0] != 0) ? std::string(bk)
+                                                                                     : std::string(key != 0 ? key : "");
+    if (k.empty()) return;
+    if (g_parityCopyQ.size() >= kParityCopyCap)
+    {
+        ++g_parityQueueFull; ++g_parityCopyDropped;
+        if (g_parityCopyLines < 40)
+        {
+            ++g_parityCopyLines;
+            DebugLog("[PARITY] copy NOT queued key=" + k + " (" + std::string(why) + ") - " + N((long long)kParityCopyCap)
+                     + " copies already wait for the zone list; its contents are not asked now - opening the box asks for them");
+        }
+        return;
+    }
+    ItParityCopyWait w; w.key = k; w.at = ::GetTickCount();
+    g_parityCopyQ.push_back(w);
+}
+/* MAIN THREAD (build.cpp): the copy createBuilding just made (live) */
+void ItParityCopyMade(void* b, const char* key) { ItParityCopyQueue(b, key, "made"); }
+/* MAIN THREAD (build.cpp): the owner's STATE just completed this copy (complete 0 -> 1) */
+void ItParityCopyCompleted(void* b, const char* key) { ItParityCopyQueue(b, key, "completed"); }
+/* MAIN THREAD, asker: an answer with items that cannot be made now (ItCanMakeItems) waits whole - nothing leaves the box, its
+   mismatch retry is not spent, and its share of this tick's swap budget (taken by ItParityApply) is handed back. Its key goes
+   on the held list (g_parityNoScratchKeys, its own cap), which ItParityTick step 3a re-asks on the first pass that can make
+   items. A full list keeps nothing: the box keeps this game's copy until something asks for it again. */
+void ItParityHoldNoMaker(const cooppar::ParityBox& a)
+{
+    ++g_parityNoScratchHeld;
+    --g_paritySwapBoxesTick; g_paritySwapItemsTick -= (long long)a.items.size();
+    if (g_parityNoScratchKeys.count(a.key) == 0 && g_parityNoScratchKeys.size() >= kParityNoScratchCap)
+    {
+        ++g_parityNoScratchLost;
+        if (g_parityNoScratchLostLines < 20)
+        {
+            ++g_parityNoScratchLostLines;
+            DebugLog("[PARITY] apply HELD but NOT kept key=" + a.key + " - the held list is full; the box keeps this game's copy until its next ask");
+        }
+        return;
+    }
+    g_parityNoScratchKeys.insert(a.key);
+    if (g_parityNoScratchLines < 20)
+    {
+        ++g_parityNoScratchLines;
+        DebugLog("[PARITY] apply HELD key=" + a.key + " items=" + N((long long)a.items.size())
+                 + " - no character with a squad container, or the game's item maker not ready yet; the answer waits and the box is asked again once items can be made");
+    }
+}
+/* Which of the report's itemsRefused counters an op-0 add raised: that counter's name is the refusal's reason ("refused":
+   none rose). */
+struct ItRefuseSnap { long long v[10]; };
+void ItRefuseSnapTake(ItRefuseSnap* s)
+{
+    s->v[0] = g_slotOutOfRange; s->v[1] = g_slotReadFault; s->v[2] = g_applyNoItemAtSlot; s->v[3] = g_slotOccupied; s->v[4] = g_applyCreateFailed;
+    s->v[5] = g_applyNoInventory; s->v[6] = g_applyNoSection; s->v[7] = g_applyNoContainer; s->v[8] = g_applyFault; s->v[9] = g_applyBadOp;
+}
+const char* ItRefuseSnapWhy(const ItRefuseSnap& s0)
+{
+    static const char* const names[10] = { "slotOutOfRange", "slotReadFault", "noItemAtSlot", "slotOccupied", "createFailed",
+                                           "noInventory", "noSection", "noContainer", "fault", "badOp" };
+    ItRefuseSnap s1; ItRefuseSnapTake(&s1);
+    for (int i = 0; i < 10; ++i) if (s1.v[i] != s0.v[i]) return names[i];
+    return "refused";
+}
+/* A refused add of a parity answer: the box's first one is named, at most 20 lines (the count is `parityAnswer[addRefused]`). */
+void ItParityAddRefusedSay(const std::string& key, const std::string& sid, const char* why, int* said)
+{
+    if (*said != 0 || g_parityAddRefusedLines >= 20) return;
+    *said = 1; ++g_parityAddRefusedLines;
+    DebugLog("[PARITY] add REFUSED key=" + key + " item=" + sid + " why=" + std::string(why)
+             + " - this game's copy of the box is without it (the re-digest will differ from the holder's)");
+}
+void* ItItemAtPod(::InventorySection* sec, int x, int y);   /* defined further down this file */
+/* MAIN THREAD: one item of a box read (cooppar::ParityItem) made and laid at its own cell, as a swap's add. 1 laid; 0 refused;
+   -1 the box has no such section. */
+static int ItParityAddOne(::Inventory* inv, const std::string& key, const cooppar::ParityItem& it, const char* why)
+{
+    ::InventorySection* sec = inv->getSection(it.section);
+    if (!ItObj(sec)) return -1;
+    ItemMoveMsg m;
+    m.uid = 0; m.op = 0; m.section = it.section; m.x = it.x; m.y = it.y; m.quantity = it.quantity;
+    m.baseSid = it.baseSid; m.companySid = it.companySid; m.materialSid = it.materialSid; m.colorSid = it.colorSid;
+    m.quality = it.quality; m.charges = it.charges; m.functionKind = it.functionKind; m.level = it.level; m.unique = it.unique;
+    m.boxKey = key;
+    if (it.owner.kind != coopmark::kOwnNone) { m.owner = it.owner; m.ownerFrom = 1; }
+    m.bag = it.bag; m.bagChecked = 1;   /* a pack is filled before it is placed (ItOp0BagFill) */
+    m.gear = it.gear;   /* the item's uniform and crafter (the answer's GEML tail) */
+    return (ItApplyMoveTo(inv, sec, 0, m, why) != 0) ? 1 : 0;
+}
+/* MAIN THREAD, asker. (0) an answer with items needs items to be makeable (ItCanMakeItems: a scratch container and the
+   game's item maker): when they are not, -1 and NOTHING is removed - the box keeps what it had and the caller holds the
+   answer (ItParityHoldNoMaker: no retry, no hand-back); (1) every item now in the box leaves by op 1 at its own slot, (2)
+   every answered item arrives by op 0 at its exact slot, (3) digest again. 1 = the re-digest equals the holder's, 0 = not.
+   placed (optional): per answered item, 1 laid at its cell, 0 refused, -1 not tried; ran (optional): 1 once the removes began.
+   removeFailed (optional, a merged hand-back swap): nothing leaves unless this game's items read whole and each is found at its own
+   cell (else 0 with *ran 0); the removes stop at the first that fails, nothing of the answer is laid, the items that had left are
+   laid back at their own cells from that read, and 0 is returned with *removeFailed > 0 (coopown::HandbackSwapRemoveOutcome). */
+int ItParitySwap(::Inventory* inv, const cooppar::ParityBox& a, std::vector<int>* placed = 0, int* ran = 0, int* removeFailed = 0)
+{
+    if (placed != 0) placed->assign(a.items.size(), -1);
+    if (ran != 0) *ran = 0;
+    if (removeFailed != 0) *removeFailed = 0;
+    if (cooppar::ParityApplyGate((long long)a.items.size(), ItCanMakeItems()) == cooppar::kParityGateHold) return -1;
     std::vector<ItParitySlot> slots;
+    std::vector<void*> slotItems;   /* per slot, the item read there */
     {
         const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
         if (secs.size() > 64) return 0;
@@ -25363,30 +27696,70 @@ int ItParitySwap(::Inventory* inv, const cooppar::ParityBox& a)
                 if (ItItemCellPod((void*)si[k].item, &cx, &cy) == 0) return 0;
                 ItParitySlot sl; sl.sec = secName; sl.x = cx; sl.y = cy;
                 slots.push_back(sl);
+                slotItems.push_back((void*)si[k].item);
             }
         }
     }
+    std::vector<cooppar::ParityItem> own;   /* a merged swap: this game's items as read before anything leaves */
+    if (removeFailed != 0)
+    {
+        if (ItParityContents(inv, &own) == 0) { ++g_handbackSwapNotAtCell; return 0; }
+        for (size_t i = 0; i < slots.size(); ++i)
+        {
+            ::InventorySection* sec = inv->getSection(slots[i].sec);
+            if (!ItObj(sec) || ItItemAtPod(sec, slots[i].x, slots[i].y) != slotItems[i]) { ++g_handbackSwapNotAtCell; return 0; }
+        }
+    }
+    if (ran != 0) *ran = 1;
+    std::vector<size_t> left;   /* the slots whose item left the box */
     for (size_t i = 0; i < slots.size(); ++i)
     {
         ::InventorySection* sec = inv->getSection(slots[i].sec);
-        if (!ItObj(sec)) continue;
+        if (!ItObj(sec)) { if (removeFailed != 0) { ++*removeFailed; break; } continue; }
         ItemMoveMsg m;
         m.uid = 0; m.op = 1; m.section = slots[i].sec; m.x = slots[i].x; m.y = slots[i].y; m.boxKey = a.key;
-        if (ItApplyMoveTo(inv, sec, 0, m, "parity swap (remove)") != 0) ++g_parityItemsRemoved;
+        if (ItApplyMoveTo(inv, sec, 0, m, "parity swap (remove)") != 0) { ++g_parityItemsRemoved; left.push_back(i); }
+        else if (removeFailed != 0) { ++*removeFailed; break; }   /* a merged swap stops at the first item that does not leave */
     }
+    if (removeFailed != 0 && coopown::HandbackSwapRemoveOutcome(1, *removeFailed) == coopown::kHbSwapPutBack)
+    {   /* nothing of the answer is laid: the items that left go back at their own cells, made from the read before the removes */
+        long long back = 0, lost = 0;
+        for (size_t n = 0; n < left.size(); ++n)
+        {
+            const ItParitySlot& sl = slots[left[n]];
+            size_t o = 0;
+            while (o < own.size() && (own[o].section != sl.sec || own[o].x != sl.x || own[o].y != sl.y)) ++o;
+            if (o < own.size() && ItParityAddOne(inv, a.key, own[o], "parity swap (put back)") == 1) ++back;
+            else ++lost;
+        }
+        g_handbackRemoveFailed += *removeFailed; g_handbackPutBack += back; g_handbackPutBackLost += lost;
+        if (lost > 0)
+            ErrorLog("[BOXOWN] handback swap STOPPED key=" + a.key + " - an item did not leave the box at its cell; " + N(back) + " item(s)"
+                     " that had left were put back, " + N(lost) + " could NOT be put back and are gone (handbackPutBackLost="
+                     + N(g_handbackPutBackLost) + ")");
+        else
+            DebugLog("[BOXOWN] handback swap STOPPED key=" + a.key + " - an item did not leave the box at its cell; the " + N(back)
+                     + " item(s) that had left were put back at their own cells and nothing of the holder's answer was laid");
+        return 0;
+    }
+    int refusedSaid = 0;   /* the box's first refused add is named once */
     for (size_t j = 0; j < a.items.size(); ++j)
     {
         const cooppar::ParityItem& it = a.items[j];
         ::InventorySection* sec = inv->getSection(it.section);
-        if (!ItObj(sec)) { ++g_parityAddRefused; continue; }
+        if (placed != 0) (*placed)[j] = 0;
+        if (!ItObj(sec)) { ++g_parityAddRefused; ItParityAddRefusedSay(a.key, it.baseSid, "noSection", &refusedSaid); continue; }
+        ItRefuseSnap refuseBefore; ItRefuseSnapTake(&refuseBefore);
         ItemMoveMsg m;
         m.uid = 0; m.op = 0; m.section = it.section; m.x = it.x; m.y = it.y; m.quantity = it.quantity;
         m.baseSid = it.baseSid; m.companySid = it.companySid; m.materialSid = it.materialSid; m.colorSid = it.colorSid;
         m.quality = it.quality; m.charges = it.charges; m.functionKind = it.functionKind; m.level = it.level; m.unique = it.unique;
         m.boxKey = a.key;
         if (it.owner.kind != coopmark::kOwnNone) { m.owner = it.owner; m.ownerFrom = 1; }   /* inv6 phase 2 (R4) */
+        m.gear = it.gear;   /* the item's uniform and crafter (the swap's GEML tail) */
         m.bag = it.bag; m.bagChecked = 1;   /* bag23 part 2: a pack is filled before it is placed (ItOp0BagFill) */
-        if (ItApplyMoveTo(inv, sec, 0, m, "parity swap (add)") != 0) ++g_parityItemsAdded; else ++g_parityAddRefused;
+        if (ItApplyMoveTo(inv, sec, 0, m, "parity swap (add)") != 0) { ++g_parityItemsAdded; if (placed != 0) (*placed)[j] = 1; }
+        else { ++g_parityAddRefused; ItParityAddRefusedSay(a.key, it.baseSid, ItRefuseSnapWhy(refuseBefore), &refusedSaid); }
     }
     unsigned int d = 0; long long c = 0, u = 0;
     if (ItParityDigest(inv, &d, &c, &u) == 0) return 0;
@@ -25862,6 +28235,53 @@ long long ItParityServe(const cooppar::ParityBoxRow& row, unsigned int asker)   
     if (neverRecv != 0 && a.status == cooppar::kParityStatusUnreadable && cooppar::ParityPullOnRefusal(row.kind) != 0) ItParityPullOne(row.key);
     return (long long)a.items.size();
 }
+/* MAIN THREAD, holder: game `fromPeer` asked for sector (sx, sy) - it has that sector loaded now. Recorded under its player
+   key (net::PlayerKeyNow), so the same game asking by both roads is one record. */
+void ItParityNoteAsker(int sx, int sy, unsigned int fromPeer)
+{
+    if (sx < 0 || sx >= 64 || sy < 0 || sy >= 64) return;
+    const unsigned int askerKey = net::PlayerKeyNow(fromPeer);
+    g_paritySecAskers[sx * 64 + sy][askerKey] = net::PlayerSlotOfKey(askerKey);
+}
+/* The games that asked for sector index secIdx (their player keys into *keys when given); returns how many. */
+int ItParitySectorAskers(int secIdx, std::vector<unsigned int>* keys)
+{
+    if (keys != 0) keys->clear();
+    if (secIdx < 0) return 0;
+    std::map<int, std::map<unsigned int, int> >::iterator s = g_paritySecAskers.find(secIdx);
+    if (s == g_paritySecAskers.end()) return 0;
+    if (keys != 0)
+        for (std::map<unsigned int, int>::iterator k = s->second.begin(); k != s->second.end(); ++k) keys->push_back(k->first);
+    return (int)s->second.size();
+}
+/* MAIN THREAD: a player's link ended - its recorded asks go. slot < 0 (not known) clears every game's; a record whose slot was
+   not known when it was made goes with any departure. */
+void ItParityForgetAsker(int slot)
+{
+    for (std::map<int, std::map<unsigned int, int> >::iterator s = g_paritySecAskers.begin(); s != g_paritySecAskers.end(); )
+    {
+        for (std::map<unsigned int, int>::iterator k = s->second.begin(); k != s->second.end(); )
+        {
+            if (cooppar::ParityAskerForget(slot, k->second) != 0) s->second.erase(k++); else ++k;
+        }
+        if (s->second.empty()) g_paritySecAskers.erase(s++); else ++s;
+    }
+}
+/* MAIN THREAD, holder, where the fill push reads the map (peerState = PeerSectorLoadedTS(sct)): a record ends once this
+   game's FRESH map shows that game in the sector (SlotMapLoadedTS by its slot) - it gets the push by area from then on; a
+   record with no slot ends once the map shows any other game there (cooppar::ParityAskerCaughtUp). */
+void ItParityAskersCatchUp(int secIdx, const Sector& sct, int peerState)
+{
+    if (secIdx < 0) return;
+    std::map<int, std::map<unsigned int, int> >::iterator s = g_paritySecAskers.find(secIdx);
+    if (s == g_paritySecAskers.end()) return;
+    for (std::map<unsigned int, int>::iterator k = s->second.begin(); k != s->second.end(); )
+    {
+        const int slotLoaded = (k->second >= 0) ? SlotMapLoadedTS(sct, k->second) : -1;
+        if (cooppar::ParityAskerCaughtUp(k->second, slotLoaded, peerState) != 0) s->second.erase(k++); else ++k;
+    }
+    if (s->second.empty()) g_paritySecAskers.erase(s);
+}
 void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer)
 {
     cooppar::ParityReq r;
@@ -25869,6 +28289,7 @@ void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer)
     if (why != cooppar::kParityDecodeOk)
     { ++g_parityBad; DebugLog("[PARITY] <- PARITY_REQ malformed (reason " + N((long long)why) + ") - ignored"); return; }
     ++g_parityReqRecv;
+    if (r.kind != cooppar::kParityAskPull) ItParityNoteAsker(r.sx, r.sy, fromPeer);   /* a fill here reaches it even before this game's map of its areas shows the sector */
     for (size_t i = 0; i < r.boxes.size(); ++i)
     {
         if (g_parityServeQ.size() >= kParityServeCap) { ++g_parityQueueFull; continue; }
@@ -25920,6 +28341,8 @@ void ParityNoteBox(const char* p, size_t n, unsigned int fromPeer)
     cooppar::ParityBox a;
     const int why = cooppar::DecodeParityBox(p, n, &a);
     if (why == cooppar::kParityDecodeBadOwner) ++g_markBadRecv;   /* inv6 phase 2: the whole answer is ignored, as any malformed one */
+    if (why == cooppar::kParityDecodeBadGear) ++g_gearBadRecv;   /* a malformed GEML tail: the whole answer is ignored too */
+    if (why == cooppar::kParityDecodeBadNest) ++g_bagNestBadRecv;   /* a pack's rows with a malformed BAGN tail: ignored too */
     if (why != cooppar::kParityDecodeOk)
     { ++g_parityBad; DebugLog("[PARITY] <- PARITY_BOX malformed (reason " + N((long long)why) + ") - ignored"); return; }
     ++g_parityBoxRecv;
@@ -25974,6 +28397,233 @@ void ItParityNoteBoxMove(const std::string& key)
         if (it->stale == 0 && it->a.key == key) it->stale = 1;
 }
 /* MAIN THREAD, asker: one CONTENTS answer, applied now (at receipt, or from the queue within the budget). */
+int InvNetRead(::Inventory* inv, std::vector<coopinv::Slot>* out);
+int InvNetBaseOf(const std::string& boxKey, std::vector<coopinv::Slot>* out);
+void InvNetBaseSet(const std::string& boxKey, const std::vector<coopinv::Slot>& base);
+int InvNetHoldUnsure(const std::string& boxKey);
+long long g_handbackMergeLines = 0, g_handbackMergeLost = 0, g_handbackProbes = 0;
+/* MAIN THREAD: each item's footprint in the box (Item +0x130 / +0x134), in InvNetRead's own order (sections in map order, then each
+   section's rows). 1 read, 0 not. */
+int ItHandbackDims(::Inventory* inv, std::vector<int>* w, std::vector<int>* h)
+{
+    w->clear(); h->clear();
+    if (!ItObj(inv)) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return 0;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            int iw = 0, ih = 0;
+            if (!ItPlaus(item) || ItIntPod(item, kItemWidth, &iw) == 0 || ItIntPod(item, kItemHeight, &ih) == 0 || iw < 1 || ih < 1) return 0;
+            w->push_back(iw); h->push_back(ih);
+        }
+    }
+    return 1;
+}
+/* MAIN THREAD: the grid of one section of the box. 1 read, 0 not (no such section, or unreadable). */
+int ItHandbackSecDims(::Inventory* inv, const std::string& name, int* w, int* h)
+{
+    ::InventorySection* sec = inv->getSection(name);
+    return (ItObj(sec) && ItIntPod(sec, kSecContentW, w) != 0 && ItIntPod(sec, kSecContentH, h) != 0) ? 1 : 0;
+}
+/* footprints measured on this game, by base, maker and material record */
+std::map<std::string, std::pair<int, int> > g_itDims;
+const size_t kItDimsCap = 4096;
+std::string ItDimsKey(const cooppar::ParityItem& p) { return p.baseSid + "|" + p.companySid + "|" + p.materialSid; }
+/* an item made from `m` only to be measured, then destroyed at once - it never enters any inventory and is not one of the
+   world's items. Behind SEH; the applying-thread guard keeps this file's own hooks from booking it. 1 measured, 0 not. */
+static int ItProbeDimsPod(const ItemMoveMsg& m, int* w, int* h)
+{
+    int ok = 0;
+    const LONG guardWas = ::InterlockedExchange(&g_itApplyingThread, (LONG)::GetCurrentThreadId());   /* put back as it was below */
+    __try
+    {
+        ::Item* item = ItCreateItem(0, m, 0);
+        if (item != 0)
+        {
+            ok = (ItIntPod(item, kItemWidth, w) != 0 && ItIntPod(item, kItemHeight, h) != 0 && *w > 0 && *h > 0) ? 1 : 0;
+            ItDestroyRefused(item);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    ::InterlockedExchange(&g_itApplyingThread, guardWas);
+    return ok;
+}
+/* MAIN THREAD: the footprint of an answered item - measured before on this game, or now on an item made for it (ItProbeDimsPod).
+   1 known, 0 not (no item could be made). */
+int ItHandbackDimsOf(const cooppar::ParityItem& p, int* w, int* h)
+{
+    const std::string dk = ItDimsKey(p);
+    std::map<std::string, std::pair<int, int> >::const_iterator d = g_itDims.find(dk);
+    if (d != g_itDims.end()) { *w = d->second.first; *h = d->second.second; return 1; }
+    ItemMoveMsg m;
+    m.uid = 0; m.op = 0; m.quantity = 1;
+    m.baseSid = p.baseSid; m.companySid = p.companySid; m.materialSid = p.materialSid; m.colorSid = p.colorSid;
+    m.quality = p.quality; m.charges = p.charges; m.functionKind = p.functionKind; m.level = p.level; m.unique = p.unique;
+    if (g_itDims.size() >= kItDimsCap) { ++g_handbackProbeCacheFull; return 0; }   /* the cache is full: no item is made to be measured - the size is unknown */
+    ++g_handbackProbes;
+    int iw = 0, ih = 0;
+    if (ItProbeDimsPod(m, &iw, &ih) == 0) return 0;
+    if (g_itDims.size() < kItDimsCap) g_itDims[dk] = std::make_pair(iw, ih);
+    *w = iw; *h = ih;
+    return 1;
+}
+/* MAIN THREAD: a hand-back answered with contents, with the baseline saved when it asked: the answer's rows with this game's moves
+   since the ask laid on top (coopinv::HandbackMerge), laid out BEFORE anything is removed (coopinv::HandbackLayout: the holder's
+   rows at their cells first, then this game's at their own cell or a free one). This game's rows are matched to its live items by
+   their place in the box (the same walk, row for row), not by record and cell.
+   1 = *merged is the box to swap in (holder rows first), *holder the answer's rows as the safety net reads rows, *holderAt each
+       merged row's holder row (-1 = one of this game's);
+   0 = no local difference, or no baseline and no move held - the answer goes in as it is;
+  -1 = this game's items could not be matched row for row - the answer waits (asked again);
+  -2 = this game's box stands (ItHandbackKeepOwn, *why says why): the merged set does not fit, a footprint or a section could not
+       be read, this game's box could not be read, or a move made before the wait could not be taken out of the saved baseline. */
+int ItHandbackMergeBuild(const cooppar::ParityBox& a, ::Inventory* inv, cooppar::ParityBox* merged,
+                         std::vector<coopinv::Slot>* holder, std::vector<int>* holderAt, std::string* why)
+{
+    if (a.status != cooppar::kParityStatusContents || ItHandbackWaiting(a.key) == 0) return 0;
+    if (InvNetHoldUnsure(a.key) != 0)
+    {
+        *why = "a move on the box during the wait could not be squared with the saved baseline (one made before the wait that could not"
+               " be taken out of it, one inside a pack, or another game's move the baseline could not take)";
+        return -2;
+    }
+    std::vector<coopinv::Slot> base, now;
+    if (InvNetBaseOf(a.key, &base) == 0) return 0;
+    if (InvNetRead(inv, &now) != 1) { *why = "this game's box could not be read item by item"; return -2; }
+    holder->assign(a.items.size(), coopinv::Slot());
+    for (size_t i = 0; i < a.items.size(); ++i)
+    {
+        coopinv::Slot& s = (*holder)[i];
+        s.section = a.items[i].section; s.x = a.items[i].x; s.y = a.items[i].y;
+        s.sid = a.items[i].baseSid; s.qty = a.items[i].quantity; s.charges = a.items[i].charges;
+    }
+    std::vector<coopinv::MergeRow> rows;
+    if (coopinv::HandbackMerge(*holder, base, now, &rows) == 0) return 0;
+    std::vector<cooppar::ParityItem> live;
+    std::vector<int> dw, dh;
+    int same = (ItParityContents(inv, &live) != 0 && ItHandbackDims(inv, &dw, &dh) != 0 && live.size() == now.size()
+                && dw.size() == now.size()) ? 1 : 0;
+    for (size_t j = 0; same != 0 && j < now.size(); ++j)
+        if (live[j].section != now[j].section || live[j].x != now[j].x || live[j].y != now[j].y || live[j].baseSid != now[j].sid) same = 0;
+    if (same == 0)
+    {
+        if (g_handbackMergeLines < 40)
+        {
+            ++g_handbackMergeLines;
+            DebugLog("[BOXOWN] handback merge WAITS key=" + a.key + " - this game's items could not be read row for row; nothing is"
+                     " removed and the answer is asked again");
+        }
+        return -1;
+    }
+    std::vector<coopinv::LaySec> secs;
+    std::vector<coopinv::LayItem> hl, ol;
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        const coopinv::MergeRow& m = rows[r];
+        coopinv::LayItem li;
+        if (m.from == 0)
+        {
+            const cooppar::ParityItem& p = a.items[m.index];
+            li.section = p.section; li.x = p.x; li.y = p.y;
+            if (ItHandbackDimsOf(p, &li.w, &li.h) == 0)
+            {
+                *why = (g_itDims.size() >= kItDimsCap)
+                     ? "the size cache is full (" + N((long long)kItDimsCap) + " kinds), so the footprint of the holder's " + p.baseSid + " is not measured"
+                     : "the footprint of the holder's " + p.baseSid + " could not be measured";
+                return -2;
+            }
+            hl.push_back(li);
+        }
+        else
+        {
+            li.section = now[m.index].section; li.x = now[m.index].x; li.y = now[m.index].y; li.w = dw[m.index]; li.h = dh[m.index];
+            if (g_itDims.size() < kItDimsCap) g_itDims[ItDimsKey(live[m.index])] = std::make_pair(li.w, li.h);
+            ol.push_back(li);
+        }
+        if (coopinv::LaySecIndex(secs, li.section) < 0)
+        {
+            coopinv::LaySec s; s.name = li.section;
+            if (ItHandbackSecDims(inv, li.section, &s.w, &s.h) == 0) { *why = "the box's section " + li.section + " could not be read"; return -2; }
+            secs.push_back(s);
+        }
+    }
+    const std::vector<coopinv::LayItem> olAsked(ol);
+    if (coopinv::HandbackLayout(secs, hl, &ol) == 0)
+    {
+        *why = "the holder's " + N((long long)hl.size()) + " row(s) and this game's " + N((long long)ol.size())
+             + " row(s) since the ask do not fit in the box together";
+        return -2;
+    }
+    *merged = a;
+    merged->items.clear();
+    holderAt->clear();
+    size_t oi = 0;
+    long long moved = 0;
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        const coopinv::MergeRow& m = rows[r];
+        if (m.from == 0)
+        {
+            cooppar::ParityItem p = a.items[m.index]; p.quantity = m.qty;
+            merged->items.push_back(p); holderAt->push_back((int)m.index);
+            continue;
+        }
+        cooppar::ParityItem p = live[m.index]; p.quantity = m.qty; p.x = ol[oi].x; p.y = ol[oi].y;
+        if (ol[oi].x != olAsked[oi].x || ol[oi].y != olAsked[oi].y) ++moved;
+        ++oi;
+        merged->items.push_back(p); holderAt->push_back(-1);
+    }
+    merged->digest = cooppar::ParityDigestOf(merged->items);
+    if (g_handbackMergeLines < 40)
+    {
+        ++g_handbackMergeLines;
+        DebugLog("[BOXOWN] handback merge key=" + a.key + " - the holder's " + N((long long)hl.size()) + " row(s) are laid first, then"
+                 " this game's " + N((long long)ol.size()) + " row(s) since the ask (" + N(moved) + " at a free cell, their own being"
+                 " taken); the whole set fits, " + N((long long)merged->items.size()) + " row(s) in all");
+    }
+    return 1;
+}
+/* MAIN THREAD, after a merged swap: the safety net's baseline becomes what the other games have of the box - the holder's rows as
+   answered - so its next visit sends exactly the moves laid on top (this game's rows as adds, the holder's stacks it changed as
+   counts, the ones it took as removes). Built from what the swap laid (placed, per merged row), not from a read of the box. A
+   holder row the box refused is left out of it, so nothing is sent about that item: this game's copy is without it and the other
+   games keep it in theirs. */
+void ItHandbackMergeDone(const std::string& key, const std::vector<coopinv::Slot>& holder, const std::vector<int>& holderAt,
+                         const std::vector<int>& placed)
+{
+    std::vector<int> refused(holder.size(), 0);
+    long long holderRefused = 0, oursLost = 0;
+    for (size_t k = 0; k < holderAt.size() && k < placed.size(); ++k)
+    {
+        if (placed[k] == 1) continue;
+        if (holderAt[k] >= 0) { refused[(size_t)holderAt[k]] = 1; ++holderRefused; }
+        else ++oursLost;
+    }
+    std::vector<coopinv::Slot> base;
+    for (size_t i = 0; i < holder.size(); ++i)
+        if (refused[i] == 0) base.push_back(holder[i]);
+    InvNetBaseSet(key, base);
+    if (oursLost > 0)
+    {
+        g_handbackMergeLost += oursLost;
+        ErrorLog("[BOXOWN] handback merge LOST key=" + key + " - " + N(oursLost) + " of this game's row(s) were refused by the box"
+                 " although the layout check found room for them; those items are gone (handbackMergeLost=" + N(g_handbackMergeLost) + ")");
+    }
+    if (holderRefused > 0 && g_handbackMergeLines < 40)
+    {
+        ++g_handbackMergeLines;
+        DebugLog("[BOXOWN] handback merge key=" + key + " - " + N(holderRefused) + " of the holder's row(s) were refused by the box"
+                 " although the layout check found room; this game's copy is without them, they are left out of the safety net's"
+                 " baseline so nothing is sent about them, and the other games keep them in their copies");
+    }
+}
 void ItParityApply(const cooppar::ParityBox& a)
 {
     ++g_paritySwapBoxesTick;
@@ -25985,7 +28635,9 @@ void ItParityApply(const cooppar::ParityBox& a)
     {
         float pos[3]; pos[0] = 0; pos[1] = 0; pos[2] = 0;
         const int writerMine = (ItBoxPosPod(b, pos) != 0 && ItBoxWriterAt(b, pos, a.key.c_str()) == kBoxMine) ? 1 : 0;
-        if (cooppar::ParityApplyOverOwn(writerMine, ItParityPullLive(a.key)) == 0) { ++g_parityAnsSelfHeld; return; }   /* P109: unless it answers this game's own pull */   /* we hold it now: ours stands */
+        const int owed = ItHandbackNetOwed(a.key);   /* this game's rows on the box are not sent yet: a pull of it is ended */
+        if (owed != 0 && g_parityPull.erase(a.key) != 0) ++g_handbackPullEnded;
+        if (cooppar::ParityApplyOverOwn(writerMine, coopown::HandbackPullStands(owed, ItParityPullLive(a.key))) == 0) { ++g_parityAnsSelfHeld; return; }   /* P109: unless it answers this game's own pull */   /* we hold it now: ours stands */
     }
     /* parity3, choice (a): THE ANSWER IS SWAPPED INTO THE OPEN WINDOW. PAR-1 dropped it while the window was open; now the
        window is the reason it was asked. Refused only when an item is on the cursor while the box is on screen (that item
@@ -26000,6 +28652,12 @@ void ItParityApply(const cooppar::ParityBox& a)
     void* shop = (win == 0) ? ItOpenShopFacadeFor(inv) : 0;
     if (ItParityCursorBusy() != 0 && (win != 0 || shop != 0)) { ++g_openDeferredCursor; ItParityDefer(a.key); return; }   /* fold 1 (F2a): only a box on screen */
     if (ItBoxHasPendingMoves(b, a.key.c_str()) != 0) { ++g_openDeferredPending; ItParityDefer(a.key); return; }
+    /* The answer's items are made in a scratch container borrowed from an active character's squad (ItAnyScratchContainer) by
+       the game's item maker (the world's object factory); a game still loading may have either missing (ItCanMakeItems). Then
+       the answer waits whole (ItParityHoldNoMaker): nothing leaves the box, the mismatch retry below is not spent, its swap
+       budget is handed back, and ItParityTick step 3a asks for the box again on the first pass that can make items. An empty
+       answer makes nothing. */
+    if (cooppar::ParityApplyGate((long long)a.items.size(), ItCanMakeItems()) == cooppar::kParityGateHold) { ItParityHoldNoMaker(a); return; }
     /* recheck-parity3 (c): with no verified rebuild the counters are swapped anyway (the stock is right; the open shop
        window shows the old list until it is reopened) - deferring here re-asked every round trip and dropped the
        answer at close. Counted as deferredNoRebuild for the report. */
@@ -26014,8 +28672,42 @@ void ItParityApply(const cooppar::ParityBox& a)
         const int liveHave = ItParityDigest(inv, &ld, &lc, &lu);
         if (ItHandbackSwapCheck(a.key, liveHave, ld) == 0) { ItParityAskOne(a.key); return; }
     }
-    const int swapped = ItParitySwap(inv, a);
-    ItHandbackApplied(a.key, swapped);   /* inv4 fold 4: the previous writer's contents are in - this game now publishes */
+    cooppar::ParityBox merged;
+    std::vector<coopinv::Slot> mergeHolder;
+    std::vector<int> mergeHolderAt, mergePlaced;
+    std::string keepWhy;
+    const int merging = ItHandbackMergeBuild(a, inv, &merged, &mergeHolder, &mergeHolderAt, &keepWhy);   /* this game's moves since the ask go on top */
+    if (merging == -1) { ItParityDefer(a.key); return; }
+    if (merging == -2)
+    {   /* nothing is removed: ended as at a timeout; the moves since the baseline go out through the safety net before any pull */
+        ItHandbackKeepOwn(a.key, keepWhy);
+        ItHandbackOweNet(a.key, "this game's box was kept over the holder's answer (the merge was not built)");
+        return;
+    }
+    int swapRan = 0, removeFailed = 0;
+    const int swapped = ItParitySwap(inv, (merging > 0) ? merged : a, &mergePlaced, &swapRan, (merging > 0) ? &removeFailed : 0);
+    if (swapped < 0) { ItParityHoldNoMaker(a); return; }   /* the swap's own gate held it: nothing was removed - no retry, no hand-back */
+    if (merging > 0 && swapRan == 0)
+    {
+        ItHandbackKeepOwn(a.key, "the box's items could not be read whole for the swap, or one was not found at its own cell, so nothing"
+                                 " was removed");
+        ItHandbackOweNet(a.key, "this game's box was kept over the holder's answer (the swap did not start)");
+        return;
+    }
+    if (merging > 0 && removeFailed > 0)
+    {   /* ItParitySwap stopped at the item that did not leave and put back the ones that had left: this game's box stands */
+        ItHandbackKeepOwn(a.key, "an item did not leave the box for the swap; the items that had left were put back at their own cells"
+                                 " and nothing of the holder's answer was laid");
+        ItHandbackOweNet(a.key, "this game's box was kept over the holder's answer (the swap stopped)");
+        if (win != 0) ItRefreshGuiPod(inv);
+        return;
+    }
+    ItHandbackApplied(a.key, swapped, (merging > 0) ? 1 : 0);   /* inv4 fold 4: the previous writer's contents are in - this game now publishes */
+    if (merging > 0)
+    {   /* the moves laid on top go out through the safety net, before any pull of the box */
+        ItHandbackMergeDone(a.key, mergeHolder, mergeHolderAt, mergePlaced);
+        ItHandbackOweNet(a.key, "this game's rows were laid on top of the holder's answer");
+    }
     int swOwnSlot = -1, swOwnVia = 0;
     const int swOwn = (win != 0) ? ItBoxOwnerOf(b, &swOwnSlot, &swOwnVia) : coopown::kOwnNone;
     if (win != 0 && (swOwn == coopown::kOwnPeer || swOwn == coopown::kOwnShared || swOwn == coopown::kOwnUnknown))
@@ -26028,18 +28720,20 @@ void ItParityApply(const cooppar::ParityBox& a)
         if (!noRebuild && ItShopFacadeRebuild(shop) == 1) ++g_openFacadeRebuilt;
     }
     else ++g_openSwappedClosed;
-    if (swapped != 0 && g_parityPull.erase(a.key) != 0) { ++g_parityPullApplied; InvNetSnapshotBox(a.key, inv); }   /* P109 R1/R4: the previous holder's contents are in - and the other game holds them too (the inv2a baseline) */
+    if (swapped != 0 && g_parityPull.erase(a.key) != 0) { ++g_parityPullApplied; if (merging <= 0) InvNetSnapshotBox(a.key, inv); }   /* a merged swap's baseline is the holder's rows (ItHandbackMergeDone) */   /* P109 R1/R4: the previous holder's contents are in - and the other game holds them too (the inv2a baseline) */
     if (swapped != 0) { ++g_parityReplaced; ItSnapRecvNote(a.key); return; }   /* P94 fold 1 (review F1): only now has this game had the holder's contents */
     ++g_parityApplyMismatch;
     int& tries = g_parityRetryN[a.key];
-    const int again = (tries < 1) ? 1 : 0;
+    const int again = coopown::HandbackReaskAfterMismatch((merging > 0) ? 1 : 0, tries);   /* a merged swap is not asked again */
     if (again != 0) { ++tries; ++g_parityRetries; ItParityAskOne(a.key); }
     else if (g_parityPull.erase(a.key) != 0) ++g_parityPullRefused;   /* P109: a pull whose swap did not match twice ends here */
     if (g_parityMismatchLines < 20)
     {
         ++g_parityMismatchLines;
         DebugLog("[PARITY] swap MISMATCH key=" + a.key + " holderItems=" + N((long long)a.items.size())
-                 + " - the re-digest differs from the holder's; " + (again != 0 ? std::string("asked once more") : std::string("already re-asked, left as is")));
+                 + " - the re-digest differs from the holder's; " + (again != 0 ? std::string("asked once more")
+                   : (merging > 0) ? std::string("a merged swap: not asked again - the safety net sends this game's rows from the box as it is")
+                   : std::string("already re-asked, left as is")));
     }
 }
 /* parity3: ONE OPENED BOX. MAIN THREAD. The box's key, then who holds it, read now: this game -> nothing to ask
@@ -26239,7 +28933,7 @@ std::string BoxOpenCommand(const std::string& arg)
 }
 int ItParityKeyBusy(const std::string& key)
 {
-    if (g_parityOpenAsked.count(key) != 0 || g_parityDeferKeys.count(key) != 0) return 1;
+    if (g_parityOpenAsked.count(key) != 0 || g_parityDeferKeys.count(key) != 0 || g_parityNoScratchKeys.count(key) != 0) return 1;   /* a held answer is awaited too */
     for (std::deque<ItParityQueued>::const_iterator it = g_parityApplyQ.begin(); it != g_parityApplyQ.end(); ++it)
         if (it->a.key == key) return 1;
     return 0;
@@ -26500,6 +29194,7 @@ int ItLootInInventoryPod(const void* obj)
 void ItemsLootNoteDestroy(const void* obj, int justUnloaded)
 {
     if (obj == 0) return;
+    ItOwnParkForget(obj);   /* a fresh parked item destroyed before it settled is forgotten (pointer compare only) */
     if (::InterlockedCompareExchange(&g_lootRegUsed, 0, 0) == 0 && ::InterlockedCompareExchange(&g_lootWatchUsed, 0, 0) == 0) return;
     int hit = 0;
     for (int i = 0; i < kLootRegCap && hit == 0; ++i) if (g_lootReg[i].item == obj) hit = 1;
@@ -26900,7 +29595,7 @@ int ItLootRouteGive(const ItEntry& fe, unsigned int farUid, int verdict, int kin
 }
 void ItLootPackLine(int kind)
 {
-    const int shown = StoreShowPlayerLine(kind == 2 ? std::string("The book is in your inventory - give it from there.")
+    const int shown = StoreShowPlayerLine(kind == 2 ? std::string("The book is in your inventory.")
                                                     : std::string("The book is in your inventory - it couldn't go in that container."));
     ItLootSay("[LOOT2] on-screen line (" + std::string(kind == 2 ? "give" : "materialise") + ") " + (shown == 1 ? std::string("shown") : std::string("NOT shown")));
 }
@@ -26911,7 +29606,7 @@ void ItLootRoomLine()
     const unsigned int now = ::GetTickCount();
     if (g_lootRoomLineSaid != 0 && (unsigned int)(now - g_lootRoomLineAt) < kLootRoomLineMs) return;
     g_lootRoomLineSaid = 1; g_lootRoomLineAt = now;
-    const int shown = StoreShowPlayerLine(std::string("Make room in your inventory to pick up the book."));
+    const int shown = StoreShowPlayerLine(std::string("There is no room in your inventory for the book."));
     ItLootSay("[LOOT2] on-screen line (no room) " + (shown == 1 ? std::string("shown") : std::string("NOT shown")) + " (waitingForRoom=" + N(g_lootWaitingForRoom) + ")");
 }
 /* a deferral is said at its 1st, 2nd, 4th, 8th ... attempt (the counters carry every one) */
@@ -28564,12 +31259,42 @@ void ItParityTick()
             }
         }
     }
+    /* asker: the boxes of building copies made here (ItParityCopyMade), a few a pass - one the zone list finds goes on the
+       re-ask list (step 3 below asks for it), one not found yet goes to the back, one past kParityCopyWaitMs is let go */
+    for (size_t cpN = 0; cpN < kParityCopyTick && !g_parityCopyQ.empty(); ++cpN)
+    {
+        ItParityCopyWait w = g_parityCopyQ.front();
+        g_parityCopyQ.pop_front();
+        void* cb = ItBoxResolve(w.key.c_str());
+        const int found = (cb != 0 && ItBoxInventory(cb) != 0) ? 1 : 0;
+        const int listFull = (found != 0 && g_parityDeferKeys.count(w.key) == 0 && g_parityDeferKeys.size() >= kParityDeferCap) ? 1 : 0;
+        if (found == 0 || listFull != 0)
+        {   /* not found yet, or the re-ask list is full: the copy keeps its place here until its wait ends */
+            if ((DWORD)(::GetTickCount() - w.at) < kParityCopyWaitMs) { g_parityCopyQ.push_back(w); continue; }
+            ++g_parityCopyDropped;
+            if (g_parityCopyLines < 40)
+            {
+                ++g_parityCopyLines;
+                DebugLog("[PARITY] copy dropped key=" + w.key + " - " + std::string(found == 0 ? "the zone list did not find it"
+                         : "the re-ask list stayed full") + " within " + N((long long)(kParityCopyWaitMs / 1000))
+                         + " s; its contents are not asked now - opening the box asks for them");
+            }
+            continue;
+        }
+        ItParityDefer(w.key);
+        if (g_parityCopyLines < 40)
+        {
+            ++g_parityCopyLines;
+            DebugLog("[PARITY] copy made key=" + w.key + " - its contents are asked of the area's writer");
+        }
+    }
     /* 3. asker: a deferred answer is asked for again. A box ON SCREEN is re-asked once the cursor is empty and its moves are
        out (parity3). P94 fold 1 (review F2): a CLOSED box is re-asked too instead of dropped - the holder set its safety-net
        baseline as if the answer arrived, so a dropped one left the copies apart until the next open - once its moves are
        out; the cursor does not hold it back (a cursor item cannot belong to a closed box). At most kParityClosedReaskTick
        closed boxes a drain and kParityClosedReaskCap re-asks a key (reset when its contents arrive, and at world teardown);
-       past the cap the key is dropped as before (`deferDropped`). Both kinds share the 5 s per-box interval below. */
+       past the cap the key is dropped as before (`deferDropped`). Both kinds share the 5 s per-box interval below. A key
+       whose answer is held until items can be made is asked by step 3a below instead. */
     if (!g_parityDeferKeys.empty())
     {
         const int cursorBusy = ItParityCursorBusy();
@@ -28579,6 +31304,7 @@ void ItParityTick()
             void* b = ItBoxResolve(it->c_str());
             ::Inventory* inv = (b != 0) ? ItBoxInventory(b) : 0;
             if (inv == 0) { g_parityDeferKeys.erase(it++); continue; }
+            if (g_parityNoScratchKeys.count(*it) != 0) { g_parityDeferKeys.erase(it++); continue; }   /* its answer is held: step 3a asks it */
             const int shown = ItParityShown(inv);   /* fold 3b: a counter counts as shown while its shop window is open */
             if (shown != 0 && cursorBusy != 0) { ++it; continue; }
             if (shown == 0)
@@ -28601,6 +31327,35 @@ void ItParityTick()
             g_parityDeferKeys.erase(it++);
         }
     }
+    /* 3a. asker: a box whose answer was held because no item could be made (g_parityNoScratchKeys, ItParityHoldNoMaker) is
+       asked again on the first pass that can make items (ItCanMakeItems, tested afresh each pass) - at most
+       kParityClosedReaskTick asks SENT a drain, and at most kParityHeldTryTick boxes looked at a drain; a box with a move not
+       yet published waits a drain. Outside kParityClosedReaskCap: holding never spends a re-ask. An ask that did not go keeps
+       its key; each pass starts after the box the last pass looked at last, so a box whose sector has no reachable writer never
+       blocks the others;
+       a box that no longer resolves leaves the list (`parityNoScratch[gone]`). */
+    if (!g_parityNoScratchKeys.empty() && cooppar::ParityHeldReask(ItCanMakeItems()) != 0)
+    {
+        int heldTick = 0, heldTried = 0;
+        const int heldN = (int)g_parityNoScratchKeys.size();
+        std::set<std::string>::iterator hk = g_parityNoScratchKeys.upper_bound(g_parityHeldCursor);
+        while (heldTick < kParityClosedReaskTick && heldTried < kParityHeldTryTick && heldTried < heldN && !g_parityNoScratchKeys.empty())
+        {
+            if (hk == g_parityNoScratchKeys.end()) hk = g_parityNoScratchKeys.begin();
+            g_parityHeldCursor = *hk;
+            void* hb = ItBoxResolve(hk->c_str());
+            ::Inventory* hinv = (hb != 0) ? ItBoxInventory(hb) : 0;
+            if (hinv == 0) { ++g_parityNoScratchGone; g_parityNoScratchKeys.erase(hk++); continue; }
+            ++heldTried;
+            if (ItBoxHasPendingMoves(hb, hk->c_str()) != 0) { ++hk; continue; }
+            const long long heldAskBefore = g_parityReq;
+            ItParityAskOne(*hk);
+            if (g_parityReq == heldAskBefore) { ++hk; continue; }   /* not sent (no row, no link): kept; the next pass starts after it */
+            ++heldTick;
+            ++g_parityReasked; ++g_parityNoScratchReasked;
+            g_parityNoScratchKeys.erase(hk++);
+        }
+    }
 }
 void ItParityWorldTeardown()
 {
@@ -28614,7 +31369,9 @@ void ItParityWorldTeardown()
     std::memset(g_grSettleState, 0, sizeof(g_grSettleState)); std::memset(g_grSettleLast, 0, sizeof(g_grSettleLast));
     std::memset(g_grSettlePolls, 0, sizeof(g_grSettlePolls));
     g_parityDeferKeys.clear();
+    g_parityCopyQ.clear();   /* the copies name the world that is going */
     g_parityRetryN.clear();
+    g_parityNoScratchKeys.clear(); g_paritySecAskers.clear(); g_parityHeldCursor.clear();   /* they name the world that is going */
     g_parityApplyQ.clear();
     ItOwnKeyReset();   /* inv4b: the per-key owner records and hand-backs name the world that is going */
     g_parityPollNow = 1;
@@ -28632,7 +31389,11 @@ void ItParityWorldTeardown()
      mine    -> (P94 fold 1, review F3: not a box of a sector once had as the non-holder that this game never received nor
                 restocked - `parityPushNeverReceived`, the answer's P109 test) if the peer has the sector loaded, one MSG_PARITY_BOX (status CONTENTS) with the box's whole contents, read
                 now (`parityPushed`); a box with an unpublished ordinary move waits a drain (`pushHeldBack`). Peer not
-                loaded: dropped - its first-sight ask covers it (`pushNoPeer`). Peer map stale: waits.
+                loaded by this game's map of the other games' areas: sent instead, addressed, to each game that asked for the
+                sector (`pushToAsker`) - an ask answered before the fill ended left that game the pre-fill contents, and the
+                map can lag its load. Peer loaded but an asker not on the map yet (three or more games): by area AND
+                addressed to that asker (`pushToAsker` too); an asker's record ends once the map shows it there. No asker:
+                dropped (`pushNoPeer`, the per-pass `push DROPPED` line). Peer map stale: waits.
      held    -> a non-holder's own fill never counts: the holder is asked again through the PAR-1 ask (`fillAsked`), unless
                 the sector's arrival ask is still to come and will carry the live digest anyway (`fillAskCovered`).
      loading -> waits, up to kParityVerdictTicks drains (`fillGaveUp`).
@@ -28642,6 +31403,8 @@ long long g_parityPushed = 0, g_parityPushItems = 0, g_parityPushNoPeer = 0, g_p
           g_parityFillAsked = 0, g_parityFillAskCovered = 0, g_parityFillGaveUp = 0, g_parityPushPeerStale = 0,
           g_parityPushNeverReceived = 0;   /* P94 fold 1 (review F3) */
 int g_parityPushLines = 0;
+long long g_parityPushToAsker = 0;   /* fill pushes sent, addressed, to games that asked for the sector (the map did not show them there) */
+int g_parityPushAskerLines = 0, g_parityPushDropPasses = 0;
 /* P94: a dirty box that ends WITHOUT a push (gone, gave up, not mine, never received (fold 1), peer not loaded, unreadable, send failed, or a non-holder's
    fill asked of the holder) forgets its inv2a baseline, as the drop did under parity3 - the safety net must not publish the
    fill as moves; its next visit takes a fresh baseline and the peer's next arrival or open ask repairs its copy. */
@@ -28654,6 +31417,7 @@ void ItParityFillPush(int* answered, long long* itemsSent)
 {
     if (g_fillDirty.empty()) return;
     if (::InterlockedCompareExchange(&g_fillsActive, 0, 0) != 0) { ++g_parityPushWaitFill; return; }
+    std::map<std::pair<int, int>, long long> pushDropBySec;   /* this pass's drops with no asker, per sector (the DROPPED line) */
     for (std::map<std::string, ItFillDirty>::iterator it = g_fillDirty.begin(); it != g_fillDirty.end(); )
     {
         const std::string key = it->first;
@@ -28693,9 +31457,12 @@ void ItParityFillPush(int* answered, long long* itemsSent)
         /* fold 1 (F3): the push of a box this game never received is refused as its answer would be (P109) */
         if (ItParityNeverReceived(b, key) != 0) { ++g_parityPushNeverReceived; ItParityNeverRecvSay(key, 1); ItFillDirtyForget(it++); continue; }
         const Sector sct = SectorOf(pos[0], pos[2]);
-        const int peer = PeerSectorLoadedTS(sct);
-        if (peer == 0) { ++g_parityPushNoPeer; ItFillDirtyForget(it++); continue; }
-        if (peer < 0)
+        const int pushSecIdx = (sct.x >= 0 && sct.x < 64 && sct.y >= 0 && sct.y < 64) ? sct.x * 64 + sct.y : -1;
+        const int pushPeerState = PeerSectorLoadedTS(sct);
+        ItParityAskersCatchUp(pushSecIdx, sct, pushPeerState);   /* an asker the fresh map now shows there gets the push by area */
+        const int pushTarget = cooppar::ParityPushTarget(pushPeerState, ItParitySectorAskers(pushSecIdx, 0));
+        if (pushTarget == cooppar::kParityPushDrop) { ++g_parityPushNoPeer; ++pushDropBySec[std::make_pair(sct.x, sct.y)]; ItFillDirtyForget(it++); continue; }
+        if (pushTarget == cooppar::kParityPushWait)
         {
             ++g_parityPushPeerStale;
             if (++it->second.ticks > kParityVerdictTicks) { ++g_parityFillGaveUp; ItFillDirtyForget(it++); } else ++it;
@@ -28710,24 +31477,59 @@ void ItParityFillPush(int* answered, long long* itemsSent)
         a.digest = cooppar::ParityDigestOf(a.items);
         std::vector<char> bytes;
         if (!cooppar::EncodeParityBox(&bytes, a)) { ++g_paritySendFailed; ItFillDirtyForget(it++); continue; }
-        if (net::SendParityPush(bytes, sct.x, sct.y))   /* M7b slice 2: to every game covering the box's sector */
+        /* By area to every game covering the sector; and, addressed, to each game that asked for the sector and that this
+           game's map does not show there (the parity answer's own road, net::SendParityBox) - alone when the map shows nobody
+           there, beside the area push when it shows another game (three or more games). Sent = at least one send went. */
+        long long pushSends = 0, pushAskerSends = 0;
+        if (pushTarget == cooppar::kParityPushPeer || pushTarget == cooppar::kParityPushPeerAndAsker)
         {
-            g_parityBytes += (long long)bytes.size();
+            if (net::SendParityPush(bytes, sct.x, sct.y)) pushSends = 1;   /* M7b slice 2: to every game covering the box's sector */
+        }
+        if (pushTarget == cooppar::kParityPushAsker || pushTarget == cooppar::kParityPushPeerAndAsker)
+        {
+            std::vector<unsigned int> pushAskers;
+            ItParitySectorAskers(pushSecIdx, &pushAskers);
+            for (size_t q = 0; q < pushAskers.size(); ++q) if (net::SendParityBox(bytes, pushAskers[q])) ++pushAskerSends;
+        }
+        if (pushSends + pushAskerSends > 0)
+        {
+            g_parityBytes += (long long)bytes.size() * (pushSends + pushAskerSends);
             g_markRowCarried += (long long)cooppar::ParityMarkedCount(a.items);   /* inv6 phase 2: the box publish */
             g_markSenderUnknown += (long long)cooppar::ParityUnknownCount(a.items);   /* review-inv6p2 LOW: unknown-owner rows (publish) */
-            ++g_parityPushed; g_parityPushItems += (long long)a.items.size();
             InvNetSnapshotBox(key, inv);   /* inv2a: the other game now holds these contents */
-            if (g_parityPushLines < 400)
+            if (pushAskerSends > 0)
             {
-                ++g_parityPushLines;
-                char hex[16]; std::sprintf(hex, "%08x", a.digest);
-                DebugLog("[PARITY] push key=" + key + " items=" + N((long long)a.items.size()) + " digest=" + std::string(hex)
-                         + " sector=" + N((long long)sct.x) + "," + N((long long)sct.y) + " - the box's whole contents after a fill");
+                ++g_parityPushToAsker;
+                if (g_parityPushAskerLines < 20)
+                {
+                    ++g_parityPushAskerLines;
+                    DebugLog("[PARITY] push key=" + key + " items=" + N((long long)a.items.size())
+                             + " sector=" + N((long long)sct.x) + "," + N((long long)sct.y) + " askers=" + N(pushAskerSends)
+                             + " - sent to the game(s) that asked for this sector (this game's map of their loaded areas does not show them there yet)");
+                }
+            }
+            if (pushSends > 0)
+            {
+                ++g_parityPushed; g_parityPushItems += (long long)a.items.size();
+                if (g_parityPushLines < 400)
+                {
+                    ++g_parityPushLines;
+                    char hex[16]; std::sprintf(hex, "%08x", a.digest);
+                    DebugLog("[PARITY] push key=" + key + " items=" + N((long long)a.items.size()) + " digest=" + std::string(hex)
+                             + " sector=" + N((long long)sct.x) + "," + N((long long)sct.y) + " - the box's whole contents after a fill");
+                }
             }
         }
         else { ++g_paritySendFailed; InvNetForget(0, key); }   /* P94: as every other exit without a push */
         ++*answered; *itemsSent += (long long)a.items.size();
         g_fillDirty.erase(it++);
+    }
+    if (!pushDropBySec.empty() && g_parityPushDropPasses < 20)
+    {   /* one line per sector for each of the first 20 passes that dropped any; the count is `parityPush[noPeer]` */
+        ++g_parityPushDropPasses;
+        for (std::map<std::pair<int, int>, long long>::const_iterator dr = pushDropBySec.begin(); dr != pushDropBySec.end(); ++dr)
+            DebugLog("[PARITY] push DROPPED n=" + N(dr->second) + " sector=" + N((long long)dr->first.first) + "," + N((long long)dr->first.second)
+                     + " - by this game's map no other game has this sector loaded, and none asked for it");
     }
 }
 /* MAIN THREAD, AFTER this tick's ring drain (review-par1 4a): the asker's queued swaps within the budget, then the holder's
@@ -28898,12 +31700,19 @@ void InvNetForget(unsigned int uid, const std::string& boxKey)
     if (g_invNetBase.empty()) return;
     if (g_invNetBase.erase(InvNetKey(uid, boxKey)) != 0) ++g_invNetForgotten;
 }
+/* MAIN THREAD: per box whose hand-back waits, the ring's next ticket when its baseline was saved (InvNetHoldBase) - a move rung
+   before it is already in that baseline - and the boxes whose baseline a held move could not be squared with (InvNetHoldMove) */
+std::map<std::string, LONG> g_invNetHoldSeq;
+std::set<std::string> g_invNetHoldUnsure;
+long long g_invNetHoldLaidBack = 0, g_invNetHoldFollowed = 0, g_invNetHoldKept = 0, g_invNetHoldKeptWaiting = 0;
 void InvNetClearAll()
 {
     if (!g_invNetBase.empty() || !g_invNetChars.empty() || !g_invNetBoxes.empty()) ++g_invNetClears;
     g_invNetBase.clear(); g_invNetHook.clear(); g_invNetLog.clear();
     g_invNetChars.clear(); g_invNetBoxes.clear();
     g_invNetCharIdx = 0; g_invNetBoxIdx = 0; g_invNetBoxListEver = 0;
+    g_invNetHoldSeq.clear(); g_invNetHoldUnsure.clear();
+    g_handbackNetOwed.clear();
 }
 /* is `item` a watched loot2c book (not yet settled)? pointer compares only */
 int InvNetWatched(void* item)
@@ -28941,8 +31750,10 @@ int InvNetRead(::Inventory* inv, std::vector<coopinv::Slot>* out)
             if (ItPtrPod(item, kObjData, &gd) == 0 || !ItPlaus(gd) || ItStrPodWhy((const char*)gd + kGdStringId, base, kSidCap) != 1
                 || ItIntPod(item, kItemQuantity, &q) == 0 || ItFloatPod(item, kItemCharges, &ch) == 0) return 0;
             if (out->size() >= 4096) return 0;
+            int cx = -1, cy = -1;
+            if (ItItemCellPod(item, &cx, &cy) == 0) return 0;   /* the item's own cell (+0xDC/+0xE0), as the parity answers read it - never SectionItem x,y */
             coopinv::Slot sl;
-            sl.section = secName; sl.x = (int)si[k].x; sl.y = (int)si[k].y; sl.sid = base; sl.qty = q; sl.charges = ch;
+            sl.section = secName; sl.x = cx; sl.y = cy; sl.sid = base; sl.qty = q; sl.charges = ch;
             out->push_back(sl);
         }
     }
@@ -29069,6 +31880,152 @@ std::string InvNetCharges(float c)
     return std::string(b);
 }
 /* compare one inventory with its baseline; a first visit only takes the baseline */
+/* MAIN THREAD: a box this game writes once its hand-back ends - the contents as they are when the wait begins become the safety
+   net's baseline (a baseline already there is kept), so a move made on the box during the wait is sent by the first visit after
+   the hand-back ends */
+void InvNetHoldBase(void* b, const std::string& boxKey)
+{
+    if (b == 0 || boxKey.empty()) return;
+    const std::string k = InvNetKey(0, boxKey);
+    if (g_invNetBase.find(k) != g_invNetBase.end()) return;
+    ::Inventory* inv = ItBoxInventory(b);
+    if (inv == 0) return;
+    std::vector<coopinv::Slot> cur;
+    if (InvNetRead(inv, &cur) == 1)
+    {   /* with the ring's next ticket: a move rung before it is in this baseline (InvNetHoldMove takes it back out) */
+        g_invNetBase[k] = cur;
+        g_invNetHoldSeq[boxKey] = ::InterlockedCompareExchange(&g_ticket, 0, 0);
+    }
+}
+/* MAIN THREAD: the safety net's baseline for a box - 1 and *out filled when there is one */
+int InvNetBaseOf(const std::string& boxKey, std::vector<coopinv::Slot>* out)
+{
+    std::map<std::string, std::vector<coopinv::Slot> >::const_iterator it = g_invNetBase.find(InvNetKey(0, boxKey));
+    if (it == g_invNetBase.end()) return 0;
+    *out = it->second;
+    return 1;
+}
+/* MAIN THREAD: the box's baseline set to what the other games have of it, so the next visit sends the difference */
+void InvNetBaseSet(const std::string& boxKey, const std::vector<coopinv::Slot>& base)
+{
+    g_invNetBase[InvNetKey(0, boxKey)] = base;
+}
+/* MAIN THREAD: a box's hand-back ended - its ticket and its mark go (the baseline stays) */
+void InvNetHoldEnd(const std::string& boxKey)
+{
+    g_invNetHoldSeq.erase(boxKey);
+    g_invNetHoldUnsure.erase(boxKey);
+}
+/* MAIN THREAD: 1 = a move held on the box could not be squared with its saved baseline - the hand-back answer is not merged */
+int InvNetHoldUnsure(const std::string& boxKey)
+{
+    return (g_invNetHoldUnsure.count(boxKey) != 0) ? 1 : 0;
+}
+const int kHoldAfter = 0, kHoldLaidBack = 1, kHoldSavedNow = 2, kHoldUnsure = 3, kHoldNoBase = 4, kHoldInPack = 5;
+/* MAIN THREAD, the drain: a move on a box refused because this game's hand-back of it waits (kBoxNoAnswer). The move stands in the
+   box. Rung after the baseline was saved: the merge or the safety net's next visit carries it (kHoldAfter). Rung before it
+   (coopown::HandbackMoveBeforeHold) - or with no baseline yet, which is saved now - it is already in the baseline, so it is taken
+   back out of it (coopinv::UnapplyOp: kHoldLaidBack / kHoldSavedNow). One that cannot be taken out, or a box whose baseline cannot
+   be read, marks the box: its answer is not merged and this game's box stands (kHoldUnsure / kHoldNoBase). A move inside a pack
+   is not in the baseline's rows and marks the box too (kHoldInPack). */
+int InvNetHoldMove(const std::string& key, long seq, const ItemMoveMsg& m, int qtyBefore)
+{
+    if (m.bagPath.has != 0)
+    {   /* the baseline lists the box's own rows, not a pack's contents: the box is marked, so the answer is not merged over it */
+        g_invNetHoldUnsure.insert(key);
+        ++g_invNetHoldKept;
+        return kHoldInPack;
+    }
+    const std::string k = InvNetKey(0, key);
+    int saved = 0;
+    if (g_invNetBase.find(k) == g_invNetBase.end())
+    {
+        void* b = ItBoxResolve(key.c_str());
+        if (b != 0) InvNetHoldBase(b, key);
+        if (g_invNetBase.find(k) == g_invNetBase.end()) { g_invNetHoldUnsure.insert(key); ++g_invNetHoldKept; return kHoldNoBase; }
+        saved = 1;
+    }
+    std::map<std::string, LONG>::const_iterator hs = g_invNetHoldSeq.find(key);
+    if (hs == g_invNetHoldSeq.end() || coopown::HandbackMoveBeforeHold(seq, (long)hs->second) == 0) return kHoldAfter;
+    if (coopinv::UnapplyOp(&g_invNetBase[k], m.op, m.section, m.x, m.y, m.baseSid, m.quantity, qtyBefore) == 0)
+    {
+        g_invNetHoldUnsure.insert(key);
+        ++g_invNetHoldKept;
+        return kHoldUnsure;
+    }
+    ++g_invNetHoldLaidBack;
+    return (saved != 0) ? kHoldSavedNow : kHoldLaidBack;
+}
+/* the drain's "box move held" line: what happens to the move */
+std::string InvNetHoldSay(int hm)
+{
+    if (hm == kHoldLaidBack)
+        return "it was made before the box's baseline was saved for the wait and is taken back out of that baseline, so it is sent"
+               " (or laid on top of the holder's contents) when the hand-back ends";
+    if (hm == kHoldSavedNow)
+        return "no baseline was saved for the box yet; it is saved now with this move taken back out of it, so the move is sent"
+               " (or laid on top of the holder's contents) when the hand-back ends";
+    if (hm == kHoldUnsure)
+        return "it could not be taken back out of the baseline saved for the wait, so the holder's answer is not swapped in: this"
+               " game's box stands and this move is not sent to the other games";
+    if (hm == kHoldNoBase)
+        return "no baseline could be read for the box, so the holder's answer is not swapped in: this game's box stands and this"
+               " move is not sent to the other games";
+    if (hm == kHoldInPack)
+        return "it is inside a pack, which the baseline saved for the wait does not list, so the holder's answer is not swapped in:"
+               " this game's box stands with the move in it, and the move itself is not sent to the other games";
+    return "it was made after the box's baseline was saved for the wait, so it is sent (or laid on top of the holder's contents)"
+           " when the hand-back ends";
+}
+/* MAIN THREAD, ApplyItemMove: another game's move on a box whose hand-back waits here, applied to this game's copy (ok): laid on the
+   baseline saved for the wait too, so the box less the baseline stays this game's own moves. Not applied: nothing changed. */
+long long g_invNetHoldFollowFailed = 0;
+void InvNetHoldFollow(const ItemMoveMsg& m, int ok)
+{
+    if (ok == 0 || m.bagPath.has != 0) return;
+    std::map<std::string, std::vector<coopinv::Slot> >::iterator bi = g_invNetBase.find(InvNetKey(0, m.boxKey));
+    if (bi == g_invNetBase.end()) return;
+    if (coopinv::ApplyOp(&bi->second, m.op, m.section, m.x, m.y, m.baseSid, m.quantity, m.charges) != 0) { ++g_invNetHoldFollowed; return; }
+    /* the box took the move but the baseline could not: the box less the baseline is no longer only this game's moves, so the box is
+       marked and the holder's answer is not merged over it */
+    g_invNetHoldUnsure.insert(m.boxKey);
+    ++g_invNetHoldKept; ++g_invNetHoldFollowFailed;
+    if (g_invNetHoldFollowFailed <= 20)
+        DebugLog("[BOXOWN] handback baseline could not follow key=" + m.boxKey + " op=" + N((long long)m.op) + " slot=" + m.section + ":"
+                 + N((long long)m.x) + "," + N((long long)m.y) + " - another game's move was applied to this game's box but not to the"
+                 " baseline saved for the wait; the box is marked: the holder's answer is not swapped in and this game's box stands"
+                 " (handbackFollowFailed=" + N(g_invNetHoldFollowFailed) + ")");
+}
+/* MAIN THREAD: every baseline goes except those of boxes whose hand-back still waits - each keeps its saved baseline, its ticket and
+   its mark, so the moves made during the wait are still sent when it ends */
+void InvNetClearAllButWaiting()
+{
+    std::map<std::string, std::vector<coopinv::Slot> > keep;
+    std::map<std::string, LONG> keepSeq;
+    std::set<std::string> keepUnsure;
+    for (std::map<std::string, ItHandback>::const_iterator h = g_ownHandback.begin(); h != g_ownHandback.end(); ++h)
+    {
+        if (coopown::HandbackWaiting(h->second.state) == 0) continue;
+        std::map<std::string, std::vector<coopinv::Slot> >::const_iterator bi = g_invNetBase.find(InvNetKey(0, h->first));
+        if (bi != g_invNetBase.end()) keep[bi->first] = bi->second;
+        std::map<std::string, LONG>::const_iterator hs = g_invNetHoldSeq.find(h->first);
+        if (hs != g_invNetHoldSeq.end()) keepSeq[hs->first] = hs->second;
+        if (g_invNetHoldUnsure.count(h->first) != 0) keepUnsure.insert(h->first);
+    }
+    const std::set<std::string> keepOwed(g_handbackNetOwed);   /* a box whose rows the safety net still owes keeps its baseline and its mark */
+    for (std::set<std::string>::const_iterator o = keepOwed.begin(); o != keepOwed.end(); ++o)
+    {
+        std::map<std::string, std::vector<coopinv::Slot> >::const_iterator bi = g_invNetBase.find(InvNetKey(0, *o));
+        if (bi != g_invNetBase.end()) keep[bi->first] = bi->second;
+    }
+    InvNetClearAll();
+    g_handbackNetOwed = keepOwed;
+    for (std::map<std::string, std::vector<coopinv::Slot> >::const_iterator k = keep.begin(); k != keep.end(); ++k)
+        g_invNetBase[k->first] = k->second;
+    g_invNetHoldSeq = keepSeq;
+    g_invNetHoldUnsure = keepUnsure;
+    g_invNetHoldKeptWaiting += (long long)keep.size();
+}
 void InvNetVisit(::Inventory* inv, unsigned int uid, const std::string& boxKey)
 {
     const std::string key = InvNetKey(uid, boxKey);
@@ -29081,7 +32038,8 @@ void InvNetVisit(::Inventory* inv, unsigned int uid, const std::string& boxKey)
     if (bi == g_invNetBase.end()) { g_invNetBase[key] = cur; ++g_invNetSnapFirst; return; }
     static std::vector<coopinv::Op> ops;
     coopinv::Diff(bi->second, cur, &ops);
-    if (ops.empty()) return;
+    if (ops.empty()) { if (uid == 0) InvNetOwedPaid(boxKey); return; }
+    int sendFailed = 0;
     const unsigned int now = ::GetTickCount();
     std::string lastHook = "none";
     {
@@ -29114,7 +32072,7 @@ void InvNetVisit(::Inventory* inv, unsigned int uid, const std::string& boxKey)
             }
             coopinv::ApplyCatch(&bi->second, o);
         }
-        else { ++g_invNetSendFailed; sent = "failed"; }
+        else { ++g_invNetSendFailed; sent = "failed"; sendFailed = 1; }
         const std::string lk = key + "|" + o.sid;
         if (g_invNetLog.size() >= kInvNetMapCap && g_invNetLog.count(lk) == 0) g_invNetLog.clear();
         std::map<std::string, InvNetLogSeen>::iterator lg = g_invNetLog.find(lk);
@@ -29131,6 +32089,7 @@ void InvNetVisit(::Inventory* inv, unsigned int uid, const std::string& boxKey)
                  + " lastHook=" + lastHook + " sent=" + sent
                  + (before > 0 ? " repeatsSuppressedBefore=" + N(before) : std::string()));
     }
+    if (uid == 0 && sendFailed == 0) InvNetOwedPaid(boxKey);   /* every difference went out: the other games have this game's rows */
 }
 void InvNetCharsRebuild()
 {
@@ -29191,7 +32150,14 @@ int InvNetBoxOne(const InvNetBoxRef& r)
     }
     if (!live) { if (g_invNetBase.erase(InvNetKey(0, r.key)) != 0) ++g_invNetForgotten; return 0; }
     float pos[3]; pos[0] = 0; pos[1] = 0; pos[2] = 0;
-    if (ItBoxPosPod(b, pos) == 0 || ItBoxWriterAt(b, pos, r.key.c_str()) != kBoxMine)   /* inv4 site 8: only the writer nets a box */
+    const int wv = (ItBoxPosPod(b, pos) != 0) ? ItBoxWriterAt(b, pos, r.key.c_str()) : kBoxNotBox;
+    if (wv == kBoxNoAnswer && ItHandbackWaiting(r.key) != 0)
+    {   /* this game writes the box once its hand-back ends: the baseline from the start of the wait is kept, not re-read */
+        InvNetHoldBase(b, r.key);
+        ++g_invNetSkippedPending;
+        return 0;
+    }
+    if (wv != kBoxMine)   /* inv4 site 8: only the writer nets a box */
     { if (g_invNetBase.erase(InvNetKey(0, r.key)) != 0) ++g_invNetNotHeld; return 0; }
     ::Inventory* inv = ItBoxInventory(b);
     if (inv == 0) { ++g_invNetUnreadable; return 0; }
@@ -29237,7 +32203,8 @@ int InvNetBoxStep(unsigned int now)
 void InvNetTick()
 {
     if (g_base == 0) return;
-    if (StoreTearingDown() != 0 || StorePlayerReachable(-1) == 0) { InvNetClearAll(); return; }   /* nobody to send to: the session link, or another player in the world through the world server */
+    if (StoreTearingDown() != 0) { InvNetClearAll(); return; }
+    if (StorePlayerReachable(-1) == 0) { InvNetClearAllButWaiting(); return; }   /* nobody to send to: the session link, or another player in the world through the world server; a box whose hand-back waits keeps its saved baseline */
     {   /* a player entering the world holds none of the inventories - every baseline goes, but only for an arrival this net can
            reach now; one it cannot reach yet is left unread and asked again next tick (two games: empty already at the link-up) */
         static long s_arrCursor = 0;
@@ -29245,7 +32212,7 @@ void InvNetTick()
         int to = -1;
         if (StoreArrivalsSince(-1, &peek, &to) > 0 && StorePlayerReachable(to) != 0)
         {
-            InvNetClearAll();
+            InvNetClearAllButWaiting();   /* a box whose hand-back waits keeps its saved baseline */
             StoreArrivalNoteServed(kArrServeInvNet);
             s_arrCursor = peek;
         }
@@ -29410,6 +32377,43 @@ void ItemsTick()
     ItLootAfterDrain();    /* loot2c fold (review 2f): the close retract runs after the drain, so a copy's leaving is seen first */
     ItParityAfterDrain();
     InvNetTick();          /* inv2a: the safety net - after the drain and the parity answers, so nothing it compares is still in flight */
+    ItOwnParkTick();       /* stolen marks waiting for their owner: this frame's fresh items parked, then the parked ones tried */
+}
+/* TEST-ONLY `boxdigest ... marks`: each item of a box, and each row of a pack in it, that carries a uniform, a crafter or a stolen mark,
+   with them - read-only, at most kDigestMarkLines lines a call */
+const long long kDigestMarkLines = 80;
+static std::string ItDigestMarkWords(const coopmark::OwnerId& o, const gearwire::GearMarks& g)
+{
+    std::string s = gearwire::GearWords(g) + " owner=";
+    if (o.kind == coopmark::kOwnNone) return s + "-";
+    return s + N((long long)o.kind) + ":" + N((long long)o.uid) + ":" + (o.factionSid.empty() ? std::string("-") : o.factionSid);
+}
+static void ItDigestMarkLines(const std::string& key, ::Inventory* inv, long long* lines)
+{
+    std::vector<cooppar::ParityItem> items;
+    if (ItParityContents(inv, &items) == 0)
+    {
+        if (*lines < kDigestMarkLines) { ++*lines; DebugLog("[PARITY] box key=" + key + " marks unreadable (an item would not read)"); }
+        return;
+    }
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        const cooppar::ParityItem& it = items[i];
+        if ((it.owner.kind != coopmark::kOwnNone || !gearwire::GearEmpty(it.gear)) && *lines < kDigestMarkLines)
+        {
+            ++*lines;
+            DebugLog("[PARITY] box key=" + key + " mark item " + N((long long)i) + " " + it.baseSid + " x" + N((long long)it.quantity) + " at " + it.section
+                     + ":" + N((long long)it.x) + "," + N((long long)it.y) + " " + ItDigestMarkWords(it.owner, it.gear));
+        }
+        for (size_t j = 0; j < it.bag.size(); ++j)
+        {
+            const coopbag::BagRow& r = it.bag[j];
+            if ((r.owner.kind == coopmark::kOwnNone && gearwire::GearEmpty(r.gear)) || *lines >= kDigestMarkLines) continue;
+            ++*lines;
+            DebugLog("[PARITY] box key=" + key + " mark row " + N((long long)i) + "." + N((long long)j) + " in " + it.baseSid + " " + r.baseSid + " x"
+                     + N((long long)r.qty) + " at " + r.section + ":" + N((long long)r.x) + "," + N((long long)r.y) + " " + ItDigestMarkWords(r.owner, r.gear));
+        }
+    }
 }
 /* `boxdigest [<x>,<y>|ring|all]` - read-only. MAIN THREAD (the command channel). */
 std::string BoxDigestCommand(const std::string& argIn)
@@ -29428,11 +32432,15 @@ std::string BoxDigestCommand(const std::string& argIn)
                  + " - TEST-ONLY: this game now counts the box as never received (P109 fold 1)");
         return "ok boxdigest forget received=" + N(r1) + " filledHere=" + N(r2) + " sectorMarked=" + N(marked);
     }
-    std::string arg;
-    const int withPlayers = joblever::BoxDigestPlayersSplit(argIn, &arg);   /* `players`: player-owned boxes too (kPbAll) - a machine's contents on both games */
+    std::string arg, argRest = argIn;
+    int withMarks = 0;   /* TEST-ONLY `marks`, the last word: each box's marked items printed (ItDigestMarkLines) */
+    long long markLines = 0;
+    if (argRest == "marks") { argRest.clear(); withMarks = 1; }
+    else if (argRest.size() > 6 && argRest.compare(argRest.size() - 6, 6, " marks") == 0) { argRest.erase(argRest.size() - 6); withMarks = 1; }
+    const int withPlayers = joblever::BoxDigestPlayersSplit(argRest, &arg);   /* `players`: player-owned boxes too (kPbAll) - a machine's contents on both games */
     if (arg == "ring") arg.clear();
     ItListWindow w;
-    if (ItListWindowOf(arg, &w) == 0) return "error boxdigest: usage boxdigest [<x>,<y>|ring|all] [players]";
+    if (ItListWindowOf(arg, &w) == 0) return "error boxdigest: usage boxdigest [<x>,<y>|ring|all] [players] [marks]";
     if (StoreTearingDown() != 0) return "error boxdigest: the engine is tearing the world down - try again";
     long long playerSkipped = 0, keyless = 0;
     g_furnTriedGen = -1;   /* the verb may build the registry even when this drain already tried */
@@ -29466,13 +32474,14 @@ std::string BoxDigestCommand(const std::string& argIn)
         }
         DebugLog("[PARITY] box key=" + std::string(g_parityRefs[r].key) + " items=" + N(c) + " digest=" + std::string(hex)
                  + (u > 0 ? " unread=" + N(u) : std::string()) + openTag);
+        if (withMarks != 0) ItDigestMarkLines(std::string(g_parityRefs[r].key), inv, &markLines);
     }
     const std::string tally = "total boxes=" + N(boxes) + " items=" + N(items) + " window=" + ItListWindowWords(w)
         + " flat=" + N(flat) + " furniture=" + N(furn) + " unreadItems=" + N(unread) + " unwalkable=" + N(unwalkable)
         + " withPlayers=" + N((long long)withPlayers) + " playerBoxesSkippedAll=" + N(playerSkipped) + " keylessAll=" + N(keyless)
         + " furnRows=" + N((long long)g_furnN) + " furnValid=" + N((long long)ItFurnValid())
         + " opened[equal,different,unanswered,holderHere]=" + N(openedEqual) + "," + N(openedDifferent) + "," + N(openedUnanswered) + "," + N(openedLocal)
-        + " openedAll=" + N((long long)g_parityOpened.size());
+        + " openedAll=" + N((long long)g_parityOpened.size()) + (withMarks != 0 ? " markLines=" + N(markLines) : std::string());
     DebugLog("[PARITY] boxdigest " + tally);
     return "ok boxdigest " + tally;
 }
@@ -29777,10 +32786,12 @@ std::string ItParity2Report()
         + N(g_fillCalls[kFillRefresh]) + "," + N(g_fillCalls[kFillBuilding]) + "," + N(g_fillCalls[kFillArtifacts]) + ","
         + N(g_fillOffMain) + "," + N(g_fillNested) + "," + N((long long)::InterlockedCompareExchange(&g_fillsActive, 0, 0)) + ","
         + N(g_fillNoTls) + "," + N(g_fillKeyless) + "," + N(g_fillDirtyFull) + "," + N((long long)g_fillDirty.size())
-        + " parityPush[items,noPeer,peerStale,heldBack,gone,player,unreadable,unowned,waitFill,gaveUp]="
+        + " parityPush[items,noPeer,peerStale,heldBack,gone,player,unreadable,unowned,waitFill,gaveUp,toAsker]="
         + N(g_parityPushItems) + "," + N(g_parityPushNoPeer) + "," + N(g_parityPushPeerStale) + "," + N(g_parityPushHeldBack) + ","
         + N(g_parityPushGone) + "," + N(g_parityPushPlayer) + "," + N(g_parityPushUnreadable) + "," + N(g_parityPushUnowned) + ","
-        + N(g_parityPushWaitFill) + "," + N(g_parityFillGaveUp)
+        + N(g_parityPushWaitFill) + "," + N(g_parityFillGaveUp) + "," + N(g_parityPushToAsker)
+        + " parityNoScratch[held,reasked,lost,gone]=" + N(g_parityNoScratchHeld) + "," + N(g_parityNoScratchReasked) + ","
+        + N(g_parityNoScratchLost) + "," + N(g_parityNoScratchGone)
         + " parityFillAsk[asked,sectorAskPendingToo]=" + N(g_parityFillAsked) + "," + N(g_parityFillAskCovered)
         /* review-parity2 nit: `calls` = refreshInventory calls the lever made through the gate, not restocks that happened */
         + " restockNow[armed,runs,counters,squads,calls,refusedNotHolder,noSquad,gaveUp]="
@@ -29857,6 +32868,37 @@ int KeeperPot(void* character, void** ownOut, int* catsOut)
     if (coop::SquadActivePlatoonOf((::Character*)character) == 0) return 0;
     return KeeperPotPod(character, ownOut, catsOut);
 }
+// PROBE-START: P133 - a [KEEPER] copy write that CHANGES a keeper group's money: once per group (the first change), and again whenever
+// it lands within 2 s of a restock that RAN on this game for that group - with the last restock outcome this game logged (T-755).
+// handoff.cpp's copy-pot pass calls it after its write. Reads and logs only.
+std::set<unsigned int> g_p133CopyFirst;
+void P133KeeperCopyWrite(unsigned int leader, int from, int to)
+{
+    if (from == to) return;
+    const unsigned long nowT = ::GetTickCount();
+    std::map<unsigned int, P133Last>::const_iterator it = g_p133Last.find(leader);
+    const int haveLast = (it != g_p133Last.end()) ? 1 : 0;
+    const unsigned long age = (haveLast != 0) ? (nowT - it->second.tick) : 0;
+    const int first = (g_p133CopyFirst.find(leader) == g_p133CopyFirst.end()) ? 1 : 0;
+    const int nearRestock = (haveLast != 0 && it->second.ran != 0 && age <= 2000) ? 1 : 0;
+    if (first == 0 && nearRestock == 0) return;
+    if (first != 0) g_p133CopyFirst.insert(leader);
+    if (P133CapOk(&g_p133CopyLines) == 0) return;
+    std::string last = "none-logged-here";
+    if (haveLast != 0)
+        last = std::string(it->second.outcome)
+               + " money=" + (it->second.haveBefore != 0 ? N((long long)it->second.before) : std::string("?")) + "->"
+               + (it->second.ran == 0 ? std::string("not run") : (it->second.haveAfter != 0 ? N((long long)it->second.after) : std::string("?")))
+               + " stock=" + P133StockWord(it->second.stockBefore) + "->"
+               + (it->second.ran == 0 ? std::string("not run") : P133StockWord(it->second.stockAfter))
+               + " " + N((long long)age) + " ms before";
+    DebugLog("[PROBE] P133 keeper-copy-write #" + N(g_p133CopyLines) + " leader=" + N((long long)leader)
+             + " money " + N((long long)from) + " -> " + N((long long)to)
+             + " why=" + std::string(first != 0 ? "first-change" : "within-2s-of-a-restock-here")
+             + (first != 0 && nearRestock != 0 ? std::string("+within-2s-of-a-restock-here") : std::string())
+             + " lastRestockHere=" + last);
+}
+// PROBE-END: P133
 /* F5: this game's priced requests in flight (g_pend rows with a trade) - the count, and with `pots` the squad pots their local
    engine moves predicted: a counter's keeper's (a box request) or the owner character's; one that resolves to no pot is counted
    in *unresolved (the caller then holds every copy write). */
@@ -30991,6 +34033,8 @@ void CapApplyRequest(unsigned int fromPeer, const std::vector<char>& pay)   /* O
             row.item.quality = fe.quality; row.item.charges = fe.charges;
             row.item.functionKind = fe.functionKind; row.item.level = fe.level; row.item.unique = fe.unique;
             row.item.quantity = w.qty > 0 ? w.qty : 1;
+            ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &row.item.owner);   /* the taken item's stolen mark rides the answer (OWN1) */
+            ItGearOf(fe, &row.item.gear);   /* its uniform and crafter (GEM1) */
             d.rows.push_back(row);
             CapKept kk; kk.item = (::Item*)k; kk.section = w.section; kk.x = w.x; kk.y = w.y; kk.row = (int)d.rows.size() - 1;
             kept.push_back(kk);
@@ -31253,6 +34297,7 @@ void CapApplyDone(const std::vector<char>& pay, unsigned int fromPeer, int fromB
         m.baseSid = ci.baseSid; m.companySid = ci.companySid; m.materialSid = ci.materialSid; m.colorSid = ci.colorSid;
         m.quality = ci.quality; m.charges = ci.charges; m.functionKind = ci.functionKind; m.level = ci.level; m.unique = ci.unique;
         m.quantity = ci.quantity > 0 ? ci.quantity : 1;
+        m.owner = ci.owner; m.gear = ci.gear;   /* the taken item's stolen mark, uniform and crafter, written by ItCreateItem */
         if (slaver == 0) { ++g_capSlaverGone; ++held; continue; }   /* not placed: the owner puts its object back */
         if (!linked) { ++held; continue; }
         ::Item* item = ItCreateItem(slaver, m, 1);
@@ -33859,7 +36904,7 @@ const char* GrActWhy(int a) { return a == 0 ? "Item::activate slot (vt +0x228) u
              : (g_applyCreateFailed != cf0) ? "create: no factory, no state record, or the factory's createItem gave no item" : "create: refused";
         return 0;
     }
-    if (bag != 0 && !bag->empty() && ItBagFill(item, bag, c, 1) == 0) { *why = "create: the pack would not fill"; ItDestroyPod(item, "coop inv5 ground: the pack would not fill"); return 0; }
+    if (bag != 0 && !bag->empty() && ItBagFill(item, bag, c, 1) == 0) { *why = "create: the pack would not fill"; ItOwnParkForget(item); ItDestroyPod(item, "coop inv5 ground: the pack would not fill"); return 0; }
     if (mm.owner.kind == 0) ++g_grOwnerUnset;   /* items9: a marked ground item now keeps its mark (ItCreateItem wrote it) */
     GrNameForgetAddr((void*)item);   /* a fresh object - a name row at its address named a freed one */
     return item;
@@ -34035,6 +37080,7 @@ int GrAddMsg(void* item, const std::string& key, int qty, ItemMoveMsg* out)
     m.idKind = coopgname::kIdName;   /* an ADD publishes the item's name */
     /* items9 (gap 2): the stolen mark lies on the ground with the item (OWN1 on the ADD). */
     ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &m.owner);
+    ItGearOf(fe, &m.gear);   /* the uniform and crafter lie on the ground with it (GEM1 on the ADD) */
     /* items9 (gap 3): a dropped pack's contents ride the ADD (BAG1), so the pack is not empty on the other game while it lies there.
        A pack whose contents cannot travel (nested pack, over the cap, unreadable) goes as before - without rows - and is counted. */
     {
@@ -34250,6 +37296,7 @@ unsigned int GrUnconfSend(GrUnconf& u, void* item, DWORD now, int* bagRows)
     put.baseSid = fe.baseSid; put.companySid = fe.companySid; put.materialSid = fe.materialSid; put.colorSid = fe.colorSid;
     put.quality = fe.quality; put.charges = fe.charges; put.functionKind = fe.functionKind; put.level = fe.level; put.unique = fe.unique;
     ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &put.owner);   /* items9 (gap 2): the PUT's OWN1 block */
+    ItGearOf(fe, &put.gear);   /* the PUT's uniform and crafter */
     int why = 0;
     if (ItBagRowsOf(item, &put.bag, &why) < 0)
     {   /* review-inv5p1 4: never PUT a pack EMPTY - it stays local-only */
@@ -34756,6 +37803,7 @@ int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
         mm.quality = cf.quality; mm.charges = cf.charges; mm.functionKind = cf.functionKind; mm.level = cf.level; mm.unique = cf.unique;
         mm.quantity = rest;
         if (cf.owner.kind != 0) mm.owner = cf.owner;
+        mm.gear = cf.gear;   /* the rest left lying keeps its uniform and crafter */
         const char* bwhy = "";
         ::Item* built = GrBuild(mm, 0, (::Character*)picker, &bwhy);
         if (built != 0 && havePos != 0 && GrActivatePod(built, kp) == 1)
@@ -34893,6 +37941,7 @@ int GroundNoteConfirm(const ItemConfirmMsg& cf)
         mm.quality = cf.quality; mm.charges = cf.charges; mm.functionKind = cf.functionKind; mm.level = cf.level; mm.unique = cf.unique;
         mm.quantity = cf.quantity > 0 ? cf.quantity : 1;
         if (cf.owner.kind != 0) mm.owner = cf.owner;   /* items9 (gap 2): picked up from the ground, still stolen */
+        mm.gear = cf.gear;   /* picked up from the ground with its uniform and crafter */
         const char* bwhy = "";
         ::Item* built = (picker != 0) ? GrBuild(mm, &cf.bag, (::Character*)picker, &bwhy) : 0;
         if (picker != 0 && built == 0) GrCreateSay("TAKE " + N((long long)cf.id) + " name=" + row.key + " sid=" + mm.baseSid + " granted but NOT built: " + bwhy);
@@ -35160,6 +38209,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         cf.quality = rfe.quality; cf.charges = rfe.charges; cf.functionKind = rfe.functionKind; cf.level = rfe.level; cf.unique = rfe.unique;
         cf.bag = rbag;
         ItOwnerTranslate(rfe.ownerRaw, rfe.ownerHave, &cf.owner);
+        ItGearOf(rfe, &cf.gear);   /* the ground item's uniform and crafter leave with it */
         GrClearPlayerMarks(&cf.owner, &cf.bag);   /* decision 396: a player's mark does not leave the ground with the item */
         const bool rcf = ItSendConfirm(cf);
         if (!rcf) ++g_reqConfirmSendFailed;
@@ -35204,6 +38254,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         mm.quality = r.quality; mm.charges = r.charges; mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = r.unique;
         mm.quantity = r.quantity > 0 ? r.quantity : 1;
         mm.owner = r.owner;   /* items9 (gap 2): the PUT's stolen mark stays on the holder's ground copy */
+        mm.gear = r.gear;   /* the PUT's uniform and crafter stay on the holder's ground copy */
         const char* why = "";
         ::Item* item = GrBuild(mm, &r.bag, 0, &why);
         const int act = (item != 0) ? GrActivatePod(item, pos) : 1;
@@ -35338,6 +38389,7 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     cf.quality = fe.quality; cf.charges = fe.charges; cf.functionKind = fe.functionKind; cf.level = fe.level; cf.unique = fe.unique;
     cf.bag = bag;
     ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &cf.owner);   /* items9 (gap 2): the TAKE answer's OWN1 block */
+    ItGearOf(fe, &cf.gear);   /* the TAKE answer's uniform and crafter (GEM1) */
     GrClearPlayerMarks(&cf.owner, &cf.bag);   /* decision 396: a player's mark does not leave the ground with the item */
     const bool gcf = ItSendConfirm(cf);
     if (!gcf) ++g_reqConfirmSendFailed;
@@ -36831,6 +39883,18 @@ std::string JobMachineWords(void* b)
     out += " sections=" + (inv != 0 ? ItSectionsWords(inv) : std::string("(no inventory)"));
     return out;
 }
+/* The building's production bar *(+0x448) and state +0x468 (farm.cpp MineBarReadPod) - read-only */
+std::string JobBarWords(void* b)
+{
+    float pg = 0.0f;
+    int st = -1;
+    const int r = MineBarReadPod(b, &pg, &st);
+    char h[96];
+    if (r == 1) _snprintf_s(h, sizeof(h), _TRUNCATE, " progress=%.3f state=%d", pg, st);
+    else if (r == 2) _snprintf_s(h, sizeof(h), _TRUNCATE, " progress=(no output record) state=%d", st);
+    else _snprintf_s(h, sizeof(h), _TRUNCATE, " progress=(unreadable) state=(unreadable)");
+    return std::string(h);
+}
 /* The first loaded building whose instance id or position key contains `needle` - boxtest's own match, in boxtest's walk order;
    with needInventory, only one that carries an inventory (so `jobtest input` names the building boxtest's path will fill). */
 void* JobFindBuilding(const std::string& needle, int needInventory, std::string* idOut, std::string* keyOut, long long* hitsOut)
@@ -36907,7 +39971,7 @@ std::string JobTestCommand(const std::string& arg)
     {
         void* b = JobFindBuilding(showKey, 0, &id, &key, &hits);
         const std::string line = "[JOB] jobtest show building='" + key + "' id='" + id + "' keyHits=" + N(hits)
-            + (b != 0 ? JobMachineWords(b) : std::string(" - no loaded building's position key or instance id contains '" + showKey + "'"));
+            + (b != 0 ? JobMachineWords(b) + JobBarWords(b) : std::string(" - no loaded building's position key or instance id contains '" + showKey + "'"));
         DebugLog(line);
         return (b != 0 ? "ok " : "error ") + line.substr(6);
     }

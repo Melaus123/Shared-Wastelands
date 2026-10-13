@@ -41,6 +41,12 @@ bool StatsApplyOwn(void* character, const unsigned int* raw44, int* rcOut);
 // Does nothing while EngineWritesBlocked() (load / teardown), counted statsTickBlocked.
 void StatsTick();
 
+// statstest (TEST-ONLY), MAIN THREAD (command channel). `squad <level>`: every character of this game's own squad
+// (OwnSquadUids) gets its skills, attributes, attack and defence set to level and the engine's recalculation run (the
+// copy apply's two calls); StatsTick sends the new values to the other games. One [STATS] line per member. `show <uid>`:
+// any character's main combat values here, read now.
+std::string StatsTestLever(const std::string& args);
+
 // The counters for the [P014] REPORT line, starting with a space.
 std::string StatsReportFields();
 

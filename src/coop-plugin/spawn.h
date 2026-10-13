@@ -69,6 +69,7 @@ int MirrorRefusalReasonForWire();        // the last refusal's reason, coopuid::
 void NotShownNoteSent(unsigned int uid, unsigned int ownerKey, bool sent);
 void NotShownOnNet(int decoded, unsigned int uid, int reason, unsigned int theirRefusals, unsigned int fromKey, bool uidMine);
 std::string MirrorTestCapLever(int cap);   // `mirrorcap <n>` - TEST-ONLY
+std::string BedHoldLever(const std::string& arg);   // `bedhold on|off` - TEST-ONLY
 
 ::Character* FindSpawned(unsigned int uid);
 // stale1 (review-stale1): the RAW object the registry holds for uid, 0 if none - no retired / plausibility test and never
@@ -428,6 +429,9 @@ std::string CageTestCommand(const std::string& arg);
 /* TEST LEVER `treattest <copyUid> <part|all> <bandage 0..1>`: raises the other game's character's copy's bandage values at the K2 safe
    point as a medic's work does; TreatTick then sends MSG_TREAT to the owner. [HEAL] treattest lines. */
 std::string TreatTestCommand(const std::string& arg);
+/* TEST LEVER `kitgive <ownUid> <itemSid> [n 1..5]`: n items made from the record sid are added to this game's own character at the K2
+   safe point through the engine's whole-inventory add. [HEAL] kitgive lines. */
+std::string KitGiveCommand(const std::string& arg);
 /* TEST LEVER `bailtest <copyUid>`: the bail confirm's own steps for one caged copy of another game's character at the K2 safe
    point (setSlaveState 0 inside the bail context, clearBounty with no faction, the walk-out order 0x85; no money taken), then the
    owner is told as after a real bail. [PRISON] bailtest lines. MAIN THREAD. */
@@ -457,6 +461,9 @@ void ApplyRemotePrison(const cooprison::PrisonMsg& m, unsigned int fromPeer);
 // a few seconds so the owner's next STATE, sent before it heard, does not erase them.
 void ApplyRemoteTreat(const cooptreat::TreatMsg& m, unsigned int fromPeer);
 void TreatNoteDropped();   // malformed, or arrived while the world is being rebuilt
+// The engine's per-part treatment step (hooked in medical.cpp) added `amount` to part `part`'s bandage on the copy `uid`, treated by
+// a medic that is not a copy. ANY THREAD (its own lock; a full table drops the amount and counts it). TreatTick sends it.
+void TreatNoteAdded(unsigned int uid, int part, float amount);
 // names1 - a copy carries its owner's character name (MSG_NAME, protocol 64). spawn.cpp "names1" block.
 void InstallNames();                                              // hook Character::setName 0x5CB840 (table "Character_rename")
 void NameTick();                                                  // MAIN THREAD: send the renames the hook marked
@@ -611,6 +618,10 @@ void SpawnUidBlocksForget();
 bool SpawnUidMintReady();   /* L3: can a uid be minted now? M4 fold 2 (L-B): a refusal is counted once per stretch of the same reason; every refused call in uidSweepTicksRefused */
 }
 namespace coop { void SpawnWorldTeardown(); }
+/* hire.cpp: a hired character's NEW squad under a stand-in faction gets the copy-squad id check (spawn.cpp; `active` =
+   Character::getSquad's answer, the squad's awake half). MAIN THREAD. */
+class Faction;
+namespace coop { void CopySquadIdCheckHired(::Faction* faction, void* active); }
 /* snap1 (user decision 2026-09-26): the `snapshot` verb's per-character engine facts. Every engine read is a guarded POD
    frame (spawn.cpp SnapCharFacts). MAIN THREAD. 1 = read (fields that would not read are flagged), 0 = not a live character. */
 namespace coop {
