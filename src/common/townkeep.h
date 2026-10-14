@@ -24,12 +24,17 @@
      no outposts, while that slot has rows on file, is taken only as the kEmptyWholeToClear-th SAY in a row on one link with no
      outposts and its town list read whole (EmptyWholeRun, EmptySayIgnored); the game marks no SAY whole before its player has been
      in the world it loaded for a while.
-   WIRE (little-endian, as every world-server message): u32 op (SAY 1 up, LIST 2 down), u32 flags, u32 count 0..kMaxTownsMsg,
+   - TEAMMATES SEE EACH OTHER'S OUTPOSTS ON THE MAP (SAID, down): the world server sends every game the outposts every player said
+     (player-towns.txt, without their keys) at its link's first AREAS report and again on every change to that file. Each game keeps
+     the rows of its own teammates (MateRows; the team table it already holds) and takes or founds, for each, a town of that player's
+     faction here at its centre, marked discovered, so a teammate's base is on this player's map (build.cpp BdTeamTownsTick). The
+     filter is the game's: a team change shows or stops showing an outpost with no word from the world server.
+   WIRE (little-endian, as every world-server message): u32 op (SAY 1 up, LIST 2 down, SAID 3 down), u32 flags, u32 count 0..kMaxTownsMsg,
    count x TOWN
-     flags LIST: 1 = the list starts again with this message (0 or 1). SAY: kSayFirst (this message starts a SAY), kSayMore (more
+     flags LIST and SAID: 1 = the list starts again with this message (0 or 1). SAY: kSayFirst (this message starts a SAY), kSayMore (more
            messages of this SAY follow), kSayWhole (the game read its whole town list); a SAY that would pass kTownsMsgBytes is
            split between its rows (EncodeTownsSay)
-     TOWN  i32 owner slot (SAY: -1, the sender), 5 x i32 handle words, f32 x, f32 y (height), f32 z, str name (0..128 bytes, no control
+     TOWN  i32 owner slot (SAY: -1, the sender; SAID: the outpost's player), 5 x i32 handle words, f32 x, f32 y (height), f32 z, str name (0..128 bytes, no control
            characters), u32 keys 0..kMaxTownKeys (with kKeysCut set: the outpost has pieces the list does not name), keys x str
            (1..47 bytes, each once)
      str = u32 length, the bytes.
@@ -50,7 +55,7 @@
 namespace townkeep {
 
 const unsigned kMsgTowns = 70;
-const unsigned kOpSay = 1, kOpList = 2;
+const unsigned kOpSay = 1, kOpList = 2, kOpSaid = 3;   /* SAID: every player's said outposts, down, for teammates' map markers */
 const size_t kMaxTownsMsg = 32;        /* outposts in one TOWNS */
 const size_t kMaxTownsPerSlot = 32;    /* outposts one player's SAY is kept with */
 const size_t kMaxTownKeys = 512;       /* kept pieces one outpost row names */
@@ -63,6 +68,8 @@ const int kTownsFormat = 2;   /* the outpost list files' format this build write
 const int kTownsFormatKeyless = 1;   /* the format before it (no cut field): still read */
 const unsigned kSayFirst = 1, kSayMore = 2, kSayWhole = 4;   /* a SAY's flags word */
 const unsigned kKeysCut = 0x80000000u;   /* on a TOWN's key count: the outpost has pieces its list does not name */
+const unsigned kStageShift = 24;         /* on a TOWN's key count, bits 24-30: the outpost's map size stage (TownRow::stage) */
+const int kStageMax = 3;                 /* Town+0x388: 0 none, 1 Village, 2 Outpost, 3 Town (the engine's own player-town icon) */
 const size_t kTownsMsgBytes = 60000;   /* one TOWNS message at most: under the world-server road's 64 KiB (liveenvelope.h kLiveInnerMax) with room for its headers */
 const float kTownSameRadius = 50.0f;    /* Guess: a town of the owner's faction whose centre is this close (x, z) to a kept outpost's centre is that outpost */
 
@@ -74,7 +81,9 @@ struct TownRow
     std::string name;
     std::vector<std::string> keys;   /* SAY and player-towns.txt: the pieces linked to the outpost; LIST and kept-towns.txt: its kept pieces */
     int cut;                         /* 1 = the outpost has pieces keys does not name (its game's list was cut, or not every piece could be read) */
-    TownRow() : owner(-1), cut(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; }
+    int stage;                       /* SAY and SAID: the outpost's map size stage as its owner's game counts it (0..kStageMax), so a teammate's map shows
+                                        the icon the owner sees; 0 in LIST and in both files */
+    TownRow() : owner(-1), cut(0), stage(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; }
 };
 
 inline bool HandSame(const int* a, const int* b) { for (int i = 0; i < 5; ++i) if (a[i] != b[i]) return false; return true; }
@@ -85,14 +94,14 @@ inline std::string NameFit(const std::string& s)
     for (size_t i = 0; i < o.size(); ++i) { const unsigned char c = (unsigned char)o[i]; if (c < 0x20 || c == 0x7F) o[i] = '?'; }
     return o;
 }
-/* a row the op may carry: SAY - owner -1; LIST (and both files) - a real owner slot; at most kMaxTownKeys keys, cut 0 or 1, every float
+/* a row the op may carry: SAY - owner -1; LIST, SAID (and both files) - a real owner slot; at most kMaxTownKeys keys, cut 0 or 1, every float
    in range, the name and each key valid, no key twice */
 inline bool RowOk(const TownRow& t, unsigned op)
 {
     if (op == kOpSay) { if (t.owner != -1) return false; }
-    else if (op == kOpList) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
+    else if (op == kOpList || op == kOpSaid) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
     else return false;
-    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1)) return false;
+    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.stage < 0 || t.stage > kStageMax) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(t.pos[j])) return false;
     if (!keptwire::TextOk(t.name, keptwire::kStrMax, true)) return false;
     std::set<std::string> seen;
@@ -101,7 +110,7 @@ inline bool RowOk(const TownRow& t, unsigned op)
 }
 
 /* ---- the wire ---- */
-/* the flags word: LIST 0 or 1; SAY any of kSayFirst, kSayMore, kSayWhole */
+/* the flags word: LIST and SAID 0 or 1; SAY any of kSayFirst, kSayMore, kSayWhole */
 inline bool FlagsOk(unsigned op, unsigned f) { return op == kOpSay ? (f & ~(kSayFirst | kSayMore | kSayWhole)) == 0 : f <= 1; }
 struct TkReader
 {
@@ -122,11 +131,11 @@ struct TkReader
     }
     bool Done() const { return !bad && at == n; }
 };
-/* SAY or LIST: 0..kMaxTownsMsg rows, every one valid for the op (nothing written for a refused one) */
+/* SAY, LIST or SAID: 0..kMaxTownsMsg rows, every one valid for the op (nothing written for a refused one) */
 inline bool EncodeTowns(std::vector<char>* out, unsigned op, int first, const std::vector<TownRow>& rows)
 {
     out->clear();
-    if ((op != kOpSay && op != kOpList) || first < 0 || !FlagsOk(op, (unsigned)first) || rows.size() > kMaxTownsMsg) return false;
+    if ((op != kOpSay && op != kOpList && op != kOpSaid) || first < 0 || !FlagsOk(op, (unsigned)first) || rows.size() > kMaxTownsMsg) return false;
     keptwire::PutU32(out, op); keptwire::PutU32(out, (unsigned)first); keptwire::PutU32(out, (unsigned)rows.size());
     for (size_t i = 0; i < rows.size(); ++i)
     {
@@ -136,7 +145,7 @@ inline bool EncodeTowns(std::vector<char>* out, unsigned op, int first, const st
         for (int j = 0; j < 5; ++j) keptwire::PutI32(out, t.hand[j]);
         for (int j = 0; j < 3; ++j) keptwire::PutF32(out, t.pos[j]);
         keptwire::PutStr(out, t.name);
-        keptwire::PutU32(out, (unsigned)t.keys.size() | (t.cut != 0 ? kKeysCut : 0u));
+        keptwire::PutU32(out, (unsigned)t.keys.size() | (t.cut != 0 ? kKeysCut : 0u) | ((unsigned)t.stage << kStageShift));
         for (size_t k = 0; k < t.keys.size(); ++k) keptwire::PutStr(out, t.keys[k]);
     }
     return true;
@@ -147,7 +156,7 @@ inline int DecodeTowns(const char* p, size_t n, unsigned* op, int* first, std::v
     rows->clear(); *op = 0; *first = 0;
     TkReader r(p, n);
     const unsigned o = r.U32(), f = r.U32(), c = r.U32();
-    if (r.bad || (o != kOpSay && o != kOpList) || !FlagsOk(o, f) || c > kMaxTownsMsg) return 0;
+    if (r.bad || (o != kOpSay && o != kOpList && o != kOpSaid) || !FlagsOk(o, f) || c > kMaxTownsMsg) return 0;
     std::vector<TownRow> v;
     for (unsigned i = 0; i < c; ++i)
     {
@@ -156,8 +165,9 @@ inline int DecodeTowns(const char* p, size_t n, unsigned* op, int* first, std::v
         for (int j = 0; j < 5; ++j) t.hand[j] = r.I32();
         for (int j = 0; j < 3; ++j) t.pos[j] = r.F32();
         t.name = r.Str(keptwire::kStrMax, true);
-        const unsigned nkw = r.U32(), nk = nkw & ~kKeysCut;
+        const unsigned nkw = r.U32(), nk = nkw & ((1u << kStageShift) - 1u);
         t.cut = (nkw & kKeysCut) != 0 ? 1 : 0;
+        t.stage = (int)((nkw & ~kKeysCut) >> kStageShift);   /* above kStageMax: RowOk refuses the row */
         if (r.bad || nk > kMaxTownKeys || (size_t)nk > (r.n - r.at) / 5) return 0;   /* a key takes 5 bytes at least */
         for (unsigned k = 0; k < nk && !r.bad; ++k) t.keys.push_back(r.Str(keptwire::kKeyMax, false));
         if (r.bad || !RowOk(t, o)) return 0;
@@ -365,6 +375,34 @@ private:
 };
 /* a town standing at (livePos) is the kept outpost t (its faction is checked by the caller) */
 inline int TownStands(const float* livePos, const TownRow& t) { return keptwire::NearXZ(livePos[0], livePos[2], t.pos[0], t.pos[2], kTownSameRadius); }
+/* SAID: the said outposts as the map needs them - keys dropped (a marker needs a name and a centre; a key list is up to kMaxTownKeys
+   strings), cut cleared, every row valid for SAID (one that is not is left out) */
+inline std::vector<TownRow> SaidForMap(const std::vector<TownRow>& said)
+{
+    std::vector<TownRow> o;
+    for (size_t i = 0; i < said.size(); ++i)
+    {
+        TownRow t(said[i]);
+        t.keys.clear(); t.cut = 0;
+        if (RowOk(t, kOpSaid)) o.push_back(t);
+    }
+    return o;
+}
+/* the SAID rows this game shows: those whose player is one of its teammates - never its own (its own outposts are its own towns),
+   never a slot that is not on its team */
+inline std::vector<size_t> MateRows(const std::vector<TownRow>& said, const std::vector<int>& mates, int mySlot)
+{
+    std::vector<size_t> o;
+    if (mySlot < 0) return o;
+    for (size_t i = 0; i < said.size(); ++i)
+        if (said[i].owner != mySlot && std::find(mates.begin(), mates.end(), said[i].owner) != mates.end()) o.push_back(i);
+    return o;
+}
+/* a SAID row's name in this game: the same outpost the same text on every look (its player, its centre to a unit, its name) */
+inline std::string SaidKey(const TownRow& t)
+{
+    return zonekeep::ZkNum(t.owner) + "|" + zonekeep::ZkNum((int)t.pos[0]) + "|" + zonekeep::ZkNum((int)t.pos[2]) + "|" + t.name;
+}
 /* A SAY from `slot` (whole: its game read its whole town list): that slot's rows become the said ones (owner set to the slot, at most
    kMaxTownsPerSlot). A said row is the slot's row on file whose centre it stands at (TownStands) or that names one of its pieces
    (TownKeysSame); a said row whose list is cut takes that row's keys it does not name (up to kMaxTownKeys), so keys the game could

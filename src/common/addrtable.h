@@ -60,7 +60,7 @@ enum AddrKind
 
 const int kAddrNameMax  = 48;   /* including the terminator */
 const int kAddrBytesMax = 16;
-const int kAddrMaxEntries = 512;
+const int kAddrMaxEntries = 1024;   /* 509 rows on 2026-10-13 and growing: 512 left three rows of room */
 
 struct AddrEntry
 {
