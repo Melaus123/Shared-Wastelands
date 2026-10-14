@@ -44,7 +44,7 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 96;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 97;   /* the world-server protocol that carries OWED */
 
 const unsigned kKindResidents = 1, kKindBar = 2;
 const unsigned kOpAdd = 1, kOpClaim = 2, kOpRelease = 3, kOpDone = 4, kOpRows = 5, kOpGone = 6;

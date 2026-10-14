@@ -111,8 +111,12 @@ const unsigned kMaxSides = 256;           // recorded sides in one team / one RE
 const float kRecLow = -100.0f, kRecHigh = 100.0f;   // the engine's standing scale
 
 enum { kUpInvite = 1, kUpAnswer = 2, kUpLeave = 3, kUpRemove = 4, kUpDisband = 5, kUpRestoreDone = 6, kUpAsk = 7,
-       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12 };
-enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25 };
+       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpWork = 13 };
+enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnWork = 26 };
+/* WORK: research work a member's characters did at a teammate's research bench, for that teammate's research (up: the bench owner's
+   slot and the amount; down: the worker's slot and the amount). The world server passes it to the owner's game when both are in one
+   team and the owner is connected; the owner's game adds it to its current research. Amounts above kMaxWork are refused. */
+const float kMaxWork = 100000.0f;
 const unsigned kMaxTechs = 4096;          // techs in a team's research and in one RESEARCH message
 /* results: 0 = done; every other number is the reason a request was refused */
 enum { kOk = 0, kRefNotOnline = 1, kRefInTeam = 2, kRefNotFounder = 3, kRefSelf = 4, kRefInvitePending = 5, kRefNoInvite = 6,
@@ -862,7 +866,7 @@ struct Up
     std::vector<char> snap;
     TeamRec rec;                     // SEED
     std::vector<Delta> deltas;       // DELTA
-    float rel; unsigned flags;       // STANCE / SIDE (with slot)
+    float rel; unsigned flags;       // STANCE / SIDE (with slot); WORK: rel = the amount, slot = the bench owner
     unsigned whole;                  // RESEARCH: 1 = this game's whole finished list, 0 = techs its own player finished now
     std::vector<std::string> techs;  // RESEARCH
     Up() : kind(0), slot(0), accept(0), snapRows(0), no(0), rel(0.0f), flags(0), whole(0) {}
@@ -914,6 +918,9 @@ inline bool EncodeResearchUp(std::vector<char>* b, bool whole, const std::vector
     PutU8(b, kUpResearch); PutU8(b, whole ? 1u : 0u); PutTechs(b, techs);
     return true;
 }
+/* false = an amount that is not above 0 and at most kMaxWork (NaN included; nothing is encoded) */
+inline bool EncodeWork(std::vector<char>* b, unsigned toSlot, float amount)
+{ b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kUpWork); PutU32(b, toSlot); PutF32(b, amount); return true; }
 /* false = not an up message this header knows, or malformed (trailing bytes included) */
 inline bool DecodeUp(const char* p, size_t n, Up* u)
 {
@@ -940,6 +947,7 @@ inline bool DecodeUp(const char* p, size_t n, Up* u)
     }
     else if (u->kind == kUpStance || u->kind == kUpSide) { u->slot = GetU32(&c); u->rel = GetF32(&c); u->flags = GetU32(&c); }
     else if (u->kind == kUpResearch) { u->whole = GetU8(&c); if (u->whole > 1) c.bad = true; GetTechs(&c, &u->techs); }
+    else if (u->kind == kUpWork) { u->slot = GetU32(&c); u->rel = GetF32(&c); if (!(u->rel > 0.0f && u->rel <= kMaxWork)) c.bad = true; }
     else if (u->kind != kUpLeave && u->kind != kUpDisband && u->kind != kUpAsk) return false;
     return !c.bad && c.at == n;
 }
@@ -965,7 +973,8 @@ struct Down
     unsigned recTeam; TeamRec rec;                       // RECORD
     unsigned resTeam, resWhole, resBy;                   // RESEARCH (resBy: the game a reply answers, or the finisher of an OWN tech; 0xFFFFFFFF = for all)
     std::vector<std::string> techs;                      // RESEARCH
-    Down() : recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
+    float work;                                          // WORK (fromSlot: the worker)
+    Down() : work(0.0f), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
 };
 /* the table as the games see it: profile ids turned into slots (slotOf: profile id -> slot; a player with no slot is skipped) */
 inline std::vector<WireTeam> ToWire(const Book& b, const std::map<std::string, unsigned>& slotOf)
@@ -1013,6 +1022,8 @@ inline bool EncodeResearchDown(std::vector<char>* b, unsigned team, bool whole, 
     PutU8(b, kDnResearch); PutU32(b, team); PutU8(b, whole ? 1u : 0u); PutU32(b, bySlot); PutTechs(b, techs);
     return true;
 }
+inline bool EncodeWorkDown(std::vector<char>* b, unsigned fromSlot, float amount)
+{ b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kDnWork); PutU32(b, fromSlot); PutF32(b, amount); return true; }
 inline bool DecodeDown(const char* p, size_t n, Down* d)
 {
     if (d == 0) return false;
@@ -1047,6 +1058,7 @@ inline bool DecodeDown(const char* p, size_t n, Down* d)
         if (!c.bad && !DecodeRec(blob, &d->rec)) c.bad = true;
     }
     else if (d->kind == kDnResearch) { d->resTeam = GetU32(&c); d->resWhole = GetU8(&c); d->resBy = GetU32(&c); if (d->resWhole > 1) c.bad = true; GetTechs(&c, &d->techs); }
+    else if (d->kind == kDnWork) { d->fromSlot = GetU32(&c); d->work = GetF32(&c); if (!(d->work > 0.0f && d->work <= kMaxWork)) c.bad = true; }
     else return false;
     return !c.bad && c.at == n;
 }

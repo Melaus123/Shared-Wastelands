@@ -97,6 +97,7 @@
 #include "../common/buildwire.h"   /* build1-b: the MSG_BUILD payload */
 #include "../common/keptwire.h"    /* KEPT: the players' kept pieces laid back into a reset world (and zonekeep.h) */
 #include "../common/townkeep.h"    /* TOWNS: the players' outposts carried into a reset world */
+#include "../common/teamwire.h"    /* TEAMMAP: kMaxWork - research work at the host's bench (WORK) */
 #include "../common/boxowner.h"    /* WorldNodeOf - a world resource node is nobody's piece */
 #include "../common/slotwire.h"    /* P18 fold 2: StandInSlotOfId / IsLegacyPeerId - a saved owner id read as a stand-in record */
 #include "../common/boxowner.h"    /* build1h: HouseOwnerOfNewPiece */
@@ -8923,6 +8924,7 @@ long g_saidRowsGen = -1;                        /* KeptWorldGen() when g_saidRow
 std::map<std::string, void*> g_saidLive;        /* SaidKey -> the town standing for it here when last looked (a log hint: each look walks the list again) */
 std::set<std::string> g_saidFailed;             /* SaidKey whose founding failed in this world: not tried again */
 std::set<void*> g_saidMarked;                   /* the towns this game marked discovered in this world (once each) */
+std::set<std::string> g_saidOverlapLogged;      /* teammates' outposts already logged as inside a town of this player's (host town overrides) */
 std::set<std::string> g_saidWaitLogged;         /* SaidKey whose wait for its area to load here was logged (once each) */
 DWORD g_saidLookAt = 0;
 long long g_saidIn = 0, g_saidFounded = 0, g_saidStanding = 0, g_saidMarkedN = 0, g_saidFoundFail = 0, g_saidWaitNotLoaded = 0;
@@ -9979,7 +9981,7 @@ void BdKeptRow(const keptwire::Row& w, int mySlot)
 long g_keptWorldSeen = 0;
 void BdKeptDropTable(const char* why)
 {
-    g_saidLive.clear(); g_saidMarked.clear(); g_saidFailed.clear(); g_saidWaitLogged.clear();   /* SAID: the towns of the world that goes (its rows stay unless they are another world's) */
+    g_saidLive.clear(); g_saidMarked.clear(); g_saidFailed.clear(); g_saidWaitLogged.clear(); g_saidOverlapLogged.clear();   /* SAID: the towns of the world that goes (its rows stay unless they are another world's) */
     if (!g_saidRows.empty() && g_saidRowsGen != KeptWorldGen()) g_saidRows.clear();
     if (!g_kept.empty())
     {
@@ -10152,7 +10154,10 @@ const size_t kTeamMapMates = 8;
 static void* g_mateFac[kTeamMapMates];      /* the teammates' factions here, refreshed every kTeamMapLookMs; only the main thread reads or writes it */
 static size_t g_mateFacN = 0;
 static DWORD g_mateFacAt = 0;
+static void* g_hostFac = 0;          /* the host's faction (slot 0) when the host is a teammate of this player, else 0 */
 const DWORD kTeamMapLookMs = 1000;
+const int kTeamHostSlot = 0;          /* the world's host: its town wins where teammates' towns overlap (Mass, 2026-10-14: "the host town should always override") */
+const float kTeamTownOverlap = 500.0f;   /* Guess: a teammate's outpost centre this close (x, z) to a town of this player's is the same base */
 static long long g_teamBlue = 0, g_teamIcon = 0, g_teamStageRuns = 0;
 static int g_hkMarkerColour = 0, g_hkTownIcon = 0;
 typedef const void* (*BdMarkerColourFn)(void* obj);
@@ -10183,6 +10188,7 @@ bool BdIsMateFaction(void* f)
     for (size_t i = 0; i < g_mateFacN; ++i) if (g_mateFac[i] == f) return true;
     return false;
 }
+void BdTeamWorkFlush(DWORD now);   /* TEAMMAP: the research work gathered at the host's benches, sent (defined below) */
 /* MAIN THREAD, every drain: the teammates' factions as this game holds them (a stand-in each), none outside a team */
 void BdTeamMapTick()
 {
@@ -10191,12 +10197,15 @@ void BdTeamMapTick()
     g_mateFacAt = now;
     const std::vector<int> mates = TeamMatesOfMine();
     size_t n = 0;
+    void* host = 0;
     for (size_t i = 0; i < mates.size() && n < kTeamMapMates; ++i)
     {
         ::Faction* f = OwnerFactionForSlot(mates[i], false);
-        if (f != 0 && !IsPlayerFaction(f)) g_mateFac[n++] = (void*)f;
+        if (f != 0 && !IsPlayerFaction(f)) { g_mateFac[n++] = (void*)f; if (mates[i] == kTeamHostSlot) host = (void*)f; }
     }
     g_mateFacN = n;
+    g_hostFac = host;
+    BdTeamWorkFlush(now);
 }
 const void* detour_markercolour(void* obj)
 {
@@ -10281,10 +10290,76 @@ int BdTeamResearchPod(void* bench, float work, uintptr_t base, float* amount, in
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* WORK AT THE HOST'S BENCH GOES TO THE HOST'S RESEARCH (teamwire.h WORK). At a bench of the host's faction this game counts nothing
+   itself: the amount (the same rate x efficiency x work) is gathered and sent once a second to the world server, which passes it to
+   the host's game, and the host's game adds it to its current research (TeamWorkArrived) - the bench's research bar moves where the
+   bench is. At any other teammate's bench the work is this player's own research, as above. */
+static float g_workOwed = 0.0f;
+static DWORD g_workSentAt = 0;
+static long long g_workSends = 0, g_workSendFails = 0, g_workArrived = 0, g_workApplyFaults = 0;
+const DWORD kWorkSendMs = 1000;
+int BdBenchWorkAmountPod(void* bench, float work, float* amount)
+{
+    __try
+    {
+        if (*((const unsigned char*)bench + 0x160) == 0) return 0;
+        void** vt = *(void***)bench;
+        *amount = ((BdBenchFloatFn)vt[0x3C0 / 8])(bench) * ((BdBenchFloatFn)vt[0x368 / 8])(bench) * work;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdResearchAddPod(uintptr_t base, float amount)
+{
+    __try
+    {
+        void* pi = *(void**)(base + (uintptr_t)kBdResPiRva);
+        void* research = pi != 0 ? *(void**)((char*)pi + 0x38) : 0;
+        if (research == 0) return 0;
+        ((BdResAddFn)(base + (uintptr_t)kBdResAddRva))(research, amount);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* MAIN THREAD (BdTeamMapTick): the work gathered at the host's benches, sent at most once a kWorkSendMs */
+void BdTeamWorkFlush(DWORD now)
+{
+    if (g_workOwed <= 0.0f || (g_workSentAt != 0 && now - g_workSentAt < kWorkSendMs)) return;
+    g_workSentAt = now;
+    const float send = g_workOwed > swteam::kMaxWork ? swteam::kMaxWork : g_workOwed;
+    if (!TeamWorkSend((unsigned)kTeamHostSlot, send)) { if (++g_workSendFails <= 3) DebugLog("[TEAMMAP] research work at the host's bench NOT sent (no link, or an amount out of range) - kept and tried again"); return; }
+    g_workOwed -= send;
+    if (++g_workSends <= 3 || g_workSends % 300 == 0)
+    {
+        char line[200];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research work %.4f at the host's bench sent for the host's research (sends=%lld)", send, g_workSends);
+        DebugLog(std::string(line));
+    }
+}
+void TeamWorkArrived(unsigned fromSlot, float amount)
+{
+    if (kBdResAddRva == 0 || kBdResPiRva == 0) return;
+    const int r = BdResearchAddPod((uintptr_t)::GetModuleHandleA(0), amount);
+    if (r == -1) { if (++g_workApplyFaults <= 3) ErrorLog("[TEAMMAP] research work from a teammate FAULTED - not added"); return; }
+    if (r == 1 && (++g_workArrived <= 3 || g_workArrived % 300 == 0))
+    {
+        char line[200];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research work %.4f from teammate slot %u at this player's bench added to this player's research (arrived=%lld)", amount, fromSlot, g_workArrived);
+        DebugLog(std::string(line));
+    }
+}
 void detour_reswork(void* bench, void* worker, float work)
 {
     orig_reswork(bench, worker, work);
-    if (g_mateFacN == 0 || bench == 0 || kBdResAddRva == 0 || kBdResPiRva == 0 || !BdIsMateFaction(BdOwnerFactionPod(bench))) return;
+    if (g_mateFacN == 0 || bench == 0 || kBdResAddRva == 0 || kBdResPiRva == 0) return;
+    void* owner = BdOwnerFactionPod(bench);
+    if (owner != 0 && owner == g_hostFac)
+    {
+        float a = 0.0f;
+        if (BdBenchWorkAmountPod(bench, work, &a) == 1 && a > 0.0f) g_workOwed += a;
+        return;
+    }
+    if (!BdIsMateFaction(owner)) return;
     float amount = 0.0f; int level = 0;
     const int r = BdTeamResearchPod(bench, work, (uintptr_t)::GetModuleHandleA(0), &amount, &level);
     if (r == 1 && ++g_teamResearchTicks == 1)
@@ -10295,18 +10370,62 @@ void detour_reswork(void* bench, void* worker, float work)
     }
     else if (r == -1 && ++g_teamResearchFaults == 1) ErrorLog("[TEAMMAP] research at a teammate's bench FAULTED - not counted");
 }
+/* A PIECE BUILT IN A TEAMMATE'S TOWN JOINS THAT TOWN (main thread). After a placement the engine gives the new pieces a town (0x4DB180
+   on 1.0.68): the player town the preview kept, else the nearest player town within its radius (TownList's nearest player town,
+   0x927E40: a town whose faction has a PlayerInterface), else it founds a new outpost, "Your Outpost". A teammate's town is never a
+   player town here, so a piece built in it founded an outpost of this player's own on top of the teammate's. While that step runs and
+   the engine finds no player town, the nearest town of a teammate's faction within the same radius is answered instead, and the piece
+   joins the teammate's town (it stays this player's piece). */
+static unsigned long long kBdPieceTownRva = 0;   static AddrReg kBdPieceTownRva_reg("PlacementPieceTown", &kBdPieceTownRva);       /* 1.0.68 0x4DB180 */
+static unsigned long long kBdPlayerTownRva = 0;  static AddrReg kBdPlayerTownRva_reg("TownListNearestPlayer", &kBdPlayerTownRva); /* 1.0.68 0x927E40 */
+typedef void (*BdPieceTownFn)(void* placement);
+static BdPieceTownFn orig_piecetown = 0;
+typedef void* (*BdPlayerTownFn)(void* list, void* pos, char flag, float radius);
+static BdPlayerTownFn orig_playertown = 0;
+static int g_inPieceTown = 0;
+static long long g_teamPiecesJoined = 0;
+static int g_hkPieceTown = 0, g_hkPlayerTown = 0;
+void detour_piecetown(void* placement)
+{
+    ++g_inPieceTown;
+    orig_piecetown(placement);
+    --g_inPieceTown;
+}
+int BdTownXZPod(void* town, float* x, float* z)
+{
+    __try { *x = *(const float*)((const char*)town + 0x48); *z = *(const float*)((const char*)town + 0x50); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void* detour_playertown(void* list, void* pos, char flag, float radius)
+{
+    void* t = orig_playertown(list, pos, flag, radius);
+    if (g_inPieceTown == 0 || g_mateFacN == 0 || orig_townnearest == 0 || pos == 0) return t;
+    /* the host's town within the radius wins over this player's own (the host town overrides); a teammate's only where none is ours */
+    void* m = (g_hostFac != 0) ? orig_townnearest(list, pos, g_hostFac, 0, 0, 10) : 0;   /* the host's nearest town, any type (10 = any) */
+    if (m == 0 && t == 0) m = orig_townnearest(list, pos, 0, 0, 0, 10);                 /* else the nearest town of any faction */
+    if (m == 0 || !BdIsMateFaction(BdOwnerFactionPod(m))) return t;
+    float tx = 0.0f, tz = 0.0f;
+    if (BdTownXZPod(m, &tx, &tz) == 0) return t;
+    const float dx = tx - ((const float*)pos)[0], dz = tz - ((const float*)pos)[2];
+    if (dx * dx + dz * dz >= radius * radius) return t;
+    if (++g_teamPiecesJoined == 1) DebugLog("[TEAMMAP] a piece built in a teammate's town joins that town instead of founding an outpost of this player's (the first; later ones are counted)");
+    return m;
+}
 void InstallTeamMap()
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     g_hkMarkerColour = (kBdMarkerPlayerRva == 0) ? -2 : BdHook(base, kBdMarkerColourRva, (void*)&detour_markercolour, (void**)&orig_markercolour);
     g_hkTownIcon = BdHook(base, kBdTownIconRva, (void*)&detour_townicon, (void**)&orig_townicon);
     g_hkTownNearest = BdHook(base, kBdTownNearestRva, (void*)&detour_townnearest, (void**)&orig_townnearest);
+    g_hkPlayerTown = (g_hkTownNearest == 1) ? BdHook(base, kBdPlayerTownRva, (void*)&detour_playertown, (void**)&orig_playertown) : -3;
+    g_hkPieceTown = (g_hkPlayerTown == 1) ? BdHook(base, kBdPieceTownRva, (void*)&detour_piecetown, (void**)&orig_piecetown) : -3;
     g_hkResWork = (kBdResAddRva == 0 || kBdResPiRva == 0) ? -2 : BdHook(base, kBdResWorkRva, (void*)&detour_reswork, (void**)&orig_reswork);
     g_hkPreviewCheck = (g_hkTownNearest == 1) ? BdHook(base, kBdPreviewCheckRva, (void*)&detour_previewcheck, (void**)&orig_previewcheck) : -3;
     const std::string msg = std::string("[TEAMMAP] teammates drawn as one's own on the map: marker colour hook ") + HkWord(g_hkMarkerColour)
         + ", town icon hook " + HkWord(g_hkTownIcon) + ", build-in-teammate's-town hooks " + HkWord(g_hkTownNearest) + " / "
-        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
-    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && g_hkResWork == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
+        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork)
+        + ", join-teammate's-town hooks " + (g_hkPlayerTown == -3 ? "skipped" : HkWord(g_hkPlayerTown)) + " / " + (g_hkPieceTown == -3 ? "skipped" : HkWord(g_hkPieceTown)) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
+    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && g_hkResWork == 1 && g_hkPlayerTown == 1 && g_hkPieceTown == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
 }
 /* MAIN THREAD (BdTeamTownsTick): a teammate's town here takes the stage its owner's game said (TownRow::stage, that game's own count of its
    base), so this map shows the icon the owner's map shows; a change is logged. Counting here instead would count this player's allies. */
@@ -10363,6 +10482,20 @@ void BdTeamTownsForget(const std::set<std::string>& keys, const std::set<void*>&
         if (d == 1) DebugLog(std::string(line)); else ErrorLog(line);
     }
 }
+/* a point (x, z) within kTeamTownOverlap of a town of this player's own faction among the walked towns */
+bool BdNearOwnTown(void* const* towns, int n, float x, float z)
+{
+    void* mine = (void*)LocalPlayerFaction();
+    if (mine == 0) return false;
+    for (int i = 0; i < n; ++i)
+    {
+        float lp[3]; int h[5]; void* f = 0;
+        if (BdTownReadPod(towns[i], lp, h, &f) == 0 || f != mine) continue;
+        const float dx = lp[0] - x, dz = lp[2] - z;
+        if (dx * dx + dz * dz < kTeamTownOverlap * kTeamTownOverlap) return true;
+    }
+    return false;
+}
 void BdTeamTownsTick()
 {
     if (kBdTownListRva == 0 || EngineWritesBlocked()) return;
@@ -10386,6 +10519,16 @@ void BdTeamTownsTick()
         const std::string key = townkeep::SaidKey(t);
         ::Faction* fac = OwnerFactionForSlot(t.owner, false);
         if (fac == 0) continue;   /* that player's faction is not here yet: looked at again next time */
+        if (t.owner != kTeamHostSlot && BdNearOwnTown(towns, n, t.pos[0], t.pos[2]))
+        {   /* the host town overrides: a teammate's outpost inside one of this player's towns is not drawn here (neither founded nor
+               marked; a copy already marked is taken off the map by the walk below, as it stands for no shown row) */
+            if (g_saidOverlapLogged.insert(key).second)
+            {
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost '%.80s' sits inside a town of this player's - not drawn here (the host town overrides)", t.owner, t.name.c_str());
+                DebugLog(std::string(line));
+            }
+            continue;
+        }
         void* standing = 0;
         for (int i = 0; i < n && standing == 0; ++i)
         {

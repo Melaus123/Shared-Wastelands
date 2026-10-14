@@ -175,7 +175,7 @@
 
 namespace {
 
-const unsigned int kProtocol = 96;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 97;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_HOST_TOKEN = 68, MSG_KEPT = 69 };   /* KEPT (69) - src/common/keptwire.h */   /* AUTH_CHALLENGE / AUTH_PROOF / STEAM_ID / HOST_TOKEN (65-68) - src/common/authproof.h */   /* FALLEN (61) - src/common/fallenwire.h */   /* T-546 step 3 (protocol 72): TEAM (60) - src/common/teamwire.h */   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* 50 is unused (REPAIR, the world repair removed in T-716) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi} (the stamp: the writtenAt of the write it answers), sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
 typedef char T581OwedNumbersAgree[(MSG_OWED == (int)owedpop::kMsgOwed && kProtocol == owedpop::kProtocol) ? 1 : -1];   /* T-581: a compile error here = owedpop.h and this file disagree */
 typedef char TownLossNumbersAgree[(MSG_TOWN_LOSS == (int)townrefill::kMsgTownLoss && kProtocol == townrefill::kProtocol) ? 1 : -1];   /* a compile error here = townrefill.h and this file disagree */
@@ -6903,6 +6903,7 @@ void TeamRecordSend(int t, ENetPeer* only, const char* why)
    that game (0 = none); a whole list or techs, bySlot = the game a reply answers or the member who finished them (0xFFFFFFFF =
    a whole research for all) */
 long long g_teamResearchIn = 0, g_teamResearchAdded = 0, g_teamResearchSent = 0, g_teamResearchRefused = 0;
+long long g_teamWorkPassed = 0, g_teamWorkRefused = 0;   /* research work passed to a bench owner's game / refused (kUpWork) */
 void TeamResearchSend(int t, ENetPeer* only, ENetPeer* skip, bool whole, unsigned bySlot, const std::vector<std::string>& techs, const char* why)
 {
     if (t < 0 || (size_t)t >= g_team.teams.size()) return;
@@ -7169,6 +7170,25 @@ void OnTeam(ENetPeer* from, const std::vector<char>& payload)
             if (u.whole) TeamResearchSend(t, 0, from, true, 0xFFFFFFFFu, g_team.teams[t].research, "the team's research grew");
             else TeamResearchSend(t, 0, from, false, TeamWireSlot(me), added, "a member finished research");
         }
+    }
+    else if (u.kind == swteam::kUpWork)
+    {
+        /* research work done at a teammate's bench: passed to the bench owner's game, both in one team and the owner connected */
+        const std::string to = ProfileOfSlot((int)u.slot);
+        const int tm = swteam::TeamOf(g_team, me), tt = to.empty() ? -1 : swteam::TeamOf(g_team, to);
+        ENetPeer* p = to.empty() ? 0 : PeerOfProfile(to);
+        std::vector<char> b;
+        if (tm < 0 || tm != tt || to == me || p == 0 || !swteam::EncodeWorkDown(&b, TeamWireSlot(me), u.rel))
+        {
+            ++g_teamWorkRefused;
+            if (g_teamWorkRefused <= 5 || g_teamWorkRefused % 100 == 0)
+                Log("TEAM research work from " + TeamSlotText(me) + " for s" + N((long long)u.slot) + " NOT passed on: " + std::string(tm < 0 ? "the sender is in no team" : to.empty() ? "no such player" : tm != tt ? "not teammates" : to == me ? "its own" : "the owner is not connected") + " (workRefused=" + N(g_teamWorkRefused) + ")");
+            return;
+        }
+        SendMsg(p, MSG_TEAM, b);
+        ++g_teamWorkPassed;
+        if (g_teamWorkPassed <= 3 || g_teamWorkPassed % 200 == 0)
+            Log("TEAM research work " + FloatText(u.rel) + " from " + TeamSlotText(me) + " passed to " + TeamSlotText(to) + " (workPassed=" + N(g_teamWorkPassed) + ")");
     }
     else if (u.kind == swteam::kUpRestoreDone)
     {

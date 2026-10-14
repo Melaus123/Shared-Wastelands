@@ -30,7 +30,7 @@ const unsigned int kMsgAuthChallenge = 65;   /* server -> game: nonce (16) | sal
 const unsigned int kMsgAuthProof     = 66;   /* game -> server: proof (32) */
 const unsigned int kMsgSteamId       = 67;   /* host's bridge -> server: token (32) | u64 Steam id, little-endian (8) - 40 bytes; id 0 = a bridged link whose id Steam did not check */
 const unsigned int kMsgHostToken     = 68;   /* host's own game -> server, ahead of its HELLO: token (32) */
-const unsigned int kProtocol         = 96;   /* the world-server protocol that carries the four */
+const unsigned int kProtocol         = 97;   /* the world-server protocol that carries the four */
 
 const size_t kSaltBytes = 16, kNonceBytes = 16, kKeyBytes = 32, kProofBytes = 32;
 const size_t kTokenBytes = 32;              /* this hosting's secret */
