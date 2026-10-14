@@ -175,7 +175,7 @@
 
 namespace {
 
-const unsigned int kProtocol = 95;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 96;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_HOST_TOKEN = 68, MSG_KEPT = 69 };   /* KEPT (69) - src/common/keptwire.h */   /* AUTH_CHALLENGE / AUTH_PROOF / STEAM_ID / HOST_TOKEN (65-68) - src/common/authproof.h */   /* FALLEN (61) - src/common/fallenwire.h */   /* T-546 step 3 (protocol 72): TEAM (60) - src/common/teamwire.h */   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* 50 is unused (REPAIR, the world repair removed in T-716) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi} (the stamp: the writtenAt of the write it answers), sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
 typedef char T581OwedNumbersAgree[(MSG_OWED == (int)owedpop::kMsgOwed && kProtocol == owedpop::kProtocol) ? 1 : -1];   /* T-581: a compile error here = owedpop.h and this file disagree */
 typedef char TownLossNumbersAgree[(MSG_TOWN_LOSS == (int)townrefill::kMsgTownLoss && kProtocol == townrefill::kProtocol) ? 1 : -1];   /* a compile error here = townrefill.h and this file disagree */
@@ -2061,6 +2061,35 @@ void TownsSendKept(ENetPeer* to)
     ++g_townsListsSent;
     Log("outposts: " + N((long long)sent) + " kept outpost(s) sent to " + PeerName(to) + " before its first kept rows" + (bad > 0 ? "; " + N((long long)bad) + " row(s) not sendable" : std::string()));
 }
+/* SAID down: every player's said outposts (player-towns.txt, keys dropped: townkeep.h SaidForMap) to one game, at most kMaxTownsMsg a
+   message; the first message starts the game's list again (an empty list too). The game keeps its teammates' rows and puts their
+   bases on its map (build.cpp BdTeamTownsTick) - the team filter is the game's, so nothing here knows who is on whose team. */
+long long g_townsSaidSent = 0;
+void TownsSendSaid(ENetPeer* to)
+{
+    const std::vector<townkeep::TownRow> rows = townkeep::SaidForMap(g_townsSaid);
+    std::vector<townkeep::TownRow> chunk;
+    int first = 1;
+    for (size_t i = 0; i <= rows.size(); ++i)
+    {
+        const bool end = i == rows.size();
+        if (!end) chunk.push_back(rows[i]);
+        if (chunk.size() >= townkeep::kMaxTownsMsg || (end && (!chunk.empty() || first != 0)))
+        {
+            std::vector<char> m;
+            if (townkeep::EncodeTowns(&m, townkeep::kOpSaid, first, chunk)) { SendMsg(to, MSG_TOWNS, m); first = 0; }
+            chunk.clear();
+        }
+    }
+    ++g_townsSaidSent;
+}
+/* SAID to every game on a link (the ones sent the kept outposts: g_townsSentTo, a link's first AREAS on, dropped at its disconnect) */
+void TownsSendSaidAll()
+{
+    for (std::set<ENetPeer*>::const_iterator i = g_townsSentTo.begin(); i != g_townsSentTo.end(); ++i) TownsSendSaid(*i);
+    Log("outposts: the said outposts (" + N((long long)g_townsSaid.size()) + ") sent to " + N((long long)g_townsSentTo.size()) + " game(s) for their teammates' map markers (saidSent="
+        + N(g_townsSaidSent) + ")");
+}
 /* up SAY (one or several messages): the sender's own outposts and their keys replace its slot's rows (townkeep.h ReplaceSlotTowns) */
 void OnTowns(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
 {
@@ -2108,6 +2137,7 @@ void OnTowns(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
     if (!WriteWholeFile(TownsSaidFile(), body))
     { ++g_townsWriteFailed; Log("outposts: player-towns.txt could NOT be written (townsWriteFailed=" + N(g_townsWriteFailed) + ") - the rows hold in memory"); }
     g_townsSaid.swap(next);
+    TownsSendSaidAll();   /* every game: the said outposts again, for their teammates' map markers */
     std::string names;
     for (size_t i = 0; i < rows.size(); ++i)
     {
@@ -2121,7 +2151,11 @@ void OnTowns(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
 /* the end of OnAreas: each sector this report lists for the first time on this link, with unfinished rows, gets its rows */
 void KeptAreasReport(ENetPeer* from, const std::vector<char>& payload, unsigned int n)
 {
-    if (g_townsSentTo.insert(from).second) TownsSendKept(from);   /* the kept outposts (an empty list too: the game drops any list it holds), before this game's first kept rows */
+    if (g_townsSentTo.insert(from).second)
+    {
+        TownsSendKept(from);   /* the kept outposts (an empty list too: the game drops any list it holds), before this game's first kept rows */
+        TownsSendSaid(from);   /* every player's said outposts: the game shows its teammates' on its map */
+    }
     if (g_keptRows.empty()) return;
     std::set<int>& sent = g_keptSent[from];
     for (unsigned k = 0; k < n; ++k)

@@ -89,6 +89,7 @@
 #include "zones.h"          /* SectorOf - the same cell arithmetic as the engine's 0x9B1EC0 */
 #include "spawn.h"          /* MirrorCapacity, MirrorSlot, SafeReadPosition */
 #include "playerfaction.h"  /* LocalPlayerFaction */
+#include "team.h"           /* TeamMatesOfMine - the teammates whose outposts this game shows on its map (townkeep.h SAID) */
 #include "policy.h"         /* PolicyVtableRvaPod, PolicyClassNamePod - the RTTI class name (the wall test) */
 #include "doors.h"          /* P15 fold 1: DoorsForgetOwner - a building's door rows are dropped before its setDestroyed flip */
 #include "net/session.h"    /* IsUidMine, SendBuild */
@@ -124,6 +125,7 @@
 #include <io.h>         /* house2 fold: _commit / _fileno */
 #include <sstream>
 #include <string>
+#include <new>       /* TEAMMAP: the map icon answered in the caller's string */
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
@@ -7405,6 +7407,7 @@ int BuildGroundSource(void* b)
 }
 
 // ------------------------------------------------------------------------------------------------------------------
+void InstallTeamMap();   /* TEAMMAP: defined beside BdTeamTownsTick */
 void InstallBuild()
 {
     if (g_installed != 0) return;
@@ -7473,6 +7476,7 @@ void InstallBuild()
     if (g_hkJob == 1) DebugLog(jmsg);
     else ErrorLog(jmsg);
     InstallFarm();   /* par16: FarmBuilding::update / operate - one writer per farm */
+    InstallTeamMap();   /* TEAMMAP: teammates drawn as one's own on the map */
 }
 
 /* P15, MAIN THREAD (BuildTick): a copy's +0x1A1 flipped. The mod's own apply (the event's amount 1) is nothing more. This game's engine
@@ -8912,6 +8916,16 @@ std::vector<char> g_townSaid;                   /* the last SAY sent */
 int g_townSaidSlot = -1;
 DWORD g_townSaidAt = 0, g_townLookAt = 0;
 long long g_townRowsIn = 0, g_townBad = 0, g_townFounded = 0, g_townStanding = 0, g_townLinked = 0, g_townFoundFail = 0, g_townSays = 0;
+/* TEAMMATES' OUTPOSTS ON THE MAP (townkeep.h SAID): every player's said outposts as the world server last sent them; the rows of this
+   game's teammates get a town of that player's faction here at their centre, marked discovered (BdTeamTownsTick) */
+std::vector<townkeep::TownRow> g_saidRows;
+long g_saidRowsGen = -1;                        /* KeptWorldGen() when g_saidRows last came in: another world's rows are dropped */
+std::map<std::string, void*> g_saidLive;        /* SaidKey -> the town standing for it here when last looked (a log hint: each look walks the list again) */
+std::set<std::string> g_saidFailed;             /* SaidKey whose founding failed in this world: not tried again */
+std::set<void*> g_saidMarked;                   /* the towns this game marked discovered in this world (once each) */
+std::set<std::string> g_saidWaitLogged;         /* SaidKey whose wait for its area to load here was logged (once each) */
+DWORD g_saidLookAt = 0;
+long long g_saidIn = 0, g_saidFounded = 0, g_saidStanding = 0, g_saidMarkedN = 0, g_saidFoundFail = 0, g_saidWaitNotLoaded = 0;
 bool TownsSendUp(const std::vector<char>& b);   /* store.cpp: TOWNS up on the world-server link */
 void* BdTownListPtr()
 {
@@ -9001,11 +9015,20 @@ void BuildTownsNote(const char* p, size_t n)
     int first = 0;
     std::vector<townkeep::TownRow> rows;
     char line[400];
-    if (townkeep::DecodeTowns(p, n, &op, &first, &rows) == 0 || op != townkeep::kOpList)
+    if (townkeep::DecodeTowns(p, n, &op, &first, &rows) == 0 || (op != townkeep::kOpList && op != townkeep::kOpSaid))
     {
         ++g_townBad;
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] a TOWNS message from the world server could not be read (%u bytes) - ignored; townsBad=%lld", (unsigned)n, g_townBad);
         ErrorLog(line);
+        return;
+    }
+    if (op == townkeep::kOpSaid)
+    {   /* SAID: every player's said outposts, whole; BdTeamTownsTick shows the teammates' on the next drain (a first message starts the list again) */
+        if (first != 0) g_saidRows.clear();
+        g_saidRows.insert(g_saidRows.end(), rows.begin(), rows.end());
+        g_saidRowsGen = KeptWorldGen();
+        g_saidIn += (long long)rows.size();
+        g_saidLookAt = 0;
         return;
     }
     if (first != 0) { g_townRows.clear(); g_townLive.clear(); g_townFailed.clear(); }
@@ -9365,6 +9388,8 @@ void BdTownKeysWalk(DWORD now, const std::set<void*>& myTowns)
 }
 /* SAY: this game's own outposts to the world server, each with the keys of its pieces (looked at every kTownLookMs; sent when changed,
    on a new slot, and every kTownSayAgainMs; split over several messages when it would pass one) */
+int BdTownSizePod(void* town);               /* TEAMMAP (beside BdTeamTownsTick): the engine's own size count on a town; 0 = missing or faulted */
+int BdTownStagePod(void* town, int* stage);   /* TEAMMAP: the town's map size stage (+0x388) */
 void BdTownsSayTick()
 {
     const DWORD now = ::GetTickCount();
@@ -9390,6 +9415,10 @@ void BdTownsSayTick()
         if (f != (void*)mine) continue;
         if (rows.size() >= townkeep::kMaxTownsPerSlot) { whole = 0; continue; }
         t.name = townkeep::NameFit(BdTownName(towns[i]));
+        BdTownSizePod(towns[i]);   /* TEAMMAP: the engine's own count every look - the engine runs it only when this player places a building, so the icon
+                                      here grows and shrinks with the base, and the stage said is the one this map shows */
+        int stage = 0;
+        if (BdTownStagePod(towns[i], &stage) != 0 && stage >= 0 && stage <= townkeep::kStageMax) t.stage = stage;
         rows.push_back(t);
         rowTown.push_back(towns[i]);
     }
@@ -9950,6 +9979,8 @@ void BdKeptRow(const keptwire::Row& w, int mySlot)
 long g_keptWorldSeen = 0;
 void BdKeptDropTable(const char* why)
 {
+    g_saidLive.clear(); g_saidMarked.clear(); g_saidFailed.clear(); g_saidWaitLogged.clear();   /* SAID: the towns of the world that goes (its rows stay unless they are another world's) */
+    if (!g_saidRows.empty() && g_saidRowsGen != KeptWorldGen()) g_saidRows.clear();
     if (!g_kept.empty())
     {
         char line[240];
@@ -10084,6 +10115,276 @@ std::string BuildKeptListCommand()
     return "ok keptlist " + sum;
 }
 
+/* TEAMMATES' OUTPOSTS ON THE MAP (townkeep.h SAID; main thread, every kTownLookMs): for each said outpost of a teammate of this game's
+   player, a player town of that teammate's faction here at its centre - taken when one stands (TownStands), else founded
+   (TownFoundPlayer) once its area is loaded here, named and given the faction, as BdKeptTownForKey founds a kept outpost - and marked discovered through the town's
+   own setDiscovered (vt+0x330, as store.cpp's carryset map), so the teammate's base is on this player's map. A founding that fails is
+   not tried again in this world; a town this game saved stands after a reload and is taken. A town has the teammate's faction, so this
+   game's SAY (its own player's towns) never names it. A rename the teammate makes reaches its town here (the said name wins). Leaving
+   the team, or an outpost no teammate says any more, takes its town off this map again (BdTeamTownsForget); nothing here destroys a town. */
+const size_t kBdTownVtDiscovered = 0x330;   /* TownBase vtable: setDiscovered (store.cpp kCarryTownVtDiscovered); +0x180 the byte it sets */
+typedef void (*BdTownByteFn)(void* town, char value);
+/* 1 = discovered after the call, 0 = the byte did not move, -1 = faulted */
+int BdTownSetDiscoveredPod(void* t)
+{
+    __try { ((BdTownByteFn)((*(void***)t)[kBdTownVtDiscovered / 8]))(t, (char)1); return *((const unsigned char*)t + 0x180) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* TEAMMATES AS ONE'S OWN ON THE MAP (main thread). A teammate's faction is drawn as this player's own: its towns and characters in the
+   player marker colour (MarkerPlayer) instead of the ally green, and its towns with the growing outpost icon a player's own base gets
+   instead of the fixed icon of a town type. The engine decides both from one test - the object's owner faction (vt+0x58) has a
+   PlayerInterface (+0x250, IsPlayerPod) - which a teammate's faction (its stand-in here) never passes:
+     MapMarkerColour (0x48F320 on 1.0.68, static, takes the object): +0x250 set -> MarkerPlayer / MarkerPlayerSelected, else the ally,
+       neutral or enemy colour;
+     Town::getMapIcon (Town vtable +0x378, 0x48D970): +0x250 set -> the growth stage at Town+0x388 (1 Village, 2 Outpost, 3 Town, else
+       SmallPlace), else the town type at Town+0xD8.
+   Both are hooked and answer for a teammate's faction as for one's own; every other object gets the engine's own answer. The stage
+   itself is the engine's TownUpdateSize (0x48C200), which counts the buildings of the local player's allies around the town and is run
+   by the engine only after this player places a building. Each game runs it on its own outposts every kTownLookMs (BdTownsSayTick) and
+   says the result with them (TownRow::stage); a teammate's town here takes that stage as said, so both maps show the same icon, growing
+   and shrinking with the owner's base. Leaving the team ends all of it at the next look. */
+static unsigned long long kBdMarkerColourRva = 0; static AddrReg kBdMarkerColourRva_reg("MapMarkerColour", &kBdMarkerColourRva);       /* 1.0.68 0x48F320: the marker colour of an object */
+static unsigned long long kBdMarkerPlayerRva = 0; static AddrReg kBdMarkerPlayerRva_reg("MapMarkerPlayerColour", &kBdMarkerPlayerRva); /* 1.0.68 0x212F568: the MarkerPlayer colour (filled from the GUI's colour list) */
+static unsigned long long kBdTownIconRva = 0;     static AddrReg kBdTownIconRva_reg("TownGetMapIcon", &kBdTownIconRva);                 /* 1.0.68 0x48D970: Town vt+0x378 */
+static unsigned long long kBdTownSizeRva = 0;     static AddrReg kBdTownSizeRva_reg("TownUpdateSize", &kBdTownSizeRva);                 /* 1.0.68 0x48C200: Town+0x388 from the allied buildings around it */
+const size_t kBdTownStage = 0x388;   /* Town: the growth stage TownUpdateSize writes (0 none, 1-3) */
+const size_t kTeamMapMates = 8;
+static void* g_mateFac[kTeamMapMates];      /* the teammates' factions here, refreshed every kTeamMapLookMs; only the main thread reads or writes it */
+static size_t g_mateFacN = 0;
+static DWORD g_mateFacAt = 0;
+const DWORD kTeamMapLookMs = 1000;
+static long long g_teamBlue = 0, g_teamIcon = 0, g_teamStageRuns = 0;
+static int g_hkMarkerColour = 0, g_hkTownIcon = 0;
+typedef const void* (*BdMarkerColourFn)(void* obj);
+static BdMarkerColourFn orig_markercolour = 0;
+typedef std::string* (*BdTownIconFn)(void* town, std::string* out);
+static BdTownIconFn orig_townicon = 0;
+typedef void (*BdTownSizeFn)(void* town);
+/* the object's owner faction (vt+0x58), 0 = none or faulted */
+void* BdOwnerFactionPod(void* obj)
+{
+    __try { return obj != 0 ? ((void* (*)(void*))((*(void***)obj)[0x58 / 8]))(obj) : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int BdTownStagePod(void* town, int* stage)
+{
+    __try { *stage = *(const int*)((const char*)town + kBdTownStage); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int BdTownSizePod(void* town)
+{
+    if (kBdTownSizeRva == 0 || town == 0) return 0;
+    __try { ((BdTownSizeFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kBdTownSizeRva))(town); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+bool BdIsMateFaction(void* f)
+{
+    if (f == 0) return false;
+    for (size_t i = 0; i < g_mateFacN; ++i) if (g_mateFac[i] == f) return true;
+    return false;
+}
+/* MAIN THREAD, every drain: the teammates' factions as this game holds them (a stand-in each), none outside a team */
+void BdTeamMapTick()
+{
+    const DWORD now = ::GetTickCount();
+    if (g_mateFacAt != 0 && now - g_mateFacAt < kTeamMapLookMs) return;
+    g_mateFacAt = now;
+    const std::vector<int> mates = TeamMatesOfMine();
+    size_t n = 0;
+    for (size_t i = 0; i < mates.size() && n < kTeamMapMates; ++i)
+    {
+        ::Faction* f = OwnerFactionForSlot(mates[i], false);
+        if (f != 0 && !IsPlayerFaction(f)) g_mateFac[n++] = (void*)f;
+    }
+    g_mateFacN = n;
+}
+const void* detour_markercolour(void* obj)
+{
+    const void* c = orig_markercolour(obj);
+    if (g_mateFacN == 0 || kBdMarkerPlayerRva == 0 || obj == 0) return c;
+    if (!BdIsMateFaction(BdOwnerFactionPod(obj))) return c;
+    ++g_teamBlue;
+    return (const void*)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kBdMarkerPlayerRva);
+}
+std::string* detour_townicon(void* town, std::string* out)
+{
+    int stage = 0;
+    if (g_mateFacN == 0 || !BdIsMateFaction(BdOwnerFactionPod(town)) || BdTownStagePod(town, &stage) == 0) return orig_townicon(town, out);
+    ++g_teamIcon;
+    /* the engine's own player-town answer (Town::getMapIcon's +0x250 branch and its jump table) */
+    return new (out) std::string(stage == 1 ? "Village" : (stage == 2 ? "Outpost" : (stage == 3 ? "Town" : "SmallPlace")));
+}
+void InstallTeamMap()
+{
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    g_hkMarkerColour = (kBdMarkerPlayerRva == 0) ? -2 : BdHook(base, kBdMarkerColourRva, (void*)&detour_markercolour, (void**)&orig_markercolour);
+    g_hkTownIcon = BdHook(base, kBdTownIconRva, (void*)&detour_townicon, (void**)&orig_townicon);
+    const std::string msg = std::string("[TEAMMAP] teammates drawn as one's own on the map: marker colour hook ") + HkWord(g_hkMarkerColour)
+        + ", town icon hook " + HkWord(g_hkTownIcon) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
+    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
+}
+/* MAIN THREAD (BdTeamTownsTick): a teammate's town here takes the stage its owner's game said (TownRow::stage, that game's own count of its
+   base), so this map shows the icon the owner's map shows; a change is logged. Counting here instead would count this player's allies. */
+int BdTownSetStagePod(void* town, int stage)
+{
+    __try { *(int*)((char*)town + kBdTownStage) = stage; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void BdTeamTownStage(const townkeep::TownRow& t, void* town)
+{
+    int before = 0;
+    if (town == 0 || BdTownStagePod(town, &before) == 0 || before == t.stage) return;
+    const int ok = BdTownSetStagePod(town, t.stage);
+    ++g_teamStageRuns;
+    char line[300];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] teammate slot %d's outpost '%.80s' stage %d -> %d as its owner said%s (blue=%lld icon=%lld sets=%lld)",
+                t.owner, t.name.c_str(), before, t.stage, ok != 0 ? "" : " - the write FAULTED", g_teamBlue, g_teamIcon, g_teamStageRuns);
+    if (ok != 0) DebugLog(std::string(line)); else ErrorLog(line);
+}
+/* 1 = the discovered byte reads `value` after the call, 0 = it did not move, -1 = faulted (BdTownSetDiscoveredPod, either way) */
+int BdTownSetDiscoveredToPod(void* t, char value)
+{
+    __try { ((BdTownByteFn)((*(void***)t)[kBdTownVtDiscovered / 8]))(t, value); return *((const unsigned char*)t + 0x180) == (unsigned char)value ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+long long g_saidHidden = 0;
+int BdTownDiscoveredPod(void* t, unsigned char* out)
+{
+    __try { *out = *((const unsigned char*)t + 0x180); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* MAIN THREAD (BdTeamTownsTick): a town marked for a teammate's outpost that no said row of a teammate names any more - the outpost was
+   removed, moved or renamed past its old key (a SAY that was not whole leaves the world server's old row for a while), or the teammate
+   left the team - is taken off this player's map again (setDiscovered false); the town itself is not destroyed. A town still standing for
+   a current row (`seen`) only drops its old key. */
+void BdTeamTownsForget(const std::set<std::string>& keys, const std::set<void*>& seen)
+{
+    for (std::map<std::string, void*>::iterator it = g_saidLive.begin(); it != g_saidLive.end(); )
+    {
+        if (keys.count(it->first) != 0) { ++it; continue; }
+        void* town = it->second;
+        const std::string key = it->first;
+        g_saidLive.erase(it++);
+        if (town == 0 || seen.count(town) != 0) continue;
+        bool other = false;   /* another current key still holds this town */
+        for (std::map<std::string, void*>::const_iterator o = g_saidLive.begin(); o != g_saidLive.end() && !other; ++o) other = (o->second == town);
+        if (other) continue;
+        g_saidMarked.erase(town);
+        const int d = BdTownSetDiscoveredToPod(town, (char)0);
+        ++g_saidHidden;
+        char line[400];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] an outpost no teammate says any more (%.120s) taken off this player's map: %s (hidden=%lld)",
+                    key.c_str(), d == 1 ? "hidden" : (d == 0 ? "the discovered byte did NOT move" : "the setter FAULTED"), g_saidHidden);
+        if (d == 1) DebugLog(std::string(line)); else ErrorLog(line);
+    }
+}
+void BdTeamTownsTick()
+{
+    if (kBdTownListRva == 0 || EngineWritesBlocked()) return;
+    const DWORD now = ::GetTickCount();
+    if (g_saidLookAt != 0 && now - g_saidLookAt < kTownLookMs) return;
+    g_saidLookAt = now;
+    const int mySlot = KeptMySlot();
+    if (mySlot < 0 || LocalPlayerFaction() == 0) return;
+    const std::vector<size_t> mates = townkeep::MateRows(g_saidRows, TeamMatesOfMine(), mySlot);
+    std::set<std::string> keys;
+    std::set<void*> seen;
+    for (size_t m = 0; m < mates.size(); ++m) keys.insert(townkeep::SaidKey(g_saidRows[mates[m]]));
+    if (mates.empty()) { BdTeamTownsForget(keys, seen); return; }
+    void* towns[kTownWalkCap];
+    const int n = BdPlayerTownsPod(towns, kTownWalkCap);
+    if (n < 0) return;
+    char line[600];
+    for (size_t m = 0; m < mates.size(); ++m)
+    {
+        const townkeep::TownRow& t = g_saidRows[mates[m]];
+        const std::string key = townkeep::SaidKey(t);
+        ::Faction* fac = OwnerFactionForSlot(t.owner, false);
+        if (fac == 0) continue;   /* that player's faction is not here yet: looked at again next time */
+        void* standing = 0;
+        for (int i = 0; i < n && standing == 0; ++i)
+        {
+            float lp[3]; int h[5]; void* f = 0;
+            if (BdTownReadPod(towns[i], lp, h, &f) != 0 && f == (void*)fac && townkeep::TownStands(lp, t) != 0) standing = towns[i];
+        }
+        if (standing == 0)
+        {
+            if (g_saidFailed.count(key) != 0) continue;
+            if (!SectorLoadedHere(SectorOf(t.pos[0], t.pos[2])))
+            {   /* founded only where its area is loaded here, as a kept outpost's town is (BdTownsLoadedTick): a player town founded in an
+                   area this game has not loaded took both games of a test down about 16 s later (2026-10-13). Looked at again next time. */
+                ++g_saidWaitNotLoaded;
+                if (g_saidWaitLogged.insert(key).second)
+                {
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost '%.80s' at (%.1f, %.1f): its area is not loaded here - founded once it is (waits=%lld)",
+                                t.owner, t.name.c_str(), t.pos[0], t.pos[2], g_saidWaitNotLoaded);
+                    DebugLog(std::string(line));
+                }
+                continue;
+            }
+            void* town = kBdTownFoundRva != 0 ? BdTownFoundPod(t.pos) : 0;
+            if (town == 0)
+            {
+                g_saidFailed.insert(key); ++g_saidFoundFail;
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost '%.80s' NOT founded here: %s - not tried again in this world (foundFail=%lld)",
+                            t.owner, t.name.c_str(), kBdTownFoundRva == 0 ? "TownFoundPlayer is not in the address table" : "TownFoundPlayer FAULTED or returned none", g_saidFoundFail);
+                ErrorLog(line);
+                continue;
+            }
+            const std::string name(t.name);
+            const int named = name.empty() ? 1 : BdTownSetNamePod(town, &name);
+            float lp[3]; int h[5]; void* f0 = 0;
+            BdTownReadPod(town, lp, h, &f0);
+            const int facOk = (f0 == (void*)fac) ? 1 : BdTownSetFactionPod(town, (void*)fac);
+            standing = town; ++g_saidFounded;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost FOUNDED here for the map: %s (said '%.80s' at (%.1f, %.1f, %.1f)%s%s); founded=%lld",
+                        t.owner, BdTownText(town).c_str(), t.name.c_str(), t.pos[0], t.pos[1], t.pos[2], named != 0 ? "" : "; the name write FAULTED",
+                        facOk != 0 ? "" : "; the faction write FAULTED", g_saidFounded);
+            DebugLog(std::string(line));
+        }
+        else if (g_saidLive[key] != standing)
+        {
+            ++g_saidStanding;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost '%.80s': a town of that player's faction already stands at its centre - %s - taken (standing=%lld)",
+                        t.owner, t.name.c_str(), BdTownText(standing).c_str(), g_saidStanding);
+            DebugLog(std::string(line));
+        }
+        if (!t.name.empty() && BdTownName(standing) != t.name)
+        {   /* the teammate renamed the outpost: its town here takes the name it now says (the founding names it; a rename after that came only as a SAY) */
+            const std::string old = BdTownName(standing), name(t.name);
+            const int named = BdTownSetNamePod(standing, &name);
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost renamed here: '%.80s' -> '%.80s'%s", t.owner, old.c_str(), name.c_str(), named != 0 ? "" : " - the name write FAULTED");
+            if (named != 0) DebugLog(std::string(line)); else ErrorLog(line);
+        }
+        g_saidLive[key] = standing;
+        seen.insert(standing);
+        if (g_saidMarked.insert(standing).second)
+        {
+            const int d = BdTownSetDiscoveredPod(standing);
+            ++g_saidMarkedN;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] teammate slot %d's outpost '%.80s' marked discovered on this player's map through setDiscovered vt+0x330: %s (marked=%lld)",
+                        t.owner, t.name.c_str(), d == 1 ? "discovered" : (d == 0 ? "the discovered byte did NOT move" : "the setter FAULTED"), g_saidMarkedN);
+            if (d == 1) DebugLog(std::string(line)); else ErrorLog(line);
+        }
+        BdTeamTownStage(t, standing);   /* TEAMMAP: its icon's stage as its owner's game counts it (TownRow::stage) */
+    }
+    BdTeamTownsForget(keys, seen);
+    /* a teammate's town on this map that stands for none of the teammates' said outposts - one this game marked before a reload (the save
+       keeps it discovered), or an old row's - is taken off the map too */
+    for (int i = 0; i < n; ++i)
+    {
+        float lp[3]; int h[5]; void* f = 0;
+        if (seen.count(towns[i]) != 0 || BdTownReadPod(towns[i], lp, h, &f) == 0 || !BdIsMateFaction(f)) continue;
+        unsigned char disc = 0;
+        if (BdTownDiscoveredPod(towns[i], &disc) == 0 || disc == 0) continue;
+        g_saidMarked.erase(towns[i]);
+        const int d = BdTownSetDiscoveredToPod(towns[i], (char)0);
+        ++g_saidHidden;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMTOWN] a teammate's town no teammate says (%s) taken off this player's map: %s (hidden=%lld)",
+                    BdTownText(towns[i]).c_str(), d == 1 ? "hidden" : (d == 0 ? "the discovered byte did NOT move" : "the setter FAULTED"), g_saidHidden);
+        if (d == 1) DebugLog(std::string(line)); else ErrorLog(line);
+    }
+}
 void BuildCopyDrain()
 {
     ++g_drainNo;
@@ -10093,6 +10394,8 @@ void BuildCopyDrain()
     if (g_copyDiagOwed != 0 && !EngineWritesBlocked()) BdCopyListDiagTick();   /* P87 root (step 5): read-only, before any adopt / reconcile / REMOVE below */
     BdTownsSayTick();   /* this game's own outposts to the world server, every drain whatever is pending (its own checks: the 5 s look, a slot, the town list, engine writes, a faction) */
     if (!g_townRows.empty()) { BdSelfScope townScope; BdTownsLoadedTick(); }   /* every game: the kept outposts' pieces loaded here linked to their towns, whatever is pending (its own 5 s look and engine-write check) */
+    BdTeamMapTick();   /* TEAMMAP: the teammates' factions the map hooks answer for (its own 1 s look) */
+    if (!g_saidRows.empty() || !g_saidLive.empty()) { BdSelfScope teamTownScope; BdTeamTownsTick(); }   /* + a marked town to take off the map */   /* every game: its teammates' outposts on its map (townkeep.h SAID; its own 5 s look and engine-write check) */
     if (g_pend.empty() && g_wait.empty() && g_pendState.empty() && g_pendRemove.empty() && g_helpIn.empty() && g_helpGoneIn.empty() && BdReconAnyDue() == 0
         && g_tombKill.empty() && KeptRowsActive() == 0) return;   /* P87: + a reconcile due; P14: + a removal queued; KEPT: + kept rows with a part this game may act on */
     if (EngineWritesBlocked()) { ++g_copyBlocked; return; }

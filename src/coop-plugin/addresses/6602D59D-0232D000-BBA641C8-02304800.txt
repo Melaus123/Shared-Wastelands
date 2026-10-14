@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 509
+!count 513
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -521,3 +521,7 @@ PlatoonLoadInstance                            code 0036F6B0 0036F6B0 4055565741
 UniqueMayMake                                  code 005921B0 005921B0 4889542410534883EC20488BD9488BC2
 DialoguePlayerCanTalk                          code 0067AA50 0067AA50 40574883EC304883B9C800000000488B
 DialogueChooseDialog                           code 0067A0C0 0067A0C0 44884C24204C89442418488954241048
+MapMarkerColour                                code 0048F320 0048F320 40534883EC20488BD94885C9750D488D
+TownGetMapIcon                                 code 0048D970 0048D970 48895C24104889742418574883EC2048
+TownUpdateSize                                 code 0048C200 0048C200 48895C240848896C2410488974241857
+MapMarkerPlayerColour                          var  0212F568 0212F568 -
