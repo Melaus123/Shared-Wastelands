@@ -10214,14 +10214,45 @@ std::string* detour_townicon(void* town, std::string* out)
     /* the engine's own player-town answer (Town::getMapIcon's +0x250 branch and its jump table) */
     return new (out) std::string(stage == 1 ? "Village" : (stage == 2 ? "Outpost" : (stage == 3 ? "Town" : "SmallPlace")));
 }
+/* BUILDING IN A TEAMMATE'S TOWN (main thread). The placement preview (PreviewBuilding's check, 0x4DBA40 on 1.0.68) takes the nearest
+   town (TownList's nearest-town query, 0x927F10) and, when the spot is inside it and its faction has no PlayerInterface (+0x250), keeps
+   it as the town the piece would intrude on - "Can't build too close to another town." A teammate's outpost here is a town of the
+   teammate's faction (BdTeamTownsTick), so without this a teammate could not build in it. While the check runs, a nearest town of a
+   teammate's faction is answered as no town, and the check goes on as it does in open ground (the piece joins this player's own town
+   nearby, or founds one, as anywhere else). Every other caller of the query gets the engine's own answer. */
+static unsigned long long kBdPreviewCheckRva = 0; static AddrReg kBdPreviewCheckRva_reg("PreviewPlacementCheck", &kBdPreviewCheckRva); /* 1.0.68 0x4DBA40 */
+static unsigned long long kBdTownNearestRva = 0;  static AddrReg kBdTownNearestRva_reg("TownListNearest", &kBdTownNearestRva);        /* 1.0.68 0x927F10 */
+typedef void (*BdPreviewCheckFn)(void* preview);
+static BdPreviewCheckFn orig_previewcheck = 0;
+typedef void* (*BdTownNearestFn)(void* list, void* pos, void* faction, void* exclude, void* allyOf, int type);
+static BdTownNearestFn orig_townnearest = 0;
+static int g_inPreviewCheck = 0;
+static long long g_teamBuildAllowed = 0;
+static int g_hkPreviewCheck = 0, g_hkTownNearest = 0;
+void detour_previewcheck(void* preview)
+{
+    ++g_inPreviewCheck;
+    orig_previewcheck(preview);
+    --g_inPreviewCheck;
+}
+void* detour_townnearest(void* list, void* pos, void* faction, void* exclude, void* allyOf, int type)
+{
+    void* t = orig_townnearest(list, pos, faction, exclude, allyOf, type);
+    if (g_inPreviewCheck == 0 || t == 0 || g_mateFacN == 0 || !BdIsMateFaction(BdOwnerFactionPod(t))) return t;
+    if (++g_teamBuildAllowed == 1) DebugLog("[TEAMMAP] a placement inside a teammate's town: its town answered as none, so the piece may be placed (the first; later ones are counted)");
+    return 0;
+}
 void InstallTeamMap()
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     g_hkMarkerColour = (kBdMarkerPlayerRva == 0) ? -2 : BdHook(base, kBdMarkerColourRva, (void*)&detour_markercolour, (void**)&orig_markercolour);
     g_hkTownIcon = BdHook(base, kBdTownIconRva, (void*)&detour_townicon, (void**)&orig_townicon);
+    g_hkTownNearest = BdHook(base, kBdTownNearestRva, (void*)&detour_townnearest, (void**)&orig_townnearest);
+    g_hkPreviewCheck = (g_hkTownNearest == 1) ? BdHook(base, kBdPreviewCheckRva, (void*)&detour_previewcheck, (void**)&orig_previewcheck) : -3;
     const std::string msg = std::string("[TEAMMAP] teammates drawn as one's own on the map: marker colour hook ") + HkWord(g_hkMarkerColour)
-        + ", town icon hook " + HkWord(g_hkTownIcon) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
-    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
+        + ", town icon hook " + HkWord(g_hkTownIcon) + ", build-in-teammate's-town hooks " + HkWord(g_hkTownNearest) + " / "
+        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
+    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
 }
 /* MAIN THREAD (BdTeamTownsTick): a teammate's town here takes the stage its owner's game said (TownRow::stage, that game's own count of its
    base), so this map shows the icon the owner's map shows; a change is logged. Counting here instead would count this player's allies. */
