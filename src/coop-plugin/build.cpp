@@ -10242,17 +10242,71 @@ void* detour_townnearest(void* list, void* pos, void* faction, void* exclude, vo
     if (++g_teamBuildAllowed == 1) DebugLog("[TEAMMAP] a placement inside a teammate's town: its town answered as none, so the piece may be placed (the first; later ones are counted)");
     return 0;
 }
+/* RESEARCHING AT A TEAMMATE'S BENCH (main thread). A research bench's work tick (ResearchBuilding vt+0x4B0, 0x29B8D0 on 1.0.68: bench,
+   the worker, the work done) only counts when the bench's owner faction has a PlayerInterface (+0x250): it then queues the engine's
+   research event, whose amount is the bench's rate (vt+0x3C0) x its efficiency (vt+0x368) x the work, and the event adds it to the
+   local player's Research (PlayerInterface+0x38) through Research::addProgress (0x836B70). On a teammate's bench nothing is counted, so
+   a teammate's research bar never moved. After the engine's own tick, a bench of a teammate's faction is given the same amount on this
+   player's research (the costs are this game's own, as for any research it runs), and this player's research level is raised to the
+   bench's level (vt+0x548) the way a bench of its own raises it on completion (Research::setLevel keeps the higher). */
+static unsigned long long kBdResWorkRva = 0;  static AddrReg kBdResWorkRva_reg("ResearchBenchWork", &kBdResWorkRva);        /* 1.0.68 0x29B8D0 */
+static unsigned long long kBdResAddRva = 0;   static AddrReg kBdResAddRva_reg("ResearchAddProgress", &kBdResAddRva);        /* 1.0.68 0x836B70 */
+static unsigned long long kBdResLevelRva = 0; static AddrReg kBdResLevelRva_reg("ResearchSetLevel", &kBdResLevelRva);       /* 1.0.68 0x834390 */
+static unsigned long long kBdResPiRva = 0;    static AddrReg kBdResPiRva_reg("PlayerInterfaceGlobal", &kBdResPiRva);       /* PlayerInterface* */
+typedef void (*BdResWorkFn)(void* bench, void* worker, float work);
+static BdResWorkFn orig_reswork = 0;
+typedef void (*BdResAddFn)(void* research, float amount);
+typedef void (*BdResLevelFn)(void* research, int level);
+typedef float (*BdBenchFloatFn)(void* bench);
+typedef int (*BdBenchIntFn)(void* bench);
+static long long g_teamResearchTicks = 0, g_teamResearchFaults = 0;
+static int g_hkResWork = 0;
+/* 1 = counted, 0 = nothing to count, -1 = faulted */
+int BdTeamResearchPod(void* bench, float work, uintptr_t base, float* amount, int* level)
+{
+    __try
+    {
+        if (*((const unsigned char*)bench + 0x160) == 0) return 0;   /* the engine's own first test in the tick */
+        void* pi = *(void**)(base + (uintptr_t)kBdResPiRva);
+        void* research = pi != 0 ? *(void**)((char*)pi + 0x38) : 0;
+        if (research == 0) return 0;
+        void** vt = *(void***)bench;
+        const float rate = ((BdBenchFloatFn)vt[0x3C0 / 8])(bench);
+        const float eff = ((BdBenchFloatFn)vt[0x368 / 8])(bench);
+        *amount = rate * eff * work;
+        if (*amount > 0.0f) ((BdResAddFn)(base + (uintptr_t)kBdResAddRva))(research, *amount);
+        *level = ((BdBenchIntFn)vt[0x548 / 8])(bench);
+        if (kBdResLevelRva != 0 && *level > 0) ((BdResLevelFn)(base + (uintptr_t)kBdResLevelRva))(research, *level);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void detour_reswork(void* bench, void* worker, float work)
+{
+    orig_reswork(bench, worker, work);
+    if (g_mateFacN == 0 || bench == 0 || kBdResAddRva == 0 || kBdResPiRva == 0 || !BdIsMateFaction(BdOwnerFactionPod(bench))) return;
+    float amount = 0.0f; int level = 0;
+    const int r = BdTeamResearchPod(bench, work, (uintptr_t)::GetModuleHandleA(0), &amount, &level);
+    if (r == 1 && ++g_teamResearchTicks == 1)
+    {
+        char line[240];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research at a teammate's bench counted on this player's research (the first: %.4f, bench level %d; later ones are counted)", amount, level);
+        DebugLog(std::string(line));
+    }
+    else if (r == -1 && ++g_teamResearchFaults == 1) ErrorLog("[TEAMMAP] research at a teammate's bench FAULTED - not counted");
+}
 void InstallTeamMap()
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     g_hkMarkerColour = (kBdMarkerPlayerRva == 0) ? -2 : BdHook(base, kBdMarkerColourRva, (void*)&detour_markercolour, (void**)&orig_markercolour);
     g_hkTownIcon = BdHook(base, kBdTownIconRva, (void*)&detour_townicon, (void**)&orig_townicon);
     g_hkTownNearest = BdHook(base, kBdTownNearestRva, (void*)&detour_townnearest, (void**)&orig_townnearest);
+    g_hkResWork = (kBdResAddRva == 0 || kBdResPiRva == 0) ? -2 : BdHook(base, kBdResWorkRva, (void*)&detour_reswork, (void**)&orig_reswork);
     g_hkPreviewCheck = (g_hkTownNearest == 1) ? BdHook(base, kBdPreviewCheckRva, (void*)&detour_previewcheck, (void**)&orig_previewcheck) : -3;
     const std::string msg = std::string("[TEAMMAP] teammates drawn as one's own on the map: marker colour hook ") + HkWord(g_hkMarkerColour)
         + ", town icon hook " + HkWord(g_hkTownIcon) + ", build-in-teammate's-town hooks " + HkWord(g_hkTownNearest) + " / "
-        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
-    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
+        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
+    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && g_hkResWork == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
 }
 /* MAIN THREAD (BdTeamTownsTick): a teammate's town here takes the stage its owner's game said (TownRow::stage, that game's own count of its
    base), so this map shows the icon the owner's map shows; a change is logged. Counting here instead would count this player's allies. */
