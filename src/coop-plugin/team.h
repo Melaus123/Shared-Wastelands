@@ -49,9 +49,9 @@ bool TeamWorkSend(unsigned toSlot, float amount);
 // MAIN THREAD (build.cpp): research work a teammate did at one of this player's benches, added to this player's current research.
 void TeamWorkArrived(unsigned fromSlot, float amount);
 // MAIN THREAD: this player's research idle or running, to the teammates (teamwire.h WORK STATE). false = no link.
-bool TeamWorkStateSend(bool idle);
+bool TeamWorkStateSend(bool idle, const std::string& tech, float frac);
 // MAIN THREAD (build.cpp): a teammate's research idle or running.
-void TeamWorkStateArrived(unsigned fromSlot, bool idle);
+void TeamWorkStateArrived(unsigned fromSlot, bool idle, const std::string& tech, float frac);
 // MAIN THREAD: the slots that share this game's player's team on its copy of the table (none without a table or a team).
 std::vector<int> TeamMatesOfMine();
 // MAIN THREAD (476): this game's player is a member (not the founder) and `slot` is outside its team - its stance is the founder's.

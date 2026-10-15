@@ -98,6 +98,8 @@
 #include "../common/keptwire.h"    /* KEPT: the players' kept pieces laid back into a reset world (and zonekeep.h) */
 #include "../common/townkeep.h"    /* TOWNS: the players' outposts carried into a reset world */
 #include "../common/teamwire.h"    /* TEAMMAP: kMaxWork - research work at the host's bench (WORK) */
+#include <mygui/MyGUI_UString.h>   /* TEAMMAP: the host's research shown on a teammate's panel of the host's town */
+#include <mygui/MyGUI_ProgressBar.h>
 #include "../common/boxowner.h"    /* WorldNodeOf - a world resource node is nobody's piece */
 #include "../common/slotwire.h"    /* P18 fold 2: StandInSlotOfId / IsLegacyPeerId - a saved owner id read as a stand-in record */
 #include "../common/boxowner.h"    /* build1h: HouseOwnerOfNewPiece */
@@ -9392,6 +9394,7 @@ void BdTownKeysWalk(DWORD now, const std::set<void*>& myTowns)
    on a new slot, and every kTownSayAgainMs; split over several messages when it would pass one) */
 int BdTownSizePod(void* town);               /* TEAMMAP (beside BdTeamTownsTick): the engine's own size count on a town; 0 = missing or faulted */
 int BdTownStagePod(void* town, int* stage);   /* TEAMMAP: the town's map size stage (+0x388) */
+int BdTownPublicPod(void* town);              /* TEAMMAP: the town's "open to public" byte (+0x380): 1 / 0, -1 unreadable */
 void BdTownsSayTick()
 {
     const DWORD now = ::GetTickCount();
@@ -9421,6 +9424,7 @@ void BdTownsSayTick()
                                       here grows and shrinks with the base, and the stage said is the one this map shows */
         int stage = 0;
         if (BdTownStagePod(towns[i], &stage) != 0 && stage >= 0 && stage <= townkeep::kStageMax) t.stage = stage;
+        t.pub = BdTownPublicPod(towns[i]) == 1 ? 1 : 0;   /* TEAMMAP: its "open to public" setting, which a teammate's copy takes */
         rows.push_back(t);
         rowTown.push_back(towns[i]);
     }
@@ -10472,6 +10476,25 @@ typedef bool (*BdBenchIdleFn)(void* bench);
 static BdBenchIdleFn orig_benchidle = 0;
 static int g_hkBenchIdle = 0;
 static int g_idleSent = -1;
+static std::string g_hostTech, g_techSent;   /* the host's current tech (as its game told it) / the tech this host last told */
+static float g_hostFrac = 0.0f;
+static DWORD g_techReadAt = 0;
+static std::string g_techNow;
+const DWORD kTechReadMs = 5000;            /* the host reads its queue's front tech (Research::save) at most this often */
+static unsigned long long kBdResProgRva = 0; static AddrReg kBdResProgRva_reg("ResearchCurrentProgress", &kBdResProgRva);   /* 1.0.68 0x82F090: the current tech's progress 0..1 */
+typedef float (*BdResProgFn)(void* research, int index);
+int BdResearchProgressPod(uintptr_t base, float* frac)
+{
+    __try
+    {
+        void* pi = *(void**)(base + (uintptr_t)kBdResPiRva);
+        void* research = pi != 0 ? *(void**)((char*)pi + 0x38) : 0;
+        if (research == 0 || kBdResProgRva == 0) return 0;
+        *frac = ((BdResProgFn)(base + (uintptr_t)kBdResProgRva))(research, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 static DWORD g_idleSentAt = 0;
 const DWORD kWorkStateAgainMs = 10000;
 /* 1 = this game's research has nothing queued, 0 = running, -1 = unreadable */
@@ -10495,9 +10518,10 @@ bool detour_benchidle(void* bench)
     if (!BdIsMateFaction(owner)) return r;
     return BdLocalResearchIdlePod((uintptr_t)::GetModuleHandleA(0)) == 1;
 }
-void TeamWorkStateArrived(unsigned fromSlot, bool idle)
+void TeamWorkStateArrived(unsigned fromSlot, bool idle, const std::string& tech, float frac)
 {
     if ((int)fromSlot != kTeamHostSlot) return;
+    g_hostTech = tech; g_hostFrac = frac;
     if (g_hostIdleKnown == 0 || (g_hostResearchIdle != 0) != idle)
         DebugLog(std::string("[TEAMMAP] the host's research is ") + (idle ? "IDLE - workers at the host's benches stop" : "running - workers at the host's benches work"));
     g_hostIdleKnown = 1; g_hostResearchIdle = idle ? 1 : 0;
@@ -10506,12 +10530,62 @@ void TeamWorkStateArrived(unsigned fromSlot, bool idle)
 void BdTeamWorkStateTick(DWORD now)
 {
     if (KeptMySlot() != kTeamHostSlot || g_mateFacN == 0 || kBdResPiRva == 0) return;
-    const int idle = BdLocalResearchIdlePod((uintptr_t)::GetModuleHandleA(0));
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const int idle = BdLocalResearchIdlePod(base);
     if (idle < 0) return;
-    if (idle == g_idleSent && g_idleSentAt != 0 && now - g_idleSentAt < kWorkStateAgainMs) return;
-    if (!TeamWorkStateSend(idle == 1)) return;
+    if (idle == 1) g_techNow.clear();
+    else if (g_techReadAt == 0 || now - g_techReadAt >= kTechReadMs || g_techNow.empty())
+    {   /* the queue's front tech, read through Research::save (StoreResearchQueue) - not every second */
+        g_techReadAt = now;
+        std::vector<std::pair<std::string, float> > q; std::string qt, qwhy;
+        if (StoreResearchQueue(&q, &qt, &qwhy) && !q.empty() && q[0].first.size() <= swteam::kMaxName) g_techNow = q[0].first;
+    }
+    float frac = 0.0f;
+    if (idle == 0 && BdResearchProgressPod(base, &frac) != 1) frac = 0.0f;
+    if (!(frac >= 0.0f)) frac = 0.0f; if (frac > 1.0f) frac = 1.0f;
+    /* idle: at a change and every kWorkStateAgainMs; running: every look (the teammates' panels follow the progress bar) */
+    if (idle == 1 && idle == g_idleSent && g_idleSentAt != 0 && now - g_idleSentAt < kWorkStateAgainMs) return;
+    if (!TeamWorkStateSend(idle == 1, idle == 1 ? std::string() : g_techNow, frac)) return;
+    g_techSent = g_techNow;
     if (idle != g_idleSent) DebugLog(std::string("[TEAMMAP] this host's research is ") + (idle == 1 ? "IDLE" : "running") + " - told to the team");
     g_idleSent = idle; g_idleSentAt = now;
+}
+/* THE HOST'S RESEARCH ON A TEAMMATE'S PANEL OF THE HOST'S TOWN (main thread). The town panel's update (0x727380 on 1.0.68; the panel's
+   first field is the town shown) writes the local player's current research into its "Research:" line (the widget at panel+0x30) and
+   bar (panel+0x28) - on a teammate's game the teammate's own, so a teammate helping at the host's bench saw "None". After the engine's
+   update, a panel of the host's town shows the host's research as the host's game last told it (teamwire.h WORK STATE). */
+static unsigned long long kBdTownPanelRva = 0; static AddrReg kBdTownPanelRva_reg("TownPanelUpdate", &kBdTownPanelRva);   /* 1.0.68 0x727380 */
+typedef void (*BdTownPanelFn)(void* panel);
+static BdTownPanelFn orig_townpanel = 0;
+static int g_hkTownPanel = 0;
+static long long g_panelShown = 0, g_panelFaults = 0;
+int BdPanelTownPod(void* panel, void** town, void** caption, void** bar)
+{
+    __try { *town = *(void**)panel; *caption = *(void**)((char*)panel + 0x30); *bar = *(void**)((char*)panel + 0x28); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+typedef void (*BdSetCaptionFn)(void* widget, const MyGUI::UString* text);
+int BdPanelWritePod(void* caption, void* bar, const MyGUI::UString* text, size_t pos)
+{
+    __try
+    {
+        if (caption != 0) ((BdSetCaptionFn)((*(void***)caption)[0x88 / 8]))(caption, text);   /* the panel's own call (vt+0x88) */
+        if (bar != 0) ((MyGUI::ProgressBar*)bar)->setProgressPosition(pos);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void detour_townpanel(void* panel)
+{
+    orig_townpanel(panel);
+    if (panel == 0 || g_hostFac == 0 || g_hostIdleKnown == 0) return;
+    void* town = 0; void* caption = 0; void* bar = 0;
+    if (BdPanelTownPod(panel, &town, &caption, &bar) == 0 || town == 0 || BdOwnerFactionPod(town) != g_hostFac) return;
+    const std::string name = (g_hostResearchIdle != 0 || g_hostTech.empty()) ? std::string("None") : StoreResearchNameOf(g_hostTech);
+    const MyGUI::UString text(name);
+    const size_t pos = (g_hostResearchIdle != 0) ? 0 : (size_t)(g_hostFrac * 100.0f + 0.5f);
+    if (BdPanelWritePod(caption, bar, &text, pos) == 0) { if (++g_panelFaults <= 3) ErrorLog("[TEAMMAP] the host's research on this panel FAULTED - the panel shows this player's own"); return; }
+    if (++g_panelShown == 1) DebugLog("[TEAMMAP] a panel of the host's town shows the host's research '" + name + "' (the first; later ones are counted)");
 }
 void InstallTeamMap()
 {
@@ -10522,17 +10596,29 @@ void InstallTeamMap()
     g_hkPlayerTown = (g_hkTownNearest == 1) ? BdHook(base, kBdPlayerTownRva, (void*)&detour_playertown, (void**)&orig_playertown) : -3;
     g_hkPieceTown = (g_hkPlayerTown == 1) ? BdHook(base, kBdPieceTownRva, (void*)&detour_piecetown, (void**)&orig_piecetown) : -3;
     g_hkResAdd = BdHook(base, kBdResAddRva, (void*)&detour_resadd, (void**)&orig_resadd);
+    g_hkTownPanel = BdHook(base, kBdTownPanelRva, (void*)&detour_townpanel, (void**)&orig_townpanel);
     g_hkBenchIdle = (kBdResPiRva == 0) ? -2 : BdHook(base, kBdBenchIdleRva, (void*)&detour_benchidle, (void**)&orig_benchidle);
     g_hkResWork = (kBdResAddRva == 0 || kBdResPiRva == 0) ? -2 : BdHook(base, kBdResWorkRva, (void*)&detour_reswork, (void**)&orig_reswork);
     g_hkPreviewCheck = (g_hkTownNearest == 1) ? BdHook(base, kBdPreviewCheckRva, (void*)&detour_previewcheck, (void**)&orig_previewcheck) : -3;
     const std::string msg = std::string("[TEAMMAP] teammates drawn as one's own on the map: marker colour hook ") + HkWord(g_hkMarkerColour)
         + ", town icon hook " + HkWord(g_hkTownIcon) + ", build-in-teammate's-town hooks " + HkWord(g_hkTownNearest) + " / "
-        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork) + ", bench idle hook " + HkWord(g_hkBenchIdle) + ", research rate counter " + HkWord(g_hkResAdd)
+        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork) + ", bench idle hook " + HkWord(g_hkBenchIdle) + ", research rate counter " + HkWord(g_hkResAdd) + ", town panel hook " + HkWord(g_hkTownPanel)
         + ", join-teammate's-town hooks " + (g_hkPlayerTown == -3 ? "skipped" : HkWord(g_hkPlayerTown)) + " / " + (g_hkPieceTown == -3 ? "skipped" : HkWord(g_hkPieceTown)) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
     if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && g_hkResWork == 1 && g_hkBenchIdle == 1 && g_hkPlayerTown == 1 && g_hkPieceTown == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
 }
 /* MAIN THREAD (BdTeamTownsTick): a teammate's town here takes the stage its owner's game said (TownRow::stage, that game's own count of its
    base), so this map shows the icon the owner's map shows; a change is logged. Counting here instead would count this player's allies. */
+const size_t kBdTownPublic = 0x380;   /* Town: "open to public" (the town panel's checkbox flips this byte, 0x721E50) */
+int BdTownPublicPod(void* town)
+{
+    __try { return *((const unsigned char*)town + kBdTownPublic) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdTownSetPublicPod(void* town, int pub)
+{
+    __try { *((unsigned char*)town + kBdTownPublic) = (unsigned char)(pub != 0 ? 1 : 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 int BdTownSetStagePod(void* town, int stage)
 {
     __try { *(int*)((char*)town + kBdTownStage) = stage; return 1; }
@@ -10540,6 +10626,14 @@ int BdTownSetStagePod(void* town, int stage)
 }
 void BdTeamTownStage(const townkeep::TownRow& t, void* town)
 {
+    /* the owner's "open to public" setting too (the host town overrides what a teammate's copy was set to here) */
+    const int pubNow = (town != 0) ? BdTownPublicPod(town) : -1;
+    if (pubNow >= 0 && pubNow != t.pub && BdTownSetPublicPod(town, t.pub) != 0)
+    {
+        char pl[240];
+        _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[TEAMMAP] teammate slot %d's outpost '%.80s' open to public %s as its owner set it", t.owner, t.name.c_str(), t.pub != 0 ? "ON" : "OFF");
+        DebugLog(std::string(pl));
+    }
     int before = 0;
     if (town == 0 || BdTownStagePod(town, &before) == 0 || before == t.stage) return;
     const int ok = BdTownSetStagePod(town, t.stage);

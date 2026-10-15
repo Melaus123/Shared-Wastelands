@@ -68,7 +68,8 @@ const int kTownsFormat = 2;   /* the outpost list files' format this build write
 const int kTownsFormatKeyless = 1;   /* the format before it (no cut field): still read */
 const unsigned kSayFirst = 1, kSayMore = 2, kSayWhole = 4;   /* a SAY's flags word */
 const unsigned kKeysCut = 0x80000000u;   /* on a TOWN's key count: the outpost has pieces its list does not name */
-const unsigned kStageShift = 24;         /* on a TOWN's key count, bits 24-30: the outpost's map size stage (TownRow::stage) */
+const unsigned kStageShift = 24;         /* on a TOWN's key count, bits 24-25: the outpost's map size stage (TownRow::stage) */
+const unsigned kPublicBit = 1u << 26;    /* on a TOWN's key count: the outpost is open to the public (TownRow::pub); bits 27-30 must be 0 */
 const int kStageMax = 3;                 /* Town+0x388: 0 none, 1 Village, 2 Outpost, 3 Town (the engine's own player-town icon) */
 const size_t kTownsMsgBytes = 60000;   /* one TOWNS message at most: under the world-server road's 64 KiB (liveenvelope.h kLiveInnerMax) with room for its headers */
 const float kTownSameRadius = 50.0f;    /* Guess: a town of the owner's faction whose centre is this close (x, z) to a kept outpost's centre is that outpost */
@@ -83,7 +84,8 @@ struct TownRow
     int cut;                         /* 1 = the outpost has pieces keys does not name (its game's list was cut, or not every piece could be read) */
     int stage;                       /* SAY and SAID: the outpost's map size stage as its owner's game counts it (0..kStageMax), so a teammate's map shows
                                         the icon the owner sees; 0 in LIST and in both files */
-    TownRow() : owner(-1), cut(0), stage(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; }
+    int pub;                         /* SAY and SAID: the outpost's "open to public" setting on its owner's game (Town+0x380), so a teammate's copy takes it */
+    TownRow() : owner(-1), cut(0), stage(0), pub(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; }
 };
 
 inline bool HandSame(const int* a, const int* b) { for (int i = 0; i < 5; ++i) if (a[i] != b[i]) return false; return true; }
@@ -101,7 +103,7 @@ inline bool RowOk(const TownRow& t, unsigned op)
     if (op == kOpSay) { if (t.owner != -1) return false; }
     else if (op == kOpList || op == kOpSaid) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
     else return false;
-    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.stage < 0 || t.stage > kStageMax) return false;
+    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.stage < 0 || t.stage > kStageMax || (t.pub != 0 && t.pub != 1)) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(t.pos[j])) return false;
     if (!keptwire::TextOk(t.name, keptwire::kStrMax, true)) return false;
     std::set<std::string> seen;
@@ -145,7 +147,7 @@ inline bool EncodeTowns(std::vector<char>* out, unsigned op, int first, const st
         for (int j = 0; j < 5; ++j) keptwire::PutI32(out, t.hand[j]);
         for (int j = 0; j < 3; ++j) keptwire::PutF32(out, t.pos[j]);
         keptwire::PutStr(out, t.name);
-        keptwire::PutU32(out, (unsigned)t.keys.size() | (t.cut != 0 ? kKeysCut : 0u) | ((unsigned)t.stage << kStageShift));
+        keptwire::PutU32(out, (unsigned)t.keys.size() | (t.cut != 0 ? kKeysCut : 0u) | ((unsigned)t.stage << kStageShift) | (t.pub != 0 ? kPublicBit : 0u));
         for (size_t k = 0; k < t.keys.size(); ++k) keptwire::PutStr(out, t.keys[k]);
     }
     return true;
@@ -167,7 +169,9 @@ inline int DecodeTowns(const char* p, size_t n, unsigned* op, int* first, std::v
         t.name = r.Str(keptwire::kStrMax, true);
         const unsigned nkw = r.U32(), nk = nkw & ((1u << kStageShift) - 1u);
         t.cut = (nkw & kKeysCut) != 0 ? 1 : 0;
-        t.stage = (int)((nkw & ~kKeysCut) >> kStageShift);   /* above kStageMax: RowOk refuses the row */
+        t.stage = (int)((nkw >> kStageShift) & 3u);
+        t.pub = (nkw & kPublicBit) != 0 ? 1 : 0;
+        if ((nkw & 0x78000000u) != 0) return 0;   /* bits 27-30: no meaning yet - refused */
         if (r.bad || nk > kMaxTownKeys || (size_t)nk > (r.n - r.at) / 5) return 0;   /* a key takes 5 bytes at least */
         for (unsigned k = 0; k < nk && !r.bad; ++k) t.keys.push_back(r.Str(keptwire::kKeyMax, false));
         if (r.bad || !RowOk(t, o)) return 0;

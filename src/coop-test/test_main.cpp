@@ -11793,7 +11793,7 @@ void t_par1_parity_wire()
     if (cooppar::ParityQuality100(nan) != 0) Fail("a NaN quality is not read as 0");
 }
 
-/* P15 (protocol 98): a STATE's destroyed bit (the complete byte's bit 1) and the pure destroyed-state decisions. */
+/* P15 (protocol 99): a STATE's destroyed bit (the complete byte's bit 1) and the pure destroyed-state decisions. */
 void t_p15_destroyed_state()
 {
     coopbuild::BuildMsg s; s.kind = coopbuild::kBuildState; s.key = "P7n|ruin"; s.progress = 0.0f; s.needed = 4.0f;
@@ -28123,13 +28123,13 @@ void t_t716_repair_removed()
 }
 void t_t313_protocol_63_both_sides()
 {
-    if (coopfeed::kFeedProtocol != 98 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 98) Fail("the feed's protocol/message numbers are not 98/58");
+    if (coopfeed::kFeedProtocol != 99 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 99) Fail("the feed's protocol/message numbers are not 99/58");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
-    if (plugin.find("const unsigned int kStoreProtocol = 98;") == std::string::npos) Fail("the plugin does not speak world-server protocol 98");
-    if (server.find("const unsigned int kProtocol = 98;") == std::string::npos) Fail("the world server does not speak protocol 98");
-    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 98u) Fail("OWED is not 63 (protocol 98) on both sides and in owedpop.h");
-    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 98u) Fail("TOWN_LOSS is not 64 (protocol 98) on both sides and in townrefill.h");
+    if (plugin.find("const unsigned int kStoreProtocol = 99;") == std::string::npos) Fail("the plugin does not speak world-server protocol 99");
+    if (server.find("const unsigned int kProtocol = 99;") == std::string::npos) Fail("the world server does not speak protocol 99");
+    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 99u) Fail("OWED is not 63 (protocol 99) on both sides and in owedpop.h");
+    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 99u) Fail("TOWN_LOSS is not 64 (protocol 99) on both sides and in townrefill.h");
     if (plugin.find("kStoreMsgBundle = 59;") == std::string::npos || server.find("MSG_BUNDLE = 59") == std::string::npos || coopbundle::kMsgBundle != 59u) Fail("BUNDLE is not 59 on both sides and in sendbundle.h");
     if (plugin.find("kStoreMsgRecordFeed = 58;") == std::string::npos || server.find("MSG_RECORD_FEED = 58") == std::string::npos) Fail("RECORD_FEED is not 58 on both sides");
 }
@@ -38638,7 +38638,7 @@ void t_t605_store_gate()
 void t_t591_town_refill()
 {
     using namespace townrefill;
-    if (kMsgTownLoss != 64u || kProtocol != 98u) Fail("TOWN_LOSS is not message 64 of protocol 98");
+    if (kMsgTownLoss != 64u || kProtocol != 99u) Fail("TOWN_LOSS is not message 64 of protocol 99");
     Table t;
     if (AddLoss(&t, "town-a") != 1 || AddLoss(&t, "town-a") != 2) Fail("a loss did not add one to its town");
     if (AddLoss(&t, "") != 0 || AddLoss(&t, std::string(129, 'x')) != 0 || AddLoss(&t, "a\tb") != 0) Fail("a loss was taken for a town id that is not usable");
@@ -40519,8 +40519,8 @@ void t_t290s3a_proof()
     if (ht.size() != 32 || authproof::kHostTokenBytes != 32 || !authproof::HostTokenDecode(ht, tok2) || std::memcmp(tok2, tok, 32) != 0) Fail("HOST_TOKEN is not {token 32}, or its round trip");
     ht.push_back(0);
     if (authproof::HostTokenDecode(ht, tok2)) Fail("a 33-byte HOST_TOKEN is read");
-    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 98u)
-        Fail("the message numbers are not 65/66/67/68 of protocol 98");
+    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 99u)
+        Fail("the message numbers are not 65/66/67/68 of protocol 99");
 }
 
 /* auth.txt: the line the host's game writes reads back; a file with no key line is no password; anything unreadable is bad */
@@ -41899,7 +41899,7 @@ void t_t36g_wire_and_rules()
     if (keptwire::RowOk(bad)) Fail("wire2: a door state of 4 is valid");
     bad = w; bad.p.doors.resize(keptwire::kMaxDoors + 1, d);
     if (keptwire::RowOk(bad)) Fail("wire2: a row of 33 doors is valid");
-    if (keptwire::kProtocol != 98u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 98");
+    if (keptwire::kProtocol != 99u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 99");
     /* RecordHoldsItems' 'has' mode (zonekeep::KeptItemsHas) and its 'all' mode count a pack's own items */
     std::vector<std::string> box(1, "4003-gamedata.base");
     if (zonekeep::KeptItemsHas(std::vector<zonekeep::KeptItem>(1, pack), box) != 1) Fail("has2: a box holding a kept pack's item is not 'has'");
@@ -41945,8 +41945,11 @@ void t_teamtowns_said()
     TownRow over(say); over.stage = kStageMax + 1; std::vector<TownRow> overRows(1, over);
     if (EncodeTowns(&m, kOpSay, (int)kSayFirst, overRows)) Fail("teamtowns: a stage above kStageMax encodes");
     if (!EncodeTowns(&m, kOpSay, (int)kSayFirst, sayRows)) Fail("teamtowns: a SAY does not encode");
-    m[12 + 4 + 20 + 12 + 4 + say.name.size() + 3] = (char)(kStageMax + 1);   /* the key count's top byte: stage 4, the cut bit cleared */
-    if (DecodeTowns(&m[0], m.size(), &op, &first, &back) != 0) Fail("teamtowns: a stage above kStageMax decodes");
+    m[12 + 4 + 20 + 12 + 4 + say.name.size() + 3] = (char)0x08;   /* the key count's top byte: bit 27, no meaning yet */
+    if (DecodeTowns(&m[0], m.size(), &op, &first, &back) != 0) Fail("teamtowns: a key count with a reserved bit decodes");
+    TownRow pubRow(say); pubRow.pub = 1; pubRow.stage = 2; std::vector<TownRow> pubRows(1, pubRow);
+    if (!EncodeTowns(&m, kOpSay, (int)kSayFirst, pubRows) || DecodeTowns(&m[0], m.size(), &op, &first, &back) != 1 || back[0].pub != 1 || back[0].stage != 2 || back[0].cut != 1)
+        Fail("teamtowns: a SAY's open-to-public bit does not round-trip beside its stage and cut mark");
     std::vector<TownRow> all; ReplaceSlotTowns(&all, 1, sayRows);
     if (all.size() != 1 || all[0].owner != 1 || all[0].stage != kStageMax) Fail("teamtowns: the world server's copy of a SAY drops its stage");
     std::vector<TownRow> none;
@@ -41974,11 +41977,12 @@ void t_teamwork_wire()
     std::vector<char> bad; PutU8(&bad, kUpWork); PutU32(&bad, 0); PutF32(&bad, kMaxWork * 2.0f);
     if (DecodeUp(&bad[0], bad.size(), &u)) Fail("teamwork: an up WORK above kMaxWork decodes");
     bad.push_back(0); if (DecodeUp(&bad[0], bad.size(), &u)) Fail("teamwork: an up WORK with trailing bytes decodes");
-    EncodeWorkState(&b, true);
-    if (!DecodeUp(&b[0], b.size(), &u) || u.kind != kUpWorkState || u.flags != 1) Fail("teamwork: an up WORK STATE does not round-trip");
-    EncodeWorkStateDown(&b, 0, false);
-    if (!DecodeDown(&b[0], b.size(), &d) || d.kind != kDnWorkState || d.fromSlot != 0 || d.workIdle != 0) Fail("teamwork: a down WORK STATE does not round-trip");
-    std::vector<char> st; PutU8(&st, kUpWorkState); PutU8(&st, 2);
+    if (!EncodeWorkState(&b, false, "1234-gamedata.base", 0.25f) || !DecodeUp(&b[0], b.size(), &u) || u.kind != kUpWorkState || u.flags != 0 || u.name != "1234-gamedata.base" || u.rel != 0.25f)
+        Fail("teamwork: an up WORK STATE does not round-trip");
+    if (EncodeWorkState(&b, false, "x", 1.5f) || EncodeWorkState(&b, false, "x", nan)) Fail("teamwork: a WORK STATE progress outside 0..1 encodes");
+    if (!EncodeWorkStateDown(&b, 0, true, "", 0.0f) || !DecodeDown(&b[0], b.size(), &d) || d.kind != kDnWorkState || d.fromSlot != 0 || d.workIdle != 1 || !d.workTech.empty())
+        Fail("teamwork: a down WORK STATE does not round-trip");
+    std::vector<char> st; PutU8(&st, kUpWorkState); PutU8(&st, 2); PutU32(&st, 0); PutF32(&st, 0.0f);
     if (DecodeUp(&st[0], st.size(), &u)) Fail("teamwork: a WORK STATE flag of 2 decodes");
 }
 /* outposts (townkeep.h): the TOWNS wire and both files fail closed, a said outpost matched to its kept pieces by handle then by
