@@ -132,6 +132,7 @@
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
+void* BdTeamCopyTown(const float* pos, void* owner);   /* TEAMMAP: the host's town a teammate's copied piece joins (defined with the team map) */
 
 int ItKeptBoxCount(void* b);   /* items.cpp: the item stacks in a box, every section (-1 = no inventory, or not read). MAIN THREAD */
 int ItKeptBoxMine(void* b, const float* pos, const char* key);   /* items.cpp: 1 = this game writes box b now. MAIN THREAD */
@@ -1791,11 +1792,12 @@ void* BdGetData(uintptr_t fn, uintptr_t container, const std::string* sid)
     __try { return ((BdGdcGetDataFn)fn)((void*)container, sid); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+void* g_bdCopyTown = 0;   /* TEAMMAP: the town a copy being made joins (BdTeamCopyTown), 0 = the engine picks it */
 void* BdCallCreate(BdCreateFn fn, void* factory, void* data, float* pos, void* owner, float* rot, bool completed, int* faulted)
 {
-    /* the recipe: town 0 (the engine picks it), cb 0, furnitureOf 0, isDoorOf 0, save 0, isIndoorsOf 0,
-       invisible 0, completed as given (0 for the lever, the PLACE's flag for a copy), foliage 0, floor 0, outside 0 */
-    __try { return fn(factory, data, pos, 0, owner, rot, 0, 0, 0, 0, 0, false, completed, false, 0, false); }
+    /* the recipe: town 0 (the engine picks it; TEAMMAP: g_bdCopyTown for a teammate's copy near the host's town), cb 0, furnitureOf 0,
+       isDoorOf 0, save 0, isIndoorsOf 0, invisible 0, completed as given (0 for the lever, the PLACE's flag for a copy), foliage 0, floor 0, outside 0 */
+    __try { return fn(factory, data, pos, g_bdCopyTown, owner, rot, 0, 0, 0, 0, 0, false, completed, false, 0, false); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *faulted = 1; return 0; }
 }
 
@@ -1873,7 +1875,7 @@ int BdOrientPod(void* b, float* q)
 void* BdCallCreateEx(BdCreateFn fn, void* factory, void* data, float* pos, void* owner, float* rot, void* fo, void* indoors,
                      bool completed, int floor, bool outside, int* faulted)
 {
-    __try { return fn(factory, data, pos, 0, owner, rot, 0, fo, 0, 0, indoors, false, completed, false, floor, outside); }
+    __try { return fn(factory, data, pos, g_bdCopyTown, owner, rot, 0, fo, 0, 0, indoors, false, completed, false, floor, outside); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *faulted = 1; return 0; }
 }
 /* build1-e: v rotated by the INVERSE of the unit quaternion q (Ogre w,x,y,z): the host's local frame (answers R1) */
@@ -4691,9 +4693,11 @@ static int BdCopyOneBody(BdPending& p, int* called)
     /* the recipe: town 0, owner coop-peer, cb / furnitureOf / isDoorOf / save / isIndoorsOf 0, completed = the PLACE's flag.
        orig_create bypasses our own detour, and this is not inside a placement commit, so the copy is never taken for a
        new piece of ours. */
+    g_bdCopyTown = BdTeamCopyTown(pos, (void*)want);   /* TEAMMAP: a teammate's piece near the host's town joins it (the host town overrides) */
     void* b = (furn != 0)   /* build1-e: furnitureOf rebuilt from THIS game's host in the builder's form, isIndoorsOf = host */
         ? BdCallCreateEx(fn, factory, gd, pos, (void*)want, rot, fo, host, m.complete != 0, m.floor, m.outside != 0, &faulted)
         : BdCallCreate(fn, factory, gd, pos, (void*)want, rot, m.complete != 0, &faulted);
+    g_bdCopyTown = 0;
     if (b == 0)
     {
         ++g_copyFailed;
@@ -8826,8 +8830,10 @@ void* BdKeptCreate(const keptwire::Row& w, int furn, void* host, float* pos, flo
     }
     const BdCreateFn fn = (orig_create != 0) ? orig_create : (BdCreateFn)(base + (uintptr_t)kBdCreateRva);
     int faulted = 0;
+    g_bdCopyTown = BdTeamCopyTown(pos, owner);   /* TEAMMAP: as for a copy */
     void* b = (furn != 0) ? BdCallCreateEx(fn, factory, gd, pos, owner, rot, fo, host, w.p.complete != 0, w.p.floor, false, &faulted)
                           : BdCallCreate(fn, factory, gd, pos, owner, rot, w.p.complete != 0, &faulted);
+    g_bdCopyTown = 0;
     if (b == 0) { *why = faulted != 0 ? "createBuilding FAULTED" : "createBuilding returned null"; return 0; }
     if (BdOwnerPod(b) != owner) BdSetFactionPod(b, owner);
     return b;
@@ -10586,6 +10592,29 @@ void detour_townpanel(void* panel)
     const size_t pos = (g_hostResearchIdle != 0) ? 0 : (size_t)(g_hostFrac * 100.0f + 0.5f);
     if (BdPanelWritePod(caption, bar, &text, pos) == 0) { if (++g_panelFaults <= 3) ErrorLog("[TEAMMAP] the host's research on this panel FAULTED - the panel shows this player's own"); return; }
     if (++g_panelShown == 1) DebugLog("[TEAMMAP] a panel of the host's town shows the host's research '" + name + "' (the first; later ones are counted)");
+}
+/* A TEAMMATE'S COPIED PIECE NEAR THE HOST'S TOWN JOINS THE HOST'S TOWN (main thread). A copy of another player's piece is made with no
+   town, and the engine gives it the nearest town of any faction - a teammate's shack in the host's base was filed under the NPC town
+   next to it ("Town: Waystation"), so it did not count towards the host's town, its power or its panel. A copy of a teammate's piece
+   is given the host's nearest town within kTeamPieceTownRadius (the engine's own radius for a piece joining its owner's town, 0x4D6D90):
+   on the host's game a town of its own, on a teammate's game its copy of the host's town. The piece stays its owner's. */
+const float kTeamPieceTownRadius = 5000.0f;
+static long long g_teamCopiesJoined = 0;
+void* BdTeamCopyTown(const float* pos, void* owner)
+{
+    if (g_mateFacN == 0 || pos == 0 || !BdIsMateFaction(owner)) return 0;
+    void* host = (KeptMySlot() == kTeamHostSlot) ? (void*)LocalPlayerFaction() : g_hostFac;
+    void* tl = BdTownListPtr();
+    if (host == 0 || tl == 0 || kBdTownNearestRva == 0) return 0;
+    const BdTownNearestFn fn = (orig_townnearest != 0) ? orig_townnearest : (BdTownNearestFn)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)kBdTownNearestRva);
+    float p[3] = { pos[0], pos[1], pos[2] };
+    void* t = fn(tl, p, host, 0, 0, 10);   /* the host's nearest town, any type (10 = any) */
+    float tx = 0.0f, tz = 0.0f;
+    if (t == 0 || BdTownXZPod(t, &tx, &tz) == 0) return 0;
+    const float dx = tx - pos[0], dz = tz - pos[2];
+    if (dx * dx + dz * dz > kTeamPieceTownRadius * kTeamPieceTownRadius) return 0;
+    if (++g_teamCopiesJoined == 1) DebugLog("[TEAMMAP] a teammate's piece copied here joins the host's town (the first; later ones are counted)");
+    return t;
 }
 void InstallTeamMap()
 {

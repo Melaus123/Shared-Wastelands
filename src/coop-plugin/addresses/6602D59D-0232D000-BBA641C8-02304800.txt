@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 522
+!count 521
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -526,7 +526,6 @@ TownGetMapIcon                                 code 0048D970 0048D970 48895C2410
 TownUpdateSize                                 code 0048C200 0048C200 48895C240848896C2410488974241857
 MapMarkerPlayerColour                          var  0212F568 0212F568 -
 PreviewPlacementCheck                          code 004DBA40 004DBA40 488BC4554154415541564157488DA8D8
-TownListNearest                                code 00927F10 00927F10 488BC44C894820488950105541544155
 ResearchBenchWork                              code 0029B8D0 0029B8D0 48895C2408574881ECA000000080B960
 ResearchAddProgress                            code 00836B70 00836B70 40534883EC70488BD98B89740100000F
 PlacementPieceTown                             code 004DB180 004DB180 488BC4554154415541564157488D6898
