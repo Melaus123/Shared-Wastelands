@@ -198,6 +198,10 @@ const unsigned int kClickRetCount = (unsigned int)(sizeof(kClickRets) / sizeof(k
 // There is no per-faction lock state in the engine's record and NOTHING on the wire syncs a door lock, so a
 // press would be a cross-player world-state write with no arbitration. Until door locks are synced (E37) this
 // site gets the engine's own answer and is counted as `ownedByPeerDoorPanelPassedThrough`.
+/* TEAMMAP: Research's bench data (0x82EC70 on 1.0.68: a bench's own stored research entry when the bench is the player's, else a
+   blank default) - a teammate's research bench is answered as this player's own here, so research work at it is reckoned with the
+   bench's own entry, as at a bench of one's own. A teammate only; never a stranger under `shared`. */
+static unsigned long long kResBenchDataRet = 0; static coop::AddrReg kResBenchDataRet_reg("ResearchBenchDataRet", &kResBenchDataRet);   /* 1.0.68 0x82ECBE */
 static unsigned long long kDoorPanelRetNotAnswered = 0; static coop::AddrReg kDoorPanelRetNotAnswered_reg("DoorPanelRetNotAnswered", &kDoorPanelRetNotAnswered);   /* stage 7/9: Steam_1.0.65 0x3044BF.  NOT in kClickRets above, and must not be put back
     there without a door-lock sync on the wire (E37). It is named and counted rather than deleted so that the
     exclusion is a visible decision instead of an absence nobody can see. */
@@ -279,7 +283,7 @@ volatile LONGLONG g_ownedByPeerDoorPanelPassedThrough = 0;
 /* T-546 step 4 (decision 481): a teammate's building opens to this game's player whatever the policy and whatever its class.
    allowedMember: requests the gate allowed because requester and owner share a team; click / doorPanel / cursor / doorCursor:
    engine answers made "this player's own" for a teammate's building at the click sites, the door panel and the two cursors. */
-volatile LONGLONG g_allowedMember = 0, g_memberClick = 0, g_memberDoorPanel = 0, g_memberCursor = 0, g_memberDoorCursor = 0;
+volatile LONGLONG g_allowedMember = 0, g_memberClick = 0, g_memberDoorPanel = 0, g_memberCursor = 0, g_memberDoorCursor = 0, g_memberResearchData = 0;
 volatile LONGLONG g_memberCursorOther = 0;   /* a teammate's type-8 useable with no container: counted, not remapped (as for anyone) */
 // P7c / review-p6u MEDIUM-3: a vtable pointer, a Complete Object Locator or a TypeDescriptor that fell OUTSIDE
 // this module's image, rejected by the P029 walk. It also counts the case where the image size itself could
@@ -495,6 +499,11 @@ char detour_OwnedByAPlayerFaction(void* building)
     if (!inTeam && !shared) return a;
     const uintptr_t base = g_base;
     const uintptr_t rva = (base != 0 && (uintptr_t)ret > base) ? ((uintptr_t)ret - base) : 0;
+    if (inTeam && kResBenchDataRet != 0 && rva == (uintptr_t)kResBenchDataRet)
+    {   /* TEAMMAP: a teammate's research bench is this player's own for Research's bench data (main thread: the research tick) */
+        if (TeammateFaction(FactionOfBuildingPod(building))) { ::InterlockedIncrement64(&g_memberResearchData); return 1; }
+        return a;
+    }
     const bool clickGate = (kGetDefaultTaskRet1 != 0 && rva == (uintptr_t)kGetDefaultTaskRet1)
                         || (kGetDefaultTaskRet2 != 0 && rva == (uintptr_t)kGetDefaultTaskRet2);   /* an empty row is no caller */
     const bool clickHandler = !clickGate && PolicyIsClickRet(rva);

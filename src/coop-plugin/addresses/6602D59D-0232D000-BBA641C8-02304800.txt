@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 521
+!count 522
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -533,3 +533,4 @@ TownListNearestPlayer                          code 00927E40 00927E40 48896C2410
 ResearchBenchIdle                              code 002995E0 002995E0 40534883EC20488B01488BD9FF505848
 ResearchCurrentProgress                        code 0082F090 0082F090 40534883EC60488BDA4885D275534839
 TownPanelUpdate                                code 00727380 00727380 488BC455488DA8A8FDFFFF4881EC5003
+ResearchBenchDataRet                           ret  0082ECBE 0082ECB9 E8914C82FF
