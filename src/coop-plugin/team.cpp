@@ -881,7 +881,8 @@ void TeamArrive(const std::vector<char>& payload)
             DebugLog("[TEAM] record of team " + N((long long)d.recTeam) + " gen " + N((long long)d.rec.gen) + " from the world server: " + N((long long)d.rec.rows.size()) + " NPC factions, "
                      + N((long long)d.rec.stances.size()) + " stances" + (d.rec.seeded ? std::string() : std::string(" (not seeded)")) + " - owed onto this game's faction (records " + N(g_records) + ")");
     }
-    else if (d.kind == swteam::kDnWork) TeamWorkArrived(d.fromSlot, d.work);   /* research work at one of this player's benches */
+    else if (d.kind == swteam::kDnWork) TeamWorkArrived(d.fromSlot, d.work);
+    else if (d.kind == swteam::kDnWorkState) TeamWorkStateArrived(d.fromSlot, d.workIdle != 0);   /* research work at one of this player's benches */
     else if (d.kind == swteam::kDnResearch)
     {
         ++g_resIn;
@@ -1207,6 +1208,12 @@ bool TeamInvitationWaiting(int* fromSlot, std::string* teamName, unsigned* seria
     if (teamName != 0) *teamName = g_invite.teamName;
     if (serial != 0) *serial = g_invite.serial;
     return true;
+}
+bool TeamWorkStateSend(bool idle)
+{
+    std::vector<char> b;
+    swteam::EncodeWorkState(&b, idle);
+    return Send(b);
 }
 bool TeamWorkSend(unsigned toSlot, float amount)
 {

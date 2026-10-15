@@ -111,8 +111,10 @@ const unsigned kMaxSides = 256;           // recorded sides in one team / one RE
 const float kRecLow = -100.0f, kRecHigh = 100.0f;   // the engine's standing scale
 
 enum { kUpInvite = 1, kUpAnswer = 2, kUpLeave = 3, kUpRemove = 4, kUpDisband = 5, kUpRestoreDone = 6, kUpAsk = 7,
-       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpWork = 13 };
-enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnWork = 26 };
+       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpWork = 13, kUpWorkState = 14 };
+enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnWork = 26, kDnWorkState = 27 };
+/* WORK STATE: a member's research is idle (1, nothing queued) or running (0); the world server passes it to the other connected members
+   of its team, and their workers at that member's bench stop while it is idle (up: flags = idle; down: fromSlot, workIdle). */
 /* WORK: research work a member's characters did at a teammate's research bench, for that teammate's research (up: the bench owner's
    slot and the amount; down: the worker's slot and the amount). The world server passes it to the owner's game when both are in one
    team and the owner is connected; the owner's game adds it to its current research. Amounts above kMaxWork are refused. */
@@ -921,6 +923,7 @@ inline bool EncodeResearchUp(std::vector<char>* b, bool whole, const std::vector
 /* false = an amount that is not above 0 and at most kMaxWork (NaN included; nothing is encoded) */
 inline bool EncodeWork(std::vector<char>* b, unsigned toSlot, float amount)
 { b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kUpWork); PutU32(b, toSlot); PutF32(b, amount); return true; }
+inline void EncodeWorkState(std::vector<char>* b, bool idle) { b->clear(); PutU8(b, kUpWorkState); PutU8(b, idle ? 1u : 0u); }
 /* false = not an up message this header knows, or malformed (trailing bytes included) */
 inline bool DecodeUp(const char* p, size_t n, Up* u)
 {
@@ -948,6 +951,7 @@ inline bool DecodeUp(const char* p, size_t n, Up* u)
     else if (u->kind == kUpStance || u->kind == kUpSide) { u->slot = GetU32(&c); u->rel = GetF32(&c); u->flags = GetU32(&c); }
     else if (u->kind == kUpResearch) { u->whole = GetU8(&c); if (u->whole > 1) c.bad = true; GetTechs(&c, &u->techs); }
     else if (u->kind == kUpWork) { u->slot = GetU32(&c); u->rel = GetF32(&c); if (!(u->rel > 0.0f && u->rel <= kMaxWork)) c.bad = true; }
+    else if (u->kind == kUpWorkState) { u->flags = GetU8(&c); if (u->flags > 1) c.bad = true; }
     else if (u->kind != kUpLeave && u->kind != kUpDisband && u->kind != kUpAsk) return false;
     return !c.bad && c.at == n;
 }
@@ -974,7 +978,8 @@ struct Down
     unsigned resTeam, resWhole, resBy;                   // RESEARCH (resBy: the game a reply answers, or the finisher of an OWN tech; 0xFFFFFFFF = for all)
     std::vector<std::string> techs;                      // RESEARCH
     float work;                                          // WORK (fromSlot: the worker)
-    Down() : work(0.0f), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
+    unsigned workIdle;                                   // WORK STATE (fromSlot: the member)
+    Down() : work(0.0f), workIdle(0), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
 };
 /* the table as the games see it: profile ids turned into slots (slotOf: profile id -> slot; a player with no slot is skipped) */
 inline std::vector<WireTeam> ToWire(const Book& b, const std::map<std::string, unsigned>& slotOf)
@@ -1024,6 +1029,7 @@ inline bool EncodeResearchDown(std::vector<char>* b, unsigned team, bool whole, 
 }
 inline bool EncodeWorkDown(std::vector<char>* b, unsigned fromSlot, float amount)
 { b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kDnWork); PutU32(b, fromSlot); PutF32(b, amount); return true; }
+inline void EncodeWorkStateDown(std::vector<char>* b, unsigned fromSlot, bool idle) { b->clear(); PutU8(b, kDnWorkState); PutU32(b, fromSlot); PutU8(b, idle ? 1u : 0u); }
 inline bool DecodeDown(const char* p, size_t n, Down* d)
 {
     if (d == 0) return false;
@@ -1059,6 +1065,7 @@ inline bool DecodeDown(const char* p, size_t n, Down* d)
     }
     else if (d->kind == kDnResearch) { d->resTeam = GetU32(&c); d->resWhole = GetU8(&c); d->resBy = GetU32(&c); if (d->resWhole > 1) c.bad = true; GetTechs(&c, &d->techs); }
     else if (d->kind == kDnWork) { d->fromSlot = GetU32(&c); d->work = GetF32(&c); if (!(d->work > 0.0f && d->work <= kMaxWork)) c.bad = true; }
+    else if (d->kind == kDnWorkState) { d->fromSlot = GetU32(&c); d->workIdle = GetU8(&c); if (d->workIdle > 1) c.bad = true; }
     else return false;
     return !c.bad && c.at == n;
 }

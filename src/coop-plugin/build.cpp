@@ -10154,6 +10154,9 @@ const size_t kTeamMapMates = 8;
 static void* g_mateFac[kTeamMapMates];      /* the teammates' factions here, refreshed every kTeamMapLookMs; only the main thread reads or writes it */
 static size_t g_mateFacN = 0;
 static DWORD g_mateFacAt = 0;
+static int g_hostIdleKnown = 0, g_hostResearchIdle = 0;   /* TEAMMAP: the host's research idle state as its game last told it */
+static int g_inTeamAdd = 0;          /* TEAMMAP: inside an add of teammates' research work (the rate counter) */
+static double g_workSentSum = 0.0;   /* TEAMMAP: work gathered for the host since the last rate line */
 static void* g_hostFac = 0;          /* the host's faction (slot 0) when the host is a teammate of this player, else 0 */
 const DWORD kTeamMapLookMs = 1000;
 const int kTeamHostSlot = 0;          /* the world's host: its town wins where teammates' towns overlap (Mass, 2026-10-14: "the host town should always override") */
@@ -10188,6 +10191,8 @@ bool BdIsMateFaction(void* f)
     for (size_t i = 0; i < g_mateFacN; ++i) if (g_mateFac[i] == f) return true;
     return false;
 }
+void BdResearchRateTick(DWORD now);   /* TEAMMAP: research rate diagnostic (defined below) */
+void BdTeamWorkStateTick(DWORD now);   /* TEAMMAP: the host tells its teammates whether its research is idle (defined below) */
 void BdTeamWorkFlush(DWORD now);   /* TEAMMAP: the research work gathered at the host's benches, sent (defined below) */
 /* MAIN THREAD, every drain: the teammates' factions as this game holds them (a stand-in each), none outside a team */
 void BdTeamMapTick()
@@ -10205,7 +10210,10 @@ void BdTeamMapTick()
     }
     g_mateFacN = n;
     g_hostFac = host;
+    if (host == 0) { g_hostIdleKnown = 0; g_hostResearchIdle = 0; }
     BdTeamWorkFlush(now);
+    BdTeamWorkStateTick(now);
+    BdResearchRateTick(now);
 }
 const void* detour_markercolour(void* obj)
 {
@@ -10237,6 +10245,8 @@ typedef void* (*BdTownNearestFn)(void* list, void* pos, void* faction, void* exc
 static BdTownNearestFn orig_townnearest = 0;
 static int g_inPreviewCheck = 0;
 static long long g_teamBuildAllowed = 0;
+static long long g_teamHostTownAnswers = 0;
+static int g_inPieceTown = 0;
 static int g_hkPreviewCheck = 0, g_hkTownNearest = 0;
 void detour_previewcheck(void* preview)
 {
@@ -10247,6 +10257,14 @@ void detour_previewcheck(void* preview)
 void* detour_townnearest(void* list, void* pos, void* faction, void* exclude, void* allyOf, int type)
 {
     void* t = orig_townnearest(list, pos, faction, exclude, allyOf, type);
+    if (g_inPieceTown != 0 && t == 0 && g_hostFac != 0 && faction != 0 && faction == (void*)LocalPlayerFaction())
+    {   /* the piece's own building step (0x4D6D90, inside PlacementPieceTown) asks for the nearest town of this player's faction and
+           founds "Your Outpost" when there is none close: the host's nearest town is answered instead, and the engine's own distance
+           test there decides whether the building joins it (the host town overrides) */
+        void* h = orig_townnearest(list, pos, g_hostFac, exclude, allyOf, type);
+        if (h != 0 && ++g_teamHostTownAnswers == 1) DebugLog("[TEAMMAP] a building of this player's near the host's town: the host's town answered for its town (the first; later ones are counted)");
+        return h != 0 ? h : t;
+    }
     if (g_inPreviewCheck == 0 || t == 0 || g_mateFacN == 0 || !BdIsMateFaction(BdOwnerFactionPod(t))) return t;
     if (++g_teamBuildAllowed == 1) DebugLog("[TEAMMAP] a placement inside a teammate's town: its town answered as none, so the piece may be placed (the first; later ones are counted)");
     return 0;
@@ -10339,7 +10357,9 @@ void BdTeamWorkFlush(DWORD now)
 void TeamWorkArrived(unsigned fromSlot, float amount)
 {
     if (kBdResAddRva == 0 || kBdResPiRva == 0) return;
+    ++g_inTeamAdd;
     const int r = BdResearchAddPod((uintptr_t)::GetModuleHandleA(0), amount);
+    --g_inTeamAdd;
     if (r == -1) { if (++g_workApplyFaults <= 3) ErrorLog("[TEAMMAP] research work from a teammate FAULTED - not added"); return; }
     if (r == 1 && (++g_workArrived <= 3 || g_workArrived % 300 == 0))
     {
@@ -10356,12 +10376,14 @@ void detour_reswork(void* bench, void* worker, float work)
     if (owner != 0 && owner == g_hostFac)
     {
         float a = 0.0f;
-        if (BdBenchWorkAmountPod(bench, work, &a) == 1 && a > 0.0f) g_workOwed += a;
+        if (BdBenchWorkAmountPod(bench, work, &a) == 1 && a > 0.0f) { g_workOwed += a; g_workSentSum += a; }
         return;
     }
     if (!BdIsMateFaction(owner)) return;
     float amount = 0.0f; int level = 0;
+    ++g_inTeamAdd;
     const int r = BdTeamResearchPod(bench, work, (uintptr_t)::GetModuleHandleA(0), &amount, &level);
+    --g_inTeamAdd;
     if (r == 1 && ++g_teamResearchTicks == 1)
     {
         char line[240];
@@ -10382,7 +10404,6 @@ typedef void (*BdPieceTownFn)(void* placement);
 static BdPieceTownFn orig_piecetown = 0;
 typedef void* (*BdPlayerTownFn)(void* list, void* pos, char flag, float radius);
 static BdPlayerTownFn orig_playertown = 0;
-static int g_inPieceTown = 0;
 static long long g_teamPiecesJoined = 0;
 static int g_hkPieceTown = 0, g_hkPlayerTown = 0;
 void detour_piecetown(void* placement)
@@ -10411,6 +10432,87 @@ void* detour_playertown(void* list, void* pos, char flag, float radius)
     if (++g_teamPiecesJoined == 1) DebugLog("[TEAMMAP] a piece built in a teammate's town joins that town instead of founding an outpost of this player's (the first; later ones are counted)");
     return m;
 }
+/* RESEARCH RATE MEASUREMENT (diagnostic). Every amount the engine adds to this game's research goes through Research::addProgress
+   (0x836B70); it is hooked only to count: this game's own benches (the engine's research events) against the teammates' work this game
+   adds (TeamWorkArrived / BdTeamResearchPod, inside g_inTeamAdd), logged per second every kResRateLogMs while either moved. The worker's
+   side logs the work it sent for the host the same way. Nothing is changed. */
+typedef void (*BdResAddHookFn)(void* research, float amount);
+static BdResAddHookFn orig_resadd = 0;
+static int g_hkResAdd = 0;
+static double g_resOwnSum = 0.0, g_resTeamSum = 0.0;
+static DWORD g_resRateAt = 0;
+const DWORD kResRateLogMs = 10000;
+void detour_resadd(void* research, float amount)
+{
+    if (g_inTeamAdd != 0) g_resTeamSum += amount; else g_resOwnSum += amount;
+    orig_resadd(research, amount);
+}
+void BdResearchRateTick(DWORD now)
+{
+    if (g_resRateAt == 0) { g_resRateAt = now; return; }
+    const DWORD span = now - g_resRateAt;
+    if (span < kResRateLogMs) return;
+    if (g_resOwnSum > 0.0 || g_resTeamSum > 0.0 || g_workSentSum > 0.0)
+    {
+        const double sec = span / 1000.0;
+        char line[260];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research rate over %.0f s: this game's own benches %.2f/s, teammates' work added here %.2f/s, work sent to the host %.2f/s",
+                    sec, g_resOwnSum / sec, g_resTeamSum / sec, g_workSentSum / sec);
+        DebugLog(std::string(line));
+    }
+    g_resOwnSum = g_resTeamSum = g_workSentSum = 0.0; g_resRateAt = now;
+}
+/* WORKERS STOP WHEN THE RESEARCH THEY FEED IS IDLE. A research bench's "nothing to research" test (ResearchBuilding vt+0x4E8,
+   0x2995E0 on 1.0.68) is true only for a bench of the player's own faction with nothing queued in the local research - so workers at
+   a teammate's bench never stopped. At the host's bench the work feeds the host's research, so the test answers the host's state, which
+   the host's game tells the team once a second when it changes and every kWorkStateAgainMs (teamwire.h WORK STATE); at any other
+   teammate's bench the work is this player's own research, so it answers this game's own queue. */
+static unsigned long long kBdBenchIdleRva = 0; static AddrReg kBdBenchIdleRva_reg("ResearchBenchIdle", &kBdBenchIdleRva);   /* 1.0.68 0x2995E0 */
+typedef bool (*BdBenchIdleFn)(void* bench);
+static BdBenchIdleFn orig_benchidle = 0;
+static int g_hkBenchIdle = 0;
+static int g_idleSent = -1;
+static DWORD g_idleSentAt = 0;
+const DWORD kWorkStateAgainMs = 10000;
+/* 1 = this game's research has nothing queued, 0 = running, -1 = unreadable */
+int BdLocalResearchIdlePod(uintptr_t base)
+{
+    __try
+    {
+        void* pi = *(void**)(base + (uintptr_t)kBdResPiRva);
+        void* research = pi != 0 ? *(void**)((char*)pi + 0x38) : 0;
+        if (research == 0) return -1;
+        return *(void**)((char*)research + 0x58) == 0 ? 1 : 0;   /* the engine's own test (vt+0x4E8): the current research */
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+bool detour_benchidle(void* bench)
+{
+    const bool r = orig_benchidle(bench);
+    if (g_mateFacN == 0 || bench == 0 || kBdResPiRva == 0) return r;
+    void* owner = BdOwnerFactionPod(bench);
+    if (owner != 0 && owner == g_hostFac) return g_hostIdleKnown != 0 ? (g_hostResearchIdle != 0) : r;
+    if (!BdIsMateFaction(owner)) return r;
+    return BdLocalResearchIdlePod((uintptr_t)::GetModuleHandleA(0)) == 1;
+}
+void TeamWorkStateArrived(unsigned fromSlot, bool idle)
+{
+    if ((int)fromSlot != kTeamHostSlot) return;
+    if (g_hostIdleKnown == 0 || (g_hostResearchIdle != 0) != idle)
+        DebugLog(std::string("[TEAMMAP] the host's research is ") + (idle ? "IDLE - workers at the host's benches stop" : "running - workers at the host's benches work"));
+    g_hostIdleKnown = 1; g_hostResearchIdle = idle ? 1 : 0;
+}
+/* MAIN THREAD (BdTeamMapTick): the host tells its teammates whether its research is idle - at a change, and every kWorkStateAgainMs */
+void BdTeamWorkStateTick(DWORD now)
+{
+    if (KeptMySlot() != kTeamHostSlot || g_mateFacN == 0 || kBdResPiRva == 0) return;
+    const int idle = BdLocalResearchIdlePod((uintptr_t)::GetModuleHandleA(0));
+    if (idle < 0) return;
+    if (idle == g_idleSent && g_idleSentAt != 0 && now - g_idleSentAt < kWorkStateAgainMs) return;
+    if (!TeamWorkStateSend(idle == 1)) return;
+    if (idle != g_idleSent) DebugLog(std::string("[TEAMMAP] this host's research is ") + (idle == 1 ? "IDLE" : "running") + " - told to the team");
+    g_idleSent = idle; g_idleSentAt = now;
+}
 void InstallTeamMap()
 {
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -10419,13 +10521,15 @@ void InstallTeamMap()
     g_hkTownNearest = BdHook(base, kBdTownNearestRva, (void*)&detour_townnearest, (void**)&orig_townnearest);
     g_hkPlayerTown = (g_hkTownNearest == 1) ? BdHook(base, kBdPlayerTownRva, (void*)&detour_playertown, (void**)&orig_playertown) : -3;
     g_hkPieceTown = (g_hkPlayerTown == 1) ? BdHook(base, kBdPieceTownRva, (void*)&detour_piecetown, (void**)&orig_piecetown) : -3;
+    g_hkResAdd = BdHook(base, kBdResAddRva, (void*)&detour_resadd, (void**)&orig_resadd);
+    g_hkBenchIdle = (kBdResPiRva == 0) ? -2 : BdHook(base, kBdBenchIdleRva, (void*)&detour_benchidle, (void**)&orig_benchidle);
     g_hkResWork = (kBdResAddRva == 0 || kBdResPiRva == 0) ? -2 : BdHook(base, kBdResWorkRva, (void*)&detour_reswork, (void**)&orig_reswork);
     g_hkPreviewCheck = (g_hkTownNearest == 1) ? BdHook(base, kBdPreviewCheckRva, (void*)&detour_previewcheck, (void**)&orig_previewcheck) : -3;
     const std::string msg = std::string("[TEAMMAP] teammates drawn as one's own on the map: marker colour hook ") + HkWord(g_hkMarkerColour)
         + ", town icon hook " + HkWord(g_hkTownIcon) + ", build-in-teammate's-town hooks " + HkWord(g_hkTownNearest) + " / "
-        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork)
+        + (g_hkPreviewCheck == -3 ? "skipped" : HkWord(g_hkPreviewCheck)) + ", teammate's research bench hook " + HkWord(g_hkResWork) + ", bench idle hook " + HkWord(g_hkBenchIdle) + ", research rate counter " + HkWord(g_hkResAdd)
         + ", join-teammate's-town hooks " + (g_hkPlayerTown == -3 ? "skipped" : HkWord(g_hkPlayerTown)) + " / " + (g_hkPieceTown == -3 ? "skipped" : HkWord(g_hkPieceTown)) + ", town size " + (kBdTownSizeRva != 0 ? "present" : "missing (a teammate's town keeps the smallest icon)");
-    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && g_hkResWork == 1 && g_hkPlayerTown == 1 && g_hkPieceTown == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
+    if (g_hkMarkerColour == 1 && g_hkTownIcon == 1 && g_hkTownNearest == 1 && g_hkPreviewCheck == 1 && g_hkResWork == 1 && g_hkBenchIdle == 1 && g_hkPlayerTown == 1 && g_hkPieceTown == 1 && kBdTownSizeRva != 0) DebugLog(msg); else ErrorLog(msg);
 }
 /* MAIN THREAD (BdTeamTownsTick): a teammate's town here takes the stage its owner's game said (TownRow::stage, that game's own count of its
    base), so this map shows the icon the owner's map shows; a change is logged. Counting here instead would count this player's allies. */
