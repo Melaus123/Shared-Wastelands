@@ -9,7 +9,9 @@
  * number sits in slot 0's block whoever runs it now, and the game in slot 0 would treat every save squad as its own.
  *
  * THE LOAD FLOOR. Each faction's squad counter (the number the engine hands the next squad) is read once at the first
- * running tick after a load, before any block raise. A number AT OR ABOVE that floor was handed out since the load, so
+ * running tick after a load, before any block raise, and kept under the faction's stable internal name (FloorKey: its
+ * game-data stringID), never under the name it shows: a faction renamed after the load keeps its floor, and a player's
+ * faction showing an NPC faction's name keeps its own. A number AT OR ABOVE that floor was handed out since the load, so
  * its block is the maker: the number rule stands (the stale-reload guard depends on it). A number BELOW the floor came
  * from the save: the squad is decided by the game that runs it now, when that is known; when it is not, the number rule
  * stands, so nothing is decided worse than before.
@@ -22,6 +24,9 @@
  */
 #ifndef SQUADORIGIN_H_INCLUDED
 #define SQUADORIGIN_H_INCLUDED
+
+#include <string>
+#include "factionkey.h"   /* SidUsable: a stringID usable as a key */
 
 namespace sqorigin {
 
@@ -65,12 +70,35 @@ inline int RunBy(int handoverSlot, int membersSlot, int holderSlot, int recordSl
     *why = kFallback; return -1;
 }
 
-/* the load floor of a faction name several factions share (a stand-in faction carries another player's faction name):
+/* the load floor of a key several factions share (two factions whose stringIDs cannot be read and that show one name):
    the LOWEST counter, so a number is called "from the save" only when it is below every one of them - a squad of the
    higher-counter faction that is wrongly called "made here" keeps the number rule, which is no worse than before */
 inline unsigned FloorMerge(int haveFloor, unsigned floorNow, unsigned counter)
 {
     return (haveFloor == 0 || counter < floorNow) ? counter : floorNow;
+}
+
+/* THE LOAD FLOOR'S KEY: a faction's game-data stringID - the same in every game and every language, and unchanged when the
+   faction is renamed. A stringID that cannot be used (unread, empty, too long: factionkey.h SidUsable) falls back to the name
+   the faction shows, with a leading '@' so that it never equals a stringID. */
+inline std::string FloorKey(const std::string& sid, const std::string& name)
+{
+    return factionkey::SidUsable(sid) ? sid : std::string("@") + name;
+}
+/* the shown-name index, for an asker that holds only a squad id and no faction (the id's name part is the name its faction
+   showed when the squad was numbered): a name one key shows names that key; a name factions of different keys show names
+   none (the empty key - no floor, so the number rule decides). haveEntry 0: the name's first faction. */
+inline std::string NameIndexMerge(int haveEntry, const std::string& keyNow, const std::string& key)
+{
+    if (haveEntry == 0) return key;
+    return keyNow == key ? keyNow : std::string();
+}
+/* the key a squad's load floor is looked up by: its faction's (factionKey) when the asker holds the faction and its key was
+   read; otherwise the shown-name index's entry for the id's name part (nameKey); empty = no floor known */
+inline std::string FloorLookupKey(int haveFaction, const std::string& factionKey, int haveName, const std::string& nameKey)
+{
+    if (haveFaction != 0) return factionKey;
+    return haveName != 0 ? nameKey : std::string();
 }
 
 /* the slot this game takes a squad's ownership decisions for. number = the id's number (its block is number / 65,536);

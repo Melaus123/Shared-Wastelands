@@ -1070,6 +1070,64 @@ inline int BuildHelpOrderVerdict(int task, int standIn, int wall)
     if (standIn == 0) return kBuildHelpOrderNone;
     return (wall != 0) ? kBuildHelpOrderWallRefused : kBuildHelpOrderGiven;
 }
+/* T-903 (decisions 920 / 920 a, owner 2026-10-17): who may help build, add materials to and repair another player's piece - a
+   faction-mate (the two players share a team), or a player the piece's owner has set FRIENDLY with the PLAYERS tab's friendly /
+   neutral / enemy buttons (or `relate`). kBuildHelpFriendHelps = 0 makes it faction-mates only. Dismantle is not this rule's: it is
+   faction-mates only (decision 548, BuildDismantleOrderVerdict). */
+const int kBuildHelpFriendHelps = 1;
+inline int HelpAllowedFor(int isTeammate, int isFriendly, int friendHelps)
+{
+    return (isTeammate != 0 || (friendHelps != 0 && isFriendly != 0)) ? 1 : 0;
+}
+inline int HelpAllowed(int isTeammate, int isFriendly) { return HelpAllowedFor(isTeammate, isFriendly, kBuildHelpFriendHelps); }
+/* T-903 re-check fold (item 2), THE OWNER'S GAME, help work about to be applied: applied (0) for a faction-mate or a player the owner
+   has set friendly; REFUSED (1, refunded) only for a KNOWN non-teammate the owner has not set friendly; HELD (2, tried again at the
+   next safe point) while this game's own slot is unknown (no teammate test possible) or the sender's standing is unread (no stand-in
+   yet, or its relation not read) - a legitimate helper is never refused for good on missing knowledge. friendHelps 0: faction-mates
+   only, so the standing is not needed. */
+const int kBuildHelpApplyGo = 0, kBuildHelpApplyRefuse = 1, kBuildHelpApplyHold = 2;
+inline int BuildHelpApplyVerdictFor(int meKnown, int isTeammate, int stanceKnown, int isFriendly, int friendHelps)
+{
+    if (meKnown == 0) return kBuildHelpApplyHold;
+    if (HelpAllowedFor(isTeammate, 0, friendHelps) != 0) return kBuildHelpApplyGo;
+    if (friendHelps == 0) return kBuildHelpApplyRefuse;
+    if (stanceKnown == 0) return kBuildHelpApplyHold;
+    return HelpAllowedFor(0, isFriendly, friendHelps) != 0 ? kBuildHelpApplyGo : kBuildHelpApplyRefuse;
+}
+inline int BuildHelpApplyVerdict(int meKnown, int isTeammate, int stanceKnown, int isFriendly)
+{
+    return BuildHelpApplyVerdictFor(meKnown, isTeammate, stanceKnown, isFriendly, kBuildHelpFriendHelps);
+}
+/* T-903: a COMPLETE piece that is not a ruin is damaged when its health is short of full - health is the progress field (state+4)
+   against needed (state+0x28); a hit on a door or wall subtracts from progress (design p51-help1). Below 0.999 x needed counts. */
+inline int BuildPieceDamaged(int complete, int destroyed, float progress, float needed)
+{
+    return (complete != 0 && destroyed == 0 && needed > 0.0f && progress < needed * 0.999f) ? 1 : 0;
+}
+/* T-903: a repair order (TaskType 95) on a copy another player's stand-in owns: on a ruin it is the P15 ruin help (1), on a complete
+   damaged piece it is repair help (3) - the work reaches the owner's game as HELP_WORK; on a wall either way it is refused (2, wall
+   work is not synced, T-221). Anything else 0. */
+const int kBuildRepairOrderDamagedHelp = 3;
+inline int BuildRepairHelpVerdict(int task, int standInOwned, int destroyed, int damaged, int wall)
+{
+    if (task != kBuildTaskRepair || standInOwned == 0 || (destroyed == 0 && damaged == 0)) return kBuildRepairOrderNone;
+    if (wall != 0) return kBuildRepairOrderRefused;
+    return destroyed != 0 ? kBuildRepairOrderHelp : kBuildRepairOrderDamagedHelp;
+}
+/* T-903, THE OWNER'S GAME: repair work (a HELP_WORK whose piece is complete here) - the piece's new health, never above needed */
+inline float BuildRepairApplyTo(float p0, float dP, float needed)
+{
+    const float v = p0 + (dP > 0.0f ? dP : 0.0f);
+    return v > needed ? needed : v;
+}
+/* T-903 fold (review HIGH 1), THE OWNER'S GAME: the repair health written through updatePhysicalWithProgress 0x558680, which finishes a
+   piece at progress >= needed while the piece's own complete byte (+0x160) is 0 - with that byte set the health may reach needed;
+   without it, it stays below 0.999 x needed (the cap every other caller of 0x558680 keeps), so the finish never runs from repair */
+inline float BuildRepairFinishSafe(float to, float needed, int ownComplete)
+{
+    const float cap = needed * 0.999f;
+    return (ownComplete == 0 && to > cap) ? cap : to;
+}
 /* the unconfirmed work the helper puts back on its copy after the owner's STATE (no flicker back): *dP and d[] ADD, *n = the widest;
    help1 fold 3: not an entry the owner already applied (live) - the STATE's progress holds it */
 inline void BuildHelpSum(const std::vector<BuildHelpEntry>& owed, float* dP, int* n, float* d)
@@ -2016,6 +2074,16 @@ inline int BuildIntoOffsetParse(const std::string& s, float* dx, float* dz)
     if (!(x >= -kBuildIntoOffsetMax && x <= kBuildIntoOffsetMax) || !(z >= -kBuildIntoOffsetMax && z <= kBuildIntoOffsetMax)) return 0;   /* NaN fails too */
     *dx = (float)x; *dz = (float)z;
     return 1;
+}
+
+/* TEST LEVER ONLY (`buildtest town <sid|key-substring>`, T-899): a registry row is named by the argument when its key contains it
+   (1) or its sid is exactly it (2); 0 = not named. An empty argument names nothing. */
+inline int BuildTownArgMatch(const std::string& arg, const std::string& key, const std::string& sid)
+{
+    if (arg.empty()) return 0;
+    if (key.find(arg) != std::string::npos) return 1;
+    if (sid == arg) return 2;
+    return 0;
 }
 
 } // namespace coopbuild

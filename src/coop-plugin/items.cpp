@@ -844,6 +844,10 @@ long long g_grPutNoTaker = 0;   /* ground5 fold 1 (F1): a ground PUT naming no t
 // The owner's rollback book-keeping, and the two GUI detours' own thread census.
 long long g_placedRecv = 0, g_placedUnknownId = 0, g_placedWrongPeer = 0;
 long long g_revokeRecv = 0, g_revokeUnknownId = 0, g_ownerPendFull = 0, g_heldDeferredSent = 0;
+/* T-608 fold: takes / gives refused busy BEFORE anything moved because the owner table read full (ItOwnerFullRefuse - harmless,
+   the asker puts its own copy back). g_ownerPendFull counts the rest: a row missing after the answer (a TAKE's held object
+   destroyed) and a parked TAKE settled on the spare row. */
+long long g_ownerFullRefused = 0;
 /* T-853: the owner's REVOKE of a GIVE it granted. g_revokeOwner: 0 builtRemoved (the object it built, found in its section and
    that quantity removed), 1 builtNotFound (not in that section any more, or not removable - nothing destroyed), 2 builtNone (no
    object was recorded: it merged into a stack at the build - nothing destroyed). g_revokeKeeper (coopgive::RevokeKeeperAction):
@@ -4696,6 +4700,10 @@ void ItFurnCandidates(const ItBoxKeyParts& want, void** cand, long* candY10, int
 /* ItBoxResolve's wire-form look-ups (a key that arrived with its record name verbatim where this game's box keys hash it) */
 long long g_boxKeyWireFormed = 0;
 int g_boxKeyWireSaid = 0;
+/* T-608 (f): while ObjectByPositionKeyHeldMiss runs, ItBoxResolve keeps its NEAR MISS line here instead of printing it (and spends
+   no per-key say budget on it); ObjectByPositionKeyMissSay prints it once the caller's own search inside buildings has failed too. */
+int g_nearMissHold = 0;
+std::string g_nearMissHeldKey, g_nearMissHeldLine;
 void* ItBoxResolve(const char* key)
 {
     g_boxLastVerdict = kObjKeyRefused;   /* build1-e (recheck-build1d F2): every exit below says why it returned */
@@ -4887,11 +4895,11 @@ void* ItBoxResolve(const char* key)
            with its distance in tenths. A zero that cannot be interrogated is not a measurement (6a 12). */
         ++g_boxKeyNearMiss;
         g_boxLastVerdict = (g_boxWalkLastTrunc != 0) ? kObjKeyTruncated : kObjKeyNone;   /* build1-e F2: complete only if untruncated */
-        if (ItBoxSayForKey(key) != 0)
+        if (g_nearMissHold != 0 || ItBoxSayForKey(key) != 0)   /* T-608 (f): a held line spends no say budget until it is said */
         {
             char nk[kBoxKeyCap]; nk[0] = 0;
             const int haveNk = (nearest != 0) ? ItBoxKeyBuild(nearest, nk, kBoxKeyCap, 0, 0) : 0;
-            DebugLog("[ITEMS] box key NEAR MISS '" + std::string(key) + "': nothing in this game's loaded"
+            const std::string nearLine = ("[ITEMS] box key NEAR MISS '" + std::string(key) + "': nothing in this game's loaded"
                      " zones answers to that position key. buildingsInSector=" + N(secHits)
                      + " thenWithinOneTenthOnXZ=" + N(xzHits)
                      + " nearestInSector=" + (haveNk != 0 ? std::string(nk) : std::string("(none, or its own key could not be built)"))
@@ -4903,6 +4911,8 @@ void* ItBoxResolve(const char* key)
                        " games rounded the same building to different tenths, and the fix is not a wider"
                        " window (that merges neighbours) but finding out why the save round trip moved it."
                        " Run boxlist on BOTH games and diff the poskey= columns.");
+            if (g_nearMissHold != 0) { g_nearMissHeldKey = key; g_nearMissHeldLine = nearLine; }
+            else DebugLog(nearLine);
         }
         ItBoxCacheForget(key);
         return 0;
@@ -9751,6 +9761,11 @@ unsigned int g_cfDelayMs = 0;
    ApplyItemRequest). */
 int g_refuseNextLeft = 0;
 int g_refuseNextReason = 0;
+/* T-608 (c): TEST-ONLY `itemtest ownerfull on|off`. 1 = this game, as the OWNER of a character or box take / give, reads its
+   owner table (g_ownerPend) as full, so ItOwnerFullRefuse refuses every such request busy before anything moves (ground, shop and
+   hold / land requests do not ask it). 0 (the default, and all of
+   normal play) = the table's own rows decide. MAIN THREAD only (the command channel and ApplyItemRequest). */
+int g_ownerFullLever = 0;
 /* T-164 B4-2: TEST-ONLY `itemtest refusehere <gate> [n]`. As the REQUESTER, the next n priced moves (a shop trade, or a
    caravan's - T-1 B5, the wandering refusal is retired; at the takerBox exit ANY move - T-164 211 fold-1 F3 asks that gate as priced) that reach the named refusal exit in ItCrossTransfer take it as if that exit's own check had failed -
    after the early put-back, exactly where the real refusal returns, through the same refund - so a run can show every exit's
@@ -11805,8 +11820,8 @@ int ItTakerRemove(::Inventory* inv, ::InventorySection* sec, int x, int y, const
 //        (T-889: the clock is held while the giver is away) means the giver completed its half, and the entry is simply
 //        released (T-853). A REVOKE finds its row by the giver's PLAYER and the request id (ItOwnerGiveFind), so a
 //        giver that reconnected under a new connection id still reaches it.
-/* T-853: a GIVE row lives coopgive::kOwnerGiveStandMs (twice the giver's lapse) of its giver's time in the world; a full table still
-   counts ownerPendFull. T-889: a row whose giver is away is kept until that giver is back, so the rows of a giver who never returns
+/* T-853: a GIVE row lives coopgive::kOwnerGiveStandMs (twice the giver's lapse) of its giver's time in the world; a full table
+   refuses a new take / give busy (ownerFullRefused, T-608). T-889: a row whose giver is away is kept until that giver is back, so the rows of a giver who never returns
    keep their slots of these 64 until the world is torn down. */
 const int kOwnerPendCap = 64;
 const unsigned int kOwnerPendTimeoutMs = 10000;   // the plan's 10 s, re-armed by the tick, never a one-shot
@@ -11897,6 +11912,30 @@ ItOwnerPend* ItOwnerPendAlloc()
         if (g_ownerPend[i].used == 0) { std::memset(&g_ownerPend[i], 0, sizeof(ItOwnerPend)); g_ownerPend[i].used = 1; return &g_ownerPend[i]; }
     return 0;
 }
+/* T-608 (a), MAIN THREAD: would ItOwnerPendAlloc fail now? 0 = a row is free; 1 = every row is in use; 2 = the TEST-ONLY
+   `itemtest ownerfull on` lever reads the table as full (g_ownerFullLever). Allocates nothing. */
+int ItOwnerPendFullNow()
+{
+    if (g_ownerFullLever != 0) return 2;
+    for (int i = 0; i < kOwnerPendCap; ++i) if (g_ownerPend[i].used == 0) return 0;
+    return 1;
+}
+/* T-608 (a), MAIN THREAD (ApplyItemRequest, before anything moves): 1 = refuse this TAKE / GIVE busy - the owner table reads full
+   (ItOwnerPendFullNow), counted ownerFullRefused and logged (the first 20, then every 100th); 0 = a row is free, go on. */
+int ItOwnerFullRefuse(const ItemRequestMsg& r, unsigned int fromPeer)
+{
+    const int full = ItOwnerPendFullNow();
+    if (full == 0) return 0;
+    ++g_ownerFullRefused;
+    if (g_ownerFullRefused <= 20 || (g_ownerFullRefused % 100) == 0)
+        DebugLog("[ITEMS] request " + N((long long)r.id) + " (" + std::string(r.dir == 0 ? "TAKE" : "GIVE") + " on "
+                 + (r.ownerUid != 0 ? "character " + N((long long)r.ownerUid) : "box '" + r.ownerBoxKey + "'") + ", from sender "
+                 + N((long long)fromPeer) + ") REFUSED busy: "
+                 + (full == 2 ? std::string("the TEST-ONLY ownerfull lever is on")
+                              : "every one of the " + N((long long)kOwnerPendCap) + " owner rows is in use")
+                 + " - nothing moved here; the asker puts its own copy back and may ask again (ownerFullRefused " + N(g_ownerFullRefused) + ")");
+    return 1;
+}
 
 /* ================= inv7c: THE ESCROW (e47-inv7-replan.md section 5; decision D6) =================
    OWNER: a TAKE row whose ok CONFIRM went out is no longer rolled back blindly at 10 s - it moves to ESCROW (the object stays
@@ -11983,28 +12022,50 @@ static ItOwnerPend* ItEscrowFindRelinked(unsigned int id, unsigned int fromPeer)
 }
 /* T-889, MAIN THREAD: the GIVE row a REVOKE names - by the giver's PLAYER and the request id, never by the connection id alone: a
    giver that reconnected (the host numbers a returning joiner afresh) sends its REVOKE from a new id. A row of that same connection
-   id first; else one of the same player (coopesc::SameSender against the key kept at the grant, as the escrow's relinked rows are
-   matched). Request ids start at a random base at each launch (reqserial.h), so a row left by that player's earlier launch shares
-   a new request's id only by chance; the REVOKE carries no launch number that could tell the two apart. *byPlayer: 1 when the row
-   was found only through the player. */
+   id first; else one of the same player (coopgive::GiveSamePlayer, T-608 (b)): the key kept at the grant and the sender's, both
+   folded by the link's slot - so a row asked on the session link answers a REVOKE that came through the notebook and the other
+   way round, and a row answers its reconnected giver once that link's slot is known; while the link's slot is unknown, a raw row
+   answers a raw sender only when that sender is the current session peer (not any raw key, as coopesc::SameSender would).
+   Neither test tells a row left by the same player's EARLIER game process from a new one - such a row matches as any row of
+   that player does - nor, while the link's slot is unknown, a raw row kept from an earlier, DIFFERENT session peer (the
+   giver-away hold keeps such rows) from the current peer's. What keeps either from answering a new REVOKE is the request id alone: request ids start at a random base at
+   each launch (reqserial.h), so the two share an id only by chance; the REVOKE carries no launch number. *byPlayer: 1 when the
+   row was found only through the player. */
 static ItOwnerPend* ItOwnerGiveFind(unsigned int id, unsigned int fromPeer, int* byPlayer)
 {
     *byPlayer = 0;
-    const unsigned int from = ItEscSenderKey(fromPeer);
-    const int mySlotKnown = ItEscMySlotKnown();
-    const int fromSess = ItEscRawIsSessionPeer(from);
+    const int linkSlot = LinkPeerSlot();
+    const int fromSess = ItEscRawIsSessionPeer(fromPeer);   /* T-608 fold: a raw sender that is the current session peer, link slot unknown */
     ItOwnerPend* viaPlayer = 0;
     for (int i = 0; i < kOwnerPendCap; ++i)
     {
         ItOwnerPend* const op = &g_ownerPend[i];
         if (op->used == 0) continue;
         const int m = coopgive::GiveRowMatch(op->dir, op->id, id, (op->peer == fromPeer) ? 1 : 0,
-                                             coopesc::SameSender(op->who, from, mySlotKnown, fromSess));
+                                             coopgive::GiveSamePlayer(op->who, fromPeer, linkSlot, fromSess));
         if (m == coopgive::kGmExact) return op;
         if (m == coopgive::kGmPlayer && viaPlayer == 0) viaPlayer = op;
     }
     if (viaPlayer != 0) *byPlayer = 1;
     return viaPlayer;
+}
+/* T-608 (d), LOG ONLY, MAIN THREAD: a PLACED (placedWrongPeer) or a REVOKE (revokeUnknownId) that found no owner row of its sender -
+   the request id, the row's keys (its connection id and the player key kept at the grant; `row` 0 = the first row holding that id,
+   if any) against the sender's, and the route it came by (live = through the notebook, session = the session link). `n` is the
+   counter just bumped: the first 20, then every 100th. */
+static void ItRowMissSay(const char* what, const char* counter, long long n, unsigned int id, unsigned int fromPeer, const ItOwnerPend* row)
+{
+    if (!(n <= 20 || (n % 100) == 0)) return;
+    if (row == 0)
+        for (int i = 0; i < kOwnerPendCap; ++i)
+            if (g_ownerPend[i].used != 0 && g_ownerPend[i].id == id) { row = &g_ownerPend[i]; break; }
+    const std::string rowKeys = (row != 0)
+        ? "the row's sender " + N((long long)row->peer) + " / player " + N((long long)row->who) + " ("
+          + std::string(row->dir == 0 ? "TAKE" : "GIVE") + (row->escrow != 0 ? ", in escrow" : "") + (row->relinked != 0 ? ", relinked" : "") + ")"
+        : std::string("no owner row holds that id");
+    DebugLog("[ITEMS] T-608 " + std::string(what) + " " + N((long long)id) + " found no row of its sender (" + std::string(counter) + " "
+             + N(n) + "): sender " + N((long long)fromPeer) + " / player " + N((long long)ItEscSenderKey(fromPeer)) + " by the "
+             + std::string(cooplive::IsRelayPeer(fromPeer) ? "live" : "session") + " route; " + rowKeys + " (log only)");
 }
 static int ItEscrowHeldNow()
 {
@@ -21599,7 +21660,8 @@ void HdLandBeforePlacement(const ItemMoveMsg& m)
 /* ApplyItemConfirm, a TAKE out of a character refused: its put-back onto a square a LAND clear found empty (or held by this take)
    is cleared again within kHdClearedKeepMs - the writer's answer said the item is not there. Only a take already pending when that
    clear ran, and never when the settle dropped the take's copy because the same item was already back in its cell (sameBack). A
-   character take's refusal carries no reason on the wire (ItemConfirmMsg.reason is ground-only), so no reason is tested. */
+   character take's refusal carries no reason on the wire, or 'busy' (the writer's owner table was full, T-608 (a) - nothing moved
+   there); no reason is tested. */
 void HdTakeRefused(const ItPending& p, int sameBack)
 {
     if (p.dir != 0 || p.ghostIsBox != 0 || p.ghostUid == 0 || p.ghostBag.has != 0) return;
@@ -22890,6 +22952,60 @@ void ItBagNestDrain(const int* idx, int n, int* consumed, const unsigned int* ui
     }
 }
 
+/* PROBE P145 BEGIN */
+/* PROBE P145 (T-608 (e), LOG ONLY): a lone change to a box another game writes is dropped by the drain (boxUnpaired) - nothing is
+   sent and nothing is put back, so this game's copy of the box can differ from the writer's (T-534: one item gone on one game
+   only). Each line: the box's key, the change (op, cell, quantity), the item, and the nearest loaded character within 30 units of
+   the box: its uid (0 = not in the spawn index, e.g. a town NPC), name, pointer and current goal (TaskGoalOfChar - read from the
+   character itself, uid or not). The first 30 lines. Reads only. MAIN THREAD. SW_DEVLOG: printed in the DEV build only. */
+int g_p145Said = 0;
+const int kP145Budget = 30;
+const float kP145Radius = 30.0f;
+void ItP145BoxDropSay(const ItEntry& e)
+{
+    if (g_p145Said >= kP145Budget) return;
+    ++g_p145Said;
+    ::Character* best = 0;
+    float bestD2 = kP145Radius * kP145Radius;
+    int within = 0;
+    if (StoreTearingDown() == 0 && ItPlaus(coop::GameWorldPtr()))
+    {
+        const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+        if (all.size() <= 20000)
+            for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+            {
+                ::Character* ch = *it;
+                Ogre::Vector3 q;
+                if (!ItObj(ch) || !SafeReadPosition(ch, &q)) continue;
+                const float dx = q.x - e.boxPos[0], dz = q.z - e.boxPos[2], d2 = dx * dx + dz * dz;
+                if (d2 >= kP145Radius * kP145Radius) continue;
+                ++within;
+                if (d2 < bestD2) { bestD2 = d2; best = ch; }
+            }
+    }
+    std::string who = "no loaded character within 30 units";
+    if (best != 0)
+    {
+        const unsigned int u = FindSpawnedUid(best);
+        std::string goal, nm;
+        int orders = -1;
+        const bool haveGoal = TaskGoalOfChar(best, &goal, &orders);
+        if (!NameOf(best, &nm)) nm = "?";
+        char dist[32];
+        _snprintf(dist, 31, "%.1f", (double)std::sqrt(bestD2)); dist[31] = 0;
+        char ptr[32];
+        _snprintf(ptr, 31, "%p", (void*)best); ptr[31] = 0;
+        who = "nearest character '" + nm + "' ptr=" + std::string(ptr) + " uid=" + N((long long)u)
+              + std::string(u == 0 ? " (no uid)" : (net::IsUidMine(u) ? " (this game's)" : " (another game's)")) + " at " + dist
+              + " units, goal " + (haveGoal ? "'" + goal + "' hasOrders=" + N((long long)orders) : std::string("not read"))
+              + "; characters within 30 units: " + N((long long)within);
+    }
+    SW_DEVLOG("[P145] box lone change dropped key='" + std::string(e.boxKey) + "' op=" + N((long long)e.op) + " cell=" + std::string(e.section)
+              + " " + N((long long)e.x) + "," + N((long long)e.y) + " qty=" + N((long long)e.quantity) + " item='" + std::string(e.baseSid)
+              + "' box at " + N((long long)e.boxPos[0]) + "," + N((long long)e.boxPos[2]) + " - another game writes this box; not sent,"
+                " not put back (boxUnpaired " + N(g_boxUnpaired) + "); " + who);
+}
+/* PROBE P145 END */
 void ItemsTickDrain()
 {
     if (g_base == 0) return;
@@ -23569,7 +23685,7 @@ void ItemsTickDrain()
                              + N((long long)s_ownSlot[k]) + ", whose game is here and writes it - this lone change is not sent (boxOwnerUnpaired)");
                 }
             }
-            else if (v == kBoxHeld) ++g_boxUnpaired;
+            else if (v == kBoxHeld) { ++g_boxUnpaired; /* PROBE P145 BEGIN */ ItP145BoxDropSay(cur); /* PROBE P145 END */ }
             else if (v == kBoxNoNotebook)
             {
                 /* B9-b (review-b9 M-4) */
@@ -24600,6 +24716,11 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     else if ((r.takerUid != 0 || r.takerBoxKey.empty()) && !net::UidOwnedByPeer(r.takerUid, fromPeer)) { ++g_requesterNotOwner; }
     else if (r.ownerUid == 0 && GrIsGroundKey(r.ownerBoxKey.c_str()) != 0) { GroundServeRequest(r, fromPeer); return; }   /* inv5 phase 1: a PUT / TAKE on the ground */
     else if (!ItTakerSlotOk(r)) { ++g_reqRefTakerSlot; }
+    /* T-608 (a): a TAKE or a GIVE that goes through keeps one owner row (g_ownerPend) until the asker's answer - the taken item held
+       for a put-back, or the built object kept for a REVOKE. With every row in use (or the TEST-ONLY ownerfull lever on) it is
+       refused HERE, before anything moves, with the ground take's 'busy, ask again' (coopground::kGroundReasonBusy on the answer).
+       The asker's ordinary refusal road puts its own copy back - nothing moved on either game - and the player may ask again. */
+    else if (ItOwnerFullRefuse(r, fromPeer) != 0) { cf.reason = coopground::kGroundReasonBusy; }
     // ================= E22c: the owner half is a STORAGE BOX =================
     // TWO QUESTIONS, IN ORDER, and they are different questions (decision 40). AUTHORITY: do we hold the
     // box's patch of map? If not we are not its writer and must refuse exactly as a game that does not own
@@ -24863,9 +24984,10 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     }
     cf.ok = ok;
     // E22b-2 / review-p5y HIGH-3. THE SECOND PHASE IS OPENED BEFORE THE ANSWER GOES OUT, so an instant reply
-    // cannot arrive before the row that names it exists. A full table is not a reason to lose an item: on a
-    // TAKE the held object is destroyed immediately (E22a's old behaviour, with no rollback available), and
-    // that is counted rather than left to be inferred from a missing rollback.
+    // cannot arrive before the row that names it exists. A full table is refused before anything moves
+    // (ItOwnerFullRefuse, T-608 (a)), so no row is expected to be missing here; should one be, a TAKE's held
+    // object is destroyed at once (no rollback is available) and counted (ownerPendFull) rather than left to
+    // be inferred from a missing rollback.
     if (ok != 0)
     {
         ItOwnerPend* op = ItOwnerPendAlloc();
@@ -24970,9 +25092,10 @@ void ApplyItemPlaced(unsigned int id, int ok, unsigned int fromPeer)
     }
     if (p == 0)
     {
-        // Two different silences: nobody is waiting on that id (it timed out and was already rolled back, or
-        // it was never ours), or somebody is - and it is not this peer.
-        if (ItOwnerPendAny(id) != 0) ++g_placedWrongPeer; else ++g_placedUnknownId;
+        // Two different misses: nobody is waiting on that id (it timed out and was already rolled back, or
+        // it was never ours), or somebody is - and it is not this peer (logged with both keys, ItRowMissSay).
+        if (ItOwnerPendAny(id) != 0) { ++g_placedWrongPeer; ItRowMissSay("PLACED", "placedWrongPeer", g_placedWrongPeer, id, fromPeer, 0); }
+        else ++g_placedUnknownId;
         return;
     }
     ItPlacedSettleRow(p, id, ok, fromPeer);
@@ -25086,8 +25209,8 @@ void ApplyItemRevoke(unsigned int id, unsigned int fromPeer)
     /* B4-4 fold 2 (MED 2): a shop revoke / ack carries the shop tail and arrives at ApplyShopTail, never here - a plain revoke is E22b's */
     int byPlayer = 0;
     ItOwnerPend* p = ItOwnerGiveFind(id, fromPeer, &byPlayer);   /* T-889: by the giver's player and the request id */
-    if (p == 0) { ++g_revokeUnknownId; return; }
-    if (p->dir != 1) { ++g_revokeUnknownId; return; }
+    if (p == 0) { ++g_revokeUnknownId; ItRowMissSay("REVOKE", "revokeUnknownId", g_revokeUnknownId, id, fromPeer, 0); return; }
+    if (p->dir != 1) { ++g_revokeUnknownId; ItRowMissSay("REVOKE", "revokeUnknownId", g_revokeUnknownId, id, fromPeer, p); return; }
     if (byPlayer != 0)
     {
         ++g_giveAway[0];
@@ -29037,6 +29160,18 @@ std::string ItemTestConfirmDelayCommand(const std::string& arg)
     return "ok itemtest confirmdelay " + N((long long)sec);
 }
 
+/* T-608 (c): TEST-ONLY `itemtest ownerfull on|off` (command channel) - see g_ownerFullLever. */
+std::string ItemTestOwnerFullCommand(const std::string& arg)
+{
+    if (arg == "on") g_ownerFullLever = 1;
+    else if (arg == "off") g_ownerFullLever = 0;
+    else return "error itemtest ownerfull: need on or off";
+    DebugLog(std::string("[ITEMS] ownerfull (TEST-ONLY lever) ") + (g_ownerFullLever != 0
+             ? "ON - every character and box take / give this game is asked as the owner is refused busy before anything moves, as with a full owner table (ground, shop and hold / land requests are not)"
+             : "OFF - the owner table's own rows decide, as in normal play"));
+    return std::string("ok itemtest ownerfull ") + (g_ownerFullLever != 0 ? "on" : "off");
+}
+
 /* T-1 B4-1: TEST-ONLY `itemtest refusenext [n] [reason]` (command channel). n 0..100, default 1 (0 disarms); reason one of
    g_refuseNames, default generic. Either may be left out; a lone word is the reason. */
 std::string ItemTestRefuseNextCommand(const std::string& arg)
@@ -29477,10 +29612,10 @@ std::string ItemsDetail()
          + N(g_reqConfirmSendFailed)
          + " itemRefusedAnswered[confirm,request,confirmLeft]=" + N(g_confirmRefusedAnswered) + "," + N(g_requestRefusedAnswered) + "," + N(g_confirmRefusedLeft)
          + " mergeGive[split,whole]=" + N(g_revertMergeSplit) + "," + N(g_revertMergeWhole)
-         + " itemReq3[placedRecv,placedUnknownId,placedWrongPeer,placedUnsent,revokeSent,revokeRecv,revokeUnknownId,rollbackGiveFailed,ownerPendFull,takerSlotRefused,heldDeferredSent,pickupNoCursor]="
+         + " itemReq3[placedRecv,placedUnknownId,placedWrongPeer,placedUnsent,revokeSent,revokeRecv,revokeUnknownId,rollbackGiveFailed,ownerPendFull,takerSlotRefused,heldDeferredSent,pickupNoCursor,ownerFullRefused]="
          + N(g_placedRecv) + "," + N(g_placedUnknownId) + "," + N(g_placedWrongPeer) + "," + N(g_placedUnsent) + ","
          + N(g_revokeSent) + "," + N(g_revokeRecv) + "," + N(g_revokeUnknownId) + "," + N(g_rollbackGiveFailed) + ","
-         + N(g_ownerPendFull) + "," + N(g_reqRefTakerSlot) + "," + N(g_heldDeferredSent) + "," + N(g_pickupNoCursor)
+         + N(g_ownerPendFull) + "," + N(g_reqRefTakerSlot) + "," + N(g_heldDeferredSent) + "," + N(g_pickupNoCursor) + "," + N(g_ownerFullRefused)
          + " itemConfirmWrongSender=" + N(g_itemConfirmWrongSender) + " itemMoveNotOwner=" + N(g_itemMoveNotOwner)   /* M7b slice 2 */
          + " parityBoxNotWriter=" + N(g_parityBoxNotWriter)   /* fold 1 */
          + " showGive[escrowed,back,backLost,done,lapsed,destroyFailed,fault,droppedFull,lateRevoke]=" + N(g_showGive[0]) + "," + N(g_showGive[1])
@@ -29876,6 +30011,22 @@ int ObjectPositionKey(void* obj, char* out, int cap, const char* suffix, int cou
 void* ObjectByPositionKey(const char* key)
 {
     return ItBoxResolve(key);
+}
+/* T-608 (f): declared in items.h - the resolve with its NEAR MISS line kept (g_nearMissHold), and that line said later. */
+void* ObjectByPositionKeyHeldMiss(const char* key)
+{
+    g_nearMissHeldKey.clear(); g_nearMissHeldLine.clear();
+    g_nearMissHold = 1;
+    void* const b = ItBoxResolve(key);
+    g_nearMissHold = 0;
+    return b;
+}
+void ObjectByPositionKeyMissSay()
+{
+    if (g_nearMissHeldLine.empty()) return;
+    if (ItBoxSayForKey(g_nearMissHeldKey.c_str()) != 0)
+        DebugLog(g_nearMissHeldLine + " (Said after the search inside buildings found nothing either.)");
+    g_nearMissHeldKey.clear(); g_nearMissHeldLine.clear();
 }
 /* par16 fold #5: declared in items.h. The hint passes the SAME two tests a box cache row passes in ItBoxResolve (the furniture
    row re-resolved first, the key read back with plain field reads, then the liveness walk memoised for this drain); anything

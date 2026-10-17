@@ -7697,10 +7697,11 @@ void PoseApplyCage(unsigned int uid, ::Character* c, PoseWant& w, DWORD now)
     if (w.bedAt != 0 && now - w.bedAt < kPoseBedRetryMs) return;
     w.bedAt = now | 1u;
     void* cage = PoseBedByCachedHand(w);
-    if (cage == 0) cage = ObjectByPositionKey(w.pw.bedKey);
+    if (cage == 0) cage = ObjectByPositionKeyHeldMiss(w.pw.bedKey);   /* T-608 (f): its NEAR MISS line waits for the search inside buildings */
     if (cage == 0) cage = PoseBedViaLayout(uid, w);
     if (cage == 0)
     {
+        ObjectByPositionKeyMissSay();   /* both searches failed: the resolver's NEAR MISS line now */
         w.bedMiss = true;
         if (!w.bedMissCounted) { w.bedMissCounted = true; ++g_poseBedUnresolved; }
         CageMissNote(uid, w.pw.bedKey, w.pw.outerKey);
@@ -7910,10 +7911,11 @@ void PoseApplyTick()
                 // BED1: a piece a layout walk already matched is re-found by its hand; then the zone list as before; then,
                 // only on a miss, the outer building's interior pieces (PoseBedViaLayout - bounded, cached per want).
                 void* bed = PoseBedByCachedHand(w);
-                if (bed == 0) bed = ObjectByPositionKey(w.pw.bedKey);   // re-resolved per try: a held pointer can outlive its zone
+                if (bed == 0) bed = ObjectByPositionKeyHeldMiss(w.pw.bedKey);   // re-resolved per try: a held pointer can outlive its zone; T-608 (f): its NEAR MISS line waits for the search inside buildings
                 if (bed == 0) bed = PoseBedViaLayout(uid, w);
                 if (bed == 0)
                 {
+                    ObjectByPositionKeyMissSay();   /* both searches failed: the resolver's NEAR MISS line now */
                     w.bedMiss = true;
                     if (!w.bedMissCounted) { w.bedMissCounted = true; ++g_poseBedUnresolved; }
                 }
@@ -12120,9 +12122,13 @@ void ReportTask(unsigned int uid)
 /* P11: ReportTask's reads, handed back (capturetest's read-back). */
 bool TaskGoalOf(unsigned int uid, std::string* goal, int* hasPendingOrders)
 {
+    return TaskGoalOfChar(FindSpawned(uid), goal, hasPendingOrders);
+}
+/* T-608 fold: TaskGoalOf's read from the character itself (probe P145: the nearest character may have no uid). */
+bool TaskGoalOfChar(::Character* c, std::string* goal, int* hasPendingOrders)
+{
     if (goal) goal->clear();
     if (hasPendingOrders) *hasPendingOrders = -1;
-    Character* c = FindSpawned(uid);
     if (c == 0 || !PlausibleObject(c)) return false;
     void* ai = GetCharacterAI(c);
     if (!PlausibleObject(ai)) return false;

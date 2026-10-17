@@ -226,6 +226,7 @@
 #include "baseshow.h"    /* T-811: SHOW - the teammates' outposts on the map */
 #include "carrycheck.h"  /* carryread / carryset: RESET WORLD's carry as counts and exact sums */
 #include "squadorigin.h"  /* a squad's origin slot: its number's block, or for a save squad the game that runs it now */
+#include "numberblock.h"  /* T-642: where a faction's squad counter stands in this game's number block */
 
 #include <cstdio>
 #include <limits>   /* par24 */
@@ -12060,6 +12061,43 @@ void t_p15_destroyed_state()
     if (coopbuild::BuildRepairOrderVerdict(95, 1, 0, 0) != coopbuild::kBuildRepairOrderNone) Fail("a repair on a whole copy was taken by the ruin rule");
     if (coopbuild::BuildRepairOrderVerdict(95, 0, 1, 0) != coopbuild::kBuildRepairOrderNone) Fail("a repair on this game's own ruin was taken by the copy rule");
     if (coopbuild::BuildRepairOrderVerdict(2, 1, 1, 0) != coopbuild::kBuildRepairOrderNone) Fail("a build order was taken by the repair rule");
+    {   /* T-903 (decision 920 a): who may help, the repair verdict on a damaged copy, the owner's repair amount */
+        if (coopbuild::HelpAllowedFor(1, 0, 1) != 1 || coopbuild::HelpAllowedFor(0, 1, 1) != 1 || coopbuild::HelpAllowedFor(1, 1, 1) != 1)
+            Fail("T-903: a faction-mate or a player set friendly was refused help");
+        if (coopbuild::HelpAllowedFor(0, 0, 1) != 0) Fail("T-903: a player neither a faction-mate nor set friendly may help");
+        if (coopbuild::HelpAllowedFor(1, 0, 0) != 1 || coopbuild::HelpAllowedFor(0, 1, 0) != 0 || coopbuild::HelpAllowedFor(0, 0, 0) != 0)
+            Fail("T-903: the faction-mates-only switch is wrong");
+        if (coopbuild::HelpAllowed(0, 1) != coopbuild::HelpAllowedFor(0, 1, coopbuild::kBuildHelpFriendHelps) || coopbuild::HelpAllowed(0, 0) != 0
+            || coopbuild::HelpAllowed(1, 0) != 1) Fail("T-903: HelpAllowed does not follow its switch");
+        if (coopbuild::BuildRepairHelpVerdict(95, 1, 0, 1, 0) != coopbuild::kBuildRepairOrderDamagedHelp) Fail("T-903: a repair on a damaged copy is not help");
+        if (coopbuild::BuildRepairHelpVerdict(95, 1, 0, 1, 1) != coopbuild::kBuildRepairOrderRefused) Fail("T-903: a repair on a damaged wall copy is not refused");
+        if (coopbuild::BuildRepairHelpVerdict(95, 1, 1, 0, 0) != coopbuild::kBuildRepairOrderHelp) Fail("T-903: a repair on a ruin copy is no longer the ruin help");
+        if (coopbuild::BuildRepairHelpVerdict(95, 1, 1, 0, 1) != coopbuild::kBuildRepairOrderRefused) Fail("T-903: a repair on a wall ruin copy is not refused");
+        if (coopbuild::BuildRepairHelpVerdict(95, 1, 0, 0, 0) != coopbuild::kBuildRepairOrderNone) Fail("T-903: a repair on a whole copy was taken as help");
+        if (coopbuild::BuildRepairHelpVerdict(95, 0, 0, 1, 0) != coopbuild::kBuildRepairOrderNone) Fail("T-903: a repair on this game's own damaged piece was taken by the copy rule");
+        if (coopbuild::BuildRepairHelpVerdict(2, 1, 0, 1, 0) != coopbuild::kBuildRepairOrderNone) Fail("T-903: a build order was taken by the repair rule");
+        if (coopbuild::BuildPieceDamaged(1, 0, 50.0f, 100.0f) != 1 || coopbuild::BuildPieceDamaged(1, 0, 100.0f, 100.0f) != 0
+            || coopbuild::BuildPieceDamaged(0, 0, 50.0f, 100.0f) != 0 || coopbuild::BuildPieceDamaged(1, 1, 50.0f, 100.0f) != 0
+            || coopbuild::BuildPieceDamaged(1, 0, 50.0f, 0.0f) != 0) Fail("T-903: the damaged test is wrong");
+        if (coopbuild::BuildRepairApplyTo(40.0f, 30.0f, 100.0f) != 70.0f || coopbuild::BuildRepairApplyTo(90.0f, 30.0f, 100.0f) != 100.0f
+            || coopbuild::BuildRepairApplyTo(100.0f, 5.0f, 100.0f) != 100.0f || coopbuild::BuildRepairApplyTo(40.0f, -5.0f, 100.0f) != 40.0f)
+            Fail("T-903: the owner's repair amount is wrong");
+        if (coopbuild::BuildRepairFinishSafe(100.0f, 100.0f, 1) != 100.0f || coopbuild::BuildRepairFinishSafe(70.0f, 100.0f, 1) != 70.0f)
+            Fail("T-903 fold: a complete piece's repair health was held short of what the engine's own repair reaches");
+        if (coopbuild::BuildRepairFinishSafe(100.0f, 100.0f, 0) != 100.0f * 0.999f || coopbuild::BuildRepairFinishSafe(70.0f, 100.0f, 0) != 70.0f)
+            Fail("T-903 fold: a repair on a piece whose complete byte is clear could reach needed (0x558680 would finish it)");
+        if (coopbuild::BuildHelpApplyVerdictFor(1, 1, 0, 0, 1) != coopbuild::kBuildHelpApplyGo || coopbuild::BuildHelpApplyVerdictFor(1, 0, 1, 1, 1) != coopbuild::kBuildHelpApplyGo
+            || coopbuild::BuildHelpApplyVerdictFor(1, 1, 0, 0, 0) != coopbuild::kBuildHelpApplyGo)
+            Fail("T-903 re-check: a faction-mate's or a friendly player's help was not applied on the owner's game");
+        if (coopbuild::BuildHelpApplyVerdictFor(1, 0, 1, 0, 1) != coopbuild::kBuildHelpApplyRefuse || coopbuild::BuildHelpApplyVerdictFor(1, 0, 1, 1, 0) != coopbuild::kBuildHelpApplyRefuse
+            || coopbuild::BuildHelpApplyVerdictFor(1, 0, 0, 0, 0) != coopbuild::kBuildHelpApplyRefuse)
+            Fail("T-903 re-check: a known non-teammate not set friendly was not refused");
+        if (coopbuild::BuildHelpApplyVerdictFor(0, 0, 1, 0, 1) != coopbuild::kBuildHelpApplyHold || coopbuild::BuildHelpApplyVerdictFor(0, 1, 1, 1, 1) != coopbuild::kBuildHelpApplyHold
+            || coopbuild::BuildHelpApplyVerdictFor(1, 0, 0, 0, 1) != coopbuild::kBuildHelpApplyHold)
+            Fail("T-903 re-check: help was judged while this game's slot or the sender's standing was unknown (must be held)");
+        if (coopbuild::BuildHelpApplyVerdict(1, 0, 1, 1) != coopbuild::BuildHelpApplyVerdictFor(1, 0, 1, 1, coopbuild::kBuildHelpFriendHelps))
+            Fail("T-903 re-check: BuildHelpApplyVerdict does not follow its switch");
+    }
     /* a copy made a ruin here */
     if (coopbuild::BuildLocalDestroyVerdict(1, 0, 1, 1, 0) != coopbuild::kBuildLocalDestroyRevert) Fail("a copy ruined here while the owner's is whole is not put back");
     if (coopbuild::BuildLocalDestroyVerdict(1, 0, 1, 1, 1) != coopbuild::kBuildLocalDestroyIgnore) Fail("a copy ruined here while the owner's is a ruin was put back");
@@ -18525,11 +18563,28 @@ void t_t889_give_row_by_player_presence_and_retry_hold()
     if (GiveRowMatch(1, 7u, 8u, 1, 1) != kGmNone) Fail("T-889: two gives from one player stay separate (another request id)");
     if (GiveRowMatch(0, 7u, 7u, 1, 1) != kGmNone) Fail("T-889: a TAKE row never answers a REVOKE");
     if (GiveRowMatch(1, 0u, 0u, 1, 1) != kGmNone) Fail("T-889: request id 0 names no row");
-    {   /* the player match is SameSender's: two slot keys of different players never match; raw keys of one session peer do */
+    {   /* T-608: the player match is GiveSamePlayer's - the exact player key (SamePlayer), plus the raw current session peer while
+           the link's slot is unknown; never any two raw keys */
         const unsigned int a = cooplive::RelayPeerId(2u), b = cooplive::RelayPeerId(3u);
-        if (GiveRowMatch(1, 7u, 7u, 0, coopesc::SameSender(a, a, 1, 0)) != kGmPlayer) Fail("T-889: the same slot key is the same player");
-        if (GiveRowMatch(1, 7u, 7u, 0, coopesc::SameSender(a, b, 1, 0)) != kGmNone) Fail("T-889: another slot is another player");
-        if (GiveRowMatch(1, 7u, 7u, 0, coopesc::SameSender(5u, 9u, 0, 0)) != kGmPlayer) Fail("T-889: a renumbered raw session peer is the same player");
+        if (GiveRowMatch(1, 7u, 7u, 0, GiveSamePlayer(a, a, -1, 0)) != kGmPlayer) Fail("T-889: the same slot key is the same player");
+        if (GiveRowMatch(1, 7u, 7u, 0, GiveSamePlayer(a, b, -1, 0)) != kGmNone) Fail("T-889: another slot is another player");
+        if (GiveSamePlayer(a, b, 2, 1) != 0) Fail("T-608: another slot is another player, whatever the session flag says");
+        /* link slot known: a raw row of the session link and the same player's relayed sender are one player, both ways */
+        if (GiveSamePlayer(5u, a, 2, 0) != 1) Fail("T-608: a row asked on the session link answers that player's REVOKE through the notebook");
+        if (GiveSamePlayer(a, 9u, 2, 0) != 1) Fail("T-608: a row asked through the notebook answers that player's REVOKE on the session link");
+        if (GiveSamePlayer(5u, 9u, 2, 0) != 1) Fail("T-608: with the link's slot known two raw ids of that link are its one player");
+        if (GiveSamePlayer(5u, b, 2, 0) != 0) Fail("T-608: a raw row of slot 2's link does not answer slot 3");
+        /* link slot unknown (no notebook, or a reconnect before PEER_SLOT): raw against raw only for the CURRENT session peer */
+        if (GiveSamePlayer(5u, 5u, -1, 0) != 1) Fail("T-608: no slot - the same raw connection id is the same player");
+        if (GiveRowMatch(1, 7u, 7u, 0, GiveSamePlayer(5u, 9u, -1, 1)) != kGmPlayer) Fail("T-608 fold: a reconnected giver (the current session peer, new raw id, no slot) finds its row");
+        if (GiveRowMatch(1, 7u, 7u, 0, GiveSamePlayer(5u, 9u, -1, 0)) != kGmNone) Fail("T-608 fold: a raw sender that is not the current session peer is not the row's player");
+        if (GiveSamePlayer(a, 9u, -1, 1) != 0) Fail("T-608 fold: the raw session peer with no link slot does not take a slot-keyed row");
+        if (GiveSamePlayer(5u, a, -1, 1) != 0) Fail("T-608 fold: a relayed sender never takes a raw row while the link's slot is unknown");
+        if (GiveSamePlayer(5u, 9u, 2, 1) != 1) Fail("T-608 fold: with the link's slot known the raw ids fold to it (the flag is not needed)");
+        /* the flag as the plugin computes it (coopesc::RawIsSessionPeerUnslotted), end to end */
+        if (GiveSamePlayer(5u, 9u, -1, coopesc::RawIsSessionPeerUnslotted(9u, 1, 9u, -1)) != 1) Fail("T-608 fold: the current session peer's new id, flag from the session state");
+        if (GiveSamePlayer(5u, 9u, -1, coopesc::RawIsSessionPeerUnslotted(9u, 1, 11u, -1)) != 0) Fail("T-608 fold: a raw id that is not the current session peer, flag from the session state");
+        if (GiveSamePlayer(5u, 9u, -1, coopesc::RawIsSessionPeerUnslotted(9u, 0, 9u, -1)) != 0) Fail("T-608 fold: no session peer up - nothing is the session peer");
     }
     /* the owner's stand clock: a GIVE's age is its giver's time in the world; a TAKE keeps wall time */
     if (OwnerPendAgeMs(1, 90000u, 1234u) != 1234u) Fail("T-889: a GIVE row is aged by its giver's time in the world");
@@ -37769,7 +37824,10 @@ void t_t587_counter_floor()
     if (w != 393216u + 71u) Fail("the floor is one past the highest own-block number, got " + I((int)w));
     if (CounterFloor(196608u + 900u, 6, 0u) != 0u) Fail("another block's number never raises the counter");
     if (CounterFloor(5u, -1, 0u) != 0u) Fail("no block known: no raise");
-    if (CounterFloor(65535u, 0, 0u) != 65536u) Fail("slot 0's highest number");
+    int cap = -1;
+    if (CounterFloor(65535u, 0, 0u, &cap) != 65535u || cap != 1) Fail("slot 0's highest number: the floor left the block or the cap was not reported (T-642 review 4)");
+    if (CounterFloor(393216u + 65535u, 6, 0u, &cap) != 393216u + 65535u || cap != 1) Fail("slot 6's highest number: the floor reached the next block");
+    if (CounterFloor(393216u + 70u, 6, 0u, &cap) != 393216u + 71u || cap != 0) Fail("a cap reported below the block's last number");
     if (CounterFloor(393216u + 3u, 6, 393216u + 50u) != 393216u + 50u) Fail("a lower number never lowers the floor");
     if (CounterFloor(458752u, 6, 0u) != 0u) Fail("the next block's first number is not this block's");
 }
@@ -44836,9 +44894,6 @@ void t_t36o_outposts_fold()
     sd[0].keys.push_back("far1");
     townkeep::KeptTownsOf(sd, far, &kt, &ts);
     if (kt.size() != 1 || kt[0].keys.size() != 1 || kt[0].keys[0] != "far1" || ts.byKey != 1) Fail("outposts fold: a said key does not match its kept piece");
-    /* the relink rule */
-    if (townkeep::TownRelinkAllowed(0, 0) != 1 || townkeep::TownRelinkAllowed(1, 1) != 1 || townkeep::TownRelinkAllowed(1, 0) != 0 || townkeep::TownRelinkAllowed(1, -1) != 0)
-        Fail("outposts fold: a piece in a town that is not a player town (or an unread list) is relinked");
 }
 /* the outposts' keys: a SAY with keys on the wire and in player-towns.txt (formats 1 and 2), a split SAY put together, a cut list
    keeping the keys on file, the reset's key-only match (the two texts of one key, the hashed record field, a tenth of a unit), a
@@ -45108,6 +45163,19 @@ void t_t36r_outposts_fold()
     if (!out.empty() || ms.worldTown != 2) Fail("outposts fold: a bought house in a world town got an outpost made with no outpost said");
     NearOutpostsTake(said1, pw, noWorld, &out, &ns);
     if (out.size() != 1 || out[0].keys.size() != 2 || ns.took != 2) Fail("outposts fold: with no world town known the pieces near the outpost were not taken");
+    /* furniture takes its host's town only: its own words naming a world town (copied from its host as it was made) do not count */
+    {
+        std::vector<zonekeep::KeptPiece> pf;
+        zonekeep::KeptPiece hb; hb.ownerSlot = 2; hb.key = "hall"; hb.pos[0] = 300.0f; pf.push_back(hb);
+        zonekeep::KeptPiece fb; fb.ownerSlot = 2; fb.key = "chest"; fb.pos[0] = 301.0f; fb.hostKey = "hall"; fb.hasTown = 1;
+        for (int i = 0; i < 5; ++i) fb.townHand[i] = h.townHand[i];
+        pf.push_back(fb);
+        const std::map<std::string, size_t> bk = PieceIndex(pf);
+        if (InWorldTown(pf[1], pf, bk, world) != 0) Fail("outposts fold: furniture read its own town words, not its host's");
+        pf[0].hasTown = 1;
+        for (int i = 0; i < 5; ++i) pf[0].townHand[i] = h.townHand[i];
+        if (InWorldTown(pf[1], pf, bk, world) != 1) Fail("outposts fold: furniture in a host standing in a world town is not in that town");
+    }
     /* a town a player's game said it holds is never a world town */
     std::vector<TownRow> saidT(1); saidT[0].owner = 2; for (int i = 0; i < 5; ++i) saidT[0].hand[i] = h.townHand[i];
     if (!WorldTownsOf(world, saidT).empty() || WorldTownsOf(world, said1).size() != 1) Fail("outposts fold: a said town counts as a world town, or another town was dropped");
@@ -45391,6 +45459,12 @@ void t_key_height_into_offset()
         || coopbuild::BuildIntoOffsetParse("1,", &dx, &dz) != 0 || coopbuild::BuildIntoOffsetParse(",1", &dx, &dz) != 0 || coopbuild::BuildIntoOffsetParse("1e9,0", &dx, &dz) != 0
         || coopbuild::BuildIntoOffsetParse("nan,0", &dx, &dz) != 0 || coopbuild::BuildIntoOffsetParse("", &dx, &dz) != 0 || coopbuild::BuildIntoOffsetParse("1x,2", &dx, &dz) != 0)
         Fail("into offset: a malformed offset reads");
+    /* T-899: `buildtest town` names a row by a key substring, else by its exact sid */
+    if (coopbuild::BuildTownArgMatch("abc", "x_abc_1", "zz") != 1 || coopbuild::BuildTownArgMatch("zz", "x_abc_1", "zz") != 2)
+        Fail("town lever: a key substring or the exact sid does not name its row");
+    if (coopbuild::BuildTownArgMatch("z", "x_abc_1", "zz") != 0 || coopbuild::BuildTownArgMatch("", "x_abc_1", "") != 0
+        || coopbuild::BuildTownArgMatch("zzz", "x_abc_1", "zz") != 0)
+        Fail("town lever: a part of a sid, or an empty argument, names a row");
 }
 /* T-799 D1: the money-known mark - set by a restock here or the other game's written value, never unset by a later event; an
    announcement carries the pot only when it was read AND its money is known. */
@@ -45976,6 +46050,77 @@ void t_t761_twin_sleep()
     if (twinsleep::StripPointAround(0.0f, 0.0f, t761_KeepAll, 0, &ox, &oz) != 0) Fail("strip point around: found past the bound");
 }
 
+/* T-642: a counter's floor from the deleted marks of this game's own block - a deleted group's number is never handed out again
+   (src/common/numberblock.h OwnMarkFloor) */
+void t642_deleted_mark_floor()
+{
+    using namespace numblock;
+    std::vector<char> b(65536u / 8u * 2u, 0);   /* blocks 0 and 1 */
+    b[0] = (char)(1u << 3);   /* number 3, block 0 */
+    const unsigned n1 = 65536u + 700u; b[n1 >> 3] = (char)((unsigned char)b[n1 >> 3] | (1u << (n1 & 7u)));   /* number 65,536 + 700, block 1 */
+    if (OwnMarkFloor(&b[0], b.size(), 1, 0u) != n1 + 1u) Fail("mark floor: not one past the highest own-block mark");
+    if (OwnMarkFloor(&b[0], b.size(), 0, 0u) != 4u) Fail("mark floor: block 0's highest mark");
+    if (OwnMarkFloor(&b[0], b.size(), 1, 70000u) != 70000u) Fail("mark floor: lowered below the floor already held");
+    if (OwnMarkFloor(&b[0], b.size(), 2, 0u) != 0u) Fail("mark floor: another block's mark raises");
+    if (OwnMarkFloor(&b[0], b.size(), -1, 5u) != 5u || OwnMarkFloor(&b[0], b.size(), 16, 5u) != 5u) Fail("mark floor: no slot raises");
+    if (OwnMarkFloor(&b[0], 10u, 1, 0u) != 0u) Fail("mark floor: read past the bitmap's end");
+    int cap = -1;
+    if (OwnMarkFloor(&b[0], b.size(), 1, 0u, &cap) != n1 + 1u || cap != 0) Fail("mark floor: a cap reported below the block's last number");
+    std::vector<char> t(65536u / 8u, 0); t[t.size() - 1] = (char)0x80;   /* the block's last number */
+    if (OwnMarkFloor(&t[0], t.size(), 0, 0u, &cap) != 65535u || cap != 1) Fail("mark floor: a mark on the block's last number put the floor in the next game's block, or the cap was not reported (T-642 review 4)");
+}
+/* T-642: the block applied from the relay's slot or the remembered one, and a counter in another game's block moved down - never below
+   a number this world may have handed out (src/common/numberblock.h SlotToApply, CounterForBlock) */
+void t642_other_block_counter_moved()
+{
+    using namespace numblock;
+    if (SlotToApply(1, 2, 1, 1) != 2 || SlotToApply(1, 2, 1, 0) != 2) Fail("slot: the relay's slot not used");
+    if (SlotToApply(0, -1, 1, 1) != 1 || SlotToApply(1, -1, 1, 1) != 1) Fail("slot: the remembered slot not used without the relay's");
+    if (SlotToApply(0, -1, 1, 0) != -1 || SlotToApply(1, -1, 1, 0) != -1) Fail("slot: a slot remembered from another world or relay applied (T-642 review 1)");
+    if (SlotToApply(0, -1, -1, 1) != -1) Fail("slot: a slot guessed");
+    int how = -1;
+    if (CounterForBlock(65600u, 1, 1, 300u, 0u, &how) != 65600u || how != kKept) Fail("block: a counter inside its block moved");
+    if (CounterForBlock(300u, 1, 1, 300u, 0u, &how) != 65536u || how != kRaised) Fail("block: not raised to the floor");
+    if (CounterForBlock(300u, 1, 1, 300u, 65900u, &how) != 65900u || how != kRaised) Fail("block: raised below a number handed out there earlier");
+    if (CounterForBlock(65536u, 0, 1, 300u, 0u, &how) != 300u || how != kMovedDown) Fail("block: not moved down to the load floor");
+    if (CounterForBlock(131072u, 1, 1, 300u, 0u, &how) != 65536u || how != kMovedDown) Fail("block: not moved down to the block's floor");
+    if (CounterForBlock(131072u, 1, 1, 300u, 65700u, &how) != 65700u || how != kMovedDown) Fail("block: moved below a number handed out there earlier");
+    if (CounterForBlock(131072u, 1, 1, 65800u, 65700u, &how) != 65800u || how != kMovedDown) Fail("block: moved below the load floor");
+    if (CounterForBlock(65536u + 64u, 0, 1, 300u, 0u, &how) != 65600u || how != kHeld) Fail("block: moved down out of a block it has handed out numbers in (T-642 review 2)");
+    if (CounterForBlock(131072u + 1u, 1, 1, 300u, 65700u, &how) != 131073u || how != kHeld) Fail("block: moved down after handing out one number in the block it leaves");
+    if (CounterForBlock(65536u, 0, 1, 65536u, 0u, &how) != 65536u || how != kHeld) Fail("block: moved below the save's own squads (the load left it above the block)");
+    if (CounterForBlock(65536u, 0, 0, 0u, 0u, &how) != 65536u || how != kHeld) Fail("block: moved down with no load floor");
+    if (CounterForBlock(5u, 16, 1, 0u, 0u, &how) != 5u || how != kKept || CounterForBlock(5u, -1, 1, 0u, 0u, &how) != 5u) Fail("block: a slot past the cap applied");
+}
+/* T-642: the load floor is kept under a faction's stringID - a faction renamed after the load keeps its floor (squadorigin.h FloorKey,
+   FloorLookupKey) */
+void t642_renamed_faction_keeps_floor()
+{
+    using namespace sqorigin;
+    std::map<std::string, unsigned> floor; floor[FloorKey("10-gamedata.base", "Holy Nation")] = 1200u;
+    const std::string after = FloorKey("10-gamedata.base", "Holy Sanctum");   /* the same faction, renamed */
+    const std::string k = FloorLookupKey(1, after, 0, std::string());
+    if (floor.find(k) == floor.end() || floor.find(k)->second != 1200u) Fail("floor key: a renamed faction lost its floor");
+    if (FloorKey("", "My Crew") != "@My Crew" || FloorKey("@slot:1", "My Crew") != "@My Crew") Fail("floor key: an unusable stringID does not fall back to the name");
+    if (FloorKey("", "10-gamedata.base") == FloorKey("10-gamedata.base", "x")) Fail("floor key: a name key equals a stringID key");
+    if (FloorLookupKey(0, std::string(), 1, "10-gamedata.base") != "10-gamedata.base" || !FloorLookupKey(0, std::string(), 0, "x").empty()) Fail("floor key: the name index not used, or used when absent");
+}
+/* T-642: a player's faction showing an NPC faction's name keeps its own floor, and the shown-name index names neither (squadorigin.h
+   FloorKey, NameIndexMerge) */
+void t642_npc_name_clash()
+{
+    using namespace sqorigin;
+    const std::string npc = FloorKey("17-gamedata.base", "Holy Nation"), player = FloorKey("204-gamedata.base", "Holy Nation");
+    if (npc == player) Fail("name clash: a player's faction shares an NPC faction's floor key");
+    std::map<std::string, unsigned> floor; floor[npc] = 900u; floor[player] = 3u;
+    if (floor.find(FloorLookupKey(1, player, 0, std::string()))->second != 3u || floor.find(FloorLookupKey(1, npc, 0, std::string()))->second != 900u) Fail("name clash: a faction reads the other's floor");
+    std::string idx = NameIndexMerge(0, std::string(), npc);
+    if (idx != npc) Fail("name index: a name's first faction not kept");
+    if (NameIndexMerge(1, idx, npc) != npc) Fail("name index: the same key twice made ambiguous");
+    idx = NameIndexMerge(1, idx, player);
+    if (!idx.empty()) Fail("name index: a name two keys show names one of them");
+    if (!NameIndexMerge(1, idx, npc).empty()) Fail("name index: an ambiguous name named again");
+}
 /* a squad's origin slot: its number's block at or above the load floor; below it, the game that runs it now; the number's block when
    the floor or the runner is not known (src/common/squadorigin.h) */
 void t850_squad_origin()
@@ -49241,6 +49386,10 @@ const TestRow kTests[] =
     , { "t809_lever_window_pick", t809_lever_window_pick }
     , { "t809_editorstate", t809_editorstate }
     , { "t850_squad_origin", t850_squad_origin }
+    , { "t642_deleted_mark_floor", t642_deleted_mark_floor }
+    , { "t642_other_block_counter_moved", t642_other_block_counter_moved }
+    , { "t642_renamed_faction_keeps_floor", t642_renamed_faction_keeps_floor }
+    , { "t642_npc_name_clash", t642_npc_name_clash }
     , { "t850_load_age_lift", t850_load_age_lift }
     , { "t876_hb_writer", t876_hb_writer }
     , { "t871_limbtest_level", t_t871_limbtest_level }

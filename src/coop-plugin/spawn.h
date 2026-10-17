@@ -36,6 +36,8 @@ bool NameOf(const void* c, std::string* out);
 bool NameSetOwn(::Character* c, const std::string& name);
 // P11: what `tasks <uid>` prints, handed back - the adopted goal and hasPendingOrders (-1 = unreadable). False = not readable here.
 bool TaskGoalOf(unsigned int uid, std::string* goal, int* hasPendingOrders);
+// T-608 fold: the same read from a character pointer - any loaded character, in the spawn index or not (a town NPC). MAIN THREAD.
+bool TaskGoalOfChar(::Character* c, std::string* goal, int* hasPendingOrders);
 
 // Apply an inbound SPAWN message (payload decoded by the session layer).
 // F115: faction and container mode arrive WITH the message. They used to be read from this

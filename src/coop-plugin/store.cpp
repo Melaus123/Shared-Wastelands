@@ -15,6 +15,7 @@
 #include "../common/standinpurge.h"   /* inv7a-b: IsStandInRecord - the purge's own stand-in test */
 #include "../common/squadwriter.h"   /* M7a3f3 T-425 [m7a3f3-st0]: HandedOverWakeRefuse */
 #include "../common/squadorigin.h"   /* a squad's origin slot: its number's block, or for a save squad the game that runs it now */
+#include "../common/numberblock.h"   /* T-642: where a faction's squad counter stands in this game's number block */
 #include "../common/squadlead.h"   /* T-799: the money-known rules, the money list and the record money field */
 namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
 namespace coop { void* SpawnBuildingFromSentHand(const unsigned char* handRaw32); int PlatoonHomeHandPod(const void* platoon, unsigned char* out32); int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32); }   /* spawn.cpp: a sent building handle resolved here; a squad's home-building hand read and given back [t755-copyhome-decl] */
@@ -2992,9 +2993,16 @@ int ZoneRecvTakesNotNewer(const Record& r, const Record& held, const char* road)
 // over the notebook's player-sector table wants to know which row is THIS GAME'S OWN ECHO, because the relay
 // broadcasts every player's row to every game including its author. With g_mySlot at -1 that test was disabled, and
 // a client spent up to five seconds treating its own player as the other player standing beside the same town.
-// This is written only where g_mySlot is written to a real slot, never cleared, and read by nothing that decides
-// ownership - only by the row-skip.
+// This is written only where g_mySlot is written to a real slot and never cleared. It lives in memory only: it is -1 at
+// every start of the game, so it does not survive a restart. Two readers: the row-skip, and NumberBlockTick, which sets
+// this world's number block from it while the relay is not linked or has not yet named a slot (numberblock.h SlotToApply);
+// a later WELCOME naming a different slot applies the block again.
+// T-642 review 1: NumberBlockTick applies the remembered slot only in the world, and with the relay, that named it - written with
+// it at the WELCOME: the world (StoreWorldStamp: the world's name and the world id this game holds) and the relay's address as the
+// link was opened (g_linkAddr / g_linkPort), compared with the configured relay (g_storeTargetAddr / g_storeTargetPort) and the
+// world now; a game played alone (role single) applies none.
 int g_lastKnownSlot = -1;
+std::string g_lastKnownSlotWorld, g_lastKnownSlotAddr; unsigned short g_lastKnownSlotPort = 0;
 // P6q (review-p6j MEDIUM-1) - THE LINK GENERATION, SO "AFTER THIS LINK'S WELCOME" IS A FACT AND NOT A GUESS.
 // g_linkGen is bumped on every link-UP edge in PumpLink; g_welcomeLinkGen records the generation whose WELCOME has
 // been processed. The two are equal only while this game holds a slot issued by the link it is currently on, which
@@ -3647,7 +3655,8 @@ long long g_deletedHere = 0;
 long long g_indexExpected = 0, g_indexSeen = 0; bool g_indexDone = false;   /* T-313: g_indexExpected is the record feed's BEGIN count (report only); g_indexDone is set by the feed's first END marker on a link (StoreFeedMarkerApply) - the unused g_cleanupRan is gone */
 bool g_worldListedRecv = false, g_worldListedSent = false;
 std::set<std::string> g_deadPending; std::vector<std::string> g_deadShells; std::map<std::string, void*> g_deadShellPtrs;
-long long g_blockSlot = -1, g_blocksApplied = 0, g_blockFactions = 0, g_blockFault = 0; bool g_blockDone = false;   /* decision 31(a) */ long long g_blockSlotMismatch = 0; bool g_blockSlotMismatchLogged = false;   /* review-p5i HIGH-1 (E17): the slot the raise USED (g_blockSlot) against the slot the relay names NOW (g_mySlot) */ std::vector<std::string> g_refusedWakes; std::map<std::string, int> g_refusedWakeTries; long long g_refusedWakeRemoved = 0, g_refusedWakeFailed = 0, g_refusedWakeGaveUp = 0;   /* groups seen awake with NO living member; the shells to destroy */
+long long g_blockSlot = -1, g_blocksApplied = 0, g_blockFactions = 0, g_blockFault = 0; bool g_blockDone = false;   /* decision 31(a) */
+long long g_blockMovedDown = 0, g_blockHeld = 0;   /* NumberBlockTick (numberblock.h CounterForBlock): counters moved down out of another game's block, and counters left there because they had handed out numbers in it or this world's load put them above this game's block (cumulative) */ long long g_blockRememberedOtherWorld = 0; bool g_blockRememberedOtherWorldLogged = false;   /* T-642 review 1: worlds in which the remembered slot was not applied because another world or relay named it, or the game is played alone (counted once per world; the latch is world state) */ long long g_blockSlotMismatch = 0; bool g_blockSlotMismatchLogged = false;   /* review-p5i HIGH-1 (E17): the times NumberBlockTick applied the block again because the slot named now (the relay's, or the remembered one) differs from the slot it was applied for (g_blockSlot); the latch: the first of them in a world is logged */ std::vector<std::string> g_refusedWakes; std::map<std::string, int> g_refusedWakeTries; long long g_refusedWakeRemoved = 0, g_refusedWakeFailed = 0, g_refusedWakeGaveUp = 0;   /* groups seen awake with NO living member; the shells to destroy */
 long long g_deadSeen = 0, g_deadDeletedAtSleep = 0;
 /* moved up (P4e5): the faction-list reader is used by the death watch above the nudge lever */
 struct FmPod { void** factions; unsigned count; };
@@ -4389,7 +4398,33 @@ int NpcMemberPos(void** members, int count, float* x, float* z)
 /* ---- A SQUAD'S ORIGIN (squadorigin.h): the slot this game takes a squad's ownership decisions for. The number's block (GroupBlockOwner)
    names the game that numbered a squad made since this world was loaded; every squad the SAVE holds is numbered in slot 0's block whoever
    runs it now, so a number below its faction's LOAD FLOOR is decided by the game that runs it now, when that is known. MAIN THREAD. ---- */
-std::map<std::string, unsigned> g_loadFloor;   /* faction name -> its squad counter at the first running tick after the load (the lowest, for a shared name) */
+std::map<std::string, unsigned> g_loadFloor;   /* faction floor key (squadorigin.h FloorKey: its stringID) -> its squad counter at the first running tick after the load (the lowest, for a shared key) */
+std::map<std::string, std::string> g_loadFloorByName;   /* the name a faction showed at the load -> its floor key; empty when factions of different keys showed it (squadorigin.h NameIndexMerge) */
+std::map<std::pair<void*, int>, unsigned> g_blockLeftAt;   /* (faction, block) -> the highest counter the faction had inside that block when NumberBlockTick moved it out, this world (numberblock.h CounterForBlock) */
+/* a faction's game-data stringID (Faction+0x240 -> GameData, +0x58: the field factionkey.h names an NPC faction by) and the name it
+   shows, copied out; a field not read is left empty. 1 = read, 0 = the read faulted. */
+static int FactionFloorFieldsPod(void* faction, char* sid, int sidCap, char* name, int nameCap)
+{
+    sid[0] = 0; name[0] = 0;
+    __try
+    {
+        const void* gd = *(const void* const*)((const char*)faction + 0x240);
+        if (Plaus(gd) && CopyStdStringPod((const char*)gd + 0x58, sid, sidCap) == 0) sid[0] = 0;
+        if (CopyStdStringPod(&((Faction*)faction)->getName(), name, nameCap) == 0) name[0] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { sid[0] = 0; name[0] = 0; return 0; }
+}
+/* a faction's load-floor key (squadorigin.h FloorKey); empty = unreadable, or neither a usable stringID nor a name */
+std::string FactionFloorKey(void* faction)
+{
+    if (!Plaus(faction)) return std::string();
+    char sid[factionkey::kMaxSid + 2], name[256];
+    if (FactionFloorFieldsPod(faction, sid, (int)sizeof(sid), name, (int)sizeof(name)) != 1) return std::string();
+    const std::string sidS(sid), nameS(name);
+    if (!factionkey::SidUsable(sidS) && nameS.empty()) return std::string();
+    return sqorigin::FloorKey(sidS, nameS);
+}
 bool g_loadFloorDone = false; long long g_loadFloorFaults = 0;
 /* the current world load's first running tick (LoadFloorTick): GetTickCount then, and the world-load generation it belongs to - a load
    begun since (g_worldGen moved on) has no age until its own first running tick (StoreWorldLoadAgeMs) */
@@ -4464,7 +4499,15 @@ int SquadOriginSlot(const std::string& wid, void* faction, int membersSlot, int 
     const int blk = GroupBlockOwner(wid);
     if (blk < 0) return blk;
     std::string fac; unsigned n = 0; SplitGroupId(wid, &fac, &n);
-    std::map<std::string, unsigned>::const_iterator fl = g_loadFloor.find(fac);
+    std::string key;   /* the load floor's key (squadorigin.h FloorLookupKey): the squad's faction's, or - no faction held, or its key unread - the shown-name index's for the id's name part */
+    if (g_loadFloorDone)
+    {
+        const std::string fk = Plaus(faction) ? FactionFloorKey(faction) : std::string();
+        std::map<std::string, std::string>::const_iterator byName = fk.empty() ? g_loadFloorByName.find(fac) : g_loadFloorByName.end();
+        const int haveName = byName != g_loadFloorByName.end() ? 1 : 0;
+        key = sqorigin::FloorLookupKey(fk.empty() ? 0 : 1, fk, haveName, haveName != 0 ? byName->second : std::string());
+    }
+    std::map<std::string, unsigned>::const_iterator fl = key.empty() ? g_loadFloor.end() : g_loadFloor.find(key);
     const int floorKnown = (g_loadFloorDone && fl != g_loadFloor.end()) ? 1 : 0;
     const unsigned floorValue = floorKnown != 0 ? fl->second : 0u;
     int runWhy = sqorigin::kFallback, runBy = -1;
@@ -4509,7 +4552,7 @@ int SquadOriginOfPlatoon(void* platoon, const std::string& wid, int* whyOut = 0)
 std::string OriginReport()
 {
     return " origin[byFloor,byHandover,byMembers,byHolder,byRecord,fallback]=" + N(g_originWhy[0]) + "," + N(g_originWhy[1]) + "," + N(g_originWhy[2]) + "," + N(g_originWhy[3]) + ","
-         + N(g_originWhy[4]) + "," + N(g_originWhy[5]) + " loadFloor[names,faults]=" + N((long long)g_loadFloor.size()) + "," + N(g_loadFloorFaults);
+         + N(g_originWhy[4]) + "," + N(g_originWhy[5]) + " loadFloor[keys,faults]=" + N((long long)g_loadFloor.size()) + "," + N(g_loadFloorFaults);
 }
 /* the writer rule, with the area answers read at (x, z) */
 int NpcWriterAsk(int npc, int havePos, float x, float z, int mine, int releasedHere, int otherNewer)
@@ -9131,7 +9174,7 @@ void TeardownBroadcast(const char* why)
        that follows it. That is the whole span in which the sector grid is deliberately kept alive over a world the
        engine is freeing, and therefore the whole span in which nothing may be invented from it. */
     ::InterlockedIncrement(&g_engineTeardown);   /* P6q (review-p6j LOW-1): interlocked - the readers are worker threads */   /* P6x (review-p6q MEDIUM-2): an INCREMENT - the flag is a depth now, so a nested teardown cannot lower it early */
-    ++g_worldTeardowns; g_tearingDown = true; g_worldListedRecv = false; g_worldListedSent = false; g_deadPending.clear(); g_deadShells.clear(); g_deadShellPtrs.clear(); g_refusedWakes.clear(); g_refusedWakeTries.clear(); g_t300Q.clear(); g_t300Queued.clear();   /* T-300: the drop queue is world state */ g_blockDone = false;   /* review-p4k L1 */   /* review-p5l MEDIUM-2 (E18): THE SLOT IS WORLD STATE TOO. Clearing g_blockDone alone left g_blockSlot naming the world that has just been torn down, and NumberBlockTick runs on the 1 Hz path with no world loaded - so a relay that restarts and hands this game a different slot at the title screen made the mismatch test true every tick for a world that no longer exists, climbing a counter into the hundreds and burning the once-per-process log latch on a false alarm, after which a REAL re-order later in the same process is never logged at all. All four move together now. */   /* review-p5n MEDIUM-2 (E23): THE COUNT IS NOT LATCH STATE - IT IS THE EVIDENCE, AND IT SURVIVES. g_blockSlot and the log latch are world state and are reset (that is P5n's fold and it is right); g_blockSlotMismatch is the number the report is read from, and zeroing it made a session in which a slot re-order really happened read as one in which it did not, as soon as any world was torn down afterwards. It is cumulative over the process now, like every other counter in ReportStore. */ g_blockSlot = -1; g_blockSlotMismatchLogged = false; g_loadFloor.clear(); g_loadFloorDone = false;   // the engine destroys every group now - none of them is "gone" (P4e)
+    ++g_worldTeardowns; g_tearingDown = true; g_worldListedRecv = false; g_worldListedSent = false; g_deadPending.clear(); g_deadShells.clear(); g_deadShellPtrs.clear(); g_refusedWakes.clear(); g_refusedWakeTries.clear(); g_t300Q.clear(); g_t300Queued.clear();   /* T-300: the drop queue is world state */ g_blockDone = false;   /* review-p4k L1 */   /* review-p5l MEDIUM-2 (E18): THE SLOT IS WORLD STATE TOO. g_blockSlot names the block applied for the world that has just been torn down, so it is cleared with g_blockDone; the log latch is world state too, so a slot change in the next world is logged (NumberBlockTick's MISMATCH). All four move together. */   /* review-p5n MEDIUM-2 (E23): THE COUNT IS NOT LATCH STATE - IT IS THE EVIDENCE, AND IT SURVIVES. g_blockSlot and the log latch are world state and are reset (that is P5n's fold and it is right); g_blockSlotMismatch is the number the report is read from, and zeroing it made a session in which a slot re-order really happened read as one in which it did not, as soon as any world was torn down afterwards. It is cumulative over the process now, like every other counter in ReportStore. */ g_blockSlot = -1; g_blockSlotMismatchLogged = false; g_blockRememberedOtherWorldLogged = false; g_loadFloor.clear(); g_loadFloorByName.clear(); g_blockLeftAt.clear(); g_loadFloorDone = false;   // the engine destroys every group now - none of them is "gone" (P4e)
     /* E29 (review-p5r LOW-2): the same separation for the log. Before the first StoreTick this is not evidence of a worker
        teardown and must not be filed as one - g_offThreadDetours is the count of detours that really did arrive on another
        thread, and an unknown-thread teardown is already counted by g_teardownThreadUnknown above. The clears below still
@@ -14755,7 +14798,7 @@ void PumpLink()
             else { g_storeWrongWorld = false; g_linkWelcomeWorld = -1; }
             /* M4 fold L1 (review 2026-09-29): only a WELCOME this game speaks - whose world was accepted just above - numbers it. A mismatched
                WELCOME's slot is not this game's slot in any world it links to, and a uid is minted only under this link's WELCOME (L2). */
-            if (protoOk && m.payload.size() >= 16) { unsigned int slot = 0; std::memcpy(&slot, &m.payload[12], 4); g_mySlot = (int)slot; if (g_mySlot >= 0) g_lastKnownSlot = g_mySlot; }   /* decision 32: my slot in the relay's order */   /* P6j (verify-p6c HIGH-2): this is the only place a real slot is ever assigned, so it is the only place the remembered one has to be written */
+            if (protoOk && m.payload.size() >= 16) { unsigned int slot = 0; std::memcpy(&slot, &m.payload[12], 4); g_mySlot = (int)slot; if (g_mySlot >= 0) { g_lastKnownSlot = g_mySlot; g_lastKnownSlotWorld = StoreWorldStamp(); g_lastKnownSlotAddr = g_linkAddr; g_lastKnownSlotPort = g_linkPort; } }   /* decision 32: my slot in the relay's order */   /* T-642 review 1: with the world (accepted just above) and the relay that named it */   /* P6j (verify-p6c HIGH-2): this is the only place a real slot is ever assigned, so it is the only place the remembered one has to be written */
             /* P6q (review-p6j MEDIUM-1): the WELCOME belongs to the link that is up RIGHT NOW, and saying so is what
                lets ApplyRelayPlayerSectors tell a table that arrived after this handshake from one that raced it. */
             ::InterlockedExchange(&g_feedDoneLinkGen, -1);   /* T-609: the record list is known again only at this WELCOME's feed END */
@@ -15634,19 +15677,20 @@ void T300SweepTick()
 }
 // decision 31(a): per-player number blocks. Every group's number comes from a per-faction counter (Faction+0x260, saved as
 // "platoonIDs"). A game raises every faction's counter to at least slot x 65,536 once per world, so the names it mints never
-// collide with another game's. The event: the first tick with a loaded world, the link up, and the SLOT known.
+// collide with another game's. The event: the first running tick of a world, once the load floor is read and a SLOT is known
+// (the relay's, or the one it last named in this run while it is not linked); again whenever that slot changes.
 //
 // E11 (2026-09-04) - THE SLOT COMES FROM THE RELAY, AND THE RULE IS THE SAME ON EVERY ROLE. As built, this ran only on a
 // non-host and hard-coded slot 1. Both halves were wrong: the relay hands slots out by CONNECTION ORDER (store_main.cpp's
 // WELCOME, read into g_mySlot at :1434), so the game that connected first is slot 0 whether or not it is the session host -
 // and E2's block ownership (GroupBlockOwner vs g_mySlot) reads that same slot. A client that connected first was therefore
 // numbering in block 1 while claiming block 0, and a host that connected second was numbering in block 0 while claiming
-// block 1: every group either game made was disowned by both. So the rule is now uniform - wait for the WELCOME, then raise
-// to g_mySlot x 65,536. Slot 0 raises nothing (its block starts at zero, where the engine's counter already is), which is
+// block 1: every group either game made was disowned by both. So the rule is now uniform - wait for a slot from the relay (its
+// WELCOME, or the slot it last named in this run of the game), then set the counters into that slot x 65,536. Slot 0 raises nothing (its block starts at zero, where the engine's counter already is), which is
 // exactly right for whichever game connected first, host or not.
 //
-// The cost of the uniform rule, stated plainly: with NO relay there is no WELCOME, g_mySlot stays -1 and NEITHER game raises
-// its counter - where before, the non-host always raised to 65,536. Direct-peer mode therefore has no number blocks at all
+// The cost of the uniform rule, stated plainly: with NO relay in this run of the game there is no WELCOME, no slot is known
+// (g_mySlot and g_lastKnownSlot stay -1) and NEITHER game raises its counter - where before, the non-host always raised to 65,536. Direct-peer mode therefore has no number blocks at all
 // until a relay is present. That is the same condition under which E2's block ownership is inert (it also requires
 // g_mySlot >= 0), so the two halves of decision 31(a) are switched on and off together rather than disagreeing.
 
@@ -15655,9 +15699,17 @@ static int RaiseCounterPod(void* faction, unsigned floorValue, unsigned* before)
     __try { unsigned* c = (unsigned*)((char*)faction + 0x260); *before = *c; if (*c < floorValue) *c = floorValue; return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* the counter set to value exactly (NumberBlockTick moves a counter down as well as up); *before = the counter it replaced */
+static int SetCounterPod(void* faction, unsigned value, unsigned* before)
+{
+    __try { unsigned* c = (unsigned*)((char*)faction + 0x260); *before = *c; *c = value; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 /* THE LOAD FLOOR (squadorigin.h): every faction's squad counter, read once at the first running tick after a load - before this game
-   raises any counter to its number block - and keyed by the faction's name, the name part of the ids it hands out. A name several
-   factions share keeps the lowest counter. Cleared at world teardown. */
+   applies its number block - and kept under the faction's stable internal name (squadorigin.h FloorKey: its stringID), so a faction
+   renamed after the load keeps its floor and a faction showing another faction's name keeps its own. A key several factions share
+   keeps the lowest counter. The shown-name index (g_loadFloorByName) serves an asker that holds only a squad id. Cleared at world
+   teardown. */
 static int ReadCounterPod(void* faction, unsigned* out)
 {
     __try { *out = *(unsigned*)((char*)faction + 0x260); return 1; }
@@ -15679,69 +15731,100 @@ void LoadFloorTick()
     }
     if (g_loadFloorDone || !g_on || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || !GameplayRunning()) return;
     FmPod fm; if (!ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) || !Plaus(fm.factions) || fm.count > 4096 || fm.count == 0) return;
-    g_loadFloor.clear(); long long faults = 0, shared = 0;
+    g_loadFloor.clear(); g_loadFloorByName.clear(); long long faults = 0, shared = 0, nameClash = 0;
     for (unsigned fi = 0; fi < fm.count; ++fi)
     {
         void* f = fm.factions[fi]; if (!Plaus(f)) continue;
         unsigned c = 0; if (ReadCounterPod(f, &c) != 1) { ++faults; continue; }
         char nm[256]; if (FactionNamePod(f, nm, 256) != 1) { ++faults; continue; }
+        const std::string key = FactionFloorKey(f); if (key.empty()) continue;
+        std::map<std::string, unsigned>::iterator it = g_loadFloor.find(key);
+        if (it == g_loadFloor.end()) g_loadFloor[key] = c; else { it->second = sqorigin::FloorMerge(1, it->second, c); ++shared; }
         if (nm[0] == 0) continue;
         const std::string name(nm);
-        std::map<std::string, unsigned>::iterator it = g_loadFloor.find(name);
-        if (it == g_loadFloor.end()) g_loadFloor[name] = c; else { it->second = sqorigin::FloorMerge(1, it->second, c); ++shared; }
+        std::map<std::string, std::string>::iterator ni = g_loadFloorByName.find(name);
+        if (ni == g_loadFloorByName.end()) g_loadFloorByName[name] = key;
+        else { const std::string m = sqorigin::NameIndexMerge(1, ni->second, key); if (m.empty() && !ni->second.empty()) ++nameClash; ni->second = m; }
     }
     g_loadFloorDone = true; g_loadFloorFaults += faults;
-    DebugLog("[STORE] load floor read: " + N((long long)g_loadFloor.size()) + " faction names from " + N((long long)fm.count) + " factions (" + N(shared) + " sharing a name, lowest kept), faults=" + N(faults)
+    DebugLog("[STORE] load floor read: " + N((long long)g_loadFloor.size()) + " faction keys (stringIDs, or '@' + the shown name for a faction whose stringID is unusable) from " + N((long long)fm.count) + " factions (" + N(shared) + " sharing a key, lowest kept; " + N(nameClash)
+             + " shown names shared by factions of different keys - no floor by name for those), faults=" + N(faults)
              + " - a squad numbered below its faction's floor was made by the save and is decided by the game that runs it now");
 }
+/* THE NUMBER BLOCK (decision 31a), applied at the first running tick of a world - in the frame the load floor is read (StoreTick calls
+   this every frame, straight after LoadFloorTick), before anything this game makes in that world takes a number. The slot: the relay's
+   while it is linked and has named one, else the slot it last named in this run of the game - only in the world, and with the relay,
+   that named it, and not in a game played alone (numberblock.h SlotToApply, T-642 review 1; g_lastKnownSlot is held in memory only,
+   so after a restart the block waits for the first WELCOME). Each faction's counter is set by numberblock.h CounterForBlock: raised
+   into the block, kept inside it, or - a counter sitting exactly on a higher block's floor, having handed out none of that game's
+   numbers - moved down to the highest of the block's floor, the faction's load floor and the highest counter it had inside this
+   block earlier in this world; held where it is (counted) when it has handed out numbers in the block it would leave (T-642 review
+   2) or the load itself left it above the block, since the save's own squads may hold any number below it. RaiseOwnRecordCounters
+   then raises each counter past this block's numbers in the records and deleted marks, in the same frame (T-642 review 3).
+   review-p5i HIGH-1 (E17): the relay frees a slot when a game disconnects and hands the smallest free one to the next, so a
+   reconnect, a relay restart or a remembered slot can name a different slot later in the same world: the block is then applied
+   again for that slot (counted and logged - groups already numbered in the old block keep their numbers). MAIN THREAD. */
+void RaiseOwnRecordCounters();   /* defined beside PlaceUnplacedNotes, below - the same namespace (coop) */
 void NumberBlockTick()
 {
-    /* review-p5i HIGH-1 (E17): THE RAISE IS LATCHED PER WORLD; THE SLOT IS NOT. The relay frees a slot when a game disconnects
-       and hands out the smallest free number to the next one, so a relay restart (or a reconnect race) can give this game a
-       DIFFERENT slot from the one whose floor its faction counters were raised to. g_blockDone then blocks any correction, and
-       both claim sites - the sleep record's block test and the death watch's - read the NEW slot against numbers minted under
-       the OLD one: every group this game made is disowned by it and adopted by the other. Nothing here re-raises (a re-raise
-       is a bigger change than this fold, and a lowered slot cannot be re-raised into anyway), so this SAYS SO, loudly and
-       once, and counts every tick it stays true - so a run in which it happened can never be read as one in which it did not. */
-    if (g_mySlot >= 0 && g_blockSlot >= 0 && (long long)g_mySlot != g_blockSlot)
+    if (!g_on || !g_loadFloorDone || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || !GameplayRunning()) return;   /* review-p4j H3: only once the world is running (a load overwrites the counter), and after the load floor is read */
+    const int linked = StoreRelayLinked() ? 1 : 0;
+    const int sameWorld = (g_lastKnownSlot >= 0 && !RoleIsSingle() && g_lastKnownSlotAddr == g_storeTargetAddr && g_lastKnownSlotPort == g_storeTargetPort
+                           && townrefill::SameWorld(g_lastKnownSlotWorld, StoreWorldStamp()) == 1) ? 1 : 0;   /* T-642 review 1 */
+    const int slot = numblock::SlotToApply(linked, g_mySlot, g_lastKnownSlot, sameWorld);
+    if (slot < 0 && g_lastKnownSlot >= 0 && !g_blockRememberedOtherWorldLogged)
+    {
+        g_blockRememberedOtherWorldLogged = true; ++g_blockRememberedOtherWorld;
+        DebugLog("[STORE] number block: the remembered slot " + N((long long)g_lastKnownSlot) + " is not applied - " + std::string(RoleIsSingle() ? "this game is played alone" : "it was named in another world or by another relay")
+                 + "; no block until the relay names a slot in this world (T-642 review 1)");
+    }
+    if (slot < 0) return;   /* E11: no slot named in this run of the game - a guessed floor is worse than none. Not latched: the next tick asks again. */
+    if (g_blockDone && g_blockSlot == (long long)slot) return;
+    const bool fromRelay = (linked != 0 && g_mySlot >= 0);
+    const long long oldSlot = g_blockDone ? g_blockSlot : -1;
+    if (g_blockDone)
     {
         ++g_blockSlotMismatch;
         if (!g_blockSlotMismatchLogged)
         {
             g_blockSlotMismatchLogged = true;
-            ErrorLog("[STORE] number block MISMATCH: raised for slot " + N(g_blockSlot) + ", relay now says slot " + N((long long)g_mySlot) + " - this game's new groups may be judged as another game's (relay restart re-ordered slots)");
+            ErrorLog("[STORE] number block MISMATCH: applied for slot " + N(oldSlot) + ", the " + std::string(fromRelay ? "relay" : "remembered slot") + " now says slot " + N((long long)slot) + " - applying the block again for the new slot; groups already numbered in the old block keep their numbers and may be judged as another game's");
         }
     }
-    if (g_blockDone || !g_on || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || !StoreRelayLinked() || !GameplayRunning()) return;   /* review-p4j H3: only once the world is running (a load overwrites the counter) */   /* E11: the host is no longer excluded - it raises too when the relay gave it a slot above 0 */   /* review-p5i HIGH-1 (E17): the RELAY link, not the game link. The floor comes from the relay's WELCOME and from nothing else, so a game-link-only session must not latch a raise on a slot left over from an earlier relay connection. */
-    if (g_mySlot < 0) return;   /* E11: no WELCOME yet - the slot is not known, and a guessed floor is worse than none. Not latched: the next tick asks again. */
-    const unsigned slot = (unsigned)g_mySlot; const unsigned floorValue = slot * 65536u;   /* review-p4j H2: 65,536 per player - a dense bitmap page of 8 KB, not 125 KB */
-    if (slot >= 16u)
+    if (slot >= numblock::kMaxBlocks)
     {
         /* decision 31(a)'s cap: 16 blocks of 65,536. SplitGroupId refuses a number at or above 1,048,576, so raising a counter
            into block 16 would make every group this game mints unreadable to GroupBlockOwner - a worse failure than a
            collision. Latched and logged rather than clamped: a clamped slot would collide with a real one. */
         g_blockDone = true; g_blockSlot = (long long)slot; g_blocksApplied = 0; g_blockFactions = 0; g_blockFault = 0;
-        ErrorLog("[STORE] number block NOT applied: relay slot " + N((long long)slot) + " is at or above decision 31(a)'s 16-block cap - this game's group numbers would leave the readable range");
-        return;
-    }
-    if (slot == 0)
-    {
-        /* E11: slot 0's block STARTS at 0, which is where the engine's own counter already starts - there is nothing to raise.
-           Latched so the once-per-world rule holds and the report says which slot was applied. */
-        g_blockDone = true; g_blockSlot = 0; g_blocksApplied = 0; g_blockFactions = 0; g_blockFault = 0;
-        DebugLog("[STORE] number block 0 (relay slot 0" + std::string(net::SessionIsHost() ? ", session host" : ", session client") + ") - no raise needed; this game mints group numbers below 65,536 and owns that block (decision 31a)");
+        ErrorLog("[STORE] number block NOT applied: " + std::string(fromRelay ? "relay" : "remembered") + " slot " + N((long long)slot) + " is at or above decision 31(a)'s 16-block cap - this game's group numbers would leave the readable range");
         return;
     }
     FmPod fm; if (!ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) || !Plaus(fm.factions) || fm.count > 4096 || fm.count == 0) return;
-    long long raised = 0, faults = 0; unsigned minBefore = 0xFFFFFFFFu, maxBefore = 0;
+    long long raised = 0, moved = 0, held = 0, faults = 0; unsigned minBefore = 0xFFFFFFFFu, maxBefore = 0;
     for (unsigned fi = 0; fi < fm.count; ++fi)
     {
         void* f = fm.factions[fi]; if (!Plaus(f)) continue;
-        unsigned before = 0; if (RaiseCounterPod(f, floorValue, &before) != 1) { ++faults; continue; }
-        if (before < floorValue) ++raised; if (before < minBefore) minBefore = before; if (before > maxBefore) maxBefore = before;
+        unsigned c = 0; if (ReadCounterPod(f, &c) != 1) { ++faults; continue; }
+        if (c < minBefore) minBefore = c; if (c > maxBefore) maxBefore = c;
+        const std::string key = FactionFloorKey(f);
+        std::map<std::string, unsigned>::const_iterator fl = key.empty() ? g_loadFloor.end() : g_loadFloor.find(key);
+        std::map<std::pair<void*, int>, unsigned>::const_iterator la = g_blockLeftAt.find(std::make_pair(f, slot));
+        int how = numblock::kKept;
+        const unsigned target = numblock::CounterForBlock(c, slot, fl != g_loadFloor.end() ? 1 : 0, fl != g_loadFloor.end() ? fl->second : 0u, la != g_blockLeftAt.end() ? la->second : 0u, &how);
+        if (how == numblock::kHeld) { ++held; continue; }
+        if (target == c) continue;
+        unsigned before = 0; if (SetCounterPod(f, target, &before) != 1) { ++faults; continue; }
+        unsigned& left = g_blockLeftAt[std::make_pair(f, (int)(c >> 16))]; if (c > left) left = c;   /* the block it leaves: a move back into it starts past every number handed out there */
+        if (how == numblock::kRaised) ++raised; else ++moved;
     }
-    g_blockDone = true; g_blockSlot = slot; g_blocksApplied = raised; g_blockFactions = fm.count; g_blockFault = faults;
-    DebugLog("[STORE] number block " + N((long long)slot) + " (relay slot, from " + N((long long)floorValue) + std::string(net::SessionIsHost() ? "; session host" : "; session client") + ") applied to " + N(raised) + " of " + N((long long)fm.count) + " factions, faults=" + N(faults) + " before=[" + N((long long)minBefore) + ".." + N((long long)maxBefore) + "] - this game's new group names never collide with another game's, and E2 reads the same slot back off them (decision 31a)");
+    g_blockDone = true; g_blockSlot = slot; g_blocksApplied = raised + moved; g_blockFactions = fm.count; g_blockFault = faults; g_blockMovedDown += moved; g_blockHeld += held;
+    DebugLog("[STORE] number block " + N((long long)slot) + " (" + std::string(fromRelay ? "relay slot" : "remembered slot - relay not linked or no slot named yet") + ", from " + N((long long)slot * 65536) + std::string(net::SessionIsHost() ? "; session host" : "; session client")
+             + (oldSlot >= 0 ? "; replacing block " + N(oldSlot) : std::string()) + ") applied over " + N((long long)fm.count) + " factions: " + N(raised) + " raised, " + N(moved) + " moved down out of another game's block, " + N(held)
+             + " held in another game's block (numbers handed out there, or the load left them there), faults=" + N(faults) + " before=[" + N((long long)minBefore) + ".." + N((long long)maxBefore) + "] - "
+             + (held == 0 ? std::string("this game's new group names never collide with another game's, and E2 reads the same slot back off them (decision 31a)")
+                          : N(held) + " factions' new group names stay in another game's block and may collide with that game's; the rest are in this game's block (decision 31a)"));
+    RaiseOwnRecordCounters();   /* T-642 review 3: past the records' and marks' numbers of this block in the same frame, before anything takes a number */
 }
 void DeadShellsTick()
 {
@@ -23209,6 +23292,7 @@ void PlatoonNudgeTick();   /* defined beside PlatoonNudge, below - the same name
 void StoreTick()
 {
     LoadFloorTick();   /* first, every frame until read: the floor is each counter as the load left it, before anything this tick can raise one (PlaceUnplacedNotes, NumberBlockTick) */
+    NumberBlockTick();   /* decision 31(a): every frame (it returns at once while the applied block stands), so the block is applied in the frame the floor is read - E11: the relay's slot decides, not the session role */
     MoneyLoadDrain();   /* T-799 D1: container loads that ran off the main thread, decided before anything announces this frame */
     ::InterlockedExchange(&g_relayLinkedCached, LinkUp() ? 1 : 0);   /* review-p5b CRASH-2: the any-thread flag is refreshed here, on the main thread, before anything else runs */
     P113Tick(); P113LeverTick();   /* PROBE P113 */
@@ -23303,7 +23387,6 @@ void StoreTick()
     if (++g_tick % 118 != 0) return;
     PlaceUnplacedNotes();   /* decision 34 / 547: the notes of the areas this game runs that no world here holds - placed from their records before the set is published */
     PublishPendingTowns();   /* review-p4t MEDIUM: the pending-towns set is rebuilt once per second here, not on every frame above the gate */
-    NumberBlockTick();   /* decision 31(a): once per world, on EVERY role - E11: the relay's slot decides, not the session role */
     RaiseOwnRecordCounters();   /* decision 31(a) / 34: past this game's own numbers in the world server's records, once the block is known */
     BitsDrainTick();   /* bits set from a worker thread land here (review-p4f) */
     DeadShellsTick();   /* the shells of wiped-out groups: destroyed on the main thread under the admin flag (1 Hz) */
@@ -23775,24 +23858,29 @@ static bool CreateUnknownSquad(const Record& r)
              + " state0x22=" + P(s22) + " " + StateFieldsLine(s22) + " sleeps at " + (cqRead ? F1(cq.ux) + "," + F1(cq.uy) + "," + F1(cq.uz) : std::string("(unreadable)")));
     return true;
 }
-/* DECISION 31(a) / 34 - THIS GAME'S OWN NUMBERS IN THE WORLD SERVER'S RECORDS ARE NEVER MINTED AGAIN. As soon as this world's block
-   is known (NumberBlockTick raises every counter to the block's floor only), each faction's group counter is raised past the
-   highest number of this game's own block among the records here (townpending::CounterFloor): a group this game numbered in a
-   session that never reached its save is in those records and not in the save's counter. Numbers of another game's block never
-   raise a counter. Records keep arriving after the link comes up, so the scan runs again whenever the record count has changed.
-   MAIN THREAD, 1 Hz. */
-size_t g_noteRaiseSeen = 0;
+/* DECISION 31(a) / 34 - THIS GAME'S OWN NUMBERS ARE NEVER MINTED AGAIN. As soon as this world's block is applied (NumberBlockTick
+   sets every counter into the block only - from the relay's slot, or the remembered one while the relay is not linked), each
+   faction's group counter is raised past the highest number of this game's own block among the records here
+   (townpending::CounterFloor) and among the deleted marks here (numberblock.h OwnMarkFloor): a group this game numbered in a session
+   that never reached its save is in those records - or, once deleted, only in the marks - and not in the save's counter. The marks
+   are kept under the name part of the ids, so every faction showing that name is raised past them. Numbers of another game's block
+   never raise a counter. Records and marks keep arriving after the link comes up, so the scan runs again whenever the record count,
+   the marks set or received, or the applied block has changed. MAIN THREAD, 1 Hz. */
+size_t g_noteRaiseSeen = 0; long long g_noteRaiseBitsSeen = -1, g_noteRaiseSlot = -1, g_noteMarkRaised = 0;   /* the scan's inputs as last read; factions raised past a deleted mark (cumulative) */
+long long g_noteRaiseCapped = 0, g_noteRaiseCappedLast = 0;   /* T-642 review 4: floors capped at the block's last number (a record or mark on it) - summed over every scan, and in the last scan */
 void RaiseOwnRecordCounters()
 {
     if (!g_blockDone || EngineWritesBlocked()) return;
-    const int mine = NoteOwnBlock(); if (mine < 0) return;
-    if (g_noteRaiseDone && g_records.size() == g_noteRaiseSeen) return;
+    const int mine = (g_blockSlot >= 0 && g_blockSlot < (long long)numblock::kMaxBlocks) ? (int)g_blockSlot : -1; if (mine < 0) return;   /* the block this world's counters are set to - with the relay down too (NoteOwnBlock asks for the relay's slot as well) */
+    const long long bitsNow = g_bitsSet + g_bitsRecv;
+    if (g_noteRaiseDone && g_records.size() == g_noteRaiseSeen && bitsNow == g_noteRaiseBitsSeen && g_noteRaiseSlot == (long long)mine) return;
     std::map<std::string, unsigned> want;   /* faction key -> the counter's floor */
+    long long capped = 0;   /* T-642 review 4 */
     for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)
     {
         std::string fac; unsigned n = 0;
         if (it->second.factionName.empty() || !SplitGroupId(it->first, &fac, &n)) continue;
-        unsigned& w = want[it->second.factionName]; w = townpending::CounterFloor(n, mine, w);
+        int cap = 0; unsigned& w = want[it->second.factionName]; w = townpending::CounterFloor(n, mine, w, &cap); if (cap != 0) ++capped;
     }
     long long raised = 0, faults = 0;
     for (std::map<std::string, unsigned>::const_iterator w = want.begin(); w != want.end(); ++w)
@@ -23802,10 +23890,25 @@ void RaiseOwnRecordCounters()
         if (!Plaus(f) || RaiseCounterPod(f, w->second, &before) != 1) { ++faults; continue; }
         if (before < w->second) ++raised;
     }
-    if (!g_noteRaiseDone || raised > 0)
-        DebugLog("[STORE] own-block counters: " + N(raised) + " factions raised past this game's highest own-block record number (block " + N((long long)mine) + ", " + N((long long)g_records.size()) + " records read, "
-                 + N((long long)want.size()) + " factions named), " + N(faults) + " not raised (no faction here or a fault)");
-    g_noteRaiseDone = true; g_noteRaiseSeen = g_records.size(); g_noteRaiseFactions += raised; g_noteRaiseFault += faults;
+    long long markRaised = 0, markFactions = 0;
+    FmPod fm;
+    if (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) && Plaus(fm.factions) && fm.count <= 4096)
+        for (unsigned fi = 0; fi < fm.count; ++fi)
+        {
+            void* f = fm.factions[fi]; if (!Plaus(f)) continue;
+            char nm[256]; if (FactionNamePod(f, nm, 256) != 1) { ++faults; continue; }
+            if (nm[0] == 0) continue;
+            std::map<std::string, std::vector<char> >::const_iterator bits = g_deletedBits.find(std::string(nm)); if (bits == g_deletedBits.end() || bits->second.empty()) continue;
+            int cap = 0; const unsigned fl = numblock::OwnMarkFloor(&bits->second[0], bits->second.size(), mine, 0u, &cap); if (cap != 0) ++capped; if (fl == 0u) continue;
+            ++markFactions;
+            unsigned before = 0; if (RaiseCounterPod(f, fl, &before) != 1) { ++faults; continue; }
+            if (before < fl) ++markRaised;
+        }
+    if (!g_noteRaiseDone || raised > 0 || markRaised > 0 || capped > 0)
+        DebugLog("[STORE] own-block counters: " + N(raised) + " factions raised past this game's highest own-block record number and " + N(markRaised) + " past its highest own-block deleted mark (block " + N((long long)mine) + ", " + N((long long)g_records.size()) + " records read, "
+                 + N((long long)want.size()) + " factions named by records, " + N(markFactions) + " factions with an own-block mark), " + N(faults) + " not raised (no faction here or a fault)"
+                 + (capped > 0 ? ", " + N(capped) + " floors capped at the block's last number (a record or mark on it - the block is used up for that faction)" : std::string()));
+    g_noteRaiseDone = true; g_noteRaiseSeen = g_records.size(); g_noteRaiseBitsSeen = bitsNow; g_noteRaiseSlot = mine; g_noteRaiseFactions += raised + markRaised; g_noteMarkRaised += markRaised; g_noteRaiseFault += faults; g_noteRaiseCapped += capped; g_noteRaiseCappedLast = capped;
 }
 /* DECISION 34 / 547 - THIS GAME PLACES THE NOTES OF THE AREAS IT RUNS. A town's note not bound here, whose area is this game's to
    run (no other game holds it, read exactly) and whose record is usable here (townpending::Placeable answers kPlaceByThisGame),
@@ -24163,7 +24266,7 @@ void ReportStore()
              + " sleeps=" + N(g_sleeps) + " written=" + N(g_written) + " sent=" + N(g_sent) + " pushed=" + N(g_pushed) + " recv=" + N(g_recv)
              + " wakes=" + N(g_wakes) + " applied=" + N(g_applied) + " notNewer=" + N(g_notNewer) + " repositioned=" + N(g_repositioned) + " placed=" + N(g_placed) + " placeTimedOut=" + N(g_placeTimedOut) + " ignoredAwake=" + N(g_ignoredAwake)
              + " unknownDeferred=" + N(g_unknownDeferred) + " created=" + N(g_created) + " createNoRefs=" + N(g_createNoRefs) + " createLoadFailed=" + N(g_createLoadFailed) + " createNoState=" + N(g_createNoState) + " createNoPlatoon=" + N(g_createNoPlatoon) + " deferredLoadedHere=" + N(g_createDeferredLoadedHere)
-             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
+             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " ownMarkRaise=" + N(g_noteMarkRaised) + " ownRaiseCapped[total,lastScan]=" + N(g_noteRaiseCapped) + "," + N(g_noteRaiseCappedLast) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " blockMove[movedDown,held]=" + N(g_blockMovedDown) + "," + N(g_blockHeld) + " blockRememberedOtherWorld=" + N(g_blockRememberedOtherWorld) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
              + " destroyedForgotten=" + N(g_destroyedForgotten) + " recvFoundInList=" + N(g_recvFoundInList) + " recvNotLoadedHere=" + N(g_recvNotLoadedHere) + " recvCacheDisagreed=" + N(g_recvCacheDisagreed)
              + " | faultSid=" + N(g_faultSid) + " faultSleepPod=" + N(g_faultSleepPod) + " faultSleepContainer=" + N(g_faultSleepContainer) + " faultWakePod=" + N(g_faultWakePod) + " | skippedEmpty=" + N(g_skippedEmpty) + " skippedNotMine=" + N(g_skippedNotMine) + " skippedNoUid=" + N(g_skippedNoUid) + " block[writtenByBlock,skippedOtherBlock]=" + N(g_writtenByBlock) + "," + N(g_skippedOtherBlock) + " skippedPlayerFaction=" + N(g_skippedPlayerFaction) + " skippedStandInRecord=" + N(g_sleepSkippedStandInRecord) + " | ZONE saves=" + N(g_zoneSaves) + " zoneSave[applied,notMine,staleCopyRefused,ownStore,readFail,writeFail,skippedOff,skippedSingle;viaFlush]=" + N(g_zoneWritten) + "," + N(g_zoneSkippedNotMine) + "," + N(g_zoneStaleCopyRefused) + "," + N(g_zoneOwnStore) + "," + N(g_zoneReadFail) + "," + N(g_zoneWriteFail) + "," + N(g_zoneSkippedOff) + "," + N(g_zoneSkippedSingle) + ";" + N(g_zoneSaveViaFlush) + "   (P6q: the first EIGHT are ZoneSaveApply's eight counted exits and sum to ZONE saves= above; viaFlush is a SPAN over all eight, not a ninth bucket - saves counted at entry while the post-teardown flush was running, of which zoneWriteAfterTeardownFlush were written) written=" + N(g_zoneWritten) + " skippedNotMine=" + N(g_zoneSkippedNotMine) + " zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + " zoneKeptAdopted=" + N(g_zoneKeptAdopted) + " zoneStampBumped=" + N(g_zoneStampBumped) + " recvOff=" + N(g_zoneRecvOff) + " loadOk=" + N(g_zoneLoadOk) + " loadFailed=" + N(g_zoneLoadFailed) + " zoneReadOffMain=" + N((long long)g_zoneReadOffMain) + " zoneSwapNoPeerFaction=" + N(g_zoneSwapNoPeerFaction) + " areaStandIns[made,failed]=" + N(g_areaStandInsMade) + "," + N(g_areaStandInsFailed)
              + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)

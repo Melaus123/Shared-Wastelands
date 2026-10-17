@@ -1564,6 +1564,8 @@ void CommandChannelTick()
         const bool ownSet = (rest.compare(0, 3, "set") == 0 && (rest.size() == 3 || rest[3] == ' '));
         /* T-172 cmd: `itemtest drift <peer|name> <staleSid> at <ownerSid> | ... hidden | show <peer|name>` - TEST-ONLY: drift in our copy. */
         const bool ownDrift = (rest.compare(0, 5, "drift") == 0 && (rest.size() == 5 || rest[5] == ' '));
+        /* T-608 (c): `itemtest ownerfull on|off` - TEST-ONLY: as the OWNER, read the owner table as full (every character and box take / give refused busy). */
+        const bool ownerFull = (rest.compare(0, 9, "ownerfull") == 0 && (rest.size() == 9 || rest[9] == ' '));
         std::vector<std::string> tok; std::string t;
         {
             std::istringstream ts(rest);
@@ -1598,6 +1600,7 @@ void CommandChannelTick()
         else if (ownMark) WriteStatus(coop::ItemTestMarkCommand(Trim(rest.substr(4))));
         else if (ownSet) WriteStatus(coop::ItemTestSetCommand(Trim(rest.substr(3))));
         else if (ownDrift) WriteStatus(coop::ItemTestDriftCommand(Trim(rest.substr(5))));   /* T-172 disp */
+        else if (ownerFull) WriteStatus(coop::ItemTestOwnerFullCommand(Trim(rest.substr(9))));   /* T-608 (c) */
         else WriteStatus(coop::ItemTest(nm, sid, cnt) ? "ok itemtest" : "error itemtest");
         finished = true;
     }
@@ -2296,7 +2299,7 @@ void CommandChannelTick()
         // outposttest found <name> [dx dz] | link <key-substring> | list - TEST-ONLY lever (outposts, build.cpp). found: a player
         // outpost founded the engine's way (TownFoundPlayer) at this player's character + (dx, dz), named <name> (the rest of the
         // line; the last two words are dx dz when both are numbers); link: one own registered piece (key or key substring) linked to
-        // this player's nearest outpost (Building +0x90, the field the placement writes); both run at the K2 safe point, one
+        // this player's nearest outpost (the Building's +0x1D0 town handle, as the engine writes it; a piece inside a building is not written); both run at the K2 safe point, one
         // [BUILD] outposttest line each. list (read-only, now): one [BUILD] outposttest list line per player town - name, centre,
         // handle words, faction, own=0|1, the registered pieces linked to it (first 8 keys) - then a summary line.
         std::string arg; std::getline(is, arg);

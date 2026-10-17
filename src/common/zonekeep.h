@@ -602,7 +602,7 @@ inline void MatsOf(const Rec& r, std::vector<KeptMat>* out)
 inline std::string HandleKey(int s, int i, int c) { return ZkNum(s) + "/" + ZkNum(i) + "/" + ZkNum(c); }
 /* a town's five handle words (townTYPE, townC, townCS, townI, townS) as one text: the form a set of towns holds */
 inline std::string TownHandText(const int* h) { return ZkNum(h[0]) + "/" + ZkNum(h[1]) + "/" + ZkNum(h[2]) + "/" + ZkNum(h[3]) + "/" + ZkNum(h[4]); }
-/* the town a state record names (Building +0x90 when it was saved): 1 with its handle words in h; 0 = none (no townTYPE, or townC,
+/* the town a state record names (the Building +0x1D0 town handle when it was saved): 1 with its handle words in h; 0 = none (no townTYPE, or townC,
    townCS, townI and townS all zero) */
 inline int TownHandOf(const Rec& r, int* h)
 {
@@ -687,7 +687,7 @@ inline bool ExtractKeptPieces(const Container& c, int writerSlot, std::vector<Ke
         p.progress = RecFloat(r, "construction progress", 0.0f);
         MatsOf(r, &p.mats);
         StateOf(r, &p, st);
-        if (r.ints.find("townTYPE") != r.ints.end())   /* the town the building is linked to (Building +0x90 when it was saved) */
+        if (r.ints.find("townTYPE") != r.ints.end())   /* the town the building is linked to (its +0x1D0 town handle when it was saved) */
         {
             p.townHand[0] = RecInt(r, "townTYPE", 0); p.townHand[1] = RecInt(r, "townC", 0); p.townHand[2] = RecInt(r, "townCS", 0);
             p.townHand[3] = RecInt(r, "townI", 0); p.townHand[4] = RecInt(r, "townS", 0);

@@ -3,10 +3,10 @@
    game (build.cpp, store.cpp) and the offline suite (test_main.cpp). Pure: no disk, no clock, no engine. Header-only. No C++11.
 
    A player's outpost is a Town the game founds when the player places a building away from any town (0x4DA6F0 -> 0x933F40); each
-   placed building is linked to it (Building +0x90) and its area record names that town by five handle words (townTYPE, townC, townCS,
+   placed top-level building is linked to it (the town's handle words at Building +0x1D8) and its area record names that town by five handle words (townTYPE, townC, townCS,
    townI, townS). The world server holds no save of the games, so:
    - EACH GAME SAYS ITS OWN OUTPOSTS (SAY): name, centre and handle words of every player town of its player's faction, and the
-     position keys of the registered pieces linked to it (Building +0x90 is that town). A player town's handle words as the game
+     position keys of the registered pieces linked to it (the engine's BuildingGetTown reads that town). A player town's handle words as the game
      reads them are not the words the engine's save writes for that town, so a kept piece is tied to its outpost by their keys, not
      by a town handle. The world server keeps the said outposts per player slot in player-towns.txt (ReplaceSlotTowns: a SAY replaces
      that slot's rows; a row whose key list is cut keeps the keys its outpost had on file, and a SAY whose town list was not read
@@ -23,8 +23,8 @@
      house and its furniture; InWorldTown). A said outpost with no kept piece is not carried.
    - THE WORLD SERVER SENDS THE KEPT OUTPOSTS (LIST) to each game at its link's first AREAS report, before its first kept rows (an
      empty list too: the game drops any list it holds). Every game takes or founds the outpost (TownLayStep) for each kept piece of it
-     loaded there and links the piece to it; a piece found standing in a town that is not a player town stays in it (TownRelinkAllowed), a piece the lay
-     made is linked whatever town the engine gave it. A SAY with
+     loaded there and links the piece to it, whatever town the engine gave it (a bought or handed-back house is on no outpost's key
+     list); a piece standing inside a building keeps its host's town. A SAY with
      no outposts, while that slot has rows on file, is taken only as the kEmptyWholeToClear-th SAY in a row on one link with no
      outposts and its town list read whole (EmptyWholeRun, EmptySayIgnored); the game marks no SAY whole before its player has been
      in the world it loaded for a while.
@@ -600,13 +600,14 @@ inline std::map<std::string, size_t> PieceIndex(const std::vector<zonekeep::Kept
     return m;
 }
 /* 1 = a kept piece stands in a world town (worldTowns, WorldTownsOf): its area record names that town, or it is furniture whose
-   building (a kept piece, found through byKey) names it - a bought house and the furniture in it */
+   building (a kept piece, found through byKey) names it - a bought house and the furniture in it. Furniture takes its host's town
+   only: the engine copies the host's handle words into furniture as it is made, so after the host is linked to an outpost the
+   furniture's own words can still name the old town. */
 inline int InWorldTown(const zonekeep::KeptPiece& k, const std::vector<zonekeep::KeptPiece>& pieces, const std::map<std::string, size_t>& byKey,
                        const std::set<std::string>& worldTowns)
 {
     if (worldTowns.empty()) return 0;
-    if (k.hasTown != 0 && worldTowns.count(zonekeep::TownHandText(k.townHand)) != 0) return 1;
-    if (k.hostKey.empty()) return 0;
+    if (k.hostKey.empty()) return (k.hasTown != 0 && worldTowns.count(zonekeep::TownHandText(k.townHand)) != 0) ? 1 : 0;
     const std::map<std::string, size_t>::const_iterator h = byKey.find(k.hostKey);
     if (h == byKey.end()) return 0;
     const zonekeep::KeptPiece& b = pieces[h->second];
@@ -830,13 +831,6 @@ inline void OutpostsFromPieces(const std::vector<TownRow>& said, const std::vect
             if (from > 0) ++st->split;
         }
     }
-}
-/* A KEPT PIECE'S TOWN LINK: 1 = it may be linked to its outpost's town (it names no town, or a player town); 0 = it stays as it is
-   (a town that is not a player town - a bought or handed-back house's - or isPlayerTown -1: the player-town list could not be read) */
-inline int TownRelinkAllowed(int hasTown, int isPlayerTown)
-{
-    if (hasTown == 0) return 1;
-    return isPlayerTown == 1 ? 1 : 0;
 }
 
 }   /* namespace townkeep */

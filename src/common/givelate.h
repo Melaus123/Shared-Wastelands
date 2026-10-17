@@ -2,6 +2,8 @@
 /* give1 (2026-09-26): the pure decisions of the player-to-player item handover's late and cancelled paths. Header-only, no
    engine types, shared by the plugin (items.cpp) and the offline suite (coop-test). */
 
+#include "liveenvelope.h"   /* T-608 fold: cooplive::SamePlayer / IsRelayPeer - GiveSamePlayer's player keys */
+
 namespace coopgive {
 
 /* A CONFIRM whose request our own 10 s timeout already expired (ApplyItemConfirm's late branch).
@@ -62,7 +64,7 @@ inline unsigned int OwnerPendWindowMs(int dir, unsigned int takeMs, unsigned int
 inline unsigned int OwnerPendAgeMs(int dir, unsigned int wallMs, unsigned int hereMs) { return (dir != 0) ? hereMs : wallMs; }
 /* T-889: does this owner row answer a REVOKE for request `id`? Only a GIVE row (dir 1) with that request id. samePeerId: the
    REVOKE came from the connection id the request came from (kGmExact - preferred). samePlayer: it came from the same PLAYER
-   (coopesc::SameSender of the player key kept at the grant and the sender's) - a reconnected giver has a new connection id
+   (GiveSamePlayer below, of the player key kept at the grant and the sender's) - a reconnected giver has a new connection id
    (kGmPlayer). Anything else: not this row (kGmNone). */
 const int kGmNone = 0, kGmExact = 1, kGmPlayer = 2;
 inline int GiveRowMatch(int rowDir, unsigned int rowId, unsigned int id, int samePeerId, int samePlayer)
@@ -70,6 +72,20 @@ inline int GiveRowMatch(int rowDir, unsigned int rowId, unsigned int id, int sam
     if (rowDir != 1 || id == 0 || rowId != id) return kGmNone;
     if (samePeerId != 0) return kGmExact;
     return (samePlayer != 0) ? kGmPlayer : kGmNone;
+}
+/* T-608 fold: GiveRowMatch's samePlayer - is a REVOKE from `sender` from the player whose key `recorded` was kept at the grant?
+   1 when cooplive::SamePlayer says so (both keys folded by the link's slot: one player whichever road its messages take, and a
+   reconnected giver once its link's slot is known). 1 also while the link's slot is unknown (linkPeerSlot < 0) for a raw sender
+   against a raw recorded key when the sender is the CURRENT session peer (senderIsSessionPeerUnslotted:
+   coopesc::RawIsSessionPeerUnslotted of the sender): with no slot the raw connection id is the only name the session peer has,
+   and a giver that reconnected comes back under a new one. A raw sender that is not the current session peer, and any relayed
+   sender, match only through SamePlayer. */
+inline int GiveSamePlayer(unsigned int recorded, unsigned int sender, int linkPeerSlot, int senderIsSessionPeerUnslotted)
+{
+    if (cooplive::SamePlayer(recorded, sender, linkPeerSlot)) return 1;
+    if (linkPeerSlot < 0 && !cooplive::IsRelayPeer(recorded) && !cooplive::IsRelayPeer(sender) && senderIsSessionPeerUnslotted != 0)
+        return 1;
+    return 0;
 }
 /* T-889: a clock held because the other game is away is logged once per row / kept REVOKE: 1 = say it now. */
 inline int AwayHoldFirst(int here, int saidBefore) { return (here == 0 && saidBefore == 0) ? 1 : 0; }

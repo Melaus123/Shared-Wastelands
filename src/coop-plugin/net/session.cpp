@@ -5132,7 +5132,8 @@ static bool ParseItemConfirmBody(const Message& m, coop::ItemConfirmMsg& c, bool
         if (!coopshop::DecodeCf(&m.payload[0], m.payload.size(), &at, &c.shop))
         { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with a shop block that is cut or out of range - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     }
-    /* inv5 (protocol 72): a refusal may end with a 'GND1' block {u32 tag, u8 reason} - the ground's reason (1 not holder, 2 not found).
+    /* inv5 (protocol 72): a refusal may end with a 'GND1' block {u32 tag, u8 reason} - the ground's reason (1 not holder, 2 not found);
+       T-608 (a): 3 busy also ends a character / box take or give refused because the owner's exchange table is full.
        It is the whole remainder when present, so the blocks below then see nothing. An unknown reason REFUSES the message. */
     if (c.ok == 0 && at + 5 == m.payload.size())
     {

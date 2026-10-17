@@ -92,6 +92,8 @@
 #include "playerfaction.h"  /* LocalPlayerFaction */
 #include "policy.h"         /* PolicyVtableRvaPod, PolicyClassNamePod - the RTTI class name (the wall test) */
 #include "team.h"           /* T-805: TeamSameAnyThread - the owner's game checks a DISMANTLE_ASK's sender */
+#include "relations.h"      /* T-903: RelationsStanceLevels - the owner's PLAYERS-tab setting towards this game's player */
+#include "../common/nametag.h"   /* T-903: nametag::kFriendly */
 #include "doors.h"          /* P15 fold 1: DoorsForgetOwner - a building's door rows are dropped before its setDestroyed flip */
 #include "net/session.h"    /* IsUidMine, SendBuild */
 #include "ownstore.h"        /* help1 fold: OwnWriterOn, OwnStoreCommittedSeq - pp.build landed (MED 4) */
@@ -192,7 +194,8 @@ const size_t kVtSetDestroyed = 0x340;  /* P15: setDestroyed(bool) 0x5567F0 (558b
 /* build1-c: Building::ConstructionState (the pointer vt+0x228 returns; ANSWERS build1):
    +0 complete, +2 isDismantled, +4 progress, lektor<BuildMaterial*> mats at +0x10 = {allocator 8, u32 count +0x18,
    u32 maxSize +0x1C, BuildMaterial** +0x20}, +0x28 needed. BuildMaterial: GameData* +0, f32 total +8, f32 delivered +0xC. */
-const size_t kStMatCount = 0x18, kStMatArray = 0x20, kMatDelivered = 0xC;
+const size_t kStMatCount = 0x18, kStMatArray = 0x20, kMatDelivered = 0xC;   /* engine (1.0.65): addConstructionProgress 0x558B10 walks
+   +0x18 / +0x20 and reads / writes material+0xC; the save 0x553D60 and load 0x554BC0 carry it as 'construction mats'; state+0x28 is read as needed by 0x558B10 and the health bar 0x546770 (progress / needed) - the engine code that sets needed is not identified (T-902) */
 const unsigned int kStMatSane = 1024;  /* a count above this is not a materials list */
 const size_t kBNeedsOperating = 0x3A9;  /* ProductionBuilding: set = a worker operates it (update 0x29AD50 runs the step itself only while clear) */
 const size_t kBProdInputCount = 0x480;  /* ProductionBuilding: the input records' count (operate 0x2986C0 reads it) */
@@ -201,6 +204,8 @@ const size_t kGdName = 0x28, kGdType = 0x50, kGdStringId = 0x58;   /* GameData (
 const size_t kBDestroyed = 0x1A1;      /* Building "destroyed" (serialise 0x551BA0) */
 const size_t kBBroken = 0x3B6;         /* Building "broken" (save 0x2A1470 / load 0x2A1710, getter 0x0F6CC0); set through vt+0x310 */
 const size_t kBOwnDismantled = 0x162;  /* review-build1d D2: Building isDismantled, the piece's OWN byte (0x2A2820 tests it) */
+const size_t kBOwnComplete = 0x160;    /* T-903 fold: Building complete, the piece's OWN byte - updatePhysicalWithProgress 0x558680 runs its finish
+                                          step (vt+0x240) at progress >= needed only while it is 0 (build/decomp_558680.txt) */
 const size_t kWorldFactory = 0x4A0;    /* GameWorld::objectFactory (RootObjectFactory*) */
 const size_t kBInterior = 0x1F0;       /* build1-e: Building::myInterior (items.cpp kBldMyInterior) */
 const size_t kInteriorLayout = 0x30;   /* build1-e: the interior's layout = the commit's furnitureOf (answers-build1b R1) */
@@ -280,7 +285,8 @@ BdRebuildDropFn orig_rebuilddrop = 0;
 int g_hkRebuild = 0;      /* P18 fold 2: 1 installed, -1 failed, -2 no address row */
 volatile long long g_rbCalls = 0, g_rbStates = 0, g_rbHeld = 0, g_rbOverflow = 0, g_rbFaults = 0;   /* ANY THREAD (Interlocked): the zone loader calls the drop */
 const size_t kBInteriorObj = 0xF8;     /* P18 fold 1: Building::isAnInteriorObject */
-const size_t kBResidentSquad = 0xD0;   /* P18 fold 1: Building::residentSquad (a hand: +0x8 its type, 0xB = none) - the buy callback clears it */
+const size_t kBResidentSquad = 0xD0;   /* P18 fold 1: Building::residentSquad (a hand: +0x8 its type, 0xB = none) - the buy callback clears it:
+   buyMeCallback 0x7ACB20 writes +0xD8 = 0xB, +0xE4 = 0 (8 bytes), +0xE0 = 0 (4 bytes); setResidentSquad 0x552780 fills the same hand (1.0.65, T-902) */
 const size_t kFacOwnerships = 0x80;    /* P18 fold 1: Faction::factionOwnerships (Ownerships*) */
 const size_t kRootHandle = 0x58;       /* P18 fold 1: RootObjectBase::handle - the hand the buy callback passes (param_1 + 0xb) */
 const size_t kRootOwner = 0x10;        /* P18 fold 1: RootObjectBase::owner (Faction*) - the buy callback's param_1[2] */
@@ -566,6 +572,17 @@ long long g_helpGoneOldNonce = 0, g_helpGoneNoRecord = 0, g_goneRecFull = 0, g_g
 long long g_helpResynced = 0, g_helpSuperseded = 0, g_helpUnencodable = 0, g_helpReplaced = 0, g_helpFloorDropped = 0;   /* help1 fold 2 */
 long long g_goneRowsKept = 0, g_goneRowsRead = 0, g_goneRowUnkept = 0;   /* help1 fold 2 (MED 3): pp.build gone markers */
 volatile LONG g_helpWallRefusedOff = 0;           /* help1 fold 2 (LOW 7): wall-copy orders refused off the main thread (counted, no line) */
+/* T-903: help per kind - [0] build, [1] add materials, [2] repair. given = an order on a copy let through as help; refused = the
+   owner is neither a faction-mate nor has set this player friendly (decision 920 a). repairDamagedHelp = repair orders on a complete
+   damaged copy given; repairWorkRec = repair work recorded on such a copy (it goes as HELP_WORK); on the owner's game repairApplied /
+   repairWhole (the piece was already whole here) / repairFaulted. */
+long long g_helpGivenK[3] = { 0, 0, 0 }, g_helpRefusedK[3] = { 0, 0, 0 };
+long long g_repairDamagedHelp = 0, g_repairWorkRec = 0, g_helpRepairApplied = 0, g_repairWhole = 0, g_repairFaulted = 0;
+volatile LONG g_helpRefusedOff = 0;   /* T-903: a help order of a player who is no faction-mate, refused off the main thread (counted, no line) */
+long long g_helpApplyRefused = 0;     /* T-903 fold (review MED 2): the owner's game - help work from a player it allows no help, refunded */
+long long g_helpApplyHeld = 0;        /* T-903 re-check fold (item 2): help work held - this game's slot or the sender's standing not known yet */
+long long g_helpRunRefused = 0;       /* T-903 fold (review MED 2): the helper's game - the engine's work on a copy of a player who allows no help, not done */
+int BdHelpKind(int t) { return t == coopbuild::kBuildTaskBuild ? 0 : (t == coopbuild::kBuildTaskAddMaterials ? 1 : 2); }
 std::vector<BdHelpGoneIn> g_helpGoneIn;           /* help1 fold (MED 3), the helper's: HELP_GONE received, handled at the K2 safe point */
 std::map<BdPlKey, coopown::HelpRecRow> g_helpRec;   /* help1 fold (MED 5/6), the helper's: pp.help as read for this store + world; fold 3: by (key, placement nonce) */
 int g_helpRecState = 0;                           /* help1 fold: pp.help 0 not read yet, 1 read (or none there), 2 unreadable */
@@ -2640,7 +2657,7 @@ unsigned int BdHelpUnacked()
 }
 /* help1, MAIN THREAD, from detour_progress right after the engine's call on a copy (the owner's stand-in holds it; not the mod's own
    write). p0 / n0 / m0 were read before the call; needed was raised for it (not on a ruin). */
-void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0)
+void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0, int repair)   /* T-903: repair = a complete damaged copy */
 {
     /* help1 fold (review LOW 11): the raised needed was already put back by BdProgressRaised's __finally (only while it still held the raised value) */
     float p1 = 0.0f, n1 = 0.0f;
@@ -2650,7 +2667,7 @@ void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0
     k[0] = 0;
     const int keyOk = ObjectPositionKey(b, k, kKeyCap, "", 3, 0);
     int capped = 0;
-    const float capTo = coopbuild::BuildHelpCopyCap(p1, n1, (ruin != 0 || x1 != 0) ? 1 : 0, &capped);
+    const float capTo = coopbuild::BuildHelpCopyCap(p1, n1, (ruin != 0 || x1 != 0 || repair != 0) ? 1 : 0, &capped);   /* T-903: a complete piece is never capped */
     if (c1 == 0 && d1 == 0 && ruin == 0 && x1 == 0 && n0 > 0.0f)
     {   /* the picture the engine drew inside the call saw the raised needed: progress (capped), setBroken(0), updatePhysicalWithProgress again */
         const unsigned long long rUpd = Rva("UpdatePhysicalWithProgress");
@@ -2693,6 +2710,14 @@ void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0
         r.helpBaseOk = 1;
     }
     if (any == 0) return;
+    if (repair != 0)   /* T-903: repair on a complete damaged copy - the health it restored goes to the owner's game as help work */
+    {
+        ++g_repairWorkRec;
+        char rl[320];
+        _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[BUILD] help repair work key=%.63s %.2f->%.2f/%.2f on a complete damaged copy - goes to the owner's game as help work; repairWorkRec=%lld",
+                    k, p0, p1, n1, g_repairWorkRec);
+        BdLogHelpFreq(rl);
+    }
     BdHelpRow& h = BdHelpRowFor(it->first, r);
     h.pendP += dP;
     for (int i = 0; i < nd; ++i) h.pendM[i] += dm[i];
@@ -2845,6 +2870,38 @@ void BdHelpTick()
         for (std::map<BdPlKey, BdHelpRow>::iterator ot = g_helpOld.begin(); ot != g_helpOld.end(); ++ot) BdHelpSendRow(ot->first.first, ot->second, edge, now);
     if (g_helpSaveDirty != 0 && (down != 0 || (DWORD)(now - g_helpSaveAt) >= kHelpSaveMs)) { g_helpSaveAt = now; BdHelpSave(); }
 }
+/* T-903 (decisions 920 / 920 a, owner 2026-10-17), MAIN THREAD: may this game's player help build, add materials to or repair a piece
+   of the player whose stand-in `owner` is? Yes for a faction-mate (PolicyTeammateFaction - the T-805 dismantle gate's own any-thread
+   test), or when that player has set this player FRIENDLY: the PLAYERS tab's friendly / neutral / enemy buttons (and `relate`) set the
+   SETTER's relation towards the other player's faction to +100 / 0 / -100 through the engine's setRelation (relations.cpp RelateSet),
+   one value per side; the owner's side is forwarded and written here as "stand-in -> this player's faction", and read with
+   RelationsStanceLevels as `them` - the side the PLAYERS tab and the name tag show as theirs (friendly = nametag::LevelOf: 50 or more,
+   or the ally flag). The owner's side is the one asked: it is the owner's building. coopbuild::HelpAllowed holds the rule. */
+int BdHelpAllowedHere(::Faction* owner, int* mate, int* friendly)
+{
+    *mate = (owner != 0 && PolicyTeammateFaction((void*)owner)) ? 1 : 0;
+    *friendly = 0;
+    ::Faction* me = LocalPlayerFaction();
+    if (owner != 0 && me != 0)
+    {
+        int you = nametag::kUnknown, them = nametag::kUnknown;
+        RelationsStanceLevels(me, owner, &you, &them);
+        *friendly = (them == nametag::kFriendly) ? 1 : 0;
+    }
+    return coopbuild::HelpAllowed(*mate, *friendly);
+}
+/* T-903, MAIN THREAD: a help order (build / add materials / repair) on a copy of a player who allows this player no help - not given,
+   counted per kind, logged. Returns 2 (BdHelpOrder's "not given"). */
+int BdHelpRefuse(int t, ::Faction* owner, const char* key, const char* road)
+{
+    const int kd = BdHelpKind(t);
+    ++g_helpRefusedK[kd];
+    char line[420];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] order task=%d (%s) on a copy of slot%d key=%s NOT GIVEN (%s) - that player is not a faction-mate and has not set this player friendly (decision 920 a); helpRefused[build,materials,repair]=%lld,%lld,%lld",
+                t, kd == 0 ? "build" : (kd == 1 ? "materials" : "repair"), StandInSlotOf(owner), key, road, g_helpRefusedK[0], g_helpRefusedK[1], g_helpRefusedK[2]);
+    BdLogHelp(line);
+    return 2;
+}
 /* help1 (owner 172): a build or add-materials order on a COPY of another player's piece (its faction is that player's stand-in) is help
    - given and counted (orderOnCopy); the helper's game then sends the work to the owner (HELP_WORK). NOT on a wall copy: a wall's progress
    call (0x5594A0) does reach the hook (it calls 0x558B10 on the wall holding the progress record), but the helper's work on a wall copy is
@@ -2857,7 +2914,10 @@ int BdHelpOrder(int t, void* subject, const char* road)
         ::Faction* rf = (::Faction*)BdOwnerPod(subject);
         int rx = 0;
         BdByteAt(subject, kBDestroyed, &rx);
-        const int rv = coopbuild::BuildRepairOrderVerdict(t, (rf != 0 && IsStandInFaction(rf)) ? 1 : 0, rx > 0 ? 1 : 0, BdIsWall(subject));
+        float rp = 0.0f, rn = 0.0f;
+        int rc = 0, rd = 0, rx2 = 0;
+        const int rdmg = (BdReadState(subject, &rp, &rn, &rc, &rd, &rx2) != 0 && rd == 0) ? coopbuild::BuildPieceDamaged(rc, rx > 0 ? 1 : 0, rp, rn) : 0;   /* T-903 */
+        const int rv = coopbuild::BuildRepairHelpVerdict(t, (rf != 0 && IsStandInFaction(rf)) ? 1 : 0, rx > 0 ? 1 : 0, rdmg, BdIsWall(subject));   /* T-903: a damaged copy too */
         if (rv == coopbuild::kBuildRepairOrderNone) return 0;
         char rk[kKeyCap];
         rk[0] = 0;
@@ -2866,10 +2926,21 @@ int BdHelpOrder(int t, void* subject, const char* road)
         if (rv == coopbuild::kBuildRepairOrderRefused)
         {
             ++g_repairRefused;
-            _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[BUILD] order task=95 (repair) on a WALL ruin copy of slot%d key=%s NOT GIVEN (%s) - only the owner's game repairs its wall (wall work is not synced, T-221); repairRefused=%lld",
-                        StandInSlotOf(rf), rk, road, g_repairRefused);
+            _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[BUILD] order task=95 (repair) on a WALL %s copy of slot%d key=%s NOT GIVEN (%s) - only the owner's game repairs its wall (wall work is not synced, T-221); repairRefused=%lld",
+                        rx > 0 ? "ruin" : "damaged", StandInSlotOf(rf), rk, road, g_repairRefused);
             BdLogHelp(rl);
             return 2;
+        }
+        int rmate = 0, rfr = 0;
+        if (BdHelpAllowedHere(rf, &rmate, &rfr) == 0) return BdHelpRefuse(t, rf, rk, road);   /* T-903 (decision 920 a) */
+        ++g_helpGivenK[2];
+        if (rv == coopbuild::kBuildRepairOrderDamagedHelp)   /* T-903: the health the helper restores on its copy goes to the owner's game */
+        {
+            ++g_repairDamagedHelp;
+            _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[BUILD] order task=95 (repair) on a damaged copy of slot%d key=%s %.2f/%.2f - help (%s, %s): the repair work goes to the owner's game as help work; repairDamagedHelp=%lld",
+                        StandInSlotOf(rf), rk, rp, rn, road, rmate != 0 ? "faction-mate" : "set friendly", g_repairDamagedHelp);
+            BdLogHelp(rl);
+            return 1;
         }
         ++g_repairOrderHelp;
         _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[BUILD] order task=95 (repair) on a ruin copy of slot%d key=%s - help (%s): the work goes to the owner's game with the ruin reset; repairOrderHelp=%lld",
@@ -2893,6 +2964,9 @@ int BdHelpOrder(int t, void* subject, const char* road)
         BdLogHelp(line);
         return 2;
     }
+    int hmate = 0, hfr = 0;
+    if (BdHelpAllowedHere(f, &hmate, &hfr) == 0) return BdHelpRefuse(t, f, k, road);   /* T-903 (decision 920 a) */
+    ++g_helpGivenK[BdHelpKind(t)];
     ++g_orderOnCopy;
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] order task=%d on a copy of slot%d key=%s - help (%s); orderOnCopy=%lld",
                 t, StandInSlotOf(f), k, road, g_orderOnCopy);
@@ -2902,13 +2976,39 @@ int BdHelpOrder(int t, void* subject, const char* road)
 /* help1 fold 2 (re-check LOW 7), ANY THREAD (a guarded vtable call, RTTI and pointer compares - BdIsWall / IsStandInFaction are any-thread):
    off the main thread the wall-copy refusal is made too (the handed test is not) - counted (helpWallRefusedOff, the REPORT line), no
    line. 1 = refused. */
+/* T-903: off the main thread a help order (build / add materials / repair) on a copy of a player who is no faction-mate is refused
+   too (helpRefusedOff, no line): the friendly setting is not read there - its accessor is main-thread only - so off the main thread
+   only a faction-mate may help. T-903 fold (review LOW 4): a repair on a wall copy, ruin or damaged, is refused here too. */
 int BdHelpWallOff(int t, void* subject)
 {
-    if (t != coopbuild::kBuildTaskBuild && t != coopbuild::kBuildTaskAddMaterials) return 0;
+    if (t != coopbuild::kBuildTaskBuild && t != coopbuild::kBuildTaskAddMaterials && t != coopbuild::kBuildTaskRepair) return 0;
     ::Faction* f = (::Faction*)BdOwnerPod(subject);
-    if (coopbuild::BuildHelpOrderVerdict(t, (f != 0 && IsStandInFaction(f)) ? 1 : 0, BdIsWall(subject)) != coopbuild::kBuildHelpOrderWallRefused) return 0;
-    ::InterlockedIncrement(&g_helpWallRefusedOff);
-    return 1;
+    const int standIn = (f != 0 && IsStandInFaction(f)) ? 1 : 0;
+    if (t != coopbuild::kBuildTaskRepair && coopbuild::BuildHelpOrderVerdict(t, standIn, BdIsWall(subject)) == coopbuild::kBuildHelpOrderWallRefused)
+    {
+        ::InterlockedIncrement(&g_helpWallRefusedOff);
+        return 1;
+    }
+    if (t == coopbuild::kBuildTaskRepair && standIn != 0)
+    {   /* T-903 fold (review LOW 4): a repair on a wall ruin copy or a damaged wall copy is refused off the main thread too - the same
+           BuildRepairHelpVerdict BdHelpOrder asks on the main thread (guarded reads only); counted helpWallRefusedOff */
+        int rx = 0;
+        BdByteAt(subject, kBDestroyed, &rx);
+        float rp = 0.0f, rn = 0.0f;
+        int rc = 0, rd = 0, rx2 = 0;
+        const int rdmg = (BdReadState(subject, &rp, &rn, &rc, &rd, &rx2) != 0 && rd == 0) ? coopbuild::BuildPieceDamaged(rc, rx > 0 ? 1 : 0, rp, rn) : 0;
+        if (coopbuild::BuildRepairHelpVerdict(t, 1, rx > 0 ? 1 : 0, rdmg, BdIsWall(subject)) == coopbuild::kBuildRepairOrderRefused)
+        {
+            ::InterlockedIncrement(&g_helpWallRefusedOff);
+            return 1;
+        }
+    }
+    if (standIn != 0 && coopbuild::HelpAllowed(PolicyTeammateFaction((void*)f) ? 1 : 0, 0) == 0)
+    {
+        ::InterlockedIncrement(&g_helpRefusedOff);
+        return 1;
+    }
+    return 0;
 }
 /* house1b (item 2), MAIN THREAD: the owner's game confirms it holds a piece handed to it */
 void BdSendAck(const std::string& key)
@@ -3058,8 +3158,10 @@ void detour_order(void* pi, void* indoors, void* task, void* subject, void* shif
     /* PROBE P140 END */
     if (BdOnMain() != 0 && BdDismantleGate(t, subject, road) != 0) return;   /* T-805: a dismantle on another player's piece */
     if (BdOnMain() == 0 && BdDismantleOff(t, subject) != 0) return;   /* T-805 fold: the same piece off the main thread - refused */
-    /* help1 (owner 172): a build / add-materials order on a copy of another player's piece is help - given and counted (orderOnCopy); this
-       was the house1b refusal for a handed piece. Repair and dismantle on a handed piece stay refused (repair waits for damage sync). */
+    /* help1 (owner 172) + T-903 (decision 920 a): a build / add-materials order on a copy of another player's piece, or a repair on a
+       ruin or damaged copy, is help - given when that player is a faction-mate or has set this player friendly, else not given
+       (BdHelpRefuse); this was the house1b refusal for a handed piece. What still reaches the refusal below: a repair on a handed piece
+       that is neither a ruin nor damaged here (nothing to repair), and an order on a handed piece no stand-in owns. */
     const int helpOnCopy = (coopbuild::BuildTaskGated(t) && subject != 0 && BdOnMain() != 0)
         ? BdHelpOrder(t, subject, road) : 0;
     if (helpOnCopy == 2) return;   /* help1 fold (review HIGH 2): a wall copy - refused (BdHelpOrder logged it) */
@@ -3474,17 +3576,38 @@ void detour_progress(void* b, float amount)
 {
     /* help1 (owner 172): the helper's own work on its copy of another player's piece (a stand-in holds it) - main thread, not the mod's own
        write (g_bdSelf), not an FLT_MAX-class call; the copy's needed is raised for this call only (never on a ruin), so it never completes here */
-    int help = 0;
+    int help = 0, rep = 0, refused = 0;   /* T-903: rep = repair on a complete damaged copy; fold (review MED 2): refused = the help rule says no */
     float p0 = 0.0f, n0 = 0.0f, raisedTo = 0.0f;
     int c0 = 0, d0 = 0, x0 = 0, m0n = -1;
     float m0[coopbuild::kBuildMaxMats];
-    if (g_bdSelf == 0 && amount < FLT_MAX * 0.5f && BdOnMain() != 0 && IsStandInFaction((::Faction*)BdOwnerPod(b))
-        && BdReadState(b, &p0, &n0, &c0, &d0, &x0) != 0 && (c0 == 0 || (x0 != 0 && BdIsWall(b) == 0)) && d0 == 0)   /* P15 fold 1 (LOW 5): never a wall ruin */   /* P15: a COMPLETE ruin copy's repair is help too (the reset goes to the owner) */
+    const int cand = (g_bdSelf == 0 && amount < FLT_MAX * 0.5f && BdOnMain() != 0 && IsStandInFaction((::Faction*)BdOwnerPod(b))
+        && BdReadState(b, &p0, &n0, &c0, &d0, &x0) != 0 && (c0 == 0 || (x0 != 0 && BdIsWall(b) == 0) || (coopbuild::BuildPieceDamaged(c0, x0, p0, n0) != 0 && BdIsWall(b) == 0)) && d0 == 0) ? 1 : 0;   /* P15 fold 1 (LOW 5): never a wall ruin */   /* P15: a COMPLETE ruin copy's repair is help too (the reset goes to the owner) */
+    if (cand != 0)
+    {   /* T-903 fold (review MED 2): the help rule is asked at the work itself, not only at the order - a job already running, a job kept
+           across a save from the old any-partner rule, or a player set back to neutral / enemy since the order */
+        int hmate = 0, hfr = 0;
+        if (BdHelpAllowedHere((::Faction*)BdOwnerPod(b), &hmate, &hfr) == 0) refused = 1;
+    }
+    if (refused != 0)
+    {   /* the engine's step on that copy is not run here and nothing is sent; counted, the frequent-line cap */
+        ++g_helpRunRefused;
+        char rk[kKeyCap];
+        rk[0] = 0;
+        if (ObjectPositionKey(b, rk, kKeyCap, "", 3, 0) == 0) { rk[0] = '?'; rk[1] = 0; }
+        char rl[360];
+        _snprintf_s(rl, sizeof(rl), _TRUNCATE, "[BUILD] help work on a copy of slot%d key=%s NOT DONE: that player is not a faction-mate and has not set this player friendly (decision 920 a) - the engine's step is skipped; helpRunRefused=%lld",
+                    StandInSlotOf((::Faction*)BdOwnerPod(b)), rk, g_helpRunRefused);
+        BdLogHelpFreq(rl);
+        ::InterlockedIncrement64(&g_progressSeen);
+        return;
+    }
+    if (cand != 0)
     {
         int tot = -1;
         m0n = BdReadMats(b, m0, (int)coopbuild::kBuildMaxMats, &tot);
         help = 1;
-        if (x0 == 0 && n0 > 0.0f)
+        rep = (c0 != 0 && x0 == 0) ? 1 : 0;   /* T-903: the engine's repair restores health up to needed - nothing is raised */
+        if (c0 == 0 && x0 == 0 && n0 > 0.0f)
         {
             raisedTo = (n0 + std::fabs(amount)) * 1000.0f + 1000.0f;
             if (BdSetNeededPod(b, raisedTo) == 0) { help = 0; raisedTo = 0.0f; }
@@ -3492,7 +3615,7 @@ void detour_progress(void* b, float amount)
     }
     if (raisedTo > 0.0f) BdProgressRaised(b, amount, raisedTo, n0);   /* help1 fold (review LOW 11): put back in __finally */
     else orig_progress(b, amount);
-    if (help != 0) BdHelpAfter(b, p0, n0, x0, m0n, m0);
+    if (help != 0) BdHelpAfter(b, p0, n0, x0, m0n, m0, rep);
     ::InterlockedIncrement64(&g_progressSeen);
     /* build1-b (T321: ~1400 FLT_MAX completions at world load, queueDropped 1141): an FLT_MAX-class amount while the world
        is loading is the engine finishing pieces it has just read, not construction - counted, never queued */
@@ -5330,7 +5453,8 @@ int BdHelpGoneFor(BdHelpIn& in, BdReg* r, int oldNonce, const char* why)
    the engine's vt+0x230(FLT_MAX), else the STATE's own guarded write. help1 fold (MED 4): the confirmation goes once pp.build holding it
    has landed (BdHelpAckTick). 1 = done with it, 0 = keep (its area is not loaded here, or fold 3: a gone record not yet landed), 2 = held
    (an earlier seq first). help1 fold 3 (findings 2, 3): work carrying another placement's nonce is never applied here - it is answered
-   GONE from that placement's record (BdHelpGoneFor). */
+   GONE from that placement's record (BdHelpGoneFor). T-903 fold (review MED 2): work from a player this game's player allows no help
+   (HelpAllowed on the owner's own stance, asked when it is applied) is refunded whole and confirmed - never applied. */
 int BdApplyHelp(BdHelpIn& in)
 {
     const coopbuild::BuildMsg& m = in.m;
@@ -5416,6 +5540,48 @@ int BdApplyHelp(BdHelpIn& in)
         BdLogHelp(line);
         return 1;
     }
+    {   /* T-903 fold (review MED 2): the help rule asked HERE, when the work is applied, on the owner's OWN stance - a faction-mate
+           (TeamSameAnyThread on the two players' slots) or a player this game's player has set friendly (RelationsStanceLevels: this
+           player's faction -> the sender's stand-in, `you`). Work from anyone else - a job running when the setting changed, a job kept
+           across a save from the old any-partner rule, a helper on an older build - is confirmed with every delivered amount refunded,
+           as for a complete piece, and nothing applied (helpApplyRefused). Re-check fold (item 2): while this game's own slot is unknown,
+           or the sender's standing is unread (no stand-in yet, or its relation not read), the work is HELD and judged again at the next
+           safe point (helpApplyHeld) - refused only for a known non-teammate not set friendly (coopbuild::BuildHelpApplyVerdict). */
+        const int me = MySlotForWire();
+        const int amate = (me >= 0 && in.slot != me && TeamSameAnyThread(me, in.slot)) ? 1 : 0;
+        ::Faction* myF = LocalPlayerFaction();
+        ::Faction* senderF = StandInForSlot(in.slot);
+        int you = nametag::kUnknown, them = nametag::kUnknown;
+        if (myF != 0 && senderF != 0) RelationsStanceLevels(myF, senderF, &you, &them);
+        const int av = coopbuild::BuildHelpApplyVerdict(me >= 0 ? 1 : 0, amate, (myF != 0 && senderF != 0 && you != nametag::kUnknown) ? 1 : 0,
+                                                        you == nametag::kFriendly ? 1 : 0);
+        if (av == coopbuild::kBuildHelpApplyHold)
+        {
+            if (in.heldLogged == 0)
+            {
+                in.heldLogged = 1;
+                ++g_helpApplyHeld;
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u held: %s - judged again at the next safe point, never refused on that helpApplyHeld=%lld",
+                            m.key.c_str(), in.slot, m.seq, me < 0 ? "this game's own slot is not known yet" : "that player's standing is not read yet (no stand-in, or its relation unread)", g_helpApplyHeld);
+                BdLogHelpFreq(line);
+            }
+            return 2;
+        }
+        if (av == coopbuild::kBuildHelpApplyRefuse)
+        {
+            float back = 0.0f;
+            coopbuild::BuildHelpAck* fa = coopbuild::BuildHelpAckFor(&r.helpAcks, slot, 1);
+            for (int i = 0; i < (int)m.nMats; ++i) { fa->ex[i] += m.mats[i]; back += m.mats[i]; }
+            if (m.nMats > fa->nEx) fa->nEx = m.nMats;
+            fa->seq = m.seq;
+            ++g_helpApplyRefused;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u REFUSED (not a faction-mate, and this player has not set that player friendly - decision 920 a): nothing applied, mats %.2f refunded to the helper (confirmed once pp.build holds it) helpApplyRefused=%lld",
+                        m.key.c_str(), in.slot, m.seq, back, g_helpApplyRefused);
+            BdLogHelp(line);
+            BdHelpAckChanged(m.key, r);
+            return 1;
+        }
+    }
     int fv = 0;
     void* b = BdFindPiece(m.key, r, &fv);
     if (b == 0)
@@ -5449,6 +5615,51 @@ int BdApplyHelp(BdHelpIn& in)
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u: the helper repaired a ruin - the engine's ruin reset here too (+0x1A1 now %d, %.2f/%.2f complete=%d); repairHelpReset=%lld",
                     m.key.c_str(), in.slot, m.seq, x0, p0, n0, c0, g_repairHelpReset);
         BdLogHelp(line);
+    }
+    if (c0 != 0 && d0 == 0 && x0 == 0 && m.reset == 0 && m.progress > 0.0f && BdIsWall(b) == 0)
+    {   /* T-903: repair work - the helper restored health on its copy of this COMPLETE piece. The message is the same HELP_WORK (no new
+           kind, no protocol change): work whose piece is complete here is repair. Health is progress (state+4, needed state+0x28): the
+           new health, never above needed, through the STATE's guarded write - progress, setBroken(0) above 0, updatePhysicalWithProgress
+           0x558680 (BdApplyStatePod) - the steps the engine's own repair takes: addConstructionProgress 0x558B10 on a complete piece adds
+           to the progress, calls setBroken(0) (vt+0x310) above 0, runs the finish vt+0x240 only while the complete byte is 0, then calls
+           0x558680 (build/decomp_558b10.txt). Health raised to exactly needed does not finish the piece again: 0x558680 at progress >=
+           needed runs its finish step ('Building construction complete', vt+0x240) only while the piece's own complete byte +0x160 is 0
+           (build/decomp_558680.txt). T-903 fold (review HIGH 1): that byte is read here and, when it is not set, the health stays below
+           0.999 x needed (BuildRepairFinishSafe), so 0x558680 never finishes a piece from this road. Delivered materials go back to the
+           helper as for a complete piece. A piece already whole here is confirmed with nothing changed (repairWhole). Fold (review LOW 5):
+           a write that faults is confirmed with its materials refunded - once, never applied again (repairFaulted). */
+        const float to = coopbuild::BuildRepairFinishSafe(coopbuild::BuildRepairApplyTo(p0, m.progress, n0), n0, BdByteAtOr0(b, kBOwnComplete));
+        const unsigned long long rUpdR = Rva("UpdatePhysicalWithProgress");
+        int rok = 1, rstg = 0, rml = -1;
+        if (to > p0) rok = (rUpdR != 0) ? BdApplyStatePod(b, 1, to, 0, 0, &rml, (uintptr_t)::GetModuleHandleA(0) + (uintptr_t)rUpdR, &rstg) : 0;
+        if (rok == 0)
+        {
+            ++g_repairFaulted;
+            ++g_helpFaulted;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u repair FAULTED at stage %d%s - confirmed with its mats refunded, never applied again repairFaulted=%lld",
+                        m.key.c_str(), in.slot, m.seq, rstg, rUpdR == 0 ? " (UpdatePhysicalWithProgress not in the address table)" : "", g_repairFaulted);
+            BdLogHelp(line);
+        }
+        coopbuild::BuildHelpAck* ra = coopbuild::BuildHelpAckFor(&r.helpAcks, slot, 1);
+        float back = 0.0f;
+        for (int i = 0; i < (int)m.nMats; ++i) { ra->ex[i] += m.mats[i]; back += m.mats[i]; }
+        if (m.nMats > ra->nEx) ra->nEx = m.nMats;
+        ra->seq = m.seq;
+        float rp1 = 0.0f, rn1 = 0.0f;
+        int rc1 = 0, rd1 = 0, rx1 = 0, rt1 = -1;
+        if (BdReadState(b, &rp1, &rn1, &rc1, &rd1, &rx1) != 0) { r.progress = rp1; r.needed = rn1; r.complete = rc1; r.destroyed = rx1; }
+        r.nMats = BdReadMats(b, r.mats, (int)coopbuild::kBuildMaxMats, &rt1);
+        r.gen = g_bdGen;
+        if (rok != 0)
+        {
+            ++g_helpApplied;
+            if (to > p0) ++g_helpRepairApplied; else ++g_repairWhole;
+        }
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] <- HELP key=%.63s from=slot%d seq=%u repair %.2f->%.2f/%.2f%s mats %.2f refunded to the helper (confirmed once pp.build holds it) repairApplied=%lld repairWhole=%lld",
+                    m.key.c_str(), in.slot, m.seq, p0, rp1, rn1, rok == 0 ? " (the write FAULTED - refunded once)" : ((to > p0) ? "" : " (already whole here - nothing changed)"), back, g_helpRepairApplied, g_repairWhole);
+        BdLogHelp(line);
+        BdHelpAckChanged(m.key, r);
+        return 1;
     }
     if (c0 != 0 || d0 != 0)   /* complete before the work arrived: every delivered amount goes back to the helper */
     {
@@ -8472,7 +8683,7 @@ void BdBldSetDrain()
     DebugLog(std::string(l));
 }
 
-/* T-805 TEST-ONLY `buildtest order <key-substring> repair|dismantle` (final-form test code: nothing happens unless the test tool sends
+/* T-805 TEST-ONLY `buildtest order <key-substring> repair|dismantle|build|materials` (T-903: build and materials too; final-form test code: nothing happens unless the test tool sends
    it): the engine's own addOrderSelectedCharacters (0x7F9280) called at its HOOKED entry - the road a click takes - so detour_order's
    gates judge the order and write their lines. The engine gives a passed order to this game's characters selected now; with none
    selected only the gate lines show. Refused while the order gate is not hooked (the call would skip the gates). */
@@ -8522,19 +8733,24 @@ void BdTestOrder()
     const std::string owner = BdFactionName(BdOwnerPod(b));
     const long long h0 = g_repairOrderHelp, r0 = g_repairRefused, o0 = g_orderBlocked, m0 = g_dismantleRefusedMember, d0 = g_dismantleRefusedOther;
     const long long a0 = g_dmAskSent, f0 = g_dmAskOffline;
+    const long long oc0 = g_orderOnCopy, rd0 = g_repairDamagedHelp, hr0 = g_helpRefusedK[0] + g_helpRefusedK[1] + g_helpRefusedK[2];   /* T-903 */
     g_inOrderLever = 1;
     const int ok = BdTestOrderCallPod(pi, b, g_btOrderTask, at);
     g_inOrderLever = 0;
     if (ok != 0) ++g_testOrder; else ++g_testFaulted;
-    char l[600];
+    char l[800];
     _snprintf_s(l, sizeof(l), _TRUNCATE, "[BUILD] buildtest order %s task=%d (%s) key=%.63s row=%s owner=%.60s: gates moved repairOrderHelp +%lld repairRefused +%lld orderBlocked +%lld"
+                " orderOnCopy +%lld repairDamagedHelp +%lld helpRefused +%lld"
                 " dismantleRefusedMember +%lld dismantleRefusedOther +%lld dmAskSent +%lld dmAskOffline +%lld (addOrderSelectedCharacters at its hooked entry; a passed order goes to the characters selected now); testOrder=%lld",
-                ok != 0 ? "CALLED" : "FAULTED", g_btOrderTask, g_btOrderTask == coopbuild::kBuildTaskRepair ? "repair" : "dismantle", key.c_str(),
+                ok != 0 ? "CALLED" : "FAULTED", g_btOrderTask, g_btOrderTask == coopbuild::kBuildTaskRepair ? "repair" : (g_btOrderTask == coopbuild::kBuildTaskDismantle ? "dismantle"
+                : (g_btOrderTask == coopbuild::kBuildTaskBuild ? "build" : "materials")), key.c_str(),
                 trow->second.via == 3 ? "copy" : "own", owner.c_str(), g_repairOrderHelp - h0, g_repairRefused - r0, g_orderBlocked - o0,
+                g_orderOnCopy - oc0, g_repairDamagedHelp - rd0, g_helpRefusedK[0] + g_helpRefusedK[1] + g_helpRefusedK[2] - hr0,
                 g_dismantleRefusedMember - m0, g_dismantleRefusedOther - d0, g_dmAskSent - a0, g_dmAskOffline - f0, g_testOrder);
     DebugLog(std::string(l));
 }
 
+std::string BdTestTown(const std::string& arg);   /* T-899 TEST-ONLY read, below with the outposts */
 std::string BuildTestArm(const std::string& arg)
 {
     std::istringstream is(arg);
@@ -8542,7 +8758,7 @@ std::string BuildTestArm(const std::string& arg)
     is >> sub >> a1 >> a2 >> a3;
     const char* usage = "error buildtest: usage buildtest place <sid> [dx dz] | progress <key-substring|placed> <amount> | dismantle <key-substring|placed>"
                         " | into <near|host-key-substring> <sid> [indoors|<dx>,<dz>] | mats <key-substring> <n> | destroy <key-substring> | broken <key-substring> 0|1"
-                        " | order <key-substring> repair|dismantle";
+                        " | order <key-substring> repair|dismantle|build|materials | town <sid|key-substring>";
     if (sub == "farm")   /* par16: the farm lever (farm.cpp FarmTestArm) */
     {
         const std::string::size_type at = arg.find("farm");
@@ -8553,6 +8769,11 @@ std::string BuildTestArm(const std::string& arg)
         ++g_testBlocked;
         DebugLog("[BUILD] buildtest REFUSED: engine writes are blocked (world loading or tearing down)");
         return "error buildtest: engine writes are blocked";
+    }
+    if (sub == "town")   /* T-899: TEST-ONLY - read now, nothing written */
+    {
+        if (a1.empty() || !a2.empty()) return usage;
+        return BdTestTown(a1);
     }
     LONG kind = 0;
     if (sub == "place")
@@ -8589,8 +8810,9 @@ std::string BuildTestArm(const std::string& arg)
     }
     else if (sub == "order")   /* T-805: TEST-ONLY - the engine's own order through the hooked order gate */
     {
-        if (a1.empty() || (a2 != "repair" && a2 != "dismantle")) return usage;
-        g_btOrderTask = (a2 == "repair") ? coopbuild::kBuildTaskRepair : coopbuild::kBuildTaskDismantle;
+        if (a1.empty() || (a2 != "repair" && a2 != "dismantle" && a2 != "build" && a2 != "materials")) return usage;
+        g_btOrderTask = (a2 == "repair") ? coopbuild::kBuildTaskRepair : (a2 == "dismantle") ? coopbuild::kBuildTaskDismantle
+                      : (a2 == "build") ? coopbuild::kBuildTaskBuild : coopbuild::kBuildTaskAddMaterials;   /* T-903: build / materials too */
         kind = 8;
     }
     else if (sub == "broken")   /* TEST-ONLY - the engine's own setBroken (vt+0x310) on the piece */
@@ -9436,8 +9658,11 @@ int BdKeptHandBack(const keptwire::Row& w, void* live, int furn, void* host, con
    dispatch and the command channel). A player's outpost is a Town in the town list's player-town list (TownList +0x68: count +0x70,
    array +0x78 - decomp_933f40). A Town's name is the std::string at +0x18 (slot +0x10 assigns it - decomp_d3f40), its handle words
    are at +0x60 (type, container, stamp, index, serial: the five words a building's area record names as its town), slot +0x40 gives
-   its centre (decomp_9263f0), slot +0x58 its faction (0x593BB0) and slot +0xA0 sets the faction. A building's town is the pointer at
-   +0x90, the field the placement writes (decomp_4da6f0).
+   its centre (decomp_9263f0), slot +0x58 its faction (0x593BB0) and slot +0xA0 sets the faction. A building's town is the handle at
+   +0x1D0 (its five words at +0x1D8, type first), read with the engine's own BuildingGetTown (coop::TownOfBuilding: the top parent's
+   town, else the nearest town by position) and written as the engine writes it (0x791A70: the town's five handle words copied in) for
+   a top-level piece only - a piece standing inside a building takes its host's town. (+0x80, words +0x88, is the hand of the building
+   a piece stands inside, not a town.)
    - THIS GAME'S OUTPOSTS are said to the world server (TOWNS SAY): looked at every 5 s, sent when they changed, on a new link slot and
      again every 60 s - name, centre and handle words of each player town of this player's faction (at most kMaxTownsPerSlot).
    - THE KEPT OUTPOSTS (TOWNS LIST) come before the first kept rows of a link, each with the keys of its kept pieces. Before a kept piece
@@ -9445,7 +9670,8 @@ int BdKeptHandBack(const keptwire::Row& w, void* live, int furn, void* host, con
      taken or founded (townkeep TownLayStep): the town this world already holds for it, else a town of the piece owner's faction
      standing within kTownSameRadius of the outpost's centre, else a new one founded the engine's way (TownFoundPlayer: the
      player_town_template town at that centre, added to the player-town list), named and given the owner's faction (this player's, or
-     the owner's stand-in). The laid piece is then linked to it (+0x90). A founding that fails is not tried again in this world; the
+     the owner's stand-in). The laid piece is then linked to it (+0x1D8); a piece standing inside a building keeps its host's town (nothing
+     written). A founding that fails is not tried again in this world; the
      piece is laid without it. ---- */
 static unsigned long long kBdTownFoundRva = 0; static AddrReg kBdTownFoundRva_reg("TownFoundPlayer", &kBdTownFoundRva);   /* Steam_1.0.65 0x933F40: TownList: found a player outpost at a position */
 static unsigned long long kBdTownListRva = 0;  static AddrReg kBdTownListRva_reg("TownList", &kBdTownListRva);           /* Steam_1.0.65 0x21330A0 (var): a POINTER to the TownList */
@@ -9454,17 +9680,19 @@ typedef void  (*BdTownSetNameFn)(void* town, const std::string* name);
 typedef void  (*BdTownSetFactionFn)(void* town, void* faction, bool flag);
 typedef void* (*BdTownGetFn)(void* town);
 typedef float* (*BdTownPosFn)(void* town, float* out);
-const size_t kTownListPlayerN = 0x70, kTownListPlayerArr = 0x78;   /* TownList: the player towns' count and array (the list at +0x68) */
+const size_t kTownListPlayerN = 0x70, kTownListPlayerArr = 0x78;
 const size_t kTownHandWords = 0x60;   /* RootObjectBase handle (+0x58) + 8: type, container, stamp, index, serial */
 const size_t kTownNameStr = 0x18;     /* RootObjectBase name */
-const size_t kBdTownPtr = 0x90;       /* Building: its town */
+const size_t kBdTownHandWords = 0x1D8;   /* Building: its town's five handle words (type first) - the hand at +0x1D0 */
+const size_t kBdParentHand = 0x88;       /* Building: the type word of the hand of the building it stands inside (0xB = none) */
+const size_t kBdLayout = 0x238;          /* Building: the layout it is part of (non-zero: it stands inside a building) */
 const int kVtTownSetName = 0x10, kVtTownPos = 0x40, kVtTownFaction = 0x58, kVtTownSetFaction = 0xA0;
 const int kTownWalkCap = 256;
 const DWORD kTownLookMs = 5000, kTownSayAgainMs = 60000;
 std::vector<townkeep::TownRow> g_townRows;     /* the kept outposts the world server sent on this link */
 std::map<std::string, size_t> g_townKeyIdx;     /* a kept piece's key -> its outpost in g_townRows */
 long g_townRowsGen = -1;                        /* KeptWorldGen() when g_townRows last came in: rows of another world's link are dropped with its kept table */
-long long g_townKeptOther = 0;                  /* kept pieces left in a town that is not a player town (no outpost taken or founded for them) */
+long long g_townLinkHost = 0;                   /* kept pieces of an outpost standing inside a building: their town is their host's, nothing written */
 std::map<size_t, void*> g_townLive;             /* an outpost -> the town standing for it in this world */
 std::set<size_t> g_townFailed;                  /* outposts whose founding failed in this world: not tried again */
 std::vector<char> g_townSaid;                   /* the last SAY sent */
@@ -9534,14 +9762,45 @@ int BdTownLevelPod(void* t)
     __except (EXCEPTION_EXECUTE_HANDLER) { v = 0; }
     return (v < 0 || v > townkeep::kLevelMax) ? 0 : v;
 }
+void* TownOfBuilding(void* building);   /* spawn.cpp (namespace coop): the engine's BuildingGetTown, guarded, ANY THREAD */
+/* a building's town: the engine's own lookup (BuildingGetTown - the top parent's town, hand +0x1D0, else the nearest town by position;
+   0 only for no building or a fault) */
 void* BdBuildingTownPod(void* b)
 {
-    __try { return *(void**)((char*)b + kBdTownPtr); }
+    if (b == 0) return 0;
+    return TownOfBuilding(b);
+}
+/* 1 = building b stands at the top level (its parent hand at +0x88 is none, type 0xB, and it is part of no layout at +0x238); 0 = it
+   stands inside a building (its town is its host's); -1 = a fault */
+int BdBuildingTopLevelPod(void* b)
+{
+    __try { return (*(int*)((char*)b + kBdParentHand) == 0xB && *(void**)((char*)b + kBdLayout) == 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* a building's own town handle words (Building +0x1D8, type first; type 0xB = none): 1 = read, 0 = a fault */
+int BdBuildingTownHandPod(void* b, int* hand)
+{
+    __try { std::memcpy(hand, (const char*)b + kBdTownHandWords, 20); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+/* a building linked to town t as the engine links it (0x791A70: t's five handle words copied to Building +0x1D8).
+   1 = written; -1 = the piece stands inside a building (BdBuildingTopLevelPod) - its town is its host's, nothing written; 0 = a fault */
 int BdBuildingSetTownPod(void* b, void* t)
 {
-    __try { *(void**)((char*)b + kBdTownPtr) = t; return 1; }
+    const int top = BdBuildingTopLevelPod(b);
+    if (top < 0) return 0;
+    if (top == 0) return -1;
+    __try
+    {
+        std::memcpy((char*)b + kBdTownHandWords, (const char*)t + kTownHandWords, 20);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the raw type words of a building's parent hand (+0x88, 0xB = stands inside none) and its town hand (+0x1D8): 1 = read, 0 = a fault */
+int BdBuildingHandTypesPod(void* b, int* parentType, int* townType)
+{
+    __try { *parentType = *(int*)((char*)b + kBdParentHand); *townType = *(int*)((char*)b + kBdTownHandWords); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 std::string BdTownName(void* t)
@@ -9660,75 +9919,81 @@ void* BdKeptTownForKey(const std::string& pieceKey, ::Faction* fac)
     BdKeptLog(line);
     return town;
 }
-/* a laid piece of an outpost linked to its town (Building +0x90, the field the placement writes) */
-void* BdKeptTownFor(const keptwire::Row& w, ::Faction* fac) { return BdKeptTownForKey(w.p.key, fac); }
-void BdKeptTownLinkKey(long row, const std::string& pieceKey, void* b, void* town)
+/* the note for a kept piece of an outpost standing inside a building: its town is its host's, nothing written. row -1 = a loaded piece */
+void BdKeptTownHostNote(long row, const std::string& pieceKey)
 {
-    if (b == 0 || town == 0) return;
+    ++g_townLinkHost;
+    if (g_townLinkHost > 40 && g_townLinkHost % 100 != 0) return;
+    char who[40], line[500];
+    if (row >= 0) _snprintf_s(who, sizeof(who), _TRUNCATE, "row %ld", row);
+    else _snprintf_s(who, sizeof(who), _TRUNCATE, "loaded");
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s stands inside a building - its town is its host's, nothing written; linkHost=%lld", who, pieceKey.c_str(), g_townLinkHost);
+    BdKeptLog(line);
+}
+/* a laid piece of an outpost linked to its town (BdBuildingSetTownPod: the town's handle words at Building +0x1D8, top-level pieces
+   only; a piece standing inside a building keeps its host's town). 1 = linked, already in it (its own handle words are the town's),
+   or stands inside a building (nothing to do); 0 = no piece or no town, or the write faulted */
+void* BdKeptTownFor(const keptwire::Row& w, ::Faction* fac) { return BdKeptTownForKey(w.p.key, fac); }
+int BdKeptTownLinkKey(long row, const std::string& pieceKey, void* b, void* town)
+{
+    if (b == 0 || town == 0) return 0;
     char who[40];
     if (row >= 0) _snprintf_s(who, sizeof(who), _TRUNCATE, "row %ld", row);
     else _snprintf_s(who, sizeof(who), _TRUNCATE, "loaded");
+    float tp[3]; int th[5]; void* tf = 0;
+    int bh[5];
+    /* already in it: its own handle words (+0x1D8) are the town's - not the engine's lookup, whose nearest-town fallback can name
+       this town for a piece whose own words are none or stale */
+    if (BdTownReadPod(town, tp, th, &tf) != 0 && BdBuildingTownHandPod(b, bh) != 0 && townkeep::HandSame(bh, th)) return 1;
     void* cur = BdBuildingTownPod(b);
-    if (cur == town) return;
     char line[500];
     const std::string was = cur != 0 ? "'" + BdTownName(cur) + "'" : std::string("none");
-    if (BdBuildingSetTownPod(b, town) == 0)
+    const int set = BdBuildingSetTownPod(b, town);
+    if (set == 0)
     {
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s: linking it to its outpost '%.80s' FAULTED - left as it is", who, pieceKey.c_str(), BdTownName(town).c_str());
         ErrorLog(line);
-        return;
+        return 0;
     }
+    if (set < 0) { BdKeptTownHostNote(row, pieceKey); return 1; }
     ++g_townLinked;
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s linked to its outpost '%.80s' (its town was %.90s); linked=%lld", who, pieceKey.c_str(), BdTownName(town).c_str(), was.c_str(), g_townLinked);
     BdKeptLog(line);
+    void* now = BdBuildingTownPod(b);   /* read back the engine's way */
+    if (now != town)
+    {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s linked to '%.80s' but the game reads its town as '%.80s'", who, pieceKey.c_str(), BdTownName(town).c_str(),
+                    now != 0 ? BdTownName(now).c_str() : "none");
+        ErrorLog(line);
+    }
+    return 1;
 }
 void BdKeptTownLink(const keptwire::Row& w, void* b, void* town) { BdKeptTownLinkKey((long)w.row, w.p.key, b, town); }
-/* 1 = t is one of the player towns, 0 = not, -1 = the list could not be read whole */
-int BdTownIsPlayer(void* t)
+/* a kept piece of an outpost to its town: a piece standing inside a building (BdBuildingTopLevelPod) keeps its host's town and no
+   town is taken or founded for it (a town founded for it would have no member, and the engine's player-town refresh destroys such a
+   town); otherwise the outpost's town is taken or founded (BdKeptTownForKey) and the piece linked to it, whatever town it stood in
+   (on a teammate's game the engine can give a copied piece a world town; a bought or handed-back house is on no outpost's key list -
+   the world server keeps it out). row -1 = a loaded piece (BdTownsLoadedTick). 1 = linked, already in its outpost, or stands inside a
+   building (nothing to do); 0 = nothing done (no outpost key, no town to take, a fault). MAIN THREAD */
+int BdKeptTownPlaceKey(long row, const std::string& pieceKey, void* b, ::Faction* fac)
 {
-    void* towns[kTownWalkCap];
-    const int n = BdPlayerTownsPod(towns, kTownWalkCap);
-    if (n < 0) return -1;
-    for (int i = 0; i < n; ++i) if (towns[i] == t) return 1;
-    return (n >= kTownWalkCap) ? -1 : 0;   /* a full walk may have cut the list */
+    if (b == 0 || fac == 0 || g_townKeyIdx.find(pieceKey) == g_townKeyIdx.end()) return 0;   /* a piece of no outpost */
+    const int top = BdBuildingTopLevelPod(b);
+    if (top < 0) return 0;   /* a fault */
+    if (top == 0) { BdKeptTownHostNote(row, pieceKey); return 1; }
+    return BdKeptTownLinkKey(row, pieceKey, b, BdKeptTownForKey(pieceKey, fac));
 }
-/* a kept piece of an outpost to its town: a piece already in a town that is not a player town (a bought or handed-back house's) stays
-   in it and no town is taken or founded for it (townkeep::TownRelinkAllowed); otherwise the outpost's town is taken or founded
-   (BdKeptTownForKey) and the piece linked. row -1 = a loaded piece (BdTownsLoadedTick). MAIN THREAD */
-void BdKeptTownPlaceKey(long row, const std::string& pieceKey, void* b, ::Faction* fac)
-{
-    if (b == 0 || fac == 0 || g_townKeyIdx.find(pieceKey) == g_townKeyIdx.end()) return;   /* a piece of no outpost */
-    void* cur = BdBuildingTownPod(b);
-    const int curPlayer = (cur == 0) ? 0 : BdTownIsPlayer(cur);
-    if (townkeep::TownRelinkAllowed(cur != 0 ? 1 : 0, curPlayer) == 0)
-    {
-        ++g_townKeptOther;
-        if (g_townKeptOther <= 40 || g_townKeptOther % 100 == 0)
-        {
-            char who[40], line[500];
-            if (row >= 0) _snprintf_s(who, sizeof(who), _TRUNCATE, "row %ld", row);
-            else _snprintf_s(who, sizeof(who), _TRUNCATE, "loaded");
-            _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] %s piece key=%.63s stands in the town '%.80s', %s - left in it, no outpost taken or founded for it; townKeptOther=%lld",
-                        who, pieceKey.c_str(), BdTownName(cur).c_str(),
-                        curPlayer < 0 ? "the player-town list could not be read" : "not a player town (a bought or handed-back house's town)", g_townKeptOther);
-            BdKeptLog(line);
-        }
-        return;
-    }
-    BdKeptTownLinkKey(row, pieceKey, b, BdKeptTownForKey(pieceKey, fac));
-}
-void BdKeptTownPlace(const keptwire::Row& w, void* b, ::Faction* fac) { BdKeptTownPlaceKey((long)w.row, w.p.key, b, fac); }
+int BdKeptTownPlace(const keptwire::Row& w, void* b, ::Faction* fac) { return BdKeptTownPlaceKey((long)w.row, w.p.key, b, fac); }
 /* EVERY GAME, not only the layer: each kept outpost's pieces loaded here are linked to the outpost's town, taken or founded on this game
    as the lay does (the piece owner's faction: this player's own, else the owner's stand-in, none made; a town of that faction within
-   kTownSameRadius of the centre is taken, so none is founded twice; a piece in a town that is not a player town stays), so this game
+   kTownSameRadius of the centre is taken, so none is founded twice; a piece inside a building keeps its host's town), so this game
    shows the outpost and its area records name it. Every kTownLookMs ONE walk of the loaded buildings (LoadedBuildings) is matched
    against the outposts' keys (the exact key, else the one key within the drift window - BoxKeyNearKey), pieces of an outpost owner's
-   faction only. A piece standing in a town after it (linked, or left in a town that is not a player town) is settled for this world
-   (g_townLoadedDone), and no walk runs once every outpost key is settled. A piece on no list that walk reads (inside a building's
+   faction only. A piece the place step settles (linked, already in its outpost, or standing inside a building) is settled for this world (g_townLoadedDone), and no walk runs once every outpost key is settled. A piece on no list that walk reads (inside a building's
    interior) is not looked for here. MAIN THREAD (BuildCopyDrain) */
 DWORD g_townLoadedAt = 0;
 size_t g_townLoadedCursor = 0;   /* reset with each new town list; the walk reads every loaded piece and keeps no cursor */
-std::set<std::string> g_townLoadedDone;   /* MAIN THREAD: outpost keys whose piece stands in a town here - not looked for again this world */
+std::set<std::string> g_townLoadedDone;   /* MAIN THREAD: outpost keys whose piece was settled here (BdKeptTownPlaceKey non-zero) - not looked for again this world */
 /* MAIN THREAD: looks after which an open outpost key's area had its buildings loaded here (ZoneLoadedSectorTri) and the key was still not
    settled. At kTownLoadedMissMax the key is settled too (its piece is gone, inside a building, or cannot be linked), so the 5 s walk stops
    once nothing more can come of it. At most kTownLinksPerLook pieces are linked a look; the rest at the next one. */
@@ -9802,8 +10067,7 @@ void BdTownsLoadedTick()
         if (links >= kTownLinksPerLook) { capped = 1; break; }   /* enough links for one frame: the rest at the next look */
         ++links;
         tried.insert(key);
-        BdKeptTownPlaceKey(-1, key, b, fac);
-        if (BdBuildingTownPod(b) != 0) g_townLoadedDone.insert(key);   /* stands in a town now: settled for this world */
+        if (BdKeptTownPlaceKey(-1, key, b, fac) != 0) g_townLoadedDone.insert(key);   /* linked, already in it, or inside a building: settled for this world */
     }
     /* a look counts against an open key only when its area's buildings are all loaded here and the look covered it: a capped look covers
        the keys it linked, a whole look (no cap, an untruncated list) every key. Keys of an owner with no faction here wait for it. */
@@ -9822,7 +10086,7 @@ void BdTownsLoadedTick()
         if (g_townLoadedGaveUp <= 40 || g_townLoadedGaveUp % 100 == 0)
         {
             char line[400];
-            _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] outpost key=%.63s: its area's buildings are loaded here and no piece at it stood in a town after %d looks (gone, inside a building, or not linkable) - not looked for again this world; townLoadedGaveUp=%lld",
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] outpost key=%.63s: its area's buildings are loaded here and no piece at it was linked or settled after %d looks (gone, inside a building's interior, or not linkable) - not looked for again this world; townLoadedGaveUp=%lld",
                         ki->first.c_str(), kTownLoadedMissMax, g_townLoadedGaveUp);
             BdKeptLog(line);
         }
@@ -9834,7 +10098,7 @@ void BdTownsLoadedTick()
 {
     return (w.p.ownerSlot == mySlot) ? LocalPlayerFaction() : OwnerFactionForSlot(w.p.ownerSlot, false);
 }
-/* THE KEYS OF EACH TOWN: this player's registered pieces whose town link (Building +0x90) is one of this player's towns -> their
+/* THE KEYS OF EACH TOWN: this player's registered pieces whose town (the engine's BuildingGetTown, BdBuildingTownPod) is one of this player's towns -> their
    registry keys' wire form under that town (sorted, each once, at most kMaxTownKeys; past it, or a key with no wire form, the town's
    list is cut). Walked every kTownKeysWalkMs and only while this player has a town: ONE walk of the loaded buildings (LoadedBuildings),
    each piece this player's faction owns keyed and matched to its registry row (the exact key, else the one row key within the drift
@@ -10063,15 +10327,26 @@ void* BdShowTownByHand(const int* hand)
     }
     return 0;
 }
-/* the loaded pieces whose town is t; *unread = 1 when the loaded pieces could not all be read */
+/* the loaded top-level pieces linked to town t: their own town handle words (+0x1D8) are t's - memory reads only, not the engine's
+   lookup (its nearest-town fallback would count a piece linked to no town); *unread = 1 when the loaded pieces, or t's handle words,
+   could not all be read */
 int BdShowLinked(void* t, int* unread)
 {
     static void* list[4096];
     int zones = 0, trunc = 0;
     const int n = LoadedBuildings(list, 4096, &zones, &trunc);
     *unread = (n < 0 || trunc != 0) ? 1 : 0;
+    float tp[3]; int th[5]; void* tf = 0;
+    if (BdTownReadPod(t, tp, th, &tf) == 0) { *unread = 1; return 0; }
     int k = 0;
-    for (int i = 0; i < n; ++i) if (list[i] != 0 && BdBuildingTownPod(list[i]) == t) ++k;
+    for (int i = 0; i < n; ++i)
+    {
+        if (list[i] == 0) continue;
+        int bh[5];
+        const int top = BdBuildingTopLevelPod(list[i]);
+        if (top < 0 || (top == 1 && BdBuildingTownHandPod(list[i], bh) == 0)) { *unread = 1; continue; }
+        if (top == 1 && townkeep::HandSame(bh, th)) ++k;
+    }
     return k;
 }
 /* a shown base taken out of this world (baseshow::GoneStep); 1 = no town of it stands now (its handle words cleared) */
@@ -10584,10 +10859,71 @@ void BdOutpostDrain()
     }
     if (best == 0) { ErrorLog("[BUILD] outposttest link REFUSED: this player has no outpost here"); return; }
     void* was = BdBuildingTownPod(b);
-    const int ok = BdBuildingSetTownPod(b, best);
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] outposttest link %s key=%.63s -> %s (its town was '%.80s')", ok != 0 ? "LINKED" : "FAULTED", hit.c_str(), BdTownText(best).c_str(),
-                was != 0 ? BdTownName(was).c_str() : "none");
+    const int ok = BdBuildingSetTownPod(b, best);   /* 1 written, -1 stands inside a building (nothing written), 0 a fault */
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] outposttest link %s key=%.63s -> %s (its town was '%.80s')%s", ok > 0 ? "LINKED" : (ok < 0 ? "NOT LINKED" : "FAULTED"), hit.c_str(),
+                BdTownText(best).c_str(), was != 0 ? BdTownName(was).c_str() : "none", ok < 0 ? " - stands inside a building - nothing written" : "");
     DebugLog(line);
+}
+/* T-899 TEST-ONLY `buildtest town <sid|key-substring>` (read only, MAIN THREAD - BuildTestArm's thread; refused with the other verbs
+   while engine writes are blocked): every registered piece the argument names (coopbuild::BuildTownArgMatch: its key contains it, or
+   its sid is exactly it; at most kBdTownLeverCap shown) with its town as the engine's BuildingGetTown reads it (BdBuildingTownPod) - name,
+   position, handle, faction - and whether that town is one of the player towns, plus the raw type words of its parent hand (+0x88,
+   0xB = stands inside none) and its town hand (+0x1D8); then this player's own outposts with their handles, so a run compares the town
+   a piece points at with the outpost it stands in. Every engine read is SEH-wrapped (BdFindPiece, BdBuildingTownPod, BdTownText). */
+const int kBdTownLeverCap = 8;
+std::string BdTestTown(const std::string& arg)
+{
+    void* towns[kTownWalkCap];
+    const int n = BdPlayerTownsPod(towns, kTownWalkCap);
+    ::Faction* mine = LocalPlayerFaction();
+    int named = 0, shown = 0, notLoaded = 0, townFault = 0, inPlayerTown = 0;
+    char line[900];
+    for (std::map<std::string, BdReg>::const_iterator r = g_reg.begin(); r != g_reg.end(); ++r)
+    {
+        const int how = coopbuild::BuildTownArgMatch(arg, r->first, r->second.sid);
+        if (how == 0) continue;
+        if (++named > kBdTownLeverCap) continue;
+        ++shown;
+        int tv = 0;
+        void* b = BdFindPiece(r->first, r->second, &tv);
+        if (b == 0)
+        {
+            ++notLoaded;
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] buildtest town piece key=%.63s sid=%.60s (named by its %s): not loaded here (verdict %d)",
+                        r->first.c_str(), r->second.sid.c_str(), how == 1 ? "key" : "sid", tv);
+            DebugLog(line);
+            continue;
+        }
+        void* t = BdBuildingTownPod(b);
+        int parentType = -1, townType = -1;
+        BdBuildingHandTypesPod(b, &parentType, &townType);   /* left -1 on a fault */
+        int player = 0;
+        for (int i = 0; i < n; ++i) if (towns[i] == t) { player = i + 1; break; }
+        if (t == 0) ++townFault;   /* BdBuildingTownPod gives 0 for a loaded piece only on a fault */
+        else if (player != 0) ++inPlayerTown;
+        char where[80];
+        where[0] = 0;
+        if (t != 0 && n < 0) _snprintf_s(where, sizeof(where), _TRUNCATE, " - the town list is not readable");
+        else if (t != 0 && player != 0) _snprintf_s(where, sizeof(where), _TRUNCATE, " - player town %d of %d", player, n);
+        else if (t != 0) _snprintf_s(where, sizeof(where), _TRUNCATE, " - NOT a player town");
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] buildtest town piece key=%.63s sid=%.60s (named by its %s) via=%d own=%d dismantled=%d: town=%s%s parentType=%d townType=%d",
+                    r->first.c_str(), r->second.sid.c_str(), how == 1 ? "key" : "sid", r->second.via, r->second.own, r->second.dismantled,
+                    t == 0 ? "FAULTED" : BdTownText(t).c_str(), where, parentType, townType);
+        DebugLog(line);
+    }
+    int mineN = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        float p[3]; int h[5]; void* f = 0;
+        if (BdTownReadPod(towns[i], p, h, &f) == 0 || f == 0 || f != (void*)mine) continue;
+        ++mineN;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] buildtest town outpost (player town %d of %d, this player's): %s", i + 1, n, BdTownText(towns[i]).c_str());
+        DebugLog(line);
+    }
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] buildtest town '%.63s': %d registered piece(s) named, %d shown (not loaded %d, town read FAULTED %d, in a player town %d); player towns %d%s, this player's %d",
+                arg.c_str(), named, shown, notLoaded, townFault, inPlayerTown, n, n < 0 ? " (the town list is not readable)" : "", mineN);
+    DebugLog(line);
+    return named == 0 ? "error buildtest town: no registered piece is named by '" + arg + "'" : "ok buildtest town: " + zonekeep::ZkNum((long long)named) + " piece(s) named";
 }
 void BdKeptPendDone(BdPending& p)
 {
@@ -10608,7 +10944,7 @@ void BdKeptPendDone(BdPending& p)
         if (b != 0) BdKeptRuinDoors(*w);
         if (b != 0) BdKeptExtrasNow(*w, L, b, "this player's own piece made again");
         if (b != 0) BdKeptOverlap(*w, L, b, host);
-        if (b != 0) BdKeptTownLink(*w, b, BdKeptTownFor(*w, LocalPlayerFaction()));   /* its outpost: taken or founded now the piece is made, then linked whatever town the engine gave the new piece (the nearest town, a world town too), as the made road for another player's piece does */
+        if (b != 0 && p.m.hostKey.empty() && w->p.destroyed == 0) BdKeptTownPlace(*w, b, LocalPlayerFaction());   /* its outpost: taken or founded, then linked - furniture (a host) keeps its host's town and a ruin joins none, so no town is taken for either */
     }
     if (how == keptwire::kHowPresent) L.extrasDone = keptwire::ExtrasWanted(w->p);   /* a piece that already stood keeps its own state */
     if (how == keptwire::kHowMade) ++g_keptMade; else if (how == keptwire::kHowPresent) ++g_keptPresent; else ++g_keptRefused;
@@ -10792,7 +11128,7 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
         }
         ++g_keptPresent;
         L.extrasDone = keptwire::ExtrasWanted(w.p);   /* a piece that already stood keeps its own state */
-        BdKeptTownPlace(w, live, BdKeptTownFaction(w, mySlot));   /* its outpost: taken or founded, then linked - a piece in a town that is not a player town stays */
+        BdKeptTownPlace(w, live, BdKeptTownFaction(w, mySlot));   /* its outpost: taken or founded, then linked - a piece inside a building keeps its host's town */
         BdKeptPieceLaid(w, L, keptwire::kHowPresent, lk, "a matching piece already stands there - nothing made");
         return;
     }
@@ -10856,7 +11192,7 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
         L.nextLook = g_drainNo + kRetryGap;
         return;
     }
-    void* const town = BdKeptTownFor(w, to);   /* its outpost first: taken or founded before the piece is made */
+    void* const town = (furn != 0) ? 0 : BdKeptTownFor(w, to);   /* its outpost first: taken or founded before the piece is made; none for a furniture row (it stands inside a building and keeps its host's town; a town founded for it would have no member, and the engine's player-town refresh destroys such a town) */
     const char* cwhy = 0;
     void* b = BdKeptCreate(w, furn, host, pos, rot, (void*)to, &cwhy);
     if (b == 0)
@@ -10868,7 +11204,7 @@ void BdKeptPieceWork(const keptwire::Row& w, BdKeptLoc& L, int mySlot, int sx, i
     }
     BdKeptApplyState(w, b);
     BdKeptRuinDoors(w);
-    BdKeptTownLink(w, b, town);
+    if (furn == 0) BdKeptTownLink(w, b, town);   /* a furniture row is linked to no town: its town is its host's */
     BdKeptExtrasNow(w, L, b, "made");
     BdKeptOverlap(w, L, b, furn != 0 ? host : 0);
     char k2[kKeyCap];
@@ -11037,7 +11373,7 @@ void BdKeptOwner(const keptwire::Row& w, BdKeptLoc& L)
         g_rsOwePlace.push_back(lk);
     }
     BdKeptOwnerState(w, live, lk);
-    BdKeptTownPlace(w, live, LocalPlayerFaction());   /* this player's own outpost in this world: taken or founded, then linked - a piece in a town that is not a player town stays */
+    BdKeptTownPlace(w, live, LocalPlayerFaction());   /* this player's own outpost in this world: taken or founded, then linked - a piece inside a building keeps its host's town */
     BdOwnDirty(2);
     L.ownerStep = 1;
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[KEPT] row %u owner: this player's piece %.63s found here and registered as its own - reported once its records hold it", w.row, lk.c_str());
@@ -12685,6 +13021,13 @@ void ReportBuild()
                 g_helpRefundItems, g_helpRefundFailed, g_helpFaulted, g_helpSaveFailed, g_helpLoadUnread, g_testMats, g_helpLines, g_helpSuppressed,
                 g_helpNonceRestored, g_helpNonceHeld, g_helpGoneUnproven, g_bdCopyCollide, g_helpGoneCarried, g_helpOldProbe, g_helpAckKeptUnknown);   /* help1 fold 4 */
     DebugLog(std::string(hp));
+    char h9[600];   /* T-903 */
+    _snprintf_s(h9, sizeof(h9), _TRUNCATE, "[BUILD] REPORT help903[givenBuild,givenMaterials,givenRepair,refusedBuild,refusedMaterials,refusedRepair,refusedOff,repairDamagedHelp,repairWorkRec,repairApplied,repairWhole,repairFaulted,friendHelps,applyRefused,runRefused,applyHeld]"
+                "=%lld,%lld,%lld,%lld,%lld,%lld,%ld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%lld,%lld",
+                g_helpGivenK[0], g_helpGivenK[1], g_helpGivenK[2], g_helpRefusedK[0], g_helpRefusedK[1], g_helpRefusedK[2],
+                (long)::InterlockedCompareExchange(&g_helpRefusedOff, 0, 0), g_repairDamagedHelp, g_repairWorkRec, g_helpRepairApplied, g_repairWhole,
+                g_repairFaulted, coopbuild::kBuildHelpFriendHelps, g_helpApplyRefused, g_helpRunRefused, g_helpApplyHeld);
+    DebugLog(std::string(h9));
     char p18[700];   /* P18 */
     _snprintf_s(p18, sizeof(p18), _TRUNCATE, "[BUILD] REPORT p18[hook,seen,queued,offMain,modWrite,nested,notMine,wasMine,noKey,dup,queueFull,registered,notTaken,known,copyRow,notMineNow,gaveUp,walkMoved,applied,applyFaulted,waiting,lines,suppressed]"
                 "=%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%u,%lld,%lld",

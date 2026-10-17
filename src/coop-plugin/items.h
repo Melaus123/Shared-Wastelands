@@ -209,7 +209,9 @@ struct ItemConfirmMsg
     // TAKE with ok 1 only - the uniform and crafter the owner's item carried, a 'GEM1' block after the optional OWN1 block.
     gearwire::GearMarks gear;
     // inv5 (protocol 72): ok 0 only - WHY a ground request was refused (coopground::kGroundReasonNotHolder 1 / NotFound 2), a
-    // 'GND1' block after the trade block; 0 = no reason given (every non-ground refusal).
+    // 'GND1' block after the trade block; 0 = no reason given (every other non-ground refusal). T-608 (a): a character or box
+    // TAKE / GIVE refused because the owner's exchange table is full carries kGroundReasonBusy 3; the asker's character / box
+    // road takes it as any refusal (its own copy put back).
     int reason;
     // T-164 B4-4 (protocol 92): the holder's answer to a shop request - the 'SHC1' block right after the trade block: its verdict, the
     // engine message the requester shows (0x70EC10), the units and cats moved, and the piece keys it wrote.
@@ -414,6 +416,7 @@ std::string HoldTestCommand(const std::string& arg);   /* P105 build 2: TEST-ONL
 void ItemsHoldSave(int phase, int onMainThread);       /* P105 build 2, the save pre-hooks (store.cpp): phase 0 before saveGame (every kept item back into its own square), 1 after it returns (lifted out again), 2 a saveLevelData outside a game save (a zone write: every hold put back and ended) */       /* p105h: TEST-ONLY `boxmove <boxKey> <section> <fx> <fy> <tx> <ty> [n]` - a move of n units (all when omitted) inside one box through the engine's own take-out + add */
 std::string ItemTestRefuseHereCommand(const std::string& arg);   /* T-164 B4-2: TEST-ONLY `itemtest refusehere <gate> [n]` - the REQUESTER takes that refusal exit after the early put-back (and refunds) */
 std::string ItemTestPackItemCommand(const std::string& arg);   /* T-215 (owner 177 a): TEST-ONLY `itemtest packitem [n]` - n sellable single items into this game's own seller's general grid */
+std::string ItemTestOwnerFullCommand(const std::string& arg);   /* T-608 (c): TEST-ONLY `itemtest ownerfull on|off` - as the OWNER, read the owner table as full: every character and box take / give refused busy */
 std::string ItemTestConfirmDelayCommand(const std::string& arg);   /* give1: TEST-ONLY `itemtest confirmdelay <0..30>` - the OWNER holds each outgoing ITEM_CONFIRM that long */
 /* inv6 TEST-ONLY levers (command channel, MAIN THREAD): `itemtest steal <n> [sid]` (a box stack into my first character through
    the engine's own RClickAutoTrade, so the engine sets the mark), `itemtest stolen <me|peer|name>` (read-only list of marked items),
@@ -545,6 +548,11 @@ int  FarmBoxItemCount(void* b, int* stacks, int* quantity);
 /* POSE (read-poses 2026-09-23): the building a key names on THIS game - ItBoxResolve, the box road's own resolver
    (cached, refuses two candidates and a world teardown). MAIN THREAD. 0 = not loaded here, or refused. */
 void* ObjectByPositionKey(const char* key);
+/* T-608 (f), MAIN THREAD: ObjectByPositionKey, but the resolver's NEAR MISS line is kept instead of printed (no per-key say budget
+   spent); ObjectByPositionKeyMissSay prints it - for a caller that searches inside buildings next (the bed / cage lookup), once that
+   search has failed too. The next HeldMiss call drops a kept line that was not said. */
+void* ObjectByPositionKeyHeldMiss(const char* key);
+void ObjectByPositionKeyMissSay();
 /* par16 fold #5, MAIN THREAD: the same answer with the CALLER'S OWN remembered pointer tried first - accepted only after the
    box cache's own two tests (the key read back from the pointer, and the pointer in this drain's walk of active zones or a
    live furniture row), else ItBoxResolve. A farm table that asks for every farm every 500 ms keeps its rows here instead of

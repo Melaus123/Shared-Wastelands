@@ -11051,8 +11051,12 @@ int KeepResetWorld(bool keepBuildings)
                 Log("reset: outposts: " + keptTownsPath + " could NOT be written (GetLastError=" + N((long long)::GetLastError()) + ") - the reset goes on; no outpost is founded again in the reset world");
             else
             {
-                Log("reset: outposts: " + N((long long)ts.towns) + " outpost(s) carried with " + N((long long)ts.keys) + " kept piece(s) linked to them, of "
-                    + N((long long)said.size()) + " the players' games said they hold and " + N((long long)withTown) + " kept piece(s) whose area record names a town ("
+                size_t carriedKeys = 0;   /* every carried outpost's pieces: matched by a said key, by distance, made from pieces or carried on */
+                for (size_t i = 0; i < keptTowns.size(); ++i) carriedKeys += keptTowns[i].keys.size();
+                Log("reset: outposts: " + N((long long)keptTowns.size()) + " outpost(s) carried with " + N((long long)carriedKeys) + " kept piece(s) in all - "
+                    + N((long long)ts.towns) + " of them with " + N((long long)ts.keys) + " kept piece(s) matched by a key their owner's game said, the rest given an outpost by "
+                    + "distance or carried on from the earlier reset (the lines above); of " + N((long long)said.size()) + " outpost(s) the players' games said they hold and "
+                    + N((long long)withTown) + " kept piece(s) whose area record names a town ("
                     + N((long long)ts.byKey) + " kept piece(s) matched to an outpost by a key its owner's game said, " + N((long long)ts.piecesLeft)
                     + " kept piece(s) of a player no said key names (" + N((long long)ts.piecesLeftTown) + " of them naming a town) - given an outpost by distance above, or laid with no outpost; "
                     + N((long long)ts.saidCut) + " said outpost(s) whose key list was cut; "

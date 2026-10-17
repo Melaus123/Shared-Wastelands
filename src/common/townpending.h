@@ -84,11 +84,16 @@ inline int PlaceNow(int place, int freshEngine, int areaHeldNow, int loadedHereN
 // block (blockSlot = n / 65536 of "<faction>_<n>", -1 none; mySlot -1 = not known) - another game's numbers are never minted here.
 inline int RaiseAfterAttempt(int blockSlot, int mySlot) { return (blockSlot >= 0 && mySlot >= 0 && blockSlot == mySlot) ? 1 : 0; }
 // CounterFloor: a faction's counter floor after one record number n - one past n when n is in this game's own block (mySlot),
-// never lower than floorNow; another block's number, or no block known, leaves it.
-inline unsigned CounterFloor(unsigned n, int mySlot, unsigned floorNow)
+// never lower than floorNow; another block's number, or no block known, leaves it. Never past the block's last number: one past
+// n = the block's last is the next game's block floor (T-642 review 4), so the floor is capped at n and *capped (when given) is
+// set to 1; else 0.
+inline unsigned CounterFloor(unsigned n, int mySlot, unsigned floorNow, int* capped = 0)
 {
+    if (capped != 0) *capped = 0;
     if (mySlot < 0 || (int)(n >> 16) != mySlot) return floorNow;
-    return (n + 1u > floorNow) ? n + 1u : floorNow;
+    unsigned v = n + 1u;
+    if ((v >> 16) != (unsigned)mySlot) { v = n; if (capped != 0) *capped = 1; }
+    return (v > floorNow) ? v : floorNow;
 }
 
 // NoteRole with the placer: a note that would be listed (kNoteNoPos / kNoteListed) but that no game can place is kNoteUnplaceable
