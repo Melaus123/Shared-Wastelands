@@ -13,7 +13,7 @@
                records an earlier build's reset kept). A ".1" backup or a ".tmp" leftover is what its file is. The old world keeps each; the
                reset world gets a copy of each but world.txt (written new) and the world lock (made by its first start).
      MOVE    - the world's state: every squad record (<id>.platoon and <id>.meta, with their .prev and .refused), the deleted-number
-               bitmaps (deleted.<faction>.bits), uniques.txt, world_relations.txt, town_losses.txt, town_bars.txt, owed_people.txt,
+               bitmaps (deleted.<faction>.bits), uniques.txt, world_relations.txt, town_losses.txt, town_bars.txt, owed_people.txt, owed_done.txt, owed_meta.txt,
                research_boxes.txt, research_takes.txt, clock.txt, areas.txt, pendingpos.txt, repair.txt, queue.txt, kept-pieces.txt and
                kept-state.txt (the players' pieces an earlier reset kept and how far each was laid back, zonekeep.h), player-towns.txt and kept-towns.txt (the outposts the players' games said they hold,
                and the ones a reset kept - townkeep.h), and the folders
@@ -106,7 +106,7 @@ inline int ResetClassify(const std::string& name, int isDir)
                                         "mods.txt", "uid_seats.txt", "fallen.txt", "teams.txt", "own_high.txt", "world.gen", "server.lock",
                                         "auth.txt", "access.txt", worldkeep::kRefusedFile };   /* authproof::kAuthFile, accessrule::kAccessFile */
     static const char* const move[] = { "uniques.txt", "world_relations.txt", "town_losses.txt", "town_bars.txt", "owed_people.txt",
-                                        "research_boxes.txt", "research_takes.txt", "clock.txt", "areas.txt", "pendingpos.txt", "repair.txt",
+                                        "owed_done.txt", "owed_meta.txt", "research_boxes.txt", "research_takes.txt", "clock.txt", "areas.txt", "pendingpos.txt", "repair.txt",
                                         "queue.txt", "kept-pieces.txt", "kept-state.txt", "player-towns.txt", "kept-towns.txt" };
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); ++i) if (b == keep[i]) return kResetKeep;
     for (size_t i = 0; i < sizeof(move) / sizeof(move[0]); ++i) if (b == move[i]) return kResetMove;

@@ -1,11 +1,14 @@
 /* src/common/limbwire.h - THE LIMB BLOCK OF MSG_STATE: each character's four limbs as its owner's game sees them.
  *
  *   limbVer u8 (= kLimbBlockVer) | state[4] u8 | for each limb whose state is kLimbReplaced: sidLen u8 | sid bytes | quality f32
+ *                                                                                                       | level i32 (version 2)
  *
  * Limb order is the engine's RobotLimbs::Limb: 0 left arm, 1 right arm, 2 left leg, 3 right leg. A state is the engine's
  * LimbState as RobotLimbs keeps it (+0x10, int[4]): 0 whole, 1 stump, 2 a robotic limb fitted, 3 crushed. For a fitted
  * limb the block names the limb item (its base sid, at most kLimbSidMax bytes, no NUL on the wire; 0 bytes = the owner
- * could not read it) and the item's quality (Item +0x11C). A fitted limb's damage is NOT here: while fitted it lives in
+ * could not read it), the item's quality (Item +0x11C) and its level (the engine's getLevel; the engine builds a limb's
+ * grade and stat effects from the level its item record holds when the item is made). Version 1 blocks (no level) still
+ * read, with each level -1 = unknown. A fitted limb's damage is NOT here: while fitted it lives in
  * that limb's health part (flesh / stunDamage / limbWear / maxHealthBase), which every STATE already carries.
  *
  * Built and parsed here only, so the offline suite (src/coop-test/test_main.cpp) hits the same bytes net/session.cpp
@@ -27,20 +30,26 @@ const unsigned char kLimbOriginal = 0;   /* LimbState LIMB_ORIGINAL */
 const unsigned char kLimbStump    = 1;   /* LIMB_STUMP */
 const unsigned char kLimbReplaced = 2;   /* LIMB_REPLACED - a robotic limb is fitted */
 const unsigned char kLimbCrushed  = 3;   /* LIMB_CRUSHED */
-const unsigned char kLimbBlockVer = 1;   /* the first byte of the block; any other value reads as no block */
+const unsigned char kLimbBlockVer  = 2;   /* the first byte of the block this build writes */
+const unsigned char kLimbBlockVer1 = 1;   /* the older block, without levels: still read; any other value reads as no block */
 const unsigned int  kLimbSidMax   = 63;
+const int           kLimbLevelMax = 100000;   /* a level outside 0..this from the wire reads as -1 (unknown) */
+
+/* true = a level the copy may build with: 0..kLimbLevelMax. -1 means unknown. */
+inline bool LimbLevelPlausible(int level) { return level >= 0 && level <= kLimbLevelMax; }
 
 struct LimbsWire
 {
     unsigned char state[kLimbCount];
     char          sid[kLimbCount][kLimbSidMax + 1];   /* NUL-terminated; meaningful for kLimbReplaced only */
     float         quality[kLimbCount];
+    int           level[kLimbCount];   /* -1 = unknown (a version 1 block, or the owner could not read it) */
 };
 
 inline void LimbsClear(LimbsWire* w)
 {
     if (w == 0) return;
-    for (unsigned int i = 0; i < kLimbCount; ++i) { w->state[i] = kLimbOriginal; w->sid[i][0] = 0; w->quality[i] = 0.0f; }
+    for (unsigned int i = 0; i < kLimbCount; ++i) { w->state[i] = kLimbOriginal; w->sid[i][0] = 0; w->quality[i] = 0.0f; w->level[i] = -1; }
 }
 
 inline size_t LimbSidLen(const char* s)
@@ -65,7 +74,8 @@ inline bool LimbsEqual(const LimbsWire& a, const LimbsWire& b)
     for (unsigned int i = 0; i < kLimbCount; ++i)
     {
         if (a.state[i] != b.state[i]) return false;
-        if (a.state[i] == kLimbReplaced && (std::strcmp(a.sid[i], b.sid[i]) != 0 || a.quality[i] != b.quality[i])) return false;
+        if (a.state[i] == kLimbReplaced
+            && (std::strcmp(a.sid[i], b.sid[i]) != 0 || a.quality[i] != b.quality[i] || a.level[i] != b.level[i])) return false;
     }
     return true;
 }
@@ -81,21 +91,27 @@ inline void EncodeLimbs(std::vector<char>* b, const LimbsWire& w)
         if (w.state[i] != kLimbReplaced) continue;
         const size_t n = LimbSidLen(w.sid[i]);
         const size_t at = b->size();
-        b->resize(at + 1 + n + 4);
+        b->resize(at + 1 + n + 4 + 4);
         (*b)[at] = (char)(unsigned char)n;
         if (n > 0) std::memcpy(&(*b)[at + 1], w.sid[i], n);
         std::memcpy(&(*b)[at + 1 + n], &w.quality[i], 4);
+        const int lv = LimbLevelPlausible(w.level[i]) ? w.level[i] : -1;
+        std::memcpy(&(*b)[at + 1 + n + 4], &lv, 4);
     }
 }
 
-/* Reads the block at p[at]. true = *w holds it and *end (when given) is the first byte after it; false = no block (a
-   payload that ends before it, another version byte, a state above kLimbCrushed, a sid over kLimbSidMax or a cut block)
-   and *w is cleared. Every test is `size - off < n` with `off` already bounded by `size`, so a hostile length cannot wrap. */
+/* Reads the block at p[at], version 2 or version 1 (each level then -1). true = *w holds it and *end (when given) is the
+   first byte after it; false = no block (a payload that ends before it, another version byte, a state above kLimbCrushed, a
+   sid over kLimbSidMax or a cut block) and *w is cleared. A level outside 0..kLimbLevelMax reads as -1. Every test is
+   `size - off < n` with `off` already bounded by `size`, so a hostile length cannot wrap. */
 inline bool DecodeLimbs(const char* p, size_t size, size_t at, LimbsWire* w, size_t* end)
 {
     if (w == 0) return false;
     LimbsClear(w);
-    if (p == 0 || at > size || size - at < 1 + kLimbCount || (unsigned char)p[at] != kLimbBlockVer) return false;
+    if (p == 0 || at > size || size - at < 1 + kLimbCount) return false;
+    const unsigned char ver = (unsigned char)p[at];
+    if (ver != kLimbBlockVer && ver != kLimbBlockVer1) return false;
+    const size_t lvBytes = (ver == kLimbBlockVer) ? 4 : 0;
     size_t q = at + 1;
     LimbsWire r;
     LimbsClear(&r);
@@ -111,11 +127,18 @@ inline bool DecodeLimbs(const char* p, size_t size, size_t at, LimbsWire* w, siz
         if (r.state[i] != kLimbReplaced) continue;
         if (size - q < 1) return false;
         const size_t n = (unsigned char)p[q];
-        if (n > kLimbSidMax || size - q - 1 < n + 4) return false;
+        if (n > kLimbSidMax || size - q - 1 < n + 4 + lvBytes) return false;
         if (n > 0) std::memcpy(r.sid[i], p + q + 1, n);
         r.sid[i][n] = 0;
         std::memcpy(&r.quality[i], p + q + 1 + n, 4);
-        q += 1 + n + 4;
+        { unsigned int qb = 0; std::memcpy(&qb, &r.quality[i], 4); if ((qb & 0x7F800000u) == 0x7F800000u) r.quality[i] = -1.0f; }   /* a NaN or infinite quality is unreadable (-1): never a refit target */
+        if (lvBytes != 0)
+        {
+            int lv = -1;
+            std::memcpy(&lv, p + q + 1 + n + 4, 4);
+            r.level[i] = LimbLevelPlausible(lv) ? lv : -1;
+        }
+        q += 1 + n + 4 + lvBytes;
     }
     *w = r;
     if (end != 0) *end = q;
@@ -172,25 +195,62 @@ inline int PlanLimbQ(unsigned char copyState, const char* copySid, float copyQua
     return step;
 }
 
+/* A same-item level difference worth a refit: both levels known (0..kLimbLevelMax) and different. An unknown level on
+   either side (-1: a version 1 owner, or a level that could not be read) is no difference. */
+inline bool LimbLevelDiffers(int copyLevel, int ownerLevel)
+{
+    return LimbLevelPlausible(copyLevel) && LimbLevelPlausible(ownerLevel) && copyLevel != ownerLevel;
+}
+
+/* PlanLimbQ, and a refit when both sides have the same named robotic limb fitted at different levels (the copy's item is
+   remade at the owner's level). */
+inline int PlanLimbQL(unsigned char copyState, const char* copySid, float copyQuality, int copyLevel,
+                      unsigned char ownerState, const char* ownerSid, float ownerQuality, int ownerLevel)
+{
+    const int step = PlanLimbQ(copyState, copySid, copyQuality, ownerState, ownerSid, ownerQuality);
+    if (step == kLimbStepNone && copyState == kLimbReplaced && ownerState == kLimbReplaced
+        && ownerSid != 0 && ownerSid[0] != 0 && LimbLevelDiffers(copyLevel, ownerLevel))
+        return kLimbStepRefit;
+    return step;
+}
+
 /* true = an RTTI type name (".?AV<Class>@@") names the engine's robotic limb item class. */
 inline bool LimbIsRobotItemClass(const char* rttiName)
 {
     return rttiName != 0 && std::strstr(rttiName, "RobotLimbItem") != 0;
 }
 
-/* The limbtest lever's arguments: `cut <uid> <limb 0-3>`, `fit <uid> <limb 0-3> <sid>`, `show <uid>`. Anything else, a uid
-   of 0, a limb out of range, a sid longer than kLimbSidMax or a trailing word is kLimbTestBad. */
+/* The limbtest lever's arguments: `cut <uid> <limb 0-3>`, `fit <uid> <limb 0-3> <sid> [level=<n>]`, `show <uid>`. Anything
+   else, a uid of 0, a limb out of range, a sid longer than kLimbSidMax or starting "level=", a level that is not 0..kLimbTestLevelMax
+   in plain digits, or a trailing word is kLimbTestBad. level: fit's n, or -1 when level= is not given (the item is then made at the
+   engine's default level, as the copy's limbs are made today). */
 const int kLimbTestBad  = 0;
 const int kLimbTestCut  = 1;
 const int kLimbTestFit  = 2;
 const int kLimbTestShow = 3;
+const int kLimbTestLevelMax = 1000;
 
-inline int LimbTestParse(const std::string& args, unsigned int* uid, int* limb, std::string* sid)
+/* true = w is "level=<n>" with n plain digits, 0..kLimbTestLevelMax; *out = n. */
+inline bool LimbTestLevelArg(const std::string& w, int* out)
+{
+    if (w.size() < 7 || w.compare(0, 6, "level=") != 0) return false;
+    int n = 0;
+    for (size_t k = 6; k < w.size(); ++k)
+    {
+        if (w[k] < '0' || w[k] > '9') return false;
+        n = n * 10 + (w[k] - '0');
+        if (n > kLimbTestLevelMax) return false;
+    }
+    *out = n;
+    return true;
+}
+
+inline int LimbTestParse(const std::string& args, unsigned int* uid, int* limb, std::string* sid, int* level = 0)
 {
     std::istringstream is(args);
     std::string what, extra, s;
     unsigned int u = 0;
-    int l = -1;
+    int l = -1, lv = -1;
     if (!(is >> what >> u) || u == 0) return kLimbTestBad;
     if (what == "show")
     {
@@ -200,11 +260,16 @@ inline int LimbTestParse(const std::string& args, unsigned int* uid, int* limb, 
     }
     if (what != "cut" && what != "fit") return kLimbTestBad;
     if (!(is >> l) || l < 0 || l >= (int)kLimbCount) return kLimbTestBad;
-    if (what == "fit" && (!(is >> s) || s.empty() || s.size() > kLimbSidMax)) return kLimbTestBad;
-    if (is >> extra) return kLimbTestBad;
+    if (what == "fit" && (!(is >> s) || s.empty() || s.size() > kLimbSidMax || s.compare(0, 6, "level=") == 0)) return kLimbTestBad;
+    if (is >> extra)
+    {
+        if (what != "fit" || !LimbTestLevelArg(extra, &lv)) return kLimbTestBad;
+        if (is >> extra) return kLimbTestBad;
+    }
     if (uid != 0) *uid = u;
     if (limb != 0) *limb = l;
     if (sid != 0) *sid = s;
+    if (level != 0) *level = lv;
     return (what == "cut") ? kLimbTestCut : kLimbTestFit;
 }
 

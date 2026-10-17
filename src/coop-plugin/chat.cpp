@@ -11,6 +11,13 @@
 // window's place, size and opacity are kept in chat.cfg in the data folder. A message that cannot go leaves a grey line and
 // the typed text in the box.
 //
+// OPTIONS AND SOUNDS (T-815, owner 865 / 870 / 871). The header's OPTIONS button (between the slider and the X) opens CHAT
+// OPTIONS, a Kenshi_WindowC with one row per message kind - its label at the left, a Kenshi_TickBoxSkin tick box at the right -
+// and CLOSE. A received message plays its kind's sound (chatwire::SoundToPlay: every kind Prospect_Click, owner 2026-10-17) when that kind's tick is on and the window is closed; there is no rate limit. The game's own interface
+// clicks are posted the same way: AK::SoundEngine::PostEvent(event, object 0x6E, ...) - table row SoundPostEvent (1.0.65
+// 0xA860C0, 1.0.68 0xA86F90; e.g. the game's Prospect_Click at 1.0.65 0x720E07). The three switches are kept in chat.cfg
+// (sound_everyone, sound_faction, sound_direct), read apart from the window's keys so a damaged place never loses them.
+//
 // THE ROAD. A message is one kInnerChat (src/common/chatwire.h) through the world server's relay - everyone by route WORLD, a
 // player by route SLOT, a faction as one SLOT copy to each other member in the world. The server stamps the sender's slot; the
 // name shown is this game's own name for that slot. "X joined / left the world." come from this game's own copy of who is in
@@ -34,6 +41,7 @@
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_ScrollView.h>
 #include <mygui/MyGUI_ScrollBar.h>
+#include <mygui/MyGUI_Window.h>
 #include <mygui/MyGUI_InputManager.h>
 #include <mygui/MyGUI_RenderManager.h>
 #include <mygui/MyGUI_KeyCode.h>
@@ -49,6 +57,7 @@
 #include "playerstab.h"                    /* PlayersTabPlayerWords */
 #include "config.h"                        /* ConfigDataDir, ConfigFilePlayerName */
 #include "soak.h"                          /* GameplayRunning */
+#include "addresses.h"                     /* AddrReg, AddrAbs, AddrOk: the SoundPostEvent row */
 #include "../common/chatwire.h"
 #include "../common/liverelay.h"           /* kInnerChat */
 #include "../common/liveenvelope.h"        /* kRouteWorld, kRouteSlot */
@@ -86,6 +95,11 @@ const char* const kPop      = "SWChatToList";
 const char* const kPopEdit  = "SWChatToSearch";
 const char* const kPopHint  = "SWChatToSearchHint";
 const char* const kPopRows  = "SWChatToRows";
+const char* const kOptBtn   = "SWChatOptionsBtn";  /* the header's OPTIONS */
+const char* const kOpt      = "SWChatOptions";     /* the CHAT OPTIONS window */
+const char* const kOptClose = "SWChatOptionsClose";
+const char* const kOptLbl[3]  = { "SWChatOptLabel0", "SWChatOptLabel1", "SWChatOptLabel2" };   /* by chatwire::Kind */
+const char* const kOptTick[3] = { "SWChatOptTick0", "SWChatOptTick1", "SWChatOptTick2" };
 
 const int kHeadH = 38;    /* Kenshi_WindowCX's header: 38 tall, its close X 31 x 32 at 5 from the top */
 const int kPad = 8;
@@ -105,7 +119,7 @@ std::string N(long long v) { char b[32]; _snprintf(b, 31, "%lld", v); b[31] = 0;
 int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /* ---- what the player pressed: written by the handlers, taken by the tick ---- */
-enum { kActNone = 0, kActSend = 1, kActClose = 2, kActToList = 3, kActSearchPick = 4, kActAccept = 5 };   /* kActAccept: Enter in the typing line; kActSend: the SEND button */
+enum { kActNone = 0, kActSend = 1, kActClose = 2, kActToList = 3, kActSearchPick = 4, kActAccept = 5, kActOptions = 6, kActOptClose = 7 };   /* kActAccept: Enter in the typing line; kActSend: the SEND button; kActOptions: OPTIONS; kActOptClose: CHAT OPTIONS' CLOSE */
 volatile LONG g_act = kActNone;
 volatile LONG g_esc = 0;          /* an ESC meant for the open window */
 volatile LONG g_tabN = 0;         /* Tab presses while typing */
@@ -120,11 +134,18 @@ volatile LONG g_searchDirty = 0;
 volatile LONG g_escHold = 0;      /* the window closed on an ESC: that ESC's pause-menu show is still refused (EscHoldOn) */
 volatile LONG g_escClosedTick = 0;
 const DWORD kEscHoldMs = 500;
+volatile LONG g_tickFlip[3] = { 0, 0, 0 };   /* clicks on CHAT OPTIONS' tick boxes, by chatwire::Kind, taken by the tick */
+volatile LONG g_soundOff = 0;                /* the sound call faulted once: no message sound for the rest of the process */
 
 void OnSend(MyGUI::Widget*)          { ::InterlockedExchange(&g_act, kActSend); }
 void OnAccept(MyGUI::EditBox*)       { ::InterlockedExchange(&g_act, kActAccept); }
 void OnClose(MyGUI::Widget*)         { ::InterlockedExchange(&g_act, kActClose); }
 void OnToBtn(MyGUI::Widget*)         { ::InterlockedExchange(&g_act, kActToList); }
+void OnOptBtn(MyGUI::Widget*)        { ::InterlockedExchange(&g_act, kActOptions); }
+void OnOptClose(MyGUI::Widget*)      { ::InterlockedExchange(&g_act, kActOptClose); }
+void OnTick0(MyGUI::Widget*)         { ::InterlockedIncrement(&g_tickFlip[0]); }
+void OnTick1(MyGUI::Widget*)         { ::InterlockedIncrement(&g_tickFlip[1]); }
+void OnTick2(MyGUI::Widget*)         { ::InterlockedIncrement(&g_tickFlip[2]); }
 void OnSearchAccept(MyGUI::EditBox*) { ::InterlockedExchange(&g_act, kActSearchPick); }
 void OnSearchChange(MyGUI::EditBox*) { ::InterlockedExchange(&g_searchDirty, 1); }
 void OnKey(MyGUI::Widget*, MyGUI::KeyCode key, MyGUI::Char)
@@ -199,6 +220,10 @@ long long g_throwLogMs = 0;
 bool g_busyPrev = true;           /* another text field had the keys, or a modal window was up, at the end of the last tick */
 std::map<int, chatwire::InRate> g_inRate;   /* received lines a second, by sender */
 long long g_dropBad = 0, g_dropNotMate = 0, g_dropNotMine = 0, g_dropFast = 0, g_dropLogMs = 0;
+chatwire::Sounds g_sounds;        /* the three sound switches (chat.cfg), all on until the file says otherwise */
+bool g_optOpen = false;           /* CHAT OPTIONS is up */
+long long g_soundPlayed[3] = { 0, 0, 0 }, g_soundQuiet = 0, g_soundRefused = 0, g_soundLogMs = 0;   /* counts only */
+bool g_soundNoAddrSaid = false;
 
 /* ---- widgets ---- */
 MyGUI::Widget* Find(MyGUI::Gui* gui, const char* name) { return gui->findWidgetT(std::string(name), false); }
@@ -209,19 +234,20 @@ MyGUI::Widget* Mk(MyGUI::Widget* parent, const char* type, const char* skin, int
     return parent->createWidgetT(std::string(type), std::string(skin), MyGUI::IntCoord(l, t, w > 1 ? w : 1, h > 1 ? h : 1),
                                  MyGUI::Align::Default, std::string(name));
 }
-/* a root widget on the "Info" layer (above the menus, as REPORT A BUG's window), or "Popup" when Info is unknown */
-MyGUI::Widget* MkRoot(MyGUI::Gui* gui, const char* skin, const MyGUI::IntCoord& c, const char* name)
+/* a root widget of `type` on the "Info" layer (above the menus, as REPORT A BUG's window), or "Popup" when Info is unknown */
+MyGUI::Widget* MkRootT(MyGUI::Gui* gui, const char* type, const char* skin, const MyGUI::IntCoord& c, const char* name)
 {
     static const char* const kLayers[2] = { "Info", "Popup" };
     for (int k = 0; k < 2; ++k)
     {
-        MyGUI::Widget* w = gui->createWidgetT(std::string("Widget"), std::string(skin), c, MyGUI::Align::Default, std::string(kLayers[k]), std::string(name));
+        MyGUI::Widget* w = gui->createWidgetT(std::string(type), std::string(skin), c, MyGUI::Align::Default, std::string(kLayers[k]), std::string(name));
         if (w == 0) return 0;
         if (w->getLayer() != 0) return w;
         gui->destroyWidget(w);
     }
     return 0;
 }
+MyGUI::Widget* MkRoot(MyGUI::Gui* gui, const char* skin, const MyGUI::IntCoord& c, const char* name) { return MkRootT(gui, "Widget", skin, c, name); }
 void ViewSize(int* vw, int* vh)
 {
     *vw = 1280; *vh = 720;
@@ -360,6 +386,10 @@ std::string PlaceWords(const chatwire::Cfg& c)
 {
     return N(c.x) + " " + N(c.y) + " " + N(c.w) + " " + N(c.h);
 }
+std::string SoundWords()
+{
+    return "everyone=" + N(g_sounds.on[chatwire::kEveryone]) + " faction=" + N(g_sounds.on[chatwire::kFaction]) + " private=" + N(g_sounds.on[chatwire::kPrivate]);
+}
 void CfgLoad(int vw, int vh)
 {
     if (g_cfgRead) return;
@@ -367,7 +397,10 @@ void CfgLoad(int vw, int vh)
     std::string text;
     chatwire::Cfg c;
     const std::string path = CfgPath();
-    if (!path.empty() && ReadSmall(path, &text) && chatwire::CfgParse(text, &c))
+    const bool read = !path.empty() && ReadSmall(path, &text);
+    chatwire::SoundsParse(read ? text : std::string(), &g_sounds);   /* on their own: a damaged place keeps them */
+    DebugLog("[CHAT] sounds " + SoundWords() + (read ? " (chat.cfg)" : " (no chat.cfg: all on)"));
+    if (read && chatwire::CfgParse(text, &c))
     {
         g_cfg = chatwire::FitRect(c, vw, vh);
         DebugLog("[CHAT] place " + PlaceWords(g_cfg) + " read opacity=" + N(g_cfg.opacity));
@@ -382,9 +415,9 @@ void CfgSave()
 {
     g_cfgDirtyMs = 0;
     const std::string path = CfgPath();
-    if (path.empty() || !WriteSmall(path, chatwire::CfgFormat(g_cfg)))
+    if (path.empty() || !WriteSmall(path, chatwire::CfgFormat(g_cfg, g_sounds)))
     { ErrorLog("[CHAT] place " + PlaceWords(g_cfg) + " NOT saved (chat.cfg could not be written)"); return; }
-    DebugLog("[CHAT] place " + PlaceWords(g_cfg) + " saved opacity=" + N(g_cfg.opacity));
+    DebugLog("[CHAT] place " + PlaceWords(g_cfg) + " saved opacity=" + N(g_cfg.opacity) + " sounds " + SoundWords());
 }
 
 /* ---- building ---- */
@@ -394,9 +427,16 @@ void DropPop(MyGUI::Gui* gui)
     if (p != 0) gui->destroyWidget(p);
     g_pop = false;
 }
+void DropOpt(MyGUI::Gui* gui)
+{
+    MyGUI::Widget* o = Find(gui, kOpt);
+    if (o != 0) gui->destroyWidget(o);
+    g_optOpen = false;
+}
 void DropAll(MyGUI::Gui* gui)
 {
     DropPop(gui);
+    DropOpt(gui);
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
     MyGUI::Widget* r = Find(gui, kRoot);
     if (r != 0)
@@ -429,6 +469,7 @@ bool BuildAll(MyGUI::Gui* gui)
        the slider's, a press on the header's empty part or the title is the drag */
     MyGUI::Widget* opL   = Mk(head, "TextBox", "Kenshi_TextboxPaintedText", 0, 0, 90, kCtlH, kOpLbl);
     MyGUI::Widget* opB   = Mk(head, "ScrollBar", "Kenshi_ScrollBar", 0, 0, 100, kCtlH, kOpBar);
+    MyGUI::Widget* optB  = Mk(head, "Button", "Kenshi_Button1", 0, 0, 90, kCtlH, kOptBtn);
     MyGUI::Widget* grip  = Mk(root, "Widget", "PanelEmpty", 0, 0, 18, 18, kGrip);
     MyGUI::Widget* meas  = Mk(root, "TextBox", "Kenshi_TextboxStandardText", 0, 0, 10, 10, kMeasure);
     MyGUI::EditBox* e = As<MyGUI::EditBox>(edit);
@@ -436,7 +477,7 @@ bool BuildAll(MyGUI::Gui* gui)
     MyGUI::ScrollBar* sb = As<MyGUI::ScrollBar>(opB);
     if (head == 0 || As<MyGUI::TextBox>(title) == 0 || As<MyGUI::Button>(close) == 0 || sv == 0 || As<MyGUI::TextBox>(toL) == 0
         || As<MyGUI::Button>(toB) == 0 || e == 0 || As<MyGUI::TextBox>(hint) == 0 || As<MyGUI::Button>(send) == 0
-        || As<MyGUI::TextBox>(opL) == 0 || sb == 0 || grip == 0 || As<MyGUI::TextBox>(meas) == 0)
+        || As<MyGUI::TextBox>(opL) == 0 || sb == 0 || As<MyGUI::Button>(optB) == 0 || grip == 0 || As<MyGUI::TextBox>(meas) == 0)
     { DropAll(gui); return false; }
     bg->setNeedMouseFocus(false);
     Style(title, chatwire::WindowTitle(), MyGUI::Align::Left | MyGUI::Align::VCenter, Lit());
@@ -450,6 +491,10 @@ bool BuildAll(MyGUI::Gui* gui)
     As<MyGUI::Button>(send)->setCaption(MyGUI::UString(chatwire::SendWord()));
     As<MyGUI::Button>(send)->setTextColour(Lit());
     As<MyGUI::Button>(toB)->setTextColour(Lit());
+    As<MyGUI::Button>(optB)->setCaption(MyGUI::UString(chatwire::OptionsWord()));
+    As<MyGUI::Button>(optB)->setTextColour(Lit());
+    optB->eventMouseButtonClick += MyGUI::newDelegate(OnOptBtn);
+    optB->eventKeyButtonPressed += MyGUI::newDelegate(OnKey);
     sv->setVisibleHScroll(false);
     e->setEditMultiLine(false);
     e->setMaxTextLength(chatwire::kMaxChars);
@@ -503,13 +548,14 @@ void Layout(MyGUI::Gui* gui)
     MyGUI::TextBox* m = As<MyGUI::TextBox>(Find(gui, kMeasure));
     const int titleW = m != 0 ? Measure(m, chatwire::WindowTitle()) : 40;
     const int opW = m != 0 ? Measure(m, chatwire::OpacityWord()) : 70;
+    const int optW = m != 0 ? Measure(m, chatwire::OptionsWord()) : 75;
     const int toW = m != 0 && !g_shownTo.empty() ? Measure(m, g_shownTo) : 0;
     const int sendW = m != 0 ? Measure(m, chatwire::SendWord()) : 40;
     chatwire::WinLayout L;
-    chatwire::WindowLayout(W, H, titleW, opW, toW, sendW, &L);
+    chatwire::WindowLayout(W, H, titleW, opW, optW, toW, sendW, &L);
     struct Place { const char* name; chatwire::WinBox b; };
     const Place ps[] = {
-        { kHead, L.head }, { kTitle, L.title }, { kOpLbl, L.opWord }, { kOpBar, L.opBar }, { kClose, L.close },
+        { kHead, L.head }, { kTitle, L.title }, { kOpLbl, L.opWord }, { kOpBar, L.opBar }, { kOptBtn, L.opt }, { kClose, L.close },
         { kView, L.view }, { kToLbl, L.toWord }, { kToBtn, L.toBtn }, { kEdit, L.edit }, { kHint, L.hint }, { kSend, L.send },
         { kGrip, L.grip }
     };
@@ -531,7 +577,7 @@ void Layout(MyGUI::Gui* gui)
         const std::string r = "x=" + N(c.left) + " y=" + N(c.top) + " w=" + N(c.width) + " h=" + N(c.height);
         if (r != g_rectShown) { g_rectShown = r; DebugLog("[UI] rect chat " + r); }
         const std::string parts = "slider x=" + N(L.opBar.x) + " w=" + N(L.opBar.w) + " edit x=" + N(L.edit.x) + " w=" + N(L.edit.w)
-                                + " to w=" + N(L.toBtn.w) + " send w=" + N(L.send.w);
+                                + " to w=" + N(L.toBtn.w) + " send w=" + N(L.send.w) + " options x=" + N(L.opt.x) + " w=" + N(L.opt.w);
         if (parts != g_partsShown) { g_partsShown = parts; DebugLog("[UI] rect chat parts " + parts); }
     }
 }
@@ -799,6 +845,82 @@ void OpenPop(MyGUI::Gui* gui, long long now)
     if (im != 0) im->setKeyFocusWidget(se);
 }
 
+/* ---- CHAT OPTIONS (owner 870): Kenshi_WindowC with a capitals title; per row the label (Kenshi_GenericTextBoxFlat) at the left
+   and a Kenshi_TickBoxSkin tick box (35 x 33, selected = on) at the right; CLOSE (Kenshi_Button1) bottom-right. Centred over the
+   chat window, kept on screen. The tick boxes only count clicks (OnTick0..2); the tick flips the switches and shows them. ---- */
+const int kTickW = 35, kTickH = 33, kOptRowH = 40;
+bool OpenOpt(MyGUI::Gui* gui)
+{
+    DropOpt(gui);
+    MyGUI::TextBox* m = As<MyGUI::TextBox>(Find(gui, kMeasure));
+    int labelW = 0;
+    for (int k = 0; k < chatwire::kSoundKinds; ++k)
+    {
+        const int w = m != 0 ? Measure(m, chatwire::SoundLabel(k)) : 260;
+        if (w > labelW) labelW = w;
+    }
+    const int closeW = Clamp((m != 0 ? Measure(m, chatwire::CloseWord()) : 50) + 40, 100, 200);
+    const int W = Clamp(labelW + kTickW + 64, 360, 640);
+    MyGUI::Widget* raw = MkRootT(gui, "Window", "Kenshi_WindowC", MyGUI::IntCoord(g_cfg.x, g_cfg.y, W, 240), kOpt);
+    MyGUI::Window* win = As<MyGUI::Window>(raw);
+    MyGUI::Widget* cl = win != 0 ? win->getClientWidget() : 0;
+    if (cl == 0) { if (raw != 0) gui->destroyWidget(raw); return false; }
+    win->setMovable(false);
+    win->setCaption(MyGUI::UString(chatwire::OptionsTitle()));
+    /* the window as tall as its frame and the rows, over the middle of the chat window, wholly on screen */
+    const int clientH = kPad + chatwire::kSoundKinds * kOptRowH + kPad + kCtlH + kPad;
+    const int H = clientH + (raw->getHeight() - cl->getHeight());
+    const int x = Clamp(g_cfg.x + (g_cfg.w - W) / 2, 0, g_vw > W ? g_vw - W : 0);
+    const int y = Clamp(g_cfg.y + (g_cfg.h - H) / 2, 0, g_vh > H ? g_vh - H : 0);
+    raw->setCoord(MyGUI::IntCoord(x, y, W, H));
+    const int cw = cl->getWidth(), ch = cl->getHeight();
+    typedef void (*TickFn)(MyGUI::Widget*);
+    static const TickFn kTickFns[3] = { OnTick0, OnTick1, OnTick2 };
+    for (int k = 0; k < chatwire::kSoundKinds; ++k)
+    {
+        const int top = kPad + k * kOptRowH;
+        MyGUI::Widget* lbl = Mk(cl, "TextBox", "Kenshi_GenericTextBoxFlat", 12, top, cw - 12 - kTickW - 24, kTickH, kOptLbl[k]);
+        MyGUI::Button* tick = As<MyGUI::Button>(Mk(cl, "Button", "Kenshi_TickBoxSkin", cw - 12 - kTickW, top, kTickW, kTickH, kOptTick[k]));
+        if (As<MyGUI::TextBox>(lbl) == 0 || tick == 0) { gui->destroyWidget(raw); return false; }
+        Style(lbl, chatwire::SoundLabel(k), MyGUI::Align::Left | MyGUI::Align::VCenter, Lit());
+        lbl->setNeedMouseFocus(false);
+        tick->setStateSelected(g_sounds.on[k] != 0);
+        tick->eventMouseButtonClick += MyGUI::newDelegate(kTickFns[k]);
+        tick->eventKeyButtonPressed += MyGUI::newDelegate(OnKey);
+    }
+    MyGUI::Button* close = As<MyGUI::Button>(Mk(cl, "Button", "Kenshi_Button1", cw - 12 - closeW, ch - kPad - kCtlH, closeW, kCtlH, kOptClose));
+    if (close == 0) { gui->destroyWidget(raw); return false; }
+    close->setCaption(MyGUI::UString(chatwire::CloseWord()));
+    close->setTextColour(Lit());
+    close->eventMouseButtonClick += MyGUI::newDelegate(OnOptClose);
+    close->eventKeyButtonPressed += MyGUI::newDelegate(OnKey);
+    g_optOpen = true;
+    const MyGUI::IntCoord c = raw->getAbsoluteCoord();
+    DebugLog("[UI] rect chat options x=" + N(c.left) + " y=" + N(c.top) + " w=" + N(c.width) + " h=" + N(c.height) + " client h=" + N(ch));
+    return true;
+}
+/* the clicks on the tick boxes since the last tick: an odd count flips that kind's switch (saved about a second later), and the
+   boxes show the switches */
+void OptTick(MyGUI::Gui* gui, long long now)
+{
+    bool changed = false;
+    for (int k = 0; k < chatwire::kSoundKinds; ++k)
+    {
+        const LONG n = ::InterlockedExchange(&g_tickFlip[k], 0);
+        if (!g_optOpen || (n & 1) == 0) continue;
+        g_sounds.on[k] = g_sounds.on[k] != 0 ? 0 : 1;
+        changed = true;
+    }
+    if (changed) { g_cfgDirtyMs = now; DebugLog("[CHAT] sounds " + SoundWords() + " (options)"); }
+    if (!g_optOpen) return;
+    if (Find(gui, kOpt) == 0) { g_optOpen = false; return; }
+    for (int k = 0; k < chatwire::kSoundKinds; ++k)
+    {
+        MyGUI::Button* b = As<MyGUI::Button>(Find(gui, kOptTick[k]));
+        if (b != 0 && b->getStateSelected() != (g_sounds.on[k] != 0)) b->setStateSelected(g_sounds.on[k] != 0);
+    }
+}
+
 /* ---- opening, closing, sending ---- */
 void FocusEdit(MyGUI::Gui* gui)
 {
@@ -828,6 +950,7 @@ void Close(MyGUI::Gui* gui, const char* why, bool clearText)
 {
     g_enterOpenHeld = false;
     DropPop(gui);
+    DropOpt(gui);
     if (clearText) { MyGUI::EditBox* e = As<MyGUI::EditBox>(Find(gui, kEdit)); if (e != 0) e->setCaption(MyGUI::UString("")); }
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
     MyGUI::Widget* r = Find(gui, kRoot);
@@ -1001,7 +1124,9 @@ void JoinTick(long long now)
 void TakeDown(MyGUI::Gui* gui, const char* why)
 {
     const bool had = g_st != kStNone || !g_ring.lines.empty();
+    if (g_cfgDirtyMs != 0) CfgSave();   /* a change of the last second (opacity, a sound switch) is not lost with the world */
     if (gui != 0) DropAll(gui);
+    g_optOpen = false;
     g_ring.Clear(); g_in.clear(); g_needSeed = true; g_words.clear(); g_inRate.clear();
     g_to = chatwire::kToEveryone; g_lastSlot = -1;   /* the last player messaged is not kept past the session */
     g_st = kStNone; g_pop = false;
@@ -1054,7 +1179,9 @@ std::string StateLine(MyGUI::Gui* gui, long long now)
     const int shown = gui != 0 ? FadeTick(gui, now, true) : 0;
     return "[CHAT] state to=" + ToLog(g_to) + " open=" + N(g_st == kStOpen ? 1 : 0) + " lines=" + N((long long)g_ring.lines.size())
          + " opacity=" + N(g_cfg.opacity) + " shown=" + N(shown) + " place=" + PlaceWords(g_cfg) + " last=" + N(g_lastSlot)
-         + " in-dropped=" + N(g_dropBad + g_dropNotMate + g_dropNotMine + g_dropFast);
+         + " in-dropped=" + N(g_dropBad + g_dropNotMate + g_dropNotMine + g_dropFast)
+         + " options=" + N(g_optOpen ? 1 : 0) + " sounds " + SoundWords() + " sound-played=" + N(g_soundPlayed[0]) + "/" + N(g_soundPlayed[1])
+         + "/" + N(g_soundPlayed[2]) + " sound-quiet=" + N(g_soundQuiet) + " sound-refused=" + N(g_soundRefused);
 }
 
 void TickBody()
@@ -1089,6 +1216,14 @@ void TickBody()
         for (int i = 0; i < tabs && i < 8; ++i) g_to = chatwire::TabNext(g_to, g_lastSlot);
         if (tabs > 0) DebugLog("[CHAT] to=" + ToLog(g_to) + " (tab)");
         if (act == kActToList) { if (g_pop) DropPop(gui); else OpenPop(gui, now); }
+        else if (act == kActOptions)
+        {
+            if (g_optOpen) { DropOpt(gui); DebugLog("[CHAT] options closed (OPTIONS)"); }
+            else if (OpenOpt(gui)) DebugLog("[CHAT] options opened");
+            else ErrorLog("[CHAT] the options window could not be built (a Kenshi skin was not made)");
+            FocusEdit(gui);
+        }
+        else if (act == kActOptClose) { DropOpt(gui); FocusEdit(gui); DebugLog("[CHAT] options closed (close)"); }
         else if (act == kActSearchPick) PickFirst(gui, now);
         else if (act == kActSend) SendFromBox(gui, now);
         else if (act == kActAccept)
@@ -1102,7 +1237,13 @@ void TickBody()
             else SendFromBox(gui, now);
         }
         else if (act == kActClose) Close(gui, "close", true);
-        if (esc && g_st == kStOpen) { if (g_pop) { DropPop(gui); FocusEdit(gui); } else { Close(gui, "esc", true); EscHoldStart(); } }
+        if (esc && g_st == kStOpen)
+        {
+            if (g_pop) { DropPop(gui); FocusEdit(gui); }
+            else if (g_optOpen) { DropOpt(gui); FocusEdit(gui); DebugLog("[CHAT] options closed (esc)"); }
+            else { Close(gui, "esc", true); EscHoldStart(); }
+        }
+        OptTick(gui, now);
     }
     if (g_st == kStNone && !g_ring.lines.empty() && !EnsureBuilt(gui)) return;
     if (g_st == kStNone) return;
@@ -1154,11 +1295,11 @@ bool FillSample(MyGUI::Gui* gui, int k)
 /* the most words each command has: a command with more is refused, so no free text rides in on one */
 size_t MaxWords(const std::string& v)
 {
-    if (v == "open" || v == "click" || v == "opacity") return 2;
+    if (v == "open" || v == "click" || v == "opacity" || v == "tick") return 2;
     if (v == "send") return 4;
     if (v == "fill" || v == "tolist") return 3;
     if (v == "move") return 5;
-    return 1;   /* state, tab, esc, close, and a verb the lever does not have */
+    return 1;   /* state, tab, esc, close, options, and a verb the lever does not have */
 }
 __declspec(noinline) void CmdInner()
 {
@@ -1261,7 +1402,27 @@ __declspec(noinline) void CmdInner()
         return;
     }
     if (verb == "close") { Close(gui, "lever", true); g_cmdResult = "ok chat close"; return; }
-    g_cmdResult = "error chat usage: open|send|fill|tolist|tab|click|opacity|move|esc|close|state";
+    if (verb == "options")
+    {
+        /* OPTIONS' own handler: the next tick opens (or closes) CHAT OPTIONS, as a click would */
+        MyGUI::Widget* b = Find(gui, kOptBtn);
+        if (b == 0) { g_cmdResult = "error chat options not-built"; return; }
+        b->eventMouseButtonClick(b);
+        g_cmdResult = "ok chat options";
+        return;
+    }
+    if (verb == "tick")
+    {
+        /* a tick box's own handler (1 EVERYONE, 2 MY FACTION, 3 private): the next tick flips that switch, as a click would */
+        const int k = atoi(Arg(1).c_str());
+        if (k < 1 || k > chatwire::kSoundKinds) { g_cmdResult = "error chat usage: tick <1-3>"; return; }
+        MyGUI::Widget* t = g_optOpen ? Find(gui, kOptTick[k - 1]) : 0;
+        if (t == 0) { g_cmdResult = "error chat tick: the options window is not open"; return; }
+        t->eventMouseButtonClick(t);
+        g_cmdResult = "ok chat tick " + N(k);
+        return;
+    }
+    g_cmdResult = "error chat usage: open|send|fill|tolist|tab|click|opacity|move|esc|close|options|tick|state";
 }
 __declspec(noinline) void CmdCatching() { try { CmdInner(); } catch (...) { g_cmdResult = "error chat threw"; } }
 /* a C++ throw out of the frame work: counted (ChatTick turns the chat off at the third), one log line at most every 5 s */
@@ -1321,6 +1482,70 @@ void Latch(const char* where)
     g_downWhy = "the chat was turned off after a fault";
     TakeDownGuarded();
 }
+/* ---- the message sound: AK::SoundEngine::PostEvent(const char* event, AkGameObjectID object, AkUInt32 flags, AkCallbackFunc,
+   void* cookie, AkUInt32 externals, AkExternalSourceInfo*, AkPlayingID) - the game's own export, bound through the table row
+   SoundPostEvent. Every interface click the game plays is this call with object 0x6E and the rest 0 (1.0.65 0x720E01..0x720E12
+   for Prospect_Click; 71 such calls post General_Click). Returns the playing id, 0 when the engine refused the event. ---- */
+unsigned long long kSoundPostEventRva = 0; AddrReg kSoundPostEventRva_reg("SoundPostEvent", &kSoundPostEventRva);
+typedef unsigned long (*PostEventFn)(const char*, unsigned long long, unsigned long, void*, void*, unsigned long, void*, unsigned long);
+const unsigned long long kUiSoundObject = 0x6E;
+/* the SEH frame: no local object with a destructor */
+int PostEventGuarded(PostEventFn fn, const char* ev, unsigned long* id)
+{
+    __try { *id = fn(ev, kUiSoundObject, 0, 0, 0, 0, 0, 0); }
+    __except (Filter(GetExceptionCode())) { return 1; }
+    return 0;
+}
+/* T-546: AK::SoundEngine::SetSwitch(const char* group, const char* state, AkGameObjectID object) - the game's own export by name
+   (1.0.65 0xA82010, ?SetSwitch@SoundEngine@AK@@YA?AW4AKRESULT@@PEBD0_K@Z), bound through the table row SoundSetSwitch. The game
+   plays its notification sounds with two calls (1.0.65 FUN_140257cc0, called by Research::setResearched for its research-complete
+   sound): SetSwitch("Notifications", state, 0x6E) then PostEvent("Notifications", 0x6E, 0...). The state (e.g. "Thing_Complete")
+   is a STATE of the switch group "Notifications", not an event: posted alone it is refused (run T1314). Returns an AKRESULT,
+   1 = AK_Success (the export returns 15 when either name is unknown). */
+unsigned long long kSoundSetSwitchRva = 0; AddrReg kSoundSetSwitchRva_reg("SoundSetSwitch", &kSoundSetSwitchRva);
+typedef unsigned long (*SetSwitchFn)(const char*, const char*, unsigned long long);
+const char* const kNotificationEvent = "Notifications";   /* the switch group AND the event the game posts after setting it */
+/* the SEH frame: no local object with a destructor */
+int SetSwitchGuarded(SetSwitchFn fn, const char* group, const char* state, unsigned long* res)
+{
+    __try { *res = fn(group, state, kUiSoundObject); }
+    __except (Filter(GetExceptionCode())) { return 1; }
+    return 0;
+}
+/* a received message of `kind` was kept: its sound, when chatwire::SoundToPlay says so. Counts only in the log, at most one line
+   every 5 seconds (no rate limit on the sound itself). A fault turns the message sounds off for the rest of the process. */
+void PlayMessageSound(int kind, long long now)
+{
+    /* no sound before the world runs and the player's sound switches are read (CfgLoad on the first in-game frame): the line is not
+       shown then (TakeDown), and the switches are not known yet (review T-815 #1) */
+    if (!g_cfgRead || !GameplayRunning()) { ++g_soundQuiet; return; }
+    const char* ev = chatwire::SoundToPlay(g_sounds, kind, g_st == kStOpen);
+    if (ev == 0) { ++g_soundQuiet; return; }
+    if (::InterlockedCompareExchange(&g_soundOff, 0, 0) != 0) return;
+    const unsigned long long at = AddrOk() != 0 ? AddrAbs(kSoundPostEventRva) : 0ull;
+    if (at == 0)
+    {
+        if (!g_soundNoAddrSaid) { g_soundNoAddrSaid = true; ErrorLog("[CHAT] no message sound: the address table has no usable SoundPostEvent row"); }
+        return;
+    }
+    unsigned long id = 0;
+    if (PostEventGuarded((PostEventFn)at, ev, &id) != 0)
+    {
+        ::InterlockedExchange(&g_soundOff, 1);
+        char b[200];
+        _snprintf(b, 199, "[CHAT] the message sound call faulted (code 0x%08lX) - message sounds are OFF for the rest of this process", (unsigned long)(LONG)g_lastCode);
+        b[199] = 0;
+        ErrorLog(b);
+        return;
+    }
+    if (id == 0) ++g_soundRefused; else ++g_soundPlayed[kind];
+    if (g_soundLogMs != 0 && now - g_soundLogMs < 5000) return;
+    g_soundLogMs = now;
+    DebugLog(std::string("[CHAT] sound ") + KindLog(kind) + (id == 0 ? " refused by the sound engine" : " played") + " - so far played everyone "
+             + N(g_soundPlayed[0]) + ", faction " + N(g_soundPlayed[1]) + ", private " + N(g_soundPlayed[2]) + "; refused " + N(g_soundRefused)
+             + "; quiet (switch off or window open) " + N(g_soundQuiet));
+}
+
 /* the third C++ throw out of the frame work: the chat goes for the rest of the process, as after a memory fault */
 void LatchThrows()
 {
@@ -1381,6 +1606,7 @@ void ChatLiveIn(int originSlot, const void* p, unsigned n)
         e.kind = kind; e.dir = chatwire::kIn; e.slot = originSlot; e.text = text;   /* the name is found by the tick */
         Push(e, now);
         DebugLog(std::string("[CHAT] in ") + KindLog(kind) + " from slot " + N(originSlot) + " chars=" + N((long long)chatwire::Utf8Chars(text)));
+        PlayMessageSound(kind, now);
     }
     catch (...) { DebugLog("[CHAT] a C++ exception reading a chat message; it is dropped"); }
 }
@@ -1389,6 +1615,65 @@ void ChatOpenTo(int slot)
 {
     ::InterlockedExchange(&g_openSlot, (LONG)slot);
     ::InterlockedExchange(&g_openReq, 1);
+}
+/* T-810: a money line, kept as a join line is (the name in it clickable when the sentence starts with it) */
+void ChatMoneyLine(int slot, const std::string& name, const std::string& sentence)
+{
+    PushGrey(chatwire::kLineMoney, slot, name, sentence, NowMs());
+    DebugLog("[CHAT] money line kept (slot " + N(slot) + ")");
+}
+/* T-546: an interface sound by event name on the message sounds' road (PostEventGuarded, kUiSoundObject, g_soundOff) */
+int ChatPlayUiEvent(const char* ev)
+{
+    if (ev == 0 || !GameplayRunning()) return -1;
+    if (::InterlockedCompareExchange(&g_soundOff, 0, 0) != 0) return -2;
+    const unsigned long long at = AddrOk() != 0 ? AddrAbs(kSoundPostEventRva) : 0ull;
+    if (at == 0) return -3;
+    unsigned long id = 0;
+    if (PostEventGuarded((PostEventFn)at, ev, &id) != 0)
+    {
+        ::InterlockedExchange(&g_soundOff, 1);
+        char b[240];
+        _snprintf(b, 239, "[CHAT] the interface sound call (%.40s) faulted (code 0x%08lX) - message and interface sounds are OFF for the rest of this process", ev, (unsigned long)(LONG)g_lastCode);
+        b[239] = 0;
+        ErrorLog(b);
+        return -2;
+    }
+    return id == 0 ? 0 : 1;
+}
+/* T-546: one of the game's notification sounds by its "Notifications" switch state, exactly as the game plays it (FUN_140257cc0):
+   SetSwitch("Notifications", state, 0x6E) then PostEvent("Notifications"). Same gates and fault latch as ChatPlayUiEvent. */
+int ChatPlayNotification(const char* state, unsigned long* switchResult)
+{
+    if (switchResult != 0) *switchResult = 0;
+    if (state == 0 || !GameplayRunning()) return -1;
+    if (::InterlockedCompareExchange(&g_soundOff, 0, 0) != 0) return -2;
+    const unsigned long long sw = AddrOk() != 0 ? AddrAbs(kSoundSetSwitchRva) : 0ull;
+    const unsigned long long at = AddrOk() != 0 ? AddrAbs(kSoundPostEventRva) : 0ull;
+    if (sw == 0 || at == 0) return -3;
+    unsigned long res = 0;
+    if (SetSwitchGuarded((SetSwitchFn)sw, kNotificationEvent, state, &res) != 0)
+    {
+        ::InterlockedExchange(&g_soundOff, 1);
+        char b[240];
+        _snprintf(b, 239, "[CHAT] the sound switch call (Notifications/%.40s) faulted (code 0x%08lX) - message and interface sounds are OFF for the rest of this process", state, (unsigned long)(LONG)g_lastCode);
+        b[239] = 0;
+        ErrorLog(b);
+        return -2;
+    }
+    if (switchResult != 0) *switchResult = res;
+    if (res != 1) return -4;
+    unsigned long id = 0;
+    if (PostEventGuarded((PostEventFn)at, kNotificationEvent, &id) != 0)
+    {
+        ::InterlockedExchange(&g_soundOff, 1);
+        char b[240];
+        _snprintf(b, 239, "[CHAT] the interface sound call (Notifications/%.40s) faulted (code 0x%08lX) - message and interface sounds are OFF for the rest of this process", state, (unsigned long)(LONG)g_lastCode);
+        b[239] = 0;
+        ErrorLog(b);
+        return -2;
+    }
+    return id == 0 ? 0 : 1;
 }
 
 std::string ChatCommand(const std::string& args)

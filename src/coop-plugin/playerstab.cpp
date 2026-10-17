@@ -28,6 +28,8 @@
 #include "store.h"
 #include "team.h"   /* T-546 step 4: TeamSameAnyThread - towards a teammate only ALLY */
 #include "chat.h"   /* MESSAGE opens the chat with TO set to the selected player */
+#include "money.h"   /* T-810: GIVE MONEY - money.cpp takes SEND from the box */
+#include "../common/moneywire.h"   /* T-810: GIVE MONEY's words */
 #include "../common/chatwire.h"   /* MESSAGE's word */
 #include "../common/teamscreens.h"   /* the faction screens: the bottom line's actions, the boxes' words */
 #include "soak.h"
@@ -79,7 +81,12 @@ const char* const kLineName   = "SWPlayersStanceLine";
 const char* const kSelectName = "SWPlayersSelectLine";
 const char* const kBtnName[3] = { "SWPlayersAllyBtn", "SWPlayersNeutralBtn", "SWPlayersHostileBtn" };
 const char* const kActName[2] = { "SWPlayersLeftActBtn", "SWPlayersRightActBtn" };   /* the bottom line's action buttons */
+const char* const kNoteName   = "SWPlayersRightNote";   /* the words in the right-hand button's place (why a player cannot be invited) */
 const char* const kMsgName = "SWPlayersMessageBtn";   /* MESSAGE: the chat with TO set to the selected player */
+const char* const kGiveName = "SWPlayersGiveMoneyBtn";   /* T-810 GIVE MONEY: the GIVE MONEY box for the selected player */
+const char* const kBoxAmount = "SWGiveMoneyAmount";   /* the GIVE MONEY box's typing box and its hint line */
+const char* const kBoxHint = "SWGiveMoneyHint";
+const int kBoxGiveMoney = 1000;   /* the GIVE MONEY box: this module's own box kind, beside teamscreen::kBox* */
 /* the one box this module shows at a time: SET HOSTILE, FACTION INVITATION, LEAVE / REMOVE FROM / DISBAND FACTION, FACTION */
 const char* const kBoxName    = "SWFactionBox";
 const char* const kBoxText    = "SWFactionBoxText";
@@ -111,13 +118,19 @@ unsigned g_boxSerial = 0;            /* the invitation the FACTION INVITATION bo
 std::string g_boxTeam, g_boxWho, g_boxText;   /* the faction and the player the box names, and its words */
 /* the bottom line's two action buttons (left, right), the action each shows (teamscreen::kAct*), and the view last applied */
 MyGUI::Button* g_act[2] = { 0, 0 };
+MyGUI::TextBox* g_note = 0;
 int g_actShown[2] = { 0, 0 };
 MyGUI::Button* g_msg = 0;            /* MESSAGE, at the right end of the text line */
 int g_msgShown = -1;
+MyGUI::Button* g_give = 0;           /* T-810 GIVE MONEY, just left of MESSAGE */
+int g_giveShown = -1;
+MyGUI::EditBox* g_boxAmount = 0;     /* the GIVE MONEY box's amount and hint line, while that box is up */
+MyGUI::TextBox* g_boxHint = 0;
+long long g_givePressed = 0, g_giveSent = 0, g_giveRefused = 0;
 std::string g_shownView;
 teamscreen::View g_view;
 bool g_viewSelected = false;
-std::vector<std::string> g_awayOwed; /* FACTION boxes owed (a removal while away), by the faction's name */
+std::vector<std::pair<int, std::string> > g_awayOwed; /* FACTION boxes owed (a removal or a disband while away): the box, the faction's name */
 unsigned long g_inviteNameSaid = 0;  /* the invitation whose box waits for the inviter's name - said once */
 unsigned long g_inviteOtherSaid = 0; /* the invitation whose box waits for another box that blocks the game - said once */
 unsigned long g_boxTryMs = 0;        /* the last box that came by itself and could not be opened: tried again a second later */
@@ -190,7 +203,11 @@ public:
         if (g_select != 0 && Inside(g_select, w)) g_select = 0;
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0 && Inside(g_btn[k], w)) g_btn[k] = 0;
         for (int k = 0; k < 2; ++k) if (g_act[k] != 0 && Inside(g_act[k], w)) g_act[k] = 0;
+        if (g_note != 0 && Inside(g_note, w)) g_note = 0;
         if (g_msg != 0 && Inside(g_msg, w)) g_msg = 0;
+        if (g_give != 0 && Inside(g_give, w)) g_give = 0;
+        if (g_boxAmount != 0 && Inside(g_boxAmount, w)) g_boxAmount = 0;
+        if (g_boxHint != 0 && Inside(g_boxHint, w)) g_boxHint = 0;
     }
 };
 /* registered once, before our first widget is made; without it no tab is added. The listener is made once on the heap and
@@ -204,7 +221,7 @@ bool UnlinkerOn()
     g_unlinkerOn = true;
     return true;
 }
-bool PageWhole() { return g_list != 0 && g_line != 0 && g_select != 0 && g_btn[0] != 0 && g_btn[1] != 0 && g_btn[2] != 0 && g_act[0] != 0 && g_act[1] != 0; }
+bool PageWhole() { return g_list != 0 && g_line != 0 && g_select != 0 && g_btn[0] != 0 && g_btn[1] != 0 && g_btn[2] != 0 && g_act[0] != 0 && g_act[1] != 0 && g_note != 0; }
 
 /* the management window's tab control, or 0 while the window has not been built (it is built the first time it opens) */
 MyGUI::TabControl* FindTabs()
@@ -357,9 +374,10 @@ MyGUI::Colour Lit() { return MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f); }   /*
 bool Reachable(MyGUI::Widget* w) { return w != 0 && w->getEnabled() && Shown(w); }
 void ForgetTab()
 {
-    g_act[0] = g_act[1] = 0; g_actShown[0] = g_actShown[1] = 0; g_shownView.clear(); g_view = teamscreen::View(); g_viewSelected = false;
+    g_act[0] = g_act[1] = 0; g_note = 0; g_actShown[0] = g_actShown[1] = 0; g_shownView.clear(); g_view = teamscreen::View(); g_viewSelected = false;
     g_tabs = 0; g_item = 0; g_list = 0; g_line = 0; g_select = 0; g_btn[0] = g_btn[1] = g_btn[2] = 0;
     g_msg = 0; g_msgShown = -1;
+    g_give = 0; g_giveShown = -1;
     g_rows.clear(); g_selSlot = -1; g_shownLine.clear(); g_shownSelect.clear(); g_shownTicked = -2; g_shownSelected = -1; g_shownLocked = -1; g_rowsEpoch = -1;
 }
 
@@ -370,6 +388,7 @@ void OnBoxCancel(MyGUI::Widget* w);
 void OnBoxConfirm(MyGUI::Widget* w);
 void OnActClicked(MyGUI::Widget* w);
 void OnMessageClicked(MyGUI::Widget* w);
+void OnGiveClicked(MyGUI::Widget* w);
 
 /* THE PAGE (mock-up A4.2): the table (Kenshi's own Kenshi_MultiListBox, as the Load Game list) over the tab's height, the
    stance line (painted text, the window's label face) and the three tick buttons (Kenshi_TickButton1) along the bottom. Sizes
@@ -439,8 +458,19 @@ bool BuildPage(MyGUI::TabItem* item)
         a->eventMouseButtonClick += MyGUI::newDelegate(OnActClicked);
         a->setVisible(false);
     }
+    /* in the right-hand button's place, when the selected player cannot be invited: why, in the select line's face, right-aligned */
+    {
+        MyGUI::Widget* nw = Mk(item, "TextBox", "Kenshi_TextboxStandardText", W - actW - gap, btnY, actW, btnH, MyGUI::Align::Right | MyGUI::Align::Bottom, kNoteName);
+        MyGUI::TextBox* n = nw != 0 ? nw->castType<MyGUI::TextBox>(false) : 0;
+        if (n == 0) return false;
+        g_note = n;
+        n->setTextAlign(MyGUI::Align::Right | MyGUI::Align::VCenter);
+        n->setTextColour(Lit());
+        n->setCaption(MyGUI::UString(""));
+        n->setVisible(false);
+    }
     /* MESSAGE: at the right end of the text line above the buttons, the same place for every selected player (the bottom row is
-       full when the stance buttons show); the line's text ends a gap before it. The same style as the action buttons. */
+       full when the stance buttons show); GIVE MONEY sits just left of it and the line's text ends a gap before that. The same style as the action buttons. */
     {
         const int msgW = Clamp(W * 14 / 100, 100, 200);
         const int msgX = W - gap - msgW;
@@ -458,6 +488,24 @@ bool BuildPage(MyGUI::TabItem* item)
         lt->setCoord(MyGUI::IntCoord(lc.left, lc.top, lineW > 1 ? lineW : 1, lc.height));
         DebugLog("[UI] rect playerstab message x=" + S(msgX) + " y=" + S(msgY) + " w=" + S(msgW) + " h=" + S(btnH) + " on the text line (its text x="
                  + S(lc.left) + " w=" + S(lineW) + "; clear of the bottom buttons: " + (msgY + btnH <= btnY ? "yes" : "NO") + ")");
+    }
+    /* T-810 GIVE MONEY: just left of MESSAGE on the text line, the same size and style; the line's text now ends a gap before it */
+    {
+        const int giveW = Clamp(W * 14 / 100, 100, 200);
+        const int giveX = W - gap - giveW - gap - giveW;
+        const int giveY = lineY + (lineH - btnH) / 2;
+        MyGUI::Widget* gw = Mk(item, "Button", "Kenshi_Button2", giveX, giveY, giveW, btnH, MyGUI::Align::Right | MyGUI::Align::Bottom, kGiveName);
+        MyGUI::Button* g = gw != 0 ? gw->castType<MyGUI::Button>(false) : 0;
+        if (g == 0) return false;
+        g_give = g; g_giveShown = -1;
+        g->setTextColour(Lit());
+        g->setCaption(MyGUI::UString(moneyw::GiveWord()));
+        g->eventMouseButtonClick += MyGUI::newDelegate(OnGiveClicked);
+        g->setVisible(false);
+        const MyGUI::IntCoord lc = lt->getCoord();
+        const int lineW = giveX - gap - lc.left;
+        lt->setCoord(MyGUI::IntCoord(lc.left, lc.top, lineW > 1 ? lineW : 1, lc.height));
+        DebugLog("[UI] rect playerstab give money x=" + S(giveX) + " y=" + S(giveY) + " w=" + S(giveW) + " h=" + S(btnH) + " left of MESSAGE (the line's text now w=" + S(lineW) + ")");
     }
     DebugLog("[UI] rect playerstab actions w=" + S(actW) + " h=" + S(btnH) + " left x=" + S(gap) + " right x=" + S(W - actW - gap) + " y=" + S(btnY)
              + " stance buttons x=" + S(gap) + ".." + S(gap + 3 * btnW + 2 * gap) + " (clear of the right-hand button: " + (gap + 3 * btnW + 2 * gap <= W - actW - gap ? "yes" : "NO") + ")");
@@ -572,7 +620,7 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
     if (lt == 0 || st == 0) return;
     const teamscreen::View v = ViewNow(rows, g_selSlot);
     const std::string line = v.lineKind == teamscreen::kLineStance ? b.line : v.line;
-    const std::string sig = std::string(b.selected ? "1|" : "0|") + line + "|" + (v.stance ? "1" : "0") + "|" + Num(v.left) + "|" + Num(v.right);
+    const std::string sig = std::string(b.selected ? "1|" : "0|") + line + "|" + (v.stance ? "1" : "0") + "|" + Num(v.left) + "|" + Num(v.right) + "|" + v.note;
     g_view = v; g_view.line = line; g_viewSelected = b.selected;
     if (sig != g_shownView)
     {
@@ -589,10 +637,17 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
             g_act[k]->setCaption(MyGUI::UString(teamscreen::ActionCaption(acts[k])));
             g_act[k]->setVisible(acts[k] != teamscreen::kActNone);
         }
+        if (g_note != 0)
+        {
+            g_note->setCaption(MyGUI::UString(v.note.c_str()));
+            g_note->setVisible(b.selected && v.right == teamscreen::kActNone && !v.note.empty());
+        }
         DebugLog("[PLAYERS] bottom line: '" + (b.selected ? line : std::string(playerstab::kSelectLine)) + "' stance buttons " + (b.selected && v.stance ? "shown" : "hidden")
-                 + ", left '" + teamscreen::ActionCaption(v.left) + "', right '" + teamscreen::ActionCaption(v.right) + "' (selected slot " + S(g_selSlot) + ", role " + S(g_ctx.role) + ")");
+                 + ", left '" + teamscreen::ActionCaption(v.left) + "', right '" + teamscreen::ActionCaption(v.right) + "'" + (v.note.empty() ? std::string() : ", right words '" + v.note + "'")
+                 + " (selected slot " + S(g_selSlot) + ", role " + S(g_ctx.role) + ")");
     }
     if (g_msg != 0 && (b.selected ? 1 : 0) != g_msgShown) { g_msgShown = b.selected ? 1 : 0; g_msg->setVisible(b.selected); }   /* MESSAGE: while a player is selected */
+    if (g_give != 0 && (b.selected ? 1 : 0) != g_giveShown) { g_giveShown = b.selected ? 1 : 0; g_give->setVisible(b.selected); }   /* T-810 GIVE MONEY: beside MESSAGE, while a player is selected */
     if (b.ticked != g_shownTicked)
     {
         g_shownTicked = b.ticked;
@@ -655,7 +710,7 @@ void Refresh()
 bool OpenBox(int kind, int slot, const std::string& team, const std::string& who, unsigned serial);
 void DropBox();
 /* the boxes that come by themselves: the invitation's box while an invitation waits unanswered (taken down when it is answered,
-   ends or a newer one replaces it), and a FACTION box owed for a removal while away - one box at a time */
+   ends or a newer one replaces it), and a FACTION box owed for a removal or a disband while away - one box at a time */
 void BoxesTick()
 {
     int from = -1; std::string team; unsigned serial = 0;
@@ -673,11 +728,12 @@ void BoxesTick()
     const bool otherUp = im != 0 && im->isModalAny();   /* the mod's other boxes, the game's own quit box: a box that comes by itself waits */
     if (!g_awayOwed.empty())
     {
-        const std::string t = g_awayOwed.front();
-        if (teamscreen::BoxText(teamscreen::kBoxAway, t, std::string()).empty()) { g_awayOwed.erase(g_awayOwed.begin()); DebugLog("[PLAYERS] FACTION box owed with no faction name - dropped"); return; }
+        const int kind = g_awayOwed.front().first;
+        const std::string t = g_awayOwed.front().second;
+        if (teamscreen::BoxText(kind, t, std::string()).empty()) { g_awayOwed.erase(g_awayOwed.begin()); DebugLog("[PLAYERS] FACTION box owed with no faction name - dropped"); return; }
         if (otherUp) return;
-        if (OpenBox(teamscreen::kBoxAway, -1, t, std::string(), 0)) { ++g_awayBoxes; g_awayOwed.erase(g_awayOwed.begin()); }
-        else { g_boxTryMs = now | 1u; if (++g_boxRetrySaid <= 1) DebugLog("[PLAYERS] FACTION box for '" + t + "' could not be shown - tried again every second"); }
+        if (OpenBox(kind, -1, t, std::string(), 0)) { ++g_awayBoxes; g_awayOwed.erase(g_awayOwed.begin()); }
+        else { g_boxTryMs = now | 1u; if (++g_boxRetrySaid <= 1) DebugLog("[PLAYERS] FACTION box could not be shown - tried again every second"); }
         return;
     }
     if (!waiting) return;
@@ -726,7 +782,7 @@ void NameBoxTick()
     if (lock && g_nameBox->getEnabled())
     {
         g_nameBox->setEnabled(false); g_nameLocked = true; ++g_nameLocks;
-        DebugLog("[PLAYERS] FACTION NAME box locked: this player is a member of '" + team + "' (locks " + S(g_nameLocks) + ")");
+        DebugLog("[PLAYERS] FACTION NAME box locked: this player is a member of a player faction (locks " + S(g_nameLocks) + ")");
     }
     else if (!lock && g_nameLocked)
     {
@@ -801,6 +857,7 @@ void DropBox()
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     MyGUI::Widget* w = g_box;
     g_boxSlot = -1; g_box = 0; g_boxKind = 0; g_boxSerial = 0; g_boxText.clear();
+    g_boxAmount = 0; g_boxHint = 0;   /* T-810: the GIVE MONEY box's parts go with it */
     ::InterlockedExchange(&g_boxPress, 0); g_boxPressedOn = 0;
     if (gui == 0 || w == 0) return;
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
@@ -811,6 +868,70 @@ void DropBox()
         if (f != 0 && Inside(f, w)) im->resetKeyFocusWidget();   /* the keyboard focus another window holds stays */
     }
     gui->destroyWidget(w);
+}
+/* T-810: the GIVE MONEY box is this module's own kind beside teamscreen's; its words are src/common/moneywire.h's */
+std::string BoxTitleOf(int kind) { return kind == kBoxGiveMoney ? std::string(moneyw::GiveWord()) : std::string(teamscreen::BoxTitle(kind)); }
+std::string BoxLeftOf(int kind)  { return kind == kBoxGiveMoney ? std::string(moneyw::CancelWord()) : std::string(teamscreen::BoxLeft(kind)); }
+std::string BoxRightOf(int kind) { return kind == kBoxGiveMoney ? std::string(moneyw::SendWord()) : std::string(teamscreen::BoxRight(kind)); }
+/* the GIVE MONEY box's words: the approved sentence with this player's money read now, then the amount row's word on a line of
+   its own ("" = no name, or the money cannot be read: the box is not opened) */
+std::string GiveBoxText(const std::string& who)
+{
+    int have = 0;
+    if (who.empty() || coop::MoneyHave(&have) != 1) return std::string();
+    return moneyw::BoxText(who, have) + "\n" + moneyw::AmountWord();
+}
+void GiveSendBody();
+void OnAmountChanged(MyGUI::EditBox* e);
+/* the GIVE MONEY box's amount row, on the text's last line after "Amount:": the typing box (Kenshi_EditBox, digits only, at most
+   moneyw::kAmountDigitsMax of them), then "(digits only)" - the line a refused SEND replaces with why - right of it when the
+   hint's widest line fits there, else on a row of its own under it (moneyw::PlaceHint; *grow = the height the box grows by) */
+bool GiveRow(MyGUI::Widget* cl, MyGUI::EditBox* e, int W, int lineH, int roomH, int roomW, int* grow, int* widen, int* fits)
+{
+    *grow = 0; *widen = 0; *fits = 1;
+    const MyGUI::UString full = e->getCaption();
+    e->setCaption(MyGUI::UString(moneyw::AmountWord()));
+    const int wordW = e->getTextSize().width;
+    e->setCaption(full);
+    const int lh = lineH > 0 ? lineH : 18;
+    const int textH = e->getTextSize().height;
+    const MyGUI::IntCoord tc = e->getCoord();
+    const int rowY = tc.top + (textH > lh ? textH - lh : lh);
+    const int x = tc.left + e->getClientCoord().left + (wordW > 0 ? wordW : 70) + 8;
+    const int editW = Clamp(W / 5, 70, 120);
+    const int textLeft = tc.left + e->getClientCoord().left;
+    MyGUI::Widget* aw = Mk(cl, "EditBox", "Kenshi_EditBox", x, rowY - 3, editW, lh + 6, MyGUI::Align::Default, kBoxAmount);
+    MyGUI::Widget* hw = Mk(cl, "TextBox", "Kenshi_TextboxStandardText", x + editW + 8, rowY, 1, lh, MyGUI::Align::Default, kBoxHint);
+    MyGUI::EditBox* a = aw != 0 ? aw->castType<MyGUI::EditBox>(false) : 0;
+    MyGUI::TextBox* h = hw != 0 ? hw->castType<MyGUI::TextBox>(false) : 0;
+    if (a == 0 || h == 0) return false;
+    a->setMaxTextLength(moneyw::kAmountDigitsMax);
+    a->setTextColour(Lit());
+    a->setOnlyText(MyGUI::UString(""));
+    a->eventEditTextChange += MyGUI::newDelegate(OnAmountChanged);
+    h->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
+    h->setTextColour(Lit());
+    /* the hint's widest line, measured in the hint's own font as "Amount:" is measured above, places it */
+    int need = 0;
+    for (int i = 0; moneyw::HintWords(i) != 0; ++i)
+    {
+        h->setCaption(MyGUI::UString(moneyw::HintWords(i)));
+        const int tw = h->getTextSize().width;
+        if (tw > need) need = tw;
+    }
+    const bool measured = need > 0;
+    if (!measured) need = 200;   /* unread: wider than the widest line at the game's usual font */
+    const moneyw::HintFit fit = moneyw::PlaceHintFit(W, textLeft, x + editW, rowY, lh, need + 4, roomH, roomW);   /* T-810 re-check fold (finding 8): with the room the area leaves */
+    const moneyw::HintSpot spot = fit.spot;
+    h->setCoord(MyGUI::IntCoord(spot.x, spot.y, spot.w > 1 ? spot.w : 1, spot.h));
+    h->setCaption(MyGUI::UString(moneyw::DigitsHint()));
+    *grow = spot.grow; *widen = fit.widen; *fits = fit.fits;
+    g_boxAmount = a; g_boxHint = h;
+    DebugLog("[UI] rect givemoney amount x=" + S(x) + " y=" + S(rowY - 3) + " w=" + S(editW) + " h=" + S(lh + 6) + " after 'Amount:' (" + S(wordW)
+             + " px wide), hint x=" + S(spot.x) + " y=" + S(spot.y) + " w=" + S(spot.w) + (spot.below ? " on its own row under the amount box" : " right of the amount box")
+             + (fit.widen > 0 ? " (the box " + S(fit.widen) + " px wider for it)" : std::string())
+             + " (widest hint line " + (measured ? S(need) + " px" : std::string("not measured")) + ")");
+    return true;
 }
 /* THE BOXES (mock-ups A4.3 and B7.3-B7.7), as bugreport.cpp BuildBox builds the mod's message boxes: Kenshi_WindowC on the Info
    layer, titled in capitals, the words left-aligned from the top and the box fitted to the text MyGUI laid out (as the FALLEN
@@ -824,14 +945,14 @@ bool OpenBox(int kind, int slot, const std::string& team, const std::string& who
 {
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (gui == 0) return false;
-    const std::string title = teamscreen::BoxTitle(kind);
-    if (g_box != 0 && g_boxKind == teamscreen::kBoxInvite && kind != teamscreen::kBoxInvite && kind != teamscreen::kBoxAway)
+    const std::string title = BoxTitleOf(kind);
+    if (g_box != 0 && g_boxKind == teamscreen::kBoxInvite && kind != teamscreen::kBoxInvite && !teamscreen::OkOnlyBox(kind))
     {
         DebugLog("[PLAYERS] FACTION INVITATION box taken down for the " + title + " box the player asked for - it comes back while the invitation waits");
         DropBox();
     }
-    if (g_box != 0) { DebugLog("[PLAYERS] " + title + " box NOT opened: the " + teamscreen::BoxTitle(g_boxKind) + " box is up"); return false; }
-    const std::string text = teamscreen::BoxText(kind, team, who);
+    if (g_box != 0) { DebugLog("[PLAYERS] " + title + " box NOT opened: the " + BoxTitleOf(g_boxKind) + " box is up"); return false; }
+    const std::string text = kind == kBoxGiveMoney ? GiveBoxText(who) : teamscreen::BoxText(kind, team, who);
     if (text.empty()) { DebugLog("[PLAYERS] " + title + " box NOT opened: its words need a name this game does not know"); return false; }
     int vw = 1280, vh = 720;
     MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
@@ -861,7 +982,7 @@ bool OpenBox(int kind, int slot, const std::string& team, const std::string& who
     const int W = cl->getWidth(), H = cl->getHeight();
     const coopui::NoticeLayout lay = coopui::NoticeLayoutIn(H);
     const int btnW = Clamp(W / 4, 120, W / 2 - 12);
-    const std::string leftWord = teamscreen::BoxLeft(kind), rightWord = teamscreen::BoxRight(kind);
+    const std::string leftWord = BoxLeftOf(kind), rightWord = BoxRightOf(kind);
     MyGUI::Widget* ew = Mk(cl, "EditBox", "Kenshi_WordWrapEmpty", 8, lay.textY, W - 16, lay.textH, MyGUI::Align::Default, kBoxText);
     MyGUI::Widget* b0w = leftWord.empty() ? 0 : Mk(cl, "Button", "Kenshi_Button2", 8, lay.btnY, btnW, lay.btnH, MyGUI::Align::Default, kBoxCancel);
     MyGUI::Widget* b1w = Mk(cl, "Button", "Kenshi_Button2", W - btnW - 8, lay.btnY, btnW, lay.btnH, MyGUI::Align::Default, kBoxOk);
@@ -893,11 +1014,43 @@ bool OpenBox(int kind, int slot, const std::string& team, const std::string& who
         if (b0 != 0) b0->setCoord(MyGUI::IntCoord(8, fit.btnY, btnW, fit.btnH));
         b1->setCoord(MyGUI::IntCoord(W - btnW - 8, fit.btnY, btnW, fit.btnH));
     }
+    int giveGrow = 0, giveWiden = 0, giveFits = 1;
+    if (kind == kBoxGiveMoney)
+    {   /* T-810: the amount row. Re-check fold (finding 8): told how much taller and wider the box may still grow inside its area */
+        const MyGUI::IntCoord bc0 = raw->getCoord();
+        if (!GiveRow(cl, e, W, lineH, (area.height - 16) - bc0.height, (area.width - 16) - bc0.width, &giveGrow, &giveWiden, &giveFits)) { gui->destroyWidget(raw); return false; }
+    }
+    if (giveWiden > 0)
+    {   /* the hint lacked room beside the amount box and the box could not grow by a row: the box grows wider, centred again, and the
+           right-hand button moves with its edge (the text keeps the width it was measured and wrapped at) */
+        const MyGUI::IntCoord bc = raw->getCoord();
+        const int nw = bc.width + giveWiden;
+        raw->setCoord(MyGUI::IntCoord(area.left + (area.width - nw) / 2, bc.top, nw, bc.height));
+        b1->setPosition(b1->getLeft() + giveWiden, b1->getTop());
+    }
+    if (giveGrow > 0)
+    {   /* the hint took a row of its own under the amount box: the box grows by that row and the buttons move down with it */
+        const MyGUI::IntCoord bc = raw->getCoord();
+        int nh = bc.height + giveGrow;
+        if (nh > area.height - 16) nh = area.height - 16;
+        const int d = nh - bc.height;
+        if (d > 0)
+        {
+            raw->setCoord(MyGUI::IntCoord(bc.left, area.top + (area.height - nh) / 2, bc.width, nh));
+            if (b0 != 0) b0->setPosition(b0->getLeft(), b0->getTop() + d);
+            b1->setPosition(b1->getLeft(), b1->getTop() + d);
+        }
+        if (d < giveGrow) DebugLog("[UI] givemoney box grew " + S(d > 0 ? d : 0) + " of the " + S(giveGrow) + " px its hint row needs - the screen area is full");
+    }
+    if (giveFits == 0)
+        DebugLog("[UI] givemoney box: the area (" + S(area.width) + "x" + S(area.height) + ") is smaller than the box with its hint, even widened by " + S(giveWiden)
+                 + " px - the hint row may overlap the buttons");
     if (b0 != 0) b0->eventMouseButtonClick += MyGUI::newDelegate(OnBoxCancel);
     b1->eventMouseButtonClick += MyGUI::newDelegate(OnBoxConfirm);
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
     const bool modal = kind != teamscreen::kBoxInvite;   /* the invitation does not stop the game: no modal layer, no keyboard focus taken */
     if (im != 0 && modal) { im->addWidgetModal(raw); im->setKeyFocusWidget(raw); }
+    if (im != 0 && kind == kBoxGiveMoney && g_boxAmount != 0) im->setKeyFocusWidget(g_boxAmount);   /* T-810: the amount takes the typing */
     g_box = raw;
     g_boxSlot = slot; g_boxKind = kind; g_boxSerial = serial; g_boxTeam = team; g_boxWho = who; g_boxText = text;
     ++g_boxOpened; ++g_boxesShown;
@@ -955,16 +1108,17 @@ void BoxCancelBody()
     ++g_boxCancelled;
     DropBox();
     if (kind == teamscreen::kBoxInvite) { Request("decline", -1, "FACTION INVITATION box: DECLINE (from slot " + S(slot) + ")"); return; }
-    DebugLog("[PLAYERS] " + std::string(teamscreen::BoxTitle(kind)) + " box: " + teamscreen::BoxLeft(kind) + (slot >= 0 ? " (slot " + S(slot) + ")" : std::string()) + " - nothing changed");
+    DebugLog("[PLAYERS] " + BoxTitleOf(kind) + " box: " + BoxLeftOf(kind) + (slot >= 0 ? " (slot " + S(slot) + ")" : std::string()) + " - nothing changed");
 }
 void HostileConfirm(int slot);
 /* the right button: the box's action, the state read live at the press */
 void BoxConfirmBody()
 {
+    if (g_boxKind == kBoxGiveMoney) { GiveSendBody(); return; }   /* T-810: SEND - the box stays up when it is refused */
     const int kind = g_boxKind, slot = g_boxSlot;
     DropBox();
     if (kind == teamscreen::kBoxHostile) { HostileConfirm(slot); return; }
-    if (kind == teamscreen::kBoxAway) { DebugLog("[PLAYERS] FACTION box: OK - closed"); return; }
+    if (teamscreen::OkOnlyBox(kind)) { DebugLog("[PLAYERS] FACTION box: OK - closed"); return; }
     if (coop::EngineWritesBlocked()) { DebugLog("[PLAYERS] " + std::string(teamscreen::BoxTitle(kind)) + " box: " + teamscreen::BoxRight(kind) + " pressed with no world - nothing sent"); return; }
     std::string team; int founder = -1;
     const int role = coop::TeamMyRole(&team, &founder);
@@ -1039,6 +1193,54 @@ void OnStanceClicked(MyGUI::Widget* w) { __try { StanceCatching(w); } __except (
 void OnBoxCancel(MyGUI::Widget*) { g_boxPressedOn = g_box; ::InterlockedExchange(&g_boxPress, 1); }
 void ActCatching(MyGUI::Widget* w) { try { ActBody(w); } catch (...) { ++g_throws; } }
 void OnActClicked(MyGUI::Widget* w) { __try { ActCatching(w); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
+/* T-810 GIVE MONEY: the box for the selected player (read live at the press), named as the chat names them */
+void GiveBody()
+{
+    if (g_selSlot < 0 || coop::EngineWritesBlocked()) return;
+    const std::vector<playerstab::RowView> rows = BuildRows();
+    const int i = playerstab::RowOfSlot(rows, g_selSlot);
+    if (i < 0) { DebugLog("[PLAYERS] GIVE MONEY pressed, but the selected player (slot " + S(g_selSlot) + ") is no longer listed"); return; }
+    const int slot = rows[(size_t)i].slot;
+    std::string name, fac;
+    if (!coop::PlayersTabPlayerWords(slot, &name, &fac) || name.empty()) name = rows[(size_t)i].name;
+    ++g_givePressed;
+    DebugLog("[PLAYERS] GIVE MONEY pressed for slot " + S(slot) + " (pressed " + S(g_givePressed) + ")");
+    OpenBox(kBoxGiveMoney, slot, std::string(), name, 0);
+}
+void GiveCatching() { try { GiveBody(); } catch (...) { ++g_throws; } }
+void OnGiveClicked(MyGUI::Widget*) { __try { GiveCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
+/* SEND on the GIVE MONEY box: money.cpp takes it from here, everything read live at the press. Sent: the box closes (the chat
+   line says it). Refused: the box stays and its hint line says why. */
+void GiveSendBody()
+{
+    const int slot = g_boxSlot;
+    const std::string who = g_boxWho;
+    const std::string typed = g_boxAmount != 0 ? g_boxAmount->getOnlyText().asUTF8() : std::string();
+    std::string hint;
+    const bool listed = slot >= 0 && playerstab::RowOfSlot(BuildRows(), slot) >= 0;
+    if (listed && coop::MoneySend(slot, who, typed, &hint) == 1)
+    {
+        ++g_giveSent;
+        DropBox();
+        DebugLog("[PLAYERS] GIVE MONEY box: SEND - on its way (slot " + S(slot) + "; sent " + S(g_giveSent) + ")");
+        return;
+    }
+    if (!listed) hint = moneyw::RefusedHint(1, moneyw::kAmtOk);
+    ++g_giveRefused;
+    if (g_boxHint != 0) g_boxHint->setCaption(MyGUI::UString(hint.c_str()));
+    DebugLog("[PLAYERS] GIVE MONEY box: SEND refused (slot " + S(slot) + (listed ? std::string() : std::string(", no longer listed"))
+             + ") - the box stays, its hint line says why (refused " + S(g_giveRefused) + ")");
+}
+/* the amount box keeps digits only: anything else typed or pasted is taken out as it arrives */
+void AmountBody(MyGUI::EditBox* e)
+{
+    if (e == 0) return;
+    const std::string s = e->getOnlyText().asUTF8();
+    const std::string d = moneyw::DigitsOnly(s);
+    if (d != s) e->setOnlyText(MyGUI::UString(d.c_str()));
+}
+void AmountCatching(MyGUI::EditBox* e) { try { AmountBody(e); } catch (...) { ++g_throws; } }
+void OnAmountChanged(MyGUI::EditBox* e) { __try { AmountCatching(e); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
 void MessageBody()
 {
     if (g_selSlot < 0) return;
@@ -1071,13 +1273,18 @@ void ShownReport()
                   + (g_btn[k] != 0 && !g_btn[k]->getEnabled() ? "(grey)" : "");
     const bool tabShown = g_item != 0 && Shown(g_tabs) && g_tabs->getIndexSelected() == (size_t)playerstab::kTabIndex;
     const bool lineShown = g_line != 0 && Shown(g_line), selShown = g_select != 0 && Shown(g_select);
-    DebugLog("[PLAYERS] SHOWN tab=" + std::string(tabShown ? "open" : "not open") + " role=" + S(g_ctx.role) + " team='" + g_ctx.team + "'"
+    DebugLog("[PLAYERS] SHOWN tab=" + std::string(tabShown ? "open" : "not open") + " role=" + S(g_ctx.role) + " team=" + std::string(g_ctx.team.empty() ? "none" : "named")
              + " | line='" + (lineShown ? g_view.line : selShown ? std::string(playerstab::kSelectLine) : std::string()) + "'"
              + " | stance buttons " + (g_btn[0] != 0 ? Vis(g_btn[0]) : std::string("none")) + " [" + stance + "]"
              + " | left='" + (g_act[0] != 0 && Shown(g_act[0]) ? std::string(teamscreen::ActionCaption(g_actShown[0])) : std::string()) + "'"
              + " right='" + (g_act[1] != 0 && Shown(g_act[1]) ? std::string(teamscreen::ActionCaption(g_actShown[1])) : std::string()) + "'"
+             + " rightWords='" + (g_note != 0 && Shown(g_note) ? g_view.note : std::string()) + "'"
+             + " | GIVE MONEY " + (g_give != 0 ? Vis(g_give) : std::string("none"))
              + " | rows: " + (rows.empty() ? std::string("none") : rows)
-             + " | box: " + (g_box != 0 ? "'" + std::string(teamscreen::BoxTitle(g_boxKind)) + "' text='" + g_boxText + "' left='" + teamscreen::BoxLeft(g_boxKind) + "' right='" + teamscreen::BoxRight(g_boxKind) + "'" : std::string("none"))
+             + " | box: " + (g_box != 0 ? "'" + BoxTitleOf(g_boxKind) + "' text=" + (g_boxKind == kBoxGiveMoney ? S((int)g_boxText.size()) + " chars" : "'" + g_boxText + "'")   /* GIVE MONEY: counts only - its text names a player */
+                            + " left='" + BoxLeftOf(g_boxKind) + "' right='" + BoxRightOf(g_boxKind) + "'"
+                            + (g_boxAmount != 0 ? " amount=" + S((int)g_boxAmount->getOnlyText().size()) + " digit(s)" : std::string())
+                            + (g_boxHint != 0 ? " hint='" + g_boxHint->getCaption().asUTF8() + "'" : std::string()) : std::string("none"))
              + " | FACTION NAME box " + (g_nameBox == 0 ? std::string("not found") : g_nameBox->getEnabled() ? std::string("editable") : std::string("locked")));
 }
 
@@ -1091,6 +1298,19 @@ std::string LeverBody(const std::string& args)
     /* the command channel hands over the rest of its line with the space after the verb: the word is compared without it */
     const size_t first = args.find_first_not_of(" \t\r\n");
     const std::string word = first == std::string::npos ? std::string() : args.substr(first, args.find_last_not_of(" \t\r\n") - first + 1);
+    /* T-810, TEST-ONLY: `givemoney` presses GIVE MONEY; `amount <digits>` puts digits in the box's amount as typing would */
+    if (word == "givemoney")
+    {
+        if (!Reachable(g_give)) { DebugLog("[PLAYERS] lever givemoney REFUSED: no GIVE MONEY button on screen (no player selected?)"); return "error playerstab no-give"; }
+        g_give->eventMouseButtonClick(g_give);
+        return "ok playerstab givemoney";
+    }
+    if (word.compare(0, 7, "amount ") == 0)
+    {
+        if (!Reachable(g_boxAmount)) { DebugLog("[PLAYERS] lever amount REFUSED: no GIVE MONEY box on screen"); return "error playerstab no-amount"; }
+        g_boxAmount->setOnlyText(MyGUI::UString(moneyw::DigitsOnly(word.substr(7)).c_str()));
+        return "ok playerstab amount";
+    }
     if (word == "message")
     {
         if (!Reachable(g_msg)) { DebugLog("[PLAYERS] lever message REFUSED: no MESSAGE button on screen (no player selected?)"); return "error playerstab no-message"; }
@@ -1199,10 +1419,10 @@ bool PlayersTabPlayerWords(int slot, std::string* name, std::string* faction)
     return true;
 }
 
-void PlayersTabRemovedWhileAway(const std::string& teamName)
+void PlayersTabOwedWhileAway(int box, const std::string& teamName)
 {
-    g_awayOwed.push_back(teamName);
-    DebugLog("[PLAYERS] FACTION box owed: removed from '" + teamName + "' while away (shown when no other box is up)");
+    g_awayOwed.push_back(std::make_pair(box, teamName));
+    DebugLog("[PLAYERS] FACTION box owed: " + std::string(box == teamscreen::kBoxAwayDisband ? "this player's faction disbanded" : "removed from this player's faction") + " while away (shown when no other box is up)");
 }
 
 void ReportPlayersTab()

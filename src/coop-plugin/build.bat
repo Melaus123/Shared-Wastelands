@@ -7,6 +7,22 @@ rem mig5: THIS tree's env script (relative to this file), so a worktree builds w
 call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
 cd /d "%~dp0"
 
+rem THE BUILD FORM. "build.bat dev" compiles the mod's own sources with /DSW_DEV_BUILD: the test-only probes are compiled in and
+rem the log's first line and a bug report's report.txt say "DEV build". With no argument it is the release build players get
+rem ("release build"; the probes kept for player-reported bugs only). The test tools pass dev for every bench run except
+rem player-path and package runs; tools\build-package.ps1 refuses a DLL that says "DEV build".
+set SWDEV=
+set SWFORM=release build
+if /i "%~1"=="dev" (
+    set SWDEV=/DSW_DEV_BUILD
+    set SWFORM=DEV build
+)
+if not "%~1"=="" if not "%SWDEV%"=="/DSW_DEV_BUILD" (
+    echo BUILD FAILED ^(unknown argument "%~1" - the only one is dev^)
+    exit /b 1
+)
+echo === building the %SWFORM% ===
+
 rem NOTE: VS2010 cl wants /FeNAME (no colon). "/Fe:name" silently produces ":name".
 rem UNICODE/_UNICODE select the W (wide-character) variants of the Windows API; every build so far has used
 rem them, so dropping them is its own change.
@@ -98,7 +114,7 @@ rem game\decl_check.cpp static_asserts OUR declarations (game\*.h) against the n
 rem list is game\layout_asserts.inl). Compiled with the DLL's flags plus /c; the object goes to obj\layout\ and is
 rem NEVER linked. A declaration that drifts from its number stops the build here, before the DLL step.
 if not exist obj\layout mkdir obj\layout
-cl /nologo /c /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 ^
+cl /nologo /c /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 /Foobj\layout\ game\decl_check.cpp
 if errorlevel 1 (
     echo BUILD FAILED ^(layout check: our declarations disagree with game\gamelayout.h^)
@@ -106,11 +122,11 @@ if errorlevel 1 (
 )
 
 rem --- Step 2: our plugin, linked against the ENet objects --------------------------
-cl /nologo /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 ^
+cl /nologo /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include /I third_party\minhook\include ^
    coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_channel.cpp ai_spike.cpp spawn.cpp replicate.cpp combat.cpp medical.cpp ^
-   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp u8file.cpp ^
+   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp money.cpp u8file.cpp ^
    net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\routerask.cpp net\steam_probe.cpp net\steam_transport.cpp net\relay_test.cpp net\relay_bridge.cpp net\steam_friends.cpp ^
    ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
    callbacks.obj compress.obj host.obj list.obj packet.obj peer.obj protocol.obj win32.obj ^

@@ -18,7 +18,7 @@
 namespace swformat {
 
 enum FolderKind { kKindWorld = 0, kKindJoined = 1, kKindRecords = 2 };
-const unsigned int kWorldFolderFormat   = 2;   /* step 0 -> 1: world.txt gains its id line; step 1 -> 2: a profiles.txt faction field may be '#' + hex (coopprof::FactionFieldFormat), which a build at 1 cannot read - a build at 1 refuses the folder instead of dropping those rows */
+const unsigned int kWorldFolderFormat   = 3;   /* step 0 -> 1: world.txt gains its id line; step 1 -> 2: a profiles.txt faction field may be '#' + hex (coopprof::FactionFieldFormat), which a build at 1 cannot read - a build at 1 refuses the folder instead of dropping those rows; step 2 -> 3 (T-811): player-towns.txt and kept-towns.txt are format 3 (the size level), which a build at 2 takes as empty and would rewrite without the offline players' outposts - a build at 2 refuses the folder instead */
 const unsigned int kJoinedFolderFormat  = 1;   /* step 0 -> 1: the same-name world folder's outage journal is taken when it is this world's */
 const unsigned int kRecordsFolderFormat = 1;   /* step 0 -> 1: the number alone */
 const unsigned int kFormatMax = 999999999u;

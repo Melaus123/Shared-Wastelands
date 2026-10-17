@@ -38,6 +38,8 @@ bool HasPuppet(unsigned int uid);
 // down, ragdolled, given up by the drive, carried or in a cage, bed or building slot (or that could not be read). Returns
 // stalecopy::kKeep* (kKeepNone = it may be retired). Reads only. MAIN THREAD.
 int StaleCopyKeepReason(unsigned int uid, Character* c);
+// 1 = carried (+0x3D4); 0 = not; -1 = unreadable. Reads only. MAIN THREAD.
+int CharCarried(Character* c);
 void PuppetUidsSnapshot(std::vector<unsigned int>* out);   // M7a A1 build 1 [a1b1-rh0]: every uid held as a puppet, MAIN THREAD
 void DropPuppetIfObject(unsigned int uid, const void* obj);   // only if its puppet still names obj; no dereference
 long long AdoptRefusedFullCount();
@@ -170,9 +172,15 @@ void  PuppetReconcileStats(unsigned int uid, ReconcileStats* out);
 float PuppetWindowMaxDrift(unsigned int uid);        // horizontal, over the current/last window
 float PuppetWindowDriftNow(unsigned int uid);        // live horizontal drift, -1 if unreadable
 bool  PuppetAuthorityPos(unsigned int uid, float* x, float* y, float* z);   // the owner's last streamed spot; false if none
+float PuppetLostDistance();                          // the drift past which a copy is LOST (teleported)
+float PuppetCorrectDistance();                       // the drift past which the drive starts correcting a copy (the release build's [M5] drift test)
 // The same spot (horizontal), only while it is a fresh owner sample: one the owner sent (not the copy's own spot a puppet is made
 // with) and younger than the far snap's stale limit (3 s, the test the far branch makes before it retires a copy). MAIN THREAD.
 bool  PuppetFreshAuthorityPos(unsigned int uid, float* x, float* z);
+/* PROBE P143 BEGIN */
+// Seconds since the owner's last MOVE for this copy's puppet; -1 when there is no puppet or no owner sample since it was made. MAIN THREAD.
+double PuppetLastMoveAgeSec(unsigned int uid);
+/* PROBE P143 END */
 // Place the puppet at the authority's last streamed position (the catch-up teleport). Declines on
 // ragdoll/prone - a placement that cannot work must decline, not fail (F324). Drift before/after
 // are OUTPUTS so the caller can print what the snap actually did rather than that it was asked.

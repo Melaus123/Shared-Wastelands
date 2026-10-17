@@ -36,7 +36,8 @@
 //        7 ASK {}   (the whole table again: this game's copy was cleared - a world torn down - while the link stayed)
 //   down 20 TABLE {u32 n, n x [u32 team, u32 founderSlot, str name, u32 m, m x u32 memberSlot]}
 //        21 INVITED {u32 fromSlot, str teamName, u32 secondsLeft}   (secondsLeft 0 = the invitation is gone)
-//        22 NOTICE {u8 event, u8 result, u32 actorSlot, u32 subjectSlot, str teamName}
+//        22 NOTICE {u8 event, u8 result, u32 actorSlot, u32 subjectSlot, str teamName}   (a refusal: actor = the requester; subject =
+//           the requester, or for a refused INVITE the invited player)
 //        23 RESTORE {u32 number, u8 reason, u8 whileAway, str teamName, u32 snapshotRows, blob snapshot}
 //   str = {u32 len, bytes}; blob = {u32 len, bytes}.
 // FILE (teams.txt in the world's folder, rewritten whole through a temp file and a write-through rename, only when its text
@@ -83,6 +84,18 @@
 //   down 25 RESEARCH {u32 team, u8 whole, u32 bySlot, u32 n, n x str sid}   (bySlot: the game a reply answers, or the finisher of
 //                                                                           an OWN tech; 0xFFFFFFFF = a whole research for all)
 //   file Q <team> <hex sid>                                                 (after its team's T line)
+//
+// THE TEAM'S RESEARCH LEVEL (owner 517 a: a team's research level is its best member's bench level, for every member): each
+// member's game reports the level its OWN research benches give (the levels the engine's benches passed to Research::setLevel
+// since its world was loaded); the world server keeps the last report of every member (teams.txt L lines, written for current
+// members only) and the team's level is the highest of them. Every report is answered with the team's level (bySlot = the
+// reporter); when the team's level changed, every other connected member gets it too (bySlot 0xFFFFFFFF), and a member gets it
+// at its WELCOME. A member's game raises its own level to the team's through the engine's setLevel (raise only). A report the
+// world server refuses (not in a team, a level over kMaxLevel, teams.txt not saved) is not answered: the game sends it again
+// after a growing wait.
+//   up   13 LEVEL {u32 level}
+//   down 26 LEVEL {u32 team, u32 level, u32 bySlot}
+//   file L <team> <hex player> <level>                                      (after its team's M lines)
 #include <string>
 #include <vector>
 #include <map>
@@ -111,9 +124,10 @@ const unsigned kMaxSides = 256;           // recorded sides in one team / one RE
 const float kRecLow = -100.0f, kRecHigh = 100.0f;   // the engine's standing scale
 
 enum { kUpInvite = 1, kUpAnswer = 2, kUpLeave = 3, kUpRemove = 4, kUpDisband = 5, kUpRestoreDone = 6, kUpAsk = 7,
-       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12 };
-enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25 };
+       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpLevel = 13 };
+enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnLevel = 26 };
 const unsigned kMaxTechs = 4096;          // techs in a team's research and in one RESEARCH message
+const unsigned kMaxLevel = 100;           // a research level a LEVEL report may carry
 /* results: 0 = done; every other number is the reason a request was refused */
 enum { kOk = 0, kRefNotOnline = 1, kRefInTeam = 2, kRefNotFounder = 3, kRefSelf = 4, kRefInvitePending = 5, kRefNoInvite = 6,
        kRefFounderLeaves = 7, kRefNotInTeam = 8, kRefNotMember = 9, kRefUnknownPlayer = 10, kRefTeamFull = 11, kRefNoSnapshot = 12,
@@ -193,6 +207,7 @@ struct Team
     TeamRec rec;                     // the team's standing (step 5)
     std::vector<SideSnap> sides;     // members' sides towards teammates as they stood before the pin
     std::vector<std::string> research;   // every tech any member has finished (stringIDs, sorted, unique)
+    std::vector<std::pair<std::string, unsigned> > levels;   // each player's last reported bench level (profile id, level)
     Team() : no(0), founderSnapRows(0) {}
 };
 struct Owed
@@ -715,6 +730,51 @@ inline int ResearchDecide(Book* b, const std::string& id, const std::vector<std:
     have.swap(merged);
     return kOk;
 }
+/* a player of the team (its founder or a member) */
+inline bool InTeam(const Team& t, const std::string& id)
+{
+    if (t.founder == id) return true;
+    for (size_t m = 0; m < t.members.size(); ++m) if (t.members[m].id == id) return true;
+    return false;
+}
+/* THE TEAM'S RESEARCH LEVEL: the highest bench level its current players reported (a departed player's report counts no more) */
+inline unsigned TeamLevelOf(const Team& t)
+{
+    unsigned best = 0;
+    for (size_t i = 0; i < t.levels.size(); ++i) if (t.levels[i].second > best && InTeam(t, t.levels[i].first)) best = t.levels[i].second;
+    return best;
+}
+/* LEVEL: `id`'s game reports the level its own research benches give. The reports of players no longer in the team are dropped,
+   `id`'s is kept; *before / *after = the team's level around it; *stored = the team's reports changed (to save). A player in no
+   team is refused (not-in-team), a level over kMaxLevel too (too-many). */
+inline int LevelDecide(Book* b, const std::string& id, unsigned level, unsigned* before, unsigned* after, bool* stored)
+{
+    *before = 0; *after = 0; *stored = false;
+    const int t = TeamOf(*b, id);
+    if (t < 0) return kRefNotInTeam;
+    if (level > kMaxLevel) return kRefTooMany;
+    Team& team = b->teams[t];
+    *before = TeamLevelOf(team);
+    std::vector<std::pair<std::string, unsigned> > keep;
+    bool put = false;
+    for (size_t i = 0; i < team.levels.size(); ++i)
+    {
+        if (!InTeam(team, team.levels[i].first)) { *stored = true; continue; }
+        if (team.levels[i].first == id)
+        {
+            if (put) { *stored = true; continue; }
+            put = true;
+            if (team.levels[i].second != level) *stored = true;
+            keep.push_back(std::make_pair(id, level));
+            continue;
+        }
+        keep.push_back(team.levels[i]);
+    }
+    if (!put) { keep.push_back(std::make_pair(id, level)); *stored = true; }
+    team.levels.swap(keep);
+    *after = TeamLevelOf(team);
+    return kOk;
+}
 /* a stance towards a player out of the record (that player joined the team: towards a member the pin holds) - true = removed */
 inline bool DropStance(TeamRec* r, unsigned slot)
 {
@@ -865,7 +925,8 @@ struct Up
     float rel; unsigned flags;       // STANCE / SIDE (with slot)
     unsigned whole;                  // RESEARCH: 1 = this game's whole finished list, 0 = techs its own player finished now
     std::vector<std::string> techs;  // RESEARCH
-    Up() : kind(0), slot(0), accept(0), snapRows(0), no(0), rel(0.0f), flags(0), whole(0) {}
+    unsigned level;                  // LEVEL
+    Up() : kind(0), slot(0), accept(0), snapRows(0), no(0), rel(0.0f), flags(0), whole(0), level(0) {}
 };
 inline void EncodeInvite(std::vector<char>* b, unsigned slot, const std::string& factionName) { b->clear(); PutU8(b, kUpInvite); PutU32(b, slot); PutStr(b, factionName.substr(0, kMaxName)); }
 inline bool EncodeAnswer(std::vector<char>* b, bool accept, unsigned snapRows, const std::vector<char>& snap)
@@ -914,6 +975,7 @@ inline bool EncodeResearchUp(std::vector<char>* b, bool whole, const std::vector
     PutU8(b, kUpResearch); PutU8(b, whole ? 1u : 0u); PutTechs(b, techs);
     return true;
 }
+inline void EncodeLevelUp(std::vector<char>* b, unsigned level) { b->clear(); PutU8(b, kUpLevel); PutU32(b, level); }
 /* false = not an up message this header knows, or malformed (trailing bytes included) */
 inline bool DecodeUp(const char* p, size_t n, Up* u)
 {
@@ -940,6 +1002,7 @@ inline bool DecodeUp(const char* p, size_t n, Up* u)
     }
     else if (u->kind == kUpStance || u->kind == kUpSide) { u->slot = GetU32(&c); u->rel = GetF32(&c); u->flags = GetU32(&c); }
     else if (u->kind == kUpResearch) { u->whole = GetU8(&c); if (u->whole > 1) c.bad = true; GetTechs(&c, &u->techs); }
+    else if (u->kind == kUpLevel) u->level = GetU32(&c);
     else if (u->kind != kUpLeave && u->kind != kUpDisband && u->kind != kUpAsk) return false;
     return !c.bad && c.at == n;
 }
@@ -965,7 +1028,8 @@ struct Down
     unsigned recTeam; TeamRec rec;                       // RECORD
     unsigned resTeam, resWhole, resBy;                   // RESEARCH (resBy: the game a reply answers, or the finisher of an OWN tech; 0xFFFFFFFF = for all)
     std::vector<std::string> techs;                      // RESEARCH
-    Down() : recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
+    unsigned lvTeam, lvLevel, lvBy;                      // LEVEL (lvBy: the reporter a reply answers; 0xFFFFFFFF = for all)
+    Down() : lvTeam(0), lvLevel(0), lvBy(0xFFFFFFFFu), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
 };
 /* the table as the games see it: profile ids turned into slots (slotOf: profile id -> slot; a player with no slot is skipped) */
 inline std::vector<WireTeam> ToWire(const Book& b, const std::map<std::string, unsigned>& slotOf)
@@ -1013,6 +1077,10 @@ inline bool EncodeResearchDown(std::vector<char>* b, unsigned team, bool whole, 
     PutU8(b, kDnResearch); PutU32(b, team); PutU8(b, whole ? 1u : 0u); PutU32(b, bySlot); PutTechs(b, techs);
     return true;
 }
+inline void EncodeLevelDown(std::vector<char>* b, unsigned team, unsigned level, unsigned bySlot)
+{
+    b->clear(); PutU8(b, kDnLevel); PutU32(b, team); PutU32(b, level); PutU32(b, bySlot);
+}
 inline bool DecodeDown(const char* p, size_t n, Down* d)
 {
     if (d == 0) return false;
@@ -1047,6 +1115,7 @@ inline bool DecodeDown(const char* p, size_t n, Down* d)
         if (!c.bad && !DecodeRec(blob, &d->rec)) c.bad = true;
     }
     else if (d->kind == kDnResearch) { d->resTeam = GetU32(&c); d->resWhole = GetU8(&c); d->resBy = GetU32(&c); if (d->resWhole > 1) c.bad = true; GetTechs(&c, &d->techs); }
+    else if (d->kind == kDnLevel) { d->lvTeam = GetU32(&c); d->lvLevel = GetU32(&c); d->lvBy = GetU32(&c); }
     else return false;
     return !c.bad && c.at == n;
 }
@@ -1166,6 +1235,9 @@ inline std::string BookFile(const Book& b)
             unsigned bits = 0; std::memcpy(&bits, &x.rel, 4);
             s += "S " + U(b.teams[t].no) + " " + Hex(x.owner) + " " + U(x.ownerSlot) + " " + Hex(x.other) + " " + U(x.otherSlot) + " " + U(bits) + " " + U(x.flags) + "\n";
         }
+        for (size_t k = 0; k < b.teams[t].levels.size(); ++k)
+            if (InTeam(b.teams[t], b.teams[t].levels[k].first))
+                s += "L " + U(b.teams[t].no) + " " + Hex(b.teams[t].levels[k].first) + " " + U(b.teams[t].levels[k].second) + "\n";
     }
     for (size_t i = 0; i < b.owed.size(); ++i)
     {
@@ -1291,6 +1363,23 @@ inline bool BookParseLine(const std::string& raw, Book* b, int* why = 0)
                 for (size_t k = 0; k < b->teams[t].sides.size(); ++k)
                     if (b->teams[t].sides[k].owner == x.owner && b->teams[t].sides[k].other == x.other) { if (why != 0) *why = kLineDuplicate; return false; }
                 b->teams[t].sides.push_back(x);
+                if (why != 0) *why = kLineOk;
+                return true;
+            }
+        return false;
+    }
+    if (tag == "L")
+    {
+        unsigned no = 0, level = 0; std::string hex, id;
+        if (!(is >> no >> hex >> level)) return false;
+        for (size_t k = 0; k < b->loadRefused.size(); ++k) if (b->loadRefused[k] == no) return false;
+        if (!UnhexS(hex, &id) || id.empty() || level > kMaxLevel) return false;
+        for (size_t t = 0; t < b->teams.size(); ++t)
+            if (b->teams[t].no == no)
+            {
+                if (TeamOf(*b, id) != (int)t) return false;
+                for (size_t k = 0; k < b->teams[t].levels.size(); ++k) if (b->teams[t].levels[k].first == id) { if (why != 0) *why = kLineDuplicate; return false; }
+                b->teams[t].levels.push_back(std::make_pair(id, level));
                 if (why != 0) *why = kLineOk;
                 return true;
             }

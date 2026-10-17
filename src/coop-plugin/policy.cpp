@@ -630,6 +630,9 @@ unsigned int PolicySizeOfImagePod(uintptr_t base)
 
 namespace coop {
 
+// T-805: the build gate's member test - the cursor hooks' own (MineInTeam, then TeammateFaction). ANY THREAD.
+bool PolicyTeammateFaction(void* faction) { return faction != 0 && MineInTeam() && TeammateFaction(faction); }
+
 // ---- PROBE P029: WHICH CONCRETE CLASS IS THIS BUILDING? -------------------------------------------------
 //
 // review-p6m HIGH-1's open leg. The click gate reaches ONE class and the cursor remap reaches five, and
@@ -1153,7 +1156,7 @@ void PolicyNotePeerFaction(void* faction)
     const int sw = FactionSidPod(faction, sid, 160);
     if (g_p028Said) return;
     g_p028Said = true;
-    DebugLog(std::string("[PROBE] P028 coop-peer faction=") + PS(faction)
+    SW_DEVLOG(std::string("[PROBE] P028 coop-peer faction=") + PS(faction)
              + " isPlayer=" + (why == 1 ? PS(ip) : std::string(why == 0 ? "unreadable" : "FAULTED"))
              + " sid='" + std::string(sw == 1 ? sid : "?") + "'"
              + " -> locked mode " + (g_peerIsPlayer == 0

@@ -378,7 +378,7 @@ void ResolveOnce()
     g_setGender  = ResolveHumanSetGender();
     g_updateApp  = ResolveHumanUpdateAppearance();
     g_updateProp = ResolveHumanUpdateProportions();
-    DebugLog("[P019] resolved AppearanceHuman: isFlayed=" + Hex(g_isFlayed)
+    SW_DEVLOG("[P019] resolved AppearanceHuman: isFlayed=" + Hex(g_isFlayed)
              + " setGender=" + Hex(g_setGender)
              + " updateAppearance=" + Hex(g_updateApp)
              + " updateProportions=" + Hex(g_updateProp));
@@ -463,7 +463,7 @@ static void NoteFirstHuman(uintptr_t vt, uintptr_t base)
     uintptr_t raw5 = 0, raw11 = 0;
     const uintptr_t t5 = SlotTargetPod(vt, 5, &raw5);
     const uintptr_t t11 = SlotTargetPod(vt, 11, &raw11);
-    DebugLog("[P019] human test: first AppearanceHuman recognised - vtable " + Hex((unsigned long long)vt)
+    SW_DEVLOG("[P019] human test: first AppearanceHuman recognised - vtable " + Hex((unsigned long long)vt)
              + " = image base + " + Hex(kHumanVtRva) + " (row AppearanceHumanVt), RTTI class '" + std::string(cls) + "'"
              + "; slot 5 (+0x28) holds rva " + HumanRva(raw5, base) + " -> " + HumanRva(t5, base)
              + (t5 != 0 && t5 == g_setGender ? std::string(" = setGender (row AppearanceHuman_chooseSex)")
@@ -804,7 +804,7 @@ void P091NoteKnock(unsigned int uid, ::Character* c, int branch)
 
 static void P091ReportLine()
 {
-    DebugLog("[P091] REPORT createBodyCopy=" + S((long long)g_p091CreateBodyCopy)
+    SW_DEVLOG("[P091] REPORT createBodyCopy=" + S((long long)g_p091CreateBodyCopy)
              + " createBodyCopyRagdoll=" + S((long long)g_p091CreateBodyCopyRagdoll)
              + " knockLimpWithRebuildPending=" + S((long long)g_p091KnockLimpRebuild)
              + " lines=" + S((long long)g_p091Lines) + " hook=" + S((long long)g_animalBodyHook));
@@ -1676,8 +1676,8 @@ bool ReportAppearance(unsigned int uid)
         ErrorLog("[P019] look: no spawned character for uid " + S(uid));
         return false;
     }
-    DebugLog("[P019] uid=" + S(uid) + " " + AppearanceString(c));
-    DebugLog("[P021] uid=" + S(uid) + " " + GearString(c));
+    SW_DEVLOG("[P019] uid=" + S(uid) + " " + AppearanceString(c));
+    SW_DEVLOG("[P021] uid=" + S(uid) + " " + GearString(c));
     return true;
 }
 
@@ -1792,7 +1792,7 @@ static void DeadNoteSeen(unsigned int uid, ::Character* c)
     if (g_deadFirstSeen.find(uid) != g_deadFirstSeen.end()) return;
     if (DeadPod(c) != 1) return;
     g_deadFirstSeen[uid] = ::GetTickCount();
-    DebugLog("[P022] deadlook: uid=" + S(uid) + " first seen dead"
+    SW_DEVLOG("[P022] deadlook: uid=" + S(uid) + " first seen dead"
              + (g_deadTouched.find(uid) != g_deadTouched.end() ? " (its items were already moved by the item sync)" : ""));
 }
 
@@ -1828,7 +1828,7 @@ static void NoteDeadHeld(unsigned int uid, int why)
     else if (why == kDeadLooted)
     {
         ++g_deadLooted;
-        DebugLog("[P022] deadlook: uid=" + S(uid) + " LOOTED (the item sync moved items on this copy) - never re-dressed");
+        SW_DEVLOG("[P022] deadlook: uid=" + S(uid) + " LOOTED (the item sync moved items on this copy) - never re-dressed");
     }
 }
 
@@ -1866,7 +1866,7 @@ void GarmentsNoteOwnerMove(unsigned int uid, const std::string& section, int op)
     g_waitKitOpen.erase(uid);
     ++g_kitStaleDropped;
     if (++g_kitStaleLines <= 50)
-        DebugLog("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - the owner moved an item in its '" + section
+        SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - the owner moved an item in its '" + section
                  + "' section (op " + S((long long)op) + ") since the list was sent; the copy keeps its gear plus the owner's"
                  " moves (T-293 fold 1, kitStale[droppedOnOwnerMove]; 50 lines at most)");
 }
@@ -2143,7 +2143,9 @@ std::string BodyDownLever(unsigned int anchorUid, float radiusM)
         + " animalTest[yes,no,unreadable]=" + S((long long)g_p10ClassAns[0]) + "," + S((long long)g_p10ClassAns[1]) + ","
         + S((long long)g_p10ClassAns[2]) + " animalVtRow=" + Hex(kAnimalVtRva) + " copyWatchS=" + S((long long)(kP10WindowMs / 1000));
     DebugLog("[P10] lever bodydown armed (TEST) " + line);
-    return "ok bodydown " + line;
+    if (ko >= 0) return "ok bodydown knocked " + line;
+    if (ko == -2) return "ok bodydown copy-watch-only (no owned animal within radius) " + line;
+    return "error bodydown knockout failed " + line;
 }
 
 /* T-327 (the eatbite lever's `animal`): the nearest living, standing animal this game DRIVES - P10's animal test, not a player
@@ -2547,7 +2549,7 @@ static void OwnLookTick()
             GarmentSet worn;
             if (r == 1 && !(CaptureGarments(c, &worn) && net::SendClothing(uid, worn))) r = 2;
             if (r == 1) InvNetNoteAnnounced((void*)c, uid);
-            DebugLog("[P019] -> APPEARANCE uid=" + S(uid) + (late ? " (own record applied LATE, after the deadline) " : " (own record applied first) ")
+            SW_DEVLOG_OR_FAIL(r != 1, "[P019] -> APPEARANCE uid=" + S(uid) + (late ? " (own record applied LATE, after the deadline) " : " (own record applied first) ")
                      + RecordSummary(it->second.rec)
                      + (r == 1 ? " + CLOTHING " + GarmentSummary(worn) : std::string(" - a send FAILED: handed to the settle send")));
         }
@@ -2593,14 +2595,14 @@ void AppearanceTick()
             if (CaptureAppearanceRecord(c, &rec) && net::SendAppearance(uid, rec))
             {
                 ++g_c.sent;
-                DebugLog("[P019] -> APPEARANCE uid=" + S(uid) + " " + RecordSummary(rec));
+                SW_DEVLOG("[P019] -> APPEARANCE uid=" + S(uid) + " " + RecordSummary(rec));
 
                 // Clothing rides the same settle event but a SEPARATE message, sent second.
                 // The order matters on the receiving side, not here (see AppearanceTick).
                 GarmentSet worn;
                 if (CaptureGarments(c, &worn) && net::SendClothing(uid, worn))
                 {
-                    DebugLog("[P022] -> CLOTHING uid=" + S(uid) + " " + GarmentSummary(worn));
+                    SW_DEVLOG("[P022] -> CLOTHING uid=" + S(uid) + " " + GarmentSummary(worn));
                     InvNetNoteAnnounced((void*)c, uid);   /* inv2a: the safety net's baseline for this character is what was just sent */
                 }
             }
@@ -2680,10 +2682,10 @@ void AppearanceTick()
             // PROBE-START: P091 - the APPEARANCE apply clock
             if (ok) P091NoteAppearanceApplied(uid);
             // PROBE-END: P091
-            DebugLog("[P019] <- APPEARANCE uid=" + S(uid) + (ok ? " applied" : " FAILED")
+            SW_DEVLOG_OR_FAIL(!ok, "[P019] <- APPEARANCE uid=" + S(uid) + (ok ? " applied" : " FAILED")
                      + (lookKoThrough ? " (owner says knocked out; standing, knockdown held - lookKoArrival)" : ""));
-            DebugLog("[P019]   before " + before);
-            DebugLog("[P019]   after  " + AppearanceString(c));
+            SW_DEVLOG_OR_FAIL(!ok, "[P019]   before " + before);
+            SW_DEVLOG_OR_FAIL(!ok, "[P019]   after  " + AppearanceString(c));
             g_pendingRemote.erase(it++);
         }
     }
@@ -2711,7 +2713,7 @@ void ApplyPendingGarments()
         if (net::IsUidMine(uid))
         {
             if (++g_kitOwnedSkipped == 1)
-                DebugLog("[P022] CLOTHING uid=" + S(uid) + " NOT applied - this game owns the character now (a kit queued before it"
+                SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " NOT applied - this game owns the character now (a kit queued before it"
                          " was taken; said once, counted as kit3[kitOwnedSkipped])");
             g_waitClothingForAppearance.erase(uid);
             g_waitNotBuiltClothing.erase(uid);
@@ -2767,7 +2769,7 @@ void ApplyPendingGarments()
             {
                 late->second = false;
                 ++g_lookKoClothLate;
-                DebugLog("[P022] CLOTHING uid=" + S(uid) + " its first look went through on the held knockdown, but the hold is"
+                SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " its first look went through on the held knockdown, but the hold is"
                          " gone or the copy is down now - the worn items wait for it to stand (lookKoArrival clothLate="
                          + S(g_lookKoClothLate) + ")");
             }
@@ -2786,7 +2788,7 @@ void ApplyPendingGarments()
                 g_deadHeldReason.erase(uid);
                 ++g_kitStaleHeldCorpse;
                 if (++g_kitStaleLines <= 50)
-                    DebugLog("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - a dead copy whose body rebuild the"
+                    SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - a dead copy whose body rebuild the"
                              " createBody guard holds for good (+0x143 set, lying in ragdoll); clothes are never applied to a held"
                              " corpse (T-293 fold 2, kitStale[heldCorpse]; 50 lines at most)");
                 g_pendingGarments.erase(it++);
@@ -2813,7 +2815,7 @@ void ApplyPendingGarments()
                 ++g_kitApplyDeferredOpen;
                 if (busy >= 1 && busy <= 3) ++g_kitDeferredWhy[busy - 1];
                 if (g_kitApplyDeferredOpen == 1)
-                    DebugLog("[P022] CLOTHING uid=" + S(uid) + " HELD - an inventory window, the cursor or a pending request still"
+                    SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " HELD - an inventory window, the cursor or a pending request still"
                              " holds one of its items (reason " + S((long long)busy) + "); applied once clear (T-1 B2 fold; said once,"
                              " counted as kitOpen[kitApplyDeferredOpen])");
             }
@@ -2833,15 +2835,15 @@ void ApplyPendingGarments()
             if (CreateBodyPendingPod(c) == 1)
             {
                 ++g_deadRebuildQueued;
-                DebugLog("[P022] deadlook: uid=" + S(uid) + " createBody PENDING (+0x143) after the dead-copy clothing apply"
+                SW_DEVLOG("[P022] deadlook: uid=" + S(uid) + " createBody PENDING (+0x143) after the dead-copy clothing apply"
                          " - not expected");
             }
         }
         if (ok) g_lookKoThrough.erase(uid);
-        DebugLog("[P022] <- CLOTHING uid=" + S(uid) + (ok ? " applied" : " FAILED") + (deadApply ? " (dead copy)" : "")
+        SW_DEVLOG_OR_FAIL(!ok, "[P022] <- CLOTHING uid=" + S(uid) + (ok ? " applied" : " FAILED") + (deadApply ? " (dead copy)" : "")
                  + (clothKoThrough ? " (owner says knocked out; standing, knockdown held - lookKoArrival)" : ""));
-        DebugLog("[P022]   before " + before);
-        DebugLog("[P022]   after  " + GearString(c));
+        SW_DEVLOG_OR_FAIL(!ok, "[P022]   before " + before);
+        SW_DEVLOG_OR_FAIL(!ok, "[P022]   after  " + GearString(c));
         g_pendingGarments.erase(it++);
     }
 }
@@ -2853,7 +2855,7 @@ void NoteKnockLooksGaveUp(unsigned int uid)
     if (g_copyLookApplied.find(uid) != g_copyLookApplied.end()) return;      // not its first look
     ++g_lookKoGaveUp;
     if (CopyPlayerSidePod(FindSpawned(uid)) == 1) ++g_lookKoGaveUpPlayer;
-    DebugLog("[P019] APPEARANCE uid=" + S(uid) + " the knockdown held for its first look gave up after "
+    SW_DEVLOG("[P019] APPEARANCE uid=" + S(uid) + " the knockdown held for its first look gave up after "
              + S((long long)coopkolook::kFirstLookWaitMs) + " ms - the copy goes down and the look waits until it stands"
              " (lookKoArrival gaveUp=" + S(g_lookKoGaveUp) + ")");
 }
@@ -2905,7 +2907,7 @@ static long long DownedWaitOwnerKoNow(const std::map<unsigned int, bool>& waitin
 
 void ReportAppearanceCounters()
 {
-    DebugLog("[P019] REPORT watched=" + S(g_c.watched)
+    SW_DEVLOG("[P019] REPORT watched=" + S(g_c.watched)
              + " sent=" + S(g_c.sent)
              + " queued=" + S(g_c.queued)
              + " applied=" + S(g_c.applied)
@@ -2983,10 +2985,9 @@ void ReportAppearanceCounters()
              + S((long long)g_p10Timeouts) + BodyTestCounts());
 }
 
-// ground5 fold 3 (T635): the ground batch's animal test for items.cpp's TEST lever `groundtest animaldrop` - the P10 lever's
-// authoritative test (effort/p10lever P10AnimalPod, not on main yet): the appearance object's vtable holds
-// AppearanceAnimal::createBody 0x539C50 (fold 3b: through the slot's E9 jump stub). IsHumanAppearance answers false for every character (T-293), so "not human" is never
-// taken as "animal". 1 = an animal, 0 = a readable appearance of another class (a human: AppearanceHuman::createBody 0x539440),
+// The animal test for items.cpp's TEST lever `groundtest animaldrop` and speech.cpp's talk levers: P10AnimalPod above - the
+// appearance object's vtable pointer is AppearanceAnimal's (AppearanceAnimalVt). IsHumanAppearance answers false for every
+// character, so "not human" is never taken as "animal". 1 = an animal, 0 = a readable appearance of another class (a human),
 // -1 = no address-table row / no appearance object / a fault. MAIN THREAD. No C++ object here (C2712).
 int GroundAnimalAppPod(::Character* c)
 {

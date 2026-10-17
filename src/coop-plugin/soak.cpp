@@ -7,8 +7,10 @@
 #include "worldsync.h"   // P039 / F331: PauseSnapshot
 #include "net/session.h"
 #include "zones.h"   // M-A: sec= on every digest line
+#include "replicate.h"   // the release build's drift test: PuppetWindowDriftNow, PuppetLostDistance
 
 #include "coop_log.h"
+namespace { swlogbudget::Gate g_qWatchBaseline; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -17,6 +19,7 @@
 #include <sstream>
 #include <locale>
 #include <string>
+#include <vector>
 #include <float.h>   // F333: _finite - a NaN speed multiplier would log every frame forever
 
 namespace coop {
@@ -97,6 +100,14 @@ long long g_frame = 0;
 int g_driftPeriodSec = 15;          // 0 = off
 unsigned int g_lastDriftTick = 0;
 long long    g_driftLines = 0;
+// The release build's drift summary (every swlogbudget::kDriftSummaryMs): copy checks, how many disagreed, the worst distance.
+long long    g_driftChecked = 0, g_driftOff = 0;
+float        g_driftWorst = 0.0f;
+unsigned int g_driftSummaryAt = 0;
+bool         g_driftSummarySet = false;
+// Per mirror slot: the copy there and its far checks in a row (swlogbudget::DriftDisagrees).
+std::vector<unsigned int> g_driftFarUid;
+std::vector<int>          g_driftFarChecks;
 
 // High-water marks. These are the numbers that answer "was a bound ever close to being hit",
 // which is a different question from "was it hit" - and the only one worth asking before it is.
@@ -252,6 +263,113 @@ void ReadSpeedProbe(Character* c, float* v)
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+/* PROBE P141 BEGIN */
+/* PROBE P141 (T-836, LOG ONLY): a copy (a character this game does not run) the digest printed last period and skips now - one
+   line naming the check that skips it, asked again after the pass in the digest's order (MirrorSlot, then SnapshotState's own
+   FindSpawned and SnapshotHealth; SnapshotState = all three pass now), one line per 60 s while it stays out (at most kP141Track
+   uids, kP141StillMax lines each; a uid no mirror row names is not watched), one line when it is back. Every 60 s the
+   LiveCharacter verdict counts the [M1] REPORT prints, when an unusable count moved. Reads only. */
+const int kP141Seen = 4096;   /* above the copy table's row count, so every printed copy is noted */
+const int kP141Track = 20;
+const int kP141StillMax = 10;
+const unsigned int kP141RepeatMs = 60000;
+unsigned int g_p141Prev[kP141Seen];   // copies the last digest printed
+int g_p141PrevN = 0;
+unsigned int g_p141Cur[kP141Seen];    // copies this digest printed
+int g_p141CurN = 0;
+struct P141Out { unsigned int uid; unsigned int since; unsigned int said; int lines; };
+P141Out g_p141Out[kP141Track];
+int g_p141OutN = 0;
+unsigned int g_p141CountsAt = 0;
+bool g_p141CountsAtSet = false;
+
+void P141NotePrinted(unsigned int uid)
+{
+    if (g_p141CurN < kP141Seen) g_p141Cur[g_p141CurN++] = uid;
+}
+
+bool P141Printed(unsigned int uid)
+{
+    for (int i = 0; i < g_p141CurN; ++i) if (g_p141Cur[i] == uid) return true;
+    return false;
+}
+
+std::string P141Facts(unsigned int uid, bool* hasRow)
+{
+    int pass = 0, row = 0;
+    std::string why;
+    const std::string tail = P141CopyFacts(uid, &pass, &row, &why);
+    *hasRow = row != 0;
+    const char* gate = "MirrorSlot";
+    if (pass)
+    {
+        float parts[32 * kPartFloats];
+        float blood = 0.0f;
+        if (FindSpawned(uid) == 0) gate = "FindSpawned";
+        else if (SnapshotHealth(uid, parts, 32, &blood) <= 0) gate = "SnapshotHealth";
+        else gate = "SnapshotState";
+    }
+    return std::string(" gate=") + gate + " why=" + why + tail;
+}
+
+void P141AfterDigest()
+{
+    const unsigned int now = ElapsedMs();
+    for (int k = 0; k < g_p141OutN; )
+    {
+        const unsigned int uid = g_p141Out[k].uid;
+        const bool own = net::IsUidMine(uid);
+        if (own || P141Printed(uid))
+        {
+            DebugLog("[P141] copy back in status uid=" + N(uid) + " after=" + N((now - g_p141Out[k].since) / 1000) + "s"
+                     + (own ? " (now this game's own)" : ""));
+            g_p141Out[k] = g_p141Out[--g_p141OutN];
+            continue;
+        }
+        if (now - g_p141Out[k].said >= kP141RepeatMs)
+        {
+            bool hasRow = true;
+            const std::string f = P141Facts(uid, &hasRow);
+            g_p141Out[k].said = now;
+            ++g_p141Out[k].lines;
+            const bool last = !hasRow || g_p141Out[k].lines >= kP141StillMax;
+            DebugLog("[P141] copy still dropped uid=" + N(uid) + " for=" + N((now - g_p141Out[k].since) / 1000) + "s" + f + (hasRow ? std::string() : P141ReleaseRouteText(uid, now))
+                     + (last ? " (last line for this uid)" : ""));
+            if (last) { g_p141Out[k] = g_p141Out[--g_p141OutN]; continue; }
+        }
+        ++k;
+    }
+    for (int j = 0; j < g_p141PrevN; ++j)
+    {
+        const unsigned int uid = g_p141Prev[j];
+        if (P141Printed(uid) || net::IsUidMine(uid)) continue;
+        bool watched = false;
+        for (int k = 0; k < g_p141OutN; ++k) if (g_p141Out[k].uid == uid) watched = true;
+        if (watched) continue;
+        bool hasRow = true;
+        const std::string f = P141Facts(uid, &hasRow);
+        const bool watch = hasRow && g_p141OutN < kP141Track;
+        DebugLog("[P141] copy dropped from status uid=" + N(uid) + f + (hasRow ? std::string() : P141ReleaseRouteText(uid, now)) + " t=" + N(now / 1000) + "s"
+                 + (watch ? "" : " (not watched)"));
+        if (watch)
+        {
+            P141Out o; o.uid = uid; o.since = now; o.said = now; o.lines = 0;
+            g_p141Out[g_p141OutN++] = o;
+        }
+    }
+    if (!g_p141CountsAtSet || now - g_p141CountsAt >= kP141RepeatMs)
+    {
+        g_p141CountsAtSet = true;
+        g_p141CountsAt = now;
+        const std::string line = P141LiveCountsLine();
+        if (!line.empty()) DebugLog(line + " t=" + N(now / 1000) + "s");
+    }
+    for (int j = 0; j < g_p141CurN; ++j) g_p141Prev[j] = g_p141Cur[j];
+    g_p141PrevN = g_p141CurN;
+    g_p141CurN = 0;
+}
+/* PROBE P141 END */
+
 // The rolling digest. One line per replicated character, every g_driftPeriodSec seconds, in
 // a format the two instances' logs can be diffed against each other line for line. The whole
 // run becomes a time series instead of the handful of samples an executor had time to take.
@@ -269,6 +387,24 @@ void DriftDigest()
         unsigned int latch = 0; float nextKO = 0.0f, koT = 0.0f;
         int n = SnapshotState(uid, rec, 32, &blood, &prone, &dead, &latch, &nextKO, &koT);
         if (n <= 0) continue;
+#ifndef SW_DEV_BUILD
+        /* the release build: a line only for a copied character whose copy disagrees with what its owner last sent (src/common/
+           logbudget.h DriftDisagrees: past the distance at which the drive starts correcting it on two checks in a row, or dead /
+           alive against the owner's word); the others are only counted for the summary every 5 minutes. This game's own
+           characters get no line. */
+        if (net::IsUidMine(uid)) continue;
+        {
+            if ((int)g_driftFarUid.size() <= i) { g_driftFarUid.resize((size_t)i + 1, 0); g_driftFarChecks.resize((size_t)i + 1, 0); }
+            if (g_driftFarUid[(size_t)i] != uid) { g_driftFarUid[(size_t)i] = uid; g_driftFarChecks[(size_t)i] = 0; }
+            const float driftXZ = PuppetWindowDriftNow(uid);
+            const bool off = swlogbudget::DriftDisagrees(driftXZ, PuppetCorrectDistance(), dead, CopyOwnerSaysDead(uid) ? 1 : 0,
+                                                         &g_driftFarChecks[(size_t)i]);
+            ++g_driftChecked;
+            if (off) ++g_driftOff;
+            if (driftXZ > g_driftWorst) g_driftWorst = driftXZ;
+            if (!off) { /* PROBE P141 BEGIN */ P141NotePrinted(uid); /* PROBE P141 END */ continue; }
+        }
+#endif
 
         std::string fs;
         for (int p = 0; p < n; ++p)
@@ -289,6 +425,7 @@ void DriftDigest()
         const std::string speedProbe = " P071 run=" + F2(sp[0]) + " ath=" + F2(sp[1]) + " athMul=" + F2(sp[2])
             + " enc=" + F2(sp[3]) + " animMax=" + F2(sp[4]) + " mvMax=" + F2(sp[5]);
         ++g_driftLines;
+        /* PROBE P141 BEGIN */ if (!net::IsUidMine(uid)) P141NotePrinted(uid); /* PROBE P141 END */
         DebugLog("[M5] drift t=" + N(ElapsedMs() / 1000) + "s uid=" + N(uid)
                  + " mine=" + N(net::IsUidMine(uid) ? 1 : 0)
                  + " prone=" + N(prone) + " dead=" + N(dead)
@@ -305,6 +442,20 @@ void DriftDigest()
                  + " " + CombatString(c)
                  + " parts=" + N(n) + " fs=" + fs);
     }
+    /* PROBE P141 BEGIN */ P141AfterDigest(); /* PROBE P141 END */
+#ifndef SW_DEV_BUILD
+    const unsigned int nowMs = ElapsedMs();
+    if (!g_driftSummarySet) { g_driftSummarySet = true; g_driftSummaryAt = nowMs; }
+    else if (nowMs - g_driftSummaryAt >= swlogbudget::kDriftSummaryMs)
+    {
+        DebugLog("[M5] drift summary t=" + N(nowMs / 1000) + "s: " + N(g_driftChecked) + " copy checks in the last "
+                 + N((nowMs - g_driftSummaryAt) / 1000) + " s, " + N(g_driftOff) + " disagreed with their owner's word, worst distance "
+                 + F2(g_driftWorst) + " (off past " + F2(PuppetCorrectDistance()) + " on " + N((int)swlogbudget::kDriftHoldChecks)
+                 + " checks in a row, LOST past " + F2(PuppetLostDistance()) + "; the release build writes a drift line only for a copy"
+                 " that disagrees)");
+        g_driftSummaryAt = nowMs; g_driftChecked = 0; g_driftOff = 0; g_driftWorst = 0.0f;
+    }
+#endif
 }
 
 // Was this exact transition written by us this tick? Consumes the note either way, so one
@@ -350,6 +501,7 @@ void SoakTick()
 {
     unsigned int ms = ElapsedMs();
     ++g_frame;
+    QuietLogFlush(true);   /* once a minute: every quiet gate's held counts (coop_log.h) */
 
     // F337 - **IS GAMEPLAY RUNNING RIGHT NOW**, which is not the same question as "has gameplay
     // ever started". `MainLoopFrames()` is cumulative, so a gate built on `> 0` stays open forever
@@ -461,7 +613,7 @@ void SoakTick()
                 if (g_lastPaused >= 0)   // not the priming sample
                 {
                     ++g_pauseEdges;
-                    DebugLog("[P039] STOP STATE CHANGED t=" + N(ms / 1000) + "s stopped="
+                    SW_DEVLOG("[P039] STOP STATE CHANGED t=" + N(ms / 1000) + "s stopped="
                              + N(g_lastPaused) + "->" + N(stopped)
                              + " (pausedFlag=" + N(paused ? 1 : 0)
                              + " speedMul=" + F2(g_lastSpeedMul) + "->" + F2(mul) + ")"
@@ -483,7 +635,7 @@ void SoakTick()
                 // A speed change that did NOT start or end a stop. Its own counter and its own
                 // wording, because calling this a pause is what made the old counter unreadable.
                 ++g_speedEdges;
-                DebugLog("[P039] SPEED CHANGED t=" + N(ms / 1000) + "s speedMul="
+                SW_DEVLOG("[P039] SPEED CHANGED t=" + N(ms / 1000) + "s speedMul="
                          + F2(g_lastSpeedMul) + "->" + F2(mul) + " (stopped=" + N(stopped)
                          + " throughout - this is NOT a pause)");
             }
@@ -512,7 +664,7 @@ void SoakTick()
             w->primed = true;
             w->lastProne = prone;
             w->lastDead  = dead;
-            DebugLog("[M5] watch uid=" + N(uid) + " baseline prone=" + N(prone)
+            SW_QUIETLOG(g_qWatchBaseline, "[M5] watch baseline", 0, 0, "[M5] watch uid=" + N(uid) + " baseline prone=" + N(prone)
                      + "(" + ProneName(prone) + ") dead=" + N(dead)
                      + " mine=" + N(net::IsUidMine(uid) ? 1 : 0));
             continue;
@@ -595,6 +747,7 @@ int SoakForgetUid(unsigned int uid)
 
 void SoakWorldTeardown()
 {
+    /* PROBE P141 BEGIN */ g_p141PrevN = 0; g_p141CurN = 0; g_p141OutN = 0; /* PROBE P141 END */
     for (int i = 0; i < kMaxWatch; ++i)
     {
         g_watch[i].uid = 0; g_watch[i].lastProne = -1; g_watch[i].lastDead = -1; g_watch[i].primed = false;

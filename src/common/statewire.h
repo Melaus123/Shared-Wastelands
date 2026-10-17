@@ -104,7 +104,7 @@ struct StateMsg
     float        hunger;        /* MedicalSystem::hunger +0x60 */
     float        fed;           /* MedicalSystem::fed +0x64 */
     unsigned char limbsHas;     /* LIMBS (133): 1 = limbs below are the owner's; 0 = not carried (absent or malformed) */
-    cooplimb::LimbsWire limbs;  /* the owner's four limbs: state, and the fitted robotic limb's sid and quality */
+    cooplimb::LimbsWire limbs;  /* the owner's four limbs: state, and the fitted robotic limb's sid, quality and level */
 };
 
 inline void EncodeState(std::vector<char>* b, unsigned int uid, const float* parts, unsigned int partCount,

@@ -26,6 +26,7 @@
 #include "../common/liveenvelope.h"   /* M7a3f7 [m7a3f7-hi0]: PlayerKeyOf / SamePlayer - the giver and the receiver as player keys */
 #include "../common/liveowner.h"   /* M7a A1 build 1 [a1b1-hd0]: AgreedSquadLeaderN */
 #include "../common/peergone.h"    /* PlayerGoneTakesRow: a player who leaves takes back only the squads handed to it */
+#include "../common/twinsleep.h"   /* T-761: the withdrawal kinds - a REVOKE with no winner takes a save-born twin only as the last resort */
 namespace coop { int KeeperPot(void* character, void** ownOut, int* catsOut); int KeeperPotWritePod(void* own, int cats);
                  int KeeperPotsInFlight(std::vector<void*>* pots, int* unresolved); }   /* T-1 B3 restructure: items.cpp - the squad's pot */
 namespace coop { int KeeperPotAnnounced(void* character, void** ownOut, int* catsOut); }
@@ -467,8 +468,87 @@ void BuildMembers(const std::vector<unsigned int>& uids, std::vector<net::XferMe
 long long g_nudges = 0, g_keptUntaken = 0, g_xferInOutsideRing = 0;
 long long g_tick = 0, g_squadsSeen = 0, g_xferOut = 0, g_xferResent = 0, g_xferAbandoned = 0, g_ackIn = 0, g_released = 0;
 long long g_xferIn = 0, g_taken = 0, g_intentsGiven = 0, g_intentsSubjectUnresolved = 0, g_ackOut = 0, g_xferInUnknownUid = 0, g_teleports = 0;
+std::set<void*> g_moneyKnown;   /* T-799 D1: the squad pots (Ownerships) whose money is known on this game - see coopsquad::MoneyKnownAfter */
+long long g_moneyKnownMarks = 0, g_catsWithheldNow = 0;
+long long g_moneyEv[coopsquad::kMoneyEvKinds] = { 0, 0, 0, 0, 0, 0, 0, 0 }, g_moneyKnownCleared = 0;   /* T-799 D1: marks asked, by event kind; marks cleared */
+long long g_recMoneyCarried = 0, g_recMoneyNotCarried = 0;                     /* T-799 D2: records written with / without the money */
+long long g_keeperPotMismatch = 0;   /* keepers whose pot (KeeperPot) is not their squad's embedded pot - the one store.cpp marks at a load */
+long long g_moneyListWritten = 0, g_moneyListWriteFailed = 0, g_moneyListRead = 0, g_moneyListBad = 0;   /* the list beside a save (store.cpp) */
+struct HolderRestockPend { int cats; long long delta; };
+std::map<unsigned int, HolderRestockPend> g_holderRestock;   /* T-799 D4: formal leader -> the restock that arrived: its money and the change owed (coopsquad::HolderRestockDelta), added at the safe point */
+std::map<unsigned int, int> g_hrResends;   /* T-799 D4: formal leader -> times a restock for it was sent on (coopsquad::HolderRestockResend) since one was written */
+std::set<unsigned int> g_hrSentLogged, g_hrAppliedLogged;   /* T-799 D4: the leaders already logged */
+long long g_hrSent = 0, g_hrSendFailed = 0, g_hrArrived = 0, g_hrApplied = 0, g_hrNotRunner = 0, g_hrUnread = 0, g_hrResent = 0, g_hrAdoptSuperseded = 0;
 
 } // namespace
+/* T-799 D1: the money-known mark of a squad pot (items.cpp's restock detour, this file's copy write and take-over adoption).
+   Cleared with the world (items.cpp ItemsWorldTeardown): a pot of the next world is another object. MAIN THREAD. */
+void KeeperMoneyKnownMark(void* own, int ev)
+{
+    if (own == 0) return;
+    if (ev > 0 && ev < coopsquad::kMoneyEvKinds) ++g_moneyEv[ev];
+    const int was = (g_moneyKnown.find(own) != g_moneyKnown.end()) ? 1 : 0;
+    if (coopsquad::MoneyKnownAfter(was, ev) != 0) { if (g_moneyKnown.insert(own).second) ++g_moneyKnownMarks; }
+    else if (was != 0) { g_moneyKnown.erase(own); ++g_moneyKnownCleared; }   /* a record without the money, or a freed pot */
+}
+int KeeperMoneyKnown(void* own) { return (own != 0 && g_moneyKnown.find(own) != g_moneyKnown.end()) ? 1 : 0; }
+void KeeperMoneyKnownClear() { g_moneyKnown.clear(); g_catsWithheldNow = 0; g_holderRestock.clear(); g_hrResends.clear(); g_hrSentLogged.clear(); g_hrAppliedLogged.clear(); }
+/* items.cpp: a keeper whose pot is not its squad's embedded pot (the mark store.cpp sets at a load would name another object) */
+void KeeperPotMismatchNote() { ++g_keeperPotMismatch; }
+/* store.cpp: the list beside a save - 0 written, 1 not written, 2 read at a load, 3 present but not a list (read as empty) */
+void KeeperMoneyListNote(int kind)
+{
+    if (kind == 0) ++g_moneyListWritten; else if (kind == 1) ++g_moneyListWriteFailed; else if (kind == 2) ++g_moneyListRead; else ++g_moneyListBad;
+}
+/* T-799 D3: 1 = a take-over adoption of the other game's announced money is due for squad `ap` led by `leader` (this game runs it) -
+   the keeper repair waits for that write, which is the known value. */
+int SquadCatsAdoptDue(void* ap, unsigned int leader)
+{
+    long long delta = 0; unsigned int seq = 0; int cats = 0;
+    return (CatsAdoptAction(ap, leader, &delta, &seq, &cats) != coopsquad::kCatsNone) ? 1 : 0;
+}
+/* T-799 D2: a record store.cpp wrote with (1) or without (0) the group's money - counted on the keeperMoney report. MAIN THREAD. */
+void KeeperRecordMoneyNote(int carried) { if (carried != 0) ++g_recMoneyCarried; else ++g_recMoneyNotCarried; }
+/* T-799 D4: the engine's restock ran on this game (the area's holder) for a keeper whose formal leader `leaderUid` may be another
+   game's - then the money it set goes to that game (MSG_KEEPER_RESTOCK, to the leader's owner). MAIN THREAD (the restock detour). */
+void KeeperRestockToRunner(unsigned int leaderUid, int cats)
+{
+    if (coopsquad::HolderRestockSend(1, (leaderUid != 0 && net::IsUidMine(leaderUid)) ? 1 : 0, leaderUid != 0 ? 1 : 0) == 0) return;
+    coopsquad::KeeperRestockMsg m; m.leader = leaderUid; m.cats = cats;
+    if (!net::SendKeeperRestock(m)) { ++g_hrSendFailed; return; }
+    ++g_hrSent;
+    if (g_hrSentLogged.insert(leaderUid).second)
+        DebugLog("[KEEPER] holder restock sent: leader=" + N((long long)leaderUid) + " money=" + N((long long)cats)
+                 + " (to the game that runs the keeper; once per leader, counted holderRestock[sent])");
+}
+/* T-799 D4: a restock for a leader this game does not run (a hand-over in flight) goes on to the leader's owner as this game knows
+   it, a limited number of times per leader between two written restocks; past that, or with no owner known, it is dropped (counted
+   holderRestock[notRunner]). MAIN THREAD. */
+void KeeperRestockResend(const coopsquad::KeeperRestockMsg& m)
+{
+    int& n = g_hrResends[m.leader];
+    if (coopsquad::HolderRestockResend(n) == 0) { ++g_hrNotRunner; return; }
+    ++n;
+    if (net::SendKeeperRestock(m)) ++g_hrResent; else ++g_hrNotRunner;
+}
+/* T-799 D4: a restock the area's holder sent. Taken at its arrival (the drain, MAIN THREAD): the change owed is the restocked money
+   less the pot as this game announces it now (coopsquad::HolderRestockDelta - this game's priced requests still in flight on the pot
+   are applied by the holder after its restock, as their answers come by the same ordered road behind it); the change is added at
+   the next safe point (SquadCatsSafePointDrain). A newer restock replaces one not yet added: the engine's restock SETS the money. */
+void KeeperRestockArrive(const coopsquad::KeeperRestockMsg& m)
+{
+    ++g_hrArrived;
+    ::Character* c = FindSpawned(m.leader);
+    const int mine = net::IsUidMine(m.leader) ? 1 : 0;
+    void* own = 0; int announced = 0;
+    const int read = (mine != 0 && Plaus(c) && KeeperPotAnnounced((void*)c, &own, &announced) == 1) ? 1 : 0;
+    const int act = coopsquad::HolderRestockApply(mine, read);
+    if (act == coopsquad::kHrNotRunner) { KeeperRestockResend(m); return; }
+    if (act != coopsquad::kHrApply) { ++g_hrUnread; return; }
+    HolderRestockPend& p = g_holderRestock[m.leader];
+    p.cats = m.cats; p.delta = coopsquad::HolderRestockDelta(m.cats, announced);
+    g_catsDue = 1;
+}
 
 // par23b: Teleport above, unchanged, reachable from items.cpp (packbuytest goto).
 bool TeleportCharacter(::Character* c, float x, float y, float z) { return Teleport(c, x, y, z); }
@@ -709,6 +789,25 @@ bool HandedOverHasId(const std::string& id)
     for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s)
         if (s->first.second == id && IdxWholeGiven(s->first, s->second) != 0) return true;   /* [a1b2f1-hd5] [review F5] */
     return false;
+}
+/* the one slot every given person of a wholly given squad went to (the squad's runner now); -1 = not wholly given, or given to several
+   games. faction 0 = any faction, by id. */
+int HandedOverSlot(void* faction, const std::string& id)
+{
+    ReleaseForgetDrain();
+    for (std::map<HoKey, SquadIdx>::const_iterator s = g_squadIdx.begin(); s != g_squadIdx.end(); ++s)
+    {
+        if (s->first.second != id || (faction != 0 && s->first.first != faction) || IdxWholeGiven(s->first, s->second) == 0) continue;
+        int slot = -1;
+        for (std::map<unsigned int, unsigned int>::const_iterator g = s->second.given.begin(); g != s->second.given.end(); ++g)
+        {
+            const int to = net::PlayerSlotOfKey(g->second);
+            if (to < 0 || (slot >= 0 && to != slot)) return -1;
+            slot = to;
+        }
+        return slot;
+    }
+    return -1;
 }
 bool HandedOverAny()
 {
@@ -1356,7 +1455,7 @@ static void RelApplyRevokeRow(unsigned int uid, unsigned int wgen, unsigned int 
     }
     net::ReleaseLocalOwner(uid, fromPeer, wgen);
     WorldStateOnOwnershipReleased(uid, c);
-    ApplyRemoteUnload(uid);
+    ApplyRemoteUnload(uid, twinsleep::kKindNeverTake);   /* the giver keeps it asleep in its world data: a save-born twin here is put to sleep, taken only as the last resort */
     net::ForgetCopyRecord(uid);
     ++g_relInRemoved;
     RelLog("[RELEASE] <- REVOKE uid=" + N((long long)uid) + " from " + SlotText(from) + " -> REMOVED (no game runs it: it sleeps in the giver's world data) (releaseIn removed " + N(g_relInRemoved) + ")");
@@ -1522,6 +1621,7 @@ void HandoffTick()
     std::set<void*> leadSeen;   /* T-1 B1 restructure: my squads announced (or unchanged) this pass - LeadDropUnseen retires the rest */
     std::map<void*, int> xferGate;   /* T-1 B3 fold (L3): per squad seen, HandoverXferMayGo - its resends are gated the same way */
     int leadSends = 0;
+    g_catsWithheldNow = 0;   /* T-799 D1: counted again by this pass */
     for (std::map<void*, std::vector<unsigned int> >::iterator it = squads.begin(); it != squads.end(); ++it)
     {
         ++g_squadsSeen;
@@ -1542,6 +1642,8 @@ void HandoffTick()
             long long adoptDelta = 0; unsigned int adoptSeq = 0; int adoptCats = 0;
             if (haveCats != 0 && CatsAdoptAction(it->first, leaderUid, &adoptDelta, &adoptSeq, &adoptCats) != coopsquad::kCatsNone)
             { leadSeen.insert(it->first); xferGate[it->first] = 0; g_catsDue = 1; continue; }
+            /* T-799 D1: a pot whose money is not known here goes out with no money - the copies keep their value */
+            if (haveCats != 0 && coopsquad::AnnounceCarriesMoney(1, KeeperMoneyKnown(potOwn)) == 0) { haveCats = 0; cats = 0; ++g_catsWithheldNow; }
         }
         // T-1 B1 restructure (re-check N1-N5 of ff655c5): ONE AUTHORITY, ONE ANNOUNCED VALUE. This game's engine's acting leader of
         // the squad (EngineLeaderChoice: +0xA0 if standing, else +0xA8 - computed ONCE, here) is announced with the formal leader
@@ -1592,7 +1694,7 @@ void HandoffTick()
             {
                 const std::string q(1, (char)34);
                 DebugLog("[XFER] -> squad leader=" + N(followUid) + " members=" + N((long long)p.members.size()) + " reason=follow-leader");
-                DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(followUid) + "," + q + "members" + q + ":" + N((long long)p.members.size())
+                SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(followUid) + "," + q + "members" + q + ":" + N((long long)p.members.size())
                          + "," + q + "forced" + q + ":0," + q + "reason" + q + ":" + q + "follow-leader" + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
             }
             continue;
@@ -1665,7 +1767,7 @@ void HandoffTick()
         { ForcedTry f; f.target = target; f.x = s.x; f.y = s.y; f.refused = 0; g_forcedTry[key] = f; }   /* its ACK says whether to back off */
         const std::string q(1, (char)34);
         DebugLog("[XFER] -> squad leader=" + N(key) + " members=" + N((long long)p.members.size()) + " sector=" + SectorString(s) + " (my player sector " + SectorString(mine) + ") " + reason + " to slot " + N((long long)target) + " keepHere=0 listed=" + N((long long)listedHere));
-        DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(key) + "," + q + "members" + q + ":" + N((long long)p.members.size())
+        SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_out" + q + "," + q + "leader" + q + ":" + N(key) + "," + q + "members" + q + ":" + N((long long)p.members.size())
                  + "," + q + "sector" + q + ":" + q + SectorString(s) + q + "," + q + "forced" + q + ":" + (forced ? "1" : "0") + "," + q + "reason" + q + ":" + q + reason + q + "," + q + "tick" + q + ":" + N(g_tick) + "}");
     }
     LeadDropUnseen(leadSeen, &leadSends);   /* squads this game no longer runs any member of: n = 0, the other game forgets them */
@@ -1754,7 +1856,7 @@ void ApplyRemoteXfer(unsigned int leader, unsigned int reason, const net::XferMe
     if (!logIn && taken == 0) return;
     const std::string q(1, (char)34);
     DebugLog("[XFER] <- squad leader=" + N(leader) + " members=" + N(count) + " taken=" + N(taken) + " intents=" + N(intents) + " unresolvedSubjects=" + N(unresolved) + " unknown=" + N(unknown) + (reason == (unsigned int)coopsquad::kXferReasonForced ? std::string(" FORCED") : (reason == (unsigned int)coopsquad::kXferReasonNone ? std::string() : " reason=" + std::string(coopsquad::XferReasonName(reason)))));
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_in" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "members" + q + ":" + N(count) + "," + q + "taken" + q + ":" + N(taken)
+    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_in" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "members" + q + ":" + N(count) + "," + q + "taken" + q + ":" + N(taken)
              + "," + q + "intents" + q + ":" + N(intents) + "," + q + "unresolved" + q + ":" + N(unresolved) + "," + q + "unknown" + q + ":" + N(unknown) + ",\"tick\":" + N(g_tick) + "}");
 }
 
@@ -1826,7 +1928,7 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
     {
         const std::string q(1, (char)34);
         DebugLog("[XFER] ACK leader=" + N(leader) + " released=" + N(released) + " kept=" + N(kept) + " after " + N(p.sends) + " send(s)");
-        DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_ack" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "released" + q + ":" + N(released) + "," + q + "kept" + q + ":" + N(kept) + "," + q + "sends" + q + ":" + N(p.sends) + ",\"tick\":" + N(g_tick) + "}");
+        SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_ack" + q + "," + q + "leader" + q + ":" + N(leader) + "," + q + "released" + q + ":" + N(released) + "," + q + "kept" + q + ":" + N(kept) + "," + q + "sends" + q + ":" + N(p.sends) + ",\"tick\":" + N(g_tick) + "}");
     }
     const Pending flown(p);
     g_pending.erase(it);
@@ -1927,7 +2029,7 @@ void P119Flush()
         const int cheb = p.x < 0 ? -1 : ((s.x > p.x ? s.x - p.x : p.x - s.x) > (s.y > p.y ? s.y - p.y : p.y - s.y) ? (s.x > p.x ? s.x - p.x : p.x - s.x) : (s.y > p.y ? s.y - p.y : p.y - s.y));
         const float pcx = p.x * 4608.0f - 147456.0f + 2304.0f, pcz = p.y * 4608.0f - 147456.0f + 2304.0f;   /* the player SECTOR's centre (zones.cpp kSectorSize / kSectorOrigin) */
         const float pd = sqrtf((r.x - pcx) * (r.x - pcx) + (r.z - pcz) * (r.z - pcz));
-        DebugLog("[PROBE] P119 putAway key=" + N(r.key) + " n=" + N((long long)r.n) + " reason='" + std::string(r.reason) + "' pos=" + N((long long)r.x) + "," + N((long long)r.z)
+        SW_DEVLOG("[PROBE] P119 putAway key=" + N(r.key) + " n=" + N((long long)r.n) + " reason='" + std::string(r.reason) + "' pos=" + N((long long)r.x) + "," + N((long long)r.z)
                  + " sector=" + SectorString(s) + " player=" + SectorString(p) + " cheb=" + (cheb < 0 ? std::string("?") : (cheb >= 2 ? std::string("2+") : N((long long)cheb)))
                  + " kind=" + P119KindName(kind) + " edge=" + N((long long)P119EdgeDist(r.x, r.z)) + " playerSecDist=" + N((long long)pd)
                  + " zone='" + P119ZoneText(s.x, s.y) + "' leaderLive=" + N((long long)r.leaderLive));
@@ -1951,7 +2053,7 @@ static void P119KeepSample(const std::map<void*, std::vector<unsigned int> >& sq
         ++k[kind]; ++g_p119Keep[kind];
         const int b = P119EdgeBin(P119EdgeDist(x, z)); ++e[b]; ++g_p119KeepEdge[b];
     }
-    DebugLog("[PROBE] P119 keep self=" + N(k[0]) + " side=" + N(k[1]) + " corner=" + N(k[2]) + " out=" + N(k[3]) + " edge[<500,<1000,<2000,>=2000]=" + N(e[0]) + "," + N(e[1]) + "," + N(e[2]) + "," + N(e[3])
+    SW_DEVLOG("[PROBE] P119 keep self=" + N(k[0]) + " side=" + N(k[1]) + " corner=" + N(k[2]) + " out=" + N(k[3]) + " edge[<500,<1000,<2000,>=2000]=" + N(e[0]) + "," + N(e[1]) + "," + N(e[2]) + "," + N(e[3])
              + " P119[putAway self,side,corner,out; keep self,side,corner,out; logged,counted]=" + N(g_p119Put[0]) + "," + N(g_p119Put[1]) + "," + N(g_p119Put[2]) + "," + N(g_p119Put[3])
              + ";" + N(g_p119Keep[0]) + "," + N(g_p119Keep[1]) + "," + N(g_p119Keep[2]) + "," + N(g_p119Keep[3]) + ";" + N(g_p119Logged) + "," + N(g_p119Counted));
 }
@@ -2173,7 +2275,7 @@ void ReportHandoff()
              + " releaseSkip[inFlight,offThread,unread,player,notAnnounced]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer)
              + "," + N(g_relSkipNotAnnounced)
              + " release[sent,adopted,asleep]=" + N(g_relSent) + "," + N(g_relAdopted) + "," + N(g_relAsleep) + " releaseOpen=" + N((long long)g_release.size()));
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_report" + q + "," + q + "xferOut" + q + ":" + N(g_xferOut) + "," + q + "ackIn" + q + ":" + N(g_ackIn) + "," + q + "released" + q + ":" + N(g_released)
+    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_report" + q + "," + q + "xferOut" + q + ":" + N(g_xferOut) + "," + q + "ackIn" + q + ":" + N(g_ackIn) + "," + q + "released" + q + ":" + N(g_released)
              + "," + q + "abandoned" + q + ":" + N(g_xferAbandoned) + "," + q + "xferIn" + q + ":" + N(g_xferIn) + "," + q + "taken" + q + ":" + N(g_taken) + "," + q + "ackOut" + q + ":" + N(g_ackOut) + "," + q + "pending" + q + ":" + N((long long)g_pending.size()) + "}");
 }
 
@@ -2409,13 +2511,16 @@ bool PlayerTeleportGround()
 // (net::IsUidMine false) in the other player's own faction (PeerFactionPod 1, the test PeerPlayerPosition uses); the lead =
 // the copy that is its own squad's leader (ActivePlatoon::squadleader, LeaderOf), else the lowest uid. Same engine teleport and
 // camera follow as PlayerTeleport. 50 world units = about 5 m (packbuytest's 15 = ~1.5 m scale; Inferred).
-bool PlayerTeleportPeer()
+// Returns 1 done (*out = "target uid=N lead=L dist=D"), 0 refused (*out = why, logged), 2 no copy of the other player's
+// characters is loaded here yet (*out = why, NOT logged: the command's wait retries every 500 ms and logs once itself).
+int PlayerTeleportPeer(std::string* out)
 {
     const float kPeerOffset = 50.0f;
+    out->clear();
     ::Character* pc = GetTarget();
     float x = 0, y = 0, z = 0;
     if (!Plaus(pc) || !ReadPos(pc, &x, &y, &z))
-    { DebugLog("[TRADER] teleport peer MISSED reason=this game has no watched player character, or its position could not be read"); return false; }
+    { *out = "this game has no watched player character, or its position could not be read"; DebugLog("[TRADER] teleport peer MISSED reason=" + *out); return 0; }
     ::Character* best = 0; unsigned int bestUid = 0; int bestLead = 0, copies = 0;
     const int cap = MirrorCapacity();
     for (int i = 0; i < cap; ++i)
@@ -2430,22 +2535,23 @@ bool PlayerTeleportPeer()
         if (best == 0 || lead > bestLead || (lead == bestLead && uid < bestUid)) { best = c; bestUid = uid; bestLead = lead; }
     }
     if (best == 0)
-    { DebugLog("[TRADER] teleport peer MISSED reason=no copy of the other player's characters is loaded here (peerCopies=0)"); return false; }
+    { *out = "no copy of the other player's characters is loaded here (peerCopies=0)"; return 2; }
     float tx = 0, ty = 0, tz = 0;
     if (!ReadPos(best, &tx, &ty, &tz))
-    { DebugLog("[TRADER] teleport peer MISSED reason=the target's position could not be read target uid=" + N(bestUid)); return false; }
+    { *out = "the target's position could not be read target uid=" + N(bestUid); DebugLog("[TRADER] teleport peer MISSED reason=" + *out); return 0; }
     float ux = x - tx, uz = z - tz;
     const float len = sqrtf(ux * ux + uz * uz);
     if (len < 0.01f) { ux = 1.0f; uz = 0.0f; } else { ux /= len; uz /= len; }
     const float nx = tx + ux * kPeerOffset, nz = tz + uz * kPeerOffset;
     if (!Teleport(pc, nx, ty, nz))
-    { DebugLog("[TRADER] teleport peer MISSED reason=the engine's teleport 0x5C9BF0 faulted target uid=" + N(bestUid)); return false; }
+    { *out = "the engine's teleport 0x5C9BF0 faulted target uid=" + N(bestUid); DebugLog("[TRADER] teleport peer MISSED reason=" + *out); return 0; }
     ++g_teleports;
     const int cam = FocusCameraPod(nx, ty, nz);
     DebugLog("[TRADER] teleport peer from " + F1(x) + "," + F1(y) + "," + F1(z) + " to " + F1(nx) + "," + F1(ty) + "," + F1(nz)
              + " target uid=" + N(bestUid) + " lead=" + N(bestLead) + " peerCopies=" + N(copies) + " dist=" + F1(len)
              + " camera=" + N(cam));
-    return true;
+    *out = "target uid=" + N(bestUid) + " lead=" + N(bestLead) + " dist=" + F1(len);
+    return 1;
 }
 
 /* ================= T-1 B3 restructure (review F1-F5 of 2534248, T540; protocol 89): A SQUAD'S MONEY RIDES MSG_SQUAD_LEAD =================
@@ -2490,6 +2596,38 @@ void SquadCatsSafePointDrain()
         if (!net::IsUidMine(s->first) || g_catsAdopt.find(s->first) != g_catsAdopt.end()) g_catsTakeSnap.erase(s++);   /* T-1 B3 fold (M2) */
         else ++s;
     }
+    /* T-799 D4: restocks the area's holder sent for keepers this game runs - the change taken at the arrival (KeeperRestockArrive)
+       is added to the pot, so the moves made here since stay in it. A take-over adoption still due for the squad is superseded: the
+       holder sent the restock to this game as the keeper's runner, after the hand-over, and the restock SETS the money, so the older
+       value is not written over it (recorded as adopted, as a written adoption is). A hand-over away from this game since the arrival:
+       the restock goes on to the new owner. */
+    for (std::map<unsigned int, HolderRestockPend>::iterator h = g_holderRestock.begin(); h != g_holderRestock.end(); )
+    {
+        const unsigned int L = h->first; const HolderRestockPend pd = h->second;
+        g_holderRestock.erase(h++);
+        ::Character* c = FindSpawned(L);
+        const int mine = net::IsUidMine(L) ? 1 : 0;
+        void* own = 0; int cur = 0;
+        const int read = (mine != 0 && Plaus(c) && KeeperPot((void*)c, &own, &cur) == 1) ? 1 : 0;
+        const int act = coopsquad::HolderRestockApply(mine, read);
+        if (act == coopsquad::kHrNotRunner) { coopsquad::KeeperRestockMsg m; m.leader = L; m.cats = pd.cats; KeeperRestockResend(m); continue; }
+        if (act != coopsquad::kHrApply) { ++g_hrUnread; continue; }
+        long long dd = 0; unsigned int ds = 0; int dc = 0;
+        if (CatsAdoptAction(SquadActivePlatoonOf(c), L, &dd, &ds, &dc) != coopsquad::kCatsNone)
+        {
+            CatsAdopt& r = g_catsAdopt[L]; r.seq = ds; r.cats = dc;
+            g_catsTakeSnap.erase(L);
+            ++g_hrAdoptSuperseded;
+        }
+        int want = 0;
+        if (coopsquad::HolderRestockWant(cur, pd.delta, &want) == 0 || (want != cur && KeeperPotWritePod(own, want) == 0)) { ++g_hrUnread; continue; }
+        KeeperMoneyKnownMark(own, coopsquad::kMoneyEvPeerWritten);
+        ++g_hrApplied;
+        g_hrResends.erase(L);
+        if (g_hrAppliedLogged.insert(L).second)
+            DebugLog("[KEEPER] holder restock applied: leader=" + N((long long)L) + " money " + N((long long)cur) + "->" + N((long long)want)
+                     + " (restocked to " + N((long long)pd.cats) + "; the moves made here since its arrival kept; once per leader, counted holderRestock[applied])");
+    }
     std::vector<unsigned int> leaders;
     g_peerLead.CatsLeaders(&leaders);
     for (std::map<unsigned int, CatsAdopt>::const_iterator s = g_catsTakeSnap.begin(); s != g_catsTakeSnap.end(); ++s)
@@ -2524,6 +2662,7 @@ void SquadCatsSafePointDrain()
             const long long want = (act == coopsquad::kCatsAbsolute) ? (long long)eCats : (long long)cur + delta;
             if (want > 2147483647LL || want < -2147483647LL - 1LL) { CatsPotUnread(L, eSeq); continue; }
             if (want != (long long)cur && KeeperPotWritePod(own, (int)want) == 0) { CatsPotUnread(L, eSeq); continue; }
+            KeeperMoneyKnownMark(own, coopsquad::kMoneyEvPeerWritten);   /* T-799 D1: the other game's value is this pot's now */
             CatsAdopt& r = g_catsAdopt[L]; r.seq = eSeq; r.cats = eCats;
             g_catsTakeSnap.erase(L);
             if (act == coopsquad::kCatsAbsolute) ++g_catsHandoverAdopted; else if (delta != 0) ++g_catsHandoverDelta;
@@ -2550,9 +2689,10 @@ void SquadCatsSafePointDrain()
         const CatsCopyPot& p = pots[k];
         const int held = (unresolved > 0 || std::find(flight.begin(), flight.end(), p.own) != flight.end()) ? 1 : 0;
         const int act = coopsquad::CopyPotAction(p.cats, p.cur, held);
-        if (act == coopsquad::kPotEqual) continue;
+        if (act == coopsquad::kPotEqual) { KeeperMoneyKnownMark(p.own, coopsquad::kMoneyEvPeerWritten); continue; }   /* T-799 D1: it holds the runner's value */
         if (act == coopsquad::kPotHold) { ++g_catsHeld; continue; }   /* F5: written by the first pass after they settle */
         if (KeeperPotWritePod(p.own, p.cats) == 0) { CatsPotUnread(p.leader, p.seq); continue; }
+        KeeperMoneyKnownMark(p.own, coopsquad::kMoneyEvPeerWritten);   /* T-799 D1 */
         ++g_catsApplied; ++g_catsLogIn;
         // PROBE-START: P133 - this copy write changed the keeper group's money
         P133KeeperCopyWrite(p.leader, p.cur, p.cats);
@@ -2590,7 +2730,15 @@ std::string SquadCatsReport()
            + " adopting=" + N((long long)g_catsAdopt.size())
            + " squadCats3[ownPotSkipped,adoptHeld,finalSent,undoNotRunner,undoPotChanged,undoShortCats]=" + N(g_catsOwnPotSkipped) + ","
            + N(g_catsAdoptHeld) + "," + N(g_catsFinalSent) + "," + N(g_catsUndoNotRunner) + "," + N(g_catsUndoPotChanged) + "," + N(g_catsUndoShort)
-           + " takeSnaps=" + N((long long)g_catsTakeSnap.size());   /* T-1 B3 fold */
+           + " takeSnaps=" + N((long long)g_catsTakeSnap.size())   /* T-1 B3 fold */
+           + " keeperMoney[knownPots,marks,withheldNow,engineLoaded,recordApplied,recordNoMoney,gone,cleared,recordCarried,recordNotCarried,savedUnknown,potMismatch,listWritten,listWriteFailed,listRead,listBad]="
+           + N((long long)g_moneyKnown.size()) + "," + N(g_moneyKnownMarks) + "," + N(g_catsWithheldNow) + ","
+           + N(g_moneyEv[coopsquad::kMoneyEvEngineLoaded]) + "," + N(g_moneyEv[coopsquad::kMoneyEvRecordApplied]) + ","
+           + N(g_moneyEv[coopsquad::kMoneyEvRecordNoMoney]) + "," + N(g_moneyEv[coopsquad::kMoneyEvGone]) + "," + N(g_moneyKnownCleared) + ","
+           + N(g_recMoneyCarried) + "," + N(g_recMoneyNotCarried) + "," + N(g_moneyEv[coopsquad::kMoneyEvSavedUnknown]) + "," + N(g_keeperPotMismatch) + ","
+           + N(g_moneyListWritten) + "," + N(g_moneyListWriteFailed) + "," + N(g_moneyListRead) + "," + N(g_moneyListBad)   /* T-799 D1 / D2 */
+           + " holderRestock[sent,sendFailed,arrived,applied,notRunner,unread,resent,adoptSuperseded]=" + N(g_hrSent) + "," + N(g_hrSendFailed) + ","
+           + N(g_hrArrived) + "," + N(g_hrApplied) + "," + N(g_hrNotRunner) + "," + N(g_hrUnread) + "," + N(g_hrResent) + "," + N(g_hrAdoptSuperseded);   /* T-799 D4 */
 }
 
 } // namespace coop

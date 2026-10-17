@@ -63,6 +63,7 @@ int g_relayTestMode = 0; unsigned short g_relayTestPort = 0; int g_relayLagMs = 
 int g_relayTestCap = 0, g_relayTestDials = 0;   /* TEST ONLY: relaytest=many's cap and dials */
 int g_relayBridgeMode = 0; unsigned short g_relayBridgePort = 0, g_relayViaPort = 0; int g_relayCap = 0;   /* relaybridge= / relayvia= / relaycap= */
 int g_parityHoldSec = 0;                    /* T-734 TEST ONLY: parityholdsec= */
+std::string g_sweepSkip;                    /* TEST ONLY: sweepskip= */
 std::string g_slotProfile;                   /* prof1 fold (review-prof1 4): the picked profile's save folder - a re-arm keeps it over the file's slot= */
 std::string g_slotFile;                      /* T-201 PP5: the settings' own slot= as last armed - what ConfigLeave puts back when the profile's folder goes */
 int g_ownSaveCfg = 1;                        /* mmo1: ownsave= (T-251: default on) */
@@ -457,6 +458,7 @@ unsigned short ConfigRelayBridgePort() { return g_relayBridgePort; }
 unsigned short ConfigRelayViaPort()    { return g_relayViaPort; }
 int            ConfigRelayCap()        { return g_relayCap; }
 int            ConfigParityHoldSec()   { return g_parityHoldSec; }
+std::string    ConfigSweepSkip()       { return g_sweepSkip; }
 void           ConfigSetSlotForProfile(const std::string& slot) { g_slot = slot; g_slotProfile = slot; }
 std::string    ConfigPlayerId()  { EnsurePlayerId("asked for before one existed"); return g_playerId; }
 
@@ -863,6 +865,9 @@ static int ConfigReadFileInto(std::string* whyOut)
         DebugLog("[CFG] TEST ONLY: parityholdsec=" + N((long long)fields.parityHoldSec) + " - this game answers 'items cannot be made yet' for "
                  + N((long long)fields.parityHoldSec) + " s from the first time it asks (the town-box hold test)");
     g_parityHoldSec = fields.parityHoldSec;
+    if (fields.sweepSkip != g_sweepSkip && !fields.sweepSkip.empty())
+        DebugLog("[CFG] TEST ONLY: sweepskip=" + fields.sweepSkip + " - the T-300 arrival sweep leaves alone every record whose id starts with that text");
+    g_sweepSkip = fields.sweepSkip;
     g_modSalt   = fields.modSalt;
     g_ownSaveCfg = fields.ownSave;   /* mmo1 */
     if (fields.routerPort != g_routerPortCfg)

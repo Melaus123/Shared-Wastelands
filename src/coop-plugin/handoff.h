@@ -35,6 +35,7 @@ bool SquadKeyOf(::Character* c, void** faction, std::string* id);   /* c's squad
 bool HandedOverHas(void* faction, const std::string& id);
 bool HandedOverHasId(const std::string& id);   /* any faction: the T-300 drop queue's re-check (it walks every faction by id) */
 bool HandedOverAny();
+int HandedOverSlot(void* faction, const std::string& id);   /* the one slot a wholly given squad was handed to; -1 = not wholly given or given to several; faction 0 = by id */
 /* M7a3f4 [m7a3f4-hh0]: the left-behind notes (a person of the squad left this game without being taken - the squad is not marked, an
    earlier mark has no effect). The sweep, meeting a rebuilt person of a squad, clears its note and its mark (the person is live here
    again). A player gone: the squads handed to that player leave the index (HandedOverForgetPlayer, drained on the main thread). */
@@ -64,8 +65,9 @@ bool PlayerTeleportAbs(float x, float z);   // to an absolute world x,z (y kept)
 bool PlayerTeleportAbsY(float x, float z, bool ground, float y);
 bool PlayerTeleportGround();
 // T-1 B0 (TEST LEVER): `playerteleport peer` - the watched player to about 5 m from this game's copy of the other player's lead
-// character (the copy that is its own squad's leader, else the lowest uid). Logs one [TRADER] teleport peer line either way.
-bool PlayerTeleportPeer();
+// character (the copy that is its own squad's leader, else the lowest uid). 1 done (*out = "target uid=.. lead=.. dist=.."),
+// 0 refused (*out = why), 2 no copy of the other player's characters loaded yet (the command waits and retries).
+int PlayerTeleportPeer(std::string* out);
 // par23b: the engine's own whole-character teleport (Character::teleport 0x5C9BF0) for ONE character - the same
 // call PlayerTeleport makes, exposed for the packbuytest test lever. false = the call faulted.
 bool TeleportCharacter(::Character* c, float x, float y, float z);
@@ -101,6 +103,7 @@ int SquadDecisionPosAt(const SquadView& sv, float* x, float* z);
 // T-1 B1 restructure (protocol 85): MSG_SQUAD_LEAD from the other game (src/common/squadlead.h) - the acting and formal leader its
 // engine has for one of its squads and the members it runs there. The follow pass uses the acting leader AS IS; the formal leader
 // becomes the copy squad's +0xA0 through the engine's own ActivePlatoon::setSquadLeader at the K2 safe point. MAIN THREAD (the drain).
+void KeeperRestockArrive(const coopsquad::KeeperRestockMsg& m);   /* T-799 D4: MSG_KEEPER_RESTOCK arrived (session.cpp) - written at the safe point */
 void ApplyRemoteSquadLead(const coopsquad::SquadLeadMsg& m, unsigned int sender);   /* M7a A1 build 1 [a1b1-hh1]: the book is keyed by the announcing game */
 /* M7a A1 build 1 [a1b1-hh2], MAIN THREAD. HandoffRosterPending [review F1]: uid is still being handed on by this game - build 2: an open
    release, this frame's release batch or an XFER naming it awaiting its ACK (ReleasePendingHas; a ROSTER CHECK is answered PENDING). SquadLeadReannounce [review F7]: the squads this game runs whose last announcement went to one of a catch-up ask's sectors announce their leader again at the next pass (fold 1 [a1b1f1-hh0] [F5]).

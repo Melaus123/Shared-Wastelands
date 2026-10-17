@@ -798,4 +798,18 @@ inline int TalkOrderLogDue(unsigned lastMs, unsigned nowMs, unsigned nLogged)
 /* T-719 / T-726: 1 = the n-th line of one kind is written (n counts from 1): the first 5, then every 100th. */
 inline int TalkLogNthDue(long long n) { return (n >= 1 && (n <= 5 || n % 100 == 0)) ? 1 : 0; }
 
+/* Which conversation `talkprompt answer <k>` / `answer act <type>` / `close` acts on (the talker's game, at the safe point):
+   the mirrored one while it is open; otherwise, for answer and answer act only, the one this game's own dialogue window shows
+   (ownShown 1) when its owner is a live character whose Dialogue is still that one (ownOwnerLive 1). *why names a refusal. */
+const int kLeverWinNone = 0, kLeverWinMirror = 1, kLeverWinOwn = 2;
+inline int LeverWindowPick(int mode, int mirrorActive, int ownShown, int ownOwnerLive, const char** why)
+{
+    *why = "";
+    if (mirrorActive != 0) return kLeverWinMirror;
+    if (mode != kTalkLeverAnswer && mode != kTalkLeverAnswerAct) { *why = "no mirrored conversation is open on this game"; return kLeverWinNone; }
+    if (ownShown != 1) { *why = "no mirrored conversation is open and this game's own window shows no conversation"; return kLeverWinNone; }
+    if (ownOwnerLive != 1) { *why = "no mirrored conversation is open and the own window's conversation has no live owner"; return kLeverWinNone; }
+    return kLeverWinOwn;
+}
+
 }   /* namespace cooptalk */

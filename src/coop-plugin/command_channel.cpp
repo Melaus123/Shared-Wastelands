@@ -347,6 +347,36 @@ void CommandStatusLate(const std::string& text)
     WriteStatus(text);
 }
 
+/* TEST-ONLY `playerteleport peer [waitS]`: while no copy of the other player's character is loaded here yet, the command waits up
+   to waitS seconds and retries every 500 ms here - the same thread and place the commands run - and writes the late result to the
+   status file. Returns at once unless a wait is armed. */
+static bool g_peerTpArmed = false;
+static DWORD g_peerTpUntil = 0, g_peerTpNext = 0;
+static int g_peerTpWaitS = 0;
+static void PeerTpWaitStep()
+{
+    if (!g_peerTpArmed) return;
+    const DWORD now = ::GetTickCount();
+    if ((long)(now - g_peerTpNext) < 0) return;
+    g_peerTpNext = now + 500;
+    std::string why;
+    const int rc = coop::PlayerTeleportPeer(&why);
+    if (rc == 2 && (long)(now - g_peerTpUntil) < 0) return;
+    g_peerTpArmed = false;
+    std::ostringstream wo; wo << g_peerTpWaitS;
+    if (rc == 1)
+    {
+        DebugLog("[TRADER] playerteleport peer: DONE after waiting (up to " + wo.str() + " s) " + why);
+        CommandStatusLate("ok playerteleport peer " + why);
+    }
+    else if (rc == 2)
+    {
+        DebugLog("[TRADER] teleport peer MISSED reason=" + why + " after waiting " + wo.str() + " s");
+        CommandStatusLate("error playerteleport peer: no copy of the other player's characters loaded after " + wo.str() + " s (peerCopies=0)");
+    }
+    else CommandStatusLate("error playerteleport peer: " + why);
+}
+
 /* P26 T718 (TEST-ONLY): a pending `playerteleport near` / `talksight` wait re-checks every 500 ms (speech.cpp TalkWaitTick) - here,
    the same thread and place the commands run. A near wait that passed moves the player exactly as the command does. */
 static void TalkWaitStep()
@@ -396,6 +426,7 @@ void CommandChannelTick()
     coop::HandoffTick();     // M-D: squad handoffs (1 Hz)
     coop::SnapshotTick();    /* snap1 (user decision 2026-09-26): an armed snapshot is taken at its world minute; its block is written 64 lines a tick */
     TalkWaitStep();          /* P26 T718 (TEST): a pending playerteleport near / talksight wait for a character to load, every 500 ms */
+    PeerTpWaitStep();        /* TEST: a pending playerteleport peer wait for a copy of the other player's character, every 500 ms */
     /* E24.3 (review-p5o HIGH-3): THE DRAIN RUNS BEFORE THE LINK PUMP. StoreTick pumps the notebook link, and an
        inbound UNIQUE_STATE is APPLIED inside that pump - it writes the engine's state table. With the drain after
        it, a change a worker thread pushed in the previous frame was read AFTER the apply had already overwritten
@@ -416,6 +447,7 @@ void CommandChannelTick()
     coop::WorldSyncTick();   // P033: adopts world characters, throttled; no-op when off
 
     coop::SpawnDeathRetryTick();   /* T-303: a copy whose SPAWN said dead and that did not die on arrival - retried every ~0.25 s */
+    coop::TwinSleepTick();         /* a withdrawn save-born twin: taken, or its squad put to sleep - before the engine's main loop, never inside its faction update */
 
     // M4 step 3 (F126): periodic authoritative state, ~1 Hz, one owned character per tick.
     // Throttled here rather than inside StateTick so the cadence is visible at the call
@@ -1126,11 +1158,18 @@ void CommandChannelTick()
         WriteStatus(coop::ResurrectLever(Trim(rest)));
         finished = true;
     }
-    else if (verb == "kill")   /* par6 (parity P6) TEST verb: kill <uid> - the engine's death steps; a copy's gate must refuse it */
+    else if (verb == "kill")   /* par6 (parity P6) TEST verb: kill <uid> | name:<Name> - the engine's death steps; a copy's gate must refuse it */
     {
-        unsigned int uid = 0;
-        if (!(is >> uid) || uid == 0) WriteStatus("error kill: usage kill <uid>");
-        else WriteStatus(coop::KillLever(uid));
+        std::string arg; is >> arg;
+        unsigned int uid = 0; std::string lab;
+        const int nr = coop::LeverNameUid(arg, &uid, &lab);
+        if (nr < 0) WriteStatus("error kill: " + lab);
+        else
+        {
+            if (nr == 0) uid = (unsigned int)strtoul(arg.c_str(), 0, 10);
+            if (uid == 0) WriteStatus("error kill: usage kill <uid> | name:<Name>");
+            else WriteStatus(coop::KillLever(uid) + (nr > 0 ? " (" + lab + ")" : std::string()));
+        }
         finished = true;
     }
     else if (verb == "decaysoon")   /* TEST-ONLY: decaysoon <uid> <hours> - that dead body's rot start is set so the game rots it after <hours> in-game hours on this game (own or a copy; medical.cpp DecaySoonLever) */
@@ -1155,6 +1194,12 @@ void CommandChannelTick()
         if (arg == "nearest") WriteStatus(coop::CopySquadNearestLever());
         else if (uid == 0) WriteStatus("error copysquad: usage copysquad <uid> | nearest");
         else WriteStatus(coop::CopySquadLever(uid));
+        finished = true;
+    }
+    else if (verb == "splitsquad")   /* TEST-ONLY verb: splitsquad [n] - at the next K2 safe point the last n members (default 1) of this game's first player squad are moved into a NEW player squad made as the squad screen's "Add squad" makes one; the result line replaces `ok splitsquad armed` in the status file (hire.cpp SplitSquadArm / SplitSquadDrain) */
+    {
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::SplitSquadArm(Trim(arg)));
         finished = true;
     }
     else if (verb == "townfill")   /* TEST-ONLY verb: townfill force | show - force starts the building-by-building refill of the next town this game holds near its player, without the empty-town verdict and the buildings' home answers; show lists the refills running here (towngen.cpp TownFillLeverImpl) */
@@ -1304,7 +1349,8 @@ void CommandChannelTick()
         // playerteleport abs <x> <z> - T193: to an absolute world position (a relative offset from a wandering player lands off target)
         //                  [<y> | ground] - P25 fold 2 (TEST): at that height, or the terrain's height there (none = the player's own)
         // playerteleport ground      - P25 fold 2 (TEST): down (or up) to the terrain's height at the player's own x,z
-        // playerteleport peer        - T-1 B0 (TEST): to about 5 m from this game's copy of the other player's lead character
+        // playerteleport peer [waitS] - T-1 B0 (TEST): to about 5 m from this game's copy of the other player's lead character;
+        //                  when none is loaded yet it WAITS up to waitS s (0..120, default 30; 0 = one try) for one (PeerTpWaitStep)
         // playerteleport groundpick shooter|target - T-310 (TEST): to that end of THIS game's last [GROUNDFIND] FOUND line (x,z;
         //                              the same path as abs); "error playerteleport groundpick none" when this game has found none
         // playerteleport near <uid | nearest <dialogueName>> <units> - P26 stage 6 (TEST): to <units> from that outdoor character,
@@ -1323,7 +1369,35 @@ void CommandChannelTick()
         }
         else if (first == "peer")
         {
-            WriteStatus(coop::PlayerTeleportPeer() ? "ok playerteleport peer" : "error playerteleport peer");
+            int waitS = 30; std::string ws, extra;
+            if (is >> ws)
+            {
+                char* e = 0;
+                const long v = std::strtol(ws.c_str(), &e, 10);
+                waitS = (e != ws.c_str() && *e == 0 && v >= 0 && v <= 120) ? (int)v : -1;
+            }
+            if (waitS < 0 || (is >> extra)) WriteStatus("error playerteleport peer usage: playerteleport peer [waitS 0..120, default 30]");
+            else
+            {
+                g_peerTpArmed = false;   /* a new command replaces a wait still pending */
+                std::string why;
+                const int rc = coop::PlayerTeleportPeer(&why);
+                std::ostringstream wo; wo << waitS;
+                if (rc == 1) WriteStatus("ok playerteleport peer " + why);
+                else if (rc == 2 && waitS > 0)
+                {
+                    const DWORD now = ::GetTickCount();
+                    g_peerTpUntil = now + (DWORD)waitS * 1000; g_peerTpNext = now + 500; g_peerTpWaitS = waitS; g_peerTpArmed = true;
+                    DebugLog("[TRADER] playerteleport peer: waiting up to " + wo.str() + " s for a copy of the other player's character");
+                    WriteStatus("ok playerteleport peer: waiting up to " + wo.str() + " s for a copy of the other player's character");
+                }
+                else if (rc == 2)
+                {
+                    DebugLog("[TRADER] teleport peer MISSED reason=" + why);
+                    WriteStatus("error playerteleport peer: no copy of the other player's characters loaded after 0 s (peerCopies=0)");
+                }
+                else WriteStatus("error playerteleport peer: " + why);
+            }
         }
         else if (first == "groundpick")
         {
@@ -1488,6 +1562,8 @@ void CommandChannelTick()
         const bool ownMark = (rest.compare(0, 4, "mark") == 0 && (rest.size() == 4 || rest[4] == ' '));
         /* items9: `itemtest set <any|sid|section:x,y> [q=<0-100>] [ch=<n>]` - TEST-ONLY: a high-grade weapon / a half-used medkit. */
         const bool ownSet = (rest.compare(0, 3, "set") == 0 && (rest.size() == 3 || rest[3] == ' '));
+        /* T-172 cmd: `itemtest drift <peer|name> <staleSid> at <ownerSid> | ... hidden | show <peer|name>` - TEST-ONLY: drift in our copy. */
+        const bool ownDrift = (rest.compare(0, 5, "drift") == 0 && (rest.size() == 5 || rest[5] == ' '));
         std::vector<std::string> tok; std::string t;
         {
             std::istringstream ts(rest);
@@ -1521,6 +1597,7 @@ void CommandChannelTick()
         else if (ownGive) WriteStatus(coop::ItemTestGiveStolenCommand(Trim(rest.substr(10))));
         else if (ownMark) WriteStatus(coop::ItemTestMarkCommand(Trim(rest.substr(4))));
         else if (ownSet) WriteStatus(coop::ItemTestSetCommand(Trim(rest.substr(3))));
+        else if (ownDrift) WriteStatus(coop::ItemTestDriftCommand(Trim(rest.substr(5))));   /* T-172 disp */
         else WriteStatus(coop::ItemTest(nm, sid, cnt) ? "ok itemtest" : "error itemtest");
         finished = true;
     }
@@ -1756,11 +1833,20 @@ void CommandChannelTick()
     }
     else if (verb == "holdtest")
     {
-        // holdtest delay <s> [n] | refusenext <gone|busy|policy> | list   - P105 build 2 TEST-ONLY lever (design 10.3): on the WRITER, the
-        // next n HOLD / LAND requests are kept unprocessed for s seconds and released in arrival order; the next HOLD is refused with
-        // that reason; or its hold rows are listed. One [ITEMS] p105 holdtest line each (coop::HoldTestCommand).
+        // holdtest delay <s> [n] | refusenext <gone|busy|policy> | keepnext [s] | list   - P105 build 2 TEST-ONLY lever (design 10.3): on
+        // the WRITER, the next n HOLD / LAND requests are kept unprocessed for s seconds and released in arrival order; the next HOLD is
+        // refused with that reason; the next LAND served is KEPT (no room) and its retries wait s seconds (default 20, 0 = retried as
+        // normal); or its hold rows are listed. One [ITEMS] p105 holdtest line each (coop::HoldTestCommand).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::HoldTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "itemrefuse")
+    {
+        // itemrefuse next confirm|request | off | show   - TEST-ONLY lever: the next ITEM_CONFIRM (or ITEM_REQUEST) this game receives is
+        // refused by the reader as a malformed backpack block, so the refused-here answer runs. One-shot. One [ITEMS] itemrefuse line each
+        // (coop::ItemRefuseCommand); a firing logs [ITEMS] itemrefuse fired.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::ItemRefuseCommand(Trim(arg))); finished = true;
     }
     else if (verb == "platoonwipe")
     {
@@ -1799,7 +1885,18 @@ void CommandChannelTick()
     else cmdChainB = true;   /* batch2: no verb of the first half - try the second half */
     if (cmdChainB)
     {
-    if (verb == "profile")
+    if (verb == "savesquadclash")   /* T-710 TEST-ONLY: `savesquadclash` or `savesquadclash <ownId>|<copyId>` (squad ids hold spaces) - the other player's
+                                      copy-squad file copied over this game's own squad file in the last save's folder, before a reload (store.cpp
+                                      OwnSaveSquadClash); refused and logged when an id holds '/', '\', ':' or '..', either file is missing, or
+                                      the files are not a copy squad's and this game's own of that save. No gate in the mod's own paths reads it. */
+    {
+        std::string rest; std::getline(is, rest);
+        std::string st;
+        coop::OwnSaveSquadClash(Trim(rest), &st);
+        WriteStatus(st);
+        finished = true;
+    }
+    else if (verb == "profile")
     {
         /* prof1 (TEST, until the profile screen): `profile new <name>` asks the world for a new profile of this player;
            `profile delete <n>` deletes one - its save folder and records store are deleted for good when the world's answer comes back. */
@@ -1922,6 +2019,14 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BoxDigestCommand(Trim(arg))); finished = true;
     }
+    else if (verb == "boxinfo")
+    {
+        // boxinfo <boxKey> [sid]   - TEST, read-only (items.cpp BoxInfoCommand): each section of the box - size, accepts list,
+        // squares used / free - and, with a sid, whether each section's accepts list allows that kind (kind only, not whether
+        // it fits). Creates, moves and sends nothing.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::BoxInfoCommand(Trim(arg))); finished = true;
+    }
     else if (verb == "restocknow")
     {
         // restocknow <x>,<y>   - par2 TEST-ONLY lever (docs/design-loot2.md rev 2, 4A "PAR-2 push"): at the next K2 safe
@@ -1976,6 +2081,16 @@ void CommandChannelTick()
         //                                        giveItem(dropOnFail) until its full inventory refuses one - the overflow road.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::GroundTestCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "addrreuse")
+    {
+        // addrreuse <groundItemKey|nearest> - TEST-ONLY: a fake DEAD uid row is registered at that ground item's address with a
+        //                                     stored handle no object carries, then the engine destroys the item (GameWorld::destroy,
+        //                                     the hooked path). Reply 'ok addrreuse uid=<fake> obj=... key=... destroyed'; the
+        //                                     destroy path then logs '[M1] address reused' and counts destroyAddrReusedNotChar, and
+        //                                     nothing reaches NotifyDespawn. The item is gone from this game.
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::AddrReuseCommand(Trim(arg))); finished = true;
     }
     // PROBE-START: P084
     else if (verb == "captlist")
@@ -2034,6 +2149,12 @@ void CommandChannelTick()
         // crimetest attacknear <sid> - rel3: the attackplayer attacker attacks the nearest living, conscious townsperson of <sid>.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::CrimeTestArm(Trim(arg))); finished = true;
+    }
+    else if (verb == "talkpause")
+    {
+        /* talkpause on|off   - TEST-ONLY lever (T-804 elimination test): on = a conversation window pauses the game in a session, as in single player */
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::DialoguePauseTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "talktest")
     {
@@ -2099,13 +2220,23 @@ void CommandChannelTick()
         else WriteStatus("error talkcursor usage: talkcursor show|hover <npcUid> | talkcursor show|hover name <Name>");
         finished = true;
     }
+    else if (verb == "editorstate")
+    {
+        /* editorstate | editorstate watch <1..120>   - TEST-ONLY, READ-ONLY (hire.cpp 'EDITOR STATE'): one [EDITOR] state line at the
+           next safe point (the character editor window, its mode, whether its widgets show, the recruits and how many bodies are
+           ready, the pause flag and the speed), or one every second for N seconds. Nothing is written to the game. */
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::EditorStateArm(Trim(arg))); finished = true;
+    }
     else if (verb == "hiretest")
     {
         /* hiretest near|uid <n> [price]   - TEST-ONLY lever (recruit1 R0-a, docs/design-recruit1.md 5): my first player character
            hires the nearest Drifter within 300 u (or uid n) through the real hire flow, join type 18, default price 100. Armed
            here, run at the K2 safe point (hire.cpp). On the game that runs the person it is the own-game hire.
            hiretest near same [<x> <z> [price]] - recruit2 race: the Drifter nearest to one fixed map point (default The Hub
-           -50978,2932; ties to the lower uid), so both games pick the same person in the same step. */
+           -50978,2932; ties to the lower uid), so both games pick the same person in the same step.
+           hiretest editor near|uid <n> [price] (and editor near same ...) - the same hire with join type 3: the engine's recruit
+           with edit = true, the call the dialogue's join-with-edit reply makes, so the engine opens the character editor. */
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::HireTestArm(Trim(arg))); finished = true;
     }
@@ -2600,7 +2731,7 @@ void CommandChannelTick()
             bool on = (mode == "on");
             coop::SuppressCharacter(c, on);
             WriteStatus("ok puppetai");
-            DebugLog("[P028] puppetai uid set: decisions now "
+            SW_DEVLOG("[P028] puppetai uid set: decisions now "
                      + std::string(on ? "SUPPRESSED" : "LIVE")
                      + " - DIAGNOSTIC, an ungated puppet is a free-running clone (F152)");
         }
@@ -2728,8 +2859,7 @@ void CommandChannelTick()
         }
         else
         {
-            bool ok = coop::WoundPart(uid, part, (float)stun, (float)cut);
-            WriteStatus(ok ? "ok wound" : "error wound");
+            WriteStatus(coop::WoundPartLever(uid, part, (float)stun, (float)cut));
         }
         finished = true;
     }
@@ -2785,11 +2915,12 @@ void CommandChannelTick()
     }
     else if (verb == "limbtest")
     {
-        // limbtest cut <ownUid> <limb 0-3> | limbtest fit <ownUid> <limb 0-3> <robotLimbSid> | limbtest show <uid>  - TEST-ONLY
+        // limbtest cut <ownUid> <limb 0-3> | limbtest fit <ownUid> <limb 0-3> <robotLimbSid> [level=<n>] | limbtest show <uid>  - TEST-ONLY
         // lever (clothing.cpp LimbTestLever). cut: this game's own character loses that limb through MedicalSystem::amputate with
         // the severed limb item, as combat does; fit: a robotic limb item made from the sid is fitted on that stump through
-        // MedicalSystem::setRobotLimbItem, as a saved fitted limb is loaded. Both run at the K2 safe point. show: any
-        // character's four limbs, read now. Limb 0 left arm, 1 right arm, 2 left leg, 3 right leg. [LIMB] limbtest lines.
+        // MedicalSystem::setRobotLimbItem, as a saved fitted limb is loaded; level=<n> (0..1000) makes the item at that level,
+        // else at the engine's default level. Both run at the K2 safe point. show: any character's four limbs (each fitted item's
+        // quality and level), read now. Limb 0 left arm, 1 right arm, 2 left leg, 3 right leg. [LIMB] limbtest lines.
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::LimbTestLever(rest));
         finished = true;

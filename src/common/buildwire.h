@@ -40,6 +40,11 @@ const unsigned char kBuildRosterRequest = 4;
 const unsigned char kBuildHandAck = 5;         /* house1b (protocol 75): the house owner holds a piece handed to it - the key only */   /* build1-f fold (review-build1f H2): the kind byte only */
 const unsigned char kBuildHelpWork = 8;        /* help1 (owner 172, protocol 90): a helper's work on its copy of another player's piece, to the owner's game (6 / 7 are the farm's, 10 MINE_OP);
                                                   help1 fold 3 (protocol 95): + a trailing u32 nonce - the owner's placement the work was done on */
+const unsigned char kBuildDismantleAsk = 12;   /* T-805 (owner 797 a): kind | key | u8 verdict - verdict kBuildDmAsk = a team member's game asks the piece owner's
+                                                  game to dismantle that piece; any other verdict is the owner's answer (BuildDismantleAskVerdict).
+                                                  T-609: MSG_BUILD's kind byte is shared with farmwire.h (6 / 7 / 10 / 11 / 13-15, coopfarm::IsFarmKind,
+                                                  peeked first by session.cpp OnBuild) - a new kind here must take a number IsFarmKind refuses
+                                                  (test t609_build_and_farm_kinds_never_share_a_number) */
 const unsigned char kBuildHelpGone = 9;        /* help1 fold (review MED 3, protocol 91): the owner's answer to work for a piece it no longer holds as its own (removed, dismantled,
                                                   handed, its removed row swept) - key | u32 seq: the helper drops every entry at or below seq and hands their materials back.
                                                   help1 fold 2 (protocol 92): key | u32 seq | u32 applied - the owner's last applied seq from that helper for that key
@@ -166,6 +171,7 @@ inline bool BuildEncodable(const BuildMsg& m)
     }
     if (m.kind == kBuildRosterRequest) return m.key.empty() && m.sid.empty() && m.hostKey.empty();   /* build1-f: no body */
     if (m.kind == kBuildHandAck) return !m.key.empty() && m.key.size() <= kBuildMaxKey;   /* house1b: the key only */
+    if (m.kind == kBuildDismantleAsk) return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.reason <= 7;   /* T-805: key + verdict (kBuildDmBlocked the last) */
     if (m.kind == kBuildRemove)   /* build1-d; P87 fold 1: a furniture tail's host key fits */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey
             && (m.reason == kBuildReasonDismantled || m.reason == kBuildReasonDestroyed)
@@ -236,6 +242,15 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         char* a = &(*b)[at];
         *a++ = (char)m.kind;
         BuildPutS(&a, m.key);
+        return true;
+    }
+    if (m.kind == kBuildDismantleAsk)   /* T-805: kind + key + verdict */
+    {
+        b->resize(at + 1 + 1 + m.key.size() + 1);
+        char* d = &(*b)[at];
+        *d++ = (char)m.kind;
+        BuildPutS(&d, m.key);
+        *d++ = (char)m.reason;
         return true;
     }
     if (m.kind == kBuildRemove)   /* build1-d; P87 fold 1: | u32 nonce [| u8 flags [| hostKey]] - nothing past the reason when all are unset */
@@ -341,7 +356,7 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
     BuildMsg m;
     m.kind = (unsigned char)p[0];
     if (m.kind != kBuildPlace && m.kind != kBuildState && m.kind != kBuildRemove && m.kind != kBuildRosterRequest && m.kind != kBuildHandAck
-        && m.kind != kBuildHelpWork && m.kind != kBuildHelpGone) return kBuildDecodeBadKind;
+        && m.kind != kBuildHelpWork && m.kind != kBuildHelpGone && m.kind != kBuildDismantleAsk) return kBuildDecodeBadKind;
     if (m.kind == kBuildRosterRequest)   /* build1-f: exactly the kind byte */
     {
         if (size != 1) return kBuildDecodeBadValue;
@@ -390,6 +405,15 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
     {
         if (m.key.empty()) return kBuildDecodeBadKey;
         if (off != size) return kBuildDecodeBadValue;
+        if (out) *out = m;
+        return kBuildDecodeOk;
+    }
+    if (m.kind == kBuildDismantleAsk)   /* T-805: exactly kind + key + verdict (0..7) */
+    {
+        if (m.key.empty()) return kBuildDecodeBadKey;
+        if (size - off < 1) return kBuildDecodeTooShort;
+        m.reason = (unsigned char)p[off]; off += 1;
+        if (off != size || m.reason > 7) return kBuildDecodeBadValue;
         if (out) *out = m;
         return kBuildDecodeOk;
     }
@@ -512,6 +536,47 @@ inline bool BuildTaskGated(int task)
     return task == kBuildTaskBuild || task == kBuildTaskAddMaterials || task == kBuildTaskRepair || task == kBuildTaskDismantle;
 }
 inline bool BuildTaskRefused(int task, int handedAway) { return BuildTaskGated(task) && handedAway != 0; }
+/* T-805: a dismantle order on a piece another player owns. A player of another faction gets none (decision 548); a team member's
+   (owner 797 a) is not given to the engine here - it is ASKED of the owner's game, which dismantles its own piece; with the owner's
+   game out of reach it is refused at the click. Every other order goes on. */
+const int kBuildDmOrderGoes = 0, kBuildDmOrderRefusedOther = 1, kBuildDmOrderRefusedMember = 2, kBuildDmOrderOwnerAway = 3, kBuildDmOrderAsk = 4;
+inline int BuildDismantleOrderVerdict(int task, int otherPlayersPiece, int member, int memberMayDismantle, int ownerReachable)
+{
+    if (task != kBuildTaskDismantle || otherPlayersPiece == 0) return kBuildDmOrderGoes;
+    if (member == 0) return kBuildDmOrderRefusedOther;
+    if (memberMayDismantle == 0) return kBuildDmOrderRefusedMember;
+    return ownerReachable != 0 ? kBuildDmOrderAsk : kBuildDmOrderOwnerAway;
+}
+/* T-805: the owner's game on a DISMANTLE_ASK - the asker must share this player's team NOW, the piece must be loaded here, be this
+   game's own and not dismantled; a wall (or a piece whose class cannot be read) is refused (a wall's dismantle defers, 0x548860); a
+   piece the engine's dismantle job itself refuses (furniture in it, a research bench - `blocked`) is refused. kBuildDmDone = the
+   engine's dismantle runs. */
+const unsigned char kBuildDmAsk = 0, kBuildDmDone = 1, kBuildDmNotMember = 2, kBuildDmGone = 3, kBuildDmNotOwn = 4, kBuildDmWall = 5, kBuildDmFaulted = 6,
+                    kBuildDmBlocked = 7;
+inline int BuildDismantleAskVerdict(int senderMember, int found, int ownHere, int dismantled, int wall, int blocked)
+{
+    if (senderMember == 0) return kBuildDmNotMember;
+    if (found == 0 || dismantled != 0) return kBuildDmGone;
+    if (ownHere == 0) return kBuildDmNotOwn;
+    if (wall != 0) return kBuildDmWall;
+    if (blocked != 0) return kBuildDmBlocked;
+    return kBuildDmDone;
+}
+inline const char* BuildDmWord(int v)
+{
+    switch (v)
+    {
+    case 0: return "ask";
+    case 1: return "done - the engine's confirmDismantle ran on the owner's piece (its mounted buildings with it)";
+    case 2: return "refused - the asker is not in the owner's team now";
+    case 3: return "refused - the piece is not loaded on the owner's game or is already dismantled";
+    case 4: return "refused - the piece is not the owner's game's own";
+    case 5: return "refused - a wall, or a piece whose class cannot be read (a wall's dismantle defers; not asked across games)";
+    case 6: return "refused - the engine's dismantle faulted on the owner's game";
+    case 7: return "refused - has furniture or attached pieces (or is a research bench) - dismantle them first";
+    default: return "?";
+    }
+}
 
 /* P15: what a copy does with the owner's destroyed state (a STATE's destroyed bit) against its own +0x1A1. A STATE made from a PLACE
    carries no destroyed state and changes nothing. */
@@ -532,6 +597,62 @@ inline int BuildRepairOrderVerdict(int task, int standInOwned, int destroyed, in
 {
     if (task != kBuildTaskRepair || standInOwned == 0 || destroyed == 0) return kBuildRepairOrderNone;
     return wall != 0 ? kBuildRepairOrderRefused : kBuildRepairOrderHelp;
+}
+/* T-221: what a WALL copy does with the owner's STATE. ownState: 1 = the copy keeps its own progress record and leads no group (a wall
+   made at runtime; BuildWallKeepsOwnRecord), 0 = the record is a group's (shared with it, or held by it as the group's lead). complete = the STATE's complete bit; p / n = the owner's progress and needed (a grouped owner wall
+   sends its group's record); liveN = the copy's own needed. A complete STATE completes either kind (the engine's complete-now path).
+   Otherwise an own-record copy takes the owner's share of its own needed, kept below 0.999 x liveN (the redraw completes a piece at
+   progress >= needed); a shared-record copy, or a needed that is not a usable number, takes materials only. *progress = the value to
+   write for kBuildWallProgress. */
+const int kBuildWallMatsOnly = 0, kBuildWallProgress = 1, kBuildWallComplete = 2;
+inline int BuildWallCopyAction(int ownState, int complete, float p, float n, float liveN, float* progress)
+{
+    *progress = 0.0f;
+    if (complete != 0) return kBuildWallComplete;
+    if (ownState == 0) return kBuildWallMatsOnly;
+    if (!(n > 0.0f && n < 3.0e38f) || !(liveN > 0.0f && liveN < 3.0e38f)) return kBuildWallMatsOnly;   /* NaN fails too */
+    const float share = p / n;
+    float v = (share > 0.0f) ? share * liveN : 0.0f;   /* a negative or NaN progress writes 0 */
+    const float cap = liveN * 0.999f;
+    if (!(v <= cap)) v = cap;
+    *progress = v;
+    return kBuildWallProgress;
+}
+/* T-221: whether a wall's progress record is its alone. recIsOwn: 1 = the record (vt+0x228) is the wall's own (+0x160), 0 = another
+   wall's, -1 unreadable; groupCount = the wall's group count (+0x390, the walls the engine's completion 0x561A20 completes after it),
+   -1 unreadable. A group's lead also holds the record at its own +0x160, so only a wall with its own record AND no group has the record
+   alone. 1 = alone, 0 = a group's, -1 = not known. */
+inline int BuildWallKeepsOwnRecord(int recIsOwn, int groupCount)
+{
+    if (recIsOwn < 0 || groupCount < 0) return -1;
+    return (recIsOwn == 1 && groupCount == 0) ? 1 : 0;
+}
+/* T-221: the own pieces looked at for a wall group's members - the lead's key sector and the eight around it (a wall line placed
+   across a sector edge stays one group). */
+inline int BuildWallGroupNear(int leadSx, int leadSy, int sx, int sy)
+{
+    const int dx = sx - leadSx, dy = sy - leadSy;
+    return (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) ? 1 : 0;
+}
+/* T-221: safe points before a wall copy's complete-now call is tried again while the copy stays unfinished: `gap` for the first
+   `fastTries` tries, then `gap` x `slowMul` for as long as the STATE is held (a newer STATE replaces it). */
+inline unsigned int BuildWallCompleteRetryGap(int tries, int fastTries, unsigned int gap, unsigned int slowMul)
+{
+    return (tries < fastTries) ? gap : gap * slowMul;
+}
+/* T-221: whether the kept-piece lay completes this player's own standing, unfinished piece because this player's own record (pp.build)
+   holds it finished. Only a wall (a save made by a game that held only copies keeps walls as blueprints), not a ruin here
+   (liveDestroyed) and not a ruin in the record (recDestroyed). The engine's wall completion (0x561A20) also completes every wall of
+   the group sharing the record, so a grouped wall needs every wall found sharing that record to be this player's, standing whole and
+   recorded finished (allOwnFinished), and at least the lead's group count of walls besides the lead found (found counts the lead;
+   leadCount -1 = the lead was not found or its count is unreadable). 1 = complete it, 0 = leave it. */
+inline int BuildKeptOwnCompleteVerdict(int wall, int liveDestroyed, int recComplete, int recDestroyed, int grouped, int allOwnFinished,
+                                       int found, int leadCount)
+{
+    if (wall == 0 || liveDestroyed != 0 || recComplete == 0 || recDestroyed != 0) return 0;
+    if (grouped == 0) return 1;
+    if (allOwnFinished == 0 || leadCount < 0) return 0;
+    return (found - 1 >= leadCount) ? 1 : 0;
 }
 /* P15: a copy made a ruin HERE by this game's own engine (not the mod's apply). The owner's game is the writer: its last applied STATE
    goes back on when that says whole; with none applied yet the copy waits for the owner's next STATE. */

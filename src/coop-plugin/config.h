@@ -77,6 +77,7 @@ unsigned short ConfigRelayBridgePort();      /* TEST ONLY: relaybridge=ip:<port>
 unsigned short ConfigRelayViaPort();         /* TEST ONLY: relayvia=ip:<port>'s port - every world-server dial over Steam's plain UDP to 127.0.0.1:<port>; 0 = absent */
 int            ConfigRelayCap();             /* TEST ONLY: relaycap= (1-32), 0 = absent = the bridge's full cap */
 int            ConfigParityHoldSec();        /* T-734 TEST ONLY: parityholdsec= (0-600 s) - ItCanMakeItems answers 0 that long from its first ask; 0 = absent = off */
+std::string    ConfigSweepSkip();            /* TEST ONLY: sweepskip= - the T-300 arrival sweep leaves alone every record whose id starts with it; empty = absent = off */
 void           ConfigSetSlotForProfile(const std::string& slot);   /* prof1: the picked profile's save folder, IN MEMORY ONLY (never written to shared_wastelands.cfg). MAIN THREAD */
 int            ConfigModFingerprintSalt();   /* settings5 S5 TEST ONLY: 1 = shared_wastelands.cfg says modfingerprint_salt=1 */
 std::string    ConfigStoreDir();

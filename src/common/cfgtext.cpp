@@ -401,6 +401,17 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "parityholdsec='" + val + "' is not a number 0-600 - ignored"; notes->push_back(nt); }
             }
         }
+        else if (key == "sweepskip")   /* TEST ONLY - see CfgFields::sweepSkip; 0-64 printable characters, no space; empty = off */
+        {
+            bool ok = val.size() <= 64;
+            for (size_t i = 0; ok && i < val.size(); ++i) { if (val[i] <= ' ' || val[i] > '~') ok = false; }
+            if (ok) f.sweepSkip = val;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "sweepskip='" + val + "' is not 0-64 printable characters without a space - ignored"; notes->push_back(nt); }
+            }
+        }
         else if (key == "modfingerprint_salt")   /* settings5 S5: TEST ONLY; the fold reads false/off/no as off too */
         { const std::string lv = CfgLower(CfgTrim(val)); f.modSalt = (lv.empty() || lv == "0" || lv == "false" || lv == "off" || lv == "no") ? 0 : 1; }
         else if (key == "joinvia")   /* M11a S1: TEST ONLY - world = the world road; anything else is the session road */

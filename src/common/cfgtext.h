@@ -139,6 +139,10 @@ struct CfgFields
        'items cannot be made yet' for <n> s from the first time it asks, so a test can see an incoming box answer HELD.
        0 = absent = off. */
     int            parityHoldSec;
+    /* TEST ONLY, no writer carries it (store.cpp T300SweepTick reads it): sweepskip=<text> - the T-300 arrival sweep leaves alone
+       every record whose id STARTS WITH <text> (a cfg value holds no space, so a prefix names an id such as 'Mercenary Guild_0').
+       Empty = absent = off. */
+    std::string    sweepSkip;
     CfgFields();      /* role=single, slot="s1", ports 0, no playerId - ConfigLoad's own defaults */
 };
 

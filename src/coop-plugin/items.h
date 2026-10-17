@@ -28,6 +28,8 @@
 #include "../common/shopwire.h"   /* T-164 B4-4: the shop block on ITEM_REQUEST / ITEM_CONFIRM (intercept at the trade call) */
 
 namespace coop {
+int LeverNameUid(const std::string& w, unsigned int* uid, std::string* label);   /* TEST-ONLY: 1 resolved, 0 not a name form, -1 a name that did not resolve (label says why) */
+void LeverNoteSpawned(const std::string& templateName, unsigned int uid);   /* TEST-ONLY: the uid the latest [M1] spawned line named for that template (the `spawned:<Template>` form) */
 
 // One item move on the wire. `quantity` MEANS A DIFFERENT THING PER OP and that is deliberate - see the table:
 //   op 0 ADD    - the stack size of the item that entered the slot.
@@ -252,6 +254,27 @@ void ApplyItemRevoke(unsigned int id, unsigned int fromPeer);
 void ApplyShopTail(unsigned int id, unsigned int fromPeer, unsigned int epoch, int kind);
 // E22b, MAIN THREAD: the owner's answer to a request WE sent. This is the only moment our own copy changes.
 void ApplyItemConfirm(const ItemConfirmMsg& c, unsigned int fromPeer);   // M7b slice 2: taken only from the game the request was asked of (itemConfirmWrongSender)
+/* T-889 step 2, MAIN THREAD: MSG_ITEM_HANDOVER (net/session.cpp OnItemHandover) - the 14-byte body (src/common/handrec.h) */
+void ApplyItemHandover(const char* p, size_t n, unsigned int fromPeer);
+/* T-889 step 2 (A2), MAIN THREAD: 1 = the ring holds an item move out of this character not yet published, or an undrained pack move,
+   or the split slot holds one of those - its squad's record is not written now (store.cpp OwnWriteSquad) */
+int ItemsCharUnpublished(void* ch);
+/* T-889 step 2, MAIN THREAD: the largest reserved E in pp.handover (store.cpp keeps the records sequence above it at the store's open) */
+unsigned long long ItemsHandoverMaxSeq();
+/* MAIN THREAD, from the ITEM_CONFIRM reader: an answer to request `id` from `fromPeer` was refused as unreadable after its id was
+   read. A request of ours asked of that game is settled now as its 10 s lapse would settle it, and the holder is told at once
+   (PLACED ok=0 for a take, REVOKE for a give) so it does not keep the item in escrow. Other request kinds keep their own road. */
+void ItemConfirmRefusedHere(unsigned int id, unsigned int fromPeer);
+/* MAIN THREAD, from the ITEM_REQUEST reader: request `id` from `fromPeer` was refused as unreadable after its id was read - answered
+   with a plain ITEM_CONFIRM ok=0 so the requester settles now. Nothing is held here for it. */
+void ItemRequestRefusedHere(unsigned int id, unsigned int fromPeer);
+/* TEST-ONLY `itemrefuse next confirm|request | off | show` (command channel). Armed, the NEXT ITEM_CONFIRM (kind kItemRefuseConfirm)
+   or ITEM_REQUEST (kItemRefuseRequest) this game receives is refused by its reader exactly as one carrying a malformed backpack
+   block, so the refused-here answer above runs on well-formed traffic. One-shot. MAIN THREAD: the reader and the command channel. */
+const int kItemRefuseConfirm = 1;
+const int kItemRefuseRequest = 2;
+int ItemRefuseNextFires(int kind, unsigned int id);   /* 1 = the lever was armed for this kind: refuse this message (the lever is now off) */
+std::string ItemRefuseCommand(const std::string& arg);
 // E22a TEST LEVER, MAIN THREAD, command channel only: give `count` of the item named by `baseSid` to the
 // first LOADED character whose name contains `needle` AND whose uid this game owns, through the engine
 // own add - so the transfer hook fires here and the other game ghost gains the item. Not a game feature.
@@ -329,6 +352,7 @@ void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer);   // M7b sli
 void ParityNoteBox(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2 fold 1: a box's contents are taken only from its writer (parityBoxNotWriter)
 void ItParityForgetAsker(int slot);   // MAIN THREAD: that player's link ended - its recorded sector asks no longer route fill pushes to it (slot -1: every game's)
 std::string BoxDigestCommand(const std::string& arg);   /* par1: `boxdigest [<x>,<y>|ring|all]` - read-only: [PARITY] box key=.. items=.. digest=.. per box (flat + furniture) and a total */
+std::string BoxInfoCommand(const std::string& arg);   /* TEST `boxinfo <boxKey> [sid]` - read-only: each section's size, accepts list, used / free squares, and whether a sid's kind is allowed */
 std::string RestockNowCommand(const std::string& arg);   /* par2: TEST-ONLY `restocknow <x>,<y>` - arms the lever; holder squads only. T-1 B2: `restocknow wander near` */
 std::string TraderSpawnCommand(const std::string& arg);   /* T-1 TEST-ONLY `traderspawn [dist]` - arms the lever: one wandering trader caravan beside this game's player through the engine's own createRandomSquad */
 std::string BoxOpenCommand(const std::string& arg);      /* parity3: TEST-ONLY `boxopen <n>` - opens the n nearest non-player boxes one after another through the engine's loot open, then closes them */
@@ -369,6 +393,7 @@ int  GameDataSidPod(const void* gd, char* out, int cap);    /* P14 fold 1, POD: 
 void GroundRefundEnd();                                     /* MAIN THREAD: the refund's items go to the one drop road (from = refund) */
 void InstallGround();                                       /* preload, MAIN THREAD (from InstallItems): the drop detour 0x5C9CB0 and the pickup gate 0x34F2E0; P2/P3/P4 (ground5 fold 1 comment): the animal drop 0x5C9A10, the box / building spill 0x54DBA0 and Item::activate 0x75CE70 (the dismantle refund's items) */
 void GroundDrain();                                         /* MAIN THREAD (ItemsTickDrain): the gate's snapshot, the detours' queue, the requester's timeouts */
+std::string AddrReuseCommand(const std::string& arg);       /* TEST-ONLY `addrreuse <groundItemKey|nearest>` - a fake dead uid row at a ground item's address, then the engine destroys the item */
 std::string GroundTestCommand(const std::string& arg);      /* TEST-ONLY `groundtest list [r] | drop <section> <x> <y> | dropsid <sid> | pick <sid> [r]` */
 void ReportGround();                                        /* `report`: the [GROUND] REPORT line */
 int GrIsGroundKey(const char* key);                         /* 1 = a G| ground key */
@@ -397,6 +422,7 @@ std::string ItemTestStealCommand(const std::string& arg);
 std::string ItemTestStolenCommand(const std::string& arg);
 std::string ItemTestGiveStolenCommand(const std::string& arg);
 std::string ItemTestSetCommand(const std::string& arg);   /* items9: TEST-ONLY `itemtest set <any|sid|section:x,y> [q=<0-100>] [ch=<n>]` */
+std::string ItemTestDriftCommand(const std::string& arg);   /* T-172 decl: TEST-ONLY `itemtest drift ...` - drift planted in our copy of another game's character */
 std::string ItemTestMarkCommand(const std::string& arg);   /* inv6 fold (T401): TEST-ONLY `itemtest mark <sid|any> [<uid>]` - set an owner on my own item */
 void ItemOwnerNoteCarried(const char* msg, const coopmark::OwnerId& o);   /* inv6: session.cpp - an 'OWN1' block went out on a message that was sent */
 void ItemOwnerNoteBadRecv();   /* inv6 phase 2 (review-inv6 LOW): a RECEIVED owner block or tail that was malformed */
@@ -495,6 +521,15 @@ int  BuildingOwnerClass(void* bld, int* slot);
    the owner's game while it is online and holds the area, else the area holder; the owner's hand-back gate). 1 this game,
    2 another game, 0 no answer (then nobody is held: both engines run as before). */
 int  FarmWriterHere(void* b);
+/* T-853 #6 / #7, MAIN THREAD: FarmWriterHere's answer AND the slot it names, from ONE ask of its ladder. verdict as FarmWriterHere;
+   slot = the game a 2 names (the owner rung's slot when the owner decided it, else the area holder of the building's area), -1 not
+   known now; byOwner = the owner rung decided it; areaSlot = that area's holder when another game (-1 not / unknown), areaHere = this
+   game holds it. Returns verdict. */
+struct FarmWriterView { int verdict; int slot; int byOwner; int areaSlot; int areaHere; };
+int  FarmWriterDecide(void* b, FarmWriterView* out);
+/* T-853 #5 / #11, MAIN THREAD: ProdStepWriterHere's three-way answer asked fresh (not the 250 ms memo) with the slot of the game a
+   kProdWriterOther names (*slot, -1 not known now) - the same ask gives both. */
+int  ProdWriterDecide(void* pb, int* slot);
 /* MAIN THREAD: who runs the steps of this production building (a mining node, a machine) - the production gate's writer (the
    owner's game while it is online and holds the area, else the area holder), kept per building key for 250 ms:
    coopfarm::kProdWriterHere 1 this game, kProdWriterOther 2 another game, kProdWriterNone 0 no answer yet. */
@@ -555,10 +590,18 @@ int  InteriorPieceIds(void* outer, unsigned int* ids, int cap, int* listed, int*
 /* review-build1f C1: the zone-walk generation g_boxWalkGen - a caller holding LoadedBuildings pointers re-checks it before
    touching them; a change means a zone was deactivated (its pieces may be freed). ANY THREAD. */
 long long BoxWalkGen();
+/* T-609 part 2 (H4), MAIN THREAD (off it: the generation is moved, counted): building `b` has just been dismantled or destroyed by
+   this mod - it leaves the memoised loaded-building list at once and stays out of fresh walks for a few drains (src/common/walkdrop.h).
+   fold 1 (F4): gone = walkdrop::GoneAfterDismantle - 0 (the call faulted or the building does not read dismantled) leaves it listed
+   and is counted (buildingGone[...notDismantled]). */
+void ItemsBuildingGone(void* b, int gone);
 /* T-454 (owner 354 a), MAIN THREAD: the furniture registry (items.cpp ItFurnBuild) is out of date - a building piece newly exists
    on this game or flipped to complete. Sets the mark only; the rebuild stays lazy (ItFurnEnsure at the next lookup, at most once
    per drain). why: 1 placed (or a restore recreated it), 2 a copy made or adopted, 3 complete 0 -> 1. */
 void ItFurnMarkStale(int why);
+/* ANY THREAD: an item's level through the engine's own getLevel (vtable +0x2B8), behind ItLevelCall's SEH guard. 1 = *out set,
+   0 = unreadable. */
+int ItItemLevel(void* item, int* out);
 /* MAIN THREAD (build.cpp): a building copy that can hold items has its contents asked of the area's writer once the zone list finds
    it - ItParityCopyMade for the copy createBuilding just made, ItParityCopyCompleted when the owner's STATE completes a copy (a
    box still being built has no inventory until then). */

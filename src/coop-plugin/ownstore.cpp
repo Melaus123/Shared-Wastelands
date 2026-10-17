@@ -459,6 +459,24 @@ bool OwnStoreLastFor(const std::string& key, long long* len, unsigned int* crc)
     return have;
 }
 
+/* T-889 fold 5. MAIN THREAD. The seq of the record OwnStoreLastFor compares against: the job still queued for this key, else the last
+   COMMITTED record. false = neither. */
+bool OwnStoreLastSeqFor(const std::string& key, unsigned long long* seq)
+{
+    OwnCsInit();
+    bool have = false;
+    ::EnterCriticalSection(&g_ownCs);
+    std::map<std::string, OwnJob>::const_iterator q = g_ownQ.find(key);
+    if (q != g_ownQ.end()) { *seq = q->second.seq; have = true; }
+    else
+    {
+        std::map<std::string, unsigned long long>::const_iterator k = g_ownCommittedSeq.find(key);
+        if (k != g_ownCommittedSeq.end()) { *seq = k->second; have = true; }
+    }
+    ::LeaveCriticalSection(&g_ownCs);
+    return have;
+}
+
 void OwnStoreDrainFailLog()
 {
     if (::InterlockedCompareExchange(&g_ownCsInit, 0, 0) == 0 || ::InterlockedExchange(&g_osFailPending, 0) == 0) return;
@@ -541,6 +559,44 @@ bool OwnLedgerAppend(const std::string& line, unsigned int cap, int* linesNow)
     }
     if (!moved) { U8DeleteFile(tmp.c_str()); return false; }
     if (linesNow != 0) *linesNow = (int)lines.size();
+    return true;
+}
+
+/* T-889 step 2: one small text file of the store folder (pp.handover) - read whole, and replaced as OwnLedgerAppend replaces the ledger */
+bool OwnTextRead(const std::string& name, std::string* text, int* notFound)
+{
+    if (notFound != 0) *notFound = 0;
+    const std::string dir = OwnStoreDir();
+    if (dir.empty() || text == 0) return false;
+    const std::string path = Join(dir, name);
+    const DWORD attr = U8GetFileAttributes(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES)
+    {
+        const DWORD e = ::GetLastError();
+        if ((e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) && notFound != 0) *notFound = 1;
+        return false;
+    }
+    std::vector<char> b;
+    if (!ReadAll(path, &b)) return false;
+    text->assign(b.begin(), b.end());
+    return true;
+}
+bool OwnTextReplace(const std::string& name, const std::string& all)
+{
+    const std::string dir = OwnStoreDir();
+    if (dir.empty()) return false;
+    const std::string path = Join(dir, name);
+    char pid[16];
+    std::sprintf(pid, "%lu", (unsigned long)::GetCurrentProcessId());
+    const std::string tmp = path + "." + pid + ".tmp";   /* CleanTmp's pid rule leaves a live process's temp alone */
+    if (!WriteAllFlushed(tmp, all.data(), all.size())) { U8DeleteFile(tmp.c_str()); return false; }
+    bool moved = MoveReplace(tmp, path);
+    if (!moved)
+    {
+        const DWORD e = ::GetLastError();
+        if (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) { ::Sleep(20); moved = MoveReplace(tmp, path); }
+    }
+    if (!moved) { U8DeleteFile(tmp.c_str()); return false; }
     return true;
 }
 

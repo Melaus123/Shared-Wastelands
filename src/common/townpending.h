@@ -21,6 +21,8 @@
 // by a game that is not in the world, is placed by no game: it never holds, wherever it is. A note whose area cannot be read here
 // (no position, off the map, no fresh area map), whose area's holder cannot be named on the roster, or whose engine answer is not
 // in yet, cannot be told: it holds. The answer follows the state - a holder who comes back into the world makes the note hold again.
+#include <string>
+
 namespace townpending {
 
 // NoteRole: what one notebook note is to its home town's pending mark (store, main thread, every publish).
@@ -178,6 +180,20 @@ inline int LogDue(int loggedBefore, unsigned lastMs, unsigned nowMs)
 {
     if (loggedBefore == 0) return 1;
     return (unsigned)(nowMs - lastMs) >= kRelogMs ? 1 : 0;
+}
+
+// T-698 / T-798 (b): NoteHoldsBuilding - a listed note that holds its town (Holds) holds ONE building's residents only when it can be
+// told which building is its home: its record's home key is that building's key, or - a record with no home key, here (recHere) - both
+// squad templates are known (tmplKnown) and its record position is known (posKnown): it then holds the building when the templates
+// match (tmplMatch) and that position is within `radius`. A note that cannot be told (no record here, a template or its position not
+// known) holds EVERY building of its town, as the town's own answer does. A TEST-ONLY pendnote note (testNote) holds every building.
+inline int NoteHoldsBuilding(int testNote, const std::string& noteHome, const std::string& bldKey, int recHere, int tmplKnown, int tmplMatch, int posKnown, float dx, float dz, float radius)
+{
+    if (testNote != 0) return 1;
+    if (!noteHome.empty()) return (!bldKey.empty() && noteHome == bldKey) ? 1 : 0;
+    if (recHere == 0 || tmplKnown == 0 || posKnown == 0) return 1;   // cannot be told: it holds
+    if (tmplMatch == 0) return 0;
+    return (dx * dx + dz * dz <= radius * radius) ? 1 : 0;
 }
 
 }   // namespace townpending

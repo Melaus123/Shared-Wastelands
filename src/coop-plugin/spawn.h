@@ -88,7 +88,7 @@ int  CreateLastRefusal();
 bool SendContextFor(unsigned int uid, ::Character* c);
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId);   // P1: + the sender's platoon id
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot);   // P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
 // M-B / H026 - `context on|off`, DEFAULT OFF: when on, a SPAWN whose CONTEXT arrived first creates the copy the way
 // the engine creates a town NPC (npc-context.md section 6): a platoon from the same squad template, the same
 // SquadType, home town and home building, the copy created INTO that platoon with that home, then the same
@@ -131,13 +131,14 @@ void DoomNote(const DoomTicket& t);
 bool IsRetiredObject(const void* obj);
 
 // P038 / F319 - the engine is destroying this object RIGHT NOW. Withdraw the pointer permanently.
-// Returns true if it was one of ours. **Called from a detour on an unknown thread**: it compares
-// addresses only, never dereferences, and publishes with InterlockedExchange.
+// Returns true if it was one of ours: a row at its address AND the object's handle is the row's
+// (livechar::DestroyIdentityOf). **Called from a detour on an unknown thread**: address compares, one
+// SEH-guarded handle read (CaptureObjId), publishes with InterlockedExchange under the row spin lock.
 //
 // This closes the window P034 cannot: P034 samples liveness two rows per tick, so a character
 // stays "alive" in our tables for a fraction of a second after it dies, and three consecutive runs
 // crashed inside exactly that window. An event has no window.
-bool RetireOnDestroy(const void* obj);
+bool RetireOnDestroy(const void* obj, const char* reason = 0);   /* PROBE P141: reason = the engine's removal literal, kept on the marked row for the release ring */
 // T-304 (2), fold 1: ANY thread, from the destroy detour before anything is retired. True ONLY for the engine's 'eaten' removal
 // (debugInfo "eaten", MedicalSystem::gettingEaten) of a registered copy of ANOTHER game's character with the game link up: the
 // detour then answers FALSE without destroying (the engine's own 'postponed' answer; counted copyDestroyRefused[eaten]) and the
@@ -161,7 +162,17 @@ void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const c
 void ApplyRemoteDespawn(unsigned int uid);
 // M-A step 2: the owner says we no longer hold this character's sector. Same removal as DESPAWN (the copy is
 // dropped, withdrawn and destroyed) but counted apart - it is not a death, and the owner re-announces later.
-void ApplyRemoteUnload(unsigned int uid);
+// A twin or a player-faction character is withdrawn, never destroyed; a save-born NON-player twin is queued for TwinSleepTick
+// (src/common/twinsleep.h). kind: twinsleep::kKind* - 0 = its runner still runs it (the UNLOAD's own word cooplo::UnloadClearsGiven 0,
+// the return check's NOT ANNOUNCED); 1 = nobody runs it (the default: the UNLOAD's 1, the roster's withdrawals, a member a release
+// dropped); 2 = a REVOKE that names no winner (the giver keeps it asleep in its world data): put to sleep here, taken only as the
+// last resort. No queued body ends frozen: what cannot be put to sleep ends in this game's take, with an Error.
+void ApplyRemoteUnload(unsigned int uid, int kind = 1);
+// MAIN THREAD, every frame (command_channel.cpp, before the engine's main loop runs - never inside its faction update):
+// the queued twins - taken by this game, left waiting for their runner's SPAWN, or their squads put to sleep (StoreRetireLocalCopy,
+// one call per frame) once twinsleep.h's gate opens; a squad's queued members share one timer and are asleep, back or taken within
+// about 70 s at most (twinsleep::kBoundSec).
+void TwinSleepTick();
 
 // review-session S6 - the peer's link went DOWN while we stayed in the game, so nothing will ever
 // send a DESPAWN for the copies it owns here. Same removal as DESPAWN/UNLOAD, counted apart, and
@@ -170,6 +181,8 @@ void ApplyRemoteUnload(unsigned int uid);
 // Returns 1 destroyed, 0 withdrawn, -1 we hold no copy for that uid. MAIN THREAD.
 int DropPeerOwnedCopy(unsigned int uid);
 int CopyIsPlayerCharacter(unsigned int uid);   /* a final leave's copy: 1 a player character / player-faction person, 0 an NPC, -1 unreadable, -2 no copy here */
+void PlayerCharTableTick();   /* MAIN THREAD (combat.cpp CombatTick): the player-character table's sweep of every character row, every 0.5 s */
+int IsUidPlayerCharAnyThread(unsigned int uid);   /* ANY THREAD (the AI worker's melee hit): 1 a player character / player-faction person, 0 an NPC, -1 not in the table */
 // inv7a (e47-inv7-replan.md 3.1): once per world generation, at the first frame engine writes are allowed, every stand-in
 // character (coop-p<n> / coop-peer by RECORD id) no mirror row knows is destroyed by DropPeerOwnedCopy's route - a caged one
 // leaves its cage first (K2 safe point), a carried one is put down, a bedded one gets up; what cannot be handled safely is
@@ -208,6 +221,12 @@ int RetirePeerContextPlatoons(int slot);
 // F334 - how many destroys were our own despawn call re-entering the hook. Exposed so the
 // `[P032]` line can print it beside `destroyOurs`, which is where that number is actually read.
 long long DespawnSelfReentryCount();
+// The destroys whose object was not the character of the row at its address (the row was finished) - another character
+// (Char) or no character at all (NotChar) - and the destroys at a dead row's address that stored no handle (not answered),
+// printed beside destroyOurs. Any thread.
+long long DestroyAddrReusedCharCount();
+long long DestroyAddrReusedNotCharCount();
+long long DestroyDeadNoHandleCount();
 
 // F322 - record the main thread, called from the in-game pump, so the destroy detour can CHECK
 // which thread it is on rather than trusting a one-run measurement.
@@ -241,8 +260,16 @@ int RetireCopyOwnerUnloaded(unsigned int uid, float x, float y, float z);
 // F332 - the same lookup for the DESTROY detour, which needs an identity rather than permission to
 // dereference. Answers for a RETIRED slot (withdrawn, still that character) and refuses a DESTROYED
 // one (the address's identity is finished and may already belong to something else). Every other
-// caller must keep using FindSpawnedUid. Same threading contract: address compares only.
+// caller must keep using FindSpawnedUid. Any thread: address compares plus the object's own handle
+// (CaptureObjId, SEH-guarded) - the row answers only when that handle is the one it stored, else 0.
+// A plain lookup: it marks, counts and logs nothing.
 unsigned int FindSpawnedUidForDestroy(const void* obj);
+// The destroy hook's call (worldgen.cpp detour_destroy) only: the same answer, and a row whose character the destroyed object
+// is not is marked destroyed and counted (destroyAddrReusedChar / NotChar). Any thread.
+unsigned int FindSpawnedUidOnDestroy(const void* obj);
+// TEST-ONLY (the addrreuse lever): a dead row for `obj` whose stored handle no object carries; the uid, or 0. MAIN THREAD.
+unsigned int AddrReuseTestRow(const void* obj);
+void AddrReuseTestDrop(const void* obj, unsigned int uid);
 // M7a3f3 T-425 [m7a3f3-sh0]: 1 = another game's copy of squad `platoonId` under `faction` is live here (the platoon its CONTEXT built, awake). MAIN THREAD.
 int CtxPlatoonLiveForId(const void* faction, const std::string& platoonId);
 
@@ -477,6 +504,23 @@ std::string NameReportLine();                                     // "[NAME] REP
 // slave1: a copy's slave state follows its owner (MSG_SLAVE, protocol 65). Hooks: StateBroadcastData::setSlaveState 0x5A3EB0
 // (table "SlaveStateSet") and StateBroadcastData::periodicUpdate 0x5A44C0 ("SlaveStatePeriodic"), both on the AI worker.
 void InstallSlaves();
+/* PROBE P140 BEGIN */
+/* PROBE P140 (T-806, log only): the cage-use task start 0x357FE0 hooked (table row CageUseStart), and a player's use-cage order
+   (task 0x6B) logged per selected character from build.cpp's order / Shift-job hooks. MAIN THREAD install; P140PlayerOrder ANY
+   THREAD (the selection is walked on the main thread only). */
+void InstallP140();
+void P140PlayerOrder(void* pi, int task, void* subject, int queued, const char* road);
+/* PROBE P140 END */
+/* PROBE P141 BEGIN */
+/* PROBE P141 (T-836, log only): a copy the drift digest stops printing. P141CopyFacts: the uid's mirror row against MirrorSlot's
+   own checks (*mirrorPass 1 = they pass), the reason in *why (noRow / retired / noObject / implausible, else LiveCharacter's
+   verdict name and code), *hasRow 0 = no mirror row names the uid; returns " storedIdx=.. storedSer=.. curIdx=.. curSer=..
+   inSomething=.. rowRetired=.. spawned=.. moveRow=.. bedHold=.." (the maps are read on the MAIN THREAD only, '?' elsewhere).
+   P141LiveCountsLine: the LiveCharacter verdict counts as one line, "" when no unusable count moved since the last line. Reads only. */
+std::string P141CopyFacts(unsigned int uid, int* mirrorPass, int* hasRow, std::string* why);
+std::string P141LiveCountsLine();
+std::string P141ReleaseRouteText(unsigned int uid, unsigned int nowMs);   /* the newest release of the uid's mirror row: route, when, destroy mark */
+/* PROBE P141 END */
 void SlaveTick();                                                 // MAIN THREAD: send the owned changes the hooks marked; log refusals
 void SlaveSendWithSpawn(unsigned int uid, const void* character); // MAIN THREAD: net::SendSpawn, after each SPAWN it sent
 void SlaveNoteRecv(unsigned int uid, int state, unsigned int ownerUid, unsigned int fromPeer);   // MAIN THREAD (dispatch): held for the K2 safe point
@@ -605,6 +649,7 @@ void ListTemplates(const std::string& filter, int maxCount);
 
 } // namespace coop
 namespace coop { void ForgetContextPlatoons(); void ForgetContextPlatoon(void* platoon); }
+namespace coop { std::string ContextWorldIdOfCopy(unsigned int uid); }   /* the world id of the context platoon a registered copy stands in now, "" = none (net/session.cpp's roster withdrawal). MAIN THREAD */
 namespace coop { void* ContextPlatoonForActive(void* active); int SlaveStateOfCharacter(const void* c); int IsContextPlatoon(void* platoon); }   /* M7a2 [m7a2-cx2]: IsContextPlatoon - the store's load, wake and sleep hooks (MAIN THREAD) */   /* recruit1 fold: hire.cpp */   // review-p3b: called from the store's world-teardown hook
 // review-p3o H2: drop every engine pointer this module caches (g_spawned, the uid mirror and its
 // hash index) before GameWorld::_clearAndDestroyGameWorldStuff frees the characters they name.
@@ -622,6 +667,10 @@ namespace coop { void SpawnWorldTeardown(); }
    Character::getSquad's answer, the squad's awake half). MAIN THREAD. */
 class Faction;
 namespace coop { void CopySquadIdCheckHired(::Faction* faction, void* active); }
+/* T-710 (store.cpp OwnRenameDrain): a copy squad loaded from the save under this game's own squad id gets the same id check once its
+   characters are read in. 1 renamed, 0 kept (no other squad holds the id), -1 not a stand-in's squad under `id` any more, -2 the check
+   could not rename it. MAIN THREAD. */
+namespace coop { int CopySquadIdCheckAtLoad(void* platoon, const std::string& id); }
 /* snap1 (user decision 2026-09-26): the `snapshot` verb's per-character engine facts. Every engine read is a guarded POD
    frame (spawn.cpp SnapCharFacts). MAIN THREAD. 1 = read (fields that would not read are flagged), 0 = not a live character. */
 namespace coop {

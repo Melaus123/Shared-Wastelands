@@ -85,5 +85,8 @@ std::string PolicyTeamClick(int ownerSlot, const std::string& cls);
 // PlayerInterface::isEnemy, the interaction menu the engine builds on it (the list made and the list shown) and the right-click
 // handler as a hover; one [TEAM] orders line. MAIN THREAD. Returns the status.
 std::string PolicyTeamOrders(int slot);
+// T-805: `faction` (a building's owner) is the faction of a player who shares this game's player's team - the test the cursor hooks
+// make (false while this game's player is in no team). ANY THREAD.
+bool PolicyTeammateFaction(void* faction);
 
 }

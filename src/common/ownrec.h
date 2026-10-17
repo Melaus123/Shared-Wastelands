@@ -745,28 +745,337 @@ inline bool GdcScan(const char* data, size_t n, const std::string& src, GdcScanO
     return !c.bad;
 }
 
+/* ONE CHARACTER OUT OF A SQUAD FILE (T-802): the copy the overlay loads for a squad a person left after the save.
+   The layout (0x6BD220's writer; checked on 104 squad files copied from a save): the squad's 0x1E record holds an int
+   field "char count" and ONE INSTANCE PER CHARACTER whose state list names that character's own records (its 0x24 main
+   record, 0x43, its 0x29 inventory, 0x39, 0x19, 0x42); an inventory record's instances name its item records (the
+   instance target). char count = the instance count = the number of 0x24 records.
+   GdcSpans: every record's byte span, sid, own hand (a 0x24 record's, as GdcScan forms it), "char count", reference-list
+   entries and instances (span, target, states). false = the bytes do not parse.
+   GdcStripChar: drops the instance naming the person's 0x24 record, every record that instance names, every record those
+   name as an instance target, state or list entry (transitively), and lowers "char count" by one; every other byte is
+   copied unchanged. The result is scanned again (GdcScan): it must parse and hold the same characters less this one.
+   Refused (out untouched) when anything does not fit: a record a kept record still names, a second character among the
+   records to drop, a kept record holding the person's hand (any handle field, as GdcScan reads them), a "char count" that
+   is not both the instance count and the 0x24 count, any layout but the verified one (one 0x1E record whose only field is
+   "char count" and which has no reference list, and no byte after the records), or no character at all. The last person
+   strips too: the copy's squad record then has char count 0 and no instance, every other byte of it unchanged - the shape
+   the engine itself writes for a squad with nobody in it (its member loader makes no one from it). */
+const int kStripOk = 0, kStripParse = 1, kStripNoChar = 2, kStripNoInstance = 3, kStripShared = 4, kStripCount = 5, kStripEmpty = 6, kStripCheck = 7,
+          kStripHandRef = 8, kStripLayout = 9;
+inline const char* StripWhyName(int w)
+{
+    switch (w)
+    {
+    case kStripOk:         return "ok";
+    case kStripParse:      return "parse";
+    case kStripNoChar:     return "no-such-character";
+    case kStripNoInstance: return "no-instance";
+    case kStripShared:     return "shared-record";
+    case kStripCount:      return "char-count";
+    case kStripEmpty:      return "would-be-empty";
+    case kStripCheck:      return "strip-selfcheck";
+    case kStripHandRef:    return "hand-reference";
+    case kStripLayout:     return "layout";
+    default:               return "?";
+    }
+}
+struct GdcInstSpan
+{
+    size_t                   from, to;
+    std::string              target;
+    std::vector<std::string> states;
+    GdcInstSpan() : from(0), to(0) {}
+};
+/* T-799 D2, THE RECORD'S MONEY: the int field a group's money rides in, inside its record's squad record (type 0x1E). It is the
+   engine's own key for a squad's money in its state record (0x623690 writes it, 0x623BB0 reads it), so the state record store.cpp
+   builds from a record's squad record (StateMake22 copies every field) hands it to the engine's own read. The engine writes no field
+   of this name into a .platoon file; a record without it does not carry the money (never "0"). */
+const char* const kRecMoneyKey = "money";
+struct GdcRecSpan
+{
+    size_t                   from, to, instCountAt, charCountAt;
+    int                      type, charCount;
+    bool                     hasCharCount;
+    std::string              sid, hand;   /* hand: a 0x24 record's own serial + type (GdcScan's id), else empty */
+    std::vector<std::string> listRefs;
+    std::vector<std::string> handIds;   /* every whole hand in the record's int fields, any prefix (GdcScan's rule), as HandId */
+    std::vector<GdcInstSpan> inst;
+    int                      fields, lists;   /* how many fields (all seven kinds) and reference lists the record has */
+    bool                     hasMoney;   /* the record holds kRecMoneyKey (T-799 D2) - money its value */
+    int                      money;
+    GdcRecSpan() : from(0), to(0), instCountAt(0), charCountAt(0), type(0), charCount(0), hasCharCount(false), fields(0), lists(0), hasMoney(false), money(0) {}
+};
+inline void GdcPutI32(std::vector<char>* v, int x)
+{
+    const unsigned int u = (unsigned int)x;
+    v->push_back((char)(u & 0xFFu)); v->push_back((char)((u >> 8) & 0xFFu)); v->push_back((char)((u >> 16) & 0xFFu)); v->push_back((char)((u >> 24) & 0xFFu));
+}
+inline bool GdcSpans(const char* data, size_t n, size_t* recsEnd, std::vector<GdcRecSpan>* out)
+{
+    out->clear();
+    GdcCur c; c.p = (const unsigned char*)data; c.n = data ? n : 0; c.at = 0; c.bad = false;
+    GdcI32(&c); GdcI32(&c);
+    const int recs = GdcCount(&c, 40);
+    if (c.bad) return false;
+    static const int kWidth[7] = { 1, 4, 4, 12, 16, 0, 0 };   /* as GdcScan */
+    for (int r = 0; r < recs; ++r)
+    {
+        GdcRecSpan s;
+        s.from = c.at;
+        GdcI32(&c);
+        s.type = GdcI32(&c);
+        GdcI32(&c);
+        GdcStr(&c, 0); GdcStr(&c, &s.sid);
+        GdcI32(&c);
+        int hs = 0, ht = 0;
+        bool haveS = false, haveT = false;
+        std::map<std::string, std::map<std::string, int> > hands;   /* prefix -> suffix -> value */
+        for (int m = 0; m < 7; ++m)
+        {
+            const int cnt = GdcCount(&c, 4);
+            if (!c.bad) s.fields += cnt;
+            for (int e = 0; e < cnt && !c.bad; ++e)
+            {
+                std::string k;
+                GdcStr(&c, &k);
+                if (kWidth[m] == 0) { GdcStr(&c, 0); continue; }
+                if (m != 2) { GdcSkip(&c, (size_t)kWidth[m]); continue; }
+                const size_t at = c.at;
+                const int v = GdcI32(&c);
+                if (c.bad) break;
+                if (k == "char count") { s.hasCharCount = true; s.charCountAt = at; s.charCount = v; }
+                if (k == kRecMoneyKey) { s.hasMoney = true; s.money = v; }
+                const std::string::size_type hp = k.rfind("handle");
+                if (hp != std::string::npos) hands[k.substr(0, hp)][k.substr(hp + 6)] = v;
+                if (k.rfind("handle") == 0)   /* the record's own hand: no prefix (GdcScan's rule) */
+                {
+                    const std::string suf = k.substr(6);
+                    if (suf == "S") { hs = v; haveS = true; }
+                    else if (suf == "TYPE") { ht = v; haveT = true; }
+                }
+            }
+            if (c.bad) return false;
+        }
+        if (s.type == 0x24 && haveS && haveT) s.hand = HandId(hs, ht);
+        for (std::map<std::string, std::map<std::string, int> >::const_iterator h = hands.begin(); h != hands.end(); ++h)
+        {
+            std::map<std::string, int>::const_iterator hS = h->second.find("S"), hT = h->second.find("TYPE");
+            if (hS != h->second.end() && hT != h->second.end()) s.handIds.push_back(HandId(hS->second, hT->second));
+        }
+        const int lists = GdcCount(&c, 8);
+        if (!c.bad) s.lists = lists;
+        for (int l = 0; l < lists && !c.bad; ++l)
+        {
+            GdcStr(&c, 0);
+            const int ne = GdcCount(&c, 16);
+            for (int e = 0; e < ne && !c.bad; ++e)
+            {
+                std::string ref;
+                GdcStr(&c, &ref); GdcSkip(&c, 12);
+                if (!c.bad) s.listRefs.push_back(ref);
+            }
+        }
+        if (c.bad) return false;
+        s.instCountAt = c.at;
+        const int inst = GdcCount(&c, 40);
+        for (int i = 0; i < inst && !c.bad; ++i)
+        {
+            GdcInstSpan is;
+            is.from = c.at;
+            GdcStr(&c, 0); GdcStr(&c, &is.target); GdcSkip(&c, 12); GdcSkip(&c, 16);
+            const int ns = GdcCount(&c, 4);
+            for (int k = 0; k < ns && !c.bad; ++k)
+            {
+                std::string st;
+                GdcStr(&c, &st);
+                if (!c.bad) is.states.push_back(st);
+            }
+            is.to = c.at;
+            s.inst.push_back(is);
+        }
+        if (c.bad) return false;
+        s.to = c.at;
+        out->push_back(s);
+    }
+    *recsEnd = c.at;
+    return !c.bad;
+}
+/* T-799 D2: the money a record file carries - kRecMoneyCarried (*money its value, 0 included), kRecMoneyNone (an older record: the
+   squad record has no kRecMoneyKey - never read as 0), kRecMoneyUnread (the bytes do not parse, or not exactly one squad record). */
+const int kRecMoneyUnread = -1, kRecMoneyNone = 0, kRecMoneyCarried = 1;
+inline int RecordMoneyOf(const char* data, size_t n, int* money)
+{
+    *money = 0;
+    std::vector<GdcRecSpan> rs;
+    size_t end = 0;
+    if (!data || !GdcSpans(data, n, &end, &rs)) return kRecMoneyUnread;
+    size_t at = 0;
+    int squads = 0;
+    for (size_t i = 0; i < rs.size(); ++i) if (rs[i].type == 0x1E) { ++squads; at = i; }
+    if (squads != 1) return kRecMoneyUnread;
+    if (!rs[at].hasMoney) return kRecMoneyNone;
+    *money = rs[at].money;
+    return kRecMoneyCarried;
+}
+inline int GdcStripChar(const char* data, size_t n, const std::string& who, std::vector<char>* out)
+{
+    std::vector<GdcRecSpan> rs;
+    size_t end = 0;
+    if (!data || !GdcSpans(data, n, &end, &rs)) return kStripParse;
+    if (end != n) return kStripLayout;   /* bytes after the records: not the verified layout */
+    std::map<std::string, size_t> bySid;
+    for (size_t i = 0; i < rs.size(); ++i)
+    {
+        if (rs[i].sid.empty()) continue;
+        if (bySid.count(rs[i].sid) != 0) return kStripShared;   /* two records under one name: what names what is unclear */
+        bySid[rs[i].sid] = i;
+    }
+    size_t mainRec = rs.size();
+    int chars = 0;
+    for (size_t i = 0; i < rs.size(); ++i)
+    {
+        if (rs[i].type != 0x24) continue;
+        ++chars;
+        if (rs[i].hand != who || who.empty()) continue;
+        if (mainRec != rs.size()) return kStripNoChar;   /* the same person twice in one file */
+        mainRec = i;
+    }
+    if (mainRec == rs.size() || rs[mainRec].sid.empty()) return kStripNoChar;
+    if (chars < 1) return kStripEmpty;   /* no character in the file (the last one strips to an empty squad record) */
+    size_t ownRec = rs.size(), ownInst = 0;
+    int hits = 0;
+    for (size_t i = 0; i < rs.size(); ++i)
+        for (size_t k = 0; k < rs[i].inst.size(); ++k)
+            for (size_t j = 0; j < rs[i].inst[k].states.size(); ++j)
+                if (rs[i].inst[k].states[j] == rs[mainRec].sid) { ++hits; ownRec = i; ownInst = k; }
+    if (hits != 1 || rs[ownRec].type != 0x1E) return kStripNoInstance;
+    const GdcRecSpan& own = rs[ownRec];
+    int squads = 0;
+    for (size_t i = 0; i < rs.size(); ++i) if (rs[i].type == 0x1E) ++squads;
+    if (squads != 1 || own.fields != 1 + (own.hasMoney ? 1 : 0) || own.lists != 0) return kStripLayout;   /* per-member data the strip would not adjust (the group's money, T-799 D2, is not per member and stays) */
+    if (!own.hasCharCount || own.charCount != (int)own.inst.size() || own.charCount != chars || own.charCountAt + 4 > own.instCountAt) return kStripCount;
+    /* the records to drop: the instance's states, then whatever they name, transitively */
+    std::set<size_t> gone;
+    std::vector<size_t> todo;
+    std::vector<std::string> names = own.inst[ownInst].states;
+    for (size_t j = 0; j < names.size(); ++j)
+    {
+        std::map<std::string, size_t>::const_iterator f = bySid.find(names[j]);
+        if (f == bySid.end() || f->second == ownRec) return kStripShared;   /* a state that is no record of this file */
+        if (gone.insert(f->second).second) todo.push_back(f->second);
+    }
+    while (!todo.empty())
+    {
+        const GdcRecSpan& g = rs[todo.back()];
+        todo.pop_back();
+        std::vector<std::string> refs = g.listRefs;
+        for (size_t k = 0; k < g.inst.size(); ++k)
+        {
+            refs.push_back(g.inst[k].target);
+            refs.insert(refs.end(), g.inst[k].states.begin(), g.inst[k].states.end());
+        }
+        for (size_t j = 0; j < refs.size(); ++j)
+        {
+            std::map<std::string, size_t>::const_iterator f = bySid.find(refs[j]);
+            if (f == bySid.end()) continue;   /* a game-data name (a template, a race): not in this file */
+            if (f->second == ownRec) return kStripShared;
+            if (gone.insert(f->second).second) todo.push_back(f->second);
+        }
+    }
+    for (std::set<size_t>::const_iterator g = gone.begin(); g != gone.end(); ++g)
+        if (rs[*g].type == 0x24 && *g != mainRec) return kStripShared;   /* another character would go with it */
+    for (size_t i = 0; i < rs.size(); ++i)   /* no kept record may name a dropped one, or hold the person's hand */
+    {
+        if (gone.count(i) != 0) continue;
+        for (size_t h = 0; h < rs[i].handIds.size(); ++h) if (rs[i].handIds[h] == who) return kStripHandRef;
+        std::vector<std::string> refs = rs[i].listRefs;
+        for (size_t k = 0; k < rs[i].inst.size(); ++k)
+        {
+            if (i == ownRec && k == ownInst) continue;
+            refs.push_back(rs[i].inst[k].target);
+            refs.insert(refs.end(), rs[i].inst[k].states.begin(), rs[i].inst[k].states.end());
+        }
+        for (size_t j = 0; j < refs.size(); ++j)
+        {
+            std::map<std::string, size_t>::const_iterator f = bySid.find(refs[j]);
+            if (f != bySid.end() && gone.count(f->second) != 0) return kStripShared;
+        }
+    }
+    std::vector<char> o;
+    o.insert(o.end(), data, data + 8);
+    GdcPutI32(&o, (int)(rs.size() - gone.size()));
+    for (size_t i = 0; i < rs.size(); ++i)
+    {
+        if (gone.count(i) != 0) continue;
+        const GdcRecSpan& g = rs[i];
+        if (i != ownRec) { o.insert(o.end(), data + g.from, data + g.to); continue; }
+        o.insert(o.end(), data + g.from, data + g.charCountAt);
+        GdcPutI32(&o, g.charCount - 1);
+        o.insert(o.end(), data + g.charCountAt + 4, data + g.instCountAt);
+        GdcPutI32(&o, (int)g.inst.size() - 1);
+        for (size_t k = 0; k < g.inst.size(); ++k)
+            if (k != ownInst) o.insert(o.end(), data + g.inst[k].from, data + g.inst[k].to);
+    }
+    o.insert(o.end(), data + end, data + n);
+    /* the copy must parse and hold the same characters less this one (a no-hand id names its record number, which moved) */
+    GdcScanOut before, after;
+    if (!GdcScan(data, n, "strip", &before) || !GdcScan(&o[0], o.size(), "strip", &after) || after.chars.size() + 1 != before.chars.size())
+        return kStripCheck;
+    std::vector<std::string> want, got;
+    bool dropped = false;
+    for (size_t j = 0; j < before.chars.size(); ++j)
+    {
+        if (!dropped && before.chars[j] == who) { dropped = true; continue; }
+        if (before.chars[j].empty() || before.chars[j][0] != '?') want.push_back(before.chars[j]);
+    }
+    for (size_t j = 0; j < after.chars.size(); ++j)
+    {
+        if (after.chars[j] == who) return kStripCheck;
+        if (after.chars[j].empty() || after.chars[j][0] != '?') got.push_back(after.chars[j]);
+    }
+    if (!dropped || want != got) return kStripCheck;
+    out->swap(o);
+    return kStripOk;
+}
+
 /* THE ROSTER CHECK (design 3.3; review-mmo2 items 2 and 5). One squad the overlay may apply: its characters in the
    save's version and in the record. apply: in = 1 for a candidate; out = 1 when the record is laid over the save.
-   conflict / duplicate / empty: why it was refused (the save's version is kept). */
+   conflict / duplicate / empty: why it was refused (the save's version is kept).
+   movedIn / movedFrom (T-802): people this record took, since the save, from a squad that is not a candidate (and that
+   squad's sid), for the log. stripped = 1: not a record but that other squad's save file without those people (recChars =
+   the copy's characters); it is checked like any candidate, so it stands only together with the record that took them.
+   restore = 1: a squad the save does not have (made or split off after the save), rebuilt from its head record (pp.sqhead,
+   SquadHeadKey) and its squad record: saveChars is empty, recChars its people (RestoreVerdict decides who is one).
+   fenced = 1 (T-710, savesquadforeign.h): the save's file of this squad id holds only another player's characters
+   (fileChars), so saveChars is the record's own people - what is checked when the record is applied; refused, the squad
+   loads that file, so the roster counts fileChars for it, never the record's people.
+   RosterCounts.moved = people applied as moved after the save; stripped = stripped squads applied; restored = restore
+   candidates applied. */
 struct RosterSquad
 {
     std::string              key;
-    std::vector<std::string> saveChars, recChars;
-    int                      apply, conflict, duplicate, empty;
-    RosterSquad() : apply(0), conflict(0), duplicate(0), empty(0) {}
+    std::vector<std::string> saveChars, recChars, movedIn, movedFrom, fileChars;
+    int                      apply, conflict, duplicate, empty, stripped, restore, fenced;
+    RosterSquad() : apply(0), conflict(0), duplicate(0), empty(0), stripped(0), restore(0), fenced(0) {}
 };
 struct RosterCounts
 {
-    int conflict, duplicate, empty;
-    RosterCounts() : conflict(0), duplicate(0), empty(0) {}
+    int conflict, duplicate, empty, moved, stripped, restored;
+    RosterCounts() : conflict(0), duplicate(0), empty(0), moved(0), stripped(0), restored(0) {}
 };
 /* THE ROSTER AFTER THE LOAD is every squad file of the save: `fixed` holds the characters of every squad that is not a
-   candidate (their save versions), and each candidate adds its record when applied, else its save version. A record
+   candidate (their save versions), and each candidate adds its record when applied, else what it loads instead: its save
+   version, or for a fenced squad the save file's characters (fileChars - another player's), never the record's. A record
    is applied only if every character its save version had, and every character the record holds, appears EXACTLY
    once in that roster: 0 = a person lost (conflict), 2+ = a person doubled (duplicate). A squad whose save version
-   has no character is refused at once (empty: nothing to check it against). Otherwise ONE squad is refused at a time
-   (the first in order that fails) and the check is run again, since refusing one changes the roster. Returns the
-   number refused. */
+   has no character is refused at once (empty: nothing to check it against); a restore candidate has no save version by
+   nature and is refused at once only when its record holds nobody. Otherwise ONE squad is refused at a time and the
+   check is run again, since refusing one changes the roster: the first failing restore candidate in order, else the
+   first failing squad in order - a squad the save has is kept over one the save lacks (a record of a squad that was
+   made and then merged away after the save still names its people). So a split's source squad, whose record lost the
+   people the split took, passes when the split-off squad is a restore candidate holding them. Returns the number
+   refused. */
 inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::string>& fixed, RosterCounts* rc)
 {
     RosterCounts local;
@@ -776,7 +1085,7 @@ inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::st
     for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
     {
         RosterSquad& s = (*sq)[i];
-        if (s.apply && s.saveChars.empty()) { s.apply = 0; s.empty = 1; ++out->empty; ++refused; }
+        if (s.apply && (s.restore ? s.recChars.empty() : s.saveChars.empty())) { s.apply = 0; s.empty = 1; ++out->empty; ++refused; }
     }
     for (;;)
     {
@@ -785,15 +1094,16 @@ inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::st
         for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
         {
             const RosterSquad& s = (*sq)[i];
-            const std::vector<std::string>& v = s.apply ? s.recChars : s.saveChars;
+            const std::vector<std::string>& v = s.apply ? s.recChars : s.fenced ? s.fileChars : s.saveChars;   /* refused: what the squad loads */
             for (std::vector<std::string>::size_type k = 0; k < v.size(); ++k) ++count[v[k]];
         }
         std::vector<RosterSquad>::size_type bad = sq->size();
         int why = 0;
+        for (int pass = 0; pass < 2 && bad == sq->size(); ++pass)   /* pass 0: restore candidates only; pass 1: every squad */
         for (std::vector<RosterSquad>::size_type i = 0; i < sq->size() && bad == sq->size(); ++i)
         {
             const RosterSquad& s = (*sq)[i];
-            if (!s.apply) continue;
+            if (!s.apply || (pass == 0 && !s.restore)) continue;
             for (std::vector<std::string>::size_type k = 0; k < s.saveChars.size() && bad == sq->size(); ++k)
             {
                 std::map<std::string, int>::const_iterator it = count.find(s.saveChars[k]);
@@ -803,12 +1113,228 @@ inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::st
             for (std::vector<std::string>::size_type k = 0; k < s.recChars.size() && bad == sq->size(); ++k)
                 if (count[s.recChars[k]] > 1) { bad = i; why = 2; }
         }
-        if (bad == sq->size()) return refused;
+        if (bad == sq->size())
+        {
+            for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
+            {
+                const RosterSquad& s = (*sq)[i];
+                if (!s.apply) continue;
+                if (s.stripped) ++out->stripped; else out->moved += (int)s.movedIn.size();
+                if (s.restore) ++out->restored;
+            }
+            return refused;
+        }
         RosterSquad& b = (*sq)[bad];
         b.apply = 0;
         if (why == 1) { b.conflict = 1; ++out->conflict; } else { b.duplicate = 1; ++out->duplicate; }
         ++refused;
     }
+}
+
+/* MOVED AFTER THE SAVE (T-802; owner rule: records win). A person a candidate's record holds who is in NO candidate's save
+   version, in no other candidate's record, and in exactly ONE squad that is not a candidate (its save version, part of
+   `fixed`) joined the record's squad after the save. Each such person is one move: cand = the candidate (index into sq),
+   from = the squad he left (index into fx). The caller loads that squad from a copy of its save file without him
+   (GdcStripChar) and adds it to sq as a stripped candidate; a person in two squads of the save, in two records, in a
+   candidate's own save version, or with no hand ('?' id) is never a move and keeps today's refusal. */
+struct RosterFixedSquad
+{
+    std::string              key;
+    std::vector<std::string> chars;
+};
+struct RosterMove
+{
+    std::vector<RosterSquad>::size_type cand;
+    std::vector<RosterFixedSquad>::size_type from;
+    std::string who;
+    RosterMove() : cand(0), from(0) {}
+};
+inline void RosterFindMoves(const std::vector<RosterSquad>& sq, const std::vector<RosterFixedSquad>& fx, std::vector<RosterMove>* moves)
+{
+    moves->clear();
+    std::map<std::string, int> inRec, inFixed;
+    std::set<std::string> inCandSave;
+    std::map<std::string, std::vector<RosterFixedSquad>::size_type> fixedAt;
+    for (std::vector<RosterSquad>::size_type i = 0; i < sq.size(); ++i)
+    {
+        inCandSave.insert(sq[i].saveChars.begin(), sq[i].saveChars.end());
+        if (sq[i].apply && !sq[i].stripped)
+            for (std::vector<std::string>::size_type k = 0; k < sq[i].recChars.size(); ++k) ++inRec[sq[i].recChars[k]];
+    }
+    for (std::vector<RosterFixedSquad>::size_type f = 0; f < fx.size(); ++f)
+        for (std::vector<std::string>::size_type k = 0; k < fx[f].chars.size(); ++k) { ++inFixed[fx[f].chars[k]]; fixedAt[fx[f].chars[k]] = f; }
+    for (std::vector<RosterSquad>::size_type i = 0; i < sq.size(); ++i)
+    {
+        const RosterSquad& s = sq[i];
+        if (!s.apply || s.stripped) continue;
+        for (std::vector<std::string>::size_type k = 0; k < s.recChars.size(); ++k)
+        {
+            const std::string& p = s.recChars[k];
+            if (p.empty() || p[0] == '?') continue;
+            if (inRec[p] != 1 || inCandSave.count(p) != 0 || inFixed[p] != 1) continue;
+            RosterMove m;
+            m.cand = i; m.from = fixedAt[p]; m.who = p;
+            moves->push_back(m);
+        }
+    }
+}
+
+/* THE PENDING STRIPS (T-802 fold). A stripped old squad that is not loaded while the overlay window is open (a far or
+   sleeping squad, read from its file only when it wakes) would load its save version later with the person still in it.
+   The records store keeps one line per applied move in PendStripFile():
+   "ps1\t<old squad sid>\t<person id (serial + type)>\t<seq of the record that took him>\t<sid of the squad that took him>\n".
+   Every later load of the old squad's file that still holds the person reads a stripped copy instead. An entry goes when a
+   load of that file no longer holds the person (an engine save rewrote it after a stripped load: PendStripDropGone), and at
+   each world load unless the loaded save already holds the move (its mark >= the entry's seq; no mark: dropped -
+   PendStripKeepAtLoad); a load that applies the record again adds the entry again. One entry per old squad + person (the
+   newer seq kept), at most kPendStripCap. Pure: no disk. */
+struct PendStrip
+{
+    std::string        oldSid, who, newSid;
+    unsigned long long seq;
+    PendStrip() : seq(0) {}
+};
+inline const char* PendStripFile() { return "pp.strip.pending"; }
+const size_t kPendStripCap = 64;
+inline bool PendFieldOk(const std::string& s)
+{
+    if (s.empty()) return false;
+    for (std::string::size_type i = 0; i < s.size(); ++i) if (s[i] == '\t' || s[i] == '\r' || s[i] == '\n') return false;
+    return true;
+}
+inline bool PendStripFormat(const PendStrip& e, std::string* out)
+{
+    if (!PendFieldOk(e.oldSid) || !PendFieldOk(e.who) || !PendFieldOk(e.newSid)) return false;
+    char b[32];
+    std::sprintf(b, "%llu", e.seq);
+    *out = "ps1\t" + e.oldSid + "\t" + e.who + "\t" + b + "\t" + e.newSid + "\n";
+    return true;
+}
+inline bool PendStripParse(const std::string& lineIn, PendStrip* e)
+{
+    std::string line = lineIn;
+    while (!line.empty() && (line[line.size() - 1] == '\r' || line[line.size() - 1] == '\n')) line.erase(line.size() - 1);
+    std::vector<std::string> f;
+    std::string::size_type from = 0;
+    for (;;)
+    {
+        const std::string::size_type tb = line.find('\t', from);
+        if (tb == std::string::npos) { f.push_back(line.substr(from)); break; }
+        f.push_back(line.substr(from, tb - from)); from = tb + 1;
+    }
+    unsigned long long s = 0;
+    if (f.size() != 5 || f[0] != "ps1" || !PendFieldOk(f[1]) || !PendFieldOk(f[2]) || !PendFieldOk(f[4]) || !ParseULL(f[3], &s)) return false;
+    e->oldSid = f[1]; e->who = f[2]; e->seq = s; e->newSid = f[4];
+    return true;
+}
+/* false = a bad field or the list is full */
+inline bool PendStripAdd(std::vector<PendStrip>* v, const PendStrip& e)
+{
+    if (!PendFieldOk(e.oldSid) || !PendFieldOk(e.who) || !PendFieldOk(e.newSid)) return false;
+    for (std::vector<PendStrip>::size_type i = 0; i < v->size(); ++i)
+        if ((*v)[i].oldSid == e.oldSid && (*v)[i].who == e.who)
+        {
+            if (e.seq >= (*v)[i].seq) (*v)[i] = e;
+            return true;
+        }
+    if (v->size() >= kPendStripCap) return false;
+    v->push_back(e);
+    return true;
+}
+/* the file's text -> the list; returns the number of lines refused (an empty line is no line) */
+inline int PendStripParseAll(const std::string& text, std::vector<PendStrip>* out)
+{
+    out->clear();
+    int bad = 0;
+    std::string::size_type from = 0;
+    while (from < text.size())
+    {
+        const std::string::size_type nl = text.find('\n', from);
+        const std::string line = text.substr(from, nl == std::string::npos ? std::string::npos : nl - from);
+        from = nl == std::string::npos ? text.size() : nl + 1;
+        if (line.empty() || line == "\r") continue;
+        PendStrip e;
+        if (!PendStripParse(line, &e) || !PendStripAdd(out, e)) ++bad;
+    }
+    return bad;
+}
+inline std::string PendStripText(const std::vector<PendStrip>& v)
+{
+    std::string all, ln;
+    for (std::vector<PendStrip>::size_type i = 0; i < v.size(); ++i) if (PendStripFormat(v[i], &ln)) all += ln;
+    return all;
+}
+/* at a world load: an entry stays only when the loaded save already holds the move; returns the number dropped */
+inline int PendStripKeepAtLoad(std::vector<PendStrip>* v, bool haveMark, unsigned long long markSeq)
+{
+    int dropped = 0;
+    for (std::vector<PendStrip>::iterator it = v->begin(); it != v->end(); )
+        if (!haveMark || markSeq < it->seq) { it = v->erase(it); ++dropped; }
+        else ++it;
+    return dropped;
+}
+/* a load of oldSid's file holding fileChars: its entries whose person is not in it go; returns the number dropped */
+inline int PendStripDropGone(std::vector<PendStrip>* v, const std::string& oldSid, const std::vector<std::string>& fileChars)
+{
+    int dropped = 0;
+    for (std::vector<PendStrip>::iterator it = v->begin(); it != v->end(); )
+        if (it->oldSid == oldSid && std::find(fileChars.begin(), fileChars.end(), it->who) == fileChars.end()) { it = v->erase(it); ++dropped; }
+        else ++it;
+    return dropped;
+}
+
+/* ROOM IN THE LIST (T-802 fold 2): how many entries a load's moves from oldSid would add (an old squad + person already
+   listed is replaced, not added); PendStripFits: they fit beside `have` entries and `reserved` already promised this load.
+   A move that does not fit is refused (its record is refused as before), never dropped silently. */
+inline size_t PendStripNewCount(const std::vector<PendStrip>& v, const std::string& oldSid, const std::vector<std::string>& who)
+{
+    size_t more = 0;
+    for (std::vector<std::string>::size_type k = 0; k < who.size(); ++k)
+    {
+        bool have = false;
+        for (std::vector<PendStrip>::size_type i = 0; i < v.size() && !have; ++i) if (v[i].oldSid == oldSid && v[i].who == who[k]) have = true;
+        for (std::vector<std::string>::size_type j = 0; j < k && !have; ++j) if (who[j] == who[k]) have = true;
+        if (!have) ++more;
+    }
+    return more;
+}
+inline bool PendStripFits(size_t have, size_t reserved, size_t more) { return have + reserved + more <= kPendStripCap; }
+/* THE STRIP DECISION (T-802 fold 2; manager rule 2026-10-15: never strip a person from the old squad unless the taking squad's
+   record is CONFIRMED loaded with him - in doubt a doubled person and an ERROR line, never a lost one). For one pending entry
+   at a load of its old squad's file: fileHolds = that file holds the person; takerAppliedSeq = the seq of THIS load's overlay
+   record of the taking squad when the engine loaded it and it holds the person (0 = not); takerHolds = the taking squad's
+   current record holds him (1), does not (0), cannot be read (-1).
+   kPendApply: strip (the entry goes once the engine loaded the stripped copy). kPendGone: the file no longer holds him (entry
+   goes). kPendTakerLost: the taking squad's current record no longer holds him - he moved back or on (no strip, entry goes).
+   kPendTakerNotLoaded / kPendTakerUnread: not confirmed (no strip, entry kept: the taking record may load or read later). */
+const int kPendApply = 0, kPendGone = 1, kPendTakerLost = 2, kPendTakerNotLoaded = 3, kPendTakerUnread = 4;
+inline int PendStripDecide(bool fileHolds, unsigned long long takerAppliedSeq, unsigned long long entrySeq, int takerHolds)
+{
+    if (!fileHolds) return kPendGone;
+    if (takerHolds == 0) return kPendTakerLost;
+    if (takerAppliedSeq == 0 || takerAppliedSeq < entrySeq) return kPendTakerNotLoaded;
+    if (takerHolds < 0) return kPendTakerUnread;
+    return kPendApply;
+}
+inline bool PendStripKeepAfter(int d) { return d == kPendApply || d == kPendTakerNotLoaded || d == kPendTakerUnread; }
+inline const char* PendDecideName(int d)
+{
+    switch (d)
+    {
+    case kPendApply:          return "applied";
+    case kPendGone:           return "the old squad's file no longer holds him";
+    case kPendTakerLost:      return "the taking squad's current record no longer holds him (he moved back or on)";
+    case kPendTakerNotLoaded: return "the taking squad's record is not loaded with him in this load";
+    case kPendTakerUnread:    return "the taking squad's current record cannot be read";
+    default:                  return "?";
+    }
+}
+/* one entry out (true = it was there) */
+inline bool PendStripDropOne(std::vector<PendStrip>* v, const std::string& oldSid, const std::string& who)
+{
+    for (std::vector<PendStrip>::iterator it = v->begin(); it != v->end(); ++it)
+        if (it->oldSid == oldSid && it->who == who) { v->erase(it); return true; }
+    return false;
 }
 
 /* ---- mmo4 (e47-mmo-design.md 4.1, 7 item 4, decision M5; fold review-mmo4): the one engine save at leave / Exit ----
@@ -1175,7 +1701,8 @@ inline void RecCur(GdcCur* c, const std::vector<char>& b) { c->p = b.empty() ? 0
 inline bool RecTag(GdcCur* c, const char* tag) { std::string s; GdcStr(c, &s); return !c->bad && s == tag; }
 inline bool RecEnd(const GdcCur* c) { return !c->bad && c->at == c->n; }
 
-/* B money: "om3m" + int32 */
+/* B money: "om3m" + int32 - version 1 of pp.money; the plugin now writes version 2, the balance and the T-810 money ledger
+   (src/common/moneywire.h EncodeRec / DecodeRec, which reads both versions) */
 inline void EncodeMoney(int m, std::vector<char>* out) { out->clear(); RecPutStr(out, "om3m"); RecPutI32(out, m); }
 inline bool DecodeMoney(const std::vector<char>& b, int* m)
 {
@@ -1184,6 +1711,201 @@ inline bool DecodeMoney(const std::vector<char>& b, int* m)
     const int v = GdcI32(&c);
     if (!RecEnd(&c)) return false;
     *m = v; return true;
+}
+
+/* THE SQUAD'S HEAD RECORD (pp.sqhead.<part>, one per squad of this player beside its pp.squad.<part>): what makes the squad
+   EXIST, which its squad record does not carry. The squad record holds its people only (0x4FE980); the squad itself - its
+   template, base town, flags, position, content file, the money of its pot - is the platoon's state record, the type-0x22
+   GameData at Platoon+0x40, which the engine fills at its own save (0x372DB0, the pot's part through 0x623690) and reads at
+   a load (0x7EC550, the pot's part through 0x623BB0). A squad made or split off after the last engine save is in no save,
+   so this record is the copy that lets a load rebuild it - once the record is filled (HeadFilled). Kept: the record's own id
+   (sid) and type and its value maps - bools, floats, ints, vectors, rotations, strings, file names - by key. Never kept: the
+   pot's "money" (HeadFieldKept); any int of a HAND (a key holding "handle":
+   0x6BC730 writes a hand as five ints "<prefix>handle" + TYPE / C / CS / I / S - the squad's own, "separated", the pot's
+   "hometown", "homebuilding", "occupied", "slave<i>"), since a hand names a live object of one running world; the counts
+   of the pot's hand lists ("slave count", "owned stuff count"), which would promise hands that are not there; the reference
+   lists and placed instances (pointers into the game's data). Layout: "osh1", sid, int32 type, then per map in the order
+   above a count and its (key, value) pairs sorted by key - a bool one byte, a vector 3 floats, a rotation 4 floats. */
+inline std::string SquadHeadKey(const std::string& sid)
+{
+    const std::string k = SquadKey(sid);
+    return k.empty() ? std::string() : "pp.sqhead." + k.substr(9);
+}
+inline bool IsSquadHeadKey(const std::string& k) { return k.size() > 10 && k.compare(0, 10, "pp.sqhead.") == 0; }
+/* the squad record's key for a head record's key ("" when it is not one) */
+inline std::string SquadKeyOfHead(const std::string& headKey)
+{
+    return IsSquadHeadKey(headKey) ? "pp.squad." + headKey.substr(10) : std::string();
+}
+/* the head record's key for a squad record's key ("" when it is not one) */
+inline std::string HeadKeyOfSquad(const std::string& squadKey)
+{
+    return (IsSquadKey(squadKey) && squadKey.size() > 9) ? "pp.sqhead." + squadKey.substr(9) : std::string();
+}
+const int kHeadBool = 0, kHeadFloat = 1, kHeadInt = 2, kHeadVec = 3, kHeadRot = 4, kHeadStr = 5, kHeadFile = 6, kHeadMaps = 7;
+const int kHeadMaxFields = 4096;           /* per map: a state record holds a few dozen */
+const unsigned int kHeadMaxStr = 4096;     /* one key or string value */
+/* Never kept in any map: the squad's money (kRecMoneyKey). The state record's value dates from the last engine save and says
+   nothing of whether the pot's money is known; the squad's money travels by T-799's own rule (coopsquad::RecordCarriesMoney
+   on the squad record), so a head can never hand an unknown 0 back as a known value. */
+inline bool HeadFieldKept(int map, const std::string& key)
+{
+    if (key.empty() || key.size() > kHeadMaxStr || key == kRecMoneyKey) return false;
+    if (map != kHeadInt) return true;
+    return key.find("handle") == std::string::npos && key != "slave count" && key != "owned stuff count";
+}
+struct SquadHead
+{
+    std::string                                                sid;
+    int                                                        type;
+    std::vector<std::pair<std::string, int> >                  b, i;      /* bools as 0 / 1 */
+    std::vector<std::pair<std::string, float> >                f;
+    std::vector<std::pair<std::string, std::vector<float> > >  v, r;      /* 3 and 4 floats */
+    std::vector<std::pair<std::string, std::string> >          s, file;
+    SquadHead() : type(0) {}
+};
+template <class T> inline bool HeadPairLess(const std::pair<std::string, T>& a, const std::pair<std::string, T>& b) { return a.first < b.first; }
+inline void SortSquadHead(SquadHead* h)
+{
+    std::sort(h->b.begin(), h->b.end(), HeadPairLess<int>);
+    std::sort(h->f.begin(), h->f.end(), HeadPairLess<float>);
+    std::sort(h->i.begin(), h->i.end(), HeadPairLess<int>);
+    std::sort(h->v.begin(), h->v.end(), HeadPairLess<std::vector<float> >);
+    std::sort(h->r.begin(), h->r.end(), HeadPairLess<std::vector<float> >);
+    std::sort(h->s.begin(), h->s.end(), HeadPairLess<std::string>);
+    std::sort(h->file.begin(), h->file.end(), HeadPairLess<std::string>);
+}
+/* false = nothing to write (no sid, or a map over kHeadMaxFields, which DecodeSquadHead would refuse). The maps are written in
+   key order whatever order they arrive in; the caller filters them with HeadFieldKept (a field it drops would make the bytes
+   unreadable to DecodeSquadHead). */
+inline bool EncodeSquadHead(const SquadHead& in, std::vector<char>* out)
+{
+    out->clear();
+    if (in.sid.empty() || in.sid.size() > kHeadMaxStr) return false;
+    const size_t mx = (size_t)kHeadMaxFields;
+    if (in.b.size() > mx || in.f.size() > mx || in.i.size() > mx || in.v.size() > mx || in.r.size() > mx || in.s.size() > mx
+        || in.file.size() > mx) return false;
+    SquadHead h(in);
+    SortSquadHead(&h);
+    RecPutStr(out, "osh1"); RecPutStr(out, h.sid); RecPutI32(out, h.type);
+    RecPutI32(out, (int)h.b.size());
+    for (size_t k = 0; k < h.b.size(); ++k) { RecPutStr(out, h.b[k].first); out->push_back((char)(h.b[k].second ? 1 : 0)); }
+    RecPutI32(out, (int)h.f.size());
+    for (size_t k = 0; k < h.f.size(); ++k) { RecPutStr(out, h.f[k].first); RecPutF32(out, h.f[k].second); }
+    RecPutI32(out, (int)h.i.size());
+    for (size_t k = 0; k < h.i.size(); ++k) { RecPutStr(out, h.i[k].first); RecPutI32(out, h.i[k].second); }
+    RecPutI32(out, (int)h.v.size());
+    for (size_t k = 0; k < h.v.size(); ++k)
+    {
+        RecPutStr(out, h.v[k].first);
+        for (size_t j = 0; j < 3; ++j) RecPutF32(out, j < h.v[k].second.size() ? h.v[k].second[j] : 0.0f);
+    }
+    RecPutI32(out, (int)h.r.size());
+    for (size_t k = 0; k < h.r.size(); ++k)
+    {
+        RecPutStr(out, h.r[k].first);
+        for (size_t j = 0; j < 4; ++j) RecPutF32(out, j < h.r[k].second.size() ? h.r[k].second[j] : 0.0f);
+    }
+    RecPutI32(out, (int)h.s.size());
+    for (size_t k = 0; k < h.s.size(); ++k) { RecPutStr(out, h.s[k].first); RecPutStr(out, h.s[k].second); }
+    RecPutI32(out, (int)h.file.size());
+    for (size_t k = 0; k < h.file.size(); ++k) { RecPutStr(out, h.file[k].first); RecPutStr(out, h.file[k].second); }
+    return true;
+}
+/* false (and *h untouched) on ANY bad field - never half-read: the tag, an empty sid, a count over kHeadMaxFields, keys not
+   strictly in order within a map (so no key twice), a field HeadFieldKept drops, a bool not 0 / 1, trailing bytes */
+inline bool DecodeSquadHead(const std::vector<char>& b, SquadHead* h)
+{
+    GdcCur c; RecCur(&c, b);
+    if (!RecTag(&c, "osh1")) return false;
+    SquadHead o;
+    GdcStr(&c, &o.sid);
+    o.type = GdcI32(&c);
+    if (c.bad || o.sid.empty() || o.sid.size() > kHeadMaxStr) return false;
+    static const int kMin[kHeadMaps] = { 5, 8, 8, 16, 20, 8, 8 };   /* the key's length field + the smallest value */
+    for (int m = 0; m < kHeadMaps; ++m)
+    {
+        const int n = GdcCount(&c, (size_t)kMin[m]);
+        if (c.bad || n > kHeadMaxFields) return false;
+        std::string prev;
+        for (int k = 0; k < n; ++k)
+        {
+            std::string key;
+            GdcStr(&c, &key);
+            if (c.bad || !HeadFieldKept(m, key) || (k > 0 && !(prev < key))) return false;
+            prev = key;
+            if (m == kHeadBool) { const unsigned char u = GdcU8(&c); if (u > 1) return false; o.b.push_back(std::make_pair(key, (int)u)); }
+            else if (m == kHeadFloat) o.f.push_back(std::make_pair(key, GdcF32(&c)));
+            else if (m == kHeadInt) o.i.push_back(std::make_pair(key, GdcI32(&c)));
+            else if (m == kHeadVec || m == kHeadRot)
+            {
+                std::vector<float> x;
+                for (int j = 0; j < (m == kHeadVec ? 3 : 4); ++j) x.push_back(GdcF32(&c));
+                (m == kHeadVec ? o.v : o.r).push_back(std::make_pair(key, x));
+            }
+            else
+            {
+                std::string val;
+                GdcStr(&c, &val);
+                if (val.size() > kHeadMaxStr) return false;
+                (m == kHeadStr ? o.s : o.file).push_back(std::make_pair(key, val));
+            }
+            if (c.bad) return false;
+        }
+    }
+    if (!RecEnd(&c)) return false;
+    *h = o; return true;
+}
+/* A FILLED HEAD: one a squad can be rebuilt from. The engine fills a squad's state record at its own save (0x372DB0): the file
+   field "content file" = "platoon/" + the squad file's name part (the file platoon/<sid>.platoon; whether the part carries the
+   ".platoon" ending is not settled, so both are taken) and the string "squad template". A squad made since the last engine save
+   can have a state record with neither (one the engine has not saved, or one the mod built), and such a head names no template
+   to build the squad from. h.sid is the state record's own id, so the content file must name that id's file. */
+inline bool HeadFilled(const SquadHead& h)
+{
+    if (h.sid.empty()) return false;
+    bool file = false, tmpl = false;
+    for (size_t k = 0; k < h.file.size(); ++k)
+        if (h.file[k].first == "content file")
+            file = h.file[k].second == "platoon/" + h.sid || h.file[k].second == "platoon/" + h.sid + ".platoon";
+    for (size_t k = 0; k < h.s.size(); ++k)
+        if (h.s[k].first == "squad template") tmpl = !h.s[k].second.empty();
+    return file && tmpl;
+}
+/* WHO IS A RESTORE CANDIDATE at a load: a squad record (pp.squad.<part>) the overlay rule takes whose squad the save does not
+   have, and whose head record is stored, reads, names a squad of that same key (its state record's own id) and is filled
+   (HeadFilled). Any other such record is dropped as before (squadMissing). */
+const int kRestoreYes = 0, kRestoreInSave = 1, kRestoreNoHead = 2, kRestoreHeadBad = 3, kRestoreHeadOther = 4, kRestoreHeadUnfilled = 5;
+inline int RestoreVerdict(bool squadInSave, bool haveHead, bool headRead, const SquadHead& head, const std::string& squadKey)
+{
+    if (squadInSave) return kRestoreInSave;
+    if (!haveHead) return kRestoreNoHead;
+    if (!headRead) return kRestoreHeadBad;
+    if (squadKey.empty() || SquadKey(head.sid) != squadKey) return kRestoreHeadOther;
+    if (!HeadFilled(head)) return kRestoreHeadUnfilled;
+    return kRestoreYes;
+}
+inline const char* RestoreVerdictName(int v)
+{
+    return v == kRestoreYes ? "candidate" : v == kRestoreInSave ? "in-save" : v == kRestoreNoHead ? "no-head"
+         : v == kRestoreHeadBad ? "head-unreadable" : v == kRestoreHeadOther ? "head-names-another-squad"
+         : v == kRestoreHeadUnfilled ? "head-unfilled" : "?";
+}
+/* THE RESTORE DRY RUN at a load: the roster check run again with the restore candidates added, on a copy of the roster as it
+   was BEFORE this load's own check (`unmarked`) - the live check refuses squads in place (apply = 0), and a squad refused there
+   would stay refused in any copy made after it, so a split's source could never be seen to pass. *shadow = unmarked + restores
+   after the check, *rc its counts; `live` = the roster after this load's own check (same order as unmarked). Returns the squads
+   of the save the live check refused that the dry run would apply (a split's source). */
+inline int RosterShadowRun(const std::vector<RosterSquad>& unmarked, const std::vector<RosterSquad>& live,
+                           const std::vector<RosterSquad>& restores, const std::vector<std::string>& fixed,
+                           std::vector<RosterSquad>* shadow, RosterCounts* rc)
+{
+    *shadow = unmarked;
+    shadow->insert(shadow->end(), restores.begin(), restores.end());
+    RosterResolve(shadow, fixed, rc);
+    int sourceWouldPass = 0;
+    for (size_t i = 0; i < unmarked.size() && i < live.size(); ++i) if ((*shadow)[i].apply && !live[i].apply) ++sourceWouldPass;
+    return sourceWouldPass;
 }
 
 /* C research: the floatFields and stringFields maps Research::save 0x8301E0 writes into a 0x15 record ("num currents", "num finished",
@@ -1322,6 +2044,19 @@ inline bool DecodeFaction(const std::vector<char>& b, FactionRec* f)
 }
 /* platoonIDs is also decision 31(a)'s number-block counter: never stepped back, or a group number is reused */
 inline int PlatoonIdsAfterRestore(int live, int rec) { return rec > live ? rec : live; }
+
+/* T-810 re-check fold (finding 3): A SAVE'S MARK ROW - and with it the money hold (no money moves while a save request has a row) -
+   STAYS AS LONG AS THE ENGINE SAYS THE SAVE IS STILL GOING, however long that is: its request code (SaveManager+0xA0) not yet seen back
+   at 0 (kSaveRequestNone), or, once it has been, the save thread's busy flag (SaveFileSystem+0x1E0) up. requestCode < 0 = it could not
+   be read: only that, for the backstop's length, gives the row up (kMarkGiveUp) - a fixed time never releases a save the engine still
+   reports. busy < 0 (unreadable) after the request cleared lands it, as before. */
+enum { kMarkWait = 0, kMarkLanded = 1, kMarkGiveUp = 2 };
+inline int MarkWaitDecide(int requestCleared, int requestCode, int busy, unsigned long waitedMs, unsigned long backstopMs)
+{
+    if (requestCleared != 0 || requestCode == 0) return busy > 0 ? kMarkWait : kMarkLanded;
+    if (requestCode > 0) return kMarkWait;
+    return waitedMs < backstopMs ? kMarkWait : kMarkGiveUp;
+}
 
 /* THE RESTORE GATE, per category: mmo2's overlay rule (OverlayCandidate: with a mark, seq > mark; with none, written after
    quick.save's file time; neither known, every record), then the record's bytes must pass the index line's length + CRC. */

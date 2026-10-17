@@ -57,10 +57,13 @@
 #include "ai_spike.h"   /* P26 stage 0 fold 1: EngineThreadNameOf - which engine thread the off-thread starts run on */
 #include "../common/talkwire.h"     /* P26 stages 1-3: MSG_TALK */
 #include "../common/talkcursor.h"   /* T-737: the talk cursor's decisions */
+#include "../common/portraitdefer.h"   /* T-804: the dialogue window's portrait refresh, held off the AI thread */
+#include "../common/dlgwinguard.h"     /* T-831: the dialogue window never calls through a removed character */
 #include "soak.h"                     /* T-737: MainLoopFrames - the frame a hover was seen on */
 #include "../common/liveenvelope.h" /* P25 fold re-check: cooplive::SamePlayer (a waiting request's owner key vs the PROMPT/END sender) */
 #include "game/GameData.h"          /* P26 stages 1-3: a dialogue line's GameData string id */
 #include "game/GameDataManager.h"   /* P26 stages 1-3: gamedata.getData / listRecordsOfType */
+#include <mygui/MyGUI_Widget.h>   /* the dialogue window's own visible test (its root widget) before a held portrait refresh replays */
 #include <Windows.h>
 #include <intrin.h>
 #include <algorithm>   /* P26 stage 0 fold 1: std::sort / std::lower_bound over the drain's pointers */
@@ -77,6 +80,7 @@
 namespace coop {
 int GroundTerrainHeightAt(float x, float z, float* out);   /* P26lvl maxdy: combat.cpp - the terrain height at (x,z) (groundline's SEH-wrapped getTerrainHeightFast): 1 height, 0 no terrain (-99), -1 no row / faulted. MAIN THREAD */
 int GroundAnimalAppPod(::Character* c);   /* P26f3: appearance.cpp - the P10 class test (appearance vtable == AppearanceAnimalVt): 1 animal, 0 not, -1 unreadable. MAIN THREAD */
+int AiWorkerBusyNow();   /* T-804: coop.cpp - the engine's own AI-worker busy test (0x25C690 on GameWorld+0x790): 1 running, 0 idle, -1 unreadable. MAIN THREAD */
 namespace {
 
 unsigned long long kDialogueSayRva = 0; static coop::AddrReg kDialogueSayRva_reg("DialogueSay", &kDialogueSayRva);   /* Steam_1.0.65 0x67F2F0 */
@@ -769,6 +773,8 @@ unsigned long long kDialogDataGetDataRva = 0; static coop::AddrReg kDialogDataGe
 unsigned long long kDlgSetConvReplyGuiRva = 0; static coop::AddrReg kDlgSetConvReplyGuiRva_reg("DialogueSetConversationReplyGUI", &kDlgSetConvReplyGuiRva);   /* P26s1 fold 1: Steam_1.0.65 0x6736E0: void Dialogue::setConversationReplyGUI() - DialogueWindow::setNPCText 0x721F00 on the ONE window (0x2132770) with +0x278; off the main thread it queues itself as op 6 (+0x80) and is replayed through the same entry (callers 0x683122 sayLine, 0x6846A0 update) */
 unsigned long long kDlgSetResponsesGuiRva = 0; static coop::AddrReg kDlgSetResponsesGuiRva_reg("DialogueSetResponesGUI", &kDlgSetResponsesGuiRva);   /* P26s1 fold 1: Steam_1.0.65 0x6735E0: void Dialogue::setResponesGUI() - DialogueWindow::setResponses 0x722EB0 on the ONE window with +0x258; op 5 off the main thread (callers 0x67FA5B listPlayerReplies, 0x684696 update) */
 unsigned long long kDialogueWindowRva = 0; static coop::AddrReg kDialogueWindowRva_reg("DialogueWindowGlobal", &kDialogueWindowRva);   /* P26s1 fold 1: Steam_1.0.65 0x2132770: DialogueWindow* - the one dialogue window (setInDialog 0x673D50 / 0x673D77 load it) */
+unsigned long long kDlgWinHideRva = 0; static coop::AddrReg kDlgWinHideRva_reg("DialogueWindowHide", &kDlgWinHideRva);   /* T-831: Steam_1.0.65 0x7213F0 / 1.0.68 0x721F20: void DialogueWindow::hide(Dialogue* dlg) - when +0xD0 == dlg: +0xF0 = 0, userPause(false), +0xD0 = 0, the root widget hidden; dlg is only compared, never read */
+unsigned long long kDlgWinPortraitRva = 0; static coop::AddrReg kDlgWinPortraitRva_reg("DialogueWindowRefreshPortrait", &kDlgWinPortraitRva);   /* T-804: Steam_1.0.65 0x7223C0 / 1.0.68 0x722EF0: void (DialogueWindow*, Character* who, char slot) - renders that slot's portrait at once (Ogre); reached through a jump stub from 0x6709A0 (slot 0) and 0x670EA0 (slot 1), both with the window global in rcx */
 
 typedef void (*SetInDialogFn)(void* dlg, bool on);
 typedef void (*ReplyClickedFn)(void* dlg, int index);
@@ -793,6 +799,7 @@ const size_t kDlgTargetHand     = 0x158;   /* P26s1 fold 1: Dialogue's conversat
 const size_t kDlgConvEvent      = 0x188;   /* P26s1 fold 1: Dialogue's current conversation event (int): the starters write it (0x683996 = 1), endDialogue clears it (0x674163) */
 const size_t kDlgEnded          = 0x148;   /* P26s1 fold 2 N2: Dialogue's 'ended' flag (char) - the engine's own busy test reads it first (0x683890:25 / 0x684B30:10); +0x188 is not cleared by every end */
 const size_t kWinDialogue       = 0xD0;    /* P26s1 fold 1: DialogueWindow's Dialogue: show writes it (0x726D4A), hide(dlg) clears it only when it is dlg (0x7213F9 / 0x72141F) */
+const size_t kWinShownChar      = 0xF0;    /* DialogueWindow's stored character: show writes the Dialogue's speaker 1 (getSpeaker(dlg, 1), 0x726CF0), the portrait refresh can set it, hide(dlg) clears it; the per-frame update 0x726FF0 calls its virtual +0x1B8 every frame while +0xD0 is set */
 const long long kTkFailLogCap = 40;       /* P26s1 fold 1 L5: 'NOT forwarded' / 'NOT shown' lines */
 const size_t kTkInboundPromptCap = 64, kTkInboundCap = 256;   /* P26s1 fold 1 L4 */
 const LONG kTkPromptMaxAge = 8;           /* P26s1 fold 1 L4: safe points a PROMPT may wait (it waits only while the world is blocked) */
@@ -1307,6 +1314,7 @@ void* TkWindowDlg()
     void* w = SayReadPtr((void*)(g_base + (uintptr_t)kDialogueWindowRva), 0);
     return (w != 0) ? SayReadPtr(w, kWinDialogue) : 0;
 }
+
 
 /* T-726: 1 = who is this game's own player-faction character - the test TkP25Intercept makes (the uid registry, the any-thread owned
    mirror, the faction's player flag). ANY THREAD: one guarded read and address compares; no C++ object. */
@@ -2310,6 +2318,129 @@ void InstallTalkStarters()
     }
 }
 
+/* T-804: THE DIALOGUE WINDOW'S PORTRAIT REFRESH, KEPT ON THE MAIN THREAD (the rule: src/common/portraitdefer.h). The engine's
+   refresh renders a portrait with Ogre at once; reached from the AI thread (sendEvent -> _chooseDialog while the conversation
+   window does not pause the game) that render runs beside the main thread's frame render and Direct3D 11 crashes. The detour
+   lets it run only on the main thread while the AI worker is idle; otherwise it keeps the latest request per slot in g_prHeld
+   (the character as its handle, not its pointer) and PortraitDrain replays it at the K2 safe point. A refresh run at once
+   empties its slot's held entry, so an older held request never paints over it. */
+typedef void (*DlgWinPortraitFn)(void* win, void* who, char slot);
+DlgWinPortraitFn orig_dlgWinPortrait = 0;
+int g_prHook = 0;                      /* 1 installed, -1 AddHook FAILED, -2 no table address */
+cooppd::HeldTable g_prHeld;            /* under g_prLock; static storage, so every entry starts unused */
+volatile LONG g_prLock = 0;            /* a short spin lock: the detour (any thread) and PortraitDrain (main thread) */
+volatile LONG64 g_prCalledNow = 0;     /* the engine's refresh run at once: main thread, AI worker idle */
+volatile LONG64 g_prHeldOff = 0;       /* held: called off the main thread */
+volatile LONG64 g_prHeldBusy = 0;      /* held: called on the main thread while the AI worker ran */
+volatile LONG64 g_prReplaced = 0;      /* a held refresh replaced by a newer one for its slot before the safe point */
+volatile LONG64 g_prNoHandle = 0;      /* a refresh to hold whose character's handle did not read: dropped where it was */
+volatile LONG64 g_prSuperseded = 0;    /* a held refresh emptied by a newer refresh for its slot run at once */
+long long g_prApplied = 0, g_prDropWindow = 0, g_prDropChar = 0, g_prDropHidden = 0, g_prFaulted = 0;   /* MAIN THREAD: the replays */
+long long g_prLogged = 0;
+const long long kPrLogCap = 10;        /* the first 10 held-and-replayed refreshes are logged; the rest only counted */
+
+void PrLock() { while (::InterlockedCompareExchange(&g_prLock, 1, 0) != 0) YieldProcessor(); }
+void PrUnlock() { ::InterlockedExchange(&g_prLock, 0); }
+
+const size_t kWinRootWidget = 0x38;    /* DialogueWindow's root widget: its visible test (1.0.65 0x721390) is that widget's getVisible */
+
+/* MAIN THREAD. The dialogue window's own visible test - what the engine's callers of the refresh (0x6709A0 slot 0, 0x670EA0
+   slot 1) ask through 0x6E1EC0 on the ForgottenGUI (its window pointer set, then this) before they refresh. 1 visible,
+   0 hidden, -1 unreadable. No C++ object. */
+int DlgWinShownPod(void* win)
+{
+    if (win == 0) return -1;
+    __try
+    {
+        MyGUI::Widget* const root = *(MyGUI::Widget* const*)((const char*)win + kWinRootWidget);
+        if (root == 0) return -1;
+        return root->getVisible() ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* ANY THREAD. Off the call-now road: guarded reads, Interlocked counters, the spin lock, no allocation, no log; the thread's
+   last error kept. */
+void detour_dlgWinPortrait(void* win, void* who, char slot)
+{
+    const int onMain = SayOnMainThread();
+    if (cooppd::CallNow(onMain, onMain ? coop::AiWorkerBusyNow() : -1))
+    {
+        ::InterlockedIncrement64(&g_prCalledNow);
+        PrLock();
+        const int superseded = cooppd::Drop(&g_prHeld, (int)(unsigned char)slot);   /* the older held request must not repaint it */
+        PrUnlock();
+        if (superseded) ::InterlockedIncrement64(&g_prSuperseded);
+        orig_dlgWinPortrait(win, who, slot);
+        return;
+    }
+    const DWORD le = ::GetLastError();
+    cooppd::Held h;
+    h.used = 1;
+    h.slot = (int)(unsigned char)slot;
+    h.why = onMain ? cooppd::kWhyWorkerBusy : cooppd::kWhyOffThread;
+    h.hadWho = (who != 0) ? 1 : 0;
+    for (int i = 0; i < 5; ++i) h.hand[i] = 0;
+    if (who != 0)
+    {
+        unsigned int w7[7];   /* the character's own hand (+0x58): vtable, then type, container, containerStamp, index, serial */
+        if (CrimeReadHandFields((::Character*)who, w7) == 0 || (w7[5] == 0 && w7[6] == 0))
+        {
+            ::InterlockedIncrement64(&g_prNoHandle);
+            PrLock(); cooppd::Drop(&g_prHeld, h.slot); PrUnlock();   /* a newer request came for this slot: an older held one must not repaint over it */
+            ::SetLastError(le);
+            return;
+        }
+        for (int i = 0; i < 5; ++i) h.hand[i] = w7[2 + i];
+    }
+    void* const shown = TkWindowDlg();
+    h.dlgAtHold = (shown == (void*)1) ? 0 : shown;
+    ::InterlockedIncrement64(onMain ? &g_prHeldBusy : &g_prHeldOff);
+    PrLock();
+    const int replaced = cooppd::Put(&g_prHeld, h);
+    PrUnlock();
+    if (replaced) ::InterlockedIncrement64(&g_prReplaced);
+    ::SetLastError(le);
+}
+
+/* MAIN THREAD (InstallSpeech). Needs the window global too: the replay passes the window as it is at the safe point. */
+void InstallPortraitHold()
+{
+    if (kDlgWinPortraitRva == 0 || kDialogueWindowRva == 0 || g_base == 0)
+    {
+        g_prHook = -2;
+        ErrorLog("[TALK] the address table has no DialogueWindowRefreshPortrait or DialogueWindowGlobal row - the dialogue window's"
+                 " portrait refresh is NOT held off the AI thread (an unpaused conversation can crash the renderer as before)");
+        return;
+    }
+    if (coop::AddHook((void*)(g_base + kDlgWinPortraitRva), (void*)&detour_dlgWinPortrait, (void**)&orig_dlgWinPortrait) != coop::SUCCESS)
+    {
+        orig_dlgWinPortrait = 0;
+        g_prHook = -1;
+        char e[200];
+        std::sprintf(e, "[TALK] AddHook DialogueWindow portrait refresh 0x%llX FAILED - the refresh is NOT held off the AI thread",
+                     kDlgWinPortraitRva);
+        ErrorLog(std::string(e));
+        return;
+    }
+    g_prHook = 1;
+    char b[300];
+    std::sprintf(b, "[TALK] hook installed: DialogueWindow portrait refresh 0x%llX (runs only on the main thread while the AI worker"
+                 " is idle; any other call is held per slot and replayed at the safe point)", kDlgWinPortraitRva);
+    DebugLog(std::string(b));
+}
+
+std::string PortraitCountsString()
+{
+    char b[400];
+    std::sprintf(b, " portrait[calledNow,heldOffThread,heldWorkerBusy,replaced,superseded,noHandle,applied,droppedWindow,droppedHidden,"
+                 "droppedChar,faulted]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld portraitHook=%s",
+                 (long long)g_prCalledNow, (long long)g_prHeldOff, (long long)g_prHeldBusy, (long long)g_prReplaced,
+                 (long long)g_prSuperseded, (long long)g_prNoHandle, g_prApplied, g_prDropWindow, g_prDropHidden, g_prDropChar,
+                 g_prFaulted, TalkHookState(g_prHook));
+    return std::string(b);
+}
+
 }   /* anonymous namespace */
 
 void InstallSpeech()
@@ -2317,6 +2448,7 @@ void InstallSpeech()
     g_base = (uintptr_t)::GetModuleHandleA(0);
     InstallTalkStarters();   /* P26 stage 0: log-only starters, independent of the say / sendEvent hooks below */
     TalkCursorInstall();     /* T-737: after InstallTalkStarters, which decides whether the P25 road is on */
+    InstallPortraitHold();   /* T-804: independent of every other hook here */
     if (kDialogueSayRva == 0)
     {
         ErrorLog("[SAY] the address table gave Dialogue::say no address - NPC speech bubbles are NOT carried between"
@@ -4383,40 +4515,53 @@ static void TkLeverStart()
 
 static int TkAnswerActPick(void* dlg, int act, int* pick, std::string* replies);   /* talkprompt answer act - defined with the TALKSIGHT scan helpers */
 
+static int WgWindow(void** win, void** dlg);   /* the one dialogue window and the Dialogue it shows - with the window guard below */
+
 static void TkLeverDrain()
 {
     if (::InterlockedExchange(&g_tkLeverPending, 0) == 0) return;
     if (g_tkLeverMode == cooptalk::kTalkLeverStart) { TkLeverStart(); return; }
-    if (!g_tkMirror.active) { TkLeverSkip("no mirrored conversation is open on this game"); return; }
-    if (!TkMirrorLive(g_tkMirror)) { TkLeverSkip("the mirrored NPC copy is gone or its Dialogue moved (TkApplyEnd's liveness check)"); return; }   /* P26s1 fold 1 M4 */
+    /* answer / answer act click the mirrored conversation while one is open; otherwise the conversation this game's own window
+       shows (this game's own player talking to an NPC here), when its owner is a live character whose Dialogue is still that
+       one. close ends only a mirrored one. */
+    void* ownWin = 0; void* ownDlg = 0;
+    const int ownShown = g_tkMirror.active ? 0 : WgWindow(&ownWin, &ownDlg);
+    const int ownLive = (ownShown == 1) ? TkLiveOwner(ownDlg, SayReadPtr(ownDlg, kDlgMe)) : 0;
+    const char* why = "";
+    const int use = cooptalk::LeverWindowPick(g_tkLeverMode, g_tkMirror.active ? 1 : 0, ownShown, ownLive, &why);
+    if (use == cooptalk::kLeverWinNone) { TkLeverSkip(why); return; }
+    if (use == cooptalk::kLeverWinMirror && !TkMirrorLive(g_tkMirror)) { TkLeverSkip("the mirrored NPC copy is gone or its Dialogue moved (TkApplyEnd's liveness check)"); return; }   /* P26s1 fold 1 M4 */
+    void* const dlg = (use == cooptalk::kLeverWinMirror) ? g_tkMirror.dlg : ownDlg;
+    const std::string which = (use == cooptalk::kLeverWinMirror) ? std::string("the mirrored window")
+                            : ("this game's own window (npc uid=" + TkU(FindSpawnedUid(SayReadPtr(dlg, kDlgMe))) + ")");
     if (g_tkLeverMode == cooptalk::kTalkLeverAnswerAct)
     {
-        /* answer act <type>: the reply whose line (or a line up to 3 below it) carries the action, read from this game's copy of
-           the mirrored line - then the same click as `answer <k>` */
+        /* answer act <type>: the reply whose line (or a line up to 3 below it) carries the action, read from the conversation's
+           current line on this game - then the same click as `answer <k>` */
         int k = -1;
         std::string replies;
-        TkAnswerActPick(g_tkMirror.dlg, g_tkLeverIndex, &k, &replies);
+        TkAnswerActPick(dlg, g_tkLeverIndex, &k, &replies);
         if (k < 0)
         {
             ++g_tkLeverSkipped;
-            DebugLog("[TALK] talkprompt answer act " + TkI(g_tkLeverIndex) + ": no reply carries it - replies [" + replies + "]");
+            DebugLog("[TALK] talkprompt answer act " + TkI(g_tkLeverIndex) + " on " + which + ": no reply carries it - replies [" + replies + "]");
             return;
         }
         if (kDialogueReplyClickedRva == 0) { TkLeverSkip("replyClicked is not in the address table"); return; }
         const ReplyClickedFn fn = (ReplyClickedFn)(g_base + (uintptr_t)kDialogueReplyClickedRva);   /* the engine's entry (hooked) */
-        const int called = TkReplyPod(fn, g_tkMirror.dlg, k);
+        const int called = TkReplyPod(fn, dlg, k);
         ++g_tkLeverRan;
-        DebugLog("[TALK] talkprompt answer act " + TkI(g_tkLeverIndex) + ": reply " + TkI(k) + " carries it - replies [" + replies
-                 + "] called=" + TkI(called) + " (through the replyClicked hook)");
+        DebugLog("[TALK] talkprompt answer act " + TkI(g_tkLeverIndex) + " on " + which + ": reply " + TkI(k) + " carries it - replies ["
+                 + replies + "] called=" + TkI(called) + " (through the replyClicked hook)");
         return;
     }
     if (g_tkLeverMode == cooptalk::kTalkLeverAnswer)
     {
         if (kDialogueReplyClickedRva == 0) { TkLeverSkip("replyClicked is not in the address table"); return; }
         const ReplyClickedFn fn = (ReplyClickedFn)(g_base + (uintptr_t)kDialogueReplyClickedRva);   /* the engine's entry (hooked) */
-        const int called = TkReplyPod(fn, g_tkMirror.dlg, g_tkLeverIndex);
+        const int called = TkReplyPod(fn, dlg, g_tkLeverIndex);
         ++g_tkLeverRan;
-        DebugLog("[TALK] talkprompt answer " + TkI(g_tkLeverIndex) + " called=" + TkI(called) + " (through the replyClicked hook)");
+        DebugLog("[TALK] talkprompt answer " + TkI(g_tkLeverIndex) + " on " + which + " called=" + TkI(called) + " (through the replyClicked hook)");
         return;
     }
     if (kTkEndDialogueRva == 0) { TkLeverSkip("endDialogue is not in the address table"); return; }
@@ -5976,6 +6121,10 @@ static ::Character* TsNearestFaction(const std::string& facKey, float x, float z
         {
             if (CrimeIsDead(ch) != 0 || !IsDownedCharacter(ch)) continue;
         }
+        else if (pick == kLeverPickDead)
+        {
+            if (CrimeIsDead(ch) == 0) continue;
+        }
         if (!SafeReadPosition(ch, &q)) continue;
         ++named;
         const float dx = q.x - o.x, dz = q.z - o.z, d = sqrtf(dx * dx + dz * dz);
@@ -5988,7 +6137,8 @@ static ::Character* TsNearestFaction(const std::string& facKey, float x, float z
         if (maxDist > 1.0e9f) std::strcpy(dt, "anywhere");
         else std::sprintf(dt, "within %.0f units", maxDist);
         std::sprintf(b, "no %s character named '%.60s' %s (%d such loaded at any distance)",
-                     pick == kLeverPickOwnLiving ? "own living non-player" : (pick == kLeverPickDowned ? "down (knocked-out)" : "loaded"),
+                     pick == kLeverPickOwnLiving ? "own living non-player" : (pick == kLeverPickDowned ? "down (knocked-out)"
+                     : (pick == kLeverPickDead ? "dead" : "loaded")),
                      nameKey.c_str(), dt, named);
         *why = b;
         return 0;
@@ -6702,8 +6852,358 @@ static std::string TalkOrderCountsString()
     return std::string(b);
 }
 
+
+/* T-804: the engine's portrait refresh through its own entry (the original past the detour). 1 ran, 0 faulted. */
+static int PortraitCallPod(DlgWinPortraitFn fn, void* win, void* who, char slot)
+{
+    __try { fn(win, who, slot); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* T-804: MAIN THREAD, AI worker paused (TalkTestDrain at the K2 safe point). Each held portrait refresh runs with the window
+   as it is now if that window still shows the conversation it was held for, is visible, and the character's handle still
+   finds it (cooppd::ReplayVerdict); otherwise it is dropped and counted. A world loading or tearing down counts as no window. */
+static void PortraitDrain()
+{
+    if (g_prHook != 1 || orig_dlgWinPortrait == 0) return;
+    cooppd::Held got[cooppd::kSlots];
+    int have[cooppd::kSlots];
+    PrLock();
+    for (int i = 0; i < cooppd::kSlots; ++i) have[i] = cooppd::Take(&g_prHeld, i, &got[i]);
+    PrUnlock();
+    for (int i = 0; i < cooppd::kSlots; ++i)
+    {
+        if (!have[i]) continue;
+        const cooppd::Held& e = got[i];
+        void* const win = EngineWritesBlocked() ? 0 : SayReadPtr((void*)(g_base + (uintptr_t)kDialogueWindowRva), 0);
+        void* const dlgNow = (win != 0) ? SayReadPtr(win, kWinDialogue) : 0;
+        void* whoNow = 0;
+        if (e.hadWho)
+        {
+            const ::hand hd(e.hand[3] /*index*/, e.hand[4] /*serial*/, (itemType)e.hand[0] /*type*/, e.hand[1] /*container*/, e.hand[2] /*containerStamp*/);
+            whoNow = P114HandChar(&hd);
+            if (whoNow != 0 && SayPlausiblePtr(whoNow) == 0) whoNow = 0;
+        }
+        const int shown = (win != 0) ? DlgWinShownPod(win) : -1;
+        const int v = cooppd::ReplayVerdict(win, shown, dlgNow, e.dlgAtHold, e.hadWho, whoNow);
+        int ran = 0;
+        if (v == cooppd::kApply)
+        {
+            ran = PortraitCallPod(orig_dlgWinPortrait, win, whoNow, (char)e.slot);
+            if (ran) ++g_prApplied; else ++g_prFaulted;
+        }
+        else if (v == cooppd::kDropWindow) ++g_prDropWindow;
+        else if (v == cooppd::kDropHidden) ++g_prDropHidden;
+        else ++g_prDropChar;
+        if (g_prLogged < kPrLogCap)
+        {
+            ++g_prLogged;
+            const char* const what = (v == cooppd::kApply) ? (ran ? "replayed" : "replay FAULTED")
+                                   : (v == cooppd::kDropWindow) ? "dropped (the window is closed or shows another conversation)"
+                                   : (v == cooppd::kDropHidden) ? "dropped (the window is not visible)"
+                                   : e.hadWho ? "dropped (the character is gone)" : "dropped (no character)";
+            char b[320];
+            std::sprintf(b, "[TALK] portrait refresh slot=%d npc uid=%u held (%s) -> %s at the safe point (logged %lldx of %lld;"
+                         " portrait[...] on the REPORT line)",
+                         e.slot, (whoNow != 0) ? FindSpawnedUid(whoNow) : 0u,
+                         (e.why == cooppd::kWhyWorkerBusy) ? "main thread, AI worker running" : "off the main thread",
+                         what, g_prLogged, kPrLogCap);
+            DebugLog(std::string(b));
+        }
+    }
+}
+
+/* T-831: THE DIALOGUE WINDOW NEVER CALLS THROUGH A REMOVED CHARACTER (the rule: src/common/dlgwinguard.h). The window's
+   per-frame update calls a virtual of its stored character (+0xF0) every frame while it shows a conversation; in a session the
+   window does not pause the game, so a character of that conversation can be removed while it shows. DlgWinGuard (each safe
+   point) ends such a conversation through the engine's endDialogue; TalkWindowBeforeRemove does the same before this mod
+   removes a character the shown conversation names. MAIN THREAD. */
+static long long g_wgEnded = 0, g_wgEndFailed = 0, g_wgOwnerGone = 0, g_wgShownCleared = 0;
+static long long g_wgGoneOwner = 0, g_wgGoneTarget = 0, g_wgGoneShown = 0, g_wgBeforeRemove = 0;
+static long long g_wgHidden = 0, g_wgHideFailed = 0, g_wgNoHideRow = 0;   /* owner gone: closed through hide / hide faulted / no hide row */
+static long long g_wgLogged = 0;
+static const long long kWgLogCap = 10;        /* the first 10 actions are logged; the rest only counted */
+static void* g_wgOwnerGoneDlg = 0;            /* the shown Dialogue last counted as owner-gone: counted once, not every frame */
+
+/* The one window and the Dialogue it shows now: 1 = both set, 0 = no window, nothing shown, no table row or the world is
+   loading or tearing down. */
+static int WgWindow(void** win, void** dlg)
+{
+    *win = 0; *dlg = 0;
+    if (kDialogueWindowRva == 0 || g_base == 0 || EngineWritesBlocked()) return 0;
+    *win = SayReadPtr((void*)(g_base + (uintptr_t)kDialogueWindowRva), 0);
+    *dlg = (*win != 0) ? SayReadPtr(*win, kWinDialogue) : 0;
+    return (*dlg != 0) ? 1 : 0;
+}
+
+/* The Dialogue's target hand words, hand +0x8..+0x18: type, container, containerStamp, index, serial. 1 = read and names
+   something, 0 = empty (index and serial 0), -1 = unreadable. No C++ object. */
+static int WgTargetHandPod(const void* dlg, unsigned int* w)
+{
+    if (dlg == 0) return -1;
+    __try
+    {
+        const unsigned int* a = (const unsigned int*)((const char*)dlg + kDlgTargetHand + 8);
+        for (int k = 0; k < 5; ++k) w[k] = a[k];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return (w[3] != 0 || w[4] != 0) ? 1 : 0;
+}
+
+/* The character the Dialogue's target hand resolves to now through the engine's handle registry (0 = gone or not a
+   character); *named as WgTargetHandPod. Only for a Dialogue whose owner is live (the Dialogue is not freed). */
+static void* WgTargetNow(void* dlg, int* named)
+{
+    unsigned int w[5];
+    *named = WgTargetHandPod(dlg, w);
+    if (*named != 1) return 0;
+    if (w[0] != 1u && w[0] != 0x5Bu) { *named = 0; return 0; }   /* a target that is not a character (hand::getCharacter resolves types 1 and 0x5B only): not checked */
+    const ::hand hd(w[3] /*index*/, w[4] /*serial*/, (itemType)w[0] /*type*/, w[1] /*container*/, w[2] /*containerStamp*/);
+    void* const c = P114HandChar(&hd);
+    return (c != 0 && SayPlausiblePtr(c) != 0) ? c : 0;
+}
+
+/* The window's stored character set to none - the same write the window's hide makes - so its update skips the call. 1 done. */
+static int WgClearShownPod(void* win)
+{
+    if (win == 0) return 0;
+    __try { *(void**)((char*)win + kWinShownChar) = 0; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* Ends the shown conversation through the engine's endDialogue: a forwarded conversation through TkEndOwn first (its END goes
+   to the other game and its mark is dropped), then, while the window still shows it, the engine's hooked entry (the mirror's
+   CLOSED and the marks are handled as for any engine end). 1 = the end ran or the window no longer shows it, 0 = not. */
+static int WgEnd(void* dlg, void* me, const char* why)
+{
+    if (g_tkConvs.find(dlg) != g_tkConvs.end()) TkEndOwn(dlg, me, cooptalk::kTalkEndEngine, why, 1);
+    if (TkWindowDlg() != dlg) return 1;
+    if (kTkEndDialogueRva == 0 || g_base == 0) return 0;
+    return TkEndEntryPod((TkEndDialogueFn)(g_base + (uintptr_t)kTkEndDialogueRva), dlg);
+}
+
+/* The window's own hide(dlg) - it compares dlg with the window's +0xD0 and never reads it, so a Dialogue freed with its owner
+   is safe to pass. 1 called, 0 no row or it faulted. No C++ object. */
+typedef void (*DlgWinHideFn)(void* win, void* dlg);
+static int WgHidePod(void* win, void* dlg)
+{
+    if (kDlgWinHideRva == 0 || g_base == 0 || win == 0) return 0;
+    const DlgWinHideFn fn = (DlgWinHideFn)(g_base + (uintptr_t)kDlgWinHideRva);
+    __try { fn(win, dlg); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static int WgHideRow() { return (kDlgWinHideRva != 0 && g_base != 0) ? 1 : 0; }
+
+static std::string WgParts(unsigned int m)
+{
+    std::string s;
+    if (m & winguard::kGoneOwner) s += "owner";
+    if (m & winguard::kGoneTarget) s += std::string(s.empty() ? "" : ",") + "target";
+    if (m & winguard::kGoneShown) s += std::string(s.empty() ? "" : ",") + "storedCharacter";
+    return s.empty() ? std::string("none") : s;
+}
+
+/* One action on the shown conversation: v = winguard::kEnd ends it, kHide closes the window through its own hide (nothing of
+   the Dialogue read), kOwnerGone calls nothing; then the window's stored character is cleared when the window still shows the conversation and that character is gone (shownLive 0). */
+static void WgAct(void* win, void* dlg, void* me, void* target, int v, unsigned int gone, int shownLive, const char* when, const char* why)
+{
+    int ended = -1;
+    if (v == winguard::kEnd)
+    {
+        ended = WgEnd(dlg, me, why); if (ended) ++g_wgEnded; else ++g_wgEndFailed;
+        /* endDialogue hides the window only while its widget is visible; a window still holding the conversation is closed
+           through its own hide, so the end is not repeated at every safe point */
+        if (TkWindowDlg() == dlg && WgHideRow() && WgHidePod(win, dlg)) ++g_wgHidden;
+    }
+    else
+    {
+        ++g_wgOwnerGone; g_wgOwnerGoneDlg = dlg;
+        if (v == winguard::kHide) { ended = WgHidePod(win, dlg); if (ended) ++g_wgHidden; else ++g_wgHideFailed; }
+        else ++g_wgNoHideRow;
+    }
+    if (gone & winguard::kGoneOwner) ++g_wgGoneOwner;
+    if (gone & winguard::kGoneTarget) ++g_wgGoneTarget;
+    if (gone & winguard::kGoneShown) ++g_wgGoneShown;
+    const int still = (TkWindowDlg() == dlg) ? 1 : 0;
+    int cleared = 0;
+    if (winguard::ClearShown(still, shownLive)) { cleared = WgClearShownPod(win); if (cleared) ++g_wgShownCleared; }
+    if (g_wgLogged >= kWgLogCap) return;
+    ++g_wgLogged;
+    const char* const what = (v == winguard::kHide) ? (ended ? "the window closed through its own hide (the Dialogue, maybe freed with its owner, is not read)"
+                                                             : "the window's hide FAULTED")
+                           : (v != winguard::kEnd) ? "nothing called (the Dialogue may have been freed with its owner; no DialogueWindowHide row)"
+                           : (ended ? "ended through the engine's endDialogue" : "endDialogue FAILED (no address row, or it faulted)");
+    char b[200];
+    std::sprintf(b, "; window still shows it=%d, stored character cleared=%d; npc uid=%u target uid=%u (logged %lldx of %lld;"
+                 " winGuard[...] on the REPORT line)", still, cleared, (v == winguard::kEnd) ? FindSpawnedUid(me) : 0u,
+                 (target != 0) ? FindSpawnedUid(target) : 0u, g_wgLogged, kWgLogCap);
+    DebugLog(std::string("[TALK] window guard (") + when + "): the shown conversation's " + WgParts(gone) + " gone - " + what + b);
+}
+
+/* MAIN THREAD, AI worker paused (TalkTestDrain at the K2 safe point), every safe point while the window shows a conversation.
+   The owner must be a live character whose Dialogue is still this one (TkLiveOwner: address compares); the target hand must
+   resolve through the engine's handle registry; the stored character is never read - only compared with the owner, the
+   resolved target and the engine's character lists (TkLiveChar). */
+static void DlgWinGuard()
+{
+    void* win = 0; void* dlg = 0;
+    if (!WgWindow(&win, &dlg)) { g_wgOwnerGoneDlg = 0; return; }
+    void* const me = SayReadPtr(dlg, kDlgMe);
+    const int ownerLive = TkLiveOwner(dlg, me);
+    int named = -1;
+    void* const target = ownerLive ? WgTargetNow(dlg, &named) : 0;
+    const int targetLive = (ownerLive && named == 1) ? (target != 0 ? 1 : 0) : -1;
+    void* const shown = SayReadPtr(win, kWinShownChar);
+    void* const ownerNow = ownerLive ? me : 0;
+    const int inLists = (shown != 0 && shown != target && shown != ownerNow) ? TkLiveChar(shown) : 0;
+    const int shownLive = winguard::ShownLive(shown, ownerNow, target, inLists);
+    const int v = winguard::Verdict(ownerLive, targetLive, shownLive, WgHideRow());
+    if (v == winguard::kKeep) { g_wgOwnerGoneDlg = 0; return; }
+    if (v == winguard::kOwnerGone && dlg == g_wgOwnerGoneDlg)   /* already counted: only a newly stored gone character is cleared */
+    {
+        if (winguard::ClearShown(1, shownLive) && WgClearShownPod(win)) ++g_wgShownCleared;
+        return;
+    }
+    WgAct(win, dlg, me, target, v, winguard::GoneMask(ownerLive, targetLive, shownLive), shownLive, "safe point",
+          "a character of the shown conversation is gone (window guard)");
+}
+
+/* Before this mod removes character c (DestroyLocalObject, the duplicate removal): a conversation the window shows whose
+   owner, target or stored character is c ends first, while c still exists. MAIN THREAD; elsewhere nothing is done. */
+void TalkWindowBeforeRemove(void* c)
+{
+    if (c == 0 || SayOnMainThread() == 0) return;
+    void* win = 0; void* dlg = 0;
+    if (!WgWindow(&win, &dlg)) return;
+    void* const me = SayReadPtr(dlg, kDlgMe);
+    void* const shown = SayReadPtr(win, kWinShownChar);
+    const int ownerHere = (me != 0 && TkDialogueOf(me) == dlg && (me == c || TkLiveChar(me))) ? 1 : 0;
+    int named = -1;
+    void* const target = ownerHere ? WgTargetNow(dlg, &named) : 0;
+    if (!winguard::EndBeforeRemove(c, me, target, shown)) return;
+    ++g_wgBeforeRemove;
+    const unsigned int gone = (me == c ? (unsigned int)winguard::kGoneOwner : 0u) | (target == c ? (unsigned int)winguard::kGoneTarget : 0u)
+                            | (shown == c ? (unsigned int)winguard::kGoneShown : 0u);
+    WgAct(win, dlg, me, target, winguard::RemoveVerdict(ownerHere, WgHideRow()), gone, (shown == c) ? 0 : -1,
+          "before this mod removes the character", "a character of the shown conversation is being removed by this mod (window guard)");
+}
+
+static std::string WinGuardCountsString()
+{
+    char b[360];
+    std::sprintf(b, " winGuard[ended,endFailed,ownerGone,hidden,hideFailed,noHideRow,storedCleared,goneOwner,goneTarget,goneStored,"
+                 "beforeRemove]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_wgEnded, g_wgEndFailed, g_wgOwnerGone, g_wgHidden, g_wgHideFailed, g_wgNoHideRow, g_wgShownCleared, g_wgGoneOwner,
+                 g_wgGoneTarget, g_wgGoneShown, g_wgBeforeRemove);
+    return std::string(b);
+}
+
+/* ANOTHER ROAD FROM THE AI THREAD TO A WINDOW (log-only, nothing changed). Dialogue::sendEvent -> startConversation 0x683500 ->
+   sayLine 0x682F10 -> _doActions 0x67FAD0 runs a line's actions on the thread that said it. Some actions build or open a window
+   there: 0x29 / 0x2A / 0x2B / 0x30 build a popup (0x729D50 -> 0x729540, which renders a portrait through 0x413330), 0x1 (trade)
+   opens the trade window (0x951620), 0xB (character editor) goes 0x7F2AD0 -> 0x6E2FA0. TalkNoteOffMainActs (hire.cpp
+   detour_doActions, off the main thread only, before the original runs) counts each such line per action type and keeps the
+   first kOffActLogCap of them for OffMainActsDrain to log at the safe point. ANY THREAD: guarded reads, Interlocked ops, no
+   lock, no allocation, no log; the thread's last error kept. The line then runs exactly as before. */
+const int kOffActKinds = 6;
+const int kOffActTypes[kOffActKinds] = { 0x1, 0xB, 0x29, 0x2A, 0x2B, 0x30 };
+const int kOffActLogCap = 8;
+const int kOffActSidCap = 64;
+struct OffActNote
+{
+    volatile LONG ready;          /* 1 once every field below is written (written last) */
+    int logged;                   /* MAIN THREAD */
+    unsigned int mask;            /* bit k = the line carries kOffActTypes[k] */
+    int hadWho;                   /* 1 = hand holds the speaking character's handle words */
+    unsigned int hand[5];         /* type, container, containerStamp, index, serial */
+    int sidLen;                   /* -1 unreadable */
+    char sid[kOffActSidCap + 1];
+};
+static volatile LONG64 g_offActLines = 0;                  /* lines run off the main thread carrying one of the types */
+static volatile LONG64 g_offActByType[kOffActKinds] = { 0 };   /* ... per type (a line counts once per type it carries) */
+static volatile LONG64 g_offActUnread = 0;                 /* lines run off the main thread whose action list did not read */
+static volatile LONG g_offActNoteN = 0;                    /* notes claimed (may pass the cap; only the first kOffActLogCap are kept) */
+static OffActNote g_offActNotes[kOffActLogCap];
+
+void TalkNoteOffMainActs(void* dlg, void* line)
+{
+    if (line == 0) return;
+    const DWORD le = ::GetLastError();
+    int types[32], values[32], items = 0;
+    const int n = TkLineActsPod(line, types, values, 32, &items);
+    if (n < 0) { ::InterlockedIncrement64(&g_offActUnread); ::SetLastError(le); return; }
+    unsigned int mask = 0;
+    for (int i = 0; i < n; ++i)
+        for (int k = 0; k < kOffActKinds; ++k)
+            if (types[i] == kOffActTypes[k]) mask |= (1u << k);
+    if (mask == 0) { ::SetLastError(le); return; }
+    ::InterlockedIncrement64(&g_offActLines);
+    for (int k = 0; k < kOffActKinds; ++k) if (mask & (1u << k)) ::InterlockedIncrement64(&g_offActByType[k]);
+    const LONG at = ::InterlockedIncrement(&g_offActNoteN) - 1;
+    if (at >= 0 && at < kOffActLogCap)
+    {
+        OffActNote& e = g_offActNotes[at];
+        e.mask = mask;
+        e.hadWho = 0;
+        void* const me = (dlg != 0) ? SayReadPtr(dlg, kDlgMe) : 0;
+        unsigned int w7[7];
+        if (me != 0 && CrimeReadHandFields((::Character*)me, w7) != 0 && (w7[5] != 0 || w7[6] != 0))
+        {
+            for (int i = 0; i < 5; ++i) e.hand[i] = w7[2 + i];
+            e.hadWho = 1;
+        }
+        e.sidLen = TkLineSidPod(line, e.sid, kOffActSidCap);
+        e.sid[(e.sidLen > 0) ? e.sidLen : 0] = 0;
+        ::InterlockedExchange(&e.ready, 1);
+    }
+    ::SetLastError(le);
+}
+
+/* MAIN THREAD, AI worker paused (TalkTestDrain): logs each kept note once, the speaking NPC found again through its handle. */
+static void OffMainActsDrain()
+{
+    for (int i = 0; i < kOffActLogCap; ++i)
+    {
+        OffActNote& e = g_offActNotes[i];
+        if (e.ready != 1 || e.logged) continue;
+        e.logged = 1;
+        std::string acts;
+        for (int k = 0; k < kOffActKinds; ++k)
+        {
+            if (!(e.mask & (1u << k))) continue;
+            char t[8];
+            std::sprintf(t, "0x%X", (unsigned)kOffActTypes[k]);
+            acts += (acts.empty() ? "" : ",") + std::string(t);
+        }
+        unsigned int uid = 0;
+        if (e.hadWho)
+        {
+            const ::hand hd(e.hand[3] /*index*/, e.hand[4] /*serial*/, (itemType)e.hand[0] /*type*/, e.hand[1] /*container*/, e.hand[2] /*containerStamp*/);
+            void* const c = P114HandChar(&hd);
+            if (c != 0 && SayPlausiblePtr(c) != 0) uid = FindSpawnedUid(c);
+        }
+        char b[200];
+        std::sprintf(b, " npc uid=%u (logged %dx of %d; offMainActs[...] on the REPORT line)", uid, i + 1, kOffActLogCap);
+        DebugLog("[TALK] off-main line acts=[" + acts + "] line=" + (e.sidLen > 0 ? std::string(e.sid) : std::string("?"))
+                 + " ran on a thread other than the main one, unchanged;" + b);
+    }
+}
+
+std::string OffMainActsCountsString()
+{
+    char b[300];
+    std::sprintf(b, " offMainActs[lines,0x1,0xB,0x29,0x2A,0x2B,0x30,unread]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 (long long)g_offActLines, (long long)g_offActByType[0], (long long)g_offActByType[1], (long long)g_offActByType[2],
+                 (long long)g_offActByType[3], (long long)g_offActByType[4], (long long)g_offActByType[5], (long long)g_offActUnread);
+    return std::string(b);
+}
+
 void TalkTestDrain()
 {
+    DlgWinGuard();     /* T-831: a shown conversation with a removed character ends before the window's next update calls through it */
+    PortraitDrain();   /* T-804: the portrait refreshes held since the last safe point, before anything below changes the window */
+    OffMainActsDrain();   /* log-only: window-opening actions run off the main thread */
     TalkOffDrain();   /* P26 stage 0 fold 1: the off-thread starts, every K2 safe point */
     CopyOwnEndDrain();   /* T-719: a copy's own conversation ends here (before an arrived PROMPT looks at its Dialogue) */
     TalkCursorDrain();   /* T-737: the talk cursor's preloads and queued ASKs (it tests teardown and a blocked world itself) */
@@ -6761,6 +7261,7 @@ void TalkTestDrain()
         const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
         if (all.size() > 20000) { TalkTestSkip("the character update list has an implausible size"); return; }
         float best = kTalkNearMax;
+        int animals = 0;   /* animals are skipped (GroundAnimalAppPod == 1), as talkprompt skips them */
         for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
         {
             ::Character* c = *it; ::Faction* f = 0; Ogre::Vector3 q;
@@ -6769,10 +7270,16 @@ void TalkTestDrain()
             if (g_talkTestNearCopy) { const unsigned int cu = FindSpawnedUid(c); if (cu == 0 || net::IsUidMine(cu)) continue; }   /* P25: a copy the other game drives */
             if (CrimeIsDead(c) != 0 || IsDownedCharacter(c)) continue;
             if (TalkDialogueOf(c) == 0 || !SafeReadPosition(c, &q)) continue;
+            if (GroundAnimalAppPod(c) == 1) { ++animals; continue; }
             const float dx = q.x - tpos.x, dz = q.z - tpos.z, d = sqrtf(dx * dx + dz * dz);
             if (d < best) { best = d; npc = c; }
         }
-        if (npc == 0) { TalkTestSkip("no living, conscious non-player character with a Dialogue within 3000 u of the target"); return; }
+        if (npc == 0)
+        {
+            char sb[160];
+            std::sprintf(sb, "no living, conscious non-player character with a Dialogue within 3000 u of the target (%d animals skipped)", animals);
+            TalkTestSkip(sb); return;
+        }
         ndist = best;
     }
     void* dlg = TalkDialogueOf(npc);
@@ -7472,7 +7979,10 @@ std::string TalkCountsString()
            + TalkByEventString(g_copyEvByEvent) + "]" + h + TalkOffCountsString() + TkCountsString() + TalkSightCounts()   /* P26 stage 0 fold 1; P26 stages 1-3; P26 stage 6 talksight */
            + " " + InteriorKeepToken()   /* P25 interior keep (replicate.cpp) */
            + CopyOwnCountsString()   /* T-719 */
-           + TalkCursorCountsString();   /* T-737 */
+           + TalkCursorCountsString()   /* T-737 */
+           + PortraitCountsString()   /* T-804 */
+           + OffMainActsCountsString()
+           + WinGuardCountsString();   /* T-831 */
 }
 
 /* T-726: a [TALK] REPORT line every 60 s in this game's own log while a world runs (not while loading or tearing down), so a bug

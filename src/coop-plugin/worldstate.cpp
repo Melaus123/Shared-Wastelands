@@ -112,6 +112,7 @@
 #include "game/GameSaveState.h"      // SavedObjectState - the record a group member is made from
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
 #include "worldgen.h"   // WorldGenDestroyHooked - the destroy detour that announces a removal is installed
+#include "speech.h"     // T-831: TalkWindowBeforeRemove - a shown conversation naming a removed body ends first
 #include <Windows.h>
 namespace coop { bool AnyPlayersFaction(::Faction* f); }   // playerfaction.cpp: any player's faction - this game's own, a stand-in, a recorded stand-in
 #include <map>          // E19: g_wsShadow, the main-thread picture of the state map
@@ -1288,6 +1289,7 @@ int WsDupDestroyPod(::Character* c)   // the engine's own (hooked) destroy; 1 ca
 {
     ::GameWorld* w = coop::GameWorldPtr();
     if (!WsPlaus(w)) return 0;
+    TalkWindowBeforeRemove(c);   // T-831: a conversation the dialogue window shows that names c ends first
     __try { w->destroy((RootObject*)c, false, coopremoval::kDuplicateNamedRemoved); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }

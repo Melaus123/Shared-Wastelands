@@ -670,6 +670,9 @@ const char* MsgTypeName(MsgType t)
     case MSG_NOT_SHOWN: return "NOT_SHOWN";   /* T-354 */
     case MSG_RESEND: return "RESEND";
     case MSG_TOWN_PRICES: return "TOWN_PRICES";   /* T-619 */
+    case MSG_KEEPER_RESTOCK: return "KEEPER_RESTOCK";   /* T-799 D4 */
+    case MSG_MELEE_DECIDED: return "MELEE_DECIDED";
+    case MSG_ITEM_HANDOVER: return "ITEM_HANDOVER";   /* T-889 step 2 */
     case MSG_SESSION_CLOSING: return "SESSION_CLOSING";   /* mmo5 */
     case MSG_SQUAD_LEAD: return "SQUAD_LEAD";   /* T-1 B1 restructure */
     /* 58 (KEEPER) retired by protocol 89 - T-1 B3 restructure */

@@ -12,8 +12,9 @@ namespace cooptreat { struct TreatMsg; }    /* heal1: src/common/treatwire.h */
 namespace coopbuild { struct BuildMsg; }    /* build1-b: src/common/buildwire.h */
 namespace coopfarm { struct FarmMsg; }      /* par16: src/common/farmwire.h */
 namespace cooplive { struct ExceptPlan; }    /* src/common/ownerroute.h */
-namespace coopsquad { struct SquadLeadMsg; }   /* T-1 B1 restructure: src/common/squadlead.h */
+namespace coopsquad { struct SquadLeadMsg; struct KeeperRestockMsg; }   /* T-1 B1 restructure: src/common/squadlead.h */
 namespace coopshot { struct ShotMsg; }   /* P104 fix: src/common/shotwire.h */
+namespace meleewire { struct MeleeMsg; }   /* src/common/meleewire.h */
 
 #include <string>
 #include <vector>
@@ -145,6 +146,7 @@ bool SendRelease(int slot, const std::vector<char>& b);
 bool SendReleaseAck(unsigned int toPeer, const std::vector<char>& b);
 bool IsRecordedOwner(unsigned int uid, unsigned int peer);
 void ForgetCopyRecord(unsigned int uid);
+bool SendKeeperRestock(const coopsquad::KeeperRestockMsg& m);   /* T-799 D4: MSG_KEEPER_RESTOCK to the keeper's formal leader's owner. False when it did not go */
 bool SendSquadLead(const coopsquad::SquadLeadMsg& m);   /* protocol 85: MSG_SQUAD_LEAD. False when it did not go - no road (the world link not ready and the session link down) or the send refused; due again at the next pass (not encodable: dropped, reads as sent; fold 1 [a1b1f1-sh1] R8) */
 /* protocol 89 (T-1 B3 restructure): MSG_KEEPER retired - the squad's money rides SendSquadLead */
 void ReleaseLocalOwner(unsigned int uid, unsigned int toPeer, unsigned int gen = 0);   // M-D: we stop being the authority for uid. M7a A1 [a1b1-sh2]: gen = the new owner's (0 = this game's + 1)
@@ -160,7 +162,7 @@ int OwnerSlotOf(unsigned int uid);
 void SessionCatchupApplyTick();   /* M7a2 fold 1 [m7a2f-ap3]: MAIN THREAD, CommandChannelTick right after coop::InQueueDrain() - the catch-up's engine writes */
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId);   // M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id)
+                 const std::string& platoonId, unsigned int loadAgeMs);   // M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
 bool SendRelSync();   // ask the peer to re-send its owned standings (after my world was rebuilt)
 bool SessionPeerRelayOk();   // M5a fold 1, MAIN THREAD: the session peer is KNOWN reachable through the notebook (a relayed standing stamped with its slot arrived on this session link and this welcomed notebook link)
 void SetRecordTownLookup(std::string (*fn)(const std::string&));   /* decision 34: the store supplies each note's home town to the encoder */
@@ -229,6 +231,7 @@ bool SendCapture(const char* p, size_t n, unsigned int victimUid);       // P11:
 bool SendCaptureDone(const char* p, size_t n, unsigned int askerPeer);   // P11: MSG_CAPTURE_DONE - an encoded capturewire.h answer (items.cpp); M7b: back to the asker
 bool SendCapturePlaced(const char* p, size_t n, unsigned int victimUid);   // P11 f3: MSG_CAPTURE_PLACED - which taken rows landed (items.cpp); M7b: to the victim's owner
 bool SendShot(const coopshot::ShotMsg& m);   // P104 fix: MSG_SHOT - our bolt struck the other game's character's copy. False when the link is down or it does not encode. MAIN THREAD (combat.cpp)
+bool SendMeleeDecided(const meleewire::MeleeMsg& m);   // MSG_MELEE_DECIDED - our player character's blow landed on the copy of an NPC another game runs, to that NPC's owner. False when no owner / road is known or it does not encode. MAIN THREAD (combat.cpp)
 /* T-327: MSG_EFFECT. The request goes to the TARGET's recorded owner (LIVE route SLOT when the notebook road is up, else the
    session link - cooffect::EffectRequestRoad); the answer goes back on the road its request came by. Both return the road
    used (cooffect::kRoadSession 1 / kRoadLive 2) or 0 = not sent (no owner record, no road, or the send failed). MAIN THREAD. */
@@ -247,6 +250,11 @@ int SendNotShownToOwner(unsigned int uid, unsigned int ownerKey);
    "forgotten" line, first 20 such lines); a world teardown or the session's owner records cleared. */
 void LostCopyNote(unsigned int uid, bool hasPos, float x, float y, float z);
 void LostCopyMove(unsigned int uid, float x, float y, float z);
+/* PROBE P143 BEGIN */
+/* A copy of another game's character this game removed (or found gone): how the code knew, its lost-book row, the keep reads at its
+   spot and the owner's last MOVE age (-1 = none). Log only; call it before LostCopyNote. MAIN THREAD. */
+void P143CopyGone(unsigned int uid, const char* how, const char* reason, int engineFlag, int dead, bool hasPos, float x, float y, float z, double lastMoveAge);
+/* PROBE P143 END */
 void LostCopyRefusedHere(unsigned int uid, bool refused);
 void LostCopyArrived(unsigned int uid);
 bool LostCopyAsked(unsigned int uid);
@@ -305,7 +313,7 @@ bool SendSwing(unsigned int uid, unsigned int targetUid);
 bool SendHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
              const char* damages24, int comboId,
              const float* parts, int partCount, float blood,
-             const ObjId& attackerId, unsigned char knock);
+             const ObjId& attackerId, unsigned char knock, unsigned char attackerPlayed = 0);   // attackerPlayed: a second trailing byte - 1 = the blow was decided and already played on the attacker's game (MELEE_DECIDED)
 
 // M4 (F126): periodic full state for an owned character. UNRELIABLE and periodic, like
 // M2a's position stream - a dropped snapshot is superseded by the next one, so reliability
@@ -369,6 +377,12 @@ bool SendParityPush(const std::vector<char>& bytes, int sx, int sy);
 // the requester's pending entry until it times out, and nothing re-sends either.
 bool SendItemRequest(const ItemRequestMsg& r);
 bool SendItemConfirm(const ItemConfirmMsg& c);
+/* T-889 step 2: the ITEM_CONFIRM body as SendItemConfirm sends it (no LND1 trailer unless landHas) - kept in a hand-over line - and its
+   decode (false = not a whole body; nothing is applied and no request is touched). */
+bool EncodeItemConfirmBody(const coop::ItemConfirmMsg& c, std::vector<char>* out);
+bool DecodeItemConfirmBody(const std::vector<char>& bytes, coop::ItemConfirmMsg* out);
+/* T-889 step 2: MSG_ITEM_HANDOVER (RELIABLE) to one player by slot - kind 1 QUERY / 2 VERDICT / 3 CLOSED (src/common/handrec.h). */
+bool SendItemHandover(int kind, unsigned int asker, unsigned int reqId, unsigned int holder, int value, int toSlot);
 // E22b-2 (P6b). The taker's "it landed" / "it did not", and the giver's "undo your half".
 bool SendItemPlaced(unsigned int id, int ok);
 bool SendItemRevoke(unsigned int id);

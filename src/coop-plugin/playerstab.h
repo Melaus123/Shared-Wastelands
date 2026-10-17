@@ -33,9 +33,10 @@ std::string PlayersTabCommand(const std::string& args);
 // "" when this game has not seen that player's faction). false = nothing could be read.
 bool PlayersTabPlayerWords(int slot, std::string* name, std::string* faction);
 
-// MAIN THREAD (team.cpp, when a removal made while this player was away has been written back with the world loaded): the
-// FACTION box "You were removed from <team> while you were away. ..." is owed - shown once, when no other box is up.
-void PlayersTabRemovedWhileAway(const std::string& teamName);
+// MAIN THREAD (team.cpp, when a removal or a disband made while this player was away has been written back with the world
+// loaded): the FACTION box `box` (teamscreens.h kBoxAway "You were removed from <team> while you were away. ..." or kBoxAwayDisband
+// "<team> was disbanded while you were away. ...") is owed - shown once, when no other box is up.
+void PlayersTabOwedWhileAway(int box, const std::string& teamName);
 
 // The `report` verb's [PLAYERS] line and the ui[] readout's counters.
 void ReportPlayersTab();

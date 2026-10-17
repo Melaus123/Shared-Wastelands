@@ -263,7 +263,21 @@ enum MsgType
     // Every other game answers Town::getLocalTradePriceMult from the source's tables,
     // so every game quotes one price at one counter. RELIABLE.
     //   'TPR1' | u32 the source's world generation | u8 len + town stringID | u16 n | n x {u8 len + item stringID, f32}   (src/common/townprices.h)
-    MSG_TOWN_PRICES   = 75
+    MSG_TOWN_PRICES   = 75,
+    // T-799 D4 (session protocol 159): KEEPER_RESTOCK (the game holding a shop's area -> the owner of the keeper squad's formal
+    // leader): the money the engine's restock set on the holder, written into the runner's pot at its safe point (handoff.cpp).
+    // RELIABLE.  u32 leader | i32 money   (src/common/squadlead.h)
+    MSG_KEEPER_RESTOCK = 76,
+    // MELEE_DECIDED (the attacker's game -> the victim's owner): a player character's melee blow on the copy of an NPC the
+    // receiving game runs, decided on the attacker's game (the engine's hit landed there). The receiver applies the wound through
+    // MedicalSystem::addWound at its safe point and ignores its own result for the swing of the attacker's copy.
+    // RELIABLE.  victim u32 | attacker u32 | cutDir i32 | comboId i32 | Damages 6 x f32 | techFlag u8   (src/common/meleewire.h)
+    MSG_MELEE_DECIDED = 77,
+    // ITEM_HANDOVER (T-889 step 2, game-to-game protocol 164): one item hand-over's record line (pp.handover) - the holder's QUERY, the
+    // receiver's VERDICT (1 holds, 0 not placed, 2 unknown), the holder's CLOSED (1 closed, 2 returned); also the receiver's QUERY.
+    // 78 is left to effort/t811's world-server SHOW, 73-77 to effort/t810's MONEY (the world-server message numbers).
+    // RELIABLE.  u8 kind | u32 askerSlot | u32 reqId | u32 holderSlot | u8 value   (src/common/handrec.h)
+    MSG_ITEM_HANDOVER = 79
 };
 
 enum Channel

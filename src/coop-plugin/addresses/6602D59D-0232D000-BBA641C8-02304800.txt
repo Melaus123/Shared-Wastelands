@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 509
+!count 524
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -34,6 +34,7 @@ AI_treatsAsEnemy                                     code 00599E30 00599E30 4889
 AI_periodicTick                              code 005112B0 005112B0 48895C240848896C2410488974241848
 AI_frameTick4                                code 005965B0 005965B0 40534883EC4048837910000F29742430
 AI_beingShotAt                           code 00999D50 00999D50 48896C2418564883EC30488BEA488BF1
+AI_underMeleeAttack                      code 00999F00 00999F00 48896C2418564883EC30488BEA488BF1
 AI_treatScore                            code 00998200 00998200 48896C2410488974241848897C242041
 AITaskSytem_describeCurrentGoal               code 0050F3C0 0050F3C0 40574881ECE000000048C7442428FEFF
 AiThreadBusy                                   code 0025C6D0 0025C6D0 4883EC284C8BC14885C9746F80794500
@@ -78,6 +79,7 @@ BuildingInteriorKeep                           code 00562540 00562540 48895C2420
 BuildingInterior_toggleLoaded                    code 005621E0 005621E0 40574883EC20488BF984D2754233D248
 BuildingSquadState                             code 0057F1F0 0057F1F0 4885C90F84BC020000488BC455574154
 BuyItem                                        code 0074A630 0074A630 40555657415441554881EC0001000048
+CageUseStart                                   code 00358040 00358040 48895C2418554883EC40488BEA488BD9
 ChangeSlaveOwner                               code 0032E430 0032E430 40554883EC30488B8128030000488BE9
 Character_getBrain                                code 002686D0 002686D0 488B8150060000C3CCCCCCCCCCCCCCCC
 Character_getCombat                       code 005C92B0 005C92B0 488B8148060000488B4008C3CCCCCCCC
@@ -160,7 +162,9 @@ DialogueStartConversation                      code 00683F90 00683F90 4056574154
 DialogueStartPlayerConversation                code 00684320 00684320 488BC457415441554883EC7048C74424
 DialogueUpdateSayRet                           ret  006851BE 006851B9 E884E19BFF
 DialogueWindowGlobal                           var  021337D0 021337D0 -
+DialogueWindowHide                             code 00721F20 00721F20 40534883EC20488BD9483991D0000000
 DialogueWindowHidePauseRet                     ret  00721F4B 00721F46 E802CF8FFF
+DialogueWindowRefreshPortrait                  code 00722EF0 00722EF0 488BC4574881ECB000000048C7442428
 DialogueWindowShowPauseRet                     ret  0072787A 00727875 E8D3758FFF
 DismantleRefund                                code 0029DC10 0029DC10 488BC4554154415541564157488DA808
 DistributeArtifacts                            code 00931A90 00931A90 40554154415541564157488DAC2410EB
@@ -521,3 +525,14 @@ PlatoonLoadInstance                            code 0036F6B0 0036F6B0 4055565741
 UniqueMayMake                                  code 005921B0 005921B0 4889542410534883EC20488BD9488BC2
 DialoguePlayerCanTalk                          code 0067AA50 0067AA50 40574883EC304883B9C800000000488B
 DialogueChooseDialog                           code 0067A0C0 0067A0C0 44884C24204C89442418488954241048
+BuildingConfirmDismantle                       code 0054FEA0 0054FEA0 83FA020F8573010000574883EC4048C7
+BuildingBuyMeCallback                          code 007AD6C0 007AD6C0 83FA020F858A070000488BC455415441
+TownDestroy                                    code 0092B3C0 0092B3C0 488BC4565741544881ECA000000048C7
+TownMapIcon                                    code 0048D970 0048D970 48895C24104889742418574883EC2048
+TownMapLayer                                   code 0048BCB0 0048BCB0 48895C24084889742410574883EC2048
+MapMarkerColour                                code 0048F320 0048F320 40534883EC20488BD94885C9750D488D
+MapMarkerColourSlots                           var  0212F538 0212F538 -
+BuildingTakeWorkSpot                           code 000F8030 000F8030 48895C2418574883EC30488B01488BFA
+WorkerSetErase                                 code 0028D440 0028D440 48895C241048896C2418488974242057
+SoundPostEvent                                 code 00A86F90 00A86F90 48895C240848896C241048897C241841
+SoundSetSwitch                                 code 00A82EE0 00A82EE0 48895C24084889742410574883EC2049

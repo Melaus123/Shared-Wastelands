@@ -293,7 +293,61 @@ inline int ContextDropStep(int stillContext, int sleptMine, int readable, int aw
     if (awake != 0) return knownMembers > 0 ? kCtxDropKeepLive : kCtxDropRetire;
     return asleepListed != 0 ? kCtxDropDestroy : kCtxDropRetry;
 }
+/* After a context platoon that slept holding none of this game's people has been destroyed (CtxDropTick): is its squad re-created asleep
+   from the store's record? The removal assumes the game that runs the squad's people sends them again by SPAWN. That fails when that
+   game restarted: its new life answered the roster CHECK with NOT-LIVE and this game withdrew its copies (net/session.cpp), so nobody
+   refills the platoon, and with no player-gone the peer-gone re-creation (spawn.cpp RetirePeerContextPlatoons) never runs. isDup: a
+   refused duplicate wake (not a context platoon) - never; notedAgeMs: ms since that NOT-LIVE withdrawal was noted for this squad, -1 =
+   none; haveRecord: the store holds the squad's record (not an area record); recordOwner: the record's writer slot; notedSlot: the slot
+   that answered NOT-LIVE. 1 = re-create, 0 = not. A note older than kCtxRecreateNoteMs is stale. */
+const int kCtxRecreateNoteMs = 120000;
+inline int ContextRecreateAfterRunnerRestart(int isDup, int notedAgeMs, int haveRecord, int recordOwner, int notedSlot)
+{
+    if (isDup != 0 || notedAgeMs < 0 || notedAgeMs > kCtxRecreateNoteMs || haveRecord == 0) return 0;
+    return (notedSlot >= 0 && recordOwner == notedSlot) ? 1 : 0;
+}
+/* A save copy of a world squad waking while this game already runs an awake copy of it. worldFaction: 1 = the squad's faction is a world
+   faction (not a player's, a peer's or a stand-in record's); zoneId: 1 = the id is an area record's; twinMine: the people this game owns
+   in ANOTHER platoon of that faction awake here under the same world id (its notebook binding or its engine id) - 0 none, -1 unreadable.
+   1 = refuse the wake (the engine would build the squad's people a second time beside the live ones); 0 = the wake goes on. */
+inline int WakeDupRefuse(int worldFaction, int zoneId, int twinMine)
+{
+    return (worldFaction == 1 && zoneId == 0 && twinMine > 0) ? 1 : 0;
+}
 
+/* WHO WRITES A SQUAD'S HEARTBEAT RECORD IS RE-JUDGED FROM WHO RUNS ITS PEOPLE, at every registry visit (store.cpp HbRegister,
+   asked every second for each awake world squad). A squad bound from another game's announcement (a context platoon) whose people this
+   game came to run was filed as another game's and never written here: the area-holder test that alone could lift it does not cover a
+   context platoon, so after the other game crashed nothing could rebuild those people.
+   HbRunnerOf: the slot that runs a strict majority of the members that decide who runs a squad (store.cpp MembersRunner, one count for
+   every asker: the members with a session uid - the living ones, or when none is alive the dead ones; a member with no session uid is in
+   no count, since no game runs it). living = how many decide; counts[s] = those run by slot s (one whose runner is unknown is in living
+   but under no slot). -1 = none decides, or no slot runs more than half of them. */
+inline int HbRunnerOf(int living, const int* counts, int nSlots)
+{
+    if (living <= 0 || counts == 0) return -1;
+    for (int s = 0; s < nSlots && s < 64; ++s) if (counts[s] > 0 && counts[s] * 2 > living) return s;
+    return -1;
+}
+/* HbForeignAfter: the registry entry's foreign mark after a visit (1 = another game writes the squad: never published here).
+     first       1 = the entry is filed now (curForeign ignored); 0 = a later visit of an existing entry.
+     mySlot      this game's slot (-1 unknown).
+     runner      HbRunnerOf.
+     blockOther  the squad's origin (squadorigin.h) is another game's slot.
+     holderRuns  this game holds the area at a member's position and runs some of the people (store.cpp HbHolderRuns; never 1 for a
+                 context platoon) - the tie-break, read only when the runner is unknown.
+   This game runs a strict majority -> 0, context platoon or not; another game does -> 1. Runner unknown or split: holderRuns 1 -> 0;
+   else at filing the origin decides (blockOther), and at a later visit the mark is unchanged. No slot of this game's own: not foreign
+   at filing, unchanged later. */
+inline int HbForeignAfter(int first, int curForeign, int mySlot, int runner, int blockOther, int holderRuns)
+{
+    const int cur = (first == 0 && curForeign != 0) ? 1 : 0;
+    if (mySlot < 0) return cur;
+    if (runner >= 0) return runner == mySlot ? 0 : 1;
+    if (holderRuns == 1) return 0;
+    if (first != 0) return blockOther != 0 ? 1 : 0;
+    return cur;
+}
 /* WHO WRITES A WORLD NPC SQUAD'S RECORD: whoever runs the squad's area keeps its record current, and the world's version wins. The sleep
    write, the heartbeat's publish and the wipe-out delete ask this first (store.cpp NpcWriterAsk), then NpcCopyFresh.
      npcSquad     - a world faction's squad: not a player's, a peer's or a stand-in record's faction, not a context platoon (another game's
@@ -353,9 +407,21 @@ inline int NpcRecordOtherNewer(int mySlot, int haveRecord, int owner, long long 
     if (mySlot < 0 || haveRecord == 0 || owner < 0 || owner == mySlot) return 0;
     return (haveStamp == 0 || recordAt > stamp) ? 1 : 0;
 }
+/* HbStampRunner: 1 = this game's copy is stamped current at the newest record's writtenAt (store.cpp HbLiftStamp). At any heartbeat
+   registry visit or filing where this game is the squad's writer by the runner rule (nowForeign 0, runner == mySlot, HbRunnerOf), this
+   game runs the people live, so its copy is the world's version; a newer record from the old writer - written before the hand-over, or
+   arriving after it - would make NpcCopyFresh refuse this copy's heartbeat, sleep write and wipe-out mark, and nobody would write the
+   squad. Only a copy NpcCopyFresh refuses is stamped. Never stamped: a copy whose stamp was forgotten (stampErased 1 - the orphan purge
+   took people out of it, so its next wake must load the world's record; stamping it would write a record missing those people), and a
+   lift by the area holder's tie-break (runner unknown), which is not the runner rule. */
+inline int HbStampRunner(int nowForeign, int runner, int mySlot, int stampErased, int haveRecord, int owner, long long recordAt, int haveStamp, long long stamp)
+{
+    if (mySlot < 0 || runner != mySlot || nowForeign != 0 || stampErased != 0) return 0;
+    return NpcCopyFresh(mySlot, haveRecord, owner, recordAt, haveStamp, stamp) == 0 ? 1 : 0;
+}
 /* "Another game's file" (store.cpp T300OtherHeld - the wake refusal, the RECV refusal, the orphan purge's and the arrival sweep's drops
    that throw this game's copy away): a record another game wrote (owner a real slot, not mine) of a squad NOT numbered in my block
-   (blockOwner: the slot whose block numbered it, -1 unknown). A squad numbered in my block is my own squad whoever wrote its latest
+   (blockOwner: the squad's origin slot - squadorigin.h: its number's block, or for a squad the save made the game that runs it now; -1 unknown). A squad numbered in my block is my own squad whoever wrote its latest
    record - the holder of its area writes it - and my copy is kept: the orphan sweep takes the holder's people out of it, and it loads the
    world's record at its first wake after that game lets go. No slot of my own: 0. 1 = another game's file. */
 inline int OtherGameFile(int mySlot, int owner, int blockOwner)
@@ -363,7 +429,7 @@ inline int OtherGameFile(int mySlot, int owner, int blockOwner)
     if (mySlot < 0 || owner < 0 || owner == mySlot) return 0;
     return blockOwner == mySlot ? 0 : 1;
 }
-/* A full record another game wrote (owner a real slot, not mine) of a squad numbered in MY block (blockOwner == mySlot), asleep here at a
+/* A full record another game wrote (owner a real slot, not mine) of a squad numbered in MY block (blockOwner == mySlot; blockOwner is the squad's origin slot, squadorigin.h), asleep here at a
    position loaded here, with another player present, in an area another game holds (heldByOther 1), of a world faction's squad
    (worldFaction 1): the squad is left asleep where it is - not moved into that area and woken (the orphan purge would empty the woken
    copy), not thrown away (OtherGameFile keeps it: it is my own squad). The record is kept; the squad's wake loads it once that game lets

@@ -232,6 +232,26 @@ bool StatsApplyOwn(void* character, const unsigned int* raw44, int* rcOut)
     return rc == 1 || rc == 2;
 }
 
+int StatsRecalcCopy(unsigned int uid, void* character)
+{
+    if (character == 0) return 0;
+    if (net::IsUidMine(uid)) { InterlockedIncrement64(&g_statsMineRefused); return 0; }   // never for a character this game drives
+    if (EngineWritesBlocked()) { InterlockedIncrement64(&g_statsBlocked); return 0; }
+    if (kCharStatsVftRva == 0 || kMedicalVftRva == 0) return 0;
+    char* s = StatsObjPod(character);
+    if (!PlausibleHeap(s)) { InterlockedIncrement64(&g_statsFault); return 0; }
+    int animal = 0, bloodKept = 0;
+    float bloodBefore = 0.0f, bloodAfterPush = 0.0f;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const int rc = StatsRecalcPod(s, base + (uintptr_t)kCharStatsVftRva,
+                                  kCharStatsAnimalVftRva != 0 ? base + (uintptr_t)kCharStatsAnimalVftRva : 0,
+                                  base + (uintptr_t)kMedicalVftRva, &animal, 1, &bloodBefore, &bloodAfterPush, &bloodKept);
+    if (rc == -1) InterlockedIncrement64(&g_statsFault);
+    if (rc == -2) InterlockedIncrement64(&g_statsMedFault);
+    if (bloodKept != 0) InterlockedIncrement64(&g_statsBloodKept);
+    return rc;
+}
+
 bool ApplyRemoteStats(unsigned int uid, const unsigned int* raw44, const char* why)
 {
     if (raw44 == 0) return false;

@@ -47,6 +47,8 @@
 #include "../../common/namewire.h"   /* names1: the MSG_NAME payload */
 #include "../../common/slavewire.h"  /* slave1: the MSG_SLAVE payload */
 #include "../../common/shotwire.h"   /* P104 fix: the MSG_SHOT payload */
+#include "../../common/meleewire.h"   /* the MSG_MELEE_DECIDED payload */
+#include "../../common/handrec.h"   /* T-889 step 2: MSG_ITEM_HANDOVER and the game-to-game protocol number */
 #include "../../common/effectwire.h"   /* T-327: the MSG_EFFECT payload and its road */
 #include "../effect.h"                 /* T-327: EffectOnNet */
 #include "../hire.h"   /* recruit1: MSG_HIRE - HireNoteRecv / HireForgetPeer */
@@ -71,6 +73,7 @@
 #include "../appearance_record.h"
 #include "../clothing.h"
 #include "../items.h"      /* E22a / decision 38: ItemMoveMsg + ApplyItemMove */
+#include "../../common/itemtail.h"   /* which optional block comes next in an ITEM_REQUEST / ITEM_CONFIRM tail */
 #include "../worldsync.h"   // F302: LocalViewDistance, the outbound half of the HELLO field
 #include "../config.h"      /* E38 / decision 42: the host forwards the CONFIG'S notebook address, never its own g_linkAddr */
 #include "../../common/worlddir.h"   /* mp4: DisplayNameOk - the name in a HELLO passes the rule playername= does */
@@ -171,7 +174,9 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 157;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 165;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+typedef char T889ProtocolAgrees[(kProtocolVersion == hovrec::kGameProtocol) ? 1 : -1];   /* T-889 step 2 (164: MSG_ITEM_HANDOVER; effort/t853 takes 163; 165 T-609: the farm worker-spot kinds inside MSG_BUILD renumbered 12-14 -> 13-15,
+                                                                                                  12 being DISMANTLE_ASK's): the offline protocol test reads handrec.h */
 
 // A body has 7 parts in this build (T032/T033/T034, every character, both instances). The
 // cap is a bound on a network-supplied count, not a belief about anatomy - a peer claiming
@@ -680,9 +685,14 @@ void OnContext(const Message& m)
     std::string squadSid(&m.payload[off + 4], sl); off += 4 + sl;
     if (!GetU32(m.payload, off, &tl) || m.payload.size() < off + 4 + tl) { ErrorLog("[net] malformed CONTEXT (town sid) - ignored"); return; }
     std::string townSid(&m.payload[off + 4], tl); off += 4 + tl;
-    std::string platoonId; unsigned int pl = 0;
-    if (GetU32(m.payload, off, &pl) && m.payload.size() >= off + 4 + pl) platoonId.assign(&m.payload[off + 4], pl);   // P1 (older senders: empty)
-    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId);
+    std::string platoonId; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu;
+    if (GetU32(m.payload, off, &pl) && m.payload.size() >= off + 4 + pl)
+    {
+        platoonId.assign(&m.payload[off + 4], pl); off += 4 + pl;   // P1 (older senders: empty)
+        { unsigned int age = 0; if (GetU32(m.payload, off, &age)) peerLoadAgeMs = age; }   /* the age of the sender's current world load in ms (0xFFFFFFFF unknown, also when absent) */
+    }
+    const int senderSlot = PeerSlotOfKey(m.peer);   /* the seat of the game this CONTEXT came from (the link it arrived on), -1 unknown */
+    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot);
 }
 
 void OnIntent(const Message& m)
@@ -965,14 +975,19 @@ void OnHit(const Message& m)
     unsigned char knock = 0;
     if (m.payload.size() >= bloodAt + 24 + 1)
         knock = (unsigned char)m.payload[bloodAt + 24];
+    // A second trailing byte after the knock byte: 1 = the blow was decided and already played on the attacker's game
+    // (MELEE_DECIDED). A missing byte reads as 0; older receivers check only a minimum size and ignore it.
+    unsigned char attackerPlayed = 0;
+    if (m.payload.size() >= bloodAt + 24 + 2)
+        attackerPlayed = (unsigned char)m.payload[bloodAt + 25];
 
     DebugLog("[net] <- HIT uid=" + N(uid) + " attacker=" + N(attackerUid) + " dir=" + N(cutDir)
              + " healthParts=" + N(partCount)
              + (coop::ObjIdValid(attackerId) ? " attackerId=" + coop::ObjIdString(attackerId)
                                              : std::string(" attackerId=none"))
-             + " knock=" + N(knock != 0 ? 1 : 0));
+             + " knock=" + N(knock != 0 ? 1 : 0) + " attackerPlayed=" + N(attackerPlayed != 0 ? 1 : 0));
     coop::ApplyRemoteHit(uid, attackerUid, cutDir, &m.payload[16], comboId,
-                         parts, (int)partCount, blood, attackerId, knock != 0);
+                         parts, (int)partCount, blood, attackerId, knock != 0, attackerPlayed != 0);
 }
 
 /* M7a A1 build 1 [a1b1-sp2] - a withdrawal (UNLOAD / DESPAWN) as received: a receipt is owed whenever this game's slot is listed,
@@ -1410,7 +1425,7 @@ static bool CharSend(MsgType type, unsigned int uid, const char* b, size_t n, Ch
 bool SendHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
              const char* damages24, int comboId,
              const float* parts, int partCount, float blood,
-             const ObjId& attackerId, unsigned char knock)
+             const ObjId& attackerId, unsigned char knock, unsigned char attackerPlayed)
 {
     /* M7b slice 1: no session-link gate here - the character stream's road (CharRoadNow) decides, below */
     // uid(u32) | attackerUid(u32) | cutDir(i32) | comboId(i32) | Damages(24)
@@ -1454,6 +1469,8 @@ bool SendHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
     // K2 (decision 61 follow-up): one trailing byte, at bloodAt + 24: 1 = this hit knocked the victim
     // down here. Older receivers ignore it (they check only a minimum size).
     b.push_back((char)(knock != 0 ? 1 : 0));
+    // A second trailing byte, at bloodAt + 25: 1 = the blow was decided and already played on the attacker's game.
+    b.push_back((char)(attackerPlayed != 0 ? 1 : 0));
 
     /* M7b slice 1: a HIT is the VICTIM'S OWNER's report (this game runs the victim - OnHit's RemoteMayWrite) to every game that
        holds a copy, so it rides the character stream's road like the SWING that caused it: the session link while the session
@@ -2195,6 +2212,12 @@ static void RosterApplyAnswer(int from, double checkAt, const cooplo::AnswerRow&
     {
         if (coop::EngineWritesBlocked()) return;   /* the next CHECK asks again */
         if (recorded) coop::SquadIdxOwnerWithdrew(a.uid, 1);   /* M7a A1 build 2 [a1b2-sp3] [review F9]: the recorded owner runs it nowhere - out of the squad index */
+        /* the recorded owner answered NOT-LIVE at generation 0: it neither runs this person nor holds any record of it in its present life
+           (a game keeps a person's generation, 1 or more, for as long as it runs it, put away included - RosterAnswerFor answers the higher
+           of that and its copy record's), so it restarted and the context platoon the copy stands in will not be refilled by SPAWN. Its
+           squad is noted, read before the withdrawal moves the copy, so the store's context removal re-creates it from its record. A NOT-LIVE
+           above generation 0 (a body that game put away) or a MOVED answer is not noted */
+        if (recorded && a.status == cooplo::kAnsNotLive && a.gen == 0) { const std::string wid = coop::ContextWorldIdOfCopy(a.uid); if (!wid.empty()) coop::StoreNoteRunnerWithdrew(wid, from); }
         coop::ApplyRemoteUnload(a.uid); g_owner.erase(a.uid); g_copyGen.erase(a.uid); g_roLastStreamAt.erase(a.uid); /* [F9] */ g_roConflictCount.erase(a.uid); ++g_roWithdrawn;
         if (cooplive::LiveLogThis(g_roWithdrawn) || g_roWithdrawn <= 50)
             DebugLog("[net] ROSTER: copy uid=" + N(a.uid) + " WITHDRAWN - slot " + N((long long)from) + (recorded ? " (its recorded owner)" : "") + " answered NOT-LIVE at gen " + N((long long)a.gen)
@@ -2560,7 +2583,7 @@ void OnUnload(const Message& m)
     }
     if (cooplo::UnloadClearsGiven(w.why) == 1) coop::SquadIdxOwnerWithdrew(uid, 1);   /* its recorded owner runs it nowhere (put away asleep, reloaded, retired) - out of the squad index */
     else coop::SquadIdxOwnerStillRuns(uid);   /* the owner's announce pass (this game's player left the area; the owner still runs the person): `given` stays, so this game never re-wakes the squad from its own world data */
-    coop::ApplyRemoteUnload(uid);
+    coop::ApplyRemoteUnload(uid, cooplo::UnloadClearsGiven(w.why));   /* a save-born non-player twin: its runner still runs it (0) or nobody does (1) */
     LostCopyForget(uid, "the owner withdrew it (UNLOAD)");   /* nothing to ask for */
 }
 /* M7a A1 build 2 [a1b2-sp8]: RELEASE (68) / RELEASE_ACK (69), from either road - exact lengths (cooplo::ReleaseDecode / ReleaseAckDecode);
@@ -2655,6 +2678,27 @@ void OnSquadLead(const Message& m)
     if (r != coopsquad::kSquadLeadDecodeOk) { ErrorLog("[net] malformed SQUAD_LEAD (reason " + N((long long)r) + ") - ignored"); return; }
     coop::ApplyRemoteSquadLead(sl, OwnerKeyOf(m.peer));   /* M7a A1 build 1 [a1b1-sp35]: the book is keyed by the announcing game's PLAYER key (fold 1 [a1b1f1-sp5] [F2]) */
 }
+/* T-799 D4 - MSG_KEEPER_RESTOCK: the area holder's restock of a keeper another game runs, to the formal leader's owner. Reliable. */
+static bool ItemSendTo(MsgType type, int toSlot, const char* p, size_t n, unsigned int uid, unsigned int* sentKey, int* whyOut = 0);
+static int ItemToAsker(bool have, unsigned int key);
+bool SendKeeperRestock(const coopsquad::KeeperRestockMsg& km)
+{
+    std::vector<char> b;
+    if (!coopsquad::EncodeKeeperRestock(&b, km)) return true;   /* not encodable: dropped, never retried */
+    /* by the item road, the road the shop's trade answers take to that game, so the restock and those answers arrive in the order
+       they were sent (the runner applies the restock as a change on arrival) */
+    if (km.leader == 0 || g_localOwned.find(km.leader) != g_localOwned.end()) return false;
+    std::map<unsigned int, unsigned int>::const_iterator own = g_owner.find(km.leader);
+    const bool have = own != g_owner.end();
+    return ItemSendTo(MSG_KEEPER_RESTOCK, ItemToAsker(have, have ? own->second : 0u), &b[0], b.size(), km.leader, 0);
+}
+/* Refused whole when it does not decode; handoff.cpp writes it at its safe point, only for a leader this game runs. */
+void OnKeeperRestock(const Message& m)
+{
+    coopsquad::KeeperRestockMsg km;
+    if (m.payload.empty() || !coopsquad::DecodeKeeperRestock(&m.payload[0], m.payload.size(), &km)) { ErrorLog("[net] malformed KEEPER_RESTOCK - ignored"); return; }
+    coop::KeeperRestockArrive(km);
+}
 
 
 bool SendSwing(unsigned int uid, unsigned int targetUid)
@@ -2668,9 +2712,10 @@ bool SendSwing(unsigned int uid, unsigned int targetUid)
 }
 
 // M-B / P064 / H027 - CONTEXT: uid(u32) | squadType(i32) | memberType(i32) | buildingHand(32 B) | charHand(32 B) | bx,by,bz(3f) | squadSidLen(u32) squadSid | townSidLen(u32) townSid
+//   | platoonIdLen(u32) platoonId | loadAgeMs(u32: ms since the sender's current world load finished, 0xFFFFFFFF unknown; squadorigin.h OwnIdLiftedByLoadAge)
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId)
+                 const std::string& platoonId, unsigned int loadAgeMs)
 {
     if (!CharRoadOpen()) return false;   /* M7a: the notebook road, or the session link while it is down */
     std::vector<char> b;
@@ -2682,6 +2727,7 @@ bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, c
     PutU32(&b, (unsigned int)squadSid.size()); b.insert(b.end(), squadSid.begin(), squadSid.end());
     PutU32(&b, (unsigned int)townSid.size());  b.insert(b.end(), townSid.begin(), townSid.end());
     PutU32(&b, (unsigned int)platoonId.size()); b.insert(b.end(), platoonId.begin(), platoonId.end());   // P1: the sender's platoon id = the squad's world id
+    PutU32(&b, loadAgeMs);   /* the age of this game's current world load; a receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
     return CharSend(MSG_CONTEXT, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* M7a */
 }
 
@@ -2869,7 +2915,7 @@ static void ParityFitLive(MsgType type, std::vector<char>* v)
     v->swap(s);
     coop::ItemGearNoteSent(0, fields);
 }
-static bool ItemSendTo(MsgType type, int toSlot, const char* p, size_t n, unsigned int uid, unsigned int* sentKey, int* whyOut = 0)
+static bool ItemSendTo(MsgType type, int toSlot, const char* p, size_t n, unsigned int uid, unsigned int* sentKey, int* whyOut)
 {
     if (whyOut != 0) *whyOut = cooplive::kAddrWhyOk;   /* fold 2 (D4): why it was not sent (kAddrWhyOk = the send itself failed) */
     if (p == 0 || n == 0) return false;
@@ -3358,10 +3404,10 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
     return sent;
 }
 
-bool SendItemConfirm(const coop::ItemConfirmMsg& c)
+/* T-889 step 2: THE ITEM_CONFIRM BODY, built once - SendItemConfirm sends it, a hand-over line keeps it (EncodeItemConfirmBody).
+   note: the gear block is counted as sent. *ownSentOut: an owner block went in. */
+static bool ItemConfirmBody(const coop::ItemConfirmMsg& c, std::vector<char>& b, bool* ownSentOut, bool note)
 {
-    if (CharRoadNow() == cooplive::kCharRoadNone) return false;   /* M7b slice 2: the item road */
-    std::vector<char> b;
     PutU32(&b, c.id);
     b.push_back((char)(unsigned char)(c.ok != 0 ? (c.landHas != 0 ? coophold::kConfirmOkLand : 1) : 0));   /* P105 build 2: 2 = ok with an 'LND1' trailer */
     PutU32(&b, (unsigned int)c.quantity);
@@ -3389,9 +3435,25 @@ bool SendItemConfirm(const coop::ItemConfirmMsg& c)
     }
     /* the GEM1 block after the owner block: a TAKE answer's uniform and crafter (ok 1), only when there is one */
     if (c.ok != 0 && !gearwire::GearEmpty(c.gear))
-    { unsigned int gd = 0; const int gs = gearwire::EncodeGear(&b, c.gear, &gd); coop::ItemGearNoteSent(gs, gd); }
+    { unsigned int gd = 0; const int gs = gearwire::EncodeGear(&b, c.gear, &gd); if (note) coop::ItemGearNoteSent(gs, gd); }
     /* P105 build 2 (protocol 126): a LAND's answer ends with where the writer put the item - the 'LND1' trailer, LAST of all */
     if (c.ok != 0 && c.landHas != 0) { coophold::LandTail lt; lt.where = c.landWhere; lt.x = c.landX; lt.y = c.landY; coophold::PutLandTail(&b, lt); }
+    if (ownSentOut != 0) *ownSentOut = ownSent;
+    return true;
+}
+bool EncodeItemConfirmBody(const coop::ItemConfirmMsg& c, std::vector<char>* out)
+{
+    if (out == 0) return false;
+    out->clear();
+    bool own = false;
+    return ItemConfirmBody(c, *out, &own, false);
+}
+bool SendItemConfirm(const coop::ItemConfirmMsg& c)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return false;   /* M7b slice 2: the item road */
+    std::vector<char> b;
+    bool ownSent = false;
+    if (!ItemConfirmBody(c, b, &ownSent, true)) return false;
     const bool sent = ItemSendTo(MSG_ITEM_CONFIRM, ItemToAsker(c.toHave != 0, c.toKey), &b[0], b.size(), 0u, 0);   /* M7b slice 2: back to the asker */
     if (sent && ownSent) coop::ItemOwnerNoteCarried("ITEM_CONFIRM", c.owner);
     if (sent && c.ok != 0 && !c.bag.empty()) coop::ItemOwnerNoteRowsCarried(coopbag::BagRowsMarked(c.bag), coopbag::BagRowsUnknown(c.bag));   /* inv6 phase 2; review-inv6p2 LOW (confirm) */
@@ -3408,6 +3470,18 @@ bool SendItemPlaced(unsigned int id, int ok)
     PutU32(&b, id);
     b.push_back((char)(unsigned char)(ok != 0 ? 1 : 0));
     return ItemSendTo(MSG_ITEM_PLACED, ItemToAskedOf(id), &b[0], b.size(), 0u, 0);   /* M7b slice 2: to the game request `id` was asked of */
+}
+
+/* T-889 step 2: MSG_ITEM_HANDOVER (79) - QUERY / VERDICT / CLOSED about one hand-over line, to one player by slot (src/common/handrec.h).
+   RELIABLE; false = no road to that player now (the 60 s re-ask repeats it) or a kind / value out of range. */
+bool SendItemHandover(int kind, unsigned int asker, unsigned int reqId, unsigned int holder, int value, int toSlot)
+{
+    if (toSlot < 0 || CharRoadNow() == cooplive::kCharRoadNone) return false;
+    hovrec::HandMsg hm;
+    hm.kind = kind; hm.asker = asker; hm.reqId = reqId; hm.holder = holder; hm.value = value;
+    std::vector<char> b;
+    if (hovrec::EncodeMsg(hm, &b) == 0) return false;
+    return ItemSendTo(MSG_ITEM_HANDOVER, toSlot, &b[0], b.size(), 0u, 0);
 }
 
 /* M7b slice 4 (C3) + DOOR_STATE (C4) - T-197; protocol 121. THE SIDE MESSAGES ON THE CHARACTER STREAM'S ROAD (ownerroute.h
@@ -3708,6 +3782,13 @@ bool SendShot(const coopshot::ShotMsg& m)
     if (!coopshot::EncodeShot(&b, m)) return false;
     return SendToOwner(MSG_SHOT, m.victimUid, &b[0], b.size());   /* M7b slice 1: to the victim's owner */
 }
+/* Reliable: one MSG_MELEE_DECIDED (combat.cpp MeleeDecidedDrain; false = no owner known, no road, or not encodable - counted there). */
+bool SendMeleeDecided(const meleewire::MeleeMsg& m)
+{
+    std::vector<char> b;
+    if (!meleewire::EncodeMelee(&b, m)) return false;
+    return SendToOwner(MSG_MELEE_DECIDED, m.victimUid, &b[0], b.size());   /* to the victim's owner */
+}
 /* recruit1.  Reliable: one MSG_HIRE (hire.cpp; queued there, applied at the K2 safe point on arrival). */
 bool SendHire(const coophire::HireMsg& m, unsigned int toPeer)
 {
@@ -3809,7 +3890,8 @@ bool SendFarm(const coopfarm::FarmMsg& m)
 void OnBuild(const Message& m)
 {
     if (!m.payload.empty() && coopfarm::IsFarmKind(&m.payload[0], m.payload.size()) != 0)
-    {   /* par16: kinds 6 / 7 are the farm's, 10 a worker's step on a production building, decoded by farmwire.h (DecodeBuild refuses them) */
+    {   /* par16: kinds 6 / 7 are the farm's, 10 / 11 a production building's step and bar, 13-15 its worker spots (T-674), decoded by
+           farmwire.h (DecodeBuild refuses them; 12 is DecodeBuild's DISMANTLE_ASK) */
         coopfarm::FarmMsg fm;
         const int fr = coopfarm::DecodeFarm(&m.payload[0], m.payload.size(), &fm);
         if (fr != coopfarm::kFarmDecodeOk)
@@ -3894,6 +3976,25 @@ void OnShot(const Message& m)
     if (!IsUidMine(s.victimUid)) refusal = 1;
     else if (!RemoteMayWrite(s.shooterUid, m.peer)) refusal = 2;
     coop::ShotOnNet(s.victimUid, s.shooterUid, s.rec, s.onPurpose, refusal);
+}
+/* MSG_MELEE_DECIDED: the other game's player character's melee blow on our NPC, decided on the attacker's game. Refused whole when
+   it does not decode; we must run the victim and the sender must run the attacker (RemoteMayWrite) - OnShot's two tests. Counted,
+   logged and queued in combat.cpp; applied at the K2 safe point through the engine's own MedicalSystem::addWound. */
+void OnMeleeDecided(const Message& m)
+{
+    meleewire::MeleeMsg s;
+    const int dc = meleewire::DecodeMelee(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &s);
+    if (dc != meleewire::kMeleeDecodeOk)
+    {
+        ErrorLog("[net] malformed MELEE_DECIDED (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
+                 + N((long long)m.peer) + " - ignored");
+        coop::MeleeOnNet(0u, 0u, 0, 0, 0, 0, 3);
+        return;
+    }
+    int refusal = 0;
+    if (!IsUidMine(s.victimUid)) refusal = 1;
+    else if (!RemoteMayWrite(s.attackerUid, m.peer)) refusal = 2;
+    coop::MeleeOnNet(s.victimUid, s.attackerUid, s.cutDir, s.comboId, s.damages, s.techFlag, refusal);
 }
 /* T-327 (protocol 111) - MSG_EFFECT. g_effViaRelay: did the message SessionDispatchQueued is dispatching come through the notebook
    (m.peer is the player key on both roads, so the road is read there, from the raw sender). */
@@ -4026,6 +4127,90 @@ static int LostEngineKeepsHere(float x, float z)
     return cooplo::EngineKeepsAt(x, z, cooplo::AreaMinUnits(sx), cooplo::AreaMinUnits(sy), cooplo::kAreaSizeUnits, self, w, e, so, no,
                                  lostcopy::kLostKeepMarginUnits);
 }
+/* PROBE P143 BEGIN */
+/* A copy booked LOST AGAIN in the visit it came back in, and the looks that then wait: which rule holds the ask back, how long the
+   visit has run and how many of the owner's MOVEs reached the book since (first line per uid, then one per 30 s, at most kP143RowsMax
+   uids). And each copy this game removes or finds gone: how the code knew, its row, the keep reads at its spot (the same guarded
+   reads LostLook makes) and the owner's last MOVE age. Log only. MAIN THREAD. */
+struct P143Row { double lostAgainAt, lastLine; long long moves; P143Row() : lostAgainAt(0.0), lastLine(-1.0), moves(0) {} };
+static std::map<unsigned int, P143Row> g_p143Rows;   /* uid -> booked LOST AGAIN in the same visit */
+const size_t kP143RowsMax = 30;
+static std::map<unsigned int, double> g_p143VisitAt;   /* uid -> when its row's current visit began (the first look whose spot read kept) */
+const size_t kP143VisitMax = 4096;
+static long long g_p143Gone = 0, g_p143GoneAgainLines = 0;
+static std::string P143Sec(double v) { if (v < 0.0) return "?"; const long long t = (long long)(v * 10.0 + 0.5); return N(t / 10) + "." + N(t % 10); }
+static const char* P143StateName(int st)
+{
+    switch (st)
+    {
+    case lostcopy::kLcWaiting: return "WAITING";
+    case lostcopy::kLcAsked: return "ASKED";
+    case lostcopy::kLcAnswered: return "ANSWERED";
+    case lostcopy::kLcRefused: return "REFUSED";
+    case lostcopy::kLcHere: return "HERE";
+    case lostcopy::kLcBackoff: return "BACKOFF";
+    default: return "?";
+    }
+}
+static void P143VisitNote(unsigned int uid, bool kept, const lostcopy::LostRow& r)
+{
+    if (!kept || r.loadedPrev) return;
+    if (g_p143VisitAt.size() >= kP143VisitMax && g_p143VisitAt.count(uid) == 0) return;
+    g_p143VisitAt[uid] = CuNowSec();
+}
+static void P143LostAgain(unsigned int uid)
+{
+    std::map<unsigned int, P143Row>::iterator it = g_p143Rows.find(uid);
+    if (it == g_p143Rows.end())
+    {
+        if (g_p143Rows.size() >= kP143RowsMax) return;
+        it = g_p143Rows.insert(std::make_pair(uid, P143Row())).first;
+    }
+    it->second.lostAgainAt = CuNowSec(); it->second.moves = 0; it->second.lastLine = -1.0;
+}
+static void P143MoveSeen(unsigned int uid)
+{
+    std::map<unsigned int, P143Row>::iterator it = g_p143Rows.find(uid);
+    if (it != g_p143Rows.end()) ++it->second.moves;
+}
+static void P143WaitLook(unsigned int uid, const lostcopy::LostRow& r, bool kept, int zoneLoaded, int keeps)
+{
+    std::map<unsigned int, P143Row>::iterator it = g_p143Rows.find(uid);
+    if (it == g_p143Rows.end()) return;
+    const double now = CuNowSec();
+    if (it->second.lastLine >= 0.0 && now - it->second.lastLine < 30.0) return;
+    it->second.lastLine = now;
+    const char* why = !kept ? ((zoneLoaded == 1 && keeps == 0) ? "edge" : "notKept")
+                    : r.backThisVisit ? "backThisVisit"
+                    : r.asksThisVisit >= lostcopy::kLostAsksPerVisit ? "budget"
+                    : r.state == lostcopy::kLcAsked ? "asked"
+                    : r.state == lostcopy::kLcBackoff ? "backoff" : "answeredOrRefused";
+    std::map<unsigned int, double>::const_iterator v = g_p143VisitAt.find(uid);
+    DebugLog("[P143] lost row waits uid=" + N(uid) + " why=" + why + " state=" + P143StateName(r.state) + " asksThisVisit=" + N((long long)r.asksThisVisit)
+             + " visitAge=" + ((r.loadedPrev && v != g_p143VisitAt.end()) ? P143Sec(now - v->second) : std::string("?"))
+             + " ownerMovesSince=" + N(it->second.moves) + " lostAgainAge=" + P143Sec(now - it->second.lostAgainAt));
+}
+void P143CopyGone(unsigned int uid, const char* how, const char* reason, int engineFlag, int dead, bool hasPos, float x, float y, float z, double lastMoveAge)
+{
+    if (uid == 0) return;
+    const int at = lostcopy::LostFind(g_lost, uid);
+    const int rowState = at >= 0 ? g_lost.rows[(size_t)at].state : -1;
+    const bool again = rowState == lostcopy::kLcHere;   /* the row says the copy had come back: this is a second loss */
+    const long long n = ++g_p143Gone;
+    if (!(n <= 100 || n % 50 == 0 || (again && g_p143GoneAgainLines < 300))) return;
+    if (again) ++g_p143GoneAgainLines;
+    const int zoneLoaded = (hasPos && coop::GameplayRunning() && !coop::EngineWritesBlocked()) ? coop::ZoneBuildingsInHereTri(x, y, z) : -2;
+    const int keeps = zoneLoaded == 1 ? LostEngineKeepsHere(x, z) : -2;
+    DebugLog("[P143] copy gone uid=" + N(uid) + " how=" + std::string(how ? how : "?")
+             + (reason != 0 ? " reason='" + std::string(reason) + "'" : std::string()) + (engineFlag >= 0 ? " engineUnloadFlag=" + N((long long)engineFlag) : std::string())
+             + (dead >= -1 && engineFlag >= 0 ? " dead=" + N((long long)dead) : std::string())
+             + " row=" + std::string(rowState < 0 ? "none" : P143StateName(rowState))
+             + (at >= 0 ? " backThisVisit=" + N((long long)g_lost.rows[(size_t)at].backThisVisit) : std::string())
+             + " edgeStrip=" + (keeps == -2 ? std::string("?") : N((long long)(keeps == 0 ? 1 : 0))) + " keepRead=" + N((long long)keeps)
+             + " loadedHere=" + (zoneLoaded == -2 ? std::string("?") : N((long long)zoneLoaded))
+             + " lastMoveAge=" + P143Sec(lastMoveAge) + " (copyGone " + N(n) + "; the first 100, every 50th, and up to 300 second losses)");
+}
+/* PROBE P143 END */
 /* One look at row i; true when the row was removed. tick: the once-a-second pass (LostCopyTick) - only its looks run down an owed
    answer's wait and a back-off. */
 static bool LostLook(size_t i, bool tick = false)
@@ -4048,6 +4233,7 @@ static bool LostLook(size_t i, bool tick = false)
     const int keeps = zoneLoaded == 1 ? LostEngineKeepsHere(r.x, r.z) : 0;
     const bool kept = lostcopy::LostSpotKept(zoneLoaded == 1 ? 1 : 0, keeps) != 0;
     const int a = lostcopy::LostLookDecide(haveCopy ? 1 : 0, ownerOk ? 1 : 0, kept ? 1 : 0, r);
+    /* PROBE P143 BEGIN */ P143VisitNote(uid, kept, r); if (a == lostcopy::kLaWait && !haveCopy) P143WaitLook(uid, r, kept, zoneLoaded, keeps); /* PROBE P143 END */
     if (haveCopy && r.state != lostcopy::kLcHere && (a == lostcopy::kLaHere || a == lostcopy::kLaDrop))
     {
         ++g_lcBack;
@@ -4122,6 +4308,7 @@ static void LostBookUid(unsigned int uid, bool hasPos, float x, float y, float z
             DebugLog("[net] lost copy uid=" + N(uid) + " of player key " + N(key) + (wasHere ? " LOST AGAIN in the same visit" : " booked")
                      + ": no copy here while its owner runs it" + std::string(hasPos ? "" : " (no spot known yet)") + " (lostCopy noted " + N(g_lcNoted) + ")");
     }
+    /* PROBE P143 BEGIN */ if (wasHere) P143LostAgain(uid); /* PROBE P143 END */
     const int i = lostcopy::LostFind(g_lost, uid);
     if (i >= 0) LostLook((size_t)i);
 }
@@ -4130,7 +4317,19 @@ void LostCopyNote(unsigned int uid, bool hasPos, float x, float y, float z)
     if (uid != 0) g_lostRefused.erase(uid);   /* the copy existed here, so its SPAWN made a row after all */
     LostBookUid(uid, hasPos, x, y, z);
 }
-void LostCopyMove(unsigned int uid, float x, float y, float z) { LostBookUid(uid, true, x, y, z); }
+void LostCopyMove(unsigned int uid, float x, float y, float z)
+{
+    /* PROBE P143 BEGIN */
+    P143MoveSeen(uid);
+    if (!g_lost.rows.empty())
+    {
+        const int at = lostcopy::LostFind(g_lost, uid);
+        if (at >= 0 && g_lost.rows[(size_t)at].state == lostcopy::kLcHere && !LostCopyHereNow(uid))
+            P143CopyGone(uid, "a MOVE found no copy while its row reads HERE (no removal seen here)", 0, -1, -1, true, x, y, z, -1.0);
+    }
+    /* PROBE P143 END */
+    LostBookUid(uid, true, x, y, z);
+}
 void LostCopyRefusedHere(unsigned int uid, bool refused)
 {
     if (uid == 0) return;
@@ -4437,7 +4636,8 @@ void ReturnCheckTick()
         /* kRtaWithdraw: NOT ANNOUNCED - the owner runs it but has not announced it to this game (its withdrawal went while this game was
            away) */
         coop::SquadIdxOwnerWithdrew(r.uid, 1);   /* its recorded owner runs it nowhere here - out of the squad index, as the roster's withdrawal does */
-        coop::ApplyRemoteUnload(r.uid); g_owner.erase(r.uid); g_copyGen.erase(r.uid); g_roLastStreamAt.erase(r.uid); g_roConflictCount.erase(r.uid);
+        coop::ApplyRemoteUnload(r.uid, 0);   /* 0 (twinsleep kKindRunnerRuns): its owner runs it - a save-born twin here waits for its SPAWN, taken only as the last resort */
+        g_owner.erase(r.uid); g_copyGen.erase(r.uid); g_roLastStreamAt.erase(r.uid); g_roConflictCount.erase(r.uid);
         ++g_rtWithdrawn;
         RtLog("[net] RETURN CHECK: " + who + " WITHDRAWN - its owner answered it is not announced to this game: the owner's withdrawal went while this"
               " game was off the world-server link (returnCheck withdrawn " + N(g_rtWithdrawn) + ")");
@@ -4725,6 +4925,8 @@ bool SendShopTail(unsigned int id, unsigned int epoch, int kind)
     return ItemSendTo(MSG_ITEM_REVOKE, ItemToAskedOf(id), &b[0], b.size(), 0u, 0);   /* M7b slice 2: to the game shop request `id` was asked of */
 }
 
+/* The id at the head of an item request / answer refused before its body is read (0 = no id there). */
+static unsigned int ItemMsgId(const Message& m) { unsigned int id = 0; return GetU32(m.payload, 0, &id) ? id : 0u; }
 // E22b - MSG_ITEM_REQUEST: the peer touched an inventory it does not own and is asking US, the owner, to make
 // the move. Refused whole on any malformed field: a half-read request would name a slot nobody can name.
 static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail, int hdDir)
@@ -4735,83 +4937,84 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
     if (!GetU32(m.payload, 0, &id) || m.payload.size() < 5) { ErrorLog("[net] malformed ITEM_REQUEST (too short) - REFUSED"); return; }
     r.id = id; at = 4;
     r.dir = (int)(unsigned char)m.payload[at]; ++at;
-    if (r.dir != 0 && r.dir != 1) { ErrorLog("[net] ITEM_REQUEST with unknown direction " + N(r.dir) + " - REFUSED"); return; }
-    if (!GetU32(m.payload, at, &ownerUid)) { ErrorLog("[net] malformed ITEM_REQUEST (owner uid) - REFUSED"); return; }
+    if (r.dir != 0 && r.dir != 1) { ErrorLog("[net] ITEM_REQUEST with unknown direction " + N(r.dir) + " - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+    if (!GetU32(m.payload, at, &ownerUid)) { ErrorLog("[net] malformed ITEM_REQUEST (owner uid) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     at += 4;
     r.ownerUid = ownerUid;
-    if (!GetStr(m.payload, &at, &r.ownerSection)) { ErrorLog("[net] malformed ITEM_REQUEST (owner section) - REFUSED"); return; }
+    if (!GetStr(m.payload, &at, &r.ownerSection)) { ErrorLog("[net] malformed ITEM_REQUEST (owner section) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     if (!GetU32(m.payload, at, &ox) || !GetU32(m.payload, at + 4, &oy) || !GetU32(m.payload, at + 8, &qty)
         || !GetU32(m.payload, at + 12, &takerUid))
-    { ErrorLog("[net] malformed ITEM_REQUEST (owner slot) - REFUSED"); return; }
+    { ErrorLog("[net] malformed ITEM_REQUEST (owner slot) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     r.ownerX = (int)ox; r.ownerY = (int)oy; r.quantity = (int)qty; r.takerUid = takerUid; at += 16;
-    if (!GetStr(m.payload, &at, &r.takerSection)) { ErrorLog("[net] malformed ITEM_REQUEST (taker section) - REFUSED"); return; }
+    if (!GetStr(m.payload, &at, &r.takerSection)) { ErrorLog("[net] malformed ITEM_REQUEST (taker section) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     if (!GetU32(m.payload, at, &tx) || !GetU32(m.payload, at + 4, &ty))
-    { ErrorLog("[net] malformed ITEM_REQUEST (taker slot) - REFUSED"); return; }
+    { ErrorLog("[net] malformed ITEM_REQUEST (taker slot) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     r.takerX = (int)tx; r.takerY = (int)ty; at += 8;
     /* cell1 fold (review-cell1 R3, protocol 82): the item block for EVERY direction - a TAKE names the record it wants. */
     if (!GetItemFields(m.payload, &at, &r.baseSid, &r.companySid, &r.materialSid, &r.colorSid,
                        &r.quality, &r.charges, &r.functionKind, &r.level, &r.unique))
-    { ErrorLog("[net] malformed ITEM_REQUEST (item record) - REFUSED"); return; }
-    if (r.baseSid.empty()) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + std::string(r.dir != 0 ? " give" : " take") + " with no base data sid - REFUSED"); return; }
+    { ErrorLog("[net] malformed ITEM_REQUEST (item record) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+    if (r.baseSid.empty()) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + std::string(r.dir != 0 ? " give" : " take") + " with no base data sid - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     if (r.ownerUid == 0)
     {
         if (!GetStr(m.payload, &at, &r.ownerBoxKey) || r.ownerBoxKey.empty())
-        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and no container key - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and no container key - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         // E22c-2 (P7n): the instance id beside it, empty allowed and absent not.
         if (!GetStr(m.payload, &at, &r.ownerBoxId))
-        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and no container id field - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and no container id field - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         /* T-693 (protocol 149): the id kind - bare or a name; anything else REFUSED whole */
         std::string idFor;
         if (!coopgname::IdKindGet(m.payload, &at, &r.ownerIdKind, &idFor) || r.ownerIdKind == coopgname::kIdNameFor)
-        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and a missing or bad id kind - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and a missing or bad id kind - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     /* T-164 211 (protocol 98): a taker uid of 0 carries the taker BOX's key next - empty = no taker (a ground put that names none) */
     if (r.takerUid == 0 && !GetStr(m.payload, &at, &r.takerBoxKey))
-    { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with taker uid 0 and no taker box field - REFUSED"); return; }
+    { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with taker uid 0 and no taker box field - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     // E35 (P6o) / decision 41. Refused whole if the block is missing: both peers speak protocol 39 or the
     // link never came up (the HELLO check), so an absent block is a malformed message, not an old peer - and
     // a request whose trade half could not be read must not be applied as if it were a free transfer.
     {
         unsigned int price = 0;
-        if (at + 5 > m.payload.size()) { ErrorLog("[net] malformed ITEM_REQUEST (trade block) - REFUSED"); return; }
+        if (at + 5 > m.payload.size()) { ErrorLog("[net] malformed ITEM_REQUEST (trade block) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         r.trade = (int)(unsigned char)m.payload[at]; ++at;
         if (r.trade != 0 && r.trade != 1 && r.trade != 2)
-        { ErrorLog("[net] ITEM_REQUEST with unknown trade kind " + N(r.trade) + " - REFUSED"); return; }
-        if (!GetU32(m.payload, at, &price)) { ErrorLog("[net] malformed ITEM_REQUEST (price) - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST with unknown trade kind " + N(r.trade) + " - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+        if (!GetU32(m.payload, at, &price)) { ErrorLog("[net] malformed ITEM_REQUEST (price) - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         r.price = (int)price; at += 4;
-        if (r.price < 0) { ErrorLog("[net] ITEM_REQUEST with a negative price - REFUSED"); return; }
+        if (r.price < 0) { ErrorLog("[net] ITEM_REQUEST with a negative price - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     /* T-164 B4-4 (protocol 92): the optional 'SHR1' shop block, right after the trade block. A cut or out-of-range one REFUSES the
        message: a shop request read without it would be applied as an ordinary box move. */
     if (at < m.payload.size() && coopshop::ReqTagAt(&m.payload[0], m.payload.size(), at))   /* T-1 B5: 'SHR3', or the older 'SHR2' (a home's) */
     {
         if (!coopshop::DecodeReq(&m.payload[0], m.payload.size(), &at, &r.shop))
-        { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a shop block that is cut or out of range - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a shop block that is cut or out of range - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     /* inv3a (protocol 70): the optional BAG1 block. A block that is there but is not whole and in range REFUSES THE MESSAGE:
        applying the item half without its contents is exactly the loss this block exists to end. */
-    if (at < m.payload.size() && !coopmark::OwnerBlockAt(&m.payload[0], m.payload.size(), at) && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at))   /* inv6: an OWN1 block may follow, or stand alone; bag23 part 2: or the BAGP block */
+    const int refuseForced = coop::ItemRefuseNextFires(coop::kItemRefuseRequest, r.id);   /* TEST-ONLY itemrefuse lever: refused below as a malformed backpack block */
+    if (refuseForced != 0 || itemtail::ReqBagNext(&m.payload[0], m.payload.size(), at))   /* inv6: an OWN1 block may follow, or stand alone; bag23 part 2: or the BAGP block; a GEM1 block (uniform / crafter) may follow the trade block directly */
     {
         size_t bagEnd = 0;
-        const int bw = coopbag::DecodeBagRows(&m.payload[0], m.payload.size(), at, &r.bag, &bagEnd);
+        const int bw = (refuseForced != 0) ? coopbag::kBagBad : coopbag::DecodeBagRows(&m.payload[0], m.payload.size(), at, &r.bag, &bagEnd);
         if (bw == coopbag::kBagBadOwner) coop::ItemOwnerNoteBadRecv();   /* inv6 phase 2 */
         if (bw == coopbag::kBagBadGear) coop::ItemGearNoteBadRecv();   /* the backpack rows' gear tail (ITEM_REQUEST) */
         if (bw == coopbag::kBagBadNest) coop::ItemBagNestNoteBadRecv();   /* the backpack rows' pack-inside-pack tail (ITEM_REQUEST) */
         if (bw != coopbag::kBagOk)
-        { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a backpack block that is " + std::string(coopbag::BagDecodeWhy(bw)) + " - REFUSED"); return; }
-        if (r.dir == 0 && !r.bag.empty()) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no backpack rows - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a backpack block that is " + std::string(refuseForced != 0 ? "malformed (forced by the itemrefuse lever - TEST)" : coopbag::BagDecodeWhy(bw)) + " - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+        if (r.dir == 0 && !r.bag.empty()) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no backpack rows - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         at = bagEnd;
     }
     /* inv6 (protocol 71): the optional OWN1 block, LAST. Anything else left over, or a cut block, REFUSES the message. */
-    if (at < m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at) && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at))   /* a GEM1 block straight after the rows: a request with no owner block */
+    if (itemtail::ReqOwnerNext(&m.payload[0], m.payload.size(), at))   /* a GEM1 block straight after the rows: a request with no owner block */
     {
         size_t oe = 0;
         const int ow = coopmark::DecodeOwner(&m.payload[0], m.payload.size(), at, &r.owner, &oe);
         if (ow != coopmark::kOwnOk)
-        { coop::ItemOwnerNoteBadRecv(); ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with trailing bytes that are not a whole owner block (" + std::string(coopmark::OwnerDecodeWhy(ow)) + ") - REFUSED"); return; }
-        if (r.dir == 0) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no owner block - REFUSED"); return; }
+        { coop::ItemOwnerNoteBadRecv(); ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with trailing bytes that are not a whole owner block (" + std::string(coopmark::OwnerDecodeWhy(ow)) + ") - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+        if (r.dir == 0) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no owner block - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         at = oe;
-        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at) && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its owner block - REFUSED"); return; }
+        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at) && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its owner block - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     /* the optional GEM1 block after the owner block (gearwire.h): a GIVE's uniform and crafter. Cut or not valid: REFUSED. */
     if (at < m.payload.size() && gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at))
@@ -4819,10 +5022,10 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
         size_t ge = 0;
         const int gw = gearwire::DecodeGear(&m.payload[0], m.payload.size(), at, &r.gear, &ge);
         if (gw != gearwire::kGearOk)
-        { coop::ItemGearNoteBadRecv(); ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a gear block that is " + std::string(gearwire::GearDecodeWhy(gw)) + " - REFUSED"); return; }
-        if (r.dir == 0) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no gear block - REFUSED"); return; }
+        { coop::ItemGearNoteBadRecv(); ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with a gear block that is " + std::string(gearwire::GearDecodeWhy(gw)) + " - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+        if (r.dir == 0) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": a TAKE carries no gear block - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
         at = ge;
-        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its gear block - REFUSED"); return; }
+        if (at != m.payload.size() && !coopbag::BagPathAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with bytes after its gear block - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     /* bag23 part 2 (protocol 81): the optional BAGP block, LAST - the owner half is inside a pack. Anything else, cut or out of range:
        REFUSED (a request is never applied to a guessed inventory). */
@@ -4830,7 +5033,7 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
     {
         size_t pe = 0;
         if (coopbag::DecodeBagPath(&m.payload[0], m.payload.size(), at, &r.ownerBag, &pe) != coopbag::kBagOk || pe != m.payload.size())
-        { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with trailing bytes that are not a whole pack path block - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with trailing bytes that are not a whole pack path block - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     if (hdTail != 0) { r.dir = hdDir; r.holdId = hdTail->holdId; r.holdHow = hdTail->how; r.holdSlot = hdTail->slot; }   /* P105 build 2 */
     coop::ApplyItemRequest(r, m.peer);
@@ -4844,10 +5047,10 @@ void OnItemRequest(const Message& m)
         coophold::HoldTail ht;
         const int dir = (int)(unsigned char)m.payload[4];
         if (!coophold::TakeHoldTail(&m.payload[0], m.payload.size(), &ht))
-        { ErrorLog("[net] ITEM_REQUEST " + std::string(dir == coophold::kDirHold ? "HOLD" : "LAND") + " with an 'HLD1' block that is cut or out of range - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_REQUEST " + std::string(dir == coophold::kDirHold ? "HOLD" : "LAND") + " with an 'HLD1' block that is cut or out of range - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m), m.peer); return; }
         Message c = m;
         c.payload.resize(c.payload.size() - coophold::kHoldTailLen);
-        if (c.payload.size() < 5) { ErrorLog("[net] malformed ITEM_REQUEST (nothing before its HLD1 block) - REFUSED"); return; }
+        if (c.payload.size() < 5) { ErrorLog("[net] malformed ITEM_REQUEST (nothing before its HLD1 block) - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m), m.peer); return; }
         c.payload[4] = 0;
         OnItemRequestBody(c, &ht, dir);
         return;
@@ -4863,6 +5066,13 @@ void OnItemPlaced(const Message& m)
     if (!GetU32(m.payload, 0, &id) || m.payload.size() < 5) { ErrorLog("[net] malformed ITEM_PLACED (too short) - REFUSED"); return; }
     const int ok = (int)(unsigned char)m.payload[4];
     coop::ApplyItemPlaced(id, ok, m.peer);
+}
+
+/* T-889 step 2 - MSG_ITEM_HANDOVER: refused whole unless it is exactly the 14-byte body with a known kind and value (coop::ApplyItemHandover). */
+void OnItemHandover(const Message& m)
+{
+    if (m.payload.empty()) { ErrorLog("[net] malformed ITEM_HANDOVER (empty) - REFUSED"); return; }
+    coop::ApplyItemHandover(&m.payload[0], m.payload.size(), m.peer);
 }
 
 // E22b-2 (P6b) - MSG_ITEM_REVOKE: the giver could not remove its own copy of a GIVE we granted.
@@ -4885,41 +5095,42 @@ void OnItemRevoke(const Message& m)
 
 // E22b - MSG_ITEM_CONFIRM: the owner's answer to a request WE sent. This is the moment - and the only moment -
 // at which our own copy of the item changes.
-static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand)
+/* T-889 step 2: THE ITEM_CONFIRM READER, apart from its apply - OnItemConfirmBody applies what it reads; DecodeItemConfirmBody reads a
+   hand-over line's kept body QUIETLY (no request is settled, no lever fires). false = refused (logged). */
+static bool ParseItemConfirmBody(const Message& m, coop::ItemConfirmMsg& c, bool quiet)
 {
-    coop::ItemConfirmMsg c;
     size_t at = 0;
     unsigned int id = 0, qty = 0;
-    if (!GetU32(m.payload, 0, &id) || m.payload.size() < 9) { ErrorLog("[net] malformed ITEM_CONFIRM (too short) - REFUSED"); return; }
+    if (!GetU32(m.payload, 0, &id) || m.payload.size() < 9) { ErrorLog("[net] malformed ITEM_CONFIRM (too short) - REFUSED"); return false; }
     c.id = id; at = 4;
     c.ok = (int)(unsigned char)m.payload[at]; ++at;
-    if (!GetU32(m.payload, at, &qty)) { ErrorLog("[net] malformed ITEM_CONFIRM (quantity) - REFUSED"); return; }
+    if (!GetU32(m.payload, at, &qty)) { ErrorLog("[net] malformed ITEM_CONFIRM (quantity) - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     c.quantity = (int)qty; at += 4;
     if (c.ok != 0)
     {
         if (!GetItemFields(m.payload, &at, &c.baseSid, &c.companySid, &c.materialSid, &c.colorSid,
                            &c.quality, &c.charges, &c.functionKind, &c.level, &c.unique))
-        { ErrorLog("[net] malformed ITEM_CONFIRM (item record) - REFUSED"); return; }
-        if (c.baseSid.empty()) { ErrorLog("[net] ITEM_CONFIRM ok with no base data sid - REFUSED"); return; }
+        { ErrorLog("[net] malformed ITEM_CONFIRM (item record) - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
+        if (c.baseSid.empty()) { ErrorLog("[net] ITEM_CONFIRM ok with no base data sid - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     }
     // E35 (P6o): the holder's own trade answer. Refused whole for the same reason the request's is - a
     // confirmation whose price could not be read would have the requester settle its purse by a guess.
     {
         unsigned int price = 0;
-        if (at + 5 > m.payload.size()) { ErrorLog("[net] malformed ITEM_CONFIRM (trade block) - REFUSED"); return; }
+        if (at + 5 > m.payload.size()) { ErrorLog("[net] malformed ITEM_CONFIRM (trade block) - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
         c.trade = (int)(unsigned char)m.payload[at]; ++at;
         if (c.trade != 0 && c.trade != 1 && c.trade != 2)
-        { ErrorLog("[net] ITEM_CONFIRM with unknown trade kind " + N(c.trade) + " - REFUSED"); return; }
-        if (!GetU32(m.payload, at, &price)) { ErrorLog("[net] malformed ITEM_CONFIRM (price) - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_CONFIRM with unknown trade kind " + N(c.trade) + " - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
+        if (!GetU32(m.payload, at, &price)) { ErrorLog("[net] malformed ITEM_CONFIRM (price) - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
         c.price = (int)price; at += 4;
-        if (c.price < 0) { ErrorLog("[net] ITEM_CONFIRM with a negative price - REFUSED"); return; }
+        if (c.price < 0) { ErrorLog("[net] ITEM_CONFIRM with a negative price - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     }
     /* T-164 B4-4 (protocol 92): the optional 'SHC1' shop answer, right after the trade block (before GND1). Cut or out of range:
        REFUSED (the requester's own 10 s timeout then gives the reservation / escrow back). */
     if (at < m.payload.size() && coopshop::TagAt(&m.payload[0], m.payload.size(), at, coopshop::kCfTag))
     {
         if (!coopshop::DecodeCf(&m.payload[0], m.payload.size(), &at, &c.shop))
-        { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with a shop block that is cut or out of range - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with a shop block that is cut or out of range - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     }
     /* inv5 (protocol 72): a refusal may end with a 'GND1' block {u32 tag, u8 reason} - the ground's reason (1 not holder, 2 not found).
        It is the whole remainder when present, so the blocks below then see nothing. An unknown reason REFUSES the message. */
@@ -4933,34 +5144,35 @@ static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand
             if (c.reason != coopground::kGroundReasonNotHolder && c.reason != coopground::kGroundReasonNotFound
                 && c.reason != coopground::kGroundReasonBusy && c.reason != coopground::kGroundReasonUnreadable   /* inv5p1 fold: 3 busy, 4 unreadable */
                 && c.reason != coopground::kGroundReasonUnknownName)   /* 5 the name is not known on the holder */
-            { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with an unknown ground reason " + N((long long)c.reason) + " - REFUSED"); return; }
+            { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with an unknown ground reason " + N((long long)c.reason) + " - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
         }
     }
     /* inv3a (protocol 70): the optional BAG1 block, refused whole when it is not whole and in range (see OnItemRequest). A
        refused confirmation is never applied, so the owner's ten-second timeout rolls its kept pack back WITH its contents. */
-    if (at < m.payload.size() && !coopmark::OwnerBlockAt(&m.payload[0], m.payload.size(), at))   /* inv6: an OWN1 block may follow, or stand alone */
+    const int refuseForced = quiet ? 0 : coop::ItemRefuseNextFires(coop::kItemRefuseConfirm, c.id);   /* T-889 step 2: a quiet decode fires no lever */   /* TEST-ONLY itemrefuse lever: refused below as a malformed backpack block */
+    if (refuseForced != 0 || itemtail::CfBagNext(&m.payload[0], m.payload.size(), at))   /* inv6: an OWN1 block may follow, or stand alone; a GEM1 block (uniform / crafter) may follow directly */
     {
         size_t bagEnd = 0;
-        const int bw = coopbag::DecodeBagRows(&m.payload[0], m.payload.size(), at, &c.bag, &bagEnd);
+        const int bw = (refuseForced != 0) ? coopbag::kBagBad : coopbag::DecodeBagRows(&m.payload[0], m.payload.size(), at, &c.bag, &bagEnd);
         if (bw == coopbag::kBagBadOwner) coop::ItemOwnerNoteBadRecv();   /* inv6 phase 2 */
         if (bw == coopbag::kBagBadGear) coop::ItemGearNoteBadRecv();   /* the backpack rows' gear tail (ITEM_CONFIRM) */
         if (bw == coopbag::kBagBadNest) coop::ItemBagNestNoteBadRecv();   /* the backpack rows' pack-inside-pack tail (ITEM_CONFIRM) */
         if (bw != coopbag::kBagOk)
-        { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with a backpack block that is " + std::string(coopbag::BagDecodeWhy(bw)) + " - REFUSED"); return; }
-        if (c.ok == 0 && !c.bag.empty()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no backpack rows - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with a backpack block that is " + std::string(refuseForced != 0 ? "malformed (forced by the itemrefuse lever - TEST)" : coopbag::BagDecodeWhy(bw)) + " - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
+        if (c.ok == 0 && !c.bag.empty()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no backpack rows - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
         at = bagEnd;
     }
     /* inv6 (protocol 71): the optional OWN1 block, LAST, ok 1 only. Anything else left over, or a cut block, REFUSES the message
        (the owner's ten-second timeout then rolls its kept item back). */
-    if (at < m.payload.size() && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at))   /* a GEM1 block straight after the rows: an answer with no owner block */
+    if (itemtail::CfOwnerNext(&m.payload[0], m.payload.size(), at))   /* a GEM1 block straight after the rows: an answer with no owner block */
     {
         size_t oe = 0;
         const int ow = coopmark::DecodeOwner(&m.payload[0], m.payload.size(), at, &c.owner, &oe);
         if (ow != coopmark::kOwnOk)
-        { coop::ItemOwnerNoteBadRecv(); ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with trailing bytes that are not a whole owner block (" + std::string(coopmark::OwnerDecodeWhy(ow)) + ") - REFUSED"); return; }
-        if (c.ok == 0) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no owner block - REFUSED"); return; }
+        { coop::ItemOwnerNoteBadRecv(); ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with trailing bytes that are not a whole owner block (" + std::string(coopmark::OwnerDecodeWhy(ow)) + ") - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
+        if (c.ok == 0) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no owner block - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
         at = oe;
-        if (at != m.payload.size() && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its owner block - REFUSED"); return; }
+        if (at != m.payload.size() && !gearwire::GearBlockAt(&m.payload[0], m.payload.size(), at)) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its owner block - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     }
     /* the optional GEM1 block after the owner block, ok 1 only: the taken item's uniform and crafter. Cut or not valid: REFUSED. */
     if (at < m.payload.size())
@@ -4971,12 +5183,31 @@ static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand
         {
             if (gw == gearwire::kGearBad) coop::ItemGearNoteBadRecv();
             ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with trailing bytes that are not a whole gear block (" + std::string(gearwire::GearDecodeWhy(gw)) + ") - REFUSED");
-            return;
+            if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer);
+            return false;
         }
-        if (c.ok == 0) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no gear block - REFUSED"); return; }
+        if (c.ok == 0) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + ": a refusal carries no gear block - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
         at = ge;
-        if (at != m.payload.size()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its gear block - REFUSED"); return; }
+        if (at != m.payload.size()) { ErrorLog("[net] ITEM_CONFIRM " + N((long long)c.id) + " with bytes after its gear block - REFUSED"); if (!quiet) coop::ItemConfirmRefusedHere(c.id, m.peer); return false; }
     }
+    return true;
+}
+bool DecodeItemConfirmBody(const std::vector<char>& bytes, coop::ItemConfirmMsg* out)
+{
+    if (out == 0 || bytes.size() < 5 || (unsigned char)bytes[4] == coophold::kConfirmOkLand) return false;
+    Message m;
+    m.type = MSG_ITEM_CONFIRM;
+    m.peer = 0;
+    m.payload = bytes;
+    coop::ItemConfirmMsg c;
+    if (!ParseItemConfirmBody(m, c, true)) return false;
+    *out = c;
+    return true;
+}
+static void OnItemConfirmBody(const Message& m, const coophold::LandTail* hdLand)
+{
+    coop::ItemConfirmMsg c;
+    if (!ParseItemConfirmBody(m, c, false)) return;
     if (hdLand != 0) { c.landHas = 1; c.landWhere = hdLand->where; c.landX = hdLand->x; c.landY = hdLand->y; }   /* P105 build 2 */
     coop::ApplyItemConfirm(c, m.peer);   /* M7b slice 2: taken only from the game the request was asked of */
     if (c.ok == 0) ItemAskedRefusedBy(c.id, m.peer);   /* fold 1: an explicit refusal from the game a re-send is held to releases it */
@@ -4989,10 +5220,10 @@ void OnItemConfirm(const Message& m)
     {
         coophold::LandTail lt;
         if (!coophold::TakeLandTail(&m.payload[0], m.payload.size(), &lt))
-        { ErrorLog("[net] ITEM_CONFIRM with an 'LND1' block that is cut or out of range - REFUSED"); return; }
+        { ErrorLog("[net] ITEM_CONFIRM with an 'LND1' block that is cut or out of range - REFUSED"); coop::ItemConfirmRefusedHere(ItemMsgId(m), m.peer); return; }
         Message c = m;
         c.payload.resize(c.payload.size() - coophold::kLandTailLen);
-        if (c.payload.size() < 5) { ErrorLog("[net] malformed ITEM_CONFIRM (nothing before its LND1 block) - REFUSED"); return; }
+        if (c.payload.size() < 5) { ErrorLog("[net] malformed ITEM_CONFIRM (nothing before its LND1 block) - REFUSED"); coop::ItemConfirmRefusedHere(ItemMsgId(m), m.peer); return; }
         c.payload[4] = 1;
         OnItemConfirmBody(c, &lt);
         return;
@@ -5394,6 +5625,7 @@ void SessionDispatchOne(const Message& m)
     case MSG_ITEM_CONFIRM: OnItemConfirm(m); break;   /* E22b */
     case MSG_ITEM_PLACED:  OnItemPlaced(m);  break;   /* E22b-2 (P6b) - the rollback's ack */
     case MSG_ITEM_REVOKE:  OnItemRevoke(m);  break;   /* E22b-2 (P6b) - undo a give */
+    case MSG_ITEM_HANDOVER: OnItemHandover(m); break;   /* T-889 step 2: a hand-over line's QUERY / VERDICT / CLOSED */
     case MSG_PARITY_REQ:   OnParityReq(m);   break;   /* par1: the other game asks us, the holder, about its boxes */
     case MSG_PARITY_BOX:   OnParityBox(m);   break;   /* par1: the holder's answer for one of our boxes */
     case MSG_COMBATMODE: OnCombatMode(m); break;
@@ -5432,10 +5664,12 @@ void SessionDispatchOne(const Message& m)
     case MSG_CAPTURE_DONE: OnCaptureDone(m); break;   /* P11: the owner's answer to our capture request */
     case MSG_CAPTURE_PLACED: OnCapturePlaced(m); break;   /* P11 f3: which taken rows landed in the captor's slaver */
     case MSG_SHOT:       OnShot(m);      break;   /* P104 fix: the other game's bolt struck our character's copy there */
+    case MSG_MELEE_DECIDED: OnMeleeDecided(m); break;   /* the other game's player character's blow on our NPC, decided there */
     case MSG_EFFECT:     OnEffect(m);    break;   /* T-327: a request about our character / an answer for our eater */
     case MSG_NOT_SHOWN:  OnNotShown(m);  break;   /* T-354: our character is not shown on the sender's game (its table refused it) */
     case MSG_RESEND:     OnResend(m);    break;   /* a lost copy's ask (we own the character) / the owner's answer to ours */
-    case MSG_TOWN_PRICES: OnTownPrices(m); break;   /* T-619: one town's local trade multipliers, by either road */
+    case MSG_TOWN_PRICES: OnTownPrices(m); break;
+    case MSG_KEEPER_RESTOCK: OnKeeperRestock(m); break;   /* T-799 D4: the area holder's restock of a keeper this game runs */   /* T-619: one town's local trade multipliers, by either road */
     case MSG_HIRE:       OnHire(m);      break;   /* recruit1: a hire request / answer / result */
     case MSG_TALK:       OnTalk(m);      break;   /* P26 stages 1-3: a conversation PROMPT / ANSWER / END */
     case MSG_BUILD:      OnBuild(m);     break;   /* build1-b: the other player placed a construction */

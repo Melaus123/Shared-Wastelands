@@ -15,6 +15,7 @@
 #include <utility>
 #include "../common/townrefill.h"   /* townrefill::Tally - StoreTownRecordTally */
 class Faction;
+namespace moneyw { struct Ledger; }   /* T-810: src/common/moneywire.h */
 namespace coop {
 void InstallStore();                         // hooks Platoon::deactivate (post) and Platoon::activate (pre)
 void InstallFontGuard();                     // T-730 (fontguard.cpp, fontguard.h): InstallStore calls it before the title screen is built
@@ -61,7 +62,11 @@ int StoreKeylessRecordGroups(const std::string& townSid, KeylessGroup* out, int 
 int StoreGiveOwedHomes(const char* buildingKey, void* building);   /* MAIN THREAD - the groups made from their world records while this building (its position key) was not loaded here are given it as their home now (towngen.cpp TownGenGiveHomeTo); returns how many the building's residents hand now names */
 void StoreNoteCopyHome(void* platoon, const std::string& worldId, const unsigned char* handRaw32, int buildingSent, int buildingResolved);   /* MAIN THREAD - a copy just built (spawn.cpp PrepareContextForSpawn): a building sent that did not resolve here leaves its home owed, given by the store's once-a-second owed-home check (store.cpp CopyHomeOwedTick) once that building is loaded here [t755-copyhome-owe] */
 std::string StoreHomeReport();   /* the home[...] counts for the [TG] report line (plain counter reads) */
+void StoreHomeClearGroup(const std::string& worldId);   /* MAIN THREAD, review MED 2 - one group's home key marked "-" (a copy's home that is a player's house, spawn.cpp) */
+int StoreSetPersistentPod(void* platoon, int on);   /* Platoon::setPersistentSquad (0x7EB230): 1 called, 0 faulted, -1 no address row (T-805 b, build.cpp's buy callback) */
+int StoreHomeClearForBuilding(const char* buildingKey);   /* MAIN THREAD - a house a player bought (build.cpp P18, here or applied from another game): every group whose home key names it is marked "-" (coopstore::kMetaHomeCleared, no home); returns how many */
 int StoreTownPeoplePending(const char* townSid, int askSx, int askSy, char* holderOut, int holderCap);   /* decision 34 / T-580, ANY thread: does the notebook hold this town's creation back - townpending::kTownNotListed / kTownElsewhere / kTownHeld (src/common/townpending.h). (askSx, askSy) = the area the creation is for (-1 unread); holderOut (may be 0) names the note that holds it */
+int StoreBuildingPeoplePending(const char* townSid, const char* buildingKey, void* bldTemplate, float bx, float bz, int askSx, int askSy, char* holderOut, int holderCap);   /* T-698, MAIN THREAD: StoreTownPeoplePending's answer for ONE building - only a held note homed at buildingKey, or a keyless note of the building's resident template (bldTemplate, may be 0) at (bx, bz), holds it; a note that cannot be told (no record here, a template or its position not known) holds every building of its town (townpending::NoteHoldsBuilding) */
 int StoreTownRecordTally(const std::string& townSid, townrefill::Tally* out);   /* MAIN THREAD - what this world's records say about one town's groups (deleted, or living: placed here, waiting here, elsewhere, unplaceable, creation failed); 1 = counted */
 std::string StoreWorldStamp();   /* MAIN THREAD - the world this game is in now (townrefill::WorldStamp of its world name and the world id it holds); an unsent REFILLED or RECORD_GONE waits with it */
 std::string StoreGoneTownReport();   /* the goneTown[...] counts for the [TG] report line (plain counter reads) */
@@ -70,6 +75,7 @@ int StoreRecordsHomedAt(const std::string& buildingKey);   /* MAIN THREAD - livi
 int StoreTownGoneThisLaunch(const std::string& townSid);   /* MAIN THREAD - groups of this town this game deleted since it started */
 std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id */
 std::string StoreTestCommand(const std::string& arg);   /* TEST-ONLY (storetest verb), main thread: storetest nopos <worldId or part of one> | storetest nopos off */
+std::string DialoguePauseTestCommand(const std::string& arg);   /* TEST-ONLY (talkpause verb), main thread: talkpause on|off - a conversation window pauses the game as in single player */
 void NoteTownPeople(const std::string& worldId, const std::string& town);   /* main thread: a received note names its home town ("" = none) */
 std::string StoreWorldIdOf(void* platoon);   /* P4p: the group's id string (Platoon+0x78), "" if unreadable */
 // P1b (b): the platoon is being destroyed by us (a live announcement superseded a sleeping copy) - forget it.
@@ -78,14 +84,17 @@ void StoreUnbindPlatoon(void* platoon);
 void* FindSleepingPlatoon(::Faction* f, const std::string& worldId);
 void* FindAwakePlatoon(::Faction* f, const std::string& worldId);      // P3: the faction's ACTIVE list, by id (0 if none)
 long StoreWorldGenNow();            /* inv7e2 fold: this game's world-load generation (g_worldGen) */
+unsigned int StoreWorldLoadAgeMs(); /* ms since this game's current world load reached its first running tick; squadorigin.h kLoadAgeUnknown before that. Any thread. */
 void StoreNoteLinkDown();           /* inv7e2 fold: the game link went down / the session was left - remember the world-load generation. Any thread. */
 long StoreWorldGenAtLinkDown();     /* inv7e2 fold: -1 until the first link down */
 int PlatoonSessionMemberUids(void* platoon, unsigned int* out, int cap);   /* inv7e2: the session uids of the live members; -1 = unreadable or more than cap */
 int StorePlatoonMineMembers(void* platoon);   /* M7a3f4 item 1 [m7a3f4-sh0]: live members this game runs (retired-before-destroy rows too); -1 = unreadable */
+int StoreIsWakeDup(void* platoon);   /* 1 = a save copy whose wake was refused beside this game's live copy of the squad (its people are not adopted; it is destroyed); MAIN THREAD */
 int PlatoonHasSessionMembers(void* platoon);                          // section 13: 1 if any live member is a session uid
-int StoreIdBlockOwner(const std::string& worldId, int* mySlot);      /* inv7a3: the relay slot that minted this id (-1 = no answer); *mySlot = this game's slot (-1 = no relay) */
+int StoreIdOriginSlot(void* faction, const std::string& worldId, const void* skip, int* mySlot, int* numberBlock, int* why);   /* the squad's origin slot (squadorigin.h: its number's block, or for a save squad the game that runs it now; -1 = no answer); skip = a platoon not to read; *mySlot = this game's slot (-1 = no relay); *numberBlock = the number's own block; *why = the source that decided it (sqorigin::kBy...) */
 int StorePlatoonActiveChars(void* platoon);                           /* inv7a3: the platoon's live member count, -1 if unreadable */
 int StoreRetireLocalCopy(void* platoon);
+int StorePlatoonBound(void* platoon);   /* 1 = the store keeps this squad (it answers 'persistent' for it), 0 = the engine's own rule decides. MAIN THREAD */
 void StoreOrphanEmptiedSquad(void* faction, void* active);   /* T-300 fix 2, MAIN THREAD: the orphan purge removed people of this ActivePlatoon - another game's file-built squad in an area another game holds is thrown away once empty; a world NPC squad's copy forgets its record stamp once empty (squadwriter.h NpcPurgeForgetStamp) */
 bool PlatoonWipe(const std::string& worldId);
 // E30-3 (P6p) lever, MAIN THREAD: quit through the GAME'S OWN pause-menu exit path, so a harness run
@@ -153,6 +162,30 @@ void StoreNoteCatchupAnswer(bool decoded, bool sent, long long chars);
 void WorldsyncCatchupAsk(const std::vector<char>& payload);
 bool StoreSendTeam(const std::vector<char>& payload);   /* T-546 step 3: MAIN THREAD - an encoded TEAM request to the world server; false = the link is down */
 bool StoreSendFallen(const std::vector<char>& payload);   /* T-556: MAIN THREAD - an encoded FALLEN request (ADD / TAKE / ASK) to the world server; false = the link is down */
+// T-810 (money.cpp; src/common/moneywire.h): this game's money and the ledger its pp.money record carries. MAIN THREAD.
+// StoreMoneyReady: 1 = the money may change now - a records store open and writing, a live world, no records restore waiting,
+// the money record neither off nor held, and the ledger read from the store (else 0, *why says what is missing).
+// StoreMoneyLedger: the ledger the next pp.money write carries (0 while it is not read for this store, world and load).
+// StoreMoneyRead: 1 = *money read. StoreMoneyTake: the game's own take (Ownerships::takeMoney) - 1 taken, 0 refused (short),
+// -1 no purse or a fault. StoreMoneyAdjust: the purse moved by `delta` in place, as the records restore sets it - 1 done, 0 it
+// would pass an int, -1 no purse. StoreMoneyWriteNow: pp.money handed to the writer now, *seq its number; false = not written.
+// StoreMoneyOnDisk: the write numbered `seq` (0 = one read from disk) is on disk. StoreSendMoney: one MONEY message to the
+// world server (false = the link is down). StoreMoneyLink: the welcomed link's number, -1 while there is none.
+int  StoreMoneyReady(std::string* why);
+moneyw::Ledger* StoreMoneyLedger();
+int  StoreMoneyRead(int* money);
+int  StoreMoneyTake(int amount);
+int  StoreMoneyAdjust(int delta);
+bool StoreMoneyWriteNow(unsigned long long* seq);
+bool StoreMoneyOnDisk(unsigned long long seq);
+bool StoreSendMoney(unsigned type, const std::vector<char>& payload);
+long StoreMoneyLink();
+// StoreMoneyEdge: a number raised by every WELCOME, link going down and profile pick - what came on the link before it is
+// another WELCOME's. StoreMoneyBaseReads: raised each time the ledger is taken anew (another world load, store or profile).
+// StoreMoneyReady also answers 0 ("game-saving") from a save's request until it lands - no money moves while a save is made -
+// and ("ledger-write") until a ledger taken from the loaded save is handed to the pp.money writer.
+long StoreMoneyEdge();
+long long StoreMoneyBaseReads();
 bool StoreSendWorldRel(const std::vector<char>& payload);   /* par24: MAIN THREAD - an encoded WORLD_REL (SEED or CHANGE) to the notebook; false = the link is down */
 bool StoreSendTownBar(const std::vector<char>& payload);   /* refill1: MAIN THREAD - encoded TOWN_BAR rows to the notebook; false = the link is down */
 bool StoreSendOwed(const std::vector<char>& payload);   /* T-581: MAIN THREAD - one encoded OWED up message (src/common/owedpop.h); false = the link is down */
@@ -446,8 +479,14 @@ bool StoreOwnRestorePending();
    StoreResearchQueue: this game's research queue now, front first (stringID, progress), and as text. StoreResearchQueueTech:
    TEST-ONLY - the engine's own Research::addToQueue (the research screen's "add"); "" = queued, else why not (*detail: the
    research level). StoreResearchNameOf: a tech's name in this game's data (the stringID when it has none). StoreResearchLevel:
-   this game's research level now (Research+0x170, what the queue's "add" checks a tech's level against), -1 = unreadable. */
+   this game's research level now (Research+0x170, what the queue's "add" checks a tech's level against), -1 = unreadable.
+   StoreResearchBenchLevel: the level this game's OWN research benches give - the highest level the engine passed to
+   Research::setLevel since the world was loaded (its only caller is a player-faction bench's completion; the mod's own setLevel
+   calls are not counted), -1 when the setLevel hook is not installed. StoreResearchRaiseLevel: this game's level raised to `level`
+   through the engine's setLevel (raise only; not counted as a bench's); "" = done (*now = the level after), else why not. */
 int StoreResearchLevel();
+int StoreResearchBenchLevel();
+std::string StoreResearchRaiseLevel(int level, int* now);
 void StoreResearchTakeOwnFinished(std::vector<std::string>* out, long long* dropped);
 bool StoreResearchFinished(std::vector<std::string>* sids, long long* queued, std::string* why);
 std::string StoreResearchLoadUnion(const std::vector<std::string>& team, int* added, std::string* detail);
@@ -530,6 +569,11 @@ int ItQueueReplayBox(const std::vector<char>& payload);
 int DoorsQueueReplay(const std::vector<char>& payload);
 
 bool StoreRelayLinked();                                 // the relay link is up   // decision 30: a faction's bitmap arrived (OR-merged)                           // decision 28: the host's "world listed" marker arrived   // P4e: a gone mark arrived
+/* the game in `slot` answered NOT-LIVE for a person whose copy here stood in the context platoon of squad `worldId` (net/session.cpp's
+   roster withdrawal): noted, so the context removal re-creates the squad from its record when that platoon is destroyed (CtxDropTick). MAIN THREAD */
+void StoreNoteRunnerWithdrew(const std::string& worldId, int slot);
+/* a new context platoon was made for squad `worldId` (spawn.cpp): its NOT-LIVE note, if any, is forgotten. MAIN THREAD */
+void StoreForgetRunnerWithdrew(const std::string& worldId);
 int StoreRecreateSleepingFromRecord(const std::string& worldId);   // F492: after a peer drop, the last sleep record becomes the sleeping copy again                              // section 13: engine-unload this save's own awake copy (no record)
 // A record from the peer (net): stored, and applied to a local sleeping squad of that id.
 void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, const std::string& factionName,

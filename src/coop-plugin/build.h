@@ -23,6 +23,8 @@ std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAI
 std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
 std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | link <key-substring> | list` - found / link armed for the K2 safe point, list read now
 void BuildTownsNote(const char* p, size_t n);            // OUTPOSTS, MAIN THREAD (store.cpp): a TOWNS LIST from the world server - the kept outposts and their pieces' keys
+void BuildShowNote(const char* p, size_t n);             // T-811, MAIN THREAD (store.cpp): a SHOW from the world server - the teammates' outposts, shown at the next drain
+void BuildShowBeforeSave(int onMainThread);              // T-811 (store.cpp saveGame pre-hook): counts the bases founded here still standing at the save (no engine write)
 std::string BuildKeptListCommand();                  // KEPT, TEST-ONLY, MAIN THREAD, read-only: `keptlist` - the kept rows this game holds, their state, claims and the key search here
 std::string StandInCommand(const std::string& arg);     // TEST-ONLY, MAIN THREAD: `standin <slot> [read]` - make (or take into the table) / read back that player's stand-in and the loaded buildings it owns
 std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction
@@ -30,6 +32,8 @@ std::string BuyHouseCommand(const std::string& arg);   /* P18 fold 1: TEST LEVER
 int BuildRecordedOwnerSlot(const char* key);          // build1h, MAIN THREAD: the owner slot the build registry recorded for the piece at this P7n key (own rows: my slot); -1 none                       // MAIN THREAD, read-only: `buildlist` - the registry with live values
 int  BuildMadeHere(const char* key, double* placedSince);   // MAIN THREAD: 1 = this game placed the piece at this key itself in the world now loaded and it is still its own; *placedSince = the area's "loaded since" stamp at the placement
 int  BuildRowPendingFor(void* building);              // MAIN THREAD: another game's PLACE or STATE (a copy, or an owner change such as a purchase) for this piece still waits here - 1 yes, 0 no, -1 key unreadable
+int  BuildHomeDropPod(void* platoon, void* building);   // MAIN THREAD, review MED 2: the group's home dropped when it names the building (Ownerships::removeOwnedObject, the engine purchase's first step) - 1 called, 0 no row / nothing, -1 faulted
+int  BuildKeyPlayerPiece(const char* key);            // MAIN THREAD: the build records name a player as the owner of the piece at this P7n key (a live row of this world, an own row waiting to be restored, a copy-list entry) - 1 yes, 0 no, -1 off the main thread or no key
 void ReportBuild();                                   // one [BUILD] REPORT line (the `report` fan-out)
 /* mmo8a (mmo8-buildings-read.md 5): the buildings this player owns, kept in the own-records store as pp.build (store.cpp writes it) */
 void BuildOwnRows(std::vector<coopown::BuildRow>* rows, std::vector<std::string>* retired, int* skipped);   // MAIN THREAD: own rows (own, not a copy, not removed) as PLACE + STATE bytes; retired = own keys taken down here

@@ -41,13 +41,19 @@ void InstallEndActionProbe();
 void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
                     const char* damages24, int comboId,
                     const float* parts, int partCount, float blood,
-                    const ObjId& attackerId, bool knock);
+                    const ObjId& attackerId, bool knock, bool attackerPlayed = false);
 
 // P104 fix (protocol 104) - A CROSSBOW BOLT THAT STRIKES THIS GAME'S CHARACTER ON THE OTHER GAME IS PLAYED HERE.
 // session.cpp OnShot hands every MSG_SHOT here (MAIN THREAD): refusal 0 = we drive the victim and the sender drives the shooter;
 // 1 = the victim is not ours, 2 = the sender does not drive the shooter, 3 = it did not decode (uids 0, rec4 0). Counted and
 // logged here; accepted ones are queued for ShotSafePointDrain.
 void ShotOnNet(unsigned int victimUid, unsigned int shooterUid, const float* rec4, bool onPurpose, int refusal);
+// MSG_MELEE_DECIDED - another game's player character's melee blow on our NPC, decided on that game. session.cpp OnMeleeDecided hands
+// every one here (MAIN THREAD): refusal 0 = we run the victim and the sender runs the attacker; 1 = the victim is not ours, 2 = the
+// sender does not run the attacker, 3 = it did not decode (uids 0, damages6 0). Counted and logged here; accepted ones wait for the
+// K2 safe point (ShotSafePointDrain), where the wound goes through MedicalSystem::addWound and a HIT goes to every game.
+void MeleeOnNet(unsigned int victimUid, unsigned int attackerUid, int cutDir, int comboId, const float* damages6,
+                unsigned char techFlag, int refusal);
 // M7a (T-197 piece 7a): the catch-up's combat mode - an owned character whose last sampled edge was ON against a replicated
 // target says so again (the caller has addressed the stream, net::CharStreamToSlot). false = not fighting / not sent. MAIN THREAD.
 bool CombatModeResendOwned(unsigned int uid);

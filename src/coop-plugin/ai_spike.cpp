@@ -36,6 +36,7 @@
 #include "store.h"     // AUD: EngineWritesBlocked (interlocked reads, any thread)
 
 #include "coop_log.h"
+namespace { swlogbudget::Gate g_qM2bSuppressed, g_qM2bReleased; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/CharMovement.h"
 
@@ -212,7 +213,7 @@ static void ApplyDirectDrive(Character* self)
 
     LONG left = InterlockedDecrement(&g_driveFrames);
     if (left == 0)
-        DebugLog("[P006] drive: finished");
+        SW_DEVLOG("[P006] drive: finished");
 }
 
 // SEH cannot coexist with C++ object unwinding in one function, so the guarded call
@@ -530,7 +531,7 @@ void detour_update(Character* self)
             }
             InterlockedExchangePointer((PVOID volatile*)&g_target, self);
             if (autoWatch) ++g_targetAutoCaptured; else ++g_targetVerbCaptured;
-            DebugLog(std::string("[P006] captured target ") + Ptr(self)
+            SW_DEVLOG(std::string("[P006] captured target ") + Ptr(self)
                      + " ai=" + Ptr((const void*)g_targetAI)
                      + (autoWatch ? " (player-squad)"
                                   : (g_wantPlayer ? " (player-squad)" : " (any character)"))
@@ -764,7 +765,7 @@ void ReportSuppression()
 bool DriveTarget(float dx, float dz, int frames)
 {
     Character* t = GetTarget();   /* the engine still knows it this frame */
-    if (t == 0) { DebugLog("[P006] drive: no target captured"); return false; }
+    if (t == 0) { SW_DEVLOG("[P006] drive: no target captured"); return false; }
 
     CharMovement* mv = t->movement;
     if (!LooksLikeObject(mv))
@@ -794,7 +795,7 @@ bool DriveTarget(float dx, float dz, int frames)
 bool MoveTarget(float dx, float dz)
 {
     Character* t = GetTarget();   /* the engine still knows it this frame */
-    if (t == 0) { DebugLog("[P006] move: no target captured"); return false; }
+    if (t == 0) { SW_DEVLOG("[P006] move: no target captured"); return false; }
 
     CharMovement* mv = t->movement;
     if (!LooksLikeObject(mv))
@@ -886,7 +887,7 @@ void SuppressCharacter(::Character* c, bool on)
                 g_gated[i].armGen = NextPulseGen();   // G1-c fold L1: a new slot is never an old pulse's
                 RaiseGatedHigh((LONG)(i + 1));   // T-354 fold 1: the mark covers slot i BEFORE `ai` is published
                 InterlockedExchangePointer((PVOID volatile*)&g_gated[i].ai, ai);
-                DebugLog("[M2b] decisions SUPPRESSED for character " + Ptr(c)
+                SW_QUIETLOG(g_qM2bSuppressed, "[M2b] decisions SUPPRESSED", 0, 0, "[M2b] decisions SUPPRESSED for character " + Ptr(c)
                          + " ai=" + Ptr(ai) + " (slot " + Num(i) + ")");
                 return;
             }
@@ -900,7 +901,7 @@ void SuppressCharacter(::Character* c, bool on)
         InterlockedExchangePointer((PVOID volatile*)&slot->ai, 0);
         slot->pulses = 0;
         slot->ch = 0;
-        DebugLog("[M2b] decisions RELEASED for character " + Ptr(c));
+        SW_QUIETLOG(g_qM2bReleased, "[M2b] decisions RELEASED", 0, 0, "[M2b] decisions RELEASED for character " + Ptr(c));
     }
 }
 
@@ -1102,31 +1103,31 @@ void ReleaseSuppression()
     InterlockedExchangePointer((PVOID volatile*)&g_targetAI, 0);
     InterlockedExchange(&g_suppressOn, 0);
     InterlockedExchange(&g_freezeOn, 0);
-    DebugLog("[P006] released: no target, no suppression, no freeze");
+    SW_DEVLOG("[P006] released: no target, no suppression, no freeze");
 }
 
 void InstallAiSpike()
 {
-    DebugLog("[P006] resolving Character::threadedUpdate ...");
+    SW_DEVLOG("[P006] resolving Character::threadedUpdate ...");
     intptr_t tu = (intptr_t)coop::AddrAbs(kMig3CharThreadedUpdate);
-    DebugLog("[P006] threadedUpdate target = " + Ptr((void*)tu));
+    SW_DEVLOG("[P006] threadedUpdate target = " + Ptr((void*)tu));
 
-    DebugLog("[P006] resolving Character::update ...");
+    SW_DEVLOG("[P006] resolving Character::update ...");
     intptr_t up = (intptr_t)coop::AddrAbs(kMig3CharUpdate);
-    DebugLog("[P006] update target = " + Ptr((void*)up));
+    SW_DEVLOG("[P006] update target = " + Ptr((void*)up));
 
-    DebugLog("[P006] resolving AI::periodicTick ...");
+    SW_DEVLOG("[P006] resolving AI::periodicTick ...");
     intptr_t ap = (intptr_t)coop::AddrAbs(kMig3AiPeriodicUpdate);
-    DebugLog("[P006] AI::periodicUpdate target = " + Ptr((void*)ap));
+    SW_DEVLOG("[P006] AI::periodicUpdate target = " + Ptr((void*)ap));
 
     // P026. Resolved and reported separately, and its failure is NOT fatal to the spike - this
     // is an instrument, and a missing instrument must not take the suppression gate down with
     // it. Expected real RVA 0x60C9E0 (resolve_stub slot 2157); the log prints what it got so a
     // wrong resolution is visible in the run rather than assumed away (F037).
-    DebugLog("[P026] resolving CombatClass::periodicTick ...");
+    SW_DEVLOG("[P026] resolving CombatClass::periodicTick ...");
     intptr_t cp = (intptr_t)coop::AddrAbs(kMig3CombatPeriodicUpdate);
     uintptr_t imgBase = (uintptr_t)::GetModuleHandleA(0);
-    DebugLog("[P026] CombatClass::periodicUpdate target = " + Ptr((void*)cp)
+    SW_DEVLOG("[P026] CombatClass::periodicUpdate target = " + Ptr((void*)cp)
              + " rva=" + Ptr((void*)((uintptr_t)cp > imgBase ? (uintptr_t)cp - imgBase : 0))
              + " EXPECTED rva 0x60C9E0");
 
@@ -1155,9 +1156,9 @@ void InstallAiSpike()
     // suppression gate down with it. The expected RVA is compared rather than merely printed, for
     // the reason P045 learned the hard way - a counter measuring a different function carries the
     // name of one and the calls of another.
-    DebugLog("[P058] resolving AI::frameTick4 ...");
+    SW_DEVLOG("[P058] resolving AI::frameTick4 ...");
     intptr_t af = (intptr_t)coop::AddrAbs(kMig3AiUpdate4Frame);
-    DebugLog("[P058] AI::frameTick4 target = " + Ptr((void*)af)
+    SW_DEVLOG("[P058] AI::frameTick4 target = " + Ptr((void*)af)
              + " rva=" + Ptr((void*)((uintptr_t)af > imgBase ? (uintptr_t)af - imgBase : 0))
              + " = the loaded table's AI_frameTick4 row (table '" + coop::AddrTableName() + "'; resolve_stub slot 141 -"
                " the slot ADJACENT to AI::periodicTick, which is slot 142)");
@@ -1174,7 +1175,7 @@ void InstallAiSpike()
         unsigned char afAfter[8];
         ::memcpy(afAfter, (const void*)af, sizeof(afAfter));
         const bool afPatched = (::memcmp(afBefore, afAfter, sizeof(afBefore)) != 0);
-        DebugLog(std::string("[P058] AI::frameTick4 AddHook ")
+        SW_DEVLOG(std::string("[P058] AI::frameTick4 AddHook ")
                  + (e == coop::SUCCESS ? "SUCCESS" : "FAILED")
                  + " prologuePatched=" + Num(afPatched ? 1 : 0)
                  + "  - **patched=0 means the trampoline did NOT arm**, whatever AddHook returned,"
@@ -1235,7 +1236,7 @@ void AiSpikeWorldTeardown()
     }
     InterlockedExchange(&g_gatedHigh, 0);   // T-354 fold 1: AFTER the clear - the next world's claims start the mark again
 
-    DebugLog(std::string("[P006] world teardown: forgot the watched target (")
+    SW_DEVLOG(std::string("[P006] world teardown: forgot the watched target (")
              + (hadTarget ? "one was armed" : "none was armed") + ") and " + Num((long long)gated)
              + " AI gate slots; this instance has no player load centre until re-armed - when the configured"
                " role is host or client the mod re-arms itself once a world runs again (AUD)");

@@ -37,6 +37,7 @@
 #include "playerstab.h" /* T-545: the PLAYERS tab, other players' factions on the FACTION tab */
 #include "fallentab.h"   /* T-556: the FALLEN tab */
 #include "chat.h"        /* in-game text chat */
+#include "money.h"       /* T-810: money between players */
 #include "titleart.h"  /* T-513: the mod's own title-screen art */
 #include "config.h"   /* E38 / decisions 42-43: shared_wastelands.cfg - the role and the addresses */
 #include "addresses.h" /* P8h: the executable fingerprint and its address table - the gate below */
@@ -155,6 +156,31 @@ static void TickWaitAi(GameWorld* gw)
     if (us > g_twUsMax) g_twUsMax = us;
 }
 
+/* 1 the AI worker is running, 0 idle (or no worker object yet), -1 faulted. No C++ object in this function (C2712). */
+static int AiWorkerBusyRaw(void* gw)
+{
+    __try
+    {
+        void* thr = *(void**)((char*)gw + 0x790);
+        if (thr == 0) return 0;
+        AiThreadFn busy = (AiThreadFn)((char*)::GetModuleHandleA(0) + kAiThreadBusyRva);
+        return busy(thr) != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+namespace coop {
+/* T-804: the engine's own AI-worker test, the gate GameWorld::mainLoop and the dialogue window updates use (0x25C690 on the
+   thread object at GameWorld+0x790): 1 running, 0 idle, -1 cannot be told (no address row, no world, a fault). MAIN THREAD
+   (speech.cpp's portrait hold asks it before letting the engine's portrait render run). */
+int AiWorkerBusyNow()
+{
+    ::GameWorld* const gw = coop::GameWorldPtr();
+    if (kAiThreadBusyRva == 0 || gw == 0) return -1;
+    return AiWorkerBusyRaw(gw);
+}
+}
+
 namespace coop {
 std::string TickWaitToken()
 {
@@ -232,6 +258,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::FallenTabTick();    /* T-556: the FALLEN tab after PLAYERS, kept current while it shows; a confirmed bring-back runs */
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
+    coop::MoneyTick();        /* T-810: money between players - given back, added, acknowledged, sent once on disk */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
 }
 
@@ -239,7 +266,7 @@ static void installProbeP001()
 {
     // Log BEFORE resolving, so a fault while resolving is preceded by its line (F032). The target is our
     // table row GameWorld_gpuFrame.
-    DebugLog("[P001] resolving mainLoop_GPUSensitiveStuff via the address table...");
+    SW_DEVLOG("[P001] resolving mainLoop_GPUSensitiveStuff via the address table...");
 
     intptr_t target = (intptr_t)coop::AddrAbs(kMig3MainLoopGpu);
 
@@ -280,12 +307,12 @@ static void detour_initGameData(GameWorld* thisptr)
     orig_initGameData(thisptr);
 
     probeOu("after initialisationGameData");
-    DebugLog("[P002] initialisationGameData returned");
+    SW_DEVLOG("[P002] initialisationGameData returned");
 }
 
 static void installProbeP002()
 {
-    DebugLog("[P002] resolving initialisationGameData via the address table...");
+    SW_DEVLOG("[P002] resolving initialisationGameData via the address table...");
     intptr_t target = (intptr_t)coop::AddrAbs(kMig3InitGameData);
 
     std::stringstream ss;
@@ -390,7 +417,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
    answer into this same row (or left it 0), so this one path serves both. */
 static bool installProbeP005()
 {
-    DebugLog("[P005] resolving TitleScreen::update via the address table row (or, with no usable table, the byte pattern)...");
+    SW_DEVLOG("[P005] resolving TitleScreen::update via the address table row (or, with no usable table, the byte pattern)...");
     intptr_t target = (intptr_t)coop::AddrAbs(kMig3TitleUpdate);
 
     std::stringstream ss;
@@ -439,7 +466,7 @@ namespace coop {
 static unsigned long long kCoPlayerIfaceRva = 0; static coop::AddrReg kCoPlayerIfaceRva_reg("PlayerInterfaceGlobal", &kCoPlayerIfaceRva);   /* stage 7/9: the address table fills this. Steam_1.0.65 0x2133630 */
 bool SetWorldAIFreeze(bool on)
 {
-    if (coop::GameWorldPtr() == 0) { DebugLog("[P008] aifreeze: ou is null"); return false; }
+    if (coop::GameWorldPtr() == 0) { SW_DEVLOG("[P008] aifreeze: ou is null"); return false; }
 
     void* viaWorld  = *(void**)((char*)coop::GameWorldPtr() + 0x580);
     if (kCoPlayerIfaceRva == 0) { DebugLog("[P008] aifreeze: PlayerInterfaceGlobal is not in the address table"); return false; }
@@ -454,7 +481,7 @@ bool SetWorldAIFreeze(bool on)
     unsigned char* flag = (unsigned char*)viaWorld + 0x2F0;
     int before = *flag;
     *flag = on ? 1 : 0;
-    DebugLog(std::string("[P008] world AI freeze ") + (on ? "ON" : "OFF")
+    SW_DEVLOG(std::string("[P008] world AI freeze ") + (on ? "ON" : "OFF")
              + ": characterEditorMode " + fmtNum(before) + " -> " + fmtNum(*flag));
     return true;
 }
@@ -798,6 +825,7 @@ static void startPluginOn(const char* road)
     coop::InstallFactionNameHooks();   /* T-368: the FACTION tab refuses a faction name another player of this world holds (Kenshi's own box) */
     coop::InstallCapture();    /* P11: task bodies 0x35A9C0 / 0x34E750 + the strip / dress / owner / shave hooks */
     coop::InstallSlaves();     /* slave1: setSlaveState 0x5A3EB0 + StateBroadcastData::periodicUpdate 0x5A44C0 */
+    /* PROBE P140 BEGIN */ coop::InstallP140();   /* T-806: who starts the cage-use task (0x357FE0), log only */ /* PROBE P140 END */
     coop::InstallHire();       /* recruit1 R0-a: Dialogue::_doActions 0x67FAD0, LOG ONLY */
     coop::InstallWorldGen();
     logHookCounts();   /* mig1: every install above went through coop::AddHook (hooks.cpp, our own MinHook) */

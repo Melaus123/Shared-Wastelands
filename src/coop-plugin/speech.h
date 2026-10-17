@@ -42,6 +42,9 @@ void CrimeTestDrain();
 std::string TalkTestArm(const std::string& arg);
 void TalkTestDrain();
 std::string TalkCountsString();
+/* T-831: before this mod removes character c - a conversation the dialogue window shows whose owner, target or stored
+   character is c ends first through the engine's endDialogue (src/common/dlgwinguard.h). MAIN THREAD; elsewhere a no-op. */
+void TalkWindowBeforeRemove(void* c);
 /* P26 stage 6 talksight (TEST-ONLY levers, speech.cpp 'TALKSIGHT LEVER'). MAIN THREAD (the command channel).
    TalkSightArm: `talksight <npcUid | nearest <dialogueName>> <targetUid> [seconds] [walkover]` - checks and arms; TalkTestDrain tries
    Dialogue::sendEvent(event 3) at every K2 safe point. When the NPC is not loaded yet (the uid is not here / no carrier near the
@@ -62,9 +65,10 @@ std::string TalkCarriersCommand(float x, float z, float radius);
    LeverNearestNamed: the nearest loaded character (2D) within maxDist of `from` (0 = this game's first own player character)
    whose display name keys as nameKey (coopsay::TalkPersonKey). kLeverPickOwnLiving: this game's own, living, non-player, with a
    uid (crimetest bountyset's person, koself name); kLeverPickAny: any (crimetest bountyset's law NPC); kLeverPickDowned: living
-   and down (prone or ragdoll), either game's (capturetest carry name). *uid (0 = not replicated), *dist, *name = its display
+   and down (prone or ragdoll), either game's (capturetest carry name); kLeverPickDead: dead, either game's (cursortest
+   deadname:). *uid (0 = not replicated), *dist, *name = its display
    name; 0 = none (*why says so in words). */
-const int kLeverPickOwnLiving = 0, kLeverPickAny = 1, kLeverPickDowned = 2;
+const int kLeverPickOwnLiving = 0, kLeverPickAny = 1, kLeverPickDowned = 2, kLeverPickDead = 3;
 std::string TalkCarriersActCommand(float x, float z, float radius, int ev, int act);
 ::Character* LeverNearestNamed(const std::string& nameKey, int pick, ::Character* from, float maxDist, unsigned int* uid, float* dist,
                                std::string* name, std::string* why);
@@ -100,6 +104,9 @@ bool TalkDeferTargetActs(void* dlg, void* line);
    TalkS6LeaderOrder, AFTER the original - gives that order exactly as the engine does for a player target. Defined in speech.cpp. */
 void* TalkS6LeaderTarget(void* dlg, void* line);
 void TalkS6LeaderOrder(void* dlg, void* target);
+/* hire.cpp detour_doActions, OFF THE MAIN THREAD only, before the original: counts (log-only) a line carrying an action that
+   builds or opens a window (0x1 trade, 0xB character editor, 0x29/0x2A/0x2B/0x30 popup); changes nothing. Defined in speech.cpp. */
+void TalkNoteOffMainActs(void* dlg, void* line);
 /* P26 stage 5 - defined in hire.cpp, namespace coop. HireCallDoActions: the engine's _doActions through the trampoline (1 ran,
    0 no trampoline, -1 faulted). HireForTalk: B - the other game's NPC hires itself into this game's squad through the
    owner-applied hire road (1 asked, 0 not: *why). MAIN THREAD. */

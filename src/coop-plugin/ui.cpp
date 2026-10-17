@@ -631,6 +631,8 @@ static std::string      g_fNewWorld;           /* the New world box */
 static std::string      g_dlgText;             /* what the open dialog says */
 static std::string      g_dlgTail;             /* RESET WORLD?'s last paragraph, under its tick box */
 static std::string      g_nbWorld;             /* the folder of the world this computer's helper was started for ("" = none) */
+static std::string      g_nbLogPath;           /* the log file of the world server this game last started; kept after it ends, so a bug
+                                                  report made after the server stopped or crashed still carries its log ("" = none) */
 static volatile LONG64  g_worldScans = 0, g_worldsListed = 0, g_worldsSkipped = 0, g_worldsCreated = 0, g_worldCreateFailed = 0;
 static volatile LONG64  g_worldsDeleted = 0, g_worldDeleteRefused = 0, g_worldDeleteFailed = 0;
 static long            g_worldDlg = 0;         /* the dialog screen 4 shows: coopui::kWorldDlgReset = RESET WORLD?, else DELETE WORLD? */
@@ -2577,6 +2579,12 @@ static int PanelStartNotebook(unsigned short port)
     g_nbStopping = 0;
     g_nbState    = coopui::kNbStarting;
     g_nbWorld    = coopworld::WorldFolderName(worldArg);   /* mp3: the world this computer's helper now runs (F874 note, Delete refusal) */
+    /* the world server writes its log in the folder it builds from --root and --world (store_main.cpp: WorldDirIn), so the same
+       construction from the same two arguments names that file */
+    {
+        const std::string serverDir = coopworld::WorldDirIn(rootArg, worldArg);
+        g_nbLogPath = serverDir.empty() ? std::string() : serverDir + "\\" + swnames::kServerLog;
+    }
     g_nbExitCode = 0;
     ::InterlockedIncrement64(&g_panelNbSpawned);
     DebugLog("[UI] the MULTIPLAYER panel started the world's notebook: " + exe + " --world " + worldArg + " (its folder " + sdir + ")"
@@ -7866,6 +7874,7 @@ void UiTitleScreenNote(void* title)   /* T-220: title pump only (detour_titleUpd
     g_titleSeenAtMs = ::GetTickCount();
 }
 void UiJoinPasswordFromLeverOnce() { g_joinPwFromLever = 1; }   /* T-290: TEST-ONLY, the joinpw lever (MAIN THREAD) */
+std::string UiServerLogPath() { return g_nbLogPath; }   /* MAIN THREAD: see ui.h */
 int UiHostingNow(std::string* world)   /* MAIN THREAD: the HOSTING rule (PanelHostingNow); the world's listed name, else its folder */
 {
     if (!PanelHostingNow()) return 0;

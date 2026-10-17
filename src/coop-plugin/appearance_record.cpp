@@ -110,7 +110,7 @@ void ResolveOnce()
     g_getAppData = ResolveGetAppearanceData();
     g_setAppData = ResolveSetAppearanceData();
     g_updateApp  = ResolveUpdateAppearance();
-    DebugLog("[P020] resolved getAppearanceData=" + Hex(g_getAppData)
+    SW_DEVLOG("[P020] resolved getAppearanceData=" + Hex(g_getAppData)
              + " setAppearanceData=" + Hex(g_setAppData)
              + " updateAppearance=" + Hex(g_updateApp));
 }
@@ -129,7 +129,7 @@ void DumpVtableOnce(void* app)
     s_done = true;
 
     uintptr_t vt = *(uintptr_t*)app;
-    if (!Ptr((void*)vt)) { DebugLog("[P020] vtable UNREADABLE"); return; }
+    if (!Ptr((void*)vt)) { SW_DEVLOG("[P020] vtable UNREADABLE"); return; }
 
     uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     std::string out = "[P020] appearance vtable @" + Hex(vt) + " imageBase=" + Hex(base);

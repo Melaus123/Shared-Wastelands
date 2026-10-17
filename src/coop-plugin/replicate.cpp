@@ -33,6 +33,7 @@
 #include "net/session.h"
 
 #include "coop_log.h"
+namespace { swlogbudget::Gate g_qNcDrop, g_qFloor; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/CharMovement.h"
 #include <ogre/OgreVector3.h>
@@ -1424,7 +1425,7 @@ void LayerProbe(unsigned int uid, Character* ch, const Ogre::Vector3& got, int p
     float dl = fabsf(got.x - logical[0]) + fabsf(got.z - logical[2]);
     const char* agrees = (dl < 0.05f) ? "logical" : "NOT-logical";
 
-    DebugLog(std::string("[P023] uid=") + N2(uid) + " why=" + why
+    SW_DEVLOG(std::string("[P023] uid=") + N2(uid) + " why=" + why
              + " prone=" + N2(prone)
              + " savedPosition=" + F2(got.x) + "," + F2(got.y) + "," + F2(got.z)
              + " logical+0x48=" + F2(logical[0]) + "," + F2(logical[1]) + "," + F2(logical[2])
@@ -3344,8 +3345,12 @@ long long g_floorGated   = 0;   // stop points where the gate declined a placeme
 long long g_floorFaults  = 0;   // the copy's position could not be re-read: at the decision once per stop point, at the result each time
 long long g_floorCopyLines = 0, g_floorOwnLines = 0;   // [FLOOR] copy / own lines asked for (FloorLineDue)
 
-// A capped [FLOOR] line: the first 40, then every 50th.
+// A capped [FLOOR] line: the first 40, then every 50th (DEV build); the release build: the first few, then a count a minute.
+#ifdef SW_DEV_BUILD
 bool FloorLineDue(long long* n) { ++*n; return *n <= 40 || *n % 50 == 0; }
+#else
+bool FloorLineDue(long long* n) { ++*n; return QuietLogPass(&g_qFloor, "[FLOOR] copy/own", 0, 0); }
+#endif
 
 std::string FloorNum(int read, int v) { return read ? N2(v) : std::string("?"); }
 
@@ -3462,8 +3467,8 @@ bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector
         {
             p.floorW.gatedSaid = 1;
             ++g_floorGated; ++g_floorChecked;
-            if (FloorLineDue(&g_floorCopyLines))
-                DebugLog("[FLOOR] copy uid=" + N2(uid) + " dY=" + F2(dYLive) + " flat=" + F2(flatLive) + " not placed: " + why);
+            ++g_floorCopyLines;   /* a declined placement is always written in full (once per stop point), outside the shared cap */
+            DebugLog("[FLOOR] copy uid=" + N2(uid) + " dY=" + F2(dYLive) + " flat=" + F2(flatLive) + " not placed: " + why);
         }
         return false;
     }
@@ -3595,6 +3600,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                     if (downed) { if (rate > p.rcVisMaxRateDowned) p.rcVisMaxRateDowned = rate; }
                     else
                     {
+#ifdef SW_DEV_BUILD   /* a test probe: compiled into the DEV build only */
                         // PROBE-START: P019 - vis_peak: the frame that sets a new standing visible-rate maximum (hop investigation H041)
                         if (rate > p.rcVisMaxRate && rate > 90.0f)
                         {
@@ -3602,11 +3608,12 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                             const double wroteAgo = ProneWriteAgoSeconds(uid, tickNow);
                             float oft = -1.0f, ft = -1.0f; int vum = -1; ReadCharFrameTimesPod(p.ch, &oft, &ft, &vum);
                             char tqpc[32]; _snprintf(tqpc, 31, "%.3f", tickNow); tqpc[31] = 0;   // review-p019b HIGH-1: QPC seconds as a double - the cross-instance join on one box (the log prefixes are per-process)
-                            ++g_visPeakLines; DebugLog("[PROBE] vis_peak side=peer uid=" + N2(uid) + " tqpc=" + std::string(tqpc) + " frameDt=" + F3((float)(frameDt * 1000.0)) + "ms from=" + F2(p.rcVisLastX) + "," + F2(p.rcVisLastY) + "," + F2(p.rcVisLastZ)
+                            ++g_visPeakLines; SW_DEVLOG("[PROBE] vis_peak side=peer uid=" + N2(uid) + " tqpc=" + std::string(tqpc) + " frameDt=" + F3((float)(frameDt * 1000.0)) + "ms from=" + F2(p.rcVisLastX) + "," + F2(p.rcVisLastY) + "," + F2(p.rcVisLastZ)
                                      + " to=" + F2(cur.x) + "," + F2(cur.y) + "," + F2(cur.z) + " step=" + F3(vis) + " rate=" + F2(rate) + " prone=" + N2(proneNow) + " ragdoll=" + N2(SafeIsRagdoll(p.ch) ? 1 : 0)
                                      + " layerGapPrev=" + F3(p.rcLayerGapLast) + " proneWriteAgoMs=" + (wroteAgo < 0.0 ? std::string("none") : F2((float)(wroteAgo * 1000.0))) + " ft=" + F3(ft * 1000.0f) + "ms oft=" + F3(oft * 1000.0f) + "ms vum=" + N2(vum));
                         }
                         // PROBE-END: P019
+#endif
                         if (rate > p.rcVisMaxRate) p.rcVisMaxRate = rate; if (rate > g_rcVisMaxRate) g_rcVisMaxRate = rate;
                     }
                 }
@@ -3728,7 +3735,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
         // `dist` here IS the drift after the snap.
         p.nativeSnapScorePending = false;
         const std::string q(1, (char)34);
-        DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "snap_scored" + q
+        SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "snap_scored" + q
                  + "," + q + "uid" + q + ":" + N2(uid)
                  + "," + q + "driftAfterSnap" + q + ":" + (Finite(dist) ? F2(dist) : std::string("-2.0"))
                  + "," + q + "ticksAfter" + q + ":" + N2(g_tick - p.nativeSnapTick)
@@ -4356,7 +4363,9 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                 {
                     FarUnloadedRow row; row.uid = uid; row.x = p.tx; row.y = p.ty; row.z = p.tz;
                     g_farUnloadedQueue.push_back(row);
-                    whyNot = "the owner's target is in an area this game has not loaded - the copy is retired and booked lost at that spot";
+                    /* the retire step (spawn.cpp RetireCopyOwnerUnloaded) refuses a shared-save twin: it is neither retired nor booked lost here [t761-twin-lost-line] */
+                    whyNot = IsTwinUid(uid) ? "the owner's target is in an area this game has not loaded - the copy is a shared-save twin: NOT retired and nothing booked lost (the retire step refuses a twin)"
+                                            : "the owner's target is in an area this game has not loaded - the copy is retired and booked lost at that spot";
                 }
             }
             else whyNot = SnapSharedGate(p, ageSec);
@@ -4462,6 +4471,16 @@ int StaleCopyKeepReason(unsigned int uid, Character* c)
     CharDbg cd;
     const int attached = (!ReadCharDbgFields(c, &cd) || cd.carried != 0 || cd.inSomething != 0) ? 1 : 0;
     return stalecopy::StaleCopyKeep(moveDrives ? 1 : 0, ragdolled ? 1 : 0, gaveUp, attached);
+}
+
+// See replicate.h. The carried word the far branch's keep reads (+0x3D4). The cage / bed / seat / building-slot word (+0x2F8) is not
+// read: the engine's own squad sleep (Platoon::deactivate, decomp_7ee910) puts a squad with such a member to sleep - it only records
+// whether a member's +0x2F8 reads 2.
+int CharCarried(Character* c)
+{
+    CharDbg cd;
+    if (!ReadCharDbgFields(c, &cd)) return -1;
+    return cd.carried != 0 ? 1 : 0;
 }
 
 bool ReplicateStart(unsigned int uid)
@@ -5218,7 +5237,7 @@ static void ProcessPendingHandoffs()
         const std::string want = TaskTypeName(hnd.wantType);
         const bool match = (after == want);
         if (match) { if (hnd.control) ++g_handoffControlMatched; else ++g_handoffMatched; }
-        DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "handoff" + q
+        SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "handoff" + q
                  + "," + q + "uid" + q + ":" + N2(hnd.uid)
                  + "," + q + "control" + q + ":" + N2(hnd.control)
                  + "," + q + "wantType" + q + ":" + N2(hnd.wantType)
@@ -6279,14 +6298,14 @@ bool AttackLocal(unsigned int attackerUid, unsigned int victimUid, int taskType)
         if (treatsAsEnemy != 0)
         {
             bool enemy = treatsAsEnemy(ai, victim);
-            DebugLog(std::string("[P010] attacker uid=") + N2(attackerUid)
+            SW_DEVLOG(std::string("[P010] attacker uid=") + N2(attackerUid)
                      + " considers victim uid=" + N2(victimUid)
                      + (enemy ? " an ENEMY (attack is plannable)"
                               : " NOT an enemy (H007: GOAP requirement would fail)"));
         }
         else
         {
-            DebugLog("[P010] treatsAsEnemy unresolved - relationship not measured");
+            SW_DEVLOG("[P010] treatsAsEnemy unresolved - relationship not measured");
         }
     }
 
@@ -6495,8 +6514,11 @@ void DropPuppet(unsigned int uid, bool restoreSpeed)
         {
             SuppressCharacter(p.ch, true);
             regated = IsSuppressed(p.ch);   // the gate can refuse (slots full, AI unreadable)
-            DebugLog("[NC] window closed by DROP uid=" + N2(uid)
-                     + (regated ? " - AI re-gated before forgetting" : " - RE-GATE REFUSED, AI left free"));
+            if (regated)
+                SW_QUIETLOG(g_qNcDrop, "[NC] window closed by DROP", 0, 0, "[NC] window closed by DROP uid=" + N2(uid)
+                         + " - AI re-gated before forgetting");
+            else   /* a refusal is always written in full */
+                DebugLog("[NC] window closed by DROP uid=" + N2(uid) + " - RE-GATE REFUSED, AI left free");
         }
         else
         {
@@ -6994,6 +7016,12 @@ float PuppetWindowDriftNow(unsigned int uid)
     return Finite(d) ? d : -1.0f;
 }
 
+// The distance past which a copy counts as LOST from its owner's last streamed position (the drive's own far test).
+float PuppetLostDistance() { return kLostDist; }
+
+// The distance past which the drive starts correcting a copy: the catch-up's entry (kCatchupEnter, far above the steady lag).
+float PuppetCorrectDistance() { return kCatchupEnter; }
+
 // The owner's last streamed position for a copy driven here as a puppet - where the owner's character stands (or lies) now.
 bool PuppetAuthorityPos(unsigned int uid, float* x, float* y, float* z)
 {
@@ -7019,6 +7047,16 @@ bool PuppetFreshAuthorityPos(unsigned int uid, float* x, float* z)
     *x = p.tx; *z = p.tz;
     return true;
 }
+/* PROBE P143 BEGIN */
+// See replicate.h: seconds since the owner's last MOVE for this copy's puppet.
+double PuppetLastMoveAgeSec(unsigned int uid)
+{
+    std::map<unsigned int, Puppet>::const_iterator it = g_puppets.find(uid);
+    if (it == g_puppets.end() || it->second.ownerSampleAt <= 0.0) return -1.0;
+    const double a = NowSeconds() - it->second.lastMoveAt;
+    return a < 0.0 ? 0.0 : a;
+}
+/* PROBE P143 END */
 
 float PuppetWindowMaxDrift(unsigned int uid)
 {

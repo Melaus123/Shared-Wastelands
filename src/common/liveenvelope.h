@@ -91,6 +91,16 @@ const unsigned int kInnerMoveStop = 72;
 /* TOWN_PRICES: one town's local trade multipliers from the world's price source, route WORLD / WORLD_EXCEPT the session peer;
    items.cpp PtNote takes it only from the source (townprice::TakeFrom). net/transport.h number; store.cpp asserts it. */
 const unsigned int kInnerTownPrices = 75;
+/* KEEPER_RESTOCK: the area holder's restock of a keeper, to the owner of its formal leader; handoff.cpp writes it only for a leader
+   that game runs. net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerKeeperRestock = 76;
+/* MELEE_DECIDED: a player character's melee blow decided on the attacker's game, to the victim's owner; its handler takes it only
+   for a victim the receiving game runs, from the game that runs the attacker (RemoteMayWrite). net/transport.h number; store.cpp
+   asserts it. */
+const unsigned int kInnerMeleeDecided = 77;
+/* T-889 step 2: ITEM_HANDOVER - QUERY / VERDICT / CLOSED about one item hand-over's record line (src/common/handrec.h), to one player by
+   slot; its handler takes each kind only from the player the line names. net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerItemHandover = 79;
 
 struct LiveUp
 {
@@ -390,7 +400,10 @@ inline bool LiveInnerAccepted(unsigned int t)
         || t == kInnerBounty || t == kInnerTalk || t == kInnerBuild || t == kInnerDoorState   /* M7b slice 4 + DOOR_STATE */
         || t == kInnerName || t == kInnerSlave || t == kInnerHire
         || t == kInnerMoveStop   /* MOVE's owner test */
-        || t == kInnerTownPrices;   /* taken only from the price source (items.cpp PtNote) */
+        || t == kInnerTownPrices   /* taken only from the price source (items.cpp PtNote) */
+        || t == kInnerKeeperRestock   /* written only for a leader the receiving game runs (handoff.cpp) */
+        || t == kInnerMeleeDecided   /* applied only to a victim the receiving game runs, from the attacker's game (combat.cpp) */
+        || t == kInnerItemHandover;   /* T-889 step 2: taken only from the player the hand-over line names (items.cpp ApplyItemHandover) */
 }
 
 /* M7b slice 2 fold 1: the relayed types that WAIT in the arrival queue while this game has no running world (store.cpp), as they
@@ -405,7 +418,8 @@ inline bool LiveInnerWaitsForWorld(unsigned int t)
         || t == kInnerTalk || t == kInnerBuild || t == kInnerDoorState   /* M7b slice 4 */
         || t == kInnerName || t == kInnerSlave || t == kInnerHire   /* a name and a slave state are kept pending, a HIRE queued, as on the session link */
         || t == kInnerPrison || t == kInnerTreat   /* a caging / treatment request waits for the owner's new world, as on the session link */
-        || t == kInnerTownPrices;   /* a town table is filed after the load, not lost to it */
+        || t == kInnerTownPrices   /* a town table is filed after the load, not lost to it */
+        || t == kInnerItemHandover;   /* T-889 step 2: a hand-over's QUERY / VERDICT / CLOSED waits like the other item messages */
 }
 
 /* A repeating refusal line: the first 5, then every 100th. `count` is the refusal's own counter, already incremented. */

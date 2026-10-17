@@ -18,6 +18,7 @@
 
 #include "handoff.h"   /* T-1 B1: SquadActivePlatoonOf - the verified squad reader */
 #include "../common/squadwriter.h"   /* M7a3f3 T-425 [m7a3f3-sc0]: SupersedeOwnIdAfterHandover */
+#include "../common/squadorigin.h"   /* the same-id supersede: OwnIdLiftedByLoadAge */
 #include "spawn.h"
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "playerfaction.h"   // P3: ResolveWireFaction (decision 23)
@@ -25,9 +26,11 @@
 #include "worldsync.h"
 #include "../common/lostcopy.h"   /* kCr*: which creation refusals would repeat on a re-send */
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
+#include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
 namespace coop { void LimbsForgetUid(unsigned int uid); void LimbsWorldTeardown(); }   /* LIMBS: clothing.cpp */
 namespace coop { void LiveMemoForgetAddress(const void* obj); }   /* beside LiveCharacter: a registered address is asked afresh */
+namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* combat.cpp: the terrain height at (x,z) - 1 a height, 0 no terrain, -1 not read */
 namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* effect.cpp: a sneak knockout of the copy awaits its verdict */
 #include "worldgen.h"   // F322: DestroyLocalObject   // F318: TrackForLiveness - P034 must cover BOTH instances   // P031: the roster is keyed by the engine's own handle
 #include "appearance.h"
@@ -64,6 +67,7 @@ namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* eff
 #include "../common/peergone.h"   /* PlayerGoneTakesRow: a player who leaves takes only the rows kept for that player */
 #include "../common/ctxkey.h"     /* the context map's squad-id key: the id and the faction the squad was built under */
 #include "../common/livechar.h"   /* LiveCharacter's decision - the SAME header the offline suite compiles */
+#include "../common/ownedmirror.h"   /* the player-character table: the lock-free table a worker thread may read */
 #include "towngen.h"        // P8a: TownGenMadeThisPlatoon - the roster's spawnCause=towngen
 #include "tags.h"           // tags1: a label per copy of the other player's characters
 #include "items.h"          // POSE (read-poses): ObjectPositionKey / ObjectByPositionKey - the bed's building key
@@ -495,6 +499,40 @@ static void MirrorRenoteIfSame(const void* obj)
     }
 }
 
+/* PROBE P141 BEGIN */
+/* PROBE P141 (LOG ONLY) - P141 route ring: the last kP141RelRows releases of a uid mirror row - the uid, the route that released
+   it, when (GetTickCount), and for a row marked destroyed: who marked it and the engine's removal reason (an .rdata literal, or 0).
+   Every writer is on the main thread: MirrorRelease and the world teardown inside the row lock, a rebind in MirrorAdd. Read by
+   P141ReleaseRouteText under the row lock. No allocation, no strings, no call out. The per-row marks beside g_mirror are written
+   where a row's `destroyed` is set (MarkAddressDestroyed under the row lock, any thread; MirrorMarkDestroyed on the main thread)
+   and cleared when the row is released or rebound. */
+static const int kP141RelRows = 256;
+static const int kP141RouteOther = 0, kP141RouteRemoveCopy = 1, kP141RouteStaleTrace = 2, kP141RouteReclaim = 3,
+                 kP141RouteTeardown = 4, kP141RouteRebind = 5;
+struct P141RelRow { unsigned int uid; int route; const char* detail; LONG markBy; char markWhy[32]; DWORD at; };
+static P141RelRow g_p141Rel[kP141RelRows];
+static int g_p141RelNext = 0, g_p141RelN = 0;
+static volatile LONG g_p141RowMarkBy[kMaxMirror];           /* 0 none, 1 an engine destroy of the row's character, 2 an engine destroy of an object that is not the row's character, 3 the liveness check */
+static char g_p141RowMarkWhy[kMaxMirror][32];               /* a copy of the engine's removal reason of mark 1 / 2 (the engine's text is not kept); empty when not known */
+/* Copies at most 31 characters of the engine's reason while the destroy call that passed it is still running. Any thread. */
+static void P141CopyWhy(char* to, const char* from)
+{
+    to[0] = 0;
+    __try { int k = 0; for (; k < 31 && from[k] != 0; ++k) to[k] = from[k]; to[k] = 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { to[0] = 0; }
+}
+static void P141RelNote(int row, unsigned int uid, int route, const char* detail)
+{
+    P141RelRow& r = g_p141Rel[g_p141RelNext];
+    r.uid = uid; r.route = route; r.detail = detail; r.at = ::GetTickCount();
+    r.markBy = row >= 0 ? g_p141RowMarkBy[row] : 0;
+    r.markWhy[0] = 0;
+    if (row >= 0) { std::memcpy(r.markWhy, g_p141RowMarkWhy[row], sizeof(r.markWhy)); r.markWhy[31] = 0; g_p141RowMarkBy[row] = 0; g_p141RowMarkWhy[row][0] = 0; }
+    g_p141RelNext = (g_p141RelNext + 1) % kP141RelRows;
+    if (g_p141RelN < kP141RelRows) ++g_p141RelN;
+}
+/* PROBE P141 END */
+
 bool MirrorAdd(unsigned int uid, const void* obj)
 {
     // Duplicate check on the ARRAY, which the index already had. FindSpawnedUid answering 0 for an
@@ -534,6 +572,7 @@ bool MirrorAdd(unsigned int uid, const void* obj)
             if (act == coopuid::kRowRefuseRebind)   { ++g_mirrorRebindRefused;  g_mirrorLastRefusal = 3; return false; }
             if (act == coopuid::kRowRebind)
             {
+                P141RelNote(i, g_mirror[i].uid, kP141RouteRebind, 0);   /* PROBE P141: the old uid loses this row */
                 g_mirror[i].uid = uid;
                 InterlockedExchange(&g_mirror[i].destroyed, 0);
                 InterlockedExchange(&g_mirror[i].dead, 0);
@@ -649,7 +688,7 @@ bool MirrorHasRoom()
 // flags are cleared (a reader checks `dead` first and then the pointer); the index slot becomes a
 // TOMBSTONE (not 0), so no later entry's run is broken, and trailing tombstones are trimmed only by
 // coopuid::IxTrimmable's rule.
-bool MirrorRelease(const void* obj, unsigned int uid, bool retireFirst)
+bool MirrorRelease(const void* obj, unsigned int uid, bool retireFirst, int p141Route = 0, const char* p141Detail = 0)   /* PROBE P141: route + detail for the release ring */
 {
     if (obj == 0 || uid == 0) return false;
     MirrorRowLock();   // mirror1 fold (review-mirror1 #5): RetireOnDestroy's check-then-mark cannot straddle a release
@@ -663,6 +702,7 @@ bool MirrorRelease(const void* obj, unsigned int uid, bool retireFirst)
         g_mirror[i].uid = 0;
         InterlockedExchange(&g_mirror[i].destroyed, 0);
         InterlockedExchange(&g_mirror[i].dead, 0);
+        P141RelNote(i, uid, p141Route, p141Detail);   /* PROBE P141 */
         released = true;
         --g_mirrorUsedNow;
     }
@@ -948,6 +988,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
         return false;
     }
     g_spawned[uid] = obj;
+    g_twinUids.erase(uid);   /* a copy built from a SPAWN is no save-born body: a twin mark an earlier body of this uid left goes */
     coop::ItemOwnParkNoteUid(uid);   /* stolen marks parked for this uid are tried at the next ItemsTick */
     if (usedFallback) ++g_spawnRefFallback;   /* T-304 (3) fold 1: a built and registered copy only */
     if (staleOldUid != 0)
@@ -996,6 +1037,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
              + " placementErrorXZ=" + F1(placeErrXZ)
              + " placementErrorY=" + F1(placeErrY)
              + " (" + who + ")");
+    LeverNoteSpawned(templateName, uid);   // TEST-ONLY: `spawned:<Template>` names this uid in levers
 
     // PROBE P013 (DIAGNOSTIC, F120) - why do the two instances' copies sometimes get
     // DIFFERENT maximum health? T033 and T034 both measured 100/100 on both sides; T035
@@ -1924,6 +1966,7 @@ std::string RemovalReasonsToken()
 }
 }   // namespace (M7a3 removal reasons)
 
+void P141NoteNotOursDestroy(unsigned int uid, const void* obj, const char* reason, int hook);   /* PROBE P141: defined in the P141 block below */
 void NoteUidPermanentlyLost(unsigned int uid);   /* defined below, beside its ring: a put-away copy of another game's character is kept as once held */
 void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const char* reason, int dead)
 {
@@ -1971,6 +2014,7 @@ void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const c
     // world uid - therefore did neither.
     float lostX = 0.0f, lostY = 0.0f, lostZ = 0.0f;   /* the owner's last streamed spot of a copy, read before its puppet goes */
     const bool lostHasPos = !net::IsUidMine(uid) && PuppetAuthorityPos(uid, &lostX, &lostY, &lostZ);
+    /* PROBE P143 BEGIN */ const double p143MoveAge = net::IsUidMine(uid) ? -1.0 : PuppetLastMoveAgeSec(uid); /* PROBE P143 END */
     DropPuppet(uid);
     FollowOwnForget(uid);   // and, for a character of this game's, its stop watch and sent stop point (the object is going)
 
@@ -2018,6 +2062,7 @@ void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const c
         else
         {
             NoteUidPermanentlyLost(uid);   /* this game held the copy: its owner's MOVEs that follow name a copy this engine put away, not one never sent */
+            /* PROBE P143 BEGIN */ net::P143CopyGone(uid, "this engine put the copy away", reason, justUnloaded ? 1 : 0, dead, lostHasPos, lostX, lostY, lostZ, p143MoveAge); /* PROBE P143 END */
             net::LostCopyNote(uid, lostHasPos, lostX, lostY, lostZ);
         }
         return;
@@ -2026,7 +2071,7 @@ void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const c
 
     // Commitment 3: only the authority may announce. A peer that despawned a uid it does not own
     // would be deleting the other player's character.
-    if (!net::IsUidMine(uid)) { ++g_despawnNotOurs; return; }
+    if (!net::IsUidMine(uid)) { ++g_despawnNotOurs; P141NoteNotOursDestroy(uid, g_drainingOffThread == 0 ? obj : 0, reason, 1); return; }   /* PROBE P141: one line per copy (capped); the object is read only while it is whole */
 
     // F329 - LOG THE SEND. T091's executor could establish the send only from a counter plus the
     // peer's receipts, because the string `DESPAWN` appeared zero times in the sender's whole log -
@@ -2061,6 +2106,100 @@ volatile LONG64 g_copyDestroyRefused = 0;       // by reason: 'eaten' is the onl
 volatile LONG64 g_eatenReArmed = 0, g_eatenLayoutOff = 0;   // the countdown set back / the body's MedicalSystem did not name it (nothing written)
 volatile LONG g_copyDestroyRefusedLastUid = 0;
 long long g_copyDestroyRefusedSeen = 0, g_copyDestroyRefusedLogged = 0;
+/* The engine's destroy of an object at a registered row's address whose object is not that row's character
+   (livechar::DestroyIdentityOf), on the destroy hook only. Counted, and the event kept, on any thread (no log);
+   DrainOffThreadDespawns logs it on the main thread. Rows marked destroyed because the destroyed object was:
+     ...Char    - a character with another handle: another character at the reused address (if this moves for a uid that is
+                  still in g_spawned, a genuine destroy of ours was refused);
+     ...NotChar - an object with no character handle (an item, a record): the shape that crashed. */
+volatile LONG64 g_destroyAddrReusedChar = 0;
+volatile LONG64 g_destroyAddrReusedNotChar = 0;
+volatile LONG64 g_destroyDeadNoHandle = 0;    // destroys at a dead row's address where the row stored no handle (not answered)
+/* The last event, written and copied whole under the row lock, so one event's uid is never paired with another's handles. */
+struct AddrReusedEvent { unsigned int uid; int dead; unsigned int rowIndex; unsigned int rowSerial; int objRead; unsigned int objIndex;
+                         unsigned int objSerial; };
+AddrReusedEvent g_addrReusedLast = { 0, 0, 0, 0, 0, 0, 0 };
+long long g_destroyAddrReusedSeen = 0, g_destroyAddrReusedLogged = 0;   // main thread only (the drain)
+long long DestroyAddrReusedCharCount()    { return (long long)::InterlockedCompareExchange64(&g_destroyAddrReusedChar, 0, 0); }
+long long DestroyAddrReusedNotCharCount() { return (long long)::InterlockedCompareExchange64(&g_destroyAddrReusedNotChar, 0, 0); }
+long long DestroyDeadNoHandleCount() { return (long long)::InterlockedCompareExchange64(&g_destroyDeadNoHandle, 0, 0); }
+/* The index row at an object's address, and whether the object is that row's character. The row's fields are read and the
+   address re-checked after (the row may be freed and refilled meanwhile: then not found). The object's handle is read with
+   CaptureObjId - DoomCapture's read: SEH-guarded, no engine call, no lock - so this runs on any thread, and it is called with no
+   lock held. FindSpawnedUidOnDestroy (the destroy hook: marks and counts), FindSpawnedUidForDestroy (plain lookups: answers only)
+   and RetireOnDestroy all decide with it. */
+struct DestroyRowCheck { bool found; unsigned int uid; LONG dead; LONG destroyed; unsigned int rowIndex; unsigned int rowSerial;
+                         bool objRead; ObjId id; int verdict; };
+static void DestroyRowCheckOf(const void* obj, DestroyRowCheck* c)
+{
+    c->found = false; c->uid = 0; c->dead = 0; c->destroyed = 0; c->rowIndex = 0; c->rowSerial = 0; c->objRead = false;
+    c->id.index = c->id.serial = c->id.type = c->id.container = c->id.containerStamp = 0;
+    c->verdict = livechar::kDestroyIsRow;
+    if (obj == 0) return;
+    const int h = IndexHash(obj);
+    for (int probe = 0; probe < kIndexSlots; ++probe)
+    {
+        const UidMirror& slot = g_index[(h + probe) & kIndexMask];
+        if (slot.obj == 0) return;
+        if (slot.obj != obj) continue;
+        c->uid = *(const volatile unsigned int*)&slot.uid;
+        c->destroyed = slot.destroyed;
+        c->dead = slot.dead;
+        c->rowIndex = *(const volatile unsigned int*)&slot.hIndex;
+        c->rowSerial = *(const volatile unsigned int*)&slot.hSerial;
+        if (*(const void* const volatile*)&slot.obj != obj) return;
+        c->found = true;
+        break;
+    }
+    if (!c->found) return;
+    c->objRead = CaptureObjId(obj, &c->id);
+    c->verdict = livechar::DestroyIdentityOf(c->dead != 0 || c->destroyed != 0, c->rowIndex, c->rowSerial, c->objRead,
+                                             c->id.index, c->id.serial);
+}
+/* Every row naming `obj` marked destroyed, then dead (F328's order: a reader that sees `dead` already sees `destroyed`), as one
+   step under the row lock (see g_mirrorRowLock), so a row the main thread frees and refills cannot receive this object's marks.
+   Returns whether a row named it; *indexWasDestroyed = the index row's flag before this mark (1 when no index row). Address
+   compares only; any thread. */
+static bool MarkAddressDestroyed(const void* obj, LONG* indexWasDestroyed, LONG p141By = 1, const char* p141Why = 0)   /* PROBE P141: the row's destroy mark and reason */
+{
+    *indexWasDestroyed = 1;
+    MirrorRowLock();
+    bool named = false;
+    for (int i = 0; i < kMaxMirror; ++i)
+        if (g_mirror[i].obj == obj)
+        {
+            InterlockedExchange(&g_mirror[i].destroyed, 1);
+            InterlockedExchange(&g_mirror[i].dead, 1);
+            g_p141RowMarkBy[i] = p141By; if (p141Why != 0) P141CopyWhy(g_p141RowMarkWhy[i], p141Why);   /* PROBE P141 */
+            named = true;
+        }
+    int h = IndexHash(obj);
+    for (int probe = 0; probe < kIndexSlots; ++probe)
+    {
+        UidMirror& slot = g_index[(h + probe) & kIndexMask];
+        if (slot.obj == 0) break;
+        if (slot.obj == obj)
+        {
+            *indexWasDestroyed = InterlockedExchange(&slot.destroyed, 1);
+            InterlockedExchange(&slot.dead, 1);
+            named = true;
+            break;
+        }
+    }
+    MirrorRowUnlock();
+    return named;
+}
+/* Called with the row lock NOT held (it takes it for the event copy: a bounded struct write, no call out). */
+static void DestroyAddrReusedNote(const DestroyRowCheck& c)
+{
+    AddrReusedEvent e;
+    e.uid = c.uid; e.dead = (c.dead != 0) ? 1 : 0; e.rowIndex = c.rowIndex; e.rowSerial = c.rowSerial;
+    e.objRead = c.objRead ? 1 : 0; e.objIndex = c.id.index; e.objSerial = c.id.serial;
+    MirrorRowLock();
+    g_addrReusedLast = e;
+    MirrorRowUnlock();
+    ::InterlockedIncrement64(c.objRead ? &g_destroyAddrReusedChar : &g_destroyAddrReusedNotChar);
+}
 static int DestroyReasonIsEaten(const char* r)   /* the engine passes a string literal; compared by value, any thread */
 {
     if (r == 0) return 0;
@@ -2116,6 +2255,28 @@ void DrainOffThreadDespawns()
             ErrorLog("[M1] T-304: this engine tried to remove uid=" + S(last) + ", a copy of the other game's character, as 'eaten' - refused;"
                      " it stays until the owner's DESPAWN (copyDestroyRefused[eaten]=" + S(refused) + " eatenReArmed=" + S((long long)g_eatenReArmed)
                      + " eatenLayoutOff=" + S((long long)g_eatenLayoutOff) + "; the first 20 are logged)");
+        }
+    }
+    const long long reusedChar = DestroyAddrReusedCharCount(), reusedNotChar = DestroyAddrReusedNotCharCount();
+    const long long reused = reusedChar + reusedNotChar;
+    if (reused != g_destroyAddrReusedSeen)
+    {
+        g_destroyAddrReusedSeen = reused;
+        if (g_destroyAddrReusedLogged < 20)
+        {
+            ++g_destroyAddrReusedLogged;
+            AddrReusedEvent e;
+            MirrorRowLock();
+            e = g_addrReusedLast;
+            MirrorRowUnlock();
+            ErrorLog("[M1] address reused: the engine destroyed "
+                     + (e.objRead != 0 ? "ANOTHER CHARACTER (handle " + S((long long)e.objIndex) + "/" + S((long long)e.objSerial) + ")"
+                                       : std::string("an object with no character handle (not a character)"))
+                     + " at the address of uid=" + S((long long)e.uid) + "'s " + std::string(e.dead != 0 ? "dead" : "live")
+                     + " row (row handle=" + S((long long)e.rowIndex) + "/" + S((long long)e.rowSerial) + "), so it is not that"
+                     + " character; the row is finished (destroyed) and nothing is read, dropped or announced for it"
+                     + " (destroyAddrReusedChar=" + S(reusedChar) + " destroyAddrReusedNotChar=" + S(reusedNotChar)
+                     + "; the first 20 are logged)");
         }
     }
 }
@@ -2208,13 +2369,513 @@ static void DropStaleTraces(unsigned int uid, const void* raw, bool forgetWords)
 {
     if (forgetWords) { NameForgetUid(uid); SlaveForgetUid(uid); coop::LimbsForgetUid(uid); MedicalForgetCopy(uid); }
     if (HasPuppet(uid)) DropPuppet(uid, false);
-    if (raw != 0) MirrorRelease(raw, uid, true);
+    if (raw != 0) MirrorRelease(raw, uid, true, kP141RouteStaleTrace);
     g_spawned.erase(uid);
+    g_twinUids.erase(uid);   /* no live body: a later copy of this uid is no save-born twin */
     DeadlookForgetCopy(uid);
     TagsForgetUid(uid);
 }
 
-void ApplyRemoteUnload(unsigned int uid)
+/* A SAVE-BORN NON-PLAYER TWIN A WITHDRAWAL LEAVES UNDRIVEN (src/common/twinsleep.h). Hits follow the owner record, so a twin body
+   awake here that this game does not run and that is no game's puppet can be hurt by nobody. Its withdrawal drops its puppet row
+   (its AI stays off; a body this game ran until a REVOKE keeps its AI as it was) and queues it. TwinSleepTick then takes it (nobody
+   runs it and this game's engine keeps its squad's spot: the hand-over's take, owner record and AI together), or handles its squad
+   whole: the queued members of one squad share one timer (twinsleep::SquadAgeSec) and go together (twinsleep::SquadMode) - put to
+   sleep where it stands, at its runner's last streamed spot, or just outside this game's kept area (twinsleep::StripPoint, the
+   point's height on the ground); left waiting, AI off, for its runner's SPAWN; or taken. The sleep is the store's engine pair
+   (StoreRetireLocalCopy), one call per frame, from the frame pump before the engine's main loop runs, never inside its faction
+   update. No body ends frozen (owner rule 750): what cannot be put to sleep ends in this game's take with an Error
+   (TwinLastResortTake), within about twinsleep::kBoundSec of the first queuing. MAIN THREAD, all of it. */
+struct TwinSleepEntry
+{
+    unsigned int uid;
+    int kind;               /* twinsleep::kKind*: the withdrawal's word */
+    int hasPos;             /* x/y/z hold the runner's last streamed spot, read from the puppet row before the row went */
+    float x, y, z;
+    int runnerSlot;         /* the slot of the owner on record at the withdrawal, -1 none */
+    int aiOff;              /* 1 = its AI was off at the withdrawal (a puppet): the sleep call opens it, a refused call shuts it again */
+    int keeps;              /* kKindNobodyRuns: this game's engine keeps its squad's spot - 1, 0, -1 unreadable */
+    int calls;              /* sleep calls made for its squad (the strip sleep counts from 0 again) */
+    DWORD calledAtMs;       /* GetTickCount of the last call */
+    DWORD queuedAtMs;       /* GetTickCount of its first withdrawal: its squad's shared timer runs from the oldest */
+    int awaiting;           /* 1 = its squad waited, AI off, for its runner's SPAWN */
+    int strip;              /* 1 = its squad is bound for the strip sleep at sx/sy/sz (one call) */
+    float sx, sy, sz;
+    DWORD stripShutAtMs;    /* GetTickCount when the strip sleep first found its gate shut, 0 = not shut */
+};
+std::vector<TwinSleepEntry> g_twinSleepQ;
+std::set<void*> g_twinWaitLogged;   /* squads (Platoon*) whose wait at the gate was logged; emptied with the queue */
+/* twinSlept, twinSleepFailed and twinStripSlept count SQUADS (a sleep call that went through; a squad whose two calls were given up;
+   a strip call that went through); every other twin counter counts uids */
+long long g_twinSleepQueued = 0, g_twinSlept = 0, g_twinSleepWaiting = 0, g_twinSleepFailed = 0, g_twinSleepFailedUids = 0, g_twinTaken = 0, g_twinSleepRetried = 0;
+long long g_twinAwaitRunner = 0, g_twinAwaitBack = 0, g_twinAwaitExpiredSlept = 0, g_twinAwaitExpiredTaken = 0, g_twinFallbackTaken = 0;
+long long g_twinStripSlept = 0, g_twinLastResortTaken = 0;
+bool g_twinUnboundLogged = false;
+
+/* THE LAST RESORT (owner rule 750: no body ends frozen): this game takes the body - owner record and AI together, the hand-over's take -
+   when it could not be put to sleep and no game will drive it here. A body this game runs can be hurt; a frozen one cannot. */
+static void TwinLastResortTake(const TwinSleepEntry& e, const std::string& why)
+{
+    HandoffTakeGone(e.uid);
+    ++g_twinLastResortTaken;
+    if (e.awaiting != 0) ++g_twinAwaitExpiredTaken;
+    ErrorLog("[TWIN] uid=" + S(e.uid) + " TAKEN by this game as the last resort - " + why + " (twinLastResortTaken " + S(g_twinLastResortTaken) + ")");
+}
+/* twinsleep::StripPoint's keep read: this game's engine keeps (x, z) - zones.cpp EngineKeepsHere (the area flags and the edge strip) */
+static int TwinKeepsFn(void*, float x, float z) { return EngineKeepsHere(x, z); }
+/* The strip point's height: the ground there (combat.cpp GroundTerrainHeightAt, the engine's own terrain read), else the squad's own. */
+static float TwinGroundY(float x, float z, float fallbackY)
+{
+    float g = 0.0f;
+    return GroundTerrainHeightAt(x, z, &g) == 1 ? g : fallbackY;
+}
+/* The strip point for a squad standing at (bx, by, bz): toward its runner's last spot when one is known, else away from this game's
+   player, else the nearest of the four axis directions. 1 = found (*o, *how names the way). */
+static int TwinStripChoose(float bx, float by, float bz, int hasSpot, float tx, float tz, Ogre::Vector3* o, const char** how)
+{
+    float ox = 0.0f, oz = 0.0f;
+    int found = 0;
+    if (hasSpot != 0) { found = twinsleep::StripPoint(bx, bz, tx, tz, TwinKeepsFn, 0, &ox, &oz); *how = "toward its runner's last spot"; }
+    if (found == 0)
+    {
+        ::Character* me = GetTarget();
+        Ogre::Vector3 pp;
+        if (me != 0 && SafeReadPosition(me, &pp) && ((bx - pp.x) * (bx - pp.x) + (bz - pp.z) * (bz - pp.z)) > 1.0f)
+        { found = twinsleep::StripPoint(bx, bz, bx + (bx - pp.x), bz + (bz - pp.z), TwinKeepsFn, 0, &ox, &oz); *how = "away from this game's player"; }
+    }
+    if (found == 0) { found = twinsleep::StripPointAround(bx, bz, TwinKeepsFn, 0, &ox, &oz); *how = "the nearest way out"; }
+    if (found == 0) return 0;
+    o->x = ox; o->z = oz; o->y = TwinGroundY(ox, oz, by);
+    return 1;
+}
+
+/* The body's withdrawal: its runner's last streamed spot is read, then its puppet row goes - DropPuppet keeps the body's AI gate
+   shut, so this game's AI does not run it - and it waits in the queue. A repeat withdrawal keeps the earlier spot, calls and first
+   withdrawal time (the shared timer runs from the first); its wait and strip state go on only under the same kind. */
+static void TwinSleepQueue(unsigned int uid, int kind)
+{
+    TwinSleepEntry e;
+    e.uid = uid;
+    e.kind = (kind == twinsleep::kKindRunnerRuns || kind == twinsleep::kKindNeverTake) ? kind : twinsleep::kKindNobodyRuns;
+    e.x = e.y = e.z = 0.0f;
+    e.hasPos = PuppetAuthorityPos(uid, &e.x, &e.y, &e.z) ? 1 : 0;
+    e.runnerSlot = net::OwnerSlotOf(uid);
+    e.aiOff = HasPuppet(uid) ? 1 : 0;
+    e.keeps = -1;
+    e.calls = 0; e.calledAtMs = 0;
+    e.queuedAtMs = ::GetTickCount();
+    e.awaiting = 0;
+    e.strip = 0; e.sx = e.sy = e.sz = 0.0f; e.stripShutAtMs = 0;
+    if (e.aiOff != 0) DropPuppet(uid);
+    for (size_t i = 0; i < g_twinSleepQ.size(); ++i)
+    {
+        if (g_twinSleepQ[i].uid != uid) continue;
+        TwinSleepEntry& o = g_twinSleepQ[i];
+        if (e.hasPos == 0 && o.hasPos != 0) { e.hasPos = 1; e.x = o.x; e.y = o.y; e.z = o.z; }
+        if (e.runnerSlot < 0) e.runnerSlot = o.runnerSlot;
+        if (o.aiOff != 0) e.aiOff = 1;
+        e.calls = o.calls; e.calledAtMs = o.calledAtMs; e.queuedAtMs = o.queuedAtMs;
+        if (o.kind == e.kind) { e.awaiting = o.awaiting; e.strip = o.strip; e.sx = o.sx; e.sy = o.sy; e.sz = o.sz; e.stripShutAtMs = o.stripShutAtMs; }
+        o = e;
+        return;
+    }
+    g_twinSleepQ.push_back(e);
+    ++g_twinSleepQueued;
+}
+/* ActivePlatoon +0xB4/+0xB8/+0xBC: the squad position the engine sleeps and wakes the squad by (handoff.h SquadView). Rewritten each
+   frame from the leader inside the faction update, so it is written right before the sleep call. 1 = written. */
+static int TwinSquadPosWritePod(void* ap, float x, float y, float z)
+{
+    __try { *(float*)((char*)ap + 0xB4) = x; *(float*)((char*)ap + 0xB8) = y; *(float*)((char*)ap + 0xBC) = z; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static int TwinDeadPod(::Character* c)
+{
+    __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static bool TwinQueued(unsigned int uid)
+{
+    for (size_t i = 0; i < g_twinSleepQ.size(); ++i) if (g_twinSleepQ[i].uid == uid) return true;
+    return false;
+}
+/* A squad's queued members bound for the strip sleep at o (one call, the gate's own clock from 0). */
+static void TwinStripSet(const std::vector<size_t>& mem, const Ogre::Vector3& o)
+{
+    for (size_t k = 0; k < mem.size(); ++k)
+    {
+        TwinSleepEntry& e = g_twinSleepQ[mem[k]];
+        e.strip = 1; e.sx = o.x; e.sy = o.y; e.sz = o.z; e.calls = 0; e.calledAtMs = 0; e.stripShutAtMs = 0;
+    }
+}
+/* A squad's queued members: the last resort, each (drop marks them out of the queue). */
+static void TwinLastResortAll(const std::vector<size_t>& mem, std::vector<char>* drop, const std::string& why)
+{
+    for (size_t k = 0; k < mem.size(); ++k) { (*drop)[mem[k]] = 1; TwinLastResortTake(g_twinSleepQ[mem[k]], why); }
+}
+
+void TwinSleepTick()
+{
+    if (g_twinSleepQ.empty()) { g_twinSleepWaiting = 0; g_twinWaitLogged.clear(); return; }
+    if (EngineWritesBlocked()) return;   /* the next frame with engine writes allowed acts; nothing leaves the queue */
+    const DWORD now = ::GetTickCount();
+
+    /* 1. Each entry read live. Gone, this game's again, or a puppet again (its runner's SPAWN came): the state that queued it is over -
+          it leaves; a body the queue's own call put to sleep loses its twin mark (a later copy of the uid is no save-born body). Nobody
+          runs it and this game's engine keeps its squad's spot: taken. */
+    std::vector<TwinSleepEntry> left;
+    for (size_t i = 0; i < g_twinSleepQ.size(); ++i)
+    {
+        TwinSleepEntry e = g_twinSleepQ[i];
+        ::Character* c = FindSpawned(e.uid);
+        if (c == 0 || net::IsUidMine(e.uid) || HasPuppet(e.uid))
+        {
+            if (c == 0 && e.calls > 0) { g_twinUids.erase(e.uid); if (e.awaiting != 0) ++g_twinAwaitExpiredSlept; }
+            if (c != 0 && e.awaiting != 0 && HasPuppet(e.uid))
+            {
+                ++g_twinAwaitBack;
+                DebugLog("[TWIN] uid=" + S(e.uid) + " is its runner's puppet again - the SPAWN came while it waited (twinAwaitBack " + S(g_twinAwaitBack) + ")");
+            }
+            continue;
+        }
+        if (e.kind == twinsleep::kKindNobodyRuns && e.strip == 0)
+        {
+            float kx = 0.0f, kz = 0.0f;
+            int keeps = -1;
+            Ogre::Vector3 at;
+            if (SquadDecisionPos(c, &kx, &kz) == 1) keeps = EngineKeepsHere(kx, kz);
+            else if (SafeReadPosition(c, &at)) { kx = at.x; kz = at.z; keeps = EngineKeepsHere(kx, kz); }
+            e.keeps = keeps;
+            if (twinsleep::WithdrawBranch(1, 0, e.kind, keeps) == twinsleep::kTake)
+            {
+                HandoffTakeGone(e.uid);   /* owner record at a gen above every record here (its squad's 'given' mark goes with it), AI on */
+                ++g_twinTaken;
+                DebugLog("[TWIN] uid=" + S(e.uid) + " taken by this game at " + F1(kx) + "," + F1(kz) + " - nobody runs it and this game's engine keeps its squad's spot (twinTaken "
+                         + S(g_twinTaken) + ")");
+                continue;
+            }
+        }
+        left.push_back(e);
+    }
+    g_twinSleepQ.swap(left);
+
+    /* 2. The rest by squad, read live. A uid whose squad cannot be read waits, bounded (twinsleep::NoSquadDecide). */
+    const size_t n = g_twinSleepQ.size();
+    std::map<void*, std::vector<size_t> > bySquad;
+    std::map<void*, SquadView> views;
+    std::vector<char> drop(n, 0);
+    long long waiting = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const TwinSleepEntry& e = g_twinSleepQ[i];
+        SquadView sv;
+        const int r = ReadSquadOf(FindSpawned(e.uid), &sv);
+        if (r == 1 && sv.platoon != 0)
+        {
+            if (views.find(sv.platoon) == views.end()) views[sv.platoon] = sv;
+            bySquad[sv.platoon].push_back(i);
+            continue;
+        }
+        const double since = (double)(DWORD)(now - e.queuedAtMs) / 1000.0;
+        const int ns = twinsleep::NoSquadDecide(e.kind, since);
+        if (ns == twinsleep::kNsWait) { ++waiting; continue; }
+        drop[i] = 1; ++g_twinSleepFailedUids;
+        const std::string why = std::string(r < 0 ? "its squad could not be read" : "it is in no squad this game can read") + " for " + F1((float)since) + " s - it cannot be put to sleep";
+        if (ns == twinsleep::kNsTake)
+        {
+            HandoffTakeGone(e.uid);
+            ++g_twinFallbackTaken;
+            DebugLog("[TWIN] uid=" + S(e.uid) + " taken by this game - " + why + "; nobody runs it (twinFallbackTaken " + S(g_twinFallbackTaken) + ")");
+        }
+        else TwinLastResortTake(e, why);
+    }
+
+    /* 3. Each squad whole: its shared timer, its road (twinsleep::SquadMode), its gate, and one sleep call per frame - the engine's squad
+          lists change inside a call, so views read before it are not used after it; the other squads are read again next frame. */
+    bool calledThisFrame = false;
+    for (std::map<void*, std::vector<size_t> >::const_iterator q = bySquad.begin(); q != bySquad.end(); ++q)
+    {
+        void* platoon = q->first;
+        const std::vector<size_t>& mem = q->second;
+        if (calledThisFrame) { ++waiting; continue; }
+        const SquadView& sv = views[platoon];
+        const unsigned int leaderUid = FindSpawnedUid(sv.leader);
+        std::vector<unsigned long> stamps;
+        int calls = 0, anyRunner = 0, anyNever = 0, strip = 0, hasSpot = 0, slot = -1, unreadKeep = 0, waited = 0;
+        DWORD calledAt = 0, shutAt = 0;
+        float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+        size_t stripAt = mem[0];
+        for (size_t k = 0; k < mem.size(); ++k)
+        {
+            const TwinSleepEntry& e = g_twinSleepQ[mem[k]];
+            stamps.push_back((unsigned long)e.queuedAtMs);
+            if (e.calls > calls) { calls = e.calls; calledAt = e.calledAtMs; }
+            if (e.awaiting != 0) waited = 1;
+            if (e.strip != 0)
+            {
+                if (strip == 0) stripAt = mem[k];
+                strip = 1;
+                if (e.stripShutAtMs != 0 && (shutAt == 0 || (DWORD)(now - e.stripShutAtMs) > (DWORD)(now - shutAt))) shutAt = e.stripShutAtMs;
+            }
+            if (e.kind == twinsleep::kKindNeverTake) anyNever = 1;
+            if (e.kind == twinsleep::kKindNobodyRuns && e.keeps < 0) unreadKeep = 1;
+            if (e.kind != twinsleep::kKindRunnerRuns) continue;
+            anyRunner = 1;
+            if (slot < 0) slot = e.runnerSlot;
+            if (e.hasPos != 0 && (hasSpot == 0 || e.uid == leaderUid)) { hasSpot = 1; tx = e.x; ty = e.y; tz = e.z; slot = e.runnerSlot; }
+        }
+        const double age = twinsleep::SquadAgeSec(&stamps[0], (int)stamps.size(), (unsigned long)now);
+        int late = age >= twinsleep::kAwaitSec ? 1 : 0;
+        /* where the squad stands: its own position, else its first queued member's */
+        float bx = sv.x, by = sv.y, bz = sv.z;
+        int bodyKnown = sv.posUsable != 0 ? 1 : 0;
+        if (bodyKnown == 0)
+        {
+            Ogre::Vector3 at;
+            ::Character* c0 = FindSpawned(g_twinSleepQ[mem[0]].uid);
+            if (c0 != 0 && SafeReadPosition(c0, &at)) { bx = at.x; by = at.y; bz = at.z; bodyKnown = 1; }
+        }
+
+        if (calls > 0)
+        {
+            const int after = twinsleep::AfterCall((double)(DWORD)(now - calledAt) / 1000.0, calls);
+            if (after == twinsleep::kCallAwait) { ++waiting; continue; }   /* the last call's effect is read again in a moment */
+            if (strip != 0)
+            {
+                TwinLastResortAll(mem, &drop, "its squad was still awake " + F1((float)twinsleep::kRecheckSec) + " s after the strip sleep at "
+                                  + F1(g_twinSleepQ[stripAt].sx) + "," + F1(g_twinSleepQ[stripAt].sz));
+                continue;
+            }
+            if (after == twinsleep::kCallGiveUp)
+            {
+                late = 1;
+                ++g_twinSleepFailed; g_twinSleepFailedUids += (long long)mem.size();
+                DebugLog("[TWIN] squad " + P(platoon) + " is still awake " + F1((float)twinsleep::kRecheckSec) + " s after its second sleep call - its late road follows now (twinSleepFailed "
+                         + S(g_twinSleepFailed) + ")");
+            }
+        }
+
+        int mode = twinsleep::kModeStrip;
+        if (strip == 0)
+        {
+            const int keepsSpot = hasSpot != 0 ? EngineKeepsHere(tx, tz) : -1;
+            const int keepsBody = bodyKnown != 0 ? EngineKeepsHere(bx, bz) : -1;
+            mode = twinsleep::SquadMode(anyRunner, anyNever, late, hasSpot, keepsSpot, keepsBody);
+            if (mode == twinsleep::kModeWait)
+            {
+                for (size_t k = 0; k < mem.size(); ++k)
+                {
+                    TwinSleepEntry& e = g_twinSleepQ[mem[k]];
+                    if (e.awaiting != 0) continue;
+                    e.awaiting = 1; ++g_twinAwaitRunner;
+                    DebugLog("[TWIN] uid=" + S(e.uid) + " waits with its AI off for its runner's SPAWN (runner slot " + S((long long)slot) + "; its squad's shared wait, "
+                             + F1((float)twinsleep::kAwaitSec) + " s from the first queuing) - "
+                             + (hasSpot == 0 ? std::string("its runner's last spot is not known")
+                                : keepsSpot == 1 ? "this game's engine keeps its runner's last spot " + F1(tx) + "," + F1(tz) + " - a squad put to sleep there would be woken at once as this game's own"
+                                : "the keep test at its runner's last spot " + F1(tx) + "," + F1(tz) + " was unreadable")
+                             + " (twinAwaitRunner " + S(g_twinAwaitRunner) + ")");
+                }
+                ++waiting;
+                continue;
+            }
+            if (mode == twinsleep::kModeTake)
+            {
+                for (size_t k = 0; k < mem.size(); ++k)
+                {
+                    drop[mem[k]] = 1;
+                    HandoffTakeGone(g_twinSleepQ[mem[k]].uid);   /* nobody runs it: owner record and AI together */
+                    ++g_twinFallbackTaken;
+                    DebugLog("[TWIN] uid=" + S(g_twinSleepQ[mem[k]].uid) + " taken by this game - its squad was not put to sleep within " + F1((float)twinsleep::kAwaitSec)
+                             + " s and nobody runs it (twinFallbackTaken " + S(g_twinFallbackTaken) + ")");
+                }
+                continue;
+            }
+            if (mode == twinsleep::kModeStrip)
+            {
+                Ogre::Vector3 o; const char* how = "";
+                if (bodyKnown == 0 || TwinStripChoose(bx, by, bz, hasSpot, tx, tz, &o, &how) == 0)
+                {
+                    TwinLastResortAll(mem, &drop, bodyKnown == 0 ? std::string("its squad's position could not be read, so no point outside this game's kept area could be found")
+                                      : "no point outside this game's kept area was found within " + F1(twinsleep::kStripStep * (float)twinsleep::kStripMaxSteps) + " units (or a keep read failed on the way)");
+                    continue;
+                }
+                TwinStripSet(mem, o);
+                strip = 1; stripAt = mem[0]; shutAt = 0; calls = 0;
+                DebugLog("[TWIN] squad " + P(platoon) + " is to be put to sleep at " + F1(o.x) + "," + F1(o.z) + ", just outside this game's kept area (" + std::string(how) + ") - "
+                         + std::string(anyRunner != 0 ? (late != 0 && waited != 0 ? "no SPAWN came from its runner within its squad's wait" : "its runner still runs it and it could not be put to sleep in time")
+                                       : (keepsBody == 0 ? "a REVOKE named no winner and it could not be put to sleep where it stands in time"
+                                                         : "a REVOKE named no winner and this game's engine keeps (or cannot judge) where it stands")));
+            }
+        }
+
+        int anyMine = 0, anyPuppet = 0, anyCarried = (sv.count > sv.stored) ? -1 : 0;   /* members past the reader's cap are not read */
+        for (int m = 0; m < sv.stored; ++m)
+        {
+            ::Character* mc = sv.members[m];
+            const unsigned int mu = FindSpawnedUid(mc);
+            if (mu != 0 && net::IsUidMine(mu)) anyMine = 1;
+            if (mu != 0 && HasPuppet(mu)) anyPuppet = 1;
+            const int h = CharCarried(mc);
+            if (h == 1) anyCarried = 1; else if (h < 0 && anyCarried == 0) anyCarried = -1;
+        }
+        const int gate = twinsleep::SleepGate(1, anyMine, anyPuppet, anyCarried);
+        const std::string gateWhy = anyMine != 0 ? "a member is this game's own" : anyPuppet != 0 ? "a member is still another game's puppet"
+                                  : anyCarried == 1 ? "a member is carried" : "a member could not be read";
+        if (strip != 0)
+        {
+            const double shutSec = shutAt != 0 ? (double)(DWORD)(now - shutAt) / 1000.0 : 0.0;
+            const int sg = twinsleep::StripGate(gate, shutSec);
+            if (sg == twinsleep::kSgLastResort)
+            {
+                TwinLastResortAll(mem, &drop, "the strip sleep's gate stayed shut " + F1((float)shutSec) + " s (" + gateWhy + ")");
+                continue;
+            }
+            if (sg == twinsleep::kSgWait)
+            {
+                if (shutAt == 0) for (size_t k = 0; k < mem.size(); ++k) g_twinSleepQ[mem[k]].stripShutAtMs = now != 0 ? now : 1;
+                ++waiting;
+                if (g_twinWaitLogged.insert(platoon).second)
+                    DebugLog("[TWIN] squad " + P(platoon) + " waits for its strip sleep - " + gateWhy + "; checked every frame, " + F1((float)twinsleep::kStripGateSec)
+                             + " s at most (logged once per squad)");
+                continue;
+            }
+        }
+        else if (gate != twinsleep::kGateGo)
+        {
+            ++waiting;
+            if (g_twinWaitLogged.insert(platoon).second)
+                DebugLog("[TWIN] squad " + P(platoon) + " waits to be put to sleep - " + gateWhy + "; checked again every frame (logged once per squad)");
+            continue;
+        }
+
+        float wx = bx, wz = bz;
+        if (strip != 0)
+        {
+            const TwinSleepEntry& s0 = g_twinSleepQ[stripAt];
+            if (TwinSquadPosWritePod(sv.ap, s0.sx, s0.sy, s0.sz) != 1)
+            {
+                TwinLastResortAll(mem, &drop, "the strip point " + F1(s0.sx) + "," + F1(s0.sz) + " could not be written as its squad's position");
+                continue;
+            }
+            wx = s0.sx; wz = s0.sz;
+        }
+        else if (mode == twinsleep::kModeRunnerSpot)
+        {
+            if (TwinSquadPosWritePod(sv.ap, tx, ty, tz) != 1)
+            {
+                /* not put to sleep unchecked where it stands: the strip road, with its keep check (called from the next frame) */
+                Ogre::Vector3 o; const char* how = "";
+                if (bodyKnown == 0 || TwinStripChoose(bx, by, bz, hasSpot, tx, tz, &o, &how) == 0)
+                {
+                    TwinLastResortAll(mem, &drop, "its runner's last spot could not be written as its squad's position and no point outside this game's kept area was found");
+                    continue;
+                }
+                TwinStripSet(mem, o);
+                DebugLog("[TWIN] squad " + P(platoon) + ": its runner's last spot could not be written - it is to be put to sleep at " + F1(o.x) + "," + F1(o.z)
+                         + ", just outside this game's kept area (" + std::string(how) + ")");
+                ++waiting;
+                continue;
+            }
+            wx = tx; wz = tz;
+        }
+        /* the queued members whose AI was off have their AI gate opened in the same frame as the sleep call (the engine removes them
+           inside it), so no gate slot outlives its body; a refused call shuts it again */
+        for (size_t k = 0; k < mem.size(); ++k)
+        {
+            const TwinSleepEntry& e = g_twinSleepQ[mem[k]];
+            if (e.aiOff == 0) continue;
+            ::Character* mc = FindSpawned(e.uid); if (mc != 0) SuppressCharacter(mc, false);
+        }
+        if (!g_twinUnboundLogged && StorePlatoonBound(platoon) == 0)
+        {
+            g_twinUnboundLogged = true;
+            DebugLog("[TWIN] squad " + P(platoon) + " is not one the store keeps: the engine's own rule decides whether it sleeps or is thrown away (logged the first time only)");
+        }
+        const int rc = StoreRetireLocalCopy(platoon);
+        calledThisFrame = true;
+        if (calls > 0) ++g_twinSleepRetried;
+        for (size_t k = 0; k < mem.size(); ++k) { TwinSleepEntry& e = g_twinSleepQ[mem[k]]; e.calls = calls + 1; e.calledAtMs = now; }
+        if (rc == 1)
+        {
+            ++g_twinSlept;
+            if (strip != 0) ++g_twinStripSlept;
+            /* the despawn hook booked each removed body as a lost copy with no spot: nothing is lost - its runner's SPAWN, or this game's
+               own world data, brings it back */
+            for (size_t k = 0; k < mem.size(); ++k) net::LostCopyForget(g_twinSleepQ[mem[k]].uid, "its squad was put to sleep here by the twin queue");
+            const std::string why = strip != 0 ? "just outside this game's kept area (twinStripSlept " + S(g_twinStripSlept) + ")"
+                                  : mode == twinsleep::kModeRunnerSpot ? std::string("its runner still runs it (its last spot is not kept by this game's engine)")
+                                  : anyRunner != 0 ? std::string("no SPAWN came from its runner, its last spot is not known and this game's engine does not keep where it stands")
+                                  : anyNever != 0 ? std::string("a REVOKE named no winner and this game's engine does not keep where it stands")
+                                  : unreadKeep != 0 ? std::string("nobody runs it and the keep test at its spot was unreadable")
+                                  : std::string("nobody runs it and this game's engine does not keep its spot");
+            DebugLog("[TWIN] squad " + P(platoon) + " put to sleep at " + F1(wx) + "," + F1(wz) + " (members " + S((long long)sv.count) + ", runner slot " + S((long long)slot) + ") - "
+                     + why + (calls > 0 ? " (second call)" : "") + " (twinSlept " + S(g_twinSlept) + ", squads)");
+        }
+        else
+        {
+            for (size_t k = 0; k < mem.size(); ++k)
+            {
+                const TwinSleepEntry& e = g_twinSleepQ[mem[k]];
+                if (e.aiOff == 0) continue;
+                ::Character* mc = FindSpawned(e.uid); if (mc != 0) SuppressCharacter(mc, true);
+            }
+            if (strip != 0)
+            {
+                TwinLastResortAll(mem, &drop, "the strip sleep call was refused (not an awake squad with a faction, or it faulted)");
+                continue;
+            }
+            DebugLog("[TWIN] squad " + P(platoon) + ": the sleep call was refused (not an awake squad with a faction, or it faulted) - its queued members' AI is as it was; called again in "
+                     + F1((float)twinsleep::kRecheckSec) + " s while it stays awake");
+        }
+    }
+    g_twinSleepWaiting = waiting;
+    std::vector<TwinSleepEntry> kept;
+    for (size_t i = 0; i < n; ++i) if (drop[i] == 0) kept.push_back(g_twinSleepQ[i]);
+    g_twinSleepQ.swap(kept);
+}
+
+/* The invariant (log only, must read 0): live registered bodies, not dead, not this game's, with no puppet row, not the watched player
+   or a player-faction character and not waiting in the twin queue - awake here with no game running them. *twinsOut: of which twins. */
+static long long TwinOwnerlessAwakeCount(long long* twinsOut)
+{
+    long long n = 0, t = 0;
+    for (std::map<unsigned int, RootObjectBase*>::const_iterator it = g_spawned.begin(); it != g_spawned.end(); ++it)
+    {
+        const unsigned int uid = it->first;
+        if (it->second == 0 || net::IsUidMine(uid) || HasPuppet(uid)) continue;
+        if (IsRetiredObject(it->second) || !PlausibleObject(it->second)) continue;
+        ::Character* c = LiveCharacter((::Character*)it->second);
+        if (c == 0 || c == GetTarget() || IsPlayerFactionPod(c) != 0 || TwinDeadPod(c) != 0) continue;
+        if (TwinQueued(uid)) continue;
+        ++n;
+        if (g_twinUids.count(uid) != 0) ++t;
+    }
+    if (twinsOut != 0) *twinsOut = t;
+    return n;
+}
+/* The queued uids the invariant above leaves out: those queued longer than twinsleep::kBoundSec (the shared wait, the strip gate's
+   wait and the recheck after a call) - each should be asleep, back or taken by then. */
+static long long TwinQueuedOverCount()
+{
+    const DWORD now = ::GetTickCount();
+    long long n = 0;
+    for (size_t i = 0; i < g_twinSleepQ.size(); ++i)
+        if ((double)(DWORD)(now - g_twinSleepQ[i].queuedAtMs) / 1000.0 >= twinsleep::kBoundSec) ++n;
+    return n;
+}
+static std::string TwinSleepToken()
+{
+    long long twins = 0;
+    const long long n = TwinOwnerlessAwakeCount(&twins);
+    return " twinSleepQueued=" + S(g_twinSleepQueued) + " twinSlept=" + S(g_twinSlept) + " twinSleepWaiting=" + S(g_twinSleepWaiting)
+           + " twinSleepFailed=" + S(g_twinSleepFailed) + " twinSleepFailedUids=" + S(g_twinSleepFailedUids) + " twinTaken=" + S(g_twinTaken)
+           + " twinFallbackTaken=" + S(g_twinFallbackTaken) + " twinAwaitRunner=" + S(g_twinAwaitRunner) + " twinAwaitBack=" + S(g_twinAwaitBack)
+           + " twinAwaitExpiredSlept=" + S(g_twinAwaitExpiredSlept) + " twinAwaitExpiredTaken=" + S(g_twinAwaitExpiredTaken) + " twinStripSlept=" + S(g_twinStripSlept)
+           + " twinLastResortTaken=" + S(g_twinLastResortTaken) + " twinSleepRetried=" + S(g_twinSleepRetried)
+           + " ownerlessAwake=" + S(n) + " queuedOver70s=" + S(TwinQueuedOverCount()) + " ownerlessAwakeTwin=" + S(twins);
+}
+
+void ApplyRemoteUnload(unsigned int uid, int kind)
 {
     if (g_unloadRecv++ < 20) DebugLog("[M1] <- UNLOAD uid=" + S(uid) + " (the first 20 received are logged, the rest counted in unloadRecv)");   /* M7a3f2 */
     Character* c = FindSpawned(uid);
@@ -2241,10 +2902,20 @@ void ApplyRemoteUnload(unsigned int uid)
     bool player = false;
     if (WithdrawNotDestroy(uid, c, &player))
     {
-        UnpuppetForOwnership(uid);   // the local AI has it again, as after a handoff
         if (player) ++g_unloadWithdrawnPlayer; else ++g_unloadWithdrawnTwin;
-        DebugLog("[M1] UNLOAD uid=" + S(uid) + (player ? " - the watched player / a player-faction character" : " - a shared-save twin")
-                 + ": puppet withdrawn, character NOT destroyed, row kept (H030)");
+        /* a non-player twin: its puppet row goes (its AI stays off) and it is queued; TwinSleepTick takes it, leaves it waiting for its
+           runner's SPAWN, or puts its squad to sleep (twinsleep::WithdrawBranch) */
+        if (twinsleep::WithdrawBranch(IsTwinUid(uid) ? 1 : 0, player ? 1 : 0, kind, -1) != twinsleep::kUnchanged)
+        {
+            TwinSleepQueue(uid, kind);
+            DebugLog("[M1] UNLOAD uid=" + S(uid) + " - a shared-save twin: puppet withdrawn, character NOT destroyed, row kept (H030); queued - "
+                     + std::string(kind == twinsleep::kKindRunnerRuns ? "its runner still runs it: its squad is put to sleep at the runner's last spot when this game's engine does not keep that spot, else it waits with its AI off for the runner's SPAWN"
+                                   : kind == twinsleep::kKindNeverTake ? "a REVOKE named no winner: its squad is put to sleep (taken only as the last resort)"
+                                   : "nobody runs it: taken here if this game's engine keeps its squad's spot, else its squad is put to sleep"));
+            return;
+        }
+        UnpuppetForOwnership(uid);   // the local AI has it again, as after a handoff
+        DebugLog("[M1] UNLOAD uid=" + S(uid) + " - the watched player / a player-faction character: puppet withdrawn, character NOT destroyed, row kept (H030)");
         return;
     }
     DebugLog("[M1] UNLOAD uid=" + S(uid) + " - the owner withdrew it (its engine put it away, or its announcement was withdrawn); retiring our copy (not a death)");   /* M7a3f2: the old text named one cause for every UNLOAD */
@@ -2266,6 +2937,7 @@ static int RemoveLocalCopy(unsigned int uid, ::Character* c, const char* what, b
     DropPuppet(uid);                       // 1
     MirrorRetire(c);                       // 2
     g_spawned.erase(uid);
+    g_twinUids.erase(uid);                 /* its body is gone: a later copy of this uid is no save-born twin */
     NameForgetUid(uid);                    // names1
     SlaveForgetUid(uid);                   // slave1
     coop::LimbsForgetUid(uid);             // LIMBS: a recorded limb block names this copy only
@@ -2292,7 +2964,7 @@ static int RemoveLocalCopy(unsigned int uid, ::Character* c, const char* what, b
     // mirror1 (crash T487) C: the copy is gone, so its row is released (4). AFTER the destroy, because
     // the destroy detour identifies our own destruction through this row. A copy the engine refused to
     // destroy keeps its retired row: its body is still standing at that address.
-    if (destroyed) MirrorRelease(c, uid, false);   // 4
+    if (destroyed) MirrorRelease(c, uid, false, kP141RouteRemoveCopy, what);   // 4
 
     DebugLog(std::string("[M1] ") + what + " applied uid=" + S(uid)
              + (destroyed ? " - copy destroyed, matching the authority"
@@ -2387,14 +3059,102 @@ static ::Faction* GoneCopyFactionPod(::Character* c)   /* the faction read under
     __try { return c->getOwnerFactionDirect(); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-int CopyIsPlayerCharacter(unsigned int uid)
+static int PlayerCharClassOf(::Character* c)   /* 1 a player character / player-faction person, 0 an NPC, -1 its faction unreadable */
 {
-    ::Character* c = FindSpawned(uid);
-    if (c == 0) return -2;
     if (c == GetTarget() || IsPlayerFactionPod(c) == 1) return 1;
     ::Faction* f = GoneCopyFactionPod(c);
     if (!PlausibleObject(f)) return -1;
     return IsStandInFaction(f) ? 1 : 0;
+}
+int CopyIsPlayerCharacter(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    if (c == 0) return -2;
+    return PlayerCharClassOf(c);
+}
+
+// The player-character table's own answer (below). As PlayerCharClassOf, except that a faction counts as a player's by
+// AnyPlayersFaction's test (playerfaction.cpp): this game's own, a stand-in, or a faction whose record id names a player's slot -
+// so a player's faction from the save still counts while the stand-in table is empty after a world load
+// (ResetPlayerFactionState). A record id that cannot be read answers -1 (the sweep keeps the row's last answer), where
+// AnyPlayersFaction counts it a player's.
+static int PlayerCharSweepClassOf(::Character* c)
+{
+    if (c == GetTarget() || IsPlayerFactionPod(c) == 1) return 1;
+    ::Faction* f = GoneCopyFactionPod(c);
+    if (!PlausibleObject(f)) return -1;
+    if (IsStandInFaction(f)) return 1;
+    const int slot = StandInRecordSlot(f);   /* >= 0 a player's slot, -2 the old two-player id, -1 any other, -3 unreadable */
+    if (slot == -1) return 0;
+    if (slot == -3) return -1;
+    return 1;
+}
+
+// THE PLAYER-CHARACTER TABLE: for every character row (this game's own and the copies), a player character / player-faction person
+// or an NPC, readable from the AI worker thread, where the engine's melee hit runs (combat.cpp detour_hitByMelee asks it which game
+// decides a blow). Two coopown::OwnedMirror tables, the lock-free table the owned-uid mirror uses (common/ownedmirror.h): this
+// MAIN THREAD sweep is their only writer, any thread reads, nothing is allocated or locked on the read side, and a crowded table
+// is rebuilt into its spare buffer and published with one pointer swap. A row whose faction cannot be read keeps its last answer; a
+// uid with no row any more leaves both tables. A character made, handed over or moved to another faction is classified at the
+// next sweep (up to 0.5 s); until then it is in neither table and THIS game keeps today's rule for its blows. The two games sweep
+// at different moments, so for that half second they can disagree on one swing: when the attacker's game has not classified the
+// pair yet it sends nothing while the NPC's game, which has, ignores its own result - that blow lands nowhere (counted on the
+// attacker's game, meleeKeptUnclassified); when the attacker's game sends and the NPC's game has not classified the pair, the NPC's
+// game keeps its own result and refuses the message (why=rule). One window remains: the NPC's game decides whether to keep its own
+// result when its own swing lands, but checks the rule for the attacker's message when it drains it; if its sweep classifies the
+// pair in between, both results apply - at most once per newly classified pair, within about one sweep plus the network delay.
+namespace {
+coopown::OwnedMirror g_pcPlayerMirror;
+coopown::OwnedMirror g_pcNpcMirror;
+std::set<unsigned int> g_pcPlayerSet, g_pcNpcSet;   /* what each table holds, MAIN THREAD - the rebuild's source */
+DWORD g_pcNextSweep = 0;
+long long g_pcSweeps = 0;
+void PcTableSync(coopown::OwnedMirror* m, std::set<unsigned int>* cur, std::set<unsigned int>& next)
+{
+    for (std::set<unsigned int>::const_iterator it = cur->begin(); it != cur->end(); ++it)
+        if (next.find(*it) == next.end()) coopown::OwnedMirrorErase(m, *it);
+    for (std::set<unsigned int>::const_iterator it = next.begin(); it != next.end(); ++it)
+        if (cur->find(*it) == cur->end()) coopown::OwnedMirrorInsert(m, *it);
+    cur->swap(next);
+    if (coopown::OwnedMirrorNeedsRebuild(m))
+    {
+        coopown::OwnedTable* t = coopown::OwnedMirrorRebuildBegin(m);
+        for (std::set<unsigned int>::const_iterator it = cur->begin(); it != cur->end(); ++it)
+            coopown::OwnedMirrorRebuildAdd(m, t, *it);
+        coopown::OwnedMirrorRebuildPublish(m, t);
+    }
+}
+} // namespace (player-character table)
+
+void PlayerCharTableTick()
+{
+    const DWORD now = ::GetTickCount();
+    if (g_pcSweeps > 0 && (long)(now - g_pcNextSweep) < 0) return;
+    g_pcNextSweep = now + 500;
+    ++g_pcSweeps;
+    std::set<unsigned int> players, npcs;
+    for (int i = 0; i < kMaxMirror; ++i)
+    {
+        unsigned int uid = 0;
+        ::Character* c = 0;
+        if (!MirrorSlot(i, &uid, &c) || uid == 0 || c == 0) continue;
+        const int k = PlayerCharSweepClassOf(c);
+        if (k == 1) players.insert(uid);
+        else if (k == 0) npcs.insert(uid);
+        else if (g_pcPlayerSet.find(uid) != g_pcPlayerSet.end()) players.insert(uid);
+        else if (g_pcNpcSet.find(uid) != g_pcNpcSet.end()) npcs.insert(uid);
+    }
+    for (std::set<unsigned int>::const_iterator it = players.begin(); it != players.end(); ++it) npcs.erase(*it);
+    PcTableSync(&g_pcPlayerMirror, &g_pcPlayerSet, players);   /* the player table first: a uid turning player is never in neither */
+    PcTableSync(&g_pcNpcMirror, &g_pcNpcSet, npcs);
+}
+
+int IsUidPlayerCharAnyThread(unsigned int uid)
+{
+    if (uid == 0) return -1;
+    if (coopown::OwnedMirrorHas(&g_pcPlayerMirror, uid)) return 1;
+    if (coopown::OwnedMirrorHas(&g_pcNpcMirror, uid)) return 0;
+    return -1;
 }
 
 // The copy's horizontal distance from (x, z); -1 when its position cannot be read (SafeReadPosition, F316).
@@ -2451,6 +3211,7 @@ int RepeatSpawnAct(unsigned int uid, float x, float y, float z)
     const bool rebuild = (act == stalecopy::kSpawnRebuild);
     /* a copy made again keeps the owner's medical words OnSpawn has just written from this SPAWN: its looks read the knocked-out
        word. A copy booked lost forgets them as an UNLOAD does; the SPAWN that brings it back writes them whole again. */
+    /* PROBE P143 BEGIN */ const double p143MoveAge = PuppetLastMoveAgeSec(uid); /* PROBE P143 END */
     const int r = RemoveLocalCopy(uid, c, "STALE COPY", rebuild);
     /* a copy made again is a new body: the marks the old body left - its applied look, a waiting SPAWN death's built / look
        progress, its cage, bed and restraint marks - are forgotten, so the new body is dressed, killed and posed as a fresh copy is */
@@ -2461,6 +3222,7 @@ int RepeatSpawnAct(unsigned int uid, float x, float y, float z)
         PrisonForgetCopy(uid);
     }
     if (r == 1) ++g_spawnStaleCopyRetired;
+    /* PROBE P143 BEGIN */ if (r == 1 && !rebuild) net::P143CopyGone(uid, "stale copy destroyed by a SPAWN far from it", 0, -1, -1, true, x, y, z, p143MoveAge); /* PROBE P143 END */
     if (r == 1 && !rebuild) net::LostCopyNote(uid, true, x, y, z);
     DebugLog("[M1] spawn uid " + S(uid) + ": its copy here stood " + F1(dist) + " units from the SPAWN's spot (" + F1(x) + "," + F1(z)
              + ") - stale; " + std::string(r == 1 ? "copy destroyed"
@@ -2480,10 +3242,12 @@ int RetireCopyOwnerUnloaded(unsigned int uid, float x, float y, float z)
     if (c == 0) return -2;
     bool player = false;
     if (WithdrawNotDestroy(uid, c, &player)) return -2;
+    /* PROBE P143 BEGIN */ const double p143MoveAge = PuppetLastMoveAgeSec(uid); /* PROBE P143 END */
     const int r = RemoveLocalCopy(uid, c, "OWNER AWAY");
     if (r == 1)
     {
         ++g_farUnloadedRetired;
+        /* PROBE P143 BEGIN */ net::P143CopyGone(uid, "copy destroyed: its owner's character is in an area not loaded here", 0, -1, -1, true, x, y, z, p143MoveAge); /* PROBE P143 END */
         net::LostCopyNote(uid, true, x, y, z);
     }
     DebugLog("[M1] uid=" + S(uid) + ": its owner's character is at " + F1(x) + "," + F1(z) + ", in an area not loaded here - the copy"
@@ -2532,7 +3296,7 @@ unsigned int FindSpawnedUid(const void* obj)
 // `FindSpawnedUid` returns 0 for a retired slot, and that is right for every normal caller: `dead`
 // means "do not touch this pointer". But the destroy detour is not asking whether the object is
 // safe to read - it is asking **what this address WAS**, so it can drop the puppet and, if we
-// authored the uid, tell the peer. Resolving a uid dereferences nothing.
+// authored the uid, tell the peer. Resolving a uid reads only the object's own handle (SEH-guarded, below).
 //
 // F334 - **what it UNLOCKS does dereference, and that is worth stating plainly rather than hiding
 // behind "a uid is just a number".** `DropPuppet` reads `p.ch->movement` to restore the speed it
@@ -2553,25 +3317,35 @@ unsigned int FindSpawnedUid(const void* obj)
 // which happens BEFORE the engine destroys it. On that path `FindSpawnedUid` answers 0, so
 // `DropPuppet` never runs and the authority never announces - the F326 fix silently skipped for
 // exactly the characters that produced the `mv=NOCHAR` puppets it was written for.
-unsigned int FindSpawnedUidForDestroy(const void* obj)
+//
+// THE ADDRESS NAMES THE ROW, NOT THE CHARACTER. A dead row keeps its address while the engine frees
+// that memory and builds another object there; answering the dead row's uid for that object sent it
+// to NotifyDespawn, whose put-away reads took it for a Character (worldPosition's virtual call at
+// +0x448 ran a record's code) and the engine then freed it a second time. So the object's own handle,
+// read while it is whole, must carry the serial the row stored at registration
+// (livechar::DestroyIdentityOf). Another serial, or no CHARACTER handle at all: 0 is the answer. A
+// dead row that stored no handle answers 0 (nothing proves the object is that character); a live row
+// that stored none keeps the address answer when the object reads as a character.
+// FindSpawnedUidOnDestroy is the destroy hook's call: there the engine IS destroying the object, so a
+// row it is not the character of is marked destroyed (its address belongs to another object now) and
+// counted (destroyAddrReusedChar / destroyAddrReusedNotChar). FindSpawnedUidForDestroy is the plain
+// lookup the other callers use: the same answer, nothing marked, counted or logged.
+static unsigned int FindUidForDestroyImpl(const void* obj, bool onDestroy)
 {
     if (obj == 0) return 0;
-    int h = IndexHash(obj);
-    for (int probe = 0; probe < kIndexSlots; ++probe)
+    DestroyRowCheck c;
+    DestroyRowCheckOf(obj, &c);
+    if (!c.found || c.destroyed != 0) return 0;
+    if (livechar::DestroyMarksRow(c.verdict))
     {
-        const UidMirror& slot = g_index[(h + probe) & kIndexMask];
-        if (slot.obj == 0)   return 0;
-        if (slot.obj == obj)
-        {
-            // mirror1 fold (review-mirror1 #4): the same re-check as FindSpawnedUid.
-            const unsigned int u = *(const volatile unsigned int*)&slot.uid;
-            const LONG x = slot.destroyed;
-            if (*(const void* const volatile*)&slot.obj != obj) return 0;
-            return x ? 0 : u;
-        }
+        LONG wasDestroyed = 1;
+        if (onDestroy && MarkAddressDestroyed(obj, &wasDestroyed, 2) && wasDestroyed == 0) DestroyAddrReusedNote(c);   /* PROBE P141: mark 2 */
+        return 0;
     }
-    return 0;
+    return livechar::DestroyAnswersUid(c.verdict) ? c.uid : 0;
 }
+unsigned int FindSpawnedUidForDestroy(const void* obj) { return FindUidForDestroyImpl(obj, false); }
+unsigned int FindSpawnedUidOnDestroy(const void* obj)  { return FindUidForDestroyImpl(obj, true); }
 
 // P034 drives these. Retirement is not removal: the slot keeps its pointer forever so the hash
 // chain stays intact, and only the `dead` flag moves.
@@ -2612,11 +3386,13 @@ int MirrorReclaimDestroyed()
         if (!coopuid::ReclaimRow(o != 0 ? 1 : 0, g_mirror[i].dead ? 1 : 0, g_mirror[i].destroyed ? 1 : 0)) continue;
         const unsigned int uid = g_mirror[i].uid;
         std::map<unsigned int, RootObjectBase*>::iterator it = g_spawned.find(uid);
-        if (it != g_spawned.end() && (const void*)it->second == o) g_spawned.erase(it);
+        if (it != g_spawned.end() && (const void*)it->second == o) { g_spawned.erase(it); g_twinUids.erase(uid); }   /* its body is gone: a later copy is no save-born twin */
         DropPuppetIfObject(uid, o);   // no dereference: the object is gone
-        if (MirrorRelease(o, uid, false))
+        const LONG p141By = g_p141RowMarkBy[i]; char p141Why[32]; std::memcpy(p141Why, g_p141RowMarkWhy[i], sizeof(p141Why)); p141Why[31] = 0;   /* PROBE P141 */
+        if (MirrorRelease(o, uid, false, kP141RouteReclaim))
         {
             ++g_mirrorReclaimed; ++n;
+            if (p141By == 2 && !net::IsUidMine(uid)) P141NoteNotOursDestroy(uid, 0, p141Why[0] != 0 ? p141Why : 0, 2);   /* PROBE P141: the destroy hook answered not ours for this copy's row */
             // mirror1 fold (review-mirror1 #10): the uid is finished, so the per-uid marks RemoveLocalCopy forgets go too -
             // unless the map still names the uid at ANOTHER object (then the uid lives on there and the marks are its own).
             if (g_spawned.find(uid) == g_spawned.end())
@@ -2652,46 +3428,28 @@ void MirrorRetire(const void* obj)
 // Returns true when the object was one of ours, so the hook can count how much of the engine's
 // destruction traffic actually concerns us without doing the counting itself.
 //
-// SAFE OFF-THREAD, and the reasoning is the same as everything else in this table: it compares
-// ADDRESSES and never dereferences the object, and it publishes with `InterlockedExchange`. It is
-// called while the object is still valid - before the original `destroy` runs - so even the
-// address comparison is against live memory.
+// SAFE OFF-THREAD: the marks are address compares published with `InterlockedExchange` under the
+// row lock (MarkAddressDestroyed), and the one read of the object is its handle through
+// DestroyRowCheckOf (SEH-guarded, no engine call, taken before the lock). It is called while the
+// object is still valid - before the original `destroy` runs.
 //
 // This is a PERMANENT retirement, not the reversible kind P034 issues. A failed handle resolve
 // means "not right now" (a region streamed out, and F284 was careful to allow it back); the engine
-// telling us it is destroying the object means "never again".
-bool RetireOnDestroy(const void* obj)
+// telling us it is destroying the object means "never again". Every row at the address is marked
+// whatever the object is - its address is being destroyed either way - but the answer "ours" (which
+// sends the object to NotifyDespawn) needs the same identity FindSpawnedUidForDestroy asks: a row
+// whose stored handle is not the object's, or a dead row that stored none, is not ours.
+bool RetireOnDestroy(const void* obj, const char* reason)
 {
     if (obj == 0) return false;
-    // F328: `destroyed` is published BEFORE `dead` in both tables. A reader that can see `dead` must
-    // already be able to see `destroyed`, or `MirrorAdd` could un-retire in the gap between the two
-    // stores - which is the exact resurrection this flag exists to prevent.
-    // mirror1 fold (review-mirror1 #5): the check and the marks are one step under the row lock (see g_mirrorRowLock), so a
-    // row the main thread frees and refills cannot receive this object's marks.
-    MirrorRowLock();
-    bool ours = false;
-    for (int i = 0; i < kMaxMirror; ++i)
-        if (g_mirror[i].obj == obj)
-        {
-            InterlockedExchange(&g_mirror[i].destroyed, 1);
-            InterlockedExchange(&g_mirror[i].dead, 1);
-            ours = true;
-        }
-    int h = IndexHash(obj);
-    for (int probe = 0; probe < kIndexSlots; ++probe)
-    {
-        UidMirror& slot = g_index[(h + probe) & kIndexMask];
-        if (slot.obj == 0) break;
-        if (slot.obj == obj)
-        {
-            InterlockedExchange(&slot.destroyed, 1);
-            InterlockedExchange(&slot.dead, 1);
-            ours = true;
-            break;
-        }
-    }
-    MirrorRowUnlock();
-    return ours;
+    DestroyRowCheck c;
+    DestroyRowCheckOf(obj, &c);
+    LONG wasDestroyed = 1;
+    if (!MarkAddressDestroyed(obj, &wasDestroyed, (!c.found || livechar::DestroyAnswersUid(c.verdict)) ? 1 : 2, reason)) return false;   /* PROBE P141: mark 1 = the answer below is ours, 2 = not ours */
+    if (!c.found) return true;   // a mirror row with no index row: no stored handle to ask
+    if (wasDestroyed == 0 && livechar::DestroyMarksRow(c.verdict)) DestroyAddrReusedNote(c);
+    if (wasDestroyed == 0 && c.verdict == livechar::kDestroyNoProof) ::InterlockedIncrement64(&g_destroyDeadNoHandle);
+    return livechar::DestroyAnswersUid(c.verdict);
 }
 
 // F334 - THE IDENTITY IS FINISHED, THOUGH WE ARE NOT THE ONES ENDING IT.
@@ -2762,6 +3520,7 @@ bool MirrorMarkDestroyed(const void* obj, unsigned int uid)
     for (int i = 0; i < kMaxMirror; ++i)
         if (g_mirror[i].obj == obj && g_mirror[i].uid == uid)
         {
+            g_p141RowMarkBy[i] = 3;   /* PROBE P141 */
             InterlockedExchange(&g_mirror[i].destroyed, 1);
             InterlockedExchange(&g_mirror[i].dead, 1);
         }
@@ -2779,6 +3538,28 @@ bool MirrorMarkDestroyed(const void* obj, unsigned int uid)
     }
     return true;
 }
+
+/* TEST-ONLY (the `addrreuse` lever, items.cpp AddrReuseCommand): a DEAD row for `obj` - an address no row holds - under a uid
+   from the top of the uid space, with a stored handle no object carries, so the next destroy of `obj` meets a dead row at its
+   address that is not its character: the engine reusing a retired character's address. MAIN THREAD. Returns the uid, or 0 when
+   the address already has a row or the table refused one. AddrReuseTestDrop finishes the row when the destroy did not happen. */
+unsigned int AddrReuseTestRow(const void* obj)
+{
+    static unsigned int s_next = 0xFFFFF000u;
+    if (obj == 0 || StoredRowOf(obj) != 0) return 0;
+    for (int tries = 0; tries < 16 && (s_next == 0 || g_spawned.find(s_next) != g_spawned.end()); ++tries)
+        s_next = (s_next == 0xFFFFFFFFu) ? 0xFFFFF000u : s_next + 1;
+    if (s_next == 0 || g_spawned.find(s_next) != g_spawned.end()) return 0;
+    const unsigned int uid = s_next;
+    s_next = (s_next == 0xFFFFFFFFu) ? 0xFFFFF000u : s_next + 1;
+    if (!MirrorAdd(uid, obj)) return 0;
+    UidMirror* row = StoredRowOf(obj);
+    if (row == 0) { MirrorMarkDestroyed(obj, uid); return 0; }
+    row->hIndex = 1; row->hSerial = 0xFFFFFFFEu;   // a handle no object carries
+    MirrorRetire(obj);
+    return uid;
+}
+void AddrReuseTestDrop(const void* obj, unsigned int uid) { MirrorMarkDestroyed(obj, uid); }
 
 // F337 - **THE DECLINE IS NOT A NO-OP, AND TREATING IT AS ONE ALIASED A DEAD UID ONTO A LIVE
 // CHARACTER.**
@@ -2817,6 +3598,7 @@ void RetireStaleUid(unsigned int uid)
     // another character, and the restore would write our saved value into it.
     DropPuppet(uid, false);     // stop driving something we can no longer identify
     g_spawned.erase(uid);       // and stop FindSpawned resolving it onto the new occupant
+    g_twinUids.erase(uid);      /* the body it named is gone: a later copy of this uid is no save-born twin */
     NameForgetUid(uid);         // names1: the last name sent for it describes a character we can no longer identify
     SlaveForgetUid(uid);        // slave1: the same for its last slave state sent
     coop::LimbsForgetUid(uid);  // LIMBS: and a recorded limb block for it
@@ -3497,6 +4279,7 @@ void ReportSpawns()
        << " despawnUnload=" << S(g_despawnUnload) << " despawnUnloadByReason=" << S(g_despawnUnloadByReason) << " removalReasons=" << RemovalReasonsToken()
        << " unloadRecv=" << S(g_unloadRecv) << " unloadApplied=" << S(g_unloadApplied) << " unloadUnknown=" << S(g_unloadUnknown) << " unloadDroppedStale=" << S(g_unloadDroppedStale)
        << " unloadWithdrawnTwin=" << S(g_unloadWithdrawnTwin) << " unloadWithdrawnPlayer=" << S(g_unloadWithdrawnPlayer)
+       << TwinSleepToken()   /* the twin sleep queue, and the bodies awake here that no game runs (must read 0) */
        << " despawnKeptPlayer=" << S(g_despawnKeptPlayer)
        // review-session S6 - the link-drop cleanup, its own block. NONE of these is included in the
        // despawn/unload numbers above: those count what the AUTHORITY told us, and a dropped link
@@ -8964,6 +9747,33 @@ void BedHandoffStart(const PrisonOp& op, ::Character* c, ::Character* cc)
     g_bedHandoffs.push_back(h);
 }
 
+/* PROBE P144 BEGIN */
+/* T-875: a character this game put in a bed for the other game's rescuer - its height against the ground when it is put there and when
+   it leaves the bed (a bed above the ground may leave it standing on a roof). Log only; at most 16 watched, each for up to 10 min. */
+struct P144Watch { unsigned int uid; float spotY; DWORD since; };
+std::vector<P144Watch> g_p144;
+float P144Ground(float x, float z) { float g = 0.0f; return coop::GroundTerrainHeightAt(x, z, &g) == 1 ? g : -99999.0f; }
+void P144Tick()
+{
+    if (g_p144.empty()) return;
+    const DWORD now = ::GetTickCount();
+    for (size_t i = 0; i < g_p144.size(); )
+    {
+        ::Character* c = FindSpawned(g_p144[i].uid);
+        const bool gone = c == 0 || !PlausibleObject(c);
+        const int inBed = gone ? -1 : PoseInSomethingPod(c);
+        if (inBed == 1 && now - g_p144[i].since < 600000u) { ++i; continue; }
+        Ogre::Vector3 at;
+        if (!gone && SafeReadPosition(c, &at))
+            DebugLog("[P144] bed " + std::string(inBed == 1 ? "watch ended (still in it after 10 min)" : "left") + " uid=" + S((long long)g_p144[i].uid)
+                     + " at y=" + S((long long)at.y) + " ground y=" + S((long long)P144Ground(at.x, at.z)) + " (put in at y=" + S((long long)g_p144[i].spotY) + ")");
+        else
+            DebugLog("[P144] bed watch ended uid=" + S((long long)g_p144[i].uid) + " (the character is gone or its position unreadable)");
+        g_p144.erase(g_p144.begin() + i);
+    }
+}
+/* PROBE P144 END */
+
 // stage 3: the second look
 void BedHandoffConfirm(const BedHandoff& h, ::Character* c, SetBedModeFn setBed)
 {
@@ -8978,6 +9788,17 @@ void BedHandoffConfirm(const BedHandoff& h, ::Character* c, SetBedModeFn setBed)
         return;
     }
     ++g_bedApplied;
+    /* PROBE P144 BEGIN */
+    {
+        Ogre::Vector3 at;
+        if (SafeReadPosition(c, &at))
+        {
+            DebugLog("[P144] bed put-in uid=" + S((long long)op.uid) + " spot y=" + S((long long)op.pos[1]) + " at y=" + S((long long)at.y)
+                     + " ground y=" + S((long long)P144Ground(at.x, at.z)));
+            if (g_p144.size() < 16) { P144Watch w; w.uid = op.uid; w.spotY = at.y; w.since = ::GetTickCount(); g_p144.push_back(w); }
+        }
+    }
+    /* PROBE P144 END */
     PrisonLog("<- BED uid=" + S((long long)op.uid) + " put in the bed on the rescuer's spot (distance " + S((long long)dist)
               + ", still there a second later" + std::string(h.op.fromCarry != 0 ? ", entered from the carry" : "") + ") - the other game's rescuer put its copy there");
     StatePush(op.uid);   // a STATE at once; the bed itself travels in the next POSE push
@@ -8985,6 +9806,7 @@ void BedHandoffConfirm(const BedHandoff& h, ::Character* c, SetBedModeFn setBed)
 
 void BedHandoffDrain()
 {
+    P144Tick();   /* PROBE P144 */
     if (g_bedHandoffs.empty()) return;
     if (EngineWritesBlocked() || kSetBedModeRva == 0) { g_bedHandoffs.clear(); return; }
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
@@ -11454,7 +12276,7 @@ void* BuildingGetTown(void* building)
 }
 long long g_ctxSent = 0, g_ctxSendFailed = 0, g_ctxRecv = 0;
 // M-B / H026 - the apply side.
-struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; };
+struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; };   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
 std::map<unsigned int, PendingContext> g_pendingCtx;
 bool PendingCtxHasUid(unsigned int uid) { return g_pendingCtx.find(uid) != g_pendingCtx.end(); }   // M4 fold: AllocateUid's row check (declared above it, same namespace)
 std::map<std::string, void*> g_ctxPlatoons;   // key: id|<squad id>|<faction> (ctxkey.h, CtxIdKey); older senders: squadSid|hand index:serial|townSid -> Platoon*
@@ -11483,14 +12305,19 @@ static int DestroyPlatoonPodImpl(Faction* f, void* platoon)
 }
 long long g_ctxSupersededAsleep = 0, g_ctxSupersedeFailed = 0;
 long long g_ctxSupersedeOwnIdRefused = 0; std::set<std::string> g_ctxOwnIdRefusedSeen;   /* inv7a3 (review-inv7a2 HIGH) */
+long long g_ctxOwnIdReloadLifted = 0; std::set<std::string> g_ctxOwnIdReloadLiftedSeen;   /* a copy its own members named this game's, found to be the stale copy on the fresh-load test: no refusal */
+long long g_ctxOwnIdLiftWithheldLowerSeat = 0; std::set<std::string> g_ctxOwnIdLiftWithheldSeen;   /* both copies fresh and this game's seat the lower one: its copy stays, refused */
 long long g_ctxHandedOverKeptMine = 0; std::set<std::string> g_ctxHandedOverKeptMineSeen;   /* M7a3f4 item 1 [m7a3f4-sc1]: a handed-over squad's own awake copy kept - a person this game runs is in it */
 long long g_ctxHandedOverSupersede = 0; std::set<std::string> g_ctxHandedOverSeen;   /* M7a3f3 T-425 [m7a3f3-sc1]: my own id, but a squad I handed over */
 std::set<std::string> g_ctxAwakeSameIdSeen; long long g_ctxAwakeSameId = 0, g_ctxRetiredAwake = 0, g_ctxRetireFailed = 0, g_ctxRetireSkippedSession = 0;
 /* inv7e2 (T418): the reloaded save's copies of the peer's squads - retired, withdrawn, or kept for an earlier generation */
 long long g_staleRetiredReloaded = 0, g_staleWithdrawnReloaded = 0, g_staleKeptEarlierGen = 0; std::set<std::string> g_staleKeptSeen;
 long long g_staleKeptNotReloaded = 0, g_staleKeptNoSlot = 0;   /* inv7e2 fold: this game did not reload since its last link-down / its slot is unknown */
-/* inv7e2: classify a platoon's session members (standinpurge.h ReloadMemberClass) and decide. uids and nOut: the members read. */
-static int ReloadVerdict(void* platoon, int mySlot, unsigned int* uids, int cap, int* nOut)
+/* inv7e2: classify a platoon's session members (standinpurge.h ReloadMemberClass) and decide. uids and nOut: the members read.
+   ageTest 0: the load test is a reload since this game's last link-down (ReloadedSinceLinkDown); 1: no load test here - the caller weighs
+   the two games' world-load ages (squadorigin.h OwnIdLiftedByLoadAge) - and kReloadRetire then says every session member was picked up
+   by this game's sweep from its current world load. */
+static int ReloadVerdict(void* platoon, int mySlot, unsigned int* uids, int cap, int* nOut, int ageTest)
 {
     *nOut = 0;
     const int n = PlatoonSessionMemberUids(platoon, uids, cap);
@@ -11503,7 +12330,8 @@ static int ReloadVerdict(void* platoon, int mySlot, unsigned int* uids, int cap,
         if (c == coopsp::kMemberAdoptedThisGen) ++thisGen; else if (c == coopsp::kMemberEarlierGen) ++earlier; else ++other;
     }
     *nOut = n;
-    return coopsp::ReloadRetireDecide(1, mySlot >= 0 ? 1 : 0, coopsp::ReloadedSinceLinkDown(cur, StoreWorldGenAtLinkDown()), thisGen, earlier, other);
+    const int loadBit = ageTest != 0 ? 1 : coopsp::ReloadedSinceLinkDown(cur, StoreWorldGenAtLinkDown());
+    return coopsp::ReloadRetireDecide(1, mySlot >= 0 ? 1 : 0, loadBit, thisGen, earlier, other);
 }
 /* inv7e (run T412) - A CONTEXT SQUAD KEEPS THE OTHER GAME'S ID ACROSS A SAVE. The engine gives a new squad its own
    stringID (`<faction>_<n>`, Platoon+0x78), files it in the squad's state record (Platoon+0x40, stringFields "platoon
@@ -11540,7 +12368,7 @@ void CarryPeerPlatoonId(Faction* faction, void* platoon, const std::string& id)
              + (r == coopsp::kCarryYes ? "carries the other game's id (live field + saved entry)" : (r == coopsp::kCarrySkipClash ? "NOT carried - another squad of the faction holds that id" : "NOT carried - no state record"))
              + " carried=" + S(g_staleIdCarried) + " skippedClash=" + S(g_staleIdSkippedClash) + " skippedNoState=" + S(g_staleIdSkippedNoState)
              + " | same-id supersede so far: retiredAwake=" + S(g_ctxRetiredAwake) + " supersededAsleep=" + S(g_ctxSupersededAsleep)
-             + " retireSkippedSession=" + S(g_ctxRetireSkippedSession) + " retireFailed=" + S(g_ctxRetireFailed) + " ownIdRefused=" + S(g_ctxSupersedeOwnIdRefused) + " handedOverSupersede=" + S(g_ctxHandedOverSupersede) + " handedOverKeptMine=" + S(g_ctxHandedOverKeptMine) /* [m7a3f4-sc2] */ /* [m7a3f3-sc2] */
+             + " retireSkippedSession=" + S(g_ctxRetireSkippedSession) + " retireFailed=" + S(g_ctxRetireFailed) + " ownIdRefused=" + S(g_ctxSupersedeOwnIdRefused) + " handedOverSupersede=" + S(g_ctxHandedOverSupersede) + " handedOverKeptMine=" + S(g_ctxHandedOverKeptMine) + " ownIdReloadLifted=" + S(g_ctxOwnIdReloadLifted) + " ownIdLiftWithheldLowerSeat=" + S(g_ctxOwnIdLiftWithheldLowerSeat) /* [m7a3f4-sc2] */ /* [m7a3f3-sc2] */
              + " retiredReloaded=" + S(g_staleRetiredReloaded) + " withdrawnReloaded=" + S(g_staleWithdrawnReloaded) + " keptEarlierGen=" + S(g_staleKeptEarlierGen)
              + " keptNotReloaded=" + S(g_staleKeptNotReloaded) + " keptNoSlot=" + S(g_staleKeptNoSlot));
 }
@@ -11587,6 +12415,7 @@ static bool PlatoonIdPod(void* platoon, std::string* out)
 }
 long long g_platoonIdFaultRoster = 0, g_platoonIdFaultCtx = 0;
 long long g_ctxTownOk = 0, g_ctxTownMiss = 0, g_ctxBuildingOk = 0, g_ctxBuildingMiss = 0, g_ctxBuildingFar = 0, g_ctxSquadOk = 0, g_ctxSquadMiss = 0;
+long long g_ctxHomePlayerHouse = 0;   /* review MED 2: copies whose home building is a player's house here - built with no home */
 
 /* A COPY SQUAD NEVER SAVES UNDER ANOTHER SQUAD'S ID (copysquadid.h).  The save keeps one platoon/<id>.platoon per id whatever
    the faction, so a copy squad's engine id is checked against every squad of every faction this game holds, awake and
@@ -11774,6 +12603,48 @@ void CopySquadIdCheckHired(::Faction* faction, void* active)
                  + S(g_ctxCopyIdKept) + ")");
 }
 
+/* T-710: A COPY SQUAD LOADED FROM THE SAVE UNDER THIS GAME'S OWN SQUAD ID.  A save made before the copy-squad id check existed can
+   hold a copy squad (a player's stand-in faction) whose id is one of this game's own squads' ids; both share one squad file.  Once the
+   copy squad's characters have been read in from that file (store.cpp OwnClaimWatchNote queues it after the engine's load), it gets
+   the check a copy squad gets when it is made (CopySquadIdCheck, via=load): a fresh id, and its "content file" renamed with it, so the
+   next save files it apart from this game's own squad.  `platoon` is only compared as a pointer until it is found in the awake or
+   asleep list of a stand-in faction (by the table or by its record id); its engine id must still be `id`.  1 renamed, 0 kept (no
+   other squad holds the id), -1 not such a squad any more, -2 the check could not rename it (its own line says why; store.cpp counts
+   it, renameFail, and the save-time line names the id).  Until the next save writes the renamed file, the renamed content file names
+   a file the loaded save does not hold: a sleep and wake before that save may read no characters for it (not handled).  MAIN THREAD. */
+int CopySquadIdCheckAtLoad(void* platoon, const std::string& id)
+{
+    if (platoon == 0 || id.empty() || coop::GameWorldPtr() == 0 || !PlausiblePtr(coop::GameWorldPtr()->factionDirectory)) return -1;
+    const lektor<Faction*>* all = coop::GameWorldPtr()->factionDirectory->allFactions();
+    if (all == 0) return -1;
+    std::vector<Faction*> fs;
+    for (unsigned i = 0; i < all->size() && i < 4096; ++i) fs.push_back((*all)[i]);
+    { int slots[kStandInTableCap]; ::Faction* si[kStandInTableCap]; const int n = StandInList(slots, si, kStandInTableCap); for (int i = 0; i < n && i < kStandInTableCap; ++i) fs.push_back((Faction*)si[i]); }
+    Faction* holder = 0;
+    for (size_t fi = 0; fi < fs.size() && holder == 0; ++fi)
+    {
+        Faction* f = fs[fi];
+        if (!PlausibleObject(f)) continue;
+        if (!IsStandInFaction((::Faction*)f) && coopsp::IsStandInRecord(StandInRecordSlot((::Faction*)f)) == 0) continue;
+        void** items = 0; unsigned n = 0;
+        if (FactionActiveListPod((void*)f, &items, &n) == 1 && n <= 4096 && (n == 0 || PlausiblePtr(items)))
+            for (unsigned i = 0; i < n && holder == 0; ++i) if (items[i] == platoon) holder = f;
+        const lektor<Platoon*>* ul = f->unloadedSquads();
+        if (ul != 0) for (unsigned i = 0; i < ul->size() && i < 4096 && holder == 0; ++i) if ((void*)(*ul)[i] == platoon) holder = f;
+    }
+    if (holder == 0) return -1;
+    std::string engineId;
+    if (!PlatoonIdPod(platoon, &engineId) || engineId != id) return -1;
+    std::string fresh;
+    const int d = CopySquadIdCheck(holder, platoon, engineId, &fresh, "load");
+    if (d == copysq::kIdKeep)
+    {
+        DebugLog("[CTX] copy squad " + P(platoon) + " engineId='" + engineId + "' kept - no other squad holds it via=load (kept=" + S(g_ctxCopyIdKept) + ")");
+        return 0;
+    }
+    return fresh.empty() ? -2 : 1;
+}
+
 /* Ownerships::setHomeBuilding for a group - the call createRandomUnloadedSquad makes for a group it creates, which also puts the group
    on the building's residents hand (towngen.cpp T392ResidentHandPod's note) - with the building's own hand (RootObjectBase::getHandle,
    +0x58) and the group's squad type (Platoon+0xA8, the field ReadContextPod reads). Used for a group made from its world record
@@ -11840,10 +12711,13 @@ bool SendContextFor(unsigned int uid, ::Character* c)
     // for characters). std::string by value from a raw RVA: hidden return slot in RDX.
     std::string platoonId;
     if (PlausibleObject(platoon) && !PlatoonIdPod(platoon, &platoonId)) { platoonId.clear(); ++g_platoonIdFaultCtx; }   /* F667: the same guarded body as the roster's */
-    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId)) { ++g_ctxSendFailed; return false; }
+    /* the age of this game's current world load (store.cpp StoreWorldLoadAgeMs; kLoadAgeUnknown before its first running tick); the
+       receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
+    const unsigned int loadAgeMs = coop::StoreWorldLoadAgeMs();
+    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs)) { ++g_ctxSendFailed; return false; }
     ++g_ctxSent;
     DebugLog("[CTX] -> uid=" + std::string(S(uid)) + " squad='" + squadSid + "' squadType=" + S(squadType) + " town='" + townSid
-             + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType));
+             + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)));
     return true;
 }
 
@@ -11992,7 +12866,7 @@ void WorldRosterFull(int page)
 
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot)
 {
     ::Character* twin = RawHandIsEmpty(charRaw32) ? 0 : SafeHandToCharacter(LocalHandFromRaw(charRaw32));   // H027
     ++g_ctxRecv;
@@ -12015,7 +12889,7 @@ void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squad
              + "," + q + "squadType" + q + ":" + S(squadType) + "," + q + "memberType" + q + ":" + S(memberType)
              + "," + q + "twinLocal" + q + ":" + (PlausibleObject(twin) ? "1" : "0") + "}");
     PendingContext pc; pc.squadSid = squadSid; pc.townSid = townSid; pc.platoonId = platoonId; pc.squadType = squadType; pc.memberType = memberType;
-    std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz;
+    std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz; pc.peerLoadAgeMs = peerLoadAgeMs; pc.recvMs = ::GetTickCount(); pc.peerSlot = senderSlot;
     g_pendingCtx[uid] = pc;
     /* T-1 B1 restructure (protocol 85): CONTEXT's member type is no longer read as the squad leader - MSG_SQUAD_LEAD carries it (handoff.cpp ApplyRemoteSquadLead). */
 }
@@ -12071,29 +12945,69 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
            announces its own NPC squads under the engine id - so the id alone cannot say which squad is the original. The
            number can (decision 31(a)): an id minted in MY block is my own squad's, and the announcement is the other game's
            stale copy of it. Neither the awake retire nor the asleep destroy runs then (the death watch's rule). */
-        int mySlot = -1; const int idBlk = StoreIdBlockOwner(pc.platoonId, &mySlot);
+        /* idBlk is the squad's origin (squadorigin.h): its number's block, or - for a squad the save made - the game that runs it now */
+        const void* ctxOwn = (pit != g_ctxPlatoons.end()) ? pit->second : 0;
+        int mySlot = -1, idNumBlk = -1, idWhy = sqorigin::kFallback;
+        const int idBlk = StoreIdOriginSlot((void*)faction, pc.platoonId, ctxOwn, &mySlot, &idNumBlk, &idWhy);
         /* M7a3f3 T-425 [m7a3f3-sc4]: ...unless this game HANDED that squad to another game (the handed-over set, handoff.cpp): the announcement is
            then the running squad, and this game's own awake / sleeping copy (its world data rebuilt it) is the stale one - the awake retire
            and the asleep destroy below run (T735: 8 REFUSED lines after the walk-back, two of each person ~40 s). */
-        const int ownBlk = coopsp::SupersedeRefuseOwn(idBlk, mySlot) != 0 ? 1 : 0;
-        const int handedOver = (ownBlk != 0 && HandedOverHas((void*)faction, pc.platoonId)) ? 1 : 0;
+        int ownBlk = coopsp::SupersedeRefuseOwn(idBlk, mySlot) != 0 ? 1 : 0;
+        /* the copy being judged cannot vouch for itself: when its own members named this game (a save squad), this game's copy and the
+           announcer's are weighed on the age of each game's current world load (squadorigin.h OwnIdLiftedByLoadAge, decision 826 a): this
+           game's copy is the stale one - the refusal does not hold and the awake retire below takes it - when every session member of it
+           was picked up by this game's sweep from its current load and that load is younger than the announcer's by more than
+           kLoadAgeTieMs (it reloaded in game, or restarted after a crash, while the other game ran on), or the two loads are within that
+           of each other and this game's seat is the higher one (the lower seat's copy stays). A copy holding a person from the session or
+           from an earlier load keeps the refusal, and so does an unknown age or seat. */
+        int liftKind = sqorigin::kOwnIdKept;
+        if (ownBlk != 0 && idWhy == sqorigin::kByMembers)
+        {
+            void* self = FindAwakePlatoon(faction, pc.platoonId);
+            unsigned int su[256]; int sn = 0;
+            const int sv = (self != 0 && self != ctxOwn && PlatoonHasSessionMembers(self) > 0) ? ReloadVerdict(self, mySlot, su, 256, &sn, 1) : coopsp::kReloadNoSession;
+            const int peerSeat = pc.peerSlot;   /* the announcer: the game this CONTEXT came from (net::PeerSlotOfKey of its link), not the person's recorded owner */
+            const unsigned int ownAge = coop::StoreWorldLoadAgeMs();
+            const unsigned int peerAge = sqorigin::LoadAgeAdvance(pc.peerLoadAgeMs, (unsigned int)(::GetTickCount() - pc.recvMs));   /* the announcer's age at send, brought to now */
+            liftKind = sqorigin::OwnIdLiftedByLoadAge(idWhy, sv == coopsp::kReloadRetire ? 1 : 0, ownAge, peerAge, mySlot, peerSeat);
+            if (liftKind == sqorigin::kOwnIdLifted)
+            {
+                ownBlk = 0; ++g_ctxOwnIdReloadLifted;
+                if (g_ctxOwnIdReloadLiftedSeen.insert(pc.platoonId).second)
+                    DebugLog("[CTX] same-id supersede id='" + pc.platoonId + "': decided as this game's by its own members (origin slot " + S((long long)idBlk) + ", number block " + S((long long)idNumBlk)
+                             + "), but its " + S((long long)sn) + " session members were all picked up by this game's sweep from world load " + S((long long)StoreWorldGenNow())
+                             + ", which finished " + S((long long)ownAge) + " ms ago; the announcer's load finished " + S((long long)peerAge) + " ms ago (" + std::string(((long long)ownAge + (long long)sqorigin::kLoadAgeTieMs < (long long)peerAge) ? "this load is younger by more than " : "within ") + S((long long)sqorigin::kLoadAgeTieMs)
+                             + " ms, the lower seat decides a tie), announcer seat " + S((long long)peerSeat) + ", this game's seat " + S((long long)mySlot)
+                             + " - this game's copy is the stale one, not refused (ownIdReloadLifted=" + S(g_ctxOwnIdReloadLifted) + ")");
+            }
+            else if (liftKind == sqorigin::kOwnIdKeptLowerSeat)
+            {
+                ++g_ctxOwnIdLiftWithheldLowerSeat;
+                if (g_ctxOwnIdLiftWithheldSeen.insert(pc.platoonId).second)
+                    DebugLog("[CTX] same-id supersede id='" + pc.platoonId + "': both copies are from loads that finished within " + S((long long)sqorigin::kLoadAgeTieMs) + " ms of each other (this game's "
+                             + S((long long)ownAge) + " ms ago with " + S((long long)sn) + " session members from world load " + S((long long)StoreWorldGenNow()) + ", the announcer's " + S((long long)peerAge)
+                             + " ms ago) - this game's seat " + S((long long)mySlot) + " is lower than the announcer's " + S((long long)peerSeat)
+                             + ", this game's copy stays: lift withheld, refused (ownIdLiftWithheldLowerSeat=" + S(g_ctxOwnIdLiftWithheldLowerSeat) + ")");
+            }
+        }
+        /* looked up whatever the origin: a save squad this game gave away has the receiving game as its origin */
+        const int handedOver = HandedOverHas((void*)faction, pc.platoonId) ? 1 : 0;
         const bool ownId = coopsquad::SupersedeOwnIdAfterHandover(ownBlk, handedOver) != 0;
         if (handedOver != 0)
         {
             ++g_ctxHandedOverSupersede;
             if (g_ctxHandedOverSeen.insert(pc.platoonId).second)
-                DebugLog("[CTX] same-id supersede ALLOWED id='" + pc.platoonId + "': this game minted it (block " + S((long long)idBlk) + " = my slot) but HANDED the squad to another game"
+                DebugLog("[CTX] same-id supersede ALLOWED id='" + pc.platoonId + "': " + std::string(ownBlk != 0 ? "decided as this game's" : "decided as another game's") + " (origin slot " + S((long long)idBlk) + ", number block " + S((long long)idNumBlk) + ") and this game HANDED the squad to another game"
                          " - the announcement is the running squad; this game's own awake / sleeping copy is the stale one (handedOverSupersede=" + S(g_ctxHandedOverSupersede) + ")");
         }
         if (ownId)
         {
-            const void* ctxOwn = (pit != g_ctxPlatoons.end()) ? pit->second : 0;
             void* ma = FindAwakePlatoon(faction, pc.platoonId); void* ms = FindSleepingPlatoon(faction, pc.platoonId);
             if ((ma != 0 && ma != ctxOwn) || (ms != 0 && ms != ctxOwn))
             {
                 ++g_ctxSupersedeOwnIdRefused;
                 if (g_ctxOwnIdRefusedSeen.insert(pc.platoonId).second)
-                    DebugLog("[CTX] same-id supersede REFUSED id='" + pc.platoonId + "': this game minted it (block " + S((long long)idBlk) + " = my slot) - its own "
+                    DebugLog("[CTX] same-id supersede REFUSED id='" + pc.platoonId + "': decided as this game's (origin slot " + S((long long)idBlk) + ", number block " + S((long long)idNumBlk) + ") - its own "
                              + (ma != 0 && ma != ctxOwn ? "AWAKE" : "sleeping") + " squad is the original, the announcement is the other game's copy (supersedeOwnIdRefused=" + S(g_ctxSupersedeOwnIdRefused) + ")");
             }
         }
@@ -12104,7 +13018,10 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
             /* inv7e2 (T418): session members that are ALL this game's own sweep adoptions of THIS link generation are the
                reloaded save's copies - the peer's continuously running squad wins; they retire and are withdrawn. */
             unsigned int ru[256]; bool ruAnn[256]; int rn = 0; int reload = coopsp::kReloadNoSession;
-            if (hasSession > 0) reload = ReloadVerdict(awakeLocal, mySlot, ru, 256, &rn);
+            /* a refusal lifted above was decided on the load-age test, which already weighed the loads: this retire asks only its member half
+               (every session member this load's sweep pickup), else a fresh start's lifted copy would be kept beside the announcer's (no link
+               down yet, so the reload-since-link-down test never retires it) */
+            if (hasSession > 0) reload = ReloadVerdict(awakeLocal, mySlot, ru, 256, &rn, liftKind == sqorigin::kOwnIdLifted ? 1 : 0);
             /* M7a3f4 item 1 [m7a3f4-sc0]: the retire runs here ONLY because this game handed the squad over (handedOver) - hand-overs are
                per person, so this platoon may still hold a person this game runs (one never handed, one kept by the receiver, one taken
                back): never retired then, nor when it cannot be read. Logged once per id, counted (handedOverKeptMine). */
@@ -12129,7 +13046,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
                         int withdrawn = 0, owed = 0, unannounced = 0;
                         for (int i = 0; i < rn; ++i) { const int w = WithdrawReloadedCopy(ru[i], ruAnn[i]); if (w == 1) { ++withdrawn; ++g_staleWithdrawnReloaded; } else if (w == 2) ++owed; else ++unannounced; }
                         ++g_staleRetiredReloaded;
-                        DebugLog("[STALE] reloaded copy id='" + pc.platoonId + "' retired: all " + S((long long)rn) + " session members were picked up by this game's sweep from world load " + S((long long)StoreWorldGenNow()) + ", loaded after this game's last link-down"
+                        DebugLog("[STALE] reloaded copy id='" + pc.platoonId + "' retired: all " + S((long long)rn) + " session members were picked up by this game's sweep from world load " + S((long long)StoreWorldGenNow()) + (liftKind == sqorigin::kOwnIdLifted ? std::string(", a fresh load (own-id refusal lifted)") : std::string(", loaded after this game's last link-down"))
                                  + " - the peer's continuously running squad wins; withdrawn=" + S((long long)withdrawn) + " owed=" + S((long long)owed) + " neverAnnounced=" + S((long long)unannounced)
                                  + " retiredReloaded=" + S(g_staleRetiredReloaded) + " withdrawnReloaded=" + S(g_staleWithdrawnReloaded) + " keptEarlierGen=" + S(g_staleKeptEarlierGen)
              + " keptNotReloaded=" + S(g_staleKeptNotReloaded) + " keptNoSlot=" + S(g_staleKeptNoSlot));
@@ -12190,14 +13107,22 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         if (!PlausibleObject(platoon)) { ++g_ctxPlatoonCreateFailed; return false; }
         std::string engineId; if (!PlatoonIdPod(platoon, &engineId)) engineId.clear();   /* the id the engine gave it: "<faction name>_<the faction's counter>" */
         void* active = 0;
-        if (!ConfigurePlatoonPod(platoon, pc.squadType, town, pc.hand, building != 0, &active)) { ++g_ctxPlatoonCreateFailed; return false; }
+        const int homePH = (building != 0 && TownGenPlayerHouse(building) != 0) ? 1 : 0;   /* review MED 2: a player's house is never a copy's home - built with no building */
+        if (!ConfigurePlatoonPod(platoon, pc.squadType, town, pc.hand, building != 0 && homePH == 0, &active)) { ++g_ctxPlatoonCreateFailed; return false; }
         g_ctxPlatoons[key] = platoon; ++g_ctxPlatoonsCreated;
+        StoreForgetRunnerWithdrew(coopctx::CtxKeyIdOf(key));   /* a new holder of the squad: a NOT-LIVE note of its earlier holder no longer applies */
         g_ctxPlatoonSlot[key] = net::OwnerSlotOf(uid);   /* the owner OnSpawn recorded before this copy is built: that player leaving retires it */
         std::string copyId;   /* a player's copy squad: its fresh id when another squad holds the engine's ("" = the engine's kept) */
         if (IsStandInFaction(faction) || IsPlayerFaction(faction)) CopySquadIdCheck(faction, platoon, engineId, &copyId, "context");
         if (!pc.platoonId.empty() && !IsPlayerFaction(faction) && !IsPeerFaction(faction)) CarryPeerPlatoonId(faction, platoon, pc.platoonId);   /* inv7e: before the bind, so the clash test sees only OTHER squads */
         if (!pc.platoonId.empty()) StoreBindPlatoon(platoon, pc.platoonId);   // P1: world id + persistent (sleeps instead of being destroyed)
         StoreNoteCopyHome(platoon, pc.platoonId, pc.hand, haveBuilding ? 1 : 0, building != 0 ? 1 : 0);   /* a building sent that is not loaded here: the copy's home is owed and given by the store's once-a-second owed-home check once that building is loaded [t755-copyhome-call] */
+        if (homePH != 0)
+        {
+            ++g_ctxHomePlayerHouse;
+            if (!pc.platoonId.empty()) StoreHomeClearGroup(pc.platoonId);   /* its home key is cleared, so no road gives the house back */
+            if (g_ctxHomePlayerHouse <= 50) DebugLog("[CTX] platoon " + P(platoon) + " key='" + key + "': the home building sent is a player's house here - built with no home, its home key cleared (first 50)");
+        }
         DebugLog("[CTX] platoon created " + P(platoon) + " key='" + key + "' engineId='" + engineId + "'" + (copyId.empty() ? std::string() : " id='" + copyId + "'") + " town=" + P(town) + " building=" + P(building) + " squadType=" + S(pc.squadType));
     }
     void* active = ReadActivePlatoonPod(platoon);   // POD helper: this function holds std::strings, so no __try here (C2712)
@@ -12292,6 +13217,20 @@ void* ContextPlatoonForActive(void* active)
     for (std::map<std::string, void*>::const_iterator it = g_ctxPlatoons.begin(); it != g_ctxPlatoons.end(); ++it)
         if (PlausibleObject(it->second) && ReadActivePlatoonPod(it->second) == active) return it->second;
     return 0;
+}
+/* The world id of the context platoon a registered copy stands in now: the copy's squad (its ActivePlatoon, through the verified reader)
+   matched against this map's platoons, the id taken from the map's key (the announced squad id, the one StoreBindPlatoon bound it under).
+   "" = no live copy, no squad, a squad that is not a context platoon (a twin, a hired copy), or an older key with no id. Read BEFORE the
+   copy is withdrawn (net/session.cpp's roster NOT-LIVE withdrawal). MAIN THREAD (the map has no lock). */
+std::string ContextWorldIdOfCopy(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    if (!PlausibleObject(c)) return std::string();
+    void* active = coop::SquadActivePlatoonOf(c);
+    if (active == 0) return std::string();
+    for (std::map<std::string, void*>::const_iterator it = g_ctxPlatoons.begin(); it != g_ctxPlatoons.end(); ++it)
+        if (PlausibleObject(it->second) && ReadActivePlatoonPod(it->second) == active) return coopctx::CtxKeyIdOf(it->first);
+    return std::string();
 }
 /* M7a2 [m7a2-cx2] (T803): 1 = `platoon` (a Platoon*, the store's key) is one this map holds - a squad built here for another
    game's announced squad, whose people arrive by SPAWN. Asleep or awake: the entry is set before the first spawn into it and is
@@ -12455,6 +13394,7 @@ void SpawnWorldTeardown()
     {
         if (g_mirror[i].obj == 0) continue;
         ++mirrorSlots;
+        P141RelNote(i, g_mirror[i].uid, kP141RouteTeardown, 0);   /* PROBE P141 */
         g_mirror[i].uid = 0;
         InterlockedExchangePointer((PVOID volatile*)&g_mirror[i].obj, (PVOID)0);
         InterlockedExchange(&g_mirror[i].dead, 0);
@@ -12480,6 +13420,7 @@ void SpawnWorldTeardown()
     // characters that will not exist a moment from now, and `g_spawned` beside it is being emptied.
     const size_t twins = g_twinUids.size();
     g_twinUids.clear();
+    g_twinSleepQ.clear(); g_twinWaitLogged.clear();   /* the queued twins and their squads belong to the world that is going */
 
     // R1-a: every parked prone write belonged to a character this teardown retires.
     g_proneDroppedRetired += (long long)g_proneParkMap.size();
@@ -12599,3 +13540,451 @@ int SnapCharFacts(void* cv, SnapFacts* o)
 /* T-392 (owner 335 a): Building::asTown for towngen's residents gate - BuildingGetTown above (resolver-verified 0xF6BE0,
    guarded), reached from outside this file. ANY THREAD. */
 namespace coop { void* TownOfBuilding(void* building) { return BuildingGetTown(building); } }
+/* PROBE P140 BEGIN */
+/* PROBE P140 (T-806, LOG ONLY): who starts the engine's cage-use task (type 0x6B) on a character.
+   (P1) a player's own use-cage order: build.cpp's order hook (addOrderSelectedCharacters 0x7F9280) and Shift-job hook
+   (addJobSelectedCharacters 0x7F4EF0) call P140PlayerOrder for task 0x6B - one line per selected character, whose time is kept.
+   The selection is walked as 0x7F9280 walks it (Read, disassembly 0x7F92D0-0x7F93C4 and decomp_7f9280): PlayerInterface +0x228
+   non-zero = something selected, +0x240 the bucket array, +0x220 the first index; a node: +0 next, a hand at +0x10 whose type
+   (+0x18) 1 is a character (hand::getCharacter 0x7974F0 reads that type at hand+8). MAIN THREAD only (skipped elsewhere).
+   (P3) the cage-use task's start (table row CageUseStart; decomp_357fe0: void(task, who) - who->vt+0x48 is the character
+   setPrisonMode 0x3305C0 is given; the task's hand at +0x10, type +0x18 == 0 (a building), names the cage building). The original
+   runs unchanged. The character's prison fields are read BEFORE it and +0x2F8 again after; then one line: the time since its last
+   player use-cage order and three caller frames, each looked up in its module's unwind table (RtlLookupFunctionEntry). Any
+   thread: goal / pending orders / world hours are read on the main thread only ('?' elsewhere). Guarded reads; no engine writes. */
+namespace coop {
+namespace {
+struct P140Rf { DWORD begin; DWORD end; DWORD unwind; };   /* RUNTIME_FUNCTION as the x64 unwind table holds it */
+typedef void (*P140StartFn)(void* task, void* who);
+typedef void* (*P140VtGetFn)(void* self);
+typedef USHORT (WINAPI *P140CaptureFn)(ULONG skip, ULONG count, PVOID* frames, PULONG hash);
+typedef const P140Rf* (WINAPI *P140LookupFn)(DWORD64 pc, DWORD64* imageBase, void* history);
+static unsigned long long kP140CageUseStartRva = 0; static coop::AddrReg kP140CageUseStartRva_reg("CageUseStart", &kP140CageUseStartRva);   /* Steam_1.0.65 0x357FE0, Steam_1.0.68 0x358040 */
+P140StartFn g_p140Orig = 0;
+int g_p140Hook = 0;
+P140CaptureFn g_p140Capture = 0;
+P140LookupFn g_p140Lookup = 0;
+CRITICAL_SECTION g_p140Lock;
+volatile long g_p140LockOk = 0;
+struct P140Order { const void* c; DWORD tick; };
+const int kP140OrderN = 64;
+P140Order g_p140Orders[64];
+int g_p140OrderPos = 0;
+volatile LONGLONG g_p140Starts = 0, g_p140Lines = 0;
+const LONGLONG kP140LineCap = 4000;
+const size_t kP140SelFirst = 0x220, kP140SelCount = 0x228, kP140SelBuckets = 0x240;
+
+int P140OnMain() { return (g_mainThreadId != 0 && (LONG)::GetCurrentThreadId() == g_mainThreadId) ? 1 : 0; }
+
+void P140NoteOrder(const void* c)
+{
+    if (c == 0 || g_p140LockOk == 0) return;
+    const DWORD now = ::GetTickCount();
+    ::EnterCriticalSection(&g_p140Lock);
+    int k = 0;
+    for (; k < kP140OrderN; ++k) if (g_p140Orders[k].c == c) break;
+    if (k == kP140OrderN) { k = g_p140OrderPos; g_p140OrderPos = (g_p140OrderPos + 1) % kP140OrderN; g_p140Orders[k].c = c; }
+    g_p140Orders[k].tick = now;
+    ::LeaveCriticalSection(&g_p140Lock);
+}
+/* seconds since this character's last player use-cage order; -1 = never (or not among the last 64 characters ordered) */
+double P140OrderAgo(const void* c)
+{
+    if (c == 0 || g_p140LockOk == 0) return -1.0;
+    double ago = -1.0;
+    const DWORD now = ::GetTickCount();
+    ::EnterCriticalSection(&g_p140Lock);
+    for (int k = 0; k < kP140OrderN; ++k)
+        if (g_p140Orders[k].c == c) { ago = (double)(DWORD)(now - g_p140Orders[k].tick) / 1000.0; break; }
+    ::LeaveCriticalSection(&g_p140Lock);
+    return ago;
+}
+/* the selected characters, as 0x7F9280 walks them: how many were found, -1 on a fault */
+int P140SelectionPod(void* pi, void** out, int cap)
+{
+    int n = 0;
+    __try
+    {
+        if (*(const unsigned long long*)((const char*)pi + kP140SelCount) == 0) return 0;
+        const char* buckets = *(const char* const*)((const char*)pi + kP140SelBuckets);
+        const unsigned long long first = *(const unsigned long long*)((const char*)pi + kP140SelFirst);
+        const char* node = *(const char* const*)(buckets + first * 8);
+        for (int guard = 0; node != 0 && guard < 512 && n < cap; ++guard)
+        {
+            if (*(const int*)(node + 0x18) == 1)
+            {
+                void* c = (void*)((const hand*)(node + 0x10))->getCharacter();
+                if (c != 0) out[n++] = c;
+            }
+            node = *(const char* const*)node;
+        }
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the character the cage-use start acts on: who->vt+0x48, as the start itself asks it (decomp_357fe0) */
+void* P140WhoCharPod(void* who)
+{
+    if (who == 0 || !PlausibleObject(who)) return 0;
+    __try { void** vt = *(void***)who; return ((P140VtGetFn)vt[0x48 / 8])(who); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the building the task's hand (+0x10) names; *typeOut = the hand's type (+0x18), -1 unreadable */
+void* P140TaskCagePod(void* task, int* typeOut)
+{
+    *typeOut = -1;
+    if (task == 0) return 0;
+    __try
+    {
+        const char* h = (const char*)task + 0x10;
+        *typeOut = *(const int*)(h + 8);
+        if (*typeOut != 0) return 0;
+        void* b = (void*)((const hand*)h)->asBuilding();
+        return (b != 0 && PlausibleObject(b)) ? b : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+struct P140CharRead { int ok; int inSome; double sStart; float sHours; };
+int P140CharPod(const void* c, P140CharRead* r)
+{
+    r->ok = 0; r->inSome = -1; r->sStart = 0.0; r->sHours = 0.0f;
+    __try
+    {
+        r->inSome = *(const int*)((const char*)c + kPoseInSomethingOff);
+        r->sStart = *(const double*)((const char*)c + kCharSentenceStartOff);
+        r->sHours = *(const float*)((const char*)c + kCharSentenceHoursOff);
+        r->ok = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r->ok = 0; }
+    return r->ok;
+}
+void* P140TaskSystemPod(void* ai)
+{
+    __try { return *(void**)((char*)ai + 0x20); }   /* as BehaviourString reads it */
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* MAIN THREAD only; '?' / -1 elsewhere or when unreadable */
+void P140Goal(void* c, std::string* goal, int* orders)
+{
+    *goal = "?"; *orders = -1;
+    if (!P140OnMain() || c == 0 || !PlausibleObject(c)) return;
+    void* ai = GetCharacterAI((::Character*)c);
+    if (!PlausibleObject(ai)) return;
+    /* the goal text and pending orders are not read here: this runs inside the engine's own task start, where the task system's
+       goal state may be half-changed, and neither call can be fault-guarded; '?' / -1 are logged instead */
+    (void)ai;
+}
+/* "<uid>/'<name>'"; *ownOut 1 this game's, 0 another game's copy, -1 no uid */
+std::string P140Who(const void* c, int* ownOut)
+{
+    *ownOut = -1;
+    if (c == 0) return "none";
+    const unsigned int uid = FindSpawnedUid(c);
+    if (uid != 0) *ownOut = net::IsUidMineAnyThread(uid) ? 1 : 0;
+    char nm[256];
+    nm[0] = 0;
+    if (!PlausibleObject(c) || !ReadStdStringPod((const char*)c + 0x18, nm, (int)sizeof(nm))) { nm[0] = '?'; nm[1] = 0; }
+    char b[300];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, "%u/'%s'", uid, nm);
+    return std::string(b);
+}
+const char* P140OwnWord(int own) { return own < 0 ? "?" : (own != 0 ? "1" : "0"); }
+/* the return addresses above the detour: [0] = the caller of the cage-use start. Called straight from the detour. */
+__declspec(noinline) void P140Frames(unsigned long long* out, int n)
+{
+    void* fr[4] = { 0, 0, 0, 0 };
+    if (n > 4) n = 4;
+    const USHORT got = (g_p140Capture != 0) ? g_p140Capture(2, (ULONG)n, fr, 0) : 0;   /* skips this function and the detour */
+    for (int k = 0; k < n; ++k) out[k] = (k < (int)got) ? (unsigned long long)(uintptr_t)fr[k] : 0;
+}
+/* module+offset, and the start of the unwind-table row that holds the address ("no unwind row" when its module has none) */
+void P140FrameWord(unsigned long long a, char* out, int cap)
+{
+    if (a == 0) { _snprintf_s(out, cap, _TRUNCATE, "-"); return; }
+    DWORD64 ib = 0;
+    const P140Rf* rf = (g_p140Lookup != 0) ? g_p140Lookup((DWORD64)a, &ib, 0) : 0;
+    HMODULE hm = (HMODULE)(uintptr_t)ib;
+    if (hm == 0 && !::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                         (LPCSTR)(uintptr_t)a, &hm)) hm = 0;
+    if (hm == 0) { _snprintf_s(out, cap, _TRUNCATE, "0x%llX(no module)", a); return; }
+    char path[MAX_PATH];
+    path[0] = 0;
+    if (::GetModuleFileNameA(hm, path, MAX_PATH) == 0) { path[0] = '?'; path[1] = 0; }
+    const char* base = path;
+    for (const char* p = path; *p != 0; ++p) if (*p == '\\' || *p == '/') base = p + 1;
+    const unsigned long long off = a - (unsigned long long)(uintptr_t)hm;
+    if (rf != 0) _snprintf_s(out, cap, _TRUNCATE, "%s+0x%llX(fn 0x%X)", base, off, (unsigned int)rf->begin);
+    else         _snprintf_s(out, cap, _TRUNCATE, "%s+0x%llX(no unwind row)", base, off);
+}
+void P140StartLog(void* c, const P140CharRead& r, int after, const char* cage, int handType, const unsigned long long* fr)
+{
+    const LONGLONG n = ::InterlockedIncrement64(&g_p140Lines);
+    if (n > kP140LineCap) return;
+    int own = -1;
+    const std::string who = P140Who(c, &own);
+    const int slave = (c != 0) ? SlaveStateOfCharacter(c) : -1;
+    std::string goal;
+    int orders = -1;
+    P140Goal(c, &goal, &orders);
+    const double ago = P140OrderAgo(c);
+    char f0[200], f1[200], f2[200], agoW[48], ss[48], hs[48], nowW[48];
+    P140FrameWord(fr[0], f0, (int)sizeof(f0));
+    P140FrameWord(fr[1], f1, (int)sizeof(f1));
+    P140FrameWord(fr[2], f2, (int)sizeof(f2));
+    if (c == 0) _snprintf_s(agoW, sizeof(agoW), _TRUNCATE, "?");
+    else if (ago < 0.0) _snprintf_s(agoW, sizeof(agoW), _TRUNCATE, "never");
+    else _snprintf_s(agoW, sizeof(agoW), _TRUNCATE, "%.1fs ago", ago);
+    if (r.ok) { _snprintf_s(ss, sizeof(ss), _TRUNCATE, "%.3f", r.sStart); _snprintf_s(hs, sizeof(hs), _TRUNCATE, "%.2f", (double)r.sHours); }
+    else { _snprintf_s(ss, sizeof(ss), _TRUNCATE, "?"); _snprintf_s(hs, sizeof(hs), _TRUNCATE, "?"); }
+    if (P140OnMain()) _snprintf_s(nowW, sizeof(nowW), _TRUNCATE, "%.3f", LocalWorldHours());
+    else _snprintf_s(nowW, sizeof(nowW), _TRUNCATE, "?");
+    char line[1600];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[P140] cage-use start char=%s own=%s cage=%s handType=%d sentenceStart=%s hours=%s now=%s slave=%d cageState(+0x2F8)=%d->%d"
+                " goal='%s' ordersPending=%d lastPlayerUseCage=%s caller=%s,%s,%s main=%d n=%lld",
+                who.c_str(), P140OwnWord(own), cage, handType, ss, hs, nowW, slave, r.inSome, after,
+                goal.c_str(), orders, agoW, f0, f1, f2, P140OnMain(), (long long)n);
+    DebugLog(line);
+    if (n == kP140LineCap) DebugLog("[P140] cage-use start: line cap reached - later starts are not logged");
+}
+void detour_p140CageUseStart(void* task, void* who)
+{
+    unsigned long long fr[3] = { 0, 0, 0 };
+    P140Frames(fr, 3);
+    ::InterlockedIncrement64(&g_p140Starts);
+    void* c = P140WhoCharPod(who);
+    if (c != 0 && !PlausibleObject(c)) c = 0;
+    P140CharRead r;
+    r.ok = 0; r.inSome = -1; r.sStart = 0.0; r.sHours = 0.0f;
+    if (c != 0) P140CharPod(c, &r);
+    int ht = -1;
+    void* cageB = P140TaskCagePod(task, &ht);
+    char cage[160];
+    cage[0] = 0;
+    if (cageB == 0 || ObjectPositionKey(cageB, cage, (int)sizeof(cage), 0, 3, 1) == 0) { cage[0] = '?'; cage[1] = 0; }
+    g_p140Orig(task, who);
+    const int after = (c != 0) ? PoseInSomethingPod(c) : -1;
+    P140StartLog(c, r, after, cage, ht, fr);
+}
+}   // namespace (P140)
+
+void InstallP140()
+{
+    if (g_p140LockOk == 0) { ::InitializeCriticalSection(&g_p140Lock); ::InterlockedExchange(&g_p140LockOk, 1); }
+    const HMODULE nt = ::GetModuleHandleA("ntdll.dll");
+    if (nt != 0)
+    {
+        g_p140Capture = (P140CaptureFn)::GetProcAddress(nt, "RtlCaptureStackBackTrace");
+        g_p140Lookup = (P140LookupFn)::GetProcAddress(nt, "RtlLookupFunctionEntry");
+    }
+    if (g_p140Hook != 1)
+    {
+        const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+        g_p140Hook = (kP140CageUseStartRva == 0) ? -2
+            : ((coop::AddHook((void*)(base + (uintptr_t)kP140CageUseStartRva), (void*)&detour_p140CageUseStart, (void**)&g_p140Orig) == coop::SUCCESS) ? 1 : -1);
+    }
+    DebugLog(std::string("[P140] probe: cage-use start hook (row CageUseStart) ")
+             + (g_p140Hook == 1 ? "INSTALLED" : (g_p140Hook == -2 ? "NOT INSTALLED (no table row)" : "FAILED"))
+             + "; stack capture " + (g_p140Capture != 0 ? "found" : "MISSING")
+             + ", unwind lookup " + (g_p140Lookup != 0 ? "found" : "MISSING"));
+}
+
+/* ANY THREAD (the order hooks run where the engine calls them); the selection is walked on the main thread only */
+void P140PlayerOrder(void* pi, int task, void* subject, int queued, const char* road)
+{
+    if (task != 0x6B) return;
+    char cage[160];
+    cage[0] = 0;
+    if (subject == 0 || ObjectPositionKey(subject, cage, (int)sizeof(cage), 0, 3, 0) == 0) { cage[0] = '?'; cage[1] = 0; }
+    const std::string tail = std::string(" cage=") + cage + " queued=" + (queued != 0 ? "1" : "0") + " via=" + (road != 0 ? road : "?");
+    if (!P140OnMain() || pi == 0)
+    {
+        DebugLog("[P140] player order use-cage char=? own=?" + tail + " (off the main thread: the selection is not walked)");
+        return;
+    }
+    void* sel[32];
+    const int n = P140SelectionPod(pi, sel, 32);
+    if (n <= 0)
+    {
+        DebugLog(std::string("[P140] player order use-cage char=none own=?") + tail + (n < 0 ? " (the selection read faulted)" : " (no character selected)"));
+        return;
+    }
+    for (int k = 0; k < n; ++k)
+    {
+        P140NoteOrder(sel[k]);
+        int own = -1;
+        const std::string who = P140Who(sel[k], &own);
+        DebugLog("[P140] player order use-cage char=" + who + " own=" + P140OwnWord(own) + tail);
+    }
+}
+}   /* namespace coop */
+/* PROBE P140 END */
+/* PROBE P141 BEGIN */
+/* PROBE P141 (T-836, LOG ONLY): what a copy the drift digest stopped printing looks like now - its mirror row against MirrorSlot's
+   checks, the engine handle the registry stored against the one the object holds now, the in-something word (+0x2F8, SEH), whether
+   the uid still has a spawned-table entry and a movement row, and the bed state this game keeps for it (the rescuer's bed ask, the
+   owner's pose want, the last carried sighting). LiveCharacterVerdict is asked only for a row MirrorSlot asked this same frame, so
+   on the main thread it answers from the frame memo and counts nothing. No engine writes, no registry writes. */
+namespace coop {
+namespace {
+static __declspec(noinline) int P141ReadInSomething(const void* c)
+{
+    __try { return *(const int*)((const char*)c + 0x2F8); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -9999; }
+}
+LONG64 g_p141LastCounts[livechar::kVerdicts];   /* the counts the last copy-check line printed */
+const char* P141AskName(int state)
+{
+    if (state == kBedAskPending) return "pending";
+    if (state == kBedAskSettled) return "settled";
+    if (state == kBedAskRefusedIn) return "refusedIn";
+    if (state == kBedAskOut) return "out";
+    return "?";
+}
+}   /* namespace */
+
+std::string P141CopyFacts(unsigned int uid, int* mirrorPass, int* hasRow, std::string* why)
+{
+    *mirrorPass = 0; *hasRow = 0; *why = "noRow";
+    int at = -1;
+    for (int i = 0; i < kMaxMirror; ++i)
+    {
+        if (uid == 0 || g_mirror[i].uid != uid) continue;
+        if (at < 0 || (g_mirror[at].dead && !g_mirror[i].dead)) at = i;   /* a live row before a retired one */
+    }
+    const bool onMain = g_mainThreadId != 0 && ::GetCurrentThreadId() == (unsigned long)g_mainThreadId;
+    int retired = -1, ins = -9999, gotCur = 0;
+    unsigned int sIdx = 0, sSer = 0, cIdx = 0, cSer = 0;
+    const void* o = 0;
+    if (at >= 0)
+    {
+        *hasRow = 1;
+        retired = g_mirror[at].dead ? 1 : 0;
+        o = g_mirror[at].obj;
+        sIdx = g_mirror[at].hIndex; sSer = g_mirror[at].hSerial;
+        if (retired) *why = "retired";                       /* the pointer of a retired row is not used */
+        else if (o == 0) *why = "noObject";
+        else if (!PlausibleObject(o)) *why = "implausible";
+        else
+        {
+            const UidMirror* stored = StoredRowOf(o);
+            if (stored != 0) { sIdx = stored->hIndex; sSer = stored->hSerial; }
+            const int v = LiveCharacterVerdict((::Character*)o);
+            *why = std::string(livechar::VerdictName(v)) + "(" + S((long long)v) + ")";
+            if (livechar::Usable(v)) *mirrorPass = 1;
+            ObjId id;
+            if (CaptureObjId(o, &id)) { cIdx = id.index; cSer = id.serial; gotCur = 1; }
+            ins = P141ReadInSomething(o);
+        }
+    }
+    std::string spawned = "?", moveRow = "?", bed = "?";
+    if (onMain)
+    {
+        std::map<unsigned int, RootObjectBase*>::const_iterator sp = g_spawned.find(uid);
+        if (sp == g_spawned.end()) spawned = "none";
+        else spawned = std::string((const void*)sp->second == o ? "sameObj" : "otherObj")
+                       + "/uidOfObj=" + S((long long)FindSpawnedUid((const void*)sp->second));
+        moveRow = HasPuppet(uid) ? "1" : "0";
+        bed = "ask=";
+        std::map<unsigned int, BedAsk>::const_iterator a = g_bedAsk.find(uid);
+        if (a == g_bedAsk.end()) bed += "none";
+        else bed += std::string(P141AskName(a->second.state)) + "/"
+                    + (a->second.sentAt ? S((long long)((::GetTickCount() - a->second.sentAt) / 1000)) + "s" : std::string("-"));
+        bed += ",pose=";
+        std::map<unsigned int, PoseWant>::const_iterator w = g_poseWant.find(uid);
+        if (w == g_poseWant.end()) bed += "none";
+        else bed += S((long long)w->second.applied) + "/" + (w->second.action.empty() ? std::string("-") : w->second.action)
+                    + (w->second.held ? "/held" : "");
+        bed += std::string(",carriedSeen=") + (g_bedCarriedAt.find(uid) != g_bedCarriedAt.end() ? "1" : "0");
+    }
+    return " storedIdx=" + S((long long)sIdx) + " storedSer=" + S((long long)sSer)
+         + " curIdx=" + (gotCur ? S((long long)cIdx) : std::string("?")) + " curSer=" + (gotCur ? S((long long)cSer) : std::string("?"))
+         + " inSomething=" + (ins == -9999 ? std::string("?") : S((long long)ins))
+         + " rowRetired=" + (retired < 0 ? std::string("noRow") : S((long long)retired))
+         + " spawned=" + spawned + " moveRow=" + moveRow + " bedHold=" + bed;
+}
+
+/* The engine destroyed a copy here and nothing was sent or booked for it. hook 1: NotifyDespawn found the uid is not this
+   game's (obj is whole: the destroy hook on the main thread; 0 when replayed from another thread); hook 2: the destroy hook
+   answered that the object is not the row's character, and the reclaim then freed the row (obj 0). asleep: the character's
+   squad has no active platoon (PlatoonAsleepPod); inSomething: the +0x2F8 word is set. '?' when the object cannot be read.
+   At most kP141NotOursMax lines a launch; the rest are counted on the copy-check counts line. MAIN THREAD. */
+static const long long kP141NotOursMax = 200;
+long long g_p141NotOursLines = 0, g_p141NotOursUnlogged = 0, g_p141NotOursUnloggedSaid = 0;
+void P141NoteNotOursDestroy(unsigned int uid, const void* obj, const char* reason, int hook)
+{
+    if (g_p141NotOursLines >= kP141NotOursMax) { ++g_p141NotOursUnlogged; return; }
+    ++g_p141NotOursLines;
+    std::string asleep = "?", ins = "?";
+    if (obj != 0 && PlausibleObject(obj))
+    {
+        void* platoon = PurgePlatoonPod((::Character*)obj);
+        const int a = platoon != 0 ? PlatoonAsleepPod(platoon) : -1;
+        if (a == 0 || a == 1) asleep = S((long long)a);
+        const int v = P141ReadInSomething(obj);
+        if (v != -9999) ins = (v != 0) ? "1" : "0";
+    }
+    ErrorLog("[P141] copy destroyed here by the engine, not ours - uid=" + S((long long)uid) + " reason=" + RemovalReasonText(reason)
+             + " asleep=" + asleep + " inSomething=" + ins + " - no despawn sent, no lost-copy booked"
+             + (hook == 1 ? " hook=uidNotMine" : " hook=notTheRowCharacter"));
+}
+
+static const char* P141RouteName(int route)
+{
+    if (route == kP141RouteRemoveCopy) return "removeCopy";
+    if (route == kP141RouteStaleTrace) return "staleTrace";
+    if (route == kP141RouteReclaim) return "reclaimDestroyed";
+    if (route == kP141RouteTeardown) return "teardown";
+    if (route == kP141RouteRebind) return "rebind";
+    return "other";
+}
+static const char* P141MarkName(LONG by)
+{
+    if (by == 1) return "engineDestroy";
+    if (by == 2) return "engineDestroyNotRowChar";
+    if (by == 3) return "livenessCheck";
+    return "none";
+}
+/* The newest release of this uid's row from the ring: " route=<name>[(<detail>)] at=<t>s" (t on the caller's nowMs clock), plus
+   the destroy mark and reason for the reclaim route; " route=unknown" when the ring no longer has it. MAIN THREAD. */
+std::string P141ReleaseRouteText(unsigned int uid, unsigned int nowMs)
+{
+    P141RelRow r = P141RelRow();
+    bool got = false;
+    MirrorRowLock();
+    for (int k = 1; k <= g_p141RelN && !got; ++k)
+    {
+        const P141RelRow& e = g_p141Rel[(g_p141RelNext - k + kP141RelRows) % kP141RelRows];
+        if (e.uid == uid) { r = e; got = true; }
+    }
+    MirrorRowUnlock();
+    if (!got) return " route=unknown";
+    const long long at = (long long)nowMs - (long long)(DWORD)(::GetTickCount() - r.at);
+    std::string s = std::string(" route=") + P141RouteName(r.route);
+    if (r.detail != 0) s += std::string("(") + r.detail + ")";
+    s += " at=" + S(at < 0 ? 0LL : at / 1000) + "s";
+    if (r.route == kP141RouteReclaim) s += std::string(" mark=") + P141MarkName(r.markBy) + " reason=" + RemovalReasonText(r.markWhy[0] != 0 ? r.markWhy : 0);
+    return s;
+}
+
+std::string P141LiveCountsLine()
+{
+    bool moved = false;
+    for (int v = 0; v < livechar::kVerdicts; ++v)
+        if (!livechar::Usable(v) && g_liveVerdicts[v] != g_p141LastCounts[v]) moved = true;   /* live / unasked move every frame */
+    if (g_p141NotOursUnlogged != g_p141NotOursUnloggedSaid) moved = true;
+    if (!moved) return std::string();
+    std::string s = "[P141] copy-check counts";
+    for (int v = 0; v < livechar::kVerdicts; ++v)
+    {
+        const LONG64 n = g_liveVerdicts[v];
+        s += std::string(" ") + livechar::VerdictName(v) + "=" + S((long long)n);
+        if (!livechar::Usable(v) && n != g_p141LastCounts[v]) s += "(+" + S((long long)(n - g_p141LastCounts[v])) + ")";
+        g_p141LastCounts[v] = n;
+    }
+    g_p141NotOursUnloggedSaid = g_p141NotOursUnlogged;
+    return s + " resolveFault=" + S((long long)g_liveResolveFault)
+             + " notOursLines=" + S(g_p141NotOursLines) + " notOursUnlogged=" + S(g_p141NotOursUnlogged);
+}
+}   /* namespace coop */
+/* PROBE P141 END */

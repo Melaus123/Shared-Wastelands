@@ -14,6 +14,7 @@
 #include "../common/loadedzones.h"   /* the loaded set from the engine's active-zone list (SectorOfZoneAt, Normalise, CountSources), swept by the offline suite */
 #include "../common/liveowner.h"   /* EngineKeepsAt - the engine's keep rule, swept by the offline suite */
 #include "coop_log.h"
+namespace { swlogbudget::Gate g_qZonesPlayer; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/RootObjectBase.h"
 #include "game/GameWorld.h"   /* recruit3: activeCharacters (recruitlist) */
@@ -989,13 +990,21 @@ void ZonesTick()
     for (size_t i = 0; i < loaded.size(); ++i) { if (i) list += " "; list += SectorString(loaded[i]); }
     if (g_ticks % 5 == 1 || list != g_zonesListShown)   // one line every ~5 s and whenever the list changes; the [VERDICT] at report carries the set
     {
+        const bool zonesChanged = list != g_zonesListShown;
         g_zonesListShown = list;
+#ifndef SW_DEV_BUILD
+        /* the release build: a changed list in full always; the 5-second repeat the first few times, then a count a minute */
+        if (zonesChanged || QuietLogPass(&g_qZonesPlayer, "[ZONES] player (unchanged list, every 5 s)", 0, 0))
+#endif
+        {
+        (void)zonesChanged;
         DebugLog("[ZONES] player sector=" + SectorString(g_playerSector) + " loaded(" + N((long long)loaded.size()) + ")=" + list
                  + (orphan != 0 ? " orphan=1 (last known position, no live watched character; orphaned tick " + N((long long)g_orphanRun)
                                   + ") sent=" + SentSectorString(sendX, sendY) : std::string()));   /* T-306 fold 1: what actually went out while orphaned */
         // F478: the engine's own active-zone list with the reason each is alive - c = camera, p = player character, t = town
         // (ZoneMap::isActivationType 0xA07B70 over activatedCountdown[3] at +0xC0) and the seconds left on its deactivation.
         DebugLog("[ZONES] active: " + ActiveZoneReasons(zm));
+        }
     }
     /* M2 (decisions 32/44/54): ONE REPORT, TO THE NOTEBOOK, FROM EITHER ROLE. The host's arm used to keep the A6
        first-loader owner map (HostNote) and send MSG_ZONES and MSG_SECTORMAP to the other game, and the client's arm
@@ -1127,7 +1136,7 @@ void ReportZones()
                " its areas. M2: mapSent, mapRecv, mapSkippedRelay, sent and recv - the session-link SECTORMAP / ZONES"
                " counters - are RETIRED with the two messages, so a readout writes ABSENT for them; the sectormap"
                " VERDICT went with the A6 owner map it printed.)");
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "zones" + q + "," + q + "host" + q + ":" + (net::SessionIsHost() ? "1" : "0")
+    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "zones" + q + "," + q + "host" + q + ":" + (net::SessionIsHost() ? "1" : "0")
              + "," + q + "playerSector" + q + ":" + q + SectorString(g_playerSector) + q
              + "," + q + "orphan" + q + ":" + q + (g_orphanRun > 0 ? "1" : "0") + q + "," + q + "sentSector" + q + ":" + q + (g_lastSentAny != 0 ? SentSectorString(g_lastSentX, g_lastSentY) : std::string("none")) + q   /* T-306 fold 1 */
              + "," + q + "loaded" + q + ":" + q + list + q + "}");

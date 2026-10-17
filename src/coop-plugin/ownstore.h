@@ -46,6 +46,7 @@ std::string OwnStoreDir();
    there is one (it is what lands next), else the last COMMITTED record (the index at open, then each successful commit,
    set by the writer thread under the queue lock). false = nothing to compare against. */
 bool OwnStoreLastFor(const std::string& key, long long* len, unsigned int* crc);
+bool OwnStoreLastSeqFor(const std::string& key, unsigned long long* seq);   /* T-889 fold 5, MAIN THREAD: OwnStoreLastFor's record's seq (the queued job's, else the last committed) */
 /* mmo1b (review-mmo1 item 1). MAIN THREAD. The writer thread never logs (the logger is not thread-safe); it records the
    first failure of each kind as plain data and this writes the line. */
 void OwnStoreDrainFailLog();
@@ -60,7 +61,19 @@ void OwnSaveReport();                             /* MAIN THREAD, the [OWNSAVE] 
 void OwnNoteCharChange(void* character);          /* ANY THREAD: an item moved in/out of this character's inventory */
 int  OwnSquadKeyOfCharNow(void* character, std::string* key);   /* P14 fold 1, MAIN THREAD: the squad record key holding the character; that squad marked write-now */
 unsigned long long OwnSeqNow();                    /* P14 fold 1, MAIN THREAD: the last seq handed out (any record) */
+unsigned long long OwnSeqReserve();                /* T-889 step 2, MAIN THREAD: ++seq - a hand-over's E; every record written later has a larger seq */
+int  OwnSkipSameSince(const std::string& key, unsigned long long* atSeq, unsigned long long* refSeq);   /* T-889 fold 5, MAIN THREAD: key's last same-bytes skip - g_ownSeq then, and its reference record's seq (1 = one known) */
+unsigned long long OwnOverlayMarkSeq();            /* T-889 step 2, MAIN THREAD: this load's save mark (g_ownSeq at the save request); 0 none */
+int  OwnOverlayMarkRule();                         /* T-889 fold 1, MAIN THREAD: 1 = this load's overlay ran under the MARK rule (a save mark was known) */
+int  OwnSquadKeyOfCharPeek(void* character, std::string* key);   /* T-889 fold 1, MAIN THREAD: OwnSquadKeyOfCharNow without the write-now mark */
+long OwnLoadGen();                                 /* T-889 step 2, MAIN THREAD: +1 at every load's overlay prepare */
+int  OwnOverlaySettled();                          /* T-889 step 2, MAIN THREAD: 1 = no overlay claim open or in progress (the load drained) */
+/* T-889 step 2, MAIN THREAD: one small text file of the current store folder (pp.handover). OwnTextRead: false = no store, or the file was
+   not read (*notFound 1 = it does not exist). OwnTextReplace: a temp file, flushed and renamed over the old one (never in place). */
+bool OwnTextRead(const std::string& name, std::string* text, int* notFound);
+bool OwnTextReplace(const std::string& name, const std::string& all);
 int  OwnBuildWriteNow(const char* why);           /* P14 fold 1, MAIN THREAD: pp.build's dirty rows handed to the writer NOW (1 = queued) */
+int  OwnBuildRecordState(const std::string& key, std::string* state);   /* T-221, MAIN THREAD: pp.build's saved STATE for a piece key (1 found, 0 none, -1 not readable now) */
 unsigned long long OwnOverlayAppliedSeq(const std::string& key);   /* P14 fold 1, MAIN THREAD: the seq of the record this load's overlay APPLIED for key (0 none) */
 void OwnMarkCharDirtyNow(void* character);       /* MAIN THREAD: a cross-player hand-over completed - ONLY that character's squad (mmo1b) */
 bool OwnWriterOn();                               /* ANY THREAD: the writer is on and not faulted - callers skip their lookups otherwise (mmo1b) */
@@ -77,6 +90,10 @@ void OwnResetImportRestoreArm(const std::string& carriedFolder, const std::strin
    OwnOverlayDone after the engine's load); -1 = not an overlaid squad. */
 int  OwnOverlayClaim(void* container, unsigned char force, std::string** name, std::string* was);
 void OwnOverlayDone(int slot, std::string* name, const std::string& was, unsigned char loaded);
+/* T-710, ANY THREAD (detour_loadFromDisk, after the engine's load): a squad read the file of one of this game's own squad ids - its line,
+   and another player's squad among them queued for the load-time rename. ownSlot: OwnOverlayClaim's answer for this load. */
+void OwnClaimWatchNote(void* container, unsigned char loaded, int ownSlot);
+int  OwnSaveSquadClash(const std::string& arg, std::string* status);   /* T-710 TEST-ONLY, MAIN THREAD: the `savesquadclash` verb; 1 copied, 0 refused */
 void OwnOverlayDrainLog();                        /* MAIN THREAD: the LOAD-OVERRIDE own lines, and the window's close */
 
 /* ---- mmo4: the one engine save of the profile's own slot at leave / Exit, and the timed autosave (store.cpp) ---- */
@@ -93,7 +110,8 @@ extern long long g_cmdVerbsRun;                   /* command_channel.cpp: verbs 
 unsigned long long OwnStoreOldestPendingSeq();    /* ANY THREAD: the lowest seq queued or being written, 0 = none (fold item 7) */
 
 /* ---- mmo3: money, research, map knowledge and the player faction row (store.cpp) ---- */
-void OwnInstallMmo3(unsigned long long base);    /* InstallStore: the Research::setResearched 0x833680 detour */
+void OwnInstallMmo3(unsigned long long base);    /* InstallStore: the Research::setResearched 0x833680 detour, and Research::setLevel's (the own bench level) */
+void OwnResBenchForget();                         /* the world torn down: this game's own bench level back to 0 */
 void OwnNoteFactionChange();                      /* ANY THREAD: a detoured relation writer touched a pair with this game's player faction */
 bool OwnBuildTick(unsigned long now);             /* mmo8a, MAIN THREAD, from OwnTick: pp.build when the build registry marked it (true = it ran) */
 void OwnBuildTeardownFlush();                     /* mmo8a3 (D1), MAIN THREAD, world teardown: pp.build's dirty rows to the writer before the build registry's generation bump */

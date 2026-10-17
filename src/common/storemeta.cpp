@@ -192,6 +192,18 @@ std::string MetaHomeClean(const std::string& home)
 {
     return (home.size() <= kMetaHomeCap && FieldIsClean(home)) ? home : std::string();
 }
+bool MetaHomeIsCleared(const std::string& home) { return home == kMetaHomeCleared; }
+std::string MetaHomeKey(const std::string& home) { return MetaHomeIsCleared(home) ? std::string() : home; }
+std::string MetaHomeNote(const std::string& kept, const std::string& arriving, int fromLive, int sameAsCleared)
+{
+    if (MetaHomeIsCleared(kept) && !arriving.empty() && !MetaHomeIsCleared(arriving) && (sameAsCleared > 0 || (sameAsCleared < 0 && fromLive == 0))) return kept;
+    return MetaHomeMerge(kept, arriving);
+}
+int OwedHomeGiveAct(int giveResult)
+{
+    if (giveResult == kGiveHomePlayerHouse) return kOwedGiveDrop;
+    return (giveResult == 1 || giveResult == 2) ? kOwedGiveDone : kOwedGiveKeep;
+}
 /* see storemeta.h [t755-copyhome-decide] */
 int CopyHomeOwe(int buildingSent, int buildingResolved, int bound)
 {

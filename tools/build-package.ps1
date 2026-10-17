@@ -19,6 +19,8 @@
 #   shared-wastelands.loader.txt  the loader finds the mod folder by this file (src\common\loadermarker.h).
 #   SharedWastelandsServer.exe                 the world server; the MULTIPLAYER panel starts it from beside the plugin by exactly this
 #                                  name (src\coop-plugin\ui.cpp: PathNextToDll("SharedWastelandsServer.exe")).
+#                                  T-896 (owner decision 900): it is never committed - src\coop-store\build.bat builds it in
+#                                  the tree, after the plugin build, and it is checked by write time like the other three.
 #   addresses\*.txt + signatures.sig   the plugin installs nothing without a table for the game's fingerprint
 #                                  (addresses.cpp); signatures.sig is the pattern road for a build with no table.
 #   Shared Wastelands.mod, _Shared Wastelands.info   the mod list entry; SharedWastelandsLoader and coopEarlyStart start the mod only
@@ -30,7 +32,10 @@
 #                                  launcher's OK as an Ogre plugin object), so a player with RE_Kenshi and no Setup still starts the mod. WRITTEN here,
 #                                  naming only SharedWastelands.dll, the same as mod-package's copy. The start-once guard (coop.cpp) makes both roads safe together.
 #   licenses\                      third-party code compiled into the shipped binaries: ENet (DLL + SharedWastelandsServer.exe),
-#                                  MinHook (DLL; BSD-2 requires the notice with binaries), MyGUI headers (DLL).
+#                                  MinHook (DLL; BSD-2 requires the notice with binaries), MyGUI headers (DLL), and (T-282)
+#                                  Ogre headers (DLL; third_party\ogre-mygui\OGRE-LICENSE.txt, copied from the headers).
+#   THIRD-PARTY-NOTICES.txt        T-282: the repo-root notices file - which shipped file contains which third-party code,
+#                                  and every licence text in one place.
 #   PACKAGE-MANIFEST.txt           NOT in the mod folder: written BESIDE it (<Name>\PACKAGE-MANIFEST.txt, owner 244), so a
 #                                  player copies only the mod folder. Every mod folder file: SHA-256, size, source, commit.
 #
@@ -49,7 +54,8 @@ param(
     [string]$Name = 'shared-wastelands',   # the file and folder names in this script repeat src\common\names.h
     [string]$OutRoot = '',
     [switch]$Zip,
-    [switch]$Replace
+    [switch]$Replace,
+    [switch]$AllowDevBuild   # T-879: package a DEV build anyway (deliberate; never for players)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -148,26 +154,9 @@ try {
             $inputs = @($inputs + (Get-CommonIncludes @($inputs | Where-Object { $_ -match '\.(c|cc|cpp|h|hpp)$' })) | Select-Object -Unique)
         }
         if ($inputs.Count -eq 0) { $problems.Add("NO SOURCES: git lists no source files under $($b.Dirs -join ', ') - cannot tell whether $($b.Src) is current"); continue }
-        # A COMMITTED binary (SharedWastelandsServer.exe is tracked) that is unchanged since its commit carries git's checkout time, not
-        # its build time - git writes SharedWastelandsServer.exe before store_main.cpp in the same checkout - so for it the question is
-        # asked of the history: the last commit that changed any of its sources must be in the history of the last commit
-        # that changed the binary. A rebuilt (locally modified) or untracked build output is asked by its write time.
-        $binTracked = @(Get-Tracked @($b.Src)).Count -gt 0
-        $binDirty = $binTracked -and @(& git -C $Tree status --porcelain=v1 -- $b.Src 2>$null | Where-Object { $_ }).Count -gt 0
-        if ($binTracked -and -not $binDirty) {
-            $cBin = "$(& git -C $Tree log -1 --format=%H -- $b.Src 2>$null)".Trim()
-            $cIn = "$(& git -C $Tree log -1 --format=%H -- $inputs 2>$null)".Trim()
-            if ($cBin -and $cIn) {
-                & git -C $Tree merge-base --is-ancestor $cIn $cBin 2>$null
-                if ($LASTEXITCODE -ne 0) {
-                    $subj = "$(& git -C $Tree log -1 --format='%h %s' $cIn 2>$null)"
-                    if ($subj.Length -gt 100) { $subj = $subj.Substring(0, 100) + '...' }
-                    $problems.Add("STALE: the committed $($b.Src) (last changed in $($cBin.Substring(0, 8))) does not include the later change to its sources in $subj - run $($b.Build) and commit it")
-                }
-            }
-            else { $problems.Add("STALE?: git history of $($b.Src) or its sources could not be read") }
-            continue
-        }
+        # T-896 (owner decision 900): no binary is committed any more - SharedWastelandsServer.exe was the last, and a stale committed
+        # copy made run T1290 vacuous. Every binary is asked by its write time: a source written after it means it is not this
+        # tree's build. A binary a branch still tracks is asked the same way (a checkout is not a build: build it).
         $newest = $inputs | ForEach-Object { Get-Item -LiteralPath (Join-Path $Tree $_) } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
         $built = (Get-Item -LiteralPath $src).LastWriteTimeUtc
         if ($built -lt $newest.LastWriteTimeUtc) {
@@ -195,6 +184,17 @@ try {
         }
     }
 
+    # ---- 2b. THE RELEASE FORM (T-879): a DLL built with `build.bat dev` carries the test-only probes and writes "DEV build" into
+    # its log's first line; players never get one. The text is searched as the mod writes it (ASCII). -AllowDevBuild overrides.
+    $dllForm = Join-Path $Tree 'src\coop-plugin\SharedWastelands.dll'
+    if (Test-Path -LiteralPath $dllForm) {
+        $formText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dllForm))
+        if ($formText.IndexOf('DEV build', [System.StringComparison]::Ordinal) -ge 0) {
+            if ($AllowDevBuild) { Write-Host "WARNING: packaging a DEV build of SharedWastelands.dll (-AllowDevBuild) - not for players" }
+            else { $problems.Add("DEV BUILD: src\coop-plugin\SharedWastelands.dll is a DEV build (built with 'build.bat dev'; it carries the test-only probes) - rebuild it with src\coop-plugin\build.bat and no argument, or pass -AllowDevBuild on purpose") }
+        }
+    }
+
     # ---- 3. the address tables: every tracked table on disk, nothing extra, and signatures.sig -------------------------
     $addrRel = 'src/coop-plugin/addresses'
     $addrSrc = Join-Path $Tree 'src\coop-plugin\addresses'
@@ -214,18 +214,20 @@ try {
         @{ Dst = 'licenses\ENet-LICENSE.txt';     Src = 'src/coop-plugin/third_party/enet/LICENSE' }
         @{ Dst = 'licenses\MinHook-LICENSE.txt';  Src = 'src/coop-plugin/third_party/minhook/LICENSE.txt' }
         @{ Dst = 'licenses\MyGUI-COPYING.MIT.txt'; Src = 'src/coop-plugin/third_party/ogre-mygui/include/mygui/COPYING.MIT' }
+        @{ Dst = 'licenses\Ogre-LICENSE.txt';    Src = 'src/coop-plugin/third_party/ogre-mygui/OGRE-LICENSE.txt' }
+        @{ Dst = 'THIRD-PARTY-NOTICES.txt';       Src = 'THIRD-PARTY-NOTICES.txt' }
     )
     $trackedPlain = @(Get-Tracked @($plain | ForEach-Object { $_.Src }))
     foreach ($p in $plain) { if ($trackedPlain -notcontains $p.Src) { $problems.Add("MISSING: $($p.Src) is not a tracked file of this tree") } }
 
     # ---- 5. the tree is clean where the package comes from (else the commit in the manifest does not describe it) ------
     $binRel = @($bins | ForEach-Object { $_.Src })
-    $cleanPaths = @($allInputDirs | Select-Object -Unique) + @($addrRel, "mod-package/$modDirName", 'src/coop-plugin/third_party')
+    $cleanPaths = @($allInputDirs | Select-Object -Unique) + @($addrRel, "mod-package/$modDirName", 'src/coop-plugin/third_party', 'THIRD-PARTY-NOTICES.txt')
     $dirty = @(& git -C $Tree status --porcelain=v1 --untracked-files=all -- $cleanPaths 2>$null)
     foreach ($l in $dirty) {
         if (-not $l) { continue }
         $path = $l.Substring(3).Trim('"')
-        if ($binRel -contains $path) { continue }   # a rebuilt build output (SharedWastelandsServer.exe is tracked) is the point, not a change
+        if ($binRel -contains $path) { continue }   # a build output (a branch made before T-896 may still track the exe) is the point, not a change
         $problems.Add("UNCOMMITTED: '$l' - commit or remove it; the manifest names commit $short")
     }
 

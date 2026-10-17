@@ -20,6 +20,7 @@
    be opened, that line is dropped silently and the next line tries to open it again. */
 
 #include <string>
+#include "../common/logbudget.h"   /* the release build's quiet-logging gate */
 
 void DebugLog(const std::wstring& message);
 void DebugLog(const std::string& message);
@@ -31,3 +32,36 @@ void ErrorLog(const char* message);
 /* T-461: the path of this launch's log (copy 0) or of an earlier launch's kept copy (1 = the previous launch;
    src/common/logrotate.h), beside SharedWastelands.dll; empty when the DLL's folder cannot be read. ANY THREAD. */
 std::wstring LogFilePath(int copy);
+
+/* The path of one part of a launch's log (src/common/logrotate.h: cooplogrot::kPartCurrent / kPartStart / kPartPrev): the
+   current part is LogFilePath(copy); ".start" holds the launch's opening 2 MB and ".prev" the part before the current one,
+   once the log has grown that far. Empty when the DLL's folder cannot be read. ANY THREAD. */
+std::wstring LogPartPath(int copy, int part);
+
+/* THE BUILD LABEL: "DEV build" (built with build.bat dev - SW_DEV_BUILD, the test probes compiled in) or "release build". The
+   log's first line and the bug report's report.txt carry it. */
+const char* LogBuildLabel();
+
+/* QUIET LOGGING (the release build; src/common/logbudget.h). True = write the line in full; when the gate holds back lines, this
+   writes the one count line itself ("<family> [<keyText>]: n more lines like this in the last s s were not written"). ANY
+   THREAD (a gate shared by two threads can only miscount). */
+bool QuietLogPass(swlogbudget::Gate* gate, const char* family, unsigned long long key, const char* keyText);
+/* Writes one count line for every key of every gate QuietLogPass has seen that holds lines back (the count since its last line).
+   periodic = true: at most once a minute (the soak tick calls it every frame); false: now (before a bug report is packed, and at
+   the game's exit). ANY THREAD. */
+void QuietLogFlush(bool periodic);
+
+/* SW_DEVLOG(msg): a test probe's line, compiled into the DEV build only - in the release build neither the line nor its text
+   is built. SW_QUIETLOG(gate, family, key, keyText, msg): a repeating line - every line in the DEV build; in the release build
+   the first few per key in full, then one count line per minute (QuietLogPass); the text is built only for a line written.
+   SW_DEVLOG_OR_FAIL(failed, msg): a probe line that also reports a failure or a refusal - every line in the DEV build; in the
+   release build written whenever `failed` is true (a failure is never a DEV-only line), its text built only then. */
+#ifdef SW_DEV_BUILD
+#define SW_DEVLOG(msg) DebugLog(msg)
+#define SW_DEVLOG_OR_FAIL(failed, msg) DebugLog(msg)
+#define SW_QUIETLOG(gate, family, key, keyText, msg) DebugLog(msg)
+#else
+#define SW_DEVLOG(msg) ((void)0)
+#define SW_DEVLOG_OR_FAIL(failed, msg) do { if (failed) DebugLog(msg); } while (0)
+#define SW_QUIETLOG(gate, family, key, keyText, msg) do { if (QuietLogPass(&(gate), (family), (key), (keyText))) DebugLog(msg); } while (0)
+#endif

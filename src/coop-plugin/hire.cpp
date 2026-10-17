@@ -32,6 +32,10 @@
 #include "game/Faction.h"
 #include "game/hand.h"
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
+#include "worldsync.h"   /* PauseSnapshot: the paused flag and the speed for the editorstate line */
+#include "../common/editorstate.h"
+#include <mygui/MyGUI_Widget.h>
+#include <float.h>   /* _finite: a non-finite speed prints ? */
 #include <Windows.h>
 #include <cstddef>
 #include <cstdio>
@@ -88,6 +92,7 @@ unsigned int g_nextReqId = 1;
 
 // the lever (MAIN THREAD: armed by the verb, drained at the safe point)
 int g_testArmed = 0; int g_testMode = 0; unsigned int g_testUid = 0; int g_testPrice = kDefaultPrice;   /* mode 1 near, 2 uid, 3 near same */
+int g_testJoinType = 18;   /* the hire's join type: 18 no editor; 3 (hiretest editor ...) recruit with the editor, as the dialogue's act 3 */
 float g_testX = kSameX, g_testZ = kSameZ;
 
 long long g_reqOut = 0, g_reqIn = 0, g_okOut = 0, g_okIn = 0, g_noIn = 0, g_doneOut = 0, g_doneIn = 0, g_taken = 0;
@@ -300,14 +305,14 @@ void OwnerCheck(const coophire::HireMsg& m, unsigned int peer)
     if (!net::IsUidMine(m.uid)) reason = coophire::kNoNotMine;
     else if (!Plaus(c = FindSpawned(m.uid))) reason = coophire::kNoGone;
     else if (g_reserved.find(m.uid) != g_reserved.end()) reason = coophire::kNoReserved;
-    else if (!Alive(c)) reason = coophire::kNoDowned;
     else
     {
+        // The hirer's game already ran the game's own dialogue, which offered the hire; the owner adds no rules of its own and
+        // refuses only a person whose faction, cage state or slave state it cannot read.
         ::Faction* f = FactionOfPod(c);
-        if (!Plaus(f) || IsPlayerFaction(f) || IsPeerFaction(f) || FactionName(f).substr(0, coophire::kHireNameMax) != m.faction) reason = coophire::kNoFaction;
-        else if (InCombatPod(c) == 1) reason = coophire::kNoCombat;
-        else if (InSomethingPod(c) == 2 || InSomethingPod(c) < 0) reason = coophire::kNoCaged;   // review-recruit1 3b: caged / prison mode; recheck (b): unreadable refuses
-        else if (SlaveStateOfCharacter(c) != 0) reason = coophire::kNoSlave;   // review-recruit1 3b: any slave state (1..3); recheck (b): unreadable (-1) refuses - T349 shows it if a free person has no slave block
+        if (!Plaus(f)) reason = coophire::kNoFaction;
+        else if (InSomethingPod(c) < 0) reason = coophire::kNoCaged;
+        else if (SlaveStateOfCharacter(c) < 0) reason = coophire::kNoSlave;
     }
     DebugLog("[HIRE] owner check uid=" + N(m.uid) + " free=" + N(reason == 0 ? 1 : 0) + " reason=" + N(reason) + " req=" + N(m.reqId) + " peer=" + N(peer));
     coophire::HireMsg a; a.reqId = m.reqId; a.uid = m.uid; a.hirerUid = m.hirerUid; a.price = m.price; a.joinType = m.joinType;
@@ -442,7 +447,7 @@ void Finish(const coophire::HireMsg& m, unsigned int peer)
     DebugLog("[HIRE] finish uid=" + N(m.uid) + " taken=" + N(m.taken) + " joined=" + N(m.joined) + " released=" + N(released)
              + " factionSet=" + N(factionSet) + " faction=" + (Plaus(c) ? FactionName(FactionOfPod(c)) : std::string("?")));
     const std::string q(1, (char)34);
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "hire_done" + q + "," + q + "uid" + q + ":" + N(m.uid) + "," + q + "taken" + q + ":" + N(m.taken)
+    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "hire_done" + q + "," + q + "uid" + q + ":" + N(m.uid) + "," + q + "taken" + q + ":" + N(m.taken)
              + "," + q + "joined" + q + ":" + N(m.joined) + "," + q + "released" + q + ":" + N(released) + "," + q + "factionSet" + q + ":" + N(factionSet) + "}");
 }
 
@@ -487,9 +492,9 @@ void RunTestLever()
     }
     if (person == 0) { ++g_testNoPerson; DebugLog("[HIRE] hiretest skipped: no person (" + std::string(g_testMode == 2 ? "uid " + N(g_testUid) + " not here" : "no Drifter within 3000 u; factions near:" + (seen.empty() ? std::string(" none") : seen)) + ")"); return; }
     DebugLog("[HIRE] hiretest uid=" + N(uid) + " mode=" + N(g_testMode) + " hirer=" + N(hirerUid) + " price=" + N(g_testPrice) + " mine=" + N(net::IsUidMine(uid) ? 1 : 0)
-             + " fac='" + FactionName(FactionOfPod(person)) + "'");
-    if (net::IsUidMine(uid)) LocalHire(uid, person, hirer, hirerUid, g_testPrice, 18);
-    else Hold(uid, person, hirerUid, g_testPrice, 18);
+             + " fac='" + FactionName(FactionOfPod(person)) + "' join=" + N(g_testJoinType));
+    if (net::IsUidMine(uid)) LocalHire(uid, person, hirer, hirerUid, g_testPrice, g_testJoinType);
+    else Hold(uid, person, hirerUid, g_testPrice, g_testJoinType);
 }
 
 // ---- the 0x67FAD0 detour: R0-b HOLD (docs/design-recruit1.md 1 step 3) ----
@@ -568,7 +573,11 @@ void detour_doActions(void* dlg, void* line, void* a3, void* a4)
         if (TalkDeferTargetActs(dlg, line)) return;   /* P26 stage 5: the router - a forwarded conversation's line: NPC-side here, target-side as ACT */
         if (HoldLine(dlg, line)) return;
     }
-    else ::InterlockedIncrement64(&g_linesOffMain);
+    else
+    {
+        ::InterlockedIncrement64(&g_linesOffMain);
+        TalkNoteOffMainActs(dlg, line);   /* log-only: a window-opening action off the main thread */
+    }
     void* const s6Target = TalkS6LeaderTarget(dlg, line);   /* P26s6 S6-3: resolved before the line runs (it may end the conversation) */
     g_doActionsOrig(dlg, line, a3, a4);
     if (s6Target != 0) TalkS6LeaderOrder(dlg, s6Target);   /* P26s6 S6-3: the walk-over the engine gives a player target */
@@ -624,8 +633,253 @@ void HireNoteRecv(const coophire::HireMsg& m, unsigned int fromPeer)
 
 void HireNoteBad() { ++g_bad; }
 
+/* EDITOR STATE (TEST-ONLY, read-only): the character editor that a hire with editing opens (dialogue act 3 -> recruit(edit)
+   -> showCharacterEditor 0x6E2FA0 on the GUI object, mode 1). Read at the safe point; nothing is written to the game.
+   GUI +0x1C0: the editor window - 0x6E2FA0 deletes the old one and stores the new CharacterEditWindow there (decomp :10-20;
+     0x7FED10 passes the GUI object itself, :218); the GUI update 0x6E98D0 runs the editor's update while it is set (:45).
+   window +0x1C0 byte: 1 when the window was made in mode 1 (ctor 0x5F4340 :175 writes mode == 1; the mode itself is not kept).
+   window +0x8: the layout's main widget - the ctor hides it (:345, vt+0x18 with 0), 0x5EF930 shows it (:646, vt+0x18 with 1)
+     right before it pauses the game (:648) and shows the tab widgets (:662-667).
+   window +0x260 / +0x268: the recruits (pointer array / count; the ctor fills them from the hire list, :317-342).
+   window +0x278: the recruit on show - set by 0x5EF2D0 (:46), which 0x5EF930 calls (:647); the update 0x5F0C10 runs the
+     body wait and then 0x5EF930 only while it is 0 (:23-45).
+   a recruit's body: character +0x448 -> +0xE8; the update waits while its entity (+0xD8) or its mesh is missing, unless no
+     entity is there, none is pending (+0xE0) and the done byte (+0xE8) is set (0x5F0C10 :27-41). */
+static unsigned long long kEdGuiRva = 0; static AddrReg kEdGuiRva_reg("ForgottenGui", &kEdGuiRva);   /* Steam_1.0.65 0x2132750: the GUI object itself */
+const size_t kGuiEditorWin = 0x1C0, kEdModeOne = 0x1C0, kEdMainWidget = 0x8, kEdRecruits = 0x260, kEdRecruitCount = 0x268, kEdOnShow = 0x278;
+const size_t kChrAnim = 0x448, kAnimBody = 0xE8, kBodyEntity = 0xD8, kBodyPending = 0xE0, kBodyDone = 0xE8;
+const unsigned long long kEdRecruitCap = 64;   /* a larger count is not read as recruits */
+
+struct EdSnap { void* win; int modeOne; int shown; long long recruits; int ready; void* onShow; int fault; };
+
+/* MAIN THREAD. Guarded reads (and MyGUI's getVisible on the main widget); no C++ object in this frame. -1 = not read. */
+static void EdReadPod(EdSnap* s)
+{
+    s->win = 0; s->modeOne = -1; s->shown = -1; s->recruits = -1; s->ready = -1; s->onShow = 0; s->fault = 0;
+    if (kEdGuiRva == 0) return;
+    __try
+    {
+        const char* const gui = (const char*)(Base() + (uintptr_t)kEdGuiRva);
+        const char* const w = *(char* const*)(gui + kGuiEditorWin);
+        s->win = (void*)w;
+        if (w == 0) return;
+        s->modeOne = *(const unsigned char*)(w + kEdModeOne);
+        s->onShow = *(void* const*)(w + kEdOnShow);
+        MyGUI::Widget* const mw = *(MyGUI::Widget* const*)(w + kEdMainWidget);
+        if (mw != 0) s->shown = mw->getVisible() ? 1 : 0;
+        const unsigned long long n = *(const unsigned long long*)(w + kEdRecruitCount);
+        s->recruits = (long long)n;
+        if (n > kEdRecruitCap) return;
+        const char* const arr = *(char* const*)(w + kEdRecruits);
+        int ready = 0;
+        for (unsigned long long i = 0; i < n; ++i)
+        {
+            const char* const c = *(char* const*)(arr + i * 8);
+            const char* const anim = (c != 0) ? *(char* const*)(c + kChrAnim) : 0;
+            const char* const body = (anim != 0) ? *(char* const*)(anim + kAnimBody) : 0;
+            if (body == 0) continue;
+            ready += coopeditor::EditorBodyReady(*(void* const*)(body + kBodyEntity) != 0 ? 1 : 0, *(void* const*)(body + kBodyPending) != 0 ? 1 : 0,
+                                                 *(const unsigned char*)(body + kBodyDone));
+        }
+        s->ready = ready;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { s->fault = 1; }
+}
+
+static long g_edArmed = 0;
+static int g_edWatchLeft = 0;      /* watched lines still to write */
+static DWORD g_edNextMs = 0;
+
+static std::string EdNum(long long v) { if (v < 0) return "?"; char b[32]; std::sprintf(b, "%lld", v); return b; }
+
+static void EdLine(const char* why)
+{
+    if (EngineWritesBlocked()) { DebugLog(std::string("[EDITOR] state (") + why + ") not read: the world is loading or tearing down"); return; }
+    EdSnap s;
+    EdReadPod(&s);
+    bool paused = false; float mul = 0.0f;
+    const bool ps = PauseSnapshot(&paused, &mul);
+    char b[320];
+    std::sprintf(b, "[EDITOR] state window=%p mode=%s widgetsShown=%s recruits=%s bodiesReady=%s paused=%s speed=",
+                 s.win, s.modeOne < 0 ? "?" : (s.modeOne == 1 ? "1" : "not1"), s.shown < 0 ? "?" : (s.shown ? "1" : "0"),
+                 EdNum(s.recruits).c_str(), EdNum(s.ready).c_str(), ps ? (paused ? "1" : "0") : "?");
+    char t[160];
+    if (ps && _finite(mul)) std::sprintf(t, "%.2f", mul); else std::sprintf(t, "?");
+    char u[200];
+    std::sprintf(u, " onShow=%p%s (%s%s)", s.onShow, s.fault ? " readFault=1" : "", why, kEdGuiRva == 0 ? "; no ForgottenGui row" : "");
+    DebugLog(std::string(b) + t + u);
+}
+
+std::string EditorStateArm(const std::string& arg)
+{
+    int secs = 0;
+    if (!coopeditor::EditorStateParse(arg, &secs)) return "error editorstate usage: editorstate | editorstate watch <1..120>";
+    if (secs > 0) { g_edWatchLeft = secs; g_edNextMs = ::GetTickCount(); DebugLog("[EDITOR] state watch armed: a line every second for " + EdNum(secs) + " s"); }
+    else ::InterlockedExchange(&g_edArmed, 1);
+    return secs > 0 ? "ok editorstate watch armed" : "ok editorstate armed";
+}
+
+void EditorStateTick()
+{
+    if (::InterlockedExchange(&g_edArmed, 0) != 0) EdLine("once");
+    if (g_edWatchLeft <= 0) return;
+    const DWORD now = ::GetTickCount();
+    if ((long)(now - g_edNextMs) < 0) return;
+    g_edNextMs = now + 1000;
+    --g_edWatchLeft;
+    EdLine(g_edWatchLeft > 0 ? "watch" : "watch, last");
+}
+
+/* RECRUIT BODIES WHILE PAUSED. The editor's setup 0x5F4340 reloads each recruit: 0x52C760 drops the body (appearance entity
+   +0xD8 and pending +0xE0 cleared, rebuild flag +0x143 set) and the editor's update 0x5F0C10 waits for the new body. The only
+   rebuild is the appearance update (AppearanceBase vt+0x8, 0x5382A0: vt+0x58 createBody while +0x143 is set), which the
+   animation update (AnimationClass vt+0x30: 0x5B5E30, AnimationClassHuman 0x5C4CC0) runs while anim +0x88 or +0x89 is set.
+   The engine's paused-frame update (Character vt+0x270: 1.0.65 0x5C7090, 1.0.68 0x5C7B20) makes that call at zero time,
+   anim->vt+0x30(anim, 0.0f), for every character except one whose faction's +0x250 is set while the editor window (GUI +0x1C0)
+   is open - and the hire has already moved the recruit into the player's faction, so its body is never rebuilt while paused.
+   The talk window's closing unpause stays blocked in a session (store.cpp), so instead, while the game is paused and the hire
+   editor still waits (mode 1, no recruit on show), this makes that same call once per frame for each recruit the engine skips
+   whose body is not ready, here at the safe point (main thread, worker paused). It stops when the body is ready, the editor
+   shows a recruit or closes, the game unpauses, or after kBodyStepGiveUpFrames frames of calls for one window. Nothing moves,
+   nothing is unpaused, nothing is sent to the other games. The call goes through the recruit's own animation object's vtable,
+   as the engine's does, so it needs no table row. */
+const size_t kFacEditorSkip  = 0x250;   /* Faction: non-zero = the paused-frame update skips its members while the editor is open */
+const size_t kAnimUpdateSlot = 0x30;    /* AnimationClass vt+0x30: the animation update; the time is the second argument */
+typedef void (*AnimUpdateFn)(void* anim, float dt);
+
+struct BsFrame
+{
+    void* win; int modeOne; int onShowSet; int windowDue; int n; int fault;
+    void* chars[kEdRecruitCap]; unsigned char ready[kEdRecruitCap]; unsigned char stepped[kEdRecruitCap];
+    unsigned char animFlags[kEdRecruitCap];   /* bit 0: anim +0x88 set, bit 1: anim +0x89 set (the animation update reaches the body update only with one of them); 0xFF unread */
+};
+
+/* An engine object pointer: inside the user address range and 8-aligned. */
+static bool BsObj(const void* p) { return Plaus(p) && ((uintptr_t)p & 7) == 0; }
+
+/* MAIN THREAD, worker paused. Guarded reads of the editor and its recruits and, when the window may be stepped (paused, mode 1,
+   no recruit on show, under the frame limit - framesForWin counts for lastWin only), the animation update call for each
+   recruit that needs it. No C++ object in this frame. */
+static void BsPod(int paused, void* lastWin, int framesForWin, BsFrame* f)
+{
+    f->win = 0; f->modeOne = 0; f->onShowSet = 0; f->windowDue = 0; f->n = 0; f->fault = 0;
+    __try
+    {
+        const char* const gui = (const char*)(Base() + (uintptr_t)kEdGuiRva);
+        const char* const w = *(char* const*)(gui + kGuiEditorWin);
+        if (!BsObj(w)) return;
+        f->win = (void*)w;
+        f->modeOne = (*(const unsigned char*)(w + kEdModeOne) == 1) ? 1 : 0;
+        f->onShowSet = (*(void* const*)(w + kEdOnShow) != 0) ? 1 : 0;
+        f->windowDue = coopeditor::EditorBodyStepDue(paused, f->modeOne, f->onShowSet, (w == (const char*)lastWin) ? framesForWin : 0);
+        const unsigned long long n = *(const unsigned long long*)(w + kEdRecruitCount);
+        if (n > kEdRecruitCap) return;
+        const char* const arr = *(char* const*)(w + kEdRecruits);
+        if (n != 0 && !BsObj(arr)) return;
+        f->n = (int)n;
+        for (int i = 0; i < f->n; ++i)
+        {
+            char* const c = *(char* const*)(arr + (size_t)i * 8);
+            f->chars[i] = c; f->ready[i] = 0; f->stepped[i] = 0; f->animFlags[i] = 0xFF;
+            if (!BsObj(c)) continue;
+            char* const anim = *(char* const*)(c + kChrAnim);
+            if (!BsObj(anim)) continue;
+            f->animFlags[i] = (unsigned char)(((*(const unsigned char*)(anim + 0x88) != 0) ? 1 : 0) | ((*(const unsigned char*)(anim + 0x89) != 0) ? 2 : 0));
+            const char* const body = *(char* const*)(anim + kAnimBody);
+            const int bodyHere = BsObj(body) ? 1 : 0;
+            if (bodyHere != 0)
+                f->ready[i] = (unsigned char)coopeditor::EditorBodyReady(*(void* const*)(body + kBodyEntity) != 0 ? 1 : 0,
+                                                                         *(void* const*)(body + kBodyPending) != 0 ? 1 : 0,
+                                                                         *(const unsigned char*)(body + kBodyDone));
+            if (f->windowDue == 0) continue;
+            const char* const fac = *(char* const*)(c + kCharFactionOff);
+            const int skips = (BsObj(fac) && *(void* const*)(fac + kFacEditorSkip) != 0) ? 1 : 0;
+            if (coopeditor::EditorRecruitStepDue(skips, bodyHere, f->ready[i]) == 0) continue;
+            void* const* const vt = *(void* const* const*)anim;
+            if (!BsObj(vt)) continue;
+            const AnimUpdateFn fn = (AnimUpdateFn)vt[kAnimUpdateSlot / sizeof(void*)];
+            if (!Plaus((const void*)fn)) continue;
+            fn(anim, 0.0f);   /* the call 0x5C7090 makes: rcx = the animation object, xmm1 = 0.0f */
+            f->stepped[i] = 1;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { f->fault = 1; }
+}
+
+static void* g_bsWin = 0;                     /* the editor window the counts below belong to */
+static int g_bsFrames = 0;                    /* frames with at least one call, for g_bsWin */
+static int g_bsGaveUpSaid = 0;
+static void* g_bsChar[kEdRecruitCap];         /* per recruit slot: the character ... */
+static int g_bsCharFrames[kEdRecruitCap];     /* ... and its frames of calls (-1 = its ready line was written) */
+/* " anim88=<0/1> anim89=<0/1>" for a recruit's animation flags, or " anim88/89=unread". */
+static std::string BsFlagsText(unsigned char fl)
+{
+    if (fl == 0xFF) return " anim88/89=unread";
+    return std::string(" anim88=") + ((fl & 1) ? "1" : "0") + " anim89=" + ((fl & 2) ? "1" : "0");
+}
+static long long g_bsSteps = 0, g_bsCalls = 0, g_bsRebuilt = 0, g_bsGiveUps = 0, g_bsFaults = 0;
+
+/* MAIN THREAD, worker paused (HireSafePointDrain), every frame. */
+static void EditorBodyStep()
+{
+    if (kEdGuiRva == 0 || EngineWritesBlocked()) return;
+    bool paused = false; float mul = 0.0f;
+    const int p = (PauseSnapshot(&paused, &mul) && paused) ? 1 : 0;
+    BsFrame f;
+    BsPod(p, g_bsWin, g_bsFrames, &f);
+    if (f.win != g_bsWin)
+    {
+        g_bsWin = f.win; g_bsFrames = 0; g_bsGaveUpSaid = 0;
+        for (unsigned long long i = 0; i < kEdRecruitCap; ++i) { g_bsChar[i] = 0; g_bsCharFrames[i] = 0; }
+    }
+    if (f.fault != 0)
+    {
+        ++g_bsFaults;
+        if (f.win != 0 && g_bsFrames < coopeditor::kBodyStepGiveUpFrames)
+        {
+            g_bsFrames = coopeditor::kBodyStepGiveUpFrames; g_bsGaveUpSaid = 1;   /* no more calls for this window */
+            ErrorLog("[HIRE] editor body step faulted - no more animation calls for this editor window");
+        }
+        return;
+    }
+    if (f.win == 0) return;
+    int any = 0, notReady = 0, firstNotReady = -1;
+    for (int i = 0; i < f.n; ++i)
+    {
+        if (g_bsChar[i] != f.chars[i])
+        {   /* another recruit in this slot: a new editor at the same window address starts its own frame count */
+            if (g_bsChar[i] != 0) { g_bsFrames = 0; g_bsGaveUpSaid = 0; }
+            g_bsChar[i] = f.chars[i]; g_bsCharFrames[i] = 0;
+        }
+        if (f.stepped[i] != 0)
+        {
+            any = 1; ++g_bsCalls;
+            g_bsCharFrames[i] = (g_bsCharFrames[i] < 0 ? 0 : g_bsCharFrames[i]) + 1;
+        }
+        if (f.ready[i] == 0) { if (firstNotReady < 0) firstNotReady = i; ++notReady; continue; }
+        if (g_bsCharFrames[i] > 0)   /* stepped before and ready now: said once */
+        {
+            ++g_bsRebuilt;
+            std::string name;
+            if (!NameOf(f.chars[i], &name) || name.empty()) name = "?";
+            DebugLog(std::string(p != 0 ? "[HIRE] editor body rebuilt while paused: " : "[HIRE] editor body ready after the unpause: ")
+                     + name + " after " + N(g_bsCharFrames[i]) + " frames" + BsFlagsText(f.animFlags[i]));
+            g_bsCharFrames[i] = -1;
+        }
+    }
+    if (any != 0) { ++g_bsFrames; ++g_bsSteps; }
+    if (g_bsGaveUpSaid == 0 && coopeditor::EditorBodyGiveUpDue(p, f.modeOne, f.onShowSet, g_bsFrames, notReady) != 0)
+    {
+        g_bsGaveUpSaid = 1; ++g_bsGiveUps;
+        ErrorLog("[HIRE] editor body rebuild while paused gave up: " + N(notReady) + " of " + N(f.n) + " recruits still without a ready body after "
+                 + N(g_bsFrames) + " frames of animation calls - the editor still waits" + (firstNotReady >= 0 ? BsFlagsText(f.animFlags[firstNotReady]) : std::string()));
+    }
+}
+
 void HireSafePointDrain()
 {
+    EditorStateTick();
+    EditorBodyStep();   /* every frame, before the held-while-loading return below: it checks the world itself */
     if ((g_testArmed == 0 && g_inbound.empty()) || EngineWritesBlocked()) return;   // held while loading: runs every frame
     if (g_testArmed != 0 && (kRecruitRva == 0 || kPlayerIfaceRva == 0)) { g_testArmed = 0; ++g_testNoHirer; DebugLog("[HIRE] hiretest skipped: recruit / PlayerInterface not in the address table"); }
     if (g_testArmed != 0) { g_testArmed = 0; RunTestLever(); }
@@ -673,7 +927,11 @@ std::string HireTestArm(const std::string& arg)
 {
     std::istringstream is(arg);
     std::string mode; is >> mode;
-    const std::string usage = "error hiretest: usage hiretest near [price] | near same [<x> <z> [price]] | uid <n> [price]";
+    /* a leading 'editor': the hire opens the character editor - recruit(edit = true), the call the dialogue's join-with-edit
+       reply makes - instead of join type 18 */
+    const bool editor = mode == "editor";
+    if (editor) { mode.clear(); is >> mode; }
+    const std::string usage = "error hiretest: usage hiretest [editor] near [price] | [editor] near same [<x> <z> [price]] | [editor] uid <n> [price]";
     std::vector<std::string> t; std::string w;
     while (is >> w) t.push_back(w);
     unsigned int uid = 0; int price = kDefaultPrice; bool same = false; float sx = kSameX, sz = kSameZ;
@@ -694,9 +952,9 @@ std::string HireTestArm(const std::string& arg)
         if (e == t[ip].c_str() || *e != 0 || p < 0 || p > 1000000) return "error hiretest: price 0..1000000";
         price = (int)p;
     }
-    g_testMode = mode == "uid" ? 2 : (same ? 3 : 1); g_testUid = uid; g_testPrice = price; g_testX = sx; g_testZ = sz; g_testArmed = 1;
-    DebugLog("[HIRE] hiretest " + mode + (uid ? " " + N(uid) : std::string()) + (same ? " same point=(" + N((long long)sx) + "," + N((long long)sz) + ")" : std::string())
-             + " price=" + N(price) + " ARMED - runs at the next safe point");
+    g_testMode = mode == "uid" ? 2 : (same ? 3 : 1); g_testUid = uid; g_testPrice = price; g_testX = sx; g_testZ = sz; g_testJoinType = editor ? 3 : 18; g_testArmed = 1;
+    DebugLog("[HIRE] hiretest " + std::string(editor ? "editor " : "") + mode + (uid ? " " + N(uid) : std::string()) + (same ? " same point=(" + N((long long)sx) + "," + N((long long)sz) + ")" : std::string())
+             + " price=" + N(price) + " join=" + N(g_testJoinType) + " ARMED - runs at the next safe point");
     return "ok hiretest armed";
 }
 
@@ -736,6 +994,8 @@ void ReportHire()
              + " testNoHirer=" + N(g_testNoHirer) + " | lines=" + N(g_linesSeen) + " linesPlayer=" + N(g_linesPlayer)
              + " linesHeld=" + N(g_linesHeld) + " linesOwn=" + N(g_linesOwn) + " linesNoUid=" + N(g_linesNoUid) + " linesNoHirer=" + N(g_linesNoHirer)
              + " linesNoAddr=" + N(g_linesNoAddr) + " endFault=" + N(g_endFault)
+             + " | editorBody[frames,calls,rebuilt,gaveUp,fault]=" + N(g_bsSteps) + "," + N(g_bsCalls) + "," + N(g_bsRebuilt) + ","
+             + N(g_bsGiveUps) + "," + N(g_bsFaults)
              + " linesOffMain=" + N((long long)g_linesOffMain) + " linesUnread=" + N(g_linesUnread) + " hook=" + N(g_doActionsHook));
 }
 
@@ -825,6 +1085,140 @@ std::string CopySquadNearestLever()
     _snprintf(b, 199, "[CMD] copysquad nearest picked uid=%u dist=%.1f anchor=%u candidates=%d", uid, best, anchorUid, candidates); b[199] = 0;
     DebugLog(std::string(b));
     return CopySquadLever(uid);
+}
+
+/* TEST-ONLY lever `splitsquad [n]`: the last n members (default 1) of this game's first player squad - the squad of its first own
+   living player-faction character (MyHirer's rule) - are moved into a NEW squad of the player faction, so a test can make a player
+   squad that the last engine save does not hold. The verb only ARMS it (MAIN THREAD, the command channel); SplitSquadDrain runs it at
+   the K2 safe point 0x7D17E0 (combat.cpp, the AI worker paused) and writes the result to the status file.
+   The new squad is made as the squad screen's "Add squad" button makes one: that handler (0x4910C0) calls PlayerInterface 0x7F3D70,
+   which is Faction::spawnEmptySquad 0x7F3880 (the player faction, no template, permanent, a position) and takes the result's
+   ActivePlatoon (Platoon+0x1D8). Each character is then moved by Character vt+0xA0 setFaction(its own faction, the new
+   ActivePlatoon): the old squad's removal (ActivePlatoon vt+0x18) and the new squad's addMember (vt+0x10 0x7966A0) - the engine's own
+   join the hire flow uses. The squad screen's drag-and-drop mover 0x795A80 makes the same old-squad removal and an insert at a
+   chosen place; it has no address-table row, so the lever does not call it. */
+namespace {
+typedef void* (*SsSpawnEmptySquadFn)(void* faction, void* squadTemplate, bool permanent, const Ogre::Vector3* p);
+typedef std::string* (*SsPlatoonSidFn)(const void* platoon, std::string* out);
+unsigned long long kSsSpawnEmptySquadRva = 0; static AddrReg kSsSpawnEmptySquadRva_reg("Faction_spawnEmptySquad", &kSsSpawnEmptySquadRva);   /* Steam_1.0.65 0x7F3880 Faction::spawnEmptySquad */
+unsigned long long kSsPlatoonSidRva = 0; static AddrReg kSsPlatoonSidRva_reg("PlatoonSid", &kSsPlatoonSidRva);   /* Steam_1.0.65 0x384AF0 Platoon::getPlatoonStringID */
+const size_t kSsActivePlatoonOff = 0x1D8;   /* Platoon -> ActivePlatoon (handoff.h, the squad reader's back-pointer) */
+const int kSsMaxN = kSquadViewCap - 1;
+const int kSsWaitMax = 600;                 /* safe points to wait while engine writes are blocked */
+int g_ssArmed = 0, g_ssN = 1, g_ssWaits = 0;
+long long g_ssRuns = 0, g_ssRefused = 0;
+
+/* POD only (C2712): the engine call; 0 = faulted or no squad made */
+void* SsSpawnEmptySquadPod(void* faction, const Ogre::Vector3* pos, void** activeOut)
+{
+    *activeOut = 0;
+    __try
+    {
+        void* platoon = ((SsSpawnEmptySquadFn)(Base() + (uintptr_t)kSsSpawnEmptySquadRva))(faction, 0, true, pos);
+        if (Plaus(platoon)) *activeOut = *(void**)((char*)platoon + kSsActivePlatoonOff);
+        return platoon;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *activeOut = 0; return 0; }
+}
+/* POD only: the squad's id ("<faction name>_<number>"); 0 = faulted */
+int SsPlatoonSidPod(const void* platoon, std::string* out)
+{
+    __try { ((SsPlatoonSidFn)(Base() + (uintptr_t)kSsPlatoonSidRva))(platoon, out); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string SsSid(const void* platoon)
+{
+    std::string s;
+    if (!Plaus(platoon) || !SsPlatoonSidPod(platoon, &s)) return "?";
+    return s.empty() ? std::string("?") : s;
+}
+/* one [SQUAD] line and the status text for a refusal */
+std::string SsRefuse(const std::string& why)
+{
+    ++g_ssRefused;
+    DebugLog("[SQUAD] splitsquad REFUSED - " + why);
+    return "error splitsquad: " + why;
+}
+/* MAIN THREAD (the K2 safe point, the AI worker paused). The status text. */
+std::string SsRun(int n)
+{
+    if (kSsSpawnEmptySquadRva == 0 || kSsPlatoonSidRva == 0) return SsRefuse("Faction_spawnEmptySquad / PlatoonSid not in the address table");
+    unsigned int firstUid = 0;
+    ::Character* first = MyHirer(&firstUid);
+    if (first == 0) return SsRefuse("no own living player-faction character");
+    ::Faction* f = FactionOfPod(first);
+    SquadView sv;
+    if (!Plaus(f) || ReadSquadOf(first, &sv) != 1 || !Plaus(sv.ap) || !Plaus(sv.platoon)) return SsRefuse("no player squad (uid " + N(firstUid) + " has no readable squad)");
+    if (sv.count > sv.stored) return SsRefuse("the player squad has " + N(sv.count) + " members, more than the reader holds (" + N(kSquadViewCap) + ")");
+    if (sv.count < n + 1) return SsRefuse("the player squad has " + N(sv.count) + " members, fewer than n+1 = " + N(n + 1));
+    std::vector< ::Character*> moving;
+    std::vector<unsigned int> uids;
+    for (int i = sv.count - n; i < sv.count; ++i)
+    {
+        ::Character* c = sv.members[i];
+        const unsigned int u = Plaus(c) ? FindSpawnedUid(c) : 0u;
+        if (u == 0 || !net::IsUidMine(u)) return SsRefuse("member " + N(i) + " of the player squad is not a character this game runs");
+        if (FactionOfPod(c) != f) return SsRefuse("member " + N(i) + " (uid " + N(u) + ") is not in the player faction");
+        moving.push_back(c); uids.push_back(u);
+    }
+    Ogre::Vector3 pos(sv.x, sv.y, sv.z);
+    if (!SafeReadPosition(moving[0], &pos) && !sv.posUsable) pos = Ogre::Vector3(0.0f, 0.0f, 0.0f);
+    const std::string fromSid = SsSid(sv.platoon);
+    void* newAp = 0;
+    void* newPlatoon = SsSpawnEmptySquadPod((void*)f, &pos, &newAp);
+    if (!Plaus(newPlatoon) || !Plaus(newAp)) return SsRefuse("Faction::spawnEmptySquad made no squad (platoon " + N((long long)(uintptr_t)newPlatoon) + ")");
+    std::string uidList;
+    int moved = 0;
+    for (size_t i = 0; i < moving.size(); ++i)
+    {
+        if (SetFactionPod(moving[i], f, newAp) == 0)
+        {
+            ++g_setFactionFault;
+            return SsRefuse("setFaction FAULTED on uid " + N(uids[i]) + " after " + N(moved) + " moved into " + SsSid(newPlatoon));
+        }
+        if (SquadActivePlatoonOf(moving[i]) == newAp) ++moved;
+        uidList += (uidList.empty() ? "" : ",") + N(uids[i]);
+    }
+    SquadView nv, ov;
+    const int newCount = ReadSquadAt(newAp, &nv) == 1 ? nv.count : -1;
+    const int oldCount = ReadSquadAt(sv.ap, &ov) == 1 ? ov.count : -1;
+    const std::string newSid = SsSid(newPlatoon);
+    ++g_ssRuns;
+    char b[160];
+    _snprintf(b, 159, " moved=%d/%d members=%d left=%d pos=%.0f,%.0f,%.0f runs=%lld", moved, n, newCount, oldCount, pos.x, pos.y, pos.z, g_ssRuns); b[159] = 0;
+    const std::string body = "from=" + fromSid + " squad=" + newSid + " uids=" + uidList + std::string(b);
+    if (moved != n) return SsRefuse("not every member reached the new squad: " + body);
+    DebugLog("[SQUAD] splitsquad " + body);
+    return "ok splitsquad " + body;
+}
+} // namespace
+
+void CommandStatusLate(const std::string& text);   /* command_channel.cpp (ui.h): the status file, written after the verb returned */
+
+std::string SplitSquadArm(const std::string& arg)
+{
+    int n = 1;
+    if (!arg.empty())
+    {
+        char extra = 0;
+        if (std::sscanf(arg.c_str(), "%d %c", &n, &extra) != 1 || n < 1 || n > kSsMaxN)
+            return SsRefuse("usage splitsquad [n] (members to move, 1.." + N(kSsMaxN) + ", default 1)");
+    }
+    if (kSsSpawnEmptySquadRva == 0 || kSsPlatoonSidRva == 0) return SsRefuse("Faction_spawnEmptySquad / PlatoonSid not in the address table");
+    g_ssArmed = 1; g_ssN = n; g_ssWaits = 0;
+    return "ok splitsquad armed n=" + N(n) + " (runs at the next safe point; the result replaces this line)";
+}
+
+void SplitSquadDrain()
+{
+    if (g_ssArmed == 0) return;
+    if (EngineWritesBlocked())
+    {
+        if (++g_ssWaits > kSsWaitMax) { g_ssArmed = 0; CommandStatusLate(SsRefuse("engine writes stayed blocked for " + N(kSsWaitMax) + " safe points")); }
+        return;
+    }
+    g_ssArmed = 0;
+    CommandStatusLate(SsRun(g_ssN));
 }
 
 } // namespace coop

@@ -9,7 +9,9 @@ State:      unmodified - whole directories, byte for byte. .gitattributes here t
             The build includes only a subset (measured with /showIncludes: 17 Ogre headers, 95 MyGUI headers); the
             directories are whole so a new #include needs nothing from outside the repo.
 Licence:    MIT. MyGUI: include\mygui\COPYING.MIT. Ogre: the MIT text is at the top of every Ogre header (e.g.
-            include\ogre\OgrePrerequisites.h, "Copyright (c) 2000-2014 Torus Knot Software Ltd").
+            include\ogre\OgrePrerequisites.h, "Copyright (c) 2000-2014 Torus Knot Software Ltd"). T-282: that header text is
+            copied word for word into OGRE-LICENSE.txt beside this file (outside include\, which stays byte-identical),
+            so the release package can ship it as licenses\Ogre-LICENSE.txt.
 
 IMPORT LIBRARIES (lib\) - T-373 (owner 280/282): made by this project from the GAME'S OWN DLLs.
 lib\<name>.def is the source; lib\<name>.lib is made from it.

@@ -66,12 +66,26 @@ void* TownOfBuilding(void* building);
 /* The group's home building, carried on its world record. TownGenPlatoonHomeKey: the position key (items.cpp ObjectPositionKey, the
    residents table's own key form) of the building the group's Ownerships+0x38 names - 1 written to out, 0 the group has no home
    building, -1 unreadable or a key a record line cannot hold. TownGenGiveHomeTo: Ownerships::setHomeBuilding for the group (spawn.cpp
-   PlatoonSetHomeBuildingPod) - 1 given and the building's residents hand names the group, 2 given and it does not, 0 the call faulted.
+   PlatoonSetHomeBuildingPod) - 1 given and the building's residents hand names the group, 2 given and it does not, 0 the call faulted,
+   4 (coopstore::kGiveHomePlayerHouse) refused: the building is a player's house (TownGenPlayerHouse), never given.
    TownGenGiveHomeByKey: the same after resolving the key (items.cpp ObjectByPositionKey) - 3 the building is not loaded here.
    MAIN THREAD. */
 int  TownGenPlatoonHomeKey(const void* platoon, char* out, int cap);
 int  TownGenGiveHomeTo(void* platoon, void* building);
 int  TownGenGiveHomeByKey(void* platoon, const char* key);
+/* A player's house (a building a player owns: the owner's player marker, another player's stand-in, or the build records naming a
+   player - townreoffer::PlayerHouseSkips). TownGenPlayerHouse: townreoffer::kHouse* (0 = not one, or the owner unreadable); the
+   build-record test is asked on the main thread only. TownGenPlayerHouseSkip: worldgen.cpp's populateBuilding detour (rerun 0) and
+   the re-offer's call (rerun 1), before the residents gate - 1 = a player's house: counted, logged once per building, its waiting
+   entry erased, and the engine call is not made. ANY THREAD.
+   TownGenBuyHeld (owner decisions 809 b / 813 b, MAIN THREAD): a house being bought whose residents are on hold - its waiting entry is
+   offered now through the check-up's own steps so the engine's purchase rehomes the groups made; when nothing is made the entry is
+   dropped. -1 off the main thread, 0 no waiting entry, else townreoffer::kOne* (what the re-offer did). TownGenBuyHeldGroups: the groups
+   that run made (up to cap; valid until the next TownGenBuyHeld). */
+int  TownGenPlayerHouse(void* building);
+int  TownGenPlayerHouseSkip(void* building, int rerun);
+int  TownGenBuyHeld(void* building);
+int  TownGenBuyHeldGroups(void** out, int cap);
 int  TownGenTownSid(void* town, char* out, int cap);   /* decision 34: the town's string id (guarded), 1 ok 0 fault; any thread */       // forgets the refusal keys (town x cause) and their counts
 int  TownGenTownPos(void* town, float* pos);   /* the town's position (guarded; 0,0 reads as none), 1 read 0 none or fault; main thread */
 }

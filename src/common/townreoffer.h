@@ -171,5 +171,72 @@ inline int KeylessHoldsBuilding(int tmplRead, const void* groupTmpl, const void*
     if (posKnown == 0) return 1;
     return (dx * dx + dz * dz <= radius * radius) ? 1 : 0;
 }
+/* T-798 (a): such a group holds the building when its RECORD places it there (KeylessHoldsBuilding on the record's rdx / rdz, a record
+   position not known holding as before - the test that covers a group asleep here, whose live place cannot be read), or when it is
+   LOADED here (live 1: its active platoon is up and a living member's position was read) and its LIVE position and template place it
+   there (dx / dz). A loaded group wandering away from its building still holds it through its record. A loaded group that could not
+   be read (live -1) holds until a later check-up reads it. */
+inline int KeylessHoldsLive(int live, int tmplRead, const void* groupTmpl, const void* bldTmpl, int bldPosRead, float dx, float dz, int recPosKnown, float rdx, float rdz, float radius)
+{
+    if (live < 0) return 1;
+    if (KeylessHoldsBuilding(tmplRead, groupTmpl, bldTmpl, (bldPosRead != 0 && recPosKnown != 0) ? 1 : 0, rdx, rdz, radius) != 0) return 1;
+    if (live == 0) return 0;
+    return KeylessHoldsBuilding(tmplRead, groupTmpl, bldTmpl, bldPosRead, dx, dz, radius);
+}
+
+/* A PLAYER'S HOUSE - a building a player owns (bought or built). The engine's populateBuilding (0x57ED90) returns at once when the
+   owner faction carries the player marker (Faction+0x250, decomp_57ed90 top); on another player's game the owner is that player's
+   stand-in, which carries none, so the engine would reset the owner from the resident template, take the building-state step and
+   make residents (decomp_57ed90:110-122). PlayerHouseSkips: which test names the building a player's house - the marker, a stand-in
+   owner, or the build records (an owner whose stand-in has not arrived yet) - or kHouseNot. An owner that could not be read answers
+   kHouseNot: the building is treated as before. */
+const int kHouseNot = 0, kHousePlayer = 1, kHouseStandIn = 2, kHouseRecord = 3;
+inline int PlayerHouseSkips(int isPlayerMarker, int isStandIn, int recordSaysPlayer, int unread)
+{
+    if (unread != 0) return kHouseNot;
+    if (isPlayerMarker != 0) return kHousePlayer;
+    if (isStandIn != 0) return kHouseStandIn;
+    return recordSaysPlayer != 0 ? kHouseRecord : kHouseNot;
+}
+inline const char* PlayerHouseWord(int h)
+{
+    return h == kHousePlayer ? "player" : (h == kHouseStandIn ? "standin" : (h == kHouseRecord ? "record" : "none"));
+}
+/* A PURCHASE OF A HOUSE WHOSE RESIDENTS ARE ON HOLD (owner decisions 809 b and 813 b). The house stays for sale; at the purchase the
+   held entry's re-offer runs first (towngen.cpp TownGenBuyHeld, through T392ReofferOne - the check-up's own steps for one building), so
+   the engine's own purchase finds the groups it makes by their home and rehomes them. kOne*: what one building's re-offer did (the
+   check-up's outcomes, numbered from 1). BuyHeldDrops: 1 = the entry is dropped and the purchase goes on without residents - anything
+   but a run (kOneMade, the engine choosing none included) or residents already there (kOneHas). BuyHeldAsk: the buy callback asks only
+   on its confirm answer (result 2), when the engine's own isForSale says yes and the purse covers the price (PurseCovers: a price or
+   purse that could not be read counts as covered - a refused purchase leaves the residents made in their house, as the re-offer would). */
+const int kOneWait = 1, kOneClaim = 2, kOneGone = 3, kOneHas = 4, kOneOther = 5, kOneFault = 6, kOneAside = 7, kOneRelease = 8;
+const int kOneKept = 9, kOneGivenUp = 10, kOneMade = 11, kOnePlayerHouse = 12, kOneCannot = 13;
+inline const char* OneWord(int a)
+{
+    switch (a)
+    {
+    case kOneWait: return "wait";
+    case kOneClaim: return "claim";
+    case kOneGone: return "gone";
+    case kOneHas: return "has-residents";
+    case kOneOther: return "other-holds";
+    case kOneFault: return "fault";
+    case kOneAside: return "set-aside";
+    case kOneRelease: return "refused-released";
+    case kOneKept: return "kept-pending";
+    case kOneGivenUp: return "given-up";
+    case kOneMade: return "made";
+    case kOnePlayerHouse: return "player-house";
+    case kOneCannot: return "cannot-run";
+    default: return "?";
+    }
+}
+inline const char* GateWord(int d)
+{
+    return d == kReWait ? "wait" : (d == kReGenerate ? "generate" : (d == kReOther ? "other" : (d == kReFilled ? "filled" : (d == -1 ? "test-lever" : "none"))));
+}
+inline int BuyHeldDrops(int a) { return (a == kOneMade || a == kOneHas) ? 0 : 1; }
+inline int PurseCovers(int price, int purse) { return (price < 0 || purse < 0 || purse >= price) ? 1 : 0; }
+inline int BuyHeldAsk(int result, int engineForSale, int purseCovers) { return (result == 2 && engineForSale == 1 && purseCovers != 0) ? 1 : 0; }
 
 }   // namespace townreoffer

@@ -32,6 +32,26 @@ namespace
     LARGE_INTEGER g_freq;
     int           g_haveStart = 0;
 
+    /* THE 10 MB CEILING (src/common/logrotate.h: CeilingStep, PartName). One block per process and log folder, shared by every
+       copy of this DLL through a named file mapping, so two copies writing one file count its bytes together and both see a
+       cut: `gen` moves at every cut, and a copy whose own gen differs closes its handle (which may name the renamed part) and
+       opens the current file again. `rolling` lets one copy at a time rename. Without the mapping each copy keeps its own block. */
+    struct LogShared
+    {
+        volatile LONG64 bytes;        /* bytes in the current part */
+        volatile LONG64 prevBytes;    /* bytes in the .prev part now */
+        volatile LONG64 cutBytes;     /* bytes deleted between .start and .prev this launch */
+        volatile LONG64 slack;        /* extra room after a failed rename */
+        volatile LONG   gen;          /* moves at every cut */
+        volatile LONG   rolling;      /* 1 while one copy renames */
+        volatile LONG   openingCut;   /* 1 once the opening part is .start */
+        volatile LONG   parts;        /* parts begun after the opening one (the current part is number parts + 1) */
+    };
+    LogShared  g_ownShared;           /* zero-initialised: used when the mapping cannot be made */
+    LogShared* g_shared = 0;          /* guarded by g_lock (the pointer); the block itself by its own interlocked fields */
+    LONG       g_myGen  = 0;          /* guarded by g_lock: the gen this copy's handle was opened at */
+    wchar_t    g_logName[2048];       /* guarded by g_lock: the current part's full path, "" until the file opened once */
+
     void EnsureLock()
     {
         if (g_lockState == 2) return;
@@ -89,6 +109,32 @@ namespace
                     "logs may not all have moved", verb, a, to ? " to " : "", b, (unsigned long)err);
     }
 
+    /* Caller holds g_lock. The ceiling's shared block for this log folder: a named mapping keyed by the process and the folder's
+       identity (volume serial + file index, the same whatever the path spelling). *created = this copy made it. Falls back to
+       this copy's own block. Logs nothing, allocates nothing that can throw after the folder handle is closed. */
+    LogShared* SharedBlock(const std::wstring& folder, bool* created)
+    {
+        *created = true;
+        std::wstring dir = folder;
+        if (dir.size() > 3 && (dir[dir.size() - 1] == L'\\' || dir[dir.size() - 1] == L'/')) dir.erase(dir.size() - 1);
+        BY_HANDLE_FILE_INFORMATION fi;
+        BOOL haveId = FALSE;
+        HANDLE d = ::CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (d != INVALID_HANDLE_VALUE) { haveId = ::GetFileInformationByHandle(d, &fi); ::CloseHandle(d); }
+        if (!haveId) return &g_ownShared;
+        wchar_t mname[96];
+        swprintf_s(mname, 96, L"Local\\SharedWastelands-logceil-%lu-%08lx-%08lx%08lx", (unsigned long)::GetCurrentProcessId(),
+                   (unsigned long)fi.dwVolumeSerialNumber, (unsigned long)fi.nFileIndexHigh, (unsigned long)fi.nFileIndexLow);
+        HANDLE m = ::CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)sizeof(LogShared), mname);
+        const DWORD err = ::GetLastError();
+        if (m == NULL) return &g_ownShared;
+        void* v = ::MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LogShared));
+        if (v == NULL) { ::CloseHandle(m); return &g_ownShared; }
+        *created = err != ERROR_ALREADY_EXISTS;   /* a new mapping is zero-filled */
+        return (LogShared*)v;   /* m and the view are deliberately never closed: the other copy must find the same block */
+    }
+
     /* Caller holds g_lock. ONCE PER COPY OF THIS DLL, BEFORE THE LOG IS OPENED: the earlier launches' logs move one place
        older (src/common/logrotate.h) - the oldest kept copy is deleted, copy n becomes copy n+1, the previous launch's log
        becomes copy 1 - so this launch writes a new file and the logs of the last cooplogrot::kLogKeep launches stay on disk,
@@ -104,8 +150,10 @@ namespace
         g_rotateDone = 1;
 
         /* every name is built before the mutex is taken, so nothing below can throw while it is held */
-        std::wstring names[cooplogrot::kLogKeep];
-        for (int n = 0; n < (int)cooplogrot::kLogKeep; ++n) names[n] = cooplogrot::RotatedName(name, n);
+        /* each launch's parts move with it: the log, its .start and its .prev (src/common/logrotate.h PartName) */
+        std::wstring names[cooplogrot::kLogKeep][cooplogrot::kPartKinds];
+        for (int n = 0; n < (int)cooplogrot::kLogKeep; ++n)
+            for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k) names[n][k] = cooplogrot::PartName(name, n, k);
         std::wstring dir = folder;
         if (dir.size() > 3 && (dir[dir.size() - 1] == L'\\' || dir[dir.size() - 1] == L'/')) dir.erase(dir.size() - 1);
 
@@ -150,19 +198,22 @@ namespace
         }
 
         const int last = (int)cooplogrot::kLogKeep - 1;
-        if (!::DeleteFileW(names[last].c_str()))
+        for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k)
         {
+            if (::DeleteFileW(names[last][k].c_str())) continue;
             err = ::GetLastError();
-            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) NoteRotateStep("delete", names[last], NULL, err);
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) NoteRotateStep("delete", names[last][k], NULL, err);
         }
         /* oldest first, so each move lands on a name already freed; a failed move does not stop the newer ones, because
-           the newest log (the previous launch, the one a crash leaves) is the one most worth keeping */
+           the newest log (the previous launch, the one a crash leaves) is the one most worth keeping. A part a launch did not
+           have (a log under 2 MB has no .start) is simply not there to move. */
         for (int n = last - 1; n >= 0; --n)
-        {
-            if (::MoveFileExW(names[n].c_str(), names[n + 1].c_str(), MOVEFILE_REPLACE_EXISTING)) continue;
-            err = ::GetLastError();
-            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) NoteRotateStep("rename", names[n], &names[n + 1], err);
-        }
+            for (int k = 0; k < (int)cooplogrot::kPartKinds; ++k)
+            {
+                if (::MoveFileExW(names[n][k].c_str(), names[n + 1][k].c_str(), MOVEFILE_REPLACE_EXISTING)) continue;
+                err = ::GetLastError();
+                if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) NoteRotateStep("rename", names[n][k], &names[n + 1][k], err);
+            }
         ::ReleaseMutex(m);
         /* m is deliberately never closed: a later copy's CreateMutexW must find it */
     }
@@ -178,6 +229,10 @@ namespace
         if (folder.empty()) return;
         std::wstring name = folder + swnames::kLogW;
         RotateLogsOnce(folder, name);   /* before the file is opened, so the previous launch's log is kept, not emptied */
+        bool sharedNew = false;
+        if (g_shared == 0) g_shared = SharedBlock(folder, &sharedNew);
+        if (name.size() < sizeof(g_logName) / sizeof(g_logName[0])) wcscpy_s(g_logName, sizeof(g_logName) / sizeof(g_logName[0]), name.c_str());
+        bool emptied = false;
         /* mig6 fold (review of 7d96a7d, F7): ONE LOG PER PROCESS. Two copies of this DLL can be loaded from the same folder
            under different path spellings (two modules, two sets of these statics, ONE file); with CREATE_ALWAYS the second
            wiped the first's lines. Now: the handle is APPEND-ONLY (FILE_APPEND_DATA without FILE_WRITE_DATA - every
@@ -198,12 +253,17 @@ namespace
                        (unsigned long)fi.dwVolumeSerialNumber, (unsigned long)fi.nFileIndexHigh, (unsigned long)fi.nFileIndexLow);
             HANDLE m = ::CreateMutexW(NULL, TRUE, mname);
             const DWORD err = ::GetLastError();
+            static HANDLE s_keptMutex = NULL;   /* this module's one kept handle; a second open (a reopen after a failure) closes its own */
             if (m != NULL && err != ERROR_ALREADY_EXISTS)
             {
-                /* the first opener in this process: this run's log starts empty, as it always did */
-                HANDLE t = ::CreateFileW(name.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                         NULL, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (t != INVALID_HANDLE_VALUE) ::CloseHandle(t);
+                /* the first opener in this process: this run's log starts empty, as it always did - unless the ceiling has
+                   already cut this launch's log (gen moved): this file is then a part another copy began, never emptied */
+                if (g_shared->gen == 0)
+                {
+                    HANDLE t = ::CreateFileW(name.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                             NULL, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (t != INVALID_HANDLE_VALUE) { ::CloseHandle(t); emptied = true; ::InterlockedExchange64(&g_shared->bytes, 0); }
+                }
                 ::ReleaseMutex(m);
             }
             else if (m != NULL)
@@ -211,11 +271,110 @@ namespace
                 /* a later copy: wait until the first has emptied the file, then append after its lines */
                 if (::WaitForSingleObject(m, 5000) == WAIT_OBJECT_0) ::ReleaseMutex(m);
             }
-            /* m is deliberately never closed: the name must outlive every copy's first log line */
+            /* the first handle is kept for the life of the process: the name must outlive every copy's first log line; a later
+               open by this same copy (the file reopened after a failed open or cut) closes its extra handle */
+            if (m != NULL)
+            {
+                if (s_keptMutex == NULL) s_keptMutex = m;
+                else ::CloseHandle(m);
+            }
         }
+        if (sharedNew && !emptied)
+        {
+            /* this copy made the ceiling's block but did not empty the file: count what is already in it */
+            LARGE_INTEGER sz;
+            if (::GetFileSizeEx(h, &sz)) ::InterlockedExchange64(&g_shared->bytes, sz.QuadPart);
+        }
+        g_myGen = g_shared->gen;
         g_file = h;
         g_fileState = 1;
     }
+
+    /* Caller holds g_lock. One write that counts toward the ceiling. */
+    void WriteCounted(const char* data, DWORD len)
+    {
+        DWORD written = 0;
+        ::WriteFile(g_file, data, len, &written, NULL);
+        if (g_shared != 0) ::InterlockedExchangeAdd64(&g_shared->bytes, (LONG64)written);
+    }
+
+#ifndef SW_DEV_BUILD
+    /* THE CEILING IS THE RELEASE BUILD'S ONLY: the DEV build's log is never cut (a test readout needs the whole log). */
+    /* Caller holds g_lock. Another copy cut the log (gen moved): this copy's handle may name the renamed part, so it opens the
+       current file again (appending, never emptying). A failed open leaves the file closed; the next line tries again. */
+    void ReopenAfterCut()
+    {
+        if (g_file != INVALID_HANDLE_VALUE) ::CloseHandle(g_file);
+        g_file = INVALID_HANDLE_VALUE;
+        g_fileState = 0;
+        g_myGen = g_shared->gen;
+        if (g_logName[0] == 0) return;
+        HANDLE h = ::CreateFileW(g_logName, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return;
+        g_file = h;
+        g_fileState = 1;
+    }
+
+    /* Caller holds g_lock and the file is open. THE 10 MB CEILING THAT KEEPS THE START (src/common/logrotate.h): before a line
+       of lineLen bytes is written, the opening part is renamed to .start when it would pass 2 MB, and later each current part
+       that would pass 4 MB replaces .prev; a new current part begins with one line saying so. One copy renames at a time; a
+       rename that fails leaves the file as it is, says so once per try, and gives the part 1 MB more before the next try. May
+       throw std::bad_alloc (the names); the caller catches it. */
+    void CeilingBeforeWrite(DWORD lineLen, const char* timeStr)
+    {
+        LogShared* s = g_shared;
+        if (s == 0 || g_logName[0] == 0) return;
+        const int step = cooplogrot::CeilingStep((unsigned long long)s->bytes, lineLen, s->openingCut != 0, (unsigned long long)s->slack);
+        if (step == cooplogrot::kCeilKeep) return;
+        /* the names before `rolling` is taken: building them may throw, and a throw after it would leave every copy unable to cut */
+        const std::wstring cur(g_logName);
+        const std::wstring to = cooplogrot::PartName(cur, 0, step == cooplogrot::kCeilCutOpening ? (int)cooplogrot::kPartStart : (int)cooplogrot::kPartPrev);
+        if (::InterlockedCompareExchange(&s->rolling, 1, 0) != 0) return;   /* another copy is cutting now */
+        if (s->gen != g_myGen) { ::InterlockedExchange(&s->rolling, 0); ReopenAfterCut(); return; }   /* it just did */
+        ::CloseHandle(g_file);
+        g_file = INVALID_HANDLE_VALUE;
+        const BOOL moved = ::MoveFileExW(cur.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING);
+        const DWORD err = moved ? 0 : ::GetLastError();
+        HANDLE h = ::CreateFileW(cur.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        g_file = h;
+        g_fileState = h != INVALID_HANDLE_VALUE ? 1 : 0;
+        char note[512];
+        note[0] = 0;
+        if (moved)
+        {
+            const LONG64 had = s->bytes;
+            if (step == cooplogrot::kCeilCutOpening) ::InterlockedExchange(&s->openingCut, 1);
+            else { ::InterlockedExchangeAdd64(&s->cutBytes, s->prevBytes); ::InterlockedExchange64(&s->prevBytes, had); }
+            const LONG part = ::InterlockedIncrement(&s->parts) + 1;
+            ::InterlockedExchange64(&s->bytes, 0);
+            ::InterlockedExchange64(&s->slack, 0);
+            g_myGen = ::InterlockedIncrement(&s->gen);
+            if (step == cooplogrot::kCeilCutOpening)
+                _snprintf_s(note, sizeof(note), _TRUNCATE,
+                            "%s KenshiCoop: log continues: part %ld of this launch; the opening part (the first 2 MB: mods, versions, the "
+                            "join) is kept in %s for the whole launch; Shared Wastelands %s, %s\r\n",
+                            timeStr, (long)part, "shared_wastelands_log.start.txt", modversion::kName, LogBuildLabel());
+            else
+                _snprintf_s(note, sizeof(note), _TRUNCATE,
+                            "%s KenshiCoop: log continues: part %ld of this launch; %.1f MB between the opening (.start) and the previous "
+                            "part (.prev) were cut to keep the log under 10 MB; Shared Wastelands %s, %s\r\n",
+                            timeStr, (long)part, (double)s->cutBytes / (1024.0 * 1024.0), modversion::kName, LogBuildLabel());
+        }
+        else
+        {
+            ::InterlockedExchangeAdd64(&s->slack, (LONG64)(cooplogrot::kPartBytes / 4u));
+            char a[96];
+            NarrowFilePart(to, a, sizeof(a));
+            _snprintf_s(note, sizeof(note), _TRUNCATE,
+                        "%s KenshiCoop: log size ceiling: could not rename the log to %s (Windows error %lu); it grows on and the "
+                        "next try is 1 MB later\r\n", timeStr, a, (unsigned long)err);
+        }
+        ::InterlockedExchange(&s->rolling, 0);
+        if (g_fileState == 1 && note[0]) WriteCounted(note, (DWORD)strlen(note));
+    }
+#endif
 
     /* Caller holds g_lock. "<sec>.<msec>" since the first log call. */
     void FormatTime(char* out, size_t outSize)
@@ -280,10 +439,10 @@ namespace
             {
                 /* every log starts with the mod's version */
                 g_versionSaid = 1;
-                char ver[96];
-                _snprintf_s(ver, sizeof(ver), _TRUNCATE, "%s KenshiCoop: Shared Wastelands %s\r\n", timeStr, modversion::kName);
-                DWORD verWritten = 0;
-                ::WriteFile(g_file, ver, (DWORD)strlen(ver), &verWritten, NULL);
+                char ver[160];
+                _snprintf_s(ver, sizeof(ver), _TRUNCATE, "%s KenshiCoop: Shared Wastelands %s, %s\r\n", timeStr, modversion::kName,
+                            LogBuildLabel());
+                WriteCounted(ver, (DWORD)strlen(ver));
             }
             if (g_fileState == 1 && g_rotateNote[0])
             {
@@ -291,8 +450,7 @@ namespace
                 char note[sizeof(g_rotateNote) + 64];
                 _snprintf_s(note, sizeof(note), _TRUNCATE, "%s KenshiCoop: %s\r\n", timeStr, g_rotateNote);
                 g_rotateNote[0] = 0;
-                DWORD noteWritten = 0;
-                ::WriteFile(g_file, note, (DWORD)strlen(note), &noteWritten, NULL);
+                WriteCounted(note, (DWORD)strlen(note));
             }
             if (g_fileState == 1)
             {
@@ -302,8 +460,11 @@ namespace
                 size_t start = kPrefixGap - plen;
                 memcpy(&line[start], prefix, plen);
 
-                DWORD written = 0;
-                ::WriteFile(g_file, line.data() + start, (DWORD)(line.size() - start), &written, NULL);
+#ifndef SW_DEV_BUILD
+                if (g_shared != 0 && g_shared->gen != g_myGen) ReopenAfterCut();   /* another copy cut the log */
+                if (g_fileState == 1) CeilingBeforeWrite((DWORD)(line.size() - start), timeStr);
+#endif
+                if (g_fileState == 1) WriteCounted(line.data() + start, (DWORD)(line.size() - start));
             }
         }
         catch (...)
@@ -335,6 +496,94 @@ void DebugLog(const char* message)         { if (message) WriteLine(false, messa
 void ErrorLog(const std::wstring& message) { WriteWide(true, message); }
 void ErrorLog(const std::string& message)  { WriteLine(true, message.data(), message.size()); }
 void ErrorLog(const char* message)         { if (message) WriteLine(true, message, strlen(message)); else WriteLine(true, "", 0); }
+
+const char* LogBuildLabel()
+{
+#ifdef SW_DEV_BUILD
+    return "DEV build";
+#else
+    return "release build";
+#endif
+}
+
+namespace
+{
+    /* Every gate QuietLogPass has seen, with its family's words (callers pass literals), so QuietLogFlush can reach the gates
+       each file keeps to itself. A gate past the table is not flushed; its own count lines still come. */
+    enum { kQuietGates = 64 };
+    swlogbudget::Gate* volatile g_quietGates[kQuietGates];
+    const char* volatile g_quietFamily[kQuietGates];
+    volatile LONG g_quietGateCount = 0;
+    volatile LONG g_quietFlushAt = 0, g_quietFlushSet = 0;
+
+    void QuietRegister(swlogbudget::Gate* gate, const char* family)
+    {
+        const LONG n = g_quietGateCount;
+        for (LONG i = 0; i < n && i < (LONG)kQuietGates; ++i) if (g_quietGates[i] == gate) return;
+        if (n >= (LONG)kQuietGates) return;
+        const LONG i = ::InterlockedIncrement(&g_quietGateCount) - 1;
+        if (i >= (LONG)kQuietGates) return;
+        g_quietFamily[i] = family;
+        ::MemoryBarrier();
+        g_quietGates[i] = gate;   /* a flush that reads the slot before this line skips it */
+    }
+
+    void QuietCountLine(const char* family, const char* keyText, unsigned long long key, unsigned int held, unsigned int spanMs)
+    {
+        char keyHex[32];
+        keyHex[0] = 0;
+        if ((keyText == 0 || keyText[0] == 0) && key != 0) _snprintf_s(keyHex, sizeof(keyHex), _TRUNCATE, "key %llx", key);
+        const char* k = keyText && keyText[0] ? keyText : keyHex;
+        char line[400];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "%s%s%s%s: %u more lines like this in the last %u s were not written (the release "
+                    "build writes the first %d in full, then this count at most once a minute)", family ? family : "?",
+                    k[0] ? " [" : "", k, k[0] ? "]" : "", held, spanMs / 1000u, (int)swlogbudget::kFullLines);
+        DebugLog(line);
+    }
+}
+
+bool QuietLogPass(swlogbudget::Gate* gate, const char* family, unsigned long long key, const char* keyText)
+{
+    if (gate == 0) return true;
+    QuietRegister(gate, family);
+    unsigned int held = 0, spanMs = 0;
+    const bool full = swlogbudget::Pass(gate, key, ::GetTickCount(), &held, &spanMs);
+    if (held != 0) QuietCountLine(family, keyText, key, held, spanMs);
+    return full;
+}
+
+void QuietLogFlush(bool periodic)
+{
+    const unsigned int now = ::GetTickCount();
+    if (periodic)
+    {
+        if (::InterlockedCompareExchange(&g_quietFlushSet, 1, 0) == 0) { ::InterlockedExchange(&g_quietFlushAt, (LONG)now); return; }
+        if (now - (unsigned int)g_quietFlushAt < swlogbudget::kCountGapMs) return;
+    }
+    ::InterlockedExchange(&g_quietFlushAt, (LONG)now);
+    LONG n = g_quietGateCount;
+    if (n > (LONG)kQuietGates) n = (LONG)kQuietGates;
+    for (LONG i = 0; i < n; ++i)
+    {
+        swlogbudget::Gate* g = g_quietGates[i];
+        if (g == 0) continue;
+        int cursor = 0;
+        unsigned long long key = 0;
+        unsigned int held = 0, spanMs = 0;
+        while (swlogbudget::TakeHeld(g, &cursor, now, &key, &held, &spanMs)) QuietCountLine(g_quietFamily[i], 0, key, held, spanMs);
+    }
+}
+
+std::wstring LogPartPath(int copy, int part)
+{
+    try
+    {
+        const std::wstring folder = DllFolder();
+        if (folder.empty()) return std::wstring();
+        return cooplogrot::PartName(folder + swnames::kLogW, copy, part);
+    }
+    catch (...) { return std::wstring(); }
+}
 
 std::wstring LogFilePath(int copy)
 {

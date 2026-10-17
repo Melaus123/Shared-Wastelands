@@ -29,7 +29,9 @@
 namespace townrefill {
 
 const unsigned kMsgTownLoss = 64;
-const unsigned kProtocol = 95;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
+const unsigned kProtocol = 100;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
+
+
 const unsigned kOpRows = 1, kOpRefilled = 2;
 const unsigned kMaxRows = 256, kMaxSid = 128, kMaxLosses = 1000000;
 
@@ -328,5 +330,11 @@ inline int FillStopDone(int stop, int filled) { return (stop == kFbStopNotHeld &
 // A building this refill's own call was set aside for (the residents gate set its squads aside; the re-offer makes them later) and
 // that now has residents homed there was filled through that re-offer: it counts as filled.
 inline int FillSkipFilled(int verdict, int setAsideBefore) { return (verdict == kFbSkipHome && setAsideBefore != 0) ? 1 : 0; }
+
+// T-798: THE TOWN-LEVEL GATE the town refill and the empty-building repair share (towngen.cpp ErTownGate). HoldSettled: this game has
+// held the town's area for at least settleMs (heldMs = time since the hold began, read while held). TownGateOpen: held, settled, and
+// ready (the opening push, the record snapshot and the relay link are in, so the loss rows, the records and the notes are known).
+inline int HoldSettled(int held, unsigned heldMs, unsigned settleMs) { return (held != 0 && heldMs >= settleMs) ? 1 : 0; }
+inline int TownGateOpen(int held, int settled, int ready) { return (held != 0 && settled != 0 && ready != 0) ? 1 : 0; }
 
 }   // namespace townrefill

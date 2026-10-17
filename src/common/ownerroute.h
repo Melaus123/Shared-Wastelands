@@ -72,7 +72,8 @@ enum { kAddrGroupHit = 0, kAddrGroupShot = 1, kAddrGroupTreat = 2, kAddrGroupPri
        kAddrGroupSay = 7, kAddrGroupStats = 8, kAddrGroupCrime = 9, kAddrGroupBounty = 10, kAddrGroupTalk = 11, kAddrGroupBuild = 12,
        kAddrGroupDoor = 13,   /* M7b slice 4 + DOOR_STATE */
        kAddrGroupName = 14, kAddrGroupSlave = 15, kAddrGroupHire = 16,
-       kAddrGroupCount = 17 };
+       kAddrGroupMelee = 17,   /* MELEE_DECIDED */
+       kAddrGroupCount = 18 };
 inline int AddrGroupOf(unsigned int innerType)
 {
     switch (innerType)
@@ -84,7 +85,7 @@ inline int AddrGroupOf(unsigned int innerType)
     case kInnerCapture: case kInnerCaptureDone: case kInnerCapturePlaced: return kAddrGroupCapture;
     case kInnerCarryBreak: return kAddrGroupCarry;
     case kInnerItemMove: case kInnerItemRequest: case kInnerItemConfirm: case kInnerItemPlaced: case kInnerItemRevoke:
-    case kInnerParityReq: case kInnerParityBox: return kAddrGroupItem;   /* M7b slice 2 */
+    case kInnerParityReq: case kInnerParityBox: case kInnerItemHandover: return kAddrGroupItem;   /* M7b slice 2; T-889 step 2 */
     case kInnerSay: return kAddrGroupSay;   /* M7b slice 4 + DOOR_STATE: the side messages */
     case kInnerStats: return kAddrGroupStats;
     case kInnerCrime: return kAddrGroupCrime;
@@ -95,6 +96,8 @@ inline int AddrGroupOf(unsigned int innerType)
     case kInnerName: return kAddrGroupName;
     case kInnerSlave: return kAddrGroupSlave;
     case kInnerHire: return kAddrGroupHire;
+    case kInnerKeeperRestock: return kAddrGroupItem;   /* T-799 D4: a shop's money */
+    case kInnerMeleeDecided: return kAddrGroupMelee;   /* a melee blow decided on the attacker's game */
     default: return -1;
     }
 }
@@ -102,7 +105,7 @@ inline const char* AddrGroupName(int g)
 {
     static const char* const k[kAddrGroupCount] = { "hit", "shot", "treat", "prison", "capture", "carry", "item",
                                                     "say", "stats", "crime", "bounty", "talk", "build", "door",
-                                                    "name", "slave", "hire" };   /* M7b slice 4 */
+                                                    "name", "slave", "hire", "melee" };   /* M7b slice 4 */
     return (g >= 0 && g < kAddrGroupCount) ? k[g] : "?";
 }
 

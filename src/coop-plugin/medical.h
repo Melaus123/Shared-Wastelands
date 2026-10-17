@@ -188,8 +188,9 @@ void ReportKO(unsigned int uid);
 // TEST HARNESS ONLY (F128). Damage one part directly on a character we OWN, so the KO
 // question can be asked deterministically instead of waiting for a brawl to land a lucky
 // blow on the right limb - four runs produced a knockout twice, in opposite directions,
-// and not at all the other two. Refuses on any uid we do not own.
-bool WoundPart(unsigned int uid, int part, float stun, float cut);
+// and not at all the other two. Refuses on any uid we do not own. Returns the status reply
+// ("ok wound ... knockout=not-attempted ..." or "error wound: <why>").
+std::string WoundPartLever(unsigned int uid, int part, float stun, float cut);
 
 // T-556: how Character::declareDead was reached, from the caller's return address (swfallen::kCause*). ANY THREAD.
 int DeathCallerCause(unsigned long long ret);

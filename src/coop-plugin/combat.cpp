@@ -40,6 +40,7 @@
 #include "build.h"   /* build1-a: BuildTestDrain runs at this same safe point */
 #include "crime.h"   // crime3: CrimeApplyDrain writes the owner's crimes onto copies at this same safe point
 #include "../common/shotwire.h"   /* P104 fix: MSG_SHOT - the bolt's record and the Damages iShotYou builds */
+#include "../common/meleewire.h"   /* MSG_MELEE_DECIDED - the blow's record, and which game decides a blow */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
 namespace coop { void TraderSpawnDrain(); }   /* traderspawn: items.cpp - the `traderspawn` lever runs at this same safe point */
@@ -49,6 +50,7 @@ namespace coop { void LimbSafePointDrain(); }   /* LIMBS: clothing.cpp - the own
 namespace coop { void BoxTakeDrain(); }      /* loot2c: items.cpp - the `boxtake` lever's move runs at this same safe point */
 
 #include "coop_log.h"
+namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/hand.h"   // P-15: the target handle is taken locally, never sent
 #include "game/CombatClass.h"      // T-186 (mig5): these three replace this file's old stand-in declarations;
@@ -241,6 +243,58 @@ PendingHit g_hitQueue[kHitQueueSize];
 volatile LONG g_hitWrite = 0;   // producer: AI worker thread
 volatile LONG g_hitRead  = 0;   // consumer: main thread
 volatile LONG64 g_hitsDropped = 0;
+
+// --- Melee blows decided HERE on another game's NPC (MSG_MELEE_DECIDED) ------------------------------------------------------
+// Our player character's blow on the copy of an NPC another game runs runs the engine's hit on the copy (the attacker's game
+// decides it) and a blow that landed waits here for the main thread (CombatTick -> MeleeDecidedDrain) to send it to the NPC's
+// game. The same fixed ring as g_hitQueue: the producer is the AI worker thread, so no allocation and no lock. Single producer,
+// single consumer, power-of-two mask.
+struct PendingMelee
+{
+    unsigned int  victimUid;
+    unsigned int  attackerUid;
+    int           cutDir;
+    int           comboId;
+    float         damages[6];
+    unsigned char techFlag;
+};
+const unsigned int kMeleeQueueSize = 64;          // power of two
+const unsigned int kMeleeQueueMask = kMeleeQueueSize - 1;
+PendingMelee g_meleeQueue[kMeleeQueueSize];
+volatile LONG g_meleeWrite = 0;   // producer: AI worker thread
+volatile LONG g_meleeRead  = 0;   // consumer: main thread
+volatile LONG64 g_meleeQueued    = 0;   // landed blows queued for sending
+volatile LONG64 g_meleeQDropped  = 0;   // the ring was full - dropped and counted
+volatile LONG64 g_meleeBlocked   = 0;   // the copy blocked the blow (the hit returned 5) - not sent
+volatile LONG64 g_meleeNoHit     = 0;   // the hit returned neither 2 nor 5 - not sent
+volatile LONG64 g_meleeOwnIgnored = 0;  // the copy of another game's player character struck our NPC - our result not applied
+volatile LONG64 g_meleeKeptUnclassified = 0;   // our blow on a copy kept the old rule only because a side is not classified yet
+volatile LONG   g_meleeIgnVictim   = 0; // the last ignored blow's two uids, for the main thread's line
+volatile LONG   g_meleeIgnAttacker = 0;
+long long g_meleeHitPlaySkipped = 0;    // MAIN THREAD: a HIT for a blow this game decided - its play skipped (ApplyRemoteHit)
+
+// The technique's byte the hit hands addWound as its 2nd argument (decomp_439150.txt:105-111: technique +0x31, read only when the
+// technique is not null). Any thread; POD, its own __try (C2712).
+unsigned char MeleeTechFlagPod(const void* technique)
+{
+    if (technique == 0) return 0;
+    __try { return (unsigned char)(*((const char*)technique + 0x31) != 0 ? 1 : 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// AI worker thread: publish one landed blow, or count it dropped when the ring is full (never block this thread).
+void MeleePush(const PendingMelee& md)
+{
+    LONG w = g_meleeWrite;
+    if (((w + 1) & kMeleeQueueMask) == (g_meleeRead & kMeleeQueueMask))
+    {
+        InterlockedIncrement64(&g_meleeQDropped);
+        return;
+    }
+    g_meleeQueue[w & kMeleeQueueMask] = md;
+    InterlockedExchange(&g_meleeWrite, w + 1);   // publish only after the slot is fully written
+    InterlockedIncrement64(&g_meleeQueued);
+}
 // How full the ring has EVER been. `droppedQ` only speaks once the bound has already been
 // exceeded; this says how close it came, which is the number worth having before it matters.
 volatile LONG g_hitQueueHigh = 0;
@@ -414,6 +468,21 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
     {
         if (net::IsUidMineAnyThread(uid))   /* O1: this is the AI worker (T024/F095) - never the std::set */
         {
+            // The copy of another game's player character struck our own NPC: that game decides the blow and sends
+            // MSG_MELEE_DECIDED, so this game's own result for the copy's swing is not applied (no double count).
+            if (attacker != 0)
+            {
+                const unsigned int cuid = UidOf(attacker);
+                if (cuid != 0
+                    && meleewire::MeleeDecide(net::IsUidMineAnyThread(cuid), IsUidPlayerCharAnyThread(cuid),
+                                              true, IsUidPlayerCharAnyThread(uid)) == meleewire::kMeleeIgnore)
+                {
+                    InterlockedExchange(&g_meleeIgnVictim, (LONG)uid);
+                    InterlockedExchange(&g_meleeIgnAttacker, (LONG)cuid);
+                    InterlockedIncrement64(&g_meleeOwnIgnored);
+                    return 0;   // HitMaterialType 0 - no material reaction
+                }
+            }
             // OURS: resolve normally, and ENQUEUE the outcome for the main thread to send.
             // Never send inline - this runs on the AI worker thread (T024/F095).
             // K2 (decision 61 follow-up): the entry is FILLED here, while the attacker pointer is valid,
@@ -467,8 +536,34 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
         }
         else
         {
-            // THEIRS: the owner will tell us the outcome. Applying local damage as well
-            // would double-count and diverge.
+            // THEIRS, our player character's blow on the copy of an NPC another game runs: decided HERE. The engine's hit runs
+            // on the copy - the block roll, the impact and the attacker's own reactions; the copy's own damage is skipped
+            // (medical.cpp detour_applyDamage) - and a blow that landed (the hit returned 2) is queued for the NPC's game,
+            // which applies the wound. A blocked blow (5) or no hit is not sent.
+            const unsigned int auid = (attacker != 0) ? UidOf(attacker) : 0;
+            const bool aMine = (auid != 0) && net::IsUidMineAnyThread(auid);
+            const int  aPc   = (auid != 0) ? IsUidPlayerCharAnyThread(auid) : -1;
+            const int  vPc   = IsUidPlayerCharAnyThread(uid);
+            if (auid != 0 && meleewire::MeleeDecide(aMine, aPc, false, vPc) == meleewire::kMeleeSend)
+            {
+                PendingMelee md;
+                md.victimUid   = uid;
+                md.attackerUid = auid;
+                md.cutDir      = cutDir;
+                md.comboId     = comboId;
+                std::memcpy(md.damages, damages, kDamagesBytes);   // before the hit runs, as the OURS path copies it
+                md.techFlag    = MeleeTechFlagPod(technique);
+                const int result = orig_hitByMelee(self, cutDir, damages, attacker, technique, comboId);
+                if (result == meleewire::kMeleeHitLanded) MeleePush(md);
+                else if (result == meleewire::kMeleeHitBlocked) InterlockedIncrement64(&g_meleeBlocked);
+                else InterlockedIncrement64(&g_meleeNoHit);
+                return result;
+            }
+            // Kept only because the attacker or the copy is not in the player-character table here yet: the NPC's game may
+            // already have classified both and ignore its own result for this swing, so the blow can land nowhere - counted.
+            if (auid != 0 && meleewire::MeleeKeptUnclassified(aMine, aPc, false, vPc)) InterlockedIncrement64(&g_meleeKeptUnclassified);
+            // Every other blow on a copy: the owner will tell us the outcome. Applying local damage
+            // as well would double-count and diverge.
             InterlockedIncrement64(&g_hitsSuppressed);
             return 0;   // HitMaterialType 0 - no material reaction
         }
@@ -519,7 +614,7 @@ void NoteKnockEdgeAnyThread(const void* character)
 void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
                     const char* damages24, int comboId,
                     const float* parts, int partCount, float blood,
-                    const ObjId& attackerId, bool knock)
+                    const ObjId& attackerId, bool knock, bool attackerPlayed)
 {
     Character* victim = FindSpawned(victimUid);
     if (victim == 0)
@@ -591,7 +686,7 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
         ++g_idLogged;
         std::string nm = "<unresolved>";
         if (attacker != 0) nm = attacker->getShownNameDirect();
-        DebugLog("[P016] in  victim=" + N3(victimUid) + " attackerId='"
+        SW_DEVLOG("[P016] in  victim=" + N3(victimUid) + " attackerId='"
                  + ObjIdString(attackerId) + "' resolved="
                  + std::string(attacker != 0 ? "YES" : "NO") + " name='" + nm + "'");
     }
@@ -650,8 +745,16 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
         }
     }
 
+    // MELEE_DECIDED: this game decided the blow and its engine already played it on the copy (impact, reactions) - only the
+    // owner's health is applied here, so the blow is not played twice.
+    const bool skipPlay = attackerPlayed && attackerUid != 0 && net::IsUidMine(attackerUid);
+    if (skipPlay)
+    {
+        notPlayedWhy = "already played here, where the blow was decided";
+        ++g_meleeHitPlaySkipped;
+    }
     bool played = false;
-    if (orientable)
+    if (orientable && !skipPlay)
     {
         char dmg[kDamagesBytes];
         std::memcpy(dmg, damages24, kDamagesBytes);
@@ -675,7 +778,7 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
         if (proneBefore != proneAfter && g_proneLogged < kProneLogLimit)
         {
             ++g_proneLogged;
-            DebugLog("[P015] prone changed INSIDE the played hit: uid=" + N3(victimUid)
+            SW_DEVLOG("[P015] prone changed INSIDE the played hit: uid=" + N3(victimUid)
                      + " " + N3(proneBefore) + " -> " + N3(proneAfter)
                      + " (H008: the engine's own roll, not the authority's)");
         }
@@ -720,17 +823,24 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
     // cannot be applied could never have that flag cleared again. C2 stays: no knockout timer from this.
     if (knock)
     {
-        if (played && corrected) KnockPush(victimUid);
+        if ((played || skipPlay) && corrected) KnockPush(victimUid);
         else ++g_knockNotPlayed;   // no played hit, or no applied health: no fall is started
     }
 
+#ifndef SW_DEV_BUILD
+    /* the release build: a failed health correction or a hit with no visual in full always, the rest the first few in full
+       then a count a minute */
+    static swlogbudget::Gate s_qRemoteHit;
+    if (!(partCount > 0 && !corrected) && !(!played && !skipPlay) && !QuietLogPass(&s_qRemoteHit, "[M3b] remote hit", 0, 0)) return;
+#endif
     DebugLog(std::string("[M3b] remote hit uid=") + N3(victimUid)
              + " from attacker uid=" + N3(attackerUid)
              + " dir=" + N3(cutDirection) + " combo=" + N3(comboId)
              + (knock ? std::string(" KNOCK") : std::string())
+             + (attackerPlayed ? std::string(" attackerPlayed") : std::string())
              + (played ? std::string(" PLAYED (attacker by ") + attackerSource + ")"
                        : std::string(" NOT PLAYED - ") + notPlayedWhy
-                         + ", so this hit lands with NO VISUAL on this screen")
+                         + (skipPlay ? std::string() : std::string(", so this hit lands with NO VISUAL on this screen")))
              + (corrected ? ", health CORRECTED to authority"
                           : (partCount > 0 ? ", health correction FAILED"
                                            : ", no health block in message")));
@@ -1489,6 +1599,7 @@ typedef char (*P311IsEnemyFn)(::Character*, ::Character*, char);
 unsigned long long kP311Remember = 0; static coop::AddrReg kP311Remember_reg("Character_remember", &kP311Remember);   /* Steam_1.0.65 0x673A10 */
 unsigned long long kP311UnderRanged = 0; static coop::AddrReg kP311UnderRanged_reg("AI_beingShotAt", &kP311UnderRanged);   /* Steam_1.0.65 0x998E80 */
 unsigned long long kP311HitReaction = 0; static coop::AddrReg kP311HitReaction_reg("Character_flinch", &kP311HitReaction);   /* Steam_1.0.65 0x438E50 */
+unsigned long long kMeleeUnderAttack = 0; static coop::AddrReg kMeleeUnderAttack_reg("AI_underMeleeAttack", &kMeleeUnderAttack);   /* Steam_1.0.65 0x999030, 1.0.68 0x999F00 */
 const size_t kRsCharAI           = 0x650;   /* iShotYou's param_1[0xca] (the Character_getBrain row: MOV RAX,[RCX+0x650]) */
 const size_t kRsCharBody         = 0x648;   /* the Character_getCombat row: MOV RAX,[RCX+0x648]; MOV RAX,[RAX+8] */
 const size_t kRsBodyCombat       = 0x8;
@@ -1618,7 +1729,7 @@ void RangedEventsDrain()
         if (kind == 1 && g_rsShotLogged < kRsLogLimit)
         {
             ++g_rsShotLogged;
-            DebugLog("[P104] SHOT #" + N3(g_rsShotLogged) + " shooter uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
+            SW_DEVLOG("[P104] SHOT #" + N3(g_rsShotLogged) + " shooter uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
                      + " target uid=" + N3(other) + " (" + RsOwnWord(otherMine) + ") turretHandType=" + N3(flag)
                      + " - the projectile exists on THIS game only");
         }
@@ -1629,14 +1740,14 @@ void RangedEventsDrain()
                              : (whoMine == 0) ? (otherMine == 1 ? "a COPY: the engine's damage is SKIPPED here (C2-b); MSG_SHOT carries the hit to its owner (P104 fix)"
                                                                 : "a COPY: the engine's damage is SKIPPED here (C2-b); the shooter is not ours, its own game decides")
                              : "not replicated: this game only";
-            DebugLog("[P104] RHIT #" + N3(g_rsHitLogged) + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
+            SW_DEVLOG("[P104] RHIT #" + N3(g_rsHitLogged) + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
                      + " shooter uid=" + N3(other) + " (" + RsOwnWord(otherMine) + ") dmg=" + F1(dmg)
                      + " onPurpose=" + N3(flag) + " -> " + what);
         }
         else if (kind == 3 && g_rsBlockLogged < kRsLogLimit)
         {
             ++g_rsBlockLogged;
-            DebugLog("[P104] RHIT-BLOCKED #" + N3(g_rsBlockLogged) + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
+            SW_DEVLOG("[P104] RHIT-BLOCKED #" + N3(g_rsBlockLogged) + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
                      + " shooter uid=" + N3(other) + " (copy) dmg=" + F1(dmg) + " onPurpose=" + N3(flag)
                      + " - a COPY's bolt: NO hit on this game (only the shooter's owner decides hits)");
         }
@@ -1710,7 +1821,7 @@ static void P112Drain()
             ++g_p112AimLogged;
             const char* vw = (e.verdict == 1) ? "FIRE" : (e.verdict == 0) ? "BLOCKED" : (e.verdict == 2) ? "WAIT" : "?";
             const int w = (e.why >= 0 && e.why < kP112WhyCount) ? e.why : 0;
-            DebugLog("[P112] AIM #" + N3(g_p112AimLogged) + " " + vw + " why=" + kP112WhyWord[w]
+            SW_DEVLOG("[P112] AIM #" + N3(g_p112AimLogged) + " " + vw + " why=" + kP112WhyWord[w]
                      + " shooter " + P112Who(e.su, e.sm, 0) + " at " + P112V(e.me)
                      + " target " + P112Who(e.tu, e.tm, 0) + " feet at " + P112V(e.tg)
                      + " horiz=" + F1(P112Horiz(e.me, e.tg)) + " dy=" + F1(e.tg[1] - e.me[1])
@@ -1722,7 +1833,7 @@ static void P112Drain()
         else if (e.kind == 3 && g_p112ShotLogged < kP112ShotCap)
         {
             ++g_p112ShotLogged;
-            DebugLog("[P112] SHOT-AIM shot#" + N3(e.shotNo) + " shooter " + P112Who(e.su, e.sm, 0) + " at " + P112V(e.me)
+            SW_DEVLOG("[P112] SHOT-AIM shot#" + N3(e.shotNo) + " shooter " + P112Who(e.su, e.sm, 0) + " at " + P112V(e.me)
                      + " target " + P112Who(e.tu, e.tm, 0) + " feet at " + P112V(e.tg)
                      + " horiz=" + F1(P112Horiz(e.me, e.tg)) + " dy=" + F1(e.tg[1] - e.me[1])
                      + " aimPt=" + P112V(e.aim) + " aimPt-targetFeet=" + P112Offset(e.aim, e.tg)
@@ -1733,7 +1844,7 @@ static void P112Drain()
             ++g_p112BoltLogged;
             const char* ew = (e.verdict == 2) ? "STRUCK-A-CHARACTER" : (e.verdict == 3) ? "STUCK(terrain/building)"
                            : (e.verdict == 0) ? (e.rangeLeft <= 0.0f ? "SPENT(range out)" : "SPENT(glancing terrain)") : "?";
-            DebugLog("[P112] BOLT-END shot#" + N3(e.shotNo) + " " + ew + " struck " + P112Who(e.hu, e.hm, (e.verdict == 2 || e.verdict == 3) ? e.r.obj : 0)
+            SW_DEVLOG("[P112] BOLT-END shot#" + N3(e.shotNo) + " " + ew + " struck " + P112Who(e.hu, e.hm, (e.verdict == 2 || e.verdict == 3) ? e.r.obj : 0)
                      + " " + P112RecWords(e.r) + " rangeLeft=" + F1(e.rangeLeft) + " age=" + F1(e.age) + " frames=" + N3(e.frames)
                      + " missToAimPt=" + (e.minAim > 1e8f ? std::string("-") : F1(e.minAim))
                      + " missToBody=" + (e.minBody > 1e8f ? std::string("unread") : F1(e.minBody)
@@ -1784,7 +1895,7 @@ static void P112WatchTick()
 {
     if (g_p112WatchOn == 0) return;
     const DWORD now = ::GetTickCount();
-    if ((long)(now - g_p112WatchUntil) >= 0) { g_p112WatchOn = 0; DebugLog("[P112] watch ended tick=" + N3((long long)now)); return; }
+    if ((long)(now - g_p112WatchUntil) >= 0) { g_p112WatchOn = 0; SW_DEVLOG("[P112] watch ended tick=" + N3((long long)now)); return; }
     if ((long)(now - g_p112WatchNext) < 0) return;
     g_p112WatchNext = now + 2000;
     for (int i = 0; i < 4; ++i)
@@ -1793,7 +1904,7 @@ static void P112WatchTick()
         if (u == 0) continue;
         ++g_p112PosLogged;
         ::Character* c = FindSpawned(u);
-        if (c == 0) { DebugLog("[P112] POS tick=" + N3((long long)now) + " uid=" + N3(u) + " - no character on this game"); continue; }
+        if (c == 0) { SW_DEVLOG("[P112] POS tick=" + N3((long long)now) + " uid=" + N3(u) + " - no character on this game"); continue; }
         float p[3], a[3];
         P112CharPos(c, p);
         const int ha = P112AnimPos(c, a);
@@ -1802,7 +1913,7 @@ static void P112WatchTick()
         const int att = AppearanceBodyAttached(c, &an, &ap, &en, &reason, &gate);
         int hasRc = 0, mode = -1, hasGun = 0, loaded = -1, tt = -1;
         RsReadRanged(c, &hasRc, &mode, &hasGun, &loaded, &tt);
-        DebugLog("[P112] POS tick=" + N3((long long)now) + " uid=" + N3(u) + " mine=" + N3(net::IsUidMine(u) ? 1 : 0)
+        SW_DEVLOG("[P112] POS tick=" + N3((long long)now) + " uid=" + N3(u) + " mine=" + N3(net::IsUidMine(u) ? 1 : 0)
                  + " pos=" + P112V(p) + " anim=" + (ha ? P112V(a) : std::string("-"))
                  + " ragdoll=" + N3(P112Ragdoll(c)) + " bodyAttached=" + N3(att)
                  + " body=" + ((reason >= 0 && reason < kHitBodySkipCount) ? std::string(kHitBodyReasonWord[reason]) : N3(reason))
@@ -1847,7 +1958,7 @@ static void P112Install()
                   : (coop::AddHook((void*)ac, (void*)&detour_p112Aim, (void**)&orig_p112Aim) == coop::SUCCESS ? 1 : 0);
     g_p112BoltHook = (bu == 0) ? -1
                    : (coop::AddHook((void*)bu, (void*)&detour_p112Bolt, (void**)&orig_p112Bolt) == coop::SUCCESS ? 1 : 0);
-    DebugLog(std::string("[P112] probe (T-310, read only): aim check (RangedCombat_aimTest) AddHook ")
+    SW_DEVLOG(std::string("[P112] probe (T-310, read only): aim check (RangedCombat_aimTest) AddHook ")
              + (g_p112AimHook == 1 ? "SUCCESS" : (g_p112AimHook == 0 ? "FAILED" : "NO ROW"))
              + ", bolt update (Harpoon_update) AddHook "
              + (g_p112BoltHook == 1 ? "SUCCESS" : (g_p112BoltHook == 0 ? "FAILED" : "NO ROW"))
@@ -1961,7 +2072,7 @@ static void ShotReactOne(::Character* v, ::Character* a, const ShotIn& s, float*
     if (g_shotReactLogged < kRsLogLimit)
     {
         ++g_shotReactLogged;
-        DebugLog("[P104] SHOT-IN REACT victim uid=" + N3(s.victim) + " (mine) attacker uid=" + N3(s.shooter) + " (the shooter's copy)"
+        SW_DEVLOG("[P104] SHOT-IN REACT victim uid=" + N3(s.victim) + " (mine) attacker uid=" + N3(s.shooter) + " (the shooter's copy)"
                  + " onPurpose=" + N3(s.onPurpose ? 1 : 0) + " gateRead=" + N3(gateRead) + " combat+0x130=" + N3(flag130)
                  + " attackerType=" + N3(type) + " targetBefore=" + tb + " targetBeforeRead=" + N3(tbRead)
                  + " -> rememberCharacter(ST_TEMPORARY_ENEMY)=" + N3(rem)
@@ -1999,7 +2110,7 @@ static void ShotReactWatchTick()
         {
             ++g_shotWatchGone;
             w.stage = 0;
-            DebugLog("[P104] SHOT-IN WATCH " + when + " victim uid=" + N3(w.victim) + " shooter copy uid=" + N3(w.shooter)
+            SW_DEVLOG("[P104] SHOT-IN WATCH " + when + " victim uid=" + N3(w.victim) + " shooter copy uid=" + N3(w.shooter)
                      + " -> " + (v == 0 ? "no victim character" : "no copy of the shooter") + " (gone)");
             continue;
         }
@@ -2009,7 +2120,7 @@ static void ShotReactWatchTick()
         std::string tw = "NONE";
         if (tgt == (const void*)a) { tw = "COPY (the shooter's copy, uid=" + N3(w.shooter) + ")"; ++g_shotWatchTurned; }
         else if (tgt != 0) { const unsigned int tu = UidOf((::Character*)tgt); tw = "OTHER (" + (tu != 0 ? "uid=" + N3(tu) : Ptr(tgt)) + ")"; }
-        DebugLog("[P104] SHOT-IN WATCH " + when + " victim uid=" + N3(w.victim) + " shooter copy uid=" + N3(w.shooter)
+        SW_DEVLOG("[P104] SHOT-IN WATCH " + when + " victim uid=" + N3(w.victim) + " shooter copy uid=" + N3(w.shooter)
                  + " targetRead=" + N3(tRead) + " target=" + tw + " treatsAsEnemy(copy)=" + N3(enemy)
                  + (tgt == (const void*)a ? " -> TURNED on the shooter's copy" : " -> not targeting the shooter's copy"));
     }
@@ -2123,6 +2234,258 @@ std::string FfShowLever(const std::string& args)
     return "ok ffshow " + N3(a) + " " + N3(b) + " (the [FF] line at the next safe point)";
 }
 
+// --- MELEE_DECIDED on the victim's game (MAIN THREAD) -------------------------------------------------------------------------
+namespace {
+struct MeleeIn { unsigned int victim; unsigned int attacker; int cutDir; int comboId; float dmg[6]; unsigned char techFlag; };
+std::vector<MeleeIn> g_meleeInQ;          /* net pump -> K2 safe point, both MAIN THREAD */
+const size_t kMeleeInMax = 256;
+long long g_meleeIn = 0, g_meleeApplied = 0, g_meleeRefused = 0, g_meleeRefNotMine = 0, g_meleeRefSender = 0, g_meleeMalformed = 0,
+          g_meleeInDropped = 0, g_meleeRefBlockedLoad = 0, g_meleeRefNoAddWound = 0, g_meleeRefNoVictim = 0, g_meleeRefNoAttacker = 0,
+          g_meleeRefOrient = 0, g_meleeFault = 0, g_meleeHitSent = 0, g_meleeKnock = 0, g_meleeReactRemember = 0, g_meleeReactHit = 0,
+          g_meleeRefRule = 0, g_meleeReactUnder = 0, g_meleeReactFault = 0;
+long long g_meleeSent = 0, g_meleeNotSent = 0;          /* the attacker's side, MeleeDecidedDrain */
+long long g_meleeIgnSeen = 0, g_meleeIgnLines = 0, g_meleeIgnLoggedAt = 0;
+const long long kMeleeLogFirst = 20, kMeleeLogEvery = 50;   /* the first 20 lines of a kind, then every 50th */
+bool MeleeLogThis(long long n) { return n <= kMeleeLogFirst || n % kMeleeLogEvery == 0; }
+
+std::string MeleeDmgText(const float* d)
+{
+    std::string t;
+    for (int i = 0; i < 6; ++i) { if (i) t += ","; t += F1(d[i]); }
+    return t;
+}
+
+void MeleeRefusedLine(unsigned int victim, unsigned int attacker, const char* why)
+{
+    ++g_meleeRefused;
+    if (MeleeLogThis(g_meleeRefused))
+        DebugLog("[MELEE] decided refused victim=" + N3(victim) + " attacker=" + N3(attacker) + " why=" + std::string(why)
+                 + " (refused " + N3(g_meleeRefused) + ")");
+}
+
+// The hit's own addWound call, argument for argument (1.0.65 0x43944D-0x439480, 1.0.68 0x4397ED-0x439820): the victim's
+// MedicalSystem (+0x458), the technique's byte, the blow's cut direction, the hit's Damages, then a pointer to two ints - the
+// hit's own -1 at rsp+0x48 and, beside it at rsp+0x4C, the cut direction it saved on entry - the attacker, a pointer to an out
+// int (rsp+0x58), and 0 (no harpoon). MAIN THREAD, K2 safe point. POD, __try (C2712); 0 on a fault.
+int MeleeCallAddWound(::Character* victim, ::Character* attacker, unsigned char techFlag, int cutDir, float* damages6,
+                      int* armour2, int* side2, void** part)
+{
+    *part = 0;
+    __try
+    {
+        *part = g_p104AddWound((char*)victim + kRsCharMedical, (char)techFlag, cutDir, damages6, armour2, attacker, side2, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// The hit reaction the melee hit runs after its wound (1.0.65 0x439746-0x43975B, 1.0.68 0x439AE6-0x439AFB): 0x438E50(the
+// victim, the cut direction re-read from rsp+0x4C - the second int of addWound's pair, the hit's Damages pointer, addWound's
+// result, the attacker). POD, __try.
+int MeleeCallHitReaction(P311HitReactionFn f, ::Character* v, int cutDir, float* damages6, void* part, ::Character* a)
+{
+    __try { f(v, cutDir, damages6, part, a); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// The melee hit's 'under melee attack' call (1.0.65 0x43948D-0x4394C7, 1.0.68 0x43982D-0x439867): AI 0x999030(the victim's AI
+// +0x650, the attacker, 1, 0), made between addWound and the hit reaction only when the victim's combat +0x130 is clear and the
+// attacker's vtable +0x20 answers 1 (the caller reads both with P311ReadGate). 1 ran, 0 a fault, -1 the victim or the attacker has no AI.
+// POD, __try (C2712).
+typedef void (*MeleeUnderAttackFn)(void*, ::Character*, char, char);
+int MeleeCallUnderAttack(MeleeUnderAttackFn f, ::Character* v, ::Character* a)
+{
+    __try
+    {
+        void* ai = *(void* const*)((const char*)v + kRsCharAI);
+        if (!RsPlaus(ai)) return -1;
+        /* 0x999030 also reads the ATTACKER's AI (decomp_999030: copy +kRsCharAI, then +0x18, then +0xAC): a copy with no AI object
+           is booked as no AI before the call, not caught half-way after the engine changed the victim's AI */
+        const char* aai = *(const char* const*)((const char*)a + kRsCharAI);
+        if (!RsPlaus(aai) || !RsPlaus(*(const void* const*)(aai + 0x18))) return -1;
+        f(ai, a, 1, 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// K2 safe point (MAIN THREAD, worker paused): each queued MSG_MELEE_DECIDED through the engine's MedicalSystem::addWound on our own
+// NPC - never hitByMeleeAttack, which would roll the block again here. Then the victim-side reactions the melee hit runs
+// (rememberCharacter, the hit reaction 0x438E50) with the attacker's copy, and the HIT to every game that holds a copy, its
+// second trailing byte set: the attacker's game already played the blow.
+void MeleeSafePointDrain()
+{
+    if (g_meleeInQ.empty()) return;
+    std::vector<MeleeIn> q;
+    q.swap(g_meleeInQ);
+    const bool blocked = EngineWritesBlocked();
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        const MeleeIn& s = q[i];
+        const char* why = 0;
+        ::Character* v = 0;
+        ::Character* a = 0;
+        if (blocked) { ++g_meleeRefBlockedLoad; why = "loading (a world is loading or tearing down)"; }
+        else if (g_p104AddWound == 0) { ++g_meleeRefNoAddWound; why = "noAddWound (see the ranged probe line)"; }
+        else if (!net::IsUidMine(s.victim)) { ++g_meleeRefNotMine; why = "notMine (the victim is no longer run here)"; }
+        else if (!meleewire::MeleeReceiverApplies(net::IsUidMine(s.attacker), IsUidPlayerCharAnyThread(s.attacker), true,
+                                                  IsUidPlayerCharAnyThread(s.victim)))
+        {
+            ++g_meleeRefRule;
+            why = "rule (this game's own rule does not ignore its result for this pair - that result stands)";
+        }
+        else if ((v = FindSpawned(s.victim)) == 0) { ++g_meleeRefNoVictim; why = "noVictim (no character for the victim uid)"; }
+        else if ((a = FindSpawned(s.attacker)) == 0) { ++g_meleeRefNoAttacker; why = "noAttackerCopy (addWound reads the attacker)"; }
+        if (why == 0)
+        {
+            void* an = 0; void* ap = 0; void* en = 0;
+            int reason = kHitBodyAttached, gate = 0;
+            bool orientable = (AppearanceBodyAttached(v, &an, &ap, &en, &reason, &gate) != 0);
+            if (orientable && gate != 0)   /* no harpoon: addWound orients on the attacker's body when the victim's gate is set (C1-b) */
+            {
+                int atReason = kHitBodyAttached;
+                if (AppearanceBodyChain(a, false, &an, &ap, &en, &atReason, 0) == 0) { orientable = false; reason = kHitAttackerNotOrientable; }
+            }
+            if (!orientable)
+            {
+                ++g_meleeRefOrient;
+                why = (reason >= 0 && reason < kHitBodySkipCount) ? kHitBodyReasonWord[reason] : "notOrientable";
+            }
+        }
+        if (why != 0) { MeleeRefusedLine(s.victim, s.attacker, why); continue; }
+        float before[32 * kPartFloats];
+        float after[32 * kPartFloats];
+        float bloodBefore = 0.0f, bloodAfter = 0.0f;
+        const int nb = SnapshotHealth(s.victim, before, 32, &bloodBefore);
+        float dm[6];
+        for (int k = 0; k < 6; ++k) dm[k] = s.dmg[k];
+        int armour[2] = { -1, s.cutDir };   /* the hit's pair: its -1, then its saved cut direction (MeleeCallAddWound) */
+        int side[2] = { 0, 0 };
+        void* part = 0;
+        const int arm = KnockArmClaim(v);   /* applyDamage marks a knock on this thread */
+        const int ok = MeleeCallAddWound(v, a, s.techFlag, s.cutDir, dm, armour, side, &part);
+        const unsigned char knock = KnockArmRelease(arm);
+        if (!ok)
+        {
+            ++g_meleeFault;
+            MeleeRefusedLine(s.victim, s.attacker, "fault (caught inside MedicalSystem::addWound, not retried)");
+            continue;
+        }
+        ++g_meleeApplied;
+        if (knock) ++g_meleeKnock;
+        int rem = -2, hr = -2;   /* -2 not run (no row / no part), 1 ran, 0 a fault caught */
+        if (kP311Remember != 0)
+        {
+            rem = P311CallRemember((P311RememberFn)coop::AddrAbs(kP311Remember), v, a);
+            if (rem == 1) ++g_meleeReactRemember;
+        }
+        int ua = -2;   /* -2 not run (no row, or the engine's gate is closed), 1 ran, 0 a fault caught, -1 the victim has no AI */
+        if (kMeleeUnderAttack != 0)
+        {
+            int flag130 = -1, type = -1;
+            if (P311ReadGate(v, a, &flag130, &type) == 1 && flag130 == 0 && type == 1)
+            {
+                ua = MeleeCallUnderAttack((MeleeUnderAttackFn)coop::AddrAbs(kMeleeUnderAttack), v, a);
+                if (ua == 1) ++g_meleeReactUnder; else if (ua == 0) ++g_meleeReactFault;
+            }
+        }
+        if (kP311HitReaction != 0 && part != 0)
+        {
+            hr = MeleeCallHitReaction((P311HitReactionFn)coop::AddrAbs(kP311HitReaction), v, armour[1], dm, part, a);
+            if (hr == 1) ++g_meleeReactHit; else if (hr == 0) ++g_meleeReactFault;
+        }
+        const int na = SnapshotHealth(s.victim, after, 32, &bloodAfter);
+        ObjId noId;
+        noId.index = noId.serial = 0;
+        noId.type = noId.container = noId.containerStamp = 0;
+        char d24[kDamagesBytes];
+        std::memcpy(d24, s.dmg, kDamagesBytes);
+        const bool hitSent = net::SendHit(s.victim, s.attacker, s.cutDir, d24, s.comboId, after, na > 0 ? na : 0, bloodAfter,
+                                          noId, knock, 1);
+        if (hitSent) ++g_meleeHitSent;
+        if (MeleeLogThis(g_meleeApplied))
+        {
+            double sb = 0.0, sa = 0.0;
+            for (int k = 0; k < nb * kPartFloats; ++k) sb += before[k];
+            for (int k = 0; k < na * kPartFloats; ++k) sa += after[k];
+            DebugLog("[MELEE] decided applied victim=" + N3(s.victim) + " attacker=" + N3(s.attacker) + " cutDir=" + N3(s.cutDir)
+                     + " dmg=" + MeleeDmgText(s.dmg) + " techFlag=" + N3((int)s.techFlag) + " part=" + Ptr(part)
+                     + " armour=" + N3(armour[0]) + "/" + N3(armour[1]) + " side=" + N3(side[0]) + " partSum " + F1((float)sb) + " -> " + F1((float)sa)
+                     + " blood " + F1(bloodBefore) + " -> " + F1(bloodAfter)
+                     + ((nb <= 0 || na <= 0) ? std::string(" (health unread)") : std::string())
+                     + " knock=" + N3(knock ? 1 : 0) + " remember=" + N3(rem) + " underMelee=" + N3(ua) + " hitReaction=" + N3(hr)
+                     + " HIT " + (hitSent ? "sent (attackerPlayed=1)" : "NOT sent") + " (applied " + N3(g_meleeApplied) + ")");
+        }
+    }
+}
+
+// CombatTick (MAIN THREAD): the blows our player characters landed on another game's NPC copies go to the NPC's owner; and the
+// line for blows by the copies of other games' player characters whose result was not applied here.
+void MeleeDecidedDrain()
+{
+    while (g_meleeRead != g_meleeWrite)
+    {
+        const PendingMelee& h = g_meleeQueue[g_meleeRead & kMeleeQueueMask];
+        meleewire::MeleeMsg m;
+        m.victimUid = h.victimUid;
+        m.attackerUid = h.attackerUid;
+        m.cutDir = h.cutDir;
+        m.comboId = h.comboId;
+        for (int k = 0; k < 6; ++k) m.damages[k] = h.damages[k];
+        m.techFlag = h.techFlag;
+        InterlockedExchange(&g_meleeRead, g_meleeRead + 1);
+        const bool sent = net::SendMeleeDecided(m);
+        if (sent) ++g_meleeSent; else ++g_meleeNotSent;
+        if (MeleeLogThis(sent ? g_meleeSent : g_meleeNotSent))
+            DebugLog(std::string(sent ? "[MELEE] decided sent" : "[MELEE] decided not sent") + " victim=" + N3(m.victimUid)
+                     + " attacker=" + N3(m.attackerUid) + " parried=0 cutDir=" + N3(m.cutDir) + " dmg=" + MeleeDmgText(m.damages)
+                     + " techFlag=" + N3((int)m.techFlag)
+                     + (sent ? " -> the victim's owner" : " (no owner known, no road, or it does not encode)")
+                     + " (sent " + N3(g_meleeSent) + " notSent " + N3(g_meleeNotSent) + " blocked " + N3(g_meleeBlocked)
+                     + " noHit " + N3(g_meleeNoHit) + ")");
+    }
+    const long long ign = g_meleeOwnIgnored;
+    if (ign > g_meleeIgnSeen)
+    {
+        g_meleeIgnSeen = ign;
+        if (g_meleeIgnLines < kMeleeLogFirst || ign - g_meleeIgnLoggedAt >= kMeleeLogEvery)
+        {
+            ++g_meleeIgnLines;
+            g_meleeIgnLoggedAt = ign;
+            DebugLog("[MELEE] own result ignored victim=" + N3((long long)(unsigned int)g_meleeIgnVictim)
+                     + " attacker=" + N3((long long)(unsigned int)g_meleeIgnAttacker) + " count=" + N3(ign)
+                     + " (the copy of another game's player character struck our NPC: that game decides the blow)");
+        }
+    }
+}
+} // namespace (MELEE_DECIDED)
+
+// MAIN THREAD (session.cpp OnMeleeDecided). See combat.h.
+void MeleeOnNet(unsigned int victimUid, unsigned int attackerUid, int cutDir, int comboId, const float* damages6,
+                unsigned char techFlag, int refusal)
+{
+    ++g_meleeIn;
+    if (refusal != 0 || damages6 == 0)
+    {
+        if (refusal == 1) { ++g_meleeRefNotMine; MeleeRefusedLine(victimUid, attackerUid, "notMine (the victim is not run here)"); }
+        else if (refusal == 2) { ++g_meleeRefSender; MeleeRefusedLine(victimUid, attackerUid, "sender (the sender does not run the attacker)"); }
+        else { ++g_meleeMalformed; MeleeRefusedLine(victimUid, attackerUid, "malformed (it did not decode)"); }
+        return;
+    }
+    if (g_meleeInQ.size() >= kMeleeInMax)
+    {
+        ++g_meleeInDropped;
+        MeleeRefusedLine(victimUid, attackerUid, "queueFull (the K2 safe point has not drained; is it installed?)");
+        return;
+    }
+    MeleeIn s;
+    s.victim = victimUid;
+    s.attacker = attackerUid;
+    s.cutDir = cutDir;
+    s.comboId = comboId;
+    for (int k = 0; k < 6; ++k) s.dmg[k] = damages6[k];
+    s.techFlag = techFlag;
+    g_meleeInQ.push_back(s);
+}
+
 // P104 fix, K2 safe point (MAIN THREAD, worker paused). See combat.h.
 void ShotSafePointDrain()
 {
@@ -2130,6 +2493,7 @@ void ShotSafePointDrain()
     /* T-311 fold 1: the WATCH lines sample here, worker paused - the victim's treatsAsEnemy can insert a default standing row (F617),
        which the ordinary per-frame tick must not do while the worker runs. Not while a world loads or tears down. */
     if (!EngineWritesBlocked()) ShotReactWatchTick();
+    MeleeSafePointDrain();   /* MSG_MELEE_DECIDED: the attacker's game's blow on our NPC, through addWound, worker paused */
     if (g_shotInQ.empty()) return;
     std::vector<ShotIn> q;
     q.swap(g_shotInQ);
@@ -2195,7 +2559,7 @@ void ShotSafePointDrain()
             double sb = 0.0, sa = 0.0;
             for (int k = 0; k < nb * kPartFloats; ++k) sb += before[k];
             for (int k = 0; k < na * kPartFloats; ++k) sa += after[k];
-            DebugLog("[P104] SHOT-IN #" + N3(g_shotApplied) + " victim uid=" + N3(s.victim) + " (mine) shooter uid=" + N3(s.shooter)
+            SW_DEVLOG("[P104] SHOT-IN #" + N3(g_shotApplied) + " victim uid=" + N3(s.victim) + " (mine) shooter uid=" + N3(s.shooter)
                      + " (copy) dmg=" + F1(s.rec[3]) + " onPurpose=" + N3(s.onPurpose ? 1 : 0)
                      + " -> APPLIED through MedicalSystem::addWound (type 6): part=" + Ptr(part) + " armour=" + N3(armour[0])
                      + " side=" + N3(side[0]) + " partSum " + F1((float)sb) + " -> " + F1((float)sa)
@@ -2235,7 +2599,7 @@ void InstallRangedProbe()
                     : "OFF why=" + N3(g_p104AddWoundWhy) + " (0 row unbound, -1 the ret's CALL is not applyDamage's, -2 iShotYou"
                       " does not call the derived entry, -3 unreadable) - a MSG_SHOT is counted, not applied")
              + " (P104 fix, protocol 104: a hit on a COPY by our shooter goes to its owner as MSG_SHOT; a COPY's bolt makes no hit here)");
-    DebugLog(std::string("[P104] T-311 victim reactions after a SHOT-IN wound: rememberCharacter ")
+    SW_DEVLOG(std::string("[P104] T-311 victim reactions after a SHOT-IN wound: rememberCharacter ")
              + (kP311Remember != 0 ? Ptr((const void*)coop::AddrAbs(kP311Remember)) : std::string("NO ROW"))
              + ", AI::underRangedAttack " + (kP311UnderRanged != 0 ? Ptr((const void*)coop::AddrAbs(kP311UnderRanged)) : std::string("NO ROW"))
              + ", hit reaction " + (kP311HitReaction != 0 ? Ptr((const void*)coop::AddrAbs(kP311HitReaction)) : std::string("NO ROW"))
@@ -2265,7 +2629,7 @@ static void RangedTestRecheckTick()
     if (s == 0)
     {
         g_rtRecheckUid = 0; g_rtRecheckStage = 0;
-        DebugLog("[P104] rangedtest RECHECK " + when + " shooter uid=" + N3(su) + " -> no character (gone)");
+        SW_DEVLOG("[P104] rangedtest RECHECK " + when + " shooter uid=" + N3(su) + " -> no character (gone)");
         return;
     }
     int hasRc = 0, mode = -1, hasGun = 0, loaded = -1, tt = -1;
@@ -2289,7 +2653,7 @@ static void RangedTestRecheckTick()
                   " searches the character's inventory, then 0x5CA890's)";
     else if (ammoType == 1) verdict = "EMPTY, NOT RELOADING (reloadCheck did not start one: the character's vtable +0x178 test said no)";
     else verdict = "EMPTY, NOT RELOADING";
-    DebugLog("[P104] rangedtest RECHECK " + when + " shooter uid=" + N3(su) + " target uid=" + N3(tu)
+    SW_DEVLOG("[P104] rangedtest RECHECK " + when + " shooter uid=" + N3(su) + " target uid=" + N3(tu)
              + " read=" + N3(rdOk) + " rc=" + N3(hasRc) + " rcCombatMode=" + N3(mode) + " gun=" + N3(hasGun)
              + " loaded=" + N3(loaded) + " turretHandType=" + N3(tt)
              + " reloadRead=" + N3(rlOk) + " rcState=" + N3(rcState) + " reloading=" + N3(reloading)
@@ -3009,7 +3373,7 @@ void CombatTick()
         {
             ++g_idLogged;
             Character* local = ResolveObjId(h.attackerId);
-            DebugLog("[P016] out victim=" + N3((long long)h.uid) + " attackerId='"
+            SW_DEVLOG("[P016] out victim=" + N3((long long)h.uid) + " attackerId='"
                      + ObjIdString(h.attackerId) + "' localResolve="
                      + std::string(local != 0 ? "YES" : "NO") + " name='"
                      + (local != 0 ? local->getShownNameDirect() : std::string("<unresolved>")) + "'");
@@ -3024,6 +3388,8 @@ void CombatTick()
         if (sent && h.knock) ++g_knockSent;   // K2
         InterlockedExchange(&g_hitRead, g_hitRead + 1);
     }
+    PlayerCharTableTick();   /* the player-character table the AI worker's melee hit reads (spawn.cpp), every 0.5 s */
+    MeleeDecidedDrain();     /* our landed blows on another game's NPC copies -> MSG_MELEE_DECIDED */
 }
 
 void ReportCombat()
@@ -3059,7 +3425,22 @@ void ReportCombat()
        << " knockOverflow=" << N3(g_knockOverflow)
        << " knockNotPlayed=" << N3(g_knockNotPlayed)
        << " knockArmsFull=" << N3(g_knockArmsFull)
-       << " knockPending=" << N3(g_knockPendingCount);
+       << " knockPending=" << N3(g_knockPendingCount)
+       // MELEE_DECIDED: the attacker's side (queued / sent / not sent / ring dropped / blocked / no hit), the NPC's side (own result
+       // ignored / in / applied / refused / malformed / in-queue dropped / addWound faults / HITs sent / knocks), and HITs whose
+       // play was skipped here because this game decided the blow.
+       << " melee[queued,sent,notSent,droppedQ,blocked,noHit]=" << N3(g_meleeQueued) << "," << N3(g_meleeSent) << ","
+       << N3(g_meleeNotSent) << "," << N3(g_meleeQDropped) << "," << N3(g_meleeBlocked) << "," << N3(g_meleeNoHit)
+       << " melee[ownIgnored,in,applied,refused,notMine,sender,malformed,inDropped,loading,noAddWound,noVictim,noAttacker,"
+          "notOrientable,fault,hitSent,knock,rule]=" << N3(g_meleeOwnIgnored) << "," << N3(g_meleeIn) << "," << N3(g_meleeApplied)
+       << "," << N3(g_meleeRefused) << "," << N3(g_meleeRefNotMine) << "," << N3(g_meleeRefSender) << "," << N3(g_meleeMalformed)
+       << "," << N3(g_meleeInDropped) << "," << N3(g_meleeRefBlockedLoad) << "," << N3(g_meleeRefNoAddWound) << ","
+       << N3(g_meleeRefNoVictim) << "," << N3(g_meleeRefNoAttacker) << "," << N3(g_meleeRefOrient) << "," << N3(g_meleeFault)
+       << "," << N3(g_meleeHitSent) << "," << N3(g_meleeKnock) << "," << N3(g_meleeRefRule)
+       << " meleeHitPlaySkipped=" << N3(g_meleeHitPlaySkipped)
+       << " meleeKeptUnclassified=" << N3(g_meleeKeptUnclassified)
+       << " meleeReact[remember,underMelee,hitReaction,fault]=" << N3(g_meleeReactRemember) << "," << N3(g_meleeReactUnder) << ","
+       << N3(g_meleeReactHit) << "," << N3(g_meleeReactFault);
     DebugLog(ss.str());
     // Stated in words, because `noAttacker` sat in this line for six runs being read as a
     // safety statistic rather than as "how often a player watched damage happen to someone
@@ -5782,11 +6163,11 @@ bool CombatModeResendOwned(unsigned int uid) { return CombatModeResendRow(uid); 
 // one-line check in the log instead of a wasted session.
 void InstallCombatUpdateProbe()
 {
-    DebugLog("[P045] resolving CombatClassAI::update ...");
+    SW_DEVLOG("[P045] resolving CombatClassAI::update ...");
     intptr_t up = (intptr_t)coop::AddrAbs(kMig3CombatClassAiUpdate);
     const uintptr_t imgBase = (uintptr_t)::GetModuleHandleA(0);
     g_imageBase = imgBase;   // P050 - cached for the per-frame task-vtable compare
-    DebugLog("[P045] CombatClassAI::update target = " + Ptr((void*)up)
+    SW_DEVLOG("[P045] CombatClassAI::update target = " + Ptr((void*)up)
              + " rva=" + Ptr((void*)(up ? (uintptr_t)up - imgBase : 0))
              + " = the loaded table's CombatClassAI_update row (table '" + coop::AddrTableName() + "'). Whether the"
                " table describes this executable is AddrInit's gate, which checked the row's bytes before any hook.");
@@ -5826,7 +6207,7 @@ void InstallCombatUpdateProbe()
     const bool patched = (::memcmp(before, after, sizeof(before)) != 0);
     g_updPatched = patched ? 1 : 0;
 
-    DebugLog("[P048] 0x60cc10 prologue before=" + HexBytes(before, 8)
+    SW_DEVLOG("[P048] 0x60cc10 prologue before=" + HexBytes(before, 8)
              + " after=" + HexBytes(after, 8)
              + " patched=" + N3(patched ? 1 : 0)
              + "  - unhooked this function begins 40 57 48 83 ec 50; a landed patch begins e9 or"
@@ -5835,7 +6216,7 @@ void InstallCombatUpdateProbe()
                " returned, and every updCalls=0 below is the probe rather than the engine.");
 
     if (us == coop::SUCCESS && patched)
-        DebugLog("[P045] CombatClassAI::update AddHook SUCCESS (and the prologue is patched)");
+        SW_DEVLOG("[P045] CombatClassAI::update AddHook SUCCESS (and the prologue is patched)");
     else if (us == coop::SUCCESS && !patched)
         ErrorLog("[P048] **AddHook RETURNED SUCCESS AND THE PROLOGUE IS UNCHANGED.** The hook is"
                  " NOT armed. Every updCalls figure in this run is 0 by construction and says"
@@ -5869,9 +6250,9 @@ void InstallEndActionProbe()
     const uintptr_t imgBase = (uintptr_t)::GetModuleHandleA(0);
     if (g_imageBase == 0) g_imageBase = imgBase;
 
-    DebugLog("[P058] resolving CharBody::finishAction ...");
+    SW_DEVLOG("[P058] resolving CharBody::finishAction ...");
     intptr_t ea = (intptr_t)coop::AddrAbs(kMig3CharBodyEndAction);
-    DebugLog("[P058] CharBody::finishAction target = " + Ptr((void*)ea)
+    SW_DEVLOG("[P058] CharBody::finishAction target = " + Ptr((void*)ea)
              + " rva=" + Ptr((void*)(ea ? (uintptr_t)ea - imgBase : 0))
              + " = the loaded table's CharBody_finishAction row (table '" + coop::AddrTableName() + "'; resolve_stub slot"
                " 1958).");
@@ -5893,14 +6274,14 @@ void InstallEndActionProbe()
     ::memcpy(after, (const void*)ea, sizeof(after));
     const bool patched = (::memcmp(before, after, sizeof(before)) != 0);
 
-    DebugLog("[P058] 0x5c5ce0 prologue before=" + HexBytes(before, 8)
+    SW_DEVLOG("[P058] 0x5c5ce0 prologue before=" + HexBytes(before, 8)
              + " after=" + HexBytes(after, 8)
              + " patched=" + N3(patched ? 1 : 0)
              + "  - **before == after means the trampoline did NOT arm**, whatever AddHook returned,"
                " and every P058 return-address line below is 0 by construction.");
 
     if (st == coop::SUCCESS && patched)
-        DebugLog("[P058] CharBody::finishAction AddHook SUCCESS (and the prologue is patched)");
+        SW_DEVLOG("[P058] CharBody::finishAction AddHook SUCCESS (and the prologue is patched)");
     else if (st == coop::SUCCESS && !patched)
         ErrorLog("[P058] **AddHook RETURNED SUCCESS AND THE PROLOGUE IS UNCHANGED.** The recorder is"
                  " NOT armed. Read no conclusion from the site table this run.");
@@ -5995,6 +6376,7 @@ void CombatModeTick()
                             if (downed) { if (rate > w->mvVisMaxRateDowned) w->mvVisMaxRateDowned = rate; }
                             else
                             {
+#ifdef SW_DEV_BUILD   /* a test probe: compiled into the DEV build only */
                                 // PROBE-START: P019 - vis_peak on a LOCALLY SIMULATED body (mine): the baseline the verdict's hop bound is built from.
                                 // review-p019 CRITICAL: this block runs for puppets too on both instances - the label was "host" and the
                                 // peer logged its puppets twice; only owned bodies are logged here (puppets are logged in DrivePuppet).
@@ -6002,10 +6384,11 @@ void CombatModeTick()
                                 {
                                     char tqpc[32]; _snprintf(tqpc, 31, "%.3f", nowS); tqpc[31] = 0; ++g_visPeakLinesLocal;
                                     float oftL = -1.0f, ftL = -1.0f; ReadCharFrameTimesPodC(c, &oftL, &ftL);
-                                    DebugLog("[PROBE] vis_peak side=local uid=" + N3((long long)w->uid) + " tqpc=" + std::string(tqpc) + " frameDt=" + F1((float)(dtS * 1000.0)) + "ms from=" + F1(w->mvLastX) + "," + F1(w->mvLastY) + "," + F1(w->mvLastZ)
+                                    SW_DEVLOG("[PROBE] vis_peak side=local uid=" + N3((long long)w->uid) + " tqpc=" + std::string(tqpc) + " frameDt=" + F1((float)(dtS * 1000.0)) + "ms from=" + F1(w->mvLastX) + "," + F1(w->mvLastY) + "," + F1(w->mvLastZ)
                                              + " to=" + F1(vp.x) + "," + F1(vp.y) + "," + F1(vp.z) + " step=" + F1(m) + " rate=" + F1(rate) + " ft=" + F1(ftL * 1000.0f) + "ms oft=" + F1(oftL * 1000.0f) + "ms");   // prone is 0 by construction on this branch; ft/oft = Character::frameTIME/offscreenFrameTime (F502)
                                 }
                                 // PROBE-END: P019
+#endif
                                 if (rate > w->mvVisMaxRate) w->mvVisMaxRate = rate;
                             }
                         }
@@ -6019,7 +6402,7 @@ void CombatModeTick()
         {
             if (w->lastState != st)
             {
-                DebugLog("[M6] state uid=" + N3(uid)
+                SW_QUIETLOG(g_qM6State, "[M6] state", 0, 0, "[M6] state uid=" + N3(uid)
                          + " " + N3(w->lastState) + ":" + SwordState(w->lastState)
                          + " -> " + N3(st) + ":" + SwordState(st)
                          + " mode=" + N3(on)
@@ -6037,7 +6420,7 @@ void CombatModeTick()
                         else if (w->weWantOn == 0) ++g_ncSwingsWhileAuthOff;
                     }
                     const std::string q(1, (char)34);
-                    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "swing" + q
+                    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "swing" + q
                              + "," + q + "uid" + q + ":" + N3(uid)
                              + "," + q + "mine" + q + ":" + N3(mine ? 1 : 0)
                              + "," + q + "native" + q + ":" + N3(native)
@@ -6503,7 +6886,7 @@ void CombatModeTick()
         if (on == 0 && w->lastOn == 1)
         {
             const std::string q(1, (char)34);
-            DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "host_move" + q
+            SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "host_move" + q
                      + "," + q + "uid" + q + ":" + N3(uid)
                      + "," + q + "frames" + q + ":" + N3(w->mvFrames)
                      + "," + q + "visMax" + q + ":" + F6(w->mvVisMax)
@@ -6584,7 +6967,7 @@ void FinishNativeClose(unsigned int uid, CombatWatch* w, const char* reason, boo
     const long long frames = g_cmPulseTick - w->nativeOpenTick;
     ++g_ncWindowsClosed;
     const std::string q(1, (char)34);
-    DebugLog("[NC] window CLOSE uid=" + N3(uid) + " reason=" + reason + " frames=" + N3(frames)
+    SW_QUIETLOG(g_qNcClose, "[NC] window CLOSE", 0, 0, "[NC] window CLOSE uid=" + N3(uid) + " reason=" + reason + " frames=" + N3(frames)
              + " swings=" + N3(w->nativeSwings) + " openDriftXZ=" + F1(w->nativeOpenDrift) + " maxDriftXZ=" + F1(windowMax)
              + " rcSteps=" + N3(rcSteps) + " rcMaxStep=" + F6(rcMax) + " rcReqMax=" + F6(rcReq) + " rcVisMaxStep3D=" + F6(rcVis)
              + " rcVisMaxRate=" + F1(rs.visMaxRate) + " rcLayerGapMax=" + F6(rs.layerGapMax) + " rcDriftMean=" + F1(rs.driftMean) + " rcSum=" + F1(rcSum)
@@ -6592,7 +6975,7 @@ void FinishNativeClose(unsigned int uid, CombatWatch* w, const char* reason, boo
              + " snapReason=" + N3(snap)
              + " (0 placed, 1 noPuppet, 2 noChar, 3 noAnim, 4 noMovement, 5 ragdoll, 6 prone, 7 unresolved, 8 notNeeded;"
                " the drift AFTER the snap is the next tick's snap_scored record)");
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "window_close" + q
+    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "window_close" + q
              + "," + q + "uid" + q + ":" + N3(uid)
              + "," + q + "reason" + q + ":" + q + reason + q
              + "," + q + "frames" + q + ":" + N3(frames)
@@ -7092,10 +7475,10 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
                     w->nativeOpenDrift = PuppetWindowDriftNow(uid);   // combat2 (F920): the gap the window starts with
                     ++g_ncWindowsOpened;
                     const std::string q(1, (char)34);
-                    DebugLog("[NC] window OPEN uid=" + N3(uid) + " target=" + N3(targetUid)
+                    SW_QUIETLOG(g_qNcOpen, "[NC] window OPEN", 0, 0, "[NC] window OPEN uid=" + N3(uid) + " target=" + N3(targetUid)
                              + " openDriftXZ=" + F1(w->nativeOpenDrift)
                              + " - AI released, authority's attack order queued, drive suspended");
-                    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "window_open" + q
+                    SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "window_open" + q
                              + "," + q + "uid" + q + ":" + N3(uid)
                              + "," + q + "target" + q + ":" + N3(targetUid)
                              + "," + q + "tick" + q + ":" + N3(g_cmPulseTick) + "}");
@@ -7164,6 +7547,11 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
     // BEFORE and AFTER, not just "applied". A call that returns without changing the byte is
     // the failure this feature is most likely to have, and it must be visible in the log rather
     // than inferred from a screenshot later - F193's lesson, applied up front this time.
+#ifndef SW_DEV_BUILD
+    /* the release build: a mode the byte did not take in full always, the rest the first few in full then a count a minute */
+    static swlogbudget::Gate s_qApplied;
+    if (!(on && after == 0) && !QuietLogPass(&s_qApplied, "[M6] COMBATMODE applied", 0, 0)) return;
+#endif
     DebugLog("[M6] COMBATMODE applied uid=" + N3(uid) + " on=" + N3(on ? 1 : 0)
              + " target=" + N3(targetUid)
              + " combatModeActive " + N3(before) + " -> " + N3(after)
@@ -7298,7 +7686,7 @@ void SetTaskInstall(bool on)
                  " through the decision pass that broke the other four. Retraction on combat-mode"
                  " OFF is unconditional.");
     else
-        DebugLog("[P055] task install OFF - the pre-F384 behaviour. Retraction still runs, because"
+        SW_DEVLOG("[P055] task install OFF - the pre-F384 behaviour. Retraction still runs, because"
                  " a build that stops installing must clean up after one that did.");
 }
 
@@ -7320,7 +7708,7 @@ void SetWeaponTask(bool on)
                  " T099 measured why it is needed at all: 0 of 118,171 client samples had a weapon"
                  " in hand against 129,631 of 129,631 on the host.");
     else
-        DebugLog("[P057] weapon task OFF - no TASK_DRAW_WEAPON install. (There is no longer a memo"
+        SW_DEVLOG("[P057] weapon task OFF - no TASK_DRAW_WEAPON install. (There is no longer a memo"
                  " eviction to switch off; it was deleted in the F407 build.) This is the control"
                  " arm, and unlike a switch that only gates a counter it genuinely changes what the"
                  " engine is asked to do.");
@@ -7390,7 +7778,7 @@ void ReportCombatMode()
                  + " f1NonFinite=" + N3(g_f1NonFinite) + " f6NonFinite=" + N3(g_f6NonFinite)
                  + " retargetOrderFailed=" + N3(g_ncRetargetOrderFailed) + " retargetRefusedWrite=" + N3(g_ncRetargetRefusedWrite) + " aiPassOverlapSeen=" + N3((long long)AiPassOverlapSeen())
                  + "  |  identity: opened == closed + openNow + orphanedByRebind + dropNoRow  (closed includes switch/drop/noChar closes)");
-        DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "nc_report" + q
+        SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "nc_report" + q
                  + "," + q + "nativeCombat" + q + ":" + N3(g_nativeCombat ? 1 : 0)
                  + "," + q + "opened" + q + ":" + N3(g_ncWindowsOpened)
                  + "," + q + "closed" + q + ":" + N3(g_ncWindowsClosed)
@@ -7646,7 +8034,7 @@ void ReportCombatMode()
     // were updated and this fifth, prose one was missed - the "fixed three of four sites" shape,
     // one site wider than the search that was used to look for it. **When a signal is retired,
     // search the STRINGS as well as the branches.**
-    DebugLog("[P045] world totals: updCallsAll=" + N3((long long)g_updTotal)
+    SW_DEVLOG("[P045] world totals: updCallsAll=" + N3((long long)g_updTotal)
              + " hookPatched=" + N3((long long)g_updPatched)
              + " unregistered=" + N3((long long)g_updUnknown)
              + " noSlot=" + N3((long long)g_updNoSlot)
@@ -7675,7 +8063,7 @@ void ReportCombatMode()
     // retired between a message arriving and the walk, and worth watching if it is large.
     // **`watchBadSlot` MUST be 0**: non-zero means the mirror is larger than the watch table and
     // characters are being dropped silently at the top end.
-    DebugLog("[P045] watch index: watchRebound=" + N3(g_cmWatchRebound)
+    SW_DEVLOG("[P045] watch index: watchRebound=" + N3(g_cmWatchRebound)
              + " watchNoMirror=" + N3(g_cmWatchNoMirror)
              + " watchBadSlot=" + N3(g_cmWatchBadSlot)
              + " watchZeroUid=" + N3(g_cmWatchZeroUid)
@@ -7737,7 +8125,7 @@ void ReportCombatMode()
     // the row-loop `continue` with no ownership label, which is currently impossible.
     // **EVERY RATIO ON THIS LINE IS OVER SAMPLED ROWS.** An unsampled row is not a measurement of
     // zero; see the ownedSampledRows block above for why that distinction decides the run.
-    DebugLog("[P056] readiness: owned rows with a weapon drawn=" + N3(ownedWepRows)
+    SW_DEVLOG("[P056] readiness: owned rows with a weapon drawn=" + N3(ownedWepRows)
              + " of " + N3(ownedSampledRows) + " SAMPLED"
              + "  |  puppet rows with a weapon drawn=" + N3(puppetWepRows)
              + " of " + N3(puppetSampledRows) + " SAMPLED"
@@ -7770,7 +8158,7 @@ void ReportCombatMode()
                  " rows. Those samples are counted in wepImplausible and NOT in wepDrawn -"
                  " deliberately, because counting them would have read as 'the weapon is not the"
                  " blocker' and that conclusion is the one nobody goes back to re-check.");
-    DebugLog("[P056] READING IT: this measures the weapon clause of the readiness requirement - the"
+    SW_DEVLOG("[P056] READING IT: this measures the weapon clause of the readiness requirement - the"
              " first clause that tests the ACTOR, and the one the installer's refusal is attributed"
              " to. **It is NOT the first thing the engine checks:** two requirements about the"
              " TARGET (swimming, imprisoned) are evaluated before it, and on a non-animal the"
@@ -7813,7 +8201,7 @@ void ReportCombatMode()
         // **THE READING T096 PRODUCED, AND THE BUILD THAT PRODUCED IT CALLED IT A PROBE FAILURE.**
         // A zero total with the prologue verifiably patched is not the probe failing - it is the
         // engine not calling the function, which is the answer this whole workstream is after.
-        DebugLog("[P045] updCallsAll=0 AND THE PROLOGUE IS PATCHED ([P048] patched=1) - so the hook"
+        SW_DEVLOG("[P045] updCallsAll=0 AND THE PROLOGUE IS PATCHED ([P048] patched=1) - so the hook"
                  " IS armed and CombatClassAI::update was genuinely never called for ANY object"
                  " on this instance. **THIS IS A RESULT, NOT A PROBE FAILURE.** Read the per-uid"
                  " rows below: anyTaskFrames=0 across them means no character here ever had a"
@@ -7867,14 +8255,14 @@ void ReportCombatMode()
         // a real leak looks like.** It is the price of reporting the snapshot rather than the live
         // slot, which is what stops a retired uid accruing a stranger's calls through a reused
         // address - a bounded lag traded for an unbounded contamination.
-        DebugLog("[P045] snapshot lag: updCallsAll=" + N3((long long)g_updTotal)
+        SW_DEVLOG("[P045] snapshot lag: updCallsAll=" + N3((long long)g_updTotal)
                  + " minus attributed=" + N3(ownedCalls + puppetCalls)
                  + " = " + N3((long long)g_updTotal - (ownedCalls + puppetCalls))
                  + " - EXPECTED and not a leak while `unregistered` is 0: rows report their count as"
                    " of their last sample, this total is read now. It should GROW with active rows"
                    " and stay a tiny fraction. A constant gap would be a leak (F373).");
 
-        DebugLog("[P045] ARMS: owned rows=" + N3(ownedRows) + " (measurable " + N3(ownedMeas)
+        SW_DEVLOG("[P045] ARMS: owned rows=" + N3(ownedRows) + " (measurable " + N3(ownedMeas)
                  + ") updCalls=" + N3(ownedCalls)
                  + "  |  puppet rows=" + N3(puppetRows) + " (measurable " + N3(puppetMeas)
                  + ") updCalls=" + N3(puppetCalls)
@@ -7917,7 +8305,7 @@ void ReportCombatMode()
         const int  uidRows    = WatchRowsForUid(w->uid);
         const bool measurable = RowMeasurable(w, uidRows);
 
-        DebugLog("[P045] uid=" + N3(w->uid)
+        SW_DEVLOG("[P045] uid=" + N3(w->uid)
                  + " mine=" + N3(w->ccMine)
                  + " isAI=" + N3(w->ccIsAI)
                  + " inCombatFrames=" + N3(w->ccSamples)
@@ -8103,7 +8491,7 @@ void ReportCombatMode()
                       : ""));
     }
 
-    DebugLog("[P045] NOTE baseTicked counts frames where stateTimer (+0x14C) changed - that field"
+    SW_DEVLOG("[P045] NOTE baseTicked counts frames where stateTimer (+0x14C) changed - that field"
              " is decremented by CombatClass::update (0x60C3A0). aiTicked counts frames where"
              " targetLastChangedTimer (+0x2F0) changed - that field is incremented at the TOP of"
              " CombatClassAI::update (0x60CC10). 0x60CC10 calls 0x60C3A0, and the dispatch"
@@ -8114,12 +8502,12 @@ void ReportCombatMode()
              " call and before every dispatch; neither = nothing ticks this combat object."
              " Denominator is inCombatFrames - outside combat mode nothing is sampled,"
              " deliberately, and a gap in sampling re-primes rather than comparing across it.");
-    DebugLog("[P045] sampling isAI faults=" + N3(g_ccIsAIFaulted)
+    SW_DEVLOG("[P045] sampling isAI faults=" + N3(g_ccIsAIFaulted)
              + " - kept OUT of the [M6] isAIFaulted counter deliberately. This call site runs every"
                " frame for every character in combat mode including owned ones, so one bad object"
                " would climb a shared counter by ~60/second and make the swing report's own"
                " diagnostic unreadable for the whole run.");
-    DebugLog("[P045] NOTE the AI field SAWTOOTHS - chooseAttackTarget (0x666450) and"
+    SW_DEVLOG("[P045] NOTE the AI field SAWTOOTHS - chooseAttackTarget (0x666450) and"
              " initCombatMode (0x667750) both RESET it to 0, and update can call the former a"
              " few instructions before its own accumulate. That is why this counts CHANGED frames"
              " and not increases: a direction test would have read every reset as `did not run`."
@@ -8133,7 +8521,7 @@ void ReportCombatMode()
     // before AND after: `alreadyArmed` is counted separately precisely because on the HOST every
     // character is already armed, so a build that reported success without the before-read would
     // certify itself on the control population.
-    DebugLog("[P057] REPORT weaponTask=" + N3(g_weaponTask ? 1 : 0)
+    SW_DEVLOG("[P057] REPORT weaponTask=" + N3(g_weaponTask ? 1 : 0)
              + " attempts=" + N3(g_wpAttempts)
              + " nowArmed=" + N3(g_wpNowArmed)
              + " stillEmpty=" + N3(g_wpStillEmpty)
@@ -8147,7 +8535,7 @@ void ReportCombatMode()
              " used to print here and have been removed rather than left reading zero, because eight"
              " zeros read as *the eviction ran and found nothing*. `taskweapon` now does exactly one"
              " thing: install TASK_DRAW_WEAPON.");
-    DebugLog("[P057] READING IT: **nowArmed>0 means a puppet that had NOTHING in its hands now has"
+    SW_DEVLOG("[P057] READING IT: **nowArmed>0 means a puppet that had NOTHING in its hands now has"
              " a weapon** - the state T099 measured as missing on 118,171 of 118,171 client"
              " samples. **stillEmpty means the task RAN and drew nothing**; factoryDeclined and"
              " reqRefused mean it never ran at all, which is a different question with a different"
@@ -8161,13 +8549,13 @@ void ReportCombatMode()
              " above, not printing zero.)");
     // P057 / U-13 - the stickiness verdict. Printed beside the install counters rather than with
     // the weapon ones, because it is a fact about the MELEE install, not about the weapon.
-    DebugLog("[P057] MEMO across the melee install: evaluated=" + N3(g_tiMemoGrew)
+    SW_DEVLOG("[P057] MEMO across the melee install: evaluated=" + N3(g_tiMemoGrew)
              + " servedFromCache=" + N3(g_tiMemoHit)
              + " neverAsked=" + N3(g_tiMemoNotAsked)
              + " unreadable=" + N3(g_tiMemoUnread)
              + " failedOnReads=" + N3(g_tiFailedOnReads)
              + " lastFailedOnUnverified=" + N3((long long)g_tiLastFailedOnUnverified));
-    DebugLog("[P057] READING IT: the requirements check inserts on BOTH exits, so the map growing"
+    SW_DEVLOG("[P057] READING IT: the requirements check inserts on BOTH exits, so the map growing"
              " means it EVALUATED. **A map that did NOT grow has two causes and only one of them"
              " is U-13**: servedFromCache is a real memo hit; neverAsked is the check never being"
              " reached (the factory declined, or the installer saw the same task already current"
@@ -8193,7 +8581,7 @@ void ReportCombatMode()
              + "  |  `(taskweapon on, taskinstall on)` is refused IN CODE, not by convention."
              " Non-zero means an operator asked for it and the second switch did NOT take effect -"
              " the run continued in whatever single-switch arm was already set. **Check which.**");
-    DebugLog("[P055] REPORT taskInstall=" + N3(g_taskInstall ? 1 : 0)
+    SW_DEVLOG("[P055] REPORT taskInstall=" + N3(g_taskInstall ? 1 : 0)
              + " attempts=" + N3(g_tiAttempts)
              + " ok=" + N3(g_tiOk)
              + " okButAlreadyThere=" + N3(g_tiOkAlready)
@@ -8254,12 +8642,12 @@ void ReportCombatMode()
                "  |  See the [P058] lines below for what to read instead.");
 
     // P058 / F399 - **IS THE INSTALLED TASK HOLLOW? THE MELEE INSTALL BESIDE ITS OWN CONTROL.**
-    DebugLog(std::string("[P058] taskData at install:")
+    SW_DEVLOG(std::string("[P058] taskData at install:")
              + TaskDataColumn("MELEE",                    g_p58Melee,       true)
              + TaskDataColumn("EQUIP",                    g_p58Equip,       false)
              + TaskDataColumn("OTHER-NEW(ours,wrong type)", g_p58OtherNew,  false)
              + TaskDataColumn("PRE-EXISTING(not ours)",   g_p58Preexisting, false));
-    DebugLog("[P058] **DOOR 1 (F402/F404) - AND THE FIRST VERSION OF THIS LINE HAD IT BACKWARDS,"
+    SW_DEVLOG("[P058] **DOOR 1 (F402/F404) - AND THE FIRST VERSION OF THIS LINE HAD IT BACKWARDS,"
              " IN BOLD, AT THE TOP.** `AITaskSytem::update4Frame` has TWO paths to"
              " `bodyTaskComplete` and F399 only had one. The first needs no combat state, no"
              " animation, no requirements check and no memo:"
@@ -8309,7 +8697,7 @@ void ReportCombatMode()
              " `finishAction` from the same instruction inside `bodyTaskComplete`, so both return"
              " 0x50cda3). It CAN separate the callers - see the caller table below, which was also"
              " wrong and is also corrected.");
-    DebugLog("[P058] READING IT: **`MELEE NULLTASKDATA > 0` CONFIRMS F399's CANDIDATE 2** - the task"
+    SW_DEVLOG("[P058] READING IT: **`MELEE NULLTASKDATA > 0` CONFIRMS F399's CANDIDATE 2** - the task"
              " factory returned a real `Tasker` of the right type carrying a NULL `TaskData`, which"
              " `CharBody::update` reaps on its next pass. That state is invisible to a vtable"
              " check, so every `ok=` T100 printed is compatible with it."
@@ -8385,7 +8773,7 @@ void ReportCombatMode()
         }
         if (shown == 0) sites = "  (NO SITES RECORDED)";
 
-        DebugLog(std::string("[P058] finishAction callers: endCallsAll=")
+        SW_DEVLOG(std::string("[P058] finishAction callers: endCallsAll=")
                  + N3((long long)g_endCallsAll)
                  + " endCallsOnWatchedBodies=" + N3((long long)g_endCallsWatched)
                  + " siteRowsUsed=" + N3((long long)shown)
@@ -8400,7 +8788,7 @@ void ReportCombatMode()
                  + " watchRingWrapped=" + N3((long long)g_endWatchWrapped)
                  + " watchRestamped=" + N3((long long)g_endWatchRestamp)
                  + "  ||" + sites);
-        DebugLog("[P058] **CHECK THE CALIBRATION FIRST, BEFORE ANY OTHER NUMBER ON THESE LINES.**"
+        SW_DEVLOG("[P058] **CHECK THE CALIBRATION FIRST, BEFORE ANY OTHER NUMBER ON THESE LINES.**"
                  " This whole probe assumes `_ReturnAddress()` inside a detour yields the ENGINE's"
                  " call site - true for a jump-patch hook, false for anything that adds a frame."
                  " **It does not have to be assumed.** This mod calls `finishAction` itself from"
@@ -8424,7 +8812,7 @@ void ReportCombatMode()
                  " that arrived before the image base was cached, which would otherwise have been"
                  " added to the calibration count and made *the probe not being ready* look like"
                  " *our own DLL called it*. Non-zero invalidates the calibration, not the sites.");
-        DebugLog("[P058] READING IT: **`watchedHits` IS THE COLUMN THAT ANSWERS THE QUESTION.** It"
+        SW_DEVLOG("[P058] READING IT: **`watchedHits` IS THE COLUMN THAT ANSWERS THE QUESTION.** It"
                  " counts removals on a CharBody we had just installed a melee task into, and"
                  " `finishAction` has no direct callers - so the caller RVA beside it IS the code"
                  " path that took our task away, read rather than ranked."
@@ -8526,7 +8914,7 @@ void ReportCombatMode()
     // P046 / T095 - THE SETTER'S OWN VERDICT. These four are exhaustive over every call we make to
     // `setTarget`, so `ok + earlyReturn + resolveFailed + wrongTarget` must equal
     // `wrote` - one more identity a reader can check rather than trust.
-    DebugLog("[P046] REPORT setTarget: ok=" + N3(g_swSetOk)
+    SW_DEVLOG("[P046] REPORT setTarget: ok=" + N3(g_swSetOk)
              + " okByAlias=" + N3(g_swSetOkAlias)
              + " earlyReturn=" + N3(g_swSetEarlyReturn)
              + " resolveFailed=" + N3(g_swSetResolveFail)
@@ -8732,6 +9120,7 @@ void detour_tsRagdollUpdates(void* gameWorld)
     coop::ShotSafePointDrain();     /* P104 fix: MSG_SHOT - the other game's bolt played on our own character through addWound, worker paused */
     /* T-327: coop::EffectSafePointDrain runs AFTER the original below (review fold M2) */
     coop::HireSafePointDrain();     /* recruit1: owner check / take + recruit / setFaction + release, with the worker paused */
+    coop::SplitSquadDrain();        /* splitsquad (test-only lever): a new player squad (spawnEmptySquad) and setFaction moves into it, with the worker paused */
     coop::WorldRelSafePointDrain(); /* par24: the notebook's world-vs-world rows written (and the once-a-world seed walk), with the worker paused */
     coop::RestockNowDrain();        /* par2 (test-only lever): the engine's own shop restock for one sector, holder squads only */
     coop::TraderSpawnDrain();       /* traderspawn (test-only lever): one wandering trader caravan through the engine's own createRandomSquad */

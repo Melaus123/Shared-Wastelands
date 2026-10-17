@@ -23,7 +23,8 @@ const int kTakerCap = 32;
 const int kDoneCap = 64;
 
 /* The owner's pending row at a tick. dir 0 TAKE / 1 GIVE; cfSent: our ok CONFIRM went out (or is held by the TEST-only
-   confirmdelay lever and will); escrow: the row is already in escrow. */
+   confirmdelay lever and will); escrow: the row is already in escrow. sinceSentMs: a TAKE's wall time since the grant, a GIVE's
+   time its giver was in the world since the grant (T-889: coopgive::OwnerPendAgeMs). */
 const int kExpWait = 0, kExpRollback = 1, kExpStand = 2, kExpEscrow = 3, kExpReturn = 4;
 inline int ExpireAction(int dir, int cfSent, int escrow, unsigned int sinceSentMs, unsigned int sinceQuietMs,
                         unsigned int timeoutMs, unsigned int quietMs)

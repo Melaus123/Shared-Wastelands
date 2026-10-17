@@ -169,6 +169,25 @@ std::string MetaHomeMerge(const std::string& kept, const std::string& arriving);
    reads as no key (and MetaHomeMerge then keeps the key already held). */
 const size_t kMetaHomeCap = 47;
 std::string MetaHomeClean(const std::string& home);
+/* A HOME CLEARED BY A PURCHASE. The groups whose home was a house a player bought have no home after it (the engine's buy blanks it);
+   "-" stands for that: a line holds it, MetaHomeClean keeps it, MetaHomeMerge takes it like a key, and the readers that give homes read
+   it as no key. MetaHomeIsCleared: the value is "-". MetaHomeKey: the key a reader gives a home by - "" for "-" (no key). MetaHomeNote:
+   the value the GAME keeps when another write arrives - MetaHomeMerge, except that a "-" held here stays against a key that is the
+   cleared one or near it (sameAsCleared 1 - the caller compares, store.cpp with BoxKeyNearKey) and, while the cleared key is not known
+   (sameAsCleared -1), against every key but the group's own live home (fromLive 1); any other key replaces it.
+   WHAT "-" DOES NOT COVER: the world server's merge is the plain MetaHomeMerge, so a later write there that names a key replaces "-"
+   (the house key again too); and "-" travels only with a full record write of the group - a road that sends no home leaves the key the
+   receiver already holds. */
+const char* const kMetaHomeCleared = "-";
+bool MetaHomeIsCleared(const std::string& home);
+std::string MetaHomeKey(const std::string& home);
+std::string MetaHomeNote(const std::string& kept, const std::string& arriving, int fromLive, int sameAsCleared);
+/* A give of an owed home (towngen.cpp TownGenGiveHomeTo / ...ByKey: 1 / 2 given, 0 a fault, 3 not loaded, kGiveHomePlayerHouse the
+   building is a player's house and is never given). OwedHomeGiveAct: kOwedGiveDone - the entry leaves the list; kOwedGiveKeep - tried
+   again later; kOwedGiveDrop - the entry is dropped and the group's home cleared. */
+const int kGiveHomePlayerHouse = 4;
+const int kOwedGiveKeep = 0, kOwedGiveDone = 1, kOwedGiveDrop = 2;
+int OwedHomeGiveAct(int giveResult);
 
 /* A COPY OF ANOTHER GAME'S GROUP AND ITS HOME BUILDING [t755-copyhome-decide]. A copy is given the building its sender named only when
    that building resolves here, and it resolves only while it is loaded. CopyHomeOwe: kCopyHomeNone - no building was sent, or it

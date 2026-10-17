@@ -127,7 +127,8 @@ inline int HoldServeStep(int repeatRow, int isWriter, int accessOk, int refuseNe
    for the units (the stack limit read first); oldFits  the hold's own square takes it; freeFound  some other square of the section
    takes it. A placed / swapped item goes into the square asked for; merged / back units onto the stack there. Anything else is the
    writer's own player having changed the box meanwhile: its old square, then (units off a stack - mergeOldOk: the stack they came
-   off is still there with room) back onto that stack, then any square, else it is KEPT (parked, placed when room appears) - every one
+   off is still there with room) back onto that stack, then any square, else it is KEPT (parked, placed when room appears; a
+   character's kept item then tries its main section, and later the ground at its feet) - every one
    of those is answered where != exact, and the asker re-asks the box. freeTargetFirst (T-159, a LAND into another box whose free
    square is in that box - LandFreeFrom kLfTarget): the player chose that box, so a free square there comes before the way home. */
 const int kLpPlaceExact = 0, kLpMergeExact = 1, kLpOld = 2, kLpFree = 3, kLpKeep = 4, kLpMergeOld = 5;
@@ -243,7 +244,8 @@ inline int LandIntoOtherBox(int srcIsBox, int dstIsBox, int dstMine, int dstHeld
 /* T-159: THE WRITER'S LOOK AT A LAND INTO ANOTHER BOX. The other box takes the item only when this game writes it too (read live),
    its access policy lets that player in, and it is not a registered shop piece (never held for, or filled by, another player's
    cursor). Otherwise the target is BARRED and the LAND is planned with no target square: the item goes back to its own square in
-   its own box, then any square there, else it is kept and placed when room appears - never dropped, never doubled; the answer says
+   its own box, then any square there, else it is kept and placed when room appears (on the ground at the box only when this game
+   stops writing it or writes its zone) - never doubled; the answer says
    where (not exact), so the asker re-reads both boxes. A LAND inside one container is never barred here. */
 inline int LandTargetOpen(int otherBox, int targetWriter, int targetAccess, int targetShopPiece)
 {

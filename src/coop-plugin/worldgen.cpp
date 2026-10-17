@@ -28,6 +28,7 @@ std::string P072ReportToken();                  /* PROBE P072: counters for the 
 #include "towngen.h"      /* T-392 (owner 335 a): TownGenResidentsGate - the residents gate */
 #include "../common/townreoffer.h"   /* T-438: PopulateMode - the SAME header the offline suite compiles */
 #include "handoff.h"      /* PROBE P116: ReadSquadAt - the guarded squad read */
+#include "speech.h"       /* T-831: TalkWindowBeforeRemove - a shown conversation naming the object ends before it goes */
 #include <intrin.h>       /* PROBE P116: _ReturnAddress - the engine caller of a refused creation */
 #include "net/session.h"  /* P4z: SessionLinked - a game with no session is its own world.  P8e (audit C4):
                              SessionIsHost is NOT read here any more.  P97 (p97-leaf, owner 334 a /
@@ -435,7 +436,11 @@ bool detour_destroy(GameWorld* self, RootObject* obj, bool justUnloaded, const c
     // BEFORE the engine destroys it - and `FindSpawnedUid` answers 0 for a withdrawn slot by design.
     // So on that path the uid was unresolvable, `DropPuppet` never ran, and the authority never
     // announced: the F326 fix skipped exactly the characters it was written for.
-    unsigned int uid = (obj != 0) ? coop::FindSpawnedUidForDestroy(obj) : 0;
+    // The lookup also asks the object's own handle: a row at this address answers only when the object
+    // is that row's character, so an object built at a dead row's reused address resolves 0 here and is
+    // never read as a Character on the way to NotifyDespawn. This is the one caller that marks such a
+    // row destroyed and counts it (FindSpawnedUidOnDestroy); the plain lookups elsewhere do not.
+    unsigned int uid = (obj != 0) ? coop::FindSpawnedUidOnDestroy(obj) : 0;
 
     // T-304 (2), fold 1 - ONLY THE OWNER REMOVES A CHARACTER. The engine's 'eaten' removal of a registered copy of the other
     // game's character (run T674: B's copy of A's corpse, eaten by an animal A never had) is refused and answered FALSE, the
@@ -467,7 +472,7 @@ bool detour_destroy(GameWorld* self, RootObject* obj, bool justUnloaded, const c
     coop::ItemsLootNoteDestroy(obj, justUnloaded ? 1 : 0);   /* loot2c fold (3c): the engine's just-unloaded flag rides along - an unload is never a touch; a registered research copy the engine destroys (the cursor item on closeInventory, a swap) is retired here - pointer compare only, any thread */
     if (justUnloaded) InterlockedIncrement64(&g_destroyUnloadedAll);
 
-    if (obj != 0 && coop::RetireOnDestroy(obj))
+    if (obj != 0 && coop::RetireOnDestroy(obj, debugInfo))
     {
         InterlockedIncrement64(&g_destroyOurs);
         if (justUnloaded) InterlockedIncrement64(&g_destroyUnloadedOurs);   // F336: the same scope
@@ -518,6 +523,7 @@ void detour_populateBuilding(RootObjectFactory* self, Building* building)
 {
     NoteThread(&g_tidPop);
     if (UpstreamGated()) { InterlockedIncrement64(&g_blkPopulate); return; }
+    if (coop::TownGenPlayerHouseSkip((void*)building, 0) != 0) return;   /* a player's house (marker, stand-in or build record): no residents step at all - towngen counts and logs it */
     /* T-438 (t438-worldgen): a SET-ASIDE building still runs the engine call - it switches the interior on (the furniture
        layout: bar, shop counters, storage) and sets the owner faction before it makes any squad (decomp_57ed90:77-79, 106-123).
        The gate raised the per-thread "squads set aside" flag with its building-sector context, so towngen's creation detour
@@ -529,14 +535,15 @@ void detour_populateBuilding(RootObjectFactory* self, Building* building)
 }
 namespace coop {
 /* T-392 (owner 335 a): the re-offer's call, MAIN THREAD (towngen's post-hook on Town::periodicTick) - the same gate and
-   the same original as the detour above, inside a crash guard. 1 = the original ran; 0 = set aside again (or `off`); -1 = no
-   original, or a fault inside the engine call. */
+   the same original as the detour above, inside a crash guard. 1 = the original ran, or the building is a player's house (not
+   populated, its entry answered); 0 = set aside again (or `off`); -1 = no original, or a fault inside the engine call. */
 int WorldGenRerunPopulate(void* factory, void* building)
 {
     if (orig_populateBuilding == 0 || factory == 0 || building == 0) return -1;
     __try
     {
         if (UpstreamGated()) { InterlockedIncrement64(&g_blkPopulate); return 0; }
+        if (TownGenPlayerHouseSkip(building, 1) != 0) return 1;   /* a player's house: its waiting entry was erased - answered, the engine call not made */
         /* T-438: the furniture was loaded when the building was set aside at load, so a re-offer the gate sets aside AGAIN does
            not run the engine call a second time (kPopSkip); the gate raised the flag, Done(0) lowers it */
         if (townreoffer::PopulateMode(0, TownGenResidentsGate(factory, building)) == townreoffer::kPopSkip) { TownGenResidentsDone(0); InterlockedIncrement64(&g_deferPopulate); return 0; }
@@ -613,6 +620,9 @@ bool DestroyLocalObject(void* obj)
     if (orig_destroy == 0) return false;   // hook never installed; do not fabricate a destruction
     GameWorld* w = (GameWorld*)coop::WorldPtr();
     if (w == 0) return false;
+    // T-831 - the dialogue window keeps a character of the conversation it shows and calls it every frame; a conversation
+    // that names this object ends first, while the object still exists (address compares; nothing happens otherwise).
+    TalkWindowBeforeRemove(obj);
     // F337 - the layout fact this line rests on, stated rather than warned about. (F336 put a
     // warning here about a "properly typed conversion" applying a base-class offset; that hazard is
     // not expressible - the parameter is `void*`, from which every cast form is a reinterpret.)
@@ -636,7 +646,7 @@ std::string TownRepopCommand(const std::string& arg)
     else if (!arg.empty() && arg != "show") return "error townrepop: usage `townrepop on|off|show`";
     const std::string s = std::string("ok townrepop ") + (InterlockedCompareExchange(&g_repopForceOn, 0, 0) != 0 ? "on" : "off")
                         + " forced=" + S(g_repopForced) + " asked=" + S(g_repopTown);
-    DebugLog("[P032] " + s);
+    SW_DEVLOG("[P032] " + s);
     return s;
 }
 
@@ -652,13 +662,13 @@ void SetWorldGenMode(int mode)
                              "OFF - ALL FOUR hooks refuse. Note the upstream three change WHICH code"
                              " paths run, not just what they produce (F271), so a failure in this"
                              " mode is harder to attribute than one in LEAF.";
-    DebugLog(std::string("[P032] worldgen ") + what
+    SW_DEVLOG(std::string("[P032] worldgen ") + what
              + " | NOTE: characters that already exist are NOT removed by this.");
 }
 
 void ReportWorldGen()
 {
-    DebugLog(std::string("[P032] REPORT mode=")
+    SW_DEVLOG(std::string("[P032] REPORT mode=")
              + (g_worldGenOn == kGenOn ? "on" : (g_worldGenOn == kGenLeaf ? "leaf" : "off"))
              + " charCreated=" + S(g_charCreated)
              + " charForBuilding=" + S(g_charForBld)
@@ -696,6 +706,13 @@ void ReportWorldGen()
              + " destroySelf=" + S(coop::DespawnSelfReentryCount())
              + " destroyUnloadedOurs=" + S(g_destroyUnloadedOurs)
              + " destroyUnloadedAll=" + S(g_destroyUnloadedAll)
+             // An object destroyed at a registered row's address that was not that row's character: the
+             // row was finished and nothing was announced - another character there (destroyAddrReusedChar)
+             // or no character at all (destroyAddrReusedNotChar); a dead row with no stored handle is not
+             // answered (destroyDeadNoHandle). None is part of destroyOurs.
+             + " destroyAddrReusedChar=" + S(coop::DestroyAddrReusedCharCount())
+             + " destroyAddrReusedNotChar=" + S(coop::DestroyAddrReusedNotCharCount())
+             + " destroyDeadNoHandle=" + S(coop::DestroyDeadNoHandleCount())
              // F337 - `markDestroyedDeclined` used to be printed here, three lines below a comment
              // complaining that a correction printed in a different log line from the number it
              // corrects is still misleading. Its siblings (`stalePointers`, `retired`, `falseGone`)
@@ -706,7 +723,7 @@ void ReportWorldGen()
              + " pop=" + S(g_tidPop)
              + " repop=" + S(g_tidRepop)
              + " main=" + S((long long)::GetCurrentThreadId()));
-    DebugLog("[P032]   |  P8e (build/read-host-audit.md C4): the leaf gate's no-map arm no longer asks the session role.  gatedNoMap is printed as leafRefusedNoMap and allowedNoMapHost is RETIRED - a readout should write ABSENT for it and not zero.  P97 (owner 334 a / 337 a): allowedNoMapFallback is RETIRED with the bounded no-map wait - a readout should write ABSENT for it and not zero.  leafRefusedNoMap is every creation refused because there was no fresh area map, on EVERY game whatever its slot (the player's own faction still passes, counted in charPlayerPass); world population freezes during an outage and resumes when the map is back.");
+    SW_DEVLOG("[P032]   |  P8e (build/read-host-audit.md C4): the leaf gate's no-map arm no longer asks the session role.  gatedNoMap is printed as leafRefusedNoMap and allowedNoMapHost is RETIRED - a readout should write ABSENT for it and not zero.  P97 (owner 334 a / 337 a): allowedNoMapFallback is RETIRED with the bounded no-map wait - a readout should write ABSENT for it and not zero.  leafRefusedNoMap is every creation refused because there was no fresh area map, on EVERY game whatever its slot (the player's own faction still passes, counted in charPlayerPass); world population freezes during an outage and resumes when the map is back.");
 }
 
 void InstallWorldGen()
@@ -736,7 +753,7 @@ void InstallWorldGen()
                                ? (unsigned long long)((uintptr_t)t[i].got - imgBase) : 0ull;
         // gog1 fold: the address IS the table row (expect), so a MATCH/MISMATCH verdict here could never fail; whether
         // the table describes this executable is AddrInit's gate. The line names the row's value and the table.
-        DebugLog(std::string("[P032] ") + t[i].name + " = " + H((unsigned long long)t[i].got)
+        SW_DEVLOG(std::string("[P032] ") + t[i].name + " = " + H((unsigned long long)t[i].got)
                  + " rva=" + H(rva) + " (the loaded table's row " + H(t[i].expect) + ", table '" + coop::AddrTableName() + "')");
     }
 

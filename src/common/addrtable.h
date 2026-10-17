@@ -60,7 +60,7 @@ enum AddrKind
 
 const int kAddrNameMax  = 48;   /* including the terminator */
 const int kAddrBytesMax = 16;
-const int kAddrMaxEntries = 512;
+const int kAddrMaxEntries = 1024;   /* rows a table may hold; a table with more is refused whole at load (the suite checks every shipped table against it) */
 
 struct AddrEntry
 {

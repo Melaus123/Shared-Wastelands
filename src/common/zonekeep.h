@@ -292,6 +292,8 @@ struct KeepStats
     int doors;           /* doors kept with their buildings */
     int leftOut;         /* names, layout names, uniforms, crafters or values the KEPT row cannot carry: left out (the rest of the piece is kept) */
     int inputsLeftOut;   /* input stocks past kMaxInputs: left out */
+    std::set<std::string> worldTowns;   /* the towns (TownHandText) that buildings no player owns name: world towns, where townkeep.h
+                                           never joins a kept piece to an outpost by distance nor makes an outpost (a bought house) */
     KeepStats() : listed(0), kept(0), items(0), nodes(0), nobody(0), writerUnknown(0), ambiguous(0), noState(0), sharedState(0), noKey(0),
                   hostMissing(0), bagItems(0), innerItems(0), nestedBags(0), flattened(0), fieldsFixed(0), packSplit(0), itemsOverCap(0), doors(0),
                   leftOut(0), inputsLeftOut(0) {}
@@ -598,6 +600,17 @@ inline void MatsOf(const Rec& r, std::vector<KeptMat>* out)
     }
 }
 inline std::string HandleKey(int s, int i, int c) { return ZkNum(s) + "/" + ZkNum(i) + "/" + ZkNum(c); }
+/* a town's five handle words (townTYPE, townC, townCS, townI, townS) as one text: the form a set of towns holds */
+inline std::string TownHandText(const int* h) { return ZkNum(h[0]) + "/" + ZkNum(h[1]) + "/" + ZkNum(h[2]) + "/" + ZkNum(h[3]) + "/" + ZkNum(h[4]); }
+/* the town a state record names (Building +0x90 when it was saved): 1 with its handle words in h; 0 = none (no townTYPE, or townC,
+   townCS, townI and townS all zero) */
+inline int TownHandOf(const Rec& r, int* h)
+{
+    for (int i = 0; i < 5; ++i) h[i] = 0;
+    if (r.ints.find("townTYPE") == r.ints.end()) return 0;
+    h[0] = RecInt(r, "townTYPE", 0); h[1] = RecInt(r, "townC", 0); h[2] = RecInt(r, "townCS", 0); h[3] = RecInt(r, "townI", 0); h[4] = RecInt(r, "townS", 0);
+    return (h[1] | h[2] | h[3] | h[4]) != 0 ? 1 : 0;
+}
 
 /* THE PIECES A PLAYER OWNS in one parsed area record, appended to *out. writerSlot = the slot the area record's writer holds (its
    .meta owner field; -1 = not known): the player faction's own id in the record names that player. A piece is kept when its state
@@ -653,7 +666,15 @@ inline bool ExtractKeptPieces(const Container& c, int writerSlot, std::vector<Ke
         if (IsWorldNodeTemplate(in.target)) { ++st->nodes; continue; }
         if (slot == coopslot::kOwnerNoViewer) { ++st->writerUnknown; continue; }
         if (slot == coopslot::kOwnerLegacy) { ++st->ambiguous; continue; }
-        if (slot < 0) { ++st->nobody; continue; }
+        if (slot < 0)
+        {
+            ++st->nobody;
+            int th[5];
+            const std::string oid = RecStr(r, "owner faction ID");
+            const bool npcOwned = !oid.empty() && oid.compare(0, ::strlen(coopslot::kStandInPrefix), coopslot::kStandInPrefix) != 0;
+            if (npcOwned && TownHandOf(r, th) != 0) st->worldTowns.insert(TownHandText(th));   /* a building a non-player faction owns names a world town (an empty or player-form owner id never does) */
+            continue;
+        }
         KeptPiece p;
         p.key = keyOfState[s];
         if (p.key.empty()) { ++st->noKey; continue; }

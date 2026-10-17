@@ -49,6 +49,7 @@
 #include "../common/keptwire.h"   /* KEPT: the kept box contents and where each kept item goes (ItKeptLayItems) */
 #include "../common/ownerroute.h"  /* M7b slice 2: ItemMoveSenderOk, AddrOwnerSlotOf */
 #include "../common/copykeep.h"    /* cell1: KitFirstFreeCell - the engine's first-free-cell rule, shared with clothing.cpp */
+#include "../common/celldrift.h"   /* T-172 inc: the copy's cell-drift repair and the leftover test, shared with the offline suite */
 #include "ai_spike.h"                /* inv5: GetCharacterAI - groundtest pick's order */
 #include "game/AITaskSystem.h"  /* inv5: AITaskSytem::issueOrder */
 #include "../common/holdwire.h"    /* P105 build 2: HOLD / LAND - the trailers, the absorb rule, where a LAND goes, the answers */
@@ -57,6 +58,7 @@
 #include "../common/ownpick.h"      /* an item this game's own player lifts out of a container this game writes: its removal goes out at once */
 #include "../common/givelate.h"   /* give1: the late-give removal, the cancel refunds and the confirmdelay lever's parse */
 #include "../common/showmove.h"   /* T-164 non-shop road: a move with the other game's character / box / pack shows at once */
+#include "../common/handrec.h"   /* T-889 step 2: the hand-over record pp.handover */
 #include "../common/itemescrow.h"   /* inv7c: the escrow's pure decisions (an interrupted TAKE is never rolled back blindly) */
 #include "../common/ownrec.h"   /* inv7c: the ledger names (ownstore.h only forward-declares LedgerEntry) */
 #include "relations.h"   /* inv6: RelationsWireSid - the owner's faction as a name both games understand */
@@ -67,6 +69,8 @@
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "policy.h"   /* E36 / decision 40: BoxAccessAllowed's answer comes from here */
 #include "spawn.h"          // FindSpawnedUid / FindSpawned - the uid mirror (address compares only, any thread)
+#include "speech.h"         /* T-808 TEST-ONLY: LeverNearestNamed - cursortest name:<Name> / deadname:<Name> */
+#include "../common/saywire.h"   /* T-808 TEST-ONLY: coopsay::TalkPersonKey - the name key those forms match by */
 #include "clothing.h"         /* T-1 B2: CaptureGarments / GarmentSummary - the pack wearers' MSG_CLOTHING after a wandering restock */
 #include "../common/tradecharge.h"   /* T-164 B4-1: the charge arithmetic and the keeper lever's affordable pick - shared with the offline suite */
 #include "../common/shopstock.h"   /* T-164 B4-4: shop recognition by the trader's home pieces, the piece by item record, the keeper's pot */
@@ -81,6 +85,7 @@
 #include "../common/presence.h"   /* M11 C1: is another player in this world - the old link or the roster (PresenceDecide) */
 #include "combat.h"         // ground5 fold 2: ReadAnimalAge01 - the animaldrop lever's animal test
 #include "ownstore.h"       /* mmo1: OwnNoteCharChange; mmo1b: OwnWriterOn, OwnMarkCharDirtyNow */
+#include "soak.h"          /* T-889 step 2: GameplayRunning - a hand-over is asked and answered only in a running world */
 #include "net/session.h"    // net::IsUidMine, net::SendItemMove
 /* T-1 B3 restructure (protocol 89): MSG_KEEPER retired - a squad's money rides MSG_SQUAD_LEAD (handoff.cpp) */
 #include "../common/squadlead.h"   /* T-1 B3 fold: KeeperUndoDecision / KeeperUndoTarget / SettledPotValue - offline-tested */
@@ -91,6 +96,7 @@
 #include "../common/capturewire.h"   /* P11: MSG_CAPTURE / MSG_CAPTURE_DONE */
 #include "zones.h"          // E22c: SectorOf / AreaViewTS - WHICH GAME holds a box's patch of map; LoadedBuildings - the key resolver's walk
 #include "../common/writerladder.h"   /* B9: WHICH GAME WRITES THIS BOX - the pure rule, shared with the offline suite */
+#include "../common/walkdrop.h"   /* T-609 part 2 (H4): a building the mod dismantles leaves the memoised building list at once */
 #include "doors.h"          /* P8e-b (review-p8e C-1): DoorsOnZoneDeactivate - ONE hook, TWO subscribers.  The door registry holds raw Building pointers too, so it needs the same invalidation this file's deactivate detour already raises for the box cache */
 #include "coop_log.h"
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
@@ -110,6 +116,8 @@
 #include <string>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>   /* T-889 step 2: strtoul */
+#include <ctime>     /* T-889 step 2: a hand-over line's time */
 #include <cmath>     /* B1 PROBE P068: sqrt / atan2 */
 #include <map>       /* B1 PROBE P068: nearlist's per-class count */
 #include <algorithm> /* PROBE P085: researchlist's sorted zone-walk membership test */
@@ -144,7 +152,7 @@ void DeadlookNoteItemTouch(unsigned int uid, const std::string& section);   /* d
 void GarmentsNoteOwnerMove(unsigned int uid, const std::string& section, int op);   /* T-293 fold 1 (F1): appearance.cpp (coop::, declared in appearance.h) */
 bool CopyOwnerSaysKo(unsigned int uid);   /* P11 fold 1: medical.cpp - the owner's last STATE said knocked out */
 unsigned int KoSelfLastUid();   /* P11 fold 1: appearance.cpp - the last `koself` target on this game (0 = none) */
-int GroundAnimalAppPod(::Character* c);          /* ground5 fold 3: appearance.cpp (coop::) - 1 animal (vtable holds 0x539C50), 0 not, -1 unreadable */
+int GroundAnimalAppPod(::Character* c);          /* appearance.cpp (coop::) - the P10 animal test (appearance vtable == AppearanceAnimalVt): 1 animal, 0 not, -1 unreadable */
 std::string GroundRaceName(::Character* c);      /* ground5 fold 3: appearance.cpp (coop::) - the race record's name */
 namespace {
 
@@ -782,6 +790,7 @@ long long g_reqRefOutOfRange = 0, g_reqRefFault = 0, g_reqRefBadDir = 0, g_reqRe
    answer arrives; 32 rows at 10 s each is far more history than a confirmation can plausibly be late by. */
 long long g_reqSendFailed = 0, g_reqPendingFull = 0, g_reqRefusedHere = 0;
 long long g_reqUnknownIdLate = 0, g_reqUnknownIdForeign = 0, g_refundAfterCompletion = 0;
+long long g_confirmRefusedAnswered = 0, g_requestRefusedAnswered = 0, g_confirmRefusedLeft = 0;   /* an unreadable answer / request, answered at once */
 /* P7q (review-p7g H-1) - ONE COUNTER COVERED TWO OUTCOMES AND THE ERRORLOG WAS FALSE IN THE COMMONER OF THEM.
    The late CONFIRM returns before ItTakerAnswer, so the holder never hears MSG_ITEM_PLACED and its own row
    lapses on the same 10 s clock, armed slightly LATER than ours - so its timeout is guaranteed to fire after
@@ -835,6 +844,17 @@ long long g_grPutNoTaker = 0;   /* ground5 fold 1 (F1): a ground PUT naming no t
 // The owner's rollback book-keeping, and the two GUI detours' own thread census.
 long long g_placedRecv = 0, g_placedUnknownId = 0, g_placedWrongPeer = 0;
 long long g_revokeRecv = 0, g_revokeUnknownId = 0, g_ownerPendFull = 0, g_heldDeferredSent = 0;
+/* T-853: the owner's REVOKE of a GIVE it granted. g_revokeOwner: 0 builtRemoved (the object it built, found in its section and
+   that quantity removed), 1 builtNotFound (not in that section any more, or not removable - nothing destroyed), 2 builtNone (no
+   object was recorded: it merged into a stack at the build - nothing destroyed). g_revokeKeeper (coopgive::RevokeKeeperAction):
+   0 keeperUndone, 1 keeperLeftToRunner (a copy here), 2 keeperKeptNotRemoved (the item stayed, so did the payment). */
+long long g_revokeOwner[3] = { 0, 0, 0 }, g_revokeKeeper[3] = { 0, 0, 0 };
+/* T-889: a give between players across a drop or a reconnect (REPORT itemGiveAway). 0 revokeByPlayer (a REVOKE found its GIVE row
+   by the giver's player - it came from a new connection id), 1 standHeldAway (a GIVE row's stand clock held while its giver was
+   away - once per row), 2 stoodAfterAway (such a row stood after all), 3 revokeHeldLinkDown (a kept REVOKE's clock held while the
+   game it goes to was not reachable - once per kept REVOKE). T-889 step 2 (owner 896 b): 4 syncReleased (a GIVE row whose giver was away
+   stopped holding its character's / box's syncing - once per row). */
+long long g_giveAway[5] = { 0, 0, 0, 0, 0 };
 long long g_thrPickMain = 0, g_thrPickOff = 0, g_thrPlaceMain = 0, g_thrPlaceOff = 0;
 long long g_seenPickup = 0, g_seenPlace = 0, g_pickupNoCursor = 0;
 // ---- E22b-3 counters (P6i): THE STACK DRAG ----
@@ -3935,7 +3955,7 @@ void P133ChargeLine(const ItChargeArm* a, int haveAfter, int after, int charge, 
             }
         }
     }
-    DebugLog("[PROBE] P133 charge-end #" + N(g_p133ChargeLines)
+    SW_DEVLOG("[PROBE] P133 charge-end #" + N(g_p133ChargeLines)
              + " route=" + std::string(a->route == tradecharge::kRouteDrag ? "drag" : "rclick")
              + " icGate=" + std::string(a->route == tradecharge::kRouteDrag ? "n/a" : P133GateWord(g_p133IcGate))
              + " buyer=" + N((long long)a->uid)
@@ -4390,6 +4410,14 @@ int ItFrontEndUp()
 // thread that invalidates it need not be the thread that reads it.
 void* g_boxWalkList[kBoxWalkCap];
 int g_boxWalkN = 0;
+/* T-609 part 2 (H4): THE BUILDINGS THIS MOD HAS JUST DISMANTLED (ItemsBuildingGone). Each is dropped from the list above at once and
+   kept out of every fresh walk for walkdrop::kGoneKeepDrains drains: the engine frees it from its kill list a frame later, while
+   the list's generation only moves at the next drain. g_bldGoneDrain counts drains (ItemsTickDrain). MAIN THREAD. */
+walkdrop::GoneRow g_bldGoneRows[walkdrop::kGoneCap];
+int g_bldGoneN = 0, g_bldGoneNext = 0;
+long long g_bldGoneDrain = 0, g_bldGoneCalls = 0, g_bldGoneDropped = 0, g_bldGoneFiltered = 0;
+volatile LONG64 g_bldGoneOffMain = 0;
+volatile LONG64 g_bldGoneNotDismantled = 0;   /* fold 1 (F4): dismantles that faulted or did not take the building down - left listed */
 long long g_boxWalkListGen = -1;
 int g_boxWalkLastTrunc = 0;   /* build1-e (recheck-build1d F2): the last fresh walk could not list everything (truncated or unsettled) */
 int g_boxLastVerdict = 0;     /* build1-e: why the last ItBoxResolve returned what it did (items.h kObjKey*) */
@@ -4426,7 +4454,13 @@ int ItBoxWalkNow()   /* a FRESH walk; it also becomes this generation's memo */
         int trunc = 0;
         zonesSeen = 0;
         ++g_boxResolveWalks;
-        const int n = LoadedBuildings(g_boxWalkList, kBoxWalkCap, &zonesSeen, &trunc);
+        int n = LoadedBuildings(g_boxWalkList, kBoxWalkCap, &zonesSeen, &trunc);
+        if (n > 0 && g_bldGoneN > 0)   /* T-609 (H4): a building this mod dismantled in the last drains stays out */
+        {
+            const int kept = walkdrop::WalkListDropRecent(g_boxWalkList, n, g_bldGoneRows, g_bldGoneN, g_bldGoneDrain, walkdrop::kGoneKeepDrains);
+            g_bldGoneFiltered += (long long)(n - kept);
+            n = kept;
+        }
         if (trunc != 0) ++g_walkTruncated;
         g_boxWalkZonesSeen += (long long)zonesSeen;
         if (g_boxWalkGen == gen0)
@@ -4606,6 +4640,12 @@ void ItFurnMarkStale(int why)
     if (why == 1) ++g_furnStalePlaced;
     else if (why == 2) ++g_furnStaleCopy;
     else ++g_furnStaleComplete;
+}
+/* ANY THREAD: ItLevelCall for the other files (clothing.cpp reads a fitted robotic limb's level with it). */
+int ItItemLevel(void* item, int* out)
+{
+    if (item == 0 || out == 0) return 0;
+    return ItLevelCall(item, out);
 }
 namespace {   /* the same unnamed namespace, reopened (T-454) */
 /* review-par1 1b: A ROW IS RE-RESOLVED THROUGH THE ENGINE, AND THE OBJECT IS NEVER READ FIRST. A chest dismantled, destroyed
@@ -6237,7 +6277,7 @@ int ItBoxMoveFromBytes(const std::vector<char>& b, ItemMoveMsg* m)
 // PENDING REQUESTS. A fixed table, main thread only, no allocation. Ten seconds and no retry: a timed-out
 // request leaves the item where the revert put it, which is where it was before the player touched it.
 const int kPendCap = 32;
-const unsigned int kPendTimeoutMs = 10000;   // the plan's 10 s
+const unsigned int kPendTimeoutMs = coopgive::kGiverLapseMs;   // the plan's 10 s - the owner's GIVE stand window is defined as twice it
 struct ItPending
 {
     int used;
@@ -6289,6 +6329,11 @@ struct ItPending
     /* 1 = a GIVE of units split off our own stack: localItem is that stack and `quantity` the units - a yes that finds them still on
        the stack takes exactly those units off it, never the whole stack */
     int giveUnits;
+    /* T-889 step 2: a GIVE's hand-over line (pp.handover) - hdLine 1 = a held line stands for this give; hdMe the giver's slot (the
+       transfer is hdMe / id / hdMe), hdOther the owner's */
+    int hdLine;
+    int hdMe, hdOther;
+    int hdNoLine;   /* T-889 fold 1 (review 6): no line (the records writer is off), but the owner is still told CLOSED at settlement */
     /* T-1 B3 fold (M2), T-215 B4-2: decided when the engine MOVED THE MONEY (ItKeeperResolveAtMove, from the building resolved at
        ItCrossTransfer's gate, before the put-back; ItKeeperApply copies it here) - keeperRan 1 = this game ran the counter's keeper
        then, so its own engine moved that REAL pot; keeperUid (the keeper's uid, a runner's or a copy's; 0 = none) / keeperPot (a
@@ -6336,6 +6381,13 @@ struct ItPending
        that has to wait, or falls to the ground, knows where the box stood even when the box no longer resolves */
     float showBoxPos[3];
     int showBoxPosOk;
+    /* T-853: set by ItShowSettle - a GIVE's escrow did NOT end somewhere real (kept alive in no inventory, parked for our box, a
+       faulted put-back, or destroyed): its lapse then sends no REVOKE (ItLapseRevoke) and a late yes takes the old road */
+    int showNotBack;
+    /* T-853: a GIVE's quality and level as sent (sentFieldsOk 1 = recorded) - a late yes's square test compares them */
+    int sentFieldsOk;
+    float sentQuality;
+    int sentLevel;
 };
 ItPending g_pend[kPendCap];
 /* T-215 B4-2: THE COUNTER'S KEEPER AS IT WAS WHEN THE ENGINE MOVED THE MONEY (ItKeeperResolveAtMove). `bld` / `keeper` are valid only
@@ -6646,6 +6698,7 @@ struct ItLapsed
     ItBagPath localBag;   /* bag23 part 2: carried across from ItPending - our half inside a pack */
     int localIsBox;                     /* T-164 211: carried across from ItPending - our half is a box, named by its key */
     char localBoxKey[kBoxKeyCap];
+    int ghostIsBox;                     /* T-889 fold 4 (G1): carried across from ItPending - a late take's in line names its kind (box / take) */
     /* P7y (F572): carried across from ItPending so the late removal can be exact. */
     void* localItem;
     int quantity;
@@ -6659,6 +6712,12 @@ struct ItLapsed
     /* T-164 fold: LOW-a - a merged take (owner 212) joins the stack on a late yes; M1 - the give's row no longer names its object */
     int showMerge;
     int showWhere;
+    int answeredNo;             /* the holder was told no at once (its answer was unreadable here): a later copy of that answer changes nothing */
+    int revokedAtLapse;         /* T-853: a GIVE whose lapse sent the owner a REVOKE (answeredNo is set too): a late ok only re-sends it */
+    int showNotBack;            /* T-853: the lapse's put-back is not proven back here (kept in no inventory, faulted, or the other game has it) */
+    int sentFieldsOk;           /* T-853: the quality and level the GIVE sent (ItPending's), for the late yes's square test */
+    float sentQuality;
+    int sentLevel;
 };
 static const int kLapsedCap = 32;
 ItLapsed g_lapsed[kLapsedCap];
@@ -6674,11 +6733,14 @@ void ItLapsedNote(const ItPending& p, int refunded, int refundPay)
     std::memcpy(r.localSection, p.localSection, kSecCap);   /* both are char[kSecCap] and the writer terminates them */
     r.localBag = p.localBag;   /* bag23 part 2 */
     r.localIsBox = p.localIsBox; std::memcpy(r.localBoxKey, p.localBoxKey, kBoxKeyCap);   /* T-164 211 */
+    r.ghostIsBox = p.ghostIsBox;   /* T-889 fold 4 (G1) */
     r.localX = p.localX; r.localY = p.localY;
     std::memcpy(r.baseSid, p.baseSid, kSidCap);
     r.bagSent = p.bagSent; r.bagDigest = p.bagDigest;   /* give1 */
     r.ownerLocal = p.ownerLocal; std::memcpy(r.ownerLocalRaw, p.ownerLocalRaw, sizeof(r.ownerLocalRaw));   /* inv7c fold */
     r.showMerge = p.showMerge; r.showWhere = p.showWhere;   /* T-164 fold (LOW-a, M1): kept by ItShowSettle, which ran first */
+    r.sentFieldsOk = p.sentFieldsOk; r.sentQuality = p.sentQuality; r.sentLevel = p.sentLevel;   /* T-853 */
+    r.showNotBack = p.showNotBack;   /* T-853: set by ItShowSettle, which ran first */
     g_lapsedNext = (g_lapsedNext + 1) % kLapsedCap;
 }
 /* T-215: what a lapsed request's refund really moved, for the late-confirm lines ("<n> cats" or "nothing"). */
@@ -6699,8 +6761,144 @@ ItPending* ItPendAlloc()
         if (g_pend[i].used == 0) { std::memset(&g_pend[i], 0, sizeof(ItPending)); g_pend[i].used = 1; return &g_pend[i]; }
     return 0;
 }
+/* T-853: SILENCE MEANS 'CANCELLED' ON BOTH GAMES. The giver's GIVE request lapses after 10 s and its item is put back here; the
+   owner's GIVE row used to stand at its own 10 s, so a confirm that never landed left the item on both games. Now the giver tells
+   the owner at once: the moment a GIVE lapses (coopgive::LapseRevoke) a REVOKE goes out and the lapsed note is marked answered,
+   so a late yes for that id changes nothing here; the owner's row lives coopgive::kOwnerGiveStandMs (twice the lapse) of the
+   giver's time in the world, and is found by the giver's player and the request id, so the REVOKE finds it after a drop or a
+   reconnect too (T-889). A REVOKE that could not be handed to the link (any road: this one, a refused confirm, a late give, a
+   cancel) is kept in a small list and tried again every coopgive::kRevokeRetryMs from the items tick, for at most
+   coopgive::kRevokeKeepMs of time the game it goes to is reachable (T-889: the clock is held while it is not) - a recurring
+   check, never a one-shot timer. Main thread only, no allocation.
+   g_lapseRevoke: 0 revokeAtLapse (sent at once), 1 revokeAtLapseUnsent (kept for a re-send), 2 lateYesAfterRevoke (a yes for
+   an id already revoked - nothing done), 3 revokeKept (any unsent REVOKE listed), 4 revokeResent, 5 revokeResendGaveUp,
+   6 revokeListFull (not kept - the list was full), 7 lapseNoRevoke (a sale whose lapse refund moved nothing: the late-yes road),
+   8 lapseNotBack (the item did not come back anywhere real - no REVOKE, the late-yes road), 9 lateOkReRevoke (a late ok for an id
+   already revoked: the REVOKE sent again - the ok proves the owner's row exists now). */
+long long g_lapseRevoke[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+struct ItRevokeKeep
+{
+    unsigned int id;            /* 0 = a free row */
+    unsigned int at;            /* GetTickCount when it was kept */
+    unsigned int lastTry;       /* GetTickCount of the last try */
+    unsigned int upMs;          /* T-889: its age - counted only while the game it goes to is reachable (coopesc::QuietStep) */
+    unsigned int stepAt;        /* T-889: GetTickCount of the last step of upMs */
+    int heldSaid;               /* T-889: the hold was logged for this entry */
+};
+static ItRevokeKeep g_revokeKeep[coopgive::kRevokeListCap];
+static bool ItLapseRevokeSay(long long n) { return n <= 5 || (n % 50) == 0; }
+/* MAIN THREAD: a REVOKE for `id` could not be handed to the link - kept for the re-send. */
+static void ItRevokeListNote(unsigned int id)
+{
+    if (id == 0) return;
+    int slot = -1;
+    for (int i = 0; i < coopgive::kRevokeListCap; ++i)
+    {
+        if (g_revokeKeep[i].id == id) return;   /* already kept */
+        if (slot < 0 && g_revokeKeep[i].id == 0) slot = i;
+    }
+    if (slot < 0)
+    {
+        ++g_lapseRevoke[6];
+        if (ItLapseRevokeSay(g_lapseRevoke[6]))
+            ErrorLog("[ITEMS] revoke " + N((long long)id) + " could not be sent and the re-send list is full - it is NOT kept; the owner's"
+                     " copy may stand beside ours. Counted itemGiveLapse revokeListFull.");
+        return;
+    }
+    const unsigned int now = ::GetTickCount();
+    g_revokeKeep[slot].id = id;
+    g_revokeKeep[slot].at = now;
+    g_revokeKeep[slot].lastTry = now;
+    g_revokeKeep[slot].upMs = 0;
+    g_revokeKeep[slot].stepAt = now;
+    g_revokeKeep[slot].heldSaid = 0;
+    ++g_lapseRevoke[3];
+    if (ItLapseRevokeSay(g_lapseRevoke[3]))
+        DebugLog("[ITEMS] revoke " + N((long long)id) + " could not be sent (no link) - kept and tried again every "
+                 + N((long long)coopgive::kRevokeRetryMs) + " ms for up to " + N((long long)(coopgive::kRevokeKeepMs / 1000))
+                 + " s of time the game it goes to is reachable. Counted itemGiveLapse revokeKept.");
+}
+/* MAIN THREAD, once per tick (ItPendExpire): each kept REVOKE is tried again; one handed to the link, or kept too long, leaves. */
+static void ItRevokeResendTick(unsigned int now)
+{
+    for (int i = 0; i < coopgive::kRevokeListCap; ++i)
+    {
+        ItRevokeKeep& k = g_revokeKeep[i];
+        if (k.id == 0) continue;
+        {   /* T-889: the entry's clock runs only while the game the REVOKE goes to (the one request id was asked of) is reachable */
+            const int here = StorePeerHere(cooplive::PlayerKeyOf(0u, net::ItemAskedSlot(k.id)));
+            k.upMs = coopesc::QuietStep(k.upMs, (unsigned int)(now - k.stepAt), here, coopesc::kQuietDtCapMs);
+            k.stepAt = now;
+            if (coopgive::AwayHoldFirst(here, k.heldSaid) != 0)
+            {
+                k.heldSaid = 1;
+                ++g_giveAway[3];
+                if (ItLapseRevokeSay(g_giveAway[3]))
+                    DebugLog("[ITEMS] revoke " + N((long long)k.id) + " is kept while the game it goes to is not reachable - its "
+                             + N((long long)(coopgive::kRevokeKeepMs / 1000)) + " s clock is held at " + N((long long)(k.upMs / 1000))
+                             + " s until that game is back. Counted itemGiveAway revokeHeldLinkDown.");
+            }
+        }
+        if ((unsigned int)(now - k.lastTry) < coopgive::kRevokeRetryMs) continue;
+        k.lastTry = now;
+        const int sent = net::SendItemRevoke(k.id) ? 1 : 0;
+        const int act = coopgive::RevokeRetryAction(sent, k.upMs, coopgive::kRevokeKeepMs);
+        if (act == coopgive::kRvKeep) continue;
+        if (act == coopgive::kRvDone)
+        {
+            ++g_lapseRevoke[4];
+            ++g_revokeSent;
+            if (ItLapseRevokeSay(g_lapseRevoke[4]))
+                DebugLog("[ITEMS] revoke " + N((long long)k.id) + " re-sent after " + N((long long)((now - k.at) / 1000))
+                         + " s - the link is back. Counted itemGiveLapse revokeResent.");
+        }
+        else
+        {
+            ++g_lapseRevoke[5];
+            if (ItLapseRevokeSay(g_lapseRevoke[5]))
+                ErrorLog("[ITEMS] revoke " + N((long long)k.id) + " could not be sent for " + N((long long)(coopgive::kRevokeKeepMs / 1000))
+                         + " s while the game it goes to was reachable - dropped; the owner's GIVE row has stood by now, so its copy may"
+                         " be beside ours. Counted itemGiveLapse revokeResendGaveUp.");
+        }
+        k.id = 0;
+    }
+}
+/* MAIN THREAD, from ItPendExpire, AFTER ItShowSettle (which sets p.showNotBack) and ItLapsedNote: a lapsed GIVE tells its owner at
+   once (see above) - only when its item is back somewhere real (its cell, the section, the pack, the ground). */
+static void ItLapseRevoke(const ItPending& p, int refunded)
+{
+    if (p.id == 0) return;
+    const int backReal = (p.showNotBack == 0) ? 1 : 0;
+    if (coopgive::LapseRevoke(p.dir, p.trade, refunded, p.takeOneConsume, backReal) == 0)
+    {
+        if (coopgive::LapseRevoke(p.dir, p.trade, refunded, p.takeOneConsume, 1) != 0)
+        {   /* a REVOKE now would leave the item on neither game: the owner's give stands, a late yes takes the old road */
+            ++g_lapseRevoke[8];
+            if (ItLapseRevokeSay(g_lapseRevoke[8]))
+                ErrorLog("[ITEMS] give " + N((long long)p.id) + " (" + std::string(p.baseSid) + ") lapsed with no answer, and our item did"
+                         " not come back anywhere real (kept alive in no inventory, parked for our box, or a faulted put-back) - NO"
+                         " revoke: the owner's copy is left to stand, and a late yes takes the old road. Counted itemGiveLapse lapseNotBack.");
+        }
+        else if (p.dir == 1 && p.takeOneConsume == 0) ++g_lapseRevoke[7];
+        return;
+    }
+    ItLapsed* lp = const_cast<ItLapsed*>(ItLapsedFind(p.id));
+    if (lp != 0) { lp->answeredNo = 1; lp->revokedAtLapse = 1; }
+    const bool sent = net::SendItemRevoke(p.id);
+    if (sent) { ++g_lapseRevoke[0]; ++g_revokeSent; }
+    else { ++g_lapseRevoke[1]; ++g_revokeUnsent; ItRevokeListNote(p.id); }
+    if (ItLapseRevokeSay(g_lapseRevoke[0] + g_lapseRevoke[1]))
+        DebugLog("[ITEMS] give " + N((long long)p.id) + " (" + std::string(p.baseSid) + ") lapsed with no answer - our item is back here,"
+                 " and the owner is asked to discard any copy it built (REVOKE " + std::string(sent ? "sent" : "NOT sent - kept for a re-send")
+                 + "); a late yes for this id changes nothing. Counted itemGiveLapse revokeAtLapse"
+                 + std::string(sent ? "" : "Unsent") + ".");
+}
 /* T-164 non-shop road: defined with ItCrossTransfer, in this same unnamed namespace (the C2668 class) */
 void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed);
+void HovGiverHeld(ItPending* p, const ItemRequestMsg& rq);   /* T-889 step 2: defined with the hand-over record, in this same unnamed namespace (the C2668 class) */
+void HovGiveSettled(ItPending& p, int closed);              /* T-889 step 2: the same */
+void HovParkGive(const ItPending& p);                       /* T-889 fold 1 (review 4): the same */
+void ItPendLapseRun(ItPending& lapsed);                     /* T-889 fold 1: defined right after ItPendExpire */
 void ItShowAwaitExpire();   /* t338-f2-decl: defined with ItShowNoteHolderMove, in this same unnamed namespace (the C2668 class) */
 // MAIN THREAD, once per tick. GetTickCount wraps every 49 days; the unsigned subtraction is wrap-correct.
 void ItPendExpire()
@@ -6708,6 +6906,7 @@ void ItPendExpire()
     ItShowAwaitExpire();   /* t338-f2-tick: a yes's wait for the holder's split, bounded (coopshow::kAwaitSplitMs) */
     ShopPendExpire();   /* T-164 B4-4 intercept: the shop requests' 10 s lapse (reservation back / escrow back) and the dedupe frame */
     const unsigned int now = ::GetTickCount();
+    ItRevokeResendTick(now);   /* T-853: the REVOKEs that could not be sent, tried again */
     for (int i = 0; i < kPendCap; ++i)
     {
         if (g_pend[i].used == 0) continue;
@@ -6719,7 +6918,18 @@ void ItPendExpire()
         ItPending lapsed;
         std::memcpy(&lapsed, &g_pend[i], sizeof(ItPending));
         g_pend[i].used = 0;
+        /* T-889 fold 1 (review 4): a GIVE with a held line is not refunded at its lapse - it is parked; the owner's verdict settles it */
+        if (lapsed.dir == 1 && lapsed.showKind == coopshow::kShowGive && hovrec::GiveLapseParks(lapsed.hdLine, lapsed.trade, lapsed.takeOneConsume) != 0)
+        { HovParkGive(lapsed); continue; }
         ++g_reqTimedOut;
+        ItPendLapseRun(lapsed);
+    }
+}
+/* MAIN THREAD: a lapsed request's own road (refund, put back what showed at once, the note, a give's REVOKE) - from ItPendExpire, and
+   from a parked give the owner answered "not placed" (T-889 fold 1, review 4) */
+void ItPendLapseRun(ItPending& lapsed)
+{
+    {
         /* P7g (review-p7a M-6): the id, what it carried and whether the cats really moved - so a
            confirmation that arrives after this can be told from an answer to a request we never made. */
         /* T-164 B4-2: the exact recorded charge; the keeper's half (T-1 B3 restructure F4) inside, by the same amount */
@@ -6728,6 +6938,7 @@ void ItPendExpire()
         if (lapsed.localIsBox != 0) ++g_box211[7];   /* T-164 211 */
         ItShowSettle(lapsed, 0, 0, 1);   /* T-164 non-shop road: a lapse puts back what showed at once - BEFORE the note, which keeps where a give went */
         ItLapsedNote(lapsed, paidBack, paidPay);
+        ItLapseRevoke(lapsed, paidBack);   /* T-853: a GIVE tells its owner at once - after the note, which it marks answered */
         ItLootNoteTimeout(lapsed.id);   /* loot2c fold (3d): a loot route's request that expired - counted, its ring entry cleared, its book looked at again */
         DebugLog("[ITEMS] item request " + N((long long)lapsed.id) + " timed out after 10 s - NO retry; the item stayed where it was");
     }
@@ -7734,6 +7945,16 @@ static void ItThRegisterPieces(void* home, float hx, float hz, void* ap, const s
     }
 }
 }   /* T-164 B4-3: step out of the unnamed namespace - coop::ItTraderHomePos is called from handoff.cpp */
+/* T-799: the squad pot (KeeperPot, below in this file) and handoff.cpp's money-known mark (D1) and adoption test (D3) - in coop
+   itself, outside the unnamed namespace (the C2668 class) */
+int KeeperPot(void* character, void** ownOut, int* catsOut);
+void KeeperMoneyKnownMark(void* own, int ev);
+int KeeperMoneyKnown(void* own);
+void KeeperMoneyKnownClear();
+int SquadCatsAdoptDue(void* ap, unsigned int leader);
+void KeeperRestockToRunner(unsigned int leaderUid, int cats);   /* T-799 D4: handoff.cpp */
+void KeeperPotMismatchNote();                 /* handoff.cpp: counted on the keeperMoney report */
+int StoreMoneyDecided(void* platoon);         /* store.cpp: 1 = this group's money was decided this world (made here, or its load seen) */
 /* MAIN THREAD. 1 = `ap` is a trader squad whose formal leader `leader` has a home building whose position read: *x/*z = that
    position; 0 = not (or unreadable - the caller keeps the squad position). Answered from a 1-s cache per squad; each fresh
    positive answer re-registers the home's pieces and writes the [KEEPER] follows line once per leader uid per session. */
@@ -7781,6 +8002,7 @@ namespace {   /* the same unnamed namespace, reopened (T-164 B4-3) */
 /* MAIN THREAD, once a second from ItemsTick: every loaded NPC squad is asked once, so BOTH games register a trader home's pieces
    whether or not they run the keeper (a copy squad is never asked by the sweep or the hand-off pass) - the stock holder must not
    depend on which game happened to ask. */
+void ItKeeperRepairCheck(void* ap, void* leader);   /* T-799 D3: defined with the restock gate below */
 static DWORD g_thTickAt = 0;
 static void ItTraderHomeTick()
 {
@@ -7802,7 +8024,7 @@ static void ItTraderHomeTick()
         coop::SquadView sv;
         if (coop::ReadSquadOf(c, &sv) != 1 || !seen.insert(sv.ap).second) continue;
         float x = 0, z = 0;
-        (void)ItTraderHomePos(sv.ap, sv.platoon, (void*)sv.leader, &x, &z);
+        if (ItTraderHomePos(sv.ap, sv.platoon, (void*)sv.leader, &x, &z) == 1) ItKeeperRepairCheck(sv.ap, (void*)sv.leader);   /* T-799 D3 */
     }
 }
 /* ANY THREAD. The position a box's holder is decided by: a registered piece of a trader's home -> the home's position (x, z; y
@@ -8219,7 +8441,7 @@ void P133RestockAfter(void* ap, const P133Pre& p, int skip, int wander, char for
     L.ran = (skip == 0) ? 1 : 0; L.haveBefore = p.haveBefore; L.before = p.before; L.haveAfter = haveAfter; L.after = after;
     L.stockBefore = p.stockBefore; L.stockAfter = stockAfter; L.tick = ::GetTickCount();
     if (P133CapOk(&g_p133RestockLines[kind]) == 0) return;
-    DebugLog("[PROBE] P133 restock #" + N(g_p133RestockLines[kind]) + " leader=" + N((long long)p.uid)
+    SW_DEVLOG("[PROBE] P133 restock #" + N(g_p133RestockLines[kind]) + " leader=" + N((long long)p.uid)
              + " runHere=" + P133YN(runHere) + " home=" + P133YN(p.home != 0 ? 1 : 0)
              + " outcome=" + outcome + " wander=" + N((long long)wander) + " force=" + N((long long)force)
              + " money=" + (p.haveBefore != 0 ? N((long long)p.before) : std::string("?")) + "->"
@@ -8229,6 +8451,114 @@ void P133RestockAfter(void* ap, const P133Pre& p, int skip, int wander, char for
              + " in=" + ((haveDl != 0 && haveNow != 0) ? P133D(dl - now) : std::string("?")));
 }
 // PROBE-END: P133
+// ================= T-799 D3 (owner 793 a and its clarification): THE KEEPER REPAIR =================
+// Once a second (ItTraderHomeTick, MAIN THREAD) every trader squad with a home building is asked: when this game runs the group's
+// formal leader and holds the shop's area, a keeper whose money is not known here (D1), or whose pot is 0 while its counters hold
+// 0 items, gets the engine's own restock now - its refresh deadline is moved into the past and ActivePlatoon::update 0x4FF930
+// (`deadline <= now && now != deadline`) calls refreshInventory on its next pass, through detour_refreshInventory's gate like any
+// restock. Nothing here writes money or stock. Once per load per group (the pot); the restock that follows writes the
+// [KEEPER] restocked now line with the after-values and marks the money known.
+long long g_keeperRepairedMoneyUnknown = 0, g_keeperRepairedEmpty = 0, g_keeperRepairTimerFailed = 0;
+struct ItKeeperRepairPend { int why; unsigned int uid; std::string sid; int moneyBefore; long long stockBefore; };
+std::map<void*, ItKeeperRepairPend> g_keeperRepairPend;   /* by the pot: asked, the restock not yet run */
+std::set<void*> g_keeperRepaired;                         /* by the pot: repaired this load */
+std::set<void*> g_keeperPotMismatchSeen;                  /* by the pot: counted as not its squad's embedded pot */
+/* The items on the home's counters (keeperlist's walk). -1 = not read (off the main thread / no interior / a piece unreadable). */
+long long ItKeeperStock(void* home)
+{
+    if (home == 0 || ItOnMainThread() == 0) return -1;
+    std::vector<void*> pieces;
+    if (ItHomePieces(home, &pieces, 0) <= 0) return -1;
+    long long total = 0;
+    for (size_t i = 0; i < pieces.size(); ++i)
+    {
+        const long long c = ItInvItemCount(ItBoxInventory(pieces[i]));
+        if (c < 0) return -1;
+        total += c;
+    }
+    return total;
+}
+std::string ItKeeperStockWord(long long v) { return (v < 0) ? std::string("?") : N(v); }
+/* The engine's restock is due now: the squad's refresh deadline one game second before the clock. 1 = written. */
+int ItRestockNow(void* ap)
+{
+    void* platoon = 0; void* clockOwner = 0;
+    double now = 0.0;
+    if (g_base == 0 || kClockOwnerPtrRva == 0) return 0;
+    if (ItPtrPod(ap, kApPlatoon, &platoon) == 0 || !ItPlaus(platoon)) return 0;
+    if (ItPtrPod((const void*)(g_base + kClockOwnerPtrRva), 0, &clockOwner) == 0 || !ItPlaus(clockOwner)) return 0;
+    if (ItDoublePod(clockOwner, kClockNowOff, &now) == 0) return 0;
+    if (!(now >= 1.0) || !(now < 1e12)) return 0;   /* the same sanity bound as ItRestockDefer: a NaN or huge clock writes nothing */
+    return ItWriteDoublePod(platoon, kPlatoonRefresh, now - 1.0);
+}
+void ItKeeperRepairCheck(void* ap, void* leader)
+{
+    if (RoleIsSingle() || g_base == 0 || ItOnMainThread() == 0 || !ItPlaus(ap) || !ItPlaus(leader)) return;
+    void* own = 0; int money = 0;
+    const int potRead = (KeeperPot(leader, &own, &money) == 1) ? 1 : 0;
+    if (potRead == 0) return;
+    void* platoon = 0;
+    const int platoonRead = (ItPtrPod(ap, kApPlatoon, &platoon) != 0 && ItPlaus(platoon)) ? 1 : 0;
+    /* the pot read here must be the squad's embedded pot (Platoon +0x148), the object store.cpp marks at a load - counted once per pot */
+    if (platoonRead != 0 && own != (void*)((char*)platoon + 0x148) && g_keeperPotMismatchSeen.insert(own).second) KeeperPotMismatchNote();
+    const int repaired = (g_keeperRepaired.find(own) != g_keeperRepaired.end()) ? 1 : 0;
+    const unsigned int uid = FindSpawnedUid(leader);
+    const int runs = (uid != 0 && net::IsUidMine(uid)) ? 1 : 0;
+    if (repaired != 0 || runs == 0) return;
+    const int known = KeeperMoneyKnown(own);
+    if (known != 0 && money != 0) return;   /* a known pot with money: nothing to repair (no counter walk) */
+    void* home = ItHomeBuildingPod(leader);
+    if (home == 0) return;
+    const long long stock = ItKeeperStock(home);
+    const int decided = (platoonRead != 0 && StoreMoneyDecided(platoon) != 0) ? 1 : 0;
+    const int why = coopsquad::KeeperRepairWhy(runs, repaired, SquadCatsAdoptDue(ap, uid), potRead, decided, known, money, stock);
+    if (why == coopsquad::kKeeperRepairNone) return;
+    float hp[3] = { 0.0f, 0.0f, 0.0f };
+    const int holds = (ItBoxPosPod(home, hp) != 0 && ItAreaVerdictAt(hp, 0) == kBoxMine) ? 1 : 0;
+    if (coopsquad::KeeperRepairGo(why, holds) == coopsquad::kKeeperRepairNone) return;
+    if (ItRestockNow(ap) == 0) { ++g_keeperRepairTimerFailed; return; }   /* asked again next second */
+    g_keeperRepaired.insert(own);
+    if (why == coopsquad::kKeeperRepairMoneyUnknown) ++g_keeperRepairedMoneyUnknown; else ++g_keeperRepairedEmpty;
+    ItKeeperRepairPend pd;
+    pd.why = why; pd.uid = uid; pd.moneyBefore = money; pd.stockBefore = stock;
+    pd.sid = (platoonRead != 0) ? StoreWorldIdOf(platoon) : std::string();
+    g_keeperRepairPend[own] = pd;
+}
+/* A restock ran on this game (detour_refreshInventory): the pot's money is known (D1), and a repair asked for it is logged with the
+   values read now. */
+void ItKeeperRestockRanHere(void* ap)
+{
+    void* leader = 0;
+    if (g_base == 0 || !ItPlaus(ap) || ItPtrPod(ap, kApSquadLeader, &leader) == 0 || !ItPlaus(leader)) return;
+    void* own = 0; int money = 0;
+    if (KeeperPot(leader, &own, &money) != 1) return;
+    KeeperMoneyKnownMark(own, coopsquad::kMoneyEvRestockHere);
+    KeeperRestockToRunner(FindSpawnedUid(leader), money);   /* T-799 D4: another game runs this keeper - the money this restock set goes there */
+    std::map<void*, ItKeeperRepairPend>::iterator it = g_keeperRepairPend.find(own);
+    if (it == g_keeperRepairPend.end()) return;
+    const ItKeeperRepairPend pd = it->second;
+    g_keeperRepairPend.erase(it);
+    const long long stockAfter = ItKeeperStock(ItHomeBuildingPod(leader));
+    DebugLog("[KEEPER] restocked now: group=" + (pd.sid.empty() ? std::string("?") : pd.sid) + " leader=" + N((long long)pd.uid)
+             + " why=" + std::string(pd.why == coopsquad::kKeeperRepairMoneyUnknown ? "money-unknown" : "empty")
+             + " money " + N((long long)pd.moneyBefore) + "->" + N((long long)money)
+             + " stock " + ItKeeperStockWord(pd.stockBefore) + "->" + ItKeeperStockWord(stockAfter)
+             + " (counted keeperRepaired)");
+}
+/* A freed squad's pot (store.cpp ForgetPlatoon): a squad made later at the same address is not "repaired this load". */
+void ItKeeperRepairForgetOne(void* own)
+{
+    g_keeperRepaired.erase(own);
+    g_keeperRepairPend.erase(own);
+    g_keeperPotMismatchSeen.erase(own);
+}
+void ItKeeperRepairWorldTeardown()
+{
+    g_keeperRepaired.clear();
+    g_keeperRepairPend.clear();
+    g_keeperPotMismatchSeen.clear();
+    KeeperMoneyKnownClear();
+}
 // MAIN THREAD in every reachable case: refreshInventory's only two callers are ActivePlatoon::update 0x4FF930
 // (the timer) and RootObjectFactory::createRandomSquad 0x582F80 (the initial stocking), both of which run on
 // the engine's own update (read-shops 4, xrefs, thunk-aware). No thread probe is added for a claim nothing
@@ -8341,12 +8671,14 @@ void detour_refreshInventory(void* ap, char force)
         ItWanderRestockNote(ap);
         ItRestockAsFill(ap, force);
         ItWanderRestockNote(ap);
+        ItKeeperRestockRanHere(ap);   /* T-799 D1: the restock set the pot here */
         // PROBE-START: P133 - a wandering trader's restock ran here
         P133RestockAfter(ap, p133, 0, wander, force);   /* wandering ran */
         // PROBE-END: P133
         return;
     }
     ItRestockAsFill(ap, force);                   /* par2: the restock is a fill - its box moves are folded and pushed whole */
+    ItKeeperRestockRanHere(ap);                   /* T-799 D1 + D3: the restock set the pot here; a repair asked for it is logged */
     // PROBE-START: P133 - a shop restock ran here (or a gate read failed open)
     P133RestockAfter(ap, p133, 0, wander, force);   /* shop ran */
     // PROBE-END: P133
@@ -8468,10 +8800,28 @@ void detour_closeAllInventories(void* gui)
 // (loadWindow / staleMap / noSession / ring1Presumed and wrEntered's restock column) - stated, not hidden.
 // A SKIPPED STEP LOSES NOTHING ON THE HOLDER: the holder runs it and the made item reaches this game as an
 // ordinary box move.
-/* THE PRODUCTION WRITER, three ways (coopfarm::kProdWriter*): 1 this game, 2 another game holds it (by the owner or the area),
-   0 no answer now. An unreadable building answers 1 (fail open, as the restock gate). */
-int ItProdWriter(void* pb)
+/* T-853 #6 / #11: the slot of the game a writer answer v (kBox*, from ItBoxWriterDecide with byO) names: the owner rung's slot when
+   the owner decided it for another game, else - the area rule, or this game's own building still waiting for its hand-back - the
+   holder of the building's area (ItBoxDecidePos, AreaHolderSlotTS). -1 = v names no other game, or its slot is not known now. Also
+   that area's holder (*areaSlot when another game, *areaHere when this one). MAIN THREAD (right after the ask: g_ownVerdictSlot). */
+int ItWriterSlotFor(const float* p, const char* key, int v, int byO, int* areaSlot, int* areaHere)
 {
+    float buf[3];
+    const float* d = ItBoxDecidePos(key, p, buf);
+    const int h = AreaHolderSlotTS(SectorOf(d[0], d[2]));
+    const int me = MySlotForWire();
+    if (areaSlot != 0) *areaSlot = (h >= 0 && h != me) ? h : -1;
+    if (areaHere != 0) *areaHere = (h >= 0 && h == me) ? 1 : 0;
+    if (v != kBoxHeld) return -1;
+    if (byO != 0 && g_ownVerdictSlot >= 0 && g_ownVerdictSlot != me) return g_ownVerdictSlot;
+    return (h >= 0 && h != me) ? h : -1;
+}
+/* THE PRODUCTION WRITER, three ways (coopfarm::kProdWriter*): 1 this game, 2 another game holds it (by the owner or the area),
+   0 no answer now. An unreadable building answers 1 (fail open, as the restock gate).
+   T-853: *slot = the slot of the game a 2 names, from the same ask (ItWriterSlotFor; -1 not known). */
+int ItProdWriterSlot(void* pb, int* slot)
+{
+    if (slot != 0) *slot = -1;
     if (g_base == 0 || !ItPlaus(pb)) { ++g_prodUnreadable; return coopfarm::kProdWriterHere; }
     float p[3] = { 0.0f, 0.0f, 0.0f };
     if (ItBoxPosPod(pb, p) == 0) { ++g_prodUnreadable; return coopfarm::kProdWriterHere; }
@@ -8485,10 +8835,12 @@ int ItProdWriter(void* pb)
     /* inv4b 4: the owner's own machine waits for its building's hand-back too - with the key given, the ladder applies that
        gate itself (ItBoxWriterDecide fold 4); a key that cannot be built leaves the step ungated, as before */
     int v = ItBoxWriterDecide(pb, p, hasKey != 0 ? pk : 0, 0, &prodByO, "prod");
+    if (slot != 0) *slot = ItWriterSlotFor(p, hasKey != 0 ? pk : 0, v, prodByO, 0, 0);   /* T-853: the runner's slot, same ask */
     if (v == kBoxMine) return coopfarm::kProdWriterHere;
     if (v == kBoxHeld) return coopfarm::kProdWriterOther;
     return coopfarm::kProdWriterNone;
 }
+int ItProdWriter(void* pb) { return ItProdWriterSlot(pb, 0); }
 int ItProdHolder(void* pb) { return (ItProdWriter(pb) == coopfarm::kProdWriterHere) ? 1 : 0; }
 /* The worker path's answer, kept per building key for kProdWriterKeepMs on the main thread: a worker's step rings every frame,
    and the writer ladder books its area counters on every ask. Off the main thread it is asked directly. */
@@ -9381,7 +9733,9 @@ bool ItGiverBagSame(::InventorySection* sec, int x, int y, void* expect, unsigne
 }
 
 /* give1 counters (the itemGive1 bracket of the items REPORT line). */
+long long g_lateYesNotBackKept = 0, g_refusedNotBackKept = 0;   /* T-853: a give whose put-back is not proven back - the owner's copy kept, no revoke */
 long long g_lateGiveConfirm = 0, g_lateGiveRemoved = 0, g_lateGiveItemGone = 0, g_lateGiveItemChanged = 0;
+long long g_lateGiveSquare[2] = { 0, 0 };   /* T-853: a late yes's copy found by sid and cell after the object test failed: 0 removed, 1 no match */
 long long g_cancelSaleDebited = 0, g_cancelBuyRefunded = 0;
 long long g_cfHeldCount = 0, g_cfHeldUnsent = 0;
 
@@ -9886,6 +10240,7 @@ void ItBoxBackSettle(ItPending& p, const std::string& gid)
     if (r == -1)
     {
         ++g_showGive[6]; ++g_box211f[8];
+        p.showNotBack = 1;   /* T-853: a faulted put-back into our box - not proven back */
         ErrorLog(gid + "the put-back into our box FAULTED; the item is kept where that left it (never destroyed or added again)."
                  " Counted showGive fault, itemBoxTaker boxBackFault.");
         p.showObj = 0;
@@ -9915,6 +10270,7 @@ void ItBoxBackSettle(ItPending& p, const std::string& gid)
         if (d < 0)
         {
             ++g_showGive[6]; ++g_box211f[8];
+            p.showNotBack = 1;   /* T-853: a faulted drop at the box - not proven back */
             ErrorLog(gid + "no room in our box, and the drop at the box's position FAULTED; the item is kept where that left it."
                      " Counted showGive fault, itemBoxTaker boxBackFault.");
             p.showObj = 0;
@@ -9922,6 +10278,7 @@ void ItBoxBackSettle(ItPending& p, const std::string& gid)
         }
         /* not dropped: parked - the box may have room later, and the row's own give-up drops it */
     }
+    p.showNotBack = 1;   /* T-853: parked in no inventory (or, the list full, dropped or lost) - not proven back */
     ItBoxBackPark(p, gid);
 }
 }   /* T-164 211 fold 2: step out of the unnamed namespace for coop::ItLootOwnChars, defined in coop itself further down (the C2668 class) */
@@ -10153,7 +10510,16 @@ int ItShowMoveAbsorb(const ItPending& p, int kind, int ok, int ourHalfDone)
    is destroyed. A full CHARACTER: the copy is KEPT alive in no inventory, counted keptNoRoom (M3 - no character inventory re-sync
    road exists; MSG_PARITY_REQ is box-only). A BOX's holder is re-asked (ItParityAskOne) on EVERY refusal / lapse / our half
    failing. The same item already back in its old cell is not added twice. */
+void ItShowSettleBody(ItPending& p, int ok, int ourHalfDone, int lapsed);   /* T-889 step 2: the settle itself, below (same namespace) */
+/* T-889 step 2 (A5): a GIVE's escrow that ends settles its hand-over line - destroyed here (the other game has it): closed; put back: returned */
 void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
+{
+    const int giveLine = (p.showKind == coopshow::kShowGive && p.hdLine != 0) ? 1 : 0;
+    const int act = (giveLine != 0) ? coopshow::SettleAction(p.showKind, ok, ourHalfDone, p.showHolderMoved, p.showAbsorbed) : 0;
+    ItShowSettleBody(p, ok, ourHalfDone, lapsed);
+    if (giveLine != 0) HovGiveSettled(p, (act == coopshow::kStDestroy) ? 1 : 0);
+}
+void ItShowSettleBody(ItPending& p, int ok, int ourHalfDone, int lapsed)
 {
     const int kind = p.showKind;
     if (kind == coopshow::kShowNone) return;
@@ -10170,6 +10536,7 @@ void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
         if (act == coopshow::kStDestroy)
         {
             ++g_showGive[3];
+            p.showNotBack = 1;   /* T-853: the other game has it - not back here */
             if (ItDestroyPod(p.showObj, "coop T-164: a given item's escrow - the other game has it now") == 0) ++g_showGive[5];
             p.showObj = 0;
             return;
@@ -10187,6 +10554,7 @@ void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
             if (a < 0)
             {
                 ++g_showGive[6];
+                p.showNotBack = 1;   /* T-853: a faulted return - not proven back */
                 ErrorLog("[ITEMS] T-164 give " + N((long long)p.id) + " (" + std::string(p.baseSid) + "): refused or lapsed - the units' return"
                          " onto our stack FAULTED; they are kept where that left them (never destroyed or added again). Counted showGive fault.");
                 p.showWhere = 1;
@@ -10211,6 +10579,7 @@ void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
         if (put == coopshow::kPutKeep)
         {
             ++g_showGive[6];
+            p.showNotBack = 1;   /* T-853: a faulted put-back - not proven back */
             ErrorLog(gid + "the put-back into " + std::string(p.localIsBox != 0 ? "our box" : "our pack") + " FAULTED; the item may be half-filed"
                      " there, so it is kept where it is (never destroyed or added again - ItRevert's rule). Counted showGive fault.");
             p.showObj = 0;
@@ -10232,6 +10601,7 @@ void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
         if (took < 0)
         {
             ++g_showGive[6];
+            p.showNotBack = 1;   /* T-853: a faulted add - not proven back */
             ErrorLog(gid + "the engine's own add into our pack FAULTED; the item is kept where that left it (never destroyed or added"
                      " again). Counted showGive fault.");
             p.showObj = 0;
@@ -10244,6 +10614,7 @@ void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
             if (d < 0)
             {
                 ++g_showGive[6];
+                p.showNotBack = 1;   /* T-853: a faulted drop - not proven back */
                 ErrorLog(gid + "no room anywhere in our pack, and the engine's drop at the character's feet FAULTED; the item is kept"
                          " where that left it. Counted showGive fault.");
                 p.showObj = 0;
@@ -10270,6 +10641,7 @@ void ItShowSettle(ItPending& p, int ok, int ourHalfDone, int lapsed)
         else
         {
             ++g_showGive[2];
+            p.showNotBack = 1;   /* T-853: backLost - in no inventory */
             ErrorLog(gid + "no room anywhere in our pack and the engine's drop did not put it on the ground - it is kept alive in no"
                      " inventory (the shop sale's escrowLost rule). Counted showGive backLost.");
         }
@@ -10943,6 +11315,7 @@ void ItCrossTransfer(int dir, const ItEntry& src, unsigned int srcUid, const ItE
         rq.materialSid = fields.materialSid; rq.colorSid = fields.colorSid;
         rq.quality = fields.quality; rq.charges = fields.charges;
         rq.functionKind = fields.functionKind; rq.level = fields.level; rq.unique = fields.unique;
+        p->sentFieldsOk = 1; p->sentQuality = fields.quality; p->sentLevel = fields.level;   /* T-853: a late yes's square test */
         /* T-164 B4-2: the charge was claimed above - give it back before the row is discarded. T-215: the TEST-ONLY
            `itemtest refusehere noItemName` forces this GIVE-side exit as well as the take-side one below (same gate name). */
         if (rq.baseSid.empty() || ItRefuseHere(tradecharge::kGateNoItemName, priced) != 0)
@@ -10966,6 +11339,7 @@ void ItCrossTransfer(int dir, const ItEntry& src, unsigned int srcUid, const ItE
         /* T-164 non-shop road (owner 207 A / 212): SENT - the move now shows at once (a give leaves our pack, a take leaves their window) */
         ItShowStart(p, dir, isSplit, (undoMergedQty > 0) ? 1 : 0, (g_revertRecreated != recreated0) ? 1 : 0, aiTakeOne, keepToday, trade,
                     src, dst, srcInv, srcSec, landedX, landedY, srcOut);
+        if (dir != 0 && p->showKind == coopshow::kShowGive) HovGiverHeld(p, rq);   /* T-889 step 2 (A3): the giver's held line */
         if (trade == 1) ++g_shopBuys; else if (trade == 2) ++g_shopSells;
         if (p->localIsBox != 0)   /* T-164 211: counted and logged per case */
         {
@@ -11245,11 +11619,13 @@ int ItOwnerTake(::Inventory* inv, ::InventorySection* sec, int x, int y, int wan
 // landed slot in ItCrossTransfer; this is the owner's half of it.
 int ItOwnerGive(::Character* c, ::InventorySection* sec, const ItemMoveMsg* m, int x, int y,
                 int* landedX, int* landedY, int* reason,
-                const std::vector<coopbag::BagRow>* bagRows = 0)   /* inv3a: a GIVE of a pack - its contents */
+                const std::vector<coopbag::BagRow>* bagRows = 0,   /* inv3a: a GIVE of a pack - its contents */
+                void** builtOut = 0)   /* T-853: the object built, when it sits in the section's own list (0 = merged away) */
 {
     int ok = 0;
     *reason = kRefNone;
     *landedX = x; *landedY = y;
+    if (builtOut != 0) *builtOut = 0;
     __try
     {
         /* review-inv6p2 MEDIUM (give): a wire-carried pack mark goes on the empty pack at create; only a local D5-2 mark after the fill */
@@ -11282,6 +11658,12 @@ int ItOwnerGive(::Character* c, ::InventorySection* sec, const ItemMoveMsg* m, i
                 {
                     ItSlotOfInSection(sec, item, landedX, landedY);
                     if (*landedX < 0) { *landedX = x; *landedY = y; }
+                }
+                if (builtOut != 0)
+                {   /* T-853: named only while it sits in the section's own list - a merge into a stack destroyed it (compares only) */
+                    int bx = -1, by = -1;
+                    ItSlotOfInSection(sec, item, &bx, &by);
+                    if (bx >= 0) *builtOut = (void*)item;
                 }
                 ok = 1;
             }
@@ -11417,9 +11799,16 @@ int ItTakerRemove(::Inventory* inv, ::InventorySection* sec, int x, int y, const
 //        relocation is allowed), which rings our own hook and publishes the ordinary ITEM_MOVE, so the
 //        taker's ghost of us gets it back by the road every other move travels.
 // GIVE   the owner builds and places the item as before and remembers WHERE IT LANDED. MSG_ITEM_REVOKE ->
-//        remove and destroy it at that slot, base sid verified first, which publishes as our own move. No
-//        revoke within 10 s means the giver completed its half, and the entry is simply released.
-const int kOwnerPendCap = 32;
+//        remove and destroy THAT OBJECT (T-853: the one we built, found by pointer in its section, only the quantity
+//        built), base sid verified first, which publishes as our own move. No
+//        revoke within coopgive::kOwnerGiveStandMs (20 s, twice the giver's own lapse) of the giver's time in the world
+//        (T-889: the clock is held while the giver is away) means the giver completed its half, and the entry is simply
+//        released (T-853). A REVOKE finds its row by the giver's PLAYER and the request id (ItOwnerGiveFind), so a
+//        giver that reconnected under a new connection id still reaches it.
+/* T-853: a GIVE row lives coopgive::kOwnerGiveStandMs (twice the giver's lapse) of its giver's time in the world; a full table still
+   counts ownerPendFull. T-889: a row whose giver is away is kept until that giver is back, so the rows of a giver who never returns
+   keep their slots of these 64 until the world is torn down. */
+const int kOwnerPendCap = 64;
 const unsigned int kOwnerPendTimeoutMs = 10000;   // the plan's 10 s, re-armed by the tick, never a one-shot
 struct ItOwnerPend
 {
@@ -11432,6 +11821,9 @@ struct ItOwnerPend
     char section[kSecCap];
     int x, y;                // TAKE: where it came from. GIVE: where it actually landed.
     char baseSid[kSidCap];   // GIVE only: so a revoke cannot destroy a different object at that cell
+    void* built;             // T-853, GIVE only: the object we built, when it sat in the section's own list after the build (0 = merged
+                             // into a stack at once) - a REVOKE removes exactly this object. COMPARED, never read for state.
+    int builtQty;            // T-853, GIVE only: the quantity the request built - all a REVOKE takes off that object
     ItBagPath bag;           // bag23 part 2: the row was granted INSIDE A PACK at this path (has 0 = not)
     // E22c: the inventory we granted the request on may be a STORAGE BOX. `uid` is then 0 and the rollback
     // resolves the box by this key instead - the same key, and the same resolver, the apply used.
@@ -11469,7 +11861,16 @@ struct ItOwnerPend
     long grantGen;          /* p105g-f1-5a: a ground TAKE: the session link generation at the grant (another peer's repeat matches by
                                key only after a link edge) */
     int escKeyed;           /* escGen is set: rows are made zeroed between two edge checks, the next check sets it */
+    /* T-889 step 2: hdLine 1 = a held line in pp.handover stands for this row (A3); hdAsker / hdHolder its transfer's asker and holder
+       slots, hdOther the other player's. syncSaid: this row's syncReleased was counted (owner 896 b). */
+    int hdLine;
+    int hdAsker, hdHolder, hdOther;
+    int hdNoLine;   /* T-889 fold 1 (review 6): no line (the records writer is off), but the asker is still told CLOSED at settlement */
+    mutable int syncSaid;
     long escGen;            /* the asker's (peer's) generation as the last edge check saw it (StorePeerGen) */
+    unsigned int who;       /* T-889: the asker's PLAYER key at the grant (ItEscSenderKey) - a GIVE row's REVOKE is matched by it */
+    unsigned int giveHereMs;   /* T-889, GIVE only: the stand clock - it runs only while the giver is in the world (QuietStep) */
+    int giveAwaySaid;       /* T-889, GIVE only: the hold of the stand clock was logged for this row */
 };
 ItOwnerPend g_ownerPend[kOwnerPendCap];
 
@@ -11579,6 +11980,31 @@ static ItOwnerPend* ItEscrowFindRelinked(unsigned int id, unsigned int fromPeer)
             && g_ownerPend[i].id == id && coopesc::SameSender(ItEscSenderKey(g_ownerPend[i].peer), from, mySlotKnown, fromSess) != 0)
             return &g_ownerPend[i];   /* inv7c fold (review 1): live or in escrow */
     return 0;
+}
+/* T-889, MAIN THREAD: the GIVE row a REVOKE names - by the giver's PLAYER and the request id, never by the connection id alone: a
+   giver that reconnected (the host numbers a returning joiner afresh) sends its REVOKE from a new id. A row of that same connection
+   id first; else one of the same player (coopesc::SameSender against the key kept at the grant, as the escrow's relinked rows are
+   matched). Request ids start at a random base at each launch (reqserial.h), so a row left by that player's earlier launch shares
+   a new request's id only by chance; the REVOKE carries no launch number that could tell the two apart. *byPlayer: 1 when the row
+   was found only through the player. */
+static ItOwnerPend* ItOwnerGiveFind(unsigned int id, unsigned int fromPeer, int* byPlayer)
+{
+    *byPlayer = 0;
+    const unsigned int from = ItEscSenderKey(fromPeer);
+    const int mySlotKnown = ItEscMySlotKnown();
+    const int fromSess = ItEscRawIsSessionPeer(from);
+    ItOwnerPend* viaPlayer = 0;
+    for (int i = 0; i < kOwnerPendCap; ++i)
+    {
+        ItOwnerPend* const op = &g_ownerPend[i];
+        if (op->used == 0) continue;
+        const int m = coopgive::GiveRowMatch(op->dir, op->id, id, (op->peer == fromPeer) ? 1 : 0,
+                                             coopesc::SameSender(op->who, from, mySlotKnown, fromSess));
+        if (m == coopgive::kGmExact) return op;
+        if (m == coopgive::kGmPlayer && viaPlayer == 0) viaPlayer = op;
+    }
+    if (viaPlayer != 0) *byPlayer = 1;
+    return viaPlayer;
 }
 static int ItEscrowHeldNow()
 {
@@ -11774,6 +12200,1686 @@ void ItRollbackTake(ItOwnerPend* p, const char* why)
     p->used = 0;
 }
 
+}   /* T-889 fold 1: step out of the unnamed namespace to declare coop's ground helpers and ItOwnHandOver, defined further down (the C2668 class) */
+::Item* GrBuild(const ItemMoveMsg& mm, const std::vector<coopbag::BagRow>* bag, ::Character* c, const char** why);
+int GrSendAddExcept(void* item, const std::string& key, int qty, unsigned int exceptPeer, int undo, int* whyOut);
+void* GrFind(const char* key, int wantQty, float wantQ, int exactOnly, int* fuzzyOut);
+std::string GrIdOf(void* item);                                       /* T-889 fold 2: the ground's own roads, defined further down in this namespace */
+std::string GrKeyOf(void* item);
+int GrRemoveLocal(void* item, const char* why);
+void GrSendGone(const std::string& key, int qty, void* addr);
+int GrNamedOf(void* addr, const std::string& key);                   /* T-889 fold 3 (F3): defined beside GrSendGone, in this namespace */
+void GrSendGoneNamed(const std::string& key, int qty, int named);
+int GrRemPendHas(void* addr);                                         /* T-889 fold 3 (F3): defined beside GrRemoveLocal */
+void GrRemPendCancel(void* addr);
+void GrSendAdd(void* item, const std::string& key, int qty);
+void ItPlacedSettleRow(ItOwnerPend* p, unsigned int id, int ok, unsigned int fromPeer);   /* T-889 fold 2 (N5): beside ApplyItemPlaced */
+static void ItOwnHandOver(unsigned int uid, const char* sid, int qty, int dirIn, unsigned int msgId, int completed, int role, unsigned int fromPeer, int haveFrom);
+namespace {   /* the same unnamed namespace, reopened (T-889 fold 1) */
+/* ===== T-889 step 2 (owner decision 862, approved): ONE DURABLE RECORD PER HAND-OVER, pp.handover (src/common/handrec.h) ===========
+   The holding side writes `held` (with the item's bytes) before the item can be on the other game; the receiving side writes `in`
+   (with E, a records sequence reserved at the placement, and its squad record's key) before the item is placed on it. A live answer
+   settles the line; after a game came back the holder asks (QUERY), the receiver answers (VERDICT) and the holder closes, restores
+   or keeps. The escrow's hand-back at an edge (D6) and its 5-minute quiet return no longer run for a row that has a line - the line
+   keeps the item until the other player answers (owner decision 862; option (a) of A8: no timer). A row with NO line (the records
+   writer off, or a slot not known yet) keeps today's road, D6 included. MAIN THREAD throughout. REPORT itemHandover[...]. */
+enum { kHovHeld = 0, kHovIn, kHovClosedLive, kHovQuery, kHovVHolds, kHovVNot, kHovVUnknown, kHovRestoredLive, kHovRestoredRebuilt,
+       kHovClosedByVerdict, kHovLineFail, kHovLineFull, kHovRebuildFail, kHovCount };
+long long g_hovC[kHovCount] = { 0 };
+/* noLine (a hand-over with no line: writer off / slot unknown), returnedLive (a line returned by a live put-back), handBackDeferred
+   (an escrow row with a line left alone at an edge - A6), quietKept (its 5-minute quiet return not run), copyRemoved (a provisional
+   copy removed on CLOSED returned), msgRefused (a malformed ITEM_HANDOVER, or one from a player the line does not name), sendFail */
+long long g_hovNoLine = 0, g_hovReturnedLive = 0, g_hovHandBackDeferred = 0, g_hovQuietKept = 0, g_hovCopyRemoved = 0, g_hovMsgRefused = 0,
+          g_hovSendFail = 0;   /* an ITEM_HANDOVER that could not be sent now (no road to that player) */
+/* T-889 fold 1 (review 2026-10-17), REPORT itemHandoverFold[...]: settleRetry (a settled line that could not be rewritten - its CLOSED
+   held back, tried again), settleGaveUp (kSettleTries reached), takeParked / giveParked (an escrowed take row / a lapsed give PARKED
+   by its line - review 5 / 4), unparked (one taken back by a late answer or a verdict), ackRecv (an ACK let a settled line go),
+   closedNoLine (a CLOSED sent for a hand-over with no line - writer off, review 6), dropNoLines (a receiver line dropped on CLOSED 3),
+   closedUnknown (CLOSED 4 - the holder could not say; the line kept), liveVerdict (an unknown answer settled by looking - review 7),
+   closeNoRebuild (verdict 0 while the holder's own state still has it - review 3), holderCopyRemoved / holderCopyMissing (verdict 1:
+   the holder's reloaded copy removed / not found - review 3), rebuildWait (a rebuild waiting for its place to load - review 9) */
+long long g_hovSettleRetry = 0, g_hovSettleGaveUp = 0, g_hovTakeParked = 0, g_hovGiveParked = 0, g_hovUnparked = 0, g_hovAckRecv = 0,
+          g_hovClosedNoLine = 0, g_hovDropNoLines = 0, g_hovClosedUnknown = 0, g_hovLiveVerdict = 0, g_hovCloseNoRebuild = 0,
+          g_hovHolderCopyRemoved = 0, g_hovHolderCopyMissing = 0, g_hovRebuildWait = 0;
+/* T-889 fold 2 (re-check 2026-10-17), REPORT itemHandoverFold2[...]: holderRemoveWait (verdict 1, the holder's own copy found but not
+   removable now - not ours to write, or the removal did not take: the line stays open, N2), groundRemoved (a ground holder's reloaded
+   copy removed through the ground's road with GROUND GONE - (a)), rebuildToGround (verdict 0 for a character gone for good: rebuilt on
+   the ground at its feet - N3), parkedNoSlot (a verdict / PLACED on a parked take settled in place, the owner table full - N5),
+   lookNoMatch (an item at a line's place that is NOT the line's item - another quality, stack size or level - N1) */
+long long g_hovHolderRemoveWait = 0, g_hovGroundRemoved = 0, g_hovRebuildToGround = 0, g_hovParkedNoSlot = 0, g_hovLookNoMatch = 0;
+ItOwnerPend g_hovSpareRow;   /* N5: a parked row being settled while every owner row is in use (used only within one settle) */
+/* T-889 fold 3 (re-check 2 of fold 2, 2026-10-17), REPORT itemHandoverFold3[...]: charIdUnread (a character's save-stable id could not
+   be read when its line was written: the hand-over refused, or the line written naming no character - held; F1), charAmbiguous (a
+   line's character id answered by more than one loaded character - taken as not loaded; F1), placedSet (a receiver's line rewritten
+   with where its placement really ended; F2), placedUnknown (where it ended could not be told, or that rewrite failed: the line's look
+   stays unknown, never "not placed"; F2), groundGoneHeld (a ground holder's removal that did not take: no GROUND GONE, the line stays
+   open; F3), groundSearchHolds (verdict 0 for a character gone for good that still carries the item: closed, no ground rebuild; F4) */
+long long g_hovCharIdUnread = 0, g_hovCharAmbiguous = 0, g_hovPlacedSet = 0, g_hovPlacedUnknown = 0, g_hovGroundGoneHeld = 0,
+          g_hovGroundSearchHolds = 0;
+/* T-889 fold 4 (re-check 3, 2026-10-17), REPORT itemHandoverFold4[...]: lateTakeLined (a late take - its confirm after our own 10 s -
+   placed with its in line written before the add and its placed step after; G1), holderElsewhere (verdict 0, the holder's own state
+   unknown: its exact item found elsewhere in the character / box - closed, no rebuild; G2), holderPathWait (... its pack path no longer
+   resolves and the item is nowhere else in it - waits, no rebuild; G2), inElsewhere (a receiver's square does not show its placement but
+   the item is elsewhere in that character / box - answered unknown, never "not placed"; G3), lookScanUnread (the whole-inventory search
+   of G2 / G3 could not be read - unknown), twinElsewhere (a ground rebuild skipped because the item was found on the character, but not
+   on the line's own square - possibly an identical twin stack; G4) */
+long long g_hovLateTakeLined = 0, g_hovHolderElsewhere = 0, g_hovHolderPathWait = 0, g_hovInElsewhere = 0, g_hovLookScanUnread = 0,
+          g_hovTwinElsewhere = 0;
+/* T-889 fold 5 (2026-10-17), REPORT itemHandoverFold5[...]: closedWaitCommit (a CLOSED 1 on a live in line whose squad record holding the
+   item had not committed yet: the line kept, no ACK - once per line), closedCommitLanded (such a line dropped and acknowledged once its
+   record landed), closedSameBytes (durable by a same-bytes skip of that squad after E), closedNoRecord (a live in line with no squad record
+   of this game's to wait for - a box: dropped at once, as before), closedKeptAfterLoad (a CLOSED 1 after a load whose own look does not
+   show the item held: the line kept, no ACK) */
+long long g_hovClosedWaitCommit = 0, g_hovClosedCommitLanded = 0, g_hovClosedSameBytes = 0, g_hovClosedNoRecord = 0, g_hovClosedKeptAfterLoad = 0;
+std::map<std::string, long> g_hovWaitCommit;   /* fold 5: receiver key -> the load generation its CLOSED 1 began waiting in */
+/* T-889 fold 5b (2026-10-17), REPORT itemHandoverFold5[...,rebuiltAtTaker,takerRebuildWait]: rebuiltAtTaker (a CLOSED 1 after a load whose
+   own verdict is 0 and whose loaded, readable character / box definitely lacks the item: rebuilt from the line's own item bytes),
+   takerRebuildWait (... not rebuilt now: the item is found here after all, its place is not loaded / unreadable, or the rebuild waits /
+   failed - the line kept, no ACK) */
+long long g_hovRebuiltAtTaker = 0, g_hovTakerRebuildWait = 0;
+const int kHovLookNotPlaced = 2;   /* G2: HovLiveCopy's `wide` for the holder's look before a rebuild (verdict 0) */
+struct HovAsk { unsigned int firstSeen; unsigned int lastAt; int sent; };
+std::map<std::string, HovAsk> g_hovAsk;     /* per line: when this process first saw it open, when it last asked */
+std::map<std::string, long> g_hovLive;     /* lines written in this process (either role): the load generation they were written in */
+unsigned int s_hovLastScan = 0;
+/* review 1: a holder line whose closed / returned rewrite failed - its CLOSED waits for the rewrite */
+struct HovSettlePend { int asker; unsigned int reqId; int holder, other, st, tries; };
+std::map<std::string, HovSettlePend> g_hovSettlePend;
+std::map<std::string, int> g_hovSettledMem;     /* review 6 / 10: holder key -> the CLOSED value this process settled it with */
+std::map<std::string, long> g_hovPlacedMem;     /* review 6: receiver key -> the load generation of a placement made with NO line */
+std::map<std::string, long> g_hovRebuildFailGen;   /* review 8: a rebuild that failed - not tried again before the next load */
+/* review 5 / 4: parked rows, with the load generation they were parked in (a load ends their live object) */
+struct HovParkedTake { ItOwnerPend row; long gen; };
+struct HovParkedGive { ItPending row; long gen; };
+std::map<std::string, HovParkedTake> g_hovParkedTake;
+std::map<std::string, HovParkedGive> g_hovParkedGive;
+
+std::string HovKey(int asker, unsigned int reqId, int holder, int role)
+{
+    return N((long long)asker) + "/" + N((long long)reqId) + "/" + N((long long)holder) + "/" + N((long long)role);
+}
+std::string HovWhy(int asker, unsigned int reqId, int holder)
+{
+    return "transfer " + N((long long)asker) + "/" + N((long long)reqId) + "/" + N((long long)holder);
+}
+int HovSay(long long n) { return (n <= 20 || (n % 100) == 0) ? 1 : 0; }
+int HovMe() { return MySlotForWire(); }
+/* 1 = the file's lines (a missing file is empty); 0 = no records folder, or the file could not be read */
+int HovLoad(std::vector<std::string>* lines)
+{
+    lines->clear();
+    std::string text;
+    int notFound = 0;
+    if (!coop::OwnTextRead(hovrec::HandFile(), &text, &notFound)) return (notFound != 0) ? 1 : 0;
+    hovrec::HandSplit(text, lines, 0);
+    return 1;
+}
+int HovSave(const std::vector<std::string>& lines)
+{
+    std::string all;
+    for (size_t i = 0; i < lines.size(); ++i) { all += lines[i]; all += '\n'; }
+    return coop::OwnTextReplace(hovrec::HandFile(), all) ? 1 : 0;   /* temp file, flush, rename over (OwnLedgerAppend's pattern) */
+}
+/* 1 written; 0 the file could not be read / written (lineFail); -1 an open line does not fit the cap (lineFull) */
+int HovPut(const hovrec::HandLine& l)
+{
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) { ++g_hovC[kHovLineFail]; return 0; }
+    const int u = hovrec::HandUpsert(&lines, l, hovrec::kHandCap);
+    if (u < 0) { ++g_hovC[kHovLineFull]; return -1; }
+    if (u == 0 || HovSave(lines) == 0) { ++g_hovC[kHovLineFail]; return 0; }
+    return 1;
+}
+/* 1 found; 0 none; -1 the file could not be read. A game with its records writer off keeps no lines (review 6): 0. */
+int HovFind(int asker, unsigned int reqId, int holder, int role, hovrec::HandLine* out)
+{
+    if (!coop::OwnWriterOn()) return 0;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return -1;
+    return (hovrec::HandFind(lines, asker, reqId, holder, role, out) >= 0) ? 1 : 0;
+}
+int HovDrop(int asker, unsigned int reqId, int holder, int role)
+{
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) { ++g_hovC[kHovLineFail]; return 0; }
+    if (hovrec::HandRemove(&lines, asker, reqId, holder, role) == 0) return 1;
+    if (HovSave(lines) == 0) { ++g_hovC[kHovLineFail]; return 0; }
+    return 1;
+}
+/* the item's bytes for a line: the ITEM_CONFIRM body (net::EncodeItemConfirmBody) without its LND1 trailer and shop block */
+int HovItemBytes(const ItemConfirmMsg& cf, std::string* out)
+{
+    ItemConfirmMsg c = cf;
+    c.ok = 1; c.landHas = 0; c.shop.has = 0; c.reason = 0;
+    std::vector<char> b;
+    if (!net::EncodeItemConfirmBody(c, &b) || b.empty()) return 0;
+    out->assign(b.begin(), b.end());
+    return 1;
+}
+int HovDecode(const hovrec::HandLine& l, ItemConfirmMsg* cf)
+{
+    std::vector<char> b(l.item.begin(), l.item.end());
+    return (!b.empty() && net::DecodeItemConfirmBody(b, cf) && cf->ok != 0 && !cf->baseSid.empty()) ? 1 : 0;
+}
+/* review 9 / 14: the pack path into / out of a line */
+void HovSetBag(hovrec::HandLine* l, const ItBagPath& bp)
+{
+    l->bagHas = (bp.has != 0 && bp.section[0] != 0) ? 1 : 0;
+    l->bagSection = (l->bagHas != 0) ? std::string(bp.section) : std::string();
+    l->bagX = (l->bagHas != 0) ? bp.x : 0; l->bagY = (l->bagHas != 0) ? bp.y : 0;
+}
+ItBagPath HovBagOf(const hovrec::HandLine& l)
+{
+    ItBagPath bp;
+    std::memset(&bp, 0, sizeof(bp));
+    if (l.bagHas != 0 && !l.bagSection.empty() && l.bagSection.size() < (size_t)kSecCap)
+    {
+        bp.has = 1;
+        std::memcpy(bp.section, l.bagSection.c_str(), l.bagSection.size() + 1);
+        bp.x = l.bagX; bp.y = l.bagY;
+    }
+    return bp;
+}
+/* T-889 fold 3 (F1): a character's SAVE-STABLE id for a line - the engine's own handle serial and type (CaptureObjId, read live; the
+   squad records' S=<serial>;T=<type>). A uid is minted fresh at every load (AllocateUid; a region reload too), so a line never stores
+   one. "c:?" when the id cannot be read. */
+std::string HovCharWhereOf(::Character* c)
+{
+    coop::ObjId id;
+    if (!ItObj(c) || !CaptureObjId((const void*)c, &id)) return hovrec::CharWhereUnknown();
+    return hovrec::CharWhere((int)id.serial, (int)id.type);
+}
+/* F1: THE LINE'S CHARACTER NOW - every lookup goes through this at the moment of use: the one registered character whose own handle has
+   the line's serial and type. 0 = none loaded here, a line naming no character (c:?), or more than one answering (charAmbiguous: taken
+   as not loaded). *uidOut: its uid in this session. */
+::Character* HovLineChar(const hovrec::HandLine& l, unsigned int* uidOut)
+{
+    if (uidOut != 0) *uidOut = 0;
+    int serial = 0, type = 0;
+    if (hovrec::CharIdParse(l.where, &serial, &type) == 0) return 0;
+    ::Character* hit = 0;
+    unsigned int hitUid = 0;
+    int matches = 0;
+    for (int i = 0; i < MirrorCapacity(); ++i)
+    {
+        unsigned int u = 0;
+        ::Character* ch = 0;
+        if (!MirrorSlot(i, &u, &ch) || u == 0 || !ItObj(ch) || ch == hit) continue;   /* the same object in a second row is not a second match */
+        coop::ObjId id;
+        if (!CaptureObjId((const void*)ch, &id) || (int)id.serial != serial || (int)id.type != type) continue;
+        ++matches;
+        hit = ch; hitUid = u;
+    }
+    if (hovrec::CharMatchUse(matches) == 0)
+    {
+        if (matches > 1 && HovSay(++g_hovCharAmbiguous))
+            ErrorLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": its character id " + l.where + " is answered by "
+                     + N((long long)matches) + " loaded characters - taken as not loaded here (charAmbiguous)");
+        return 0;
+    }
+    if (uidOut != 0) *uidOut = hitUid;
+    return hit;
+}
+int HovLiveNow(const std::string& key)
+{
+    std::map<std::string, long>::const_iterator it = g_hovLive.find(key);
+    return (it != g_hovLive.end() && it->second == coop::OwnLoadGen()) ? 1 : 0;
+}
+/* review 3 / 11: the largest seq this load's overlay applied for the line's squad - the key saved in the line, and the squad its character
+   is in NOW (a member moved to another squad); *known: a squad record is named at all */
+unsigned long long HovAppliedFor(const hovrec::HandLine& l, int* known)
+{
+    *known = 0;
+    unsigned long long a = 0ULL;
+    if (!l.squadKey.empty()) { *known = 1; a = coop::OwnOverlayAppliedSeq(l.squadKey); }
+    ::Character* c = HovLineChar(l, 0);   /* T-889 fold 3 (F1): by its save-stable id, now */
+    std::string k;
+    if (ItObj(c) && coop::OwnSquadKeyOfCharPeek((void*)c, &k) != 0 && !k.empty())
+    {
+        *known = 1;
+        const unsigned long long b = coop::OwnOverlayAppliedSeq(k);
+        if (b > a) a = b;
+    }
+    return a;
+}
+/* the other player of a line can answer: IN_WORLD on this link's roster, or (no roster) the session peer while the session is up */
+int HovOtherHere(int slot)
+{
+    if (slot < 0) return 0;
+    const int r = StoreRosterSlotInWorld(slot);
+    if (r == 1) return 1;
+    return (r < 0 && slot == LinkPeerSlot() && net::SessionLinked()) ? 1 : 0;
+}
+void HovSend(int kind, int asker, unsigned int reqId, int holder, int value, int to)
+{
+    if (!net::SendItemHandover(kind, (unsigned int)asker, reqId, (unsigned int)holder, value, to) && HovSay(++g_hovSendFail))
+        DebugLog("[ITEMS] T-889 ITEM_HANDOVER kind " + N((long long)kind) + " for " + HovWhy(asker, reqId, holder) + " to slot " + N((long long)to)
+                 + " could not be sent now - the 60 s re-ask repeats it");
+}
+
+/* ---- T-889 fold 1 (review 7 / 3 / 14): THE LINE'S ITEM IN THIS GAME'S LOADED CHARACTER / BOX / GROUND NOW ---- */
+struct HovHit { ::Inventory* inv; ::InventorySection* sec; void* item; int x, y; };
+/* T-889 fold 2 (N1): is `item` the line's item - the same record, stack size, quality and level (hovrec::LineItemMatch)? allowLarger:
+   a larger stack of it also counts (removal searches only). 1 yes, 0 no (or unreadable). */
+int HovItemIs(void* item, const ItemConfirmMsg& cf, int qty, int allowLarger)
+{
+    if (!ItPlaus(item)) return 0;
+    char s2[kSidCap]; s2[0] = 0;
+    const int sidSame = (ItBaseSidPod(item, s2, kSidCap) != 0 && cf.baseSid == s2) ? 1 : 0;
+    int q = -1, lv = 0;
+    float ql = 0.0f;
+    if (ItIntPod(item, kItemQuantity, &q) == 0) q = -1;
+    const int qr = (ItFloatPod(item, kItemQuality, &ql) != 0) ? 1 : 0;
+    const int lr = (sidSame != 0 && ItLevelCall(item, &lv) != 0) ? 1 : 0;
+    return hovrec::LineItemMatch(sidSame, q, qty, qr, ql, cf.quality, lr, lv, cf.level, allowLarger);
+}
+/* T-889 fold 3 (F2): the item at a receiver's square against the line's item, any stack size. *kindRead: its record could be read
+   (and, when it is the line's record, its quality, level and stack size too); *sameKind: the line's record, quality and level; *qty: its
+   stack size (-1 unread) */
+void HovKindAt(void* item, const ItemConfirmMsg& cf, int* kindRead, int* sameKind, int* qty)
+{
+    *kindRead = 0; *sameKind = 0; *qty = -1;
+    if (!ItPlaus(item)) return;
+    char s2[kSidCap]; s2[0] = 0;
+    if (ItBaseSidPod(item, s2, kSidCap) == 0) return;
+    if (cf.baseSid != s2) { *kindRead = 1; return; }
+    int q = -1, lv = 0;
+    float ql = 0.0f;
+    if (ItIntPod(item, kItemQuantity, &q) == 0 || ItFloatPod(item, kItemQuality, &ql) == 0 || ItLevelCall(item, &lv) == 0) return;
+    *kindRead = 1; *qty = q;
+    *sameKind = hovrec::LineItemMatch(1, 1, 1, 1, ql, cf.quality, 1, lv, cf.level, 0);
+}
+/* F2: every stack of the line's item (record, quality, level - any size) in `sec`'s own list: the object (compared only), its square and
+   size. 0 = something in the section could not be read (where an add ends is then not told). */
+int HovSecSnap(::InventorySection* sec, const ItemConfirmMsg& cf, std::vector<hovrec::PlStack>* out)
+{
+    out->clear();
+    if (!ItObj(sec)) return 0;
+    const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+    if (si.size() > 4096) return 0;
+    for (size_t k = 0; k < si.size(); ++k)
+    {
+        void* item = (void*)si[k].item;
+        if (!ItPlaus(item)) return 0;
+        int kr = 0, same = 0, q = -1;
+        HovKindAt(item, cf, &kr, &same, &q);
+        if (kr == 0) return 0;
+        if (same == 0) continue;
+        int x = -1, y = -1;
+        if (ItIntPod(item, kItemX, &x) == 0 || ItIntPod(item, kItemY, &y) == 0) return 0;
+        hovrec::PlStack s;
+        s.id = (unsigned long long)(size_t)item; s.x = x; s.y = y; s.qty = q;
+        out->push_back(s);
+    }
+    return 1;
+}
+/* every section of `inv`, each pack's inside after it (6 levels): the first item that IS the line's item with exactly `qty` units
+   (*exact), else the first larger stack of it (*larger - `qty` units come off it). Pointer reads as ItFindInTree. 1 = an exact one
+   was found. T-889 fold 2 (N1): by every field that tells a stack apart (HovItemIs), no longer by record alone. */
+int HovTreeFind(::Inventory* inv, const ItemConfirmMsg& cf, int qty, int depth, HovHit* exact, HovHit* larger)
+{
+    if (inv == 0 || depth > 6) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) continue;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            if (!ItPlaus(item)) continue;
+            const int ex = HovItemIs(item, cf, qty, 0);
+            if (ex != 0 || (larger->item == 0 && HovItemIs(item, cf, qty, 1) != 0))
+            {
+                int x = -1, y = -1;
+                if (ItIntPod(item, kItemX, &x) != 0 && ItIntPod(item, kItemY, &y) != 0)
+                {
+                    HovHit h; h.inv = inv; h.sec = sec; h.item = item; h.x = x; h.y = y;
+                    if (ex != 0) { *exact = h; return 1; }
+                    *larger = h;
+                }
+            }
+            void* pinv = 0;
+            if (ItBagInvPod(item, &pinv) != 0 && pinv != 0 && HovTreeFind((::Inventory*)pinv, cf, qty, depth + 1, exact, larger) != 0) return 1;
+        }
+    }
+    return 0;
+}
+/* T-889 fold 4 (G2 / G3): every stack of the line's item (record, quality, level - any size) in every section of `inv` and every pack
+   inside (6 levels): *kindN counts them all, *sizeN those of exactly `size` units. 0 = something in it could not be read - a look built
+   on it is then unknown, never "not there". */
+int HovTreeKind(::Inventory* inv, const ItemConfirmMsg& cf, int size, int depth, int* kindN, int* sizeN)
+{
+    if (inv == 0 || depth > 6) return 0;
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return 0;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;   /* as HovTreeFind: a map entry with no section holds nothing */
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return 0;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* item = (void*)si[k].item;
+            if (!ItPlaus(item)) return 0;
+            int kr = 0, same = 0, q = -1;
+            HovKindAt(item, cf, &kr, &same, &q);
+            if (kr == 0) return 0;
+            if (same != 0) { ++*kindN; if (q == size) ++*sizeN; }
+            void* pinv = 0;
+            if (ItBagInvPod(item, &pinv) != 0 && pinv != 0 && HovTreeKind((::Inventory*)pinv, cf, size, depth + 1, kindN, sizeN) == 0) return 0;
+        }
+    }
+    return 1;
+}
+/* -1 that place is not loaded here (for a removal: not this game's to write), or its square could not be read; 0 the item is not
+   there; 1 it is (removed, with doRemove); 2 it is, but the removal did not take (now). wide 0: the line's own square only (through its
+   pack path); wide 1: then the whole inventory and every pack in it (review 14). T-889 fold 2 (N1): "the item" is the line's item by
+   every field that tells a stack apart - record, stack size, quality, level (HovItemIs); another item of the same record there is NOT
+   it. A verdict's look is always wide 0. The ground ((a)): by its key near its position, the same exact match; a removal goes through
+   the ground's own road - off the ground and destroyed under its claim (GrRemoveLocal), GROUND GONE by its name to the other games.
+   T-889 fold 4: wide kHovLookNotPlaced - the holder's look before a rebuild (G2): its square, then its exact item anywhere in the
+   character / box (found: holds); a pack path that no longer resolves is unknown, never "not there". A receiver's look (wide 0, no
+   removal) whose square does not show its placement searches the whole character / box (G3, PlacedLookWide). */
+int HovLiveCopy(const hovrec::HandLine& l, int wide, int doRemove, ::Character** cOut)
+{
+    if (cOut != 0) *cOut = 0;
+    ItemConfirmMsg cf;
+    if (HovDecode(l, &cf) == 0) return -1;
+    const int qty = (cf.quantity > 0) ? cf.quantity : 1;
+    if (l.where.size() < 3) return -1;
+    if (l.where[0] == 'g')
+    {
+        float pos[3] = { 0.0f, 0.0f, 0.0f };
+        if (std::sscanf(l.section.c_str(), "%f,%f,%f", &pos[0], &pos[1], &pos[2]) != 3) return -1;
+        if (ItAreaVerdictAt(pos, kAreaForGround) != kBoxMine) return -1;
+        int fz = 0;
+        void* const gi = GrFind(l.where.c_str() + 2, qty, cf.quality, 0, &fz);
+        if (gi == 0) return 0;
+        if (HovItemIs(gi, cf, qty, 0) == 0) { ++g_hovLookNoMatch; return 0; }
+        if (doRemove == 0) return 1;
+        /* T-889 fold 3 (F3): CLAIM AND REMOVE FIRST; GROUND GONE (its name and published-name flag read beforehand) only when the
+           removal took. A removal deferred by a busy claim is taken back (the next verdict tries the whole of it again) and a failed
+           one sends nothing: another player's pickup meanwhile still goes through this game's ground, and the line stays open. */
+        const std::string nm = GrIdOf(gi);
+        const std::string gname = nm.empty() ? l.where.substr(2) : nm;
+        const int named = GrNamedOf(gi, gname);
+        const int pendBefore = GrRemPendHas(gi);
+        const int gr = GrRemoveLocal(gi, "T-889: a hand-over's item the other game holds, back on the holder's reloaded ground");
+        if (gr < 0 && pendBefore == 0) GrRemPendCancel(gi);   /* not left to a retry that would remove it with no GROUND GONE */
+        if (hovrec::GroundRemoveSendsGone(gr) == 0)
+        {
+            if (HovSay(++g_hovGroundGoneHeld))
+                DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the ground copy's removal did not take ("
+                         + std::string(gr < 0 ? "its claim is busy" : "no key to claim, or not surely on the ground") + ") - NO GROUND GONE"
+                         " sent; the line stays open, tried again at the next verdict (groundGoneHeld)");
+            return hovrec::GroundRemoveLook(gr);
+        }
+        GrSendGoneNamed(gname, qty, named);   /* the other games stop showing it - by its name, after it is really gone here */
+        ++g_hovGroundRemoved;
+        return 1;
+    }
+    ::Inventory* top = 0;
+    unsigned int uid = 0;
+    ::Character* lc = (l.where[0] == 'c') ? HovLineChar(l, &uid) : 0;   /* T-889 fold 3 (F1): by its save-stable id, now */
+    const std::string key = (l.where[0] == 'b') ? l.where.substr(2) : std::string();
+    if (l.where[0] == 'c')
+    {
+        ::Character* c = lc;
+        if (!ItObj(c) || (doRemove != 0 && !net::IsUidMine(uid))) return -1;
+        top = ItInventoryOf(c);
+        if (cOut != 0) *cOut = c;
+    }
+    else
+    {
+        void* b = ItBoxResolve(key.c_str());
+        if (b == 0 || (doRemove != 0 && ItBoxHolderVerdict(key.c_str()) != kBoxMine)) return -1;
+        top = ItBoxInventory(b);
+    }
+    if (top == 0) return -1;
+    int pathOk = 0;   /* T-889 fold 4 (G2): the line's square was reached through its pack path */
+    {   /* the line's own square, through its pack path */
+        ::Character* c2 = 0;
+        ::Inventory* inv = 0;
+        const ItBagPath bp = HovBagOf(l);
+        ::InventorySection* sec = ItResolvePath(uid, key.empty() ? 0 : key.c_str(), l.section, bp, &c2, &inv);
+        void* at = 0;
+        if (sec != 0 && inv != 0 && ItSlotInSectionWhy(sec, l.x, l.y) == 1)
+        {
+            pathOk = 1;
+            const int readOk = (ItGetAtPod(sec, l.x, l.y, &at) != 0) ? 1 : 0;   /* N1: a square that could not be read is unknown, never "not there" */
+            const int there = (readOk != 0 && at != 0 && ItPlaus(at)) ? 1 : 0;
+            int look = 0;
+            if (l.role == hovrec::kRoleDst)
+            {   /* T-889 fold 3 (F2): the receiver's square as its placement really ended - the stack it made (1), what the square held before
+                   or nothing of this item (0), anything else - or the placement not written down yet - unknown */
+                int kindRead = 0, sameKind = 0, haveQty = -1;
+                if (there != 0) HovKindAt(at, cf, &kindRead, &sameKind, &haveQty);
+                look = hovrec::PlacedLook(1, readOk, l.plHas, there, kindRead, sameKind, haveQty, l.plPre, l.plGot);
+                if (look < 0 && !(readOk != 0 && wide != 0)) return -1;   /* a removal that read the square goes on to the wide search */
+                if (look == 0 && wide == 0 && doRemove == 0)
+                {   /* T-889 fold 4 (G3): the square does not show the stack the placement made - the player may have moved it before a
+                       reload. The whole character / box is searched: the resulting stack (size got) anywhere, or any stack of this item when
+                       the square does not hold exactly its stack from before, is unknown - never "not placed" */
+                    const int preAt = (there != 0 && kindRead != 0 && sameKind != 0 && l.plPre > 0 && haveQty == l.plPre) ? 1 : 0;
+                    int kindN = 0, gotN = 0;
+                    const int scan = HovTreeKind(top, cf, l.plGot, 0, &kindN, &gotN);
+                    const int wl = hovrec::PlacedLookWide(look, preAt, scan, gotN > 0 ? 1 : 0, kindN > 0 ? 1 : 0);
+                    if (wl < 0)
+                    {
+                        const long long n = (scan == 0) ? ++g_hovLookScanUnread : ++g_hovInElsewhere;
+                        if (HovSay(n))
+                            DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the receiver's square " + N((long long)l.x) + ","
+                                     + N((long long)l.y) + " does not show its placement (" + N((long long)l.plPre) + " -> " + N((long long)l.plGot) + "), but "
+                                     + (scan == 0 ? std::string("the rest of it could not be read (lookScanUnread)")
+                                                  : "this item is elsewhere in it (" + N((long long)gotN) + " stack(s) of " + N((long long)l.plGot) + ", "
+                                                    + N((long long)kindN) + " of any size; inElsewhere)") + " - answered UNKNOWN, never 'not placed'");
+                        return -1;
+                    }
+                }
+            }
+            else
+            {
+                look = hovrec::SquareLook(1, readOk, there, there != 0 ? HovItemIs(at, cf, qty, 0) : 0);
+                if (look < 0) return -1;
+            }
+            if (look == 1)
+            {
+                if (doRemove == 0) return 1;
+                return (ItTakerRemoveExact(inv, sec, l.x, l.y, cf.baseSid.c_str(), at, qty) == 1) ? 1 : 2;   /* qty units off the stack it made */
+            }
+            if (look == 0 && there != 0) ++g_hovLookNoMatch;
+        }
+        else if (l.role == hovrec::kRoleDst && wide == 0) return -1;   /* F2: the receiver's square (or the pack it is in) not found: unknown */
+    }
+    if (wide == 0) return 0;
+    if (wide == kHovLookNotPlaced)
+    {   /* T-889 fold 4 (G2): not on the line's square (or its pack path no longer resolves) - the exact item anywhere in the character /
+           box, every pack in it: found -> holds (no rebuild); a path that no longer resolves with nothing found -> unknown (wait) */
+        int kindN = 0, exactN = 0;
+        const int scan = HovTreeKind(top, cf, qty, 0, &kindN, &exactN);
+        const int hl = hovrec::HolderNotPlacedLook(pathOk, 0, scan, exactN > 0 ? 1 : 0);
+        if (scan == 0) ++g_hovLookScanUnread;
+        else if (hl == 1) ++g_hovHolderElsewhere;
+        else if (hl < 0) ++g_hovHolderPathWait;
+        if (hl != 0 && HovSay(scan == 0 ? g_hovLookScanUnread : (hl == 1 ? g_hovHolderElsewhere : g_hovHolderPathWait)))
+            DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": verdict 0 with this game's own state unknown - "
+                     + std::string(pathOk != 0 ? "not on the line's square" : "the line's pack path no longer resolves (the pack moved or was taken off)")
+                     + "; " + (scan == 0 ? std::string("the rest could not be read - the line WAITS, no rebuild (lookScanUnread)")
+                               : hl == 1 ? std::string("its exact item is elsewhere here - closed with NO rebuild (holderElsewhere)")
+                                         : std::string("its exact item is nowhere else here - the line WAITS, no rebuild (holderPathWait)")));
+        return hl;
+    }
+    HovHit ex, lg;
+    std::memset(&ex, 0, sizeof(ex)); std::memset(&lg, 0, sizeof(lg));
+    HovTreeFind(top, cf, qty, 0, &ex, &lg);
+    const HovHit& h = (ex.item != 0) ? ex : lg;
+    if (h.item == 0) return 0;
+    if (doRemove == 0) return 1;
+    return (ItTakerRemoveExact(h.inv, h.sec, h.x, h.y, cf.baseSid.c_str(), h.item, qty) == 1) ? 1 : 2;
+}
+
+/* ---- review 1: A SETTLED LINE IS ANNOUNCED ONLY ONCE ITS REWRITE TOOK ---- */
+void HovSettleSend(int asker, unsigned int reqId, int holder, int other, int value, const char* why)
+{
+    g_hovSettledMem[HovKey(asker, reqId, holder, hovrec::kRoleSrc)] = value;
+    HovSend(hovrec::kMsgClosed, asker, reqId, holder, value, other);
+    DebugLog("[ITEMS] T-889 hand-over " + HovWhy(asker, reqId, holder) + " " + std::string(value == hovrec::kClosedPlaced ? "closed" : "returned")
+             + " (" + std::string(why) + "); CLOSED " + N((long long)value) + " to slot " + N((long long)other));
+}
+/* the holder's line -> st. 1 = written (or no line to rewrite: *value the CLOSED to send); 0 = could not be read / rewritten */
+int HovSettleWrite(int asker, unsigned int reqId, int holder, int st, int* value)
+{
+    *value = (st == hovrec::kStClosed) ? hovrec::kClosedPlaced : hovrec::kClosedReturned;
+    hovrec::HandLine l;
+    const int f = HovFind(asker, reqId, holder, hovrec::kRoleSrc, &l);
+    if (f < 0) return 0;
+    if (f == 0) return 1;
+    if (l.state != hovrec::kStHeld) { *value = (l.state == hovrec::kStReturned) ? hovrec::kClosedReturned : hovrec::kClosedPlaced; return 1; }
+    l.state = st;
+    return (HovPut(l) == 1) ? 1 : 0;
+}
+/* the holder's line -> st (closed / returned), then CLOSED to the other player. A line that cannot be rewritten stays held on file and
+   its CLOSED is NOT sent (a CLOSED with the line still held would let a later QUERY answer "not placed" and rebuild - a double): the
+   rewrite and its CLOSED are tried again at every hand-over tick (HovSettleTick), and nothing else acts on that line meanwhile. */
+void HovHolderSettleIds(int asker, unsigned int reqId, int holder, int other, int st, const char* why)
+{
+    const std::string key = HovKey(asker, reqId, holder, hovrec::kRoleSrc);
+    int value = 0;
+    if (HovSettleWrite(asker, reqId, holder, st, &value) == 0)
+    {
+        if (g_hovSettlePend.find(key) == g_hovSettlePend.end())
+        {
+            HovSettlePend sp; sp.asker = asker; sp.reqId = reqId; sp.holder = holder; sp.other = other; sp.st = st; sp.tries = 0;
+            g_hovSettlePend[key] = sp;
+        }
+        ++g_hovSettleRetry;
+        ErrorLog("[ITEMS] T-889 hand-over " + HovWhy(asker, reqId, holder) + ": its line could not be marked " + std::string(hovrec::StateName(st))
+                 + " (" + std::string(why) + ") - its CLOSED is NOT sent until it is; tried again every 5 s (settleRetry " + N(g_hovSettleRetry) + ")");
+        return;
+    }
+    g_hovSettlePend.erase(key);
+    HovSettleSend(asker, reqId, holder, other, value, why);
+}
+int HovSettlePending(const std::string& key) { return (g_hovSettlePend.find(key) != g_hovSettlePend.end()) ? 1 : 0; }
+/* MAIN THREAD, from HovTick: each pending settle tried again, at most kSettleTries times */
+void HovSettleTick()
+{
+    for (std::map<std::string, HovSettlePend>::iterator it = g_hovSettlePend.begin(); it != g_hovSettlePend.end(); )
+    {
+        HovSettlePend& sp = it->second;
+        if (hovrec::SettleRetryDue(sp.tries) == 0) { ++it; continue; }
+        ++sp.tries;
+        int value = 0;
+        if (HovSettleWrite(sp.asker, sp.reqId, sp.holder, sp.st, &value) != 0)
+        {
+            const HovSettlePend done = sp;
+            g_hovSettlePend.erase(it++);
+            HovSettleSend(done.asker, done.reqId, done.holder, done.other, value, "its line rewritten on a later try");
+            continue;
+        }
+        if (hovrec::SettleRetryDue(sp.tries) == 0)
+        {
+            ++g_hovSettleGaveUp;
+            ErrorLog("[ITEMS] T-889 hand-over " + HovWhy(sp.asker, sp.reqId, sp.holder) + ": its line still could not be marked "
+                     + std::string(hovrec::StateName(sp.st)) + " after " + N((long long)sp.tries) + " tries - this process stops trying and never"
+                     " acts on it again; the line stays held and is asked about after the next launch (settleGaveUp)");
+        }
+        ++it;
+    }
+}
+void HovHolderSettle(ItOwnerPend* p, int st, const char* why)
+{
+    if (p->hdLine == 0)
+    {   /* review 6: a hand-over with no line (writer off) still tells the receiver at live settlement */
+        if (p->hdNoLine == 0) return;
+        p->hdNoLine = 0;
+        ++g_hovClosedNoLine;
+        HovSettleSend(p->hdAsker, p->id, p->hdHolder, p->hdOther, st == hovrec::kStClosed ? hovrec::kClosedPlaced : hovrec::kClosedReturned, why);
+        return;
+    }
+    p->hdLine = 0;
+    if (st == hovrec::kStClosed) ++g_hovC[kHovClosedLive]; else ++g_hovReturnedLive;
+    HovHolderSettleIds(p->hdAsker, p->id, p->hdHolder, p->hdOther, st, why);
+}
+/* ItRollbackTake, and the row's line returned once the row really ended (a put-back the engine refused keeps the row - and the line) */
+void HovRollback(ItOwnerPend* p, const char* why)
+{
+    ItRollbackTake(p, why);
+    if (p->used == 0) HovHolderSettle(p, hovrec::kStReturned, why);
+}
+/* A6: an escrow row with a line at an edge - dropped, not handed back; the line keeps the item (its bytes) */
+void HovEdgeDrop(ItOwnerPend* p, const char* edge)
+{
+    ++g_hovHandBackDeferred;
+    if (HovSay(g_hovHandBackDeferred))
+        DebugLog("[ITEMS] T-889 escrowed TAKE " + N((long long)p->id) + " at the edge '" + std::string(edge) + "': NOT handed back (D6 replaced) -"
+                 " its hand-over line keeps the item until " + HovWhy(p->hdAsker, p->id, p->hdHolder) + " is answered (handBackDeferred)");
+    p->hdLine = 0;
+    p->item = 0;   /* in no inventory; nothing frees it - the line's bytes are what a restore rebuilds from */
+    p->used = 0;
+}
+/* review 5: an escrowed row with a line whose asker is away leaves the 64 owner rows - parked, its kept object with it */
+void HovParkTake(ItOwnerPend* p)
+{
+    const std::string key = HovKey(p->hdAsker, p->id, p->hdHolder, hovrec::kRoleSrc);
+    HovParkedTake k; k.row = *p; k.gen = coop::OwnLoadGen();
+    g_hovParkedTake[key] = k;
+    p->used = 0;
+    ++g_hovTakeParked;
+    if (HovSay(g_hovTakeParked))
+        DebugLog("[ITEMS] T-889 escrowed TAKE " + N((long long)p->id) + ": its asker is away - the row is PARKED off the owner table and no longer"
+                 " holds its " + std::string(p->isBox != 0 ? "box's" : (p->isGround != 0 ? "ground's" : "character's")) + " syncing; its line ("
+                 + HovWhy(p->hdAsker, p->id, p->hdHolder) + ") settles it (takeParked)");
+}
+/* a parked row taken out to be settled (0 = none parked, or parked before a load - its object went with that world: the parked row
+   is dropped and the line settles with no live object). T-889 fold 2 (N5): it is ALWAYS consumed - back into the owner table, or,
+   with every owner row in use, onto the spare row g_hovSpareRow, which its settle (ItPlacedSettleRow) parks again if the engine
+   refused a put-back. A parked row is never left behind a verdict's settle. */
+ItOwnerPend* HovUnparkTakeKey(const std::string& key)
+{
+    std::map<std::string, HovParkedTake>::iterator it = g_hovParkedTake.find(key);
+    if (it == g_hovParkedTake.end()) return 0;
+    if (g_hovSpareRow.used != 0) HovParkTake(&g_hovSpareRow);   /* never expected: a spare row left in use is parked, not overwritten */
+    const int sameLoad = (it->second.gen == coop::OwnLoadGen()) ? 1 : 0;
+    ItOwnerPend* p = (sameLoad != 0) ? ItOwnerPendAlloc() : 0;
+    const int road = hovrec::ParkedSettleRoad(1, sameLoad, p != 0 ? 1 : 0);
+    if (road == hovrec::kPsDrop) { g_hovParkedTake.erase(it); ++g_hovUnparked; return 0; }
+    if (road == hovrec::kPsSpare)
+    {
+        ++g_ownerPendFull;
+        ++g_hovParkedNoSlot;
+        p = &g_hovSpareRow;
+        ErrorLog("[ITEMS] T-889 parked TAKE " + N((long long)it->second.row.id) + ": every owner row is in use - settled in place on the spare row"
+                 " (parkedNoSlot " + N(g_hovParkedNoSlot) + ")");
+    }
+    *p = it->second.row;
+    p->used = 1;
+    g_hovParkedTake.erase(it);
+    ++g_hovUnparked;
+    return p;
+}
+/* a PLACED (the asker's re-send) for a parked row: by (asker player, id) */
+ItOwnerPend* HovUnparkByPlaced(unsigned int id, unsigned int fromPeer)
+{
+    const int asker = net::PlayerSlotOfKey(fromPeer);
+    for (std::map<std::string, HovParkedTake>::iterator it = g_hovParkedTake.begin(); it != g_hovParkedTake.end(); ++it)
+        if (it->second.row.id == id && (it->second.row.peer == fromPeer || (asker >= 0 && it->second.row.hdAsker == asker)))
+        {
+            ItOwnerPend* const p = HovUnparkTakeKey(it->first);
+            if (p != 0 && p->item == 0) { p->used = 0; return 0; }   /* parked before a load: no live object - its line's QUERY settles it */
+            return p;
+        }
+    return 0;
+}
+/* A3, GIVE: the giver's `held` line, right after its request went out and its item left into the show-at-once escrow. The request is
+   already sent, so a line that cannot be written cannot refuse it: the give goes on with no line (today's road), said out loud.
+   T-889 fold 1: E_h and the giver's squad key (review 3), the pack path (review 9); writer off: no line, the CLOSED still goes (review 6). */
+void HovGiverHeld(ItPending* p, const ItemRequestMsg& rq)
+{
+    p->hdLine = 0; p->hdNoLine = 0;
+    const int me = HovMe(), other = net::ItemAskedSlot(p->id);
+    if (!coop::OwnWriterOn())
+    {
+        ++g_hovNoLine;
+        if (me >= 0 && other >= 0) { p->hdNoLine = 1; p->hdMe = me; p->hdOther = other; }
+        return;
+    }
+    if (me < 0 || other < 0) { ++g_hovNoLine; return; }
+    ItemConfirmMsg cf;   /* the given item's record in the confirm body's shape - one decoder rebuilds either side's item */
+    cf.id = rq.id; cf.ok = 1; cf.quantity = (rq.quantity > 0) ? rq.quantity : 1;
+    cf.baseSid = rq.baseSid; cf.companySid = rq.companySid; cf.materialSid = rq.materialSid; cf.colorSid = rq.colorSid;
+    cf.quality = rq.quality; cf.charges = rq.charges; cf.functionKind = rq.functionKind; cf.level = rq.level; cf.unique = rq.unique;
+    cf.bag = rq.bag; cf.owner = rq.owner; cf.gear = rq.gear;
+    hovrec::HandLine l;
+    l.role = hovrec::kRoleSrc; l.state = hovrec::kStHeld; l.kind = hovrec::kKindGive;
+    l.askerSlot = me; l.holderSlot = me; l.otherSlot = other; l.reqId = p->id; l.atUnix = (long long)std::time(0);
+    l.section = p->localSection; l.x = p->localX; l.y = p->localY;
+    HovSetBag(&l, p->localBag);
+    if (p->localIsBox != 0) l.where = "b:" + std::string(p->localBoxKey);
+    else
+    {
+        ::Character* gc = FindSpawned(p->mineUid);
+        l.where = HovCharWhereOf(gc);   /* T-889 fold 3 (F1): its save-stable id */
+        if (hovrec::CharIdWriteRoad(l.where != hovrec::CharWhereUnknown() ? 1 : 0, 0) == hovrec::kCidUnknown)
+        {   /* the request is already out: the line names no character - it holds (never looked at, never rebuilt) */
+            ++g_hovCharIdUnread;
+            ErrorLog("[ITEMS] T-889 give " + N((long long)p->id) + ": the giver's character id could not be read - its line names no character"
+                     " and HOLDS the item until a live answer settles it (charIdUnread " + N(g_hovCharIdUnread) + ")");
+        }
+        std::string k;
+        if (ItObj(gc) && coop::OwnSquadKeyOfCharNow((void*)gc, &k) != 0) l.squadKey = k;
+    }
+    int w = 0;
+    if (HovItemBytes(cf, &l.item) == 0) ++g_hovC[kHovLineFail];
+    else { l.seqE = coop::OwnSeqReserve(); w = HovPut(l); }
+    if (w != 1)
+    {
+        ErrorLog("[ITEMS] T-889 give " + N((long long)p->id) + " ('" + std::string(p->baseSid) + "'): the giver's record line could not be written"
+                 " (lineFail " + N(g_hovC[kHovLineFail]) + ", lineFull " + N(g_hovC[kHovLineFull]) + ") - the request is already out, so the give goes on"
+                 " with NO line: a death before its answer can lose the item (today's road)");
+        return;
+    }
+    p->hdLine = 1; p->hdMe = me; p->hdOther = other;
+    g_hovLive[HovKey(me, p->id, me, hovrec::kRoleSrc)] = coop::OwnLoadGen();
+    ++g_hovC[kHovHeld];
+    if (HovSay(g_hovC[kHovHeld]))
+        DebugLog("[ITEMS] T-889 give " + HovWhy(me, p->id, me) + " ('" + std::string(p->baseSid) + "'): HELD line written (itemHandover held)");
+}
+/* A5, GIVE: the giver's escrow ended - destroyed (the owner has it): closed; put back: returned. From the ItShowSettle wrapper. */
+void HovGiveSettled(ItPending& p, int closed)
+{
+    if (p.hdLine == 0)
+    {
+        if (p.hdNoLine == 0) return;
+        p.hdNoLine = 0;
+        ++g_hovClosedNoLine;
+        HovSettleSend(p.hdMe, p.id, p.hdMe, p.hdOther, closed != 0 ? hovrec::kClosedPlaced : hovrec::kClosedReturned, "a give with no line settled");
+        return;
+    }
+    p.hdLine = 0;
+    if (closed != 0) ++g_hovC[kHovClosedLive]; else ++g_hovReturnedLive;
+    HovHolderSettleIds(p.hdMe, p.id, p.hdMe, p.hdOther, closed != 0 ? hovrec::kStClosed : hovrec::kStReturned,
+                      closed != 0 ? "the give stood: its escrow was destroyed" : "the give ended without a yes: its escrow went back");
+}
+/* review 4, from ItPendExpire: a lapsed GIVE with a held line is PARKED - no refund, no put-back, no REVOKE; its item stays in no inventory
+   until the owner's verdict (or a late answer) settles it */
+void HovParkGive(const ItPending& p)
+{
+    const std::string key = HovKey(p.hdMe, p.id, p.hdMe, hovrec::kRoleSrc);
+    HovParkedGive k; std::memcpy(&k.row, &p, sizeof(ItPending)); k.gen = coop::OwnLoadGen();
+    g_hovParkedGive[key] = k;
+    ++g_hovGiveParked;
+    if (HovSay(g_hovGiveParked))
+        DebugLog("[ITEMS] T-889 give " + N((long long)p.id) + " ('" + std::string(p.baseSid) + "') lapsed with no answer: NOT refunded - its item stays"
+                 " held off our character until the owner says whether it placed it (" + HovWhy(p.hdMe, p.id, p.hdMe) + ", giveParked)");
+}
+/* a parked give back into the request table for its late answer (ApplyItemConfirm); 0 none, or no free row */
+ItPending* HovGiveUnpark(unsigned int id)
+{
+    for (std::map<std::string, HovParkedGive>::iterator it = g_hovParkedGive.begin(); it != g_hovParkedGive.end(); ++it)
+    {
+        if (it->second.row.id != id || it->second.gen != coop::OwnLoadGen()) continue;
+        for (int i = 0; i < kPendCap; ++i)
+        {
+            if (g_pend[i].used != 0) continue;
+            std::memcpy(&g_pend[i], &it->second.row, sizeof(ItPending));
+            g_pend[i].used = 1;
+            g_pend[i].sentAt = ::GetTickCount();
+            g_hovParkedGive.erase(it);
+            ++g_hovUnparked;
+            return &g_pend[i];
+        }
+        return 0;
+    }
+    return 0;
+}
+/* a parked give settled by the owner's verdict: 1 its escrow destroyed (the owner holds it), 0 the lapse's own road (put back, refund,
+   REVOKE). 0 = no parked give of that key (or it was parked before a load - its object went with that world). */
+int HovGiveParkedSettle(const std::string& key, int verdict)
+{
+    std::map<std::string, HovParkedGive>::iterator it = g_hovParkedGive.find(key);
+    if (it == g_hovParkedGive.end()) return 0;
+    ItPending p;
+    std::memcpy(&p, &it->second.row, sizeof(ItPending));
+    const long gen = it->second.gen;
+    g_hovParkedGive.erase(it);
+    if (gen != coop::OwnLoadGen()) return 0;
+    if (verdict == hovrec::kVHolds)
+    {
+        ++g_hovC[kHovClosedByVerdict];
+        ItShowSettle(p, 1, 1, 0);   /* the escrow destroyed; HovGiveSettled closes the line (CLOSED 1) */
+        ItOwnHandOver(p.mineUid, p.baseSid, p.quantity, coop::kHandOut, p.id, 1, coop::kHandRequester, 0u, 0);
+    }
+    else
+    {
+        ++g_hovC[kHovRestoredLive];
+        ++g_reqTimedOut;
+        ItPendLapseRun(p);   /* put back (HovGiveSettled returns the line, CLOSED 2), the note, the REVOKE */
+    }
+    return 1;
+}
+/* A3: THE HOLDER OF A TAKE / BOX TAKE / GROUND PICKUP, just before its ok CONFIRM. 1 = go on (a `held` line stands, or none is kept:
+   the records writer is off or a slot is not known yet - today's road then, D6 included); 0 = the hand-over is REFUSED (the line
+   could not be written - lineFail - or an open line does not fit - lineFull): the caller puts the item back and answers ok 0.
+   T-889 fold 1: E_h and the holder's squad key (review 3), the pack path (review 9); writer off: the CLOSED still goes (review 6). */
+int HovHolderGrant(ItOwnerPend* op, const ItemConfirmMsg& cf, unsigned int fromPeer, int kind)
+{
+    op->hdLine = 0; op->hdNoLine = 0;
+    const int me = HovMe(), asker = net::PlayerSlotOfKey(fromPeer);
+    if (!coop::OwnWriterOn())
+    {
+        ++g_hovNoLine;
+        if (me >= 0 && asker >= 0) { op->hdNoLine = 1; op->hdAsker = asker; op->hdHolder = me; op->hdOther = asker; }
+        return 1;
+    }
+    if (me < 0 || asker < 0) { ++g_hovNoLine; return 1; }
+    hovrec::HandLine l;
+    l.role = hovrec::kRoleSrc; l.state = hovrec::kStHeld; l.kind = kind;
+    l.askerSlot = asker; l.holderSlot = me; l.otherSlot = asker; l.reqId = op->id; l.atUnix = (long long)std::time(0);
+    if (kind == hovrec::kKindGround)
+    {
+        char pb[96];
+        _snprintf_s(pb, sizeof(pb), _TRUNCATE, "%.3f,%.3f,%.3f", op->groundPos[0], op->groundPos[1], op->groundPos[2]);
+        l.where = "g:" + std::string(op->groundKey); l.section = pb;
+    }
+    else if (kind == hovrec::kKindBox) { l.where = "b:" + std::string(op->boxKey); l.section = op->section; HovSetBag(&l, op->bag); }
+    else
+    {
+        l.section = op->section; HovSetBag(&l, op->bag);
+        ::Character* hc = FindSpawned(op->uid);
+        l.where = HovCharWhereOf(hc);   /* T-889 fold 3 (F1): its save-stable id */
+        if (hovrec::CharIdWriteRoad(l.where != hovrec::CharWhereUnknown() ? 1 : 0, 1) == hovrec::kCidRefuse)
+        {
+            ++g_hovCharIdUnread;
+            ErrorLog("[ITEMS] T-889 hand-over " + HovWhy(asker, op->id, me) + ": the holder's character id could not be read - the hand-over is"
+                     " REFUSED and the item stays here (charIdUnread " + N(g_hovCharIdUnread) + ")");
+            return 0;
+        }
+        std::string k;
+        if (ItObj(hc) && coop::OwnSquadKeyOfCharNow((void*)hc, &k) != 0) l.squadKey = k;   /* the lift goes into its next record (write-now) */
+    }
+    l.x = op->x; l.y = op->y;
+    int w = 0;
+    if (HovItemBytes(cf, &l.item) == 0) ++g_hovC[kHovLineFail];
+    else { l.seqE = coop::OwnSeqReserve(); w = HovPut(l); }   /* E_h: after the lift - every later record of this squad lacks the item */
+    if (w != 1)
+    {
+        ErrorLog("[ITEMS] T-889 hand-over " + HovWhy(asker, op->id, me) + " (" + std::string(hovrec::KindName(kind)) + "): the holder's record line"
+                 " could not be written (lineFail " + N(g_hovC[kHovLineFail]) + ", lineFull " + N(g_hovC[kHovLineFull]) + ") - the hand-over is REFUSED"
+                 " and the item stays here");
+        return 0;
+    }
+    op->hdLine = 1; op->hdAsker = asker; op->hdHolder = me; op->hdOther = asker;
+    g_hovLive[HovKey(asker, op->id, me, hovrec::kRoleSrc)] = coop::OwnLoadGen();
+    ++g_hovC[kHovHeld];
+    if (HovSay(g_hovC[kHovHeld]))
+        DebugLog("[ITEMS] T-889 hand-over " + HovWhy(asker, op->id, me) + " (" + std::string(hovrec::KindName(kind)) + "): HELD line written"
+                 " before the ok CONFIRM - the item is kept by this record until the asker's answer (itemHandover held)");
+    return 1;
+}
+/* A4, TAKE: the taker's `in` line BEFORE ItTakerAdd, E reserved now (a record written after the placement has a larger seq; a save
+   asked for after it has a mark of at least E). 0 = refused (no line, no placement: PLACED ok=0 puts it back on the holder);
+   1 = no line kept (writer off / slot unknown); 2 = written (HovTakerInDone then keeps or drops it by the add's answer). */
+int HovTakerIn(const ItPending& p, const ItemConfirmMsg& cf, ::Character* c, int qty)
+{
+    if (!coop::OwnWriterOn()) { ++g_hovNoLine; return 1; }
+    const int me = HovMe(), holder = net::ItemAskedSlot(p.id);
+    if (me < 0 || holder < 0) { ++g_hovNoLine; return 1; }
+    hovrec::HandLine l;
+    l.role = hovrec::kRoleDst; l.state = hovrec::kStIn; l.kind = (p.ghostIsBox != 0) ? hovrec::kKindBox : hovrec::kKindTake;
+    l.askerSlot = me; l.holderSlot = holder; l.otherSlot = holder; l.reqId = p.id; l.atUnix = (long long)std::time(0);
+    if (p.localIsBox != 0) l.where = "b:" + std::string(p.localBoxKey);
+    else
+    {
+        l.where = HovCharWhereOf(c != 0 ? c : FindSpawned(p.mineUid));   /* T-889 fold 3 (F1): its save-stable id */
+        if (hovrec::CharIdWriteRoad(l.where != hovrec::CharWhereUnknown() ? 1 : 0, 1) == hovrec::kCidRefuse)
+        {
+            ++g_hovCharIdUnread;
+            ErrorLog("[ITEMS] T-889 take " + HovWhy(me, p.id, holder) + ": the taker's character id could not be read - NOT placed here; PLACED"
+                     " ok=0 puts it back on the holder (charIdUnread " + N(g_hovCharIdUnread) + ")");
+            return 0;
+        }
+    }
+    l.section = p.localSection; l.x = p.localX; l.y = p.localY;   /* the square asked for; HovTakerInDone writes where it really ended */
+    HovSetBag(&l, p.localBag);
+    if (c != 0 && p.localIsBox == 0) { std::string k; if (coop::OwnSquadKeyOfCharNow((void*)c, &k) != 0) l.squadKey = k; }
+    ItemConfirmMsg cq = cf;
+    cq.quantity = (qty > 0) ? qty : 1;   /* T-889 fold 3 (F5): the stack size really placed (a confirm's 0 is the request's size) */
+    int w = 0;
+    if (HovItemBytes(cq, &l.item) == 0) ++g_hovC[kHovLineFail];
+    else { l.seqE = coop::OwnSeqReserve(); w = HovPut(l); }
+    if (w != 1)
+    {
+        ErrorLog("[ITEMS] T-889 take " + HovWhy(me, p.id, holder) + " ('" + cf.baseSid + "'): the taker's record line could not be written (lineFail "
+                 + N(g_hovC[kHovLineFail]) + ", lineFull " + N(g_hovC[kHovLineFull]) + ") - NOT placed here; PLACED ok=0 puts it back on the holder");
+        return 0;
+    }
+    return 2;
+}
+/* T-889 fold 3 (F2): the add's answer. Placed: THE PLACED STEP - the line rewritten with where the add really ended (it may merge onto a
+   stack, or move to the first free square): its square, the stack there after it and what that square held before (the section's
+   stacks of this item before - `before`, snapOk - and after, hovrec::PlacedWhere). Until that rewrite lands - a crash between the add and
+   it, or an end that cannot be told - the line's look answers unknown, never "not placed". */
+void HovTakerInDone(const ItPending& p, int placed, ::InventorySection* sec, int snapOk, const std::vector<hovrec::PlStack>& before,
+                    const ItemConfirmMsg& cf, int qty)
+{
+    const int me = HovMe(), holder = net::ItemAskedSlot(p.id);
+    if (placed == 0) { HovDrop(me, p.id, holder, hovrec::kRoleDst); return; }   /* the line goes with the add that failed */
+    g_hovLive[HovKey(me, p.id, holder, hovrec::kRoleDst)] = coop::OwnLoadGen();
+    ++g_hovC[kHovIn];
+    std::vector<hovrec::PlStack> after;
+    int x = 0, y = 0, pre = 0, got = 0;
+    const int known = (snapOk != 0 && HovSecSnap(sec, cf, &after) != 0 && hovrec::PlacedWhere(before, after, qty, &x, &y, &pre, &got) != 0) ? 1 : 0;
+    hovrec::HandLine l;
+    int w = 0;
+    if (known != 0 && HovFind(me, p.id, holder, hovrec::kRoleDst, &l) == 1)
+    {
+        l.x = x; l.y = y; l.plHas = 1; l.plPre = pre; l.plGot = got;
+        w = HovPut(l);
+    }
+    if (w == 1) ++g_hovPlacedSet;
+    else if (HovSay(++g_hovPlacedUnknown))
+        ErrorLog("[ITEMS] T-889 take " + HovWhy(me, p.id, holder) + ": " + std::string(known != 0 ? "where the add ended could not be written into its line"
+                 : "where the add ended could not be told (a merge over several stacks, or an unreadable section)") + " - the line's look stays"
+                 " UNKNOWN, never 'not placed'; its records or a live answer settle it (placedUnknown)");
+    if (HovSay(g_hovC[kHovIn]))
+        DebugLog("[ITEMS] T-889 take " + HovWhy(me, p.id, holder) + ": IN line written before the placement; "
+                 + (w == 1 ? "placed at " + N((long long)x) + "," + N((long long)y) + " (" + N((long long)pre) + " -> " + N((long long)got) + ")"
+                           : std::string("its end not written down")) + " (itemHandover in)");
+}
+/* review 6: a placement made here with NO line (writer off) - remembered for this process, so a QUERY before the next load is answered */
+void HovNotePlacedNoLine(int asker, unsigned int reqId, int holder)
+{
+    if (asker < 0 || holder < 0 || coop::OwnWriterOn()) return;
+    g_hovPlacedMem[HovKey(asker, reqId, holder, hovrec::kRoleDst)] = coop::OwnLoadGen();
+}
+/* T-889 fold 4 (G1): EVERY ADD OF A TAKEN ITEM - the live confirm's (ApplyItemConfirm) and the late one's (ItLateTakePlace: a confirm
+   that came after our own 10 s) - goes through this one road: this item's stacks in the section before; the taker's in line BEFORE the
+   add (refused: nothing is added, and PLACED ok=0 puts it back on the holder); the add; then its placed step (HovTakerInDone - or the
+   line goes with an add that failed); with no line kept, the placement is remembered for this process. Returns the add's answer. */
+int HovTakerAddLined(const ItPending& p, const ItemConfirmMsg& cf, ::Character* c, ::InventorySection* sec, ItemMoveMsg* mm, int mergeOnto, int late)
+{
+    if (sec == 0) return 0;
+    std::vector<hovrec::PlStack> before;
+    const int snap = HovSecSnap(sec, cf, &before);
+    const int hdIn = HovTakerIn(p, cf, c, mm->quantity);
+    const int ok = (hovrec::TakerMayAdd(hdIn) != 0) ? ItTakerAdd(c, sec, mm, p.localX, p.localY, &cf.bag, mergeOnto) : 0;
+    const int step = hovrec::TakerLineStep(hdIn, ok);
+    if (step == hovrec::kTlStep) HovTakerInDone(p, ok, sec, snap, before, cf, mm->quantity);
+    else if (step == hovrec::kTlMemory) HovNotePlacedNoLine(HovMe(), p.id, net::ItemAskedSlot(p.id));
+    if (late != 0 && hdIn == 2 && ok != 0 && HovSay(++g_hovLateTakeLined))
+        DebugLog("[ITEMS] T-889 take " + HovWhy(HovMe(), p.id, net::ItemAskedSlot(p.id)) + ": a LATE take (its confirm after our own 10 s) placed"
+                 " with its in line written before the add and its placed step after (lateTakeLined)");
+    return ok;
+}
+/* A4, GIVE: the owner the give was built on - its `in` line, E reserved now. The item is already built: a line that cannot be written
+   is said out loud (its verdict after a death of the giver's game would say not placed - a double). */
+void HovOwnerIn(const ItemRequestMsg& r, unsigned int fromPeer, ::Character* c, int landedX, int landedY)
+{
+    const int giver = net::PlayerSlotOfKey(fromPeer);
+    if (!coop::OwnWriterOn()) { ++g_hovNoLine; HovNotePlacedNoLine(giver, r.id, giver); return; }
+    if (giver < 0) { ++g_hovNoLine; return; }
+    hovrec::HandLine l;
+    l.role = hovrec::kRoleDst; l.state = hovrec::kStIn; l.kind = hovrec::kKindGive;
+    l.askerSlot = giver; l.holderSlot = giver; l.otherSlot = giver; l.reqId = r.id; l.atUnix = (long long)std::time(0);
+    if (r.ownerUid == 0) l.where = "b:" + r.ownerBoxKey;
+    else
+    {
+        l.where = HovCharWhereOf(c != 0 ? c : FindSpawned(r.ownerUid));   /* T-889 fold 3 (F1): its save-stable id */
+        if (hovrec::CharIdWriteRoad(l.where != hovrec::CharWhereUnknown() ? 1 : 0, 0) == hovrec::kCidUnknown)
+        {   /* built already: the line names no character - it holds (its look unknown, never "not placed") */
+            ++g_hovCharIdUnread;
+            ErrorLog("[ITEMS] T-889 give " + HovWhy(giver, r.id, giver) + " built here: the owner character's id could not be read - its line names"
+                     " no character, so a look at it answers unknown (charIdUnread " + N(g_hovCharIdUnread) + ")");
+        }
+    }
+    l.section = r.ownerSection; l.x = landedX; l.y = landedY;
+    l.plHas = 1; l.plPre = 0; l.plGot = (r.quantity > 0) ? r.quantity : 1;   /* F2: written after the build - a fresh square (ItOwnerGive never merges) */
+    HovSetBag(&l, ItBagPathFromWire(r.ownerBag));
+    if (c != 0 && r.ownerUid != 0) { std::string k; if (coop::OwnSquadKeyOfCharNow((void*)c, &k) != 0) l.squadKey = k; }
+    {   /* the item's bytes in the confirm body's shape - a CLOSED 2 / live look names it by them */
+        ItemConfirmMsg cf;
+        cf.id = r.id; cf.ok = 1; cf.quantity = (r.quantity > 0) ? r.quantity : 1;
+        cf.baseSid = r.baseSid; cf.companySid = r.companySid; cf.materialSid = r.materialSid; cf.colorSid = r.colorSid;
+        cf.quality = r.quality; cf.charges = r.charges; cf.functionKind = r.functionKind; cf.level = r.level; cf.unique = r.unique;
+        cf.bag = r.bag; cf.owner = r.owner; cf.gear = r.gear;
+        if (HovItemBytes(cf, &l.item) == 0) l.item.clear();
+    }
+    l.seqE = coop::OwnSeqReserve();
+    if (HovPut(l) != 1)
+    {
+        ErrorLog("[ITEMS] T-889 give " + HovWhy(giver, r.id, giver) + " built here, but its IN line could not be written (lineFail " + N(g_hovC[kHovLineFail])
+                 + ", lineFull " + N(g_hovC[kHovLineFull]) + "): if the giver's game dies before its CLOSED, this game would answer 'not placed' - a DOUBLE");
+        return;
+    }
+    g_hovLive[HovKey(giver, r.id, giver, hovrec::kRoleDst)] = coop::OwnLoadGen();
+    ++g_hovC[kHovIn];
+}
+/* the live owner row of a holder line (a TAKE / box / ground escrow), 0 none */
+ItOwnerPend* HovRowOf(const hovrec::HandLine& l)
+{
+    for (int i = 0; i < kOwnerPendCap; ++i)
+    {
+        ItOwnerPend* const p = &g_ownerPend[i];
+        if (p->used != 0 && p->hdLine != 0 && p->dir == 0 && p->id == l.reqId && p->hdAsker == l.askerSlot && p->hdHolder == l.holderSlot) return p;
+    }
+    return 0;
+}
+/* the giver's own request still waiting for its answer (a GIVE line), 0 none */
+ItPending* HovGiveRowOf(const hovrec::HandLine& l)
+{
+    for (int i = 0; i < kPendCap; ++i)
+        if (g_pend[i].used != 0 && g_pend[i].hdLine != 0 && g_pend[i].id == l.reqId && g_pend[i].hdMe == l.holderSlot) return &g_pend[i];
+    return 0;
+}
+/* a holder line whose row is still on its live 10 s answer (not escrow) or whose give still waits: not asked yet */
+int HovRowBusy(const hovrec::HandLine& l)
+{
+    if (l.kind == hovrec::kKindGive) return (HovGiveRowOf(l) != 0) ? 1 : 0;
+    ItOwnerPend* const p = HovRowOf(l);
+    return (p != 0 && p->escrow == 0) ? 1 : 0;
+}
+/* review 6 / 10: a row (lined or not) of that transfer is still open here - its live answer settles it */
+int HovTransferRowLive(int asker, unsigned int reqId, int holder)
+{
+    for (int i = 0; i < kOwnerPendCap; ++i)
+    {
+        const ItOwnerPend& p = g_ownerPend[i];
+        if (p.used != 0 && p.dir == 0 && p.id == reqId && (p.hdLine != 0 || p.hdNoLine != 0) && p.hdAsker == asker && p.hdHolder == holder) return 1;
+    }
+    for (int i = 0; i < kPendCap; ++i)
+        if (g_pend[i].used != 0 && g_pend[i].id == reqId && (g_pend[i].hdLine != 0 || g_pend[i].hdNoLine != 0) && g_pend[i].hdMe == holder && asker == holder) return 1;
+    const std::string key = HovKey(asker, reqId, holder, hovrec::kRoleSrc);
+    return (g_hovParkedTake.find(key) != g_hovParkedTake.end() || g_hovParkedGive.find(key) != g_hovParkedGive.end()) ? 1 : 0;
+}
+/* T-889 fold 2 (N3): Character::hasDied under SEH - 1 dead, 0 alive, -1 unreadable (no C++ object in this frame) */
+int HovDeadPod(::Character* c)
+{
+    __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* N3: where a character line's item is rebuilt (hovrec::CharRebuildRoute). Ours: this game runs it AND its faction is this game's
+   player faction (the items.cpp own-character test, as the stand-in shuffle's); another player's: a stand-in faction (IsPeerFaction). */
+int HovCharRoute(::Character* c, unsigned int uid)
+{
+    if (!ItObj(c)) return hovrec::CharRebuildRoute(0, 0, 0, 0, 0, 0);
+    void* f = 0;
+    const int fr = (ItFactionPod((void*)c, &f) != 0 && f != 0) ? 1 : 0;
+    const int own = (fr != 0 && (f == (void*)LocalPlayerFaction() || IsPlayerFaction((::Faction*)f))) ? 1 : 0;
+    const int other = (fr != 0 && own == 0 && IsPeerFaction((::Faction*)f)) ? 1 : 0;
+    return hovrec::CharRebuildRoute(1, HovDeadPod(c), net::IsUidMine(uid) ? 1 : 0, fr, own, other);
+}
+/* the line's item built (GrBuild, its pack rows included) and put on this game's ground at pos - ground this game holds: its name
+   bound and GROUND ADD sent (GroundUndoTake's road). key: the name it carries (a ground line's own key; "" = its own key where it
+   landed - N3); exceptAsker: the asker's game is not told (a ground line: it did the same on its own ground). A built item that
+   could not be put down is freed (review 8). 1 on the ground; 0 not (*why). */
+int HovGroundPut(const ItemMoveMsg& mm, const ItemConfirmMsg& cf, const float* pos, const std::string& key, const hovrec::HandLine& l,
+                 int exceptAsker, const char** why)
+{
+    const char* bwhy = "";
+    ::Item* it = GrBuild(mm, &cf.bag, 0, &bwhy);
+    if (it == 0) { *why = "the item could not be built"; return 0; }
+    if (GroundPutBackOk((void*)it, pos, "T-889: a hand-over's item rebuilt on the ground") == 0)
+    {
+        ItDestroyPod((void*)it, "T-889: a rebuilt ground item that could not be put down");   /* review 8: never left in no place */
+        *why = "the built item could not be put on the ground (freed)";
+        return 0;
+    }
+    const std::string k = !key.empty() ? key : GrKeyOf((void*)it);
+    int told = 0, gw = 0;
+    if (k.empty()) told = 0;
+    else if (exceptAsker != 0) told = GrSendAddExcept((void*)it, k, mm.quantity, cooplive::RelayPeerId((unsigned int)l.askerSlot), 1, &gw);
+    else { GrSendAdd((void*)it, k, mm.quantity); told = 1; }
+    DebugLog("[GROUND] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the rebuilt item is on this game's ground under its name "
+             + (k.empty() ? std::string("(none - its key would not read)") : k) + "; GROUND ADD to the other games "
+             + std::string(told != 0 ? "sent" : "NOT sent (their parity catch-up shows it)"));
+    return 1;
+}
+/* A7: THE RESTORE WITH NO OBJECT (after a reload): the item rebuilt from the line's bytes where it was. T-889 fold 3 (F4): 2 = not rebuilt -
+   a character gone for good still carries it (the exact search of its whole inventory found it): the caller closes with no rebuild.
+   1 rebuilt; 0 failed (counted
+   rebuildFail; not tried again before the next load - review 8); -1 wait (its character / box / ground is not loaded here or not this
+   game's to write now - review 9; asked again). A character: through its pack path, else the section the pack sat in (review 9). The
+   ground: the item built as the ground road builds it (GrBuild, its pack rows included), put back, its name bound and GROUND ADD sent
+   to the other games except the asker - GroundUndoTake's road; a failed put-back frees the built item (review 8). */
+/* T-889 fold 5b: where a rebuild ended, for a receiver's line - its section's stacks of the item before the add (snapOk 0: not on the
+   line's own path - the pack fallback - or unreadable: its end not told), then hovrec::PlacedWhere; toGround: put on the ground */
+struct HovRbPlace
+{
+    int toGround, snapOk, known, x, y, pre, got;
+    std::vector<hovrec::PlStack> before;
+    HovRbPlace() : toGround(0), snapOk(0), known(0), x(0), y(0), pre(0), got(0) {}
+};
+void HovRbWhere(HovRbPlace* pl, ::InventorySection* sec, const ItemConfirmMsg& cf, int qty)
+{
+    std::vector<hovrec::PlStack> after;
+    pl->known = (pl->snapOk != 0 && HovSecSnap(sec, cf, &after) != 0
+                 && hovrec::PlacedWhere(pl->before, after, qty, &pl->x, &pl->y, &pl->pre, &pl->got) != 0) ? 1 : 0;
+}
+int HovRebuild(const hovrec::HandLine& l, HovRbPlace* pl = 0)
+{
+    const std::string fkey = HovKey(l.askerSlot, l.reqId, l.holderSlot, l.role);
+    {
+        std::map<std::string, long>::const_iterator fg = g_hovRebuildFailGen.find(fkey);
+        if (fg != g_hovRebuildFailGen.end() && fg->second == coop::OwnLoadGen()) return -1;
+    }
+    ItemConfirmMsg cf;
+    if (HovDecode(l, &cf) == 0)
+    {
+        ++g_hovC[kHovRebuildFail];
+        g_hovRebuildFailGen[fkey] = coop::OwnLoadGen();
+        ErrorLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": its item bytes would not decode - NOT rebuilt (rebuildFail)");
+        return 0;
+    }
+    ItemMoveMsg mm;
+    mm.baseSid = cf.baseSid; mm.companySid = cf.companySid; mm.materialSid = cf.materialSid; mm.colorSid = cf.colorSid;
+    mm.quality = cf.quality; mm.charges = cf.charges; mm.functionKind = cf.functionKind; mm.level = cf.level; mm.unique = cf.unique;
+    mm.quantity = (cf.quantity > 0) ? cf.quantity : 1; mm.owner = cf.owner; mm.gear = cf.gear;
+    int ok = 0, lx = l.x, ly = l.y, reason = 0, wait = 0;
+    const char* why = "not this game's to write now";
+    if (l.where[0] == 'c')
+    {
+        unsigned int uid = 0;
+        ::Character* c = HovLineChar(l, &uid);   /* T-889 fold 3 (F1): by its save-stable id, now */
+        const int route = HovCharRoute(c, uid);
+        int grb = hovrec::kGrbRebuild;
+        if (route == hovrec::kRebGround)
+        {   /* T-889 fold 3 (F4): its reloaded copy may still carry it (a captured character's faction is neither ours nor another
+               player's) - the exact search of its whole inventory, every pack in it, first */
+            ::Inventory* top = ItInventoryOf(c);
+            int sqHit = 0;
+            {   /* T-889 fold 4 (G4): the line's own square, through its pack path, first */
+                ::Character* sc = 0;
+                ::Inventory* sinv = 0;
+                const ItBagPath sbp = HovBagOf(l);
+                ::InventorySection* ssec = ItResolvePath(uid, 0, l.section, sbp, &sc, &sinv);
+                void* at = 0;
+                if (ssec != 0 && sinv != 0 && ItSlotInSectionWhy(ssec, l.x, l.y) == 1 && ItGetAtPod(ssec, l.x, l.y, &at) != 0 && at != 0
+                    && HovItemIs(at, cf, mm.quantity, 0) != 0) sqHit = 1;
+            }
+            HovHit ex, lg;
+            std::memset(&ex, 0, sizeof(ex)); std::memset(&lg, 0, sizeof(lg));
+            const int treeHit = (sqHit == 0 && top != 0) ? HovTreeFind(top, cf, mm.quantity, 0, &ex, &lg) : 0;
+            const int hit = hovrec::GroundSearchHit(sqHit, treeHit);
+            grb = hovrec::GroundRebuildCheck((sqHit != 0 || top != 0) ? 1 : 0, (hit != hovrec::kGsNone) ? 1 : 0);
+            if (grb == hovrec::kGrbHolds)
+            {
+                ++g_hovGroundSearchHolds;
+                if (hit == hovrec::kGsElsewhere && ++g_hovTwinElsewhere == 1)
+                    DebugLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the item was found on the character gone for"
+                             " good, but NOT on the line's own square - taken as carried (no ground rebuild), though it may be an identical twin stack"
+                             " (twinElsewhere; logged once)");
+                DebugLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": its character (uid " + N((long long)uid) + ") is"
+                         " gone for good, but still carries the item - NO ground rebuild (groundSearchHolds)");
+                return 2;
+            }
+        }
+        if (route == hovrec::kRebWait) { wait = 1; why = "our character is not loaded here (or unreadable), or run by another game for now"; }
+        else if (route == hovrec::kRebGround && grb == hovrec::kGrbWait) { wait = 1; why = "the character is gone for good, but its inventory would not read"; }
+        else if (route == hovrec::kRebGround)
+        {   /* T-889 fold 2 (N3): dead, dismissed or now another player's - the item goes on the ground at its feet */
+            float pos[3] = { 0.0f, 0.0f, 0.0f };
+            if (ItBoxPosPodRaw((void*)c, pos) != 1) { wait = 1; why = "the character is gone for good, but its position would not read"; }
+            else if (ItAreaVerdictAt(pos, kAreaForGround) != kBoxMine) { wait = 1; why = "the character is gone for good, and this game does not hold the ground at its feet now"; }
+            else if ((ok = HovGroundPut(mm, cf, pos, std::string(), l, 0, &why)) != 0)
+            {
+                ++g_hovRebuildToGround;
+                if (pl != 0) pl->toGround = 1;   /* T-889 fold 5b */
+                DebugLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": its character (uid " + N((long long)uid) + ") is gone"
+                         " for good (dead, dismissed or now another player's) - the item is rebuilt ON THE GROUND at its feet (rebuildToGround)");
+            }
+        }
+        else
+        {
+            ::Character* wc = 0;
+            ::Inventory* inv = 0;
+            const ItBagPath bp = HovBagOf(l);
+            ::InventorySection* sec = ItResolvePath(uid, 0, l.section, bp, &wc, &inv);
+            const int onPath = (sec != 0) ? 1 : 0;   /* T-889 fold 5b */
+            if (sec == 0 && bp.has != 0) sec = ItResolve(uid, std::string(bp.section), &wc, &inv);   /* the pack is gone: the section it sat in */
+            if (sec == 0) why = "its section (or the pack it sat in) is not on our character";
+            else
+            {
+                if (pl != 0 && onPath != 0) pl->snapOk = HovSecSnap(sec, cf, &pl->before);   /* T-889 fold 5b: where it ends, for a receiver's line */
+                ok = ItOwnerGive(wc != 0 ? wc : c, sec, &mm, l.x, l.y, &lx, &ly, &reason, &cf.bag, 0);
+                if (ok != 0 && pl != 0) HovRbWhere(pl, sec, cf, mm.quantity);
+            }
+            if (ok != 0) coop::OwnMarkCharDirtyNow((void*)c);   /* write-now: the restored item is in its next record */
+        }
+    }
+    else if (l.where[0] == 'b')
+    {
+        const std::string key = l.where.substr(2);
+        if (ItBoxHolderVerdict(key.c_str()) != kBoxMine || ItBoxResolve(key.c_str()) == 0) { wait = 1; why = "this game does not hold that box's patch of map now"; }
+        else
+        {
+            ::Character* wc = 0;
+            ::Inventory* inv = 0;
+            const ItBagPath bp = HovBagOf(l);
+            ::InventorySection* sec = ItResolvePath(0, key.c_str(), l.section, bp, &wc, &inv);
+            const int onPath = (sec != 0) ? 1 : 0;   /* T-889 fold 5b */
+            if (sec == 0 && bp.has != 0) { void* bld = 0; sec = ItBoxSection(key.c_str(), std::string(bp.section), &bld, &inv); }
+            if (sec == 0) why = "the box's section (or the pack it sat in) is not there";
+            else
+            {
+                if (pl != 0 && onPath != 0) pl->snapOk = HovSecSnap(sec, cf, &pl->before);   /* T-889 fold 5b: where it ends, for a receiver's line */
+                ok = ItOwnerGive(0, sec, &mm, l.x, l.y, &lx, &ly, &reason, &cf.bag, 0);
+                if (ok != 0 && pl != 0) HovRbWhere(pl, sec, cf, mm.quantity);
+            }
+        }
+    }
+    else
+    {
+        float pos[3] = { 0.0f, 0.0f, 0.0f };
+        if (std::sscanf(l.section.c_str(), "%f,%f,%f", &pos[0], &pos[1], &pos[2]) != 3) why = "its ground position would not read";
+        else if (ItAreaVerdictAt(pos, kAreaForGround) != kBoxMine) { wait = 1; why = "this game does not hold that ground now (the area's holder changed or it is not loaded)"; }
+        else ok = HovGroundPut(mm, cf, pos, l.where.substr(2), l, 1, &why);   /* T-889 fold 2: the same road, shared with N3 */
+    }
+    if (ok == 0 && wait != 0)
+    {
+        if (HovSay(++g_hovRebuildWait))
+            DebugLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": not placed on the other game - the rebuild WAITS ("
+                     + std::string(why) + "); asked again in 60 s (rebuildWait)");
+        return -1;
+    }
+    if (ok == 0)
+    {
+        ++g_hovC[kHovRebuildFail];
+        g_hovRebuildFailGen[fkey] = coop::OwnLoadGen();
+        ErrorLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + " ('" + cf.baseSid + "' x" + N((long long)mm.quantity) + " at "
+                 + l.where + " " + l.section + "): the other game says NOT PLACED, but the item could NOT be rebuilt here (" + std::string(why)
+                 + ", reason " + N((long long)reason) + ") - the line is kept; not tried again before the next load (rebuildFail)");
+        return 0;
+    }
+    DebugLog("[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": REBUILT '" + cf.baseSid + "' x" + N((long long)mm.quantity)
+             + " at " + l.where + " " + l.section + " " + N((long long)lx) + "," + N((long long)ly) + " (the other game never placed it)");
+    return 1;
+}
+/* a provisional copy here removed on CLOSED(returned): the line's square through its pack path, else the character's / box's whole
+   inventory and its packs by record and stack size (review 14) */
+void HovRemoveCopy(const hovrec::HandLine& l)
+{
+    ::Character* c = 0;
+    const int r = HovLiveCopy(l, 1, 1, &c);
+    if (r == 1) { ++g_hovCopyRemoved; if (c != 0) coop::OwnMarkCharDirtyNow((void*)c); }
+    const std::string said = "[ITEMS] T-889 hand-over " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": its holder has the item back - the provisional copy at "
+             + l.where + " " + l.section + " " + N((long long)l.x) + "," + N((long long)l.y)
+             + (r == 1 ? std::string(" was REMOVED (copyRemoved)") : r < 0 ? std::string(" could not be looked at (not loaded / not ours now) - it STAYS: a double")
+                                                                           : std::string(" was NOT found (used or moved away) - it stays: a double"));
+    if (r == 1) DebugLog(said); else ErrorLog(said);
+}
+/* T-889 fold 5: is the item of a live in line in a COMMITTED record of this game? The squad its character is in now (a member moved), else
+   the squad named in the line; *squadKnown 0 = neither (a box: its record is not this game's). hovrec::InRecordDurable's answer. */
+int HovInDurable(const hovrec::HandLine& l, int* squadKnown)
+{
+    std::string k = l.squadKey;
+    ::Character* c = HovLineChar(l, 0);
+    std::string now;
+    if (ItObj(c) && coop::OwnSquadKeyOfCharPeek((void*)c, &now) != 0 && !now.empty()) k = now;
+    *squadKnown = k.empty() ? 0 : 1;
+    if (k.empty()) return hovrec::kDurNo;
+    unsigned long long cs = 0ULL, at = 0ULL, ref = 0ULL;
+    const int haveC = coop::OwnStoreCommittedSeq(k, &cs) ? 1 : 0;
+    const int haveS = coop::OwnSkipSameSince(k, &at, &ref);
+    return hovrec::InRecordDurable(haveC, cs, l.seqE, haveS, at, ref);
+}
+/* the receiver's own answer for its in line - a QUERY's VERDICT, and (fold 5) a CLOSED 1 after a load: its records, then a look at its
+   square (review 7 / fold 2 N1); the first after-load 0 / 1 frozen into the line */
+int HovReceiverVerdict(hovrec::HandLine* lp, const std::string& key, int* liveOut, unsigned long long* appliedOut, int* lookedOut)
+{
+    hovrec::HandLine& l = *lp;
+    const int live = HovLiveNow(key);
+    int squadKnown = 0;
+    const unsigned long long applied = HovAppliedFor(l, &squadKnown);
+    const int holds = hovrec::HoldsAfterLoad(applied, coop::OwnOverlayMarkSeq(), l.seqE);
+    int v = hovrec::Verdict(1, l.frozen, live, holds, squadKnown, coop::OwnOverlayMarkRule(), 1, 1);
+    int looked = -2;
+    if (v == hovrec::kVUnknown)
+    {   /* review 7: look at the receiver's loaded character / box before answering "unknown" */
+        looked = HovLiveCopy(l, 0, 0, 0);   /* T-889 fold 2 (N1): the line's own square, by the line's exact item - never anywhere by record */
+        v = hovrec::ResolveUnknownLive(v, 1, looked);
+        if (looked >= 0) ++g_hovLiveVerdict;
+    }
+    if (hovrec::VerdictFreezes(1, l.frozen, live, v) != 0)
+    {
+        l.frozen = v;
+        if (HovPut(l) != 1) ErrorLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the after-load verdict could not be frozen into its line");
+    }
+    *liveOut = live; *appliedOut = applied; *lookedOut = looked;
+    return v;
+}
+/* T-889 fold 5b: a rebuild at the taker in this load - its line rewrite not landed yet, or a ground rebuild whose drop has not: never a
+   second rebuild in the same load (the rewrite is tried again; a ground one drops) */
+struct HovTkRb { long gen; int toGround; int rewritten; hovrec::HandLine line; };
+std::map<std::string, HovTkRb> g_hovTakerRb;
+/* T-889 fold 5b: CLOSED 1 AFTER A LOAD WITH OUR OWN VERDICT 0. The holder gave its copy up at PLACED ok=1; when our loaded, readable
+   character / box definitely lacks the item (the line's square, then the exact item anywhere in it), it is rebuilt from the line's own
+   item bytes through the holder's rebuild road (HovRebuild: into the character / box - its square, else its pack's section; on the ground
+   at the feet of a character gone for good, after the exact search; waits when not loaded). A new E is reserved BEFORE the add and the
+   line rewritten after it (E, frozen cleared, where the rebuild ended), then live: the fold-5 road ACKs once our record holding it
+   commits. A crash before that commit reloads a state without it: verdict 0 again, rebuilt again - never a double, since a record at or
+   past the new E (or a save asked for after it) answers "holds". Returns hovrec::kTnKeep / kTnLive / kTnDropNow; *lp: the line now. */
+int HovTakerRebuild(hovrec::HandLine* lp, const std::string& key, int verdict)
+{
+    hovrec::HandLine& l = *lp;
+    const long gen = coop::OwnLoadGen();
+    std::map<std::string, HovTkRb>::iterator tr = g_hovTakerRb.find(key);
+    if (tr != g_hovTakerRb.end() && tr->second.gen != gen) { g_hovTakerRb.erase(tr); tr = g_hovTakerRb.end(); }
+    if (tr != g_hovTakerRb.end())
+    {   /* rebuilt already in this load */
+        if (tr->second.toGround != 0) return hovrec::kTnDropNow;
+        if (tr->second.rewritten == 0 && HovPut(tr->second.line) == 1) tr->second.rewritten = 1;
+        if (tr->second.rewritten == 0) return hovrec::kTnKeep;
+        l = tr->second.line;
+        g_hovLive[key] = gen;
+        return hovrec::kTnLive;
+    }
+    /* the look: the line's square (G3 when it does not show the placement), then the exact item anywhere in the character / box */
+    const int sq = HovLiveCopy(l, 0, 0, 0);
+    int scan = 0, exactN = 0, kindN = 0;   /* kindN: any stack of the item - a merged / split / used stack may hold it: never rebuilt over it (re-check of fold 5b) */
+    if (sq == 0)
+    {
+        ItemConfirmMsg cf;
+        ::Inventory* top = 0;
+        if (HovDecode(l, &cf) != 0 && l.where.size() > 2)
+        {
+            if (l.where[0] == 'c') { ::Character* c = HovLineChar(l, 0); if (ItObj(c)) top = ItInventoryOf(c); }
+            else if (l.where[0] == 'b') { void* b = ItBoxResolve(l.where.c_str() + 2); if (b != 0) top = ItBoxInventory(b); }
+        }
+        if (top != 0) scan = HovTreeKind(top, cf, (cf.quantity > 0) ? cf.quantity : 1, 0, &kindN, &exactN);
+    }
+    const int lack = hovrec::TakerLackLook(sq, scan, (exactN > 0 || kindN > 0) ? 1 : 0);
+    if (hovrec::TakerClosedAfterLoad(verdict, lack) != hovrec::kTcRebuild)
+    {
+        if (HovSay(++g_hovTakerRebuildWait))
+            DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": CLOSED 1 after a load, our verdict " + N((long long)verdict)
+                     + ", but " + std::string(lack == hovrec::kTlkFound ? "the item is found here after all" : "our character / box is not loaded or would not read")
+                     + " - NOT rebuilt; the line kept, no ACK (takerRebuildWait)");
+        return hovrec::kTnKeep;
+    }
+    const unsigned long long e2 = coop::OwnSeqReserve();   /* before the add: every record handed to the writer after it holds the item */
+    HovRbPlace pl;
+    const int rb = HovRebuild(l, &pl);
+    hovrec::HandLine nl = l;
+    int rewritten = 0;
+    if (rb == 1 && pl.toGround == 0)
+    {
+        nl.seqE = e2; nl.frozen = hovrec::kVNone;
+        if (pl.known != 0) { nl.x = pl.x; nl.y = pl.y; nl.plHas = 1; nl.plPre = pl.pre; nl.plGot = pl.got; }
+        else nl.plHas = 0;   /* its end not told: the look stays unknown, never "not placed" */
+        rewritten = (HovPut(nl) == 1) ? 1 : 0;
+    }
+    const int next = hovrec::TakerRebuildNext(rb, pl.toGround, rewritten);
+    if (rb == 1)
+    {
+        HovTkRb t; t.gen = gen; t.toGround = pl.toGround; t.rewritten = rewritten; t.line = nl;
+        g_hovTakerRb[key] = t;
+        ++g_hovRebuiltAtTaker;
+        const std::string said = "[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": CLOSED 1 after a load and our loaded "
+            + std::string(l.where[0] == 'b' ? "box" : "character") + " lacks the item - REBUILT here from the line's bytes "
+            + (pl.toGround != 0 ? std::string("on the ground at the feet of its character gone for good; dropped and acknowledged now")
+               : rewritten != 0 ? "(E " + N((long long)e2) + ", " + (pl.known != 0 ? "at " + N((long long)pl.x) + "," + N((long long)pl.y) : std::string("its end not told"))
+                                  + "); acknowledged once our record holding it commits"
+                                : std::string("but its line could NOT be rewritten - no ACK; the rewrite is tried again, never a second rebuild"))
+            + " (rebuiltAtTaker)";
+        if (rewritten != 0 || pl.toGround != 0) DebugLog(said); else ErrorLog(said);
+    }
+    else if (HovSay(++g_hovTakerRebuildWait))
+        DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": CLOSED 1 after a load, our character / box lacks the item, but the"
+                 " rebuild " + std::string(rb == 2 ? "found it on the character gone for good" : rb < 0 ? "waits (its place is not loaded / not ours now)"
+                 : "failed (rebuildFail)") + " - the line kept, no ACK (takerRebuildWait)");
+    if (next == hovrec::kTnLive) { l = nl; g_hovLive[key] = gen; }
+    return next;
+}
+/* fold 5: CLOSED 1 on an in line - 1 = the line is KEPT and not acknowledged (waiting for its record, or after a load not shown held);
+   0 = go on to drop it and acknowledge (hovrec::ClosedPlacedRoad) */
+int HovClosedPlacedWaits(hovrec::HandLine* lp, const std::string& key)
+{
+    const int live = HovLiveNow(key);
+    int squadKnown = 0, dur = hovrec::kDurNo, v = hovrec::kVNone;
+    if (live != 0) dur = HovInDurable(*lp, &squadKnown);
+    else { int lv = 0, lk = -2; unsigned long long ap = 0ULL; v = HovReceiverVerdict(lp, key, &lv, &ap, &lk); }
+    const hovrec::HandLine& l = *lp;
+    const int road = hovrec::ClosedPlacedRoad(live, squadKnown, l.seqE, dur, v);
+    if (road == hovrec::kCpWait)
+    {
+        if (g_hovWaitCommit.find(key) == g_hovWaitCommit.end())
+        {
+            g_hovWaitCommit[key] = coop::OwnLoadGen();
+            if (HovSay(++g_hovClosedWaitCommit))
+                DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": CLOSED 1, but our squad record holding the item is not"
+                         " committed yet (E " + N((long long)l.seqE) + ") - the in line is KEPT and NOT acknowledged (its holder keeps its closed line);"
+                         " dropped and acknowledged once that record lands (closedWaitCommit)");
+        }
+        return 1;
+    }
+    if (road == hovrec::kCpKeep)
+    {
+        if (v == hovrec::kVNot)
+        {   /* T-889 fold 5b: not held after the load - rebuilt here when our container definitely lacks it */
+            const int tn = HovTakerRebuild(lp, key, v);
+            if (tn == hovrec::kTnLive) return HovClosedPlacedWaits(lp, key);   /* now live: fold 5's road - wait for its record, then drop and ACK */
+            if (tn == hovrec::kTnDropNow) return 0;
+        }
+        if (HovSay(++g_hovClosedKeptAfterLoad))
+            ErrorLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": CLOSED 1 after a load, but our own look does not show the item"
+                     " held (verdict " + N((long long)v) + ", E " + N((long long)l.seqE) + ") - the in line and its item bytes are KEPT and NOT"
+                     " acknowledged; the holder gave its copy up: a 0 is rebuilt here once our container is loaded and definitely lacks it, a 2"
+                     " waits (closedKeptAfterLoad)");
+        return 1;
+    }
+    if (road == hovrec::kCpDropNoRecord) ++g_hovClosedNoRecord;
+    if (dur == hovrec::kDurSameBytes) ++g_hovClosedSameBytes;
+    return 0;
+}
+void HovOnClosed(const hovrec::HandMsg& m, int from);   /* fold 5: HovTick re-checks a waiting line through it - defined below, this namespace */
+/* A7, MAIN THREAD, every 5 s from ItOwnerPendExpire: once this game is in the world and its load's overlay has drained, each open line
+   whose other player is in the world asks (QUERY), the first time kQueryFirstMs after this process first saw it, then every 60 s.
+   T-889 fold 1: the pending settles first (review 1); a returned line re-sends its CLOSED 2 until it is acknowledged (review 10). */
+void HovTick(unsigned int now)
+{
+    if (s_hovLastScan != 0 && (unsigned int)(now - s_hovLastScan) < 5000u) return;
+    s_hovLastScan = (now == 0) ? 1u : now;
+    if (!coop::OwnWriterOn() || g_base == 0 || EngineWritesBlocked() || !GameplayRunning() || coop::OwnOverlaySettled() == 0) return;
+    HovSettleTick();
+    const int me = HovMe();
+    if (me < 0 || StoreRosterSlotInWorld(me) == 0) return;
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return;
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        hovrec::HandLine l;
+        if (hovrec::HandLineParse(lines[i], &l) == 0) continue;
+        const int resend = (l.role == hovrec::kRoleSrc && l.state == hovrec::kStReturned) ? 1 : 0;
+        if (hovrec::IsOpen(l.state) == 0 && resend == 0) continue;
+        if (HovOtherHere(l.otherSlot) == 0) continue;
+        const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, l.role);
+        if (l.role == hovrec::kRoleDst)
+        {   /* T-889 fold 5: a live in line waiting for its record after CLOSED 1 - re-checked every scan through the CLOSED 1 road itself */
+            std::map<std::string, long>::iterator wc = g_hovWaitCommit.find(key);
+            if (wc != g_hovWaitCommit.end())
+            {
+                if (wc->second != coop::OwnLoadGen()) g_hovWaitCommit.erase(wc);   /* a load since: its next CLOSED 1 goes by the after-load verdict */
+                else
+                {
+                    hovrec::HandMsg cm;
+                    cm.kind = hovrec::kMsgClosed; cm.asker = (unsigned int)l.askerSlot; cm.reqId = l.reqId; cm.holder = (unsigned int)l.holderSlot;
+                    cm.value = hovrec::kClosedPlaced;
+                    HovOnClosed(cm, l.holderSlot);
+                    continue;
+                }
+            }
+        }
+        if (l.role == hovrec::kRoleSrc && (HovSettlePending(key) != 0 || (resend == 0 && HovRowBusy(l) != 0))) continue;   /* its live answer comes first */
+        HovAsk& a = g_hovAsk[key];
+        if (a.firstSeen == 0) a.firstSeen = s_hovLastScan;
+        if (hovrec::QueryDue(a.firstSeen, a.sent, a.lastAt, now) == 0) continue;
+        const bool sent = (resend != 0)
+            ? net::SendItemHandover(hovrec::kMsgClosed, (unsigned int)l.askerSlot, l.reqId, (unsigned int)l.holderSlot, hovrec::kClosedReturned, l.otherSlot)
+            : net::SendItemHandover(hovrec::kMsgQuery, (unsigned int)l.askerSlot, l.reqId, (unsigned int)l.holderSlot, l.role == hovrec::kRoleSrc ? 0 : 1, l.otherSlot);
+        if (!sent) continue;
+        a.sent = 1; a.lastAt = now;
+        if (resend != 0) continue;
+        ++g_hovC[kHovQuery];
+        if (HovSay(g_hovC[kHovQuery]))
+            DebugLog("[ITEMS] T-889 QUERY " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + " (" + std::string(hovrec::RoleName(l.role)) + " line, "
+                     + std::string(hovrec::KindName(l.kind)) + ") to slot " + N((long long)l.otherSlot) + " (itemHandover query)");
+    }
+}
+/* the receiver answers the holder's QUERY */
+void HovOnQueryAsReceiver(const hovrec::HandMsg& m, int from)
+{
+    if (from != (int)m.holder) { ++g_hovMsgRefused; return; }   /* only the holder the transfer names asks this */
+    const std::string key = HovKey((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst);
+    if (!coop::OwnWriterOn())
+    {   /* review 6: no lines here - memory of this process's own placements, else it truly cannot know */
+        std::map<std::string, long>::const_iterator pm = g_hovPlacedMem.find(key);
+        const int v0 = hovrec::VerdictNoLines((pm != g_hovPlacedMem.end() && pm->second == coop::OwnLoadGen()) ? 1 : 0);
+        HovSend(hovrec::kMsgVerdict, (int)m.asker, m.reqId, (int)m.holder, v0, from);
+        return;
+    }
+    hovrec::HandLine l;
+    const int f = HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst, &l);
+    const int have = (f == 1) ? 1 : 0;
+    const unsigned long long mark = coop::OwnOverlayMarkSeq();
+    const int markRule = coop::OwnOverlayMarkRule();
+    int live = 0, looked = -2;
+    unsigned long long applied = 0ULL;
+    const int v = (have != 0) ? HovReceiverVerdict(&l, key, &live, &applied, &looked)   /* T-889 fold 5: shared with CLOSED 1 after a load */
+                              : hovrec::Verdict(0, hovrec::kVNone, 0, 0, 0, markRule, 1, (f >= 0) ? 1 : 0);
+    HovSend(hovrec::kMsgVerdict, (int)m.asker, m.reqId, (int)m.holder, v, from);
+    DebugLog("[ITEMS] T-889 VERDICT " + N((long long)v) + " for " + HovWhy((int)m.asker, m.reqId, (int)m.holder) + " to slot " + N((long long)from)
+             + " (in line " + N((long long)have) + ", live " + N((long long)live) + ", record seq " + N((long long)applied) + ", save mark " + N((long long)mark)
+             + ", mark rule " + N((long long)markRule) + ", E " + N((long long)(have != 0 ? l.seqE : 0ULL)) + ", frozen " + N((long long)(have != 0 ? l.frozen : -1))
+             + ", looked " + N((long long)looked) + ")");
+}
+/* the holder answers the receiver's QUERY: nothing while its line is held (or a live row / a pending settle still settles it); else CLOSED */
+void HovOnQueryAsHolder(const hovrec::HandMsg& m, int from)
+{
+    hovrec::HandLine l;
+    const int f = HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc, &l);
+    if (f < 0) return;
+    if ((f == 1 && from != l.otherSlot) || (f == 0 && HovMe() != (int)m.holder)) { ++g_hovMsgRefused; return; }
+    const std::string key = HovKey((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc);
+    if (HovSettlePending(key) != 0) return;
+    std::map<std::string, int>::const_iterator mv = g_hovSettledMem.find(key);
+    const int a = hovrec::HolderAnswer(f, f == 1 ? l.state : hovrec::kStHeld, (mv != g_hovSettledMem.end()) ? mv->second : 0,
+                                       HovTransferRowLive((int)m.asker, m.reqId, (int)m.holder), coop::OwnWriterOn() ? 1 : 0);
+    if (a != 0) HovSend(hovrec::kMsgClosed, (int)m.asker, m.reqId, (int)m.holder, a, from);
+}
+/* the holder acts on the receiver's VERDICT */
+void HovOnVerdict(const hovrec::HandMsg& m, int from)
+{
+    hovrec::HandLine l;
+    if (HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc, &l) != 1) return;
+    if (from != l.otherSlot) { ++g_hovMsgRefused; return; }
+    const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc);
+    if (HovSettlePending(key) != 0) return;   /* review 1: its own settle is still being written - nothing else acts on it */
+    if (l.state != hovrec::kStHeld)
+    {   /* already settled: the receiver missed its CLOSED */
+        HovSend(hovrec::kMsgClosed, l.askerSlot, l.reqId, l.holderSlot, (l.state == hovrec::kStReturned) ? hovrec::kClosedReturned : hovrec::kClosedPlaced, l.otherSlot);
+        return;
+    }
+    if (m.value == hovrec::kVHolds) ++g_hovC[kHovVHolds]; else if (m.value == hovrec::kVNot) ++g_hovC[kHovVNot]; else ++g_hovC[kHovVUnknown];
+    if (m.value != hovrec::kVHolds && m.value != hovrec::kVNot)
+    {
+        if (HovSay(g_hovC[kHovVUnknown]))
+            DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the other game cannot tell (verdict 2: its records writer is off,"
+                     " its file unreadable, or its place is not loaded) - the line and the item stay held, asked again in 60 s");
+        return;
+    }
+    if (l.kind == hovrec::kKindGive)
+    {
+        if (HovGiveRowOf(l) != 0) return;   /* the give's own answer settles it */
+        if (HovGiveParkedSettle(key, m.value) != 0) return;   /* review 4: a parked give - its live escrow */
+    }
+    ItOwnerPend* row = (l.kind != hovrec::kKindGive) ? HovRowOf(l) : 0;
+    if (row == 0 && l.kind != hovrec::kKindGive) row = HovUnparkTakeKey(key);   /* review 5: a parked row */
+    if (row != 0 && row->item == 0) { row->used = 0; row = 0; }   /* parked before a load: no live object */
+    if (row != 0)
+    {   /* the row still keeps the object: the answer goes through the PLACED road (the same destroy / put-back, ledger and money) */
+        if (m.value == hovrec::kVHolds) ++g_hovC[kHovClosedByVerdict]; else ++g_hovC[kHovRestoredLive];
+        if (row == &g_hovSpareRow) ItPlacedSettleRow(row, row->id, m.value == hovrec::kVHolds ? 1 : 0, row->peer);   /* N5: not in the table */
+        else coop::ApplyItemPlaced(row->id, m.value == hovrec::kVHolds ? 1 : 0, row->peer);
+        return;
+    }
+    /* review 3: no live object - does this game's own (reloaded) state still have the item? */
+    int squadKnown = 0;
+    const unsigned long long applied = (l.where[0] == 'c') ? HovAppliedFor(l, &squadKnown) : 0ULL;
+    const int hs = hovrec::HolderStateAfterLoad(HovLiveNow(key), l.seqE, (l.where[0] == 'c') ? squadKnown : 0, applied,
+                                                coop::OwnOverlayMarkRule(), coop::OwnOverlayMarkSeq());
+    int here = -1;
+    if (hovrec::HolderNeedsLook(m.value, hs) != 0)   /* T-889 fold 2 ((a)): the ground is looked at too - a reload of a save from before the pickup put it back */
+        here = HovLiveCopy(l, (m.value == hovrec::kVNot) ? kHovLookNotPlaced : ((m.value == hovrec::kVHolds && hs == hovrec::kHsHas) ? 1 : 0), 0, 0);   /* T-889 fold 4 (G2) */
+    const int act = hovrec::HolderAction(l.state, m.value, 0, hs, here);
+    if (act == hovrec::kActKeep)
+    {
+        DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": verdict " + N((long long)m.value) + " - its place here is not loaded"
+                 " (own state " + N((long long)hs) + "); the line waits, asked again in 60 s");
+        return;
+    }
+    if (act == hovrec::kActClose)
+    {
+        ++g_hovC[kHovClosedByVerdict];
+        HovHolderSettleIds(l.askerSlot, l.reqId, l.holderSlot, l.otherSlot, hovrec::kStClosed, "verdict 1: the other game holds it");
+        return;
+    }
+    if (act == hovrec::kActRemoveThenClose)
+    {
+        ::Character* c = 0;
+        const int r = HovLiveCopy(l, hs == hovrec::kHsHas ? 1 : 0, 1, &c);
+        if (hovrec::HolderRemoveOutcome(r) == hovrec::kRmWait)
+        {   /* T-889 fold 2 (N2): found, but not removable now (not this game's to write, or the removal did not take) - the line stays open */
+            ++g_hovHolderRemoveWait;
+            if (HovSay(g_hovHolderRemoveWait))
+                DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the other game holds it and this game's copy is here, but it"
+                         " cannot be removed now (" + std::string(r == 2 ? "the removal did not take" : "not this game's to write now") + ") - the line"
+                         " stays OPEN, tried again at the next verdict (holderRemoveWait)");
+            return;
+        }
+        if (r == 1) { ++g_hovHolderCopyRemoved; if (c != 0) coop::OwnMarkCharDirtyNow((void*)c); }
+        else
+        {
+            ++g_hovHolderCopyMissing;
+            DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the other game holds it; the copy seen here was gone by the"
+                     " removal - nothing removed, the line closes (holderCopyMissing)");
+        }
+        ++g_hovC[kHovClosedByVerdict];
+        HovHolderSettleIds(l.askerSlot, l.reqId, l.holderSlot, l.otherSlot, hovrec::kStClosed,
+                           r == 1 ? "verdict 1: the other game holds it - our reloaded copy removed" : "verdict 1: the other game holds it");
+        return;
+    }
+    if (act == hovrec::kActCloseNoRebuild)
+    {
+        ++g_hovCloseNoRebuild;
+        HovHolderSettleIds(l.askerSlot, l.reqId, l.holderSlot, l.otherSlot, hovrec::kStReturned, "verdict 0: never placed there - our reloaded state still has it (no rebuild)");
+        return;
+    }
+    const int rb = HovRebuild(l);
+    if (rb == 2)
+    {   /* T-889 fold 3 (F4): the character gone for good still carries it - this game has it: returned, no rebuild */
+        ++g_hovCloseNoRebuild;
+        HovHolderSettleIds(l.askerSlot, l.reqId, l.holderSlot, l.otherSlot, hovrec::kStReturned,
+                           "verdict 0: never placed there - the character gone for good still carries it (no ground rebuild)");
+        return;
+    }
+    if (rb != 1) return;
+    ++g_hovC[kHovRestoredRebuilt];
+    HovHolderSettleIds(l.askerSlot, l.reqId, l.holderSlot, l.otherSlot, hovrec::kStReturned, "verdict 0: never placed there - rebuilt here");
+}
+/* the receiver on the holder's CLOSED; every CLOSED 1 / 2 is acknowledged (review 10: the holder then lets its settled line go) */
+void HovOnClosed(const hovrec::HandMsg& m, int from)
+{
+    if (from != (int)m.holder) { ++g_hovMsgRefused; return; }
+    const std::string key = HovKey((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst);
+    hovrec::HandLine l;
+    const int f = HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst, &l);
+    if (f < 0) return;   /* not readable now: the holder asks / re-sends again */
+    if (f == 0)
+    {
+        g_hovPlacedMem.erase(key);
+        if (m.value == hovrec::kClosedPlaced || m.value == hovrec::kClosedReturned) HovSend(hovrec::kMsgAck, (int)m.asker, m.reqId, (int)m.holder, m.value, from);
+        return;
+    }
+    if (m.value == hovrec::kClosedPlaced && HovClosedPlacedWaits(&l, key) != 0) return;   /* T-889 fold 5: kept, no ACK */
+    const int liveCopy = (HovLiveNow(key) != 0 || l.frozen == hovrec::kVHolds) ? 1 : 0;
+    const int rc = hovrec::ReceiverOnClosed(1, m.value, liveCopy, l.kind);
+    if (rc == hovrec::kRcKeep)
+    {
+        ++g_hovClosedUnknown;
+        if (HovSay(g_hovClosedUnknown))
+            ErrorLog("[ITEMS] T-889 " + HovWhy((int)m.asker, m.reqId, (int)m.holder) + ": its holder has no line for it and cannot say (CLOSED 4) - this line"
+                     " and the copy here are KEPT, asked again in 60 s (closedUnknown)");
+        return;
+    }
+    if (rc == hovrec::kRcRemoveCopy) HovRemoveCopy(l);
+    if (m.value == hovrec::kClosedNoLines) ++g_hovDropNoLines;
+    if (HovDrop((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst) == 0) return;   /* not dropped: asked / answered again */
+    g_hovLive.erase(key);
+    g_hovAsk.erase(key);
+    g_hovTakerRb.erase(key);   /* T-889 fold 5b */
+    if (g_hovWaitCommit.erase(key) != 0 && HovSay(++g_hovClosedCommitLanded))
+        DebugLog("[ITEMS] T-889 " + HovWhy((int)m.asker, m.reqId, (int)m.holder) + ": our squad record holding the item has landed - the in line"
+                 " is dropped and CLOSED 1 acknowledged now (closedCommitLanded)");
+    if (m.value == hovrec::kClosedPlaced || m.value == hovrec::kClosedReturned) HovSend(hovrec::kMsgAck, (int)m.asker, m.reqId, (int)m.holder, m.value, from);
+}
+/* review 10: the holder on the receiver's ACK - its settled line goes */
+void HovOnAck(const hovrec::HandMsg& m, int from)
+{
+    hovrec::HandLine l;
+    if (HovFind((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleSrc, &l) != 1) return;
+    if (from != l.otherSlot) { ++g_hovMsgRefused; return; }
+    if (l.state == hovrec::kStHeld) return;
+    const std::string key = HovKey(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc);
+    if (HovDrop(l.askerSlot, l.reqId, l.holderSlot, hovrec::kRoleSrc) == 0) return;
+    ++g_hovAckRecv;
+    g_hovLive.erase(key);
+    g_hovAsk.erase(key);
+}
+/* CHANGE B (owner 896 (b)): a GIVE row held for a giver who is not here no longer holds its character's / box's syncing (its build
+   rang and published - it carries no unpublished move); every other row still does. The stand clock is kept. T-889 fold 1 (review 5):
+   nor does an escrowed TAKE row with a line whose asker is away (it is parked at the next tick). */
+int ItOwnerRowHoldsSync(const ItOwnerPend& r)
+{
+    const int here = (StorePeerHere(r.who != 0 ? r.who : r.peer) != 0) ? 1 : 0;
+    const int h = hovrec::OwnerRowHoldsSync(r.dir, r.escrow, here, r.hdLine);
+    if (h == 0 && r.dir == 1 && r.syncSaid == 0)
+    {
+        r.syncSaid = 1;
+        ++g_giveAway[4];
+        if (ItLapseRevokeSay(g_giveAway[4]))
+            DebugLog("[ITEMS] give row " + N((long long)r.id) + ": its giver is not in the world - the row no longer holds "
+                     + std::string(r.isBox != 0 ? "the box's" : "the character's") + " syncing (owner 896 b). Counted itemGiveAway syncReleased.");
+    }
+    return h;
+}
+/* ===== end T-889 step 2 block ===== */
+
 /* inv7c: MAIN THREAD. An escrow row returned to the owner. The put-back is ItRollbackTake's (the keeper's cats, the verdict
    re-ask, the engine add); a refused re-add keeps the row in escrow, so only a row that really ended is counted. */
 static void ItEscrowReturn(ItOwnerPend* p, const char* why)
@@ -11781,7 +13887,7 @@ static void ItEscrowReturn(ItOwnerPend* p, const char* why)
     const unsigned int rid = p->id;
     const unsigned int rkey = ItEscSenderKey(p->peer);   /* T-355: the asker's player key, read before the row can end */
     const int wasGround = p->isGround;   /* p105g-f2-3 */
-    ItRollbackTake(p, why);
+    HovRollback(p, why);   /* T-889 fold 1 (review 6): a row with no line (writer off) tells the receiver CLOSED 2 */
     if (p->used == 0) { ++g_escReturnedAtEnd; g_escReturned.Note(rkey, rid); }   /* inv7c fold (review 3); T-355: by (asker, id) */
     if (p->used == 0 && wasGround != 0)
     {   /* p105g-f2-3 (row T-435): D6 for the ground, the same rule as a character's / box's - the kept item goes back where it lay */
@@ -11868,6 +13974,24 @@ static void ItEscrowEdgeTick(unsigned int now)
     for (int i = 0; i < kOwnerPendCap; ++i)
         if (g_ownerPend[i].used != 0 && g_ownerPend[i].escrow != 0)
             g_ownerPend[i].quietMs = coopesc::QuietStep(g_ownerPend[i].quietMs, dt, StorePeerHere(g_ownerPend[i].peer), coopesc::kQuietDtCapMs);
+    for (int i = 0; i < kOwnerPendCap; ++i)
+    {   /* T-889: a GIVE row's stand clock runs only while its giver is in the world (the escrow's pattern) */
+        ItOwnerPend* const gp = &g_ownerPend[i];
+        if (gp->used == 0 || gp->dir != 1 || gp->escrow != 0) continue;
+        /* judged by the giver's PLAYER key (its slot once known), not the connection it gave over: a giver back on another road counts as
+           here, and another player on the old connection does not (T-889 review #2) */
+        const int here = StorePeerHere(gp->who != 0 ? gp->who : gp->peer);
+        gp->giveHereMs = coopesc::QuietStep(gp->giveHereMs, dt, here, coopesc::kQuietDtCapMs);
+        if (coopgive::AwayHoldFirst(here, gp->giveAwaySaid) != 0)
+        {
+            gp->giveAwaySaid = 1;
+            ++g_giveAway[1];
+            if (ItLapseRevokeSay(g_giveAway[1]))
+                DebugLog("[ITEMS] give row " + N((long long)gp->id) + " (sender " + N((long long)gp->peer) + "): its giver is not in the world -"
+                         " the stand clock is held at " + N((long long)gp->giveHereMs) + " of " + N((long long)coopgive::kOwnerGiveStandMs)
+                         + " ms until the giver is back. Counted itemGiveAway standHeldAway.");
+        }
+    }
     {   /* a ready flag from an older link generation is ignored */
         const LONG st = ::InterlockedExchange(&g_escReadyPending, 0);
         if (st != 0)
@@ -11898,10 +14022,20 @@ void ItemsEscrowHandBack(const char* edge)
     for (int i = 0; i < kOwnerPendCap; ++i)
         if (g_ownerPend[i].used != 0 && g_ownerPend[i].escrow != 0)
         {
+            if (g_ownerPend[i].hdLine != 0) { HovEdgeDrop(&g_ownerPend[i], edge); continue; }   /* T-889 step 2 (A6): its line keeps the item */
             ItEscrowReturn(&g_ownerPend[i], "escrow handed back to its owner at an edge (D6)");
             ++n;
         }
     if (n != 0) DebugLog("[ITEMS] inv7c: " + std::string(edge) + " - " + N((long long)n) + " escrowed TAKE(s) handed back to the owner first (D6)");
+    /* T-889 fold 1 (review 4 / 5): parked takes and gives are not handed back either - their lines keep the items */
+    const size_t parked = g_hovParkedTake.size() + g_hovParkedGive.size();
+    if (parked != 0)
+    {
+        g_hovHandBackDeferred += (long long)parked;
+        g_hovParkedTake.clear();
+        g_hovParkedGive.clear();
+        DebugLog("[ITEMS] T-889 " + std::string(edge) + ": " + N((long long)parked) + " parked hand-over(s) left to their lines (handBackDeferred)");
+    }
 }
 void ItemsEscrowSessionEnd()
 {
@@ -11912,6 +14046,14 @@ void ItemsEscrowSessionEnd()
    accepted a HELLO / the joiner got its WELCOME). M5b fold 1 (review 2026-09-30 item 1): stamped with the generation AFTER this
    Poll's edges - a CONNECT drained in the same Poll bumps it below the loop, and the old stamp was then counted escReadyStale. */
 void ItemsSessionReady() { ::InterlockedExchange(&g_escReadyPending, (LONG)(net::SessionLinkGenAfterBatch() + 1)); }   /* inv7c fold 2: the stamped generation + 1 (0 = none) */
+/* T-889 step 2, MAIN THREAD (store.cpp, the records store's open): the largest E a hand-over line holds - the records sequence restarts from
+   the index, and a reserved E must stay below every later record */
+unsigned long long ItemsHandoverMaxSeq()
+{
+    std::vector<std::string> lines;
+    if (HovLoad(&lines) == 0) return 0ULL;
+    return hovrec::HandMaxSeq(lines);
+}
 namespace {   /* the same unnamed namespace, reopened (inv7c) */
 
 // MAIN THREAD, once per tick. Wrap-correct like ItPendExpire, and RECURRING: a request whose answer never
@@ -11920,15 +14062,33 @@ void ItOwnerPendExpire()
 {
     const unsigned int now = ::GetTickCount();
     ItEscrowEdgeTick(now);   /* inv7c: link edges, the taker's re-send */
+    HovTick(now);             /* T-889 step 2 (A7): the hand-over lines' QUERY */
     for (int i = 0; i < kOwnerPendCap; ++i)
     {
         if (g_ownerPend[i].used == 0) continue;
         ItOwnerPend* const op = &g_ownerPend[i];
-        const int act = coopesc::ExpireAction(op->dir, op->cfSent, op->escrow, now - op->sentAt, op->quietMs,
-                                              kOwnerPendTimeoutMs, coopesc::kEscrowQuietMs);   /* inv7c */
+        if (hovrec::ParkTakeRow(op->dir, op->escrow, op->hdLine, StorePeerHere(op->who != 0 ? op->who : op->peer) != 0 ? 1 : 0) != 0)
+        { HovParkTake(op); continue; }   /* T-889 fold 1 (review 5): its asker is away - the line, not the row, settles it */
+        /* T-853: a GIVE stands only after coopgive::kOwnerGiveStandMs (twice the giver's lapse), so the REVOKE the giver sends
+           when its own request lapses lands while this row still lives; a TAKE keeps its 10 s. T-889: a GIVE's age is its giver's
+           time in the world (giveHereMs), so a drop or a reconnect does not let it stand before that REVOKE can come. */
+        const int act = coopesc::ExpireAction(op->dir, op->cfSent, op->escrow, coopgive::OwnerPendAgeMs(op->dir, now - op->sentAt, op->giveHereMs), op->quietMs,
+                                              coopgive::OwnerPendWindowMs(op->dir, kOwnerPendTimeoutMs, coopgive::kOwnerGiveStandMs),
+                                              coopesc::kEscrowQuietMs);   /* inv7c */
         if (act == coopesc::kExpWait) continue;
-        if (act == coopesc::kExpStand) { op->used = 0; continue; }   /* a GIVE nobody revoked stands; there is nothing to undo */
-        if (act == coopesc::kExpRollback) { ItRollbackTake(op, "no MSG_ITEM_PLACED within 10 s"); continue; }
+        if (act == coopesc::kExpStand)
+        {   /* a GIVE nobody revoked stands; there is nothing to undo */
+            if (op->giveAwaySaid != 0)
+            {
+                ++g_giveAway[2];
+                if (ItLapseRevokeSay(g_giveAway[2]))
+                    DebugLog("[ITEMS] give row " + N((long long)op->id) + " stood after its giver had been away (" + N((long long)op->giveHereMs)
+                             + " ms in the world, " + N((long long)((now - op->sentAt) / 1000)) + " s since the grant). Counted itemGiveAway stoodAfterAway.");
+            }
+            op->used = 0;
+            continue;
+        }
+        if (act == coopesc::kExpRollback) { HovRollback(op, "no MSG_ITEM_PLACED within 10 s"); continue; }   /* T-889 step 2: its line returned with it */
         if (act == coopesc::kExpEscrow)
         {
             op->escrow = 1;
@@ -11946,6 +14106,7 @@ void ItOwnerPendExpire()
                      + " its re-send at the next link-up settles it");
             continue;
         }
+        if (op->hdLine != 0) { op->quietMs = 0; ++g_hovQuietKept; continue; }   /* T-889 step 2 (A6): no quiet return for a row with a line - its QUERY settles it */
         ItEscrowReturn(op, "escrow: nothing heard for 5 minutes (the clock restarts at every link edge)");
     }
 }
@@ -12486,7 +14647,7 @@ std::string RangedTestGive(unsigned int uid, const std::string& sid, int count)
     const int wOk = (r == 1) ? RtWhereIs(inv, item, where, (int)sizeof(where), &equip, &slot) : 0;
     const std::string out = std::string(r == 1 ? "added" : "refused") + "(via=" + via + ",sec=" + (wOk ? std::string(where) : std::string("?"))
                           + ",equipped=" + N((long long)equip) + ",slot=" + N((long long)slot) + ")";
-    DebugLog("[P104] rangedtest give uid=" + N((long long)uid) + " " + sid + " (weapon) tried=" + (tried.empty() ? std::string("-") : tried)
+    SW_DEVLOG("[P104] rangedtest give uid=" + N((long long)uid) + " " + sid + " (weapon) tried=" + (tried.empty() ? std::string("-") : tried)
              + " -> " + out + (r == 1 && equip != 1 ? " - NOT IN AN EQUIP SLOT: the character cannot draw it" : ""));
     return out;
 }
@@ -12551,7 +14712,7 @@ std::string RangedTestGiveAmmo(unsigned int uid, const std::string& sid, int rou
     }
     const std::string out = "rounds=" + N((long long)placed) + "/" + N((long long)rounds) + ",items=" + N((long long)items)
                           + ",perItem=" + N((long long)perItem) + ",stop=" + stop;
-    DebugLog("[P104] rangedtest give uid=" + N((long long)uid) + " " + sid + " (ammo, rounds in chargesLeft +0x118) -> " + out);
+    SW_DEVLOG("[P104] rangedtest give uid=" + N((long long)uid) + " " + sid + " (ammo, rounds in chargesLeft +0x118) -> " + out);
     return out;
 }
 
@@ -18583,7 +20744,7 @@ void ItWanderAfterDrain()
         if (CaptureGarments(c, &worn) && net::SendClothing(uid, worn))
         {
             ++g_wanderResent;
-            DebugLog("[P022] -> CLOTHING uid=" + N((long long)uid) + " (T-1 B2: after this game's wandering restock - the copy"
+            SW_DEVLOG("[P022] -> CLOTHING uid=" + N((long long)uid) + " (T-1 B2: after this game's wandering restock - the copy"
                      " replaces the packs whole) " + GarmentSummary(worn));
             InvNetNoteAnnounced((void*)c, uid);   /* inv2a: the safety net's baseline is what was just sent */
         }
@@ -18877,6 +21038,29 @@ int ItLootWatchDrainEntry(const ItEntry& e, int mine);        /* loot2c fold (3a
 static long long g_bagOp0Sent = 0, g_bagOp0Rows = 0, g_bagOp0Refused = 0, g_bagOp0NotAt = 0;
 static long long g_bagOp0Applied = 0, g_bagOp0Relocated = 0, g_bagOp0Lost = 0;
 static long long g_bagOp0Covered = 0;   /* bag23 fold (review R3) counter: inner pack moves already carried by an op-0 add's rows */
+/* T-172 glob: THE OWNER'S ADD INTO A CELL OUR COPY HOLDS WITH ANOTHER RECORD (src/common/celldrift.h). The items REPORT's
+   cellDrift[adds,removed,sameRecord,removeFailed,stillTaken,restamped,destroyFailed,parityAsked,lines]: adds = owner adds that found
+   the copy's cell held (the drift); removed = records taken out of those cells by the engine's own removal; sameRecord = of those,
+   the owner's own record (a duplicate add); removeFailed = a record the removal would not take; stillTaken = an add refused because
+   the cell was still held after the removals (never written over); restamped = grid cells given back after a removal blanked another
+   item's cells; destroyFailed = a removed record the engine's destroy refused; parityAsked = a box copy's holder asked for the whole
+   box; lines = containers logged (one line each, capped). leftoverSweep[containers,removed,unjudged,removeFailed,restamped,capFull]:
+   the one-time sweep per copy container. cellDriftFold[mineSkipped,cellsNulled,gridRefused,sectionRefused,faultRestored,repeatLines]
+   (2026-09-30 review fold): mineSkipped = an add over a held cell on a character THIS game owns, refused with nothing removed (MED 1);
+   cellsNulled = grid cells still answering a removed record emptied before its destroy (LOW 2, the sweep's too); gridRefused /
+   sectionRefused = a drift add's record not removed because the grid was unreadable or oversize / the record named another section
+   (LOW 5); faultRestored = a removal that faulted after the engine call whose blanked cells were still given back (LOW 4, the sweep's
+   too); repeatLines = containers the repeating refusal was said for (one line each, capped). */
+static long long g_driftAdds = 0, g_driftRemoved = 0, g_driftSameRecord = 0, g_driftRemoveFailed = 0, g_driftStillTaken = 0;
+static long long g_driftRestamped = 0, g_driftDestroyFailed = 0, g_driftParityAsked = 0, g_driftLines = 0;
+static long long g_sweepContainers = 0, g_sweepRemoved = 0, g_sweepUnjudged = 0, g_sweepRemoveFailed = 0, g_sweepRestamped = 0;
+static long long g_sweepCapFull = 0, g_sweepLines = 0;
+static long long g_driftMineSkipped = 0, g_driftCellsNulled = 0, g_driftGridRefused = 0, g_driftSecRefused = 0, g_driftFaultRestored = 0;
+static long long g_driftRepeatLines = 0;
+static std::set<std::string> g_driftRepeatSaid;   /* copy containers the repeating-refusal line was written for (one line each) */
+static std::set<std::string> g_driftSaid;    /* copy containers the drift line was written for (one line each) */
+static std::set<std::string> g_driftSwept;   /* copy containers whose one-time leftover sweep ran in this world */
+const size_t kDriftSaidCap = 64, kDriftSweptCap = 4096;
 static void ItOp0BagRows(const ItEntry& cur, ItemMoveMsg* m)
 {
     m->bag.clear();
@@ -18971,7 +21155,8 @@ const unsigned int kHdTimeoutMs = 10000u, kHdParkRetryMs = 2000u, kHdDoneKeepMs 
 const int kHdAHoldSent = 0, kHdAHoldYes = 1, kHdAHoldGone = 2, kHdAHoldPolicy = 3, kHdAHoldReask = 4, kHdALandSent = 5,
           kHdALandExact = 6, kHdALandElsewhere = 7, kHdALandReask = 8, kHdAPutBackRefused = 9, kHdABoxReasked = 10,
           kHdAAbsorbed = 11, kHdARowsDropped = 12, kHdAUnnameable = 13, kHdALandBack = 14, kHdALandRefused = 15,
-          kHdAHoldCountDiffers = 16, kHdALandOtherBox = 17, kHdALandTargetPulled = 18, kHdACount = 19;   /* T-159: landOtherBox, landTargetPulled */
+          kHdAHoldCountDiffers = 16, kHdALandOtherBox = 17, kHdALandTargetPulled = 18,   /* T-159: landOtherBox, landTargetPulled */
+          kHdALandCleared = 19, kHdALandNotCleared = 20, kHdATakeRecleared = 21, kHdACount = 22;
 long long g_hdA[kHdACount];
 /* the writer's - holdServe[...] */
 const int kHdWGranted = 0, kHdWRefGone = 1, kHdWRefWrongItem = 2, kHdWRefShort = 3, kHdWRefNotHolder = 4, kHdWRefPolicy = 5,
@@ -18980,7 +21165,8 @@ const int kHdWGranted = 0, kHdWRefGone = 1, kHdWRefWrongItem = 2, kHdWRefShort =
           kHdWParkedPlaced = 17, kHdWBackNotWriter = 18, kHdWPublished = 19, kHdWPublishFailed = 20,
           kHdWHoldRecord = 21, kHdWHoldLandFirst = 22, kHdWBackGround = 23, kHdWBackGroundFault = 24, kHdWBackNoGround = 25,   /* fold 2 */
           kHdWLandOtherBox = 26, kHdWOtherBoxBarred = 27,   /* T-159 */
-          kHdWCount = 28;
+          kHdWKeptMain = 28, kHdWKeptGround = 29, kHdWKeptGroundFault = 30, kHdWKeptGroundNot = 31, kHdWKeepLever = 32,
+          kHdWCount = 33;
 long long g_hdW[kHdWCount];
 /* the save edges - holdSave[...] */
 const int kHdSPutBack = 0, kHdSLifted = 1, kHdSKeptOut = 2, kHdSRelostEnded = 3, kHdSZoneEnded = 4, kHdSOffThread = 5,
@@ -19008,9 +21194,11 @@ struct HdAsk
     int landAnswered, landRefused;   /* fold 1 (HIGH-1): a HOLD - its LAND was answered for good / refused */
     std::string landSec, landKey2; int landX, landY, landUnits, landHow, landReask;   /* fold 1 (MED-1): a HOLD - its LAND as sent (sent again on a late grant) */
     std::string landBox;      /* T-159: a HOLD - its LAND's target box when that is ANOTHER box the same game writes (empty = the hold's own container) */
+    int landClear;            /* a character's LAND: 1 = this copy's drop square was cleared when the writer's placement came before the answer,
+                                 2 = that placement named the drop square itself (the drop is kept); the answer then clears nothing */
     HdAsk() : used(0), id(0u), kind(0), holdId(0u), sentAt(0u), nextAt(0u), doneAt(0u), tries(0), waiting(0), granted(0), landed(0),
               done(0), split(0), reaskBox(0), cursorItem(0), landAnswered(0), landRefused(0), landX(0), landY(0), landUnits(0), landHow(0),
-              landReask(0) {}
+              landReask(0), landClear(0) {}
 };
 HdAsk g_hdAsk[kHdAskCap];
 struct HdHold
@@ -19023,8 +21211,11 @@ struct HdHold
     int parked; unsigned int parkedAt;
     int inSave; ::InventorySection* saveSec; ::Inventory* saveInv; int saveX, saveY;
     int saveMerged;           /* fold 1 (MED-2): the save's put-back merged the units onto their own stack (taken off again after) */
+    unsigned int keptAt;      /* when it was first kept with no room (a character's kept item goes on the ground after kHdKeptGroundMs) */
+    int skipping; unsigned int skipUntil;   /* holdtest keepnext: no retry before skipUntil */
+    int groundTried;          /* ground drops at the feet tried and not placed - up to kHdGroundTriesCap, then only at a save, zone write or edge */
     HdHold() : used(0), peer(0u), slot(-1), id(0u), isBox(0), uid(0u), x(0), y(0), units(0), whole(0), escrow(0), parked(0), parkedAt(0u),
-               inSave(0), saveSec(0), saveInv(0), saveX(0), saveY(0), saveMerged(0) {}
+               inSave(0), saveSec(0), saveInv(0), saveX(0), saveY(0), saveMerged(0), keptAt(0u), skipping(0), skipUntil(0u), groundTried(0) {}
 };
 HdHold g_hdHold[kHdHoldCap];
 ItEntry g_hdHoldFe[kHdHoldCap];   /* each hold's item fields, read before the lift (POD; memcpy, as every ItEntry) */
@@ -19036,6 +21227,20 @@ int g_hdHoldAnsNext = 0;
 struct HdQueued { ItemRequestMsg r; unsigned int peer; unsigned int due; };
 std::vector<HdQueued> g_hdQ;      /* holdtest delay: kept requests, released in arrival order */
 int g_hdDelayS = 0, g_hdDelayN = 0, g_hdRefuseNext = 0, g_hdInSave = 0;
+int g_hdKeepNext = 0, g_hdKeepSkipS = 0;   /* holdtest keepnext: the next LAND served is KEPT; its retries wait this many seconds */
+const unsigned int kHdKeptGroundMs = 30000u, kHdClearedKeepMs = 20000u;
+const int kHdGroundTriesCap = 5;
+/* the asker: a character's square whose LAND clear found nothing there (a take of ours had lifted the item) or the item held by a
+   pending take - that take's refusal puts it back, so a take already pending when this row was made, refused within
+   kHdClearedKeepMs, clears the square again */
+struct HdCleared
+{
+    int used; unsigned int landId, uid, at; std::string section, sid; int x, y, units, how;
+    HdCleared() : used(0), landId(0u), uid(0u), at(0u), x(0), y(0), units(0), how(0) {}
+};
+const int kHdClearedCap = 8;
+HdCleared g_hdCleared[kHdClearedCap];
+int g_hdClearedNext = 0;
 
 std::string HdHowName(int how)
 {
@@ -19299,6 +21504,129 @@ int HdAbsorb(const ItemMoveMsg& m)
     HdSay("[ITEMS] P105 absorbed own tagged op=" + N((long long)m.op) + " req " + N((long long)m.rqtId) + " - already shown here, not applied");
     return 1;
 }
+/* HdClearLocal's results: cleared; not cleared; not cleared - nothing on that square; not cleared - a pending take holds that item */
+const int kHcNot = 0, kHcCleared = 1, kHcEmpty = 2, kHcHeld = 3;
+/* 1 = a pending take (its shown copy or its wait row) or a cursor tracker names this object: removing it would leave that row
+   naming a destroyed object (the take's settle writes through it) */
+int HdObjInFlight(const void* obj)
+{
+    if (obj == 0) return 0;
+    for (int i = 0; i < kPendCap; ++i)
+    {
+        if (g_pend[i].used != 0 && g_pend[i].showObj == obj) return 1;
+        if (g_showAwait[i].used != 0 && g_showAwait[i].showObj == obj) return 1;
+    }
+    if (g_heldPend.used != 0 && g_heldPend.re.item == obj) return 1;
+    if (g_splitPend.used != 0 && (g_splitPend.cloneItem == obj || g_splitPend.re.item == obj)) return 1;
+    if (g_itHeld.item == obj) return 1;
+    return 0;
+}
+static int ItApplyMoveTo(::Inventory* inv, ::InventorySection* sec, ::Character* c, const ItemMoveMsg& m, const char* ownerDesc);   /* defined below */
+/* The asker's own copy of a character: the hold's item taken off one square by a LOCAL change only (nothing is published) - the
+   whole item when it was placed there (its count must be the units landed), the landed units when they were merged onto a stack
+   there. An object a pending take or a cursor tracker names is never removed: only units off a stack that stays are taken from it;
+   otherwise it is left (kHcHeld) for that take's settle and HdTakeRefused. Returns kHc*; *why says why when not cleared. */
+int HdClearLocal(unsigned int uid, const std::string& section, int x, int y, const std::string& sid, int units, int how, std::string* why)
+{
+    ::Character* c = 0; ::Inventory* inv = 0;
+    ::InventorySection* sec = ItResolvePath(uid, 0, section, ItBagPathFromWire(coopbag::BagPath()), &c, &inv);
+    if (sec == 0 || inv == 0) { *why = "the section does not resolve here"; return kHcNot; }
+    void* at = 0; int q = 0; char sid0[kSidCap]; sid0[0] = 0;
+    if (ItGetAtPod(sec, x, y, &at) == 0 || at == 0) { *why = "nothing on that square"; return kHcEmpty; }
+    if (ItBaseSidPod(at, sid0, kSidCap) == 0 || sid != std::string(sid0)) { *why = "a different item is on that square ('" + std::string(sid0) + "')"; return kHcNot; }
+    if (ItIntPod(at, kItemQuantity, &q) == 0) q = 0;
+    ItemMoveMsg m;
+    m.uid = uid; m.section = section; m.x = x; m.y = y; m.baseSid = sid;
+    const int stack = (how == coophold::kHowMerged || how == coophold::kHowBack) ? 1 : 0;
+    if (stack != 0 && units > 0 && q > units) { m.op = 3; m.quantity = units; }   /* the landed units off the stack, the rest (alive) stays */
+    else if (stack != 0 && q != units) { *why = "the stack there holds x" + N((long long)q) + ", not the x" + N((long long)units) + " landed"; return kHcNot; }
+    else if (stack == 0 && q != units) { *why = "the item there holds x" + N((long long)q) + ", not the x" + N((long long)units) + " landed"; return kHcNot; }
+    else if (HdObjInFlight(at) != 0) { *why = "a pending take holds that item"; return kHcHeld; }
+    else { m.op = 1; m.quantity = q; }
+    if (ItApplyMoveTo(inv, sec, c, m, "P105 land: this copy matched to the writer") == 0) { *why = "the local change was refused"; return kHcNot; }
+    return kHcCleared;
+}
+/* A character's LAND (the asker): this copy's drop square cleared to match the writer, said once; when the clear found the square
+   empty or the item held by a pending take, a re-clear row is kept for that take's refusal (HdTakeRefused) */
+void HdLandClear(const HdAsk& a, const std::string& when)
+{
+    std::string why;
+    const int rc = HdClearLocal(a.rq.ownerUid, a.rq.takerSection, a.rq.takerX, a.rq.takerY, a.rq.baseSid, a.rq.quantity, a.rq.holdHow, &why);
+    if (rc == kHcCleared) ++g_hdA[kHdALandCleared]; else ++g_hdA[kHdALandNotCleared];
+    HdSay("[ITEMS] P105 land " + N((long long)a.id) + ": this copy's " + a.rq.takerSection + " " + HdXY(a.rq.takerX, a.rq.takerY)
+          + (rc == kHcCleared ? " cleared to match the writer (" + when + ")" : " not cleared: " + why + " (" + when + ")"));
+    if (rc != kHcEmpty && rc != kHcHeld) return;
+    HdCleared& e = g_hdCleared[g_hdClearedNext];
+    g_hdClearedNext = (g_hdClearedNext + 1) % kHdClearedCap;
+    e.used = 1; e.landId = a.id; e.uid = a.rq.ownerUid; e.at = ::GetTickCount(); e.section = a.rq.takerSection; e.sid = a.rq.baseSid;
+    e.x = a.rq.takerX; e.y = a.rq.takerY; e.units = a.rq.quantity; e.how = a.rq.holdHow;
+}
+/* ApplyItemMove (after HdAbsorb): an UNTAGGED add / count from the writer of a character can arrive before the answer to our LAND on
+   that character (the writer sends its placement first, on the same road). Applied over the drop this copy still shows it may be
+   refused as occupied, and the answer's clear would then leave no copy - so the first open LAND of that character and record whose
+   drop is shown here has its clear run now, under the same rules, and its answer clears nothing. A placement that names the drop
+   square itself keeps the drop. */
+void HdLandBeforePlacement(const ItemMoveMsg& m)
+{
+    if (m.uid == 0 || (m.op != 0 && m.op != 2) || m.rqtHas != 0 || m.bagPath.has != 0) return;
+    std::string msid = m.baseSid;
+    int msidRead = msid.empty() ? 0 : 1;
+    for (int i = 0; i < kHdAskCap; ++i)
+    {
+        HdAsk& a = g_hdAsk[i];
+        if (a.used == 0 || a.kind != 1 || a.done != 0 || a.reaskBox != 0 || a.landClear != 0 || a.rq.ownerUid != m.uid) continue;
+        if (msidRead == 0)
+        {   /* a count change names no item: the stack on that square in this copy says which item it is (none readable = not ours) */
+            msidRead = 1;
+            ::Character* rc = 0; ::Inventory* rinv = 0; void* at = 0; char sid0[kSidCap]; sid0[0] = 0;
+            ::InventorySection* rsec = ItResolvePath(m.uid, 0, m.section, ItBagPathFromWire(coopbag::BagPath()), &rc, &rinv);
+            if (rsec != 0 && ItGetAtPod(rsec, m.x, m.y, &at) != 0 && at != 0 && ItBaseSidPod(at, sid0, kSidCap) != 0) msid = sid0;
+        }
+        if (msid != a.rq.baseSid) continue;                       /* only the LAND's own item */
+        if (m.op == 0 && m.quantity != a.rq.quantity) continue;   /* a placement of it carries the landed units */
+        if (m.section == a.rq.takerSection && m.x == a.rq.takerX && m.y == a.rq.takerY)
+        {
+            a.landClear = 2;
+            HdSay("[ITEMS] P105 land " + N((long long)a.id) + ": the writer's placement (op " + N((long long)m.op) + ") names this copy's drop square "
+                  + a.rq.takerSection + " " + HdXY(a.rq.takerX, a.rq.takerY) + " before the answer - the drop is kept");
+            return;
+        }
+        a.landClear = 1;
+        HdLandClear(a, "before the writer's placement, op " + N((long long)m.op) + " at " + m.section + " " + HdXY(m.x, m.y));
+        return;
+    }
+}
+/* ApplyItemConfirm, a TAKE out of a character refused: its put-back onto a square a LAND clear found empty (or held by this take)
+   is cleared again within kHdClearedKeepMs - the writer's answer said the item is not there. Only a take already pending when that
+   clear ran, and never when the settle dropped the take's copy because the same item was already back in its cell (sameBack). A
+   character take's refusal carries no reason on the wire (ItemConfirmMsg.reason is ground-only), so no reason is tested. */
+void HdTakeRefused(const ItPending& p, int sameBack)
+{
+    if (p.dir != 0 || p.ghostIsBox != 0 || p.ghostUid == 0 || p.ghostBag.has != 0) return;
+    const unsigned int now = ::GetTickCount();
+    for (int k = 0; k < kHdClearedCap; ++k)
+    {
+        HdCleared& e = g_hdCleared[k];
+        if (e.used == 0) continue;
+        if ((unsigned int)(now - e.at) >= kHdClearedKeepMs) { e = HdCleared(); continue; }
+        if (e.uid != p.ghostUid || e.section != std::string(p.ghostSection) || e.x != p.ghostX || e.y != p.ghostY) continue;
+        if ((int)(e.at - p.sentAt) < 0) continue;   /* sent after the clear: not the take that had the item off that square */
+        if (sameBack != 0)
+        {
+            HdSay("[ITEMS] P105 land " + N((long long)e.landId) + ": the refused take " + N((long long)p.id) + " found the same item back on this copy's "
+                  + e.section + " " + HdXY(e.x, e.y) + " (its copy was dropped) - not cleared again");
+            e = HdCleared();
+            return;
+        }
+        std::string why;
+        const int ok = (HdClearLocal(e.uid, e.section, e.x, e.y, e.sid, e.units, e.how, &why) == kHcCleared) ? 1 : 0;
+        if (ok != 0) ++g_hdA[kHdATakeRecleared];
+        HdSay("[ITEMS] P105 land " + N((long long)e.landId) + ": the refused take " + N((long long)p.id) + " put the item back on this copy's " + e.section + " "
+              + HdXY(e.x, e.y) + " - " + (ok != 0 ? std::string("cleared again to match the writer") : "not cleared again: " + why));
+        e = HdCleared();
+        return;
+    }
+}
 /* ApplyItemConfirm (after the asked-game check): the answer to a HOLD / LAND of ours. 1 = ours (handled). */
 int HdNoteConfirm(const ItemConfirmMsg& cf)
 {
@@ -19366,6 +21694,34 @@ int HdNoteConfirm(const ItemConfirmMsg& cf)
     HdSay(head + " answered " + (cf.ok != 0 ? "where=" + HdWhereName(cf.landHas != 0 ? cf.landWhere : 0) + (cf.landHas != 0 ? " at " + HdXY(cf.landX, cf.landY) : std::string(""))
                                             : "REFUSED " + HdReasonName(cf.reason))
           + ((act != coophold::kAnNone || a.reaskBox != 0) ? " - box re-asked" : ""));
+    if (a.kind == 1 && a.rq.ownerUid != 0 && a.reaskBox == 0)
+    {   /* a character's LAND whose drop this copy shows: the writer's answer is the truth. Its placement reaches this game as an
+           ordinary (untagged) publication unless it went exactly where this player dropped it, so this copy's drop square is cleared
+           here when the answer puts the item anywhere else (a local change only). A square the answer names is never cleared: the
+           writer's add may be on it already. A free square's section is not on the wire (the writer uses the hold's own section when
+           the target does not resolve there), so x,y alone keeps the drop square only when the drop is in the hold's own section.
+           A LAND refused 'gone' after its hold was granted: the writer has the item elsewhere (handed back, or on the ground) and
+           publishes that untagged - the drop is cleared the same way; any other refusal leaves it. Nothing is cleared here when the
+           writer's placement came first (HdLandBeforePlacement). A LAND with reaskBox set (the cursor ended in another container) is
+           not touched: this copy shows the item there, and a character has no re-read (HdAskBox of no key does nothing) - this copy
+           keeps what it shows until the writer's next move or snapshot of that character. */
+        const int hi = HdAskFind(a.holdId);
+        const int holdGranted = (hi >= 0 && g_hdAsk[hi].kind == 0 && g_hdAsk[hi].granted != 0) ? 1 : 0;
+        if (a.landClear != 0)
+            HdSay("[ITEMS] P105 land " + N((long long)a.id) + ": this copy's " + a.rq.takerSection + " " + HdXY(a.rq.takerX, a.rq.takerY)
+                  + (a.landClear == 1 ? std::string(" was cleared before the writer's placement - not cleared again")
+                                      : std::string(" holds the writer's placement (it came before the answer) - kept")));
+        else if (cf.ok != 0)
+        {
+            const int where = (cf.landHas != 0) ? cf.landWhere : coophold::kWhereExact;
+            const int sameSec = (a.rq.ownerSection == a.rq.takerSection) ? 1 : 0;
+            const int onDrop = (where == coophold::kWhereExact || ((where == coophold::kWhereOld || where == coophold::kWhereFree) && sameSec != 0
+                                && cf.landX == a.rq.takerX && cf.landY == a.rq.takerY)) ? 1 : 0;
+            if (onDrop == 0) HdLandClear(a, HdWhereName(where));
+        }
+        else if (cf.reason == coophold::kReasonGone && holdGranted != 0)
+            HdLandClear(a, "refused gone after its hold was granted - the writer has the item elsewhere");
+    }
     const int reask = (act != coophold::kAnNone || a.reaskBox != 0) ? 1 : 0;
     const std::string key2 = a.reaskKey2;
     const int otherBox = (a.kind == 1 && a.rq.ownerUid == 0 && a.rq.takerUid == 0 && !a.rq.takerBoxKey.empty() && a.rq.takerBoxKey != a.rq.ownerBoxKey
@@ -19556,6 +21912,114 @@ void HdServeHold(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg*
     HdSay(who + " granted: '" + std::string(fe.baseSid) + "' x" + N((long long)want) + " lifted out of " + h.section + " " + HdXY(h.x, h.y)
           + (h.whole != 0 ? "" : " (units off the stack)") + " (held for that player's cursor)");
 }
+#ifdef SW_DEV_BUILD   /* P139, a test probe: compiled into the DEV build only */
+/* PROBE P139 BEGIN */
+/* PROBE P139 (T-808, 04-probes.md): the land handler's KEEP result - which of the cell tests refused, per section (the land's target
+   square and the hold's own square): ItCellAccepts' three tests apart (inRange / fitsAt - the on/off byte, the type list and the grid /
+   itemInArea over the section's ITEM LIST, 1 = taken), the section's on/off byte (+0xD0, clothing.cpp kSectionEnabledOff), the first
+   row of the item list whose footprint overlaps the held item's footprint there (what itemInArea scans; SELF = the held item itself)
+   and the GRID's occupant at the square (getItemAt - what a player sees and what the ghost put's ItUndoCellFree asks).
+   Report-only, MAIN THREAD. First 40 keep results, then every 20th. */
+int g_p139Seen = 0;
+const size_t kP139SecEnabled = 0xD0;
+int P139EnabledPod(::InventorySection* sec)   /* 1 on, 0 off, -1 unread */
+{
+    if (sec == 0) return -1;
+    __try { return *((const unsigned char*)sec + kP139SecEnabled) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+void P139CellPartsPod(::InventorySection* sec, void* item, int x, int y, int* rng, int* fits, int* area)   /* each 1 / 0, -1 unread */
+{
+    *rng = -1; *fits = -1; *area = -1;
+    if (sec == 0 || item == 0) return;
+    __try
+    {
+        *rng = ItSlotInRange(sec, (::Item*)item, x, y) ? 1 : 0;
+        if (*rng != 1) return;   /* off the grid fitsAt / itemInArea are not asked (ItCellAccepts' own guard) */
+        *fits = sec->fitsAt((::Item*)item, x, y) ? 1 : 0;
+        *area = sec->itemInArea((::Item*)item, x, y) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+/* the first item-list row whose footprint (the row's x,y, the row item's width / height) overlaps `item`'s footprint at (x,y);
+   *rows the list size, *hits the overlapping rows. 1 found, 0 none, -1 unread */
+int P139ListAtPod(::InventorySection* sec, void* item, int x, int y, void** row, int* rx, int* ry, int* rows, int* hits)
+{
+    *row = 0; *rx = -1; *ry = -1; *rows = -1; *hits = -1;
+    if (sec == 0) return -1;
+    __try
+    {
+        int ew = 1, eh = 1;
+        if (item == 0 || ItIntPod(item, kItemWidth, &ew) == 0 || ew <= 0) ew = 1;
+        if (item == 0 || ItIntPod(item, kItemHeight, &eh) == 0 || eh <= 0) eh = 1;
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        if (si.size() > 4096) return -1;
+        *rows = (int)si.size(); *hits = 0;
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            void* it = (void*)si[k].item;
+            if (it == 0) continue;
+            int iw = 1, ih = 1;
+            if (ItIntPod(it, kItemWidth, &iw) == 0 || iw <= 0) iw = 1;
+            if (ItIntPod(it, kItemHeight, &ih) == 0 || ih <= 0) ih = 1;
+            const int sx = (int)si[k].x, sy = (int)si[k].y;
+            if (sx < x + ew && x < sx + iw && sy < y + eh && y < sy + ih)
+            {
+                ++*hits;
+                if (*row == 0) { *row = it; *rx = sx; *ry = sy; }
+            }
+        }
+        return (*row != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *row = 0; return -1; }
+}
+int P139GdNamePod(void* gd, char* out, int cap)   /* a GameData's display name (JobGdNamePod's read) */
+{
+    if (out == 0 || cap <= 0) return 0;
+    out[0] = 0;
+    if (gd == 0 || !ItPlaus(gd)) return 0;
+    __try
+    {
+        ::GameData* g = (::GameData*)gd;
+        const char* np = g->name.c_str(); const size_t nl = g->name.size();
+        if (np == 0 || nl >= (size_t)cap) return 0;
+        std::memcpy(out, np, nl); out[nl] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+int P139DiedPod(::Character* c)   /* 1 dead, 0 alive, -1 unread */
+{
+    if (c == 0) return -1;
+    __try { return c->hasDied() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+std::string P139N(int v) { return v < 0 ? std::string("?") : N((long long)v); }
+std::string P139Item(void* it, void* self)
+{
+    if (it == 0) return "none";
+    char sid[kSidCap]; char nm[96]; sid[0] = 0; nm[0] = 0;
+    void* gd = 0;
+    if (ItPtrPod(it, kObjData, &gd) != 0 && gd != 0) { ItGdSidPod(gd, sid, kSidCap); P139GdNamePod(gd, nm, 96); }
+    return std::string(it == self ? "SELF:" : "") + (sid[0] != 0 ? std::string(sid) : std::string("?")) + "('" + (nm[0] != 0 ? std::string(nm) : std::string("?")) + "')";
+}
+std::string P139Side(const char* pre, ::InventorySection* sec, void* item, int x, int y)
+{
+    const std::string p(pre);
+    if (sec == 0) return p + "sec=0";
+    int rng = -1, fits = -1, area = -1;
+    P139CellPartsPod(sec, item, x, y, &rng, &fits, &area);
+    void* row = 0; int rx = -1, ry = -1, rows = -1, hits = -1;
+    const int lr = P139ListAtPod(sec, item, x, y, &row, &rx, &ry, &rows, &hits);
+    void* g = 0;
+    const int gr = ItGetAtPod(sec, x, y, &g);
+    return p + "sec=1 " + p + "parts=" + P139N(rng) + "/" + P139N(fits) + "/" + P139N(area) + " " + p + "en=" + P139N(P139EnabledPod(sec))
+        + " " + p + "list00=" + (lr < 0 ? std::string("?") : (lr == 0 ? std::string("none") : P139Item(row, item) + "@" + HdXY(rx, ry)))
+        + " " + p + "listRows=" + P139N(rows) + " " + p + "listHits=" + P139N(hits)
+        + " " + p + "grid00=" + (gr == 0 ? std::string("?") : P139Item(g, item));
+}
+/* PROBE P139 END */
+#endif
 void HdServeLand(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg* cf, int* repeat)
 {
     const std::string who = "[ITEMS] P105 land " + N((long long)r.id) + " (hold " + N((long long)r.holdId) + ")";
@@ -19629,6 +22093,13 @@ void HdServeLand(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg*
     const int freeFound = (freeFrom != coophold::kLfNone) ? 1 : 0;
     /* T-159: a free square of the target box comes before the way home (the player chose that box) */
     int plan = coophold::LandPlan(how, cellFits, mergeOk, oldFits, freeFound, mergeOldOk, (other != 0 && freeFrom == coophold::kLfTarget) ? 1 : 0);
+#ifdef SW_DEV_BUILD   /* P139, a test probe: compiled into the DEV build only */
+    /* PROBE P139 BEGIN */
+    const int p139PlanCells = plan;   /* the plan the cells gave, before the keepnext lever */
+    /* PROBE P139 END */
+#endif
+    const int leverKeep = g_hdKeepNext;   /* TEST-ONLY: holdtest keepnext */
+    if (leverKeep != 0) { g_hdKeepNext = 0; plan = coophold::kLpKeep; ++g_hdW[kHdWKeepLever]; }
     int done = 0, px = 0, py = 0, mq = 0;
     std::string psec;
     if (plan == coophold::kLpPlaceExact) { psec = r.takerSection; px = tx; py = ty; done = (ItShowPutGhostPod(tsec, esc, tx, ty) == 1) ? 1 : 0; }
@@ -19644,6 +22115,11 @@ void HdServeLand(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg*
         if (ItShowUnitsPod(osec, oinv, oocc, h.x, h.y, units) == 1) { HdDestroyPod(esc); done = 2; mq = ooq + units; }
     }
     else if (plan == coophold::kLpFree) { psec = (fsec == tsec) ? r.takerSection : h.section; px = fx; py = fy; done = (ItShowPutGhostPod(fsec, esc, fx, fy) == 1) ? 1 : 0; }
+#ifdef SW_DEV_BUILD   /* P139, a test probe: compiled into the DEV build only */
+    /* PROBE P139 BEGIN */
+    const int p139PlanBefore = p139PlanCells;
+    /* PROBE P139 END */
+#endif
     if (done == 0) plan = coophold::kLpKeep;
     const int where = coophold::LandWhereOf(plan);
     /* T-159: where it went decides which box the publication names - the target box (exact, or a free square there) or its own */
@@ -19651,18 +22127,49 @@ void HdServeLand(const ItemRequestMsg& r, unsigned int fromPeer, ItemConfirmMsg*
                           && (plan == coophold::kLpPlaceExact || plan == coophold::kLpMergeExact || (plan == coophold::kLpFree && fsec == tsec))) ? 1 : 0;
     const std::string pkey = (inTarget != 0) ? tkey : std::string(), pid = (inTarget != 0) ? tid : std::string();
     if (inTarget != 0) ++g_hdW[kHdWLandOtherBox];
-    if (done == 1) HdPublish(hi, 0, psec, px, py, units, r.id, pkey, pid);
-    else if (done == 2) HdPublish(hi, 2, psec, px, py, mq, r.id, pkey, pid);
+    /* the request tag (the asker absorbs it) only when the item went exactly where the asker dropped it, or into a box (the asker
+       re-asks the box); a character's item put anywhere else is published untagged so the asker's copy applies the real placement */
+    const unsigned int tag = (plan == coophold::kLpPlaceExact || plan == coophold::kLpMergeExact || h.isBox != 0) ? r.id : 0u;
+    if (done == 1) HdPublish(hi, 0, psec, px, py, units, tag, pkey, pid);
+    else if (done == 2) HdPublish(hi, 2, psec, px, py, mq, tag, pkey, pid);
     if (plan == coophold::kLpPlaceExact) { if (how == coophold::kHowSwap) ++g_hdW[kHdWLandSwapped]; else ++g_hdW[kHdWLandPlaced]; }
     else if (plan == coophold::kLpMergeExact) ++g_hdW[kHdWLandMerged];
     else if (plan == coophold::kLpKeep) ++g_hdW[kHdWLandKept];
     else ++g_hdW[kHdWLandElsewhere];
     cf->ok = 1; cf->quantity = units; cf->landHas = 1; cf->landWhere = where; cf->landX = px; cf->landY = py; HdCfFields(cf, g_hdHoldFe[hi]);
     HdSay(who + " -> " + (inTarget != 0 ? "box '" + tkey + "' " : std::string("")) + (done != 0 ? psec + " " + HdXY(px, py) : std::string("nowhere yet")) + " how=" + HdHowName(how) + " where=" + HdWhereName(where)
-          + (plan == coophold::kLpKeep ? " (no room: the item is KEPT here and placed when room appears - never dropped)" : "")
-        + (plan == coophold::kLpMergeOld ? " (units back onto the stack they came off)" : ""));
+          + (plan == coophold::kLpKeep ? " (no room: the item is KEPT here and placed when room appears)" : "")
+        + (plan == coophold::kLpMergeOld ? " (units back onto the stack they came off)" : "")
+        + (done != 0 && tag == 0u ? " - published untagged (the asker applies it)" : "")
+        + (leverKeep != 0 ? " (holdtest keepnext - TEST)" : ""));
+#ifdef SW_DEV_BUILD   /* P139, a test probe: compiled into the DEV build only */
+    /* PROBE P139 BEGIN */
+    if (plan == coophold::kLpKeep)
+    {
+        ++g_p139Seen;
+        if (g_p139Seen <= 40 || (g_p139Seen % 20) == 0)
+        {
+            ::Character* p139c = (h.isBox == 0 && ItObj(FindSpawned(h.uid))) ? FindSpawned(h.uid) : 0;
+            const int p139dead = (h.isBox == 0) ? P139DiedPod(p139c) : -1;
+            SW_DEVLOG("[P139] land keep hold=" + N((long long)h.id) + " land=" + N((long long)r.id) + " seen=" + N((long long)g_p139Seen)
+                     + " owner=" + (h.isBox != 0 ? "box '" + h.key + "'" : "character " + N((long long)h.uid))
+                     + " held=" + P139Item(esc, 0) + " section=" + r.takerSection + " x,y=" + HdXY(tx, ty)
+                     + " cellFits=" + N((long long)cellFits) + " oldFits=" + N((long long)oldFits) + " freeFound=" + N((long long)freeFound)
+                     + " free=" + HdXY(fx, fy) + " planBefore=" + N((long long)p139PlanBefore) + " done=" + N((long long)done)
+                     + " how=" + N((long long)how) + " whole=" + N((long long)h.whole) + " mergeOk=" + N((long long)mergeOk) + " mergeOldOk=" + N((long long)mergeOldOk)
+                     + " " + P139Side("", tsec, esc, tx, ty)
+                     + " | old=" + h.section + " ox,oy=" + HdXY(h.x, h.y) + " " + P139Side("o", osec, esc, h.x, h.y)
+                     + " bodyDead=" + (h.isBox != 0 ? std::string("box") : P139N(p139dead)));
+        }
+    }
+    /* PROBE P139 END */
+#endif
     if (done != 0) h = HdHold();
-    else { h.parked = 1; h.parkedAt = ::GetTickCount(); }
+    else
+    {
+        h.parked = 1; h.parkedAt = ::GetTickCount(); h.keptAt = h.parkedAt;
+        if (leverKeep != 0 && g_hdKeepSkipS > 0) { h.skipping = 1; h.skipUntil = h.parkedAt + (unsigned int)g_hdKeepSkipS * 1000u; }
+    }
 }
 void HdServeNow(const ItemRequestMsg& r, unsigned int fromPeer)
 {
@@ -19716,9 +22223,35 @@ void HdQueueTick(unsigned int now)
         HdServeNow(e.r, e.peer);
     }
 }
-/* A hold's kept item back into its own container: its own square, else (units off a stack) onto that stack, else any free square.
-   1 = placed (the row ends); 0 = no room or no container (the row is PARKED: kept, placed when room appears - never dropped). */
-int HdPutBack(int i, int publish, const std::string& why)
+/* A character's kept item with no room on it: dropped at its feet through the engine's own drop (the ground road announces it, as a
+   player's drop). 2 = the hold ended (on the ground, or the drop faulted - never added again); 0 = not placed, still kept. */
+int HdGroundAtFeet(int i, const std::string& why, int isFinal)
+{
+    HdHold& h = g_hdHold[i];
+    ::Character* c = ItObj(FindSpawned(h.uid)) ? FindSpawned(h.uid) : 0;
+    const int d = (c != 0 && h.escrow != 0) ? ItShowDropAtFeetPod((void*)ItInventoryOf(c), h.escrow) : 0;
+    const std::string head = "[ITEMS] P105 hold " + N((long long)h.id) + ": no room on character " + N((long long)h.uid);
+    if (d == 1) { ++g_hdW[kHdWKeptGround]; HdSay(head + " - put on the ground at its feet (" + why + ")"); h = HdHold(); return 2; }
+    if (d < 0)
+    {
+        ++g_hdW[kHdWKeptGroundFault];
+        HdSay(head + " - the drop at its feet FAULTED: the hold ends (the item may be on the ground already; never added again) (" + why + ")");
+        h = HdHold();
+        return 2;
+    }
+    ++g_hdW[kHdWKeptGroundNot];
+    if (isFinal == 0 && h.groundTried < kHdGroundTriesCap) ++h.groundTried;
+    if (h.groundTried <= 1 || isFinal != 0) HdSay(head + " - the drop at its feet was not placed (" + why + ") - KEPT");
+    else if (h.groundTried == kHdGroundTriesCap)
+        HdSay(head + " - the drop at its feet was not placed " + N((long long)kHdGroundTriesCap) + " times - KEPT; tried again only at the next save, zone write or edge");
+    return 0;
+}
+/* A hold's kept item back into its own container: its own square, else (units off a stack) onto that stack, else any free square;
+   a character's item then the first free square of its main section. 1 = handed back (the hold ended); 2 = on the ground at a
+   character's feet, or a faulted drop (the hold ended); 0 = no room or no container (PARKED: kept, placed when room appears).
+   A character's kept item goes on the ground at its feet at once when the row goes now (isFinal: save, zone write, edge), else
+   after kHdKeptGroundMs kept - kHdGroundTriesCap drops that are not placed, then only at the next save, zone write or edge. */
+int HdPutBack(int i, int publish, const std::string& why, int isFinal = 0)
 {
     HdHold& h = g_hdHold[i];
     ::Inventory* inv = 0;
@@ -19732,19 +22265,37 @@ int HdPutBack(int i, int publish, const std::string& why)
             && std::strcmp(sid, g_hdHoldFe[i].baseSid) == 0 && ItShowUnitsPod(sec, inv, occ, h.x, h.y, h.units) == 1)
         { HdDestroyPod(h.escrow); merged = 1; put = 1; mq = oq + h.units; }
     }
+    std::string psec = h.section;
     if (sec != 0 && put == 0)
     {
         int fx = -1, fy = -1;
         if (ItFirstFreeSlot(sec, h.escrow, &fx, &fy) == 1 && fx >= 0 && ItShowPutGhostPod(sec, h.escrow, fx, fy) == 1) { put = 1; x = fx; y = fy; }
     }
+    if (put == 0 && h.isBox == 0 && h.section != "main")
+    {   /* a character's item: the first free square of its main section */
+        ::Inventory* minv = 0;
+        ::InventorySection* msec = HdSec(0, h.key, h.uid, "main", &minv);
+        int fx = -1, fy = -1;
+        if (msec != 0 && ItFirstFreeSlot(msec, h.escrow, &fx, &fy) == 1 && fx >= 0 && ItShowPutGhostPod(msec, h.escrow, fx, fy) == 1)
+        { put = 1; x = fx; y = fy; psec = "main"; ++g_hdW[kHdWKeptMain]; }
+    }
     if (put == 0)
     {
-        if (h.parked == 0) HdSay("[ITEMS] P105 hold " + N((long long)h.id) + " from slot" + N((long long)h.slot) + ": no room to hand it back (" + why + ") - KEPT, placed when room appears");
-        h.parked = 1; h.parkedAt = ::GetTickCount();
+        const unsigned int now = ::GetTickCount();
+        if (h.parked == 0)
+        {
+            h.keptAt = now;
+            HdSay("[ITEMS] P105 hold " + N((long long)h.id) + " from slot" + N((long long)h.slot) + ": no room to hand it back (" + why + ") - KEPT, placed when room appears");
+        }
+        h.parked = 1; h.parkedAt = now;
+        /* a character's kept item is never lost: on the ground at its feet when the row goes now, or after kHdKeptGroundMs kept */
+        if (h.isBox == 0 && publish != 0 && h.escrow != 0 && HdWriter(0, h.key, h.uid, 0) != 0
+            && (isFinal != 0 || ((unsigned int)(now - h.keptAt) >= kHdKeptGroundMs && h.groundTried < kHdGroundTriesCap)))
+            return HdGroundAtFeet(i, isFinal != 0 ? why : std::string("kept 30 s with no room"), isFinal);
         return 0;
     }
-    if (publish != 0) { if (merged != 0) HdPublish(i, 2, h.section, h.x, h.y, mq, 0); else HdPublish(i, 0, h.section, x, y, h.units, 0); }
-    HdSay("[ITEMS] P105 hold " + N((long long)h.id) + " from slot" + N((long long)h.slot) + " handed back into " + h.section + " " + HdXY(x, y)
+    if (publish != 0) { if (merged != 0) HdPublish(i, 2, h.section, h.x, h.y, mq, 0); else HdPublish(i, 0, psec, x, y, h.units, 0); }
+    HdSay("[ITEMS] P105 hold " + N((long long)h.id) + " from slot" + N((long long)h.slot) + " handed back into " + psec + " " + HdXY(x, y)
           + (merged != 0 ? " (onto its stack)" : "") + " (" + why + ")" + (publish != 0 ? "" : " - not published"));
     h = HdHold();
     return 1;
@@ -19786,17 +22337,24 @@ void HdHoldTick(unsigned int now)
             h = HdHold();
             continue;
         }
+        if (h.parked != 0 && h.skipping != 0) { if ((int)(now - h.skipUntil) < 0) continue; h.skipping = 0; }   /* holdtest keepnext */
         if (h.parked != 0 && (unsigned int)(now - h.parkedAt) >= kHdParkRetryMs)
-        { if (HdPutBack(i, 1, "room found for a kept item") != 0) ++g_hdW[kHdWParkedPlaced]; }
+        { if (HdPutBack(i, 1, "room found for a kept item") == 1) ++g_hdW[kHdWParkedPlaced]; }
     }
 }
-/* leave / exit / load / session end (ItemsEscrowHandBack): FINAL - every kept item back into its container (published); the asker's
-   rows dropped and an item it holds on its cursor put back (the engine's return, behind the guard). */
+/* leave / exit / load / session end (ItemsEscrowHandBack): FINAL - every kept item back into its container (published), a character's
+   item with no room there on the ground at its feet (HdPutBack, isFinal); the asker's rows dropped and an item it holds on its
+   cursor put back (the engine's return, behind the guard). */
 void HdEdge(const char* edge)
 {
-    int n = 0, kept = 0;
+    int n = 0, kept = 0, ground = 0;
     for (int i = 0; i < kHdHoldCap; ++i)
-        if (g_hdHold[i].used != 0) { ++g_hdW[kHdWBackEdge]; if (HdPutBack(i, 1, std::string(edge)) != 0) ++n; else ++kept; }
+    {
+        if (g_hdHold[i].used == 0) continue;
+        ++g_hdW[kHdWBackEdge];
+        const int pb = HdPutBack(i, 1, std::string(edge), 1);
+        if (pb == 1) ++n; else if (pb == 2) ++ground; else ++kept;
+    }
     int rows = 0, back = 0, lands = 0;
     for (int i = 0; i < kHdAskCap; ++i) if (g_hdAsk[i].used != 0 && g_hdAsk[i].done == 0) ++rows;
     /* fold 1 (MED-3): a hold that may be open on its writer (granted, or not answered yet) with no LAND yet gets a LAND back onto its
@@ -19820,8 +22378,10 @@ void HdEdge(const char* edge)
     }
     g_hdA[kHdARowsDropped] += rows;
     g_hdQ.clear();
-    if (n != 0 || kept != 0 || rows != 0)
-        HdSay("[ITEMS] P105 holds handed back at " + std::string(edge) + ": " + N((long long)n) + " (kept, no room: " + N((long long)kept) + "); asker rows dropped "
+    for (int k = 0; k < kHdClearedCap; ++k) g_hdCleared[k] = HdCleared();   /* the asker's re-clear rows go with its other rows */
+    if (n != 0 || ground != 0 || kept != 0 || rows != 0)
+        HdSay("[ITEMS] P105 holds handed back at " + std::string(edge) + ": " + N((long long)n) + " (on the ground at a character's feet or a faulted drop: "
+              + N((long long)ground) + "; kept, no room: " + N((long long)kept) + "); asker rows dropped "
               + N((long long)rows) + ", cursor items put back " + N((long long)back) + ", lands back sent " + N((long long)lands));
 }
 void HdTeardown()   /* ItemsWorldTeardown: the world is going - the rows name it */
@@ -19831,6 +22391,8 @@ void HdTeardown()   /* ItemsWorldTeardown: the world is going - the rows name it
     for (int i = 0; i < kHdAskCap; ++i) if (g_hdAsk[i].used != 0) { if (g_hdAsk[i].done == 0) ++rows; g_hdAsk[i] = HdAsk(); }
     g_hdW[kHdWBackTeardown] += n; g_hdA[kHdARowsDropped] += rows;
     g_hdQ.clear(); g_hdInSave = 0;
+    for (int k = 0; k < kHdClearedCap; ++k) g_hdCleared[k] = HdCleared();
+    g_hdClearedNext = 0; g_hdKeepNext = 0; g_hdKeepSkipS = 0;   /* the re-clear rows and the keepnext lever name the world that is going */
     if (n != 0 || rows != 0) HdSay("[ITEMS] P105 holds dropped at the world's teardown: " + N((long long)n) + " (they go with the world); asker rows " + N((long long)rows));
 }
 void HdSaveBegin()
@@ -19859,6 +22421,7 @@ void HdSaveBegin()
             if (ItFirstFreeSlot(sec, h.escrow, &fx, &fy) == 1 && fx >= 0 && ItShowPutGhostPod(sec, h.escrow, fx, fy) == 1) { put = 1; x = fx; y = fy; }
         }
         if (put != 0) { h.inSave = 1; h.saveMerged = merged; h.saveSec = sec; h.saveInv = inv; h.saveX = x; h.saveY = y; ++n; ++g_hdS[kHdSPutBack]; }
+        else if (h.isBox == 0 && h.parked != 0 && HdPutBack(i, 1, "a game save with no room on the character", 1) != 0) {}   /* a kept item: handed back for good, or on the ground */
         else { ++out; ++g_hdS[kHdSKeptOut]; }
     }
     if (n + out != 0) HdSay("[ITEMS] P105 holds put back for the save: " + N((long long)n) + " (kept out, no room: " + N((long long)out) + ") - lifted out again when the save returns");
@@ -19929,7 +22492,7 @@ void HdZoneWrite()   /* 15.4: a saveLevelData outside a game save is a zone writ
            without the item */
         void* bld = 0;
         const int writer = HdWriter(g_hdHold[i].isBox, g_hdHold[i].key, g_hdHold[i].uid, &bld);
-        if (HdPutBack(i, writer, "a zone is written outside a game save (zone unload)") != 0) { ++n; continue; }
+        if (HdPutBack(i, writer, "a zone is written outside a game save (zone unload)", g_hdHold[i].isBox == 0 ? 1 : 0) != 0) { ++n; continue; }
         /* fold 1 (MED-2): no room in the box - the item goes on the ground at the box, as the engine's own overflow does (the one drop
            road, a spill of this game's own building: ItBoxBackDrop) while this game writes it; otherwise it stays kept */
         float pos[3] = { 0.0f, 0.0f, 0.0f };
@@ -19967,11 +22530,13 @@ void HdTick()   /* every drain, before the ring is looked at */
 std::string HdReportTokens()
 {
     std::string s = " cursorHold[holdSent,holdYes,holdGone,holdPolicy,holdReask,landSent,landExact,landElsewhere,landReask,putBackRefused,boxReasked,"
-                    "absorbedTagged,rowsDroppedLinkEdge,unnameable,landBack,landRefused,holdCountDiffers,landOtherBox,landTargetPulled]=";
+                    "absorbedTagged,rowsDroppedLinkEdge,unnameable,landBack,landRefused,holdCountDiffers,landOtherBox,landTargetPulled,landCleared,"
+                    "landNotCleared,takeRecleared]=";
     for (int i = 0; i < kHdACount; ++i) s += (i != 0 ? "," : "") + N(g_hdA[i]);
     s += " holdServe[granted,refGone,refWrongItem,refShort,refNotHolder,refPolicy,refBusy,repeatAnswered,landPlaced,landMerged,landSwapped,"
          "landElsewhere,landKept,landNoHold,backSession,backEdge,backTeardown,parkedPlaced,backNotWriter,published,publishFailed,"
-         "holdRecordAnswered,holdLandFirst,backGround,backGroundFault,backNoGround,landOtherBox,otherBoxBarred]=";
+         "holdRecordAnswered,holdLandFirst,backGround,backGroundFault,backNoGround,landOtherBox,otherBoxBarred,keptMain,keptGround,"
+         "keptGroundFault,keptGroundNot,keepLever]=";
     for (int i = 0; i < kHdWCount; ++i) s += (i != 0 ? "," : "") + N(g_hdW[i]);
     s += " holdSave[putBack,lifted,keptOut,relostEnded,zoneEnded,offThread,noEnd,zoneKeptOut,zoneGroundFault,endedPublished,endedUnpublished]=";
     for (int i = 0; i < kHdSCount; ++i) s += (i != 0 ? "," : "") + N(g_hdS[i]);
@@ -20000,7 +22565,7 @@ std::string HoldTestCommand(const std::string& arg)
     }
     std::string r;
     int s = 0, n = 1;
-    if (t.empty()) r = "error holdtest usage: holdtest delay <s> [n] | refusenext <gone|busy|policy> | list";
+    if (t.empty()) r = "error holdtest usage: holdtest delay <s> [n] | refusenext <gone|busy|policy> | keepnext [s] | list";
     else if (ItOnMainThread() == 0) r = "error holdtest: not on the main thread";
     else if (t[0] == "delay")
     {
@@ -20020,6 +22585,17 @@ std::string HoldTestCommand(const std::string& arg)
         if (why == 0) r = "error holdtest refusenext: usage holdtest refusenext <gone|busy|policy>";
         else { g_hdRefuseNext = why; r = "ok holdtest refusenext " + t[1] + ": the next HOLD this game writes is refused " + HdReasonName(why); }
     }
+    else if (t[0] == "keepnext")
+    {
+        int ks = 20;
+        if (t.size() > 2 || (t.size() == 2 && HdInt(t[1], 0, 600, &ks) == 0)) r = "error holdtest keepnext: usage holdtest keepnext [seconds 0..600]";
+        else
+        {
+            g_hdKeepNext = 1; g_hdKeepSkipS = ks;
+            r = "ok holdtest keepnext: the next LAND this game serves as the writer is KEPT (no room)"
+              + (ks > 0 ? ", its retries wait " + N((long long)ks) + " s" : std::string(", retried as normal"));
+        }
+    }
     else if (t[0] == "list")
     {
         int holds = 0, asks = 0;
@@ -20031,7 +22607,7 @@ std::string HoldTestCommand(const std::string& arg)
                 ++holds;
                 rows += " [hold " + N((long long)h.id) + " slot" + N((long long)h.slot) + " " + (h.isBox != 0 ? "box '" + h.key + "'" : "character " + N((long long)h.uid))
                       + " " + h.section + " " + HdXY(h.x, h.y) + " '" + std::string(g_hdHoldFe[i].baseSid) + "' x" + N((long long)h.units)
-                      + (h.parked != 0 ? " PARKED" : "") + (h.inSave != 0 ? " inSave" : "") + "]";
+                      + (h.parked != 0 ? " PARKED" : "") + (h.skipping != 0 ? " retryPaused" : "") + (h.inSave != 0 ? " inSave" : "") + "]";
             }
         for (int i = 0; i < kHdAskCap; ++i)
             if (g_hdAsk[i].used != 0 && g_hdAsk[i].done == 0)
@@ -20042,9 +22618,9 @@ std::string HoldTestCommand(const std::string& arg)
                       + (a.granted != 0 ? " granted" : "") + (a.landed != 0 ? " landed" : "") + (a.waiting != 0 ? " waiting" : "") + " tries=" + N((long long)a.tries) + "]";
             }
         r = "ok holdtest list holds=" + N((long long)holds) + " asked=" + N((long long)asks) + " kept=" + N((long long)g_hdQ.size())
-          + " delayLeft=" + N((long long)g_hdDelayN) + " refuseNext=" + HdReasonName(g_hdRefuseNext) + rows;
+          + " delayLeft=" + N((long long)g_hdDelayN) + " refuseNext=" + HdReasonName(g_hdRefuseNext) + " keepNext=" + N((long long)g_hdKeepNext) + rows;
     }
-    else r = "error holdtest: unknown verb '" + t[0] + "' (delay | refusenext | list)";
+    else r = "error holdtest: unknown verb '" + t[0] + "' (delay | refusenext | keepnext | list)";
     if (r.compare(0, 3, "ok ") == 0) DebugLog("[ITEMS] p105 " + r.substr(3));
     else DebugLog("[ITEMS] p105 holdtest REFUSED args='" + arg + "': " + r);
     return r;
@@ -20324,6 +22900,7 @@ void ItemsTickDrain()
        against a list taken in an earlier frame. The zone-deactivate detour bumps it too, so a list can span
        neither a drain nor a deactivation. */
     ::InterlockedIncrement64(&g_boxWalkGen);
+    ++g_bldGoneDrain;   /* T-609 (H4): the dismantled-building ring ages by drains */
     /* P6t (review-p6k LOW-5), KEPT BY B9 OVER THE ONE BANNER THAT SURVIVES. ItBoxSay's slots fire once for
        the life of the process, so a notebook outage that happened after an earlier one had already spent the
        slot printed nothing at all while the counters climbed - the one line that explains them never came
@@ -20962,7 +23539,7 @@ void ItemsTickDrain()
                     if (g_p029Said < kP029Budget)
                     {
                         ++g_p029Said;
-                        DebugLog("[PROBE] P029 box publish '" + std::string(cur.boxKey) + "'"
+                        SW_DEVLOG("[PROBE] P029 box publish '" + std::string(cur.boxKey) + "'"
                                  + ItP029Fields(cur.boxVtRva)
                                  + " - if this is a StorageBuilding then its getDefaultTask is the constant 0x1A"
                                    " (0x2AB390, no ownership term), so the `shared` CLICK GATE has never applied"
@@ -21088,9 +23665,12 @@ void ItemsTickDrain()
 
 // MAIN THREAD, from the store's world-teardown broadcast. Every ring slot names a character in the world being
 // destroyed, and a drain after the teardown would ask the mirror about pointers that are gone.
+/* store.cpp ForgetPlatoon, MAIN THREAD: the freed squad's pot leaves the keeper repair's rows (T-799 D3). */
+void KeeperRepairForget(void* own) { if (own != 0) ItKeeperRepairForgetOne(own); }
 void ItemsWorldTeardown()
 {
     ++g_teardowns;
+    ItKeeperRepairWorldTeardown();   /* T-799: the repaired / asked pots and the money-known marks name the world that is going */
     HdTeardown();   /* P105 build 2: the hold rows name the world that is going */
     GroundWorldTeardown();   /* inv5p1 fold (review-inv5p1 1): the ground's request rows, unconfirmed drops and queue name the world that is going */
     InvNetClearAll();   /* inv2a: the net's lists hold raw pointers into the world that is going */
@@ -21167,11 +23747,321 @@ void ItemsWorldTeardown()
        empty; a deactivation during the teardown raises it again. */
     g_boxWalkN = 0;
     g_boxWalkListGen = -1;
+    g_bldGoneN = 0; g_bldGoneNext = 0;   /* T-609 fold 1 (F5): the dismantled-building ring names the world that is going - a new world's
+                                            building at a reused address is not kept out of its walks */
     ::InterlockedIncrement64(&g_boxWalkGen);
     ::InterlockedExchange(&g_boxCachePurgePending, 0);
     g_leverDestroyedItem = 0;   /* review-p6d M-4: it names an object in the world that is going */
     ItParityWorldTeardown();    /* par1: the furniture registry and every parity queue name that world too */
+    g_driftSwept.clear(); g_driftSaid.clear(); g_driftRepeatSaid.clear();   /* T-172 tear: the next world's copies are swept and logged afresh */
     DebugLog("[ITEMS] world teardown: the item-move ring and every pending item request are forgotten");
+}
+
+/* T-172 help: the last op-0 apply's drift outcome, read by ApplyItemMove right after ItApplyMoveTo (that function holds a __try, so
+   it keeps no std::string - C2712). */
+struct ItDriftLast { int occupants, removed, sameRecord, failed, restamped, mineSkipped, refuseWhy; char firstSid[kSidCap]; };
+static ItDriftLast g_driftLast;
+static void* s_driftGrid[coopdrift::kGridCellCap];   /* MAIN THREAD only: a section's grid copied before one engine call */
+static ::Item* s_sweepRows[512];                       /* MAIN THREAD only: a section's records, copied before the sweep removes any */
+static ::Item* s_driftLive[coopdrift::kLiveCap];       /* MAIN THREAD only: a section's records read right after one removal */
+
+/* T-172 review fold: the records `sec` lists now, copied into s_driftLive. The count, or -1 (over kLiveCap, or a fault). */
+static int ItDriftLivePod(::InventorySection* sec)
+{
+    __try
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        const size_t nr = si.size();
+        if (nr > (size_t)coopdrift::kLiveCap) return -1;
+        for (size_t k = 0; k < nr; ++k) s_driftLive[k] = si[k].item;
+        return (int)nr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-172, right after the engine's removal of `victim` (and on that removal's fault exit - review LOW 4): every cell the removal blanked
+   under ANOTHER item is given back, only to an item the section still lists (review LOW 3) and only when the section kept the grid
+   s_driftGrid was copied from; then, once `victim` is no longer listed, every cell still answering it is emptied - it is destroyed next
+   (review LOW 2). *listed: 1 = still listed, or not known. 1 done, -1 the list or the grid would not read (nothing restored or
+   emptied). */
+static int ItDriftAfterPod(::InventorySection* sec, void* cells, int gw, int gh, ::Item* victim, int* restamped, int* nulled, int* listed)
+{
+    *restamped = 0; *nulled = 0; *listed = 1;
+    __try
+    {
+        const int nl = ItDriftLivePod(sec);
+        if (nl < 0) return -1;
+        int gw2 = 0, gh2 = 0;
+        void* cells2 = 0;
+        if (ItIntPod(sec, kSecContentW, &gw2) == 0 || ItIntPod(sec, kSecContentH, &gh2) == 0 || ItPtrPod(sec, kSecContent, &cells2) == 0)
+            return -1;
+        *listed = coopdrift::InList((const void* const*)s_driftLive, nl, (const void*)victim);
+        if (cells2 != 0 && cells2 == cells && gw2 == gw && gh2 == gh)
+            *restamped = coopdrift::RestoreBlanked((void**)cells, (const void* const*)s_driftGrid, gw * gh, victim,
+                                                   (const void* const*)s_driftLive, nl);
+        if (*listed == 0 && cells2 != 0 && coopdrift::GridOk(gw2, gh2) != 0)
+            *nulled = coopdrift::NullStale((void**)cells2, gw2 * gh2, victim);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* T-172, MAIN THREAD, behind the applying-thread guard (the caller holds it): `victim` out of OUR COPY's `sec` through the engine's own
+   whole-stack removal (op 1's call, Inventory::takeItemOut 0x749E10), the grid cells that removal blanked under
+   ANOTHER item still listed given back (InventorySection::removeItem 0x748EE0 zeroes its whole footprint without asking -
+   ItDriftAfterPod), any cell still answering the record emptied, then the record destroyed by the engine. Asked first: the grid reads
+   and is within kGridCellCap, the record's own section name is this section's (0x749E10 finds the section by that name), and the
+   section lists at most kLiveCap records. 1 removed (destroyed, or *destroyFailed 1), 0 not removed (nothing destroyed), -1 faulted
+   (nothing destroyed; when the fault came after the engine call, the blanked cells are still given back). *why: coopdrift::kWhy*. */
+static int ItDriftRemovePod(::Inventory* inv, ::InventorySection* sec, ::Item* victim, int* restamped, int* nulled, int* destroyFailed,
+                            int* why)
+{
+    *restamped = 0; *nulled = 0; *destroyFailed = 0; *why = coopdrift::kWhyNone;
+    volatile int gw = 0, gh = 0, called = 0, after = 0;   /* volatile: read again on the fault exit */
+    void* volatile cells = 0;
+    __try
+    {
+        int w = 0, h = 0;
+        void* c0 = 0;
+        if (ItIntPod(sec, kSecContentW, &w) == 0 || ItIntPod(sec, kSecContentH, &h) == 0 || coopdrift::GridOk(w, h) == 0
+            || ItPtrPod(sec, kSecContent, &c0) == 0 || c0 == 0) { *why = coopdrift::kWhyGrid; return 0; }
+        gw = w; gh = h; cells = c0;
+        char isn[kSecCap], ssn[kSecCap];
+        isn[0] = 0; ssn[0] = 0;
+        if (ItStrPod((const char*)victim + kItemSection, isn, kSecCap) == 0 || ItStrPod((const char*)sec + kSecName, ssn, kSecCap) == 0
+            || isn[0] == 0 || std::strcmp(isn, ssn) != 0) { *why = coopdrift::kWhySection; return 0; }
+        if (sec->items.size() > (size_t)coopdrift::kLiveCap) { *why = coopdrift::kWhyTooMany; return 0; }
+        const int n = w * h;
+        for (int i = 0; i < n; ++i) s_driftGrid[i] = ((void**)c0)[i];
+        called = 1;
+        ::Item* gone = inv->takeItemOut(victim, -1, true);
+        int listed = 1;
+        const int ar = ItDriftAfterPod(sec, c0, w, h, victim, restamped, nulled, &listed);
+        after = 1;
+        if (ar < 0) { *why = coopdrift::kWhyFault; return -1; }        /* the list would not read: never destroyed */
+        if (listed != 0) { *why = coopdrift::kWhyListed; return 0; }   /* still listed: never destroyed */
+        ::Item* d = ItObj(gone) ? gone : victim;
+        if (ItDestroyPod((void*)d, "coop T-172: a record our copy held where the owner's add landed") == 0) *destroyFailed = 1;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (called != 0 && after == 0)   /* review LOW 4: the engine call ran (or faulted part-way) - its blanked cells are still given back */
+        {
+            int lst = 1, rs = 0, nu = 0;
+            if (ItDriftAfterPod(sec, (void*)cells, (int)gw, (int)gh, victim, &rs, &nu, &lst) > 0) { *restamped = rs; *nulled = nu; ++g_driftFaultRestored; }
+        }
+        *why = coopdrift::kWhyFault;
+        return -1;
+    }
+}
+static void ItDriftNoteOcc(::Item** occ, int* n, int cap, ::Item* o)
+{
+    for (int k = 0; k < *n; ++k) if (occ[k] == o) return;
+    if (*n < cap) occ[(*n)++] = o;
+}
+/* T-172, MAIN THREAD, from ItApplyMoveTo's op 0 (under its __try and the applying-thread guard): make (x,y) free for `item` in OUR
+   COPY's section. The owner's add says that footprint was empty on the owner, so every record the copy holds in it is DRIFT: any cell
+   the grid answers (getItemAt 0x745AF0), or a record whose own cell and size overlap it (the item's +0xDC/+0xE0, never SectionItem
+   x,y - bag23 fix). Each is removed (ItDriftRemovePod). No record there = 1 and the add goes in exactly as before. Otherwise 1 = every
+   one removed and the footprint free by the grid (cell1's rule, ItUndoCellFree), 0 = still held (the add is refused, never written
+   over). g_driftLast says what was found. On a character THIS game owns (`uid`, net::IsUidMine) nothing is removed and 0 is answered:
+   there the occupant is a real item of ours, never a stale copy record (review MED 1). */
+static int ItDriftClearCell(::Inventory* inv, ::InventorySection* sec, ::Item* item, int x, int y, const char* wantSid, unsigned int uid)
+{
+    std::memset(&g_driftLast, 0, sizeof(g_driftLast));
+    int iw = 0, ih = 0;
+    if (ItIntPod(item, kItemWidth, &iw) == 0 || ItIntPod(item, kItemHeight, &ih) == 0 || iw <= 0 || ih <= 0) return 1;
+    ::Item* occ[64];
+    int n = 0;
+    for (int j = 0; j < ih; ++j)
+        for (int i = 0; i < iw; ++i)
+        {
+            ::Item* o = sec->getItemAt(x + i, y + j);   /* in range: ItSlotInRangeWhy answered 1 for this footprint */
+            if (o != 0 && o != item) ItDriftNoteOcc(occ, &n, 64, o);
+        }
+    const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+    if (si.size() <= 4096)
+        for (size_t k = 0; k < si.size(); ++k)
+        {
+            ::Item* r = si[k].item;
+            int cx = -1, cy = -1, rw = 0, rh = 0;
+            if (!ItPlaus(r) || r == item) continue;
+            if (ItItemCellPod(r, &cx, &cy) == 0 || ItIntPod(r, kItemWidth, &rw) == 0 || ItIntPod(r, kItemHeight, &rh) == 0) continue;
+            if (coopdrift::FootprintsOverlap(x, y, iw, ih, cx, cy, rw, rh) != 0) ItDriftNoteOcc(occ, &n, 64, r);
+        }
+    if (n == 0) return 1;
+    g_driftLast.occupants = n;
+    for (int k = 0; k < n; ++k)
+    {
+        char sid[kSidCap];
+        sid[0] = 0;
+        if (ItBaseSidPod(occ[k], sid, kSidCap) != 0)
+        {
+            if (wantSid != 0 && wantSid[0] != 0 && std::strcmp(sid, wantSid) == 0) ++g_driftLast.sameRecord;
+            if (g_driftLast.firstSid[0] == 0) { std::strncpy(g_driftLast.firstSid, sid, kSidCap - 1); g_driftLast.firstSid[kSidCap - 1] = 0; }
+        }
+    }
+    /* review MED 1: FindSpawned answers this game's OWN characters too (adopted, or taken in a hand-over while the sender still
+       publishes) - nothing of ours is removed; the add is refused (ItApplyMoveTo), said once by ItDriftNote. */
+    if (coopdrift::SkipForOwner(uid, (uid != 0u && net::IsUidMine(uid)) ? 1 : 0) != 0)
+    {
+        g_driftLast.mineSkipped = 1;
+        ++g_driftMineSkipped;
+        return 0;
+    }
+    int nulledAll = 0;
+    for (int k = 0; k < n; ++k)
+    {
+        int rs = 0, nu = 0, df = 0, why = coopdrift::kWhyNone;
+        const int r = ItDriftRemovePod(inv, sec, occ[k], &rs, &nu, &df, &why);
+        g_driftLast.restamped += rs; nulledAll += nu;
+        if (df != 0) ++g_driftDestroyFailed;
+        if (r == 1) ++g_driftLast.removed; else ++g_driftLast.failed;
+        if (why == coopdrift::kWhyGrid) ++g_driftGridRefused;
+        else if (why == coopdrift::kWhySection) ++g_driftSecRefused;
+        if (why != coopdrift::kWhyNone && (g_driftLast.refuseWhy == 0 || coopdrift::RefusalRepeats(why) != 0)) g_driftLast.refuseWhy = why;
+    }
+    g_driftCellsNulled += nulledAll;
+    ++g_driftAdds;
+    g_driftRemoved += g_driftLast.removed; g_driftSameRecord += g_driftLast.sameRecord;
+    g_driftRemoveFailed += g_driftLast.failed; g_driftRestamped += g_driftLast.restamped;
+    if (g_driftLast.failed != 0) return 0;
+    return ItUndoCellFree(sec, item, x, y) ? 1 : 0;
+}
+/* T-172: is `r` an invisible leftover of `sec`? coopdrift::RowVisibility on the live grid, behind SEH. */
+static int ItRowVisPod(::InventorySection* sec, ::Item* r, int* cx, int* cy)
+{
+    *cx = -1; *cy = -1;
+    __try
+    {
+        int gw = 0, gh = 0, w = 0, h = 0;
+        void* cells = 0;
+        if (ItIntPod(sec, kSecContentW, &gw) == 0 || ItIntPod(sec, kSecContentH, &gh) == 0 || ItPtrPod(sec, kSecContent, &cells) == 0)
+            return coopdrift::kRowUnjudged;
+        if (!ItPlaus(r) || ItItemCellPod(r, cx, cy) == 0 || ItIntPod(r, kItemWidth, &w) == 0 || ItIntPod(r, kItemHeight, &h) == 0)
+            return coopdrift::kRowUnjudged;
+        return coopdrift::RowVisibility((const void* const*)cells, gw, gh, (const void*)r, *cx, *cy, w, h);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return coopdrift::kRowUnjudged; }
+}
+/* T-172: one section of OUR COPY swept - every record no grid cell of its own footprint answers (cell1's grid rule) is removed by
+   ItDriftRemovePod. The caller holds the applying-thread guard. 1 swept, -1 faulted. */
+static int ItSweepSectionPod(::Inventory* inv, ::InventorySection* sec, int* removed, int* unjudged, int* failed, int* restamped,
+                             int* destroyFailed, int* nulled)
+{
+    __try
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        const size_t nr = si.size();
+        if (nr > 512) { ++*unjudged; return 1; }
+        for (size_t k = 0; k < nr; ++k) s_sweepRows[k] = si[k].item;
+        for (size_t k = 0; k < nr; ++k)
+        {
+            int cx = -1, cy = -1;
+            const int v = ItRowVisPod(sec, s_sweepRows[k], &cx, &cy);
+            if (v == coopdrift::kRowVisible) continue;
+            if (v != coopdrift::kRowLeftover) { ++*unjudged; continue; }
+            int rs = 0, nu = 0, df = 0, why = coopdrift::kWhyNone;
+            const int rr = ItDriftRemovePod(inv, sec, s_sweepRows[k], &rs, &nu, &df, &why);
+            *restamped += rs; *nulled += nu;
+            if (df != 0) ++*destroyFailed;
+            if (rr == 1) ++*removed; else ++*failed;
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-172: the copy container an ITEM_MOVE names - a character copy by uid, a box copy by its key, a pack inside either by its path. */
+static std::string ItDriftKey(const ItemMoveMsg& m)
+{
+    std::string k = (m.uid != 0) ? ("uid " + N((long long)m.uid)) : ("box " + m.boxKey);
+    if (m.bagPath.has != 0) k += " pack " + std::string(m.bagPath.section) + " " + N((long long)m.bagPath.x) + "," + N((long long)m.bagPath.y);
+    return k;
+}
+/* T-172 review fold (#6): the inventory's sections read behind SEH (the map at +0x28, as ItGeneralSection reads it). The count, or -1
+   (more than `cap` sections, or a fault). */
+static int ItSweepSecsPod(::Inventory* inv, ::InventorySection** secs, int cap)
+{
+    __try
+    {
+        const ItSecMap& sm = *(const ItSecMap*)((char*)inv + 0x28);
+        if (sm.size() > (size_t)cap) return -1;
+        int ns = 0;
+        for (ItSecMap::const_iterator it = sm.begin(); it != sm.end() && ns < cap; ++it) if (ItObj(it->second)) secs[ns++] = it->second;
+        return ns;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-172: THE ONE-TIME SWEEP - the first time an owner's move reaches a copy container in this world, every section of that inventory
+   loses its invisible leftover records (left by the old overwrite). Only ever a COPY: ApplyItemMove refuses a box this game holds
+   before this point, and the caller never passes a uid this game owns. MAIN THREAD. */
+static void ItLeftoverSweepOnce(::Inventory* inv, const std::string& key, const char* desc)
+{
+    if (inv == 0 || key.empty() || g_driftSwept.count(key) != 0) return;
+    if (g_driftSwept.size() >= kDriftSweptCap) { ++g_sweepCapFull; return; }
+    g_driftSwept.insert(key);
+    ++g_sweepContainers;
+    ::InventorySection* secs[64];
+    const int ns = ItObj(inv) ? ItSweepSecsPod(inv, secs, 64) : -1;
+    if (ns < 0) { ++g_sweepUnjudged; return; }   /* over 64 sections, or the map would not read: not swept, counted */
+    int removed = 0, unjudged = 0, failed = 0, restamped = 0, destroyFailed = 0, nulled = 0;
+    ::InterlockedExchange(&g_itApplyingThread, (LONG)::GetCurrentThreadId());
+    for (int s = 0; s < ns; ++s)
+        if (ItSweepSectionPod(inv, secs[s], &removed, &unjudged, &failed, &restamped, &destroyFailed, &nulled) < 0) ++failed;
+    ::InterlockedExchange(&g_itApplyingThread, 0);
+    g_sweepRemoved += removed; g_sweepUnjudged += unjudged; g_sweepRemoveFailed += failed; g_sweepRestamped += restamped;
+    g_driftDestroyFailed += destroyFailed; g_driftCellsNulled += nulled;
+    if ((removed != 0 || failed != 0) && g_sweepLines < (long long)kDriftSaidCap)
+    {
+        ++g_sweepLines;
+        DebugLog("[ITEMS] leftover sweep on " + std::string(desc) + " (" + key + "): " + N((long long)removed) + " invisible leftover record(s)"
+                 " removed, " + N((long long)failed) + " the removal would not take, " + N((long long)unjudged) + " not judged, grid cells given"
+                 " back " + N((long long)restamped) + " - once per copy container (T-172)");
+    }
+}
+/* T-172: after an op-0 apply that met drift - a box copy's holder is asked for the whole box (the existing parity route, which rebuilds
+   our copy from the holder's answer); the drift is logged once per copy container. An add on a character this game owns (nothing
+   removed, refused - review MED 1) gets its own line instead. A refusal that will repeat on every later drift add of the container
+   (an unreadable / oversize grid, a record naming another section - review LOW 5) is said once more, with what could re-sync it. MAIN
+   THREAD. */
+static void ItDriftNote(const ItemMoveMsg& m, const std::string& key, const char* desc, int ok)
+{
+    if (g_driftLast.mineSkipped != 0)
+    {
+        const std::string mk = key + " owned";
+        if (g_driftSaid.count(mk) != 0 || g_driftSaid.size() >= kDriftSaidCap) return;
+        g_driftSaid.insert(mk);
+        ++g_driftLines;
+        DebugLog("[ITEMS] cell drift on " + std::string(desc) + " (" + key + "): the other game's add of '" + m.baseSid + "' at " + m.section
+                 + " " + N((long long)m.x) + "," + N((long long)m.y) + " met " + N((long long)g_driftLast.occupants) + " record(s) on a"
+                 " character THIS game owns (first '" + std::string(g_driftLast.firstSid) + "') - nothing removed, the add REFUSED (T-172"
+                 " review MED 1: our own items are never taken for drift; one line per character, cellDriftFold mineSkipped counts the rest)");
+        return;
+    }
+    if (m.uid == 0 && !m.boxKey.empty()) { ++g_driftParityAsked; ItParityAskOne(m.boxKey); }
+    if (coopdrift::RefusalRepeats(g_driftLast.refuseWhy) != 0 && g_driftRepeatSaid.count(key) == 0 && g_driftRepeatSaid.size() < kDriftSaidCap)
+    {
+        g_driftRepeatSaid.insert(key);
+        ++g_driftRepeatLines;
+        DebugLog("[ITEMS] cell drift on " + std::string(desc) + " (" + key + "): a record was not removed because "
+                 + (g_driftLast.refuseWhy == coopdrift::kWhyGrid ? std::string("the section's grid would not read or is over 4096 cells")
+                                                                 : std::string("the record's own section name is not this section's"))
+                 + " - every later drift add into that cell is refused the same way (counted cellDriftFold gridRefused / sectionRefused). "
+                 + ((m.uid == 0 && !m.boxKey.empty()) ? std::string("The holder was asked for the whole box (parity), which rebuilds this copy.")
+                               : std::string("Nothing re-syncs a character copy's inventory for this today; the owner's kit (the whole"
+                                             " inventory, clothing.cpp's kit apply) would."))
+                 + " (T-172 review LOW 5, one line per copy container)");
+    }
+    if (g_driftSaid.count(key) != 0 || g_driftSaid.size() >= kDriftSaidCap) return;
+    g_driftSaid.insert(key);
+    ++g_driftLines;
+    DebugLog("[ITEMS] cell drift on " + std::string(desc) + " (" + key + "): the owner added '" + m.baseSid + "' at " + m.section + " "
+             + N((long long)m.x) + "," + N((long long)m.y) + " and our copy held " + N((long long)g_driftLast.occupants) + " record(s) there"
+             " (first '" + std::string(g_driftLast.firstSid) + "', the owner's own record " + N((long long)g_driftLast.sameRecord) + ") - removed "
+             + N((long long)g_driftLast.removed) + ", not removed " + N((long long)g_driftLast.failed) + ", grid cells given back "
+             + N((long long)g_driftLast.restamped) + "; the owner's item " + (ok != 0 ? std::string("is in") : std::string("was REFUSED"))
+             + (m.uid == 0 ? std::string("; the holder is asked for the whole box") : std::string(""))
+             + " (T-172: one line per copy container, the counters carry the rest)");
 }
 
 // bag23 part 1 (inv3 phase 2): an op-0 ADD of a pack fills the fresh pack BEFORE ItApplyMoveTo places it. Called from inside that
@@ -21237,6 +24127,19 @@ static int ItApplyMoveTo(::Inventory* inv, ::InventorySection* sec, ::Character*
                     ++g_slotOccupied; ItDestroyRefused(item);
                     g_bagOp0Lost += (long long)(bagA + bagL);   /* bag23 fold (review R5, re-check: relocated rows are already inside bagA) occupied: the pack is gone, and its rows with it */
                     ItLogRefusedAdd(m, ownerDesc, "occupied");
+                }
+                /* T-172 op0: ANOTHER RECORD IN THE CELL IS DRIFT. _addItem 0x748BE0 overwrites the cell pointers without asking, and
+                   the record the copy held there used to stay listed with no cell answering it - an invisible leftover. Every record
+                   in the footprint is removed first through the engine's own removal (ItDriftClearCell); a cell still held is refused,
+                   never written over. */
+                else if (ItDriftClearCell(inv, sec, item, m.x, m.y, m.baseSid.c_str(), m.uid) == 0)
+                {
+                    if (g_driftLast.mineSkipped == 0) ++g_driftStillTaken;   /* an owned character's refusal is cellDriftFold mineSkipped */
+                    ItDestroyRefused(item);
+                    g_bagOp0Lost += (long long)(bagA + bagL);   /* the pack is gone, and its rows with it */
+                    ItLogRefusedAdd(m, ownerDesc, g_driftLast.mineSkipped != 0
+                                    ? "held on a character this game owns - the drift repair never removes our own items (T-172 review MED 1)"
+                                    : "held by a record the drift repair could not remove (T-172)");
                 }
                 else
                 {
@@ -21404,6 +24307,7 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     ++g_recv;
     if (g_base == 0) { ++g_refused; return; }
     if (m.op < 0 || m.op > 4) { ++g_applyBadOp; ++g_refused; return; }   /* items9: op 4 CHARGES */
+    HdLandBeforePlacement(m);   /* P105: the writer's untagged placement before our LAND's answer - the drop shown here is cleared first */
     /* T-293 fold 1 (review F1): the owner's move in a worn section makes a clothing list still waiting for this copy stale - asked
        HERE, before the copy is found or the move tried, so a move that fails on the copy or lands on a living copy counts too. Both
        messages ride CH_RELIABLE and are handled as they arrive, so a waiting list was sent before this move. Not inside a pack. */
@@ -21504,7 +24408,12 @@ void ApplyItemMove(const ItemMoveMsg& m, unsigned int fromPeer)
     if (!ItObj(sec)) { ++g_applyNoSection; ++g_refused; return; }
     if (ItShowAbsorbSplit(m, sec) != 0) return;   /* t338-f2-apply: the holder's own split of units we hold - shown already, not applied twice */
     ItShowNoteHolderMove(m, sec);   /* T-164 fold (H2): a take held off this cell - the holder's own move is marked before it lands */
+    /* T-172 apply: the copy container's one-time leftover sweep, then the move; an add that met drift is noted (and a box re-asked). */
+    const std::string driftKey = ItDriftKey(m);
+    if (m.uid == 0 || !net::IsUidMine(m.uid)) ItLeftoverSweepOnce(inv, driftKey, desc);
+    std::memset(&g_driftLast, 0, sizeof(g_driftLast));
     const int ok = ItApplyMoveTo(inv, sec, c, m, desc);
+    if (m.op == 0 && g_driftLast.occupants != 0) ItDriftNote(m, driftKey, desc, ok);
     if (hbWait != 0) InvNetHoldFollow(m, ok);
     if (m.bagPath.has != 0 && ok != 0) { ++g_bagApplied; ShopCaravanMoveApplied((void*)inv); }   /* bag23 part 2; T-1 B5: the caravan window behind this pack follows */
     /* deadlook1 fold 3: an APPLIED owner move on a copy - in a worn section of a dead copy it marks the copy looted. bag23 part 2: a
@@ -21660,6 +24569,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     int ok = 0;
     void* kept = 0;                       // E22b-2: the TAKE's object, alive and in no inventory
     int landedX = r.ownerX, landedY = r.ownerY;   // E22b-2: where a GIVE's item actually went
+    void* built = 0;   // T-853: and which object it is (0 = merged into a stack at once)
     // E35 (P6o): the counter this trade is against, and what has already been moved on the shopkeeper's purse
     // by the time the item half is attempted. Both are set only inside the box branch below; they are
     // declared here because the settlement has to happen where `ok` is known.
@@ -21857,7 +24767,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
             mm.gear = r.gear;   /* the giver's uniform and crafter, written by ItCreateItem */
             // `c` is 0 - a box has no platoon - and ItOwnerGive passes it straight to ItCreateItem, which
             // finds a scratch container elsewhere for exactly this case.
-            ok = ItOwnerGive(0, sec, &mm, r.ownerX, r.ownerY, &landedX, &landedY, &reason, &r.bag);
+            ok = ItOwnerGive(0, sec, &mm, r.ownerX, r.ownerY, &landedX, &landedY, &reason, &r.bag, &built);
             if (ok != 0)
             {
                 cf.baseSid = r.baseSid; cf.companySid = r.companySid;
@@ -21892,7 +24802,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         mm.functionKind = r.functionKind; mm.level = r.level; mm.unique = r.unique;
         mm.quantity = r.quantity > 0 ? r.quantity : 1; mm.owner = r.owner;   /* inv6 (R2): the giver's mark, resolved by ItCreateItem */
         mm.gear = r.gear;   /* the given item's uniform and crafter, written by ItCreateItem */
-        ok = ItOwnerGive(c, sec, &mm, r.ownerX, r.ownerY, &landedX, &landedY, &reason, &r.bag);
+        ok = ItOwnerGive(c, sec, &mm, r.ownerX, r.ownerY, &landedX, &landedY, &reason, &r.bag, &built);
         if (ok != 0)
         {
             // The confirmation echoes what was built, so the requester's log can be read against ours.
@@ -21967,6 +24877,7 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         else
         {
             op->id = r.id; op->peer = fromPeer; op->dir = r.dir; op->item = kept;
+            op->who = ItEscSenderKey(fromPeer);   /* T-889: the asker's player - a GIVE's REVOKE finds the row by it (ItOwnerGiveFind) */
             op->uid = r.ownerUid;
             /* E35 (P6o): the cats move with the row, so every rollback path can put them back. `trade` is set
                only when cats REALLY moved (tradePaid != 0), never merely because the request asked. */
@@ -21990,6 +24901,8 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                 op->x = landedX; op->y = landedY;
                 std::strncpy(op->baseSid, r.baseSid.c_str(), kSidCap - 1);
                 op->baseSid[kSidCap - 1] = 0;
+                op->built = built;   /* T-853: a REVOKE removes exactly this object, and only what was built */
+                op->builtQty = (r.quantity > 0) ? r.quantity : 1;   /* the quantity actually built (a 0 would take the whole stack) */
             }
             op->sentAt = ::GetTickCount();
         }
@@ -21997,6 +24910,16 @@ void ApplyItemRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     /* mmo6: THE OWNER SIDE OF A GIVE - the item was built on our character, so its squad is a hand-over's too (ledger IN, then
        write-now). mmo1b marked only a TAKE's owner (ApplyItemPlaced); a give's owner hears nothing further when it stands. */
     if (ok != 0 && r.dir == 1 && r.ownerUid != 0) ItOwnHandOver(r.ownerUid, r.baseSid.c_str(), r.quantity, coop::kHandIn, r.id, 1, coop::kHandOwner, fromPeer, 1);
+    if (ok != 0 && r.dir == 1) HovOwnerIn(r, fromPeer, c, landedX, landedY);   /* T-889 step 2 (A4): the GIVE owner's in line */
+    if (ok != 0 && r.dir == 0 && kept != 0)
+    {   /* T-889 step 2 (A3): the holder's held line BEFORE the ok CONFIRM can put the item on the asker; one that cannot be written refuses */
+        ItOwnerPend* const hp = ItOwnerPendFind(r.id, fromPeer);
+        if (hp != 0 && HovHolderGrant(hp, cf, fromPeer, hp->isBox != 0 ? hovrec::kKindBox : hovrec::kKindTake) == 0)
+        {
+            HovRollback(hp, "T-889: the hand-over record could not be written - the take is refused");
+            ok = 0; cf.ok = 0; cf.trade = 0; cf.price = 0; ++g_reqRefused;
+        }
+    }
     {   /* inv7c: the ok CONFIRM for a TAKE went out (or is held to go out) - from here the taker may place it, so the row's
            10 s end is escrow, not a blind rollback. A confirmation that could not be sent keeps the old rollback. */
         const bool cfOut = ItSendConfirm(cf);
@@ -22043,6 +24966,7 @@ void ApplyItemPlaced(unsigned int id, int ok, unsigned int fromPeer)
             return;
         }
         p = ItEscrowFindRelinked(id, fromPeer);
+        if (p == 0) p = HovUnparkByPlaced(id, fromPeer);   /* T-889 fold 1 (review 5): a parked row's re-sent PLACED */
     }
     if (p == 0)
     {
@@ -22051,6 +24975,12 @@ void ApplyItemPlaced(unsigned int id, int ok, unsigned int fromPeer)
         if (ItOwnerPendAny(id) != 0) ++g_placedWrongPeer; else ++g_placedUnknownId;
         return;
     }
+    ItPlacedSettleRow(p, id, ok, fromPeer);
+}
+/* T-889 fold 2 (N5): the PLACED settle of one owner row - from ApplyItemPlaced, and from a verdict on a parked row settled in place
+   on the spare row (the owner table full). A spare row the settle left in use (a put-back the engine refused) is parked again. */
+void ItPlacedSettleRow(ItOwnerPend* p, unsigned int id, int ok, unsigned int fromPeer)
+{
     if (p->dir != 0) { ++g_placedUnknownId; return; }   // a PLACED naming a GIVE is not an answer to anything
     g_escDone.Note(ItEscSenderKey(fromPeer), id);   /* inv7c; T-355: by (sender player, id) */
     if (p->escrow != 0)
@@ -22074,25 +25004,99 @@ void ApplyItemPlaced(unsigned int id, int ok, unsigned int fromPeer)
         }
         if (p->isGround != 0 && p->item != 0) GrNameForgetAddr(p->item);   /* destroyed: no name row may stand for its address */
         if (p->item != 0) ItDestroyPod(p->item, "coop E22b-2 take placed");
+        HovHolderSettle(p, hovrec::kStClosed, "PLACED ok=1");   /* T-889 step 2 (A5): the line closed, CLOSED to the taker */
         p->item = 0;
         p->used = 0;
         return;
     }
-    ItRollbackTake(p, "the taker answered MSG_ITEM_PLACED ok=0");
+    HovRollback(p, "the taker answered MSG_ITEM_PLACED ok=0");   /* T-889 step 2 (A5): the line returned with it */
+    if (p == &g_hovSpareRow && p->used != 0) HovParkTake(p);   /* T-889 fold 2 (N5): kept, never dropped */
 }
 
+/* T-889 step 2, MAIN THREAD: MSG_ITEM_HANDOVER - QUERY / VERDICT / CLOSED about one hand-over line (src/common/handrec.h). Answered only in
+   a running world whose load's overlay has drained (the asker repeats in 60 s); each kind only from the player the line names. */
+void ApplyItemHandover(const char* p, size_t n, unsigned int fromPeer)
+{
+    hovrec::HandMsg m;
+    if (p == 0 || hovrec::DecodeMsg(p, n, &m) == 0)
+    { if (HovSay(++g_hovMsgRefused)) ErrorLog("[net] malformed ITEM_HANDOVER (" + N((long long)n) + " bytes) - REFUSED"); return; }
+    /* T-889 fold 1 (review 6): a game with its records writer off answers too (from memory) and drops nothing it does not have */
+    if (g_base == 0 || EngineWritesBlocked() || !GameplayRunning() || coop::OwnOverlaySettled() == 0) return;
+    const int from = net::PlayerSlotOfKey(fromPeer);
+    if (m.kind == hovrec::kMsgQuery) { if (m.value == 0) HovOnQueryAsReceiver(m, from); else HovOnQueryAsHolder(m, from); }
+    else if (m.kind == hovrec::kMsgVerdict) HovOnVerdict(m, from);
+    else if (m.kind == hovrec::kMsgAck) HovOnAck(m, from);
+    else HovOnClosed(m, from);
+}
+/* T-853: MAIN THREAD, from ApplyItemRevoke. Removes exactly `built` (the object this game built for a GIVE row) and `qty` units of
+   it, wherever it sits in `sec` now (found by pointer - ItSlotOfInSection compares only), through ItTakerRemoveExact. Units the
+   player stacked onto it stay; a different item of the same record is never taken. 1 removed; 0 not in that section any more (or
+   not removable); -1 no object was recorded (it merged into a stack at the build). xOut / yOut = where it was found. */
+static int ItOwnerRevokeRemove(::Inventory* inv, ::InventorySection* sec, void* built, int qty, const char* wantSid, int* xOut, int* yOut)
+{
+    *xOut = -1; *yOut = -1;
+    if (built == 0) return -1;
+    int x = -1, y = -1;
+    ItSlotOfInSection(sec, (::Item*)built, &x, &y);
+    if (x < 0) return 0;
+    *xOut = x; *yOut = y;
+    return (ItTakerRemoveExact(inv, sec, x, y, wantSid, built, (qty > 0) ? qty : -1) == 1) ? 1 : 0;
+}
+/* T-853 (money): the keeper's half of a revoked GIVE (a sale to our counter), undone exactly once (coopgive::RevokeKeeperAction):
+   here only when the object we built was really removed AND this game runs the keeper (or it is a local-only keeper). MAIN THREAD. */
+static void ItRevokeKeeperSettle(ItOwnerPend* p, int removed, unsigned int id)
+{
+    const int traded = (p->trade != 0 && p->price > 0) ? 1 : 0;
+    int copyHere = 0;
+    if (traded != 0 && removed != 0 && p->isBox != 0)
+    {
+        void* const bld = ItBoxResolve(p->boxKey);
+        void* const keeper = (bld != 0) ? ItShopPieceKeeper(bld) : 0;
+        const unsigned int kuid = (keeper != 0) ? FindSpawnedUid(keeper) : 0;
+        copyHere = (kuid != 0 && !net::IsUidMine(kuid)) ? 1 : 0;
+    }
+    const int act = coopgive::RevokeKeeperAction(traded, removed, copyHere);
+    if (act == coopgive::kRkNone) return;
+    if (act == coopgive::kRkUndo)
+    {
+        ++g_revokeKeeper[0];
+        ItRollbackKeeper(p, "the giver revoked its own half of a sale");
+        return;
+    }
+    if (act == coopgive::kRkRunner)
+    {
+        ++g_revokeKeeper[1];
+        DebugLog("[ITEMS] revoke received " + N((long long)id) + " counter='" + std::string(p->boxKey) + "': the keeper is a copy here,"
+                 " run by the other game - its pot (" + N((long long)p->price) + " cats) is that game's to undo, nothing written here."
+                 " Counted itemRevokeOwner keeperLeftToRunner.");
+    }
+    else
+    {
+        ++g_revokeKeeper[2];
+        ErrorLog("[ITEMS] revoke received " + N((long long)id) + " counter='" + std::string(p->boxKey) + "': the item we built was NOT"
+                 " removed, so the sale stands on this game and the keeper's " + N((long long)p->price) + " cats stay paid (never refunded"
+                 " beside an item that stayed). Counted itemRevokeOwner keeperKeptNotRemoved.");
+    }
+    p->trade = 0; p->price = 0;
+}
 // MAIN THREAD: the giver could not remove its own copy of a GIVE we granted (E22b-2 / review-p5y HIGH-3).
 void ApplyItemRevoke(unsigned int id, unsigned int fromPeer)
 {
     ++g_revokeRecv;
     /* B4-4 fold 2 (MED 2): a shop revoke / ack carries the shop tail and arrives at ApplyShopTail, never here - a plain revoke is E22b's */
-    ItOwnerPend* p = ItOwnerPendFind(id, fromPeer);
+    int byPlayer = 0;
+    ItOwnerPend* p = ItOwnerGiveFind(id, fromPeer, &byPlayer);   /* T-889: by the giver's player and the request id */
     if (p == 0) { ++g_revokeUnknownId; return; }
     if (p->dir != 1) { ++g_revokeUnknownId; return; }
-    /* E35 (P6o): the giver could not remove its own copy, so the sale did not happen - the shopkeeper's cats
-       go back BEFORE the item is destroyed, because that destroy has arms that return early and the money
-       undo must not depend on which one is taken. */
-    ItRollbackKeeper(p, "the giver revoked its own half of a sale");
+    if (byPlayer != 0)
+    {
+        ++g_giveAway[0];
+        if (ItLapseRevokeSay(g_giveAway[0]))
+            DebugLog("[ITEMS] revoke " + N((long long)id) + " found its give row by the giver's player (granted to sender " + N((long long)p->peer)
+                     + ", now from " + N((long long)fromPeer) + "). Counted itemGiveAway revokeByPlayer.");
+    }
+    /* E35 (P6o), T-853: the shopkeeper's cats are settled by what the removal below really did (ItRevokeKeeperSettle) - back only
+       when the object we built is gone and this game runs the keeper; every arm below calls it, so none can skip it. */
     // review-p6b MEDIUM-4, the GIVE half. Same question, same reason, same moment - the removal below is a
     // real write on a character we are claiming to speak for, and it publishes.
     // review-p6i MEDIUM-2, the GIVE half: a box is asked the same question, by the same helper.
@@ -22116,6 +25120,7 @@ void ApplyItemRevoke(unsigned int id, unsigned int fromPeer)
                  + " - authority moved while the give was outstanding. Nothing was removed; the giver kept"
                  + " its copy and the item the owner built is still there, so the two games are one item"
                  + " apart until the new owner republishes.");
+        ItRevokeKeeperSettle(p, 0, id);   /* T-853: nothing removed - the payment stands with the item */
         p->used = 0;
         return;
     }
@@ -22129,22 +25134,29 @@ void ApplyItemRevoke(unsigned int id, unsigned int fromPeer)
     // destroyed, remove through the engine and destroy what it hands back - and it is called rather than
     // copied so the two cannot drift. Not behind the applying guard: the removal must ring our own hook and
     // publish, which is what takes the item off the giver's ghost of us.
-    const int done = (sec != 0 && inv != 0) ? ItTakerRemove(inv, sec, p->x, p->y, p->baseSid) : 0;
-    if (done != 0)
+    /* T-853: exactly the object this game built for the row, and only the quantity it built, wherever it sits in that section now -
+       never whatever same-record stack sits at the landed cell (units the player stacked onto it, or another item moved there) */
+    int wx = -1, wy = -1;
+    const int done = (sec != 0 && inv != 0) ? ItOwnerRevokeRemove(inv, sec, p->built, p->builtQty, p->baseSid, &wx, &wy) : 0;
+    if (done == 1) ++g_revokeOwner[0]; else if (done < 0) ++g_revokeOwner[2]; else ++g_revokeOwner[1];
+    ItRevokeKeeperSettle(p, (done == 1) ? 1 : 0, id);
+    if (done == 1)
     {
         ++g_rollbackGive;
         ItOwnHandOver(p->uid, p->baseSid, 0, coop::kHandRev, id, 1, coop::kHandOwner, fromPeer, 1);   /* mmo6 fold (HIGH 2): the give we built is cancelled */
         DebugLog("[ITEMS] revoke received " + N((long long)id) + " uid=" + N((long long)p->uid) + " "
-                 + std::string(p->section) + " " + N((long long)p->x) + "," + N((long long)p->y)
-                 + ": the item we built was removed and destroyed");
+                 + std::string(p->section) + " " + N((long long)wx) + "," + N((long long)wy)
+                 + ": the item we built was removed and destroyed (that object, " + N((long long)p->builtQty) + " built)");
     }
     else
     {
         ++g_rollbackGiveFailed;
         ErrorLog("[ITEMS] revoke received " + N((long long)id) + " uid=" + N((long long)p->uid) + " "
                  + std::string(p->section) + " " + N((long long)p->x) + "," + N((long long)p->y)
-                 + " but NOTHING WAS REMOVED (no section, empty slot, or a different item is there now);"
-                 + " the giver kept its copy and this game still holds one");
+                 + " but NOTHING WAS REMOVED (no section, the object we built is no longer in that section, or none was"
+                 + " recorded - it merged into a stack at the build; nothing else is destroyed on trust);"
+                 + " the giver kept its copy and this game still holds one. Counted itemRevokeOwner "
+                 + std::string(done < 0 ? "builtNone" : "builtNotFound") + ".");
     }
     p->used = 0;
 }
@@ -22169,7 +25181,38 @@ static void ItTakerAnswer(int dir, unsigned int id, int ok)
         DebugLog("[ITEMS] revoke sent " + N((long long)id) + ": this game could not remove its own copy of the"
                  " item it gave, so the owner is asked to destroy the one it built");
     }
-    else ++g_revokeUnsent;
+    else
+    {
+        ++g_revokeUnsent;
+        ItRevokeListNote(id);   /* T-853: kept and tried again when the link is back */
+    }
+}
+
+/* T-853: MAIN THREAD, from ItLateGiveRemove, when the recorded object is no longer at the recorded cell - the lapse's put-back
+   made a new object there. The item at that cell is our copy when it has the recorded base sid, exactly the quantity the
+   request carried and the quality and level it sent (coopgive::LateGiveSquareMatch), and for a pack when its rows still digest
+   to what was sent. Removed through
+   ItTakerRemoveExact, aimed at the object now at the cell. 1 removed, 0 not ours (or nothing there). */
+static int ItLateGiveRemoveSquare(::Inventory* inv, ::InventorySection* sec, const ItLapsed& lp)
+{
+    void* at = 0;
+    if (ItSlotInSectionWhy(sec, lp.localX, lp.localY) != 1 || ItGetAtPod(sec, lp.localX, lp.localY, &at) == 0 || !ItPlaus(at)) return 0;
+    int qty = -1;
+    if (ItIntPod(at, kItemQuantity, &qty) == 0) qty = -1;
+    void* gd = 0;
+    char sid[kSidCap];
+    sid[0] = 0;
+    const bool sidOk = ItPtrPod(at, kObjData, &gd) != 0 && ItPlaus(gd) && ItStrPod((const char*)gd + kGdStringId, sid, kSidCap) != 0;
+    const bool sidSame = sidOk && lp.baseSid[0] != 0 && std::strcmp(sid, lp.baseSid) == 0;
+    const bool digestSame = (lp.bagSent != 0) ? ItGiverBagSame(sec, lp.localX, lp.localY, at, lp.bagDigest) : true;
+    float q = 0.0f;
+    const bool qOk = ItFloatPod(at, kItemQuality, &q) != 0;
+    int lv = 0;
+    const bool lvOk = ItLevelCall(at, &lv) != 0;
+    const bool qualitySame = lp.sentFieldsOk != 0 && qOk && coopgive::LateGiveQualitySame(q, lp.sentQuality);
+    const bool levelSame = lp.sentFieldsOk != 0 && lvOk && lv == lp.sentLevel;
+    if (!coopgive::LateGiveSquareMatch(sidSame, qty, lp.quantity, lp.bagSent != 0, digestSame, qualitySame, levelSame)) return 0;
+    return (ItTakerRemoveExact(inv, sec, lp.localX, lp.localY, lp.baseSid, at, lp.quantity) == 1) ? 1 : 0;
 }
 
 /* give1 (HIGH, from the inv3a re-check). A GIVE whose ok CONFIRM arrives after our own 10 s timeout: the owner's expiry lets a
@@ -22186,6 +25229,14 @@ static void ItLateGiveRemove(const ItLapsed& lp, unsigned int id)
         ItOwnHandOver(lp.mineUid, lp.baseSid, lp.quantity, coop::kHandOut, id, 1, coop::kHandRequester);
         return;
     }
+    if (lp.showNotBack != 0)
+    {   /* the put-back after our lapse is not proven back (kept in no inventory, faulted, or the other game has it): the owner's copy is the
+           one copy - nothing is removed here and no revoke is sent (a duplicate is preferred to a loss) */
+        ++g_lateYesNotBackKept;
+        DebugLog("[ITEMS] late give " + N((long long)id) + " (" + std::string(lp.baseSid) + "): our item did not get back after the lapse -"
+                 " the owner's copy is kept as the one copy; nothing removed, no revoke (lateYesNotBackKept=" + N(g_lateYesNotBackKept) + ")");
+        return;
+    }
     /* T-164 211 fold 2 (L3): a cell of OUR BOX is removed from only while this game still writes that box - else the revoke road */
     const int boxNotOurs = (lp.showWhere == 0 && lp.localIsBox != 0 && ItLocalBoxMine(lp.localBoxKey) == 0) ? 1 : 0;
     if (boxNotOurs != 0)
@@ -22198,7 +25249,8 @@ static void ItLateGiveRemove(const ItLapsed& lp, unsigned int id)
     }
     if (coopshow::LateGiveRoad((lp.showWhere == 0 && boxNotOurs == 0) ? 1 : 0) == coopshow::kLgRevoke)
     {   /* T-164 fold (M1): the escrow went back somewhere this row does not name (the engine's own add, the ground, kept) - no cell
-           to remove at; the owner is asked to discard the copy it built (its give row lives 10 s from its own confirm) */
+           to remove at; the owner is asked to discard the copy it built (its give row lives coopgive::kOwnerGiveStandMs from its own
+           confirm) */
         ++g_showGive[8];
         ItTakerAnswer(1, id, 0);
         DebugLog("[ITEMS] late give " + N((long long)id) + " (" + std::string(lp.baseSid) + "): the answer came after our 10 s and our"
@@ -22214,6 +25266,25 @@ static void ItLateGiveRemove(const ItLapsed& lp, unsigned int id)
     {
         if (lp.bagSent != 0) bagSame = ItGiverBagSame(lsec, lp.localX, lp.localY, lp.localItem, lp.bagDigest);
         if (bagSame) removed = ItTakerRemoveExact(linv, lsec, lp.localX, lp.localY, lp.baseSid, lp.localItem, lp.quantity);
+        if (coopgive::LateGiveTrySquare(removed, lp.bagSent != 0, bagSame))
+        {   /* T-853: the object test failed - the put-back after our lapse made a new object; the same item at the same cell is ours */
+            if (ItLateGiveRemoveSquare(linv, lsec, lp) == 1)
+            {
+                removed = 1;
+                bagSame = true;
+                ++g_lateGiveSquare[0];
+                if (ItLapseRevokeSay(g_lateGiveSquare[0]))
+                    DebugLog("[ITEMS] late give " + N((long long)id) + " (" + std::string(lp.baseSid) + "): our copy is a new object since the"
+                             " put-back, found by its sid, quality, level, cell and quantity and removed. Counted itemGiveLapse lateGiveSquareRemoved.");
+            }
+            else
+            {
+                ++g_lateGiveSquare[1];
+                if (ItLapseRevokeSay(g_lateGiveSquare[1]))
+                    DebugLog("[ITEMS] late give " + N((long long)id) + " (" + std::string(lp.baseSid) + "): the item at our recorded cell is not"
+                             " our copy by sid, quantity, quality, level (or pack rows) either - nothing removed. Counted itemGiveLapse lateGiveSquareNoMatch.");
+            }
+        }
     }
     const int outcome = coopgive::LateGiveOutcome(lp.bagSent != 0, bagSame, removed);
     if (outcome == coopgive::kGiveRemoved)
@@ -22275,7 +25346,16 @@ static void ItLateTakePlace(const ItLapsed* lpIn, const ItemConfirmMsg& cf)
     if (ownChoice == coopmark::kTakerOwnWire) mm.owner = cf.owner;
     else if (ownChoice == coopmark::kTakerOwnLocal) { mm.ownerLocal = 1; std::memcpy(mm.ownerLocalRaw, lp.ownerLocalRaw, sizeof(mm.ownerLocalRaw)); }
     mm.gear = cf.gear;   /* the holder's uniform and crafter of the taken item */
-    const int ok = (sec != 0) ? ItTakerAdd(c, sec, &mm, lp.localX, lp.localY, &cf.bag, lp.showMerge) : 0;   /* T-164 fold (LOW-a): owner 212 */
+    /* T-889 fold 4 (G1): the late take goes through the live take's one road - its in line written before the add, its placed step
+       after (a refused line places nothing: PLACED ok=0 below puts it back on the holder) */
+    ItPending tp;
+    std::memset(&tp, 0, sizeof(tp));
+    tp.used = 1; tp.id = cf.id; tp.dir = 0; tp.mineUid = lp.mineUid; tp.quantity = lp.quantity; tp.ghostIsBox = lp.ghostIsBox;
+    std::memcpy(tp.localSection, lp.localSection, kSecCap);
+    tp.localX = lp.localX; tp.localY = lp.localY; tp.localBag = lp.localBag;
+    tp.localIsBox = lp.localIsBox; std::memcpy(tp.localBoxKey, lp.localBoxKey, kBoxKeyCap);
+    std::memcpy(tp.baseSid, lp.baseSid, kSidCap);
+    const int ok = (sec != 0) ? HovTakerAddLined(tp, cf, c, sec, &mm, lp.showMerge, 1) : 0;   /* T-164 fold (LOW-a): owner 212 */
     if (ok != 0) ++g_escLateTakePlaced; else ++g_escLateTakePlaceFailed;
     ItOwnHandOver(lp.mineUid, cf.baseSid.c_str(), mm.quantity, coop::kHandIn, cf.id, ok != 0 ? 1 : 0, coop::kHandRequester);
     DebugLog("[ITEMS] inv7c: item confirm " + N((long long)cf.id) + " for a TAKE arrived after our own 10 s - the owner holds it"
@@ -22319,6 +25399,7 @@ long long g_shopCfOk = 0, g_shopCfRefused = 0, g_shopCfLapsed = 0, g_shopCfLate 
 long long g_shopRefundFailed = 0, g_shopEscrowBack = 0, g_shopEscrowLost = 0, g_shopCreateFailed = 0;
 long long g_shopHoldBuyOk = 0, g_shopHoldSellOk = 0, g_shopHoldRefused = 0, g_shopHoldKeeperPayFailed = 0, g_shopHoldTakeFault = 0;
 long long g_shopHoldSellPartial = 0, g_shopSoldPartial = 0;   /* T-447 leftover 1: partial sales - the holder's, and the requester's settled ones */
+long long g_shopHoldSellNoRoomTaken = 0;   /* T-801: sales the holder took with no counter room (the item destroyed, as single player) */
 long long g_shopEscrowFeet = 0, g_shopEscrowShort = 0;   /* T-447 review 1/2: an escrow (or its rest) dropped at the seller's feet; one partly back, the rest kept */
 long long g_shopEscrowKept = 0, g_shopEscrowDropFault = 0, g_shopEscrowQtyFault = 0, g_shopHoldQtyUnread = 0;   /* T-447 fold 2: an escrow on the kept retry; a feet drop that faulted; an escrow quantity unreadable; the holder's sale object unreadable */
 long long g_shopShadowMatch = 0, g_shopShadowMismatch = 0, g_shopShadowUnmeasured = 0;
@@ -23198,7 +26279,7 @@ void* g_shopRebuildDefer = 0;
    no time expiry, never evicted; at most 64 rows, and a full table refuses NEW shop trades before anything moves (verdict kVBusy,
    counted appliedFull). Keyed {peer, the requester's per-process epoch, id} (item 12). paid (LOW 7): the cats the keeper really
    received on a buy / paid out on a sale (0 = none) - the undo moves back only that. */
-struct ShopApplied { unsigned int id, peer, at, keeperUid, epoch; int dir, n, price, paid, stock; std::string homeKey; ItemMoveMsg mm; std::string srcKey; };   /* T-1 B5: stock + homeKey / keeperUid name the stock. fold 2 (T811 L8): srcKey = a buy's piece the FIRST removed units came from (the s.keys form) - its undo files there first; empty for a sale */
+struct ShopApplied { unsigned int id, peer, at, keeperUid, epoch; int dir, n, price, paid, stock; std::string homeKey; ItemMoveMsg mm; std::string srcKey; int destroyed; };   /* T-801: destroyed 1 = a sale no counter had room for - the item was destroyed, its undo refunds only */   /* T-1 B5: stock + homeKey / keeperUid name the stock. fold 2 (T811 L8): srcKey = a buy's piece the FIRST removed units came from (the s.keys form) - its undo files there first; empty for a sale */
 std::vector<ShopApplied> g_shopApplied;
 const size_t kShopAppliedCap = 64;
 /* fold 2 (LOW 8): a buy undo's rebuilt units no piece of the shop took - KEPT (alive, in no inventory, as the requester's kept buy
@@ -24840,6 +27921,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     int paid = 0;   /* fold 2 (LOW 7): the cats the keeper really received (buy) / paid out (sale) */
     std::string srcKey;   /* T-1 B5 fold 2 (T811 L8): a buy's piece the FIRST removed units came from - its undo files there first */
     int soldN = n, soldPrice = r.price;   /* T-447 leftover 1: what this trade moved - less than asked only for a PARTIAL sale */
+    int sellResolved = -1, noRoomDestroyed = 0;   /* T-801: a sale's counters that resolved; 1 = taken with no room, the item destroyed */
     if (r.dir == 0)
     {
         /* the stacks of EXACTLY the clicked variant across the home's pieces, chain order (MED 4 fold: the buy carries the full
@@ -24908,7 +27990,9 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
             /* T-447 leftover 1: a piece may absorb part of the stack into its own stacks and refuse the rest; the next piece is then
                offered only the rest. `got` = the units the shop's pieces took; every piece that took units is named (asked again).
                T-1 B5: a caravan's packs in squad-member order, the same loop (no destroy-on-fail: ItAddAnywhereCount). */
-            int got = 0, faulted = 0;
+            int got = 0, faulted = 0, qtyUnread = 0;
+            sellResolved = 0;
+            for (size_t ri = 0; ri < stock.invs.size(); ++ri) if (stock.invs[ri] != 0) ++sellResolved;   /* T-801 */
             for (size_t pi = 0; it != 0 && placed == 0 && faulted == 0 && pi < stock.invs.size(); ++pi)
             {
                 ::Inventory* inv = (::Inventory*)stock.invs[pi];
@@ -24918,7 +28002,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                 if (ad == -1) { faulted = 1; continue; }
                 if (ad == -2)
                 {   /* T-447 review 6 / fold 2: the quantity could not be read - nothing tried; the object is unfiled and goes below */
-                    ++g_shopHoldQtyUnread;
+                    ++g_shopHoldQtyUnread; qtyUnread = 1;
                     ErrorLog("[SHOP] holder SELL id=" + N((long long)r.id) + ": the sold item's quantity could not be read - it is offered to no"
                              " more pieces (the shop took " + N((long long)got) + " of " + N((long long)n) + "). Counted shopPartial holdQtyUnread.");
                     break;
@@ -24936,7 +28020,14 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
                          " (never destroyed or offered again); the shop is counted as having taken " + N((long long)got) + " of " + N((long long)n)
                          + " units. Counted shopFold addFault.");
             }
-            if (got < n)
+            if (placed == 0 && coopsquad::SellNoRoomTaken(sellResolved, got, faulted, qtyUnread, it != 0 ? 1 : 0, caravan) != 0)
+            {   /* T-801 (parity with single player): no counter had room - the keeper has paid, the item is destroyed, the sale stands */
+                ItDestroyPod((void*)it, "T-801 shop holder: a sold item no counter of the shop had room for - taken and destroyed, as single player does");
+                placed = 1; noRoomDestroyed = 1;
+                ++g_shopHoldSellNoRoomTaken;
+                if (r.price > 0) { paid = r.price; ShopPotPublish(stock, 0); }
+            }
+            else if (got < n)
             {
                 if (it != 0 && faulted == 0)
                     ItDestroyPod((void*)it, got > 0 ? "T-447 shop holder: the rest of a sold stack no piece of the shop had room for"
@@ -24984,6 +28075,7 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
         a.epoch = r.shop.epoch; a.paid = paid;
         a.homeKey = r.shop.homeKey; a.stock = r.shop.stock;   /* T-1 B5: the undo resolves the same stock */
         a.srcKey = (r.dir == 0) ? srcKey : std::string();   /* T-1 B5 fold 2: a buy undo's first piece; a sale's undo is unchanged */
+        a.destroyed = noRoomDestroyed;   /* T-801 */
         a.mm.baseSid = cf.baseSid; a.mm.companySid = cf.companySid; a.mm.materialSid = cf.materialSid; a.mm.colorSid = cf.colorSid;
         a.mm.quality = cf.quality; a.mm.charges = cf.charges; a.mm.functionKind = cf.functionKind; a.mm.level = cf.level; a.mm.unique = cf.unique;
         a.mm.quantity = soldN; a.mm.owner = (r.dir == 0) ? cf.owner : r.owner;
@@ -24996,6 +28088,8 @@ void ApplyShopRequest(const ItemRequestMsg& r, unsigned int fromPeer)
              + " price=" + N((long long)r.price) + " " + ShopStockWords(r.shop.stock, r.shop.homeKey, r.shop.keeperUid) + " keeper=" + N((long long)r.shop.keeperUid) + " peer=" + N((long long)fromPeer)
              + " verdict=" + N((long long)verdict) + (cf.ok != 0 ? " APPLIED" : " REFUSED")
              + (soldN != n ? " PARTIAL sold=" + N((long long)soldN) + " for " + N((long long)soldPrice) : std::string()) + " pieces=" + N((long long)touched.size())
+             + (r.dir != 0 ? " resolved=" + N((long long)sellResolved) : std::string())   /* T-801: the counters that resolved */
+             + (noRoomDestroyed != 0 ? std::string(" NO-ROOM-TAKEN(item destroyed, as single player)") : std::string())
              + " (" + (caravan != 0 ? "packs=" + N((long long)stock.invs.size()) + " wearers mine/other/unknown=" + N((long long)stock.wMine) + "/"
                        + N((long long)stock.wOther) + "/" + N((long long)stock.wUnknown) : "home=" + N((long long)(home != 0 ? 1 : 0)))
              + " held=" + N((long long)heldHere) + " keeper=" + N((long long)keeperOk)
@@ -25367,6 +28461,13 @@ int ShopRevokeApplied(unsigned int id, unsigned int fromPeer, unsigned int epoch
             }
         }
     }
+    else if (a.destroyed != 0)
+    {   /* T-801: a sale taken with no counter room - its item was destroyed, so there is nothing on the counters to remove (a search
+           would take an identical stack the shop already had); the seller keeps its own escrow. Only the keeper's price comes back. */
+        itemDone = 1;
+        if (a.price <= 0) moneyDone = 1;
+        else if (keeperOk != 0 && ItKeeperPaySquad(keeper, -a.price) == 1) moneyDone = 1;   /* the keeper's pay back (a gift) */
+    }
     else if (heldHere != 0)
     {
         std::vector<void*> items, invs; std::vector<int> qty, pieceOf;
@@ -25393,7 +28494,7 @@ int ShopRevokeApplied(unsigned int id, unsigned int fromPeer, unsigned int epoch
         + " n=" + N((long long)a.n) + " price=" + N((long long)a.price) + " " + ShopStockWords(a.stock, a.homeKey, a.keeperUid) + " peer=" + N((long long)fromPeer)
         + " (the other game settled it as a refusal before our ok arrived): units " + (itemDone != 0 ? "undone" : "NOT undone")
         + " (" + N((long long)got) + "), money " + (moneyDone != 0 ? "undone" : "NOT undone") + " (held=" + N((long long)heldHere)
-        + " keeper=" + N((long long)keeperOk) + ")" + (kept != 0 ? " kept=1" : "") + (shortCats != 0 ? " short=" + N((long long)shortCats) : std::string())
+        + " keeper=" + N((long long)keeperOk) + ")" + (a.destroyed != 0 ? " destroyed=1" : "") + (kept != 0 ? " kept=1" : "") + (shortCats != 0 ? " short=" + N((long long)shortCats) : std::string())
         + (a.dir == 0 ? " src=" + (a.srcKey.empty() ? std::string("none") : a.srcKey) + (undoBack.empty() ? std::string() : " back=" + undoBack)
                       : std::string());   /* T-1 B5 fold 2 */
     if (outcome == 2) DebugLog(line); else ErrorLog(line + " - counted shopLate undoPart / undoNone");
@@ -25463,6 +28564,7 @@ void ApplyItemConfirm(const ItemConfirmMsg& cf, unsigned int fromPeer)
     if (GroundNoteConfirm(cf) != 0) return;   /* inv5 phase 1: the answer to a ground PUT / TAKE */
     if (ShopPendConfirm(cf) != 0) return;   /* T-164 B4-4 intercept: the answer to a shop request of ours */
     ItPending* pp = ItPendFind(cf.id);
+    if (pp == 0) pp = HovGiveUnpark(cf.id);   /* T-889 fold 1 (review 4): a parked give's late answer settles it */
     /* mmo6 fold (review-mmo6 HIGH 1): the requester side (mmo1b item 6) is marked, and ledgered, only once THIS game's own half
        is known - a refusal and an unresolved section mark only; the place (TAKE, IN) / removal (GIVE, OUT) writes the line. */
     if (pp == 0)
@@ -25473,6 +28575,29 @@ void ApplyItemConfirm(const ItemConfirmMsg& cf, unsigned int fromPeer)
         const ItLapsed* lp = ItLapsedFind(cf.id);
         if (lp == 0) { ++g_reqUnknownIdForeign; return; }
         ++g_reqUnknownIdLate;
+        if (lp->answeredNo != 0)
+        {   /* the holder was told no at once (its answer was unreadable, or T-853: our GIVE lapsed and a REVOKE went out): a later
+               copy changes nothing - our item is back here and the owner discards the copy it built */
+            if (lp->revokedAtLapse != 0)
+            {
+                ++g_lapseRevoke[2];
+                if (ItLapseRevokeSay(g_lapseRevoke[2]))
+                    DebugLog("[ITEMS] item confirm " + N((long long)cf.id) + " (ok=" + N((long long)cf.ok) + ") for a GIVE that lapsed here and"
+                             " was already revoked - nothing is removed or placed; our item stays the one copy. Counted itemGiveLapse lateYesAfterRevoke.");
+                if (coopgive::LateYesReRevoke(lp->revokedAtLapse, cf.ok) != 0)
+                {   /* the ok proves the owner's row exists now; our REVOKE may have reached the owner before it did and found nothing */
+                    ++g_lapseRevoke[9];
+                    const bool again = net::SendItemRevoke(cf.id);
+                    if (again) ++g_revokeSent;
+                    else { ++g_revokeUnsent; ItRevokeListNote(cf.id); }
+                    if (ItLapseRevokeSay(g_lapseRevoke[9]))
+                        DebugLog("[ITEMS] item confirm " + N((long long)cf.id) + " ok for a GIVE already revoked: the owner's row exists now, so"
+                                 " the REVOKE is sent again (" + std::string(again ? "sent" : "NOT sent - kept for a re-send")
+                                 + "). Counted itemGiveLapse lateOkReRevoke.");
+                }
+            }
+            return;
+        }
         if (lp->localIsBox != 0) { if (cf.ok != 0) ++g_box211f[0]; else ++g_box211f[1]; }   /* T-164 211 fold-1 (F6) */
         if (lp->takeOneConsume != 0)   /* par1: a late ok to a consume is answered ok (the item named - F3) and never placed */
         {
@@ -25593,7 +28718,9 @@ void ApplyItemConfirm(const ItemConfirmMsg& cf, unsigned int fromPeer)
         ItRefundTrade(p, "holderRefused", "the holder refused the request");   /* T-164 B4-2: the exact charge; the keeper's half (F4) inside */
         ItOwnHandOver(p.mineUid, p.baseSid, p.quantity, p.dir == 0 ? coop::kHandIn : coop::kHandOut, p.id, 0, coop::kHandRequester);   /* mmo6 fold: mark only */
         ItLootNoteConfirm(p.id, 1, 0);
+        const long long sameBack0 = g_showTake[10];   /* the settle's "same item back in its cell" count, read before it runs */
         ItShowSettle(p, 0, 0, 0);   /* T-164 non-shop road: refused - what showed at once goes back, quietly (208) */
+        HdTakeRefused(p, g_showTake[10] != sameBack0 ? 1 : 0);   /* P105: a put-back onto a square a LAND clear found empty is cleared again */
         return;
     }
 
@@ -25666,8 +28793,9 @@ void ApplyItemConfirm(const ItemConfirmMsg& cf, unsigned int fromPeer)
             ItOwnSay("[OWN] confirm sid=" + cf.baseSid + " owner=" + ItOwnerText(cf.owner) + " UNRESOLVED here - the local D5-2 mark goes on instead (ownerUnresolved="
                      + N(g_markUnresolved) + ")");
         }
-        ok = ItTakerAdd(c, sec, &mm, p.localX, p.localY, &cf.bag,
-                        (p.showKind == coopshow::kShowTakeUnits && p.showMerge != 0) ? 1 : 0);   /* T-164 (owner 212) */
+        /* T-889 step 2 (A4), fold 3 (F2), fold 4 (G1): the taker's in line BEFORE the item is on this game (refused: nothing placed), the
+           add, then its placed step - one road, shared with the late take (ItLateTakePlace) */
+        ok = HovTakerAddLined(p, cf, c, sec, &mm, (p.showKind == coopshow::kShowTakeUnits && p.showMerge != 0) ? 1 : 0, 0);   /* T-164 (owner 212) */
     }
     else
     {
@@ -26347,6 +29475,7 @@ std::string ItemsDetail()
          + N(g_reqUnknownIdForeign) + "," + N(g_reqRefusedHere) + ","
          + N(g_revertRelocated) + "," + N(g_revertRecreated) + "," + N(g_reqConfirmNoTaker) + "," + N(g_reqConfirmFailed) + ","
          + N(g_reqConfirmSendFailed)
+         + " itemRefusedAnswered[confirm,request,confirmLeft]=" + N(g_confirmRefusedAnswered) + "," + N(g_requestRefusedAnswered) + "," + N(g_confirmRefusedLeft)
          + " mergeGive[split,whole]=" + N(g_revertMergeSplit) + "," + N(g_revertMergeWhole)
          + " itemReq3[placedRecv,placedUnknownId,placedWrongPeer,placedUnsent,revokeSent,revokeRecv,revokeUnknownId,rollbackGiveFailed,ownerPendFull,takerSlotRefused,heldDeferredSent,pickupNoCursor]="
          + N(g_placedRecv) + "," + N(g_placedUnknownId) + "," + N(g_placedWrongPeer) + "," + N(g_placedUnsent) + ","
@@ -26556,6 +29685,9 @@ std::string ItemsDetail()
          + N(g_restockWanderSkippedNotWriter) + "," + N(g_restockWanderSkippedUnrun) + "," + N(g_restockWanderRanUnrunArea) + ","
          + N(g_restockWanderSplitWait) + "," + N(g_restockWanderUnreadable) + "," + N(g_restockDeferredShort) + ItWanderReport()
          + " restockSinglePlayer=" + N(g_restockSinglePlayer)
+         + " keeperRepaired[moneyUnknown,empty]=" + N(g_keeperRepairedMoneyUnknown) + "," + N(g_keeperRepairedEmpty)   /* T-799 D3 */
+         + " keeperRepair[pending,timerFailed]=" + N((long long)g_keeperRepairPend.size()) + "," + N(g_keeperRepairTimerFailed)
+         + " shopSellNoRoomTaken=" + N(g_shopHoldSellNoRoomTaken)   /* T-801 D5 */
          /* B1 (read-bstate) item 1 */
          + " production[prodRanHolder,prodSkippedNotHolder,workerPassed,singlePlayer,unreadable]="
          + N(g_prodRanHolder) + "," + N(g_prodSkippedNotHolder) + "," + N(g_prodWorkerPassed) + ","
@@ -26582,6 +29714,7 @@ std::string ItemsDetail()
             that was repeated; `genUnsettled` is one that was refused after two torn attempts, and whenever it
             is non-zero the two counters above inherit it - some of those refusals were live buildings. */
          + " itemBoxWalkP7q[boxWalkGenMoved,boxWalkGenUnsettled]=" + N(g_boxWalkGenMoved) + "," + N(g_boxWalkGenUnsettled)
+         + " buildingGone[calls,dropped,filtered,offMain,notDismantled]=" + N(g_bldGoneCalls) + "," + N(g_bldGoneDropped) + "," + N(g_bldGoneFiltered) + "," + N((long long)g_bldGoneOffMain) + "," + N((long long)g_bldGoneNotDismantled)
          /* P7a. `mergePublishedAtSlot` / `mergeUnresolved` are the SENDER'S half of the wrong-cell merge fix
             and `applyQtySidMismatch` the RECEIVER'S; `purseRefunded` / `purseRefundFailed` are the money put
             back on a refused or lapsed priced request.
@@ -26626,6 +29759,47 @@ std::string ItemsDetail()
          + " itemGive1[lateGiveConfirm,lateGiveRemoved,lateGiveItemGone,lateGiveItemChanged,cancelSaleDebited,cancelBuyRefunded,confirmHeld,confirmHeldUnsent]="
          + N(g_lateGiveConfirm) + "," + N(g_lateGiveRemoved) + "," + N(g_lateGiveItemGone) + "," + N(g_lateGiveItemChanged) + ","
          + N(g_cancelSaleDebited) + "," + N(g_cancelBuyRefunded) + "," + N(g_cfHeldCount) + "," + N(g_cfHeldUnsent)
+         /* T-853: a lapsed GIVE's REVOKE at once, the late yes it makes a no-op, the kept REVOKEs' re-send, and the late yes's
+            removal by sid and cell when the object changed. */
+         + " itemGiveLapse[revokeAtLapse,revokeAtLapseUnsent,lateYesAfterRevoke,revokeKept,revokeResent,revokeResendGaveUp,revokeListFull,lapseNoRevoke,lateGiveSquareRemoved,lateGiveSquareNoMatch,lapseNotBack,lateOkReRevoke]="
+         + N(g_lapseRevoke[0]) + "," + N(g_lapseRevoke[1]) + "," + N(g_lapseRevoke[2]) + "," + N(g_lapseRevoke[3]) + ","
+         + N(g_lapseRevoke[4]) + "," + N(g_lapseRevoke[5]) + "," + N(g_lapseRevoke[6]) + "," + N(g_lapseRevoke[7]) + ","
+         + N(g_lateGiveSquare[0]) + "," + N(g_lateGiveSquare[1]) + "," + N(g_lapseRevoke[8]) + "," + N(g_lapseRevoke[9])
+         /* T-853: the owner's REVOKE - the object it built removed exactly, and the keeper's half settled once */
+         + " itemRevokeOwner[builtRemoved,builtNotFound,builtNone,keeperUndone,keeperLeftToRunner,keeperKeptNotRemoved]="
+         + N(g_revokeOwner[0]) + "," + N(g_revokeOwner[1]) + "," + N(g_revokeOwner[2]) + ","
+         + N(g_revokeKeeper[0]) + "," + N(g_revokeKeeper[1]) + "," + N(g_revokeKeeper[2])
+         /* T-889: a give across a drop or a reconnect - the REVOKE found by the giver's player, the owner's stand clock and the
+            giver's kept-REVOKE clock held while the other game is away */
+         + " itemGiveAway[revokeByPlayer,standHeldAway,stoodAfterAway,revokeHeldLinkDown,syncReleased]="
+         + N(g_giveAway[0]) + "," + N(g_giveAway[1]) + "," + N(g_giveAway[2]) + "," + N(g_giveAway[3]) + "," + N(g_giveAway[4])
+         /* T-889 step 2: the hand-over record (pp.handover) */
+         + " itemHandover[held,in,closedLive,query,vHolds,vNot,vUnknown,restoredLive,restoredRebuilt,closedByVerdict,lineFail,lineFull,rebuildFail]="
+         + N(g_hovC[0]) + "," + N(g_hovC[1]) + "," + N(g_hovC[2]) + "," + N(g_hovC[3]) + "," + N(g_hovC[4]) + "," + N(g_hovC[5]) + "," + N(g_hovC[6])
+         + "," + N(g_hovC[7]) + "," + N(g_hovC[8]) + "," + N(g_hovC[9]) + "," + N(g_hovC[10]) + "," + N(g_hovC[11]) + "," + N(g_hovC[12])
+         + " itemHandoverMore[noLine,returnedLive,handBackDeferred,quietKept,copyRemoved,msgRefused,sendFail]=" + N(g_hovNoLine) + "," + N(g_hovReturnedLive)
+         + "," + N(g_hovHandBackDeferred) + "," + N(g_hovQuietKept) + "," + N(g_hovCopyRemoved) + "," + N(g_hovMsgRefused) + "," + N(g_hovSendFail)
+         /* T-889 fold 1 (review 2026-10-17) */
+         + " itemHandoverFold[settleRetry,settleGaveUp,takeParked,giveParked,unparked,ackRecv,closedNoLine,dropNoLines,closedUnknown,liveVerdict,"
+           "closeNoRebuild,holderCopyRemoved,holderCopyMissing,rebuildWait]=" + N(g_hovSettleRetry) + "," + N(g_hovSettleGaveUp) + "," + N(g_hovTakeParked)
+         + "," + N(g_hovGiveParked) + "," + N(g_hovUnparked) + "," + N(g_hovAckRecv) + "," + N(g_hovClosedNoLine) + "," + N(g_hovDropNoLines)
+         + "," + N(g_hovClosedUnknown) + "," + N(g_hovLiveVerdict) + "," + N(g_hovCloseNoRebuild) + "," + N(g_hovHolderCopyRemoved)
+         + "," + N(g_hovHolderCopyMissing) + "," + N(g_hovRebuildWait)
+         /* T-889 fold 2 (re-check 2026-10-17) */
+         + " itemHandoverFold2[holderRemoveWait,groundRemoved,rebuildToGround,parkedNoSlot,lookNoMatch]=" + N(g_hovHolderRemoveWait) + ","
+         + N(g_hovGroundRemoved) + "," + N(g_hovRebuildToGround) + "," + N(g_hovParkedNoSlot) + "," + N(g_hovLookNoMatch)
+         /* T-889 fold 3 (re-check 2 of fold 2, 2026-10-17) */
+         + " itemHandoverFold3[charIdUnread,charAmbiguous,placedSet,placedUnknown,groundGoneHeld,groundSearchHolds]=" + N(g_hovCharIdUnread)
+         + "," + N(g_hovCharAmbiguous) + "," + N(g_hovPlacedSet) + "," + N(g_hovPlacedUnknown) + "," + N(g_hovGroundGoneHeld) + ","
+         + N(g_hovGroundSearchHolds)
+         /* T-889 fold 4 (re-check 3, 2026-10-17) */
+         + " itemHandoverFold4[lateTakeLined,holderElsewhere,holderPathWait,inElsewhere,lookScanUnread,twinElsewhere]=" + N(g_hovLateTakeLined)
+         + "," + N(g_hovHolderElsewhere) + "," + N(g_hovHolderPathWait) + "," + N(g_hovInElsewhere) + "," + N(g_hovLookScanUnread) + ","
+         + N(g_hovTwinElsewhere)
+         /* T-889 fold 5 (2026-10-17) */
+         + " itemHandoverFold5[closedWaitCommit,closedCommitLanded,closedSameBytes,closedNoRecord,closedKeptAfterLoad,rebuiltAtTaker,takerRebuildWait]="
+         + N(g_hovClosedWaitCommit) + "," + N(g_hovClosedCommitLanded) + "," + N(g_hovClosedSameBytes) + "," + N(g_hovClosedNoRecord) + ","
+         + N(g_hovClosedKeptAfterLoad) + "," + N(g_hovRebuiltAtTaker) + "," + N(g_hovTakerRebuildWait)   /* T-889 fold 5b */
          /* inv6 phase 1: the stolen mark. carried = messages SENT with an OWN1 block; received = arrivals with one; applied = set on the
             new item (wire); unresolved = the owner not found here on arrival (parked when it names a uid - itemOwnPark); localApplied = D5-2; unreadable =
             owner words not readable (any thread); senderUnknown = our own owner not found at send; badBlock = would not encode. */
@@ -26669,7 +29843,16 @@ std::string ItemsDetail()
             was deleted with the host fallback and the door road's refusals are wrDoor[r4Refused] now. */
          + " doorArea[loadWindow,staleMap,noSession,ring1Presumed,freshNoAreaRow]="
          + N(g_doorLoadWindow) + "," + N(g_doorStaleMap) + "," + N(g_doorNoSession) + ","
-         + N(g_doorRing1Presumed) + "," + N(g_doorFreshNoAreaRow);
+         + N(g_doorRing1Presumed) + "," + N(g_doorFreshNoAreaRow)
+         /* T-172 rep: the copy's cell-drift repair and the one-time leftover sweep (see the T-172 glob counters) */
+         + " cellDrift[adds,removed,sameRecord,removeFailed,stillTaken,restamped,destroyFailed,parityAsked,lines]=" + N(g_driftAdds) + ","
+         + N(g_driftRemoved) + "," + N(g_driftSameRecord) + "," + N(g_driftRemoveFailed) + "," + N(g_driftStillTaken) + ","
+         + N(g_driftRestamped) + "," + N(g_driftDestroyFailed) + "," + N(g_driftParityAsked) + "," + N(g_driftLines)
+         + " leftoverSweep[containers,removed,unjudged,removeFailed,restamped,capFull]=" + N(g_sweepContainers) + ","
+         + N(g_sweepRemoved) + "," + N(g_sweepUnjudged) + "," + N(g_sweepRemoveFailed) + "," + N(g_sweepRestamped) + "," + N(g_sweepCapFull)
+         + " cellDriftFold[mineSkipped,cellsNulled,gridRefused,sectionRefused,faultRestored,repeatLines]=" + N(g_driftMineSkipped) + ","
+         + N(g_driftCellsNulled) + "," + N(g_driftGridRefused) + "," + N(g_driftSecRefused) + "," + N(g_driftFaultRestored) + ","
+         + N(g_driftRepeatLines);
 }
 
 /* ====== E45 (P8e): THE DOOR ROAD'S THREE BORROWED ANSWERS ======
@@ -26804,6 +29987,12 @@ int ProdStepWriterHere(void* pb)
     if (g_base == 0 || !ItPlaus(pb)) return coopfarm::kProdWriterNone;
     return ItProdWriterKept(pb);
 }
+int ProdWriterDecide(void* pb, int* slot)
+{
+    if (slot != 0) *slot = -1;
+    if (g_base == 0 || !ItPlaus(pb)) return coopfarm::kProdWriterNone;
+    return ItProdWriterSlot(pb, slot);
+}
 int ProductionBuildingIs(const void* b) { return ItProdSlotIs(b); }
 int ProdOperateRun(void* pb, void* who, float amount)
 {
@@ -26815,22 +30004,28 @@ int ProdOperateRun(void* pb, void* who, float amount)
 /* par16: declared in items.h. THE FARM'S WRITER is the production machines' writer, asked exactly as ItProdHolder asks it
    (forBox 0, the restock family's area counters; "farm" names the asker in the owner rung's lines) - without ItProdHolder's own
    production counters, so a farm is never booked as a machine. */
-int FarmWriterHere(void* b)
+int FarmWriterDecide(void* b, FarmWriterView* out)
 {
-    if (g_base == 0 || b == 0 || !ItPlaus(b)) return 0;
+    FarmWriterView fv;
+    fv.verdict = 0; fv.slot = -1; fv.byOwner = 0; fv.areaSlot = -1; fv.areaHere = 0;
     float p[3] = { 0.0f, 0.0f, 0.0f };
-    if (ItBoxPosPod(b, p) == 0) return 0;
-    int byO = 0;
-    int v = ItBoxWriterDecide(b, p, 0, 0, &byO, "farm");
-    if (v == kBoxMine && byO != 0)
+    if (g_base != 0 && b != 0 && ItPlaus(b) && ItBoxPosPod(b, p) != 0)
     {
-        char pk[kBoxKeyCap]; pk[0] = 0;
-        if (ItBoxKeyBuild(b, pk, kBoxKeyCap, 0, 0) != 0 && pk[0] != 0) v = ItHandbackGate(b, pk, p);
+        int byO = 0;
+        int v = ItBoxWriterDecide(b, p, 0, 0, &byO, "farm");
+        if (v == kBoxMine && byO != 0)
+        {
+            char pk[kBoxKeyCap]; pk[0] = 0;
+            if (ItBoxKeyBuild(b, pk, kBoxKeyCap, 0, 0) != 0 && pk[0] != 0) v = ItHandbackGate(b, pk, p);
+        }
+        fv.byOwner = byO;
+        fv.verdict = (v == kBoxMine) ? 1 : ((v == kBoxHeld) ? 2 : 0);
+        fv.slot = ItWriterSlotFor(p, 0, v, byO, &fv.areaSlot, &fv.areaHere);   /* T-853 #6: the slot from the same ask */
     }
-    if (v == kBoxMine) return 1;
-    if (v == kBoxHeld) return 2;
-    return 0;
+    if (out != 0) *out = fv;
+    return fv.verdict;
 }
+int FarmWriterHere(void* b) { return FarmWriterDecide(b, 0); }
 /* BED1 (T263/T264 poseBedUnresolved): declared in items.h. THE OUTER BUILDING OF A LAYOUT PIECE, as the key ItBoxResolve
    can find. Building+0x238 is the `Layout* __isfurnitureOf` the constructor stores and Layout+0x90 the building that
    layout belongs to (kBldFurnitureLayout / kLayoutOwnerBuilding above): furnitureParentBuilding 0xD5F60 is exactly those
@@ -26888,6 +30083,25 @@ int ItInteriorSetPod(const void* interior, unsigned int* ids, int cap, int* list
 /* review-build1f C1: declared in items.h - the zone-walk generation (bumped at every zone deactivation, on any thread, and
    once per ItemsTick). A plain aligned 8-byte read, as ItBoxWalkNow's. */
 long long BoxWalkGen() { return g_boxWalkGen; }
+/* T-609 part 2 (H4), declared in items.h: building `b` has just been dismantled (or handed to the engine's destroy) by this mod. It
+   leaves the memoised building list now - every later reader in this generation (the box resolver, the bag walk, the door road)
+   would otherwise hold its pointer after the engine frees it - and stays out of fresh walks for walkdrop::kGoneKeepDrains drains.
+   Off the main thread the list is not ours to touch: the generation is moved instead (counted). */
+void ItemsBuildingGone(void* b, int gone)
+{
+    if (b == 0) return;
+    if (gone == 0) { ::InterlockedIncrement64(&g_bldGoneNotDismantled); return; }   /* fold 1 (F4): not taken down - it stays listed */
+    if (ItOnMainThread() == 0) { ::InterlockedIncrement64(&g_bldGoneOffMain); ::InterlockedIncrement64(&g_boxWalkGen); return; }
+    ++g_bldGoneCalls;
+    if (g_boxWalkListGen == g_boxWalkGen)
+    {
+        const int n0 = g_boxWalkN;
+        g_boxWalkN = walkdrop::WalkListDrop(g_boxWalkList, g_boxWalkN, b);
+        g_bldGoneDropped += (long long)(n0 - g_boxWalkN);
+    }
+    walkdrop::GoneAdd(g_bldGoneRows, walkdrop::kGoneCap, &g_bldGoneN, &g_bldGoneNext, b, g_bldGoneDrain);
+}
+long long ZoneTornGen() { return g_grZoneTornGen; }   /* one more each time a zone is taken apart (either thread) */
 int InteriorPieceIds(void* outer, unsigned int* ids, int cap, int* listed, int* truncated, int* torn)
 {
     int l = -1, t = 0, n = 0, tr = 0;
@@ -27783,7 +30997,8 @@ int ItBoxHasPendingMoves(void* b, const char* key)
     if (g_splitPend.used != 0 && g_splitPend.re.kind == kKindBox && g_splitPend.re.box == b) return 1;
     if (g_heldPend.used != 0 && g_heldPend.re.kind == kKindBox && g_heldPend.re.box == b) return 1;
     for (int q = 0; q < kOwnerPendCap; ++q)
-        if (g_ownerPend[q].used != 0 && g_ownerPend[q].isBox != 0 && std::strcmp(g_ownerPend[q].boxKey, key) == 0) return 1;
+        if (g_ownerPend[q].used != 0 && g_ownerPend[q].isBox != 0 && std::strcmp(g_ownerPend[q].boxKey, key) == 0
+            && ItOwnerRowHoldsSync(g_ownerPend[q]) != 0) return 1;   /* T-889 step 2 (896 b): not a GIVE row whose giver is away */
     /* P94 fold 1 (review F5): this game's own held request on the box (a T-164 take waiting for its answer), as
        InvNetCharPending checks g_pend for a character - an answer swapped in under it would lose the take. */
     for (int p = 0; p < kPendCap; ++p)
@@ -30704,6 +33919,143 @@ int ItIsDeadPod(::Character* c)
    raw +0x118 write that publishes NOTHING here - the inventory safety net must catch it and send ITEM_MOVE op 4, which is what a
    player's medkit use gets. q= has no in-place engine writer (a grade never changes in play), so after a q= write the lever
    republishes the item as its owner's remove + add at the same slot - the other game rebuilds it with every field, as a move does. */
+/* T-172 lever: TEST-ONLY `itemtest drift <peer|name> <staleSid> at <ownerSid>` | `itemtest drift <peer|name> <staleSid> hidden` |
+   `itemtest drift show <peer|name>`. Drift planted in OUR COPY of another game's character, behind the applying-thread guard - nothing
+   is published or requested, exactly what a lost owner move leaves. `at`: a `staleSid` record put at the cell where an `ownerSid` item
+   would land in the copy's general section now (the engine's first free cell for it, ItFirstFreeSlot) - so the owner's next add of
+   `ownerSid` into its own general section lands on it. `hidden`: a `staleSid` record filed at the cell of the copy's first visible
+   record whose cell takes it, and the grid put back exactly as it was - an invisible leftover, the old overwrite's shape; that copy's
+   one-time sweep is due again. `show`: read-only - per section the records, visible and leftover, by cell. Refused for a character this
+   game owns. */
+static int ItDriftPlantPod(::InventorySection* sec, ::Item* item, int x, int y, int hidden)
+{
+    int r = 0;
+    ::InterlockedExchange(&g_itApplyingThread, (LONG)::GetCurrentThreadId());
+    __try
+    {
+        if (!ItSlotInRange(sec, item, x, y) || !sec->fitsAt(item, x, y)) r = 0;
+        else if (hidden == 0) { if (ItCellAccepts(sec, item, x, y)) { sec->placeItemDirect(item, x, y); r = 1; } }
+        else
+        {
+            int gw = 0, gh = 0;
+            void* cells = 0;
+            if (ItIntPod(sec, kSecContentW, &gw) != 0 && ItIntPod(sec, kSecContentH, &gh) != 0 && coopdrift::GridOk(gw, gh) != 0
+                && ItPtrPod(sec, kSecContent, &cells) != 0 && cells != 0)
+            {
+                const int n = gw * gh;
+                for (int i = 0; i < n; ++i) s_driftGrid[i] = ((void**)cells)[i];
+                sec->placeItemDirect(item, x, y);
+                for (int i = 0; i < n; ++i) ((void**)cells)[i] = s_driftGrid[i];   /* listed, and no cell answers it */
+                r = 1;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = -1; }
+    ::InterlockedExchange(&g_itApplyingThread, 0);
+    return r;
+}
+std::string ItemTestDriftCommand(const std::string& arg)
+{
+    std::vector<std::string> tok;
+    {
+        std::string w;
+        for (size_t i = 0; i <= arg.size(); ++i)
+        {
+            if (i == arg.size() || arg[i] == ' ' || arg[i] == '\t') { if (!w.empty()) tok.push_back(w); w.clear(); }
+            else w += arg[i];
+        }
+    }
+    const char* usage = " - usage itemtest drift <peer|name> <staleSid> at <ownerSid> | <peer|name> <staleSid> hidden | show <peer|name>";
+    const int show = (tok.size() == 2 && tok[0] == "show") ? 1 : 0;
+    const int at = (tok.size() == 4 && tok[2] == "at") ? 1 : 0;
+    const int hidden = (tok.size() == 3 && tok[2] == "hidden") ? 1 : 0;
+    if (show == 0 && at == 0 && hidden == 0) return std::string("error itemtest drift: bad arguments") + usage;
+    if (StoreTearingDown() != 0 || !ItPlaus(coop::GameWorldPtr())) return "error itemtest drift: no world is running";
+    const std::string who = (show != 0) ? tok[1] : tok[0];
+    ::Character* c = 0; unsigned int uid = 0; std::string nm; long long hits = 0;
+    if (ItLeverPick(who, &c, &uid, &nm, &hits) == 0 || c == 0) return "error itemtest drift: no loaded character matches '" + who + "'";
+    if (uid == 0 || net::IsUidMine(uid)) return "error itemtest drift: '" + nm + "' is not a copy of another game's character (never the owner's own)";
+    ::Inventory* inv = ItInventoryOf(c);
+    std::string sn;
+    ::InventorySection* gsec = (inv != 0) ? ItGeneralSection(inv, &sn) : 0;
+    if (gsec == 0) return "error itemtest drift: '" + nm + "' has no general section";
+    if (show != 0)
+    {
+        long long allRows = 0, allLeft = 0, allUnj = 0;
+        const ItSecMap& sm = *(const ItSecMap*)((char*)inv + 0x28);
+        if (sm.size() > 64) return "error itemtest drift show: the section map reads back implausibly";
+        for (ItSecMap::const_iterator it = sm.begin(); it != sm.end(); ++it)
+        {
+            ::InventorySection* sec = it->second;
+            if (!ItObj(sec)) continue;
+            char secName[kSecCap]; secName[0] = 0;
+            ItStrPod(&it->first, secName, kSecCap);
+            const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+            if (si.empty() || si.size() > 512) continue;
+            long long vis = 0, left = 0, unj = 0;
+            std::string list;
+            for (size_t k = 0; k < si.size(); ++k)
+            {
+                ::Item* r = si[k].item;
+                int cx = -1, cy = -1;
+                const int v = ItRowVisPod(sec, r, &cx, &cy);
+                if (v == coopdrift::kRowVisible) ++vis; else if (v == coopdrift::kRowLeftover) ++left; else ++unj;
+                char sid[kSidCap]; sid[0] = 0;
+                ItBaseSidPod((void*)r, sid, kSidCap);
+                if (k < 24) list += std::string(list.empty() ? "" : " ") + sid + "@" + N((long long)cx) + "," + N((long long)cy)
+                                    + (v == coopdrift::kRowVisible ? ":v" : (v == coopdrift::kRowLeftover ? ":LEFTOVER" : ":?"));
+            }
+            allRows += (long long)si.size(); allLeft += left; allUnj += unj;
+            DebugLog("[ITEMS] drift show uid=" + N((long long)uid) + " '" + nm + "' " + secName + (sec == gsec ? " (general)" : "")
+                     + " rows=" + N((long long)si.size()) + " visible=" + N(vis) + " leftover=" + N(left) + " unjudged=" + N(unj)
+                     + " [" + list + "] (TEST-ONLY lever, read-only)");
+        }
+        return "ok itemtest drift show uid=" + N((long long)uid) + " rows=" + N(allRows) + " leftover=" + N(allLeft) + " unjudged=" + N(allUnj);
+    }
+    ItemMoveMsg ms; ms.baseSid = tok[1]; ms.quantity = 1;
+    int x = -1, y = -1;
+    if (at != 0)
+    {
+        ItemMoveMsg mp; mp.baseSid = tok[3]; mp.quantity = 1;
+        ::Item* probe = ItCreateItem(c, mp, 0);
+        if (probe == 0) return "error itemtest drift: could not create '" + tok[3] + "' (unknown sid on this install, or no scratch container)";
+        const int found = ItFirstFreeSlot(gsec, (void*)probe, &x, &y);
+        ItDestroyRefused(probe);   /* in no inventory: only its size was asked */
+        if (found == 0) return "error itemtest drift: no free cell for '" + tok[3] + "' in " + sn;
+    }
+    ::Item* stale = ItCreateItem(c, ms, 0);
+    if (stale == 0) return "error itemtest drift: could not create '" + tok[1] + "' (unknown sid on this install, or no scratch container)";
+    int r = 0;
+    if (at != 0) r = ItDriftPlantPod(gsec, stale, x, y, 0);
+    else
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = gsec->items;
+        std::vector< ::Item*> rows;
+        for (size_t k = 0; k < si.size() && k < 512; ++k) rows.push_back(si[k].item);
+        for (size_t k = 0; k < rows.size() && r == 0; ++k)
+        {
+            int cx = -1, cy = -1;
+            if (rows[k] == stale || ItRowVisPod(gsec, rows[k], &cx, &cy) != coopdrift::kRowVisible) continue;
+            r = ItDriftPlantPod(gsec, stale, cx, cy, 1);
+            if (r == 1) { x = cx; y = cy; }
+        }
+    }
+    if (r == -1)
+    {
+        ErrorLog("[ITEMS] drift lever: the engine's add FAULTED - the record is left where the fault left it (TEST-ONLY lever)");
+        return "error itemtest drift: the add faulted";
+    }
+    if (r != 1)
+    {
+        ItDestroyRefused(stale);
+        return "error itemtest drift: no cell of " + sn + " takes '" + tok[1] + "'" + (hidden != 0 ? " under a visible record" : "");
+    }
+    if (hidden != 0) g_driftSwept.erase("uid " + N((long long)uid));
+    const std::string line = "uid=" + N((long long)uid) + " '" + nm + "' " + sn + " " + N((long long)x) + "," + N((long long)y) + " stale='" + tok[1] + "'"
+        + (hidden != 0 ? std::string(" HIDDEN (an invisible leftover; this copy's sweep is due again)") : std::string(" visible, where '" + tok[3] + "' lands"));
+    DebugLog("[ITEMS] drift lever: planted " + line + " - our copy only, nothing published (TEST-ONLY lever)");
+    return "ok itemtest drift " + line;
+}
 std::string ItemTestSetCommand(const std::string& arg)
 {
     coopistat::SetArgs a; std::string err;
@@ -31781,6 +35133,21 @@ void InvNetNoteAnnounced(void* ch, unsigned int uid)
     if (InvNetRead(inv, &cur) == 1) { g_invNetBase[k] = cur; ++g_invNetSnapAnnounce; }
     else if (g_invNetBase.erase(k) != 0) ++g_invNetForgotten;
 }
+/* T-889 step 2 (A2): the first two tests of InvNetCharPending - a ring move out of this character or an undrained pack move, or the split
+   slot holding one of those. A squad record is not written while a member answers 1 (store.cpp OwnWriteSquad). Pointer compares only. */
+int ItemsCharUnpublished(void* ch)
+{
+    int ringChar = 0, ringBag = 0;
+    for (int i = 0; i < kRing; ++i)
+    {
+        if (::InterlockedCompareExchange(&g_ring[i].ready, 0, 0) == 0) continue;
+        if (g_ring[i].kind == kKindBag) ringBag = 1;
+        else if (g_ring[i].kind == kKindChar && g_ring[i].ch == ch) ringChar = 1;
+    }
+    const int split = (::InterlockedCompareExchange(&g_itSplit.ready, 0, 0) != 0
+                       && (g_itSplit.re.kind == kKindBag || (g_itSplit.re.kind == kKindChar && g_itSplit.re.ch == ch))) ? 1 : 0;
+    return hovrec::CharUnpublished(ringChar, ringBag, split);
+}
 /* DOES THIS CHARACTER HAVE A MOVE NOT YET PUBLISHED, OR A REQUEST IN FLIGHT? (ItBoxHasPendingMoves's character twin) */
 int InvNetCharPending(void* ch, unsigned int uid)
 {
@@ -31793,7 +35160,8 @@ int InvNetCharPending(void* ch, unsigned int uid)
     if (g_splitPend.used != 0 && (g_splitPend.re.ch == ch || g_splitPend.uid == uid)) return 1;
     if (g_heldPend.used != 0 && (g_heldPend.re.ch == ch || g_heldPend.uid == uid)) return 1;
     for (int q = 0; q < kOwnerPendCap; ++q)
-        if (g_ownerPend[q].used != 0 && g_ownerPend[q].isBox == 0 && g_ownerPend[q].uid == uid) return 1;
+        if (g_ownerPend[q].used != 0 && g_ownerPend[q].isBox == 0 && g_ownerPend[q].uid == uid
+            && ItOwnerRowHoldsSync(g_ownerPend[q]) != 0) return 1;   /* T-889 step 2 (896 b): not a GIVE row whose giver is away */
     for (int p = 0; p < kPendCap; ++p)
         if (g_pend[p].used != 0 && g_pend[p].mineUid == uid) return 1;
     return 0;
@@ -31843,7 +35211,8 @@ int KitApplyBusy(void* ch, unsigned int uid)
         for (int p = 0; p < kPendCap; ++p)
             if (g_pend[p].used != 0 && g_pend[p].ghostIsBox == 0 && g_pend[p].ghostUid == uid) return 3;
         for (int q = 0; q < kOwnerPendCap; ++q)
-            if (g_ownerPend[q].used != 0 && g_ownerPend[q].isBox == 0 && g_ownerPend[q].uid == uid) return 3;
+            if (g_ownerPend[q].used != 0 && g_ownerPend[q].isBox == 0 && g_ownerPend[q].uid == uid
+                && ItOwnerRowHoldsSync(g_ownerPend[q]) != 0) return 3;   /* T-889 step 2 (896 b): not a GIVE row whose giver is away */
     }
     return 0;
 }
@@ -32415,6 +35784,80 @@ static void ItDigestMarkLines(const std::string& key, ::Inventory* inv, long lon
         }
     }
 }
+/* TEST `boxinfo <boxKey> [sid]` - read-only: each section of the box with its size, its accepts list (as ItSectionsWords prints it),
+   how many squares hold something (ItGetAtPod non-empty) and how many are empty, and with a sid whether that kind is in the
+   section's accepts list (an empty list takes any kind). Kind only - not whether the item would fit. Creates, moves and sends
+   nothing. MAIN THREAD (the command channel, where boxdigest runs). */
+std::string BoxInfoCommand(const std::string& argIn)
+{
+    std::string key = argIn, sid;
+    const std::string::size_type sp = argIn.find(' ');
+    if (sp != std::string::npos) { key = argIn.substr(0, sp); sid = argIn.substr(sp + 1); }
+    while (!sid.empty() && sid[0] == ' ') sid.erase(0, 1);
+    if (key.empty() || sid.find(' ') != std::string::npos) return "error boxinfo: usage boxinfo <boxKey> [sid]";
+    if (StoreTearingDown() != 0) return "error boxinfo: the engine is tearing the world down - try again";
+    void* b = ItBoxResolve(key.c_str());
+    if (b == 0) return "error boxinfo: no loaded box has the key " + key;
+    ::Inventory* inv = ItBoxInventory(b);
+    if (!ItObj(inv)) return "error boxinfo: box '" + key + "' has no readable inventory";
+    const ItSecMap& secs = *(const ItSecMap*)((char*)inv + 0x28);
+    if (secs.size() > 64) return "error boxinfo: box '" + key + "' has an unreadable section map";
+    std::string out = "ok boxinfo box '" + key + "' (verdict " + N((long long)ItBoxMoveVerdict(b, key)) + ") sections=[";
+    bool first = true;
+    for (ItSecMap::const_iterator it = secs.begin(); it != secs.end(); ++it)
+    {
+        ::InventorySection* sec = it->second;
+        if (!ItObj(sec)) continue;
+        if (!first) out += " ";
+        first = false;
+        int w = -1, h = -1;
+        if (ItIntPod(sec, kSecContentW, &w) == 0) w = -1;
+        if (ItIntPod(sec, kSecContentH, &h) == 0) h = -1;
+        const int n = ItSecLimitCountPod(sec);
+        int takes = -1;   /* 1 the sid's kind is allowed, 0 not, -1 the list could not be read */
+        out += it->first + "(" + N((long long)w) + "x" + N((long long)h) + " accepts=";
+        if (n < 0) out += "?";
+        else if (n == 0) { out += "any"; takes = 1; }
+        else
+        {
+            void* arr = 0;
+            if (ItPtrPod(sec, kSecLimitArray, &arr) == 0 || !ItPlaus(arr)) out += "(list unreadable)";
+            else
+            {
+                takes = 0;
+                for (int q = 0; q < n && q < 64; ++q)
+                {
+                    void* gd = 0;
+                    char cs[kSidCap]; cs[0] = 0;
+                    const int read = (ItPtrPod(arr, (size_t)q * sizeof(void*), &gd) != 0 && ItGdSidPod(gd, cs, kSidCap) != 0) ? 1 : 0;
+                    if (q < 8) { if (q) out += ","; out += (read != 0 ? std::string(cs) : std::string("?")); }
+                    if (read == 0) { if (takes == 0) takes = -1; }
+                    else if (!sid.empty() && sid == cs) takes = 1;
+                }
+                if (n > 8) out += ",+" + N((long long)(n - 8));
+                if (n > 64 && takes != 1) takes = -1;
+            }
+        }
+        int used = 0, freeSq = 0, faulted = 0;
+        if (w >= 0 && h >= 0 && (long long)w * h <= 4096)
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    void* at = 0;
+                    if (ItGetAtPod(sec, x, y, &at) == 0) ++faulted;
+                    else if (at == 0) ++freeSq;
+                    else ++used;
+                }
+        else faulted = -1;
+        out += " used=" + N((long long)used) + " free=" + N((long long)freeSq);
+        if (faulted != 0) out += (faulted < 0 ? std::string(" squares=unread") : " faulted=" + N((long long)faulted));
+        if (!sid.empty()) out += " takes " + sid + "=" + (takes == 1 ? "yes" : (takes == 0 ? "no" : "unread"));
+        out += ")";
+    }
+    out += "]";
+    DebugLog("[PARITY] boxinfo " + out.substr(11));
+    return out;
+}
 /* `boxdigest [<x>,<y>|ring|all]` - read-only. MAIN THREAD (the command channel). */
 std::string BoxDigestCommand(const std::string& argIn)
 {
@@ -32892,7 +36335,7 @@ void P133KeeperCopyWrite(unsigned int leader, int from, int to)
                + " stock=" + P133StockWord(it->second.stockBefore) + "->"
                + (it->second.ran == 0 ? std::string("not run") : P133StockWord(it->second.stockAfter))
                + " " + N((long long)age) + " ms before";
-    DebugLog("[PROBE] P133 keeper-copy-write #" + N(g_p133CopyLines) + " leader=" + N((long long)leader)
+    SW_DEVLOG("[PROBE] P133 keeper-copy-write #" + N(g_p133CopyLines) + " leader=" + N((long long)leader)
              + " money " + N((long long)from) + " -> " + N((long long)to)
              + " why=" + std::string(first != 0 ? "first-change" : "within-2s-of-a-restock-here")
              + (first != 0 && nearRestock != 0 ? std::string("+within-2s-of-a-restock-here") : std::string())
@@ -34732,6 +38175,10 @@ std::string CaptureReportLine()
    `[ITEMS] p105 boxmove ...` line, refusals included.
    <container>: a box key as boxlist prints it (key=...), `me` (this game's lowest-uid own player-faction character - the one the
    loot open shows beside the box, boxopen's opener) or `peer` (the other game's character with the lowest uid, itemtake's rule).
+   A uid, `name:<Name>` or `deadname:<Name>` names a CHARACTER (as <container> and for `open`): a name form is the nearest loaded
+   character - or the nearest DEAD one - to the opener (`me`) within 1000 units whose name matches <Name> ('_' stands for a space,
+   case-insensitive), so a run request can name a spawned NPC whose uid it cannot know. It resolves to that uid (the line carries
+   `name:<Name> -> uid N`) and takes the uid road from there.
    pick / drop act on a container whose window is OPEN (cursortest open opens a box through boxopen's road, the engine's loot open,
    which also shows `me`); a container with no window is refused.
 
@@ -34945,6 +38392,69 @@ int P105Int(const std::string& s, int lo, int hi, int* out)
     *out = v; return 1;
 }
 /* <container> -> its inventory; *desc names it for the line. 0 = not found (desc says why). */
+/* T-808 TEST-ONLY: a container token of digits only names a CHARACTER by its uid - alive or dead, this game's own or another game's
+   copy (P105Container, `cursortest open <uid>`). A box key always carries '@', so the two never collide. 1 = a uid (*uid set). */
+int P105IsUid(const std::string& w, unsigned int* uid)
+{
+    *uid = 0;
+    if (w.empty() || w.size() > 10) return 0;
+    for (size_t i = 0; i < w.size(); ++i) if (w[i] < '0' || w[i] > '9') return 0;
+    const unsigned long v = std::strtoul(w.c_str(), 0, 10);
+    if (v == 0 || v > 0xFFFFFFFFUL) return 0;
+    *uid = (unsigned int)v;
+    return 1;
+}
+/* T-808 TEST-ONLY: `name:<Name>` names the nearest loaded character (standing, down or dead; this game's own or another game's
+   copy) whose name keys as <Name> (coopsay::TalkPersonKey: case-insensitive, '_' and a space alike - cursortest splits words on
+   spaces); `deadname:<Name>` the nearest DEAD one. Nearest to the opener (ItBoxOpenOpener, never itself picked), within the loot
+   range of 1000 units (ground plane). 0 = not a name form; 1 = resolved (*uid set, *label = `<token> -> uid N '<shown name>' D units
+   from the opener`); -1 = a name form that did not resolve (*label says why, for the error line). */
+/* TEST-ONLY: `spawned:<Template>` names the uid of the latest character made through the create path ([M1] spawned, this game's own
+   or another game's copy) from that template (keyed as TalkPersonKey: case-insensitive, '_' and a space alike). Uids differ run to run,
+   so a request names the character it made this way instead of by a number. The 256 most recently noted templates are remembered (a new
+   template replaces the oldest). */
+namespace { struct LeverSpawnedRow { std::string key; unsigned int uid; }; LeverSpawnedRow g_leverSpawned[256]; int g_leverSpawnedN = 0; int g_leverSpawnedNext = 0; }
+void LeverSpawnedNote(const std::string& templateName, unsigned int uid)
+{
+    const std::string k = coopsay::TalkPersonKey(templateName);
+    for (int i = 0; i < g_leverSpawnedN; ++i) if (g_leverSpawned[i].key == k) { g_leverSpawned[i].uid = uid; return; }
+    const int at = (g_leverSpawnedN < 256) ? g_leverSpawnedN++ : g_leverSpawnedNext;
+    g_leverSpawned[at].key = k; g_leverSpawned[at].uid = uid;
+    if (g_leverSpawnedN == 256 && at == g_leverSpawnedNext) g_leverSpawnedNext = (g_leverSpawnedNext + 1) % 256;
+}
+int P105NameUid(const std::string& w, unsigned int* uid, std::string* label)
+{
+    *uid = 0; label->clear();
+    if (w.compare(0, 8, "spawned:") == 0)
+    {
+        const std::string k = coopsay::TalkPersonKey(w.substr(8));
+        for (int i = 0; i < g_leverSpawnedN; ++i)
+            if (g_leverSpawned[i].key == k) { *uid = g_leverSpawned[i].uid; *label = w + " -> uid " + N((long long)*uid) + " (the latest [M1] spawned line for that template)"; return 1; }
+        *label = "no character made from template '" + w.substr(8) + "' through the create path on this game";
+        return -1;
+    }
+    int dead = 0;
+    std::string nm;
+    if (w.compare(0, 5, "name:") == 0) nm = w.substr(5);
+    else if (w.compare(0, 9, "deadname:") == 0) { nm = w.substr(9); dead = 1; }
+    else return 0;
+    const std::string kind = (dead != 0) ? std::string("dead character") : std::string("character");
+    if (nm.empty()) { *label = "no " + kind + " named '' within 1000 units (an empty name)"; return -1; }
+    unsigned int u = 0; float d = -1.0f; std::string shown, why;
+    ::Character* c = coop::LeverNearestNamed(coopsay::TalkPersonKey(nm), (dead != 0) ? coop::kLeverPickDead : coop::kLeverPickAny,
+                                             ItBoxOpenOpener(), 1000.0f, &u, &d, &shown, &why);
+    if (c == 0)
+    {   /* the helper's own "no ... named ..." words end in " (N such loaded at any distance)": only that count is kept */
+        const size_t lp = why.rfind(" (");
+        const std::string tail = (why.compare(0, 3, "no ") == 0 && lp != std::string::npos) ? why.substr(lp) : " (" + why + ")";
+        *label = "no " + kind + " named '" + nm + "' within 1000 units" + tail;
+        return -1;
+    }
+    if (u == 0) { *label = "the nearest " + kind + " named '" + nm + "' ('" + shown + "') has no uid on this game"; return -1; }
+    *uid = u;
+    *label = w + " -> uid " + N((long long)u) + " '" + shown + "' " + N((long long)(d + 0.5f)) + " units from the opener";
+    return 1;
+}
 ::Inventory* P105Container(const std::string& who, std::string* desc)
 {
     if (!ItPlaus(coop::GameWorldPtr())) { *desc = "no GameWorld"; return 0; }
@@ -34973,6 +38483,29 @@ int P105Int(const std::string& s, int lo, int hi, int* out)
         if (ghost == 0) { *desc = "no character of the other game is loaded here"; return 0; }
         *desc = "the other game's character uid " + N((long long)gu);
         return ItInventoryOf(ghost);
+    }
+    {   /* T-808: `name:<Name>` / `deadname:<Name>` resolve to a uid, which then takes the uid road just below */
+        unsigned int nu = 0;
+        std::string nl;
+        const int nr = P105NameUid(who, &nu, &nl);
+        if (nr < 0) { *desc = nl; return 0; }
+        if (nr > 0)
+        {
+            ::Inventory* inv = P105Container(N((long long)nu), desc);
+            *desc = nl + ": " + *desc;
+            return inv;
+        }
+    }
+    {   /* T-808: a uid names a character (alive or dead, own or another game's copy) */
+        unsigned int cu = 0;
+        if (P105IsUid(who, &cu) != 0)
+        {
+            ::Character* c = FindSpawned(cu);
+            if (!ItObj(c)) { *desc = "no loaded character has the uid " + who; return 0; }
+            *desc = "character uid " + who + " (" + (net::IsUidMine(cu) ? std::string("this game's") : std::string("another game's copy"))
+                  + ", dead=" + N((long long)ItIsDeadPod(c)) + ")";
+            return ItInventoryOf(c);
+        }
     }
     void* b = ItBoxResolve(who.c_str());
     if (b == 0) { *desc = "no loaded box has the key " + who; return 0; }
@@ -35231,11 +38764,52 @@ std::string P105RangeField(void* gui, void* other, int* ok)
     if (P105RangePod(gui, other, ok, &d) == 0 || *ok < 0) return " range=unread";
     return " range=" + N((long long)(d + 0.5f)) + " rangeOk=" + N((long long)*ok) + " (limit 1000)";
 }
+/* T-808 TEST-ONLY: `cursortest open <uid>` - a CHARACTER's loot window (alive or dead, this game's own or another game's copy), opened
+   the way a player's loot of a body opens it: ForgottenGUI::_showTradeWindow 0x790D00 with TW_LOOTING (ItOpenLootWindow, the call
+   ForgottenGUI::update 0x6E98D0:64 makes for a posted LOOT_TARGET). Read (decomp_790d00): it closes every window (0x6E5380), shows
+   the opener through showInventory 0x6E6080, and for mode 2 shows the TARGET through showInventory 0x6E6080 too - the target is any
+   RootObject (its hand +0x58); its type-1 (character) arm only chooses the trader window for modes other than 2. The same trade-range
+   limit as a box open (1000 units, ground plane) is checked first. One [ITEMS] p105 line per open (CursorTestCommand), naming the
+   character and both windows. */
+std::string P105Hex(const void* p) { char b[32]; _snprintf(b, 31, "%p", p); b[31] = 0; return std::string(b); }
+std::string P105OpenCharacter(unsigned int uid)
+{
+    const std::string who = N((long long)uid);
+    ::Character* c = FindSpawned(uid);
+    if (!ItObj(c)) return "error cursortest open: no loaded character has the uid " + who;
+    ::Character* opener = ItBoxOpenOpener();
+    if (opener == 0) return "error cursortest open: no player-faction character with a uid this game owns";
+    const std::string openerUid = N((long long)FindSpawnedUid(opener));
+    if ((void*)opener == (void*)c) return "error cursortest open: uid " + who + " is the opener itself - name another character";
+    Ogre::Vector3 op, cp;
+    if (SafeReadPosition(opener, &op) && SafeReadPosition(c, &cp))
+    {
+        const float dx = op.x - cp.x, dz = op.z - cp.z, d = std::sqrt(dx * dx + dz * dz);
+        if (d > 1000.0f)
+            return "error cursortest open: opener uid " + openerUid + " stands " + N((long long)(d + 0.5f)) + " units from character uid " + who
+                 + " (limit 1000) - nothing opened";
+    }
+    if (g_p105HaveTown == 0 && ItSaveTownHand(g_p105Town) != 0) g_p105HaveTown = 1;
+    const int called = ItOpenLootWindow((void*)opener, (void*)c);
+    ::Inventory* inv = ItInventoryOf(c);
+    ::Inventory* oinv = ItInventoryOf(opener);
+    void* gui = (inv != 0) ? P105WindowOf(inv) : 0;
+    void* ogui = (oinv != 0) ? P105WindowOf(oinv) : 0;
+    char nm[256]; nm[0] = 0;
+    if (ItNamePod(c, nm, 256) != 1) nm[0] = 0;
+    const std::string line = "open character uid " + who + " '" + std::string(nm) + "' ("
+                           + (net::IsUidMine(uid) ? std::string("this game's") : std::string("another game's copy")) + ", dead=" + N((long long)ItIsDeadPod(c))
+                           + ") opener uid " + openerUid + " window=" + P105Hex(gui) + " openerWindow=" + P105Hex(ogui) + " called=" + N((long long)called);
+    if (called == 0 || gui == 0) return "error cursortest " + line + " windowShown=0";
+    return "ok cursortest " + line + " windowShown=1 (the engine's loot open 0x790D00 TW_LOOTING, as a player's loot of a body)";
+}
 std::string P105CursorBody(const std::string& arg)
 {
     const std::vector<std::string> tok = P105Tokens(arg);
-    const std::string usage = "error cursortest usage: cursortest open <boxKey> | close | pick <boxKey|me|peer> <section> <x> <y> [all]"
-                              " | drop <boxKey|me|peer> <section> <x> <y>|free | back | list | square <boxKey|me|peer> <section> <x> <y>";
+    const std::string usage = "error cursortest usage: cursortest open <boxKey|uid|name:<Name>|deadname:<Name>> | close"
+                              " | pick <boxKey|me|peer|uid|name:<Name>|deadname:<Name>> <section> <x> <y> [all]"
+                              " | drop <boxKey|me|peer|uid|name:<Name>|deadname:<Name>> <section> <x> <y>|free | back | list"
+                              " | square <boxKey|me|peer|uid|name:<Name>|deadname:<Name>> <section> <x> <y>   ('_' = a space in <Name>)";
     if (tok.empty()) return usage;
     if (g_base == 0) return "error cursortest: not installed";
     if (ItOnMainThread() == 0) return "error cursortest: not on the main thread";
@@ -35269,10 +38843,29 @@ std::string P105CursorBody(const std::string& arg)
         if (kShowTradeWindowRva == 0 || kCloseInventoriesRva == 0 || orig_showInventory == 0) return "error cursortest open: the loot open / close calls are not installed";
         if (cur0 != 0 || ItParityCursorBusy() != 0) return "error cursortest open: something is on the cursor - an open closes every window, and a close can destroy a cursor item";
         if (g_boxOpenState != 0) return "error cursortest open: a boxopen run is still going";
+        {   /* T-808: `cursortest open <uid>` - a character's loot window */
+            unsigned int cu = 0;
+            std::string nl;
+            const int nr = P105NameUid(tok[1], &cu, &nl);
+            if (nr < 0) return "error cursortest open: " + nl;
+            if (nr > 0) return P105OpenCharacter(cu) + " [" + nl + "]";
+            if (P105IsUid(tok[1], &cu) != 0) return P105OpenCharacter(cu);
+        }
         void* b = ItBoxResolve(tok[1].c_str());
         if (b == 0) return "error cursortest open: no loaded box has the key " + tok[1];
         ::Character* opener = ItBoxOpenOpener();
         if (opener == 0) return "error cursortest open: no player-faction character with a uid this game owns";
+        {   /* the engine's trade-range limit (P105RangePod above: ground-plane distance under 1000 units): from further away a
+               pick or drop in the window fails that test, so the open is refused before anything is called */
+            Ogre::Vector3 op; float bp[3] = { 0.0f, 0.0f, 0.0f };
+            if (SafeReadPosition(opener, &op) && ItBoxPosPod(b, bp) != 0)
+            {
+                const float dx = op.x - bp[0], dz = op.z - bp[2], d = std::sqrt(dx * dx + dz * dz);
+                if (d > 1000.0f)
+                    return "error cursortest open: opener uid " + N((long long)FindSpawnedUid(opener)) + " stands " + N((long long)(d + 0.5f))
+                         + " units from box '" + tok[1] + "' (limit 1000) - nothing opened";
+            }
+        }
         if (g_p105HaveTown == 0 && ItSaveTownHand(g_p105Town) != 0) g_p105HaveTown = 1;
         const int called = ItOpenLootWindow((void*)opener, b);
         ::Inventory* inv = ItBoxInventory(b);
@@ -35320,8 +38913,9 @@ std::string P105CursorBody(const std::string& arg)
         const int px = left + x * sw + sw / 2, py = top + y * sh + sh / 2;   /* the pickup TRUNCATES (its cvttss2si + idiv, checked by P105GlobalsOk): the centre is safe there */
         int pickFits = 0;
         const std::string premise = P105Premise(sec, before, x, y, 0, &pickFits);
-        int pickRangeOk = -1;   /* T816: a box source reports how far the opener stands from it (report only; the pick is not refused) */
+        int pickRangeOk = -1;   /* a box source: how far the opener stands from it, by the engine's range test; out of range = refused before the call */
         const std::string pickRange = (tok[1] != "me" && tok[1] != "peer") ? P105RangeField(gui, (void*)ItBoxOpenOpener(), &pickRangeOk) : std::string();
+        if (pickRangeOk == 0) return "error cursortest pick: PREMISE FAILED" + pickRange + "; nothing called";
         if (sw <= 0 || sh <= 0 || (px - left) / sw != x || (py - top) / sh != y)
             return "error cursortest pick: AIM CHECK FAILED - pixel " + N(px) + "," + N(py) + " grid=" + N(left) + "," + N(top) + " slot=" + N(sw) + "x" + N(sh)
                  + " does not convert back to " + N(x) + "," + N(y) + "; nothing called";
@@ -35339,7 +38933,11 @@ std::string P105CursorBody(const std::string& arg)
                                + " fixture:" + premise + pickRange;
         if (called == 0) return "error cursortest pick FAULTED " + line;
         if (cur1 == 0) return "error cursortest pick: the engine's pickup lifted nothing - " + line;
-        g_p105PickWho = tok[1]; g_p105PickSec = tok[2]; g_p105PickItem = cur1;
+        {   /* a name form is kept as the uid it named (the same answer: this call, this frame), so the drop's "where is it now" reads that character */
+            unsigned int nu = 0; std::string nl;
+            g_p105PickWho = (P105NameUid(tok[1], &nu, &nl) > 0) ? N((long long)nu) : tok[1];
+        }
+        g_p105PickSec = tok[2]; g_p105PickItem = cur1;
         return "ok cursortest pick " + line;
     }
     if (v == "drop")
@@ -37046,6 +40644,21 @@ int GrRemoveLocal(void* item, const char* why)
     GpLock(); GrReleaseLocked(ik.c_str()); GpUnlock();
     return og == 1 ? 1 : 0;
 }
+/* T-889 fold 3 (F3): a removal GrRemoveLocal deferred (by the item's address) - is one queued; take it back (its caller tries the whole
+   removal again later: claim, remove, then GROUND GONE) */
+int GrRemPendHas(void* addr)
+{
+    for (size_t i = 0; i < g_grRemPend.size(); ++i) if (g_grRemPend[i].addr == addr) return 1;
+    return 0;
+}
+void GrRemPendCancel(void* addr)
+{
+    for (size_t i = 0; i < g_grRemPend.size(); )
+    {
+        if (g_grRemPend[i].addr == addr) { g_grRemPend.erase(g_grRemPend.begin() + (long)i); continue; }
+        ++i;
+    }
+}
 /* MAIN THREAD. This game's own picker, found again by its uid (never the pointer the detour saw). */
 void* GrPickerByUid(unsigned int uid)
 {
@@ -37201,6 +40814,31 @@ void GrSendGone(const std::string& key, int qty, void* addr)
     m.uid = 0; m.op = 1; m.x = 0; m.y = 0; m.quantity = qty;
     m.boxKey = key;
     m.idKind = (named != 0) ? coopgname::kIdName : coopgname::kIdBare;   /* a published name, or the key of an item no game named */
+    if (!net::SendItemMove(m)) ++g_grSendFailGone;
+}
+/* T-889 fold 3 (F3): the published-name flag GrSendGone would read for (`key`, `addr`) - read BEFORE a removal forgets the name row */
+int GrNamedOf(void* addr, const std::string& key)
+{
+    int named = 0;
+    GpLock();
+    const int ni = coopgname::NameAtAddr(g_grName, addr);
+    if (ni >= 0) named = g_grName.row[ni].frozen;
+    else
+    {
+        int at = -1;
+        if (coopgname::NameFindName(g_grName, key.c_str(), &at, 1) > 0) named = g_grName.row[at].frozen;
+    }
+    GpUnlock();
+    return named;
+}
+/* F3: GROUND GONE for an item already removed here (GrRemoveLocal forgot its name row): by its name, with the flag read before */
+void GrSendGoneNamed(const std::string& key, int qty, int named)
+{
+    GrGoneNote(key, named);
+    ItemMoveMsg m;
+    m.uid = 0; m.op = 1; m.x = 0; m.y = 0; m.quantity = qty;
+    m.boxKey = key;
+    m.idKind = (named != 0) ? coopgname::kIdName : coopgname::kIdBare;
     if (!net::SendItemMove(m)) ++g_grSendFailGone;
 }
 /* THE HOLDER'S WORD TO THE OTHER GAMES about ground it holds, after it served one game's TAKE / PUT: to every game but that one
@@ -37751,6 +41389,128 @@ static void GrSendPlaced(unsigned int id, int ok)
     const bool sent = net::SendItemPlaced(id, ok);
     if (!sent) ++g_grSendFailPlaced;
     ItTakerListNote(id, ok, sent ? 1 : 0, 1);
+}
+/* A request of ours whose answer (ITEM_CONFIRM) the reader refused as unreadable after its id was read. Left alone, our own 10 s
+   lapse rolls our side back but the holder never hears from us: a TAKE stays in its escrow for minutes, and a GIVE it built stands
+   beside the copy our lapse put back. So the row is settled NOW exactly as ItPendExpire settles a lapse (the refund, what showed at
+   once put back, the lapsed note, the loot route's timeout) and the holder is told at once on the road a "could not place" answer
+   takes (ItTakerAnswer): MSG_ITEM_PLACED ok=0 for a take or a consume, listed for re-send at the next link-up; MSG_ITEM_REVOKE for
+   a give. A request that had already lapsed here is answered the same way. The lapsed note is marked, so a later copy of the same
+   answer changes nothing. A HOLD / LAND, a ground PUT / TAKE and a shop request each lapse or ask again under the same id on their
+   own clock and are left to it. MAIN THREAD: the session reader, where ApplyItemConfirm runs. */
+void ItemConfirmRefusedHere(unsigned int id, unsigned int fromPeer)
+{
+    if (id == 0) return;
+    if (!net::ItemAnswerFromAsked(id, fromPeer)) return;   /* not the game this request was asked of: that game's own answer settles it */
+    int ownRoad = (HdAskFind(id) >= 0) ? 1 : 0;
+    for (size_t i = 0; i < g_grRows.size() && ownRoad == 0; ++i) if (g_grRows[i].id == id) ownRoad = 1;
+    for (int i = 0; i < kShopPendCap && ownRoad == 0; ++i) if (g_shopPend[i].used != 0 && g_shopPend[i].id == id) ownRoad = 1;
+    ItPending* pp = (ownRoad == 0) ? ItPendFind(id) : 0;
+    if (pp == 0)
+    {
+        ItLapsed* lp = (ownRoad == 0) ? const_cast<ItLapsed*>(ItLapsedFind(id)) : 0;
+        if (lp != 0 && lp->answeredNo == 0)
+        {   /* lapsed here already: the holder may be keeping the item for our answer - it is told no now */
+            lp->answeredNo = 1;
+            ++g_confirmRefusedAnswered;
+            const int ldir = (lp->takeOneConsume != 0) ? 0 : lp->dir;
+            if (ldir == 1 && lp->showNotBack != 0)
+            {   /* our put-back is not proven back: the owner's copy stays the one copy - no revoke (a duplicate is preferred to a loss) */
+                ++g_refusedNotBackKept;
+                ErrorLog("[net] ITEM_CONFIRM " + N((long long)id) + " refused here - our request had already lapsed and our item did not get back;"
+                         " the owner's copy is kept, no revoke (refusedNotBackKept=" + N(g_refusedNotBackKept) + ")");
+                return;
+            }
+            ItTakerAnswer(ldir, id, 0);
+            ErrorLog("[net] ITEM_CONFIRM " + N((long long)id) + " refused here - our request had already lapsed; "
+                     + std::string(ldir == 0 ? "told the holder it could not be placed (PLACED ok=0)" : "asked the holder to revoke the copy it built (REVOKE)"));
+            return;
+        }
+        ++g_confirmRefusedLeft;
+        ErrorLog("[net] ITEM_CONFIRM " + N((long long)id) + " refused here - " + std::string(ownRoad != 0
+                 ? "a hold / land, ground or shop request: left to its own lapse or re-ask" : "no request of ours waits on it: nothing to settle"));
+        return;
+    }
+    ItPending p;
+    std::memcpy(&p, pp, sizeof(ItPending));
+    pp->used = 0;
+    ++g_confirmRefusedAnswered;
+    int paidPay = 0;
+    const int paidBack = ItRefundTrade(p, "confirmRefused", "the holder's answer was unreadable here - settled as a lapse", &paidPay);
+    ItShowSettle(p, 0, 0, 1);   /* as the lapse: what showed at once goes back - BEFORE the note, which keeps where a give went */
+    ItLapsedNote(p, paidBack, paidPay);
+    ItLapsed* lp = const_cast<ItLapsed*>(ItLapsedFind(id));
+    if (lp != 0) lp->answeredNo = 1;
+    ItLootNoteTimeout(id);
+    const int dir = (p.takeOneConsume != 0) ? 0 : p.dir;
+    if (dir == 1 && p.showNotBack != 0)
+    {   /* our put-back is not proven back: the owner's copy stays the one copy - no revoke (a duplicate is preferred to a loss) */
+        ++g_refusedNotBackKept;
+        ErrorLog("[net] ITEM_CONFIRM " + N((long long)id) + " refused here - settled as a lapse, but our item did not get back; the owner's copy"
+                 " is kept, no revoke (refusedNotBackKept=" + N(g_refusedNotBackKept) + ")");
+        return;
+    }
+    ItTakerAnswer(dir, id, 0);
+    ErrorLog("[net] ITEM_CONFIRM " + N((long long)id) + " refused here - "
+             + std::string(dir == 0 ? "told the holder it could not be placed (PLACED ok=0)" : "asked the holder to revoke the copy it built (REVOKE)")
+             + ", our side rolled back");
+}
+/* A request from another game that the reader refused as unreadable after its id was read: answered with a plain refusal
+   (ITEM_CONFIRM ok=0, no blocks) on the road every other refusal takes, so the requester settles now instead of waiting out its
+   10 s or sending again. Nothing was reserved or escrowed here for it. MAIN THREAD: the session reader, where ApplyItemRequest runs. */
+void ItemRequestRefusedHere(unsigned int id, unsigned int fromPeer)
+{
+    if (id == 0) return;
+    ItemConfirmMsg cf;
+    cf.id = id; cf.ok = 0;
+    cf.toKey = fromPeer; cf.toHave = 1;   /* the answer goes back to the asker */
+    ++g_requestRefusedAnswered;
+    if (!ItSendConfirm(cf)) ++g_reqConfirmSendFailed;
+    ErrorLog("[net] ITEM_REQUEST " + N((long long)id) + " refused here - answered as refused");
+}
+/* TEST-ONLY `itemrefuse next confirm|request | off | show` (command channel). Armed, the next ITEM_CONFIRM (or ITEM_REQUEST) this
+   game receives is refused by the message reader at the point where a malformed backpack block is refused - the same log line, its
+   reason saying the lever forced it, and the same answer (ItemConfirmRefusedHere / ItemRequestRefusedHere) - so that answer can be
+   driven with well-formed traffic. One-shot: it turns itself off when it fires. MAIN THREAD (the reader and the command channel). */
+static int g_itemRefuseNext = 0;            /* 0 off, kItemRefuseConfirm or kItemRefuseRequest */
+static unsigned int g_itemRefuseFired = 0;
+int ItemRefuseNextFires(int kind, unsigned int id)
+{
+    if (g_itemRefuseNext == 0 || g_itemRefuseNext != kind) return 0;
+    g_itemRefuseNext = 0;
+    ++g_itemRefuseFired;
+    DebugLog("[ITEMS] itemrefuse fired: ITEM_" + std::string(kind == kItemRefuseConfirm ? "CONFIRM " : "REQUEST ") + N((long long)id)
+             + " is refused as a malformed backpack block (TEST-ONLY); the lever is now off");
+    return 1;
+}
+std::string ItemRefuseCommand(const std::string& arg)
+{
+    std::vector<std::string> t;
+    {
+        std::string cur;
+        for (size_t i = 0; i <= arg.size(); ++i)
+        {
+            const char c = (i < arg.size()) ? arg[i] : ' ';
+            if (c == ' ' || c == '\t') { if (!cur.empty()) { t.push_back(cur); cur.clear(); } }
+            else cur += c;
+        }
+    }
+    std::string r;
+    if (ItOnMainThread() == 0) r = "error itemrefuse: not on the main thread";
+    else if (t.size() == 2 && t[0] == "next" && (t[1] == "confirm" || t[1] == "request"))
+    {
+        g_itemRefuseNext = (t[1] == "confirm") ? kItemRefuseConfirm : kItemRefuseRequest;
+        r = "ok itemrefuse armed: the next ITEM_" + std::string(t[1] == "confirm" ? "CONFIRM" : "REQUEST")
+          + " this game receives is refused as a malformed backpack block (TEST-ONLY, one-shot)";
+    }
+    else if (t.size() == 1 && t[0] == "off") { g_itemRefuseNext = 0; r = "ok itemrefuse off"; }
+    else if (t.size() == 1 && t[0] == "show")
+        r = "ok itemrefuse show next=" + std::string(g_itemRefuseNext == kItemRefuseConfirm ? "confirm" : (g_itemRefuseNext == kItemRefuseRequest ? "request" : "off"))
+          + " fired=" + N((long long)g_itemRefuseFired);
+    else r = "error itemrefuse usage: itemrefuse next confirm|request | off | show";
+    if (r.compare(0, 3, "ok ") == 0) DebugLog("[ITEMS] " + r.substr(3));
+    else DebugLog("[ITEMS] itemrefuse REFUSED args='" + arg + "': " + r);
+    return r;
 }
 /* The holder's answer to a shown TAKE (the row is already out of g_grRows). Always 1. */
 int GrShowSettle(GrRow row, const ItemConfirmMsg& cf, DWORD now)
@@ -38391,6 +42151,14 @@ void GroundServeRequest(const ItemRequestMsg& r, unsigned int fromPeer)
     ItOwnerTranslate(fe.ownerRaw, fe.ownerHave, &cf.owner);   /* items9 (gap 2): the TAKE answer's OWN1 block */
     ItGearOf(fe, &cf.gear);   /* the TAKE answer's uniform and crafter (GEM1) */
     GrClearPlayerMarks(&cf.owner, &cf.bag);   /* decision 396: a player's mark does not leave the ground with the item */
+    if (HovHolderGrant(op, cf, fromPeer, hovrec::kKindGround) == 0)
+    {   /* T-889 step 2 (A3): no record line, no hand-over - the item goes back on the ground and the asker is refused (busy) */
+        ItRollbackTake(op, "T-889: the hand-over record could not be written - the ground take is refused");
+        ItemConfirmMsg rf;
+        rf.id = cf.id; rf.ok = 0; rf.toKey = cf.toKey; rf.toHave = cf.toHave; rf.reason = coopground::kGroundReasonBusy;
+        if (!ItSendConfirm(rf)) ++g_reqConfirmSendFailed;
+        return;
+    }
     const bool gcf = ItSendConfirm(cf);
     if (!gcf) ++g_reqConfirmSendFailed;
     op->cfSent = coopgshow::KeptCfSent(op->cfSent, 1, gcf ? 1 : 0);   /* p105g-f2-1 (row T-435): from here 10 s of silence is escrow */
@@ -39608,6 +43376,53 @@ std::string GpNudge(const std::string& sid, float dx, float dz, float r)
     DebugLog("[GROUND] " + line);
     return "ok groundtest " + line;
 }
+/* TEST-ONLY lever `addrreuse <groundItemKey|nearest>`: the ground item with that key (any loaded one), or the nearest keyed one
+   within 30 units of this game's first own player character, gets a fake DEAD uid row at its address whose stored handle no
+   object carries (spawn.cpp AddrReuseTestRow), then the engine destroys the item through GameWorld::destroy (ItDestroyPod, the
+   hooked path) under the item's claim. The destroy detour must refuse the row - the [M1] address reused line at the next tick,
+   destroyAddrReusedNotChar +1 - and nothing reaches NotifyDespawn. The item is gone from this game. MAIN THREAD (the command channel). */
+std::string AddrReuseCommand(const std::string& arg)
+{
+    if (StoreTearingDown() != 0) return "error addrreuse: the engine is tearing the world down - try again";
+    if (arg.empty()) return "error addrreuse: usage addrreuse <groundItemKey|nearest>";
+    ::Character* me = ItBoxOpenOpener();
+    float cp[3]; cp[0] = 0; cp[1] = 0; cp[2] = 0;
+    if (me == 0 || ItBoxPosPod(me, cp) == 0) return "error addrreuse: no player-faction character with a uid this game owns";
+    const bool nearest = (arg == "nearest");
+    std::vector<GpRow> rows;
+    int walked = 0, zones = 0, trunc = 0;
+    GpCollect(nearest ? 30.0f : 0.0f, cp, &rows, &walked, &zones, &trunc);
+    int best = -1;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (rows[i].key.empty()) continue;
+        if (!nearest) { if (rows[i].key == arg) { best = (int)i; break; } continue; }
+        if (best < 0 || rows[i].d2 < rows[(size_t)best].d2) best = (int)i;
+    }
+    if (best < 0) return nearest ? std::string("error addrreuse: no keyed ground item within 30 units")
+                                 : "error addrreuse: no loaded ground item with key " + arg;
+    const GpRow row = rows[(size_t)best];
+    int claimed = 0;
+    GpLock(); claimed = GrClaimLocked(row.key.c_str()); GpUnlock();
+    if (claimed == 0) return "error addrreuse: the item is being picked up or handed over right now - try again";
+    const unsigned int uid = AddrReuseTestRow(row.item);
+    if (uid == 0)
+    {
+        GpLock(); GrReleaseLocked(row.key.c_str()); GpUnlock();
+        return "error addrreuse: the item's address already has a uid row, or the uid table refused the test row";
+    }
+    const int done = ItDestroyPod(row.item, "coop addrreuse (TEST)");
+    GpLock(); GrReleaseLocked(row.key.c_str()); GpUnlock();
+    if (done != 1)
+    {
+        AddrReuseTestDrop(row.item, uid);
+        return "error addrreuse uid=" + N((long long)uid) + " obj=" + GpPtr(row.item)
+             + ": the engine did not destroy the item (it answered false, or the call faulted) - the test row is finished";
+    }
+    const std::string line = "addrreuse uid=" + N((long long)uid) + " obj=" + GpPtr(row.item) + " key=" + row.key + " destroyed";
+    DebugLog("[GROUND] lever " + line + " (the destroy path's [M1] address reused line follows at the next tick)");
+    return "ok " + line;
+}
 std::string GroundTestCommand(const std::string& arg)
 {
     char verb[16]; verb[0] = 0;
@@ -40050,4 +43865,7 @@ int CageCandidatesNear(const float* from, void** out, float* distOut, std::strin
     return got;
 }
 // ===================== end P17 / P43 TEST-ONLY levers =====================
+/* TEST-ONLY: the `name:<Name>` / `deadname:<Name>` forms for levers outside the item code (kill). */
+int LeverNameUid(const std::string& w, unsigned int* uid, std::string* label) { return P105NameUid(w, uid, label); }
+void LeverNoteSpawned(const std::string& templateName, unsigned int uid) { LeverSpawnedNote(templateName, uid); }
 }   /* namespace coop */

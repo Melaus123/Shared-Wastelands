@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -44,7 +45,9 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 95;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 100;   /* the world-server protocol that carries OWED */
+
+
 
 const unsigned kKindResidents = 1, kKindBar = 2;
 const unsigned kOpAdd = 1, kOpClaim = 2, kOpRelease = 3, kOpDone = 4, kOpRows = 5, kOpGone = 6;
@@ -470,6 +473,121 @@ inline int SettleStep(int settling, int held, int claim)
 {
     if (settling == 0) return kSetNone;
     return (held != 0 && claim == (int)kClaimNone) ? kSetReclaim : kSetHold;
+}
+
+// ---- T-798 (a): WHY A BUILDING'S RESIDENTS CHECK COULD NOT ANSWER (towngen.cpp T392BuildingHasResidents). 1 = has residents,
+// 0 = none, a negative code = could not tell, and why. Every one is read again at the building's next check-up; nothing ends a wait
+// by time. Commit waits on any negative `has`.
+const int kHasListUnread = -1;    // the town's residents list (its head, a link, or an end within kT798ListMax groups) could not be read
+const int kHasGroupUnread = -2;   // a group on the list whose home building could not be read
+const int kHasKeyless = -3;       // a group made here from a record with no home key, loaded, of the building's template, at the building
+const int kHasHandUnread = -4;    // the building's own residents hand could not be read
+const int kHasNoBuilding = -5;    // the building was not found in this game's live zones
+const int kHasReasons = 5;
+inline const char* HasName(int has)
+{
+    if (has > 0) return "has-residents";
+    if (has == 0) return "none";
+    if (has == kHasListUnread) return "residents-list-unread";
+    if (has == kHasGroupUnread) return "group-home-unread";
+    if (has == kHasKeyless) return "keyless-group-here";
+    if (has == kHasHandUnread) return "residents-hand-unread";
+    if (has == kHasNoBuilding) return "building-not-found";
+    return "unread";
+}
+// HasSlot: the counter of a could-not-tell code (0 .. kHasReasons - 1); -1 for an answer
+inline int HasSlot(int has) { return (has < 0 && has >= -kHasReasons) ? -has - 1 : -1; }
+// WhyLogStep: the building's wait line is written when its could-not-tell reason differs from the last one written for it
+// (`last`, 0 = none written). 1 = write it.
+inline int WhyLogStep(int last, int has) { return (has < 0 && has != last) ? 1 : 0; }
+// GroupFaultHolds: a group on a town's residents list whose home read has faulted at `run` check-up rounds in a row (a good read
+// clears the run) still makes its town's buildings answer "could not tell" while run < bound; past the bound that one group no longer
+// holds, so a group that can never be read does not block its town's empty buildings for ever.
+const int kGroupFaultBound = 20;
+inline int GroupFaultHolds(int run, int bound) { return run < bound ? 1 : 0; }
+
+// ---- T-798 (c): AN EMPTY BUILDING SET ASIDE AGAIN FROM REAL STATE. The whole of the repair's eligibility, read live at the town's
+// check-up: this game holds the building's area with its zone live (heldLive 1), Kenshi's town population fills the building and no
+// player owns it (populatable 1), its residents check gave a complete answer of none (has 0), no owed row and no set-aside entry
+// of this game's names it, no living world record names it as home (recordsHome 0), no notebook note holds it (noteHolds 0), the
+// town has no recorded or this-launch loss (townLoss 0 - a town whose people were killed is the town refill's to judge), and the
+// repair did not set it aside before this session nor did a re-run give it up (repairedBefore 0).
+// kT392RepairOldWorlds 1: every town qualifies, including towns of worlds that never set any work aside. 0: only a town this world
+// has set residents aside in before - an owed row of the town in the world server's table, or a set-aside by this game this session
+// (towngen.cpp passes it as townAsideBefore).
+const int kT392RepairOldWorlds = 1;
+inline int T392MayRepairEmpty(int heldLive, int populatable, int has, int owedRow, int entry, int recordsHome, int noteHolds, int townLoss,
+                              int repairedBefore, int townAsideBefore, int repairOldWorlds = kT392RepairOldWorlds)
+{
+    if (heldLive != 1 || populatable != 1 || has != 0) return 0;
+    if (owedRow != 0 || entry != 0 || recordsHome != 0 || noteHolds != 0) return 0;
+    if (townLoss != 0 || repairedBefore != 0) return 0;
+    if (repairOldWorlds == 0 && townAsideBefore == 0) return 0;
+    return 1;
+}
+
+// ---- T-798 (d): THE WORLD SERVER'S TWO COMPANION FILES, beside owed_people.txt and apart from it (an older world server rewrites
+// owed_people.txt with only the v1 lines it parses, so a new field there would be erased).
+// owed_done.txt: one "d1 <kind> <key>" line per building whose residents a DONE made / has reported there (DoneKept); an ADD for one
+// of them is answered GONE has.
+typedef std::set<std::string> DoneSet;   /* TableKey(kind, key) */
+inline int DoneKept(unsigned kind, unsigned why) { return (kind == kKindResidents && (why == kWhyMade || why == kWhyHas)) ? 1 : 0; }
+inline int AddIsDone(const DoneSet& d, unsigned kind, const std::string& key) { return d.count(TableKey(kind, key)) != 0 ? 1 : 0; }
+inline void LineFields(const std::string& line0, std::vector<std::string>* f)
+{
+    std::string line = line0;
+    while (!line.empty() && (line[line.size() - 1] == '\r' || line[line.size() - 1] == '\n')) line.erase(line.size() - 1);
+    f->clear();
+    size_t at = 0;
+    for (;;) { const size_t tab = line.find('\t', at); if (tab == std::string::npos) { f->push_back(line.substr(at)); break; } f->push_back(line.substr(at, tab - at)); at = tab + 1; }
+}
+inline std::string DoneLineOf(const std::string& tableKey)
+{
+    if (tableKey.size() < 3 || tableKey[1] != '|') return std::string();
+    const unsigned kind = tableKey[0] == 'b' ? kKindBar : kKindResidents;
+    char b[32]; _snprintf(b, 31, "d1\t%u\t", kind); b[31] = 0;
+    return std::string(b) + tableKey.substr(2) + "\n";
+}
+// 1 = a building was read into the set, 0 = not a usable d1 line
+inline int ParseDoneLine(const std::string& line, DoneSet* d)
+{
+    std::vector<std::string> f; LineFields(line, &f);
+    if (f.size() != 3 || f[0] != "d1") return 0;
+    char* e = 0;
+    const unsigned long kind = std::strtoul(f[1].c_str(), &e, 10); if (e == f[1].c_str() || *e != 0) return 0;
+    if (!KindOk((unsigned)kind) || !StrOk(f[2])) return 0;
+    d->insert(TableKey((unsigned)kind, f[2]));
+    return 1;
+}
+// owed_meta.txt: one "m1 <kind> <key> <adder> <gones> <faults> <empties> <seconds of retry spacing left>" line per row - what
+// owed_people.txt does not carry. Read after the rows; a line for no row is ignored.
+inline std::string MetaLine(const Row& r, double now)
+{
+    double left = r.retryAt - now;
+    if (left < 0.0) left = 0.0;
+    if (left > kRetrySpacingSec) left = kRetrySpacingSec;
+    char b[128]; _snprintf(b, 127, "m1\t%u\t", r.kind); b[127] = 0;
+    std::string s = std::string(b) + r.key;
+    _snprintf(b, 127, "\t%d\t%d\t%d\t%d\t%.0f\n", r.adder, r.gones, r.faults, r.empties, left); b[127] = 0;
+    return s + b;
+}
+// 1 = the row's counts were set; 0 = not a usable m1 line, or no such row in the table
+inline int ParseMetaLine(const std::string& line, Table* t, double now)
+{
+    std::vector<std::string> f; LineFields(line, &f);
+    if (f.size() != 8 || f[0] != "m1") return 0;
+    char* e = 0;
+    const unsigned long kind = std::strtoul(f[1].c_str(), &e, 10); if (e == f[1].c_str() || *e != 0 || !KindOk((unsigned)kind)) return 0;
+    const Table::iterator it = t->find(TableKey((unsigned)kind, f[2]));
+    if (it == t->end()) return 0;
+    long v[4];
+    for (int i = 0; i < 4; ++i) { v[i] = std::strtol(f[3 + i].c_str(), &e, 10); if (e == f[3 + i].c_str() || *e != 0 || v[i] < 0) return 0; }
+    if (v[1] >= kTriesMax || v[2] >= kTriesMax || v[3] >= kTriesMax) return 0;
+    double left = std::strtod(f[7].c_str(), &e); if (e == f[7].c_str() || *e != 0 || left < 0.0) return 0;
+    if (left > kRetrySpacingSec) left = kRetrySpacingSec;
+    it->second.adder = (int)v[0]; it->second.gones = (int)v[1]; it->second.faults = (int)v[2]; it->second.empties = (int)v[3];
+    it->second.retryAt = left > 0.0 ? now + left : 0.0;
+    return 1;
 }
 
 }   // namespace owedpop

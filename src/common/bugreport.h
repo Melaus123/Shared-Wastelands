@@ -590,13 +590,15 @@ inline void CapPack(LogPack* p, unsigned long long cap)
     }
     if (first > 0) p->segs.erase(p->segs.begin(), p->segs.begin() + (long)first);
 }
-/* The kept segments from `first` on as one DEFLATE stream, with its raw length and CRC. */
-inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>* stream, unsigned long long* rawLen, unsigned int* crc)
+/* The kept segments [first, end) as one DEFLATE stream, with its raw length and CRC. */
+inline void JoinPackRange(const LogPack& p, size_t first, size_t end, std::vector<unsigned char>* stream, unsigned long long* rawLen,
+                          unsigned int* crc)
 {
     stream->clear();
     *rawLen = 0;
     *crc = 0;
-    for (size_t k = first; k < p.segs.size(); ++k)
+    if (end > p.segs.size()) end = p.segs.size();
+    for (size_t k = first; k < end; ++k)
     {
         stream->insert(stream->end(), p.segs[k].bytes.begin(), p.segs[k].bytes.end());
         *crc = Crc32Combine(*crc, p.segs[k].crc, p.segs[k].rawLen);
@@ -605,16 +607,29 @@ inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>*
     stream->push_back(kFinalBlock[0]);
     stream->push_back(kFinalBlock[1]);
 }
+/* The kept segments from `first` on as one DEFLATE stream, with its raw length and CRC. */
+inline void JoinPack(const LogPack& p, size_t first, std::vector<unsigned char>* stream, unsigned long long* rawLen, unsigned int* crc)
+{
+    JoinPackRange(p, first, p.segs.size(), stream, rawLen, crc);
+}
 
 /* ---------------------------------------------------------------------------------------------------------------------
    THE SIZE BUDGET (372). Each part of the zip is `fixed` bytes that are never cut (its headers, its final block, a whole
-   crash file) plus its segments' bytes. While the total is over the limit: the oldest kept segment of the lowest-`order` part
-   that still has one is dropped (among parts of equal order, the one with the most kept bytes); when no part has a segment
-   left to drop, a `droppable` part goes whole, lowest order first. Orders, cut first to last: kOrderOlderLog, kOrderPrevLog,
-   kOrderNearby, kOrderThisLog, kOrderCrash; kOrderKeep is never cut. The two earlier launches' logs take kOrderOlderLog and
-   kOrderPrevLog by EarlierLogOrder. The result says, per part, how many leading segments go and whether the part goes whole.
+   crash file) plus its segments' bytes. Orders, cut first to last: kOrderOlderLog, kOrderPrevLog, kOrderNearby,
+   kOrderServerLog, kOrderThisLog, kOrderCrash; kOrderKeep is never cut. kOrderServerLog is the log of the world server this
+   computer runs, so a report from the host also shows the server's side. The two earlier launches' logs take kOrderOlderLog and kOrderPrevLog
+   by EarlierLogOrder. A part may carry a `floor`: segment bytes it keeps through pass 1 (SetBudgetFloors shares the room
+   among the logs, so one big log cannot push every other log out of the report).
+   Pass 1: while the total is over the limit, the oldest kept segment (the newest, for a `cutFromEnd` part: a launch's opening
+   part keeps its first bytes) of the lowest-`order` part that may still lose one is dropped (among parts of equal order, the one with the higher cutFirst, then the one with the most kept bytes). A part with a floor may lose a segment only while
+   its kept bytes are ABOVE its floor, so it can end up to one segment under it; this way, when the fixed bytes plus the
+   floors are within the limit, pass 1 alone always fits. A part with floor 0 may lose every segment in pass 1.
+   Pass 2 (still over the limit): the same order with the floors ignored. Then, when no part has a segment left to drop, a
+   `droppable` part goes whole, lowest order first. With every floor 0 the result is the same as with no floors at all.
+   The result says, per part, how many leading segments go and whether the part goes whole; PartLeftOut says whether
+   nothing of a part is left.
    ------------------------------------------------------------------------------------------------------------------ */
-enum { kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderNearby = 2, kOrderThisLog = 3, kOrderCrash = 4, kOrderKeep = 9 };
+enum { kOrderOlderLog = 0, kOrderPrevLog = 1, kOrderNearby = 2, kOrderServerLog = 3, kOrderThisLog = 4, kOrderCrash = 5, kOrderKeep = 9 };
 /* The budget order of kept earlier launch `launch`'s log (1 = the previous launch, 2 = the one before it), given which of them
    the attached crash file ended (`crashLaunch` 1, 2, or 0 = none): the crashed launch's log is cut after the other one; with no
    crash, or a crash that ended launch 1, the log from two launches ago is cut first. */
@@ -629,15 +644,74 @@ struct BudgetPart
     std::vector<unsigned long long> segBytes;
     int order;
     bool droppable;
-    BudgetPart() : fixed(0), order(kOrderKeep), droppable(false) {}
+    unsigned long long floor;   /* segment bytes kept through pass 1 (0 = none) */
+    int cutFirst;               /* among parts of one order, a higher cutFirst loses its segments first (the parts of one
+                                   launch's log: its middle .prev 2, its opening .start 1, its newest part 0) */
+    bool cutFromEnd;            /* its segments go from the end, so its first bytes stay (a launch's opening part) */
+    BudgetPart() : fixed(0), order(kOrderKeep), droppable(false), floor(0), cutFirst(0), cutFromEnd(false) {}
 };
 struct BudgetCut
 {
-    std::vector<size_t> dropSegs;   /* per part: leading segments dropped */
+    std::vector<size_t> dropSegs;   /* per part: segments dropped - the leading ones, or the trailing ones of a cutFromEnd part */
     std::vector<int> dropped;       /* per part: 1 = left out whole */
     unsigned long long total;       /* the total after the cuts */
     bool fits;
 };
+/* 1 when nothing of part `k` goes into the report: it was left out whole, or it is a log with segments and lost every one. */
+inline bool PartLeftOut(const std::vector<BudgetPart>& parts, const BudgetCut& c, size_t k)
+{
+    return c.dropped[k] != 0 || (!parts[k].segBytes.empty() && c.dropSegs[k] >= parts[k].segBytes.size());
+}
+/* The logs' floors. The room is the limit less every part's fixed bytes; it is shared 35% this launch's log (kOrderThisLog),
+   10% the log of the world server this computer runs (kOrderServerLog), 20% the earlier log kept longer (kOrderPrevLog), 10%
+   the other earlier log (kOrderOlderLog) and 25% the nearby players' logs (kOrderNearby); the parts of one order split its
+   share equally - except a launch's opening and middle parts (cutFirst above 0): when its order has a part with cutFirst 0,
+   only those split the share, so a launch's newest part keeps the whole share its log had before the log was cut into
+   parts. The crash file and the never-cut parts get no floor.
+   A log whose segments come to less than its share gets its whole size as its floor. The room no log takes (a smaller log's
+   rest, a share with no log, rounding) goes to the logs that have more, this launch's log first, then kOrderServerLog,
+   kOrderPrevLog, kOrderNearby, kOrderOlderLog (parts of one order in list order), each up to its whole size. With no world
+   server log its share is room no log takes, so this launch's log then gets what it got before that log had a share. The floors never add up to
+   more than the room; with no room every floor is 0. */
+inline void SetBudgetFloors(std::vector<BudgetPart>* parts, unsigned long long limit)
+{
+    std::vector<BudgetPart>& p = *parts;
+    unsigned long long fixed = 0;
+    for (size_t i = 0; i < p.size(); ++i) { fixed += p[i].fixed; p[i].floor = 0; }
+    const unsigned long long room = fixed < limit ? limit - fixed : 0;
+    static const int kFloorKinds = 5;
+    static const int kFloorOrders[kFloorKinds] = { kOrderThisLog, kOrderServerLog, kOrderPrevLog, kOrderNearby, kOrderOlderLog };
+    static const unsigned int kFloorShare[kFloorKinds] = { 35u, 10u, 20u, 25u, 10u };   /* percent of the room; they add up to 100 */
+    std::vector<unsigned long long> whole(p.size(), 0);
+    unsigned long long given = 0;
+    for (int o = 0; o < kFloorKinds; ++o)
+    {
+        size_t n = 0, newest = 0;
+        for (size_t i = 0; i < p.size(); ++i) if (p[i].order == kFloorOrders[o]) { ++n; if (p[i].cutFirst == 0) ++newest; }
+        if (n == 0) continue;
+        const bool newestOnly = newest > 0;
+        const unsigned long long share = room * kFloorShare[o] / 100u / (newestOnly ? newest : n);
+        for (size_t i = 0; i < p.size(); ++i)
+        {
+            if (p[i].order != kFloorOrders[o]) continue;
+            for (size_t k = 0; k < p[i].segBytes.size(); ++k) whole[i] += p[i].segBytes[k];
+            if (newestOnly && p[i].cutFirst != 0) continue;   /* an opening or middle part: no share (spare room below) */
+            p[i].floor = whole[i] < share ? whole[i] : share;
+            given += p[i].floor;
+        }
+    }
+    unsigned long long spare = room - given;
+    for (int o = 0; o < kFloorKinds && spare != 0; ++o)
+    {
+        for (size_t i = 0; i < p.size() && spare != 0; ++i)
+        {
+            if (p[i].order != kFloorOrders[o] || p[i].floor >= whole[i]) continue;
+            const unsigned long long more = whole[i] - p[i].floor < spare ? whole[i] - p[i].floor : spare;
+            p[i].floor += more;
+            spare -= more;
+        }
+    }
+}
 inline BudgetCut PlanBudget(const std::vector<BudgetPart>& parts, unsigned long long limit)
 {
     BudgetCut c;
@@ -650,24 +724,33 @@ inline BudgetCut PlanBudget(const std::vector<BudgetPart>& parts, unsigned long 
         for (size_t k = 0; k < parts[i].segBytes.size(); ++k) kept[i] += parts[i].segBytes[k];
         c.total += parts[i].fixed + kept[i];
     }
-    while (c.total > limit)
+    for (int pass = 1; pass <= 2; ++pass)
     {
-        int best = -1;
-        for (size_t i = 0; i < parts.size(); ++i)
+        while (c.total > limit)
         {
-            if (c.dropped[i] != 0 || parts[i].order == kOrderKeep || c.dropSegs[i] >= parts[i].segBytes.size()) continue;
-            if (best < 0 || parts[i].order < parts[(size_t)best].order
-                || (parts[i].order == parts[(size_t)best].order && kept[i] > kept[(size_t)best])) best = (int)i;
-        }
-        if (best >= 0)
-        {
+            int best = -1;
+            for (size_t i = 0; i < parts.size(); ++i)
+            {
+                if (c.dropped[i] != 0 || parts[i].order == kOrderKeep || c.dropSegs[i] >= parts[i].segBytes.size()) continue;
+                if (pass == 1 && parts[i].floor != 0 && kept[i] <= parts[i].floor) continue;   /* at or under its floor */
+                if (best < 0 || parts[i].order < parts[(size_t)best].order
+                    || (parts[i].order == parts[(size_t)best].order && parts[i].cutFirst > parts[(size_t)best].cutFirst)
+                    || (parts[i].order == parts[(size_t)best].order && parts[i].cutFirst == parts[(size_t)best].cutFirst
+                        && kept[i] > kept[(size_t)best])) best = (int)i;
+            }
+            if (best < 0) break;
             const size_t b = (size_t)best;
-            const unsigned long long s = parts[b].segBytes[c.dropSegs[b]];
+            const size_t seg = parts[b].cutFromEnd ? parts[b].segBytes.size() - 1 - c.dropSegs[b] : c.dropSegs[b];
+            const unsigned long long s = parts[b].segBytes[seg];
             ++c.dropSegs[b];
             kept[b] -= s;
             c.total -= s;
-            continue;
         }
+    }
+    /* no segment left to drop: droppable parts go whole */
+    while (c.total > limit)
+    {
+        int best = -1;
         for (size_t i = 0; i < parts.size(); ++i)
         {
             if (c.dropped[i] != 0 || !parts[i].droppable) continue;

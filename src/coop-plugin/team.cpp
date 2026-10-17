@@ -6,7 +6,7 @@
 #include "soak.h"           /* GameplayRunning */
 #include "tags.h"           /* TagsCaptionsDirty: a team change recolours and renames the name tags */
 #include "policy.h"         /* PolicyTeamAccessProbe: the `team access` lever */
-#include "playerstab.h"     /* PlayersTabRemovedWhileAway: the FACTION box at the next join */
+#include "playerstab.h"     /* PlayersTabOwedWhileAway: the FACTION box at the next join */
 #include "coop_log.h"
 #include "game/Faction.h"
 #include "../common/teamwire.h"
@@ -15,6 +15,7 @@
 #include "../common/teamstanding.h"   /* step 5: the pre-join snapshot, the join set, the founder's stance, the restore */
 #include "../common/teamresearch.h"   /* step 6: the shared research - what is new here, the echo rule, the lines */
 #include "../common/teamscreens.h"    /* the faction screens' words: the message lines */
+#include "chat.h"           /* ChatPlayNotification: a teammate's research line plays the game's research-complete sound */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -36,6 +37,7 @@ struct WaitingInvite { int on; unsigned fromSlot; std::string teamName; unsigned
 WaitingInvite g_invite;
 unsigned g_inviteSerial = 0;         // the serial the last invitation received was given
 long long g_linesShown = 0, g_linesNotShown = 0, g_linesNoWords = 0, g_linesHeld = 0;
+long long g_resSoundPlayed = 0, g_resSoundNot = 0;   // T-546: research-complete sounds played / not played with a shown line (counts only)
 teamscreen::HeldLines g_heldLines;   // the faction lines waiting for a world that is ready to show them, in order
 bool g_heldSaid = false;             // "the game cannot show a line yet" said for the lines held now
 /* when each slot last became or stopped being this game's player's teammate (GetTickCount, 0 = never), read on any thread
@@ -125,6 +127,15 @@ long long g_resIn = 0, g_resWholeSends = 0, g_resWholeResends = 0, g_resWholeAns
           g_resAppliedBySet = 0, g_resAppliedByLoad = 0, g_resApplyFails = 0, g_resAlready = 0, g_resNotMine = 0, g_resOffDropped = 0,
           g_resDroppedSaid = 0, g_resReadFails = 0;
 bool g_resOffSaid = false;
+/* THE TEAM'S RESEARCH LEVEL (teamresearch.h LevelSendNow / LevelRaiseTo): this game's report as sent (team, link, level), when,
+   whether the world server answered it and how often it went again; the team's level the world server last sent, and its team */
+unsigned g_lvSentTeam = 0;
+int g_lvSentLink = -1, g_lvSentLevel = -1, g_lvResends = 0;
+bool g_lvAnswered = false;
+unsigned long g_lvSentAt = 0, g_lvRaiseTriedAt = 0;
+unsigned g_lvTeam = 0;
+int g_lvLevel = -1;
+long long g_lvReports = 0, g_lvReportsAgain = 0, g_lvAnswers = 0, g_lvIn = 0, g_lvRaises = 0, g_lvRaiseFails = 0, g_lvNotSent = 0;
 
 std::string N(long long v) { std::ostringstream o; o << v; return o.str(); }
 std::string Value(int read, float v) { if (read != 1) return std::string("unreadable here now"); std::ostringstream o; o << v; return o.str(); }
@@ -163,28 +174,42 @@ std::string ScreenNameOf(unsigned slot)
    (no message bar) is held again with the ones after it, for the next tick */
 void FlushLines()
 {
-    const std::vector<std::string> lines = teamscreen::TakeHeld(&g_heldLines, GameplayRunning() && !EngineWritesBlocked());
+    std::vector<unsigned char> sounds;
+    const std::vector<std::string> lines = teamscreen::TakeHeld(&g_heldLines, GameplayRunning() && !EngineWritesBlocked(), &sounds);
     for (size_t i = 0; i < lines.size(); ++i)
     {
         const int r = StoreShowPlayerLine(lines[i]);
         if (r == 0)
         {
-            teamscreen::PutBack(&g_heldLines, lines, i);
+            teamscreen::PutBack(&g_heldLines, lines, i, &sounds);
             if (!g_heldSaid) { g_heldSaid = true; DebugLog("[TEAM] message line '" + lines[i] + "' held: the game has no message bar yet (" + N((long long)g_heldLines.q.size()) + " held)"); }
             return;
         }
         g_heldSaid = false;
         if (r == 1) ++g_linesShown; else ++g_linesNotShown;
+        std::string snd;
+        if (teamscreen::HeldLineSounds(sounds, i, r))
+        {
+            unsigned long swr = 0;
+            const int p = ChatPlayNotification(swteam::kResearchSoundEvent, &swr);
+            if (p == 1) ++g_resSoundPlayed; else ++g_resSoundNot;
+            snd = std::string(" - research sound Notifications/") + swteam::kResearchSoundEvent
+                  + (p == 1 ? std::string(" played") : p == 0 ? std::string(" refused by the sound engine")
+                     : p == -4 ? " not played (the sound switch was not set: " + N((long long)swr) + ")"
+                     : p == -1 ? std::string(" not played (no world running)") : p == -2 ? std::string(" not played (the sound call is off after a fault)")
+                     : std::string(" not played (no SoundSetSwitch or SoundPostEvent address)"))
+                  + " (played " + N(g_resSoundPlayed) + ", not " + N(g_resSoundNot) + ")";
+        }
         DebugLog("[TEAM] message line '" + lines[i] + "' " + (r == 1 ? std::string("shown") : "NOT shown (" + N((long long)r) + ")")
-                 + " (shown " + N(g_linesShown) + ", not shown " + N(g_linesNotShown) + ", held " + N(g_linesHeld) + ", dropped " + N((long long)g_heldLines.dropped) + ")");
+                 + " (shown " + N(g_linesShown) + ", not shown " + N(g_linesNotShown) + ", held " + N(g_linesHeld) + ", dropped " + N((long long)g_heldLines.dropped) + ")" + snd);
     }
 }
 /* one line on the game's message line (StoreShowPlayerLine, as the PLAYERS and FALLEN tabs' lines), behind any line still held;
    held while a world loads or tears down and shown once it is ready; "" = the page has no words for it here - logged only */
-void ShowLine(const std::string& line, const std::string& what)
+void ShowLine(const std::string& line, const std::string& what, bool sound = false)
 {
     if (line.empty()) { ++g_linesNoWords; DebugLog("[TEAM] message line for " + what + ": none (no words for it on this side, or a name this game does not know)"); return; }
-    teamscreen::HoldLine(&g_heldLines, line);
+    teamscreen::HoldLine(&g_heldLines, line, sound);
     if (!GameplayRunning() || EngineWritesBlocked())
     {
         ++g_linesHeld;
@@ -356,10 +381,12 @@ void ReleaseHeld()
         ++g_restoresDone;
         DebugLog("[TEAM] restore #" + N((long long)d.no) + " written with the world loaded: " + swteam::WhyName((int)d.why) + " from '" + swteam::Clean(d.teamName) + "'"
                  + (d.away ? " while away" : "") + " - " + said + "; RESTORE_DONE sent (answered " + N(g_restoresDone) + ")");
-        if (d.away && d.why == swteam::kWhyRemoved && !d.snap.empty())
+        const int awayBox = teamscreen::AwayBoxOf(d.away != 0, (int)d.why, !d.snap.empty());
+        if (awayBox != teamscreen::kBoxNone)
         {
-            DebugLog("[TEAM] removal applied at join: the FACTION box is owed (removed from '" + swteam::Clean(d.teamName) + "' while away)");
-            PlayersTabRemovedWhileAway(d.teamName);
+            const bool removed = d.why == swteam::kWhyRemoved;
+            DebugLog("[TEAM] " + std::string(removed ? "removal" : "disband") + " applied at join: the FACTION box is owed (" + (removed ? "removed from '" : "disbanded '") + swteam::Clean(d.teamName) + "' while away)");
+            PlayersTabOwedWhileAway(awayBox, d.teamName);
         }
         SendDone(d.no);
     }
@@ -663,8 +690,9 @@ void ResearchTick()
                     if (route == swteam::kResViaLoad) ++g_resAppliedByLoad; else ++g_resAppliedBySet;
                     DebugLog("[TEAM] research: " + in[i].sid + " from s" + N((long long)in[i].by) + " applied " + (route == swteam::kResViaLoad
                              ? std::string("through Research::load (queued behind this game's front tech; taken out of the queue, the rest kept)") : std::string("through setResearched"))
-                             + ": \"" + swteam::ResearchCompleteLine(name, NameOf(in[i].by)) + "\" (appliedBySet " + N(g_resAppliedBySet) + ", appliedByLoad " + N(g_resAppliedByLoad) + ")");
-                    ShowLine(teamscreen::ResearchCompleteShown(name, ScreenNameOf(in[i].by)), "a teammate's tech applied");
+                             + " - the mod's research line with the teammate's name on the message line" + (route == swteam::kResViaLoad ? std::string(" (Research::load shows nothing of the engine's)") : std::string(", beside the engine's own toast"))
+                             + " (appliedBySet " + N(g_resAppliedBySet) + ", appliedByLoad " + N(g_resAppliedByLoad) + ")");
+                    ShowLine(teamscreen::ResearchCompleteShown(name, ScreenNameOf(in[i].by)), "a teammate's tech applied", swteam::ResearchLineSound(route));
                 }
                 else
                 {
@@ -756,7 +784,62 @@ std::string ResearchText()
            + " ownSends=" + N(g_resOwnSends) + " ownResends=" + N(g_resOwnResendCount) + " ownAnswers=" + N(g_resOwnAnswers) + " refused=" + N(g_resRefused)
            + " notSent=" + N(g_resNotSent) + " encodeFails=" + N(g_resEncodeFails) + " loads=" + N(g_resLoads) + " loadedTechs=" + N(g_resLoadedTechs)
            + " loadFails=" + N(g_resLoadFails) + " appliedBySet=" + N(g_resAppliedBySet) + " appliedByLoad=" + N(g_resAppliedByLoad) + " applyFails=" + N(g_resApplyFails)
-           + " already=" + N(g_resAlready) + " notMine=" + N(g_resNotMine) + " off=" + N(StoreResearchOff() ? 1 : 0) + " offDropped=" + N(g_resOffDropped);
+           + " already=" + N(g_resAlready) + " notMine=" + N(g_resNotMine) + " off=" + N(StoreResearchOff() ? 1 : 0) + " offDropped=" + N(g_resOffDropped)
+           + " | level: own=" + N((long long)StoreResearchBenchLevel()) + " team=" + N((long long)g_lvLevel) + " (team " + N((long long)g_lvTeam) + ") reports=" + N(g_lvReports)
+           + " reportsAgain=" + N(g_lvReportsAgain) + " answers=" + N(g_lvAnswers) + " in=" + N(g_lvIn) + " raises=" + N(g_lvRaises) + " raiseFails=" + N(g_lvRaiseFails) + " notSent=" + N(g_lvNotSent);
+}
+/* THE TEAM'S RESEARCH LEVEL, every frame (owner 517 a): with the player in a team and the world ready, the engine's level raised
+   to the team's whenever it is lower (a world load that reset it is raised again here), and this game's own bench level reported
+   once per world load, link and team, again when it changes, and again after a growing wait while not answered. Out of a team
+   nothing is raised: the level stays until the next world load sets it from this player's own benches (teamresearch.h). */
+void LevelTick()
+{
+    const int me = StoreMySlot();
+    const int t = (me < 0 || g_tableGen < 0) ? -1 : swteam::WireTeamOf(g_table, (unsigned)me, 0);
+    const unsigned myTeam = t < 0 ? 0u : g_table[t].no;
+    if (myTeam == 0)
+    {
+        g_lvSentTeam = 0; g_lvSentLink = -1; g_lvSentLevel = -1; g_lvAnswered = false; g_lvResends = 0; g_lvTeam = 0; g_lvLevel = -1; g_lvRaiseTriedAt = 0;
+        return;
+    }
+    if (!WorldReady() || StoreResearchOff()) return;
+    const unsigned long now = ::GetTickCount();
+    const int have = StoreResearchLevel();
+    const int raise = swteam::LevelRaiseTo(myTeam, g_lvTeam, g_lvLevel, have);
+    if (raise >= 0 && (g_lvRaiseTriedAt == 0 || now - g_lvRaiseTriedAt >= kResRetryMs))
+    {
+        int after = -1;
+        const std::string w = StoreResearchRaiseLevel(raise, &after);
+        if (w.empty())
+        {
+            g_lvRaiseTriedAt = 0; ++g_lvRaises;
+            DebugLog("[TEAM] research level: raised " + N((long long)have) + " -> " + N((long long)after) + " through the engine's setLevel - team " + N((long long)myTeam) + "'s level "
+                     + N((long long)raise) + " (this game's own benches give " + N((long long)StoreResearchBenchLevel()) + "; raises " + N(g_lvRaises) + ")");
+        }
+        else
+        {
+            g_lvRaiseTriedAt = now; ++g_lvRaiseFails;
+            if (ResSay(g_lvRaiseFails)) DebugLog("[TEAM] research level: NOT raised to team " + N((long long)myTeam) + "'s level " + N((long long)raise) + " (" + w + ", now " + N((long long)after)
+                                                 + ") - tried again in " + N((long long)(kResRetryMs / 1000)) + " s (raiseFails " + N(g_lvRaiseFails) + ")");
+        }
+    }
+    if (StoreWelcomedThisLink() == 0) return;
+    const int link = StoreLinkGen();
+    const int own = StoreResearchBenchLevel();
+    const int k = swteam::LevelSendNow(myTeam, own, g_lvSentTeam, g_lvSentLink, g_lvSentLevel, link, g_lvAnswered, now - g_lvSentAt, g_lvResends);
+    if (k == swteam::kLvNone) return;
+    if (k == swteam::kLvAgain) ++g_lvResends; else g_lvResends = 0;
+    g_lvSentTeam = myTeam; g_lvSentLink = link; g_lvSentLevel = own; g_lvAnswered = false; g_lvSentAt = now;   /* sent or not, the next try waits its turn */
+    std::vector<char> b; swteam::EncodeLevelUp(&b, (unsigned)own);
+    if (!Send(b))
+    {
+        ++g_lvNotSent;
+        if (ResSay(g_lvNotSent)) DebugLog("[TEAM] research level: this game's report was NOT sent (no link) - tried again in " + N((long long)(swteam::ResearchResendWaitMs(g_lvResends) / 1000)) + " s (notSent " + N(g_lvNotSent) + ")");
+        return;
+    }
+    if (k == swteam::kLvAgain) ++g_lvReportsAgain; else ++g_lvReports;
+    DebugLog("[TEAM] research level: this game's own benches give level " + N((long long)own) + " - " + (k == swteam::kLvAgain ? std::string("reported AGAIN") : std::string("reported"))
+             + " to team " + N((long long)myTeam) + " (reports " + N(g_lvReports) + ", again " + N(g_lvReportsAgain) + ")");
 }
 /* the box stub's cells: every teammate's faction here (a stand-in met this session, else the coop-p<n> faction the save carries) */
 void CellsTick()
@@ -860,7 +943,7 @@ void TeamArrive(const std::vector<char>& payload)
         DebugLog("[TEAM] notice " + std::string(swteam::EventName((int)d.event)) + " result=" + swteam::ResultName((int)d.result) + " actor=s"
                  + (d.actorSlot == 0xFFFFFFFFu ? std::string("?") : N((long long)d.actorSlot)) + " subject=s" + (d.subjectSlot == 0xFFFFFFFFu ? std::string("?") : N((long long)d.subjectSlot))
                  + ": \"" + NoticeLine(d) + "\"");
-        ShowLine(teamscreen::NoticeLine((int)d.event, (int)d.result, me >= 0 && d.subjectSlot == (unsigned)me, ScreenNameOf(d.subjectSlot), d.teamName),
+        ShowLine(teamscreen::NoticeLine((int)d.event, (int)d.result, me >= 0 && d.subjectSlot == (unsigned)me, ScreenNameOf(d.subjectSlot), d.teamName, ScreenNameOf(d.actorSlot)),
                  std::string("the notice ") + swteam::EventName((int)d.event) + " " + swteam::ResultName((int)d.result));
     }
     else if (d.kind == swteam::kDnRecord)
@@ -915,6 +998,19 @@ void TeamArrive(const std::vector<char>& payload)
                 DebugLog("[TEAM] research: " + d.techs[i] + " finished by s" + N((long long)d.resBy) + " (" + NameOf(d.resBy) + ") in team " + N((long long)d.resTeam) + " received");
             }
     }
+    else if (d.kind == swteam::kDnLevel)
+    {
+        /* the team's research level: the answer to this game's report (bySlot = this game), or the team's changed; the engine's
+           level is raised to it by LevelTick */
+        ++g_lvIn;
+        const bool answer = me >= 0 && d.lvBy == (unsigned)me;
+        if (answer && d.lvTeam == g_lvSentTeam) { g_lvAnswered = true; g_lvResends = 0; ++g_lvAnswers; }
+        const bool news = d.lvTeam != g_lvTeam || (int)d.lvLevel != g_lvLevel;
+        g_lvTeam = d.lvTeam; g_lvLevel = (int)d.lvLevel; g_lvRaiseTriedAt = 0;
+        if (news || g_lvIn <= 20)
+            DebugLog("[TEAM] research level: team " + N((long long)d.lvTeam) + "'s level is " + N((long long)d.lvLevel) + " from the world server (" + (answer ? std::string("the answer to this game's report") : std::string("the team's level changed"))
+                     + ") - this game's engine is raised to it when lower (in " + N(g_lvIn) + ")");
+    }
     else if (d.kind == swteam::kDnRestore)
     {
         ++g_restores; if (d.away) ++g_restoresAway;
@@ -947,6 +1043,7 @@ void TeamTick()
     PinTick();
     RecordTick();
     ResearchTick();
+    LevelTick();
     CellsTick();
     const int gen = StoreLinkGen();
     if (g_tableGen == gen || g_askedGen == gen || StoreWelcomedThisLink() == 0) return;
@@ -967,6 +1064,14 @@ void TeamForget(const char* why, bool linkLost)
         DebugLog(std::string("[TEAM] this game's copy of the table cleared (") + why + ")"
                  + (held ? "; " + N((long long)held) + " held restore row(s) dropped - the world server sends them again at the next join" : std::string())
                  + (inv ? "; the waiting invitation ended with the connection" : std::string()));
+    }
+    /* owner 516 b: an invitation still waiting unanswered ends with the link (the world server restarted, or the connection
+       dropped) - the invited player is told whose it was, in the world still loaded (no line once the world is gone). An
+       answered one is not: its answer's outcome is not known here. */
+    if (inv && !g_invite.answered)
+    {
+        if (GameplayRunning()) ShowLine(teamscreen::NoticeLine(swteam::kEvInviteGone, swteam::kOk, true, std::string(), g_invite.teamName, ScreenNameOf(g_invite.fromSlot)), "a waiting invitation ended with the link");
+        else DebugLog("[TEAM] the waiting invitation ended with the link - no world loaded, no line");
     }
     if (!g_pinned.empty())
     {
@@ -989,6 +1094,8 @@ void TeamForget(const char* why, bool linkLost)
     g_resWholeTeam = 0; g_resWholeLink = -1; g_resFlightTeam = 0; g_resFlightLink = -1; g_resFlightAt = 0; g_resFlightResends = 0; g_resFlightList.clear();
     g_resLoadTriedAt = 0; g_resReadTriedAt = 0; g_resWholeOwed = false; g_resWhole.clear(); g_resIncoming.clear();
     g_resPending.clear(); g_resOwnFlight.clear(); g_resOwnAt = 0; g_resOwnResends = 0; g_resNotOwn.clear(); g_resHeld.clear();
+    /* the research level is reported again after the next load (or link), and the team's level comes with its answer */
+    g_lvSentTeam = 0; g_lvSentLink = -1; g_lvSentLevel = -1; g_lvAnswered = false; g_lvResends = 0; g_lvTeam = 0; g_lvLevel = -1; g_lvRaiseTriedAt = 0;
 }
 
 bool TeamStanceIsFounders(int slot)
@@ -1118,7 +1225,7 @@ std::string TeamCommand(const std::string& args)
                 one = " | " + sid + " (" + StoreResearchNameOf(sid) + ") finished=" + (std::find(mine.begin(), mine.end(), sid) != mine.end() ? "yes" : "no")
                       + " queued=" + (at < 0 ? std::string("no") : "at " + N((long long)at));
             }
-            DebugLog("[TEAM] research show: finished=" + N((long long)mine.size()) + " queue=" + N(q) + " [" + qt + "]" + one + " researchLevel=" + N((long long)StoreResearchLevel())
+            DebugLog("[TEAM] research show: finished=" + N((long long)mine.size()) + " queue=" + N(q) + " [" + qt + "]" + one + " researchLevel=" + N((long long)StoreResearchLevel()) + " ownBenchLevel=" + N((long long)StoreResearchBenchLevel()) + " teamLevel=" + N((long long)g_lvLevel)
                      + " | " + ResearchText());
             return "ok team research show finished=" + N((long long)mine.size());
         }

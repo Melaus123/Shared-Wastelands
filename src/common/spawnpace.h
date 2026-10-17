@@ -59,7 +59,7 @@ enum
     kMsgSay = 43, kMsgStats = 44, kMsgCrime = 45, kMsgBounty = 46, kMsgCarryBreak = 47, kMsgPrison = 48, kMsgTreat = 49,
     kMsgName = 51, kMsgSlave = 52, kMsgHire = 55, kMsgSquadLead = 57, kMsgTalk = 59, kMsgCapture = 60, kMsgCaptureDone = 61,
     kMsgCapturePlaced = 62, kMsgShot = 63, kMsgEffect = 65, kMsgInside = 66, kMsgRelease = 68, kMsgReleaseAck = 69,
-    kMsgRoster = 70, kMsgMoveStop = 72, kMsgOwnerMoved = 202
+    kMsgRoster = 70, kMsgMoveStop = 72, kMsgMeleeDecided = 77, kMsgOwnerMoved = 202
 };
 const unsigned int kXferMemberSize = 48;   /* one XFER member: uid u32 | x,y,z,fx,fz f32 | intentType i32 | intentSubject u32 | ... */
 const unsigned int kXferMaxMembers = 256;
@@ -118,7 +118,8 @@ inline int MessageSubjects(unsigned int type, const unsigned char* p, size_t siz
     case kMsgContext: case kMsgUnload: case kMsgSay: case kMsgStats: case kMsgBounty: case kMsgPrison: case kMsgTreat:
     case kMsgName: case kMsgInside: case kMsgMoveStop: case kMsgOwnerMoved: case kMsgItemMove:
         SubjectAt(p, size, 0, out); break;
-    case kMsgHit: case kMsgSwing: case kMsgCarryBreak: case kMsgShot:   /* victim / swinger / body, then attacker / target / carrier / shooter */
+    case kMsgHit: case kMsgSwing: case kMsgCarryBreak: case kMsgShot: case kMsgMeleeDecided:
+        /* victim / swinger / body, then attacker / target / carrier / shooter */
         SubjectAt(p, size, 0, out); SubjectAt(p, size, 4, out); break;
     case kMsgCombatMode: case kMsgIntent:   /* the character | on / task type | the target / subject */
         SubjectAt(p, size, 0, out); SubjectAt(p, size, 8, out); break;

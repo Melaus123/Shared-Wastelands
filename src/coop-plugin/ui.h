@@ -75,6 +75,9 @@ void UiJoinPasswordFromLeverOnce();
 // MAIN THREAD: 1 = this game hosts a world now (the rule that shows HOSTING); *world = that world's name as listed. Read by the Steam
 // rich presence (net/steam_friends.cpp).
 int  UiHostingNow(std::string* world);
+// MAIN THREAD: the log file of the world server this game started in this launch (it may have ended since); "" when this game
+// started none. The bug report packs it when it is there (bugreport.cpp).
+std::string UiServerLogPath();
 // MAIN THREAD: CAN'T JOIN drawn in a RUNNING WORLD (the MODS DON'T MATCH notice's recipe, one OK) for a Steam join request that came
 // while in a world. 1 shown, 0 refused, -1 a MyGUI throw, -2 a fault. The tick closes it on its OK or when the world goes.
 int  UiJoinRefuseShow(const char* text);

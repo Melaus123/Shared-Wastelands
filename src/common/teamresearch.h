@@ -15,7 +15,19 @@
 //   - a list this game sends stays this game's until the world server answers it: a refusal (a NOTICE research-whole /
 //     research-own) or no answer sends it again after a growing wait (ResearchResendWaitMs; ResearchDownKind reads an answer);
 //   - leaving or removal takes nothing away (no code: nothing is ever removed).
-// The message lines are the approved page's (build/pages/player-factions.html B7.8): ResearchSharedLine, ResearchCompleteLine.
+// The message line is the approved page's (build/pages/player-factions.html B7.8, the singular approved by owner 515):
+// ResearchSharedLine. A teammate's tech shows "Research complete: <tech> (<teammate>)." every time (owner 680; teamscreens.h
+// ResearchCompleteShown).
+//
+// THE TEAM'S RESEARCH LEVEL (owner 517 a; the wire in teamwire.h LEVEL): the level a research bench gives is Research+0x170, raised
+// only by Research::setLevel (from a player-faction bench's completion) and set to 0 by Research::load. A game's OWN level is the
+// highest level the engine's benches passed to setLevel since its world was loaded (the mod's own setLevel calls do not count);
+// in a team it reports that level once per world load, link and team and whenever it changes (LevelSendNow), and raises its
+// engine's level to the team's through setLevel whenever the engine's is lower (LevelRaiseTo - checked every tick, so a load that
+// reset it is raised again). ON LEAVING (or removal, or a disband) the level stays where the team raised it until the next world
+// load, where Research::load resets it and only the player's own benches raise it again: setLevel only raises, and the base game
+// itself lowers the level only that way (a destroyed bench takes nothing away until the next load), so a team behaves as one
+// player who lost the benches (owner 512).
 #include "ownrec.h"
 #include <string>
 #include <vector>
@@ -144,6 +156,14 @@ inline int ResearchApplyRoute(const std::vector<QueuedTech>& queue, const std::s
     for (size_t i = 0; i < queue.size(); ++i) if (queue[i].sid == tech) { ++seen; if (i == 0) front = true; }
     return (seen == 0 || (seen == 1 && front)) ? kResViaSetResearched : kResViaLoad;
 }
+/* THE RESEARCH-COMPLETE SOUND (owner 521 / T-634): a teammate's "Research complete: <tech> (<teammate>)." line plays the game's own
+   research-complete sound once, when it is shown - only for a tech that went in through Research::load, which plays nothing.
+   setResearched plays that very sound itself with its own toast (decomp_833680, findings: a "Thing_Complete" per tech), so a second
+   one there would double it; the finishing player's own game hears setResearched's and shows no line. "Thing_Complete" is a STATE of
+   the sound switch group "Notifications", not an event: the game sets that switch and then posts the event "Notifications"
+   (1.0.65 FUN_140257cc0; ChatPlayNotification does the same, the group name kept in chat.cpp); posted as an event it is refused. */
+const char* const kResearchSoundEvent = "Thing_Complete";
+inline bool ResearchLineSound(int route) { return route == kResViaLoad; }
 
 /* the wait before a list the world server has not accepted is sent again: 2 s, doubled at each resend, at most 60 s */
 inline unsigned long ResearchResendWaitMs(int resends)
@@ -195,13 +215,33 @@ inline bool ResearchWholeDue(unsigned myTeam, unsigned sentTeam, int sentLink, i
     return myTeam != 0 && (sentTeam != myTeam || sentLink != link);
 }
 
-/* the approved lines (build/pages/player-factions.html, B7.8): "Shared research: 6 new technologies." and
-   "Research complete: Iron Plates (Sam)." */
+/* the approved line (build/pages/player-factions.html, B7.8; the singular owner 515): "Shared research: 6 new technologies." /
+   "Shared research: 1 new technology." */
 inline std::string ResearchSharedLine(int n)
 {
     std::ostringstream o; o << "Shared research: " << n << (n == 1 ? " new technology." : " new technologies.");
     return o.str();
 }
-inline std::string ResearchCompleteLine(const std::string& tech, const std::string& member) { return "Research complete: " + tech + " (" + member + ")."; }
+
+/* THE LEVEL REPORT: what to send now - nothing (kLvNone), the report (kLvSend: in a team, the hook's own level known, and the level
+   not sent yet for this team, link and level), or the same report again (kLvAgain: sent, not answered, and its growing wait
+   ResearchResendWaitMs(resends) passed since it went) */
+enum { kLvNone = 0, kLvSend = 1, kLvAgain = 2 };
+inline int LevelSendNow(unsigned myTeam, int own, unsigned sentTeam, int sentLink, int sentLevel, int link, bool answered, unsigned long sinceMs, int resends)
+{
+    if (myTeam == 0 || own < 0) return kLvNone;
+    if (sentTeam != myTeam || sentLink != link || sentLevel != own) return kLvSend;
+    if (!answered && sinceMs >= ResearchResendWaitMs(resends)) return kLvAgain;
+    return kLvNone;
+}
+/* the level this game's engine is raised to: the team's (a LEVEL for the team this player is in now), when the engine's level
+   (`have`, -1 = not readable) is below it; -1 = nothing to raise */
+inline int LevelRaiseTo(unsigned myTeam, unsigned msgTeam, int teamLevel, int have)
+{
+    if (!ResearchForMyTeam(myTeam, msgTeam) || have < 0 || teamLevel <= have) return -1;
+    return teamLevel;
+}
+/* the own bench level after the engine's setLevel was called with `level` (the highest since the world was loaded) */
+inline int OwnBenchLevelAfter(int own, int level) { return level > own ? level : own; }
 
 }   // namespace swteam

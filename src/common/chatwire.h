@@ -1,5 +1,6 @@
 /* src/common/chatwire.h - IN-GAME TEXT CHAT, as the approved mock-up build/pages/text-chat-mockup.html shows it. The pure half: the chat message's bytes, the words every line says, the colours, the
- * TO choice's Tab order and search, the kept lines, the fade, which road a message takes, and chat.cfg's text.
+ * TO choice's Tab order and search, the kept lines, the fade, which road a message takes, which sound a received message plays
+ * (T-815), and chat.cfg's text.
  * src/coop-plugin/chat.cpp draws the window and feeds these.
  *
  * THE MESSAGE (inner type cooplive::kInnerChat, through the world server's relay; the server stamps the sender's slot, so the
@@ -22,7 +23,7 @@ namespace chatwire {
 
 enum Kind { kEveryone = 0, kFaction = 1, kPrivate = 2 };
 enum Dir { kIn = 0, kOut = 1 };                       /* a private line: received ("From Bob") or sent ("To Bob") */
-enum LineKind { kLineTalk = 0, kLineJoin = 1, kLineLeave = 2, kLineGone = 3, kLineNotConnected = 4 };
+enum LineKind { kLineTalk = 0, kLineJoin = 1, kLineLeave = 2, kLineGone = 3, kLineNotConnected = 4, kLineMoney = 5 };   /* kLineMoney (T-810): "You sent Bob c.500" / "Bob sent you c.500" - grey, as the join lines */
 /* the TO choice: everyone, my faction, or a player's slot (0 and up) */
 const int kToEveryone = -1;
 const int kToFaction = -2;
@@ -47,6 +48,17 @@ inline const char* TypeHint()      { return "type a message..."; }
 inline const char* SearchHint()    { return "search players..."; }
 inline const char* MessageWord()   { return "MESSAGE"; }
 inline const char* SeparatorWord() { return "----------"; }
+/* T-815 (owner 870): the header's OPTIONS button and the CHAT OPTIONS window it opens */
+inline const char* OptionsWord()   { return "OPTIONS"; }
+inline const char* OptionsTitle()  { return "CHAT OPTIONS"; }
+inline const char* CloseWord()     { return "CLOSE"; }
+/* the label left of each tick box, by message kind (Kind) */
+inline const char* SoundLabel(int kind)
+{
+    if (kind == kFaction) return "Sound for MY FACTION messages";
+    if (kind == kPrivate) return "Sound for private messages";
+    return "Sound for EVERYONE messages";
+}
 
 inline std::string JoinLine(const std::string& name)  { return name + " joined the world."; }
 inline std::string LeaveLine(const std::string& name) { return name + " left the world."; }
@@ -331,9 +343,37 @@ inline int SendPlan(int kind, int target, int mates, const std::vector<int>& mat
     return kPlanSend;
 }
 
-/* ---- chat.cfg: the window's place, size and opacity ---- */
+/* ---- the message sounds (T-815, owner 865 / 871) ----
+   A received message plays a sound by its kind, each kind with its own switch (all on at first), and none while the chat window
+   is open; there is no rate limit. Every kind plays Prospect_Click (owner 2026-10-17: General_Click was too hard to hear) - an
+   event of its own in the game's SFX_General_Bank.bnk, posted the way the game posts its own interface clicks. */
+const int kSoundKinds = 3;                     /* kEveryone, kFaction, kPrivate */
+struct Sounds { int on[kSoundKinds]; Sounds() { on[0] = 1; on[1] = 1; on[2] = 1; } };
+/* the sound event a kind plays, 0 for a kind that has none */
+inline const char* SoundEventOf(int kind)
+{
+    if (kind == kEveryone || kind == kFaction || kind == kPrivate) return "Prospect_Click";
+    return 0;
+}
+/* the event to play for a received message of `kind`, or 0: none while the window is open or that kind's switch is off */
+inline const char* SoundToPlay(const Sounds& s, int kind, bool windowOpen)
+{
+    if (windowOpen || kind < 0 || kind >= kSoundKinds || s.on[kind] == 0) return 0;
+    return SoundEventOf(kind);
+}
+/* chat.cfg's key for a kind's switch */
+inline const char* SoundKey(int kind)
+{
+    if (kind == kFaction) return "sound_faction";
+    if (kind == kPrivate) return "sound_direct";
+    return "sound_everyone";
+}
+
+/* ---- chat.cfg: the window's place, size and opacity, and the three sound switches ---- */
 struct Cfg { int x, y, w, h, opacity; Cfg() : x(0), y(0), w(0), h(0), opacity(60) {} };
-const int kMinW = 320, kMinH = 180;
+/* the least width holds the header's CHAT, OPACITY, the slider at its least width (kSliderLeast), OPTIONS and the X with the
+   tight gaps, for the widest words the layout test measures (320 before the OPTIONS button) */
+const int kMinW = 400, kMinH = 180;
 const int kDefaultOpacity = 60;
 inline std::string IntText(int v)
 {
@@ -358,6 +398,34 @@ inline bool ParseInt(const std::string& s, int* v)
     for (; i < s.size(); ++i) { if (s[i] < '0' || s[i] > '9') return false; n = n * 10 + (s[i] - '0'); }
     *v = neg ? -n : n;
     return true;
+}
+/* the window keys and the sound switches, one file */
+inline std::string CfgFormat(const Cfg& c, const Sounds& snd)
+{
+    std::string t = CfgFormat(c);
+    for (int k = 0; k < kSoundKinds; ++k) t += std::string(SoundKey(k)) + "=" + (snd.on[k] != 0 ? "1" : "0") + "\r\n";
+    return t;
+}
+/* the sound switches, read on their own: whatever else the file holds or lacks (a damaged or missing window key throws the
+   window's place away, never the switches), each switch is its key's 0 or 1, else on */
+inline void SoundsParse(const std::string& text, Sounds* out)
+{
+    Sounds s;
+    size_t at = 0;
+    while (at < text.size())
+    {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line[line.size() - 1] == '\r' || line[line.size() - 1] == ' ')) line.erase(line.size() - 1);
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if (v != "0" && v != "1") continue;
+        for (int i = 0; i < kSoundKinds; ++i) if (k == SoundKey(i)) s.on[i] = v == "1" ? 1 : 0;
+    }
+    *out = s;
 }
 /* true = x, y, w and h were all read (opacity is optional, 0..100, else the default) */
 inline bool CfgParse(const std::string& text, Cfg* out)
@@ -418,35 +486,40 @@ inline Cfg DefaultRect(int vw, int vh)
 }
 
 /* ---- the window's layout: every control's place from the window's size and the measured widths of its words ----
-   The header: CHAT at the left, then OPACITY and its slider, then the close X where Kenshi's header has it. Below the lines, two
+   The header: CHAT at the left, then OPACITY and its slider, then OPTIONS (T-815), then the close X where Kenshi's header has
+   it. Below the lines, two
    rows of controls: TO and its button, then the typing box and SEND at the bottom. The resize grip holds the bottom-right corner,
    so SEND ends clear of it. */
 const int kWinHeadH = 38, kWinPad = 8, kWinCtlH = 30, kWinGap = 6;
 const int kGripSize = 18;
-const int kSliderLeast = 80;
+const int kSliderLeast = 40, kSliderMost = 120;   /* the opacity slider never stretches past kSliderMost; OPTIONS stays by the X */
 const float kLineBandAlpha = 0.45f;   /* the dark band behind each row of a chat line, at the line's full alpha: black at 45% */
 struct WinBox { int x, y, w, h; };
 inline void SetWinBox(WinBox* b, int x, int y, int w, int h) { b->x = x; b->y = y; b->w = w; b->h = h; }
-struct WinLayout { WinBox head, title, opWord, opBar, close, view, toWord, toBtn, edit, hint, send, grip; };
-/* titleW, opWordW, toCapW, sendWordW: the measured widths of CHAT, OPACITY, the TO button's caption and SEND.
+struct WinLayout { WinBox head, title, opWord, opBar, opt, close, view, toWord, toBtn, edit, hint, send, grip; };
+/* titleW, opWordW, optWordW, toCapW, sendWordW: the measured widths of CHAT, OPACITY, OPTIONS, the TO button's caption and SEND.
    The layout is written through out, not returned by value: VS2010's x64 optimiser stores a returned struct of 16 bytes or more
    with aligned SSE moves (movaps), taking the caller's return slot to be 16-byte aligned while the caller may place it at an
    8-byte boundary, and the store then faults. A plain pointer carries no such assumption, so every box is stored field by field. */
-inline void WindowLayout(int W, int H, int titleW, int opWordW, int toCapW, int sendWordW, WinLayout* out)
+inline void WindowLayout(int W, int H, int titleW, int opWordW, int optWordW, int toCapW, int sendWordW, WinLayout* out)
 {
     WinLayout& L = *out;
     SetWinBox(&L.head, 0, 0, W, kWinHeadH);
     SetWinBox(&L.close, W - 40, 5, 31, 32);   /* Kenshi_WindowCX's close X: 31 x 32 at 5 from the top */
+    int optW = optWordW + 24;                 /* OPTIONS as wide as its word and the button's edges */
+    if (optW < 64) optW = 64;
     /* the header's gaps: roomy, or tight when the roomy ones would leave the slider under its least width; the X never moves */
-    static const int kGaps[2][4] = { { 10, 14, 6, 8 }, { 4, 6, 4, 4 } };   /* title's margin, title-OPACITY, OPACITY-slider, slider-X */
+    static const int kGaps[2][5] = { { 10, 14, 6, 8, 6 }, { 4, 6, 4, 4, 4 } };   /* title's margin, title-OPACITY, OPACITY-slider, slider-OPTIONS, OPTIONS-X */
     for (int k = 0; k < 2; ++k)
     {
         SetWinBox(&L.title, kGaps[k][0], 3, titleW + 12, kWinHeadH - 4);
         SetWinBox(&L.opWord, L.title.x + L.title.w + kGaps[k][1], (kWinHeadH - kWinCtlH) / 2, opWordW + 10, kWinCtlH);
+        SetWinBox(&L.opt, L.close.x - kGaps[k][4] - optW, (kWinHeadH - kWinCtlH) / 2, optW, kWinCtlH);
         const int barX = L.opWord.x + L.opWord.w + kGaps[k][2];
-        SetWinBox(&L.opBar, barX, (kWinHeadH - 22) / 2, L.close.x - kGaps[k][3] - barX, 22);
+        SetWinBox(&L.opBar, barX, (kWinHeadH - 22) / 2, L.opt.x - kGaps[k][3] - barX, 22);
         if (L.opBar.w >= kSliderLeast) break;
     }
+    if (L.opBar.w > kSliderMost) L.opBar.w = kSliderMost;
     if (L.opBar.w < 1) L.opBar.w = 1;
     const int row2 = H - kWinPad - kWinCtlH;
     const int row1 = row2 - kWinGap - kWinCtlH;

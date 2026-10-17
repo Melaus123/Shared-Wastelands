@@ -668,6 +668,14 @@ volatile LONG64 g_deathFault              = 0;   // copy: declareDead faulted (a
 volatile LONG64 g_deathNoCopy             = 0;   // the owner said dead for a uid with no character loaded here
 volatile LONG64 g_deathOwnerAliveCopyDead = 0;   // the owner says alive, the copy is dead (never resurrected - reported)
 volatile LONG64 g_copyDeathRefused        = 0;   // a copy's own declareDead refused (the owner has not said dead)
+// T-681: whether the gate refused the ONE declareDead call a main-thread caller is making. The refusal count above is shared
+// with the medical tick on the AI worker thread, so a difference in it can be another copy's refusal; the caller names its
+// character and thread here, and the gate marks a refusal only for that character on that thread. MAIN THREAD callers.
+static void* volatile g_deathWatchChar = 0;
+static volatile DWORD g_deathWatchThread = 0;
+static volatile LONG g_deathWatchRefused = 0;
+static void DeathWatchBegin(void* character) { g_deathWatchRefused = 0; g_deathWatchThread = ::GetCurrentThreadId(); g_deathWatchChar = character; }
+static bool DeathWatchEnd() { const bool refused = g_deathWatchRefused != 0; g_deathWatchChar = 0; g_deathWatchThread = 0; g_deathWatchRefused = 0; return refused; }
 volatile LONG64 g_copyDeathRefusedRebuild = 0;   // ... refused because a body rebuild is in flight
 volatile LONG64 g_copyDeathAllowedOwner   = 0;   // a copy's declareDead allowed: the owner's latest STATE says dead
 volatile LONG64 g_copyDeathMedCleared     = 0;   // refusals that put MedicalSystem::dead back to 0
@@ -936,6 +944,7 @@ bool CopyDeathAllowed(void* character, unsigned long long callerRet, bool worldR
     else if (CopyRebuildInFlightAny((::Character*)character) != 0) why = 2;
     if (why == 0) { InterlockedIncrement64(&g_copyDeathAllowedOwner); return true; }
     InterlockedIncrement64(&g_copyDeathRefused);
+    if (character == g_deathWatchChar && ::GetCurrentThreadId() == g_deathWatchThread) g_deathWatchRefused = 1;   // T-681: this call's own refusal
     if (why == 2) InterlockedIncrement64(&g_copyDeathRefusedRebuild);
     // par6b: MedicalSystem::dead IS hasDied's byte, and medicalUpdate set it just before this call - a call from one of its two
     // call sites began on a LIVE copy (it calls only while the flag was 0), so it is treated as alive and the clear below
@@ -1009,11 +1018,11 @@ void ApplyOwnerDeath(unsigned int uid, int dead)
     MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
     const bool medOk = PlausiblePtr(med);
     // par6b: the flag IS hasDied's byte, so hasDied reads 1 after this call whatever declareDead did - whether the death went
-    // through is told by the gate's refusal count (snapshot before the call) and the call's own fault result.
-    const LONG64 refusedBefore = g_copyDeathRefused;
+    // through is told by the gate's refusal of this call for this character (DeathWatch) and the call's own fault result.
+    DeathWatchBegin(c);
     if (medOk) med->dead = true;                    // medicalUpdate's own order: the flag, then declareDead
     const int called = StoreDeclareDeadPod(c);
-    const long long refused = (long long)(g_copyDeathRefused - refusedBefore);
+    const long long refused = DeathWatchEnd() ? 1 : 0;
     if (called != 1 || refused != 0)
     {
         if (medOk) med->dead = false;   // the death did not go through: do not leave the copy half-dead (the next STATE retries)
@@ -1320,12 +1329,13 @@ std::string KillLever(unsigned int uid)
     InterlockedIncrement64(&g_killLever);
     MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
     const bool medOk = PlausiblePtr(med);
-    const LONG64 refusedBefore = g_copyDeathRefused;
+    DeathWatchBegin(c);
     if (medOk) med->dead = true;
     const int called = StoreDeclareDeadPod(c);
-    // par6b: the flag IS hasDied's byte, so hasDied cannot say whether the gate refused - its refusal count can. The copy was
-    // alive (checked above), so a refused call has its flag put back; hasDied is read after, for the lever's line.
-    const long long refused = (long long)(g_copyDeathRefused - refusedBefore);
+    // par6b: the flag IS hasDied's byte, so hasDied cannot say whether the gate refused - its refusal of this call for this
+    // character can (DeathWatch). The copy was alive (checked above), so a refused call has its flag put back; hasDied is read
+    // after, for the lever's line.
+    const long long refused = DeathWatchEnd() ? 1 : 0;
     if (medOk && refused != 0) med->dead = false;
     const bool nowDead = c->hasDied();
     const bool pushed = (mine && nowDead) ? StatePush(uid) : false;
@@ -1499,7 +1509,7 @@ void InstallMedicalProbe()
     InstallCopyAmputateGate();   // LIMBS: a copy loses a limb only when its owner's STATE says so
     InstallCopyTreatCatch();   // a medic's per-part treatment of a copy is recorded for spawn.cpp TreatTick
     InstallRagdollRest();   // R3 (read-ragdoll): a copy's settled ragdoll is moved to its owner's rest, inside 0x7D38D0
-    DebugLog("[P014] resolving MedicalSystem::medicalUpdate ...");
+    SW_DEVLOG("[P014] resolving MedicalSystem::medicalUpdate ...");
     intptr_t fn = (intptr_t)coop::AddrAbs(kMig3MedicalUpdate);
     if (fn == 0)
     {
@@ -1745,39 +1755,41 @@ int VitalPartIndex(MedicalSystem* med, int which)   // which: 0 -> +0x80, 1 -> +
 //
 // It writes only the authority's own copy; the existing replication carries it from there,
 // which is exactly the path under test.
-bool WoundPart(unsigned int uid, int part, float stun, float cut)
+// The reply says what was written, or why nothing was; the knock-out itself is not attempted here.
+std::string WoundPartLever(unsigned int uid, int part, float stun, float cut)
 {
     if (!net::IsUidMine(uid))
     {
         ErrorLog("[M4] wound refused: uid " + N(uid) + " is not ours - writing a character"
                  " we do not own is the one thing replication must never do");
-        return false;
+        return "error wound: uid " + N(uid) + " is not ours - this game does not drive it";
     }
     Character* c = FindSpawned(uid);
-    if (c == 0) { ErrorLog("[M4] wound: no local object for uid " + N(uid)); return false; }
+    if (c == 0) { ErrorLog("[M4] wound: no local object for uid " + N(uid)); return "error wound: no local object for uid " + N(uid); }
 
     MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
-    if (!PlausiblePtr(med)) return false;
+    if (!PlausiblePtr(med)) return "error wound: the medical system of uid " + N(uid) + " is unreadable";
     int n = med->countBodyParts();
     if (part < 0 || part >= n)
     {
         ErrorLog("[M4] wound refused: part " + N(part) + " out of range (0.." + N(n - 1) + ")");
-        return false;
+        return "error wound: part " + N(part) + " out of range (0.." + N(n - 1) + ")";
     }
     MedicalSystem::HealthPartStatus* p = med->partAt((unsigned __int64)part);
-    if (!PlausiblePtr(p)) return false;
+    if (!PlausiblePtr(p)) return "error wound: part " + N(part) + " of uid " + N(uid) + " is unreadable";
 
     p->stunDamage += stun;
     p->flesh     -= cut;
     p->recomputeHealth();
     med->clampHealth();
 
-    DebugLog("[M4] wound uid=" + N(uid) + " part=" + N(part)
+    const std::string line = "wound uid=" + N(uid) + " part=" + N(part)
              + " +stun=" + F2(stun) + " -flesh=" + F2(cut)
              + " -> f=" + F2(p->flesh) + " stun=" + F2(p->stunDamage)
              + " coll=" + F2(p->flesh - p->stunDamage + p->splintLevel)
-             + " prone=" + N((int)c->poseState()));
-    return true;
+             + " prone=" + N((int)c->poseState());
+    DebugLog("[M4] " + line);
+    return "ok " + line + " knockout=not-attempted (wound only damages a part; koself is the sure knock-out)";
 }
 
 // PROBE P017 - see medical.h. Named fields, not raw offsets: the header declares every one of

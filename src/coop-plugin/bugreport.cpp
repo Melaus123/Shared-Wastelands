@@ -13,13 +13,15 @@
 // closes the menu first, and the tick opens it again through the engine's own show (ui.cpp UiPauseMenuReshow).
 //
 // WHAT IS SENT (365-367, 372, 581): the description; the mod logs of this launch and the two launches before it
-// (src/common/logrotate.h); Kenshi's crash file when one of those two earlier launches crashed (coopbug::CrashLaunch); and each
+// (src/common/logrotate.h); Kenshi's crash file when one of those two earlier launches crashed (coopbug::CrashLaunch); the log
+// of the world server this game started in this launch, when its file is there (UiServerLogPath); and each
 // nearby player's CURRENT log,
 // asked for by LOG_ASK through the world server (route AREA - the games that have this player's sector in their delivery area)
 // and answered in LOG_PARTs by slot, without telling that player (377). Every log has its IP addresses replaced and every
 // player identity code cut to its first 8 characters before it is compressed (coopbug::ScrubIps) - an answering game scrubs its
 // own. Everything goes into one zip under coopbug::kPackLimit,
-// the earlier launches' logs cut first, oldest part first (coopbug::PlanBudget, coopbug::EarlierLogOrder), with report.txt
+// each log keeping a share of the room through the first pass (coopbug::SetBudgetFloors), the earlier launches' logs cut
+// first, oldest part first (coopbug::PlanBudget, coopbug::EarlierLogOrder), with report.txt
 // saying what is in it and what
 // was cut. The zip is posted (multipart/form-data, WinHTTP, HTTPS) to coopbug::kRelayUrl.
 //
@@ -48,12 +50,13 @@
 #include <mygui/MyGUI_XmlDocument.h>
 #include <mygui/MyGUI_IFont.h>
 #include "bugreport.h"
-#include "ui.h"                            /* UiFindLayoutSuffix, UiPauseMenuVisible, UiPauseMenuReshow */
+#include "ui.h"                            /* UiFindLayoutSuffix, UiPauseMenuVisible, UiPauseMenuReshow, UiServerLogPath */
 #include "titleart.h"                      /* TitleArtNoteBand - the note's place on the mod's title art */
 #include "store.h"                         /* StoreSendLive, StoreLiveReady, StoreLiveSendQueued, StoreRosterOtherInWorldTS */
 #include "zones.h"                         /* MyPlayerSector */
 #include "config.h"                        /* ConfigFilePlayerName */
 #include "addresses.h"                     /* AddrTableName, AddrExeFingerprint */
+#include "../common/logrotate.h"            /* the names of a launch's log parts (.start, .prev) */
 #include "../common/modversion.h"           /* the mod's version: the report's info line and the title screen's version line */
 #include "soak.h"                          /* GameplayRunning */
 #include "doors.h"                         /* ReportDoors - the door totals go into the log a report packs */
@@ -422,6 +425,9 @@ struct Job
     std::string info;       /* one line: game, fingerprint, protocol, where */
     std::string where;
     std::wstring log0, log1, log2, gameFolder;
+    std::wstring logStart[3], logMiddle[3];   /* each launch's opening (.start) and middle (.prev) parts, when its log grew past
+                                                 2 MB (the 10 MB ceiling, coop_log.cpp); index = launch, 0 = this one */
+    std::wstring serverLog;  /* the log of the world server this game started (UiServerLogPath); empty = none */
 };
 struct ZipPart
 {
@@ -430,6 +436,7 @@ struct ZipPart
     const coopbug::LogPack* pack;           /* a log, or */
     const std::vector<unsigned char>* raw;  /* a file stored as it is (the crash file) */
     std::string what;                       /* report.txt's words for it */
+    int cutFirst;                           /* coopbug::BudgetPart::cutFirst (0 when left out of the initialiser) */
 };
 std::string UtcNow()
 {
@@ -437,11 +444,12 @@ std::string UtcNow()
     char b[64]; _snprintf(b, 63, "%04d-%02d-%02d %02d:%02d:%02d UTC", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond); b[63] = 0;
     return b;
 }
-std::string LogLine(const std::string& name, const std::string& what, const coopbug::LogPack& p, unsigned long long cut)
+std::string LogLine(const std::string& name, const std::string& what, const coopbug::LogPack& p, unsigned long long cut, bool cutAtEnd)
 {
     std::string s = name + ": " + what + ", " + Num(p.rawTotal) + " bytes, " + Num(p.ipsScrubbed) + " IP addresses removed";
-    const unsigned long long dropped = p.rawDropped + cut;
-    if (dropped != 0) s += "; its oldest " + Num(dropped) + " bytes are not included (kept under " + Num(coopbug::kPackLimit) + " bytes)";
+    const unsigned long long dropped = p.rawDropped + (cutAtEnd ? 0 : cut);
+    if (dropped != 0) s += "; its oldest " + Num(dropped) + " bytes are not included (the whole report is kept under " + Num(coopbug::kPackLimit) + " bytes, compressed)";
+    if (cutAtEnd && cut != 0) s += "; its last " + Num(cut) + " bytes are not included, its first bytes are (the whole report is kept under " + Num(coopbug::kPackLimit) + " bytes, compressed)";
     return s + "\r\n";
 }
 void RunJob(Job& j)
@@ -456,6 +464,7 @@ void RunJob(Job& j)
     }
     else
     {
+        QuietLogFlush(false);   /* the quiet gates' held counts into this launch's log before it is read */
         volatile long* stop = StopOf(j.gen);
         coopbug::LogPack cur, prev, older;
         std::string raw;
@@ -466,6 +475,22 @@ void RunJob(Job& j)
         if (havePrev && !coopbug::PackLog(raw, &prev, stop)) return;
         const bool haveOlder = ReadTail(j.log2, coopbug::kRawLogWindow, &raw, &older.rawTotal, &older.rawDropped, &olderEnd);
         if (haveOlder && !coopbug::PackLog(raw, &older, stop)) return;
+        /* the world server's log, newest bytes kept like the game's logs, scrubbed by the same PackLog (it names players by their
+           identity code); no file there (no world server started, or one that never wrote) = no part and no line */
+        coopbug::LogPack server;
+        const bool haveServer = !j.serverLog.empty() && ReadTail(j.serverLog, coopbug::kRawLogWindow, &raw, &server.rawTotal, &server.rawDropped, 0);
+        if (haveServer && !coopbug::PackLog(raw, &server, stop)) return;
+        /* a launch whose log grew past 2 MB is in up to three parts: its opening (.start, the first 2 MB), its middle (.prev)
+           and its newest part (the log itself, read above) - packed the same way, sent in that order, in that launch's share */
+        coopbug::LogPack opening[3], middle[3];
+        bool haveOpening[3], haveMiddle[3];
+        for (int L = 0; L < 3; ++L)
+        {
+            haveOpening[L] = !j.logStart[L].empty() && ReadTail(j.logStart[L], coopbug::kRawLogWindow, &raw, &opening[L].rawTotal, &opening[L].rawDropped, 0);
+            if (haveOpening[L] && !coopbug::PackLog(raw, &opening[L], stop)) return;
+            haveMiddle[L] = !j.logMiddle[L].empty() && ReadTail(j.logMiddle[L], coopbug::kRawLogWindow, &raw, &middle[L].rawTotal, &middle[L].rawDropped, 0);
+            if (haveMiddle[L] && !coopbug::PackLog(raw, &middle[L], stop)) return;
+        }
         raw.clear();
         std::string crashName; std::vector<unsigned char> crash;
         const int crashLaunch = FindCrash(j.gameFolder, havePrev ? prevEnd : 0, haveOlder ? olderEnd : 0, &crashName, &crash);
@@ -485,13 +510,48 @@ void RunJob(Job& j)
         }
         /* the budget (372) */
         std::vector<ZipPart> parts;
+        const int launchOrder[3] = { (int)coopbug::kOrderThisLog, coopbug::EarlierLogOrder(1, crashLaunch), coopbug::EarlierLogOrder(2, crashLaunch) };
+        const char* const launchWords[3] = { "this launch's mod log",
+                                             crashLaunch == 1 ? "the mod log of the launch that crashed, the previous launch" : "the previous launch's mod log",
+                                             crashLaunch == 2 ? "the mod log of the launch that crashed, two launches ago" : "the mod log from two launches ago" };
+        /* the opening and middle parts of launch L, in that order, before its newest part: same order (the launch's share), the
+           middle cut first, then the opening (never the opening before the middle) */
+        struct LaunchParts
+        {
+            static void Add(std::vector<ZipPart>* out, int L, int order, const char* words, const coopbug::LogPack* op, bool haveOp,
+                            const coopbug::LogPack* mid, bool haveMid)
+            {
+                if (haveOp)
+                {
+                    ZipPart p = { cooplogrot::PartName(std::string(swnames::kLog), L, cooplogrot::kPartStart), order, op, 0,
+                                  std::string(words) + ", its opening part (the first 2 MB of that launch)", 1 };
+                    out->push_back(p);
+                }
+                if (haveMid)
+                {
+                    ZipPart p = { cooplogrot::PartName(std::string(swnames::kLog), L, cooplogrot::kPartPrev), order, mid, 0,
+                                  std::string(words) + ", the part before its newest one (the bytes between the two were cut to keep "
+                                  "the log under 10 MB)", 2 };
+                    out->push_back(p);
+                }
+            }
+        };
+        LaunchParts::Add(&parts, 0, launchOrder[0], launchWords[0], &opening[0], haveOpening[0], &middle[0], haveMiddle[0]);
         if (haveCur) { ZipPart p = { swnames::kLog, coopbug::kOrderThisLog, &cur, 0, "this launch's mod log" }; parts.push_back(p); }
+        if (haveServer)
+        {
+            ZipPart p = { std::string("world-server/") + swnames::kServerLog, coopbug::kOrderServerLog, &server, 0,
+                          "the log of the world server this computer ran for this world" };
+            parts.push_back(p);
+        }
+        LaunchParts::Add(&parts, 1, launchOrder[1], launchWords[1], &opening[1], haveOpening[1], &middle[1], haveMiddle[1]);
         if (havePrev)
         {
             ZipPart p = { swnames::kLogPrev, coopbug::EarlierLogOrder(1, crashLaunch), &prev, 0,
                           crashLaunch == 1 ? "the mod log of the launch that crashed, the previous launch" : "the previous launch's mod log" };
             parts.push_back(p);
         }
+        LaunchParts::Add(&parts, 2, launchOrder[2], launchWords[2], &opening[2], haveOpening[2], &middle[2], haveMiddle[2]);
         if (haveOlder)
         {
             ZipPart p = { swnames::kLogPrev2, coopbug::EarlierLogOrder(2, crashLaunch), &older, 0,
@@ -515,6 +575,8 @@ void RunJob(Job& j)
         for (size_t k = 0; k < parts.size(); ++k)
         {
             bp[k].order = parts[k].order;
+            bp[k].cutFirst = parts[k].cutFirst;
+            bp[k].cutFromEnd = parts[k].cutFirst == 1;   /* a launch's opening part keeps its first bytes */
             bp[k].fixed = coopbug::ZipEntryOverhead(parts[k].name);
             if (parts[k].pack != 0)
             {
@@ -525,11 +587,13 @@ void RunJob(Job& j)
         }
         /* report.txt and the zip's end record, never cut: a generous reserve, as report.txt is written after the cuts */
         bp[parts.size()].fixed = coopbug::ZipEntryOverhead("report.txt") + 16384u + j.desc.size() + coopbug::kZipEndBytes;
+        coopbug::SetBudgetFloors(&bp, coopbug::kPackLimit);   /* one big log cannot cut every other log to nothing */
         const coopbug::BudgetCut cut = coopbug::PlanBudget(bp, coopbug::kPackLimit);
         /* report.txt */
         std::string m;
         m += std::string(swnames::kBugReportTitle) + "\r\n";
         m += "Made: " + UtcNow() + "\r\n";
+        m += std::string("Build: ") + LogBuildLabel() + "\r\n";
         m += j.info + "\r\n";
         m += "Where: " + j.where + "\r\n\r\n";
         m += "What happened (the player's words):\r\n" + j.desc + "\r\n\r\n";
@@ -538,18 +602,22 @@ void RunJob(Job& j)
         es.push_back(coopbug::ZipEntry());   /* report.txt goes first; it is filled in below */
         for (size_t k = 0; k < parts.size(); ++k)
         {
-            if (cut.dropped[k] != 0) { m += parts[k].name + ": " + parts[k].what + " - left out to keep the report under " + Num(coopbug::kPackLimit) + " bytes\r\n"; continue; }
+            /* left out whole, or a log that lost every segment: listed as left out, with no empty file in the zip */
+            if (coopbug::PartLeftOut(bp, cut, k)) { m += parts[k].name + ": " + parts[k].what + " - left out to keep the report under " + Num(coopbug::kPackLimit) + " bytes\r\n"; continue; }
             coopbug::ZipEntry e;
             e.name = parts[k].name;
             if (parts[k].pack != 0)
             {
-                const size_t first = cut.dropSegs[k];
+                const size_t nSegs = parts[k].pack->segs.size();
+                const bool atEnd = bp[k].cutFromEnd;
+                const size_t first = atEnd ? 0 : cut.dropSegs[k];
+                const size_t end = atEnd ? nSegs - cut.dropSegs[k] : nSegs;
                 unsigned long long rawLen = 0, cutRaw = 0;
-                for (size_t s = 0; s < first; ++s) cutRaw += parts[k].pack->segs[s].rawLen;
-                coopbug::JoinPack(*parts[k].pack, first, &e.data, &rawLen, &e.crc);
+                for (size_t s = 0; s < nSegs; ++s) if (s < first || s >= end) cutRaw += parts[k].pack->segs[s].rawLen;
+                coopbug::JoinPackRange(*parts[k].pack, first, end, &e.data, &rawLen, &e.crc);
                 e.method = 8;
                 e.rawLen = (unsigned int)rawLen;
-                m += LogLine(parts[k].name, parts[k].what, *parts[k].pack, cutRaw);
+                m += LogLine(parts[k].name, parts[k].what, *parts[k].pack, cutRaw, atEnd);
             }
             else
             {
@@ -778,6 +846,8 @@ void StartJob(const std::string& desc, int sendOnly)
     j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
               + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
     j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->gameFolder = GameFolder();
+    for (int L = 0; L < 3; ++L) { j->logStart[L] = LogPartPath(L, cooplogrot::kPartStart); j->logMiddle[L] = LogPartPath(L, cooplogrot::kPartPrev); }
+    j->serverLog = Widen(UiServerLogPath());
     if (!sendOnly) { coop::ReportDoors(); coop::ReportFarm(); }   /* the door totals, reload[...] and the [FARM] / [MINE] totals go into the log this report packs */
     const uintptr_t t = _beginthreadex(NULL, 0, &JobMain, j, 0, NULL);
     if (t == 0)

@@ -309,7 +309,7 @@ void DeriveRadiusFromViewDistance()
     ++g_radiusDeriveIgnored;
     if (g_saidWaiting) return;   // once per session (ForgetDerivedRadius resets it)
     g_saidWaiting = true;
-    DebugLog("[P033] client VIEW_DISTANCE ignored - the adoption distance is unlimited on every role (decision 36)");
+    SW_DEVLOG("[P033] client VIEW_DISTANCE ignored - the adoption distance is unlimited on every role (decision 36)");
 }
 
 } // namespace
@@ -368,7 +368,7 @@ void ForgetDerivedRadius()
 {
     g_saidWaiting = false;   // the next session gets to say its own piece
     if (g_radiusSource != kRadiusClient) return;   // explicit command and fallback both stand
-    DebugLog("[P033] adopt radius " + F1(g_adoptRadius) + " was derived from a peer's VIEW_DISTANCE"
+    SW_DEVLOG("[P033] adopt radius " + F1(g_adoptRadius) + " was derived from a peer's VIEW_DISTANCE"
              " and that peer is gone - reverting to DEFAULT-unlimited " + F1(kFallbackRadius)
              + ". A radius belonging to a peer that has left is a fact about nobody, and it would"
              " otherwise read as current at every instrument (F311).");
@@ -380,7 +380,7 @@ void SetWorldRadius(float r)
 {
     g_adoptRadius = r;
     g_radiusSource = kRadiusExplicit;   // an explicit command wins; the derive must not overwrite it
-    DebugLog("[P033] adopt radius = " + F1(r)
+    SW_DEVLOG("[P033] adopt radius = " + F1(r)
              + (r <= 0.0f ? " (UNBOUNDED - adopts the whole map, which T084 measured as 21.6%"
                             " position parity beyond 3000 units and a filled uid table)"
                           : " units. Characters beyond this are NOT adopted and are counted in"
@@ -394,13 +394,13 @@ void SetWorldSync(int mode, int budget)
     if (mode != kModeOff) g_sweepComplete = false;
 
     if (mode == kModeOff)
-        DebugLog("[P033] worldsync OFF. NOTE: characters already adopted STAY adopted and keep"
+        SW_DEVLOG("[P033] worldsync OFF. NOTE: characters already adopted STAY adopted and keep"
                  " streaming - this stops further adoption, it does not undo any.");
     else if (mode == kModeOnce)
-        DebugLog("[P033] worldsync ONCE budget=" + S(budget)
+        SW_DEVLOG("[P033] worldsync ONCE budget=" + S(budget)
                  + " - at most this many more characters will be adopted, then it stops itself.");
     else
-        DebugLog("[P033] worldsync ON - adopting up to " + S(kAdoptPerTick)
+        SW_DEVLOG("[P033] worldsync ON - adopting up to " + S(kAdoptPerTick)
                  + " per tick until the world is covered.");
 }
 
@@ -419,6 +419,7 @@ long long g_worldAdoptable = 0, g_skippedOtherHeld = 0, g_skippedNoMap = 0;
 long long g_reannounceDrained = 0;
 // PROBE-START: P021 - T209: the client reached the area rule 12 times all run; count every drop in the main loop
 long long g_p21Seen = 0, g_p21Spawned = 0, g_p21Guard = 0, g_p21Rule = 0, g_p21Radius = 0, g_p21Ticks = 0; int g_p21Logged = 0;
+long long g_sweepWakeDupSkipped = 0; int g_sweepWakeDupLogged = 0;   /* people of a refused duplicate wake the sweep did not adopt */
 long long g_sweepContextSkipped = 0; int g_sweepContextLogged = 0;   /* rebuilt people of a context platoon the sweep did not adopt */
 long long g_sweepHandedOverSkipped = 0, g_sweepHandedOverAdopted = 0; int g_sweepHandedOverLogged = 0;   /* M7a3f3 T-425 [m7a3f3-ws2] */
 long long g_sweepStandInSkipped = 0;   /* inv7a-b: stand-in copies (faction RECORD coop-p<n> / coop-peer) the sweep met and did not adopt (pass 0 only) */
@@ -588,11 +589,11 @@ static void RetireWithdrawDrain()
         }
     }
     if (sent > 0)
-        DebugLog("[P034] retire-withdraw: sent " + S((long long)sent) + " UNLOAD(s) for characters this"
+        SW_DEVLOG("[P034] retire-withdraw: sent " + S((long long)sent) + " UNLOAD(s) for characters this"
                  " engine no longer has, first uid=" + S(firstUid) + "; " + S(RetireWithdrawPending())
                  + " still pending (P8m)");
     else if (resolved > 0 && (g_announceTicks % 60) == 0)
-        DebugLog("[P034] retire-withdraw: " + S((long long)resolved) + " retired uid(s) needed no UNLOAD"
+        SW_DEVLOG("[P034] retire-withdraw: " + S((long long)resolved) + " retired uid(s) needed no UNLOAD"
                  " (the peer was never told about them); " + S(RetireWithdrawPending()) + " pending (P8m)");
 }
 
@@ -699,7 +700,7 @@ static void AnnHoldEnds(unsigned int uid, const char* how)
     if (g_annHeld.erase(uid) == 0) return;
     if (g_annHeldLogged >= 60) return;
     ++g_annHeldLogged;
-    DebugLog("[P033] announce HOLD ends uid=" + S(uid) + " - " + how);
+    SW_DEVLOG("[P033] announce HOLD ends uid=" + S(uid) + " - " + how);
 }
 bool WithdrawHeldUnload(unsigned int uid)
 {
@@ -711,6 +712,22 @@ bool WithdrawHeldUnload(unsigned int uid)
 
 // M-A step 2 - once a second: a character announced into a sector the peer no longer holds is UNLOADED on the
 // peer; one withheld whose sector the peer now holds is announced (CONTEXT + SPAWN).
+/* The position every announce and withdraw decision reads for a character: a non-player character's SQUAD position (the engine
+   sleeps and wakes the squad whole by it), so every road judges a squad whole and agrees with the 1 Hz pass - a road judging by the
+   character's own spot would SPAWN what the pass withdraws; a player-faction character keeps its own. Only x and z change: a SPAWN
+   still carries the character's own spot. */
+static Ogre::Vector3 AnnounceDecisionPos(::Character* c, const Ogre::Vector3& pos)
+{
+    Ogre::Vector3 dp = pos;
+    if (!IsPlayerFaction(c->getOwnerFactionDirect())) { float sqx = 0, sqz = 0; if (SquadDecisionPos(c, &sqx, &sqz) == 1) { dp.x = sqx; dp.z = sqz; } }
+    return dp;
+}
+static bool AnnounceLoadedHere(::Character* c, const Ogre::Vector3& pos)
+{
+    const Ogre::Vector3 dp = AnnounceDecisionPos(c, pos);
+    return coop::IsPositionLoadedHere(dp.x, dp.y, dp.z);
+}
+
 static void AnnouncePass()
 {
     ++g_announceTicks;
@@ -737,7 +754,10 @@ static void AnnouncePass()
         ::Character* c = FindSpawned(uid);
         if (!PlausibleObject(c) || !PlausibleObject(*(void**)((char*)c + 0x448))) continue;
         Ogre::Vector3 pos = c->worldPosition();
-        const bool held = PeerHoldsSectorOf(pos);
+        /* a non-player character is judged by its SQUAD position (the engine sleeps and wakes the squad whole by it), so its whole squad
+           is withdrawn or announced together; a player-faction character keeps its own. pos stays the character's own (its SPAWN) */
+        Ogre::Vector3 dp = AnnounceDecisionPos(c, pos);
+        const bool held = PeerHoldsSectorOf(dp);
         /* W1-b (T240; review 2026-09-22 H2/H3): with the relay present `held` reads the EFFECTIVE area map (zones.cpp
            ApplyRelayAreaMap -> g_otherLoaded), in which a reporter absent from the latest AREAMAP keeps its last known
            areas - so an absent reporter never reads as holding nothing, and a present one that walked away reads exactly
@@ -752,7 +772,7 @@ static void AnnouncePass()
            standing just outside it read !mineLoaded while the peer still held its sector, so the withdraw leg fired
            and the re-announce leg (which did not test mineLoaded at all) undid it on the next pass - 26 SPAWNs and 26
            UNLOADs per uid in T221. The two legs now use the SAME predicate, read live. */
-        const bool mineLoaded = coop::IsPositionLoadedHere(pos.x, pos.y, pos.z);
+        const bool mineLoaded = coop::IsPositionLoadedHere(dp.x, dp.y, dp.z);
         std::map<unsigned int, int>::iterator it = g_announced.find(uid);
         const int state = (it == g_announced.end()) ? 1 : it->second;   // rows adopted before this code: assume announced
         /* M7a: the pass's rule is cooplive::AnnounceDecide with no reporter gained (the catch-up is the one caller that has one) */
@@ -761,7 +781,7 @@ static void AnnouncePass()
            take; it goes once no other in-world game has the area loaded or this game's forced hand-over of it was refused */
         const bool handoverCase = state == 1 && held && !mineLoaded;
         const int ann = cooplive::AnnounceDecide(held, mineLoaded, state == 1, false,
-                                                 handoverCase && HandoffOtherInWorldHasArea(pos.x, pos.z) == 1, handoverCase && HandoffForcedRefusedFor(uid));
+                                                 handoverCase && HandoffOtherInWorldHasArea(dp.x, dp.z) == 1, handoverCase && HandoffForcedRefusedFor(uid));
         if (ann == cooplive::kAnnHoldForHandover)
         {
             if (it == g_announced.end()) g_announced[uid] = 1;   /* stays marked announced: ReleaseOnPutAway opens its RELEASE and WithdrawHeldUnload sends its UNLOAD */
@@ -769,7 +789,7 @@ static void AnnouncePass()
             if (g_annHeld.insert(std::make_pair(uid, 1)).second && g_annHeldLogged < 60)
             {
                 ++g_annHeldLogged;
-                DebugLog("[P033] announce HOLD uid=" + S(uid) + " - not loaded here, another in-world game has its area loaded: its UNLOAD waits for the hand-over decision (announceHeldForHandover "
+                SW_DEVLOG("[P033] announce HOLD uid=" + S(uid) + " - not loaded here, another in-world game has its area loaded: its UNLOAD waits for the hand-over decision (announceHeldForHandover "
                          + S(g_announceHeldForHandover) + ")");
             }
             continue;
@@ -789,7 +809,7 @@ static void AnnouncePass()
 
 /* stand1 fold (review-stand1 1d): this game's slot has just arrived - every row goes again through the link-up edge's own path; a
    SPAWN held for the slot left its row unannounced, so AnnouncePass re-sends it as well */
-void WorldSyncReannounceAll() { if (g_adoptedCount > 0) g_reannounceAt = 0; DebugLog("[P033] re-announcing " + S(g_adoptedCount) + " rows: this game's slot is now known (stand1 fold)"); }
+void WorldSyncReannounceAll() { if (g_adoptedCount > 0) g_reannounceAt = 0; SW_DEVLOG("[P033] re-announcing " + S(g_adoptedCount) + " rows: this game's slot is now known (stand1 fold)"); }
 
 void WorldSyncTick()
 {
@@ -801,7 +821,7 @@ void WorldSyncTick()
     if (up && !g_linkWasUp && g_adoptedCount > 0)
     {
         g_reannounceAt = 0;
-        DebugLog("[P033] link came up with " + S(g_adoptedCount) + " characters already adopted -"
+        SW_DEVLOG("[P033] link came up with " + S(g_adoptedCount) + " characters already adopted -"
                  " re-announcing them to the peer. Without this the peer never hears about anything"
                  " adopted before it joined.");
     }
@@ -813,7 +833,7 @@ void WorldSyncTick()
         if (s_liveWas && !liveNow && up && g_adoptedCount > 0)
         {
             g_reannounceAt = 0;
-            DebugLog("[P033] this game's world-server link went down - re-announcing " + S(g_adoptedCount) + " characters to the session peer (M7a fold F3)");
+            SW_DEVLOG("[P033] this game's world-server link went down - re-announcing " + S(g_adoptedCount) + " characters to the session peer (M7a fold F3)");
         }
         s_liveWas = liveNow;
     }
@@ -874,7 +894,7 @@ void WorldSyncTick()
         // adopted as suppressed puppets and driven every tick, and the drift they do show is
         // already explained by adoption distance (F294), not by their container.
             if (coopslot::WireLacksSlot(WireFactionName(f))) { coop::NoteHeldForSlot(); g_announced[row.uid] = 0; continue; }   /* stand1 fold (1d): held, not dropped */
-            if (!PeerHoldsSectorOf(pos)) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
+            if (!PeerHoldsSectorOf(AnnounceDecisionPos(c, pos))) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
             SendContextFor(row.uid, c);   // M-B: CONTEXT before SPAWN, same reliable channel, so the copy is created with it
             if (net::SendSpawn(row.uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c))
             {
@@ -885,7 +905,7 @@ void WorldSyncTick()
         if (g_reannounceAt >= g_adoptedCount)
         {
             g_reannounceAt = -1;
-            DebugLog("[P033] re-announce complete: " + S(g_reannounced) + " sent in total.");
+            SW_DEVLOG("[P033] re-announce complete: " + S(g_reannounced) + " sent in total.");
         }
     }
 
@@ -918,7 +938,7 @@ void WorldSyncTick()
     if (!isHost && !g_refusedClient)
     {
         g_refusedClient = true;
-        DebugLog("[P033] sweep: player-faction characters + world characters in areas this game holds (decision 33)");
+        SW_DEVLOG("[P033] sweep: player-faction characters + world characters in areas this game holds (decision 33)");
     }
 
     if (!PlausiblePtr(coop::GameWorldPtr())) return;
@@ -947,7 +967,7 @@ void WorldSyncTick()
         if (haveRef && nowE - lastEye >= 10.0)
         {
             lastEye = nowE; const Sector se = SectorOf(eye.x, eye.z); g_p22EyeMine = (HeldByOtherTS(se) == 0);   /* P022 */
-            DebugLog("[PROBE] P021 eye sector " + S((long long)se.x) + "," + S((long long)se.y) + " held=" + S((long long)HeldByOtherTS(se)) + " listSize=" + S((long long)n)
+            SW_DEVLOG("[PROBE] P021 eye sector " + S((long long)se.x) + "," + S((long long)se.y) + " held=" + S((long long)HeldByOtherTS(se)) + " listSize=" + S((long long)n)
                      + " seen/spawned/guard/rule/radius=" + S(g_p21Seen) + "/" + S(g_p21Spawned) + "/" + S(g_p21Guard) + "/" + S(g_p21Rule) + "/" + S(g_p21Radius));
         }
     }
@@ -985,7 +1005,7 @@ void WorldSyncTick()
                         if (g_p22Logged < 8 && PlausibleObject(*(void**)((char*)c + 0x448)))
                         {
                             ++g_p22Logged; ::Faction* pf = c->getOwnerFactionDirect();
-                            DebugLog("[PROBE] P022 spawned-hit: uid=" + S((long long)su) + " forwardMapAgrees=" + S((long long)(agrees ? 1 : 0)) + " mine=" + S((long long)(net::IsUidMine(su) ? 1 : 0))
+                            SW_DEVLOG("[PROBE] P022 spawned-hit: uid=" + S((long long)su) + " forwardMapAgrees=" + S((long long)(agrees ? 1 : 0)) + " mine=" + S((long long)(net::IsUidMine(su) ? 1 : 0))
                                      + " player=" + S((long long)(IsPlayerFaction(pf) ? 1 : 0)) + " faction='" + (PlausibleObject(pf) ? WireFactionName(pf) : std::string("?")) + "'");
                         }
                     }
@@ -1037,10 +1057,31 @@ void WorldSyncTick()
                         {
                             ++g_sweepContextLogged;
                             const Sector cs = SectorOf(dp.x, dp.z);
-                            DebugLog("[P033] sweep: NOT adopted - a rebuilt person of a context platoon (another game's squad, sector " + S((long long)cs.x) + "," + S((long long)cs.y)
+                            SW_DEVLOG("[P033] sweep: NOT adopted - a rebuilt person of a context platoon (another game's squad, sector " + S((long long)cs.x) + "," + S((long long)cs.y)
                                      + "); noted for the orphan clean-up (sweepContextSkipped=" + S(g_sweepContextSkipped) + "; the first 8 logged)");
                         }
                         OrphanNote((void*)c, dp.x, dp.z);
+                    }
+                    continue;
+                }
+            }
+            /* a person of a save copy whose wake was refused beside this game's live copy of the same squad (store.cpp detour_activate) is
+               never adopted: the live copy runs that person, and adopting this body would announce a second one under a fresh uid. The
+               removal on the next tick destroys the copy with its people. */
+            if (!sweepPlayerF)
+            {
+                SquadView dsv;
+                if (ReadSquadOf(c, &dsv) == 1 && StoreIsWakeDup(dsv.platoon) == 1)
+                {
+                    if (pass == 0)
+                    {
+                        ++g_sweepWakeDupSkipped;
+                        if (g_sweepWakeDupLogged < 8)
+                        {
+                            ++g_sweepWakeDupLogged;
+                            SW_DEVLOG("[P033] sweep: NOT adopted - a person of a refused duplicate wake (a save copy woken beside this game's live copy of the squad); left to its removal (sweepWakeDupSkipped="
+                                     + S(g_sweepWakeDupSkipped) + "; the first 8 logged)");
+                        }
                     }
                     continue;
                 }
@@ -1067,7 +1108,7 @@ void WorldSyncTick()
                             if (g_sweepHandedOverLogged < 8)
                             {
                                 ++g_sweepHandedOverLogged;
-                                DebugLog("[P033] sweep: NOT adopted - a rebuilt person of squad id='" + hid + "', which this game handed to another game (sector "
+                                SW_DEVLOG("[P033] sweep: NOT adopted - a rebuilt person of squad id='" + hid + "', which this game handed to another game (sector "
                                          + S((long long)hs.x) + "," + S((long long)hs.y) + "); noted for the orphan clean-up (sweepHandedOverSkipped=" + S(g_sweepHandedOverSkipped) + "; the first 8 logged)");
                             }
                             OrphanNote((void*)c, dp.x, dp.z);
@@ -1085,7 +1126,7 @@ void WorldSyncTick()
                 if (g_p21Logged < 8)
                 {
                     ++g_p21Logged; const Sector sc = SectorOf(dp.x, dp.z);
-                    DebugLog("[PROBE] P021 refused: sector " + S((long long)sc.x) + "," + S((long long)sc.y) + " held=" + S((long long)HeldByOtherTS(sc))
+                    SW_DEVLOG("[PROBE] P021 refused: sector " + S((long long)sc.x) + "," + S((long long)sc.y) + " held=" + S((long long)HeldByOtherTS(sc))
                              + " isHost=" + S((long long)(isHost ? 1 : 0)) + " pos=" + S((long long)dp.x) + "," + S((long long)dp.z));
                 }
                 // PROBE-END: P021
@@ -1130,7 +1171,7 @@ void WorldSyncTick()
             if (!g_sweepComplete)
             {
                 g_sweepComplete = true;
-                DebugLog("[P033] sweep complete - no un-adopted characters remain. adopted="
+                SW_DEVLOG("[P033] sweep complete - no un-adopted characters remain. adopted="
                          + S(g_adopted));
             }
             return;
@@ -1212,7 +1253,7 @@ void WorldSyncTick()
         // already explained by adoption distance (F294), not by their container.
         const bool slotHeld = coopslot::WireLacksSlot(factionName);   /* stand1 fold (review-stand1 1d): my faction has no slot yet - HELD: the row stays unannounced and is re-sent on release */
         if (slotHeld) coop::NoteHeldForSlot();
-        const bool peerHolds = !slotHeld && PeerHoldsSectorOf(pos);   // M-A step 2: announce only into a sector the peer holds
+        const bool peerHolds = !slotHeld && PeerHoldsSectorOf(AnnounceDecisionPos(best, pos));   // M-A step 2: announce only into a sector the peer holds
         if (!peerHolds) { g_announced[uid] = 0; ++g_withheld; }
         else SendContextFor(uid, best);   // M-B / P064: the context travels with the announcement (same reliable channel)
         if (peerHolds && !net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z, factionName, false, best))
@@ -1239,7 +1280,7 @@ void WorldSyncTick()
         ++done;
         if (g_mode == kModeOnce) --g_budget;
 
-        DebugLog("[P033] adopted uid=" + S(uid) + " '" + templateName + "' fac='" + factionName
+        SW_DEVLOG("[P033] adopted uid=" + S(uid) + " '" + templateName + "' fac='" + factionName
                  + "' pos=" + F1(pos.x) + "," + F1(pos.y) + "," + F1(pos.z)
                  + " distXZ=" + (haveRef ? F1((float)std::sqrt(bestD2)) : std::string("n/a")));
     }
@@ -1311,7 +1352,7 @@ static void RetireStaleUidIfThisRow(const Adopted& row)
         ++g_staleUidSpared;
         char b[96];
         std::sprintf(b, " %p - the uid now names another object %p", row.obj, current);
-        DebugLog("[P034] uid=" + S(row.uid) + " stale row for an OLD object" + std::string(b) + ", so the uid is NOT retired (stale1).");
+        SW_DEVLOG("[P034] uid=" + S(row.uid) + " stale row for an OLD object" + std::string(b) + ", so the uid is NOT retired (stale1).");
         return;
     }
     RetireStaleUid(row.uid);
@@ -1457,7 +1498,7 @@ void ValidateAdopted(int howMany)
                 /* P8m - the peer is owed an UNLOAD for this uid.  Queued, not sent: the send belongs to
                    the announce cadence, and it must survive a link that is down. */
                 RetireWithdrawNote(row.uid, cooprw::kEvRetire);
-                DebugLog("[P034] uid=" + S(row.uid) + " RETIRED - its handle no longer resolves."
+                SW_DEVLOG("[P034] uid=" + S(row.uid) + " RETIRED - its handle no longer resolves."
                          " Nothing will dereference this pointer again. This may be destruction OR"
                          " a region streaming out; it is re-checked and restored if it comes back.");
             }
@@ -1475,7 +1516,7 @@ void ValidateAdopted(int howMany)
                    simply forgotten and the existing re-announce leg of AnnouncePass sends the SPAWN again
                    once the sector is held and loaded (state == 0 && held && mineLoaded). */
                 RetireWithdrawNote(row.uid, cooprw::kEvRestore);
-                DebugLog("[P034] uid=" + S(row.uid) + " RESTORED - the handle resolves again to the"
+                SW_DEVLOG("[P034] uid=" + S(row.uid) + " RESTORED - the handle resolves again to the"
                          " same object, so the earlier failure was transient (streamed out and"
                          " back), NOT destruction.");
             }
@@ -1543,7 +1584,7 @@ static std::string OrphanReportTokenWs()
 void ReportWorldSync()
 {
     const char* mode = (g_mode == kModeOff) ? "off" : (g_mode == kModeOnce ? "once" : "on");
-    DebugLog(std::string("[P033] REPORT mode=") + mode
+    SW_DEVLOG(std::string("[P033] REPORT mode=") + mode
              + " budgetLeft=" + S(g_budget)
              + " adopted=" + S(g_adopted)
              + " sweepComplete=" + S(g_sweepComplete ? 1 : 0)
@@ -1564,7 +1605,7 @@ void ReportWorldSync()
              + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " p22[stale,real]=" + S(g_p22Stale) + "," + S(g_p22Real) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
              + " falseGone=" + S(g_falseGone)
              + " sweepStandInSkipped=" + S(g_sweepStandInSkipped)   /* inv7a-b */
-             + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
+             + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
              + OrphanReportTokenWs()   /* orphan1: orphan[removed,skipped,gatedHeldUnlinked]= */
              + " reannounceSkippedNotMine=" + S(g_reannounceSkippedNotMine)
              + " stale1[rowsSuperseded,staleUidSpared]=" + S(g_rowsSuperseded) + "," + S(g_staleUidSpared)
@@ -1652,7 +1693,7 @@ void WorldsyncWorldTeardown()
     g_retireWithdraw.clear();
     g_sweepAdoptGen.clear();   /* inv7e2: the world these adoptions came from is gone */
 
-    DebugLog("[P033] world teardown: forgot " + S((long long)rows)
+    SW_DEVLOG("[P033] world teardown: forgot " + S((long long)rows)
              + " adopted liveness rows and " + S((long long)announced) + " announce marks");
 }
 
@@ -1754,7 +1795,7 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
     if (!cooplive::CatchupAnswerFirstOnLink(&g_cuAnsweredRecent, &s_cuAnsweredGen, StoreNotebookLinkGen(), a.slot, a.askNo))
     {
         ++g_cuDedup;
-        DebugLog("[P033] catch-up #" + S((long long)a.askNo) + " for slot " + S((long long)a.slot) + ": already answered - not answered twice (catchUpState dedup " + S(g_cuDedup) + ")");
+        SW_DEVLOG("[P033] catch-up #" + S((long long)a.askNo) + " for slot " + S((long long)a.slot) + ": already answered - not answered twice (catchUpState dedup " + S(g_cuDedup) + ")");
         return;
     }
     SquadLeadReannounce(a.keys);   /* M7a A1 build 1 [a1b1-ws0] [review F7]: a game that newly has the area hears the leaders of the squads there again (handoff.cpp; fold 1 [a1b1f1-ws0] [F5]: only those) */
@@ -1780,7 +1821,7 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
         ++mine;
         std::map<unsigned int, int>::iterator an = g_announced.find(uid);
         const int state = (an == g_announced.end()) ? 1 : an->second;
-        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), PeerHoldsSectorOf(pos), coop::IsPositionLoadedHere(pos.x, pos.y, pos.z), state == 1);
+        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), PeerHoldsSectorOf(AnnounceDecisionPos(c, pos)), AnnounceLoadedHere(c, pos), state == 1);
         if (ann == cooplive::kCatchupHeld)   /* item 2: the receiver may already run it - named, and re-sent here when the hand-over settles */
         {
             ++held; ++g_cuHeld;
@@ -1809,7 +1850,7 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
     std::vector<char> eb;
     const bool sent = cooplive::CatchupEndEncode(&eb, end) && StoreSendLive(cooplive::kRouteSlot, a.slot, cooplive::kInnerCatchupEnd, eb, true);
     StoreNoteCatchupAnswer(true, sent, sentChars);
-    DebugLog("[P033] catch-up #" + S((long long)a.askNo) + " for slot " + S((long long)a.slot) + ": " + S((long long)a.keys.size()) + " sectors, "
+    SW_DEVLOG_OR_FAIL(failed > 0 || !sent, "[P033] catch-up #" + S((long long)a.askNo) + " for slot " + S((long long)a.slot) + ": " + S((long long)a.keys.size()) + " sectors, "
              + S(mine) + " of this game's characters stand there - " + S(resent) + " re-sent to that game (SLOT), " + S(announced) + " announced (AREA), "
              + S(held) + " held (a hand-over in flight), " + S(failed) + " failed - CATCHUP_END " + (sent ? "sent" : "NOT sent (no notebook road)"));
 }
@@ -1851,7 +1892,7 @@ void WorldsyncCatchupReverseTick()
         ++done;
         std::map<unsigned int, int>::iterator an = g_announced.find(uid);
         const int state = (an == g_announced.end()) ? 1 : an->second;
-        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), PeerHoldsSectorOf(pos), coop::IsPositionLoadedHere(pos.x, pos.y, pos.z), state == 1);
+        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), PeerHoldsSectorOf(AnnounceDecisionPos(c, pos)), AnnounceLoadedHere(c, pos), state == 1);
         if (ann != cooplive::kAnnResend && ann != cooplive::kAnnSpawn) continue;
         GameData* gd = 0; Faction* f = 0;
         if (!CatchupWire(c, &gd, &f)) { ++g_cuWireReadFailed; continue; }   /* fold 4: counted, as the ask's are */
@@ -1867,7 +1908,7 @@ void WorldsyncCatchupReverseTick()
     ++g_cuReverse; g_cuReverseChars += g_cuRevPassResent; g_cuReverseAnnounced += g_cuRevPassAnnounced; g_cuFailed += g_cuRevPassFailed;
     /* fold 4 (T760 V7): a round that stopped at the budget is written too, so a round that sent nothing can be read */
     if (g_cuRevPassResent + g_cuRevPassAnnounced + g_cuRevPassFailed > 0 || g_cuRevPassBudgetHits > 0)
-        DebugLog("[P033] reverse catch-up #" + S((long long)g_cuRevAsk) + ": " + S((long long)g_cuRevActive.size()) + " sectors newly in this game's delivery area - "
+        SW_DEVLOG_OR_FAIL(g_cuRevPassFailed > 0, "[P033] reverse catch-up #" + S((long long)g_cuRevAsk) + ": " + S((long long)g_cuRevActive.size()) + " sectors newly in this game's delivery area - "
                  + S(g_cuRevPassResent) + " of its characters there re-sent (AREA), " + S(g_cuRevPassAnnounced) + " announced, " + S(g_cuRevPassFailed)
                  + " failed (M7a2; fold 1: walked in the session tick, " + S(kCuRevBudget) + " a tick, budgetHit " + S(g_cuRevBudgetHit) + ")"
                  + (g_cuRevPassBudgetHits > 0 ? std::string(", budget hits ") + S(g_cuRevPassBudgetHits) + (g_cuRevPassResent + g_cuRevPassAnnounced + g_cuRevPassFailed == 0 ? ", all kept" : "") : std::string()));
@@ -1893,7 +1934,7 @@ void WorldsyncCatchupHandoverSettled(unsigned int uid)
         if (CatchupSendState(uid, c, gd, f, pos)) { ++sentN; ++g_cuHeldResent; } else ++g_cuFailed;
         net::CharStreamToSlot(-1);
     }
-    DebugLog("[P033] catch-up: uid=" + S((long long)uid) + " held back by a hand-over in flight - the hand-over settled, its state re-sent to "
+    SW_DEVLOG("[P033] catch-up: uid=" + S((long long)uid) + " held back by a hand-over in flight - the hand-over settled, its state re-sent to "
              + S(sentN) + " of " + S((long long)slots.size()) + " askers (M7a2)");
 }
 
@@ -1999,7 +2040,7 @@ int WorldsyncPeerGone(int slot)
     coop::ZonesForgetEffectiveMask(slot);   /* M8: only the departed link peer's bit when its slot is known; every bit, as before, while it is not */
 
     const int marks = (int)g_announced.size();
-    DebugLog("[P033] peer gone: " + S((long long)marks) + " uids marked NOT announced (the rows"
+    SW_DEVLOG("[P033] peer gone: " + S((long long)marks) + " uids marked NOT announced (the rows"
              " themselves are ours and are kept); a re-announce starts on the next link-up edge");
     return marks;
 }

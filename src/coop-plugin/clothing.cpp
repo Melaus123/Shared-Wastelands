@@ -16,6 +16,7 @@
 #include "store.h"   /* LIMBS: EngineWritesBlocked, StoreIsDeadPod */
 #include "policy.h"   /* LIMBS: PolicyVtableRvaPod / PolicyClassNamePod - the made limb item's RTTI class */
 #include "combat.h"   /* copy3: ReadAnimalAge01 - the animal test (CharacterAnimal getter offset) */
+#include "stats.h"    /* LIMBS: StatsRecalcCopy - a copy's stats recalculated after its limb changes */
 
 #include "coop_log.h"
 #include <stdint.h>   /* mig3: what <core/Functions.h> also brought in */
@@ -760,7 +761,7 @@ static __declspec(noinline) bool ApplyGarmentsBody(::Character* c, const Garment
     ++g_c.applied;
     coop::ItemApplyingLeave(kitPrevApplying);   /* kit2: the marker as it was before this apply */
 
-    DebugLog("[P022] applied garments: wanted=" + S((long long)set.Count())
+    SW_DEVLOG("[P022] applied garments: wanted=" + S((long long)set.Count())
              + " created=" + S(created)
              + " unresolved=" + S(unresolved)
              + " addFailed=" + S(addFailed)
@@ -964,6 +965,7 @@ long long g_limbCallFault = 0, g_limbNoRow = 0, g_limbNoEffect = 0, g_limbItemDe
 long long g_limbCannotRegrow = 0, g_limbNoCrushRoad = 0, g_limbUnnamed = 0, g_limbLogLines = 0;
 long long g_limbQueued = 0, g_limbQueueFull = 0, g_limbDrainBlocked = 0, g_limbNotBuilt = 0, g_limbDeadSkip = 0;
 long long g_limbImplausible = 0, g_limbFitNotRobot = 0, g_limbQualityRefit = 0, g_limbForgot = 0, g_limbTestRuns = 0;
+long long g_limbLevelRefit = 0, g_limbStatsRecalc = 0, g_limbStatsRecalcNot = 0;
 
 /* 1 = states / items read; 0 = no RobotLimbs yet (all four whole); -1 = the read faulted. */
 static int ReadLimbsPod(const void* c, int* states, void** items)
@@ -1045,14 +1047,17 @@ static int LimbSetRobotCall(void* med, int limb, void* item)
     return rc;
 }
 
-/* A robotic limb item from its sid, made as the kit makes a worn item, with the owner's quality. 0 = not made. */
-static Item* LimbMakeItem(::Character* c, const char* sid, float quality)
+/* A robotic limb item from its sid, made as the kit makes a worn item, with the owner's quality. level >= 0 goes into the record
+   before the item is made, as the kit does, because the engine builds a limb at the level its record holds then; -1 leaves the
+   engine's default level. 0 = not made. */
+static Item* LimbMakeItem(::Character* c, const char* sid, float quality, int level)
 {
     GameDataContainer* container = GetScratchContainer(c);
     if (container == 0 || coop::GameWorldPtr() == 0 || !Ptr(coop::GameWorldPtr()->objectFactory)) return 0;
     ::GameData* state = container->newRecord((itemType)kItemStateType, "", "coopitem");
     if (!Obj(state)) return 0;
     state->stringFields[kBaseSidKey] = sid;
+    if (level >= 0) state->intFields[kLevelKey] = level;
     Item* item = coop::GameWorldPtr()->objectFactory->createItem(state);
     if (!Obj(item)) return 0;
     float q = 0.0f, ch = 0.0f, back = 0.0f; int n = 1, fnc = 0; unsigned char un = 0;
@@ -1061,14 +1066,21 @@ static Item* LimbMakeItem(::Character* c, const char* sid, float quality)
     return item;
 }
 
-static void LimbLog(unsigned int uid, unsigned int limb, int step, unsigned char here, unsigned char owner, const char* sid,
-                    unsigned int fromPeer, const char* outcome)
+/* [LIMBS] lines: the first 400, then every 20th - a copy's limb changes are rare, and each one is wanted in the log. */
+static bool LimbLogWanted()
 {
     ++g_limbLogLines;
-    if (g_limbLogLines > 20 && g_limbLogLines % 50 != 0) return;
+    return g_limbLogLines <= 400 || g_limbLogLines % 20 == 0;
+}
+
+/* lv: the owner's level for that limb's item (-1 unknown, printed "?"); written when an item is named. */
+static void LimbLog(unsigned int uid, unsigned int limb, int step, unsigned char here, unsigned char owner, const char* sid,
+                    int lv, unsigned int fromPeer, const char* outcome)
+{
+    if (!LimbLogWanted()) return;
     DebugLog("[LIMBS] uid=" + S((long long)uid) + " " + cooplimb::LimbName(limb) + " " + cooplimb::LimbStepName(step)
              + " here=" + S((long long)here) + " owner=" + S((long long)owner)
-             + ((sid != 0 && sid[0] != 0) ? std::string(" item=") + sid : std::string())
+             + ((sid != 0 && sid[0] != 0) ? std::string(" item=") + sid + " lv=" + (lv >= 0 ? S((long long)lv) : std::string("?")) : std::string())
              + " from peer " + S((long long)fromPeer) + " -> " + outcome + " (line " + S(g_limbLogLines) + ")");
 }
 
@@ -1088,6 +1100,8 @@ const cooplimb::LimbsWire* LimbsOfOwned(unsigned int uid)
         LimbItemSid(it[i], s_w.sid[i]);   /* unreadable = an empty name: the copy leaves that limb alone (unnamed) */
         float q = 0.0f, ch = 0.0f; int n = 1, fnc = 0; unsigned char un = 0;
         if (Obj(it[i]) && ReadItemDetailPod(it[i], &q, &ch, &n, &fnc, &un)) s_w.quality[i] = q;
+        int lv = -1;
+        if (Obj(it[i]) && ItItemLevel(it[i], &lv) == 1 && cooplimb::LimbLevelPlausible(lv)) s_w.level[i] = lv;   /* else -1: unknown */
     }
     ++g_limbCarried;
     return &s_w;
@@ -1150,17 +1164,17 @@ static std::map<unsigned int, LimbWant> s_limbWant;
 const size_t kLimbWantMax = 512;
 
 /* Per copy limb (key uid << 2 | limb): the owner sid that made no item here, or made one that is not a robotic limb - not
-   asked again until the owner's sid changes; and the owner quality a same-item refit was last tried for. MAIN THREAD. */
+   asked again until the owner's sid changes; and the owner quality and level a same-item refit was last tried for. MAIN THREAD. */
 static std::map<unsigned long long, std::string> s_limbBadSid;
-static std::map<unsigned long long, float> s_limbQualityTried;
+static std::map<unsigned long long, std::pair<float, int> > s_limbQualityTried;
 /* Per copy limb: the owner state and sid whose step the engine took without changing the limb - not tried again until the
    owner's word for that limb changes. MAIN THREAD. */
 static std::map<unsigned long long, std::string> s_limbNoEffectTried;
 static std::string LimbWord(unsigned char state, const char* sid) { return std::string(1, (char)('0' + state)) + sid; }
 
 /* The limbtest lever's one armed request (MAIN THREAD). */
-struct LimbTest { bool armed; int kind; unsigned int uid; int limb; char sid[cooplimb::kLimbSidMax + 1]; };
-static LimbTest s_limbTest = { false, 0, 0, 0, { 0 } };
+struct LimbTest { bool armed; int kind; unsigned int uid; int limb; int level; char sid[cooplimb::kLimbSidMax + 1]; };
+static LimbTest s_limbTest = { false, 0, 0, 0, -1, { 0 } };
 
 void ApplyOwnerLimbs(unsigned int uid, int has, const cooplimb::LimbsWire& w, unsigned int fromPeer)
 {
@@ -1243,20 +1257,24 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
         if (st[i] < (int)cooplimb::kLimbOriginal || st[i] > (int)cooplimb::kLimbCrushed) { ++g_limbImplausible; return; }
     const bool dead = StoreIsDeadPod(c) != 0;   /* 1 dead, -1 unreadable: either way no amputation */
     void* med = (char*)c + kLimbMedical;
+    bool changed = false;   /* a limb was amputated, fitted or taken off: the copy's stats are recalculated after the loop */
     for (unsigned int i = 0; i < cooplimb::kLimbCount; ++i)
     {
         char here[cooplimb::kLimbSidMax + 1];
         here[0] = 0;
         const unsigned char cs = (unsigned char)st[i];
         float hereQ = -1.0f;
+        int hereLv = -1;
         if (cs == cooplimb::kLimbReplaced)
         {
             LimbItemSid(it[i], here);
             float q = 0.0f, ch = 0.0f; int n = 1, fnc = 0; unsigned char un = 0;
             if (Obj(it[i]) && ReadItemDetailPod(it[i], &q, &ch, &n, &fnc, &un)) hereQ = q;
+            int lv = -1;
+            if (Obj(it[i]) && ItItemLevel(it[i], &lv) == 1) hereLv = lv;
         }
         const unsigned long long key = ((unsigned long long)uid << 2) | i;
-        const int step = cooplimb::PlanLimbQ(cs, here, hereQ, w.state[i], w.sid[i], w.quality[i]);
+        const int step = cooplimb::PlanLimbQL(cs, here, hereQ, hereLv, w.state[i], w.sid[i], w.quality[i], w.level[i]);
         if (step == cooplimb::kLimbStepNone) { s_limbQualityTried.erase(key); s_limbNoEffectTried.erase(key); continue; }
         if (step == cooplimb::kLimbStepCannotRegrow) { ++g_limbCannotRegrow; continue; }
         if (step == cooplimb::kLimbStepNoCrushRoad) { ++g_limbNoCrushRoad; continue; }
@@ -1264,10 +1282,12 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
         const bool sameItem = step == cooplimb::kLimbStepRefit && here[0] != 0 && std::strcmp(here, w.sid[i]) == 0;
         if (sameItem)
         {
-            std::map<unsigned long long, float>::iterator tried = s_limbQualityTried.find(key);
-            if (tried != s_limbQualityTried.end() && tried->second == w.quality[i]) { ++g_limbFitKnownBad; continue; }
-            s_limbQualityTried[key] = w.quality[i];   /* one try per owner quality: a quality that does not stick is not retried */
-            ++g_limbQualityRefit;
+            const std::pair<float, int> want(w.quality[i], w.level[i]);
+            std::map<unsigned long long, std::pair<float, int> >::iterator tried = s_limbQualityTried.find(key);
+            if (tried != s_limbQualityTried.end() && tried->second == want) { ++g_limbFitKnownBad; continue; }
+            s_limbQualityTried[key] = want;   /* one try per owner quality and level: one that does not stick is not retried */
+            if (cooplimb::LimbQualityDiffers(hereQ, w.quality[i])) ++g_limbQualityRefit;
+            else ++g_limbLevelRefit;
         }
         std::map<unsigned long long, std::string>::iterator bad = s_limbBadSid.find(key);
         if ((step == cooplimb::kLimbStepFit || step == cooplimb::kLimbStepRefit) && bad != s_limbBadSid.end() && bad->second == w.sid[i])
@@ -1285,7 +1305,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
             if (sameItem) s_limbQualityTried.erase(key);
             continue;
         }
-        const char* outcome = "done";
+        std::string outcome = "done";
         bool clear = true;   /* nothing failed: the limb should now be the owner's */
         if (step == cooplimb::kLimbStepAmputate)
         {
@@ -1293,7 +1313,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
             else
             {
                 const int rc = LimbAmputateCall(med, (int)i, false, true);
-                if (rc == 1) { ++g_limbAmputated; outcome = "amputated"; }
+                if (rc == 1) { ++g_limbAmputated; outcome = "amputated"; changed = true; }
                 else { clear = false; if (rc == -2) { ++g_limbNoRow; outcome = "no MedicalSystem_amputate row"; } else { ++g_limbCallFault; outcome = "amputate faulted"; } }
             }
         }
@@ -1303,7 +1323,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
             const int rc = LimbSetRobotCall(med, (int)i, 0);
             if (rc == 1)
             {
-                ++g_limbUnfitted; outcome = "unfitted";
+                ++g_limbUnfitted; outcome = "unfitted"; changed = true;
                 LimbDestroyItem(old, "copy robotic limb taken off: its owner's limb changed (LIMBS)");
             }
             else { clear = false; if (rc == -2) { ++g_limbNoRow; outcome = "no MedicalSystem_setRobotLimbItem row"; } else { ++g_limbCallFault; outcome = "setRobotLimbItem (off) faulted"; } }
@@ -1315,7 +1335,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
             {
                 /* the new item first: the fitted limb comes off only once its replacement exists and is a robotic limb */
                 const long prev = ItemApplyingEnter();
-                Item* item = LimbMakeItem(c, w.sid[i], w.quality[i]);
+                Item* item = LimbMakeItem(c, w.sid[i], w.quality[i], w.level[i]);   /* -1 (a version 1 owner): the default level */
                 ItemApplyingLeave(prev);
                 char cls[96];
                 cls[0] = 0;
@@ -1334,7 +1354,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
                         const int rc = LimbSetRobotCall(med, (int)i, 0);
                         if (rc == 1)
                         {
-                            ++g_limbUnfitted;
+                            ++g_limbUnfitted; changed = true;
                             LimbDestroyItem(old, "copy robotic limb taken off: its owner's limb changed (LIMBS)");
                         }
                         else
@@ -1346,7 +1366,14 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
                     if (off)
                     {
                         const int rc = LimbSetRobotCall(med, (int)i, item);
-                        if (rc == 1) { ++g_limbFitted; outcome = sameItem ? "refitted at the owner's quality" : "fitted"; }
+                        if (rc == 1)
+                        {
+                            ++g_limbFitted; changed = true;
+                            int madeLv = -1;
+                            const bool haveLv = ItItemLevel(item, &madeLv) == 1;
+                            outcome = std::string(sameItem ? "refitted at the owner's quality / level" : "fitted")
+                                      + " (lv here " + (haveLv ? S((long long)madeLv) : std::string("?")) + ")";
+                        }
                         else
                         {
                             clear = false; ++g_limbCallFault; outcome = "setRobotLimbItem (on) faulted";
@@ -1371,7 +1398,21 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
                 outcome = "called, but the limb did not change - not tried again until the owner's limb changes";
             }
         }
-        LimbLog(uid, i, step, cs, w.state[i], w.sid[i], fromPeer, outcome);
+        LimbLog(uid, i, step, cs, w.state[i], w.sid[i], w.level[i], fromPeer, outcome.c_str());
+    }
+    /* a limb fitted, refitted or taken off changes the stats the engine derives (strength / dexterity / athletics effects,
+       run speed); the owner's engine recalculates them, and the copy is recalculated here so it does not wait on the engine */
+    if (changed)
+    {
+        const int rc = StatsRecalcCopy(uid, c);
+        if (rc == 1 || rc == 2 || rc == -2) ++g_limbStatsRecalc;
+        else ++g_limbStatsRecalcNot;
+        if (LimbLogWanted())
+            DebugLog("[LIMBS] uid=" + S((long long)uid) + " stats recalculated after the limb change -> "
+                     + (rc == 1 ? std::string("recalc+medical") : rc == 2 ? std::string("recalc only (medical object not the expected one)")
+                        : rc == 0 ? std::string("not recalculated (refused, no stats object, or vftable not an expected one)")
+                        : rc == -2 ? std::string("recalc ran, medical push faulted") : std::string("recalc faulted"))
+                     + " (line " + S(g_limbLogLines) + ")");
     }
     CopyBodyNoteModApply(uid, c);   // a rebuild the limb apply queued is held in ragdoll whoever owns it
 }
@@ -1384,7 +1425,8 @@ static std::string LimbF(float v)
     return o.str();
 }
 
-/* "leftArm=0 rightArm=2(95748-Newwworld.mod q=0.5) ..." - the four limb states and each fitted item's sid and quality. */
+/* "leftArm=0 rightArm=2(95748-Newwworld.mod q=0.5 lv=40) ..." - the four limb states and each fitted item's sid, quality and
+   level (the engine's getLevel; "?" when unreadable). */
 static std::string LimbStateText(::Character* c)
 {
     int st[cooplimb::kLimbCount]; void* it[cooplimb::kLimbCount];
@@ -1400,7 +1442,10 @@ static std::string LimbStateText(::Character* c)
         LimbItemSid(it[i], sid);
         float q = 0.0f, ch = 0.0f; int n = 1, fnc = 0; unsigned char un = 0;
         const bool haveQ = Obj(it[i]) && ReadItemDetailPod(it[i], &q, &ch, &n, &fnc, &un);
-        out += "(" + std::string(sid[0] != 0 ? sid : "?") + " q=" + (haveQ ? LimbF(q) : std::string("?")) + ")";
+        int lv = 0;
+        const bool haveLv = Obj(it[i]) && ItItemLevel(it[i], &lv) == 1;
+        out += "(" + std::string(sid[0] != 0 ? sid : "?") + " q=" + (haveQ ? LimbF(q) : std::string("?"))
+               + " lv=" + (haveLv ? S((long long)lv) : std::string("?")) + ")";
     }
     return out;
 }
@@ -1414,7 +1459,8 @@ static void LimbTestDrain()
     ++g_limbTestRuns;
     const std::string head = std::string("[LIMB] limbtest ") + (t.kind == cooplimb::kLimbTestCut ? "cut" : "fit")
                              + " uid=" + S((long long)t.uid) + " " + cooplimb::LimbName((unsigned int)t.limb)
-                             + (t.kind == cooplimb::kLimbTestFit ? std::string(" item=") + t.sid : std::string());
+                             + (t.kind == cooplimb::kLimbTestFit ? std::string(" item=") + t.sid : std::string())
+                             + (t.kind == cooplimb::kLimbTestFit && t.level >= 0 ? " level=" + S((long long)t.level) : std::string());
     ::Character* c = 0;
     const char* why = 0;
     int st[cooplimb::kLimbCount]; void* it[cooplimb::kLimbCount];
@@ -1445,7 +1491,7 @@ static void LimbTestDrain()
     else
     {
         const long prev = ItemApplyingEnter();
-        Item* item = LimbMakeItem(c, t.sid, -1.0f);   /* the item's own default quality */
+        Item* item = LimbMakeItem(c, t.sid, -1.0f, t.level);   /* the item's own default quality; level= or the default level */
         ItemApplyingLeave(prev);
         char cls[96];
         cls[0] = 0;
@@ -1496,11 +1542,12 @@ std::string LimbTestLever(const std::string& args)
     unsigned int uid = 0;
     int limb = -1;
     std::string sid;
-    const int kind = cooplimb::LimbTestParse(args, &uid, &limb, &sid);
+    int level = -1;
+    const int kind = cooplimb::LimbTestParse(args, &uid, &limb, &sid, &level);
     if (kind == cooplimb::kLimbTestBad)
     {
-        DebugLog("[cmd] usage: limbtest cut <ownUid> <limb 0-3> | limbtest fit <ownUid> <limb 0-3> <robotLimbSid> | limbtest show <uid>"
-                 " (limb 0 left arm, 1 right arm, 2 left leg, 3 right leg)");
+        DebugLog("[cmd] usage: limbtest cut <ownUid> <limb 0-3> | limbtest fit <ownUid> <limb 0-3> <robotLimbSid> [level=<0..1000>]"
+                 " | limbtest show <uid> (limb 0 left arm, 1 right arm, 2 left leg, 3 right leg)");
         return "error limbtest usage";
     }
     if (kind == cooplimb::kLimbTestShow)
@@ -1529,13 +1576,15 @@ std::string LimbTestLever(const std::string& args)
     s_limbTest.kind = kind;
     s_limbTest.uid = uid;
     s_limbTest.limb = limb;
+    s_limbTest.level = (kind == cooplimb::kLimbTestFit) ? level : -1;
     cooplimb::LimbsWire scratch;
     cooplimb::LimbsClear(&scratch);
     cooplimb::LimbSetSid(&scratch, 0, sid.c_str());
     std::memcpy(s_limbTest.sid, scratch.sid[0], sizeof s_limbTest.sid);
     s_limbTest.armed = true;
     DebugLog(std::string("[LIMB] limbtest ") + what + " uid=" + S((long long)uid) + " " + cooplimb::LimbName((unsigned int)limb)
-             + (kind == cooplimb::kLimbTestFit ? " item=" + sid : std::string()) + " armed for the K2 safe point");
+             + (kind == cooplimb::kLimbTestFit ? " item=" + sid : std::string())
+             + (kind == cooplimb::kLimbTestFit && level >= 0 ? " level=" + S((long long)level) : std::string()) + " armed for the K2 safe point");
     return std::string("ok limbtest ") + what + " armed";
 }
 
@@ -1585,13 +1634,14 @@ static void ReportLimbCounters()
              + " safePoint[queued,queueFull,blockedDropped,notBuilt,deadSkip,implausible,forgot]=" + S(g_limbQueued) + "," + S(g_limbQueueFull) + ","
              + S(g_limbDrainBlocked) + "," + S(g_limbNotBuilt) + "," + S(g_limbDeadSkip) + "," + S(g_limbImplausible) + "," + S(g_limbForgot)
              + " fitNotRobot=" + S(g_limbFitNotRobot) + " noEffectKept=" + S(g_limbNoEffectKept) + " qualityRefit=" + S(g_limbQualityRefit) + " limbtestRuns=" + S(g_limbTestRuns)
+             + " levelRefit=" + S(g_limbLevelRefit) + " statsRecalc[done,not]=" + S(g_limbStatsRecalc) + "," + S(g_limbStatsRecalcNot)
              + " gate[refused,applying,passed]=" + S((long long)g_copyAmputateRefused) + "," + S((long long)g_copyAmputateApplying) + ","
              + S((long long)g_copyAmputatePassed));
 }
 
 void ReportClothingCounters()
 {
-    DebugLog("[P022] REPORT captured=" + S(g_c.captured)
+    SW_DEVLOG("[P022] REPORT captured=" + S(g_c.captured)
              + " itemsCaptured=" + S(g_c.itemsCaptured)
              + " applied=" + S(g_c.applied)
              + " itemsCreated=" + S(g_c.itemsCreated)

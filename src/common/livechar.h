@@ -72,6 +72,26 @@ inline bool DoomEnds(bool resolvesToSelf, bool inUpdateList)
 {
     return !resolvesToSelf && !inUpdateList;
 }
+// The engine is about to destroy the object at an address the registry holds a row for. The address alone names the row, not
+// the character: a dead row keeps its address (a character that streamed out comes back under its uid), and the engine hands a
+// freed address to any later object. The object's own CHARACTER handle, read while it is whole, against the handle the row
+// stored at registration decides, by serial as SameStored does:
+//   kDestroyIsRow   - the same serial: the row's character. Also a LIVE row that stored no handle when the object reads as a
+//                     character: nothing to compare, and a live row names an address nothing has reported gone.
+//   kDestroyNotRow  - another serial, or the object has no CHARACTER handle (a live row that stored none included): another
+//                     object lives at this address. The row can never be its character again and the destroy is not ours.
+//   kDestroyNoProof - a DEAD row that stored no handle: it was withdrawn because its handle stopped resolving, so the address
+//                     may hold anything by now and nothing proves this object is the row's character. Not ours.
+enum DestroyIdentity { kDestroyIsRow = 0, kDestroyNotRow = 1, kDestroyNoProof = 2 };
+inline int DestroyIdentityOf(bool rowDead, unsigned int rowIndex, unsigned int rowSerial, bool objRead, unsigned int objIndex,
+                             unsigned int objSerial)
+{
+    if (rowIndex == 0 && rowSerial == 0) return rowDead ? kDestroyNoProof : (objRead ? kDestroyIsRow : kDestroyNotRow);
+    if (!objRead) return kDestroyNotRow;
+    return SameStored(rowIndex, rowSerial, objIndex, objSerial) ? kDestroyIsRow : kDestroyNotRow;
+}
+inline bool DestroyAnswersUid(int v) { return v == kDestroyIsRow; }   // the row's uid is the answer (drop, announce)
+inline bool DestroyMarksRow(int v)   { return v == kDestroyNotRow; }  // another object owns the address: the row is finished
 // The names the REPORT line prints, in Verdict order.
 inline const char* VerdictName(int v)
 {

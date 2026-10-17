@@ -44,12 +44,14 @@ def make_tree(name):
     sources (so they are current)."""
     t = os.path.join(ROOT, name, "tree")
     src = {
-        ".gitignore": "*.dll\nsrc/installer/*.exe\n",
+        ".gitignore": "*.dll\nsrc/installer/*.exe\nsrc/coop-store/*.exe\n",   # T-896: the world server is built, never committed
         "src/coop-plugin/coop.cpp": '#include "loadermarker.h"\nint x;\n',
         "src/coop-plugin/build.bat": "rem build\n",
         "src/coop-plugin/third_party/enet/LICENSE": "ENet MIT licence text\n",
         "src/coop-plugin/third_party/minhook/LICENSE.txt": "MinHook BSD licence text\n",
         "src/coop-plugin/third_party/ogre-mygui/include/mygui/COPYING.MIT": "MyGUI MIT licence text\n",
+        "src/coop-plugin/third_party/ogre-mygui/OGRE-LICENSE.txt": "Ogre MIT licence text\n",
+        "THIRD-PARTY-NOTICES.txt": "third-party notices\n",
         "src/common/loadermarker.h": '#include "modsenabled.h"\n',
         "src/common/modsenabled.h": "/* mods */\n",
         "src/common/installtext.h": "/* install text */\n",
@@ -60,7 +62,6 @@ def make_tree(name):
         "src/common/clockmath.cpp": '#include "clockmath.h"\n',
         "src/common/clockmath.h": "/* clock */\n",
         "src/common/shopwire.h": "/* plugin only */\n",
-        "src/coop-store/SharedWastelandsServer.exe": b"MZ store stub",
         "mod-package/Shared Wastelands/Shared Wastelands.mod": b"\x10\x00mod",
         "mod-package/Shared Wastelands/_Shared Wastelands.info": "<info/>\n",
         "mod-package/Shared Wastelands/shared-wastelands.loader.txt": "# marker\nformat=1\ndll=SharedWastelands.dll\nstart=coopEarlyStart\n",
@@ -82,6 +83,7 @@ def make_tree(name):
     write(os.path.join(t, "src/coop-plugin/SharedWastelands.dll"), b"MZ plugin stub\x00coopEarlyStart\x00startPlugin\x00")
     write(os.path.join(t, "src/kenshi-loader/SharedWastelandsLoader.dll"), b"MZ loader stub")
     write(os.path.join(t, "src/installer/SharedWastelandsSetup.exe"), b"MZ setup stub")
+    write(os.path.join(t, "src/coop-store/SharedWastelandsServer.exe"), b"MZ store stub")   # T-896: a build output like the rest
     now = time.time() + 5   # build outputs clearly newer than every source
     for rel in ("src/coop-plugin/SharedWastelands.dll", "src/kenshi-loader/SharedWastelandsLoader.dll",
                 "src/installer/SharedWastelandsSetup.exe", "src/coop-store/SharedWastelandsServer.exe"):
@@ -113,7 +115,8 @@ class BuildPackage(unittest.TestCase):
         manifest = os.path.join(out, "pkg", "PACKAGE-MANIFEST.txt")   # beside the mod folder, not in it (owner 244)
         for f in ("SharedWastelands.dll", "SharedWastelandsLoader.dll", "SharedWastelandsSetup.exe", "SharedWastelandsServer.exe", "Shared Wastelands.mod",
                   "_Shared Wastelands.info", "shared-wastelands.loader.txt", "title-background.png", "RE_Kenshi.json", "addresses/signatures.sig",
-                  "licenses/ENet-LICENSE.txt", "licenses/MinHook-LICENSE.txt", "licenses/MyGUI-COPYING.MIT.txt"):
+                  "licenses/ENet-LICENSE.txt", "licenses/MinHook-LICENSE.txt", "licenses/MyGUI-COPYING.MIT.txt",
+                  "licenses/Ogre-LICENSE.txt", "THIRD-PARTY-NOTICES.txt"):
             self.assertTrue(os.path.isfile(os.path.join(mod, f)), f)
         self.assertFalse(os.path.exists(os.path.join(mod, "PACKAGE-MANIFEST.txt")), "the manifest is inside the mod folder")
         self.assertEqual(sorted(os.listdir(os.path.join(out, "pkg"))), ["PACKAGE-MANIFEST.txt", "Shared Wastelands"])
@@ -157,8 +160,8 @@ class BuildPackage(unittest.TestCase):
     def test_store_staleness_follows_its_includes(self):
         t = make_tree("walk")
         out = os.path.join(ROOT, "walk", "out")
-        # a later commit to a header the plugin compiles and SharedWastelandsServer.exe does not: the (untracked, by write time) DLL is
-        # stale, the (committed, by history) SharedWastelandsServer.exe is not
+        # a later change to a header the plugin compiles and SharedWastelandsServer.exe does not: the DLL is stale, the exe is not
+        # (both asked by write time - T-896: nothing is committed)
         write(os.path.join(t, "src/common/shopwire.h"), "/* plugin only, changed */\n")
         git(t, "commit", "-q", "-am", "shopwire")
         later = time.time() + 60   # written after the stub build outputs (make_tree dates them 5 s ahead)
@@ -167,22 +170,40 @@ class BuildPackage(unittest.TestCase):
         self.assertEqual(rc, 1, text)
         self.assertIn("STALE: src/coop-plugin/SharedWastelands.dll", text)
         self.assertNotIn("SharedWastelandsServer.exe", text)
-        # a later commit to a header reached from a .cpp the store's build.bat names: the committed exe is stale
+        # a later change to a header reached from a .cpp the store's build.bat names: the exe is stale
         write(os.path.join(t, "src/common/clockmath.h"), "/* clock, changed */\n")
         git(t, "commit", "-q", "-am", "clockmath change")
+        os.utime(os.path.join(t, "src/common/clockmath.h"), (later, later))
         rc, text = run(t, out)
         self.assertEqual(rc, 1, text)
-        self.assertIn("STALE: the committed src/coop-store/SharedWastelandsServer.exe", text)
-        self.assertIn("clockmath change", text)
+        self.assertIn("STALE: src/coop-store/SharedWastelandsServer.exe", text)
+        self.assertIn("src\\common\\clockmath.h", text)
         self.assert_nothing_left(out)
 
-    def test_committed_exe_checked_out_after_is_not_stale(self):
+    def test_server_exe_is_built_never_taken_from_a_checkout(self):
+        # T-896 (owner decision 900): an exe older than its sources (as a checkout leaves a committed one) is refused - build it
         t = make_tree("order")
-        old = time.time() - 3600   # git wrote the exe BEFORE its source in the same checkout: not a stale build
+        old = time.time() - 3600
         os.utime(os.path.join(t, "src/coop-store/SharedWastelandsServer.exe"), (old, old))
         out = os.path.join(ROOT, "order", "out")
         rc, text = run(t, out)
-        self.assertEqual(rc, 0, text)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("STALE: src/coop-store/SharedWastelandsServer.exe", text)
+        self.assertIn("src\\coop-store\\build.bat", text)
+        self.assert_nothing_left(out)
+        # not built at all: refused, naming the build
+        os.remove(os.path.join(t, "src/coop-store/SharedWastelandsServer.exe"))
+        rc, text = run(t, out)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("MISSING: src/coop-store/SharedWastelandsServer.exe is not built in this tree - run src\\coop-store\\build.bat", text)
+        self.assert_nothing_left(out)
+
+    def test_this_repo_never_commits_the_server_exe(self):
+        # T-896: the mod history does not track the world server, and its .gitignore keeps a built one out
+        repo = os.path.join(HERE, "..")
+        exe = "src/coop-store/SharedWastelandsServer.exe"
+        self.assertEqual(subprocess.run(["git", "-C", repo, "ls-files", "--", exe], capture_output=True, text=True).stdout.strip(), "")
+        self.assertEqual(subprocess.run(["git", "-C", repo, "check-ignore", "--no-index", "-q", exe]).returncode, 0)
 
     def test_refuses_pre_loader_dll(self):
         t = make_tree("old")

@@ -18,6 +18,8 @@
 
 #include <cstring>
 #include <map>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace coopsquad {
@@ -268,6 +270,206 @@ inline int ResendMayGo(int passRan, int squadSeen, int gate)
 inline int LeadHasAfterRelease(unsigned int recordFormal, unsigned int releasedUid, int has)
 {
     return (has != 0 && recordFormal == releasedUid) ? 0 : has;
+}
+
+/* ---- T-799 (owner 793 a and its clarification): shopkeepers with no money or no goods ---- */
+/* D1, THE MONEY-KNOWN MARK. A squad pot's money is known on this game once the engine's restock ran here (it SETS the pot), the
+   other game's announced value was written into it (a copy write, the take-over adoption, the area holder's restock - D4), the
+   engine read the group's saved money itself (kMoneyEvEngineLoaded: the state record's "money", 0x623BB0, for a group the engine
+   loaded from the save by itself), or the group was made or overridden from one of the mod's records that carries its money and
+   that money went in (kMoneyEvRecordApplied). A group made or overridden from a record that does not carry it (an older record), or
+   whose money did not go in, holds whatever that load left - often 0 - so its mark is cleared (kMoneyEvRecordNoMoney); a freed pot's
+   mark goes with it (kMoneyEvGone - its address may be reused). While the mark is unset this game's announcement carries no money
+   (hasCats 0) and every copy keeps its own value. A group the engine loaded from a save made while its money was not known on this
+   game (kMoneyEvSavedUnknown: its world id is in the list written beside that save, MoneyUnknownAtSave) holds that unknown value
+   again - its mark is cleared too. */
+const int kMoneyEvNone = 0, kMoneyEvRestockHere = 1, kMoneyEvPeerWritten = 2, kMoneyEvEngineLoaded = 3, kMoneyEvRecordApplied = 4,
+          kMoneyEvRecordNoMoney = 5, kMoneyEvGone = 6, kMoneyEvSavedUnknown = 7;
+const int kMoneyEvKinds = 8;
+inline int MoneyKnownAfter(int known, int ev)
+{
+    if (ev == kMoneyEvRecordNoMoney || ev == kMoneyEvGone || ev == kMoneyEvSavedUnknown) return 0;
+    return (known != 0 || ev == kMoneyEvRestockHere || ev == kMoneyEvPeerWritten || ev == kMoneyEvEngineLoaded || ev == kMoneyEvRecordApplied) ? 1 : 0;
+}
+/* The road a group's people container was read by (store.cpp detour_loadFromDisk). kLoadRoadRecord: one of the mod's notebook
+   records, read in place of the save's file (a LOAD-OVERRIDE). kLoadRoadEngineFile: the save's own file. kLoadRoadOwnOverlay: the
+   player's own record, or a pending strip's copy of the save's file, read in place of it. A people container does not hold the
+   squad's money - the engine saves and loads it in the squad's state record - so on the last two roads the pot holds what the
+   engine read from the save's state record, the same as on the save's own file. */
+const int kLoadRoadEngineFile = 0, kLoadRoadRecord = 1, kLoadRoadOwnOverlay = 2;
+/* The event a group's people container load gives its pot (the engine's own read of the saved money comes earlier, when the platoon
+   is made from its state record). A record read in: known when it carried the money and the write took, else cleared. Any other
+   road: the FIRST load this world of a group the mod did not make (firstLoad 0 for one CreateUnknownSquad made) that is not a
+   context platoon (another game's people, carried by SPAWN, whose money only that game's copy writes give) is the engine's own read
+   of the save - known, unless that save was made while the group's money was not known here (listedUnknown), which clears it. Any
+   later load leaves the mark as it is. */
+inline int LoadMoneyEvent(int road, int carried, int applied, int firstLoad, int context, int listedUnknown)
+{
+    if (road == kLoadRoadRecord) return (carried != 0 && applied != 0) ? kMoneyEvRecordApplied : kMoneyEvRecordNoMoney;
+    if (firstLoad == 0 || context != 0) return kMoneyEvNone;
+    return (listedUnknown != 0) ? kMoneyEvSavedUnknown : kMoneyEvEngineLoaded;
+}
+/* THE LIST BESIDE A SAVE (store.cpp, "multiplayer.money" in the save's folder): the world ids of the groups whose money was not known
+   on this game when the save was made - the engine saved whatever their pots held (often 0), and its own load of that save must not
+   make it known. A group whose money this world decided (made here, or its load seen) is listed by its mark now; one never loaded
+   this world is listed as the loaded save's list had it (its state record still holds what that save held). */
+inline int MoneyUnknownAtSave(int decided, int known, int listedAtLoad)
+{
+    return (decided != 0) ? (known == 0 ? 1 : 0) : (listedAtLoad != 0 ? 1 : 0);
+}
+const char* const kMoneyListHead = "money-unknown 1";
+inline std::string EncodeMoneyList(const std::set<std::string>& ids)
+{
+    std::string s = std::string(kMoneyListHead) + "\n";
+    for (std::set<std::string>::const_iterator it = ids.begin(); it != ids.end(); ++it)
+        if (!it->empty() && it->find('\n') == std::string::npos && it->find('\r') == std::string::npos) s += *it + "\n";
+    return s;
+}
+/* false (and *ids empty) = not a list this build wrote: no head line */
+inline bool DecodeMoneyList(const std::string& text, std::set<std::string>* ids)
+{
+    ids->clear();
+    size_t at = 0;
+    bool head = false;
+    while (at < text.size())
+    {
+        size_t e = text.find('\n', at);
+        if (e == std::string::npos) e = text.size();
+        std::string line = text.substr(at, e - at);
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        at = e + 1;
+        if (!head)
+        {
+            if (line != kMoneyListHead) return false;
+            head = true;
+            continue;
+        }
+        if (!line.empty()) ids->insert(line);
+    }
+    return head;
+}
+/* A group made from a record (store.cpp CreateUnknownSquad): known only when the record carried the money and the engine's read put
+   it into the new pot. */
+inline int MadeMoneyEvent(int carried, int applied)
+{
+    return (carried != 0 && applied != 0) ? kMoneyEvRecordApplied : kMoneyEvRecordNoMoney;
+}
+/* What a record's save does with its squad record's money field (store.cpp RecordMoneyPut / RecordMoneyTake): the pot's money is put
+   when it is carried; when it is not, a field already there (brought by a record read into that container) is taken out, so a pot
+   whose money is unknown never goes out with an older value; after the save the container's field is given back as it was. */
+const int kRecFieldKeep = 0, kRecFieldSet = 1, kRecFieldErase = 2, kRecFieldRestore = 3;
+inline int RecMoneyFieldAtSave(int carry, int had)
+{
+    return (carry != 0) ? kRecFieldSet : (had != 0 ? kRecFieldErase : kRecFieldKeep);
+}
+inline int RecMoneyFieldAfterSave(int atSave, int had)
+{
+    if (atSave == kRecFieldKeep) return kRecFieldKeep;
+    return (had != 0) ? kRecFieldRestore : kRecFieldErase;
+}
+/* D2: a record this game writes carries the group's money only when its pot was read and its money is known here - an unknown 0
+   written into a record would come back as known. */
+inline int RecordCarriesMoney(int potRead, int moneyKnown)
+{
+    return (potRead != 0 && moneyKnown != 0) ? 1 : 0;
+}
+/* 1 = the announcement carries the pot: it was read AND its money is known here. */
+inline int AnnounceCarriesMoney(int potRead, int moneyKnown)
+{
+    return (potRead != 0 && moneyKnown != 0) ? 1 : 0;
+}
+/* D3, THE KEEPER REPAIR: which keeper gets the engine's own restock NOW (its refresh deadline moved to the past, so the engine's
+   next update pass stocks the counters and sets the money). Only the game that runs the group (its formal leader) and holds the
+   shop's area repairs (KeeperRepairGo), once per load per group, and never while a take-over adoption of the other game's value is
+   due (that write is the known value). Money unknown: repaired whatever the counters hold (owner 793 a) - but only for a group whose
+   money this world was decided (decided: made here, or its load seen by this game in a multiplayer role); a group loaded while this
+   game was single player, before the role changed, or whose background load is not yet decided was never judged and is not
+   repaired. Money known: repaired only when the pot is 0 AND the counters hold 0 items (stock: items on the shop's counters, < 0 not
+   read - asked again next pass). */
+const int kKeeperRepairNone = 0, kKeeperRepairMoneyUnknown = 1, kKeeperRepairEmpty = 2;
+inline int KeeperRepairWhy(int runsGroup, int repairedThisLoad, int adoptDue, int potRead, int decided, int moneyKnown, int money, long long stock)
+{
+    if (runsGroup == 0 || repairedThisLoad != 0 || adoptDue != 0 || potRead == 0) return kKeeperRepairNone;
+    if (moneyKnown == 0) return (decided != 0) ? kKeeperRepairMoneyUnknown : kKeeperRepairNone;
+    return (money == 0 && stock == 0) ? kKeeperRepairEmpty : kKeeperRepairNone;
+}
+inline int KeeperRepairGo(int why, int holdsArea)
+{
+    return (holdsArea != 0) ? why : kKeeperRepairNone;
+}
+/* D5 (T-801), A SALE NO COUNTER HAS ROOM FOR: single player takes it - the keeper pays and the item is destroyed. The holder does the
+   same when the shop's counters resolved (resolved > 0), none took a unit (got 0), no add faulted, the quantity was read and the
+   item was made. A caravan's packs are not counters: refused as before. 1 = the sale is taken. */
+inline int SellNoRoomTaken(int resolved, int got, int faulted, int qtyUnread, int itemMade, int caravan)
+{
+    return (resolved > 0 && got == 0 && faulted == 0 && qtyUnread == 0 && itemMade != 0 && caravan == 0) ? 1 : 0;
+}
+/* D4, A RESTOCK ON THE AREA'S HOLDER REACHES THE GAME THAT RUNS THE KEEPER. The engine restocks a shop on the game that holds its
+   area (items.cpp ItRestockHolder), whichever game runs the keeper's formal leader. When another game runs it, the holder sends the
+   money its restock set (MSG_KEEPER_RESTOCK) to the leader's owner, which writes it into its pot (known there: kMoneyEvPeerWritten)
+   and announces it as usual - so the runner's pot is not left where its load left it. 1 = send: the restock ran here, the leader's
+   uid is known and the leader is another game's. */
+inline int HolderRestockSend(int ranHere, int leaderMine, int leaderKnown)
+{
+    return (ranHere != 0 && leaderKnown != 0 && leaderMine == 0) ? 1 : 0;
+}
+/* The runner's answer to an arrived restock: kHrApply when this game runs the leader and read its pot; kHrNotRunner when it does not
+   (a hand-over in flight) - the message goes on to the leader's owner as this game knows it, at most kHolderRestockResendCap times
+   per leader between two restocks written (HolderRestockResend); kHrUnread when the pot is unread (dropped, counted). */
+const int kHrApply = 1, kHrNotRunner = 2, kHrUnread = 3;
+inline int HolderRestockApply(int leaderMine, int potRead)
+{
+    if (leaderMine == 0) return kHrNotRunner;
+    return (potRead != 0) ? kHrApply : kHrUnread;
+}
+const int kHolderRestockResendCap = 4;
+inline int HolderRestockResend(int resentSoFar)
+{
+    return (resentSoFar < kHolderRestockResendCap) ? 1 : 0;
+}
+/* THE RESTOCK AS A CHANGE TAKEN AT ITS ARRIVAL. The holder's restock and its answers to this game's priced requests come from the
+   holder by the same reliable road, in order, so at the restock's arrival every priced request of this game still in flight on the
+   pot is applied by the holder AFTER its restock. The pot as this game announces it (the pot less those requests' predicted moves)
+   must then equal the restocked money: the change owed is cats - announced, taken at the arrival and added to the pot at the next
+   safe point, so every move made here after the arrival (an accepted request, a refused one's undo, a new trade) stays in it. */
+inline long long HolderRestockDelta(int cats, int announcedAtArrival)
+{
+    return (long long)cats - (long long)announcedAtArrival;
+}
+/* 1 = *want is the pot after the change; 0 = out of the pot's range (nothing written) */
+inline int HolderRestockWant(int cur, long long delta, int* want)
+{
+    const long long w = (long long)cur + delta;
+    if (w > 2147483647LL || w < -2147483647LL - 1LL) return 0;
+    *want = (int)w;
+    return 1;
+}
+/* MSG_KEEPER_RESTOCK: u32 formal leader uid | i32 money, little-endian, exactly 8 bytes. A leader of 0 is neither encoded nor read. */
+struct KeeperRestockMsg
+{
+    unsigned int leader;
+    int cats;
+    KeeperRestockMsg() : leader(0), cats(0) {}
+};
+const size_t kKeeperRestockSize = 8;
+inline bool EncodeKeeperRestock(std::vector<char>* b, const KeeperRestockMsg& m)
+{
+    b->clear();
+    if (m.leader == 0) return false;
+    const unsigned int u[2] = { m.leader, (unsigned int)m.cats };
+    for (int i = 0; i < 2; ++i)
+        for (int k = 0; k < 4; ++k) b->push_back((char)((u[i] >> (8 * k)) & 0xFFu));
+    return true;
+}
+inline bool DecodeKeeperRestock(const char* p, size_t n, KeeperRestockMsg* out)
+{
+    if (p == 0 || n != kKeeperRestockSize) return false;
+    unsigned int u[2] = { 0u, 0u };
+    for (int i = 0; i < 2; ++i)
+        for (int k = 0; k < 4; ++k) u[i] |= (unsigned int)(unsigned char)p[4 * i + k] << (8 * k);
+    if (u[0] == 0) return false;
+    out->leader = u[0]; out->cats = (int)u[1];
+    return true;
 }
 
 }   /* namespace coopsquad */
