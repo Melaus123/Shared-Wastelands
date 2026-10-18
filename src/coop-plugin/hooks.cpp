@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "coop_log.h"
+#include "addresses.h"   /* review S3: AddrHookRefusedAt - a call-only row is never hooked */
 
 namespace
 {
@@ -16,6 +17,7 @@ namespace
     volatile LONG64 g_hookIdent   = 0;   /* InterlockedIncrement64 hands out 1, 2, 3 ... */
     volatile LONG   g_installed   = 0;
     volatile LONG   g_failed      = 0;
+    volatile LONG   g_callOnlyLogged = 0;   /* review S3: the first refused call-only target is logged, once */
 
     void EnsureMinHook()
     {
@@ -53,6 +55,23 @@ namespace coop
 {
     HookStatus AddHook(void* target, void* detour, void** original)
     {
+        /* review S3 (2026-10-17): a row registered call-only (kAddrUseCallOnly) is one the gate may have accepted with
+           another mod's jump at its entry - hooking it would detour that mod's jump, not the game's function. Refused
+           (counted as failed), whatever the caller's next step; logged once per launch. */
+        const char* callOnly = AddrHookRefusedAt((unsigned long long)(uintptr_t)target);
+        if (callOnly != 0)
+        {
+            ::InterlockedIncrement(&g_failed);
+            if (::InterlockedCompareExchange(&g_callOnlyLogged, 1, 0) == 0)
+            {
+                char line[240];
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[HOOK] AddHook REFUSED: row %s is registered call-only (kAddrUseCallOnly) - this mod must not hook it",
+                            callOnly);
+                ErrorLog(line);
+            }
+            return FAIL;
+        }
         EnsureMinHook();
         const ULONG_PTR ident = (ULONG_PTR)::InterlockedIncrement64(&g_hookIdent);
         MH_STATUS status = MH_CreateHookEx(ident, target, detour, original);

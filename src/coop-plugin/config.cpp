@@ -428,6 +428,8 @@ void IdentityLoad(const coopcfg::CfgFields& oldFields)
 }
 
 namespace coop {
+/* F1033 (T1345): the anonymous EnsureDirTree for other files - every missing level of a folder (ui.cpp NEW WORLD) */
+void MakeFolderTree(const std::string& dir) { EnsureDirTree(dir); }
 
 int         ConfigRole()     { return (int)::InterlockedCompareExchange(&g_role, 0, 0); }
 bool        RoleIsSingle()   { return ConfigRole() == kRoleSingle; }

@@ -65,3 +65,20 @@ void QuietLogFlush(bool periodic);
 #define SW_DEVLOG_OR_FAIL(failed, msg) do { if (failed) DebugLog(msg); } while (0)
 #define SW_QUIETLOG(gate, family, key, keyText, msg) do { if (QuietLogPass(&(gate), (family), (key), (keyText))) DebugLog(msg); } while (0)
 #endif
+
+/* T-910 - SW_FIRSTLOG(counter, n, msg): a repeating line whose count is on a REPORT line already - every line in the DEV build; in
+   the release build the first n (swlogbudget::FirstLines on `counter`, an unsigned int the caller keeps), then none. SW_FIRSTN(counter,
+   n): the same test as a condition (always true in the DEV build). The text is built only for a line written. */
+#ifdef SW_DEV_BUILD
+#define SW_FIRSTN(counter, n) ((void)(counter), true)
+#define SW_FIRSTLOG(counter, n, msg) do { (void)(counter); DebugLog(msg); } while (0)
+#else
+#define SW_FIRSTN(counter, n) (swlogbudget::FirstLines(&(counter), (n)))
+#define SW_FIRSTLOG(counter, n, msg) do { if (swlogbudget::FirstLines(&(counter), (n))) DebugLog(msg); } while (0)
+#endif
+
+/* T-910 - THE [KEEPER] LINES OF THIS LAUNCH, for the bug report's keeper-lines.txt: every line written whose text starts "[KEEPER]"
+   is also kept in memory (src/common/linekeep.h: the first 50 and the newest 200), so a cut of the log file cannot lose them.
+   Returns them as one text in time order (empty when there are none) and sets *seen to how many such lines this launch wrote.
+   ANY THREAD. */
+std::string LogKeeperLinesText(unsigned long long* seen);

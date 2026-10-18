@@ -1094,6 +1094,27 @@ int ZoneKeepSectorTri(int sx, int sy)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* T-936: MAIN THREAD. The ZoneMap of area (sx, sy), located as ZoneLoadedSectorTri locates it (ZoneManager + 0xC8 + (sx * 64 + sy)
+   * 0x168), and its own area words +0x18 / +0x1C (the x / y ReadZoneReasonPod reads from an active zone). 1 = read; 0 = off the grid;
+   -1 refused off the main thread / no ZoneManager / faulted (counted as ZoneLoadedSectorTri's are). The caller compares the words
+   with (sx, sy) before handing *zone to the engine. */
+int ZoneMapOfSectorPod(int sx, int sy, void** zone, int* rx, int* ry)
+{
+    *zone = 0; *rx = -1; *ry = -1;
+    const unsigned long mt = StoreMainThreadId();
+    if (mt == 0 || ::GetCurrentThreadId() != (DWORD)mt) { ++g_zbOffMain; return -1; }
+    void* zm = ZoneManagerPtr();
+    if (!PlausiblePod(zm)) { ++g_zbNoZm; return -1; }
+    if (sx < 0 || sx >= 64 || sy < 0 || sy >= 64) return 0;
+    __try
+    {
+        char* z = (char*)((uintptr_t)zm + 0xC8 + (uintptr_t)(sx * 64 + sy) * 0x168);
+        *rx = *(const int*)(z + 0x18); *ry = *(const int*)(z + 0x1C);
+        *zone = z;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *zone = 0; return -1; }
+}
 /* the live keep question at a squad's centre - asked at the moment of each hand-over decision and each take */
 int EngineKeepsHere(float x, float z)
 {

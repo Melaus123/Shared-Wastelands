@@ -181,7 +181,7 @@
 
 namespace {
 
-const unsigned int kProtocol = 100;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 101;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_HOST_TOKEN = 68, MSG_KEPT = 69, MSG_GROUND_REFUSE = 71, MSG_BOX_REFUSE = 72, MSG_MONEY_SEND = 73, MSG_MONEY_SENT_OK = 74, MSG_MONEY_DELIVER = 75, MSG_MONEY_APPLIED = 76, MSG_MONEY_REFUSE = 77 };   /* T-810: MONEY (73-77) - src/common/moneywire.h */
 const int MSG_SHOW = 78;   /* T-811 (protocol 100): SHOW, down only - src/common/baseshow.h */   /* KEPT (69) - src/common/keptwire.h */   /* AUTH_CHALLENGE / AUTH_PROOF / STEAM_ID / HOST_TOKEN (65-68) - src/common/authproof.h */   /* FALLEN (61) - src/common/fallenwire.h */   /* T-546 step 3 (protocol 72): TEAM (60) - src/common/teamwire.h */   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* 50 is unused (REPAIR, the world repair removed in T-716) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi} (the stamp: the writtenAt of the write it answers), sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
 typedef char T581OwedNumbersAgree[(MSG_OWED == (int)owedpop::kMsgOwed && kProtocol == owedpop::kProtocol) ? 1 : -1];   /* T-581: a compile error here = owedpop.h and this file disagree */
@@ -2021,8 +2021,8 @@ std::vector<townkeep::TownRow> g_townsKept;    /* kept-towns.txt */
 std::set<ENetPeer*> g_townsSentTo;             /* the games sent the kept outposts on this link */
 /* T-811: SHOW - the last list each game was sent (a list that reads the same is not sent again); BasesShowTo / BasesShowAll are beside
    the team code */
-std::map<ENetPeer*, std::vector<char> > g_showSent;
-long long g_showSentN = 0, g_showSame = 0, g_showCut = 0, g_showRefused = 0;
+std::map<ENetPeer*, std::vector<char> > g_showSent;   /* the SHOW and its SHOW KEYS messages (protocol 101) side by side: either changing sends both */
+long long g_showSentN = 0, g_showSame = 0, g_showCut = 0, g_showRefused = 0, g_showKeysMsgs = 0, g_showKeysRefused = 0;
 void BasesShowAll(const char* why);
 std::map<ENetPeer*, townkeep::SayAssembly> g_townsSayParts;   /* a SAY split over several messages, put together per link */
 std::map<ENetPeer*, std::pair<int, int> > g_townsEmptyWholeRun;   /* per link: (slot, SAYs in a row with no outposts read whole; townkeep.h EmptyWholeRun) */
@@ -7143,7 +7143,9 @@ void TeamChanged(const char* why) { TeamTableSend(0, why); BasesShowAll(why); } 
 /* T-811: SHOW (src/common/baseshow.h) - each game is sent the said outposts (player-towns.txt, kept while their player is offline) of
    the other players in its player's faction of players (the team table: founder and members), each with that player's name from
    profiles.txt; a player in no team is sent an empty list. Sent at admission, when player-towns.txt changes and when the team table
-   changes - each time only to a game whose list differs from the last one it was sent. */
+   changes - each time only to a game whose list differs from the last one it was sent. Protocol 101 (owner 936 / 937): each SHOW is
+   followed by TOWNS SHOW KEYS (townkeep.h kOpShowKeys) - each shown row's said piece keys and cut flag, split under the message cap -
+   so the teammate's game links its copies of those pieces to the town it shows; a change of keys alone sends both again. */
 std::string ShowNameOfSlot(int slot)
 {
     for (size_t i = 0; i < g_profiles.size(); ++i) if (g_profiles[i].slot == slot && g_profiles[i].active != 0) return g_profiles[i].name;
@@ -7170,14 +7172,31 @@ void BasesShowTo(ENetPeer* p, const char* why)
     std::vector<char> b;
     if (!baseshow::Encode(&b, cut != 0 ? baseshow::kFlagCut : 0u, rows))
     { ++g_showRefused; Log("SHOW to slot " + N((long long)slot) + " NOT sent: its list does not encode (showRefused=" + N(g_showRefused) + ")"); return; }
+    const std::vector<townkeep::TownRow> keyRows = baseshow::KeyRowsFor(g_townsSaid, rows);
+    std::vector<std::vector<char> > keyMsgs;
+    if (!townkeep::EncodeShowKeys(&keyMsgs, keyRows))
+    {   /* the SHOW alone is still sent; an empty key list after it (the game then links nothing and unlinks nothing new) */
+        ++g_showKeysRefused;
+        Log("SHOW KEYS to slot " + N((long long)slot) + ": the key rows do not encode - an empty key list sent (showKeysRefused=" + N(g_showKeysRefused) + ")");
+        if (!townkeep::EncodeShowKeys(&keyMsgs, std::vector<townkeep::TownRow>())) keyMsgs.clear();
+    }
+    std::vector<char> all(b);   /* what this game was sent: the SHOW, then each SHOW KEYS message, each after its length */
+    for (size_t i = 0; i < keyMsgs.size(); ++i) { keptwire::PutU32(&all, (unsigned)keyMsgs[i].size()); all.insert(all.end(), keyMsgs[i].begin(), keyMsgs[i].end()); }
     std::map<ENetPeer*, std::vector<char> >::const_iterator was = g_showSent.find(p);
-    if (was != g_showSent.end() && was->second == b) { ++g_showSame; return; }
+    if (was != g_showSent.end() && was->second == all) { ++g_showSame; return; }
     if (!SendMsg(p, MSG_SHOW, b)) return;
-    g_showSent[p] = b;
+    size_t keysSent = 0;
+    for (size_t i = 0; i < keyMsgs.size(); ++i) { if (!SendMsg(p, MSG_TOWNS, keyMsgs[i])) break; ++keysSent; }
+    if (keysSent == keyMsgs.size()) g_showSent[p] = all;
+    else g_showSent.erase(p);   /* a SHOW KEYS message did not go: the next SHOW to this game sends both again */
+    g_showKeysMsgs += (long long)keysSent;
     ++g_showSentN;
     if (cut != 0) ++g_showCut;
+    size_t keyCount = 0;
+    for (size_t i = 0; i < keyRows.size(); ++i) keyCount += keyRows[i].keys.size();
     Log("SHOW (" + std::string(why) + ") to slot " + N((long long)slot) + ": " + N((long long)rows.size()) + " teammate outpost(s) of " + N((long long)mates.size())
-        + " teammate(s)" + (cut != 0 ? " (list cut)" : "") + "; showSent=" + N(g_showSentN) + " showSame=" + N(g_showSame) + " showCut=" + N(g_showCut));
+        + " teammate(s)" + (cut != 0 ? " (list cut)" : "") + ", keys of " + N((long long)keyRows.size()) + " in " + N((long long)keysSent) + " SHOW KEYS message(s), "
+        + N((long long)keyCount) + " key(s); showSent=" + N(g_showSentN) + " showSame=" + N(g_showSame) + " showCut=" + N(g_showCut) + " showKeysMsgs=" + N(g_showKeysMsgs));
 }
 void BasesShowAll(const char* why)
 {

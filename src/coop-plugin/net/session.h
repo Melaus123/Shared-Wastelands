@@ -283,6 +283,10 @@ int PlayerAddrOfKey(unsigned int key);
 bool SendBuild(const coopbuild::BuildMsg& m);
 // par16: a farm's growth state (writer -> other, kind 6) or a held game's harvest (kind 7), on MSG_BUILD. False when the link is down.
 bool SendFarm(const coopfarm::FarmMsg& m);
+// P47: a power piece's POWER_STATE to every game (WORLD) / a POWER_ASK to the piece writer's own slot, on MSG_BUILD; the
+// bytes encoded by powerwire.h EncodePower. False when there is no road (or no road to that slot). MAIN THREAD.
+bool SendPower(const std::vector<char>& b);
+bool SendPowerToSlot(const std::vector<char>& b, int slot);
 // The farm messages SendFarm could not encode (dropped, never sent; each counted and said) - for [MINE] REPORT. MAIN THREAD.
 long long FarmUnencodableCount();
 

@@ -30,6 +30,7 @@
 #include <set>        /* house2 fold 2: the keys erased while the owed file was unread */
 #include <vector>
 #include <algorithm>  /* help1 fold 2: BuildHelpResync sorts */
+#include <cstdio>     /* T-903: BuildDeadSetSig */
 
 namespace coopbuild {
 
@@ -2084,6 +2085,162 @@ inline int BuildTownArgMatch(const std::string& arg, const std::string& key, con
     if (key.find(arg) != std::string::npos) return 1;
     if (sid == arg) return 2;
     return 0;
+}
+
+/* TEST LEVER ONLY (`buildtest upgrade|downgrade <key-substring>`, T-609 U): whether the lever calls the engine's upgrade / downgrade on
+   a registered, loaded piece. Checked in this order; kBuildUpgradeGo = call it. The engine's own upgrade (1.0.65 0x2A49A0) does nothing
+   when the 'upgrades to' record (vt+0x268; downgrade: vt+0x270) is 0. vt+0x268 (0x29BEE0) answers only when the record's 'upgrades to'
+   list is not empty, the owner is a player faction and the target is in the research object's enabled-buildings set ([0x2133630]+0x38,
+   +0x130, filled from finished research's 'enable buildings' - Research::setResearched 0x833680; read 2026-10-17). */
+const int kBuildUpgradeGo = 0, kBuildUpgradeNotOwn = 1, kBuildUpgradeNoState = 2, kBuildUpgradeDismantled = 3, kBuildUpgradeRuin = 4,
+          kBuildUpgradeNotComplete = 5, kBuildUpgradeNoRecord = 6, kBuildUpgradeWall = 7;
+inline int BuildUpgradeLeverVerdict(int own, int isCopy, int stateRead, int complete, int dismantled, int ruin, int hasRecord, int isWall)
+{
+    if (own == 0 || isCopy != 0) return kBuildUpgradeNotOwn;
+    if (isWall != 0) return kBuildUpgradeWall;   /* a wall's upgrade override also upgrades its linked walls, which may be other games' pieces */
+    if (stateRead == 0) return kBuildUpgradeNoState;
+    if (dismantled != 0) return kBuildUpgradeDismantled;
+    if (ruin != 0) return kBuildUpgradeRuin;
+    if (complete == 0) return kBuildUpgradeNotComplete;
+    if (hasRecord == 0) return kBuildUpgradeNoRecord;
+    return kBuildUpgradeGo;
+}
+/* the refusal's reason, as the lever's line says it */
+inline const char* BuildUpgradeLeverWhy(int verdict, int down)
+{
+    switch (verdict)
+    {
+    case kBuildUpgradeGo:          return "go";
+    case kBuildUpgradeNotOwn:      return "not this game's own piece (a copy, or no own row)";
+    case kBuildUpgradeNoState:     return "its construction state does not read";
+    case kBuildUpgradeDismantled:  return "it is dismantled";
+    case kBuildUpgradeRuin:        return "it is a ruin";
+    case kBuildUpgradeNotComplete: return "it is not complete";
+    case kBuildUpgradeWall:        return "it is a wall (its upgrade also changes the walls linked to it)";
+    case kBuildUpgradeNoRecord:    return down != 0 ? "the game gave no 'downgrades to' target (no link in the record, or the owner is not a player faction)"
+                                                    : "the game gave no 'upgrades to' target (no link in the record, the owner is not a player faction, or the research that enables the target is not done - team research finish <techSid>)";
+    default:                       return "unknown verdict";
+    }
+}
+
+/* T-609 U fix: what the main thread does with one upgrade / downgrade hook event. A piece's key holds its record id, so the engine's
+   upgrade gives the SAME piece a new key: this game's own row moves to the new key as a REMOVE of the old key (the dismantle's road:
+   the row marked removed, its tombstone, the REMOVE sent now or owed) and a new row at the new key whose PLACE + STATE are owed.
+   A copy is never moved here - its owner's game re-keys it and tells this one. newRow: what the registry holds at the NEW key. */
+const int kBuildRekeyNewNone = 0;      /* no row there, or a removed / dismantled one (replaced) */
+const int kBuildRekeyNewCopy = 1;      /* another game's copy row */
+const int kBuildRekeyNewOwn = 2;       /* a live own row */
+const int kBuildRekeyNoKey = 0;        /* a key or the new record could not be read: nothing can be moved (dropped) */
+const int kBuildRekeySame = 1;         /* the key did not change (no target record): nothing to do */
+const int kBuildRekeyStale = 2;        /* queued in an earlier world: dropped */
+const int kBuildRekeyNoRow = 3;        /* no row at the old key: not a piece the list tracks */
+const int kBuildRekeyCopy = 4;         /* a copy, or a row this game does not own: its owner re-keys it */
+const int kBuildRekeyGone = 5;         /* the row is already removed or dismantled */
+const int kBuildRekeyOverCopy = 6;     /* the new key holds a copy row here: left as it is (dropped) */
+const int kBuildRekeyRemoveOnly = 7;   /* the new key already holds a live own row: only the old key's REMOVE */
+const int kBuildRekeyOwn = 8;          /* REMOVE the old key; a new row at the new key, its PLACE owed */
+inline int BuildRekeyAct(int keysOk, int sameKey, int sameWorld, int rowExists, int own, int copyHere, int removed, int newRow)
+{
+    if (keysOk == 0) return kBuildRekeyNoKey;
+    if (sameKey != 0) return kBuildRekeySame;
+    if (sameWorld == 0) return kBuildRekeyStale;
+    if (rowExists == 0) return kBuildRekeyNoRow;
+    if (copyHere != 0 || own == 0) return kBuildRekeyCopy;
+    if (removed != 0) return kBuildRekeyGone;
+    if (newRow == kBuildRekeyNewCopy) return kBuildRekeyOverCopy;
+    if (newRow == kBuildRekeyNewOwn) return kBuildRekeyRemoveOnly;
+    return kBuildRekeyOwn;
+}
+/* 1 = the verdict leaves a changed key un-moved although it may be this game's own piece (the rekeyDropped counter) */
+inline int BuildRekeyDropped(int act) { return (act == kBuildRekeyNoKey || act == kBuildRekeyStale || act == kBuildRekeyOverCopy) ? 1 : 0; }
+/* the old key's REMOVE, as the rekey line says it */
+const int kBuildRekeyRmSent = 0, kBuildRekeyRmOwed = 1, kBuildRekeyRmNotShared = 2, kBuildRekeyRmFailed = 3;
+inline int BuildRekeyRemoveOutcome(int sent, int owed, int sentOk)
+{
+    if (sent != 0) return kBuildRekeyRmSent;
+    if (owed != 0) return kBuildRekeyRmOwed;
+    if (sentOk == 0) return kBuildRekeyRmNotShared;   /* the other game never got its PLACE: no copy there */
+    return kBuildRekeyRmFailed;                       /* not encodable */
+}
+inline const char* BuildRekeyRemoveWord(int o)
+{
+    switch (o)
+    {
+    case kBuildRekeyRmSent:      return "removeSent";
+    case kBuildRekeyRmOwed:      return "removeOwed";
+    case kBuildRekeyRmNotShared: return "removeNotShared";
+    case kBuildRekeyRmFailed:    return "removeFailed";
+    default:                     return "remove?";
+    }
+}
+/* the off-main queue: a fixed array holding n records; a push past cap (or with a bad count) is refused - the caller counts it dropped */
+const int kBuildRekeyQueueCap = 256;   /* a long wall group upgraded off the main thread queues one pair per piece */
+template <class Rec>
+inline int BuildRekeyQueuePush(Rec* q, int* n, int cap, const Rec& r)
+{
+    if (q == 0 || n == 0 || cap <= 0 || *n < 0 || *n >= cap) return 0;
+    q[*n] = r;
+    ++*n;
+    return 1;
+}
+/* T-903 (F1026): a furniture copy's search inside its host that came back truncated only because some handles on the host's interior
+   list resolve to nothing. Such a handle may be this very piece not loaded yet, so by default the copy is held (never an empty twin).
+   BuildDeadHandlesIgnore says when those handles count as NO PIECE and the search as complete-and-empty. The caller fills one
+   BuildDeadHandleIn from a fresh read of the list; every BUILDING handle on it is exactly one of: good (resolved, its own ids equal the
+   hand's, a key built, not at or near the wanted key), hit (resolved and keyed at or near the wanted key), dead (hand::asBuilding and
+   hand::asObjectBase both answered null, neither faulted), other (anything else: a faulted lookup, unreadable or different ids, no key,
+   or asObjectBase answering an object). */
+struct BuildDeadHandleIn
+{
+    int listed, n, cut, torn;        /* the list's own size (-1 unreadable), entries read, the walk stopped early, a zone came down */
+    int typed, good, hits, dead, other;
+    int areaLoaded;                  /* the host's area reads fully loaded here */
+    long long setAge;                /* safe points since this host's dead set (BuildDeadSetSig) was first seen unchanged; -1 = new or changed now */
+    int regRow, copyListRow, removedMark;   /* this key: a registry row here, a copy-list ('~c') row, marked removed */
+};
+const long long kBuildDeadHandleWait = 30;   /* safe points the same dead set must persist across two searches */
+/* 1 = count the dead handles as no piece (the copy may be made), only when ALL hold:
+   (a) the list was read whole (listed >= 0, n == listed, cut 0, torn 0), every BUILDING handle is good or dead (no other) and none hit;
+   (b) at least one dead handle (none dead = an ordinary search, not this rule's case);
+   (c) the host's area reads fully loaded;
+   (d) the same dead set was seen at least kBuildDeadHandleWait safe points before (setAge; a new or changed set is -1);
+   (e) a fresh copy: no registry row, no copy-list row, the key not marked removed.
+   0 = keep the hold. */
+inline int BuildDeadHandlesIgnore(const BuildDeadHandleIn& x)
+{
+    if (x.listed < 0 || x.n != x.listed || x.cut != 0 || x.torn != 0) return 0;                        /* (a) the list read whole */
+    if (x.typed < 0 || x.good < 0 || x.hits != 0 || x.other != 0 || x.good + x.dead != x.typed) return 0;   /* (a) every handle good or dead */
+    if (x.dead <= 0) return 0;                                                                         /* (b) */
+    if (x.areaLoaded == 0) return 0;                                                                   /* (c) */
+    if (x.setAge < kBuildDeadHandleWait) return 0;                                                     /* (d) (-1 fails too) */
+    if (x.regRow != 0 || x.copyListRow != 0 || x.removedMark != 0) return 0;                          /* (e) */
+    return 1;
+}
+/* the dead set's signature: each dead handle's (container, index, serial) as "c/i/s", sorted and joined by ';' - the order the list
+   was read in does not change it; any handle added, gone or changed does */
+inline std::string BuildDeadSetSig(const std::vector<unsigned int>& triples)
+{
+    std::vector<std::string> v;
+    for (size_t i = 0; i + 2 < triples.size(); i += 3)
+    {
+        char b[48];
+        std::sprintf(b, "%u/%u/%u", triples[i], triples[i + 1], triples[i + 2]);
+        v.push_back(b);
+    }
+    std::sort(v.begin(), v.end());
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) { if (i != 0) s += ";"; s += v[i]; }
+    return s;
+}
+/* one search's step of a host's remembered dead set: `*keptSig` / `*keptAt` (`*had` 0 = nothing remembered) are updated in place.
+   Returns the set's age in safe points when the same set was remembered (now - keptAt, unsigned wrap allowed), else remembers this
+   set at `now` and returns -1 (a changed set restarts the wait). An empty set is never remembered (-1, memory cleared). */
+inline long long BuildDeadSetStep(int* had, std::string* keptSig, unsigned int* keptAt, const std::string& sig, unsigned int now)
+{
+    if (sig.empty()) { *had = 0; keptSig->clear(); *keptAt = 0; return -1; }
+    if (*had != 0 && *keptSig == sig) return (long long)(unsigned int)(now - *keptAt);
+    *had = 1; *keptSig = sig; *keptAt = now;
+    return -1;
 }
 
 } // namespace coopbuild

@@ -11,6 +11,11 @@
  * mismatch, and NOTHING is installed: one plain line in the log, one caption on the title screen, and the
  * game runs unmodded - exactly what role=single already means (config.h), reached by a different road.
  * REFUSE RATHER THAN CRASH (user, approved 2026-09-04).
+ * rk1 - THE ONE DIFFERENCE THAT IS ACCEPTED: a table-road code row that another mod has HOOKED (its first instruction
+ * replaced by a 5-byte E9 jump, every later byte the table names still matching) when every registration of that row
+ * is kAddrUseCallOnly - this mod only calls it, as the game itself does through the other mod's jump. Counted as
+ * addrHookedAccepted, one [ADDR] line each, never in addrMismatch (src/common/addrhooked.h decides). Any other
+ * difference, any row this mod hooks or patches, and every row on the signature road still refuse.
  *
  * WHAT THIS IS NOT. It is not a tamper check and it is not a guarantee that an address is the right FUNCTION -
  * only that the bytes there are the bytes this build was read against, which is F038's distinction and is all
@@ -37,14 +42,22 @@ namespace coop {
    name that is not in the table is a REFUSAL rather than a zero nobody notices.
 
    The array behind it is a zero-initialised POD with a plain int counter, so it is correct no matter what
-   order these constructors run in (both are zero before any constructor runs). */
+   order these constructors run in (both are zero before any constructor runs).
+
+   rk1: THE USE. kAddrUseStrict (the default) = this mod hooks or patches the address, or nobody has said - its bytes
+   must match exactly. kAddrUseCallOnly = this mod only CALLS (or reads) the address, never hooks or writes it - the
+   gate then also accepts another mod's 5-byte jump at its start (src/common/addrhooked.h). Give kAddrUseCallOnly only
+   when EVERY use of the bound constant is a plain call through it; a name registered twice is call-only only when
+   every registration says so. */
+enum { kAddrUseStrict = 0, kAddrUseCallOnly = 1 };
 struct AddrReg
 {
-    AddrReg(const char* name, unsigned long long* slot);
+    AddrReg(const char* name, unsigned long long* slot, int use = kAddrUseStrict);
 };
 
 /* Fingerprint the executable, load its table, verify every entry, fill every registered slot.
-   Returns 1 if EVERYTHING matched and the plugin may install; 0 otherwise. Logs exactly one line either way.
+   Returns 1 if EVERYTHING matched (a call-only row hooked by another mod counts as matched - rk1, above) and the
+   plugin may install; 0 otherwise. Logs one summary line either way, plus one [ADDR] line per accepted hooked row.
    owner 97a: with NO table for this executable, or one that is not usable, it then also looks for
    TitleScreen::update by a byte pattern (src/common/sigscan.h) and fills ONLY the TitleScreen_update row
    with a unique match, so the refusal button can still be shown - one more [ADDR] line says which.
@@ -57,6 +70,13 @@ int AddrOk();
 /* The table's answer for one name, as an RVA, or 0 if it is not in the table. Startup use only - the
    registered constants above are what the detours read. */
 unsigned long long Rva(const char* name);
+
+/* review S3 (2026-10-17): THE HOOK GUARD. `target` is an absolute address about to be hooked (coop::AddHook,
+   hooks.cpp). Returns the name of the registered row bound there when EVERY registration bound to that address is
+   kAddrUseCallOnly - the gate may have accepted another mod's 5-byte jump at it, so this mod must not hook it; AddHook
+   refuses. 0 when the hook is allowed: no registration is bound there (unbound, or an address no row names), or at
+   least one is strict. ANY THREAD after AddrInit (reads slots written once, before any hook). */
+const char* AddrHookRefusedAt(unsigned long long target);
 
 /* One token for the periodic title-pump line, and the counters this build is judged by. */
 std::string AddrReportToken();

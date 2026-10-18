@@ -660,6 +660,9 @@ int  ItZoneLoadedHereLive(const float* pos);
 
 std::string ItemsReport();    // the " items[...]=" token for the [STORE] REPORT line
 std::string ItemsDetail();    // the thread/branch detail that follows it
+/* T-910: the bug report's header - the empty-shop repairs this launch (T-799 D3) and the [KEEPER] restocked now lines:
+   "moneyUnknown=<n> empty=<n> timerFailed=<n> restockedNow=<n>". MAIN THREAD. */
+std::string ItemsKeeperRepairToken();
 /* snap1 (user decision 2026-09-26): `snapshot [<tag>]` - READ-ONLY. Arms one snapshot for the next whole in-game minute of the
    shared world clock; SnapshotTick (every frame, main thread) takes it at that instant and writes the [SNAP] block 64 lines a
    tick: one `char` line per uid-keyed character (own and copies), one `box` line per loaded non-player box, one `town` line per

@@ -157,7 +157,7 @@ def scan(sample=None):
     bound = set()
     defs = {}   # name -> [(path, line, literal text, value)]
     for p, (raw, code) in src.items():
-        for m in re.finditer(r'\bAddrReg\s+' + IDENT + r'\s*\([^;]*?&\s*(' + IDENT + r')\s*\)', code):
+        for m in re.finditer(r'\bAddrReg\s+' + IDENT + r'\s*\([^;]*?&\s*(' + IDENT + r')\s*[,)]', code):   # rk1 review N1: the use argument may follow
             bound.add(m.group(1))
         for m in re.finditer(r'\b(' + IDENT + r')\s*(?:\[\s*\w*\s*\])?\s*=\s*\{?\s*' + CAST + r'(0[xX][0-9A-Fa-f]+|[1-9][0-9]*)[uUlL]*\s*[;,}]', code):
             v = int(m.group(2), 0)

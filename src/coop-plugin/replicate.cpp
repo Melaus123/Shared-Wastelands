@@ -3071,7 +3071,7 @@ static void P093Due(unsigned int uid, Puppet& p, P093Acc& a, double now, float l
     ReadCharFrameTimesPod(p.ch, &oft, &ft, &vum);
     const int prone = ReadProneStatePod(p.ch);
     const long long offv[4] = { w.off[0], w.off[1], w.off[2], w.off[3] };
-    DebugLog(std::string(trig ? "[M2] RUNPROBE P093" : "[M2] RUNPROBE-CTL P093")
+    SW_DEVLOG(std::string(trig ? "[M2] RUNPROBE P093" : "[M2] RUNPROBE-CTL P093")   /* T-910: the DEV build's only; RUNPROBE-SUM stays */
              + " uid=" + N2(uid) + " t=" + F2((float)now) + " lag=" + F2(lag) + " lagU=" + F2(lagU) + " lagUminW=" + F2(w.lagUmin)
              + " W=" + F3(Wf) + " hold=" + kP093ClassName[cls] + " open=" + kP093OpenName[open]
              + " | run=" + F2(runMean) + " own=" + F2(ownMean) + " R=" + F3(R) + " eqLag=" + F2(eqLag)

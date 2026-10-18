@@ -1486,7 +1486,9 @@ void Latch(const char* where)
    void* cookie, AkUInt32 externals, AkExternalSourceInfo*, AkPlayingID) - the game's own export, bound through the table row
    SoundPostEvent. Every interface click the game plays is this call with object 0x6E and the rest 0 (1.0.65 0x720E01..0x720E12
    for Prospect_Click; 71 such calls post General_Click). Returns the playing id, 0 when the engine refused the event. ---- */
-unsigned long long kSoundPostEventRva = 0; AddrReg kSoundPostEventRva_reg("SoundPostEvent", &kSoundPostEventRva);
+/* rk1: CALL-ONLY - this mod only calls the export through this address (PostEventGuarded / SetSwitchGuarded below), never
+   hooks or writes it, so another mod's 5-byte jump at its start is accepted by the gate (addresses.h, src/common/addrhooked.h) */
+unsigned long long kSoundPostEventRva = 0; AddrReg kSoundPostEventRva_reg("SoundPostEvent", &kSoundPostEventRva, kAddrUseCallOnly);
 typedef unsigned long (*PostEventFn)(const char*, unsigned long long, unsigned long, void*, void*, unsigned long, void*, unsigned long);
 const unsigned long long kUiSoundObject = 0x6E;
 /* the SEH frame: no local object with a destructor */
@@ -1502,7 +1504,8 @@ int PostEventGuarded(PostEventFn fn, const char* ev, unsigned long* id)
    sound): SetSwitch("Notifications", state, 0x6E) then PostEvent("Notifications", 0x6E, 0...). The state (e.g. "Thing_Complete")
    is a STATE of the switch group "Notifications", not an event: posted alone it is refused (run T1314). Returns an AKRESULT,
    1 = AK_Success (the export returns 15 when either name is unknown). */
-unsigned long long kSoundSetSwitchRva = 0; AddrReg kSoundSetSwitchRva_reg("SoundSetSwitch", &kSoundSetSwitchRva);
+/* rk1: CALL-ONLY, as SoundPostEvent above */
+unsigned long long kSoundSetSwitchRva = 0; AddrReg kSoundSetSwitchRva_reg("SoundSetSwitch", &kSoundSetSwitchRva, kAddrUseCallOnly);
 typedef unsigned long (*SetSwitchFn)(const char*, const char*, unsigned long long);
 const char* const kNotificationEvent = "Notifications";   /* the switch group AND the event the game posts after setting it */
 /* the SEH frame: no local object with a destructor */

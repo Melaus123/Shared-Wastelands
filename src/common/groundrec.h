@@ -39,7 +39,7 @@
 
 namespace coopgrec {
 
-const unsigned int kProtocol = 100;            /* the world-server protocol that carries ground records and GROUND_REFUSE */
+const unsigned int kProtocol = 101;            /* the world-server protocol that carries ground records and GROUND_REFUSE */
 
 
 const unsigned int kMsgGroundRefuse = 71u;    /* world server -> the writer: its ground record was not taken, and why */

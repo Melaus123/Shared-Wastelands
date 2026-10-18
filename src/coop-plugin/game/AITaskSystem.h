@@ -21,6 +21,8 @@ public:
 
     void issueOrder(TaskType t, const hand& subject, const Ogre::Vector3& location, bool clearOld, bool shift);
     void dropAllOrders();
+    void resetOrders();        // 0x506AA0: the order target reset and the order list emptied
+    void dropStandingJobs();   // 0x5067F0: the standing job list (+0x90) emptied
     void dropGoals();
     bool hasPendingOrders() const;
 

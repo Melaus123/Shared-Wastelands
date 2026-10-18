@@ -164,6 +164,9 @@ int ZoneLoadedSectorTri(int sx, int sy);
 /* MAIN THREAD. The engine's keep flags for one area: 1 when its ZoneMap +0xB1 or +0xB0 byte is set (the pair the engine's
    own side-neighbour test reads, 0xA088A0), 0 neither or off the grid, -1 refused off the main thread / no ZoneManager / faulted. */
 int ZoneKeepSectorTri(int sx, int sy);
+/* T-936: MAIN THREAD. The ZoneMap of area (sx, sy) (*zone) and its own area words +0x18 / +0x1C (*rx / *ry). 1 read, 0 off the
+   grid, -1 refused off the main thread / no ZoneManager / faulted. build.cpp's town wake checks the words name (sx, sy) first. */
+int ZoneMapOfSectorPod(int sx, int sy, void** zone, int* rx, int* ry);
 /* MAIN THREAD. Would this game's engine keep a squad whose centre stands at (x, z): cooplo::EngineKeepsAt over the live
    flags of the area and its four side neighbours (off the grid = no neighbour = no narrowing), with kKeepMarginUnits. 1 keeps, 0 not,
    -1 unreadable (the caller retries next tick or refuses). */

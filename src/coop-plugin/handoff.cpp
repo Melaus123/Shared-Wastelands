@@ -2461,6 +2461,11 @@ bool PlayerTeleport(float dx, float dz)
     ::Character* pc = GetTarget();
     float x = 0, y = 0, z = 0;
     if (!Plaus(pc) || !ReadPos(pc, &x, &y, &z)) return false;
+    if (IsDownedCharacter(pc))   // T1338 / T1342: a downed character's ragdoll stays behind and pulls it back when time runs - the move would not hold
+    {
+        DebugLog("[XFER] player teleport REFUSED: the watched character is down (knocked out / playing dead) - the engine's teleport does not move its ragdoll, it would snap back");
+        return false;
+    }
     if (!Teleport(pc, x + dx, y, z + dz)) return false;
     ++g_teleports;
     // F479: the teleport moved the character only; a zone stays active while its CAMERA countdown is alive, and the client's camera
@@ -2479,6 +2484,11 @@ bool PlayerTeleportAbsY(float x, float z, bool ground, float y)
     ::Character* pc = GetTarget();
     float cx = 0, cy = 0, cz = 0;
     if (!Plaus(pc) || !ReadPos(pc, &cx, &cy, &cz)) return false;
+    if (IsDownedCharacter(pc))   // T1338 / T1342: a downed character's ragdoll stays behind and pulls it back when time runs - the move would not hold
+    {
+        DebugLog("[XFER] player teleport REFUSED: the watched character is down (knocked out / playing dead) - the engine's teleport does not move its ragdoll, it would snap back");
+        return false;
+    }
     float ty = y;
     if (ground)
     {

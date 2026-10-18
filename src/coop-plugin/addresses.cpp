@@ -17,6 +17,7 @@
 #include "addresses.h"
 #include "command_channel.h"   /* PathNextToDll - the same directory the command channel and the config use */
 #include "../common/addrtable.h"
+#include "../common/addrhooked.h"  /* rk1: a call-only row another mod has hooked - accepted or refused */
 #include "../common/sigscan.h"    /* owner 97a: TitleScreen::update by its bytes when there is no usable table */
 #include "../common/sigtable.h"   /* T-63 stage 7: every row by its signature when no table matches this executable */
 #include "../common/storemeta.h"   /* coopstore::Crc32 - already offline-tested against the zip/png vectors */
@@ -48,6 +49,7 @@ namespace {
 const int kMaxRegs = kAddrMaxRegs;
 typedef AddrSlot RegSlot;   /* gog1 fold 2: addrtable.h's POD, so AddrSettleSlots binds and clears these very slots */
 RegSlot g_regs[kMaxRegs];
+unsigned char g_regUse[kMaxRegs];   /* rk1: beside g_regs[i] - 1 = kAddrUseCallOnly, 0 = strict (zero-initialised: strict) */
 int     g_regCount = 0;
 int     g_regOverflow = 0;
 
@@ -63,6 +65,8 @@ long long g_mismatch    = 0;      /* addrMismatch       - entries whose bytes di
 long long g_varEntries  = 0;      /* addrVarEntries     - writable globals: present, NOT verifiable */
 long long g_unreadable  = 0;      /* addrUnreadable     - the read itself raised; counted INSIDE addrMismatch */
 long long g_hookedFirst = 0;      /* addrLooksHooked    - a mismatch whose first byte is a jump: someone else's hook */
+long long g_hookedAccepted = 0;   /* addrHookedAccepted - rk1: a call-only row hooked by another mod, the rest matching:
+                                     accepted, NOT in addrMismatch nor addrLooksHooked (src/common/addrhooked.h) */
 long long g_bindMissing = 0;      /* addrBindMissing    - a registered name the table does not carry */
 long long g_badLines    = 0;
 std::string g_firstMismatch;      /* the FIRST mismatching entry, named - a refusal that names nothing is not a measurement */
@@ -147,10 +151,27 @@ int ReadWholeFile(const std::string& path, std::string* out)
     return 1;
 }
 
+/* rk1: 1 when EVERY registration of `name` is kAddrUseCallOnly - and there is at least one, and none was lost to a
+   registry overflow (an unregistered row may still be read through Rva(name), whose use nobody declared). 0 otherwise. */
+int RowCallOnly(const char* name)
+{
+    unsigned char uses[kMaxRegs];
+    int i, n = 0;
+    if (name == 0 || g_regOverflow != 0) return 0;
+    for (i = 0; i < g_regCount; ++i)
+    {
+        if (g_regs[i].name == 0 || std::strcmp(g_regs[i].name, name) != 0) continue;
+        uses[n++] = g_regUse[i];
+    }
+    return AddrUsesAllCallOnly(uses, n);   /* review S2: the rule itself, offline-tested (src/common/addrhooked.h) */
+}
+
 /* ---- one entry, verified -------------------------------------------------------------------------------- */
-/* Returns 1 matched, 0 mismatched, -1 not applicable (a writable global). Fills `detail` on a mismatch with
-   what was EXPECTED and what was THERE - the inputs, not only the answer. */
-int VerifyEntry(uintptr_t base, const AddrEntry& e, std::string* detail)
+/* Returns 1 matched, 0 mismatched, -1 not applicable (a writable global), 2 ACCEPTED HOOKED (rk1): a code row whose
+   first instruction another mod replaced with its 5-byte jump, every later byte matching, and callOnly != 0 (every
+   registration of the row only calls it - RowCallOnly; always 0 on the signature road). Fills `detail` on a mismatch
+   with what was EXPECTED and what was THERE - the inputs, not only the answer - and on an accepted row with both. */
+int VerifyEntry(uintptr_t base, const AddrEntry& e, int callOnly, std::string* detail)
 {
     if (e.kind == kAddrVar) return -1;
 
@@ -190,14 +211,21 @@ int VerifyEntry(uintptr_t base, const AddrEntry& e, std::string* detail)
         {
             *detail = "at rva " + H(e.verifyAt) + " the table expects " + Hex(e.bytes, e.nbytes)
                     + " and this process has " + Hex(got, e.nbytes);
+            /* rk1: somebody else's 5-byte jump at the entry of a row this mod only calls, the rest the same function -
+               accepted (src/common/addrhooked.h). Every other difference still refuses, below. */
+            const int atEntry = (e.kind == kAddrCode && e.verifyAt == e.rva) ? 1 : 0;
+            if (AddrHookedVerdict(e.bytes, got, e.nbytes, atEntry, callOnly) == kHookAccepted) return 2;
             /* A jump as the FIRST byte is not a different game build - it is somebody else's hook, and it
                is a different repair (that address needs a shadow window in the table). Say which it is. */
-            if (e.kind == kAddrCode && e.verifyAt == e.rva
-                && (got[0] == 0xE9 || got[0] == 0xEB || got[0] == 0xFF || got[0] == 0x68))
+            if (atEntry != 0 && (got[0] == 0xE9 || got[0] == 0xEB || got[0] == 0xFF || got[0] == 0x68))
             {
                 ++g_hookedFirst;
                 *detail += " - and the first byte is a jump, so this address is most likely ALREADY HOOKED by"
                            " another mod rather than being a different game build";
+                if (AddrHookedVerdict(e.bytes, got, e.nbytes, atEntry, 1) == kHookAccepted)
+                    *detail += "; the rest of its bytes match, but it is still refused: a registration of this row hooks,"
+                               " patches or does not declare its use, or the row came from the signature search (which"
+                               " accepts no hooked row)";
             }
             return 0;
         }
@@ -280,11 +308,12 @@ void TitleByPattern(const char* why)
 
 namespace coop {
 
-AddrReg::AddrReg(const char* name, unsigned long long* slot)
+AddrReg::AddrReg(const char* name, unsigned long long* slot, int use)
 {
     if (g_regCount >= kMaxRegs) { ++g_regOverflow; return; }
     g_regs[g_regCount].name = name;
     g_regs[g_regCount].slot = slot;
+    g_regUse[g_regCount] = (unsigned char)(use == kAddrUseCallOnly ? 1 : 0);   /* rk1: anything else is strict */
     ++g_regCount;
 }
 
@@ -314,6 +343,24 @@ unsigned long long Rva(const char* name)
 {
     const AddrEntry* e = AddrFind(g_entries, g_entryCount, name);
     return e ? (unsigned long long)e->rva : 0ull;
+}
+
+/* review S3 (2026-10-17) - see addresses.h. Every registration bound to `target`; refused only when all of them are
+   call-only (src/common/addrhooked.h AddrUsesAllCallOnly - one strict registration there means the gate checked those
+   bytes exactly). After a registry overflow the gate treated every row as strict, so nothing is refused. */
+const char* AddrHookRefusedAt(unsigned long long target)
+{
+    unsigned char uses[kMaxRegs];
+    const char* first = 0;
+    int i, n = 0;
+    if (target == 0 || g_regOverflow != 0) return 0;
+    for (i = 0; i < g_regCount; ++i)
+    {
+        if (g_regs[i].slot == 0 || *g_regs[i].slot == 0 || AddrAbs(*g_regs[i].slot) != target) continue;
+        if (first == 0) first = g_regs[i].name;
+        uses[n++] = g_regUse[i];
+    }
+    return AddrUsesAllCallOnly(uses, n) != 0 ? (first != 0 ? first : "?") : 0;
 }
 
 const char* AddrRefusalCaption() { return g_caption; }
@@ -493,9 +540,19 @@ static int AddrInitBody()
         for (i = 0; i < g_entryCount; ++i)
         {
             std::string detail;
-            const int v = VerifyEntry(base, g_entries[i], &detail);
+            /* rk1: the signature road keeps the strict check for every row (callOnly 0) - its bytes come from the file's
+               own signature match, and a hooked row there is refused exactly as before */
+            const int callOnly = byPattern ? 0 : RowCallOnly(g_entries[i].name);
+            const int v = VerifyEntry(base, g_entries[i], callOnly, &detail);
             if (v < 0) { ++g_varEntries; continue; }
             ++g_checked;
+            if (v == 2)
+            {
+                ++g_hookedAccepted;
+                DebugLog(std::string("[ADDR] ") + g_entries[i].name + " (rva " + H(g_entries[i].rva) + ") starts with another"
+                         " mod's jump (hooked); the rest of its bytes match and this mod only calls it, so it is accepted ("
+                         + detail + ")");
+            }
             if (v == 0)
             {
                 ++g_mismatch;
@@ -526,7 +583,8 @@ static int AddrInitBody()
         ErrorLog("[ADDR] kenshi-coop is DISABLED in this game: " + g_why + ". addrTableLoaded=1 addrEntriesChecked="
                  + N(g_checked) + " addrMismatch=" + N(g_mismatch) + " addrVarEntries=" + N(g_varEntries)
                  + " addrBindMissing=" + N(g_bindMissing) + " addrUnreadable=" + N(g_unreadable)
-                 + " addrLooksHooked=" + N(g_hookedFirst) + " addrRegOverflow=" + N(g_regOverflow)
+                 + " addrLooksHooked=" + N(g_hookedFirst) + " addrHookedAccepted=" + N(g_hookedAccepted)
+                 + " addrRegOverflow=" + N(g_regOverflow)
                  + ". FIRST MISMATCH: " + g_firstMismatch
                  + ". Nothing was hooked and no link was opened; Kenshi runs exactly as it does without this mod.");
         if (byPattern)
@@ -549,7 +607,8 @@ static int AddrInitBody()
     ::InterlockedExchange(&g_ok, 1);
     DebugLog("[ADDR] address table '" + g_version + "' matched this executable: fingerprint " + g_fingerprint
              + ", addrTableLoaded=1 addrEntriesChecked=" + N(g_checked) + " addrMismatch=0 addrVarEntries="
-             + N(g_varEntries) + " addrBound=" + N(g_regCount) + " from '" + g_tablePath + "'."
+             + N(g_varEntries) + " addrHookedAccepted=" + N(g_hookedAccepted) + " addrBound=" + N(g_regCount)
+             + " from '" + g_tablePath + "'."
              " addrVarEntries are writable globals - they have no constant bytes to compare and are NOT part of"
              " addrEntriesChecked; they ride on the other entries and on the fingerprint (build/prep-p8h.md).");
     return 1;
@@ -601,6 +660,7 @@ std::string AddrReportToken()
       << ",varEntries=" << g_varEntries
       << ",unreadable=" << g_unreadable
       << ",looksHooked=" << g_hookedFirst
+      << ",hookedAccepted=" << g_hookedAccepted
       << ",bindMissing=" << g_bindMissing
       << ",bound=" << g_regCount
       << ",badLines=" << g_badLines

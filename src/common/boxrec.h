@@ -45,7 +45,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 100;            /* the world-server protocol that carries box records and BOX_REFUSE */
+const unsigned int kProtocol = 101;            /* the world-server protocol that carries box records and BOX_REFUSE */
 
 
 const unsigned int kMsgBoxRefuse = 72u;       /* world server -> the writer: its box record was not taken, and why */

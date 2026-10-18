@@ -18,6 +18,7 @@
 #include "../common/logrotate.h"   /* the names of the kept copies of earlier launches' logs */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "../common/modversion.h"   /* the mod's version, the log's first line */
+#include "../common/linekeep.h"   /* T-910: the [KEEPER] lines kept in memory for the bug report */
 
 namespace
 {
@@ -397,6 +398,9 @@ namespace
         _snprintf_s(out, outSize, _TRUNCATE, "%llu.%03llu", ms / 1000ull, ms % 1000ull);
     }
 
+    /* T-910: the [KEEPER] lines of this launch (LogKeeperLinesText), made at the first one, under g_lock. */
+    swlinekeep::LineKeep* g_keeperKeep = 0;
+
     /* Room left at the front of every line for "Error " + "<sec>.<msec>", filled in under the lock. The widest
        possible prefix is 6 + 20 digits + 4 = 30 characters. */
     const size_t kPrefixGap = 40;
@@ -408,11 +412,13 @@ namespace
               caller's own handler sees it and every other thread keeps logging. Holding the lock across this
               copy was a hang: the fault skipped the unlock and the next log line on any thread blocked forever. */
         std::string line;
+        size_t bodyAt = 0;   /* T-910: where the caller's text starts in `line` */
         try
         {
             line.reserve(kPrefixGap + len + len / 8 + 32);
             line.assign(kPrefixGap, ' ');
             line += " KenshiCoop: ";
+            bodyAt = line.size();
             /* every '\n' reaches the file as CRLF. */
             for (size_t i = 0; i < len; ++i)
             {
@@ -425,6 +431,7 @@ namespace
         {
             return;   /* out of memory while building the line: the line is dropped, the game goes on */
         }
+        const bool keeperLine = bodyAt != 0 && line.compare(bodyAt, 8, "[KEEPER]") == 0;   /* T-910: read from our own copy */
 
         /* 2. INSIDE the lock: only our own state. The timestamp is taken here so lines stay in time order, then
               the prefix goes into the gap and the whole line is ONE WriteFile. */
@@ -434,6 +441,13 @@ namespace
         {
             char timeStr[48];
             FormatTime(timeStr, sizeof(timeStr));
+            if (keeperLine)
+            {
+                /* T-910: kept for the bug report whether or not the file takes it - the line as the file has it, its line end left off */
+                if (g_keeperKeep == 0) g_keeperKeep = new swlinekeep::LineKeep(swlinekeep::kKeepFirst, swlinekeep::kKeepLast);
+                const std::string kept = std::string(isError ? "Error " : "") + timeStr + line.substr(kPrefixGap, line.size() - kPrefixGap - 2);
+                swlinekeep::Keep(g_keeperKeep, kept.data(), kept.size());
+            }
             EnsureFile();
             if (g_fileState == 1 && g_versionSaid == 0)
             {
@@ -496,6 +510,26 @@ void DebugLog(const char* message)         { if (message) WriteLine(false, messa
 void ErrorLog(const std::wstring& message) { WriteWide(true, message); }
 void ErrorLog(const std::string& message)  { WriteLine(true, message.data(), message.size()); }
 void ErrorLog(const char* message)         { if (message) WriteLine(true, message, strlen(message)); else WriteLine(true, "", 0); }
+
+/* T-910: coop_log.h */
+std::string LogKeeperLinesText(unsigned long long* seen)
+{
+    std::string out;
+    unsigned long long n = 0;
+    EnsureLock();
+    ::EnterCriticalSection(&g_lock);
+    try
+    {
+        if (g_keeperKeep != 0) { out = swlinekeep::Text(*g_keeperKeep); n = g_keeperKeep->seen; }
+    }
+    catch (...)
+    {
+        out.clear();   /* out of memory: the report goes without the file */
+    }
+    ::LeaveCriticalSection(&g_lock);
+    if (seen != 0) *seen = n;
+    return out;
+}
 
 const char* LogBuildLabel()
 {

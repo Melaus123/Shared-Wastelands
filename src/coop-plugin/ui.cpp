@@ -77,6 +77,8 @@
 #include <mygui/MyGUI_ISubWidgetText.h>   /* ui7: the text's measured line height (getFontHeight, virtual) */
 #include <mygui/MyGUI_Window.h>
 #include <mygui/MyGUI_MultiListBox.h>    /* ui2: the worlds and profiles lists - Kenshi's own Load Game list widget */
+#include <mygui/MyGUI_TabControl.h>      /* p47d: `uiclick playerstab` - the management window's tab control */
+#include <mygui/MyGUI_TabItem.h>
 #include <mygui/MyGUI_InputManager.h>
 #include <mygui/MyGUI_LayerManager.h>    /* pp1b: getWidgetFromPoint - uiclick refuses a covered widget */
 #include <mygui/MyGUI_RenderManager.h>   /* mmo5: the view size, for the host-left window (tags.cpp includes it too) */
@@ -134,6 +136,7 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
 
 namespace coop {
+void MakeFolderTree(const std::string& dir);   /* config.cpp (F1033): every missing level of a folder */
 
 static const char* const kOurName    = "CoopMultiplayerButton";
 static const char* const kExitSuffix = "ExitButton";                    // matched AFTER the layout prefix
@@ -2867,7 +2870,7 @@ static void PanelCreateWorld()
         return;
     }
     const std::string top = StoreTopDir();
-    U8CreateDirectory(top.c_str(), 0);   /* the first world on this computer: the top folder may not be there yet */
+    MakeFolderTree(top);   /* the first world on this computer: the top folder and its parents (save\Shared Wastelands) may not be there yet - T1345: only the last level was made, Windows error 3 */
     const std::string dir = top + "\\" + folder;
     bool dirMade = U8CreateDirectory(dir.c_str(), 0) != 0;
     DWORD e = dirMade ? 0 : ::GetLastError();
@@ -7585,6 +7588,24 @@ static MyGUI::Widget* UiTopModalRoot(MyGUI::InputManager* im)
     const MyGUI::VectorWidgetPtr& v = im->*UiModalRootsGet(UiModalRootsTag());
     return v.empty() ? 0 : v.back();
 }
+/* T-903: InputManager's private mOldAbsZ (the wheel's last absolute value), by the same access - `uiclick point:` passes it back to
+   injectMouseMove so the move carries no wheel turn (MyGUI raises a wheel event for any change of z). Same name, another overload. */
+struct UiOldAbsZTag { typedef int MyGUI::InputManager::*type; friend type UiModalRootsGet(UiOldAbsZTag); };
+template struct UiRobMember<UiOldAbsZTag, &MyGUI::InputManager::mOldAbsZ>;
+/* T-905 / T-903: what a widget the mouse would hit IS - type, box, layer and up to 8 parents (8, so the root window's name shows:
+   T1343's RE_Kenshi window sat 4 levels above the cover). " type=... box=l,t wxh layer='...' parents: 'name'(Type) ..." */
+static std::string UiDriveHitDesc(MyGUI::Widget* top)
+{
+    if (top == 0) return std::string();
+    const MyGUI::IntCoord tc = top->getAbsoluteCoord();
+    std::string s = " type=" + top->getTypeName() + " box=" + coopui::PanelNum((long long)tc.left) + "," + coopui::PanelNum((long long)tc.top) + " "
+                    + coopui::PanelNum((long long)tc.width) + "x" + coopui::PanelNum((long long)tc.height)
+                    + " layer='" + (top->getLayer() != 0 ? top->getLayer()->getName() : std::string("none")) + "' parents:";
+    int pd = 0;
+    for (MyGUI::Widget* q = top->getParent(); q != 0 && pd < 8; q = q->getParent(), ++pd)
+        s += " '" + q->getName() + "'(" + q->getTypeName() + ")";
+    return s;
+}
 static bool UiDriveMouseReach(MyGUI::Widget* w, std::string* why)
 {
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
@@ -7609,8 +7630,13 @@ static bool UiDriveMouseReach(MyGUI::Widget* w, std::string* why)
     int depth = 0;
     for (MyGUI::Widget* p = top; p != 0 && depth < 80; p = p->getParent(), ++depth)
         if (p == w) return true;
-    if (why != 0) *why = "covered at its centre (" + coopui::PanelNum((long long)x) + "," + coopui::PanelNum((long long)y) + ") by '"
-                         + (top != 0 ? top->getName() : std::string("nothing that takes the mouse")) + "'";
+    if (why != 0)
+    {
+        *why = "covered at its centre (" + coopui::PanelNum((long long)x) + "," + coopui::PanelNum((long long)y) + ") by '"
+               + (top != 0 ? top->getName() : std::string("nothing that takes the mouse")) + "'";
+        /* T-905 (T1340: covered by an unnamed widget under RE_Kenshi): what covers it - type, box, layer, and up to 8 parents (T-903) */
+        *why += UiDriveHitDesc(top);
+    }
     return false;
 }
 /* T-220 - TEST-ONLY `uiclick close` and `uiclick escape`: the panel's two close routes that are not a button of ours (PP6 fold item 1:
@@ -7654,12 +7680,213 @@ static bool UiDriveEscape(const std::string& name)
              + "; the panel was " + (wanted != 0 ? "open" : "closed") + ")");
     return true;
 }
+/* p47d (owner 938) - `uiclick playerstab`: the tab whose page holds the row's widget (w1), and the tab control holding it, found by
+   walking up from w1 (0 = not found, with the reason). */
+static MyGUI::TabControl* UiDriveTabOf(MyGUI::Gui* gui, const coopui::UiDriveName* row, MyGUI::TabItem** itemOut, std::string* why)
+{
+    if (row == 0 || row->w1 == 0) { if (why != 0) *why = "not in the name table"; return 0; }
+    MyGUI::Widget* page = gui->findWidgetT(std::string(row->w1), false);
+    if (page == 0) { if (why != 0) *why = std::string("not found (") + row->w1 + " is not made - no management window with the tab in it)"; return 0; }
+    MyGUI::TabItem* item = 0;
+    MyGUI::TabControl* tabs = 0;
+    int depth = 0;
+    for (MyGUI::Widget* p = page; p != 0 && depth < 80 && tabs == 0; p = p->getParent(), ++depth)
+    {
+        if (item == 0) item = p->castType<MyGUI::TabItem>(false);
+        else tabs = p->castType<MyGUI::TabControl>(false);
+    }
+    if (item == 0 || tabs == 0) { if (why != 0) *why = std::string(row->w1) + " is not on a tab's page"; return 0; }
+    if (itemOut != 0) *itemOut = item;
+    return tabs;
+}
+/* The click a player makes on that tab's button: the tab control's own selection and its own eventTabChangeSelect - what MyGUI's
+   TabControl does for a click on one of its tab buttons (a click on the tab already chosen changes nothing, so nothing fires). The tab
+   buttons are the control's skin children, out of reach of a name search, so the control itself is checked: visible, enabled (the
+   window open) and not covered (no modal box over it). */
+static bool UiDriveTabClick(MyGUI::Gui* gui, const std::string& name)
+{
+    std::string why;
+    MyGUI::TabItem* item = 0;
+    MyGUI::TabControl* tabs = UiDriveTabOf(gui, coopui::UiDriveFind(name, coopui::kDriveTab), &item, &why);
+    if (tabs == 0) return UiDriveRefuse("uiclick", name, why);
+    if (!UiDriveReach(tabs, &why, 0, 0)) return UiDriveRefuse("uiclick", name, "the tab control is " + why);
+    if (!UiDriveMouseReach(tabs, &why)) return UiDriveRefuse("uiclick", name, why);
+    const size_t idx = tabs->findItemIndex(item);
+    if (idx == MyGUI::ITEM_NONE) return UiDriveRefuse("uiclick", name, "the tab is not in its control");
+    const std::string screen = UiDriveScreen();
+    if (tabs->getIndexSelected() == idx)
+    {
+        DebugLog("[UI] uiclick " + name + " FIRED (screen " + screen + ", tab " + coopui::PanelNum((long long)idx) + " already chosen - a click on it changes nothing)");
+        return true;
+    }
+    tabs->setIndexSelected(idx);
+    tabs->eventTabChangeSelect(tabs, idx);
+    DebugLog("[UI] uiclick " + name + " FIRED (screen " + screen + ", tab " + coopui::PanelNum((long long)idx) + " of " + coopui::PanelNum((long long)tabs->getItemCount()) + " chosen)");
+    return true;
+}
 /* pp1b (item 3): an accepted engine: click waits here for the tail of the pump (UiDriveEngineClickFlush). */
 static std::string g_driveEngineQueued;
+/* T-903: a point inside the view (RenderManager's view size - the game window's client area in MyGUI's pixels), else why not. */
+static bool UiDrivePointOnScreen(int x, int y, std::string* why)
+{
+    MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+    if (rm == 0) { *why = "no GUI (no RenderManager - no view size)"; return false; }
+    const MyGUI::IntSize vs = rm->getViewSize();
+    if (x < vs.width && y < vs.height) return true;
+    *why = "off screen (the view is " + coopui::PanelNum((long long)vs.width) + "x" + coopui::PanelNum((long long)vs.height) + ")";
+    return false;
+}
+/* T-903 (T1343) - TEST-ONLY `uiclick point:<x>,<y>`: a REAL mouse click at a screen point, for a window that is neither ours nor an
+   engine: layout widget (RE_Kenshi's own settings window over the title, closed by its X). Delivered as the player's mouse is - into
+   MyGUI's InputManager: injectMouseMove to the point (the wheel's z unchanged), then injectMousePress and injectMouseRelease with the
+   left button - so MyGUI's own pick, modal rule, focus and click run, and whatever handler the hit widget has (ours, Kenshi's or
+   another mod's) runs as for a player's click. Queued like an engine: click and fired at the tail of the pump (UiDriveEngineClickFlush,
+   MAIN THREAD, after the engine's own update). What the mouse hits is named BEFORE the press by LayerManager::getWidgetFromPoint (the
+   pick injectMouseMove makes), with the covered-refusal line's description. This is MyGUI's in-process input, not OS input (F010). */
+static bool UiDrivePointFire(const std::string& name)
+{
+    int x = 0, y = 0;
+    if (coopui::UiDrivePointName(name, &x, &y) == 0) return UiDriveRefuse("uiclick", name, "not a point:<x>,<y>");
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    MyGUI::LayerManager* lm = MyGUI::LayerManager::getInstancePtr();
+    if (MyGUI::Gui::getInstancePtr() == 0 || im == 0 || lm == 0)
+        return UiDriveRefuse("uiclick", name, "no GUI at the end of the frame (Gui / InputManager / LayerManager)");
+    std::string why;
+    if (!UiDrivePointOnScreen(x, y, &why)) return UiDriveRefuse("uiclick", name, why + " (at the end of the frame)");
+    MyGUI::Widget* top = lm->getWidgetFromPoint(x, y);
+    std::string hit = "hit '" + (top != 0 ? top->getName() : std::string("nothing that takes the mouse")) + "'" + UiDriveHitDesc(top);
+    if (im->isModalAny())
+    {
+        MyGUI::Widget* root = UiTopModalRoot(im);
+        hit += " - a modal window is up ('" + (root != 0 ? root->getName() : std::string("unnamed")) + "'): MyGUI gives the mouse only to it";
+    }
+    const std::string screen = UiDriveScreen();
+    const int z = im->*UiModalRootsGet(UiOldAbsZTag());
+    const bool mv = im->injectMouseMove(x, y, z);
+    const bool pr = im->injectMousePress(x, y, MyGUI::MouseButton::Left);
+    const bool rl = im->injectMouseRelease(x, y, MyGUI::MouseButton::Left);
+    DebugLog("[UI] uiclick " + name + " FIRED - " + hit + " (at the end of the frame, screen " + screen + "; MyGUI took the move / press / release: "
+             + (mv ? "1" : "0") + "/" + (pr ? "1" : "0") + "/" + (rl ? "1" : "0") + ")");
+    return true;
+}
+/* T-906 (T1348 / T1349) - TEST-ONLY `uiclick closewindow:<LayoutSuffix>`: Kenshi's management window (opened by the map button for
+   the PLAYERS tab) stays over the in-game menu's EXIT GAME, and a second map-button press only switches its tab; a player closes it
+   with its X. This finds the engine widget whose name ends in _<LayoutSuffix> (UiDriveEngine, the engine: match - the reachable
+   match first, else the first), walks up to its nearest MyGUI::Window, and fires that window's OWN eventWindowButtonPressed("close")
+   - the event MyGUI's Window raises for a click on its X skin button, as T-220's `uiclick close` does for our panel. Refused when
+   there is no such widget, no Window above it, the window is not visible, or a modal window is up that the window is not inside.
+   Queued like an engine: click and fired at the tail of the pump (an engine handler runs there, not mid-frame inside our hook);
+   the window's visibility is read right after the event and again at the next pump (g_closeWinRecheck). No injected input. */
+static std::string g_closeWinRecheck;   /* the last fired closewindow: name, re-read once at the next pump */
+static MyGUI::Window* UiDriveWindowOf(MyGUI::Gui* gui, const std::string& suffix, std::string* why)
+{
+    std::string r;
+    MyGUI::Widget* w = UiDriveEngine(gui, suffix, 0, &r);
+    if (w == 0) { if (why != 0) *why = "no such widget - " + r; return 0; }
+    int depth = 0;
+    for (MyGUI::Widget* p = w; p != 0 && depth < 80; p = p->getParent(), ++depth)
+    {
+        MyGUI::Window* win = p->castType<MyGUI::Window>(false);
+        if (win != 0) return win;
+    }
+    if (why != 0) *why = "no window ancestor - '" + w->getName() + "' is not inside a MyGUI Window:" + UiDriveHitDesc(w);
+    return 0;
+}
+/* The checks before the event (found, a window, visible, not shut out by a modal window); the window, or 0 with the reason. */
+static MyGUI::Window* UiDriveCloseWindowCheck(MyGUI::Gui* gui, const std::string& name, std::string* why)
+{
+    std::string suffix;
+    if (coopui::UiDriveCloseWindowName(name, &suffix) == 0) { *why = "not a closewindow:<LayoutSuffix>"; return 0; }
+    MyGUI::Window* win = UiDriveWindowOf(gui, suffix, why);
+    if (win == 0) return 0;
+    int vis = 0;
+    std::string r;
+    UiDriveReach(win, &r, &vis, 0);
+    if (vis == 0) { *why = "not visible - the window '" + win->getName() + "' (" + win->getTypeName() + ") is " + r; return 0; }
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    if (im != 0 && im->isModalAny())
+    {
+        MyGUI::Widget* root = UiTopModalRoot(im);
+        bool inside = false;
+        int d = 0;
+        for (MyGUI::Widget* p = win; p != 0 && d < 80 && !inside; p = p->getParent(), ++d) inside = (p == root);
+        if (root == 0 || !inside)
+        {
+            *why = "a modal window is up ('" + (root != 0 ? root->getName() : std::string("unnamed")) + "') and the window '" + win->getName() + "' is not inside it";
+            return 0;
+        }
+    }
+    return win;
+}
+static bool UiDriveCloseWindowFire(const std::string& name)
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return UiDriveRefuse("uiclick", name, "no GUI at the end of the frame");
+    std::string why, suffix;
+    MyGUI::Window* win = UiDriveCloseWindowCheck(gui, name, &why);
+    if (win == 0) return UiDriveRefuse("uiclick", name, why + " (at the end of the frame)");
+    coopui::UiDriveCloseWindowName(name, &suffix);
+    const std::string wname = win->getName();       /* read BEFORE the event: the handler may destroy the window */
+    const std::string wtype = win->getTypeName();
+    const std::string screen = UiDriveScreen();
+    win->eventWindowButtonPressed(win, "close");
+    /* after: found AGAIN from the live tree (never through `win`, which the handler may have destroyed) */
+    std::string after = "gone";
+    MyGUI::Window* again = UiDriveWindowOf(gui, suffix, 0);
+    if (again != 0 && again == win)
+    {
+        int vis = 0;
+        UiDriveReach(again, 0, &vis, 0);
+        after = vis != 0 ? "1" : "0";
+    }
+    else if (again != 0) after = "gone (the widget now sits in another window '" + again->getName() + "')";
+    DebugLog("[UI] uiclick " + name + " FIRED - window '" + wname + "' (" + wtype + ") visible before=1 after=" + after
+             + " (read right after the window's own eventWindowButtonPressed 'close', at the end of the frame, screen " + screen + "; read again at the next pump)");
+    g_closeWinRecheck = name;
+    return true;
+}
+/* The next pump's second read of the window a closewindow: fired on - says whether the engine hid it later. */
+static void UiDriveCloseWindowRecheck()
+{
+    if (g_closeWinRecheck.empty()) return;
+    const std::string name = g_closeWinRecheck;
+    g_closeWinRecheck.clear();
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    std::string suffix;
+    if (gui == 0 || coopui::UiDriveCloseWindowName(name, &suffix) == 0) return;
+    MyGUI::Window* win = UiDriveWindowOf(gui, suffix, 0);
+    int vis = 0;
+    if (win != 0) UiDriveReach(win, 0, &vis, 0);
+    DebugLog("[UI] uiclick " + name + " NEXT PUMP - window " + (win != 0 ? "'" + win->getName() + "' (" + win->getTypeName() + ") visible=" + (vis != 0 ? "1" : "0")
+             : std::string("gone (no Window above the widget, or no such widget)")));
+}
 static bool UiDriveClick(MyGUI::Gui* gui, const std::string& name)
 {
     if (coopui::UiDriveFind(name, coopui::kDriveWindowClose) != 0) return UiDriveWindowClose(gui, name);   /* T-220 */
     if (coopui::UiDriveFind(name, coopui::kDriveEscape) != 0) return UiDriveEscape(name);                  /* T-220 */
+    if (coopui::UiDriveFind(name, coopui::kDriveTab) != 0) return UiDriveTabClick(gui, name);              /* p47d */
+    if (coopui::UiDriveCloseWindowLike(name) != 0)   /* T-906: checked now, fired at the tail of the pump (checked again there) */
+    {
+        std::string cwhy;
+        MyGUI::Window* win = UiDriveCloseWindowCheck(gui, name, &cwhy);
+        if (win == 0) return UiDriveRefuse("uiclick", name, cwhy);
+        if (!g_driveEngineQueued.empty()) return UiDriveRefuse("uiclick", name, "an engine click is already queued (" + g_driveEngineQueued + ")");
+        g_driveEngineQueued = name;
+        DebugLog("[UI] uiclick " + name + " QUEUED (screen " + UiDriveScreen() + ", window '" + win->getName() + "' (" + win->getTypeName()
+                 + ")) - its own 'close' event fires at the end of this frame");
+        return true;
+    }
+    if (coopui::UiDrivePointLike(name) != 0)   /* T-903: checked now (shape, on screen), fired at the tail of the pump */
+    {
+        int x = 0, y = 0;
+        std::string pwhy;
+        if (coopui::UiDrivePointName(name, &x, &y) == 0) return UiDriveRefuse("uiclick", name, "not a point:<x>,<y>");
+        if (!UiDrivePointOnScreen(x, y, &pwhy)) return UiDriveRefuse("uiclick", name, pwhy);
+        if (!g_driveEngineQueued.empty()) return UiDriveRefuse("uiclick", name, "an engine click is already queued (" + g_driveEngineQueued + ")");
+        g_driveEngineQueued = name;
+        DebugLog("[UI] uiclick " + name + " QUEUED (screen " + UiDriveScreen() + ") - the mouse click fires at the end of this frame");
+        return true;
+    }
     std::string why, suffix;
     const int engine = coopui::UiDriveEngineName(name, &suffix);
     MyGUI::Widget* w = (engine != 0)
@@ -7685,6 +7912,8 @@ static bool UiDriveClick(MyGUI::Gui* gui, const std::string& name)
 /* The queued engine click, found AGAIN (the engine's update may have rebuilt the screen) and checked again before it fires. */
 static bool UiDriveEngineClickFire(const std::string& name)
 {
+    if (coopui::UiDrivePointLike(name) != 0) return UiDrivePointFire(name);   /* T-903: the queued screen-point click */
+    if (coopui::UiDriveCloseWindowLike(name) != 0) return UiDriveCloseWindowFire(name);   /* T-906: the queued window close */
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (gui == 0) return UiDriveRefuse("uiclick", name, "no GUI at the end of the frame");
     std::string why, suffix;
@@ -7706,13 +7935,23 @@ static bool UiDrivePick(MyGUI::Gui* gui, const std::string& list, const std::str
     if (w == 0) return UiDriveRefuse("uipick", what, why);
     MyGUI::MultiListBox* m = w->castType<MyGUI::MultiListBox>(false);
     if (m == 0) return UiDriveRefuse("uipick", what, "the widget is not a list");
+    /* p47d: the PLAYERS table is in Kenshi's management window, where a box can lie over it - refused when covered, as a click */
+    const bool players = (list == "players");
+    if (players && !UiDriveMouseReach(w, &why)) return UiDriveRefuse("uipick", what, why);
     const size_t count = m->getItemCount();
     size_t row = MyGUI::ITEM_NONE;
-    for (size_t i = 0; i < count && row == MyGUI::ITEM_NONE; ++i)
+    int slot = -1;
+    if (players && coopui::UiDrivePickSlot(text, &slot) != 0)
     {
-        const char* p = m->getItemNameAt(i).asUTF8_c_str();   /* the row's first column, as the player reads it */
-        if (p != 0 && text == p) row = i;
+        const int r = PlayersTabRowOfSlot(slot);   /* the table's own row for that slot, as it was last filled */
+        if (r >= 0 && (size_t)r < count) row = (size_t)r;
     }
+    else
+        for (size_t i = 0; i < count && row == MyGUI::ITEM_NONE; ++i)
+        {
+            const char* p = m->getItemNameAt(i).asUTF8_c_str();   /* the row's first column, as the player reads it */
+            if (p != 0 && (text == p || (players && text == coopui::UiDrivePlainText(p)))) row = i;   /* p47d: PLAYERS' names are coloured */
+        }
     if (row == MyGUI::ITEM_NONE) return UiDriveRefuse("uipick", what, "no such row (" + coopui::PanelNum((long long)count) + " rows)");
     const std::string screen = UiDriveScreen();
     m->setIndexSelected(row);
@@ -7852,6 +8091,25 @@ static bool UiDriveState(MyGUI::Gui* gui)
     static const char* const kTitle[4] = { "ContinueButton", "NewGameButton", "LoadGameButton", "ExitButton" };
     for (int k = 0; k < 4; ++k)
         line += ",engine:" + std::string(kTitle[k]) + ":" + UiDriveFlags(UiDriveEngine(gui, std::string(kTitle[k]), 0, 0));
+    {   /* p47d: the PLAYERS tab (its control's flags, then 1 while it is the chosen tab; - = no such tab), the table (rows:chosen row,
+           - = none) and what INVITE TO FACTION's button and the faction box's two buttons read now (their flags are in buttons=) */
+        MyGUI::TabItem* item = 0;
+        MyGUI::TabControl* tabs = UiDriveTabOf(gui, coopui::UiDriveFind("playerstab", coopui::kDriveTab), &item, 0);
+        line += " playerstab=" + (tabs != 0 ? UiDriveFlags(tabs) + (tabs->getIndexSelected() == tabs->findItemIndex(item) ? "1" : "0") : std::string("-"));
+        MyGUI::Widget* pw = gui->findWidgetT(std::string("SWPlayersList"), false);
+        MyGUI::MultiListBox* pl = pw != 0 ? pw->castType<MyGUI::MultiListBox>(false) : 0;
+        line += " players=" + (pl != 0 ? coopui::PanelNum((long long)pl->getItemCount()) + ":"
+                                         + (pl->getIndexSelected() == MyGUI::ITEM_NONE ? std::string("-") : coopui::PanelNum((long long)pl->getIndexSelected()))
+                                       : std::string("-"));
+        static const char* const kCap[3][2] = { { "playersright", "SWPlayersRightActBtn" }, { "boxright", "SWFactionBoxRightBtn" }, { "boxleft", "SWFactionBoxLeftBtn" } };
+        for (int k = 0; k < 3; ++k)
+        {
+            MyGUI::Widget* cw = gui->findWidgetT(std::string(kCap[k][1]), false);
+            MyGUI::TextBox* tb = cw != 0 ? cw->castType<MyGUI::TextBox>(false) : 0;
+            const char* cap = tb != 0 ? tb->getCaption().asUTF8_c_str() : 0;
+            line += " " + std::string(kCap[k][0]) + "='" + (cap != 0 ? cap : "") + "'";
+        }
+    }
     DebugLog(line);
     return true;
 }
@@ -8565,6 +8823,8 @@ void UiDriveEngineClickFlush(int atTitle)
     try { LoadTailAct(atTitle); }
     catch (...) { DebugLog("[AUTOLOAD] a C++ exception at the end of the frame; nothing more done"); }
     if (atTitle == 0) g_prepPhase = coopui::kPrepNone;   /* in a world: the press's preparation is over */
+    try { UiDriveCloseWindowRecheck(); }   /* T-906: the second read of a window closed at the previous pump's tail (before any new fire) */
+    catch (...) { g_closeWinRecheck.clear(); }
     if (g_driveEngineQueued.empty()) return;
     const std::string name = g_driveEngineQueued;
     g_driveEngineQueued.clear();   /* cleared FIRST: a handler that throws or re-enters never fires it twice */

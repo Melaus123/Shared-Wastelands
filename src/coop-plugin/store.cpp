@@ -439,7 +439,7 @@ const int kSaveRequestLoad = 2;
 unsigned long long kSaveFileSystemGlobalRva = 0; static coop::AddrReg kSaveFileSystemGlobalRva_reg("SaveFileSystemGlobal", &kSaveFileSystemGlobalRva);   /* P8h: the address table fills this. Steam_1.0.65 0x212DC08 */
 const unsigned int kSfsBusyOff = 0x1E0;
 unsigned long long kResetGameRva = 0; static coop::AddrReg kResetGameRva_reg("ResetGame", &kResetGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x36CA40 */   // F489: GameWorld::resetGame - what SaveManager::loadGame calls to clear the world mid-session (FactionDirectory::clearAndFree, the global container, the player faction)
-const unsigned int kStoreProtocol = 100;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kStoreProtocol = 101;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 typedef bool (*GdcLoadFn)(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag);
 GdcLoadFn orig_gdcLoad = 0;
 /* Z1-b (review-z1 item 1): the readFile -> load handshake. It was two bare strings any thread overwrote; it is now a
@@ -4948,7 +4948,12 @@ unsigned char detour_isPersistent(void* platoon)
             // everyone is dead: let the engine's classifier decide (it discards) - the destroy hook below then deletes the notebook entry
             ++g_releasedDead;
             std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
-            DebugLog("[STORE] group '" + (b != g_bind.end() ? b->second : std::string("?")) + "' has no living members - released to the engine (decision 28)");
+            const std::string relName = (b != g_bind.end() ? b->second : std::string("?"));
+#ifndef SW_DEV_BUILD
+            static std::set<std::string> s_releasedSaid;   /* T-910: the release build says it once per group; releasedDead counts every release */
+            if (s_releasedSaid.insert(relName).second)
+#endif
+            DebugLog("[STORE] group '" + relName + "' has no living members - released to the engine (decision 28)");
             return orig_isPersistent(platoon);
         }
         if (living == -1) ++g_livingFault;
@@ -24104,6 +24109,15 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
     else if (IsPositionLoadedHere(x, y, z)) { ++g_createDeferredLoadedHere; what = "unknown here but its position is loaded here: NOT created (a sleeping copy in a live area would wake at once beside the holder's group; review-s2hb fold)"; }
     else if (CreateUnknownSquad(r)) what = "unknown here: sleeping squad CREATED from the record";
     else { ++g_unknownDeferred; what = "unknown here: creation not possible (refs/load/state - see counters)"; }
+#ifndef SW_DEV_BUILD
+    {
+        /* T-910: the release build writes each outcome's first lines in full, then a count a minute (coop_log.h QuietLogPass); a
+           refusal or a failure ("NOT ...", "not possible") is always written */
+        static swlogbudget::Gate s_qRecv;
+        const bool recvRefused = what.find("NOT ") != std::string::npos || what.find("not possible") != std::string::npos;
+        if (!recvRefused && !QuietLogPass(&s_qRecv, "[STORE] RECV worldId", swlogbudget::KeyOf(what.c_str()), what.c_str())) return;
+    }
+#endif
     DebugLog("[STORE] RECV worldId=" + worldId + " squad='" + squadSid + "' faction='" + factionName + "' pos=" + F1(x) + "," + F1(y) + "," + F1(z)
              + " writtenAt=" + N(writtenAt) + " owner=" + N(owner) + " bytes=" + N((long long)bytes.size()) + " -> " + what);
 }
@@ -26106,8 +26120,9 @@ int StoreRequestTestSave(void* saveMgr, const std::string& name)
 /* Owner 204 TEST-ONLY lever (`handkey save|load`, command_channel.cpp; F010: the harness cannot press a key). It calls the
    ENGINE's own entry - the hooked address, so our detour runs exactly as it does for the key: F5 is SaveManager::save("quicksave", 0)
    (processKeys 0x7875C0 case 0xE, the call at 0x787A40), F9 is SaveManager::load("quicksave") (processKeys 0x787AA5). Nothing else.
-   1 = called; -2 = that hook is not installed (not called: without the hook the engine would really save / load); -1 = no
-   SaveManager. MAIN THREAD. */
+   1 = called and the engine's own function ran; 2 = called, but our hook's multiplayer rule refused it (the engine's function not
+   called - g_handSaveRefused / g_handLoadRefused rose); 3 = save only, called, but the folder redirect refused it (not called);
+   -2 = that hook is not installed (not called: without the hook the engine would really save / load); -1 = no SaveManager. MAIN THREAD. */
 int StoreHandKey(void* saveMgr, int load)
 {
     if (saveMgr == 0) return -1;
@@ -26116,11 +26131,18 @@ int StoreHandKey(void* saveMgr, int load)
     {
         const uintptr_t a = (uintptr_t)coop::AddrAbs(kT239SmLoadName);
         if (g_loadNameHookOn == 0 || orig_saveManagerLoadName == 0 || a == 0) return -2;
+        const long long loadRefusedBefore = g_handLoadRefused;
         ((SaveManagerLoadNameFn)a)(saveMgr, &name);
-        return 1;
+        return g_handLoadRefused != loadRefusedBefore ? 2 : 1;   /* T-906: our hook's multiplayer rule refused it (the engine's load not called) */
     }
     if (orig_saveManagerSave == 0 || kSaveManagerSaveRva == 0) return -2;
+    const long long saveRefusedBefore = g_handSaveRefused;
+    g_saveRedirectRefusedNow = 0;
     ((SaveManagerSaveFn)(Base() + kSaveManagerSaveRva))(saveMgr, &name, (char)0);
+    const int redirectRefused = g_saveRedirectRefusedNow;
+    g_saveRedirectRefusedNow = 0;
+    if (g_handSaveRefused != saveRefusedBefore) return 2;   /* T-906 (T1349): detour_saveManagerSave's multiplayer rule refused it - the engine's save not called */
+    if (redirectRefused != 0) return 3;                     /* T-906: SaveRedirectTo refused the folder - the engine's save not called */
     return 1;
 }
 /* 1 = the request left the pump (+0xA0 back to 0), the SaveFileSystem copy finished (+0x1E0 back to 0) AND the slot's

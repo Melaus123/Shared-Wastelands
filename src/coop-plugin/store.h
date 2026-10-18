@@ -510,7 +510,9 @@ double LocalWorldHours();
 // never retried). MAIN THREAD. The caller checks the name.
 int StoreRequestTestSave(void* saveMgr, const std::string& name);
 // Owner 204 TEST-ONLY (`handkey save|load`): the engine's own SaveManager::save("quicksave", 0) (F5) or load("quicksave") (F9)
-// through the hooked entry - nothing else. 1 called, -2 that hook is not installed (not called), -1 no SaveManager. MAIN THREAD.
+// through the hooked entry - nothing else. 1 called (the engine's function ran), 2 refused by our hook's multiplayer rule (the
+// engine's function not called), 3 save refused by the folder redirect (not called), -2 that hook is not installed (not called),
+// -1 no SaveManager. MAIN THREAD.
 int StoreHandKey(void* saveMgr, int load);
 // 1 = the save left the request pump, the SaveFileSystem copy finished and <slot>\quick.save exists; 2 = finished but no
 // quick.save (failed); 0 running; -1 unreadable. -2 from StoreRequestTestSave = the save hook is not installed.

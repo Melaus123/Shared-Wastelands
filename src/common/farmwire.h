@@ -337,6 +337,31 @@ inline int MineStepRoute(int single, int linked, int writer)
     return kMineRelay;
 }
 
+/* T-610: A WORKER THAT IS A COPY of another game's character (whoCopy): its step is neither run nor relayed on this game, on any
+   linked game - the writer included. Its own game runs its job and runs or relays that work (MineStepRoute, MINE_OP); a second
+   count from the copy was the work counted twice (T1321: B's character's copy on A ran one operate step on A while B relayed the
+   same work). 1 = skip the step. */
+inline int MineWorkerSkip(int single, int whoCopy)
+{
+    return (single == 0 && whoCopy != 0) ? 1 : 0;
+}
+
+/* T-610: THE COPY TEST of a worker, from any thread: a replicated character (uid != 0) that the owned mirror does not list
+   (mine == 0), while that mirror is exact (mirrorExact != 0). A "not mine" from an inexact mirror is no proof, so the worker is
+   then treated as this game's own - the fail-safe of items.cpp ItCcIsCopy (kit3 review D8). 1 = a copy. */
+inline int WorkerIsCopy(unsigned int uid, int mine, int mirrorExact)
+{
+    return (uid != 0 && mine == 0 && mirrorExact != 0) ? 1 : 0;
+}
+
+/* T-610: THE TAKE STEP for an unlisted worker that is a copy of another game's character (whoCopy): refused on every linked game.
+   Its own game asks the runner for its spot (SPOT_ASK); the runner takes it with its copy through the engine's own take, which
+   does not pass the take detour (farm.cpp SpTakeRun), so that copy is then listed. 1 = refuse. */
+inline int SpotCopyRefused(int single, int linked, int listed, int whoCopy)
+{
+    return (single == 0 && linked != 0 && listed == 0 && whoCopy != 0) ? 1 : 0;
+}
+
 /* MINE_OP work on this game (received, or kept by the worker's own game): run it (this game writes the building), wait (no
    writer named yet - held up to kFmPendMs, as FARM_OP), or refuse / send on (another game writes it). */
 const int kMineAccRefuse = -1, kMineAccWait = 0, kMineAccRun = 1;

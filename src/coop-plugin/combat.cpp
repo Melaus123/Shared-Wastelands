@@ -50,7 +50,7 @@ namespace coop { void LimbSafePointDrain(); }   /* LIMBS: clothing.cpp - the own
 namespace coop { void BoxTakeDrain(); }      /* loot2c: items.cpp - the `boxtake` lever's move runs at this same safe point */
 
 #include "coop_log.h"
-namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
+namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose, g_qM6Sent, g_qM6Unknown; }   /* T-910: g_qM6Sent, g_qM6Unknown */   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/hand.h"   // P-15: the target handle is taken locally, never sent
 #include "game/CombatClass.h"      // T-186 (mig5): these three replace this file's old stand-in declarations;
@@ -6921,7 +6921,7 @@ void CombatModeTick()
         if (net::SendCombatMode(uid, on != 0, targetUid))
         {
             ++g_cmSent;
-            DebugLog("[M6] combat mode " + std::string(on ? "ON" : "OFF") + " uid=" + N3(uid)
+            SW_QUIETLOG(g_qM6Sent, "[M6] combat mode sent", on ? 1 : 0, on ? "ON" : "OFF", "[M6] combat mode " + std::string(on ? "ON" : "OFF") + " uid=" + N3(uid)
                      + " target=" + N3(targetUid) + " -> peer");
         }
     }
@@ -7084,7 +7084,7 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
     if (c == 0)
     {
         ++g_cmRefused;
-        DebugLog("[M6] COMBATMODE for unknown uid=" + N3(uid) + " - no local copy (F079)");
+        SW_QUIETLOG(g_qM6Unknown, "[M6] COMBATMODE for unknown uid", 0, 0, "[M6] COMBATMODE for unknown uid=" + N3(uid) + " - no local copy (F079)");   /* T-910 */
         // P059 - a window cannot be closed properly without the character; do not leave the row open.
         CombatWatch* zw = CombatWatchFor(uid);
         if (zw != 0 && zw->nativeOn) { ++g_ncCloseNoChar; FinishNativeClose(uid, zw, "no_character", false); }

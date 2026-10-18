@@ -49,8 +49,8 @@ namespace hovrec {
 const int          kHandFamily   = 17;
 const unsigned int kHandCap      = 256;    /* lines the file keeps; only SETTLED lines (closed / returned) are dropped to fit */
 inline std::string HandFile() { return "pp.handover"; }
-const unsigned int kGameProtocol = 165;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it);
-                                              165 (T-609): the farm worker-spot kinds inside MSG_BUILD renumbered 12-14 -> 13-15 */
+const unsigned int kGameProtocol = 166;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it);
+                                              166 (P47): MSG_BUILD kinds 16 POWER_STATE and 17 POWER_ASK (src/common/powerwire.h) */
 const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h, liveenvelope.h kInnerItemHandover assert it) */
 
 const int kRoleSrc = 0, kRoleDst = 1;

@@ -428,9 +428,7 @@ static ::Faction* SweepFactionPod(::Character* c)   /* area2 fold: the faction r
     __try { return c->getOwnerFactionDirect(); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-// PROBE-START: P022 - are the "already spawned" candidates real mirrors or stale index hits at recycled addresses?
-int g_p22Logged = 0; bool g_p22EyeMine = false; long long g_p22Stale = 0, g_p22Real = 0;
-// PROBE-END: P022
+/* T-910: probe P022 (resolved) removed */
 // PROBE-END: P021
 /* P8e: and the `isHost` term is GONE - see the comment above and audit row C5.
    P8a: THE AREA RULE, ONCE, WITH ITS ANSWER NAMED.  The sweep needs a yes/no and the roster needs to know
@@ -966,7 +964,7 @@ void WorldSyncTick()
         ++g_p21Ticks; static double lastEye = 0.0; const double nowE = (double)::GetTickCount() / 1000.0;
         if (haveRef && nowE - lastEye >= 10.0)
         {
-            lastEye = nowE; const Sector se = SectorOf(eye.x, eye.z); g_p22EyeMine = (HeldByOtherTS(se) == 0);   /* P022 */
+            lastEye = nowE; const Sector se = SectorOf(eye.x, eye.z);
             SW_DEVLOG("[PROBE] P021 eye sector " + S((long long)se.x) + "," + S((long long)se.y) + " held=" + S((long long)HeldByOtherTS(se)) + " listSize=" + S((long long)n)
                      + " seen/spawned/guard/rule/radius=" + S(g_p21Seen) + "/" + S(g_p21Spawned) + "/" + S(g_p21Guard) + "/" + S(g_p21Rule) + "/" + S(g_p21Radius));
         }
@@ -997,19 +995,6 @@ void WorldSyncTick()
                 if (su != 0)
                 {
                     ++g_p21Spawned;
-                    // PROBE-START: P022
-                    if (g_p22EyeMine && pass == 0)
-                    {
-                        const bool agrees = (const void*)FindSpawned(su) == (const void*)c;
-                        if (agrees) ++g_p22Real; else ++g_p22Stale;
-                        if (g_p22Logged < 8 && PlausibleObject(*(void**)((char*)c + 0x448)))
-                        {
-                            ++g_p22Logged; ::Faction* pf = c->getOwnerFactionDirect();
-                            SW_DEVLOG("[PROBE] P022 spawned-hit: uid=" + S((long long)su) + " forwardMapAgrees=" + S((long long)(agrees ? 1 : 0)) + " mine=" + S((long long)(net::IsUidMine(su) ? 1 : 0))
-                                     + " player=" + S((long long)(IsPlayerFaction(pf) ? 1 : 0)) + " faction='" + (PlausibleObject(pf) ? WireFactionName(pf) : std::string("?")) + "'");
-                        }
-                    }
-                    // PROBE-END: P022
                     continue;   // already ours - includes everything adopted
                 }
             }
@@ -1602,7 +1587,7 @@ void ReportWorldSync()
              + " retired=" + S(g_retired)
              + " restored=" + S(g_restored)
              + " unloadSent[putAway,reloaded,heldSettled,retire,announce]=" + S(g_unloadSentWhy[0]) + "," + S(g_unloadSentWhy[1]) + "," + S(g_unloadSentWhy[2]) + "," + S(g_unloadSentWhy[3]) + "," + S(g_unloadSentWhy[4])
-             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " p22[stale,real]=" + S(g_p22Stale) + "," + S(g_p22Real) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
+             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
              + " falseGone=" + S(g_falseGone)
              + " sweepStandInSkipped=" + S(g_sweepStandInSkipped)   /* inv7a-b */
              + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */

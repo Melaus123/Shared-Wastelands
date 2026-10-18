@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 namespace coopbuild { struct BuildMsg; }   /* build1-b: src/common/buildwire.h */
+namespace powerwire { struct PowerMsg; }   /* P47: src/common/powerwire.h */
 namespace coopown { struct BuildRow; struct HelpRecRow; }     /* mmo8a: src/common/ownrec.h (pp.build); help1 fold: pp.help */
 namespace coop {
 void InstallBuild();                                  // preload: the observe hooks (address table names below)
@@ -17,6 +18,7 @@ void BuildCopyDrain();                                // build1-b, K2 safe point
 void BuildNoteRecv(const coopbuild::BuildMsg& m, unsigned int fromPeer);   // build1-b/c/d, MAIN THREAD (session dispatch): a decoded PLACE, STATE or REMOVE (build1-d), queued
 void BuildForgetWorld();                              // build1-c (review-build1b M2): world teardown - pending PLACEs / STATEs and the copy rows
 void BuildNoteBad();                                  // build1-b: a MSG_BUILD that did not decode
+void PowerNoteRecv(const powerwire::PowerMsg& m, unsigned int fromPeer);   // P47, MAIN THREAD (session dispatch): a POWER_STATE / POWER_ASK, kept for the K2 safe point
 void BuildTestDrain();                                // K2 safe point (combat.cpp detour_tsRagdollUpdates): runs the armed request
 std::string BuildListCommand();
 std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it

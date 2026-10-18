@@ -345,6 +345,23 @@ static void (*orig_titleUpdate)(TitleScreen*) = 0;
 static long long g_titleFrames = 0;
 static bool g_titleFirstLogged = false;
 
+/* T-910: the [P005] titleFrames line's pace. The DEV build writes it every 120 title frames, as before; the release build writes
+   the first, then one a minute (every 120 frames is about 11 lines a second at the title screen). */
+static bool TitleLineDue()
+{
+#ifdef SW_DEV_BUILD
+    return true;
+#else
+    static bool s_said = false;
+    static DWORD s_at = 0;
+    const DWORD now = ::GetTickCount();
+    if (s_said && now - s_at < 60000u) return false;
+    s_said = true;
+    s_at = now;
+    return true;
+#endif
+}
+
 static void detour_titleUpdate(TitleScreen* thisptr)
 {
     ++g_titleFrames;
@@ -359,7 +376,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
         DebugLog(ss.str());
     }
 
-    if (g_titleFrames % 120 == 0)
+    if (g_titleFrames % 120 == 0 && TitleLineDue())
     {
         std::stringstream ss;
         ss << "[P005] titleFrames=" << fmtNum(g_titleFrames)
@@ -448,10 +465,14 @@ static bool installProbeP005()
 // ---------------------------------------------------------------------------
 static void probeOu(const char* when)
 {
+#ifdef SW_DEV_BUILD   /* T-910: P003 is answered - the DEV build's only */
     std::stringstream ss;
     ss << "[P003] " << when
        << " ou(value)=" << fmtPtr(coop::GameWorldPtr());   /* our GameWorldGlobal row */
     DebugLog(ss.str());
+#else
+    (void)when;
+#endif
 }
 // PROBE-END: P003
 

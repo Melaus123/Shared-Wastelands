@@ -108,6 +108,10 @@ bool         g_driftSummarySet = false;
 // Per mirror slot: the copy there and its far checks in a row (swlogbudget::DriftDisagrees).
 std::vector<unsigned int> g_driftFarUid;
 std::vector<int>          g_driftFarChecks;
+// T-910: per mirror slot, whether the copy there disagreed at its last check and how many of its disagreeing lines were written; and
+// the disagreeing checks not written (the release build writes a character's first 3, then each disagreement's start and end).
+std::vector<int>          g_driftWasOff, g_driftShown;
+long long                 g_driftHeld = 0;
 
 // High-water marks. These are the numbers that answer "was a bound ever close to being hit",
 // which is a different question from "was it hit" - and the only one worth asking before it is.
@@ -387,6 +391,7 @@ void DriftDigest()
         unsigned int latch = 0; float nextKO = 0.0f, koT = 0.0f;
         int n = SnapshotState(uid, rec, 32, &blood, &prone, &dead, &latch, &nextKO, &koT);
         if (n <= 0) continue;
+        bool driftEnd = false;   /* T-910: this line is the first check after a disagreement that agrees again */
 #ifndef SW_DEV_BUILD
         /* the release build: a line only for a copied character whose copy disagrees with what its owner last sent (src/common/
            logbudget.h DriftDisagrees: past the distance at which the drive starts correcting it on two checks in a row, or dead /
@@ -395,14 +400,22 @@ void DriftDigest()
         if (net::IsUidMine(uid)) continue;
         {
             if ((int)g_driftFarUid.size() <= i) { g_driftFarUid.resize((size_t)i + 1, 0); g_driftFarChecks.resize((size_t)i + 1, 0); }
-            if (g_driftFarUid[(size_t)i] != uid) { g_driftFarUid[(size_t)i] = uid; g_driftFarChecks[(size_t)i] = 0; }
+            if ((int)g_driftWasOff.size() <= i) { g_driftWasOff.resize((size_t)i + 1, 0); g_driftShown.resize((size_t)i + 1, 0); }   /* T-910 */
+            if (g_driftFarUid[(size_t)i] != uid) { g_driftFarUid[(size_t)i] = uid; g_driftFarChecks[(size_t)i] = 0; g_driftWasOff[(size_t)i] = 0; g_driftShown[(size_t)i] = 0; }
             const float driftXZ = PuppetWindowDriftNow(uid);
             const bool off = swlogbudget::DriftDisagrees(driftXZ, PuppetCorrectDistance(), dead, CopyOwnerSaysDead(uid) ? 1 : 0,
                                                          &g_driftFarChecks[(size_t)i]);
             ++g_driftChecked;
             if (off) ++g_driftOff;
             if (driftXZ > g_driftWorst) g_driftWorst = driftXZ;
-            if (!off) { /* PROBE P141 BEGIN */ P141NotePrinted(uid); /* PROBE P141 END */ continue; }
+            const bool wasOff = g_driftWasOff[(size_t)i] != 0;
+            g_driftWasOff[(size_t)i] = off ? 1 : 0;
+            if (!off && !wasOff) { /* PROBE P141 BEGIN */ P141NotePrinted(uid); /* PROBE P141 END */ continue; }
+            /* T-910: a character's first 3 disagreeing lines; after them only a disagreement's start and its end (the first check that
+               agrees again); the rest are counted on the drift summary */
+            if (off && wasOff && g_driftShown[(size_t)i] >= 3) { ++g_driftHeld; /* PROBE P141 BEGIN */ P141NotePrinted(uid); /* PROBE P141 END */ continue; }
+            if (off) ++g_driftShown[(size_t)i];
+            driftEnd = !off;
         }
 #endif
 
@@ -421,9 +434,13 @@ void DriftDigest()
             ReadCarriedProbe(c, &carried, &inSomething);
             carryProbe = " carried=" + N(carried) + " inSomething=" + N(inSomething);
         }
+#ifdef SW_DEV_BUILD
         float sp[6]; ReadSpeedProbe(c, sp);   // PROBE P071
         const std::string speedProbe = " P071 run=" + F2(sp[0]) + " ath=" + F2(sp[1]) + " athMul=" + F2(sp[2])
             + " enc=" + F2(sp[3]) + " animMax=" + F2(sp[4]) + " mvMax=" + F2(sp[5]);
+#else
+        const std::string speedProbe;   /* T-910: the P071 fields are the DEV build's only */
+#endif
         ++g_driftLines;
         /* PROBE P141 BEGIN */ if (!net::IsUidMine(uid)) P141NotePrinted(uid); /* PROBE P141 END */
         DebugLog("[M5] drift t=" + N(ElapsedMs() / 1000) + "s uid=" + N(uid)
@@ -440,7 +457,7 @@ void DriftDigest()
                  // blind to for 60 runs, and the one the user could see from the sofa while
                  // every instrument here reported a pass.
                  + " " + CombatString(c)
-                 + " parts=" + N(n) + " fs=" + fs);
+                 + " parts=" + N(n) + " fs=" + fs + (driftEnd ? " (agrees again)" : ""));
     }
     /* PROBE P141 BEGIN */ P141AfterDigest(); /* PROBE P141 END */
 #ifndef SW_DEV_BUILD
@@ -452,8 +469,9 @@ void DriftDigest()
                  + N((nowMs - g_driftSummaryAt) / 1000) + " s, " + N(g_driftOff) + " disagreed with their owner's word, worst distance "
                  + F2(g_driftWorst) + " (off past " + F2(PuppetCorrectDistance()) + " on " + N((int)swlogbudget::kDriftHoldChecks)
                  + " checks in a row, LOST past " + F2(PuppetLostDistance()) + "; the release build writes a drift line only for a copy"
-                 " that disagrees)");
-        g_driftSummaryAt = nowMs; g_driftChecked = 0; g_driftOff = 0; g_driftWorst = 0.0f;
+                 " that disagrees - a character's first 3, then each disagreement's start and end; " + N(g_driftHeld)
+                 + " more disagreeing checks were not written)");   /* T-910 */
+        g_driftSummaryAt = nowMs; g_driftChecked = 0; g_driftOff = 0; g_driftWorst = 0.0f; g_driftHeld = 0;
     }
 #endif
 }

@@ -60,6 +60,7 @@
 #include "../common/modversion.h"           /* the mod's version: the report's info line and the title screen's version line */
 #include "soak.h"                          /* GameplayRunning */
 #include "doors.h"                         /* ReportDoors - the door totals go into the log a report packs */
+namespace coop { std::string ItemsKeeperRepairToken(); }   /* T-910: items.cpp (declared in items.h) - the empty-shop repairs on the report's header */
 #include "farm.h"                          /* ReportFarm - the [FARM] / [MINE] totals go into the log a report packs */
 #include "net/session.h"                   /* SessionProtocolVersion */
 #include "../common/bugreport.h"
@@ -428,7 +429,10 @@ struct Job
     std::wstring logStart[3], logMiddle[3];   /* each launch's opening (.start) and middle (.prev) parts, when its log grew past
                                                  2 MB (the 10 MB ceiling, coop_log.cpp); index = launch, 0 = this one */
     std::wstring serverLog;  /* the log of the world server this game started (UiServerLogPath); empty = none */
+    std::string keeperHead;  /* T-910: report.txt's empty-shop repairs line */
+    std::string keeperText;  /* T-910: every [KEEPER] line of this launch (LogKeeperLinesText), for keeper-lines.txt */
 };
+const char* const kKeeperLinesFile = "keeper-lines.txt";   /* T-910 */
 struct ZipPart
 {
     std::string name;
@@ -571,6 +575,16 @@ void RunJob(Job& j)
                           coopbug::kOrderNearby, &nearby[k].pack, 0, nearby[k].name + "'s current mod log (a nearby player, slot " + Num(nearby[k].slot) + ")" };
             parts.push_back(p);
         }
+        /* T-910: every [KEEPER] line of this launch, kept in memory (coop_log.h LogKeeperLinesText); its IP addresses removed as a log's are; never cut */
+        std::string keeperClean;
+        coopbug::ScrubIps(j.keeperText, &keeperClean);
+        const std::vector<unsigned char> keeperRaw(keeperClean.begin(), keeperClean.end());
+        if (!keeperRaw.empty())
+        {
+            ZipPart p = { kKeeperLinesFile, coopbug::kOrderKeep, 0, &keeperRaw,
+                          "every [KEEPER] line this launch wrote (the first 50 and the newest 200, kept in memory so a cut of the log cannot lose them)" };
+            parts.push_back(p);
+        }
         std::vector<coopbug::BudgetPart> bp(parts.size() + 1);
         for (size_t k = 0; k < parts.size(); ++k)
         {
@@ -583,7 +597,7 @@ void RunJob(Job& j)
                 bp[k].fixed += sizeof(coopbug::kFinalBlock);
                 for (size_t s = 0; s < parts[k].pack->segs.size(); ++s) bp[k].segBytes.push_back(parts[k].pack->segs[s].bytes.size());
             }
-            else { bp[k].fixed += parts[k].raw->size(); bp[k].droppable = true; }
+            else { bp[k].fixed += parts[k].raw->size(); bp[k].droppable = parts[k].order != coopbug::kOrderKeep; }   /* T-910: keeper-lines.txt is never dropped */
         }
         /* report.txt and the zip's end record, never cut: a generous reserve, as report.txt is written after the cuts */
         bp[parts.size()].fixed = coopbug::ZipEntryOverhead("report.txt") + 16384u + j.desc.size() + coopbug::kZipEndBytes;
@@ -594,6 +608,7 @@ void RunJob(Job& j)
         m += std::string(swnames::kBugReportTitle) + "\r\n";
         m += "Made: " + UtcNow() + "\r\n";
         m += std::string("Build: ") + LogBuildLabel() + "\r\n";
+        m += j.keeperHead + "\r\n";   /* T-910 */
         m += j.info + "\r\n";
         m += "Where: " + j.where + "\r\n\r\n";
         m += "What happened (the player's words):\r\n" + j.desc + "\r\n\r\n";
@@ -845,6 +860,13 @@ void StartJob(const std::string& desc, int sendOnly)
     j->where = WhereNow();
     j->info = std::string("Shared Wastelands ") + modversion::kName + "; Game: " + (table.empty() ? std::string("unknown") : table) + " (fingerprint " + (fp.empty() ? std::string("unknown") : fp)
               + "); game-to-game protocol " + Num(net::SessionProtocolVersion()) + "; made in " + j->where;
+    {
+        /* T-910: the empty-shop repairs and every [KEEPER] line of this launch go into the report (report.txt's header, keeper-lines.txt) */
+        unsigned long long keeperSeen = 0;
+        j->keeperText = LogKeeperLinesText(&keeperSeen);
+        j->keeperHead = "Empty-shop repairs this launch: " + coop::ItemsKeeperRepairToken() + "; [KEEPER] lines this launch: " + Num(keeperSeen)
+                        + (j->keeperText.empty() ? std::string() : std::string(" (") + kKeeperLinesFile + ")");
+    }
     j->log0 = LogFilePath(0); j->log1 = LogFilePath(1); j->log2 = LogFilePath(2); j->gameFolder = GameFolder();
     for (int L = 0; L < 3; ++L) { j->logStart[L] = LogPartPath(L, cooplogrot::kPartStart); j->logMiddle[L] = LogPartPath(L, cooplogrot::kPartPrev); }
     j->serverLog = Widen(UiServerLogPath());

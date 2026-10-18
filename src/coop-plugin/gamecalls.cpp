@@ -649,6 +649,8 @@ void AnimationClass::setPosition(const Ogre::Vector3& pos)
 static unsigned long long kGcOrAddOrder = 0; static coop::AddrReg kGcOrAddOrder_reg("OrdersReceiver_issueOrder", &kGcOrAddOrder);   /* Steam_1.0.65 0x5078F0 */
 static unsigned long long kGcOrClearGoals = 0; static coop::AddrReg kGcOrClearGoals_reg("OrdersReceiver_dropGoals", &kGcOrClearGoals);   /* Steam_1.0.65 0x509F40 */
 static unsigned long long kGcOrClearOrders = 0; static coop::AddrReg kGcOrClearOrders_reg("OrdersReceiver_dropAllOrders", &kGcOrClearOrders);   /* Steam_1.0.65 0x506A10 */
+static unsigned long long kGcOrResetOrders = 0; static coop::AddrReg kGcOrResetOrders_reg("OrdersReceiver_resetOrders", &kGcOrResetOrders);   /* Steam_1.0.65 0x506AA0 */
+static unsigned long long kGcOrClearJobs = 0; static coop::AddrReg kGcOrClearJobs_reg("OrdersReceiver_dropStandingJobs", &kGcOrClearJobs);   /* Steam_1.0.65 0x5067F0 */
 static unsigned long long kGcOrHasOrders = 0; static coop::AddrReg kGcOrHasOrders_reg("OrdersReceiver_hasPendingOrders", &kGcOrHasOrders);   /* Steam_1.0.65 0x68FAB0 */
 static unsigned long long kGcAtsGoalString = 0; static coop::AddrReg kGcAtsGoalString_reg("AITaskSytem_describeCurrentGoal", &kGcAtsGoalString);   /* Steam_1.0.65 0x50E930 */
 
@@ -663,6 +665,24 @@ void OrdersReceiver::dropAllOrders()
 {
     typedef void (*Fn)(void* self);
     const unsigned long long a = coop::AddrAbs(kGcOrClearOrders);
+    if (a != 0) ((Fn)a)(this);
+}
+
+/* 0x506AA0: the remembered order target (+0x18 type = 0xB, the empty hand; +0x20 / +0x24 zeroed) reset and the order list
+   (+0x78) emptied again, each order deleted; the engine runs it after dropAllOrders on giveOrder's clearOld path (0x5C8310). */
+void OrdersReceiver::resetOrders()
+{
+    typedef void (*Fn)(void* self);
+    const unsigned long long a = coop::AddrAbs(kGcOrResetOrders);
+    if (a != 0) ((Fn)a)(this);
+}
+
+/* 0x5067F0: the standing job list (count +0x90, array +0x98 - the jobs 0x507C40 keeps) emptied, each job deleted; the engine
+   runs it after resetOrders (0x32E550) and alone (0x5CDA50). */
+void OrdersReceiver::dropStandingJobs()
+{
+    typedef void (*Fn)(void* self);
+    const unsigned long long a = coop::AddrAbs(kGcOrClearJobs);
     if (a != 0) ((Fn)a)(this);
 }
 

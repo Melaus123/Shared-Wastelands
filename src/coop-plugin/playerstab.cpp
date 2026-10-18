@@ -1441,6 +1441,7 @@ void ReportPlayersTab()
     ShownSeh();
 }
 void* PlayersTabItemPtr() { return g_item; }
+int PlayersTabRowOfSlot(int slot) { return g_list == 0 ? -1 : playerstab::RowOfSlot(g_rows, slot); }   /* p47d: the rows as the table shows them */
 
 }
 namespace {

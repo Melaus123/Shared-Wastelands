@@ -42,6 +42,9 @@ void PlayersTabOwedWhileAway(int box, const std::string& teamName);
 void ReportPlayersTab();
 // The PLAYERS tab's item in the management window's tab control (a MyGUI::TabItem*), 0 while it is not in.
 void* PlayersTabItemPtr();
+// p47d - the TEST-ONLY UI driver's `uipick players slot <n>` (ui.cpp UiDrivePick): the table's row showing player slot `slot` as the
+// table was last filled, or -1 (no table, or no row for that slot). MAIN THREAD.
+int PlayersTabRowOfSlot(int slot);
 // The management window's tab strip (a MyGUI::TabControl*), called before and after the mod adds or removes a tab of it: the
 // game's own button width is noted while the control holds its seven, and the seven and the mod's tabs (PLAYERS, FALLEN) share
 // the strip the seven filled - each button sized to its caption measured on the game's own tab buttons (src/common/fallentab.h

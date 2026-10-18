@@ -23,6 +23,7 @@
 #include "modsenabled.h"   /* owner 123/124: is a mod switched on in Kenshi's mod list */
 #include "ogreplugin.h"    /* the loader's hand-built Ogre plugin object: its name string's layout */
 #include "addrtable.h"   /* P8h: the address table format and the executable fingerprint */
+#include "addrhooked.h"  /* rk1: a call-only row another mod has hooked - accepted or refused */
 #include "sigtable.h"    /* T-63 stage 7: every address row by its byte pattern when no table matches */
 #include "modlist.h"   /* settings5 S5: the mod list, its diff and its words */
 #include "storelink.h"   /* B10-b (review-b10 M-3 / M-7): the store link's two pure decisions */
@@ -128,6 +129,7 @@
 #include "placeinput.h"  /* a placement input height = live y less the ground height */
 #include "recname.h"     /* a record's data file name: the world server's folder and a game's mirror */
 #include "farmwire.h"    /* par16 */
+#include "powerwire.h"   /* P47 */
 #include "bountywire.h"   /* crime5: a character's bounties between its owner and its copies */
 #include "garmentdetail.h" /* quality1: per-item details after the CLOTHING list */
 #include "bagwire.h" /* inv3a: a handed-over backpack's contents on ITEM_REQUEST / ITEM_CONFIRM */
@@ -193,6 +195,7 @@
 #include "reqserial.h"   /* T-336: the request counter's random base per launch */
 #include "celldrift.h"   /* T-172 tinc: the copy's cell-drift repair and the leftover test */
 #include "logbudget.h"   /* T-879: the release build's quiet-logging gate and the drift test */
+#include "linekeep.h"   /* T-910: the bug report's keeper-lines.txt - the first and the newest lines of one kind */
 #include "logrotate.h"   /* T-417: the names of the mod log's kept copies of earlier launches */
 #include "pausemenu.h"   /* T-514: where the pause menu's rows go */
 #include "addrlookup.h"  /* T-524: the internet address from the lookup websites */
@@ -4951,6 +4954,85 @@ void t_addr_pattern_refusal_clears_every_slot()
     a = b = g = 7;
     coopaddr::AddrClearSlots(three, 3);
     if (a != 0 || b != 0 || g != 0) Fail("AddrClearSlots left a slot filled");
+}
+
+/* rk1: A ROW ANOTHER MOD HAS HOOKED (src/common/addrhooked.h AddrHookedVerdict, the gate's call in addresses.cpp VerifyEntry).
+   Literal inputs: the 1.0.65 SoundPostEvent row and the bytes run T1339 read under RE_Kenshi 0.3.5 (log-A line 4). */
+static void Rk1Hex(const char* h, unsigned char* out, int n)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        unsigned int v = 0;
+        for (int k = 0; k < 2; ++k)
+        {
+            const char c = h[2 * i + k];
+            v = v * 16u + (unsigned int)(c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c - '0');
+        }
+        out[i] = (unsigned char)v;
+    }
+}
+void t_rk1_addr_hooked_call_only_verdict()
+{
+    using namespace coopaddr;
+    unsigned char want[16], got[16];
+    Rk1Hex("48895C240848896C241048897C241841", want, 16);
+    /* exact match: matched whatever the use and wherever the bytes are read */
+    Rk1Hex("48895C240848896C241048897C241841", got, 16);
+    if (AddrHookedVerdict(want, got, 16, 1, 0) != kHookExact || AddrHookedVerdict(want, got, 16, 0, 1) != kHookExact)
+        Fail("rk1: an exact match is not kHookExact");
+    /* T1339: E9 + 4 bytes, the rest the same, call-only -> accepted */
+    Rk1Hex("E94BAB56FF48896C241048897C241841", got, 16);
+    if (AddrHookedVerdict(want, got, 16, 1, 1) != kHookAccepted) Fail("rk1: the T1339 SoundPostEvent bytes on a call-only row were not accepted");
+    /* the same bytes on a strict row (hooked or patched by this mod, or undeclared) -> refused */
+    if (AddrHookedVerdict(want, got, 16, 1, 0) != kHookRefuse) Fail("rk1: a hooked strict row was accepted");
+    /* the same bytes where the row's bytes are not read at the function's own start -> refused */
+    if (AddrHookedVerdict(want, got, 16, 0, 1) != kHookRefuse) Fail("rk1: a hooked row read away from its entry was accepted");
+    /* E9 at the start but a later byte differs -> not the same function: refused */
+    Rk1Hex("E94BAB56FF48896C241048897C241941", got, 16);
+    if (AddrHookedVerdict(want, got, 16, 1, 1) != kHookRefuse) Fail("rk1: E9 with a different tail was accepted");
+    Rk1Hex("E94BAB56FF49896C241048897C241841", got, 16);   /* the first byte after the jump */
+    if (AddrHookedVerdict(want, got, 16, 1, 1) != kHookRefuse) Fail("rk1: E9 with byte 5 different was accepted");
+    /* a difference that is not an E9 jump -> refused: a different first byte, a short EB jump, an FF 25 absolute jump */
+    Rk1Hex("48895C240848896C241048897C241842", got, 16);
+    if (AddrHookedVerdict(want, got, 16, 1, 1) != kHookRefuse) Fail("rk1: a plain difference was accepted");
+    Rk1Hex("EB4BAB56FF48896C241048897C241841", got, 16);
+    if (AddrHookedVerdict(want, got, 16, 1, 1) != kHookRefuse) Fail("rk1: an EB jump was accepted");
+    Rk1Hex("FF25000000001122334455667788AABB", got, 16);
+    if (AddrHookedVerdict(want, got, 16, 1, 1) != kHookRefuse) Fail("rk1: an FF 25 jump was accepted");
+    /* 5 bytes or fewer: nothing after the jump to prove it -> refused */
+    Rk1Hex("E94BAB56FF", got, 5);
+    if (AddrHookedVerdict(want, got, 5, 1, 1) != kHookRefuse) Fail("rk1: a 5-byte row with a jump was accepted");
+    if (AddrHookedVerdict(want, got, 3, 1, 1) != kHookRefuse) Fail("rk1: a 3-byte row with a jump was accepted");
+    Rk1Hex("E94BAB56FF48", got, 6);   /* 6 bytes: one byte after the jump, matching - too little to prove it (review N2) */
+    if (AddrHookedVerdict(want, got, 6, 1, 1) != kHookRefuse) Fail("rk1: a 6-byte row, jump plus one matching byte, was accepted");
+    Rk1Hex("E94BAB56FF48896C241048897C", got, 13);   /* 13 bytes: the jump plus 8 matching - accepted */
+    if (AddrHookedVerdict(want, got, 13, 1, 1) != kHookAccepted) Fail("rk1: a 13-byte row, jump plus 8 matching, was not accepted");
+    {   /* review N3: a function that itself starts with a jump, its distance changed - refused */
+        unsigned char w2[16], g2[16];
+        Rk1Hex("E9000000004889742410574883EC2049", w2, 16);
+        Rk1Hex("E9111111114889742410574883EC2049", g2, 16);
+        if (AddrHookedVerdict(w2, g2, 16, 1, 1) != kHookRefuse) Fail("rk1: a jump-started function with a changed jump was accepted");
+    }
+    /* no bytes at all */
+    if (AddrHookedVerdict(want, got, 0, 1, 1) != kHookRefuse || AddrHookedVerdict(0, got, 16, 1, 1) != kHookRefuse)
+        Fail("rk1: no bytes was not refused");
+}
+
+/* review S2/S3 (2026-10-17): src/common/addrhooked.h AddrUsesAllCallOnly - the rule behind RowCallOnly (every registration
+   of a NAME) and AddrHookRefusedAt (every registration bound to a hook's ADDRESS): call-only only when all are call-only. */
+void t_rk1_addr_uses_all_call_only()
+{
+    using namespace coopaddr;
+    const unsigned char allCall[3] = { 1, 1, 1 };
+    const unsigned char oneStrict[3] = { 1, 0, 1 };
+    const unsigned char lastStrict[2] = { 1, 0 };
+    const unsigned char odd[2] = { 1, 7 };   /* a value that is not call-only counts as strict */
+    if (AddrUsesAllCallOnly(allCall, 3) != 1) Fail("S2: every registration call-only is not call-only");
+    if (AddrUsesAllCallOnly(allCall, 1) != 1) Fail("S2: one call-only registration is not call-only");
+    if (AddrUsesAllCallOnly(oneStrict, 3) != 0) Fail("S2: one strict registration among call-only ones did not make the row strict");
+    if (AddrUsesAllCallOnly(lastStrict, 2) != 0) Fail("S2: a strict last registration did not make the row strict");
+    if (AddrUsesAllCallOnly(odd, 2) != 0) Fail("S2: an unknown use value was taken as call-only");
+    if (AddrUsesAllCallOnly(allCall, 0) != 0 || AddrUsesAllCallOnly(0, 3) != 0) Fail("S2: no registrations at all was taken as call-only");
 }
 
 void t_addr_signatures_resolve_every_kind_and_refuse_anything_less()
@@ -12097,6 +12179,47 @@ void t_p15_destroyed_state()
             Fail("T-903 re-check: help was judged while this game's slot or the sender's standing was unknown (must be held)");
         if (coopbuild::BuildHelpApplyVerdict(1, 0, 1, 1) != coopbuild::BuildHelpApplyVerdictFor(1, 0, 1, 1, coopbuild::kBuildHelpFriendHelps))
             Fail("T-903 re-check: BuildHelpApplyVerdict does not follow its switch");
+    }
+    /* T-903 (F1026): dead handles on a host's interior list count as no piece only when every condition holds */
+    {
+        coopbuild::BuildDeadHandleIn ok;
+        ok.listed = 26; ok.n = 26; ok.cut = 0; ok.torn = 0;
+        ok.typed = 26; ok.good = 13; ok.hits = 0; ok.dead = 13; ok.other = 0;
+        ok.areaLoaded = 1; ok.setAge = coopbuild::kBuildDeadHandleWait; ok.regRow = 0; ok.copyListRow = 0; ok.removedMark = 0;
+        if (coopbuild::BuildDeadHandlesIgnore(ok) != 1) Fail("T-903 F1026: every condition held but the dead handles still held the copy");
+        coopbuild::BuildDeadHandleIn x;
+        x = ok; x.listed = -1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): an unreadable list size was taken as read whole");
+        x = ok; x.n = 25; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): fewer entries read than listed was taken as whole");
+        x = ok; x.cut = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): a walk cut short was taken as whole");
+        x = ok; x.torn = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): a torn walk was taken as whole");
+        x = ok; x.good = 12; x.hits = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): a piece at or near the key was ignored");
+        x = ok; x.good = 12; x.other = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a/b): an unresolved handle that is not dead (faulted, ids differ, no key) was ignored");
+        x = ok; x.good = 12; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (a): counts that do not add up to typed were trusted");
+        x = ok; x.good = 26; x.dead = 0; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (b): no dead handle - not this rule's case");
+        x = ok; x.areaLoaded = 0; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (c): an area not fully loaded was trusted");
+        x = ok; x.setAge = -1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (d): a dead set seen for the first time was trusted");
+        x = ok; x.setAge = coopbuild::kBuildDeadHandleWait - 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (d): a dead set younger than the wait was trusted");
+        x = ok; x.setAge = 1000; if (coopbuild::BuildDeadHandlesIgnore(x) != 1) Fail("T-903 F1026 (d): an older unchanged dead set still held the copy");
+        x = ok; x.regRow = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key with a registry row here was made again");
+        x = ok; x.copyListRow = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key with a copy-list row was made again");
+        x = ok; x.removedMark = 1; if (coopbuild::BuildDeadHandlesIgnore(x) != 0) Fail("T-903 F1026 (e): a key marked removed was made again");
+        /* the set's signature: order-free, any change shows */
+        std::vector<unsigned int> t1, t2, t3;
+        t1.push_back(2069); t1.push_back(387); t1.push_back(11); t1.push_back(2069); t1.push_back(552); t1.push_back(12);
+        t2.push_back(2069); t2.push_back(552); t2.push_back(12); t2.push_back(2069); t2.push_back(387); t2.push_back(11);
+        t3 = t1; t3[5] = 13;
+        const std::string s1 = coopbuild::BuildDeadSetSig(t1);
+        if (s1 != coopbuild::BuildDeadSetSig(t2) || s1 == coopbuild::BuildDeadSetSig(t3) || s1.empty() || !coopbuild::BuildDeadSetSig(std::vector<unsigned int>()).empty())
+            Fail("T-903 F1026: the dead set's signature depends on the read order or misses a changed handle");
+        /* the per-host memory: first sight -1, the same set ages, a changed set restarts, an empty set clears */
+        int had = 0; std::string ks; unsigned int at = 0;
+        if (coopbuild::BuildDeadSetStep(&had, &ks, &at, s1, 100) != -1 || had != 1 || at != 100) Fail("T-903 F1026 (d): a first-seen dead set was not remembered as new");
+        if (coopbuild::BuildDeadSetStep(&had, &ks, &at, s1, 130) != 30) Fail("T-903 F1026 (d): the same dead set did not age");
+        if (coopbuild::BuildDeadSetStep(&had, &ks, &at, coopbuild::BuildDeadSetSig(t3), 160) != -1 || at != 160) Fail("T-903 F1026 (d): a changed dead set did not restart the wait");
+        if (coopbuild::BuildDeadSetStep(&had, &ks, &at, coopbuild::BuildDeadSetSig(t3), 189) != 29) Fail("T-903 F1026 (d): the restarted wait did not count from the change");
+        if (coopbuild::BuildDeadSetStep(&had, &ks, &at, std::string(), 200) != -1 || had != 0) Fail("T-903 F1026 (d): an empty dead set was remembered");
+        had = 1; ks = s1; at = 0xFFFFFFF0u;
+        if (coopbuild::BuildDeadSetStep(&had, &ks, &at, s1, 0x0000000Eu) != 30) Fail("T-903 F1026 (d): the safe-point clock's wrap broke the age");
     }
     /* a copy made a ruin here */
     if (coopbuild::BuildLocalDestroyVerdict(1, 0, 1, 1, 0) != coopbuild::kBuildLocalDestroyRevert) Fail("a copy ruined here while the owner's is whole is not put back");
@@ -20017,6 +20140,8 @@ void t_pp1_ui_drive_names()
         { "hostpwshow", "1", "SWHostPwShowBtn" }, { "pwjoin", "1", "SWPwJoinBtn" }, { "pwcancel", "1", "SWPwCancelBtn" },   /* T-290 */
         { "refresh", "1", "SWFriendRefreshBtn" }, { "invitefriends", "1", "SWInviteOpenBtn" }, { "invite", "1", "SWInviteSendBtn" },
         { "inviteback", "1", "CoopCloseBtn" }, { "friends", "2", "SWFriendList" }, { "invitelist", "2", "SWInviteList" },
+        { "playerstab", "6", "SWPlayersList" }, { "invitefaction", "1", "SWPlayersRightActBtn" },   /* p47d: the PLAYERS tab's team flow */
+        { "factionaccept", "1", "SWFactionBoxRightBtn" }, { "factiondecline", "1", "SWFactionBoxLeftBtn" }, { "players", "2", "SWPlayersList" },
         { "password", "3", "SWPwEdit" }, { "hostpassword", "3", "SWHostPwEdit" },
         { "hosting", "1", "SWHostingPauseButton" },
         { "newworld", "1", "CoopNewWorldBtn" }, { "deleteworld", "1", "CoopDeleteWorldBtn" }, { "options", "1", "CoopGameOptionsBtn" },
@@ -20064,7 +20189,9 @@ void t_pp1_ui_drive_names()
         Fail("T-220: uiclick close / escape / optdec<a..i> accepted, optdecj refused, close / escape are not plain buttons");
     for (size_t i = 0; i < n; ++i)
         if (t[i].caption != 0 && std::string(t[i].name) != "create" && std::string(t[i].name) != "cancel" && std::string(t[i].name) != "select"
-            && std::string(t[i].name) != "resetcancel" && std::string(t[i].name) != "resetok") Fail(std::string("pp1b: an unexpected caption gate on ") + t[i].name);
+            && std::string(t[i].name) != "resetcancel" && std::string(t[i].name) != "resetok"
+            && std::string(t[i].name) != "invitefaction" && std::string(t[i].name) != "factionaccept" && std::string(t[i].name) != "factiondecline")
+            Fail(std::string("pp1b: an unexpected caption gate on ") + t[i].name);
     {
         /* T-201 N1: TRY AGAIN is gone; `cancel` presses the dialog's CANCEL, or BACK while it reads CANCEL (a press in progress) */
         const coopui::UiDriveName* cn = coopui::UiDriveFind("cancel", coopui::kDriveButton);
@@ -20132,6 +20259,83 @@ void t_pp1_ui_drive_names()
      || coopui::UiDriveUsage("uipick", "saves s1").empty() || coopui::UiDriveUsage("uitype", "address").empty()
      || coopui::UiDriveUsage("uitype", "slot s1").empty() || coopui::UiDriveUsage("uistate", "all").empty()
      || coopui::UiDriveUsage("load", "s1").empty()) Fail("usage passed a bad line");
+    {   /* T-906 (T1349): `uiclick closewindow:<LayoutSuffix>` - the window holding an engine widget, closed by its own X event */
+        std::string cws;
+        if (!coopui::UiDriveCloseWindowName("closewindow:TabsMain", &cws) || cws != "TabsMain") Fail("t906: closewindow:TabsMain");
+        if (!coopui::UiDriveCloseWindowName("closewindow:" + std::string(48, 'a'), 0)) Fail("t906: a 48-character suffix refused");
+        if (coopui::UiDriveCloseWindowName("closewindow:", 0) || coopui::UiDriveCloseWindowName("closewindow:Tabs_Main", 0)
+            || coopui::UiDriveCloseWindowName("closewindow:" + std::string(49, 'a'), 0) || coopui::UiDriveCloseWindowName("engine:TabsMain", 0)
+            || coopui::UiDriveCloseWindowName("TabsMain", 0) || coopui::UiDriveCloseWindowName("closewindow:Tabs Main", 0)
+            || coopui::UiDriveCloseWindowName("Closewindow:TabsMain", 0)) Fail("t906: closewindow name shape");
+        if (coopui::UiDriveCloseWindowLike("engine:TabsMain") || coopui::UiDriveCloseWindowLike("close") || !coopui::UiDriveCloseWindowLike("closewindow:"))
+            Fail("t906: UiDriveCloseWindowLike");
+        if (!coopui::UiDriveUsage("uiclick", "closewindow:TabsMain").empty() || !coopui::UiDriveUsage("uiclick", "  closewindow:SWPlayersList \r\n").empty())
+            Fail("t906: uiclick closewindow:<suffix> refused");
+        if (coopui::UiDriveUsage("uiclick", "closewindow:").find("usage: uiclick closewindow:") != 0
+            || coopui::UiDriveUsage("uiclick", "closewindow:Tabs-Main").find("usage: uiclick closewindow:") != 0
+            || coopui::UiDriveUsage("uiclick", "closewindow:TabsMain now").empty() || coopui::UiDriveUsage("uiclick", "closewindow").empty())
+            Fail("t906: a bad uiclick closewindow line passed");
+        if (coopui::UiDriveUsage("uiclick", "").find("closewindow:<LayoutSuffix>") == std::string::npos) Fail("t906: the uiclick usage names closewindow");
+        if (!coopui::UiDriveUsage("uiclick", "close").empty() || coopui::UiDriveFind("closewindow:TabsMain", coopui::kDriveWindowClose) != 0)
+            Fail("t906: T-220 close unchanged; closewindow: is not a table row");
+    }
+    {   /* p47d (owner 938): the PLAYERS tab's team flow, by name */
+        const coopui::UiDriveName* inv = coopui::UiDriveFind("invitefaction", coopui::kDriveButton);
+        const coopui::UiDriveName* acc = coopui::UiDriveFind("factionaccept", coopui::kDriveButton);
+        const coopui::UiDriveName* dec = coopui::UiDriveFind("factiondecline", coopui::kDriveButton);
+        if (inv == 0 || inv->caption == 0 || std::string(inv->caption) != "INVITE TO FACTION") Fail("p47d: invitefaction presses the right-hand button only while it reads INVITE TO FACTION");
+        if (acc == 0 || acc->caption == 0 || std::string(acc->caption) != "ACCEPT") Fail("p47d: factionaccept presses the box's right button only while it reads ACCEPT");
+        if (dec == 0 || dec->caption == 0 || std::string(dec->caption) != "DECLINE") Fail("p47d: factiondecline presses the box's left button only while it reads DECLINE");
+        if (coopui::UiDriveFind("playerstab", coopui::kDriveButton) != 0 || coopui::UiDriveFind("playerstab", coopui::kDriveTab) == 0
+            || coopui::UiDriveFind("players", coopui::kDriveTab) != 0) Fail("p47d: playerstab is a tab, not a button; players is a list");
+        if (!coopui::UiDriveUsage("uiclick", "playerstab").empty() || !coopui::UiDriveUsage("uiclick", "invitefaction").empty()
+            || !coopui::UiDriveUsage("uiclick", "factionaccept").empty() || !coopui::UiDriveUsage("uiclick", "factiondecline").empty())
+            Fail("p47d: uiclick playerstab / invitefaction / factionaccept / factiondecline refused");
+        if (coopui::UiDriveUsage("uiclick", "players").empty() || coopui::UiDriveUsage("uiclick", "playerstab now").empty())
+            Fail("p47d: uiclick players (a list) or a second word passed");
+        if (!coopui::UiDriveUsage("uipick", "players Scott").empty() || !coopui::UiDriveUsage("uipick", "players slot 2").empty()
+            || !coopui::UiDriveUsage("uipick", "players Big Scott").empty() || !coopui::UiDriveUsage("uipick", "worlds slot x").empty())
+            Fail("p47d: uipick players <name> / slot <n> refused (or a world called 'slot x')");
+        if (coopui::UiDriveUsage("uipick", "players").empty() || coopui::UiDriveUsage("uipick", "players slot").empty()
+            || coopui::UiDriveUsage("uipick", "players slot x").empty() || coopui::UiDriveUsage("uipick", "players slot 1000").empty()
+            || coopui::UiDriveUsage("uipick", "players slot 1 2").empty() || coopui::UiDriveUsage("uipick", "playerstab Scott").empty())
+            Fail("p47d: a bad uipick players line passed");
+        int slot = -1;
+        if (!coopui::UiDrivePickSlot("slot 2", &slot) || slot != 2 || !coopui::UiDrivePickSlot("slot 0", &slot) || slot != 0
+            || !coopui::UiDrivePickSlot("slot   17", &slot) || slot != 17) Fail("p47d: UiDrivePickSlot read a slot wrong");
+        if (coopui::UiDrivePickSlot("Scott", 0) || coopui::UiDrivePickSlot("slot", 0) || coopui::UiDrivePickSlot("slots 2", 0)
+            || coopui::UiDrivePickSlot("slot -1", 0) || coopui::UiDrivePickSlot("slot 2x", 0)) Fail("p47d: UiDrivePickSlot took a name for a slot");
+        /* the table's names are coloured (playerstab.h ColouredName / EscapeHash): the colour code dropped, ## read as # */
+        if (coopui::UiDrivePlainText("#ff8800Scott") != "Scott" || coopui::UiDrivePlainText("#2A6BFFBig ##1") != "Big #1"
+            || coopui::UiDrivePlainText("Scott") != "Scott" || coopui::UiDrivePlainText("#12") != "#12" || coopui::UiDrivePlainText("#") != "#"
+            || coopui::UiDrivePlainText("a#zzzzzzb") != "a#zzzzzzb" || coopui::UiDrivePlainText("") != "")
+            Fail("p47d: UiDrivePlainText");
+        if (coopui::UiDrivePlainText(playerstab::ColouredName("Big #1", 2)) != "Big #1") Fail("p47d: a coloured PLAYERS name does not read back plain");
+    }
+    /* T-903 (T1343): `uiclick point:<x>,<y>` - a screen-point mouse click; bounded whole numbers, nothing else */
+    {
+        int px = -1, py = -1;
+        if (!coopui::UiDrivePointName("point:481,113", &px, &py) || px != 481 || py != 113) Fail("t903: point:481,113");
+        if (!coopui::UiDrivePointName("point:0,0", &px, &py) || px != 0 || py != 0) Fail("t903: point:0,0");
+        if (!coopui::UiDrivePointName("point:16383,00720", &px, &py) || px != 16383 || py != 720) Fail("t903: point at the bound / leading zeros");
+        static const char* const kBadPt[] = { "point:", "point:1", "point:1,", "point:,1", "point:1,2,3", "point:-1,5", "point:+1,5",
+            "point:1 ,5", "point:1,5 ", "point:16384,1", "point:1,16384", "point:123456,1", "point:99999,1", "point:1.5,2", "point:a,b",
+            "Point:1,2", "point1,2", "engine:point", "point:1;2", "point:0x10,2" };
+        for (size_t i = 0; i < sizeof(kBadPt) / sizeof(kBadPt[0]); ++i)
+            if (coopui::UiDrivePointName(kBadPt[i], &px, &py)) Fail(std::string("t903: a bad point accepted: '") + kBadPt[i] + "'");
+        if (coopui::UiDrivePointLike("point:x") != 1 || coopui::UiDrivePointLike("poin") != 0 || coopui::UiDrivePointLike("") != 0
+         || coopui::UiDrivePointLike("engine:ExitButton") != 0) Fail("t903: UiDrivePointLike");
+        if (!coopui::UiDriveUsage("uiclick", "point:481,113").empty() || !coopui::UiDriveUsage("uiclick", "  point:10,20 \r\n").empty())
+            Fail("t903: uiclick point:x,y refused as a usage error");
+        if (coopui::UiDriveUsage("uiclick", "point:481").find("usage: uiclick point:<x>,<y>") != 0
+         || coopui::UiDriveUsage("uiclick", "point:16384,1").find("usage: uiclick point:<x>,<y>") != 0
+         || coopui::UiDriveUsage("uiclick", "point:-5,5").find("usage: uiclick point:<x>,<y>") != 0) Fail("t903: a bad point is not refused with the point usage");
+        if (coopui::UiDriveUsage("uiclick", "point:1, 2").find("uiclick point:<x>,<y>") == std::string::npos
+         || coopui::UiDriveUsage("uiclick", "point:1,2 now").empty()) Fail("t903: a point with a blank is not refused");
+        if (coopui::UiDriveUsage("uitype", "point:1,2 abc").empty() || coopui::UiDriveUsage("uipick", "point:1,2 abc").empty())
+            Fail("t903: point: accepted by uitype / uipick");
+        if (coopui::UiDriveUsage("uiclick", "").find("uiclick point:<x>,<y>") == std::string::npos) Fail("t903: the usage text does not name the point form");
+    }
 }
 
 void t_mmo8a2_world_scope()
@@ -20162,8 +20366,8 @@ void t_mmo8a2_world_scope()
 void t_t810_money()
 {
     namespace mw = moneyw;
-    if (mw::kProtocol != 100u || mw::kMsgSend != 73u || mw::kMsgSentOk != 74u || mw::kMsgDeliver != 75u || mw::kMsgApplied != 76u || mw::kMsgRefuse != 77u)
-        Fail("T-810: MONEY is not 73-77 of world-server protocol 100");
+    if (mw::kProtocol != 101u || mw::kMsgSend != 73u || mw::kMsgSentOk != 74u || mw::kMsgDeliver != 75u || mw::kMsgApplied != 76u || mw::kMsgRefuse != 77u)
+        Fail("T-810: MONEY is not 73-77 of world-server protocol 101");
     if (mw::NextNumber(0, 10) != (10ULL << 16) || mw::NextNumber((10ULL << 16) + 5, 10) != (10ULL << 16) + 5 || mw::NextNumber(7, 0) != 7)
         Fail("T-810: a number is the larger of the next one and the clock's");
     /* the wire */
@@ -23409,6 +23613,18 @@ void t_t616_node_writer_mine_op()
     if (coopfarm::MineStepRoute(0, 1, coopfarm::kProdWriterHere) != coopfarm::kMineRun) Fail("the writer relayed its own worker's step");
     if (coopfarm::MineStepRoute(0, 1, coopfarm::kProdWriterOther) != coopfarm::kMineRelay) Fail("a non-writer ran a worker's step on its own copy");
     if (coopfarm::MineStepRoute(0, 1, coopfarm::kProdWriterNone) != coopfarm::kMineRelay) Fail("an undecided game ran a worker's step locally");
+    /* T-610: a copy of another game's character is neither run nor relayed; the copy test; the take step refuses it */
+    if (coopfarm::MineWorkerSkip(0, 1) != 1) Fail("T-610: a copy's worker step was not skipped");
+    if (coopfarm::MineWorkerSkip(0, 0) != 0) Fail("T-610: this game's own worker's step was skipped");
+    if (coopfarm::MineWorkerSkip(1, 1) != 0) Fail("T-610: a lone game skipped a worker's step");
+    if (coopfarm::WorkerIsCopy(7, 0, 1) != 1) Fail("T-610: a replicated character this game does not own was not a copy");
+    if (coopfarm::WorkerIsCopy(7, 1, 1) != 0) Fail("T-610: this game's own character was called a copy");
+    if (coopfarm::WorkerIsCopy(0, 0, 1) != 0) Fail("T-610: a character with no uid was called a copy");
+    if (coopfarm::WorkerIsCopy(7, 0, 0) != 0) Fail("T-610: an inexact owned mirror's 'not mine' was taken as proof");
+    if (coopfarm::SpotCopyRefused(0, 1, 0, 1) != 1) Fail("T-610: an unlisted copy took a spot");
+    if (coopfarm::SpotCopyRefused(0, 1, 1, 1) != 0) Fail("T-610: a copy the runner listed was refused");
+    if (coopfarm::SpotCopyRefused(0, 1, 0, 0) != 0) Fail("T-610: this game's own worker was refused as a copy");
+    if (coopfarm::SpotCopyRefused(1, 1, 0, 1) != 0 || coopfarm::SpotCopyRefused(0, 0, 0, 1) != 0) Fail("T-610: a lone or unlinked game refused a take");
     if (coopfarm::MineOpAccept(coopfarm::kProdWriterHere) != coopfarm::kMineAccRun) Fail("MINE_OP: the writer did not run it");
     if (coopfarm::MineOpAccept(coopfarm::kProdWriterOther) != coopfarm::kMineAccRefuse) Fail("MINE_OP: a game another game writes for did not refuse it");
     if (coopfarm::MineOpAccept(coopfarm::kProdWriterNone) != coopfarm::kMineAccWait) Fail("MINE_OP: undecided work was not held");
@@ -23458,21 +23674,221 @@ void t_t616_node_writer_mine_op()
    kind - a kind added to DecodeBuild's accept list is caught here with no second list to keep up to date. */
 void t_t609_build_farm_kinds_apart()
 {
-    int nBuild = 0, nFarm = 0;
+    int nBuild = 0, nFarm = 0, nPower = 0;
     for (int k = 0; k < 256; ++k)
     {
         const char b = (char)(unsigned char)k;
         coopbuild::BuildMsg bm;
         const int isBuild = (coopbuild::DecodeBuild(&b, 1, &bm) != coopbuild::kBuildDecodeBadKind) ? 1 : 0;
         const int isFarm = (coopfarm::IsFarmKind(&b, 1) != 0) ? 1 : 0;
-        nBuild += isBuild; nFarm += isFarm;
-        if (isBuild != 0 && isFarm != 0) Fail("T-609: MSG_BUILD kind " + I(k) + " is both a building kind (DecodeBuild) and a farm kind (IsFarmKind)");
+        const int isPower = (powerwire::IsPowerKind(&b, 1) != 0) ? 1 : 0;   /* P47: the third table (16, 17), peeked first */
+        nBuild += isBuild; nFarm += isFarm; nPower += isPower;
+        if (isBuild + isFarm + isPower > 1) Fail("T-609 / P47: MSG_BUILD kind " + I(k) + " is in more than one table (building " + I(isBuild) + ", farm " + I(isFarm) + ", power " + I(isPower) + ")");
     }
+    if (nPower != 2) Fail("P47: the kind walk saw " + I(nPower) + " power kinds, not 2");
+    const char p16 = (char)powerwire::kPowerState, p17 = (char)powerwire::kPowerAsk;
+    if (coopfarm::IsFarmKind(&p16, 1) != 0 || coopfarm::IsFarmKind(&p17, 1) != 0) Fail("P47: the farm peek takes kind 16 or 17");
     /* the walk saw both tables: 8 building kinds (1-5, 8, 9, 12) and 7 farm kinds (6, 7, 10, 11, 13-15) today - more is fine */
     if (nBuild < 8) Fail("T-609: the kind walk saw fewer than 8 building kinds (" + I(nBuild) + ") - DecodeBuild no longer answers a one-byte message by kind");
     if (nFarm < 7) Fail("T-609: the kind walk saw fewer than 7 farm kinds (" + I(nFarm) + ")");
     const char dm = (char)coopbuild::kBuildDismantleAsk;
     if (coopfarm::IsFarmKind(&dm, 1) != 0) Fail("T-609: DISMANTLE_ASK is taken by the farm peek");
+}
+
+/* P47: POWER_STATE / POWER_ASK round trip and every refusal (the decoder's own: key length 0 / 64, 17 stocks, NaN); the writer's
+   send rule (a stock that rose goes at once); the gate, accept, sender and ask rules */
+void t_p47_power()
+{
+    powerwire::PowerMsg m;
+    m.kind = powerwire::kPowerState; m.key = "gen-sid@3,4@10,20,30"; m.on = 1; m.gets = 0; m.battery = 12.5f;
+    m.stock.push_back(0.75f); m.stock.push_back(0.0f);
+    std::vector<char> b;
+    if (!powerwire::EncodePower(&b, m)) { Fail("P47: a POWER_STATE did not encode"); return; }
+    if (b.size() != 2 + m.key.size() + 1 + 4 + 1 + 8) Fail("P47: POWER_STATE size " + I((int)b.size()));
+    powerwire::PowerMsg o;
+    if (powerwire::DecodePower(&b[0], b.size(), &o) != powerwire::kPowerDecodeOk) { Fail("P47: a POWER_STATE did not decode"); return; }
+    if (o.kind != m.kind || o.key != m.key || o.on != 1 || o.gets != 0 || o.battery != 12.5f || o.stock.size() != 2 || o.stock[0] != 0.75f)
+        Fail("P47: POWER_STATE round trip");
+    std::vector<char> x = b; x.push_back(0);
+    if (powerwire::DecodePower(&x[0], x.size(), &o) == powerwire::kPowerDecodeOk) Fail("P47: a byte over taken");
+    x = b; x.pop_back();
+    if (powerwire::DecodePower(&x[0], x.size(), &o) == powerwire::kPowerDecodeOk) Fail("P47: a byte short taken");
+    x = b; x[2 + m.key.size()] = (char)4;
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadValue) Fail("P47: an unknown flag bit taken");
+    powerwire::PowerMsg bad = m; bad.battery = -1.0f;
+    if (powerwire::EncodePower(&b, bad)) Fail("P47: a negative battery encoded");
+    bad = m; bad.stock.assign(17, 1.0f);
+    if (powerwire::EncodePower(&b, bad)) Fail("P47: 17 stocks encoded");
+    bad = m; bad.key = std::string(64, 'k');
+    if (powerwire::EncodePower(&b, bad)) Fail("P47: a 64-byte key encoded");
+    /* the decoder's own refusals, on hand-made bytes the encoder never writes */
+    std::vector<char> g;
+    if (!powerwire::EncodePower(&g, m)) { Fail("P47: a POWER_STATE did not encode again"); return; }
+    const size_t body = 2 + m.key.size();   /* flags at body, battery at body + 1, n at body + 5, stocks from body + 6 */
+    x.clear(); x.push_back((char)powerwire::kPowerState); x.push_back((char)0); x.insert(x.end(), g.begin() + body, g.end());
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadKey) Fail("P47: a key of length 0 taken");
+    x.clear(); x.push_back((char)powerwire::kPowerState); x.push_back((char)64); x.insert(x.end(), (size_t)64, 'k'); x.insert(x.end(), g.begin() + body, g.end());
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadKey) Fail("P47: a key of length 64 taken");
+    x = g; x[body + 5] = (char)17; x.insert(x.end(), (size_t)(15 * 4), (char)0);
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadValue) Fail("P47: 17 stocks taken");
+    const unsigned int qnanBits = 0x7FC00000u;
+    float qnan = 0.0f;
+    std::memcpy(&qnan, &qnanBits, 4);
+    x = g; std::memcpy(&x[body + 1], &qnan, 4);
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadValue) Fail("P47: a NaN battery level taken");
+    x = g; std::memcpy(&x[body + 6], &qnan, 4);
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadValue) Fail("P47: a NaN stock taken");
+    powerwire::PowerMsg a;
+    a.kind = powerwire::kPowerAsk; a.key = "light@1,2@3,4,5"; a.what = powerwire::kAskSwitch; a.value = 1.0f;
+    if (!powerwire::EncodePower(&b, a) || b.size() != 2 + a.key.size() + 5) { Fail("P47: a POWER_ASK did not encode"); return; }
+    if (powerwire::DecodePower(&b[0], b.size(), &o) != powerwire::kPowerDecodeOk || o.what != 1 || o.value != 1.0f || o.key != a.key) Fail("P47: POWER_ASK round trip");
+    x = b; x[2 + a.key.size()] = (char)2;
+    if (powerwire::DecodePower(&x[0], x.size(), &o) != powerwire::kPowerDecodeBadValue) Fail("P47: an unknown ask taken");
+    a.value = 0.5f;
+    if (powerwire::EncodePower(&b, a)) Fail("P47: a switch of 0.5 encoded");
+    /* the writer's send rule */
+    if (powerwire::PowerSendDue(0, 0, 0, 0, 0) != 1) Fail("P47: the first look is not sent");
+    if (powerwire::PowerSendDue(1, 1, 0, 0, 0) != 1 || powerwire::PowerSendDue(1, 0, 1, 0, 0) != 1) Fail("P47: a switch / count change waits");
+    if (powerwire::PowerSendDue(1, 0, 0, 1, powerwire::kPowerLevelGapMs - 1) != 0) Fail("P47: a level change went before its gap");
+    if (powerwire::PowerSendDue(1, 0, 0, 1, powerwire::kPowerLevelGapMs) != 1) Fail("P47: a level change held past its gap");
+    if (powerwire::PowerSendDue(1, 0, 0, 0, 100000) != 0) Fail("P47: nothing changed and it was sent");
+    if (powerwire::PowerLevelDiffers(1.0f, 1.00001f) != 0 || powerwire::PowerLevelDiffers(1.0f, 1.01f) != 1) Fail("P47: the level threshold");
+    if (powerwire::PowerStockRose(1.0f, 0.5f) != 1 || powerwire::PowerStockRose(0.5f, 1.0f) != 0 || powerwire::PowerStockRose(1.0f, 1.00001f) != 0)
+        Fail("P47: a stock that rose (a fuel item taken)");
+    if (powerwire::PowerSendDue(1, 0, powerwire::PowerStockRose(1.0f, 0.2f), 1, 0) != 1) Fail("P47: a stock that rose waited for the level gap");
+    /* the gate, accept and ask rules (writer 0 none, 1 here, 2 another game) */
+    if (powerwire::PowerGateRuns(0, 2) != 0 || powerwire::PowerGateRuns(0, 1) != 1 || powerwire::PowerGateRuns(0, 0) != 1 || powerwire::PowerGateRuns(1, 2) != 1)
+        Fail("P47: the burn / charge gate");
+    if (powerwire::PowerStateAccept(2) != 1 || powerwire::PowerStateAccept(1) != 0 || powerwire::PowerStateAccept(0) != 0) Fail("P47: a state written on its writer or with no writer");
+    if (powerwire::PowerStateFrom(2, 3, 3) != 1 || powerwire::PowerStateFrom(2, 3, 4) != 0 || powerwire::PowerStateFrom(2, -1, 3) != -1
+        || powerwire::PowerStateFrom(2, 3, -1) != -1 || powerwire::PowerStateFrom(1, -1, -1) != 0 || powerwire::PowerStateFrom(0, 3, 3) != 0)
+        Fail("P47: a POWER_STATE's sender (written from the writer only, kept while a slot is unknown)");
+    if (powerwire::PowerAskAccept(1) != 1 || powerwire::PowerAskAccept(2) != 0 || powerwire::PowerAskAccept(0) != 0) Fail("P47: an ask done off the writer");
+    if (powerwire::PowerAskDue(1, 1, 0) != 1 || powerwire::PowerAskDue(1, 1, 1) != 0 || powerwire::PowerAskDue(0, 1, 0) != 0) Fail("P47: the asker's switch check");
+    if (powerwire::PowerAskFromOk(2, 2, 0) != 1 || powerwire::PowerAskFromOk(3, 2, 1) != 1 || powerwire::PowerAskFromOk(3, 2, 0) != 0 || powerwire::PowerAskFromOk(-1, 2, 1) != 0
+        || powerwire::PowerAskFromOk(3, -1, 1) != 0) Fail("P47: an ask from a game that is not the owner's team");
+}
+
+/* the look queue's gap table in miniature: one window of kPowerMarkProbe slots shared by `pieces` pieces (ids 1..pieces), each
+   stepped once per ms for `ms` ms through powerwire::PowerMarkPick; marks[id] counts the queued looks */
+void P47MarkSim(int pieces, unsigned int ms, int* marks)
+{
+    int owner[powerwire::kPowerMarkProbe];
+    unsigned int at[powerwire::kPowerMarkProbe];
+    for (int i = 0; i < powerwire::kPowerMarkProbe; ++i) { owner[i] = 0; at[i] = 0; }
+    for (int id = 0; id <= pieces; ++id) marks[id] = 0;
+    for (unsigned int now = 1000; now < 1000 + ms; ++now)
+        for (int id = 1; id <= pieces; ++id)
+        {
+            int kind[powerwire::kPowerMarkProbe];
+            unsigned int age[powerwire::kPowerMarkProbe];
+            for (int i = 0; i < powerwire::kPowerMarkProbe; ++i) { kind[i] = owner[i] == id ? 1 : (owner[i] == 0 ? 0 : 2); age[i] = now - at[i]; }
+            const int pick = powerwire::PowerMarkPick(kind, age, powerwire::kPowerMarkProbe, 0);
+            if (pick >= 0) { owner[pick] = id; at[pick] = now; ++marks[id]; }
+        }
+}
+
+/* P47 fix: a stock that reached 0 goes at once (the engine stops the fuel step then); the look queue's gap table (an off-main
+   step marks at most once per kPowerMarkGapMs per slot; pieces that share a window still throttle; a forced mark goes at once) */
+void t_p47_look_queue()
+{
+    /* a stock that reached 0 */
+    if (powerwire::PowerStockEmptied(0.0f, 0.5f) != 1) Fail("P47 fix: a stock that reached 0 from 0.5 was not seen");
+    if (powerwire::PowerStockEmptied(0.00005f, 0.5f) != 1) Fail("P47 fix: a stock under the threshold is not 0");
+    if (powerwire::PowerStockEmptied(0.0f, 0.0f) != 0) Fail("P47 fix: a stock already 0 when sent was sent again");
+    if (powerwire::PowerStockEmptied(0.2f, 0.5f) != 0) Fail("P47 fix: a stock that fell but is not 0 went at once");
+    if (powerwire::PowerStockEmptied(0.5f, 0.0f) != 0) Fail("P47 fix: a stock that rose from 0 counted as emptied");
+    if (powerwire::PowerSendDue(1, 0, powerwire::PowerStockEmptied(0.0f, 0.3f), 1, 0) != 1) Fail("P47 fix: a stock of 0 waited for the level gap");
+    if (powerwire::PowerSendDue(1, 0, powerwire::PowerStockEmptied(0.1f, 0.3f), 1, 0) != 0) Fail("P47 fix: a falling stock above 0 skipped the level gap");
+    /* the look queue's gap table: one window (kind 1 = this piece, 0 = empty, 2 = another piece) */
+    const unsigned int G = powerwire::kPowerMarkGapMs;
+    {
+        const int k0[4] = { 2, 0, 1, 0 }; const unsigned int a0[4] = { 0, 0, G - 1, 0 };
+        if (powerwire::PowerMarkPick(k0, a0, 4, 0) != -1) Fail("P47 fix: a piece marked again inside the gap");
+        if (powerwire::PowerMarkPick(k0, a0, 4, 1) != 2) Fail("P47 fix: a forced mark (the mod's own write) held by the gap");
+        const unsigned int a1[4] = { 0, 0, G, 0 };
+        if (powerwire::PowerMarkPick(k0, a1, 4, 0) != 2) Fail("P47 fix: a piece held past the gap");
+        const int k2[4] = { 2, 2, 0, 0 }; const unsigned int a2[4] = { 0, 0, 0, 0 };
+        if (powerwire::PowerMarkPick(k2, a2, 4, 0) != 2) Fail("P47 fix: a piece new to its window did not take the first empty slot");
+        const int k3[4] = { 2, 2, 2, 2 }; const unsigned int a3[4] = { 10, G + 5, G - 1, G + 1 };
+        if (powerwire::PowerMarkPick(k3, a3, 4, 0) != 1) Fail("P47 fix: a full window did not hand over its oldest slot");
+        const unsigned int a4[4] = { 10, G / 2 - 2, G / 2 - 1, 0 };
+        if (powerwire::PowerMarkPick(k3, a4, 4, 0) != -1) Fail("P47 fix: a full window inside half the gap marked anyway");
+        const unsigned int a5[4] = { 10, G / 2 - 2, G / 2, 0 };
+        if (powerwire::PowerMarkPick(k3, a5, 4, 0) != 2) Fail("P47 fix: a full window's slot half a gap old was not handed over");
+        if (powerwire::PowerMarkPick(k3, a4, 4, 1) != 2) Fail("P47 fix: a forced mark on a full window did not take the oldest slot");
+    }
+    {   /* pieces stepped every ms for 1000 ms */
+        const unsigned int ms = 1000;
+        int marks[8];
+        P47MarkSim(2, ms, marks);   /* two pieces whose addresses share a window (the old one-slot table: both marked every step) */
+        if (marks[1] < 1 || marks[2] < 1) Fail("P47 fix: a piece sharing a window was never marked");
+        if (marks[1] > (int)(ms / G) + 1 || marks[2] > (int)(ms / G) + 1) Fail("P47 fix: a piece sharing a window marked more than once per gap");
+        P47MarkSim(6, ms, marks);   /* more pieces than the window holds: they take turns, each slot at most once per half gap */
+        int total = 0;
+        for (int id = 1; id <= 6; ++id)
+        {
+            total += marks[id];
+            if (marks[id] < 1) Fail("P47 fix: a piece of a full window was never marked");
+        }
+        if (total > powerwire::kPowerMarkProbe * ((int)(2 * ms / G) + 1)) Fail("P47 fix: a full window marked more than once per half gap per slot");
+    }
+    if (!(G < 2000)) Fail("P47 fix: the mark gap is not under the row's stale time (2000 ms)");
+    /* fold 2 (T1328): a due mark while engine writes are blocked is counted blocked, never as a full queue */
+    if (powerwire::PowerMarkOutcome(1, 1, 0) != powerwire::kPowerMarkBlocked) Fail("P47 fold 2: a blocked mark with no room counted as a full queue");
+    if (powerwire::PowerMarkOutcome(1, 1, 1) != powerwire::kPowerMarkBlocked) Fail("P47 fold 2: a mark was queued while engine writes are blocked");
+    if (powerwire::PowerMarkOutcome(1, 0, 1) != powerwire::kPowerMarkBlocked) Fail("P47 fold 2: a blocked mark with no key counted as noKey");
+    if (powerwire::PowerMarkOutcome(0, 0, 1) != powerwire::kPowerMarkNoKey) Fail("P47 fold 2: a mark with no key was queued");
+    if (powerwire::PowerMarkOutcome(0, 1, 0) != powerwire::kPowerMarkFull) Fail("P47 fold 2: a real overflow was not counted full");
+    if (powerwire::PowerMarkOutcome(0, 1, 1) != powerwire::kPowerMarkQueued) Fail("P47 fold 2: a due mark with a key and room was not queued");
+    /* fold 2 (T1328): first-look / first-apply lines only for a player's piece; changes have their own budget */
+    if (powerwire::PowerSayKind(1, 0, 0) != powerwire::kPowerSayNone) Fail("P47 fold 2: a world piece's first look printed a line");
+    if (powerwire::PowerSayKind(1, 0, 1) != powerwire::kPowerSayFirst) Fail("P47 fold 2: a player's piece's first look printed no line");
+    if (powerwire::PowerSayKind(0, 0, 1) != powerwire::kPowerSayNone) Fail("P47 fold 2: a send with no change and not the first printed a line");
+    if (powerwire::PowerSayKind(0, 1, 0) != powerwire::kPowerSayEvent || powerwire::PowerSayKind(1, 1, 0) != powerwire::kPowerSayEvent
+        || powerwire::PowerSayKind(1, 1, 1) != powerwire::kPowerSayEvent) Fail("P47 fold 2: a change did not spend the change budget (or a world piece's change was hidden)");
+    if (powerwire::kPowerSayFirst == powerwire::kPowerSayEvent || powerwire::kPowerSayCap < 1) Fail("P47 fold 2: the two line budgets are not separate");
+}
+
+/* H-P47a: an off-main step's writer verdict - the live answer when it knows, else the main thread's published one while its row is
+   live, else none (the step runs, as before); every branch, and what the charge / fuel gate then does */
+void t_p47_offmain_verdict()
+{
+    const unsigned int S = 2000;   /* build.cpp kPwStaleMs */
+    /* the live answer knows: it wins over any published verdict, fresh or not */
+    if (powerwire::PowerStepSource(1, 1, 2, 0, S) != powerwire::kPowerFromLive || powerwire::PowerStepSource(2, 1, 1, 0, S) != powerwire::kPowerFromLive
+        || powerwire::PowerStepSource(2, 0, 0, 0, S) != powerwire::kPowerFromLive) Fail("H-P47a: a live answer lost to the published verdict");
+    if (powerwire::PowerStepWriter(powerwire::PowerStepSource(1, 1, 2, 0, S), 1, 2) != 1) Fail("H-P47a: the live verdict not used");
+    /* live none: the published verdict decides while its row is live */
+    if (powerwire::PowerStepSource(0, 1, 2, 0, S) != powerwire::kPowerFromPublished || powerwire::PowerStepSource(0, 1, 2, S, S) != powerwire::kPowerFromPublished)
+        Fail("H-P47a: a fresh published verdict not used when the live answer is none");
+    if (powerwire::PowerStepWriter(powerwire::PowerStepSource(0, 1, 2, 10, S), 0, 2) != 2) Fail("H-P47a: the published 'another game writes' not used");
+    if (powerwire::PowerStepWriter(powerwire::PowerStepSource(0, 1, 1, 10, S), 0, 1) != 1) Fail("H-P47a: the published 'this game writes' not used");
+    /* none known: no published verdict, a stale one, or one that names no writer */
+    if (powerwire::PowerStepSource(0, 0, 2, 0, S) != powerwire::kPowerFromNone) Fail("H-P47a: a verdict used that was never published");
+    if (powerwire::PowerStepSource(0, 1, 2, S + 1, S) != powerwire::kPowerFromNone) Fail("H-P47a: a stale published verdict used");
+    if (powerwire::PowerStepSource(0, 1, 0, 0, S) != powerwire::kPowerFromNone) Fail("H-P47a: a published 'none' counted as published");
+    if (powerwire::PowerStepWriter(powerwire::kPowerFromNone, 0, 2) != 0) Fail("H-P47a: no source gave a writer");
+    /* the gate on the result: the published 'another game writes' holds the charge / burn; none still runs it (today's behaviour) */
+    if (powerwire::PowerGateRuns(0, powerwire::PowerStepWriter(powerwire::PowerStepSource(0, 1, 2, 5, S), 0, 2)) != 0)
+        Fail("H-P47a: the copy's charge ran with the published 'another game writes'");
+    if (powerwire::PowerGateRuns(0, powerwire::PowerStepWriter(powerwire::PowerStepSource(0, 0, 0, 0, S), 0, 0)) != 1)
+        Fail("H-P47a: a step with no verdict anywhere was held");
+}
+
+/* H-P47b: the copy's switch put back to the writer's last state after the mod's own completion apply - every branch */
+void t_p47_completion_switch()
+{
+    if (powerwire::PowerCompletionSwitch(2, 1, 0, 1) != 0) Fail("H-P47b: the engine's switch-on was not put back to the writer's off");
+    if (powerwire::PowerCompletionSwitch(2, 1, 1, 0) != 1) Fail("H-P47b: a switch-off was not put back to the writer's on");
+    if (powerwire::PowerCompletionSwitch(2, 1, 1, 1) != -1 || powerwire::PowerCompletionSwitch(2, 1, 0, 0) != -1)
+        Fail("H-P47b: a switch already the writer's was written");
+    if (powerwire::PowerCompletionSwitch(2, 0, 0, 1) != -1) Fail("H-P47b: a switch written with no writer state held");
+    if (powerwire::PowerCompletionSwitch(1, 1, 0, 1) != -1 || powerwire::PowerCompletionSwitch(0, 1, 0, 1) != -1)
+        Fail("H-P47b: a switch written on the writer's own game or with no writer");
+    if (powerwire::PowerCompletionSwitch(2, 1, 0, -1) != -1) Fail("H-P47b: a switch written after an unreadable read");
+    /* the put-back switch then asks nothing (the copy mirrors the writer) */
+    if (powerwire::PowerAskDue(1, powerwire::PowerCompletionSwitch(2, 1, 0, 1), 0) != 0) Fail("H-P47b: the put-back switch still asks");
 }
 
 /* par16: the farm wire (kinds 6 / 7 round trip, refusals), the hold gate, the publish rate, the apply count and the operate take */
@@ -29983,13 +30399,13 @@ void t_t716_repair_removed()
 }
 void t_t313_protocol_63_both_sides()
 {
-    if (coopfeed::kFeedProtocol != 100 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 100) Fail("the feed's protocol/message numbers are not 100/58");
+    if (coopfeed::kFeedProtocol != 101 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 101) Fail("the feed's protocol/message numbers are not 101/58");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
-    if (plugin.find("const unsigned int kStoreProtocol = 100;") == std::string::npos) Fail("the plugin does not speak world-server protocol 100");
-    if (server.find("const unsigned int kProtocol = 100;") == std::string::npos) Fail("the world server does not speak protocol 100");
-    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 100u) Fail("OWED is not 63 (protocol 100) on both sides and in owedpop.h");
-    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 100u) Fail("TOWN_LOSS is not 64 (protocol 100) on both sides and in townrefill.h");
+    if (plugin.find("const unsigned int kStoreProtocol = 101;") == std::string::npos) Fail("the plugin does not speak world-server protocol 101");
+    if (server.find("const unsigned int kProtocol = 101;") == std::string::npos) Fail("the world server does not speak protocol 101");
+    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 101u) Fail("OWED is not 63 (protocol 101) on both sides and in owedpop.h");
+    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 101u) Fail("TOWN_LOSS is not 64 (protocol 101) on both sides and in townrefill.h");
     if (plugin.find("kStoreMsgBundle = 59;") == std::string::npos || server.find("MSG_BUNDLE = 59") == std::string::npos || coopbundle::kMsgBundle != 59u) Fail("BUNDLE is not 59 on both sides and in sendbundle.h");
     if (plugin.find("kStoreMsgRecordFeed = 58;") == std::string::npos || server.find("MSG_RECORD_FEED = 58") == std::string::npos) Fail("RECORD_FEED is not 58 on both sides");
 }
@@ -31743,6 +32159,59 @@ void t_t879_drift_disagrees()
     far = 0;
     if (!DriftDisagrees(5.0f, 20.0f, 1, 0, &far) || !DriftDisagrees(5.0f, 20.0f, 0, 1, &far)) Fail("dead here against alive by the owner's word was not called off");
     if (DriftDisagrees(5.0f, 20.0f, 1, 1, &far)) Fail("a copy dead on both sides was called off");
+}
+
+/* T-910: the release build's "the first n lines, then none" (logbudget.h FirstLines) */
+void t_t910_first_lines()
+{
+    using namespace swlogbudget;
+    unsigned int shown = 0;
+    for (int i = 0; i < 10; ++i) if (!FirstLines(&shown, 10)) Fail("one of the first 10 lines was not written");
+    if (FirstLines(&shown, 10) || FirstLines(&shown, 10)) Fail("a line after the first 10 was written");
+    if (shown != 10) Fail("the count of lines written went past its cap");
+    unsigned int none = 0;
+    if (FirstLines(&none, 0) || none != 0) Fail("a cap of 0 wrote a line");
+}
+
+/* T-910: the bug report's keeper-lines.txt - the first lines and the newest lines of one kind, every line counted (linekeep.h) */
+void t_t910_line_keep()
+{
+    using namespace swlinekeep;
+    {
+        LineKeep k(2, 3);
+        if (!Text(k).empty() || k.seen != 0) Fail("an empty keep has text or a count");
+        Keep(&k, "1", 1); Keep(&k, "2", 1); Keep(&k, "3", 1); Keep(&k, "4", 1);
+        if (Text(k) != "1\r\n2\r\n3\r\n4\r\n" || k.seen != 4) Fail("a keep that lost nothing is not every line in order");
+    }
+    {
+        LineKeep k(2, 3);
+        const char* in[8] = { "1", "2", "3", "4", "5", "6", "7", "8" };
+        for (int i = 0; i < 8; ++i) Keep(&k, in[i], 1);
+        if (k.seen != 8) Fail("a keep did not count every line");
+        if (Text(k) != "1\r\n2\r\n... not kept: 3 lines between these two (this file keeps the first 2 and the newest 3) ...\r\n6\r\n7\r\n8\r\n")
+            Fail("a full keep is not its first lines, one gap line, then its newest lines in order");
+        Keep(&k, "9", 1);
+        if (Text(k) != "1\r\n2\r\n... not kept: 4 lines between these two (this file keeps the first 2 and the newest 3) ...\r\n7\r\n8\r\n9\r\n")
+            Fail("the ring did not move on by one line");
+    }
+    {
+        LineKeep k(1, 1);
+        Keep(&k, "a", 1); Keep(&k, "b", 1); Keep(&k, "c", 1);
+        if (Text(k) != "a\r\n... not kept: 1 line between these two (this file keeps the first 1 and the newest 1) ...\r\nc\r\n") Fail("one line not kept is not said as one line");
+    }
+    {
+        LineKeep k(2, 0);
+        Keep(&k, "a", 1); Keep(&k, "b", 1); Keep(&k, "c", 1);
+        if (Text(k) != "a\r\nb\r\n... not kept: 1 line between these two (this file keeps the first 2 and the newest 0) ...\r\n" || k.seen != 3)
+            Fail("a keep with no ring did not keep its first lines and count the rest");
+    }
+    {
+        LineKeep k(1, 1);
+        const std::string big((size_t)kKeepLineCap + 50, 'x');
+        Keep(&k, big.data(), big.size());
+        if (k.first.size() != 1 || k.first[0].size() != (size_t)kKeepLineCap) Fail("a line past the cap was not cut at the cap");
+    }
+    if (NumText(0) != "0" || NumText(18446744073709551615ull) != "18446744073709551615") Fail("NumText is wrong at its ends");
 }
 
 /* T-879: the parts of one launch's log in the report budget - the middle (.prev) is cut first, then the opening (.start), the
@@ -34847,6 +35316,12 @@ void t_joblever_parse()
      || joblever::JobInputParse("input Stove 52-gamedata.base 0x3", &in) || joblever::JobInputParse("input Stove 52-gamedata.base", &in)
      || joblever::JobInputParse("input Stove 52-gamedata.base 3 section=", &in) || joblever::JobInputParse("input Stove 52-gamedata.base 3 main", &in))
         Fail("jobtest input refusals");
+    unsigned int stopUid = 0;
+    if (!joblever::JobStopParse("stop 4194305", &stopUid) || stopUid != 4194305) Fail("T-610: jobtest stop");
+    if (!joblever::JobStopParse(" stop 0x10 ", &stopUid) || stopUid != 16) Fail("T-610: jobtest stop hex");
+    if (joblever::JobStopParse("stop 0", &stopUid) || joblever::JobStopParse("stop", &stopUid) || joblever::JobStopParse("stop 5 x", &stopUid)
+     || joblever::JobStopParse("stop x", &stopUid) || joblever::JobStopParse("show 5", &stopUid) || joblever::JobStopParse("stop 0x100000000", &stopUid))
+        Fail("T-610: jobtest stop refusals");
     std::string k;
     if (!joblever::JobShowParse("show Stove", &k) || k != "Stove" || joblever::JobShowParse("show", &k) || joblever::JobShowParse("show a b", &k))
         Fail("jobtest show");
@@ -41169,7 +41644,7 @@ void t_t605_store_gate()
 void t_t591_town_refill()
 {
     using namespace townrefill;
-    if (kMsgTownLoss != 64u || kProtocol != 100u) Fail("TOWN_LOSS is not message 64 of protocol 100");
+    if (kMsgTownLoss != 64u || kProtocol != 101u) Fail("TOWN_LOSS is not message 64 of protocol 101");
     Table t;
     if (AddLoss(&t, "town-a") != 1 || AddLoss(&t, "town-a") != 2) Fail("a loss did not add one to its town");
     if (AddLoss(&t, "") != 0 || AddLoss(&t, std::string(129, 'x')) != 0 || AddLoss(&t, "a\tb") != 0) Fail("a loss was taken for a town id that is not usable");
@@ -41721,12 +42196,31 @@ void t_t815_chat_sounds()
     SoundsParse(CfgFormat(c), &h);
     if (h.on[0] != 1 || h.on[1] != 1 || h.on[2] != 1) Fail("chat.cfg: a file from before the switches is not all on");
 }
+/* review S2/S3 (2026-10-17): the plugin uses the tested rule - RowCallOnly and the hook guard both decide through
+   AddrUsesAllCallOnly, and coop::AddHook asks the guard before MinHook touches the target. */
+void t_rk1_hook_guard_pins()
+{
+    const std::string a = T313ReadFile("../coop-plugin/addresses.cpp");
+    const std::string h = T313ReadFile("../coop-plugin/hooks.cpp");
+    if (a.empty() || h.empty()) { Fail("could not read addresses.cpp / hooks.cpp"); return; }
+    const size_t row = a.find("int RowCallOnly(const char* name)");
+    const size_t guard = a.find("const char* AddrHookRefusedAt(unsigned long long target)");
+    if (row == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", row) == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", row) - row > 600)
+        Fail("addresses.cpp: RowCallOnly does not decide through AddrUsesAllCallOnly (S2)");
+    if (guard == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", guard) == std::string::npos || a.find("AddrUsesAllCallOnly(uses, n)", guard) - guard > 700)
+        Fail("addresses.cpp: AddrHookRefusedAt does not decide through AddrUsesAllCallOnly (S3)");
+    const size_t ask = h.find("AddrHookRefusedAt((unsigned long long)(uintptr_t)target)");
+    const size_t create = h.find("MH_CreateHookEx(ident, target, detour, original)");
+    if (ask == std::string::npos || create == std::string::npos || ask > create) Fail("hooks.cpp: AddHook does not ask AddrHookRefusedAt before MH_CreateHookEx (S3)");
+    if (h.find("return FAIL;", ask) == std::string::npos || h.find("return FAIL;", ask) > create) Fail("hooks.cpp: a call-only target is not refused before MH_CreateHookEx (S3)");
+}
 /* T-815: the plugin's sound road - the row it binds is in both address tables, and the sound follows the kept line */
 void t_t815_chat_sound_pins()
 {
     const std::string c = T313ReadFile("../coop-plugin/chat.cpp");
     if (c.empty()) { Fail("could not read chat.cpp"); return; }
-    if (c.find("AddrReg kSoundPostEventRva_reg(\"SoundPostEvent\", &kSoundPostEventRva);") == std::string::npos) Fail("chat.cpp: the SoundPostEvent row is not bound");
+    if (c.find("AddrReg kSoundPostEventRva_reg(\"SoundPostEvent\", &kSoundPostEventRva, kAddrUseCallOnly);") == std::string::npos) Fail("chat.cpp: the SoundPostEvent row is not bound call-only (rk1)");
+    if (c.find("AddrReg kSoundSetSwitchRva_reg(\"SoundSetSwitch\", &kSoundSetSwitchRva, kAddrUseCallOnly);") == std::string::npos) Fail("chat.cpp: the SoundSetSwitch row is not bound call-only (rk1)");
     const size_t kept = c.find("DebugLog(std::string(\"[CHAT] in \") + KindLog(kind)");
     const size_t play = c.find("PlayMessageSound(kind, now);");
     if (kept == std::string::npos || play == std::string::npos || play < kept || play - kept > 400) Fail("chat.cpp: the sound is not played after the received line is kept");
@@ -43135,8 +43629,8 @@ void t_t290s3a_proof()
     if (ht.size() != 32 || authproof::kHostTokenBytes != 32 || !authproof::HostTokenDecode(ht, tok2) || std::memcmp(tok2, tok, 32) != 0) Fail("HOST_TOKEN is not {token 32}, or its round trip");
     ht.push_back(0);
     if (authproof::HostTokenDecode(ht, tok2)) Fail("a 33-byte HOST_TOKEN is read");
-    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 100u)
-        Fail("the message numbers are not 65/66/67/68 of protocol 100");
+    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 101u)
+        Fail("the message numbers are not 65/66/67/68 of protocol 101");
 }
 
 /* auth.txt: the line the host's game writes reads back; a file with no key line is no password; anything unreadable is bad */
@@ -44515,7 +45009,7 @@ void t_t36g_wire_and_rules()
     if (keptwire::RowOk(bad)) Fail("wire2: a door state of 4 is valid");
     bad = w; bad.p.doors.resize(keptwire::kMaxDoors + 1, d);
     if (keptwire::RowOk(bad)) Fail("wire2: a row of 33 doors is valid");
-    if (keptwire::kProtocol != 100u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 100");
+    if (keptwire::kProtocol != 101u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 101");
     /* RecordHoldsItems' 'has' mode (zonekeep::KeptItemsHas) and its 'all' mode count a pack's own items */
     std::vector<std::string> box(1, "4003-gamedata.base");
     if (zonekeep::KeptItemsHas(std::vector<zonekeep::KeptItem>(1, pack), box) != 1) Fail("has2: a box holding a kept pack's item is not 'has'");
@@ -44553,7 +45047,7 @@ void t_t36o_outposts()
     if (DecodeTowns(&cut[0], cut.size(), &op, &first, &back) != 0 || !back.empty()) Fail("outposts: a LIST cut short decodes");
     std::vector<char> more(m); more.push_back(0);
     if (DecodeTowns(&more[0], more.size(), &op, &first, &back) != 0) Fail("outposts: a LIST with a trailing byte decodes");
-    std::vector<char> badOp(m); badOp[0] = 3;
+    std::vector<char> badOp(m); badOp[0] = 4;   /* 3 is SHOW KEYS since protocol 101 */
     if (DecodeTowns(&badOp[0], badOp.size(), &op, &first, &back) != 0) Fail("outposts: an unknown op decodes");
     std::vector<char> big(m); big[8] = (char)(kMaxTownsMsg + 1);
     if (DecodeTowns(&big[0], big.size(), &op, &first, &back) != 0) Fail("outposts: a count past the cap decodes");
@@ -44628,6 +45122,13 @@ void t_t36o_outposts()
     if (!kept.empty() || ts.piecesLeft != 7) Fail("outposts: pieces with no said outpost carry one");
     /* the lay step */
     if (TownLayStep(1, 1, 1) != kStepCached || TownLayStep(0, 1, 1) != kStepStanding || TownLayStep(0, 0, 1) != kStepFound || TownLayStep(0, 0, 0) != kStepNone) Fail("outposts: the lay step is wrong");
+    /* owner 938: the team gate - own and teammates' outposts get a town; no table yet waits; a non-teammate's gets none */
+    if (KeptTownTeamGate(2, 2, 0, 0, 0) != kTeamGateTown || KeptTownTeamGate(2, 2, 0, 1, 0) != kTeamGateTown || KeptTownTeamGate(-1, -1, 1, 0, 0) != kTeamGateTown)
+        Fail("outposts: this player's own kept outpost is gated on the team");
+    if (KeptTownTeamGate(3, 2, 0, 1, 1) != kTeamGateTown) Fail("outposts: a teammate's kept outpost gets no town");
+    if (KeptTownTeamGate(3, 2, 0, 1, 0) != kTeamGateNotMate) Fail("outposts: a non-teammate's kept outpost gets a town");
+    if (KeptTownTeamGate(3, 2, 0, 0, 1) != kTeamGateWait || KeptTownTeamGate(3, 2, 0, 0, 0) != kTeamGateWait) Fail("outposts: a kept outpost is decided before the team table is known");
+    if (KeptTownTeamGate(-1, 2, 0, 1, 1) != kTeamGateWait || KeptTownTeamGate(3, -1, 0, 1, 1) != kTeamGateWait) Fail("outposts: a kept outpost with no slot known is decided");
     const float at1[3] = { 1030.0f, 0.0f, -2030.0f }, at2[3] = { 1100.0f, 0.0f, -2000.0f };
     if (TownStands(at1, a) != 1 || TownStands(at2, a) != 0) Fail("outposts: a standing town is not judged by its distance from the centre");
 }
@@ -45465,6 +45966,146 @@ void t_key_height_into_offset()
     if (coopbuild::BuildTownArgMatch("z", "x_abc_1", "zz") != 0 || coopbuild::BuildTownArgMatch("", "x_abc_1", "") != 0
         || coopbuild::BuildTownArgMatch("zzz", "x_abc_1", "zz") != 0)
         Fail("town lever: a part of a sid, or an empty argument, names a row");
+    /* T-609 U: `buildtest upgrade|downgrade` calls the engine only on an own, readable, whole, complete piece with a target record */
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 1) != coopbuild::kBuildUpgradeWall
+        || coopbuild::BuildUpgradeLeverVerdict(0, 0, 1, 1, 0, 0, 1, 1) != coopbuild::kBuildUpgradeNotOwn)
+        Fail("upgrade lever: a wall is not refused, or refused before the own check");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeGo)
+        Fail("upgrade lever: an own complete piece with an 'upgrades to' record is refused");
+    if (coopbuild::BuildUpgradeLeverVerdict(0, 0, 1, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeNotOwn
+        || coopbuild::BuildUpgradeLeverVerdict(1, 1, 1, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeNotOwn)
+        Fail("upgrade lever: a piece that is not own (or a copy) is not refused as not own");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 0, 1, 0, 0, 1, 0) != coopbuild::kBuildUpgradeNoState)
+        Fail("upgrade lever: an unreadable state is not refused");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 1, 0, 1, 0) != coopbuild::kBuildUpgradeDismantled
+        || coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 1, 1, 0) != coopbuild::kBuildUpgradeRuin)
+        Fail("upgrade lever: a dismantled piece or a ruin is not refused");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 0, 0, 0, 1, 0) != coopbuild::kBuildUpgradeNotComplete)
+        Fail("upgrade lever: an unfinished piece is not refused");
+    if (coopbuild::BuildUpgradeLeverVerdict(1, 0, 1, 1, 0, 0, 0, 0) != coopbuild::kBuildUpgradeNoRecord)
+        Fail("upgrade lever: a piece with no target record is not refused");
+    if (coopbuild::BuildUpgradeLeverVerdict(0, 1, 0, 0, 1, 1, 0, 0) != coopbuild::kBuildUpgradeNotOwn)
+        Fail("upgrade lever: not own is not the first reason");
+    if (std::string(coopbuild::BuildUpgradeLeverWhy(coopbuild::kBuildUpgradeNoRecord, 1)).find("downgrades to") == std::string::npos
+        || std::string(coopbuild::BuildUpgradeLeverWhy(coopbuild::kBuildUpgradeNoRecord, 0)).find("upgrades to") == std::string::npos
+        || std::string(coopbuild::BuildUpgradeLeverWhy(99, 0)) != "unknown verdict")
+        Fail("upgrade lever: a reason does not name its case");
+}
+/* T-609 U fix: what the main thread does with an upgrade / downgrade hook event (args: keysOk, sameKey, sameWorld, rowExists, own,
+   copyHere, removed, newRow) - every verdict, the order they are judged in, the dropped ones and the REMOVE's word */
+void t_t609u_rekey_act()
+{
+    using namespace coopbuild;
+    if (BuildRekeyAct(1, 0, 1, 1, 1, 0, 0, kBuildRekeyNewNone) != kBuildRekeyOwn) Fail("rekey: an own live row with a free new key is not moved");
+    if (BuildRekeyAct(0, 0, 1, 1, 1, 0, 0, kBuildRekeyNewNone) != kBuildRekeyNoKey || BuildRekeyAct(0, 1, 0, 0, 0, 1, 1, kBuildRekeyNewCopy) != kBuildRekeyNoKey)
+        Fail("rekey: an unreadable key is not the first reason");
+    if (BuildRekeyAct(1, 1, 1, 1, 1, 0, 0, kBuildRekeyNewNone) != kBuildRekeySame || BuildRekeyAct(1, 1, 0, 0, 0, 1, 1, kBuildRekeyNewCopy) != kBuildRekeySame)
+        Fail("rekey: an unchanged key does something");
+    if (BuildRekeyAct(1, 0, 0, 1, 1, 0, 0, kBuildRekeyNewNone) != kBuildRekeyStale || BuildRekeyAct(1, 0, 0, 0, 0, 0, 0, kBuildRekeyNewNone) != kBuildRekeyStale)
+        Fail("rekey: a pair queued in an earlier world is not dropped first");
+    if (BuildRekeyAct(1, 0, 1, 0, 0, 0, 0, kBuildRekeyNewNone) != kBuildRekeyNoRow || BuildRekeyAct(1, 0, 1, 0, 1, 1, 1, kBuildRekeyNewOwn) != kBuildRekeyNoRow)
+        Fail("rekey: a piece with no row is not left alone");
+    if (BuildRekeyAct(1, 0, 1, 1, 1, 1, 0, kBuildRekeyNewNone) != kBuildRekeyCopy || BuildRekeyAct(1, 0, 1, 1, 0, 0, 0, kBuildRekeyNewNone) != kBuildRekeyCopy
+        || BuildRekeyAct(1, 0, 1, 1, 1, 1, 1, kBuildRekeyNewCopy) != kBuildRekeyCopy)
+        Fail("rekey: a copy (or a row this game does not own) is re-keyed here");
+    if (BuildRekeyAct(1, 0, 1, 1, 1, 0, 1, kBuildRekeyNewNone) != kBuildRekeyGone || BuildRekeyAct(1, 0, 1, 1, 1, 0, 1, kBuildRekeyNewCopy) != kBuildRekeyGone)
+        Fail("rekey: a removed row is moved, or judged after the new key");
+    if (BuildRekeyAct(1, 0, 1, 1, 1, 0, 0, kBuildRekeyNewCopy) != kBuildRekeyOverCopy) Fail("rekey: a copy row at the new key is overwritten");
+    if (BuildRekeyAct(1, 0, 1, 1, 1, 0, 0, kBuildRekeyNewOwn) != kBuildRekeyRemoveOnly) Fail("rekey: a live own row at the new key is not kept (REMOVE only)");
+    if (BuildRekeyDropped(kBuildRekeyNoKey) != 1 || BuildRekeyDropped(kBuildRekeyStale) != 1 || BuildRekeyDropped(kBuildRekeyOverCopy) != 1)
+        Fail("rekey: a dropped verdict is not counted dropped");
+    if (BuildRekeyDropped(kBuildRekeySame) != 0 || BuildRekeyDropped(kBuildRekeyNoRow) != 0 || BuildRekeyDropped(kBuildRekeyCopy) != 0
+        || BuildRekeyDropped(kBuildRekeyGone) != 0 || BuildRekeyDropped(kBuildRekeyRemoveOnly) != 0 || BuildRekeyDropped(kBuildRekeyOwn) != 0)
+        Fail("rekey: a verdict with nothing to move is counted dropped");
+    if (BuildRekeyRemoveOutcome(1, 1, 1) != kBuildRekeyRmSent || BuildRekeyRemoveOutcome(1, 0, 0) != kBuildRekeyRmSent
+        || BuildRekeyRemoveOutcome(0, 1, 1) != kBuildRekeyRmOwed || BuildRekeyRemoveOutcome(0, 0, 0) != kBuildRekeyRmNotShared
+        || BuildRekeyRemoveOutcome(0, 0, 1) != kBuildRekeyRmFailed)
+        Fail("rekey: the old key's REMOVE outcome is misread");
+    if (std::string(BuildRekeyRemoveWord(kBuildRekeyRmSent)) != "removeSent" || std::string(BuildRekeyRemoveWord(kBuildRekeyRmOwed)) != "removeOwed"
+        || std::string(BuildRekeyRemoveWord(kBuildRekeyRmNotShared)) != "removeNotShared" || std::string(BuildRekeyRemoveWord(kBuildRekeyRmFailed)) != "removeFailed"
+        || std::string(BuildRekeyRemoveWord(99)) != "remove?")
+        Fail("rekey: a REMOVE outcome does not say its word");
+}
+/* T-609 U fix: the off-main re-key queue - filled in order up to its cap, a push past it (or with a bad queue or count) refused unchanged */
+struct T609uRec { char k[8]; int down; };
+void t_t609u_rekey_queue()
+{
+    using namespace coopbuild;
+    T609uRec q[3];
+    std::memset(q, 0, sizeof q);
+    int n = 0;
+    T609uRec r;
+    std::memset(&r, 0, sizeof r);
+    for (int i = 0; i < 3; ++i)
+    {
+        r.k[0] = (char)('a' + i); r.down = i;
+        if (BuildRekeyQueuePush(q, &n, 3, r) != 1 || n != i + 1) Fail("rekey queue: a push below the cap is refused");
+    }
+    if (q[0].k[0] != 'a' || q[1].k[0] != 'b' || q[2].k[0] != 'c' || q[2].down != 2) Fail("rekey queue: the records are not kept in order");
+    r.k[0] = 'z';
+    if (BuildRekeyQueuePush(q, &n, 3, r) != 0 || n != 3 || q[2].k[0] != 'c') Fail("rekey queue: a push past the cap is taken or changes the queue");
+    int bad = -1;
+    if (BuildRekeyQueuePush(q, &bad, 3, r) != 0 || bad != -1) Fail("rekey queue: a negative count is pushed to");
+    int m = 0;
+    if (BuildRekeyQueuePush((T609uRec*)0, &m, 3, r) != 0 || m != 0) Fail("rekey queue: a missing queue is pushed to");
+    if (BuildRekeyQueuePush(q, (int*)0, 3, r) != 0) Fail("rekey queue: a missing count is pushed to");
+    if (BuildRekeyQueuePush(q, &m, 0, r) != 0 || m != 0) Fail("rekey queue: a zero cap takes a record");
+}
+#include "townwake.h"   /* T-936: a newly founded outpost woken at the next safe point */
+/* T-936: the wake queue - one entry per town (by handle words, else by the founding's address), in order, up to its cap; an entry
+   taken out keeps the rest in order */
+void t_t936_wake_queue()
+{
+    using namespace townwake;
+    Entry q[3];
+    std::memset(q, 0, sizeof q);
+    int n = 0;
+    Entry e;
+    std::memset(&e, 0, sizeof e);
+    e.hand[0] = 7; e.hand[4] = 1; e.ptr = 0x1000;
+    if (Push(q, &n, 3, e) != kPushQueued || n != 1) Fail("wake queue: a new town is not queued");
+    if (Push(q, &n, 3, e) != kPushAgain || n != 1) Fail("wake queue: the same town is queued twice");
+    Entry f = e; f.ptr = 0x2000;
+    if (Push(q, &n, 3, f) != kPushAgain || n != 1) Fail("wake queue: the same handle at another address is a second town");
+    Entry g; std::memset(&g, 0, sizeof g); g.ptr = 0x3000;   /* no handle read: matched by its address */
+    if (Push(q, &n, 3, g) != kPushQueued || n != 2) Fail("wake queue: a town with no handle read is refused");
+    if (Push(q, &n, 3, g) != kPushAgain || n != 2) Fail("wake queue: a town with no handle read is queued twice by its address");
+    Entry h; std::memset(&h, 0, sizeof h); h.hand[0] = 8; h.ptr = 0x4000;
+    if (Push(q, &n, 3, h) != kPushQueued || n != 3) Fail("wake queue: a third town below the cap is refused");
+    Entry z; std::memset(&z, 0, sizeof z); z.hand[0] = 9; z.ptr = 0x5000;
+    if (Push(q, &n, 3, z) != kPushFull || n != 3 || q[2].hand[0] != 8) Fail("wake queue: a push past the cap is taken or changes the queue");
+    RemoveAt(q, &n, 0);
+    if (n != 2 || q[0].ptr != 0x3000 || q[1].hand[0] != 8) Fail("wake queue: taking the first out does not keep the rest in order");
+    RemoveAt(q, &n, 5);
+    if (n != 2) Fail("wake queue: an index past the end takes an entry out");
+    int bad = -1;
+    if (Push(q, &bad, 3, z) != kPushFull || bad != -1) Fail("wake queue: a negative count is pushed to");
+    if (Push((Entry*)0, &n, 3, z) != kPushFull || Push(q, (int*)0, 3, z) != kPushFull || Push(q, &n, 0, z) != kPushFull) Fail("wake queue: a missing queue / count or a zero cap takes a town");
+    Entry a0; std::memset(&a0, 0, sizeof a0); Entry b0 = a0;
+    if (SameTown(a0, b0)) Fail("wake queue: two entries with no handle and no address are the same town");
+}
+/* T-936: one look at a queued town - woken only when found, asleep, on the grid, its area loaded and the located area record naming
+   that area; kept while it is not found or its area is not loaded, dropped after 60 s or in another world */
+void t_t936_wake_verdict()
+{
+    using namespace townwake;
+    if (Verdict(1, 1, 0, 1, 1, 0, 1) != kWake) Fail("wake verdict: a found, asleep town in a loaded, matching area is not woken");
+    if (Verdict(1, 1, 1, 1, 1, 0, 1) != kAlready) Fail("wake verdict: an awake town is called");
+    if (Verdict(1, 1, 0, 0, 0, 1000, 1) != kWaitArea || Verdict(1, 1, 0, -1, 0, 1000, 1) != kWaitArea) Fail("wake verdict: a town whose area is not loaded (or unread) is not kept");
+    if (Verdict(1, 1, 0, 0, 0, kGiveUpMs, 1) != kDropTimeout) Fail("wake verdict: a town waiting 60 s for its area is kept");
+    if (Verdict(0, 0, 0, 0, 0, 10, 1) != kWaitTown || Verdict(0, 0, 0, 0, 0, kGiveUpMs + 1, 1) != kDropTimeout) Fail("wake verdict: a town not found is not kept, or kept past 60 s");
+    if (Verdict(1, 1, 0, 1, 0, 0, 1) != kAreaMismatch) Fail("wake verdict: an area record naming another area is called");
+    if (Verdict(1, 0, 0, 1, 1, 0, 1) != kNoArea) Fail("wake verdict: a town off the grid is called");
+    if (Verdict(1, 1, 0, 1, 1, 0, 0) != kDropWorld) Fail("wake verdict: a town of another world is called");
+    if (TakesOut(kWaitArea) != 0 || TakesOut(kWaitTown) != 0 || TakesOut(kWake) != 1 || TakesOut(kAlready) != 1 || TakesOut(kDropTimeout) != 1 || TakesOut(kAreaMismatch) != 1)
+        Fail("wake verdict: the wait / take-out split is wrong");
+    if (AreaRecordMatches(1, 3, 4, 3, 4) != 1 || AreaRecordMatches(1, 3, 4, 4, 3) != 0 || AreaRecordMatches(0, 3, 4, 3, 4) != 0 || AreaRecordMatches(-1, 3, 4, 3, 4) != 0)
+        Fail("wake verdict: the area-record check is wrong");
+    int sx = -1, sy = -1;
+    if (SectorOfXZ(0.0f, 0.0f, &sx, &sy) != 1 || sx != 32 || sy != 32) Fail("wake verdict: the world centre is not area 32,32");
+    if (SectorOfXZ(-147456.0f, 147455.0f, &sx, &sy) != 1 || sx != 0 || sy != 63) Fail("wake verdict: the grid's corners are not areas 0 / 63");
+    if (SectorOfXZ(-147457.0f, 0.0f, &sx, &sy) != 0 || sx != -1) Fail("wake verdict: a position west of the grid is an area (or clamped)");
+    if (SectorOfXZ(1e12f, 0.0f, &sx, &sy) != 0) Fail("wake verdict: a garbage position is an area");
 }
 /* T-799 D1: the money-known mark - set by a restock here or the other game's written value, never unset by a later event; an
    announcement carries the pot only when it was read AND its money is known. */
@@ -46397,7 +47038,7 @@ bool T697RowSame(const coopgrec::GroundRow& a, const coopgrec::GroundRow& b)
 void t_t697_ground_record()
 {
     using namespace coopgrec;
-    if (kProtocol != 100u || kMsgGroundRefuse != 71u) Fail("T-697: ground records are not world-server protocol 100 / GROUND_REFUSE 71");
+    if (kProtocol != 101u || kMsgGroundRefuse != 71u) Fail("T-697: ground records are not world-server protocol 101 / GROUND_REFUSE 71");
     /* the id */
     if (GroundRecId(3, 41) != "ground.3.41" || GroundRecId(0, 0) != "ground.0.0" || GroundRecId(63, 63) != "ground.63.63") Fail("T-697: GroundRecId spelling");
     if (!GroundRecId(64, 0).empty() || !GroundRecId(0, -1).empty()) Fail("T-697: an out-of-range sector made an id");
@@ -46555,7 +47196,7 @@ std::string T823Hash(const std::string& sid)
 void t_t823_box_record()
 {
     using namespace coopbrec;
-    if (kProtocol != 100u || kMsgBoxRefuse != 72u) Fail("T-823: box records are not world-server protocol 100 / BOX_REFUSE 72");
+    if (kProtocol != 101u || kMsgBoxRefuse != 72u) Fail("T-823: box records are not world-server protocol 101 / BOX_REFUSE 72");
 
     /* the id: the key without its height, the record name always in its hashed form */
     const std::string key = "12-box.mod@3,41@1003,-205,100";
@@ -46810,7 +47451,7 @@ void t_t823_box_record()
 void t_t811_base_show()
 {
     using namespace baseshow;
-    if (kMsgShow != 78u || kProtocol != 100u || kProtocol != keptwire::kProtocol || kProtocol != authproof::kProtocol) Fail("T-811: SHOW is not message 78 of world-server protocol 100");
+    if (kMsgShow != 78u || kProtocol != 101u || kProtocol != keptwire::kProtocol || kProtocol != authproof::kProtocol) Fail("T-811: SHOW is not message 78 of world-server protocol 101");
     std::vector<townkeep::TownRow> said;
     townkeep::TownRow a; a.owner = 1; a.name = "Rock Camp"; a.pos[0] = 100.0f; a.pos[1] = 5.0f; a.pos[2] = 200.0f; said.push_back(a);
     townkeep::TownRow b = a; b.owner = 2; b.name = "Hill Fort"; b.pos[0] = -50.0f; said.push_back(b);
@@ -46876,6 +47517,19 @@ void t_t811_base_show()
     if (GoneStep(1, 0, 0, 1) != kGoneDestroy) Fail("GoneStep: a base founded here with no piece in it is not destroyed");
     if (GoneStep(0, 0, 0, 1) != kGoneLeave || GoneStep(1, 1, 0, 1) != kGoneLeave || GoneStep(1, 0, 1, 1) != kGoneLeave || GoneStep(1, 0, 0, 0) != kGoneLeave)
         Fail("GoneStep: a town not founded here, one a loaded piece names, one whose pieces were not all read, or one without TownDestroy is destroyed");
+    /* P47 store gate: a town whose model-piece store holds anything (or could not be read) is not destroyed */
+    if (StoreKeep(1, 0, 0) != 0) Fail("StoreKeep: a town with an empty store is kept");
+    if (StoreKeep(1, 1, 0) != 1 || StoreKeep(1, 0, 2) != 1 || StoreKeep(1, 3, 4) != 1) Fail("StoreKeep: a town whose store holds pieces or sign pairs is destroyed");
+    if (StoreKeep(0, 0, 0) != 1) Fail("StoreKeep: a town whose store could not be read is destroyed");
+    if (StoreKeep(1, 0x100000000ULL, 0) != 1) Fail("StoreKeep: a count above 32 bits is read as empty");
+    {
+        std::vector<StoreLogged> seen;
+        const int ha[5] = {9, 1, 2, 3, 4}, hb[5] = {9, 1, 2, 3, 5}, hc[5] = {9, 1, 2, 3, 6};
+        if (StoreLogOnce(&seen, ha, 2) != 1 || StoreLogOnce(&seen, ha, 2) != 0) Fail("StoreLogOnce: a town is not logged once");
+        if (StoreLogOnce(&seen, hb, 2) != 1 || seen.size() != 2) Fail("StoreLogOnce: a second town is not logged");
+        if (StoreLogOnce(&seen, hc, 2) != 0 || seen.size() != 2) Fail("StoreLogOnce: the list grows past its cap");
+        if (StoreLogOnce(&seen, hb, 2) != 0) Fail("StoreLogOnce: a noted town is logged again at the cap");
+    }
     if (RowStep(1, 1, 1) != kRowKeep || RowStep(0, 1, 1) != kRowTake || RowStep(0, 0, 1) != kRowFound || RowStep(0, 0, 0) != kRowNone) Fail("RowStep: keep / take / found / none");
     /* the size level (owner 874 a): in the SAY, player-towns.txt and SHOW, and the icon the engine gives it */
     if (IconIndexOfLevel(0) != 9 || IconIndexOfLevel(1) != 3 || IconIndexOfLevel(2) != 1 || IconIndexOfLevel(3) != 2) Fail("IconIndexOfLevel: not the engine's 0x48CEE0 mapping");
@@ -46939,6 +47593,193 @@ void t_t811_base_show()
     Shown fresh;
     if (fresh.drawn != 0 || !fresh.markSaid.empty()) Fail("Shown: a new base starts drawn or with a line said");
 
+}
+
+/* owner 936 / 937 (protocol 101): TOWNS SHOW KEYS - the shown rows' piece keys (baseshow.h KeyRowsFor, townkeep.h EncodeShowKeys /
+   ShowKeysTake), the wire fails closed, and the game's per-copy link decision (KeyRowOf, LinkStep) on every branch */
+void t_p47d_show_keys()
+{
+    using namespace baseshow;
+    if (kProtocol != 101u || townkeep::kOpShowKeys != 3u || townkeep::kOpSay != 1u || townkeep::kOpList != 2u || townkeep::kMsgTowns != 70u)
+        Fail("p47d: SHOW KEYS is not TOWNS op 3 of world-server protocol 101");
+    if (townkeep::kMaxShowKeyRows != kMaxShowRows) Fail("p47d: a SHOW KEYS list does not hold one row per shown row");
+    /* KeyRowsFor: one key row per shown row, its keys and cut flag, handle words 0; the viewer's own and a non-teammate's never */
+    std::vector<townkeep::TownRow> said;
+    townkeep::TownRow a; a.owner = 1; a.name = "Rock Camp"; a.pos[0] = 100.0f; a.pos[1] = 5.0f; a.pos[2] = 200.0f; a.level = 2;
+    a.hand[0] = 7; a.hand[1] = 8; a.keys.push_back("P7n|wall|1"); a.keys.push_back("P7n|gen|2"); a.cut = 0; said.push_back(a);
+    townkeep::TownRow b = a; b.owner = 2; b.name = "Hill Fort"; b.pos[0] = -50.0f; b.keys.clear(); b.keys.push_back("P7n|bat|3"); b.cut = 1; said.push_back(b);
+    townkeep::TownRow mine = a; mine.owner = 0; mine.name = "My Base"; mine.keys.clear(); mine.keys.push_back("P7n|mine|4"); said.push_back(mine);
+    townkeep::TownRow other = a; other.owner = 3; other.keys.clear(); other.keys.push_back("P7n|other|5"); said.push_back(other);
+    std::set<int> mates; mates.insert(1); mates.insert(2);
+    std::map<int, std::string> names; names[1] = "Anna"; names[2] = "Ben";
+    int cut = 0;
+    const std::vector<ShowRow> shown = RowsFor(said, 0, mates, names, &cut);
+    const std::vector<townkeep::TownRow> kr = KeyRowsFor(said, shown);
+    if (shown.size() != 2 || kr.size() != 2) { Fail("p47d: KeyRowsFor does not give one key row per shown row"); return; }
+    if (kr[0].owner != 1 || kr[0].keys != a.keys || kr[0].cut != 0 || kr[0].pos[0] != 100.0f || kr[0].name != "Rock Camp" || kr[0].level != 2 || townkeep::HandKnown(kr[0].hand))
+        Fail("p47d: a key row does not carry its owner, centre, name, level and keys, with no handle words");
+    if (kr[1].owner != 2 || kr[1].keys.size() != 1 || kr[1].keys[0] != "P7n|bat|3" || kr[1].cut != 1) Fail("p47d: a cut outpost's key row is not marked cut");
+    for (size_t i = 0; i < kr.size(); ++i) if (kr[i].owner == 0 || kr[i].owner == 3) Fail("p47d: the viewer's own or a non-teammate's keys are sent");
+    if (!KeyRowsFor(said, std::vector<ShowRow>()).empty()) Fail("p47d: key rows are sent for no shown row");
+    /* the wire: a round trip, a split list, the assembly */
+    std::vector<std::vector<char> > msgs;
+    if (!townkeep::EncodeShowKeys(&msgs, kr) || msgs.size() != 1) { Fail("p47d: two key rows do not encode as one message"); return; }
+    unsigned op = 0; int first = 0;
+    std::vector<townkeep::TownRow> back;
+    if (townkeep::DecodeTowns(&msgs[0][0], msgs[0].size(), &op, &first, &back) != 1 || op != townkeep::kOpShowKeys || first != (int)townkeep::kSayFirst
+        || back.size() != 2 || back[0].keys != a.keys || back[1].cut != 1)
+        Fail("p47d: SHOW KEYS does not round-trip");
+    townkeep::ShowKeysAssembly as;
+    std::vector<townkeep::TownRow> done;
+    if (townkeep::ShowKeysTake(&as, (unsigned)first, back, &done) != townkeep::kSayDone || done.size() != 2) Fail("p47d: a one-message SHOW KEYS is not whole");
+    if (!townkeep::EncodeShowKeys(&msgs, std::vector<townkeep::TownRow>()) || msgs.size() != 1
+        || townkeep::DecodeTowns(&msgs[0][0], msgs[0].size(), &op, &first, &back) != 1 || !back.empty()
+        || townkeep::ShowKeysTake(&as, (unsigned)first, back, &done) != townkeep::kSayDone || !done.empty())
+        Fail("p47d: an empty SHOW KEYS does not empty the list held");
+    std::vector<townkeep::TownRow> big;
+    for (int r = 0; r < 5; ++r)
+    {
+        townkeep::TownRow t = a; t.keys.clear();
+        for (int k = 0; k < (int)townkeep::kMaxTownKeys; ++k)
+        {
+            char kb[48]; _snprintf_s(kb, sizeof(kb), _TRUNCATE, "P7n|piece-%d-%04d|xxxxxxxxxxxxxxxxxxxx", r, k);
+            t.keys.push_back(kb);
+        }
+        t.pos[0] = 1000.0f * (float)r;
+        big.push_back(t);
+    }
+    if (!townkeep::EncodeShowKeys(&msgs, big) || msgs.size() < 2) { Fail("p47d: SHOW KEYS past one message is not split"); return; }
+    std::vector<townkeep::TownRow> got;
+    int whole = 0;
+    for (size_t m = 0; m < msgs.size(); ++m)
+    {
+        if (msgs[m].size() > townkeep::kTownsMsgBytes) Fail("p47d: a SHOW KEYS message passes the message cap");
+        if (townkeep::DecodeTowns(&msgs[m][0], msgs[m].size(), &op, &first, &back) != 1 || op != townkeep::kOpShowKeys) { Fail("p47d: a split part does not decode"); return; }
+        const int took = townkeep::ShowKeysTake(&as, (unsigned)first, back, &got);
+        if (took != (m + 1 < msgs.size() ? townkeep::kSayPart : townkeep::kSayDone)) Fail("p47d: a split SHOW KEYS does not end at its last message");
+        if (took == townkeep::kSayDone) whole = 1;
+    }
+    if (whole == 0 || got.size() != big.size() || got[4].keys != big[4].keys) Fail("p47d: a split SHOW KEYS does not come back whole");
+    /* refusals: nothing is taken */
+    if (townkeep::ShowKeysTake(&as, 0u, kr, &done) != townkeep::kSayOrphan) Fail("p47d: a SHOW KEYS part that starts no list is taken");
+    std::vector<townkeep::TownRow> badRow(1, a); badRow[0].owner = -1;
+    if (townkeep::EncodeShowKeys(&msgs, badRow) || !msgs.empty()) Fail("p47d: a key row with no owner slot encodes");
+    std::vector<townkeep::TownRow> tooMany(townkeep::kMaxShowKeyRows + 1, b);
+    if (townkeep::EncodeShowKeys(&msgs, tooMany)) Fail("p47d: a SHOW KEYS past kMaxShowKeyRows rows encodes");
+    std::vector<char> m1;
+    if (!townkeep::EncodeTowns(&m1, townkeep::kOpShowKeys, (int)townkeep::kSayFirst, kr)) { Fail("p47d: EncodeTowns refuses SHOW KEYS"); return; }
+    if (townkeep::EncodeTowns(&m1, townkeep::kOpShowKeys, (int)(townkeep::kSayFirst | townkeep::kSayWhole), kr)) Fail("p47d: SHOW KEYS encodes with the SAY's whole flag");
+    townkeep::EncodeTowns(&m1, townkeep::kOpShowKeys, (int)townkeep::kSayFirst, kr);
+    std::vector<char> w1(m1); w1[4] = (char)(townkeep::kSayFirst | townkeep::kSayWhole);
+    if (townkeep::DecodeTowns(&w1[0], w1.size(), &op, &first, &back) != 0) Fail("p47d: SHOW KEYS with the SAY's whole flag decodes");
+    std::vector<char> t1(m1.begin(), m1.end() - 1);
+    if (townkeep::DecodeTowns(&t1[0], t1.size(), &op, &first, &back) != 0) Fail("p47d: a cut-short SHOW KEYS decodes");
+    std::vector<char> t2(m1); t2.push_back(0);
+    if (townkeep::DecodeTowns(&t2[0], t2.size(), &op, &first, &back) != 0) Fail("p47d: a SHOW KEYS with a trailing byte decodes");
+    std::vector<char> t3(m1); t3[12] = (char)0xFF; t3[13] = (char)0xFF; t3[14] = (char)0xFF; t3[15] = (char)0x7F;   /* the first row's owner: past every slot */
+    if (townkeep::DecodeTowns(&t3[0], t3.size(), &op, &first, &back) != 0) Fail("p47d: a SHOW KEYS row with no real owner slot decodes");
+    std::vector<char> t4(m1); t4[0] = 4;
+    if (townkeep::DecodeTowns(&t4[0], t4.size(), &op, &first, &back) != 0) Fail("p47d: TOWNS op 4 decodes");
+    std::vector<townkeep::TownRow> say(1, a); say[0].owner = -1;
+    if (townkeep::EncodeTowns(&m1, townkeep::kOpShowKeys, (int)townkeep::kSayFirst, say)) Fail("p47d: a SAY row (owner -1) encodes as SHOW KEYS");
+    /* the game: a shown base's key row and the per-copy step */
+    Shown s; s.owner = 1; s.pos[0] = 110.0f; s.pos[2] = 200.0f;
+    if (KeyRowOf(s, kr) != 0) Fail("p47d: a shown base near its row's centre does not find its key row");
+    Shown far = s; far.pos[0] = 100.0f + 2.0f * kSameBaseRadius;
+    Shown wrongOwner = s; wrongOwner.owner = 2;
+    if (KeyRowOf(far, kr) != -1 || KeyRowOf(wrongOwner, kr) != -1) Fail("p47d: a key row is found for a base far off or of another owner");
+    if (LinkStep(1, 1, 0, 0, 0) != kLinkDo || LinkStep(1, 1, 1, 0, 0) != kLinkAlready || LinkStep(1, 0, 0, 0, 0) != kLinkNoTown)
+        Fail("p47d: a copy on its base's keys is not linked / left / waiting as its town stands");
+    if (LinkStep(1, 1, 0, 1, 1) != kLinkDo) Fail("p47d: a copy on one base's keys standing in another shown town is not moved to its own");
+    if (LinkStep(0, 0, 0, 1, 1) != kLinkUndo) Fail("p47d: a copy off its town's keys is not put back");
+    if (LinkStep(0, 0, 0, 1, 0) != kLinkNone || LinkStep(0, 0, 0, 0, 1) != kLinkNone) Fail("p47d: a copy is unlinked while its base's keys are cut, or while it is in no shown town");
+    {   /* P47 put-back: the nearest town whose area holds the spot, the going / shown towns, dead or busy towns and player towns passed over */
+        PutBackTown c[6];
+        for (int i = 0; i < 6; ++i) { c[i].excluded = 0; c[i].dead = 0; c[i].busy = 0; c[i].playerTown = 0; c[i].d2 = 100.0f; c[i].radius = 20.0f; }
+        c[0].d2 = 900.0f;                       /* the spot outside its area (30 > 20) */
+        c[1].d2 = 10.0f; c[1].excluded = 1;     /* the going town or a shown town */
+        c[2].d2 = 11.0f; c[2].dead = 1;
+        c[3].d2 = 12.0f; c[3].busy = 1;
+        c[4].d2 = 13.0f; c[4].playerTown = 1;
+        c[5].d2 = 50.0f;
+        if (PutBackPick(c, 6) != 5) Fail("p47e: the put-back does not pass over an excluded, dead, busy or player town, or one whose area misses the spot");
+        c[0].d2 = 400.0f;                       /* exactly on its edge (20 * 20): it holds the spot, but town 5 is nearer */
+        if (PutBackPick(c, 6) != 5) Fail("p47e: the put-back does not take the nearest town that holds the spot");
+        c[5].excluded = 1;
+        if (PutBackPick(c, 6) != 0) Fail("p47e: a town with the spot exactly on its edge is not taken (0x9279C0 compares <=)");
+        c[5].excluded = 0; c[0].d2 = 50.0f;
+        if (PutBackPick(c, 6) != 0) Fail("p47e: of two equally near towns the put-back does not keep the first (0x9279C0's strict compare)");
+        volatile float zero = 0.0f;
+        c[0].radius = zero / zero;              /* not a number */
+        if (PutBackPick(c, 6) != 5) Fail("p47e: a town whose radius is not a number is taken");
+        c[5].excluded = 1;
+        if (PutBackPick(c, 6) != -1 || PutBackPick(c, 0) != -1) Fail("p47e: a put-back with no town holding the spot does not answer none (the wilderness town)");
+    }
+    /* review fold 4: two outposts of one owner within kSameBaseRadius - each base finds the key row at exactly its centre */
+    std::vector<townkeep::TownRow> two;
+    townkeep::TownRow n1 = a; n1.pos[0] = 100.0f; two.push_back(n1);
+    townkeep::TownRow n2 = a; n2.pos[0] = 100.0f + 0.5f * kSameBaseRadius; n2.keys.clear(); n2.keys.push_back("P7n|well|9"); two.push_back(n2);
+    Shown at1; at1.owner = 1; for (int j = 0; j < 3; ++j) at1.pos[j] = n1.pos[j];
+    Shown at2 = at1; for (int j = 0; j < 3; ++j) at2.pos[j] = n2.pos[j];
+    if (KeyRowOf(at1, two) != 0 || KeyRowOf(at2, two) != 1) Fail("p47d: of two outposts of one owner close together, a base does not find the key row at its own centre");
+    Shown between = at1; between.pos[0] = 100.0f + 0.25f * kSameBaseRadius;
+    if (KeyRowOf(between, two) != 0) Fail("p47d: a base at no row's exact centre does not fall back to the first row near it");
+    Shown otherAt2 = at2; otherAt2.owner = 2;
+    if (KeyRowOf(otherAt2, two) != -1) Fail("p47d: a key row at a base's exact centre is taken for another owner's base");
+    /* review fold: the cut / leave rule a copy off its town's keys may leave by */
+    if (UnlinkOk(1, 0, 0, 0) != 1 || UnlinkOk(1, 1, 1, 0) != 1 || UnlinkOk(1, 1, 0, 0) != 1) Fail("p47d: a copy may not leave the base of a row that went");
+    if (UnlinkOk(0, 1, 0, 1) != 1) Fail("p47d: a copy off a whole key row that said its key earlier may not leave its town");
+    if (UnlinkOk(0, 1, 1, 1) != 0 || UnlinkOk(0, 0, 0, 1) != 0) Fail("p47d: a copy leaves its town while its key row is cut or has not come");
+    /* T1342: a copy the engine put in the shown town at creation, its key never said by the row, stays (counted engineLeft) */
+    if (UnlinkOk(0, 1, 0, 0) != 0 || EngineLeft(0, 1, 0, 0) != 1) Fail("t1342: a copy whose key its row never said is taken out of the town the engine put it in");
+    if (EngineLeft(1, 1, 0, 0) != 0 || EngineLeft(0, 1, 1, 0) != 0 || EngineLeft(0, 0, 0, 0) != 0 || EngineLeft(0, 1, 0, 1) != 0)
+        Fail("t1342: a copy is counted engine-left while its base goes, its row is cut or has not come, or its key was said");
+    if (LinkStep(0, 0, 0, 1, UnlinkOk(0, 1, 0, 0)) != kLinkNone) Fail("t1342: an engine-placed copy never said is put back");
+    if (LinkStep(0, 0, 0, 1, UnlinkOk(0, 1, 0, 1)) != kLinkUndo) Fail("t1342: a copy said then dropped by its row is not put back");
+    if (LinkStep(0, 0, 0, 1, UnlinkOk(0, 1, 1, 1)) != kLinkNone) Fail("t1342: a copy is put back while its row is cut");
+    if (LinkStep(0, 0, 0, 1, UnlinkOk(1, 1, 0, 0)) != kLinkUndo) Fail("t1342: a copy is left in the town of a base that goes");
+    /* T1342: the keys a row ever said - kept across lists, dropped with the row, per row (owner and exact centre), full past the cap */
+    {
+        townkeep::TownRow s1; s1.owner = 1; s1.pos[0] = 10.0f; s1.pos[1] = 2.0f; s1.pos[2] = 30.0f; s1.keys.push_back("K|well|1");
+        townkeep::TownRow s2 = s1; s2.pos[0] = 50.0f; s2.keys.clear(); s2.keys.push_back("K|gen|2");
+        std::vector<SeenRow> seen;
+        std::vector<townkeep::TownRow> l1; l1.push_back(s1); l1.push_back(s2);
+        SeenNote(&seen, l1);
+        if (seen.size() != 2 || SeenHas(seen, s1, "K|well|1") != 1 || SeenHas(seen, s1, "K|gen|2") != 0 || SeenHas(seen, s2, "K|gen|2") != 1)
+            Fail("t1342: a row's said keys are not held for that row alone");
+        townkeep::TownRow s1b = s1; s1b.keys.clear();   /* the owner moved the well out of the outpost */
+        std::vector<townkeep::TownRow> l2; l2.push_back(s1b); l2.push_back(s2);
+        SeenNote(&seen, l2);
+        if (SeenHas(seen, s1, "K|well|1") != 1) Fail("t1342: a key the row said earlier is forgotten when the row stops saying it");
+        townkeep::TownRow other = s1; other.owner = 2;
+        if (SeenHas(seen, other, "K|well|1") != 0) Fail("t1342: a key said for one owner's row counts for another owner's row at the same centre");
+        std::vector<townkeep::TownRow> l3; l3.push_back(s2);
+        SeenNote(&seen, l3);
+        if (seen.size() != 1 || SeenHas(seen, s1, "K|well|1") != 0 || SeenHas(seen, s2, "K|gen|2") != 1) Fail("t1342: a row on no whole list keeps its said keys");
+        townkeep::TownRow big = s2; big.keys.clear();
+        char kb[32];
+        for (size_t i = 0; i <= kSeenKeysCap; ++i) { _snprintf_s(kb, sizeof(kb), _TRUNCATE, "K|x|%u", (unsigned)i); big.keys.push_back(kb); }
+        std::vector<townkeep::TownRow> l4(1, big);
+        SeenNote(&seen, l4);
+        if (seen.size() != 1 || seen[0].full != 1 || SeenHas(seen, s2, "K|never|0") != 1) Fail("t1342: a row past kSeenKeysCap keys is not full (every key counted said)");
+        seen.clear();
+        if (SeenHas(seen, s2, "K|gen|2") != 0) Fail("t1342: a cleared set still says a key");
+    }
+    /* review test gaps: the receive side refuses a list past kMaxShowKeyRows rows (one message or split), the keys held stay; a new
+       first part while a list is open starts it again */
+    townkeep::ShowKeysAssembly as2;
+    std::vector<townkeep::TownRow> held(1, a);
+    if (townkeep::ShowKeysTake(&as2, townkeep::kSayFirst, tooMany, &held) != townkeep::kSayOrphan || held.size() != 1 || held[0].keys != a.keys)
+        Fail("p47d: a one-message SHOW KEYS past kMaxShowKeyRows rows is taken (or the keys held change)");
+    std::vector<townkeep::TownRow> part1(townkeep::kMaxShowKeyRows - 10, b), part2(11, b);
+    if (townkeep::ShowKeysTake(&as2, townkeep::kSayFirst | townkeep::kSayMore, part1, &held) != townkeep::kSayPart
+        || townkeep::ShowKeysTake(&as2, 0u, part2, &held) != townkeep::kSayOrphan || held.size() != 1 || held[0].keys != a.keys)
+        Fail("p47d: a split SHOW KEYS past kMaxShowKeyRows rows is taken (or the keys held change)");
+    if (townkeep::ShowKeysTake(&as2, 0u, part2, &held) != townkeep::kSayOrphan) Fail("p47d: a part after a refused list is taken (the list is not closed)");
+    std::vector<townkeep::TownRow> oldPart(3, b), newList(1, a), got2;
+    if (townkeep::ShowKeysTake(&as2, townkeep::kSayFirst | townkeep::kSayMore, oldPart, &got2) != townkeep::kSayPart
+        || townkeep::ShowKeysTake(&as2, townkeep::kSayFirst, newList, &got2) != townkeep::kSayDone || got2.size() != 1 || got2[0].keys != a.keys)
+        Fail("p47d: a new first part while a list is open does not start the list again");
 }
 
 
@@ -47330,9 +48171,9 @@ void t_t889_wire_and_protocol()
     x = b; x[0] = (char)kMsgClosed; x[13] = 0; if (DecodeMsg(&x[0], x.size(), &d) != 0) Fail("t889: CLOSED 0 refused");
     x = b; x[0] = (char)kMsgQuery; x[13] = 2; if (DecodeMsg(&x[0], x.size(), &d) != 0) Fail("t889: QUERY 2 refused");
     if (b[1] != 1 || b[2] != 0 || b[5] != 2 || b[9] != 3) Fail("t889: little-endian on the wire");
-    /* the numbers: game-to-game protocol 165 (net/session.cpp's kProtocolVersion, which this test cannot see, asserts it equals
+    /* the numbers: game-to-game protocol 166 (net/session.cpp's kProtocolVersion, which this test cannot see, asserts it equals
        kGameProtocol); message 79 (free on main and outside 73-78) */
-    if (kGameProtocol != 165u) Fail("t889: the game-to-game protocol is 165");
+    if (kGameProtocol != 166u) Fail("t889: the game-to-game protocol is 166");
     if (kMsgHandover != 79u || cooplive::kInnerItemHandover != 79u) Fail("t889: MSG_ITEM_HANDOVER is 79");
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerItemHandover)) Fail("t889: the world server road delivers it");
     if (!cooplive::LiveInnerWaitsForWorld(cooplive::kInnerItemHandover)) Fail("t889: it waits for the world like the other item messages");
@@ -48238,6 +49079,9 @@ const TestRow kTests[] =
     { "addr_a_corrupted_table_refuses_and_never_passes_by_default",           t_addr_a_corrupted_table_refuses_and_never_passes_by_default },
     { "addr_signatures_resolve_every_kind_and_refuse_anything_less",          t_addr_signatures_resolve_every_kind_and_refuse_anything_less },
     { "addr_pattern_refusal_clears_every_slot",                               t_addr_pattern_refusal_clears_every_slot },
+    { "rk1_addr_hooked_call_only_verdict",                                    t_rk1_addr_hooked_call_only_verdict },
+    { "rk1_addr_uses_all_call_only",                                          t_rk1_addr_uses_all_call_only },
+    { "rk1_hook_guard_pins",                                                  t_rk1_hook_guard_pins },
     { "door_last_actor_is_reported_not_reverted",            t_door_last_actor_is_reported_not_reverted },
     { "door_a_holder_word_plays_the_swing_and_the_rest_snap", t_door_a_holder_word_plays_the_swing_and_the_rest_snap },
     { "door_a_played_swing_is_ours_until_it_lands",           t_door_a_played_swing_is_ours_until_it_lands },
@@ -48559,6 +49403,10 @@ const TestRow kTests[] =
     { "par16_farm_wire_gate_rate_apply",                            t_par16_farm },
     { "t616_node_writer_mine_op",                                   t_t616_node_writer_mine_op },
     { "t609_build_and_farm_kinds_never_share_a_number",             t_t609_build_farm_kinds_apart },
+    { "p47_power_wire_send_rule_gate_accept_ask",                    t_p47_power },
+    { "p47_fix_stock_emptied_and_look_queue_gap",                    t_p47_look_queue },
+    { "p47a_offmain_writer_verdict_live_published_none",             t_p47_offmain_verdict },
+    { "p47b_completion_switch_put_back",                             t_p47_completion_switch },
     { "t1b1_keep_awake_all_copies_loaded_ground_not_player",          t_t1b1_keep_awake },
     { "t1b1_follow_action_uid_else_position_stay_send_wait",          t_t1b1_follow_action },
     { "t1b1_xfer_take_by_squad_position_else_member",                 t_t1b1_xfer_take },
@@ -49398,6 +50246,8 @@ const TestRow kTests[] =
     , { "t879_log_part_names", t_t879_log_part_names }
     , { "t879_log_ceiling", t_t879_log_ceiling }
     , { "t879_drift_disagrees", t_t879_drift_disagrees }
+    , { "t910_first_lines", t_t910_first_lines }
+    , { "t910_line_keep", t_t910_line_keep }
     , { "t879_budget_cut_first", t_t879_budget_cut_first }
     , { "t697_ground_record", t_t697_ground_record }
     , { "t710_scan_owners", t710_scan_owners }
@@ -49416,6 +50266,7 @@ const TestRow kTests[] =
     , { "t609_zone_kept_adopt", t_t609_zone_kept_adopt }
 
     , { "t811_base_show", t_t811_base_show }
+    , { "p47d_show_keys", t_p47d_show_keys }
 
     , { "t889_handrec_round_trip", t_t889_handrec_round_trip }
     , { "t889_holds_after_load", t_t889_holds_after_load }
@@ -49444,6 +50295,10 @@ const TestRow kTests[] =
     , { "t889f5_durable", t_t889f5_durable }
     , { "t889f5_closed_road", t_t889f5_closed_road }
     , { "t889f5b_taker_closed", t_t889f5b_taker_closed }
+    , { "t609u_rekey_act", t_t609u_rekey_act }   /* T-609 U fix */
+    , { "t609u_rekey_queue", t_t609u_rekey_queue }
+    , { "t936_wake_queue", t_t936_wake_queue }   /* T-936 */
+    , { "t936_wake_verdict", t_t936_wake_verdict }
 };
 
 }   /* anonymous namespace */

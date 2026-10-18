@@ -28,11 +28,16 @@
      no outposts, while that slot has rows on file, is taken only as the kEmptyWholeToClear-th SAY in a row on one link with no
      outposts and its town list read whole (EmptyWholeRun, EmptySayIgnored); the game marks no SAY whole before its player has been
      in the world it loaded for a while.
-   WIRE (little-endian, as every world-server message): u32 op (SAY 1 up, LIST 2 down), u32 flags, u32 count 0..kMaxTownsMsg,
-   count x TOWN
+   WIRE (little-endian, as every world-server message): u32 op (SAY 1 up, LIST 2 down, SHOW KEYS 3 down - protocol 101), u32 flags,
+   u32 count 0..kMaxTownsMsg, count x TOWN
      flags LIST: 1 = the list starts again with this message (0 or 1). SAY: kSayFirst (this message starts a SAY), kSayMore (more
            messages of this SAY follow), kSayWhole (the game read its whole town list); a SAY that would pass kTownsMsgBytes is
-           split between its rows (EncodeTownsSay)
+           split between its rows (EncodeTownsSay). SHOW KEYS: kSayFirst (the key list starts again with this message), kSayMore
+           (more messages of it follow); split as a SAY is (EncodeShowKeys)
+     SHOW KEYS (owner 936 / 937, 2026-10-17): sent right after every SHOW (baseshow.h) - per teammate outpost the SHOW carries, its
+           owner slot, centre, name, size level and the said keys of its linked pieces with the cut flag (handle words all 0: the
+           owner's game's words mean nothing on another game); the game links its copies of those pieces to the town it shows for
+           the outpost (baseshow.h KeyRowsFor / LinkStep)
      TOWN  i32 owner slot (SAY: -1, the sender), 5 x i32 handle words, f32 x, f32 y (height), f32 z, str name (0..128 bytes, no control
            characters), u32 keys 0..kMaxTownKeys (with kKeysCut set: the outpost has pieces the list does not name), keys x str
            (1..47 bytes, each once), u32 size level 0..kLevelMax (T-811, protocol 100: the outpost's plevel, Town+0x388 - which outpost
@@ -55,7 +60,7 @@
 namespace townkeep {
 
 const unsigned kMsgTowns = 70;
-const unsigned kOpSay = 1, kOpList = 2;
+const unsigned kOpSay = 1, kOpList = 2, kOpShowKeys = 3;   /* SHOW KEYS (3): world-server protocol 101 */
 const size_t kMaxTownsMsg = 32;        /* outposts in one TOWNS */
 const size_t kMaxTownsPerSlot = 32;    /* outposts one player's SAY is kept with */
 const size_t kMaxTownKeys = 512;       /* kept pieces one outpost row names */
@@ -96,12 +101,12 @@ inline std::string NameFit(const std::string& s)
     for (size_t i = 0; i < o.size(); ++i) { const unsigned char c = (unsigned char)o[i]; if (c < 0x20 || c == 0x7F) o[i] = '?'; }
     return o;
 }
-/* a row the op may carry: SAY - owner -1; LIST (and both files) - a real owner slot; at most kMaxTownKeys keys, cut 0 or 1, every float
+/* a row the op may carry: SAY - owner -1; LIST, SHOW KEYS (and both files) - a real owner slot; at most kMaxTownKeys keys, cut 0 or 1, every float
    in range, the name and each key valid, no key twice */
 inline bool RowOk(const TownRow& t, unsigned op)
 {
     if (op == kOpSay) { if (t.owner != -1) return false; }
-    else if (op == kOpList) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
+    else if (op == kOpList || op == kOpShowKeys) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
     else return false;
     if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.level < 0 || t.level > kLevelMax) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(t.pos[j])) return false;
@@ -112,8 +117,14 @@ inline bool RowOk(const TownRow& t, unsigned op)
 }
 
 /* ---- the wire ---- */
-/* the flags word: LIST 0 or 1; SAY any of kSayFirst, kSayMore, kSayWhole */
-inline bool FlagsOk(unsigned op, unsigned f) { return op == kOpSay ? (f & ~(kSayFirst | kSayMore | kSayWhole)) == 0 : f <= 1; }
+/* the flags word: LIST 0 or 1; SAY any of kSayFirst, kSayMore, kSayWhole; SHOW KEYS any of kSayFirst, kSayMore */
+inline bool FlagsOk(unsigned op, unsigned f)
+{
+    if (op == kOpSay) return (f & ~(kSayFirst | kSayMore | kSayWhole)) == 0;
+    if (op == kOpShowKeys) return (f & ~(kSayFirst | kSayMore)) == 0;
+    return f <= 1;
+}
+inline bool OpKnown(unsigned op) { return op == kOpSay || op == kOpList || op == kOpShowKeys; }
 struct TkReader
 {
     const unsigned char* p; size_t n, at; bool bad;
@@ -133,11 +144,11 @@ struct TkReader
     }
     bool Done() const { return !bad && at == n; }
 };
-/* SAY or LIST: 0..kMaxTownsMsg rows, every one valid for the op (nothing written for a refused one) */
+/* SAY, LIST or SHOW KEYS: 0..kMaxTownsMsg rows, every one valid for the op (nothing written for a refused one) */
 inline bool EncodeTowns(std::vector<char>* out, unsigned op, int first, const std::vector<TownRow>& rows)
 {
     out->clear();
-    if ((op != kOpSay && op != kOpList) || first < 0 || !FlagsOk(op, (unsigned)first) || rows.size() > kMaxTownsMsg) return false;
+    if (!OpKnown(op) || first < 0 || !FlagsOk(op, (unsigned)first) || rows.size() > kMaxTownsMsg) return false;
     keptwire::PutU32(out, op); keptwire::PutU32(out, (unsigned)first); keptwire::PutU32(out, (unsigned)rows.size());
     for (size_t i = 0; i < rows.size(); ++i)
     {
@@ -159,7 +170,7 @@ inline int DecodeTowns(const char* p, size_t n, unsigned* op, int* first, std::v
     rows->clear(); *op = 0; *first = 0;
     TkReader r(p, n);
     const unsigned o = r.U32(), f = r.U32(), c = r.U32();
-    if (r.bad || (o != kOpSay && o != kOpList) || !FlagsOk(o, f) || c > kMaxTownsMsg) return 0;
+    if (r.bad || !OpKnown(o) || !FlagsOk(o, f) || c > kMaxTownsMsg) return 0;
     std::vector<TownRow> v;
     for (unsigned i = 0; i < c; ++i)
     {
@@ -213,6 +224,33 @@ inline bool EncodeTownsSay(std::vector<std::vector<char> >* msgs, const std::vec
     }
     return true;
 }
+/* SHOW KEYS AS MESSAGES (the world server, after each SHOW): split as a SAY is - the first carries kSayFirst, every one but the last
+   kSayMore; no rows: one message (the game then holds no keys). At most kMaxShowKeyRows rows. False = too many rows, a row not valid
+   for SHOW KEYS or too big for a message alone (msgs then holds nothing) */
+const size_t kMaxShowKeyRows = 256;   /* = baseshow::kMaxShowRows: one key row per shown outpost */
+inline bool EncodeShowKeys(std::vector<std::vector<char> >* msgs, const std::vector<TownRow>& rows)
+{
+    msgs->clear();
+    if (rows.size() > kMaxShowKeyRows) return false;
+    std::vector<std::vector<TownRow> > parts(1);
+    size_t bytes = 12;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        const size_t b = TownBytes(rows[i]);
+        if (!RowOk(rows[i], kOpShowKeys) || 12 + b > kTownsMsgBytes) return false;
+        if (!parts.back().empty() && (parts.back().size() >= kMaxTownsMsg || bytes + b > kTownsMsgBytes)) { parts.push_back(std::vector<TownRow>()); bytes = 12; }
+        parts.back().push_back(rows[i]);
+        bytes += b;
+    }
+    for (size_t p = 0; p < parts.size(); ++p)
+    {
+        const unsigned f = (p == 0 ? kSayFirst : 0u) | (p + 1 < parts.size() ? kSayMore : 0u);
+        std::vector<char> m;
+        if (!EncodeTowns(&m, kOpShowKeys, (int)f, parts[p])) { msgs->clear(); return false; }
+        msgs->push_back(m);
+    }
+    return true;
+}
 /* THE WORLD SERVER'S SIDE OF A SPLIT SAY, one per link: kSayFirst starts it again, each message's rows are added (at most
    kMaxTownsPerSlot; past it the SAY is taken as not read whole), and the message without kSayMore ends it */
 struct SayAssembly
@@ -235,6 +273,27 @@ inline int SayTake(SayAssembly* a, unsigned flags, const std::vector<TownRow>& r
     *whole = ((flags & kSayWhole) != 0 && a->over == 0) ? 1 : 0;
     a->open = 0; a->over = 0;
     return kSayDone;
+}
+/* THE GAME'S SIDE OF SPLIT SHOW KEYS: kSayFirst starts the list again, each message's rows are added, the message without kSayMore
+   ends it. kSayDone: *done holds the whole list; kSayPart: more follow; kSayOrphan: a message that does not start a list while none is
+   open, or a list past kMaxShowKeyRows rows (nothing taken: the keys held stay) */
+struct ShowKeysAssembly
+{
+    std::vector<TownRow> rows;
+    int open, over;
+    ShowKeysAssembly() : open(0), over(0) {}
+};
+inline int ShowKeysTake(ShowKeysAssembly* a, unsigned flags, const std::vector<TownRow>& rows, std::vector<TownRow>* done)
+{
+    if ((flags & kSayFirst) != 0) { a->rows.clear(); a->open = 1; a->over = 0; }
+    else if (a->open == 0) return kSayOrphan;
+    for (size_t i = 0; i < rows.size(); ++i) { if (a->rows.size() < kMaxShowKeyRows) a->rows.push_back(rows[i]); else a->over = 1; }
+    if ((flags & kSayMore) != 0) return kSayPart;
+    const int over = a->over;
+    if (over == 0) done->swap(a->rows);
+    a->rows.clear();
+    a->open = 0; a->over = 0;
+    return over == 0 ? kSayDone : kSayOrphan;
 }
 
 /* ---- the files ---- */
@@ -481,6 +540,20 @@ inline int TownLayStep(int cachedOk, int standing, int mayFound)
     if (cachedOk != 0) return kStepCached;
     if (standing != 0) return kStepStanding;
     return mayFound != 0 ? kStepFound : kStepNone;
+}
+/* owner 938: THE TEAM GATE of a kept outpost after a RESET WORLD - a game takes, founds or links a town for it only when its owner is
+   this game's own player or a teammate on this game's copy of the team table (as a new outpost is shown only to teammates). Without a
+   table yet the outpost WAITS (not settled: looked at again once the table comes); a non-teammate's outpost gets no town (its pieces
+   are laid as they are) and is not settled either, so a later join gives it its town. ownFaction = the piece's faction is this game's
+   own player's (an own outpost whatever the slots say); else mySlot < 0 or owner < 0: wait. */
+const int kTeamGateTown = 0, kTeamGateWait = 1, kTeamGateNotMate = 2;
+inline int KeptTownTeamGate(int owner, int mySlot, int ownFaction, int tableKnown, int sameTeam)
+{
+    if (ownFaction != 0) return kTeamGateTown;
+    if (owner < 0 || mySlot < 0) return kTeamGateWait;
+    if (owner == mySlot) return kTeamGateTown;
+    if (tableKnown == 0) return kTeamGateWait;
+    return sameTeam != 0 ? kTeamGateTown : kTeamGateNotMate;
 }
 
 const int kEmptyWholeToClear = 3;   /* SAYs in a row on one link, each with no outposts and read whole, before a player's outposts on file are cleared */

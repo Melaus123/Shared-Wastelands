@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 524
+!count 531
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -449,6 +449,7 @@ TitleScreen_closePanels                  code 00913BC0 00913BC0 40574883EC3048C7
 TitleScreen_ctor                               code 00918020 00918020 488BC4554154415541564157488DA818
 TitleScreen_update                             code 009129B0 009129B0 40574883EC5048C7442420FEFFFFFF48
 TownFoundPlayer                                code 00933F40 00933F40 4C8BDC5556574881EC9000000048C744
+TownWake                                       code 0092CCE0 0092CCE0 4889542410574883EC508B81D8000000
 TownHand                                       var  01F38690 01F38690 -
 TownInitialiseResidentData                     code 00935F90 00935F90 488BC455488BEC4883EC6048C745C0FE
 TownList                                       var  021330A0 021330A0 -
@@ -535,3 +536,9 @@ BuildingTakeWorkSpot                           code 000F7FF0 000F7FF0 48895C2418
 WorkerSetErase                                 code 0028D400 0028D400 48895C241048896C2418488974242057
 SoundPostEvent                                 code 00A860C0 00A860C0 48895C240848896C241048897C241841
 SoundSetSwitch                                 code 00A82010 00A82010 48895C24084889742410574883EC2049
+BuildingUpgrade                                code 002A49A0 002A49A0 488BC4554154415541564157488BEC48
+BuildingDowngrade                              code 002A4D70 002A4D70 40574883EC7048C7442430FEFFFFFF48
+PowerBatteryCharge                             code 00299460 00299460 40534883EC400F297C2420488BD9E866
+ProductionUpdateInputs                         code 0029A330 0029A330 488BC455415441554883EC604533ED44
+OrdersReceiver_resetOrders                     code 00506AA0 00506AA0 40534883EC2048896C243033ED48C741
+OrdersReceiver_dropStandingJobs                code 005067F0 005067F0 48895C2410574883EC2033DB488BF939

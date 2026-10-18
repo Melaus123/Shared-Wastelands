@@ -826,6 +826,7 @@ void P060Line(DoorRow* r, const char* key, int was, int now, int doaTenths, int 
 {
     if (r == 0 || ::InterlockedIncrement(&r->lines) > kP060PerKeyBudget)
     { ::InterlockedIncrement64(&g_doorLinesSuppressed); return; }
+#ifdef SW_DEV_BUILD   /* T-910: the P060 line is the DEV build's only (the budget above still counts) */
     {
         char b[352];
         _snprintf(b, 351, "[P060] door key=%s was=%d now=%d doa=%d locked=%d wants=%d broken=%d gate=%d hold=%s ret=0x%llX at=%s",
@@ -834,6 +835,9 @@ void P060Line(DoorRow* r, const char* key, int was, int now, int doaTenths, int 
         b[351] = 0;
         DebugLog(b);
     }
+#else
+    (void)key; (void)was; (void)now; (void)doaTenths; (void)locked; (void)wants; (void)broken; (void)gate; (void)hold; (void)retRva; (void)where;
+#endif
 }
 /* The holder verdict, asked ONLY where it can be asked: items.cpp's AreaVerdictForDoor is the box
    road's own ItAreaVerdictAt and one of its arms reads main-thread state.  Off the main thread the

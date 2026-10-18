@@ -68,6 +68,18 @@ inline int JobInputParse(const std::string& arg, JobInput* out)
     return 1;
 }
 
+/* T-610 `stop <uid>`: uid decimal or 0x hex, non-zero, nothing after it. 1 parsed, 0 not. */
+inline int JobStopParse(const std::string& arg, unsigned int* uid)
+{
+    *uid = 0;
+    std::string tok[3];
+    if (coopsay::TalkSplit(arg, tok, 3) != 2 || tok[0] != "stop") return 0;
+    unsigned long long v = 0;
+    if (!coopsay::TalkParseNumber(tok[1], &v) || v == 0 || v > 0xFFFFFFFFULL) return 0;
+    *uid = (unsigned int)v;
+    return 1;
+}
+
 /* `show <key>`. 1 parsed, 0 not. */
 inline int JobShowParse(const std::string& arg, std::string* key)
 {

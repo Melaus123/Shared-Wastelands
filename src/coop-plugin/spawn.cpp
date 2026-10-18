@@ -73,6 +73,7 @@ namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* eff
 #include "items.h"          // POSE (read-poses): ObjectPositionKey / ObjectByPositionKey - the bed's building key
 
 #include "coop_log.h"
+namespace { swlogbudget::Gate g_qM1IntoNull, g_qM1IntoRef, g_qM1IntoCtx, g_qCtxRenamed, g_qCtxKeptHire, g_qCtxKeptLoad, g_qCtxSent; }   /* T-910: the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "hooks.h"   // R3: coop::AddHook (own MinHook) for the rescue hook 0x7D38D0
 #include "game/CharMovement.h"   // twin placement at adoption
@@ -899,12 +900,12 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
         if (!keepContainer)
         {
             useContainer = 0;
-            DebugLog("[M1] spawning into faction '" + factionName
+            SW_QUIETLOG(g_qM1IntoNull, "[M1] spawning into faction (container=NULL)", 0, 0, "[M1] spawning into faction '" + factionName
                      + "' (" + P(chosen) + "), container=NULL (engine-chosen)");
         }
         else
         {
-            DebugLog("[M1] spawning into faction '" + factionName
+            SW_QUIETLOG(g_qM1IntoRef, "[M1] spawning into faction (reference platoon)", 0, 0, "[M1] spawning into faction '" + factionName
                      + "' (" + P(chosen) + "), container=reference platoon " + P(container));
         }
     }
@@ -920,7 +921,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
     if (forceContainer != 0)
     {
         useContainer = forceContainer;
-        DebugLog("[M1] spawning into CONTEXT platoon " + P(forceContainer) + " home building " + P(homeBuilding));
+        SW_QUIETLOG(g_qM1IntoCtx, "[M1] spawning into CONTEXT platoon", 0, 0, "[M1] spawning into CONTEXT platoon " + P(forceContainer) + " home building " + P(homeBuilding));
     }
 
     // mirror1 (crash T487) A - A COPY THE UID TABLE CANNOT HOLD IS NEVER BUILT. T487 built and drove
@@ -1052,6 +1053,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
     // (-0.8 vs -1.1), which is consistent with two references standing on different ground.
     // This line prints the reference, the container, and the new character's own ceiling,
     // so the correlation can be read straight off the two logs instead of inferred.
+#ifdef SW_DEV_BUILD   /* T-910: P013 (unregistered) is the DEV build's only */
     {
         MedicalSystem* med = (MedicalSystem*)((char*)obj + 0x458);
         std::string maxes, ages, hpms, chances;
@@ -1101,6 +1103,7 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
                  + " hpm=" + hpms
                  + " hitWeight=" + chances);
     }
+#endif
 
     // PROBE P019 (F153) - what this character LOOKS like, emitted on EVERY spawn on BOTH
     // instances so the two logs diff without anyone having to ask for it.
@@ -1114,8 +1117,8 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
     //
     // `building=1` means the body was still being assembled when this was read, so the line
     // is a snapshot and not a verdict - re-read with `look <uid>` once it settles.
-    DebugLog("[P019] uid=" + S(uid) + " (" + who + ") "
-             + AppearanceString((::Character*)obj));
+    SW_DEVLOG("[P019] uid=" + S(uid) + " (" + who + ") "
+             + AppearanceString((::Character*)obj));   /* T-910: the DEV build's only */
 
     return true;
 }
@@ -12573,7 +12576,7 @@ static int CopySquadIdCheck(Faction* faction, void* platoon, const std::string& 
                              + " noFree=" + S(g_ctxCopyIdNoFree) + " writeFailed=" + S(g_ctxCopyIdWriteFailed) + " unread=" + S(g_ctxCopyIdUnread)
                              + " squadsRead=" + S(w.read) + walkText + " tries=" + S((long long)tries);
     if (why.empty())
-        DebugLog("[CTX] copy squad " + P(platoon) + " faction='" + fname + "' engineId='" + engineId + "' -> '" + fresh + "' (held by "
+        SW_QUIETLOG(g_qCtxRenamed, "[CTX] copy squad renamed", 0, 0, "[CTX] copy squad " + P(platoon) + " faction='" + fname + "' engineId='" + engineId + "' -> '" + fresh + "' (held by "
                  + copysq::HeldText(held) + " squad) via=" + via + cfText + counts);
     else
         ErrorLog("[CTX] copy squad " + P(platoon) + " faction='" + fname + "' engineId='" + engineId + "' held by " + copysq::HeldText(held)
@@ -12605,7 +12608,7 @@ void CopySquadIdCheckHired(::Faction* faction, void* active)
     std::string engineId; if (!PlatoonIdPod(platoon, &engineId)) engineId.clear();
     std::string fresh;
     if (CopySquadIdCheck((Faction*)faction, platoon, engineId, &fresh, "hire") == copysq::kIdKeep)
-        DebugLog("[CTX] copy squad " + P(platoon) + " faction='" + fname + "' engineId='" + engineId + "' kept - no other squad holds it via=hire (kept="
+        SW_QUIETLOG(g_qCtxKeptHire, "[CTX] copy squad kept via=hire", 0, 0, "[CTX] copy squad " + P(platoon) + " faction='" + fname + "' engineId='" + engineId + "' kept - no other squad holds it via=hire (kept="
                  + S(g_ctxCopyIdKept) + ")");
 }
 
@@ -12645,7 +12648,7 @@ int CopySquadIdCheckAtLoad(void* platoon, const std::string& id)
     const int d = CopySquadIdCheck(holder, platoon, engineId, &fresh, "load");
     if (d == copysq::kIdKeep)
     {
-        DebugLog("[CTX] copy squad " + P(platoon) + " engineId='" + engineId + "' kept - no other squad holds it via=load (kept=" + S(g_ctxCopyIdKept) + ")");
+        SW_QUIETLOG(g_qCtxKeptLoad, "[CTX] copy squad kept via=load", 0, 0, "[CTX] copy squad " + P(platoon) + " engineId='" + engineId + "' kept - no other squad holds it via=load (kept=" + S(g_ctxCopyIdKept) + ")");
         return 0;
     }
     return fresh.empty() ? -2 : 1;
@@ -12722,7 +12725,7 @@ bool SendContextFor(unsigned int uid, ::Character* c)
     const unsigned int loadAgeMs = coop::StoreWorldLoadAgeMs();
     if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs)) { ++g_ctxSendFailed; return false; }
     ++g_ctxSent;
-    DebugLog("[CTX] -> uid=" + std::string(S(uid)) + " squad='" + squadSid + "' squadType=" + S(squadType) + " town='" + townSid
+    SW_QUIETLOG(g_qCtxSent, "[CTX] ->", 0, 0, "[CTX] -> uid=" + std::string(S(uid)) + " squad='" + squadSid + "' squadType=" + S(squadType) + " town='" + townSid
              + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)));
     return true;
 }
@@ -12886,7 +12889,8 @@ void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squad
     void* squadGd = 0;
     if (!squadSid.empty() && coop::GameWorldPtr() != 0) { squadGd = coop::GameWorldPtr()->gamedata.getData(squadSid); if (squadGd) ++g_ctxSquadOk; else ++g_ctxSquadMiss; }
     const std::string q(1, (char)34);
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "context" + q
+    static unsigned int s_verdictContextLines = 0;   /* T-910: the release build's first 10 */
+    SW_FIRSTLOG(s_verdictContextLines, 10, "[VERDICT] {" + q + "ev" + q + ":" + q + "context" + q
              + "," + q + "uid" + q + ":" + S(uid)
              + "," + q + "townSid" + q + ":" + q + townSid + q + "," + q + "townResolved" + q + ":" + (town ? "1" : "0") + "," + q + "townHow" + q + ":" + S(how)
              + "," + q + "buildingSent" + q + ":" + ((bx != 0.0f || bz != 0.0f) ? "1" : "0") + "," + q + "buildingResolved" + q + ":" + (bld ? "1" : "0")
@@ -13199,7 +13203,8 @@ void FinishContextForSpawn(unsigned int uid, int memberType)
     if (memberType >= 0 && memberType <= 4) { c->setSquadRole((SquadRole)memberType); ++g_ctxMemberTypeSet; }
     ++g_ctxApplied;
     const std::string q(1, (char)34);
-    DebugLog("[VERDICT] {" + q + "ev" + q + ":" + q + "context_applied" + q + "," + q + "uid" + q + ":" + S(uid)
+    static unsigned int s_verdictAppliedLines = 0;   /* T-910: the release build's first 10 */
+    SW_FIRSTLOG(s_verdictAppliedLines, 10, "[VERDICT] {" + q + "ev" + q + ":" + q + "context_applied" + q + "," + q + "uid" + q + ":" + S(uid)
              + "," + q + "memberType" + q + ":" + S(memberType) + "," + q + "platoonsCreated" + q + ":" + S(g_ctxPlatoonsCreated)
              + "," + q + "platoonsReused" + q + ":" + S(g_ctxPlatoonsReused) + "," + q + "awakeSameId" + q + ":" + S(g_ctxAwakeSameId) + "," + q + "retiredAwake" + q + ":" + S(g_ctxRetiredAwake) + "," + q + "retireFailed" + q + ":" + S(g_ctxRetireFailed) + "," + q + "retireSkippedSession" + q + ":" + S(g_ctxRetireSkippedSession) + "," + q + "supersededAsleep" + q + ":" + S(g_ctxSupersededAsleep) + "," + q + "supersedeFailed" + q + ":" + S(g_ctxSupersedeFailed) + "," + q + "supersedeOwnIdRefused" + q + ":" + S(g_ctxSupersedeOwnIdRefused)
              + "," + q + "copyIdRenamedOwn" + q + ":" + S(g_ctxCopyIdRenamedOwn) + "," + q + "copyIdRenamedOther" + q + ":" + S(g_ctxCopyIdRenamedOther)

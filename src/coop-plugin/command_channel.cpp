@@ -597,9 +597,14 @@ void CommandChannelTick()
         {
             SaveManager* sm = SaveManager::getSingleton();
             const int r = coop::StoreHandKey(sm, which == "load" ? 1 : 0);
-            if (r == 1)
+            if (r == 1 || r == 2 || r == 3)
             {
-                DebugLog("[cmd] handkey " + which + ": the engine's SaveManager::" + which + "(\"quicksave\"" + (which == "save" ? std::string(", 0") : std::string()) + ") was called through its hook, as the key calls it");
+                /* T-906 (T1349): r says what our hook did with the call (store.h StoreHandKey) - log only; the status is unchanged */
+                const std::string call = "SaveManager::" + which + "(\"quicksave\"" + (which == "save" ? std::string(", 0") : std::string()) + ")";
+                if (r == 1) DebugLog("[cmd] handkey " + which + ": the engine's " + call + " was called through its hook, as the key calls it");
+                else if (r == 2) DebugLog("[cmd] handkey " + which + ": " + call + " was asked through its hook, as the key asks it - REFUSED by the multiplayer rule (hand "
+                                          + which + " refused in a multiplayer world); the engine's " + which + " was NOT called");
+                else DebugLog("[cmd] handkey " + which + ": " + call + " was asked through its hook, as the key asks it - REFUSED by the save-folder redirect; the engine's save was NOT called");
                 WriteStatus("ok handkey " + which);
             }
             else if (r == -2) { ErrorLog("[cmd] handkey " + which + " REFUSED: the SaveManager::" + which + " hook is not installed in this build - not called"); WriteStatus("error handkey no-hook " + which); }
@@ -1458,7 +1463,7 @@ void CommandChannelTick()
     }
     else if (coopui::UiDriveIsVerb(verb) != 0)
     {
-        /* uiclick <name> | uipick <list> <row text> | uitype <field> <text> | uistate   - TEST-ONLY (pp1, player-path-plan 1a):
+        /* uiclick <name> | uiclick engine:<Suffix> | uiclick point:<x>,<y> | uipick <list> <row text> | uitype <field> <text> | uistate   - TEST-ONLY (pp1, player-path-plan 1a; T-903 point:):
            drive the REAL panel and Kenshi title buttons through their own handlers; a hidden or disabled widget is REFUSED
            (ui.cpp UiDriveCommand). The name table is common/uidrive.h. */
         std::string rest; std::getline(is, rest); rest = Trim(rest);
@@ -2247,6 +2252,7 @@ void CommandChannelTick()
     {
         // buildtest place <sid> [dx dz] | progress <key-substring> <amount> | dismantle <key-substring>   - TEST-ONLY lever
         // (also mats / destroy / into, and broken <key-substring> 0|1: the engine's own setBroken on the piece)
+        // (upgrade|downgrade <key-substring>: the engine's own upgrade / downgrade on an own, complete piece - T-609 U)
         // (build1-a, docs/design-build1.md s3): armed here, run at the K2 safe point (build.cpp BuildTestDrain).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildTestArm(Trim(arg))); finished = true;
@@ -2357,6 +2363,9 @@ void CommandChannelTick()
         // text - default task 87 OPERATE_MACHINERY, as a player's order (`plain` = without the player-order argument).
         // jobtest input <buildingKey> <itemSid> <n> [section=<name>]   - TEST-ONLY: n of the item into that machine's input section
         // (boxtest's path, the section whose limit list names the item unless one is named). jobtest show <buildingKey> - read-only.
+        // jobtest stop <characterUid>   - T-610 TEST-ONLY: this game's own character's orders dropped (dropAllOrders 0x506A10), its order
+        // target reset (0x506AA0), its standing jobs dropped (0x5067F0) and its current task ended (the task's end flag); ok only when
+        // the order list and the standing job list both read empty after.
         // Each prints the machine's name, product, inputs and sections. [JOB] lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::JobTestCommand(Trim(arg))); finished = true;

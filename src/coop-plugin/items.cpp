@@ -1550,6 +1550,12 @@ long long g_prodRanHolder = 0, g_prodSkippedNotHolder = 0, g_prodWorkerPassed = 
    the relay table full, an unusable amount). workerPassed counts the worker steps run here as the writer (or with nobody else
    in the world). */
 long long g_prodWorkerRelayed = 0, g_prodWorkerUnrelayed = 0;
+/* T-610: `prodWorkerCopySkipped` a worker's step neither run nor relayed here because the worker is a copy of another game's
+   character (coopfarm::MineWorkerSkip - its own game runs or relays its work; T1321's double count). ANY THREAD: interlocked.
+   The first skip of each copy is said on the main thread (ItProdCopySayDrain, from ItemsTickDrain). */
+volatile LONG64 g_prodWorkerCopySkipped = 0;
+volatile LONG g_prodCopyLastUid = 0;   /* the copy last skipped - one note per run of repeats */
+volatile LONG g_prodCopySayUid = 0;    /* a copy waiting to be said, 0 none */
 // ---- P6k: the review-p6d folds ----
 // `rollbackPlaceFaulted` (M-1): ItPlacePod faulted inside the E22b-2 OWNER ROLLBACK. That is a real player
 // drag on its 10 s deadline with no lever anywhere near it, and it used to be printed inside
@@ -3596,6 +3602,20 @@ void ItCcSayDrain()   /* MAIN THREAD (ItemsTickDrain) */
             DebugLog(std::string("[ITEMS] copyConsume: the first ") + kCcName[k] + " refused on a copy (uid=" + N((long long)(unsigned int)g_ccFirstUid[k])
                      + ") - a copy's own game does not use up its items; its owner's uses arrive as item moves (kit2, owner 102)");
 }
+const int kProdCopySaidCap = 64;
+unsigned int g_prodCopySaid[kProdCopySaidCap];   /* MAIN THREAD: copies whose skip was said (a ring - one line per copy) */
+int g_prodCopySaidNext = 0;
+void ItProdCopySayDrain()   /* T-610, MAIN THREAD (ItemsTickDrain) */
+{
+    const unsigned int uid = (unsigned int)::InterlockedExchange(&g_prodCopySayUid, 0);
+    if (uid == 0) return;
+    for (int i = 0; i < kProdCopySaidCap; ++i) if (g_prodCopySaid[i] == uid) return;
+    g_prodCopySaid[g_prodCopySaidNext] = uid;
+    g_prodCopySaidNext = (g_prodCopySaidNext + 1) % kProdCopySaidCap;
+    DebugLog("[ITEMS] productionWorker copySkipped uid=" + N((long long)uid) + " - a copy of another game's character worked a"
+             " production building here; its step is not run and not relayed (its own game runs its job and runs or relays that work,"
+             " T-610 / T1321). One line per copy; prodWorkerCopySkipped counts every skipped step.");
+}
 std::string ItCcReport()
 {
     return " copyConsumeRefused[eat,reload,medkit,drop,takeOne,eatItem,takeOneTaker]=" + N((long long)g_ccRefused[kCcEat]) + "," + N((long long)g_ccRefused[kCcReload])
@@ -4899,18 +4919,21 @@ void* ItBoxResolve(const char* key)
         {
             char nk[kBoxKeyCap]; nk[0] = 0;
             const int haveNk = (nearest != 0) ? ItBoxKeyBuild(nearest, nk, kBoxKeyCap, 0, 0) : 0;
+            static unsigned int s_nearMissAdvice = 0;   /* T-910: the release build's first 10 carry the advice text; boxKeyNearMiss counts them all */
+            const bool nearAdvice = SW_FIRSTN(s_nearMissAdvice, 10);
             const std::string nearLine = ("[ITEMS] box key NEAR MISS '" + std::string(key) + "': nothing in this game's loaded"
                      " zones answers to that position key. buildingsInSector=" + N(secHits)
                      + " thenWithinOneTenthOnXZ=" + N(xzHits)
                      + " nearestInSector=" + (haveNk != 0 ? std::string(nk) : std::string("(none, or its own key could not be built)"))
                      + " nearestDistanceTenths=" + N((long long)(nearestD < 0 ? -1 : nearestD))
                      + " (dx=" + N((long long)nearestDx) + ", dz=" + N((long long)nearestDz) + ")."
+                     + std::string(nearAdvice ?
                        " buildingsInSector=0 means the box is simply not loaded here - the ordinary case, and"
                        " what the old wording always claimed. A non-zero nearestDistanceTenths of 1 or 2 with"
                        " the same base record is the case that threatens the position key itself: the two"
                        " games rounded the same building to different tenths, and the fix is not a wider"
                        " window (that merges neighbours) but finding out why the save round trip moved it."
-                       " Run boxlist on BOTH games and diff the poskey= columns.");
+                       " Run boxlist on BOTH games and diff the poskey= columns." : ""));
             if (g_nearMissHold != 0) { g_nearMissHeldKey = key; g_nearMissHeldLine = nearLine; }
             else DebugLog(nearLine);
         }
@@ -8469,6 +8492,7 @@ void P133RestockAfter(void* ap, const P133Pre& p, int skip, int wander, char for
 // restock. Nothing here writes money or stock. Once per load per group (the pot); the restock that follows writes the
 // [KEEPER] restocked now line with the after-values and marks the money known.
 long long g_keeperRepairedMoneyUnknown = 0, g_keeperRepairedEmpty = 0, g_keeperRepairTimerFailed = 0;
+long long g_keeperRestockedNowLines = 0;   /* T-910: [KEEPER] restocked now lines this launch (the bug report's header) */
 struct ItKeeperRepairPend { int why; unsigned int uid; std::string sid; int moneyBefore; long long stockBefore; };
 std::map<void*, ItKeeperRepairPend> g_keeperRepairPend;   /* by the pot: asked, the restock not yet run */
 std::set<void*> g_keeperRepaired;                         /* by the pot: repaired this load */
@@ -8549,6 +8573,7 @@ void ItKeeperRestockRanHere(void* ap)
     const ItKeeperRepairPend pd = it->second;
     g_keeperRepairPend.erase(it);
     const long long stockAfter = ItKeeperStock(ItHomeBuildingPod(leader));
+    ++g_keeperRestockedNowLines;   /* T-910 */
     DebugLog("[KEEPER] restocked now: group=" + (pd.sid.empty() ? std::string("?") : pd.sid) + " leader=" + N((long long)pd.uid)
              + " why=" + std::string(pd.why == coopsquad::kKeeperRepairMoneyUnknown ? "money-unknown" : "empty")
              + " money " + N((long long)pd.moneyBefore) + "->" + N((long long)money)
@@ -8874,6 +8899,13 @@ int ItProdWriterKept(void* pb)
     m.v = v; m.at = now;
     return v;
 }
+/* T-610, ANY THREAD: a copy's worker step was skipped - counted; a copy other than the last one skipped is queued to be said */
+void ProdCopySkipNote(unsigned int uid)
+{
+    ::InterlockedIncrement64(&g_prodWorkerCopySkipped);
+    if ((unsigned int)::InterlockedExchange(&g_prodCopyLastUid, (LONG)uid) == uid) return;
+    ::InterlockedCompareExchange(&g_prodCopySayUid, (LONG)uid, 0);
+}
 void detour_prodOperate(void* pb, void* who, float dt)
 {
     /* A lone game makes its own items, above every counter of the gate (decision 43, as the restock gate). */
@@ -8882,6 +8914,14 @@ void detour_prodOperate(void* pb, void* who, float dt)
     {   /* a WORKER'S step (a character mining a node or working a machine) runs on the building's writer only; on any other
            game its work is kept and goes to the writer as MINE_OP (farm.cpp) - waiting while no writer is named - and the ore
            reaches this game as a box move; the writer's game sends the node's bar and state to the others (MINE_STATE) */
+        /* T-610: a worker that is a COPY of another game's character is neither run nor relayed here - its own game runs its job
+           and runs or relays that work. The step comes from the work task's slot, run by AITaskSytem::update inside
+           Character::threadedUpdate - the AI worker thread (farm.cpp T-853 #9, Read) - so the copy test is the any-thread one:
+           FindSpawnedUid (address compares) and the owned mirror (net::IsUidMineAnyThread, O1), never the main thread's set. */
+        const unsigned int whoUid = FindSpawnedUid(who);
+        const int whoCopy = (whoUid != 0) ? coopfarm::WorkerIsCopy(whoUid, net::IsUidMineAnyThread(whoUid) ? 1 : 0,
+                                                                   net::OwnedMirrorExactAnyThread() ? 1 : 0) : 0;
+        if (coopfarm::MineWorkerSkip(0, whoCopy) != 0) { ProdCopySkipNote(whoUid); return; }
         const int writer = ItProdWriterKept(pb);
         if (coopfarm::MineStepRoute(0, MineLinked(), writer) == coopfarm::kMineRun)
         {
@@ -8926,8 +8966,9 @@ void ItBoxCountDropped(int verdict, const char* key, int rungLoaded)
     }
     ++g_boxZoneGone;
     if (rungLoaded != 0) ++g_boxZoneGoneRungLoaded; else ++g_boxZoneGoneRungGone;
+    static unsigned int s_zoneGoneLines = 0;   /* T-910: the release build's first 10; boxZoneGone counts them all */
     if (ItBoxSayForKey(key) != 0)
-        DebugLog("[ITEMS] box zone-gone '" + std::string(key) + "': this game does not have that box's patch"
+        SW_FIRSTLOG(s_zoneGoneLines, 10, "[ITEMS] box zone-gone '" + std::string(key) + "': this game does not have that box's patch"
                  " of map loaded at the moment of commitment - OR the question could not be asked at all, see"
                  " boxPosUnanswerable in itemBox4 - so nothing was published or requested"
                  " (rungSectorLoaded=" + N((long long)rungLoaded) + " - 0 means the area was already gone when"
@@ -23010,6 +23051,7 @@ void ItemsTickDrain()
 {
     if (g_base == 0) return;
     ItCcSayDrain();   /* kit2: the first refusal of each kind, said on the main thread */
+    ItProdCopySayDrain();   /* T-610: the first skipped worker step of each copy */
     GroundDrain();   /* inv5 phase 1: the ground detours' queue, the gate's snapshot and the requester's timeouts, on the main thread */
     /* P6t (review-p6k HIGH-1). ONE GENERATION PER DRAIN. The resolver's liveness test memoises the engine's
        walk for the length of a generation; bumping it here is what stops one drain from testing membership
@@ -29536,6 +29578,13 @@ std::string ItemTestPackItemCommand(const std::string& arg)
     return "ok itemtest packitem " + N((long long)created);
 }
 
+/* T-910: items.h */
+std::string ItemsKeeperRepairToken()
+{
+    return "moneyUnknown=" + N(g_keeperRepairedMoneyUnknown) + " empty=" + N(g_keeperRepairedEmpty) + " timerFailed=" + N(g_keeperRepairTimerFailed)
+           + " restockedNow=" + N(g_keeperRestockedNowLines);
+}
+
 std::string ItemsReport()
 {
     return " items[sent,recv,applied,refused,unknownUid,ownerUnknown,itemReadFault,ringDropped]="
@@ -29829,6 +29878,7 @@ std::string ItemsDetail()
          + N(g_prodSinglePlayer) + "," + N(g_prodUnreadable)
          + " productionWorker[relayed,unrelayed,nodeMarkIgnored,writerKept]=" + N(g_prodWorkerRelayed) + "," + N(g_prodWorkerUnrelayed) + ","
          + N(g_ownNodeMarkIgnored) + "," + N(g_prodWriterMemoHit)
+         + " productionWorkerCopySkipped=" + N((long long)g_prodWorkerCopySkipped)   /* T-610 */
          /* P7f (review-p6z H-3): the load window, and it is expected to be NON-ZERO on a client - every trader
             stocked during the world load passes through it. Zero on a client with a session means the window is
             not being seen at all, which is the shape this fold exists to fix. */
@@ -43889,6 +43939,60 @@ void* JobFindBuilding(const std::string& needle, int needInventory, std::string*
     }
     return found;
 }
+/* T-610 TEST-ONLY (jobtest stop). The order system is the character AI's +0x20 (replicate.cpp ClearAttackOrder, groundtest
+   pick). Its order list count is +0x78 (dropAllOrders 0x506A10 empties it - build/decomp_506a10.txt, Read); its STANDING JOB
+   list count is +0x90 (0x507C40 appends a job there when the order is a player's job order - the 'player' path of giveOrder,
+   0x5D1640 -> 0x5C8310 - build/decomp_507c40.txt, decomp_5c8310.txt, Read). dropAllOrders does not touch +0x90, so a move order
+   leaves the job standing and the character goes back to it (Inferred from the same reads); dropStandingJobs 0x5067F0 empties
+   +0x90 (build/decomp_5067f0.txt, Read). -1 = unreadable. */
+const size_t kJobAiOrders = 0x20, kJobOrderCount = 0x78, kJobStandingCount = 0x90;
+int JobCountPod(void* orders, size_t off)
+{
+    __try { return (int)*(const volatile unsigned int*)((const char*)orders + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int JobDropOrdersPod(void* orders)   /* the engine's own dropAllOrders 0x506A10. 1 ran, 0 faulted. No C++ object (C2712). */
+{
+    __try { ((AITaskSytem*)orders)->dropAllOrders(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
+}
+/* The engine's own resetOrders 0x506AA0 then dropStandingJobs 0x5067F0, in the order 0x32E550 runs them (Read, disassembly of
+   build/bin/kenshi_x64.exe): the order target reset and the order list emptied, then the standing job list emptied, each job
+   deleted. Main thread, as the engine's order paths. 1 ran, 0 faulted. No C++ object (C2712). */
+int JobClearJobsPod(void* orders)
+{
+    __try { ((AITaskSytem*)orders)->resetOrders(); ((AITaskSytem*)orders)->dropStandingJobs(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
+}
+/* MAIN THREAD (the command channel). This game's own character's orders are dropped, its order target reset and its standing
+   jobs dropped (JobClearJobsPod), then its current task ended the way the mod already ends a task (CcEndEatTaskPod: the order
+   system's +0x26D = 1, FUN_140019538). Both counts are read before and after. */
+std::string JobStopRun(unsigned int uid)
+{
+    if (!net::IsUidMine(uid)) return "error jobtest stop: uid " + N((long long)uid) + " is not this game's own character - send it to its own game";
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !ItObj(c)) return "error jobtest stop: uid " + N((long long)uid) + " is not here";
+    void* ai = GetCharacterAI(c);
+    void* orders = 0;
+    if (!ItPlaus(ai) || ItPtrPod(ai, kJobAiOrders, &orders) == 0 || !ItPlaus(orders))
+        return "error jobtest stop: uid " + N((long long)uid) + " has no order system";
+    const int ordersBefore = JobCountPod(orders, kJobOrderCount), jobsBefore = JobCountPod(orders, kJobStandingCount);
+    const int dropped = JobDropOrdersPod(orders);
+    const int jobsCleared = JobClearJobsPod(orders);
+    const int ended = CcEndEatTaskPod(c);
+    const int ordersAfter = JobCountPod(orders, kJobOrderCount), jobsAfter = JobCountPod(orders, kJobStandingCount);
+    const std::string line = "[JOB] jobtest stop uid=" + N((long long)uid) + " dropped=" + N((long long)dropped) + " jobsCleared=" + N((long long)jobsCleared) + " ended=" + N((long long)ended)
+        + " orders[before,after]=" + N((long long)ordersBefore) + "," + N((long long)ordersAfter)
+        + " standingJobs[before,after]=" + N((long long)jobsBefore) + "," + N((long long)jobsAfter)
+        + (jobsAfter != 0 ? " (a standing job is left - the character may go back to it)" : "")
+        + " (TEST-ONLY: the engine's own dropAllOrders 0x506A10, resetOrders 0x506AA0 and dropStandingJobs 0x5067F0, then the task's end flag +0x26D as FUN_140019538 sets it)";
+    DebugLog(line);
+    /* each engine call does nothing when its address row is 0, so "dropped" / "jobsCleared" alone prove nothing: ok also needs
+       both lists read empty */
+    return ((dropped == 1 && jobsCleared == 1 && ended == 1 && ordersAfter == 0 && jobsAfter == 0) ? "ok " : "error ") + line.substr(6);
+}
 }   // namespace (P17 / P43 levers)
 
 /* P17 TEST-ONLY lever - see items.h. MAIN THREAD (the command channel), where the moveorder and attack levers give their orders. */
@@ -43921,6 +44025,8 @@ std::string JobTestCommand(const std::string& arg)
         DebugLog(line);
         return (r == 1 ? "ok " : "error ") + line.substr(6);
     }
+    unsigned int stopUid = 0;
+    if (joblever::JobStopParse(arg, &stopUid)) return JobStopRun(stopUid);   /* T-610 */
     if (joblever::JobInputParse(arg, &in))
     {
         void* b = JobFindBuilding(in.key, 1, &id, &key, &hits);
@@ -43941,7 +44047,7 @@ std::string JobTestCommand(const std::string& arg)
         DebugLog(line);
         return (b != 0 ? "ok " : "error ") + line.substr(6);
     }
-    return "error jobtest: usage jobtest work <characterUid> <buildingKey> [plain] [task=<n>] | jobtest input <buildingKey> <itemSid> <n> [section=<name>] | jobtest show <buildingKey>";
+    return "error jobtest: usage jobtest work <characterUid> <buildingKey> [plain] [task=<n>] | jobtest input <buildingKey> <itemSid> <n> [section=<name>] | jobtest show <buildingKey> | jobtest stop <characterUid>";
 }
 
 /* P43 (cagetest) - see items.h. MAIN THREAD. Nothing here calls the cage: isFreeSlot is the safe point's question (spawn.cpp). */

@@ -128,7 +128,7 @@ volatile float g_yOverVal = 0.0f;
 volatile LONG64 g_upSeen = 0, g_upRan = 0, g_upHeld = 0, g_upNoKey = 0, g_opHeld = 0, g_opLocal = 0, g_opNoEntry = 0, g_fmFull = 0,
                 g_tailFault = 0, g_tsSeen = 0, g_tsRan = 0, g_tsHeld = 0, g_tsHeldUndecided = 0, g_tsReplayed = 0,
                 g_tsDropped = 0, g_tsLate = 0, g_opMerged = 0, g_skillRead = 0,
-                g_skillFault = 0, g_dtMissing = 0, g_yieldOverridden = 0, g_opZeroWork = 0;
+                g_skillFault = 0, g_dtMissing = 0, g_yieldOverridden = 0, g_opZeroWork = 0, g_opCopySkipped = 0;
 long long g_pubSent = 0, g_pubKeep = 0, g_pubFail = 0, g_readFail = 0, g_recvState = 0, g_recvOp = 0, g_applied = 0, g_applyWait = 0,
           g_applyRefusedWriter = 0, g_applyMismatch = 0, g_applyDropped = 0, g_applyFault = 0, g_applyWaitWriter = 0, g_refreshSkipped = 0,
           g_plantsHidden = 0, g_waterApplied = 0, g_inTooMany = 0,
@@ -481,6 +481,7 @@ SpCtRow g_spCt[kSpRunCap];
 int g_spCtHigh = 0;                  /* under g_fmcs */
 volatile LONG g_spCtN = 0;           /* counted spots in all: the take detour reads nothing while 0 */
 volatile LONG64 g_spCtRefused = 0;
+volatile LONG64 g_spCopyRefused = 0;   /* T-610: takes refused to a copy of another game's character (SpotCopyRefused) */
 
 /* ANY THREAD, crash-guarded: the hand's four ids (+0xC..+0x18) and whether it is the null hand (type 0xB). 1 read. */
 int SpHandIds(const void* hand, unsigned int* ids, int* isNull)
@@ -675,6 +676,12 @@ unsigned long long detour_take(void* b, void* hand)
     void* who = SpCharOf(hand);
     const unsigned int uid = (who != 0) ? FindSpawnedUid(who) : 0u;
     if (uid == 0) { ::InterlockedIncrement64(&g_spNoUid); return orig_take(b, hand); }   /* a worker no other game can name: as before */
+    /* T-610: a copy of another game's character takes no spot here - its own game asks the runner, and the runner takes the spot
+       with its copy through SpTakeRun (no detour), so that copy is listed above. Before, on the runner such a copy's own take
+       passed (the writer is here) and its step ran here as well as on its own game. Any-thread owner test (O1). */
+    if (coopfarm::SpotCopyRefused(0, 1, 0, coopfarm::WorkerIsCopy(uid, net::IsUidMineAnyThread(uid) ? 1 : 0,
+                                                                  net::OwnedMirrorExactAnyThread() ? 1 : 0)) != 0)
+    { ::InterlockedIncrement64(&g_spCopyRefused); return 0; }
     const int act = SpTakeDecide(key, uid, ids);
     if (act == coopfarm::kSpotPass) { ::InterlockedIncrement64(&g_spPassed); return orig_take(b, hand); }
     ::InterlockedIncrement64(act == coopfarm::kSpotAskNow ? &g_spAsked : &g_spRefused);
@@ -1088,6 +1095,12 @@ void detour_operate(void* f, void* who, float amount)
     if (RoleIsSingle() || ::InterlockedCompareExchange(&g_fmLinked, 0, 0) == 0) { orig_operate(f, who, amount); return; }
     char key[64];
     if (ObjectPositionKey(f, key, (int)sizeof(key), 0, 3, 0) == 0) { orig_operate(f, who, amount); return; }
+    /* T-610: a worker that is a COPY of another game's character is neither run nor relayed here (its own game runs or relays
+       that work as FARM_OP) - as detour_prodOperate; the any-thread copy test, since operate runs on the AI worker thread (#9) */
+    const unsigned int whoUid = (who != 0) ? FindSpawnedUid(who) : 0u;
+    if (whoUid != 0 && coopfarm::MineWorkerSkip(0, coopfarm::WorkerIsCopy(whoUid, net::IsUidMineAnyThread(whoUid) ? 1 : 0,
+                                                                          net::OwnedMirrorExactAnyThread() ? 1 : 0)) != 0)
+    { ::InterlockedIncrement64(&g_opCopySkipped); return; }
     const int v = FmSeen(key);
     if (coopfarm::FarmGate(0, 1, v) == coopfarm::kFarmHold)
     {   /* NOT a local harvest: the WORK (amount x this frame's g_dt, fold #2) and the worker (uid + skill, fold #1) go to the
@@ -2425,7 +2438,7 @@ void ReportFarm()
                  "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                  " foldOp[withCopy,withSkill,noWorker,yieldOverridden,skillRead,skillFault,merged,paused,waitWriter,handedToSelf,droppedStale,droppedLink,zeroWork,dtMissing,fault]"
                  "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
-                 " foldHooks[timeSkip,yield]=%d,%d table[high,cap]=%d,%d",
+                 " foldHooks[timeSkip,yield]=%d,%d table[high,cap]=%d,%d opCopySkipped=%lld",
                  (long long)g_upSeen, (long long)g_upRan, (long long)g_upHeld, (long long)g_upNoKey, (long long)g_opHeld, (long long)g_opLocal,
                  (long long)g_opNoEntry, (long long)g_fmFull, (long long)g_tailFault,
                  g_pubSent, g_pubKeep, g_pubFail, g_readFail, g_recvState, g_recvOp,
@@ -2437,7 +2450,7 @@ void ReportFarm()
                  g_plantsHidden, g_waterApplied, g_inTooMany,
                  g_opWithCopy, g_opWithSkill, g_opNoWorker, (long long)g_yieldOverridden, (long long)g_skillRead, (long long)g_skillFault,
                  (long long)g_opMerged, g_opPaused, g_opWaitWriter, g_opHandedToSelf, g_opDroppedStale, g_opDroppedLink, (long long)g_opZeroWork,
-                 (long long)g_dtMissing, g_opFault, g_hkTimeSkip, g_hkYield, high, kFmCap);
+                 (long long)g_dtMissing, g_opFault, g_hkTimeSkip, g_hkYield, high, kFmCap, (long long)g_opCopySkipped);
     DebugLog(std::string(b));
     int mnUsed = 0;
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) != 0)
@@ -2474,14 +2487,14 @@ void ReportFarm()
                  " left[noted,noRow]=%lld,%lld release[sent,fail]=%lld,%lld inDropped=%lld rows[used,granted]=%d,%d"
                  " runner[askRecv,notRunner,yes,full,noCopy,ansFail,relRecv,relNoRow,freedRel,freedGone,freedNotRunner,freedUnloaded,fault,capFull,held]"
                  "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d hooks[erase,take]=%d,%d"
-                 " farmSender[refused,wait,keptProven]=%lld,%lld,%lld",
+                 " farmSender[refused,wait,keptProven]=%lld,%lld,%lld copyRefused=%lld",
                  (long long)g_spSeen, (long long)g_spPassListed, (long long)g_spPassed, (long long)g_spRefused, (long long)g_spAsked,
                  (long long)g_spNoKey, (long long)g_spNoUid, (long long)g_spFull, (long long)g_spHandFault,
                  g_spAskSent, g_spAskFail, giveUp, g_spAnsRecv, g_spAnsYes, g_spAnsFull, g_spAnsNoCopy, g_spAnsStray,
                  (long long)g_spLeft, (long long)g_spLeftNoRow, g_spRelSent, g_spRelFail, g_spInDropped, spUsed, spGranted,
                  g_srAskRecv, g_srNotRunner, g_srYes, g_srFull, g_srNoCopy, g_srAnsFail, g_srRelRecv, g_srRelNoRow, g_srFreedRel, g_srFreedGone,
                  g_srFreedNotRunner, g_srFreedUnloaded, g_srFault, g_srCapFull, (int)g_spRun.size(), g_hkErase, g_hkTake,
-                 g_applyRefusedSender, g_applyWaitSender, g_applyKeptProven);
+                 g_applyRefusedSender, g_applyWaitSender, g_applyKeptProven, (long long)g_spCopyRefused);
     DebugLog(std::string(sb));
     std::sprintf(sb, "[SPOT] REPORT T-853 asker[revoked,keepYes,strayReleased,unusedReleased,regrant,keepAsk]=%lld,%lld,%lld,%lld,%lld,%lld"
                  " runner[counted,countedFull,freedCounted,revokeSent,revokeFail,countedHeld,ownRefusedByCounted]=%lld,%lld,%lld,%lld,%lld,%ld,%lld"

@@ -98,5 +98,14 @@ inline bool DriftDisagrees(float driftXZ, float correctDist, int deadHere, int o
    and the worst distance. */
 const unsigned int kDriftSummaryMs = 300000u;
 
+/* T-910: the release build's "the first n lines, then none" (coop_log.h SW_FIRSTLOG / SW_FIRSTN), for a line whose count is on a
+   REPORT line already: true while *shown is under n, counting this line. */
+inline bool FirstLines(unsigned int* shown, unsigned int n)
+{
+    if (*shown >= n) return false;
+    ++*shown;
+    return true;
+}
+
 }   /* namespace swlogbudget */
 #endif

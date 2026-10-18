@@ -55,6 +55,7 @@
 #include "../../common/buildwire.h"  /* build1-b: the MSG_BUILD payload */
 #include "../build.h"                 /* build1-b: BuildNoteRecv, BuildNoteBad */
 #include "../../common/farmwire.h"   /* par16: MSG_BUILD kinds 6 FARM / 7 FARM_OP */
+#include "../../common/powerwire.h"  /* P47: MSG_BUILD kinds 16 POWER_STATE / 17 POWER_ASK */
 #include "../farm.h"                  /* par16: FarmNoteRecv */
 #include "../crime.h"                /* crime3: ApplyRemoteCrime */
 #include "../../common/statewire.h"   /* K1 (read-carry): the MSG_STATE payload - SendState and OnState call these */
@@ -79,6 +80,7 @@
 #include "../../common/worlddir.h"   /* mp4: DisplayNameOk - the name in a HELLO passes the rule playername= does */
 
 #include "../coop_log.h"
+namespace { swlogbudget::Gate g_qNetAppearance, g_qNetClothing, g_qNetCombatMode, g_qNetSpawn; }   /* T-910: the received-message lines' quiet-logging gates, one per message type (coop_log.h SW_QUIETLOG) */
 
 #include <map>
 #include <set>
@@ -174,7 +176,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 165;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 166;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 typedef char T889ProtocolAgrees[(kProtocolVersion == hovrec::kGameProtocol) ? 1 : -1];   /* T-889 step 2 (164: MSG_ITEM_HANDOVER; effort/t853 takes 163; 165 T-609: the farm worker-spot kinds inside MSG_BUILD renumbered 12-14 -> 13-15,
                                                                                                   12 being DISMANTLE_ASK's): the offline protocol test reads handrec.h */
 
@@ -597,7 +599,7 @@ void OnAppearance(const Message& m)
         ErrorLog("[net] malformed APPEARANCE record for uid " + N(uid) + " - REFUSED");
         return;
     }
-    DebugLog("[net] <- APPEARANCE uid=" + N(uid) + " bytes=" + N((long long)m.payload.size())
+    SW_QUIETLOG(g_qNetAppearance, "[net] <- APPEARANCE", 0, 0, "[net] <- APPEARANCE uid=" + N(uid) + " bytes=" + N((long long)m.payload.size())
              + " " + coop::RecordSummary(rec));
     coop::QueueRemoteRecord(uid, rec);
 }
@@ -624,7 +626,7 @@ void OnClothing(const Message& m)
         ErrorLog("[net] malformed CLOTHING record for uid " + N(uid) + " - REFUSED");
         return;
     }
-    DebugLog("[net] <- CLOTHING uid=" + N(uid) + " bytes=" + N((long long)m.payload.size())
+    SW_QUIETLOG(g_qNetClothing, "[net] <- CLOTHING", 0, 0, "[net] <- CLOTHING uid=" + N(uid) + " bytes=" + N((long long)m.payload.size())
              + " " + coop::GarmentSummary(set));
     coop::QueueRemoteGarments(uid, set);
 }
@@ -647,7 +649,7 @@ void OnCombatMode(const Message& m)
         ErrorLog("[net] malformed COMBATMODE (too short) - ignored");
         return;
     }
-    DebugLog("[net] <- COMBATMODE uid=" + N(uid) + " on=" + N(on)
+    SW_QUIETLOG(g_qNetCombatMode, "[net] <- COMBATMODE", 0, 0, "[net] <- COMBATMODE uid=" + N(uid) + " on=" + N(on)
              + " targetUid=" + N(targetUid));
     coop::ApplyRemoteCombatMode(uid, on != 0, targetUid);
 }
@@ -758,7 +760,7 @@ void OnSpawn(const Message& m)
     g_departedPending.erase(sm.uid);   /* M8: a claim made after a departure supersedes it - no road removes this row for that departure */
 
     std::ostringstream ageText; ageText.imbue(std::locale::classic()); ageText << sm.age;
-    DebugLog("[net] <- SPAWN uid=" + N(sm.uid) + " '" + sm.templateName + "' (owner peer " + N(m.peer) + ")"
+    SW_QUIETLOG(g_qNetSpawn, "[net] <- SPAWN", 0, 0, "[net] <- SPAWN uid=" + N(sm.uid) + " '" + sm.templateName + "' (owner peer " + N(m.peer) + ")"
              + " faction='" + (sm.factionName.empty() ? std::string("<inherited>") : sm.factionName)
              + "' keepContainer=" + N(sm.keepContainer ? 1 : 0)
              + " age=" + (sm.ageAbsent ? std::string("<absent>") : ageText.str()) + (sm.ageClamped ? " (clamped)" : "")
@@ -3884,11 +3886,38 @@ bool SendFarm(const coopfarm::FarmMsg& m)
     }
     return SideSendWorld(MSG_BUILD, &b[0], b.size());   /* M7b slice 4: WORLD */
 }
+/* P47. Reliable, on MSG_BUILD: a power piece's writer's POWER_STATE (WORLD - every game), and a switch asked of the piece's writer
+   (POWER_ASK, to that game's own slot only). False when there is no road; the bytes come encoded (powerwire.h EncodePower). */
+bool SendPower(const std::vector<char>& b)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone || b.empty()) return false;
+    return SideSendWorld(MSG_BUILD, &b[0], b.size());
+}
+bool SendPowerToSlot(const std::vector<char>& b, int slot)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone || b.empty()) return false;
+    const int to = BuildSlotTarget(slot);
+    if (to == cooplive::kAddrOwnerNone) return false;
+    return ItemSendTo(MSG_BUILD, to, &b[0], b.size(), 0u, 0);
+}
 /* build1-b - MSG_BUILD: refused whole when it does not decode. It is a whole state and is NOT dropped during a load
    (the arrival queue holds it); build.cpp queues it and creates the copy at the K2 safe point. build1-c: a STATE is held
    (the latest per key) and written onto the copy at the same safe point. */
 void OnBuild(const Message& m)
 {
+    if (!m.payload.empty() && powerwire::IsPowerKind(&m.payload[0], m.payload.size()) != 0)
+    {   /* P47: kinds 16 / 17 are a power piece's state and a switch asked of its writer, decoded by powerwire.h */
+        powerwire::PowerMsg pm;
+        const int pr = powerwire::DecodePower(&m.payload[0], m.payload.size(), &pm);
+        if (pr != powerwire::kPowerDecodeOk)
+        {
+            coop::BuildNoteBad();
+            DebugLog("[net] <- BUILD power kind malformed (reason " + N((long long)pr) + ") - ignored");
+            return;
+        }
+        coop::PowerNoteRecv(pm, m.peer);
+        return;
+    }
     if (!m.payload.empty() && coopfarm::IsFarmKind(&m.payload[0], m.payload.size()) != 0)
     {   /* par16: kinds 6 / 7 are the farm's, 10 / 11 a production building's step and bar, 13-15 its worker spots (T-674), decoded by
            farmwire.h (DecodeBuild refuses them; 12 is DecodeBuild's DISMANTLE_ASK) */

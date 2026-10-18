@@ -98,7 +98,7 @@ int UiPauseMenuReshow();
 bool UiMenuCommand(const std::string& args);
 bool UiFactionTabCaption(const std::string& name);   // T-368, MAIN THREAD: the FACTION tab's name box shows the name the world gave this game's player faction
 bool UiFactionTabRename(const std::string& name);   // T-368, TEST-ONLY `renamemyfaction tab <name>`: the FACTION tab's name box gets the name and its Enter (the engine's own handler runs)
-// pp1b (review 2026-09-27) - an accepted `uiclick engine:<Suffix>` is QUEUED and fired here, at the TAIL of the pump that ran the
+// pp1b (review 2026-09-27) - an accepted `uiclick engine:<Suffix>` (T-903: and `uiclick point:<x>,<y>`, MyGUI's own mouse input) is QUEUED and fired here, at the TAIL of the pump that ran the
 // command (coop.cpp: after orig_titleUpdate / after orig_mainLoop and TagsTick). The status was written `ok uiclick` first; a
 // click that refuses here (the widget is gone or covered by then) writes `error uiclick`, as quitmenu does.
 void UiDriveEngineClickFlush(int atTitle);   /* T-201 PP6' fold: 1 = after the title's update (the one-press load may post), 0 = the in-world tail */

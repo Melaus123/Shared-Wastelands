@@ -10,7 +10,8 @@
    suite (src/coop-test/test_main.cpp) can pin every row. The widget names are ui.cpp's UiNames strings; the suite asserts each
    row literally, and a row whose widget is not on screen logs `REFUSED - not found` in the game rather than guessing.
    `engine:<LayoutSuffix>` names one of KENSHI'S OWN widgets by the suffix after its layout prefix (the same match the U3 column
-   code uses, ui.cpp NameCarriesLayoutSuffix), e.g. `engine:NewGameButton`. C++03, header-only. */
+   code uses, ui.cpp NameCarriesLayoutSuffix), e.g. `engine:NewGameButton`. T-903: `uiclick point:<x>,<y>` is a real mouse
+   click at a screen point through MyGUI's own input (another mod's window, which has no name we know). C++03, header-only. */
 #ifndef COOP_UIDRIVE_H
 #define COOP_UIDRIVE_H
 
@@ -22,7 +23,8 @@ namespace coopui {
 
 enum UiDriveKind { kDriveButton = 1, kDriveList = 2, kDriveEdit = 3,
                    kDriveWindowClose = 4,   /* T-220: the panel window's title-bar X (its own eventWindowButtonPressed "close") */
-                   kDriveEscape = 5 };      /* T-220: the engine's ESC arm at the title (TitleScreen::closeTheOtherBits) */
+                   kDriveEscape = 5,        /* T-220: the engine's ESC arm at the title (TitleScreen::closeTheOtherBits) */
+                   kDriveTab = 6 };         /* p47d: a tab of a tab control - the tab whose page holds w1 (the PLAYERS tab) */
 
 /* One friendly name. `w2` is a second widget for a name the player sees as ONE control that the panel builds twice (BACK:
    the Host / Join / Hosting screens' Back and the Multiplayer screen's own Back - only one is ever visible); the driver takes
@@ -134,6 +136,15 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "fee",           kDriveEdit,   "SWOptFeeEdit",          0 },   /* T-556: GAME OPTIONS' RESURRECTION FEE box */
         { "password",      kDriveEdit,   "SWPwEdit",              0 },   /* T-290: PASSWORD REQUIRED's box (UiDriveTypedHidden) */
         { "hostpassword",  kDriveEdit,   "SWHostPwEdit",          0 },   /* T-290: HOST GAME's PASSWORD box (UiDriveTypedHidden) */
+        /* p47d (owner 938): the PLAYERS tab (playerstab.cpp), the team flow a player takes - the tab in Kenshi's management window
+           (the tab whose page holds the table), the table (`uipick players <name>` or `uipick players slot <n>`), INVITE TO FACTION
+           (the bottom line's right button, only while it reads that) and the FACTION INVITATION box's ACCEPT / DECLINE (its right /
+           left button, only while they read that - the same two buttons read LEAVE / CANCEL, REMOVE / CANCEL ... on other boxes) */
+        { "playerstab",     kDriveTab,    "SWPlayersList",        0 },
+        { "invitefaction",  kDriveButton, "SWPlayersRightActBtn", 0, "INVITE TO FACTION" },
+        { "factionaccept",  kDriveButton, "SWFactionBoxRightBtn", 0, "ACCEPT" },
+        { "factiondecline", kDriveButton, "SWFactionBoxLeftBtn",  0, "DECLINE" },
+        { "players",        kDriveList,   "SWPlayersList",        0 },
         /* the bug report window (bugreport.cpp): REPORT A BUG on the title screen, or in the Esc menu */
         { "bugreport",     kDriveButton, "BugReportTitleButton",  "BugReportPauseButton" },
         { "bugsend",       kDriveButton, "BugReportSend",         0 },
@@ -169,6 +180,52 @@ inline int UiDriveEngineName(const std::string& name, std::string* suffix)
         if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return 0;
     }
     if (suffix != 0) *suffix = name.substr(pre);
+    return 1;
+}
+
+/* T-906 (T1348 / T1349: Kenshi's management window, opened for the PLAYERS tab, stays over the in-game menu's EXIT GAME and the
+   driver had no way to close it) - `uiclick closewindow:<LayoutSuffix>`: the engine widget whose name ends in _<LayoutSuffix> (the
+   `engine:` match), its nearest MyGUI Window ancestor, and that window's own eventWindowButtonPressed "close" - the event its X raises
+   (ui.cpp UiDriveCloseWindowFire). The suffix is 1..48 of [A-Za-z0-9], as engine:. UiDriveCloseWindowLike: it starts with
+   `closewindow:`. 1 (and the suffix) when `name` is that shape, else 0. */
+inline int UiDriveCloseWindowLike(const std::string& name) { return name.compare(0, 12, "closewindow:") == 0 ? 1 : 0; }
+inline int UiDriveCloseWindowName(const std::string& name, std::string* suffix)
+{
+    if (UiDriveCloseWindowLike(name) == 0) return 0;
+    return UiDriveEngineName("engine:" + name.substr(12), suffix);
+}
+
+/* T-903 (T1343: RE_Kenshi 0.3.5's own settings window opens over the title and covers MULTIPLAYER; a player closes it with its
+   X, a widget that is neither ours nor an engine: layout name) - `uiclick point:<x>,<y>`: a mouse click at screen pixels x, y
+   (the game window's client area, MyGUI's own coordinates), delivered through MyGUI's InputManager as the player's mouse is
+   (ui.cpp UiDrivePointFire). Each number is 1..5 decimal digits and at most kDrivePointMax; no sign, no blank, nothing after
+   the second number. 1 (and the two numbers) when `name` is that shape, else 0. UiDrivePointLike: it starts with `point:`. */
+const int kDrivePointMax = 16383;
+inline int UiDrivePointLike(const std::string& name) { return name.compare(0, 6, "point:") == 0 ? 1 : 0; }
+inline int UiDrivePointName(const std::string& name, int* x, int* y)
+{
+    if (UiDrivePointLike(name) == 0) return 0;
+    int v[2] = { 0, 0 };
+    size_t i = 6;
+    for (int k = 0; k < 2; ++k)
+    {
+        size_t digits = 0;
+        while (i < name.size() && name[i] >= '0' && name[i] <= '9')
+        {
+            if (++digits > 5) return 0;
+            v[k] = v[k] * 10 + (name[i] - '0');
+            ++i;
+        }
+        if (digits == 0 || v[k] > kDrivePointMax) return 0;
+        if (k == 0)
+        {
+            if (i >= name.size() || name[i] != ',') return 0;
+            ++i;
+        }
+    }
+    if (i != name.size()) return 0;
+    if (x != 0) *x = v[0];
+    if (y != 0) *y = v[1];
     return 1;
 }
 
@@ -223,6 +280,44 @@ inline std::string UiDriveArgsForLog(const std::string& verb, const std::string&
     return UiDriveTypedHidden(field) != 0 ? field + " <hidden>" : args;
 }
 
+/* p47d: a list row's text as the player reads it - each MyGUI colour code (# and six hex digits) dropped and an escaped ## read as
+   one # (the PLAYERS table's names are coloured: playerstab.h ColouredName / EscapeHash). */
+inline std::string UiDrivePlainText(const std::string& s)
+{
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] != '#') { o += s[i]; continue; }
+        if (i + 1 < s.size() && s[i + 1] == '#') { o += '#'; ++i; continue; }
+        size_t k = 0;
+        while (k < 6 && i + 1 + k < s.size())
+        {
+            const char c = s[i + 1 + k];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) break;
+            ++k;
+        }
+        if (k == 6) { i += 6; continue; }
+        o += '#';
+    }
+    return o;
+}
+/* p47d: `uipick players slot <n>` names a PLAYERS table row by the player's slot (0..999) rather than the name it reads. 1 and the
+   slot when `text` is `slot <digits>`; 0 when it is not that shape (the text is a name). */
+inline int UiDrivePickSlot(const std::string& text, int* slot)
+{
+    std::string w, d;
+    UiDriveSplit(text, &w, &d);
+    if (w != "slot" || d.empty() || d.size() > 3) return 0;
+    int v = 0;
+    for (size_t i = 0; i < d.size(); ++i)
+    {
+        if (d[i] < '0' || d[i] > '9') return 0;
+        v = v * 10 + (d[i] - '0');
+    }
+    if (slot != 0) *slot = v;
+    return 1;
+}
+
 /* The usage error for one verb's arguments, or "" when the shape is right (the widget itself is checked live). */
 inline std::string UiDriveUsage(const std::string& verb, const std::string& args)
 {
@@ -231,15 +326,24 @@ inline std::string UiDriveUsage(const std::string& verb, const std::string& args
     if (verb == "uistate") return a.empty() ? std::string() : std::string("usage: uistate (no argument)");
     if (verb == "uiclick")
     {
-        if (a.empty() || !rest.empty()) return "usage: uiclick <name> | uiclick engine:<LayoutSuffix>";
+        if (a.empty() || !rest.empty()) return "usage: uiclick <name> | uiclick engine:<LayoutSuffix> | uiclick point:<x>,<y> | uiclick closewindow:<LayoutSuffix>";
+        if (UiDrivePointLike(a) != 0)   /* T-903: the screen-point click; its on-screen check is live (the view size) */
+            return UiDrivePointName(a, 0, 0) != 0 ? std::string()
+                 : std::string("usage: uiclick point:<x>,<y> - x and y whole screen pixels 0..16383, no sign, no blanks");
+        if (UiDriveCloseWindowLike(a) != 0)   /* T-906: the window holding an engine widget, closed by its own X event */
+            return UiDriveCloseWindowName(a, 0) != 0 ? std::string()
+                 : std::string("usage: uiclick closewindow:<LayoutSuffix> - 1..48 letters and digits, the suffix after the engine widget's '_'");
         if (UiDriveFind(a, kDriveButton) == 0 && UiDriveFind(a, kDriveWindowClose) == 0 && UiDriveFind(a, kDriveEscape) == 0
-            && UiDriveEngineName(a, 0) == 0) return "no button called '" + a + "'";   /* T-220: close / escape */
+            && UiDriveFind(a, kDriveTab) == 0 && UiDriveEngineName(a, 0) == 0) return "no button called '" + a + "'";   /* T-220: close / escape; p47d: playerstab */
         return std::string();
     }
     if (verb == "uipick")
     {
-        if (a.empty() || rest.empty()) return "usage: uipick worlds|profiles <row text>";
+        if (a.empty() || rest.empty()) return "usage: uipick <list> <row text> | uipick players slot <n>";
         if (UiDriveFind(a, kDriveList) == 0) return "no list called '" + a + "'";
+        std::string w;
+        UiDriveSplit(rest, &w, 0);
+        if (a == "players" && w == "slot" && UiDrivePickSlot(rest, 0) == 0) return "usage: uipick players slot <n> (n = 0..999)";   /* p47d */
         return std::string();
     }
     if (verb == "uitype")
