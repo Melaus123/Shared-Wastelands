@@ -171,6 +171,50 @@ inline std::string FailText(int kind, int code)
     std::sprintf(b, "Couldn't send your report (error %d).", code);
     return b;
 }
+/* THE STEP A SEND STOPPED AT. The log line of a send names the step it was in, how long the send ran and how much of the
+ report went up, so a failure can be told apart: the server never reached (finding it, connecting and the secure handshake
+ all happen in one call), an upload cut off part-way, or no answer after the upload. */
+enum { kStepOpen = 0, kStepReach = 1, kStepUpload = 2, kStepAnswer = 3, kStepRead = 4 };
+inline const char* SendStepName(int step)
+{
+    if (step == kStepOpen) return "starting the connection library";
+    if (step == kStepReach) return "reaching the server (finding it, connecting, the secure handshake)";
+    if (step == kStepUpload) return "uploading";
+    if (step == kStepAnswer) return "waiting for the server's answer";
+    if (step == kStepRead) return "reading the server's answer";
+    return "an unknown step";
+}
+inline std::string SendTraceText(int step, unsigned long msTotal, unsigned long msStep, unsigned long sent, unsigned long total)
+{
+    char b[160];
+    std::sprintf(b, " after %lu ms (%lu ms in that step); %lu of %lu bytes uploaded", msTotal, msStep, sent, total);
+    return std::string("stopped while ") + SendStepName(step) + b;
+}
+/* WHY A SECURE CONNECTION WAS REFUSED (decision 952 a). A send that fails with 12175 (ERROR_WINHTTP_SECURE_FAILURE) logs the
+ reasons WinHTTP gave in its secure-failure flags (WINHTTP_CALLBACK_STATUS_FLAG_*; values as winhttp.h, SDK 7.1 and 10.0.26100):
+ each set bit in plain words, an unknown bit as hex, no bit as "no reason given". Log only: the box and FailKindOf stay. */
+inline std::string SecureFailureText(unsigned long flags)
+{
+    static const struct { unsigned long bit; const char* why; } kWhy[] = {
+        { 0x00000001ul, "the certificate's revocation could not be checked" },   /* CERT_REV_FAILED */
+        { 0x00000002ul, "the certificate is invalid" },                          /* INVALID_CERT */
+        { 0x00000004ul, "the certificate was revoked" },                         /* CERT_REVOKED */
+        { 0x00000008ul, "the certificate authority is not trusted" },            /* INVALID_CA */
+        { 0x00000010ul, "the certificate is for another name" },                /* CERT_CN_INVALID */
+        { 0x00000020ul, "the certificate is expired or not yet valid" },         /* CERT_DATE_INVALID */
+        { 0x00000040ul, "the certificate is not meant for this use" },           /* CERT_WRONG_USAGE */
+        { 0x80000000ul, "the secure channel failed" },                           /* SECURITY_CHANNEL_ERROR */
+    };
+    std::string out;
+    unsigned long left = flags & 0xFFFFFFFFul;
+    for (size_t i = 0; i < sizeof(kWhy) / sizeof(kWhy[0]); ++i)
+        if (left & kWhy[i].bit) { if (!out.empty()) out += "; "; out += kWhy[i].why; left &= ~kWhy[i].bit; }
+    char b[48];
+    if (left != 0) { std::sprintf(b, "unknown reason 0x%lx", left); if (!out.empty()) out += "; "; out += b; }
+    if (out.empty()) out = "no reason given";
+    std::sprintf(b, " (flags 0x%lx)", flags & 0xFFFFFFFFul);
+    return "secure connection refused: " + out + b;
+}
 inline bool SendSucceeded(int winErr, int httpStatus) { return winErr == 0 && httpStatus >= 200 && httpStatus <= 299; }
 
 /* ---------------------------------------------------------------------------------------------------------------------

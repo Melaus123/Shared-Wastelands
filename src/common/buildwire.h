@@ -1129,6 +1129,40 @@ inline float BuildRepairFinishSafe(float to, float needed, int ownComplete)
     const float cap = needed * 0.999f;
     return (ownComplete == 0 && to > cap) ? cap : to;
 }
+/* help1, THE HELPER'S GAME: the materials a helper put into its copy, slot by slot, against the copy's baseline (the amounts after the
+   mod's own last write): the baseline when known; else the amount read just before the engine's call (nBefore slots read, -1 none);
+   else the amount now - no gain. A gain counts above kBuildHelpMatEps; anything else is 0. gain[0..nNow) is written; 1 = a slot gained. */
+const float kBuildHelpMatEps = 0.0001f;
+inline int BuildHelpMatGain(const float* now, int nNow, int baseOk, const float* base, int nBefore, const float* before, float* gain)
+{
+    int any = 0;
+    for (int i = 0; i < nNow; ++i)
+    {
+        const float b = (baseOk != 0) ? base[i] : ((i < nBefore) ? before[i] : now[i]);
+        gain[i] = now[i] - b;
+        if (gain[i] > kBuildHelpMatEps) any = 1; else gain[i] = 0.0f;
+    }
+    return any;
+}
+/* T-903, THE HELPER'S GAME: a copy's materials looked at on the main thread after the engine's add-materials task ran off it
+   (or before an owner's STATE overwrites them). GONE: no live row or piece here (removed, not found); NOT_COPY: not a copy the owner's
+   stand-in holds; SKIP: a wall (wall work is not synced) or a dismantled piece; NO_BASE: the copy's baseline is not known yet - nothing
+   can be measured, so nothing is taken and the baseline is left for the owner's next STATE to set; NO_GAIN: nothing above the baseline;
+   RECORD: the help rule allows this player - help work for the owner; REFUSE: it does not - the materials come off the copy and the
+   items go back. */
+const int kBuildHarvestGone = 0, kBuildHarvestNotCopy = 1, kBuildHarvestSkip = 2, kBuildHarvestNoGain = 3, kBuildHarvestRecord = 4, kBuildHarvestRefuse = 5,
+          kBuildHarvestNoBase = 6;
+inline int BuildHelpHarvestVerdict(int found, int isCopy, int wall, int dismantled, int baseOk, int gained, int allowed)
+{
+    if (found == 0) return kBuildHarvestGone;
+    if (isCopy == 0) return kBuildHarvestNotCopy;
+    if (wall != 0 || dismantled != 0) return kBuildHarvestSkip;
+    if (baseOk == 0) return kBuildHarvestNoBase;
+    if (gained == 0) return kBuildHarvestNoGain;
+    return allowed != 0 ? kBuildHarvestRecord : kBuildHarvestRefuse;
+}
+/* help1: the whole items a material gain stands for (a refund hands back whole items; the same rounding as a HELP_GONE's) */
+inline int BuildHelpWholeItems(float gain) { return gain > 0.0f ? (int)(gain + 0.001f) : 0; }
 /* the unconfirmed work the helper puts back on its copy after the owner's STATE (no flicker back): *dP and d[] ADD, *n = the widest;
    help1 fold 3: not an entry the owner already applied (live) - the STATE's progress holds it */
 inline void BuildHelpSum(const std::vector<BuildHelpEntry>& owed, float* dP, int* n, float* d)

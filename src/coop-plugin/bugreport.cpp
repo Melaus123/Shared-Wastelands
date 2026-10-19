@@ -338,10 +338,24 @@ void Finish(long gen, int ok, int kind, int code)
     if (g_sh.gen != gen) return;
     g_sh.phase = kPhDone; g_sh.ok = ok; g_sh.failKind = kind; g_sh.failCode = code;
 }
-/* 1 sent; 0 failed (*kind, *code as the box says them); -1 stopped by CANCEL. */
-int Post(long gen, const std::string& boundary, const std::vector<unsigned char>& body, int* kind, int* code)
+/* Decision 952 a: WinHTTP's secure-failure report. Registered on the request for WINHTTP_CALLBACK_FLAG_SECURE_FAILURE only; the
+   session is synchronous, so it runs on Post's own thread inside WinHttpSendRequest. dwContext = the address of Post's local
+   flags DWORD (passed to WinHttpSendRequest); it touches only that. */
+void CALLBACK OnSecureFailure(HINTERNET, DWORD_PTR ctx, DWORD status, LPVOID info, DWORD infoLen)
+{
+    if (status == WINHTTP_CALLBACK_STATUS_SECURE_FAILURE && ctx != 0 && info != 0 && infoLen >= sizeof(DWORD))
+        *(DWORD*)ctx |= *(const DWORD*)info;
+}
+/* 1 sent; 0 failed (*kind, *code as the box says them); -1 stopped by CANCEL. *trace = the step it ended in, its times and the
+   bytes uploaded (coopbug::SendTraceText), for the log line. */
+int Post(long gen, const std::string& boundary, const std::vector<unsigned char>& body, int* kind, int* code, std::string* trace)
 {
     *kind = coopbug::kFailOther; *code = 0;
+    const DWORD t0 = ::GetTickCount();
+    DWORD tStep = t0;
+    int step = coopbug::kStepOpen;
+    size_t sent = 0;
+    *trace = coopbug::SendTraceText(step, 0, 0, 0, (unsigned long)body.size());
     const std::string url = coopbug::kRelayUrl;
     if (url.empty()) { *code = coopbug::kErrNoRelay; return 0; }
     /* HTTPS only: the report carries the players' logs and their words */
@@ -357,6 +371,7 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
     if (uc.lpszExtraInfo) path += std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     if (path.empty()) path = L"/";
     int winErr = 0, status = 0, stopped = 0;
+    DWORD secureFlags = 0;   /* OnSecureFailure's flags: why a secure connection was refused (12175) */
     HINTERNET s = ::WinHttpOpen(swnames::kBugReportAgentW, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     HINTERNET c = 0, r = 0;
     if (s == 0) winErr = (int)::GetLastError();
@@ -365,7 +380,7 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
         DWORD protos = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
         ::WinHttpSetOption(s, WINHTTP_OPTION_SECURE_PROTOCOLS, &protos, sizeof(protos));   /* refused on a Windows without TLS 1.2: its default stays */
         ::WinHttpSetTimeouts(s, 15000, 15000, 30000, 30000);
-        c = ::WinHttpConnect(s, host.c_str(), uc.nPort, 0);
+        c = ::WinHttpConnect(s, host.c_str(), uc.nPort, 0);   /* names the server only: nothing goes out until the request is sent */
         if (c == 0) winErr = (int)::GetLastError();
     }
     if (c != 0)
@@ -377,8 +392,11 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
     if (r != 0)
     {
         const std::wstring head = L"Content-Type: multipart/form-data; boundary=" + Widen(boundary);
-        if (!::WinHttpSendRequest(r, head.c_str(), (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, (DWORD)body.size(), 0)) winErr = (int)::GetLastError();
-        size_t sent = 0;
+        step = coopbug::kStepReach; tStep = ::GetTickCount();
+        ::WinHttpSetStatusCallback(r, OnSecureFailure, WINHTTP_CALLBACK_FLAG_SECURE_FAILURE, 0);
+        if (!::WinHttpSendRequest(r, head.c_str(), (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, (DWORD)body.size(), (DWORD_PTR)&secureFlags))
+            winErr = (int)::GetLastError();
+        if (winErr == 0) { step = coopbug::kStepUpload; tStep = ::GetTickCount(); }
         while (winErr == 0 && sent < body.size())
         {
             if (*StopOf(gen) != 0) { stopped = 1; break; }
@@ -388,9 +406,11 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
             sent += wrote;
             SetPhase(gen, kPhSending, (int)((unsigned long long)sent * 100ull / (unsigned long long)body.size()));
         }
+        if (winErr == 0 && !stopped) { step = coopbug::kStepAnswer; tStep = ::GetTickCount(); }
         if (winErr == 0 && !stopped && !::WinHttpReceiveResponse(r, NULL)) winErr = (int)::GetLastError();
         if (winErr == 0 && !stopped)
         {
+            step = coopbug::kStepRead; tStep = ::GetTickCount();
             DWORD st = 0, sz = sizeof(st);
             if (::WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX))
                 status = (int)st;
@@ -408,6 +428,9 @@ int Post(long gen, const std::string& boundary, const std::vector<unsigned char>
     if (r != 0) ::WinHttpCloseHandle(r);
     if (c != 0) ::WinHttpCloseHandle(c);
     if (s != 0) ::WinHttpCloseHandle(s);
+    const DWORD tEnd = ::GetTickCount();
+    *trace = coopbug::SendTraceText(step, (unsigned long)(tEnd - t0), (unsigned long)(tEnd - tStep), (unsigned long)sent, (unsigned long)body.size());
+    if (winErr == ERROR_WINHTTP_SECURE_FAILURE) *trace += "; " + coopbug::SecureFailureText((unsigned long)secureFlags);
     if (stopped) return -1;
     if (coopbug::SendSucceeded(winErr, status)) return 1;
     *kind = coopbug::FailKindOf(winErr, status);
@@ -665,11 +688,12 @@ void RunJob(Job& j)
     if (body.empty()) { Finish(j.gen, 0, coopbug::kFailOther, 0); return; }
     SetPhase(j.gen, kPhSending, 0);
     int kind = 0, code = 0;
-    const int r = Post(j.gen, boundary, body, &kind, &code);
+    std::string trace;
+    const int r = Post(j.gen, boundary, body, &kind, &code, &trace);
     if (r < 0) return;
     Finish(j.gen, r == 1 ? 1 : 0, kind, code);
-    DebugLog(r == 1 ? std::string("[BUG] report sent (") + Num(body.size()) + " bytes)"
-                    : "[BUG] report NOT sent: " + coopbug::FailText(kind, code) + " (kind " + NumI(kind) + ", code " + NumI(code) + ")");
+    DebugLog(r == 1 ? std::string("[BUG] report sent (") + Num(body.size()) + " bytes; " + trace + ")"
+                    : "[BUG] report NOT sent: " + coopbug::FailText(kind, code) + " (kind " + NumI(kind) + ", code " + NumI(code) + "); " + trace);
 }
 unsigned __stdcall JobMain(void* arg)
 {

@@ -440,6 +440,7 @@ struct BdEvent
     int broken;          /* +0x3B6 read after the call */
     int dismBefore;      /* build1-d: isDismantled read BEFORE the call (-1 not read) - a REMOVE needs a real 0 -> 1 flip */
     int nMats;           /* build1-c: delivered mats read after the call (-1 unreadable) */
+    int harvest;         /* a progress call off the main thread on a copy a stand-in holds - the main thread measures its materials (BdHelpHarvest) */
     float mats[coopbuild::kBuildMaxMats];
     char key[kKeyCap];
 };
@@ -621,6 +622,10 @@ long long g_helpApplyRefused = 0;     /* T-903 fold (review MED 2): the owner's 
 long long g_helpApplyHeld = 0;        /* T-903 re-check fold (item 2): help work held - this game's slot or the sender's standing not known yet */
 long long g_deadHandlesIgnored = 0;   /* T-903 (F1026): copy searches inside a host whose dead handles counted as no piece (BuildDeadHandlesIgnore) - the copy made */
 long long g_helpRunRefused = 0;       /* T-903 fold (review MED 2): the helper's game - the engine's work on a copy of a player who allows no help, not done */
+long long g_helpHarvested = 0, g_helpHarvestRefused = 0;   /* the helper's game: materials put into a copy off the main thread - recorded as help / refused and put back */
+long long g_helpHarvestCarried = 0, g_helpHarvestLost = 0;   /* refused items not handed back at once: carried as an owed entry (handed back through the owner's refund) / the engine's add faulted (never retried) */
+long long g_helpHarvestNoBase = 0;   /* looks at a copy whose baseline was not known yet - nothing measured */
+std::vector<std::string> g_bdHarvestDue;   /* MAIN THREAD: live keys of copies whose materials the next K2 safe point measures (BdHarvestDrain), each once */
 int BdHelpKind(int t) { return t == coopbuild::kBuildTaskBuild ? 0 : (t == coopbuild::kBuildTaskAddMaterials ? 1 : 2); }
 std::vector<BdHelpGoneIn> g_helpGoneIn;           /* help1 fold (MED 3), the helper's: HELP_GONE received, handled at the K2 safe point */
 std::map<BdPlKey, coopown::HelpRecRow> g_helpRec;   /* help1 fold (MED 5/6), the helper's: pp.help as read for this store + world; fold 3: by (key, placement nonce) */
@@ -2105,11 +2110,12 @@ int BdMatsDiffer(int na, const float* a, int nb, const float* b)
 
 // PROBE-START: P082
 // ANY THREAD, no allocation: one POD record into the queue BuildTick drains.
-void BdQueueEvent(int kind, void* b, float amount, int onMain, int dismBefore)
+void BdQueueEvent(int kind, void* b, float amount, int onMain, int dismBefore, int harvest = 0)
 {
     BdEvent e;
     std::memset(&e, 0, sizeof e);
     e.kind = kind;
+    e.harvest = harvest;
     e.amount = amount;
     e.onMain = onMain;
     e.dismBefore = dismBefore;   /* build1-d */
@@ -2379,14 +2385,19 @@ void BdHelpOldJoin(std::map<BdPlKey, BdHelpRow>& into, const std::string& key, c
 }
 struct BdHelpSidLine { std::string key; int i; std::string sid; unsigned int nonce; };   /* help1 fold 3: an owed file S line, placed once every row is read */
 /* a copy's baseline: its delivered amounts now (as made, or after the mod's own write) */
+/* a copy's baseline set to the amounts given (n slots; the rest 0) */
+void BdHelpBaseSet(BdReg& r, const float* m, int n)
+{
+    for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) r.helpBase[i] = (i < n) ? m[i] : 0.0f;
+    r.helpBaseOk = 1;
+}
 void BdHelpBaseRead(BdReg& r, void* b)
 {
     float m[coopbuild::kBuildMaxMats];
     int tot = -1;
     const int n = BdReadMats(b, m, (int)coopbuild::kBuildMaxMats, &tot);
     if (n < 0) { r.helpBaseOk = 0; return; }
-    for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) r.helpBase[i] = (i < n) ? m[i] : 0.0f;
-    r.helpBaseOk = 1;
+    BdHelpBaseSet(r, m, n);
 }
 void BdHelpMsgOf(const std::string& key, const coopbuild::BuildHelpEntry& e, coopbuild::BuildMsg* m)
 {
@@ -2711,6 +2722,29 @@ unsigned int BdHelpUnacked()
     for (std::map<BdPlKey, BdHelpRow>::const_iterator it = g_helpOld.begin(); it != g_helpOld.end(); ++it) u += (unsigned int)it->second.owed.size();   /* help1 fold 3 */
     return u;
 }
+/* help1, MAIN THREAD: work measured on a copy recorded for the owner - progress dP, the ruin reset, the material gains dm[0..nd) - as
+   pending help (BdHelpTick turns it into HELP_WORK), with each gained material's item sid (a HELP_GONE refund names it) and the copy's
+   position (a refund's receiver). key = the row's key. */
+void BdHelpRecordWork(const std::string& key, const BdReg& r, void* b, float dP, int reset, float need, const float* dm, int nd)
+{
+    BdHelpRow& h = BdHelpRowFor(key, r);
+    h.pendP += dP;
+    for (int i = 0; i < nd; ++i) h.pendM[i] += dm[i];
+    if (nd > h.pendN) h.pendN = nd;
+    if (reset != 0) h.pendReset = 1;
+    if (h.pendAny == 0) { h.pendAny = 1; h.pendSince = ::GetTickCount(); }
+    h.need = need;
+    for (int i = 0; i < nd && i < (int)coopbuild::kBuildMaxMats; ++i)   /* help1 fold (MED 3): the item a HELP_GONE refund hands back */
+    {
+        if (!(dm[i] > 0.0f) || !h.sid[i].empty()) continue;
+        char sid[128];
+        sid[0] = 0;
+        void* gd = BdMatDataPod(b, i);
+        if (gd != 0) BdStrPod((const char*)gd + kGdStringId, sid, (int)sizeof(sid));
+        if (sid[0] != 0) { h.sid[i] = sid; BdHelpSaveSoon(); }
+    }
+    h.pos[0] = r.pos[0]; h.pos[1] = r.pos[1]; h.pos[2] = r.pos[2]; h.posOk = 1;
+}
 /* help1, MAIN THREAD, from detour_progress right after the engine's call on a copy (the owner's stand-in holds it; not the mod's own
    write). p0 / n0 / m0 were read before the call; needed was raised for it (not on a ruin). */
 void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0, int repair)   /* T-903: repair = a complete damaged copy */
@@ -2752,19 +2786,10 @@ void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0
     int nd = 0, any = (dP > 0.0f || reset != 0) ? 1 : 0;
     if (m1n > 0 && reset == 0)
     {
-        for (int i = 0; i < m1n; ++i)
-        {
-            const float base = (r.helpBaseOk != 0) ? r.helpBase[i] : ((i < m0n) ? m0[i] : m1[i]);
-            dm[i] = m1[i] - base;
-            if (dm[i] > 0.0001f) any = 1; else dm[i] = 0.0f;
-        }
+        if (coopbuild::BuildHelpMatGain(m1, m1n, r.helpBaseOk, r.helpBase, m0n, m0, dm) != 0) any = 1;
         nd = m1n;
     }
-    if (m1n >= 0)
-    {
-        for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) r.helpBase[i] = (i < m1n) ? m1[i] : 0.0f;
-        r.helpBaseOk = 1;
-    }
+    if (m1n >= 0) BdHelpBaseSet(r, m1, m1n);
     if (any == 0) return;
     if (repair != 0)   /* T-903: repair on a complete damaged copy - the health it restored goes to the owner's game as help work */
     {
@@ -2774,23 +2799,7 @@ void BdHelpAfter(void* b, float p0, float n0, int ruin, int m0n, const float* m0
                     k, p0, p1, n1, g_repairWorkRec);
         BdLogHelpFreq(rl);
     }
-    BdHelpRow& h = BdHelpRowFor(it->first, r);
-    h.pendP += dP;
-    for (int i = 0; i < nd; ++i) h.pendM[i] += dm[i];
-    if (nd > h.pendN) h.pendN = nd;
-    if (reset != 0) h.pendReset = 1;
-    if (h.pendAny == 0) { h.pendAny = 1; h.pendSince = ::GetTickCount(); }
-    h.need = n1;
-    for (int i = 0; i < nd && i < (int)coopbuild::kBuildMaxMats; ++i)   /* help1 fold (MED 3): the item a HELP_GONE refund hands back */
-    {
-        if (!(dm[i] > 0.0f) || !h.sid[i].empty()) continue;
-        char sid[128];
-        sid[0] = 0;
-        void* gd = BdMatDataPod(b, i);
-        if (gd != 0) BdStrPod((const char*)gd + kGdStringId, sid, (int)sizeof(sid));
-        if (sid[0] != 0) { h.sid[i] = sid; BdHelpSaveSoon(); }
-    }
-    h.pos[0] = r.pos[0]; h.pos[1] = r.pos[1]; h.pos[2] = r.pos[2]; h.posOk = 1;
+    BdHelpRecordWork(it->first, r, b, dP, reset, n1, dm, nd);
 }
 /* help1, MAIN THREAD (BdHelpTick): a row's unsent entries go (all of them again at link-up, any left unconfirmed for kHelpResendMs);
    help1 fold 3: for the key's row and for each replaced placement's row alike (each entry carries its own nonce) */
@@ -3378,6 +3387,7 @@ void BdOnNewPiece(void* b, int via, const float* pos, const float* rot, int meta
             {
                 r.via = 3; r.own = 0; r.ownerSlot = handedTo;
                 r.hasPos = (host != 0 && BdCopyF((const char*)host + kObjPos, r.pos, 3)) ? 1 : 0;   /* the host's world position (the REMOVE's zone check) */
+                BdHelpBaseRead(r, b);   /* help1: the copy's baseline - a helper's later deliveries are measured against it */
             }
             if (r.own != 0 && r.via != 3) BdOwnDirty(2);   /* mmo8a: an own piece placed here - its pp.build row is written now */
             if (r.own != 0 && r.via != 3 && (via == 1 || via == 2) && g_bdKeptDraining == 0) BdMadeHereMark(b, key);   /* BuildMadeHere: a placement by the commit or the lever, never a kept piece laid back */
@@ -3676,7 +3686,19 @@ void detour_progress(void* b, float amount)
     /* build1-b (T321: ~1400 FLT_MAX completions at world load, queueDropped 1141): an FLT_MAX-class amount while the world
        is loading is the engine finishing pieces it has just read, not construction - counted, never queued */
     if (amount >= FLT_MAX * 0.5f && EngineWritesBlocked()) { ::InterlockedIncrement64(&g_loadBurstSkipped); return; }
-    BdQueueEvent(1, b, amount, BdOnMain(), -1);
+    /* the engine's add-materials task runs on its AI worker: it puts the items into the piece, then makes this amount-0 call. On a copy a
+       stand-in holds (not a wall, not dismantled) that call is marked, so the main thread measures the copy's materials against its
+       baseline and either records them as help or refuses them (BdHelpHarvest) - the help rule and the help records are main-thread only,
+       so nothing else is done here. g_bdSelf is not asked: it counts the main thread's own writes. POD reads only. */
+    int harvest = 0;
+    const int onMain = BdOnMain();
+    if (onMain == 0 && amount < FLT_MAX * 0.5f && IsStandInFaction((::Faction*)BdOwnerPod(b)) && BdIsWall(b) == 0)
+    {
+        float hp = 0.0f, hn = 0.0f;
+        int hc = 0, hd = 0, hx = 0;
+        if (BdReadState(b, &hp, &hn, &hc, &hd, &hx) != 0 && hd == 0) harvest = 1;
+    }
+    BdQueueEvent(1, b, amount, onMain, -1, harvest);
 }
 
 unsigned long long detour_dismantle(void* b, float amount)
@@ -5607,7 +5629,7 @@ void BdHelpOnGone(const BdHelpGoneIn& g)
     int anyWhole = 0, unnamed = 0;
     for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i)
     {
-        whole[i] = ((i < n && back[i] > 0.0f) ? (int)(back[i] + 0.001f) : 0) + owe[i];
+        whole[i] = ((i < n) ? coopbuild::BuildHelpWholeItems(back[i]) : 0) + owe[i];
         if (whole[i] > 0) { anyWhole = 1; if (h.sid[i].empty()) unnamed = 1; }
     }
     const float zero[3] = { 0.0f, 0.0f, 0.0f };
@@ -6218,6 +6240,146 @@ void BdHelpOnState(const std::string& key, BdReg& r, void* b, const coopbuild::B
     else if (changed != 0) BdHelpSaveSoon();
 }
 
+/* T-903, THE HELPER'S GAME, MAIN THREAD (the K2 safe point): a copy's materials measured against its baseline - after the engine's
+   add-materials task ran off the main thread (where its call is neither help nor refused), and just before an owner's STATE overwrites
+   them. The help rule is asked here, when the materials are committed. Allowed: the gains are recorded as help work for the owner as a
+   main-thread help step records them (BdHelpRecordWork) and the baseline moves on. Not allowed: the gained slots are put back to the
+   baseline (the STATE's mats-only write) and the items handed to this game's own character nearest the copy, as a refund is; items not
+   taken stay owed as one more help entry of this placement (as a HELP_GONE carries them), which the owner's game refuses and hands back
+   through its STATE's refund (kept due until taken). key = the row's key, r = the row (0: none), b = the live piece (0: not found);
+   why = what asked (the line). */
+void BdHelpHarvest(const std::string& key, BdReg* r, void* b, const char* why)
+{
+    float p = 0.0f, n = 0.0f;
+    int c = 0, d = 0, x = 0;
+    const int found = (r != 0 && r->removed == 0 && b != 0 && BdReadState(b, &p, &n, &c, &d, &x) != 0) ? 1 : 0;
+    ::Faction* owner = (found != 0) ? (::Faction*)BdOwnerPod(b) : 0;
+    const int isCopy = (found != 0 && r->via == 3 && IsStandInFaction(owner)) ? 1 : 0;
+    const int wall = (isCopy != 0) ? BdIsWall(b) : 0;
+    float now[coopbuild::kBuildMaxMats], gain[coopbuild::kBuildMaxMats];
+    for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i) { now[i] = 0.0f; gain[i] = 0.0f; }
+    int tot = -1;
+    const int nNow = (isCopy != 0 && wall == 0 && d == 0) ? BdReadMats(b, now, (int)coopbuild::kBuildMaxMats, &tot) : -1;
+    const int baseOk = (isCopy != 0) ? r->helpBaseOk : 0;
+    const int gained = (nNow > 0 && baseOk != 0) ? coopbuild::BuildHelpMatGain(now, nNow, 1, r->helpBase, -1, 0, gain) : 0;
+    int mate = 0, fr = 0;
+    const int allowed = (gained != 0) ? BdHelpAllowedHere(owner, &mate, &fr) : 0;
+    const int v = coopbuild::BuildHelpHarvestVerdict(found, isCopy, wall, d, baseOk, gained, allowed);
+    if (v == coopbuild::kBuildHarvestGone || v == coopbuild::kBuildHarvestNotCopy || v == coopbuild::kBuildHarvestSkip) return;
+    char line[560];
+    if (v == coopbuild::kBuildHarvestNoBase)
+    {   /* the baseline is left unset: moving it to the amounts now would take a delivery already in them for the mod's own */
+        ++g_helpHarvestNoBase;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help materials (off the main thread) key=%.63s NOT MEASURED (%s): the copy's baseline is not known yet (set by the owner's next STATE) - nothing taken; helpHarvestNoBase=%lld",
+                    key.c_str(), why, g_helpHarvestNoBase);
+        BdLogHelpFreq(line);
+        return;
+    }
+    if (v == coopbuild::kBuildHarvestNoGain)
+    {
+        if (nNow >= 0) BdHelpBaseSet(*r, now, nNow);   /* as a main-thread help step: the baseline follows the amounts read */
+        return;
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < nNow; ++i) sum += gain[i];
+    if (v == coopbuild::kBuildHarvestRecord)
+    {
+        BdHelpRecordWork(key, *r, b, 0.0f, 0, n, gain, nNow);
+        BdHelpBaseSet(*r, now, nNow);
+        ++g_helpHarvested;
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help materials (off the main thread) key=%.63s dMats=%.2f recorded for slot%d (%s) - they go to the owner's game as help work; helpHarvested=%lld",
+                    key.c_str(), sum, StandInSlotOf(owner), why, g_helpHarvested);
+        BdLogHelpFreq(line);
+        return;
+    }
+    /* refused: each gained slot back to the baseline; its item read first (as a STATE's refund reads it) */
+    std::string sid[coopbuild::kBuildMaxMats];
+    float back[coopbuild::kBuildMaxMats];
+    for (int i = 0; i < nNow; ++i)
+    {
+        back[i] = (gain[i] > 0.0f) ? r->helpBase[i] : now[i];
+        if (!(gain[i] > 0.0f)) continue;
+        char s[128];
+        s[0] = 0;
+        void* gd = BdMatDataPod(b, i);
+        if (gd != 0) BdStrPod((const char*)gd + kGdStringId, s, (int)sizeof(s));
+        sid[i] = s;
+    }
+    int ml = -1, stg = 0;
+    if (BdApplyStatePod(b, 0, 0.0f, nNow, back, &ml, 0, &stg) == 0)
+    {   /* the materials are still on the copy: no item is handed back (never twice) and the refusal is not counted yet; the baseline is
+           kept, so the next look refuses them again */
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help materials (off the main thread) key=%.63s dMats=%.2f REFUSED (%s): slot%d's piece takes no help from this player - the copy's materials could NOT be put back (the write faulted at stage %d), no items returned; tried again at the next look",
+                    key.c_str(), sum, why, StandInSlotOf(owner), stg);
+        BdLogHelpFreq(line);
+        return;
+    }
+    ++g_helpHarvestRefused;
+    BdHelpBaseSet(*r, back, nNow);
+    ::Character* ch = BdNearestOwnChar(r->pos);
+    int whole[coopbuild::kBuildMaxMats];
+    int givenAt[coopbuild::kBuildMaxMats];   /* 1 given, 0 not taken (carried below), < 0 the engine's add faulted */
+    int items = 0, owed = 0, lost = 0;
+    const char* noWhy = "";
+    for (int i = 0; i < (int)coopbuild::kBuildMaxMats; ++i)
+    {
+        whole[i] = (i < nNow) ? coopbuild::BuildHelpWholeItems(gain[i]) : 0;
+        givenAt[i] = 1;
+        if (whole[i] <= 0) continue;
+        if (sid[i].empty() || ch == 0) { givenAt[i] = 0; owed += whole[i]; noWhy = sid[i].empty() ? "a material's item is not known here" : "no own character"; continue; }
+        int units = 0;   /* a refused add may follow a partial placement: those units were taken, only the rest is owed */
+        const int given = ItemsGiveMaterial(ch, sid[i], whole[i], &units);
+        givenAt[i] = given;
+        if (given == 1) { items += whole[i]; continue; }
+        if (given < 0) { lost += whole[i]; noWhy = "the engine's add FAULTED - never retried"; continue; }   /* a faulted add may have half-filed the item */
+        if (units > 0 && units < whole[i]) { items += units; whole[i] -= units; }
+        owed += whole[i];
+        noWhy = "the inventory refused them";
+    }
+    char miss[200];
+    miss[0] = 0;
+    if (owed > 0)
+    {   /* the items not taken ride one more entry of this placement: the owner's game refuses it and its STATE's refund hands them back,
+           kept due until the inventory takes them; the HELP_GONE refund names their items if the owner's piece is gone first */
+        BdHelpRow& h = BdHelpRowFor(key, *r);
+        coopbuild::BuildHelpEntry ce;
+        if (coopbuild::BuildHelpGoneCarry(whole, givenAt, h.nextSeq, h.nonce, &ce) != 0)
+        {
+            ++h.nextSeq;
+            h.owed.push_back(ce);
+            for (int i = 0; i < nNow; ++i) if (givenAt[i] == 0 && whole[i] > 0 && h.sid[i].empty() && !sid[i].empty()) h.sid[i] = sid[i];
+            h.pos[0] = r->pos[0]; h.pos[1] = r->pos[1]; h.pos[2] = r->pos[2]; h.posOk = 1;
+            BdHelpSaveSoon();
+            g_helpHarvestCarried += owed;
+            _snprintf_s(miss, sizeof(miss), _TRUNCATE, ", %d still owed (%s) - carried as entry seq=%u", owed, noWhy, ce.seq);
+        }
+    }
+    if (lost > 0)
+    {
+        g_helpHarvestLost += lost;
+        const size_t ml2 = std::strlen(miss);
+        _snprintf_s(miss + ml2, sizeof(miss) - ml2, _TRUNCATE, ", %d NOT returned (%s)", lost, noWhy);
+    }
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] help materials (off the main thread) key=%.63s dMats=%.2f REFUSED (%s): slot%d's piece takes no help from this player (not a faction-mate, not set friendly) - the copy's materials put back and %d items returned to the nearest own character%s; helpHarvestRefused=%lld carried=%lld lost=%lld",
+                key.c_str(), sum, why, StandInSlotOf(owner), items, miss, g_helpHarvestRefused, g_helpHarvestCarried, g_helpHarvestLost);
+    BdLogHelpFreq(line);
+}
+/* T-903, MAIN THREAD, the K2 safe point: the copies an off-main add-materials step changed (marked by BuildTick), each once */
+void BdHarvestDrain()
+{
+    if (g_bdHarvestDue.empty()) return;
+    std::vector<std::string> due;
+    due.swap(g_bdHarvestDue);
+    for (size_t i = 0; i < due.size(); ++i)
+    {
+        std::map<std::string, BdReg>::iterator it = BdRowByLiveKey(due[i]);
+        if (it == g_reg.end()) continue;
+        int fv = 0;
+        void* b = (it->second.removed == 0) ? BdFindPiece(it->first, it->second, &fv) : 0;   /* re-found: never a kept pointer */
+        BdHelpHarvest(it->first, &it->second, b, "after an add-materials step");
+    }
+}
+
 /* build1-c, K2 safe point: one held STATE onto its copy. 1 = done with it (applied or dropped), 0 = keep it. */
 int BdApplyOne(const std::string& key, BdStatePend& s)
 {
@@ -6262,6 +6424,7 @@ int BdApplyOne(const std::string& key, BdStatePend& s)
         BdLogState(line);
         return 1;
     }
+    BdHelpHarvest(key, &row->second, b, "before the owner's STATE");   /* a helper's materials not yet measured are recorded or refused before the STATE overwrites them */
     if (m.needed > 0.0f && ln > 0.0f && std::fabs(ln - m.needed) > 0.001f * m.needed && BdIsWall(b) == 0 && BdSetNeededPod(b, m.needed) != 0)
     {   /* help1 fold (review LOW 11): a copy's needed off the owner's (a raise never put back) heals to the STATE's */
         ++g_neededHealed;
@@ -8681,6 +8844,13 @@ void BuildTick()
     for (int i = 0; i < n; ++i)
     {
         const BdEvent& e = g_drain[i];
+        if (e.kind == 1 && e.harvest != 0 && e.keyOk != 0)
+        {   /* a copy's materials changed off the main thread: measured at the next K2 safe point (BdHarvestDrain), each key once */
+            const std::string hk(e.key);
+            size_t q = 0;
+            while (q < g_bdHarvestDue.size() && g_bdHarvestDue[q] != hk) ++q;
+            if (q == g_bdHarvestDue.size()) g_bdHarvestDue.push_back(hk);
+        }
         if (e.keyOk != 0 && e.stateOk != 0)
         {
             std::map<std::string, BdReg>::iterator it = g_reg.find(std::string(e.key));
@@ -8738,7 +8908,8 @@ void BuildTick()
         const char* k = (e.keyOk != 0) ? e.key : "?";
         char line[400];
         if (e.kind == 1)
-            std::sprintf(line, "[BUILD] progress key=%s %.2f/%.2f complete=%d amount=%g", k, e.progress, e.needed, e.complete, e.amount);
+            std::sprintf(line, "[BUILD] progress key=%s %.2f/%.2f complete=%d amount=%g thread=%s", k, e.progress, e.needed, e.complete, e.amount,
+                         e.onMain ? "main" : "OTHER");
         else if (e.kind == 2)
             std::sprintf(line, "[BUILD] dismantled key=%s progress=%.2f/%.2f isDismantled=%d amount=%g thread=%s", k, e.progress, e.needed,
                          e.dismantled, e.amount, e.onMain ? "main" : "OTHER");
@@ -12929,10 +13100,11 @@ void BuildCopyDrain()
     if (!g_shown.empty()) BdShowMarkTick();   /* T-811 log: what the map draws for each teammate base (read-only; a line when it first shows or changes) */
     BdTownWake();   /* T-936: the outposts founded since (here, by the lever, the relink or a teammate's copy just above) woken once their area is loaded (its own engine-write check) */
     if (g_pend.empty() && g_wait.empty() && g_pendState.empty() && g_pendRemove.empty() && g_helpIn.empty() && g_helpGoneIn.empty() && BdReconAnyDue() == 0
-        && g_tombKill.empty() && KeptRowsActive() == 0) return;   /* P87: + a reconcile due; P14: + a removal queued; KEPT: + kept rows with a part this game may act on */
+        && g_tombKill.empty() && KeptRowsActive() == 0 && g_bdHarvestDue.empty()) return;   /* P87: + a reconcile due; P14: + a removal queued; KEPT: + kept rows with a part this game may act on */
     if (EngineWritesBlocked()) { ++g_copyBlocked; return; }
     BdSelfScope selfScope;   /* help1: every engine call below is the mod's own - vt+0x230 inside it is never a helper's work */
     BdHelpDrain();   /* help1: the helpers' work onto this game's own pieces (no stand-in needed) */
+    BdHarvestDrain();   /* the materials put into copies off the main thread: recorded as help for their owners, or refused and returned */
     BdTombKillDrain();   /* P14 (mmo8b): the save's own pieces the records retired - removed, no refund (no stand-in needed) */
     /* Every copy belongs to the stand-in of the player whose piece it is: a PLACE is judged by its sender's slot (BdPending::fromSlot), a
        STATE or a REMOVE by the owner slot its copy row recorded, a reconcile by its REMOVE's sender. An entry whose player's stand-in does
@@ -13004,6 +13176,7 @@ void PowerForgetWorld();   /* P47 (H-P47a): below */
 void BuildForgetWorld()
 {
     FarmForgetWorld();   /* par16 */
+    g_bdHarvestDue.clear();   /* the marked copies belong to the world going away */
     PowerForgetWorld();   /* P47 (H-P47a): the published writer verdicts belong to the world going away */
     g_ocQ.clear(); g_ocDepth = 0;   /* P18: the queued keys belong to the world going away */
     g_btPlaced = 0; g_btPlacedKey[0] = 0;   /* TEST-ONLY: the piece buildtest place made belongs to the world going away */
@@ -15029,12 +15202,13 @@ void ReportBuild()
                 g_helpRefundItems, g_helpRefundFailed, g_helpFaulted, g_helpSaveFailed, g_helpLoadUnread, g_testMats, g_helpLines, g_helpSuppressed,
                 g_helpNonceRestored, g_helpNonceHeld, g_helpGoneUnproven, g_bdCopyCollide, g_helpGoneCarried, g_helpOldProbe, g_helpAckKeptUnknown);   /* help1 fold 4 */
     DebugLog(std::string(hp));
-    char h9[600];   /* T-903 */
+    char h9[700];   /* T-903 */
     _snprintf_s(h9, sizeof(h9), _TRUNCATE, "[BUILD] REPORT help903[givenBuild,givenMaterials,givenRepair,refusedBuild,refusedMaterials,refusedRepair,refusedOff,repairDamagedHelp,repairWorkRec,repairApplied,repairWhole,repairFaulted,friendHelps,applyRefused,runRefused,applyHeld,deadHandlesIgnored]"
-                "=%lld,%lld,%lld,%lld,%lld,%lld,%ld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%lld,%lld,%lld",
+                "=%lld,%lld,%lld,%lld,%lld,%lld,%ld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%lld,%lld,%lld harvest[done,refused,carried,lost,noBase]=%lld,%lld,%lld,%lld,%lld",
                 g_helpGivenK[0], g_helpGivenK[1], g_helpGivenK[2], g_helpRefusedK[0], g_helpRefusedK[1], g_helpRefusedK[2],
                 (long)::InterlockedCompareExchange(&g_helpRefusedOff, 0, 0), g_repairDamagedHelp, g_repairWorkRec, g_helpRepairApplied, g_repairWhole,
-                g_repairFaulted, coopbuild::kBuildHelpFriendHelps, g_helpApplyRefused, g_helpRunRefused, g_helpApplyHeld, g_deadHandlesIgnored);
+                g_repairFaulted, coopbuild::kBuildHelpFriendHelps, g_helpApplyRefused, g_helpRunRefused, g_helpApplyHeld, g_deadHandlesIgnored,
+                g_helpHarvested, g_helpHarvestRefused, g_helpHarvestCarried, g_helpHarvestLost, g_helpHarvestNoBase);
     DebugLog(std::string(h9));
     char p18[700];   /* P18 */
     _snprintf_s(p18, sizeof(p18), _TRUNCATE, "[BUILD] REPORT p18[hook,seen,queued,offMain,modWrite,nested,notMine,wasMine,noKey,dup,queueFull,registered,notTaken,known,copyRow,notMineNow,gaveUp,walkMoved,applied,applyFaulted,waiting,lines,suppressed]"

@@ -12291,6 +12291,46 @@ void t_p15_destroyed_state()
     if (coopbuild::BuildKeptOwnCompleteVerdict(1, 0, 1, 0, 1, 1, 4, -1) != 0) Fail("a group whose lead was not found was completed");
 }
 
+/* T-903: a helper's materials put into a copy off the main thread - the gain against the copy's baseline and the verdict */
+void t_t903_help_harvest()
+{
+    const float now[3] = { 5.0f, 2.0f, 7.0f };
+    const float base[3] = { 3.0f, 2.0f, 9.0f };
+    const float before[3] = { 4.0f, 1.0f, 7.0f };
+    float g[3] = { -1.0f, -1.0f, -1.0f };
+    if (coopbuild::BuildHelpMatGain(now, 3, 1, base, -1, 0, g) != 1 || g[0] != 2.0f || g[1] != 0.0f || g[2] != 0.0f)
+        Fail("T-903 F1036: the gain against a known baseline is wrong (a rise counts, no change and a drop are 0)");
+    g[0] = -1.0f; g[1] = -1.0f; g[2] = -1.0f;
+    if (coopbuild::BuildHelpMatGain(now, 3, 1, base, 3, before, g) != 1 || g[0] != 2.0f)
+        Fail("T-903 F1036: a known baseline did not win over the amounts read before the call");
+    g[0] = -1.0f; g[1] = -1.0f; g[2] = -1.0f;
+    if (coopbuild::BuildHelpMatGain(now, 3, 0, base, 2, before, g) != 1 || g[0] != 1.0f || g[1] != 1.0f || g[2] != 0.0f)
+        Fail("T-903 F1036: with no baseline the amounts read before the call were not used (and the rest taken as no gain)");
+    g[0] = -1.0f; g[1] = -1.0f; g[2] = -1.0f;
+    if (coopbuild::BuildHelpMatGain(now, 3, 0, base, -1, 0, g) != 0 || g[0] != 0.0f || g[1] != 0.0f || g[2] != 0.0f)
+        Fail("T-903 F1036: with no baseline and nothing read before, a gain was counted (must be 0)");
+    {
+        const float tiny[1] = { 1.00005f };
+        const float one[1] = { 1.0f };
+        float t[1] = { -1.0f };
+        if (coopbuild::BuildHelpMatGain(tiny, 1, 1, one, -1, 0, t) != 0 || t[0] != 0.0f) Fail("T-903 F1036: a gain within the epsilon counted");
+        const float more[1] = { 1.001f };
+        if (coopbuild::BuildHelpMatGain(more, 1, 1, one, -1, 0, t) != 1 || !(t[0] > coopbuild::kBuildHelpMatEps)) Fail("T-903 F1036: a gain past the epsilon did not count");
+        if (coopbuild::BuildHelpMatGain(more, 0, 1, one, -1, 0, t) != 0) Fail("T-903 F1036: no slot read counted a gain");
+    }
+    if (coopbuild::BuildHelpHarvestVerdict(0, 1, 0, 0, 1, 1, 1) != coopbuild::kBuildHarvestGone) Fail("T-903 F1036: a piece not found here was harvested");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 0, 0, 0, 1, 1, 1) != coopbuild::kBuildHarvestNotCopy) Fail("T-903 F1036: a piece that is no stand-in's copy was harvested");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 1, 1, 0, 1, 1, 1) != coopbuild::kBuildHarvestSkip) Fail("T-903 F1036: a wall copy was harvested");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 1, 0, 1, 1, 1, 0) != coopbuild::kBuildHarvestSkip) Fail("T-903 F1036: a dismantled copy was harvested");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 1, 0, 0, 0, 1, 1) != coopbuild::kBuildHarvestNoBase || coopbuild::BuildHelpHarvestVerdict(1, 1, 0, 0, 0, 0, 0) != coopbuild::kBuildHarvestNoBase)
+        Fail("T-903 F1036: a copy with no baseline was measured (its delivery would be lost when the baseline moved)");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 1, 0, 0, 1, 0, 0) != coopbuild::kBuildHarvestNoGain) Fail("T-903 F1036: no gain was recorded or refused");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 1, 0, 0, 1, 1, 1) != coopbuild::kBuildHarvestRecord) Fail("T-903 F1036: an allowed helper's materials were not recorded as help");
+    if (coopbuild::BuildHelpHarvestVerdict(1, 1, 0, 0, 1, 1, 0) != coopbuild::kBuildHarvestRefuse) Fail("T-903 F1036: a helper the help rule refuses was not refused");
+    if (coopbuild::BuildHelpWholeItems(3.0f) != 3 || coopbuild::BuildHelpWholeItems(2.9995f) != 3 || coopbuild::BuildHelpWholeItems(2.5f) != 2
+        || coopbuild::BuildHelpWholeItems(0.0f) != 0 || coopbuild::BuildHelpWholeItems(-1.0f) != 0) Fail("T-903 F1036: the whole items of a gain are wrong");
+}
+
 /* build1-b: MSG_BUILD PLACE - a construction one game's player placed, copied as coop-peer on the other. */
 void t_build1b_place_wire()
 {
@@ -32824,7 +32864,35 @@ void t_t461_send_outcome()
     if (FailKindOf(12002, 0) != kFailServer || FailKindOf(12030, 0) != kFailServer || FailKindOf(12152, 0) != kFailServer) Fail("a timeout / broken answer is not the server");
     if (FailKindOf(0, 502) != kFailServer || FailKindOf(0, 500) != kFailServer || FailKindOf(0, 599) != kFailServer) Fail("a 5xx is not the server");
     if (FailKindOf(0, 413) != kFailOther || FailKindOf(0, 404) != kFailOther || FailKindOf(12175, 0) != kFailOther) Fail("another failure is not 'error n'");
+    if (SendTraceText(kStepReach, 15032, 15010, 0, 5590668) != "stopped while reaching the server (finding it, connecting, the secure handshake) after 15032 ms (15010 ms in that step); 0 of 5590668 bytes uploaded")
+        Fail("the send trace of a server never reached does not read as written");
+    if (SendTraceText(kStepUpload, 40000, 30000, 196608, 2986814).find("stopped while uploading after 40000 ms (30000 ms in that step); 196608 of 2986814 bytes uploaded") != 0)
+        Fail("the send trace of an upload cut off does not name the step and the bytes");
+    if (std::string(SendStepName(kStepOpen)) == SendStepName(kStepReach) || std::string(SendStepName(kStepUpload)) == SendStepName(kStepAnswer)
+        || std::string(SendStepName(kStepAnswer)) == SendStepName(kStepRead) || std::string(SendStepName(99)) != "an unknown step")
+        Fail("two send steps share a name, or an unknown step is not named as one");
     if (FailCodeOf(12175, 0) != 12175 || FailCodeOf(0, 413) != 413) Fail("the error number");
+    /* decision 952 a: a 12175 send logs why the secure connection was refused */
+    {
+        const struct { unsigned long f; const char* text; } one[] = {
+            { 0x1ul, "secure connection refused: the certificate's revocation could not be checked (flags 0x1)" },
+            { 0x2ul, "secure connection refused: the certificate is invalid (flags 0x2)" },
+            { 0x4ul, "secure connection refused: the certificate was revoked (flags 0x4)" },
+            { 0x8ul, "secure connection refused: the certificate authority is not trusted (flags 0x8)" },
+            { 0x10ul, "secure connection refused: the certificate is for another name (flags 0x10)" },
+            { 0x20ul, "secure connection refused: the certificate is expired or not yet valid (flags 0x20)" },
+            { 0x40ul, "secure connection refused: the certificate is not meant for this use (flags 0x40)" },
+            { 0x80000000ul, "secure connection refused: the secure channel failed (flags 0x80000000)" },
+        };
+        for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); ++i)
+            if (SecureFailureText(one[i].f) != one[i].text) Fail("a single secure-failure flag does not read as written");
+        if (SecureFailureText(0x8ul | 0x20ul) != "secure connection refused: the certificate authority is not trusted; the certificate is expired or not yet valid (flags 0x28)")
+            Fail("two secure-failure flags are not both named, joined by '; '");
+        if (SecureFailureText(0x100ul) != "secure connection refused: unknown reason 0x100 (flags 0x100)") Fail("an unknown secure-failure bit is not shown as hex");
+        if (SecureFailureText(0x80000000ul | 0x1000ul) != "secure connection refused: the secure channel failed; unknown reason 0x1000 (flags 0x80001000)")
+            Fail("a known and an unknown secure-failure bit together");
+        if (SecureFailureText(0ul) != "secure connection refused: no reason given (flags 0x0)") Fail("no secure-failure flag is not 'no reason given'");
+    }
     if (!SendSucceeded(0, 200) || !SendSucceeded(0, 204) || SendSucceeded(0, 302) || SendSucceeded(12002, 200)) Fail("success is not a 2xx answer");
 }
 void t_t461_crash_file_rule()
@@ -49234,6 +49302,7 @@ const TestRow kTests[] =
     { "build1b_place_wire",                                          t_build1b_place_wire },
     { "build1c_state_wire",                                          t_build1c_state_wire },
     { "p15_destroyed_state",                                         t_p15_destroyed_state },
+    { "t903_help_harvest",                                           t_t903_help_harvest },
     { "build1d_remove_wire",                                         t_build1d_remove_wire },
     { "par13_owed_remove",                                           t_par13_owed_remove },
     { "p87_reconcile",                                               t_p87_reconcile },   /* P87 */
