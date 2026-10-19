@@ -11793,7 +11793,7 @@ void t_par1_parity_wire()
     if (cooppar::ParityQuality100(nan) != 0) Fail("a NaN quality is not read as 0");
 }
 
-/* P15 (protocol 99): a STATE's destroyed bit (the complete byte's bit 1) and the pure destroyed-state decisions. */
+/* P15 (protocol 100): a STATE's destroyed bit (the complete byte's bit 1) and the pure destroyed-state decisions. */
 void t_p15_destroyed_state()
 {
     coopbuild::BuildMsg s; s.kind = coopbuild::kBuildState; s.key = "P7n|ruin"; s.progress = 0.0f; s.needed = 4.0f;
@@ -28123,13 +28123,13 @@ void t_t716_repair_removed()
 }
 void t_t313_protocol_63_both_sides()
 {
-    if (coopfeed::kFeedProtocol != 99 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 99) Fail("the feed's protocol/message numbers are not 99/58");
+    if (coopfeed::kFeedProtocol != 100 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 100) Fail("the feed's protocol/message numbers are not 100/58");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
-    if (plugin.find("const unsigned int kStoreProtocol = 99;") == std::string::npos) Fail("the plugin does not speak world-server protocol 99");
-    if (server.find("const unsigned int kProtocol = 99;") == std::string::npos) Fail("the world server does not speak protocol 99");
-    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 99u) Fail("OWED is not 63 (protocol 99) on both sides and in owedpop.h");
-    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 99u) Fail("TOWN_LOSS is not 64 (protocol 99) on both sides and in townrefill.h");
+    if (plugin.find("const unsigned int kStoreProtocol = 100;") == std::string::npos) Fail("the plugin does not speak world-server protocol 100");
+    if (server.find("const unsigned int kProtocol = 100;") == std::string::npos) Fail("the world server does not speak protocol 100");
+    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 100u) Fail("OWED is not 63 (protocol 100) on both sides and in owedpop.h");
+    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 100u) Fail("TOWN_LOSS is not 64 (protocol 100) on both sides and in townrefill.h");
     if (plugin.find("kStoreMsgBundle = 59;") == std::string::npos || server.find("MSG_BUNDLE = 59") == std::string::npos || coopbundle::kMsgBundle != 59u) Fail("BUNDLE is not 59 on both sides and in sendbundle.h");
     if (plugin.find("kStoreMsgRecordFeed = 58;") == std::string::npos || server.find("MSG_RECORD_FEED = 58") == std::string::npos) Fail("RECORD_FEED is not 58 on both sides");
 }
@@ -38638,7 +38638,7 @@ void t_t605_store_gate()
 void t_t591_town_refill()
 {
     using namespace townrefill;
-    if (kMsgTownLoss != 64u || kProtocol != 99u) Fail("TOWN_LOSS is not message 64 of protocol 99");
+    if (kMsgTownLoss != 64u || kProtocol != 100u) Fail("TOWN_LOSS is not message 64 of protocol 100");
     Table t;
     if (AddLoss(&t, "town-a") != 1 || AddLoss(&t, "town-a") != 2) Fail("a loss did not add one to its town");
     if (AddLoss(&t, "") != 0 || AddLoss(&t, std::string(129, 'x')) != 0 || AddLoss(&t, "a\tb") != 0) Fail("a loss was taken for a town id that is not usable");
@@ -40519,8 +40519,8 @@ void t_t290s3a_proof()
     if (ht.size() != 32 || authproof::kHostTokenBytes != 32 || !authproof::HostTokenDecode(ht, tok2) || std::memcmp(tok2, tok, 32) != 0) Fail("HOST_TOKEN is not {token 32}, or its round trip");
     ht.push_back(0);
     if (authproof::HostTokenDecode(ht, tok2)) Fail("a 33-byte HOST_TOKEN is read");
-    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 99u)
-        Fail("the message numbers are not 65/66/67/68 of protocol 99");
+    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 100u)
+        Fail("the message numbers are not 65/66/67/68 of protocol 100");
 }
 
 /* auth.txt: the line the host's game writes reads back; a file with no key line is no password; anything unreadable is bad */
@@ -41899,7 +41899,7 @@ void t_t36g_wire_and_rules()
     if (keptwire::RowOk(bad)) Fail("wire2: a door state of 4 is valid");
     bad = w; bad.p.doors.resize(keptwire::kMaxDoors + 1, d);
     if (keptwire::RowOk(bad)) Fail("wire2: a row of 33 doors is valid");
-    if (keptwire::kProtocol != 99u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 99");
+    if (keptwire::kProtocol != 100u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 100");
     /* RecordHoldsItems' 'has' mode (zonekeep::KeptItemsHas) and its 'all' mode count a pack's own items */
     std::vector<std::string> box(1, "4003-gamedata.base");
     if (zonekeep::KeptItemsHas(std::vector<zonekeep::KeptItem>(1, pack), box) != 1) Fail("has2: a box holding a kept pack's item is not 'has'");
@@ -41965,6 +41965,24 @@ void t_teamtowns_said()
     if (SaidKey(a) != SaidKey(a2) || SaidKey(a) == SaidKey(b)) Fail("teamtowns: SaidKey does not name one outpost the same on every look");
 }
 /* teamwire.h WORK: research work at a teammate's bench - round trip up and down, the amount bounds (0, NaN, above kMaxWork) refused */
+void t_bank_wire()
+{
+    using namespace swteam;
+    std::vector<char> b; Up u; Down d; unsigned after = 0;
+    if (!EncodeBank(&b, kBankDeposit, 7, 1500) || !DecodeUp(&b[0], b.size(), &u) || u.kind != kUpBank || u.flags != kBankDeposit || u.no != 7 || u.slot != 1500) Fail("bank: an up BANK does not round-trip");
+    if (EncodeBank(&b, kBankDeposit, 1, 0) || EncodeBank(&b, kBankWithdraw, 1, kMaxBank + 1) || EncodeBank(&b, 9, 1, 5)) Fail("bank: a bad request encodes");
+    if (!EncodeBank(&b, kBankAsk, 0, 0)) Fail("bank: an ASK does not encode");
+    if (!EncodeBankDown(&b, kBankWithdraw, 7, kBankShort, 2, 300) || !DecodeDown(&b[0], b.size(), &d) || d.kind != kDnBank || d.bankOp != kBankWithdraw || d.bankTxn != 7 || d.result != kBankShort || d.fromSlot != 2 || d.bankBalance != 300) Fail("bank: a down BANK does not round-trip");
+    b.push_back(0); if (DecodeDown(&b[0], b.size(), &d)) Fail("bank: trailing bytes decode");
+    if (BankDecide(100, kBankDeposit, 50, &after) != kBankOk || after != 150) Fail("bank: a deposit is not added");
+    if (BankDecide(100, kBankWithdraw, 101, &after) != kBankShort || after != 100) Fail("bank: an overdraw is not refused");
+    if (BankDecide(100, kBankWithdraw, 100, &after) != kBankOk || after != 0) Fail("bank: a withdraw is not taken");
+    if (BankDecide(kMaxBank, kBankDeposit, 1, &after) != kBankFull) Fail("bank: a full bank takes more");
+    Book k; Team tm; tm.no = 4; tm.founder = "a"; tm.name = "T"; tm.bank = 12345; k.teams.push_back(tm);
+    Book back; const std::string file = BookFile(k); std::istringstream in(file); std::string line; int why = 0;
+    while (std::getline(in, line)) { if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1); BookParseLine(line, &back, &why); }
+    if (back.teams.size() != 1 || back.teams[0].bank != 12345) Fail("bank: a team's balance does not survive teams.txt");
+}
 void t_teamwork_wire()
 {
     using namespace swteam;
@@ -43885,7 +43903,7 @@ const TestRow kTests[] =
     { "key_height_into_offset", t_key_height_into_offset },
     { "bagnest_push_partner", t_bagnest_push_partner },
     { "t36o_outposts", t_t36o_outposts },
-    { "teamtowns_said", t_teamtowns_said }, { "teamwork_wire", t_teamwork_wire },
+    { "teamtowns_said", t_teamtowns_said }, { "teamwork_wire", t_teamwork_wire }, { "bank_wire", t_bank_wire },
     { "t778_gear_wire", t_t778_gear_wire }
     , { "carry_sums", t_carry_sums }
 };

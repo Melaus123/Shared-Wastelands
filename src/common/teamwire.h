@@ -111,8 +111,13 @@ const unsigned kMaxSides = 256;           // recorded sides in one team / one RE
 const float kRecLow = -100.0f, kRecHigh = 100.0f;   // the engine's standing scale
 
 enum { kUpInvite = 1, kUpAnswer = 2, kUpLeave = 3, kUpRemove = 4, kUpDisband = 5, kUpRestoreDone = 6, kUpAsk = 7,
-       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpWork = 13, kUpWorkState = 14 };
-enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnWork = 26, kDnWorkState = 27 };
+       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpWork = 13, kUpWorkState = 14, kUpBank = 15 };
+enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnWork = 26, kDnWorkState = 27, kDnBank = 28 };
+/* SW Bank: a team's shared cats. Up BANK: u8 op (kBankDeposit/Withdraw/Ask), u32 txn, u32 amount. Down BANK: u8 op, u32 txn, u8 result,
+   u32 bySlot, u32 balance. The server decides and saves before it answers; a deposit's cats left the purse first (refunded on a refusal). */
+enum { kBankDeposit = 1, kBankWithdraw = 2, kBankAsk = 3 };
+enum { kBankOk = 0, kBankNoTeam = 1, kBankShort = 2, kBankFull = 3, kBankNotSaved = 4, kBankBad = 5 };
+const unsigned kMaxBank = 2000000000u;   /* a team's balance and any one amount stay at or under this */
 /* WORK STATE: a member's research is idle (1, nothing queued) or running (0), with its current tech's stringID (empty when idle) and its
    progress (0..1); the world server passes it to the other connected members of its team: their workers at that member's bench stop
    while it is idle, and their panel of that member's town shows its research (up: flags = idle, name = tech, rel = progress; down:
@@ -201,7 +206,8 @@ struct Team
     TeamRec rec;                     // the team's standing (step 5)
     std::vector<SideSnap> sides;     // members' sides towards teammates as they stood before the pin
     std::vector<std::string> research;   // every tech any member has finished (stringIDs, sorted, unique)
-    Team() : no(0), founderSnapRows(0) {}
+    unsigned bank;                   // SW Bank: the team's shared cats
+    Team() : no(0), founderSnapRows(0), bank(0) {}
 };
 struct Owed
 {
@@ -929,6 +935,8 @@ inline bool EncodeWork(std::vector<char>* b, unsigned toSlot, float amount)
 inline bool EncodeWorkState(std::vector<char>* b, bool idle, const std::string& tech, float frac)
 { b->clear(); if (!(frac >= 0.0f && frac <= 1.0f) || tech.size() > kMaxName) return false; PutU8(b, kUpWorkState); PutU8(b, idle ? 1u : 0u); PutStr(b, tech); PutF32(b, frac); return true; }
 /* false = not an up message this header knows, or malformed (trailing bytes included) */
+inline bool EncodeBank(std::vector<char>* b, unsigned op, unsigned txn, unsigned amount)
+{ b->clear(); if (op < kBankDeposit || op > kBankAsk || amount > kMaxBank || (op != kBankAsk && amount == 0)) return false; PutU8(b, kUpBank); PutU8(b, op); PutU32(b, txn); PutU32(b, amount); return true; }
 inline bool DecodeUp(const char* p, size_t n, Up* u)
 {
     if (u == 0) return false;
@@ -955,6 +963,7 @@ inline bool DecodeUp(const char* p, size_t n, Up* u)
     else if (u->kind == kUpStance || u->kind == kUpSide) { u->slot = GetU32(&c); u->rel = GetF32(&c); u->flags = GetU32(&c); }
     else if (u->kind == kUpResearch) { u->whole = GetU8(&c); if (u->whole > 1) c.bad = true; GetTechs(&c, &u->techs); }
     else if (u->kind == kUpWork) { u->slot = GetU32(&c); u->rel = GetF32(&c); if (!(u->rel > 0.0f && u->rel <= kMaxWork)) c.bad = true; }
+    else if (u->kind == kUpBank) { u->flags = GetU8(&c); u->no = GetU32(&c); u->slot = GetU32(&c); if (u->flags < kBankDeposit || u->flags > kBankAsk || u->slot > kMaxBank || (u->flags != kBankAsk && u->slot == 0)) c.bad = true; }
     else if (u->kind == kUpWorkState) { u->flags = GetU8(&c); GetStr(&c, &u->name, kMaxName); u->rel = GetF32(&c); if (u->flags > 1 || !(u->rel >= 0.0f && u->rel <= 1.0f)) c.bad = true; }
     else if (u->kind != kUpLeave && u->kind != kUpDisband && u->kind != kUpAsk) return false;
     return !c.bad && c.at == n;
@@ -984,7 +993,8 @@ struct Down
     float work;                                          // WORK (fromSlot: the worker)
     unsigned workIdle;                                   // WORK STATE (fromSlot: the member)
     std::string workTech; float workFrac;                // WORK STATE: its current tech and progress (0..1)
-    Down() : work(0.0f), workIdle(0), workFrac(0.0f), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
+    unsigned bankOp, bankTxn, bankBalance;               // BANK (result, fromSlot = the player it was for)
+    Down() : bankOp(0), bankTxn(0), bankBalance(0), work(0.0f), workIdle(0), workFrac(0.0f), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
 };
 /* the table as the games see it: profile ids turned into slots (slotOf: profile id -> slot; a player with no slot is skipped) */
 inline std::vector<WireTeam> ToWire(const Book& b, const std::map<std::string, unsigned>& slotOf)
@@ -1036,6 +1046,18 @@ inline bool EncodeWorkDown(std::vector<char>* b, unsigned fromSlot, float amount
 { b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kDnWork); PutU32(b, fromSlot); PutF32(b, amount); return true; }
 inline bool EncodeWorkStateDown(std::vector<char>* b, unsigned fromSlot, bool idle, const std::string& tech, float frac)
 { b->clear(); if (!(frac >= 0.0f && frac <= 1.0f) || tech.size() > kMaxName) return false; PutU8(b, kDnWorkState); PutU32(b, fromSlot); PutU8(b, idle ? 1u : 0u); PutStr(b, tech); PutF32(b, frac); return true; }
+inline bool EncodeBankDown(std::vector<char>* b, unsigned op, unsigned txn, unsigned result, unsigned bySlot, unsigned balance)
+{ b->clear(); if (op < kBankDeposit || op > kBankAsk || result > kBankBad || balance > kMaxBank) return false; PutU8(b, kDnBank); PutU8(b, op); PutU32(b, txn); PutU8(b, result); PutU32(b, bySlot); PutU32(b, balance); return true; }
+/* the server's decision for one BANK request on a team's balance (pure: the caller saves before it answers) */
+inline unsigned BankDecide(unsigned balance, unsigned op, unsigned amount, unsigned* after)
+{
+    *after = balance;
+    if (op == kBankAsk) return kBankOk;
+    if (amount == 0 || amount > kMaxBank) return kBankBad;
+    if (op == kBankDeposit) { if (amount > kMaxBank - balance) return kBankFull; *after = balance + amount; return kBankOk; }
+    if (op == kBankWithdraw) { if (amount > balance) return kBankShort; *after = balance - amount; return kBankOk; }
+    return kBankBad;
+}
 inline bool DecodeDown(const char* p, size_t n, Down* d)
 {
     if (d == 0) return false;
@@ -1071,6 +1093,7 @@ inline bool DecodeDown(const char* p, size_t n, Down* d)
     }
     else if (d->kind == kDnResearch) { d->resTeam = GetU32(&c); d->resWhole = GetU8(&c); d->resBy = GetU32(&c); if (d->resWhole > 1) c.bad = true; GetTechs(&c, &d->techs); }
     else if (d->kind == kDnWork) { d->fromSlot = GetU32(&c); d->work = GetF32(&c); if (!(d->work > 0.0f && d->work <= kMaxWork)) c.bad = true; }
+    else if (d->kind == kDnBank) { d->bankOp = GetU8(&c); d->bankTxn = GetU32(&c); d->result = GetU8(&c); d->fromSlot = GetU32(&c); d->bankBalance = GetU32(&c); if (d->bankOp < kBankDeposit || d->bankOp > kBankAsk || d->result > kBankBad || d->bankBalance > kMaxBank) c.bad = true; }
     else if (d->kind == kDnWorkState) { d->fromSlot = GetU32(&c); d->workIdle = GetU8(&c); GetStr(&c, &d->workTech, kMaxName); d->workFrac = GetF32(&c); if (d->workIdle > 1 || !(d->workFrac >= 0.0f && d->workFrac <= 1.0f)) c.bad = true; }
     else return false;
     return !c.bad && c.at == n;
@@ -1180,6 +1203,7 @@ inline std::string BookFile(const Book& b)
         if (b.teams[t].rec.seeded || !b.teams[t].rec.rows.empty() || !b.teams[t].rec.stances.empty())
         { std::vector<char> blob; EncodeRec(b.teams[t].rec, &blob); s += "R " + U(b.teams[t].no) + " " + HexV(blob) + "\n"; }
         for (size_t k = 0; k < b.teams[t].research.size(); ++k) s += "Q " + U(b.teams[t].no) + " " + Hex(b.teams[t].research[k]) + "\n";
+        if (b.teams[t].bank != 0) s += "B " + U(b.teams[t].no) + " " + U(b.teams[t].bank) + "\n";
         for (size_t m = 0; m < b.teams[t].members.size(); ++m)
         {
             const Member& x = b.teams[t].members[m];
@@ -1281,6 +1305,14 @@ inline bool BookParseLine(const std::string& raw, Book* b, int* why = 0)
                 if (why != 0) *why = kLineOk;
                 return true;
             }
+        return false;
+    }
+    if (tag == "B")
+    {
+        unsigned no = 0, bal = 0;
+        if (!(is >> no >> bal) || bal > kMaxBank) return false;
+        for (size_t k = 0; k < b->loadRefused.size(); ++k) if (b->loadRefused[k] == no) return false;
+        for (size_t t = 0; t < b->teams.size(); ++t) if (b->teams[t].no == no) { b->teams[t].bank = bal; if (why != 0) *why = kLineOk; return true; }
         return false;
     }
     if (tag == "Q")

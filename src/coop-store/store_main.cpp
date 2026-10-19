@@ -175,7 +175,7 @@
 
 namespace {
 
-const unsigned int kProtocol = 99;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 100;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_HOST_TOKEN = 68, MSG_KEPT = 69 };   /* KEPT (69) - src/common/keptwire.h */   /* AUTH_CHALLENGE / AUTH_PROOF / STEAM_ID / HOST_TOKEN (65-68) - src/common/authproof.h */   /* FALLEN (61) - src/common/fallenwire.h */   /* T-546 step 3 (protocol 72): TEAM (60) - src/common/teamwire.h */   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* 50 is unused (REPAIR, the world repair removed in T-716) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi} (the stamp: the writtenAt of the write it answers), sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
 typedef char T581OwedNumbersAgree[(MSG_OWED == (int)owedpop::kMsgOwed && kProtocol == owedpop::kProtocol) ? 1 : -1];   /* T-581: a compile error here = owedpop.h and this file disagree */
 typedef char TownLossNumbersAgree[(MSG_TOWN_LOSS == (int)townrefill::kMsgTownLoss && kProtocol == townrefill::kProtocol) ? 1 : -1];   /* a compile error here = townrefill.h and this file disagree */
@@ -7203,6 +7203,32 @@ void OnTeam(ENetPeer* from, const std::vector<char>& payload)
         for (size_t i = 0; i < ids.size(); ++i) { if (ids[i] == me) continue; ENetPeer* p = PeerOfProfile(ids[i]); if (p != 0) { SendMsg(p, MSG_TEAM, b); ++sent; } }
         if (++g_teamWorkStates <= 5 || g_teamWorkStates % 200 == 0)
             Log("TEAM research " + std::string(u.flags ? "IDLE" : "running") + " at " + TeamSlotText(me) + " told to " + N((long long)sent) + " teammate(s) (workStates=" + N(g_teamWorkStates) + ")");
+    }
+    else if (u.kind == swteam::kUpBank)
+    {
+        /* SW Bank: the team's shared cats. The server decides and saves first, then answers the sender and tells every other
+           connected member the new balance. A deposit's cats already left the sender's purse: a refusal refunds them there. */
+        const int t = swteam::TeamOf(g_team, me);
+        unsigned after = 0, r = swteam::kBankNoTeam;
+        swteam::Book next = g_team;
+        if (t >= 0)
+        {
+            r = swteam::BankDecide(next.teams[t].bank, u.flags, u.slot, &after);
+            if (r == swteam::kBankOk && after != next.teams[t].bank) { next.teams[t].bank = after; if (!TeamCommit(&next)) r = swteam::kBankNotSaved; }
+        }
+        const unsigned bal = t >= 0 ? g_team.teams[t].bank : 0;
+        std::vector<char> b;
+        if (swteam::EncodeBankDown(&b, u.flags, u.no, r, TeamWireSlot(me), bal)) SendMsg(from, MSG_TEAM, b);
+        static const char* kOp[] = { "?", "deposit", "withdraw", "balance" };
+        static const char* kRes[] = { "ok", "no team", "not enough in the bank", "bank full", "not saved", "bad request" };
+        Log("BANK " + std::string(kOp[u.flags <= 3 ? u.flags : 0]) + " " + N((long long)u.slot) + " by " + TeamSlotText(me) + " (txn " + N((long long)u.no) + "): "
+            + std::string(kRes[r <= 5 ? r : 5]) + (t >= 0 ? " - team " + N((long long)g_team.teams[t].no) + " balance " + N((long long)bal) : std::string()));
+        if (t < 0 || r != swteam::kBankOk || u.flags == swteam::kBankAsk) return;
+        std::vector<std::string> ids(1, g_team.teams[t].founder);
+        for (size_t m = 0; m < g_team.teams[t].members.size(); ++m) ids.push_back(g_team.teams[t].members[m].id);
+        std::vector<char> st;
+        if (!swteam::EncodeBankDown(&st, swteam::kBankAsk, 0, swteam::kBankOk, TeamWireSlot(me), bal)) return;
+        for (size_t i = 0; i < ids.size(); ++i) { if (ids[i] == me) continue; ENetPeer* p = PeerOfProfile(ids[i]); if (p != 0) SendMsg(p, MSG_TEAM, st); }
     }
     else if (u.kind == swteam::kUpRestoreDone)
     {

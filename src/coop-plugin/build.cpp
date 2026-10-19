@@ -80,6 +80,7 @@
 //                          first own player character (+30,0 by default); refused while zone+0xA8 is set.
 //   progress <sub> <amt>   vt+0x230(b, amt) - the engine's path, so the progress hook fires.
 //   dismantle <sub>        vt+0x248(b, FLT_MAX) - what confirmDismantle does.
+#include "bank.h"
 #include "build.h"
 #include "farm.h"           /* par16: farms ride this channel (MSG_BUILD kinds 6 / 7) */
 #include "addresses.h"      /* the five names below come from the address table */
@@ -2874,6 +2875,12 @@ void detour_order(void* pi, void* indoors, void* task, void* subject, void* shif
                     t, inCommit != 0 ? "the placement commit's own build order" : "a click", g_orderSkipped, g_orderBlocked);
         BdLogCapped(line);
         return;
+    }
+    /* SW Bank: any order other than build / add-materials / repair / dismantle on the ATM building opens the bank box instead */
+    if (subject != 0 && !coopbuild::BuildTaskGated(t) && BdOnMain() != 0)
+    {
+        char sid[128]; BdSidOf(subject, sid, (int)sizeof(sid));
+        if (BankIsAtm(sid)) { BankOpen(); return; }
     }
     orig_order(pi, indoors, task, subject, shift, addDontClear, location);
 }

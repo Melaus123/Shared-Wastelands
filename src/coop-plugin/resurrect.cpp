@@ -806,6 +806,9 @@ void Reconcile(int gen)
 }
 
 } // namespace
+/* SW Bank (bank.cpp): the purse, read and taken from / given to through the same pointer the bring-back fee uses */
+int BankPurseMoney() { int m = -1; void* o = PursePod(); return (o != 0 && PurseMoneyPod(o, &m) == 1) ? m : -1; }
+int BankPurseTake(int amount) { void* o = PursePod(); return o != 0 ? PurseTakePod(o, amount) : -1; }
 
 void ResurrectSaveFinished(const std::string& saveName)
 {
