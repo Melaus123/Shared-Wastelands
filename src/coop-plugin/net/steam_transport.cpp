@@ -68,6 +68,8 @@
 #include "../coop_log.h"
 #include "../../common/relaysplit.h"
 #include "../../common/steamlisten.h"
+#include "../../common/typetally.h"   /* what each link carried, by message type - the [NET] TRAFFIC REPORT line */
+#include "../config.h"   /* ConfigNetRateLog (TEST ONLY) */
 
 #include <cstddef>
 #include <cstdio>
@@ -629,7 +631,7 @@ public:
           sent_(0), recv_(0), bytesOut_(0), bytesIn_(0), connectGen_(0), nextPeerId_(1), peerId_(0), ping_(0),
           steamPending_(0), queueBytes_(0), dialMs_(0), upMs_(0), lastRecvMs_(0), relayed_(0), endReason_(0), maxState_(0), endedConn_(0),
           timeoutConnectedMs_(kTimeoutConnectedMs), nEvents_(0), registered_(false), rate_(kSendRateBytes), rateNextMs_(0), rateFrozen_(false),
-          rateLogged_(0), p2p_(false), remoteKind_(0), remoteId64_(0)
+          rateLogged_(0), p2p_(false), remoteKind_(0), remoteId64_(0), rateLogMs_(0), tallyLink_(nettally::kLinkSession)
     {
         endText_[0] = 0;
         EnsureLock();
@@ -843,9 +845,11 @@ public:
                 return false;
             }
             CountSent(frameBytes, msgs.size());   /* an unreliable frame counts as sent only once Steam took it */
+            nettally::CountOut(tallyLink_, (unsigned int)type, frameBytes);
             return true;
         }
         CountSent(frameBytes, msgs.size());   /* a reliable frame counts when queued: it is retried, never dropped, while the link lives */
+        nettally::CountOut(tallyLink_, (unsigned int)type, frameBytes);
         for (size_t i = 0; i < msgs.size(); ++i)
         {
             queueBytes_ += (long long)msgs[i].size();
@@ -869,6 +873,8 @@ public:
     LinkState   State() const { return state_; }
     BackendId   Backend() const { return BACKEND_STEAM; }
     const char* BackendName() const { return "steam"; }
+    void SetStoreLink() { if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* counted as the world link; nothing else changes on Steam */
+    void SetTrafficLink(int link) { tallyLink_ = link; }   /* the [NET] TRAFFIC REPORT line this link is counted on - see transport.h */
     unsigned int PeerCount() const { return state_ == LINK_UP ? 1u : 0u; }
     bool CurrentPeerId(unsigned int* out) const
     {
@@ -1358,6 +1364,9 @@ private:
         out->push_back(msg);
         ++recv_; ++g_stats.recv;
         bytesIn_ += frame.size(); g_stats.bytesIn += (long long)frame.size();
+        nettally::CountIn(tallyLink_, (unsigned int)(unsigned char)frame[0], frame.size());
+        if (tallyLink_ != nettally::kLinkSession && (unsigned int)(unsigned char)frame[0] == nettally::kTypeLive)   /* 53 is a LIVE envelope only toward the world server */
+            nettally::CountLiveIn(tallyLink_, tallyLink_ == nettally::kLinkWorld, &frame[0] + 5, frame.size() - 5);
         return true;
     }
 
@@ -1403,6 +1412,24 @@ private:
         steamPending_ = (long long)st.pendingUnreliable + (long long)st.pendingReliable + (long long)st.sentUnackedReliable;
         NoteQueued();
         StepRate(st);
+        RateLog(st);
+    }
+
+    /* TEST ONLY (netratelog=1; absent = off): once a second per link, what Steam reports for it beside this link's own rate and queue,
+       so a bench sees real Steam numbers. Reads only. Integers only: q = quality x100 (-100 = Steam cannot say yet). */
+    void RateLog(const SnRealTimeStatus& st)
+    {
+        if (ConfigNetRateLog() == 0) return;
+        const DWORD now = ::GetTickCount();
+        if (rateLogMs_ != 0 && now - rateLogMs_ < 1000u) return;
+        rateLogMs_ = (now == 0) ? 1 : now;
+        char b[384];
+        _snprintf(b, sizeof(b) - 1, "[net] RATE link=%s peer=%u rate=%d steamRate=%d outBps=%d inBps=%d ping=%d qL=%d qR=%d pendRel=%d pendUnrel=%d"
+                  " unacked=%d queueUs=%lld ownQ=%lld", nettally::LinkName(tallyLink_), peerId_, rate_, st.sendRateBytesPerSecond,
+                  (int)st.outBytesPerSec, (int)st.inBytesPerSec, st.ping, (int)(st.qualityLocal * 100.0f), (int)(st.qualityRemote * 100.0f),
+                  st.pendingReliable, st.pendingUnreliable, st.sentUnackedReliable, st.queueTimeUsec, queueBytes_);
+        b[sizeof(b) - 1] = 0;
+        DebugLog(b);
     }
 
     /* Owner decision 594: once a second while the link is UP the send rate follows Steam's live delivery quality and the data waiting
@@ -1497,6 +1524,8 @@ private:
     bool         p2p_;           /* this link's connection is Steam P2P (relay only), not the relay test's plain UDP or socket pair */
     int          remoteKind_;    /* the remote identity's type at UP (kIdentitySteamId, kIdentityIpAddress, 0 none) */
     unsigned long long remoteId64_;   /* the remote's Steam id at UP when it is one: for the host's allow / block rules, never logged */
+    DWORD        rateLogMs_;     /* TEST ONLY netratelog: GetTickCount of this link's last [net] RATE line; 0 = none yet */
+    int          tallyLink_;     /* nettally::kLink*: the [NET] TRAFFIC REPORT line this link is counted on (SetStoreLink, SetTrafficLink) */
 };
 
 /* ---- the Steam listener: many links on one listen socket ---- */
@@ -1632,6 +1661,7 @@ public:
         if (SteamProbeSockets() == 0) { Stop(NoSteamWhy("another Steam call in this game faulted")); return false; }   /* no Steam call after any fault */
         const unsigned int h = table_.handle[s];
         SteamTransport* t = new SteamTransport();
+        t->SetTrafficLink(nettally::kLinkBridge);   /* a listener's links are the bridge's */
         if (t->Stopped())   /* the link registry is full */
         {
             delete t;
@@ -1862,6 +1892,7 @@ private:
         if (verdict == steamlisten::kArriveAccept)
         {
             t = new SteamTransport();
+            t->SetTrafficLink(nettally::kLinkBridge);   /* a listener's links are the bridge's */
             if (t->Stopped()) { delete t; t = 0; verdict = steamlisten::kArriveNoRoom; }   /* the link registry is full */
         }
         if (t == 0) { Refuse(h, verdict, events); return; }

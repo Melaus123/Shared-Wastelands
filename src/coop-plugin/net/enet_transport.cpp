@@ -18,6 +18,8 @@
 #define ENET_IMPLEMENTATION_NOT_USED  // (ENet has no header-only mode; sources are compiled separately)
 #include "../third_party/enet/include/enet/enet.h"
 #include "../../common/sendbound.h"   /* M16 (T-197): what waits to be sent on this link is bounded */
+#include "../../common/typetally.h"   /* what each link carried, by message type - the [NET] TRAFFIC REPORT line */
+#include "../config.h"   /* ConfigBenchCapKbs (TEST ONLY) */
 #include "../../common/sendbundle.h"   /* M13: what is handed to ENet for the world server during one pass leaves as one packet per lane */
 #include "steam_transport.h"   /* the factory's Steam backend */
 
@@ -61,7 +63,7 @@ public:
     EnetTransport()
         : host_(0), peer_(0), state_(LINK_DOWN), sent_(0), recv_(0),
           nextPeerId_(1), hosting_(false), connectGen_(0), tLimit_(0), tMinMs_(0), tMaxMs_(0),
-          sbDirect_(0), sbWaited_(0), sbCoalesced_(0), sbEpisodes_(0), sbDropped_(0), sbSendFailed_(0), sbWaitMax_(0), liveDir_(coopsb::kDirNoLive),
+          sbDirect_(0), sbWaited_(0), sbCoalesced_(0), sbEpisodes_(0), sbDropped_(0), sbSendFailed_(0), sbWaitMax_(0), liveDir_(coopsb::kDirNoLive), tallyLink_(nettally::kLinkSession),
           bundle_(false), bnSendFailed_(0), bnRecvBundles_(0), bnRecvBundled_(0), bnRecvBad_(0), bnLinksOn_(0), udpPackets_(0), udpBytes_(0), bytesOut_(0), bytesIn_(0)
     {
     }
@@ -88,6 +90,7 @@ public:
             state_ = LINK_FAILED;
             return false;
         }
+        BenchCap();
         state_    = LINK_LISTENING;
         hosting_  = true;
         DebugLog("[net] hosting on port " + N(port) + " (direct/ENet)");
@@ -106,6 +109,7 @@ public:
             state_ = LINK_FAILED;
             return false;
         }
+        BenchCap();
 
         ENetAddress addr;
         if (enet_address_set_host(&addr, address.c_str()) != 0)
@@ -259,6 +263,7 @@ public:
     bool Send(unsigned int /*peer*/, MsgType type, const char* data, size_t len, Channel ch)
     {
         if (host_ == 0 || peer_ == 0 || state_ != LINK_UP) return false;
+        nettally::CountOut(tallyLink_, (unsigned int)type, kHeaderBytes + len);   /* what this link was handed, by type (sent now or waiting) */
 
         std::vector<char> buf(kHeaderBytes + len);
         buf[0] = (char)(unsigned char)type;
@@ -424,7 +429,18 @@ public:
     }
     /* sendBound[waitNow,waitBytesNow,waitMax,netQueued,netBytes,direct,waited,coalesced,episodes,droppedAtClose,sendFailed] - see sendbound.h;
        waitMax = the most waiting since the previous REPORT; netQueued/netBytes = what ENet holds for this link now. */
-    void SetStoreLink() { liveDir_ = coopsb::kDirUp; }   /* M16 fold 2: see transport.h */
+    void SetStoreLink() { liveDir_ = coopsb::kDirUp; if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* M16 fold 2: see transport.h */
+    void SetTrafficLink(int link) { tallyLink_ = link; }   /* the [NET] TRAFFIC REPORT line this link is counted on - see transport.h */
+    /* TEST ONLY (benchcapkbs=<n>; absent = off): ENet's own bandwidth limit, <n> KB/s (1000 bytes) in and out, on the host made just
+       now, so a bench can see a game on a slow line. ENet paces what it sends and tells the far end what it may send here. */
+    void BenchCap()
+    {
+        const int kbs = ConfigBenchCapKbs();
+        if (host_ == 0 || kbs <= 0) return;
+        enet_host_bandwidth_limit(host_, (enet_uint32)kbs * 1000u, (enet_uint32)kbs * 1000u);
+        DebugLog("[net] TEST ONLY: benchcapkbs=" + N((long long)kbs) + " - ENet's bandwidth limit on this " + std::string(nettally::LinkName(tallyLink_))
+                 + " link is " + N((long long)kbs) + " KB/s in and out");
+    }
     std::string SendBoundToken()
     {
         const long long wm = sbWaitMax_; sbWaitMax_ = box_.Count();
@@ -574,6 +590,8 @@ private:
                 if (es[i].len) e.payload.assign(body + es[i].at, body + es[i].at + es[i].len);
                 out->push_back(e);
                 ++recv_;
+                nettally::CountIn(tallyLink_, es[i].type, kHeaderBytes + es[i].len);   /* each message of a bundle, as if it came alone */
+                if (es[i].type == nettally::kTypeLive) nettally::CountLiveIn(tallyLink_, true, body + es[i].at, es[i].len);
             }
             return;
         }
@@ -586,6 +604,9 @@ private:
                              (const char*)p->data + kHeaderBytes + declared);
         out->push_back(m);
         ++recv_;
+        nettally::CountIn(tallyLink_, (unsigned int)p->data[0], kHeaderBytes + (size_t)declared);
+        if (liveDir_ == coopsb::kDirUp && (unsigned int)p->data[0] == nettally::kTypeLive)   /* 53 is a LIVE envelope on a link to the world server only */
+            nettally::CountLiveIn(tallyLink_, true, (const char*)p->data + kHeaderBytes, (size_t)declared);
     }
 
     ENetHost* host_;
@@ -601,6 +622,7 @@ private:
     SbNetQ netq_;          /* M16: what ENet still holds for this link (its packet free callback keeps it) */
     long long sbDirect_, sbWaited_, sbCoalesced_, sbEpisodes_, sbDropped_, sbSendFailed_, sbWaitMax_;
     int liveDir_;   /* M16 fold 2: coopsb::kDirUp on the world-server link (SetStoreLink), kDirNoLive on the session link */
+    int tallyLink_; /* nettally::kLink*: the [NET] TRAFFIC REPORT line this link is counted on (SetStoreLink, SetTrafficLink) */
     bool bundle_;                  /* M13: bundling is on for the connection up now (SetBundling) */
     coopbundle::Collector col_;    /* M13: the open bundle of each lane */
     coopbundle::Tally bnTally_;    /* M13: what the collector did */
@@ -610,6 +632,26 @@ private:
 };
 
 } // namespace
+
+/* When the current TRAFFIC REPORT window began: the plugin's load, then each report. */
+static DWORD s_trafficSince = ::GetTickCount();
+
+/* One [NET] TRAFFIC REPORT line per kind of link that carried a message since the last one: out and in by type (the ten with the
+   most bytes), the LIVE envelopes' inner types in, and every type's byte totals - one line per link per minute, so a player's
+   bug report carries what the links really moved. MAIN THREAD, every 60 s from TalkReportTick (speech.cpp) while a world runs;
+   the first line covers everything since the plugin loaded. */
+void TrafficReportTick()
+{
+    static nettally::Table w;
+    const DWORD now = ::GetTickCount();
+    const long long secs = (long long)((now - s_trafficSince + 500u) / 1000u);
+    s_trafficSince = now;
+    for (int link = 0; link < nettally::kLinks; ++link)
+    {
+        nettally::Take(link, &w);
+        if (!nettally::Empty(w)) DebugLog(nettally::ReportLine(link, secs, w));
+    }
+}
 
 ITransport* CreateTransport(BackendId which)
 {

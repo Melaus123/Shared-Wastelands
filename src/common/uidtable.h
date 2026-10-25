@@ -247,6 +247,22 @@ inline int NotShownOwnerAction(int uidMine)
     return uidMine ? kNsOwnerCounted : kNsOwnerNotMine;
 }
 
+/* I. WHICH CHARACTER THE WORLD SWEEP ADOPTS FIRST (worldsync.cpp WorldSyncTick).  The sweep adopts the same characters whether
+   or not another player is in this world - this game's own player-faction characters and the world's people alike; only the
+   SPAWN waits for a game that can receive it.  Own characters before world characters, the nearest of each kind first: after a
+   world load every own character is uid 0 until the sweep reaches it, and a death in that window is dropped. */
+enum { kSweepPickNone = 0, kSweepPickOwn = 1, kSweepPickOther = 2 };
+inline int SweepPick(int haveOwn, int haveOther)
+{
+    return haveOwn ? kSweepPickOwn : (haveOther ? kSweepPickOther : kSweepPickNone);
+}
+/* The once-per-world-load line, asked when the sweep finds nothing left to adopt: due once, and only after it adopted something
+   in this world load (a sweep tick before the world's characters exist finds nothing too). */
+inline int SweepLoadLineDue(long long adoptedThisLoad, int loggedThisLoad)
+{
+    return (adoptedThisLoad > 0 && !loggedThisLoad) ? 1 : 0;
+}
+
 }   /* namespace coopuid */
 
 #endif

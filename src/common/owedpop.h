@@ -14,7 +14,8 @@
 // - EXACTLY ONCE: a row is made only by the game the world server has GIVEN it to. A game whose town check-up finds it holds the
 //   area with the zone live asks for the row (CLAIM); the world server gives it to the first asker and to nobody else while that
 //   game keeps it; the game hands it back (RELEASE) the moment it no longer holds the area with the zone live, and a game that
-//   disconnects loses every row it held. Every game hears every row with "yours" / "another game's" / "nobody's".
+//   disconnects loses every row it held - once its own release hold (RowHoldDecide, 60 s) runs out with that player still away
+//   (T-630: a link close alone releases nothing). Every game hears every row with "yours" / "another game's" / "nobody's".
 // - DONE: the row leaves the table. From the game holding it: made, gone (the building no longer exists) or fault (the engine
 //   call faulted). Gone, fault and empty hand the row back and are tried again, 5 minutes apart; the third of a kind removes it. From ANY game: has (that game's engine shows the residents / the bar crowd already there).
 //   Every game hears GONE and forgets its own copy of the work.
@@ -45,7 +46,7 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 101;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 108;   /* the world-server protocol that carries OWED */
 
 
 
@@ -264,6 +265,34 @@ inline std::vector<std::string> TablePeerGone(Table* t, int who)
     if (who <= 0) return out;
     for (Table::iterator it = t->begin(); it != t->end(); ++it) if (it->second.claimant == who) { it->second.claimant = 0; out.push_back(it->first); }
     return out;
+}
+// T-630: A LINK CLOSE IS NOT A LEAVE. The rows a closed game held - its owed rows, and on the world server its kept-row claims and
+// unsaved holder lays - stay its own through THEIR OWN RELEASE HOLD, keyed by its permanent slot: kRowHoldSec, the world server's
+// kRestoreGraceSec (60 s: a game re-dials about every 17 s, so it covers three tries; the 10 s PLAYER_GONE hold, peergone.h, does not
+// cover one and is not this hold). The same player admitted again within it - a re-dial, an eviction's new connection, a restarted
+// game of the same profile - keeps them (rows are kept by slot + 1); past it with the player still away they are released
+// (RowHoldApply: TablePeerGone). The world server decides it at the admission (RowHoldReturned) and on its 1 Hz tick (RowHoldTick).
+// A slot is given only at admission, with the player id, so every close of a game that may hold rows starts a hold.
+const double kRowHoldSec = 60.0;   /* = store_main.cpp kRestoreGraceSec */
+const int kRowHoldWait = 0, kRowHoldRelease = 1, kRowHoldKeep = 2;
+inline int RowHoldDecide(double closedAt, double now, double holdSec, int admittedAgain)
+{
+    if (admittedAgain != 0) return kRowHoldKeep;
+    return (now - closedAt >= holdSec) ? kRowHoldRelease : kRowHoldWait;
+}
+// the hold's verdict applied to the table: released (the keys returned) only for kRowHoldRelease
+inline std::vector<std::string> RowHoldApply(Table* t, int who, int act)
+{
+    if (act != kRowHoldRelease) return std::vector<std::string>();
+    return TablePeerGone(t, who);
+}
+// the rows `who` (slot + 1) holds - named on the close's line while they wait for the hold
+inline size_t TableHeldBy(const Table& t, int who)
+{
+    size_t n = 0;
+    if (who <= 0) return n;
+    for (Table::const_iterator it = t.begin(); it != t.end(); ++it) if (it->second.claimant == who) ++n;
+    return n;
 }
 // the claim field one receiving game is told for a row
 inline int ClaimFor(int claimant, int recipient)

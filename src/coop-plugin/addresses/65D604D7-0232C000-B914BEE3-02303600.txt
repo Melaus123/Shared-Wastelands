@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 531
+!count 557
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -76,10 +76,12 @@ Building_prepareLevel                        code 005516B0 005516B0 405355565741
 BuildingGetTown                                code 000F6BE0 000F6BE0 40534883EC20488BD90F1F8000000000
 BuildingInteriorKeep                           code 00561AB0 00561AB0 48895C2420554883EC20488B19488BE9
 BuildingInterior_toggleLoaded                    code 00561750 00561750 40574883EC20488BF984D2754233D248
+BuildingSwapPick                               code 007F3BD0 007F3BD0 48895C2410555657415441554883EC20
 BuildingSquadState                             code 0057E760 0057E760 4885C90F84BC020000488BC455574154
 BuyItem                                        code 00749AF0 00749AF0 40555657415441554881EC0001000048
 CageUseStart                                   code 00357FE0 00357FE0 48895C2418554883EC40488BEA488BD9
 ChangeSlaveOwner                               code 0032E3F0 0032E3F0 40554883EC30488B8128030000488BE9
+CharacterLimit                                 var  02132EF0 02132EF0 -
 Character_getBrain                                code 00268690 00268690 488B8150060000C3CCCCCCCCCCCCCCCC
 Character_getCombat                       code 005C8820 005C8820 488B8148060000488B4008C3CCCCCCCC
 Character_currentMoveSpeed                     code 005C7940 005C7940 40534883EC20488BD9E8BC30A5FF84C0
@@ -542,3 +544,27 @@ PowerBatteryCharge                             code 00299460 00299460 40534883EC
 ProductionUpdateInputs                         code 0029A330 0029A330 488BC455415441554883EC604533ED44
 OrdersReceiver_resetOrders                     code 00506AA0 00506AA0 40534883EC2048896C243033ED48C741
 OrdersReceiver_dropStandingJobs                code 005067F0 005067F0 48895C2410574883EC2033DB488BF939
+PreviewTownOwnerTest                           code 004DB212 004DB212 4839985002000074074C89BE90000000
+BuildPreviewCreate                             code 004E0BD0 004E0BD0 405556574154415541564157488D6C24
+BuildPreviewDestroy                            code 004D2CC0 004D2CC0 4889742420574883EC30488BF233D248
+BuildPreviewListGlobal                         var  0212CE38 0212CE38 -
+BuildPreviewListGuard                          var  0212CE44 0212CE44 -
+PlacementTownPickCall                          code 004D63C9 004D63C9 E8338DB7FF488BD8488B0558D2C50148
+PlacementGroupTownTest                         code 004DA8A3 004DA8A3 4883B8500200000074074C8BAF900000
+FoliageTownOwnerTest                           code 006D229E 006D229E 4883B950020000007534F30F104848F3
+OrdersReceiver_removeJob                       code 00506870 00506870 4883EC284C8BC985D2786F3B91900000
+OrdersReceiver_setJobMode                      code 00507780 00507780 48895C240848896C2410488974241857
+TaskBuildBody                                  code 0034A3E0 0034A3E0 488BC455574154488D68A14881ECF000
+TaskAddMaterialsBody                           code 00348810 00348810 488BC455565741544155415641574881
+WallHitByMelee                                 code 0029D520 0029D520 48895C2410574883EC50488B01498BF8
+JobFinderFactionTest                           code 009A5A64 009A5A64 483BD80F8565010000488B4528488D56
+BuildingBuyTeardownCall                        code 007ACF15 007ACF15 E8FAF188FF4533C0498D5558488B0D40
+TownMoveGround                                 code 009B2840 009B2840 4533C0E9AEEF66FFCCCCCCCCCCCCCCCC
+TownMoveRegion                                 code 008F47E0 008F47E0 F30F10024C8BDC4C8BC9F30F580502AD
+TownMoveRegionMgr                              var  02133098 02133098 -
+TownAddArea                                    code 0092C860 0092C860 4889542410534883EC308B81D8000000
+PhysicsThreadedBaseDtor                        code 007DC1F0 007DC1F0 40534883EC20488B5908488D057714F0
+ZoneManager_resetPopulation                    code 009FCC30 009FCC30 40534883EC40488B05F3697301488BD9
+LevelEditor_setVisible                         code 0077B350 0077B350 488BC45557415441554156488DA8E8FE
+Character_moveToNewSquad                       code 005CDA50 005CDA50 48896C242041544883EC30440FB6E248
+ActivePlatoon_specialToNewSquads               code 0079B620 0079B620 488BC4554154415541564157488BEC48

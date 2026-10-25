@@ -200,6 +200,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     if (!g_firstFrameLogged)
     {
         g_firstFrameLogged = true;
+#ifdef SW_DEV_BUILD   /* T-879 F: P001 is a DEV probe - its line is the test build's only */
         std::stringstream ss;
         ss.imbue(std::locale::classic());
         ss << "[P001] first main-loop frame. this=" << fmtPtr(thisptr)
@@ -207,6 +208,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
            << (thisptr == coop::GameWorldPtr() ? " (this==ou)" : " (this!=ou)")
            << " threadId=" << fmtNum((long long)::GetCurrentThreadId());
         DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
     }
 
     /* tickwait: the engine's own AI-worker wait FIRST - nothing of ours below may overlap the previous AI pass */
@@ -238,6 +240,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::PoseApplyTick();    // POSE: copies take their owners' bed / replayed action, and are held still while posed
     coop::InteriorKeepTick(); /* P25: a building the other player's copy stands in keeps its inside loaded here (the engine's own keep call) */
 
+#ifdef SW_DEV_BUILD   /* T-879 A: the [P001] heartbeat is the test build's only (P001 answered, F040/F045); g_frames stays - it is the pump's count */
     // heartbeat: ~every 5s at 60fps, cheap enough to leave in during the probe
     if (g_frames % 300 == 0)
     {
@@ -246,6 +249,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
            << " dt=" << fmtNum((long long)(time * 1000.0f)) << "ms";
         DebugLog(ss.str());
     }
+#endif
 
     orig_mainLoop(thisptr, time);
 
@@ -256,6 +260,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::TagsTick();
     coop::PlayersTabTick();   /* T-545: other players' factions made known; the PLAYERS tab's table kept current while it shows */
     coop::FallenTabTick();    /* T-556: the FALLEN tab after PLAYERS, kept current while it shows; a confirmed bring-back runs */
+    coop::UiEditorResetTick();   /* the Level Editor's Reset Population: greyed with its hover note in a multiplayer world */
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
     coop::MoneyTick();        /* T-810: money between players - given back, added, acknowledged, sent once on disk */
@@ -270,9 +275,11 @@ static void installProbeP001()
 
     intptr_t target = (intptr_t)coop::AddrAbs(kMig3MainLoopGpu);
 
+#ifdef SW_DEV_BUILD   /* T-879 F: P001 - the hook target line is the test build's only */
     std::stringstream ss;
     ss << "[P001] hook target mainLoop_GPUSensitiveStuff = " << fmtPtr((void*)target);
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
 
     if (target == 0)
     {
@@ -283,7 +290,7 @@ static void installProbeP001()
     coop::HookStatus st =
         coop::AddHook((void*)target, (void*)&detour_mainLoop, (void**)&orig_mainLoop);
 
-    DebugLog(st == coop::SUCCESS ? "[P001] AddHook SUCCESS" : "[P001] AddHook FAILED");
+    SW_DEVLOG_OR_FAIL(st != coop::SUCCESS, st == coop::SUCCESS ? "[P001] AddHook SUCCESS" : "[P001] AddHook FAILED");   /* T-879 F: a failure in both builds */
 }
 // PROBE-END: P001
 
@@ -299,10 +306,12 @@ static void installProbeP001()
 static void (*orig_initGameData)(GameWorld*) = 0;
 static void detour_initGameData(GameWorld* thisptr)
 {
+#ifdef SW_DEV_BUILD   /* T-879 A: P002 answered (F033/F046) - the test build's only */
     std::stringstream ss;
     ss << "[P002] initialisationGameData ENTERED. this=" << fmtPtr(thisptr)
        << " threadId=" << fmtNum((long long)::GetCurrentThreadId());
     DebugLog(ss.str());
+#endif
 
     orig_initGameData(thisptr);
 
@@ -315,9 +324,11 @@ static void installProbeP002()
     SW_DEVLOG("[P002] resolving initialisationGameData via the address table...");
     intptr_t target = (intptr_t)coop::AddrAbs(kMig3InitGameData);
 
+#ifdef SW_DEV_BUILD   /* T-879 F: P002 - the hook target line is the test build's only */
     std::stringstream ss;
     ss << "[P002] hook target initialisationGameData = " << fmtPtr((void*)target);
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
 
     if (target == 0)
     {
@@ -327,7 +338,7 @@ static void installProbeP002()
 
     coop::HookStatus st =
         coop::AddHook((void*)target, (void*)&detour_initGameData, (void**)&orig_initGameData);
-    DebugLog(st == coop::SUCCESS ? "[P002] AddHook SUCCESS" : "[P002] AddHook FAILED");
+    SW_DEVLOG_OR_FAIL(st != coop::SUCCESS, st == coop::SUCCESS ? "[P002] AddHook SUCCESS" : "[P002] AddHook FAILED");   /* T-879 F: a failure in both builds */
 }
 // PROBE-END: P002
 
@@ -369,11 +380,13 @@ static void detour_titleUpdate(TitleScreen* thisptr)
     if (!g_titleFirstLogged)
     {
         g_titleFirstLogged = true;
+#ifdef SW_DEV_BUILD   /* T-879 F: P005 - the first-title-frame line is the test build's only */
         std::stringstream ss;
         ss << "[P005] first TitleScreen::update. this=" << fmtPtr(thisptr)
            << " ou=" << fmtPtr(coop::GameWorldPtr())
            << " threadId=" << fmtNum((long long)::GetCurrentThreadId());
         DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
     }
 
     if (g_titleFrames % 120 == 0 && TitleLineDue())
@@ -437,11 +450,13 @@ static bool installProbeP005()
     SW_DEVLOG("[P005] resolving TitleScreen::update via the address table row (or, with no usable table, the byte pattern)...");
     intptr_t target = (intptr_t)coop::AddrAbs(kMig3TitleUpdate);
 
+#ifdef SW_DEV_BUILD   /* T-879 F: P005 - the hook target line is the test build's only */
     std::stringstream ss;
     ss << "[P005] hook target TitleScreen::update = " << fmtPtr((void*)target)
        << " (row TitleScreen_update = game RVA 0x" << std::hex << std::uppercase << kMig3TitleUpdate << std::dec
        << " as AddrInit bound it from '" << coop::AddrTableName() << "' or the title pattern, + module base)";
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
 
     if (target == 0)
     {
@@ -451,7 +466,7 @@ static bool installProbeP005()
 
     coop::HookStatus st =
         coop::AddHook((void*)target, (void*)&detour_titleUpdate, (void**)&orig_titleUpdate);
-    DebugLog(st == coop::SUCCESS ? "[P005] AddHook SUCCESS" : "[P005] AddHook FAILED");
+    SW_DEVLOG_OR_FAIL(st != coop::SUCCESS, st == coop::SUCCESS ? "[P005] AddHook SUCCESS" : "[P005] AddHook FAILED");   /* T-879 F: a failure in both builds */
     return st == coop::SUCCESS;
 }
 // PROBE-END: P005

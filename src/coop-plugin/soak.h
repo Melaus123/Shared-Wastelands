@@ -39,6 +39,11 @@ void ReportSoak();
 // mirror1 fold (review-mirror1 #1): a transition-watch row goes with its uid's mirror row (returns the rows freed), and
 // every row goes at a world teardown. MAIN THREAD.
 int  SoakForgetUid(unsigned int uid);
+/* PROBE P156 BEGIN */
+// probe P156: how long before `at` (a GetTickCount value, ms) the transition watch saw uid's prone value change; -1 = never seen.
+// MAIN THREAD.
+long SoakProneAgoMs(unsigned int uid, unsigned long at);
+/* PROBE P156 END */
 void SoakWorldTeardown();
 
 // F140: the transition watch OVER-COUNTS peer disagreements. Two of B's nine transitions in

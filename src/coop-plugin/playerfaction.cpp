@@ -138,12 +138,40 @@ namespace {
 int FindStandIn(int slot) { for (int i = 0; i < kMaxStandIns; ++i) if (g_si[i].f != 0 && g_si[i].slot == slot) return i; return -1; }
 int FindStandInPtr(const ::Faction* f) { if (f == 0) return -1; for (int i = 0; i < kMaxStandIns; ++i) if (g_siPtr[i] == f) return i; return -1; }
 int FreeStandIn() { for (int i = 0; i < kMaxStandIns; ++i) if (g_si[i].f == 0) return i; return -1; }
+/* T-968: the coop-p<n> records the loaded world carries (any slot), read once per world in PlayerFactionTick's first tick of that
+   world, before the engine reads an area. Such a record enters the stand-in table only when its player is resolved
+   (ResolveStandIn, OwnerFactionForSlot(...,true)), and IsStandInFaction does not answer for it until then. MAIN THREAD. */
+const int kSavedSiCap = kMaxStandIns;
+struct SavedSi { int slot; ::Faction* f; };
+SavedSi g_savedSi[kSavedSiCap];
+int g_savedSiN = 0, g_savedSiOver = 0;
+int g_cellsMe = -1;   /* this game's slot at the last refresh: its own coop-p<n> record is left out of the cells */
+/* T-968: the foliage stub's cells (policy.cpp PolicyStandInFactions) - every other player's faction on this game: each stand-in in
+   the table, an old save's coop-peer, and each saved coop-p<n> record not of this game's slot. MAIN THREAD, at each change
+   (RegisterStandIn, the once-per-world lookup, a change of this game's slot, the world's teardown); the stub, on any thread,
+   only compares against them. */
+void StandInCellsRefresh()
+{
+    void* facs[kMaxStandIns + 1 + kSavedSiCap];
+    int n = 0;
+    for (int i = 0; i < kMaxStandIns; ++i) if (g_siPtr[i] != 0) facs[n++] = (void*)g_siPtr[i];
+    ::Faction* lp = g_legacyPeer;
+    if (lp != 0 && FindStandInPtr(lp) < 0) facs[n++] = (void*)lp;
+    const int me = coop::MySlotForWire();
+    g_cellsMe = me;
+    for (int i = 0; i < g_savedSiN; ++i)
+        if (g_savedSi[i].f != 0 && !(me >= 0 && g_savedSi[i].slot == me)) facs[n++] = (void*)g_savedSi[i].f;
+    coop::PolicyStandInFactions(facs, n);
+}
+unsigned int g_siRegistrations = 0;   /* MAIN THREAD: RegisterStandIn's calls that wrote the table (StandInRegistrations) */
 int RegisterStandIn(int slot, ::Faction* f, ::GameData* gd, const std::string& name)
 {
     int i = FindStandIn(slot); if (i < 0) i = FreeStandIn();
     if (i < 0) { ++g_tableFull; return -1; }
     g_si[i].slot = slot; g_si[i].f = f; g_si[i].gd = gd; g_si[i].name = name; g_si[i].asked = name; g_si[i].placeholder = false;
     g_siPtr[i] = f; g_anyMiss = false;   /* stand1 fold (6c) */
+    ++g_siRegistrations;
+    StandInCellsRefresh();
     return i;
 }
 std::string StandInsText()
@@ -185,6 +213,7 @@ std::string ClashFreeName(const std::string& want, int slot, ::Faction* except)
         const int rs = RelationsSetupPod(existing);   // review-p3o M1: the reuse branch needs the relations setup too (idempotent: phase1 re-sets the same fields)
         DebugLog(std::string("[PF] relations setup on the reused peer faction: ") + (rs == 1 ? "phase1 ok" : rs == 0 ? "skipped" : "FAULTED"));
         if (g_si[idx].name != name) RenamePeer(idx, name);
+        coop::StoreApplyBlockToNewFaction(existing);   /* its squads are numbered in this game's block */
         return existing;
     }
     name = ClashFreeName(name, slot, 0);   // review-p3-factions: never create a record under an existing faction name   /* stand1: two stand-ins may carry the same player name - " (peer)", then " (p<slot>)"; the rename uses the same rule */
@@ -206,6 +235,7 @@ std::string ClashFreeName(const std::string& want, int slot, ::Faction* except)
              + " (faction data field " + S(d) + (d == (void*)gd ? " = the record" : " != the record!") + ") getName='" + f->getName() + "' isPlayer=" + S(IsPlayerPod(f))
              + " relation(mine->peer)=" + (g_relationRead == 1 ? S(rel) : std::string("unread")) + " (enemy<=-30, ally>=50)"
              + " relations setup: " + (rs == 1 ? "phase1 ok" : rs == 0 ? "NO relations object" : "phase1 FAULTED"));
+    coop::StoreApplyBlockToNewFaction(f);   /* a new faction's counter starts at 0: its squads are numbered in this game's block */
     return f;
 }
 /* The faction record that holds `name` here, `except` (and its record) never counting: a live faction carrying the name now (its
@@ -405,6 +435,7 @@ void PlayerFactionOnLinkDown()
 int WireSenderSlot() { return g_wireRelayedSlot >= 0 ? g_wireRelayedSlot : g_linkPeerSlot; }   /* M5b */
 void SetWireRelayedSender(int slot) { g_wireRelayedSlot = slot; }
 ::Faction* StandInForSlot(int slot) { const int i = FindStandIn(slot); return (i >= 0 && PlausibleObject(g_si[i].f)) ? g_si[i].f : 0; }
+unsigned int StandInRegistrations() { return g_siRegistrations; }
 int StandInList(int* slots, ::Faction** out, int cap)   /* T-356: crime's sight cells - one per other player's faction */
 {
     int n = 0;
@@ -826,7 +857,27 @@ void PlayerFactionTick()
         ::Faction* lf = coop::GameWorldPtr()->factionDirectory->findFactionById(std::string(coopslot::kLegacyPeerId));
         g_legacyPeer = PlausibleObject(lf) ? lf : 0;
         if (g_legacyPeer != 0) DebugLog("[PF] this world carries a protocol-67 coop-peer faction " + S((const void*)lf) + " - dormant; its buildings still count as another player's");
+        /* T-968: every coop-p<n> record the loaded world carries (the faction list read by id, as PeerFactionAny does) goes in the
+           foliage cells now, in the world's first main-loop tick and before the engine reads an area, so a copy town saved under
+           its stand-in keeps the avoid-towns world objects its owner's game keeps at the load */
+        g_savedSiN = 0; g_savedSiOver = 0;
+        void** arr = 0; unsigned na = 0;
+        if (ReadFactionArrayPod(&arr, &na) && Plaus(arr) && na <= 4096)
+            for (unsigned i = 0; i < na; ++i)
+            {
+                ::Faction* f = (::Faction*)arr[i]; char sid[64];
+                if (!Plaus(f) || ReadSidPod(f, sid, 64) != 1) continue;
+                const int s = coopslot::StandInSlotOfId(std::string(sid));
+                if (s < 0 || !PlausibleObject(f)) continue;
+                if (g_savedSiN < kSavedSiCap) { g_savedSi[g_savedSiN].slot = s; g_savedSi[g_savedSiN].f = f; ++g_savedSiN; }
+                else ++g_savedSiOver;
+            }
+        if (g_savedSiN > 0 || g_savedSiOver > 0)
+            DebugLog("[PF] this world carries " + S(g_savedSiN + g_savedSiOver) + " saved stand-in faction record(s) (coop-p<n>) - the foliage cells hold every one not of this game's slot ("
+                     + S(MySlotForWire()) + ") from now on" + (g_savedSiOver > 0 ? ", " + S(g_savedSiOver) + " past the list's " + S(kSavedSiCap) + " left out" : std::string()));
+        StandInCellsRefresh();
     }
+    if (MySlotForWire() != g_cellsMe) StandInCellsRefresh();   /* T-968: this game's slot changed - its own saved record leaves the foliage cells */
     const std::string& now = mine->getName();
     // review-p3s M3: keyed on the faction OBJECT too - a different Faction* is a new baseline (a reload), not a rename
     if (mine != g_lastSeenFaction || !g_nameBaselined)   // review-s6 M4: an empty name must not re-arm the edge every frame
@@ -899,5 +950,7 @@ namespace coop {
 void ResetPlayerFactionState() { coop::PolicyForgetPeerFaction();   /* E36 / decision 40: the stand-in's address dies with the world - see policy.cpp */
                                 for (int i = 0; i < kMaxStandIns; ++i) { g_siPtr[i] = 0; g_si[i] = StandIn(); }   /* stand1: every stand-in dies with the world; the link peer's slot does not */
                                 g_legacyPeer = 0; g_legacyLooked = false; g_anyMiss = false;   /* stand1 fold */
+                                g_savedSiN = 0; g_savedSiOver = 0;
+                                StandInCellsRefresh();   /* T-968: the foliage stub's cells empty with the table and the saved records */
                                 g_renameRefused = 0; g_lastSeenName.clear(); g_lastSeenFaction = 0; g_nameBaselined = false; g_worldWasTornDown = true; }   /* T-368: a FACTION answer not applied yet waits for the pick's next world (PlayerFactionWorldAnswerForget) */
 }

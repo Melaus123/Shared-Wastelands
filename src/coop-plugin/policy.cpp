@@ -775,20 +775,22 @@ void* BoxAllocNear(uintptr_t site)   /* a page within a rel32 jump of the site, 
     }
     return 0;
 }
-int BoxTestPatch(uintptr_t site)
+/* the 8-byte owner test `cmp qword [rax+0x250], 0` at `site` (`orig` = it and the 2-byte jcc after it, which stays) replaced by a
+   jump to the sight stub for that test on a page of its own; outCells / outWhy get the result */
+int Test8Patch(uintptr_t site, const unsigned char* orig, BoxCells*& outCells, const char*& outWhy)
 {
     unsigned char now[10];
-    if (!BoxReadPod((const void*)site, now, 10)) { g_boxWhy = "the site could not be read"; return 0; }
-    if (std::memcmp(now, kBoxTestOrig, 10) != 0) { g_boxWhy = "the 10 bytes at the site are not the expected test (another mod?)"; return 0; }
+    if (!BoxReadPod((const void*)site, now, 10)) { outWhy = "the site could not be read"; return 0; }
+    if (std::memcmp(now, orig, 10) != 0) { outWhy = "the 10 bytes at the site are not the expected test (another mod?)"; return 0; }
     unsigned char* stub = (unsigned char*)BoxAllocNear(site);
-    if (stub == 0) { g_boxWhy = "no page for the stub within a jump of the site"; return 0; }
+    if (stub == 0) { outWhy = "no page for the stub within a jump of the site"; return 0; }
     const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
-    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_boxWhy = "the stub page is out of jump range"; return 0; }
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); outWhy = "the stub page is out of jump range"; return 0; }
     BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
     for (int k = 0; k < kBoxCells; ++k) cells->cell[k] = 0;
     cells->hits = 0;
     if (coopcrime::SightStubBuild(stub, (unsigned long long)site, kBoxCells, (int)kBoxCellsOff) != 50 + 13 * kBoxCells)
-    { ::VirtualFree(stub, 0, MEM_RELEASE); g_boxWhy = "the stub came out at an unexpected length"; return 0; }
+    { ::VirtualFree(stub, 0, MEM_RELEASE); outWhy = "the stub came out at an unexpected length"; return 0; }
     ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
     unsigned char patch[8];
     patch[0] = 0xE9;
@@ -796,13 +798,165 @@ int BoxTestPatch(uintptr_t site)
     std::memcpy(patch + 1, &rel32, 4);
     patch[5] = patch[6] = patch[7] = 0x90;
     DWORD oldProt = 0;
-    if (!::VirtualProtect((void*)site, 8, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_boxWhy = "VirtualProtect refused"; return 0; }
+    if (!::VirtualProtect((void*)site, 8, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); outWhy = "VirtualProtect refused"; return 0; }
     std::memcpy((void*)site, patch, 8);
     DWORD ignored = 0;
     ::VirtualProtect((void*)site, 8, oldProt, &ignored);
     ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, 8);
-    g_boxCells = cells;
-    g_boxWhy = "patched";
+    outCells = cells;
+    outWhy = "patched";
+    return 1;
+}
+int BoxTestPatch(uintptr_t site) { return Test8Patch(site, kBoxTestOrig, g_boxCells, g_boxWhy); }
+
+/* ---- T-923 (owner 919, F1038): A TEAMMATE'S OUTPOST DOES NOT REFUSE THIS PLAYER'S BUILDING AS "TOO CLOSE TO ANOTHER TOWN" ---------
+   The build cursor's near-town rule (the preview's vt+0xC8, 0x4DAFB0) puts the town it found near the cursor in preview+0x90, then
+   exempts it only when that town's faction is a player faction (Read, capstone on both Steam builds, 1.0.65 shown; 1.0.68 0x4DBCA2):
+     0x4DB20F  call [rax+0x58]                                    the town's faction (rax; null-checked by the same call at 0x4DB1FD)
+     0x4DB212  48 39 98 50 02 00 00   cmp qword [rax+0x250], rbx  its PlayerInterface* against rbx (= 0: xor r15d,r15d / mov ebx,r15d
+                                                                  at 0x4DAFFA, never written again before here; calls keep rbx)
+     0x4DB219  74 07                  je 0x4DB222                 EQUAL (ZF=1): no PlayerInterface - not a player: the town is kept
+     0x4DB21B  4C 89 BE 90 00 00 00   mov [rsi+0x90], r15         NOT EQUAL (ZF=0): a player faction - the town is forgotten (r15 = 0)
+     0x4DB222  mov rcx,[rsi+0x90] ; test ; je ...                 no town left: nothing refuses, the player's own road
+   So at this site ZF=0 means "a player": the same polarity as the sight / box stubs (their jne / je read ZF=0 as a player). A
+   teammate's outpost town is shown here under that teammate's stand-in faction (build.cpp's outpost town, F1038), which has no
+   PlayerInterface, so the teammate's building was refused. THE FIX: the 7-byte compare is replaced (E9 rel32 + 2 NOPs, ending at the
+   je) by a jump to coopcrime::SightStubBuild's stub built with THIS compare's own 7 bytes: it re-does the compare (a player faction:
+   ZF=0, as before), else compares the faction against cells holding this game's teammates' factions (a match: `cmp rax, 0` with
+   rax non-zero, so ZF=0 - the player's answer, the town is forgotten, counted in hits), else re-does the compare (ZF=1, as before),
+   and jumps back to the je at site + 7. Every other flag the je does not read. It reads only rax, rbx and its own page, calls
+   nothing and writes no register. The cells are the box stub's (PolicyTeammateFactions, main thread, only when they change: this
+   game's current teammates' stand-ins, empty with no team, so a player who left the team stops matching at the next table change);
+   any thread may run the stub (the preview runs on the main thread). Not giving the stand-in a PlayerInterface: see the box test above.
+   Written once at InstallPolicy (the preload stage). Only this site: the preview's other faction test (0x4DB234, for a town it keeps)
+   is never reached for a town forgotten here. */
+unsigned long long kNearTownTestRva = 0; static AddrReg kNearTownTestRva_reg("PreviewTownOwnerTest", &kNearTownTestRva);   /* Steam_1.0.65 0x4DB212 - a patch site, not a function */
+const unsigned char kNearTownOrig[9] = { 0x48, 0x39, 0x98, 0x50, 0x02, 0x00, 0x00, 0x74, 0x07 };   /* the compare, then its je */
+const int kNearTownTestLen = 7;
+typedef char kNearStubBeforeCells[(2 * kNearTownTestLen + 34 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];
+BoxCells* g_nearCells = 0;
+const char* g_nearWhy = "not tried";
+int g_nearHeld = 0;
+int NearTownTestPatch(uintptr_t site)
+{
+    unsigned char now[9];
+    if (!BoxReadPod((const void*)site, now, 9)) { g_nearWhy = "the site could not be read"; return 0; }
+    if (std::memcmp(now, kNearTownOrig, 9) != 0) { g_nearWhy = "the 9 bytes at the site are not the expected test (another mod?)"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_nearWhy = "no page for the stub within a jump of the site"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_nearWhy = "the stub page is out of jump range"; return 0; }
+    BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
+    for (int k = 0; k < kBoxCells; ++k) cells->cell[k] = 0;
+    cells->hits = 0;
+    if (coopcrime::SightStubBuild(stub, (unsigned long long)site, kBoxCells, (int)kBoxCellsOff, kNearTownOrig, kNearTownTestLen)
+        != coopcrime::SightStubLenFor(kNearTownTestLen, kBoxCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_nearWhy = "the stub came out at an unexpected length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[kNearTownTestLen];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = patch[6] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, kNearTownTestLen, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_nearWhy = "VirtualProtect refused"; return 0; }
+    std::memcpy((void*)site, patch, kNearTownTestLen);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, kNearTownTestLen, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, kNearTownTestLen);
+    g_nearCells = cells;
+    g_nearWhy = "patched";
+    return 1;
+}
+
+/* ---- T-923 (decision 967): A GROUPED CONFIRM TAKES A TEAMMATE'S OUTPOST AS THE GROUP'S PLAYER TOWN ----------------------------
+   The placement confirm 0x4DA6F0 picks each piece's town (0x4D6300, preview+0x90; build.cpp's town pick lets it be a teammate's
+   outpost town), then keeps as the group's town the town of any piece whose faction is a player faction (Read, capstone on both
+   Steam builds, 1.0.65 shown; 1.0.68 0x4DB333):
+     0x4DA8A0  call [rax+0x58]                               the piece's town's faction (rax)
+     0x4DA8A3  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0   its PlayerInterface*
+     0x4DA8AB  74 07                     je 0x4DA8B4                 no PlayerInterface: not taken
+     0x4DA8AD  4C 8B AF 90 00 00 00      mov r13, [rdi+0x90]         a player's town: the group's town (r13)
+   The group's town is given to every piece of the group that asked for one and got none (a piece far from any town); with none, the
+   confirm takes this player's nearest player town within 16000 (0x926F70, which only counts PlayerInterface factions) or founds
+   'Your Outpost' at the pieces' centre. So a group one of whose pieces joined a teammate's outpost and another found no town would
+   split: the far piece into another town or a new outpost. THE FIX: the box test's stub (the same 8-byte test, the same cells): a
+   teammate's stand-in faction answers ZF=0, as a player's - the teammate's town becomes the group's town; every other faction as
+   before. The stub reads only rax and its own page; the cells are written with the others (PolicyTeammateFactions), empty with no
+   team. Written once at InstallPolicy. The confirm runs on the main thread. */
+unsigned long long kGroupTownTestRva = 0; static AddrReg kGroupTownTestRva_reg("PlacementGroupTownTest", &kGroupTownTestRva);   /* Steam_1.0.65 0x4DA8A3 - a patch site, not a function */
+const unsigned char kGroupTownOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x07 };
+BoxCells* g_groupCells = 0;
+const char* g_groupWhy = "not tried";
+int g_groupHeld = 0;
+
+/* ---- T-968: ANOTHER PLAYER'S OUTPOST COPY KEEPS THE WORLD OBJECTS THE OWNER'S GAME KEEPS NEAR IT ---------------------------------
+   The foliage routine (0x6D20C0, which places an area's scattered world objects - world buildings and boxes among them) leaves an
+   object marked avoid-towns out when it stands inside the nearest town's no-foliage range (town+0x384, squared, against the
+   distance to the town's centre), unless that town's faction (town+0x10, in rcx) is a player faction. Bytes, the same on both
+   Steam builds (Confirmed; 1.0.65 0x6D229E, 1.0.68 0x6D25EE):
+     48 83 B9 50 02 00 00 00   cmp qword [rcx+0x250], 0     the faction's PlayerInterface*
+     75 34                     jne KEEP                     ZF=0: a player faction - the object is kept, whatever the range
+   So ZF=0 means "a player", the polarity of the box / near-town stubs. Another player's outpost is shown on this game as a copy
+   town under that player's stand-in faction, which has no PlayerInterface, so this game left out objects inside the copy's range
+   that the owner's game keeps (a world box missing on one game only). THE FIX: the 8-byte test is replaced (E9 rel32 + 3 NOPs,
+   ending at the jne) by a jump to coopcrime::SightStubBuild's stub built for rcx: it re-does the test (a player faction: ZF=0,
+   as before), else compares the faction against cells holding EVERY stand-in faction on this game (a match: `cmp rcx, 0` with rcx
+   non-zero, ZF=0 - kept, counted in hits), else re-does the test (ZF=1, as before) and jumps back to the jne at site + 8. The
+   cells hold every stand-in, not only teammates': the owner's game keeps these objects near its own town whoever looks, so the
+   copy must keep them for every other player's town (parity), team or not. The cells hold every other player's faction on this
+   game - each stand-in in playerfaction.cpp's table, an old save's coop-peer, and each coop-p<n> record the loaded world carries
+   for another slot (read at the world's first main-loop tick, before the first area read, because the save's record enters the
+   table only when its player is resolved) - written on the main thread at each change (PolicyStandInFactions, from
+   playerfaction.cpp StandInCellsRefresh). A faction keeps its cell while it stays (coopcrime::StableCellsPlace), so the stub
+   never misses one while the set changes; each cell is written only when it changes. The stub reads only rcx
+   and its own page, calls nothing and writes no register; any thread may run it (the routine's thread is not known). Town+0x384
+   has no other reader (the only float read of it is this routine's), so this changes only which avoid-towns objects this game
+   keeps near another player's town. Not giving the stand-in a PlayerInterface: see the box test above. Written once at
+   InstallPolicy (the preload stage). */
+unsigned long long kFoliageTownTestRva = 0; static AddrReg kFoliageTownTestRva_reg("FoliageTownOwnerTest", &kFoliageTownTestRva);   /* Steam_1.0.65 0x6D229E - a patch site, not a function */
+const unsigned char kFoliageTownOrig[10] = { 0x48, 0x83, 0xB9, 0x50, 0x02, 0x00, 0x00, 0x00, 0x75, 0x34 };   /* the test, then its jne */
+const int kFoliageTestLen = 8;
+const int kFoliageCells = coop::kStandInTableCap + 1;   /* every stand-in the table can hold, and an old save's coop-peer */
+struct FoliageCells { volatile LONG64 hits; void* volatile cell[kFoliageCells]; };   /* hits at +0, cell k at +8+8k (SightStubBuild's layout) */
+typedef char kFoliageStubBeforeCells[(2 * kFoliageTestLen + 34 + 13 * kFoliageCells <= (int)kBoxCellsOff) ? 1 : -1];
+typedef char kFoliageCellsInPage[((int)kBoxCellsOff + 8 + 8 * kFoliageCells <= 0x1000) ? 1 : -1];
+FoliageCells* g_foliageCells = 0;
+const char* g_foliageWhy = "not-tried";   /* one word: it is printed in the REPORT token */
+int g_foliageHeld = 0;                     /* factions in the cells (MAIN THREAD) */
+int g_foliageDrops = 0;                    /* stand-ins that did not fit at the last table write (MAIN THREAD) */
+const void* g_foliagePlaced[kFoliageCells];   /* the placement the cells carry (MAIN THREAD; kept while the stub is not patched too) */
+volatile LONG g_foliageReadGen = -1;          /* the world generation of the last first-area-read note (PolicyFoliageAreaRead) */
+volatile LONG g_foliageAtFirstRead = -1;      /* factions in the cells at this world's first area read; -1 none read yet */
+int FoliageTownTestPatch(uintptr_t site)
+{
+    unsigned char now[10];
+    if (!BoxReadPod((const void*)site, now, 10)) { g_foliageWhy = "unreadable"; return 0; }
+    if (std::memcmp(now, kFoliageTownOrig, 10) != 0) { g_foliageWhy = "not-expected"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_foliageWhy = "no-page"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_foliageWhy = "out-of-range"; return 0; }
+    FoliageCells* cells = (FoliageCells*)(stub + kBoxCellsOff);
+    for (int k = 0; k < kFoliageCells; ++k) cells->cell[k] = 0;
+    cells->hits = 0;
+    if (coopcrime::SightStubBuild(stub, (unsigned long long)site, kFoliageCells, (int)kBoxCellsOff, 0, kFoliageTestLen, coopcrime::kSightRegRcx)
+        != coopcrime::SightStubLenFor(kFoliageTestLen, kFoliageCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_foliageWhy = "bad-length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[kFoliageTestLen];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = patch[6] = patch[7] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, kFoliageTestLen, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_foliageWhy = "protect-refused"; return 0; }
+    std::memcpy((void*)site, patch, kFoliageTestLen);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, kFoliageTestLen, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, kFoliageTestLen);
+    g_foliageCells = cells;
+    g_foliageWhy = "patched";
     return 1;
 }
 }   // namespace
@@ -1085,6 +1239,65 @@ std::string TeamOrdersTokens()
 }
 }   // namespace
 
+long long PolicyGroupTownHits(const char** why)
+{
+    if (why != 0) *why = g_groupWhy;
+    return g_groupCells != 0 ? (long long)g_groupCells->hits : -1;
+}
+int PolicyTeammateSlot(void* faction)
+{
+    if (faction == 0 || !MineInTeam()) return -1;
+    const int me = coop::MySlotForWire();
+    const int s = StandInSlotAnyPod(faction);
+    return (me >= 0 && s >= 0 && s != me && coop::TeamSameAnyThread(me, s)) ? s : -1;
+}
+int PolicyTeammateSlotIsMate(int slot)
+{
+    if (slot < 0 || !MineInTeam()) return 0;
+    const int me = coop::MySlotForWire();
+    return (me >= 0 && slot != me && coop::TeamSameAnyThread(me, slot)) ? 1 : 0;
+}
+int PolicyTeammateFactionList(void** out, int cap)
+{
+    if (!MineInTeam()) return 0;
+    int n = 0;
+    for (int k = 0; k < kOrdCells && n < cap; ++k)
+    {
+        void* f = g_ordCells[k];
+        if (f != 0 && PolicyTeammateSlot(f) >= 0) out[n++] = f;
+    }
+    return n;
+}
+long long PolicyNearTownHits(const char** why)
+{
+    if (why != 0) *why = g_nearWhy;
+    return g_nearCells != 0 ? (long long)g_nearCells->hits : -1;
+}
+
+void PolicyStandInFactions(void* const* facs, int n)
+{
+    /* T-968: the foliage stub's cells - each faction given keeps the cell it holds, a new one takes an empty cell, a gone one's cell
+       is cleared; those past the cells are counted */
+    const void* next[kFoliageCells];
+    int drops = 0;
+    const int held = coopcrime::StableCellsPlace(g_foliagePlaced, (const void* const*)facs, facs != 0 ? n : 0, next, kFoliageCells, &drops);
+    for (int k = 0; k < kFoliageCells; ++k) g_foliagePlaced[k] = next[k];
+    g_foliageHeld = held;
+    g_foliageDrops = drops;
+    if (g_foliageCells == 0) return;
+    for (int k = 0; k < kFoliageCells; ++k)
+        if (g_foliageCells->cell[k] != next[k]) g_foliageCells->cell[k] = (void*)next[k];
+}
+
+int PolicyFoliageAreaRead(long worldGen)
+{
+    /* T-968: the factions in the foliage cells at this world's first area read, once per world generation; -1 after the first */
+    if (::InterlockedExchange(&g_foliageReadGen, (LONG)worldGen) == (LONG)worldGen) return -1;
+    const LONG held = (LONG)g_foliageHeld;
+    ::InterlockedExchange(&g_foliageAtFirstRead, held);
+    return (int)held;
+}
+
 void PolicyTeammateFactions(void* const* facs, int n)
 {
     /* T-546 (owner 512): the team set (this game's player faction and these factions) the isAllyOf / isEnemyOf detours answer
@@ -1099,6 +1312,28 @@ void PolicyTeammateFactions(void* const* facs, int n)
             if (g_ordCells[k] != want) g_ordCells[k] = want;
         }
         ::InterlockedExchange(&g_ordHeld, held);
+    }
+    if (g_nearCells != 0)
+    {   /* T-923: the near-town owner stub's cells, kept whether or not the box stub is patched */
+        int nheld = 0;
+        for (int k = 0; k < kBoxCells; ++k)
+        {
+            void* want = (k < n && facs != 0) ? facs[k] : 0;
+            if (want != 0) ++nheld;
+            if (g_nearCells->cell[k] != want) g_nearCells->cell[k] = want;
+        }
+        g_nearHeld = nheld;
+    }
+    if (g_groupCells != 0)
+    {   /* T-923: the grouped confirm's player-town stub's cells */
+        int gheld = 0;
+        for (int k = 0; k < kBoxCells; ++k)
+        {
+            void* want = (k < n && facs != 0) ? facs[k] : 0;
+            if (want != 0) ++gheld;
+            if (g_groupCells->cell[k] != want) g_groupCells->cell[k] = want;
+        }
+        g_groupHeld = gheld;
     }
     if (g_boxCells == 0) return;
     int held = 0;
@@ -1141,6 +1376,24 @@ void InstallPolicy()
                  + (g_boxCells != 0 ? " - a teammate's box clicked as this player's own takes the loot road, not the steal line; every other owner as before" : " - a teammate's type-9 box still ends in the steal line"));
         DebugLog("[POLICY] cursor hooks installed: " + PN(g_cursorHooks) + " of 2 (UseableStuff::getMouseCursor 0x546C30 via vtable thunk 0x3BCBE, DoorStuff::getMouseCursor 0x547010 via vtable thunk 0x4EC7E; neither has a direct caller, so the vtable is the only route and hooking the body catches it). PURE RETURN-VALUE REMAP under `shared` only, and since doors1 only for a STORAGE BOX (StorageBuilding): a peer box's 0xF/0x18 answer becomes 9, the answer the engine gives for our own box. A peer door keeps the stranger's pick-lock cursor (user decision 2026-09-24: the owner's lock holds - pick or break it); beds, benches, research and turrets keep the engine's stranger answer. No lock and no other engine state is written");
     }
+    /* T-923: the build cursor's near-town owner test (independent of the hooks above) */
+    if (kNearTownTestRva == 0) g_nearWhy = "no address row";
+    else NearTownTestPatch(g_base + (uintptr_t)kNearTownTestRva);
+    DebugLog(std::string("[POLICY] near-town owner test: ") + g_nearWhy
+             + (g_nearCells != 0 ? " (the build cursor's 'too close to another town' rule, 1.0.65 0x4DB212: a teammate's town is passed as this player's own; every other town as before)"
+                                 : " - a teammate's outpost still refuses this player's building as too close to another town"));
+    /* T-923: the grouped confirm's player-town test */
+    if (kGroupTownTestRva == 0) g_groupWhy = "no address row";
+    else Test8Patch(g_base + (uintptr_t)kGroupTownTestRva, kGroupTownOrig, g_groupCells, g_groupWhy);
+    DebugLog(std::string("[POLICY] grouped-confirm player-town test: ") + g_groupWhy
+             + (g_groupCells != 0 ? " (the placement confirm's group town, 1.0.65 0x4DA8A3: a teammate's outpost town counts as a player's town; every other town as before)"
+                                  : " - a grouped placement beside a teammate's outpost may still found its own outpost for a piece that found no town"));
+    /* T-968: the foliage routine's town owner test */
+    if (kFoliageTownTestRva == 0) g_foliageWhy = "no-row";
+    else FoliageTownTestPatch(g_base + (uintptr_t)kFoliageTownTestRva);
+    DebugLog(std::string("[POLICY] foliage town owner test: ") + g_foliageWhy
+             + (g_foliageCells != 0 ? " (the foliage routine's avoid-towns rule, 1.0.65 0x6D229E: a town of another player's stand-in keeps the world objects the owner's game keeps; every other town as before)"
+                                    : " - NOT PATCHED (no-row: no address row for this build; not-expected: the bytes at the site are not the engine's, another mod?): another player's outpost copy still leaves out world objects marked avoid-towns that the owner's game keeps"));
 }
 
 // PROBE P028 - is the `coop-peer` stand-in faction a player faction? Emitted ONCE, on the main thread, the
@@ -1611,6 +1864,10 @@ std::string PolicyReport()
          + " basePolicy3[mineUnreadable,mineWasStandIn,mineNotYetKnown,policyRequesterFromPeer]=" + PN(g_mineUnreadable) + "," + PN(g_mineWasStandIn) + "," + PN(g_mineNotYetKnown) + "," + PN(g_policyRequesterFromPeer)
          + " basePolicyMember[allowedMember,click,doorPanel,cursor,doorCursor,cursorOther]=" + PN(g_allowedMember) + "," + PN(g_memberClick) + "," + PN(g_memberDoorPanel) + "," + PN(g_memberCursor) + "," + PN(g_memberDoorCursor) + "," + PN(g_memberCursorOther)
          + TeamOrdersTokens()
+         + " nearTownTeammateHits=" + (g_nearCells != 0 ? PN((long long)g_nearCells->hits) : std::string("n/a")) + " nearTownCellsHeld=" + PN((long long)g_nearHeld)
+         + " foliageTown[patched,why,cells,hits,drops]=" + PN(g_foliageCells != 0 ? 1 : 0) + "," + g_foliageWhy + "," + PN((long long)g_foliageHeld)
+         + "," + PN(g_foliageCells != 0 ? (long long)g_foliageCells->hits : 0) + "," + PN((long long)g_foliageDrops)
+         + " foliageCellsAtFirstAreaRead=" + PN((long long)g_foliageAtFirstRead)
          + " teamBox[patched,cellsHeld,hits]=" + PN(g_boxCells != 0 ? 1 : 0) + "," + PN((long long)g_boxHeld) + "," + PN(g_boxCells != 0 ? (long long)g_boxCells->hits : 0)
          + " ownedByPeerAnswered=" + PN(g_ownedByPeerAnswered)
          + " ownedByPeerAnsweredClick=" + PN(g_ownedByPeerAnsweredClick)

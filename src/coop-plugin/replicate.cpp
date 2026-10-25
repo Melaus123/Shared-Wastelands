@@ -62,6 +62,7 @@ static unsigned long long kMig3AiIsEnemy = 0; static coop::AddrReg kMig3AiIsEnem
 #include "combat.h"   // P059: NoteNativeWindowDropped
 #include "../common/pathlead.h"   // D3 (read-pathend): the path drive's lead / near-end / too-close / landed arithmetic
 #include "../common/runboost.h"   // T-189 runboost (H051): the raise decision and the boost arithmetic
+#include "../common/windowbound.h"   // T-986 (drift bound): the native combat window's distance bound
 #include "../common/followplay.h"   // the follow drive: the owner's stamped route, the playback target, the stop rules
 #include "../common/p124stop.h"   // PROBE P124: the stop reading and the overshoot measure, swept by the offline suite
 #include "../common/getupcrawl.h"   // T-178 crawl1 (H050): MoveDrivesProne - a crawler (prone 2, not a ragdoll) is driven
@@ -342,6 +343,10 @@ const double kSnapMaxSampleAgeSec = 3.0;
 // the drive walk (RetireCopyOwnerUnloaded drops the puppet, so never inside it).
 struct FarUnloadedRow { unsigned int uid; float x, y, z; };
 std::vector<FarUnloadedRow> g_farUnloadedQueue;
+// T-986: copies whose native combat window the drive found past kLostDist from their owner this frame; closed after the drive walk
+// (the close places the copy and clears its window, so never inside it).
+struct DriftCloseRow { unsigned int uid; float dist; };
+std::vector<DriftCloseRow> g_driftCloseQueue;
 // review-r2 item 3: a not-closing window is a stall only when the copy moved mostly SIDEWAYS - its displacement
 // projected on the direction to the window-start target, over the distance moved, is below this. A copy sliding
 // along an obstacle scores ~0; a copy chasing straight at its owner's speed scores ~1 and is not stalled.
@@ -439,6 +444,12 @@ struct Puppet
     bool  catchupGaveUp;
     int   rearms;             // T-573: give-ups lifted so far (copyjudge::kMaxRearms at most)
     int   gaveUpWindows;      // T-573: judged windows since the current give-up
+    bool  gaveUpOwnSet;       // T-986 floorplace: the owner's point was stored at the current give-up (an owner sample was heard)
+    float gaveUpOwnX, gaveUpOwnY, gaveUpOwnZ;   // ... that point (the copy holds no owner floor number; the height stands in)
+    int   moveLifts;          // T-986 floorplace fold: owner-moved lifts since a placement last held (the lift distance doubles)
+    bool  placeHold;          // T-986 s: a catch-up placement has not shown yet - the drive is held (copyjudge::PlaceHold)
+    double placeHoldAt;       // ... when it was placed (NowSeconds; moved on by HoldShiftClocks)
+    float placeFromX, placeFromZ;   // ... where the copy stood before it
     long long heldFromTick;   // T-573: the frame this game's simulation stopped for this copy's judge; -1 = running
     double heldFromSec;       // T-573: ... and when, in NowSeconds; -1 = running
     int   snapCause;          // review-r2 item 5: kSnapCauseFar / kSnapCauseStuck, set at placement; 0 = none yet
@@ -540,6 +551,7 @@ struct Puppet
     floorplace::FloorWatch floorW;  // T-424: the floor placement's strikes on the stop point it judges against (FloorStep)
     bool floorPending; long long floorTick; float floorOwnerY; bool floorSaid;   // a placement awaits its result; its frame;
                                     // the height it placed at; its [FLOOR] line was printed (so its result line is too)
+    double floorAt;                 // T-986 g3: when it was placed (NowSeconds) - the bound of its result's judgement
     bool fBehind;                   // behind schedule (followplay::BehindScheduleStep): it aims at the owner's newest reported point
 
     long long nativeSnapTick;
@@ -767,8 +779,10 @@ long long g_catchupSnaps     = 0;
 long long g_catchupEffective = 0;   // the puppet actually moved by roughly the gap
 long long g_catchupIneffective = 0;
 long long g_catchupGaveUp    = 0;
-long long g_catchupGaveUpFinal = 0;   // T-573: give-ups with no re-arm left
+long long g_catchupGaveUpFinal = 0;   // T-573: give-ups with no TIMED re-arm left - T-986 floorplace fold: not final, an owner's move still lifts them
 long long g_catchupRearmed   = 0;     // T-573: given-up copies tried again (copyjudge)
+long long g_placeHoldLanded = 0, g_placeHoldTimedOut = 0, g_placeHeldFrames = 0;   // T-986 s: placement holds released / frames held
+long long g_catchupLiftOwnerMoved = 0;   // T-986 floorplace: give-ups lifted because the owner moved kCatchupEnter from its give-up point
 long long g_judgeHeldFrames  = 0;     // T-573: copy-frames neither judged nor driven because this game's simulation was stopped
 long long g_judgeHeldResumes = 0;     // T-573: copies whose window clocks moved on by a stop that ended
 bool      g_simHeld          = false; // T-573: this frame's stopped state, read live in ReplicateTick
@@ -1618,6 +1632,7 @@ static float RunBoostFrame(Puppet& p, float lag, bool dirOk)
     return boost;
 }
 
+
 static void ApplyDriveSpeed(Puppet& p, CharMovement* mv, float dist, const Ogre::Vector3& cur, float aimX, float aimZ)
 {
     if (g_driveSpeed != 0.0f)
@@ -1700,6 +1715,7 @@ static void ApplyDriveSpeed(Puppet& p, CharMovement* mv, float dist, const Ogre:
         else ++g_speedRefused;
     }
 }
+
 
 void DriveTowardAim(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector3& cur,
                     float dx, float dz, float dist, float aimX, float aimZ, float leadSec)
@@ -2282,6 +2298,7 @@ static void FollowReset(Puppet& p)
     followplay::StopProgressReset(&p.fStopProg); p.fStopStalled = false; p.fStopArrive = followplay::kStopArriveDist;
     p.fBehind = false;
     floorplace::FloorWatchReset(&p.floorW); p.floorPending = false; p.floorTick = 0; p.floorOwnerY = 0.0f; p.floorSaid = false;   // T-424
+    p.floorAt = 0.0;   // T-986 g3: the landing judgement's clock
 }
 
 // The owner's clock for uid: its owner game's (by slot), or this copy's own while no owner slot is known.
@@ -3289,17 +3306,40 @@ std::string P093SummaryLine()
 // T-573: what a give-up's log line adds - whether, and after how many judged windows, the copy is tried again.
 std::string RearmNote(const Puppet& p)
 {
+    // T-986 floorplace: either way, a move of the owner by kCatchupEnter from where it stands now lifts the give-up sooner.
     if (!copyjudge::RearmLeft(p.rearms))
-        return " No re-arm left (" + N2(copyjudge::kMaxRearms) + " used): this copy is not placed again.";
+        return " No re-arm left (" + N2(copyjudge::kMaxRearms) + " used): this copy is placed again only once its owner moves "
+               + F2(kCatchupEnter) + " units from where it stands now.";
     return " Tried again after " + N2(copyjudge::RearmWaitWindows(p.rearms)) + " judged windows (re-arm "
-           + N2(p.rearms + 1) + " of " + N2(copyjudge::kMaxRearms) + ").";
+           + N2(p.rearms + 1) + " of " + N2(copyjudge::kMaxRearms) + "), or sooner once its owner moves " + F2(kCatchupEnter)
+           + " units from where it stands now.";
+}
+
+// T-986 s: a catch-up placement was just made from `from`: the drive is held until it shows (copyjudge::PlaceHold, DrivePuppet).
+void PlaceHoldStart(Puppet& p, const Ogre::Vector3& from)
+{
+    p.placeHold = true;
+    p.placeHoldAt = NowSeconds();
+    p.placeFromX = from.x; p.placeFromZ = from.z;
 }
 
 // T-573: the bookkeeping every give-up shares - the wait for the next re-arm starts now.
 void NoteGaveUp(Puppet& p)
 {
     p.gaveUpWindows = 0;
+    // T-986 floorplace: the owner's point now - the give-up is lifted once it has moved kCatchupEnter from here.
+    p.gaveUpOwnSet = p.ownerSampleAt > 0.0;
+    p.gaveUpOwnX = p.tx; p.gaveUpOwnY = p.ty; p.gaveUpOwnZ = p.tz;
     if (!copyjudge::RearmLeft(p.rearms)) ++g_catchupGaveUpFinal;
+}
+
+// T-986 floorplace fold: a give-up made before any owner report stored no point, so no move could lift it; the first owner
+// report after it stores the point (called where a report sets the owner's point and ownerSampleAt).
+void NoteGiveUpOwnerPoint(Puppet& p)
+{
+    if (!p.catchupGaveUp || p.gaveUpOwnSet) return;
+    p.gaveUpOwnSet = true;
+    p.gaveUpOwnX = p.tx; p.gaveUpOwnY = p.ty; p.gaveUpOwnZ = p.tz;
 }
 
 // T-573: every clock a copy's judgement, grace or hold reads moves on by a stop of this game's simulation that ended
@@ -3326,6 +3366,8 @@ void HoldShiftClocks(Puppet& p, double now)
     p.pathOwnerStillSince = copyjudge::ShiftSince(p.pathOwnerStillSince, ss);
     p.pathTurnSince       = copyjudge::ShiftSince(p.pathTurnSince, ss);
     p.rcLastTickAt        = copyjudge::ShiftSince(p.rcLastTickAt, ss);
+    p.floorAt             = copyjudge::ShiftSince(p.floorAt, ss);   // T-986 g: a floor placement's judgement bound counts running time
+    p.placeHoldAt         = copyjudge::ShiftSince(p.placeHoldAt, ss);   // T-986 s: a placement's drive hold counts running time
     if (p.fStopProg.armed) p.fStopProg.bestAt = copyjudge::ShiftSince(p.fStopProg.bestAt, ss);
     for (int i = 0; i < kSnapRateMax; ++i) p.snapTimes[i] = copyjudge::ShiftSince(p.snapTimes[i], ss);
     ++g_judgeHeldResumes;
@@ -3343,6 +3385,8 @@ long long g_floorAgain   = 0;   // ... still over it (the strike was counted at 
 long long g_floorGaveUp  = 0;   // stop points given up after kFloorStrikes strikes (once each)
 long long g_floorGated   = 0;   // stop points where the gate declined a placement (once each)
 long long g_floorFaults  = 0;   // the copy's position could not be re-read: at the decision once per stop point, at the result each time
+long long g_floorJudgedLanded = 0, g_floorJudgedWaited = 0;   // T-986 g: results judged on the landing / at the 1.5 s bound
+long long g_floorPendingDropped = 0;   // T-986 g3: pending results dropped because the pose hold or a fight window took the copy over
 long long g_floorCopyLines = 0, g_floorOwnLines = 0;   // [FLOOR] copy / own lines asked for (FloorLineDue)
 
 // A capped [FLOOR] line: the first 40, then every 50th (DEV build); the release build: the first few, then a count a minute.
@@ -3406,17 +3450,27 @@ const char* FloorGate(Puppet& p)
 }
 
 // Every judged frame of the copy's drive, just before its arrival test. First the result of an outstanding placement, once
-// the engine's movement update has run since it (two frames, as the combat-window snap's score); then the decision
+// it has landed or the bound has passed (T-986 g: floorplace::FloorJudgeDue - not two frames on, when the engine has not yet
+// moved it); while it is pending the drive ends that frame (true) and nothing is decided or placed. Then the decision
 // (floorplace::FloorPlace) on this frame's position, re-judged on a live re-read before the gate and the placement. True =
 // placed this frame (the drive ends this frame, as after a catch-up placement).
-bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector3& cur, float dist, float arriveDist, bool authMoving)
+// T-986 g2: ownerMovingNow = the drive's own "the owner is moving now" for this copy (DrivePuppet's call: authMoving, and for a
+// follow copy also its stamped route's OwnerMovingNow; both expire at the velocity horizon).
+bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector3& cur, float dist, float arriveDist, bool ownerMovingNow)
 {
     if (p.floorPending)
     {
-        if (g_tick < p.floorTick + 2) return false;
-        p.floorPending = false;
         Ogre::Vector3 now;
         const bool posOk = SafeReadPosition(p.ch, &now);
+        // T-986 g3: judged 'ok' once the copy's HEIGHT is within the gap of the height it was placed at (at least 2 frames on);
+        // 'again' only once the bound has passed. The x/z part lands at once and the height ~1 s later (T1434), so movement is
+        // not the test. Reached late (a road skipped this step), it is judged on the height it has now.
+        const bool heightApart = !posOk || floorplace::FloorStillApart(p.floorOwnerY - now.y);
+        const double judgeSec = NowSeconds() - p.floorAt;
+        const int due = floorplace::FloorJudgeDue(g_tick - p.floorTick, judgeSec, heightApart);
+        if (due == floorplace::kFloorJudgeWait) return true;   // pending: no decision, no strike, no push that could read as the landing
+        p.floorPending = false;
+        if (due == floorplace::kFloorJudgeLanded) ++g_floorJudgedLanded; else ++g_floorJudgedWaited;
         if (!posOk) ++g_floorFaults;
         int fl = -1, sf = -1;
         const int got = FloorReadPod(p.ch, mv, &fl, &sf);
@@ -3424,18 +3478,20 @@ bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector
         if (again) ++g_floorAgain; else ++g_floorOk;
         if (p.floorSaid)
             DebugLog("[FLOOR] copy uid=" + N2(uid) + " result copyY=" + (posOk ? F2(now.y) : std::string("?"))
-                     + " floorAfter=" + FloorNum(got & 1, fl) + " surfaceAfter=" + FloorNum(got & 2, sf) + (again ? " again" : " ok"));
+                     + " floorAfter=" + FloorNum(got & 1, fl) + " surfaceAfter=" + FloorNum(got & 2, sf) + (again ? " again" : " ok")
+                     + " judged=" + (due == floorplace::kFloorJudgeLanded ? "landed" : "waited") + " after=" + F2((float)judgeSec) + "s");   // T-986 g: on the landing
     }
 
     // The point and height the copy is judged against: its owner's stated stop point, else the owner's newest report.
     float plX = p.tx, plZ = p.tz, ownerY = p.ty;
     if (p.follow && p.stopHeld) { plX = p.stopX; plZ = p.stopZ; ownerY = p.stopY; }
     floorplace::FloorWatchStop(&p.floorW, plX, plZ);   // a new stop point starts the strikes again
-    const bool ownerStopped = p.follow ? p.stopHeld : !authMoving;
+    // T-986 g2: a follow copy's owner that stands still without a stop message (teleport, load, carried) counts stopped, and the
+    // drive's own stall count counts as stalled (floorplace::FloorPlaceCopy); judged against its newest report (plX/plZ/ownerY).
     const bool arrived = dist <= arriveDist;
-    const bool stalled = p.follow && p.fStopStalled;
     float fdx = plX - cur.x, fdz = plZ - cur.z;
-    int decision = floorplace::FloorPlace(ownerStopped, p.stopHeld, arrived, stalled, sqrtf(fdx * fdx + fdz * fdz), ownerY - cur.y, p.floorW.strikes);
+    int decision = floorplace::FloorPlaceCopy(p.follow, p.stopHeld, ownerMovingNow, arrived, p.fStopStalled, p.stalledWindows,
+                                              sqrtf(fdx * fdx + fdz * fdz), ownerY - cur.y, p.floorW.strikes);
     if (decision == floorplace::kFloorNone) return false;
     if (decision == floorplace::kFloorGaveUp)
     {
@@ -3458,7 +3514,8 @@ bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector
     fdx = plX - live.x; fdz = plZ - live.z;
     const float flatLive = sqrtf(fdx * fdx + fdz * fdz);
     const float dYLive = ownerY - live.y;
-    decision = floorplace::FloorPlace(ownerStopped, p.stopHeld, arrived, stalled, flatLive, dYLive, p.floorW.strikes);
+    decision = floorplace::FloorPlaceCopy(p.follow, p.stopHeld, ownerMovingNow, arrived, p.fStopStalled, p.stalledWindows,
+                                          flatLive, dYLive, p.floorW.strikes);   // T-986 g2: the same inputs, live
     if (decision != floorplace::kFloorPlace) return false;
     const char* why = FloorGate(p);
     if (why != 0)
@@ -3493,6 +3550,96 @@ bool FloorStep(unsigned int uid, Puppet& p, CharMovement* mv, const Ogre::Vector
     p.fHeld = false;
     p.driving = false;
     p.floorPending = true; p.floorTick = g_tick; p.floorOwnerY = ownerY;
+    p.floorAt = NowSeconds();   // T-986 g3: the bound of the landing judgement
+    return true;
+}
+
+// T-986 g3: a pending floor placement whose copy is taken over by a road that moves the copy itself - the pose hold (a sit or a
+// bed places it) or the native fight window (its AI walks it) - is dropped: no result is judged against a position that road
+// made, and no strike beyond the placement's own (counted when it was placed). Counted on [FLOOR] REPORT pendingDropped.
+void FloorPendingDrop(unsigned int uid, Puppet& p, const char* road)
+{
+    if (!p.floorPending) return;
+    p.floorPending = false;
+    ++g_floorPendingDropped;
+    if (p.floorSaid) DebugLog("[FLOOR] copy uid=" + N2(uid) + " result dropped: " + road + " took the copy over before it was judged");
+}
+
+// T-986 floorplace TEST-ONLY - THE FLOOR MEASUREMENT (`floorplace <uid|name:<Name>|spawned:<T>> <floor -1..3> [dx dz]`,
+// FloorPlaceLever). One copy is placed at its owner's last known point through teleportTo(pos, floor) and read back the same
+// frame, two frames later and ~1 s later: its height, its floor (getFloor), its floor group (CharMovement+0x334) and how far
+// from the asked x,z it stands. While a reading is open the drive walk does not call DrivePuppet for that copy
+// (FloorPlaceTestStep answers true), so nothing of the drive's - push, path, catch-up, floor placement - moves it; what is
+// read is the engine's own doing. Only the lever fills g_fpTests; while it is empty nothing here runs.
+struct FloorPlaceTest
+{
+    long long startTick; double startSec;
+    float rx, ry, rz; int floorArg;
+    bool said2; long long heldFrames;
+    bool sameOk; float sameX, sameY, sameZ;
+};
+std::map<unsigned int, FloorPlaceTest> g_fpTests;
+const double kFloorPlaceHoldSec = 1.0;          // the drive is held this long after the placement
+const long long kFloorPlaceMaxFrames = 600;     // ... or this many frames, whichever comes first
+
+// One [FLOORPLACE] reading. mode 0 = before the placement, 1 = the same frame (stored for the later readings), 2 = later.
+// No __try here (FloorReadPod holds it, C2712).
+void FloorPlaceReading(unsigned int uid, Puppet& p, FloorPlaceTest& t, const char* at, int mode)
+{
+    Ogre::Vector3 now;
+    const bool posOk = SafeReadPosition(p.ch, &now);
+    CharMovement* mv = PlausibleObj(p.ch->movement) ? p.ch->movement : 0;
+    int fl = -1, sf = -1;
+    const int got = FloorReadPod(p.ch, mv, &fl, &sf);
+    std::string pos = "y=? offset=?";
+    if (posOk)
+    {
+        const float ox = now.x - t.rx, oz = now.z - t.rz;
+        pos = "y=" + F2(now.y) + " yFromReq=" + F2(now.y - t.ry) + " offset=" + F2(ox) + "," + F2(oz)
+              + " flat=" + F2(sqrtf(ox * ox + oz * oz));
+    }
+    std::string tail;
+    if (mode == 1 && posOk) { t.sameOk = true; t.sameX = now.x; t.sameY = now.y; t.sameZ = now.z; }
+    if (mode == 2)
+    {
+        if (posOk && t.sameOk)
+        {
+            const float mx = now.x - t.sameX, my = now.y - t.sameY, mz = now.z - t.sameZ;
+            tail += " movedSinceSame=" + F2(sqrtf(mx * mx + my * my + mz * mz));
+        }
+        tail += " frames=" + N2(g_tick - t.startTick) + " driveHeldFrames=" + N2(t.heldFrames) + " driveRan=0";
+    }
+    DebugLog("[FLOORPLACE] uid=" + N2(uid) + " at=" + at + " " + pos + " getFloor=" + FloorNum(got & 1, fl)
+             + " +0x334=" + FloorNum(got & 2, sf) + (p.nativeWindow ? " nativeWindow=1" : "") + tail);
+}
+
+// The drive walk asks this for every copy each frame while g_fpTests is not empty: true = a reading is open for this copy
+// and its drive is held this frame. The ~1 s reading closes it (held that frame too; the drive resumes the next).
+bool FloorPlaceTestStep(unsigned int uid, Puppet& p)
+{
+    std::map<unsigned int, FloorPlaceTest>::iterator ti = g_fpTests.find(uid);
+    if (ti == g_fpTests.end()) return false;
+    FloorPlaceTest& t = ti->second;
+    if (!PlausibleObj(p.ch) || IsRetiredObject(p.ch) || !coopuid::DriveDecision(FindSpawnedUid(p.ch), uid) || LiveCharacter(p.ch) == 0)
+    {
+        DebugLog("[FLOORPLACE] uid=" + N2(uid) + " ended: the copy is no longer live here - no further reading");
+        g_fpTests.erase(ti);
+        return false;
+    }
+    ++t.heldFrames;
+    const long long frames = g_tick - t.startTick;
+    if (!t.said2 && frames >= 2)
+    {
+        t.said2 = true;
+        FloorPlaceReading(uid, p, t, "2frames", 2);
+    }
+    if (NowSeconds() - t.startSec >= kFloorPlaceHoldSec || frames >= kFloorPlaceMaxFrames)
+    {
+        FloorPlaceReading(uid, p, t, "1s", 2);
+        DebugLog("[FLOORPLACE] uid=" + N2(uid) + " done after " + F2((float)(NowSeconds() - t.startSec))
+                 + " s - the drive resumes for this copy");
+        g_fpTests.erase(ti);
+    }
     return true;
 }
 
@@ -3547,6 +3694,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
         }
         if (p.driving) { if (PlausibleObj(p.ch->movement)) SafeStopMovement(p.ch->movement); p.driving = false; }
         PoseNoteHeldFrame();
+        FloorPendingDrop(uid, p, "the pose hold");   // T-986 g3: the pose places the copy itself
         return;
     }
 
@@ -3558,13 +3706,26 @@ void DrivePuppet(unsigned int uid, Puppet& p)
     // simulation runs again, so the first running frame carries on as if no time had passed.
     if (g_simHeld) { ++g_judgeHeldFrames; return; }
 
-    // H015 / P059 - INSIDE A NATIVE COMBAT WINDOW THE AI OWNS THE LEGS. Measured, not driven:
-    // the AI is closing on the same target the authority's copy is closing on, so the two bodies
-    // should track each other without a push, and any gap is the window's own drift number.
-    // Correction happens ONCE, at window close (SnapPuppetToAuthority), on the authority's edge.
+    // H015 / P059 - INSIDE A NATIVE COMBAT WINDOW THE AI OWNS THE LEGS. Measured, not driven: the AI closes on the same target
+    // the owner's character is closing on, and any gap is the window's own drift number. Correction happens at window close
+    // (SnapPuppetToAuthority). T-986 (drift bound): THE WINDOW IS BOUNDED BY DISTANCE. The two bodies track each other only
+    // while the owner moves too: in T1425 the owners stood in attack mode, no OFF edge was ever sent, and the copies ran to their
+    // target and stayed 5,000-6,700 units away until the game quit - this branch returns before the far snap, so nothing
+    // brought them back. A copy past kLostDist (the far snap's own distance), on a FRESH owner sample (the far snap's 3 s rule,
+    // PuppetFreshAuthorityPos - a stale stream never closes a window), is queued here and its window closed after the drive walk
+    // (combat.cpp CloseNativeWindowForDrift, reason "drift": AI gated, its pass waited out, order cleared; combat mode and the
+    // action KEPT - T-986 fold 1 - the owner's OFF ends them); the ordinary drive then has it, and only a fresh ON from the
+    // owner opens a window again.
     if (p.nativeWindow)
     {
+        FloorPendingDrop(uid, p, "a fight window");   // T-986 g3: the fight AI walks the copy itself
         if (dist > p.nativeMaxDrift) p.nativeMaxDrift = dist;
+        float freshX = 0.0f, freshZ = 0.0f;   // T-986 fold 1: unused; the call is the far snap's freshness test
+        if (winbound::DriftClosesWindow(true, dist, kLostDist) && PuppetFreshAuthorityPos(uid, &freshX, &freshZ))
+        {
+            DriftCloseRow row; row.uid = uid; row.dist = dist;
+            g_driftCloseQueue.push_back(row);
+        }
         if (p.pathMode)   // D1: the AI owns the legs in a native window. D1-b item 5: stopped, so it does not walk the old path
         {
             p.pathMode = false; PathForgetDest(p); p.pathWantIssue = false; p.pathGrant = false;
@@ -3946,10 +4107,26 @@ void DrivePuppet(unsigned int uid, Puppet& p)
 
     // A follow copy whose owner stated its stop arrives within that stop's radius (p.fStopArrive, set above): a player's copy
     // is landed on the spot rather than within the general radius, unless it stopped closing on it.
+    // T-986 s: a catch-up placement that has not shown yet holds the drive - a push from the stale spot carried the copy past the
+    // point it was placed at (P157, T1436). Released on the flat move or the bound; the progress window then starts from here.
+    if (p.placeHold)
+    {
+        const float hx = cur.x - p.placeFromX, hz = cur.z - p.placeFromZ;
+        const int h = copyjudge::PlaceHold(Finite(cur.x) && Finite(cur.z), hx * hx + hz * hz, NowSeconds() - p.placeHoldAt);
+        if (h == copyjudge::kPlaceHeld) { ++g_placeHeldFrames; p.driving = false; return; }
+        p.placeHold = false;
+        if (h == copyjudge::kPlaceLanded) ++g_placeHoldLanded; else ++g_placeHoldTimedOut;
+        p.progressCheckTick = g_tick;
+        p.progressFromX = cur.x; p.progressFromZ = cur.z;
+        p.progressFromDist = dist;
+        p.progressFromTX = p.tx; p.progressFromTZ = p.tz;
+        p.stalledWindows = 0;
+    }
     const float arriveDist = (p.follow && p.stopHeld) ? p.fStopArrive : kArriveDist;
     // T-424 / T-472: a copy on another floor than its stopped owner - under it (it reads arrived) or short of a climb it
     // stopped closing on - is placed at the owner's height (FloorStep). This arrival test and the progress window stay flat.
-    if (FloorStep(uid, p, mv, cur, dist, arriveDist, authMoving)) return;
+    if (FloorStep(uid, p, mv, cur, dist, arriveDist,
+                  authMoving || (p.follow && followplay::OwnerMovingNow(p.trk, ageSec, horizon)))) return;   // T-986 g2: the follow drive's own answer
     if (dist <= arriveDist)
     {
         /* recheck-r2b item 1: an arrived copy restarts its progress window here, so the first window judged after it
@@ -4220,22 +4397,47 @@ void DrivePuppet(unsigned int uid, Puppet& p)
                              + RearmNote(p));
                 }
             }
-            else if (p.snapWatchWindows >= kSnapStrikeWindows) p.snapWatchWindows = -1;
+            else if (p.snapWatchWindows >= kSnapStrikeWindows)
+            {
+                p.snapWatchWindows = -1;
+                p.moveLifts = 0;   // T-986 floorplace fold: the placement held - the owner-moved lift distance starts at kCatchupEnter again
+            }
         }
 
         // T-573: a given-up copy waits its judged windows, then is tried again - bounded and backed off (copyjudge.h), so
         // F189's runaway stays impossible while a copy no longer stands out of place for the rest of its life.
+        // T-986 floorplace: ... or sooner, on an event: its owner's point has moved kCatchupEnter or more from where it was at
+        // the give-up (a new target is a new question; T1431's copy stayed 300 units behind a walking owner on the timer).
+        // That lift spends no timed re-arm; the 5-in-60 s rate ring every placement keeps stays the runaway guard (F189).
         if (p.catchupGaveUp)
         {
             ++p.gaveUpWindows;
-            if (copyjudge::RearmDue(p.rearms, p.gaveUpWindows))
+            const float gmx = p.tx - p.gaveUpOwnX, gmy = p.ty - p.gaveUpOwnY, gmz = p.tz - p.gaveUpOwnZ;
+            const float ownerMovedSq = gmx * gmx + gmy * gmy + gmz * gmz;
+            const float liftDist = copyjudge::MoveLiftDist(p.moveLifts, kCatchupEnter);   // T-986 floorplace fold: doubles per failed lift
+            const int lift = copyjudge::GiveUpLift(p.rearms, p.gaveUpWindows, p.gaveUpOwnSet, ownerMovedSq, liftDist);
+            if (lift == copyjudge::kLiftOwnerMoved)
+            {
+                ++g_catchupLiftOwnerMoved;
+                ++p.moveLifts;   // T-986 floorplace fold: the next owner-moved lift needs twice the distance, until a placement holds
+                const int waited = p.gaveUpWindows;
+                p.catchupGaveUp = false; p.catchupTries = 0; p.snapStrikes = 0; p.snapWatchWindows = -1; p.gaveUpWindows = 0;
+                p.gaveUpOwnSet = false;
+                ErrorLog("[M2] catch-up LIFTED uid=" + N2(uid) + " reason=owner-moved (its owner moved " + F2(sqrtf(ownerMovedSq))
+                         + " >= liftDist " + F2(liftDist) + ", next " + F2(copyjudge::MoveLiftDist(p.moveLifts, kCatchupEnter)) + ";"
+                         + " from " + F2(p.gaveUpOwnX) + "," + F2(p.gaveUpOwnY) + "," + F2(p.gaveUpOwnZ) + " after " + N2(waited)
+                         + " judged windows, drift " + F2(dist) + "; timed re-arms used " + N2(p.rearms) + " of "
+                         + N2(copyjudge::kMaxRearms) + ", unchanged) - the stuck, far and floor placements may place this copy again");
+            }
+            else if (lift == copyjudge::kLiftTimer)
             {
                 ++p.rearms;
                 ++g_catchupRearmed;
                 p.catchupGaveUp = false; p.catchupTries = 0; p.snapStrikes = 0; p.snapWatchWindows = -1; p.gaveUpWindows = 0;
+                p.gaveUpOwnSet = false;
                 ErrorLog("[M2] catch-up RE-ARMED uid=" + N2(uid) + " (re-arm " + N2(p.rearms) + " of "
                          + N2(copyjudge::kMaxRearms) + ", drift " + F2(dist) + ") - the give-up is lifted; the stuck and"
-                         " far placements may place this copy again");
+                         " far placements may place this copy again. reason=timer");
             }
         }
 
@@ -4302,6 +4504,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
             }
             P071NotePlacement(uid, p.ch, 1, plX, p.ty, plZ);   // PROBE P071
             mv->teleportTo(Ogre::Vector3(plX, p.ty, plZ), -1);
+            PlaceHoldStart(p, cur);   // T-986 s: no push from the stale spot until the placement shows
             PathForgetDest(p);   // D1 item 3 (snap 1)
             p.fHeld = false;
 
@@ -4402,6 +4605,7 @@ void DrivePuppet(unsigned int uid, Puppet& p)
             }
             P071NotePlacement(uid, p.ch, 2, plX, p.ty, plZ);   // PROBE P071
             mv->teleportTo(Ogre::Vector3(plX, p.ty, plZ), -1);
+            PlaceHoldStart(p, cur);   // T-986 s: no push from the stale spot until the placement shows
             PathForgetDest(p);   // D1 item 3 (snap 2)
             p.fHeld = false;
 
@@ -4609,6 +4813,9 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
         p.stalledWindows = 0; p.catchupPending = false; p.catchupDriftBefore = 0.0f;
         p.catchupFromX = 0.0f; p.catchupFromZ = 0.0f; p.catchupTries = 0; p.catchupGaveUp = false;
         p.rearms = 0; p.gaveUpWindows = 0; p.heldFromTick = -1; p.heldFromSec = -1.0;   // T-573
+        p.gaveUpOwnSet = false; p.gaveUpOwnX = 0.0f; p.gaveUpOwnY = 0.0f; p.gaveUpOwnZ = 0.0f;   // T-986 floorplace
+        p.moveLifts = 0;   // T-986 floorplace fold
+        p.placeHold = false; p.placeHoldAt = 0.0; p.placeFromX = 0.0f; p.placeFromZ = 0.0f;   // T-986 s: no placement pending
         p.progressFromTX = 0.0f; p.progressFromTZ = 0.0f; p.snapCause = 0; p.snapWatchWindows = -1; p.snapStrikes = 0;
         for (int si = 0; si < kSnapRateMax; ++si) p.snapTimes[si] = -1.0e9;
         p.snapTimesNext = 0; p.unstickEnded = false;
@@ -4731,6 +4938,7 @@ void ApplyRemoteMove(unsigned int uid, float x, float y, float z, float velX, fl
         }
     }
     p.tx = x; p.ty = y; p.tz = z; p.ownerSampleAt = NowSeconds();
+    NoteGiveUpOwnerPoint(p);   // T-986 floorplace fold
     p.velX = velX; p.velZ = velZ;
     if (Finite(authDesiredSpeed) && authDesiredSpeed >= 0.0f) p.authDesired = authDesiredSpeed;   // 0 is a real level; -1 = the authority could not read it
     if (Finite(faceX) && Finite(faceZ) && (faceX != 0.0f || faceZ != 0.0f)) { p.faceX = faceX; p.faceZ = faceZ; }   // H024
@@ -5141,6 +5349,7 @@ void ApplyRemoteMoveStop(unsigned int uid, float x, float y, float z, unsigned i
     sm.x = x; sm.y = y; sm.z = z; sm.vx = 0.0f; sm.vz = 0.0f; sm.t = stopT; sm.still = true;
     if (followplay::Push(&p.trk, sm) == 0) ++g_followOutOfOrder;
     p.tx = x; p.ty = y; p.tz = z; p.velX = 0.0f; p.velZ = 0.0f; p.ownerSampleAt = NowSeconds();   // what a standing report at the stop point would set
+    NoteGiveUpOwnerPoint(p);   // T-986 floorplace fold
     p.ownSpd = 0.0f;   // the smoothed speed restarts from the owner's real one when it moves again
     if (p.goalHave) { p.goalSpent = true; p.goalSpentX = p.goalX; p.goalSpentZ = p.goalZ; }
     p.goalHave = false;
@@ -5336,6 +5545,7 @@ void P071Tick()
         P071Rec& r = g_p071[i];
         if (!r.used) continue;
         if (!r.armed) { r.armed = 1; continue; }   // noted this frame: report on the next one
+#ifdef SW_DEV_BUILD   /* T-879 G: P071 is a DEV probe - the line's text and its building are the test build's only; the slot is freed in both */
         char buf[400];
         if (!P071StillMapped(r.uid, r.ch))
         {
@@ -5354,7 +5564,10 @@ void P071Tick()
                       lg[1] - r.y, got == 2 ? an[1] - r.y : 0.0f, floorAfter, g_p071Dropped);
         }
         r.used = 0;
-        DebugLog(std::string(buf));
+        SW_DEVLOG(std::string(buf));   /* T-879 F: P071 is a DEV probe - the line is the test build's only; the notes (capped at kP071Cap) are unchanged */
+#else
+        r.used = 0;
+#endif   /* SW_DEV_BUILD - T-879 G */
     }
 }
 // PROBE-END: P071
@@ -5531,7 +5744,7 @@ static void P115Line(const char* buf)
 {
     if (g_p115Lines >= kP115LineCap) { ++g_p115Capped; return; }
     ++g_p115Lines;
-    DebugLog(std::string(buf));
+    SW_DEVLOG(std::string(buf));   /* T-879 F: P115 is a DEV probe - its lines are the test build's only; the cap and counts are unchanged */
 }
 static int P115OwnPlayerPod(::Character* c)   // 1 = this game's player faction, 0 = not, -1 = the read faulted
 {
@@ -5571,12 +5784,16 @@ static void P115OwnStep(unsigned int uid, ::Character* c, P115Own& o, double now
                 const float des = AuthorityDesiredSpeed(c);
                 float run = 0.0f, animMax = 0.0f;
                 const bool runOk = RunCeilingRead(c, &run, &animMax);
+#ifdef SW_DEV_BUILD   /* T-879 G: P115 is a DEV probe - the line's text and its building are the test build's only; P115Line still counts in both */
                 char buf[320];
                 _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                             "[PROBE] P115 move order uid=%u target=%.1f,%.1f from=%.1f,%.1f dist=%.1f run=%s des=%.1f runSpd=%.1f t=%.2f",
                             uid, dx, dz, p.x, p.z, P115Dist(dx, dz, p.x, p.z),
                             runOk ? (cooprunboost::OwnerRuns(des, run) ? "1" : "0") : "?", des, runOk ? run : -1.0f, now);
                 P115Line(buf);
+#else
+                P115Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
             }
             else ++g_p115RateLimited;
         }
@@ -5599,6 +5816,7 @@ static void P115OwnStep(unsigned int uid, ::Character* c, P115Own& o, double now
     if (now - o.lastArriveLine >= kP115RateSec)
     {
         o.lastArriveLine = now;
+#ifdef SW_DEV_BUILD   /* T-879 G: P115 is a DEV probe - the line's text and its building are the test build's only; P115Line still counts in both */
         char buf[320];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "[PROBE] P115 arrive uid=%u at=%.1f,%.1f after=%.2f target=%.1f,%.1f miss=%.1f maxSpd=%.1f t=%.2f",
@@ -5606,6 +5824,9 @@ static void P115OwnStep(unsigned int uid, ::Character* c, P115Own& o, double now
                     o.haveOrder ? o.tx : 0.0f, o.haveOrder ? o.tz : 0.0f,
                     o.haveOrder ? P115Dist(o.stopX, o.stopZ, o.tx, o.tz) : -1.0f, o.maxSpd, o.stillSince);
         P115Line(buf);
+#else
+        P115Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
     }
     else ++g_p115RateLimited;
     o.haveOrder = false; o.maxSpd = 0.0f;
@@ -5643,6 +5864,7 @@ static void P115CpFinish(unsigned int uid, P115Cp& s, double now, const char* wh
     else ++g_p115Resumed;
     if (now - s.lastLine < kP115RateSec) { ++g_p115RateLimited; return; }
     s.lastLine = now;
+#ifdef SW_DEV_BUILD   /* T-879 G: P115 is a DEV probe - the line's text and its building are the test build's only; P115Line still counts in both */
     char buf[480];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "[PROBE] P115 copy settle uid=%u end=%s ownerStop=%.1f,%.1f copyFarthest=%.1f,%.1f overshoot=%.1f backtrack=%d back=%.1f"
@@ -5651,6 +5873,9 @@ static void P115CpFinish(unsigned int uid, P115Cp& s, double now, const char* wh
                 settled ? s.stillSince - s.stopAt : -1.0, s.maxSpd, s.boost ? 1 : 0, e.x, e.z, P115Dist(e.x, e.z, s.stopX, s.stopZ),
                 maxAlong, P115Dist(s.stopX, s.stopZ, s.startX, s.startZ), (ux != 0.0f || uz != 0.0f) ? 1 : 0, (int)s.trail.size(), now);
     P115Line(buf);
+#else
+    P115Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 // COPY: every MOVE that passed ApplyRemoteMove's gates (main thread, the drain).
@@ -5792,7 +6017,7 @@ static void P124Line(const char* buf)
 {
     if (g_p124Lines >= kP124LineCap) { ++g_p124Capped; return; }
     ++g_p124Lines;
-    DebugLog(std::string(buf));
+    SW_DEVLOG(std::string(buf));   /* T-879 F: P124 is a DEV probe - its lines are the test build's only; the cap and counts are unchanged */
 }
 
 // COPY: every MOVE that passed ApplyRemoteMove's gates (main thread, the drain); `p` is the report's copy row.
@@ -5835,6 +6060,7 @@ static void P124Finish(unsigned int uid, P124Cp& s, double now)
     if (m.overshoot > g_p124MaxOver) g_p124MaxOver = m.overshoot;
     if (m.backtrack) ++g_p124Backtracks;
     const p124::Pt& f = s.trail[m.farIndex >= 0 ? m.farIndex : n - 1];
+#ifdef SW_DEV_BUILD   /* T-879 G: P124 is a DEV probe - the line's text and its building are the test build's only; P124Line still counts in both */
     char buf[480];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "[PROBE] P124 npc stop uid=%u lastMoving=%.1f,%.1f ownerSpd=%.1f still=%.1f,%.1f copyFarthest=%.1f,%.1f overshoot=%.1f"
@@ -5842,6 +6068,9 @@ static void P124Finish(unsigned int uid, P124Cp& s, double now)
                 uid, s.lastX, s.lastZ, sqrtf(s.lastVx * s.lastVx + s.lastVz * s.lastVz), s.stillX, s.stillZ, f.x, f.z, m.overshoot,
                 m.backtrack, m.back, m.endDist, s.trail[n - 1].x, s.trail[n - 1].z, m.headingOk, n, now);
     P124Line(buf);
+#else
+    P124Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 static void P124Frame()
@@ -5905,7 +6134,7 @@ static void P123Line(const char* buf)
 {
     if (g_p123Lines >= kP123LineCap) { ++g_p123Capped; return; }
     ++g_p123Lines;
-    DebugLog(std::string(buf));
+    SW_DEVLOG(std::string(buf));   /* T-879 F: P123 is a DEV probe - its lines are the test build's only; the cap and counts are unchanged */
 }
 static const char* P123ModeName(int m)
 {
@@ -5926,11 +6155,15 @@ static P123Cp* P123Slot(unsigned int uid)
 }
 static void P123OwnerStop(unsigned int uid, double bodyStopAt, long long frames, double now, int eng, const Ogre::Vector3& at)
 {
+#ifdef SW_DEV_BUILD   /* T-879 G: P123 is a DEV probe - the line's text and its building are the test build's only; P123Line still counts in both */
     char buf[256];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "[PROBE] P123 stop side=owner uid=%u at=%.1f,%.1f bodyStopAt=%.3f sentAt=%.3f frames=%lld eng=%d t=%.3f",
                 uid, at.x, at.z, bodyStopAt, now, frames, eng, now);
     P123Line(buf);
+#else
+    P123Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 static void P123CopyStopRecv(unsigned int uid, const Puppet& p, double now)
 {
@@ -5942,22 +6175,30 @@ static void P123CopyStopRecv(unsigned int uid, const Puppet& p, double now)
     const bool ok = SafeReadPosition(p.ch, &v);
     const float dx = p.stopX - v.x, dz = p.stopZ - v.z;
     const float shortAlong = (ok && p.fHaveH) ? dx * p.fHX + dz * p.fHZ : -999.0f;
+#ifdef SW_DEV_BUILD   /* T-879 G: P123 is a DEV probe - the line's text and its building are the test build's only; P123Line still counts in both */
     char buf[320];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "[PROBE] P123 stop side=copy recv uid=%u at=%.1f,%.1f copy=%.1f,%.1f shortAlong=%.2f dist=%.2f vum=%d path=%d t=%.3f",
                 uid, p.stopX, p.stopZ, v.x, v.z, shortAlong, ok ? sqrtf(dx * dx + dz * dz) : -1.0f, p.fVum, p.pathMode ? 1 : 0, now);
     P123Line(buf);
+#else
+    P123Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 static void P123Held(unsigned int uid, const Puppet& p, const Ogre::Vector3& cur, double now)
 {
     if (!p.followPlayer || P123Slot(uid) == 0) return;
     const float lx = p.stopHeld ? p.stopX : p.fNX, lz = p.stopHeld ? p.stopZ : p.fNZ;
+#ifdef SW_DEV_BUILD   /* T-879 G: P123 is a DEV probe - the line's text and its building are the test build's only; P123Line still counts in both */
     char buf[288];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "[PROBE] P123 held uid=%u at=%s limit=%.1f,%.1f copy=%.1f,%.1f along=%.2f ownerMoving=%d vum=%d t=%.3f",
                 uid, p.stopHeld ? "stop" : "newest", lx, lz, cur.x, cur.z, (cur.x - lx) * p.fHX + (cur.z - lz) * p.fHZ,
                 p.fMoving ? 1 : 0, p.fVum, now);
     P123Line(buf);
+#else
+    P123Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 static void P123Frame()
 {
@@ -5981,12 +6222,17 @@ static void P123Frame()
         const bool active = p.fLastMovingAt > 0.0 && now - p.fLastMovingAt <= kP123ActiveSec;
         if (active && step > kP123JumpDist)
         {
+#ifdef SW_DEV_BUILD   /* T-879 G: P123 is a DEV probe - the line's text and its building are the test build's only; P123Line still counts in both */
             char jb[288];
             _snprintf_s(jb, sizeof(jb), _TRUNCATE,
                         "[PROBE] P123 jump uid=%u step=%.1f dt=%.3f from=%.1f,%.1f to=%.1f,%.1f vum=%d path=%d mode=%s t=%.3f",
                         it->first, step, dt, fromX, fromZ, v.x, v.z, p.fVum, p.pathMode ? 1 : 0, P123ModeName(p.fMode), now);
             P123Line(jb);
+#else
+            P123Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
         }
+#ifdef SW_DEV_BUILD   /* T-879 A: the P123 f line is the test build's only (a DEV probe kept for T-484); its reads feed only this line */
         if (active)
         {
             double tc = 0.0;
@@ -6005,15 +6251,20 @@ static void P123Frame()
                         p.pathMode ? 1 : 0, now);
             P123Line(fb);
         }
+#endif   /* T-879 A */
         if (st->stopOpen && (spd < kP123SettleSpd || !p.stopHeld || now - st->stopRecvAt > kP123SettleMaxSec))
         {
             const float sx = p.stopX - v.x, sz = p.stopZ - v.z;
+#ifdef SW_DEV_BUILD   /* T-879 G: P123 is a DEV probe - the line's text and its building are the test build's only; P123Line still counts in both */
             char sb[288];
             _snprintf_s(sb, sizeof(sb), _TRUNCATE,
                         "[PROBE] P123 stop side=copy settle uid=%u after=%.3f endDist=%.2f shortAlong=%.2f end=%s t=%.3f",
                         it->first, now - st->stopRecvAt, sqrtf(sx * sx + sz * sz), p.fHaveH ? sx * p.fHX + sz * p.fHZ : -999.0f,
                         spd < kP123SettleSpd ? "still" : (!p.stopHeld ? "cleared" : "timeout"), now);
             P123Line(sb);
+#else
+            P123Line(0);   /* counts only - the release build has no line */
+#endif   /* SW_DEV_BUILD - T-879 G */
             st->stopOpen = false;
         }
     }
@@ -6038,6 +6289,7 @@ void ReplicateTick()
     // mirror1 (crash T487) C - release the rows of finished characters, BEFORE the drive walk below:
     // the reclaim drops puppets, so it must never run inside it. Every 30 frames (a 4096-row scan since T-354; T-354 fold 1).
     DrainOffThreadDespawns();   // T-304 (2): this game's off-thread destroys are announced here, before the reclaim frees their rows
+    RehandleTick();   // copies whose engine handle changed: refused rows finished and booked lost, missed owner deaths applied
     if ((g_tick % 30) == 0) MirrorReclaimDestroyed();
 
     // T-573: this frame's stopped state, read live from the engine (its pause flag or a zero speed multiplier - the P039
@@ -6055,7 +6307,8 @@ void ReplicateTick()
          it != g_puppets.end(); ++it)
     {
         HoldShiftClocks(it->second, shiftNow);   // T-573: before the drive, so no judgement spans a stop
-        DrivePuppet(it->first, it->second);
+        if (g_fpTests.empty() || !FloorPlaceTestStep(it->first, it->second))   // T-986 floorplace TEST-ONLY: a reading holds the drive
+            DrivePuppet(it->first, it->second);
         RunBoostSettle(it->first, it->second);   // T-189 runboost: a raise the drive did not renew this frame ends
     }
     if (!g_farUnloadedQueue.empty())   // the far branch's copies whose owner is in an area not loaded here, after the walk
@@ -6063,6 +6316,12 @@ void ReplicateTick()
         std::vector<FarUnloadedRow> q;
         q.swap(g_farUnloadedQueue);
         for (size_t i = 0; i < q.size(); ++i) RetireCopyOwnerUnloaded(q[i].uid, q[i].x, q[i].y, q[i].z);
+    }
+    if (!g_driftCloseQueue.empty())   // T-986: windows past the far snap's distance, closed after the walk (as an OFF edge closes one)
+    {
+        std::vector<DriftCloseRow> q;
+        q.swap(g_driftCloseQueue);
+        for (size_t i = 0; i < q.size(); ++i) CloseNativeWindowForDrift(q[i].uid, q[i].dist, kLostDist);
     }
     ProcessPendingHandoffs();   // H019: score handoffs whose pass has had time to run
     FollowOwnerStopFrame();   // every frame: the stated stop of this game's armed (walking) characters
@@ -6240,6 +6499,9 @@ void AdoptRemotePuppet(unsigned int uid)
         p.stalledWindows = 0; p.catchupPending = false; p.catchupDriftBefore = 0.0f;
         p.catchupFromX = 0.0f; p.catchupFromZ = 0.0f; p.catchupTries = 0; p.catchupGaveUp = false;
         p.rearms = 0; p.gaveUpWindows = 0; p.heldFromTick = -1; p.heldFromSec = -1.0;   // T-573
+        p.gaveUpOwnSet = false; p.gaveUpOwnX = 0.0f; p.gaveUpOwnY = 0.0f; p.gaveUpOwnZ = 0.0f;   // T-986 floorplace
+        p.moveLifts = 0;   // T-986 floorplace fold
+        p.placeHold = false; p.placeHoldAt = 0.0; p.placeFromX = 0.0f; p.placeFromZ = 0.0f;   // T-986 s: no placement pending
         p.progressFromTX = 0.0f; p.progressFromTZ = 0.0f; p.snapCause = 0; p.snapWatchWindows = -1; p.snapStrikes = 0;
         for (int si = 0; si < kSnapRateMax; ++si) p.snapTimes[si] = -1.0e9;
         p.snapTimesNext = 0; p.unstickEnded = false;
@@ -6570,6 +6832,7 @@ void DropPuppet(unsigned int uid, bool restoreSpeed)
     else if (!restoreSpeed && p.speedSaved)
         ++g_speedRestoreSkipped;
 
+    g_fpTests.erase(it->first);   // T-986 floorplace fold: an open floorplace reading ends with its row
     g_puppets.erase(it);
 }
 
@@ -7093,6 +7356,7 @@ int SnapPuppetToAuthority(unsigned int uid, float* driftBefore, float* driftSame
     if (driftBefore) *driftBefore = sqrtf(dx * dx + dz * dz);
     P071NotePlacement(uid, p.ch, 3, p.tx, p.ty, p.tz);   // PROBE P071
     mv->teleportTo(Ogre::Vector3(p.tx, p.ty, p.tz), -1);
+    PlaceHoldStart(p, cur);   // T-986 s: the ordinary drive takes the copy back next frame - held until the placement shows
     PathForgetDest(p);   // D1 item 3 (snap 3)
     Ogre::Vector3 now = p.ch->worldPosition();
     dx = p.tx - now.x; dz = p.tz - now.z;
@@ -7197,6 +7461,49 @@ int ForceCatchupGiveUp(unsigned int uid)
         ErrorLog("[M2] TEST giveup uid=" + N2(it->first) + " - marked given up as a failed placement would." + RearmNote(p));
     }
     return n;
+}
+
+// T-986 floorplace TEST-ONLY lever (`floorplace <uid|name:<Name>|spawned:<T>> <floor -1..3> [dx dz]`; FloorPlaceTestStep holds
+// the drive for the reading). Refused: a floor outside -1..3, an offset beyond 500 units, this game's own character, no copy of
+// the uid here, a reading of it still open, no owner sample heard yet, and a copy the catch-up placements could not place either
+// (not live here, no movement object, ragdolled - F324 - or not standing). Places nothing else and changes no switch.
+std::string FloorPlaceLever(unsigned int uid, int floorArg, float dx, float dz)
+{
+    if (floorArg < -1 || floorArg > 3) return "error floorplace: the floor must be -1..3";
+    if (!(dx > -500.01f && dx < 500.01f && dz > -500.01f && dz < 500.01f)) return "error floorplace: the offset must be within 500 units";
+    if (net::IsUidMine(uid)) return "error floorplace: uid " + N2(uid) + " is this game's own character - refused, copies only";
+    std::map<unsigned int, Puppet>::iterator it = g_puppets.find(uid);
+    if (it == g_puppets.end()) return "error floorplace: no copy of uid " + N2(uid) + " on this game";
+    Puppet& p = it->second;
+    if (g_fpTests.find(uid) != g_fpTests.end()) return "error floorplace: a reading of uid " + N2(uid) + " is still open";
+    if (p.ownerSampleAt <= 0.0) return "error floorplace: no owner position heard for this copy yet";
+    if (!PlausibleObj(p.ch) || IsRetiredObject(p.ch) || !coopuid::DriveDecision(FindSpawnedUid(p.ch), uid) || LiveCharacter(p.ch) == 0
+        || !PlausibleObj(*(void**)((char*)p.ch + kAnimationClassOff)))
+        return "error floorplace: the copy is not live on this game";
+    CharMovement* mv = p.ch->movement;
+    if (!PlausibleObj(mv)) return "error floorplace: the copy has no movement object";
+    if (SafeIsRagdoll(p.ch)) return "error floorplace: the copy is ragdolled (a placement cannot take, F324)";
+    if (ReadProneStatePod(p.ch) != 0) return "error floorplace: the copy is not standing";
+
+    FloorPlaceTest t;
+    t.startTick = g_tick; t.startSec = NowSeconds();
+    t.rx = p.tx + dx; t.ry = p.ty; t.rz = p.tz + dz; t.floorArg = floorArg;
+    t.said2 = false; t.heldFrames = 0;
+    t.sameOk = false; t.sameX = 0.0f; t.sameY = 0.0f; t.sameZ = 0.0f;
+    DebugLog("[FLOORPLACE] uid=" + N2(uid) + " floorArg=" + N2(floorArg) + " req=" + F2(t.rx) + "," + F2(t.ry) + "," + F2(t.rz)
+             + " offsetArg=" + F2(dx) + "," + F2(dz) + " ownerSampleAge=" + F2((float)(NowSeconds() - p.ownerSampleAt)) + "s");
+    FloorPlaceReading(uid, p, t, "before", 0);
+    mv->teleportTo(Ogre::Vector3(t.rx, t.ry, t.rz), floorArg);
+    // As after the floor placement: an unstick order no longer pushes, and the drive's walk state starts again.
+    if (p.unsticking) { p.unsticking = false; p.orderActive = false; ClearAttackOrder(p.ch); }
+    p.unstickEnded = false;
+    p.stalledWindows = 0;
+    PathForgetDest(p);
+    p.fHeld = false;
+    p.driving = false;
+    FloorPlaceReading(uid, p, t, "same", 1);
+    g_fpTests[uid] = t;
+    return "ok floorplace uid=" + N2(uid) + " floor=" + N2(floorArg);
 }
 
 // P037 / F315. See the constants block for why this is a TEST before it is a fix, and why it is
@@ -7320,8 +7627,11 @@ void ReportReplication()
        << " catchupEffective=" << N2(g_catchupEffective)
        << " catchupIneffective=" << N2(g_catchupIneffective)
        << " catchupGaveUp=" << N2(g_catchupGaveUp)
-       << " catchupGaveUpFinal=" << N2(g_catchupGaveUpFinal)   // T-573
+       << " catchupGaveUpFinal=" << N2(g_catchupGaveUpFinal)   // T-573: no timed re-arm left; not final since T-986 floorplace fold (an owner's move lifts it)
        << " catchupRearmed=" << N2(g_catchupRearmed)
+       << " catchupLiftOwnerMoved=" << N2(g_catchupLiftOwnerMoved)   // T-986 floorplace
+       << " placeHold[landed,timedOut,heldFrames]=" << N2(g_placeHoldLanded) << "," << N2(g_placeHoldTimedOut)
+       << "," << N2(g_placeHeldFrames)   // T-986 s: the drive held after a placement until it showed
        << " judgeHeldFrames=" << N2(g_judgeHeldFrames)
        << " judgeHeldResumes=" << N2(g_judgeHeldResumes)
        << " catchupSkippedRagdoll=" << N2(g_catchupSkippedRagdoll)
@@ -7491,7 +7801,9 @@ void ReportReplication()
     DebugLog(ss.str());
     // T-424: the floor placement (FloorStep)
     DebugLog("[FLOOR] REPORT floorPlace[checked,placed,ok,again,gaveUp,gated,faults]=" + N2(g_floorChecked) + "," + N2(g_floorPlaced)
-             + "," + N2(g_floorOk) + "," + N2(g_floorAgain) + "," + N2(g_floorGaveUp) + "," + N2(g_floorGated) + "," + N2(g_floorFaults));
+             + "," + N2(g_floorOk) + "," + N2(g_floorAgain) + "," + N2(g_floorGaveUp) + "," + N2(g_floorGated) + "," + N2(g_floorFaults)
+             + " judged[landed,waited]=" + N2(g_floorJudgedLanded) + "," + N2(g_floorJudgedWaited)
+             + " pendingDropped=" + N2(g_floorPendingDropped));   // T-986 g3: results dropped by the pose hold or a fight window
     // PROBE-START: P093
     DebugLog(P093SummaryLine());
     // PROBE-END: P093
@@ -7522,6 +7834,7 @@ void ReplicateWorldTeardown()
     long long windows = 0;
     for (std::map<unsigned int, Puppet>::const_iterator it = g_puppets.begin(); it != g_puppets.end(); ++it)
         if (it->second.nativeWindow) ++windows;
+    g_fpTests.clear();   // T-986 floorplace fold: open floorplace readings end with the table
     g_puppets.clear();
     g_followClk.clear(); g_followOwn.clear(); g_followOwnSent.clear();   // the owners' clocks and this game's stop watch belong to the world that is going
     g_adoptRefusedUids.clear();   // mirror1: the once-per-uid log belongs to the world that is going

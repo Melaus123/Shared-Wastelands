@@ -5909,15 +5909,12 @@ static void UiRefusedTipDrop(MyGUI::Gui* gui)
     if (tip != 0) gui->destroyWidget(tip);
     UiRectForget(g_rectRefuseTip);
 }
-/* A hover note under `parent` (on its own layer node, so it draws over the parent's other widgets' text): the thin panel
-   named `name`, one centred line `text` in the message box's text colour (widget `textName`), the panel sized to the
-   measured text plus the inset and the skin's frame. It takes no mouse. Null, with nothing left behind, when any step fails. */
-static MyGUI::Widget* UiHoverTipBuild(MyGUI::Gui* gui, MyGUI::Widget* parent, const char* name, const char* textName, const char* text)
+/* A hover note's inside, in `tip` (a fresh thin panel `W` wide): one centred line `text` in the message box's text colour
+   (widget `textName`), the panel sized to the measured text plus the inset and the skin's frame. It takes no mouse. Null, with
+   the panel destroyed, when any step fails. */
+static MyGUI::Widget* UiHoverTipFill(MyGUI::Gui* gui, MyGUI::Widget* tip, int W, const char* textName, const char* text)
 {
     const UiNames& n = NM();
-    const int W = parent->getWidth() > 200 ? parent->getWidth() : 200;   /* wide enough that the line is never clipped while measured */
-    MyGUI::Widget* tip = MkOver(parent, n.typeWidget, std::string("Kenshi_FloatingPanelThinSkin"), 0, 0, W, 60, std::string(name));
-    if (tip == 0) return 0;
     tip->setNeedMouseFocus(false);
     MyGUI::Widget* tw = Mk(tip, n.typeText, n.skinFlat, kHoverTipPadX, kHoverTipPadY, W - 2 * kHoverTipPadX - 16, 30, std::string(textName));
     MyGUI::TextBox* tb = (tw != 0) ? tw->castType<MyGUI::TextBox>(false) : 0;
@@ -5935,6 +5932,16 @@ static MyGUI::Widget* UiHoverTipBuild(MyGUI::Gui* gui, MyGUI::Widget* parent, co
     tip->setSize(MyGUI::IntSize(ts.width + 2 * kHoverTipPadX + fw, ts.height + 2 * kHoverTipPadY + fh));
     tw->setCoord(MyGUI::IntCoord(kHoverTipPadX, kHoverTipPadY, ts.width, ts.height));
     return tip;
+}
+/* A hover note under `parent` (on its own layer node, so it draws over the parent's other widgets' text): the thin panel
+   named `name`, filled by UiHoverTipFill. Null, with nothing left behind, when any step fails. */
+static MyGUI::Widget* UiHoverTipBuild(MyGUI::Gui* gui, MyGUI::Widget* parent, const char* name, const char* textName, const char* text)
+{
+    const UiNames& n = NM();
+    const int W = parent->getWidth() > 200 ? parent->getWidth() : 200;   /* wide enough that the line is never clipped while measured */
+    MyGUI::Widget* tip = MkOver(parent, n.typeWidget, std::string("Kenshi_FloatingPanelThinSkin"), 0, 0, W, 60, std::string(name));
+    if (tip == 0) return 0;
+    return UiHoverTipFill(gui, tip, W, textName, text);
 }
 /* Puts a hover note just below-right of the pointer `m`, kept inside the widget it is drawn in (above the pointer when there
    is no room below it). */
@@ -6118,6 +6125,159 @@ static void UiOptTipTick(MyGUI::Gui* gui, MyGUI::Widget* panel)
         UiLogRect(std::string(coopui::OptDefs()[i].key) == "gp.nnm" ? "nestsnote" : "feenote", tip, g_rectOptTip);
     }
 }
+
+/* RESET POPULATION IN A MULTIPLAYER WORLD - THE LOOK. The refusal itself is store.cpp's hook on ZoneManager's reset; this greys
+   the Level Editor's Reset Population button while the editor shows in a multiplayer world and puts its reason up as a hover
+   note, the same note as GAME OPTIONS' and the refused title button's: a disabled widget gets no MyGUI mouse or tooltip event,
+   so the pointer is polled each in-world frame while the button is known. The note is a root widget on the Info layer (Popup
+   when Info is unknown), because the editor's strip is too short to hold it. In single player nothing is looked up or changed,
+   except lighting the button again where the mod greyed it in an earlier multiplayer world (the panel outlives a world).
+   The button is looked up when the panel shows and forgotten when it hides or the world goes. MAIN THREAD. */
+static const char* const kEdTipName     = "SWEditorResetTip";
+static const char* const kEdTipTextName = "SWEditorResetTipText";
+static MyGUI::Widget* g_edBtn = 0;      /* the button while the editor shows (found at the show); 0 when hidden, unfound or the world went */
+static bool g_edGreyedByMod = false;    /* the mod disabled it - single player lights it again only then */
+static bool g_edDead = false;           /* a memory fault or a throw: no more looks this run (the refusal itself stays) */
+static int  g_edTipUp = 0;              /* 1 while the note is (believed) on screen - it is looked up only then */
+static int  g_edTipFails = 0;           /* builds failed in a row; at 3 it is given up for the run */
+static long long g_edCount[5] = { 0, 0, 0, 0, 0 };   /* greyed, lit again, not found, notes shown, faults */
+
+static MyGUI::Widget* UiEditorFindButton(MyGUI::Widget* w, int depth)
+{
+    if (w == 0 || depth > 12) return 0;
+    if (coopprof::EditorResetButtonName(w->getName())) return w;
+    const size_t n = w->getChildCount();
+    for (size_t i = 0; i < n; ++i)
+    {
+        MyGUI::Widget* hit = UiEditorFindButton(w->getChildAt(i), depth + 1);
+        if (hit != 0) return hit;
+    }
+    return 0;
+}
+static void UiEditorTipDrop(MyGUI::Gui* gui)
+{
+    if (g_edTipUp == 0) return;
+    g_edTipUp = 0;
+    MyGUI::Widget* tip = gui->findWidgetT(std::string(kEdTipName), false);
+    if (tip != 0) gui->destroyWidget(tip);
+}
+/* The note as a root widget on the Info layer (Popup when Info is unknown), filled by UiHoverTipFill. */
+static MyGUI::Widget* UiEditorTipBuild(MyGUI::Gui* gui, int vw)
+{
+    static const char* const kLayers[2] = { "Info", "Popup" };
+    const UiNames& n = NM();
+    const int W = vw > 200 ? vw : 200;   /* wide enough that the line is never clipped while measured */
+    for (int k = 0; k < 2; ++k)
+    {
+        MyGUI::Widget* tip = gui->createWidgetT(n.typeWidget, std::string("Kenshi_FloatingPanelThinSkin"), MyGUI::IntCoord(0, 0, W, 60),
+                                                MyGUI::Align::Default, std::string(kLayers[k]), std::string(kEdTipName));
+        if (tip == 0) return 0;
+        if (tip->getLayer() != 0) return UiHoverTipFill(gui, tip, W, kEdTipTextName, coopprof::kEditorResetRefusedText);
+        gui->destroyWidget(tip);
+    }
+    return 0;
+}
+/* The button's state from coopprof::EditorResetButtonDecide; `shown` 1 logs a greying at the panel's show. */
+static void UiEditorApply(int shown)
+{
+    if (g_edBtn == 0) return;
+    const bool mp = coop::HandSaveBlocked();
+    const int d = coopprof::EditorResetButtonDecide(mp, g_edGreyedByMod, g_edBtn->getEnabled());
+    if (d == coopprof::kEditorBtnGrey)
+    {
+        g_edBtn->setEnabled(false);
+        g_edGreyedByMod = true;
+        ++g_edCount[0];
+        if (shown != 0) DebugLog("[EDITOR] Reset Population greyed: multiplayer world (greyed=" + coopui::PanelNum(g_edCount[0]) + ")");
+    }
+    else if (d == coopprof::kEditorBtnLight)
+    {
+        g_edBtn->setEnabled(true);
+        g_edGreyedByMod = false;
+        ++g_edCount[1];
+        DebugLog("[EDITOR] Reset Population lit again: single player (lit=" + coopui::PanelNum(g_edCount[1]) + ")");
+    }
+}
+static void UiEditorShownBody(int shown)
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return;
+    g_edBtn = 0;
+    if (shown == 0 || (!coop::HandSaveBlocked() && !g_edGreyedByMod)) { UiEditorTipDrop(gui); return; }
+    MyGUI::EnumeratorWidgetPtr roots = gui->getEnumerator();
+    while (g_edBtn == 0 && roots.next()) g_edBtn = UiEditorFindButton(roots.current(), 0);
+    if (g_edBtn == 0)
+    {
+        ++g_edCount[2];
+        ErrorLog("[EDITOR] the Level Editor shows but its Reset Population button was not found (notFound=" + coopui::PanelNum(g_edCount[2])
+                 + ") - the button is not greyed; pressing it is still refused in a multiplayer world");
+        return;
+    }
+    UiEditorApply(1);
+}
+static void UiEditorTickBody()
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return;
+    if (g_edBtn != 0) UiEditorApply(0);
+    MyGUI::IntPoint m;
+    if (g_edBtn == 0 || g_edTipFails >= 3 || g_edBtn->getEnabled() || !coop::HandSaveBlocked() || !UiPointerOver(g_edBtn, &m))
+    {
+        UiEditorTipDrop(gui);
+        return;
+    }
+    int vw = 1280, vh = 720;
+    MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+    if (rm != 0) { const MyGUI::IntSize& vs = rm->getViewSize(); if (vs.width > 0 && vs.height > 0) { vw = vs.width; vh = vs.height; } }
+    MyGUI::Widget* tip = (g_edTipUp != 0) ? gui->findWidgetT(std::string(kEdTipName), false) : 0;
+    if (tip == 0)
+    {
+        g_edTipUp = 0;
+        tip = UiEditorTipBuild(gui, vw);
+        if (tip == 0)
+        {
+            if (++g_edTipFails == 3)
+                ErrorLog("[EDITOR] the Reset Population hover note could not be built 3 times in a row - given up for this run;"
+                         " the button stays greyed.");
+            return;
+        }
+        g_edTipFails = 0;
+        g_edTipUp = 1;
+        ++g_edCount[3];
+    }
+    /* below-right of the pointer, kept on screen (above the pointer when there is no room below it) */
+    int x = m.left + kHoverTipDx, y = m.top + kHoverTipDy;
+    if (x + tip->getWidth() > vw) x = vw - tip->getWidth();
+    if (y + tip->getHeight() > vh) y = m.top - tip->getHeight() - 4;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (tip->getLeft() != x || tip->getTop() != y) tip->setPosition(MyGUI::IntPoint(x, y));
+}
+static void UiEditorForgetBody()
+{
+    g_edBtn = 0;
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui != 0) UiEditorTipDrop(gui);
+}
+static void UiEditorShownCatching(int shown) { try { UiEditorShownBody(shown); } catch (...) { g_edBtn = 0; g_edDead = true; ++g_edCount[4]; } }
+static void UiEditorTickCatching() { try { UiEditorTickBody(); } catch (...) { g_edBtn = 0; g_edDead = true; ++g_edCount[4]; } }
+static void UiEditorForgetCatching() { try { UiEditorForgetBody(); } catch (...) { g_edDead = true; ++g_edCount[4]; } }
+void UiEditorPanelShown(int shown)
+{
+    if (g_edDead) return;
+    __try { UiEditorShownCatching(shown); } __except (EXCEPTION_EXECUTE_HANDLER) { g_edBtn = 0; g_edDead = true; ++g_edCount[4]; }
+}
+void UiEditorResetTick()
+{
+    if (g_edDead || (g_edBtn == 0 && g_edTipUp == 0)) return;
+    __try { UiEditorTickCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_edBtn = 0; g_edDead = true; ++g_edCount[4]; }
+}
+void UiEditorForgetWorld()
+{
+    if (g_edDead) { g_edBtn = 0; return; }
+    __try { UiEditorForgetCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_edBtn = 0; g_edDead = true; ++g_edCount[4]; }
+}
+long long UiEditorResetCount(int k) { return (k >= 0 && k < 5) ? g_edCount[k] : 0; }
 
 static void UiCreateButton(MyGUI::Widget* parent, MyGUI::Widget* exitBtn)
 {

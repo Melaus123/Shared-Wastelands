@@ -60,7 +60,7 @@
 namespace keptwire {
 
 const unsigned kMsgKept = 69;
-const unsigned kProtocol = 101;   /* the world-server protocol that carries KEPT */
+const unsigned kProtocol = 108;   /* the world-server protocol that carries KEPT */
 
 
 

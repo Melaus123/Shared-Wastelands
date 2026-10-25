@@ -42,6 +42,7 @@
 #include "../common/shotwire.h"   /* P104 fix: MSG_SHOT - the bolt's record and the Damages iShotYou builds */
 #include "../common/meleewire.h"   /* MSG_MELEE_DECIDED - the blow's record, and which game decides a blow */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
+#include "../common/windowbound.h"   /* T-986 fold 1: which close leaves combat mode (winbound::CloseKind) */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
 namespace coop { void TraderSpawnDrain(); }   /* traderspawn: items.cpp - the `traderspawn` lever runs at this same safe point */
 namespace coop { void SquadLeaderSafePointDrain(); }   /* T-1 B1: handoff.cpp - the copy squad's leader set to the owner's at this safe point */
@@ -50,7 +51,7 @@ namespace coop { void LimbSafePointDrain(); }   /* LIMBS: clothing.cpp - the own
 namespace coop { void BoxTakeDrain(); }      /* loot2c: items.cpp - the `boxtake` lever's move runs at this same safe point */
 
 #include "coop_log.h"
-namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose, g_qM6Sent, g_qM6Unknown; }   /* T-910: g_qM6Sent, g_qM6Unknown */   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
+namespace { swlogbudget::Gate g_qM6State, g_qNcOpen, g_qNcClose, g_qM6Sent, g_qM6Unknown, g_qM6NoTarget; }   /* T-910: g_qM6Sent, g_qM6Unknown; T-879: g_qM6NoTarget */   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
 #include "game/hand.h"   // P-15: the target handle is taken locally, never sent
 #include "game/CombatClass.h"      // T-186 (mig5): these three replace this file's old stand-in declarations;
@@ -4511,6 +4512,12 @@ long long g_ncOpenNoPuppet       = 0;   // no Puppet row for the uid at open - d
 long long g_ncClosedBySwitch     = 0;   // nativecombat off closed it
 long long g_ncClosedByDrop       = 0;   // DropPuppet closed it (re-gated)
 long long g_ncClosedByDropNoRegate = 0; // DropPuppet closed it and could NOT re-gate
+long long g_ncClosedDrift        = 0;   // T-986 (drift bound): the drive found the copy past the far snap's distance - closed as an OFF edge
+long long g_ncDriftNoRow         = 0;   // T-986: the drive said window, no watch row had one open - the drive was handed back
+long long g_ncClosedByOff        = 0;   // T-986 fold 1: the owner's OFF edge closed it
+long long g_ncDriftReopened      = 0;   // T-986 fold 1: a fresh ON reopened a window within kNcDriftReopenSec of a drift close of that uid
+const double kNcDriftReopenSec   = 30.0;
+std::map<unsigned int, double> g_ncDriftClosedAt;   // T-986 fold 1: uid -> when drift last closed its window (CmNowSeconds); erased at reopen / OFF
 long long g_ncCloseNoChar        = 0;   // an edge arrived for a uid with no local character
 long long g_ncSnapReason[9]      = {0, 0, 0, 0, 0, 0, 0, 0, 0};   // index = SnapPuppetToAuthority result; 7 = character unresolved; 8 = not needed (drift below kNcSnapOnlyAbove)
 const float kNcSnapOnlyAbove = 2.0f;
@@ -6076,6 +6083,7 @@ bool TrySwing(unsigned int uid, ::Character* c, CombatClass* cc, unsigned int ta
     if (outcome == 0 && g_swSetOkReported < 2)
     {
         ++g_swSetOkReported;
+#ifdef SW_DEV_BUILD   /* T-879 G: P046 is a DEV probe - the line's text and its building are the test build's only; the worked-example count stays in both; failures still print in both */
         ErrorLog("[P046] setTarget uid=" + N3(uid) + " target=" + N3(targetUid)
                  + " outcome=0:OK - currentTarget (+0x290) is the character we asked for"
                    " immediately after the call. curTarget=" + Ptr(got)
@@ -6084,6 +6092,7 @@ bool TrySwing(unsigned int uid, ::Character* c, CombatClass* cc, unsigned int ta
                  + " (worked example, printed at most twice. wasNoOp=1 here means the field was"
                    " ALREADY correct and our call did nothing - a pass for the run, not evidence"
                    " that the setter works.)");
+#endif   /* SW_DEV_BUILD - T-879 G */
     }
     else if (outcome != 0 && g_swSetReported < 12)
     {
@@ -6843,6 +6852,8 @@ void CombatModeTick()
                     ErrorLog("[M6] peer combat ENDED BY ITS OWN ENGINE uid=" + N3(uid)
                              + " - the authority last told us ON and we never applied OFF."
                                " prone=" + N3(*(const int*)((const char*)c + 0xE0))
+                             + (g_ncDriftClosedAt.find(uid) != g_ncDriftClosedAt.end()
+                                    ? " - its window was closed by drift (we kept combat mode; T-986 fold 1)" : "")
                              + " (P030/F246)");
                 }
                 else if (w->lastPeerMode == 0 && on == 1 && w->weWantOn == 0)
@@ -6911,7 +6922,8 @@ void CombatModeTick()
         if (on != 0 && targetUid == 0)
         {
             ++g_cmNoTarget;
-            DebugLog("[M6] combat mode NOT replicated for uid=" + N3(uid)
+            /* T-879: the release build writes the first few in full, then one count line a minute (SW_QUIETLOG); DEV every line */
+            SW_QUIETLOG(g_qM6NoTarget, "[M6] combat mode NOT replicated", 0, 0, "[M6] combat mode NOT replicated for uid=" + N3(uid)
                      + " - its target is not a character we replicate. Sending it would let the"
                        " peer swing at a world NPC and apply damage on one machine only"
                        " (P-16). Refused deliberately.");
@@ -7057,6 +7069,107 @@ void CloseAllNativeWindows(const char* reason)
         ++g_ncClosedBySwitch;
         FinishNativeClose(w->uid, w, reason, resolved);
     }
+}
+
+// T-986 (drift bound) / T-986 fold 1 - THE CLOSE THE OWNER'S OFF EDGE AND THE DRIVE'S DISTANCE BOUND SHARE, in one order: gate,
+// wait out the AI pass in flight, [OFF only: leave combat mode], take the order back, [OFF only: take the task back], then the
+// shared tail (FinishNativeClose places the copy and hands it back to the drive). What each kind undoes is winbound's
+// (src/common/windowbound.h). `wasNative` false (an OFF edge for a copy with no open window) runs the clears only, as the OFF edge
+// always did. MAIN THREAD: the OFF edge arrives through InQueueDrain and the drift close runs in ReplicateTick, one after the
+// other in the frame pump (command_channel.cpp), never at once.
+static void CloseNativeWindowSteps(::Character* c, CombatClass* cc, unsigned int uid, CombatWatch* ncw, bool wasNative, int kind)
+{
+    const char* reason = winbound::CloseReason(kind);
+    // H015 / P059 - CLOSE THE NATIVE WINDOW, GATE FIRST. Everything below (clear orders, clear
+    // goals, leave combat, end action) must run with the decision gate already shut, or one
+    // pass slips through and the AI picks `Self preservation` (T075: 73 ms).
+    if (wasNative)
+    {
+        SuppressCharacter(c, true);
+        if (!IsSuppressed(c)) ++g_ncGateRefusedOnClose;
+        // The gate stops NEW passes. The one already running on the worker finishes on its own
+        // schedule; the clears below must not race it (review finding 2). Bounded wait.
+        const int qs = WaitForNoAiPassOn(c, kNcQuiesceMs);
+        if (qs == 1) ++g_ncCloseWaitedForPass; else if (qs == 2) ++g_ncCloseQuiesceTimedOut;
+    }
+
+    // end == 2 is the engine's own "leave combat mode" branch. The hand is required by the
+    // signature and unused there, so the character's own is passed.
+    // T-986 fold 1: only the owner's OFF edge leaves combat mode. A drift close KEEPS it, as the switch-off close does: the owner
+    // is still fighting, and its swings play on a copy only in combat mode (SW_GATE_NOT_IN_COMBAT_MODE).
+    if (winbound::CloseLeavesCombat(kind) && cc != 0)
+    {
+        const hand& h = c->getHandle();
+        cc->enterCombat(h, 2, false);
+    }
+
+    // F242 - AND TAKE THE ORDER BACK. Leaving combat mode is not enough on its own: T073
+    // cleared the mode and left the order, and the peer kept fighting for 87 seconds after
+    // the authority stopped - 756 of its 947 swings happened after the fight was over.
+    // Cleared even when injection is off: a build that stops injecting must still be able
+    // to clean up after one that did, and clearing orders nobody set is harmless.
+    if (ClearAttackOrder(c)) ++g_cmOrdersCleared;
+
+    // P055 - **AND TAKE THE TASK BACK.** F242's rule, which this project has now paid for
+    // twice: *anything we SET on a puppet, we must be able to UNSET.* An order left behind
+    // kept a peer fighting for 87 seconds after the authority stopped, and a task is a
+    // stronger level than an order - **nothing in the engine ever removes one on its own**
+    // (F375: "finished" is a flag the AI reads on its next pass, and the AI is gated).
+    //
+    // Retracted even when installation is switched OFF, for the same reason orders are: a
+    // build that stops installing must still clean up after one that did, and ending an
+    // action nobody set is harmless.
+    // T-986 fold 1: the OFF edge only. A drift close does not end the action - from this thread that is the F408 race the
+    // switch-off close refuses; the owner's OFF edge ends it.
+    if (winbound::CloseEndsAction(kind))
+    {
+        CharBody* body = (CharBody*)*(void* const*)((const char*)c + kCharBodyOff);
+        if (!PlausibleObject(body)) ++g_tiEndNoBody;   // every early return gets a counter
+        else
+        {
+            // Read BEFORE, so `ended` counts what was actually ended rather than how often we
+            // asked. A retraction against an empty field is not the same event as one that
+            // destroyed a task, and one counter for both hides the difference.
+            const bool had = (*(const void* const*)((const char*)body + kCurrentTaskOff) != 0);
+            body->finishAction();
+            if (had) ++g_tiEnded; else ++g_tiEndedEmpty;
+        }
+    }
+
+    if (wasNative)
+    {
+        FinishNativeClose(uid, ncw, reason, true);
+    }
+}
+
+// T-986 (drift bound) - see combat.h. In T1425 the owners stood in attack mode and never sent OFF; their copies ran to the target
+// and stayed 5,000-6,700 units away. Past the far snap's distance the window ends here, combat mode KEPT (fold 1); a fresh ON
+// from the owner (a new fight, a new target, or the catch-up resend) is the only thing that opens one again.
+void CloseNativeWindowForDrift(unsigned int uid, float drift, float bound)
+{
+    CombatWatch* ncw = CombatWatchFor(uid);
+    if (ncw == 0 || !ncw->nativeOn)
+    {
+        // The copy's drive says window and no watch row has one open: nothing to close here, so the drive is handed back
+        // (the flag alone would leave the copy undriven for good).
+        ++g_ncDriftNoRow;
+        SetPuppetNativeWindow(uid, false);
+        return;
+    }
+    ++g_ncClosedDrift;
+    static swlogbudget::Gate s_qNcDrift;
+    SW_QUIETLOG(s_qNcDrift, "[NC] window drift close", 0, 0, "[NC] window drift close uid=" + N3(uid) + " drift=" + F1(drift)
+             + " bound=" + F1(bound) + " - the copy is farther from its owner than the far snap's distance; window closed,"
+             + " combat mode kept (the owner's OFF ends it), the drive takes it back (T-986)");
+    g_ncDriftClosedAt[uid] = CmNowSeconds();
+    ::Character* c = FindSpawned(uid);
+    if (c == 0)
+    {
+        // T-986 fold 1: counted as a drift close only (closedByDrift), not also closeNoChar - the reason counts add up to `closed`
+        FinishNativeClose(uid, ncw, "drift", false);
+        return;
+    }
+    CloseNativeWindowSteps(c, CombatOf(c), uid, ncw, true, winbound::kCloseDrift);
 }
 
 void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
@@ -7474,6 +7587,14 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
                     w->nativeSwings = 0; w->nativeTarget = targetUid;
                     w->nativeOpenDrift = PuppetWindowDriftNow(uid);   // combat2 (F920): the gap the window starts with
                     ++g_ncWindowsOpened;
+                    {   // T-986 fold 1: a reopen soon after a drift close of this uid - counted only, no behaviour change
+                        std::map<unsigned int, double>::iterator dc = g_ncDriftClosedAt.find(uid);
+                        if (dc != g_ncDriftClosedAt.end())
+                        {
+                            if (CmNowSeconds() - dc->second < kNcDriftReopenSec) ++g_ncDriftReopened;
+                            g_ncDriftClosedAt.erase(dc);
+                        }
+                    }
                     const std::string q(1, (char)34);
                     SW_QUIETLOG(g_qNcOpen, "[NC] window OPEN", 0, 0, "[NC] window OPEN uid=" + N3(uid) + " target=" + N3(targetUid)
                              + " openDriftXZ=" + F1(w->nativeOpenDrift)
@@ -7488,57 +7609,14 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
     }
     else
     {
-        // H015 / P059 - CLOSE THE NATIVE WINDOW, GATE FIRST. Everything below (clear orders, clear
-        // goals, leave combat, end action) must run with the decision gate already shut, or one
-        // pass slips through and the AI picks `Self preservation` (T075: 73 ms).
+        // H015 / P059 / T-986 (drift bound) - CLOSE THE NATIVE WINDOW, GATE FIRST. The steps and their order (gate, wait out
+        // the AI pass, leave combat mode, take the order and the task back, the shared tail) are CloseNativeWindowSteps's,
+        // shared with the drive's distance bound (CloseNativeWindowForDrift, which keeps combat mode and the action - T-986 fold 1).
         CombatWatch* ncw = CombatWatchFor(uid);
         const bool wasNative = (ncw != 0 && ncw->nativeOn != 0);
-        if (wasNative)
-        {
-            SuppressCharacter(c, true);
-            if (!IsSuppressed(c)) ++g_ncGateRefusedOnClose;
-            // The gate stops NEW passes. The one already running on the worker finishes on its own
-            // schedule; the clears below must not race it (review finding 2). Bounded wait.
-            const int qs = WaitForNoAiPassOn(c, kNcQuiesceMs);
-            if (qs == 1) ++g_ncCloseWaitedForPass; else if (qs == 2) ++g_ncCloseQuiesceTimedOut;
-        }
-
-        // end == 2 is the engine's own "leave combat mode" branch. The hand is required by the
-        // signature and unused there, so the character's own is passed.
-        const hand& h = c->getHandle();
-        cc->enterCombat(h, 2, false);
-
-        // F242 - AND TAKE THE ORDER BACK. Leaving combat mode is not enough on its own: T073
-        // cleared the mode and left the order, and the peer kept fighting for 87 seconds after
-        // the authority stopped - 756 of its 947 swings happened after the fight was over.
-        // Cleared even when injection is off: a build that stops injecting must still be able
-        // to clean up after one that did, and clearing orders nobody set is harmless.
-        if (ClearAttackOrder(c)) ++g_cmOrdersCleared;
-
-        // P055 - **AND TAKE THE TASK BACK.** F242's rule, which this project has now paid for
-        // twice: *anything we SET on a puppet, we must be able to UNSET.* An order left behind
-        // kept a peer fighting for 87 seconds after the authority stopped, and a task is a
-        // stronger level than an order - **nothing in the engine ever removes one on its own**
-        // (F375: "finished" is a flag the AI reads on its next pass, and the AI is gated).
-        //
-        // Retracted even when installation is switched OFF, for the same reason orders are: a
-        // build that stops installing must still clean up after one that did, and ending an
-        // action nobody set is harmless.
-        {
-            CharBody* body = (CharBody*)*(void* const*)((const char*)c + kCharBodyOff);
-            if (!PlausibleObject(body)) ++g_tiEndNoBody;   // every early return gets a counter
-            else
-            {
-                // Read BEFORE, so `ended` counts what was actually ended rather than how often we
-                // asked. A retraction against an empty field is not the same event as one that
-                // destroyed a task, and one counter for both hides the difference.
-                const bool had = (*(const void* const*)((const char*)body + kCurrentTaskOff) != 0);
-                body->finishAction();
-                if (had) ++g_tiEnded; else ++g_tiEndedEmpty;
-            }
-        }
-
-        if (wasNative) FinishNativeClose(uid, ncw, "authority_off", true);
+        if (wasNative) ++g_ncClosedByOff;
+        g_ncDriftClosedAt.erase(uid);   // the owner's OFF: combat mode now ends by our hand
+        CloseNativeWindowSteps(c, cc, uid, ncw, wasNative, winbound::kCloseOwnerOff);
     }
 
     int after = CombatModeOf(cc);
@@ -7679,6 +7757,7 @@ void SetTaskInstall(bool on)
     // complaining would leave the forbidden state live for the rest of the run.
     if (on && g_weaponTask) { RefuseIfBothTaskSwitches("taskinstall on"); return; }
     g_taskInstall = on;
+#ifdef SW_DEV_BUILD   /* T-879 G: P055 is a DEV probe - the line's text and its building are the test build's only; the switch is set above in both */
     if (on)
         ErrorLog("[P055] TASK INSTALL ON - puppets entering combat mode will be handed a"
                  " TASK_MELEE_FOCUSED Task directly as their current action, with NO AI decision"
@@ -7688,6 +7767,7 @@ void SetTaskInstall(bool on)
     else
         SW_DEVLOG("[P055] task install OFF - the pre-F384 behaviour. Retraction still runs, because"
                  " a build that stops installing must clean up after one that did.");
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 void SetWeaponTask(bool on)
@@ -7695,6 +7775,7 @@ void SetWeaponTask(bool on)
     if (on && (g_nativeCombat || CountOpenNativeWindows() > 0)) { ++g_ncSwitchRefused; ErrorLog("[NC] REFUSED: taskweapon on while nativecombat is on or a window is open."); return; }
     if (on && g_taskInstall) { RefuseIfBothTaskSwitches("taskweapon on"); return; }
     g_weaponTask = on;
+#ifdef SW_DEV_BUILD   /* T-879 G: P057 is a DEV probe - the line's text and its building are the test build's only; the switch is set above in both */
     if (on)
         ErrorLog("[P057] WEAPON TASK ON - a puppet entering combat mode with EMPTY HANDS will be"
                  " handed the engine's own TASK_DRAW_WEAPON task. **AND THAT IS NOW THE ONLY THING THIS"
@@ -7712,6 +7793,7 @@ void SetWeaponTask(bool on)
                  " eviction to switch off; it was deleted in the F407 build.) This is the control"
                  " arm, and unlike a switch that only gates a counter it genuinely changes what the"
                  " engine is asked to do.");
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 void SetSwingReplication(bool on)
@@ -7767,6 +7849,8 @@ void ReportCombatMode()
                  + " orphanedByRebind=" + N3(g_ncOrphanedByRebind)
                  + " switchRefused=" + N3(g_ncSwitchRefused)
                  + " closedBySwitch=" + N3(g_ncClosedBySwitch) + " closedByDrop=" + N3(g_ncClosedByDrop)
+                 + " closedByOff=" + N3(g_ncClosedByOff) + " closedByDrift=" + N3(g_ncClosedDrift) + " driftNoRow=" + N3(g_ncDriftNoRow)
+                 + " driftReopened=" + N3(g_ncDriftReopened)
                  + " closedByDropNoRegate=" + N3(g_ncClosedByDropNoRegate) + " closeNoChar=" + N3(g_ncCloseNoChar)
                  + " closeWaitedForPass=" + N3(g_ncCloseWaitedForPass) + " closeQuiesceTimedOut=" + N3(g_ncCloseQuiesceTimedOut)
                  + " retargetQuiesceTimedOut=" + N3(g_ncRetargetQuiesceTimedOut)
@@ -7777,7 +7861,7 @@ void ReportCombatMode()
                  + " openRefusedNoOrder=" + N3(g_ncOpenRefusedNoOrder) + " dropNoRow=" + N3(g_ncDropNoRow) + " closeNoCharSwitch=" + N3(g_ncCloseNoCharSwitch)
                  + " f1NonFinite=" + N3(g_f1NonFinite) + " f6NonFinite=" + N3(g_f6NonFinite)
                  + " retargetOrderFailed=" + N3(g_ncRetargetOrderFailed) + " retargetRefusedWrite=" + N3(g_ncRetargetRefusedWrite) + " aiPassOverlapSeen=" + N3((long long)AiPassOverlapSeen())
-                 + "  |  identity: opened == closed + openNow + orphanedByRebind + dropNoRow  (closed includes switch/drop/noChar closes)");
+                 + "  |  identity: opened == closed + openNow + orphanedByRebind + dropNoRow  (T-986 fold 1, one watch row per uid: closed == closedByOff + closedBySwitch + closedByDrop + closedByDropNoRegate - dropNoRow + closeNoChar + closedByDrift)");
         SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "nc_report" + q
                  + "," + q + "nativeCombat" + q + ":" + N3(g_nativeCombat ? 1 : 0)
                  + "," + q + "opened" + q + ":" + N3(g_ncWindowsOpened)
@@ -7792,6 +7876,9 @@ void ReportCombatMode()
                  + "," + q + "orphanedByRebind" + q + ":" + N3(g_ncOrphanedByRebind)
                  + "," + q + "closedBySwitch" + q + ":" + N3(g_ncClosedBySwitch)
                  + "," + q + "closedByDrop" + q + ":" + N3(g_ncClosedByDrop)
+                 + "," + q + "closedByDrift" + q + ":" + N3(g_ncClosedDrift)
+                 + "," + q + "closedByOff" + q + ":" + N3(g_ncClosedByOff)
+                 + "," + q + "driftReopened" + q + ":" + N3(g_ncDriftReopened)
                  + "," + q + "closedByDropNoRegate" + q + ":" + N3(g_ncClosedByDropNoRegate)
                  + "," + q + "closeNoChar" + q + ":" + N3(g_ncCloseNoChar)
                  + "," + q + "closeWaitedForPass" + q + ":" + N3(g_ncCloseWaitedForPass)
@@ -7924,6 +8011,7 @@ void ReportCombatMode()
     //
     // Two passes over 512 mostly-empty slots costs nothing and is the honest fix; the alternative
     // was to tell the reader to scroll back up, i.e. to fix the document instead of the artefact.
+#ifdef SW_DEV_BUILD   /* T-879 G: P045 / P056 are DEV probes - this report block (row tallies into locals and its lines) is the test build's only; the counters it reads stay in both */
     long long anySamples = 0, ownedRows = 0, ownedCalls = 0, puppetRows = 0, puppetCalls = 0;
     long long ownedMeas = 0, puppetMeas = 0;
     // P056 - counted over the SAME rows and in the SAME pass, so the readiness summary and the ARMS
@@ -8513,6 +8601,7 @@ void ReportCombatMode()
              " and not increases: a direction test would have read every reset as `did not run`."
              " It also means a single sample of 0.0 says nothing - a fresh object and one that has"
              " never ticked are identical - so only aiTicked/inCombatFrames is evidence here.");
+#endif   /* SW_DEV_BUILD - T-879 G */
 
     // P055 / F384 - THE FIFTH ATTEMPT'S OWN VERDICT.
     // P057 / F394 - THE SIXTH ATTEMPT'S OWN VERDICT.
@@ -9044,6 +9133,224 @@ bool ReadAnimalAge01(const void* c, float* out)
 unsigned long long kThreadSafeRagdollUpdatesRva = 0; static coop::AddrReg kThreadSafeRagdollUpdatesRva_reg("ThreadSafeRagdollUpdates", &kThreadSafeRagdollUpdatesRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7D17E0 */   /* GameWorld::threadSafeRagdollUpdates void(GameWorld*) - hooked */
 unsigned long long kRagdollModeRva = 0; static coop::AddrReg kRagdollModeRva_reg("RagdollMode", &kRagdollModeRva);   /* P8h: the address table fills this. Steam_1.0.65 0x5CB2D0 */   /* Character ragdollMode(Character*, bool on, int part) - called, never hooked */
 
+#ifdef SW_DEV_BUILD
+// PROBE-START: P169
+/* PROBE P169 (T-1046, LOG ONLY): notes every run of the physics objects' base destructor (PhysicsThreadedBaseInterface,
+   1.0.65 0x7DC1F0) and reports a destroy of an object that looks destroyed already; changes nothing in the game.
+   The physics thread's destroy loop (threadJunkPreBT 0x4CBB90, list +0x218) deletes each object through vtable slot 0. A hull
+   goes to its own deleting destructor (0x4CEBB0), which sets the hull vtable and ends in this base destructor; the base
+   destructor sets the bare base vtable and frees the name string at +8 without clearing +8. The base class is abstract (three
+   _purecall slots), so no live object carries the bare base vtable: one that arrives here still carrying it has been
+   destroyed before (or is being destroyed on another thread), and this run frees +8 a second time. Two subclass destructors
+   (0x7DC240, 0x7DC3A0) carry an inlined copy of the base destructor and are not seen here.
+   ON THE DESTROYING THREAD (the physics thread, sometimes the main thread): no heap, no strings, no log, no lock - the heap is
+   the suspect. Each destroy takes a number (interlocked) and fills one slot of a 256-slot ring (pointer, vtable at entry,
+   caller, thread, main-loop frame); the slot's number is written last, and a reader keeps a slot only when its number reads
+   the same before and after. Flagged: (twice) the pointer is already in the ring, destroyed within kP169TwiceFrames main-loop
+   frames - the heap can also hand the address to a new object, so the earlier slot's vtable and caller are printed beside it;
+   (bare) the bare base vtable at entry. A flagged destroy goes into a 64-slot flag ring and onto this thread's own stack
+   (g_p169StackFlag points at it while the original runs), tagged "P169FLAG", so a crash inside the original still has it in
+   the dump. MAIN THREAD: P169Drain (the ragdoll safe point, once a frame) writes one [P169] line per flag, 40 lines in all,
+   the rest counted, with the mod's last copy knock-down and last copy destroy beside it. */
+long long MainLoopFrames();   /* coop.cpp (soak.h): the main loop's frame count - one aligned 64-bit read from any thread */
+unsigned long long kP169BaseDtorRva = 0; static coop::AddrReg kP169BaseDtorRva_reg("PhysicsThreadedBaseDtor", &kP169BaseDtorRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7DC1F0 */   /* PhysicsThreadedBaseInterface base destructor void(this) - hooked (PROBE P169) */
+const int kP169RingN = 256;   /* a power of two */
+const int kP169FlagN = 64;    /* a power of two */
+const long long kP169TwiceFrames = 600;
+const long long kP169LineCap = 40;
+const unsigned long long kP169FlagMagic = 0x47414C4639363150ULL;   /* the bytes "P169FLAG" */
+const unsigned long long kP169RingMagic = 0x474E495239363150ULL;   /* the bytes "P169RING" */
+struct P169EntryData { unsigned long long obj, vt, from; long long frame; unsigned long tid; };
+struct P169EntrySlot { volatile LONG64 num; P169EntryData d; };   /* num 0 = being written, else the destroy's number */
+struct P169Store { unsigned long long magic; P169EntrySlot ring[kP169RingN]; };
+struct P169FlagData
+{
+    unsigned long long magic, obj, vt, from, prevVt, prevFrom;
+    long long num, frame, prevNum, prevFrame, knockFrame, copyFrame;
+    unsigned long tid, prevTid, knockUid, copyUid;
+    int kind;   /* 1 twice, 2 bare, 3 both */
+};
+struct P169FlagSlot { volatile LONG64 num; P169FlagData d; };
+P169Store g_p169Store = { kP169RingMagic };
+P169FlagSlot g_p169Flags[kP169FlagN];
+P169FlagData* volatile g_p169StackFlag = 0;
+volatile LONG64 g_p169Deletes = 0, g_p169Twice = 0, g_p169Bare = 0, g_p169FlagNext = 0;
+volatile LONG64 g_p169KnockFrame = -1, g_p169CopyFrame = -1;
+volatile LONG g_p169KnockUid = 0, g_p169CopyUid = 0;
+long long g_p169FlagRead = 0, g_p169Lines = 0, g_p169Capped = 0;   /* main thread only */
+unsigned long long g_p169BaseVt = 0, g_p169ImageLo = 0, g_p169ImageHi = 0;
+typedef void (*P169DtorFn)(void* obj);
+P169DtorFn g_p169OrigDtor = 0;
+
+/* KnockDrain (main thread): a copy was just switched to ragdoll - its old click hull is on the physics destroy list */
+void P169NoteKnock(unsigned int uid)
+{
+    ::InterlockedExchange(&g_p169KnockUid, (LONG)uid);
+    ::InterlockedExchange64(&g_p169KnockFrame, MainLoopFrames());
+}
+/* RemoveLocalCopy (spawn.cpp): a copy was just destroyed by the mod */
+void P169NoteCopyDestroy(unsigned int uid)
+{
+    ::InterlockedExchange(&g_p169CopyUid, (LONG)uid);
+    ::InterlockedExchange64(&g_p169CopyFrame, MainLoopFrames());
+}
+
+int P169ReadVt(const void* obj, unsigned long long* vt)
+{
+    __try { *vt = *(const unsigned long long*)obj; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *vt = 0; return 0; }
+}
+
+/* The newest whole ring slot for obj numbered below num (concurrent later destroys are skipped): 1 found, 0 none. */
+int P169FindPrev(unsigned long long obj, LONG64 num, LONG64* prevNum, P169EntryData* out)
+{
+    LONG64 best = 0;
+    for (int i = 0; i < kP169RingN; ++i)
+    {
+        P169EntrySlot& s = g_p169Store.ring[i];
+        const LONG64 n1 = s.num;
+        if (n1 <= best || n1 >= num) continue;
+        const P169EntryData c = s.d;
+        _ReadWriteBarrier();
+        if (s.num != n1 || c.obj != obj) continue;
+        best = n1;
+        *out = c;
+    }
+    *prevNum = best;
+    return best != 0 ? 1 : 0;
+}
+
+/* ANY THREAD (mostly the physics thread). Runs before the original; allocates nothing, logs nothing, takes no lock. */
+void P169DtorDetour(void* obj)
+{
+    const LONG64 num = ::InterlockedIncrement64(&g_p169Deletes);
+    P169EntryData me = { 0 };
+    me.obj = (unsigned long long)(uintptr_t)obj;
+    P169ReadVt(obj, &me.vt);
+    me.from = (unsigned long long)(uintptr_t)_ReturnAddress();
+    me.frame = MainLoopFrames();
+    me.tid = ::GetCurrentThreadId();
+    LONG64 prevNum = 0;
+    P169EntryData prev = { 0 };
+    const int had = P169FindPrev(me.obj, num, &prevNum, &prev);
+    int kind = 0;
+    if (had != 0 && me.frame - prev.frame <= kP169TwiceFrames) kind |= 1;
+    if (g_p169BaseVt != 0 && me.vt == g_p169BaseVt) kind |= 2;
+    P169EntrySlot& slot = g_p169Store.ring[(size_t)((num - 1) & (kP169RingN - 1))];
+    ::InterlockedExchange64(&slot.num, 0);
+    slot.d = me;
+    ::InterlockedExchange64(&slot.num, num);
+    P169FlagData flag = { 0 };
+    if (kind != 0)
+    {
+        if (kind & 1) ::InterlockedIncrement64(&g_p169Twice);
+        if (kind & 2) ::InterlockedIncrement64(&g_p169Bare);
+        flag.magic = kP169FlagMagic;
+        flag.obj = me.obj; flag.vt = me.vt; flag.from = me.from; flag.num = num; flag.frame = me.frame; flag.tid = me.tid;
+        flag.prevNum = prevNum; flag.prevVt = prev.vt; flag.prevFrom = prev.from; flag.prevFrame = prev.frame; flag.prevTid = prev.tid;
+        flag.knockFrame = g_p169KnockFrame; flag.knockUid = (unsigned long)g_p169KnockUid;
+        flag.copyFrame = g_p169CopyFrame; flag.copyUid = (unsigned long)g_p169CopyUid;
+        flag.kind = kind;
+        g_p169StackFlag = &flag;
+        const LONG64 f = ::InterlockedIncrement64(&g_p169FlagNext);
+        P169FlagSlot& fs = g_p169Flags[(size_t)((f - 1) & (kP169FlagN - 1))];
+        ::InterlockedExchange64(&fs.num, 0);
+        fs.d = flag;
+        ::InterlockedExchange64(&fs.num, f);
+    }
+    g_p169OrigDtor(obj);
+    if (kind != 0) g_p169StackFlag = 0;
+}
+
+std::string P169Where(unsigned long long a)
+{
+    char b[40];
+    if (a >= g_p169ImageLo && a < g_p169ImageHi)
+        _snprintf_s(b, sizeof b, _TRUNCATE, "exe+0x%llX", a - g_p169ImageLo);
+    else
+        _snprintf_s(b, sizeof b, _TRUNCATE, "0x%llX", a);
+    return b;
+}
+std::string P169Hex(unsigned long long a)
+{
+    char b[24];
+    _snprintf_s(b, sizeof b, _TRUNCATE, "0x%llX", a);
+    return b;
+}
+std::string P169Since(const char* name, long long at, unsigned long uid, long long frame)
+{
+    if (at < 0) return std::string(" ") + name + "[none]";
+    return std::string(" ") + name + "[frame=" + N3(at) + " uid=" + N3((long long)uid) + " framesBefore=" + N3(frame - at) + "]";
+}
+
+/* MAIN THREAD, once a frame (the ragdoll safe point): one line per flagged destroy not yet written. */
+void P169Drain()
+{
+    const LONG64 next = g_p169FlagNext;
+    while (g_p169FlagRead < next)
+    {
+        const long long f = g_p169FlagRead + 1;
+        if (next - f >= kP169FlagN) { g_p169FlagRead = f; ++g_p169Capped; continue; }   /* overwritten before it was read */
+        P169FlagSlot& s = g_p169Flags[(size_t)((f - 1) & (kP169FlagN - 1))];
+        const LONG64 n1 = s.num;
+        if (n1 == 0 || n1 < f) break;   /* still being written: read it next frame */
+        const P169FlagData d = s.d;
+        _ReadWriteBarrier();
+        g_p169FlagRead = f;
+        if (n1 != f || s.num != n1) { ++g_p169Capped; continue; }   /* overwritten */
+        if (g_p169Lines >= kP169LineCap) { ++g_p169Capped; continue; }
+        ++g_p169Lines;
+        std::string line = std::string("[P169] destroy flagged=")
+                           + ((d.kind & 3) == 3 ? "twice+bare" : ((d.kind & 1) ? "twice" : "bare"))
+                           + " obj=" + P169Hex(d.obj) + " vt=" + P169Where(d.vt) + " from=" + P169Where(d.from)
+                           + " thread=" + N3((long long)d.tid) + " frame=" + N3(d.frame) + " #" + N3(d.num);
+        if (d.prevNum != 0)
+            line += " prev[#" + N3(d.prevNum) + " vt=" + P169Where(d.prevVt) + " from=" + P169Where(d.prevFrom)
+                    + " thread=" + N3((long long)d.prevTid) + " frame=" + N3(d.prevFrame)
+                    + " framesSince=" + N3(d.frame - d.prevFrame) + " destroysSince=" + N3(d.num - d.prevNum) + "]";
+        else
+            line += " prev[none]";
+        line += P169Since("lastKnock", d.knockFrame, d.knockUid, d.frame);
+        line += P169Since("lastCopyDestroy", d.copyFrame, d.copyUid, d.frame);
+        DebugLog(line + " (PROBE P169)");
+    }
+}
+
+/* From InstallPhysicsGuard, at the preload like every other hook. */
+void P169Install()
+{
+    if (kP169BaseDtorRva == 0)
+    {
+        ErrorLog("[P169] PhysicsThreadedBaseDtor not in the address table - probe NOT installed");
+        return;
+    }
+    const unsigned char* fn = (const unsigned char*)(uintptr_t)coop::AddrAbs(kP169BaseDtorRva);
+    /* +0x0A: lea rax,[rip+disp32] - the bare base vtable the destructor writes (both builds) */
+    if (fn == 0 || fn[0x0A] != 0x48 || fn[0x0B] != 0x8D || fn[0x0C] != 0x05)
+    {
+        ErrorLog("[P169] base destructor bytes are not the expected lea at +0x0A - probe NOT installed");
+        return;
+    }
+    int disp = 0;
+    std::memcpy(&disp, fn + 0x0D, sizeof disp);
+    g_p169BaseVt = (unsigned long long)(uintptr_t)(fn + 0x11 + disp);
+    const unsigned char* img = (const unsigned char*)::GetModuleHandleA(0);
+    const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(img + ((const IMAGE_DOS_HEADER*)img)->e_lfanew);
+    g_p169ImageLo = (unsigned long long)(uintptr_t)img;
+    g_p169ImageHi = g_p169ImageLo + nt->OptionalHeader.SizeOfImage;
+    const coop::HookStatus st = coop::AddHook((void*)fn, (void*)&P169DtorDetour, (void**)&g_p169OrigDtor);
+    DebugLog(std::string("[P169] base destructor hook ") + (st == coop::SUCCESS ? "SUCCESS" : "FAILED")
+             + " at " + P169Where((unsigned long long)(uintptr_t)fn) + " bareVt=" + P169Where(g_p169BaseVt) + " (PROBE P169)");
+}
+
+void P169Report()
+{
+    DebugLog("[H054] REPORT probeP169[deletes,flaggedTwice,flaggedBare,lines,capped]=" + N3((long long)g_p169Deletes) + ","
+             + N3((long long)g_p169Twice) + "," + N3((long long)g_p169Bare) + "," + N3(g_p169Lines) + "," + N3(g_p169Capped));
+}
+// PROBE-END: P169
+#endif   /* SW_DEV_BUILD - PROBE P169 */
+
 namespace {
 
 typedef void (*TsRagdollUpdatesFn)(void* gameWorld);
@@ -9095,6 +9402,9 @@ void KnockDrain()
         if (!KnockSetUnconscious(c)) { ++g_knockSkippedGone; continue; }
         g_ragdollMode(c, true, 1);   // the call applyDamage makes at 0x64EAB6 / 0x64EB0A
         ++g_knockApplied;
+#ifdef SW_DEV_BUILD
+        P169NoteKnock(uid);   /* PROBE P169 */
+#endif
         if (g_knockLogged < kKnockLogLimit)
         {
             ++g_knockLogged;
@@ -9108,6 +9418,9 @@ void KnockDrain()
 
 void detour_tsRagdollUpdates(void* gameWorld)
 {
+#ifdef SW_DEV_BUILD
+    P169Drain();   /* PROBE P169 */
+#endif
     if (g_knockPendingCount > 0) KnockDrain();
     coop::CrimeTestDrain();   // crimetest (test-only lever): a BountyManager write, here because the worker is paused
     coop::TalkTestDrain();    /* P26 stage 0 talktest (test-only lever): one Dialogue::sendEvent, with the worker paused */
@@ -9260,6 +9573,9 @@ void detour_physDestroy(void* physicsActual, void* actor)
 
 void InstallPhysicsGuard()
 {
+#ifdef SW_DEV_BUILD
+    P169Install();   /* PROBE P169 */
+#endif
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     bool boxOk = false;
     bool desOk = false;
@@ -9292,6 +9608,9 @@ void ReportPhysicsGuard()
     DebugLog("[H054] REPORT physGuard[queries,destroys,destroyWaited,queryWaited,queryWaitedQuery,maxWaitUs]="
              + N3(g_pgQueries) + "," + N3(g_pgDestroys) + "," + N3(g_pgDestroyWaited) + ","
              + N3(g_pgQueryWaited) + "," + N3(g_pgQueryWaitedQuery) + "," + N3(g_pgMaxWaitUs));
+#ifdef SW_DEV_BUILD
+    P169Report();   /* PROBE P169 */
+#endif
 }
 
 } // namespace coop

@@ -21,6 +21,8 @@ std::string SectorString(const Sector& s);
 // MAIN THREAD. Once per second: recompute this instance's loaded set (probes the engine's own
 // `isZoneLoadedT` on a 7x7 ring around the watched player's sector), log it, and report it to the notebook (AREAS).
 void ZonesTick();
+// T-492, MAIN THREAD: one more each second ZonesTick spends (only rises) - the rebuild restore's once-a-second re-checks ride it.
+long long ZonesSecondCount();
 // `report`: the loaded set as a [VERDICT] record (M2: the host's sectormap record went with the A6 owner map).
 void ReportZones();
 std::string BuildingsCommand();     // piece 3b lever: buildings in the active zones by owner faction
@@ -186,6 +188,12 @@ bool SectorLoadedHere(const Sector& s);   /* MAIN THREAD: is s in this game's ac
    live "is this point loaded" question the box road asks. */
 void SectorCentrePointTS(const Sector& s, float* xyz);
 int  SectorLoadedHereTS(const Sector& s);   /* review-p5i CRASH-2: ANY THREAD - the same question over the locked 64x64 grid, never the std::vector the main thread reassigns every second. 1 loaded here, 0 not (out of range is 0); no clock, because this game's own loaded set is never stale, only empty */
+double SectorReportedAgoTS(const Sector& s);   /* fold 3 (T1506): ANY THREAD - seconds since this game last SENT a loaded report naming the area; -1 = never (the world server's 'loaded' reads that report) */
+void ZonesNoteReported(const std::vector<Sector>& loaded);   /* fold 4 (review): only a report the world server takes */
+unsigned ZonesReportSeqTS();                   /* fold 4 (review): ANY THREAD - taken loaded reports counted (an event) */
+unsigned SectorReportSeqTS(const Sector& s);   /* fold 4 (review): ANY THREAD - the number of the last taken report naming the area; 0 none on this link */
+int  AreaMapRawViewTS(const Sector& s, int slot, int* holderOut);   /* fold 4 (review): ANY THREAD - the LAST area map of this link verbatim (no clock, a frozen holder named as the world server names it): `slot`'s loaded bit 1 / 0, -1 no map on this link; *holderOut its holder (-1 nobody) */
+unsigned PieceMapSeqTS();                      /* fold 4 (review): ANY THREAD - area maps applied, empty ones too (an event) */   /* fold 3 (T1506): MAIN THREAD - a loaded report naming these areas was sent now */
 /* B9 (design-e46-store 2.3); M2 (decisions 32/44/54). ANY THREAD, under g_heldLock like every other TS reader.
    DOES ANOTHER GAME HAVE THIS SECTOR LOADED - the writer ladder's R2 input.
      1  = the notebook's effective area map says another game has it loaded (map fresh within 5 s)

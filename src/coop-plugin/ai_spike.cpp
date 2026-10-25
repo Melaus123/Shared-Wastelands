@@ -550,6 +550,7 @@ void detour_update(Character* self)
 
     orig_update(self);
 
+#ifdef SW_DEV_BUILD   /* T-879 A: the [P006] status line and its tick are the test build's only (P006 answered, F047/F058) */
     // Throttled status line. Character::update runs once per character per frame, so this
     // fires roughly every few seconds depending on population.
     if (++g_logTick % 20000 == 0)
@@ -566,6 +567,7 @@ void detour_update(Character* self)
            << " pos=" << TargetPos();
         DebugLog(ss.str());
     }
+#endif   /* T-879 A */
 }
 
 } // namespace
@@ -582,9 +584,11 @@ static void ArmCommon(int suppress)
     InterlockedExchange(&g_suppressOn, suppress);
     InterlockedExchange(&g_freezeOn, 0);
     InterlockedExchange(&g_armCapture, 1);
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; arming stays in both */
     DebugLog(suppress
         ? "[P006] armed SUPPRESS: next captured character stops DECIDING (AI::periodicUpdate gated)"
         : "[P006] armed WATCH: next captured character left intact (baseline)");
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 void ArmSuppression() { InterlockedExchange(&g_wantPlayer, 0); ArmCommon(1); }
@@ -596,15 +600,19 @@ void ArmWatchPlayer() { InterlockedExchange(&g_wantPlayer, 1); ArmCommon(0); }
 void SetSuppress(bool on)
 {
     InterlockedExchange(&g_suppressOn, on ? 1 : 0);
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; the switch stays in both */
     DebugLog(on ? "[P006] DECISION suppression ON for existing target (no new goals)"
                 : "[P006] DECISION suppression OFF for existing target (still watching)");
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 void SetFreeze(bool on)
 {
     InterlockedExchange(&g_freezeOn, on ? 1 : 0);
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; the switch stays in both */
     DebugLog(on ? "[P006] LOCOMOTION freeze ON for existing target (F058 lever: body stops)"
                 : "[P006] LOCOMOTION freeze OFF for existing target");
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 // F330 - WHEN THE WORLD FREEZES, SAY WHAT STOPPED.
@@ -721,6 +729,7 @@ long long WorldActivityTotal()
 
 void ReportSuppression()
 {
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; its counters stay in both */
     std::stringstream ss;
     ss << "[P006] REPORT target=" << Ptr((const void*)g_target)
        << " ai=" << Ptr((const void*)g_targetAI)
@@ -759,6 +768,7 @@ void ReportSuppression()
        << " aiPerThread=" << Num(g_aiThreadId)
        << " mainThread=" << Num(g_upThreadId);
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 
@@ -782,6 +792,7 @@ bool DriveTarget(float dx, float dz, int frames)
     g_driveZ = dz;
     InterlockedExchange(&g_driveFrames, frames);
 
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; the drive itself runs in both */
     Ogre::Vector3 pos = t->worldPosition();
     std::stringstream ss;
     ss.imbue(std::locale::classic());
@@ -789,6 +800,7 @@ bool DriveTarget(float dx, float dz, int frames)
     ss << "[P006] drive: STEER_BY_DIRECTION set, dir=" << dx << "," << dz
        << " frames=" << frames << " from=" << pos.x << "," << pos.y << "," << pos.z;
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 G */
     return true;
 }
 
@@ -808,6 +820,7 @@ bool MoveTarget(float dx, float dz)
     Ogre::Vector3 pos = t->worldPosition();
     Ogre::Vector3 dest(pos.x + dx, pos.y, pos.z + dz);
 
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; the move itself runs in both */
     std::stringstream ss;
     ss.imbue(std::locale::classic());
     ss.setf(std::ios::fixed); ss.precision(1);
@@ -815,12 +828,14 @@ bool MoveTarget(float dx, float dz)
        << " -> " << dest.x << "," << dest.y << "," << dest.z
        << " (movement=" << Ptr(mv) << ")";
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 G */
 
     mv->setPathGoal(dest, PATH_PRIORITY_MEDIUM, true);
 
     // Read the destination back. If it matches what we just set, the pointer really is a
     // CharMovement and the call took effect - which distinguishes "wrong offset" from
     // "destination set but nothing consumes it".
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; the read-back feeds only this line */
     Ogre::Vector3 rb = mv->getDestination();
     std::stringstream ss2;
     ss2.imbue(std::locale::classic());
@@ -831,6 +846,7 @@ bool MoveTarget(float dx, float dz)
               : " MISMATCH (offset 0x640 suspect, or destination overwritten)")
         << " speed=" << mv->speedNow << "/" << mv->desiredSpeed;
     DebugLog(ss2.str());
+#endif   /* SW_DEV_BUILD - T-879 G */
     return true;
 }
 
@@ -848,7 +864,9 @@ void ForgetTarget(const void* obj)
     InterlockedExchangePointer((PVOID volatile*)&g_target, 0);
     InterlockedExchangePointer((PVOID volatile*)&g_targetAI, 0);
     ++g_targetForgotten;
+#ifdef SW_DEV_BUILD   /* T-879 G: P006 is a DEV probe - the line's text and its building are the test build's only; the watch is cleared in both */
     ErrorLog(std::string("[P006] watched target ") + Ptr(obj) + " was destroyed - watch cleared (H030); until re-armed the zone tick keeps reporting the areas loaded around the last known position (T-306 orphan mode) - when the configured role is host or client the mod re-arms itself on the next player-squad character it sees (AUD)");
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 // --- M2b per-character gating (main thread only) ---
@@ -1144,11 +1162,11 @@ void InstallAiSpike()
     coop::HookStatus c =
         coop::AddHook((void*)ap, (void*)&detour_aiPeriodic, (void**)&orig_aiPeriodic);
 
-    DebugLog(a == coop::SUCCESS ? "[P006] threadedUpdate AddHook SUCCESS"
+    SW_DEVLOG_OR_FAIL(a != coop::SUCCESS, a == coop::SUCCESS ? "[P006] threadedUpdate AddHook SUCCESS"
                                      : "[P006] threadedUpdate AddHook FAILED");
-    DebugLog(b == coop::SUCCESS ? "[P006] update AddHook SUCCESS"
+    SW_DEVLOG_OR_FAIL(b != coop::SUCCESS, b == coop::SUCCESS ? "[P006] update AddHook SUCCESS"
                                      : "[P006] update AddHook FAILED");
-    DebugLog(c == coop::SUCCESS ? "[P006] AI::periodicUpdate AddHook SUCCESS"
+    SW_DEVLOG_OR_FAIL(c != coop::SUCCESS, c == coop::SUCCESS ? "[P006] AI::periodicUpdate AddHook SUCCESS"
                                      : "[P006] AI::periodicUpdate AddHook FAILED");
 
     // P058 / F399 / F400 - the slot next door. **Resolved, checked and reported on its own line, and

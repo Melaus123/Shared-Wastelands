@@ -250,6 +250,14 @@ inline int TitleRedialDecide(int isClient, int hasDoor, int sockState, long long
     return (dials + 1 >= dialCap) ? kTitleRedialLast : kTitleRedialAgain;
 }
 
+/* CAN THE WORLD-SERVER LINK STILL DELIVER A WELCOME? Yes while it is connecting (ENet may still get an answer), up with the
+   handshake in flight, or already welcomed. No when it is down, failed or absent, or refused in words: nothing re-dials it
+   while a load holds the main thread, so the load waits stop on a no instead of running out their cap. */
+inline int StoreSockCouldArm(int sockState)
+{
+    return (sockState == kSockConnecting || sockState == kSockUpNotWelcomed || sockState == kSockUpWelcomed) ? 1 : 0;
+}
+
 /* ---- W3 (decisions 58, 59; store protocol 45): THE STORE WELCOME, WRITTEN AND READ IN ONE PLACE ----
    {u32 protocol, u32 authority, u32 recordCount, u32 slot, u32 worldLen + worldLen bytes}. The slot arrived in 31, the
    world name in 45 - the notebook's world, which the game follows (coopworld::WelcomeWorldDecide). Decode tolerates the

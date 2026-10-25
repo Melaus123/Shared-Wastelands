@@ -349,6 +349,43 @@ inline int SightCellsFill(const int* slots, const void* const* facs, int n, int 
     return held;
 }
 
+/* T-968: cell placement that never moves a faction (the foliage stub's cells, compared against on any thread while the main
+ * thread writes them). out[k] keeps cur[k] while cur[k] is still wanted (a repeat of an earlier cell's faction is cleared); a cell
+ * whose faction is no longer wanted is cleared; each wanted faction not in a cell yet takes the lowest empty cell. Null and repeated
+ * wants are skipped; those that find no empty cell are counted in *dropped (may be 0). `want` may be 0 when n = 0. Returns the
+ * cells held. Pure. */
+inline int StableCellsPlace(const void* const* cur, const void* const* want, int n, const void** out, int cap, int* dropped)
+{
+    int held = 0, drop = 0;
+    for (int k = 0; k < cap; ++k)
+    {
+        const void* f = cur[k];
+        out[k] = 0;
+        if (f == 0) continue;
+        bool wanted = false, earlier = false;
+        for (int i = 0; i < n; ++i) if (want[i] == f) { wanted = true; break; }
+        for (int j = 0; j < k; ++j) if (out[j] == f) { earlier = true; break; }
+        if (wanted && !earlier) { out[k] = f; ++held; }
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        const void* f = want[i];
+        if (f == 0) continue;
+        bool seen = false;
+        for (int j = 0; j < i; ++j) if (want[j] == f) { seen = true; break; }
+        if (seen) continue;
+        bool placed = false;
+        for (int k = 0; k < cap; ++k) if (out[k] == f) { placed = true; break; }
+        if (placed) continue;
+        int at = -1;
+        for (int k = 0; k < cap; ++k) if (out[k] == 0) { at = k; break; }
+        if (at < 0) { ++drop; continue; }
+        out[at] = f; ++held;
+    }
+    if (dropped != 0) *dropped = drop;
+    return held;
+}
+
 /* The sight stub (crime.cpp SightPatch writes it on its own page; cellsOff = the cells' offset on that page: hits at cellsOff,
  * cell k at cellsOff + 8 + 8k). N = 14 + 13 * cells. It touches no register and never dereferences a cell.
  *    0  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0     the original test
@@ -361,31 +398,52 @@ inline int SightCellsFill(const int* slots, const void* const* facs, int n, int 
  * N+10  F0 48 FF 05 <rel32>       HIT: lock inc qword [rip -> hits]
  * N+18  48 83 F8 00               cmp rax, 0                    ZF=0 CF=0 SF=0 OF=0, as the original on a player faction
  * N+22  FF 25 00000000 <abs64>    BACK: jmp [rip] -> site + 8 (the je, left in place)
- * Returns the length, kSightStubLen for kSightCellCap cells. */
+ * Returns the length, kSightStubLen for kSightCellCap cells.
+ *
+ * T-923: the same stub for a site whose test is another instruction. `test` / `testLen` are the original test's own bytes
+ * (default: the 8-byte `cmp qword [rax+0x250], 0` above); the stub re-does exactly those bytes at 0 and at NOTPEER, so the flags
+ * the engine's jcc reads are the original instruction's own, and BACK returns to site + testLen (the jcc, left in place). The
+ * test must read only rax-relative memory and registers (no RIP-relative operand: it runs from the stub's page). Layout for a
+ * test of length L (H = L + 6, N = H + 13 * cells): 0 test, L jne BACK, H + 13k cell k, N test again, N+L jmp short BACK,
+ * HIT = N+L+2 lock inc, HIT+8 cmp rax,0, BACK = HIT+12 jmp [rip] -> site + L. Length SightStubLenFor(L, cells) = 2L + 34 + 13 * cells
+ * (L = 8: 50 + 13 * cells, the layout above byte for byte).
+ *
+ * The register option (T-968): `reg` names the register that holds the faction at the site - kSightRegRax (the default, every
+ * layout above) or kSightRegRcx. For rcx the cell compare is `48 3B 0D <rel32>` (cmp rcx, [rip -> cell k]), HIT's is
+ * `48 83 F9 00` (cmp rcx, 0), and the default test (test == 0) is `48 83 B9 50 02 00 00 00` (cmp qword [rcx+0x250], 0); the
+ * layout and the length are the same. A given `test` must then read only rcx-relative memory. */
+const int kSightRegRax = 0;
+const int kSightRegRcx = 1;
 const int kSightStubLen = 50 + 13 * kSightCellCap;
+inline int SightStubLenFor(int testLen, int cells) { return 2 * testLen + 34 + 13 * cells; }
 inline void SightPut32(unsigned char* at, int v) { std::memcpy(at, &v, 4); }
-inline int SightStubBuild(unsigned char* p, unsigned long long site, int cells, int cellsOff)
+inline int SightStubBuild(unsigned char* p, unsigned long long site, int cells, int cellsOff, const unsigned char* test = 0, int testLen = 8,
+                          int reg = kSightRegRax)
 {
-    static const unsigned char test[8] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00 };
-    const int N = 14 + 13 * cells;
-    const int hit = N + 10, back = N + 22;
-    std::memcpy(p, test, 8);
-    p[8] = 0x0F; p[9] = 0x85; SightPut32(p + 10, back - 14);
+    const int rcx = (reg == kSightRegRcx) ? 1 : 0;
+    unsigned char test8[8] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00 };
+    if (rcx) test8[2] = 0xB9;   /* cmp qword [rcx+0x250], 0 */
+    if (test == 0) { test = test8; testLen = 8; }
+    const int H = testLen + 6;
+    const int N = H + 13 * cells;
+    const int hit = N + testLen + 2, back = hit + 12;
+    std::memcpy(p, test, (size_t)testLen);
+    p[testLen] = 0x0F; p[testLen + 1] = 0x85; SightPut32(p + testLen + 2, back - H);
     for (int k = 0; k < cells; ++k)
     {
-        const int o = 14 + 13 * k;
+        const int o = H + 13 * k;
         unsigned char* q = p + o;
-        q[0] = 0x48; q[1] = 0x3B; q[2] = 0x05; SightPut32(q + 3, cellsOff + 8 + 8 * k - (o + 7));
+        q[0] = 0x48; q[1] = 0x3B; q[2] = (unsigned char)(rcx ? 0x0D : 0x05); SightPut32(q + 3, cellsOff + 8 + 8 * k - (o + 7));
         q[7] = 0x0F; q[8] = 0x84; SightPut32(q + 9, hit - (o + 13));
     }
-    std::memcpy(p + N, test, 8);
-    p[N + 8] = 0xEB; p[N + 9] = 0x0C;
-    p[N + 10] = 0xF0; p[N + 11] = 0x48; p[N + 12] = 0xFF; p[N + 13] = 0x05; SightPut32(p + N + 14, cellsOff - (N + 18));
-    p[N + 18] = 0x48; p[N + 19] = 0x83; p[N + 20] = 0xF8; p[N + 21] = 0x00;
-    p[N + 22] = 0xFF; p[N + 23] = 0x25; SightPut32(p + N + 24, 0);
-    const unsigned long long backTo = site + 8;
-    std::memcpy(p + N + 28, &backTo, 8);
-    return N + 36;
+    std::memcpy(p + N, test, (size_t)testLen);
+    p[N + testLen] = 0xEB; p[N + testLen + 1] = 0x0C;
+    p[hit] = 0xF0; p[hit + 1] = 0x48; p[hit + 2] = 0xFF; p[hit + 3] = 0x05; SightPut32(p + hit + 4, cellsOff - (hit + 8));
+    p[hit + 8] = 0x48; p[hit + 9] = 0x83; p[hit + 10] = (unsigned char)(rcx ? 0xF9 : 0xF8); p[hit + 11] = 0x00;
+    p[back] = 0xFF; p[back + 1] = 0x25; SightPut32(p + back + 2, 0);
+    const unsigned long long backTo = site + (unsigned long long)testLen;
+    std::memcpy(p + back + 6, &backTo, 8);
+    return back + 14;
 }
 
 /* The TRESPASS stub (crime.cpp, site 0x858D13 inside the senses function 0x8587B0, which keeps its `this` in rbp from 0x8587CF:

@@ -70,6 +70,7 @@ void* TownOfBuilding(void* building);
    4 (coopstore::kGiveHomePlayerHouse) refused: the building is a player's house (TownGenPlayerHouse), never given.
    TownGenGiveHomeByKey: the same after resolving the key (items.cpp ObjectByPositionKey) - 3 the building is not loaded here.
    MAIN THREAD. */
+int  TownGenRepairMarks(const std::string& buildingKey, int* repaired, int* owedSettling);   /* T-984 (TEST lever's read), any thread: *repaired 1 = the empty-building repair set this building's residents aside in this world; *owedSettling 1 = an owed residents row for it was made here and no finished save holds it yet (OwedSettling). 0 = empty key */
 int  TownGenPlatoonHomeKey(const void* platoon, char* out, int cap);
 int  TownGenGiveHomeTo(void* platoon, void* building);
 int  TownGenGiveHomeByKey(void* platoon, const char* key);

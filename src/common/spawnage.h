@@ -14,6 +14,8 @@
  *   uid u32 | x y z f32 | nameLen u32 | name | facLen u32 | faction | keepContainer u8 | age f32 (P1)
  *       | statsHas u8 | [176-byte stats block when statsHas != 0] (S1, session 49: src/common/statswire.h)
  *       | flags u8 (T-303, session protocol 102: bit 0 = the owner's character is DEAD, bit 1 = knocked out)
+ *       | sidLen u32 | sid (T-922, session protocol 172: the template's stringID, 0..kSpawnMaxSid bytes; 0 = none - the
+ *         receiver then uses the shown name in `name` alone; templatekey.h)
  *
  * An older payload without the trailing age decodes to 0.0 (the value every copy had before) and says
  * so (ageAbsent), so a caller can count it.  A present age that is NaN, infinite or outside [0,1] is
@@ -65,10 +67,13 @@ struct SpawnMsg
     int statsState;     /* S1: kSpawnStats* */
     unsigned int ownerFlags;   /* T-303: kSpawnFlag* (unknown bits masked off); 0 when absent */
     bool flagsAbsent;          /* T-303: the payload ended before the flags byte */
+    std::string templateSid;   /* T-922: the template's stringID, "" = none sent / absent / refused */
+    bool templateSidAbsent;    /* T-922: the payload ended before the stringID's length */
+    bool templateSidBad;       /* T-922: a length over kSpawnMaxSid or past the payload's end: the id is not used */
     int statsBadIndex;  /* S1: the first non-finite float of a refused block, -1 otherwise */
     unsigned int stats[coopstats::kStatsCount];   /* S1: the owner's 44 values when statsState == kSpawnStatsOk */
     SpawnMsg() : uid(0), x(0), y(0), z(0), keepContainer(true), age(0.0f), ageAbsent(false), ageClamped(false),
-                 statsState(kSpawnStatsAbsent), ownerFlags(0), flagsAbsent(true), statsBadIndex(-1) { std::memset(stats, 0, sizeof(stats)); }
+                 statsState(kSpawnStatsAbsent), ownerFlags(0), flagsAbsent(true), templateSidAbsent(true), templateSidBad(false), statsBadIndex(-1) { std::memset(stats, 0, sizeof(stats)); }
 };
 
 /* [0,1], with NaN and the infinities caught by their BITS (a `v != v` test is not safe under /fp:fast).
@@ -131,6 +136,16 @@ inline void AppendSpawnFlags(std::vector<char>* b, unsigned int flags)
     b->push_back((char)(unsigned char)(flags & kSpawnFlagsKnown));
 }
 
+/* T-922 (protocol 172): appended AFTER AppendSpawnFlags - the template's stringID (templatekey.h SidToSend), u32 length then
+   the bytes; an id longer than kSpawnMaxSid is written as none (length 0). */
+const unsigned int kSpawnMaxSid = 95u;   /* templatekey.h kMaxSid (the offline suite asserts they agree) */
+inline void AppendSpawnTemplateSid(std::vector<char>* b, const std::string& sid)
+{
+    const bool fits = sid.size() <= (size_t)kSpawnMaxSid;
+    SpawnPutU32(b, fits ? (unsigned int)sid.size() : 0u);
+    if (fits) b->insert(b->end(), sid.begin(), sid.end());
+}
+
 inline int DecodeSpawn(const char* p, size_t size, SpawnMsg* out)
 {
     SpawnMsg m;
@@ -174,6 +189,15 @@ inline int DecodeSpawn(const char* p, size_t size, SpawnMsg* out)
                 m.ownerFlags = (unsigned int)(unsigned char)p[off] & kSpawnFlagsKnown;
                 m.flagsAbsent = false;
                 off += 1;
+                if (size - off >= 4)   /* T-922 (protocol 172): the template's stringID follows the flags byte */
+                {
+                    unsigned int sidLen = 0;
+                    std::memcpy(&sidLen, p + off, 4);
+                    off += 4;
+                    m.templateSidAbsent = false;
+                    if ((size_t)sidLen <= (size_t)kSpawnMaxSid && size - off >= (size_t)sidLen) { m.templateSid.assign(p + off, sidLen); off += sidLen; }
+                    else m.templateSidBad = true;
+                }
             }
         }
     }

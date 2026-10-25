@@ -46,7 +46,7 @@
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 101;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW) */
+const unsigned kProtocol = 108;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW) */
 const unsigned kFlagCut = 1;
 const size_t kMaxShowRows = 256;   /* teammate outposts in one SHOW */
 const size_t kShowMsgBytes = townkeep::kTownsMsgBytes;   /* one SHOW at most: under the world-server road's 64 KiB */
@@ -99,8 +99,9 @@ inline std::vector<ShowRow> RowsFor(const std::vector<townkeep::TownRow>& said, 
 }
 
 /* SHOW KEYS (townkeep.h kOpShowKeys): one row per shown row, in its order - the first said outpost of the row's owner at exactly the
-   row's centre (RowsFor copies the centre bit for bit), with its name, size level, keys and cut flag; handle words all 0. A said row
-   not valid for SHOW KEYS is left out (that row's copies are then not linked on the viewer's game, and none is unlinked) */
+   row's centre (RowsFor copies the centre bit for bit), with its name, size level, keys and cut flag, and (T-924) the handle words its
+   owner's game said for it - an identity a game matches its copy by (MatchIdent), never a town on another game; the same five words
+   the wire always carried (they were 0): no new field, no protocol change. A said row not valid for SHOW KEYS is left out (that row's copies are then not linked on the viewer's game, and none is unlinked) */
 inline std::vector<townkeep::TownRow> KeyRowsFor(const std::vector<townkeep::TownRow>& said, const std::vector<ShowRow>& shown)
 {
     std::vector<townkeep::TownRow> out;
@@ -116,6 +117,7 @@ inline std::vector<townkeep::TownRow> KeyRowsFor(const std::vector<townkeep::Tow
             k.keys = t.keys;
             k.cut = t.cut != 0 ? 1 : 0;
             k.level = t.level;
+            for (int j = 0; j < 5; ++j) k.hand[j] = t.hand[j];   /* T-924: the owner's own town handle words (0 when its game said none) */
             if (townkeep::RowOk(k, townkeep::kOpShowKeys)) out.push_back(k);
             break;
         }
@@ -208,20 +210,72 @@ struct Shown
     int going;     /* 1 = its row went and it is not taken out yet (a loaded piece names it, or the destroy faulted): tried again */
     int drawn;     /* T-811 log: 1 = the map made its marker (the icon hook ran for its town) */
     std::string markSaid;   /* T-811 log: the icon / colour last written in its [TEAMBASE] map marker line ("" = none yet) */
-    Shown() : owner(-1), ours(0), level(0), going(0), drawn(0) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) hand[i] = 0; }
+    int ownerHand[5];       /* T-924: the owner's own town handle words, from its key row (all 0: not known) */
+    std::set<std::string> keys;   /* T-924: the keys its key row last named (a re-founded outpost keeps its pieces' keys) */
+    Shown() : owner(-1), ours(0), level(0), going(0), drawn(0) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) { hand[i] = 0; ownerHand[i] = 0; } }
 };
-/* each row's shown base: the first not yet matched of the same owner within kSameBaseRadius of the row's centre (-1 none);
-   *gone: the shown bases no row matched, in order */
-inline void Match(const std::vector<Shown>& shown, const std::vector<ShowRow>& rows, std::vector<int>* rowTo, std::vector<size_t>* gone)
+/* T-924 IDENTITY: the key row of a SHOW row - the one of the same owner at exactly its centre (KeyRowsFor copies it bit for bit;
+   -1 none: the SHOW KEYS for it has not come yet) */
+inline int KeyRowOfRow(const ShowRow& r, const std::vector<townkeep::TownRow>& keyRows)
+{
+    for (size_t k = 0; k < keyRows.size(); ++k)
+        if (keyRows[k].owner == r.owner && keyRows[k].pos[0] == r.pos[0] && keyRows[k].pos[1] == r.pos[1] && keyRows[k].pos[2] == r.pos[2]) return (int)k;
+    return -1;
+}
+/* a shown base takes its row's identity: the owner's town handle words when its key row carries them, its keys when it names any
+   (a key row with neither leaves what the base knew) */
+inline void ShownIdentity(Shown* s, const townkeep::TownRow& keyRow)
+{
+    if (townkeep::HandKnown(keyRow.hand)) for (int i = 0; i < 5; ++i) s->ownerHand[i] = keyRow.hand[i];
+    if (!keyRow.keys.empty()) { s->keys.clear(); s->keys.insert(keyRow.keys.begin(), keyRow.keys.end()); }
+}
+inline int SharesKey(const Shown& s, const townkeep::TownRow& keyRow)
+{
+    for (size_t k = 0; k < keyRow.keys.size(); ++k) if (s.keys.count(keyRow.keys[k]) != 0) return 1;
+    return 0;
+}
+/* each row's shown base (-1 none), of the same owner, not yet matched, in three passes: 1. the owner's town handle (the row's key
+   row carries it and the base knows it, the same words); 2. a shared piece key (an outpost the owner's game founded again, with a new
+   handle and a moved centre, still holds its pieces); 3. today's rule, the first within kSameBaseRadius of the row's centre - only
+   for a pair whose identity is not known on both sides (a world server that sends zeros, a base taken up before its key row came).
+   A matched row whose centre moved keeps its base (no second copy). *gone: the shown bases no row matched, in order */
+inline void MatchIdent(const std::vector<Shown>& shown, const std::vector<ShowRow>& rows, const std::vector<townkeep::TownRow>& keyRows,
+                       std::vector<int>* rowTo, std::vector<size_t>* gone)
 {
     std::vector<int> used(shown.size(), 0);
     rowTo->assign(rows.size(), -1);
+    std::vector<int> kr(rows.size(), -1);
+    for (size_t r = 0; r < rows.size(); ++r) kr[r] = KeyRowOfRow(rows[r], keyRows);
     for (size_t r = 0; r < rows.size(); ++r)
+    {
+        if (kr[r] < 0 || !townkeep::HandKnown(keyRows[(size_t)kr[r]].hand)) continue;
         for (size_t s = 0; s < shown.size(); ++s)
-            if (used[s] == 0 && shown[s].owner == rows[r].owner && keptwire::NearXZ(shown[s].pos[0], shown[s].pos[2], rows[r].pos[0], rows[r].pos[2], kSameBaseRadius) != 0)
+            if (used[s] == 0 && shown[s].owner == rows[r].owner && townkeep::HandKnown(shown[s].ownerHand) && townkeep::HandSame(shown[s].ownerHand, keyRows[(size_t)kr[r]].hand))
             { used[s] = 1; (*rowTo)[r] = (int)s; break; }
+    }
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        if ((*rowTo)[r] >= 0 || kr[r] < 0) continue;
+        for (size_t s = 0; s < shown.size(); ++s)
+            if (used[s] == 0 && shown[s].owner == rows[r].owner && SharesKey(shown[s], keyRows[(size_t)kr[r]]) != 0)
+            { used[s] = 1; (*rowTo)[r] = (int)s; break; }
+    }
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        if ((*rowTo)[r] >= 0) continue;
+        const bool rowHand = kr[r] >= 0 && townkeep::HandKnown(keyRows[(size_t)kr[r]].hand);
+        for (size_t s = 0; s < shown.size(); ++s)
+            if (used[s] == 0 && shown[s].owner == rows[r].owner && (!rowHand || !townkeep::HandKnown(shown[s].ownerHand))
+                && keptwire::NearXZ(shown[s].pos[0], shown[s].pos[2], rows[r].pos[0], rows[r].pos[2], kSameBaseRadius) != 0)
+            { used[s] = 1; (*rowTo)[r] = (int)s; break; }
+    }
     gone->clear();
     for (size_t s = 0; s < shown.size(); ++s) if (used[s] == 0) gone->push_back(s);
+}
+/* with no key rows: today's rule alone (the first not yet matched of the same owner within kSameBaseRadius of the row's centre) */
+inline void Match(const std::vector<Shown>& shown, const std::vector<ShowRow>& rows, std::vector<int>* rowTo, std::vector<size_t>* gone)
+{
+    MatchIdent(shown, rows, std::vector<townkeep::TownRow>(), rowTo, gone);
 }
 /* the key row of a shown base: the one of the same owner at exactly its centre (BdShowApply gives a base its row's centre bit for bit,
    and KeyRowsFor copies it the same way - so two outposts of one owner within kSameBaseRadius each find their own); else the first
@@ -416,6 +470,228 @@ inline int RowStep(int ownTownStands, int otherStands, int canFound)
     if (ownTownStands != 0) return kRowKeep;
     if (otherStands != 0) return kRowTake;
     return canFound != 0 ? kRowFound : kRowNone;
+}
+
+/* ---- T-924 COPY LIST (2026-10-23, T1441): THIS GAME'S COPIES OF ITS TEAMMATES' OUTPOSTS, BY HANDLE WORDS ----
+   The engine founds a copy with the local player's faction and its default name; the mod writes the stand-in faction and the label
+   after. A copy a save held (its model-piece store kept it, StoreKeep) came back after a reload as THIS player's own town (T1441: the
+   same handle, the player's faction, 0 keys), was said to the world server as its own, and a teammate's game founded a copy of it.
+   So each game lists the copies it founded or took up - its slot, the copy's handle words and centre, the owner's town handle words
+   and name when known - in its world folder: kCopyListFilePrefix + the player key + ".txt". A town whose handle is listed, standing
+   within kSameBaseRadius of its listed centre (CopyAt: a handle the engine gave another town since is not taken), is that slot's copy
+   whatever its faction or name: taken up again with the stand-in faction and the label written (TakeUpSlot), and never said as this
+   player's own (SayOwnTown). T-924 FOLD 1: a row is never dropped when its copy is taken out or its town is gone - an older save
+   reloaded can still hold that copy; a row whose town is gone is near harmless (a take-up needs the handle AND the centre) - and past
+   kCopyListCap the oldest row goes. The list not read (CopyListState) holds this player's SAY. FILE: TAB-separated, LF line ends (a CR before it read as nothing); line 1 "<kCopyListHeader><TAB>1", then per copy
+     C <owner slot> <5 x copy handle word> <x> <y> <z> <5 x owner's town handle word (0: not known)> <owner's outpost name>
+   ints decimal, floats the 8 lower-case hex digits of their IEEE bits, the name escaped as zonekeep.h's lists. */
+const char* const kCopyListFilePrefix = "shown-town-copies-";
+const char* const kCopyListHeader = "shown-town-copies";
+const int kCopyListFormat = 1;
+const size_t kCopyListCap = 1024;   /* rows kept (kMaxShowRows bases at once, with room for the ones a save held) */
+struct CopyRow
+{
+    int owner;          /* the owner's player slot */
+    int hand[5];        /* the copy's town handle words in THIS game */
+    float pos[3];       /* the copy town's own centre as read here */
+    int ownerHand[5];   /* the owner's own town handle words (all 0: not known) */
+    std::string name;   /* the owner's outpost name ("" = not known) */
+    CopyRow() : owner(-1) { for (int i = 0; i < 5; ++i) { hand[i] = 0; ownerHand[i] = 0; } pos[0] = pos[1] = pos[2] = 0.0f; }
+};
+inline bool CopyRowOk(const CopyRow& r)
+{
+    if (r.owner < 0 || r.owner > townkeep::kOwnerMax || !townkeep::HandKnown(r.hand)) return false;
+    for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(r.pos[j])) return false;
+    return keptwire::TextOk(r.name, keptwire::kStrMax, true);
+}
+/* the row of a handle (-1 none, or no handle) */
+inline int CopyFind(const std::vector<CopyRow>& l, const int* h)
+{
+    if (!townkeep::HandKnown(h)) return -1;
+    for (size_t i = 0; i < l.size(); ++i) if (townkeep::HandSame(l[i].hand, h)) return (int)i;
+    return -1;
+}
+/* the row listed for a town of handle h standing at lp: its index when the handle is listed and lp is within kSameBaseRadius of the
+   listed centre; -1 none */
+inline int CopyAt(const std::vector<CopyRow>& l, const int* h, const float* lp)
+{
+    const int i = CopyFind(l, h);
+    if (i < 0) return -1;
+    return keptwire::NearXZ(lp[0], lp[2], l[(size_t)i].pos[0], l[(size_t)i].pos[2], kSameBaseRadius) != 0 ? i : -1;
+}
+/* a copy noted (founded, taken up, or its identity learnt): 1 = the list changed. A row of the same handle is updated - an owner's
+   handle or name once known is kept when the note has none; a row not valid (no handle) is not noted; a new row past kCopyListCap
+   makes room by dropping the oldest. T-924 FOLD 2: a row noted again moves to the newest end (the list runs oldest to newest noted);
+   at the cap the oldest row whose handle is not in live (zonekeep::TownHandText of the bases standing now) goes - a live copy's row
+   never does; with every row live none goes (*allLive = 1). A move alone answers 0 (the file is written at the next change) */
+inline int CopyNote(std::vector<CopyRow>* l, const CopyRow& r, const std::set<std::string>* live = 0, int* allLive = 0)
+{
+    if (allLive != 0) *allLive = 0;
+    if (!CopyRowOk(r)) return 0;
+    const int i = CopyFind(*l, r.hand);
+    if (i < 0)
+    {
+        while (l->size() >= kCopyListCap)
+        {
+            size_t drop = l->size();
+            for (size_t k = 0; k < l->size() && drop == l->size(); ++k)
+                if (live == 0 || live->count(zonekeep::TownHandText((*l)[k].hand)) == 0) drop = k;
+            if (drop == l->size()) { if (allLive != 0) *allLive = 1; break; }
+            l->erase(l->begin() + (long)drop);
+        }
+        l->push_back(r);
+        return 1;
+    }
+    const CopyRow o = (*l)[(size_t)i];
+    CopyRow m = r;
+    if (!townkeep::HandKnown(m.ownerHand)) for (int j = 0; j < 5; ++j) m.ownerHand[j] = o.ownerHand[j];
+    if (m.name.empty()) m.name = o.name;
+    const bool same = m.owner == o.owner && m.pos[0] == o.pos[0] && m.pos[1] == o.pos[1] && m.pos[2] == o.pos[2] && townkeep::HandSame(m.ownerHand, o.ownerHand) && m.name == o.name;
+    l->erase(l->begin() + i);
+    l->push_back(same ? o : m);
+    return same ? 0 : 1;
+}
+/* one report when the list has stayed unread this long (logged = 1 once made) */
+const unsigned long kCopyHoldReportMs = 60000;
+inline int CopyHoldReport(unsigned long heldMs, int logged) { return (logged == 0 && heldMs >= kCopyHoldReportMs) ? 1 : 0; }
+/* THE LIST'S STATE after a look at its file: in - read, or no file (an empty list); held - no file named (no world folder or player
+   key yet), the file is there but would not open (locked), or a read error. While held this player's own outposts are not said
+   (SayAllowed: a copy among them would be said as its own) and the shown bases are not applied; tried again every kCopyListRetryMs */
+const int kCopyListHold = 0, kCopyListIn = 1;
+const unsigned long kCopyListRetryMs = 2000;
+inline int CopyListState(int pathKnown, int opened, int absent, int readOk)
+{
+    if (pathKnown == 0) return kCopyListHold;
+    if (opened == 0) return absent != 0 ? kCopyListIn : kCopyListHold;
+    return readOk != 0 ? kCopyListIn : kCopyListHold;
+}
+inline int SayAllowed(int listState) { return listState == kCopyListIn ? 1 : 0; }
+/* T-924 FOLD 3 (T1442: the list's folder did not exist on a client, read as 'no file' and every write failed unseen): WHY the list is
+   in or held - no file named (no data folder or player key yet), the world's data folder not made yet (held: it is made at the record
+   index read), no file in the folder (an empty list), the file unreadable (locked, a read error: held), read */
+const int kCopyWhyRead = 0, kCopyWhyNoFile = 1, kCopyWhyNoPath = 2, kCopyWhyNoFolder = 3, kCopyWhyUnreadable = 4;
+inline int CopyListWhy(int pathKnown, int folderThere, int opened, int fileAbsent, int readOk)
+{
+    if (pathKnown == 0) return kCopyWhyNoPath;
+    if (folderThere == 0) return kCopyWhyNoFolder;
+    if (opened == 0) return fileAbsent != 0 ? kCopyWhyNoFile : kCopyWhyUnreadable;
+    return readOk != 0 ? kCopyWhyRead : kCopyWhyUnreadable;
+}
+inline int CopyListStateOf(int why) { return (why == kCopyWhyRead || why == kCopyWhyNoFile) ? kCopyListIn : kCopyListHold; }
+inline const char* CopyWhyName(int why)
+{
+    return why == kCopyWhyRead ? "read" : why == kCopyWhyNoFile ? "no file yet" : why == kCopyWhyNoPath ? "no file named (no data folder or player key yet)"
+         : why == kCopyWhyNoFolder ? "the world's data folder is not made yet" : why == kCopyWhyUnreadable ? "the file is there but cannot be read" : "none";
+}
+/* the list may be written over its file: it was taken from it (readIn) and the file was read whole (or absent), or its bad lines were
+   kept aside first (badKept) - never over content that could not be read */
+inline int CopyWriteOk(int readIn, int whole, int badKept) { return (readIn != 0 && (whole != 0 || badKept != 0)) ? 1 : 0; }
+/* where a file with bad lines is kept aside: <file>.bad, then .bad2 .. .bad<kCopyBadNames> (one already there is never written over) */
+const int kCopyBadNames = 9;
+inline std::string BadCopyName(const std::string& path, int n) { return n <= 1 ? path + ".bad" : path + ".bad" + zonekeep::ZkNum(n); }
+/* a town standing here untracked, at a reload's take-up: the slot it is taken up as a copy of, -1 none. A listed town (listedOwner
+   >= 0, CopyAt) is its listed slot's copy whatever its faction or name; else, once this world's kept list is in (markOk), one carrying
+   the mod's mark (LeftoverMark) of a slot not this player's */
+inline int TakeUpSlot(int listedOwner, int mySlot, int markOk, int standInSlot, int labelForm, int nearKept)
+{
+    if (listedOwner >= 0 && listedOwner != mySlot) return listedOwner;
+    if (markOk != 0 && standInSlot != mySlot && LeftoverMark(standInSlot, labelForm, nearKept) != 0) return standInSlot;
+    return -1;
+}
+/* SAY: 1 = a town of this player's faction that is not a listed copy (said as this player's own) */
+inline int SayOwnTown(int ownFaction, int listedCopy) { return (ownFaction != 0 && listedCopy == 0) ? 1 : 0; }
+/* THE FIRST APPLY (the SHOW KEYS that carries the rows' identity follows each SHOW, as its own message): a row that would have a copy
+   founded for it while no whole SHOW KEYS came since its SHOW, and none held names it, waits - at most kShowKeysWaitMs (then founded
+   as today) - so a moved outpost is matched to its copy, not founded twice. 1 = wait */
+const unsigned long kShowKeysWaitMs = 10000;   /* Guess: the world server sends SHOW KEYS right after SHOW */
+inline int FoundWait(int keysSinceShow, int rowHasKeyRow, unsigned long waitedMs)
+{
+    return (keysSinceShow == 0 && rowHasKeyRow == 0 && waitedMs < kShowKeysWaitMs) ? 1 : 0;
+}
+/* ONE APPLY'S PLAN (T-924 fold): rowTo - each row's shown base (MatchIdent); rowWait - 1 = a row that waits for its SHOW KEYS before a
+   copy is founded for it (FoundWait); gone - the unmatched bases to take out; held - the unmatched bases of an owner with a row
+   waiting (kept as they are: the identity match runs first once the keys come, at the latest when the wait ends) */
+struct ApplyPlan
+{
+    std::vector<int> rowTo;
+    std::vector<int> rowWait;
+    std::vector<size_t> gone;
+    std::vector<size_t> held;
+};
+inline void PlanApply(const std::vector<Shown>& shown, const std::vector<ShowRow>& rows, const std::vector<townkeep::TownRow>& keyRows,
+                      int keysSinceShow, unsigned long waitedMs, ApplyPlan* p)
+{
+    std::vector<size_t> unmatched;
+    MatchIdent(shown, rows, keyRows, &p->rowTo, &unmatched);
+    p->rowWait.assign(rows.size(), 0);
+    std::set<int> waitOwners;
+    for (size_t r = 0; r < rows.size(); ++r)
+        if (FoundWait(keysSinceShow, KeyRowOfRow(rows[r], keyRows) >= 0 ? 1 : 0, waitedMs) != 0) { p->rowWait[r] = 1; waitOwners.insert(rows[r].owner); }
+    p->gone.clear();
+    p->held.clear();
+    for (size_t i = 0; i < unmatched.size(); ++i)
+    {
+        if (waitOwners.count(shown[unmatched[i]].owner) != 0) p->held.push_back(unmatched[i]);
+        else p->gone.push_back(unmatched[i]);
+    }
+}
+inline std::string EncodeCopyList(const std::vector<CopyRow>& l)
+{
+    std::string o = std::string(kCopyListHeader) + "\t" + zonekeep::ZkNum(kCopyListFormat) + "\n";
+    for (size_t i = 0; i < l.size(); ++i)
+    {
+        const CopyRow& r = l[i];
+        o += "C\t" + zonekeep::ZkNum(r.owner);
+        for (int j = 0; j < 5; ++j) o += "\t" + zonekeep::ZkNum(r.hand[j]);
+        for (int j = 0; j < 3; ++j) o += "\t" + zonekeep::FloatHex(r.pos[j]);
+        for (int j = 0; j < 5; ++j) o += "\t" + zonekeep::ZkNum(r.ownerHand[j]);
+        o += "\t" + zonekeep::Esc(r.name) + "\n";
+    }
+    return o;
+}
+/* the rows back, line by line: every good row kept (a handle twice: the later row wins; past kCopyListCap the oldest goes). The answer:
+   the lines that could not be read (0 = read whole; an empty file reads as an empty list). A first line that is not this list's
+   header of this format counts every line bad and keeps no row (*why names the first bad line) */
+inline size_t DecodeCopyList(const std::string& text, std::vector<CopyRow>* out, std::string* why)
+{
+    out->clear();
+    std::vector<CopyRow> rows;
+    std::vector<std::string> f;
+    size_t at = 0, bad = 0;
+    int lineNo = 0;
+    bool headerBad = false;
+    while (at < text.size())
+    {
+        size_t e = text.find('\n', at);
+        if (e == std::string::npos) e = text.size();
+        std::string line = text.substr(at, e - at);
+        at = e + 1;
+        ++lineNo;
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        const std::string where = "line " + zonekeep::ZkNum(lineNo) + ": ";
+        zonekeep::SplitTabs(line, &f);
+        if (lineNo == 1)
+        {
+            int v = 0;
+            if (f.size() != 2 || f[0] != kCopyListHeader || !zonekeep::DecInt(f[1], &v) || v != kCopyListFormat) headerBad = true;
+            if (headerBad) { ++bad; *why = where + "not a " + kCopyListHeader + " list of format " + zonekeep::ZkNum(kCopyListFormat); }
+            continue;
+        }
+        if (line.empty()) continue;
+        if (headerBad) { ++bad; continue; }
+        CopyRow r;
+        bool ok = f.size() == 16u && f[0] == "C" && zonekeep::DecInt(f[1], &r.owner);
+        for (int j = 0; ok && j < 5; ++j) ok = zonekeep::DecInt(f[(size_t)(2 + j)], &r.hand[j]);
+        for (int j = 0; ok && j < 3; ++j) ok = zonekeep::HexFloat(f[(size_t)(7 + j)], &r.pos[j]);
+        for (int j = 0; ok && j < 5; ++j) ok = zonekeep::DecInt(f[(size_t)(10 + j)], &r.ownerHand[j]);
+        ok = ok && zonekeep::Unesc(f[15], &r.name) && CopyRowOk(r);
+        if (!ok) { if (bad == 0) *why = where + "a copy line this build cannot read"; ++bad; continue; }
+        const int i = CopyFind(rows, r.hand);
+        if (i >= 0) rows[(size_t)i] = r;
+        else CopyNote(&rows, r);
+    }
+    out->swap(rows);
+    return bad;
 }
 
 }   /* namespace baseshow */

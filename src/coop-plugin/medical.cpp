@@ -908,6 +908,27 @@ bool CopyOwnerSaysKo(unsigned int uid) { return OwnerSaysKo(uid); }
 // "knocked out" entry cannot hold the looks forever. ANY THREAD.
 void CopyNoteOwnerKo(unsigned int uid, bool ko) { NoteOwnerKo(uid, ko); }
 
+// An owner's death that found no usable copy here (none loaded, or the liveness check refused the copy after the engine changed
+// its handle): one line per uid, the uid kept (at most kDeathMissedMax, then only counted), and the death applied through
+// ApplyOwnerDeath when a copy of the uid is usable again (MedicalCopyUsableAgain, drained by MedicalDrainMissedDeaths).
+// MAIN THREAD.
+static const size_t kDeathMissedMax = 64;
+static std::set<unsigned int> g_deathMissed;
+static const int kDeathDueMax = 64;
+static unsigned int g_deathDue[kDeathDueMax];
+static int g_deathDueN = 0;
+static volatile LONG64 g_deathNoCopyUnlogged = 0, g_deathMissedApplied = 0;
+static volatile LONG64 g_deathNoCopyNoRow = 0;   // an owner's death for a uid this game holds no row for: counted, not held
+static void DeathMissedNote(unsigned int uid)
+{
+    if (g_deathMissed.count(uid) != 0) return;
+    if (g_deathMissed.size() >= kDeathMissedMax) { InterlockedIncrement64(&g_deathNoCopyUnlogged); return; }
+    g_deathMissed.insert(uid);
+    DebugLog("[DEATH] uid=" + N(uid) + " the owner says dead but its copy here is not usable now - the word is kept and the death is applied"
+             " when a copy of it is usable again (deathNoCopy=" + N(g_deathNoCopy) + "; one line per uid, at most "
+             + N((long long)kDeathMissedMax) + " uids held, then counted deathNoCopyUnlogged)");
+}
+
 // The per-copy word tables (above): uid's hunger, knocked-out and dead words are forgotten. Called where its copy is removed
 // here (spawn.cpp: RemoveLocalCopy, an inbound DESPAWN, the mirror reclaim) and where its ownership moves to or from this game
 // (net/session.cpp: TakeLocalOwner, ReleaseLocalOwner, SetLocalOwner) - a word kept past either would be read as the owner's
@@ -918,6 +939,7 @@ void MedicalForgetCopy(unsigned int uid)
     SlotRelease(g_ownerHunger, kOwnerHungerSlots, kOwnerHungerProbe, uid);
     SlotRelease(g_ownerKo, kOwnerKoSlots, kOwnerKoProbe, uid);
     SlotRelease(g_ownerDead, kOwnerDeadSlots, kOwnerDeadProbe, uid);
+    g_deathMissed.erase(uid);
 }
 
 // Every copy's words are forgotten: world teardown (spawn.cpp SpawnWorldTeardown) and session end (net/session.cpp
@@ -927,6 +949,8 @@ void MedicalForgetAllCopies()
     SlotClearAll(g_ownerHunger, kOwnerHungerSlots);
     SlotClearAll(g_ownerKo, kOwnerKoSlots);
     SlotClearAll(g_ownerDead, kOwnerDeadSlots);
+    g_deathMissed.clear();
+    g_deathDueN = 0;
 }
 
 // par6 (parity P6) - see the table above. ANY THREAD (the medical tick's AI worker, or a lever on the main thread).
@@ -988,7 +1012,20 @@ void ApplyOwnerDeath(unsigned int uid, int dead)
     if (uid == 0 || net::IsUidMine(uid)) return;   // this game's engine decides the deaths of the characters it drives
     NoteOwnerDead(uid, dead != 0);
     ::Character* c = FindSpawned(uid);
-    if (c == 0) { if (dead != 0) InterlockedIncrement64(&g_deathNoCopy); return; }
+    if (c == 0)
+    {
+        if (dead != 0)
+        {
+            InterlockedIncrement64(&g_deathNoCopy);
+            /* held only while this game has a row for the uid whose copy is not usable now (the liveness check refuses it, e.g.
+               after the engine changed its handle); with no row the owner's later SPAWN carries the dead flag */
+            if (SpawnedRawObject(uid) != 0) DeathMissedNote(uid);
+            else InterlockedIncrement64(&g_deathNoCopyNoRow);
+        }
+        else g_deathMissed.erase(uid);   // the owner's word is alive now: nothing is owed
+        return;
+    }
+    g_deathMissed.erase(uid);   // a usable copy has the owner's word from here (a deferred kill is retried by the next STATE)
     if (dead == 0)
     {
         if (c->hasDied())
@@ -1042,6 +1079,32 @@ void ApplyOwnerDeath(unsigned int uid, int dead)
     InterlockedIncrement64(&g_deathApplied);
     DebugLog("[DEATH] uid=" + N(uid) + " the owner says dead -> copy killed through the engine's path"
              " (MedicalSystem.dead + Character::declareDead 0x7A5660) isDead=1 applied=" + N(g_deathApplied));
+}
+
+void MedicalCopyUsableAgain(unsigned int uid)
+{
+    if (uid == 0 || g_deathMissed.count(uid) == 0) return;
+    for (int i = 0; i < g_deathDueN; ++i)
+        if (g_deathDue[i] == uid) return;
+    if (g_deathDueN < kDeathDueMax) g_deathDue[g_deathDueN++] = uid;
+}
+
+void MedicalDrainMissedDeaths()
+{
+    unsigned int due[kDeathDueMax];
+    const int n = g_deathDueN;
+    for (int i = 0; i < n; ++i) due[i] = g_deathDue[i];
+    g_deathDueN = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const unsigned int uid = due[i];
+        if (g_deathMissed.count(uid) == 0) continue;                      // applied or forgotten since
+        if (!OwnerSaysDead(uid)) { g_deathMissed.erase(uid); continue; }  // the owner's word changed: nothing is owed
+        InterlockedIncrement64(&g_deathMissedApplied);
+        DebugLog("[DEATH] uid=" + N(uid) + " a copy is usable again - the owner's death it missed is applied now (deathMissedApplied="
+                 + N(g_deathMissedApplied) + ")");
+        ApplyOwnerDeath(uid, 1);
+    }
 }
 
 // T-303 (protocol 102) - A CORPSE IS NEVER ANNOUNCED STANDING. T665: the owner re-announced its dead character after a
@@ -1680,7 +1743,8 @@ void ReportMedical()
        << " deathAlready=" << N(g_deathAlready)
        << " deathDeferred=" << N(g_deathDeferred)
        << " deathFault=" << N(g_deathFault)
-       << " deathNoCopy=" << N(g_deathNoCopy)
+       << " deathNoCopy=" << N(g_deathNoCopy) << " deathNoCopyNoRow=" << N(g_deathNoCopyNoRow) << " deathNoCopyUnlogged=" << N(g_deathNoCopyUnlogged)
+       << " deathMissedApplied=" << N(g_deathMissedApplied)
        << " deathOwnerAliveCopyDead=" << N(g_deathOwnerAliveCopyDead)
        << " spawnFlagDeadSent=" << N(g_spawnFlagDeadSent)          /* T-303 */
        << " spawnFlagKoSent=" << N(g_spawnFlagKoSent)

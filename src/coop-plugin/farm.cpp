@@ -425,7 +425,8 @@ void MnMerge(MnIn* in, unsigned int uid, float amount, float work)
    for coopfarm::kSpotRetryMs, then asked again; no answer in coopfarm::kSpotAskGiveUpMs -> asked again. The runner takes the spot
    through the engine's own take with its copy of the worker (so its own workers see the machine full) and keeps the hand it
    added; a release, its copy going, or no longer running the building frees it through the set's own erase (FarmDrain, K2).
-   A new row's runner is not known until FarmTick reads it (500 ms): the first step of a worker on a building is refused once.
+   A new row's runner is not known until FarmTick reads it: a new row has FarmTick read every row's runner on the next frame
+   (g_spNewDue), so a worker at a building this game runs is refused only the steps of that one frame.
    The detours run on the work step's thread: POD rows under g_fmcs, no engine call but the hand lookup and the engine's own tail.
    T-853 #9 (Read, not measured in a run): the work step 0x347490 is a task's per-frame slot (Task_UseTurret vt+0x10,
    build/vtable_Task_UseTurret.txt), run by AITaskSytem::update inside Character::threadedUpdate - the AI worker thread (F062). The
@@ -455,6 +456,7 @@ struct SpRow { char key[64]; unsigned int hash; unsigned int uid; unsigned int i
 SpRow g_sp[kSpCap];
 int g_spHigh = 0;                    /* under g_fmcs */
 volatile LONG g_spGrantedN = 0;      /* rows in kSpotGranted: the erase detour reads nothing while 0 */
+volatile LONG g_spNewDue = 0;        /* a worker row was made since the last runner read: FarmTick reads the runners on its next frame */
 volatile LONG64 g_spSeen = 0, g_spPassListed = 0, g_spPassed = 0, g_spRefused = 0, g_spAsked = 0, g_spNoKey = 0, g_spNoUid = 0,
                 g_spFull = 0, g_spLeft = 0, g_spLeftNoRow = 0, g_spHandFault = 0;
 long long g_spGiveUp = 0;            /* under g_fmcs */
@@ -632,6 +634,7 @@ int SpTakeDecide(const char* key, unsigned int uid, const unsigned int* ids)
             r.grantSlot = -1;
             if (free >= g_spHigh) g_spHigh = free + 1;
             i = free;
+            ::InterlockedExchange(&g_spNewDue, 1);
         }
     }
     if (i >= 0)
@@ -742,7 +745,7 @@ int SpCopyHand(unsigned char* out, const void* who)
     return 1;
 }
 
-/* MAIN THREAD (FarmTick, every 500 ms): every row's runner read (ProdWriterDecide: the three-way answer and the runner's slot from
+/* MAIN THREAD (FarmTick, every 500 ms and on the next frame after a new row): every row's runner read (ProdWriterDecide: the three-way answer and the runner's slot from
    one ask); asks, keep-alive asks and releases sent to the runner; a row not touched for kFmForgetMs is dropped unless its spot is
    granted or its release is still owed (an owed release whose runner stays unknown kFmForgetMs is dropped: the runner frees the spot
    itself when its copy goes, a counted spot when it is no longer asked for). T-853 #1: each row adds at most one release and one ask
@@ -1813,15 +1816,15 @@ void MnSendRound(DWORD now)
 void FarmTick()
 {
     if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0) return;
-    /* M11 C1 (T-197, to-do M11): g_fmLinked = ANOTHER PLAYER IS IN THIS WORLD - the old link up, or this link's PLAYERS roster shows
-       another slot IN_WORLD (coop::PlayersPresent). With the old link alone, a world-road game (and a link outage with the other game
-       still in the world) ran every farm's own engine on both games - two writers. Its six readers keep their meaning. */
-    const LONG linked = (coop::PlayersPresent(mppresence::kSiteFarm) && !RoleIsSingle()) ? 1 : 0;
+    /* g_fmLinked = THIS GAME IS IN A MULTIPLAYER WORLD (not a single-player game): every farm and machine takes the writer road -
+       the writer verdict, a worker's step relayed to the writer (to this game itself when it writes), the writer's publish -
+       whether this game is alone in the world or not. A single-player game runs every farm's own engine. */
+    const LONG linked = RoleIsSingle() ? 0 : 1;
     const LONG was = ::InterlockedExchange(&g_fmLinked, linked);
     if (linked == 0)
     {
         if (was != 0)
-        {   /* no other player any more (M11 C1: the old link down and nobody else IN_WORLD on the roster): every farm runs its own engine again, nothing is owed */
+        {   /* a single-player game now: every farm runs its own engine again, nothing is owed */
             ::EnterCriticalSection(&g_fmcs);
             for (int i = 0; i < g_fmHigh; ++i)
             {
@@ -1844,7 +1847,15 @@ void FarmTick()
         return;
     }
     const DWORD now = ::GetTickCount();
-    if (now - g_tickAt < 500) return;
+    if (now - g_tickAt < 500)
+    {   /* a new worker row: its runner read now rather than at the next round, so its steps are not refused until then */
+        if (::InterlockedCompareExchange(&g_spNewDue, 0, 0) != 0 && !EngineWritesBlocked())
+        {
+            ::InterlockedExchange(&g_spNewDue, 0);
+            SpSendRound(now);
+        }
+        return;
+    }
     g_tickAt = now;
     if (EngineWritesBlocked()) { ++g_blocked; return; }
     if (::InterlockedExchange(&g_fmFullFlag, 0) != 0 && g_saidFull == 0)
@@ -1856,6 +1867,7 @@ void FarmTick()
     }
     MnSendRound(now);
     MsSendRound(now);
+    ::InterlockedExchange(&g_spNewDue, 0);
     SpSendRound(now);
     const int n = FmSnapshot(g_cp);
     for (int i = 0; i < n; ++i)

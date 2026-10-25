@@ -35,8 +35,9 @@
            split between its rows (EncodeTownsSay). SHOW KEYS: kSayFirst (the key list starts again with this message), kSayMore
            (more messages of it follow); split as a SAY is (EncodeShowKeys)
      SHOW KEYS (owner 936 / 937, 2026-10-17): sent right after every SHOW (baseshow.h) - per teammate outpost the SHOW carries, its
-           owner slot, centre, name, size level and the said keys of its linked pieces with the cut flag (handle words all 0: the
-           owner's game's words mean nothing on another game); the game links its copies of those pieces to the town it shows for
+           owner slot, centre, name, size level and the said keys of its linked pieces with the cut flag, and (T-924) the handle
+           words its owner's game said for it - an identity a game matches its copy by, never a town on another game (until T-924
+           all 0; the same five words, no wire change); the game links its copies of those pieces to the town it shows for
            the outpost (baseshow.h KeyRowsFor / LinkStep)
      TOWN  i32 owner slot (SAY: -1, the sender), 5 x i32 handle words, f32 x, f32 y (height), f32 z, str name (0..128 bytes, no control
            characters), u32 keys 0..kMaxTownKeys (with kKeysCut set: the outpost has pieces the list does not name), keys x str
@@ -904,6 +905,212 @@ inline void OutpostsFromPieces(const std::vector<TownRow>& said, const std::vect
             if (from > 0) ++st->split;
         }
     }
+}
+
+/* ---- THE TOWN A KEPT OUTPOST TAKES ON A GAME - BY ITS PIECES' OWN TOWN LINKS FIRST, NEVER BY DISTANCE ALONE ----
+   A kept row's centre is a snapshot from the reset and a player town's centre moves during a session (hundreds of units), so the
+   town is chosen in this order (KeptTownChoose): (1) of the live towns of the owner's faction at least one of the row's LOADED keyed
+   pieces links to (their own town words, Building +0x1D8), the one the most of the owner's loaded top-level pieces within the row's
+   reach link to, keyed or not (OwnedInReach; whichever kept row holds it - two rows may share one town) - the town holding the base's other buildings wins over a town holding more of the keyed ones (LinksMajority, MajorityBetter:
+   a tie to the more keyed pieces, then the town with the row's handle, then the nearer centre, then the earlier in the list); (2) the
+   town this world already holds for the outpost; (3) the nearest live town of the owner's faction within ChooseRadius of the row's
+   centre - the largest of that town's own radius (vt+0x2A0, the radius the engine's duplicate-town cleanup 0x929FB0 measures with),
+   the farthest loaded keyed piece's distance plus kTownCoverMargin, and kTownSameRadius; a town held for another kept row
+   (CandOpen 0) is taken by this step only when no other town stands within its radius (the two rows then share it). A town is
+   founded only when none of the three holds - so never beside a live own town, whichever row holds it - and never while the choice
+   is unsure (refused, looked at again later): the links or the town list could not all be read, a town's own radius did not read
+   (RadiusRead), or no town of the faction stands while keyed pieces of the row are loaded. */
+struct TownCand
+{
+    int hand[5];     /* the live town's handle words (Town+0x60) */
+    float pos[3];    /* its centre */
+    float radius;    /* its own radius (vt+0x2A0); below 0 or not finite = not read (RadiusRead) */
+    int links;       /* the row's loaded keyed pieces whose own town words are this town's */
+    int owned;       /* the owner faction's loaded top-level pieces within the row's reach, keyed or not, whose own town words are this town's (OwnedInReach) */
+    int cached;      /* 1 = the town this world already holds for the row */
+    int otherRow;    /* 1 = the town this world holds for ANOTHER kept row */
+    TownCand() : radius(0.0f), links(0), owned(0), cached(0), otherRow(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; }
+};
+const float kTownCoverMargin = 250.0f;   /* Guess: past the farthest loaded keyed piece, a town centre this much farther still covers the base */
+const int kChoseNone = 0, kChoseLinks = 1, kChoseCache = 2, kChoseRadius = 3, kChoseFound = 4, kChoseRefused = 5;
+/* the radius town c must stand within of the row's centre to be taken (coverR: the farthest loaded keyed piece + margin, 0 = none) */
+inline float ChooseRadius(const TownCand& c, float coverR)
+{
+    float r = kTownSameRadius;
+    if (c.radius == c.radius && c.radius < 1.0e7f && c.radius > r) r = c.radius;
+    if (coverR == coverR && coverR < 1.0e7f && coverR > r) r = coverR;
+    return r;
+}
+/* 1 = a wins a links tie with b: the town with the row's handle, else the nearer centre */
+inline int TieBetter(const TownCand& a, const TownCand& b, const TownRow& row)
+{
+    if (HandKnown(row.hand))
+    {
+        const int ah = HandSame(a.hand, row.hand) ? 1 : 0, bh = HandSame(b.hand, row.hand) ? 1 : 0;
+        if (ah != bh) return ah;
+    }
+    return DistSqXZ(a.pos, row.pos) < DistSqXZ(b.pos, row.pos) ? 1 : 0;
+}
+/* 1 = town c is open to the row: it is not the town held for another kept row, unless it is also the one held for this row. An
+   open town is taken by the radius step before a town held for another row and may be counted as the row's duplicate; the links
+   step takes a town whichever row holds it */
+inline int CandOpen(const TownCand& c) { return (c.otherRow == 0 || c.cached != 0) ? 1 : 0; }
+/* 1 = a beats b for the majority: more of the owner's loaded top-level pieces link to it, then more of the row's loaded keyed
+   pieces, then TieBetter */
+inline int MajorityBetter(const TownCand& a, const TownCand& b, const TownRow& row)
+{
+    if (a.owned != b.owned) return a.owned > b.owned ? 1 : 0;
+    if (a.links != b.links) return a.links > b.links ? 1 : 0;
+    return TieBetter(a, b, row);
+}
+/* the kept town by its pieces' links (-1 = no loaded keyed piece of the row links to a candidate): of the towns at least one loaded
+   keyed piece of the row links to, whichever kept row holds them (two rows may share one town), the MajorityBetter one - a big town
+   nearby wins only by the owner's pieces within this row's reach (OwnedInReach); also the duplicate repair's kept town */
+inline int LinksMajority(const std::vector<TownCand>& c, const TownRow& row)
+{
+    int best = -1;
+    for (size_t i = 0; i < c.size(); ++i)
+    {
+        if (c[i].links <= 0) continue;   /* no keyed piece of this row links to it */
+        if (best < 0 || MajorityBetter(c[i], c[(size_t)best], row) != 0) best = (int)i;
+    }
+    return best;
+}
+/* 1 = a town's own radius read: 0 or more and finite */
+inline int RadiusRead(float r) { return (r == r && r >= 0.0f && r <= 3.0e38f) ? 1 : 0; }
+/* THE CHOICE: kChoseLinks / kChoseCache / kChoseRadius with *pick the town; kChoseFound (found one now), kChoseRefused (none holds
+   but the choice is unsure: no founding now), kChoseNone (founding not possible) with *pick -1. Unsure only when something did not
+   read: `unsure` (the links or the town list did not all read) or a candidate's own radius did not read (RadiusRead). A town list
+   read whole that holds no town for the row is SURE - right after a keep reset no own town stands and the row's pieces are loaded,
+   and the outpost is founded (T-937 fold 5, run T1507). The radius step takes the nearest open town (CandOpen) within its ChooseRadius of the row's centre;
+   if none, the nearest town held for another kept row within its OWN radius (kChoseRadius: the two rows share it) - only when the
+   choice is sure, else kChoseRefused; only when neither stands within its radius is the result Found, Refused or None */
+inline int KeptTownChoose(const std::vector<TownCand>& c, const TownRow& row, float coverR, int unsure, int mayFound, int* pick)
+{
+    *pick = -1;
+    const int m = LinksMajority(c, row);
+    if (m >= 0) { *pick = m; return kChoseLinks; }
+    for (size_t i = 0; i < c.size(); ++i) if (c[i].cached != 0) { *pick = (int)i; return kChoseCache; }
+    int sure = (unsure == 0) ? 1 : 0;   /* the town list and the links read whole: no town of them holding the row means none does */
+    float best = 0.0f, heldD2 = 0.0f;
+    int held = -1;   /* the nearest town held for another kept row within its radius */
+    for (size_t i = 0; i < c.size(); ++i)
+    {
+        if (RadiusRead(c[i].radius) == 0) sure = 0;   /* its own radius may reach the row's centre */
+        const float r = ChooseRadius(c[i], coverR), d2 = DistSqXZ(c[i].pos, row.pos);
+        if (CandOpen(c[i]) == 0)
+        {   /* another kept row's town: taken below only when no open town stands within its radius and every town read */
+            const float rh = ChooseRadius(c[i], 0.0f);   /* its own radius only (the engine refuses a second town that close), never the reach */
+            if (d2 <= rh * rh && (held < 0 || d2 < heldD2)) { held = (int)i; heldD2 = d2; }
+            continue;
+        }
+        if (d2 <= r * r && (*pick < 0 || d2 < best)) { *pick = (int)i; best = d2; }
+    }
+    if (*pick < 0 && held >= 0)
+    {   /* no open town within its radius: the nearest town another kept row holds within its OWN radius - shared only when every
+           town read (an unread one may be this row's own town) */
+        if (sure == 0) return kChoseRefused;
+        *pick = held;
+    }
+    if (*pick >= 0) return kChoseRadius;
+    if (sure == 0) return kChoseRefused;
+    return mayFound != 0 ? kChoseFound : kChoseNone;
+}
+/* 1 = the choice is to found (kChoseFound) and its links came from a walk made before this call (walksNow == walksBefore: no walk
+   ran during it): the caller walks once more and chooses again before founding. Every other choice (links, cache, radius, refused,
+   none) is used as made, from the walk on hand (up to kTownLookMs old) */
+inline int ChooseAgain(int how, long long walksBefore, long long walksNow) { return (how == kChoseFound && walksNow == walksBefore) ? 1 : 0; }
+/* 1 = the walk again did not run whole (the candidates did not read, no walk was made, or it stopped part way): the choice is unsure */
+inline int RewalkUnsure(int candsRead, long long walksBefore, long long walksNow, int tallyOk) { return (candsRead == 0 || walksNow == walksBefore || tallyOk == 0) ? 1 : 0; }
+/* the row's loaded keyed pieces counted per town handle words */
+struct HandCount { int hand[5]; int n; };
+inline void HandCountAdd(std::vector<HandCount>* v, const int* h)
+{
+    for (size_t i = 0; i < v->size(); ++i) if (HandSame((*v)[i].hand, h)) { ++(*v)[i].n; return; }
+    HandCount c;
+    for (int i = 0; i < 5; ++i) c.hand[i] = h[i];
+    c.n = 1;
+    v->push_back(c);
+}
+inline int HandCountOf(const std::vector<HandCount>& v, const int* h)
+{
+    for (size_t i = 0; i < v.size(); ++i) if (HandSame(v[i].hand, h)) return v[i].n;
+    return 0;
+}
+/* a loaded top-level piece of a row owner's faction: its own town words and its spot */
+struct OwnPiece { int hand[5]; float pos[3]; };
+/* the pieces of pcs within the row's reach - reachD (its farthest loaded keyed piece from its centre) plus kTownCoverMargin - counted
+   per town into *out (cleared first): a big town nearby, e.g. the player's main base, counts only its pieces in the outpost's reach */
+inline void OwnedInReach(const std::vector<OwnPiece>& pcs, const TownRow& row, float reachD, std::vector<HandCount>* out)
+{
+    out->clear();
+    const float r = reachD + kTownCoverMargin;
+    if (!(r >= 0.0f) || r > 3.0e38f) return;
+    for (size_t i = 0; i < pcs.size(); ++i) if (DistSqXZ(pcs[i].pos, row.pos) <= r * r) HandCountAdd(out, pcs[i].hand);
+}
+/* WHICH PIECE MAY BE RELINKED into the chosen town. linkKind: what its own town words name - kLinkNone (no live town: none, a dead or
+   taken-down town, the wilderness), kLinkOtherLive (another live town: a world town, e.g. a bought house's), kLinkOwnLive (a live town
+   of the row owner's faction); -1 = not read. Relinked only a piece of the row owner's faction whose key is on the row and whose link
+   names no live town - or, for a piece this game just made for the row (madeHere: the engine gave it a town of its own choosing),
+   no live town of the owner's faction. A piece in a live own town is left to the duplicate repair. */
+const int kLinkNone = 0, kLinkOtherLive = 1, kLinkOwnLive = 2;
+const int kRelinkAlready = 0, kRelinkYes = 1, kRelinkSkipLive = 2, kRelinkSkipNotOwn = 3, kRelinkUnread = 4;
+inline int RelinkVerdict(int sameAsChosen, int linkKind, int ownerIsRowFaction, int keyOnOwnRow, int madeHere)
+{
+    if (sameAsChosen != 0) return kRelinkAlready;
+    if (linkKind < 0) return kRelinkUnread;
+    if (ownerIsRowFaction == 0 || keyOnOwnRow == 0) return kRelinkSkipNotOwn;
+    if (linkKind == kLinkOwnLive) return kRelinkSkipLive;
+    if (linkKind == kLinkOtherLive && madeHere == 0) return kRelinkSkipLive;
+    return kRelinkYes;
+}
+/* THE DUPLICATE REPAIR: the towns other than the kept one (LinksMajority) holding loaded keyed pieces of the row, never a town held
+   only for another kept row (CandOpen). A town held for this row and another may be one: this row's pieces in it are moved into the
+   kept town, but it is never removed while any kept row holds it (BdKtDupRemove: kRemoveChosen) and the other row's pieces stay */
+inline int IsDuplicate(const std::vector<TownCand>& c, size_t i, int keep) { return ((int)i != keep && c[i].links > 0 && CandOpen(c[i]) != 0) ? 1 : 0; }
+inline int DuplicateCount(const std::vector<TownCand>& c, int keep)
+{
+    int k = 0;
+    for (size_t i = 0; i < c.size(); ++i) if (IsDuplicate(c, i, keep) != 0) ++k;
+    return k;
+}
+/* a duplicate is removed (kRemoveYes) only when it is no kept outpost's chosen town, the loaded pieces and waiting placements were all
+   read and none names it, every area of the row's keys is loaded, every area around it is loaded (aroundLoaded: 1 = every area
+   overlapping the DupAroundHalf square around its centre is loaded here, 0 = one is not, -1 = its own radius did not read) - a piece
+   of it in an area not loaded is not seen and would keep a dead link - its model-piece store is empty (baseshow::StoreKeep) and the
+   engine's TownDestroy is in the address table; else the first reason it is held */
+const int kRemoveYes = 0, kRemoveUnread = 1, kRemoveLinked = 2, kRemoveStore = 3, kRemoveNoCall = 4, kRemoveChosen = 5, kRemoveAreaOut = 6,
+          kRemoveAroundOut = 7, kRemoveNoRadius = 8;
+const float kDupAroundMin = 250.0f;   /* Guess: the least reach of a duplicate town past its centre, before the kept pieces' reach */
+/* the half-size of the square around a duplicate's centre whose areas must all be loaded before it is removed: the larger of its own
+   radius and kDupAroundMin, plus farD (the farthest of the row's keyed pieces from that centre); -1 = its radius did not read */
+inline float DupAroundHalf(float radius, float farD)
+{
+    if (RadiusRead(radius) == 0) return -1.0f;
+    float h = radius > kDupAroundMin ? radius : kDupAroundMin;
+    if (farD == farD && farD > 0.0f && farD <= 3.0e38f) h += farD;
+    return h;
+}
+inline int DuplicateRemoveStep(int unread, int linked, int storeKeep, int chosenTown, int areasLoaded, int aroundLoaded, int canDestroy)
+{
+    if (chosenTown != 0) return kRemoveChosen;
+    if (unread != 0) return kRemoveUnread;
+    if (areasLoaded == 0) return kRemoveAreaOut;
+    if (aroundLoaded < 0) return kRemoveNoRadius;
+    if (aroundLoaded == 0) return kRemoveAroundOut;
+    if (linked != 0) return kRemoveLinked;
+    if (storeKeep != 0) return kRemoveStore;
+    return canDestroy != 0 ? kRemoveYes : kRemoveNoCall;
+}
+/* one duplicate waiting for removal; BdKtRepairStep steps EVERY waiting duplicate at each look (each kPendTry one is tried for
+   removal that look, BdKtDupRemove): kPendGone (no town has its handle words now, or its row is gone: dropped), kPendDead (the town
+   still stands on the list but is dead, state 8 - the game removed it: dropped, not removed again), kPendTry */
+const int kPendTry = 0, kPendGone = 1, kPendDead = 2;
+inline int PendingStep(int standing, int dead, int rowOk)
+{
+    if (standing == 0) return kPendGone;
+    if (dead != 0) return kPendDead;
+    return rowOk != 0 ? kPendTry : kPendGone;
 }
 
 }   /* namespace townkeep */

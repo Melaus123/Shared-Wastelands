@@ -12,7 +12,8 @@
                access.txt (who may enter), the world lock, the logs, server-refused.txt and a keep-buildings-<time>\ folder (the area
                records an earlier build's reset kept). A ".1" backup or a ".tmp" leftover is what its file is. The old world keeps each; the
                reset world gets a copy of each but world.txt (written new) and the world lock (made by its first start).
-     MOVE    - the world's state: every squad record (<id>.platoon and <id>.meta, with their .prev and .refused), the deleted-number
+     MOVE    - the world's state: every squad record (<id>.platoon and <id>.meta, with their .prev and .refused; the ground, box and
+               piece records - ground.<...>, box.<...>, piece.<...> - are files of this form too), the deleted-number
                bitmaps (deleted.<faction>.bits), uniques.txt, world_relations.txt, town_losses.txt, town_bars.txt, owed_people.txt, owed_done.txt, owed_meta.txt,
                research_boxes.txt, research_takes.txt, clock.txt, areas.txt, pendingpos.txt, repair.txt, queue.txt, kept-pieces.txt and
                kept-state.txt (the players' pieces an earlier reset kept and how far each was laid back, zonekeep.h), player-towns.txt and kept-towns.txt (the outposts the players' games said they hold,
@@ -61,8 +62,19 @@ inline bool ResetPrefixDigits(const std::string& lowerName, const char* prefix)
     return lowerName.find_first_not_of("0123456789", p.size()) == std::string::npos;
 }
 
-/* A host game's mirror folder, mirror-<pid> (any case). */
-inline bool ResetIsMirror(const std::string& name) { return ResetPrefixDigits(worldkeep::Lower(name), "mirror-"); }
+/* T-985 C1 fold 1 (review LOW 7): a game's KEPT mirror folder, mirror-k<16 hex> (mirrorkeep.h StableDirName; lowerName lower-cased) */
+inline bool ResetIsKeptMirror(const std::string& lowerName)
+{
+    const std::string p("mirror-k");
+    if (lowerName.size() != p.size() + 16 || lowerName.compare(0, p.size(), p) != 0) return false;
+    return lowerName.find_first_not_of("0123456789abcdef", p.size()) == std::string::npos;
+}
+/* A host game's mirror folder, mirror-<pid> or mirror-k<16 hex> (any case). */
+inline bool ResetIsMirror(const std::string& name)
+{
+    const std::string l = worldkeep::Lower(name);
+    return ResetPrefixDigits(l, "mirror-") || ResetIsKeptMirror(l);
+}
 
 /* The name lower-cased, with one trailing ".tmp" and then one trailing ".1" taken off: what a leftover or a backup belongs to. */
 inline std::string ResetBaseName(const std::string& name)
@@ -96,6 +108,7 @@ inline int ResetClassify(const std::string& name, int isDir)
     {
         if (l == "repair" || l == "recycle") return kResetMove;
         if (ResetPrefixDigits(l, "mirror-")) return kResetMove;               /* old-world copies of records a host game made */
+        if (ResetIsKeptMirror(l)) return kResetMove;                         /* T-985 C1 fold 1: and a game's kept mirror-k<16 hex> folder */
         if (ResetPrefixDigits(l, kAsidePrefix)) return kResetUnfinished;      /* an earlier reset's delete that stopped part-way */
         if (ResetPrefixDigits(l, kKeptBuildingsPrefix)) return kResetKeep;    /* area records a reset set aside */
         return kResetUnknown;

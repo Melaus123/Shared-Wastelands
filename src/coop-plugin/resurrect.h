@@ -28,10 +28,11 @@ std::string ResurrectLever(const std::string& args);
 struct FallenTabRead
 {
     int on, growth, moneyRead;
+    int atLimit;                    /* swtab::AtCharacterLimit: 1 at the game's character limit, 0 below, -1 not judged */
     long long amount, price, money;
     std::vector<std::string> alive;
     std::vector<swtab::Row> rows;
-    FallenTabRead() : on(0), growth(0), moneyRead(0), amount(0), price(0), money(0) {}
+    FallenTabRead() : on(0), growth(0), moneyRead(0), atLimit(-1), amount(0), price(0), money(0) {}
 };
 void ResurrectTabRead(FallenTabRead* out);
 // The characters a fallen one may come back beside: this game's own living characters of this player's faction that the
@@ -51,6 +52,14 @@ struct BringBackOut
     BringBackOut() : ok(0), refusal(0), price(0), money(0), paid(0) {}
 };
 BringBackOut ResurrectBringBackFor(unsigned int deadUid, unsigned int besideUid, long long expectPrice);
+// THE CAMERA ROAD (src/common/fallentab.h CameraRoadOffered): 1 while this player has no living character (the people and
+// animals of the player's faction this game drives) - the tab then brings a character back where the camera is looking; 0 with
+// one alive (the squadmate road). MAIN THREAD.
+int ResurrectCameraRoadOffered();
+// The bring-back on the camera road: the row of deadUid comes back at the first safe spot of the ground point the camera is
+// looking at and the rings round it, in a new squad of the player's faction; the camera is never moved. The same checks and
+// result as ResurrectBringBackFor (mate stays empty). MAIN THREAD.
+BringBackOut ResurrectBringBackHere(unsigned int deadUid, long long expectPrice);
 
 // MAIN THREAD (store.cpp's OPTIONS drain): the host's resurrection options (src/common/resurrectfee.h). Begin before a map,
 // ResurrectOption for each row (true = the key is one of resurrect / resurrectfee / resurrectgrowth, taken here), End after a

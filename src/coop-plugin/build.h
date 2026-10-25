@@ -23,13 +23,13 @@ void BuildTestDrain();                                // K2 safe point (combat.c
 std::string BuildListCommand();
 std::string BuildStateCommand(const std::string& arg);   // KEPT, TEST-ONLY, MAIN THREAD, read-only: `bldstate <key-substring|key>` - a piece's own state as the kept lay writes it
 std::string BuildSetArm(const std::string& arg);         // KEPT, TEST-ONLY, MAIN THREAD: `bldset <key-substring|key> <field> <value>` - armed, written at the K2 safe point
-std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | link <key-substring> | list` - found / link armed for the K2 safe point, list read now
+std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY, MAIN THREAD: `outposttest found <name> [dx dz] | refound <name> <dx> <dz> | link <key-substring> | list` - found / refound / link armed for the K2 safe point, list read now
 void BuildTownsNote(const char* p, size_t n);            // OUTPOSTS, MAIN THREAD (store.cpp): a TOWNS LIST from the world server - the kept outposts and their pieces' keys
 void BuildShowNote(const char* p, size_t n);             // T-811, MAIN THREAD (store.cpp): a SHOW from the world server - the teammates' outposts, shown at the next drain
 void BuildShowBeforeSave(int onMainThread);              // T-811 (store.cpp saveGame pre-hook): counts the bases founded here still standing at the save (no engine write)
 std::string BuildKeptListCommand();                  // KEPT, TEST-ONLY, MAIN THREAD, read-only: `keptlist` - the kept rows this game holds, their state, claims and the key search here
 std::string StandInCommand(const std::string& arg);     // TEST-ONLY, MAIN THREAD: `standin <slot> [read]` - make (or take into the table) / read back that player's stand-in and the loaded buildings it owns
-std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction
+std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction; T-608 T1389: `buildgive counter=<full box key> <slot>` - one shop counter only
 std::string BuyHouseCommand(const std::string& arg);   /* P18 fold 1: TEST LEVER `buyhouse <buildingKey|nearest> [cats=<n>]` / `buyhouse show <buildingKey|last>` */
 int BuildRecordedOwnerSlot(const char* key);          // build1h, MAIN THREAD: the owner slot the build registry recorded for the piece at this P7n key (own rows: my slot); -1 none                       // MAIN THREAD, read-only: `buildlist` - the registry with live values
 int  BuildMadeHere(const char* key, double* placedSince);   // MAIN THREAD: 1 = this game placed the piece at this key itself in the world now loaded and it is still its own; *placedSince = the area's "loaded since" stamp at the placement
@@ -62,5 +62,9 @@ void BuildRefundLanded(void* who, const char* gkey, int qty);             // P14
 int  BuildRefundTaken(const char* gkey, int qty, void* picker, int peer);   // P14 fold 1, MAIN THREAD (items.cpp): qty taken from the ground at gkey - by our picker (peer 0) or the other player (peer 1)
 int  BuildRefundHanded(const char* gkey, int qty);   // P14 fold 5, MAIN THREAD (items.cpp GroundNoteConfirm): qty of our PUT at gkey applied by the area's holder - on its ground, never re-owed at reload
 int  BuildGroundSource(void* b);                      // P3, MAIN THREAD (ground5 fold 1: LocalPlayerFaction walks the faction list): coopground::kGroundSrc* of a building's spill / refund
+void PieceRecordArrive(const std::string& id, const std::vector<char>& bytes);   // MAIN THREAD (store.cpp): a piece record from the world server - kept per id, never applied
+void PieceRecordGone(const std::string& id, const char* from);   // MAIN THREAD (store.cpp): a piece record's removal - its kept copy is forgotten
+void PieceRecordEcho(const std::string& id, int hasStamp, long long stamp);   // MAIN THREAD (store.cpp RECORD_SEQ): this game's piece write sent with that stamp is on the world server's disk
+void PieceRefuseArrive(const std::vector<char>& payload);   // MAIN THREAD (store.cpp): PIECE_REFUSE (79) - counted, the piece marked again or its mark dropped
 void BuildHelpQuitFlush();                            // MAIN THREAD, process exit: the batched owed-file save now (review MED 8)
 }

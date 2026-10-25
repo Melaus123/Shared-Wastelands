@@ -20,9 +20,6 @@
 
 namespace mppresence {
 
-/* The sites, for the plugin's counters (presence[...] on the store REPORT line). */
-enum Site { kSiteBoxArea = 0, kSiteOwnerRung = 1, kSiteUnreadRung = 2, kSiteFarm = 3, kSiteWorldGen = 4, kSiteCount = 5 };
-
 /* oldLinkUp: the old game-to-game link is up. rosterOtherInWorld: 1 = this link's PLAYERS roster shows another slot IN_WORLD,
    0 = it shows none, -1 = no roster on this link. 1 = another player is present, 0 = this game is alone. */
 inline int PresenceDecide(int oldLinkUp, int rosterOtherInWorld)
@@ -70,6 +67,25 @@ inline int TieBreakNoTable(int oldLinkUp, int isHost, int mySlot, int lowestInWo
     const int r = TieBreakByRoster(oldLinkUp, mySlot, lowestInWorld);
     return (r >= 0) ? r : (isHost != 0 ? 1 : 0);
 }
+
+/* IS ONE PLAYER - A COPY'S OWNER - IN THIS WORLD? The question is about that player alone, so it has one answer whatever the number of
+   players. ownerKnown: this game holds an owner record for the copy. ownerSlotInWorld: StoreRosterSlotInWorld of the owner's slot (1 in
+   the world, 0 not, -1 no roster on this link or no slot known). ownerIsSessionPeer: the record names the old link's peer. oldLinkUp:
+   the old link is up. 1 = in the world: the owner's own link up, or its slot IN_WORLD on the roster. No record = no owner to wait for.
+   No roster on this link (or no slot known for the owner): nothing shows the owner gone, so it counts as in the world - a game with no
+   world server holds back as it does with company. */
+inline int OwnerInWorld(int ownerKnown, int ownerSlotInWorld, int ownerIsSessionPeer, int oldLinkUp)
+{
+    if (ownerKnown == 0) return 0;
+    if (ownerIsSessionPeer != 0 && oldLinkUp != 0) return 1;
+    return (ownerSlotInWorld != 0) ? 1 : 0;
+}
+/* The engine's 'eaten' removal of a copy of another game's character (spawn.cpp RefuseEngineDestroyOfCopy): refused while the copy's
+   owner is in this world - only the owner removes its character, a corpse included - and let through when it is not. An eating thread
+   off the main thread reads the main thread's answer: kEatAsked = not answered yet (refused, the safe side: the eater tries again). */
+enum { kEatAsked = 0, kEatOwnerHere = 1, kEatOwnerAway = 2 };
+inline int EatAnswerOf(int ownerInWorld) { return ownerInWorld != 0 ? (int)kEatOwnerHere : (int)kEatOwnerAway; }
+inline int EatAnswerRefuses(int answer) { return answer != kEatOwnerAway ? 1 : 0; }
 
 }  // namespace mppresence
 

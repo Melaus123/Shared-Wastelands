@@ -139,6 +139,9 @@ float GetDriveSpeed();
 // `stalledWindows` counts either way.
 void SetCatchup(bool on);
 int  ForceCatchupGiveUp(unsigned int uid);   // T-573 TEST-ONLY: `giveup <uid>` (0 = every copy); returns copies marked
+// T-986 floorplace TEST-ONLY: `floorplace <uid|name:<Name>|spawned:<T>> <floor -1..3> [dx dz]` - place a COPY at its owner's last
+// known point (+ offset) through teleportTo(pos, floor) and read it back ([FLOORPLACE]); returns the status text ("ok ..." / "error ...").
+std::string FloorPlaceLever(unsigned int uid, int floorArg, float dx, float dz);
 
 // H015 / P059 - NATIVE COMBAT WINDOW. While a puppet is fighting under its own AI (the gate
 // released by combat.cpp), the drive must not push it: two locomotion writers on one body is the

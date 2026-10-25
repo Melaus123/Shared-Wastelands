@@ -45,7 +45,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 101;            /* the world-server protocol that carries box records and BOX_REFUSE */
+const unsigned int kProtocol = 108;            /* the world-server protocol that carries box records and BOX_REFUSE */
 
 
 const unsigned int kMsgBoxRefuse = 72u;       /* world server -> the writer: its box record was not taken, and why */
@@ -475,6 +475,233 @@ inline int DecodeBoxRefuse(const std::vector<char>& b, std::string* id, int* rea
     if (storedGen) *storedGen = sg;
     if (sentGen) *sentGen = ng;
     return 1;
+}
+
+/* ---- a game's intake of an arriving record ----
+   A record that reaches a game (the world server's forward or its feed) is kept in that game's box table only when its id is one
+   MakeBoxRecId makes, it decodes whole, its key names that very id, and its generation is not lower than the copy already kept for
+   that id (an equal generation replaces the copy: the world server stores one set of bytes per generation). Anything else is
+   counted by its reason and never kept - never part of a box. */
+const int kBiKeep = 0, kBiBadId = 1, kBiUnreadable = 2, kBiWrongBox = 3, kBiOlder = 4, kBiMax = 4;
+/* 1 = an arriving record of generation newGen replaces the kept copy (none kept, or newGen not lower than copyGen) */
+inline int BoxKeepArrived(int haveCopy, unsigned int copyGen, unsigned int newGen)
+{
+    if (haveCopy == 0) return 1;
+    return newGen >= copyGen ? 1 : 0;
+}
+/* kBiKeep: *hOut and *itemsOut hold the record; kBiOlder: *hOut holds its header, *itemsOut untouched; anything else: neither is
+   touched. *decodeWhy: the decoder's reason when kBiUnreadable, else kBrOk. */
+inline int BoxIntakeJudge(const std::string& id, const char* p, size_t size, int haveCopy, unsigned int copyGen,
+                          BoxHeader* hOut, std::vector<cooppar::ParityItem>* itemsOut, int* decodeWhy)
+{
+    if (decodeWhy) *decodeWhy = kBrOk;
+    if (BoxRecIdParse(id, 0, 0, 0, 0, 0) == 0) return kBiBadId;
+    BoxHeader h;
+    std::vector<cooppar::ParityItem> items;
+    const int d = DecodeBoxRecord(p, size, &h, &items);
+    if (d != kBrOk) { if (decodeWhy) *decodeWhy = d; return kBiUnreadable; }
+    if (MakeBoxRecId(h.key) != id) return kBiWrongBox;
+    if (hOut) *hOut = h;
+    if (BoxKeepArrived(haveCopy, copyGen, h.generation) == 0) return kBiOlder;
+    if (itemsOut) itemsOut->swap(items);
+    return kBiKeep;
+}
+/* ---- a game's own write of a box record ----
+   The record a writer sends: the box read whole, its header naming this game as the writer. No record when the box has more than
+   kBrMaxRows items or would pass kBrMaxBytes (a box written in part would lose the rest). */
+const int kBwOk = 0, kBwOverCap = 1, kBwBadItem = 2, kBwBadHeader = 3;
+/* The record for header h (its generation and flags as they are) and items, into *out (may be 0; emptied unless kBwOk). kBwOk: the
+   record; kBwOverCap: more items than kBrMaxRows, or the record would not fit (kBrMaxBytes or the item list's own limits);
+   kBwBadItem: an item is not valid (no base record, a quantity below 1, a number that is not finite); kBwBadHeader: the header is out
+   of range. Encoding the same box twice with generation 0 and no flags gives the same bytes: the caller's "unchanged" test. */
+inline int BoxWriteCheck(const BoxHeader& h, const std::vector<cooppar::ParityItem>& items, std::vector<char>* out)
+{
+    if (out) out->clear();
+    if (items.size() > kBrMaxRows) return kBwOverCap;
+    BoxHeader hh = h;
+    hh.format = kBrFormat;
+    if (!BoxHeaderValid(hh)) return kBwBadHeader;
+    if (!BoxItemsValid(items)) return kBwBadItem;
+    std::vector<char> b;
+    if (!EncodeBoxRecord(&b, hh, items)) return kBwOverCap;
+    if (out) out->swap(b);
+    return kBwOk;
+}
+/* The generation of this game's next write. haveKept / keptGen: the record of the box this game holds (received from the world
+   server); haveSent / sentGen: this game's own last write of it, or the stored generation a refusal named. 1 = a seed at generation
+   1 (no record known); 0 = an update one above the higher of the two; -1 = no write (the generation cannot go higher). */
+inline int BoxWriteGen(int haveKept, unsigned int keptGen, int haveSent, unsigned int sentGen, unsigned int* gen)
+{
+    if (haveKept == 0 && haveSent == 0) { if (gen) *gen = 1u; return 1; }
+    unsigned int base = 0;
+    if (haveKept != 0) base = keptGen;
+    if (haveSent != 0 && sentGen > base) base = sentGen;
+    if (base == 0xFFFFFFFFu) return -1;
+    if (gen) *gen = base + 1u;
+    return 0;
+}
+/* 1 = nothing to write: this game's last write carried these very contents (sameContents: the same key, kind, owner, writer and
+   items) and no record newer than that write has reached this game since */
+inline int BoxWriteUnchanged(int haveSent, unsigned int sentGen, int haveKept, unsigned int keptGen, int sameContents)
+{
+    if (haveSent == 0 || sameContents == 0) return 0;
+    if (haveKept != 0 && keptGen > sentGen) return 0;
+    return 1;
+}
+/* What a BOX_REFUSE changes in this game's own write state - it applies nothing to the box. Older, the same generation with other
+   bytes, or a seed where a record exists: the stored generation is known, so the next write is an update above it (kBwrRaise). No
+   record to update: the next write is a seed (kBwrSeed). Not the writer, or an owner change: the games read the box's writer or owner
+   differently right now - the write is tried again later, once their reads may agree (kBwrRetry; the write state is unchanged). Any
+   other reason: nothing (kBwrNone). */
+const int kBwrNone = 0, kBwrRaise = 1, kBwrSeed = 2, kBwrRetry = 3;
+inline int BoxRefuseNext(int reason, unsigned int storedGen, int* haveSent, unsigned int* sentGen)
+{
+    if (reason == kBrRefuseOlder || reason == kBrRefuseSameGen || reason == kBrRefuseSeedExists)
+    {
+        if (*haveSent == 0 || storedGen > *sentGen) *sentGen = storedGen;
+        *haveSent = 1;
+        return kBwrRaise;
+    }
+    if (reason == kBrRefuseNoRecord) { *haveSent = 0; *sentGen = 0; return kBwrSeed; }
+    if (reason == kBrRefuseNotWriter || reason == kBrRefuseOwnerChange) return kBwrRetry;
+    return kBwrNone;
+}
+
+inline const char* BoxIntakeWhy(int why)
+{
+    switch (why)
+    {
+    case kBiKeep: return "kept";
+    case kBiBadId: return "the id is not a box record id";
+    case kBiUnreadable: return "the record does not decode";
+    case kBiWrongBox: return "the record's key names another box";
+    case kBiOlder: return "older than the kept copy";
+    default: return "unknown";
+    }
+}
+
+/* ---- the stored record put into the box at its area's load ----
+   The box's ONE WRITER puts the world server's record into its box once per load of the box's area, after the engine has built the
+   box from the area file (whichever copy the game loaded), so the world server's copy wins. A game that does not write the box puts
+   nothing into it: its copy follows the writer's. The state of one box's apply at this load (reset when its area leaves the game's
+   loaded ground, at world teardown and at a link loss): */
+const int kBasNone = 0;       /* not decided yet at this load */
+const int kBasWait = 1;       /* waiting: a move not published, items cannot be made yet, the cursor over the box's window, the
+                                 writer not known yet, or the stored record a refusal named not here yet */
+const int kBasDone = 2;       /* applied, or not needed (the box is that record or a newer one) */
+const int kBasNotWriter = 3;  /* another game writes the box now: its moves are not held here (looked at again: a game that
+                                 becomes the writer again applies afresh) */
+const int kBasRefused = 4;    /* the record was not laid at this load (the swap twice did not give its contents, or the merged swap
+                                 twice did not start): this game's box stands and is written as the next generation above that
+                                 record - a newer stored record is tried afresh before that write */
+const int kBasNoBox = 6;      /* the record's box is not found here (looked for again) */
+const int kBasMax = 6;
+
+/* 1 = the stored record must be put into this game's box: one is stored, and the box is not already that record or a newer one
+   (haveMine 0: nothing put into or written from the box in this world - a game that loaded the world again always applies) */
+inline int BoxApplyNeeded(int haveStored, unsigned int storedGen, int haveMine, unsigned int mineGen)
+{
+    if (haveStored == 0) return 0;
+    if (haveMine == 0) return 1;
+    return storedGen > mineGen ? 1 : 0;
+}
+/* A refusal of this game's write named a stored generation (knownGen) above this game's box: the apply waits for that record (or a
+   newer one) to arrive here (keptHave / keptGen: the copy this game keeps). No clock: the box table's arrival of the record ends the
+   wait; a link loss or the box's area leaving forgets the named generation. */
+const int kBrWaitNo = 0, kBrWaitYes = 1;
+inline int BoxStoredWait(int knownHave, unsigned int knownGen, int haveMine, unsigned int mineGen, int keptHave, unsigned int keptGen)
+{
+    if (knownHave == 0 || knownGen <= (haveMine != 0 ? mineGen : 0u)) return kBrWaitNo;
+    return (keptHave != 0 && keptGen >= knownGen) ? kBrWaitNo : kBrWaitYes;
+}
+/* What the swap's answer makes of this load's apply. swapped: the swap's answer (1 the box reads as the record, 0 it does not, -1 held:
+   items cannot be made and nothing was removed); tries: the swaps at this load that did not match before this one. A mismatch is
+   tried once more; the second ends the apply: this game's box stands and is written as the next generation above the record (it is the
+   writer, and its box is what its player sees). */
+const unsigned int kBrApplyTries = 2u;
+const int kBarApplied = 0, kBarHeld = 1, kBarAgain = 2, kBarRefused = 3;
+inline int BoxApplyAfterSwap(int swapped, unsigned int tries)
+{
+    if (swapped > 0) return kBarApplied;
+    if (swapped < 0) return kBarHeld;
+    return (tries + 1u < kBrApplyTries) ? kBarAgain : kBarRefused;
+}
+/* MAY THE WRITER WRITE THE BOX NOW? A writer never writes before its box's apply of the stored record is decided at this load, and
+   never writes - least of all a seed - from a box whose contents it never received or over a stored record a refusal named and it
+   never saw. A box whose apply ended with its own copy standing (kBasRefused) is written: it becomes the next generation - unless a
+   refusal named a newer stored record, which goes in first.
+   applyState: this load's kBas*; haveKept: a stored record of the box reached this game; knownAbove: a refusal named a stored
+   generation above this game's box; neverRecv: this game holds the box but never received its contents. */
+const int kBwgGo = 0, kBwgWaitApply = 1, kBwgNeverRecv = 2;
+inline int BoxWriteGate(int applyState, int haveKept, int knownAbove, int neverRecv)
+{
+    if (neverRecv != 0) return kBwgNeverRecv;
+    if (haveKept == 0 && knownAbove == 0) return kBwgGo;   /* no record stored: nothing to put in first (the first write is a seed) */
+    if (applyState == kBasRefused) return (knownAbove == 0) ? kBwgGo : kBwgWaitApply;   /* a newer stored record a refusal named goes in first */
+    return (applyState == kBasDone) ? kBwgGo : kBwgWaitApply;
+}
+/* BoxWriteGate's knownAbove (T-823 fold 3): 1 = a refusal named a stored generation (knownGen) above this game's box (mineGen) that
+   has not been tried here yet. A box whose apply ended with its own copy standing (kBasRefused) at the stored record refusedGen has
+   tried every record up to refusedGen, so a named generation at or below it is spent: the box is written, as refusedGen + 1 or
+   above (BoxWriteGen). Without this the named generation stayed above the box's own and the write waited for ever. */
+inline int BoxKnownAbove(int knownHave, unsigned int knownGen, int haveMine, unsigned int mineGen, int applyState, unsigned int refusedGen)
+{
+    if (knownHave == 0 || knownGen <= (haveMine != 0 ? mineGen : 0u)) return 0;
+    return (applyState == kBasRefused && knownGen <= refusedGen) ? 0 : 1;
+}
+/* 1 = a shop restock in the box's area waits: the stock's stored record is not decided yet at this load (a restock before the apply
+   would be undone by it; the engine asks for the restock again on its next pass) */
+inline int BoxApplyHoldsRestock(int applyState) { return (applyState == kBasNone || applyState == kBasWait) ? 1 : 0; }
+/* 1 = a refusal answers this game's LATEST write of the box (sentGen is the box's generation): the box is then what it was before
+   that write */
+inline int BoxRefuseLatest(int haveMine, unsigned int mineGen, unsigned int sentGen) { return (haveMine != 0 && sentGen == mineGen) ? 1 : 0; }
+/* THE MOVES ON A BOX WAIT FOR ITS STORED RECORD. From its area's load until the stored record is decided at that load, a box this game
+   writes and that is not already that record (or a newer one) answers "not now" to every move site - the answer a box gets while this
+   game's hand-back of it waits: a player's move between a character and the box is undone and refused, an engine task's take from it
+   is refused (the task finds nothing and tries again later), a move inside the box stands and is laid on the baseline saved for the
+   wait, and the apply lays the stored record with those moves on top. No clock: the hold ends when the apply is decided (the record
+   applied, the box already that record, or the swap twice refused), or when the area leaves; through a link loss the box holds back
+   and the wait goes on once the link and its records are back.
+   haveKept: a stored record of the box is here; areaLoaded: its area is loaded here; applyState: this load's kBas*; needed:
+   BoxApplyNeeded. A box another game writes (kBasNotWriter) is not held here: its copy follows that writer's, and when this game
+   becomes its writer again a fresh apply decides it (T-823 fold 3). */
+const int kBahNo = 0, kBahHold = 1;
+inline int BoxApplyHold(int haveKept, int areaLoaded, int applyState, int needed)
+{
+    if (haveKept == 0 || areaLoaded == 0 || needed == 0) return kBahNo;
+    return (applyState == kBasNone || applyState == kBasWait || applyState == kBasNoBox) ? kBahHold : kBahNo;
+}
+/* 1 = the moves on a box in a loaded area with no stored record here wait too: the world server's records for this world have not all
+   been applied here (feedDone 0: the feed's last page not applied yet, or no link at all - a game with no world server holds back as
+   a game with friends does), and one of them may be this box's. Once they have all been applied with none for the box, the hold ends
+   and the box's first write (when it has changed) is a seed. */
+inline int BoxApplyHoldUnknown(int feedDone) { return (feedDone == 0) ? 1 : 0; }
+/* 1 = a change to a box in a loaded area was made while this game could not know the box's stored record (none here and no link).
+   Counted only: the stored record still wins at the apply - a change that was not held as a move is not laid on top of it */
+inline int BoxChangeUnknown(int haveKept, int linked) { return (haveKept == 0 && linked == 0) ? 1 : 0; }
+/* 1 = a box whose apply ended with its own copy standing (kBasRefused, at the stored record refusedGen) must take a newer stored record
+   that arrived since (keptGen above refusedGen) before it is written: the write would otherwise replace that newer record */
+inline int BoxRefusedStale(int applyState, int haveKept, unsigned int keptGen, unsigned int refusedGen)
+{
+    return (applyState == kBasRefused && haveKept != 0 && keptGen > refusedGen) ? 1 : 0;
+}
+/* A write refused as not the writer's, or as an owner change, waits until this game reads the box differently from that write: 1 = try
+   it again now. sentOwner: the owner slot the refused write named (-1 none); nowMine: this game's writer decision now (1 this game,
+   0 another game - the write path then drops the mark, -1 the box is not here - the write path drops it, 2 the writer cannot be told
+   yet - no answer, nothing changed); nowOwner: the owner slot read now. */
+inline int BoxRetryChanged(int sentOwner, int nowMine, int nowOwner)
+{
+    if (nowMine == 2) return 0;
+    if (nowMine != 1) return 1;
+    return (nowOwner != sentOwner) ? 1 : 0;
+}
+/* T-823 fold 3: 1 = a write refused as not the writer's (or as an owner change) is tried again now: this game reads the box
+   differently from that write (BoxRetryChanged), or a new area map arrived since the refusal (newMap) - the world server judges
+   the writer from the area maps, and its view may lag this game's, so each new map tries the write once more. */
+inline int BoxRetryDue(int sentOwner, int nowMine, int nowOwner, int newMap)
+{
+    if (newMap != 0) return 1;
+    return BoxRetryChanged(sentOwner, nowMine, nowOwner);
 }
 
 }   /* namespace coopbrec */

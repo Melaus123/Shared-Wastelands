@@ -1097,6 +1097,25 @@ bool CopyClearKept(unsigned int uid, int liveCrime, const coopcrime::CrimeState&
 
 } // namespace
 
+// PROBE-START: P158
+/* PROBE P158 (T-921): the crime state and bounty list of `c` as text, by the POD reads BountySample already makes (MAIN THREAD).
+   "<crime>/<expiry>[<list>]", '?' for a part that faulted. Reads only; nothing is sent or written. */
+std::string P158CrimeText(const void* c)
+{
+    if (c == 0) return "-";
+    char b[64];
+    int cr = 0; float ce = 0.0f;
+    if (CrReadCrime(c, &cr, &ce)) std::sprintf(b, "%d/%.1f", cr, CrClampForLog(ce));
+    else std::sprintf(b, "?");
+    RawBounty raw[kRawBountyMax];
+    const int n = BmRead(c, raw);
+    if (n < 0) return std::string(b) + "[?]";
+    coopbounty::BountyList l;
+    BmToList(raw, n, &l);
+    return std::string(b) + "[" + BountyListText(l) + "]";
+}
+// PROBE-END: P158
+
 void CrimeTick()
 {
     if (EngineWritesBlocked())

@@ -63,6 +63,15 @@ inline unsigned CounterForBlock(unsigned counter, int slot, int loadFloorKnown, 
     return target;
 }
 
+/* the block a faction made after the block was applied takes (a player's stand-in, made when that player is first seen): the
+   applied slot once this world's block is applied and inside the cap, else -1 (NumberBlockTick covers it when it applies the block
+   later, or the block is not applied for a slot past the cap). */
+inline int BlockForNewFaction(int blockDone, long long blockSlot)
+{
+    if (blockDone == 0 || blockSlot < 0 || blockSlot >= (long long)kMaxBlocks) return -1;
+    return (int)blockSlot;
+}
+
 /* the counter floor from one faction's deleted marks (bit n of bits = number n deleted, size bytes): one past the highest
    number of mySlot's block that is marked, never lower than floorNow - but never past the block's last number (lo + 65,535):
    one past a mark on that number is the next game's block floor (T-642 review 4), so the floor is capped there and *capped

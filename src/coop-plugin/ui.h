@@ -88,6 +88,13 @@ bool UiHostAddrCommand(const std::string& args);
 // T-461: the first widget at or under `root` whose name ends in "_<suffix>" after Kenshi's per-instance layout prefix (the match
 // the title column uses), or 0. MAIN THREAD, inside the caller's SEH frame.
 MyGUI::Widget* UiFindLayoutSuffix(MyGUI::Widget* root, const char* suffix);
+// RESET POPULATION in a multiplayer world: the Level Editor's button greyed with its hover note. UiEditorPanelShown is called after
+// the engine's LevelEditor::setVisible (1 shown, 0 hidden), UiEditorResetTick each in-world frame, UiEditorForgetWorld at world
+// teardown. UiEditorResetCount(k): k 0 greyed, 1 lit again, 2 button not found, 3 notes shown, 4 faults. MAIN THREAD.
+void UiEditorPanelShown(int shown);
+void UiEditorResetTick();
+void UiEditorForgetWorld();
+long long UiEditorResetCount(int k);
 // T-461: Kenshi's in-game pause menu through the engine's own getter and show (the ESC route): Visible 1 open / 0 closed / < 0 not
 // read; Reshow opens it again (1 open now, 0 the engine declined, < 0 not done). MAIN THREAD, in a world.
 int UiPauseMenuVisible();

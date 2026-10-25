@@ -25,13 +25,18 @@
 #include "identity.h"
 #include "worldsync.h"
 #include "../common/lostcopy.h"   /* kCr*: which creation refusals would repeat on a re-send */
+#include "../common/templatekey.h"   /* T-922: a template travels by its stringID, a shown name only as the fallback */
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
+#include "../common/squadbirth.h"   // CONTEXT's birth word
 namespace coop { void LimbsForgetUid(unsigned int uid); void LimbsWorldTeardown(); }   /* LIMBS: clothing.cpp */
 namespace coop { void LiveMemoForgetAddress(const void* obj); }   /* beside LiveCharacter: a registered address is asked afresh */
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* combat.cpp: the terrain height at (x,z) - 1 a height, 0 no terrain, -1 not read */
 namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* effect.cpp: a sneak knockout of the copy awaits its verdict */
+#ifdef SW_DEV_BUILD
+namespace coop { void P169NoteCopyDestroy(unsigned int uid); }   /* PROBE P169: combat.cpp - the frame and uid of the mod's last copy destroy */
+#endif
 #include "worldgen.h"   // F322: DestroyLocalObject   // F318: TrackForLiveness - P034 must cover BOTH instances   // P031: the roster is keyed by the engine's own handle
 #include "appearance.h"
 #include "replicate.h"   // F152: ApplyRemoteSpawn now adopts the peer copy as a puppet
@@ -67,6 +72,7 @@ namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* eff
 #include "../common/peergone.h"   /* PlayerGoneTakesRow: a player who leaves takes only the rows kept for that player */
 #include "../common/ctxkey.h"     /* the context map's squad-id key: the id and the faction the squad was built under */
 #include "../common/livechar.h"   /* LiveCharacter's decision - the SAME header the offline suite compiles */
+#include "../common/presence.h"   /* OwnerInWorld: the 'eaten' refusal asks whether the copy's owner is in this world */
 #include "../common/ownedmirror.h"   /* the player-character table: the lock-free table a worker thread may read */
 #include "towngen.h"        // P8a: TownGenMadeThisPlatoon - the roster's spawnCause=towngen
 #include "tags.h"           // tags1: a label per copy of the other player's characters
@@ -217,7 +223,8 @@ const int kMaxMirror = coopuid::kMirrorRows;
 // original uid** (F296, written for the streaming case and correct there); when the engine recycles
 // the address of a genuinely destroyed character, that resurrects a uid whose copy is gone from the
 // peer forever. Until P038 existed there was no way to tell the two cases apart.
-struct UidMirror { const void* obj; unsigned int uid; volatile LONG dead; volatile LONG destroyed; unsigned int hIndex; unsigned int hSerial; };   /* hIndex/hSerial: the engine handle at registration (g_index rows; 0,0 = none read) */
+struct UidMirror { const void* obj; unsigned int uid; volatile LONG dead; volatile LONG destroyed; unsigned int hIndex; unsigned int hSerial;
+                   unsigned int hContainer; unsigned int hStamp; const void* fp[livechar::kFpWitnesses]; };   /* hIndex/hSerial/hContainer/hStamp: the engine handle at registration (g_index rows; 0,0 = none read); fp: the character's fingerprint - its template record, its AnimationClass and its AI object (FingerprintPod; 0 = none read) */
 UidMirror g_mirror[kMaxMirror] = {0};
 // F328: address recycled after a real destruction, and re-registered under a NEW uid.
 long long g_mirrorRebound = 0;
@@ -276,6 +283,8 @@ static long long g_spawnStaleCopyFreshKept = 0; // a copy far from a late SPAWN'
 long long g_spawnStaleRowReplaced = 0;  // a SPAWN this game asked for made a copy over a stale row of its uid (WorldsyncCopyRowStale)
 long long g_spawnStaleAddrRetired = 0;  // T-758: a just-built body's address still held by another uid's row - that row retired, the new uid registered
 static int g_createRefusal = 0;          // CreateAt's last lasting refusal (lostcopy::kCr*), read by OnSpawn
+static long long g_tmplIdHit = 0, g_tmplNameFallback = 0, g_tmplRefused = 0, g_tmplSentByName = 0, g_tmplRefusedKept = 0, g_tmplSidBad = 0;   /* T-922: templatekey.h - a SPAWN's template found by stringID / by shown name / by neither; templates this game sent by shown name; a repeat SPAWN of a copy already here whose template is not found here (the copy kept); a SPAWN whose stringID tail was malformed */
+static int g_tmplFallbackLogged = 0;   /* T-922: name-fallback lines written (10) */
 long long g_notShownSendFailed   = 0;   // ...that found no road (no link up on the road the SPAWN came by)
 long long g_notShownIn           = 0;   // owner side: our character is not shown on another game
 long long g_notShownInNotMine    = 0;   // owner side: a NOT_SHOWN naming a uid this game does not run (stale) - nothing changes
@@ -473,13 +482,43 @@ std::string MirrorCapText()
 {
     return g_mirrorTestCap > 0 ? " - TEST CAP " + S((long long)g_mirrorTestCap) + " rows (mirrorcap lever)" : std::string();
 }
-/* The engine handle the character has NOW, kept on its index row: LiveCharacter compares it with the handle read at each call,
-   so a different character later built at this address is not taken for the registered one. MAIN THREAD (registration). */
+/* The character's fingerprint, read under its own frame: [0] its template record (OrphanDataPod reads it the same way), [1] its
+   AnimationClass pointer at +0x448 (appearance.cpp kCharAnimationOff; this file's position gates read it), [2] its AI pointer at
+   +0x650 (appearance.cpp kCharAiOff; the roster's member-type read). Pointers are compared, never followed. false and all 0 when
+   the read faults. */
+static bool FingerprintPod(const void* obj, const void** w)
+{
+    __try
+    {
+        w[0] = ((const ::Character*)obj)->getRecordDirect();
+        w[1] = *(const void* const*)((const char*)obj + 0x448);
+        w[2] = *(const void* const*)((const char*)obj + 0x650);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { w[0] = 0; w[1] = 0; w[2] = 0; return false; }
+}
+/* The row's fingerprint becomes the character's witnesses now; a failed read, or any witness read as 0, keeps what the row has. */
+static void RowFingerprintNote(UidMirror& slot, const void* obj)
+{
+    const void* w[livechar::kFpWitnesses] = { 0, 0, 0 };
+    if (!FingerprintPod(obj, w)) return;
+    for (int k = 0; k < livechar::kFpWitnesses; ++k)
+        if (w[k] == 0) return;
+    for (int k = 0; k < livechar::kFpWitnesses; ++k) slot.fp[k] = w[k];
+}
+/* The engine handle the character has NOW, kept on its index row with its fingerprint: LiveCharacter compares it with the handle
+   read at each call, so a different character later built at this address is not taken for the registered one, and a handle the
+   engine changed on the same character can be told from one (RehandleVerdict). MAIN THREAD (registration). */
 static void MirrorNoteHandle(UidMirror& slot, const void* obj)
 {
     ObjId id;
-    if (CaptureObjId(obj, &id)) { slot.hIndex = id.index; slot.hSerial = id.serial; }
-    else { slot.hIndex = 0; slot.hSerial = 0; }
+    for (int k = 0; k < livechar::kFpWitnesses; ++k) slot.fp[k] = 0;
+    if (CaptureObjId(obj, &id))
+    {
+        slot.hIndex = id.index; slot.hSerial = id.serial; slot.hContainer = id.container; slot.hStamp = id.containerStamp;
+        RowFingerprintNote(slot, obj);
+    }
+    else { slot.hIndex = 0; slot.hSerial = 0; slot.hContainer = 0; slot.hStamp = 0; }
     LiveMemoForgetAddress(obj);
 }
 /* An address registered again under its own uid (un-retired, or a repeat registration): the handle is re-noted only when its
@@ -494,7 +533,11 @@ static void MirrorRenoteIfSame(const void* obj)
         UidMirror& slot = g_index[(h + probe) & kIndexMask];
         if (slot.obj == 0) return;
         if (slot.obj != obj) continue;
-        if (livechar::SameStored(slot.hIndex, slot.hSerial, id.index, id.serial)) { slot.hIndex = id.index; slot.hSerial = id.serial; }
+        if (livechar::SameStored(slot.hIndex, slot.hSerial, id.index, id.serial))
+        {
+            slot.hIndex = id.index; slot.hSerial = id.serial; slot.hContainer = id.container; slot.hStamp = id.containerStamp;
+            RowFingerprintNote(slot, obj);
+        }
         LiveMemoForgetAddress(obj);
         return;
     }
@@ -757,12 +800,48 @@ static bool MirrorRowAt(const void* obj, unsigned int* uid, int* dead, int* dest
     return false;
 }
 
-bool CreateAt(unsigned int uid, const std::string& templateName,
+/* T-922 (templatekey.h): a SPAWN's template - its stringID (sid, "" when none came) and its shown name - resolved: the
+   stringID first (GameDataContainer::getData, a lookup that creates nothing; only a CHARACTER or RECORD_ANIMAL entry stands),
+   then the shown name (CHARACTER, then RECORD_ANIMAL). Counts nothing. MAIN THREAD. */
+GameData* ResolveTemplate(const std::string& sid, const std::string& name, templatekey::Lookup* l)
+{
+    *l = templatekey::Lookup();
+    if (coop::GameWorldPtr() == 0) return 0;
+    GameData* data = 0;
+    l->tried = templatekey::TryAsId(sid);
+    if (l->tried)
+    {
+        data = coop::GameWorldPtr()->gamedata.getData(sid);
+        l->idFound = data != 0 && PlausibleObject(data);
+        if (l->idFound) l->idType = (int)data->type;
+        l->idTypeOk = l->idFound && templatekey::TypeAccepted(l->idType, (int)RECORD_CHARACTER, (int)RECORD_ANIMAL);
+    }
+    if (!templatekey::NameLookupNeeded(*l)) return data;
+    l->nameTried = !name.empty();
+    if (!l->nameTried) return 0;
+    data = coop::GameWorldPtr()->gamedata.findRecordByName(name, RECORD_CHARACTER);
+    if (data == 0 || !PlausibleObject(data))
+        data = coop::GameWorldPtr()->gamedata.findRecordByName(name, RECORD_ANIMAL);
+    l->nameFound = data != 0 && PlausibleObject(data);
+    return l->nameFound ? data : 0;
+}
+/* T-922: a SPAWN whose template this game does not have - refused as before (a re-send would be refused the same way), with
+   what was tried, id then name, and each result. Nothing else is changed by the caller. */
+void RefuseNoTemplate(const std::string& sid, const std::string& name, const templatekey::Lookup& l, const std::string& where)
+{
+    ++g_tmplRefused;
+    ErrorLog("[M1] spawn refused: no CHARACTER or RECORD_ANIMAL template named '" + name + "' - tried "
+             + templatekey::TriedWords(sid, name, l) + " (" + where + "; tmplRefused " + S(g_tmplRefused) + ")");
+    g_createRefusal = lostcopy::kCrNoTemplate;
+}
+
+bool CreateAt(unsigned int uid, const std::string& templateName, const std::string& templateSid,   /* T-922: "" = none */
               const Ogre::Vector3& worldPos, const char* who,
               const std::string& factionName, bool keepContainer,
               RootObjectContainer* forceContainer, Building* homeBuilding, float age, Faction* forceFaction = 0)
 {
     if (coop::GameWorldPtr() == 0) { ErrorLog("[M1] spawn refused: no GameWorld"); return false; }
+    templatekey::Lookup tl; GameData* data = 0; bool tlDone = false;   /* resolved before a stale row is retired */
 
     if (g_spawned.find(uid) != g_spawned.end())
     {
@@ -774,6 +853,9 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
         const void* oldObj = SpawnedRawObject(uid);
         if (!net::IsUidMine(uid) && FindSpawned(uid) == 0 && WorldsyncCopyRowStale(uid, worldPos.x, worldPos.y, worldPos.z))
         {
+            /* a template this game cannot find is refused BEFORE the stale row is retired - nothing changes */
+            data = ResolveTemplate(templateSid, templateName, &tl); tlDone = true;
+            if (data == 0) { RefuseNoTemplate(templateSid, templateName, tl, std::string(who) + ", its stale row kept"); return false; }
             ++g_spawnStaleRowReplaced;
             MirrorMarkDestroyed(oldObj, uid);
             DropPuppet(uid, false);       // the old object is gone: nothing to restore a speed into
@@ -791,7 +873,19 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
         else
         {
             /* a live copy standing far from a remote SPAWN's spot was decided by ApplyRemoteSpawn (RepeatSpawnAct) before this call:
-               retired and made again (then no row is here), or kept. What reaches here is a repeat, and is ignored. */
+               retired and made again (then no row is here), or kept. What reaches here is a repeat, and is ignored. A repeat
+               whose template this game cannot find is counted (tmplRefusedKept): the copy here is kept and no lasting refusal
+               is set - the copy is here, so nothing is to be booked lost. */
+            data = ResolveTemplate(templateSid, templateName, &tl);
+            if (data == 0 || templatekey::Verdict(tl) == templatekey::kTkRefused)
+            {
+                ++g_tmplRefusedKept;
+                if (g_tmplRefusedKept <= 20)
+                    ErrorLog("[M1] spawn uid " + S(uid) + " (" + std::string(who) + "): its copy is already here, but no CHARACTER or"
+                             " RECORD_ANIMAL template named '" + templateName + "' - tried " + templatekey::TriedWords(templateSid, templateName, tl)
+                             + "; the copy here is kept and the SPAWN ignored (tmplRefusedKept " + S(g_tmplRefusedKept)
+                             + "; the first 20 logged, then counted)");
+            }
             DebugLog("[M1] spawn ignored: uid " + S(uid) + " already exists locally");
             return true;
         }
@@ -807,15 +901,22 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
     // Falling back locally rather than sending the type: both installs load byte-identical static
     // data (the same premise that lets a template NAME identify the same content on both sides,
     // F072), so the receiver can resolve the type itself and no protocol change is needed.
-    GameData* data = coop::GameWorldPtr()->gamedata.findRecordByName(templateName, RECORD_CHARACTER);
-    if (data == 0 || !PlausibleObject(data))
-        data = coop::GameWorldPtr()->gamedata.findRecordByName(templateName, RECORD_ANIMAL);
-    if (data == 0 || !PlausibleObject(data))
+    /* T-922: the shown name is not the same in every language - the text is tried as the template's stringID first, then as
+       a shown name (templatekey.h). */
+    if (!tlDone) data = ResolveTemplate(templateSid, templateName, &tl);
+    const int tv = templatekey::Verdict(tl);
+    if (data == 0 || tv == templatekey::kTkRefused)
     {
-        ErrorLog("[M1] spawn refused: no CHARACTER or RECORD_ANIMAL template named '" + templateName
-                 + "' (lookup returned " + P(data) + ")");
-        g_createRefusal = lostcopy::kCrNoTemplate;   // not in this game's data: a re-send would be refused the same way
+        RefuseNoTemplate(templateSid, templateName, tl, who);   /* not in this game's data: a re-send would be refused the same way */
         return false;
+    }
+    if (tv == templatekey::kTkIdHit) ++g_tmplIdHit;
+    else
+    {
+        ++g_tmplNameFallback;
+        if (++g_tmplFallbackLogged <= 10)
+            DebugLog("[M1] spawn template '" + templateName + "' (" + who + ") found by its shown name, not by its stringID '" + templateSid + "'"
+                     " (tmplNameFallback " + S(g_tmplNameFallback) + ", logged 10x)");
     }
 
     // NOT PlausibleObject: RootObjectFactory is non-polymorphic (see the guard comment).
@@ -1126,6 +1227,57 @@ bool CreateAt(unsigned int uid, const std::string& templateName,
 } // namespace
 void CreateRefusalReset() { g_createRefusal = lostcopy::kCrNone; }   // see spawn.h
 int  CreateLastRefusal()  { return g_createRefusal; }   // see spawn.h
+/* T-922 (templatekey.h): the stringID a SPAWN carries for c's template (net::SendSpawn) - "" when c or its template cannot be
+   read or the id is empty, longer than templatekey::kMaxSid or unusable (the receiver then uses the shown name). MAIN THREAD. */
+std::string TemplateSidOf(const void* c)
+{
+    ::Character* ch = (::Character*)c;
+    ::GameData* gd = (ch != 0 && PlausibleObject(ch)) ? ch->getRecordDirect() : 0;
+    if (gd == 0 || !PlausibleObject(gd)) return std::string();
+    return templatekey::SidToSend(gd->stringID);
+}
+void TemplateNoteSentByName() { ++g_tmplSentByName; }   /* a SPAWN sent with no stringID */
+void TemplateNoteSidBad() { ++g_tmplSidBad; }   /* T-922: a SPAWN received whose stringID tail was malformed (spawnage.h templateSidBad) */
+/* T-922 TEST-ONLY lever `tmplname <templateStringId> [new shown name...]` (command_channel.cpp "tmplname"): the record with
+   that stringID (GameDataContainer::getData, the find-only lookup ResolveTemplate uses) gets the new shown name through the
+   engine's own renameRecord (as playerfaction.cpp renames its faction's record). This game then names that template as a game
+   in another language would, so a SPAWN it sends by shown name meets the T-922 field case on a one-language bench. With no
+   name the current one is logged. One [TMPLNAME] line. MAIN THREAD (the command channel's verbs). */
+std::string TmplNameLever(const std::string& args)
+{
+    std::string sid = args, want;
+    const std::string::size_type sp = args.find(' ');
+    if (sp != std::string::npos) { sid = args.substr(0, sp); want = args.substr(sp + 1); }
+    while (!want.empty() && want[0] == ' ') want.erase(0, 1);
+    while (!want.empty() && want[want.size() - 1] == ' ') want.erase(want.size() - 1);
+    if (sid.empty()) return "error tmplname usage: tmplname <templateStringId> [new shown name]";
+    if (!templatekey::TryAsId(sid))
+    {
+        DebugLog("[TMPLNAME] " + sid + " refused: not a usable stringID ok=0");
+        return "error tmplname: not a usable stringID";
+    }
+    if (coop::GameWorldPtr() == 0)
+    {
+        DebugLog("[TMPLNAME] " + sid + " refused: no game world ok=0");
+        return "error tmplname: no game world";
+    }
+    ::GameData* gd = coop::GameWorldPtr()->gamedata.getData(sid);
+    if (gd == 0 || !PlausibleObject(gd))
+    {
+        DebugLog("[TMPLNAME] " + sid + " not found on this game ok=0");
+        return "error tmplname: no record " + sid;
+    }
+    const std::string old = gd->name;
+    if (want.empty())
+    {
+        DebugLog("[TMPLNAME] " + sid + " '" + old + "' type=" + S((long long)(int)gd->type) + " (read only)");
+        return "ok tmplname " + sid;
+    }
+    coop::GameWorldPtr()->gamedata.renameRecord(gd, want);
+    const int ok = (gd->name == want) ? 1 : 0;
+    DebugLog("[TMPLNAME] " + sid + " '" + old + "' -> '" + gd->name + "' ok=" + S((long long)ok));
+    return ok ? "ok tmplname" : "error tmplname: the name did not change";
+}
 
 // M4 fold (review 2026-09-29 H1, store protocol 58) + owner decision 205 A: the uid minter's seat and blocks - for store.cpp
 // (UidBlockTick, UidBlockOnNotebook, the link-down edge) and the adoption sweep. MAIN THREAD.
@@ -1237,7 +1389,7 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
 
     // The local spawn is where the per-instance modifier state is READ - once, here - and
     // from this point it travels explicitly rather than being re-read on the far side.
-    if (!CreateAt(uid, templateName, pos, "local", g_spawnFactionName, g_spawnKeepContainer, 0, 0, 0.0f))
+    if (!CreateAt(uid, templateName, std::string(), pos, "local", g_spawnFactionName, g_spawnKeepContainer, 0, 0, 0.0f))
         return false;
 
     // We made it, so we are its authority - recorded unconditionally, session or not.
@@ -1248,8 +1400,14 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
         // Absolute world coordinates travel, not the dx/dz offset: the peer's reference
         // character is somewhere else entirely. The modifiers travel for the same reason
         // (F115) - the peer's own `spawnfaction` state is not ours and never was.
+        // T-920 (T1423, T1427): the copy is sent as the world sweep sends one - the character's own faction as it is on the wire
+        // (this game's player faction becomes its stand-in there) and never into the peer's squad. Sent as '<inherited>' with
+        // keepContainer, the copy was built in the PEER's player faction and squad, and when its row was retired the peer's sweep
+        // adopted the body as its own character - a duplicate no real copy can make.
+        ::Character* made = FindSpawned(uid);
+        ::Faction* mf = (made != 0 && PlausibleObject(made)) ? made->getOwnerFactionDirect() : 0;
         net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z,
-                       g_spawnFactionName, g_spawnKeepContainer, FindSpawned(uid));
+                       PlausibleObject(mf) ? WireFactionName(mf, true) : g_spawnFactionName, false, made);
 
         // H010a (F156): the APPEARANCE cannot ride the SPAWN message. At this point the
         // engine has not applied the roll yet - the values still read as defaults (F157) -
@@ -1281,7 +1439,7 @@ bool SpawnTemplateNear(const std::string& templateName, unsigned int anchorUid, 
                  + ". Nothing was created.");
         return false;
     }
-    if (!CreateAt(uid, templateName, pos, "local", factionName, keepContainer, 0, 0, 0.0f))
+    if (!CreateAt(uid, templateName, std::string(), pos, "local", factionName, keepContainer, 0, 0, 0.0f))
         return false;
     net::SetLocalOwner(uid);
     net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z, factionName, keepContainer, FindSpawned(uid));
@@ -1309,7 +1467,7 @@ bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos,
         ErrorLog("[M1] spawn (own squad) refused: this game has no player faction");
         return false;
     }
-    if (!CreateAt(uid, templateName, pos, "own squad", std::string(), true, (RootObjectContainer*)squad, 0, age, mine))
+    if (!CreateAt(uid, templateName, std::string(), pos, "own squad", std::string(), true, (RootObjectContainer*)squad, 0, age, mine))
         return false;
     net::SetLocalOwner(uid);
     if (uidOut) *uidOut = uid;
@@ -1322,7 +1480,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
 void FinishContextForSpawn(unsigned int uid, int memberType);
 bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos);
 
-bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName,
+bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName, const std::string& templateSid,
                       float x, float y, float z,
                       const std::string& factionName, bool keepContainer, float age,
                       const unsigned int* stats44)
@@ -1333,7 +1491,12 @@ bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName,
        Rebuild - the stale copy was destroyed (the owner's medical words OnSpawn has just written are kept) and the steps below
        make the copy; Retire - nothing is made (booked lost when the spot is not loaded here, or the old body still stands), so no
        after-creation step runs on a copy that is not there; Ignore - a repeat, which CreateAt ignores (stalecopy.h). */
-    if (g_spawned.find(uid) != g_spawned.end() && RepeatSpawnAct(uid, x, y, z) == stalecopy::kSpawnRetire) return true;
+    /* the template is resolved FIRST - before RepeatSpawnAct (which may destroy and unregister a stale copy) and the context
+       step - so a SPAWN whose template this game cannot find changes nothing: a registered copy is left as it is (CreateAt's
+       repeat branch then ignores the SPAWN and counts it as tmplRefusedKept, or refuses it before retiring a stale row). */
+    templatekey::Lookup pre;
+    const bool tmplOk = coop::GameWorldPtr() != 0 && ResolveTemplate(templateSid, templateName, &pre) != 0;
+    if (tmplOk && g_spawned.find(uid) != g_spawned.end() && RepeatSpawnAct(uid, x, y, z) == stalecopy::kSpawnRetire) return true;
     // M-B / H026: if this uid's CONTEXT arrived first (the host sends it before SPAWN on the same reliable
     // channel), build or reuse the platoon it names and create the copy INTO it, with its home building.
     // H027 (F435): if this instance ALREADY holds the character by the same handle (the save-derived dozen both
@@ -1346,9 +1509,14 @@ bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName,
         TagsNoteCopy(uid);      // tags1: a label, if this is the other player's own character
         return true;
     }
+    /* T-922: the template is resolved BEFORE the squad context is prepared (PrepareContextForSpawn empties and rebuilds this
+       game's copy of the squad), so a SPAWN this game cannot make changes nothing here. A uid already registered is decided by
+       CreateAt's own repeat branch first, as before. */
+    if (coop::GameWorldPtr() != 0 && !tmplOk && g_spawned.find(uid) == g_spawned.end())
+    { RefuseNoTemplate(templateSid, templateName, pre, "remote, before its squad context was touched"); return false; }
     RootObjectContainer* ctxContainer = 0; Building* ctxBuilding = 0; int ctxMember = -1; bool ctxUsed = false;
     if (g_contextOn && g_spawned.find(uid) == g_spawned.end()) ctxUsed = PrepareContextForSpawn(uid, factionName, Ogre::Vector3(x, y, z), &ctxContainer, &ctxBuilding, &ctxMember);   /* M7a fold F8: a re-sent SPAWN of a copy that exists builds no context */
-    if (!CreateAt(uid, templateName, Ogre::Vector3(x, y, z), "remote",
+    if (!CreateAt(uid, templateName, templateSid, Ogre::Vector3(x, y, z), "remote",
                   factionName, keepContainer, ctxContainer, ctxBuilding, age))
         return false;
     if (ctxUsed) FinishContextForSpawn(uid, ctxMember);
@@ -1822,6 +1990,97 @@ static void DoomSweep()
     }
 }
 
+/* A COPY THE ENGINE GAVE A NEW HANDLE. A row's stored handle is not the one the object carries now (kNotStored): another
+   character at a reused address, or the same character under a new handle. On the main thread the engine and the row's
+   fingerprint decide (livechar::NotStoredJudge): renote - the row (and its worldsync liveness row) takes the new handle, the check
+   answers live, and an owner's death the copy missed is applied (medical.cpp, from RehandleTick); refuse - the row is queued for
+   RehandleTick, which finishes it without touching the object and asks the owner for a fresh copy; undecided - nothing changes and
+   the next check asks again. MAIN THREAD only. */
+static const int kRehandleQ = 16;
+static const void* g_rehandleQObj[kRehandleQ];
+static unsigned int g_rehandleQUid[kRehandleQ];
+static int g_rehandleQN = 0;
+static long long g_rehandleQFull = 0, g_rehandleRefused = 0, g_rehandleNoLiveRow = 0;
+static volatile LONG64 g_liveRehandled = 0;
+static void RehandleRefuseQueue(const void* obj, unsigned int uid)
+{
+    if (net::IsUidMine(uid)) return;   /* this game's own characters are never refused: no other game could send them again */
+    for (int i = 0; i < g_rehandleQN; ++i)
+        if (g_rehandleQObj[i] == obj && g_rehandleQUid[i] == uid) return;
+    if (g_rehandleQN >= kRehandleQ) { ++g_rehandleQFull; return; }   /* judged again at its next check */
+    g_rehandleQObj[g_rehandleQN] = obj; g_rehandleQUid[g_rehandleQN] = uid; ++g_rehandleQN;
+}
+
+/* PROBE P156 BEGIN */
+/* probe P156 (LOG ONLY): what the liveness check saw when a row's stored handle was not the object's - once per row per handle
+   change; the first kP156Lines of a launch are kept for RehandleTick to print, the rest only counted. MAIN THREAD. */
+struct P156Rec { unsigned int uid; int animal; unsigned int oI, oS, oC, nI, nS, nC; int oldSelf, newSelf, inList, dead, destroyed, doomed, fp, judge; DWORD at; };   /* probe P156 */
+struct P156Seen { const void* obj; unsigned int uid, storedSerial, nowIndex, nowSerial; };   /* probe P156 */
+static const int kP156Lines = 20;   /* probe P156 */
+static P156Rec g_p156Rec[kP156Lines];   /* probe P156 */
+static int g_p156RecN = 0, g_p156Printed = 0;   /* probe P156 */
+static long long g_p156Suppressed = 0, g_p156Renote = 0, g_p156Refuse = 0, g_p156Undecided = 0;   /* probe P156 */
+static P156Seen g_p156Seen[256];   /* probe P156: the last handle change noted per address slot */
+static int P156AnimalPod(const void* gd)   /* probe P156: 1 the template is an animal record, 0 not, -1 unread */
+{
+    if (gd == 0) return -1;
+    __try { return ((const GameData*)gd)->type == RECORD_ANIMAL ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static void P156Note(::Character* c, const UidMirror* row, const ObjId& id, bool newSelf, bool inList, bool doomed, int fp, int judge,
+                     const void* nowData)   /* probe P156 */
+{
+    P156Seen& s = g_p156Seen[(int)(MixAddress(c) & 255ull)];
+    if (s.obj == c && s.uid == row->uid && s.storedSerial == row->hSerial && s.nowIndex == id.index && s.nowSerial == id.serial) return;
+    s.obj = c; s.uid = row->uid; s.storedSerial = row->hSerial; s.nowIndex = id.index; s.nowSerial = id.serial;
+    if (judge == livechar::kRehandleRenote) ++g_p156Renote; else if (judge == livechar::kRehandleRefuse) ++g_p156Refuse; else ++g_p156Undecided;
+    if (g_p156RecN >= kP156Lines) { ++g_p156Suppressed; return; }
+    ObjId old;
+    old.index = row->hIndex; old.serial = row->hSerial; old.type = (unsigned int)RECORD_CHARACTER; old.container = row->hContainer; old.containerStamp = row->hStamp;
+    P156Rec& r = g_p156Rec[g_p156RecN++];
+    r.uid = row->uid; r.animal = P156AnimalPod(nowData != 0 ? nowData : row->fp[0]);
+    r.oI = row->hIndex; r.oS = row->hSerial; r.oC = row->hContainer; r.nI = id.index; r.nS = id.serial; r.nC = id.container;
+    r.oldSelf = (ResolveObjIdGuarded(&old) == c) ? 1 : 0;
+    r.newSelf = newSelf ? 1 : 0; r.inList = inList ? 1 : 0; r.dead = row->dead != 0 ? 1 : 0; r.destroyed = row->destroyed != 0 ? 1 : 0;
+    r.doomed = doomed ? 1 : 0; r.fp = fp; r.judge = judge; r.at = ::GetTickCount();
+}
+static std::string P156ReportFields()   /* probe P156 */
+{
+    return " p156[lines,suppressed,renote,refuse,undecided]=" + S((long long)g_p156RecN) + "," + S(g_p156Suppressed) + "," + S(g_p156Renote)
+           + "," + S(g_p156Refuse) + "," + S(g_p156Undecided);
+}
+/* PROBE P156 END */
+
+/* This game's own characters are judged too and renote like copies (nothing else re-notes them, and the fingerprint's owned
+   objects tell a new character at the address from them); a refusal of one is queued but never finished (RehandleTick): no other
+   game could send it again, so its row keeps refusing as before. */
+static int RehandleVerdict(::Character* c, UidMirror* row, const ObjId& id)
+{
+    const bool rowDead = row->dead != 0, destroyed = row->destroyed != 0;
+    ObjId stored;
+    stored.index = row->hIndex; stored.serial = row->hSerial; stored.type = (unsigned int)RECORD_CHARACTER;
+    stored.container = row->hContainer; stored.containerStamp = row->hStamp;
+    const bool doomed = DoomedHas(c, id) || DoomedHas(c, stored);   /* a destroy noted under either handle */
+    ::Character* now = ResolveObjIdGuarded(&id);
+    const bool newSelf = (now == c), newOther = (now != 0 && now != c);
+    const bool inList = InActiveCharacters(c);
+    const void* w[livechar::kFpWitnesses] = { 0, 0, 0 };
+    const bool readNow = FingerprintPod(c, w);
+    const int fp = livechar::FingerprintOf(row->fp, readNow, w, livechar::kFpWitnesses);
+    const int j = livechar::NotStoredJudge(rowDead, destroyed, doomed, newSelf, newOther, inList, fp);
+    /* PROBE P156 BEGIN */ P156Note(c, row, id, newSelf, inList, doomed, fp, j, w[0]); /* PROBE P156 END */
+    if (j == livechar::kRehandleRenote)
+    {
+        row->hIndex = id.index; row->hSerial = id.serial; row->hContainer = id.container; row->hStamp = id.containerStamp;
+        if (WorldsyncRenoteHandle(row->uid, c, id.index, id.serial, id.container, id.containerStamp) == 0) ++g_rehandleNoLiveRow;
+        InterlockedIncrement64(&g_liveRehandled);
+        MedicalCopyUsableAgain(row->uid);
+        return livechar::kLive;
+    }
+    if (j == livechar::kRehandleRefuse) RehandleRefuseQueue(c, row->uid);
+    return livechar::kNotStored;
+}
+
 /* The main thread's answers for this frame, by address (direct-mapped). An entry is reused only in the same frame, with no
    destroy noted since (g_doomPos unchanged), the address not retired since and not registered again since (MirrorNoteHandle
    forgets it via LiveMemoForgetAddress); anything else asks the engine again. */
@@ -1863,11 +2122,17 @@ int LiveCharacterVerdict(::Character* c)
     ::Character* now = ask ? ResolveObjIdGuarded(&id) : 0;
     const bool resolvedSelf = (now == c);
     const bool inList = ask && !resolvedSelf && InActiveCharacters(c);
-    const int v = livechar::Judge(plausible, retired, worldUp, gotHandle, storedSame, doomed, onMain, resolvedSelf, now != 0 && now != c, inList);
+    int v = livechar::Judge(plausible, retired, worldUp, gotHandle, storedSame, doomed, onMain, resolvedSelf, now != 0 && now != c, inList);
+    /* a handle that is not the stored one: on the main thread the engine and the row's fingerprint decide whether this is the same
+       character under a new handle (RehandleVerdict); off it the refusal stands */
+    if (v == livechar::kNotStored && onMain && row != 0) v = RehandleVerdict(c, row, id);
     InterlockedIncrement64(&g_liveVerdicts[v]);
     // The engine resolved this very handle to this address (main thread): a moved index on the same serial is re-noted.
     if (v == livechar::kLive && resolvedSelf && row != 0 && livechar::Renote(row->hIndex, row->hSerial, id.index, id.serial))
-    { row->hIndex = id.index; InterlockedIncrement64(&g_liveRenoted); }
+    { row->hIndex = id.index; row->hContainer = id.container; row->hStamp = id.containerStamp; InterlockedIncrement64(&g_liveRenoted); }
+    /* while the engine names the stored handle at this address, the character's template and owned objects now are its fingerprint:
+       an object the engine replaced since registration is not taken later for another character */
+    if (v == livechar::kLive && resolvedSelf && row != 0 && row->hSerial == id.serial) RowFingerprintNote(*row, c);
     if (memo != 0) { memo->obj = c; memo->frame = g_liveFrame; memo->doomPos = g_doomPos; memo->verdict = v; }
     return v;
 }
@@ -2054,6 +2319,11 @@ void NotifyDespawn(unsigned int uid, const void* obj, bool justUnloaded, const c
     {
         ++g_despawnUnload;
         if (!justUnloaded) { ++g_despawnUnloadByReason; RemovalReasonNote(reason, 1, dead); }
+        /* T-999 fold 3: the removed character's squad is noted (store.cpp g_unloadEmptied): at an area unload the squad walk removes every
+           member before the faction update asks the keep question again and destroys the empty squad - still the unload's discard. The
+           squad is read by the verified plain-read reader (handoff.h ReadSquadOf: Character+0x658 ActivePlatoon, +0x78 Platoon, back-pointer
+           checked; never getSquad) while the object is whole, before the engine's destroy; a replay from the off-thread drain is counted. */
+        { void* unloadSq = 0; if (g_drainingOffThread == 0) { coop::SquadView sv; if (coop::ReadSquadOf((::Character*)obj, &sv) == 1) unloadSq = sv.platoon; } coop::StoreNoteUnloadEmptied(unloadSq, g_drainingOffThread != 0 ? 1 : 0); }
         if (net::IsUidMine(uid))
         {
             if (g_drainingOffThread == 0) P119NotePutAway(uid, obj, reason);   // PROBE P119
@@ -2096,7 +2366,7 @@ long long DespawnSelfReentryCount() { return g_despawnSelfReentry; }
 
 /* T-304 (2), fold 1 - ONLY THE OWNER REMOVES A CHARACTER, a corpse included (spawn.h). Refused: ONLY the engine's 'eaten' removal
    (MedicalSystem::gettingEaten 0x64F8E0 -> GameWorld::destroy(body, false, "eaten"), build/decomp_64f8e0.txt:192) of a registered
-   copy of another game's character, with the link up. Every other reason goes through: the squad walk 0x79BA60 ('wandered out of
+   copy of another game's character while that character's owner is in this world (mppresence::OwnerInWorld). Every other reason goes through: the squad walk 0x79BA60 ('wandered out of
    zone', decomp_79ba60.txt:135-161) retries a member until destroy answers 0 and would spin on a refusal, and ~ActivePlatoon
    0x4FE4B0 ('platoon destructor') clears the member's squad (+0x658) before its destroy. A refusal answers FALSE - 0x798F50's
    own 'postponed' answer - and gettingEaten's caller 0x435350 discards the answer. The eat countdown (MedicalSystem+0x15C; the
@@ -2104,7 +2374,19 @@ long long DespawnSelfReentryCount() { return g_despawnSelfReentry; }
    instead of on every bite (and the '{1} has been eaten alive.' line, when the engine shows it, repeats at that pace, not per
    bite); 1, not 0, because 0 re-enters the first-bite block (decomp_64f8e0.txt:118, a player-faction body). The write runs on the eating thread itself,
    inside its own call. The body stays, eaten at, until the owner's DESPAWN. */
-volatile LONG g_copyDestroyLinked = 0;          // cached by DrainOffThreadDespawns on the main thread (the transport is not any-thread)
+/* Whether the copy's owner is in this world - the same rule whatever the number of players. The owner record and the roster are
+   main-thread tables: on the main thread they are read there and then; an eating thread off it asks the table below and the main
+   thread answers every frame (EatAskAnswer, from DrainOffThreadDespawns). A row is one 64-bit word, uid << 32 | answer
+   (mppresence::kEatAsked / kEatOwnerHere / kEatOwnerAway). Only an asking thread claims a free row (0 -> uid << 32); only the main
+   thread answers or frees one; each is a compare-exchange of the whole word, so an answer is never read beside another uid. An
+   unanswered ask refuses (only the owner removes); the eater's next try, five bites on, reads the answer. A row nobody has asked
+   about for kEatAskIdleMs is freed. */
+const int kEatAskRows = 32;
+const unsigned long kEatAskIdleMs = 60000;
+volatile LONG64 g_eatAsk[kEatAskRows] = { 0 };
+volatile LONG g_eatAskAt[kEatAskRows] = { 0 };   // GetTickCount of the row's last ask
+volatile LONG64 g_eatAskFull = 0;                // asks that found every row taken (refused)
+volatile LONG64 g_copyEatOwnerAway = 0;          // 'eaten' removals of a copy let through: its owner is not in this world
 volatile LONG64 g_copyDestroyRefused = 0;       // by reason: 'eaten' is the only reason refused
 volatile LONG64 g_eatenReArmed = 0, g_eatenLayoutOff = 0;   // the countdown set back / the body's MedicalSystem did not name it (nothing written)
 volatile LONG g_copyDestroyRefusedLastUid = 0;
@@ -2220,11 +2502,55 @@ static int EatenReArmPod(const void* obj)   /* 1 set back, 0 the layout did not 
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+static int EatenCopyOwnerInWorld(unsigned int uid)   /* MAIN THREAD: the owner record and the roster */
+{
+    unsigned int key = 0;
+    const int known = net::UidOwnerPeer(uid, &key) ? 1 : 0;
+    const int slot = known != 0 ? net::PeerSlotOfKey(key) : -1;
+    const int slotInWorld = slot >= 0 ? StoreRosterSlotInWorld(slot) : -1;
+    const int sessionPeer = (known != 0 && net::OwnerIsSessionPeer(key)) ? 1 : 0;
+    return mppresence::OwnerInWorld(known, slotInWorld, sessionPeer, net::SessionLinked() ? 1 : 0);
+}
+static int EatAskOffThread(unsigned int uid)   /* any thread: the main thread's answer for uid; kEatAsked while there is none */
+{
+    const LONG now = (LONG)::GetTickCount();
+    int freeRow = -1;
+    for (int i = 0; i < kEatAskRows; ++i)
+    {
+        const LONG64 w = ::InterlockedCompareExchange64(&g_eatAsk[i], 0, 0);
+        if (w == 0) { if (freeRow < 0) freeRow = i; continue; }
+        if ((unsigned int)((unsigned long long)w >> 32) != uid) continue;
+        ::InterlockedExchange(&g_eatAskAt[i], now);
+        return (int)((unsigned long long)w & 0xFFull);
+    }
+    for (int i = (freeRow < 0 ? kEatAskRows : freeRow); i < kEatAskRows; ++i)
+    {
+        ::InterlockedExchange(&g_eatAskAt[i], now);
+        if (::InterlockedCompareExchange64(&g_eatAsk[i], (LONG64)((unsigned long long)uid << 32), 0) == 0) return mppresence::kEatAsked;
+    }
+    ::InterlockedIncrement64(&g_eatAskFull);
+    return mppresence::kEatAsked;
+}
+static void EatAskAnswer()   /* MAIN THREAD, every frame: answer each asked row; free the rows nobody asks about any more */
+{
+    const unsigned long now = (unsigned long)::GetTickCount();
+    for (int i = 0; i < kEatAskRows; ++i)
+    {
+        const LONG64 w = ::InterlockedCompareExchange64(&g_eatAsk[i], 0, 0);
+        if (w == 0) continue;
+        if (now - (unsigned long)::InterlockedCompareExchange(&g_eatAskAt[i], 0, 0) >= kEatAskIdleMs) { ::InterlockedCompareExchange64(&g_eatAsk[i], 0, w); continue; }
+        const unsigned int uid = (unsigned int)((unsigned long long)w >> 32);
+        const LONG64 a = (LONG64)(((unsigned long long)uid << 32) | (unsigned long long)mppresence::EatAnswerOf(EatenCopyOwnerInWorld(uid)));
+        if (a != w) ::InterlockedCompareExchange64(&g_eatAsk[i], a, w);
+    }
+}
 bool RefuseEngineDestroyOfCopy(const void* obj, unsigned int uid, const char* debugInfo)
 {
-    if (obj == 0 || uid == 0 || DestroyReasonIsEaten(debugInfo) == 0) return false;     // only 'eaten' (fold 1)
-    if (::InterlockedCompareExchange(&g_copyDestroyLinked, 0, 0) == 0) return false;   // no link: the peer-gone path owns the copies
+    if (obj == 0 || uid == 0 || DestroyReasonIsEaten(debugInfo) == 0) return false;     // only 'eaten'
     if (net::IsUidMineAnyThread(uid)) return false;                                    // ours: destroyed and announced (NotifyDespawn)
+    const bool mainThread = g_mainThreadId != 0 && ::GetCurrentThreadId() == (unsigned long)g_mainThreadId;
+    const int answer = mainThread ? mppresence::EatAnswerOf(EatenCopyOwnerInWorld(uid)) : EatAskOffThread(uid);
+    if (mppresence::EatAnswerRefuses(answer) == 0) { ::InterlockedIncrement64(&g_copyEatOwnerAway); return false; }   // the owner is not in this world: the engine removes the copy
     ::InterlockedIncrement64(&g_copyDestroyRefused);
     ::InterlockedExchange(&g_copyDestroyRefusedLastUid, (LONG)uid);
     if (EatenReArmPod(obj) == 1) ::InterlockedIncrement64(&g_eatenReArmed); else ::InterlockedIncrement64(&g_eatenLayoutOff);
@@ -2233,7 +2559,7 @@ bool RefuseEngineDestroyOfCopy(const void* obj, unsigned int uid, const char* de
 void DrainOffThreadDespawns()
 {
     if (g_mainThreadId == 0 || ::GetCurrentThreadId() != (unsigned long)g_mainThreadId) return;
-    ::InterlockedExchange(&g_copyDestroyLinked, coop::PlayersPresent() ? 1 : 0);   /* another player here: the old link, or the roster's IN_WORLD */
+    EatAskAnswer();   /* the 'eaten' refusal's answers for the eating threads: is each asked copy's owner in this world */
     for (int i = 0; i < kOffThreadDespawnSlots; ++i)
     {
         if (::InterlockedCompareExchange(&g_offThreadDespawn[i].state, 2, 2) != 2) continue;
@@ -2964,6 +3290,9 @@ static int RemoveLocalCopy(unsigned int uid, ::Character* c, const char* what, b
     g_selfDespawnObj = c;
     bool destroyed = DestroyLocalObject(c);   // 3
     g_selfDespawnObj = prevSelf;
+#ifdef SW_DEV_BUILD
+    if (destroyed) coop::P169NoteCopyDestroy(uid);   /* PROBE P169 */
+#endif
     // mirror1 (crash T487) C: the copy is gone, so its row is released (4). AFTER the destroy, because
     // the destroy detour identifies our own destruction through this row. A copy the engine refused to
     // destroy keeps its retired row: its body is still standing at that address.
@@ -3024,7 +3353,7 @@ void ApplyRemoteDespawn(unsigned int uid)
 // through the faction manager, so `Faction+0x250` is null on it) - ordinary puppets, destroyed.
 //
 // Returns 1 destroyed, 0 withdrawn, -1 we hold no copy for that uid.
-int DropPeerOwnedCopy(unsigned int uid)
+int DropPeerOwnedCopy(unsigned int uid, int departed)
 {
     ::Character* c = FindSpawned(uid);
     if (c == 0)
@@ -3038,10 +3367,18 @@ int DropPeerOwnedCopy(unsigned int uid)
     bool player = false;
     if (WithdrawNotDestroy(uid, c, &player))
     {
-        UnpuppetForOwnership(uid);   // the local AI has it again, as after a handoff
+        /* T-1007 (J2): ON A DEPARTURE ONLY (departed 1: PLAYER_GONE's roads; a link loss is not one) a non-player twin goes to the twin
+           queue under 'never take' - its squad is put to sleep (TwinSleepTick), as the UNLOAD road queues a REVOKE that named no
+           winner. The hand-out order (peergone.h GoneTakeOverDecide) is the one road that takes a departed player's NPC: its first
+           game takes it (kGtTake) and it never reaches here; a twin dropped here had no first game (no receiver, or no map within the
+           looks), so no game takes it here. Anything else gets this game's AI back. */
+        const bool twinQueued = departed != 0
+            && twinsleep::WithdrawBranch(IsTwinUid(uid) ? 1 : 0, player ? 1 : 0, twinsleep::kKindNeverTake, -1) != twinsleep::kUnchanged;
+        if (twinQueued) TwinSleepQueue(uid, twinsleep::kKindNeverTake);
+        else UnpuppetForOwnership(uid);   // the local AI has it again, as after a handoff
         ++g_peerGoneWithdrawn;
         DebugLog("[M1] peer gone: uid=" + S(uid)
-                 + (player ? " - the watched player / a player-faction character" : " - a shared-save twin")
+                 + (player ? " - the watched player / a player-faction character" : (twinQueued ? " - a shared-save twin, queued for the twin sleep (T-1007 (J2): a departure - put to sleep)" : " - a shared-save twin"))
                  + ": puppet withdrawn, character NOT destroyed, row kept (H030)");
         return 0;
     }
@@ -3371,6 +3708,7 @@ bool IsRetiredObject(const void* obj)
     const int s = coopuid::IxFind(keys, kIndexMask, IndexHash(obj), obj);
     return s >= 0 && g_index[s].dead != 0;
 }
+
 
 // mirror1 (crash T487) C - THE PERIODIC RECLAIM. MAIN THREAD, and never while the puppet list is being
 // walked (it drops puppets): ReplicateTick calls it before its drive loop.
@@ -3721,6 +4059,7 @@ bool MirrorSlot(int i, unsigned int* uid, Character** out)
 // static fallback (F099), so an unregistered object hands back garbage rather than failing.
 static void DumpOneHandle(const char* label, Character* c)
 {
+#ifdef SW_DEV_BUILD   /* T-879 G: P009 is a DEV probe - the line's text and its building are the test build's only; the handle reads feed only this line */
     if (c == 0 || !PlausibleObject(c))
     {
         DebugLog(std::string("[P009] ") + label + ": character unreadable");
@@ -3745,6 +4084,7 @@ static void DumpOneHandle(const char* label, Character* c)
        << " resolvesTo=" << P(back)
        << (back == c ? "  <-- ROUND TRIP OK" : "  <-- ROUND TRIP FAILED");
     DebugLog(ss.str());
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 void ReportHandle(unsigned int uid)
@@ -4268,9 +4608,15 @@ void ReportSpawns()
        << S((long long)g_liveVerdicts[2]) << "," << S((long long)g_liveVerdicts[3]) << "," << S((long long)g_liveVerdicts[4]) << "," << S((long long)g_liveVerdicts[5]) << ","
        << S((long long)g_liveVerdicts[6]) << "," << S((long long)g_liveVerdicts[7]) << "," << S((long long)g_liveVerdicts[8]) << "," << S((long long)g_liveVerdicts[9])
        << " liveResolveFault=" << S((long long)g_liveResolveFault) << " doomNoted=" << S((long long)g_doomNoted) << " doomOverwrote=" << S((long long)g_doomOverwrote) << " doomEnded=" << S((long long)g_doomEnded) << " liveRenoted=" << S((long long)g_liveRenoted)
+       << " liveRehandled=" << S((long long)g_liveRehandled) << " rehandleRefused=" << S(g_rehandleRefused)
+       << " rehandleQueueFull=" << S(g_rehandleQFull) << " rehandleNoLivenessRow=" << S(g_rehandleNoLiveRow)
+       /* PROBE P156 BEGIN */ << P156ReportFields() /* PROBE P156 END */
        << " copyDestroyRefused[eaten]=" << S((long long)g_copyDestroyRefused) << " eatenReArmed=" << S((long long)g_eatenReArmed)
-       << " eatenLayoutOff=" << S((long long)g_eatenLayoutOff)
+       << " eatenLayoutOff=" << S((long long)g_eatenLayoutOff) << " copyEatOwnerAway=" << S((long long)g_copyEatOwnerAway) << " eatAskFull=" << S((long long)g_eatAskFull)
        << " spawnRefFallback=" << S(g_spawnRefFallback) << " spawnBuiltNoRef=" << S(g_spawnBuiltNoRef) << " spawnRefusedNoRef=" << S(g_spawnRefusedNoRef)   /* T-304 (3) */
+       << " tmplIdHit=" << S(g_tmplIdHit) << " tmplNameFallback=" << S(g_tmplNameFallback) << " tmplRefused=" << S(g_tmplRefused)
+       << " tmplRefusedKept=" << S(g_tmplRefusedKept) << " tmplSidBad=" << S(g_tmplSidBad)
+       << " tmplSentByName=" << S(g_tmplSentByName)   /* T-922: templatekey.h */
        // F332. `destroyOurs - despawnSelfReentry - despawnUnload` is the number this project has
        // never had: how many characters THIS engine destroyed on its own account. T091 read
        // `destroyOurs=46` on the client and every one was our own call coming back round.
@@ -6145,6 +6491,72 @@ unsigned int CarryingUidOf(unsigned int uid)
 
 namespace { bool BedPendingFor(unsigned int uid, unsigned int carrierUid); }   // a bed request for an own body from the carrier's game (arrest2 block below)
 namespace { void BedAskAtPutDown(unsigned int uid); }   // the rescuer's bed ask at the carry's end (arrest2 block below)
+// PROBE-START: P158
+/* PROBE P158 (T-921, LOG ONLY): an NPC this game runs picking up / putting down a player-faction character this game owns -
+   CarryWatchTick's carry edge (MAIN THREAD). Reads only what the mod already reads; changes nothing. */
+std::string P158CrimeText(const void* c);   // crime.cpp: the crime state and bounty list, POD reads
+namespace {
+bool ReadStdStringPod(const void* s, char* out, int cap);   // defined below, in the same (anonymous) namespace
+struct P158Pair { DWORD lastAt; long long n; };
+std::map<unsigned long long, P158Pair> g_p158Pairs;   // (carrier uid << 32 | body uid) -> its last edge and edge count
+long long g_p158Lines = 0, g_p158Suppressed = 0;
+const long long kP158LineCap = 40;   // lines per launch, then ...
+const long long kP158Every   = 20;   // ... every 20th edge of a pair
+void* P158FactionPod(::Character* c)
+{
+    __try { return (void*)c->getOwnerFactionDirect(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string P158Name(const void* c)
+{
+    char buf[128];
+    if (c == 0 || !PlausibleObject(c) || !ReadStdStringPod((const char*)c + 0x18, buf, (int)sizeof(buf))) return "?";
+    return std::string(buf);
+}
+void P158Edge(const char* what, unsigned int carrierUid, ::Character* carrier, unsigned int bodyUid)
+{
+    if (bodyUid == 0 || !net::IsUidMine(bodyUid)) return;
+    ::Character* body = FindSpawned(bodyUid);
+    if (body == 0 || !PlausibleObject(body) || carrier == 0 || !PlausibleObject(carrier)) return;
+    if (IsPlayerFactionPod(body) != 1 || IsPlayerFactionPod(carrier) != 0) return;
+    const DWORD t = ::GetTickCount();
+    const unsigned long long key = ((unsigned long long)carrierUid << 32) | (unsigned long long)bodyUid;
+    std::map<unsigned long long, P158Pair>::iterator it = g_p158Pairs.find(key);
+    std::string since = "-";
+    if (it == g_p158Pairs.end())
+    {
+        P158Pair p; p.lastAt = t; p.n = 0;
+        it = g_p158Pairs.insert(std::make_pair(key, p)).first;
+    }
+    else since = F1((float)(t - it->second.lastAt) / 1000.0f);
+    it->second.lastAt = t;
+    const long long n = ++it->second.n;
+    if (g_p158Lines >= kP158LineCap && (n % kP158Every) != 0) { ++g_p158Suppressed; return; }
+    ++g_p158Lines;
+    void* fp = P158FactionPod(carrier);
+    std::string fac = "?";
+    if (fp != 0 && PlausibleObject(fp)) fac = ((::Faction*)fp)->getName();
+    std::string pos = "-";
+    Ogre::Vector3 p;
+    if (SafeReadPosition(carrier, &p)) pos = F1(p.x) + "," + F1(p.z);
+    std::string goal, job = "-";
+    int orders = -1;
+    if (TaskGoalOfChar(carrier, &goal, &orders)) job = "'" + goal + "'";
+    DebugLog(std::string("[P158] carry ") + what + " carrier=" + S(carrierUid) + " '" + P158Name(carrier) + "' fac='" + fac
+             + "' body=" + S(bodyUid) + " '" + P158Name(body) + "' bodyKO=" + S((long long)CopyDowned(body)) + " pos=" + pos
+             + " sinceLast=" + since + " count=" + S(n) + " crime=" + P158CrimeText(body) + " job=" + job);
+}
+void P158CarryEdges(unsigned int carrierUid, ::Character* carrier, unsigned int was, unsigned int now)
+{
+    if (was != 0) P158Edge("putdown", carrierUid, carrier, was);
+    if (now != 0) P158Edge("pickup", carrierUid, carrier, now);
+}
+std::string P158ReportToken()
+{
+    return " p158[lines,suppressed,pairs]=" + S(g_p158Lines) + "," + S(g_p158Suppressed) + "," + S((long long)g_p158Pairs.size());
+}
+}   // namespace (P158)
+// PROBE-END: P158
 
 void CarryWatchTick()
 {
@@ -6161,6 +6573,9 @@ void CarryWatchTick()
         const unsigned int was = (last == g_carryLast.end()) ? 0 : last->second;
         if (now == was) continue;
         if (now == 0) g_carryLast.erase(last); else g_carryLast[uid] = now;
+        // PROBE-START: P158
+        P158CarryEdges(uid, c, was, now);
+        // PROBE-END: P158
         // The carry ended with another game's character's copy in a bed here: our rescuer put it there (the engine lets go,
         // puts down and sets the bed in one call). Its own game's bed request is SENT before the "carrying nothing" STATE, so
         // that game can hold its carry mirror's drop and enter the bed from the carry. The request goes on the reliable channel
@@ -6380,7 +6795,11 @@ std::string CarryReportToken()
          + "," + S(g_carryBreakApplied) + "," + S(g_carryBreakStale) + "," + S(g_carryBreakRefused) + "," + S(g_carryBreakDropped)
          + "," + S((long long)g_ownCarried.size())
          + " handOver[noted,letGo,ended,expired,full,now]=" + S(g_handOverNoted) + "," + S(g_handOverLetGo) + "," + S(g_handOverEnded)
-         + "," + S(g_handOverExpired) + "," + S(g_handOverFull) + "," + S((long long)g_handOvers.size());
+         + "," + S(g_handOverExpired) + "," + S(g_handOverFull) + "," + S((long long)g_handOvers.size())
+         // PROBE-START: P158
+         + P158ReportToken()
+         // PROBE-END: P158
+         ;
 }
 
 void CarryHandOverNote(unsigned int body, unsigned int carrier, unsigned int taker)
@@ -9112,7 +9531,7 @@ const DWORD kOrphanNoteGapMs = 1000;      /* a gap longer than this between two 
 struct OrphanNoteT { DWORD first, last; };
 std::map<const void*, OrphanNoteT> g_orphanNoteT;
 std::set<const void*> g_orphanNotedSeen;   /* people noted this world generation (counted once each) */
-long g_orphanLinkGen = -1; int g_orphanWasLinked = 0; DWORD g_orphanLinkUpMs = 0;
+long g_orphanLinkGen = -1; int g_orphanWasLinked = 0; DWORD g_orphanLinkUpMs = 0; int g_orphanMeIn = 0;
 /* T-304 (1) (run T674): a stray the engine woke from a squad this game rebuilt while unlinked stood beside the other game's
    live copy of the same animal, within 100 units of this game's player, so the near-player rule kept it for good - it ate
    on one screen only and was later adopted as this game's own. A noted character that DUPLICATES a live copy (same template
@@ -9234,14 +9653,19 @@ void OrphanPurgeTick(long worldGen)
         /* [m11c2f1-2] the clock also restarts at the old link's own up edge (a new link generation included), exactly as before C2: a
            link-up merged with an earlier roster arrival counts no arrival, and the grace must not be spent before the peer's SPAWNs */
         const int oldEdge = (oldUp != 0 && (s_oldWasUp == 0 || lg != g_orphanLinkGen)) ? 1 : 0;
+        /* this game's own entry in the world: the clock restarts when the roster first lists it IN_WORLD, and nothing is removed before
+           (g_orphanMeIn gates linkedMs below) - another game's announcements reach it only after that */
+        const int meIn = StoreMeInWorldNow();
         if (lk != 0 && (g_orphanWasLinked == 0 || arrived > 0 || oldEdge != 0)) g_orphanLinkUpMs = ::GetTickCount();
-        g_orphanWasLinked = lk; g_orphanLinkGen = lg; s_oldWasUp = oldUp;
+        if (meIn != 0 && g_orphanMeIn == 0) g_orphanLinkUpMs = ::GetTickCount();
+        g_orphanWasLinked = lk; g_orphanLinkGen = lg; s_oldWasUp = oldUp; g_orphanMeIn = meIn;
     }
     if (worldGen != g_orphanGen)
     {
         g_orphanGen = worldGen; g_orphanQ.clear(); g_orphanSkipSeen.clear(); g_orphanNoteT.clear(); g_orphanNotedSeen.clear();
         g_orphanCarrierTried.clear(); g_orphanBedTried.clear(); g_orphanOwnDropTried.clear();
         g_orphanHeld.clear();   /* T-304 (1): the world teardown frees the gate table */
+        g_orphanLinkUpMs = ::GetTickCount();   /* a world load restarts the arrival clock: the grace before any removal runs from the load, whoever is in the world, so a game whose own roster entry or another game's announcements have not landed yet removes nobody */
         OrphanFlush(true);
     }
     if (!g_orphanAgg.empty()) OrphanFlush(g_orphanQ.empty());
@@ -9287,7 +9711,6 @@ void OrphanPurgeTick(long worldGen)
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     const DropCarriedObjectFn drop = (kDropCarriedObjectRva != 0) ? (DropCarriedObjectFn)(base + kDropCarriedObjectRva) : 0;
     const SetBedModeFn setBed = (kSetBedModeRva != 0) ? (SetBedModeFn)(base + kSetBedModeRva) : 0;
-    const int linked = (net::LinkIsUp() || StoreOtherBeyondLinkInWorld() != 0) ? 1 : 0;   /* another player in this world: the old link, or one or more other slots IN_WORLD on the world server's roster (mparrive::OthersInWorldBeyondLink - a slot that may be the old link's peer counts alone only while that link has never been up) */
     std::set<const void*> gone;
     int removed = 0;
     std::set<std::pair<void*, void*> > t300Emptied;   /* T-300 fix 2: (faction, ActivePlatoon) of each removed person - offered to the store after the pass */
@@ -9299,7 +9722,6 @@ void OrphanPurgeTick(long worldGen)
         for (int step = 0; step < 6; ++step)   /* each step is decided from a fresh read; the tried-sets make it finish */
         {
             coopor::Seen s = coopor::SeenNone();
-            s.linked = linked;
             float x = 0.0f, z = 0.0f;
             const int havePos = OrphanPos(c, &x, &z);
             const Sector sec = SectorOf(x, z);
@@ -9341,7 +9763,7 @@ void OrphanPurgeTick(long worldGen)
             {
                 std::map<const void*, OrphanNoteT>::const_iterator nt = g_orphanNoteT.find((const void*)c);
                 s.notedMs = (nt != g_orphanNoteT.end() && now - nt->second.last <= kOrphanNoteGapMs) ? (unsigned long)(now - nt->second.first) : 0;
-                s.linkedMs = linked != 0 ? (unsigned long)(now - g_orphanLinkUpMs) : 0;
+                s.linkedMs = (g_orphanMeIn != 0) ? (unsigned long)(now - g_orphanLinkUpMs) : 0;   /* the arrival clock kept at the top of this tick, whoever is in the world now; 0 (too fresh) until the roster lists this game in the world */
             }
             int why = coopor::kWhyNone;
             const int act = coopor::Decide(s, &why);
@@ -12119,7 +12541,50 @@ void ReportTask(unsigned int uid)
     Ogre::Vector3 p = c->worldPosition();
     DebugLog("[M1] tasks uid=" + S(uid) + " goal='" + ts->describeCurrentGoal() + "'"
              + " pos=" + F1(p.x) + "," + F1(p.y) + "," + F1(p.z)
-             + " hasOrders=" + S(ts->hasPendingOrders() ? 1 : 0));
+             + " hasOrders=" + S(ts->hasPendingOrders() ? 1 : 0) + OrderListWords(c));
+}
+
+/* The order system's three lists, read in place (POD, SEH-guarded). The order system is the AI's +0x20. Its ORDER QUEUE is the
+   container at +0x38, count +0x60 (64-bit; 0x507180 walks it, dropAllOrders 0x506A10 empties it through 0x50C720); its PENDING orders
+   are the list at +0x70, count +0x78; its STANDING jobs (a job given with Shift, kept by 0x507C40) the list at +0x90 count, +0x98 array,
+   each job's TaskType at *(job+0x70)+0x44 (0x506740). Its byte +0x35 is the JOB SWITCH: the re-plan (0x510460) hands it to the
+   standing-job scorer 0x50DB20, which with it off scores only the few types 0x50B730 lets through; its writer is 0x507780
+   (OrdersReceiver_setJobMode: add-job 0x507C40 sets it on when it keeps a job; Character 0x5C9FC0 case 0xF sets it either way). 1 read, 0 fault. */
+static int OrderListsPod(void* ts, long long* queued, int* pending, int* standing, int* types, int typeCap, int* typeN, int* jobSwitch)
+{
+    *typeN = 0;
+    __try
+    {
+        const char* o = (const char*)ts;
+        *jobSwitch = *(const unsigned char*)(o + 0x35);
+        *queued = *(const long long*)(o + 0x60);
+        *pending = (int)*(const unsigned int*)(o + 0x78);
+        *standing = (int)*(const unsigned int*)(o + 0x90);
+        const char* const* jobs = *(const char* const* const*)(o + 0x98);
+        for (int i = 0; i < *standing && *typeN < typeCap; ++i)
+        {
+            const char* job = jobs[i];
+            types[(*typeN)++] = (job != 0) ? *(const int*)(*(const char* const*)(job + 0x70) + 0x44) : -1;
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+std::string OrderListWords(::Character* c)
+{
+    if (c == 0 || !PlausibleObject(c)) return " orders=(no character)";
+    void* ai = GetCharacterAI(c);
+    if (!PlausibleObject(ai)) return " orders=(AI unreadable)";
+    void* ts = *(void**)((char*)ai + 0x20);
+    if (!PlausibleObject(ts)) return " orders=(order system unreadable)";
+    long long queued = -1;
+    int pending = -1, standing = -1, typeN = 0, jobSwitch = -1;
+    int types[8];
+    if (OrderListsPod(ts, &queued, &pending, &standing, types, 8, &typeN, &jobSwitch) == 0) return " orders=(unreadable)";
+    std::string t;
+    for (int i = 0; i < typeN; ++i) t += (i != 0 ? "," : "") + S((long long)types[i]);
+    return " orders[queued,pending]=" + S(queued) + "," + S((long long)pending) + " jobSwitch=" + S((long long)jobSwitch) + " standingJobs=" + S((long long)standing)
+         + (standing > 0 ? " standingTaskTypes=" + t + (standing > typeN ? ",.." : "") : std::string());
 }
 
 /* P11: ReportTask's reads, handed back (capturetest's read-back). */
@@ -12285,7 +12750,7 @@ void* BuildingGetTown(void* building)
 }
 long long g_ctxSent = 0, g_ctxSendFailed = 0, g_ctxRecv = 0;
 // M-B / H026 - the apply side.
-struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; };   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
+struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; int birth; };   /* birth: the squad's birth flag (squadbirth.h), -1 unknown */   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
 std::map<unsigned int, PendingContext> g_pendingCtx;
 bool PendingCtxHasUid(unsigned int uid) { return g_pendingCtx.find(uid) != g_pendingCtx.end(); }   // M4 fold: AllocateUid's row check (declared above it, same namespace)
 std::map<std::string, void*> g_ctxPlatoons;   // key: id|<squad id>|<faction> (ctxkey.h, CtxIdKey); older senders: squadSid|hand index:serial|townSid -> Platoon*
@@ -12723,7 +13188,8 @@ bool SendContextFor(unsigned int uid, ::Character* c)
     /* the age of this game's current world load (store.cpp StoreWorldLoadAgeMs; kLoadAgeUnknown before its first running tick); the
        receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
     const unsigned int loadAgeMs = coop::StoreWorldLoadAgeMs();
-    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs)) { ++g_ctxSendFailed; return false; }
+    const unsigned int birthWire = sqbirth::WireOfBirth(PlausibleObject(platoon) ? coop::StoreBirthOfPlatoon(platoon) : sqbirth::kBirthUnknown);   /* the squad's birth flag: the copy takes its kept byte from it */
+    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs, birthWire)) { ++g_ctxSendFailed; return false; }
     ++g_ctxSent;
     SW_QUIETLOG(g_qCtxSent, "[CTX] ->", 0, 0, "[CTX] -> uid=" + std::string(S(uid)) + " squad='" + squadSid + "' squadType=" + S(squadType) + " town='" + townSid
              + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)));
@@ -12875,7 +13341,7 @@ void WorldRosterFull(int page)
 
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth)
 {
     ::Character* twin = RawHandIsEmpty(charRaw32) ? 0 : SafeHandToCharacter(LocalHandFromRaw(charRaw32));   // H027
     ++g_ctxRecv;
@@ -12899,7 +13365,7 @@ void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squad
              + "," + q + "squadType" + q + ":" + S(squadType) + "," + q + "memberType" + q + ":" + S(memberType)
              + "," + q + "twinLocal" + q + ":" + (PlausibleObject(twin) ? "1" : "0") + "}");
     PendingContext pc; pc.squadSid = squadSid; pc.townSid = townSid; pc.platoonId = platoonId; pc.squadType = squadType; pc.memberType = memberType;
-    std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz; pc.peerLoadAgeMs = peerLoadAgeMs; pc.recvMs = ::GetTickCount(); pc.peerSlot = senderSlot;
+    std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz; pc.peerLoadAgeMs = peerLoadAgeMs; pc.recvMs = ::GetTickCount(); pc.peerSlot = senderSlot; pc.birth = birth;
     g_pendingCtx[uid] = pc;
     /* T-1 B1 restructure (protocol 85): CONTEXT's member type is no longer read as the squad leader - MSG_SQUAD_LEAD carries it (handoff.cpp ApplyRemoteSquadLead). */
 }
@@ -13125,7 +13591,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         std::string copyId;   /* a player's copy squad: its fresh id when another squad holds the engine's ("" = the engine's kept) */
         if (IsStandInFaction(faction) || IsPlayerFaction(faction)) CopySquadIdCheck(faction, platoon, engineId, &copyId, "context");
         if (!pc.platoonId.empty() && !IsPlayerFaction(faction) && !IsPeerFaction(faction)) CarryPeerPlatoonId(faction, platoon, pc.platoonId);   /* inv7e: before the bind, so the clash test sees only OTHER squads */
-        if (!pc.platoonId.empty()) StoreBindPlatoon(platoon, pc.platoonId);   // P1: world id + persistent (sleeps instead of being destroyed)
+        if (!pc.platoonId.empty()) StoreBindPlatoon(platoon, pc.platoonId, pc.birth);   // P1: world id + the kept byte its birth flag says
         StoreNoteCopyHome(platoon, pc.platoonId, pc.hand, haveBuilding ? 1 : 0, building != 0 ? 1 : 0);   /* a building sent that is not loaded here: the copy's home is owed and given by the store's once-a-second owed-home check once that building is loaded [t755-copyhome-call] */
         if (homePH != 0)
         {
@@ -13999,3 +14465,98 @@ std::string P141LiveCountsLine()
 }
 }   /* namespace coop */
 /* PROBE P141 END */
+
+namespace coop {
+/* MAIN THREAD, every frame (ReplicateTick, before the reclaim). The rows the liveness check refused after a handle change are
+   finished: marked destroyed for their uid (MirrorMarkDestroyed - the object is NOT touched: the evidence says it is not the
+   copy), the uid's map entry, puppet and per-copy marks forgotten as the creation core forgets a stale row (so the owner's SPAWN
+   builds a copy at once), and the uid booked as a lost copy at its owner's last streamed spot, so the lost-copy road asks the
+   owner for a fresh copy. This game's own characters are not finished here: nothing could send them again. Then an owner's
+   death a copy missed is applied (medical.cpp), and probe P156's kept lines are written. */
+void RehandleTick()
+{
+    /* PROBE P156 BEGIN */
+    while (g_p156Printed < g_p156RecN)
+    {
+        const P156Rec& r = g_p156Rec[g_p156Printed++];
+        const bool own = net::IsUidMine(r.uid);   /* probe P156: this game's own character - UidOwnerPeer has no record for it */
+        unsigned int owner = 0;
+        if (!own) net::UidOwnerPeer(r.uid, &owner);
+        const long proneMs = SoakProneAgoMs(r.uid, r.at);
+        long carryMs = -1;
+        std::map<unsigned int, DWORD>::const_iterator ca = g_bedCarriedAt.find(r.uid);
+        if (ca != g_bedCarriedAt.end()) { carryMs = (long)(r.at - (ca->second & ~1u)); if (carryMs < 0) carryMs = 0; }
+        DebugLog("[P156] rehandled uid=" + S(r.uid) + (own ? std::string(" own=1") : " own=0 owner=" + S(owner)) + " animal=" + S(r.animal)
+                 + " old=" + S(r.oI) + "/" + S(r.oS) + "/" + S(r.oC) + " new=" + S(r.nI) + "/" + S(r.nS) + "/" + S(r.nC)
+                 + " oldResolvesSelf=" + S(r.oldSelf) + " newResolvesSelf=" + S(r.newSelf) + " inList=" + S(r.inList)
+                 + " dead=" + S(r.dead) + " destroyed=" + S(r.destroyed) + " doomed=" + S(r.doomed)
+                 + " fp=" + livechar::FingerprintName(r.fp) + " judge=" + livechar::RehandleName(r.judge)
+                 + " sinceProne=" + (proneMs < 0 ? std::string("-1") : F1((float)proneMs / 1000.0f))
+                 + " sinceCarry=" + (carryMs < 0 ? std::string("-1") : F1((float)carryMs / 1000.0f))
+                 + " sincePose=-1");   /* probe P156: no last-posture-apply time is stored per uid */
+    }
+    /* PROBE P156 END */
+    const void* qObj[kRehandleQ];
+    unsigned int qUid[kRehandleQ];
+    const int n = g_rehandleQN;
+    for (int i = 0; i < n; ++i) { qObj[i] = g_rehandleQObj[i]; qUid[i] = g_rehandleQUid[i]; }
+    g_rehandleQN = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const void* obj = qObj[i];
+        const unsigned int uid = qUid[i];
+        if (net::IsUidMine(uid)) continue;
+        UidMirror* row = StoredRowOf(obj);
+        if (row == 0 || row->uid != uid || row->destroyed != 0) continue;   /* finished another way since it was queued */
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        const bool hasPos = PuppetAuthorityPos(uid, &x, &y, &z);   /* read before the puppet goes */
+        if (!MirrorMarkDestroyed(obj, uid)) continue;
+        ++g_rehandleRefused;
+        if (SpawnedRawObject(uid) == obj)
+        {
+            DropPuppet(uid, false);   /* writes nothing through the object */
+            g_spawned.erase(uid);
+            NameForgetUid(uid);
+            SlaveForgetUid(uid);
+            coop::LimbsForgetUid(uid);
+            DeadlookForgetCopy(uid);
+            TagsForgetUid(uid);
+        }
+        if (g_rehandleRefused <= 20)
+            DebugLog("[M1] uid=" + S(uid) + ": its copy's engine handle changed and the object at its address is not that copy (another"
+                     " template, animation or AI object, its row destroyed, or the new handle names another character) - the row is finished without"
+                     " touching the object, and the owner is asked for a fresh copy" + std::string(hasPos ? "" : " (no streamed spot known)")
+                     + " (rehandleRefused " + S(g_rehandleRefused) + "; the first 20 logged, then counted)");
+        net::LostCopyNote(uid, hasPos, x, y, z);
+    }
+    MedicalDrainMissedDeaths();
+}
+
+/* TEST-ONLY (`handleskew` lever). MAIN THREAD. */
+std::string HandleSkewLever(unsigned int uid, bool refuse)
+{
+    if (uid == 0) return "error handleskew: no uid";
+    if (net::IsUidMine(uid)) return "error handleskew: uid " + S(uid) + " is driven by this game - copies only";
+    const void* obj = SpawnedRawObject(uid);
+    UidMirror* row = obj != 0 ? StoredRowOf(obj) : 0;
+    if (row == 0 || row->uid != uid || row->dead != 0) return "error handleskew: uid " + S(uid) + " has no live copy row here";
+    if (row->hIndex == 0 && row->hSerial == 0) return "error handleskew: uid " + S(uid) + "'s row stored no handle - nothing to change";
+    const unsigned int was = row->hSerial;
+    row->hSerial = was + 1u;   /* the engine's handle is unchanged and still resolves here: the next check meets another serial */
+    if (refuse)
+    {
+        for (int k = 0; k < livechar::kFpWitnesses; ++k)
+            row->fp[k] = (const void*)(row->fp[k] != 0 ? ((uintptr_t)row->fp[k] ^ (uintptr_t)0x10) : (uintptr_t)0x10);
+    }
+    bool fpKnown = true;
+    for (int k = 0; k < livechar::kFpWitnesses; ++k)
+        if (row->fp[k] == 0) fpKnown = false;
+    LiveMemoForgetAddress(obj);
+    const std::string line = "[M3] handleskew uid=" + S(uid) + " refuse=" + S(refuse ? 1 : 0) + " storedSerial " + S(was) + " -> "
+                             + S(row->hSerial) + std::string(refuse ? " and the stored fingerprint changed" : "")
+                             + (fpKnown ? std::string() : std::string(" (the row stored no fingerprint: the check cannot renote it)"))
+                             + " - the next liveness check of the copy meets a handle that is not the stored one";
+    DebugLog(line);
+    return line;
+}
+}   /* namespace coop */

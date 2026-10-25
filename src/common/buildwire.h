@@ -46,6 +46,20 @@ const unsigned char kBuildDismantleAsk = 12;   /* T-805 (owner 797 a): kind | ke
                                                   T-609: MSG_BUILD's kind byte is shared with farmwire.h (6 / 7 / 10 / 11 / 13-15, coopfarm::IsFarmKind,
                                                   peeked first by session.cpp OnBuild) - a new kind here must take a number IsFarmKind refuses
                                                   (test t609_build_and_farm_kinds_never_share_a_number) */
+const unsigned char kBuildHit = 18;            /* kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict - verdict kBuildHitAsk = a melee hit on a player's wall
+                                                  (the damage struct's +0 / +4), asked of the game that writes that wall (the machines' writer: the owner's game while it is
+                                                  online and holds the area, else the area holder); verdicts 1-6 are that game's answer for the seq (BuildHitWord), after
+                                                  which the asker stops sending it (6 'not the writer': the asker asks the writer once more).
+                                                  The RESULT form, verdict kBuildHitResult: kind | key | u32 seq | f32 drop | f32 needed | u8 7 | u8 flags | f32 after -
+                                                  a writer that is not the wall's owner sends what its hit did to every game: drop = the progress the hit took (>= 0, raw:
+                                                  the engine's hit removes a fixed amount), after / needed = the owner's health after it as the writer expects it (the
+                                                  share after / needed is what is compared), flags bit 0 = the hit made the wall a ruin, bit 1 = owed (sent again to the
+                                                  owner's game only: the summed drop of every hit on that wall that game did not take). 16 / 17 are powerwire.h's */
+const unsigned char kBuildHitFlagDestroyed = 1, kBuildHitFlagOwed = 2;
+const unsigned char kBuildHitAsk = 0, kBuildHitApplied = 1, kBuildHitGone = 2, kBuildHitNotLoaded = 3, kBuildHitRuin = 4, kBuildHitFaulted = 5,
+                    kBuildHitNotWriter = 6, kBuildHitResult = 7;
+const unsigned char kBuildHitLastVerdict = 7;
+const float         kBuildHitMax = 1.0e6f;      /* a HIT's cut or blunt above this (or below 0) is refused */
 const unsigned char kBuildHelpGone = 9;        /* help1 fold (review MED 3, protocol 91): the owner's answer to work for a piece it no longer holds as its own (removed, dismantled,
                                                   handed, its removed row swept) - key | u32 seq: the helper drops every entry at or below seq and hands their materials back.
                                                   help1 fold 2 (protocol 92): key | u32 seq | u32 applied - the owner's last applied seq from that helper for that key
@@ -116,11 +130,19 @@ struct BuildMsg
     unsigned char reset;            /* help1 HELP_WORK: 1 = the helper's copy was a ruin and the work rebuilt it (the engine's reset) */
     unsigned int applied;           /* help1 fold 2 HELP_GONE (protocol 92): the owner's last applied seq from that helper for that key (0 = none); fold 3: nMats / mats = its refused tail */
     unsigned char rmFlags;          /* P87 fold 1 REMOVE: kBuildRm* (0 = none); nonce = the placement it ends, hostKey = a furniture tombstone's host */
+    unsigned char townHand;         /* T-923 (protocol 167) PLACE: 1 = an outdoor piece handed to ownerSlot because it was placed in that player's outpost town;
+                                       townPos = that town's centre (x, z) as the world server's outpost list gives it - the owner's game makes the piece
+                                       in its own town standing there, at any distance from the piece (a grouped placement's far piece). 0 = none */
+    float townPos[2];
+    float hitCut, hitBlunt;         /* HIT: the damage struct's +0 / +4 the hit carried (seq = the asker's number, reason = the verdict) */
+    float hitDrop, hitAfter;        /* HIT result: the raw progress the hit (owed: the hits) took, >= 0; the owner's health the writer expects after it, in units of needed */
+    unsigned char hitOwed;          /* HIT result: 1 = owed - the writer sends it again to the owner's game only */
     std::vector<BuildHelpAck> helpAcks;   /* help1 STATE: the confirmation tail (empty = not written); fold 3: each row landed seq + live */
     float mats[kBuildMaxMats];
     BuildMsg() : kind(0), complete(0), destroyed(0), broken(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFFFF),
-                 nonce(0), seq(0), reset(0), applied(0), rmFlags(0)
+                 nonce(0), seq(0), reset(0), applied(0), rmFlags(0), townHand(0), hitCut(0.0f), hitBlunt(0.0f), hitDrop(0.0f), hitAfter(0.0f), hitOwed(0)
     {
+        townPos[0] = townPos[1] = 0.0f;
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
         rot[0] = 1.0f; rot[1] = 0.0f; rot[2] = 0.0f; rot[3] = 0.0f;
         for (unsigned int i = 0; i < kBuildMaxMats; ++i) mats[i] = 0.0f;
@@ -128,6 +150,8 @@ struct BuildMsg
 };
 
 const unsigned short kBuildOwnerSender = 0xFFFF;   /* a PLACE's ownerSlot meaning "the sender's own piece" */
+const size_t kBuildTownTail = 9;                  /* T-923 (protocol 167): a PLACE's town tail - the tag byte, then the town centre's x and z */
+const unsigned char kBuildTownTag = 1;
 const unsigned short kBuildOwnerSlotMax = 1023;   /* the notebook's slots 0..1023 (slotwire.h kSlotMax) */
 const unsigned char kBuildOwnerSenderOneByte = 0xFF;   /* the sender, in a PLACE whose owner number is one byte (pp.build rows and owed-file rows saved by builds that wrote one byte) */
 
@@ -172,6 +196,12 @@ inline bool BuildEncodable(const BuildMsg& m)
     }
     if (m.kind == kBuildRosterRequest) return m.key.empty() && m.sid.empty() && m.hostKey.empty();   /* build1-f: no body */
     if (m.kind == kBuildHandAck) return !m.key.empty() && m.key.size() <= kBuildMaxKey;   /* house1b: the key only */
+    if (m.kind == kBuildHit && m.reason == kBuildHitResult)   /* key | seq (> 0) | drop (finite, >= 0), needed (finite, >= 0) | destroyed 0/1, owed 0/1 | after (finite) */
+        return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.seq != 0 && BuildFloatOk(m.hitDrop) && m.hitDrop >= 0.0f && BuildFloatOk(m.needed) && m.needed >= 0.0f
+            && m.destroyed <= 1 && m.hitOwed <= 1 && BuildFloatOk(m.hitAfter);
+    if (m.kind == kBuildHit)   /* key | seq (> 0) | cut, blunt (finite, 0..kBuildHitMax) | verdict */
+        return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.seq != 0 && m.reason <= kBuildHitLastVerdict
+            && BuildFloatOk(m.hitCut) && BuildFloatOk(m.hitBlunt) && m.hitCut >= 0.0f && m.hitBlunt >= 0.0f && m.hitCut <= kBuildHitMax && m.hitBlunt <= kBuildHitMax;
     if (m.kind == kBuildDismantleAsk) return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.reason <= 7;   /* T-805: key + verdict (kBuildDmBlocked the last) */
     if (m.kind == kBuildRemove)   /* build1-d; P87 fold 1: a furniture tail's host key fits */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey
@@ -191,6 +221,9 @@ inline bool BuildEncodable(const BuildMsg& m)
         || m.floor < -kBuildMaxFloor || m.floor > kBuildMaxFloor)   /* build1-e */
         return false;
     if (m.ownerSlot != kBuildOwnerSender && m.ownerSlot > kBuildOwnerSlotMax) return false;
+    if (m.townHand > 1 || (m.townHand == 1 && (m.ownerSlot == kBuildOwnerSender || !m.hostKey.empty()
+                                               || !BuildFloatOk(m.townPos[0]) || !BuildFloatOk(m.townPos[1]))))
+        return false;   /* T-923: a town hand-over names an owner and is an outdoor piece */
     for (int i = 0; i < 3; ++i) if (!BuildFloatOk(m.pos[i])) return false;
     if (!BuildRotOk(m.rot)) return false;
     return BuildFloatOk(m.progress) && BuildFloatOk(m.needed);
@@ -243,6 +276,24 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         char* a = &(*b)[at];
         *a++ = (char)m.kind;
         BuildPutS(&a, m.key);
+        return true;
+    }
+    if (m.kind == kBuildHit)   /* kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict; the RESULT: f32 drop | f32 needed | u8 7 | u8 flags | f32 after */
+    {
+        const int res = (m.reason == kBuildHitResult) ? 1 : 0;
+        b->resize(at + 1 + 1 + m.key.size() + 4 + 4 + 4 + 1 + (res != 0 ? 1 + 4 : 0));
+        char* h = &(*b)[at];
+        *h++ = (char)m.kind;
+        BuildPutS(&h, m.key);
+        std::memcpy(h, &m.seq, 4); h += 4;
+        std::memcpy(h, res != 0 ? &m.hitDrop : &m.hitCut, 4); h += 4;
+        std::memcpy(h, res != 0 ? &m.needed : &m.hitBlunt, 4); h += 4;
+        *h++ = (char)m.reason;
+        if (res != 0)
+        {
+            *h++ = (char)((m.destroyed != 0 ? kBuildHitFlagDestroyed : 0) | (m.hitOwed != 0 ? kBuildHitFlagOwed : 0));
+            std::memcpy(h, &m.hitAfter, 4);
+        }
         return true;
     }
     if (m.kind == kBuildDismantleAsk)   /* T-805: kind + key + verdict */
@@ -304,7 +355,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
         }
         return true;
     }
-    b->resize(at + 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 2 + (m.nonce != 0 ? 4 : 0));   /* + the two owner-number bytes; + the nonce */
+    b->resize(at + 1 + 1 + m.key.size() + 1 + m.sid.size() + 12 + 16 + 1 + 4 + 4 + 1 + m.hostKey.size() + 1 + 4 + 1 + 2 + (m.nonce != 0 ? 4 : 0) + (m.townHand != 0 ? kBuildTownTail : 0));   /* + the two owner-number bytes; + the nonce; + T-923's town tail */
     char* p = &(*b)[at];
     *p++ = (char)m.kind;
     BuildPutS(&p, m.key);
@@ -320,6 +371,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
     *p++ = (char)m.outside;
     *p++ = (char)(m.ownerSlot & 0xFF); *p++ = (char)((m.ownerSlot >> 8) & 0xFF);   /* the owner number, little-endian */
     if (m.nonce != 0) { std::memcpy(p, &m.nonce, 4); p += 4; }   /* house2 fold (protocol 76) */
+    if (m.townHand != 0) { *p++ = (char)kBuildTownTag; BuildPutF(&p, m.townPos[0]); BuildPutF(&p, m.townPos[1]); }   /* T-923 (protocol 167) */
     return true;
 }
 
@@ -357,7 +409,7 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
     BuildMsg m;
     m.kind = (unsigned char)p[0];
     if (m.kind != kBuildPlace && m.kind != kBuildState && m.kind != kBuildRemove && m.kind != kBuildRosterRequest && m.kind != kBuildHandAck
-        && m.kind != kBuildHelpWork && m.kind != kBuildHelpGone && m.kind != kBuildDismantleAsk) return kBuildDecodeBadKind;
+        && m.kind != kBuildHelpWork && m.kind != kBuildHelpGone && m.kind != kBuildDismantleAsk && m.kind != kBuildHit) return kBuildDecodeBadKind;
     if (m.kind == kBuildRosterRequest)   /* build1-f: exactly the kind byte */
     {
         if (size != 1) return kBuildDecodeBadValue;
@@ -406,6 +458,30 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
     {
         if (m.key.empty()) return kBuildDecodeBadKey;
         if (off != size) return kBuildDecodeBadValue;
+        if (out) *out = m;
+        return kBuildDecodeOk;
+    }
+    if (m.kind == kBuildHit)   /* exactly kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict; the RESULT: f32 drop | f32 needed | u8 7 | u8 flags | f32 after */
+    {
+        if (m.key.empty()) return kBuildDecodeBadKey;
+        if (size - off < 13) return kBuildDecodeTooShort;
+        float f1 = 0.0f, f2 = 0.0f;
+        std::memcpy(&m.seq, p + off, 4); off += 4;
+        std::memcpy(&f1, p + off, 4); off += 4;
+        std::memcpy(&f2, p + off, 4); off += 4;
+        m.reason = (unsigned char)p[off]; off += 1;
+        if (m.reason == kBuildHitResult)
+        {
+            if (size - off < 5) return kBuildDecodeTooShort;
+            const unsigned char fl = (unsigned char)p[off]; off += 1;
+            if ((fl & ~(kBuildHitFlagDestroyed | kBuildHitFlagOwed)) != 0) return kBuildDecodeBadValue;
+            m.destroyed = (unsigned char)((fl & kBuildHitFlagDestroyed) != 0 ? 1 : 0);
+            m.hitOwed = (unsigned char)((fl & kBuildHitFlagOwed) != 0 ? 1 : 0);
+            std::memcpy(&m.hitAfter, p + off, 4); off += 4;
+            m.hitDrop = f1; m.needed = f2;
+        }
+        else { m.hitCut = f1; m.hitBlunt = f2; }
+        if (off != size || !BuildEncodable(m)) return kBuildDecodeBadValue;
         if (out) *out = m;
         return kBuildDecodeOk;
     }
@@ -501,13 +577,25 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
         const unsigned char o = (unsigned char)p[off]; off += 1;   /* the one-byte owner number: 0xFF the sender, else the slot */
         m.ownerSlot = (o == kBuildOwnerSenderOneByte) ? kBuildOwnerSender : (unsigned short)o;
     }
-    if (size - off >= 4)   /* the per-placement nonce; absent = 0 */
+    /* the tail, told apart by its length: none (0), the per-placement nonce (4; absent = 0), T-923's town tail (kBuildTownTail, protocol 167),
+       or both, the nonce first; nothing else follows */
+    const size_t tail = size - off;
+    if (tail != 0 && tail != 4 && tail != kBuildTownTail && tail != 4 + kBuildTownTail)
+        return tail < 4 ? kBuildDecodeTooShort : kBuildDecodeBadValue;
+    if (tail == 4 || tail == 4 + kBuildTownTail)
     {
         std::memcpy(&m.nonce, p + off, 4); off += 4;
         if (m.nonce == 0) return kBuildDecodeBadValue;   /* one encoding: a zero nonce is never written */
-        if (off != size) return kBuildDecodeBadValue;     /* nothing follows the nonce */
     }
-    else if (size - off != 0) return kBuildDecodeTooShort;
+    if (size - off == kBuildTownTail)
+    {
+        if ((unsigned char)p[off] != kBuildTownTag) return kBuildDecodeBadValue;
+        off += 1;
+        m.townHand = 1;
+        std::memcpy(&m.townPos[0], p + off, 4); off += 4;
+        std::memcpy(&m.townPos[1], p + off, 4); off += 4;
+        if (!BuildFloatOk(m.townPos[0]) || !BuildFloatOk(m.townPos[1]) || m.ownerSlot == kBuildOwnerSender || !m.hostKey.empty()) return kBuildDecodeBadValue;
+    }
     if (m.hostForm > kBuildHostIndoorsOnly || (m.hostKey.empty() && m.hostForm != 0) || m.outside > 1
         || m.floor < -kBuildMaxFloor || m.floor > kBuildMaxFloor)
         return kBuildDecodeBadValue;
@@ -592,7 +680,8 @@ inline int BuildDestroyedAction(int fromPlace, int msgDestroyed, int liveDestroy
     return liveDestroyed != 0 ? kBuildDestroyRepair : kBuildDestroyKeep;
 }
 /* P15: a repair order (TaskType 95) on a RUIN copy (a stand-in owns it) is help - the work reaches the owner's game as HELP_WORK with
-   the ruin reset; on a wall ruin copy it is refused (wall work is not synced, T-221). Any other order is not this rule's. */
+   the ruin reset; on a wall ruin copy it is refused (the owner's ruin reset is not carried for walls). Any other order is not this
+   rule's. */
 const int kBuildRepairOrderNone = 0, kBuildRepairOrderHelp = 1, kBuildRepairOrderRefused = 2;
 inline int BuildRepairOrderVerdict(int task, int standInOwned, int destroyed, int wall)
 {
@@ -604,12 +693,24 @@ inline int BuildRepairOrderVerdict(int task, int standInOwned, int destroyed, in
    sends its group's record); liveN = the copy's own needed. A complete STATE completes either kind (the engine's complete-now path).
    Otherwise an own-record copy takes the owner's share of its own needed, kept below 0.999 x liveN (the redraw completes a piece at
    progress >= needed); a shared-record copy, or a needed that is not a usable number, takes materials only. *progress = the value to
-   write for kBuildWallProgress. */
-const int kBuildWallMatsOnly = 0, kBuildWallProgress = 1, kBuildWallComplete = 2;
+   write for kBuildWallProgress and kBuildWallCompleteDamaged.
+   A complete STATE whose progress is below its needed is a hit wall (a hit lowers a complete wall's progress, its health): an
+   own-record copy is complete and takes the same share of its own needed (kBuildWallCompleteDamaged - a progress write, as the engine's
+   hit makes; no 0.999 cap, the piece stays complete). A shared-record copy is completed only: a progress write there would land in
+   every member's record, so it keeps materials only, as for an unfinished STATE. A complete STATE at its needed on an own-record copy
+   returns kBuildWallComplete with *progress = liveN: a copy a hit had lowered is put back to full health. */
+const int kBuildWallMatsOnly = 0, kBuildWallProgress = 1, kBuildWallComplete = 2, kBuildWallCompleteDamaged = 3;
 inline int BuildWallCopyAction(int ownState, int complete, float p, float n, float liveN, float* progress)
 {
     *progress = 0.0f;
-    if (complete != 0) return kBuildWallComplete;
+    if (complete != 0)
+    {
+        if (ownState == 0 || !(n > 0.0f && n < 3.0e38f) || !(liveN > 0.0f && liveN < 3.0e38f)) return kBuildWallComplete;   /* NaN fails too */
+        if (!(p < n)) { *progress = liveN; return kBuildWallComplete; }   /* whole again: full health, for a copy a hit had lowered */
+        const float hs = p / n;
+        *progress = (hs > 0.0f) ? hs * liveN : 0.0f;
+        return kBuildWallCompleteDamaged;
+    }
     if (ownState == 0) return kBuildWallMatsOnly;
     if (!(n > 0.0f && n < 3.0e38f) || !(liveN > 0.0f && liveN < 3.0e38f)) return kBuildWallMatsOnly;   /* NaN fails too */
     const float share = p / n;
@@ -618,6 +719,281 @@ inline int BuildWallCopyAction(int ownState, int complete, float p, float n, flo
     if (!(v <= cap)) v = cap;
     *progress = v;
     return kBuildWallProgress;
+}
+/* A melee hit on a wall (WallBuilding's 0x29D520, hooked): wall = the target is a WallBuilding; playerWall = a player owns it (this
+   game's player faction, or another player's stand-in); othersKnown = another player is known here (a stand-in exists); damageRead =
+   the damage struct's +0 / +4 were read; replay = the mod's own replay of a hit on the main thread. A player wall's hit is not run by
+   the engine where it lands: it is queued (kBuildHitRouteQueue) and the main thread asks who writes the wall. A town's or an unowned
+   wall, a lone game, the mod's replay and a damage struct that cannot be read take the engine's hit as it comes. */
+const int kBuildHitRouteEngine = 0, kBuildHitRouteQueue = 2;
+inline int BuildWallHitRoute(int wall, int playerWall, int othersKnown, int damageRead, int replay)
+{
+    if (wall == 0 || replay != 0 || playerWall == 0 || othersKnown == 0 || damageRead == 0) return kBuildHitRouteEngine;
+    return kBuildHitRouteQueue;
+}
+/* The game a HIT ask reached: dup = that asker's seq was replayed here already (answered again, not hit again); held = the piece has a
+   live registry row here (this game's own, or a copy); loaded = it is loaded here under its key and owned as its row says; destroyed = it
+   is a ruin; writer = this game writes the wall now (the machines' writer ask). kBuildHitApplied on a new seq = the hit is replayed
+   through the engine's own hit routine; kBuildHitNotWriter = the writer changed while the ask travelled. */
+inline int BuildHitVerdict(int dup, int held, int loaded, int destroyed, int writer)
+{
+    if (dup != 0) return kBuildHitApplied;
+    if (held == 0) return kBuildHitGone;
+    if (loaded == 0) return kBuildHitNotLoaded;
+    if (destroyed != 0) return kBuildHitRuin;
+    if (writer == 0) return kBuildHitNotWriter;
+    return kBuildHitApplied;
+}
+/* A HIT's DROP: the progress the writer's hit took, p0 - p1 read around its replay (never below 0; not a number = 0) */
+inline float BuildHitDrop(float p0, float p1)
+{
+    const float d = p0 - p1;
+    return (d > 0.0f && d < 3.0e38f) ? d : 0.0f;
+}
+/* A HIT RESULT on a game that did not run the hit. recOk = this game may write the wall's progress (the owner's own piece - the engine's
+   hit writes its record, a group's or not - or a copy holding its own record); drop = the result's drop; liveP = this game's live
+   progress. A ruin in the result ruins a whole wall here; otherwise a complete whole wall takes the drop off its own live health, so a
+   repair made here since the hit is kept; at <= 0 it is ruined, as the engine's hit ruins it (*to = 0). A ruin here is not made whole. */
+const int kBuildHitResNone = 0, kBuildHitResDestroy = 1, kBuildHitResProgress = 2;
+inline int BuildHitDropAction(int recOk, int msgDestroyed, int liveDestroyed, int liveComplete, float drop, float liveP, float* to)
+{
+    *to = liveP;
+    if (liveDestroyed != 0) return kBuildHitResNone;
+    if (msgDestroyed != 0) { *to = 0.0f; return kBuildHitResDestroy; }
+    if (recOk == 0 || liveComplete == 0 || !(drop >= 0.0f && drop < 3.0e38f) || !(liveP > -3.0e38f && liveP < 3.0e38f)) return kBuildHitResNone;
+    const float v = liveP - drop;
+    if (!(v > 0.0f)) { *to = 0.0f; return kBuildHitResDestroy; }
+    *to = v;
+    return kBuildHitResProgress;
+}
+/* Whether a HIT RESULT from slot `from` is taken here. verdict / writerSlot = this game's own writer ask for that wall (1 this game, 2
+   another game - writerSlot, 0 none); owed = the writer sends it again for a hit the owner's game did not take; owner = this game owns
+   the wall. A result is taken only from the game this game's ask names as the writer - a stale writer (during a holder change) or any
+   other game is refused, and the owner refuses one while it writes the wall itself. An owed result is the owner's only: its hit was
+   written while the owner's game did not have the piece loaded, whoever writes the wall now (BuildHitOwedApplies guards a double hit). */
+inline int BuildHitResultAccept(int verdict, int writerSlot, int from, int owed, int owner)
+{
+    if (from < 0) return 0;
+    if (owed != 0) return owner != 0 ? 1 : 0;
+    return (verdict == 2 && writerSlot == from) ? 1 : 0;
+}
+/* A health as a share of its needed (-1 = the needed or the health is not a usable number). Health is compared across games as a
+   share: a writer's copy and the owner's piece can hold records with different needed values (a group's, or the wall's own). */
+inline float BuildHitShare(float p, float n)
+{
+    if (!(n > 0.0f && n < 3.0e38f) || !(p > -3.0e38f && p < 3.0e38f)) return -1.0f;
+    return p / n;
+}
+const float kBuildHitShareEps = 1.0e-4f;   /* shares closer than this are the same health (float rounding across games) */
+/* liveP / liveN is above after / n (shares; with either one unusable, the raw values) */
+inline int BuildHitAbove(float liveP, float liveN, float after, float n)
+{
+    const float a = BuildHitShare(liveP, liveN), b = BuildHitShare(after, n);
+    if (a < 0.0f || b < 0.0f) return (liveP > after) ? 1 : 0;
+    return (a > b + kBuildHitShareEps) ? 1 : 0;
+}
+/* THE OWNER'S GAME: an owed result is applied once (seen = its seq from that writer was taken here) and only while this game's health
+   share is above the share the writer expects after the hits - a zone record the writer saved after them already carries them */
+inline int BuildHitOwedApplies(int seen, float liveP, float liveN, float after, float n)
+{
+    return (seen == 0 && BuildHitAbove(liveP, liveN, after, n) != 0) ? 1 : 0;
+}
+/* THE OWNER'S GAME: an owed result's new health - the summed raw drop off the live health, never below the writer's expected share of
+   this game's own needed, so a record that already carries part of the drop is lowered to the expected health and never past it, and a
+   repair made here since is kept. A ruin in the result, or a health at <= 0, ruins it (kBuildHitResDestroy); kBuildHitResProgress when
+   it lowers (*to = the value); kBuildHitResNone otherwise. */
+inline int BuildHitOwedTarget(int msgDestroyed, int liveComplete, float liveP, float liveN, float drop, float after, float n, float* to)
+{
+    *to = liveP;
+    if (msgDestroyed != 0) { *to = 0.0f; return kBuildHitResDestroy; }
+    if (liveComplete == 0 || !(drop >= 0.0f && drop < 3.0e38f) || !(liveP > -3.0e38f && liveP < 3.0e38f)) return kBuildHitResNone;
+    float v = liveP - drop;
+    const float s = BuildHitShare(after, n);
+    if (s >= 0.0f && liveN > 0.0f && liveN < 3.0e38f && v < s * liveN) v = s * liveN;
+    if (!(v < liveP)) return kBuildHitResNone;
+    if (!(v > 0.0f)) { *to = 0.0f; return kBuildHitResDestroy; }
+    *to = v;
+    return kBuildHitResProgress;
+}
+/* THE OWNER'S GAME: an own wall found again when its area loads here (the zone scan's walk of a newly loaded zone) owes one STATE
+   for that arrival - a game that wrote hits on it while it was not loaded here holds their drop until this game's STATE for the
+   wall reaches it (the writer's BuildHitOwedOnState). Only an own wall (not a copy, not removed) whose PLACE went out.
+   1 = its STATE goes now */
+inline int BuildOwnWallArriveState(int own, int copyHere, int removed, int sentOk, int isWall)
+{
+    return (own != 0 && copyHere == 0 && removed == 0 && sentOk != 0 && isWall != 0) ? 1 : 0;
+}
+/* TEST LEVER `buildtest progress` on a COMPLETE piece that is not a ruin: the engine's progress routine raises a complete piece's
+   health past its needed amount, so the lever sets the health itself - the live health plus amount, never above needed (an amount
+   at or past the gap repairs it to full; a health already above needed is put back to needed). kBuildTestRepairEngine = not this
+   case (an unfinished piece or a ruin keeps the engine's routine), kBuildTestRepairWrite = write *to, kBuildTestRepairNone = nothing
+   to change. */
+const int kBuildTestRepairEngine = 0, kBuildTestRepairWrite = 1, kBuildTestRepairNone = 2;
+inline int BuildTestRepairTarget(int complete, int destroyed, float p, float n, float amount, float* to)
+{
+    *to = p;
+    if (complete == 0 || destroyed != 0 || !(n > 0.0f && n < 3.0e38f) || !(p > -3.0e38f && p < 3.0e38f)) return kBuildTestRepairEngine;
+    float t = p;
+    if (p > n) t = n;
+    else if (amount > 0.0f) t = (amount >= n - p) ? n : p + amount;
+    *to = t;
+    return (t != p) ? kBuildTestRepairWrite : kBuildTestRepairNone;
+}
+/* THE WRITER'S GAME: what it owes the owner's game for one wall - ONE entry per (wall key, owner slot): the summed raw drop of every hit
+   it wrote there that the owner's game has not taken, and the owner's health it expects after them (expectP in units of needN: the
+   owner's last known health minus the sum, never below 0; 0 after a ruin). seq = the owed form's seq, drawn again whenever a hit is
+   added; the fresh results in the sum by their own seqs; the last owed send (its seq, sum and the number of hits it held). */
+struct BuildHitOwedRow
+{
+    std::string key;
+    int ownerSlot;
+    unsigned int seq;
+    float sum, expectP, needN;
+    unsigned char destroyed;
+    std::vector<unsigned int> hitSeqs;
+    std::vector<float> hitDrops;
+    unsigned int sentSeq;
+    float sentSum;
+    size_t sentCount;
+    int sent;
+    unsigned long sentAt;
+    BuildHitOwedRow() : ownerSlot(-1), seq(0), sum(0.0f), expectP(0.0f), needN(0.0f), destroyed(0), sentSeq(0), sentSum(0.0f), sentCount(0), sent(0), sentAt(0) {}
+};
+/* a hit's fresh result into the owed table: added to its wall's entry (the sum grows, the expected health falls by the drop, a new owed
+   seq) or a new entry whose expected health starts from baseP / baseN - the owner's last known health for the wall. Past cap entries the
+   oldest entry goes; past hitCap hits the oldest hit's seq is forgotten (its drop stays in the sum). Returns the entries dropped. */
+inline size_t BuildHitOwedAdd(std::vector<BuildHitOwedRow>* t, const std::string& key, int ownerSlot, unsigned int hitSeq, float drop, unsigned char destroyed,
+                              float baseP, float baseN, unsigned int owedSeq, size_t cap, size_t hitCap)
+{
+    BuildHitOwedRow* e = 0;
+    for (size_t i = 0; i < t->size(); ++i) if ((*t)[i].key == key && (*t)[i].ownerSlot == ownerSlot) e = &(*t)[i];
+    size_t dropped = 0;
+    if (e == 0)
+    {
+        if (cap == 0) return 1;
+        while (t->size() >= cap) { t->erase(t->begin()); ++dropped; }
+        BuildHitOwedRow r;
+        r.key = key; r.ownerSlot = ownerSlot; r.expectP = (baseP > 0.0f && baseP < 3.0e38f) ? baseP : 0.0f; r.needN = baseN;
+        t->push_back(r);
+        e = &t->back();
+    }
+    const float d = (drop > 0.0f && drop < 3.0e38f) ? drop : 0.0f;
+    e->sum += d;
+    e->expectP = (e->expectP - d > 0.0f) ? e->expectP - d : 0.0f;
+    if (destroyed != 0) { e->destroyed = 1; e->expectP = 0.0f; }
+    e->seq = owedSeq;
+    e->hitSeqs.push_back(hitSeq);
+    e->hitDrops.push_back(d);
+    while (e->hitSeqs.size() > hitCap)
+    {
+        e->hitSeqs.erase(e->hitSeqs.begin());
+        e->hitDrops.erase(e->hitDrops.begin());
+        if (e->sentCount > 0) --e->sentCount;
+    }
+    return dropped;
+}
+/* the entry's owed form is sent now */
+inline void BuildHitOwedMarkSent(BuildHitOwedRow* e, unsigned long now)
+{
+    e->sentSeq = e->seq; e->sentSum = e->sum; e->sentCount = e->hitSeqs.size(); e->sent = 1; e->sentAt = now;
+}
+/* the owner's game at slot answered seq for key. A verdict meaning it took the result (applied, ruin, faulted) takes it out of the
+   entry - the last owed send (its sum and its hits) or one fresh hit (its drop; the expected health stays, the owner holds the hit now);
+   the entry goes when nothing is left. Any other verdict ('not the writer', gone, not loaded) keeps it for the next owed round. */
+const int kBuildHitOwedNoMatch = 0, kBuildHitOwedTaken = 1, kBuildHitOwedKept = 2;
+inline int BuildHitOwedAnswer(std::vector<BuildHitOwedRow>* t, const std::string& key, unsigned int seq, int slot, int verdict)
+{
+    for (size_t i = 0; i < t->size(); ++i)
+    {
+        BuildHitOwedRow& e = (*t)[i];
+        if (e.key != key || e.ownerSlot != slot) continue;
+        size_t h = 0;
+        while (h < e.hitSeqs.size() && e.hitSeqs[h] != seq) ++h;
+        const int isSent = (e.sentSeq != 0 && e.sentSeq == seq) ? 1 : 0;
+        if (isSent == 0 && h == e.hitSeqs.size()) continue;
+        if (verdict != kBuildHitApplied && verdict != kBuildHitRuin && verdict != kBuildHitFaulted) return kBuildHitOwedKept;
+        if (isSent != 0)
+        {
+            e.sum -= e.sentSum;
+            const size_t n = (e.sentCount < e.hitSeqs.size()) ? e.sentCount : e.hitSeqs.size();
+            e.hitSeqs.erase(e.hitSeqs.begin(), e.hitSeqs.begin() + (std::ptrdiff_t)n);
+            e.hitDrops.erase(e.hitDrops.begin(), e.hitDrops.begin() + (std::ptrdiff_t)n);
+            e.sentSeq = 0; e.sentSum = 0.0f; e.sentCount = 0; e.sent = 0;
+        }
+        else
+        {
+            e.sum -= e.hitDrops[h];
+            if (h < e.sentCount) { --e.sentCount; e.sentSum -= e.hitDrops[h]; }
+            e.hitSeqs.erase(e.hitSeqs.begin() + (std::ptrdiff_t)h);
+            e.hitDrops.erase(e.hitDrops.begin() + (std::ptrdiff_t)h);
+        }
+        if (!(e.sum > 1.0e-6f)) e.sum = 0.0f;
+        if (e.hitSeqs.empty() && e.sum == 0.0f) t->erase(t->begin() + (std::ptrdiff_t)i);
+        return kBuildHitOwedTaken;
+    }
+    return kBuildHitOwedNoMatch;
+}
+/* THE WRITER'S GAME: the owner's STATE for a wall it owes (read from the owner's live piece, so the piece is loaded there), compared as
+   shares. At or below the expected share, or a ruin: cleared. Above it: sent again (owed) - not while the last send is younger than
+   gapMs and the owed seq has not changed since (seqChanged: a hit was added). */
+const int kBuildHitOwedKeep = 0, kBuildHitOwedClear = 1, kBuildHitOwedResend = 2;
+inline int BuildHitOwedOnState(float stateP, float stateN, int stateDestroyed, float after, float n, unsigned long now, unsigned long sentAt, int sent,
+                               int seqChanged, unsigned long gapMs)
+{
+    if (stateDestroyed != 0 || BuildHitAbove(stateP, stateN, after, n) == 0) return kBuildHitOwedClear;
+    if (sent != 0 && seqChanged == 0 && (unsigned long)(now - sentAt) < gapMs) return kBuildHitOwedKeep;
+    return kBuildHitOwedResend;
+}
+/* The writer's game: the seqs replayed for one asker, the newest last (a resend that crossed the answer is not hit twice) */
+inline int BuildHitSeen(const std::vector<unsigned int>& recent, unsigned int seq)
+{
+    for (size_t i = 0; i < recent.size(); ++i) if (recent[i] == seq) return 1;
+    return 0;
+}
+inline void BuildHitRemember(std::vector<unsigned int>* recent, unsigned int seq, size_t cap)
+{
+    if (BuildHitSeen(*recent, seq) != 0) return;
+    recent->push_back(seq);
+    while (recent->size() > cap) recent->erase(recent->begin());
+}
+/* The writer's game: the seqs replayed per asker slot (and, for results, the seqs taken per writer slot) (a seq is that asker's own number, so the slot is part of the key) */
+inline int BuildHitSeenBy(const std::map<int, std::vector<unsigned int> >& by, int slot, unsigned int seq)
+{
+    std::map<int, std::vector<unsigned int> >::const_iterator it = by.find(slot);
+    return (it != by.end() && BuildHitSeen(it->second, seq) != 0) ? 1 : 0;
+}
+inline void BuildHitRememberBy(std::map<int, std::vector<unsigned int> >* by, int slot, unsigned int seq, size_t cap)
+{
+    BuildHitRemember(&(*by)[slot], seq, cap);
+}
+/* A HIT is for the moment it was made: an ask (the asking game) or an arrived ask (the writer's game) older than limit ms is dropped,
+   never sent or replayed later. Tick counts, so a wrap between since and now still measures right. */
+inline int BuildHitExpired(unsigned long now, unsigned long since, unsigned long limit)
+{
+    return ((unsigned long)(now - since) >= limit) ? 1 : 0;
+}
+/* A copy WALL that this game's engine made a ruin is put back to the owner's last STATE only when the owner's STATE carries that
+   copy's health: the wall hit hook is installed (hits on copies go to the wall's writer) and the copy holds its own progress record
+   (a group's record takes no progress writes, so a put-back would stand at progress <= 0 and the next swing ruin it again). Otherwise
+   the ruin is kept. */
+inline int BuildWallRuinPutBack(int hookInstalled, int ownRecord)
+{
+    return (hookInstalled != 0 && ownRecord > 0) ? 1 : 0;
+}
+inline const char* BuildHitWord(int v)
+{
+    switch (v)
+    {
+    case 0: return "ask";
+    case 1: return "applied - the writer's engine took the hit (its STATE or result carries it)";
+    case 2: return "refused - the writer has no live row for the piece (removed, handed or unknown)";
+    case 3: return "refused - the piece is not loaded on the writer's game";
+    case 4: return "refused - the piece is a ruin on the writer's game";
+    case 5: return "refused - the engine's hit faulted on the writer's game";
+    case 6: return "refused - that game does not write the wall now (asked once more of the writer)";
+    case 7: return "result - the wall's state after the writer's hit";
+    default: return "?";
+    }
 }
 /* T-221: whether a wall's progress record is its alone. recIsOwn: 1 = the record (vt+0x228) is the wall's own (+0x160), 0 = another
    wall's, -1 unreadable; groupCount = the wall's group count (+0x390, the walls the engine's completion 0x561A20 completes after it),
@@ -1062,14 +1438,25 @@ inline bool BuildHelpRowStale(unsigned int rowNonce, unsigned int pieceNonce) { 
 /* help1 fold 3 (finding 6): pp.help's goneSeq floor (entries at or below it were settled by a HELP_GONE) joins a row only when both
    nonces are known and equal - never an unknown placement's floor onto another's entries */
 inline bool BuildHelpFloorApplies(unsigned int rowNonce, unsigned int recNonce) { return rowNonce != 0 && recNonce != 0 && rowNonce == recNonce; }
-/* help1 (owner 172) + fold (HIGH 2) + fold 2 (LOW 7): a build / add-materials order on a copy owned by another player's stand-in is help
-   (1) - refused on a wall copy (2) on EVERY order road (click, commit, Shift job, on the main thread or off it); anything else 0 */
+/* a piece's kind for the wall help rules: kBuildWallKindNone (not a wall), kBuildWallKindOwnRecord (a wall holding its own progress
+   record, ownRecord > 0 - BuildWallKeepsOwnRecord), kBuildWallKindGroup (a wall whose progress record is a group's, or unreadable).
+   The values are kBuildRepairWall*'s. */
+const int kBuildWallKindNone = 0, kBuildWallKindGroup = 1, kBuildWallKindOwnRecord = 2;
+inline int BuildWallHelpKind(int wall, int ownRecord)
+{
+    if (wall == 0) return kBuildWallKindNone;
+    return ownRecord > 0 ? kBuildWallKindOwnRecord : kBuildWallKindGroup;
+}
+/* a build / add-materials order on a copy owned by another player's stand-in is help (1) on EVERY order road (click, commit, Shift
+   job, on the main thread or off it) - a wall copy holding its own progress record too: its work reaches the owner's wall as help work
+   (F1011). A wall copy whose record is a group's, or unreadable (wallKind kBuildWallKindGroup), is refused (2): its work lands in the
+   group's shared record under the lead's key, which is not shown to reach the owner's wall. Anything else 0 */
 const int kBuildHelpOrderNone = 0, kBuildHelpOrderGiven = 1, kBuildHelpOrderWallRefused = 2;
-inline int BuildHelpOrderVerdict(int task, int standIn, int wall)
+inline int BuildHelpOrderVerdict(int task, int standIn, int wallKind)
 {
     if (task != kBuildTaskBuild && task != kBuildTaskAddMaterials) return kBuildHelpOrderNone;
     if (standIn == 0) return kBuildHelpOrderNone;
-    return (wall != 0) ? kBuildHelpOrderWallRefused : kBuildHelpOrderGiven;
+    return (wallKind == kBuildWallKindGroup) ? kBuildHelpOrderWallRefused : kBuildHelpOrderGiven;
 }
 /* T-903 (decisions 920 / 920 a, owner 2026-10-17): who may help build, add materials to and repair another player's piece - a
    faction-mate (the two players share a team), or a player the piece's owner has set FRIENDLY with the PLAYERS tab's friendly /
@@ -1081,6 +1468,61 @@ inline int HelpAllowedFor(int isTeammate, int isFriendly, int friendHelps)
     return (isTeammate != 0 || (friendHelps != 0 && isFriendly != 0)) ? 1 : 0;
 }
 inline int HelpAllowed(int isTeammate, int isFriendly) { return HelpAllowedFor(isTeammate, isFriendly, kBuildHelpFriendHelps); }
+/* T-903 (F1041), THE HELPER'S GAME: the help rule's answer for a running build / add-materials job on a copy another player's stand-in
+   holds, as the main thread hands it to the job hooks. ALLOWED (the rule says yes), REFUSED only for a KNOWN refusal - this game's own
+   slot is known and the team table is current (a faction-mate test is possible) and, while friends may help, the owner's stance towards this player has been read -
+   and UNKNOWN otherwise: a job is never ended on missing knowledge (the step refusal in the progress hook still guards the work). */
+const int kBuildHelpJobUnknown = 0, kBuildHelpJobAllowed = 1, kBuildHelpJobRefused = 2;
+inline int BuildHelpJobVerdictFor(int meKnown, int allowed, int stanceKnown, int friendHelps)
+{
+    if (allowed != 0) return kBuildHelpJobAllowed;
+    if (meKnown == 0) return kBuildHelpJobUnknown;
+    if (friendHelps != 0 && stanceKnown == 0) return kBuildHelpJobUnknown;
+    return kBuildHelpJobRefused;
+}
+inline int BuildHelpJobVerdict(int meKnown, int allowed, int stanceKnown) { return BuildHelpJobVerdictFor(meKnown, allowed, stanceKnown, kBuildHelpFriendHelps); }
+/* T-903 (F1041), ANY THREAD: end this build / add-materials job now (1) or let the engine run its step (0)? Only a job of THIS game's
+   own character (mine) on a piece a player's stand-in holds (standIn), and only on a REFUSED answer the main thread gave at most
+   freshMs ago (a stale or unknown answer runs the step, as before this rule). */
+inline int BuildHelpJobEnd(int standIn, int mine, int verdict, unsigned int ageMs, unsigned int freshMs)
+{
+    return (standIn != 0 && mine != 0 && verdict == kBuildHelpJobRefused && ageMs <= freshMs) ? 1 : 0;
+}
+/* T-903, THE HELPER'S GAME (MAIN THREAD, the K2 safe point): after a helper's job on a piece was ended, is this standing job of that
+   helper removed? Only a help job whose target is that piece (samePiece): build, add materials, repair, or the type the engine STORES a
+   kept job as - the order system's add-job (0x507C40) swaps a type its record marks 'can be a job' (+0x4) for the record's replacement
+   (+0xC), and build and repair are both kept as 125 (T1376: `standingTaskTypes=125` after a build and a repair order) - plus the
+   replacement and companion (+0x10) types the engine's own records name for build / add materials / repair, read live (extra, n).
+   Any other job stays (hauling, operating). */
+const int kBuildTaskKeptWork = 125;
+inline int BuildHelpStandingDrop(int task, int samePiece, const int* extra, int extraN)
+{
+    if (samePiece == 0 || task <= 0) return 0;
+    if (task == kBuildTaskBuild || task == kBuildTaskAddMaterials || task == kBuildTaskRepair || task == kBuildTaskKeptWork) return 1;
+    for (int i = 0; i < extraN; ++i) if (extra[i] > 0 && extra[i] == task) return 1;
+    return 0;
+}
+/* THE HELPER'S GAME, ANY THREAD: the engine's building finder for the kept build / repair job (TaskType 125) skips every building whose
+   faction is not the searching character's. Is the building taken as the character's own? Equal factions: always (the engine's own
+   path, kBuildJobFinderSame). Another faction: only when the character is of this game's player faction (charMine), the building's
+   faction is a stand-in with a row in the table the main thread writes (standInRow), that row's help answer is ALLOWED and at most
+   freshMs old, and the building is not a wall whose progress record is a group's or unreadable (wallGroup 1: help on such a wall copy
+   is refused on every order road); a wall holding its own record is taken as any building.
+   Unknown or stale answers, a refusal, another game's character or a building of any other faction keep the engine's skip. */
+const int kBuildJobFinderSame = 0, kBuildJobFinderAllowed = 1, kBuildJobFinderNotMine = 2, kBuildJobFinderNotStandIn = 3;
+const int kBuildJobFinderRefused = 4, kBuildJobFinderStale = 5, kBuildJobFinderWall = 6;
+inline int BuildJobFinderVerdict(int sameFaction, int charMine, int standInRow, int verdict, unsigned int ageMs, unsigned int freshMs, int wallGroup)
+{
+    if (sameFaction != 0) return kBuildJobFinderSame;
+    if (charMine == 0) return kBuildJobFinderNotMine;
+    if (standInRow == 0) return kBuildJobFinderNotStandIn;
+    if (verdict == kBuildHelpJobRefused) return kBuildJobFinderRefused;
+    if (verdict != kBuildHelpJobAllowed || ageMs > freshMs) return kBuildJobFinderStale;
+    if (wallGroup != 0) return kBuildJobFinderWall;
+    return kBuildJobFinderAllowed;
+}
+/* 1 = the finder goes on as for its own building, 0 = the engine's skip */
+inline int BuildJobFinderTakes(int verdict) { return (verdict == kBuildJobFinderSame || verdict == kBuildJobFinderAllowed) ? 1 : 0; }
 /* T-903 re-check fold (item 2), THE OWNER'S GAME, help work about to be applied: applied (0) for a faction-mate or a player the owner
    has set friendly; REFUSED (1, refunded) only for a KNOWN non-teammate the owner has not set friendly; HELD (2, tried again at the
    next safe point) while this game's own slot is unknown (no teammate test possible) or the sender's standing is unread (no stand-in
@@ -1106,14 +1548,70 @@ inline int BuildPieceDamaged(int complete, int destroyed, float progress, float 
     return (complete != 0 && destroyed == 0 && needed > 0.0f && progress < needed * 0.999f) ? 1 : 0;
 }
 /* T-903: a repair order (TaskType 95) on a copy another player's stand-in owns: on a ruin it is the P15 ruin help (1), on a complete
-   damaged piece it is repair help (3) - the work reaches the owner's game as HELP_WORK; on a wall either way it is refused (2, wall
-   work is not synced, T-221). Anything else 0. */
+   damaged piece it is repair help (3) - the work reaches the owner's game as HELP_WORK. wall: kBuildRepairWallNone (not a wall),
+   kBuildRepairWallGroup (a wall whose progress record is a group's, or cannot be read) - refused either way (2); kBuildRepairWallOwnRecord
+   (a wall copy holding its own record) - a damaged one is repair help (3), its ruin is refused (2: the ruin road resets the owner's
+   piece, which is not taken for walls). Anything else 0. */
 const int kBuildRepairOrderDamagedHelp = 3;
+const int kBuildRepairWallNone = 0, kBuildRepairWallGroup = 1, kBuildRepairWallOwnRecord = 2;
 inline int BuildRepairHelpVerdict(int task, int standInOwned, int destroyed, int damaged, int wall)
 {
     if (task != kBuildTaskRepair || standInOwned == 0 || (destroyed == 0 && damaged == 0)) return kBuildRepairOrderNone;
-    if (wall != 0) return kBuildRepairOrderRefused;
+    if (wall == kBuildRepairWallOwnRecord && destroyed == 0) return kBuildRepairOrderDamagedHelp;
+    if (wall != kBuildRepairWallNone) return kBuildRepairOrderRefused;
     return destroyed != 0 ? kBuildRepairOrderHelp : kBuildRepairOrderDamagedHelp;
+}
+/* THE OWNER'S GAME: whether help work's progress (build progress or repaired health) applies to this piece - any piece that is not a
+   wall; a wall only when it holds its own progress record (ownRecord > 0), so the work lands on this wall alone and the helper's
+   own-record copy measures against the same piece's own needed. A wall whose record is a group's (or unreadable) does not take it - a
+   write there lands in every member's shared record: repair work is dropped with its materials back to the helper, build work keeps
+   its materials only. */
+inline int BuildRepairWallApplies(int wall, int ownRecord)
+{
+    return (wall == 0 || ownRecord > 0) ? 1 : 0;
+}
+/* a progress step on a copy a stand-in holds, by help kind: an unfinished piece - build (amount above 0) or the add-materials task's
+   amount-0 call (materials); a complete ruin or complete damaged piece - repair (amount above 0); anything else -1 (a whole complete
+   piece, a negative amount, an amount-0 call on a complete piece). amountSign: -1, 0 or 1. */
+const int kBuildOffHelpBuild = 0, kBuildOffHelpMaterials = 1, kBuildOffHelpRepair = 2;
+inline int BuildHelpOffMainKind(int complete, int destroyed, int damaged, int amountSign)
+{
+    if (amountSign < 0) return -1;
+    if (complete == 0) return amountSign > 0 ? kBuildOffHelpBuild : kBuildOffHelpMaterials;
+    if (amountSign == 0) return -1;
+    return (destroyed != 0 || damaged != 0) ? kBuildOffHelpRepair : -1;
+}
+/* THE HELPER'S GAME: the owner's STATE on a wall copy and the repair-refused marker. A helper's own-record copy accepts its repair, while
+   an owner whose wall is grouped refuses it (BuildRepairWallApplies): the materials come back and the owner's health does not rise - the
+   marker is set (refundNow: this STATE handed materials back; copyComplete: the copy is complete, so the work was repair), and repair
+   orders and work on that wall are refused while it is set. Any change of the owner's health (prevP -> newP, ownerKnown) clears it. */
+const int kBuildWallRepHoldNone = 0, kBuildWallRepHoldSet = 1, kBuildWallRepHoldClear = 2;
+inline int BuildWallRepairHoldAct(int wall, int ownRecord, int copyComplete, int refundNow, int ownerKnown, float prevP, float newP)
+{
+    if (wall == 0) return kBuildWallRepHoldNone;
+    if (ownerKnown != 0 && newP != prevP) return kBuildWallRepHoldClear;
+    if (ownRecord > 0 && copyComplete != 0 && refundNow != 0) return kBuildWallRepHoldSet;
+    return kBuildWallRepHoldNone;
+}
+/* a bounded set of keys (the marker table): set (past cap the oldest go - returns how many), has, clear (1 = it was set) */
+inline int BuildKeyMarkHas(const std::vector<std::string>& t, const std::string& k)
+{
+    for (size_t i = 0; i < t.size(); ++i) if (t[i] == k) return 1;
+    return 0;
+}
+inline size_t BuildKeyMarkSet(std::vector<std::string>* t, const std::string& k, size_t cap)
+{
+    if (BuildKeyMarkHas(*t, k) != 0) return 0;
+    if (cap == 0) return 1;
+    size_t dropped = 0;
+    while (t->size() >= cap) { t->erase(t->begin()); ++dropped; }
+    t->push_back(k);
+    return dropped;
+}
+inline int BuildKeyMarkClear(std::vector<std::string>* t, const std::string& k)
+{
+    for (size_t i = 0; i < t->size(); ++i) if ((*t)[i] == k) { t->erase(t->begin() + (std::ptrdiff_t)i); return 1; }
+    return 0;
 }
 /* T-903, THE OWNER'S GAME: repair work (a HELP_WORK whose piece is complete here) - the piece's new health, never above needed */
 inline float BuildRepairApplyTo(float p0, float dP, float needed)
@@ -1146,17 +1644,18 @@ inline int BuildHelpMatGain(const float* now, int nNow, int baseOk, const float*
 }
 /* T-903, THE HELPER'S GAME: a copy's materials looked at on the main thread after the engine's add-materials task ran off it
    (or before an owner's STATE overwrites them). GONE: no live row or piece here (removed, not found); NOT_COPY: not a copy the owner's
-   stand-in holds; SKIP: a wall (wall work is not synced) or a dismantled piece; NO_BASE: the copy's baseline is not known yet - nothing
+   stand-in holds; SKIP: a grouped wall copy (wallGroup: its record is a group's or unreadable - its work is not carried) or a
+   dismantled piece; NO_BASE: the copy's baseline is not known yet - nothing
    can be measured, so nothing is taken and the baseline is left for the owner's next STATE to set; NO_GAIN: nothing above the baseline;
    RECORD: the help rule allows this player - help work for the owner; REFUSE: it does not - the materials come off the copy and the
    items go back. */
 const int kBuildHarvestGone = 0, kBuildHarvestNotCopy = 1, kBuildHarvestSkip = 2, kBuildHarvestNoGain = 3, kBuildHarvestRecord = 4, kBuildHarvestRefuse = 5,
           kBuildHarvestNoBase = 6;
-inline int BuildHelpHarvestVerdict(int found, int isCopy, int wall, int dismantled, int baseOk, int gained, int allowed)
+inline int BuildHelpHarvestVerdict(int found, int isCopy, int wallGroup, int dismantled, int baseOk, int gained, int allowed)
 {
     if (found == 0) return kBuildHarvestGone;
     if (isCopy == 0) return kBuildHarvestNotCopy;
-    if (wall != 0 || dismantled != 0) return kBuildHarvestSkip;
+    if (wallGroup != 0 || dismantled != 0) return kBuildHarvestSkip;
     if (baseOk == 0) return kBuildHarvestNoBase;
     if (gained == 0) return kBuildHarvestNoGain;
     return allowed != 0 ? kBuildHarvestRecord : kBuildHarvestRefuse;
@@ -1572,6 +2071,167 @@ inline int BuildForSaleKeep(int engineSays, int ownerIsStandIn) { return (engine
    -2 coop-peer, -1 any other id (an NPC, a town, this game's player - the engine's own answer stands). */
 inline int BuildRebuildHold(int firstIsBuildingState, int recordSlot) { return (firstIsBuildingState != 0 && (recordSlot >= 0 || recordSlot == -2)) ? 1 : 0; }
 inline int BuildRebuildOwnerSlot(int standInSlotOfId, int isLegacyPeerId) { return isLegacyPeerId != 0 ? -2 : (standInSlotOfId >= 0 ? standInSlotOfId : -1); }
+/* A KEPT PIECE'S OWNER AFTER A TOWN REBUILD. The hold above keeps another player's saved piece, but every rebuild (and every first build
+   of an area, or a dropped save) raises the area's fresh flag (zone +0xA8, 0x9FEC00), and createBuilding then gives a piece whose owner
+   is no player faction the town's faction (F941 / F942) - a stand-in is none. When the area finishes loading here, each row in it is
+   judged once. rowCurrent: not removed, not dismantled, this world's generation; rowKnown: a copy row on this world's copy list;
+   pending: a PLACE or a REMOVE for the key still waits; found: 1 the key named one live piece (not dismantled), 0 none, -1 more than
+   one or a malformed key (final), -2 not yet (a teardown, its host, its inside or its state not readable yet - the area is walked
+   again on its event, BuildRebuildRestoreWake), -3 the lookup's walk was cut (final); sidMatch: that piece's record id is the row's;
+   ownerClass: the live owner - kBuildRrOwnerRight the row's own, kBuildRrOwnerMine this game's player (on a copy row),
+   kBuildRrOwnerOther another stand-in or player, kBuildRrOwnerTown no player's (the town, an NPC faction, nobody); wantHere: the row's
+   owner faction exists here. A piece of this game's player or of another player is never taken. */
+const int kBuildRrOwnerRight = 0, kBuildRrOwnerMine = 1, kBuildRrOwnerOther = 2, kBuildRrOwnerTown = 3;
+const int kBuildRrNone = 0;        /* not looked at, or nothing to put back */
+const int kBuildRrRestore = 1;     /* the row's owner is written back */
+const int kBuildRrNotMine = 2;     /* the piece is this game's player's or another player's: left alone */
+const int kBuildRrAmbiguous = 3;   /* the key did not name exactly one piece of the row's record: left alone */
+const int kBuildRrNoOwner = 4;     /* the row's owner faction is not in this world now: looked at again when a stand-in is registered */
+const int kBuildRrNotYet = 5;      /* the key could not be answered yet: the area is walked again (BuildRebuildRestoreRetry) */
+const int kBuildRrCut = 6;         /* the lookup's walk was cut: a walk of the same area is cut the same way - final, counted */
+inline int BuildRebuildRestoreAct(int rowCurrent, int rowKnown, int pending, int found, int sidMatch, int ownerClass, int wantHere)
+{
+    if (rowCurrent == 0 || rowKnown == 0 || pending != 0 || found == 0) return kBuildRrNone;
+    if (found == -3) return kBuildRrCut;
+    if (found == -2) return kBuildRrNotYet;
+    if (found < 0 || sidMatch == 0) return kBuildRrAmbiguous;
+    if (ownerClass == kBuildRrOwnerRight) return kBuildRrNone;
+    if (ownerClass != kBuildRrOwnerTown) return kBuildRrNotMine;
+    return wantHere != 0 ? kBuildRrRestore : kBuildRrNoOwner;
+}
+/* the after-load pass with the re-make. A copy row (another player's piece) that is current, on the copy list (rowKnown: not marked
+   removed; listMain: its own entry, not an alias), with no PLACE / REMOVE waiting, whose owner's last word is not a ruin (ownerGone), and
+   whose key answered a COMPLETE empty search (found 0 with emptyComplete 1 - never a cut, truncated, torn or not-yet answer, nor a piece
+   being dismantled) is made again from its copy-list entry: the area was built from a record older than the piece. Every other answer is
+   BuildRebuildRestoreAct's, unchanged. */
+const int kBuildRrRemake = 7;      /* made again from the copy list (BdRemakeQueue) */
+inline int BuildRebuildRestoreChoose(int rowCurrent, int rowKnown, int listMain, int pending, int found, int emptyComplete, int ownerGone,
+                                     int sidMatch, int ownerClass, int wantHere)
+{
+    if (rowCurrent != 0 && rowKnown != 0 && listMain != 0 && pending == 0 && found == 0 && emptyComplete != 0 && ownerGone == 0) return kBuildRrRemake;
+    return BuildRebuildRestoreAct(rowCurrent, rowKnown, pending, found, sidMatch, ownerClass, wantHere);
+}
+/* a re-make queued at the pass is still owed when the PLACE road reaches it: its copy row stands (rowCopy: via 3, not this game's own;
+   rowGone: removed or dismantled), the copy list still knows it (not marked removed), and no REMOVE for it waits. 1 = make it */
+inline int BuildRemakeStillOwed(int rowCopy, int rowGone, int listKnown, int removePending)
+{
+    return (rowCopy != 0 && rowGone == 0 && listKnown != 0 && removePending == 0) ? 1 : 0;
+}
+/* a re-make inside a host counts the host's inside as loaded only on an explicit 'loaded' answer (insideState 1 - never 0, not loaded or
+   none, nor -1, a host that does not resolve or does not read); a free-standing re-make (furn 0) has no inside. The after-load pass and
+   the run ask the same. 1 = loaded */
+inline int BuildRemakeInsideOk(int furn, int insideState)
+{
+    return (furn == 0 || insideState == 1) ? 1 : 0;
+}
+/* the keys a free-standing re-make's run asks are the pass's: the builder's key (mainNone: it answered a complete empty search), then the
+   copy's own (live) key when it differs (hasOther; otherFound / otherNone: that key's answer). Inside a host both keys go to one search. */
+const int kBuildRemakeKeysNone = 0;    /* complete and empty at every key: made */
+const int kBuildRemakeKeysFound = 1;   /* the piece stands at its own key: taken on */
+const int kBuildRemakeKeysShort = 2;   /* an answer short of complete: waits */
+inline int BuildRemakeKeysAnswer(int mainNone, int hasOther, int otherFound, int otherNone)
+{
+    if (mainNone == 0) return kBuildRemakeKeysShort;
+    if (hasOther == 0) return kBuildRemakeKeysNone;
+    if (otherFound != 0) return kBuildRemakeKeysFound;
+    return (otherNone != 0) ? kBuildRemakeKeysNone : kBuildRemakeKeysShort;
+}
+/* a re-make with no piece found when it runs - free-standing or inside a host: made only when the host's inside is loaded
+   (BuildRemakeInsideOk) and every key asked answered a complete empty search (searchComplete); otherwise it waits, at most cap times
+   (triesSoFar: the waits before this one), then is given up - never made beside a piece it could not rule out */
+const int kBuildRemakeMake = 0, kBuildRemakeWait = 1, kBuildRemakeGiveUp = 2;
+inline int BuildRemakeRunGate(int furn, int insideState, int searchComplete, int triesSoFar, int cap)
+{
+    if (BuildRemakeInsideOk(furn, insideState) != 0 && searchComplete != 0) return kBuildRemakeMake;
+    return (triesSoFar + 1 >= cap) ? kBuildRemakeGiveUp : kBuildRemakeWait;
+}
+/* an entry ending now is a re-make ending without an outcome (remakeOut 0: not made, taken on, refused or faulted yet) - counted once,
+   by whatever ends it (the road: refused; a REMOVE, a PLACE merged in, a restore taking it over, the world torn down: dropped). 1 = count */
+inline int BuildRemakeEnds(int remake, int remakeOut)
+{
+    return (remake != 0 && remakeOut == 0) ? 1 : 0;
+}
+/* an area whose restore left rows not yet answerable waits for the event its rows wait for (BuildRebuildRestoreWake), then the zone scan
+   walks it again - at most cap passes an area a load (passesDone: the walks already woken for it), then its remaining rows are
+   counted and dropped. 1 = wait for the event */
+inline int BuildRebuildRestoreRetry(int notYetRows, int passesDone, int cap) { return (notYetRows > 0 && passesDone < cap) ? 1 : 0; }
+/* what a not-yet row waits for (waitKinds: the area's rows' kinds together). kBuildRrWaitTorn - a teardown answered the lookup: a zone
+   taken apart since the pass (tornMoved, ZoneTornGen). kBuildRrWaitInside - a host that did not resolve, or whose inside is not
+   loaded: walked again at each second of the zones tick (secondMoved) from the pass on, until the inside reads loaded.
+   kBuildRrWaitSecond - a state that would not read: the next second of the zones tick. 1 = walk it again */
+const int kBuildRrWaitTorn = 1, kBuildRrWaitInside = 2, kBuildRrWaitSecond = 4;
+inline int BuildRebuildRestoreWake(int waitKinds, int tornMoved, int secondMoved)
+{
+    if ((waitKinds & kBuildRrWaitTorn) != 0 && tornMoved != 0) return 1;
+    if ((waitKinds & (kBuildRrWaitInside | kBuildRrWaitSecond)) != 0 && secondMoved != 0) return 1;
+    return 0;
+}
+/* after the owner is back: what lays the row's state. An own row has none to ask (this game is its writer); a copy row with a STATE
+   already waiting keeps that one (it is newer); a copy whose owner's state was never applied here has none (owner only, counted); a
+   WALL copy made a ruin here whose owner's last word was whole stays a ruin where the owner's STATE does not carry its health
+   (wallRuinKept, as BdCopyDestroyedHere and BdApplyOne keep it); otherwise the owner's last STATE is queued on the STATE road. */
+const int kBuildRrStateOwn = 0, kBuildRrStateQueue = 1, kBuildRrStateHeld = 2, kBuildRrStateUnknown = 3, kBuildRrStateWallKept = 4;
+inline int BuildRebuildRestoreState(int isCopy, int ownerKnown, int stateHeld, int wallRuinKept)
+{
+    if (isCopy == 0) return kBuildRrStateOwn;
+    if (stateHeld != 0) return kBuildRrStateHeld;
+    if (ownerKnown == 0) return kBuildRrStateUnknown;
+    if (wallRuinKept != 0) return kBuildRrStateWallKept;
+    return kBuildRrStateQueue;
+}
+/* A BOUGHT HOUSE'S FURNITURE ON THE FRIEND'S GAME. The buyer's engine purchase (Building::buyMeCallback, build/decomp_7acb20.txt :166)
+   runs 0x54EA40(interior, 1) (build/decomp_54ea40.txt) on the interior's piece set (+0xE8): a hand that no longer resolves is dropped
+   from the set; a resolved piece is destroyed (GameWorld::destroy, reason "_destroyAllInternalBuildings") when its data type (vt+0x20)
+   is not a building's (0) or the hand its vt+0x438 returns has type 0xB (no object); otherwise it stays. objType: vt+0x20's answer;
+   stayHandType: that hand's type (-1 = not read). 1 = the engine destroys it. */
+inline int BuildTeardownEngineDestroys(int objType, int stayHandType) { return (objType != 0 || stayHandType == 0xB) ? 1 : 0; }
+/* the friend's teardown of one entry of that set (the friend's purchase replay). In this order: an entry that does not resolve is left alone (this
+   game does not drop it from the set); an entry whose owner BEFORE the house's owner write was a player's faction or a stand-in is kept
+   (ownerKeeps - the engine's Building::setFaction 0x556EC0 gives every building piece of the interior the new owner, so at the teardown
+   genuine town furniture already reads as the buyer's stand-in; the owner is recorded before that write); an entry with no key cannot be shown to be nobody's and stays; an entry this mod has a record of is kept (recordMatch: a
+   registry row by its live key or alias, a row within BoxKeyNearKey's window of it - a layout key drifts across a reload -, a row naming
+   this house as its host whose piece is this one, or a listed copy); else the engine's own rule decides. Entries of every type are
+   judged, as the engine judges them (an entry of another type reads objType != 0: the engine destroys it). engineDestroys: 1 the
+   engine's rule destroys it, 0 it keeps it, -1 the rule's reads faulted (kept). */
+const int kBuildTdDead = 2, kBuildTdKeepNoKey = 3, kBuildTdKeepPlayer = 4, kBuildTdKeepEngine = 5, kBuildTdRemove = 6, kBuildTdKeepOwner = 7, kBuildTdKeepNoErase = 8;
+/* the live owner keeps the entry: its read faulted (readOk 0 - not shown to be nobody's) or the owner is a player's or a stand-in */
+inline int BuildTeardownOwnerKeeps(int readOk, int ownerIsPlayers) { return (readOk == 0 || ownerIsPlayers != 0) ? 1 : 0; }
+/* the owner rule on the owner recorded BEFORE the house's owner write: an entry not in that record (inRecord 0) is judged by the key
+   rules only (0); else as BuildTeardownOwnerKeeps on the recorded read */
+inline int BuildTeardownOwnerBeforeKeeps(int inRecord, int readOk, int ownerIsPlayers) { return inRecord == 0 ? 0 : BuildTeardownOwnerKeeps(readOk, ownerIsPlayers); }
+inline int BuildTeardownPieceAct(int resolved, int ownerKeeps, int keyed, int recordMatch, int engineDestroys)
+{
+    if (resolved == 0) return kBuildTdDead;
+    if (ownerKeeps != 0) return kBuildTdKeepOwner;
+    if (keyed == 0) return kBuildTdKeepNoKey;
+    if (recordMatch != 0) return kBuildTdKeepPlayer;
+    return engineDestroys == 1 ? kBuildTdRemove : kBuildTdKeepEngine;
+}
+/* the purchase's room step (decomp_7acb20 :149-165) frees the user of every resolved BUILDING piece (the set node's hand type 0) before
+   the teardown, with no owner test - a player's piece the keep rule keeps too; the friend's game frees the same users, so both games
+   leave the same people in the same beds and cages. An unresolved entry (kBuildTdDead), an entry of another type and a second-set
+   entry (kBuildTdKeepNoErase - the room step walks the first set only) are not touched */
+inline int BuildTeardownFreesUsers(int act, int handType) { return (handType == 0 && act != kBuildTdDead && act != kBuildTdKeepNoErase) ? 1 : 0; }
+/* THE BUYER'S OWN PURCHASE. Building::buyMeCallback (decomp_7acb20 :166) calls 0x54EA40(interior, 1) at one call site, after the
+   house's owner write; that call is redirected so the buyer's game tears the house down by the friend's rule (the keep rule above),
+   and both games keep the same pieces. The mod's teardown runs only when this game armed it for this purchase (armed: the buy
+   detour, before the engine's purchase, with the owners recorded before its owner write), the call comes on the main thread, its
+   interior is the armed house's and it asks the sale rule (saleRule: the call's second argument, 1 at this site); anything else
+   gets the engine's own teardown. 1 = the mod's teardown runs. */
+inline int BuildBuyerTeardownRuns(int armed, int onMain, int interiorMatches, int saleRule)
+{
+    return (armed != 0 && onMain != 0 && interiorMatches != 0 && saleRule != 0) ? 1 : 0;
+}
+/* the room step inside the mod's teardown: the friend's road runs it (no engine purchase runs there); on the buyer's road the
+   engine's purchase has already run its own (decomp_7acb20 :149-165, every building piece of the set) before the call - not twice */
+inline int BuildTeardownRoomStepHere(int buyerRoad) { return buyerRoad != 0 ? 0 : 1; }
+/* the interior's second set (+0x128): 0x54EA40 erases every entry from it (0x574420) and destroys it, with no type test (decomp_54ea40
+   :128-139). The same keep rule judges each entry (engineDestroys 1); one it would remove is removed only when the set's erase can be
+   called (eraseRow) - a destroyed entry left in the set is a freed pointer there - else it is kept and counted (kBuildTdKeepNoErase) */
+inline int BuildTeardownSet2Act(int act, int eraseRow) { return (act == kBuildTdRemove && eraseRow == 0) ? kBuildTdKeepNoErase : act; }
+/* a teardown that could not judge the whole of a house that had pieces: the set held entries (setSize > 0) and the walk listed none,
+   was cut at its cap or was torn by a zone change - counted, so a capped line cannot hide it */
+inline int BuildTeardownBlind(long long setSize, int n, int truncated, int torn) { return (setSize > 0 && (n == 0 || truncated != 0 || torn != 0)) ? 1 : 0; }
 /* WHOSE STAND-IN A COPY BELONGS TO: the slot of the player whose PLACE made it (or whose REMOVE names a piece with no row here). fromSlot:
    the sender's slot as recorded when the message arrived (>= 0 a slot; kBuildSenderSessionPeer = the old game-to-game link's peer before
    its slot was known, ownerroute.h kAddrOwnerSessionPeer; -1 none). linkPeerSlot: that link peer's slot now (-1 unknown). The answer is

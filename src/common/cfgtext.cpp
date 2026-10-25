@@ -12,7 +12,7 @@ namespace coopcfg {
 CfgFields::CfgFields()
     : role(kCfgSingle), hostPort(0), storePort(0), slot("s1"), modSalt(0), profileTest(0), ownSave(1), joinViaWorld(0), routerPort(1),
       relayTestMode(kRelayTestNone), relayTestPort(0), relayLagMs(0), relayLossPct(0), relayTestCap(0), relayTestDials(0),
-      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0)
+      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0), benchCapKbs(0), netRateLog(0)
 {
     /* B13: playerId is deliberately EMPTY by default and never invented here. This is a text layer; the
        thing that generates an id is config.cpp, once, and it writes the file back when it does. */
@@ -399,6 +399,32 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
             {
                 ++bad;
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "parityholdsec='" + val + "' is not a number 0-600 - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "benchcapkbs")   /* TEST ONLY - see CfgFields::benchCapKbs; 0-1000000, one to seven digits; 0 = off */
+        {
+            long v = 0;
+            bool ok = !val.empty() && val.size() <= 7;
+            for (size_t i = 0; ok && i < val.size(); ++i)
+            {
+                if (val[i] < '0' || val[i] > '9') ok = false;
+                else v = v * 10 + (val[i] - '0');
+            }
+            if (ok && v <= 1000000) f.benchCapKbs = (int)v;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "benchcapkbs='" + val + "' is not a number 0-1000000 - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "netratelog")   /* TEST ONLY - see CfgFields::netRateLog; 1 or on = on, 0 or off = off */
+        {
+            if (val == "1" || val == "on") f.netRateLog = 1;
+            else if (val == "0" || val == "off") f.netRateLog = 0;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "netratelog='" + val + "' is not 1, on, 0 or off - ignored"; notes->push_back(nt); }
             }
         }
         else if (key == "sweepskip")   /* TEST ONLY - see CfgFields::sweepSkip; 0-64 printable characters, no space; empty = off */

@@ -128,6 +128,7 @@ void DumpVtableOnce(void* app)
     if (s_done || app == 0) return;
     s_done = true;
 
+#ifdef SW_DEV_BUILD   /* T-879 G: P020 is a DEV probe - the line's text and its building are the test build's only; the once-only flag stays in both */
     uintptr_t vt = *(uintptr_t*)app;
     if (!Ptr((void*)vt)) { SW_DEVLOG("[P020] vtable UNREADABLE"); return; }
 
@@ -143,7 +144,8 @@ void DumpVtableOnce(void* app)
         if (slot == g_setAppData) out += "  <== setAppearanceData";
         if (slot == g_updateApp)  out += "  <== updateAppearance";
     }
-    DebugLog(out);
+    SW_DEVLOG(out);   /* T-879 F: P020 is a DEV probe - test build only */
+#endif   /* SW_DEV_BUILD - T-879 G */
 }
 
 void* GetAppearanceObj(::Character* c)

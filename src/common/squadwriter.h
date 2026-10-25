@@ -144,31 +144,22 @@ inline int SupersedeOwnIdAfterHandover(int ownBlock, int handedOver)
     return (ownBlock != 0 && handedOver == 0) ? 1 : 0;
 }
 /* The wake hook: the wake of a squad I handed over is refused while another game holds its area (heldByOther, HeldByOtherTS at its file
-   position: 1 held, 0 not, -1 no fresh map), another player is in this world (othersPresent: store.cpp PlayersPresent - the old link or
-   the world server's roster) and it is a world faction's squad - the T-300 treatment (back on ice, thrown away on the next tick).
-   1 = refuse. */
-inline int HandedOverWakeRefuse(int handedOver, int heldByOther, int othersPresent, int worldFaction)
+   position: 1 held, 0 not, -1 no fresh map, -2 frozen) and it is a world faction's squad - the T-300 treatment (back on ice, thrown
+   away on the next tick). No player-count input: the same rule runs whoever else is in the world. 1 = refuse. */
+inline int HandedOverWakeRefuse(int handedOver, int heldByOther, int worldFaction)
 {
-    if (handedOver != 0 && heldByOther == -2 && worldFaction != 0) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - nothing of its area wakes here, whoever is present */
-    return (handedOver != 0 && heldByOther == 1 && othersPresent != 0 && worldFaction != 0) ? 1 : 0;
-}
-/* THE STALE-SQUAD DROP QUEUE's first test (store.cpp T300DropTick). A drop of another game's file or of a squad this game handed over
-   exists because another player runs those people live here, so it is cancelled while no other player is in this world
-   (othersPresent 0). 1 = go on to the re-check. */
-inline int StaleDropGoesOn(int othersPresent)
-{
-    return othersPresent != 0 ? 1 : 0;
+    if (handedOver != 0 && heldByOther == -2 && worldFaction != 0) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - nothing of its area wakes here */
+    return (handedOver != 0 && heldByOther == 1 && worldFaction != 0) ? 1 : 0;
 }
 /* THE STALE-SQUAD SWEEP (store.cpp T300SweepTick), armed when another player enters this world (the arrival record: the world server's
-   roster or the old link). armed: a sweep is owed; worldReady: a running world this game may write to; othersPresent: another player is
-   in this world now. The sweep waits for a world before it asks who is present, so an arrival seen while the world still loads is
-   not lost. */
-enum { kStaleSweepIdle = 0, kStaleSweepWait = 1, kStaleSweepDisarm = 2, kStaleSweepRun = 3 };
-inline int StaleSweepStep(int armed, int worldReady, int othersPresent)
+   roster or the old link). armed: a sweep is owed; worldReady: a running world this game may write to. The sweep waits for a world,
+   so an arrival seen while the world still loads is not lost, and then runs whoever is in the world by then: its own area test
+   (another game holds the area; a frozen one is skipped) decides each record. */
+enum { kStaleSweepIdle = 0, kStaleSweepWait = 1, kStaleSweepRun = 2 };
+inline int StaleSweepStep(int armed, int worldReady)
 {
     if (armed == 0) return kStaleSweepIdle;
-    if (worldReady == 0) return kStaleSweepWait;
-    return othersPresent != 0 ? kStaleSweepRun : kStaleSweepDisarm;
+    return worldReady == 0 ? kStaleSweepWait : kStaleSweepRun;
 }
 /* The sweep: a rebuilt non-player person of a squad I handed over is never adopted while another game runs a live copy of that squad
    here, or while the area is not known to be mine alone (heldByOther 1, or -1 no fresh map) - it is noted for the orphan clean-up.
@@ -430,15 +421,15 @@ inline int OtherGameFile(int mySlot, int owner, int blockOwner)
     return blockOwner == mySlot ? 0 : 1;
 }
 /* A full record another game wrote (owner a real slot, not mine) of a squad numbered in MY block (blockOwner == mySlot; blockOwner is the squad's origin slot, squadorigin.h), asleep here at a
-   position loaded here, with another player present, in an area another game holds (heldByOther 1), of a world faction's squad
+   position loaded here, in an area another game holds (heldByOther 1; a frozen one, -2, too), of a world faction's squad
    (worldFaction 1): the squad is left asleep where it is - not moved into that area and woken (the orphan purge would empty the woken
    copy), not thrown away (OtherGameFile keeps it: it is my own squad). The record is kept; the squad's wake loads it once that game lets
    go. No slot of my own: 0. 1 = leave it asleep. */
-inline int OwnBlockRecvHold(int mySlot, int owner, int blockOwner, int playersPresent, int heldByOther, int worldFaction)
+inline int OwnBlockRecvHold(int mySlot, int owner, int blockOwner, int heldByOther, int worldFaction)
 {
     if (mySlot < 0 || owner < 0 || owner == mySlot || blockOwner != mySlot) return 0;
-    if (heldByOther == -2 && worldFaction == 1) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - left asleep, whoever is present */
-    return (playersPresent != 0 && heldByOther == 1 && worldFaction == 1) ? 1 : 0;
+    if (heldByOther == -2 && worldFaction == 1) return 1;   /* frozen (coopdrop::kAreaFrozen): the holder is a player not in the world - left asleep */
+    return (heldByOther == 1 && worldFaction == 1) ? 1 : 0;
 }
 
 /* The store authority's 1 Hz walk of sleeping squads (PublishSleepingPositions) sends a sleeping squad's position as the

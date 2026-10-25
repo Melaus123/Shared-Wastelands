@@ -858,6 +858,8 @@ static void ZonesLogLoadedChange(const std::vector<loadedzones::Area>& areas, in
     DebugLog("[ZONES] loaded set: " + N((long long)src.total) + " area(s) from " + from + "; outside the watched character's 7x7 around "
              + SectorString(g_playerSector) + ": " + N((long long)src.outsideRing) + " list=" + list);
 }
+long long g_zonesSeconds = 0;   /* T-492, MAIN THREAD: the seconds ZonesTick spent (its once-a-second work ran) */
+long long ZonesSecondCount() { return g_zonesSeconds; }
 void ZonesTick()
 {
     ++g_tick;
@@ -891,6 +893,7 @@ void ZonesTick()
         }
     }
     lastReport = nowR;   /* review-p4y MEDIUM-2: the second is spent HERE, below the last bail-out - a tick that reported nothing must not consume it */
+    ++g_zonesSeconds;
     ++g_ticks;   /* review-p5a MEDIUM-3: the clock is spent here, so the count belongs here too - g_ticks is REPORTS again, not frames spent inside a bail-out window (the bail-out counters below stay frames, which is what they are) */
     g_playerSector = SectorOf(px, pz);
     std::vector<Sector> loaded;
@@ -958,6 +961,7 @@ void ZonesTick()
     if (orphan != 0) { g_playerSectorTS.x = -1; g_playerSectorTS.y = -1; g_peerSectorTS.x = -1; g_peerSectorTS.y = -1; }   /* T-306: orphaned, there is no player to draw a halo round (ForgetPlayerHaloTS above) - keep it cleared */
     ::LeaveCriticalSection(&g_heldLock);
     // PROBE-START: P025
+#ifdef SW_DEV_BUILD   /* T-879 A: the P025 eye (every 10 s) is the test build's only - a DEV probe; its clock and reads feed only this line */
     /* P025 (F527/E13): the client is refused throughout its own town both before and after the relay names it holder. This
        samples the SAME view the refusal path reads, for the player's own sector, every 10 s on the main thread - so the
        refusals have a continuous background to be read against instead of eight isolated lines. */
@@ -985,6 +989,7 @@ void ZonesTick()
             bP[255] = 0; DebugLog(bP);
         }
     }
+#endif   /* T-879 A */
     // PROBE-END: P025
     std::string list;
     for (size_t i = 0; i < loaded.size(); ++i) { if (i) list += " "; list += SectorString(loaded[i]); }
@@ -1022,6 +1027,7 @@ void ZonesTick()
         for (size_t i = 0; i < loaded.size(); ++i) { xy.push_back(loaded[i].x); xy.push_back(loaded[i].y); }
         const bool sentAreas = StoreSendAreas(xy.empty() ? 0 : &xy[0], (int)loaded.size(), sendX, sendY);   /* T-306 fold 1: sendX/sendY - the live sector, or unknown from the second orphaned tick */   /* decision 32: the notebook keeps the map */   /* E25: and the player sector, out of the same tick as the halo above */
         if (sentAreas) ++g_areasSent;
+        if (sentAreas && StoreAreasTaken() != 0) ZonesNoteReported(loaded);   /* fold 3 (T1506): what the world server now reads as loaded here - the piece writer's question; fold 4 (review): only a report the world server takes (JoinAreasAdmit) */
         if (sentAreas) { g_lastSentAny = 1; g_lastSentX = sendX; g_lastSentY = sendY; if (sendUnknown != 0) ++g_orphanSentUnknown; }   /* T-306 fold 1: for the VERDICT */
         if (sentAreas && xy.empty()) ++g_areasSentEmpty;
         if (sentAreas) g_areasLastNonEmpty = xy.empty() ? 0 : 1;   /* M6 fold 1: what ZonesAreasLeave reads */
@@ -1207,6 +1213,72 @@ int MineHeldTS(const Sector& s)
 // already read .size() can dereference freed heap. g_loadedHere is the SAME set as a fixed grid, written under g_heldLock at
 // the one place g_loaded changes, so the two cannot disagree. No clock is applied: unlike the relay's maps, this game's own
 // loaded set is never stale, only empty. Out of range answers 0, exactly as the other any-thread queries above do.
+/* fold 3 (T1506): WHEN THIS GAME LAST SENT A LOADED REPORT NAMING EACH AREA - the world server reads 'loaded' from that report
+   (lastSeen within kGraceSec), so the piece writer asks this, not the engine's active list. Written at the send, under g_heldLock. */
+double g_reportedAt[64][64];   /* 0 = never */
+/* fold 4 (review): each taken report is numbered (an event for the piece writer), each area keeps the number of the last one naming
+   it, and the stamps belong to one link (cleared at a link change and at world teardown) */
+unsigned g_reportSeqAt[64][64];
+unsigned g_reportSeq = 0;
+long g_reportedLinkGen = -1;
+/* fold 4 (review): THE LAST AREA MAP VERBATIM - its holder column (a frozen holder too: the world server still names the restored
+   holder, store_main.cpp AreaMapBuild) and its loaded masks, no freshness clock (ageing is no event); one link's */
+int g_pmHolder[64][64];
+unsigned g_pmMask[64][64][coopdrop::kAreaMaskWords];
+unsigned g_pmSeq = 0;
+long g_pmLinkGen = -1;
+int g_pmHave = 0;
+static void PieceMapRawClearLocked()
+{
+    for (int x = 0; x < 64; ++x) for (int y = 0; y < 64; ++y) g_pmHolder[x][y] = -1;
+    std::memset(g_pmMask, 0, sizeof(g_pmMask));
+}
+static void ZonesReportedClearLocked()
+{
+    std::memset(g_reportedAt, 0, sizeof(g_reportedAt));
+    std::memset(g_reportSeqAt, 0, sizeof(g_reportSeqAt));
+}
+void ZonesNoteReported(const std::vector<Sector>& loaded)
+{
+    const double now = NowSec();
+    const long lg = (long)StoreLinkGen();
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    if (lg != g_reportedLinkGen) { ZonesReportedClearLocked(); g_reportedLinkGen = lg; }   /* fold 4 (review): another link's stamps are gone */
+    if (++g_reportSeq == 0) g_reportSeq = 1;
+    for (size_t i = 0; i < loaded.size(); ++i)
+        if (loaded[i].x >= 0 && loaded[i].x < 64 && loaded[i].y >= 0 && loaded[i].y < 64)
+        { g_reportedAt[loaded[i].x][loaded[i].y] = now > 0.0 ? now : 1e-9; g_reportSeqAt[loaded[i].x][loaded[i].y] = g_reportSeq; }
+    ::LeaveCriticalSection(&g_heldLock);
+}
+double SectorReportedAgoTS(const Sector& s)
+{
+    if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return -1.0;
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    const double at = (g_reportedLinkGen == (long)StoreLinkGen()) ? g_reportedAt[s.x][s.y] : 0.0;
+    ::LeaveCriticalSection(&g_heldLock);
+    if (!(at > 0.0)) return -1.0;
+    const double age = NowSec() - at;
+    return age < 0.0 ? 0.0 : age;
+}
+unsigned ZonesReportSeqTS()
+{
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    const unsigned n = g_reportSeq;
+    ::LeaveCriticalSection(&g_heldLock);
+    return n;
+}
+unsigned SectorReportSeqTS(const Sector& s)
+{
+    if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return 0;
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    const unsigned n = (g_reportedLinkGen == (long)StoreLinkGen()) ? g_reportSeqAt[s.x][s.y] : 0u;
+    ::LeaveCriticalSection(&g_heldLock);
+    return n;
+}
 int SectorLoadedHereTS(const Sector& s)
 {
     if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return 0;
@@ -1412,8 +1484,10 @@ namespace coop { void ZonesForgetHeldGrid(int keepRelayGrid)
         std::memset(g_mineHeld, 0, sizeof(g_mineHeld));
         OwnerSlotClear();   /* M7b slice 2 */
         std::memset(g_effMask, 0, sizeof(g_effMask));   /* W1-b: the effective map is the relay grid's source, so it goes when the relay grid goes and is kept when it is kept */
+        PieceMapRawClearLocked(); g_pmHave = 0;   /* fold 4 (review): the piece writer's copy of the last map goes with it */
     }
     std::memset(g_loadedHere, 0, sizeof(g_loadedHere));
+    ZonesReportedClearLocked();   /* fold 4 (review): this world's loaded-report stamps go at its teardown */
     g_playerSectorTS.x = -1; g_playerSectorTS.y = -1; g_peerSectorTS.x = -1; g_peerSectorTS.y = -1;   /* E13 attempt 2: the player's sector is stale world state too, and it is cleared UNDER THE LOCK because a worker reads it. E25: the peer's with it */
     ::LeaveCriticalSection(&g_heldLock);
     g_loaded.clear(); g_playerSector.x = -1; g_playerSector.y = -1;
@@ -1859,6 +1933,7 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
     std::memset(g_otherLoaded, 0, sizeof(g_otherLoaded));
     std::memset(g_mineHeld, 0, sizeof(g_mineHeld));
     OwnerSlotClear();   /* M7b slice 2: cleared with the grids it sits beside */
+    PieceMapRawClearLocked(); g_pmHave = 1; g_pmLinkGen = (long)StoreLinkGen(); if (++g_pmSeq == 0) g_pmSeq = 1;   /* fold 4 (review): every applied map, an empty one too, is an event */
     const double nowSec = NowSec();
     if (count == 0)
     {
@@ -1885,6 +1960,8 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
         if (o >= 0 && o != mySlot) g_hostHeld[x][y] = 1;
         if (o >= 0 && mySlot >= 0 && o == mySlot) g_mineHeld[x][y] = 1;   /* decision 35: the areas I hold, read back out of the same owner column */
         g_ownerSlot[x][y] = (o >= 0) ? o : -1;   /* M7b slice 2: this row's owner column verbatim, any slot (S2-67); -1 = the row names nobody */
+        g_pmHolder[x][y] = (o >= 0) ? o : -1;   /* fold 4 (review): verbatim, a frozen holder too */
+        for (int pw = 0; pw < coopdrop::kAreaMaskWords; ++pw) g_pmMask[x][y][pw] |= mask[pw];
         if (o >= 0 && o != mySlot)
         {
             const std::map<int, int>::const_iterator fz = frozenOfSlot.find(o);
@@ -1923,6 +2000,30 @@ int ApplyRelayAreaMap(const char* msg, int bytes, int mySlot)
    notebook's EFFECTIVE loaded map for this sector (the mask ApplyRelayAreaMap keeps, both games from the same maps). ANY THREAD.
    1 set, 0 clear (M9: also a slot with no column), -1 no fresh map (the same 5 s clock PeerSectorLoadedTS reads), a sector out of
    range or a negative slot. M9f1 */
+/* fold 4 (review): the last area map of this link exactly as the world server sent it (see g_pmHolder) */
+int AreaMapRawViewTS(const Sector& s, int slot, int* holderOut)
+{
+    if (holderOut != 0) *holderOut = -1;
+    if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64) return -1;
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    int on = -1;
+    if (g_pmHave != 0 && g_pmLinkGen == (long)StoreLinkGen())
+    {
+        if (holderOut != 0) *holderOut = g_pmHolder[s.x][s.y];
+        on = (slot < 0) ? 0 : coopdrop::AreaMaskTest(g_pmMask[s.x][s.y], coopdrop::AreaSeatOfSlot(g_areaBook.slotOfSeat, slot));
+    }
+    ::LeaveCriticalSection(&g_heldLock);
+    return on;
+}
+unsigned PieceMapSeqTS()
+{
+    HeldLockInit();
+    ::EnterCriticalSection(&g_heldLock);
+    const unsigned n = g_pmSeq;
+    ::LeaveCriticalSection(&g_heldLock);
+    return n;
+}
 int SlotMapLoadedTS(const Sector& s, int slot)
 {
     if (s.x < 0 || s.x >= 64 || s.y < 0 || s.y >= 64 || slot < 0) return -1;   /* M9 (T-197): any slot - its seat is looked up below */

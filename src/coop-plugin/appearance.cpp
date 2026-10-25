@@ -759,6 +759,7 @@ static void P091CreateBodyNote(void* app)
         claimed = 1;
         if (::InterlockedIncrement(&g_p091Lines) <= kP091LineCap)
         {
+#ifdef SW_DEV_BUILD   /* T-879 G: P091 is a DEV probe - the line's text and its building are the test build's only; the counters and cap above stay in both */
             char buf[384];
             _snprintf(buf, sizeof(buf) - 1,
                       "[P091] createBody copy uid=%u thread=%s isRagdoll=%d prone=%d limp=%d app[141,142,143,E8]=%d,%d,%d,%d"
@@ -766,7 +767,8 @@ static void P091CreateBodyNote(void* app)
                       uid, onMain ? "main" : "off", sn.ragdoll, sn.prone, sn.limp, sn.b141, sn.b142, sn.b143, sn.bE8,
                       msApp, msKnock, appIsCurrent, (long)g_p091CreateBodyCopy, (long)g_p091CreateBodyCopyRagdoll);
             buf[sizeof(buf) - 1] = 0;
-            DebugLog(buf);
+            SW_DEVLOG(buf);   /* T-879 F: P091 is a DEV probe - test build only; its counters are unchanged */
+#endif   /* SW_DEV_BUILD - T-879 G */
         }
         P091ReleaseLog();
         claimed = 0;
@@ -791,6 +793,7 @@ void P091NoteKnock(unsigned int uid, ::Character* c, int branch)
     if (branch == -1 && pending) ::InterlockedIncrement(&g_p091KnockLimpRebuild);
     if (!changed) return;
     if (::InterlockedCompareExchange(&g_p091Lines, 0, 0) >= kP091LineCap) return;
+#ifdef SW_DEV_BUILD   /* T-879 G: P091 is a DEV probe - the line's text and its building are the test build's only; the cap count stays in both */
     const char* name = (branch == -1) ? "limpEarly" : (branch == 0) ? "none" : (branch == 1) ? "wait1" : (branch == 2) ? "wait2" : "?";
     const std::string line = "[P091] knock uid=" + S((long long)uid) + " branch=" + name + (fresh ? " (new knockdown)" : " (changed)")
         + " isRagdoll=" + S((long long)sn.ragdoll) + " prone=" + S((long long)sn.prone) + " limp=" + S((long long)sn.limp)
@@ -798,7 +801,11 @@ void P091NoteKnock(unsigned int uid, ::Character* c, int branch)
         + "," + S((long long)sn.bE8) + " msSinceAppearance=" + S(P091MsSince(r->appAt))
         + " knockLimpWithRebuildPending=" + S((long long)g_p091KnockLimpRebuild);
     if (!P091ClaimLog()) return;
-    if (::InterlockedIncrement(&g_p091Lines) <= kP091LineCap) DebugLog(line);
+    if (::InterlockedIncrement(&g_p091Lines) <= kP091LineCap) SW_DEVLOG(line);   /* T-879 F: P091 - test build only */
+#else
+    if (!P091ClaimLog()) return;
+    ::InterlockedIncrement(&g_p091Lines);   /* the cap count, as in the test build */
+#endif   /* SW_DEV_BUILD - T-879 G */
     P091ReleaseLog();
 }
 

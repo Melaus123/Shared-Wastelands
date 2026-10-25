@@ -33,6 +33,7 @@ void SetWireRelayedSender(int slot);          // M5a fold 1, MAIN THREAD: the wi
 int  StandInRecordSlot(::Faction* f);         // inv4 fold, ANY THREAD: the slot a faction's record id "coop-p<n>" names (table or not); -2 coop-peer, -1 other, -3 unreadable
 int  StandInSlotOf(::Faction* f);             // ANY THREAD: a stand-in's slot (one created or reused here); -1 for anything else
 ::Faction* StandInForSlot(int slot);          // MAIN THREAD: that slot's stand-in (created or reused here), 0 if none yet
+unsigned int StandInRegistrations();          // MAIN THREAD: how many times a stand-in was put in the table (only rises) - a new value = a stand-in appeared or changed
 const int kStandInTableCap = 32;              // T-356: the stand-in table's bound (one per player slot this world has seen)
 int  StandInList(int* slots, ::Faction** out, int cap);   // T-356, MAIN THREAD: every stand-in in the table (slot, faction), at most cap; the count
 bool LegacyPeerFactionExists();              // MAIN THREAD: the loaded world carries a protocol-67 "coop-peer" faction (asked by id)

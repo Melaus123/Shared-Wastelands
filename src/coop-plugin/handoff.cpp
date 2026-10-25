@@ -2351,10 +2351,11 @@ void SquadLeaderSafePointDrain()
     }
 }
 // Owner 110 (see handoff.h). "Ground loaded here" = IsPositionLoadedHere (zones.cpp): the engine's own
-// ZoneManager::isZoneLoadedT answer for the member's position - the mod's existing loaded-position test.
+// ZoneManager::isZoneLoadedT answer for the member's position - the mod's existing loaded-position test. The same walk whatever
+// the number of players in the world: a copy squad is one whose members are all copies of characters another game runs.
 void CopySquadKeepAwake(void* faction)
 {
-    if (faction == 0 || !coop::PlayersPresent()) return;
+    if (faction == 0) return;
     const DWORD nowMs = ::GetTickCount();
     std::map<void*, DWORD>::iterator t = g_keepAwakeAt.find(faction);
     if (t != g_keepAwakeAt.end() && nowMs - t->second < 1000) return;

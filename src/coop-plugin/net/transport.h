@@ -397,6 +397,10 @@ public:
     virtual void SetBundling(bool /*on*/) {}
     /* M13: what bundling did on this link as one REPORT token (" bundle[...]"); empty for a link that never bundles. */
     virtual std::string BundleToken() { return std::string(); }
+    /* Which [NET] TRAFFIC REPORT line this link's messages are counted on: nettally::kLinkSession / kLinkWorld / kLinkBridge
+       (src/common/typetally.h). SetStoreLink makes a link the world link; a hosting game's bridge marks its own links. Counting
+       only - nothing sent changes. A no-op for a backend without the tally. */
+    virtual void SetTrafficLink(int /*link*/) {}
 
     /* What this link still holds undelivered: messages handed to it and not yet sent (those waiting in M16's bound included),
        and guaranteed ones sent but not yet acknowledged - `packets` pieces (a large message travels in several) of `bytes` in all. A sender of bulk data that can
@@ -415,6 +419,9 @@ public:
 
 // Factory: the player's choice, made explicit. No default argument, deliberately.
 ITransport* CreateTransport(BackendId which);
+/* One [NET] TRAFFIC REPORT line per kind of link that carried a message since the last call (src/common/typetally.h), then a new
+   window. MAIN THREAD. Defined in net/enet_transport.cpp. */
+void TrafficReportTick();
 
 const char* MsgTypeName(MsgType t);
 const char* LinkStateName(LinkState s);

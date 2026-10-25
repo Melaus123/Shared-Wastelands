@@ -1,5 +1,6 @@
 /* src/common/storemeta.cpp - see storemeta.h. Pure: no globals, no OS, no engine. C++03. */
 #include "storemeta.h"
+#include "squadbirth.h"   /* the birth flag's field 16 text */
 
 #include <cstdio>
 #include <cstdlib>
@@ -87,7 +88,7 @@ unsigned int Crc32(const void* data, std::size_t n)
 }
 
 MetaLine::MetaLine()
-    : version(0), writtenAt(0), posAt(0), owner(0), x(0.0f), y(0.0f), z(0.0f), len(0), crc(0), seq(0) {}
+    : version(0), writtenAt(0), posAt(0), owner(0), x(0.0f), y(0.0f), z(0.0f), len(0), crc(0), seq(0), birth(-1) {}
 
 FolderFacts::FolderFacts()
     : metaState(kFileAbsent), haveMeta(0),
@@ -176,7 +177,8 @@ static bool MetaEncodeTagged(const char* tag, int seqField, const MetaLine& m, s
     std::sprintf(hex, "%08x", (unsigned int)(m.len > 0 ? m.crc : 0u));
     o << hex;
     if (seqField != 0) o << "\t" << m.seq;   /* B12: field 14, appended - see storemeta.h */
-    if (seqField != 0 && !m.home.empty()) o << "\t" << m.home;   /* field 15, only when the record has a home - see storemeta.h */
+    if (seqField != 0 && (!m.home.empty() || m.birth >= 0)) o << "\t" << m.home;   /* field 15 when the record has a home, or empty ahead of field 16 - see storemeta.h */
+    if (seqField != 0 && m.birth >= 0) o << "\t" << sqbirth::BirthField(m.birth);   /* field 16, only when the squad's birth flag is known */
     o << "\n";
     *out = o.str();
     return true;
@@ -295,6 +297,7 @@ bool MetaParse(const std::string& line, MetaLine* out)
     }
     /* field 15 of a v7 line: the home building key, optional (storemeta.h); StripCr above has run on it when it is the last field */
     if (version >= 7 && f.size() >= 15) m.home = f[14];
+    if (version >= 7 && f.size() >= 16) m.birth = sqbirth::BirthOfField(f[15]);   /* field 16: the birth flag, optional; any other text is unknown */
     if (m.worldId.empty()) return false;
     *out = m;
     return true;

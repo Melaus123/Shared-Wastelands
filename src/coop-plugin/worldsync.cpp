@@ -133,6 +133,11 @@ long long g_noFaction   = 0;
 long long g_sendFailed  = 0;
 long long g_registerFailed = 0;   // registrations refused - counted and skipped; never stops the sweep (mirror1 fold, review-mirror1 #3)
 bool g_sweepComplete = false;
+static long long g_sweepOwnAdopted = 0;        /* this game's own player-faction characters the sweep adopted (REPORT) */
+static long long g_sweepWorldAdopted = 0;      /* every other character the sweep adopted (REPORT) */
+static long long g_sweepOwnThisLoad = 0;       /* the same two, this world load only: the once-per-load line's counts */
+static long long g_sweepWorldThisLoad = 0;
+static bool g_sweepLoadLogged = false;         /* that line was written for this world load */
 bool g_refusedClient = false;   // host-only guard, reported once
 
 // P034 - IS THE STALE-POINTER PROBLEM REAL? A PROBE, NOT A FIX.
@@ -649,6 +654,46 @@ int SweepAdoptGen(unsigned int uid, long* gen)
     *gen = it->second; return 1;
 }
 void ForgetSweepAdopt(unsigned int uid) { g_sweepAdoptGen.erase(uid); }
+/* T-1007 (J): THE 'NUMBER NEXT' LIST - trader squads (active platoons, compared only, never read through) a trade window found with
+   unnumbered members (items.cpp ShopCaravanHolderAt). The sweep takes their unnumbered people after this game's own characters and
+   before any other, under every one of its own exclusions, its area rule and its radius. A squad a full scan finds no takeable
+   unnumbered person of leaves the list; at most kNumberNextCap, the oldest out first. MAIN THREAD. */
+static std::vector<const void*> g_numberNext;
+static std::vector<char> g_numberNextSeen;
+static const size_t kNumberNextCap = 16;
+void SweepNumberNext(void* ap)
+{
+    if (ap == 0) return;
+    for (size_t i = 0; i < g_numberNext.size(); ++i) if (g_numberNext[i] == (const void*)ap) return;
+    if (g_numberNext.size() >= kNumberNextCap) { g_numberNext.erase(g_numberNext.begin()); g_numberNextSeen.erase(g_numberNextSeen.begin()); }
+    g_numberNext.push_back((const void*)ap); g_numberNextSeen.push_back(0);
+}
+static int SweepNumberNextHas(::Character* c)
+{
+    if (g_numberNext.empty()) return 0;
+    SquadView sv;
+    if (ReadSquadOf(c, &sv) != 1 || sv.ap == 0) return 0;
+    for (size_t i = 0; i < g_numberNext.size(); ++i) if (g_numberNext[i] == (const void*)sv.ap) { g_numberNextSeen[i] = 1; return 1; }
+    return 0;
+}
+/* T-1007 (J2): THE SWEEP'S AREA RULE AS AN ANSWER for a trader caravan's unnumbered members (items.cpp ShopCaravanArea), so the
+   game that trades with such a caravan is the game whose sweep numbers it: AnnounceAreaDecide (HeldByOtherTS of the sector) - 1
+   this game's (AnnounceAreaMine's true), 2 another game holds it, 0 no map. MAIN THREAD. */
+int SweepAreaAnswer(float x, float z)
+{
+    const int d = AnnounceAreaDecide(x, z);
+    if (d == kAreaOtherHeld) return 2;
+    if (d == kAreaNoMap) return 0;
+    return 1;
+}
+static void SweepNumberNextScanEnd(bool full)
+{
+    for (size_t i = g_numberNext.size(); i-- > 0; )
+    {
+        if (full && g_numberNextSeen[i] == 0) { g_numberNext.erase(g_numberNext.begin() + (std::ptrdiff_t)i); g_numberNextSeen.erase(g_numberNextSeen.begin() + (std::ptrdiff_t)i); }
+        else g_numberNextSeen[i] = 0;
+    }
+}
 bool AnnouncedExplicit(unsigned int uid)
 {
     std::map<unsigned int, int>::const_iterator it = g_announced.find(uid);
@@ -710,9 +755,9 @@ bool WithdrawHeldUnload(unsigned int uid)
 
 // M-A step 2 - once a second: a character announced into a sector the peer no longer holds is UNLOADED on the
 // peer; one withheld whose sector the peer now holds is announced (CONTEXT + SPAWN).
-/* The position every announce and withdraw decision reads for a character: a non-player character's SQUAD position (the engine
-   sleeps and wakes the squad whole by it), so every road judges a squad whole and agrees with the 1 Hz pass - a road judging by the
-   character's own spot would SPAWN what the pass withdraws; a player-faction character keeps its own. Only x and z change: a SPAWN
+/* The spot a character's squad is slept and woken by: a non-player character's SQUAD position (the engine sleeps and wakes the squad
+   whole by it); a player-faction character keeps its own. "Loaded here" and the hand-over read this spot; whether another game holds
+   the character is AnnounceHeldByOther's answer (below), which every announce and withdraw road asks. Only x and z change: a SPAWN
    still carries the character's own spot. */
 static Ogre::Vector3 AnnounceDecisionPos(::Character* c, const Ogre::Vector3& pos)
 {
@@ -725,6 +770,245 @@ static bool AnnounceLoadedHere(::Character* c, const Ogre::Vector3& pos)
     const Ogre::Vector3 dp = AnnounceDecisionPos(c, pos);
     return coop::IsPositionLoadedHere(dp.x, dp.y, dp.z);
 }
+/* THE ANNOUNCE AREA ANSWER: does another game hold where this character is? Every announce and withdraw road asks it - the 1 Hz pass,
+   the link-up drain, the spawn sweep and both catch-ups - so they never disagree. A player-faction character, or one with no readable
+   squad or squad spot, is judged by its own spot (why = own). A non-player character is judged with its whole squad
+   (cooplive::AnnounceSquadHeld): held when the squad's spot or any member's own spot lies in an area another game holds, or a member
+   this game announced stands within cooplive::kAnnMemberMarginUnits of one. A member that walks into another game's area takes its
+   squad there (its fight is played there) instead of being withdrawn because its squad's spot is outside. The answer is kept per squad
+   for the generation (AnnounceSquadGenNext, stepped at each road's start), so every member of a squad gets the same one, even after
+   the road has acted on the first. Any number of other games: OtherHasSector reads them all. A dead member does not count (its body
+   stays in the squad's member list); a squad with more members than the reader holds is not judged whole - each member answers for
+   itself (cooplive::AnnounceSquadWalk). */
+static unsigned long long g_annSqGen = 1;
+static cooplive::AnnSquadMemo g_annSqMemo;
+/* annSquadAnswers: squad answers worked out; annMemberHeld / annMarginKept: times a squad's answer CHANGED to resting on a member's own
+   spot / on the margin; annOverCapAnswers: answers given per member for a squad above the reader's cap; annDeadMemberRows /
+   annDeadUnreadRows / annMemberPosFail: member rows left out as dead / dead flag unreadable / spot unread */
+static long long g_annSqAnswers = 0, g_annMemberHeld = 0, g_annMarginKept = 0, g_annSqLines = 0, g_annSqPosFail = 0;
+static long long g_annOverCap = 0, g_annDeadRows = 0, g_annDeadUnreadRows = 0;
+static void AnnounceSquadGenNext() { ++g_annSqGen; }
+/* a member's own spot under SEH (a member being torn down keeps its vtable while its body is freed): 1 read, 0 no body, -1 faulted */
+static int AnnMemberPosPod(::Character* m, Ogre::Vector3* out)
+{
+    __try { return SafeReadPosition(m, out) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static bool AnnPeerHoldsNear(float x, float z)
+{
+    float xs[4], zs[4];
+    cooplive::AnnounceMarginCorners(x, z, cooplive::kAnnMemberMarginUnits, xs, zs);
+    for (int k = 0; k < 4; ++k) if (OtherHasSector(SectorOf(xs[k], zs[k]))) return true;
+    return false;
+}
+/* one member's row (cooplive::AnnounceMemberRow) from the live reads: the dead flag and the spot under SEH, its uid and announce mark */
+static int AnnMemberRowOf(::Character* m, int* held, int* nearOut, int* announced)
+{
+    if (!PlausibleObject(m)) return cooplive::kAnnMemNoSpot;
+    const int dead = StoreIsDeadPod(m);
+    Ogre::Vector3 mp(0.0f, 0.0f, 0.0f);
+    const int spotRead = (dead == 0 && AnnMemberPosPod(m, &mp) == 1) ? 1 : 0;
+    const unsigned int mu = spotRead != 0 ? FindSpawnedUid(m) : 0;
+    int mark = cooplive::kAnnMarkNone;
+    if (mu != 0)
+    {
+        const int st = AnnouncedState(mu);
+        mark = st == coopsquad::kAnnWithheld ? (int)cooplive::kAnnMarkWithheld : (st == coopsquad::kAnnNoEntry ? (int)cooplive::kAnnMarkNoRecord : (int)cooplive::kAnnMarkAnnounced);
+    }
+    const int spotHeld = (spotRead != 0 && OtherHasSector(SectorOf(mp.x, mp.z))) ? 1 : 0;
+    const int spotNear = (spotRead != 0 && spotHeld == 0 && AnnPeerHoldsNear(mp.x, mp.z)) ? 1 : 0;
+    const int r = cooplive::AnnounceMemberRow(dead, spotRead, spotHeld, spotNear, (mu != 0 && net::IsUidMine(mu)) ? 1 : 0, mark, held, nearOut, announced);
+    if (r == cooplive::kAnnMemDead) ++g_annDeadRows;
+    else if (r == cooplive::kAnnMemDeadUnread) ++g_annDeadUnreadRows;
+    else if (r == cooplive::kAnnMemNoSpot) ++g_annSqPosFail;
+    return r;
+}
+static bool AnnounceHeldByOther(::Character* c, const Ogre::Vector3& pos, int* whyOut)
+{
+    int why = cooplive::kAnnSqWhyOwn;
+    SquadView sv;
+    float sqx = 0, sqz = 0;
+    if (IsPlayerFaction(c->getOwnerFactionDirect()) || ReadSquadOf(c, &sv) != 1 || sv.ap == 0 || SquadDecisionPosAt(sv, &sqx, &sqz) != 1)
+    {
+        if (whyOut) *whyOut = why;
+        return PeerHoldsSectorOf(pos);
+    }
+    int memoHeld = 0;
+    if (cooplive::AnnSquadMemoGet(g_annSqMemo, sv.ap, g_annSqGen, &memoHeld, &why) == 1) { if (whyOut) *whyOut = why; return memoHeld != 0; }
+    const int squadHeld = OtherHasSector(SectorOf(sqx, sqz)) ? 1 : 0;
+    const int walk = cooplive::AnnounceSquadWalk(squadHeld, sv.count, sv.stored);
+    int mh[kSquadViewCap], mn[kSquadViewCap], ma[kSquadViewCap];
+    int n = 0;
+    if (walk == cooplive::kAnnWalkSelf)
+    {
+        /* more members than were read: this character answers for itself, and the answer is not kept for its squad */
+        ++g_annOverCap;
+        if (AnnMemberRowOf(c, &mh[0], &mn[0], &ma[0]) == cooplive::kAnnMemCounts) n = 1;
+        const bool selfHeld = cooplive::AnnounceSquadHeld(0, n, mh, mn, ma, &why) != 0;
+        if (whyOut) *whyOut = why;
+        return selfHeld;
+    }
+    for (int i = 0; walk == cooplive::kAnnWalkSquad && i < sv.stored && i < kSquadViewCap; ++i)
+        if (AnnMemberRowOf(sv.members[i], &mh[n], &mn[n], &ma[n]) == cooplive::kAnnMemCounts) ++n;
+    const bool held = cooplive::AnnounceSquadHeld(squadHeld, n, mh, mn, ma, &why) != 0;
+    ++g_annSqAnswers;
+    const int prevWhy = cooplive::AnnSquadMemoPut(&g_annSqMemo, sv.ap, g_annSqGen, held ? 1 : 0, why);
+    if (prevWhy != why && why == cooplive::kAnnSqWhyMember) ++g_annMemberHeld;
+    else if (prevWhy != why && why == cooplive::kAnnSqWhyMargin) ++g_annMarginKept;
+#ifdef SW_DEV_BUILD
+    {
+        const bool byMember = why == cooplive::kAnnSqWhyMember || why == cooplive::kAnnSqWhyMargin;
+        const bool wasByMember = prevWhy == cooplive::kAnnSqWhyMember || prevWhy == cooplive::kAnnSqWhyMargin;
+        if (prevWhy != why && (byMember || wasByMember) && g_annSqLines < 120)
+        {
+            ++g_annSqLines;
+            SW_DEVLOG("[P033] announce squad answer uid=" + S((long long)FindSpawnedUid(c)) + " why=" + std::string(cooplive::AnnounceSquadWhyName(why))
+                     + " was=" + (prevWhy < 0 ? std::string("-") : std::string(cooplive::AnnounceSquadWhyName(prevWhy))) + " held=" + S((long long)(held ? 1 : 0))
+                     + " squadSpot=" + S((long long)sqx) + "," + S((long long)sqz) + " area=" + SectorString(SectorOf(sqx, sqz)) + " members=" + S((long long)n)
+                     + " annMemberHeld=" + S(g_annMemberHeld) + " annMarginKept=" + S(g_annMarginKept));
+        }
+    }
+#else
+    (void)prevWhy;
+#endif
+    if (whyOut) *whyOut = why;
+    return held;
+}
+// PROBE-START: P166
+#ifdef SW_DEV_BUILD
+/* PROBE P166 (T-752, LOG ONLY): a non-player character whose own position and its decision position (AnnounceDecisionPos - its
+   squad's) fall in different areas, or give a different answer to "does another game hold this area", at each announce decision
+   road. One line per (uid, road) per change of (both areas, both held answers, the decision); the first 200 change lines per road
+   in full, then every 20th, all counted; `report` adds one summary line. suspect = held(own) 1, held(decision) 0, and either not
+   announced with no SPAWN / RESEND decided or an UNLOAD decided - the character stands where another game has the area, and that game
+   is not sent it or has it withdrawn. why = what the shared answer (AnnounceHeldByOther) rested on; byMember counts the decisions it
+   took on a member's own spot or the margin, where the squad's spot alone answered "not held". Reads only. */
+enum { kP166Pass = 0, kP166Link = 1, kP166Spawn = 2, kP166Catchup = 3, kP166CatchupRev = 4, kP166Roads = 5 };
+enum { kP166DecNothing = 0, kP166DecSpawn = 1, kP166DecUnload = 2, kP166DecHold = 3, kP166DecResend = 4, kP166DecWithheld = 5,
+       kP166DecUnloadHeld = 6 };
+struct P166Key { int ownKey, decKey, heldOwn, heldDec, dec; };
+static std::map<unsigned long long, P166Key> g_p166Last;
+static long long g_p166Lines[kP166Roads] = { 0, 0, 0, 0, 0 };
+static long long g_p166Split = 0, g_p166Ended = 0, g_p166Suspect = 0, g_p166Logged = 0, g_p166Skipped = 0, g_p166ReadFail = 0, g_p166ByMember = 0;
+static std::vector<unsigned int> g_p166SuspectUids;
+static const char* P166RoadName(int r)
+{
+    return r == kP166Pass ? "pass" : (r == kP166Link ? "link" : (r == kP166Spawn ? "spawn" : (r == kP166Catchup ? "catchup" : "catchupRev")));
+}
+static const char* P166DecName(int d)
+{
+    switch (d)
+    {
+    case kP166DecSpawn: return "spawn";
+    case kP166DecUnload: return "unload";
+    case kP166DecUnloadHeld: return "unloadHeld";
+    case kP166DecHold: return "hold";
+    case kP166DecResend: return "resend";
+    case kP166DecWithheld: return "withheld";
+    default: return "nothing";
+    }
+}
+/* the announce / catch-up decision codes (cooplive kAnnKeep 0, kAnnSpawn 1, kAnnUnload 2, kAnnResend 3, kAnnHoldForHandover 4 =
+   kCatchupHeld 4) as P166's; unloadHeld = an UNLOAD decided while its squad's RELEASE is owed (the pass sends nothing then) */
+static int P166DecOfAnn(int ann, bool releasePending)
+{
+    if (ann == cooplive::kAnnSpawn) return kP166DecSpawn;
+    if (ann == cooplive::kAnnUnload) return releasePending ? kP166DecUnloadHeld : kP166DecUnload;
+    if (ann == cooplive::kAnnResend) return kP166DecResend;
+    if (ann == cooplive::kAnnHoldForHandover) return kP166DecHold;
+    return kP166DecNothing;
+}
+/* the faction test and the decision position under SEH (no C++ object here - C2712) */
+static int P166ReadPod(::Character* c, const Ogre::Vector3& pos, Ogre::Vector3* dp, int* npc)
+{
+    __try
+    {
+        *npc = IsPlayerFaction(c->getOwnerFactionDirect()) ? 0 : 1;
+        *dp = AnnounceDecisionPos(c, pos);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static std::string P166Holders(const Sector& s)
+{
+    unsigned w[1] = { 0 };
+    const int r = SectorHoldersTS(s, w, 1);
+    if (r != 1) return r < 0 ? std::string("nomap") : std::string("out");
+    char b[16]; std::sprintf(b, "0x%X", w[0]);
+    return std::string(b);
+}
+static std::string P166Pos(const Ogre::Vector3& p) { return S((long long)p.x) + "," + S((long long)p.z); }
+static std::string P166Ann(unsigned int uid)
+{
+    std::map<unsigned int, int>::const_iterator it = g_announced.find(uid);
+    return it == g_announced.end() ? std::string("none") : S((long long)it->second);
+}
+/* dec = the road's decision, why = what AnnounceHeldByOther's answer rested on; called BEFORE the road acts, so ann is the state the
+   decision was taken from */
+static void P166Note(int road, ::Character* c, unsigned int uid, const Ogre::Vector3& pos, int dec, int why)
+{
+    if (uid == 0 || road < 0 || road >= kP166Roads || !PlausibleObject(c)) return;
+    Ogre::Vector3 dp = pos; int npc = 0;
+    if (P166ReadPod(c, pos, &dp, &npc) != 1) { ++g_p166ReadFail; return; }
+    if (npc == 0) return;
+    const Sector so = SectorOf(pos.x, pos.z), sd = SectorOf(dp.x, dp.z);
+    const int heldOwn = PeerHoldsSectorOf(pos) ? 1 : 0, heldDec = PeerHoldsSectorOf(dp) ? 1 : 0;
+    if (why == cooplive::kAnnSqWhyMember || why == cooplive::kAnnSqWhyMargin) ++g_p166ByMember;
+    const int ownKey = so.x * 1024 + so.y, decKey = sd.x * 1024 + sd.y;
+    const unsigned long long k = ((unsigned long long)uid << 3) | (unsigned long long)road;
+    const bool split = ownKey != decKey || heldOwn != heldDec;
+    std::map<unsigned long long, P166Key>::iterator it = g_p166Last.find(k);
+    const char* kind = "split";
+    if (!split)
+    {
+        if (it == g_p166Last.end()) return;
+        g_p166Last.erase(it); ++g_p166Ended;
+        kind = "split ended";
+    }
+    else
+    {
+        if (it != g_p166Last.end() && it->second.ownKey == ownKey && it->second.decKey == decKey && it->second.heldOwn == heldOwn
+            && it->second.heldDec == heldDec && it->second.dec == dec) return;
+        P166Key nk = { ownKey, decKey, heldOwn, heldDec, dec };
+        g_p166Last[k] = nk;
+        ++g_p166Split;
+    }
+    std::map<unsigned int, int>::const_iterator an = g_announced.find(uid);
+    const bool notAnnounced = an == g_announced.end() ? (road == kP166Spawn) : (an->second != 1);   /* the pass and the catch-ups read "no entry" as announced; the spawn road's character is new */
+    const bool withdrawn = dec == kP166DecUnload || dec == kP166DecUnloadHeld;
+    const int suspect = (split && heldOwn == 1 && heldDec == 0 && ((notAnnounced && dec != kP166DecSpawn && dec != kP166DecResend) || withdrawn)) ? 1 : 0;
+    if (suspect != 0)
+    {
+        ++g_p166Suspect;
+        bool known = false;
+        for (size_t i = 0; i < g_p166SuspectUids.size(); ++i) if (g_p166SuspectUids[i] == uid) { known = true; break; }
+        if (!known && g_p166SuspectUids.size() < 10) g_p166SuspectUids.push_back(uid);
+    }
+    const long long n = ++g_p166Lines[road];
+    if (n > 200 && n % 20 != 0) { ++g_p166Skipped; return; }
+    ++g_p166Logged;
+    std::string tmpl = "?";
+    { GameData* gd = c->getRecordDirect(); if (PlausibleObject(gd)) tmpl = gd->name; }
+    void* sf = 0; std::string sid;
+    if (!SquadKeyOf(c, &sf, &sid)) sid = "-";
+    SW_DEVLOG(std::string("[P166] ") + kind + " road=" + P166RoadName(road) + " uid=" + S((long long)uid) + " '" + tmpl + "' squad='" + sid
+             + "' own=" + P166Pos(pos) + " area=" + SectorString(so) + " dec=" + P166Pos(dp) + " area=" + SectorString(sd)
+             + " held[own,dec]=" + S((long long)heldOwn) + "," + S((long long)heldDec)
+             + " loadedHere[own,dec]=" + S((long long)(coop::IsPositionLoadedHere(pos.x, pos.y, pos.z) ? 1 : 0)) + "," + S((long long)(coop::IsPositionLoadedHere(dp.x, dp.y, dp.z) ? 1 : 0))
+             + " ann=" + P166Ann(uid) + " decision=" + P166DecName(dec) + " why=" + cooplive::AnnounceSquadWhyName(why)
+             + " holders[own,dec]=" + P166Holders(so) + "," + P166Holders(sd) + " suspect=" + S((long long)suspect) + " n=" + S(n));
+}
+static void P166Report()
+{
+    std::string uids;
+    for (size_t i = 0; i < g_p166SuspectUids.size(); ++i) { if (i) uids += ","; uids += S((long long)g_p166SuspectUids[i]); }
+    SW_DEVLOG("[P166] REPORT split=" + S(g_p166Split) + " ended=" + S(g_p166Ended) + " suspect[heldOwn1,heldDec0,notAnnouncedOrUnload]=" + S(g_p166Suspect) + " byMember=" + S(g_p166ByMember)
+             + " suspectUids=" + (uids.empty() ? std::string("-") : uids)
+             + " lines[pass,link,spawn,catchup,catchupRev]=" + S(g_p166Lines[0]) + "," + S(g_p166Lines[1]) + "," + S(g_p166Lines[2]) + "," + S(g_p166Lines[3]) + "," + S(g_p166Lines[4])
+             + " logged=" + S(g_p166Logged) + " skipped=" + S(g_p166Skipped) + " readFail=" + S(g_p166ReadFail) + " tracked=" + S((long long)g_p166Last.size()));
+}
+#endif
+// PROBE-END: P166
 
 static void AnnouncePass()
 {
@@ -752,10 +1036,13 @@ static void AnnouncePass()
         ::Character* c = FindSpawned(uid);
         if (!PlausibleObject(c) || !PlausibleObject(*(void**)((char*)c + 0x448))) continue;
         Ogre::Vector3 pos = c->worldPosition();
-        /* a non-player character is judged by its SQUAD position (the engine sleeps and wakes the squad whole by it), so its whole squad
-           is withdrawn or announced together; a player-faction character keeps its own. pos stays the character's own (its SPAWN) */
+        /* a non-player character is judged with its whole squad (AnnounceHeldByOther: the squad's spot or any member's own spot in an
+           area another game holds), so its whole squad is withdrawn or announced together; a player-faction character keeps its own.
+           Loaded here and the hand-over read the squad's spot dp (the engine sleeps and wakes the squad whole by it). pos stays the
+           character's own (its SPAWN) */
         Ogre::Vector3 dp = AnnounceDecisionPos(c, pos);
-        const bool held = PeerHoldsSectorOf(dp);
+        int annWhy = 0;
+        const bool held = AnnounceHeldByOther(c, pos, &annWhy);
         /* W1-b (T240; review 2026-09-22 H2/H3): with the relay present `held` reads the EFFECTIVE area map (zones.cpp
            ApplyRelayAreaMap -> g_otherLoaded), in which a reporter absent from the latest AREAMAP keeps its last known
            areas - so an absent reporter never reads as holding nothing, and a present one that walked away reads exactly
@@ -780,6 +1067,11 @@ static void AnnouncePass()
         const bool handoverCase = state == 1 && held && !mineLoaded;
         const int ann = cooplive::AnnounceDecide(held, mineLoaded, state == 1, false,
                                                  handoverCase && HandoffOtherInWorldHasArea(dp.x, dp.z) == 1, handoverCase && HandoffForcedRefusedFor(uid));
+        // PROBE-START: P166
+#ifdef SW_DEV_BUILD
+        P166Note(kP166Pass, c, uid, pos, P166DecOfAnn(ann, ReleasePendingHas(uid)), annWhy);
+#endif
+        // PROBE-END: P166
         if (ann == cooplive::kAnnHoldForHandover)
         {
             if (it == g_announced.end()) g_announced[uid] = 1;   /* stays marked announced: ReleaseOnPutAway opens its RELEASE and WithdrawHeldUnload sends its UNLOAD */
@@ -811,6 +1103,7 @@ void WorldSyncReannounceAll() { if (g_adoptedCount > 0) g_reannounceAt = 0; SW_D
 
 void WorldSyncTick()
 {
+    AnnounceSquadGenNext();   /* one squad answer per tick: the pass, the link-up drain and the spawn sweep below share it */
     { static long long s_t = 0; if (++s_t % 118 == 0 && g_mode != 0) AnnouncePass(); }   // M-A step 2, 1 Hz
     // Link-up EDGE, checked before anything else returns early - a re-announce is needed whether
     // or not adoption is currently on, and whether or not this instance is still sweeping.
@@ -892,7 +1185,14 @@ void WorldSyncTick()
         // adopted as suppressed puppets and driven every tick, and the drift they do show is
         // already explained by adoption distance (F294), not by their container.
             if (coopslot::WireLacksSlot(WireFactionName(f))) { coop::NoteHeldForSlot(); g_announced[row.uid] = 0; continue; }   /* stand1 fold (1d): held, not dropped */
-            if (!PeerHoldsSectorOf(AnnounceDecisionPos(c, pos))) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
+            int linkWhy = 0;
+            const bool linkHeld = AnnounceHeldByOther(c, pos, &linkWhy);
+            // PROBE-START: P166
+#ifdef SW_DEV_BUILD
+            P166Note(kP166Link, c, row.uid, pos, linkHeld ? kP166DecSpawn : kP166DecWithheld, linkWhy);
+#endif
+            // PROBE-END: P166
+            if (!linkHeld) { if (RelayMapFresh()) g_announced[row.uid] = 0; ++g_withheld; continue; }   /* M7a3 P3: with no fresh area map nobody can say the peer lacks it - the entry is left as it was */   // M-A step 2
             SendContextFor(row.uid, c);   // M-B: CONTEXT before SPAWN, same reliable channel, so the copy is created with it
             if (net::SendSpawn(row.uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c))
             {
@@ -910,10 +1210,12 @@ void WorldSyncTick()
     if (g_mode == kModeOff) return;
     if (g_mode == kModeOnce && g_budget <= 0) return;
 
-    // Adopting with no other player in the world would mint uids and register characters whose SPAWN goes nowhere. Refuse
-    // instead, and let the sweep run when another player is here (the old link up, or another slot IN_WORLD on the roster); a
-    // player who arrives later asks for what it lacks by the catch-up.
-    if (!coop::PlayersPresent()) return;
+    // The sweep adopts the same characters, in the same order, whether or not another player is in this world: a uid is how
+    // the mod names a character (a death with no uid is dropped, so the fallen list would never show it), and every mechanic
+    // keyed by uid runs for a game playing alone as for one with company. The one difference is the SPAWN below: with nobody
+    // else here (the old link down and no other slot IN_WORLD on the roster) nothing is sent - the row stays unannounced, and
+    // AnnouncePass or the link-up re-announce sends it once another player holds its area.
+    const bool othersHere = coop::PlayersPresent();
 
     // ONLY THE HOST ADOPTS. Option A has exactly one canonical world, and it is the host's; the
     // client's own population is suppressed at the leaf precisely so it can receive that one.
@@ -982,6 +1284,12 @@ void WorldSyncTick()
         // budget is small, what the peer has is the crowd the player is standing in.
         ::Character* best = 0;
         double bestD2 = 0.0;
+        ::Character* bestOwn = 0;     /* the nearest of this game's own player-faction characters */
+        ::Character* bestOther = 0;   /* the nearest other character */
+        double bestOwnD2 = 0.0, bestOtherD2 = 0.0;
+        ::Character* bestNext = 0;   /* T-1007 (J): the nearest unnumbered person of a 'number next' squad */
+        double bestNextD2 = 0.0;
+        bool nextScanFull = true;
 
         for (GameHashSet< ::Character*>::type::const_iterator it = all.begin();
              it != all.end(); ++it)
@@ -999,6 +1307,7 @@ void WorldSyncTick()
                 }
             }
                                                     // on previous ticks and our own spawns
+            const bool candOwn = IsPlayerFaction(SweepFactionPod(c));   /* this game's own player faction (the engine's player flag) */
 
             /* inv7a-b (Read 2026-09-27): A STAND-IN COPY IS NEVER THIS GAME'S OWN. The purge's fallbacks can run before a woken
                stand-in squad's members exist; adopting such a copy announced it as ours, and the purge then took it for a live
@@ -1120,17 +1429,40 @@ void WorldSyncTick()
                 if (pass == 0 && HeldByOtherTS(SectorOf(dp.x, dp.z)) == 1) OrphanNote((void*)c, dp.x, dp.z);
                 continue;   // decision 33
             }
-            if (!haveRef) { best = c; break; }
+            /* own characters first (coopuid::SweepPick): after a world load each is uid 0 until the sweep reaches it, and a death
+               in that window is dropped; among each kind the nearest goes first */
+            if (!haveRef)
+            {
+                if (candOwn) { bestOwn = c; nextScanFull = false; break; }
+                if (bestNext == 0 && SweepNumberNextHas(c) != 0) bestNext = c;   /* T-1007 (J) */
+                if (bestOther == 0) bestOther = c;
+                continue;
+            }
             double dx = dp.x - eye.x, dz = dp.z - eye.z;   /* T-1 B1: the deciding position */
             double d2 = dx * dx + dz * dz;
             // Outside the radius: not adopted, and counted so the omission is a NUMBER rather than
             // a silence. A world we deliberately do not replicate must say how much it left out.
             if (g_adoptRadius > 0.0f && d2 > (double)g_adoptRadius * (double)g_adoptRadius) { ++g_p21Radius; continue; }   /* P021 */
-            if (best == 0 || d2 < bestD2) { best = c; bestD2 = d2; }
+            if (!candOwn && SweepNumberNextHas(c) != 0 && (bestNext == 0 || d2 < bestNextD2)) { bestNext = c; bestNextD2 = d2; }   /* T-1007 (J) */
+            if (candOwn) { if (bestOwn == 0 || d2 < bestOwnD2) { bestOwn = c; bestOwnD2 = d2; } }
+            else if (bestOther == 0 || d2 < bestOtherD2) { bestOther = c; bestOtherD2 = d2; }
         }
-
+        SweepNumberNextScanEnd(nextScanFull);   /* T-1007 (J) */
+        const int pick = coopuid::SweepPick(bestOwn != 0 ? 1 : 0, bestOther != 0 ? 1 : 0);
+        const bool bestIsOwn = (pick == coopuid::kSweepPickOwn);
+        if (pick == coopuid::kSweepPickOwn) { best = bestOwn; bestD2 = bestOwnD2; }
+        else if (pick == coopuid::kSweepPickOther) { best = bestOther; bestD2 = bestOtherD2; }
+        if (pick == coopuid::kSweepPickOther && bestNext != 0) { best = bestNext; bestD2 = bestNextD2; }   /* T-1007 (J): a 'number next' squad before any other world character */
         if (best == 0)
         {
+            /* once per world load, the first time the sweep finds nothing left to adopt: how many characters it adopted, own and world */
+            if (coopuid::SweepLoadLineDue(g_sweepOwnThisLoad + g_sweepWorldThisLoad, g_sweepLoadLogged ? 1 : 0) == 1)
+            {
+                g_sweepLoadLogged = true;
+                DebugLog("[WORLDSYNC] sweep: this world load's characters adopted - own " + S(g_sweepOwnThisLoad) + ", world " + S(g_sweepWorldThisLoad)
+                         + " (another player in this world: " + std::string(othersHere ? "yes" : "no") + "; sweepAdopted[own,world]=" + S(g_sweepOwnAdopted)
+                         + "," + S(g_sweepWorldAdopted) + "; once per world load, when nothing is left to adopt)");
+            }
             // Recount what the radius excluded, so `skippedTooFar` reflects the world as it is now
             // rather than accumulating across passes.
             if (g_adoptRadius > 0.0f && haveRef)
@@ -1238,7 +1570,13 @@ void WorldSyncTick()
         // already explained by adoption distance (F294), not by their container.
         const bool slotHeld = coopslot::WireLacksSlot(factionName);   /* stand1 fold (review-stand1 1d): my faction has no slot yet - HELD: the row stays unannounced and is re-sent on release */
         if (slotHeld) coop::NoteHeldForSlot();
-        const bool peerHolds = !slotHeld && PeerHoldsSectorOf(AnnounceDecisionPos(best, pos));   // M-A step 2: announce only into a sector the peer holds
+        int spawnWhy = 0;
+        const bool peerHolds = othersHere && !slotHeld && AnnounceHeldByOther(best, pos, &spawnWhy);   // M-A step 2: announce only into a sector the peer holds; nothing with nobody else here
+        // PROBE-START: P166
+#ifdef SW_DEV_BUILD
+        P166Note(kP166Spawn, best, uid, pos, peerHolds ? kP166DecSpawn : kP166DecWithheld, spawnWhy);
+#endif
+        // PROBE-END: P166
         if (!peerHolds) { g_announced[uid] = 0; ++g_withheld; }
         else SendContextFor(uid, best);   // M-B / P064: the context travels with the announcement (same reliable channel)
         if (peerHolds && !net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z, factionName, false, best))
@@ -1263,6 +1601,7 @@ void WorldSyncTick()
 
         ++g_adopted;
         ++done;
+        if (bestIsOwn) { ++g_sweepOwnAdopted; ++g_sweepOwnThisLoad; } else { ++g_sweepWorldAdopted; ++g_sweepWorldThisLoad; }
         if (g_mode == kModeOnce) --g_budget;
 
         SW_DEVLOG("[P033] adopted uid=" + S(uid) + " '" + templateName + "' fac='" + factionName
@@ -1559,12 +1898,12 @@ const char* AdoptGateFor(void* character)
     return "adoptable";
 }
 
-/* orphan1 (decision 37): the report token - people removed / skipped by OrphanPurgeTick, and the leaf gate's unlinked refusals. */
+/* orphan1 (decision 37): the report token - people removed / skipped by OrphanPurgeTick. */
 static std::string OrphanReportTokenWs()
 {
     long long removed = 0, skipped = 0;
     OrphanReportNumbers(&removed, &skipped);
-    return " orphan[removed,skipped,gatedHeldUnlinked]=" + S(removed) + "," + S(skipped) + "," + S(WorldGenGatedHeldUnlinked()) + OrphanReportDetail();
+    return " orphan[removed,skipped]=" + S(removed) + "," + S(skipped) + OrphanReportDetail();
 }
 void ReportWorldSync()
 {
@@ -1587,9 +1926,10 @@ void ReportWorldSync()
              + " retired=" + S(g_retired)
              + " restored=" + S(g_restored)
              + " unloadSent[putAway,reloaded,heldSettled,retire,announce]=" + S(g_unloadSentWhy[0]) + "," + S(g_unloadSentWhy[1]) + "," + S(g_unloadSentWhy[2]) + "," + S(g_unloadSentWhy[3]) + "," + S(g_unloadSentWhy[4])
-             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
+             + " reannounced=" + S(g_reannounced) + " withheld=" + S(g_withheld) + " announceSkippedHandover=" + S(g_announceSkippedHandover) + " announceHeldForHandover=" + S(g_announceHeldForHandover) + " announceHeldNow=" + S((long long)g_annHeld.size()) + " annMemberHeld=" + S(g_annMemberHeld) + " annMarginKept=" + S(g_annMarginKept) + " annSquadAnswers=" + S(g_annSqAnswers) + " annMemberPosFail=" + S(g_annSqPosFail) + " annOverCapAnswers=" + S(g_annOverCap) + " annDeadMemberRows=" + S(g_annDeadRows) + " annDeadUnreadRows=" + S(g_annDeadUnreadRows) + " p21[seen,spawned,guard,rule,radius,ticks]=" + S(g_p21Seen) + "," + S(g_p21Spawned) + "," + S(g_p21Guard) + "," + S(g_p21Rule) + "," + S(g_p21Radius) + "," + S(g_p21Ticks) + " d33[worldAdoptable,skippedOtherHeld,announceRefusedNoMap]=" + S(g_worldAdoptable) + "," + S(g_skippedOtherHeld) + "," + S(g_skippedNoMap) + " reannounceDrained=" + S(g_reannounceDrained) + "   (P8e / audit C5+C6: the third d33 number was printed as skippedNoMap and is announceRefusedNoMap now - SAME EVENT, renamed because it no longer depends on the session role.  P97 (owner 334 a / 337 a): the fourth d33 number, announceNoMapFallback, and the roster reason adoptableNoMapFallback are RETIRED with the bounded no-map wait - with no fresh map every game skips - so a readout writes ABSENT for them and not zero; the token adoptableNoMap is RETIRED with the host arm, so a readout writes ABSENT and not zero.  reannounceDrained is rows the re-announce queue walked on THIS game, which nothing counted while the drain was host-only - a client's zero could not be told from an empty queue.)" + " unloadsSent=" + S(g_unloadsSent) + " withdrawnOwnUnload=" + S(g_withdrawnOwnUnload) + " reannouncedOnReload=" + S(g_reannouncedOnReload) + " announceTicks=" + S(g_announceTicks) + " announceStale=" + S(g_announceStale) + " streamGateWithheld=" + S(g_streamGateWithheld) + " announceAbsentReporter=" + S(coop::ZonesAnnounceAbsentReporter()) + " effCarriedCells=" + S((long long)coop::ZonesEffCarriedCells()) + " areaMap[rows,seats,rekeyed,bytes]=" + coop::ZonesAreaMapCounters() /* M9 (T-197) */ + " effDroppedAfterPeerGone=" + S(coop::ZonesEffDroppedAfterPeerGone())
              + " falseGone=" + S(g_falseGone)
              + " sweepStandInSkipped=" + S(g_sweepStandInSkipped)   /* inv7a-b */
+             + " sweepAdopted[own,world]=" + S(g_sweepOwnAdopted) + "," + S(g_sweepWorldAdopted)   /* characters the sweep adopted: this game's own player faction, and every other */
              + " sweepHandedOver[skipped,adopted]=" + S(g_sweepHandedOverSkipped) + "," + S(g_sweepHandedOverAdopted) + " sweepContextSkipped=" + S(g_sweepContextSkipped) + " sweepWakeDupSkipped=" + S(g_sweepWakeDupSkipped)   /* M7a3f3 T-425 [m7a3f3-ws4] */
              + OrphanReportTokenWs()   /* orphan1: orphan[removed,skipped,gatedHeldUnlinked]= */
              + " reannounceSkippedNotMine=" + S(g_reannounceSkippedNotMine)
@@ -1628,6 +1968,11 @@ void ReportWorldSync()
                                          ? F1(net::PeerViewDistance())
                                          : std::string("none"))
              + " skippedTooFar=" + S(g_skippedTooFar));
+    // PROBE-START: P166
+#ifdef SW_DEV_BUILD
+    P166Report();
+#endif
+    // PROBE-END: P166
 }
 
 // review-p3o H2 - THE LIVENESS ROWS, DROPPED BEFORE THE ENGINE FREES WHAT THEY NAME.
@@ -1677,6 +2022,7 @@ void WorldsyncWorldTeardown()
        number that means "we told the peer" on an event where we told it nothing. */
     g_retireWithdraw.clear();
     g_sweepAdoptGen.clear();   /* inv7e2: the world these adoptions came from is gone */
+    g_sweepOwnThisLoad = 0; g_sweepWorldThisLoad = 0; g_sweepLoadLogged = false;   /* the sweep's line is once per world load */
 
     SW_DEVLOG("[P033] world teardown: forgot " + S((long long)rows)
              + " adopted liveness rows and " + S((long long)announced) + " announce marks");
@@ -1797,6 +2143,7 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
     std::set<int> want(a.keys.begin(), a.keys.end());
     long long mine = 0, resent = 0, announced = 0, failed = 0, held = 0;
     cooplive::CatchupEndMsg end; end.askNo = a.askNo; end.keys = a.keys;
+    AnnounceSquadGenNext();   /* the ask's walk judges each squad once, with the areas as they stand now */
     for (int i = 0; i < g_adoptedCount && i < kMaxAdopted; ++i)
     {
         const unsigned int uid = g_adoptedRows[i].uid;
@@ -1806,7 +2153,14 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
         ++mine;
         std::map<unsigned int, int>::iterator an = g_announced.find(uid);
         const int state = (an == g_announced.end()) ? 1 : an->second;
-        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), PeerHoldsSectorOf(AnnounceDecisionPos(c, pos)), AnnounceLoadedHere(c, pos), state == 1);
+        int cuWhy = 0;
+        const bool cuHeld = AnnounceHeldByOther(c, pos, &cuWhy);
+        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), cuHeld, AnnounceLoadedHere(c, pos), state == 1);
+        // PROBE-START: P166
+#ifdef SW_DEV_BUILD
+        P166Note(kP166Catchup, c, uid, pos, P166DecOfAnn(ann, false), cuWhy);
+#endif
+        // PROBE-END: P166
         if (ann == cooplive::kCatchupHeld)   /* item 2: the receiver may already run it - named, and re-sent here when the hand-over settles */
         {
             ++held; ++g_cuHeld;
@@ -1867,6 +2221,7 @@ void WorldsyncCatchupReverseTick()
     }
     long long done = 0;
     net::CharStreamToSlot(-1);
+    AnnounceSquadGenNext();   /* this tick's slice of the walk judges each squad once */
     for (; g_cuRevCursor < g_adoptedCount && g_cuRevCursor < kMaxAdopted; ++g_cuRevCursor)
     {
         const unsigned int uid = g_adoptedRows[g_cuRevCursor].uid;
@@ -1877,7 +2232,14 @@ void WorldsyncCatchupReverseTick()
         ++done;
         std::map<unsigned int, int>::iterator an = g_announced.find(uid);
         const int state = (an == g_announced.end()) ? 1 : an->second;
-        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), PeerHoldsSectorOf(AnnounceDecisionPos(c, pos)), AnnounceLoadedHere(c, pos), state == 1);
+        int crWhy = 0;
+        const bool crHeld = AnnounceHeldByOther(c, pos, &crWhy);
+        const int ann = cooplive::CatchupCharDecide(HandoffPendingHas(uid), crHeld, AnnounceLoadedHere(c, pos), state == 1);
+        // PROBE-START: P166
+#ifdef SW_DEV_BUILD
+        P166Note(kP166CatchupRev, c, uid, pos, P166DecOfAnn(ann, false), crWhy);
+#endif
+        // PROBE-END: P166
         if (ann != cooplive::kAnnResend && ann != cooplive::kAnnSpawn) continue;
         GameData* gd = 0; Faction* f = 0;
         if (!CatchupWire(c, &gd, &f)) { ++g_cuWireReadFailed; continue; }   /* fold 4: counted, as the ask's are */
@@ -1989,6 +2351,22 @@ bool WorldsyncCopyRowStale(unsigned int uid, float x, float y, float z)
         if ((const void*)*li == raw) { running = true; break; }
     return lostcopy::StaleRowGivesWay(1, 0, IsRetiredObject(raw) ? 1 : 0, resolves ? 1 : 0,
                                       running ? 1 : 0, ZoneBuildingsInHereTri(x, y, z) == 1 ? 1 : 0) != 0;
+}
+
+/* A character the engine gave a new handle, proven the same by the liveness check (spawn.cpp RehandleVerdict): its liveness rows
+   that hold a handle take the new one, so P034's resolve asks the handle the character carries now. Returns the rows changed.
+   MAIN THREAD. */
+int WorldsyncRenoteHandle(unsigned int uid, const void* obj, unsigned int index, unsigned int serial, unsigned int container, unsigned int stamp)
+{
+    int n = 0;
+    for (int i = 0; i < g_adoptedCount && i < kMaxAdopted; ++i)
+    {
+        Adopted& row = g_adoptedRows[i];
+        if (row.uid != uid || row.obj != obj || !ObjIdValid(row.id)) continue;
+        row.id.index = index; row.id.serial = serial; row.id.container = container; row.id.containerStamp = stamp;
+        ++n;
+    }
+    return n;
 }
 
 // review-session S6 - THE PEER IS GONE; NOTHING HERE HAS BEEN TOLD ANYTHING ANY MORE.

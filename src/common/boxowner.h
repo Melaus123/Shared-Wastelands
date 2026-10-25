@@ -2,13 +2,13 @@
    BUILDING'S STORAGE. Pure decisions only; the plugin (items.cpp ItBoxOwnerOf / ItOwnerRungAt) reads the facts, the offline
    suite (coop-test) tests these. Header-only. No C++11.
    - What is INSIDE a player's house belongs to the HOUSE owner, whoever placed it (decision 2).
-   - ONE WRITER (review-inv4): both games decide from the SAME input - the notebook's area map, which both receive from one
-     clock - never from a local read. The owner's game writes only while the link is up AND the map shows the OWNER's slot
-     loaded in the box's sector; the owner's own game uses exactly that test for itself.
+   - ONE WRITER: every game decides from the SAME input - the notebook's area map, which all receive from one clock - never
+     from a local read. The owner's game writes only while the map shows the OWNER's slot loaded in the box's sector; the
+     owner's own game uses exactly that test for itself. The number of players in the world is not an input: a game alone in
+     the world decides as a game with company does.
    - FAIL SAFE: a player-owned box whose owner cannot be resolved here (slot unknown, stand-in unknown, faction record
-     unreadable, map stale / notebook down) has NO writer on either game (kRungDefer): moves are refused. The area rule
-     applies only when a FRESH map positively shows the owner not loaded (decision 1), or when the session link is down
-     (nothing can cross - the lone game writes as it always has).
+     unreadable, map stale / notebook down) has NO writer on any game (kRungDefer): moves are refused. The area rule
+     applies only when a FRESH map positively shows the owner not loaded (decision 1).
    - A player faction that is not this game's own reads as SHARED (two players one faction - out of scope): the area rule. */
 #ifndef COOP_BOXOWNER_H
 #define COOP_BOXOWNER_H
@@ -120,17 +120,16 @@ const int kRungHeld = 2;    /* == items.cpp kBoxHeld: the owner's (other) game w
 const int kRungDefer = 4;   /* == items.cpp kBoxNoAnswer: nobody writes - refused on both games */
 
 const int kWhyMine = 0, kWhyHeld = 1, kWhyAbsent = 2, kWhyNone = 3, kWhyUnreadable = 4, kWhyShared = 5,
-          kWhyUnresolved = 6, kWhyStale = 7, kWhyLinkDown = 8;
+          kWhyUnresolved = 6, kWhyStale = 7;
 
-/* THE OWNER RUNG - the same on both games. linked = the session link is up; ownerSlot = the owner's notebook slot as THIS
-   game knows it (-1 unknown); mapOwnerLoaded = the notebook map's loaded bit for ownerSlot in the box's sector (1 set, 0 clear,
-   -1 no fresh map / notebook down). */
-inline int OwnerRung(int cls, int ownerSlot, int linked, int mapOwnerLoaded, int* why)
+/* THE OWNER RUNG - the same on every game, whatever the number of players in the world. ownerSlot = the owner's notebook slot
+   as THIS game knows it (-1 unknown); mapOwnerLoaded = the notebook map's loaded bit for ownerSlot in the box's sector (1 set,
+   0 clear, -1 no fresh map / notebook down). */
+inline int OwnerRung(int cls, int ownerSlot, int mapOwnerLoaded, int* why)
 {
     if (cls == kOwnNone) { *why = kWhyNone; return kRungArea; }
     if (cls == kOwnUnreadable) { *why = kWhyUnreadable; return kRungArea; }
     if (cls == kOwnShared) { *why = kWhyShared; return kRungArea; }
-    if (linked == 0) { *why = kWhyLinkDown; return kRungArea; }                 /* nothing crosses: the lone game's own rule */
     if (cls == kOwnUnknown || ownerSlot < 0) { *why = kWhyUnresolved; return kRungDefer; }
     if (mapOwnerLoaded < 0) { *why = kWhyStale; return kRungDefer; }            /* the plugin keeps the notebook-down refusal */
     if (mapOwnerLoaded == 1)
@@ -147,10 +146,10 @@ inline int WriterIs(int rung, int areaVerdict) { return (rung >= 0) ? rung : are
 
 /* inv4b 3: a box whose owner cannot be read HERE (off the main thread - getOwnerFaction is an engine call - or its building not
    resolvable by key). knownCls = the class last read for that key on the main thread (kOwnUnreadable = never read). The area
-   rule only where the box is KNOWN not player-owned (none / shared, as OwnerRung itself) or the link is down; else nobody writes. */
-inline int UnreadRung(int knownCls, int linked)
+   rule only where the box is KNOWN not player-owned (none / shared, as OwnerRung itself); else nobody writes - whatever the
+   number of players in the world. */
+inline int UnreadRung(int knownCls)
 {
-    if (linked == 0) return kRungArea;
     if (knownCls == kOwnNone || knownCls == kOwnShared) return kRungArea;
     return kRungDefer;
 }
@@ -173,6 +172,35 @@ inline int HandbackStart(double since, int mySlot, int prevState, int sameBuildi
 inline int HandbackServes(int heldByOwner, int wroteByArea, int areaMineNow)
 {
     return (heldByOwner != 0 && wroteByArea != 0 && areaMineNow != 0) ? 1 : 0;
+}
+/* T-823 fold 3: a waiting hand-back (state 0) whose ask did not go out (askSent 0: the box could not be read, or there was no road
+   to the area's holder) is asked again at each tick until it goes; its wait then ends on the answer as usual. 1 = ask now. */
+inline int HandbackAskDue(int state, int askSent) { return (state == 0 && askSent == 0) ? 1 : 0; }
+/* T-823 fold 3: 1 = no other game can answer the hand-back with contents - this game holds the box's area itself (holderSlot is
+   mySlot), and only the area's holder serves a hand-back's contents (HandbackServes). The hand-back then does not wait at all. */
+inline int HandbackNobodyAnswers(int holderSlot, int mySlot) { return (holderSlot >= 0 && holderSlot == mySlot) ? 1 : 0; }
+/* T-823 (run T1424): DOES THE SECTOR ARRIVAL ASK LIST THIS BOX? The ask goes to the game that holds the area, and only a box's
+   writer answers with its contents. cls = the box's owner class; writerHeld = this game's writer answer names another game
+   (kRungHeld / kBoxHeld); writerSlot = that game's slot (-1 not known); areaSlot = the slot of the OTHER game holding the box's area
+   (-1 none, not known, or this game). A box no player owns, or whose building cannot be read, is listed as before (the area rule);
+   this game's own box never (its hand-back covers it); another player's, a shared or an unresolved owner's box only when its writer
+   IS the area's holder. A box whose writer is a game other than the area's holder is not listed (that holder would answer "not
+   holder"); one this game writes, or nobody writes now, is not listed either. */
+inline int ParityAskListsBox(int cls, int writerHeld, int writerSlot, int areaSlot)
+{
+    if (cls == kOwnMe) return 0;
+    if (cls != kOwnPeer && cls != kOwnShared && cls != kOwnUnknown) return 1;
+    return (writerHeld != 0 && writerSlot >= 0 && writerSlot == areaSlot) ? 1 : 0;
+}
+/* T-823 fold 3: THE ARRIVAL ASK'S FIRST CUT by the owner class alone, before the key is read. kPaTake = listed as before (no
+   player owns it, or its building cannot be read); kPaLeave = left out (this game's own box: its hand-back covers it); kPaByWriter =
+   a player's box whose writer decides (ParityAskListsBox) once its key and sector are read. Values of their own, not the kPb* modes. */
+const int kPaTake = 0, kPaLeave = 1, kPaByWriter = 2;
+inline int ParityAskBoxClass(int cls)
+{
+    if (cls == kOwnMe) return kPaLeave;
+    if (cls == kOwnPeer || cls == kOwnShared || cls == kOwnUnknown) return kPaByWriter;
+    return kPaTake;
 }
 
 /* inv4b 7: a parity answer for a hand-back in `state`: the new state; *counted = 1 only for the FIRST answer. Contents that

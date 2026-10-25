@@ -7,6 +7,7 @@
 #include "bugreport.h"  /* T-461: LOG_ASK / LOG_PART, a nearby player's log for a bug report */
 #include "chat.h"       /* a chat line from another player */
 #include "../common/ownrec.h"
+#include "../common/buildpick.h"   /* T-906: WorldKey - the building-swap pick's world key */
 #include "../common/zonerec.h"   /* T-609 part 2 (H1): a zone record is stamped max(now, last + 1) */
 #include "../common/savesquadforeign.h"   /* T-710: whose characters a save squad file holds, and the fence for laying this game's own record over it */
 #include "../common/teamresearch.h"   /* T-546 step 6: the shared research decisions (StoreResearchLoadUnion) */
@@ -17,12 +18,16 @@
 #include "../common/squadorigin.h"   /* a squad's origin slot: its number's block, or for a save squad the game that runs it now */
 #include "../common/numberblock.h"   /* T-642: where a faction's squad counter stands in this game's number block */
 #include "../common/squadlead.h"   /* T-799: the money-known rules, the money list and the record money field */
+#include "../common/groundrec.h"   /* T-697 step 2: a ground.<sx>.<sy> record is an area's ground (items.cpp keeps it), never a squad; GROUND_REFUSE (71) */
+#include "../common/piecerec.h"   /* a piece.<sx>.<sy>.#<hash>.<x10>.<z10>.<y10> record is one built piece (build.cpp keeps it), never a squad */
+#include "../common/boxrec.h"   /* T-823: a box.<sx>.<sy>.#<hash>.<x10>.<z10> record is one box's contents (items.cpp keeps it), never a squad */
 namespace coop { bool HandedOverHas(void* faction, const std::string& id); bool HandedOverHasId(const std::string& id); bool HandedOverAny(); int HandedOverSlot(void* faction, const std::string& id); }   /* handoff.cpp (handoff.h) - declared here alone, as zones.cpp declares its one */
 namespace coop { void* SpawnBuildingFromSentHand(const unsigned char* handRaw32); int PlatoonHomeHandPod(const void* platoon, unsigned char* out32); int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32); }   /* spawn.cpp: a sent building handle resolved here; a squad's home-building hand read and given back [t755-copyhome-decl] */
 namespace coop { void KeptNoteRows(const char* p, size_t n); void KeptSaveFinished(long reqSeq); void KeptAreaWritten(const std::string& zoneId); void KeptAreaEcho(const std::string& worldId, int hasStamp, long long stamp); void KeptAreaSent(const std::string& zoneId, int sent, long long stamp); void KeptAreaStampSent(const std::string& zoneId, long long stamp); }   /* KEPT (src/common/keptwire.h): the rows and their state, and what settles a lay - defined in the kept block at the end of this file */
 namespace coop { void KeeperMoneyKnownMark(void* own, int ev); int KeeperMoneyKnown(void* own); void KeeperRecordMoneyNote(int carried); void KeeperMoneyListNote(int kind); }
 namespace coop { void KeeperRepairForget(void* own); }   /* items.cpp: a freed squad's pot leaves the keeper repair's rows */   /* handoff.cpp: T-799 the money-known mark of a squad pot (D1) and the records' money counts (D2) */
 namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps skipped because the squad's faction RECORD is a stand-in */
+namespace coop { extern volatile long g_bdPickKey; }   /* build.cpp (LONG; the Windows names are not included yet here) - T-906: the world key the building-swap pick draws from (PickWorldKeyPublish) */
 #include "../common/queuejournal.h"   /* B12 (decision 52): the outage queue's two pure decisions - the conflict rule and the journal line */
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "../common/uidblock.h"   /* M4 fold (store protocol 58): UID_BLOCK - the notebook's uid counter blocks */
@@ -43,6 +48,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "build.h"          /* build1-c: BuildForgetWorld at world teardown */
 #include "relations.h"      // RelationsForgetQueue at world teardown
 #include "../common/carrycheck.h"   /* carryread / carryset: RESET WORLD's carry as counts and exact sums */
+#include "../common/writequeue.h"   /* coopwq::FileName: the one rule both programs name a record's files by */
 #include "playerstab.h"     /* T-545: PlayersTabForgetWorld at world teardown */
 #include "fallentab.h"      /* T-556: FallenTabForgetWorld at world teardown */
 #include "team.h"           /* T-546 step 3: TeamArrive - the faction membership table */
@@ -62,6 +68,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "../common/liverelay.h"   /* M6 (T-197 piece 6, store protocol 60): the AREA target, CATCHUP (56) and the notebook road's own inner types - the SAME header the notebook and the offline suite compile */
 #include "../common/pumpcarry.h"   /* the world-server link's carry: arrival order, a waiting relayed MOVE overwritten by a newer one */
 #include "../common/prisonwire.h"   /* a relayed PRISON's kind: a death request is dropped during a load */
+#include "../common/squadsplit.h"   /* T-948 b: the two new-squad hooks' decisions (copies are not split off) */
 #include "../common/liveenvelope.h"   /* M5a (T-197 piece 4, store protocol 59): LIVE (53) - the SAME header the notebook and the offline suite compile */
 #include "../common/handrec.h"   /* T-889 step 2: MSG_ITEM_HANDOVER's number (asserted below) */
 #include "../common/liveowner.h"   /* M7a A1 build 1 [a1b1-st6]: the OWNER_MOVED road gate */
@@ -81,6 +88,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include "../common/loadlatch.h"   /* P7y (F610): WorldGenBumpDecide - the world-generation latch as a pure function, swept by the same offline suite */
 #include "../common/stateptr.h"   /* T-296 fix 2 (H055): coopstate::StateWakeDecide / StateReloadAllowed / StateCreateDecide - a platoon's state record (+0x40) lives outside its own container; the offline suite sweeps the same header */
 #include "../common/slotwire.h"   /* stand1: coop-p<n> ids and the N-party zone owner swap */
+#include "../common/squadbirth.h"   /* a squad's birth flag: the keep question, the discard delete, the retire rule */
 #include "../common/storemeta.h"   /* B10 (audit C13): kOwnerUnknown, OwnerFieldFromSlot and OwnerTranslateDecide - the SAME translation unit the notebook and the offline test exe compile, so three programs cannot hold three ideas of what the RECORD owner field means. */
 #include "../common/modlist.h"   /* settings5 S5: the mod list on the store HELLO and in the mods REFUSE */
 #include "../common/permdelete.h"   /* DELETE WORLD / DELETE PROFILE delete for good - the path-inside check and which saves go */
@@ -123,6 +131,7 @@ namespace { long long g_sleepSkippedStandInRecord = 0; }   /* area2 fold: sleeps
 #include <errno.h>   /* tickwait: EnsureDir tells EEXIST from a missing parent */
 #include "../common/dirlevels.h"   /* tickwait: EnsureDir makes every missing folder level (pure, offline-tested) */
 #include "../common/recname.h"     /* a record's data file name: the world server's folder and this game's mirror */
+#include "../common/mirrorkeep.h"   /* T-985 C1: the kept mirror folder's name and the kept record table (pure) */
 #include "../common/owedpop.h"   /* T-581: OWED (63) - the owed town populations; the SAME header the world server and the offline suite compile */
 #include "../common/townrefill.h"   /* TOWN_LOSS (64) and RECORD_GONE's town - the SAME header the world server and the offline suite compile */
 #include <ctime>
@@ -384,6 +393,10 @@ unsigned long long kSaveManagerSaveRva = 0; static coop::AddrReg kSaveManagerSav
    caller (execute 0x47BAA0), and both the title screen's Load button and the plugin's own `load` verb reach it,
    so it is the only point a player-driven load passes through. Its return is a three-way at that caller:
    0 = loaded, 2 = return silently, anything else = the engine's "Failed to load game" box. */
+unsigned long long kEditorResetRva = 0; static coop::AddrReg kEditorResetRva_reg("ZoneManager_resetPopulation", &kEditorResetRva);   /* Steam_1.0.65 0x9FCC30 - the Level Editor's Reset Population */
+unsigned long long kEditorShowRva = 0; static coop::AddrReg kEditorShowRva_reg("LevelEditor_setVisible", &kEditorShowRva);   /* Steam_1.0.65 0x77B350 - LevelEditor::setVisible(this, bool) */
+unsigned long long kSqSplitRva = 0; static coop::AddrReg kSqSplitRva_reg("ActivePlatoon_specialToNewSquads", &kSqSplitRva);   /* T-948 b: Steam_1.0.65 0x79B620 - ActivePlatoon::_putTheSpecialCharactersInNewSquads(this) */
+unsigned long long kSqMoveRva = 0; static coop::AddrReg kSqMoveRva_reg("Character_moveToNewSquad", &kSqMoveRva);   /* T-948 b: Steam_1.0.65 0x5CDA50 - Character::moveToNewSquad(this, bool) -> Platoon* */
 unsigned long long kT239SmLoadName = 0; static coop::AddrReg kT239SmLoadName_reg("SaveManager_loadSave", &kT239SmLoadName);   /* T-239: the F9 quickload refusal. Steam_1.0.65 0x47AC10 */
 unsigned long long kLoadGameRva = 0; static coop::AddrReg kLoadGameRva_reg("LoadGame", &kLoadGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x373DC0 */
 /* L1 (T243; F555 corrected). void SaveManager::execute - the save-request PUMP, loadGame's only caller. Its load arm
@@ -439,7 +452,7 @@ const int kSaveRequestLoad = 2;
 unsigned long long kSaveFileSystemGlobalRva = 0; static coop::AddrReg kSaveFileSystemGlobalRva_reg("SaveFileSystemGlobal", &kSaveFileSystemGlobalRva);   /* P8h: the address table fills this. Steam_1.0.65 0x212DC08 */
 const unsigned int kSfsBusyOff = 0x1E0;
 unsigned long long kResetGameRva = 0; static coop::AddrReg kResetGameRva_reg("ResetGame", &kResetGameRva);   /* P8h: the address table fills this. Steam_1.0.65 0x36CA40 */   // F489: GameWorld::resetGame - what SaveManager::loadGame calls to clear the world mid-session (FactionDirectory::clearAndFree, the global container, the player faction)
-const unsigned int kStoreProtocol = 101;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kStoreProtocol = 108;   /* the world-server protocol this game speaks (store_main.cpp kProtocol): raise both when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 typedef bool (*GdcLoadFn)(void* container, const std::string* file, const std::string* modName, int modIndex, void* serialisable, bool flag);
 GdcLoadFn orig_gdcLoad = 0;
 /* Z1-b (review-z1 item 1): the readFile -> load handshake. It was two bare strings any thread overwrote; it is now a
@@ -464,7 +477,7 @@ struct ZoneStamp { long long writtenAt; unsigned long long seq; ZoneStamp() : wr
    record of this zone existed, with the record list known on link generation markGen"; on a load from a record it is the
    link generation of that load. */
 struct ZoneSwapEntry { std::string file; int owner; long long writtenAt; unsigned long long seq; ZoneSwapEntry() : owner(0), writtenAt(0), seq(0) {} };
-struct ZoneMarkEvent { bool loaded; ZoneStamp stamp; long markGen; ZoneMarkEvent() : loaded(false), markGen(-1) {} };
+struct ZoneMarkEvent { bool loaded; ZoneStamp stamp; long markGen; long provGen; int listDone; ZoneMarkEvent() : loaded(false), markGen(-1), provGen(-1), listDone(-1) {} };   /* T-823 fold 2: provGen / listDone */
 std::map<std::string, ZoneSwapEntry> g_zoneSwapTS; std::map<std::string, ZoneMarkEvent> g_zoneMarkPending; CRITICAL_SECTION g_zoneSwapLock; bool g_zoneSwapLockInit = false;
 volatile LONG64 g_zoneReadOffMain = 0, g_zoneSwapOffMainTranslate = 0; long long g_zoneSwapNoPeerFaction = 0;   /* Z1-b: reads seen off the main thread; swaps refused because translation needs the main thread / the coop-peer faction */
 /* the player numbers each area record's FILE names as building owners (coopslot::ZoneFileNamedSlots), for the record version
@@ -496,6 +509,53 @@ int ZoneMySlot();   /* g_mySlot - defined below beside it, same (anonymous) name
    equal to g_linkGen only while this game holds the full record list of the link it is on. Interlocked - the zone read
    detour reads it on worker threads. */
 volatile long g_feedDoneLinkGen = -1;
+/* T-985 step 2B: THE AREA_DONE TABLE (recordfeed.h AreaDoneTable) - per area (key y * 64 + x) the stamp at which its records were all
+   here, the whole-table stamp, and the stamp of the last write (any area). A stamp is FeedAreaStampMake(g_areaDoneGen, link)
+   (fold, review LOW 4); a clear moves g_areaDoneGen - at each WELCOME and every world load, where g_snapshotApplied and
+   g_feedDoneLinkGen are reset - so an older stamp never reads as done. The last page's marker sets the whole-table stamp before
+   g_feedDoneLinkGen (fold, review MED 1 + 2); AREA_DONE all=1 only counts; all=0 stamps its named areas (step C). Written on the
+   main thread with interlocked calls, read anywhere with interlocked reads. g_areaGateDisagree counts a gate whose new answer is not
+   the old one (it must stay 0). */
+coopfeed::AreaDoneTable g_areaDone;
+volatile long g_areaDoneGen = 1;
+volatile long g_areaGateDisagree[kAreaGateCount] = { 0, 0, 0, 0, 0, 0, 0 };
+long long g_areaDoneAllFeed = 0, g_areaDoneAllTotal = 0, g_areaDoneAllMismatch = 0, g_areaDoneAreas = 0, g_areaDoneStale = 0, g_areaDoneMarkersStale = 0, g_areaDoneMalformed = 0;
+long long AreaDoneStamp(int k)
+{
+    if (k == coopfeed::kFeedAreaAny) return ::InterlockedCompareExchange64(&g_areaDone.some, 0, 0);
+    if (k < 0 || k >= coopfeed::kFeedAreaKeys) return -1;
+    return ::InterlockedCompareExchange64(&g_areaDone.area[k], 0, 0);
+}
+void AreaGateCount(int gate, int oldAnswer, int newAnswer)
+{
+    if ((oldAnswer != 0) != (newAnswer != 0) && gate >= 0 && gate < kAreaGateCount) ::InterlockedIncrement(&g_areaGateDisagree[gate]);
+}
+/* the zone gates: area k done ON this link in this generation (g_feedDoneLinkGen's meaning, per area) */
+int AreaDoneOnLinkGate(int k, long link, int oldAnswer, int gate)
+{
+    const long gen = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
+    const int n = coopfeed::FeedAreaDoneOnLink(::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), AreaDoneStamp(k), gen, link);
+    AreaGateCount(gate, oldAnswer, n);
+    return n;
+}
+/* the snapshot gates: area k done in this generation (StoreSnapshotApplied's meaning, per area) */
+int AreaDoneHeldGate(int k, int oldAnswer, int gate)
+{
+    const long gen = ::InterlockedCompareExchange(&g_areaDoneGen, 0, 0);
+    const int n = coopfeed::FeedAreaDoneHeld(::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), AreaDoneStamp(k), gen);
+    AreaGateCount(gate, oldAnswer, n);
+    return n;
+}
+void AreaDoneClear() { ::InterlockedIncrement(&g_areaDoneGen); }   /* fold (LOW 4): every stamp of the old generation stops reading as done */
+/* T-823 fold 2 (run T1424): MAIN THREAD. Area reads (and loads from a record) made while the link was up but its record list was
+   not complete: the link generation and world teardown count at the read; judged at the list's end (ZoneProvisionalSettle), thrown
+   away at a WELCOME or a world teardown (ZoneProvisionalThrow). */
+struct ZoneProvRead { long gen; long long teardowns; bool fromRecord; bool afterSettle; ZoneStamp stamp; ZoneProvRead() : gen(-1), teardowns(0), fromRecord(false), afterSettle(false) {} };   /* afterSettle: fold 4 */
+std::map<std::string, ZoneProvRead> g_zoneProvRead;
+long long g_zoneProvMade = 0, g_zoneProvGood = 0, g_zoneProvDropRecord = 0, g_zoneProvDropLink = 0, g_zoneProvDropTeardown = 0,
+          g_zoneProvThrown = 0, g_zoneReadLines = 0, g_zoneReadLinesSuppressed = 0,
+          g_zoneProvWaitAtSettle = 0;   /* T-823 fold 4: provisional reads made after a settle of their own link, still waiting at the next settle or throw */
+long g_zoneSettledGen = -1;   /* T-823 fold 4: MAIN THREAD - the link generation of the last list-end settle (-1 after a throw: a WELCOME or teardown) */
 /* seconds on the performance counter - the clock zones.cpp stamps coop::MyMapLoadedSinceTS with */
 static double ZoneNowSec() { static LARGE_INTEGER f; static bool have = false; if (!have) { ::QueryPerformanceFrequency(&f); have = true; } LARGE_INTEGER c; ::QueryPerformanceCounter(&c); return (double)c.QuadPart / (double)f.QuadPart; }
 volatile LONG64 g_zoneSwapWithdrawn = 0;   /* Z1-c (recheck-z1b item 2): swaps withdrawn because the swap entry was hidden or changed between a worker's lookup and its handshake */
@@ -520,7 +580,7 @@ LoadFromDiskFn orig_loadFromDisk = 0;
 uintptr_t Base() { return (uintptr_t)::GetModuleHandleA(0); }
 
 /* home: the group's home building key as an index line carries it (ParseMetaLine) - the live registry is g_homeOf, below */
-struct Record { std::string worldId, squadSid, factionName, file, town, home; float x, y, z; long long writtenAt; int owner; long long posAt; int gone; unsigned long long seq; long seqLinkGen; Record() : x(0), y(0), z(0), writtenAt(0), owner(0), posAt(0), gone(0), seq(0), seqLinkGen(-1) {} };   /* T-313 seqLinkGen = the notebook link seq was taken on */   /* B12 (decision 52): seq is the NOTEBOOK'S sequence number for this record - stamped by that one process, read off its index line or its push-down, and never chosen here. It is what a queued write's conflict is decided against; 0 means no notebook has stamped it */   // gone (P4e): the group was wiped out / thrown away; never re-created from this entry   // posAt: the position's own time (P2: sleeping squads travel)
+struct Record { std::string worldId, squadSid, factionName, file, town, home; float x, y, z; long long writtenAt; int owner; long long posAt; int gone; unsigned long long seq; long seqLinkGen; int birth; Record() : x(0), y(0), z(0), writtenAt(0), owner(0), posAt(0), gone(0), seq(0), seqLinkGen(-1), birth(-1) {} };   /* birth: the squad's birth flag (squadbirth.h), -1 unknown */   /* T-313 seqLinkGen = the notebook link seq was taken on */   /* B12 (decision 52): seq is the NOTEBOOK'S sequence number for this record - stamped by that one process, read off its index line or its push-down, and never chosen here. It is what a queued write's conflict is decided against; 0 means no notebook has stamped it */   // gone (P4e): the group was wiped out / thrown away; never re-created from this entry   // posAt: the position's own time (P2: sleeping squads travel)
 std::map<std::string, Record> g_records;          // worldId -> the newest record known here (the host's set is canonical)
 std::map<void*, std::string> g_bind;              // Platoon* -> worldId (client: the host's platoon id from CONTEXT)
 std::map<std::string, void*> g_byWorldId;         // worldId -> Platoon* seen here (sleep/wake hooks, binds)
@@ -731,6 +791,15 @@ long long g_welcomeIdTorn = 0;         /* T-490: protocol-69 WELCOMEs whose id f
 /* T-490: THE IDENTITY THIS GAME HOLDS - the index's world once its index is read, else the WELCOME it accepted ("" = none). */
 const std::string& HeldWorldId() { return g_indexLoaded ? g_indexWorldId : g_linkWorldId; }
 bool HeldWorldUpgraded() { return g_indexLoaded ? g_indexWorldUpgraded : g_linkWorldIdUpgraded; }
+/* T-906: the world id this game holds, as the key the building-swap pick draws from (build.cpp detour_swapPick, any thread). The world
+   server gives every game of one world the same id, so every game draws the same choice; no id yet = 0 = the engine's own draw.
+   Published wherever the world id is set (the WELCOME, the index read in StoreArmWorldIndex), so the key follows the id at once. */
+void PickWorldKeyPublish()
+{
+    const std::string& id = HeldWorldId();
+    const LONG k = id.empty() ? 0 : (LONG)buildpick::WorldKey(id.c_str());
+    if (::InterlockedCompareExchange(&coop::g_bdPickKey, 0, 0) != k) ::InterlockedExchange(&coop::g_bdPickKey, k);
+}
 /* T-490: the world id a key file write carries (coopworld::KeyWriteWorldId); fileId = the file's own field 8. */
 std::string KeyIdForWrite(const std::string& fileId) { return coopworld::KeyWriteWorldId(g_indexLoaded, g_indexWorldId, g_linkWorldId, fileId); }
 // E24.1 (review-p5o HIGH-1) - HAS THE NOTEBOOK FINISHED ITS OPENING PUSH? 0 = never welcomed (or the link went
@@ -762,7 +831,7 @@ int g_welcomePush = 0;
 int g_basePolicy = coop::kPolicyUnknown;
 // review-p5b CRASH-2: LinkUp() dereferences g_link, which the MAIN thread deletes (SetStoreServer below) - a worker inside StoreRelayLinked() was one delete away from a virtual call through freed heap. The main thread refreshes this flag; every other thread reads it. Same shape as towngen.cpp:40's cached session flags.
 volatile long g_relayLinkedCached = 0;
-// review-p5d CRASH-1: net::SessionLinked() is `g_transport != 0 && g_transport->State() == LINK_UP` - a null test and a virtual call as two separate operations, over a pointer the MAIN thread deletes (net/session.cpp). The two detours below (detour_unloadedUpdate, detour_gdcSave -> ZoneWriteIsMine) carry no OnMainThread() guard, so they read this flag instead. Same shape as g_relayLinkedCached above and as towngen.cpp:40 / worldgen.cpp's g_wgLinkedCached.
+// review-p5d CRASH-1: net::SessionLinked() is `g_transport != 0 && g_transport->State() == LINK_UP` - a null test and a virtual call as two separate operations, over a pointer the MAIN thread deletes (net/session.cpp). The two detours below (detour_unloadedUpdate, detour_gdcSave -> ZoneWriteIsMine) carry no OnMainThread() guard, so they read this flag instead. Same shape as g_relayLinkedCached above and as towngen.cpp:40.
 volatile long g_sessionLinkedCached = 0;
 bool LinkUp() { return g_link != 0 && g_link->State() == net::LINK_UP && g_storeWelcomed && !g_storeProtoMismatch && !g_storeWrongWorld; }   /* MAIN THREAD ONLY - off-thread callers read StoreRelayLinked() */
 /* B9: THE MOMENT THE NOTEBOOK WAS LAST REACHABLE, as a GetTickCount stamp. Written on the main thread in
@@ -917,6 +986,98 @@ int ReadPod(void* p, Pod* o)
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* EVERY SQUAD'S BIRTH FLAG (squadbirth.h), keyed by the platoon: noted when the squad is made - createRandomUnloadedSquad's kept byte
+   (towngen.cpp CreatedTown, any thread), a copy's CONTEXT word (StoreBindPlatoon), a record's flag (CreateUnknownSquad) - or, for a
+   squad from a save load, read once off its own kept byte while it is awake (the engine saves and reloads the byte; it clears it only at
+   the unload itself, _NV_reCheckPersistenceOnUnload 0x9A6860). Value: the birth (0 / 1), plus kBirthFromLive for a read one. The row
+   goes with the platoon (ForgetPlatoonRows). ANY THREAD - its own lock; the lookups never dereference the platoon. */
+const int kBirthFromLive = 2;
+const size_t kBirthCap = 65536;
+CRITICAL_SECTION g_birthLock;
+volatile LONG g_birthLockState = 0;
+std::map<void*, int> g_birthOf;
+volatile LONGLONG g_birthNoted = 0, g_birthLiveRead = 0, g_birthCapFull = 0, g_keepOffThread = 0;   /* g_keepOffThread: keep questions asked off the main thread, answered as before the birth flag (kept) */
+long long g_birthFilled = 0;   /* MAIN THREAD: held records whose unknown birth flag an arriving record filled, newer or not */
+std::set<void*> g_discarding;            /* MAIN THREAD: bound squads whose last keep answer was the game's own 'discard' while they had living members */
+/* T-999 fold 3: bound squads that lost a member to an engine UNLOAD removal (spawn.cpp NotifyDespawn's RemovalIsUnload branch - the area
+   unload's squad walk, 'wandered out of zone') since they were last asked the keep question with living members. At an area unload the
+   engine asks with the members there, removes them all, asks again with the squad empty (-2) and destroys it: a squad here keeps its
+   discard mark through the empty question and its destroy takes the discard delete (squadbirth.h DiscardMarkErased, LivingUnloadRoad).
+   A squad emptied by hiring or merging is not here. Forgotten with the platoon (ForgetPlatoonRows), at its unbind and at teardown;
+   capped. MAIN THREAD. */
+std::set<void*> g_unloadEmptied;
+const size_t kUnloadEmptiedCap = 65536;
+long long g_unloadEmptiedNoted = 0, g_unloadEmptiedKeptMark = 0, g_unloadEmptiedDiscard = 0, g_unloadEmptiedCapFull = 0, g_unloadEmptiedCleared = 0, g_unloadEmptiedLines = 0;
+volatile LONGLONG g_unloadEmptiedOffThread = 0;   /* removals replayed off the object (the off-thread despawn drain) or off the main thread: counted, not noted */
+std::map<void*, int> g_keepVerdictOf;    /* MAIN THREAD: each bound squad's last keep verdict (squadbirth.h), so a squad is counted once per change */
+void BirthLockEnter()
+{
+    if (::InterlockedCompareExchange(&g_birthLockState, 1, 0) == 0) { ::InitializeCriticalSection(&g_birthLock); ::InterlockedExchange(&g_birthLockState, 2); }
+    while (g_birthLockState != 2) ::Sleep(0);
+    ::EnterCriticalSection(&g_birthLock);
+}
+void BirthNoteRaw(void* platoon, int value)
+{
+    if (platoon == 0) return;
+    BirthLockEnter();
+    std::map<void*, int>::iterator it = g_birthOf.find(platoon);
+    if (it != g_birthOf.end()) it->second = value;
+    else if (g_birthOf.size() < kBirthCap) g_birthOf[platoon] = value;
+    else ::InterlockedIncrement64(&g_birthCapFull);
+    ::LeaveCriticalSection(&g_birthLock);
+}
+void BirthNote(void* platoon, int birth)
+{
+    if (birth != sqbirth::kBirthKeep && birth != sqbirth::kBirthDiscard) return;
+    BirthNoteRaw(platoon, birth); ::InterlockedIncrement64(&g_birthNoted);
+}
+/* the row (birth | kBirthFromLive), -1 none */
+int BirthRow(void* platoon)
+{
+    if (platoon == 0) return -1;
+    BirthLockEnter();
+    std::map<void*, int>::const_iterator it = g_birthOf.find(platoon);
+    const int v = it != g_birthOf.end() ? it->second : -1;
+    ::LeaveCriticalSection(&g_birthLock);
+    return v;
+}
+/* the birth flag this game publishes for a squad (squadbirth.h BirthToPublish): one noted at its creation, copy or record; one read off
+   its own kept byte goes as unknown. A map lookup only, so a freed platoon may be asked. */
+int BirthPublishOf(void* platoon) { const int v = BirthRow(platoon); return v < 0 ? sqbirth::kBirthUnknown : sqbirth::BirthToPublish(v & 1, (v & kBirthFromLive) != 0 ? 1 : 0); }
+void BirthForget(void* platoon)
+{
+    if (platoon == 0) return;
+    BirthLockEnter(); g_birthOf.erase(platoon); ::LeaveCriticalSection(&g_birthLock);
+}
+/* the known birth flag of the record this squad is bound to, -1 none. MAIN THREAD. */
+int BoundRecordBirth(void* platoon)
+{
+    std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
+    if (b == g_bind.end()) return sqbirth::kBirthUnknown;
+    std::map<std::string, Record>::const_iterator rr = g_records.find(b->second);
+    return rr != g_records.end() ? rr->second.birth : sqbirth::kBirthUnknown;
+}
+/* the birth flag a keep question uses (squadbirth.h BirthChoose): the one noted at its creation, copy or record; else its bound
+   record's known flag; else its own kept byte, read once and noted (*fromLive = 1 for such a flag); -1 unreadable. The record comes
+   before the byte: a resident knocked out at an unload has its byte cleared by the engine, and a save keeps the cleared byte.
+   MAIN THREAD, a live platoon. */
+int BirthResolve(void* platoon, int* fromLive)
+{
+    const int v = BirthRow(platoon);
+    const int noted = (v >= 0 && (v & kBirthFromLive) == 0) ? (v & 1) : sqbirth::kBirthUnknown;
+    int live = (v >= 0 && (v & kBirthFromLive) != 0) ? (v & 1) : sqbirth::kBirthUnknown;
+    const int rec = noted >= 0 ? sqbirth::kBirthUnknown : BoundRecordBirth(platoon);
+    if (noted < 0 && rec < 0 && live < 0)
+    {
+        Pod q;
+        if (Plaus(platoon) && ReadPod(platoon, &q))
+        {
+            live = q.persistent != 0 ? sqbirth::kBirthKeep : sqbirth::kBirthDiscard;
+            BirthNoteRaw(platoon, live | kBirthFromLive); ::InterlockedIncrement64(&g_birthLiveRead);
+        }
+    }
+    return sqbirth::BirthChoose(noted, rec, live, fromLive);
 }
 /* The person records (type 0x24, one per character) in the record container of a sleeping or awake platoon (holder+0x10);
    -1 = no container, a broken count or a fault. The walk is the mmo1c container walk. MAIN THREAD. */
@@ -1282,7 +1443,7 @@ void P113Emit(const P113Ev& e)
     {
         if (e.sharedWith != 0 && g_p113AlarmLines < kP113AlarmCap) { ++g_p113AlarmLines; ErrorLog("[P113] SHARED HEAD rec=" + P(e.rec) + " " + P113RdText(e.rd) + " - its instances head was freed by the destroy of rec=" + P(e.sharedWith) + " via=" + P113Via(e.via, 4) + " thread=" + th + P113FreedText(e)); }
         if (!g_p113Verbose) { }   /* PROBE P113: ordinary runs print alarms + REPORT only */
-        else if (g_p113Lines < kP113LineCap) { ++g_p113Lines; DebugLog("[P113] destroy rec=" + P(e.rec) + " " + P113RdText(e.rd) + " container=" + P(e.firstContainer) + " via=" + P113Via(e.via, 4) + " thread=" + th + " (#" + N(g_p113First) + ")"); }
+        else if (g_p113Lines < kP113LineCap) { ++g_p113Lines; SW_DEVLOG("[P113] destroy rec=" + P(e.rec) + " " + P113RdText(e.rd) + " container=" + P(e.firstContainer) + " via=" + P113Via(e.via, 4) + " thread=" + th + " (#" + N(g_p113First) + ")"); }
         else ++g_p113Capped;
     }
     else if (e.kind == 4 || e.kind == 5)
@@ -1290,7 +1451,7 @@ void P113Emit(const P113Ev& e)
         const std::string hwT = " head=" + P(e.rd.head) + " size=" + N((long long)e.rd.hsize) + " headWords=" + P113Hex(e.firstVia[0]) + "," + P113Hex(e.firstVia[1]) + "," + P113Hex(e.firstVia[2]);
         if (e.kind == 5 && e.reuse)   /* PROBE P113 (count): a REUSE is counted on REPORT p113[...]; only the first 3 per run are written, as Debug lines */
         {
-            if (g_p113ReuseLines < kP113ReuseLineCap) { ++g_p113ReuseLines; DebugLog("[P113] SECOND DESTROY (any record) " + P113ReuseText(e) + " rec=" + P(e.rec) + " type=" + N((long long)e.rd.type) + " sidLen=0 container+0x10=" + P(e.rd.container) + hwT + " via=" + P113Via(e.via, 4) + " thread=" + th + " - same address and head as a record destroyed before, stringID emptied; run as the engine asked"); }
+            if (g_p113ReuseLines < kP113ReuseLineCap) { ++g_p113ReuseLines; SW_DEVLOG("[P113] SECOND DESTROY (any record) " + P113ReuseText(e) + " rec=" + P(e.rec) + " type=" + N((long long)e.rd.type) + " sidLen=0 container+0x10=" + P(e.rd.container) + hwT + " via=" + P113Via(e.via, 4) + " thread=" + th + " - same address and head as a record destroyed before, stringID emptied; run as the engine asked"); }
         }
         else if (g_p113AlarmLines < kP113AlarmCap)
         {
@@ -1304,7 +1465,7 @@ void P113Emit(const P113Ev& e)
     else if (e.kind == 2)
     {
         const std::string body = "rec=" + P(e.rec) + " " + P113RdText(e.rd) + " first sid='" + std::string(e.firstSid) + "' container=" + P(e.firstContainer) + " firstVia=" + P113Via(e.firstVia, 4) + " via=" + P113Via(e.via, 4) + " thread=" + th;
-        if (e.reuse) { if (g_p113ReuseLines < kP113ReuseLineCap) { ++g_p113ReuseLines; DebugLog("[P113] SECOND DESTROY " + P113ReuseText(e) + " " + body); } }   /* PROBE P113 (count): kind 2 runs the same classifier */
+        if (e.reuse) { if (g_p113ReuseLines < kP113ReuseLineCap) { ++g_p113ReuseLines; SW_DEVLOG("[P113] SECOND DESTROY " + P113ReuseText(e) + " " + body); } }   /* PROBE P113 (count): kind 2 runs the same classifier */
         else if (g_p113AlarmLines < kP113AlarmCap) { ++g_p113AlarmLines; ErrorLog("[P113] SECOND DESTROY " + P113ReuseText(e) + " " + body); }
         else ++g_p113Capped;
     }
@@ -1472,7 +1633,7 @@ void P113Snapshot(void* container, const char* why)
     ++g_p113Snaps;
     ::InterlockedExchange(&g_p113Active, 1);
     ::LeaveCriticalSection(&g_p113Lock);
-    if (g_p113Verbose && g_p113Lines < kP113LineCap) { ++g_p113Lines; DebugLog("[P113] tracked container=" + P(container) + " records=" + N((long long)n) + " walk=" + N((long long)w) + " why=" + why + " tracked=" + N((long long)g_p113Tracked.size())); }
+    if (g_p113Verbose && g_p113Lines < kP113LineCap) { ++g_p113Lines; SW_DEVLOG("[P113] tracked container=" + P(container) + " records=" + N((long long)n) + " walk=" + N((long long)w) + " why=" + why + " tracked=" + N((long long)g_p113Tracked.size())); }
 }
 void P113NoteContainer(void* container) { if (g_p113LockOk && container != 0 && OnMainThread()) P113Snapshot(container, "create"); }
 void P113NoteLoad(void* container)
@@ -1505,7 +1666,7 @@ void P113Tick()
     ::EnterCriticalSection(&g_p113Lock); n = g_p113RingN; for (int k = 0; k < n; ++k) local[k] = g_p113Ring[k]; g_p113RingN = 0; ::LeaveCriticalSection(&g_p113Lock);
     for (int k = 0; k < n; ++k) P113Emit(local[k]);
     static DWORD last = 0; const DWORD now = ::GetTickCount();
-    if (orig_p113GdDtor != 0 && (last == 0 || now - last >= 60000)) { last = now; DebugLog(P113ReportLine()); }   /* every 60 s in every run (the probe watches every record) */
+    if (orig_p113GdDtor != 0 && (last == 0 || now - last >= 60000)) { last = now; SW_DEVLOG(P113ReportLine()); }   /* every 60 s in every DEV run (the probe watches every record); T-879: test-only, P113 is a DEV probe */
 }
 void P113Install(uintptr_t base)
 {
@@ -1513,7 +1674,7 @@ void P113Install(uintptr_t base)
     ::InitializeCriticalSection(&g_p113Lock); ::InterlockedExchange(&g_p113LockOk, 1); { HMODULE k = ::GetModuleHandleA("kernel32.dll"); if (k) g_p113Capture = (P113CaptureFn)::GetProcAddress(k, "RtlCaptureStackBackTrace"); }
     if (kP113GdDtorRva == 0) { ErrorLog("[P113] GameData_dtor row missing - probe off"); return; }
     const coop::HookStatus h = coop::AddHook((void*)(base + kP113GdDtorRva), (void*)&detour_p113GdDtor, (void**)&orig_p113GdDtor);
-    DebugLog(std::string("[P113] ~GameData hook ") + (h == coop::SUCCESS ? "OK" : "FAILED") + " at +" + P113Hex(kP113GdDtorRva));
+    SW_DEVLOG_OR_FAIL(h != coop::SUCCESS, std::string("[P113] ~GameData hook ") + (h == coop::SUCCESS ? "OK" : "FAILED") + " at +" + P113Hex(kP113GdDtorRva));
 }
 // PROBE-END: P113
 int LoadPod(void* container, const std::string* path, const std::string* modName)
@@ -1688,10 +1849,12 @@ int SetPersistentPod(void* platoon, bool on)
 }
 
 // ---- files ----
+volatile LONG g_fileNameBounded = 0;   /* record file names made in the bounded form (coopwq::FileName: a long non-English id) - each time one is made */
 std::string Sanitize(const std::string& s)
 {
-    std::string o; for (size_t i = 0; i < s.size(); ++i) { char c = s[i]; o += (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.') ? c : '_'; }
-    return o;
+    const std::string n = coopwq::FileName(s);   /* the world server's own rule (src/common/writequeue.h): both programs name a record's files alike */
+    if (coopwq::FileNameIsBounded(n)) ::InterlockedIncrement(&g_fileNameBounded);
+    return n;
 }
 /* P7b - THE SAVE ROOT, IN ONE PLACE. The notebook's folder has always been derived from it ("coop-store" sits
    BESIDE the slots, decision 22), and P7b needs the same root to find a slot folder when the engine's own folder
@@ -1850,19 +2013,113 @@ bool ZoneSwapLookup(const std::string& zoneId, ZoneSwapEntry* out)
 /* T-609: MAIN THREAD. A fresh read's no-record fact (gen < 0: none - the read found a record, or the record list was not
    known). A fact that lands while g_records already holds the zone is dropped: the read may have found no swap entry only
    because a mirror rewrite had hidden it (ZoneSwapHide), and a copy read then is the game's own copy (F480). */
-void ZoneNoRecordApply(const std::string& zoneId, long gen)
+/* T-823 fold 2: MAIN THREAD. One line per PROVISIONAL area read (fold 4: marked reads and reads with no mark are not logged, so
+   the cap is kept for these and the end-of-list lines; capped 200 a session, the rest counted): whether this link's record list was
+   complete at the read (1 / 0 / ? not known) and the mark result. */
+void ZoneReadSay(const std::string& zoneId, bool fromRecord, int listDone, const char* res)
 {
-    if (gen < 0 || g_records.find(zoneId) != g_records.end()) { g_zoneKeptMark.erase(zoneId); return; }
-    ZoneKeptMark& m = g_zoneKeptMark[zoneId]; m.gen = gen; m.fromRecord = false; m.recordSeenAt = 0.0;
+    if (g_zoneReadLines >= 200) { ++g_zoneReadLinesSuppressed; return; }
+    ++g_zoneReadLines;
+    const std::string ld = (listDone == 1) ? "1" : (listDone == 0) ? "0" : "?";
+    DebugLog("[ZONE] read " + zoneId + (fromRecord ? std::string(" from its record") : std::string(" from the area file")) + " atMs="
+             + N((long long)(ZoneNowSec() * 1000.0)) + " listComplete=" + ld + " mark=" + std::string(res));
+}
+/* T-823 fold 2: MAIN THREAD. A WELCOME or a world teardown throws every provisional read away (they were made on another link or
+   in another world); counted. */
+void ZoneProvisionalThrow(const char* why)
+{
+    if (!OnMainThread()) return;
+    g_zoneSettledGen = -1;   /* fold 4: a WELCOME re-arms the list; reads after it wait for its end */
+    if (g_zoneProvRead.empty()) return;
+    g_zoneProvThrown += (long long)g_zoneProvRead.size();
+    for (std::map<std::string, ZoneProvRead>::const_iterator w = g_zoneProvRead.begin(); w != g_zoneProvRead.end(); ++w)
+        if (w->second.afterSettle) ++g_zoneProvWaitAtSettle;
+    if (g_zoneReadLines < 200)
+    {
+        ++g_zoneReadLines;
+        DebugLog("[ZONE] provisional reads thrown away: " + N((long long)g_zoneProvRead.size()) + " at " + std::string(why));
+    }
+    else ++g_zoneReadLinesSuppressed;
+    g_zoneProvRead.clear();
+}
+void ZoneNoRecordApply(const std::string& zoneId, long gen, long provGen = -1, int listDone = -1)
+{
+    g_zoneProvRead.erase(zoneId);   /* T-823 fold 2: this read replaces an earlier provisional one */
+    const bool held = (g_records.find(zoneId) != g_records.end());
+    if (gen < 0 || held)
+    {
+        g_zoneKeptMark.erase(zoneId);
+        if (gen < 0 && !held && provGen >= 1)
+        {   /* T-823 fold 2: the link was up but its record list not complete - remembered, judged when the list completes */
+            ZoneProvRead& p = g_zoneProvRead[zoneId]; p.gen = provGen; p.teardowns = g_worldTeardowns; p.fromRecord = false; p.stamp = ZoneStamp();
+            p.afterSettle = (g_zoneSettledGen == provGen);   /* fold 4: its link's list end was already settled - it waits for the next */
+            ++g_zoneProvMade;
+            ZoneReadSay(zoneId, false, listDone, "provisional");
+            return;
+        }
+        /* fold 3: a read with no mark is not logged */
+        return;
+    }
+    ZoneKeptMark& m = g_zoneKeptMark[zoneId]; m.gen = gen; m.fromRecord = false; m.recordSeenAt = 0.0;   /* fold 4: not logged */
 }
 bool ZoneLoadedCopyOlder(const ZoneStamp& loaded, const Record& cur);   /* defined below, same (anonymous) namespace */
 /* T-609: MAIN THREAD. A load from the record of `stamp`, on link generation gen (< 0: no mark). Dropped when a newer record
    is already held here: it landed before the mark stood, so its landing time is unknown. */
-void ZoneFromRecordMarkApply(const std::string& zoneId, const ZoneStamp& stamp, long gen)
+void ZoneFromRecordMarkApply(const std::string& zoneId, const ZoneStamp& stamp, long gen, long provGen = -1, int listDone = -1)
 {
+    g_zoneProvRead.erase(zoneId);   /* T-823 fold 2: this load replaces an earlier provisional read */
     std::map<std::string, Record>::const_iterator rit = g_records.find(zoneId);
-    if (gen < 0 || (rit != g_records.end() && ZoneLoadedCopyOlder(stamp, rit->second))) { g_zoneKeptMark.erase(zoneId); return; }
-    ZoneKeptMark& m = g_zoneKeptMark[zoneId]; m.gen = gen; m.fromRecord = true; m.recordSeenAt = 0.0;
+    const bool newer = (rit != g_records.end() && ZoneLoadedCopyOlder(stamp, rit->second));
+    if (gen < 0 || newer)
+    {
+        g_zoneKeptMark.erase(zoneId);
+        if (gen < 0 && !newer && provGen >= 1)
+        {   /* T-823 fold 2: loaded from a record while the list was not complete - remembered, judged when the list completes */
+            ZoneProvRead& p = g_zoneProvRead[zoneId]; p.gen = provGen; p.teardowns = g_worldTeardowns; p.fromRecord = true; p.stamp = stamp;
+            p.afterSettle = (g_zoneSettledGen == provGen);   /* fold 4: its link's list end was already settled - it waits for the next */
+            ++g_zoneProvMade;
+            ZoneReadSay(zoneId, true, listDone, "provisional");
+            return;
+        }
+        /* fold 3: a load with no mark is not logged */
+        return;
+    }
+    ZoneKeptMark& m = g_zoneKeptMark[zoneId]; m.gen = gen; m.fromRecord = true; m.recordSeenAt = 0.0;   /* fold 4: not logged */
+}
+/* T-823 fold 2 (run T1424): MAIN THREAD, at the record list's end (StoreFeedMarkerApply). Each provisional read becomes the kept
+   mark of this link only if no record of the area is held now (for a load from a record: none newer than the copy loaded), the
+   link generation is the one of the read and no world teardown happened since (zonerec::ZoneProvisionalJudge); else dropped, as
+   a read with the list complete-but-not-yet would have been. A record landing after this goes through ZoneSwapPublish's
+   recordSeenAt as for any mark. One line each (the read lines' cap). */
+void ZoneProvisionalSettle(const std::vector<unsigned short>* areas)   /* T-985 step 2B: 0 = every area (the last page's marker), else only the reads of the areas a partial AREA_DONE names */
+{
+    if (!OnMainThread()) return;
+    const long lg = (long)StoreLinkGen();
+    if (g_zoneProvRead.empty()) { if (areas == 0) g_zoneSettledGen = lg; return; }   /* fold 4 */
+    for (std::map<std::string, ZoneProvRead>::iterator it = g_zoneProvRead.begin(); it != g_zoneProvRead.end(); )
+    {
+        if (areas != 0 && !coopfeed::FeedAreaListHas(*areas, coopfeed::FeedZoneIdAreaKey(it->first))) { ++it; continue; }   /* T-985 step 2B: its area is not done yet */
+        const ZoneProvRead& p = it->second;
+        if (p.afterSettle) ++g_zoneProvWaitAtSettle;   /* fold 4: made after the last settle of its link - it waited for this one */
+        std::map<std::string, Record>::const_iterator rit = g_records.find(it->first);
+        const int held = (rit != g_records.end()) ? 1 : 0;
+        const int blocks = zonerec::ZoneProvisionalBlocks(p.fromRecord ? 1 : 0, held, (held != 0 && ZoneLoadedCopyOlder(p.stamp, rit->second)) ? 1 : 0);   /* fold 3 */
+        const int why = zonerec::ZoneProvisionalJudge(blocks, p.gen, lg, p.teardowns, g_worldTeardowns);
+        if (why == zonerec::kZpMadeGood)
+        { ZoneKeptMark& m = g_zoneKeptMark[it->first]; m.gen = lg; m.fromRecord = p.fromRecord; m.recordSeenAt = 0.0; ++g_zoneProvGood; }
+        else if (why == zonerec::kZpRecordHeld) ++g_zoneProvDropRecord;
+        else if (why == zonerec::kZpLinkChanged) ++g_zoneProvDropLink;
+        else ++g_zoneProvDropTeardown;
+        if (g_zoneReadLines < 200)
+        {
+            ++g_zoneReadLines;
+            DebugLog("[ZONE] provisional read " + it->first + " at the record list's end: " + std::string(zonerec::ZoneProvisionalWhy(why))
+                     + " (read on link " + N((long long)p.gen) + ", link now " + N((long long)lg) + ")");
+        }
+        else ++g_zoneReadLinesSuppressed;
+        g_zoneProvRead.erase(it++);   /* T-985 step 2B: judged - only the settled reads leave */
+    }
+    if (areas == 0) g_zoneSettledGen = lg;   /* fold 4 */
 }
 /* MAIN THREAD: apply what the detours learned, per zone, last event wins. Every reader of g_zoneFromRecord calls it first. */
 void ZoneFromRecordDrain()
@@ -1875,29 +2132,29 @@ void ZoneFromRecordDrain()
     ::LeaveCriticalSection(&g_zoneSwapLock);
     /* Z1-c: an off-main world teardown asked for the map to go (TeardownBroadcastLateFlags). It is counted and cleared
        here, BEFORE the events swapped out above - they were queued after that teardown, so they describe the new world. */
-    if (clearReq) { ::InterlockedExchangeAdd(&g_teardownLateMarks, (long)g_zoneFromRecord.size()); g_zoneFromRecord.clear(); g_zoneKeptMark.clear(); }
+    if (clearReq) { ::InterlockedExchangeAdd(&g_teardownLateMarks, (long)g_zoneFromRecord.size()); g_zoneFromRecord.clear(); g_zoneKeptMark.clear(); ZoneProvisionalThrow("a world teardown"); }   /* T-823 fold 2 */
     for (std::map<std::string, ZoneMarkEvent>::const_iterator it = ev.begin(); it != ev.end(); ++it)
     {
-        if (it->second.loaded) { g_zoneFromRecord[it->first] = it->second.stamp; ZoneFromRecordMarkApply(it->first, it->second.stamp, it->second.markGen); }
-        else { g_zoneFromRecord.erase(it->first); ZoneNoRecordApply(it->first, it->second.markGen); }
+        if (it->second.loaded) { g_zoneFromRecord[it->first] = it->second.stamp; ZoneFromRecordMarkApply(it->first, it->second.stamp, it->second.markGen, it->second.provGen, it->second.listDone); }
+        else { g_zoneFromRecord.erase(it->first); ZoneNoRecordApply(it->first, it->second.markGen, it->second.provGen, it->second.listDone); }
     }
 }
 /* Any thread: a zone read (loaded=false; markGen >= 0 when it found no record with the record list known - see
    ZoneNoRecordApply) or a load from a record (loaded=true; markGen = the link generation of the load - see
    ZoneFromRecordMarkApply). On the main thread the pending events are drained first and the mark is applied directly -
    the old behaviour; off it, the event is queued for the drain. */
-void ZoneMarkNote(const std::string& zoneId, bool loaded, const ZoneStamp& stamp, long markGen = -1)
+void ZoneMarkNote(const std::string& zoneId, bool loaded, const ZoneStamp& stamp, long markGen = -1, long provGen = -1, int listDone = -1)
 {
     if (OnMainThread())
     {
         ZoneFromRecordDrain();
-        if (loaded) { g_zoneFromRecord[zoneId] = stamp; ZoneFromRecordMarkApply(zoneId, stamp, markGen); }
-        else { g_zoneFromRecord.erase(zoneId); ZoneNoRecordApply(zoneId, markGen); }
+        if (loaded) { g_zoneFromRecord[zoneId] = stamp; ZoneFromRecordMarkApply(zoneId, stamp, markGen, provGen, listDone); }
+        else { g_zoneFromRecord.erase(zoneId); ZoneNoRecordApply(zoneId, markGen, provGen, listDone); }
         return;
     }
     if (!g_zoneSwapLockInit) return;
     ::EnterCriticalSection(&g_zoneSwapLock);
-    ZoneMarkEvent& e = g_zoneMarkPending[zoneId]; e.loaded = loaded; e.stamp = stamp; e.markGen = markGen;
+    ZoneMarkEvent& e = g_zoneMarkPending[zoneId]; e.loaded = loaded; e.stamp = stamp; e.markGen = markGen; e.provGen = provGen; e.listDone = listDone;
     ::LeaveCriticalSection(&g_zoneSwapLock);
 }
 /* Any thread: the readFile -> load handshake (see g_zonePendingByPath). */
@@ -2114,6 +2371,7 @@ bool ParseMetaLine(const std::string& line, Record* r)
     /* field 15 of a v7 line: the group's home building key, optional (storemeta.h); a line without it reads as no home */
     r->home.clear();
     if (f[0] == "v7" && f.size() >= 15) { r->home = f[14]; while (!r->home.empty() && (r->home[r->home.size() - 1] == '\r' || r->home[r->home.size() - 1] == '\n')) r->home.erase(r->home.size() - 1); }
+    r->birth = sqbirth::BirthOfLineFields(f);   /* field 16 of a v7 line: the squad's birth flag, optional (storemeta.h); a line without it reads as unknown */
     return !r->worldId.empty();
 }
 /* ================= B12 (decision 52): THE OUTAGE QUEUE'S JOURNAL =================
@@ -2377,6 +2635,7 @@ bool ZoneIndexMirrorCopy(Record* r)
                  + " zoneIndexCopied=" + N(g_zoneIndexCopied) + " zoneIndexCopyFailed=" + N(g_zoneIndexCopyFailed) + " (first 8 logged)");
     return ok;
 }
+long long g_indexEarlierName = 0;   /* .meta files LoadIndex passed over: under their id's earlier file name */
 void LoadIndex()
 {
     /* W2-f (review-w2 B): set FIRST, so the journal merge below (QueueLoad -> QueueSave) and the held deleted-bits
@@ -2399,6 +2658,18 @@ void LoadIndex()
         std::ifstream f(U8W((g_dirCanonical + "\\" + fd.cFileName).c_str()).c_str()); if (!f) continue;
         std::string line; if (!std::getline(f, line)) continue;
         Record r; if (!ParseMetaLine(line, &r)) { ++g_indexBadLines; continue; }
+        {   /* a .meta under the earlier file name of the id it names: the world server moves such a pair to the name FileName gives
+               at its start, or leaves it when it cannot be tied to this id - either way this record's data is not read from there */
+            const std::string mn = fd.cFileName;
+            if (mn.size() > 5 && _stricmp(mn.c_str() + (mn.size() - 5), ".meta") == 0 && coopwq::EarlierNameOnly(mn.substr(0, mn.size() - 5), r.worldId))
+            {
+                ++g_indexEarlierName;
+                if (g_indexEarlierName <= 4)
+                    DebugLog("[STORE] index: " + mn + " is under the earlier file name of " + r.worldId + " - not read from there (the world server"
+                             " moves it to " + Sanitize(r.worldId) + ".meta at its start); indexEarlierName=" + N(g_indexEarlierName) + " (first 4 logged)");
+                continue;
+            }
+        }
         if (DeletedBitTest(r.worldId)) { ++g_recvRefusedDeleted; continue; }   /* review-p4h M1 */
         NoteTownPeople(r.worldId, r.town);   /* decision 34 */
         NoteRecordHome(r.worldId, r.home);   /* the group's home building key (optional field 15) */
@@ -2616,6 +2887,255 @@ void JoinedFolderRetry()
     unsigned int found = 0;
     if (StoreDataFolderFormat(g_dirCanonical, swformat::kKindJoined, &found) == swformat::kFormatConvert) ConvertJoinedFolder(found);
 }
+/* ===== T-985 C1: THE KEPT RECORD TABLE - a game's record table survives a restart (src/common/mirrorkeep.h) =====
+   WHY THE MIRROR WAS NAMED AFTER THE PROCESS (P1, 6b27204): every game on one computer puts its mirror inside the same world folder
+   (the benches give both games one storedir=), and the process id kept two games' copies apart. A new process meant an empty folder
+   and an empty table, so every launch downloaded every record (T1460: life 2 indexRecords=0). THE NAME NOW is mirror-k<hash of the
+   world id and the id the world knows this player by> (MirrorKeepName): stable across restarts of this player in this world, and
+   still apart for another player, another world, or a reset world (a new id). A lock file held for the process's life
+   (MirrorKeepClaim) keeps two games of the SAME player apart: the second falls back to mirror-<pid> and keeps nothing.
+   THE TABLE is written whole, by rename, when the records before the load are in (PreloadFinish) and when a save finished
+   (ProfileSavedTell) - no timer. It is read back right after LoadIndex (MirrorKeepLoad); a row is taken only when its mirror file
+   is there with the size and last-write time the row recorded (fold 1, review MED 5: no CRC, no record file read on the main
+   thread), so the HELD list never claims a record this game lacks.
+   FOLD 1 (review 2026-10-24): a key taken back is HELD BACK (MirrorKeepGated: not woken, not placed, not made again on a peer drop)
+   until the world server names it - its preload index, a fetch, or a record of the feed - and at the end of the first whole feed
+   snapshot a kept key the snapshot did not name is dropped (MirrorKeepSnapshotEnd). Deleted marks that arrive after the load drop
+   a kept record (MirrorKeepDeletedBits). Two keys sharing one mirror file name are not listed (MirrorKeepWrite).
+   MAIN THREAD only. */
+HANDLE g_mkLock = INVALID_HANDLE_VALUE;   /* the kept folder's lock file, open for the life of the process */
+bool g_mkClaimed = false;                 /* this process holds the kept folder: its table is read and written */
+std::string g_mkIdHash;                   /* the kept folder's identity hash ("" = per-process folder) */
+int g_mkState = 0, g_mkWhy = mirrorkeep::kWhyNotArmed;   /* keptTable kept (1 = read back, 0 = started fresh) and why (mirrorkeep::kWhy*) */
+long long g_mkRead = 0, g_mkRejected = 0, g_mkNoFile = 0, g_mkChanged = 0, g_mkBadLines = 0, g_mkSkipped = 0,
+          g_mkWritten = 0, g_mkWriteFailed = 0, g_mkLastRows = 0, g_mkVerifyMs = 0, g_mkOffThread = 0, g_mkUnlisted = 0;
+/* fold 1 (review MED 5 / LOW 6): bytesReadLoad = the table file's bytes read at the load (no record file is read); bytesReadWrite =
+   record-file bytes a table write read (0: a write takes each file's size and time only) */
+long long g_mkBytesReadLoad = 0, g_mkBytesReadWrite = 0;
+/* fold 1 (review HIGH 1 / LOW 2 / MED 4): droppedUnnamed = kept keys the first whole snapshot did not name, dropped; unnamedChanged =
+   such keys kept because this game wrote them after the load; droppedDeleted = kept records dropped by a deleted mark that came
+   after the load; nameClash = keys left out of the last table write for sharing a mirror file name; gatedPlace = kept keys whose
+   placement was refused while held back (each key once per load); gatedWake = times a load, wake or re-creation was refused for a
+   key still held back; dropSkipped = first snapshots that dropped no unnamed key because they were not seen whole
+   (mirrorkeep::SnapshotWholeForDrop); refusedUnjudged = kept records dropped because no WELCOME judged the table's stored seq
+   before its keys would be released (mirrorkeep::SeqJudge) */
+long long g_mkDroppedUnnamed = 0, g_mkUnnamedChanged = 0, g_mkDroppedDeleted = 0, g_mkNameClash = 0, g_mkNameClashLogged = 0, g_mkGatedPlace = 0, g_mkGatedWake = 0;
+long long g_mkDropSkipped = 0, g_mkRefusedUnjudged = 0;
+std::set<std::string> g_mkGatedPlaceKeys;   /* the kept keys gatedPlace has counted this load */
+std::map<std::string, Record> g_mkBeside;   /* kept rows held beside the record LoadIndex gave the same key, until the world server names it (mirrorkeep::KeptPlace) */
+long long g_mkHeldBeside = 0;               /* keptTable gatedKeptHeldBeside: kept rows held beside an index-load record at the load */
+long long g_mkBesideMovedAsleep = 0;        /* beside[movedAsleep]: squads asleep here moved to a row held beside when it was swapped in */
+void MirrorKeepMoveAsleep(const Record& r);   /* defined below SetSleepPosAllPod, in this namespace */
+std::map<std::string, long long> g_mkKept;   /* keys taken back from the table this launch -> the writtenAt they came with; emptied at the first whole snapshot's end */
+std::set<std::string> g_mkGate;              /* of those, the ones the world server has not named yet: never woken or placed (MirrorKeepGated) */
+std::set<std::string> g_mkSeen;              /* kept keys named by a record of the current snapshot (cleared at each first-page ASK) */
+bool g_mkSnapAsked = false, g_mkSnapDone = false;   /* a first-page ASK went after the load / the first whole snapshot has ended */
+/* fold 1 (finding 3): the highest world sequence number stored in the table read at this load (0 = none: a C1 table); judged once,
+   at the first WELCOME tail after the load (MirrorKeepWelcomeSeq); refusedBehind = kept records dropped because the world server was
+   behind the table */
+unsigned long long g_mkStoredSeq = 0ULL; bool g_mkSeqJudged = false; long long g_mkRefusedBehind = 0;
+unsigned long long MirrorKeepSeqSeen();   /* g_wgSeqSeen, the highest world sequence number this game has seen - defined beside it, below, in this namespace */
+bool MkFileStat(const std::string& path, unsigned long long* size, unsigned long long* mtime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!U8GetFileAttributesEx(path.c_str(), GetFileExInfoStandard, &fa) || (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return false;
+    *size = ((unsigned long long)fa.nFileSizeHigh << 32) | (unsigned long long)fa.nFileSizeLow;
+    *mtime = ((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32) | (unsigned long long)fa.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+/* fold 1 (review HIGH 1): THE GATE. true = this key was taken back from the table and the world server has not named it yet, and the
+   first whole snapshot has not ended: nothing is woken, loaded over, placed or made again from it. */
+bool MirrorKeepGated(const std::string& key) { return mirrorkeep::KeptHeldBack((g_mkGate.count(key) != 0 && g_mkBeside.count(key) == 0) ? 1 : 0, g_mkSnapDone ? 1 : 0) != 0; }   /* a kept row held beside leaves the index-load record in place: not held back */
+/* the world server named this key outside a snapshot (its preload index lists every record it holds; a fetch answered it) */
+/* fullFollows = 1: the key's full record comes right after this (a fetch answer, or a feed record with its bytes) and that road
+   publishes an area record and places a squad itself. 0: the preload index or a header-only feed record named it - nothing else
+   will, so a kept area record is published here and a squad asleep here is moved to a swapped-in row. */
+void MirrorKeepConfirmed(const std::string& key, int fullFollows)
+{
+    if (g_mkGate.empty() || g_mkGate.erase(key) == 0) return;
+    const std::map<std::string, Record>::iterator bs = g_mkBeside.find(key);
+    if (bs != g_mkBeside.end())
+    {   /* the kept row held beside the index-load record is swapped in now, when newer than the record here (never an area record) */
+        const std::map<std::string, Record>::iterator it = g_records.find(key);
+        if (mirrorkeep::BesideSwapIn(it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, bs->second.writtenAt) != 0)
+        {
+            NoteTownPeople(key, bs->second.town);   /* decision 34, as LoadIndex */
+            NoteRecordHome(key, bs->second.home);
+            it->second = bs->second;
+            if (!fullFollows) MirrorKeepMoveAsleep(it->second);   /* the header-only answer is refused as not newer now, so it would never move the sleeping squad */
+        }
+        g_mkBeside.erase(bs);
+        return;
+    }
+    if (!fullFollows && IsZoneId(key) && g_records.find(key) != g_records.end()) ZoneSwapPublish(key);   /* a kept area record reaches the area swap table only once the world server names it (MirrorKeepLoad does not publish it) */
+}
+/* a record of this key came from the world server on the feed (in full or as its header): confirmed, and named by this snapshot */
+void MirrorKeepNamed(const std::string& key, int fullFollows)
+{
+    if (g_mkKept.empty()) return;
+    MirrorKeepConfirmed(key, fullFollows);
+    if (g_mkKept.count(key) != 0) g_mkSeen.insert(key);
+}
+/* StoreFeedTick, at each first-page ASK: a new snapshot starts - only its own records count as named */
+void MirrorKeepAsked() { g_mkSeen.clear(); if (!g_mkKept.empty()) g_mkSnapAsked = true; }
+/* StoreArmWorldIndex, after SetStoreDirsFor and before the folders are made: the kept name, when the world and the player are known */
+void MirrorKeepName()
+{
+    g_mkIdHash.clear();
+    const std::string person = MyPersonId();
+    const int d = mirrorkeep::NameDecide(coopworld::WorldIdOk(g_linkWorldId) ? 1 : 0, coopstore::PlayerIdOk(person) != 0 ? 1 : 0);
+    if (d != mirrorkeep::kNameStable)
+    {
+        g_mkWhy = d == mirrorkeep::kNameNoWorldId ? mirrorkeep::kWhyNoWorldId : mirrorkeep::kWhyNoPlayer;
+        DebugLog("[STORE] T-985 C1: this game's mirror stays " + g_dirMirror + " (named after this process) and its record table is not kept"
+                 " between launches - " + mirrorkeep::WhyName(g_mkWhy));
+        return;
+    }
+    g_mkIdHash = mirrorkeep::IdentityHash(g_linkWorldId, person);
+    g_dirMirror = g_dirCanonical + "\\" + mirrorkeep::StableDirName(g_mkIdHash);
+}
+/* after EnsureStoreDirs: hold the kept folder's lock file, or fall back to this process's own folder */
+void MirrorKeepClaim()
+{
+    if (g_mkIdHash.empty() || g_mkClaimed) return;
+    const std::string lock = g_dirMirror + "\\" + mirrorkeep::kLockFile;
+    const HANDLE h = U8CreateFile(lock.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, 0);
+    if (h != INVALID_HANDLE_VALUE) { g_mkLock = h; g_mkClaimed = true; return; }   /* never closed: Windows closes it, and deletes the file, when the process ends - a crash too */
+    const DWORD err = ::GetLastError();
+    const std::string stable = g_dirMirror;
+    g_mkIdHash.clear(); g_mkWhy = mirrorkeep::kWhyInUse;
+    g_dirMirror = g_dirCanonical + "\\" + mirrorkeep::ProcessDirName((unsigned long)::GetCurrentProcessId());
+    EnsureDir(g_dirMirror);
+    ErrorLog("[STORE] T-985 C1: the kept mirror folder " + stable + " could not be claimed (Windows error " + N((long long)err)
+             + (err == ERROR_SHARING_VIOLATION ? std::string(": another game of this player on this computer holds it") : std::string())
+             + ") - this game uses " + g_dirMirror + " and keeps no records between launches");
+}
+/* StoreArmWorldIndex, right after LoadIndex: the kept table back into g_records, each row checked against its file */
+void MirrorKeepLoad()
+{
+    g_mkState = 0;
+    g_mkKept.clear(); g_mkGate.clear(); g_mkSeen.clear(); g_mkSnapAsked = false; g_mkSnapDone = false;   /* fold 1: nothing held back from an earlier index */
+    g_mkSeqJudged = false; g_mkStoredSeq = 0ULL; g_mkGatedPlaceKeys.clear(); g_mkBeside.clear();   /* this load's table is judged against the world server on its own; nothing held beside from an earlier index */
+    if (!g_mkClaimed) return;
+    const std::string path = g_dirMirror + "\\" + mirrorkeep::kTableFile;
+    if (!StoreFileThere(path))
+    {
+        g_mkWhy = mirrorkeep::kWhyNoTable;
+        DebugLog("[STORE] T-985 C1: no kept record table in " + g_dirMirror + " yet - started fresh (it is written when the records before"
+                 " the load are in and when a save finishes)");
+        return;
+    }
+    std::vector<char> b;
+    std::vector<mirrorkeep::KeptRow> rows; long long bad = 0;
+    const int v = ReadFileBytes(path, &b) ? mirrorkeep::TableParseSeq(std::string(b.begin(), b.end()), g_indexWorldId, g_mkIdHash, &rows, &bad, &g_mkStoredSeq)
+                                          : mirrorkeep::kTableTorn;
+    g_mkBadLines += bad; g_mkBytesReadLoad += (long long)b.size();
+    g_mkWhy = mirrorkeep::WhyOfTable(v);
+    if (v != mirrorkeep::kTableOk)
+    {
+        ErrorLog("[STORE] T-985 C1: the kept record table " + path + " is NOT used (" + mirrorkeep::WhyName(g_mkWhy) + ") - started fresh;"
+                 " every record comes from the world server");
+        return;
+    }
+    g_mkState = 1;
+    const DWORD t0 = ::GetTickCount();
+    long long logged = 0;
+    g_publishSuppressed = true;   /* as LoadIndex: one PublishPendingTowns for the whole table */
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        const mirrorkeep::KeptRow& k = rows[i];
+        const int del = DeletedBitTest(k.key) ? 1 : 0, zoneOff = (IsZoneId(k.key) && !g_zoneOn) ? 1 : 0;
+        const std::string file = MirrorFile(k.key);
+        unsigned long long size = 0, mtime = 0;
+        const int rv = (del || zoneOff) ? (int)mirrorkeep::kRowOk : mirrorkeep::RowCheck(k, MkFileStat(file, &size, &mtime) ? 1 : 0, size, mtime);   /* fold 1 (review MED 5): size and time only - no record file is read */
+        const std::map<std::string, Record>::const_iterator it = g_records.find(k.key);
+        const int lv = mirrorkeep::RowLoad(del, zoneOff, rv, it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k.writtenAt);
+        if (lv == mirrorkeep::kLoadRejected)
+        {
+            ++g_mkRejected;
+            if (rv == mirrorkeep::kRowNoFile) ++g_mkNoFile; else ++g_mkChanged;
+            if (++logged <= 8) DebugLog("[STORE] T-985 C1: kept record " + k.key + " NOT taken - " + mirrorkeep::RowCheckName(rv)
+                                        + " (the world server sends it again; first 8 logged)");
+            continue;
+        }
+        if (mirrorkeep::RowLoadNotes(lv) == 0) { ++g_mkSkipped; continue; }   /* skipped, or not newer: and no town or home note (fold 1, review LOW 8) */
+        const int place = mirrorkeep::KeptPlace(lv, it != g_records.end() ? 1 : 0, IsZoneId(k.key) ? 1 : 0);   /* beside the index-load record, or in its place */
+        if (place == mirrorkeep::kKeptReplace)
+        {
+            NoteTownPeople(k.key, k.town);   /* decision 34, as LoadIndex */
+            NoteRecordHome(k.key, k.home);
+        }
+        Record r;
+        r.worldId = k.key; r.squadSid = k.squadSid; r.factionName = k.factionName; r.town = k.town; r.home = k.home; r.file = file;
+        r.x = k.x; r.y = k.y; r.z = k.z; r.writtenAt = k.writtenAt; r.posAt = k.posAt; r.owner = (int)k.owner; r.gone = 0; r.seq = k.seq; r.birth = k.birth;
+        if (place == mirrorkeep::kKeptBeside) { g_mkBeside[k.key] = r; ++g_mkHeldBeside; }   /* the index-load record stays for every road until the world server names the key (MirrorKeepConfirmed swaps this in) */
+        else g_records[k.key] = r;
+        ++g_mkRead;   /* not published to the area swap table here: area streaming reads that table on worker threads with no hold-back, so a kept area record is published when the world server names it (MirrorKeepConfirmed) or, if it stays, at the first snapshot's end (MirrorKeepSnapshotEnd); until then the table keeps what LoadIndex published */
+        g_mkKept[k.key] = k.writtenAt; g_mkGate.insert(k.key);   /* fold 1 (review HIGH 1): held back until the world server names it */
+    }
+    g_publishSuppressed = false;
+    PublishPendingTowns();
+    g_mkVerifyMs = (long long)(DWORD)(::GetTickCount() - t0);
+    DebugLog("[STORE] T-985 C1: KEPT record table read back from " + g_dirMirror + ": " + N(g_mkRead) + " of " + N((long long)rows.size())
+             + " records taken, " + N(g_mkRejected) + " rejected (file gone " + N(g_mkNoFile) + ", file changed " + N(g_mkChanged)
+             + "), " + N(g_mkSkipped) + " skipped (deleted, area records off, or not newer), " + N(g_mkBadLines) + " unreadable row(s); "
+             + N(g_mkBytesReadLoad) + " table bytes read, rows checked by size and time in " + N(g_mkVerifyMs) + " ms; the "
+             + N((long long)g_mkGate.size()) + " taken are not woken or placed until the world server names them");
+}
+/* the kept table, written whole by rename - at PreloadFinish and when a save finished. MAIN THREAD. */
+void MirrorKeepWrite(const char* why)
+{
+    if (!g_mkClaimed || !g_indexLoaded) return;
+    if (!OnMainThread()) { ++g_mkOffThread; return; }
+    std::vector<mirrorkeep::KeptRow> rows; rows.reserve(g_records.size());
+    std::vector<std::string> names; names.reserve(g_records.size());   /* fold 1 (review MED 4): each row's mirror file */
+    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)
+    {
+        const std::map<std::string, Record>::const_iterator bs = g_mkBeside.find(it->first);
+        const Record& r = bs != g_mkBeside.end() ? bs->second : it->second;   /* a row held beside is what this game keeps for that key */
+        const std::string file = MirrorFile(it->first);
+        if (mirrorkeep::RowListed(r.gone, r.writtenAt, r.file == file ? 1 : 0, DeletedBitTest(it->first) ? 1 : 0) == 0) continue;
+        unsigned long long size = 0, mtime = 0;
+        if (!MkFileStat(file, &size, &mtime)) { ++g_mkUnlisted; continue; }
+        mirrorkeep::KeptRow k;
+        k.key = it->first; k.squadSid = r.squadSid; k.factionName = r.factionName; k.town = r.town; k.home = r.home;
+        k.x = r.x; k.y = r.y; k.z = r.z; k.writtenAt = r.writtenAt; k.posAt = r.posAt; k.owner = (unsigned int)r.owner; k.seq = r.seq; k.birth = r.birth;
+        mirrorkeep::RowStamp(&k, size, mtime);   /* its own file's size and time; no CRC - the file is not read, the field stays 00000000 */
+        rows.push_back(k); names.push_back(file);   /* rows[i] and names[i] stay paired (mirrorkeep::ListUnclashed) */
+    }
+    {   /* two keys whose mirror file names are one name to Windows - neither is listed */
+        std::vector<mirrorkeep::KeptRow> listed; std::vector<size_t> clashAt;
+        const long long nc = mirrorkeep::ListUnclashed(rows, names, &listed, &clashAt);
+        if (nc < 0) { ++g_mkWriteFailed; return; }   /* rows and file names out of step: nothing is written (they are filled together above) */
+        g_mkNameClash = nc;
+        for (size_t i = 0; i < clashAt.size(); ++i)
+            if (++g_mkNameClashLogged <= 8) DebugLog("[STORE] T-985 C1: record " + rows[clashAt[i]].key + " is not kept between launches - its mirror file " + names[clashAt[i]]
+                                                     + " has the same name to Windows as another record's (first 8 logged; keptTable nameClash)");
+        rows.swap(listed);
+    }
+    std::string text; long long refused = 0;
+    const std::string path = g_dirMirror + "\\" + mirrorkeep::kTableFile;
+    if (!mirrorkeep::TableFormatSeq(g_indexWorldId, g_mkIdHash, MirrorKeepSeqSeen(), rows, &text, &refused) || !WriteFileBytes(path, std::vector<char>(text.begin(), text.end())))
+    {
+        if (++g_mkWriteFailed <= 4) ErrorLog("[STORE] T-985 C1: the kept record table " + path + " could NOT be written (" + std::string(why)
+                                             + ") - the previous one stays; a row of it is taken back only where its file still matches");
+        return;
+    }
+    ++g_mkWritten; g_mkLastRows = (long long)rows.size() - refused;
+    if (g_mkWritten <= 4 || g_mkWritten % 50 == 0)
+        DebugLog("[STORE] T-985 C1: kept record table written (" + std::string(why) + "): " + N(g_mkLastRows) + " records, " + N(refused)
+                 + " not writable, " + N(g_mkUnlisted) + " passed over so far (file missing or changing); written " + N(g_mkWritten));
+}
+/* the REPORT line's keptTable[...] token */
+std::string MirrorKeepReportValues()
+{
+    return N((long long)g_mkState) + "," + N((long long)g_mkWhy) + "," + N(g_mkRead) + "," + N(g_mkRejected) + "," + N(g_mkNoFile) + "," + N(g_mkChanged)
+         + "," + N(g_mkBadLines) + "," + N(g_mkSkipped) + "," + N(g_mkWritten) + "," + N(g_mkWriteFailed) + "," + N(g_mkLastRows)
+         + "," + N(g_mkUnlisted) + "," + N(g_mkBytesReadLoad) + "," + N(g_mkBytesReadWrite) + "," + N(g_mkVerifyMs) + "," + N(g_mkOffThread)
+         + "," + N(g_mkDroppedUnnamed) + "," + N(g_mkUnnamedChanged) + "," + N(g_mkDroppedDeleted) + "," + N(g_mkNameClash)
+         + "," + N(g_mkGatedPlace) + "," + N(g_mkGatedWake) + "," + N((long long)g_mkGate.size()) + "," + N(g_mkRefusedBehind)
+         + "," + N(g_mkDropSkipped) + "," + N(g_mkRefusedUnjudged) + "," + N(g_mkHeldBeside);
+}
 void StoreArmWorldIndex(const char* why)
 {
     if (!g_dirReady || g_indexLoaded) return;
@@ -2649,14 +3169,19 @@ void StoreArmWorldIndex(const char* why)
                  " moved when the notebook starts; the record index is read when the notebook links (" + w + ").");
         return;
     }
+    MirrorKeepName();    /* T-985 C1: the kept mirror folder, named before it is made */
     EnsureStoreDirs();
+    MirrorKeepClaim();   /* T-985 C1: its lock file, or this process's own folder */
     if (g_dirJoined)
     {
         unsigned int found = 0;
         if (StoreDataFolderFormat(g_dirCanonical, swformat::kKindJoined, &found) == swformat::kFormatConvert) ConvertJoinedFolder(found);
     }
     g_indexWorldId = g_linkWorldId; g_indexWorldUpgraded = g_linkWorldIdUpgraded;   /* T-490: the world whose records, mirror and queue this game now holds */
+    PickWorldKeyPublish();   /* T-906 review F1: the key follows the id at once */
     LoadIndex();
+    MirrorKeepLoad();   /* T-985 C1: the kept record table back, each row checked against its file */
+    PickWorldKeyPublish();   /* T-906 review F1: LoadIndex sets g_indexLoaded, which switches HeldWorldId to the index's id */
     const int k = (w == "install") ? 0 : (w == "roleLeftSingle") ? 1 : 2;
     ++g_indexReadAt[k];
     DebugLog("[STORE] W2b: read the notebook record index of world '" + g_dirWorld + "' from " + g_dirCanonical
@@ -2698,7 +3223,8 @@ struct StoreOut
     void* platoon;                 // kOutGone: the destroyed platoon, used as a MAP KEY only and never dereferenced (it is freed by the time the drain runs)
     unsigned long long bindGen;    // kOutGone: g_bindGen as it stood when the destroy fired (E23 - a binding stamped ABOVE this is a different platoon at the same address)
     float x, y, z; long long stamp; int owner;
-    StoreOut() : type(0), recFlags(0), platoon(0), bindGen(0), x(0.0f), y(0.0f), z(0.0f), stamp(0), owner(0) {}
+    int living;                    // kOutGone: the squad's living members as the destroy fired (LivingMembersPod; > 0, or -1 not read = the unload discard road)
+    StoreOut() : type(0), recFlags(0), platoon(0), bindGen(0), x(0.0f), y(0.0f), z(0.0f), stamp(0), owner(0), living(-1) {}
 };
 std::vector<StoreOut> g_storeOutbox; CRITICAL_SECTION g_outboxLock; bool g_outboxLockInit = false;
 // review-p5g MEDIUM-2: these three are incremented from WORKER threads (OutboxPush, under the outbox lock) and from the MAIN
@@ -2845,7 +3371,7 @@ extern bool g_quitDraining;  /* P6c (p5z HIGH-1): the quit drain's own scope fla
 // E18: the main-thread halves of the two off-thread detours, forward-declared here because the drain (just below) calls them
 // and their bodies need DeleteEntryHere, ForgetPlatoon and the whole zone-record path, all of which are defined much further
 // down this file. Same anonymous namespace, same shape as the line above.
-void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp, unsigned long long gen);   /* MAIN THREAD: a destroy the engine did on a worker (E23: `gen` is g_bindGen as it stood then) */
+void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp, unsigned long long gen, int living);   /* MAIN THREAD: a destroy the engine did on a worker (E23: `gen` is g_bindGen as it stood then) */
 void ZoneSaveApply(const std::string& path);                                       /* MAIN THREAD: the zone-record body for a file the engine just saved */
 /* A RECORD OVER 2 MB (coophb::kBigRecordBytes) goes to the world server as one message, and while it goes this game's link and
    frame rate suffer; each squad or zone that sends one is named once, with its member count, so a run shows which ones are that
@@ -2945,6 +3471,7 @@ typedef char StoreTownLossNumberAgrees[(kStoreMsgTownLoss == townrefill::kMsgTow
 const unsigned int kStoreMsgKept = 69;   /* KEPT - up CLAIM / RELEASE / LAID / SETTLED, down ROWS / STATE (src/common/keptwire.h) */
 typedef char StoreKeptNumberAgrees[(kStoreMsgKept == keptwire::kMsgKept && kStoreProtocol == keptwire::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgShow = 78;   /* T-811: SHOW - down: the teammates' outposts (src/common/baseshow.h) */
+typedef char StorePieceNumberAgrees[(kStoreProtocol == piecerec::kProtocol) ? 1 : -1];   /* a compile error here = piecerec.h and this file disagree */
 typedef char StoreShowNumberAgrees[(kStoreMsgShow == baseshow::kMsgShow && kStoreProtocol == baseshow::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgFallen = 61;   /* T-556: FALLEN - up ADD / TAKE / ASK, down TABLE (src/common/fallenwire.h) */
 typedef char T556StoreFallenNumberAgrees[(kStoreMsgFallen == swfallen::kMsgFallen) ? 1 : -1];   /* a compile error here = the header and this file disagree */
@@ -3151,6 +3678,7 @@ static bool GetStrS(const std::vector<char>& p, size_t* at, std::string* out) { 
    (a gone made in another world is dropped with its town at the WELCOME - GoneKeepThisWorld). The
    world server counts it as a loss of that town. MAIN THREAD. */
 std::map<std::string, std::string> g_goneTown;
+std::set<std::string> g_goneDiscard;   /* gones of this game's own marked DISCARD (squadbirth.h) until sent - a re-send keeps the mark */
 long long g_goneTownKept = 0, g_goneTownSent = 0, g_goneSentNoTown = 0, g_goneTownNotLoss = 0;   /* g_goneTownNotLoss: deletes that named no town (not a death road) */
 std::map<std::string, std::string> g_goneWorld;   /* the world (townrefill::WorldStamp) each gone of this game's own was made in, kept until it is sent */
 long long g_goneOtherWorld = 0;                   /* unsent gones dropped at a WELCOME: made in another world (GoneKeepThisWorld) */
@@ -3167,11 +3695,14 @@ bool SendGoneAny(const std::string& worldId, long long stamp)
     {
         std::vector<char> b; PutStrS(&b, worldId); PutU32S(&b, (unsigned int)(stamp & 0xFFFFFFFFu)); PutU32S(&b, (unsigned int)((unsigned long long)stamp >> 32));
         const std::map<std::string, std::string>::iterator gt = g_goneTown.find(worldId);
-        const bool named = gt != g_goneTown.end() && townrefill::AppendGoneTown(&b, gt->second);   /* the group's town, after the stamp - a reader that stops at the stamp is unchanged */
+        const bool discard = g_goneDiscard.count(worldId) != 0;   /* a discard names no town: the mark stands in its place */
+        const bool named = !discard && gt != g_goneTown.end() && townrefill::AppendGoneTown(&b, gt->second);   /* the group's town, after the stamp - a reader that stops at the stamp is unchanged */
+        if (discard) townrefill::AppendGoneDiscard(&b);
         if (!g_link->Send(0, (net::MsgType)kStoreMsgGone, &b[0], b.size(), net::CH_RELIABLE)) { g_goneUnsent[worldId] = stamp; return false; }
         if (named) ++g_goneTownSent; else ++g_goneSentNoTown;
         if (gt != g_goneTown.end()) g_goneTown.erase(gt);
         g_goneWorld.erase(worldId);
+        if (discard) g_goneDiscard.erase(worldId);
         ++g_linkSent; return true;
     }
     g_goneUnsent[worldId] = stamp;   /* M2-b: re-sent at the notebook relink (StoreRepushUpTick) */
@@ -3236,7 +3767,7 @@ long long StoreOutboxDrain()
         /* E18: the two BOOKKEEPING kinds. They are not handed to a sender, so they are not counted as delivered or refused
            either - their own counters say what happened to them, and `continue` keeps them out of the send tally, which
            would otherwise read as if the outbox had transmitted something it never tried to. */
-        else if (q[i].type == kOutGone) { DrainGoneEntry(q[i].worldId, q[i].platoon, q[i].stamp, q[i].bindGen); continue; }
+        else if (q[i].type == kOutGone) { DrainGoneEntry(q[i].worldId, q[i].platoon, q[i].stamp, q[i].bindGen, q[i].living); continue; }
         else if (q[i].type == kOutZone) { ZoneSaveApply(q[i].path); ++g_gdcSaveOffThreadDrained; continue; }
         else { ::InterlockedIncrement64(&g_outboxDroppedCap); continue; }   /* unreachable: only the five kinds above are ever queued - counted with the cap's drops so it can never be a silent zero, never sent blind */
         if (ok) ::InterlockedIncrement64(&g_outboxDrained); else ::InterlockedIncrement64(&g_outboxSendFailed);
@@ -3670,9 +4201,16 @@ int ReadFactionsPod(void* fm, FmPod* o)
    that faction's code (factionkey.h). By worldId, MAIN THREAD; dropped with the group's row and cleared at world teardown. */
 struct FacCheck { std::string stored; const void* fac; bool code; FacCheck() : fac(0), code(false) {} };
 std::map<std::string, FacCheck> g_facCheck;
+void DropEntryHere(const std::string& worldId, bool townLoss);
 void DeleteEntryHere(const std::string& worldId, bool townLoss)
 {
     DeletedBitSet(worldId);   /* decision 30: the bit is permanent */
+    g_goneDiscard.erase(worldId);   /* a plain delete of the id is no discard */
+    DropEntryHere(worldId, townLoss);
+}
+/* the entry, its record and its mirror file leave this game's books: a delete's whole work but the deleted bit */
+void DropEntryHere(const std::string& worldId, bool townLoss)
+{
     if (townLoss)
     {   /* ONLY A DEATH ROAD names the group's town - the group was wiped out (the death watch marked it). The engine
            also throws a group away with nobody dead (its last member hired, or merged into another group), and that is no loss of its town,
@@ -3693,6 +4231,139 @@ void DeleteEntryHere(const std::string& worldId, bool townLoss)
        own files on MSG_RECORD_GONE - it already does - and this game is not its second hand. */
     U8DeleteFile(MirrorFile(worldId).c_str());
     ++g_deletedHere;
+}
+/* T-985 C1: THE KEPT TABLE REFUSED WHOLE (a mirrorkeep::SeqJudge refusal). Every key taken from it whose record is still the table's
+   copy is dropped as an unnamed key is dropped (DropEntryHere: record, mirror file, town note; and the home note; no deleted mark, no
+   town loss), whether still held back or already released; one re-fetched (or written here) since, or named by the current
+   snapshot (mirrorkeep::RefuseDrops), stays. MAIN THREAD. */
+void MirrorKeepRefuseTable(int verdict, unsigned long long seqHigh)
+{
+    std::vector<std::string> drop;
+    for (std::map<std::string, long long>::const_iterator k = g_mkKept.begin(); k != g_mkKept.end(); ++k)
+    {
+        const std::map<std::string, Record>::const_iterator it = g_records.find(k->first);
+        if (mirrorkeep::RefuseDrops(it != g_records.end() ? 1 : 0, it != g_records.end() ? it->second.writtenAt : 0LL, k->second, g_mkSeen.count(k->first) != 0 ? 1 : 0) != 0) drop.push_back(k->first);
+    }
+    for (size_t i = 0; i < drop.size(); ++i) { DropEntryHere(drop[i], false); g_homeOf.erase(drop[i]); }
+    for (std::map<std::string, long long>::const_iterator k = g_mkKept.begin(); k != g_mkKept.end(); ++k)   /* a kept area record the refusal keeps (named by the snapshot) is served to area streaming now - the kept list is cleared below, so the snapshot's end cannot publish it */
+        if (g_mkBeside.count(k->first) == 0 && IsZoneId(k->first) && g_records.find(k->first) != g_records.end()) ZoneSwapPublish(k->first);
+    const bool unjudged = verdict == mirrorkeep::kSeqRefuseUnjudged;
+    if (unjudged) g_mkRefusedUnjudged += (long long)drop.size(); else g_mkRefusedBehind += (long long)drop.size();
+    g_mkState = 0; g_mkWhy = unjudged ? mirrorkeep::kWhyUnjudged : mirrorkeep::kWhyServerBehind;
+    g_mkKept.clear(); g_mkGate.clear(); g_mkSeen.clear(); g_mkBeside.clear();   /* a row held beside never replaced its record: discarded */
+    if (!drop.empty()) PublishPendingTowns();
+    if (unjudged)
+        ErrorLog("[STORE] T-985 C1: the kept record table is REFUSED (unjudged) - it was written at world sequence " + N((long long)g_mkStoredSeq)
+                 + " and no WELCOME carried the world server's seqHigh before its records would be used, so a world server restored from a backup"
+                   " cannot be ruled out: " + N((long long)drop.size()) + " kept record(s) dropped; every record comes from the world server (keptTable refusedUnjudged)");
+    else
+        ErrorLog("[STORE] T-985 C1: the kept record table is REFUSED (serverBehind) - the world server's seqHigh " + N((long long)seqHigh) + " is below the "
+                 + N((long long)g_mkStoredSeq) + " the table was written at (restored from a backup?): " + N((long long)drop.size())
+                 + " kept record(s) dropped; every record comes from the world server (keptTable refusedBehind)");
+}
+/* T-985 C1 fold 1 (review HIGH 1): StoreFeedMarkerApply, at a snapshot's END marker (behind every record of its pages). The FIRST
+   whole snapshot after the kept table was read decides every kept key: one it named stays; one it did not name is dropped - the
+   record, its mirror file and its town note (DropEntryHere, no deleted mark, no town loss) and its home note.
+   THIS DROP IS VALID ONLY WHILE THE FIRST FEED SNAPSHOT IS WHOLE: today a snapshot pages every record the world server holds, so
+   "not named" means "not held there". A FILTERED snapshot (planned step C2: only some areas) names only part of the world - C2 must
+   change this (drop only keys of what that snapshot covers, or wait for a whole list) or it would drop records the server still holds.
+   Afterwards nothing is held back (MirrorKeepGated answers false). MAIN THREAD. */
+void MirrorKeepSnapshotEnd(long long beginTotal, long long sentTotal, long long lastSent)
+{
+    if (g_mkSnapDone || !g_mkSnapAsked) return;
+    if (g_mkState == 1 && !g_mkSeqJudged)
+    {   /* no WELCOME judged the table's stored seq: judged now, before this end releases any kept key - a table with a stored seq is refused */
+        g_mkSeqJudged = true;
+        const int sj = mirrorkeep::SeqJudge(g_mkStoredSeq, 0, 0ULL);
+        if (sj != mirrorkeep::kSeqKeep) MirrorKeepRefuseTable(sj, 0ULL);
+    }
+    g_mkSnapDone = true;
+    /* the drop needs the snapshot whole: its pages must have carried every record the BEGIN counted, and the LAST page must not be the
+       empty one the world server sends for a key too long for the wire (mirrorkeep::SnapshotWholeForDrop) */
+    const int whole = mirrorkeep::SnapshotWholeForDrop(beginTotal, sentTotal, lastSent);
+    if (!whole && !g_mkKept.empty()) ++g_mkDropSkipped;
+    std::vector<std::string> drop;
+    long long changed = 0, besideDiscarded = 0;
+    for (std::map<std::string, long long>::const_iterator k = g_mkKept.begin(); k != g_mkKept.end(); ++k)
+    {
+        if (g_mkBeside.count(k->first) != 0) { ++besideDiscarded; continue; }   /* a row still held beside was never confirmed: discarded below, the index-load record stays */
+        const std::map<std::string, Record>::const_iterator it = g_records.find(k->first);
+        const int v = mirrorkeep::UnnamedDecide(whole, g_mkSeen.count(k->first) != 0 ? 1 : 0, it != g_records.end() ? 1 : 0,
+                                                it != g_records.end() ? it->second.writtenAt : 0LL, k->second);
+        if (v == mirrorkeep::kUnnamedDrop) drop.push_back(k->first);
+        else if (v == mirrorkeep::kUnnamedChangedHere) ++changed;
+    }
+    for (size_t i = 0; i < drop.size(); ++i)
+    {
+        DropEntryHere(drop[i], false);
+        g_homeOf.erase(drop[i]);
+        if (i < 8) DebugLog("[STORE] T-985 C1: kept record " + drop[i] + " DROPPED - the world server's first whole snapshot did not name it (it no longer holds"
+                            " it); its mirror file and its town and home notes go too (first 8 logged; keptTable droppedUnnamed)");
+    }
+    g_mkDroppedUnnamed += (long long)drop.size(); g_mkUnnamedChanged += changed;
+    const long long awaiting = (long long)g_mkGate.size();
+    for (std::map<std::string, long long>::const_iterator g = g_mkKept.begin(); g != g_mkKept.end(); ++g)   /* every kept area record still here - unnamed and kept, or named with a full record that did not replace it: served to area streaming from now */
+        if (IsZoneId(g->first) && g_records.find(g->first) != g_records.end()) ZoneSwapPublish(g->first);
+    g_mkKept.clear(); g_mkGate.clear(); g_mkSeen.clear(); g_mkBeside.clear();
+    if (!drop.empty()) PublishPendingTowns();
+    DebugLog("[STORE] T-985 C1: the first snapshot has ended" + (whole ? std::string(" (seen whole)")
+             : " (NOT seen whole: the BEGIN counted " + N(beginTotal) + " records, its pages " + N(sentTotal) + ", the last page " + N(lastSent)
+               + " - no unnamed key is dropped; they stay until named or re-fetched; keptTable dropSkipped)")
+             + " - " + N((long long)drop.size()) + " kept record(s) it did not name dropped, " + N(besideDiscarded)
+             + " kept row(s) held beside an index-load record discarded (never named; that record stays), " + N(changed)
+             + " kept although not named (written here since the load); " + N(awaiting) + " were still held back and are released or dropped now");
+}
+/* T-985 C1 fold 1 (review LOW 2): ApplyDeletedBits, after a faction's marks are merged. The marks come after the WELCOME, after the
+   kept table was read: a kept record whose key is marked now is dropped as a received delete drops it (DeleteEntryHere: the record,
+   its mirror file, its town note) and its home note. MAIN THREAD. */
+void MirrorKeepDeletedBits()
+{
+    if (g_mkKept.empty()) return;
+    std::vector<std::string> del;
+    for (std::map<std::string, long long>::const_iterator k = g_mkKept.begin(); k != g_mkKept.end(); ++k)
+        if (g_records.find(k->first) != g_records.end() && DeletedBitTest(k->first)) del.push_back(k->first);
+    for (size_t i = 0; i < del.size(); ++i)
+    {
+        DeleteEntryHere(del[i], false);
+        g_homeOf.erase(del[i]); g_mkKept.erase(del[i]); g_mkGate.erase(del[i]); g_mkBeside.erase(del[i]);
+        if (++g_mkDroppedDeleted <= 8) DebugLog("[STORE] T-985 C1: kept record " + del[i] + " DROPPED - a deleted mark for it arrived after the kept table was read"
+                                                " (first 8 logged; keptTable droppedDeleted)");
+    }
+    if (!del.empty()) PublishPendingTowns();
+}
+/* T-985 C1: WorldGenOnWelcome, at each WELCOME. The first one after the kept table was read (the WELCOME that armed the index runs
+   StoreArmWorldIndex, so MirrorKeepLoad, just before this) judges the table, with or without world numbers, while every kept key is
+   still held back - the preload this WELCOME starts names, and so releases, kept keys before a later WELCOME could judge them.
+   mirrorkeep::SeqJudge: a world server whose seqHigh is below the table's stored seq stepped back (restored from a backup) - its
+   stamps are older than the kept ones, which would win; a WELCOME with no world numbers cannot rule that out. Either refuses the
+   whole table (MirrorKeepRefuseTable). After the first snapshot's end nothing is judged here (that end judged an unjudged table).
+   MAIN THREAD. */
+void MirrorKeepWelcomeSeq(int known, unsigned long long seqHigh)
+{
+    if (g_mkSeqJudged || g_mkState != 1 || g_mkSnapDone) return;
+    g_mkSeqJudged = true;
+    const int sj = mirrorkeep::SeqJudge(g_mkStoredSeq, known, seqHigh);
+    if (sj != mirrorkeep::kSeqKeep) MirrorKeepRefuseTable(sj, seqHigh);
+}
+/* A DISCARD DELETE: the game discarded a bound squad born not kept at its area unload (or an old world's leftover roaming record is
+   retired). The entry, record and mirror file go here; no deleted mark (another game may still hold the squad, and the world server
+   keeps the record then) and no town loss. The gone is marked DISCARD on the wire, and keeps the mark through a re-send. MAIN THREAD. */
+/* 1 = another platoon here is bound to `worldId` (a same-id pair): the discard of one must not delete the record the other still
+   names, and the heartbeat does not bind a second one to it. MAIN THREAD. */
+int BoundIdHeldByOther(void* platoon, const std::string& worldId)
+{
+    for (std::map<void*, std::string>::const_iterator b = g_bind.begin(); b != g_bind.end(); ++b) if (b->first != platoon && b->second == worldId) return 1;
+    return 0;
+}
+long long g_discardSharedKept = 0;   /* discards of one of a same-id pair: nothing sent, the record stays */
+long long g_discardSent = 0, g_discardSentLines = 0;
+void DiscardDeleteSend(const std::string& worldId, long long stamp, const char* why)
+{
+    { std::map<std::string, Record>::const_iterator rr = g_records.find(worldId); if (rr != g_records.end()) { if (rr->second.writtenAt > stamp) stamp = rr->second.writtenAt; if (rr->second.posAt > stamp) stamp = rr->second.posAt; } }   /* no older than the record's last stamp known here (a heartbeat's stamp can run ahead of the clock), or the world server ignores the delete as older */
+    DropEntryHere(worldId, false);
+    g_goneDiscard.insert(worldId);
+    const bool sent = SendGoneAny(worldId, stamp); ++g_goneSent; ++g_discardSent;
+    if (g_discardSentLines < 20) { ++g_discardSentLines; DebugLog("[STORE] DISCARD-DELETE worldId=" + worldId + " - " + why + "; no town loss, no deleted mark; sent=" + (sent ? "1" : "0") + " (the first 20 logged; birth[discardSent] on the REPORT)"); }
 }
 void AdminDestroyBeginImpl() { g_adminDestroy = true; }
 void AdminDestroyEndImpl() { g_adminDestroy = false; }
@@ -3748,6 +4419,7 @@ long long g_wgStamped = 0, g_wgStampedAcked = 0, g_wgStampSkipped = 0, g_wgStamp
 long long g_loadRefusedOlderWorld = 0, g_loadRefusedNotebookBehind = 0, g_loadRefusedUnnumbered = 0, g_loadRefusedKeyless = 0, g_wgNoGen = 0;
 long long g_wgAdopted = 0, g_wgNotebookBehindLive = 0, g_wgMarkSkippedNumbered = 0, g_wgProfileMismatch = 0;
 void WorldGenNoteSeq(unsigned long long s) { if (s > g_wgSeqSeen) g_wgSeqSeen = s; }
+unsigned long long MirrorKeepSeqSeen() { return g_wgSeqSeen; }   /* T-985 C1 fold 1 (finding 3): the kept table's header seq (declared above MkFileStat) */
 void WorldGenNoteGen(unsigned int g) { if (g > g_wgHighGen) g_wgHighGen = g; }
 /* restore1a fold 2 (recheck-restore1a): the number the NOTEBOOK has confirmed for this game's profile - raised only by its WELCOME
    row and its WORLD_SAVED answers, never by this game's own saves or adoptions, and reset when the profile changes. */
@@ -3839,6 +4511,8 @@ void StoreApplyRecordSeq(const std::vector<char>& payload)
         unsigned int slo = 0, shi = 0;
         const int hasStamp = (GetU32S(payload, at + 8, &slo) && GetU32S(payload, at + 12, &shi)) ? 1 : 0;
         coop::KeptAreaEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* KEPT: the world server holds this game's write of that record with this stamp - a lay written into it may settle */
+        if (piecerec::IsPieceRecId(worldId)) coop::PieceRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* this game's piece write sent with that stamp is on the world server's disk */
+        if (coopgrec::IsGroundRecId(worldId)) coop::GroundRecordEcho(worldId, hasStamp, (long long)(((unsigned long long)shi << 32) | slo));   /* T-697 step 2 fold 2 (item 7): this game's ground write was taken - the area may be written again */
     }
     {
         std::map<std::string, Record>::iterator it = g_records.find(worldId);
@@ -4049,6 +4723,7 @@ void StoreRepushUpTick()
     {
         if (g_welcomeGotIds.count(it->first) != 0) continue;   /* the notebook already has this one */
         if (IsZoneId(it->first) && !g_zoneOn) { ++skipped; continue; }   /* review-p3h H1, as the deleted arm did */
+        if (coopbrec::IsBoxRecId(it->first) || piecerec::IsPieceRecId(it->first)) { ++skipped; continue; }   /* a box or piece record is written only by its writer (items.cpp, build.cpp), never re-sent from here */
         std::vector<char> b;
         if (!it->second.file.empty()) ReadFileBytes(it->second.file, &b);   /* a position-only note is still worth sending */
         if (!SendRecordAny(it->second.worldId, it->second.squadSid, it->second.factionName,
@@ -4065,7 +4740,7 @@ bool SendOne(const Record& r)
 {
     std::vector<char> bytes;
     if (!ReadFileBytes(r.file, &bytes)) return false;
-    if (!SendRecordAny(r.worldId, r.squadSid, r.factionName, r.x, r.y, r.z, r.writtenAt, r.owner, bytes)) return false;
+    if (!SendRecordAny(r.worldId, r.squadSid, r.factionName, r.x, r.y, r.z, r.writtenAt, r.owner, bytes, sqbirth::FlagsOfBirth(r.birth))) return false;
     ++g_sent;
     return true;
 }
@@ -4659,8 +5334,10 @@ void detour_deactivate(void* platoon, void* container)
                 if (slot < 8)
                 {
                     seenOff[slot] = rvaOff;
+#ifdef SW_DEV_BUILD   /* T-879 G: P020 is a DEV probe - the line's text and its building are the test build's only; the per-caller slots stay in both */
                     char b[240]; _snprintf(b, 239, "[PROBE] P020 off-thread sleep BYPASSED: caller rva=0x%llX okb=%d activeChars=%d (first only per caller)", rvaOff, offOk ? 1 : 0, offOk ? offPod.activeChars : -1); b[239] = 0;
-                    DebugLog(b);
+                    SW_DEVLOG(b);   /* T-879 F: P020 is a DEV probe - test build only */
+#endif   /* SW_DEV_BUILD - T-879 G */
                 }
             }
         }
@@ -4909,9 +5586,10 @@ void detour_deactivate(void* platoon, void* container)
         ErrorLog("[STORE] SLEEP save FAILED (" + N(sv) + ") worldId=" + worldId + " file=" + r.file + eb);
         return;
     }
+    { std::map<std::string, Record>::const_iterator ob = g_records.find(worldId); r.birth = sqbirth::BirthMerge(ob != g_records.end() ? ob->second.birth : sqbirth::kBirthUnknown, BirthPublishOf(platoon)); }   /* the squad's birth flag rides its record at the sleep write: only one noted at its creation, copy or record (a byte read off the squad goes as unknown) */
     g_records[worldId] = r; g_byWorldId[worldId] = platoon; g_localWrittenAt[platoon] = r.writtenAt; ++g_written; g_npcStampErased.erase(platoon); g_npcPurged.erase(platoon);
     if (holderOtherBlock != 0) { ++g_npcHolderSleep; NpcLine("[STORE] NPC SLEEP written by the area's holder: worldId=" + worldId + " numbered in slot " + N((long long)blk) + "'s block, chars=" + N(before.activeChars) + " mine=" + N(mine) + " (holderWroteOtherBlock at sleep=" + N(g_npcHolderSleep) + ")"); }
-    if (g_p120N >= 0 && g_p120Writes < 40) { ++g_p120Writes; DebugLog("[PROBE] P120 write wid=" + worldId + " slot=" + N((long long)g_mySlot) + " n=" + N((long long)g_p120N) + P120List(g_p120Mem, g_p120N)); }   // PROBE P120
+    if (g_p120N >= 0 && g_p120Writes < 40) { ++g_p120Writes; SW_DEVLOG("[PROBE] P120 write wid=" + worldId + " slot=" + N((long long)g_mySlot) + " n=" + N((long long)g_p120N) + P120List(g_p120Mem, g_p120N)); }   // PROBE P120
     if (mineByBlock && memberRuleRefuses) ++g_writtenByBlock;   /* E2: counted at the WRITE, not at the gate - a group the block rule let past can still be refused below it (player faction, a faulted read, a failed save), and a counter named "written" that counted gate passes would be this project's lesson 1 all over again */
     const bool sent = SendOne(r);
     DebugLog("[STORE] SLEEP wrote worldId=" + worldId + " squad='" + r.squadSid + "' faction='" + r.factionName + "' chars=" + N(before.activeChars)
@@ -4929,8 +5607,13 @@ static int LivingMembersPod(void* platoon)
     __try
     {
         Pod q; if (!ReadPod(platoon, &q)) return -1;
-        if (!Plaus(q.active) || q.activeChars <= 0 || !Plaus(q.members)) return -2;   // not awake: the engine's own answer applies
-        if (q.activeChars > 512) return -2;   /* review-p4j C2: judged up to 512 members (the array is the engine's, bounded by activeChars); beyond that not judged */
+        /* T-999 fold 2: -2 only for a squad read whole with no awake members (no active platoon - ReadPod then reads 0 members - or
+           none in it: emptied by hiring or merging), where the engine's own answer applies. An active platoon or a member list at an
+           implausible address, or more than 512 members, is -1 (not read): the keep question keeps it, and a destroy keeps the unload road */
+        if (q.active != 0 && !Plaus(q.active)) return -1;
+        if (q.activeChars <= 0) return -2;   /* not awake: the engine's own answer applies */
+        if (!Plaus(q.members)) return -1;
+        if (q.activeChars > 512) return -1;   /* review-p4j C2: judged up to 512 members (the array is the engine's, bounded by activeChars); beyond that not judged */
         int living = 0;
         for (int i = 0; i < q.activeChars && i < 512; ++i) { void* c = q.members[i]; if (Plaus(c) && !((::Character*)c)->hasDied()) ++living; }
         return living;
@@ -4938,26 +5621,186 @@ static int LivingMembersPod(void* platoon)
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 long long g_releasedDead = 0, g_livingFault = 0;
+/* the keep question's protections for a squad born not kept, read live at the question. MAIN THREAD. */
+int MemberPtrsPod(void* platoon, void** out, int cap)
+{
+    __try
+    {
+        Pod q;
+        if (!ReadPod(platoon, &q) || !Plaus(q.active) || q.activeChars <= 0 || !Plaus(q.members)) return 0;
+        int n = 0;
+        for (int i = 0; i < q.activeChars && n < cap; ++i) out[n++] = q.members[i];
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void* CharFactionPod(void* c)
+{
+    __try { return (void*)((::Character*)c)->getOwnerFactionDirect(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int FactionIsPlayers(void* f)
+{
+    ::Faction* fac = (::Faction*)f;
+    return (Plaus(fac) && (IsPlayerFaction(fac) || IsStandInFaction(fac) || StandInRecordSlot(fac) != -1)) ? 1 : 0;
+}
+/* 1 = a member is a player's or a stand-in's character, or carries one */
+int SquadHoldsPlayersChar(void* platoon)
+{
+    { Pod sq; if (ReadPod(platoon, &sq) && FactionIsPlayers((void*)sq.faction) != 0) return 1; }   /* the squad's own faction is a player's or a stand-in's */
+    void* m[64];
+    const int n = MemberPtrsPod(platoon, m, 64);
+    for (int i = 0; i < n; ++i)
+    {
+        if (!Plaus(m[i])) continue;
+        if (FactionIsPlayers(CharFactionPod(m[i])) != 0) return 1;
+        const unsigned int uid = FindSpawnedUid(m[i]);
+        const unsigned int carried = uid != 0 ? CarryingUidOf(uid) : 0u;
+        if (carried == 0) continue;
+        ::Character* body = FindSpawned(carried);
+        if (body != 0 && Plaus(body) && FactionIsPlayers(CharFactionPod(body)) != 0) return 1;
+    }
+    return 0;
+}
+/* T-999 fold 2: each bound squad's live home read (TownGenPlatoonHomeKey: 1 a home, 0 none; a read that failed is not kept) with the
+   id the squad was bound to when it was read. The row goes with the platoon (ForgetPlatoonRows), at its unbind (StoreUnbindPlatoon) and
+   at the world teardown; a squad bound to another id reads again. MAIN THREAD. */
+std::map<void*, std::pair<std::string, int> > g_liveHomeOf;
+const size_t kLiveHomeCap = 65536;
+long long g_liveHomeHits = 0;
+/* T-999 fold 2b: each bound squad's template test (squadbirth.h KeepDecide templateRoaming: 1 listed in its bound record's town's
+   "roaming squads", 0 not; a read that could not be made, -1, is not kept) with the id it was bound to - kept, erased and re-read
+   exactly as g_liveHomeOf. MAIN THREAD. */
+std::map<void*, std::pair<std::string, int> > g_roamOf;
+long long g_roamHits = 0;
+/* 1 = the town's game data lists template `tmpl` in reference list `list` (the "roaming squads" test of RetireOldRoaming and of the
+   keep question); 0 not. One function for both (fold 2c: it was declared here in the anonymous namespace and defined in coop - C2668) */
+int TownListsTemplate(GameData* town, const std::string& list, const std::string& tmpl)
+{
+    typedef GameHashMap<std::string, Ogre::vector<GameDataReference>::type>::type M;
+    M::const_iterator it = town->referenceLists.find(list);
+    if (it == town->referenceLists.end()) return 0;
+    for (size_t i = 0; i < it->second.size(); ++i) if (it->second[i].sid == tmpl) return 1;
+    return 0;
+}
+int SquadTemplateRoaming(void* platoon)
+{
+    std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
+    if (b == g_bind.end()) return -1;
+    std::map<void*, std::pair<std::string, int> >::const_iterator rc = g_roamOf.find(platoon);
+    if (rc != g_roamOf.end() && rc->second.first == b->second) { ++g_roamHits; return rc->second.second; }
+    std::map<std::string, Record>::const_iterator rr = g_records.find(b->second);
+    if (rr == g_records.end() || rr->second.town.empty() || rr->second.squadSid.empty() || !Plaus(coop::GameWorldPtr())) return -1;
+    GameData* tg = coop::GameWorldPtr()->gamedata.getData(rr->second.town);
+    if (!Plaus(tg)) return -1;
+    const int listed = TownListsTemplate(tg, "roaming squads", rr->second.squadSid);
+    if (rc != g_roamOf.end() || g_roamOf.size() < kLiveHomeCap) g_roamOf[platoon] = std::make_pair(b->second, listed);
+    return listed;
+}
+/* 1 = the squad has a home building: its bound record's home key (the index line's or the registry's), else its live one
+   (TownGenPlatoonHomeKey) - a town's resident, which the game keeps. MAIN THREAD. */
+int SquadHasHome(void* platoon)
+{
+    std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
+    if (b != g_bind.end())
+    {
+        if (!coopstore::MetaHomeKey(RecordHomeOf(b->second)).empty()) return 1;
+        std::map<std::string, Record>::const_iterator rr = g_records.find(b->second);
+        if (rr != g_records.end() && !coopstore::MetaHomeKey(rr->second.home).empty()) return 1;
+    }
+    /* T-999 fold 2: the live read once per binding (g_liveHomeOf) - the engine asks the keep question every frame for every awake
+       squad; the record's and the registry's keys above stay live reads (the mod's own home gives go through the registry) */
+    const std::string boundId = b != g_bind.end() ? b->second : std::string();
+    std::map<void*, std::pair<std::string, int> >::const_iterator hc = g_liveHomeOf.find(platoon);
+    if (hc != g_liveHomeOf.end() && hc->second.first == boundId) { ++g_liveHomeHits; return hc->second.second; }
+    char hk[128];
+    const int hr = TownGenPlatoonHomeKey(platoon, hk, 128);
+    const int live = hr == 1 ? 1 : 0;
+    if ((hr == 1 || hr == 0) && (hc != g_liveHomeOf.end() || g_liveHomeOf.size() < kLiveHomeCap)) g_liveHomeOf[platoon] = std::make_pair(boundId, live);
+    return live;
+}
+/* 1 = another game holds the squad's area now (the area map, read live) */
+int SquadAreaHeldByOther(void* platoon)
+{
+    Pod q;
+    if (!ReadPod(platoon, &q)) return 0;
+    return HeldByOtherTS(SectorOf(q.x, q.z)) == 1 ? 1 : 0;
+}
+long long g_birthKept[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };   /* squads per keep verdict (squadbirth.h kKeep*), counted when a squad's verdict changes */
+long long g_birthKeepLines[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+void KeepVerdictNote(void* platoon, int verdict)
+{
+    if (verdict < 0 || verdict > 7) return;
+    std::map<void*, int>::iterator it = g_keepVerdictOf.find(platoon);
+    if (it != g_keepVerdictOf.end() && it->second == verdict) return;
+    if (it != g_keepVerdictOf.end()) it->second = verdict; else g_keepVerdictOf[platoon] = verdict;
+    ++g_birthKept[verdict];
+    if (g_birthKeepLines[verdict] >= 5) return;
+    ++g_birthKeepLines[verdict];
+    static const char* const kWhy[8] = { "nobody living, or no members - the game's own answer",
+                                         "born not kept, or a kept byte read off a roaming-listed squad with no home - the game's own answer (it may discard at the unload)",
+                                         "born kept - kept", "no birth flag readable, or a kept byte read off a squad not shown to be a roaming one - kept", "a player's squad or holds a player's character - kept",
+                                         "another game holds its area - kept", "has a home building - kept",
+                                         "its member list could not be read - kept (the answer from before the birth flag)" };
+    DebugLog(std::string("[STORE] keep question for squad '") + WorldIdOf(platoon) + "': " + kWhy[verdict] + " (the first 5 of this kind; birth[...] on the REPORT)");
+}
 unsigned char detour_isPersistent(void* platoon)
 {
     if (g_on && g_bind.find(platoon) != g_bind.end())
     {
         const int living = LivingMembersPod(platoon);
-        if (living == 0)
+        if (living == 0 || (living == -2 && OnMainThread()))
         {
-            // everyone is dead: let the engine's classifier decide (it discards) - the destroy hook below then deletes the notebook entry
+            // everyone is dead, or a squad read whole with no awake members (LivingMembersPod -2: emptied by hiring or merging; off the main thread -2 keeps the answer from before, below; -1, not read, is kept below): let the engine's classifier decide (it discards) - the destroy hook below then deletes the notebook entry
             ++g_releasedDead;
             std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
             const std::string relName = (b != g_bind.end() ? b->second : std::string("?"));
-#ifndef SW_DEV_BUILD
-            static std::set<std::string> s_releasedSaid;   /* T-910: the release build says it once per group; releasedDead counts every release */
-            if (s_releasedSaid.insert(relName).second)
-#endif
+            /* the engine asks once a frame about every awake group until the area unloads, so the line is said once per group (its
+               platoon and name - a name alone would hide a second group of that name); releasedDead counts every release */
+            static std::set<std::pair<void*, std::string> > s_releasedSaid;
+            if (s_releasedSaid.size() < 4096 && s_releasedSaid.insert(std::make_pair(platoon, relName)).second)
             DebugLog("[STORE] group '" + relName + "' has no living members - released to the engine (decision 28)");
+            if (OnMainThread())   /* the maps are the main thread's */
+            {
+                /* a wipe-out's delete names its town, never a discard - its mark goes; so does an empty squad's (-2) emptied by hiring or
+                   merging. T-999 fold 3: an empty squad the engine's own unload removals emptied (g_unloadEmptied) keeps its mark - the
+                   engine asks again after its squad walk removed the members, and the destroy that follows is still the unload's discard */
+                const int emptiedByUnload = g_unloadEmptied.count(platoon) != 0 ? 1 : 0;
+                if (sqbirth::DiscardMarkErased(living, emptiedByUnload) != 0) g_discarding.erase(platoon);
+                else if (g_discarding.count(platoon) != 0) ++g_unloadEmptiedKeptMark;
+                KeepVerdictNote(platoon, sqbirth::kKeepDeadRelease);
+            }
             return orig_isPersistent(platoon);
         }
-        if (living == -1) ++g_livingFault;
-        ++g_keptPersistent; return 1;
+        if (living == -1) ++g_livingFault;   /* T-999 fold 2: the member list not read - kept below (KeepDecide kKeepNotRead), the answer from before the birth flag */
+        /* off the main thread (the sleep hook runs on a worker at times): the answer from before the birth flag - kept - with no map
+           touched, since the birth registry's companions, the record table and the character tables below are the main thread's */
+        if (!OnMainThread()) { ::InterlockedIncrement64(&g_keepOffThread); ++g_keptPersistent; return 1; }
+        if (living > 0 && g_unloadEmptied.erase(platoon) != 0) ++g_unloadEmptiedCleared;   /* T-999 fold 3: asked with living members again - the unload removal noted (a straggler 'wandered out of zone') did not empty it */
+        /* the squad's birth flag decides (squadbirth.h KeepDecide): a home building - kept; born kept - kept; no flag readable - kept; born
+           not kept, or a kept byte read off the squad itself with no home (in an older world that byte may be this mod's own forcing) -
+           kept only while its faction is a player's or it holds a player's character, or another game holds its area; else the game's
+           own answer (the engine's own test keeps a campaign's squad), and its discard at the unload deletes its record (detour_destroyPlatoon) */
+        int fromLive = 0;
+        const int birth = BirthResolve(platoon, &fromLive);
+        int hasHome = 0, playerHeld = 0, otherHeld = 0;
+        int templateRoaming = -1;   /* fold 2b: asked only of a kept byte read off the squad with no home */
+        if (living > 0 && (birth == sqbirth::kBirthDiscard || (birth == sqbirth::kBirthKeep && fromLive != 0)))   /* T-999 fold 2: a squad not read (-1) is kept before these are asked */
+        {
+            hasHome = SquadHasHome(platoon);
+            if (hasHome == 0 && birth == sqbirth::kBirthKeep) templateRoaming = SquadTemplateRoaming(platoon);
+            if (hasHome == 0 && (birth == sqbirth::kBirthDiscard || templateRoaming == 1)) { playerHeld = SquadHoldsPlayersChar(platoon); otherHeld = SquadAreaHeldByOther(platoon); }
+        }
+        const int verdict = sqbirth::KeepDecide(living, birth, fromLive, hasHome, playerHeld, otherHeld, templateRoaming);
+        KeepVerdictNote(platoon, verdict);
+        if (sqbirth::KeepAnswers(verdict) != 0)
+        {
+            g_discarding.erase(platoon);
+            ++g_keptPersistent; return 1;
+        }
+        const unsigned char own = orig_isPersistent(platoon);
+        if (own == 0) g_discarding.insert(platoon); else g_discarding.erase(platoon);
+        return own;
     }
     return orig_isPersistent(platoon);
 }
@@ -5045,7 +5888,7 @@ unsigned char detour_unloadedUpdate(void* unloaded)
         // PROBE-END: P023
         return orig_unloadedUpdate(unloaded);
     }
-    if (SleepSectorPod(unloaded, &s) && (g_sessionLinkedCached != 0) && OtherHasSector(s))   /* review-p5d CRASH-1: the cached session flag */   /* M2: OtherHasSector reads the notebook's LOCKED map alone and answers false when it is not fresh, so the session clock PeerZonesFresh went with the session feed */
+    if (SleepSectorPod(unloaded, &s) && OtherHasSector(s))   /* OtherHasSector reads the world server's LOCKED map alone (any thread) and answers false when it is not fresh - whichever road the games are linked by */
     {
         ++g_wakeSkippedHeld;
         EngineDtPod(unloaded, &dt);   // F488: keep the platoon's clock stamp fresh while held, as the engine would - a release must not see the whole held interval as one step
@@ -5113,7 +5956,7 @@ static void WakeWaitEnd(WakeWait& w, Pod* q, const std::string& noPeople)
     if (q != 0 && w.road == coopsquad::kWakeRoadSwap && w.taken != 0 && w.owner != g_mySlot && g_p120Loads < 40)
     {   // PROBE P120: the people the engine built from the record's file
         P120Member lm[64]; const int ln = P120Read(q->members, q->activeChars, lm, 64); ++g_p120Loads;
-        DebugLog("[PROBE] P120 load wid=" + w.wid + " writer=" + N((long long)w.owner) + " path=engine-read n=" + N((long long)ln) + (ln > 0 ? P120List(lm, ln) : std::string()));
+        SW_DEVLOG("[PROBE] P120 load wid=" + w.wid + " writer=" + N((long long)w.owner) + " path=engine-read n=" + N((long long)ln) + (ln > 0 ? P120List(lm, ln) : std::string()));
     }
     if (g_wakeCountLines < 40)
     {   /* person records in the sleeping container before the wake and in the awake one once the people are built, and the people
@@ -5253,6 +6096,7 @@ unsigned char detour_loadFromDisk(void* container, unsigned char force, void* mo
             g_byWorldId[worldId] = lp.platoon;
             PreloadNoteLoad(worldId, 0);   /* T-346: counted when the held load knew this group's copy was not current */
             std::map<std::string, Record>::const_iterator it = g_records.find(worldId);
+            if (it != g_records.end() && MirrorKeepGated(worldId)) { ++g_mkGatedWake; it = g_records.end(); }   /* T-985 C1 fold 1 (review HIGH 1): a kept record not yet named is not loaded over the save */
             const long long local = g_localWrittenAt.count(lp.platoon) ? g_localWrittenAt[lp.platoon] : 0;
             if (it != g_records.end() && it->second.gone) { /* P4e: a gone entry has no file to swap */ }
             else if (it != g_records.end() && it->second.writtenAt > local && coopsquad::ContextRecordApply(ContextPlatoonForActive(container) != 0 ? 1 : 0) == coopsquad::kCtxRecSkip)
@@ -5413,7 +6257,9 @@ void ForgetPlatoonRows(void* platoon, bool money)
     g_localWrittenAt.erase(platoon); g_pendingPlace.erase(platoon); g_npcStampErased.erase(platoon); g_npcPurged.erase(platoon); WakeWaitForget(platoon);
     g_bindGenOf.erase(platoon);   /* E23: the stamp is part of the binding - it goes when the binding goes, or the map grows by one entry per platoon the engine ever frees */
     HbForget(platoon);   /* E47-S2 exit edge: destroyed / retired */
+    BirthForget(platoon); g_discarding.erase(platoon); g_keepVerdictOf.erase(platoon); g_liveHomeOf.erase(platoon); g_roamOf.erase(platoon);   /* the birth flag, the keep marks, the live home read and the template test go with the platoon (the address can be reused) */
     SquadReadForgetOne(platoon);   /* the read-in mark goes with the platoon (the address can be reused) */
+    g_unloadEmptied.erase(platoon);   /* T-999 fold 3: the unload-emptied mark goes with the platoon (the address can be reused) */
     if (g_stCreated.erase(platoon) != 0) ++g_stForgotten;   /* T-296 fix 2: the origin mark goes with the platoon (the address can be reused) */
     if (g_copyHomeOwedMap.erase(platoon) != 0) ++g_copyHomeGone;   /* a copy freed before its building loaded here: its owed home goes with it [t755-copyhome-forget] */
 }
@@ -5469,7 +6315,15 @@ void ForgetPlatoonRows(void* platoon, bool money)
 // decision: for a genuine reuse "do not forget" is right (forgetting would strand the new platoon), but for a missing stamp
 // there is no evidence in either direction, and the safe pair is SKIP THE DELETE, STILL FORGET - no permanent bit, and no
 // freed pointer left behind.
-void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp, unsigned long long gen)
+/* T-999 fold 3: a destroy that takes the discard delete only because the engine's own unload removals emptied the squad (its members
+   read -2 at the destroy, g_unloadEmptied): counted (birth unloadEmptied[discardByIt]) and the first 10 logged. MAIN THREAD. */
+void UnloadEmptiedDiscardNote(const std::string& worldId, int living, int emptiedByUnload, const char* where)
+{
+    if (living != -2 || emptiedByUnload == 0) return;
+    ++g_unloadEmptiedDiscard;
+    if (g_unloadEmptiedLines < 10) { ++g_unloadEmptiedLines; DebugLog("[STORE] unload-emptied squad worldId=" + worldId + " - the engine's own unload removed its members before its destroy, so the destroy is the discard" + std::string(where) + " (the first 10 logged; birth unloadEmptied[discardByIt] on the REPORT)"); }
+}
+void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp, unsigned long long gen, int living)
 {
     std::map<void*, std::string>::const_iterator b = g_bind.find(platoon);
     const bool boundHere = (b != g_bind.end() && !b->second.empty());   /* the main path's test, negated */
@@ -5516,7 +6370,16 @@ void DrainGoneEntry(const std::string& engineId, void* platoon, long long stamp,
        `boundHere` already implies a non-empty id, so the old `!id.empty()` guard has nothing left to say. */
     /* P6c (p5z HIGH-1): `g_quitDraining` alongside g_tearingDown - the quit drain's entries are unloads too, and
        that is the one thing P5z's latch was for. */
-    if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining)
+    const int offDiscarding = (boundHere && g_discarding.count(platoon) != 0) ? 1 : 0;   /* a set lookup by the freed address, never a dereference */
+    /* T-999 fold 3: the off-thread hook touches no map, so the registry is read HERE, on the main thread, by the freed address exactly as
+       g_discarding above (a set lookup, never a dereference; a reused-and-rebound address returned above; the forget below clears it) */
+    const int offEmptied = (boundHere && g_unloadEmptied.count(platoon) != 0) ? 1 : 0;
+    const int offDel = sqbirth::DestroyDelete(boundHere ? 1 : 0, diedOut ? 1 : 0, offDiscarding, living, offEmptied, (offDiscarding != 0 && sqbirth::LivingUnloadRoad(living, offEmptied) != 0) ? BoundIdHeldByOther(platoon, id) : 0);
+    if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelDiscard)
+    { UnloadEmptiedDiscardNote(id, living, offEmptied, " (drained off the main thread)"); DiscardDeleteSend(id, stamp, "the game discarded a squad born not kept at its area unload (drained off the main thread)"); ++g_destroyOffThreadGoneDrained; }
+    else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining && offDel == sqbirth::kDelNone)
+    { ++g_discardSharedKept; ++g_destroyOffThreadGoneDrained; }   /* another squad here holds the same id: its record stays */
+    else if (boundHere && !g_adminDestroy && !g_tearingDown && !g_quitDraining)
     {
         DeleteEntryHere(id, diedOut);   // decision 28: the notebook lists the living - the entry and its files go, nothing is kept
         { std::string fac; unsigned n = 0; if (SplitGroupId(id, &fac, &n)) SendBitsAny(fac); }   /* decision 30 */
@@ -5555,7 +6418,7 @@ void detour_destroyPlatoon(void* faction, void* platoon)
         std::string offId;
         if (PlatoonSidPod(platoon, &offId) && !offId.empty())
         {
-            StoreOut e; e.type = kOutGone; e.worldId = offId; e.platoon = platoon; e.stamp = (long long)time(0);
+            StoreOut e; e.type = kOutGone; e.worldId = offId; e.platoon = platoon; e.stamp = (long long)time(0); e.living = LivingMembersPod(platoon);
             e.bindGen = g_bindGen;   /* E23: the identity question, captured. A plain read of a volatile counter that only ever climbs, and only the main thread writes it - so any binding stamped above this number was made after this destroy, and any binding at or below it was already in force when the engine freed this pointer. */
             if (OutboxPush(e)) ::InterlockedIncrement64(&g_destroyOffThreadQueued);
         }
@@ -5574,10 +6437,23 @@ void detour_destroyPlatoon(void* faction, void* platoon)
         else
         {
             const std::string worldId = b->second; const long long stamp = (long long)time(0);
+            const int discarding = g_discarding.count(platoon) != 0 ? 1 : 0;
+            const int livingNow = discarding != 0 ? LivingMembersPod(platoon) : -1;   /* the unload road: the squad still has its living members at the destroy, or they could not be read (-1); one emptied by hiring or merging has none (-2). Not discarding: the plain delete whatever this reads */
+            const int emptiedByUnload = g_unloadEmptied.count(platoon) != 0 ? 1 : 0;   /* T-999 fold 3: its members were removed by the engine's own unload (-2 is then still the unload road) */
+            const int del = sqbirth::DestroyDelete(1, diedOut ? 1 : 0, discarding, livingNow, emptiedByUnload, (discarding != 0 && sqbirth::LivingUnloadRoad(livingNow, emptiedByUnload) != 0) ? BoundIdHeldByOther(platoon, worldId) : 0);
+            if (del == sqbirth::kDelDiscard)
+            {
+                UnloadEmptiedDiscardNote(worldId, livingNow, emptiedByUnload, "");
+                DiscardDeleteSend(worldId, stamp, "the game discarded a squad born not kept at its area unload");
+            }
+            else if (del == sqbirth::kDelNone) ++g_discardSharedKept;   /* another squad here holds the same id: its record stays */
+            else
+            {
             DeleteEntryHere(worldId, diedOut);   // decision 28: the notebook lists the living - the entry and its files go, nothing is kept
             { std::string fac; unsigned n = 0; if (SplitGroupId(worldId, &fac, &n)) SendBitsAny(fac); }   /* decision 30 */
             const bool sent = SendGoneAny(worldId, stamp); ++g_goneSent;
             DebugLog("[STORE] DELETED worldId=" + worldId + " (the engine's own destroy of a group we had written down) sent=" + (sent ? "1" : "0"));
+            }
         }
     }
     ForgetPlatoon(platoon); ++g_destroyedForgotten;
@@ -5639,6 +6515,20 @@ int SetSleepPosAllPod(void* platoon, float x, float y, float z)
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* T-985 C1: a row held beside, swapped in by MirrorKeepConfirmed with no full record following, for a squad ASLEEP here: its sleeping
+   position moves to the row's as ApplyRemoteRecord's position-only road moves it (the anchor is not touched, so the engine relocates
+   it on wake). The world server answered that key as a header only (the HELD list claimed the row's stamps), and that road refuses a
+   header no newer than the record here. An awake squad is left alone (its live state is the truth); with no world (EngineWritesBlocked)
+   nothing is asleep and the load reads the swapped-in record. MAIN THREAD. */
+void MirrorKeepMoveAsleep(const Record& r)
+{
+    if (EngineWritesBlocked()) return;
+    ::Faction* fac = (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && !r.factionName.empty()) ? FindFactionByKey(r.factionName) : 0;
+    void* sl = FindSleepingPlatoonImpl(fac, r.worldId);
+    if (sl == 0) return;
+    SetSleepPosPod(sl, r.x, r.y, r.z, 0); SetSleepPosAllPod(sl, r.x, r.y, r.z);
+    ++g_mkBesideMovedAsleep;
 }
 
 // ---- the wake hook: before the engine builds the characters, apply a newer record ----
@@ -5781,7 +6671,7 @@ struct T300Drop { std::string wid; int why; int needEmpty; int tries; };
 std::vector<T300Drop> g_t300Q; std::set<std::string> g_t300Queued;
 long long g_hoWakeRefused = 0, g_hoWakeNoFile = 0;   /* M7a3f3 T-425 [m7a3f3-st1]: wakes of a squad this game handed over - refused / no file to place it */
 long long g_t300WakeRefused = 0, g_t300RecvRefused = 0, g_t300PurgeAsked = 0, g_t300PurgeNotOther = 0, g_t300Sweeps = 0, g_t300SweepQueued = 0,
-          g_t300SweepKnown = 0, g_t300SweepNoMap = 0, g_t300Removed = 0, g_t300KeptKnown = 0, g_t300Cancelled = 0, g_t300Unlinked = 0,
+          g_t300SweepKnown = 0, g_t300SweepNoMap = 0, g_t300Removed = 0, g_t300KeptKnown = 0, g_t300Cancelled = 0,
           g_t300Gone = 0, g_t300NotEmpty = 0, g_t300GaveUp = 0, g_t300Lines = 0;
 int g_t300SweepArmed = 0, g_t300SweepTries = 0;
 const int kT300WhyWake = 1, kT300WhyRecv = 2, kT300WhyPurge = 3, kT300WhySweep = 4, kT300WhyHandedOver = 5;
@@ -5794,15 +6684,14 @@ void T300Line(const std::string& s)
     if (g_t300Lines == kT300LineCap) DebugLog("[STORE] T-300 line cap reached (" + N(kT300LineCap) + ") - further drops are counted on the REPORT otherHeldDrop[] token only");
 }
 /* 1 = the record came from ANOTHER game's file (squadwriter.h OtherGameFile: another game wrote it, of a squad not numbered in this
-   game's block - a squad numbered in my block stays mine whoever wrote its latest record), another player is in this
-   world (PlayersPresent: the old link or the world server's roster - every game reaches the others through the world server), and
-   the notebook map says another game holds the area at the FILE's position (HeldByOtherTS - the same answer the creation gate and
-   the orphan purge read; -1 = no fresh map = 0 here). */
+   game's block - a squad numbered in my block stays mine whoever wrote its latest record), and the notebook map says another game
+   holds the area at the FILE's position (HeldByOtherTS - the same answer the creation gate and the orphan purge read; -1 = no fresh
+   map = 0 here). The same rule runs whoever else is in the world: a holder whose player is not in it answers frozen (-2), never 1. */
 /* the squad's origin (SquadOriginSlot, at the file's position and with the file's writer) stands for its block: a squad the save made is
    another game's when that game runs it now */
 int T300OtherHeld(const Record& r)
 {
-    if (coopsquad::OtherGameFile(g_mySlot, r.owner, SquadOriginSlot(r.worldId, 0, -1, 1, r.x, r.z, r.owner)) == 0 || !PlayersPresent()) return 0;
+    if (coopsquad::OtherGameFile(g_mySlot, r.owner, SquadOriginSlot(r.worldId, 0, -1, 1, r.x, r.z, r.owner)) == 0) return 0;
     return HeldByOtherTS(SectorOf(r.x, r.z)) == 1 ? 1 : 0;
 }
 /* 1 = a world faction's squad (not the player's, not the peer's, not a stand-in record faction) - the only kind the store files */
@@ -5837,10 +6726,10 @@ void* T300PlatoonOfActive(void* faction, void* active)
 }
 std::string T300Report()
 {
-    return " otherHeldDrop[wakeRefused,recvRefused,purgeAsked,purgeNotOther,sweeps,sweepQueued,sweepKnown,sweepNoMap,removed,keptKnown,cancelled,unlinked,gone,notEmpty,gaveUp,pending]="
+    return " otherHeldDrop[wakeRefused,recvRefused,purgeAsked,purgeNotOther,sweeps,sweepQueued,sweepKnown,sweepNoMap,removed,keptKnown,cancelled,gone,notEmpty,gaveUp,pending]="
         + N(g_t300WakeRefused) + "," + N(g_t300RecvRefused) + "," + N(g_t300PurgeAsked) + "," + N(g_t300PurgeNotOther) + "," + N(g_t300Sweeps) + ","
         + N(g_t300SweepQueued) + "," + N(g_t300SweepKnown) + "," + N(g_t300SweepNoMap) + "," + N(g_t300Removed) + "," + N(g_t300KeptKnown) + ","
-        + N(g_t300Cancelled) + "," + N(g_t300Unlinked) + "," + N(g_t300Gone) + "," + N(g_t300NotEmpty) + "," + N(g_t300GaveUp) + "," + N((long long)g_t300Q.size())
+        + N(g_t300Cancelled) + "," + N(g_t300Gone) + "," + N(g_t300NotEmpty) + "," + N(g_t300GaveUp) + "," + N((long long)g_t300Q.size())
         + " handedOverWake[refused,noFile]=" + N(g_hoWakeRefused) + "," + N(g_hoWakeNoFile)   /* M7a3f3 T-425 [m7a3f3-st4] */
         + " contextPlatoon[loadSkipped,wakeSkipped,sleepRefused,sleepRefusedHandedOver;contextSleepWithMine]=" + N(g_ctxLoadSkipped) + "," + N(g_ctxWakeSkipped) + "," + N(g_ctxSleepRefused) + "," + N(g_ctxSleepRefusedHandedOver) + ";" + N(g_ctxSleepWithMine) + " contextWake[refused,noId]=" + N(g_ctxWakeRefused) + "," + N(g_ctxWakeNoId)   /* M7a2 [m7a2-cx5]: the first four are skips/refusals, exclusive; the last is sleeps that went on to the rules */
         + " sleepOtherGame=" + N(g_sleepRefusedOtherGame)   /* BlockSquadWrite at the sleep */
@@ -5867,6 +6756,23 @@ void* LiveTwinRunHere(void* faction, const std::string& wid, void* self, int* mi
         if (!named) continue;
         const int n = StorePlatoonMineMembers(p);
         if (n > 0) { *mine = n; return p; }
+    }
+    return 0;
+}
+/* 1 = another awake squad of this platoon's faction carries world id `wid` (a doubled squad; the same naming test as LiveTwinRunHere),
+   0 = none, -1 = the faction or its awake list did not read. MAIN THREAD. */
+int LiveSameIdOther(void* platoon, const std::string& wid)
+{
+    Pod q; q.faction = 0; q.unloaded = 0;
+    if (!Plaus(platoon) || wid.empty() || !ReadPod(platoon, &q) || !Plaus(q.faction)) return -1;
+    ActiveListPod L; if (!ReadActiveListPod(q.faction, &L) || !Plaus(L.items) || L.count > 4096) return -1;
+    for (unsigned i = 0; i < L.count; ++i)
+    {
+        void* p = L.items[i];
+        if (!Plaus(p) || p == platoon) continue;
+        std::map<void*, std::string>::const_iterator b = g_bind.find(p);
+        std::string sid;
+        if ((b != g_bind.end()) ? (b->second == wid) : (PlatoonSidPod(p, &sid) && sid == wid)) return 1;
     }
     return 0;
 }
@@ -5903,8 +6809,8 @@ void detour_activate(void* platoon)
     }
     if (g_on && g_dirReady && coop::HandedOverAny())
     {
-        /* M7a3f3 T-425 [m7a3f3-st5]: a squad this game HANDED to another game, in an area another game holds (at this game's file position),
-           another player in this world - this game's copy is stale (the other game runs the squad): refused as T-300 refuses another game's file. */
+        /* M7a3f3 T-425 [m7a3f3-st5]: a squad this game HANDED to another game, in an area another game holds (at this game's file position)
+           or a frozen one - this game's copy is stale (the other game runs the squad): refused as T-300 refuses another game's file. */
         const std::string wid = WorldIdOf(platoon);
         Pod q;
         if (!wid.empty() && !IsZoneId(wid) && ReadPod(platoon, &q) && coop::HandedOverHas(q.faction, wid))
@@ -5914,7 +6820,7 @@ void detour_activate(void* platoon)
             else
             {
                 const Sector sec = SectorOf(rt->second.x, rt->second.z);
-                if (coopsquad::HandedOverWakeRefuse(1, HeldByOtherTS(sec), PlayersPresent() ? 1 : 0, T300WorldFaction(platoon)) == 1)
+                if (coopsquad::HandedOverWakeRefuse(1, HeldByOtherTS(sec), T300WorldFaction(platoon)) == 1)
                 {
                     ++g_hoWakeRefused; T300Queue(wid, kT300WhyHandedOver, 0); g_bind[platoon] = wid; StampBind(platoon);
                     T300Line("[STORE] WAKE of '" + wid + "' refused - this game HANDED the squad to another game, which holds " + N((long long)sec.x) + "," + N((long long)sec.y)
@@ -6005,6 +6911,7 @@ void detour_activate(void* platoon)
         {
             g_byWorldId[worldId] = platoon;
             std::map<std::string, Record>::const_iterator it = g_records.find(worldId);
+            if (it != g_records.end() && MirrorKeepGated(worldId)) { ++g_mkGatedWake; it = g_records.end(); }   /* T-985 C1 fold 1 (review HIGH 1): a kept record not yet named is not applied at a wake */
             if (it != g_records.end())
             {
                 const Record& r = it->second;
@@ -6078,7 +6985,7 @@ void detour_activate(void* platoon)
     orig_activate(platoon);
     { std::map<void*, int>::iterator pc = g_p120Created.find(platoon); if (pc != g_p120Created.end()) { if (g_p120LoadPlatoon != platoon) { g_p120LoadPlatoon = platoon; g_p120LoadWriter = pc->second; g_p120Path = 1; } g_p120Created.erase(pc); } }   // PROBE P120 [F6]: the CreateUnknownSquad load path, at its first wake
     if (g_p120LoadPlatoon == platoon) { Pod w; P120Member lm[64]; const int ln = ReadPod(platoon, &w) ? P120Read(w.members, w.activeChars, lm, 64) : -1; ++g_p120Loads;   // PROBE P120
-        DebugLog("[PROBE] P120 load wid=" + (g_bind.count(platoon) ? g_bind[platoon] : std::string("?")) + " writer=" + N((long long)g_p120LoadWriter) + " path=" + std::string(g_p120Path == 1 ? "create" : "wake") + " n=" + N((long long)ln) + (ln > 0 ? P120List(lm, ln) : std::string()));   // PROBE P120
+        SW_DEVLOG("[PROBE] P120 load wid=" + (g_bind.count(platoon) ? g_bind[platoon] : std::string("?")) + " writer=" + N((long long)g_p120LoadWriter) + " path=" + std::string(g_p120Path == 1 ? "create" : "wake") + " n=" + N((long long)ln) + (ln > 0 ? P120List(lm, ln) : std::string()));   // PROBE P120
         g_p120LoadPlatoon = 0; g_p120Path = 0; }   // PROBE P120
     if (stAfter != 0) StateAfterWake(platoon, stAfter);
     P113NoteWake(platoon);   /* PROBE P113: the lever waits on its squad's wake */   /* T-296 fix 2: a tracked squad's +0x40 still outside its container after the wake? */
@@ -6425,9 +7332,9 @@ void LoadRefusedWorldSay(const char* where)
 }
 /* ==================================================================================================================
    M11 C1 (T-197, to-do M11; src/common/presence.h): IS ANOTHER PLAYER IN THIS WORLD? The old link up, OR this link's PLAYERS
-   roster shows another slot IN_WORLD (mppresence::PresenceDecide). No roster and no old link = alone, as before (the no-world
-   fail-open). The seven single-writer sites (items.cpp ItAreaVerdictAt / ItOwnerRungAt / ItBoxWriterDecide, farm.cpp FarmTick,
-   worldgen.cpp WorldGenTick) ask PlayersPresent; the area tie-break (zones.cpp MySlotLowerEx) reads the lowest IN_WORLD slot.
+   roster shows another slot IN_WORLD (mppresence::PresenceDecide). No roster and no old link = alone (the no-world fail-open).
+   The box writers, the area writer, farms and machines and the town-people gate do not ask it: they take one road whatever the
+   number of players. The area tie-break (zones.cpp MySlotLowerEx) reads the lowest IN_WORLD slot.
    The roster lives on the main thread, so StorePresenceTick (MAIN THREAD, every frame, from WorldGenTick) copies its two
    answers - and the old link's state, for the zones workers - into interlocked values any thread reads; a reader one frame
    behind decides as it would have a frame earlier.
@@ -6436,7 +7343,6 @@ static volatile LONG g_presRosterOtherTS = -1;    /* 1 another slot IN_WORLD, 0 
 static volatile LONG g_presRosterLowestTS = -1;   /* the lowest IN_WORLD slot (mine included), -1 none / no roster */
 static volatile LONG g_presOldLinkTS = 0;         /* net::SessionLinked() at the last StorePresenceTick */
 static volatile LONG g_presJoinedRoadTS = 0;      /* M11 C5: this world was entered through the world road (JoinedByWorldRoad) at the last StorePresenceTick */
-static volatile LONGLONG g_presAlone[mppresence::kSiteCount] = {0}, g_presByLink[mppresence::kSiteCount] = {0}, g_presByRoster[mppresence::kSiteCount] = {0};
 static volatile LONGLONG g_presTieByRoster = 0, g_presTieByRole = 0;
 static int g_presSaid = -1, g_presSaidLinked = -1, g_presSaidOther = -2, g_presSaidLowest = -2, g_presSaidRoad = -1;
 static long long g_presEdges = 0;
@@ -6454,7 +7360,7 @@ void StorePresenceTick()
     const int v = mppresence::PresenceDecideRoad(linked, other, road);
     if (v == g_presSaid && linked == g_presSaidLinked && other == g_presSaidOther && lowest == g_presSaidLowest && road == g_presSaidRoad) return;
     g_presSaid = v; g_presSaidLinked = linked; g_presSaidOther = other; g_presSaidLowest = lowest; g_presSaidRoad = road; ++g_presEdges;
-    DebugLog(std::string("[PRESENCE] another player in this world: ") + (v != 0 ? "YES" : "NO - this game writes as the only one")
+    DebugLog(std::string("[PRESENCE] another player in this world: ") + (v != 0 ? "YES" : "NO")
              + " (old link " + (linked != 0 ? "up" : "down") + ", the world server's roster: "
              + (other < 0 ? "none on this link" : (other != 0 ? "another slot IN_WORLD" : "no other slot IN_WORLD"))
              + ", lowest IN_WORLD slot " + N((long long)lowest) + ", my slot " + N((long long)g_mySlot) + (road != 0 ? ", joined through the world road - with no roster the others count as present (M11 C5)" : "") + "; M11 C1, presenceEdges " + N(g_presEdges) + ")");
@@ -6462,7 +7368,7 @@ void StorePresenceTick()
 int StoreRosterOtherInWorldTS() { return (int)::InterlockedCompareExchange(&g_presRosterOtherTS, 0, 0); }
 int StoreRosterLowestInWorldTS() { return (int)::InterlockedCompareExchange(&g_presRosterLowestTS, 0, 0); }
 int StorePresenceOldLinkTS() { return (int)::InterlockedCompareExchange(&g_presOldLinkTS, 0, 0); }
-bool PlayersPresent(int site)
+bool PlayersPresent()
 {
     /* M11 C1 fold (review F3): ANY THREAD. On the main thread the old link's own test, read live exactly as the seven sites read it
        before M11 C1; on any other thread the per-frame copy StorePresenceOldLinkTS(), because net::SessionLinked() is a null test
@@ -6470,19 +7376,13 @@ bool PlayersPresent(int site)
        main thread is known, OnMainThread() answers no and the copy is read - the safe direction. */
     const int linked = OnMainThread() ? (net::SessionLinked() ? 1 : 0) : StorePresenceOldLinkTS();
     const int v = mppresence::PresenceDecideRoad(linked, StoreRosterOtherInWorldTS(), (int)::InterlockedCompareExchange(&g_presJoinedRoadTS, 0, 0));   /* M11 C5: the world-road outage case */
-    if (site >= 0 && site < mppresence::kSiteCount)
-        ::InterlockedIncrement64(v == 0 ? &g_presAlone[site] : (linked != 0 ? &g_presByLink[site] : &g_presByRoster[site]));
     return v != 0;
 }
 void StorePresenceTieNote(int byRoster) { ::InterlockedIncrement64(byRoster != 0 ? &g_presTieByRoster : &g_presTieByRole); }
-/* the store REPORT's token: per site, decisions that answered alone / not alone by the old link / not alone by the roster only */
+/* the store REPORT's token: the area tie-break's answers by the roster / by the session role, and the presence answer's changes */
 static std::string PresenceReportToken()
 {
-    static const char* const kName[mppresence::kSiteCount] = { "box", "owner", "unread", "farm", "worldgen" };
-    std::string s = " m11c1 presence[alone,byLink,byRoster]=";
-    for (int i = 0; i < mppresence::kSiteCount; ++i)
-        s += std::string(i != 0 ? "/" : "") + kName[i] + ":" + N((long long)g_presAlone[i]) + "," + N((long long)g_presByLink[i]) + "," + N((long long)g_presByRoster[i]);
-    return s + " presenceTie[byRoster,byRole]=" + N((long long)g_presTieByRoster) + "," + N((long long)g_presTieByRole) + " presenceEdges=" + N(g_presEdges);
+    return " presenceTie[byRoster,byRole]=" + N((long long)g_presTieByRoster) + "," + N((long long)g_presTieByRole) + " presenceEdges=" + N(g_presEdges);
 }
 /* ==================================================================================================================
    M11 C2 (T-197, row M11; src/common/arrivals.h): THE ASKS. A site that re-sent everything at the old link's up edge keeps a cursor
@@ -6537,6 +7437,11 @@ long StorePeerGenAs(unsigned int peer, int byLink)
 }
 int StorePeerHere(unsigned int peer) { return StorePeerHereAs(peer, StorePeerByLink(peer)); }
 long StorePeerGen(unsigned int peer) { return StorePeerGenAs(peer, StorePeerByLink(peer)); }
+int StoreMeInWorldNow()   /* MAIN THREAD: the world server's roster, on this link, lists THIS game IN_WORLD */
+{
+    StoreArrivalTick();
+    return (g_rosterLinkGen == (long)StoreLinkGen() && LinkUp() && mparrive::MeInWorld(g_roster, g_mySlot)) ? 1 : 0;
+}
 int StoreOtherBeyondLinkInWorld()
 {
     StoreArrivalTick();
@@ -9192,11 +10097,12 @@ void TeardownBroadcast(const char* why)
     const size_t bound = g_bind.size(), byId = g_byWorldId.size();
     g_stCreated.clear();   /* T-296 fix 2: the origin marks are world state (the global state container is emptied with the world) */
     MoneyLoadWorldTeardown();   /* T-799 D1: the decided platoons and the queued loads name the world that is going */
+    BirthLockEnter(); g_birthOf.clear(); ::LeaveCriticalSection(&g_birthLock); g_discarding.clear(); g_keepVerdictOf.clear(); g_liveHomeOf.clear(); g_roamOf.clear(); g_unloadEmptied.clear();   /* the birth flags, keep marks, live home reads and template tests are keyed by platoon address, which the next world reuses */
     g_bind.clear(); g_bindGenOf.clear(); g_byWorldId.clear(); g_localWrittenAt.clear(); g_pendingPlace.clear(); g_wakeWait.clear(); g_npcStampErased.clear(); g_npcPurged.clear(); g_npcStrayHbSeen.clear(); g_npcStrayDeleteSeen.clear(); g_npcFreshSeen.clear(); g_facCheck.clear(); HbWorldTeardown();   /* E47-S2: the registry is world state */   /* E33: g_zoneFromRecord moved to TeardownBroadcastLateFlags - the post-teardown flush has to read it */   /* E23: the stamps are the bindings' - they go with them (the counter itself keeps climbing, so a stamp from the old world can never be read as older than a destroy in the new one) */
     g_zoneLogLines = 0;   /* E22c: the 64-line budget is PER WORLD (the suppressed count is cumulative evidence and is not reset) */
     ZoneMarkPendingClear(false, false);   /* Z1-b: the handshake table, under its lock (the load facts stay for the post-teardown flush - E33) */   // review-p3y P3Y-1: these were swallowed into the comment below by p3y (review-p3j: a stranded handshake must not outlive the read that set it)
     g_loadOverrideRestoredLogged = 0; g_loadOverrideFailedLogged = 0; g_loadOverrideMissingLogged = 0;   // review-p3x P3X-4: first-only per world
-    ResetPlayerFactionState(); ForgetContextPlatoons(); RelationsForgetQueue(); PlayersTabForgetWorld(); FallenTabForgetWorld();
+    ResetPlayerFactionState(); ForgetContextPlatoons(); RelationsForgetQueue(); PlayersTabForgetWorld(); FallenTabForgetWorld(); coop::UiEditorForgetWorld();
     coop::TeamForget("the world was torn down - leaving to the title, or another load", false);   /* T-546: asked again once a world is loaded */
     OwnResBenchForget();   /* the team research level: the next world's own benches give this game's own level */
     g_ctxSleptMine.clear(); g_ctxDrops.clear(); g_wakeDup.clear();   /* the context wake rule's platoons and the refused duplicate wakes belong to the freed world */
@@ -9353,7 +10259,7 @@ void TeardownBroadcastLateFlags(const char* why)
     if (OnMainThread())
     { const long undrained = ZoneMarkPendingClear(true, false);   /* Z1-b: the load facts a worker queued and the tick has not drained yet go too, and still count */
       ::InterlockedExchange(&g_teardownLateMarks, (long)g_zoneFromRecord.size() + undrained);
-      g_zoneFromRecord.clear(); g_zoneKeptMark.clear(); }
+      g_zoneFromRecord.clear(); g_zoneKeptMark.clear(); ZoneProvisionalThrow("a world teardown"); }   /* T-823 fold 2 */
     else ZoneMarkPendingClear(true, true);   /* Z1-c: the request; g_zoneFromRecord is left to the main thread */
     /* P6j (verify-p6c HIGH-1): lowered AFTER the call above, because the stale g_loadedHere that call wipes is the
        thing the gate is protecting against - lowering first would re-open the window on it for as long as the
@@ -9461,7 +10367,9 @@ bool detour_gdcLoad(void* container, const std::string* file, const std::string*
         const long lg = ::InterlockedCompareExchange(&g_linkGen, 0, 0);
         /* item 4: the mark names the record it was loaded from; T-609: and the link it was loaded on (the kept mark) - only once this
            link's record feed has ended, so a record another game wrote while this one was away cannot land later as "seen in step" */
-        ZoneMarkNote(pl.zoneId, true, st, ::InterlockedCompareExchange(&g_feedDoneLinkGen, 0, 0) == lg ? lg : -1);
+        const long fdl = ::InterlockedCompareExchange(&g_feedDoneLinkGen, 0, 0);
+        const int fdDone = AreaDoneOnLinkGate(coopfeed::FeedZoneIdAreaKey(pl.zoneId), lg, fdl == lg ? 1 : 0, kAreaGateLoadRecord);   /* T-985 step 2B: its own area (the old whole-feed answer counted against it) */
+        ZoneMarkNote(pl.zoneId, true, st, fdDone != 0 ? lg : -1, (fdDone == 0 && lg >= 1) ? lg : -1, fdDone != 0 ? 1 : 0);   /* T-823 fold 2: the list not complete yet - provisional */
         if (translate) TranslateZoneOwners(container, pl.zoneId, pl.writerSlot, pl.worldPlayers);   /* stand1 */
     }
     else { ++g_zoneLoadFailed; ErrorLog("[ZONE] the engine FAILED to load our record file for " + pl.zoneId + " ('" + path + "') - this zone stays 'not from record' and will not be written back"); }
@@ -9674,6 +10582,8 @@ long long g_loadGate44SessionPumps = 0, g_loadGate44Batches = 0, g_loadGate44Ela
      keyedSessionLost the session link went down mid-wait, so the party that would have named the notebook is
                       gone; the wait stops rather than running out its cap (E38's own H-1 shape). */
 long long g_loadGateKeyedNoLink = 0, g_loadGateKeyedLinkArrived = 0, g_loadGateKeyedNoSession = 0, g_loadGateKeyedSessionLost = 0;
+/* A keyed load whose wait stopped because no session link was up and the world-server link could not deliver a welcome. */
+long long g_loadGateKeyedStoreCannotArm = 0;
 /* P7q (review-p7l M-1 / M-2): the pending ring's own numbers.
      pendMaxInFlight       the high-water mark of pending key writes. It is the PROBE for M-1: the defect
                            needs two saves overlapping, and this is the only number that can say it happened.
@@ -10027,9 +10937,11 @@ void WorldGenOnWelcome(const std::vector<char>& payload, bool auth)
     {
         g_wgNotebook = restoreguard::WorldState();
         DebugLog("[STORE] world guard: this WELCOME carried no world numbers - a load fails open (noGen)");
+        MirrorKeepWelcomeSeq(0, 0ULL);   /* T-985 C1: the kept table cannot be judged by this WELCOME - one with a stored seq is refused (mirrorkeep::SeqJudge) */
         return;
     }
     const restoreguard::WorldState v = restoreguard::ViewOf(m);
+    MirrorKeepWelcomeSeq(1, v.seqHigh);   /* T-985 C1: a world server behind the kept table refuses it */
     if (!m.profile.empty() && !ProfileForKey().empty() && m.profile != ProfileForKey())
     {
         ++g_wgProfileMismatch;
@@ -10118,6 +11030,7 @@ static void OwedSettleOnSave(const std::string& saveName, const std::string& sav
 }
 void ProfileSavedTell(const std::string& saveName, const std::string& saveDir, long reqSeq, unsigned long long reqFt)
 {
+    MirrorKeepWrite("a save finished");   /* T-985 C1: the kept record table, at each finished save */
     if (g_profPickedNum == 0) return;
     const DWORD q = U8GetFileAttributes(JoinPathA(saveDir, "quick.save").c_str());
     const bool quick = q != INVALID_FILE_ATTRIBUTES && (q & FILE_ATTRIBUTE_DIRECTORY) == 0;
@@ -10590,6 +11503,7 @@ static bool StoreWelcomeWorld(unsigned int proto, const std::vector<char>& paylo
     {
         g_linkWorldId = d == coopworld::kWelcomeWorldNone ? std::string() : welId;
         g_linkWorldIdUpgraded = !g_linkWorldId.empty() && welUp;
+        PickWorldKeyPublish();   /* T-906 review F1: published with the WELCOME itself, so a load the gate lets go on this pump has it */
     }
     if (d == coopworld::kWelcomeWorldConfirm)
     {
@@ -11161,15 +12075,23 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
             if (noLinkAtEntry != 0)
             {
                 if (keyed) ++g_loadGateKeyedNoLink;   /* W3-g: the Keyed counters keep their names' meaning - keyed saves only */
-                DebugLog("[STORE] load gate: '" + name + "' is " + std::string(keyed ? "a KEYED" : "an UNKEYED (W3-g: it loads either way; the wait is for the record index)") + " save and NO notebook link is armed at all"
-                         " (role=" + std::string(ConfigRoleName()) + ", sessionLink="
-                         + N((long long)sessionAtGate) + "). Before P7q this refused instantly and booked"
-                         " loadRefusedUnlinked, which is also what a real timeout books. It WAITS now: the host's"
-                         " session WELCOME is what names the notebook, and the welcome-only session pump below is"
-                         " what delivers it" + std::string(keyed ? " (loadGateKeyedNoLink)." : "."));
+                if (StoreJoinViaWorld())
+                    /* The world road: the world-server link is the only thing that welcomes this game, and it is not armed. */
+                    DebugLog("[STORE] load gate: '" + name + "' is " + std::string(keyed ? "a KEYED" : "an UNKEYED (it loads either way; the wait is for the record index)") + " save and"
+                             " this game joins through the world server, but its world-server link is not armed and not up and welcomed"
+                             " (role=" + std::string(ConfigRoleName()) + ", sockState=" + N((long long)StoreLinkSockState())
+                             + ", sessionLink=" + N((long long)sessionAtGate) + "). The wait below stops at once when neither the"
+                             " world-server link nor a session link can deliver a welcome" + std::string(keyed ? " (loadGateKeyedNoLink)." : "."));
+                else
+                    DebugLog("[STORE] load gate: '" + name + "' is " + std::string(keyed ? "a KEYED" : "an UNKEYED (W3-g: it loads either way; the wait is for the record index)") + " save and NO notebook link is armed at all"
+                             " (role=" + std::string(ConfigRoleName()) + ", sessionLink="
+                             + N((long long)sessionAtGate) + "). Before P7q this refused instantly and booked"
+                             " loadRefusedUnlinked, which is also what a real timeout books. It WAITS now: the host's"
+                             " session WELCOME is what names the notebook, and the welcome-only session pump below is"
+                             " what delivers it" + std::string(keyed ? " (loadGateKeyedNoLink)." : "."));
             }
             const DWORD w0 = ::GetTickCount();
-            DWORD waitedMs = 0; int welcomedNow = 0, waitTimedOut = 0, linkArrived = 0, sessionLostInWait = 0;
+            DWORD waitedMs = 0; int welcomedNow = 0, waitTimedOut = 0, linkArrived = 0, sessionLostInWait = 0, storeCannotArm = 0;
             long long pumps = 0, batches = 0;
             for (;;)
             {
@@ -11196,14 +12118,29 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
                 }
                 welcomedNow = ((StoreWelcomedThisLink() != 0) && LinkUp()) ? 1 : 0;
                 if (welcomedNow != 0) break;
-                if (sessionAtGate != 0 && !net::SessionLinked())
+                if (sessionAtGate != 0 && !net::SessionLinked() && StoreLinkCouldArm() == 0)
                 {
-                    /* The party that was going to name the notebook is gone. Running out the rest of the cap
-                       would be waiting on something that can no longer happen - E38's own H-1 shape. */
+                    /* The party that was going to name the notebook is gone, and no world-server link it already named
+                       is still connecting or awaiting its welcome. Running out the rest of the cap would be waiting on
+                       something that can no longer happen - E38's own H-1 shape. */
                     sessionLostInWait = 1; if (keyed) ++g_loadGateKeyedSessionLost;
                     ErrorLog("[STORE] load gate: the SESSION LINK went down while this " + std::string(keyed ? "keyed" : "unkeyed") + " load was waiting for"
                              " the notebook's welcome. Nothing can deliver one now, so the wait stops here rather"
                              " than running out its cap; the verdict below is the answer" + std::string(keyed ? " (loadGateKeyedSessionLost)." : "."));
+                    break;
+                }
+                if (!net::SessionUpOrDialing() && StoreLinkCouldArm() == 0)
+                {
+                    /* Neither road can deliver a welcome: no session link up or connecting, and the world-server link is absent, down
+                       or refused - nothing re-dials it while this load holds the main thread. Running out the cap
+                       would be a wait on nothing. The exit takes the timeout's road below (the same verdict) but is
+                       not booked as a timeout. Tested after the session-lost branch so that branch keeps its reason. */
+                    storeCannotArm = 1; if (keyed) ++g_loadGateKeyedStoreCannotArm;
+                    ErrorLog("[STORE] load gate: no session link is up and the world-server link is missing or not able to"
+                             " welcome (sockState=" + N((long long)StoreLinkSockState()) + ": 0 down or absent, 4 refused) while this "
+                             + std::string(keyed ? "keyed" : "unkeyed") + " load was waiting for the notebook's welcome. Nothing can"
+                             " deliver one, so the wait stops here rather than running out its cap; the verdict below is the answer"
+                             + std::string(keyed ? " (loadGateKeyedStoreCannotArm)." : "."));
                     break;
                 }
                 ::Sleep(1);
@@ -11242,7 +12179,7 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
                      + N(pumps) + " batches=" + N(batches) + " welcomed=" + N((long long)welcomedNow) + " timedOut="
                      + N((long long)waitTimedOut) + " noLinkAtEntry=" + N((long long)noLinkAtEntry)
                      + " linkArrivedInGate=" + N((long long)linkArrived) + " sessionLostInWait="
-                     + N((long long)sessionLostInWait) + " keyed=" + N((long long)(keyed ? 1 : 0)) + " role=" + std::string(ConfigRoleName())
+                     + N((long long)sessionLostInWait) + " storeCannotArm=" + N((long long)storeCannotArm) + " keyed=" + N((long long)(keyed ? 1 : 0)) + " role=" + std::string(ConfigRoleName())
                      + ". A timeout here means the verdict below (a refusal for a keyed save; an unkeyed one still loads) is the answer for a link that never came up,"
                      " not for one that was merely slow; sessionPumps is the input that says the socket was"
                      " serviced while it happened.");
@@ -11285,7 +12222,16 @@ int WorldKeyLoadVerdict(const void* folderStr, const void* nameStr)
            what a reader cannot otherwise tell is whether the SESSION link was up - i.e. whether an address was
            still plausibly on its way - or whether nothing at all was armed and no wait could ever have helped. */
         const int sessionNow = net::SessionLinked() ? 1 : 0;
-        const std::string missing = (sessionNow == 0)
+        /* On the world road the world-server link is the one that names the notebook, not the session's WELCOME. */
+        const int worldRoad = StoreJoinViaWorld() ? 1 : 0;   /* a joiner on the world road; a host always declares the session road */
+        const std::string missing = (worldRoad != 0 || g_link != 0)   /* a host's own world-server link counts too: with it, BOTH links is false */
+            ? std::string(worldRoad != 0 ? "the WORLD-SERVER link - this game joins through the world server and that link "
+                                         : "the WORLD-SERVER link - this game's own link to it ")
+              + std::string(g_link != 0 ? "exists but" : "is not armed and") + " is not up and welcomed (sockState="
+              + (OnMainThread() ? N((long long)StoreLinkSockState()) : std::string("unread off the main thread"))
+              + ": 0 down or absent, 1 connecting, 2 up and not welcomed, 4 refused)"
+              + std::string(sessionNow == 0 ? "; there is no session link either" : "")
+            : (sessionNow == 0)
             ? std::string("BOTH links - there is no session link either, so nothing in this process could have"
                           " named a notebook and the wait above could not have succeeded")
             : std::string("the NOTEBOOK link only - the session link IS up, so the address either never arrived or"
@@ -11808,6 +12754,157 @@ void detour_saveManagerLoadName(void* self, const void* name)
     }
     orig_saveManagerLoadName(self, name);
 }
+/* RESET POPULATION (the Level Editor's button). ZoneManager's reset 0x9FCC30 - its one caller is the button's click handler
+   0x76B830 - runs only while the editor is open: it wipes the whole world (_clearAndDestroyGameWorldStuff, detour_worldTeardown)
+   and re-fills the nearest town. In a multiplayer world that deletes this player's own squad while the other players keep the old
+   townspeople, so there the original is not called (coopprof::EditorResetDecide); in single player it runs unchanged. The
+   button is greyed with the reason by ui.cpp when the panel shows (detour_editorShow, after the engine's own show). MAIN THREAD. */
+typedef void (*EditorResetFn)(void* zoneMgr);
+typedef void (*EditorShowFn)(void* editor, char show);
+EditorResetFn orig_editorReset = 0;
+EditorShowFn  orig_editorShow  = 0;
+long long g_editorResetRefused = 0, g_editorResetRun = 0;
+int g_editorResetHookOn = 0, g_editorShowHookOn = 0;
+void detour_editorReset(void* zoneMgr)
+{
+    if (coopprof::EditorResetDecide(HandSaveBlocked()) == coopprof::kEditorResetRefuse)
+    {
+        ++g_editorResetRefused;
+        DebugLog("[EDITOR] Reset Population refused: multiplayer world (refused=" + N(g_editorResetRefused) + ")");
+        return;
+    }
+    ++g_editorResetRun;
+    orig_editorReset(zoneMgr);
+}
+void detour_editorShow(void* editor, char show)
+{
+    orig_editorShow(editor, show);
+    coop::UiEditorPanelShown(show != 0 ? 1 : 0);
+}
+/* T-948 b (run T1505, Confirmed): another game's characters (copies) arrive here in ONE squad, as their own game has them; two
+   engine roads then split them into new squads numbered as this game's own, so this game's area roster differs from the owner's.
+     ROAD 1 - ActivePlatoon::_putTheSpecialCharactersInNewSquads 0x79B620 (decomp_79b620: void (ActivePlatoon*); each member caged
+       (+0x2F8 == 2) or carried goes alone into a new squad made by spawnEmptySquad 0x7F3880, with the CAPTURED_NPC package, or is
+       removed when that squad has no ActivePlatoon). setPrisonMode 0x3305C0 calls it (decomp_3305c0:86) - the mod's cage step on a
+       copy (spawn.cpp PosePrisonPod) reaches it. When EVERY member is a copy the original is not called: the squad stays as the
+       owner's game has it (sqsplit::SplitDecide). A squad with any own or unread member runs the original unchanged.
+     ROAD 2 - Character::moveToNewSquad 0x5CDA50 (decomp_5cda50: Platoon* (Character*, bool)), from the dialogue actions
+       (0x67FAD0 x3, Dialogue::_doActions - the AI worker runs them, hire.cpp detour_doActions) and the slave roads 0x6AE510 /
+       0x6AE960 (xrefs_5cda50). For a copy it is refused: the character stays where it is and its squad is returned - the engine's
+       own answer for a character already alone (decomp_5cda50:13-15, *(ActivePlatoon +0x78)); all five call sites discard the
+       answer. The mod never calls 0x5CDA50; a future deliberate move of a copy passes inside StoreSquadMovePassBegin / End.
+   THE COPY TEST (SqCopyTest) is items.cpp ItCcIsCopy's: a replicated character (FindSpawnedUid - address compares) this game does
+   not run - net::IsUidMine on the main thread, the owned mirror off it (O1); off the main thread while the mirror may miss an
+   owned uid, "not mine" is no proof: the character counts as this game's own and `unsure` counts it. ANY THREAD.
+   squadSplit[..] on the STORE REPORT line; 20 [SQSPLIT] lines per road, then counted only. */
+typedef void  (*SqSplitFn)(void* activePlatoon);
+typedef void* (*SqMoveFn)(void* character, char flag);
+SqSplitFn orig_sqSplit = 0;
+SqMoveFn  orig_sqMove  = 0;
+int g_sqSplitHookOn = 0, g_sqMoveHookOn = 0;
+volatile LONGLONG g_sqSplitSkipped = 0, g_sqSplitRun = 0, g_sqMoveRefused = 0, g_sqMovePassed = 0, g_sqMoveOwnPass = 0;
+volatile LONGLONG g_sqMoveOffMain = 0, g_sqUnsure = 0, g_sqSplitLines = 0, g_sqMoveLines = 0;
+DWORD g_sqPassTls = TLS_OUT_OF_INDEXES;   /* per thread: the depth of the mod's own deliberate moves (TlsAlloc: the DLL loads late) */
+const int kSqMemberCap = 64;
+const LONGLONG kSqLineCap = 20;
+/* 1 = a copy, 0 = this game's own or not replicated, -1 = unsure (off the main thread while the owned mirror may miss a uid). ANY THREAD */
+int SqCopyTest(void* c)
+{
+    if (!Plaus(c)) return 0;
+    const unsigned int u = FindSpawnedUid(c);
+    if (u == 0) return 0;
+    if (OnMainThread()) return net::IsUidMine(u) ? 0 : 1;
+    if (net::IsUidMineAnyThread(u)) return 0;
+    return net::OwnedMirrorExactAnyThread() ? 1 : -1;
+}
+/* the squad's members, POD only: ActivePlatoon +0x58 the count, +0x60 the array (decomp_79b620:31-33). The count copied; 0 = none;
+   -1 = faulted, an unreadable array or more than cap */
+int SqMembersPod(const void* ap, void** out, int cap)
+{
+    __try
+    {
+        const int n = *(const int*)((const char*)ap + 0x58);
+        if (n <= 0) return 0;
+        void* const* m = *(void* const* const*)((const char*)ap + 0x60);
+        if (n > cap || !Plaus(m)) return -1;
+        for (int i = 0; i < n; ++i) out[i] = m[i];
+        return n;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* ActivePlatoon +0x78 the Platoon, when it points back (+0x1D8); 0 otherwise. POD, any thread */
+void* SqPlatoonOfApPod(const void* ap)
+{
+    __try
+    {
+        void* pl = *(void* const*)((const char*)ap + 0x78);
+        return (Plaus(pl) && *(void* const*)((const char*)pl + 0x1D8) == ap) ? pl : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* a character's ActivePlatoon (Character +0x658, the field getSquad 0x790F70 reads - never called: it makes a squad when empty) */
+void* SqActivePlatoonOfPod(const void* c)
+{
+    __try { void* ap = *(void* const*)((const char*)c + 0x658); return Plaus(ap) ? ap : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int SqCountPod(const void* ap)
+{
+    __try { return *(const int*)((const char*)ap + 0x58); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+std::string SqThread() { return OnMainThread() ? std::string("main") : ("worker " + N((long long)::GetCurrentThreadId())); }
+std::string SqWid(void* platoon) { return (OnMainThread() && platoon != 0) ? WorldIdOf(platoon) : std::string("?"); }   /* g_bind: main thread only */
+void detour_sqSplit(void* ap)
+{
+    void* m[kSqMemberCap];
+    const int n = Plaus(ap) ? SqMembersPod(ap, m, kSqMemberCap) : -1;
+    int copies = 0, unsure = (n < 0) ? 1 : 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const int t = SqCopyTest(m[i]);
+        if (t == 1) ++copies;
+        else if (t < 0) { ++unsure; ::InterlockedIncrement64(&g_sqUnsure); }
+    }
+    if (sqsplit::SplitDecide(n, copies, unsure) == sqsplit::kSplitSkip)
+    {
+        const LONGLONG k = ::InterlockedIncrement64(&g_sqSplitSkipped);
+        const LONGLONG line = ::InterlockedIncrement64(&g_sqSplitLines);
+        if (line <= kSqLineCap)
+        {
+            void* const pl = SqPlatoonOfApPod(ap);
+            DebugLog("[SQSPLIT] new squads refused: every member of squad '" + SqWid(pl) + "' (" + P(pl) + ", members=" + N((long long)n)
+                     + ", first uid=" + N((long long)FindSpawnedUid(m[0])) + ") is another game's character - _putTheSpecialCharactersInNewSquads not run,"
+                     " the squad stays as its own game has it (thread=" + SqThread() + ", skipped=" + N((long long)k) + ")"
+                     + (line == kSqLineCap ? std::string(" - later ones counted only") : std::string()));
+        }
+        return;
+    }
+    ::InterlockedIncrement64(&g_sqSplitRun);
+    orig_sqSplit(ap);
+}
+void* detour_sqMove(void* c, char flag)
+{
+    const int t = SqCopyTest(c);
+    if (t < 0) ::InterlockedIncrement64(&g_sqUnsure);
+    const int depth = (g_sqPassTls != TLS_OUT_OF_INDEXES) ? (int)(INT_PTR)::TlsGetValue(g_sqPassTls) : 0;
+    const int d = sqsplit::MoveDecide(t, depth);
+    if (d == sqsplit::kMoveRefuse)
+    {
+        void* const ap = SqActivePlatoonOfPod(c);
+        void* const pl = (ap != 0) ? SqPlatoonOfApPod(ap) : 0;   /* the engine's own answer for a character already alone */
+        const LONGLONG k = ::InterlockedIncrement64(&g_sqMoveRefused);
+        if (!OnMainThread()) ::InterlockedIncrement64(&g_sqMoveOffMain);
+        const LONGLONG line = ::InterlockedIncrement64(&g_sqMoveLines);
+        if (line <= kSqLineCap)
+            DebugLog("[SQSPLIT] move to a new squad refused: uid=" + N((long long)FindSpawnedUid(c)) + " is another game's character - it stays in squad '"
+                     + SqWid(pl) + "' (" + P(pl) + ", members=" + N((long long)(ap != 0 ? SqCountPod(ap) : 0)) + ") flag=" + N((long long)(unsigned char)flag)
+                     + " thread=" + SqThread() + " refused=" + N((long long)k) + (line == kSqLineCap ? std::string(" - later ones counted only") : std::string()));
+        return pl;
+    }
+    ::InterlockedIncrement64(d == sqsplit::kMovePass ? &g_sqMoveOwnPass : &g_sqMovePassed);
+    return orig_sqMove(c, flag);
+}
 int TitleScreenUpPod();   /* defined below, beside the pump gate */
 /* F926 / user decision 2026-09-25: "the player shouldn't be able to load a save while connected; the act of connecting itself
    is the act of loading the save associated with your profile". T308 showed why: an in-world load while linked left the other
@@ -12145,16 +13242,24 @@ std::string* detour_sfsReadFile(void* sfs, std::string* out, const std::string* 
         const bool onMain = OnMainThread();
         ++g_zoneReads;
         if (!onMain) ::InterlockedIncrement64(&g_zoneReadOffMain);
+        {   /* T-968: once per world, what the foliage cells held at its first area read (the saved stand-ins must be in by now) */
+            const int cellsHeld = coop::PolicyFoliageAreaRead(coop::StoreWorldGenNow());
+            if (cellsHeld >= 0)
+                DebugLog("[ZONE] first area read of this world (" + zoneId + (onMain ? "" : ", off the main thread") + "): the foliage cells hold "
+                         + N((long long)cellsHeld) + " other player faction(s) - a town of any of them keeps the avoid-towns world objects its owner's game keeps");
+        }
         ZoneSwapEntry sw;
         const bool haveRec = ZoneSwapLookup(zoneId, &sw);
-        long noRecordGen = -1;
+        long noRecordGen = -1, provGen = -1;
+        const long fdR = ::InterlockedCompareExchange(&g_feedDoneLinkGen, 0, 0);   /* read before g_linkGen, as before */
+        const long lgR = ::InterlockedCompareExchange(&g_linkGen, 0, 0);
+        const int listDone = AreaDoneOnLinkGate(coopfeed::FeedZoneIdAreaKey(zoneId), lgR, (fdR >= 0 && fdR == lgR) ? 1 : 0, kAreaGateAreaRead);   /* T-985 step 2B: its own area (the old whole-feed answer counted against it) */
         if (!haveRec)
         {
-            const long fd = ::InterlockedCompareExchange(&g_feedDoneLinkGen, 0, 0);
-            const long lg = ::InterlockedCompareExchange(&g_linkGen, 0, 0);
-            if (fd >= 0 && fd == lg) noRecordGen = lg;
+            if (listDone != 0) noRecordGen = lgR;
+            else if (lgR >= 1) provGen = lgR;   /* T-823 fold 2: the link is up but its record list not complete - a provisional read */
         }
-        ZoneMarkNote(zoneId, false, ZoneStamp(), noRecordGen);   // a fresh load: derived from a record only if the swap below fires
+        ZoneMarkNote(zoneId, false, ZoneStamp(), noRecordGen, provGen, listDone);   // a fresh load: derived from a record only if the swap below fires
         ZonePendingDropZone(zoneId);   // review-p3j: a stranded handshake must not outlive the read that set it
         PreloadNoteLoad(zoneId, 1);   /* T-346: counted when the held load knew this area's copy was not current */
         if (g_on && g_zoneOn && !RoleIsSingle() && haveRec && !sw.file.empty())   /* AUD-b: no override in a lone game */
@@ -12618,6 +13723,62 @@ void InstallStore()
                          + " - F9 can still load a save by hand in a multiplayer world (only the linked-load refusal F926 catches it).");
         }
     }
+    /* Reset Population: refused in a multiplayer world (the reset hook), its button greyed with the reason (the panel hook).
+       Each table row is byte-checked by AddrInit; each hook is judged by the bytes read back. */
+    {
+        unsigned char epre[8], epost[8];
+        const uintptr_t rAddr = (uintptr_t)coop::AddrAbs(kEditorResetRva);
+        if (rAddr != 0)
+        {
+            const int r0 = ReadPrologue((const void*)rAddr, epre);
+            coop::HookStatus hr = coop::AddHook((void*)rAddr, (void*)&detour_editorReset, (void**)&orig_editorReset);
+            const int r1 = ReadPrologue((const void*)rAddr, epost);
+            g_editorResetHookOn = (hr == coop::SUCCESS && orig_editorReset != 0 && r0 != 0 && r1 != 0 && std::memcmp(epre, epost, 8) != 0) ? 1 : 0;
+        }
+        const uintptr_t sAddr = (uintptr_t)coop::AddrAbs(kEditorShowRva);
+        if (sAddr != 0)
+        {
+            const int s0 = ReadPrologue((const void*)sAddr, epre);
+            coop::HookStatus hs = coop::AddHook((void*)sAddr, (void*)&detour_editorShow, (void**)&orig_editorShow);
+            const int s1 = ReadPrologue((const void*)sAddr, epost);
+            g_editorShowHookOn = (hs == coop::SUCCESS && orig_editorShow != 0 && s0 != 0 && s1 != 0 && std::memcmp(epre, epost, 8) != 0) ? 1 : 0;
+        }
+        if (g_editorResetHookOn != 0)
+            DebugLog(std::string("[EDITOR] hook installed: ZoneManager's Reset Population is refused in a multiplayer world; its button ")
+                     + (g_editorShowHookOn != 0 ? "is greyed with the reason (LevelEditor::setVisible hooked)" : "is NOT greyed this run (LevelEditor::setVisible not hooked)"));
+        else
+            ErrorLog(std::string("[EDITOR] Reset Population refusal=not-installed (") + (rAddr == 0 ? "no ZoneManager_resetPopulation row in this build's table" : "the hook did not take")
+                     + ") - the Level Editor's Reset Population can still wipe a multiplayer world");
+    }
+    /* T-948 b: the two new-squad roads - a squad of copies is not split, a copy is not moved to a new squad. Each table row is
+       byte-checked by AddrInit; each hook is judged by the bytes read back. */
+    {
+        if (g_sqPassTls == TLS_OUT_OF_INDEXES) g_sqPassTls = ::TlsAlloc();
+        unsigned char qpre[8], qpost[8];
+        const uintptr_t spAddr = (uintptr_t)coop::AddrAbs(kSqSplitRva);
+        if (spAddr != 0)
+        {
+            const int q0 = ReadPrologue((const void*)spAddr, qpre);
+            coop::HookStatus hq = coop::AddHook((void*)spAddr, (void*)&detour_sqSplit, (void**)&orig_sqSplit);
+            const int q1 = ReadPrologue((const void*)spAddr, qpost);
+            g_sqSplitHookOn = (hq == coop::SUCCESS && orig_sqSplit != 0 && q0 != 0 && q1 != 0 && std::memcmp(qpre, qpost, 8) != 0) ? 1 : 0;
+        }
+        const uintptr_t mvAddr = (uintptr_t)coop::AddrAbs(kSqMoveRva);
+        if (mvAddr != 0)
+        {
+            const int q2 = ReadPrologue((const void*)mvAddr, qpre);
+            coop::HookStatus hm = coop::AddHook((void*)mvAddr, (void*)&detour_sqMove, (void**)&orig_sqMove);
+            const int q3 = ReadPrologue((const void*)mvAddr, qpost);
+            g_sqMoveHookOn = (hm == coop::SUCCESS && orig_sqMove != 0 && q2 != 0 && q3 != 0 && std::memcmp(qpre, qpost, 8) != 0) ? 1 : 0;
+        }
+        if (g_sqSplitHookOn != 0 && g_sqMoveHookOn != 0 && g_sqPassTls != TLS_OUT_OF_INDEXES)
+            DebugLog("[SQSPLIT] hooks installed: a squad whose members are all another game's characters is not split (_putTheSpecialCharactersInNewSquads),"
+                     " and another game's character is not moved to a new squad (moveToNewSquad)");
+        else
+            ErrorLog(std::string("[SQSPLIT] hooks NOT all installed: specialToNewSquads=") + (spAddr == 0 ? "no row" : (g_sqSplitHookOn != 0 ? "on" : "did not take"))
+                     + " moveToNewSquad=" + (mvAddr == 0 ? "no row" : (g_sqMoveHookOn != 0 ? "on" : "did not take")) + " passTls=" + (g_sqPassTls != TLS_OUT_OF_INDEXES ? "ok" : "none")
+                     + " - the engine can still split another game's characters into this game's own new squads");
+    }
     DebugLog(std::string("[STORE] world-teardown hooks: _clearAndDestroyGameWorldStuff ") + (h4 == coop::SUCCESS ? "OK" : "FAILED") + ", resetGame " + (h5 == coop::SUCCESS ? "OK" : "FAILED"));
     if (hExit == coop::SUCCESS) DebugLog("[EXIT] GameWorld::~GameWorld hook OK - at process exit the mod finishes its writes and ends the process before Kenshi's own shutdown (H052/H053)");
     else ErrorLog("[EXIT] GameWorld::~GameWorld hook FAILED - at process exit Kenshi's own shutdown runs and can abort (H052 Havok allocator, H053 ParticleUniverse externs)");
@@ -13022,6 +14183,7 @@ long long g_feedAsksFirst = 0, g_feedAsksNext = 0, g_feedOffsSent = 0, g_feedBeg
           g_feedEnds = 0, g_feedEndsAgain = 0, g_feedMarkersStale = 0, g_feedMalformed = 0, g_feedSendFailed = 0, g_feedDeferredMarked = 0,
           g_feedUniquesExpected = 0, g_feedSnapshotSent = 0;
 unsigned long long g_feedSeqHigh = 0ULL;
+long long g_feedHeldRowsSent = 0, g_feedHeldMsgsSent = 0;   /* the last HELD list: its rows and messages */
 bool StoreFeedSend(const std::vector<char>& b)
 {
     if (b.empty() || g_link == 0 || !g_link->Send(0, (net::MsgType)kStoreMsgRecordFeed, &b[0], b.size(), net::CH_RELIABLE)) { ++g_feedSendFailed; return false; }
@@ -13044,6 +14206,7 @@ bool StoreWelcomedOnConnection() { return g_link != 0 && g_link->State() == net:
 void StoreFeedOffAtLoad(const char* why)
 {
     g_snapshotApplied = false;
+    ::InterlockedExchange(&g_feedDoneLinkGen, -1); AreaDoneClear();   /* T-985 step 2B: a world reloaded on the same link knows its record list again only at its own feed's end (until 2B only a WELCOME reset this) */
     if (coopfeed::FeedOffTaken(&g_feed) == 0) return;
     if (!StoreWelcomedOnConnection()) return;   /* an OFF before the WELCOME is refused by the world server */
     g_feedOffOwedLink = StoreNotebookLinkGen();   /* review L1: owed on this link until it is out - StoreFeedTick retries it */
@@ -13062,6 +14225,21 @@ void StoreFeedTick()
     }
     const int act = coopfeed::FeedAskDecide(g_feed, LinkUp() ? 1 : 0, EngineWritesBlocked() ? 1 : 0, wg, lg, g_inBytes[kOriginNotebook], g_inCount[kOriginNotebook]);   /* review L3: entries too */
     if (act == coopfeed::kAskNone) return;
+    if (act == coopfeed::kAskFirst)
+    {   /* HELD first (recordfeed.h): the stamps of every record in this game's table, read on the tick the ASK goes, so the notebook
+           sends a record this game already holds as its header only */
+        std::vector<coopfeed::HeldRow> rows; rows.reserve(g_records.size());
+        for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)
+            if (coopfeed::FeedHeldKeyListed(it->first))   /* T-985 fold 1: never a ground or box record - those must arrive in full */
+            {
+                const std::map<std::string, Record>::const_iterator bs = g_mkBeside.find(it->first);   /* T-985 C1: a kept row held beside the index-load record - its file is checked and held here */
+                const Record& hr = bs != g_mkBeside.end() ? bs->second : it->second;
+                rows.push_back(coopfeed::HeldRow(it->first, hr.writtenAt, hr.posAt, (unsigned int)hr.owner));
+            }
+        std::vector<std::vector<char> > held; coopfeed::FeedHeldEncodeAll(rows, &held);
+        for (size_t i = 0; i < held.size(); ++i) if (!StoreFeedSend(held[i])) return;   /* the whole list again on the next tick - its first message starts it over */
+        g_feedHeldRowsSent = (long long)rows.size(); g_feedHeldMsgsSent = (long long)held.size();
+    }
     const std::string key = (act == coopfeed::kAskNext) ? g_feed.nextKey : std::string();
     std::vector<char> b;
     if (!coopfeed::FeedEncodeAsk(&b, key) || !StoreFeedSend(b)) return;   /* asked again on the next tick */
@@ -13069,8 +14247,11 @@ void StoreFeedTick()
     if (act == coopfeed::kAskFirst)
     {
         ++g_feedAsksFirst; g_snapshotApplied = false; g_feedSnapshotSent = 0;
+        MirrorKeepAsked();   /* T-985 C1 fold 1: a new snapshot - only its own records name a kept key */
+        g_areaDoneAllFeed = 0;   /* T-985 step 2B: counted per feed. No clear here (fold, LOW 3): every first ask follows a WELCOME on its link or a world load (g_worldGen moves only in StoreWorldLoadBegan, which calls StoreFeedOffAtLoad), and both clear */
         DebugLog("[STORE] T-313 record feed ASK (first page): this game has a world (worldGen " + N((long long)wg) + ", notebook link "
-                 + N((long long)lg) + ") - the notebook sends its unique states and records now, about 1 MB a page");
+                 + N((long long)lg) + ") - the notebook sends its unique states and records now, about 1 MB a page; this game told it the stamps of the "
+                 + N(g_feedHeldRowsSent) + " records it holds (" + N(g_feedHeldMsgsSent) + " HELD message(s)), so one it already holds comes as a header only");
     }
     else ++g_feedAsksNext;
 }
@@ -13106,6 +14287,8 @@ struct PreWantHere
 {
     bool operator()(const cooppre::IndexEntry& e) const
     {
+        MirrorKeepConfirmed(e.key, 0);   /* T-985 C1 fold 1: the world server's index names it - a kept key it lists is no longer held back */
+        if (coopbrec::IsBoxRecId(e.key) || piecerec::IsPieceRecId(e.key)) return false;   /* a box or piece record never enters the record table: the feed after the load brings it to its own table */
         std::map<std::string, Record>::const_iterator it = g_records.find(e.key);
         const bool have = it != g_records.end();
         return cooppre::PreWant(have ? 1 : 0, have ? it->second.writtenAt : 0, have ? it->second.posAt : 0, e.fileStamp, e.posAt,
@@ -13181,6 +14364,7 @@ bool PreloadTakesRecord(const std::vector<char>& payload)
     if (!net::DecodeRecordPayload(payload, &worldId, &squadSid, &factionName, &x, &y, &z, &writtenAt, &owner, &bytes, &townR, &seqIn, 0, &homeR)) return false;
     NoteTownPeople(worldId, townR);
     NoteRecordHome(worldId, homeR);   /* the group's home building key */
+    MirrorKeepConfirmed(worldId, 1);   /* T-985 C1: re-fetched - the fetched record follows */
     if (PreloadMirrorApply(worldId, squadSid, factionName, x, y, z, writtenAt, owner, bytes) != 0) g_pre.failed.insert(worldId);
     StoreNoteRecordSeq(worldId, seqIn);
     return true;
@@ -13240,6 +14424,7 @@ void PreloadFinish(int verdict, DWORD now)
     g_pre.phase = cooppre::kPhReleased;
     ::InterlockedExchange(&g_preCountOn, 1);
     g_preVerdictPending = verdict;   /* counted done / stale only when the pump's verdict lets the load go */
+    MirrorKeepWrite("the records before the load are in");   /* T-985 C1: the fetched records are in the kept table */
 }
 /* MAIN THREAD, SaveRequestPumpBody, right after its verdict let a title load go (T-346 fold 1, review LOW 5): the held load's
    exchange is counted and logged as done or stale only now - a load the verdict refuses is not a stale load (PreloadNoRequest
@@ -13323,9 +14508,54 @@ std::string PreloadReportValues()
          + "," + N((long long)::InterlockedCompareExchange(&g_preCountOn, 0, 0)) + "," + N((long long)g_pre.phase)
          + "," + N(g_prePosOnly) + "," + N(g_preReasked) + "," + N(g_preFetchCuts);   /* T-346 fold 1 */
 }
+/* T-985 step 2B: THE DRAIN - an AREA_DONE marker, in arrival order behind the records it covers. Fold (review MED 1 + 2): the last
+   page's marker already set the whole table and settled every provisional read, so all=1 only COUNTS - and counts a mismatch when
+   the whole table is not at this feed's stamp (it names a feed the marker did not complete). all=0 (step C) stamps the named areas
+   and settles their provisional reads (ZoneProvisionalSettle). A lost AREA_DONE changes nothing in 2B. */
+void StoreAreaDoneApply(const std::vector<char>& payload)
+{
+    unsigned int epoch = 0; coopfeed::AreaDoneMsg m;
+    if (!coopfeed::FeedAreaDoneMarkerDecode(payload, &epoch, &m)) { ++g_areaDoneMalformed; return; }
+    if (epoch != g_feed.epoch) { ++g_areaDoneMarkersStale; return; }   /* queued before an OFF or a new first ASK */
+    const long lg = ::InterlockedCompareExchange(&g_linkGen, 0, 0);
+    const long long stamp = coopfeed::FeedAreaStampMake(::InterlockedCompareExchange(&g_areaDoneGen, 0, 0), lg);
+    const int d = coopfeed::FeedAreaDoneDecide(::InterlockedCompareExchange64(&g_areaDone.all, 0, 0), m.all, stamp);
+    if (d != coopfeed::kAdAreas)
+    {
+        ++g_areaDoneAllFeed; ++g_areaDoneAllTotal;
+        if (d == coopfeed::kAdAllMismatch)
+        {
+            ++g_areaDoneAllMismatch;
+            if (g_areaDoneAllMismatch <= 3) ErrorLog("[STORE] T-985 AREA_DONE all=1 names a feed the last page's marker did not complete on link " + N((long long)lg) + " (areaDone allMismatch)");
+        }
+        return;
+    }
+    for (size_t i = 0; i < m.keys.size(); ++i) ::InterlockedExchange64(&g_areaDone.area[m.keys[i]], stamp);
+    ::InterlockedExchange64(&g_areaDone.some, stamp);
+    g_areaDoneAreas += (long long)m.keys.size();
+    ZoneFromRecordDrain();     /* T-823 fold 2: reads a worker queued before the list's end land first */
+    ZoneProvisionalSettle(&m.keys);   /* the provisional reads of the named areas are judged now */
+    DebugLog("[STORE] T-985 AREA_DONE applied: " + N((long long)m.keys.size()) + " area(s) of this snapshot done on link " + N((long long)lg));
+}
+/* T-985 step 2B: the AREA_DONE counts and gateDisagree (must stay 0 - the proof that 2B changes no gate's answer), for the REPORT line */
+std::string AreaDoneReportGroup()
+{
+    long long sum = 0; std::string by;
+    for (int g = 0; g < kAreaGateCount; ++g)
+    {
+        const long v = ::InterlockedCompareExchange(&g_areaGateDisagree[g], 0, 0);
+        sum += (long long)v;
+        if (g != 0) by += ",";
+        by += N((long long)v);
+    }
+    return " areaDone[allThisFeed,allTotal,allMismatch,areasNamed,arrivedStale,markersStale,malformed]=" + N(g_areaDoneAllFeed) + "," + N(g_areaDoneAllTotal) + "," + N(g_areaDoneAllMismatch) + "," + N(g_areaDoneAreas)
+           + "," + N(g_areaDoneStale) + "," + N(g_areaDoneMarkersStale) + "," + N(g_areaDoneMalformed)
+           + " gateDisagree=" + N(sum) + " gateDisagreeBy[areaRead,loadRecord,groundWrite,groundScan,boxHold,boxTick,town]=" + by;
+}
 /* THE DRAIN - a PAGE_END marker (ApplyRecordClassMessage), in arrival order behind its page's records. */
 void StoreFeedMarkerApply(const std::vector<char>& payload)
 {
+    if (coopfeed::IsFeedAreaDoneMarker(payload)) { StoreAreaDoneApply(payload); return; }   /* T-985 step 2B: kind 10 rides the same queue entry type */
     unsigned int epoch = 0; coopfeed::FeedMsg m;
     if (!coopfeed::FeedMarkerDecode(payload, &epoch, &m)) { ++g_feedMalformed; return; }
     bool snap = g_snapshotApplied;
@@ -13334,8 +14564,15 @@ void StoreFeedMarkerApply(const std::vector<char>& payload)
     if (r == coopfeed::kMarkStale) { ++g_feedMarkersStale; return; }
     if (r == coopfeed::kMarkPage) return;
     ++g_feedEnds;
+    {   /* T-985 step 2B fold (review MED 1 + 2): every area is done at this marker, written BEFORE the whole-feed stamp - a reader that sees the stamp sees the table; AREA_DONE all=1 behind it only counts */
+        const long long st = coopfeed::FeedAreaStampMake(::InterlockedCompareExchange(&g_areaDoneGen, 0, 0), ::InterlockedCompareExchange(&g_linkGen, 0, 0));
+        ::InterlockedExchange64(&g_areaDone.all, st); ::InterlockedExchange64(&g_areaDone.some, st);   /* STEP D (filtering): this marker must stop setting all - only AREA_DONE all=1 may say every area is here then */
+    }
     ::InterlockedExchange(&g_feedDoneLinkGen, ::InterlockedCompareExchange(&g_linkGen, 0, 0));   /* T-609: this link's record list is known - a zone read finding no record now means none exists */
+    ZoneFromRecordDrain();     /* T-823 fold 2: reads a worker queued before the list's end land first */
+    ZoneProvisionalSettle(0);   /* T-823 fold 2: the reads made before the list was complete are judged now - every area, as before 2B */
     if (r == coopfeed::kMarkEndAgain) ++g_feedEndsAgain;
+    MirrorKeepSnapshotEnd(g_indexExpected, g_feedSnapshotSent, (long long)m.sent);   /* T-985 C1: the first snapshot decides every kept key - the unnamed-key drop only when it was seen whole */
     ::InterlockedExchange(&g_preCountOn, 0);   /* T-346: this world's records are all applied - nothing loads from a copy the held load knew was old after this */
     DebugLog("[STORE] T-313 record feed: this world's snapshot is APPLIED - " + N(g_feedSnapshotSent) + " records paged (BEGIN said "
              + N(g_indexExpected) + ", " + N(g_feedUniquesExpected) + " unique states)"
@@ -13420,7 +14657,7 @@ void ApplyRecordClassMessage(int type, const std::vector<char>& payload)
         std::string townR, homeR;
         unsigned long long seqIn = 0;
         unsigned recFlags = 0;
-        if (net::DecodeRecordPayload(payload, &worldId, &squadSid, &factionName, &x, &y, &z, &writtenAt, &owner, &bytes, &townR, &seqIn, &recFlags, &homeR)) { ++g_linkRecords; NoteTownPeople(worldId, townR); NoteRecordHome(worldId, homeR); StoreNotePushArrival(worldId); ApplyRemoteRecord(worldId, squadSid, factionName, x, y, z, writtenAt, owner, bytes, recFlags); StoreNoteRecordSeq(worldId, seqIn); }   /* B12 (store protocol 41): the notebook's seq is taken from the NOTEBOOK'S OWN link and nowhere else - the session peer sends 0 in that field */   /* B10-b (review-b10 M-2): the push's books are kept HERE, at the store link's own call site, and nowhere the session link can reach */
+        if (net::DecodeRecordPayload(payload, &worldId, &squadSid, &factionName, &x, &y, &z, &writtenAt, &owner, &bytes, &townR, &seqIn, &recFlags, &homeR)) { ++g_linkRecords; MirrorKeepNamed(worldId, bytes.empty() ? 0 : 1); NoteTownPeople(worldId, townR); NoteRecordHome(worldId, homeR); StoreNotePushArrival(worldId); ApplyRemoteRecord(worldId, squadSid, factionName, x, y, z, writtenAt, owner, bytes, recFlags); StoreNoteRecordSeq(worldId, seqIn); }   /* B12 (store protocol 41): the notebook's seq is taken from the NOTEBOOK'S OWN link and nowhere else - the session peer sends 0 in that field */   /* B10-b (review-b10 M-2): the push's books are kept HERE, at the store link's own call site, and nowhere the session link can reach */
         else ErrorLog("[STORE] malformed RECORD from the store - ignored");
     }
 }
@@ -14515,6 +15752,15 @@ static void StoreCatchupArrive(const std::vector<char>& p)
 void StoreFeedArrive(const std::vector<char>& payload)
 {
     if (!payload.empty() && cooppre::IsPreKind(&payload[0], payload.size())) { PreloadArrive(payload); return; }   /* T-346 slice 1: an INDEX_PAGE / FETCH_END */
+    if (!payload.empty() && coopfeed::IsFeedAreaDoneKind(&payload[0], payload.size()))
+    {   /* T-985 step 2B: AREA_DONE - queued as a marker behind the records it covers, when it belongs to this link's latest snapshot */
+        coopfeed::AreaDoneMsg ad;
+        if (!coopfeed::FeedAreaDoneDecode(&payload[0], payload.size(), &ad)) { ++g_areaDoneMalformed; return; }
+        if (coopfeed::FeedAreaDoneArrived(g_feed, StoreNotebookLinkGen(), ad.epoch) == 0) { ++g_areaDoneStale; return; }
+        std::vector<char> mk; coopfeed::FeedMarkerEncode(&mk, g_feed.epoch, payload);
+        InQueueEnqueue((int)kStoreMsgRecordFeed, kOriginNotebook, kScopeSave, kClassEdge, 0, 0, mk);
+        return;
+    }
     coopfeed::FeedMsg m;
     if (payload.empty() || !coopfeed::FeedDecode(&payload[0], payload.size(), &m) || (m.kind != (unsigned)coopfeed::kFeedBegin && m.kind != (unsigned)coopfeed::kFeedPageEnd))
     {
@@ -14546,6 +15792,7 @@ void StoreFeedMarkLastDeferred()
 }
 void PumpLink()
 {
+    PickWorldKeyPublish();   /* T-906: a backstop only - the id's setters publish it themselves (review F1); this catches a setter added later */
     if (g_link == 0) return;
     if (g_quitSteamLinkClosed != 0) return;   /* closed at the quit: its down edge is not run while the game exits */
     /* P7v (design-noworld-queue 1.4) - BACK-PRESSURE. Past the high-water mark with the predicate blocked,
@@ -14708,7 +15955,7 @@ void PumpLink()
         /* E24.1: the end of the WELCOME's push, as an event. The bitmaps and the unique states ARE the push; the
            first message of any other type after the WELCOME is the relay having moved on to the records (or to its
            next per-second AREAMAP, which is why a notebook holding nothing still ends its push). */
-        if (g_welcomePush == 1 && m.type != net::MSG_STORE_WELCOME && m.type != kStoreMsgDeletedBits && m.type != kStoreMsgUniqueState && m.type != kStoreMsgOptions && m.type != (net::MsgType)kStoreMsgClock && m.type != (net::MsgType)kStoreMsgWeather && m.type != (net::MsgType)kStoreMsgResearch && m.type != (net::MsgType)kStoreMsgResearchTake && m.type != (net::MsgType)kStoreMsgTownBar && m.type != (net::MsgType)kStoreMsgOwed && m.type != (net::MsgType)kStoreMsgTownLoss && m.type != (net::MsgType)kStoreMsgWorldRel && m.type != (net::MsgType)kStoreMsgOwnHigh && m.type != (net::MsgType)kStoreMsgUidBlock && m.type != (net::MsgType)kStoreMsgLive && m.type != (net::MsgType)kStoreMsgCatchup && m.type != (net::MsgType)kStoreMsgPlayerGone && m.type != (net::MsgType)kStoreMsgKept && m.type != (net::MsgType)townkeep::kMsgTowns && m.type != (net::MsgType)kStoreMsgShow && m.type != (net::MsgType)moneyw::kMsgDeliver)   /* T-810: a receiver's money inbox rides inside the push */   /* TOWNS: the kept outposts can land inside the push too; T-811: SHOW too */   /* KEPT: a STATE broadcast (another game's claim or lay) can land inside the push too */   /* M8: a PLAYER_GONE can land inside the push too */   /* M6: a CATCHUP can land inside the push too */   /* M5a: a LIVE from another game can land inside the push - it is not the relay moving on */   /* M4 fold: a UID_BLOCK answer can land inside the push - it is not the relay moving on */   /* restore1b1: the OWN_HIGH rows ride right after the WELCOME */   /* loot2b: the research boxes ride inside it too (after the unique states); loot2c: and the take rows after them; refill1: and the town bar rows after those */   /* E40: the CLOCK and the weather rows ride INSIDE the opening push (the relay sends them right after the options), so neither of them is the relay having moved on */
+        if (g_welcomePush == 1 && m.type != net::MSG_STORE_WELCOME && m.type != kStoreMsgDeletedBits && m.type != kStoreMsgUniqueState && m.type != kStoreMsgOptions && m.type != (net::MsgType)kStoreMsgClock && m.type != (net::MsgType)kStoreMsgWeather && m.type != (net::MsgType)kStoreMsgResearch && m.type != (net::MsgType)kStoreMsgResearchTake && m.type != (net::MsgType)kStoreMsgTownBar && m.type != (net::MsgType)kStoreMsgOwed && m.type != (net::MsgType)kStoreMsgTownLoss && m.type != (net::MsgType)kStoreMsgWorldRel && m.type != (net::MsgType)kStoreMsgOwnHigh && m.type != (net::MsgType)kStoreMsgUidBlock && m.type != (net::MsgType)kStoreMsgLive && m.type != (net::MsgType)kStoreMsgCatchup && m.type != (net::MsgType)kStoreMsgPlayerGone && m.type != (net::MsgType)kStoreMsgKept && m.type != (net::MsgType)townkeep::kMsgTowns && m.type != (net::MsgType)kStoreMsgShow && m.type != (net::MsgType)moneyw::kMsgDeliver && m.type != (net::MsgType)coopgrec::kMsgGroundRefuse && m.type != (net::MsgType)coopbrec::kMsgBoxRefuse && m.type != (net::MsgType)piecerec::kMsgPieceRefuse)   /* T-697 step 2: a GROUND_REFUSE answering a write can land inside the push */   /* T-810: a receiver's money inbox rides inside the push */   /* TOWNS: the kept outposts can land inside the push too; T-811: SHOW too */   /* KEPT: a STATE broadcast (another game's claim or lay) can land inside the push too */   /* M8: a PLAYER_GONE can land inside the push too */   /* M6: a CATCHUP can land inside the push too */   /* M5a: a LIVE from another game can land inside the push - it is not the relay moving on */   /* M4 fold: a UID_BLOCK answer can land inside the push - it is not the relay moving on */   /* restore1b1: the OWN_HIGH rows ride right after the WELCOME */   /* loot2b: the research boxes ride inside it too (after the unique states); loot2c: and the take rows after them; refill1: and the town bar rows after those */   /* E40: the CLOCK and the weather rows ride INSIDE the opening push (the relay sends them right after the options), so neither of them is the relay having moved on */
         {
             g_welcomePush = 2;
             DebugLog("[STORE] the notebook's opening push is complete - a locally first-seen unique state may now be published");
@@ -14807,6 +16054,8 @@ void PumpLink()
             /* P6q (review-p6j MEDIUM-1): the WELCOME belongs to the link that is up RIGHT NOW, and saying so is what
                lets ApplyRelayPlayerSectors tell a table that arrived after this handshake from one that raced it. */
             ::InterlockedExchange(&g_feedDoneLinkGen, -1);   /* T-609: the record list is known again only at this WELCOME's feed END */
+            AreaDoneClear();   /* T-985 step 2B: and no area of it */
+            ZoneProvisionalThrow("a WELCOME");   /* T-823 fold 2 */
             ::InterlockedExchange(&g_welcomeLinkGen, ::InterlockedCompareExchange(&g_linkGen, 0, 0));
             ::InterlockedIncrement(&g_moneyEdge);   /* T-810: a WELCOME (a profile pick's too, on the same link) - money that came before it was another WELCOME's; this one's inbox rides in its push */
             coop::ZonesSlotsSeenReset("a new notebook link");   /* review-recruit3 5b: a new link may be another world or notebook, with its own slot numbering - the relay's table re-fills it within a second */
@@ -14979,6 +16228,9 @@ void PumpLink()
         else if (m.type == (net::MsgType)kStoreMsgOwed) coop::TownGenOwedArrive(m.payload);   /* T-581: the owed rows - a table write only; the town check-up acts on it */
         else if (m.type == (net::MsgType)kStoreMsgKept) coop::KeptNoteRows(m.payload.empty() ? 0 : &m.payload[0], m.payload.size());   /* the kept pieces' rows and their state */
         else if (m.type == (net::MsgType)townkeep::kMsgTowns) coop::BuildTownsNote(m.payload.empty() ? 0 : &m.payload[0], m.payload.size());   /* the kept outposts (before the first kept rows of the link) */
+        else if (m.type == (net::MsgType)piecerec::kMsgPieceRefuse) coop::PieceRefuseArrive(m.payload);   /* the world server did not take this game's piece record - counted, the piece marked again */
+        else if (m.type == (net::MsgType)coopbrec::kMsgBoxRefuse) coop::BoxRefuseArrive(m.payload);   /* T-823: the world server did not take this game's box record - counted and logged, nothing applied */
+        else if (m.type == (net::MsgType)coopgrec::kMsgGroundRefuse) coop::GroundRefuseArrive(m.payload);   /* T-697 step 2: the world server did not take this game's ground record - a ground-table write; GroundDrain acts on it */
         else if (m.type == (net::MsgType)kStoreMsgShow) coop::BuildShowNote(m.payload.empty() ? 0 : &m.payload[0], m.payload.size());   /* T-811: the teammates' outposts, shown at the next drain */
         else if (m.type == (net::MsgType)kStoreMsgTownLoss) coop::TownLossNoteRows(m.payload);   /* each town's recorded losses and refilled flag - a table write only; the town check-up acts on it */
         else if (m.type == (net::MsgType)kStoreMsgResearch)
@@ -15112,6 +16364,8 @@ long long g_loadGateNoAddressYet = 0, g_loadGateWaitOverEnetTimeout = 0;
    the address has gone. */
 long long g_loadGateWaitedForStoreLink = 0, g_loadGateBatchesPumped = 0, g_loadGateSessionPumps = 0;
 long long g_loadGateStoreLinkSessionLost = 0, g_loadGateAddressArrivedInGate = 0, g_loadGateDrainMsMax = 0;
+/* An E38 wait that stopped because its world-server link was down, absent or refused - it could no longer deliver a welcome. */
+long long g_loadGateStoreLinkLost = 0;
 /* WHICH STAGE THE WAIT ENDED AT. The gate waits for four things in order and a reader has to be able to tell
    which one it was still waiting for when the clock ran out - "timedOut=1" alone says only that it failed. */
 const int kGateStageStoreLink = 1, kGateStageWelcome = 2, kGateStageAreaMap = 3, kGateStageClock = 4, kGateStageReady = 5;
@@ -15197,7 +16451,7 @@ void E38LoadGate()
        after - the town load at 0x372190 and the "No towns loaded" check are BELOW :212.) What this gate
        contributes is unchanged: it waits, so that first pass has a clock to use. */
     int welcomed = 0, areaMapSeen = 0, clockSeen = 0, timedOut = 0;   /* E40: and one CLOCK, so the world that is about to load can set its time on its first tick rather than on its next second */
-    int sessionLostInWait = 0;
+    int sessionLostInWait = 0, storeLinkLost = 0;
     int stage = (g_link == 0) ? kGateStageStoreLink : kGateStageWelcome;   /* P7h: what this load is waiting for right now */
     DWORD waited = 0, lastDrainMs = 0;
     for (;;)
@@ -15261,6 +16515,18 @@ void E38LoadGate()
               : (areaMapSeen == 0 ? kGateStageAreaMap
               : (clockSeen == 0 ? kGateStageClock : kGateStageReady));
         if (welcomed != 0 && areaMapSeen != 0 && clockSeen != 0) break;
+        if (g_link != 0 && StoreLinkCouldArm() == 0)
+        {
+            /* The world-server link is down, absent or refused: nothing re-dials it while this load holds the main
+               thread, so nothing more can arrive on it. Not a timeout - the wait stops on the link, not the clock. */
+            ++g_loadGateStoreLinkLost;
+            storeLinkLost = 1;
+            ErrorLog("[STORE] E38 load gate: the world-server link can no longer deliver anything (sockState="
+                     + N((long long)StoreLinkSockState()) + ": 0 down or absent, 4 refused) while this load was waiting at stage "
+                     + std::string(GateStageName(stage)) + ". The wait stops here rather than running out its cap; the load"
+                     " proceeds on the local fallback (loadGateStoreLinkLost).");
+            break;
+        }
         ::Sleep(1);
     }
     /* P7h (review-p6z H-2) - THE TRUE ELAPSED, MEASURED AFTER THE LAST DRAIN. `waited` is the value the cap was
@@ -15304,7 +16570,7 @@ void E38LoadGate()
              + " welcomed=" + N(welcomed)
              + " areaMapSeen=" + N(areaMapSeen) + " clockSeen=" + N(clockSeen) + " timedOut=" + N(timedOut)
              + " waitedForStoreLink=" + N(waitedForStoreLink) + " addressArrivedInGate=" + N(g_loadGateAddressArrivedInGate)
-             + " sessionLostInWait=" + N(sessionLostInWait)
+             + " sessionLostInWait=" + N(sessionLostInWait) + " storeLinkLost=" + N(storeLinkLost)
              + " batchesPumped=" + N(g_loadGateBatchesPumped) + " sessionPumps=" + N(g_loadGateSessionPumps)
              + " inQueued[notebook,session]=" + N(g_inQueued[kOriginNotebook]) + "," + N(g_inQueued[kOriginSession])
              + " inHeld=" + N((long long)(g_inQueue.size() - g_inHead)) + " queueSaturated=" + N(g_loadGateQueueSaturated)
@@ -15323,6 +16589,7 @@ void E38LoadGate()
 // of deleted group numbers in the notebook) is a pending decision. The WORLD_LISTED marker stays on the wire as a no-op.
 /* moved (P4e5): below every POD reader they use */
 long long g_watchWalked = 0, g_watchNoId = 0, g_watchUnknown = 0, g_watchAlive = 0, g_watchTicks = 0, g_watchNotMine = 0;
+long long g_watchAlreadyDead = 0;   /* T-881: a group already marked wiped out (g_deadPending) - not walked again until it sleeps, is destroyed or the world tears down */
 long long g_watchEngineKept = 0;   /* a group with nobody alive that the engine keeps for its rebuild (coopt2::EngineKeepsDeadGroup) - not a wipe-out */
 long long g_watchOtherBlock = 0;   /* review-p5i MEDIUM-3 (E17): "another game NUMBERED this group" - a different answer from "another game owns its CHARACTERS", and their disagreement is the whole subject of E2/E12 */
 /* 1 = the engine keeps this group for its rebuild (Platoon+0xD9 regenerates, a home town Ownerships+0x30, that town not dead -
@@ -15355,8 +16622,9 @@ void DeathWatchTick()
             ++g_watchWalked;
             const int living = LivingMembersPod(p);
             if (living > 0) { ++g_watchAlive; HbRegister(p); continue; }   /* E47-S2 entry edge: an awake world group with living members (a map find when already known) */
-            if (living < 0) { ++g_watchUnknown; continue; }   /* -1 fault / -2 not awake here */   /* E12: moved ABOVE the ownership tests - the member rule below was already gated on living == 0, so a -1/-2 group reached this line either way; the order only changes which test names it, and "unknown" is the honest name */
+            if (living < 0) { ++g_watchUnknown; continue; }   /* -1 not read (a fault, an implausible member list, more than 512) / -2 not awake here */   /* E12: moved ABOVE the ownership tests - the member rule below was already gated on living == 0, so a -1/-2 group reached this line either way; the order only changes which test names it, and "unknown" is the honest name */
             const std::string wid = WorldIdOf(p); if (wid.empty()) { ++g_watchNoId; continue; }   /* E12: read here rather than after the ownership tests - the block rule needs the NUMBER, and the number is in the id */
+            if (g_deadPending.count(wid) != 0) { ++g_watchAlreadyDead; continue; }   /* T-881: marked once (below), released to the engine; its delete waits for the sleep / destroy path - nothing more to read here */
             /* E12 (2026-09-04): THE SAME BLOCK RULE AS E2, AND FOR THE SAME REASON. This watch declares a world group wiped out
                on the strength of its MEMBERS' uids - and a group's members are exactly what stops answering when they are
                destroyed or adopted. E2 (F524) already replaced that test at sleep time with the group's own number: decision
@@ -15431,12 +16699,10 @@ void T300DropTick()
     if (EngineWritesBlocked()) return;   /* a load or a teardown: kept for a tick with a world */
     std::vector<T300Drop> q; q.swap(g_t300Q);
     FmPod fm; const int fmOk = (Plaus(coop::GameWorldPtr()) && ReadFactionsPod((void*)coop::GameWorldPtr()->factionDirectory, &fm) && Plaus(fm.factions) && fm.count <= 4096) ? 1 : 0;
-    const int present = PlayersPresent() ? 1 : 0;   /* another player in this world: the old link or the world server's roster */
     for (size_t i = 0; i < q.size(); ++i)
     {
         T300Drop d = q[i];
         const std::string why(T300WhyWord(d.why));
-        if (coopsquad::StaleDropGoesOn(present) == 0) { ++g_t300Unlinked; g_t300Queued.erase(d.wid); T300Line("[STORE] T-300 drop of '" + d.wid + "' (" + why + ") cancelled: no other player is in this world"); continue; }
         std::map<std::string, Record>::const_iterator rt = g_records.find(d.wid);
         /* M7a3f3 T-425 [m7a3f3-st6]: a handed-over drop is re-checked by its own rule (still handed over, another game still holds the area) */
         const int stillDue = (d.why == kT300WhyHandedOver)
@@ -15627,18 +16893,18 @@ void CtxDropTick()
     }
 }
 /* T-300 fix 3: ONE SWEEP WHEN ANOTHER PLAYER ENTERS THIS WORLD (armed in StoreTick from the arrival record - the world server's
-   roster or the old link; it waits for a world, then needs another player still present). Every record from another game's file
+   roster or the old link; it waits for a world, then runs whoever is in the world by then: a holder who has left answers frozen
+   and its records are skipped). Every record from another game's file
    whose position is in an area another game holds: its squad here is queued when it is awake with no registered member (woken
    from the file while this game was alone - T658's 99), or asleep inside the area loaded here (the engine would wake it within
-   2 s). Squads asleep elsewhere are left: the wake hook refuses them if they are ever woken while another player is present. A
+   2 s). Squads asleep elsewhere are left: the wake hook refuses them if they are ever woken while another game holds their area. A
    record whose area the map has not answered yet (-1) is retried each second, up to 30. */
 static std::set<std::string> g_t300SweepSkipLogged;   /* TEST ONLY sweepskip=: ids whose 'left alone' line is written (one line per id) */
 void T300SweepTick()
 {
     if (g_t300SweepArmed == 0 || !OnMainThread()) return;
     const int worldReady = (g_on && g_dirReady && !EngineWritesBlocked() && Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory)) ? 1 : 0;
-    const int step = coopsquad::StaleSweepStep(g_t300SweepArmed, worldReady, (worldReady != 0 && PlayersPresent()) ? 1 : 0);
-    if (step == coopsquad::kStaleSweepDisarm) g_t300SweepArmed = 0;
+    const int step = coopsquad::StaleSweepStep(g_t300SweepArmed, worldReady);
     if (step != coopsquad::kStaleSweepRun) return;
     ++g_t300SweepTries;
     long long queued = 0, awake = 0, asleepLoaded = 0, known = 0, noMap = 0;
@@ -15770,6 +17036,24 @@ void LoadFloorTick()
    reconnect, a relay restart or a remembered slot can name a different slot later in the same world: the block is then applied
    again for that slot (counted and logged - groups already numbered in the old block keep their numbers). MAIN THREAD. */
 void RaiseOwnRecordCounters();   /* defined beside PlaceUnplacedNotes, below - the same namespace (coop) */
+/* one faction's squad counter set into slot's block (numberblock.h CounterForBlock), the block it leaves remembered for a later move
+   back. Returns numblock::kKept / kRaised / kMovedDown / kHeld; -1 the counter was not read, -2 it was not written. *counterOut = the
+   counter as read. MAIN THREAD. */
+int BlockOneFaction(void* f, int slot, unsigned* counterOut)
+{
+    unsigned c = 0; if (ReadCounterPod(f, &c) != 1) return -1;
+    *counterOut = c;
+    const std::string key = FactionFloorKey(f);
+    std::map<std::string, unsigned>::const_iterator fl = key.empty() ? g_loadFloor.end() : g_loadFloor.find(key);
+    std::map<std::pair<void*, int>, unsigned>::const_iterator la = g_blockLeftAt.find(std::make_pair(f, slot));
+    int how = numblock::kKept;
+    const unsigned target = numblock::CounterForBlock(c, slot, fl != g_loadFloor.end() ? 1 : 0, fl != g_loadFloor.end() ? fl->second : 0u, la != g_blockLeftAt.end() ? la->second : 0u, &how);
+    if (how == numblock::kHeld) return numblock::kHeld;
+    if (target == c) return numblock::kKept;
+    unsigned before = 0; if (SetCounterPod(f, target, &before) != 1) return -2;
+    unsigned& left = g_blockLeftAt[std::make_pair(f, (int)(c >> 16))]; if (c > left) left = c;   /* the block it leaves: a move back into it starts past every number handed out there */
+    return how;
+}
 void NumberBlockTick()
 {
     if (!g_on || !g_loadFloorDone || !Plaus(coop::GameWorldPtr()) || !Plaus(coop::GameWorldPtr()->factionDirectory) || !GameplayRunning()) return;   /* review-p4j H3: only once the world is running (a load overwrites the counter), and after the load floor is read */
@@ -15810,18 +17094,10 @@ void NumberBlockTick()
     for (unsigned fi = 0; fi < fm.count; ++fi)
     {
         void* f = fm.factions[fi]; if (!Plaus(f)) continue;
-        unsigned c = 0; if (ReadCounterPod(f, &c) != 1) { ++faults; continue; }
-        if (c < minBefore) minBefore = c; if (c > maxBefore) maxBefore = c;
-        const std::string key = FactionFloorKey(f);
-        std::map<std::string, unsigned>::const_iterator fl = key.empty() ? g_loadFloor.end() : g_loadFloor.find(key);
-        std::map<std::pair<void*, int>, unsigned>::const_iterator la = g_blockLeftAt.find(std::make_pair(f, slot));
-        int how = numblock::kKept;
-        const unsigned target = numblock::CounterForBlock(c, slot, fl != g_loadFloor.end() ? 1 : 0, fl != g_loadFloor.end() ? fl->second : 0u, la != g_blockLeftAt.end() ? la->second : 0u, &how);
-        if (how == numblock::kHeld) { ++held; continue; }
-        if (target == c) continue;
-        unsigned before = 0; if (SetCounterPod(f, target, &before) != 1) { ++faults; continue; }
-        unsigned& left = g_blockLeftAt[std::make_pair(f, (int)(c >> 16))]; if (c > left) left = c;   /* the block it leaves: a move back into it starts past every number handed out there */
-        if (how == numblock::kRaised) ++raised; else ++moved;
+        unsigned c = 0; const int r = BlockOneFaction(f, slot, &c);
+        if (r != -1) { if (c < minBefore) minBefore = c; if (c > maxBefore) maxBefore = c; }
+        if (r < 0) { ++faults; continue; }
+        if (r == numblock::kHeld) ++held; else if (r == numblock::kRaised) ++raised; else if (r == numblock::kMovedDown) ++moved;
     }
     g_blockDone = true; g_blockSlot = slot; g_blocksApplied = raised + moved; g_blockFactions = fm.count; g_blockFault = faults; g_blockMovedDown += moved; g_blockHeld += held;
     DebugLog("[STORE] number block " + N((long long)slot) + " (" + std::string(fromRelay ? "relay slot" : "remembered slot - relay not linked or no slot named yet") + ", from " + N((long long)slot * 65536) + std::string(net::SessionIsHost() ? "; session host" : "; session client")
@@ -16083,6 +17359,12 @@ int StoreLinkSockState()
                  : (g_storeWelcomed ? coopstore::kSockUpWelcomed : coopstore::kSockUpNotWelcomed);
     }
     return sock;
+}
+
+/* MAIN THREAD, like StoreLinkSockState: 1 while the world-server link can still deliver a WELCOME. The load waits read it. */
+int StoreLinkCouldArm()
+{
+    return coopstore::StoreSockCouldArm(StoreLinkSockState());
 }
 
 /* TEST-ONLY `worldaway` (store.h StoreWorldAwayLever): the re-dial held until g_awayUntilMs while g_awayOn */
@@ -22515,9 +23797,10 @@ struct HbEntry
     DWORD        owedAt;        /* fold 2 (recheck-s2hb): when it was first deferred - the oldest owed goes first */
     int          slow;          /* review-s2hb fold: its last serialise took > 4 ms - its floor is 5x the period */
     int          dirtyItem;     /* the dirty mark includes an item move: a wake alone does not skip the giant wait (HbDue) */
+    int          dirtyWriter;   /* the dirty mark includes this game becoming the group's writer (HbRegister): not a wake alone either */
     long long    loadedAt;      /* the world record this wake applied (its writtenAt); 0 = none. Read and cleared at the next visit */
     DWORD        loadedMs;      /* when that wake applied it: the skip holds only for a visit soon after (coophb::WakeLoadedSkip) */
-    HbEntry() : lastVisitMs(0), lastCrc(0), lastBytes(0), dirty(0), foreign(0), owed(0), slow(0), owedAt(0), dirtyItem(0), loadedAt(0), loadedMs(0) {}
+    HbEntry() : lastVisitMs(0), lastCrc(0), lastBytes(0), dirty(0), foreign(0), owed(0), slow(0), owedAt(0), dirtyItem(0), dirtyWriter(0), loadedAt(0), loadedMs(0) {}
 };
 std::map<void*, HbEntry> g_hb;      /* Platoon* -> state. MAIN THREAD only */
 std::vector<void*> g_hbRing;        /* the cursor's copy of the non-foreign keys */
@@ -22532,7 +23815,7 @@ long long g_hbRegistered = 0, g_hbForeign = 0, g_hbRefusedFaction = 0, g_hbPrune
           g_hbCompared = 0, g_hbCompareMismatch = 0, g_hbEngineBytes = 0, g_hbOursOff = 0;
 /* hbDirty[item,wake]: the only two edges wired (damage, death and member join/leave are not - a single death rides the
    30 s floor and a wipe-out is DeathWatchTick's delete). */
-long long g_hbDirtyItem = 0, g_hbDirtyWake = 0;
+long long g_hbDirtyItem = 0, g_hbDirtyWake = 0, g_hbDirtyWriter = 0;   /* g_hbDirtyWriter: groups marked changed because this game became their writer (HbRegister) */
 int g_hbFaultOff = 0;                 /* review-s2hb fold (HIGH hang): an engine FAULT - off for the process; the verb does not clear it */
 long long g_hbFaults = 0, g_hbSlowGroups = 0, g_hbTickBudgetStops = 0, g_hbMixedRefused = 0, g_hbStampBumped = 0, g_createDeferredLoadedHere = 0;
 long long g_hbOtherGameRefused = 0, g_hbOtherGameLogged = 0;   /* BlockSquadWrite at the heartbeat: visits refused - REPORT hbOtherGame */
@@ -22630,6 +23913,12 @@ void HbRegister(void* platoon)
             {
                 ex->second.foreign = now; ++g_hbGen;
                 if (now == 0) ++g_npcHbForeignLifted; else ++g_npcHbForeignDropped;
+                if (coophb::WriterLiftMarks(was, now) != 0)
+                {   /* this game writes the group from now on (a take-over from a gone player, a hand-over during play): written within the
+                       dirty gap, not at its next floor turn, so a game that restarts finds this game's record; the bytes this game last sent
+                       are forgotten, another game's record has stood on the world server since. The publish still judges who runs it. */
+                    ex->second.dirty = 1; ex->second.dirtyWriter = 1; ex->second.lastCrc = 0; ++g_hbDirtyWriter;
+                }
                 HbWriterLine(platoon, 0, now, runner, living, runHere, topSlot, topN, stampAt, stampOwner);
             }
             else if (stampAt != 0)
@@ -22901,16 +24190,17 @@ int HbOwnedAwake(void* platoon, const std::string& worldId, Pod* q, int* mineOut
 }
 
 /* ---- one group: publish. 1 published, 0 refused/unchanged (counted), -1 an engine fault (a strike). ---- */
+long long g_hbBound = 0, g_hbBoundLines = 0, g_hbBindIdHeld = 0;   /* squads the heartbeat bound to the record it wrote; visits that did not bind because another squad here is bound to the id */
 int HbPublishOne(void* platoon, DWORD now, bool wasDirty)
 {
     std::map<void*, HbEntry>::iterator it = g_hb.find(platoon);
     if (it == g_hb.end()) return 0;
     HbEntry& e = it->second;
     ++g_hbVisited;
-    const bool wakeOnly = e.dirty != 0 && e.dirtyItem == 0;   /* marked by a wake and by no item move since the last visit */
+    const bool wakeOnly = e.dirty != 0 && e.dirtyItem == 0 && e.dirtyWriter == 0;   /* marked by a wake alone: no item move and no change of writer since the last visit */
     const long long loadedAt = e.loadedAt;
     const DWORD loadedMs = e.loadedMs;
-    e.lastVisitMs = now; e.dirty = 0; e.dirtyItem = 0; e.owed = 0; e.loadedAt = 0; e.loadedMs = 0;   /* every visit stamps: a refused group waits a turn instead of spinning */
+    e.lastVisitMs = now; e.dirty = 0; e.dirtyItem = 0; e.dirtyWriter = 0; e.owed = 0; e.loadedAt = 0; e.loadedMs = 0;   /* every visit stamps: a refused group waits a turn instead of spinning */
     const std::string worldId = WorldIdOf(platoon);
     if (worldId.empty()) { ++g_hbNoId; return 0; }
     if (DeletedBitTest(worldId) || g_deadPending.count(worldId)) { ++g_hbDeletedNumber; return 0; }   /* a wipe-out is DeathWatchTick's delete, never a heartbeat */
@@ -22959,11 +24249,18 @@ int HbPublishOne(void* platoon, DWORD now, bool wasDirty)
         e.lastBytes = (unsigned int)bytes.size(); ++g_hbSkippedUnchanged;   /* one serialise, no disk, no wire */
         return 0;
     }
+    { std::map<std::string, Record>::const_iterator ob = g_records.find(worldId); r.birth = sqbirth::BirthMerge(ob != g_records.end() ? ob->second.birth : sqbirth::kBirthUnknown, BirthPublishOf(platoon)); }   /* the squad's birth flag rides its record: only one noted at its creation, copy or record (a byte read off the squad goes as unknown) */
     if (!HbCommitRecord(r, bytes)) { ++g_hbCommitFailed; return 0; }
     g_records[worldId] = r; g_byWorldId[worldId] = platoon; g_localWrittenAt[platoon] = r.writtenAt; g_npcStampErased.erase(platoon); g_npcPurged.erase(platoon);
+    if (g_bind.find(platoon) == g_bind.end() && BoundIdHeldByOther(platoon, worldId) != 0) ++g_hbBindIdHeld;   /* a same-id pair: not bound, so this squad's discard can never delete the record the other names */
+    else if (g_bind.find(platoon) == g_bind.end())
+    {   /* the record names this squad now: bound (stamped), so the game's discard of it deletes the record and a keep question is asked of it */
+        g_bind[platoon] = worldId; StampBind(platoon); ++g_hbBound;
+        if (g_hbBoundLines < 10) { ++g_hbBoundLines; DebugLog("[STORE] heartbeat bound squad '" + worldId + "' to its record (birth " + N((long long)r.birth) + "; the first 10 logged; birth[hbBound] on the REPORT)"); }
+    }
     BigRecordNote(worldId, bytes.size(), q.activeChars);   /* named with its member count here; SendRecordAny's own note is then a repeat and says nothing */
     /* not g_sent: that is the sleep path's "records put on the wire"; heartbeat sends are hb published / sendFailed */
-    if (!SendRecordAny(r.worldId, r.squadSid, r.factionName, r.x, r.y, r.z, r.writtenAt, r.owner, bytes))
+    if (!SendRecordAny(r.worldId, r.squadSid, r.factionName, r.x, r.y, r.z, r.writtenAt, r.owner, bytes, sqbirth::FlagsOfBirth(r.birth)))
     {
         /* review-s2hb fold: NOT published - lastCrc cleared so the group re-publishes after the outage */
         ++g_hbSendFailed; e.lastCrc = 0; e.lastBytes = (unsigned int)bytes.size();
@@ -23029,7 +24326,7 @@ bool HbDue(const HbEntry& e, bool dirty, DWORD now)
 {
     const unsigned int since = (unsigned int)(now - e.lastVisitMs);
     if (!dirty && e.slow) return coopown::TurnDue(true, since, coophb::kPeriodMs, coopown::kSlowMul, coophb::kDirtyGapMs);
-    const bool wakeOnly = dirty && e.dirty != 0 && e.dirtyItem == 0 && e.owed == 0;
+    const bool wakeOnly = dirty && e.dirty != 0 && e.dirtyItem == 0 && e.dirtyWriter == 0 && e.owed == 0;
     return coophb::DueOnTurn(dirty && !wakeOnly, since, e.lastBytes, coophb::kPeriodMs, coophb::kDirtyGapMs, coophb::kGiantBytes, coophb::kGiantMultiplier);
 }
 /* may the group send now? (coophb::BudgetAllowsGroup) - a small record an item move marked is held to this second's own sends,
@@ -23047,7 +24344,7 @@ std::string HbLineText(unsigned int bps, unsigned int windowMs)
     return "[SAVE] hb[registrySize,published,skippedUnchanged,deferredBudget,bytesPerSec,worstRecordBytes]="
          + N(HbOwnedCount()) + "," + N(g_hbPublished) + "," + N(g_hbSkippedUnchanged) + "," + N(g_hbBudgetDeferred) + ","
          + N((long long)bps) + "," + N(g_hbWorstRecordBytes)
-         + " hbDirty[item,wake,published]=" + N(g_hbDirtyItem) + "," + N(g_hbDirtyWake) + "," + N(g_hbDirtyPublished)
+         + " hbDirty[item,wake,published]=" + N(g_hbDirtyItem) + "," + N(g_hbDirtyWake) + "," + N(g_hbDirtyPublished) + " hbDirtyWriter=" + N(g_hbDirtyWriter)
          + " hbRefused[faction,notOwned,notAwake,noId,deleted,heldByOther,quitting,modStr]=" + N(g_hbRefusedFaction) + "," + N(g_hbNotOwned)
          + "," + N(g_hbNotAwake) + "," + N(g_hbNoId) + "," + N(g_hbDeletedNumber) + "," + N(g_hbHeldByOther) + "," + N(g_hbQuitRefused) + "," + N(g_hbModStrBad)
          + " hbFailed[scratch,record,save,commit,send,dirtyLookupMiss]=" + N(g_hbScratchFailed) + "," + N(g_hbRecordFailed) + "," + N(g_hbSaveFailed)
@@ -23060,12 +24357,22 @@ std::string HbLineText(unsigned int bps, unsigned int windowMs)
          + "," + N(g_hbSlowGroups) + "," + N(g_hbTickBudgetStops) + "," + N(g_hbMixedRefused) + "," + N(g_hbStampBumped) + "," + N(g_sleepStampBumped) + "," + OwnHex(g_hbShapeSeen)
          + " handSave[hiddenOpens,savesRefused,loadsRefused,newGamesRefused,loadHook]=" + N(UiHandSaveHiddenOpens()) + "," + N(g_handSaveRefused)
          + "," + N(g_handLoadRefused) + "," + N(g_handNewGameRefused) + "," + N((long long)g_loadNameHookOn)   /* T-239 */
+         + " editorReset[refused,run,resetHook,showHook,greyed,lit,notFound,notes,uiFaults]=" + N(g_editorResetRefused) + "," + N(g_editorResetRun)
+         + "," + N((long long)g_editorResetHookOn) + "," + N((long long)g_editorShowHookOn) + "," + N(UiEditorResetCount(0)) + "," + N(UiEditorResetCount(1))
+         + "," + N(UiEditorResetCount(2)) + "," + N(UiEditorResetCount(3)) + "," + N(UiEditorResetCount(4))
+         + " squadSplit[skipped,run,moveRefused,movePassed,moveOwnPass,refusedOffMain,unsure,hooks]=" + N((long long)g_sqSplitSkipped) + "," + N((long long)g_sqSplitRun)   /* T-948 b */
+         + "," + N((long long)g_sqMoveRefused) + "," + N((long long)g_sqMovePassed) + "," + N((long long)g_sqMoveOwnPass) + "," + N((long long)g_sqMoveOffMain)
+         + "," + N((long long)g_sqUnsure) + "," + N((long long)g_sqSplitHookOn) + N((long long)g_sqMoveHookOn)
          + " recordFiledNotApplied=" + N(g_ignoredAwake)
          + " " + TickWaitToken()   /* tickwait: coop.cpp's AI-worker wait */
          + " hbContext[refusedContext,refusedHandedOver]=" + N(g_hbCtxRefused) + "," + N(g_hbHandedOverRefused) + " hbOtherGame=" + N(g_hbOtherGameRefused)   /* M7a2 [m7a2-cx6]: per heartbeat visit, as hbNotOwned */
          + " hbDebt[owedNow,owedMax,deferredByDebt,wakeGiant,wakeLoadedSkipped,bigRecords]=" + N((long long)g_hbOwedAtStart) + "," + N((long long)g_hbOwedMax)
          + "," + N(g_hbDebtDeferred) + "," + N(g_hbWakeGiant) + "," + N(g_hbWakeLoadedSkipped) + "," + N(g_bigRecords);
 }
+/* T-879: the release build writes the 60 s line at most once per 10 minutes (SW_INTERVALN, kReleaseReportGapMs; its bytesPerSec
+   and windowMs stay the last minute's); the newest one held back is written at the game's exit and before a bug report. The
+   report's line is unchanged. */
+static ChangedLogSlot s_hbLineChanged;
 void HbLog(DWORD nowMs)
 {
     if (g_hbLogAtMs != 0 && (DWORD)(nowMs - g_hbLogAtMs) < 60000) return;
@@ -23073,7 +24380,8 @@ void HbLog(DWORD nowMs)
     const long long wb = g_hbBytesTotal - g_hbLogBytesAt;
     g_hbLastBps = coophb::BytesPerSec((unsigned int)(wb < 0 ? 0 : wb), windowMs);
     g_hbLogAtMs = nowMs; g_hbLogBytesAt = g_hbBytesTotal;
-    DebugLog(HbLineText(g_hbLastBps, windowMs));
+    const std::string line = HbLineText(g_hbLastBps, windowMs);
+    if (SW_INTERVALN(s_hbLineChanged, kReleaseReportGapMs, line)) DebugLog(line);
 }
 void HbReportLine()
 {
@@ -23658,11 +24966,12 @@ bool SetStoreServer(const std::string& address, unsigned short port)
     return true;
 }
 
-void StoreBindPlatoon(void* platoon, const std::string& worldId)
+void StoreBindPlatoon(void* platoon, const std::string& worldId, int birth)
 {
     if (!Plaus(platoon) || worldId.empty()) return;
     g_bind[platoon] = worldId; StampBind(platoon); g_byWorldId[worldId] = platoon;   /* E23: bind site 4 of 6 - StoreBindPlatoon, which spawn.cpp calls with the PEER's platoon id from CONTEXT, so the store's id and the engine's own sid differ here by construction */
-    SetPersistentPod(platoon, true);   // so this engine puts the copy to sleep (and writes its record) instead of destroying it
+    SetPersistentPod(platoon, sqbirth::MadeKeptByte(birth) != 0);   // the copy's kept byte is its squad's birth flag (unknown: kept, so this engine sleeps it)
+    BirthNote(platoon, birth);
     HbRegister(platoon);   /* E47-S2 entry edge: E23 bind site 4 (a copy of another game's group is kept as foreign by its number) */
 }
 
@@ -23849,7 +25158,7 @@ static bool CreateUnknownSquad(const Record& r)
     Pod cq; const int cqRead = (ReadPod(p, &cq) && Plaus(cq.unloaded)) ? 1 : 0;   /* T-632: where the engine put it to sleep (UnloadedPlatoon+0x64/+0x6C) */
     if (cqRead && coopstate::CreatePosAgrees(cq.ux, cq.uz, r.x, r.z)) ++g_stCreatePosAgree;
     else { ++g_stCreatePosOdd; ErrorLog("[STORE] CREATE worldId=" + r.worldId + ": sleeps at " + (cqRead ? F1(cq.ux) + "," + F1(cq.uy) + "," + F1(cq.uz) : std::string("(unreadable)")) + ", not at its record's position " + F1(r.x) + "," + F1(r.y) + "," + F1(r.z) + " (T-632 createPos odd)"); }
-    g_bind[p] = r.worldId; StampBind(p); g_byWorldId[r.worldId] = p; g_localWrittenAt[p] = r.writtenAt; SetPersistentPod(p, true);   /* E23: bind site 5 of 6 - the world id on the platoon made from its record */
+    g_bind[p] = r.worldId; StampBind(p); g_byWorldId[r.worldId] = p; g_localWrittenAt[p] = r.writtenAt; SetPersistentPod(p, sqbirth::MadeKeptByte(r.birth) != 0); BirthNote(p, r.birth);   /* the record's birth flag (unknown: kept). E23: bind site 5 of 6 - the world id on the platoon made from its record */
     {   /* T-799 D1: a group made from its record - its money is known only when the record carried it and the engine's read put it in */
         int now = 0;
         const int applied = (recCarried != 0 && PotMoneyPod(p, &now) == 1 && now == recMoney) ? 1 : 0;
@@ -23915,6 +25224,25 @@ void RaiseOwnRecordCounters()
                  + (capped > 0 ? ", " + N(capped) + " floors capped at the block's last number (a record or mark on it - the block is used up for that faction)" : std::string()));
     g_noteRaiseDone = true; g_noteRaiseSeen = g_records.size(); g_noteRaiseBitsSeen = bitsNow; g_noteRaiseSlot = mine; g_noteRaiseFactions += raised + markRaised; g_noteMarkRaised += markRaised; g_noteRaiseFault += faults; g_noteRaiseCapped += capped; g_noteRaiseCappedLast = capped;
 }
+/* A FACTION MADE AFTER THIS WORLD'S BLOCK WAS APPLIED - a player's stand-in (playerfaction.cpp CreatePeer). The engine starts a new
+   faction's squad counter at 0, in slot 0's block, so the squads made under the stand-in would carry numbers of a block that is not
+   this game's. Its counter is set into this game's block by NumberBlockTick's rule (BlockOneFaction), and the own-block scan is asked
+   to run again at its next turn, since a new faction changes none of its inputs. Before the block is applied nothing is done here:
+   NumberBlockTick sets every faction then. MAIN THREAD. */
+long long g_blockNewFactionSet = 0, g_blockNewFactionKept = 0, g_blockNewFactionHeld = 0, g_blockNewFactionFault = 0;
+void BlockApplyNewFaction(void* f)
+{
+    const int slot = numblock::BlockForNewFaction(g_blockDone ? 1 : 0, g_blockSlot);
+    if (!g_on || slot < 0 || !Plaus(f)) return;
+    unsigned c = 0; const int r = BlockOneFaction(f, slot, &c);
+    if (r < 0) ++g_blockNewFactionFault; else if (r == numblock::kHeld) ++g_blockNewFactionHeld; else if (r == numblock::kKept) ++g_blockNewFactionKept; else ++g_blockNewFactionSet;
+    g_noteRaiseSlot = -1;   /* the own-block scan runs again: past this block's numbers its name has in the records and deleted marks */
+    if (g_blockNewFactionSet + g_blockNewFactionKept + g_blockNewFactionHeld + g_blockNewFactionFault <= 20)
+        DebugLog("[STORE] number block " + N((long long)slot) + " for a stand-in made after the block was applied: counter " + N((long long)c) + " "
+                 + (r == -1 ? std::string("not read") : r == -2 ? std::string("not written") : r == numblock::kHeld ? std::string("held where it is")
+                    : r == numblock::kKept ? std::string("kept (already in this block)") : std::string("set into this game's block"))
+                 + " (set=" + N(g_blockNewFactionSet) + " kept=" + N(g_blockNewFactionKept) + " held=" + N(g_blockNewFactionHeld) + " faults=" + N(g_blockNewFactionFault) + "; the first 20 logged)");
+}
 /* DECISION 34 / 547 - THIS GAME PLACES THE NOTES OF THE AREAS IT RUNS. A town's note not bound here, whose area is this game's to
    run (no other game holds it, read exactly) and whose record is usable here (townpending::Placeable answers kPlaceByThisGame),
    whatever block numbered it, is the world's version of a group no world here holds (a session that ended before it saved, a load
@@ -23925,6 +25253,40 @@ void RaiseOwnRecordCounters()
    of this game's own block (townpending::RaiseAfterAttempt), so this game never mints that number again for another group. A
    failed creation is not tried again in this world, and the note then holds nothing back. At most kPlacePerTick per second, once
    this world's own-block counters are raised (RaiseOwnRecordCounters). MAIN THREAD, 1 Hz. */
+/* AN OLD WORLD'S LEFTOVER ROAMING SQUAD, at its placing: a record with no birth flag is retired (a discard delete) instead of made again
+   when it has no home key, its faction is not a player's or a stand-in's, its squad template is listed in its town's "roaming squads"
+   (the town's game data - the list the engine's town setup reads, decomp_8f8a00) and its saved file names no player's or stand-in's
+   faction (squadbirth.h RetireJudge). 1 = retired. MAIN THREAD. */
+long long g_retiredAtLoad = 0, g_retireLines = 0;   /* TownListsTemplate: beside SquadTemplateRoaming (fold 2c) */
+/* 1 = the saved squad's bytes name a stand-in's record id or this game's player faction's id, 0 = neither, -1 not readable */
+int FileNamesPlayers(const std::string& file)
+{
+    std::vector<char> b;
+    if (!ReadFileBytes(file, &b) || b.empty()) return -1;
+    if (sqbirth::BytesHold(&b[0], b.size(), std::string(coopslot::kStandInPrefix)) != 0) return 1;
+    char pb[160];
+    if (PlayerFactionSidPod(pb, (int)sizeof(pb)) != 1 || pb[0] == 0) return -1;
+    return sqbirth::BytesHold(&b[0], b.size(), std::string(pb)) != 0 ? 1 : 0;
+}
+int RetireOldRoaming(const Record& r)
+{
+    if (r.birth != sqbirth::kBirthUnknown) return 0;
+    const int homeEmpty = (coopstore::MetaHomeKey(RecordHomeOf(r.worldId)).empty() && coopstore::MetaHomeKey(r.home).empty()) ? 1 : 0;
+    if (homeEmpty == 0) return 0;
+    ::Faction* f = FindFactionByKey(r.factionName);
+    const int players = (!Plaus(f) || r.factionName[0] == '@') ? 1 : FactionIsPlayers(f);
+    if (players != 0) return 0;
+    int roaming = -1;
+    GameData* tg = (!r.town.empty() && Plaus(coop::GameWorldPtr())) ? coop::GameWorldPtr()->gamedata.getData(r.town) : 0;
+    if (Plaus(tg)) roaming = TownListsTemplate(tg, "roaming squads", r.squadSid);
+    if (roaming != 1) return 0;
+    const int holds = FileNamesPlayers(r.file);
+    if (sqbirth::RetireJudge(r.birth, homeEmpty, players, roaming, holds) == 0) return 0;
+    ++g_retiredAtLoad;
+    if (g_retireLines < 20) { ++g_retireLines; DebugLog("[STORE] note " + r.worldId + " (town '" + r.town + "', squad '" + r.squadSid + "') RETIRED at its placing: an old world's roaming squad with no birth flag and no home - deleted, not made again (the first 20 logged; birth[retired] on the REPORT)"); }
+    DiscardDeleteSend(r.worldId, (long long)time(0), "an old world's leftover roaming squad, retired at its placing");
+    return 1;
+}
 void PlaceUnplacedNotes()
 {
     const int kPlacePerTick = 8;
@@ -23935,6 +25297,7 @@ void PlaceUnplacedNotes()
     for (std::map<std::string, std::string>::const_iterator it = g_pendingTown.begin(); it != g_pendingTown.end() && (int)due.size() < kPlacePerTick; ++it)
     {
         if (it->second.empty() || it->second == "-" || DeletedBitTest(it->first) || g_byWorldId.count(it->first) != 0) continue;
+        if (MirrorKeepGated(it->first)) { if (g_mkGatedPlaceKeys.insert(it->first).second) ++g_mkGatedPlace; continue; }   /* T-985 C1: a kept key the world server has not named is not placed (counted once per key) */
         const Record* rp = NoteRecordUsable(it->first); if (rp == 0) continue;
         if (NotePlaceable(it->first, rp->factionName, it->second, 1, rp->x, rp->z, &budget, 0) != townpending::kPlaceByThisGame) continue;
         due.push_back(it->first);
@@ -23954,6 +25317,7 @@ void PlaceUnplacedNotes()
             }
             continue;
         }
+        if (RetireOldRoaming(r) != 0) { ++tried; continue; }   /* an old world's leftover roaming squad: deleted, not made again */
         ++tried;
         const bool ok = CreateUnknownSquad(r);
         const int blk = GroupBlockOwner(r.worldId);   /* the number's own block, not the squad's origin: the counter raise below keeps this game's numbering clear of the id */
@@ -23993,11 +25357,16 @@ void StoreUnbindPlatoon(void* platoon)
     if (it != g_bind.end()) { std::map<std::string, void*>::iterator b = g_byWorldId.find(it->second); if (b != g_byWorldId.end() && b->second == platoon) g_byWorldId.erase(b); g_bind.erase(it); }
     g_localWrittenAt.erase(platoon); g_pendingPlace.erase(platoon); g_npcStampErased.erase(platoon); g_npcPurged.erase(platoon); WakeWaitForget(platoon);
     g_bindGenOf.erase(platoon);   /* E23: the stamp goes with the binding here too */
+    g_liveHomeOf.erase(platoon); g_roamOf.erase(platoon);   /* T-999 fold 2: the live home read and the template test go with the binding */
+    g_unloadEmptied.erase(platoon);   /* T-999 fold 3: and the unload-emptied mark */
     HbForget(platoon);   /* E47-S2 exit edge: unbound (spawn.cpp retiring a copy) */
 }
 
 void ApplyRemoteGoneImpl(const std::string& worldId, long long stamp, const char* from)
 {
+    if (coopgrec::IsGroundRecId(worldId)) { coop::GroundRecordGone(worldId, from); return; }   /* T-697 step 2: a ground record's removal leaves the ground table (items.cpp), never the squad path */
+    if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordGone(worldId, from); return; }   /* a piece record's removal leaves the piece table (build.cpp), never the squad path */
+    if (coopbrec::IsBoxRecId(worldId)) { coop::BoxRecordGone(worldId, from); return; }   /* T-823: a box record's removal leaves the box table (items.cpp), never the squad path */
     ++g_goneRecv;
     if (EngineWritesBlocked()) StoreNoteRecordArrivedNoWorld("RECORD_GONE");   /* P7f (review-p6z C-1), P7p (review-p7f H-1/M-1): the ARRIVAL detector, on the shared predicate. Not a refusal - the guards below are what make it safe */
     if (!g_dirReady) return;
@@ -24019,9 +25388,43 @@ int StoreQueueWrite(int family, const std::string& recordKey, const std::vector<
 {
     return StoreQueueWriteImpl(family, recordKey, payload);
 }
+/* T-697 step 2: the area holder's ground record (items.cpp GrcWrite) to the world server as a RECORD (28), at the area centre (the
+   server's gate wants a real position). MAIN THREAD. false = not sent (no link); nothing is queued - the area stays marked. */
+bool StoreSendGroundRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!LinkUp() || bytes.empty()) return false;
+    const long long stamp = (long long)time(0);   /* fold 3 (LOW-3): the world server's RECORD_SEQ echo carries it back */
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
+}
+/* T-823: the box writer's record (items.cpp BoxRecTick) to the world server as a RECORD (28), at the box's position (the server's
+   gate wants a real position). MAIN THREAD. false = not sent (no link); nothing is queued - the box stays marked. */
+bool StoreSendBoxRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes)
+{
+    if (!LinkUp() || bytes.empty()) return false;
+    return SendRecordAny(id, "", "", x, y, z, (long long)time(0), (int)StoreOwnerField(), bytes);
+}
+/* a piece's record (build.cpp PieceRecDrain) to the world server as a RECORD (28), at the piece's position (the server's gate wants a
+   real position). MAIN THREAD. false = not sent (no link); nothing is queued - the piece stays marked. */
+bool StoreSendPieceRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut)
+{
+    if (!LinkUp() || bytes.empty()) return false;
+    const long long stamp = (long long)time(0);   /* the world server's RECORD_SEQ answer carries it back: it names the write answered */
+    if (stampOut != 0) *stampOut = stamp;
+    return SendRecordAny(id, "", "", x, y, z, stamp, (int)StoreOwnerField(), bytes);
+}
 void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, const std::string& factionName,
                        float x, float y, float z, long long writtenAt, int owner, const std::vector<char>& bytes, unsigned recFlags)
 {
+    /* T-697 step 2: A GROUND RECORD IS NOT A SQUAD. It is judged by its generation (not the stamp rule below), kept in the ground
+       table (items.cpp GroundRecordArrive) and applied by the area's holder at its next safe point - no file, no squad lookup. */
+    if (coopgrec::IsGroundRecId(worldId)) { coop::GroundRecordArrive(worldId, bytes); return; }
+    /* T-823: A BOX RECORD IS NOT A SQUAD. It is judged by its generation and kept in the box table (items.cpp BoxRecordArrive) - no
+       file, no squad lookup, nothing applied to a box here. */
+    if (coopbrec::IsBoxRecId(worldId)) { coop::BoxRecordArrive(worldId, bytes); return; }
+    /* A PIECE RECORD IS NOT A SQUAD. It is kept in the piece table (build.cpp PieceRecordArrive) - no file, no squad lookup, nothing
+       applied to a piece here. */
+    if (piecerec::IsPieceRecId(worldId)) { coop::PieceRecordArrive(worldId, bytes); return; }
     ++g_recv;
     /* B10-b (review-b10 M-2): the opening push's bookkeeping is NOT here. This function is reached from the
        session peer's link as well as the notebook's, and only the notebook's records may count toward the
@@ -24037,7 +25440,7 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
         // stays what it was - and move our sleeping copy without touching its anchor, so the engine relocates on wake.
         ++g_posUpdatesRecv;
         std::map<std::string, Record>::iterator old = g_records.find(worldId);
-        if (old != g_records.end()) { if (old->second.posAt >= writtenAt) { ++g_notNewer; return; } old->second.x = x; old->second.y = y; old->second.z = z; old->second.posAt = writtenAt; if (factionkey::PositionTakesKey(old->second.factionName, false, factionName, (recFlags & factionkey::kRecFacCode) != 0)) { old->second.factionName = factionName; ++g_posKeyTaken; } }   /* factionkey.h: a name -> code re-key travels with a position update */   /* B10 (audit C8): the notebook keeps the index line; this game keeps the position in memory and the payload in its mirror */
+        if (old != g_records.end()) { if (old->second.posAt >= writtenAt) { if (old->second.birth < 0 && sqbirth::BirthOfFlags(recFlags) >= 0) { old->second.birth = sqbirth::BirthOfFlags(recFlags); ++g_birthFilled; } ++g_notNewer; return; } old->second.x = x; old->second.y = y; old->second.z = z; old->second.posAt = writtenAt; old->second.birth = sqbirth::BirthMerge(old->second.birth, sqbirth::BirthOfFlags(recFlags)); if (factionkey::PositionTakesKey(old->second.factionName, false, factionName, (recFlags & factionkey::kRecFacCode) != 0)) { old->second.factionName = factionName; ++g_posKeyTaken; } }   /* factionkey.h: a name -> code re-key travels with a position update */   /* B10 (audit C8): the notebook keeps the index line; this game keeps the position in memory and the payload in its mirror */
         else { Record r; { std::map<std::string, std::string>::const_iterator pt = g_pendingTown.find(worldId); if (pt != g_pendingTown.end()) r.town = pt->second; else { std::map<std::string, Record>::const_iterator o2 = g_records.find(worldId); if (o2 != g_records.end()) r.town = o2->second.town; } }   /* review-p4t HIGH-1: the town survives a full-record apply */ r.worldId = worldId; r.squadSid = squadSid; r.factionName = RekeyFactionKey(factionName); r.x = x; r.y = y; r.z = z; r.writtenAt = 0; r.posAt = writtenAt; r.owner = owner; r.file = std::string(); g_records[worldId] = r; ZoneSwapPublish(worldId); }
         if (EngineWritesBlocked()) StoreNoteRecordEngineTouchNoWorld("RECORD position update");   /* P7p (review-p7f M-1): the position-update branch's own first engine touch - the notNewer refusal above returns before it */
         Faction* fac2 = (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && !factionName.empty()) ? FindFactionByKey(factionName) : 0;   /* P7f (review-p6z C-1), site 3 of 5 */
@@ -24049,6 +25452,7 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
     { std::map<std::string, std::string>::const_iterator pt = g_pendingTown.find(worldId); if (pt != g_pendingTown.end()) r.town = pt->second; else { std::map<std::string, Record>::const_iterator o2 = g_records.find(worldId); if (o2 != g_records.end()) r.town = o2->second.town; } }   /* review-p4t HIGH-1: the town survives a full-record apply */
     r.file = MirrorFile(worldId);   /* B10 (audit C8): a record that ARRIVED is written to this process's own mirror so a wake can load it - never into the notebook's folder */
     std::map<std::string, Record>::const_iterator old = g_records.find(worldId);
+    if (old != g_records.end() && old->second.birth < 0 && sqbirth::BirthOfFlags(recFlags) >= 0 && !IsZoneId(worldId)) { g_records[worldId].birth = sqbirth::BirthOfFlags(recFlags); ++g_birthFilled; }   /* before the not-newer test: the world server's push of a record this game's index already holds (same stamp) carries the birth flag the index did not */
     if (old != g_records.end() && old->second.writtenAt >= writtenAt && (!IsZoneId(worldId) || ZoneRecvTakesNotNewer(r, old->second, "RECV") == 0)) { if (IsZoneId(worldId)) ++g_zoneRecvNotNewer; else ++g_notNewer; return; }   /* T-609 fold 1 (F2): a zone holder's copy over another writer's is taken */
     if (IsZoneId(worldId))
     {
@@ -24062,6 +25466,7 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
         return;
     }
     if (!WriteFileBytes(r.file, bytes)) { ErrorLog("[STORE] RECV could not write " + r.file); return; }
+    r.birth = sqbirth::BirthMerge(old != g_records.end() ? old->second.birth : sqbirth::kBirthUnknown, sqbirth::BirthOfFlags(recFlags));   /* the squad's birth flag the record carries; one not carried keeps the one held */
     g_records[worldId] = r;
     // apply to a local squad of that id: asleep -> move its sleeping position (the engine wakes it in a loaded zone,
     // and the wake hook loads the record); awake -> the live stream is the truth; unknown -> P1b (addUnloadedSquad)
@@ -24083,7 +25488,7 @@ void ApplyRemoteRecord(const std::string& worldId, const std::string& squadSid, 
             ++g_t300RecvRefused; T300Queue(worldId, kT300WhyRecv, 0);
             what = "asleep here, position loaded here, but another game's file (slot " + N((long long)owner) + ") in an area another game holds while the game link is up: NOT moved or woken - thrown away on the next tick (T-300)";
         }
-        else if (IsPositionLoadedHere(x, y, z) && coopsquad::OwnBlockRecvHold(g_mySlot, owner, SquadOriginSlot(worldId, (void*)fac, -1, 1, x, z, owner), PlayersPresent() ? 1 : 0, HeldByOtherTS(SectorOf(x, z)), T300WorldFaction(sleeping)) == 1)
+        else if (IsPositionLoadedHere(x, y, z) && coopsquad::OwnBlockRecvHold(g_mySlot, owner, SquadOriginSlot(worldId, (void*)fac, -1, 1, x, z, owner), HeldByOtherTS(SectorOf(x, z)), T300WorldFaction(sleeping)) == 1)
         {
             /* another game's record of a squad numbered in this game's block, in an area another game holds (squadwriter.h OwnBlockRecvHold):
                that game runs its people. Not moved into the area and woken (the orphan purge would empty the woken copy), not thrown away (it is
@@ -24210,13 +25615,13 @@ void ReportStore()
              + " loadGate44WaitP7q[sessionPumps,batches,elapsedMs,elapsedMsMax,overEnetTimeout]=" + N(g_loadGate44SessionPumps) + "," + N(g_loadGate44Batches) + "," + N(g_loadGate44ElapsedMsTotal) + "," + N(g_loadGate44ElapsedMsMax) + "," + N(g_loadGate44OverEnetTimeout)
              /* P7q (review-p7l H-1). keyedNoLink is a keyed load that began with NO notebook link - before P7q
                 that case did not wait at all and was indistinguishable from a timeout in the report. */
-             + " loadGate44Keyed[keyedNoLink,keyedLinkArrived,keyedNoSession,keyedSessionLost]=" + N(g_loadGateKeyedNoLink) + "," + N(g_loadGateKeyedLinkArrived) + "," + N(g_loadGateKeyedNoSession) + "," + N(g_loadGateKeyedSessionLost)
+             + " loadGate44Keyed[keyedNoLink,keyedLinkArrived,keyedNoSession,keyedSessionLost,keyedStoreCannotArm]=" + N(g_loadGateKeyedNoLink) + "," + N(g_loadGateKeyedLinkArrived) + "," + N(g_loadGateKeyedNoSession) + "," + N(g_loadGateKeyedSessionLost) + "," + N(g_loadGateKeyedStoreCannotArm)
              + " loadGate[runs,timedOut,notLinked,single,offThread,maxMs,totalMs,sessionLost]=" + N(g_loadGateRuns) + "," + N(g_loadGateTimedOut) + "," + N(g_loadGateNotLinked) + "," + N(g_loadGateSingle) + "," + N(g_loadGateOffThread) + "," + N(g_loadGateWaitedMsMax) + "," + N(g_loadGateWaitedMsTotal) + "," + N(g_loadGateSessionLost)
              + " loadGateP7f[noAddressYet,waitOverEnetTimeout]=" + N(g_loadGateNoAddressYet) + "," + N(g_loadGateWaitOverEnetTimeout)
              /* P7h (review-p6z H-4/H-2). waitedForStoreLink is the wait that did not exist before this build;
                 batchesPumped is how many bounded drains the gate did (it is >= runs, and > runs is the case H-2
                 said was invisible); drainMsMax is the single most expensive of them. */
-             + " loadGateP7h[waitedForStoreLink,addressArrivedInGate,storeLinkSessionLost,batchesPumped,sessionPumps,drainMsMax]=" + N(g_loadGateWaitedForStoreLink) + "," + N(g_loadGateAddressArrivedInGate) + "," + N(g_loadGateStoreLinkSessionLost) + "," + N(g_loadGateBatchesPumped) + "," + N(g_loadGateSessionPumps) + "," + N(g_loadGateDrainMsMax)
+             + " loadGateP7h[waitedForStoreLink,addressArrivedInGate,storeLinkSessionLost,batchesPumped,sessionPumps,drainMsMax,storeLinkLost]=" + N(g_loadGateWaitedForStoreLink) + "," + N(g_loadGateAddressArrivedInGate) + "," + N(g_loadGateStoreLinkSessionLost) + "," + N(g_loadGateBatchesPumped) + "," + N(g_loadGateSessionPumps) + "," + N(g_loadGateDrainMsMax) + "," + N(g_loadGateStoreLinkLost)
              + " pumpBatch[capped,carried,carryDropped,held,collapsed,carryMax]=" + N(g_pumpBatchesCapped) + "," + N(g_pumpCarried) + "," + N(g_pumpCarryDropped) + "," + N((long long)g_linkCarry.Size()) + "," + N(g_linkCarry.Collapsed()) + "," + N((long long)g_linkCarry.MaxSize())
              /* P7f (review-p6z C-1 and H-3), CORRECTED BY P7p (review-p7f M-1). TWO NUMBERS, AND ONLY ONE OF
                 THEM IS THE ACCEPTANCE TOKEN.
@@ -24259,13 +25664,14 @@ void ReportStore()
                 that answered this game's latest ask; ends = last-page markers applied (endsAgain = after the first on a link); pageEndsStale /
                 markersStale = answers to an ask made before an OFF or on another link; expected = the last BEGIN's record count; snapshotSent =
                 records paged since the last first ASK; snapshotApplied = this world's snapshot is applied; heldNotebook = bytes held from the notebook. */
-             + " preload[begun,done,stale,staleLink,staleTimeout,skippedNoLink,abandoned,indexPages,indexRows,wanted,areasFetched,groupsFetched,positions,notNewer,deleted,writeFailed,staleKeys,waitLastMs,waitMaxMs,malformed,answersStale,sendFailed,nonCurrentAreas,nonCurrentGroups,counting,phase,positionOnly,reasked,fetchCuts]=" + PreloadReportValues()   /* T-346 slice 1: nonCurrentAreas / nonCurrentGroups must read 0 */
+             + " preload[begun,done,stale,staleLink,staleTimeout,skippedNoLink,abandoned,indexPages,indexRows,wanted,areasFetched,groupsFetched,positions,notNewer,deleted,writeFailed,staleKeys,waitLastMs,waitMaxMs,malformed,answersStale,sendFailed,nonCurrentAreas,nonCurrentGroups,counting,phase,positionOnly,reasked,fetchCuts]=" + PreloadReportValues() + " keptTable[kept,why,read,rejected,noFile,changed,badLines,skipped,written,writeFailed,lastRows,unlisted,bytesReadLoad,bytesReadWrite,verifyMs,offThread,droppedUnnamed,unnamedChanged,droppedDeleted,nameClash,gatedPlace,gatedWake,awaiting,refusedBehind,dropSkipped,refusedUnjudged,gatedKeptHeldBeside]=" + MirrorKeepReportValues() + " beside[movedAsleep]=" + N(g_mkBesideMovedAsleep)   /* T-346 slice 1: nonCurrentAreas / nonCurrentGroups must read 0 */
              + " recordFeed[asksFirst,asksNext,offs,begins,pages,ends,endsAgain,pageEndsStale,markersStale,malformed,sendFailed,deferredMarked,expected,snapshotSent,snapshotApplied,paging,heldNotebook,heldNotebookEntries,beginsStale,offRetried,offDropped,seqKeptNewer]="
              + N(g_feedAsksFirst) + "," + N(g_feedAsksNext) + "," + N(g_feedOffsSent) + "," + N(g_feedBegins) + "," + N(g_feedPagesIn) + "," + N(g_feedEnds)
              + "," + N(g_feedEndsAgain) + "," + N(g_feedPageEndsStale) + "," + N(g_feedMarkersStale) + "," + N(g_feedMalformed) + "," + N(g_feedSendFailed)
              + "," + N(g_feedDeferredMarked) + "," + N(g_indexExpected) + "," + N(g_feedSnapshotSent) + "," + N((long long)(g_snapshotApplied ? 1 : 0))
              + "," + N((long long)g_feed.paging) + "," + N((long long)g_inBytes[kOriginNotebook])
              + "," + N((long long)g_inCount[kOriginNotebook]) + "," + N(g_feedBeginsStale) + "," + N(g_feedOffRetried) + "," + N(g_feedOffDropped) + "," + N(g_queueSeqKeptNewer)   /* T-313 review L3, L4, L1, M1 */
+             + AreaDoneReportGroup()   /* T-985 step 2B: AREA_DONE counts and gateDisagree (must stay 0) */
              /* THE PICTURE. verdict is 0 loading, 1 no-notebook, 2 stale, 3 fresh, and it is the LIVE one. The
                 five tick buckets are exhaustive over every tick that reached the verdict. areaMapAgeMs reads
                 -1 when no map has arrived for this world. */
@@ -24280,11 +25686,14 @@ void ReportStore()
              + " sleeps=" + N(g_sleeps) + " written=" + N(g_written) + " sent=" + N(g_sent) + " pushed=" + N(g_pushed) + " recv=" + N(g_recv)
              + " wakes=" + N(g_wakes) + " applied=" + N(g_applied) + " notNewer=" + N(g_notNewer) + " repositioned=" + N(g_repositioned) + " placed=" + N(g_placed) + " placeTimedOut=" + N(g_placeTimedOut) + " ignoredAwake=" + N(g_ignoredAwake)
              + " unknownDeferred=" + N(g_unknownDeferred) + " created=" + N(g_created) + " createNoRefs=" + N(g_createNoRefs) + " createLoadFailed=" + N(g_createLoadFailed) + " createNoState=" + N(g_createNoState) + " createNoPlatoon=" + N(g_createNoPlatoon) + " deferredLoadedHere=" + N(g_createDeferredLoadedHere)
-             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " ownMarkRaise=" + N(g_noteMarkRaised) + " ownRaiseCapped[total,lastScan]=" + N(g_noteRaiseCapped) + "," + N(g_noteRaiseCappedLast) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " blockMove[movedDown,held]=" + N(g_blockMovedDown) + "," + N(g_blockHeld) + " blockRememberedOtherWorld=" + N(g_blockRememberedOtherWorld) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
+             + " travelGated=" + N(g_travelGated) + " travelWakes=" + N(g_travelWakes) + " mineArea[ran,noSector,notLoaded,notMine,noMap,teardown]=" + N(g_unloadedMineRan) + "," + N(g_mineAreaNoSector) + "," + N(g_mineAreaNotLoaded) + "," + N(g_mineAreaHeld) + "," + N(g_mineAreaNoMap) + "," + N(g_mineAreaTeardown) + " posUpdatesSent=" + N(g_posUpdatesSent) + " sleepPos[stale,unusable]=" + N(g_sleepPosStale) + "," + N(g_sleepPosUnusable) + " posUpdatesRecv=" + N(g_posUpdatesRecv) + " posUpdatesApplied=" + N(g_posUpdatesApplied) + " posKeySent=" + N(g_posKeySent) + " posKeyTaken=" + N(g_posKeyTaken) + " loadSeen=" + N(g_loadSeen) + " createdRecords=" + N(g_createdRecords) + " createdQueued=" + N(g_createdQueued) + " createdDrained=" + N(g_createdDrained) + " createdDrainSkipped=" + N(g_createdDrainSkipped) + " createdRecordFailed=" + N(g_createdRecordFailed) + " deleteSent=" + N(g_goneSent) + " goneResentAtRelink=" + N(g_goneResentAtRelink) + " bitsResentAtRelink=" + N(g_bitsResentAtRelink) + " deleteRecv=" + N(g_goneRecv) + " deleteRemovedCopy=" + N(g_goneRemovedCopy) + " deletedHere=" + N(g_deletedHere) + " deleteNoId=" + N(g_goneNoId) + " adminDestroys=" + N(g_adminDestroys) + " releasedDead=" + N(g_releasedDead) + " livingFault=" + N(g_livingFault) + " areas[sent,mapRecv,mySlot,playerSectorMsgs,playerSectorMalformed]=" + N(g_areasSent) + "," + N(g_areaMapRecv) + "," + N((long long)g_mySlot) + "," + N(g_playerSectorMsgs) + "," + N(g_playerSectorMalformed) + " bits[factions,set,recv,sent,parseFail]=" + N((long long)g_deletedBits.size()) + "," + N(g_bitsSet) + "," + N(g_bitsRecv) + "," + N(g_bitsSent) + "," + N(g_bitsParseFail) + " wakeRefusedDeleted=" + N(g_wakeRefusedDeleted) + T300Report() + " refusedWake[removed,failed,gaveUp]=" + N(g_refusedWakeRemoved) + "," + N(g_refusedWakeFailed) + "," + N(g_refusedWakeGaveUp) + " recvRefusedDeleted=" + N(g_recvRefusedDeleted) + " sleepRefusedDeleted=" + N(g_sleepRefusedDeleted) + " pendingTowns[towns,records]=" + N(g_pendingTownsCount) + "," + N(g_pendingRecords) + " pendingNotes[inLoadedAreas,noPosition]=" + N(g_pendingLoadedHere) + "," + N(g_pendingNoPos) + " pendingUnplaceable[noGame,holderAbsent,lookups,noFaction]=" + N(g_pendUnplaceNoGame) + "," + N(g_pendUnplaceAbsent) + "," + N(g_noteLookups) + "," + N(g_noteLookupNoFaction) + " notePlaced[placed,failed,engineHad,idDiffers]=" + N(g_notePlaced) + "," + N(g_notePlaceFailedN) + "," + N(g_notePlaceEngineHad) + "," + N(g_notePlacedIdDiffers) + " ownRaise[done,factions,faults]=" + N((long long)(g_noteRaiseDone ? 1 : 0)) + "," + N(g_noteRaiseFactions) + "," + N(g_noteRaiseFault) + " ownMarkRaise=" + N(g_noteMarkRaised) + " ownRaiseCapped[total,lastScan]=" + N(g_noteRaiseCapped) + "," + N(g_noteRaiseCappedLast) + " townRead[none,fault]=" + N(g_townNone) + "," + N(g_faultTownRead) + " noteTownEmpty=" + N(g_noteTownEmpty) + " noteTownNone=" + N(g_noteTownNone) + " sleepSkippedOtherHeld=" + N(g_sleepSkippedOtherHeld) + " recordPos[member,platoon,last,home,town,none]=" + N(g_recPosSrc[0]) + "," + N(g_recPosSrc[1]) + "," + N(g_recPosSrc[2]) + "," + N(g_recPosSrc[3]) + "," + N(g_recPosSrc[4]) + "," + N(g_recPosSrc[5]) + " block[slot,applied,factions,fault]=" + N(g_blockSlot) + "," + N(g_blocksApplied) + "," + N(g_blockFactions) + "," + N(g_blockFault) + " blockSlotMismatch=" + N(g_blockSlotMismatch) + " blockMove[movedDown,held]=" + N(g_blockMovedDown) + "," + N(g_blockHeld) + " blockRememberedOtherWorld=" + N(g_blockRememberedOtherWorld) + " watch[ticks,walked,alive,unknown,noId,notMine,otherBlock,engineKept,alreadyDead]=" + N(g_watchTicks) + "," + N(g_watchWalked) + "," + N(g_watchAlive) + "," + N(g_watchUnknown) + "," + N(g_watchNoId) + "," + N(g_watchNotMine) + "," + N(g_watchOtherBlock) + "," + N(g_watchEngineKept) + "," + N(g_watchAlreadyDead) + " deadPending=" + N((long long)g_deadPending.size()) + " deadSeen=" + N(g_deadSeen) + " deadDeletedAtSleep=" + N(g_deadDeletedAtSleep) + " index=" + N(g_indexSeen) + "/" + N(g_indexExpected) + " indexReadOnly=1" + " loadOverrides=" + N(g_loadOverrides) + " loadOverrideFailed=" + N(g_loadOverrideFailed) + " loadOverrideNotLoading=" + N(g_loadOverrideNotLoading) + " loadOverrideMissingFile=" + N(g_loadOverrideMissingFile) + " loadOverrideOffThread=" + N(g_loadOverrideOffThread) + " loadOverrideRetried[read,failedToo]=" + N(g_loadOverrideRetried - g_loadOverrideRetryFailed) + "," + N(g_loadOverrideRetryFailed) + " wakeRoad[swap,swapMissed,countLines,filledUnread,markedRead]=" + N(g_wakeRoadSwap) + "," + N(g_wakeRoadSwapMissed) + "," + N(g_wakeCountLines) + "," + N(g_wakeFilledUnread) + "," + N(g_wakeMarkedRead) + " uniqueState[sent,recv,applied,unknownSid,unchanged]=" + WorldStateReport() + WorldStateDetail() + ItemsReport() + ItemsDetail() + " basepolicy=" + std::string(BasePolicyName()) + PolicyReport() + ClockReport()
              + " destroyedForgotten=" + N(g_destroyedForgotten) + " recvFoundInList=" + N(g_recvFoundInList) + " recvNotLoadedHere=" + N(g_recvNotLoadedHere) + " recvCacheDisagreed=" + N(g_recvCacheDisagreed)
              + " | faultSid=" + N(g_faultSid) + " faultSleepPod=" + N(g_faultSleepPod) + " faultSleepContainer=" + N(g_faultSleepContainer) + " faultWakePod=" + N(g_faultWakePod) + " | skippedEmpty=" + N(g_skippedEmpty) + " skippedNotMine=" + N(g_skippedNotMine) + " skippedNoUid=" + N(g_skippedNoUid) + " block[writtenByBlock,skippedOtherBlock]=" + N(g_writtenByBlock) + "," + N(g_skippedOtherBlock) + " skippedPlayerFaction=" + N(g_skippedPlayerFaction) + " skippedStandInRecord=" + N(g_sleepSkippedStandInRecord) + " | ZONE saves=" + N(g_zoneSaves) + " zoneSave[applied,notMine,staleCopyRefused,ownStore,readFail,writeFail,skippedOff,skippedSingle;viaFlush]=" + N(g_zoneWritten) + "," + N(g_zoneSkippedNotMine) + "," + N(g_zoneStaleCopyRefused) + "," + N(g_zoneOwnStore) + "," + N(g_zoneReadFail) + "," + N(g_zoneWriteFail) + "," + N(g_zoneSkippedOff) + "," + N(g_zoneSkippedSingle) + ";" + N(g_zoneSaveViaFlush) + "   (P6q: the first EIGHT are ZoneSaveApply's eight counted exits and sum to ZONE saves= above; viaFlush is a SPAN over all eight, not a ninth bucket - saves counted at entry while the post-teardown flush was running, of which zoneWriteAfterTeardownFlush were written) written=" + N(g_zoneWritten) + " skippedNotMine=" + N(g_zoneSkippedNotMine) + " zoneStaleCopyRefused=" + N(g_zoneStaleCopyRefused) + " zoneKeptAdopted=" + N(g_zoneKeptAdopted) + " zoneStampBumped=" + N(g_zoneStampBumped) + " recvOff=" + N(g_zoneRecvOff) + " loadOk=" + N(g_zoneLoadOk) + " loadFailed=" + N(g_zoneLoadFailed) + " zoneReadOffMain=" + N((long long)g_zoneReadOffMain) + " zoneSwapNoPeerFaction=" + N(g_zoneSwapNoPeerFaction) + " areaStandIns[made,failed]=" + N(g_areaStandInsMade) + "," + N(g_areaStandInsFailed)
-             + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
+             + " areaOwners[scans,scanReadFail,scanQueued,refusedNamed,capHits,capLeftMax,thirdKept,thirdNoStandIn,legacyKept,worldPlayers]=" + N(g_areaScans) + "," + N(g_areaScanReadFail) + "," + N((long long)g_areaScanQueue.size()) + "," + N(g_areaRefusedNamed) + "," + N(g_areaStandInCapHits) + "," + N(g_areaStandInCapLeftMax) + "," + N(g_ownerThirdKept) + "," + N(g_ownerThirdNoStandIn) + "," + N(g_ownerLegacyInactive) + "," + N((long long)StoreWorldPlayerCount()) + " areaRefusedLegacy=" + N(g_areaRefusedLegacy) + " areaPlaceholders[madeThisWorld,retries,failedNow]=" + N(g_areaPlaceholdersThisWorld) + "," + N(g_areaStandInRetries) + "," + N((long long)g_areaStandInRetryAt.size()) + " zoneSwapOffMainTranslate=" + N((long long)g_zoneSwapOffMainTranslate) + " zoneWriteWaitedForLoad=" + N(g_zoneWriteWaitedForLoad) + " zoneWriteWaitDropped=" + N(g_zoneWriteWaitDropped) + " zoneWriteWaiting=" + N((long long)g_zoneParked.size()) + " zoneSwapWithdrawn=" + N((long long)g_zoneSwapWithdrawn) + " zoneProvRead[made,madeGood,dropRecord,dropLink,dropTeardown,thrown,waitingNow,readLines,readLinesSuppressed,waitingAtSettle]=" + N(g_zoneProvMade) + "," + N(g_zoneProvGood) + "," + N(g_zoneProvDropRecord) + "," + N(g_zoneProvDropLink) + "," + N(g_zoneProvDropTeardown) + "," + N(g_zoneProvThrown) + "," + N((long long)g_zoneProvRead.size()) + "," + N(g_zoneReadLines) + "," + N(g_zoneReadLinesSuppressed) + "," + N(g_zoneProvWaitAtSettle) + " | WAKE skippedHeld=" + N((long long)g_wakeSkippedHeld) + " wakeHeldNoMap=" + N((long long)g_wakeHeldNoMap) + " checked=" + N((long long)g_wakeChecked) + " frozen=" + N((long long)g_wakeFrozen) + " dtFaults=" + N((long long)g_wakeDtFaults) + " dtMax=" + F1(g_wakeDtMax) + " |" + " recreatedOnDrop=" + N(g_recreatedOnDrop) + " recreateNoRecord=" + N(g_recreateNoRecord) + " recreateHasCopy=" + N(g_recreateHasCopy) + " recreateFailed=" + N(g_recreateFailed) + " indexBadLines=" + N(g_indexBadLines) + " offThreadDetours[deactivate,destroy,gdcSave,unloadedUpdate]=" + N((long long)g_offThreadDeactivate) + "," + N((long long)g_offThreadDestroy) + "," + N((long long)g_offThreadGdcSave) + "," + N((long long)g_offThreadUnloadedUpdate) + " deactivateOffThreadBypassed=" + N((long long)g_deactivateOffThreadBypassed) + " destroyOffThread[queued,goneDrained,noId,admin,rebound]=" + N((long long)g_destroyOffThreadQueued) + "," + N(g_destroyOffThreadGoneDrained) + "," + N(g_goneNoIdDrained) + "," + N(g_goneDrainedAdmin) + "," + N(g_goneRebound) + " bindGen[counter,stamps,missing]=" + N((long long)g_bindGen) + "," + N((long long)g_bindGenOf.size()) + "," + N(g_goneBindGenMissing) + " outboxFlushedAtTeardown=" + N(g_outboxFlushedAtTeardown) + " outboxFlushedPostTeardown=" + N(g_outboxFlushedPostTeardown) + " zoneWriteAfterTeardownFlush=" + N(g_zoneWriteAfterTeardownFlush) + " gridKeptAtTeardown=" + N(g_gridKeptAtTeardown) + " teardownWithoutRelay=" + N(g_teardownWithoutRelay) + "   (P6x, review-p6q HIGH-1: these two sum to worldTeardowns=; gridKeptAtTeardown=0 means the condition for keeping the map was never met - the store link came up 11-24 s AFTER the teardown in every evidence log - and NOT that the kept map was unnecessary. E38, connect to the notebook process before loading the world, is the fix) engineTeardownDepth=" + N((long long)::InterlockedCompareExchange(&g_engineTeardown, 0, 0)) + " teardownDepthUnderflow=" + N(g_teardownDepthUnderflow) + " teardownLateLogSkipped=" + N(g_teardownLateLogSkipped) + " teardownLateLogPending=" + N((long long)::InterlockedCompareExchange(&g_teardownLatePending, 0, 0)) + "   (P6x, review-p6q CRASH-2: the late step is two halves - flags in the __finally, logging after it. skipped counts a teardown whose flags ran without its log, counted at the NEXT teardown; pending=1 means the most recent one has not logged yet. Read them together: neither alone is 'how many unwinds happened') engineTeardownClearedLate=" + N(g_engineTeardownClearedLate) + " outboxTeardownOffThread=" + N(g_outboxTeardownOffThread) + " outboxFlushRefusedOffThread=" + N(g_outboxFlushRefusedOffThread) + " teardownThreadUnknown=" + N(g_teardownThreadUnknown) + " gdcSaveOffThreadQueued=" + N((long long)g_gdcSaveOffThreadQueued) + " gdcSaveOffThreadDrained=" + N(g_gdcSaveOffThreadDrained) + " offThreadDetoursAll=" + N(g_offThreadDetours) + " outbox[queued,drained,droppedCap,sendFailed]=" + N((long long)g_outboxQueued) + "," + N((long long)g_outboxDrained) + "," + N((long long)g_outboxDroppedCap) + "," + N((long long)g_outboxSendFailed) + " worldTeardowns=" + N(g_worldTeardowns) + " quit[flag,sleepRefused,outboxFlushed,withdrawn]=" + N((long long)QuitFlagSet()) + "," + N(g_sleepRefusedQuitting) + "," + N(g_outboxFlushedAtQuit) + "," + N(g_quitWithdrawn) + " quitLatched=" + N((long long)g_quitting) + " close[hook,closeSeen,quitFromClose,offThread,noTickYet,storeFaults]=" + N((long long)(g_closeHookOn ? 1 : 0)) + "," + N((long long)g_closeSeen) + "," + N((long long)g_quitFromClose) + "," + N((long long)g_closeOffThread) + "," + N((long long)g_closeNoTickYet) + "," + N((long long)g_closeStoreFaults) + " menuQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_menuHookOn ? 1 : 0)) + "," + N((long long)g_menuSeen) + "," + N((long long)g_quitFromMenu) + "," + N((long long)g_menuOffThread) + "," + N((long long)g_menuNoTickYet) + " titleQuit[hook,seen,latched,offThread,noTickYet]=" + N((long long)(g_titleHookOn ? 1 : 0)) + "," + N((long long)g_titleSeen) + "," + N((long long)g_quitFromTitle) + "," + N((long long)g_titleOffThread) + "," + N((long long)g_titleNoTickYet) + " quitFromFallback=" + N((long long)g_quitFromFallback) + " zoneSaveLog[lines,suppressed]=" + N(g_zoneLogLines) + "," + N(g_zoneLogSuppressed) + " zoneWr[holderMine,holderOther,ladder]=" + N(g_zoneWrPath[1]) + "," + N(g_zoneWrPath[2]) + "," + N(g_zoneWrPath[3]) + " zoneWrRung[notLoadedHere,soleLoaded,tieLower,tieHigher,refusedNoNotebook,noAnswer]=" + N(g_zoneWrRung[coopwriter::kRungNotLoadedHere]) + "," + N(g_zoneWrRung[coopwriter::kRungSoleLoaded]) + "," + N(g_zoneWrRung[coopwriter::kRungTieLower]) + "," + N(g_zoneWrRung[coopwriter::kRungTieHigher]) + "," + N(g_zoneWrRung[coopwriter::kRungRefusedNoNotebook]) + "," + N(g_zoneWrRung[coopwriter::kRungNoAnswer]) + " zoneWrSpans[peerUnknown,gracePass]=" + N(g_zoneWrSpanPeerUnknown) + "," + N(g_zoneWrSpanGracePass) + "   (audit C11: the THREE zoneWr paths are exclusive and sum to the zone saves that reached the decision - the ladder's SINGLE answer is unreachable from the save route since AUD-b, a lone game exits at zoneSkippedSingle above it, so that token is RETIRED rather than left at 0; the SIX rungs (M2 added noAnswer: no notebook slot comparison, so no writer) sum to zoneWr[ladder] alone and are the SAME ladder a box takes; the three Spans say HOW and sum to nothing. THE VERDICT: holderOther >= 1 on the game that does not hold a town whose zone the other game saved, where the deployed build wrote every zone file on the host)" + " | OWNER zonesTranslated=" + N(g_ownerTranslated) + " states=" + N(g_ownerInstances) + " toPeer=" + N(g_ownerTranslatedToPeer) + " toMine=" + N(g_ownerTranslatedToMine) + " noList=" + N(g_ownerNoList) + " faults=" + N(g_ownerFaults) + " skippedOff=" + N(g_zoneSkippedOff) + " readFail=" + N(g_zoneReadFail) + " recv=" + N(g_zoneRecv) + " recvNotNewer=" + N(g_zoneRecvNotNewer) + " zoneRecvHolderTaken=" + N(g_zoneRecvHolderTaken) + " reads=" + N(g_zoneReads) + " overrides=" + N(g_zoneOverrides) + " overrideMissingFile=" + N(g_zoneOverrideMissingFile) + " on=" + N(g_zoneOn ? 1 : 0) + " retireFaults=" + N(g_retireFaultDeactivate) + "/" + N(g_retireFaultListMove) + " skippedOff=" + N(g_skippedOff) + " zoneSkippedSingle=" + N(g_zoneSkippedSingle)
              + " ourCreate=" + N(g_ourCreate) + " keptPersistent=" + N(g_keptPersistent) + " noId=" + N(g_noId) + " saveFailed=" + N(g_saveFailed) + " loadFailed=" + N(g_loadFailed) + " faults=" + N(g_faults)
+             + " birth[noted,liveRead,capFull,deadRelease,engine,keptBorn,keptUnknown,keptPlayer,keptOtherHolder,hbBound,discardSent,retired,keptHome,keepOffThread,hbBindIdHeld,discardSharedKept,filled,keptNotRead,homeCached,homeCacheHits,roamCached,roamCacheHits]=" + N((long long)g_birthNoted) + "," + N((long long)g_birthLiveRead) + "," + N((long long)g_birthCapFull)
+             + "," + N(g_birthKept[0]) + "," + N(g_birthKept[1]) + "," + N(g_birthKept[2]) + "," + N(g_birthKept[3]) + "," + N(g_birthKept[4]) + "," + N(g_birthKept[5])
+             + "," + N(g_hbBound) + "," + N(g_discardSent) + "," + N(g_retiredAtLoad) + "," + N(g_birthKept[6]) + "," + N((long long)g_keepOffThread) + "," + N(g_hbBindIdHeld) + "," + N(g_discardSharedKept) + "," + N(g_birthFilled) + "," + N(g_birthKept[7]) + "," + N((long long)g_liveHomeOf.size()) + "," + N(g_liveHomeHits) + "," + N((long long)g_roamOf.size()) + "," + N(g_roamHits) + " unloadEmptied[noted,offThread,keptMark,discardByIt,capFull,clearedLiving,held]=" + N(g_unloadEmptiedNoted) + "," + N((long long)g_unloadEmptiedOffThread) + "," + N(g_unloadEmptiedKeptMark) + "," + N(g_unloadEmptiedDiscard) + "," + N(g_unloadEmptiedCapFull) + "," + N(g_unloadEmptiedCleared) + "," + N((long long)g_unloadEmptied.size()) + " noId=" + N(g_noId) + " saveFailed=" + N(g_saveFailed) + " loadFailed=" + N(g_loadFailed) + " faults=" + N(g_faults)
              + " | T296 state[created0x22,createRefused,createOdd,copyFaults,stray,tracked,trackedWakes,trackedOurs,trackedChanged,trackedOutside,scanned,scanFaults,inside,moved,moveFailed,outside,reloadRefused,after[outside,inside,moved,faults],forgotten]=" + N(g_stCreated22) + "," + N(g_stCreateRefused) + "," + N(g_stCreateOdd) + "," + N(g_stCopyFaults) + "," + N(g_stStray) + "," + N((long long)g_stCreated.size()) + "," + N(g_stTrackedWakes) + "," + N(g_stTrackedOurs) + "," + N(g_stTrackedChanged) + "," + N(g_stTrackedOutside) + "," + N(g_stScanned) + "," + N(g_stScanFaults) + "," + N(g_stInside) + "," + N(g_stMoved) + "," + N(g_stMoveFailed) + "," + N(g_stOutside) + "," + N(g_stReloadRefused) + ",[" + N(g_stAfterOutside) + "," + N(g_stAfterInside) + "," + N(g_stAfterMoved) + "," + N(g_stAfterFaults) + "]," + N(g_stForgotten) + " createPos[set,setFault,agree,odd]=" + N(g_stCreatePosSet) + "," + N(g_stCreatePosFault) + "," + N(g_stCreatePosAgree) + "," + N(g_stCreatePosOdd)
              + " | B10 canonWriteAttempted=" + N(g_canonWriteAttempted) + " indexReadOnly=1"
              + "   (audit C8: canonWriteAttempted is a TRIPWIRE ON A DELETED RULE and MUST read 0 - it is not F172's silent zero; indexReadOnly says this game READS the notebook's folder and never owns it)"
@@ -24309,7 +25718,7 @@ void ReportStore()
                + "," + N(g_storeAuthExtra) + "," + N(g_storeHostTokenSent) + "," + N(g_storeHostTokenFailed)
              + " storeProto[mismatch,ignoredMessages]=" + N((long long)(g_storeProtoMismatch ? 1 : 0)) + "," + N(g_storeMismatchIgnored)
              + " u8AnsiFallback=" + N((long long)g_u8AnsiFallback)   /* paths read in the ANSI code page because they were not UTF-8 (u8file.h) */
-             + StoreSendBoundToken() + StoreBundleToken() + OriginReport() + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
+             + coop::BoxRecordReport() + StoreSendBoundToken() + StoreBundleToken() + OriginReport() + "   (audit C15: repushed MUST read 0 in a run with no notebook outage and MUST be non-zero in the outage leg - that pair is the whole verdict)");
     ReportClockLines();   /* E40 / decision 45: the [TIME] and [WEATHER] lines, on BOTH games, at every report */
     HbReportLine();   /* E47-S2: the [SAVE] hb[...] line at every report */
     const std::string q(1, (char)34);
@@ -24454,6 +25863,7 @@ int StoreRecreateSleepingFromRecord(const std::string& worldId)
 {
     std::map<std::string, Record>::const_iterator it = g_records.find(worldId);
     if (it == g_records.end() || it->second.file.empty() || IsZoneId(worldId)) { ++g_recreateNoRecord; return 0; }
+    if (MirrorKeepGated(worldId)) { ++g_mkGatedWake; return 0; }   /* T-985 C1 fold 1 (review HIGH 1): a kept record not yet named is not made again */
     Faction* f = (Plaus(coop::GameWorldPtr()) && Plaus(coop::GameWorldPtr()->factionDirectory) && !it->second.factionName.empty()) ? FindFactionByKey(it->second.factionName) : 0;   /* P7f (review-p6z C-1), site 5 of 5 */
     if (Plaus(f) && (FindSleepingPlatoonImpl(f, worldId) != 0 || FindActivePlatoonImpl(f, worldId) != 0)) { ++g_recreateHasCopy; return 0; }
     if (CreateUnknownSquad(it->second)) { ++g_recreatedOnDrop; DebugLog("[STORE] peer gone: sleeping copy of '" + worldId + "' re-created from its record (writtenAt " + N(it->second.writtenAt) + ")"); return 1; }
@@ -24477,6 +25887,23 @@ void StoreForgetRunnerWithdrew(const std::string& worldId)
 }
 namespace coop { int StoreRetireLocalCopy(void* platoon) { AdminDestroyBeginImpl(); const int rc = StoreRetireLocalCopyImpl(platoon); AdminDestroyEndImpl(); return rc; } }   /* P4e: the retire pair is admin, not "gone" */
 namespace coop { int StorePlatoonBound(void* platoon) { return g_bind.find(platoon) != g_bind.end() ? 1 : 0; } }   /* a bound squad is answered 'persistent' (detour_isPersistent) */
+namespace coop {   /* T-948 b (store.h): the mod's own deliberate move of a copy to a new squad passes detour_sqMove on this thread. Nothing calls it today */
+void StoreSquadMovePassBegin() { if (g_sqPassTls != TLS_OUT_OF_INDEXES) ::TlsSetValue(g_sqPassTls, (LPVOID)(INT_PTR)((int)(INT_PTR)::TlsGetValue(g_sqPassTls) + 1)); }
+void StoreSquadMovePassEnd() { if (g_sqPassTls != TLS_OUT_OF_INDEXES) { const int d = (int)(INT_PTR)::TlsGetValue(g_sqPassTls); ::TlsSetValue(g_sqPassTls, (LPVOID)(INT_PTR)(d > 0 ? d - 1 : 0)); } }
+}
+namespace coop {
+/* T-999 fold 3 (store.h): spawn.cpp's UNLOAD removal of a character notes the character's squad (`platoon`, the verified squad reader's
+   Platoon; 0 = none). Bound squads only; main thread only, with the object whole - offThread = 1 (the off-thread despawn drain replaying
+   a removal, the object may be gone) or a call off the main thread is counted, not noted. */
+void StoreNoteUnloadEmptied(void* platoon, int offThread)
+{
+    if (offThread != 0 || !OnMainThread()) { ::InterlockedIncrement64(&g_unloadEmptiedOffThread); return; }
+    if (platoon == 0 || g_bind.find(platoon) == g_bind.end()) return;
+    if (g_unloadEmptied.count(platoon) != 0) return;
+    if (g_unloadEmptied.size() >= kUnloadEmptiedCap) { ++g_unloadEmptiedCapFull; return; }
+    g_unloadEmptied.insert(platoon); ++g_unloadEmptiedNoted;
+}
+}
 namespace coop {
 void StoreAdminDestroyBegin() { AdminDestroyBeginImpl(); } void StoreAdminDestroyEnd() { AdminDestroyEndImpl(); }
 // P4e: a creation on a worker thread (T191: the threaded spawn check) must not touch the main-thread maps, the engine's save or the
@@ -24534,6 +25961,7 @@ void ApplyDeletedBits(const std::string& faction, const std::vector<char>& bits,
     std::vector<char>& b = g_deletedBits[faction]; if (b.size() < bits.size()) b.resize(bits.size(), 0);
     for (size_t i = 0; i < bits.size(); ++i) b[i] = (char)((unsigned char)b[i] | (unsigned char)bits[i]);   /* OR-merge: a bit never clears */
     WriteBitsFile(faction);
+    MirrorKeepDeletedBits();   /* T-985 C1 fold 1 (review LOW 2): a kept record marked now is dropped */
     DebugLog("[STORE] DELETED-BITS for '" + faction + "' from " + std::string(from) + " (" + N((long long)bits.size()) + " bytes)");
 }
 }
@@ -24783,6 +26211,10 @@ bool StoreSendAreas(const int* xy, int count, int playerX, int playerY)
     /* PROBE P142 BEGIN */ P142AreasSent(xy, count, p142Packets, p142Bytes, p142Known); /* PROBE P142 END */
     ++g_areasSent; return true;
 }
+/* fold 4 (review): THE WORLD SERVER'S OWN ADMISSION OF AN AREAS (store_main.cpp JoinAreasAdmit / coopjoin::StageStep): a session-road
+   game's always, a world-road game's only once its JOIN_STAGE IN_WORLD went out on this link - the same test CatchupAskDrain makes.
+   Asked right after StoreSendAreas (which sends an owed IN_WORLD first). MAIN THREAD. */
+int StoreAreasTaken() { return (!StoreJoinViaWorld() || g_joinInWorldSentGen == (long)StoreLinkGen()) ? 1 : 0; }
 // E5 / decision 31(c): MAIN THREAD - one named character's state to the notebook process. Same send primitive as StoreSendAreas.
 bool StoreSendUniqueState(const std::string& sid, int state, int playerInvolved)
 {
@@ -25673,6 +27105,8 @@ int StoreRefusedReason() { if (!g_storeProtoMismatch) return -1; return g_storeR
 bool StoreLinkIsUp() { return LinkUp(); }                 /* U2: see store.h - MAIN THREAD ONLY */
 bool StoreLinkConnected() { return g_link != 0 && g_link->State() == net::LINK_UP && !g_storeProtoMismatch && !g_storeWrongWorld; }   /* see store.h - MAIN THREAD ONLY */
 std::string StoreNotebookDir() { return coopworld::WorldDirIn(BaseDir(), ConfigWorldKey()); }   /* P8J-B2: the notebook's top folder may be storedir= */   /* U2 / W2b: this game's world folder, through the ONE construction (coopworld::WorldDir) the notebook also uses */
+std::string StoreDataDir() { return g_dirCanonical; }   /* T-924 FOLD 3: see store.h */
+void StoreEnsureDir(const std::string& d) { EnsureDir(d); }   /* T-924 FOLD 3 */
 std::string StoreTopDir() { return BaseDir(); }                                         /* mp3: see store.h */
 std::string MyPersonId() { return g_worldPersonId.empty() ? ConfigPlayerId() : g_worldPersonId; }   /* see store.h */
 std::string StorePlayerKey() { return g_profPickedNum >= 1 ? coopprof::SlotKey(MyPersonId(), g_profPickedNum) : MyPersonId(); }   /* loot2c x prof1 merge: see store.h */
@@ -25802,6 +27236,12 @@ bool StoreIsWorldAuthority() { return LinkUp() && g_storeAuthority; }
 int StoreTearingDown() { return ::InterlockedCompareExchange(&g_engineTeardown, 0, 0) > 0 ? 1 : 0; }   /* P6x (review-p6q MEDIUM-2): "> 0", because g_engineTeardown is a DEPTH now - a nested teardown's lower cannot open the gate while an outer one is still freeing the world. Negative is impossible by construction (the decrement clamps and counts), and "> 0" answers correctly even if it were. */   /* P6j (verify-p6c HIGH-1): g_engineTeardown, NOT g_tearingDown - see the definition of both. The name is kept because the question the callers ask is unchanged; only its span is corrected, from "until the next world is read off disk" to "while the engine is freeing this one". */
 int StoreWelcomePushDone() { return g_welcomePush == 2 ? 1 : 0; }   /* E24.1 */
 int StoreSnapshotApplied() { return g_snapshotApplied ? 1 : 0; }   /* T-313: this world's record-feed snapshot is applied (StoreFeedMarkerApply) */
+int StoreAreaDoneSec(int sec, int oldAnswer, int gate)   /* T-985 step 2B (store.h) */
+{
+    return AreaDoneHeldGate(sec == kStoreAreaAny ? coopfeed::kFeedAreaAny : coopfeed::FeedSecXYAreaKey(sec), oldAnswer, gate);
+}
+int StoreAreaDoneXY(int x, int y, int oldAnswer, int gate) { return AreaDoneHeldGate(coopfeed::FeedAreaKey(x, y), oldAnswer, gate); }   /* T-985 step 2B (store.h) */
+typedef char T985s2bAreaAnyAgrees[(kStoreAreaAny == coopfeed::kFeedAreaAny && kAreaGateCount == 7) ? 1 : -1];   /* a compile error here = store.h and recordfeed.h disagree */
 /* one group of a town, by its world id, into the tally (MAIN THREAD) */
 static void StoreTallyOne(const std::string& wid, townrefill::Tally* t)
 {
@@ -25841,6 +27281,15 @@ int StoreRecordsHomedAt(const std::string& buildingKey)
         if (r != g_records.end() && r->second.gone == 0) ++n;
     }
     return n;
+}
+/* T-984 (TEST lever's read): what this game holds of one world id's record and its home key (see store.h). MAIN THREAD, reads only */
+int StoreRecordFacts(const std::string& worldId, int* owner, long long* writtenAt, int* gone, std::string* home)
+{
+    *owner = -1; *writtenAt = 0; *gone = 0; *home = RecordHomeOf(worldId);
+    const std::map<std::string, Record>::const_iterator r = worldId.empty() ? g_records.end() : g_records.find(worldId);
+    if (r == g_records.end()) return 0;
+    *owner = r->second.owner; *writtenAt = r->second.writtenAt; *gone = r->second.gone;
+    return 1;
 }
 void StoreHomeClearGroup(const std::string& worldId) { HomeClearOne(worldId); }   /* see store.h */
 int StoreSetPersistentPod(void* platoon, int on) { return (kSetPersistentRva == 0 || platoon == 0) ? -1 : SetPersistentPod(platoon, on != 0); }   /* see store.h */
@@ -26197,6 +27646,8 @@ void StoreOrphanEmptiedSquad(void* faction, void* active)
 namespace coop { int StoreShowPlayerLine(const std::string& line) { std::string l(line); return ShowGameMessagePod(&l); } }   /* loot2c part B: the one on-screen line a touched book routed into its player's own pack gets */
 namespace coop { int StoreGameDay() { ClockPod c; return (g_clkBase != 0 && ReadClockPod(g_clkBase, &c) && c.day >= 0) ? c.day : -1; } }   /* T-556: the FALLEN tab's DIED column */
 namespace coop { int StoreGiveOwedHomes(const char* buildingKey, void* building) { return GiveOwedHomesImpl(buildingKey, building); } }   /* store.h */
+namespace coop { void StoreBirthNote(void* platoon, int birth) { BirthNote(platoon, birth); } }   /* store.h */
+namespace coop { int StoreBirthOfPlatoon(void* platoon) { return sqbirth::BirthMerge(BoundRecordBirth(platoon), BirthPublishOf(platoon)); } }   /* store.h: the flag CONTEXT publishes - never one read off the squad's own byte */
 namespace coop { void StoreNoteCopyHome(void* platoon, const std::string& worldId, const unsigned char* handRaw32, int buildingSent, int buildingResolved) { NoteCopyHomeImpl(platoon, worldId, handRaw32, buildingSent, buildingResolved); } }   /* store.h [t755-copyhome-api] */
 namespace coop { int StoreKeylessRecordGroups(const std::string& townSid, KeylessGroup* out, int cap) { return KeylessRecordGroupsImpl(townSid, out, cap); } }   /* store.h */
 namespace coop { std::string StoreHomeReport() { return HomeReportImpl(); } }   /* store.h */
@@ -26702,4 +28153,35 @@ std::string DialoguePauseTestCommand(const std::string& arg)
 }
 /* T-799 D3 (items.cpp ItKeeperRepairCheck): 1 = this platoon's money was decided this world - made here, or its load seen. MAIN THREAD. */
 int StoreMoneyDecided(void* platoon) { return (platoon != 0 && g_moneyDecided.count(platoon) != 0) ? 1 : 0; }
+/* items.cpp ItKeeperRepairCheck: the money the squad's own record carries - the record of its world id in the index (g_records), read
+   from its file (coopown::RecordMoneyOf, as a LOAD-OVERRIDE reads it). 1 = carried (*money set); 0 = no record, a gone record, an
+   unread file or no money field; 2 = another awake squad carries the same world id, or that could not be read (LiveSameIdOther) -
+   the record may be the other squad's, so its money is not taken. MAIN THREAD. */
+int StoreRecordMoneyRead(void* platoon, int* money)
+{
+    if (money == 0) return 0;
+    *money = 0;
+    if (!Plaus(platoon)) return 0;
+    const std::string wid = WorldIdOf(platoon);
+    if (wid.empty()) return 0;
+    if (LiveSameIdOther(platoon, wid) != 0) return 2;
+    std::map<std::string, Record>::const_iterator it = g_records.find(wid);
+    if (it == g_records.end() || it->second.gone != 0 || it->second.file.empty()) return 0;
+    std::vector<char> b;
+    if (!ReadFileBytes(it->second.file, &b) || b.empty()) return 0;
+    int m = 0;
+    if (coopown::RecordMoneyOf(&b[0], b.size(), &m) != coopown::kRecMoneyCarried) return 0;
+    *money = m;
+    return 1;
+}
+/* That money into the squad's embedded pot and its state record's money field (as MoneyLoadRecord puts a LOAD-OVERRIDE's), so a save
+   carries it. 1 = the pot holds it. MAIN THREAD. */
+int StoreRecordMoneyPut(void* platoon, int money)
+{
+    if (!Plaus(platoon)) return 0;
+    void* st = 0;
+    if (PlatoonStatePod(platoon, &st) == 1 && Plaus(st)) ((::GameData*)st)->intFields[std::string(coopown::kRecMoneyKey)] = money;
+    return PotMoneyWritePod(platoon, money);
+}
 } // namespace coop
+namespace coop { void StoreApplyBlockToNewFaction(void* faction) { BlockApplyNewFaction(faction); } }   /* playerfaction.cpp CreatePeer: a stand-in takes this game's number block */

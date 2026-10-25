@@ -137,6 +137,11 @@ void SetNativeCombat(bool on);
 // P059 - replicate.cpp's DropPuppet tells the watch row its window is gone (regated = it could
 // re-gate the AI before forgetting the character).
 void NoteNativeWindowDropped(unsigned int uid, bool regated);
+// T-986 (drift bound) - the drive found a copy in a native window farther than `bound` (the far snap's distance) from its owner's
+// reported spot: the window closes, reason "drift" - the AI gated, its pass waited out, the order cleared; combat mode and the
+// current action are KEPT (T-986 fold 1), the owner's OFF edge ends them. MAIN THREAD (ReplicateTick,
+// after the drive walk).
+void CloseNativeWindowForDrift(unsigned int uid, float drift, float bound);
 
 void SetWeaponTask(bool on);
 

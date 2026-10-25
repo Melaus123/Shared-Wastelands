@@ -44,6 +44,7 @@
 #include "spawn.h"          /* FindSpawned / FindSpawnedUid */
 #include "store.h"          /* StoreMainThreadId */
 #include "net/session.h"    /* IsUidMine, UidOwnedByPeer, SendSay */
+#include "net/transport.h"  /* TrafficReportTick */
 #include "../common/saywire.h"
 #include "playerfaction.h"  /* crimetest: IsPlayerFaction / IsPeerFaction */
 #include "relations.h"      /* crime7: RelationsWireSid - the optional victim-faction filter */
@@ -7987,7 +7988,9 @@ std::string TalkCountsString()
 
 /* T-726: a [TALK] REPORT line every 60 s in this game's own log while a world runs (not while loading or tearing down), so a bug
    report carries the talk counters (talk[...], the P25 counters and whys, the arrival counters tpEv[...], copyOwnEnd[...]) without
-   the harness's report verb. MAIN THREAD (StoreTick, 1 Hz). */
+   the harness's report verb. MAIN THREAD (StoreTick, 1 Hz). T-879: the release build writes it at most once per 10 minutes
+   (SW_INTERVALN, kReleaseReportGapMs); the newest one held back is written at the game's exit and before a bug report. */
+static ChangedLogSlot s_talkReportChanged;
 void TalkReportTick()
 {
     static DWORD last = 0;
@@ -7995,7 +7998,9 @@ void TalkReportTick()
     const DWORD now = ::GetTickCount();
     if (last != 0 && now - last < 60000) return;
     last = (now == 0) ? 1 : now;
-    DebugLog("[TALK] REPORT " + TalkCountsString() + TalkOrderCountsString());
+    net::TrafficReportTick();   /* the [NET] TRAFFIC REPORT lines, on the same 60 s beat */
+    const std::string line = "[TALK] REPORT " + TalkCountsString() + TalkOrderCountsString();
+    if (SW_INTERVALN(s_talkReportChanged, kReleaseReportGapMs, line)) DebugLog(line);
 }
 
 std::string SayCountsString()

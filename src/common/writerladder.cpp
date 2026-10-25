@@ -121,12 +121,19 @@ int OwnerArriveEdge(double since, double sweptSince, int activePolls)
     if (activePolls < kArriveSettlePolls) return kArriveWait;
     return kArriveSweep;
 }
-int OwnerArriveWait(int state, unsigned long elapsedMs, unsigned long waitMs, int* timedOut)
+int OwnerArriveWait(int state, int writerGone, int linkLost, int* ended)
 {
-    if (timedOut != 0) *timedOut = 0;
+    if (ended != 0) *ended = kArriveEndNone;
     if (state == 1) return 1;
-    if (elapsedMs > waitMs) { if (timedOut != 0) *timedOut = 1; return 1; }
+    if (linkLost != 0) { if (ended != 0) *ended = kArriveEndLink; return 1; }
+    if (writerGone != 0) { if (ended != 0) *ended = kArriveEndGone; return 1; }
     return 0;
+}
+int HandbackWriterGone(int prevSlot, int prevLoaded, int holderNow, int othersLoaded)
+{
+    if (prevSlot < 0) return (othersLoaded == 0) ? 1 : 0;
+    if (prevLoaded == 0) return 1;
+    return (holderNow >= 0 && holderNow != prevSlot) ? 1 : 0;
 }
 int OwnerArriveApplies(int state) { return (state == 0 || state == 2) ? 1 : 0; }
 int OwnerArriveSwapOrReask(int state, int askHave, unsigned int askDigest, int liveHave, unsigned int liveDigest)

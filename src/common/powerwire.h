@@ -245,4 +245,13 @@ inline int PowerCompletionSwitch(int writer, int have, int writerOn, int afterOn
     return ((afterOn != 0 ? 1 : 0) != w) ? w : -1;
 }
 
+/* a piece on the power network: a power output (+0x3BC) below 0 (a consumer) or above 0 (a producer), or a battery capacity (+0x3C8)
+   above 0 - the three tests setPowerOn 0x2973B0 hands the town grid's add 0x92CBB0. A piece with neither (a campfire, a torch post)
+   draws and makes nothing, and setPowerOn would still switch its effects and lights. A NaN output is taken as on (the switch written
+   as for any power piece). 1 = on, 0 = off */
+inline int PowerOnNetwork(float output, float capacity) { return (output != 0.0f || capacity > 0.0f) ? 1 : 0; }
+/* the writer's POWER_STATE is sent for a piece on the network, or for one off it that carries input stocks (stocks > 0: the
+   message's stocks are its only use there). 1 = send */
+inline int PowerStateCarries(int onNetwork, int stocks) { return (onNetwork != 0 || stocks > 0) ? 1 : 0; }
+
 } // namespace powerwire

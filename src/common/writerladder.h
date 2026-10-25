@@ -155,11 +155,20 @@ int ZoneWriterDecide(int roleIsSingle, int held, int mine, int loadedHereSector,
 enum { kArriveNone = 0, kArriveWait = 1, kArriveSweep = 2 };
 const int kArriveSettlePolls = 2;
 int OwnerArriveEdge(double since, double sweptSince, int activePolls);
-/* OwnerArriveWait: a hand-back in `state` (0 asked, 2 contents on the way, 1 done) after elapsedMs of waitMs. 1 = this game
-   writes the box now (done, or the wait ran out - *timedOut = 1 only then, and the caller LOGS it: no silent loss), 0 = wait. */
-int OwnerArriveWait(int state, unsigned long elapsedMs, unsigned long waitMs, int* timedOut);
+/* OwnerArriveWait: a hand-back in `state` (0 asked, 2 contents on the way, 1 done). No clock ends it: it is done when the previous
+   writer's answer lands, or it ends with no answer when a new area map shows that writer gone from the box's area or from the world
+   (writerGone) or when the link is lost (linkLost) - *ended says which (kArriveEnd*; the caller LOGS an end with no answer: no
+   silent loss). 1 = this game writes the box now, 0 = wait. */
+enum { kArriveEndNone = 0, kArriveEndGone = 1, kArriveEndLink = 2 };
+int OwnerArriveWait(int state, int writerGone, int linkLost, int* ended);
+/* HandbackWriterGone, read from a new area map: prevSlot = the box's area holder when the hand-back asked (-1 = none but this game);
+   prevLoaded = that slot's loaded bit for the area now (1 / 0 / -1 no fresh map); holderNow = the area's holder now (-1 unknown);
+   othersLoaded = another game has the area loaded (1 / 0 / -1 no fresh map). 1 = no game is left that could answer with the box's
+   contents (only the game holding the area answers them). An unknown read is never "gone". */
+int HandbackWriterGone(int prevSlot, int prevLoaded, int holderNow, int othersLoaded);
 /* OwnerArriveApplies: the holder's contents replace the owner's stale copy only while the hand-back waits (state 0 or 2). A
-   done or timed-out hand-back keeps the owner's copy (the owner already writes it); such an answer is a LATE one, counted. */
+   done hand-back, or one ended with no answer, keeps the owner's copy (the owner already writes it); such an answer is a LATE one,
+   counted. */
 int OwnerArriveApplies(int state);
 /* inv7d fold (review-inv7d MED): SWAP OR RE-ASK. A contents answer (state 2) replaces the owner's copy only if the box is
    UNCHANGED SINCE THE ASK: askDigest = this game's own digest when it asked (askHave 0 = not recorded), liveDigest = the box

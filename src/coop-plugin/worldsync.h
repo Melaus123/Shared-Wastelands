@@ -227,6 +227,9 @@ void WorldsyncResendAsk(int streamSlot, int askerSlot, const std::vector<unsigne
    row's handle does not resolve to its object, the object is not in the engine's list of running characters, and the SPAWN's spot
    is loaded here (the engine's zone byte). MAIN THREAD. */
 bool WorldsyncCopyRowStale(unsigned int uid, float x, float y, float z);
+/* A character the engine gave a new handle, proven the same (spawn.cpp RehandleVerdict): its liveness rows take the new handle.
+   Returns the rows changed (0 = no liveness row holds a handle for it). MAIN THREAD. */
+int WorldsyncRenoteHandle(unsigned int uid, const void* obj, unsigned int index, unsigned int serial, unsigned int container, unsigned int stamp);
 /* T-758: CreateAt's just-built body sits at an address a row of ANOTHER uid (oldUid) still holds - that row is stale.  P034's
    stale-pointer step for it: liveness rows settled, mirror row marked destroyed, oldUid retired (RetireStaleUid) unless the registry
    names another object for it.  Returns 1 retired, 0 spared.  MAIN THREAD. */

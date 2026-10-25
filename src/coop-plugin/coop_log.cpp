@@ -586,9 +586,120 @@ bool QuietLogPass(swlogbudget::Gate* gate, const char* family, unsigned long lon
     return full;
 }
 
+namespace
+{
+    /* T-879: every ChangedLogSlot ChangedLogPass has seen, so QuietLogFlush(false) can write the lines they hold. Guarded by g_lock.
+       A slot past the table is not flushed; its changed lines still come. */
+    enum { kChangedSlots = 16 };
+    ChangedLogSlot* g_changedSlots[kChangedSlots];
+    int g_changedSlotCount = 0;
+
+    unsigned long long ChangedHash(const std::string& s)
+    {
+        unsigned long long h = 1469598103934665603ULL;   /* FNV-1a, 64 bit */
+        for (size_t i = 0; i < s.size(); ++i) { h ^= (unsigned char)s[i]; h *= 1099511628211ULL; }
+        return h;
+    }
+
+    /* Under g_lock: the slot joins the table QuietLogFlush(false) reads, once. */
+    void ChangedRegister(ChangedLogSlot* slot)
+    {
+        if (slot->registered != 0) return;
+        slot->registered = 1;
+        if (g_changedSlotCount < (int)kChangedSlots) g_changedSlots[g_changedSlotCount++] = slot;
+    }
+
+    /* Writes the newest line each slot held back since its last line, and forgets it (the slot's key is unchanged). */
+    void ChangedLogFlushHeld()
+    {
+        for (int i = 0; ; ++i)
+        {
+            std::string line;
+            bool more = false;
+            EnsureLock();
+            ::EnterCriticalSection(&g_lock);
+            try
+            {
+                more = i < g_changedSlotCount && i < (int)kChangedSlots;
+                if (more && g_changedSlots[i] != 0 && g_changedSlots[i]->held != 0) line.swap(*g_changedSlots[i]->held);
+            }
+            catch (...)
+            {
+                line.clear();
+            }
+            ::LeaveCriticalSection(&g_lock);
+            if (!more) break;
+            if (!line.empty()) DebugLog(line);
+        }
+    }
+}
+
+bool ChangedLogPass(ChangedLogSlot* slot, const std::string& key, const std::string& text)
+{
+    if (slot == 0) return true;
+    const unsigned long long h = ChangedHash(key);
+    bool write = true;
+    EnsureLock();
+    ::EnterCriticalSection(&g_lock);
+    try
+    {
+        ChangedRegister(slot);
+        if (slot->wrote != 0 && slot->keyHash == h)
+        {
+            write = false;
+            if (slot->held == 0) slot->held = new std::string();
+            slot->held->assign(text);
+        }
+        else
+        {
+            slot->wrote = 1;
+            slot->keyHash = h;
+            if (slot->held != 0) slot->held->clear();
+        }
+    }
+    catch (...)
+    {
+        write = true;   /* out of memory: write the line rather than lose it */
+    }
+    ::LeaveCriticalSection(&g_lock);
+    return write;
+}
+
+bool IntervalLogPass(ChangedLogSlot* slot, unsigned int gapMs, const std::string& text)
+{
+    if (slot == 0) return true;
+    const unsigned long now = ::GetTickCount();
+    bool write = true;
+    EnsureLock();
+    ::EnterCriticalSection(&g_lock);
+    try
+    {
+        ChangedRegister(slot);
+        if (slot->wrote != 0 && (unsigned long)(now - slot->lastMs) < (unsigned long)gapMs)
+        {
+            write = false;
+            if (slot->held == 0) slot->held = new std::string();
+            slot->held->assign(text);
+        }
+        else
+        {
+            slot->wrote = 1;
+            slot->lastMs = now;
+            if (slot->held != 0) slot->held->clear();
+        }
+    }
+    catch (...)
+    {
+        write = true;   /* out of memory: write the line rather than lose it */
+    }
+    ::LeaveCriticalSection(&g_lock);
+    return write;
+}
+
 void QuietLogFlush(bool periodic)
 {
     const unsigned int now = ::GetTickCount();
+    if (!periodic) ChangedLogFlushHeld();   /* T-879: the newest timed lines held back (SW_CHANGEDN / SW_INTERVALN), before the log ends or is read */
     if (periodic)
     {
         if (::InterlockedCompareExchange(&g_quietFlushSet, 1, 0) == 0) { ::InterlockedExchange(&g_quietFlushAt, (LONG)now); return; }

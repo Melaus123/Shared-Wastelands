@@ -332,6 +332,88 @@ inline int AnnounceDecide(bool anyOtherLoaded, bool mineLoaded, bool announcedTo
     if (a == kAnnUnload && anyOtherLoaded && !mineLoaded && otherInWorldLoaded && !handoverRefused) return kAnnHoldForHandover;
     return a;
 }
+/* A NON-PLAYER CHARACTER'S SQUAD, HELD BY ANOTHER GAME OR NOT - one answer per squad, shared by every member and every announce road
+   (worldsync.cpp AnnounceHeldByOther). The squad is held when its squad spot lies in an area another game holds (squadSpotHeld) or any
+   member's own spot does (memberHeld[i]). With neither, a member this game has announced keeps it held while it stands within
+   kAnnMemberMarginUnits of such an area (memberNear[i] && memberAnnounced[i]): a squad is announced when a member steps in and withdrawn
+   only once every member is that far out, so a member walking along an area's side does not withdraw and re-announce its squad each
+   second. *why = the test that decided (kAnnSqWhyNone when none did). The arrays may be 0 when n is 0. */
+enum { kAnnSqWhyNone = 0, kAnnSqWhySquad = 1, kAnnSqWhyMember = 2, kAnnSqWhyMargin = 3, kAnnSqWhyOwn = 4 };
+const float kAnnMemberMarginUnits = 300.0f;   /* 30 m at 10 world units a metre - a Guess; stays below an area's side (4608 units) */
+inline const char* AnnounceSquadWhyName(int w)
+{
+    return w == kAnnSqWhySquad ? "squad" : (w == kAnnSqWhyMember ? "member" : (w == kAnnSqWhyMargin ? "margin" : (w == kAnnSqWhyOwn ? "own" : "none")));
+}
+inline int AnnounceSquadHeld(int squadSpotHeld, int n, const int* memberHeld, const int* memberNear, const int* memberAnnounced, int* why)
+{
+    int w = squadSpotHeld ? (int)kAnnSqWhySquad : (int)kAnnSqWhyNone;
+    for (int i = 0; w == kAnnSqWhyNone && memberHeld != 0 && i < n; ++i) if (memberHeld[i]) w = kAnnSqWhyMember;
+    for (int i = 0; w == kAnnSqWhyNone && memberNear != 0 && memberAnnounced != 0 && i < n; ++i) if (memberNear[i] && memberAnnounced[i]) w = kAnnSqWhyMargin;
+    if (why) *why = w;
+    return w != kAnnSqWhyNone ? 1 : 0;
+}
+/* The spots the margin test reads: the four corners of the square of half-side `margin` around (x, z). A margin below an area's side
+   reaches at most one area further along each axis, so the corners' areas are every area within the margin. */
+inline void AnnounceMarginCorners(float x, float z, float margin, float* xs, float* zs)
+{
+    xs[0] = x - margin; zs[0] = z - margin; xs[1] = x + margin; zs[1] = z - margin;
+    xs[2] = x - margin; zs[2] = z + margin; xs[3] = x + margin; zs[3] = z + margin;
+}
+/* ONE ANSWER PER SQUAD PER GENERATION (the caller steps the generation at each road's start): a later member of the same squad in the
+   same generation gets the answer the first one got, whatever the road did meanwhile (an UNLOAD sent, an announce mark cleared). */
+struct AnnSquadMemoRow { unsigned long long gen; int held; int why; };
+typedef std::map<const void*, AnnSquadMemoRow> AnnSquadMemo;
+const size_t kAnnSquadMemoMax = 1024;
+inline int AnnSquadMemoGet(const AnnSquadMemo& m, const void* squad, unsigned long long gen, int* held, int* why)
+{
+    if (squad == 0) return 0;
+    AnnSquadMemo::const_iterator it = m.find(squad);
+    if (it == m.end() || it->second.gen != gen) return 0;
+    if (held) *held = it->second.held;
+    if (why) *why = it->second.why;
+    return 1;
+}
+/* Stores this generation's answer and answers the row's previous why (-1: no row). Past kAnnSquadMemoMax rows, the rows of older
+   generations make room. */
+inline int AnnSquadMemoPut(AnnSquadMemo* m, const void* squad, unsigned long long gen, int held, int why)
+{
+    if (m == 0 || squad == 0) return -1;
+    AnnSquadMemo::iterator it = m->find(squad);
+    const int prev = it == m->end() ? -1 : it->second.why;
+    if (it == m->end() && m->size() >= kAnnSquadMemoMax)
+        for (AnnSquadMemo::iterator e = m->begin(); e != m->end(); ) { if (e->second.gen != gen) m->erase(e++); else ++e; }
+    AnnSquadMemoRow r; r.gen = gen; r.held = held; r.why = why;
+    (*m)[squad] = r;
+    return prev;
+}
+/* WHO IS WALKED for a squad's answer: nobody when the squad's spot is held already (the answer is "held" whatever the members say);
+   every member when the reader holds them all; only the asking character when the engine's member count is above what was read
+   (count > stored) - the squad cannot be judged whole, so each member answers for itself and the answer is not kept per squad. */
+enum { kAnnWalkNone = 0, kAnnWalkSquad = 1, kAnnWalkSelf = 2 };
+inline int AnnounceSquadWalk(int squadSpotHeld, int count, int stored)
+{
+    if (squadSpotHeld) return kAnnWalkNone;
+    return count > stored ? (int)kAnnWalkSelf : (int)kAnnWalkSquad;
+}
+/* ONE MEMBER'S ROW for AnnounceSquadHeld. deadFlag: the engine's dead read (1 dead, 0 alive, -1 unreadable); spotRead: its own spot
+   was read; spotHeld / spotNear: that spot lies in / within the margin of an area another game holds; mine: this game runs its uid;
+   mark: its announce mark here (kAnnMarkNoRecord, an adopted uid with no mark yet, is taken as announced, as the 1 Hz pass takes it).
+   A dead member (a body stays in its squad's member list), one whose dead flag is unreadable, or one whose spot was not read does not
+   count; a knocked-out member is alive and counts. kAnnMemCounts fills the row: held, near (only for an announced member not inside),
+   announced. */
+enum { kAnnMarkNone = 0, kAnnMarkWithheld = 1, kAnnMarkAnnounced = 2, kAnnMarkNoRecord = 3 };
+enum { kAnnMemCounts = 0, kAnnMemDead = 1, kAnnMemDeadUnread = 2, kAnnMemNoSpot = 3 };
+inline int AnnounceMemberRow(int deadFlag, int spotRead, int spotHeld, int spotNear, int mine, int mark, int* held, int* nearOut, int* announced)
+{
+    if (deadFlag == 1) return kAnnMemDead;
+    if (deadFlag != 0) return kAnnMemDeadUnread;
+    if (!spotRead) return kAnnMemNoSpot;
+    const int ann = (mine && (mark == kAnnMarkAnnounced || mark == kAnnMarkNoRecord)) ? 1 : 0;
+    if (held) *held = spotHeld ? 1 : 0;
+    if (announced) *announced = ann;
+    if (nearOut) *nearOut = (!spotHeld && ann && spotNear) ? 1 : 0;
+    return kAnnMemCounts;
+}
 /* THE RELAYED-OWNER GATE for the six stream types whose session handler has no owner test of its own (it applies only to a
    copy this game holds - fine for the one session peer, not for any number of games): a relayed one is refused when this game
    runs the uid, or when the uid's recorded owner is another player. An unknown uid passes (CONTEXT arrives before SPAWN). */

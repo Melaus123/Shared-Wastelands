@@ -21,6 +21,10 @@
 // line says why until the selection or the squadmate changes. While the box is up, a word it shows that changes (the price, its
 // sum, the next price) or a squadmate who can no longer be picked closes it, and the caption line says so; money spent while
 // it is up is said only after its BRING BACK (the road refuses). The box is centred on the management window, inside it.
+// THE CAMERA ROAD: while this player has no living character (resurrect.cpp ResurrectCameraRoadOffered), the label reads "BRING
+// <NAME> BACK", there is no drop-down, the caption line reads "None of your characters is alive. <name> comes back where your
+// camera is looking." and BRING BACK takes ResurrectBringBackHere on the frame after the confirm, at the point the camera is
+// looking at then. The camera is never moved. A bring-back there shows no message line: the character appearing is the result.
 #include "fallentab.h"
 #include "resurrect.h"
 #include "playerstab.h"   /* PlayersTabItemPtr, MgmtTabsFit - the strip PLAYERS and FALLEN share */
@@ -93,6 +97,9 @@ unsigned long g_readMs = 0;
 std::vector<swtab::Row> g_rows;           /* the list's rows, newest first (the order they were added in = the list's index) */
 std::vector<swtab::Row> g_rowsEsc;        /* the same with their cells as the list holds them ('#' doubled) */
 std::vector<coop::FallenMate> g_mates;    /* the drop-down as shown */
+int g_camRoad = 0;                        /* the camera road: no living character of this player - no drop-down */
+int g_boxCam = 0, g_busyCam = 0;          /* the confirm box / the waiting bring-back is the camera road's (0 the squadmate road's) */
+long long g_camBacks = 0;                 /* bring-backs on the camera road (no message line) */
 unsigned int g_selUid = 0;                /* the selected row (the dead character's uid), 0 none */
 unsigned int g_mateUid = 0;               /* the picked squadmate, 0 none */
 size_t g_pickSet = MyGUI::ITEM_NONE;      /* the drop-down's position as this file last set or adopted it */
@@ -196,6 +203,7 @@ void ForgetTab()
 {
     g_tabs = 0; g_item = 0; g_list = 0; g_empty = 0; g_price[0] = g_price[1] = 0; g_caption = 0; g_label = 0; g_pick = 0; g_btn = 0;
     g_rows.clear(); g_rowsEsc.clear(); g_mates.clear(); g_pickSet = MyGUI::ITEM_NONE;
+    g_camRoad = 0;   /* a page made again fills its drop-down again */
     for (int k = 0; k < swtab::kPriceLines; ++k) g_shownPrice[k].clear();
     g_shownCaption.clear(); g_shownLabel.clear(); g_shownBtn.clear(); g_shownBtnOn = -1;
 }
@@ -353,11 +361,13 @@ bool SameMates(const std::vector<coop::FallenMate>& a, const std::vector<coop::F
     return true;
 }
 std::string MateName(unsigned int uid) { const int i = MateIndex(uid); return i >= 0 ? g_mates[(size_t)i].name : std::string(); }
+/* the picked entry's name: the squadmate ("" on the camera road, which picks nothing) */
+std::string PickName() { return g_camRoad ? std::string() : MateName(g_mateUid); }
 void DropBox()
 {
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     MyGUI::Widget* w = g_box;
-    g_box = 0; g_boxDead = 0; g_boxMate = 0; g_boxPrice = -1;
+    g_box = 0; g_boxDead = 0; g_boxMate = 0; g_boxPrice = -1; g_boxCam = 0;
     if (gui == 0 || w == 0) return;
     MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
     if (im != 0) { im->removeWidgetModal(w); im->resetKeyFocusWidget(); }
@@ -372,6 +382,8 @@ void ApplyView()
     swtab::ViewIn in;
     in.on = g_read.on; in.rows = (int)g_rows.size(); in.selected = sel >= 0 ? 1 : 0; in.mates = (int)g_mates.size();
     in.busy = g_busy; in.note = g_note; in.price = g_read.price; in.money = g_read.money; in.moneyRead = g_read.moneyRead; in.boxUp = g_box != 0 ? 1 : 0;
+    in.cameraRoad = g_camRoad;
+    in.atLimit = g_read.atLimit == 1 ? 1 : 0;
     const swtab::View v = swtab::ViewFor(in);
     const swtab::PriceLines pl = swtab::PriceLinesFor(g_read.on, g_read.amount, g_read.growth, g_read.alive);
     const std::string before = g_shownPrice[0] + " | " + g_shownPrice[1];
@@ -386,17 +398,18 @@ void ApplyView()
     std::string cap;
     if (v.caption == swtab::kCapSelect) cap = swtab::SelectLine();
     else if (v.caption == swtab::kCapBusy) cap = swtab::ProgressLine(g_busyName);
+    else if (v.caption == swtab::kCapCamera) cap = swtab::CameraRoadLine(selName);
     else if (v.caption == swtab::kCapRefusal)
     {
         /* the names the refusal was made with; the price and the purse as read now */
         if (v.refusal == g_note && g_note != swtab::kRefNone) cap = swtab::RefusalWords(g_note, g_noteName, g_noteMate, g_read.price, g_read.money);
-        else cap = swtab::RefusalWords(v.refusal, selName, MateName(g_mateUid), g_read.price, g_read.money);
+        else cap = swtab::RefusalWords(v.refusal, selName, PickName(), g_read.price, g_read.money);
     }
     if (cap != g_shownCaption) DebugLog("[FALLEN] tab caption line: '" + cap + "'" + (v.caption == swtab::kCapRefusal ? std::string(" (") + swtab::RefusalTag(v.refusal) + ")" : std::string()));
     SetText(g_caption, cap, &g_shownCaption);
-    SetText(g_label, v.pickShown ? swtab::BesideLabel(selName) : std::string(), &g_shownLabel);
+    SetText(g_label, v.pickShown ? (g_camRoad ? swtab::BackLabel(selName) : swtab::BesideLabel(selName)) : std::string(), &g_shownLabel);
     if (g_label->getVisible() != (v.pickShown != 0)) g_label->setVisible(v.pickShown != 0);
-    if (g_pick->getVisible() != (v.pickShown != 0)) g_pick->setVisible(v.pickShown != 0);
+    if (g_pick->getVisible() != (v.dropShown != 0)) g_pick->setVisible(v.dropShown != 0);   /* the camera road has no drop-down */
     if (g_pick->getEnabled() != (v.pickEnabled != 0)) g_pick->setEnabled(v.pickEnabled != 0);
     const std::string bc = swtab::ButtonCaption(g_read.on, g_read.price);
     if (bc != g_shownBtn) { g_shownBtn = bc; g_btn->setCaption(MyGUI::UString(bc.c_str())); }
@@ -446,6 +459,7 @@ void Refresh()
     coop::ResurrectTabRead(&g_read);
     std::vector<coop::FallenMate> mates;
     coop::ResurrectFreeMates(&mates);
+    const int camRoad = coop::ResurrectCameraRoadOffered();
     if (!swtab::SameRows(g_read.rows, g_rows))
     {
         g_list->removeAllItems();
@@ -466,6 +480,14 @@ void Refresh()
     const int at = sel;   /* the list's index is the row's (the order of adding), however a column head sorted it */
     if (at >= 0) { if (g_list->getIndexSelected() != (size_t)at) g_list->setIndexSelected((size_t)at); }
     else if (g_list->getIndexSelected() != MyGUI::ITEM_NONE) g_list->clearIndexSelected();
+    if (swtab::DropDownSwitched(g_camRoad, camRoad))
+    {
+        g_camRoad = camRoad;
+        g_mates.clear(); g_mateUid = 0;
+        g_pick->removeAllItems(); g_pickSet = MyGUI::ITEM_NONE;
+        DebugLog(std::string("[FALLEN] tab drop-down: ") + (camRoad ? "none - this player has no living character: the camera road" : "squadmates"));
+    }
+    if (camRoad) mates.clear();
     if (!SameMates(mates, g_mates))
     {
         g_pick->removeAllItems();
@@ -480,7 +502,9 @@ void Refresh()
     g_mates = mates;   /* the same entries; who is selected in the game is read fresh */
     if (g_box != 0)
     {
-        const std::string now = g_read.on ? swtab::BoxText(g_boxName, g_boxMateName, g_read.amount, g_read.growth, (int)g_read.alive.size(), g_boxSeto) : std::string();
+        const std::string now = !g_read.on ? std::string()
+                              : !g_boxCam ? swtab::BoxText(g_boxName, g_boxMateName, g_read.amount, g_read.growth, (int)g_read.alive.size(), g_boxSeto)
+                              : swtab::BoxTextCamera(g_boxName, g_read.amount, g_read.growth, (int)g_read.alive.size(), g_boxSeto);
         if (!g_read.on || now != g_boxText)
         {
             ++g_boxClosedByChange;
@@ -490,14 +514,22 @@ void Refresh()
             if (g_read.on) SetNote(swtab::kRefPriceChanged, name, mate, g_read.price, g_read.money);
             DebugLog("[FALLEN] tab confirm box closed: " + std::string(g_read.on ? "a word it shows changed (price " + S(was) + " -> " + S(g_read.price) + "): '" + now + "'" : "the host turned resurrection off"));
         }
-        else if (MateIndex(g_boxMate) < 0)
+        else if (g_boxCam ? !camRoad : MateIndex(g_boxMate) < 0)
         {
             ++g_boxClosedByChange;
             const std::string name = g_boxName, mate = g_boxMateName;
+            const int wasCam = g_boxCam;
             DropBox();
-            SetNote(swtab::kRefMateGone, name, mate, g_read.price, g_read.money);
-            DebugLog("[FALLEN] tab confirm box closed: '" + mate + "' can no longer be picked");
+            if (!wasCam) SetNote(swtab::kRefMateGone, name, mate, g_read.price, g_read.money);   /* the camera road's box: the squadmate road's states show */
+            DebugLog("[FALLEN] tab confirm box closed: " + (wasCam ? std::string("a character of this player is alive again - the camera road is no longer offered")
+                                                                   : "'" + mate + "' can no longer be picked"));
         }
+    }
+    if (g_camRoad)
+    {
+        SetPick(-1);   /* the camera road picks nothing */
+        ApplyView();
+        return;
     }
     int mi = MateIndex(g_mateUid);
     if (mi < 0 && !g_mates.empty())
@@ -603,10 +635,11 @@ void RowBody(size_t index)
     ClearNote();
     ++g_selects;
     ApplyView();
-    if (g_selUid != 0) DebugLog("[FALLEN] tab row selected: list index " + S((long long)index) + " uid " + S(g_selUid) + " '" + g_rows[(size_t)r].name + "' -> '" + swtab::BesideLabel(g_rows[(size_t)r].name) + "'");
+    if (g_selUid != 0) DebugLog("[FALLEN] tab row selected: list index " + S((long long)index) + " uid " + S(g_selUid) + " '" + g_rows[(size_t)r].name + "' -> '" + (g_camRoad ? swtab::BackLabel(g_rows[(size_t)r].name) : swtab::BesideLabel(g_rows[(size_t)r].name)) + "'");
 }
 void MateBody(size_t index)
 {
+    if (g_camRoad) return;   /* the camera road has no drop-down */
     g_mateUid = (index != MyGUI::ITEM_NONE && index < g_mates.size()) ? g_mates[index].uid : 0;
     ClearNote();
     ++g_matePicks;
@@ -619,7 +652,7 @@ void PressBody()
     ++g_presses;
     Refresh();   /* read live at the press */
     const int sel = swtab::RowOfUid(g_rows, g_selUid);
-    const int mi = MateIndex(g_mateUid);
+    const int mi = swtab::PressPick(g_camRoad, MateIndex(g_mateUid));
     if (sel < 0 || mi < 0 || g_shownBtnOn != 1)
     {
         ++g_pressGreyed;
@@ -627,12 +660,16 @@ void PressBody()
         return;
     }
     const swtab::Row& r = g_rows[(size_t)sel];
-    const coop::FallenMate& m = g_mates[(size_t)mi];
-    const std::string text = swtab::BoxText(r.name, m.name, g_read.amount, g_read.growth, (int)g_read.alive.size(), r.setoOrBigBo);
+    const bool inCam = g_camRoad != 0;
+    const unsigned int mateUid = inCam ? 0u : g_mates[(size_t)mi].uid;
+    const std::string pickName = inCam ? std::string() : g_mates[(size_t)mi].name;
+    const std::string text = inCam ? swtab::BoxTextCamera(r.name, g_read.amount, g_read.growth, (int)g_read.alive.size(), r.setoOrBigBo)
+                                   : swtab::BoxText(r.name, pickName, g_read.amount, g_read.growth, (int)g_read.alive.size(), r.setoOrBigBo);
     if (!OpenBox(text)) { DebugLog("[FALLEN] tab confirm box could NOT be made - nothing done"); return; }
-    g_boxDead = r.uid; g_boxMate = m.uid; g_boxPrice = g_read.price; g_boxName = r.name; g_boxMateName = m.name; g_boxText = text; g_boxSeto = r.setoOrBigBo;
+    g_boxDead = r.uid; g_boxMate = mateUid; g_boxPrice = g_read.price; g_boxName = r.name; g_boxMateName = pickName; g_boxText = text; g_boxSeto = r.setoOrBigBo;
+    g_boxCam = inCam ? 1 : 0;
     ++g_boxOpened;
-    DebugLog("[FALLEN] tab confirm box up for uid " + S(r.uid) + " beside uid " + S(m.uid) + " price " + S(g_read.price) + ": '" + text + "'");
+    DebugLog("[FALLEN] tab confirm box up for uid " + S(r.uid) + (inCam ? std::string(" where the camera is looking") : " beside uid " + S(mateUid)) + " price " + S(g_read.price) + ": '" + text + "'");
 }
 void BoxCancelBody()
 {
@@ -645,13 +682,17 @@ void BoxConfirmBody()
     const unsigned int dead = g_boxDead, mate = g_boxMate;
     const long long price = g_boxPrice;
     const std::string name = g_boxName, mateName = g_boxMateName;
+    const int cam = g_boxCam;
     DropBox();
-    if (dead == 0 || mate == 0) return;
+    const int road = swtab::ConfirmRoad(dead, mate, cam);
+    if (road == swtab::kConfirmNone) return;
     ++g_confirmed;
     g_busy = 1; g_busyDead = dead; g_busyMate = mate; g_busyPrice = price; g_busyName = name; g_busyMateName = mateName;
+    g_busyCam = road == swtab::kConfirmCamera ? 1 : 0;
     ClearNote();
+    DebugLog("[FALLEN] tab confirm box: BRING BACK confirmed for uid " + S(dead) + " '" + name + "' "
+             + (road == swtab::kConfirmCamera ? std::string("where the camera is looking") : "beside uid " + S(mate) + " '" + mateName + "'") + " at price " + S(price));
     ApplyView();   /* the progress line, the button greyed - the road runs on the next frame */
-    DebugLog("[FALLEN] tab confirm box: BRING BACK confirmed for uid " + S(dead) + " '" + name + "' beside uid " + S(mate) + " '" + mateName + "' at price " + S(price));
 }
 /* the confirmed bring-back, on the frame after the press: resurrect.cpp's road (the TEST lever's own) */
 void RunBringBack()
@@ -659,18 +700,27 @@ void RunBringBack()
     const unsigned int dead = g_busyDead, mate = g_busyMate;
     const long long price = g_busyPrice;
     const std::string name = g_busyName, mateName = g_busyMateName;
-    g_busy = 0;
-    const coop::BringBackOut out = coop::ResurrectBringBackFor(dead, mate, price);
+    const int cam = g_busyCam;
+    g_busy = 0; g_busyCam = 0;
+    const coop::BringBackOut out = cam ? coop::ResurrectBringBackHere(dead, price) : coop::ResurrectBringBackFor(dead, mate, price);
     const std::string nm = out.name.empty() ? name : out.name, mt = out.mate.empty() ? mateName : out.mate;
     if (out.ok)
     {
         ++g_broughtBack;
-        const std::string line = swtab::DoneLine(nm, mt, out.paid);
-        const int shown = coop::StoreShowPlayerLine(playerstab::EscapeHash(line));   /* '#' doubled, as every caption: never a colour code */
-        if (shown == 1) ++g_lineShown; else ++g_lineNotShown;
         if (g_selUid == dead) g_selUid = 0;
         ClearNote();
-        DebugLog("[FALLEN] tab brought back uid " + S(dead) + ": message line '" + line + "' " + (shown == 1 ? "shown" : "NOT shown (" + S(shown) + ")"));
+        if (cam)
+        {
+            ++g_camBacks;   /* no message line: the character appearing where the camera is looking is the result */
+            DebugLog("[FALLEN] tab brought back uid " + S(dead) + " where the camera is looking: no message line");
+        }
+        else
+        {
+            const std::string line = swtab::DoneLine(nm, mt, out.paid);
+            const int shown = coop::StoreShowPlayerLine(playerstab::EscapeHash(line));   /* '#' doubled, as every caption: never a colour code */
+            if (shown == 1) ++g_lineShown; else ++g_lineNotShown;
+            DebugLog("[FALLEN] tab brought back uid " + S(dead) + ": message line '" + line + "' " + (shown == 1 ? "shown" : "NOT shown (" + S(shown) + ")"));
+        }
     }
     else
     {
@@ -703,6 +753,7 @@ void TabChangedBody(MyGUI::TabControl* sender, size_t index)
     if ((int)index != OurIndex()) return;
     ++g_tabOpened;
     g_mateUid = 0;   /* each opening starts the drop-down on the character selected in the game (the page) */
+    ClearNote();     /* a refusal left from an earlier opening is not shown again; a note the read below sets stays */
     const long long rebuilt = g_rebuilds;
     if (!coop::EngineWritesBlocked()) Refresh();
     if (g_rebuilds == rebuilt) LogTable();
@@ -717,7 +768,7 @@ void OnTabChanged(MyGUI::TabControl* sender, size_t index) { __try { TabChangedC
 void TickBody()
 {
     if (!coop::GameplayRunning() || coop::EngineWritesBlocked()) return;
-    if (g_busy) RunBringBack();
+    if (g_busy) RunBringBack();   /* a confirmed bring-back, on the frame after its confirm */
     if (g_uiDead) return;
     if (g_item != 0)
     {
@@ -779,7 +830,8 @@ std::string LeverBody(const std::string& args)
     }
     if (l.kind == swtab::kLeverMate)
     {
-        if (!Reachable(g_pick) || l.n >= (int)g_mates.size()) { DebugLog("[FALLEN] tab lever" + args + " REFUSED: the squadmate list is not on screen or has no such entry (" + S((long long)g_mates.size()) + ")"); return "error resurrect tab no-mate"; }
+        const size_t entries = g_camRoad ? 0 : g_mates.size();   /* the camera road: no drop-down */
+        if (!Reachable(g_pick) || l.n >= (int)entries) { DebugLog("[FALLEN] tab lever" + args + " REFUSED: the drop-down is not on screen or has no such entry (" + S((long long)entries) + ")"); return "error resurrect tab no-mate"; }
         g_pick->setIndexSelected((size_t)l.n);   /* where a mouse pick leaves the box; read back as each frame does */
         AdoptPick();
         return "ok resurrect tab mate";
@@ -806,6 +858,7 @@ void FallenTabForgetWorld()
 {
     g_refusedThisWorld = 0;
     g_rows.clear(); g_rowsEsc.clear(); g_mates.clear(); g_selUid = 0; g_mateUid = 0; g_pickSet = MyGUI::ITEM_NONE; ClearNote(); g_busy = 0;
+    g_camRoad = 0; g_busyCam = 0;   /* a world gone ends the camera road's bring-back in flight */
     g_read = FallenTabRead(); g_readMs = 0;
     for (int k = 0; k < swtab::kPriceLines; ++k) g_shownPrice[k].clear();
     g_shownCaption.clear(); g_shownLabel.clear(); g_shownBtn.clear(); g_shownBtnOn = -1;
@@ -828,6 +881,7 @@ void ReportFallenTab()
              + " boxClosedByChange=" + S(g_boxClosedByChange) + " confirmed=" + S(g_confirmed) + " broughtBack=" + S(g_broughtBack)
              + " refused[" + ref + " messageLine[shown,not]=" + S(g_lineShown) + "," + S(g_lineNotShown)
              + " rebuilds=" + S(g_rebuilds) + "," + S(g_mateRebuilds) + " tabEvents=" + S(g_tabEvents) + " looks=" + S(g_looks)
+             + " camRoad=" + S(g_camRoad) + " camBacks=" + S(g_camBacks)
              + " faults=" + S(g_faults) + " throws=" + S(g_throws));
 }
 

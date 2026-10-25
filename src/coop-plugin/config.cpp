@@ -63,6 +63,7 @@ int g_relayTestMode = 0; unsigned short g_relayTestPort = 0; int g_relayLagMs = 
 int g_relayTestCap = 0, g_relayTestDials = 0;   /* TEST ONLY: relaytest=many's cap and dials */
 int g_relayBridgeMode = 0; unsigned short g_relayBridgePort = 0, g_relayViaPort = 0; int g_relayCap = 0;   /* relaybridge= / relayvia= / relaycap= */
 int g_parityHoldSec = 0;                    /* T-734 TEST ONLY: parityholdsec= */
+int g_benchCapKbs = 0, g_netRateLog = 0;    /* TEST ONLY: benchcapkbs= / netratelog= */
 std::string g_sweepSkip;                    /* TEST ONLY: sweepskip= */
 std::string g_slotProfile;                   /* prof1 fold (review-prof1 4): the picked profile's save folder - a re-arm keeps it over the file's slot= */
 std::string g_slotFile;                      /* T-201 PP5: the settings' own slot= as last armed - what ConfigLeave puts back when the profile's folder goes */
@@ -461,6 +462,8 @@ unsigned short ConfigRelayViaPort()    { return g_relayViaPort; }
 int            ConfigRelayCap()        { return g_relayCap; }
 int            ConfigParityHoldSec()   { return g_parityHoldSec; }
 std::string    ConfigSweepSkip()       { return g_sweepSkip; }
+int            ConfigBenchCapKbs()     { return g_benchCapKbs; }
+int            ConfigNetRateLog()      { return g_netRateLog; }
 void           ConfigSetSlotForProfile(const std::string& slot) { g_slot = slot; g_slotProfile = slot; }
 std::string    ConfigPlayerId()  { EnsurePlayerId("asked for before one existed"); return g_playerId; }
 
@@ -870,6 +873,12 @@ static int ConfigReadFileInto(std::string* whyOut)
     if (fields.sweepSkip != g_sweepSkip && !fields.sweepSkip.empty())
         DebugLog("[CFG] TEST ONLY: sweepskip=" + fields.sweepSkip + " - the T-300 arrival sweep leaves alone every record whose id starts with that text");
     g_sweepSkip = fields.sweepSkip;
+    if (fields.benchCapKbs != g_benchCapKbs && fields.benchCapKbs != 0)
+        DebugLog("[CFG] TEST ONLY: benchcapkbs=" + N((long long)fields.benchCapKbs) + " - ENet's bandwidth limit on this game's links is "
+                 + N((long long)fields.benchCapKbs) + " KB/s in and out, from the next connection (ENet links only - Steam links are not capped)");
+    if (fields.netRateLog != g_netRateLog && fields.netRateLog != 0)
+        DebugLog("[CFG] TEST ONLY: netratelog=1 - each Steam link logs a [net] RATE line once a second");
+    g_benchCapKbs = fields.benchCapKbs; g_netRateLog = fields.netRateLog;
     g_modSalt   = fields.modSalt;
     g_ownSaveCfg = fields.ownSave;   /* mmo1 */
     if (fields.routerPort != g_routerPortCfg)

@@ -144,6 +144,20 @@ inline int Candidates(const Keeper* ks, int n, int only, int* kOut, int* pOut, i
     return got;
 }
 
+/* T-608 T1389: WHICH PURCHASE `buytest keeper` MAKES, from its mode words (command_channel.cpp). kFormPlayer = the player's
+   right-click (buy, sell, sell pack - every form before T1389, unchanged); kFormNpc = `npc [stack]`: Inventory::buyItem, the NPC
+   purchase path, through the NPC purchase gate; kFormBad = usage. npc goes only with a buy, stack only with npc, pack only with
+   sell; exactly two key tokens (`keeper` and the pick); a bad cats= is usage. */
+const int kFormBad = 0, kFormPlayer = 1, kFormNpc = 2;
+inline int KeeperForm(int nArgs, int npc, int stack, int sell, int pack, int catsBad)
+{
+    if (nArgs != 2 || catsBad != 0) return kFormBad;
+    if (pack != 0 && sell == 0) return kFormBad;
+    if (npc != 0) return (sell == 0) ? kFormNpc : kFormBad;
+    if (stack != 0) return kFormBad;
+    return kFormPlayer;
+}
+
 }   // namespace keeperaim
 
 #endif

@@ -1872,7 +1872,10 @@ void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolve
         else { ++g_killNoEffect; DebugLog("[WS] '" + sid + "' DEAD twin=" + N(isTwin) + ": the engine's declareDead ran but the map still reads " + N(afterKill)); }
         return;
     }
-    if (own == kOwnMine)
+    /* A state that arrives before this world's record-feed snapshot is applied is the world's opening data: what this game
+       holds for the character then is only its save's, so the world server's answer is written below like any unowned one.
+       The snapshot's own page-end marker sets the flag after its page's states are applied (store.cpp StoreFeedMarkerApply). */
+    if (own == kOwnMine && StoreSnapshotApplied() != 0)
     {
         // E20 - OURS, LOADED, AND THE MESSAGE IS NOT A DEATH. Our engine is the truth for this character, so the
         // notebook's answer is refused. Refusing alone is not enough: for an alive, free, non-player-faction unique

@@ -22,6 +22,14 @@
  * one stands. Worst case per copy: (1 + kMaxRearms) give-ups' worth of placements, each give-up itself capped (3 tries
  * or 3 strikes) and every placement under the 5-per-60-s rate cap.
  *
+ * T-986 floorplace: A GIVE-UP ALSO ENDS WHEN THE OWNER MOVES. The owner's point is stored at the give-up; once it has moved
+ * kCatchupEnter (20) units or more from there, the copy is tried again (GiveUpLift) - a new target is a new question, and
+ * a timer alone left a copy 300 units behind its walking owner (T1431). That lift spends no timed re-arm, and it applies
+ * after the last one too, so the count above bounds a STANDING owner's copy only. T-986 floorplace fold: for a moving
+ * owner, the distance doubles with each such lift since a placement of the copy last held (MoveLiftDist: 20, 40, 80, 160,
+ * then 160), so an owner pacing in a small area stops lifting a copy whose placements keep failing, and an owner walking
+ * away lifts it at most once per 160 units walked; every placement still keeps the 5-per-60-s rate cap (F189's guard).
+ *
  * C++03 (VS2010 v100): no auto, no nullptr, no range-for.
  */
 #ifndef COMMON_COPYJUDGE_H
@@ -105,6 +113,56 @@ inline bool RearmDue(int rearmsDone, int windowsSinceGaveUp)
 inline bool RearmLeft(int rearmsDone)
 {
     return RearmWaitWindows(rearmsDone) >= 0;
+}
+
+/* T-986 floorplace: how a given-up copy's give-up ends at a judged window edge. ownerPointStored = the owner's point was
+   stored at the give-up (an owner sample had been heard); ownerMovedSq = squared distance from that point to the owner's
+   point now; liftDist = how far the owner must have moved (MoveLiftDist). The owner's move comes first, so a timed re-arm
+   is spent only on a standing owner. A distance that is not a finite number never lifts by the owner's move.
+   T-986 floorplace fold: the distance is 3D on purpose - an owner who climbed or went down a floor at the same x,z puts its
+   copy's placement target on another floor, which is a new question (T-986's subject), not a standing owner. */
+const int kLiftNone = 0;
+const int kLiftTimer = 1;
+const int kLiftOwnerMoved = 2;
+inline int GiveUpLift(int rearmsDone, int windowsSinceGaveUp, bool ownerPointStored, float ownerMovedSq, float liftDist)
+{
+    if (ownerPointStored && liftDist > 0.0f && ownerMovedSq < 3.0e38f && ownerMovedSq >= liftDist * liftDist)
+        return kLiftOwnerMoved;
+    if (RearmDue(rearmsDone, windowsSinceGaveUp)) return kLiftTimer;
+    return kLiftNone;
+}
+
+/* T-986 floorplace fold: how far the owner must move for the next owner-moved lift. It doubles with each owner-moved lift
+   since a placement of the copy last held (moveLifts; zeroed when a placement's strike watch closes with no strike):
+   base, 2x, 4x, 8x, then 8x. Capped at 8x (160 for base 20): below the far placement's 250-unit distance, so an owner who
+   walks off far enough to leave its copy a far-placement case always lifts it (T1431's 300-unit loss), however many lifts
+   failed before; uncapped, a copy whose placements failed a few times would wait on its owner walking kilometres. With the
+   cap, a copy whose placements always fail is placed at most 3 times per 160 units its owner walks (plus the timed re-arms). */
+const int kMoveLiftMaxDoublings = 3;
+inline float MoveLiftDist(int moveLifts, float baseDist)
+{
+    float d = baseDist;
+    for (int i = 0; i < moveLifts && i < kMoveLiftMaxDoublings; ++i) d *= 2.0f;
+    return d;
+}
+
+/* T-986 s: A PLACED COPY'S DRIVE WAITS FOR THE PLACEMENT TO SHOW. The engine's teleport shows a few frames later (P157, T1436:
+   f5-f13), and a drive that steered from the stale pre-teleport position in between pushed the copy past the point it was
+   placed at - landing it as far beyond as it had been short (Confirmed). So after a catch-up placement the drive is held until
+   the copy's flat position has moved more than kPlaceLandedFlat from its pre-placement spot (x/z shows at once; the height
+   later - T1434), or kPlaceHoldSec of running game has passed (a placement that moves it less, or does not show).
+   posOk: the position was read; movedFlatSq: squared flat distance from the pre-placement spot (not a number = not moved);
+   secSince: seconds of running game since the placement (not a number = release now). */
+const float  kPlaceLandedFlat = 0.5f;
+const double kPlaceHoldSec    = 1.0;
+const int kPlaceHeld     = 0;   /* hold: no steer, no path issue, no window, no strike */
+const int kPlaceLanded   = 1;   /* it moved: release, the progress window starts from here */
+const int kPlaceTimedOut = 2;   /* the bound passed: release */
+inline int PlaceHold(bool posOk, float movedFlatSq, double secSince)
+{
+    if (posOk && movedFlatSq < 3.0e38f && movedFlatSq > kPlaceLandedFlat * kPlaceLandedFlat) return kPlaceLanded;
+    if (!(secSince < kPlaceHoldSec)) return kPlaceTimedOut;
+    return kPlaceHeld;
 }
 
 } // namespace copyjudge

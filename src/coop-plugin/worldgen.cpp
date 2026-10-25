@@ -12,7 +12,8 @@
 
 #include "worldgen.h"
 #include "playerfaction.h"   /* T-230: IsPlayerFaction - the player's own starting squad passes the leaf gate */
-#include "../common/orphanpurge.h"   /* orphan1: the leaf gate's unlinked arm (LeafUnlinked) */
+#include "../common/orphanpurge.h"   /* the leaf gate's answers (LeafLinked, LeafCreationRefused) */
+#include "config.h"     /* RoleIsSingle - a single-player game creates its own people everywhere */
 #include "items.h"      /* PROBE P072: ObjectPositionKey (any thread, no allocation) */
 #include "store.h"      /* PROBE P072: StoreMainThreadId; M11 C1: PlayersPresent, StorePresenceTick */
 #include "../common/presence.h"   /* M11 C1: is another player in this world - the old link or the roster (PresenceDecide) */
@@ -116,9 +117,9 @@ const LONG kGenLeaf = 2;   // ONLY createRandomCharacter gated - the clean arm. 
                            // AREA-GATED: characters are created where this game holds the area and
                            // refused where another player holds it (decisions 25/31(b) (creation); with no fresh map every game refuses - P97 retired decision 33's no-map fallback).
 // AUD 2026-09-17: LEAF IS THE DEFAULT ON EVERY GAME (decision 48: the game that holds the area generates it).
-// The harness used to send `worldgen leaf` to the client only - a host-centred leftover. A game with no
-// session is still its own world: the `g_wgLinkedCached == 0` arm in LeafGatedAt below lets everything
-// through, so single-player is unchanged. `worldgen on` is the ungated control.
+// The harness used to send `worldgen leaf` to the client only - a host-centred leftover. A single-player
+// game is its own world: LeafGatedAt's single-player arm below lets everything through. A game in a
+// multiplayer world, alone in it or not, takes the area rule. `worldgen on` is the ungated control.
 volatile LONG g_worldGenOn = kGenLeaf;
 
 // The leaf is gated in both suppressing modes; the upstream three only in `off`.
@@ -151,16 +152,12 @@ bool LeafGated()     { return g_worldGenOn == kGenOff || g_worldGenOn == kGenLea
    bounded no-map wait's counter that replaced it is RETIRED too - with no fresh area map every game refuses, so
    g_leafGatedNoMap (printed as leafRefusedNoMap) is "no fresh map, refused" and nothing else, and the report
    token allowedNoMapFallback is gone: a readout writes ABSENT for it and not zero. */
-volatile LONG64 g_leafAllowedArea = 0, g_leafGatedHeld = 0, g_leafGatedNoMap = 0, g_leafAllowedUnlinked = 0;
+volatile LONG64 g_leafAllowedArea = 0, g_leafGatedHeld = 0, g_leafGatedNoMap = 0, g_leafAllowedSingle = 0;
 /* P6j (verify-p6c MEDIUM-2): the leaf gate's teardown refusal, which used to land in gatedNotMine below - the engine
    freeing the world reported as "no player holds this area", in the one counter that is supposed to size how often
    decision 37 refuses a genuinely unclaimed area. Its own number. */
 volatile LONG64 g_leafGatedTeardown = 0;
-/* orphan1 (T420/T426, decision 37): refused while the game link was down because the LIVE notebook map names another game
-   the holder of the area. Its own number - allowedUnlinked keeps meaning "no link, allowed". */
-volatile LONG64 g_leafGatedHeldUnlinked = 0;
 volatile LONG64 g_leafGatedOtherLoaded = 0;   /* decision 37 (was decision 35): gated because this game does NOT hold the area, while no other player holds it either - a different fact from "another player holds it", and it must not hide inside that number. The identifier keeps its P5f name so an old log still reads; the report label is gatedNotMine. */
-volatile long g_wgLinkedCached = 0;   /* P5c: net::SessionLinked is a virtual call on a transport the main thread deletes (towngen.cpp:40); workers read this, refreshed on the tick.  P8e (audit C4): g_wgHostCached went with the gate's host term - it had one reader and it was that gate, and a dead role read left beside the lines being rewritten is the review-p8a M-4 mistake. */
 // PROBE-START: P116 - leaf no-map refusal follow-up
 /* .modding/04-probes.md P116 (Related: P97).  QUESTION: does a squad woken empty during a notebook outage get
    refilled after the area map returns?  The leaf gate's no-map refusal runs on any thread (the character factory
@@ -235,6 +232,7 @@ void P116Tick()   /* MAIN THREAD (WorldGenTick) */
         if (::InterlockedCompareExchange(&r.ready, 1, 1) != 1 || r.world != w || r.stage >= 3) continue;
         if (r.stage == 0)
         {
+#ifdef SW_DEV_BUILD   /* T-879 F: P116 is a DEV probe - its lines are the test build's only; the stages still advance */
             const int m = P116Members(r.owner);
             std::ostringstream o;
             o << "[PROBE] P116 refusal phase=" << (i >= kP116Half ? "later" : "load") << " n=" << (long)r.nth << " world=" << (long)w << " sector=" << r.sx << "," << r.sy
@@ -243,6 +241,7 @@ void P116Tick()   /* MAIN THREAD (WorldGenTick) */
             if (m < 0) o << "none"; else o << m;
             o << " thread=" << (r.tid == mainTid ? "main" : "worker");
             DebugLog(o.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
             r.stage = 1;
         }
         if (r.stage == 1)
@@ -250,12 +249,15 @@ void P116Tick()   /* MAIN THREAD (WorldGenTick) */
             coop::Sector s; s.x = r.sx; s.y = r.sy;
             if (coop::HeldByOtherTS(s) < 0) continue;
             r.freshAt = now; r.stage = 2;
+#ifdef SW_DEV_BUILD   /* T-879 F: P116 - test build only */
             std::ostringstream o;
             o << "[PROBE] P116 map back n=" << (long)r.nth << " world=" << (long)w << " sector=" << r.sx << "," << r.sy << " followUpIn=60s";
             DebugLog(o.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
         }
         if (r.stage == 2 && (unsigned long)(now - r.freshAt) >= kP116FollowMs)
         {
+#ifdef SW_DEV_BUILD   /* T-879 F: P116 - test build only */
             const int m = P116Members(r.owner);
             std::ostringstream o;
             o << "[PROBE] P116 follow-up phase=" << (i >= kP116Half ? "later" : "load") << " n=" << (long)r.nth << " world=" << (long)w << " sector=" << r.sx << "," << r.sy
@@ -263,6 +265,7 @@ void P116Tick()   /* MAIN THREAD (WorldGenTick) */
             if (r.owner == 0) o << "noOwner"; else if (m < 0) o << "gone"; else o << m;
             o << " refusalsThisWorld=" << (long)::InterlockedCompareExchange(&g_p116Refusals, 0, 0);
             DebugLog(o.str());
+#endif   /* SW_DEV_BUILD - T-879 F */
             r.stage = 3;
         }
     }
@@ -272,17 +275,9 @@ static bool LeafGatedAt(const coop::Sector& s, void* p116Owner = 0, void* p116Ca
 {
     if (g_worldGenOn == kGenOff) return true;
     if (g_worldGenOn != kGenLeaf) return false;
-    if (g_wgLinkedCached == 0)
-    {
-        /* orphan1 (T420/T426, decision 37): "no game link" is NOT "no notebook". T420: A created 65 people in B-held 43,11
-           while B reloaded, with the notebook up and naming B the holder the whole time; after link-up nobody announced
-           them (decision 33) and nothing removed them. The shortcut now asks the notebook map first, through the SAME
-           thread-safe cache the linked arm reads: HeldByOtherTS = zones.cpp's g_hostHeld grid under g_heldLock, filled by
-           the notebook's AREAMAP and fresh for 5 s. -1 (no live map: true solo / offline play) and 0 (unclaimed, or
-           this game's) keep the old answer - allowed; 1 (another game holds it) is refused. */
-        if (coopor::LeafUnlinked(coop::HeldByOtherTS(s)) == coopor::kLeafGatedHeldUnlinked) { InterlockedIncrement64(&g_leafGatedHeldUnlinked); return true; }
-        InterlockedIncrement64(&g_leafAllowedUnlinked); return false;   /* review-p4z HIGH-1: a game with no session is its own world (P5c: the cached flag, this runs on worker threads) */
-    }
+    /* A single-player game (no multiplayer world at all) creates its own people everywhere. Any game in a multiplayer world -
+       alone in it or not - takes the area rule below: with no fresh map nobody creates until the world server is back. */
+    if (coop::RoleIsSingle()) { InterlockedIncrement64(&g_leafAllowedSingle); return false; }   /* RoleIsSingle: any thread */
     /* decision 37: the gate is "does the relay name THIS game the holder of this area". An area nobody holds is refused too -
        it is claimed by the first game to report it, and inventing into it from a distance is what duplicated a town (F514c). */
     /* review-p5g Q5: ONE locked read - the gate's decision and the counter that says WHY come from the same view (the cause
@@ -584,22 +579,13 @@ bool detour_checkForRepopulateTown(ZoneManager* self, Town* t)
 
 namespace coop {
 
-// P5c - MAIN THREAD. Refresh the session flags the leaf gate reads. `LeafGatedAt` runs on the
-// engine's character-factory worker threads, and net::SessionLinked() is a virtual
-// call on a transport the main thread deletes (towngen.cpp:40 pays for the same lesson). Same
-// shape as TownGenTick: an interlocked write here, a plain read there.
+// MAIN THREAD, every frame: the presence answers copied for every thread (StorePresenceTick).
 void WorldGenTick()
 {
-    StorePresenceTick();   /* M11 C1: the roster's presence answers, copied for every thread, once a frame (before the line below reads them) */
-    /* M11 C1 (T-197, to-do M11): g_wgLinkedCached = ANOTHER PLAYER IS IN THIS WORLD - the old link up, or this link's PLAYERS roster
-       shows another slot IN_WORLD. With the old link alone a world-road game took LeafGatedAt's lone-game arm and invented towns
-       beside another game doing the same. No roster and no old link = alone, as before. */
-    ::InterlockedExchange(&g_wgLinkedCached, coop::PlayersPresent(mppresence::kSiteWorldGen) ? 1 : 0);
+    StorePresenceTick();   /* the roster's presence answers, copied for every thread, once a frame */
     /* P8e (audit C4): the SessionIsHost refresh is gone with the gate term that read it. */
     P116Tick();   /* PROBE P116 */
 }
-/* orphan1: the leaf gate's unlinked refusals, for the [P033] REPORT orphan[] token (declared in spawn.h). */
-long long WorldGenGatedHeldUnlinked() { return (long long)g_leafGatedHeldUnlinked; }
 
 // F322 - destroy a local object through the engine's own path.
 //
@@ -675,14 +661,14 @@ void ReportWorldGen()
              + " populateBuilding=" + S(g_populateBld)
              + " repopulateTown=" + S(g_repopTown) + " repopForced=" + S(g_repopForced)
              + " | blockedChar=" + S(g_blkChar) + " charPlayerPass=" + S(g_charPlayerPass)
-             + " leafArea[allowed,gatedHeld,gatedNotMine,leafRefusedNoMap,allowedUnlinked,gatedTeardown]=" + S(g_leafAllowedArea)
+             + " leafArea[allowed,gatedHeld,gatedNotMine,leafRefusedNoMap,allowedSingle,gatedTeardown]=" + S(g_leafAllowedArea)
              + "," + S(g_leafGatedHeld) + "," + S(g_leafGatedOtherLoaded) + "," + S(g_leafGatedNoMap)
-             + "," + S(g_leafAllowedUnlinked) + "," + S(g_leafGatedTeardown)
+             + "," + S(g_leafAllowedSingle) + "," + S(g_leafGatedTeardown)
              + " blockedCharForBuilding=" + S(g_blkCharForBld)
              + " blockedPopulate=" + S(g_blkPopulate)
              + " deferredPopulate=" + S(g_deferPopulate)   /* T-392: residents set aside by the gate (each re-offer that sets it aside again counts again). T-438: at load the engine call still ran (faction, furniture) with its squads set aside */
              + " blockedRepop=" + S(g_blkRepop)
-             + P072ReportToken()   /* PROBE P072 */
+             + P072ReportToken()   /* PROBE P072 - this [P032] REPORT is a SW_DEVLOG line, built in the test build only (T-879 E) */
              // P038 / F319. `destroySeen` climbing proves the hook is live at all; `destroyOurs`
              // is the number that matters - how many of the engine's destructions concerned a
              // character we were still holding a pointer to. If `destroyOurs` is 0 across a whole
@@ -777,7 +763,7 @@ void InstallWorldGen()
     {
         coop::HookStatus s = coop::AddHook((void*)dy, (void*)&detour_destroy,
                                                     (void**)&orig_destroy);
-        DebugLog(s == coop::SUCCESS ? "[P038] GameWorld::destroy AddHook SUCCESS - a destroyed"
+        SW_DEVLOG_OR_FAIL(s != coop::SUCCESS, s == coop::SUCCESS ? "[P038] GameWorld::destroy AddHook SUCCESS - a destroyed"
                                            " character is now withdrawn AT THE MOMENT it dies,"
                                            " instead of whenever the sampled handle check next"
                                            " reaches its row"
@@ -817,7 +803,9 @@ void InstallWorldGen()
     }
     else ErrorLog("[P032] checkForRepopulateTown resolved to 0");
 
-    P072Install((unsigned long long)imgBase);   /* PROBE P072 */
+#ifdef SW_DEV_BUILD
+    P072Install((unsigned long long)imgBase);   /* PROBE P072 (test build only, T-879 E) */
+#endif
 }
 
 } // namespace coop
@@ -832,6 +820,7 @@ void InstallWorldGen()
 namespace {
 unsigned long long kP072SetupRva = 0; static coop::AddrReg kP072SetupRva_reg("Building_prepareLevel", &kP072SetupRva);   /* Steam_1.0.65 0x5516B0 */
 unsigned long long kP072LoadRva  = 0; static coop::AddrReg kP072LoadRva_reg("BuildingInterior_toggleLoaded", &kP072LoadRva);   /* Steam_1.0.65 0x561750 */
+#ifdef SW_DEV_BUILD   /* T-879 E: the probe's detours, ring and lines are the test build's only; the two address registrations above stay in both builds */
 
 typedef void (*P072SetupFn)(void* bld, void* faction, void* squad, const void* layoutInt, const void* layoutExt);
 typedef void (*P072LoadFn)(void* interior, bool on);
@@ -1067,7 +1056,7 @@ void P072Tick()
             line = "[P072] load key=" + key + " on=" + S((long long)r->on) + " zone=" + P072Zone(r)
                  + " thread=" + thr + " layout='" + r->a + "' already=" + S((long long)r->already)
                  + " mapped=" + S((long long)r->mapped) + " int=" + H((unsigned long long)r->interior);
-        DebugLog(line);
+        SW_DEVLOG(line);   /* T-879: the setup / load lines are test-build only (P072 is a DEV probe); the ring and its counts are unchanged */
         InterlockedExchange(&r->seq, g_p072Tail + kP072Ring);
         ++g_p072Tail;
     }
@@ -1080,4 +1069,7 @@ std::string P072ReportToken()
          + " p072Lines=" + S((long long)lines);
 }
 } // namespace coop
+#else
+} // namespace
+#endif   /* SW_DEV_BUILD - T-879 E */
 // PROBE-END: P072

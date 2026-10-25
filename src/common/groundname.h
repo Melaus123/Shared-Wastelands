@@ -478,6 +478,23 @@ inline int IdKindGet(const std::vector<char>& b, size_t* at, int* kind, std::str
     return 1;
 }
 
+/* ---- made during play, on the wire ----
+   ITEM_MOVE with owner uid 0 and ITEM_REQUEST with owner uid 0, right after the id kind: u8 made - 1 = the item was made during
+   play on the game where it is real (Item+0x1A0 == 0xB; groundrec.h kGrMade), 0 = not, or not known. Any other value refuses the
+   message. A storage box's move or request carries 0. */
+inline void MadePut(std::vector<char>* b, int made) { b->push_back((char)(unsigned char)(made != 0 ? 1 : 0)); }
+/* 1 = read (*at moved past it); 0 = cut, or a value other than 0 / 1 (*made 0, *at unchanged) */
+inline int MadeGet(const std::vector<char>& b, size_t* at, int* made)
+{
+    *made = 0;
+    if (*at >= b.size()) return 0;
+    const int v = (int)(unsigned char)b[*at];
+    if (v != 0 && v != 1) return 0;
+    *made = v;
+    *at += 1;
+    return 1;
+}
+
 /* ---- the removed-name memory ---- */
 struct GoneRow { int used; int named; unsigned int at; char name[coopground::kGroundKeyCap]; };
 struct GoneMemory { GoneRow row[kGoneCap]; int head; long long overwritten; };
@@ -519,6 +536,19 @@ inline int GoneHas(const GoneMemory& m, const char* name, unsigned int now)
         if (d >= 0 && d <= nearMax) nearHit = 2;
     }
     return nearHit;
+}
+/* T-697 step 2 fold 2 (item 3): 1 = `name` ITSELF (an exact name, never the near-unnamed answer 2) left within kGoneKeepMs; *at
+   (may be 0) when. A record apply asks it with the time its record arrived: only a name that left AFTER that is "gone" for the row. */
+inline int GoneExactAt(const GoneMemory& m, const char* name, unsigned int now, unsigned int* at)
+{
+    if (name == 0 || name[0] == 0) return 0;
+    for (int i = 0; i < kGoneCap; ++i)
+    {
+        const GoneRow& r = m.row[i];
+        if (r.used == 0 || (unsigned int)(now - r.at) > kGoneKeepMs) continue;
+        if (NameStrEq(r.name, name) != 0) { if (at) *at = r.at; return 1; }
+    }
+    return 0;
 }
 /* THE HOLDER'S ANSWER when a TAKE's name matches nothing on its ground: "not found" (the requester's copy goes) only when the item
    is known to have left; otherwise "name not known here" (asked again, then kept - never removed). */

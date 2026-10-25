@@ -123,6 +123,15 @@ inline unsigned int BytesPerSec(unsigned int bytesInWindow, unsigned int windowM
     return (v > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (unsigned int)v;
 }
 
+/* A visit that takes the 'another game writes this group' mark off (this game now runs most of its people, or holds its area and runs
+ * some of them): the group is marked changed, so it is written within the dirty gap instead of at its next floor turn (up to a full
+ * period), and the bytes this game last sent are forgotten, since another game's record has stood on the world server since. 1 = mark;
+ * a group that stays this game's, stays another game's, or becomes another game's is not marked. */
+inline int WriterLiftMarks(int wasForeign, int nowForeign)
+{
+    return (wasForeign != 0 && nowForeign == 0) ? 1 : 0;
+}
+
 }   /* namespace coophb */
 
 #endif

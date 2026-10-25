@@ -29,7 +29,7 @@
 namespace townrefill {
 
 const unsigned kMsgTownLoss = 64;
-const unsigned kProtocol = 101;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
+const unsigned kProtocol = 108;   /* the world-server protocol that carries TOWN_LOSS and RECORD_GONE's town */
 
 
 const unsigned kOpRows = 1, kOpRefilled = 2;
@@ -144,6 +144,17 @@ inline int DecodeRefilled(const char* p, size_t n, std::string* sid)
     return 1;
 }
 
+/* RECORD_GONE marked DISCARD (squadbirth.h): in place of the town, this one word after the stamp and nothing after it - the squad
+   was discarded by its game at an area unload (born not kept), which is no loss of its town */
+const unsigned kGoneDiscardMark = 0xFFFFFFFFu;
+inline void AppendGoneDiscard(std::vector<char>* b) { if (b != 0) PutU32(b, kGoneDiscardMark); }
+// `at` = the byte after the stamp. 1 = the gone is marked DISCARD, 0 = not.
+inline int GoneIsDiscard(const char* p, size_t n, size_t at)
+{
+    if (p == 0 || at >= n || n - at != 4) return 0;
+    unsigned v = 0; std::memcpy(&v, p + at, 4);
+    return v == kGoneDiscardMark ? 1 : 0;
+}
 // RECORD_GONE's town, written after the stamp. false = not a usable town id (nothing is written).
 inline bool AppendGoneTown(std::vector<char>* b, const std::string& town)
 {
@@ -157,6 +168,7 @@ inline int ReadGoneTown(const char* p, size_t n, size_t at, std::string* out)
     if (out == 0) return -1;
     out->clear();
     if (at >= n) return 0;
+    if (GoneIsDiscard(p, n, at) != 0) return 0;   /* a discard names no town */
     if (p == 0 || n - at < 4) return -1;
     unsigned len = 0; std::memcpy(&len, p + at, 4);
     if (len == 0 || len > kMaxSid || n - at - 4 < (size_t)len) return -1;

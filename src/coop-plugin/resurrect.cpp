@@ -71,6 +71,13 @@
 // the row named by its uid, the squadmate the player picked and the price the confirm box showed (a different price refuses).
 // ResurrectTabRead and ResurrectFreeMates are the tab's reads. A snapshot also keeps the in-game day (store.cpp StoreGameDay)
 // and how the death came (fallenwire.h DeathWhy, from the character's MedicalSystem blood and hunger).
+// THE CAMERA ROAD (fallentab.h CameraRoadOffered): while this player has no living character, ResurrectBringBackHere takes
+// BringBack's road at the ground point the camera is looking at: the same option / link / loading / waiting / price / money
+// checks; the camera is never moved. The spot is the first safe one of the camera's point and the rings round it (CameraSpot:
+// the camera's own area loaded here, the terrain's height, no building of its areas within 30 m; characters nearby, enemies
+// too, are not judged on this road); the game's character limit refuses on both roads (CharacterLimitPod); the character is made in a NEW squad
+// of the player's faction (Faction::spawnEmptySquad(no template, permanent, the spot) - the squad screen's "Add squad" road,
+// hire.cpp's splitsquad lever) and goes to other games by the same SPAWN. One [FALLEN] line per bring-back names the spot.
 #include "resurrect.h"
 #include "spawn.h"           // FindSpawned, FindSpawnedUid, MirrorSlot, SafeReadPosition, CreateOwnInSquad, NameOf, NameSetOwn
 #include "store.h"           // EngineWritesBlocked
@@ -113,6 +120,7 @@
 namespace coop {
 
 long long ItInvItemCount(::Inventory* inv);   // items.cpp: every item in every section, -1 unreadable
+int GroundTerrainHeightAt(float x, float z, float* out);   // combat.cpp: the terrain height at (x,z) - 1 a height, 0 no terrain, -1 not read. MAIN THREAD (the camera road's spot)
 
 namespace {
 
@@ -131,6 +139,12 @@ const size_t kInSomethingOff = 0x2F8;    // Character int inSomething: 1 bed, 2 
 const size_t kChainedOff = 0x320;        // Character chained byte, setChainedMode's first write (items.cpp kCapChainedOff)
 const size_t kBeingCarriedOff = 0x3D4;   // Character bool _isBeingCarried, which getPickedUp sets (spawn.cpp kBeingCarriedOff)
 const size_t kVtIsEnemyOf = 0x3E8;       // Character vtable: isEnemyOf(other, factorInDisguises) (combat.cpp kRsVtIsEnemy)
+const size_t kSqActiveOff = 0x1D8;       // Platoon -> ActivePlatoon (hire.cpp kSsActivePlatoonOff)
+long long g_camBack = 0, g_camAlive = 0, g_camNoRow = 0, g_camSquadFailed = 0;   // the camera road: bring-backs, and refusals per reason (no enemy refusal there)
+long long g_camSquadRemoved = 0, g_camSquadKept = 0, g_camSquadRemoveFault = 0,
+          g_atLimit = 0, g_limitUnread = 0;          // the camera road's new squads removed / kept / faulted, the character limit
+long long g_camSpot[swtab::kSpotCodes] = { 0 };      // the camera road's spot refusals per swtab::kSpot* reason
+long long g_p163Lines = 0;                           // PROBE P163 lines written
 std::vector<swfallen::Fallen> g_list;    // this game's copy of the world server's list: newest first, at most swfallen::kFallenKeep
 std::vector<swfallen::Taken> g_taken;    // rows brought back (or reported ALIVE) here that the last TABLE still listed; kept across a world teardown
 std::vector<swfallen::PendWire> g_pendWire;   // the last TABLE's pending rows (brought back, not yet in a finished save)
@@ -375,6 +389,7 @@ bool EnemiesNear(::Character* mate, const Ogre::Vector3& at, swfallen::EnemyCoun
     *out = e;
     return true;
 }
+void OwnFactionRows(std::vector<swfallen::SquadRow>* rows, std::vector< ::Character*>* chars, int* alive, int* dead);   // below
 // The record name of the town nearest (x, z) - fallenwire.h NearestTown over zones.cpp TownDistances; "" none.
 std::string TownNear(float x, float z)
 {
@@ -385,6 +400,216 @@ std::string TownNear(float x, float z)
     const int k = swfallen::NearestTown(rows);
     return k >= 0 ? rows[(size_t)k].name : std::string();
 }
+
+int ObjPosPod(void* obj, float* x, float* z)   // RootObjectBase's position field (no virtual call); 1 read, 0 a fault
+{
+    __try { const ::RootObjectBase* r = (const ::RootObjectBase*)obj; *x = r->pos.x; *z = r->pos.z; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// One area the camera road may use: in the engine's active zones and with its saved buildings made - the zone's loaded byte
+// ZoneMap+0xB1, which the engine sets after it made the zone's buildings (zones.cpp ZoneLoadedSectorTri). 1 yes, 0 no.
+int AreaLoadedHere(int ax, int ay, const int* sx, const int* sy, int zones)
+{
+    for (int z = 0; z < zones; ++z) if (sx[z] == ax && sy[z] == ay) return ZoneLoadedSectorTri(ax, ay) == 1 ? 1 : 0;
+    return 0;
+}
+// THE CAMERA'S POINT: PlayerInterface 0x7F1DC0 (the PlayerInterfaceViewPoint row; Vector3* (PlayerInterface*, Vector3* out)) -
+// PlayerInterface+0x30 -> +0x58 Ogre::Node::getPosition: the camera object's centre node, which focusCamera (0x7F1F10 ->
+// 0x6B00F0, Node::setPosition) sets to the point it is asked to look at, and round which the engine's zone keeper (0xA0E950)
+// keeps the 3x3 areas loaded. The PlayerInterface is the PlayerInterfaceGlobal var (as speech.cpp TkP25GatePod reads both).
+// speech.cpp hooks 0x7F1DC0; its hook answers differently only for startPlayerConversation's own call, so this call gets the
+// engine's answer. 1 read, 0 no PlayerInterface / no table row, -1 a fault. MAIN THREAD.
+unsigned long long kRsViewPointRva = 0; static coop::AddrReg kRsViewPointRva_reg("PlayerInterfaceViewPoint", &kRsViewPointRva);   /* Steam_1.0.65 0x7F1DC0 */
+unsigned long long kRsPlayerIfaceRva = 0; static coop::AddrReg kRsPlayerIfaceRva_reg("PlayerInterfaceGlobal", &kRsPlayerIfaceRva);   /* Steam_1.0.65 0x2133630 (var) */
+typedef void* (*RsViewPointFn)(void* playerInterface, float* out);
+int ViewPointPod(float* x, float* y, float* z)
+{
+    *x = 0.0f; *y = 0.0f; *z = 0.0f;
+    if (kRsViewPointRva == 0 || kRsPlayerIfaceRva == 0) return 0;
+    __try
+    {
+        void* const pi = *(void* const*)coop::AddrAbs(kRsPlayerIfaceRva);
+        if (pi == 0) return 0;
+        float v[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        ((RsViewPointFn)coop::AddrAbs(kRsViewPointRva))(pi, v);
+        *x = v[0]; *y = v[1]; *z = v[2];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *x = 0.0f; *y = 0.0f; *z = 0.0f; return -1; }
+}
+const float kViewPointLimit = 1.0e7f;   /* a world position lies well inside this (64 areas of 4608 units); beyond it, or not a number: unread */
+const int kSpotZonesCap = 256;
+const int kSpotBuildingsCap = 4096;
+// THE CAMERA ROAD's spot (swtab::SpotCandidates / FirstSafeSpot): the ground point the camera is looking at first, then the
+// rings round it. 1 = *at (its height the terrain's there), 0 = none (*why a swtab::kSpot* reason). The buildings judged are
+// those of the candidates' areas and their neighbours (LoadedBuildingsInSector, each loaded area once); a spot is clear when no
+// such building's position is within kSpotClearUnits of it and the ground that far round it lies in loaded areas (a building in
+// an area not loaded here is on no list). Characters nearby are not judged: the player chose where to look, so an enemy nearby
+// never refuses a spot. *detail: the counts the log line gives.
+int CameraSpot(Ogre::Vector3* at, int* why, std::string* detail)
+{
+    *why = swtab::kSpotNoCamera;
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    const int vr = ViewPointPod(&cx, &cy, &cz);
+    if (vr != 1 || !(cx > -kViewPointLimit && cx < kViewPointLimit) || !(cz > -kViewPointLimit && cz < kViewPointLimit))
+    {
+        *detail = "the camera's point did not read (" + (vr == 0 ? std::string("no PlayerInterface or no table row") : vr < 0 ? std::string("a fault")
+                : "not a world position: " + F1(cx) + "," + F1(cz)) + ") -> " + swtab::SpotTag(*why);
+        return 0;
+    }
+    const std::vector<swtab::SpotXZ> cands = swtab::SpotCandidates(cx, cz);
+    static int sx[kSpotZonesCap], sy[kSpotZonesCap];
+    const int zones = ActiveZoneSectors(sx, sy, kSpotZonesCap);
+    std::vector<Sector> areas;   /* the candidates' areas and their eight neighbours, each once */
+    for (size_t k = 0; k < cands.size(); ++k)
+    {
+        const Sector o = SectorOf(cands[k].x, cands[k].z);
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                Sector s; s.x = o.x + dx; s.y = o.y + dy;
+                bool have = false;
+                for (size_t j = 0; j < areas.size(); ++j) if (areas[j].x == s.x && areas[j].y == s.y) { have = true; break; }
+                if (!have) areas.push_back(s);
+            }
+    }
+    static void* list[kSpotBuildingsCap];
+    std::vector<swtab::SpotXZ> blds;
+    int walked = 0, unread = 0, truncated = 0, posFaults = 0;
+    for (size_t i = 0; i < areas.size(); ++i)
+    {
+        if (!AreaLoadedHere(areas[i].x, areas[i].y, sx, sy, zones)) continue;
+        int tr = 0;
+        const int nb = LoadedBuildingsInSector(areas[i].x, areas[i].y, list, kSpotBuildingsCap, &tr);
+        if (nb < 0) { ++unread; continue; }
+        ++walked;
+        if (tr != 0) ++truncated;
+        for (int b = 0; b < nb; ++b) { float bx = 0.0f, bz = 0.0f; if (ObjPosPod(list[b], &bx, &bz)) blds.push_back(swtab::SpotXZ(bx, bz)); else ++posFaults; }
+    }
+    const int whole = (zones >= 0 && unread == 0 && truncated == 0 && posFaults == 0) ? 1 : 0;
+    std::vector<swtab::SpotTry> tries(cands.size());
+    std::vector<float> ys(cands.size(), 0.0f);
+    int loaded = 0, ground = 0, edge = 0;   /* no enemy walk on this road */
+    const float m = swtab::kSpotClearUnits;
+    for (size_t k = 0; k < cands.size(); ++k)
+    {
+        const Sector s = SectorOf(cands[k].x, cands[k].z);
+        tries[k].loaded = AreaLoadedHere(s.x, s.y, sx, sy, zones);
+        if (!tries[k].loaded) continue;
+        ++loaded;
+        float g = 0.0f;
+        tries[k].ground = GroundTerrainHeightAt(cands[k].x, cands[k].z, &g) == 1 ? 1 : 0;
+        if (!tries[k].ground) continue;
+        ++ground; ys[k] = g;
+        int inside = 1;   /* the four corners kSpotClearUnits out lie in loaded areas */
+        for (int q = 0; q < 4 && inside; ++q)
+        {
+            const Sector e = SectorOf(cands[k].x + ((q & 1) ? m : -m), cands[k].z + ((q & 2) ? m : -m));
+            if (!AreaLoadedHere(e.x, e.y, sx, sy, zones)) inside = 0;
+        }
+        if (!inside) { ++edge; continue; }
+        tries[k].clear = swtab::SpotClear(cands[k], blds, m);
+    }
+    const std::string counts = "camera point " + F1(cx) + "," + F1(cz) + " area " + SectorString(SectorOf(cx, cz))
+            + " candidates=" + N((long long)cands.size()) + " loaded=" + N(loaded) + " ground=" + N(ground) + " byUnloadedEdge=" + N(edge)
+            + " buildings=" + N((long long)blds.size()) + " areas walked=" + N(walked) + "/" + N((long long)areas.size()) + " unread=" + N(unread)
+            + " truncated=" + N(truncated) + " posFaults=" + N(posFaults) + " zones=" + N(zones) + " clear=" + F1(m / 10.0f) + " m";
+    const int pick = swtab::FirstSafeSpot(tries, whole, why, zones >= 0 ? 1 : 0);   /* the area list unread: listUnread, not notLoaded */
+    *detail = counts + " -> " + swtab::SpotTag(*why);   /* the first clear spot is taken */
+    if (pick < 0) return 0;
+    *at = Ogre::Vector3(cands[(size_t)pick].x, ys[(size_t)pick], cands[(size_t)pick].z);
+    *detail += " (" + (pick == 0 ? std::string("the camera's point") : "ring " + N(swtab::SpotRingOf(pick)) + ", bearing " + N(swtab::SpotBearingOf(pick))) + ")";
+    return 1;
+}
+void* NewPlayerSquadPod(::Faction* f, const Ogre::Vector3* p, void** apOut)   // Faction::spawnEmptySquad; the Platoon, 0 none or a fault
+{
+    *apOut = 0;
+    if (f == 0) return 0;   /* no player faction: no squad (the caller counts it as squadFailed) */
+    __try
+    {
+        void* pl = (void*)f->spawnEmptySquad(0, true, *p);
+        if (pl != 0) *apOut = *(void**)((char*)pl + kSqActiveOff);
+        return pl;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *apOut = 0; return 0; }
+}
+// THE GAME'S CHARACTER LIMIT: the int the hire step 0x7FED10 compares the player faction's living count with (cmp eax,
+// [CharacterLimit]; jge refuse - the count is 0x7F2270, the faction's squads' members not hasDied). 1 read, 0 no table row / a fault.
+unsigned long long kRsCharLimitRva = 0; static coop::AddrReg kRsCharLimitRva_reg("CharacterLimit", &kRsCharLimitRva);   /* Steam_1.0.65 0x2132EF0, an int var */
+int CharacterLimitPod(int* out)
+{
+    *out = 0;
+    if (kRsCharLimitRva == 0) return 0;
+    __try { *out = *(const int*)coop::AddrAbs(kRsCharLimitRva); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return 0; }
+}
+static int g_capTest = 0;   /* TEST-ONLY (`resurrect cap <n>`, T-556): 0 the game's limit; n > 0 BRING BACK refuses at n living characters (this game, until it closes or `resurrect cap 0`) */
+static int LimitInForce(int* out)   /* the limit BRING BACK judges by: the game's, lowered by the test cap (swtab::LimitForRefusal) */
+{
+    int limit = 0;
+    const int read = CharacterLimitPod(&limit);
+    return swtab::LimitForRefusal(read, limit, g_capTest, out);
+}
+// The camera road's new squad, made for a character that did not come, is removed while it holds nobody: Faction::removeSquad
+// (the engine's own discard of a squad; store.cpp's detour books it as the engine's). The member count is ActivePlatoon+0x58
+// (handoff.cpp SquadReadPod; the hire step reads it as the squad's size). 1 removed, 0 kept (members in it, or the count does not
+// read), -1 the removal faulted.
+const size_t kApCountOff = 0x58;
+int SquadCountPod(void* ap, int* n)
+{
+    __try { *n = *(const int*)((const char*)ap + kApCountOff); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *n = -1; return 0; }
+}
+int RemoveSquadPod(::Faction* f, void* platoon)
+{
+    if (f == 0) return -1;
+    __try { f->removeSquad((Platoon*)platoon); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int DropNewSquad(void* platoon, void* ap)
+{
+    if (platoon == 0) return 0;
+    int members = 0;   /* no ActivePlatoon: a squad just made, nobody put in it */
+    if (ap != 0 && (SquadCountPod(ap, &members) == 0 || members != 0)) { ++g_camSquadKept; return 0; }
+    const int r = RemoveSquadPod(LocalPlayerFaction(), platoon);
+    if (r == 1) ++g_camSquadRemoved; else ++g_camSquadRemoveFault;
+    return r;
+}
+std::string DropWords(int r)
+{
+    return r == 1 ? " - the new squad was removed" : r == 0 ? " - the new squad was KEPT (it holds members, or its count does not read)" : " - removing the new squad FAULTED";
+}
+// PROBE-START: P163
+#ifdef SW_DEV_BUILD   /* a DEV probe: its reads feed only this line */
+/* PROBE P163 (T-556, LOG ONLY): what the engine's recruit step (PlayerInterface::recruit -> 0x7FED10) answered for a brought-back
+   character. 0x7FED10 returns 0 when the player faction's living count is not below the game's character limit (the CharacterLimit
+   row - BringBack refuses at it first, so a 0 here means the engine's count and this game's differ); this game's
+   own counts beside it show where the limit stands. A line when recruit did not answer 1, or put the character in another
+   squad than the chosen one (the engine found it full). */
+const long long kP163LineCap = 20;
+void P163Recruit(unsigned int uid, int rc, void* engineSquad, void* chosen)
+{
+    if (rc == 1 && engineSquad == chosen) return;
+    if (g_p163Lines >= kP163LineCap) return;
+    ++g_p163Lines;
+    std::vector<swfallen::SquadRow> rows; std::vector< ::Character*> chars; int alive = 0, dead = 0;
+    OwnFactionRows(&rows, &chars, &alive, &dead);
+    int inChosen = 0, inEngine = 0;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (rows[i].squad == (unsigned long long)(uintptr_t)chosen) ++inChosen;
+        if (rows[i].squad == (unsigned long long)(uintptr_t)engineSquad) ++inEngine;
+    }
+    int limit = 0;
+    const int limitRead = CharacterLimitPod(&limit);
+    SW_DEVLOG("[PROBE] P163 recruit uid=" + N(uid) + " answered=" + N(rc) + " (1 joined; 0 refused - the character limit; <0 not called)"
+              + " ownFaction alive/dead=" + N(alive) + "/" + N(dead) + " (this game's own, the new one included)"
+              + " limit=" + (limitRead ? N(limit) : std::string("unread"))
+              + " chosenSquad=" + X(chosen) + " members=" + N(inChosen) + " engineSquad=" + X(engineSquad) + " members=" + N(inEngine)
+              + " squadMoved=" + N(engineSquad != chosen ? 1 : 0) + " #" + N(g_p163Lines) + " (PROBE P163)");
+}
+#endif
+// PROBE-END: P163
 
 // The characters this game drives in its own player faction, in the mirror's order (live and dead). The squad rows feed
 // swfallen::PickSquadAnchor; chars[i] is row i's character.
@@ -954,7 +1179,8 @@ void ResurrectOptionsMapEnd(bool complete)
 // THE BRING-BACK ROAD (the TEST lever's `resurrect <n> ...` and the FALLEN tab): row n of this game's copy comes back beside the
 // character besideUid, or else the first living member of this player's squad `want`. src names the caller in the log lines
 // ("TEST" for the lever). expectPrice >= 0: refused when the price read now differs. *out: the result the tab shows.
-static std::string BringBack(const char* src, const std::string& args, int n, int want, unsigned int besideUid, long long expectPrice, BringBackOut* out)
+static std::string BringBack(const char* src, const std::string& args, int n, int want, unsigned int besideUid, long long expectPrice, BringBackOut* out,
+                             int here = 0)   /* 1: the camera road */
 {
     *out = BringBackOut();
     if (n >= 0 && n < (int)g_list.size()) out->name = g_list[(size_t)n].name.empty() ? g_list[(size_t)n].templateName : g_list[(size_t)n].name;
@@ -968,10 +1194,15 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     std::vector<swfallen::SquadRow> rows; std::vector< ::Character*> chars; int alive = 0, dead = 0, squads = 0;
     ::Character* anchor = 0;
     unsigned int anchorUid = besideUid;
+    const bool inCam = here != 0;   /* the camera road: no living character of this player to come back beside */
     if (why == 0)
     {
         OwnFactionRows(&rows, &chars, &alive, &dead);
-        if (besideUid != 0) anchor = FindSpawned(besideUid);
+        if (inCam)
+        {
+            if (!swtab::CameraRoadOffered(alive)) { why = "this player has a living character now - the camera road is only for a player with none"; ref = swtab::kRefFailed; ++g_camAlive; }
+        }
+        else if (besideUid != 0) anchor = FindSpawned(besideUid);
         else
         {
             const int anchorRow = swfallen::PickSquadAnchor(rows, want, &squads);
@@ -987,7 +1218,7 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     swfallen::EnemyCount enemies;
     std::string enemyName, unableText, skippedText;
     int skipped = 0;
-    if (why == 0)
+    if (why == 0 && !inCam)
     {
         ReadMate(anchor, anchorUid, &mate);
         rule = swfallen::BesideVerdict(mate);
@@ -1011,8 +1242,20 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
         }
         if (why == 0 && rule != swfallen::kBesideOk) { ++g_besideRefused[rule]; why = swfallen::BesideWord(rule); ref = swtab::RefusalOfBeside(rule); }
     }
-    ActivePlatoon* squad = (why == 0) ? (ActivePlatoon*)SquadPod(anchor) : 0;
-    if (why == 0 && squad == 0) { why = "the squadmate has no squad"; ref = swtab::kRefMateGone; }
+    Ogre::Vector3 spot(0.0f, 0.0f, 0.0f);
+    int spotWhy = -1;
+    std::string spotDetail;
+    if (why == 0 && inCam)
+    {
+        const int sr = CameraSpot(&spot, &spotWhy, &spotDetail);   /* refused only by buildings, areas not loaded or lists unread */
+        if (sr == 0)
+        {
+            why = "no safe spot where the camera is looking"; ref = swtab::kRefNoSpot;
+            if (spotWhy >= 0 && spotWhy < swtab::kSpotCodes) ++g_camSpot[spotWhy];
+        }
+    }
+    ActivePlatoon* squad = (why == 0 && !inCam) ? (ActivePlatoon*)SquadPod(anchor) : 0;
+    if (why == 0 && !inCam && squad == 0) { why = "the squadmate has no squad"; ref = swtab::kRefMateGone; }
     // the fee (resurrectfee.h): A and this player's money read now; the price is taken only once the new character exists
     swfallen::BackCount cnt;
     swfee::Price fee;
@@ -1020,6 +1263,20 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     std::string feeDetail;
     void* purse = 0;
     int moneyRead = 0;
+    // the game's character limit (swtab::AtCharacterLimit): the hire step would refuse, so nothing is made
+    std::string limitDetail;
+    if (why == 0)
+    {
+        int limit = 0;
+        const int limitRead = LimitInForce(&limit);
+        const int atLim = swtab::AtCharacterLimit(limitRead, limit, alive);
+        if (atLim < 0) ++g_limitUnread;
+        if (atLim == 1)
+        {
+            why = "the player faction's living characters are not below the game's character limit - the hire step would refuse"; ref = swtab::kRefAtLimit; ++g_atLimit;
+            limitDetail = " | living=" + N(alive) + " limit=" + N(limit) + (g_capTest > 0 ? " (TEST cap " + N(g_capTest) + ")" : std::string());
+        }
+    }
     if (why == 0 && PendingNow() >= swfallen::kFallenKeep)
     {
         ++g_feePendingFull;
@@ -1056,16 +1313,35 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
                 detail += " enemies within 50 m=" + N(enemies.within) + " nearest='" + enemyName + "' at " + F1(enemies.nearest / 10.0f) + " m"
                         + " (enemies near that cannot fight=" + N(enemies.unable) + (unableText.empty() ? std::string() : ":" + unableText) + ")";
         }
-        detail += feeDetail;
+        if (inCam)
+            detail += " | where the camera is looking: " + (spotDetail.empty() ? std::string("-") : spotDetail);   /* no enemy count on this road */
+        detail += limitDetail + feeDetail;
         out->refusal = ref != swtab::kRefNone ? ref : swtab::kRefFailed;
         DebugLog("[FALLEN] " + tag + args + " refused: " + why + detail + " | tab words: " + swtab::RefusalTag(out->refusal));
         return std::string("error resurrect refused: ") + why + detail;
     }
-    if (besideUid != 0) ++g_besideNamed;
-    ++g_besideAllowed;
+    if (!inCam) { if (besideUid != 0) ++g_besideNamed; ++g_besideAllowed; }
     const swfallen::Fallen s = g_list[(size_t)n];
     Ogre::Vector3 pos(at.x + swfallen::kBesideUnits, at.y, at.z);
     const int countBefore = alive;
+    void* camPlatoon = 0;   /* the camera road's new squad, removed on every failure below while it holds nobody */
+    if (inCam)
+    {
+        pos = spot;
+        void* ap = 0;
+        void* newPlatoon = NewPlayerSquadPod(LocalPlayerFaction(), &pos, &ap);
+        if (newPlatoon == 0 || ap == 0)
+        {
+            ++g_backRefused; ++g_camSquadFailed;
+            out->refusal = swtab::kRefFailed;
+            const std::string dropped = newPlatoon != 0 ? DropWords(DropNewSquad(newPlatoon, ap)) : std::string();
+            DebugLog("[FALLEN] " + tag + "entry " + N(n) + " '" + s.name + "' FAILED: Faction::spawnEmptySquad made no squad at the camera spot " + F1(pos.x) + "," + F1(pos.y) + "," + F1(pos.z)
+                     + " (platoon " + X(newPlatoon) + ", player faction " + X(LocalPlayerFaction()) + ") - nothing made, nothing paid" + dropped);
+            return "error resurrect: no new squad could be made at the camera spot";
+        }
+        squad = (ActivePlatoon*)ap;
+        camPlatoon = newPlatoon;
+    }
 
     // 1. create
     unsigned int uid = 0;
@@ -1073,7 +1349,8 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     {
         ++g_backRefused;
         out->refusal = swtab::kRefFailed;
-        DebugLog("[FALLEN] " + tag + "entry " + N(n) + " '" + s.name + "' FAILED: the engine did not create '" + s.templateName + "'");
+        const std::string dropped = camPlatoon != 0 ? DropWords(DropNewSquad(camPlatoon, (void*)squad)) : std::string();   /* the camera road */
+        DebugLog("[FALLEN] " + tag + "entry " + N(n) + " '" + s.name + "' FAILED: the engine did not create '" + s.templateName + "'" + dropped);
         return "error resurrect: create failed for template '" + s.templateName + "'";
     }
     ::Character* c = FindSpawned(uid);
@@ -1081,7 +1358,8 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     {
         ++g_backRefused;
         out->refusal = swtab::kRefFailed;
-        DebugLog("[FALLEN] " + tag + "entry " + N(n) + " FAILED: uid " + N(uid) + " was created but is not registered here");
+        const std::string dropped = camPlatoon != 0 ? DropWords(DropNewSquad(camPlatoon, (void*)squad)) : std::string();   /* removed only while it holds nobody */
+        DebugLog("[FALLEN] " + tag + "entry " + N(n) + " FAILED: uid " + N(uid) + " was created but is not registered here" + dropped);
         return "error resurrect: the created character is not registered";
     }
     // the price, now that the person exists
@@ -1117,16 +1395,25 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     const bool statsSet = s.statsHave && StatsApplyOwn(c, s.stats, &statsRc);
     // 4. the road (probe L3)
     const int newMove = IntAtPod(c, kMoveOff, kMoveField), newAi = IntAtPod(c, kAiOff, kAiField);
-    const int refMove = IntAtPod(anchor, kMoveOff, kMoveField), refAi = IntAtPod(anchor, kAiOff, kAiField);
+    const int refMove = anchor != 0 ? IntAtPod(anchor, kMoveOff, kMoveField) : -1, refAi = anchor != 0 ? IntAtPod(anchor, kAiOff, kAiField) : -1;   /* the camera road: no member to compare (recruit is called) */
     std::vector<swfallen::SquadRow> r1; std::vector< ::Character*> c1; int alive1 = 0, dead1 = 0;
     OwnFactionRows(&r1, &c1, &alive1, &dead1);
     const int road = swfallen::RoadDecide(s.animal, newMove, newAi, refMove, refAi);
     int recruitRc = 0, squadRestored = 0;
+    std::string camDropped;   /* the camera road: its new squad removed when the character is not in it */
     if (road == swfallen::kRoadCreateRecruit)
     {
         ++g_backRecruit;
         recruitRc = HireRecruitNoEdit(c);
-        if (SquadPod(c) != (void*)squad) squadRestored = HireSetFaction(c, LocalPlayerFaction(), squad) == 1 ? 1 : -1;
+        void* const recruitSquad = SquadPod(c);
+        if (recruitSquad != (void*)squad) squadRestored = HireSetFaction(c, LocalPlayerFaction(), squad) == 1 ? 1 : -1;
+        if (squadRestored != 1 && camPlatoon != 0 && SquadPod(c) != (void*)squad)
+            camDropped = DropWords(DropNewSquad(camPlatoon, (void*)squad));   /* the hire step's squad kept the character: the new one, empty, removed */
+        // PROBE-START: P163
+#ifdef SW_DEV_BUILD
+        P163Recruit(uid, recruitRc, recruitSquad, (void*)squad);   /* the DEV build's only */
+#endif
+        // PROBE-END: P163
     }
     const int moveAfter = IntAtPod(c, kMoveOff, kMoveField), aiAfter = IntAtPod(c, kAiOff, kAiField);
     // 5. the SPAWN on the normal road
@@ -1170,9 +1457,11 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     const std::string line = "entry " + N(n) + " uid=" + N(uid) + " (was uid " + N(s.uid) + ") name='" + s.name + "' template='"
         + s.templateName + "' animal=" + N(s.animal) + " place='" + swfallen::PlaceWords(s.place) + "'"
         + (besideUid != 0 ? std::string(" squad of the named squadmate") : " squad " + N(want < 0 ? 0 : want) + " of " + N(squads)) + "=" + X(squad)
-        + " beside uid=" + N(anchorUid) + " rule=allowed (free, enemies within 50 m=0, enemies near that cannot fight=" + N(enemies.unable)
-        + (unableText.empty() ? std::string() : ":" + unableText)
-        + ", unreadable near=" + N(enemies.unknown) + ")"
+        + " beside uid=" + N(anchorUid)
+        + (inCam ? std::string(" rule=allowed (camera road: buildings only)")
+                 : " rule=allowed (free, enemies within 50 m=0, enemies near that cannot fight=" + N(enemies.unable)
+                   + (unableText.empty() ? std::string() : ":" + unableText)
+                   + ", unreadable near=" + N(enemies.unknown) + ")")
         + " at=" + F1(pos.x) + "," + F1(pos.y) + "," + F1(pos.z)
         + " items rolled=" + N(itemsRolled) + " cleared=" + N(cleared) + " after=" + N(itemsAfterStrip)
         + " named=" + N(named ? 1 : 0) + " stats=" + N(statsSet ? 1 : 0) + "(rc " + N(statsRc) + ")"
@@ -1186,7 +1475,10 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
         + " look=" + (haveLook ? "waits for the body" : "none kept - own look and empty kit by the settle send")
         + " | TAKE (new serial " + N(newSerial) + ") " + (takeSent ? "sent to the world server - final once this game's save has it" : "NOT sent (no link) - sent when the link is up")
         + " list=" + N((long long)g_list.size()) + uniqueWords
-        + " | fee " + FeeWords(fee, cnt) + " money " + N(moneyBefore) + " -> " + N(moneyAfter);
+        + " | fee " + FeeWords(fee, cnt) + " money " + N(moneyBefore) + " -> " + N(moneyAfter)
+        + (inCam ? " | CAMERA ROAD: at the spot " + F1(pos.x) + "," + F1(pos.y) + "," + F1(pos.z) + " (terrain height " + F1(pos.y)
+                   + "; no water level is read) " + spotDetail + " in a new squad " + X(squad) + camDropped : std::string());
+    if (inCam) ++g_camBack;
     DebugLog("[FALLEN] " + tag + line);
     return std::string(sent ? "ok" : "error") + " resurrect " + line;
 }
@@ -1196,7 +1488,7 @@ std::string ResurrectLever(const std::string& args)
     std::istringstream is(args);
     std::string first; is >> first;
     const char* const usage = "error resurrect usage: resurrect list | resurrect <n> [squad <i> | beside <uid>] | resurrect killlast | resurrect killother <uid>"
-                              " | resurrect host on|off | resurrect host fee <amount> | resurrect host growth steady|steep | resurrect price | resurrect money <n>"
+                              " | resurrect host on|off | resurrect host fee <amount> | resurrect host growth steady|steep | resurrect price | resurrect money <n> | resurrect cap <n>"
                               " | resurrect tab [open | select <row> | mate <i> | press | confirm | cancel | report]";
     std::string extra;
     if (first == "host")   /* TEST: a host option to the world server, as the host's options screen would send it */
@@ -1262,6 +1554,22 @@ std::string ResurrectLever(const std::string& args)
         }
         return "error resurrect killother: no other living character of this player's faction here that this game did not bring back";
     }
+    if (first == "cap")   /* TEST-ONLY (T-556): BRING BACK's character limit lowered to <n> for this game; 0 the game's own */
+    {
+        long long n = -1;
+        if (!(is >> n) || n < 0 || n > 100000 || (is >> extra)) return usage;
+        g_capTest = (int)n;
+        int gameLimit = 0;
+        const int gameRead = CharacterLimitPod(&gameLimit);
+        int inForce = 0;
+        const int forceRead = LimitInForce(&inForce);
+        std::vector<swfallen::SquadRow> cr; std::vector< ::Character*> cc; int ca = 0, cd = 0;
+        OwnFactionRows(&cr, &cc, &ca, &cd);
+        const std::string line = "cap=" + N(n) + " game's limit=" + (gameRead ? N(gameLimit) : std::string("unread")) + " in force="
+                               + (forceRead ? N(inForce) : std::string("none")) + " living=" + N(ca) + " atLimit=" + N(swtab::AtCharacterLimit(forceRead, inForce, ca));
+        DebugLog("[FALLEN] cap (TEST): " + line);
+        return "ok resurrect cap " + line;
+    }
     if (first == "tab")   /* TEST: the FALLEN tab's own controls, fired as a click (fallentab.cpp) */
     {
         std::string rest; std::getline(is, rest);
@@ -1316,6 +1624,29 @@ BringBackOut ResurrectBringBackFor(unsigned int deadUid, unsigned int besideUid,
     return out;
 }
 
+BringBackOut ResurrectBringBackHere(unsigned int deadUid, long long expectPrice)
+{
+    BringBackOut out;
+    int n = -1;
+    for (size_t i = 0; i < g_list.size(); ++i) if (g_list[i].uid == deadUid) { n = (int)i; break; }
+    if (n < 0)
+    {
+        out.refusal = swtab::kRefFailed;
+        ++g_camNoRow;
+        DebugLog("[FALLEN] bring-back (tab) uid " + N(deadUid) + " where the camera is looking refused: the row is no longer on this game's copy of the list | tab words: failed");
+        return out;
+    }
+    BringBack("tab", "row uid=" + N(deadUid) + " where the camera is looking, shown price " + N(expectPrice), n, -1, 0, expectPrice, &out, 1);
+    return out;
+}
+
+int ResurrectCameraRoadOffered()
+{
+    std::vector<swfallen::SquadRow> rows; std::vector< ::Character*> chars; int alive = 0, dead = 0;
+    OwnFactionRows(&rows, &chars, &alive, &dead);
+    return swtab::CameraRoadOffered(alive);
+}
+
 void ResurrectTabRead(FallenTabRead* out)
 {
     *out = FallenTabRead();
@@ -1326,6 +1657,11 @@ void ResurrectTabRead(FallenTabRead* out)
     out->moneyRead = PurseMoneyPod(PursePod(), &money) == 1 ? 1 : 0;
     out->money = out->moneyRead ? money : 0;
     for (size_t i = 0; i < g_list.size(); ++i) out->rows.push_back(swtab::RowFor(g_list[i]));
+    std::vector<swfallen::SquadRow> own; std::vector< ::Character*> chars; int alive = 0, dead = 0;
+    OwnFactionRows(&own, &chars, &alive, &dead);
+    int limit = 0;
+    const int limitRead = LimitInForce(&limit);
+    out->atLimit = swtab::AtCharacterLimit(limitRead, limit, alive);   /* the button greyed at the limit */
 }
 
 /* PlayerInterface::isObjectSelected 0x7F4180 (bool, PlayerInterface* this, RootObject*): a character of the player's faction
@@ -1401,7 +1737,15 @@ static std::string BesideReport()
     r += "]=";
     for (int i = 1; i < swfallen::kBesideCodes; ++i) r += std::string(i > 1 ? "," : "") + N(g_besideRefused[i]);
     return r + " enemyUnknown=" + N(g_enemyUnknown) + " enemyUnable=" + N(g_enemyUnable) + " enemyListBad=" + N(g_enemyListBad) + " place[known,none,noList]=" + N(g_placeKnown) + "," + N(g_placeNone) + "," + N(g_placeNoList)
-             + " killOther=" + N(g_killOther);
+             + " killOther=" + N(g_killOther)
+             + " camRoad[back,alive,noRow,squadFailed]=" + N(g_camBack) + "," + N(g_camAlive) + "," + N(g_camNoRow)
+             + "," + N(g_camSquadFailed)
+             + " camSpot[notLoaded,noGround,byBuilding,listUnread,noCamera]=" + N(g_camSpot[swtab::kSpotNotLoaded]) + "," + N(g_camSpot[swtab::kSpotNoGround])
+             + "," + N(g_camSpot[swtab::kSpotByBuilding]) + "," + N(g_camSpot[swtab::kSpotListUnread])
+             + "," + N(g_camSpot[swtab::kSpotNoCamera])
+             + " camSquad[removed,kept,removeFault]=" + N(g_camSquadRemoved) + "," + N(g_camSquadKept) + "," + N(g_camSquadRemoveFault)
+             + " charLimit[refused,unread]=" + N(g_atLimit) + "," + N(g_limitUnread)
+             + " p163Lines=" + N(g_p163Lines);
 }
 
 // The fee counters for the REPORT line: the host options as this game holds them, bring-backs charged / free, the total taken,

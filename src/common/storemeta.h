@@ -34,6 +34,10 @@
  * ignores a field past the ones it knows, while a `v8` tag would be refused by all of them and the group would
  * vanish from their index. A line without it, and every line below v7, reads back as no home.
  *
+ * AN OPTIONAL FIELD 16 ON A v7 LINE, `birth`: the squad's birth flag (squadbirth.h) - "p" born kept, "d" born not kept. It is
+ * written only when known, after field 15 (empty when the record has no home), and read the same way: a line without it, any other
+ * value, and every line below v7, read back as unknown (-1).
+ *
  * STORE-FILE FORMAT 6 (B10, design-e46-store 3.5). The same line without the last field:
  *
  *   v6 <writtenAt> <owner> <x> <y> <z> <squadSid> <factionName> <worldId> <posAt> <town> <len> <crc32>
@@ -140,6 +144,7 @@ struct MetaLine
     unsigned int crc;
     unsigned long long seq;   /* B12 (decision 52): the notebook's own sequence number; 0 below v7 */
     std::string  home;        /* the group's home building key; "" = none (optional field 15 of a v7 line) */
+    int          birth;       /* the squad's birth flag (squadbirth.h): 1 born kept, 0 born not kept, -1 unknown (optional field 16 of a v7 line) */
     MetaLine();
 };
 

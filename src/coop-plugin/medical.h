@@ -43,6 +43,10 @@ void ApplyOwnerDeathRequest(unsigned int uid, const std::string& caller, unsigne
 // (MedicalSystem::dead = 1, Character::declareDead 0x7A5660); on a dead copy a no-op; dead=0 never resurrects. par6b: counted
 // applied only when declareDead went through - refused by the gate or faulted, the flag is cleared and it counts deferred.
 void ApplyOwnerDeath(unsigned int uid, int dead);
+// A copy of uid is usable again (the liveness check re-noted its new handle, or a lost copy is back): an owner's death that found
+// no usable copy is applied at the next MedicalDrainMissedDeaths (spawn.cpp RehandleTick) through ApplyOwnerDeath. MAIN THREAD.
+void MedicalCopyUsableAgain(unsigned int uid);
+void MedicalDrainMissedDeaths();
 // par6 TEST-ONLY lever (`kill <uid>`): the engine's death steps on a loaded replicated character. Owned: dies, STATE pushed.
 // A copy: the copy gate must refuse it, and the lever puts the flag (= hasDied's byte) back (par6b).
 std::string KillLever(unsigned int uid);

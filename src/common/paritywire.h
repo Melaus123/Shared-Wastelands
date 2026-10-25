@@ -375,10 +375,47 @@ inline int DecodeParityReq(const char* p, size_t size, ParityReq* out)
    left items out at its cap, so an unpaired holder item may be one it has); *gone: the listed ROAD rows nothing of the holder's
    pairs with (each is sent as a GROUND GONE; a listed row that is not road never is). A key that does not parse as a ground key
    is in neither list. Returns the holder road items left unpaired that were kept out of *add because the listing was cut.
-   *pairsOut (may be 0): every pair made, (holder index, asked index) - the holder tells the asker the name of a pair whose ids differ. */
-inline size_t ParityGroundPlan(const std::vector<ParityGroundRow>& holder, const std::vector<ParityGroundRow>& asked, int listingCut,
-                               std::vector<size_t>* add, std::vector<size_t>* gone, std::vector<std::pair<size_t, size_t> >* pairsOut = 0)
+   *pairsOut (may be 0): every pair made, (holder index, asked index) - the holder tells the asker the name of a pair whose ids differ.
+   holderWhole != 0 (the holder's walk of the sector was whole - not cut, not truncated - and its ground there is settled, loaded
+   and has had the area's stored record applied; the caller decides): the holder's ground is the authority for the sector, so
+   (1) a listed row that is NOT road and pairs with nothing of the holder's is a GONE too (also in *goneUnmarked, may be 0; never
+   when `listingCut` != 0 - the holder's copy of it may be paired with nothing because the asker left it out, and no ADD goes) - a
+   restarted asker has forgotten which items came by the road, so an item it lists unmarked that the holder lacks (one picked
+   before the asker's restart, or loot only the asker placed) leaves; and (2) the holder's WORLD LOOT that nothing listed pairs with
+   goes in *addWorld (may be 0; never when `listingCut` != 0). World loot is kept out of *add because each game places its own: an
+   unpaired holder copy usually means the asker's copy lies elsewhere, and while unmarked rows never left that copy stayed, so an
+   ADD made a double. With (1) every unpaired listed copy in the sector leaves, so the holder's copy is what makes both games the
+   same - the caller sends *addWorld only once all of this answer's GONEs went out. A holder world-loot item within
+   kParityWorldAddEdgeTenths of its sector's edge is never in *addWorld: the asker's copy may lie across the edge, in another
+   sector's listing this answer cannot remove. With holderWhole 0 an unmarked row is never a GONE and *addWorld stays empty. The
+   asker leaves its own unconfirmed drops OUT of its listing. */
+/* The count an asker sends as its listing's `groundLeft` (0 = the listing is whole): the items left out at the cap, plus the keyless
+   items lying in the sector (they cannot be listed, yet the holder's copy of one would come back as a world ADD beside it), and at
+   least 1 when the ground walk itself was cut (a missing item is not known to be absent). Clamped to the wire's 16 bits. */
+inline unsigned int ParityListingLeft(unsigned int cappedOut, unsigned int keylessHere, int walkCut)
 {
+    unsigned long long n = (unsigned long long)cappedOut + (unsigned long long)keylessHere;
+    if (walkCut != 0 && n == 0) n = 1;
+    return (n > 0xFFFFull) ? 0xFFFFu : (unsigned int)n;
+}
+const long kParityWorldAddEdgeTenths = 50;          /* 5 world units */
+const long kParitySectorTenths = 46080;             /* poskey.h kSectorSize (4608 units) in tenths */
+const long kParitySectorOriginTenths = 1474560;     /* poskey.h kSectorOrigin (147456 units) in tenths */
+/* 1 = the key's flat position lies within `margin` tenths of an edge of the key's own sector (or outside it) */
+inline int ParityGroundNearEdge(const coopground::GroundKeyParts& p, long margin)
+{
+    const long left = (long)p.sx * kParitySectorTenths - kParitySectorOriginTenths;
+    const long top = (long)p.sy * kParitySectorTenths - kParitySectorOriginTenths;
+    const long dx0 = p.x10 - left, dx1 = left + kParitySectorTenths - p.x10;
+    const long dz0 = p.z10 - top, dz1 = top + kParitySectorTenths - p.z10;
+    return (dx0 < margin || dx1 < margin || dz0 < margin || dz1 < margin) ? 1 : 0;
+}
+inline size_t ParityGroundPlan(const std::vector<ParityGroundRow>& holder, const std::vector<ParityGroundRow>& asked, int listingCut,
+                               std::vector<size_t>* add, std::vector<size_t>* gone, std::vector<std::pair<size_t, size_t> >* pairsOut = 0,
+                               int holderWhole = 0, std::vector<size_t>* goneUnmarked = 0, std::vector<size_t>* addWorld = 0)
+{
+    if (addWorld != 0) addWorld->clear();
+    if (goneUnmarked != 0) goneUnmarked->clear();
     if (pairsOut != 0) pairsOut->clear();
     if (add == 0 || gone == 0) return 0;
     add->clear(); gone->clear();
@@ -423,8 +460,17 @@ inline size_t ParityGroundPlan(const std::vector<ParityGroundRow>& holder, const
     }
     size_t held = 0;
     for (size_t i = 0; i < hn; ++i)
-        if (hOk[i] != 0 && hUsed[i] == 0 && holder[i].road != 0) { if (listingCut != 0) ++held; else add->push_back(i); }
-    for (size_t j = 0; j < an; ++j) if (aOk[j] != 0 && aUsed[j] == 0 && asked[j].road != 0) gone->push_back(j);
+    {
+        if (hOk[i] == 0 || hUsed[i] != 0) continue;
+        if (holder[i].road != 0) { if (listingCut != 0) ++held; else add->push_back(i); }
+        else if (addWorld != 0 && holderWhole != 0 && listingCut == 0 && ParityGroundNearEdge(hp[i], kParityWorldAddEdgeTenths) == 0) addWorld->push_back(i);
+    }
+    for (size_t j = 0; j < an; ++j)
+    {
+        if (aOk[j] == 0 || aUsed[j] != 0) continue;
+        if (asked[j].road != 0) gone->push_back(j);
+        else if (holderWhole != 0 && listingCut == 0) { gone->push_back(j); if (goneUnmarked != 0) goneUnmarked->push_back(j); }
+    }
     return held;
 }
 

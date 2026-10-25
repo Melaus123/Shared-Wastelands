@@ -45,7 +45,7 @@ bool TaskGoalOfChar(::Character* c, std::string* goal, int* hasPendingOrders);
 // two copies were different characters despite sharing a uid, template and position.
 // P1: `age` (0..1, already clamped by the decoder) is the owner's CharacterAnimal +0x700 and goes into
 // the factory's create() in place of the 0.0 every copy had, so a copied animal is its owner's size.
-bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName,
+bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName, const std::string& templateSid,   /* T-922: "" = none */
                       float x, float y, float z,
                       const std::string& factionName, bool keepContainer, float age,
                       const unsigned int* stats44 = 0);   // S1: the owner's 44 stat values, 0 = none carried
@@ -74,6 +74,10 @@ std::string MirrorTestCapLever(int cap);   // `mirrorcap <n>` - TEST-ONLY
 std::string BedHoldLever(const std::string& arg);   // `bedhold on|off` - TEST-ONLY
 
 ::Character* FindSpawned(unsigned int uid);
+std::string TemplateSidOf(const void* c);   /* T-922 (templatekey.h): the stringID a SPAWN carries for c's template, "" = none. MAIN THREAD */
+std::string TmplNameLever(const std::string& args);   /* T-922 TEST-ONLY lever `tmplname` (command_channel.cpp): a record's shown name read, or set through the engine's renameRecord, by stringID. MAIN THREAD */
+void TemplateNoteSentByName();              /* counts a SPAWN sent with no stringID (tmplSentByName) */
+void TemplateNoteSidBad();                  /* T-922: counts a SPAWN received whose stringID tail was malformed (tmplSidBad) */
 // stale1 (review-stale1): the RAW object the registry holds for uid, 0 if none - no retired / plausibility test and never
 // dereferenced by the caller; P034 compares it with a liveness row's address to tell a current row from an out-of-date one.
 // MAIN THREAD.
@@ -90,7 +94,7 @@ int  CreateLastRefusal();
 bool SendContextFor(unsigned int uid, ::Character* c);
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot);   // P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth);   // + the squad's birth flag (squadbirth.h, -1 unknown). P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
 // M-B / H026 - `context on|off`, DEFAULT OFF: when on, a SPAWN whose CONTEXT arrived first creates the copy the way
 // the engine creates a town NPC (npc-context.md section 6): a platoon from the same squad template, the same
 // SquadType, home town and home building, the copy created INTO that platoon with that home, then the same
@@ -142,12 +146,13 @@ bool IsRetiredObject(const void* obj);
 // crashed inside exactly that window. An event has no window.
 bool RetireOnDestroy(const void* obj, const char* reason = 0);   /* PROBE P141: reason = the engine's removal literal, kept on the marked row for the release ring */
 // T-304 (2), fold 1: ANY thread, from the destroy detour before anything is retired. True ONLY for the engine's 'eaten' removal
-// (debugInfo "eaten", MedicalSystem::gettingEaten) of a registered copy of ANOTHER game's character with the game link up: the
+// (debugInfo "eaten", MedicalSystem::gettingEaten) of a registered copy of ANOTHER game's character while that character's
+// owner is in this world (mppresence::OwnerInWorld; the same rule whatever the number of players): the
 // detour then answers FALSE without destroying (the engine's own 'postponed' answer; counted copyDestroyRefused[eaten]) and the
 // copy stays until the owner's DESPAWN. Every other reason goes through. Only the owner removes a character, a corpse included.
 bool RefuseEngineDestroyOfCopy(const void* obj, unsigned int uid, const char* debugInfo);
 // T-304 (2): MAIN THREAD, every frame (ReplicateTick). Runs NotifyDespawn for this game's own destroys that came off the main
-// thread (they carry the uid resolved at the hook's entry), and caches the link state RefuseEngineDestroyOfCopy reads.
+// thread (they carry the uid resolved at the hook's entry), and answers the eating threads' asks RefuseEngineDestroyOfCopy reads.
 void DrainOffThreadDespawns();
 
 // F322 - THE DESPAWN PAIR. Until P038 hooked GameWorld::destroy there was no moment at which a
@@ -181,7 +186,7 @@ void TwinSleepTick();
 // obeying H030: a twin or a player-faction character of OURS is withdrawn, never destroyed; the
 // peer's own player characters are peer-faction copies here and are ordinary puppets.
 // Returns 1 destroyed, 0 withdrawn, -1 we hold no copy for that uid. MAIN THREAD.
-int DropPeerOwnedCopy(unsigned int uid);
+int DropPeerOwnedCopy(unsigned int uid, int departed = 0);   // T-1007 (J2): departed 1 = PLAYER_GONE's roads (a withdrawn twin is queued), 0 = a link loss
 int CopyIsPlayerCharacter(unsigned int uid);   /* a final leave's copy: 1 a player character / player-faction person, 0 an NPC, -1 unreadable, -2 no copy here */
 void PlayerCharTableTick();   /* MAIN THREAD (combat.cpp CombatTick): the player-character table's sweep of every character row, every 0.5 s */
 int IsUidPlayerCharAnyThread(unsigned int uid);   /* ANY THREAD (the AI worker's melee hit): 1 a player character / player-faction person, 0 an NPC, -1 not in the table */
@@ -210,7 +215,6 @@ void OrphanNote(void* c, float x, float z);
 void OrphanPurgeTick(long worldGen);
 void OrphanReportNumbers(long long* removed, long long* skipped);
 std::string OrphanReportDetail();   /* " orphanSkip[...]=... orphan[faulted,noted,pending]=..." */
-long long WorldGenGatedHeldUnlinked();   /* orphan1: defined in worldgen.cpp - the leaf gate's unlinked refusals */
 
 // review-session S6 - retire every platoon the CONTEXT announcements of the player in `slot` created
 // here (-1: the old link's peer with no announced slot - every platoon): the store's deactivate pair
@@ -324,6 +328,13 @@ int  MirrorUsed();
 // uid's map entry and puppet without a dereference. MAIN THREAD, never inside a walk of the puppet
 // list. Returns how many rows were released.
 int  MirrorReclaimDestroyed();
+// A copy whose engine handle changed: the rows the liveness check refused are finished (the object untouched) and their owners
+// asked for a fresh copy, an owner's death a copy missed is applied, probe P156's lines are written. MAIN THREAD, every frame
+// (ReplicateTick, before the reclaim).
+void RehandleTick();
+// TEST-ONLY (`handleskew` lever): the copy's stored handle serial - and with `refuse` its stored fingerprint - is changed, so the
+// next liveness check meets a handle that is not the stored one. Copies only. MAIN THREAD. Returns the [M3] line or an error.
+std::string HandleSkewLever(unsigned int uid, bool refuse);
 bool MirrorSlot(int i, unsigned int* uid, ::Character** out);
 
 // F155: the BEHAVIOUR of a replicated character, as one short string.
@@ -389,6 +400,9 @@ void WorldRosterFull(int page);
 // Log the goal the engine actually adopted for a uid - settles "did it take the task we
 // sent" by inspection rather than by inferring it from where the character walked.
 void ReportTask(unsigned int uid);
+// MAIN THREAD (levers): " orders[queued,pending]=q,p jobSwitch=0|1 standingJobs=n standingTaskTypes=.." - the order system's three lists
+// and its job switch (+0x35), read in place.
+std::string OrderListWords(::Character* c);
 
 // PROBE P009 (diagnostic only, H006): print a character's embedded `hand` - the engine's
 // own toString/bool/explainState - for a spawned uid and for the captured player

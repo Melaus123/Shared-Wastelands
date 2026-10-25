@@ -92,6 +92,53 @@ inline int DestroyIdentityOf(bool rowDead, unsigned int rowIndex, unsigned int r
 }
 inline bool DestroyAnswersUid(int v) { return v == kDestroyIsRow; }   // the row's uid is the answer (drop, announce)
 inline bool DestroyMarksRow(int v)   { return v == kDestroyNotRow; }  // another object owns the address: the row is finished
+// A row whose stored handle is not the one the object carries now (kNotStored) names either a DIFFERENT character built at a
+// reused address, or the same character the engine gave a new handle (a new serial, often a new index and container; sometimes
+// a whole squad at once). The character carries no uid, so the main thread asks more witnesses (spawn.cpp RehandleVerdict):
+//   fingerprint      - the character's template record and two objects the character owns (its AnimationClass and its AI),
+//                      stored on the row at registration and refreshed while the engine names the stored handle at the
+//                      address (FingerprintOf). A character built later at a reused address has objects of its own, so two
+//                      characters of one template (squad-mates share template and faction) are told apart; the faction is
+//                      not a witness, because a hire or a squad move changes it. A row that stored none, or any witness
+//                      unread now, is unknown;
+//   doomed           - a destroy is noted for this address under the NEW or the STORED handle;
+//   newResolvesSelf  - the engine's registry resolves the NEW handle to this very address;
+//   newResolvesOther - it resolves the new handle to another character;
+//   inActiveList     - the address is in the engine's active-character set.
+// kRehandleRenote only when every witness says the same character (the row takes the new handle); kRehandleRefuse when one
+// proves another (the fingerprint differs, the row is destroyed, the new handle names another object); otherwise undecided -
+// nothing changes and the next check asks again.
+enum Fingerprint { kFpUnknown = 0, kFpSame = 1, kFpDiffers = 2 };
+const int kFpWitnesses = 3;   // the template record, the AnimationClass, the AI object
+// Same only when every stored witness is known and equal to the one read now; any witness stored or read as 0, or a failed read,
+// is unknown; otherwise differs.
+inline int FingerprintOf(const void* const* stored, bool readNow, const void* const* now, int n)
+{
+    for (int k = 0; k < n; ++k)
+        if (stored[k] == 0) return kFpUnknown;
+    if (!readNow) return kFpUnknown;
+    for (int k = 0; k < n; ++k)
+        if (now[k] == 0) return kFpUnknown;
+    for (int k = 0; k < n; ++k)
+        if (stored[k] != now[k]) return kFpDiffers;
+    return kFpSame;
+}
+enum Rehandle { kRehandleUndecided = 0, kRehandleRenote = 1, kRehandleRefuse = 2 };
+inline int NotStoredJudge(bool rowDead, bool destroyed, bool doomed, bool newResolvesSelf, bool newResolvesOther, bool inActiveList,
+                          int fingerprint)
+{
+    if (destroyed || newResolvesOther || fingerprint == kFpDiffers) return kRehandleRefuse;
+    if (!rowDead && !doomed && newResolvesSelf && inActiveList && fingerprint == kFpSame) return kRehandleRenote;
+    return kRehandleUndecided;
+}
+inline const char* RehandleName(int j)
+{
+    return j == kRehandleRenote ? "renote" : j == kRehandleRefuse ? "refuse" : j == kRehandleUndecided ? "undecided" : "?";
+}
+inline const char* FingerprintName(int f)
+{
+    return f == kFpSame ? "same" : f == kFpDiffers ? "differs" : f == kFpUnknown ? "unknown" : "?";
+}
 // The names the REPORT line prints, in Verdict order.
 inline const char* VerdictName(int v)
 {

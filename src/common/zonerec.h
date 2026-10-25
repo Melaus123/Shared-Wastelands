@@ -105,6 +105,41 @@ inline int ZoneRecvJudge(int haveHeld, long long heldStamp, int heldOwner, long 
 }
 inline int ZoneRecvTakes(int why) { return (why != kZvRefuseNotNewer) ? 1 : 0; }
 
+/* T-823 fold 2 (run T1424): A ZONE READ MADE WHILE THE LINK WAS UP BUT ITS RECORD LIST WAS NOT COMPLETE YET (the player's own
+   area is read during the load, before the list is even asked for) is remembered as provisional and judged when the list
+   completes. recordBlocks: a record of the area is held now (for a load from a record: one newer than the copy loaded);
+   readGen / linkGen: the link generation at the read / now; readTeardowns / teardownsNow: the world teardown count at the read /
+   now. Tested in this order; the first that fails is the answer. kZpMadeGood = the read gets the kept mark of this link. */
+const int kZpMadeGood = 0;      /* every condition holds: marked as if read after the list was complete */
+const int kZpRecordHeld = 1;    /* a record of the area is held (a newer one, for a load from a record): dropped */
+const int kZpLinkChanged = 2;   /* the link generation changed since the read (or none was known): dropped */
+const int kZpTornDown = 3;      /* a world teardown happened since the read: dropped */
+inline int ZoneProvisionalJudge(int recordBlocks, long readGen, long linkGen, long long readTeardowns, long long teardownsNow)
+{
+    if (recordBlocks != 0) return kZpRecordHeld;
+    if (readGen < 1 || readGen != linkGen) return kZpLinkChanged;
+    if (readTeardowns != teardownsNow) return kZpTornDown;
+    return kZpMadeGood;
+}
+inline const char* ZoneProvisionalWhy(int why)
+{
+    switch (why)
+    {
+    case kZpMadeGood: return "made good";
+    case kZpRecordHeld: return "dropped: a record of the area is held";
+    case kZpLinkChanged: return "dropped: the link changed since the read";
+    case kZpTornDown: return "dropped: the world was torn down since the read";
+    }
+    return "dropped: unknown";
+}
+/* T-823 fold 3: ZoneProvisionalJudge's recordBlocks. fromRecord: the provisional read was a load from a record; recordHeld: a record
+   of the area is held now; heldIsNewer: that record is newer than the copy loaded. An area-file read is blocked by any record held;
+   a load from a record only by a newer one (its own record is expected to be there). */
+inline int ZoneProvisionalBlocks(int fromRecord, int recordHeld, int heldIsNewer)
+{
+    if (fromRecord != 0) return (recordHeld != 0 && heldIsNewer != 0) ? 1 : 0;
+    return (recordHeld != 0) ? 1 : 0;
+}
 /* A, THE GAME: may a zone copy that was NOT loaded from the record now held be saved over it? hasMark: the copy carries the
    kept mark (loaded on this link from a record, or with no record once the record list was known); markGen / linkGen: the
    link generation the mark was taken on / the generation now; holderSlot: the

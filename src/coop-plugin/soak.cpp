@@ -81,6 +81,9 @@ struct Watch
     int  lastProne;
     int  lastDead;
     bool primed;
+    /* PROBE P156 BEGIN */
+    unsigned long proneAt;   // probe P156: GetTickCount when the prone value last changed (0 = never seen to change)
+    /* PROBE P156 END */
 };
 Watch g_watch[kMaxWatch] = {0};
 
@@ -209,6 +212,7 @@ Watch* WatchFor(unsigned int uid)
     g_watch[free].lastProne = -1;
     g_watch[free].lastDead  = -1;
     g_watch[free].primed    = false;
+    /* PROBE P156 BEGIN */ g_watch[free].proneAt = 0; /* PROBE P156 END */
     return &g_watch[free];
 }
 
@@ -266,6 +270,7 @@ void ReadSpeedProbe(Character* c, float* v)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
 
 /* PROBE P141 BEGIN */
 /* PROBE P141 (T-836, LOG ONLY): a copy (a character this game does not run) the digest printed last period and skips now - one
@@ -353,7 +358,8 @@ void P141AfterDigest()
         bool hasRow = true;
         const std::string f = P141Facts(uid, &hasRow);
         const bool watch = hasRow && g_p141OutN < kP141Track;
-        DebugLog("[P141] copy dropped from status uid=" + N(uid) + f + (hasRow ? std::string() : P141ReleaseRouteText(uid, now)) + " t=" + N(now / 1000) + "s"
+        const std::string route = hasRow ? std::string() : P141ReleaseRouteText(uid, now);
+        DebugLog("[P141] copy dropped from status uid=" + N(uid) + f + route + " t=" + N(now / 1000) + "s"
                  + (watch ? "" : " (not watched)"));
         if (watch)
         {
@@ -418,6 +424,8 @@ void DriftDigest()
             driftEnd = !off;
         }
 #endif
+#ifdef SW_DEV_BUILD
+#endif
 
         std::string fs;
         for (int p = 0; p < n; ++p)
@@ -460,6 +468,8 @@ void DriftDigest()
                  + " parts=" + N(n) + " fs=" + fs + (driftEnd ? " (agrees again)" : ""));
     }
     /* PROBE P141 BEGIN */ P141AfterDigest(); /* PROBE P141 END */
+#ifdef SW_DEV_BUILD
+#endif
 #ifndef SW_DEV_BUILD
     const unsigned int nowMs = ElapsedMs();
     if (!g_driftSummarySet) { g_driftSummarySet = true; g_driftSummaryAt = nowMs; }
@@ -724,6 +734,7 @@ void SoakTick()
                      + " src=" + std::string(byAuthority ? "ownerWrite" : "thisEngine")
                      + " " + LatchString(c));
             w->lastProne = prone;
+            /* PROBE P156 BEGIN */ w->proneAt = ::GetTickCount() | 1u; /* PROBE P156 END */
         }
         if (dead != w->lastDead)
         {
@@ -762,6 +773,21 @@ int SoakForgetUid(unsigned int uid)
     }
     return n;
 }
+
+/* PROBE P156 BEGIN */
+long SoakProneAgoMs(unsigned int uid, unsigned long at)   // probe P156
+{
+    if (uid == 0) return -1;
+    for (int i = 0; i < kMaxWatch; ++i)
+    {
+        if (g_watch[i].uid != uid) continue;
+        if (g_watch[i].proneAt == 0) return -1;
+        const long d = (long)(at - g_watch[i].proneAt);
+        return d < 0 ? 0 : d;
+    }
+    return -1;
+}
+/* PROBE P156 END */
 
 void SoakWorldTeardown()
 {

@@ -3,6 +3,8 @@
 // player's fallen characters (resurrect.cpp's copy of the world server's list), the price lines, the squadmate drop-down and
 // BRING BACK, the confirm box, the caption line and the game's message line. BRING BACK takes the TEST lever's own road
 // (resurrect.h ResurrectBringBackFor). The words and states are src/common/fallentab.h; see fallentab.cpp for how it runs.
+// With no living character of this player the tab shows no drop-down and brings the character back where the camera is
+// looking (the camera road, resurrect.h ResurrectCameraRoadOffered / ResurrectBringBackHere).
 #pragma once
 #include <string>
 

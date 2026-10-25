@@ -693,6 +693,33 @@ inline bool OpenSaveIsDecidedFolder(bool openRead, const std::string& openName, 
    while the connection is down, and is never decided in single player). Blocked only with the title DOWN in a multiplayer world: at
    the title the mod drives its own loads and new game, and an unreadable title blocks nothing. */
 inline bool HandSaveBlockedDecide(int titleUp, bool mpFolder) { return titleUp == 0 && mpFolder; }
+/* RESET POPULATION (the Level Editor's button). ZoneManager's reset wipes the whole world and re-fills the nearest town: in a
+   multiplayer world that deletes this player's own squad while the other players keep the old townspeople, so there it is
+   refused (the original is not called); in single player it runs unchanged. mpWorld = HandSaveBlocked(), the same test the
+   hand save / load refusals use. */
+const int kEditorResetRun = 0, kEditorResetRefuse = 1;
+inline int EditorResetDecide(bool mpWorld) { return mpWorld ? kEditorResetRefuse : kEditorResetRun; }
+/* The button's state, decided each time the editor panel shows and each in-world frame while it is known: greyed in a
+   multiplayer world while it is lit; in single player lit again only where the mod greyed it (the panel outlives a world),
+   otherwise left exactly as the engine made it. */
+const int kEditorBtnLeave = 0, kEditorBtnGrey = 1, kEditorBtnLight = 2;
+inline int EditorResetButtonDecide(bool mpWorld, bool greyedByMod, bool enabledNow)
+{
+    if (mpWorld) return enabledNow ? kEditorBtnGrey : kEditorBtnLeave;
+    return greyedByMod ? kEditorBtnLight : kEditorBtnLeave;
+}
+/* Whether a widget's runtime name is the Reset Population button: "populate" in Kenshi_LevelEditor.layout (no other layout of
+   the game has that name), bare or after a per-instance layout prefix ("<hex>_populate"; the hex has no '_', so the first
+   '_' is the separator). */
+inline bool EditorResetButtonName(const std::string& name)
+{
+    static const char* const kName = "populate";
+    if (name == kName) return true;
+    const std::string::size_type p = name.find('_');
+    return p != std::string::npos && name.compare(p + 1, std::string::npos, kName) == 0;
+}
+/* The greyed button's hover note, word for word as approved. */
+const char* const kEditorResetRefusedText = "Reset Population is turned off in a multiplayer world. It deletes your own squad, and the other players would keep the old townspeople.";
 /* T-201 PP6' (player-path-plan.md PP6 + the one-press revision): WHAT THE ONE PRESS DOES ONCE THE WORLD HAS ADMITTED THE PICKED
    PROFILE. folderFound = this (world, profile)'s save folder was FOUND by its key file (SaveFolderScanChoose, not the name rule's new
    name - a folder of another world or profile under the rule's name is never found); quickSave = <save root>\<folder>\quick.save

@@ -2,23 +2,29 @@
 //   jobtest work <characterUid> <buildingKey> [plain] [task=<n>] - P17: this game's own character is given the engine's own
 //                                                                  "operate this machine" order on the building (items.cpp)
 //   jobtest input <buildingKey> <itemSid> <n> [section=<name>]  - P17: n of an item into the machine's input section (items.cpp)
+//   jobtest input <buildingKey> need<i> <n> [section=<name>]    - T-609: the same, the item being the one the machine's i-th
+//                                                                  input asks for (i = 0..; read as `jobtest show` reads it)
 //   jobtest show <buildingKey>                                   - P17: read-only - the machine's name, product, inputs, sections
 //   cagetest <copyUid> nearest                                   - P43: this game's engine cages the other game's character's copy
 //                                                                  in the nearest free cage (spawn.cpp)
 //   boxdigest [<window>] players                                 - the digest with player-owned boxes included (items.cpp)
+//   cursortest open|pick|drop|square placed|copyof:<sid> ...     - T-609 (T1367): a box named without its key (CursorBoxArg)
 // No engine type and no logging here.
 #pragma once
+#include <cstdlib>
 #include <string>
 #include "saywire.h"   /* TalkSplit / TalkParseNumber - the levers' shared token and number readers */
+#include "poskey.h"    /* T-609: ParseKeySpot / SidFieldsSame - a position key's record field (CursorKeyIsRecord) */
 
 namespace joblever {
 
 const int kTaskOperateMachinery = 87;   // TaskType OPERATE_MACHINERY, "Operating machine" (.modding/03-systems/taskdata-table.md)
 const int kTaskMax = 1000;              // a task= override above this is a typing error, not a task type
 const int kInputMax = 1000;             // jobtest input: at most this many items in one put
+const int kNeedMax = 15;                // jobtest input need<i>: i at most this (a machine's input list holds at most 16)
 
 struct JobWork { unsigned int uid; std::string key; int task; int plain; };
-struct JobInput { std::string key, sid, section; int count; };
+struct JobInput { std::string key, sid, section; int count; int need; };   // need = i of need<i>, -1 = sid is an item sid
 
 /* `work <uid> <key> [plain] [task=<n>]`: uid decimal or 0x hex, non-zero; no `plain` = the order as a player's (giveOrder's
    player-order argument set), `plain` = without it (the way the mod's NPC orders give one); task= overrides OPERATE_MACHINERY. Each option at most once, in either order. 1 parsed, 0 not this form or malformed. */
@@ -48,10 +54,12 @@ inline int JobWorkParse(const std::string& arg, JobWork* out)
     return 1;
 }
 
-/* `input <key> <sid> <n> [section=<name>]`: n decimal 1..kInputMax; no section = the section whose limit list names the item. */
+/* `input <key> <sid> <n> [section=<name>]`: n decimal 1..kInputMax; no section = the section whose limit list names the item.
+   T-609: <sid> may be `need<i>` (i decimal 0..kNeedMax) = the item the machine's i-th input asks for; out->need = i, out->sid
+   stays "need<i>". `need` with nothing, or with anything but decimal digits after it, is malformed (0). */
 inline int JobInputParse(const std::string& arg, JobInput* out)
 {
-    out->key.clear(); out->sid.clear(); out->section.clear(); out->count = 0;
+    out->key.clear(); out->sid.clear(); out->section.clear(); out->count = 0; out->need = -1;
     std::string tok[6];
     const int n = coopsay::TalkSplit(arg, tok, 6);
     if ((n != 4 && n != 5) || tok[0] != "input") return 0;
@@ -64,7 +72,16 @@ inline int JobInputParse(const std::string& arg, JobInput* out)
         if (tok[4].compare(0, 8, "section=") != 0 || tok[4].size() == 8) return 0;
         sec = tok[4].substr(8);
     }
-    out->key = tok[1]; out->sid = tok[2]; out->count = (int)v; out->section = sec;
+    int need = -1;
+    if (tok[2].compare(0, 4, "need") == 0)
+    {
+        const std::string d = tok[2].substr(4);
+        if (d.empty() || d.size() > 2) return 0;
+        for (size_t k = 0; k < d.size(); ++k) if (d[k] < '0' || d[k] > '9') return 0;
+        need = std::atoi(d.c_str());
+        if (need > kNeedMax) return 0;
+    }
+    out->key = tok[1]; out->sid = tok[2]; out->count = (int)v; out->section = sec; out->need = need;
     return 1;
 }
 
@@ -77,6 +94,20 @@ inline int JobStopParse(const std::string& arg, unsigned int* uid)
     unsigned long long v = 0;
     if (!coopsay::TalkParseNumber(tok[1], &v) || v == 0 || v > 0xFFFFFFFFULL) return 0;
     *uid = (unsigned int)v;
+    return 1;
+}
+
+/* `dojobs <uid> 0|1`. 1 parsed, 0 not. */
+inline int JobDoJobsParse(const std::string& arg, unsigned int* uid, int* on)
+{
+    *uid = 0; *on = 0;
+    std::string tok[4];
+    if (coopsay::TalkSplit(arg, tok, 4) != 3 || tok[0] != "dojobs") return 0;
+    unsigned long long v = 0;
+    if (!coopsay::TalkParseNumber(tok[1], &v) || v == 0 || v > 0xFFFFFFFFULL) return 0;
+    if (tok[2] != "0" && tok[2] != "1") return 0;
+    *uid = (unsigned int)v;
+    *on = (tok[2] == "1") ? 1 : 0;
     return 1;
 }
 
@@ -128,6 +159,35 @@ inline int BoxDigestPlayersSplit(const std::string& arg, std::string* window)
         return 1;
     }
     return 0;
+}
+
+/* T-609 (T1367) TEST-ONLY: the box argument of `cursortest open | pick | drop | square` (items.cpp P105BoxArg). A box key holds the
+   position to 0.1 unit, so a run cannot name a piece placed during the run by its key; these two words name it instead:
+     placed            - the exact piece the last `buildtest place` made on this game (as `bagtest ... placed`)
+     copyof:<sid>      - the nearest loaded COPY (a stand-in faction owns it) of record <sid> to this game's own character - on game B,
+                         the piece game A placed
+   kBoxArgKey = anything else (a key, me, peer, a uid, name:...), passed on unchanged; kBoxArgBad = `copyof:` with no sid, or a sid
+   holding '@' or a space (a key, not a record). *sid = the record sid of copyof:. */
+enum { kBoxArgBad = -1, kBoxArgKey = 0, kBoxArgPlaced = 1, kBoxArgCopyOf = 2 };
+inline int CursorBoxArg(const std::string& w, std::string* sid)
+{
+    sid->clear();
+    if (w == "placed") return kBoxArgPlaced;
+    if (w.compare(0, 7, "copyof:") != 0) return kBoxArgKey;
+    const std::string s = w.substr(7);
+    if (s.empty() || s.find('@') != std::string::npos || s.find(' ') != std::string::npos || s.size() >= (size_t)poskey::kSidRoom) return kBoxArgBad;
+    *sid = s;
+    return kBoxArgCopyOf;
+}
+/* 1 = the position key's record field names record `sid` (verbatim, or the "#"+hash form a long key carries); 0 = another record or
+   not a key */
+inline int CursorKeyIsRecord(const std::string& key, const std::string& sid)
+{
+    char f[poskey::kSidRoom];
+    int sx = 0, sy = 0;
+    long x10 = 0, z10 = 0;
+    if (sid.empty() || poskey::ParseKeySpot(key.c_str(), f, poskey::kSidRoom, &sx, &sy, &x10, &z10) == 0) return 0;
+    return poskey::SidFieldsSame(f, sid.c_str());
 }
 
 }   // namespace joblever

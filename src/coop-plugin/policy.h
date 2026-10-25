@@ -78,6 +78,29 @@ std::string PolicyTeamAccessProbe(int ownerSlot, const std::string& cls);
 // teammate's box clicked as this player's own take the loot road in PlayerInterface::buildingSelected's inline owner test. Each cell
 // is written only when it changes.
 void PolicyTeammateFactions(void* const* facs, int n);
+// T-923: the near-town owner stub's hits (a teammate's town forgotten by the build cursor's "too close to another town" rule as
+// a player's own), -1 while the stub is not patched; *why (may be 0) gets the install answer. Any thread.
+long long PolicyNearTownHits(const char** why);
+// T-968: MAIN THREAD - every other player's faction on this game (the stand-in table, an old save's coop-peer and each coop-p<n>
+// record the loaded world carries for another slot; 0 / n = 0 = none) for the foliage stub, which keeps near another player's
+// outpost copy the avoid-towns world objects the owner's game keeps. Called at each change; a faction keeps its cell while it
+// stays, and each cell is written only when it changes.
+void PolicyStandInFactions(void* const* facs, int n);
+// T-968: ANY THREAD (the area read's detour) - the factions in the foliage cells, at this world generation's first call only
+// (remembered for the REPORT token foliageCellsAtFirstAreaRead); -1 at every later call of the same generation.
+int PolicyFoliageAreaRead(long worldGen);
+// T-923: the grouped placement confirm's player-town stub's hits (a teammate's outpost town taken as the group's town), -1 while not
+// patched; *why (may be 0) gets the install answer. Any thread.
+long long PolicyGroupTownHits(const char** why);
+// T-923: the slot of a CURRENT teammate whose faction `faction` is (its stand-in, or the coop-p<n> faction a save carries -
+// StandInSlotAnyPod; the team from this game's copy of the team table, TeamSameAnyThread); -1 for any other faction, this game's
+// own, or while this game's player is in no team. ANY THREAD.
+int PolicyTeammateSlot(void* faction);
+// T-923 review LOW 6: 1 = notebook slot `slot` (a SHOW row's owner) is this game's player's CURRENT teammate (the team table), 0 = not.
+int PolicyTeammateSlotIsMate(int slot);
+// T-923: this game's current teammates' factions (the cells PolicyTeammateFactions keeps, each checked again with
+// PolicyTeammateSlot), at most cap; 0 while this game's player is in no team. MAIN THREAD (the cells are written there).
+int PolicyTeammateFactionList(void** out, int cap);
 // T-546 step 4b: the `team click <slot> [class]` lever - a real click (the engine's own buildingSelected) on that player's nearest
 // loaded building; one [TEAM] click line with the hook counters that moved. MAIN THREAD. Returns the status.
 std::string PolicyTeamClick(int ownerSlot, const std::string& cls);

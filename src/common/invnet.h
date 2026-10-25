@@ -179,6 +179,97 @@ inline int BuyLowered(int before, int after, int gotClone)
 {
     return (gotClone != 0 && TakeOneLowered(before, after) != 0) ? 1 : 0;
 }
+/* T-608 / T-534 (F1042): AN NPC PURCHASE RUNS ONLY WHERE IT CAN BE PUBLISHED. Inventory::buyItem is the whole purchase (the unit,
+   the cats on both sides); a purchase from a box this game does not write cannot be published (the drain drops it and the box
+   differs for good), and a copy's purchase belongs to its own game. Returning 0 without running the engine's purchase is the
+   engine's own refusal: nothing moves, no money changes.
+   NpcBuyBoxClass names the seller: `keyed` = a box this mod can name (a keyed building, linked game); `mine` = its verdict is
+   "this game writes it"; `offMainWait` = the verdict is the off-main-thread "owner not readable here" wait (ItBoxVerdict's
+   UnreadRung defer); `ownerUnread` = the box's owner class was never read on the main thread. */
+/* T-608 (owner decision 971 b): `peerOwned` = another player's counter whose own game writes it (on the main thread: the owner rung
+   says held by its owner; off it: the owner class last read is another player's) - the purchase is SENT to that game, which makes
+   the sale (kBuyBoxPeerOwner). */
+const int kBuyBoxNone = 0, kBuyBoxMine = 1, kBuyBoxNotMine = 2, kBuyBoxUnread = 3, kBuyBoxPlayerWait = 4, kBuyBoxPeerOwner = 5;
+inline int NpcBuyBoxClass(int keyed, int mine, int offMainWait, int ownerUnread, int peerOwned = 0)
+{
+    if (keyed == 0) return kBuyBoxNone;
+    if (mine != 0) return kBuyBoxMine;
+    if (peerOwned != 0) return kBuyBoxPeerOwner;
+    if (offMainWait == 0) return kBuyBoxNotMine;   /* another game writes it, or nobody does now: refused on every game */
+    return (ownerUnread != 0) ? kBuyBoxUnread : kBuyBoxPlayerWait;
+}
+/* kBuyRun: the engine's purchase runs. kBuyRefuseCopy: the buyer is a copy of another game's character. kBuyRefuseNotWriter: the
+   box is not this game's to write. kBuyRefuseLearn: refused, and the main thread is asked to read the box's owner class (a
+   refused purchase rings nothing that would read it, so without the ask the box would be refused on every game for good).
+   kBuyRunPlayerBox: a player-owned box off the main thread - its writer is decided by the owner rung, which reads only on the
+   main thread; the purchase runs and the drain decides, as before this gate (counted apart). The mod's own applies always run. */
+/* kBuySendOwner (T-608, decision 971 b): the local purchase is refused and the purchase is sent to the counter owner's game. */
+const int kBuyRun = 0, kBuyRefuseCopy = 1, kBuyRefuseNotWriter = 2, kBuyRefuseLearn = 3, kBuyRunPlayerBox = 4, kBuySendOwner = 5;
+inline int NpcBuyGate(int applying, int copyBuyer, int boxClass)
+{
+    if (applying != 0) return kBuyRun;
+    if (copyBuyer != 0) return kBuyRefuseCopy;
+    if (boxClass == kBuyBoxNone || boxClass == kBuyBoxMine) return kBuyRun;
+    if (boxClass == kBuyBoxUnread) return kBuyRefuseLearn;
+    if (boxClass == kBuyBoxPlayerWait) return kBuyRunPlayerBox;
+    if (boxClass == kBuyBoxPeerOwner) return kBuySendOwner;
+    return kBuyRefuseNotWriter;
+}
+inline int NpcBuyRefused(int gate) { return (gate == kBuyRefuseCopy || gate == kBuyRefuseNotWriter || gate == kBuyRefuseLearn || gate == kBuySendOwner) ? 1 : 0; }
+/* T-608: ONE VISIT, ONE COUNT. A refused purchase sends the shopper on to another item (AI::buySomething bumps its `bought` before
+   the purchase, so one visit makes several tries). A try is a NEW visit unless the same buyer was refused at the same box within
+   `windowMs` (wrap-safe ticks). */
+inline int NpcBuyNewVisit(int sameBuyer, int sameKey, unsigned int lastMs, unsigned int nowMs, unsigned int windowMs)
+{
+    if (sameBuyer == 0 || sameKey == 0) return 1;
+    return ((unsigned int)(nowMs - lastMs) >= windowMs) ? 1 : 0;
+}
+/* T-608: ONE PURCHASE IN FLIGHT PER NPC. busy[0..cap) holds the buyers with a purchase sent and not yet answered (0 = a free slot).
+   >= 0: admitted into that slot; kNbAdmitSame: this buyer already has one in flight (its other tries are refused quietly);
+   kNbAdmitFull: no slot free (refused, counted). */
+const int kNbAdmitSame = -1, kNbAdmitFull = -2;
+inline int NpcBuyAdmit(const void* const* busy, int cap, const void* buyer)
+{
+    int freeAt = kNbAdmitFull;
+    for (int i = 0; i < cap; ++i)
+    {
+        if (busy[i] == buyer && buyer != 0) return kNbAdmitSame;
+        if (busy[i] == 0 && freeAt < 0) freeAt = i;
+    }
+    return freeAt;
+}
+/* T-608: THE BUYING GAME'S MAIN-THREAD CHECK before the request goes. Sent only when the counter resolves here, the link is up,
+   the owner rung says the counter's OWNER's game writes it (heldByOwner) and its owner is another player (peerOwned). Anything
+   else - owner offline, area not loaded there, no owner resolved - is refused: never a local sale that pays a stand-in. */
+/* fold 2 (review M1): the engine's own two checks run HERE, before the owner sells, as Inventory::buyItem runs them before anything
+   moves - budgetRead: the NPC's money read (it rides the request as its budget; the owner refuses a unit price above it); roomOk:
+   1 the NPC's inventory takes one unit, 0 it does not ("No room"), -1 the item is no longer on this game's copy of the counter. */
+const int kNbSend = 0, kNbNoCounter = 1, kNbNoLink = 2, kNbNotOwnerGame = 3, kNbBuyerGone = 4, kNbNoBudget = 5, kNbNoRoom = 6,
+          kNbNotOnCounter = 7, kNbReasons = 8;
+inline int NpcBuySendDecide(int buyerLive, int counterFound, int linked, int heldByOwner, int peerOwned, int budgetRead = 1, int roomOk = 1)
+{
+    if (buyerLive == 0) return kNbBuyerGone;
+    if (counterFound == 0) return kNbNoCounter;
+    if (linked == 0) return kNbNoLink;
+    if (heldByOwner == 0 || peerOwned == 0) return kNbNotOwnerGame;
+    if (budgetRead == 0) return kNbNoBudget;
+    if (roomOk < 0) return kNbNotOnCounter;
+    if (roomOk == 0) return kNbNoRoom;
+    return kNbSend;
+}
+/* A refusal storm stays readable: say refusal number `n` (1-based) when it is one of the first `first`, then every `every`th. */
+inline int RefusalSay(long long n, long long first, long long every)
+{
+    if (n <= 0) return 0;
+    if (n <= first) return 1;
+    return (every > 0 && n % every == 0) ? 1 : 0;
+}
+/* The per-box re-ask limiter (ItParityTick step 3, which every dropped box change now goes through): 1 = a key last asked at
+   `last` (have = 0: never asked) may be asked again at `now`. Millisecond ticks, wrap-safe; it ages out by time alone. */
+inline int ReaskDue(int have, unsigned int last, unsigned int now, unsigned int gapMs)
+{
+    return (have == 0 || (unsigned int)(now - last) >= gapMs) ? 1 : 0;
+}
 /* Research consume 0x82DA30 replayed over the stacks its two getItem calls returned, in call order (gapB 4a): while need > 0 -
    need < qty: that stack is lowered to qty - need by a direct write (nothing rings) and the consume stops; otherwise the whole
    stack goes through the watched removeItemAutoDestroy and need -= qty. Returns the lowered stack's index (its new quantity in

@@ -11,10 +11,8 @@
  * them and nothing removed them - people that existed on one machine only, for good.
  *
  * TWO HALVES.
- *   (1) PREVENTION (LeafUnlinked): with the game link down, a LIVE notebook map that names another holder refuses
- *       the creation (decision 37: a game invents people only where the notebook names it holder).  No live map
- *       (true solo / offline play, or the notebook down) and an area that is unclaimed or this game's keep the old
- *       unlinked answer: allowed.
+ *   (1) PREVENTION (LeafLinked): a game in a multiplayer world creates people only where a fresh notebook map names it
+ *       the holder (decision 37), whether other players are in the world or not; with no fresh map nobody creates.
  *   (2) CLEANUP (Decide): after link-up, an unregistered non-player character standing in an area another game
  *       holds is removed through the stand-in purge's route (the holder's world wins; there is no handover).
  *       Never a player-faction character, never one carried by a player character, never a caged one (a caged
@@ -31,12 +29,6 @@
 #define COOP_COMMON_ORPHANPURGE_H
 
 namespace coopor {
-
-/* (1) THE LEAF GATE'S UNLINKED ARM.  heldByOther is HeldByOtherTS's answer: 1 another game holds the area,
-   0 it does not (unclaimed or this game's), -1 no live notebook map. */
-const int kLeafAllowUnlinked = 0, kLeafGatedHeldUnlinked = 1;
-/* -2 (coopdrop::kAreaFrozen): the area's holder is a player not in the world - nothing is created there until it is back. */
-inline int LeafUnlinked(int heldByOther) { return (heldByOther == 1 || heldByOther == -2) ? kLeafGatedHeldUnlinked : kLeafAllowUnlinked; }
 
 /* (1b) p97-op - P97 (owner 334 a / 337 a): THE LEAF GATE'S LINKED ARM.  `may` is MayInventFromView's answer:
    > 0 this game invents here, 0 it does not, < 0 no fresh area map (the caller takes the teardown answer apart
@@ -82,14 +74,13 @@ enum {
     kWhyInUnknown         = 10,  /* +0x2F8 names a state other than 0 / 1 bed / 2 cage */
     kWhyNearPlayer        = 11,  /* review-orphan1 HIGH: a player-faction character within kNearPlayerR - a later pass */
     kWhyNotedTooShort     = 12,  /* review-orphan1 MED: noted continuously for less than kNotedMinMs - a later pass */
-    kWhyLinkTooFresh      = 13,  /* review-orphan1 MED: the game link has been up less than kLinkedMinMs - a later pass */
+    kWhyLinkTooFresh      = 13,  /* review-orphan1 MED: another player arrived in this world less than kLinkedMinMs ago - a later pass */
     kWhyCount             = 14
 };
 
 /* Everything the decision needs about one queued character, read by the caller. */
 struct Seen
 {
-    int linked;           /* 1 = the game-to-game link is up (the cleanup runs only after link-up) */
     int areaOther;        /* HeldByOtherTS for the sector it stands in: 1 another game holds it, 0 not, -1 no live map */
     int known;            /* 1 = FindSpawnedUid answers a uid for it (registered: adopted or a peer copy) */
     int standIn;          /* 1 = its faction record is a stand-in (coop-p<n> / coop-peer): the stand-in purge's business */
@@ -106,7 +97,7 @@ struct Seen
     int nearPlayer;       /* 1 = a player-faction character is within the adjacency radius */
     int dupOfLiveCopy;    /* T-304 (1): 1 = a registered copy of ANOTHER game's character with the same template and faction stands within kDupCopyR - a duplicate, so the near-player wait does not apply */
     unsigned long notedMs;   /* how long the adoption pass has noted it CONTINUOUSLY */
-    unsigned long linkedMs;  /* how long the game link has been up (0 when it is down) */
+    unsigned long linkedMs;  /* how long since another player last arrived in this world (spawn.cpp OrphanPurgeTick's arrival clock) */
 };
 
 /* review-orphan1 MED: the waiting period. */
@@ -115,7 +106,7 @@ const unsigned long kNotedMinMs = 5000, kLinkedMinMs = 10000;
 inline Seen SeenNone()
 {
     Seen s;
-    s.linked = 1; s.areaOther = 1; s.known = 0; s.standIn = 0; s.guarded = 0; s.fightNear = 0; s.inSomething = 0;
+    s.areaOther = 1; s.known = 0; s.standIn = 0; s.guarded = 0; s.fightNear = 0; s.inSomething = 0;
     s.beingCarried = 0; s.carrierFound = 0; s.carrierIsPlayer = 0; s.carrierTried = 0; s.bedTried = 0;
     s.carrying = 0; s.ownDropTried = 0;
     s.nearPlayer = 0; s.dupOfLiveCopy = 0; s.notedMs = kNotedMinMs; s.linkedMs = kLinkedMinMs;
@@ -128,7 +119,6 @@ inline Seen SeenNone()
 inline int Decide(const Seen& s, int* why)
 {
     *why = kWhyNone;
-    if (s.linked == 0) return kActNone;          /* only after link-up: a solo / unlinked game keeps its world */
     if (s.areaOther != 1) return kActNone;       /* unclaimed, mine, or no live map: not an orphan */
     if (s.known != 0) return kActNone;           /* registered: someone announces it */
     if (s.standIn != 0) return kActNone;         /* the stand-in purge's (inv7a), not ours */

@@ -48,6 +48,7 @@
 #include "../../common/slavewire.h"  /* slave1: the MSG_SLAVE payload */
 #include "../../common/shotwire.h"   /* P104 fix: the MSG_SHOT payload */
 #include "../../common/meleewire.h"   /* the MSG_MELEE_DECIDED payload */
+#include "../../common/squadbirth.h"   /* CONTEXT's birth word */
 #include "../../common/handrec.h"   /* T-889 step 2: MSG_ITEM_HANDOVER and the game-to-game protocol number */
 #include "../../common/effectwire.h"   /* T-327: the MSG_EFFECT payload and its road */
 #include "../effect.h"                 /* T-327: EffectOnNet */
@@ -176,7 +177,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 166;   /* the game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 172;   /* T-922 (172): the SPAWN carries the template's stringID in a tail after the flags byte; the shown name stays in its old field. The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 typedef char T889ProtocolAgrees[(kProtocolVersion == hovrec::kGameProtocol) ? 1 : -1];   /* T-889 step 2 (164: MSG_ITEM_HANDOVER; effort/t853 takes 163; 165 T-609: the farm worker-spot kinds inside MSG_BUILD renumbered 12-14 -> 13-15,
                                                                                                   12 being DISMANTLE_ASK's): the offline protocol test reads handrec.h */
 
@@ -687,14 +688,15 @@ void OnContext(const Message& m)
     std::string squadSid(&m.payload[off + 4], sl); off += 4 + sl;
     if (!GetU32(m.payload, off, &tl) || m.payload.size() < off + 4 + tl) { ErrorLog("[net] malformed CONTEXT (town sid) - ignored"); return; }
     std::string townSid(&m.payload[off + 4], tl); off += 4 + tl;
-    std::string platoonId; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu;
+    std::string platoonId; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu; unsigned int birthWire = sqbirth::kWireBirthUnknown;
     if (GetU32(m.payload, off, &pl) && m.payload.size() >= off + 4 + pl)
     {
         platoonId.assign(&m.payload[off + 4], pl); off += 4 + pl;   // P1 (older senders: empty)
+        { unsigned int bw = sqbirth::kWireBirthUnknown; if (GetU32(m.payload, off + 4, &bw)) birthWire = bw; }   /* the squad's birth flag after the load age (squadbirth.h); absent = unknown */
         { unsigned int age = 0; if (GetU32(m.payload, off, &age)) peerLoadAgeMs = age; }   /* the age of the sender's current world load in ms (0xFFFFFFFF unknown, also when absent) */
     }
     const int senderSlot = PeerSlotOfKey(m.peer);   /* the seat of the game this CONTEXT came from (the link it arrived on), -1 unknown */
-    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot);
+    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot, sqbirth::BirthOfWire(birthWire));
 }
 
 void OnIntent(const Message& m)
@@ -739,6 +741,7 @@ void OnSpawn(const Message& m)
     if (sm.ageClamped) ++g_spawnAgeClamped;
     if (sm.statsState == coopspawn::kSpawnStatsBad) coop::StatsNoteBadBlock();          // S1: truncated / NaN / infinite
     else if (sm.statsState != coopspawn::kSpawnStatsOk) coop::StatsNoteNoBlock();       // S1: an older payload, or has 0
+    if (sm.templateSidBad) coop::TemplateNoteSidBad();   /* T-922: a malformed stringID tail - the id is not used, the shown name is (spawnage.h) */
 
     // M4 fold (review 2026-09-29 H1, defence in depth): a SPAWN whose uid names a character THIS game runs is refused and
     // counted. It can only be a repeated uid (a restarted peer re-minting); taking it would write g_owner over our own
@@ -777,7 +780,7 @@ void OnSpawn(const Message& m)
     if (!sm.flagsAbsent) coop::CopyNoteSpawnFlags(sm.uid, sm.ownerFlags);
     const long long nsBefore = coop::MirrorPeerRefusals();   /* T-354 */
     coop::CreateRefusalReset();   /* the creation core's lasting refusal, read after the SPAWN */
-    coop::ApplyRemoteSpawn(sm.uid, sm.templateName, sm.x, sm.y, sm.z, sm.factionName, sm.keepContainer, sm.age,
+    coop::ApplyRemoteSpawn(sm.uid, sm.templateName, sm.templateSid, sm.x, sm.y, sm.z, sm.factionName, sm.keepContainer, sm.age,
                            sm.statsState == coopspawn::kSpawnStatsOk ? sm.stats : 0);   /* S1: the owner's 44 stat values */
     if (coop::FindSpawned(sm.uid) != 0) coop::TalkCursorCopyReady(sm.uid);   /* T-737: the copy is here - one preload ASK of its talk cursor */
     /* T-354: our character table refused this copy - the owner is told, so it is counted on both games. T-354 fold 1: only
@@ -1055,6 +1058,7 @@ bool RemoteMayWriteStill(unsigned int uid, unsigned int fromPeer) { return Remot
 
 bool SessionIsHost() { return g_isHost; }
 bool SessionLinked() { return g_transport != 0 && g_transport->State() == LINK_UP; }
+bool SessionUpOrDialing() { return g_transport != 0 && (g_transport->State() == LINK_UP || g_transport->State() == LINK_CONNECTING); }
 unsigned int SessionPeerCount() { return g_transport != 0 ? g_transport->PeerCount() : 0; }   /* P7f (review-p6z H-1) */
 bool SessionPeerRawId(unsigned int* out) { return g_transport != 0 && g_transport->CurrentPeerId(out); }   /* T-355 fold 2 */
 
@@ -1722,6 +1726,8 @@ static int CharRoadNow()   /* M7a fold F1: RELATION's rule - the session link wh
     return cooplive::CharStreamRoad(coop::StoreLiveReady(), g_transport != 0 && g_transport->State() == LINK_UP, SessionPeerRelayOk(), coop::LinkPeerSlot());
 }
 static bool CharRoadOpen() { return CharRoadNow() != cooplive::kCharRoadNone; }
+/* the road SendItemRequest takes is open - the session link or the world server's relay (a world-road game has no session link) */
+bool ItemRoadOpen() { return CharRoadOpen(); }
 /* M7b slice 4 fold 1 (F5): the road (and route) the last character-stream send took - a CRIME that follows a SPAWN goes the same way */
 struct CharLastSent { bool valid, session; unsigned int uid, route, target; };
 static CharLastSent g_charLastSent = { false, false, 0u, 0u, 0u };
@@ -2715,9 +2721,10 @@ bool SendSwing(unsigned int uid, unsigned int targetUid)
 
 // M-B / P064 / H027 - CONTEXT: uid(u32) | squadType(i32) | memberType(i32) | buildingHand(32 B) | charHand(32 B) | bx,by,bz(3f) | squadSidLen(u32) squadSid | townSidLen(u32) townSid
 //   | platoonIdLen(u32) platoonId | loadAgeMs(u32: ms since the sender's current world load finished, 0xFFFFFFFF unknown; squadorigin.h OwnIdLiftedByLoadAge)
+//   | birth(u32: the squad's birth flag, squadbirth.h WireOfBirth - 1 kept, 0 not kept, 0xFFFFFFFF unknown)
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId, unsigned int loadAgeMs)
+                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire)
 {
     if (!CharRoadOpen()) return false;   /* M7a: the notebook road, or the session link while it is down */
     std::vector<char> b;
@@ -2730,6 +2737,7 @@ bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, c
     PutU32(&b, (unsigned int)townSid.size());  b.insert(b.end(), townSid.begin(), townSid.end());
     PutU32(&b, (unsigned int)platoonId.size()); b.insert(b.end(), platoonId.begin(), platoonId.end());   // P1: the sender's platoon id = the squad's world id
     PutU32(&b, loadAgeMs);   /* the age of this game's current world load; a receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
+    PutU32(&b, birthWire);   /* the squad's birth flag (squadbirth.h WireOfBirth): the receiver's copy takes its kept byte from it */
     return CharSend(MSG_CONTEXT, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* M7a */
 }
 
@@ -2847,6 +2855,18 @@ static std::map<unsigned int, cooplive::ItemAskedSet> g_itemAsked;   /* request 
 static std::vector<unsigned int> g_itemAskedRing;          /* the order ids were first noted in: the oldest is forgotten first */
 static size_t g_itemAskedNext = 0;
 static const size_t kItemAskedMax = 4096;
+/* T-1007 (J3): a request asked again under its id (a re-send) moves to the NEWEST place of the order the oldest is forgotten in */
+static void ItemAskedRefresh(unsigned int id)
+{
+    const size_t n = g_itemAskedRing.size();
+    if (n == 0) return;
+    const size_t newest = (n >= kItemAskedMax) ? (g_itemAskedNext + n - 1) % n : n - 1;
+    size_t j = n;
+    for (size_t k = 0; k < n; ++k) if (g_itemAskedRing[k] == id) { j = k; break; }
+    if (j == n || j == newest) return;
+    while (j != newest) { const size_t nx = (j + 1) % n; g_itemAskedRing[j] = g_itemAskedRing[nx]; j = nx; }
+    g_itemAskedRing[newest] = id;
+}
 static void ItemAskedNote(unsigned int id, unsigned int key)
 {
     if (g_itemAsked.find(id) == g_itemAsked.end())
@@ -2859,6 +2879,7 @@ static void ItemAskedNote(unsigned int id, unsigned int key)
             g_itemAskedNext = (g_itemAskedNext + 1) % kItemAskedMax;
         }
     }
+    else ItemAskedRefresh(id);   /* T-1007 (J3) */
     cooplive::ItemAskedAdd(&g_itemAsked[id], key, coop::LinkPeerSlot());
 }
 static cooplive::ItemAskedSet* ItemAskedFind(unsigned int id)
@@ -2896,6 +2917,25 @@ int PlayerSlotOfKey(unsigned int key)
     return (s >= 0) ? s : coop::LinkPeerSlot();
 }
 unsigned int PlayerKeyNow(unsigned int sender) { return cooplive::PlayerKeyOf(sender, coop::LinkPeerSlot()); }   /* fold 1 (F2) */
+/* T-1007 (J): the game a request was asked of cannot answer now - no road to any game (CharRoadNow none), or it has left: out of the
+   world roster and, for the session peer, its session link down too (the sticky re-send's own test). False with no ask on record. */
+bool ItemAskedGameGone(unsigned int id)
+{
+    unsigned int key = 0;
+    if (!ItemAskedKey(id, &key)) return false;
+    if (CharRoadNow() == cooplive::kCharRoadNone) return true;
+    const int asked = ItemToAsker(true, key);
+    const bool sessionUp = g_transport != 0 && g_transport->State() == LINK_UP;
+    const bool isPeer = key == 0u || (asked >= 0 && asked == coop::LinkPeerSlot());
+    const int inWorld = (asked >= 0) ? coop::StoreRosterSlotInWorld(asked) : -1;
+    return isPeer ? (!sessionUp && inWorld == 0) : (inWorld == 0);
+}
+/* T-1007 (J2): the request was asked over the session link - the key it went under is the session peer's raw key (0) */
+bool ItemAskedOnSession(unsigned int id)
+{
+    unsigned int key = 0;
+    return ItemAskedKey(id, &key) && key == 0u;
+}
 int ItemAskedSlot(unsigned int id)
 {
     unsigned int key = 0;
@@ -3015,7 +3055,7 @@ static bool ItemMoveBytes(const coop::ItemMoveMsg& m, std::vector<char>& b, bool
     // E22c-2 (P7n): the key, then the instance id BESIDE it. The id is allowed to be empty - that is the
     // ordinary state in a shipped town - and the receiver never keys on it; it counts whether it agrees with
     // the building the position key found. Both fields sit before the op-2 base sid so that block stays last.
-    if (m.uid == 0) { PutStr(&b, m.boxKey); PutStr(&b, m.boxId); coopgname::IdKindPut(&b, m.idKind, m.idFor); }   /* T-693 (protocol 149): what the key is - bare, a name, or a name for the receiver's listed id */
+    if (m.uid == 0) { PutStr(&b, m.boxKey); PutStr(&b, m.boxId); coopgname::IdKindPut(&b, m.idKind, m.idFor); coopgname::MadePut(&b, m.made); }   /* T-693 (protocol 149): what the key is - bare, a name, or a name for the receiver's listed id */
     /* inv6 (protocol 71) + items9 (protocol 78): an ADD ends with [BAG1 - a pack's contents, a holder's GROUND ADD] [OWN1 - the stolen
        mark], each only when there is something (coopistat::EncodeAddTail; op 0 has no op-2 sid, so this tail is last). A block that
        will not encode is dropped - the item goes without it - rather than the move lost. */
@@ -3133,11 +3173,13 @@ bool SendItemMoveOnPlan(const coop::ItemMoveMsg& m, const cooplive::ExceptPlan& 
 /* M7b slice 2: the ASK to the holder of the sector it names (coop::ItemAreaWriterSlot; none known -> the session peer on the
    session road, else not sent - counted noOwner, the next parity round asks again); the ANSWER back to the asker; a PUSH (a box
    this game writes, newly filled) to every game covering its sector. */
-bool SendParityReq(const std::vector<char>& bytes, int sx, int sy)
+bool SendParityReq(const std::vector<char>& bytes, int sx, int sy, int toSlot)
 {
     if (CharRoadNow() == cooplive::kCharRoadNone) return false;
     if (bytes.empty()) return true;
-    const int to = cooplive::ItemAddrDecide(cooplive::kItemToArea, false, 0u, coop::ItemAreaWriterSlot(sx, sy), false, 0u, coop::LinkPeerSlot());
+    /* T-964 writer ask: a named game (the writer of a player-owned box another game writes) is asked on whichever road reaches it */
+    const int holder = (toSlot >= 0) ? toSlot : coop::ItemAreaWriterSlot(sx, sy);
+    const int to = cooplive::ItemAddrDecide(cooplive::kItemToArea, false, 0u, holder, false, 0u, coop::LinkPeerSlot());
     const bool ok = ItemSendTo(MSG_PARITY_REQ, to, &bytes[0], bytes.size(), 0u, 0);
     if (ok) AddrCount(MSG_PARITY_REQ, kAddrColToOwner);
     return ok;
@@ -3223,6 +3265,9 @@ static void OnItemMoveBody(const Message& m, const coophold::ReqTag* hdTag)
         /* T-693 (protocol 149): the id kind - cut, unknown, or a NAME FOR on anything but an ADD: REFUSED whole */
         if (!coopgname::IdKindGet(m.payload, &at, &im.idKind, &im.idFor) || (im.idKind == coopgname::kIdNameFor && im.op != 0))
         { ErrorLog("[net] ITEM_MOVE with owner uid 0 and a missing or bad id kind - REFUSED"); return; }
+        /* the made-during-play byte: cut or not 0 / 1 - REFUSED whole */
+        if (!coopgname::MadeGet(m.payload, &at, &im.made))
+        { ErrorLog("[net] ITEM_MOVE with owner uid 0 and a missing or bad made-during-play byte - REFUSED"); return; }
     }
     /* P7a fold 1: the op-2 base sid, if the sender put one there. OPTIONAL BY CONSTRUCTION - a sender that
        did not append it, or an entry whose fields could not be read, leaves this empty and the receiver's
@@ -3335,7 +3380,7 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
                   r.quality, r.charges, r.functionKind, r.level, r.unique);
     // E22c (P6e), as in SendItemMove: the owner half is a STORAGE BOX when its uid is 0, and its instance id
     // is the LAST thing in the payload so the give-fields block keeps the position protocol 37 gave it.
-    if (r.ownerUid == 0) { PutStr(&b, r.ownerBoxKey); PutStr(&b, r.ownerBoxId); coopgname::IdKindPut(&b, r.ownerIdKind == coopgname::kIdName ? coopgname::kIdName : coopgname::kIdBare, std::string()); }   /* E22c-2 (P7n): key, then the id beside it; T-693 (protocol 149): then whether the key is a name */
+    if (r.ownerUid == 0) { PutStr(&b, r.ownerBoxKey); PutStr(&b, r.ownerBoxId); coopgname::IdKindPut(&b, r.ownerIdKind == coopgname::kIdName ? coopgname::kIdName : coopgname::kIdBare, std::string()); coopgname::MadePut(&b, r.made); }   /* E22c-2 (P7n): key, then the id beside it; T-693 (protocol 149): then whether the key is a name */
     if (r.takerUid == 0) PutStr(&b, r.takerBoxKey);   /* T-164 211 (protocol 98): the taker BOX's key (empty = no taker) */
     // E35 (P6o) / decision 41: AFTER the optional container key, so the key keeps the position protocol 38
     // gave it and this block is simply two more fields at the end. Both are UNCONDITIONAL - a trade flag of 0
@@ -4378,6 +4423,7 @@ void LostCopyRefusedHere(unsigned int uid, bool refused)
 }
 void LostCopyArrived(unsigned int uid)
 {
+    if (uid != 0) coop::MedicalCopyUsableAgain(uid);   /* an owner's death this copy missed is applied (medical.cpp) */
     if (uid == 0 || g_lost.rows.empty() || !LostCopyHereNow(uid)) return;
     const int i = lostcopy::LostFind(g_lost, uid);
     if (i < 0) return;
@@ -4995,6 +5041,9 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
         std::string idFor;
         if (!coopgname::IdKindGet(m.payload, &at, &r.ownerIdKind, &idFor) || r.ownerIdKind == coopgname::kIdNameFor)
         { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and a missing or bad id kind - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
+        /* the made-during-play byte: cut or not 0 / 1 - REFUSED whole */
+        if (!coopgname::MadeGet(m.payload, &at, &r.made))
+        { ErrorLog("[net] ITEM_REQUEST with owner uid 0 and a missing or bad made-during-play byte - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     /* T-164 211 (protocol 98): a taker uid of 0 carries the taker BOX's key next - empty = no taker (a ground put that names none) */
     if (r.takerUid == 0 && !GetStr(m.payload, &at, &r.takerBoxKey))
@@ -5320,9 +5369,13 @@ bool SendSpawn(unsigned int uid, const std::string& templateName, float x, float
        adoption, link-up, reload, a rejoin - creates the copy as the character is here (a corpse is never announced standing). */
     const unsigned int spawnFlags = coop::SpawnOwnerFlags(character);
     coopspawn::AppendSpawnFlags(&b, spawnFlags);
+    /* T-922 (protocol 172): the template's stringID follows (templatekey.h); "" = none, the receiver then uses the shown name */
+    const std::string tmplSid = coop::TemplateSidOf(character);
+    coopspawn::AppendSpawnTemplateSid(&b, tmplSid);
 
     bool ok = CharSend(MSG_SPAWN, uid, &b[0], b.size(), CH_RELIABLE, coop::AreaKeyAt(x, z));   /* M7a: the sector of the position it carries */
     if (ok) coop::SpawnNoteFlagsSent(spawnFlags);   /* T-303 fold 1: counted only for a SPAWN the send accepted */
+    if (ok && tmplSid.empty()) coop::TemplateNoteSentByName();   /* a SPAWN sent by shown name alone */
     if (ok && statsHave) coop::StatsNoteSpawnCarried(uid, statsRaw);
     if (ok) coop::NameSendWithSpawn(uid, character);   /* names1: the character's current name follows every SPAWN on the same reliable channel */
     if (ok) coop::SlaveSendWithSpawn(uid, character);  /* slave1: and its slave state */
@@ -5336,7 +5389,7 @@ bool SendSpawn(unsigned int uid, const std::string& templateName, float x, float
     // whether the peer has been told is a different question.
 
     std::ostringstream ageText; ageText.imbue(std::locale::classic()); ageText << age;
-    DebugLog("[net] -> SPAWN uid=" + N(uid) + " '" + templateName + "' age=" + ageText.str()
+    DebugLog("[net] -> SPAWN uid=" + N(uid) + " '" + templateName + "' sid='" + tmplSid + "' age=" + ageText.str()
              + (clampedOut ? " (clamped)" : "")
              + " dead=" + N((spawnFlags & coopspawn::kSpawnFlagDead) != 0 ? 1 : 0)
              + " ko=" + N((spawnFlags & coopspawn::kSpawnFlagKo) != 0 ? 1 : 0)   /* T-303 */
@@ -5629,6 +5682,7 @@ void OnPeerSlot(const Message& m)
     DebugLog("[net] <- PEER_SLOT " + N((long long)slot) + (moved ? " (was " + N((long long)was) + ")" : std::string())
              + " - the session peer's claims are keyed by its player number; " + N(n) + " re-keyed from the link id"
              + (moved ? std::string(" or its old number") : std::string()) + " (ownerRekeyed " + N(g_ownerRekeyed) + ")");
+    coop::ShopAskerSlotKnown((int)slot);   /* T-1007 (J4): the shop records filed under the link key move to the slot */
 }
 void SessionMoveViaLive(int n)
 {
@@ -6129,6 +6183,8 @@ void OnPeerGone(int goneSlot)
     coop::NameForgetPeer(goneSlot);   /* names1: names held for copies the gone peer never had built here (every one while its slot is unknown) */
     coop::SlaveForgetPeer(goneSlot);  /* slave1: slave states held for copies the gone peer never had built here */
     coop::HireForgetPeer(goneSlot);   /* recruit1: requests in flight to the gone peer and promises to it are dropped */
+    coop::ShopAppliedResendTo(goneSlot);   /* T-1007 (J4): that player's unacked shop confirms again, by the road that still reaches it */
+    coop::ShopPendAskedGone(goneSlot, 1);   /* T-1007 (J): the link went down - the shop requests asked before it are settled */
     coop::ItParityForgetAsker(goneSlot);   /* the gone peer's sector asks no longer route fill pushes to it (every game's while its slot is unknown) */
 
     const int platoons = RetirePeerContextPlatoons(goneSlot);
@@ -6166,6 +6222,7 @@ int PeerGoneSweepPending(const char* why)
     long long alreadyGone = 0;
     PeerGoneTakePending(&uids, &alreadyGone);
     net::g_peerGoneAlreadyGone += alreadyGone;
+    coop::ShopPendAskedGone(-1, 1);   /* T-1007 (J2): the link this sweep stands in for went down - its shop requests are settled, rows captured or not */
     if (uids.empty() && alreadyGone == 0) return 0;
     if (!uids.empty()) coop::TalkForgetPeer(coop::kTalkAllPeers);   /* M8 review F3 (P26 rule): the conversations of the link this sweep stands in for end BEFORE its copies go - OnPeerGone's order */
     long long destroyed = 0, withdrawn = 0, absent = 0;
@@ -6305,7 +6362,7 @@ void PlayerGoneTakeOverTick()
             continue;
         }
         ++g_gtEnded;
-        const int r = DropPeerOwnedCopy(w.uid);
+        const int r = DropPeerOwnedCopy(w.uid, 1);   /* T-1007 (J2): a departure */
         net::g_owner.erase(w.uid); net::g_copyGen.erase(w.uid); coop::net::RosterStreamForget(w.uid); net::g_departedPending.erase(w.uid);
         dropped.push_back(w.uid); droppedSlots.insert(w.slot);
         const std::string why = pc != 0 ? std::string("its copy is gone or unreadable")
@@ -6337,12 +6394,14 @@ void OnPlayerGone(unsigned int slot, const char* how, int standIn)
     long long destroyed = 0, withdrawn = 0, absent = 0, cleared = 0;
     for (size_t i = 0; i < uids.size(); ++i)
     {
-        const int r = DropPeerOwnedCopy(uids[i]);
+        const int r = DropPeerOwnedCopy(uids[i], 1);   /* T-1007 (J2): a departure */
         if (r == 1) ++destroyed; else if (r == 0) ++withdrawn; else ++absent;
     }
     coop::NameForgetPeer((int)slot);   /* names held for copies that player never had built here */
     coop::SlaveForgetPeer((int)slot);  /* slave states held for that player's copies */
     coop::HireForgetPeer((int)slot);   /* hire requests to that player cancelled, promises to it released, its undrained hire messages dropped */
+    coop::ShopPendAskedGone((int)slot, 0);   /* T-1007 (J): the shop requests asked of that player are settled (the lapse's give-back) */
+    coop::ShopAppliedForgetGame((int)slot);   /* T-1007 (J1): the shop trades applied for that player can never be acked - their records go */
     coop::ItParityForgetAsker((int)slot);   /* that player's sector asks no longer route fill pushes to it */
     const int platoons = RetirePeerContextPlatoons((int)slot);   /* after its copies went: the platoons built here for its characters */
     for (size_t i = 0; i < uids.size(); ++i) { cleared += (long long)net::g_owner.erase(uids[i]); net::g_copyGen.erase(uids[i]); coop::net::RosterStreamForget(uids[i]); /* [a1b1-sp11] [F9] */ net::g_peerGoneAlreadyGone += (long long)net::g_departedPending.erase(uids[i]); }   /* M8 review F5: a captured row PLAYER_GONE removed first is counted peerGoneM8 alreadyGone HERE - its mark is spent, so the session road never sees it */

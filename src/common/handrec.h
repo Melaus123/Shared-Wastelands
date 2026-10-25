@@ -49,8 +49,8 @@ namespace hovrec {
 const int          kHandFamily   = 17;
 const unsigned int kHandCap      = 256;    /* lines the file keeps; only SETTLED lines (closed / returned) are dropped to fit */
 inline std::string HandFile() { return "pp.handover"; }
-const unsigned int kGameProtocol = 166;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it);
-                                              166 (P47): MSG_BUILD kinds 16 POWER_STATE and 17 POWER_ASK (src/common/powerwire.h) */
+const unsigned int kGameProtocol = 172;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it); 172 T-922: the SPAWN carries the template's stringID in a tail after the flags byte; the shown name stays in its old field */
+
 const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h, liveenvelope.h kInnerItemHandover assert it) */
 
 const int kRoleSrc = 0, kRoleDst = 1;

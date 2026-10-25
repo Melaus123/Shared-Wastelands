@@ -28,6 +28,14 @@ int  StoreWelcomePushDone();
 // held when this game asked, then the last page's END marker - been applied by the drain? 0 at the title, through a load and
 // until then; reset at every load, quit to menu and new link. Until it is 1, "the notebook does not know this id" is unanswerable.
 int  StoreSnapshotApplied();
+// T-985 step 2B: have the world server's records of ONE area all arrived here (its AREA_DONE, or the whole feed's AREA_DONE all=1)?
+// Cleared where StoreSnapshotApplied is reset. sec = an items.cpp sector index (x * 64 + y); -1 = no area (only the whole feed
+// answers); kStoreAreaAny = any area done. oldAnswer = the whole-feed answer the gate used before 2B: a differing answer is counted
+// (gateDisagree on the [STORE] REPORT line) and the new one returned. Any thread (interlocked reads).
+enum { kAreaGateAreaRead = 0, kAreaGateLoadRecord = 1, kAreaGateGroundWrite = 2, kAreaGateGroundScan = 3, kAreaGateBoxHold = 4, kAreaGateBoxTick = 5, kAreaGateTown = 6, kAreaGateCount = 7 };
+const int kStoreAreaAny = -2;
+int  StoreAreaDoneSec(int sec, int oldAnswer, int gate);
+int  StoreAreaDoneXY(int x, int y, int oldAnswer, int gate);   // sector x, y (area key y * 64 + x, zones.cpp Key()); -1, -1 = no area
 void ReportStore();
 void StorePumpCapSet(int n);                 // TEST-ONLY (verb pumpcap): n > 0 = each world-server intake call handles at most n messages, no time budget; 0 = the normal rule
 // T-239 (owner 191 A / 192): true while the player may not save, load or start a new game by hand - the title is down AND this is a
@@ -39,6 +47,10 @@ bool HandSaveBlocked();
 void StorePeerGone();
 void SetStoreOn(bool on);
 void SetZoneStateOn(bool on);   // piece 3a: zone capture + load override (default OFF until piece 3b)
+/* T-948 b: Character::moveToNewSquad 0x5CDA50 refuses another game's character (store.cpp detour_sqMove) - except inside this pair, on
+   this thread: the mod's own deliberate move of a copy. Nests. Nothing calls it today. Any thread. */
+void StoreSquadMovePassBegin();
+void StoreSquadMovePassEnd();
 /* E47-S2 (P8f re-prepared): the 30-second heartbeat for this game's AWAKE world groups (F660). `heartbeat on|off`; the
    publisher ships OFF and the registry and its counters run either way. The dirty marks are MAIN THREAD (a worker's is
    dropped - the 30 s floor covers it). cause: kHbCauseItem / kHbCauseWake. */
@@ -50,9 +62,14 @@ const int kHbCauseItem = 0, kHbCauseWake = 1;
 bool SetStoreServer(const std::string& address, unsigned short port);
 // Harness lever: move the awake platoon named worldId by (dx, dz) - `platoonnudge <id> <dx> <dz>`.
 bool PlatoonNudge(const std::string& worldId, float dx, float dz);
-// The client's context-built platoon carries the host's platoon id (CONTEXT). Also marks it persistent so this engine
-// puts it to sleep instead of destroying it.
-void StoreBindPlatoon(void* platoon, const std::string& worldId);
+// A copy of another game's squad carries that squad's id (CONTEXT) and its birth flag (squadbirth.h): the copy's kept byte is set from
+// the flag (unknown: kept, so this engine puts it to sleep instead of destroying it).
+void StoreBindPlatoon(void* platoon, const std::string& worldId, int birth);
+// A squad's birth flag (squadbirth.h: 1 born kept, 0 born not kept) noted at its creation. ANY THREAD.
+void StoreBirthNote(void* platoon, int birth);
+// The birth flag CONTEXT publishes for a squad: the one noted at its creation, copy or record, else its bound record's known flag; a
+// flag read off the squad's own kept byte is -1 (squadbirth.h BirthToPublish). MAIN THREAD.
+int StoreBirthOfPlatoon(void* platoon);
 void StoreLinkFromWelcome(const std::string& address, unsigned short port);   /* E38 / decision 42: the notebook address the host published in its session WELCOME - opened at the title screen, before the world loads */
 void StoreRoleLeftSingle();                         /* E38 / decision 43: a `join` or `store server` verb took this game out of single-player - read the record index that was skipped at start */
 /* a group made here from a world record that carries no home key (written before the key existed) - its
@@ -71,6 +88,7 @@ int StoreTownRecordTally(const std::string& townSid, townrefill::Tally* out);   
 std::string StoreWorldStamp();   /* MAIN THREAD - the world this game is in now (townrefill::WorldStamp of its world name and the world id it holds); an unsent REFILLED or RECORD_GONE waits with it */
 std::string StoreGoneTownReport();   /* the goneTown[...] counts for the [TG] report line (plain counter reads) */
 int StoreTownGoneUnsent(const std::string& townSid);   /* MAIN THREAD - this game's gones naming this town not sent to the world server yet */
+int StoreRecordFacts(const std::string& worldId, int* owner, long long* writtenAt, int* gone, std::string* home);   /* T-984 (TEST lever's read), MAIN THREAD: 1 = a record of this world id is held here (*owner = the slot that wrote it, *writtenAt its stamp - 0 = a position-only entry, *gone = wiped out / thrown away); *home = the home key the records carry (g_homeOf: "" none, "-" cleared) either way */
 int StoreRecordsHomedAt(const std::string& buildingKey);   /* MAIN THREAD - living world records whose group's home building is this key (the town refill's home test) */
 int StoreTownGoneThisLaunch(const std::string& townSid);   /* MAIN THREAD - groups of this town this game deleted since it started */
 std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id */
@@ -95,6 +113,7 @@ int StoreIdOriginSlot(void* faction, const std::string& worldId, const void* ski
 int StorePlatoonActiveChars(void* platoon);                           /* inv7a3: the platoon's live member count, -1 if unreadable */
 int StoreRetireLocalCopy(void* platoon);
 int StorePlatoonBound(void* platoon);   /* 1 = the store keeps this squad (it answers 'persistent' for it), 0 = the engine's own rule decides. MAIN THREAD */
+void StoreNoteUnloadEmptied(void* platoon, int offThread);   /* T-999 fold 3, MAIN THREAD: spawn.cpp's UNLOAD removal of a character notes its squad (the Platoon, 0 = none) - a bound squad emptied by the engine's own unload keeps its discard to its destroy; offThread = 1: counted, not noted */
 void StoreOrphanEmptiedSquad(void* faction, void* active);   /* T-300 fix 2, MAIN THREAD: the orphan purge removed people of this ActivePlatoon - another game's file-built squad in an area another game holds is thrown away once empty; a world NPC squad's copy forgets its record stamp once empty (squadwriter.h NpcPurgeForgetStamp) */
 bool PlatoonWipe(const std::string& worldId);
 // E30-3 (P6p) lever, MAIN THREAD: quit through the GAME'S OWN pause-menu exit path, so a harness run
@@ -111,6 +130,7 @@ void StoreAdminDestroyBegin();                     // P4e: our own destroys (ret
 void StoreAdminDestroyEnd();
 /* M2 (decisions 32/44/54): ApplyRemoteGone and StoreWorldListed were the session link's RECORD_GONE / WORLD_LISTED entries - deleted. */
 void ApplyDeletedBits(const std::string& faction, const std::vector<char>& bits, const char* from);
+int  StoreAreasTaken();   /* fold 4 (review): 1 = the world server takes this game's AREAS now (a world-road game only after its IN_WORLD on this link) */
 bool StoreSendAreas(const int* xy, int count, int playerX, int playerY);   // decision 32: my loaded areas (x,y pairs) to the relay, and (decision 37 amended) THIS game's own player sector after them - INT_MIN,INT_MIN when it is not known, which the relay stores for nobody
 bool StoreProfileFactionName(const std::string& name, const char* why, int rename);   /* names2a: MAIN THREAD - PROFILES kind 3 (a load) or 5 (rename != 0: the player renamed), my faction's name for my profile's notebook row; false = not sent now (no profile / link down) */
 bool StoreProfileFactionSeen(unsigned num, const std::string& name);   /* T-368, MAIN THREAD: PROFILES kind 6 - this game has the FACTION answer naming `name` for profile num; false = not sent (another pick, link down) */
@@ -214,7 +234,7 @@ int  StoreWorldPlayerCount();                              // MAIN THREAD: every
 int  StoreRosterNameOf(int slot, std::string* name);   // MAIN THREAD: the player name the last PLAYERS roster gives that slot; 1 = a name, 0 = listed without one or not listed, -1 = no roster yet
 /* M11 C1 (T-197, to-do M11; src/common/presence.h): is another player in this world - the old game-to-game link up, OR this link's
    PLAYERS roster shows another slot IN_WORLD. The seven single-writer sites ask this instead of the old link alone. */
-bool PlayersPresent(int site = -1);      // ANY THREAD (the old link: read live on the main thread, StorePresenceOldLinkTS's per-frame copy on any other - review-p5d CRASH-1; + the roster's copy below); site = mppresence::Site, counted
+bool PlayersPresent();      // ANY THREAD (the old link: read live on the main thread, StorePresenceOldLinkTS's per-frame copy on any other - review-p5d CRASH-1; + the roster's copy below)
 void StorePresenceTick();                // MAIN THREAD, every frame (WorldGenTick): copies the roster's answers for any thread; [PRESENCE] logged on a change
 int  StoreRosterOtherInWorldTS();        // ANY THREAD: 1 = another slot IN_WORLD on this link's roster, 0 = none, -1 = no roster (as of the last tick)
 int  StoreRosterLowestInWorldTS();       // ANY THREAD: the lowest IN_WORLD slot on this link's roster (this game's own included); -1 = none / no roster
@@ -234,6 +254,7 @@ long StorePeerGen(unsigned int peer);    // that player's epoch - the session pe
 int  StorePeerByLink(unsigned int peer);  // 1 = that player is judged by the old link now (mparrive::PeerByLink); a raw link id always is
 int  StorePeerHereAs(unsigned int peer, int byLink);   // StorePeerHere judged the way a hold chose when it was made (byLink: StorePeerByLink then)
 long StorePeerGenAs(unsigned int peer, int byLink);    // StorePeerGen judged that way - one key per hold (mparrive::PeerGenIn)
+int  StoreMeInWorldNow();            // 1 = this link's roster lists THIS game IN_WORLD (MAIN THREAD)
 int  StoreOtherBeyondLinkInWorld();      // 1 = this link's roster shows another slot IN_WORLD that is not the old link's peer - with that link never up in this process, any other slot IN_WORLD (mparrive::OthersInWorldBeyondLink)
 int  StorePlayerReachable(int slot);     // 1 = a send meant for that player (-1 = any other game) can go now: the session peer by the old link, another by the world-server road (mparrive::Reachable); session link up -> 1 for -1. Off the main thread: the old link's per-frame copy
 int  StoreArrivalRoundTarget(int to, int owedOrActive);   // whom a round owed for an arrival goes to: `to`, or -1 = every game (mparrive::RoundTarget)
@@ -246,6 +267,7 @@ bool StoreNewHostToken(std::string* hex);                // MAIN THREAD, before 
 bool StoreHostToken(unsigned char out[32]);              // MAIN THREAD: this hosting's secret (HOST_TOKEN / the bridge's STEAM_ID); false = this game started no world server
 std::string StoreAccessTest(const std::string& args);    // TEST-ONLY `accesstest`: the hosting game writes its world's access.txt
 int  StoreMySlot();                                      // decision 32: my slot in the relay's order (-1 unknown)
+void StoreApplyBlockToNewFaction(void* faction);         // MAIN THREAD: a faction made after this world's number block was applied (a stand-in) takes this game's block
 /* B9 (design-e46-store 2.2, decision 44). ANY THREAD: how many milliseconds this game has been unable to
    see the notebook process. 0 while the link is up. The clock starts at the store's FIRST tick, so a game
    that never reaches the notebook at all still ages - "we have never had one" is an outage and not an
@@ -283,6 +305,9 @@ bool StoreLinkConnected();
 /* MAIN THREAD ONLY: the world-server link's state as coopstore::StoreSocketState (src/common/storelink.h) - down / connecting /
    up and welcomed / up and not welcomed / up and refused. config.cpp's title re-dial reads it. */
 int  StoreLinkSockState();
+/* MAIN THREAD ONLY, like StoreLinkSockState: 1 while the world-server link can still deliver a WELCOME (connecting, up
+   mid-handshake, or welcomed), 0 when it is down, absent or refused (coopstore::StoreSockCouldArm). The load waits read it. */
+int  StoreLinkCouldArm();
 /* MAIN THREAD ONLY: one re-dial of the world-server link - the link closed (quietly), then, when dialAgain, dialled at addr:port.
    SetStoreServer alone keeps a non-null link to the same address, so a re-dial is always this pair. Used by StoreRedialTick in a
    world and by config.cpp's title re-dial. */
@@ -305,6 +330,12 @@ std::string StoreNotebookDir();
 /* mp3, MAIN THREAD: the shared-world helper's TOP folder - storedir= when present, else <save root>\coop-store - with one
    folder per world inside it. The MULTIPLAYER panel's Host a game screen lists, makes and deletes worlds there. */
 std::string StoreTopDir();
+/* T-924 FOLD 3, MAIN THREAD: this game's own data folder for the world it is in (g_dirCanonical: the world's own folder for a world run
+   on this computer, its joined folder for a world joined - one per world; made by the record index read, EnsureStoreDirs); "" before a
+   world is set */
+std::string StoreDataDir();
+/* every missing folder level of d made (EnsureDir) */
+void StoreEnsureDir(const std::string& d);
 /* MAIN THREAD (the title panel): a deleted world's saves on this computer, deleted for good - every save folder in Kenshi's
    save root whose key file carries worldId whatever world name it carries, or names worldName with no id (saves from before world
    ids; swdel::WorldDeleteFind) and
@@ -563,6 +594,9 @@ void StoreNoteRecordEngineTouchNoWorld(const char* what);
    MAIN THREAD ONLY (it reads the record index and rewrites the journal file); an off-thread call is
    refused, counted and said, never served. */
 int StoreQueueWrite(int family, const std::string& recordKey, const std::vector<char>& payload);
+bool StoreSendGroundRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* T-697 step 2, MAIN THREAD: the area holder's ground record as a RECORD at the area centre; false = no link (nothing queued) */
+bool StoreSendPieceRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes, long long* stampOut);   /* MAIN THREAD: a piece's record as a RECORD at the piece's position (the stamp sent, which RECORD_SEQ carries back); false = no link (nothing queued) */
+bool StoreSendBoxRecord(const std::string& id, float x, float y, float z, const std::vector<char>& bytes);   /* T-823, MAIN THREAD: a box writer's record as a RECORD at the box's position; false = no link (nothing queued) */
 /* The two per-family replays, defined in items.cpp and doors.cpp beside the live writes they re-issue
    (the journal's drain in store.cpp calls them; it does not carry a second copy of either write - lesson
    11). Each returns 1 when the entry is finished with and 0 when the send could not go out, which leaves

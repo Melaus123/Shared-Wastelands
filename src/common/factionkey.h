@@ -61,7 +61,7 @@ inline bool TakeIdMatch(bool found, bool foundIsPlayers) { return found && !foun
 
 /* a RECORD's flags byte (after the sequence number; absent = 0): bit 0 - the faction field is an NPC faction's game-data
    code, as the sender's FactionKey made it */
-const unsigned int kRecFacCode = 1u;
+const unsigned int kRecFacCode = 1u;   /* bits 1-2: the squad's birth flag (squadbirth.h kRecBirthMask) */
 
 /* a position update for a stored row: its faction key replaces the stored one only when the sender marked it an NPC
    faction's code (incomingIsCode) and it is usable as one, and the stored field is a different, non-empty key that is not a

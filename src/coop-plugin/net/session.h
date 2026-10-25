@@ -61,6 +61,9 @@ void SessionReport();
 // True if this instance is hosting (used for uid allocation parity).
 bool SessionIsHost();
 bool SessionLinked();   // P1: the transport is up
+bool SessionUpOrDialing();   /* the transport is up or still connecting - a link that can still carry a WELCOME. MAIN THREAD */
+
+bool ItemRoadOpen();    // the road SendItemRequest takes is open (the session link or the world server's relay)
 bool SessionPeerRawId(unsigned int* out);   /* T-355 fold 2: the session link's current peer's transport id (raw, unfolded); false with no peer up */
 unsigned int SessionPeerCount();   /* P7f (review-p6z H-1): the backend's own connected-peer count, for a caller that wants the transport's number rather than our cached LinkState */
 
@@ -162,7 +165,7 @@ int OwnerSlotOf(unsigned int uid);
 void SessionCatchupApplyTick();   /* M7a2 fold 1 [m7a2f-ap3]: MAIN THREAD, CommandChannelTick right after coop::InQueueDrain() - the catch-up's engine writes */
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId, unsigned int loadAgeMs);   // M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
+                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire);   // + the squad's birth flag (squadbirth.h WireOfBirth). M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
 bool SendRelSync();   // ask the peer to re-send its owned standings (after my world was rebuilt)
 bool SessionPeerRelayOk();   // M5a fold 1, MAIN THREAD: the session peer is KNOWN reachable through the notebook (a relayed standing stamped with its slot arrived on this session link and this welcomed notebook link)
 void SetRecordTownLookup(std::string (*fn)(const std::string&));   /* decision 34: the store supplies each note's home town to the encoder */
@@ -370,7 +373,8 @@ bool SendItemMoveExcept(const ItemMoveMsg& m, unsigned int exceptKey, int* whyOu
 bool SendItemMoveOnPlan(const ItemMoveMsg& m, const cooplive::ExceptPlan& plan, int* whyOut);
 // par1: MSG_PARITY_REQ / MSG_PARITY_BOX, already encoded (src/common/paritywire.h). False when the item road is down.
 // M7b slice 2: the ask to the holder of sector (sx, sy); the answer back to the asker's key; a push to every game covering (sx, sy).
-bool SendParityReq(const std::vector<char>& bytes, int sx, int sy);
+// T-964 writer ask: toSlot = the game asked (an open ask names the box's writer); -1 = the holder of sector (sx, sy).
+bool SendParityReq(const std::vector<char>& bytes, int sx, int sy, int toSlot = -1);
 bool SendTownPrices(const std::vector<char>& bytes);   /* T-619: one town's local trade multipliers, the price source -> its session peer (session link, RELIABLE); false = not sent */
 int  SendTownPricesLive(const std::vector<char>& bytes);   /* the same through the world server to every other admitted game but the session peer; 0 = not sent, 1 = WORLD, 2 = WORLD_EXCEPT the session peer */
 bool SendParityBox(const std::vector<char>& bytes, unsigned int askerKey);
@@ -397,6 +401,8 @@ bool SendShopTail(unsigned int id, unsigned int epoch, int kind);   // T-164 B4-
 // LinkPeerSlot).
 bool ItemAnswerFromAsked(unsigned int id, unsigned int fromPeer);
 int  ItemAskedSlot(unsigned int id);
+bool ItemAskedGameGone(unsigned int id);   // T-1007 (J): the game this request was asked of cannot answer now (no road, or it left); false with no ask on record. MAIN THREAD
+bool ItemAskedOnSession(unsigned int id);   // T-1007 (J2): this request was asked over the session link (the session peer's raw key). MAIN THREAD
 int  PlayerSlotOfKey(unsigned int key);
 // M7b slice 4 fold 1 (F2): a sender id as a PLAYER key now (cooplive::PlayerKeyOf with this link's peer slot). ANY THREAD.
 unsigned int PlayerKeyNow(unsigned int sender);

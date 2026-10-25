@@ -4,11 +4,12 @@
  * THE ROAD (.modding/investigations/t1-b44-intercept-design.md): the non-holder's right-click trade (InventoryGUI::RClickAutoTrade
  * 0x713150) is stopped BEFORE anything moves. The requester reserves the money (a buy) or holds the item in escrow (a sale),
  * sends MSG_ITEM_REQUEST with the shop block below, and settles on the holder's MSG_ITEM_CONFIRM, whose shop block names the
- * outcome, the units, the price and the pieces the holder touched. A refusal or the 10 s timeout gives the reservation / escrow back.
+ * outcome, the units, the price and the pieces the holder touched. A refusal, or no answer before the asked game leaves or the road
+ * to it is lost, gives the reservation / escrow back.
  *
  *   Gate          - which road a trade call takes on this game (the original here, the intercept, or a local refusal).
  *   CaravanHolder - T-1 B5: which game holds a travelling trader's packs (the keeper's uid, every backing pack's wearer and - fold 1 F2 -
- *                   the squad's formal leader; fold 1 F1: no session, or nothing adopted, is this game - the engine's own trade).
+ *                   the squad's formal leader; a single-player game, or nothing adopted, is this game - the engine's own trade).
  *   PreCheck      - the original's own cheap pre-checks, answered with the original's own TradeResult.
  *   Units         - one unit, or the whole stack with shift ('all', owner 186) - ONE request either way.
  *   TotalPrice    - unit price x units, refused on overflow.
@@ -17,7 +18,7 @@
  *                   T-450: CountPlacementsCapped / CellUnits / CellRoom / RoomAdd count it (free cells under the section's
  *                   item-count cap, x the stack limit - one unit at a limit of 1 or less - plus matching stacks' room).
  *   Desc/SameDesc - the clicked variant's full description; the holder takes only stacks that match it exactly.
- *   LateAnswer    - an ok after the requester's 10 s lapse: the holder is asked to undo its halves (UndoOutcome counts it).
+ *   LateAnswer    - an ok after the requester settled the request with no answer (its lapse): the holder is asked to undo its halves (UndoOutcome counts it).
  *   Reserve       - the buyer's reservation answer (ItPursePay) in words.
  *   Settle        - what the requester does on the answer (a bit set).
  *   TakePlan      - which stacks, in the pieces' chain order, the holder takes n units from (0x951BA0's first-holder rule).
@@ -52,6 +53,11 @@ const int kEntryDrag = 2;  /* a drag drop (I3, T-164 part 2) */
    trader's packs - the packs its squad's members wear - named by the keeper's uid alone (the home key is empty). */
 const int kStockHome = 0;
 const int kStockCaravan = 1;
+/* T-608 (owner decision 971 b, protocol 168): an NPC's purchase from a PLAYER's shop counter, made on a game that does not write
+   that counter. The home key is the COUNTER's box key, no keeper (town NPCs often carry no uid - the buyer stays on the buying game),
+   one unit, entry kEntryOne. The counter owner's game makes the sale (ApplyNpcBuyRequest) and answers; an older build refuses the
+   kind (StockKeyOk). */
+const int kStockNpcBuy = 2;
 
 struct ShopReq
 {
@@ -99,24 +105,93 @@ inline int Gate(int isShop, int hasHome, int homeKeyOk, int holder, int caravan 
 /* T-1 B5 (manager decision 2, 2026-10-02): WHICH GAME HOLDS A CARAVAN'S PACKS - the game that runs the trader's squad, the rule B1
    uses: the keeper's uid is that game's AND every pack used is worn by a member that game runs AND (fold 1 F2) the squad's FORMAL
    LEADER is run by that game too (the squad pot is the leader's, and only the leader's game announces it - SquadCatsAnnounceNow).
-   linked: a session exists (net::SessionLinked). keeperUid: the keeper carries a uid. keeperMine: it is this game's. leader: the
+   multiplayer: this game is in a multiplayer world (not a single-player game) - 1 whether or not another player is in that world
+   now. keeperUid: the keeper carries a uid. keeperMine: it is this game's. leader: the
    formal leader - 1 this game runs it, 2 the other game, 0 no uid (or not read). packs: the backing packs found. wMine / wOther /
    wUnknown: of them, worn by a member this game runs / the other game runs / no uid (or no wearer found). wearerUid: some worn pack
    of the squad has a wearer with a uid, or the squad could not be shown to have none (not read, or wider than the view).
-   fold 1 F1: NO SESSION (single player, or before one exists) - held here: the engine's own trade, exactly as before B5 (the town
-   shop's road fails open the same way - ItAreaVerdictAt). NOTHING ADOPTED (the keeper, the leader and every wearer carry no uid) -
+   A SINGLE-PLAYER GAME - held here: the engine's own trade. In a multiplayer world the character numbers decide on every player
+   count: a caravan another player's game runs is that game's even while it is away (the request then gets no answer and is
+   settled as a refusal when that game leaves or the road to it is lost). NOTHING ADOPTED (the keeper, the leader and every wearer carry no uid) -
    held here too: the engine's own trade, as before B5 for an unadopted caravan. Otherwise 1 this game, 2 the other game, 0 not
    known (the keeper, the leader or a wearer with no uid), kCaravanMixed the keeper's game does not run every wearer and the leader
    (a squad hand-over in flight, or a split squad) - Gate refuses both 0 and kCaravanMixed: nothing runs. */
 const int kCaravanMixed = 3;
-inline int CaravanHolder(int linked, int keeperUid, int keeperMine, int leader, int packs, int wMine, int wOther, int wUnknown, int wearerUid)
+inline int CaravanHolder(int multiplayer, int keeperUid, int keeperMine, int leader, int packs, int wMine, int wOther, int wUnknown, int wearerUid)
 {
-    if (linked == 0) return 1;
+    if (multiplayer == 0) return 1;
     if (packs <= 0) return 0;
     if (keeperUid == 0 && leader == 0 && wearerUid == 0 && wMine == 0 && wOther == 0) return 1;
     if (keeperUid == 0 || leader == 0 || wUnknown != 0) return 0;
     if (keeperMine != 0) return (wOther == 0 && leader == 1) ? 1 : kCaravanMixed;
     return (wMine == 0 && leader == 2) ? 2 : kCaravanMixed;
+}
+
+/* T-1007 (J): A PARTLY NUMBERED CARAVAN. Each member that carries no number - the keeper (keeperUid 0), the formal leader read with
+   no number (leaderUnnum 1) and each pack worn by a member found with no number (wUnnum) - takes ONE answer from the area rule at
+   the squad's decision position (the numbering sweep's rule): area kCarAreaMine counts it as this game's, kCarAreaOther as another
+   game's, kCarAreaUnknown leaves it unknown. Numbered members keep their numbers; wUnknown (a pack whose wearer was not found, a
+   squad wider than the view) stays unknown. A single-player game and NOTHING ADOPTED are CaravanHolder's, unchanged; the rest is
+   CaravanHolder over the answered members. */
+const int kCarAreaUnknown = 0, kCarAreaMine = 1, kCarAreaOther = 2;
+inline int CaravanHolderArea(int multiplayer, int keeperUid, int keeperMine, int leader, int leaderUnnum, int packs, int wMine, int wOther,
+                             int wUnnum, int wUnknown, int wearerUid, int area)
+{
+    if (multiplayer == 0) return 1;
+    if (packs <= 0) return 0;
+    if (keeperUid == 0 && leader == 0 && wearerUid == 0 && wMine == 0 && wOther == 0) return 1;
+    if (area == kCarAreaMine || area == kCarAreaOther)
+    {
+        const int side = (area == kCarAreaMine) ? 1 : 2;
+        if (keeperUid == 0) { keeperUid = 1; keeperMine = (side == 1) ? 1 : 0; }
+        if (leader == 0 && leaderUnnum != 0) leader = side;
+        if (side == 1) wMine += wUnnum; else wOther += wUnnum;
+    }
+    else wUnknown += wUnnum;
+    return CaravanHolder(1, keeperUid, keeperMine, leader, packs, wMine, wOther, wUnknown, wearerUid);
+}
+/* T-1007 (J2): THE ANSWER WAIT'S PURE RULES.
+   PendOnGone - which pending request a leave or a link loss settles. linkLoss 0 (PLAYER_GONE): one asked of goneSlot (kPendAskedGone).
+     linkLoss 1 (the session link went down): one asked over the session link (askedSession 1) and sent before the link's latest
+     edge (sentBeforeEdge 1) - kPendLinkLost; one asked of a game over the world server stays (its leave or the road check ends it).
+   RepeatRoad - the holder, at a request whose {peer, epoch, id} it answered already (the requester re-sends a pending request once a
+     second): the applied record's confirm (kept until the ack), else the answer memory's; kRepeatFresh = never answered: judged now.
+   DupAnswer - the requester, at a further answer to a request it settled already: an ok to one settled as a trade is acked again (a
+     lost ack is made good), an ok to one settled as a refusal is revoked (the holder undoes its halves), a refusal changes nothing.
+   RefusalShows - whether a refused caravan trade shows "That's not for sale." now: a click or a drop (perClick 1) once per frame; a
+     pending request only when it is the one the player waits on (its id is the latest click's). */
+const int kPendKeep = 0, kPendAskedGone = 1, kPendLinkLost = 2;
+inline int PendOnGone(int askedSlot, int askedSession, int sentBeforeEdge, int goneSlot, int linkLoss)
+{
+    if (linkLoss == 0) return (goneSlot >= 0 && askedSlot == goneSlot) ? kPendAskedGone : kPendKeep;
+    return (askedSession != 0 && sentBeforeEdge != 0) ? kPendLinkLost : kPendKeep;
+}
+/* T-1007 (J3): inAcked - the request is on the holder's acked list (acked or revoked: finished) - kRepeatAcked: nothing is sent and
+   nothing applied. Order: an unacked record's confirm, the acked list, the answer memory, then a fresh judgement. */
+const int kRepeatFresh = 0, kRepeatFromRecord = 1, kRepeatFromMemory = 2, kRepeatAcked = 3;
+inline int RepeatRoad(int inRecord, int inMemory, int inAcked = 0)
+{
+    if (inRecord != 0) return kRepeatFromRecord;
+    if (inAcked != 0) return kRepeatAcked;
+    return (inMemory != 0) ? kRepeatFromMemory : kRepeatFresh;
+}
+/* T-1007 (J3): WHO ASKED, as the holder keys its records and answers: the asker's player slot when it is known (whichever road the
+   message came on), else the raw sender key marked by the top bit (never equal to a slot). */
+inline unsigned int AskerKey(int slot, unsigned int rawKey) { return (slot >= 0) ? (unsigned int)slot : (0x80000000u | rawKey); }
+/* T-1007 (J4): the session peer's slot became known - a key filed while it was not (top bit set: a raw link key, which only the
+   session peer's messages carry) is re-filed under that slot; a slot key, or no slot known, is kept. */
+inline unsigned int AskerRefile(unsigned int asker, int slot) { return ((asker & 0x80000000u) != 0 && slot >= 0) ? (unsigned int)slot : asker; }
+inline int AskerIsSlot(unsigned int asker) { return ((asker & 0x80000000u) == 0) ? 1 : 0; }
+const int kDupNothing = 0, kDupAck = 1, kDupRevoke = 2;
+inline int DupAnswer(int settledOk, int answerOk)
+{
+    if (answerOk == 0) return kDupNothing;
+    return (settledOk != 0) ? kDupAck : kDupRevoke;
+}
+inline int RefusalShows(int perClick, int sameFrame, unsigned int id, unsigned int latestId)
+{
+    if (perClick != 0) return (sameFrame != 0) ? 0 : 1;
+    return (id != 0 && id == latestId) ? 1 : 0;
 }
 
 /* ---------------- the original's cheap pre-checks (decomp_713150 :82-127) ---------------- */
@@ -389,7 +464,8 @@ const int kVKeeperBroke = 7;   /* a sale the keeper cannot pay */
 const int kVNoRoom = 8;        /* a sale no piece accepts */
 const int kVFault = 9;         /* an engine call failed */
 const int kVMismatch = 10;     /* a malformed shop block (n / price / dir) */
-const int kVBusy = 11;         /* fold 2 (MED 2): the holder's applied-record table is full (unacked records) - refused before anything moves */
+const int kVBusy = 11;         /* the holder's applied-record table is full (unacked records) - refused before anything moves */
+const int kVBuyerShort = 12;   /* an NPC purchase whose unit price is above the NPC's budget - refused, nothing moves */
 inline int HolderCommon(int homeFound, int heldHere, int keeperOk, int policyOk, int refuseNext, int blockOk)
 {
     if (blockOk == 0) return kVMismatch;
@@ -474,6 +550,65 @@ inline int TakePlan(const int* qty, int m, int n, int* takes)
     return n - (left > 0 ? left : 0);
 }
 
+/* ---------------- T-608: an NPC purchase from a player's counter (stock kind 2) ---------------- */
+/* THE OWNER'S GAME. blockOk: one unit, a buy, the sid agrees; counterFound: the key resolves to a live counter with an inventory;
+   ownerWrites: the owner rung says this game's own player owns it and is loaded there (the writer by owner, mine); refuseNext:
+   the TEST-ONLY lever's verdict (0 = none); tableRoom: the applied-record table has room (every applied row waits for an ack);
+   stackFound: a stack of exactly the asked item is on the counter; removed: one unit came off it. Nothing moves before kVOk. */
+inline int NpcBuyHolder(int blockOk, int counterFound, int ownerWrites, int refuseNext, int tableRoom, int stackFound)
+{
+    if (blockOk == 0) return kVMismatch;
+    if (counterFound == 0) return kVNoHome;
+    if (ownerWrites == 0) return kVNotHolder;
+    if (refuseNext != 0) return refuseNext;
+    if (tableRoom == 0) return kVBusy;
+    if (stackFound == 0) return kVSoldOut;
+    return kVOk;
+}
+/* fold 2 (review H1 / M1): the unit's price (ShopUnitPricePod - the engine prices a ONE-UNIT clone) against the NPC's budget (the
+   NPC's money, sent in the request's trade price): above it -> kVBuyerShort, as buyItem's "I can't afford that." - nothing moves. */
+inline int NpcBuyAfford(int unitPrice, int budget) { return (unitPrice >= 0 && budget >= 0 && unitPrice <= budget) ? kVOk : kVBuyerShort; }
+/* How many units ShopRemovePod takes for the one unit sold: a stack of one leaves whole (-1, as buyItem's 0x748EE0), else 1. */
+inline int NpcBuyTakeCount(int stackQty) { return (stackQty <= 1) ? -1 : 1; }
+/* fold 2 (review L2): THE OWNER'S PAYMENT. payResult: the counter's takeMoney(-price) (1 paid; a negative amount is a gift and is
+   refused only when the call cannot be made); putBack: after a failed payment the removed unit went back on the counter.
+   kNbOwnPaid: the sale stands at its price; kNbOwnRefuse: the unit is back - refused (kVFault), no record; kNbOwnFree: the unit
+   could not be put back - the sale stands at PRICE 0 (counted), so the buyer is never charged for a sale the owner was not paid for. */
+const int kNbOwnPaid = 0, kNbOwnRefuse = 1, kNbOwnFree = 2;
+inline int NpcBuyOwnerPaid(int payResult, int putBack)
+{
+    if (payResult == 1) return kNbOwnPaid;
+    return (putBack != 0) ? kNbOwnRefuse : kNbOwnFree;
+}
+/* THE BUYING GAME, on an answer to one of its NPC purchases. ok / hasShop / verdict: the answer; npcLive: the buyer still exists
+   here. An ok is ALWAYS acknowledged (the owner keeps its record until the ack - 64 unacked make it refuse every shop trade), also
+   when late (after the 10 s lapse) and also when the NPC is gone (then only the NPC side is skipped: the owner has already sold
+   it - the accepted residual). A refusal moved nothing: no ack (no record was kept), the counter is re-asked. */
+const int kNbGive = 1, kNbPay = 2, kNbAck = 4, kNbReask = 8;
+inline int NpcBuyAnswer(int ok, int hasShop, int verdict, int npcLive)
+{
+    if (ok != 0 && hasShop != 0 && verdict == kVOk) return kNbAck | (npcLive != 0 ? (kNbGive | kNbPay) : 0);
+    return kNbReask;
+}
+/* fold 2 (review M2 b): an answer to an NPC purchase whose pending row is gone (dropped after 5 minutes, or cleared with the world):
+   an OK is still ACKNOWLEDGED (the owner's record must clear - 64 stuck records refuse every shop trade); nothing else is done. */
+inline int NpcBuyOrphanAnswer(int forgotten, int ok, int hasShop, int verdict)
+{
+    if (forgotten == 0) return 0;
+    return (ok != 0 && hasShop != 0 && verdict == kVOk) ? kNbAck : 0;
+}
+/* The buying game's pending row by age (wrap-safe ticks): kNbKeep; kNbLapse - lapseMs passed with no answer: the NPC is freed
+   for another purchase, nothing is done (a late ok is still applied and acked); kNbForget - forgetMs passed since the send: the
+   row is dropped (counted - an ok after that would find no row and its record would wait on the owner). */
+const int kNbKeep = 0, kNbLapse = 1, kNbForget = 2;
+inline int NpcBuyAge(unsigned int sentAt, unsigned int now, int lapsed, unsigned int lapseMs, unsigned int forgetMs)
+{
+    const unsigned int age = now - sentAt;
+    if (age >= forgetMs) return kNbForget;
+    if (lapsed == 0 && age >= lapseMs) return kNbLapse;
+    return kNbKeep;
+}
+
 /* ---------------- a late answer (review HIGH 2) ---------------- */
 /* The requester settled a lapsed row as a refusal (reservation back / escrow back). An ok that arrives after that means the
    holder applied BOTH of its halves (buy: units out of the pieces, keeper paid; sale: item filed, keeper paid out), so the two
@@ -530,13 +665,21 @@ inline int StockKeyOk(int stock, const std::string& homeKey)
 {
     if (stock == kStockHome) return homeKey.empty() ? 0 : 1;
     if (stock == kStockCaravan) return homeKey.empty() ? 1 : 0;
+    if (stock == kStockNpcBuy) return homeKey.empty() ? 0 : 1;   /* T-608: the counter's key */
     return 0;
+}
+/* T-608: an NPC purchase names no keeper, ONE unit, a right-click entry and a buy (dir 0, trade 1 - checked by the holder) */
+inline int NpcBuyShapeOk(int stock, unsigned int keeperUid, int n, int entry)
+{
+    if (stock != kStockNpcBuy) return 1;
+    return (keeperUid == 0 && n == 1 && entry == kEntryOne) ? 1 : 0;
 }
 /* T-1 B5: a request block of either form starts at `at` ('SHR3', or the older 'SHR2'). */
 inline int ReqTagAt(const char* p, size_t size, size_t at) { return (TagAt(p, size, at, kReqTag) != 0 || TagAt(p, size, at, kReqTagV2) != 0 || TagAt(p, size, at, kReqTagV4) != 0) ? 1 : 0; }
 inline int EncodeReq(std::vector<char>* b, const ShopReq& r)
 {
     if (r.n <= 0 || r.n > kMaxUnits || r.unitPrice < 0 || r.entry < 0 || r.entry > kEntryDrag || StockKeyOk(r.stock, r.homeKey) == 0 || r.sid.empty() || r.epoch == 0) return 0;
+    if (NpcBuyShapeOk(r.stock, r.keeperUid, r.n, r.entry) == 0) return 0;   /* T-608 */
     /* T-619: an 'SHR4' block carries the two price legs when both are numbers above 0 and below 100; a missing, out-of-range or NaN
        leg sends the 'SHR3' block - the trade goes on and the holder counts its legs unsent */
     const int legs = (r.cult > 0.0f && r.cult < 100.0f && r.local > 0.0f && r.local < 100.0f) ? 1 : 0;
@@ -570,6 +713,7 @@ inline int DecodeReq(const char* p, size_t size, size_t* at, ShopReq* r)
     }
     if (StockKeyOk(r->stock, r->homeKey) == 0) return 0;   /* T-1 B5: an empty home key only for a caravan */
     if (n == 0 || n > (unsigned int)kMaxUnits || up > 0x7FFFFFFFu || r->entry > kEntryDrag) return 0;
+    if (NpcBuyShapeOk(r->stock, r->keeperUid, (int)n, r->entry) == 0) return 0;   /* T-608: an NPC purchase is one unit, no keeper */
     r->n = (int)n; r->unitPrice = (int)up; r->has = 1;
     *at = a;
     return 1;

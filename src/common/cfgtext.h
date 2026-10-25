@@ -143,6 +143,11 @@ struct CfgFields
        every record whose id STARTS WITH <text> (a cfg value holds no space, so a prefix names an id such as 'Mercenary Guild_0').
        Empty = absent = off. */
     std::string    sweepSkip;
+    /* TEST ONLY, no writer carries them: benchcapkbs=<n> (0-1000000 KB/s) - ENet's bandwidth limit, in and out, on this game's links
+       (net/enet_transport.cpp); netratelog=1 - each Steam link logs Steam's own status once a second (net/steam_transport.cpp).
+       0 = absent = off. */
+    int            benchCapKbs;
+    int            netRateLog;
     CfgFields();      /* role=single, slot="s1", ports 0, no playerId - ConfigLoad's own defaults */
 };
 

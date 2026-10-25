@@ -48,8 +48,43 @@ const char* LogBuildLabel();
 bool QuietLogPass(swlogbudget::Gate* gate, const char* family, unsigned long long key, const char* keyText);
 /* Writes one count line for every key of every gate QuietLogPass has seen that holds lines back (the count since its last line).
    periodic = true: at most once a minute (the soak tick calls it every frame); false: now (before a bug report is packed, and at
-   the game's exit). ANY THREAD. */
+   the game's exit), and then also the newest line every SW_CHANGEDN slot held back (T-879). ANY THREAD. */
 void QuietLogFlush(bool periodic);
+
+/* T-879 - A TIMED REPORT LINE WRITTEN ONLY WHEN IT CHANGED (the release build). ChangedLogSlot: one per line, a zero-initialised
+   static the caller keeps (plain data: no constructor or destructor runs). ChangedLogPass(slot, key, text): true = write the line
+   now (`key` differs from the key of the line this slot last wrote, or it wrote none); false = `key` is the same - the line is not
+   written and `text` is kept, and QuietLogFlush(false) (before a bug report is packed, and at the game's exit) writes the newest
+   text kept. key = the line's text, or the text without a figure that moves every time (a window length). ANY THREAD.
+   SW_CHANGEDN(slot, key, text): the test as a condition - always true in the DEV build (every line, the key not built); in the
+   release build ChangedLogPass. */
+struct ChangedLogSlot
+{
+    unsigned long long keyHash;   /* the key of the line last written */
+    long wrote;                   /* 1 once a line was written */
+    long registered;              /* 1 once QuietLogFlush can reach it */
+    std::string* held;            /* the newest text not written (made at first use, never freed) */
+    unsigned long lastMs;         /* IntervalLogPass: GetTickCount of the line last written */
+};
+bool ChangedLogPass(ChangedLogSlot* slot, const std::string& key, const std::string& text);
+#ifdef SW_DEV_BUILD
+#define SW_CHANGEDN(slot, key, text) ((void)(slot), true)
+#else
+#define SW_CHANGEDN(slot, key, text) (ChangedLogPass(&(slot), (key), (text)))
+#endif
+
+/* T-879 - A TIMED REPORT LINE WRITTEN AT MOST ONCE PER gapMs (the release build). IntervalLogPass(slot, gapMs, text): true = write
+   the line now (the slot wrote none yet, or its last line is gapMs or more old); false = the line is not written and `text` is kept,
+   and QuietLogFlush(false) (before a bug report is packed, and at the game's exit) writes the newest text kept. ANY THREAD.
+   SW_INTERVALN(slot, gapMs, text): the test as a condition - always true in the DEV build (every line); in the release build
+   IntervalLogPass. kReleaseReportGapMs: the release build's gap for the timed [TALK] REPORT and [SAVE] hb lines (10 minutes). */
+const unsigned int kReleaseReportGapMs = 600000;
+bool IntervalLogPass(ChangedLogSlot* slot, unsigned int gapMs, const std::string& text);
+#ifdef SW_DEV_BUILD
+#define SW_INTERVALN(slot, gapMs, text) ((void)(slot), true)
+#else
+#define SW_INTERVALN(slot, gapMs, text) (IntervalLogPass(&(slot), (gapMs), (text)))
+#endif
 
 /* SW_DEVLOG(msg): a test probe's line, compiled into the DEV build only - in the release build neither the line nor its text
    is built. SW_QUIETLOG(gate, family, key, keyText, msg): a repeating line - every line in the DEV build; in the release build

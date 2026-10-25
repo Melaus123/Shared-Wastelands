@@ -13,7 +13,7 @@
  *     str base sid | str company sid | str material sid | str colour sid   (the item fields a GROUND ADD carries; str = u32 len + bytes) |
  *     u32 quantity | f32 quality | f32 charges | i32 function | i32 level | u8 unique |
  *     f32 x | f32 y | f32 z | f32 rotation w | f32 rotation x | f32 rotation y | f32 rotation z |
- *     u8 marks (kGrHasOwner | kGrHasGear | kGrHasBag; any other bit refuses the record) |
+ *     u8 marks (kGrHasOwner | kGrHasGear | kGrHasBag | kGrMade; any other bit refuses the record) |
  *     [OWN1 block, ownerwire.h - the stolen mark] [GEM1 block, gearwire.h - uniform and crafter]
  *     [u32 length + BAG1 block, bagwire.h - a backpack's contents with its OWNL / GEML / BAGN tails; never empty]
  *   Nothing may follow the last row.
@@ -23,8 +23,9 @@
  * the list. The encoder leaves out (counts) a row it cannot write whole, and counts every row past the caps in the header's cut.
  *
  * THE WORLD SERVER'S RULE (GroundAcceptRule): a SEED is taken only when no record of that id exists and its sender holds the area;
- * any later write must come from the game that holds the area now, as an update (not a seed), with a generation not lower than the
- * stored one. A refused write is answered with message kMsgGroundRefuse {str id | u32 reason | u32 stored generation | u32 sent
+ * any later write must come from the game that holds the area now, as an update (not a seed), with a generation higher than the
+ * stored one - an equal generation is taken only as a harmless repeat of the very same bytes (kGrRepeat, nothing written), else refused
+ * kGrRefuseSameGen (T-697 step 2 fold 1, M2: the box-record rule). A refused write is answered with message kMsgGroundRefuse {str id | u32 reason | u32 stored generation | u32 sent
  * generation}.
  *
  * Pure: no engine memory, no Windows, no globals. C++03 (VS2010 v100).
@@ -39,19 +40,69 @@
 
 namespace coopgrec {
 
-const unsigned int kProtocol = 101;            /* the world-server protocol that carries ground records and GROUND_REFUSE */
+const unsigned int kProtocol = 108;            /* the world-server protocol that carries ground records and GROUND_REFUSE (format-2 rows) */
 
 
 const unsigned int kMsgGroundRefuse = 71u;    /* world server -> the writer: its ground record was not taken, and why */
 
 const unsigned int kGrMarker = 0x31445247u;   /* 'G','R','D','1' little-endian */
-const unsigned int kGrFormat = 1u;
+const unsigned int kGrFormat = 2u;            /* the row layout above; a record of any other format is refused */
 const unsigned int kGrMaxRows = 1024u;        /* rows per area; the rest are counted in the header's cut */
 const unsigned int kGrMaxBytes = 2u << 20;    /* 2 MB per record; rows that would pass it are counted in the cut */
 const unsigned int kGrHeaderBytes = 36u;
+const unsigned int kGrRowCountAt = 28u;     /* the header's u32 rows (after marker, format, flags, generation, writer slot, sx, sy) */
+const unsigned int kGrCutAt = 32u;          /* the header's u32 cut; the rows follow at kGrHeaderBytes */
 const unsigned int kGrFlagSeed = 1u;
 const int kGrMaxSector = 63;
 const unsigned char kGrHasOwner = 1, kGrHasGear = 2, kGrHasBag = 4;
+const unsigned char kGrMade = 8;   /* the row's item was made during play (Item+0x1A0 == 0xB on the game where it is real): the game's own area
+                                      close drops such an item from the ground, so an apply never builds it back when it is missing */
+/* The made-during-play mark of an object on one game: would the game's own area close keep this item on the ground. The engine
+   gives an item the map placed a persist link of its own and turns ANY item picked up into an inventory into one with none (0xB,
+   kept after a drop and a save); the area close drops 0xB items from the ground. live: the object's own persist-link read (-1
+   unreadable, 0 a link of its own, 1 none - 0xB); mapCopy: 1 = the object lies on the ground as the mod's copy of a map item no
+   one picked up (the game's registry of map copies - every object the mod makes starts at 0xB, so its own read cannot tell);
+   lost: 1 = that registry refused an entry since the world loaded, so an unlisted object may be one of the mod's. An object with
+   a link of its own is the map's (the game writes it with its area); a listed map copy is the map's; an unlisted object with no
+   link is made during play unless the registry overflowed; every doubt reads as the map's (the row is rebuilt when missing,
+   never lost). 1 = made. */
+inline int GrMadeRule(int live, int mapCopy, int lost)
+{
+    if (live != 1) return 0;
+    if (mapCopy != 0 || lost != 0) return 0;
+    return 1;
+}
+/* The mark of an object the mod makes or moves: one that goes INTO an inventory is made during play whatever its source (the
+   engine makes any item picked up 0xB); one that stays on, or goes back onto, the ground as the rest of a stack that never
+   entered an inventory keeps the source's mark (the engine keeps the map's own link on the rest of a partial pickup). 1 = made. */
+inline int GrMadeOfPlaced(int intoInventory, int srcMade)
+{
+    if (intoInventory != 0) return 1;
+    return (srcMade != 0) ? 1 : 0;
+}
+/* After a pickup of the object at one address: 1 = its map-copy entry stays. whole: 1 = the whole stack was taken (the object went
+   into an inventory, or was merged into a stack there and freed); onGround: that address read now (1 on the ground, 0 not, -1
+   unreadable). A whole stack taken is made during play, as the engine makes it - the entry goes; a partial pickup leaves the
+   rest, the same object, on the ground with its mark - the entry stays; an address read on the ground again (dropped back
+   before this ran, or another object there now) keeps its entry (a doubt reads as the map's). */
+inline int GrPickKeepsMapCopy(int whole, int onGround)
+{
+    if (whole == 0) return 1;
+    return (onGround == 1) ? 1 : 0;
+}
+/* What becomes of an object the mod asked the engine to destroy (GameWorld::destroy 0x798F50). returned: destroy's answer (1 or
+   0); inInv: the object's isInInventory byte (Item+0xD8) read right after a 0 answer (1 set, 0 clear); faulted: 1 = the call or
+   that read faulted, or there was no world to ask. destroy answers 0 for no object, for an item whose isInInventory is set (a
+   refusal: nothing done, the byte still set), and - while the engine's AI worker runs - after filing the object on its own list
+   to destroy on a later frame without reading the byte. So a 0 with the byte clear is a queued object, going as a 1 goes; a 0
+   with the byte set, or any doubt, is an object still alive. */
+const int kGrDestroyKept = 0, kGrDestroyGone = 1, kGrDestroyQueued = 2;
+inline int GrDestroyAnswer(int returned, int inInv, int faulted)
+{
+    if (faulted != 0) return kGrDestroyKept;
+    if (returned == 1) return kGrDestroyGone;
+    return (inInv == 0) ? kGrDestroyQueued : kGrDestroyKept;
+}
 const float kGrMaxCoord = 1.0e7f;             /* a world coordinate past this is a bad read (poskey.h's test) */
 
 /* decode results: anything but kGrOk is a refused record */
@@ -60,7 +111,9 @@ const int kGrOk = 0, kGrShort = 1, kGrBadMarker = 2, kGrBadFormat = 3, kGrBadHea
 
 /* the world server's answers */
 const int kGrAccept = 0, kGrRefuseBadId = 1, kGrRefuseUnreadable = 2, kGrRefuseWrongArea = 3, kGrRefuseWriter = 4,
-          kGrRefuseSeedExists = 5, kGrRefuseNoRecord = 6, kGrRefuseNotHolder = 7, kGrRefuseOlder = 8, kGrRefusePosition = 9;
+          kGrRefuseSeedExists = 5, kGrRefuseNoRecord = 6, kGrRefuseNotHolder = 7, kGrRefuseOlder = 8, kGrRefusePosition = 9,
+          kGrRefuseSameGen = 10,   /* T-697 step 2 fold 1 (M2): the stored generation again with other bytes (two holders around a holder change) */
+          kGrRepeat = 11;          /* not a refusal: the very same bytes again at the stored generation - nothing is written (boxrec.h kBrRepeat) */
 
 struct GroundHeader
 {
@@ -78,12 +131,13 @@ struct GroundRow
     float quality, charges;
     int functionKind, level;
     unsigned char unique;
+    unsigned char made;                                     /* 1 = made during play (the kGrMade mark) */
     float pos[3];                                           /* exact world position x, y, z */
     float rot[4];                                           /* rotation w, x, y, z */
     coopmark::OwnerId owner;                                /* the stolen mark; kind 0 = none */
     gearwire::GearMarks gear;                               /* uniform and crafter; empty = none */
     std::vector<coopbag::BagRow> bag;                       /* a backpack's contents; empty = not a pack, or an empty one */
-    GroundRow() : qty(1), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0)
+    GroundRow() : qty(1), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0), made(0)
     { pos[0] = pos[1] = pos[2] = 0.0f; rot[0] = 1.0f; rot[1] = rot[2] = rot[3] = 0.0f; }
 };
 
@@ -220,6 +274,7 @@ inline bool GrPutRow(std::vector<char>* out, const GroundRow& in, unsigned int* 
     if (r.owner.kind != coopmark::kOwnNone) marks |= kGrHasOwner;
     if (!gearwire::GearEmpty(r.gear)) marks |= kGrHasGear;
     if (!r.bag.empty()) marks |= kGrHasBag;
+    if (r.made != 0) marks |= kGrMade;
     b.push_back((char)marks);
     if ((marks & kGrHasOwner) != 0 && !coopmark::EncodeOwner(&b, r.owner)) return false;
     if ((marks & kGrHasGear) != 0 && gearwire::EncodeGear(&b, r.gear, 0) != 1) return false;
@@ -266,8 +321,8 @@ inline bool EncodeGroundRecord(std::vector<char>* out, const GroundHeader& h, co
         out->insert(out->end(), one.begin(), one.end());
         ++s.written;
     }
-    GrSetU32(out, 28, s.written);
-    GrSetU32(out, 32, cut);
+    GrSetU32(out, kGrRowCountAt, s.written);
+    GrSetU32(out, kGrCutAt, cut);
     if (st) *st = s;
     return true;
 }
@@ -315,7 +370,8 @@ inline bool GrGetRow(const char* p, size_t size, size_t* off, GroundRow* out)
     if (o >= size) return false;
     const unsigned char marks = (unsigned char)p[o];
     o += 1;
-    if ((marks & ~(kGrHasOwner | kGrHasGear | kGrHasBag)) != 0) return false;
+    if ((marks & ~(kGrHasOwner | kGrHasGear | kGrHasBag | kGrMade)) != 0) return false;
+    r.made = (unsigned char)((marks & kGrMade) != 0 ? 1 : 0);
     if ((marks & kGrHasOwner) != 0)
     {
         size_t e = 0;
@@ -373,8 +429,9 @@ inline const char* GroundDecodeWhy(int why)
 
 /* ---- the world server's rule ---- */
 /* exists: a record of this id is stored; storedGen: its generation; seed: the write is a seed (kGrFlagSeed); gen: the write's
-   generation; senderSlot / holderSlot: the writing game's slot and the slot the area map names as the area's holder (-1 = none). */
-inline int GroundAcceptRule(int exists, unsigned int storedGen, int seed, unsigned int gen, int senderSlot, int holderSlot)
+   generation; senderSlot / holderSlot: the writing game's slot and the slot the area map names as the area's holder (-1 = none);
+   sameBytes: 1 when the write's bytes are exactly the stored record's (the server compares them only at the stored generation). */
+inline int GroundAcceptRule(int exists, unsigned int storedGen, int seed, unsigned int gen, int senderSlot, int holderSlot, int sameBytes)
 {
     const int holds = (senderSlot >= 0 && holderSlot >= 0 && senderSlot == holderSlot) ? 1 : 0;
     if (exists == 0)
@@ -385,12 +442,13 @@ inline int GroundAcceptRule(int exists, unsigned int storedGen, int seed, unsign
     if (seed != 0) return kGrRefuseSeedExists;
     if (holds == 0) return kGrRefuseNotHolder;
     if (gen < storedGen) return kGrRefuseOlder;
+    if (gen == storedGen) return sameBytes != 0 ? kGrRepeat : kGrRefuseSameGen;
     return kGrAccept;
 }
 /* A whole write judged: the id must parse, the bytes decode, the header's sector match the id and its writer slot be the sender's,
    then GroundAcceptRule. *hOut (may be 0): the decoded header (left default when the bytes do not decode). */
 inline int GroundJudgeWrite(const std::string& id, const char* p, size_t size, int senderSlot, int holderSlot, int exists, unsigned int storedGen,
-                            GroundHeader* hOut)
+                            int sameBytes, GroundHeader* hOut)
 {
     int sx = 0, sy = 0;
     if (GroundRecIdParse(id, &sx, &sy) == 0) return kGrRefuseBadId;
@@ -399,7 +457,7 @@ inline int GroundJudgeWrite(const std::string& id, const char* p, size_t size, i
     if (hOut) *hOut = h;
     if (h.sx != sx || h.sy != sy) return kGrRefuseWrongArea;
     if (senderSlot < 0 || h.writerSlot != (unsigned int)senderSlot) return kGrRefuseWriter;
-    return GroundAcceptRule(exists, storedGen, (h.flags & kGrFlagSeed) != 0 ? 1 : 0, h.generation, senderSlot, holderSlot);
+    return GroundAcceptRule(exists, storedGen, (h.flags & kGrFlagSeed) != 0 ? 1 : 0, h.generation, senderSlot, holderSlot, sameBytes);
 }
 inline const char* GroundRefuseWhy(int why)
 {
@@ -412,6 +470,8 @@ inline const char* GroundRefuseWhy(int why)
          : why == kGrRefuseNoRecord ? "an update, and the area has no record to update (send a seed)"
          : why == kGrRefuseNotHolder ? "the sending game does not hold the area"
          : why == kGrRefuseOlder ? "its generation is lower than the stored record's"
+         : why == kGrRefuseSameGen ? "its generation equals the stored record's and its bytes differ"
+         : why == kGrRepeat ? "the very same bytes again (taken, nothing written)"
          : why == kGrRefusePosition ? "a position-only update - a ground record is always written whole"
          : "refused";
 }

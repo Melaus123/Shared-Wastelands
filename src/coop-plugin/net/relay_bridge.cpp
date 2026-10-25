@@ -54,6 +54,7 @@
 #include "../../common/relaysplit.h"
 #include "../../common/steamlisten.h"
 #include "../../common/gamelink.h"
+#include "../../common/typetally.h"   /* nettally::kLinkBridge */
 
 #include <deque>
 #include <sstream>
@@ -324,6 +325,7 @@ void NewPair(unsigned int link, DWORD now)
     if (p->local != 0)
     {
         p->local->SetStoreLink();   /* the world server's bundles are unpacked into whole messages; type 53 is a LIVE envelope */
+        p->local->SetTrafficLink(nettally::kLinkBridge);   /* counted on the bridge's TRAFFIC REPORT line, not this game's own world link */
         p->local->SetPeerTimeouts(coopgl::kGameLinkTimeoutLimit, coopgl::kGameLinkTimeoutMinimumMs, coopgl::kGameLinkTimeoutMaximumMs);
         err.clear();
     }

@@ -51,6 +51,40 @@ inline int FloorPlace(bool ownerStopped, bool stopHeld, bool arrivedFlat, bool s
     return strikes >= kFloorStrikes ? kFloorGaveUp : kFloorPlace;
 }
 
+/* T-986 g: WHEN A PLACEMENT'S RESULT IS JUDGED. A copy placed with the engine's teleport has not moved two frames later; T-986 g3:
+   its x/z lands at once and its HEIGHT ~1 s later (T1434 - Confirmed: uid 19 moved 25.9 flat at once and was judged 'again' at
+   0.08 s on that movement while the placement held). So the result is judged on the height alone: 'ok' as soon as the copy
+   stands within kFloorGapY of the height it was placed at (at least 2 frames on); 'again' ONLY once kFloorJudgeWaitSec of
+   running game has passed with the height still apart. 1.5 s: the height was seen to land by ~1 s; the margin keeps a slow
+   landing from being read as a failure. A placement reached late (the copy's drive skipped it for a while) is judged on the
+   height it has then. framesSince: frames since the placement; secSince: seconds of running game since it (not a number =
+   judge now); heightApart: the copy's height is still over kFloorGapY from the height placed at, or unreadable. */
+const double kFloorJudgeWaitSec = 1.5;
+const int kFloorJudgeWait     = 0;   /* still pending: no decision, no strike, no second placement */
+const int kFloorJudgeLanded   = 1;   /* the height is within the gap: judged 'ok' */
+const int kFloorJudgeTimedOut = 2;   /* the bound has passed: judged on the height now ('again' when still apart) */
+inline int FloorJudgeDue(long long framesSince, double secSince, bool heightApart)
+{
+    if (framesSince >= 2 && !heightApart) return kFloorJudgeLanded;
+    if (!(secSince < kFloorJudgeWaitSec)) return kFloorJudgeTimedOut;
+    return kFloorJudgeWait;
+}
+
+/* T-986 g2: FloorPlace's inputs for one copy. An owner that arrived without walking (a teleport, a load, being carried) sends
+   no stop (T1433: a copy stayed downstairs under such an owner for good), so a follow copy's owner counts stopped on a held stop
+   OR when it is not moving now (ownerMovingNow: the drive's own fresh answer, expiring at the velocity horizon); a non-follow
+   copy's owner as before (not moving now). A follow copy counts stalled on the stop point's watch (only with a held stop - it is
+   about closing on that point) OR on the drive's own stall count (driveStalledWindows >= 1: windows in which it went nowhere or
+   did not close); a non-follow copy is placed only when arrived, as before. Each stall input carries its own condition, so
+   FloorPlace's stopHeld gate is passed as satisfied. */
+inline int FloorPlaceCopy(bool follow, bool stopHeld, bool ownerMovingNow, bool arrivedFlat, bool stopStalled, int driveStalledWindows,
+                          float flatDist, float dY, int strikes)
+{
+    const bool ownerStopped = follow ? (stopHeld || !ownerMovingNow) : !ownerMovingNow;
+    const bool stalled = follow && ((stopHeld && stopStalled) || driveStalledWindows >= 1);
+    return FloorPlace(ownerStopped, true, arrivedFlat, stalled, flatDist, dY, strikes);
+}
+
 /* The next judged frame after a placement: the gap is still over kFloorGapY (or unreadable) - the placement's result is 'again'. */
 inline bool FloorStillApart(float dY) { return !FlFinite(dY) || FlAbs(dY) > kFloorGapY; }
 

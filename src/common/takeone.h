@@ -80,5 +80,58 @@ inline int ConsumeHolds(int showWanted, int stackHere) { return (showWanted != 0
    another item (the writer puts back what it took) is a no - the unit goes back on the stack, relative, unless the writer's own move
    named that cell meanwhile (its count is the truth). */
 inline int ConsumeSettleOk(int ok, int sameItem) { return (ok != 0 && sameItem != 0) ? 1 : 0; }
+
+/* T-969 (owner decision 992 b, verbatim: "when a world's box access is not 'shared' and the players are not teammates, the taking
+   game checks the access rule before a character takes from a box another game writes"). The take-one hook asks BEFORE the engine's
+   take. `policy` is this world's base access option as policy.h numbers it (kPolicyUnknown 0 / kPolicyShared 1 / owner 2 / locked 3;
+   items.cpp asserts the two mirrored here); unknown is judged as shared, as the writer's own judge does. boxHeldByOther: another
+   game writes the box (the area / owner verdict kBoxHeld). 1 = ask the access rule (BoxAccessAllowed with this game's own player as
+   the requester - the decision the writer applies to our TAKE request; teammates are allowed inside it). */
+const int kT1PolicyUnknown = 0;
+const int kT1PolicyShared = 1;
+inline int AccessAsk(int policy, int boxHeldByOther)
+{
+    if (boxHeldByOther == 0) return 0;
+    return (policy == kT1PolicyUnknown || policy == kT1PolicyShared) ? 0 : 1;
+}
+/* 1 = the engine's take runs; 0 = refused here (the detour returns 0: nothing taken, the character does not get the unit) */
+inline int AccessTakeRuns(int asked, int allowed) { return (asked == 0 || allowed != 0) ? 1 : 0; }
+
+/* T-969 fold 2 (review): THE GATE'S WHOLE DECISION, the same on every thread - PolicyJudge's answer for this game's own player,
+   from what the take hook can read without the writer decision. ownerCls: boxowner.h's classes (mirrored below, items.cpp checks
+   them); known 0 = no owner answer here (never read on the main thread, or not resolvable now). thisGameWrites: this game writes
+   the box (the owner rung said mine, or the area rule answers this game) - not "a box another game writes". mate: the owner's
+   slot is this player's current teammate (rule "member"). peerIsPlayer: PolicyPeerIsPlayer (1 = the stand-in is a player
+   faction, so `locked` refuses instead of leaning on the engine's lock).
+   DIFFERS FROM PolicyJudge ON PURPOSE: an owner this game cannot read is allowed (counted, kT1GateRunUnread) - PolicyJudge refuses
+   'owner-unreadable', but the gate only refuses a KNOWN other player's box (review item 3). */
+const int kT1OwnUnreadable = -1;
+const int kT1OwnNone = 0;
+const int kT1OwnMe = 1;
+const int kT1OwnPeer = 2;
+const int kT1OwnShared = 3;
+const int kT1OwnUnknown = 4;
+const int kT1PolicyOwner = 2;
+const int kT1PolicyLocked = 3;
+const int kT1GateRun = 0;          /* the engine's take runs (today's road) */
+const int kT1GateRunUnread = 1;    /* runs: the owner is not known here - counted */
+const int kT1GateRunMate = 2;      /* runs: a teammate's box - counted */
+const int kT1GateRefuse = 3;       /* refused: the detour returns 0 */
+inline int GateDecide(int policy, int known, int ownerCls, int thisGameWrites, int mate, int peerIsPlayer)
+{
+    if (AccessAsk(policy, 1) == 0) return kT1GateRun;                  /* shared / not known yet: judged as shared */
+    if (known == 0 || ownerCls == kT1OwnUnreadable || ownerCls == kT1OwnUnknown) return kT1GateRunUnread;
+    if (ownerCls != kT1OwnPeer) return kT1GateRun;                      /* nobody's, mine, a shared faction's: allowed */
+    if (thisGameWrites != 0) return kT1GateRun;                         /* not a box another game writes (decision 992 b) */
+    if (mate != 0) return kT1GateRunMate;
+    if (policy == kT1PolicyOwner) return kT1GateRefuse;
+    if (policy == kT1PolicyLocked) return (peerIsPlayer == 1) ? kT1GateRefuse : kT1GateRun;   /* else the engine's own lock */
+    return kT1GateRun;
+}
+/* the repeat counter's minute: 1 = a refusal at `now` starts a new minute for the box (none yet, or the last began 60 s ago) */
+inline int GateNewMinute(int haveWindow, unsigned int windowAt, unsigned int now)
+{
+    return (haveWindow == 0 || (unsigned int)(now - windowAt) >= 60000u) ? 1 : 0;
+}
 }
 #endif

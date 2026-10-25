@@ -26,10 +26,11 @@
 #include "../common/groundkey.h"   /* inv5 phase 1: the ground key and ITEM_CONFIRM's refusal reason block */
 #include "../common/itemstatwire.h"   /* items9: ITEM_MOVE op 4 CHARGES, op 0's [BAG1][OWN1] tail, snapshot detail stats */
 #include "../common/shopwire.h"   /* T-164 B4-4: the shop block on ITEM_REQUEST / ITEM_CONFIRM (intercept at the trade call) */
+#include "../common/boxrec.h"   /* T-823: one box's contents as one world-server record - the box table below keeps them */
 
 namespace coop {
 int LeverNameUid(const std::string& w, unsigned int* uid, std::string* label);   /* TEST-ONLY: 1 resolved, 0 not a name form, -1 a name that did not resolve (label says why) */
-void LeverNoteSpawned(const std::string& templateName, unsigned int uid);   /* TEST-ONLY: the uid the latest [M1] spawned line named for that template (the `spawned:<Template>` form) */
+void LeverNoteSpawned(const std::string& templateName, unsigned int uid);   /* TEST-ONLY: notes a uid an [M1] spawned line named for that template (the `spawned:<Template>` form names the newest this game drives, else the newest) */
 
 // One item move on the wire. `quantity` MEANS A DIFFERENT THING PER OP and that is deliberate - see the table:
 //   op 0 ADD    - the stack size of the item that entered the slot.
@@ -70,6 +71,9 @@ struct ItemMoveMsg
     // takes the name - nothing is built). On the wire right after boxId (groundname.h IdKindPut / IdKindGet); 0 for a storage box.
     int idKind;
     std::string idFor;
+    // owner uid 0 only: 1 = the item was made during play on the game where it is real (Item+0x1A0 == 0xB); on the wire right after
+    // the id kind (groundname.h MadePut / MadeGet). A storage box's move carries 0.
+    int made;
     // inv6 (protocol 71): ADD only - the stolen mark as an identity (src/common/ownerwire.h), kind 0 = clean (nothing on the wire).
     coopmark::OwnerId owner;
     // ADD only - a gear item's uniform and crafter (src/common/gearwire.h), a 'GEM1' block after the OWN1 block; empty = nothing on the wire.
@@ -104,7 +108,7 @@ struct ItemMoveMsg
     unsigned int rqtId;
     int rqtSlot;
     ItemMoveMsg() : uid(0), op(0), x(0), y(0), quantity(0), quality(0.0f), charges(0.0f),
-                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; }
+                    functionKind(0), level(0), unique(0), ownerLocal(0), ownerFrom(0), bagChecked(0), rqtHas(0), rqtId(0u), rqtSlot(-1), idKind(0), made(0) { std::memset(ownerLocalRaw, 0, sizeof(ownerLocalRaw)); gearLocal = 0; gearLocalUniform = 0; }
 };
 
 // E22b / decision 38 part (2). A player touched an inventory this game does NOT own. The local half of the
@@ -128,6 +132,7 @@ struct ItemRequestMsg
     std::string ownerBoxKey;    // E22c-2 (P7n): the owning building's POSITION KEY, when ownerUid == 0
     std::string ownerBoxId;     // E22c-2 (P7n): its instance id when it has one - a cross-check, never the name
     int ownerIdKind;            // T-693 (protocol 149): a ground TAKE's ownerBoxKey is a published name (coopgname::kIdName) or the bare current key (kIdBare); after ownerBoxId on the wire
+    int made;                   // owner uid 0 only: 1 = the item was made during play on the requester (Item+0x1A0 == 0xB); after the id kind on the wire
     std::string ownerSection;
     int ownerX, ownerY;
     int quantity;
@@ -178,7 +183,7 @@ struct ItemRequestMsg
     unsigned int holdId;
     int holdHow;
     int holdSlot;
-    ItemRequestMsg() : id(0), dir(0), ownerUid(0), ownerIdKind(0), ownerX(0), ownerY(0), quantity(0), takerUid(0),
+    ItemRequestMsg() : id(0), dir(0), ownerUid(0), ownerIdKind(0), made(0), ownerX(0), ownerY(0), quantity(0), takerUid(0),
                        takerX(0), takerY(0), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0),
                        trade(0), price(0), ownerBagDone(0), ownerBagShadowed(0), holdId(0u), holdHow(0), holdSlot(-1) {}
 };
@@ -331,7 +336,11 @@ bool BuyTest(const std::string& needle, const std::string& sidWanted, int npcPat
 bool PackBuyTest(const std::string& mode);   // par23 (parity P23): TEST LEVER - buy one item out of a wandering trader's pack
 bool TraderList();   // T-1 B0: TEST, read-only - every loaded trader squad, who runs each member, pack digests ([TRADER] lines)
 std::string KeeperListCommand(const std::string& arg);   // T-164 B4-0: TEST, read-only - `keeperlist [<x>,<y>|all] [<page>]`: NPC squads with a home building, each indoor piece with an inventory ([KEEPER] lines)
-bool BuyTestKeeper(const std::string& pick, int sell, int cats);   /* T-164 B4-1: cats = the purse set first (-1 = not asked) */   // T-164 B4-0: TEST LEVER - `buytest keeper <n|ghost|own> [sell]`: BuyTest aimed at a keeperlist keeper, buyer walked to it first; ghost = home area held by the other game ([BUYTEST] keeper line)
+/* T-608 T1389 (TEST-ONLY, `buildgive counter=<full box key> <slot>`, build.cpp): the counter that key names, or 0 with *why */
+void* GiveCounterPiece(const std::string& key, std::string* why);
+/* T-608 T1389 (TEST-ONLY): the owner class the NPC purchase gate now reads for that counter, and its writer - line words */
+std::string GiveCounterOwnerWords(void* piece, const std::string& key);
+bool BuyTestKeeper(const std::string& pick, int sell, int cats, int npc = 0, int stack = 0);   /* T-608 T1389: npc 1 = the NPC purchase path (stack 1 = one unit of a stack); T-164 B4-1: cats = the purse set first (-1 = not asked) */   // T-164 B4-0: TEST LEVER - `buytest keeper <n|ghost|own> [sell]`: BuyTest aimed at a keeperlist keeper, buyer walked to it first; ghost = home area held by the other game ([BUYTEST] keeper line)
 bool BuyTestChar(unsigned int uid, const std::string& nameText, int sell, int cats);   /* TEST LEVER: `buytest char <uid|name=<text>> sell [cats=<n>]` - sell one item to that character, no home or pack test ([STORE] buytest char line) */
 
 // P7i (T232 section 2/section 3) READ-ONLY LEVERS, MAIN THREAD, command channel only. T232's `boxtest rebirth ...` and
@@ -352,6 +361,12 @@ std::string BoxListCommand(const std::string& arg);
 void TownPricesNote(const char* p, size_t n, unsigned int fromPeer);   /* T-619, MAIN THREAD: a TOWN_PRICES payload, by the session link or relayed by the world server (fromPeer a relay key) */
 void ParityNoteReq(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2: fromPeer = the asker, the answers go back to it
 void ParityNoteBox(const char* p, size_t n, unsigned int fromPeer);   // M7b slice 2 fold 1: a box's contents are taken only from its writer (parityBoxNotWriter)
+void ShopPendAskedGone(int slot, int linkLoss);   // T-1007 (J) MAIN THREAD (session.cpp): every pending shop request asked of that player (slot < 0: none by slot), and with linkLoss 1 every one asked over the session link before its latest edge (T-1007 (J2) coopshop::PendOnGone), is settled as the lapse settles one - a late answer is still handled
+void ShopAppliedForgetGame(int slot);   // T-1007 (J1) MAIN THREAD (session.cpp OnPlayerGone): that player's applied shop records are dropped - it can never ack or revoke them
+int SweepAreaAnswer(float x, float z);   // T-1007 (J2) MAIN THREAD (worldsync.cpp): the numbering sweep's area rule as an answer - 1 this game's, 2 another game holds it, 0 no map
+void ShopAppliedResendTo(int slot);   // T-1007 (J4) MAIN THREAD (session.cpp OnPeerGone): that player's unacked shop confirms are sent again by the road that reaches it now (slot < 0: nothing)
+void ShopAskerSlotKnown(int slot);   // T-1007 (J4) MAIN THREAD (session.cpp OnPeerSlot): the session peer's records filed under its raw link key are re-filed under its slot
+void SweepNumberNext(void* ap);   // T-1007 (J) MAIN THREAD (worldsync.cpp): a trader squad (its active platoon) a trade window found with unnumbered members - the numbering sweep takes it first
 void ItParityForgetAsker(int slot);   // MAIN THREAD: that player's link ended - its recorded sector asks no longer route fill pushes to it (slot -1: every game's)
 std::string BoxDigestCommand(const std::string& arg);   /* par1: `boxdigest [<x>,<y>|ring|all]` - read-only: [PARITY] box key=.. items=.. digest=.. per box (flat + furniture) and a total */
 std::string BoxInfoCommand(const std::string& arg);   /* TEST `boxinfo <boxKey> [sid]` - read-only: each section's size, accepts list, used / free squares, and whether a sid's kind is allowed */
@@ -394,6 +409,44 @@ int  GroundPickHoldActive();                                /* P14 fold 1, ANY T
 int  GameDataSidPod(const void* gd, char* out, int cap);    /* P14 fold 1, POD: a GameData's stringID (1 = read) - a building material slot's record */
 void GroundRefundEnd();                                     /* MAIN THREAD: the refund's items go to the one drop road (from = refund) */
 void InstallGround();                                       /* preload, MAIN THREAD (from InstallItems): the drop detour 0x5C9CB0 and the pickup gate 0x34F2E0; P2/P3/P4 (ground5 fold 1 comment): the animal drop 0x5C9A10, the box / building spill 0x54DBA0 and Item::activate 0x75CE70 (the dismantle refund's items) */
+/* T-697 step 2 (src/common/groundsync.h): the ground records. MAIN THREAD. Arrive: a RECORD ground.<sx>.<sy> from the world server -
+   kept per area when its generation is not lower than the kept copy's (never a squad); Gone: its removal; Refuse: GROUND_REFUSE (71) -
+   the answer is acted on at the next GroundDrain. */
+void GroundRecordArrive(const std::string& id, const std::vector<char>& bytes);
+void GroundRecordGone(const std::string& id, const char* from);
+void GroundRefuseArrive(const std::vector<char>& payload);
+void GroundRecordEcho(const std::string& id, int hasStamp, long long stamp);   /* fold 2 (item 7), MAIN THREAD: the world server stored this game's ground write (RECORD_SEQ echo) */
+/* T-823 (src/common/boxrec.h): THE BOX RECORDS THIS GAME RECEIVED. MAIN THREAD. Arrive: a RECORD box.<sx>.<sy>.#<hash>.<x10>.<z10>
+   from the world server - kept per id when it reads whole and its generation is not lower than the kept copy's (never a squad; nothing
+   is applied to a box here); Gone: its removal; Kept: the kept copy of one id (1 = kept, its header and items copied out; 0 = none);
+   IdsInArea: the kept ids of one area square (their count; the ids appended); LinkLost: the world-server link is down - the kept
+   copies are forgotten (the feed sends every record again); Report: the counts for the [STORE] REPORT line. */
+void BoxRecordArrive(const std::string& id, const std::vector<char>& bytes);
+void BoxRecordGone(const std::string& id, const char* from);
+int  BoxRecordKept(const std::string& id, coopbrec::BoxHeader* h, std::vector<cooppar::ParityItem>* items);
+int  BoxRecordIdsInArea(int sx, int sy, std::vector<std::string>* ids);
+void BoxRecordLinkLost();
+std::string BoxRecordReport();
+/* T-823: this game's writes of the records of the boxes it is the one writer of. MAIN THREAD. Mark / MarkC: a box's contents changed
+   here (its position key; a key that names no box is ignored) - its record is owed; BoxRecTick (GroundDrain): once a second the marked
+   boxes are read whole and written when this game is the box's writer at that moment, never before the stored record is in the box
+   at this load (the apply, from the same tick); BoxRefuseArrive: BOX_REFUSE (72) - counted, one capped line; another record stored
+   past the write goes into the box first and the box is written again; BoxRecWTeardown: at world teardown the marks, the
+   last-written contents and what each box was are dropped (they name the world that is going; the generations written stay). */
+void BoxRecMark(const std::string& key);
+void BoxRecMarkC(const char* key);
+void BoxRecTick(unsigned long now);
+void BoxRefuseArrive(const std::vector<char>& payload);
+void BoxRecWTeardown();
+/* The stored record put into the box at its area's load (items.cpp BoxApplyScan, from BoxRecTick). BoxRecWLinkLost: a link loss
+   forgets the stored generations refusals named and decides every box's apply again; BoxRecShopApplyPending: 1 while a shop's
+   stored stock in area (sx, sy) is not decided yet at this load (the area's restock waits for it). MAIN THREAD. */
+void BoxRecWLinkLost();
+int  BoxRecShopApplyPending(int sx, int sy);
+/* 1 = the box at `key` holds the world server's shop stock here: its kept record is a shop record with items and that record's
+   apply at this load is done, another game writes the box, or the record was refused (detour_refreshInventory's set-up restock
+   rule). MAIN THREAD; 0 off it. */
+int  BoxRecShopStockApplied(const std::string& key);
 void GroundDrain();                                         /* MAIN THREAD (ItemsTickDrain): the gate's snapshot, the detours' queue, the requester's timeouts */
 std::string AddrReuseCommand(const std::string& arg);       /* TEST-ONLY `addrreuse <groundItemKey|nearest>` - a fake dead uid row at a ground item's address, then the engine destroys the item */
 std::string GroundTestCommand(const std::string& arg);      /* TEST-ONLY `groundtest list [r] | drop <section> <x> <y> | dropsid <sid> | pick <sid> [r]` */
@@ -530,6 +583,8 @@ int  FarmWriterHere(void* b);
    game holds it. Returns verdict. */
 struct FarmWriterView { int verdict; int slot; int byOwner; int areaSlot; int areaHere; };
 int  FarmWriterDecide(void* b, FarmWriterView* out);
+/* MAIN THREAD: who writes a PLAYER WALL's health (a melee hit) - FarmWriterDecide's ask, asked as "wall"; the same answer and slot */
+int  WallWriterDecide(void* b, FarmWriterView* out);
 /* T-853 #5 / #11, MAIN THREAD: ProdStepWriterHere's three-way answer asked fresh (not the 250 ms memo) with the slot of the game a
    kProdWriterOther names (*slot, -1 not known now) - the same ask gives both. */
 int  ProdWriterDecide(void* pb, int* slot);
@@ -567,6 +622,8 @@ const int kObjKeyTruncated = 3;   /* the walk could not list everything (LoadedB
 const int kObjKeyTeardown = 4;    /* the world is being torn down: no walk */
 const int kObjKeyRefused = 5;     /* an empty or malformed key */
 int ObjectByPositionKeyVerdict();
+/* T-492, MAIN THREAD: 1 = the last lookup's kObjKeyTruncated came from an empty or unsettled walk (worth asking again), 0 = a real cut */
+int ObjectByPositionKeyEmptyWalk();
 /* T-392 fold (review H1): the cap the resolver builds its candidate keys with (kBoxKeyCap). A key built with any other cap can
    differ from the resolver's (a long record name is hashed only when it does not fit), so build with this one. ANY THREAD. */
 int BoxKeyCap();
