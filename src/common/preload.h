@@ -8,8 +8,18 @@
  * game's copy is only a cache, brought up to date BEFORE the world loads; decision 256 (a): the loading screen may wait.
  *
  * THE EXCHANGE. Four more kinds inside RECORD_FEED (58), after recordfeed.h's 1-4, on reliable channel 0:
- *   up   5 INDEX_ASK  {u32 token, str afterKey}       the next page of the world server's record INDEX after that key ("" first)
- *   down 6 INDEX_PAGE {u32 token, u8 last, u32 n, n * (str key, u64 fileStamp, u64 posAt)}   keys ascending; fileStamp = the
+ *   up   5 INDEX_ASK  {u32 token, str afterKey, u8 aoiVersion (1), u8 ring, u16 n, n * (u8 x, u8 y)}   the next page of the
+ *                                                     world server's record INDEX after that key ("" first). The areas are
+ *                                                     this game's area list (its area file, areafile.h); n = 0 (ring 0) when
+ *                                                     it has none. The world server only counts the rows against them; the
+ *                                                     game itself picks the rows it fetches (PreRowChoose)
+ *   down 6 INDEX_PAGE {u32 token, u8 last, u32 n, n * (str key, u64 fileStamp, u64 posAt, u8 x, u8 y, u32 bytes, u8 flags)}   keys
+ *                                                     ascending; x,y = the record's area (0xFF,0xFF = none: no area in its
+ *                                                     key and no usable position); bytes = its payload's size; flags bit 0
+ *                                                     (kPreRowOwn, T-985 C2b fold 3) = a group record whose faction field carries a
+ *                                                     name of the asking game's player faction (PreAskerFactionNames: its own, and
+ *                                                     the clash and placeholder names a stand-in for the asker's slot takes on
+ *                                                     another game), fetched wherever it is (no other bit is valid); fileStamp = the
  *                                                     record's file time (0 = a position-only record), posAt = its position's
  *   up   7 FETCH      {u32 token, u8 resume, u32 n, n * str key}   send these records now (n <= kPreFetchBatch); resume = 1:
  *                                                     the rest of a batch the last FETCH_END cut short (the world server writes
@@ -37,10 +47,13 @@
 #include <string>
 #include <vector>
 #include "recordfeed.h"
+#include "slotwire.h"   /* T-985 C2b fold 3: coopslot::StandInClashName, PlaceholderName - the names a stand-in for the asker's slot carries */
+#include "profiles.h"   /* T-985 C2b fold 3: coopprof::FactionForRow - a name in a profile row's form */
 
 namespace cooppre {
 
-const unsigned int kPreProtocol = 108;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+const unsigned int kPreProtocol = 121;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+
 
 
 enum { kPreIndexAsk = 5, kPreIndexPage = 6, kPreFetch = 7, kPreFetchEnd = 8 };
@@ -48,21 +61,35 @@ const size_t kPreIndexPageEntries = 4096;          /* at most this many index ro
 const size_t kPreIndexPageBytes = 512u * 1024u;    /* and about this many bytes */
 const size_t kPreFetchBatch = 256;                 /* keys per FETCH */
 const unsigned int kPreBoundMs = 60000;            /* the longest the load is held (decision 256 a); then a counted stale load */
+const int kPreGrid = 64;                           /* an area is x,y on the 64 x 64 grid (areafile.h, liverelay.h) */
+const int kPreRing = 2;                            /* the ring round the area list that the load's fetch covers (areafile::kRing) */
+const int kPreRingMax = 8;                         /* the widest ring an INDEX_ASK may name */
+const size_t kPreAreaMax = 4096;                   /* the most areas an INDEX_ASK may carry (areafile::kMaxAreas) */
+const unsigned int kPreAoiVersion = 1u;            /* INDEX_ASK's area field */
+const int kPreNoArea = -1;                         /* an index row's x and y when its record has no area */
+const unsigned int kPreRowOwn = 1u;                /* T-985 C2b fold 3: index row flag - a group record carrying a name of the asking game's player faction (PreAskerFactionNames, PreRowOfAskersFaction) */
+const unsigned int kPreRowFlagsKnown = 1u;         /* every row flag this build knows; a row with another is refused */
 
 struct IndexEntry
 {
     std::string key;
     unsigned long long fileStamp, posAt;
-    IndexEntry() : fileStamp(0ULL), posAt(0ULL) {}
-    IndexEntry(const std::string& k, unsigned long long f, unsigned long long p) : key(k), fileStamp(f), posAt(p) {}
+    int ax, ay;              /* the record's area (kPreNoArea, kPreNoArea = none) */
+    unsigned int bytes;      /* its payload's size on the world server (0 = none or not known) */
+    unsigned int flags;      /* kPreRowOwn (T-985 C2b fold 1) */
+    IndexEntry() : fileStamp(0ULL), posAt(0ULL), ax(kPreNoArea), ay(kPreNoArea), bytes(0u), flags(0u) {}
+    IndexEntry(const std::string& k, unsigned long long f, unsigned long long p) : key(k), fileStamp(f), posAt(p), ax(kPreNoArea), ay(kPreNoArea), bytes(0u), flags(0u) {}
+    IndexEntry(const std::string& k, unsigned long long f, unsigned long long p, int x, int y, unsigned int b) : key(k), fileStamp(f), posAt(p), ax(x), ay(y), bytes(b), flags(0u) {}
 };
 struct PreMsg
 {
     unsigned int kind, token, last, resume, answered, sent;   /* resume: FETCH; answered, sent: FETCH_END */
     std::string key;                    /* INDEX_ASK: afterKey */
+    unsigned int ring;                  /* INDEX_ASK: the ring the game fetches round its areas (0 with no areas) */
+    std::vector<int> areas;             /* INDEX_ASK: the game's area list, x,y pairs (empty = none) */
     std::vector<IndexEntry> entries;    /* INDEX_PAGE */
     std::vector<std::string> keys;      /* FETCH */
-    PreMsg() : kind(0), token(0), last(0), resume(0), answered(0), sent(0) {}
+    PreMsg() : kind(0), token(0), last(0), resume(0), answered(0), sent(0), ring(0) {}
 };
 
 /* one of this header's kinds (the caller then decodes it); recordfeed.h's FeedDecode refuses them */
@@ -73,11 +100,24 @@ inline bool IsPreKind(const char* p, size_t n)
     return k >= (unsigned int)kPreIndexAsk && k <= (unsigned int)kPreFetchEnd;
 }
 
+inline bool PreAreaOnGrid(int x, int y) { return x >= 0 && x < kPreGrid && y >= 0 && y < kPreGrid; }
+/* areas = x,y pairs, each on the grid, at most kPreAreaMax (empty = no list: ring is sent as 0). Anything else is not encodable
+   (appends nothing). */
+inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const std::string& afterKey, int ring, const std::vector<int>& areas)
+{
+    if (afterKey.size() > coopfeed::kFeedKeyMax || ring < 0 || ring > kPreRingMax || areas.size() % 2 != 0 || areas.size() / 2 > kPreAreaMax) return false;
+    for (size_t k = 0; k < areas.size(); k += 2) if (!PreAreaOnGrid(areas[k], areas[k + 1])) return false;
+    coopfeed::FeedHead(b, kPreIndexAsk); coopfeed::FeedPut32(b, token); coopfeed::FeedPutKey(b, afterKey);
+    const unsigned int n = (unsigned int)(areas.size() / 2);
+    b->push_back((char)kPreAoiVersion); b->push_back((char)(areas.empty() ? 0 : ring));
+    b->push_back((char)(n & 0xFFu)); b->push_back((char)((n >> 8) & 0xFFu));
+    for (size_t k = 0; k < areas.size(); k += 2) { b->push_back((char)areas[k]); b->push_back((char)areas[k + 1]); }
+    return true;
+}
+/* an INDEX_ASK with no area list */
 inline bool PreEncodeIndexAsk(std::vector<char>* b, unsigned int token, const std::string& afterKey)
 {
-    if (afterKey.size() > coopfeed::kFeedKeyMax) return false;
-    coopfeed::FeedHead(b, kPreIndexAsk); coopfeed::FeedPut32(b, token); coopfeed::FeedPutKey(b, afterKey);
-    return true;
+    return PreEncodeIndexAsk(b, token, afterKey, 0, std::vector<int>());
 }
 /* entries with a key over the bound are not encodable - the whole page is refused (appends nothing) */
 inline bool PreEncodeIndexPage(std::vector<char>* b, unsigned int token, bool last, const std::vector<IndexEntry>& es)
@@ -85,7 +125,14 @@ inline bool PreEncodeIndexPage(std::vector<char>* b, unsigned int token, bool la
     for (size_t i = 0; i < es.size(); ++i) if (es[i].key.size() > coopfeed::kFeedKeyMax) return false;
     coopfeed::FeedHead(b, kPreIndexPage); coopfeed::FeedPut32(b, token); b->push_back(last ? (char)1 : (char)0);
     coopfeed::FeedPut32(b, (unsigned int)es.size());
-    for (size_t i = 0; i < es.size(); ++i) { coopfeed::FeedPutKey(b, es[i].key); coopfeed::FeedPut64(b, es[i].fileStamp); coopfeed::FeedPut64(b, es[i].posAt); }
+    for (size_t i = 0; i < es.size(); ++i)
+    {
+        coopfeed::FeedPutKey(b, es[i].key); coopfeed::FeedPut64(b, es[i].fileStamp); coopfeed::FeedPut64(b, es[i].posAt);
+        const bool on = PreAreaOnGrid(es[i].ax, es[i].ay);   /* an area off the grid goes as none */
+        b->push_back(on ? (char)es[i].ax : (char)0xFF); b->push_back(on ? (char)es[i].ay : (char)0xFF);
+        coopfeed::FeedPut32(b, es[i].bytes);
+        b->push_back((char)(es[i].flags & kPreRowFlagsKnown));
+    }
     return true;
 }
 inline bool PreEncodeFetch(std::vector<char>* b, unsigned int token, bool resume, const std::vector<std::string>& keys)
@@ -115,7 +162,20 @@ inline bool PreDecode(const char* p, size_t n, PreMsg* out)
     size_t at = coopfeed::kFeedHeader;
     if (n - at < 4) return false;
     m.token = coopfeed::FeedGet32(p + at); at += 4;
-    if (m.kind == (unsigned int)kPreIndexAsk) { if (!PreGetKey(p, n, &at, &m.key)) return false; }
+    if (m.kind == (unsigned int)kPreIndexAsk)
+    {
+        if (!PreGetKey(p, n, &at, &m.key) || n - at < 4) return false;   /* the area field is required: a short ask is refused */
+        const unsigned int ver = (unsigned int)(unsigned char)p[at], ring = (unsigned int)(unsigned char)p[at + 1];
+        const unsigned int cnt = (unsigned int)(unsigned char)p[at + 2] | ((unsigned int)(unsigned char)p[at + 3] << 8); at += 4;
+        if (ver != kPreAoiVersion || ring > (unsigned int)kPreRingMax || cnt > kPreAreaMax || (cnt == 0 && ring != 0) || n - at < (size_t)cnt * 2) return false;
+        for (unsigned int i = 0; i < cnt; ++i)
+        {
+            const int x = (int)(unsigned char)p[at], y = (int)(unsigned char)p[at + 1]; at += 2;
+            if (!PreAreaOnGrid(x, y)) return false;
+            m.areas.push_back(x); m.areas.push_back(y);
+        }
+        m.ring = ring;
+    }
     else if (m.kind == (unsigned int)kPreIndexPage)
     {
         if (n - at < 5) return false;
@@ -126,8 +186,14 @@ inline bool PreDecode(const char* p, size_t n, PreMsg* out)
         for (unsigned int i = 0; i < cnt; ++i)
         {
             IndexEntry e;
-            if (!PreGetKey(p, n, &at, &e.key) || n - at < 16) return false;
-            e.fileStamp = coopfeed::FeedGet64(p + at); e.posAt = coopfeed::FeedGet64(p + at + 8); at += 16;
+            if (!PreGetKey(p, n, &at, &e.key) || n - at < 23) return false;
+            e.fileStamp = coopfeed::FeedGet64(p + at); e.posAt = coopfeed::FeedGet64(p + at + 8);
+            const int x = (int)(unsigned char)p[at + 16], y = (int)(unsigned char)p[at + 17];
+            e.bytes = coopfeed::FeedGet32(p + at + 18); e.flags = (unsigned int)(unsigned char)p[at + 22]; at += 23;
+            if ((e.flags & ~kPreRowFlagsKnown) != 0u) return false;   /* a row flag this build does not know */
+            if (x == 0xFF && y == 0xFF) { e.ax = kPreNoArea; e.ay = kPreNoArea; }
+            else if (PreAreaOnGrid(x, y)) { e.ax = x; e.ay = y; }
+            else return false;   /* half an area, or one off the grid */
             m.entries.push_back(e);
         }
     }
@@ -164,7 +230,7 @@ inline bool PreIndexWalk(const std::map<std::string, V>& m, const std::string& a
         if (!out->empty() && (out->size() >= maxEntries || bytes >= maxBytes)) break;
         if (it->first.size() > coopfeed::kFeedKeyMax) continue;   /* not encodable - never in the index (the feed answers it the same way) */
         IndexEntry e; e.key = it->first; stamp(it->second, &e.fileStamp, &e.posAt);
-        bytes += 4 + e.key.size() + 16;
+        bytes += 4 + e.key.size() + 23;
         out->push_back(e); last = it->first;
     }
     *lastKey = last;
@@ -205,6 +271,136 @@ inline int PreWant(int haveLocal, long long localFile, long long localPos, unsig
     if (!isZone && srvPos > 0ULL && (long long)srvPos > localPos) return 1;
     return 0;
 }
+
+/* WHICH ROWS THE LOAD'S FETCH COVERS (game): a row whose area lies within `ring` area-squares (Chebyshev, no wrap - the distance
+   areafile.h RingDistance measures) of any area of xy (this game's area list, x,y pairs) is IN; one farther is OUT - not fetched
+   before the load, left for the feed after it, which still sends every record; a row with no area is NOAREA and always fetched;
+   an empty xy (no area list) is NOLIST: every row, as before there was a list. */
+enum { kPreAoiNoList = 0, kPreAoiIn = 1, kPreAoiOut = 2, kPreAoiNoArea = 3 };
+inline int PreAoiClass(int ax, int ay, const std::vector<int>& xy, int ring)
+{
+    if (xy.size() < 2) return kPreAoiNoList;
+    if (!PreAreaOnGrid(ax, ay)) return kPreAoiNoArea;
+    for (size_t k = 0; k + 1 < xy.size(); k += 2)
+    {
+        int dx = xy[k] - ax, dy = xy[k + 1] - ay;
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        if ((dx > dy ? dx : dy) <= ring) return kPreAoiIn;
+    }
+    return kPreAoiOut;
+}
+/* 1 = the load's fetch may take a row of this class (every class but OUT) */
+inline int PreAoiFetches(int cls) { return cls != kPreAoiOut ? 1 : 0; }
+
+/* T-985 C2b fold 2 (re-check MED 1) + fold 3: AN INDEX ROW'S AREA AND FLAGS (world server, store_main.cpp PreIndexAreas). x, y = the
+   record's area (off the grid = none); named = its key names its area (an area, ground, box or piece record); ofAskersFaction =
+   PreRowOfAskersFaction's answer for the row against PreAskerFactionNames' set. The OWN flag goes only on a group record: an area or
+   ground record the asker held is left to the ring, or every area that player ever held would be fetched. */
+inline void PreRowPlace(IndexEntry* e, int x, int y, int named, int ofAskersFaction)
+{
+    if (PreAreaOnGrid(x, y)) { e->ax = x; e->ay = y; } else { e->ax = kPreNoArea; e->ay = kPreNoArea; }
+    e->flags = (!named && ofAskersFaction) ? kPreRowOwn : 0u;
+}
+/* T-985 C2b fold 3 + fold 4 (re-checks, under-fetch): THE NAMES A GROUP RECORD OF THE ASKING GAME'S PLAYER FACTION CAN CARRY in its
+   faction field. A game writes a group of a player's faction under that faction's CURRENT name on that game (factionkey.h;
+   playerfaction.cpp FactionKey): the asker's own game under its player's name - rowFaction, the faction name in the asker's profile
+   row - and another game, which runs that player's characters in its stand-in for the asker's slot (record id coop-p<slot>,
+   slotwire.h), under the stand-in's name. That name is built from a BASE - the player's name, the slot's placeholder "Player <slot>"
+   (PlaceholderName: a stand-in made before that player was seen there, MakeAreaWriterStandIn), or the literal "Player 2" a stand-in
+   takes when its wire name arrives empty (playerfaction.cpp ResolveStandIn) - then " (2)" when the base is the writing game's own
+   faction's name (ResolveStandIn, MakeAreaWriterStandIn), then the clash names "<x> (peer)" / "<x> (peer) (p<slot>)" when another
+   faction record there carries it (StandInClashName via ClashFreeName, CreatePeer and RenamePeerOnce). So the set is every base,
+   each with and without " (2)", each of those plain and in both clash forms. askerSlot = the slot this world gave the asker
+   (store_main.cpp SlotOf: the WELCOME's slot, which the asker's game puts in its wire names and every other game keys its stand-in
+   by); -1 = none, and only the profile's own name is used. Each name is put in a profile row's form (FactionForRow: trimmed, cut to
+   the row's length), the form the world server compares a record's field in, so a long name's forms are cut as its field is. A
+   team adds no name: characters never move between engine factions (teamwire.h). Over-matching - another player who really named
+   their faction one of these, "Player 2" for every slot, or a name long enough that the cut leaves its forms equal - only fetches a
+   group early, never leaves one out. NOT covered: a stand-in kept in a save under the player's OLD name until it is renamed
+   (playerfaction.cpp ~205-212), and groups written before the player renamed their faction - their field names no name known here,
+   so those groups are left to the ring (they come with the feed). Each name once; an empty name never. */
+inline void PreAskerFactionNames(const std::string& rowFaction, int askerSlot, std::vector<std::string>* out)
+{
+    out->clear();
+    const bool slot = askerSlot >= 0 && askerSlot <= coopslot::kSlotMax;
+    std::vector<std::string> base;
+    if (!rowFaction.empty()) base.push_back(rowFaction);
+    if (slot) { base.push_back(coopslot::PlaceholderName(askerSlot)); base.push_back("Player 2"); }
+    std::vector<std::string> raw;
+    for (size_t i = 0; i < base.size(); ++i)
+    {
+        std::vector<std::string> forms(1, base[i]);
+        if (slot) forms.push_back(base[i] + " (2)");
+        for (size_t k = 0; k < forms.size(); ++k)
+        {
+            raw.push_back(forms[k]);
+            if (!slot) continue;
+            raw.push_back(coopslot::StandInClashName(forms[k], askerSlot, true, false));
+            raw.push_back(coopslot::StandInClashName(forms[k], askerSlot, true, true));
+        }
+    }
+    for (size_t i = 0; i < raw.size(); ++i)
+    {
+        std::string f;
+        if (!coopprof::FactionForRow(raw[i], &f) || f.empty()) continue;
+        bool dup = false;
+        for (size_t j = 0; j < out->size() && !dup; ++j) dup = (*out)[j] == f;
+        if (!dup) out->push_back(f);
+    }
+}
+/* T-985 C2b fold 2 (re-check MED 1) + fold 3: 1 = a record whose key names no area (a group record) and whose faction field
+   (recFaction, as the world server stores it, put in a profile row's form - profiles.h FactionForRow) equals one of askerFactions
+   (PreAskerFactionNames: every name a group of the asking game's player faction can carry). So the asker's groups another game
+   wrote are flagged, under a stand-in's clash or placeholder name too, and the world NPC groups the asker's game wrote as an area's
+   holder are not (their field is an NPC faction's code). An empty field or name never matches. */
+inline int PreRowOfAskersFaction(int named, const std::string& recFaction, const std::vector<std::string>& askerFactions)
+{
+    if (named || recFaction.empty()) return 0;
+    for (size_t i = 0; i < askerFactions.size(); ++i) if (!askerFactions[i].empty() && askerFactions[i] == recFaction) return 1;
+    return 0;
+}
+
+/* T-985 C2b fold 1 (review HIGH 1, HIGH 2, LOW 5, LOW 7): THE LOAD'S FETCH CHOICE FOR ONE INDEX ROW (game, store.cpp PreWantHere;
+   the offline suite calls it directly). srvCls = PreAoiClass of the row's area (the world server's copy); localCls = the same
+   for this game's own copy (its record here or a kept row held beside; kPreAoiNoArea when it has none or none with a position);
+   own = the row's kPreRowOwn flag; boxOrPiece = a box or piece record (never fetched: its own table takes it from the feed);
+   gated = a kept key the kept-table gate still holds back; beside = that kept row is held beside an index-load record; newer =
+   PreWant (the world server's copy is newer than the record here).
+   A row is OUTSIDE only when the server's copy AND this game's copy lie outside the ring and it is not a group of the
+   asker's player faction: a group whose older copy here stands inside the ring would load early from that copy at its old spot, and the player's
+   own groups may have moved since this PC wrote its area file - both are fetched. */
+struct PreRowPick
+{
+    int confirmFirst;   /* the index names the key: a kept key is released BEFORE newer is judged (store.cpp MirrorKeepConfirmed) */
+    int confirmAfter;   /* a held-back kept key outside whose copy here is current: released after the judgement */
+    int fetch;          /* fetched before the load */
+    int skipCount;      /* a newer row left for the feed (preAoi skipped, skippedBytes) */
+    int skipSet;        /* named in the list the load detours read (preAoi skippedLoad) - only when the server's copy is newer */
+    int held;           /* a kept key that stays held back (preAoi skippedHeld) */
+    int staleHeld;      /* of those, one whose kept copy is older than the server's: never released until the server's arrives */
+    int byLocal, byOwn; /* fetched only because of this game's copy / only as a group of the asker's player faction */
+    PreRowPick() : confirmFirst(0), confirmAfter(0), fetch(0), skipCount(0), skipSet(0), held(0), staleHeld(0), byLocal(0), byOwn(0) {}
+};
+inline int PreRowOutside(int srvCls, int localCls, int own) { return (srvCls == kPreAoiOut && localCls != kPreAoiIn && !own) ? 1 : 0; }
+inline PreRowPick PreRowChoose(int srvCls, int localCls, int own, int boxOrPiece, int gated, int beside, int newer)
+{
+    PreRowPick p;
+    const int out = PreRowOutside(srvCls, localCls, own);
+    const int gatedOut = (out && !boxOrPiece && gated) ? 1 : 0;
+    if (gatedOut && beside) { p.held = 1; p.skipSet = newer ? 1 : 0; return p; }   /* held beside for the feed; the index-load record loads */
+    p.confirmFirst = gatedOut ? 0 : 1;
+    if (boxOrPiece) return p;
+    if (!newer) { p.confirmAfter = gatedOut; return p; }
+    if (out) { p.skipCount = 1; p.skipSet = 1; p.held = gatedOut; p.staleHeld = gatedOut; return p; }
+    p.fetch = 1;
+    if (srvCls == kPreAoiOut) { if (localCls == kPreAoiIn) p.byLocal = 1; else p.byOwn = 1; }
+    return p;
+}
+/* T-985 C2b fold 1 (review MED 4): at the first feed snapshot's end, 1 = a kept key still held back (stillGated) that this load
+   left outside with a newer copy on the world server (staleHeld) stays held - the snapshot was not seen whole, so not carrying
+   it says nothing, and releasing it would wake or place the older copy here. */
+inline int PreStaleHoldKeeps(int snapshotWhole, int stillGated, int staleHeld) { return (!snapshotWhole && stillGated && staleHeld) ? 1 : 0; }
 
 /* THE STATE (game), one per held load. */
 enum { kPhIdle = 0, kPhIndex = 1, kPhFetch = 2, kPhDone = 3, kPhReleased = 4 };

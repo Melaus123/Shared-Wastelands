@@ -54,6 +54,7 @@
 #include "../effect.h"                 /* T-327: EffectOnNet */
 #include "../hire.h"   /* recruit1: MSG_HIRE - HireNoteRecv / HireForgetPeer */
 #include "../../common/buildwire.h"  /* build1-b: the MSG_BUILD payload */
+#include "../../common/piecerec.h"   /* the protocol from which a piece's placement, state and removal travel only in its record */
 #include "../build.h"                 /* build1-b: BuildNoteRecv, BuildNoteBad */
 #include "../../common/farmwire.h"   /* par16: MSG_BUILD kinds 6 FARM / 7 FARM_OP */
 #include "../../common/powerwire.h"  /* P47: MSG_BUILD kinds 16 POWER_STATE / 17 POWER_ASK */
@@ -92,7 +93,8 @@ namespace { swlogbudget::Gate g_qNetAppearance, g_qNetClothing, g_qNetCombatMode
 
 #include <Windows.h>   /* E16: InterlockedIncrement64. Last of the includes, behind every engine header - the order the other plugin translation units use. */
 
-namespace coop { int PeerPlayerSectorsTS(int* slots, int* xs, int* ys, int cap); }   /* M7a A1 build 1 [a1b1-sp1f]: zones.cpp - the fresh player-sector rows of this link (every slot, this game's too), -1 = no fresh table */
+namespace coop { int PeerPlayerSectorsTS(int* slots, int* xs, int* ys, int cap); }
+static const int kPsRows = 1024;   /* the player-area rows read from PlayerSectorsTS: coopdrop::kPlayerSectorsMaxRows (src/common/areadrop.h) */   /* M7a A1 build 1 [a1b1-sp1f]: zones.cpp - the fresh player-sector rows of this link (every slot, this game's too), -1 = no fresh table */
 namespace coop { void WorldStateOnOwnershipReleased(unsigned int uid, const void* character); }   /* worldstate.cpp - a dual run's yield is a release */
 namespace coop { void OnPlayerGone(unsigned int slot, const char* how, int standIn); }   /* below, in coop: the return check handles a leave it missed as PLAYER_GONE's (standIn 1: no take here) */
 namespace coop { int CopyIsPlayerCharacter(unsigned int uid); }   /* spawn.cpp: 1 the player character / a player-faction person, 0 an NPC, -1 unreadable, -2 no body */
@@ -177,7 +179,10 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 172;   /* T-922 (172): the SPAWN carries the template's stringID in a tail after the flags byte; the shown name stays in its old field. The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 180;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+typedef char PieceFeedProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolRecordFeed) ? 1 : -1];   /* PLACE / STATE / REMOVE / ROSTER_REQUEST are no longer sent */
+typedef char PieceLiveBarProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveBar) ? 1 : -1];   /* T-1047 step 2b (175): a player's power piece's production bar and work state ride its record's LIVE part - no MINE_STATE for it */
+typedef char PieceLiveProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveRecord) ? 1 : -1];   /* a player's power piece: no POWER_STATE, its record's LIVE part */
 typedef char T889ProtocolAgrees[(kProtocolVersion == hovrec::kGameProtocol) ? 1 : -1];   /* T-889 step 2 (164: MSG_ITEM_HANDOVER; effort/t853 takes 163; 165 T-609: the farm worker-spot kinds inside MSG_BUILD renumbered 12-14 -> 13-15,
                                                                                                   12 being DISMANTLE_ASK's): the offline protocol test reads handrec.h */
 
@@ -1874,13 +1879,13 @@ static bool ReceiptExpectSlots(int sectorKey, std::vector<int>* out)
     out->clear();
     if (!coop::StoreLiveReady()) return false;
     if (sectorKey < 0 || sectorKey >= cooplive::kAreaKeyCount) return true;   /* no sector: no receipt - the ROSTER is the repair */
-    int sl[256], xs[256], ys[256];
-    const int n = coop::PeerPlayerSectorsTS(sl, xs, ys, 256);
+    int sl[kPsRows], xs[kPsRows], ys[kPsRows];
+    const int n = coop::PeerPlayerSectorsTS(sl, xs, ys, kPsRows);
     if (n < 0) return false;
     const int me = coop::StoreMySlot();
     const int sx = cooplive::AreaKeyX(sectorKey), sy = cooplive::AreaKeyY(sectorKey);
     for (int i = 0; i < n; ++i)
-        if (sl[i] != me && cooplo::ReceiptExpected(coop::StoreRosterSlotInWorld(sl[i]), 1, cooplo::Cheb(xs[i], ys[i], sx, sy), cooplo::kReceiptRadius)) out->push_back(sl[i]);
+        if (sl[i] != me && cooplo::ReceiptExpected(coop::StoreRosterSlotInWorld(sl[i]), 1, cooplo::Cheb(xs[i], ys[i], sx, sy), cooplo::kReceiptRadius)) cooplo::SlotAddOnce(out, sl[i]);   /* a slot with several player-character rows is expected once */
     return true;
 }
 static void OutRowExpect(OutRow* r, const std::vector<int>& e, double lastAt, int sends)
@@ -2069,9 +2074,9 @@ static void RosterHolderTick(double now)
     if (!coop::StoreLiveReady() || coop::StoreMySlot() < 0 || !coop::GameplayRunning() || coop::EngineWritesBlocked()) return;   /* no world, no copies to read */
     const int me = coop::StoreMySlot();
     const long gen = coop::StoreLiveGen();
-    int sl[256], xs[256], ys[256]; int px = -1, py = -1;
-    const int n = coop::PeerPlayerSectorsTS(sl, xs, ys, 256);
-    for (int i = 0; i < n; ++i) if (sl[i] == me) { px = xs[i]; py = ys[i]; }
+    int sl[kPsRows], xs[kPsRows], ys[kPsRows]; int ownX[kPsRows], ownY[kPsRows], ownN = 0;   /* this game's own rows: an area per player character */
+    const int n = coop::PeerPlayerSectorsTS(sl, xs, ys, kPsRows);
+    for (int i = 0; i < n; ++i) if (sl[i] == me && ownN < 256) { ownX[ownN] = xs[i]; ownY[ownN] = ys[i]; ++ownN; }
     std::map<int, std::vector<cooplo::CheckRow> > all;
     std::map<int, std::map<int, std::vector<cooplo::CheckRow> > > bySector;
     std::map<int, std::map<int, std::pair<unsigned int, unsigned long long> > > mineHash;
@@ -2104,12 +2109,12 @@ static void RosterHolderTick(double now)
         RoOwnerView& v = g_roView[*o];
         const int edge = v.edgeGen != gen ? 1 : 0;
         std::set<int> nearSecs, diff;
-        if (px >= 0 && v.hashAt > 0.0)
+        if (ownN > 0 && v.hashAt > 0.0)   /* sectors within 2 of ANY of this game's player characters */
         {
             for (std::map<int, std::pair<unsigned int, unsigned long long> >::const_iterator h = mineHash[*o].begin(); h != mineHash[*o].end(); ++h)
-                if (cooplo::Cheb(cooplive::AreaKeyX(h->first), cooplive::AreaKeyY(h->first), px, py) <= 2) nearSecs.insert(h->first);
+                if (cooplo::NearAnyArea(ownX, ownY, ownN, cooplive::AreaKeyX(h->first), cooplive::AreaKeyY(h->first), 2) != 0) nearSecs.insert(h->first);
             for (std::map<int, std::pair<unsigned int, unsigned long long> >::const_iterator h = v.hash.begin(); h != v.hash.end(); ++h)
-                if (cooplo::Cheb(cooplive::AreaKeyX(h->first), cooplive::AreaKeyY(h->first), px, py) <= 2) nearSecs.insert(h->first);
+                if (cooplo::NearAnyArea(ownX, ownY, ownN, cooplive::AreaKeyX(h->first), cooplive::AreaKeyY(h->first), 2) != 0) nearSecs.insert(h->first);
             for (std::set<int>::const_iterator k = nearSecs.begin(); k != nearSecs.end(); ++k)
             {
                 std::map<int, std::pair<unsigned int, unsigned long long> >::const_iterator a = mineHash[*o].find(*k), b = v.hash.find(*k);
@@ -3360,6 +3365,7 @@ static bool GetItemFields(const std::vector<char>& p, size_t* at, std::string* b
     return true;
 }
 
+static int g_itemRequestToSlot = -1;   /* SendItemRequestToSlot's named game for the one send it makes; -1 = none */
 bool SendItemRequest(const coop::ItemRequestMsg& r)
 {
     if (CharRoadNow() == cooplive::kCharRoadNone) return false;   /* M7b slice 2: the item road */
@@ -3412,16 +3418,19 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
     /* bag23 part 2 (protocol 81): the owner half INSIDE A PACK - its path, LAST. One that will not encode is not sent. */
     if (r.ownerBag.has != 0 && !coopbag::EncodeBagPath(&b, r.ownerBag))
     { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + ": its pack path would not encode - NOT SENT"); return false; }
-    /* P105 build 2 (protocol 126): a HOLD / LAND ends with its 'HLD1' trailer, LAST of all (announced by the dir byte) */
+    /* P105 build 2 (protocol 126): a HOLD / LAND's 'HLD1' trailer, last but for the ASK1 trailer every request ends with (announced by the dir byte) */
     if (r.dir == coophold::kDirHold || r.dir == coophold::kDirLand)
     { coophold::HoldTail ht; ht.holdId = r.holdId; ht.how = r.holdHow; ht.slot = r.holdSlot; coophold::PutHoldTail(&b, ht); }
+    /* game protocol 180: every request ends with its 'ASK1' trailer, after the HLD1 one - a journalled ask's id for the box's ledger */
+    { coopbrec::AskTail at; at.askId = r.askId; at.slot = r.askSlot; at.carry = r.askCarry; coopbrec::PutAskTail(&b, at); }
     /* M7b slice 2: a character's request to its OWNER (the owner table); a box's, a shop's or the ground's to the WRITER of its key
        (coop::ItemRequestTargetSlot: a player-owned box's owner, else the area holder). The game it went to is remembered by the id:
        its answer is taken only from that game, and PLACED / REVOKE / the shop tail go back to it. */
     int to = cooplive::kAddrOwnerNone;
     unsigned int stickyKey = 0u;
     bool held = false;
-    if (ItemAskedStickyKey(r.id, &stickyKey))
+    if (g_itemRequestToSlot >= 0) { to = g_itemRequestToSlot; held = true; }   /* SendItemRequestToSlot: the named game */
+    else if (ItemAskedStickyKey(r.id, &stickyKey))
     {   /* fold 1: a request RE-SENT under an id already asked (a ground PUT keeps its first id) goes to the game it was asked of
            until that game refuses it - only then to the current writer - so two holders never both serve one PUT.
            re-check fold (MED): a held game that has LEFT (out of the world roster, and for the session peer its session link down
@@ -3448,6 +3457,18 @@ bool SendItemRequest(const coop::ItemRequestMsg& r)
     if (sent) { ItemAskedNote(r.id, askedKey); AddrCount(MSG_ITEM_REQUEST, kAddrColToOwner); }
     if (sent && ownSent) coop::ItemOwnerNoteCarried("ITEM_REQUEST", r.owner);
     if (sent && !r.bag.empty()) coop::ItemOwnerNoteRowsCarried(coopbag::BagRowsMarked(r.bag), coopbag::BagRowsUnknown(r.bag));   /* inv6 phase 2; review-inv6p2 LOW (request) */
+    return sent;
+}
+
+/* A REQUEST TO ONE NAMED GAME (a lapsed home-shop trade's settle-only ask of the game holding the shop's area now): sent as
+   SendItemRequest sends, to toSlot; the game it went to joins the id's asked games, so its answer is taken and the id's later
+   re-sends are held to it. MAIN THREAD. */
+bool SendItemRequestToSlot(const coop::ItemRequestMsg& r, int toSlot)
+{
+    if (toSlot < 0) return false;
+    g_itemRequestToSlot = toSlot;
+    const bool sent = SendItemRequest(r);
+    g_itemRequestToSlot = -1;
     return sent;
 }
 
@@ -4602,8 +4623,8 @@ static void ReturnBook(long gen, double downSec)
 static void ReturnOwnList(int me)
 {
     if (!g_rtOwnDue || !coop::StoreLiveReady() || coop::StoreRosterSlotInWorld(me) < 0 || coop::EngineWritesBlocked()) return;
-    int sl[256], xs[256], ys[256];
-    const int n = coop::PeerPlayerSectorsTS(sl, xs, ys, 256);
+    int sl[kPsRows], xs[kPsRows], ys[kPsRows];
+    const int n = coop::PeerPlayerSectorsTS(sl, xs, ys, kPsRows);
     if (n < 0)
     {
         if (++g_rtOwnLooks < kRtOwnLooksMax) return;
@@ -4999,12 +5020,33 @@ bool SendShopTail(unsigned int id, unsigned int epoch, int kind)
     coopshop::EncodeTail(&b, epoch, kind);
     return ItemSendTo(MSG_ITEM_REVOKE, ItemToAskedOf(id), &b[0], b.size(), 0u, 0);   /* M7b slice 2: to the game shop request `id` was asked of */
 }
+/* MSG_ITEM_REVOKE with the shop tail kind 2 - THE CANCEL of a home shop's trade, to toSlot: the game the area map names as the holder
+   of the shop's area now (never the game the request was asked of by that alone). A body that will not encode is not sent. */
+bool SendShopCancel(unsigned int id, unsigned int epoch, int toSlot, const coopshop::ShopCancel& c)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone || toSlot < 0) return false;   /* M7b slice 2: the item road */
+    std::vector<char> b;
+    PutU32(&b, id);
+    if (coopshop::EncodeCancelTail(&b, epoch, c) == 0)
+    { ErrorLog("[net] ITEM_REVOKE " + N((long long)id) + ": its shop cancel would not encode - NOT SENT"); return false; }
+    return ItemSendTo(MSG_ITEM_REVOKE, toSlot, &b[0], b.size(), 0u, 0);
+}
+/* MSG_ITEM_REVOKE with the shop tail kind 3 - the holder's CANCEL ANSWER (coopshop::kCa*) to the asker's key (a slot's player key, or
+   the session peer's raw key) */
+bool SendShopCancelAnswer(unsigned int id, unsigned int epoch, unsigned int toKey, int answer)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return false;   /* M7b slice 2: the item road */
+    std::vector<char> b;
+    PutU32(&b, id);
+    if (coopshop::EncodeCancelAnswerTail(&b, epoch, answer) == 0) return false;
+    return ItemSendTo(MSG_ITEM_REVOKE, ItemToAsker(true, toKey), &b[0], b.size(), 0u, 0);
+}
 
 /* The id at the head of an item request / answer refused before its body is read (0 = no id there). */
 static unsigned int ItemMsgId(const Message& m) { unsigned int id = 0; return GetU32(m.payload, 0, &id) ? id : 0u; }
 // E22b - MSG_ITEM_REQUEST: the peer touched an inventory it does not own and is asking US, the owner, to make
 // the move. Refused whole on any malformed field: a half-read request would name a slot nobody can name.
-static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail, int hdDir)
+static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail, int hdDir, const coopbrec::AskTail& ask)
 {
     coop::ItemRequestMsg r;
     size_t at = 0;
@@ -5114,12 +5156,20 @@ static void OnItemRequestBody(const Message& m, const coophold::HoldTail* hdTail
         { ErrorLog("[net] ITEM_REQUEST " + N((long long)r.id) + " with trailing bytes that are not a whole pack path block - REFUSED"); coop::ItemRequestRefusedHere(r.id, m.peer); return; }
     }
     if (hdTail != 0) { r.dir = hdDir; r.holdId = hdTail->holdId; r.holdHow = hdTail->how; r.holdSlot = hdTail->slot; }   /* P105 build 2 */
+    r.askId = ask.askId; r.askSlot = ask.slot; r.askCarry = ask.carry;   /* game protocol 180: the ASK1 trailer */
     coop::ApplyItemRequest(r, m.peer);
 }
 /* P105 build 2 (protocol 126): dir 2 HOLD / 3 LAND end with the 'HLD1' trailer (coophold) - read off the end, the rest read as a
-   take-shaped request (dir 0 rules: no backpack rows, no owner block), then the direction restored. Not whole: REFUSED. */
-void OnItemRequest(const Message& m)
+   take-shaped request (dir 0 rules: no backpack rows, no owner block), then the direction restored. Not whole: REFUSED. Game protocol
+   180: every request ends with the 'ASK1' trailer (coopbrec::AskTail), read off the end first - none, or not whole: REFUSED. */
+void OnItemRequest(const Message& m0)
 {
+    coopbrec::AskTail ask;
+    size_t askLen = 0;
+    if (m0.payload.empty() || !coopbrec::TakeAskTail(&m0.payload[0], m0.payload.size(), &ask, &askLen))
+    { ErrorLog("[net] ITEM_REQUEST without a whole 'ASK1' trailer - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m0), m0.peer); return; }
+    Message m = m0;
+    m.payload.resize(m.payload.size() - askLen);
     if (m.payload.size() >= 5 && ((unsigned char)m.payload[4] == coophold::kDirHold || (unsigned char)m.payload[4] == coophold::kDirLand))
     {
         coophold::HoldTail ht;
@@ -5130,10 +5180,10 @@ void OnItemRequest(const Message& m)
         c.payload.resize(c.payload.size() - coophold::kHoldTailLen);
         if (c.payload.size() < 5) { ErrorLog("[net] malformed ITEM_REQUEST (nothing before its HLD1 block) - REFUSED"); coop::ItemRequestRefusedHere(ItemMsgId(m), m.peer); return; }
         c.payload[4] = 0;
-        OnItemRequestBody(c, &ht, dir);
+        OnItemRequestBody(c, &ht, dir, ask);
         return;
     }
-    OnItemRequestBody(m, 0, 0);
+    OnItemRequestBody(m, 0, 0, ask);
 }
 
 // E22b-2 (P6b) - MSG_ITEM_PLACED: the taker's answer about a TAKE we granted. Refused whole if it is short:
@@ -5165,7 +5215,8 @@ void OnItemRevoke(const Message& m)
         coopshop::ShopTail t;
         if (!coopshop::DecodeTail(&m.payload[0], m.payload.size(), &at, &t))
         { ErrorLog("[net] ITEM_REVOKE " + N((long long)id) + " with a shop tail that is cut or out of range - REFUSED"); return; }
-        coop::ApplyShopTail(id, m.peer, t.epoch, t.kind);
+        if (t.kind == coopshop::kTailCancel || t.kind == coopshop::kTailCancelAnswer) coop::ApplyShopCancelTail(id, m.peer, t);   /* kinds 2 / 3 */
+        else coop::ApplyShopTail(id, m.peer, t.epoch, t.kind);
         return;
     }
     coop::ApplyItemRevoke(id, m.peer);

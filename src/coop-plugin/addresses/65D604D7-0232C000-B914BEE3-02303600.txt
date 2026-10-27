@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 557
+!count 561
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -545,6 +545,7 @@ ProductionUpdateInputs                         code 0029A330 0029A330 488BC45541
 OrdersReceiver_resetOrders                     code 00506AA0 00506AA0 40534883EC2048896C243033ED48C741
 OrdersReceiver_dropStandingJobs                code 005067F0 005067F0 48895C2410574883EC2033DB488BF939
 PreviewTownOwnerTest                           code 004DB212 004DB212 4839985002000074074C89BE90000000
+PreviewNearTownDone                            code 004DB2F6 004DB2F6 837E38007569488B461848394610745F
 BuildPreviewCreate                             code 004E0BD0 004E0BD0 405556574154415541564157488D6C24
 BuildPreviewDestroy                            code 004D2CC0 004D2CC0 4889742420574883EC30488BF233D248
 BuildPreviewListGlobal                         var  0212CE38 0212CE38 -
@@ -568,3 +569,6 @@ ZoneManager_resetPopulation                    code 009FCC30 009FCC30 40534883EC
 LevelEditor_setVisible                         code 0077B350 0077B350 488BC45557415441554156488DA8E8FE
 Character_moveToNewSquad                       code 005CDA50 005CDA50 48896C242041544883EC30440FB6E248
 ActivePlatoon_specialToNewSquads               code 0079B620 0079B620 488BC4554154415541564157488BEC48
+DoorHitByMelee                                 code 0029D650 0029D650 488BC4574881EC9000000048C7442448
+LockPickTick                                   code 00297E10 00297E10 40534883EC30F30F5851180F29742420
+Ownerships_takeMoney                           code 007CAF00 007CAF00 8B81880000003BC27D0785D2780332C0

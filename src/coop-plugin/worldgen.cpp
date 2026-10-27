@@ -600,6 +600,23 @@ void WorldGenTick()
 // MAIN THREAD ONLY. Returns false when the hook never installed or the world is not available -
 // the caller reports that case rather than assuming the object went away.
 bool WorldGenDestroyHooked() { return orig_destroy != 0; }
+/* T-1080: this game is about to remove `character` (DestroyLocalObject). Its squad's living members
+   other than it are counted (-1: the squad read faulted, more members than the read holds, or a member's death not readable) and the
+   store marks a recorded squad left with nobody living (StoreModRemovalMark): the engine's discard of that squad is this game's own
+   removal, not the squad's end. MAIN THREAD. */
+void ModRemovalNote(void* character)
+{
+    ::coop::SquadView v;
+    if (character == 0 || ::coop::ReadSquadOf((::Character*)character, &v) != 1 || v.platoon == 0) return;
+    int living = v.count > v.stored ? -1 : 0;
+    for (int i = 0; living >= 0 && i < v.stored; ++i)
+    {
+        if (v.members[i] == 0 || (void*)v.members[i] == character) continue;
+        const int dead = ::coop::StoreIsDeadPod((void*)v.members[i]);
+        if (dead < 0) living = -1; else if (dead == 0) ++living;
+    }
+    ::coop::StoreModRemovalMark(v.platoon, living);
+}
 bool DestroyLocalObject(void* obj)
 {
     if (obj == 0) return false;
@@ -609,6 +626,7 @@ bool DestroyLocalObject(void* obj)
     // T-831 - the dialogue window keeps a character of the conversation it shows and calls it every frame; a conversation
     // that names this object ends first, while the object still exists (address compares; nothing happens otherwise).
     TalkWindowBeforeRemove(obj);
+    ModRemovalNote(obj);   /* T-1080: the squad this removal empties keeps its record */
     // F337 - the layout fact this line rests on, stated rather than warned about. (F336 put a
     // warning here about a "properly typed conversion" applying a base-class offset; that hazard is
     // not expressible - the parameter is `void*`, from which every cast form is a reinterpret.)

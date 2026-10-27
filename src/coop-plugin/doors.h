@@ -85,5 +85,24 @@ void NoteDoorOriginUnknown();
 void SetDoorsOn(bool on);
 void ReportDoors();
 int DoorOpenStatePod(void* door, int* state, int* openTenths);   /* PROBE P068 (B1): guarded read, 1 = read; state 0 closed 1 open */
+// A built piece's doors on its record (build.cpp). ANY THREAD: 1 = `door` is listed by its parent (+0x368), at *indexOut.
+int DoorsDoorOfParent(void* door, void** parentOut, int* indexOut);
+// Guarded read of what the record carries: health +0x164, its max +0x188, door broken +0x3EC, has a lock, lock level, lock broken.
+int DoorsRecReadPod(void* door, float* health, float* maxHealth, int* broken, int* hasLock, int* level, int* lockBroken);
+// MAIN THREAD: the record's values onto a door (a break: setBroken(1), unlock, openDoor; a mend: setBroken(0)). -1 fault, 0 nothing to write, 1 written.
+int DoorsRecApply(void* door, float health, int broken, int hasLock, int level, int lockBroken);
+// MAIN THREAD: a repair's gained health added to the door (up to its max), broken cleared above 0 - as the engine's repair 0x558B10 leaves it. 1 = done.
+int DoorsRecRepair(void* door, float gain);
+void* DoorsKeptDoorAt(void* building, int index);
+void* DoorsLockOf(void* door);
+// The record's door applies and the door road around them, for the pieceLive REPORT line (DoorsRecCountsOut): out[0..9] = breaks,
+// mends, lock levels, lock broken flags, health writes, broken keeps, broken doors reopened, mends handed back to the holder's word,
+// door locks picked, other locks picked; n = the slots to fill.
+void DoorsRecCounts(long long* out, int n);
+// TEST-ONLY (bldstate, bldset): the door's state (0..3) and its lock's locked byte (0 with no lock); 1 = read.
+int DoorsTestStatePod(void* door, int* state, int* locked);
+// TEST-ONLY (bldset doorpick), MAIN THREAD: the lock pick's tick at its hooked entry, up to maxCalls times while the lock reads
+// locked; the words say what was called and the locked byte before and after.
+std::string DoorsTestPick(void* door, int maxCalls, int* lockedBefore, int* lockedAfter);
 
 } // namespace coop

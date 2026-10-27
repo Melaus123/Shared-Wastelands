@@ -762,7 +762,7 @@ inline bool GdcScan(const char* data, size_t n, const std::string& src, GdcScanO
    strips too: the copy's squad record then has char count 0 and no instance, every other byte of it unchanged - the shape
    the engine itself writes for a squad with nobody in it (its member loader makes no one from it). */
 const int kStripOk = 0, kStripParse = 1, kStripNoChar = 2, kStripNoInstance = 3, kStripShared = 4, kStripCount = 5, kStripEmpty = 6, kStripCheck = 7,
-          kStripHandRef = 8, kStripLayout = 9;
+          kStripHandRef = 8, kStripLayout = 9, kAddSidClash = 10, kAddPresent = 11;
 inline const char* StripWhyName(int w)
 {
     switch (w)
@@ -777,13 +777,15 @@ inline const char* StripWhyName(int w)
     case kStripCheck:      return "strip-selfcheck";
     case kStripHandRef:    return "hand-reference";
     case kStripLayout:     return "layout";
+    case kAddSidClash:     return "record-name-clash";
+    case kAddPresent:      return "already-present";
     default:               return "?";
     }
 }
 struct GdcInstSpan
 {
     size_t                   from, to;
-    std::string              target;
+    std::string              name, target;   /* name: the entry's own name (the first string of the instance) */
     std::vector<std::string> states;
     GdcInstSpan() : from(0), to(0) {}
 };
@@ -883,7 +885,7 @@ inline bool GdcSpans(const char* data, size_t n, size_t* recsEnd, std::vector<Gd
         {
             GdcInstSpan is;
             is.from = c.at;
-            GdcStr(&c, 0); GdcStr(&c, &is.target); GdcSkip(&c, 12); GdcSkip(&c, 16);
+            GdcStr(&c, &is.name); GdcStr(&c, &is.target); GdcSkip(&c, 12); GdcSkip(&c, 16);
             const int ns = GdcCount(&c, 4);
             for (int k = 0; k < ns && !c.bad; ++k)
             {
@@ -1039,6 +1041,291 @@ inline int GdcStripChar(const char* data, size_t n, const std::string& who, std:
     return kStripOk;
 }
 
+/* ONE CHARACTER BACK INTO A RECORD'S LOAD COPY (T-1062, owner decision 1091 a): the reverse of GdcStripChar. src = the save's file
+   of the same squad, holding the person; dst = the record's copy, without him. His instance (from src's squad record) is added
+   after dst's own instances, every record that instance names, transitively (GdcStripChar's walk), just before dst's squad
+   record (the engine writes a squad's member records first and its squad record last), and "char count" rises by one; every
+   other byte of dst is copied unchanged. A record of his whose name dst already uses for another record is given a name
+   neither file uses (GdcFreshName), and every reference to it in the copied bytes follows (GdcRenamedRec, GdcRenamedInst):
+   the engine names records from a per-process counter, so a record and a save of different sessions can share names. His entry in
+   the squad record is renamed the same way when dst's squad record already has an entry of its name.
+   Refused (out untouched) when anything does not fit: src or dst not the verified layout (GdcSquadLayout), no hand, the person
+   not exactly once in src or already in dst (kAddPresent), his records naming another character or the squad record, or no
+   fresh name found (kAddSidClash). Self-check: stripping him from the result (GdcStripChar) gives dst back byte for byte, and the result scans
+   as dst's characters plus him once. */
+/* A RECORD OR INSTANCE COPIED WITH NAMES REPLACED: the bytes of one record (or one instance) of 0x6BD220's layout, walked as
+   GdcSpans walks them, copied to `o` with every name in `ren` replaced where it names a record - the record's own name, its
+   reference lists' entries, its instances' targets and states. Every other byte is copied as it is (a replaced name changes its
+   length prefix only). false = the bytes from `from` do not parse as exactly one record (instance) ending at `to`. */
+inline void GdcCopyBytes(GdcCur* c, size_t k, std::vector<char>* o)
+{
+    const size_t at = c->at;
+    GdcSkip(c, k);
+    if (!c->bad) o->insert(o->end(), (const char*)c->p + at, (const char*)c->p + at + k);
+}
+inline int GdcCopyCount(GdcCur* c, size_t minEach, std::vector<char>* o)
+{
+    const int k = GdcCount(c, minEach);
+    if (!c->bad) GdcPutI32(o, k);
+    return k;
+}
+inline void GdcCopyName(GdcCur* c, const std::map<std::string, std::string>& ren, bool rename, std::vector<char>* o)
+{
+    std::string s;
+    GdcStr(c, &s);
+    if (c->bad) return;
+    if (rename)
+    {
+        std::map<std::string, std::string>::const_iterator f = ren.find(s);
+        if (f != ren.end()) s = f->second;
+    }
+    GdcPutI32(o, (int)s.size());
+    o->insert(o->end(), s.begin(), s.end());
+}
+/* own (optional): the entry's own name is written as *own instead of the name it has */
+inline void GdcCopyInst(GdcCur* c, const std::map<std::string, std::string>& ren, std::vector<char>* o, const std::string* own = 0)
+{
+    if (own == 0) GdcCopyName(c, ren, false, o);
+    else
+    {
+        GdcStr(c, 0);
+        if (c->bad) return;
+        GdcPutI32(o, (int)own->size());
+        o->insert(o->end(), own->begin(), own->end());
+    }
+    GdcCopyName(c, ren, true, o);   /* the target */
+    GdcCopyBytes(c, 28, o);
+    const int ns = GdcCopyCount(c, 4, o);
+    for (int k = 0; k < ns && !c->bad; ++k) GdcCopyName(c, ren, true, o);
+}
+inline bool GdcRenamedInst(const char* data, size_t from, size_t to, const std::map<std::string, std::string>& ren, std::vector<char>* o,
+                           const std::string* own = 0)
+{
+    GdcCur c; c.p = (const unsigned char*)data; c.n = data ? to : 0; c.at = from; c.bad = false;
+    GdcCopyInst(&c, ren, o, own);
+    return !c.bad && c.at == to;
+}
+inline bool GdcRenamedRec(const char* data, size_t from, size_t to, const std::map<std::string, std::string>& ren, std::vector<char>* o)
+{
+    static const int kWidth[7] = { 1, 4, 4, 12, 16, 0, 0 };   /* as GdcSpans */
+    GdcCur c; c.p = (const unsigned char*)data; c.n = data ? to : 0; c.at = from; c.bad = false;
+    GdcCopyBytes(&c, 12, o);
+    GdcCopyName(&c, ren, false, o);
+    GdcCopyName(&c, ren, true, o);   /* the record's own name */
+    GdcCopyBytes(&c, 4, o);
+    for (int m = 0; m < 7 && !c.bad; ++m)
+    {
+        const int cnt = GdcCopyCount(&c, 4, o);
+        for (int e = 0; e < cnt && !c.bad; ++e)
+        {
+            GdcCopyName(&c, ren, false, o);
+            if (kWidth[m] == 0) GdcCopyName(&c, ren, false, o);
+            else GdcCopyBytes(&c, (size_t)kWidth[m], o);
+        }
+    }
+    const int lists = GdcCopyCount(&c, 8, o);
+    for (int l = 0; l < lists && !c.bad; ++l)
+    {
+        GdcCopyName(&c, ren, false, o);
+        const int ne = GdcCopyCount(&c, 16, o);
+        for (int e = 0; e < ne && !c.bad; ++e) { GdcCopyName(&c, ren, true, o); GdcCopyBytes(&c, 12, o); }
+    }
+    const int inst = GdcCopyCount(&c, 40, o);
+    for (int i = 0; i < inst && !c.bad; ++i) GdcCopyInst(&c, ren, o);
+    return !c.bad && c.at == to;
+}
+/* a name no name in `used` is: "<digits><rest>" (the engine's "<n>--INGAME") takes the next number above every name of the
+   same rest in `used`; any other name gets "-<k>" added. The new name joins `used`; empty = none found. */
+inline size_t GdcLeadDigits(const std::string& s)
+{
+    size_t d = 0;
+    while (d < s.size() && d < 18 && s[d] >= '0' && s[d] <= '9') ++d;
+    return (d < s.size() && s[d] >= '0' && s[d] <= '9') ? 0 : d;
+}
+inline std::string GdcFreshName(const std::string& old, std::set<std::string>* used)
+{
+    std::string fresh;
+    const size_t d = GdcLeadDigits(old);
+    if (d > 0)
+    {
+        const std::string rest = old.substr(d);
+        unsigned long long top = 0;
+        for (std::set<std::string>::const_iterator u = used->begin(); u != used->end(); ++u)
+        {
+            const size_t e = GdcLeadDigits(*u);
+            unsigned long long v = 0;
+            if (e == 0 || u->compare(e, std::string::npos, rest) != 0 || !ParseULL(u->substr(0, e), &v)) continue;
+            if (v > top) top = v;
+        }
+        for (unsigned long long k = top + 1; k < top + 100000ULL && fresh.empty(); ++k)
+        {
+            char b[32];
+            std::sprintf(b, "%llu", k);
+            fresh = std::string(b) + rest;
+            if (used->count(fresh) != 0) fresh.clear();
+        }
+    }
+    else
+        for (int k = 1; k < 100000 && fresh.empty(); ++k)
+        {
+            char b[32];
+            std::sprintf(b, "-%d", k);
+            fresh = old + b;
+            if (used->count(fresh) != 0) fresh.clear();
+        }
+    if (!fresh.empty()) used->insert(fresh);
+    return fresh;
+}
+inline int GdcSquadLayout(const std::vector<GdcRecSpan>& rs, size_t* sqAt)
+{
+    size_t at = rs.size();
+    int squads = 0, chars = 0;
+    for (size_t i = 0; i < rs.size(); ++i)
+    {
+        if (rs[i].type == 0x1E) { ++squads; at = i; }
+        if (rs[i].type == 0x24) ++chars;
+    }
+    if (squads != 1) return kStripLayout;
+    const GdcRecSpan& o = rs[at];
+    if (o.fields != 1 + (o.hasMoney ? 1 : 0) || o.lists != 0) return kStripLayout;
+    if (!o.hasCharCount || o.charCount != (int)o.inst.size() || o.charCount != chars || o.charCountAt + 4 > o.instCountAt) return kStripCount;
+    *sqAt = at;
+    return kStripOk;
+}
+inline int GdcAddChar(const char* src, size_t sn, const char* dst, size_t dn, const std::string& who, std::vector<char>* out)
+{
+    if (who.empty() || who[0] == '?') return kStripNoChar;
+    std::vector<GdcRecSpan> ss, ds;
+    size_t send = 0, dend = 0;
+    if (!src || !dst || !GdcSpans(src, sn, &send, &ss) || !GdcSpans(dst, dn, &dend, &ds)) return kStripParse;
+    if (send != sn || dend != dn) return kStripLayout;   /* bytes after the records: not the verified layout */
+    size_t sAt = 0, dAt = 0;
+    int lay = GdcSquadLayout(ss, &sAt);
+    if (lay != kStripOk) return lay;
+    lay = GdcSquadLayout(ds, &dAt);
+    if (lay != kStripOk) return lay;
+    std::map<std::string, size_t> sBySid;
+    std::set<std::string> dSids;
+    for (size_t i = 0; i < ss.size(); ++i)
+    {
+        if (ss[i].sid.empty()) continue;
+        if (sBySid.count(ss[i].sid) != 0) return kStripShared;
+        sBySid[ss[i].sid] = i;
+    }
+    for (size_t i = 0; i < ds.size(); ++i)
+    {
+        if (ds[i].type == 0x24 && ds[i].hand == who) return kAddPresent;
+        if (!ds[i].sid.empty() && !dSids.insert(ds[i].sid).second) return kStripShared;
+    }
+    size_t mainRec = ss.size();
+    for (size_t i = 0; i < ss.size(); ++i)
+    {
+        if (ss[i].type != 0x24 || ss[i].hand != who) continue;
+        if (mainRec != ss.size()) return kStripNoChar;   /* the same person twice in one file */
+        mainRec = i;
+    }
+    if (mainRec == ss.size() || ss[mainRec].sid.empty()) return kStripNoChar;
+    size_t inst = ss[sAt].inst.size();
+    int hits = 0;
+    for (size_t i = 0; i < ss.size(); ++i)
+        for (size_t k = 0; k < ss[i].inst.size(); ++k)
+            for (size_t j = 0; j < ss[i].inst[k].states.size(); ++j)
+                if (ss[i].inst[k].states[j] == ss[mainRec].sid) { ++hits; if (i == sAt) inst = k; }
+    if (hits != 1 || inst == ss[sAt].inst.size()) return kStripNoInstance;
+    std::set<size_t> take;
+    std::vector<size_t> todo;
+    const std::vector<std::string>& names = ss[sAt].inst[inst].states;
+    for (size_t j = 0; j < names.size(); ++j)
+    {
+        std::map<std::string, size_t>::const_iterator f = sBySid.find(names[j]);
+        if (f == sBySid.end() || f->second == sAt) return kStripShared;   /* a state that is no record of this file */
+        if (take.insert(f->second).second) todo.push_back(f->second);
+    }
+    while (!todo.empty())
+    {
+        const GdcRecSpan& g = ss[todo.back()];
+        todo.pop_back();
+        std::vector<std::string> refs = g.listRefs;
+        for (size_t k = 0; k < g.inst.size(); ++k)
+        {
+            refs.push_back(g.inst[k].target);
+            refs.insert(refs.end(), g.inst[k].states.begin(), g.inst[k].states.end());
+        }
+        for (size_t j = 0; j < refs.size(); ++j)
+        {
+            std::map<std::string, size_t>::const_iterator f = sBySid.find(refs[j]);
+            if (f == sBySid.end()) continue;   /* a game-data name (a template, a race): not in this file */
+            if (f->second == sAt) return kStripShared;
+            if (take.insert(f->second).second) todo.push_back(f->second);
+        }
+    }
+    /* every name either file uses or names - a game-data name (a template, a race) his records refer to included: a record given
+       such a name would take over that reference. A fresh name must be none of them. */
+    std::set<std::string> used(dSids);
+    for (std::map<std::string, size_t>::const_iterator s = sBySid.begin(); s != sBySid.end(); ++s) used.insert(s->first);
+    for (int f = 0; f < 2; ++f)
+    {
+        const std::vector<GdcRecSpan>& rs = f == 0 ? ds : ss;
+        for (size_t i = 0; i < rs.size(); ++i)
+        {
+            used.insert(rs[i].listRefs.begin(), rs[i].listRefs.end());
+            for (size_t k = 0; k < rs[i].inst.size(); ++k) { used.insert(rs[i].inst[k].target); used.insert(rs[i].inst[k].states.begin(), rs[i].inst[k].states.end()); }
+        }
+    }
+    /* his entry in the squad record: its own name comes from the engine's per-process counter as record names do, so it can be
+       the name of an entry dst's squad record already has - it then takes a name no entry of either squad record has */
+    std::string entryName = ss[sAt].inst[inst].name;
+    bool entryRenamed = false;
+    {
+        std::set<std::string> entries;
+        for (size_t k = 0; k < ds[dAt].inst.size(); ++k) entries.insert(ds[dAt].inst[k].name);
+        if (entries.count(entryName) != 0)
+        {
+            for (size_t k = 0; k < ss[sAt].inst.size(); ++k) entries.insert(ss[sAt].inst[k].name);
+            entryName = GdcFreshName(entryName, &entries);
+            if (entryName.empty()) return kAddSidClash;
+            entryRenamed = true;
+        }
+    }
+    std::map<std::string, std::string> ren;   /* a record of his whose name dst uses -> a name neither file uses */
+    for (std::set<size_t>::const_iterator g = take.begin(); g != take.end(); ++g)
+    {
+        if (ss[*g].type == 0x24 && *g != mainRec) return kStripShared;   /* another character would come with him */
+        if (dSids.count(ss[*g].sid) == 0) continue;
+        const std::string fresh = GdcFreshName(ss[*g].sid, &used);
+        if (fresh.empty()) return kAddSidClash;
+        ren[ss[*g].sid] = fresh;
+    }
+    std::vector<char> o;
+    o.insert(o.end(), dst, dst + 8);
+    GdcPutI32(&o, (int)(ds.size() + take.size()));
+    for (size_t i = 0; i < ds.size(); ++i)
+    {
+        const GdcRecSpan& g = ds[i];
+        if (i != dAt) { o.insert(o.end(), dst + g.from, dst + g.to); continue; }
+        for (std::set<size_t>::const_iterator t = take.begin(); t != take.end(); ++t)   /* his records, then the squad record */
+        {
+            if (ren.empty()) o.insert(o.end(), src + ss[*t].from, src + ss[*t].to);
+            else if (!GdcRenamedRec(src, ss[*t].from, ss[*t].to, ren, &o)) return kStripCheck;
+        }
+        o.insert(o.end(), dst + g.from, dst + g.charCountAt);
+        GdcPutI32(&o, g.charCount + 1);
+        o.insert(o.end(), dst + g.charCountAt + 4, dst + g.instCountAt);
+        GdcPutI32(&o, (int)g.inst.size() + 1);
+        o.insert(o.end(), dst + g.instCountAt + 4, dst + g.to);
+        if (ren.empty() && !entryRenamed) o.insert(o.end(), src + ss[sAt].inst[inst].from, src + ss[sAt].inst[inst].to);
+        else if (!GdcRenamedInst(src, ss[sAt].inst[inst].from, ss[sAt].inst[inst].to, ren, &o, entryRenamed ? &entryName : 0)) return kStripCheck;
+    }
+    /* the result less him must be dst exactly, and must scan as dst's people plus him */
+    std::vector<char> back;
+    if (GdcStripChar(&o[0], o.size(), who, &back) != kStripOk || back != std::vector<char>(dst, dst + dn)) return kStripCheck;
+    GdcScanOut before, after;
+    if (!GdcScan(dst, dn, "add", &before) || !GdcScan(&o[0], o.size(), "add", &after) || after.chars.size() != before.chars.size() + 1) return kStripCheck;
+    if (std::count(after.chars.begin(), after.chars.end(), who) != 1) return kStripCheck;
+    out->swap(o);
+    return kStripOk;
+}
+
 /* THE ROSTER CHECK (design 3.3; review-mmo2 items 2 and 5). One squad the overlay may apply: its characters in the
    save's version and in the record. apply: in = 1 for a candidate; out = 1 when the record is laid over the save.
    conflict / duplicate / empty: why it was refused (the save's version is kept).
@@ -1050,41 +1337,62 @@ inline int GdcStripChar(const char* data, size_t n, const std::string& who, std:
    fenced = 1 (T-710, savesquadforeign.h): the save's file of this squad id holds only another player's characters
    (fileChars), so saveChars is the record's own people - what is checked when the record is applied; refused, the squad
    loads that file, so the roster counts fileChars for it, never the record's people.
+   T-1062 (owner decisions 1091 a, 1092 a; manager ruling: in a doubling the record's copy wins) - the check settles PER PERSON:
+   addBack = people of the save's version in no squad after the load and with no left note: the caller copies each back into
+   the record's load copy (GdcAddChar) and the record is applied with them (nobody is deleted: a person moved to a squad made
+   after the save, which the load cannot rebuild yet, stays in his old squad - design 3.3). leftOut / leftWhy = such people
+   whose left note (LeftNote: a death) keeps them out. dupSave = record people counted twice or more after the load only
+   because the save itself holds them so (never more copies than the save alone loads): the record is applied, the other copy
+   is left alone. noAdd (in) = people whose copy-back the caller could not make: a conflict, as before.
    RosterCounts.moved = people applied as moved after the save; stripped = stripped squads applied; restored = restore
-   candidates applied. */
+   candidates applied; addBack / leftOut / dupSave = people settled each way in applied squads. */
 struct RosterSquad
 {
     std::string              key;
     std::vector<std::string> saveChars, recChars, movedIn, movedFrom, fileChars;
+    std::vector<std::string> addBack, leftOut, dupSave, noAdd;
+    std::vector<int>         leftWhy;
     int                      apply, conflict, duplicate, empty, stripped, restore, fenced;
     RosterSquad() : apply(0), conflict(0), duplicate(0), empty(0), stripped(0), restore(0), fenced(0) {}
 };
 struct RosterCounts
 {
-    int conflict, duplicate, empty, moved, stripped, restored;
-    RosterCounts() : conflict(0), duplicate(0), empty(0), moved(0), stripped(0), restored(0) {}
+    int conflict, duplicate, empty, moved, stripped, restored, addBack, leftOut, dupSave;
+    RosterCounts() : conflict(0), duplicate(0), empty(0), moved(0), stripped(0), restored(0), addBack(0), leftOut(0), dupSave(0) {}
 };
+inline bool RosterHas(const std::vector<std::string>& v, const std::string& p)
+{
+    for (std::vector<std::string>::size_type k = 0; k < v.size(); ++k) if (v[k] == p) return true;
+    return false;
+}
 /* THE ROSTER AFTER THE LOAD is every squad file of the save: `fixed` holds the characters of every squad that is not a
-   candidate (their save versions), and each candidate adds its record when applied, else what it loads instead: its save
-   version, or for a fenced squad the save file's characters (fileChars - another player's), never the record's. A record
-   is applied only if every character its save version had, and every character the record holds, appears EXACTLY
-   once in that roster: 0 = a person lost (conflict), 2+ = a person doubled (duplicate). A squad whose save version
-   has no character is refused at once (empty: nothing to check it against); a restore candidate has no save version by
-   nature and is refused at once only when its record holds nobody. Otherwise ONE squad is refused at a time and the
-   check is run again, since refusing one changes the roster: the first failing restore candidate in order, else the
-   first failing squad in order - a squad the save has is kept over one the save lacks (a record of a squad that was
-   made and then merged away after the save still names its people). So a split's source squad, whose record lost the
-   people the split took, passes when the split-off squad is a restore candidate holding them. Returns the number
-   refused. */
-inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::string>& fixed, RosterCounts* rc)
+   candidate (their save versions), and each candidate adds what it loads: applied, its record plus the people copied back
+   into it (addBack); refused, its save version, or for a fenced squad the save file's characters (fileChars - another
+   player's), never the record's. The save alone (`base`) is the same with every candidate refused.
+   Per person, in an applied squad that is neither stripped nor a restore candidate: a person of its save version in no squad
+   after the load is settled - left out by a left note (`left`: person id -> LeftNote kind), else copied back (addBack); a
+   stripped squad's person, a person with no hand ('?' id) or one in noAdd is not settled and refuses the squad (conflict).
+   A person the squad loads counted twice or more refuses it (duplicate) only when the load makes more copies of him than the
+   save alone (count > base); otherwise he stays in the record (dupSave). A squad whose save version has no character is
+   refused at once (empty: nothing to check it against); a restore candidate has no save version by nature and is refused at
+   once only when its record holds nobody. Otherwise ONE squad is refused at a time and everything is settled again, since
+   refusing one changes the roster: the first failing restore candidate in order, else the first failing squad in order - a
+   squad the save has is kept over one the save lacks (a record of a squad that was made and then merged away after the save
+   still names its people). Returns the number refused. */
+inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::string>& fixed, RosterCounts* rc,
+                         const std::map<std::string, int>* left = 0)
 {
     RosterCounts local;
     RosterCounts* out = rc ? rc : &local;
     *out = RosterCounts();
     int refused = 0;
+    std::map<std::string, int> base;
+    for (std::vector<std::string>::size_type k = 0; k < fixed.size(); ++k) ++base[fixed[k]];
     for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
     {
         RosterSquad& s = (*sq)[i];
+        const std::vector<std::string>& v = s.fenced ? s.fileChars : s.saveChars;
+        for (std::vector<std::string>::size_type k = 0; k < v.size(); ++k) ++base[v[k]];
         if (s.apply && (s.restore ? s.recChars.empty() : s.saveChars.empty())) { s.apply = 0; s.empty = 1; ++out->empty; ++refused; }
     }
     for (;;)
@@ -1093,9 +1401,28 @@ inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::st
         for (std::vector<std::string>::size_type k = 0; k < fixed.size(); ++k) ++count[fixed[k]];
         for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
         {
-            const RosterSquad& s = (*sq)[i];
+            RosterSquad& s = (*sq)[i];
+            s.addBack.clear(); s.leftOut.clear(); s.leftWhy.clear(); s.dupSave.clear();
             const std::vector<std::string>& v = s.apply ? s.recChars : s.fenced ? s.fileChars : s.saveChars;   /* refused: what the squad loads */
             for (std::vector<std::string>::size_type k = 0; k < v.size(); ++k) ++count[v[k]];
+        }
+        /* settle each person of an applied squad's save version who is in no squad after the load */
+        for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
+        {
+            RosterSquad& s = (*sq)[i];
+            if (!s.apply || s.restore || s.stripped) continue;
+            for (std::vector<std::string>::size_type k = 0; k < s.saveChars.size(); ++k)
+            {
+                const std::string& p = s.saveChars[k];
+                if (count[p] != 0 || p.empty() || p[0] == '?' || RosterHas(s.noAdd, p)) continue;
+                if (left != 0)
+                {
+                    std::map<std::string, int>::const_iterator ln = left->find(p);
+                    if (ln != left->end()) { s.leftOut.push_back(p); s.leftWhy.push_back(ln->second); continue; }
+                }
+                s.addBack.push_back(p);
+                ++count[p];
+            }
         }
         std::vector<RosterSquad>::size_type bad = sq->size();
         int why = 0;
@@ -1105,22 +1432,28 @@ inline int RosterResolve(std::vector<RosterSquad>* sq, const std::vector<std::st
             const RosterSquad& s = (*sq)[i];
             if (!s.apply || (pass == 0 && !s.restore)) continue;
             for (std::vector<std::string>::size_type k = 0; k < s.saveChars.size() && bad == sq->size(); ++k)
+                if (count[s.saveChars[k]] == 0 && !RosterHas(s.leftOut, s.saveChars[k])) { bad = i; why = 1; }
+            for (int part = 0; part < 2 && bad == sq->size(); ++part)
             {
-                std::map<std::string, int>::const_iterator it = count.find(s.saveChars[k]);
-                if (it == count.end() || it->second == 0) { bad = i; why = 1; }
-                else if (it->second > 1) { bad = i; why = 2; }
+                const std::vector<std::string>& v = part == 0 ? s.recChars : s.addBack;
+                for (std::vector<std::string>::size_type k = 0; k < v.size() && bad == sq->size(); ++k)
+                {
+                    const int c = count[v[k]];
+                    if (c > 1 && c > base[v[k]]) { bad = i; why = 2; }
+                }
             }
-            for (std::vector<std::string>::size_type k = 0; k < s.recChars.size() && bad == sq->size(); ++k)
-                if (count[s.recChars[k]] > 1) { bad = i; why = 2; }
         }
         if (bad == sq->size())
         {
             for (std::vector<RosterSquad>::size_type i = 0; i < sq->size(); ++i)
             {
-                const RosterSquad& s = (*sq)[i];
+                RosterSquad& s = (*sq)[i];
                 if (!s.apply) continue;
                 if (s.stripped) ++out->stripped; else out->moved += (int)s.movedIn.size();
                 if (s.restore) ++out->restored;
+                for (std::vector<std::string>::size_type k = 0; k < s.recChars.size(); ++k)
+                    if (count[s.recChars[k]] > 1 && !RosterHas(s.dupSave, s.recChars[k])) s.dupSave.push_back(s.recChars[k]);
+                out->addBack += (int)s.addBack.size(); out->leftOut += (int)s.leftOut.size(); out->dupSave += (int)s.dupSave.size();
             }
             return refused;
         }
@@ -1176,6 +1509,151 @@ inline void RosterFindMoves(const std::vector<RosterSquad>& sq, const std::vecto
             m.cand = i; m.from = fixedAt[p]; m.who = p;
             moves->push_back(m);
         }
+    }
+}
+
+/* THE LEFT NOTES (T-1062). Why a person of this game left his squad, kept in the records store (LeftNoteFile(), a local file
+   beside the records; never sent anywhere) so that a load whose newer record no longer holds him knows: a death is noted when
+   this game snapshots its own dead (resurrect.cpp TakeSnapshot), before the squad write that drops him (OwnWriteSquad waits
+   for the snapshot). One line per person: "pl1\t<person id (serial + type)>\t<kind>\t<unix time>\n"; a newer note of the same
+   person replaces the older.
+   A note counts only for a save older than it (LeftNoteHonoured): a load of a save made before the death brings the person back
+   with the same hand, and a later save of that world holds him alive - a note older than the loaded save says nothing of him.
+   A landed save drops no note: any older named save may be loaded next, and for it the note still counts. The file is bounded by
+   one note per person and the count cap kLeftNoteHardCap, past which the oldest note goes (its drops counted and logged). Pure:
+   no disk. */
+enum { kLeftDied = 1 };
+struct LeftNote
+{
+    std::string who;
+    int         kind;
+    long long   at;
+    LeftNote() : kind(0), at(0) {}
+};
+inline bool LeftFieldOk(const std::string& s)
+{
+    if (s.empty()) return false;
+    for (std::string::size_type i = 0; i < s.size(); ++i) if (s[i] == '\t' || s[i] == '\r' || s[i] == '\n') return false;
+    return true;
+}
+inline const char* LeftNoteFile() { return "pp.left.notes"; }
+const size_t kLeftNoteHardCap = 4096;
+inline const char* LeftKindName(int k) { return k == kLeftDied ? "died" : "?"; }
+inline bool LeftNoteFormat(const LeftNote& e, std::string* out)
+{
+    if (!LeftFieldOk(e.who) || e.kind != kLeftDied || e.at < 0) return false;
+    char b[48];
+    std::sprintf(b, "\t%d\t%lld\n", e.kind, e.at);
+    *out = "pl1\t" + e.who + b;
+    return true;
+}
+inline bool LeftNoteParse(const std::string& lineIn, LeftNote* e)
+{
+    std::string line = lineIn;
+    while (!line.empty() && (line[line.size() - 1] == '\r' || line[line.size() - 1] == '\n')) line.erase(line.size() - 1);
+    std::vector<std::string> f;
+    std::string::size_type from = 0;
+    for (;;)
+    {
+        const std::string::size_type tb = line.find('\t', from);
+        if (tb == std::string::npos) { f.push_back(line.substr(from)); break; }
+        f.push_back(line.substr(from, tb - from)); from = tb + 1;
+    }
+    unsigned long long k = 0, t = 0;
+    if (f.size() != 4 || f[0] != "pl1" || !LeftFieldOk(f[1]) || !ParseULL(f[2], &k) || k != (unsigned long long)kLeftDied || !ParseULL(f[3], &t)) return false;
+    e->who = f[1]; e->kind = (int)k; e->at = (long long)t;
+    return true;
+}
+/* a newer note of the same person replaces the older; past the hard cap the oldest goes. Returns the notes the cap dropped. */
+inline int LeftNoteAdd(std::vector<LeftNote>* v, const LeftNote& e)
+{
+    for (std::vector<LeftNote>::iterator it = v->begin(); it != v->end(); )
+        if (it->who == e.who) it = v->erase(it); else ++it;
+    v->push_back(e);
+    int dropped = 0;
+    while (v->size() > kLeftNoteHardCap) { v->erase(v->begin()); ++dropped; }
+    return dropped;
+}
+/* every line that parses, in order (LeftNoteAdd's rule); returns the lines that did not; *capDropped (optional) = notes the
+   hard cap dropped */
+inline int LeftNoteParseAll(const std::string& text, std::vector<LeftNote>* out, int* capDropped = 0)
+{
+    out->clear();
+    int bad = 0, cap = 0;
+    if (capDropped) *capDropped = 0;
+    std::string::size_type from = 0;
+    while (from < text.size())
+    {
+        std::string::size_type nl = text.find('\n', from);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(from, nl - from);
+        from = nl + 1;
+        if (line.empty() || line == "\r") continue;
+        LeftNote e;
+        if (LeftNoteParse(line, &e)) cap += LeftNoteAdd(out, e); else ++bad;
+    }
+    if (capDropped) *capDropped = cap;
+    return bad;
+}
+inline std::string LeftNoteText(const std::vector<LeftNote>& v)
+{
+    std::string t, l;
+    for (size_t i = 0; i < v.size(); ++i) if (LeftNoteFormat(v[i], &l)) t += l;
+    return t;
+}
+/* saveAt: the loaded save's unix time (its mark's, else its quick.save file's); < 0 = unknown, every note counts. A death in the
+   save's own second counts: a save made after the death does not hold him, so the question does not arise for it. */
+inline bool LeftNoteHonoured(const LeftNote& e, long long saveAt) { return saveAt < 0 || e.at >= saveAt; }
+/* the roster check's view: person id -> kind, the notes honoured for this save only; *stale (optional) = notes older than it */
+inline void LeftNoteMap(const std::vector<LeftNote>& v, std::map<std::string, int>* m, long long saveAt = -1, int* stale = 0)
+{
+    m->clear();
+    int st = 0;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (LeftNoteHonoured(v[i], saveAt)) (*m)[v[i].who] = v[i].kind;
+        else ++st;
+    }
+    if (stale) *stale = st;
+}
+/* THE LOADED SAVE'S TIME the notes are judged against (LeftNoteHonoured): its mark's time when it has a mark of this store (taken
+   at the save's request, before the world is captured); else its quick.save file's last write time less kLeftNoteFileMargin
+   seconds, since the file is written after the world was captured and a death while the save ran is not in it; else -1 (unknown,
+   every note counts). The margin is the mark's own slow-save bound (120 s, kOwnMarkWaitMs): a save still going after that is
+   reported slow. A death up to that long before the save began then counts too: that save was made after it, so it holds him
+   dead or not at all, and keeping him out agrees with it. */
+const long long kLeftNoteFileMargin = 120;
+inline long long LeftNoteSaveAt(bool haveMark, long long markAt, bool haveFileTime, long long fileTime)
+{
+    if (haveMark) return markAt;
+    if (!haveFileTime) return -1;
+    return fileTime > kLeftNoteFileMargin ? fileTime - kLeftNoteFileMargin : 0;
+}
+/* THE ALIVE RULE'S EXCEPTION (resurrect.cpp Reconcile): a fallen-list row of this game whose character is alive in the loaded
+   world is reported ALIVE (the save predates the death) - unless a died note of that hand serial counts for the loaded save
+   (LeftNoteHonoured): the death came after the save, and the save's older version brought him back only because his squad's
+   newer record was refused at this load (or he had none). The death then stands: no ALIVE, the world server keeps the row.
+   serial 0 = unknown: the exception does not apply. */
+inline bool LeftNoteHoldsDeath(const std::vector<LeftNote>& v, unsigned int serial, long long saveAt)
+{
+    if (serial == 0) return false;
+    char b[24];
+    std::sprintf(b, "S=%d;", (int)serial);
+    const std::string pre(b);
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].kind == kLeftDied && v[i].who.compare(0, pre.size(), pre) == 0 && LeftNoteHonoured(v[i], saveAt)) return true;
+    return false;
+}
+/* THE ROSTER CHECK WITH NOBODY SETTLED (the rule before T-1062): every person of every squad's save version is marked noAdd, so
+   a lost person refuses his squad and nobody is copied back or kept out by a note - a fixed point that needs no copy-back made.
+   The load's last resort when its copy-back rounds do not settle. */
+inline void RosterNoSettle(std::vector<RosterSquad>* sq)
+{
+    for (size_t i = 0; i < sq->size(); ++i)
+    {
+        RosterSquad& s = (*sq)[i];
+        for (size_t k = 0; k < s.saveChars.size(); ++k)
+            if (!RosterHas(s.noAdd, s.saveChars[k])) s.noAdd.push_back(s.saveChars[k]);
     }
 }
 
@@ -1898,11 +2376,11 @@ inline const char* RestoreVerdictName(int v)
    of the save the live check refused that the dry run would apply (a split's source). */
 inline int RosterShadowRun(const std::vector<RosterSquad>& unmarked, const std::vector<RosterSquad>& live,
                            const std::vector<RosterSquad>& restores, const std::vector<std::string>& fixed,
-                           std::vector<RosterSquad>* shadow, RosterCounts* rc)
+                           std::vector<RosterSquad>* shadow, RosterCounts* rc, const std::map<std::string, int>* left = 0)
 {
     *shadow = unmarked;
     shadow->insert(shadow->end(), restores.begin(), restores.end());
-    RosterResolve(shadow, fixed, rc);
+    RosterResolve(shadow, fixed, rc, left);
     int sourceWouldPass = 0;
     for (size_t i = 0; i < unmarked.size() && i < live.size(); ++i) if ((*shadow)[i].apply && !live[i].apply) ++sourceWouldPass;
     return sourceWouldPass;

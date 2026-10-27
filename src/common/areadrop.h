@@ -26,6 +26,7 @@
 
 #include <vector>   /* M9 (T-197): the seat book and the AREAMAP writer */
 #include <cstddef>
+#include <map>      /* the world server's player-sector rows (AreasPlayerRows) */
 
 namespace coopdrop {
 
@@ -71,7 +72,7 @@ const int kAreaRowMinBytes = 5;           /* M9f1 (T-197; M9 review M2): u8 x, u
 const int kAreaRowMaxBytes = 37;          /* M9f1: u8 x, u8 y, u16 owner, u8 0xFF, 32-byte mask */
 const int kAreaRowListMax = 31;           /* M9f1: a row naming at most 31 seats lists them (5 + n bytes); 32 or more goes as the mask */
 const unsigned kAreaRowBitmap = 0xFFu;    /* M9f1: the n that says "the 32-byte mask follows" */
-const int kPlayerSectorsMaxRows = 512;    /* M9f1 (M9 review LOW): PLAYERSECTORS (37) rows, both ends - twice the 256 connected games */
+const int kPlayerSectorsMaxRows = 1024;   /* PLAYERSECTORS (37) rows, both ends: 16 games x kAreasPlayerSectorsMax player areas */
 const double kAreaPendingSec = 15.0;      /* M9f1 (M9 review M1): a slot named gone with no column waits at most this long for a map */
 const unsigned kAreaOwnerNone = 0xFFFFu;   /* the owner column of a row nobody holds; also the one u16 no slot can take */
 const int kAreaMaxRows = 4096;             /* 64 x 64 sectors */
@@ -415,6 +416,82 @@ inline void AreaApplyMapCore(AreaBook* b, const int* listed, int mySlot, double 
      ownerInWorld - 1 that roster shows the owner IN_WORLD.
    No roster on this link: frozen for every other-slot owner. 1 = frozen. */
 const int kAreaFrozen = -2;
+/* AREAS (34): {u32 n, n x (i32 x, i32 y), u16 m, m x (i32 x, i32 y)} - the reporter's loaded areas, then the areas its player
+   characters stand in, the followed character's first. m = 0 means "this game does not know where its players are" (the world
+   server drops that slot's rows at once), never "no players". m is at most kAreasPlayerSectorsMax at both ends: the writer cuts the
+   list there, the reader refuses more. Little-endian, as the rest of the message. */
+const int kAreasPlayerSectorsMax = 64;
+inline void AreasPutPlayerSectors(std::vector<char>* b, const int* xy, int m)
+{
+    if (m < 0 || xy == 0) m = 0;
+    if (m > kAreasPlayerSectorsMax) m = kAreasPlayerSectorsMax;
+    AreaPutU16(b, (unsigned)m);
+    for (int i = 0; i < m * 2; ++i)
+    {
+        const unsigned u = (unsigned)xy[i];
+        b->push_back((char)(unsigned char)(u & 0xFFu)); b->push_back((char)(unsigned char)((u >> 8) & 0xFFu));
+        b->push_back((char)(unsigned char)((u >> 16) & 0xFFu)); b->push_back((char)(unsigned char)((u >> 24) & 0xFFu));
+    }
+}
+/* the player-sector list of an AREAS payload of n bytes whose loaded pairs end at `at`: 1 = well formed (*xy = the m x,y pairs as
+   sent; an entry off the grid is the caller's to skip), 0 = malformed (no count, m over the cap, or fewer bytes than m pairs). */
+inline int AreasReadPlayerSectors(const unsigned char* p, size_t n, size_t at, std::vector<int>* xy)
+{
+    xy->clear();
+    if (p == 0 || at > n || n - at < 2) return 0;
+    const unsigned m = AreaGetU16(p + at);
+    if (m > (unsigned)kAreasPlayerSectorsMax || n - at - 2 < (size_t)m * 8) return 0;
+    const unsigned char* q = p + at + 2;
+    for (unsigned i = 0; i < m * 2; ++i, q += 4)
+        xy->push_back((int)((unsigned)q[0] | ((unsigned)q[1] << 8) | ((unsigned)q[2] << 16) | ((unsigned)q[3] << 24)));
+    return 1;
+}
+/* AREAS (34), the whole payload of n bytes, checked before the world server acts on any of it: kAreasOk = well formed (*pairs = the
+   loaded-pair count, *xy = the player-sector list as AreasReadPlayerSectors reads it); kAreasBadPairs = no count, or the loaded pairs
+   run past the end; kAreasBadList = the player-sector list is malformed (no count, m over the cap, or fewer bytes than m pairs). */
+const int kAreasOk = 0, kAreasBadPairs = 1, kAreasBadList = 2;
+inline int AreasParse(const unsigned char* p, size_t n, unsigned* pairs, std::vector<int>* xy)
+{
+    if (pairs != 0) *pairs = 0;
+    if (xy == 0) return kAreasBadList;
+    xy->clear();
+    if (p == 0 || n < 4) return kAreasBadPairs;
+    const unsigned c = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+    if ((size_t)c > (n - 4) / 8) return kAreasBadPairs;
+    if (pairs != 0) *pairs = c;
+    if (AreasReadPlayerSectors(p, n, 4 + (size_t)c * 8, xy) == 0) return kAreasBadList;
+    return kAreasOk;
+}
+/* ONE ROW OF THE WORLD SERVER'S PLAYER-SECTOR TABLE: an area one of a reporter's player characters stands in, and when it arrived. */
+struct AreasPlayerRow { int x, y; double at; AreasPlayerRow() : x(-1), y(-1), at(0.0) {} };
+typedef std::map<int, std::vector<AreasPlayerRow> > AreasPlayerRows;   /* key = the reporter's slot; its followed character's row first */
+/* a slot's rows from a well-formed list (AreasParse's xy): replaced whole by its entries on the 64 x 64 area grid, in order, stamped
+   `now` (an entry off the grid is skipped). No such entry - m = 0, "this game does not know where its players are" - erases the
+   slot's rows now instead of letting them age out. Returns how many rows the slot has now. */
+inline int AreasPlayerRowsReplace(AreasPlayerRows* rows, int slot, const std::vector<int>& xy, double now)
+{
+    if (rows == 0) return 0;
+    std::vector<AreasPlayerRow> mine;
+    for (size_t k = 0; k + 1 < xy.size(); k += 2)
+    {
+        const int x = xy[k], y = xy[k + 1];
+        if (x < 0 || x >= 64 || y < 0 || y >= 64) continue;
+        AreasPlayerRow r; r.x = x; r.y = y; r.at = now; mine.push_back(r);
+    }
+    if (mine.empty()) { rows->erase(slot); return 0; }
+    const int c = (int)mine.size();
+    (*rows)[slot].swap(mine);
+    return c;
+}
+/* the whole row update for one AREAS payload: AreasParse, then AreasPlayerRowsReplace. -1 = malformed, and the rows are left exactly
+   as they were; else how many rows the slot has now. (OnAreas runs the two halves itself, with JoinAreasAdmit between them.) */
+inline int AreasPlayerRowsUpdate(AreasPlayerRows* rows, int slot, const unsigned char* p, size_t n, double now)
+{
+    unsigned pairs = 0; std::vector<int> xy;
+    if (AreasParse(p, n, &pairs, &xy) != kAreasOk) return -1;
+    return AreasPlayerRowsReplace(rows, slot, xy, now);
+}
+
 inline int AreaFrozenDecide(int owner, int mySlot, int rosterKnown, int ownerInWorld)
 {
     if (owner < 0 || owner == mySlot) return 0;

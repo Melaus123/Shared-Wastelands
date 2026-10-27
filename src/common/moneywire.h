@@ -30,7 +30,8 @@
 namespace moneyw {
 
 /* ---- message numbers and the world-server protocol (store_main.cpp and store.cpp check these at compile time) ---- */
-const unsigned kProtocol = 108;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+const unsigned kProtocol = 121;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+
 const unsigned kMsgSend = 73;         /* game -> server: {u64 transfer, u32 receiver slot, i32 amount} */
 const unsigned kMsgSentOk = 74;       /* server -> sender: {u64 transfer} - recorded (or already recorded) */
 const unsigned kMsgDeliver = 75;      /* server -> receiver: {u64 inbox number, u32 sender slot (0xFFFFFFFF unknown), i32 amount} */

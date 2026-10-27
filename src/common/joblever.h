@@ -1,6 +1,7 @@
 // joblever.h - the argument shapes of three TEST-ONLY levers, pure and offline-tested (the test program, test_main.cpp):
 //   jobtest work <characterUid> <buildingKey> [plain] [task=<n>] - P17: this game's own character is given the engine's own
 //                                                                  "operate this machine" order on the building (items.cpp)
+//                                                                  [door=<i>]: the order on door i of the building instead
 //   jobtest input <buildingKey> <itemSid> <n> [section=<name>]  - P17: n of an item into the machine's input section (items.cpp)
 //   jobtest input <buildingKey> need<i> <n> [section=<name>]    - T-609: the same, the item being the one the machine's i-th
 //                                                                  input asks for (i = 0..; read as `jobtest show` reads it)
@@ -20,26 +21,37 @@ namespace joblever {
 
 const int kTaskOperateMachinery = 87;   // TaskType OPERATE_MACHINERY, "Operating machine" (.modding/03-systems/taskdata-table.md)
 const int kTaskMax = 1000;              // a task= override above this is a typing error, not a task type
+const int kWorkDoorMax = 31;            // jobtest work door=<i>: i at most this (the door list read holds at most 32)
 const int kInputMax = 1000;             // jobtest input: at most this many items in one put
 const int kNeedMax = 15;                // jobtest input need<i>: i at most this (a machine's input list holds at most 16)
 
-struct JobWork { unsigned int uid; std::string key; int task; int plain; };
+struct JobWork { unsigned int uid; std::string key; int task; int plain; int door; };   // door -1 = the building itself
 struct JobInput { std::string key, sid, section; int count; int need; };   // need = i of need<i>, -1 = sid is an item sid
 
 /* `work <uid> <key> [plain] [task=<n>]`: uid decimal or 0x hex, non-zero; no `plain` = the order as a player's (giveOrder's
-   player-order argument set), `plain` = without it (the way the mod's NPC orders give one); task= overrides OPERATE_MACHINERY. Each option at most once, in either order. 1 parsed, 0 not this form or malformed. */
+   player-order argument set), `plain` = without it (the way the mod's NPC orders give one); task= overrides OPERATE_MACHINERY; door=<i> (decimal 0..kWorkDoorMax) gives the order on door i of the building (out->door, -1 = the
+   building itself). Each option at most once, in any order. 1 parsed, 0 not this form or malformed. */
 inline int JobWorkParse(const std::string& arg, JobWork* out)
 {
-    out->uid = 0; out->key.clear(); out->task = kTaskOperateMachinery; out->plain = 0;
+    out->uid = 0; out->key.clear(); out->task = kTaskOperateMachinery; out->plain = 0; out->door = -1;
     std::string tok[6];
     const int n = coopsay::TalkSplit(arg, tok, 6);
     if (n < 3 || tok[0] != "work") return 0;
     unsigned long long v = 0;
     if (!coopsay::TalkParseNumber(tok[1], &v) || v == 0 || v > 0xFFFFFFFFULL) return 0;
-    int plain = 0, task = -1;
+    int plain = 0, task = -1, door = -1;
     for (int k = 3; k < n; ++k)
     {
         if (tok[k] == "plain" && plain == 0) { plain = 1; continue; }
+        if (tok[k].compare(0, 5, "door=") == 0 && door < 0)
+        {
+            const std::string d = tok[k].substr(5);
+            if (d.empty() || d.size() > 2) return 0;
+            for (size_t q = 0; q < d.size(); ++q) if (d[q] < '0' || d[q] > '9') return 0;
+            door = std::atoi(d.c_str());
+            if (door > kWorkDoorMax) return 0;
+            continue;
+        }
         if (tok[k].compare(0, 5, "task=") == 0 && task < 0)
         {
             unsigned long long t = 0;
@@ -49,7 +61,7 @@ inline int JobWorkParse(const std::string& arg, JobWork* out)
         }
         return 0;
     }
-    out->uid = (unsigned int)v; out->key = tok[2]; out->plain = plain;
+    out->uid = (unsigned int)v; out->key = tok[2]; out->plain = plain; out->door = door;
     if (task > 0) out->task = task;
     return 1;
 }

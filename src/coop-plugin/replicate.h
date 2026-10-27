@@ -84,6 +84,10 @@ void UnpuppetForOwnership(unsigned int uid);
 // sector, which is the only precision the caller needs. `ageSec` is how old that sample is; a caller that must not
 // act on a stale answer checks it. Returns false when no such character is replicated here at all.
 bool PeerPlayerPosition(float* x, float* y, float* z, double* ageSec);
+// the areas of every copy of another player's player-faction character (PeerPlayerPosition's test) whose last sample is at most
+// maxAgeSec old: every copy is looked at and each area kept once, at most cap distinct areas into xs / ys. Returns how many. MAIN
+// THREAD (the zone tick).
+int PeerPlayerSectors(int* xs, int* ys, int cap, double maxAgeSec);
 // E25: 1 = the character is in the peer player's own faction, 0 = not, -1 = the read faulted. tags1 labels only the 1s.
 int PeerFactionPod(::Character* c);
 

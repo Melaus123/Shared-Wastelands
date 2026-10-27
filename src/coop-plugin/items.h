@@ -183,9 +183,15 @@ struct ItemRequestMsg
     unsigned int holdId;
     int holdHow;
     int holdSlot;
+    // game protocol 180 (src/common/boxrec.h AskTail): the 'ASK1' trailer every request ends with. askId: a journalled ask's id (a change
+    // of a player's box handed to its writer), recorded by the writer in the box's ledger with the write carrying the change - 0 = not
+    // one; askSlot: the asker's ledger slot; askCarry: the entries of other games' asks the handed-over change carried (recorded as doubt).
+    unsigned long long askId;
+    int askSlot;
+    std::vector<coopbrec::BoxLedgerEntry> askCarry;
     ItemRequestMsg() : id(0), dir(0), ownerUid(0), ownerIdKind(0), made(0), ownerX(0), ownerY(0), quantity(0), takerUid(0),
                        takerX(0), takerY(0), quality(0.0f), charges(0.0f), functionKind(0), level(0), unique(0),
-                       trade(0), price(0), ownerBagDone(0), ownerBagShadowed(0), holdId(0u), holdHow(0), holdSlot(-1) {}
+                       trade(0), price(0), ownerBagDone(0), ownerBagShadowed(0), holdId(0u), holdHow(0), holdSlot(-1), askId(0ULL), askSlot(-1) {}
 };
 
 // E22b. The owner's answer. `ok` 0 is a REFUSAL and the requester changes nothing at all - the item simply
@@ -259,6 +265,7 @@ void ItemsSessionReady();
 void ApplyItemRevoke(unsigned int id, unsigned int fromPeer);
 // T-164 B4-4 fold 2, MAIN THREAD: MSG_ITEM_REVOKE carrying the shop tail ('SHK1', src/common/shopwire.h) - kind 0 the shop revoke, 1 the shop ack.
 void ApplyShopTail(unsigned int id, unsigned int fromPeer, unsigned int epoch, int kind);
+void ApplyShopCancelTail(unsigned int id, unsigned int fromPeer, const coopshop::ShopTail& t);   /* MAIN THREAD: shop tail kind 2 (a cancel, at the shop area's holder) or 3 (its answer, at the asker) */
 // E22b, MAIN THREAD: the owner's answer to a request WE sent. This is the only moment our own copy changes.
 void ApplyItemConfirm(const ItemConfirmMsg& c, unsigned int fromPeer);   // M7b slice 2: taken only from the game the request was asked of (itemConfirmWrongSender)
 /* T-889 step 2, MAIN THREAD: MSG_ITEM_HANDOVER (net/session.cpp OnItemHandover) - the 14-byte body (src/common/handrec.h) */
@@ -423,6 +430,21 @@ void GroundRecordEcho(const std::string& id, int hasStamp, long long stamp);   /
    copies are forgotten (the feed sends every record again); Report: the counts for the [STORE] REPORT line. */
 void BoxRecordArrive(const std::string& id, const std::vector<char>& bytes);
 void BoxRecordGone(const std::string& id, const char* from);
+void BoxRecordEcho(const std::string& id, int hasStamp, long long stamp);   /* MAIN THREAD: the world server stored this game's box record write sent with that stamp (RECORD_SEQ) */
+/* A PLAYER'S BOX (coopbrec::BoxIsPlayerRec), MAIN THREAD: IsPlayerBox - 1 = the key names one (its contents travel only as its record);
+   MarkSoft - the safety net's mark of one; PieceRemoved - a player-built piece's removal mark removes the box records at its position;
+   MoveDropped / MoveRefused - counters of the item moves not sent / not taken for one. */
+int  BoxMoveIsPlayerBox(const std::string& key);
+int  BoxIsPlayerBoxAt(void* b, const std::string& key);   /* the same for building b (no resolve) */
+std::string BoxRecDigestTag(const std::string& key);   /* boxdigest: a player's box's record id, kept generation and digest, and this game's generation */
+void BoxRecMarkSoft(const std::string& key);
+void BoxRecPieceRemoved(const std::string& pieceKey);
+/* a player-built piece re-keyed by an upgrade or downgrade (the same box, a new record): the record under the old key is removed (a
+   later re-key back to that key must not find stale contents there) and the box is marked under its new key, so its writer writes
+   its contents there (a seed: no record of the new id exists) */
+void BoxRecPieceRekeyed(const std::string& oldKey, const std::string& newKey);
+void BoxLiveMoveDropped();
+void BoxLiveMoveRefused();
 int  BoxRecordKept(const std::string& id, coopbrec::BoxHeader* h, std::vector<cooppar::ParityItem>* items);
 int  BoxRecordIdsInArea(int sx, int sy, std::vector<std::string>* ids);
 void BoxRecordLinkLost();
@@ -435,9 +457,60 @@ std::string BoxRecordReport();
    last-written contents and what each box was are dropped (they name the world that is going; the generations written stay). */
 void BoxRecMark(const std::string& key);
 void BoxRecMarkC(const char* key);
+/* this game's own take or put on a box was just asked of its writer (the ask path, at the send): a player's box another game writes
+   remembers the newest generation kept or in the box at that moment, so an ask answered between two scans is still waited for */
+void BoxAskOpened(const char* key);
 void BoxRecTick(unsigned long now);
 void BoxRefuseArrive(const std::vector<char>& payload);
+/* MAIN THREAD: BOX_TAKEN (80) - this game's write of a box record is stored: its own write becomes the kept record, and the
+   journal entries that write holds are dropped */
+void BoxTakenArrive(const std::vector<char>& payload);
+/* MAIN THREAD (the drain): character uid of this game (its item in section) took part in a change of the player's box at key this
+   game writes - where an undo of that change looks first */
+void BoxJrnHint(const std::string& key, unsigned int uid, const char* section);
+/* MAIN THREAD: BOX_ASKED (82) - after a link loss, this game's newest stored write of a box: its journal's waiting writes are answered */
+void BoxAskedArrive(const std::vector<char>& payload);
+/* MAIN THREAD: the ending of a journalled ask - the writer's answer (what 1 yes, 0 no) or the request's timeout (what -1); an answer after
+   the timeout ends it as a late one. 1 = the request id is a journalled ask's (the caller's road does nothing more with it). */
+int BoxJrnAnswer(unsigned int id, int what);
 void BoxRecWTeardown();
+/* THE SHOP RECORDS (src/common/shoprec.h, items.cpp): one record per shop building on the world server - the building's next restock
+   time on the shared in-game clock, its refill count, the empty-shop repair's mark and each keeper squad's money with a change count.
+   Only the game the current area map names as the holder of the shop's area decides a restock and writes the record. MAIN THREAD.
+   Arrive: a shop record from the world server (kept when newer); RefuseArrive: the world server did not take this game's write (the
+   kept copy is not used until a newer one arrives or 30 s pass, the next write goes above the stored generation); LinkLost: the kept
+   copies not owed to the world server are forgotten; RestockGate: the restock detour's verdict for a keeper squad with a home building
+   (0 = not such a squad - the caller's own road; 1 = the engine's restock ran; 2 = refused or held); TraderTick: once a second per
+   keeper squad with a home - the game running the keeper takes the record's money, the holder starts a due refill; RepairAsk: the
+   empty-shop repair through the record (0 = no record - the caller asks the engine; 1 = asked; 2 = already asked since the last
+   refill; 3 = not decidable here yet); HolderExact: 1 = the current area map names this game as the holder of the area at `pos`;
+   RestockDueCommand / KeeperMoneyCommand: the test levers `restockdue <homeKey>` and `keepermoney <squad> <amount>`; Report: the
+   counters on the [ITEMS] REPORT line; WorldTeardown: the per-world marks go. */
+void ShopRecordArrive(const std::string& id, const std::vector<char>& bytes);
+void ShopRefuseArrive(const std::string& id, int reason, unsigned int storedGen, unsigned int sentGen);
+void ShopRecordLinkLost();
+void ShopRecordEcho(const std::string& id, int hasStamp, long long stamp);   /* MAIN THREAD: the world server stored this game's shop record write sent with that stamp (RECORD_SEQ) */
+int  ShopRestockGate(void* ap, char force);
+void ShopTraderTick(void* ap, void* leader);
+int  ShopRepairAsk(void* ap);
+int  ShopHolderExact(const float* pos);
+std::string ShopRestockDueCommand(const std::string& homeKey);
+std::string ShopKeeperMoneyCommand(const std::string& homeKey, const std::string& squad, int amount);
+std::string ShopReport();
+void ShopRecWorldTeardown();
+/* Trades through the shop record: ApRecorded / KeeperRecorded (character; countIt 1 = counted as an announcement skipped) /
+   PlatoonRecorded: 1 = the shop record carries that keeper squad's money (today's money roads leave it alone); RequestSeen: 1 = the
+   record says the holder applied this trade request already (asker slot key, the asker's epoch, the request id) - counted and said;
+   NoteRequest: the holder applied it - the record takes the request as the asker's last applied one and the holder's pot as the money. */
+int  ShopApRecorded(void* ap);
+int  ShopKeeperRecorded(void* character, int countIt);
+int  ShopPlatoonRecorded(void* platoon);
+void ShopPlatoonForget(void* platoon);   /* a freed squad leaves the 'carried by a shop record' list */
+int  ShopKeeperRecordRole(void* keeper);  /* shoprec::ShopTradeRole for keeper's squad: 0 no record, 1 this game records its trades, 2 refused */
+int  ShopRequestSeen(void* keeper, unsigned int asker, unsigned int epoch, unsigned int id, int* n, int* move);   /* 0 not applied, 1 applied (*n / *move its entry), 2 applied and cancelled */
+void ShopNoteRequest(void* keeper, unsigned int asker, unsigned int epoch, unsigned int id, int n, int move);
+/* replicate.cpp: every player character's building key as its owner last said it (fresh words only); the count appended */
+int  PlayersInsideKeys(std::vector<std::string>* keys);
 /* The stored record put into the box at its area's load (items.cpp BoxApplyScan, from BoxRecTick). BoxRecWLinkLost: a link loss
    forgets the stored generations refusals named and decides every box's apply again; BoxRecShopApplyPending: 1 while a shop's
    stored stock in area (sx, sy) is not decided yet at this load (the area's restock waits for it). MAIN THREAD. */
@@ -470,11 +543,14 @@ void ItemsHoldSave(int phase, int onMainThread);       /* P105 build 2, the save
 std::string ItemTestRefuseHereCommand(const std::string& arg);   /* T-164 B4-2: TEST-ONLY `itemtest refusehere <gate> [n]` - the REQUESTER takes that refusal exit after the early put-back (and refunds) */
 std::string ItemTestPackItemCommand(const std::string& arg);   /* T-215 (owner 177 a): TEST-ONLY `itemtest packitem [n]` - n sellable single items into this game's own seller's general grid */
 std::string ItemTestOwnerFullCommand(const std::string& arg);   /* T-608 (c): TEST-ONLY `itemtest ownerfull on|off` - as the OWNER, read the owner table as full: every character and box take / give refused busy */
+std::string ItemTestShopLapseCommand(const std::string& arg);   /* TEST-ONLY `itemtest shoplapse <0..30>` - the asker settles its next unanswered home-shop trade as a refusal after that long */
 std::string ItemTestConfirmDelayCommand(const std::string& arg);   /* give1: TEST-ONLY `itemtest confirmdelay <0..30>` - the OWNER holds each outgoing ITEM_CONFIRM that long */
 /* inv6 TEST-ONLY levers (command channel, MAIN THREAD): `itemtest steal <n> [sid]` (a box stack into my first character through
    the engine's own RClickAutoTrade, so the engine sets the mark), `itemtest stolen <me|peer|name>` (read-only list of marked items),
    `itemtest givestolen <peer|name>` (GIVE the remembered stolen stack through the itemgive lever). [OWN] lines. */
 std::string ItemTestStealCommand(const std::string& arg);
+std::string ItemTestRcGiveCommand(const std::string& arg);   /* T-1079 TEST-ONLY: a give / take through the engine's right-click */
+std::string ItemTestStackGiveCommand(const std::string& arg);   /* T-1079 TEST-ONLY: units off our character onto a box's stack, no window */
 std::string ItemTestStolenCommand(const std::string& arg);
 std::string ItemTestGiveStolenCommand(const std::string& arg);
 std::string ItemTestSetCommand(const std::string& arg);   /* items9: TEST-ONLY `itemtest set <any|sid|section:x,y> [q=<0-100>] [ch=<n>]` */
@@ -511,6 +587,14 @@ void BoxTakeDrain();                                        /* the boxtake move 
 /* loot2c internals shared by several regions of items.cpp - declared once here so every region names the one coop:: definition */
 const int kLootWhyClose = 0, kLootWhyUnload = 1, kLootWhyAnswer = 2, kLootWhyServe = 3, kLootWhyPush = 4, kLootWhySave = 5;
 void ItemsLootZoneOffThread();                              /* ANY THREAD - a zone deactivate off the main thread with copies registered: counted (retractMissedOffThread) */
+void BoxLedgerServe(const std::string& key, int slot, unsigned long long askId, const std::vector<coopbrec::BoxLedgerEntry>& carry, int add);   /* a served journalled ask into the box's ledger (add 1), or out of it when put back (add 0) */
+void ItemsBoxJrnBeforeSave(int onMainThread);              /* the saveGame / saveLevelData pre-hooks: a box change parked only for the box's swap gates is undone on the character before anything is serialised (off the main thread: counted only) */
+std::string ItemsBoxOwedAsk(long long* n0);                /* the save request: the box changes this save holds unresolved, as the bytes of the file beside it ("" none) */
+void ItemsBoxOwedNote(int onMainThread);                   /* the saveGame pre-hook (after ItemsBoxJrnBeforeSave): those rows as this save is written */
+int ItemsBoxOwedPeek(long long n0, long long* n, std::string* bytes);   /* a save still waiting: the note it would claim now (its copy in the records store) */
+int ItemsBoxOwedClaim(long long n0, std::string* bytes);   /* the save landed: its own saveGame note (1), else *bytes stays its request's */
+void ItemsBoxOwedLoaded(const std::vector<char>& bytes, int have);   /* the load's prepare: the loading save's rows (have 0: none) */
+void ItemsBoxOwedLoadEnded(long genAtPrepare);             /* the end of the engine's load call: a load that made no world drops its rows */
 void ItemsLootBeforeSave(int onMainThread, int which);      /* the saveGame 0x375220 (which 0) / saveLevelData 0x36DCA0 (which 1) pre-hooks: touched copies' takes recorded, the journal flushed, every untouched copy out of its box before anything is serialised (off the main thread: counted only) */
 void ItemsLootWriteTripwire(int onMainThread);              /* the gdcSave pre-hook: a TRIPWIRE only - an untouched copy still in its box at a disk write is counted (lootLiveAtWrite, must stay 0) */
 int  ItLootFindAny(void* item);                             /* the registry slot naming this item (any state), or -1 */

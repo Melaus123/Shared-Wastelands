@@ -104,6 +104,10 @@ int PolicyTeammateFactionList(void** out, int cap);
 // T-546 step 4b: the `team click <slot> [class]` lever - a real click (the engine's own buildingSelected) on that player's nearest
 // loaded building; one [TEAM] click line with the hook counters that moved. MAIN THREAD. Returns the status.
 std::string PolicyTeamClick(int ownerSlot, const std::string& cls);
+// T-1079 TEST-ONLY: the same real click on a named building (buildingSelected, the click byte set for the call and put back; the order
+// goes to whatever this player has selected). 1 called (*answer = its bool, *byteWas = the click byte before), 0 the call faulted,
+// -1 no world / no address row / not a readable object, -2 no player interface, -3 the building's position unread. MAIN THREAD.
+int PolicyClickBuilding(void* building, int* answer, int* byteWas);
 // T-546 step 7: the `team orders <slot>` lever - for this game's own first character and that player's first character: the engine's
 // PlayerInterface::isEnemy, the interaction menu the engine builds on it (the list made and the list shown) and the right-click
 // handler as a hover; one [TEAM] orders line. MAIN THREAD. Returns the status.

@@ -29,13 +29,20 @@
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
+#include "../common/squadevent.h"   // T-1084: sqevent::HomeChanged - a home hand that changed marks the squad's record due
 #include "../common/squadbirth.h"   // CONTEXT's birth word
 namespace coop { void LimbsForgetUid(unsigned int uid); void LimbsWorldTeardown(); }   /* LIMBS: clothing.cpp */
 namespace coop { void LiveMemoForgetAddress(const void* obj); }   /* beside LiveCharacter: a registered address is asked afresh */
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* combat.cpp: the terrain height at (x,z) - 1 a height, 0 no terrain, -1 not read */
 namespace coop { bool EffectKoHoldsKnockdown(unsigned int victimUid); }   /* effect.cpp: a sneak knockout of the copy awaits its verdict */
+namespace coop { void* ItHeldBuildingOf(void* c); }   /* items.cpp: the building a character's held hand names (cage, pole, bed), 0 none */
 #ifdef SW_DEV_BUILD
 namespace coop { void P169NoteCopyDestroy(unsigned int uid); }   /* PROBE P169: combat.cpp - the frame and uid of the mod's last copy destroy */
+#ifdef SW_DEV_BUILD
+// PROBE-START: P172 - the roster's squad and captivity fields: store.cpp (the squad's id and the registry's verdict), items.cpp (captlist's reads)
+namespace coop { std::string StoreP172SquadRow(void* platoon); std::string ItP172CaptFields(void* c); }
+// PROBE-END: P172
+#endif
 #endif
 #include "worldgen.h"   // F322: DestroyLocalObject   // F318: TrackForLiveness - P034 must cover BOTH instances   // P031: the roster is keyed by the engine's own handle
 #include "appearance.h"
@@ -4557,6 +4564,19 @@ void WorldRoster()
         // itself a finding - so make the collision visible instead of losing a row.
         std::string line = " race=" + race + " fac=" + fac + " pos=" + pos
                          + " ours=" + std::string(ours ? "1" : "0");
+#ifdef SW_DEV_BUILD
+        // PROBE-START: P172 (T-948, T1516) - which squad each body is in and what the squad registry calls it, so a uid-less
+        // body on B standing on A's character's spot can be traced to its squad. Main thread (the command channel); reads only:
+        // the verified squad reader (handoff.h ReadSquadOf), the store's id and verdict, captlist's captivity reads.
+        {
+            SquadView sv;
+            const int sr = ReadSquadOf(c, &sv);
+            line += (sr == 1) ? StoreP172SquadRow(sv.platoon) : (sr == 0 ? std::string(" sq=none sqRow=none") : std::string(" sq=? sqRow=?(squadReadFaulted)"));
+            line += " uid=" + S((long long)FindSpawnedUid(c));
+            line += ItP172CaptFields((void*)c);
+        }
+        // PROBE-END: P172
+#endif
         if (byHandle.find(key) != byHandle.end())
             byHandle[key] += "  <-- DUPLICATE KEY, also:" + line;
         else
@@ -9508,7 +9528,8 @@ void StandinPurgeNoteWoken(void* platoon, void* faction, const std::string& id, 
    stand-in purge, each noted character that is still in the engine's update list is judged by coopor::Decide and removed
    by the purge's own route (g_selfDespawnObj + DestroyLocalObject); a carried one is put down by its non-player carrier,
    a bedded one gets up, one carrying something puts it down. Never removed: a player-faction character, one carried by a
-   player character, a caged one (possibly a player's prisoner), or one near a fight with a player character (300 units,
+   player character, a caged one (possibly a player's prisoner) unless it duplicates another game's registered copy (then it leaves
+   its cage the engine's own way first, OrphanCageOutDrain), or one near a fight with a player character (300 units,
    a later pass). review-orphan1: nor one within 100 units of a player character, nor before it has been noted
    continuously for 5 s (a gap over 1 s between notes restarts that clock) with the game link up for 10 s. At most
    coopor::kPerPass removals per judging pass, at most one pass per 200 ms. The holder's world wins; there is no
@@ -9517,6 +9538,56 @@ namespace {
 std::set<const void*> g_orphanQ;
 std::set<std::pair<const void*, int> > g_orphanSkipSeen;
 std::set<const void*> g_orphanCarrierTried, g_orphanBedTried, g_orphanOwnDropTried;
+/* a caged duplicate's cage-out (coopor::kActCageOut): queued here on the main thread, run at the K2 safe point by OrphanCageOutDrain
+   (setPrisonMode(false), as the stand-in purge does), then destroyed on a later pass once its cage state reads 0. Address keys, world state. */
+std::set<const void*> g_orphanCageQueued, g_orphanCageTried;
+struct OrphanCageOutEntry { ::Character* c; long gen; };   /* gen: the world load it was queued in (StoreWorldGenNow) */
+std::vector<OrphanCageOutEntry> g_orphanCageOut;
+long long g_orphanCagedDupRemoved = 0, g_orphanCageOutCalled = 0, g_orphanCageOutFailed = 0, g_orphanCagedDupLines = 0, g_orphanCageOutStale = 0;
+const long long kOrphanCagedDupLineCap = 60;
+/* one registered copy justifies at most one caged body: body -> its copy's uid, and every copy already paired (kept for the world, also
+   after its body is removed). g_orphanPairRefusedSeen: caged bodies whose only matching copies were paired with others (counted once each) */
+std::map<const void*, unsigned int> g_orphanPairBody;
+std::set<unsigned int> g_orphanPairCopy;
+std::set<const void*> g_orphanPairRefusedSeen;
+long long g_orphanPairReleased = 0;
+std::set<const void*> g_orphanSameCageMultiSeen;   /* the same-cage exception refused: a cage of several places holding no more people than places, or unread (once each) */
+std::map<const void*, std::pair<int, int> > g_orphanCageSeats;   /* a queued let-out's cage: places and people at its decision, for its removal line */
+const size_t kOrphanCagePlacesOff = 0x3AC, kOrphanCageOccOff = 0x3E0;   /* UseableStuff: numOperatorsMax (int), the occupant set's size (as BedTestSlotsPod / farm.cpp SpRoomRead) */
+int OrphanCageSeatsPod(const void* cage, int* places, int* occ)
+{
+    *places = -1; *occ = -1;
+    __try
+    {
+        const int p = *(const int*)((const char*)cage + kOrphanCagePlacesOff);
+        const unsigned long long o = *(const unsigned long long*)((const char*)cage + kOrphanCageOccOff);
+        if (p < 1 || p > 64 || o > 256) return 0;
+        *places = p; *occ = (int)o;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *places = -1; *occ = -1; return 0; }
+}
+std::string OrphanSeatsText(const void* c)
+{
+    std::map<const void*, std::pair<int, int> >::const_iterator it = g_orphanCageSeats.find(c);
+    if (it == g_orphanCageSeats.end() || it->second.first < 0) return "cage places ?";
+    return "cage places " + S((long long)it->second.first) + ", people " + S((long long)it->second.second);
+}
+std::set<const void*> g_orphanSameCageSeen;   /* caged bodies judged duplicates of an already-paired copy as one more split in its cage (once each) */
+/* a let-out abandoned (coopor::PairReleaseOnAct): the body's pairing goes, and its queued let-out is withdrawn */
+void OrphanUnpair(::Character* c)
+{
+    std::map<const void*, unsigned int>::iterator it = g_orphanPairBody.find((const void*)c);
+    if (it == g_orphanPairBody.end()) return;
+    g_orphanPairCopy.erase(it->second); g_orphanPairBody.erase(it); ++g_orphanPairReleased;
+    if (g_orphanCageQueued.erase((const void*)c) == 0) return;
+    for (size_t i = 0; i < g_orphanCageOut.size(); )
+    {
+        if (g_orphanCageOut[i].c == c) g_orphanCageOut.erase(g_orphanCageOut.begin() + i); else ++i;
+    }
+}
+/* the people one pass removed from one squad, and where the last of them stood - the squad's own rule reads them once it is empty */
+struct OrphanEmptiedAt { int havePos; float x, z; void* platoon; std::vector<const void*> gone; OrphanEmptiedAt() : havePos(0), x(0.0f), z(0.0f), platoon(0) {} };   /* platoon: the squad read from a body before its destroy */
 long g_orphanGen = -1;
 DWORD g_orphanLastMs = 0;
 long long g_orphanRemoved = 0, g_orphanSkipped = 0, g_orphanFaulted = 0, g_orphanQueued = 0, g_orphanLines = 0;
@@ -9586,7 +9657,7 @@ int OrphanPos(::Character* c, float* x, float* z)   /* worldPosition dereference
     if (!PlausibleObject(*(void**)((char*)c + 0x448))) return 0;
     return OrphanPosPod(c, x, z);
 }
-struct OrphanCopy { GameData* data; Faction* faction; float x, z; unsigned int uid; };
+struct OrphanCopy { GameData* data; Faction* faction; float x, z; unsigned int uid; void* held; };   /* held: the building holding a caged copy, 0 none */
 void OrphanPeerCopies(std::vector<OrphanCopy>* out)   /* T-304 (1): the other game's live copies, read once per pass that needs them */
 {
     for (std::map<unsigned int, RootObjectBase*>::const_iterator it = g_spawned.begin(); it != g_spawned.end(); ++it)
@@ -9597,6 +9668,7 @@ void OrphanPeerCopies(std::vector<OrphanCopy>* out)   /* T-304 (1): the other ga
         OrphanCopy oc; oc.uid = it->first; oc.x = 0.0f; oc.z = 0.0f;
         if (OrphanPos(k, &oc.x, &oc.z) != 1) continue;
         oc.data = OrphanDataPod(k); oc.faction = PurgeFactionPod(k);
+        oc.held = PoseInSomethingPod(k) == 2 ? ItHeldBuildingOf((void*)k) : 0;
         if (oc.data == 0 || oc.faction == 0) continue;
         out->push_back(oc);
     }
@@ -9664,6 +9736,8 @@ void OrphanPurgeTick(long worldGen)
     {
         g_orphanGen = worldGen; g_orphanQ.clear(); g_orphanSkipSeen.clear(); g_orphanNoteT.clear(); g_orphanNotedSeen.clear();
         g_orphanCarrierTried.clear(); g_orphanBedTried.clear(); g_orphanOwnDropTried.clear();
+        g_orphanCageQueued.clear(); g_orphanCageTried.clear(); g_orphanCageOut.clear();   /* raw pointers into the freed world */
+        g_orphanPairBody.clear(); g_orphanPairCopy.clear(); g_orphanPairRefusedSeen.clear(); g_orphanSameCageSeen.clear(); g_orphanSameCageMultiSeen.clear(); g_orphanCageSeats.clear();
         g_orphanHeld.clear();   /* T-304 (1): the world teardown frees the gate table */
         g_orphanLinkUpMs = ::GetTickCount();   /* a world load restarts the arrival clock: the grace before any removal runs from the load, whoever is in the world, so a game whose own roster entry or another game's announcements have not landed yet removes nobody */
         OrphanFlush(true);
@@ -9713,6 +9787,7 @@ void OrphanPurgeTick(long worldGen)
     const SetBedModeFn setBed = (kSetBedModeRva != 0) ? (SetBedModeFn)(base + kSetBedModeRva) : 0;
     std::set<const void*> gone;
     int removed = 0;
+    std::map<std::pair<void*, void*>, OrphanEmptiedAt> emptiedAt;   /* the people removed from each, and where the last one stood */
     std::set<std::pair<void*, void*> > t300Emptied;   /* T-300 fix 2: (faction, ActivePlatoon) of each removed person - offered to the store after the pass */
     std::vector<OrphanCopy> copies; bool copiesRead = false;   /* T-304 (1): read on first need */
     for (size_t i = 0; i < live.size(); ++i)
@@ -9742,6 +9817,9 @@ void OrphanPurgeTick(long worldGen)
             s.bedTried = (g_orphanBedTried.count((const void*)c) != 0 || setBed == 0) ? 1 : 0;
             s.carrying = CarryFlag(c) ? 1 : 0;
             s.ownDropTried = (g_orphanOwnDropTried.count((const void*)c) != 0 || drop == 0) ? 1 : 0;
+            s.cageAddr = kSetPrisonModeRva != 0 ? 1 : 0;
+            s.cageQueued = g_orphanCageQueued.count((const void*)c) != 0 ? 1 : 0;
+            s.cageTried = g_orphanCageTried.count((const void*)c) != 0 ? 1 : 0;
             if (havePos == 1 && !px.empty())
             {
                 const int mineFight = OrphanCombatPod(c) == 1 ? 1 : 0;
@@ -9752,13 +9830,63 @@ void OrphanPurgeTick(long worldGen)
                 for (size_t j = 0; j < px.size(); ++j)
                     if (coopor::NearPlayer(px[j] - x, pz[j] - z, kOrphanNearR) != 0) { s.nearPlayer = 1; break; }
             unsigned int dupUid = 0;   /* T-304 (1) */
-            if (s.nearPlayer != 0 && havePos == 1 && s.areaOther == 1 && s.known == 0 && PlausibleObject(f))
+            int cagePlaces = -1, cageOcc = -1;   /* its cage's places and the people it holds now, -1 unread */
+            unsigned int pendPairUid = 0;   /* a caged body's copy, recorded only when the decision queues its let-out */
+            if (havePos == 1 && s.areaOther == 1 && s.known == 0 && PlausibleObject(f))   /* every queued body: a duplicate skips the near-player wait, and a caged one is let out and removed */
             {
                 if (!copiesRead) { OrphanPeerCopies(&copies); copiesRead = true; }
                 GameData* gd = OrphanDataPod(c);
-                for (size_t k = 0; gd != 0 && k < copies.size(); ++k)
-                    if (copies[k].data == gd && copies[k].faction == f && coopor::DupNear(copies[k].x - x, copies[k].z - z) != 0)
-                    { s.dupOfLiveCopy = 1; dupUid = copies[k].uid; break; }
+                std::map<const void*, unsigned int>::const_iterator pb = g_orphanPairBody.find((const void*)c);
+                if (gd != 0 && pb != g_orphanPairBody.end())   /* paired earlier: only its own copy can make it a duplicate */
+                {
+                    void* bh = s.inSomething == 2 ? ItHeldBuildingOf((void*)c) : 0;
+                    for (size_t k = 0; k < copies.size(); ++k)
+                    {
+                        if (copies[k].uid != pb->second || copies[k].data != gd || copies[k].faction != f) continue;
+                        const float ddx = copies[k].x - x, ddz = copies[k].z - z;
+                        const int m = s.inSomething == 2 ? coopor::CagedDupMatch(ddx, ddz, (bh != 0 && copies[k].held == bh) ? 1 : 0) : coopor::DupNear(ddx, ddz);
+                        if (m != 0) { s.dupOfLiveCopy = 1; dupUid = copies[k].uid; }
+                        break;
+                    }
+                }
+                else if (gd != 0 && s.inSomething == 2)   /* caged: the stronger test, and the nearest copy no other body is paired with */
+                {
+                    std::vector<float> ddx, ddz; std::vector<int> match, taken, pairedNow; std::vector<size_t> idx;
+                    void* bh = 0; int bhRead = 0;
+                    for (size_t k = 0; k < copies.size(); ++k)
+                    {
+                        if (copies[k].data != gd || copies[k].faction != f || coopor::DupNear(copies[k].x - x, copies[k].z - z) == 0) continue;
+                        if (bhRead == 0) { bh = ItHeldBuildingOf((void*)c); bhRead = 1; if (bh != 0) OrphanCageSeatsPod(bh, &cagePlaces, &cageOcc); }   /* read only when a same-kind copy is near */
+                        ddx.push_back(copies[k].x - x); ddz.push_back(copies[k].z - z);
+                        const int sameHeld = (bh != 0 && copies[k].held == bh) ? 1 : 0;
+                        const int pairedElsewhere = g_orphanPairCopy.count(copies[k].uid) != 0 ? 1 : 0;
+                        match.push_back(coopor::CagedDupMatch(copies[k].x - x, copies[k].z - z, sameHeld));
+                        const int tight = coopor::SameCageTight(copies[k].x - x, copies[k].z - z, sameHeld);
+                        const int extraOk = coopor::SameCageExtraAllowed(cagePlaces, cageOcc);
+                        if (tight != 0 && pairedElsewhere != 0 && extraOk == 0 && g_orphanSameCageMultiSeen.size() < 65536) g_orphanSameCageMultiSeen.insert((const void*)c);
+                        taken.push_back(coopor::CopyTakenFor(pairedElsewhere, (tight != 0 && extraOk != 0) ? 1 : 0));
+                        pairedNow.push_back(pairedElsewhere); idx.push_back(k);
+                    }
+                    const int pick = ddx.empty() ? -1 : coopor::PickPairedCopy(&ddx[0], &ddz[0], &match[0], &taken[0], (int)ddx.size());
+                    if (pick >= 0)
+                    {
+                        const OrphanCopy& pc = copies[idx[pick]];
+                        s.dupOfLiveCopy = 1; dupUid = pc.uid;
+                        if (pairedNow[pick] == 0) pendPairUid = pc.uid;   /* the copy's own body: paired once its let-out is queued */
+                        else if (g_orphanSameCageSeen.size() < 65536) g_orphanSameCageSeen.insert((const void*)c);   /* one more split in the copy's cage: no pairing of its own */
+                    }
+                    else
+                    {
+                        for (size_t m = 0; m < match.size(); ++m)
+                            if (match[m] != 0) { if (g_orphanPairRefusedSeen.size() < 65536) g_orphanPairRefusedSeen.insert((const void*)c); break; }
+                    }
+                }
+                else
+                {
+                    for (size_t k = 0; gd != 0 && k < copies.size(); ++k)
+                        if (copies[k].data == gd && copies[k].faction == f && coopor::DupNear(copies[k].x - x, copies[k].z - z) != 0)
+                        { s.dupOfLiveCopy = 1; dupUid = copies[k].uid; break; }
+                }
             }
             {
                 std::map<const void*, OrphanNoteT>::const_iterator nt = g_orphanNoteT.find((const void*)c);
@@ -9767,9 +9895,10 @@ void OrphanPurgeTick(long worldGen)
             }
             int why = coopor::kWhyNone;
             const int act = coopor::Decide(s, &why);
-            if (act == coopor::kActNone) { OrphanRelease(c); break; }   /* T-304 (1): not an orphan now - its decisions are its own again */
+            if (act == coopor::kActNone) { OrphanRelease(c); if (coopor::PairReleaseOnAct(act) != 0) OrphanUnpair(c); break; }   /* T-304 (1): not an orphan now - its decisions are its own again */
             if (act == coopor::kActSkip || act == coopor::kActLater)
             {
+                if (coopor::PairReleaseOnAct(act) != 0) OrphanUnpair(c);   /* left standing: its copy may justify another body */
                 if (coopor::HoldWhilePending(act, why) != 0) OrphanHold(c); else OrphanRelease(c);   /* T-304 (1), fold 1: only while the link or the noted clock is too fresh */
                 if (why > 0 && why < coopor::kWhyCount && g_orphanSkipSeen.size() < 65536
                     && g_orphanSkipSeen.insert(std::make_pair((const void*)c, why)).second) { ++g_orphanSkipped; ++g_orphanSkipWhy[why]; }
@@ -9777,12 +9906,32 @@ void OrphanPurgeTick(long worldGen)
             }
             if (act == coopor::kActDropCarrier) { g_orphanCarrierTried.insert((const void*)c); PurgeDropPod(drop, carrier); continue; }
             if (act == coopor::kActBedOut) { g_orphanBedTried.insert((const void*)c); PoseBedPod(setBed, c, false, 0); continue; }
+            if (act == coopor::kActCageOut)   /* out at the K2 safe point; held still and judged again on a later pass */
+            {
+                if (coopor::HoldWhilePending(act, why) != 0) OrphanHold(c);
+                if (pendPairUid != 0 && coopor::PairRecordOnAct(act) != 0) { g_orphanPairBody[(const void*)c] = pendPairUid; g_orphanPairCopy.insert(pendPairUid); }
+                if (g_orphanCageSeats.size() < 4096) g_orphanCageSeats[(const void*)c] = std::make_pair(cagePlaces, cageOcc);
+                g_orphanCageQueued.insert((const void*)c);
+                OrphanCageOutEntry e; e.c = c; e.gen = StoreWorldGenNow(); g_orphanCageOut.push_back(e);
+                break;
+            }
             if (act == coopor::kActDropOwn) { g_orphanOwnDropTried.insert((const void*)c); PurgeDropPod(drop, c); continue; }
             /* coopor::kActDestroy - the stand-in purge's route (DropPeerOwnedCopy's step 3); no row, no puppet, no uid */
             void* pl = PurgePlatoonPod(c);
             const std::string fname = PlausibleObject(f) ? WireFactionName(f) : std::string("?");
             int owner = -2; double age = -1.0;
             AreaProbeTS(sec, &owner, &age);
+            const int letOut = g_orphanCageTried.count((const void*)c) != 0 ? 1 : 0;   /* a caged duplicate this clean-up let out of its cage */
+            void* hintPlatoon = 0;   /* its squad, read while it exists: the squad may be asleep once its last person is gone */
+            { SquadView hv; if (ReadSquadOf(c, &hv) == 1 && PlausibleObject(hv.platoon)) hintPlatoon = hv.platoon; }
+            std::string bodyName("?"), bodySquad("?");
+            if (letOut != 0 && g_orphanCagedDupLines < kOrphanCagedDupLineCap)   /* read before the destroy, for its one line */
+            {
+                GameData* bgd = OrphanDataPod(c);
+                if (PlausibleObject(bgd)) bodyName = bgd->name;
+                SquadView sv;
+                if (ReadSquadOf(c, &sv) == 1 && PlausibleObject(sv.platoon)) bodySquad = StoreWorldIdOf(sv.platoon);
+            }
             const void* prevSelf = g_selfDespawnObj;
             g_selfDespawnObj = c;
             const int r = PurgeDestroyPod(c);
@@ -9791,8 +9940,25 @@ void OrphanPurgeTick(long worldGen)
             if (r == 1)
             {
                 gone.insert((const void*)c); ++g_orphanRemoved;
+                g_orphanCageTried.erase((const void*)c); g_orphanCageQueued.erase((const void*)c);   /* the address may be given to someone else */
+                g_orphanPairBody.erase((const void*)c);   /* its copy stays paired: it justified this body */
                 if (g_orphanHeld.erase((const void*)c) != 0) ReleaseGateForObject((const void*)c);   /* T-304 (1): by address - the object is gone */
-                if (s.dupOfLiveCopy != 0)
+                if (letOut != 0)
+                {
+                    ++g_orphanCagedDupRemoved;
+                    if (g_orphanCagedDupLines < kOrphanCagedDupLineCap)
+                    {
+                        ++g_orphanCagedDupLines;
+                        DebugLog("[ORPHAN] removed a caged duplicate '" + bodyName + "' of '" + fname + "' (squad '" + bodySquad + "') in " + S((long long)sec.x) + ","
+                                 + S((long long)sec.y) + ": no uid here, and the other game's registered copy uid=" + S(dupUid) + " stands within "
+                                 + S((long long)coopor::kDupCopyR) + " units with the same template and faction - let out of its cage (" + OrphanSeatsText((const void*)c) + ") the engine's own way first"
+                                 + " (orphanCagedDup removed=" + S(g_orphanCagedDupRemoved) + ")");
+                        if (g_orphanCagedDupLines == kOrphanCagedDupLineCap)
+                            DebugLog("[ORPHAN] caged-duplicate line cap reached (" + S(kOrphanCagedDupLineCap) + ") - further ones are counted on the [P033] REPORT orphanCagedDup[] token only");
+                    }
+                }
+                g_orphanCageSeats.erase((const void*)c);
+                if (s.dupOfLiveCopy != 0 && s.nearPlayer != 0)   /* the near-player wait was skipped for it */
                 {
                     ++g_orphanDupRemoved;
                     DebugLog("[ORPHAN] T-304: removed an unregistered duplicate of the other game's copy uid=" + S(dupUid) + " ('" + fname
@@ -9800,6 +9966,13 @@ void OrphanPurgeTick(long worldGen)
                              + S((long long)kOrphanNearR) + " units (orphanDupRemoved=" + S(g_orphanDupRemoved) + ")");
                 }
                 if (pl != 0 && PlausibleObject(f)) t300Emptied.insert(std::make_pair((void*)f, pl));   /* T-300 fix 2 */
+                if (pl != 0 && PlausibleObject(f))
+                {
+                    OrphanEmptiedAt& at = emptiedAt[std::make_pair((void*)f, pl)];
+                    if (havePos == 1) { at.havePos = 1; at.x = x; at.z = z; }
+                    if (at.platoon == 0) at.platoon = hintPlatoon;
+                    at.gone.push_back((const void*)c);
+                }
                 const void* key = pl != 0 ? (const void*)pl : (const void*)f;
                 std::map<const void*, OrphanAgg>::iterator ag = g_orphanAgg.find(key);
                 if (ag == g_orphanAgg.end())
@@ -9821,7 +9994,7 @@ void OrphanPurgeTick(long worldGen)
     }
     /* T-300 fix 2: the purge removes people, never their squad. A squad that is another game's file-built squad in an area
        another game holds is thrown away by the store once it is empty, so the next file cannot wake and refill it. */
-    for (std::set<std::pair<void*, void*> >::const_iterator ep = t300Emptied.begin(); ep != t300Emptied.end(); ++ep) StoreOrphanEmptiedSquad(ep->first, ep->second);
+    for (std::set<std::pair<void*, void*> >::const_iterator ep = t300Emptied.begin(); ep != t300Emptied.end(); ++ep) { const OrphanEmptiedAt& at = emptiedAt[*ep]; StoreOrphanEmptiedSquad(ep->first, ep->second, at.platoon, at.havePos, at.x, at.z, at.gone.empty() ? 0 : &at.gone[0], (int)at.gone.size()); }
 }
 
 void OrphanReportNumbers(long long* removed, long long* skipped)
@@ -9840,7 +10013,35 @@ std::string OrphanReportDetail()
     t += " orphanT304[dupRemoved,held,released,holdFull,heldNow,holdRefused,holdNotOurs]=" + S(g_orphanDupRemoved) + "," + S(g_orphanHoldN)
          + "," + S(g_orphanHoldReleased) + "," + S(g_orphanHoldFull) + "," + S((long long)g_orphanHeld.size())
          + "," + S(g_orphanHoldRefused) + "," + S(g_orphanHoldNotOurs);
+    t += " orphanCagedDup[removed,cageOutCalled,cageOutFailed,queuedNow,triedNow]=" + S(g_orphanCagedDupRemoved) + "," + S(g_orphanCageOutCalled)
+         + "," + S(g_orphanCageOutFailed) + "," + S((long long)g_orphanCageQueued.size()) + "," + S((long long)g_orphanCageTried.size())
+         + " orphanCagedPair[paired,refusedPaired,staleCageOut,released,sameCageExtra,sameCageMulti]=" + S((long long)g_orphanPairCopy.size()) + "," + S((long long)g_orphanPairRefusedSeen.size())
+         + "," + S(g_orphanCageOutStale) + "," + S(g_orphanPairReleased) + "," + S((long long)g_orphanSameCageSeen.size()) + "," + S((long long)g_orphanSameCageMultiSeen.size());
     return t;
+}
+
+/* K2 SAFE POINT (PrisonSafePointDrain): the caged duplicates the orphan clean-up queued leave their cage the engine's own way
+   (setPrisonMode(false), as StandinPurgeCageOutDrain does for a stand-in), so no cage keeps pointing at a body that is then destroyed.
+   Each body still known to the engine is marked tried whether the call took or not, so the call is never made twice for one body;
+   one the engine no longer knows is dropped unmarked. A world being replaced drops the queue (the next world re-judges its people). */
+void OrphanCageOutDrain()
+{
+    if (g_orphanCageOut.empty()) return;
+    if (EngineWritesBlocked()) { g_orphanCageOut.clear(); g_orphanCageQueued.clear(); return; }
+    const long gen = StoreWorldGenNow();
+    for (size_t i = 0; i < g_orphanCageOut.size(); ++i)
+    {
+        const OrphanCageOutEntry& e = g_orphanCageOut[i];
+        const void* key = (const void*)e.c;
+        g_orphanCageQueued.erase(key);
+        if (e.gen != gen) { ++g_orphanCageOutStale; continue; }   /* queued in a world since replaced: the address may name someone else */
+        ::Character* c = LiveCharacter(e.c);   // queued earlier in the frame loop: the engine must still know it
+        if (c == 0) continue;
+        g_orphanCageTried.insert(key);
+        if (PoseInSomethingPod(c) != 2) continue;
+        if (PosePrisonPod(c, false, 0) == 1) ++g_orphanCageOutCalled; else ++g_orphanCageOutFailed;
+    }
+    g_orphanCageOut.clear();
 }
 
 /* TEST-ONLY lever (command file only - `bedtest`, command_channel.cpp). MAIN THREAD (the command pump, as CarryTestCommand).
@@ -10496,6 +10697,7 @@ int SlaveStateOfCharacter(const void* c);          /* slave1 block below: -1 unr
 void PrisonSafePointDrain()
 {
     StandinPurgeCageOutDrain();   /* inv7a: a stand-in leaving its cage before the purge destroys it */
+    OrphanCageOutDrain();         /* a caged duplicate leaving its cage before the orphan clean-up removes it */
     BailTestSafePointDrain();     /* the bailtest lever's bail steps, at this same safe point */
     BedOutForCarryDrain();
     BedHandoffDrain();   // hand-offs queued at an earlier safe point - a new one below waits for the next
@@ -12765,6 +12967,44 @@ unsigned long long kSetHomeBuildingRva = 0; static coop::AddrReg kSetHomeBuildin
 typedef void (*SetSquadTypeFn)(void* platoon, int st);
 typedef void (*SetHomeTownFn)(void* ownerships, void* town, int st);
 typedef void (*SetHomeBuildingFn)(void* ownerships, const hand& h, int st);
+/* T-1084: A SQUAD'S HOME BUILDING SET BY THE ENGINE MARKS ITS WORLD RECORD DUE. Ownerships::setHomeBuilding is hooked (InstallHomeWatch);
+   the 28 bytes of the pot's home hand (+0x38) are copied before and after the engine's call, and only a change is noted
+   (sqevent::HomeChanged; the engine fills only an empty home). The copies read the pot this call was handed, on the calling thread,
+   while the engine writes it there; the note itself reads nothing off the main thread (store.cpp SqEventNote). The mod's own calls -
+   a copy built from its record, a home given back - pass through SetHomeBuildingOwn, whose depth is PER THREAD, and are not noted:
+   what the record already holds is not a change. A state load's calls (mostly off the main thread) are queued and match no squad
+   the heartbeat tracks, and on the main thread a load or a teardown is skipped (sqevent::NoteAction). */
+SetHomeBuildingFn orig_setHomeBuilding = 0;
+DWORD g_homeOwnTls = TLS_OUT_OF_INDEXES;   /* per thread: the depth of the mod's own calls (TlsAlloc: the DLL loads late) */
+int g_homeHookOn = 0;
+volatile LONG64 g_homeOwnPassed = 0, g_homeUnchanged = 0, g_homeNoted = 0, g_homeUnread = 0;
+static int HomeOwnDepth() { return g_homeOwnTls != TLS_OUT_OF_INDEXES ? (int)(INT_PTR)::TlsGetValue(g_homeOwnTls) : 0; }
+static int HomeHandCopyPod(const void* pot, unsigned char* out)
+{
+    __try { std::memcpy(out, (const char*)pot + 0x38, sqevent::kHomeHandBytes); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void detour_setHomeBuilding(void* pot, const hand& h, int st)
+{
+    if (HomeOwnDepth() > 0) { ::InterlockedIncrement64(&g_homeOwnPassed); orig_setHomeBuilding(pot, h, st); return; }
+    unsigned char before[sqevent::kHomeHandBytes], after[sqevent::kHomeHandBytes];
+    const int readBefore = HomeHandCopyPod(pot, before);
+    orig_setHomeBuilding(pot, h, st);
+    if (readBefore != 1 || HomeHandCopyPod(pot, after) != 1) { ::InterlockedIncrement64(&g_homeUnread); return; }
+    if (sqevent::HomeChanged(before, after) == 0) { ::InterlockedIncrement64(&g_homeUnchanged); return; }
+    ::InterlockedIncrement64(&g_homeNoted);
+    coop::StoreNoteSquadHome(pot);
+}
+/* The mod's own Ownerships::setHomeBuilding call: through the hook, with this thread's depth raised so the hook passes it unnoted. */
+void SetHomeBuildingOwn(void* pot, const hand& h, int st)
+{
+    if (g_homeOwnTls != TLS_OUT_OF_INDEXES) ::TlsSetValue(g_homeOwnTls, (LPVOID)(INT_PTR)(HomeOwnDepth() + 1));
+    __try { ((SetHomeBuildingFn)((uintptr_t)::GetModuleHandleA(0) + kSetHomeBuildingRva))(pot, h, st); }
+    __finally
+    {
+        if (g_homeOwnTls != TLS_OUT_OF_INDEXES) { const int d = HomeOwnDepth(); ::TlsSetValue(g_homeOwnTls, (LPVOID)(INT_PTR)(d > 0 ? d - 1 : 0)); }
+    }
+}
 // P1b (b): after the host takes a squad over, the client's own copy is asleep under the same id. The host's live
 // announcement is the truth: the sleeping copy is destroyed and the context copy created fresh (no duplicate).
 static int PlatoonAsleepPod(void* platoon)
@@ -12861,7 +13101,7 @@ bool ConfigurePlatoonPod(void* platoon, int st, void* town, const unsigned char*
         ((SetSquadTypeFn)(base + kSetSquadTypeRva))(platoon, st);
         void* own = (char*)platoon + 0x148;                                    // embedded Ownerships
         if (town != 0) ((SetHomeTownFn)(base + kSetHomeTownRva))(own, town, st);
-        if (haveBuilding) { const hand lh = LocalHandFromRaw(handRaw); ((SetHomeBuildingFn)(base + kSetHomeBuildingRva))(own, lh, st); }
+        if (haveBuilding) { const hand lh = LocalHandFromRaw(handRaw); SetHomeBuildingOwn(own, lh, st); }
         *activeOut = *(void**)((char*)platoon + 0x1D8);                        // ActivePlatoon*
         return *activeOut != 0;
     }
@@ -13050,6 +13290,23 @@ static int CopySquadIdCheck(Faction* faction, void* platoon, const std::string& 
 }
 
 } // namespace
+/* T-1084: the home hook's install and its counts (the hook itself is in the namespace above, beside the home row). */
+void InstallHomeWatch()
+{
+    if (kSetHomeBuildingRva == 0) { ErrorLog("[STORE] squad home hook NOT installed: SetHomeBuilding has no row - a world squad's home reaches the world server on the heartbeat's 30 s floor only"); return; }
+    if (g_homeOwnTls == TLS_OUT_OF_INDEXES) g_homeOwnTls = ::TlsAlloc();
+    if (g_homeOwnTls == TLS_OUT_OF_INDEXES) { ErrorLog("[STORE] squad home hook NOT installed: no thread slot for the mod's own calls - a world squad's home reaches the world server on the heartbeat's 30 s floor only"); return; }
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    g_homeHookOn = (coop::AddHook((void*)(base + (uintptr_t)kSetHomeBuildingRva), (void*)&detour_setHomeBuilding, (void**)&orig_setHomeBuilding) == coop::SUCCESS && orig_setHomeBuilding != 0) ? 1 : 0;
+    if (g_homeHookOn != 0) DebugLog("[STORE] squad home hook installed: Ownerships::setHomeBuilding - a world squad's new home building marks its record due (T-1084)");
+    else ErrorLog("[STORE] squad home hook NOT installed: Ownerships::setHomeBuilding did not take - a world squad's home reaches the world server on the heartbeat's 30 s floor only");
+}
+std::string HomeWatchReport()
+{
+    return "homeHook[on,noted,unchanged,ownPassed,unread]=" + std::to_string((long long)g_homeHookOn) + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeNoted, 0, 0))
+         + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeUnchanged, 0, 0)) + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeOwnPassed, 0, 0))
+         + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeUnread, 0, 0));
+}
 
 /* A character a hire moved into a NEW squad of a stand-in faction (setFaction with no squad given: the faction's
    addMember makes the squad, numbered by the stand-in's own counter - the clash a copy squad made here can meet).
@@ -13126,11 +13383,10 @@ int CopySquadIdCheckAtLoad(void* platoon, const std::string& id)
 int PlatoonSetHomeBuildingPod(void* platoon, void* building)
 {
     if (platoon == 0 || building == 0 || kSetHomeBuildingRva == 0) return 0;
-    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     __try
     {
         const int st = *(const int*)((const char*)platoon + 0xA8);
-        ((SetHomeBuildingFn)(base + kSetHomeBuildingRva))((char*)platoon + 0x148, *(const hand*)((const char*)building + 0x58), st);
+        SetHomeBuildingOwn((char*)platoon + 0x148, *(const hand*)((const char*)building + 0x58), st);
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
@@ -13152,12 +13408,11 @@ int PlatoonHomeHandPod(const void* platoon, unsigned char* out32)
 int PlatoonSetHomeHandPod(void* platoon, const unsigned char* handRaw32)
 {
     if (platoon == 0 || handRaw32 == 0 || kSetHomeBuildingRva == 0 || RawHandIsEmpty(handRaw32)) return 0;
-    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     __try
     {
         const int st = *(const int*)((const char*)platoon + 0xA8);
         const hand lh = LocalHandFromRaw(handRaw32);
-        ((SetHomeBuildingFn)(base + kSetHomeBuildingRva))((char*)platoon + 0x148, lh, st);
+        SetHomeBuildingOwn((char*)platoon + 0x148, lh, st);
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
@@ -13812,7 +14067,7 @@ int RetirePeerContextPlatoons(int slot)
         StoreUnbindPlatoon(asleep);
         if (DestroyPlatoonPod(f, asleep) == 1)
         {
-            if (!worldId.empty()) { const int rc = StoreRecreateSleepingFromRecord(worldId); if (rc == 1) ++g_peerGoneRecreated; }   // F492: the world keeps the squad where it last slept
+            if (!worldId.empty()) { const int rc = StoreRecreateSleepingFromRecord(worldId, 0); if (rc == 1) ++g_peerGoneRecreated; }   // F492: the world keeps the squad where it last slept
             ++retired; ++g_peerGoneRetired;
             DebugLog("[CTX] peer gone: context platoon " + P(asleep) + " key='" + key + "' retired"
                      " (deactivate pair) and destroyed");

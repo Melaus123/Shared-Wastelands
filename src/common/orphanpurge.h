@@ -16,7 +16,9 @@
  *   (2) CLEANUP (Decide): after link-up, an unregistered non-player character standing in an area another game
  *       holds is removed through the stand-in purge's route (the holder's world wins; there is no handover).
  *       Never a player-faction character, never one carried by a player character, never a caged one (a caged
- *       person may be a player's prisoner and letting them out is not ours to do), and not while a fight with a
+ *       person may be a player's prisoner and letting them out is not ours to do) - unless it DUPLICATES another game's
+ *       registered copy (same template and faction within kDupCopyR): that body is the same person shown twice, so it leaves
+ *       its cage the engine's own way (setPrisonMode(false) at the K2 safe point) and is removed - and not while a fight with a
  *       player character is going on nearby (removal mid-fight would be visible and unfair; a later pass does it).
  *       review-orphan1: nor within 100 units of a player character (talking, trading, looting need adjacency), nor
  *       before it has been noted CONTINUOUSLY for 5 s and the game link has been up 10 s - a twin awaiting the holder's
@@ -56,7 +58,8 @@ enum {
     kActBedOut      = 3,   /* it gets out of its bed first */
     kActDropOwn     = 4,   /* it puts down what it carries first */
     kActSkip        = 5,   /* left standing, counted (*why); re-judged on a later pass */
-    kActLater       = 6    /* not now (*why = kWhyInCombatWithPlayer); a later pass removes it */
+    kActLater       = 6,   /* not now (*why = kWhyInCombatWithPlayer); a later pass removes it */
+    kActCageOut     = 7    /* a caged duplicate of a live copy: setPrisonMode(false) is queued for the K2 safe point; removed on a later pass */
 };
 
 /* WHY it was skipped. */
@@ -75,7 +78,10 @@ enum {
     kWhyNearPlayer        = 11,  /* review-orphan1 HIGH: a player-faction character within kNearPlayerR - a later pass */
     kWhyNotedTooShort     = 12,  /* review-orphan1 MED: noted continuously for less than kNotedMinMs - a later pass */
     kWhyLinkTooFresh      = 13,  /* review-orphan1 MED: another player arrived in this world less than kLinkedMinMs ago - a later pass */
-    kWhyCount             = 14
+    kWhyCageNoAddr        = 14,  /* a caged duplicate, and setPrisonMode has no address in this build's table - never destroyed in its cage */
+    kWhyCageWait          = 15,  /* a caged duplicate whose cage-out is queued and has not run yet - a later pass */
+    kWhyCageStuck         = 16,  /* a caged duplicate still caged after its cage-out ran - left standing, the call is never made twice */
+    kWhyCount             = 17
 };
 
 /* Everything the decision needs about one queued character, read by the caller. */
@@ -95,7 +101,10 @@ struct Seen
     int carrying;         /* Character +0x348: it carries something itself */
     int ownDropTried;     /* 1 = it was already told to put that down (or there is no drop address) */
     int nearPlayer;       /* 1 = a player-faction character is within the adjacency radius */
-    int dupOfLiveCopy;    /* T-304 (1): 1 = a registered copy of ANOTHER game's character with the same template and faction stands within kDupCopyR - a duplicate, so the near-player wait does not apply */
+    int dupOfLiveCopy;    /* T-304 (1): 1 = a registered copy of ANOTHER game's character with the same template and faction stands within kDupCopyR - a duplicate, so the near-player wait does not apply and a caged one is let out and removed */
+    int cageAddr;         /* 1 = setPrisonMode has an address */
+    int cageQueued;       /* 1 = its cage-out is queued and the K2 safe point has not run it yet */
+    int cageTried;        /* 1 = its cage-out ran (called or faulted) */
     unsigned long notedMs;   /* how long the adoption pass has noted it CONTINUOUSLY */
     unsigned long linkedMs;  /* how long since another player last arrived in this world (spawn.cpp OrphanPurgeTick's arrival clock) */
 };
@@ -110,6 +119,7 @@ inline Seen SeenNone()
     s.beingCarried = 0; s.carrierFound = 0; s.carrierIsPlayer = 0; s.carrierTried = 0; s.bedTried = 0;
     s.carrying = 0; s.ownDropTried = 0;
     s.nearPlayer = 0; s.dupOfLiveCopy = 0; s.notedMs = kNotedMinMs; s.linkedMs = kLinkedMinMs;
+    s.cageAddr = 1; s.cageQueued = 0; s.cageTried = 0;
     return s;
 }
 
@@ -124,12 +134,19 @@ inline int Decide(const Seen& s, int* why)
     if (s.standIn != 0) return kActNone;         /* the stand-in purge's (inv7a), not ours */
     if (s.guarded != 0) { *why = kWhyPlayerTied; return kActSkip; }
     if (s.beingCarried != 0 && s.carrierIsPlayer != 0) { *why = kWhyCarriedByPlayer; return kActSkip; }
-    if (s.inSomething == 2) { *why = kWhyCaged; return kActSkip; }
+    if (s.inSomething == 2 && s.dupOfLiveCopy == 0) { *why = kWhyCaged; return kActSkip; }   /* a caged body that duplicates no live copy may be a player's prisoner */
     if (s.fightNear != 0) { *why = kWhyInCombatWithPlayer; return kActLater; }
     if (s.nearPlayer != 0 && s.dupOfLiveCopy == 0) { *why = kWhyNearPlayer; return kActLater; }   /* T-304 (1): a duplicate of a live copy is not someone the player is dealing with - the other game already shows that character */
     if (s.linkedMs < kLinkedMinMs) { *why = kWhyLinkTooFresh; return kActLater; }   /* before ANY action, a put-down included */
     if (s.notedMs < kNotedMinMs) { *why = kWhyNotedTooShort; return kActLater; }
     if (s.inSomething < 0) { *why = kWhyPoseUnreadable; return kActSkip; }
+    if (s.inSomething == 2)   /* only a duplicate of a live copy reaches here: out of its cage the engine's own way, then removed */
+    {
+        if (s.cageAddr == 0) { *why = kWhyCageNoAddr; return kActSkip; }
+        if (s.cageTried != 0) { *why = kWhyCageStuck; return kActSkip; }
+        if (s.cageQueued != 0) { *why = kWhyCageWait; return kActLater; }
+        return kActCageOut;
+    }
     if (s.beingCarried != 0)
     {
         if (s.carrierTried != 0) { *why = kWhyCarryStuck; return kActSkip; }
@@ -166,10 +183,55 @@ inline int NearPlayer(float dx, float dz, float radius) { return (dx * dx + dz *
 const float kDupCopyR = 100.0f;
 inline int DupNear(float dx, float dz) { return (dx * dx + dz * dz <= kDupCopyR * kDupCopyR) ? 1 : 0; }
 
+/* A CAGED body is the same person as a copy only on the stronger test: within kDupCageR of it (a split body stands on its copy's
+   spot - the measured spread was 0 to 2.5 units), or held by the same building (cage / pole) within kDupCopyR. A caged prisoner of
+   the same kind and faction a few steps away is someone else. sameHeld: 1 = both name the same building (neither 0). */
+const float kDupCageR = 3.0f;
+inline int CagedDupMatch(float dx, float dz, int sameHeld)
+{
+    const float d2 = dx * dx + dz * dz;
+    if (d2 <= kDupCageR * kDupCageR) return 1;
+    return (sameHeld != 0 && d2 <= kDupCopyR * kDupCopyR) ? 1 : 0;
+}
+/* In the copy's own cage and on its spot (within kDupCageR): one more split of the same person - a duplicate however many such
+   bodies share that cage. sameHeld as CagedDupMatch. */
+inline int SameCageTight(float dx, float dz, int sameHeld) { return (sameHeld != 0 && dx * dx + dz * dz <= kDupCageR * kDupCageR) ? 1 : 0; }
+/* Is a copy already taken for this body? pairedElsewhere: another body is paired with it. A body in its cage on its spot is never
+   kept off it (SameCageTight); every other match keeps one copy for one body. */
+inline int CopyTakenFor(int pairedElsewhere, int sameCageTight) { return (pairedElsewhere != 0 && sameCageTight == 0) ? 1 : 0; }
+/* The same-cage exception holds only where a second same-kind prisoner cannot be someone else: a cage with one place, or one holding
+   more people than its places (the extras can only be splits). places / occupants -1 = unread: no exception. */
+inline int SameCageExtraAllowed(int places, int occupants)
+{
+    if (places < 1 || occupants < 0) return 0;
+    return (places == 1 || occupants > places) ? 1 : 0;
+}
+/* One copy justifies at most one caged body: the nearest matching copy that no other body is paired with. -1 = none. */
+inline int PickPairedCopy(const float* dx, const float* dz, const int* match, const int* taken, int n)
+{
+    int best = -1; float bestD2 = 0.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        if (match[i] == 0 || taken[i] != 0) continue;
+        const float d2 = dx[i] * dx[i] + dz[i] * dz[i];
+        if (best < 0 || d2 < bestD2) { best = i; bestD2 = d2; }
+    }
+    return best;
+}
+/* The pairing is recorded only when the decision acts on the body (its let-out is queued), and released when the let-out is
+   abandoned (left standing, or no longer an orphan) so the copy can justify another body. A removal keeps it: the copy justified
+   that body. A wait (kActLater) keeps whatever is recorded. */
+inline int PairRecordOnAct(int act) { return act == kActCageOut ? 1 : 0; }
+inline int PairReleaseOnAct(int act) { return (act == kActNone || act == kActSkip) ? 1 : 0; }
+
 /* T-304 (1), fold 1: a noted character is held (its decisions suppressed) ONLY while it waits for the link or the noted clock -
    the waits that end in its removal (a duplicate near a player lands here, Decide skips the near-player wait for it). Never
    mid-fight with a player (kWhyInCombatWithPlayer), never a plain near-player wait, never a kActSkip one. */
-inline int HoldWhilePending(int act, int why) { return (act == kActLater && (why == kWhyLinkTooFresh || why == kWhyNotedTooShort)) ? 1 : 0; }
+inline int HoldWhilePending(int act, int why)
+{
+    if (act == kActCageOut) return 1;   /* a caged duplicate is held from its let-out until it is removed */
+    return (act == kActLater && (why == kWhyLinkTooFresh || why == kWhyNotedTooShort || why == kWhyCageWait)) ? 1 : 0;
+}
 
 /* At most this many removals per judging pass (removal = a destroy; the put-down steps are free). */
 const int kPerPass = 4;
@@ -192,6 +254,9 @@ inline const char* WhyToken(int why)
     case kWhyNearPlayer:         return "nearPlayer";
     case kWhyNotedTooShort:      return "notedTooShort";
     case kWhyLinkTooFresh:       return "linkTooFresh";
+    case kWhyCageNoAddr:         return "cageNoAddr";
+    case kWhyCageWait:           return "cageWait";
+    case kWhyCageStuck:          return "cageStuck";
     default:                     return "none";
     }
 }

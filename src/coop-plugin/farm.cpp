@@ -312,7 +312,8 @@ struct MsIn { float progress; int state; DWORD at; unsigned int from; };   /* T-
 std::map<std::string, MsIn> g_inMineState;   /* MAIN THREAD: the latest received bar and state per node key, applied at K2 */
 volatile LONG64 g_msFull = 0;
 long long g_msSent = 0, g_msSendFail = 0, g_msReadFail = 0, g_msRecv = 0, g_msApplied = 0, g_msRefused = 0, g_msApplyFault = 0,
-          g_msNotProduction = 0, g_msUnresolved = 0, g_msSendUnresolved = 0;
+          g_msNotProduction = 0, g_msUnresolved = 0, g_msSendUnresolved = 0,
+          g_msRecordSkipped = 0, g_msRecordDropped = 0;   /* T-1047 step 2b: rounds not sent, and received ones dropped, for a player's power piece whose record carries its bar */
 
 /* ANY THREAD: the node at `key` was worked now */
 void MsMark(const char* key)
@@ -1678,6 +1679,7 @@ void MsSendRound(DWORD now)
         const MsRow& c = cand[k];
         void* b = FmResolve(std::string(c.key));
         if (b == 0) { if (MsMissDue(c, 0, now) != 0) ++g_msSendUnresolved; continue; }   /* gone or out of the loaded area: not sent */
+        if (PwMineStateSkip(b, c.key) != 0) { ++g_msRecordSkipped; continue; }   /* T-1047 step 2b: a player's power piece - its record carries the bar */
         float pg = 0.0f;
         int st = -1;
         if (MineBarReadPod(b, &pg, &st) != 1) { if (MsMissDue(c, 1, now) != 0) ++g_msReadFail; continue; }   /* no output record, or a fault */
@@ -2217,6 +2219,13 @@ void FarmDrain()
             continue;
         }
         if (ProductionBuildingIs(b) == 0) { ++g_msNotProduction; g_inMineState.erase(it++); continue; }
+        if (PwMineStateDrop(b, it->first) != 0)
+        {   /* T-1047 step 2b: a player's power piece whose record's values are still to land here - the record writes its bar (the
+               POWER_STATE receiver's rule, PwStateDrop) */
+            ++g_msRecordDropped;
+            g_inMineState.erase(it++);
+            continue;
+        }
         const MsIn in = it->second;
         char h[400];
         int runSlot = -1;
@@ -2475,14 +2484,14 @@ void ReportFarm()
     std::sprintf(mb, "[MINE] REPORT relay[held,noKey,full,badAmount,sent,sendFail,toSelf,keptUndecided,droppedUndecided,droppedLink,forgot]"
                  "=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                  " run[recv,ran,calls,refused,notProduction,waitWriter,dropped,fault,paused,withCopy,noWorker]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
-                 " state[sent,sendFail,readFail,recv,applied,refused,applyFault,notProduction,unresolved,full,sendUnresolved]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " state[sent,sendFail,readFail,recv,applied,refused,applyFault,notProduction,unresolved,full,sendUnresolved,recordSkipped,recordDropped]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                  " unencodable=%lld sendFailLost=%lld capLost=%lld pairs=%d",
                  (long long)g_mnHeld, (long long)g_mnNoKey, (long long)g_mnFull, (long long)g_mnBadAmount, g_mnSent, g_mnSendFail, g_mnToSelf,
                  g_mnKeptUndecided, g_mnDroppedUndecided, g_mnDroppedLink, g_mnForgot,
                  g_mnRecv, g_mnRan, g_mnCalls, g_mnRefused, g_mnNotProduction, g_mnWaitWriter, g_mnDropped, g_mnFault, g_mnPaused,
                  g_mnWithCopy, g_mnNoWorker,
                  g_msSent, g_msSendFail, g_msReadFail, g_msRecv, g_msApplied, g_msRefused, g_msApplyFault, g_msNotProduction, g_msUnresolved,
-                 (long long)g_msFull, g_msSendUnresolved, net::FarmUnencodableCount(), g_mnSendFailLost, g_mnCapLost, mnUsed);
+                 (long long)g_msFull, g_msSendUnresolved, g_msRecordSkipped, g_msRecordDropped, net::FarmUnencodableCount(), g_mnSendFailLost, g_mnCapLost, mnUsed);
     DebugLog(std::string(mb));
     int spUsed = 0, spGranted = 0;
     long long giveUp = 0;
@@ -2525,6 +2534,24 @@ void MineWorkedNote(void* pb)
     char key[64];
     if (ObjectPositionKey(pb, key, (int)sizeof(key), 0, 3, 0) == 0) return;
     MsMark(key);
+}
+
+/* T-1047 step 2b, ANY THREAD: MINE_STATE's own worked clock (g_ms's workedAt, under g_fmcs) read for the piece record's bar bands */
+int MineWorkedRecently(const char* key)
+{
+    if (::InterlockedCompareExchange(&g_fmInit, 0, 0) == 0 || key == 0 || key[0] == 0) return 0;
+    const unsigned int h = FmHash(key);
+    const DWORD now = ::GetTickCount();
+    int worked = 0;
+    ::EnterCriticalSection(&g_fmcs);
+    for (int j = 0; j < g_msHigh; ++j)
+        if (g_ms[j].used != 0 && g_ms[j].hash == h && std::strcmp(g_ms[j].key, key) == 0)
+        {
+            worked = ((DWORD)(now - g_ms[j].workedAt) <= coopfarm::kMineStateWorkedMs) ? 1 : 0;
+            break;
+        }
+    ::LeaveCriticalSection(&g_fmcs);
+    return worked;
 }
 
 int MineStepRelay(void* pb, void* who, float amount)

@@ -38,6 +38,7 @@ namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /*
 namespace coop { int ItTraderHomePos(void* ap, void* platoon, void* leader, float* x, float* z); }   /* T-164 B4-3 (M4): items.cpp - a trader squad's home building position */   /* T-1 B3 fold (M2): items.cpp - net of this game's in-flight predictions */
 namespace coop { bool StoreLiveReady(); int StoreRosterSlotInWorld(int slot); int StoreMySlot(); bool EngineWritesBlocked(); }   /* M7a A1 build 2 [a1b2-hd9]: store.cpp (store.h) */
 #include <algorithm>
+namespace coop { int ShopKeeperRecorded(void* character, int countIt); }   /* items.cpp: 1 = the shop record carries that keeper's money */
 
 namespace coop {
 namespace {
@@ -2630,6 +2631,7 @@ void SquadCatsSafePointDrain()
             g_catsTakeSnap.erase(L);
             ++g_hrAdoptSuperseded;
         }
+        if (coop::ShopKeeperRecorded((void*)c, 0) != 0) continue;   /* the shop record carries this keeper's money (items.cpp ShopTraderTick sets the pot): the restock message writes nothing */
         int want = 0;
         if (coopsquad::HolderRestockWant(cur, pd.delta, &want) == 0 || (want != cur && KeeperPotWritePod(own, want) == 0)) { ++g_hrUnread; continue; }
         KeeperMoneyKnownMark(own, coopsquad::kMoneyEvPeerWritten);
@@ -2667,6 +2669,13 @@ void SquadCatsSafePointDrain()
             long long delta = 0; unsigned int eSeq = 0; int eCats = 0;
             const int act = CatsAdoptAction(SquadActivePlatoonOf(c), L, &delta, &eSeq, &eCats);
             if (act == coopsquad::kCatsNone) continue;
+            if (coop::ShopKeeperRecorded((void*)c, 0) != 0)
+            {   /* the shop record carries this keeper's money (items.cpp ShopTraderTick sets the pot from it): the hand-over's value is
+                   not written; taken as adopted so it is not asked again */
+                CatsAdopt& r = g_catsAdopt[L]; r.seq = eSeq; r.cats = eCats;
+                g_catsTakeSnap.erase(L);
+                continue;
+            }
             if (KeeperPot((void*)c, &own, &cur) != 1) { CatsPotUnread(L, eSeq); continue; }
             const int potFlight = (unresolved > 0 || std::find(flight.begin(), flight.end(), own) != flight.end()) ? 1 : 0;
             if (coopsquad::TakeoverAdoptHeld(act, potFlight) != 0) { ++g_catsAdoptHeld; continue; }   /* T-1 B3 fold (M2): after they settle */
@@ -2698,6 +2707,7 @@ void SquadCatsSafePointDrain()
     for (size_t k = 0; k < pots.size(); ++k)
     {
         const CatsCopyPot& p = pots[k];
+        if (coop::ShopKeeperRecorded((void*)FindSpawned(p.leader), 1) != 0) continue;   /* the shop record carries this keeper's money: it sets every copy (items.cpp ShopTraderTick), the runner's announcement does not */
         const int held = (unresolved > 0 || std::find(flight.begin(), flight.end(), p.own) != flight.end()) ? 1 : 0;
         const int act = coopsquad::CopyPotAction(p.cats, p.cur, held);
         if (act == coopsquad::kPotEqual) { KeeperMoneyKnownMark(p.own, coopsquad::kMoneyEvPeerWritten); continue; }   /* T-799 D1: it holds the runner's value */

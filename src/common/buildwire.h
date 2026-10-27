@@ -46,7 +46,7 @@ const unsigned char kBuildDismantleAsk = 12;   /* T-805 (owner 797 a): kind | ke
                                                   T-609: MSG_BUILD's kind byte is shared with farmwire.h (6 / 7 / 10 / 11 / 13-15, coopfarm::IsFarmKind,
                                                   peeked first by session.cpp OnBuild) - a new kind here must take a number IsFarmKind refuses
                                                   (test t609_build_and_farm_kinds_never_share_a_number) */
-const unsigned char kBuildHit = 18;            /* kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict - verdict kBuildHitAsk = a melee hit on a player's wall
+const unsigned char kBuildHit = 18;            /* kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict | i8 door | u8 repair - verdict kBuildHitAsk = a melee hit on a player's wall
                                                   (the damage struct's +0 / +4), asked of the game that writes that wall (the machines' writer: the owner's game while it is
                                                   online and holds the area, else the area holder); verdicts 1-6 are that game's answer for the seq (BuildHitWord), after
                                                   which the asker stops sending it (6 'not the writer': the asker asks the writer once more).
@@ -56,6 +56,10 @@ const unsigned char kBuildHit = 18;            /* kind | key | u32 seq | f32 cut
                                                   share after / needed is what is compared), flags bit 0 = the hit made the wall a ruin, bit 1 = owed (sent again to the
                                                   owner's game only: the summed drop of every hit on that wall that game did not take). 16 / 17 are powerwire.h's */
 const unsigned char kBuildHitFlagDestroyed = 1, kBuildHitFlagOwed = 2;
+/* An ask or an answer (any verdict but kBuildHitResult) ends in i8 door | u8 repair: door = the index of the hit door in its piece's door
+   list (-1 = the piece itself, a wall); repair 1 (an ask naming a door only) = not a hit but the health a repair gained on a game that
+   does not write the piece (cut = that health, blunt 0), for the writer to add to its door. The RESULT form carries neither. */
+const int kBuildHitMaxDoor = 15;
 const unsigned char kBuildHitAsk = 0, kBuildHitApplied = 1, kBuildHitGone = 2, kBuildHitNotLoaded = 3, kBuildHitRuin = 4, kBuildHitFaulted = 5,
                     kBuildHitNotWriter = 6, kBuildHitResult = 7;
 const unsigned char kBuildHitLastVerdict = 7;
@@ -137,10 +141,12 @@ struct BuildMsg
     float hitCut, hitBlunt;         /* HIT: the damage struct's +0 / +4 the hit carried (seq = the asker's number, reason = the verdict) */
     float hitDrop, hitAfter;        /* HIT result: the raw progress the hit (owed: the hits) took, >= 0; the owner's health the writer expects after it, in units of needed */
     unsigned char hitOwed;          /* HIT result: 1 = owed - the writer sends it again to the owner's game only */
+    int hitDoor;                    /* HIT ask / answer: the door's index in its piece's door list, -1 = the piece itself */
+    unsigned char hitRepair;        /* HIT ask naming a door: 1 = a repair's gained health (hitCut) to add, not a hit */
     std::vector<BuildHelpAck> helpAcks;   /* help1 STATE: the confirmation tail (empty = not written); fold 3: each row landed seq + live */
     float mats[kBuildMaxMats];
     BuildMsg() : kind(0), complete(0), destroyed(0), broken(0), progress(0.0f), needed(0.0f), nMats(0), reason(0), hostForm(0), floor(0), outside(0), ownerSlot(0xFFFF),
-                 nonce(0), seq(0), reset(0), applied(0), rmFlags(0), townHand(0), hitCut(0.0f), hitBlunt(0.0f), hitDrop(0.0f), hitAfter(0.0f), hitOwed(0)
+                 nonce(0), seq(0), reset(0), applied(0), rmFlags(0), townHand(0), hitCut(0.0f), hitBlunt(0.0f), hitDrop(0.0f), hitAfter(0.0f), hitOwed(0), hitDoor(-1), hitRepair(0)
     {
         townPos[0] = townPos[1] = 0.0f;
         for (int i = 0; i < 3; ++i) pos[i] = 0.0f;
@@ -198,10 +204,12 @@ inline bool BuildEncodable(const BuildMsg& m)
     if (m.kind == kBuildHandAck) return !m.key.empty() && m.key.size() <= kBuildMaxKey;   /* house1b: the key only */
     if (m.kind == kBuildHit && m.reason == kBuildHitResult)   /* key | seq (> 0) | drop (finite, >= 0), needed (finite, >= 0) | destroyed 0/1, owed 0/1 | after (finite) */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.seq != 0 && BuildFloatOk(m.hitDrop) && m.hitDrop >= 0.0f && BuildFloatOk(m.needed) && m.needed >= 0.0f
-            && m.destroyed <= 1 && m.hitOwed <= 1 && BuildFloatOk(m.hitAfter);
+            && m.destroyed <= 1 && m.hitOwed <= 1 && BuildFloatOk(m.hitAfter) && m.hitDoor == -1 && m.hitRepair == 0;
     if (m.kind == kBuildHit)   /* key | seq (> 0) | cut, blunt (finite, 0..kBuildHitMax) | verdict */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.seq != 0 && m.reason <= kBuildHitLastVerdict
-            && BuildFloatOk(m.hitCut) && BuildFloatOk(m.hitBlunt) && m.hitCut >= 0.0f && m.hitBlunt >= 0.0f && m.hitCut <= kBuildHitMax && m.hitBlunt <= kBuildHitMax;
+            && BuildFloatOk(m.hitCut) && BuildFloatOk(m.hitBlunt) && m.hitCut >= 0.0f && m.hitBlunt >= 0.0f && m.hitCut <= kBuildHitMax && m.hitBlunt <= kBuildHitMax
+            && m.hitDoor >= -1 && m.hitDoor <= kBuildHitMaxDoor && m.hitRepair <= 1
+            && (m.hitRepair == 0 || (m.hitDoor >= 0 && m.reason == kBuildHitAsk && m.hitBlunt == 0.0f));   /* a repair: an ask naming a door, its gain in cut */
     if (m.kind == kBuildDismantleAsk) return !m.key.empty() && m.key.size() <= kBuildMaxKey && m.reason <= 7;   /* T-805: key + verdict (kBuildDmBlocked the last) */
     if (m.kind == kBuildRemove)   /* build1-d; P87 fold 1: a furniture tail's host key fits */
         return !m.key.empty() && m.key.size() <= kBuildMaxKey
@@ -281,7 +289,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
     if (m.kind == kBuildHit)   /* kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict; the RESULT: f32 drop | f32 needed | u8 7 | u8 flags | f32 after */
     {
         const int res = (m.reason == kBuildHitResult) ? 1 : 0;
-        b->resize(at + 1 + 1 + m.key.size() + 4 + 4 + 4 + 1 + (res != 0 ? 1 + 4 : 0));
+        b->resize(at + 1 + 1 + m.key.size() + 4 + 4 + 4 + 1 + (res != 0 ? 1 + 4 : 2));
         char* h = &(*b)[at];
         *h++ = (char)m.kind;
         BuildPutS(&h, m.key);
@@ -294,6 +302,7 @@ inline bool EncodeBuild(std::vector<char>* b, const BuildMsg& m)
             *h++ = (char)((m.destroyed != 0 ? kBuildHitFlagDestroyed : 0) | (m.hitOwed != 0 ? kBuildHitFlagOwed : 0));
             std::memcpy(h, &m.hitAfter, 4);
         }
+        else { *h++ = (char)(signed char)m.hitDoor; *h++ = (char)m.hitRepair; }   /* the door and the repair word */
         return true;
     }
     if (m.kind == kBuildDismantleAsk)   /* T-805: kind + key + verdict */
@@ -480,7 +489,12 @@ inline int DecodeBuildLayout(const char* p, size_t size, BuildMsg* out, int owne
             std::memcpy(&m.hitAfter, p + off, 4); off += 4;
             m.hitDrop = f1; m.needed = f2;
         }
-        else { m.hitCut = f1; m.hitBlunt = f2; }
+        else
+        {   /* an ask or an answer: the door and the repair word follow the verdict */
+            if (size - off < 2) return kBuildDecodeTooShort;
+            m.hitDoor = (int)(signed char)p[off]; m.hitRepair = (unsigned char)p[off + 1]; off += 2;
+            m.hitCut = f1; m.hitBlunt = f2;
+        }
         if (off != size || !BuildEncodable(m)) return kBuildDecodeBadValue;
         if (out) *out = m;
         return kBuildDecodeOk;
@@ -731,6 +745,35 @@ inline int BuildWallHitRoute(int wall, int playerWall, int othersKnown, int dama
     if (wall == 0 || replay != 0 || playerWall == 0 || othersKnown == 0 || damageRead == 0) return kBuildHitRouteEngine;
     return kBuildHitRouteQueue;
 }
+/* A melee hit on a door (DoorStuff's 0x29D650, hooked): door = the target is a door its parent piece lists, at index (its place in that
+   list); playerPiece = a player owns the parent piece (this game's player faction or a stand-in); othersKnown, damageRead and replay as
+   for a wall. A player piece's door hit is not run where it lands: it is queued (kBuildHitRouteQueue) and the main thread asks who
+   writes the piece's record. Any other door, a door past kBuildHitMaxDoor, a lone game, the mod's replay and an unread damage struct
+   take the engine's hit. */
+inline int BuildDoorHitRoute(int door, int index, int playerPiece, int othersKnown, int damageRead, int replay)
+{
+    if (door == 0 || index < 0 || index > kBuildHitMaxDoor || replay != 0 || playerPiece == 0 || othersKnown == 0 || damageRead == 0) return kBuildHitRouteEngine;
+    return kBuildHitRouteQueue;
+}
+/* BuildRepairSumDue: a repair's gains on a door another game writes are summed and asked of that writer at most once every gapMs.
+   gain (0 for a look with no new gain; not a number, below 0 or over kBuildHitMax ignored) is added to *sum. 1 = an ask is due now:
+   *out = the summed gain (at most kBuildHitMax - the rest stays in *sum for the next ask), *lastAt = now, *haveLast = 1. The first
+   ask of a door is due at once. */
+inline int BuildRepairSumDue(float* sum, unsigned int* lastAt, int* haveLast, float gain, unsigned int now, unsigned int gapMs, float* out)
+{
+    if (sum == 0 || lastAt == 0 || haveLast == 0 || out == 0) return 0;
+    if (gain > 0.0f && gain <= kBuildHitMax) *sum += gain;
+    if (!(*sum > 0.0f)) { *sum = 0.0f; return 0; }
+    if (*haveLast != 0 && (unsigned int)(now - *lastAt) < gapMs) return 0;
+    float send = *sum;
+    if (send > kBuildHitMax) send = kBuildHitMax;
+    *out = send;
+    *sum -= send;
+    if (!(*sum > 0.0f)) *sum = 0.0f;
+    *lastAt = now; *haveLast = 1;
+    return 1;
+}
+const unsigned int kBuildDoorRepairGapMs = 250u;   /* a door's repair asks: at most one per this many ms */
 /* The game a HIT ask reached: dup = that asker's seq was replayed here already (answered again, not hit again); held = the piece has a
    live registry row here (this game's own, or a copy); loaded = it is loaded here under its key and owned as its row says; destroyed = it
    is a ruin; writer = this game writes the wall now (the machines' writer ask). kBuildHitApplied on a new seq = the hit is replayed
@@ -2935,6 +2978,157 @@ inline long long BuildDeadSetStep(int* had, std::string* keptSig, unsigned int* 
     if (*had != 0 && *keptSig == sig) return (long long)(unsigned int)(now - *keptAt);
     *had = 1; *keptSig = sig; *keptAt = now;
     return -1;
+}
+
+/* T-988 (owner decision 1099, 2026-10-25; fold 1): THE PIECE SELF-CHECK'S RULE - does a FINISHED player wall, gate or building have a
+   physics body at all? Read from the piece by build.cpp (PcCheckPiece) with plain reads of the game's own records only; decided here
+   from plain values.
+   The physics: building +0x228 -> its physics list (SimplePhysXEntity count +0x20, array +0x28, as 0x5594A0 reads them); each
+   entity's NxActor count +0x58 and array +0x60 (0x4CD3A0) - the reads probe P168 made in runs T1494-T1498 (an actor pointer changed
+   across a reload in T1495). A body = a non-null actor pointer in that array; the actor itself is never read or called.
+   Fold 1 (review 'T-988 SELF-CHECK REVIEW' HIGH): the check no longer calls into PhysXCore64. No concrete actor vtable is Confirmed,
+   and the engine deletes physics objects on its physics thread while the check reads on the main thread: a dying actor carries an
+   abstract base vtable whose slots are _purecall, an abort no guard catches. So the check can NO LONGER SEE an actor's shapes: an
+   actor with no shape, and a finished piece whose every shape is still in the unfinished-piece groups 23-26 (0x55EC50; 05-findings
+   'T-988 PHYSICS-GROUP READ'), both read as healthy here. A piece whose record's path mode is 0 (IGNORE) is never in the walk map by
+   design and is not suspect. */
+const int kPieceCheckFault = -1, kPieceCheckSkip = 0, kPieceCheckHealthy = 1, kPieceCheckNoBody = 2;
+struct PieceCheckIn
+{
+    int stateOk, complete, dismantled, destroyed;   /* the piece's build state (stateOk 0 = unreadable) */
+    int pathModeOk, pathMode;                       /* 1 the record's "path mode" was read, 0 the record has none, -1 unreadable,
+                                                       kPcPathModeOverLimit (fold 2) its fields ran past kPcFieldWalkMax */
+    int physOk;                                     /* 1 the physics list was read, 0 the piece has no physics list, -1 a read faulted */
+    int entities, bodies;                           /* the list's entities; the non-null actors they list */
+    PieceCheckIn() : stateOk(0), complete(0), dismantled(0), destroyed(0), pathModeOk(0), pathMode(0), physOk(0), entities(0), bodies(0) {}
+};
+/* kPieceCheckSkip not finished (or dismantled, or a ruin) - not checked; kPieceCheckFault a read failed or a count cannot be (no
+   verdict); kPieceCheckHealthy; kPieceCheckNoBody no physics list, no entity, or no actor in any entity */
+/* Fold 2 (re-check LOW): the record's "path mode" is found by walking its int fields (GameData +0x178, a hash map) with a count limit,
+   so a corrupt map (a node chain that loops back) cannot hang the main thread. kPcFieldWalkMax = 4096: far above the few dozen int
+   fields a building record carries, and 4096 short string compares cost microseconds even at kPcPiecesPerTick checks per tick. A walk
+   that reaches the limit is kPcPathModeOverLimit, and the piece gets no verdict (kPieceCheckFault, counted in `faults`) */
+const int kPcPathModeOverLimit = -2;
+const size_t kPcFieldWalkMax = 4096;
+/* 1 found (*v), 0 not among the fields, kPcPathModeOverLimit more than maxFields fields walked. `It` walks (name, int) pairs */
+template <class It> int PieceCheckFindPathMode(It it, It end, size_t maxFields, int* v)
+{
+    size_t n = 0;
+    for (; it != end; ++it)
+    {
+        if (++n > maxFields) return kPcPathModeOverLimit;
+        if (it->first.size() == 9 && std::memcmp(it->first.c_str(), "path mode", 9) == 0) { *v = it->second; return 1; }
+    }
+    return 0;
+}
+inline int PieceCheckVerdict(const PieceCheckIn& x)
+{
+    if (x.stateOk == 0) return kPieceCheckFault;
+    if (x.complete == 0 || x.dismantled != 0 || x.destroyed != 0) return kPieceCheckSkip;
+    if (x.pathModeOk == kPcPathModeOverLimit) return kPieceCheckFault;   /* fold 2: a record whose fields could not all be walked */
+    if (x.pathModeOk == 1 && x.pathMode == 0) return kPieceCheckHealthy;   /* IGNORE: never in the walk map */
+    if (x.physOk < 0) return kPieceCheckFault;
+    if (x.physOk == 0) return kPieceCheckNoBody;
+    if (x.entities < 0 || x.bodies < 0) return kPieceCheckFault;   /* counts that cannot be */
+    if (x.bodies == 0) return kPieceCheckNoBody;
+    return kPieceCheckHealthy;
+}
+/* Fold 1 (review MED): the piece kinds the check judges. Read from the game's own type of the live object - the RTTI class of its
+   vtable (build.cpp PcKindOf, as BdIsWall reads it) - and its layout-furniture link (Building +0x238 isFurnitureOf, kBFurnitureOf).
+   The record's itemType (GameData +0x50) is BUILDING for every piece, so it cannot tell furniture apart. Exactly WallBuilding is a
+   wall, DoorStuff / GatewayBuilding a gate, Building a building; anything else (UseableStuff and every class under it: storage,
+   beds, crafting, turrets, lights; an unreadable class) and any layout furniture is another kind: counted apart, never a SUSPECT line */
+const int kPcKindOther = 0, kPcKindWall = 1, kPcKindGate = 2, kPcKindBuilding = 3;
+/* Fold 2 (re-check MED): the furniture PieceCheckKindOf takes is what the mod's own furniture tests name so - the live object's layout-
+   furniture link (+0x238 kBFurnitureOf) OR its interior-object flag (+0xF8 kBInteriorObj, Building::isAnInteriorObject), as the
+   setFaction hook's queue test reads them (build.cpp detour_setfaction: `BdPtrAt(b, kBFurnitureOf) != 0 || BdByteAtOr0(b,
+   kBInteriorObj) != 0`), OR a registry row with a host, as the tombstone note reads it (build.cpp BdTombNote: `!r.hostKey.empty() ||
+   r.hostForm != 0`). Furniture placed with only isIndoorsOf (no +0x238 link) is still furniture: never judged */
+inline int PieceCheckFurniture(int furnitureLink, int interiorObject, const std::string& rowHostKey, int rowHostForm)
+{
+    return (furnitureLink != 0 || interiorObject != 0 || !rowHostKey.empty() || rowHostForm != 0) ? 1 : 0;
+}
+inline int PieceCheckKindOf(const char* cls, int layoutFurniture)
+{
+    if (layoutFurniture != 0 || cls == 0) return kPcKindOther;
+    if (std::strcmp(cls, ".?AVWallBuilding@@") == 0) return kPcKindWall;
+    if (std::strcmp(cls, ".?AVDoorStuff@@") == 0 || std::strcmp(cls, ".?AVGatewayBuilding@@") == 0) return kPcKindGate;
+    if (std::strcmp(cls, ".?AVBuilding@@") == 0) return kPcKindBuilding;
+    return kPcKindOther;
+}
+inline const char* PieceCheckKindWord(int k)
+{
+    switch (k)
+    {
+    case kPcKindWall: return "wall";
+    case kPcKindGate: return "gate";
+    case kPcKindBuilding: return "building";
+    default: return "other";
+    }
+}
+/* Fold 1 (review MED): a piece found with no body is checked again later - a wall's physics was first seen ~66 s after its area
+   loaded (T-988 PHYSICS-GROUP READ E4) - and logs SUSPECT only when it still has none at its last re-check. `tries` = the re-checks
+   already made. Done for any other verdict */
+const int kPcNextDone = 0, kPcNextRecheck = 1, kPcNextSuspect = 2;
+inline int PieceCheckNext(int verdict, int tries, int maxRechecks)
+{
+    if (verdict != kPieceCheckNoBody) return kPcNextDone;
+    return (tries < maxRechecks) ? kPcNextRecheck : kPcNextSuspect;
+}
+/* Fold 1: the waiting checks - one per key, at most `cap`; TakeDue hands out at most `max` whose time came (the per-tick cursor), the
+   oldest first. Times are a wrapping millisecond clock (GetTickCount) */
+struct PieceCheckDue { std::string key; unsigned int due; int road; int tries; };
+struct PieceCheckQueue
+{
+    std::vector<PieceCheckDue> q;
+    std::set<std::string> keys;
+    size_t cap;
+    explicit PieceCheckQueue(size_t c) : cap(c) {}
+    /* 1 queued, 0 already waiting (it keeps its first time and road) or no key, -1 the queue is full (not queued) */
+    int Push(const std::string& key, unsigned int due, int road, int tries)
+    {
+        if (key.empty() || keys.count(key) != 0) return 0;
+        if (q.size() >= cap) return -1;
+        PieceCheckDue d;
+        d.key = key; d.due = due; d.road = road; d.tries = tries;
+        q.push_back(d);
+        keys.insert(key);
+        return 1;
+    }
+    int Waiting(const std::string& key) const { return keys.count(key) != 0 ? 1 : 0; }
+    size_t TakeDue(unsigned int now, int max, std::vector<PieceCheckDue>* out)
+    {
+        out->clear();
+        for (size_t i = 0; i < q.size() && (int)out->size() < max; )
+        {
+            if ((int)(now - q[i].due) < 0) { ++i; continue; }
+            out->push_back(q[i]);
+            keys.erase(q[i].key);
+            q.erase(q.begin() + (std::ptrdiff_t)i);
+        }
+        return out->size();
+    }
+    void Clear() { q.clear(); keys.clear(); }
+};
+/* how the piece came to be finished on this game, as the SUSPECT line names it */
+const int kPcRoadPlaced = 1, kPcRoadLeverPlace = 2, kPcRoadBuilt = 3, kPcRoadLeverProgress = 4, kPcRoadCopyMade = 5, kPcRoadCopyAdopted = 6,
+          kPcRoadRestored = 7, kPcRoadOwnerState = 8, kPcRoadHelp = 9, kPcRoadAreaLoad = 10;
+inline const char* PieceCheckRoadWord(int road)
+{
+    switch (road)
+    {
+    case kPcRoadPlaced: return "placed";
+    case kPcRoadLeverPlace: return "leverPlace";
+    case kPcRoadBuilt: return "built";
+    case kPcRoadLeverProgress: return "leverProgress";
+    case kPcRoadCopyMade: return "copyMade";
+    case kPcRoadCopyAdopted: return "copyAdopted";
+    case kPcRoadRestored: return "restored";
+    case kPcRoadOwnerState: return "ownerState";
+    case kPcRoadHelp: return "help";
+    case kPcRoadAreaLoad: return "areaLoad";
+    default: return "?";
+    }
 }
 
 } // namespace coopbuild

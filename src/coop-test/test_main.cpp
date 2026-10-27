@@ -45,6 +45,7 @@
 #include "joblever.h"     /* P17 / P43: the jobtest, cagetest and `boxdigest ... players` argument shapes */
 #include "panelfit.h"  /* P8i-b: the panel's size refusal and its give-up rule, as pure arithmetic */
 #include "../common/hbmath.h"   /* E47-S2: the world-group heartbeat's cadence arithmetic - the same header the plugin compiles */
+#include "../common/squadevent.h"   /* T-1084: a world squad's events mark its record due on the heartbeat's early road - the same header the plugin compiles */
 #include "panelstatus.h" /* U2: every sentence the MULTIPLAYER panel's status area can say */
 #include "doorsync.h"  /* P8n: the door road's last-actor rule, terminal-state test and churn give-up */
 #include "retirewithdraw.h"   /* P8m (H-ghost): the pending-withdraw set as pure transitions */
@@ -130,6 +131,7 @@
 #include "placeinput.h"  /* a placement input height = live y less the ground height */
 #include "recname.h"     /* a record's data file name: the world server's folder and a game's mirror */
 #include "mirrorkeep.h"  /* T-985 C1: the kept mirror folder and the kept record table */
+#include "areafile.h"    /* T-985: this game's area file - where its people are, kept beside the record table */
 #include "farmwire.h"    /* par16 */
 #include "powerwire.h"   /* P47 */
 #include "bountywire.h"   /* crime5: a character's bounties between its owner and its copies */
@@ -171,6 +173,7 @@
 #include "walkdrop.h"     /* T-609 part 2 (H4): a dismantled building leaves the memoised building list */
 #include "holdwire.h"     /* P105 build 2: HOLD / LAND - the trailers, the absorb rule, where a LAND goes, the answers */
 #include "ownpick.h"      /* P105: an own pickup out of a container this game writes - its removal published at once */
+#include "rcgive.h"       /* T-1079: a give made without the cursor - the drain's pairing by record and units */
 #include "showmove.h"     /* T-164 non-shop road: the show-at-once decisions */
 #include "ownerwire.h"    /* inv6: the stolen mark as an identity - the OWN1 block, the journal b2 fields, the D5-2 choice */
 #include "gearwire.h"     /* an item's uniform and crafter - the GEM1 block, the GEML tail, the journal b3 fields */
@@ -186,6 +189,7 @@
 #include "humantest.h"    /* T-293: the human class rule */
 #include "orphanpurge.h"  /* orphan1: the leaf gate's unlinked arm and the orphan cleanup's steps */
 #include "dirlevels.h"    /* tickwait: EnsureDir's folder levels */
+#include "arearec.h" /* T-1084 step 3: the area-recorded marks (R5), the unrecorded-wake refusal (R6), the authority's build arm */
 #include "squadwriter.h" /* T-1 B1: one writer per NPC squad - follow-leader, the receiver's squad-position take, copy-squad keep-awake */
 #include "squadlead.h"   /* T-1 B1 restructure: MSG_SQUAD_LEAD wire and the book of the other game's announcements */
 #include "removalreason.h"   /* M7a3: the engine's removal reason - an unload is never sent as a death */
@@ -195,6 +199,7 @@
 #include "keeperaim.h"   /* lev343-tests (owner 343 b): where `buytest keeper` aims */
 #include "townprices.h"   /* T-619: the host's town price tables, the joiner's choice, the holder's price-leg test */
 #include "shopwire.h"   /* T-164 B4-4 intercept: the gate, amount/price, reservation/escrow, holder verdicts, the shop blocks */   /* T-164 B4-4: shop recognition by the trader's home pieces, the piece by item record, the keeper's pot */
+#include "shopcancel.h"   /* the holder's steps on a home shop trade's cancel and settle-only request, over a copy of the record */
 #include "wanderrestock.h"   /* T-1 B2 (owner 109): who restocks a wandering trader */
 #include "reqserial.h"   /* T-336: the request counter's random base per launch */
 #include "celldrift.h"   /* T-172 tinc: the copy's cell-drift repair and the leftover test */
@@ -254,11 +259,19 @@ int  g_tests = 0;
 int  g_failed = 0;
 const char* g_name = "";
 int  g_thisFailed = 0;
+int  g_skipped = 0;
+int  g_thisSkipped = 0;
 
 void Fail(const std::string& what)
 {
     std::printf("FAIL %s: %s\n", g_name, what.c_str());
     g_thisFailed = 1;
+}
+/* a test that cannot run here (its evidence files are missing) says so instead of passing */
+void Skip(const std::string& why)
+{
+    std::printf("SKIPPED %s: %s\n", g_name, why.c_str());
+    g_thisSkipped = 1;
 }
 std::string D(double v)   { char b[64]; std::sprintf(b, "%.9g", v); return b; }
 std::string I(int v)      { char b[32]; std::sprintf(b, "%d", v); return b; }
@@ -7942,13 +7955,13 @@ void t_quality1_garment_details_block()
 void t_bag23_path_block()
 {
     coopbag::BagPath p;
-    p.has = 1; p.section = "backpack_attach"; p.x = 1; p.y = 2; p.sid = "123-gamedata.base";
+    p.has = 1; p.section = "backpack_attach"; p.x = 1; p.y = 2; p.sid = "123-gamedata.base"; p.packSid = "456-gamedata.base";
     std::vector<char> b;
     b.push_back('x');
     if (!coopbag::EncodeBagPath(&b, p)) { Fail("a path did not encode"); return; }
     coopbag::BagPath o; size_t end = 0;
     if (coopbag::DecodeBagPath(&b[0], b.size(), 1, &o, &end) != coopbag::kBagOk || end != b.size() || o.has != 1
-        || o.section != p.section || o.x != 1 || o.y != 2 || o.sid != p.sid) Fail("the path did not round-trip");
+        || o.section != p.section || o.x != 1 || o.y != 2 || o.sid != p.sid || o.packSid != p.packSid) Fail("the path did not round-trip");
     if (!coopbag::BagPathAt(&b[0], b.size(), 1) || coopbag::BagPathAt(&b[0], b.size(), 0)) Fail("the marker test is wrong");
     for (size_t cut = 1; cut < b.size(); ++cut)
     {
@@ -11399,6 +11412,177 @@ void t_copy3_animal_route()
     if (coopkeep::KitPlacement(0, coopkeep::KitEngineRouteResult(2, 3)) != coopkeep::kKitPlacedBySection) Fail("an engine-route add counts as placed by section");
 }
 
+/* T-1076 (owner decision 1076 c): ring 1 from ANY of this game's player characters; a party's ring 1 is judged as the followed one's */
+void t_t1076_ring1_party()
+{
+    std::vector<unsigned char> g(loadedzones::kGrid * loadedzones::kGrid, 0);
+    g[35 * loadedzones::kGrid + 18] = 1;   /* the report's shape: a second party at 35,18 ('p'), the followed character at 19,13 */
+    int po = -1;
+    if (loadedzones::Ring1Of(19, 13, &g[0], 35, 19, &po) != 1 || po != 1) Fail("ring1 from a second party, party-only");
+    if (loadedzones::Ring1Grants(1, 0, 0) != 1) Fail("a party-only ring 1 with nobody else beside it grants");
+    if (loadedzones::Ring1Of(19, 13, &g[0], 40, 40, &po) != 0 || po != 0) Fail("ring1 0 with no party near");
+    if (loadedzones::Ring1Of(19, 13, &g[0], 20, 14, &po) != 1 || po != 0) Fail("the followed character's ring 1 is not party-only");
+    std::vector<unsigned char> e(loadedzones::kGrid * loadedzones::kGrid, 0);
+    if (loadedzones::Ring1Of(-1, -1, &e[0], 35, 19, &po) != 0 || po != 0) Fail("no followed character and no party: 0");
+    if (loadedzones::Ring1Of(-1, -1, 0, 35, 19, &po) != 0) Fail("no grid: 0");
+    e[0] = 1;
+    if (loadedzones::Ring1Of(-1, -1, &e[0], 0, 1, &po) != 1 || po != 1) Fail("edge of the grid: a party at 0,0 is beside 0,1");
+    if (loadedzones::Ring1Of(-1, -1, &e[0], -1, 0, &po) != 0) Fail("off the grid: 0");
+    if (loadedzones::Ring1Grants(1, 1, 1) != 1) Fail("ring 1 (a party's or the followed character's), another player beside it, lower slot: grants");
+    if (loadedzones::Ring1Grants(1, 1, 0) != 0) Fail("ring 1, another player beside it, higher slot: yields");
+    if (loadedzones::Ring1Grants(1, 0, 0) != 1) Fail("ring 1, nobody else beside it, higher slot: grants");
+    if (loadedzones::Ring1Grants(0, 0, 1) != 0) Fail("no ring 1: no grant");
+}
+/* the world server's area assignment with a slot holding two player-character areas: an area beside either goes to that slot */
+void t_t1077_area_assign_list()
+{
+    const int s[3] = { 0, 1, 1 }, x[3] = { 10, 40, 20 }, y[3] = { 10, 40, 21 };   /* slot 0 at 10,10; slot 1 followed at 40,40 and a party at 20,21 */
+    const double at[3] = { 99.0, 99.0, 99.0 };
+    int n = -1, why = -1;
+    if (coopstore::AreaAssignDecide(0, 20, 20, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 1 || why != coopstore::kAssignRing1) Fail("t1077: an area beside slot 1's second entry goes to slot 1");
+    if (coopstore::AreaAssignDecide(0, 41, 40, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || why != coopstore::kAssignRing1) Fail("t1077: and an area beside its first entry");
+    if (coopstore::AreaAssignDecide(1, 11, 11, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 0 || why != coopstore::kAssignRing1) Fail("t1077: beside slot 0 only -> slot 0");
+    if (coopstore::AreaAssignDecide(1, 30, 30, 3, s, x, y, at, 100.0, 5.0, &n, &why) != 1 || n != 0 || why != coopstore::kAssignReporter) Fail("t1077: beside nobody -> the reporter");
+    const int s2[3] = { 1, 0, 1 }, x2[3] = { 20, 21, 50 }, y2[3] = { 20, 20, 50 };
+    if (coopstore::AreaAssignDecide(1, 20, 21, 3, s2, x2, y2, at, 100.0, 5.0, &n, &why) != 0 || n != 2) Fail("t1077: slot 1's party and slot 0 both beside -> the lower slot 0");
+}
+/* AREAS' player-sector list (src/common/areadrop.h): {u16 m, m x (i32 x, i32 y)} after the loaded pairs */
+void t_t1077_player_sector_wire()
+{
+    std::vector<char> b(4, (char)0);   /* u32 n = 0 loaded pairs */
+    const int xy[4] = { 19, 13, 35, 18 };
+    coopdrop::AreasPutPlayerSectors(&b, xy, 2);
+    std::vector<int> got;
+    if (b.size() != 4 + 2 + 16 || coopdrop::AreasReadPlayerSectors((const unsigned char*)&b[0], b.size(), 4, &got) != 1
+        || got.size() != 4 || got[0] != 19 || got[1] != 13 || got[2] != 35 || got[3] != 18) Fail("t1077: two player sectors round trip, in order");
+    std::vector<char> e(4, (char)0);
+    coopdrop::AreasPutPlayerSectors(&e, 0, 0);
+    if (e.size() != 6 || coopdrop::AreasReadPlayerSectors((const unsigned char*)&e[0], e.size(), 4, &got) != 1 || !got.empty()) Fail("t1077: m = 0 round trips as an empty list");
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&e[0], 5, 4, &got) != 0) Fail("t1077: no count is malformed");
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&e[0], 4, 4, &got) != 0) Fail("t1077: a report that stops after the pairs is malformed");
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&b[0], b.size() - 1, 4, &got) != 0) Fail("t1077: fewer bytes than m pairs is malformed");
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&b[0], b.size(), b.size() + 1, &got) != 0) Fail("t1077: a start past the end is malformed");
+    std::vector<char> o(4, (char)0);
+    o.push_back((char)(coopdrop::kAreasPlayerSectorsMax + 1)); o.push_back((char)0); o.resize(o.size() + (size_t)(coopdrop::kAreasPlayerSectorsMax + 1) * 8, (char)0);
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&o[0], o.size(), 4, &got) != 0) Fail("t1077: m over the cap is refused");
+    std::vector<int> many; for (int i = 0; i < (coopdrop::kAreasPlayerSectorsMax + 4) * 2; ++i) many.push_back(i);
+    std::vector<char> c(4, (char)0);
+    coopdrop::AreasPutPlayerSectors(&c, &many[0], coopdrop::kAreasPlayerSectorsMax + 4);
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&c[0], c.size(), 4, &got) != 1 || (int)got.size() != coopdrop::kAreasPlayerSectorsMax * 2 || got[coopdrop::kAreasPlayerSectorsMax * 2 - 1] != coopdrop::kAreasPlayerSectorsMax * 2 - 1) Fail("t1077: the writer cuts the list at the cap");
+    const int odd[2] = { -2147483647 - 1, 70 };
+    std::vector<char> d(4, (char)0);
+    coopdrop::AreasPutPlayerSectors(&d, odd, 1);
+    if (coopdrop::AreasReadPlayerSectors((const unsigned char*)&d[0], d.size(), 4, &got) != 1 || got.size() != 2 || got[0] != (-2147483647 - 1) || got[1] != 70) Fail("t1077: off-grid values travel as sent (the world server skips them)");
+}
+/* the list a game sends (src/common/loadedzones.h PlayerSectorList) */
+void t_t1077_player_sector_list()
+{
+    std::vector<loadedzones::Area> a;
+    loadedzones::Area r;
+    r.x = 19; r.y = 13; r.why = loadedzones::kWhyPlayer; a.push_back(r);   /* the followed character's own area, marked too */
+    r.x = 35; r.y = 18; a.push_back(r);                                     /* a second party */
+    r.x = 36; r.y = 18; r.why = loadedzones::kWhyTown; a.push_back(r);      /* a town keep, no player */
+    r.x = 35; r.y = 18; r.why = loadedzones::kWhyPlayer | loadedzones::kWhyCamera; a.push_back(r);   /* the second party again */
+    std::vector<int> xy;
+    if (loadedzones::PlayerSectorList(19, 13, a, 1, 16, &xy) != 0 || xy.size() != 4 || xy[0] != 19 || xy[1] != 13 || xy[2] != 35 || xy[3] != 18) Fail("t1077: followed first, the second party once, a town keep left out");
+    if (loadedzones::PlayerSectorList(-2147483647 - 1, -2147483647 - 1, a, 1, 16, &xy) != 0 || xy.size() != 4 || xy[0] != 19 || xy[2] != 35) Fail("t1077: the followed area unknown, the marked areas still go");
+    if (loadedzones::PlayerSectorList(19, 13, a, 0, 16, &xy) != 0 || xy.size() != 2 || xy[0] != 19) Fail("t1077: no marks (probe fallback): the followed area alone");
+    if (loadedzones::PlayerSectorList(-1, -1, a, 0, 16, &xy) != 0 || !xy.empty()) Fail("t1077: nothing known: an empty list (sent as m = 0)");
+    std::vector<loadedzones::Area> big;
+    for (int i = 0; i < 20; ++i) { r.x = i; r.y = 40; r.why = loadedzones::kWhyPlayer; big.push_back(r); }
+    if (loadedzones::PlayerSectorList(50, 50, big, 1, 16, &xy) != 5 || xy.size() != 32 || xy[0] != 50 || xy[1] != 50 || xy[2] != 0) Fail("t1077: capped at 16, the followed area first, 5 left out");
+}
+/* the world server's OnAreas row update (src/common/areadrop.h AreasParse + AreasPlayerRowsReplace, through AreasPlayerRowsUpdate) */
+void t_t1077_onareas_rows()
+{
+    coopdrop::AreasPlayerRows rows;
+    std::vector<char> a;
+    a.push_back((char)1); a.push_back((char)0); a.push_back((char)0); a.push_back((char)0);   /* u32 n = 1 loaded pair */
+    a.resize(a.size() + 8, (char)0);                                                          /* the pair 0,0 */
+    const int xy[6] = { 19, 13, 70, 2, 35, 18 };   /* the second entry is off the grid */
+    coopdrop::AreasPutPlayerSectors(&a, xy, 3);
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&a[0], a.size(), 10.0) != 2) Fail("t1077 rows: the two on-grid entries are taken");
+    coopdrop::AreasPlayerRows::const_iterator r1 = rows.find(1);
+    if (r1 == rows.end() || r1->second.size() != 2 || r1->second[0].x != 19 || r1->second[0].y != 13 || r1->second[1].x != 35 || r1->second[1].y != 18
+        || r1->second[0].at != 10.0) Fail("t1077 rows: in order, the off-grid entry skipped, stamped with the arrival time");
+    std::vector<char> b(4, (char)0);
+    const int xy2[2] = { 40, 40 };
+    coopdrop::AreasPutPlayerSectors(&b, xy2, 1);
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 2, (const unsigned char*)&b[0], b.size(), 11.0) != 1) Fail("t1077 rows: slot 2's one entry");
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&b[0], b.size(), 12.0) != 1) Fail("t1077 rows: slot 1's new list");
+    r1 = rows.find(1);
+    if (r1 == rows.end() || r1->second.size() != 1 || r1->second[0].x != 40 || r1->second[0].at != 12.0) Fail("t1077 rows: a new list replaces the old one whole");
+    std::vector<char> c(4, (char)0); c[0] = (char)5;   /* 5 loaded pairs promised, none there */
+    coopdrop::AreasPutPlayerSectors(&c, xy2, 1);
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&a[0], a.size() - 1, 13.0) != -1) Fail("t1077 rows: a list short by a byte is malformed");
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&c[0], c.size(), 13.0) != -1) Fail("t1077 rows: loaded pairs past the end are malformed");
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, 0, 0, 13.0) != -1) Fail("t1077 rows: no payload is malformed");
+    r1 = rows.find(1);
+    if (r1 == rows.end() || r1->second.size() != 1 || r1->second[0].at != 12.0 || rows.size() != 2) Fail("t1077 rows: a malformed AREAS changes nothing");
+    unsigned pairs = 99; std::vector<int> got;
+    if (coopdrop::AreasParse((const unsigned char*)&a[0], a.size(), &pairs, &got) != coopdrop::kAreasOk || pairs != 1 || got.size() != 6) Fail("t1077 rows: AreasParse reads the pair count and the list");
+    if (coopdrop::AreasParse((const unsigned char*)&c[0], c.size(), &pairs, &got) != coopdrop::kAreasBadPairs) Fail("t1077 rows: AreasParse names the pairs fault");
+    if (coopdrop::AreasParse((const unsigned char*)&a[0], a.size() - 1, &pairs, &got) != coopdrop::kAreasBadList) Fail("t1077 rows: AreasParse names the list fault");
+    std::vector<char> e(4, (char)0);
+    coopdrop::AreasPutPlayerSectors(&e, 0, 0);
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 1, (const unsigned char*)&e[0], e.size(), 14.0) != 0 || rows.count(1) != 0 || rows.count(2) != 1) Fail("t1077 rows: m = 0 erases the slot's rows, another slot keeps its own");
+    const int off[2] = { -1, 64 };
+    std::vector<char> f(4, (char)0);
+    coopdrop::AreasPutPlayerSectors(&f, off, 1);
+    if (coopdrop::AreasPlayerRowsUpdate(&rows, 2, (const unsigned char*)&f[0], f.size(), 15.0) != 0 || rows.count(2) != 0) Fail("t1077 rows: a list with no on-grid entry erases too");
+}
+/* this game's own party halo is drawn from exactly the list it sends (src/common/loadedzones.h PartyHaloFromList) */
+void t_t1077_party_halo_list()
+{
+    std::vector<loadedzones::Area> a;
+    loadedzones::Area r; r.x = 35; r.y = 18; r.why = loadedzones::kWhyPlayer; a.push_back(r);
+    std::vector<unsigned char> g(loadedzones::kGrid * loadedzones::kGrid, (unsigned char)7);
+    std::vector<int> xy; xy.push_back(19); xy.push_back(13); xy.push_back(35); xy.push_back(18);
+    loadedzones::PartyHaloFromList(xy, 1, 0, a, &g[0]);
+    int on = 0; for (size_t i = 0; i < g.size(); ++i) on += g[i] != 0 ? 1 : 0;
+    if (on != 2 || g[19 * loadedzones::kGrid + 13] != 1 || g[35 * loadedzones::kGrid + 18] != 1) Fail("t1077 halo: every entry sent and nothing else (the grid is cleared first)");
+    loadedzones::PartyHaloFromList(xy, 1, 1, a, &g[0]);
+    if (g[19 * loadedzones::kGrid + 13] != 0 || g[35 * loadedzones::kGrid + 18] != 1) Fail("t1077 halo: orphaned, the followed character's last area is left out, the other party kept");
+    r.x = 19; r.y = 13; a.push_back(r);
+    loadedzones::PartyHaloFromList(xy, 1, 1, a, &g[0]);
+    if (g[19 * loadedzones::kGrid + 13] != 1) Fail("t1077 halo: orphaned, a live mark on the followed area keeps it");
+    std::vector<int> mk; mk.push_back(35); mk.push_back(18);
+    loadedzones::PartyHaloFromList(mk, 0, 1, a, &g[0]);
+    if (g[35 * loadedzones::kGrid + 18] != 1) Fail("t1077 halo: no followed entry - the first mark is not left out");
+    std::vector<loadedzones::Area> big;
+    for (int i = 0; i < 20; ++i) { r.x = i; r.y = 40; r.why = loadedzones::kWhyPlayer; big.push_back(r); }
+    std::vector<int> cl;
+    loadedzones::PlayerSectorList(50, 50, big, 1, 16, &cl);
+    loadedzones::PartyHaloFromList(cl, 1, 0, big, &g[0]);
+    if (g[14 * loadedzones::kGrid + 40] != 1 || g[15 * loadedzones::kGrid + 40] != 0 || g[19 * loadedzones::kGrid + 40] != 0) Fail("t1077 halo: a marked area past the cap counts for nobody, this game included");
+}
+/* a slot with several player-sector rows is expected once (ReceiptExpectSlots), and "near any own row" (RosterHolderTick) */
+void t_t1077_receipt_and_roster_near()
+{
+    std::vector<int> out;
+    if (cooplo::SlotAddOnce(&out, 2) != 1 || cooplo::SlotAddOnce(&out, 2) != 0 || cooplo::SlotAddOnce(&out, 5) != 1) Fail("t1077: SlotAddOnce's answers");
+    if (out.size() != 2 || out[0] != 2 || out[1] != 5) Fail("t1077: a slot with two rows is expected once");
+    const int ox[2] = { 19, 35 }, oy[2] = { 13, 18 };
+    if (cooplo::NearAnyArea(ox, oy, 2, 37, 20, 2) != 1) Fail("t1077: within 2 of the second party");
+    if (cooplo::NearAnyArea(ox, oy, 2, 21, 15, 2) != 1) Fail("t1077: within 2 of the followed character");
+    if (cooplo::NearAnyArea(ox, oy, 2, 27, 15, 2) != 0) Fail("t1077: near neither");
+    if (cooplo::NearAnyArea(ox, oy, 0, 19, 13, 2) != 0) Fail("t1077: no own rows: near nothing");
+}
+/* T-1076: an area still loading is set aside as `loading`, not judged `nobody`; once loaded it is judged as before */
+void t_t1076_mid_load_defer()
+{
+    if (townreoffer::DeferCauseAt(1, 0, 0, 0) != townreoffer::kDefLoading) Fail("mid-load, nobody holds it: set aside as loading");
+    if (townreoffer::DeferCauseAt(1, 0, -2, 0) != townreoffer::kDefNobody) Fail("a frozen area (held -2) mid-load keeps its earlier label");
+    if (townreoffer::DeferCauseAt(1, 0, -1, 0) != townreoffer::kDefNobody) Fail("no map row (held -1, may 0) mid-load keeps its earlier label");
+    if (std::strcmp(townreoffer::DeferCauseName(townreoffer::kDefLoading), "loading") != 0) Fail("the cause word is loading");
+    if (townreoffer::DeferCauseAt(1, 0, 0, 1) != townreoffer::kDefNobody) Fail("loaded, nobody holds it: nobody, as before");
+    if (townreoffer::DeferCauseAt(1, 0, 1, 0) != townreoffer::kDefNone) Fail("another game holds it: an answer, mid-load or not");
+    if (townreoffer::DeferCauseAt(1, -1, -1, 0) != townreoffer::kDefNoMap) Fail("no fresh map stays no-map");
+    if (townreoffer::DeferCauseAt(1, 1, 0, 0) != townreoffer::kDefNone) Fail("may invent (ring 1) mid-load: an answer");
+    if (townreoffer::DeferCauseAt(0, 0, 0, 0) != townreoffer::kDefNoNotebook) Fail("no link stays no-notebook");
+    if (townreoffer::Decide(1, 0, 0, 0, 0, 0) != townreoffer::kReWait) Fail("the check-up keeps a mid-load item waiting, never drained");
+    if (townreoffer::Decide(1, 0, 0, 0, 1, 0) != townreoffer::kReGenerate) Fail("once loaded and this game's: generated");
+}
 /* T-392 (owner 335 a / 337 a): what the town gates set aside, and what the town's check-up does with it */
 void t_t392_defer_cause()
 {
@@ -12858,6 +13042,208 @@ struct Par13Send
         return true;
     }
 };
+/* T-988 (owner decision 1099; fold 1): the piece self-check's rule (coopbuild::PieceCheckVerdict), its kinds, its re-check, its queue
+   and per-tick cursor, and the plugin's wiring (no call into PhysXCore64) */
+std::string T313ReadFile(const char* path);
+void t_t988_piececheck()
+{
+    using namespace coopbuild;
+    /* the verdict: a body is a listed actor; the shapes are not read */
+    PieceCheckIn x;
+    x.stateOk = 1; x.complete = 1; x.pathModeOk = 1; x.pathMode = 2; x.physOk = 1; x.entities = 1; x.bodies = 1;
+    if (PieceCheckVerdict(x) != kPieceCheckHealthy) Fail("T-988: a finished piece with one body is not healthy");
+    PieceCheckIn z = x;
+    z.bodies = 0;
+    if (PieceCheckVerdict(z) != kPieceCheckNoBody) Fail("T-988: a finished piece whose entities list no actor is not noBody");
+    z.entities = 0;
+    if (PieceCheckVerdict(z) != kPieceCheckNoBody) Fail("T-988: a finished piece with an empty physics list is not noBody");
+    z.physOk = 0;
+    if (PieceCheckVerdict(z) != kPieceCheckNoBody) Fail("T-988: a finished piece with no physics list is not noBody");
+    z.physOk = -1;
+    if (PieceCheckVerdict(z) != kPieceCheckFault) Fail("T-988: a faulted physics read was not a fault");
+    z.pathModeOk = -1; z.physOk = 0;
+    if (PieceCheckVerdict(z) != kPieceCheckNoBody) Fail("T-988: an unread path mode hid a piece with no physics");
+    z.pathModeOk = 0;
+    if (PieceCheckVerdict(z) != kPieceCheckNoBody) Fail("T-988: a record with no path mode hid a piece with no physics");
+    PieceCheckIn ig = z;
+    ig.pathModeOk = 1; ig.pathMode = 0;
+    if (PieceCheckVerdict(ig) != kPieceCheckHealthy) Fail("T-988: a path mode 0 (IGNORE) piece was suspect");
+    ig.physOk = -1;
+    if (PieceCheckVerdict(ig) != kPieceCheckHealthy) Fail("T-988: a path mode 0 piece needed its physics read");
+    PieceCheckIn u = z;
+    u.physOk = 0; u.complete = 0;
+    if (PieceCheckVerdict(u) != kPieceCheckSkip) Fail("T-988: an unfinished piece was checked");
+    u = z; u.physOk = 0; u.destroyed = 1;
+    if (PieceCheckVerdict(u) != kPieceCheckSkip) Fail("T-988: a ruin was checked");
+    u = z; u.physOk = 0; u.dismantled = 1;
+    if (PieceCheckVerdict(u) != kPieceCheckSkip) Fail("T-988: a dismantled piece was checked");
+    u = x; u.stateOk = 0; u.complete = 0;
+    if (PieceCheckVerdict(u) != kPieceCheckFault) Fail("T-988: an unreadable build state was not a fault");
+    u = x; u.bodies = -1;
+    if (PieceCheckVerdict(u) != kPieceCheckFault) Fail("T-988: a negative body count gave a verdict");
+    u = x; u.entities = -1;
+    if (PieceCheckVerdict(u) != kPieceCheckFault) Fail("T-988: a negative entity count gave a verdict");
+    PieceCheckIn d;
+    if (PieceCheckVerdict(d) != kPieceCheckFault) Fail("T-988: an all-zero input (nothing read) gave a verdict");
+    if (std::strcmp(PieceCheckRoadWord(kPcRoadBuilt), "built") != 0 || std::strcmp(PieceCheckRoadWord(kPcRoadAreaLoad), "areaLoad") != 0
+        || std::strcmp(PieceCheckRoadWord(kPcRoadOwnerState), "ownerState") != 0 || std::strcmp(PieceCheckRoadWord(0), "?") != 0
+        || std::strcmp(PieceCheckRoadWord(99), "?") != 0) Fail("T-988: a road word");
+    for (int r = kPcRoadPlaced; r <= kPcRoadAreaLoad; ++r) if (std::strcmp(PieceCheckRoadWord(r), "?") == 0) Fail("T-988: a road has no word");
+
+    /* fold 1, fix 2: only a wall, a gate or a building is judged; furniture and every other kind is counted apart */
+    if (PieceCheckKindOf(".?AVWallBuilding@@", 0) != kPcKindWall || PieceCheckKindOf(".?AVDoorStuff@@", 0) != kPcKindGate
+        || PieceCheckKindOf(".?AVGatewayBuilding@@", 0) != kPcKindGate || PieceCheckKindOf(".?AVBuilding@@", 0) != kPcKindBuilding)
+        Fail("T-988 fold 1: a wall, gate or building class was not judged as one");
+    const char* const others[] = { ".?AVUseableStuff@@", ".?AVStorageBuilding@@", ".?AVCraftingBuilding@@", ".?AVTurretBuilding@@",
+                                   ".?AVLightBuilding@@", ".?AVProductionBuilding@@", "", ".?AVWallBuilding" };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); ++i)
+        if (PieceCheckKindOf(others[i], 0) != kPcKindOther) Fail(std::string("T-988 fold 1: class '") + others[i] + "' was judged as a wall / gate / building");
+    if (PieceCheckKindOf(0, 0) != kPcKindOther) Fail("T-988 fold 1: an unreadable class was judged");
+    if (PieceCheckKindOf(".?AVWallBuilding@@", 1) != kPcKindOther || PieceCheckKindOf(".?AVBuilding@@", 1) != kPcKindOther)
+        Fail("T-988 fold 1: layout furniture was judged as a wall / building");
+    if (std::strcmp(PieceCheckKindWord(kPcKindWall), "wall") != 0 || std::strcmp(PieceCheckKindWord(kPcKindGate), "gate") != 0
+        || std::strcmp(PieceCheckKindWord(kPcKindBuilding), "building") != 0 || std::strcmp(PieceCheckKindWord(kPcKindOther), "other") != 0)
+        Fail("T-988 fold 1: a kind word");
+
+    /* fold 2, fix 1: furniture is the +0x238 link OR the interior-object flag OR a registry row with a host - never judged */
+    if (PieceCheckFurniture(0, 0, "", 0) != 0) Fail("T-988 fold 2: a free-standing piece was taken for furniture");
+    if (PieceCheckFurniture(1, 0, "", 0) != 1) Fail("T-988 fold 2: a piece with the layout-furniture link is not furniture");
+    if (PieceCheckFurniture(0, 1, "", 0) != 1) Fail("T-988 fold 2: an interior object (no +0x238 link) is not furniture");
+    if (PieceCheckFurniture(0, 0, "host-key", 0) != 1) Fail("T-988 fold 2: a piece whose row has a host key is not furniture");
+    if (PieceCheckFurniture(0, 0, "", 2) != 1) Fail("T-988 fold 2: a piece whose row has a host form is not furniture");
+    if (PieceCheckKindOf(".?AVBuilding@@", PieceCheckFurniture(0, 1, "", 0)) != kPcKindOther
+        || PieceCheckKindOf(".?AVDoorStuff@@", PieceCheckFurniture(0, 1, "", 0)) != kPcKindOther
+        || PieceCheckKindOf(".?AVDoorStuff@@", PieceCheckFurniture(0, 0, "host-key", 0)) != kPcKindOther
+        || PieceCheckKindOf(".?AVBuilding@@", PieceCheckFurniture(0, 0, "", 1)) != kPcKindOther)
+        Fail("T-988 fold 2: indoor furniture with no +0x238 link (a Building / DoorStuff) was judged as a building / gate");
+    if (PieceCheckKindOf(".?AVBuilding@@", PieceCheckFurniture(0, 0, "", 0)) != kPcKindBuilding
+        || PieceCheckKindOf(".?AVDoorStuff@@", PieceCheckFurniture(0, 0, "", 0)) != kPcKindGate)
+        Fail("T-988 fold 2: a free-standing building / gate was no longer judged");
+
+    /* fold 2, fix 2: the path-mode walk over the record's fields stops at its limit and gives no verdict (a fault) */
+    {
+        std::map<std::string, int> f;
+        f["level"] = 3; f["path mode"] = 2; f["zz"] = 1;
+        int pmv = -9;
+        if (PieceCheckFindPathMode(f.begin(), f.end(), kPcFieldWalkMax, &pmv) != 1 || pmv != 2) Fail("T-988 fold 2: the path mode was not found");
+        f.erase("path mode");
+        if (PieceCheckFindPathMode(f.begin(), f.end(), kPcFieldWalkMax, &pmv) != 0) Fail("T-988 fold 2: a record with no path mode was not 0");
+        std::map<std::string, int> big;
+        for (size_t i = 0; i < kPcFieldWalkMax + 10; ++i) { char k[24]; std::sprintf(k, "f%05u", (unsigned)i); big[k] = (int)i; }
+        if (PieceCheckFindPathMode(big.begin(), big.end(), kPcFieldWalkMax, &pmv) != kPcPathModeOverLimit)
+            Fail("T-988 fold 2: a record with more fields than the limit was walked to its end");
+        std::map<std::string, int> exact;
+        for (size_t i = 0; i < kPcFieldWalkMax; ++i) { char k[24]; std::sprintf(k, "f%05u", (unsigned)i); exact[k] = (int)i; }
+        if (PieceCheckFindPathMode(exact.begin(), exact.end(), kPcFieldWalkMax, &pmv) != 0) Fail("T-988 fold 2: a record of exactly the limit was cut");
+        /* a node chain that loops back (never reaches its end): the walk stops at the limit */
+        struct Ring
+        {
+            const std::vector<std::pair<std::string, int> >* v;
+            size_t i;
+            const std::pair<std::string, int>* operator->() const { return &(*v)[i]; }
+            Ring& operator++() { i = (i + 1) % v->size(); return *this; }
+            bool operator!=(const Ring& o) const { return i != o.i; }
+        };
+        std::vector<std::pair<std::string, int> > ring;
+        ring.push_back(std::make_pair(std::string("a"), 1));
+        ring.push_back(std::make_pair(std::string("b"), 2));
+        Ring rb, re;
+        rb.v = &ring; rb.i = 0; re.v = &ring; re.i = ring.size();   /* the wrap never reaches index 2 */
+        if (PieceCheckFindPathMode(rb, re, kPcFieldWalkMax, &pmv) != kPcPathModeOverLimit) Fail("T-988 fold 2: a looping field chain was not stopped");
+        if (kPcFieldWalkMax < 1024) Fail("T-988 fold 2: the field-walk limit is near a real record's field count");
+        PieceCheckIn ol = x;
+        ol.pathModeOk = kPcPathModeOverLimit; ol.pathMode = 0;
+        if (PieceCheckVerdict(ol) != kPieceCheckFault) Fail("T-988 fold 2: a record walked to the limit gave a verdict (not counted in faults)");
+        ol.physOk = 0;
+        if (PieceCheckVerdict(ol) != kPieceCheckFault) Fail("T-988 fold 2: a record walked to the limit was judged (no body)");
+        ol.complete = 0;
+        if (PieceCheckVerdict(ol) != kPieceCheckSkip) Fail("T-988 fold 2: an unfinished piece was counted as a fault");
+    }
+
+    /* fold 1, fix 3: no body is checked again before it logs; only the last re-check logs SUSPECT */
+    if (PieceCheckNext(kPieceCheckNoBody, 0, 2) != kPcNextRecheck || PieceCheckNext(kPieceCheckNoBody, 1, 2) != kPcNextRecheck)
+        Fail("T-988 fold 1: a piece with no body logged before its re-checks");
+    if (PieceCheckNext(kPieceCheckNoBody, 2, 2) != kPcNextSuspect || PieceCheckNext(kPieceCheckNoBody, 5, 2) != kPcNextSuspect)
+        Fail("T-988 fold 1: a piece still with no body at its last re-check did not log");
+    if (PieceCheckNext(kPieceCheckHealthy, 0, 2) != kPcNextDone || PieceCheckNext(kPieceCheckHealthy, 2, 2) != kPcNextDone
+        || PieceCheckNext(kPieceCheckFault, 0, 2) != kPcNextDone || PieceCheckNext(kPieceCheckSkip, 1, 2) != kPcNextDone)
+        Fail("T-988 fold 1: a piece with a body (or no verdict) was re-checked or logged");
+    {   /* the re-check walk: no body at the first check and the first re-check, a body at the second - never logged */
+        int tries = 0, logged = 0, rechecks = 0;
+        const int verdicts[3] = { kPieceCheckNoBody, kPieceCheckNoBody, kPieceCheckHealthy };
+        for (int s = 0; s < 3; ++s)
+        {
+            const int nx = PieceCheckNext(verdicts[s], tries, 2);
+            if (nx == kPcNextRecheck) { ++rechecks; ++tries; }
+            else { if (nx == kPcNextSuspect) logged = 1; break; }
+        }
+        if (logged != 0 || rechecks != 2) Fail("T-988 fold 1: a body built late was logged, or not re-checked twice");
+    }
+
+    /* fold 1, fixes 3 + 4: the bounded queue and the per-tick cursor */
+    {
+        PieceCheckQueue q(20);
+        for (int i = 0; i < 20; ++i)
+        {
+            char k[16];
+            std::sprintf(k, "k%d", i);
+            if (q.Push(k, 100, kPcRoadAreaLoad, 0) != 1) Fail("T-988 fold 1: a key was not queued");
+        }
+        if (q.Push("k3", 50, kPcRoadBuilt, 0) != 0 || q.q.size() != 20) Fail("T-988 fold 1: a waiting key was queued twice");
+        if (q.Push("more", 100, kPcRoadBuilt, 0) != -1 || q.q.size() != 20 || q.Waiting("more") != 0) Fail("T-988 fold 1: the queue grew past its cap");
+        if (q.Push("", 100, kPcRoadBuilt, 0) != 0) Fail("T-988 fold 1: an empty key was queued");
+        std::vector<PieceCheckDue> out;
+        if (q.TakeDue(99, 8, &out) != 0 || q.q.size() != 20) Fail("T-988 fold 1: a check was taken before its time");
+        if (q.TakeDue(100, 8, &out) != 8 || q.q.size() != 12 || out[0].key != "k0" || out[7].key != "k7")
+            Fail("T-988 fold 1: the cursor did not take 8, the oldest first");
+        if (q.Waiting("k0") != 0 || q.Waiting("k8") != 1) Fail("T-988 fold 1: a taken key still waits, or a left one does not");
+        if (q.Push("k0", 90100, kPcRoadAreaLoad, 1) != 1) Fail("T-988 fold 1: a taken key could not be queued for its re-check");
+        if (q.TakeDue(200, 8, &out) != 8 || q.TakeDue(200, 8, &out) != 4 || q.q.size() != 1) Fail("T-988 fold 1: the cursor did not drain 8, 8, 4");
+        if (q.TakeDue(200, 8, &out) != 0) Fail("T-988 fold 1: a re-check was taken before its delay");
+        if (q.TakeDue(90100, 8, &out) != 1 || out[0].tries != 1 || out[0].road != kPcRoadAreaLoad) Fail("T-988 fold 1: the re-check lost its count or road");
+        q.Push("w", 0xFFFFFFF0u, kPcRoadBuilt, 0);
+        if (q.TakeDue(0xFFFFFFE0u, 8, &out) != 0 || q.TakeDue(0x10u, 8, &out) != 1) Fail("T-988 fold 1: the wrapping clock");
+        q.Push("c", 0, kPcRoadBuilt, 0);
+        q.Clear();
+        if (!q.q.empty() || q.Waiting("c") != 0) Fail("T-988 fold 1: Clear left a key");
+    }
+
+    /* fold 1, the plugin's wiring: no call into PhysXCore64, the kinds, the re-check and the cursor */
+    const std::string src = T313ReadFile("../coop-plugin/build.cpp");
+    if (src.empty()) { Fail("T-988 fold 1: could not read the plugin's build.cpp"); return; }
+    const size_t b0 = src.find("THE PIECE SELF-CHECK - READ ONLY");
+    const size_t b1 = (b0 != std::string::npos) ? src.find("std::string PcReportText()", b0) : std::string::npos;
+    if (b0 == std::string::npos || b1 == std::string::npos) { Fail("T-988 fold 1: the self-check block was not found"); return; }
+    const std::string blk = src.substr(b0, b1 - b0);
+    const char* const banned[] = { "GetModuleHandle", "PhysXCore64.dll", "Fn)(", "kPcVtNbShapes", "kPcVtShapes", "kPcVtGroup", "PcSlot(" };
+    for (size_t i = 0; i < sizeof(banned) / sizeof(banned[0]); ++i)
+        if (blk.find(banned[i]) != std::string::npos) Fail(std::string("T-988 fold 1: the self-check still calls into the physics library (") + banned[i] + ")");
+    if (blk.find("if (kind == coopbuild::kPcKindOther) { if (tries == 0) ++g_pcOther; return; }") == std::string::npos
+        || blk.find("const int kind = PcKindOf(b, r);") == std::string::npos
+        || blk.find("return coopbuild::PieceCheckKindOf(cls, furn);") == std::string::npos)
+        Fail("T-988 fold 1: another kind is not counted apart before the SUSPECT line");
+    /* fold 2, fix 1: the plugin reads the interior-object flag and the row's host, as its other furniture tests read them */
+    if (blk.find("coopbuild::PieceCheckFurniture(BdPtrAt(b, kBFurnitureOf) != 0 ? 1 : 0, BdByteAtOr0(b, kBInteriorObj) != 0 ? 1 : 0,") == std::string::npos
+        || blk.find("r.hostKey, r.hostForm);") == std::string::npos)
+        Fail("T-988 fold 2: the self-check does not read the interior-object flag and the registry row's host for furniture");
+    if (src.find("(BdPtrAt(b, kBFurnitureOf) != 0 || BdByteAtOr0(b, kBInteriorObj) != 0)") == std::string::npos
+        || src.find("ti.furn = (!r.hostKey.empty() || r.hostForm != 0) ? 1 : 0;") == std::string::npos)
+        Fail("T-988 fold 2: the furniture tests the self-check mirrors (detour_setfaction, BdTombNote) changed - re-mirror them");
+    /* fold 2, fix 2: the path-mode walk is bounded (no open walk over the record's fields left in the block) */
+    if (blk.find("return coopbuild::PieceCheckFindPathMode(m.begin(), m.end(), coopbuild::kPcFieldWalkMax, v);") == std::string::npos
+        || blk.find("it != m.end(); ++it)") != std::string::npos)
+        Fail("T-988 fold 2: the path-mode walk over the record's fields has no count limit");
+    if (blk.find("coopbuild::PieceCheckNext(v, tries, kPcRechecks)") == std::string::npos
+        || blk.find("g_pcDue.Push(key, (unsigned int)(::GetTickCount() + kPcRecheckMs), road, tries + 1)") == std::string::npos
+        || blk.find("const DWORD kPcRecheckMs = 90000;") == std::string::npos || blk.find("const int kPcRechecks = 2;") == std::string::npos)
+        Fail("T-988 fold 1: a piece with no body is not re-checked later");
+    if (blk.find("const int kPcPiecesPerTick = 8;") == std::string::npos
+        || blk.find("g_pcDue.TakeDue((unsigned int)now, kPcPiecesPerTick, &due);") == std::string::npos
+        || blk.find("g_pcDue.Push(it->first, (unsigned int)now, coopbuild::kPcRoadAreaLoad, 0)") == std::string::npos)
+        Fail("T-988 fold 1: the per-tick cursor is not wired (an area is still checked in one tick)");
+    const size_t rp = src.find("pieceCheck[checked,suspect,noShapes,excludedOnly,notCarved,faults,capped,other,rechecks,lateBody,dropped]", b1);
+    if (rp == std::string::npos || rp > b1 + 400) Fail("T-988 fold 1: the REPORT fields are not the old seven then the four new");
+}
 /* T-274: the per-zone scan's mark / clear / retry rule (coopbuild::BuildZoneScan*); T-274 fold: round-robin pick and the give-up */
 void t_t274_zonescan()
 {
@@ -21131,7 +21517,7 @@ void t_mmo8a2_world_scope()
 void t_t810_money()
 {
     namespace mw = moneyw;
-    if (mw::kProtocol != 108u || mw::kMsgSend != 73u || mw::kMsgSentOk != 74u || mw::kMsgDeliver != 75u || mw::kMsgApplied != 76u || mw::kMsgRefuse != 77u)
+    if (mw::kProtocol != 121u || mw::kMsgSend != 73u || mw::kMsgSentOk != 74u || mw::kMsgDeliver != 75u || mw::kMsgApplied != 76u || mw::kMsgRefuse != 77u)
         Fail("T-810: MONEY is not 73-77 of world-server protocol 101");
     if (mw::NextNumber(0, 10) != (10ULL << 16) || mw::NextNumber((10ULL << 16) + 5, 10) != (10ULL << 16) + 5 || mw::NextNumber(7, 0) != 7)
         Fail("T-810: a number is the larger of the next one and the clock's");
@@ -21879,18 +22265,21 @@ void t_mmo2_overlay_roster()
     fixed.push_back("c");   /* c is in another squad of the save: the record would double him */
     if (RosterResolve(&r, fixed, &rc) != 1 || r[0].apply || !r[0].duplicate || rc.duplicate != 1 || rc.conflict != 0) Fail("mmo2: a doubled person refuses (rosterDuplicate)");
     r[0].apply = 1; r[0].duplicate = 0; r[0].recChars.clear(); r[0].recChars.push_back("a");   /* b moved to a squad the save does not have (or died) */
-    if (RosterResolve(&r, none, &rc) != 1 || r[0].apply || !r[0].conflict || rc.conflict != 1) Fail("mmo2: a person in no squad keeps the save's version");
-    r[0].apply = 1; r[0].conflict = 0; r[0].recChars.push_back("b");
+    if (RosterResolve(&r, none, &rc) != 0 || !r[0].apply || r[0].conflict || rc.conflict != 0 || r[0].addBack.size() != 1 || r[0].addBack[0] != "b" || rc.addBack != 1)
+        Fail("mmo2 (T-1062): a person in no squad with no left note is copied back and the record applies");
+    r[0].recChars.push_back("b");
     fixed.clear(); fixed.push_back("b");   /* the save itself holds b twice */
-    if (RosterResolve(&r, fixed, &rc) != 1 || rc.duplicate != 1) Fail("mmo2: a person the save already doubles refuses");
+    if (RosterResolve(&r, fixed, &rc) != 0 || !r[0].apply || rc.duplicate != 0 || r[0].dupSave.size() != 1 || r[0].dupSave[0] != "b" || rc.dupSave != 1 || !r[0].addBack.empty())
+        Fail("mmo2 (T-1062): a person the save already doubles keeps the record's copy and the record applies");
     r[0].apply = 1; r[0].duplicate = 0; r[0].saveChars.clear();
     if (RosterResolve(&r, none, &rc) != 1 || r[0].apply || !r[0].empty || rc.empty != 1) Fail("mmo2: a squad whose save version has no character is refused");
     r.assign(2, RosterSquad());
     r[0].key = "X"; r[0].apply = 1; r[0].saveChars.push_back("a"); r[0].saveChars.push_back("b"); r[0].recChars.push_back("a");
     r[1].key = "Y"; r[1].apply = 1; r[1].saveChars.push_back("c"); r[1].recChars.push_back("c"); r[1].recChars.push_back("b");
     if (RosterResolve(&r, none, &rc) != 0 || !r[0].apply || !r[1].apply) Fail("mmo2: a move between two overlaid squads passes");
-    r[1].apply = 0;   /* Y not overlaid: b is in X's save only - X's record would lose b */
-    if (RosterResolve(&r, none, &rc) != 1 || r[0].apply || !r[0].conflict) Fail("mmo2: a squad not overlaid counts with its save version");
+    r[1].apply = 0;   /* Y not overlaid: b is in X's save only - X's record would lose b, so he is copied back into it (T-1062) */
+    if (RosterResolve(&r, none, &rc) != 0 || !r[0].apply || r[0].conflict || r[0].addBack.size() != 1 || r[0].addBack[0] != "b")
+        Fail("mmo2: a squad not overlaid counts with its save version (b copied back into X)");
     r.assign(2, RosterSquad());
     r[0].key = "X"; r[0].apply = 1; r[0].saveChars.push_back("a"); r[0].recChars.push_back("b");
     r[1].key = "Y"; r[1].apply = 1; r[1].saveChars.push_back("b"); r[1].recChars.push_back("a");
@@ -21898,7 +22287,16 @@ void t_mmo2_overlay_roster()
     r.assign(2, RosterSquad());
     r[0].key = "X"; r[0].apply = 1; r[0].saveChars.push_back("a"); r[0].recChars.push_back("q");
     r[1].key = "Y"; r[1].apply = 1; r[1].saveChars.push_back("q"); r[1].recChars.push_back("z");
-    if (RosterResolve(&r, none, &rc) != 2 || r[0].apply || r[1].apply) Fail("mmo2: one refusal at a time, to a fixed point");
+    if (RosterResolve(&r, none, &rc) != 0 || !r[0].apply || !r[1].apply || r[0].addBack.size() != 1 || r[0].addBack[0] != "a" || !r[1].addBack.empty())
+        Fail("mmo2 (T-1062): a lost person is copied back - nothing refused");
+    /* one refusal at a time, to a fixed point: X doubles d (in another squad of the save) and is refused; X then loads its save
+       version, which holds m, and Y's record (which took m) would double him - refused next */
+    r.assign(2, RosterSquad());
+    r[0].key = "X"; r[0].apply = 1; r[0].saveChars.push_back("a"); r[0].saveChars.push_back("m"); r[0].recChars.push_back("a"); r[0].recChars.push_back("d");
+    r[1].key = "Y"; r[1].apply = 1; r[1].saveChars.push_back("y"); r[1].recChars.push_back("y"); r[1].recChars.push_back("m");
+    fixed.clear(); fixed.push_back("d");
+    if (RosterResolve(&r, fixed, &rc) != 2 || r[0].apply || r[1].apply || !r[0].duplicate || !r[1].duplicate || rc.duplicate != 2)
+        Fail("mmo2: one refusal at a time, to a fixed point");
 }
 
 /* T-802: one character out of a squad file, and the roster check's moved-after-the-save outcome (src/common/ownrec.h
@@ -22037,7 +22435,7 @@ void t_t802_moved_after_save()
         for (size_t i = 0; i < r.size(); ++i) for (size_t k = 0; k < r[i].recChars.size(); ++k) ++n[r[i].recChars[k]];
         if (n.size() != 4 || n["a"] != 1 || n["r"] != 1 || n["q"] != 1 || n["e"] != 1) Fail("t802: nobody doubled, nobody lost");
     }
-    r[0].saveChars = T802V("a", "z");   /* X refused for its own reason (z lost): the stripped squad goes with it */
+    r[0].saveChars = T802V("a", "?X.platoon#1");   /* X refused for its own reason (a person with no hand lost - never copied back): the stripped squad goes with it */
     if (RosterResolve(&r, fixed, &rc) != 2 || r[0].apply || r[1].apply || rc.moved != 0 || rc.stripped != 0) Fail("t802: no strip stands without the record that took the person");
     /* a person truly in two candidates' records: no move, still refused */
     std::vector<RosterSquad> s2(2);
@@ -22130,6 +22528,300 @@ void t_t802_moved_after_save()
 
 /* T-802 fold 2: a strip only when the taking squad's record is loaded with the person and still holds him; a full pending list
    refuses the move (src/common/ownrec.h PendStripDecide, PendStripNewCount, PendStripFits, PendStripDropOne). */
+/* T-1062: the roster check settles per person (RosterResolve with left notes), a person copied back into a record's load copy
+   (GdcAddChar), and the left notes' lines (LeftNote*). */
+void t_t1062_settle_per_person()
+{
+    using namespace coopown;
+    RosterCounts rc;
+    std::map<std::string, int> left;
+    left["b"] = kLeftDied;
+    /* the player's report, case 1: b died just before the close - the record holds a, the save a and b */
+    std::vector<RosterSquad> r(1);
+    r[0].key = "X"; r[0].apply = 1; r[0].saveChars = T802V("a", "b"); r[0].recChars = T802V("a");
+    if (RosterResolve(&r, T802V("e"), &rc, &left) != 0 || !r[0].apply || r[0].leftOut != T802V("b") || r[0].leftWhy.size() != 1 || r[0].leftWhy[0] != kLeftDied
+        || !r[0].addBack.empty() || rc.leftOut != 1 || rc.addBack != 0 || rc.conflict != 0)
+        Fail("t1062: a death with a left note - the record applies and b stays out");
+    /* the same death never noted: b is copied back - nobody is deleted (decision 1091 a) */
+    if (RosterResolve(&r, T802V("e"), &rc) != 0 || !r[0].apply || r[0].addBack != T802V("b") || !r[0].leftOut.empty() || rc.addBack != 1)
+        Fail("t1062: a death without a note - the record applies with b copied back");
+    /* design 3.3: b moved to a squad made after the save, which this load cannot rebuild - copied back, never lost */
+    std::map<std::string, int> other;
+    other["z"] = kLeftDied;
+    if (RosterResolve(&r, T802V("e"), &rc, &other) != 0 || !r[0].apply || r[0].addBack != T802V("b"))
+        Fail("t1062: design 3.3 - a person moved to a squad the load cannot rebuild is copied back");
+    /* a person in another applied record follows that record: neither copied back nor left out by a note */
+    r.assign(2, RosterSquad());
+    r[0].key = "X"; r[0].apply = 1; r[0].saveChars = T802V("a", "b"); r[0].recChars = T802V("a");
+    r[1].key = "Y"; r[1].apply = 1; r[1].saveChars = T802V("y"); r[1].recChars = T802V("y", "b");
+    if (RosterResolve(&r, T802V(0), &rc, &left) != 0 || !r[0].apply || !r[1].apply || !r[0].addBack.empty() || !r[0].leftOut.empty())
+        Fail("t1062: a person in another applied record follows it");
+    /* case 2: the save holds b twice (X's save version and an unrecorded squad's file): the record's copy is kept, the other
+       copy is left where it is (a serial + type match is not proven the same person) */
+    r.assign(1, RosterSquad());
+    r[0].key = "X"; r[0].apply = 1; r[0].saveChars = T802V("a", "b"); r[0].recChars = T802V("a", "b");
+    if (RosterResolve(&r, T802V("b", "q"), &rc, &left) != 0 || !r[0].apply || r[0].dupSave != T802V("b") || rc.dupSave != 1 || rc.duplicate != 0)
+        Fail("t1062: a doubling the save holds - the record applies, nobody stripped");
+    /* a doubling the load would make (b joined X after the save and is still in another squad, no strip made) still refuses */
+    r[0].saveChars = T802V("a");
+    if (RosterResolve(&r, T802V("b", "q"), &rc, &left) != 1 || r[0].apply || !r[0].duplicate || rc.duplicate != 1)
+        Fail("t1062: a doubling the load would make still refuses (never more copies than the save alone)");
+    /* not settled - refuses as before: a lost person with no hand, and one whose copy-back could not be made */
+    r[0].apply = 1; r[0].duplicate = 0; r[0].saveChars = T802V("a", "?X.platoon#1"); r[0].recChars = T802V("a");
+    if (RosterResolve(&r, T802V(0), &rc) != 1 || r[0].apply || !r[0].conflict) Fail("t1062: a lost person with no hand refuses as before");
+    r[0].apply = 1; r[0].conflict = 0; r[0].saveChars = T802V("a", "b"); r[0].noAdd = T802V("b");
+    if (RosterResolve(&r, T802V(0), &rc) != 1 || r[0].apply || !r[0].conflict || !r[0].addBack.empty()) Fail("t1062: a copy-back that could not be made refuses as before");
+    /* the copy-back: A back into the record's copy without him, from the save's file */
+    const std::string A = HandId(11, 1), B = HandId(22, 1);
+    std::vector<char> two = T802Squad(true, true, -1, false, true), onlyB, back, out;
+    if (GdcStripChar(&two[0], two.size(), A, &onlyB) != kStripOk) Fail("t1062: setup - A strips from a squad of two");
+    else
+    {
+        if (GdcAddChar(&two[0], two.size(), &onlyB[0], onlyB.size(), A, &out) != kStripOk) Fail("t1062: A is copied back from the save's file");
+        else
+        {
+            GdcScanOut sc;
+            if (!GdcScan(&out[0], out.size(), "t", &sc) || sc.chars.size() != 2 || std::count(sc.chars.begin(), sc.chars.end(), A) != 1
+                || std::count(sc.chars.begin(), sc.chars.end(), B) != 1)
+                Fail("t1062: the copy holds A and B once each");
+            if (GdcStripChar(&out[0], out.size(), A, &back) != kStripOk || back != onlyB) Fail("t1062: A stripped again gives the record's copy back byte for byte");
+        }
+        out.clear();
+        if (GdcAddChar(&two[0], two.size(), &two[0], two.size(), A, &out) != kAddPresent || !out.empty()) Fail("t1062: a person already in the copy is refused");
+        if (GdcAddChar(&two[0], two.size(), &onlyB[0], onlyB.size(), HandId(99, 1), &out) != kStripNoChar) Fail("t1062: a person not in the save's file is refused");
+        if (GdcAddChar(&two[0], two.size(), &onlyB[0], onlyB.size(), "?X.platoon#0", &out) != kStripNoChar) Fail("t1062: a person with no hand is refused");
+        std::vector<char> extra = T802Squad(false, true, -1, false, true, 2);   /* one more field in the copy's squad record */
+        if (GdcAddChar(&two[0], two.size(), &extra[0], extra.size(), A, &out) != kStripLayout) Fail("t1062: a copy not in the verified layout is refused");
+        std::vector<char> rich = T802Squad(false, true, -1, false, true, 4), withMoney;   /* the record's copy carries the group's money */
+        int money = 0;
+        if (GdcAddChar(&two[0], two.size(), &rich[0], rich.size(), A, &withMoney) != kStripOk || RecordMoneyOf(&withMoney[0], withMoney.size(), &money) != kRecMoneyCarried
+            || money != 2500)
+            Fail("t1062: the copy-back keeps the record's money");
+        if (std::string(StripWhyName(kAddPresent)) != "already-present" || std::string(StripWhyName(kAddSidClash)) != "record-name-clash") Fail("t1062: refusal names");
+    }
+    /* the last member back into an empty copy */
+    std::vector<char> one = T802Squad(true, false, -1, false, true), none0, again;
+    if (GdcStripChar(&one[0], one.size(), A, &none0) != kStripOk || GdcAddChar(&one[0], one.size(), &none0[0], none0.size(), A, &again) != kStripOk)
+        Fail("t1062: the last member is copied back into an empty squad copy");
+    else
+    {
+        GdcScanOut sc;
+        if (!GdcScan(&again[0], again.size(), "t", &sc) || sc.chars != T802V(A.c_str())) Fail("t1062: the copy holds the last member alone");
+    }
+    /* the left notes' lines */
+    LeftNote e;
+    e.who = A; e.kind = kLeftDied; e.at = 1700000000;
+    std::string line;
+    if (!LeftNoteFormat(e, &line) || line != "pl1\t" + A + "\t1\t1700000000\n") Fail("t1062: a left note's line");
+    LeftNote g;
+    if (!LeftNoteParse(line, &g) || g.who != A || g.kind != kLeftDied || g.at != 1700000000) Fail("t1062: a left note's line reads back");
+    if (LeftNoteParse("pl1\tS=1;T=1\t7\t5", &g) || LeftNoteParse("ps1\tS=1;T=1\t1\t5", &g) || LeftNoteParse("pl1\t\t1\t5", &g) || LeftNoteParse("pl1\tS=1;T=1\t1", &g))
+        Fail("t1062: a bad note line is refused");
+    std::vector<LeftNote> v;
+    if (LeftNoteParseAll(line + "junk\n" + line, &v) != 1 || v.size() != 1) Fail("t1062: one note per person; a bad line is counted");
+    int capDropped = 0;
+    const int nAdd = (int)kLeftNoteHardCap + 4;
+    for (int i = 0; i < nAdd; ++i) { LeftNote n; n.who = HandId(i + 1000, 1); n.kind = kLeftDied; n.at = i; capDropped += LeftNoteAdd(&v, n); }
+    std::map<std::string, int> m;
+    LeftNoteMap(v, &m);
+    if (v.size() != kLeftNoteHardCap || capDropped != 5 || v.back().who != HandId(1000 + nAdd - 1, 1) || m.size() != kLeftNoteHardCap || m.count(A) != 0)
+        Fail("t1062: the safety cap keeps the newest notes and counts its drops");
+    std::vector<LeftNote> rt;
+    int rtCap = -1;
+    if (LeftNoteParseAll(LeftNoteText(v), &rt, &rtCap) != 0 || rt.size() != v.size() || rt.back().who != v.back().who || rtCap != 0) Fail("t1062: the notes' text reads back");
+    /* note writing (OwnLeftNoteDeath's steps): the file's text read, the death added, the text written - a second death of the
+       same person replaces his note */
+    {
+        std::vector<LeftNote> w;
+        LeftNote d1; d1.who = B; d1.kind = kLeftDied; d1.at = 500;
+        if (LeftNoteParseAll(std::string(), &w) != 0 || LeftNoteAdd(&w, d1) != 0) Fail("t1062 write: the first note into an empty file");
+        std::string text = LeftNoteText(w);
+        LeftNote d2 = d1; d2.at = 900;
+        if (LeftNoteParseAll(text, &w) != 0 || LeftNoteAdd(&w, d2) != 0) Fail("t1062 write: the second note");
+        text = LeftNoteText(w);
+        std::vector<LeftNote> r2;
+        if (LeftNoteParseAll(text, &r2) != 0 || r2.size() != 1 || r2[0].who != B || r2[0].at != 900) Fail("t1062 write: one note per person, the newer kept");
+    }
+    /* F1, the age rule: a note counts only for a save older than it (a death in the save's own second counts); unknown = all count */
+    {
+        std::vector<LeftNote> n1;
+        LeftNote d; d.who = "b"; d.kind = kLeftDied; d.at = 100;
+        n1.push_back(d);
+        if (!LeftNoteHonoured(d, 50) || !LeftNoteHonoured(d, 100) || LeftNoteHonoured(d, 101) || !LeftNoteHonoured(d, -1)) Fail("t1062 F1: a note counts for an older save only");
+        std::map<std::string, int> lm;
+        int stale = -1;
+        LeftNoteMap(n1, &lm, 200, &stale);
+        if (!lm.empty() || stale != 1) Fail("t1062 F1: a note older than the loaded save is stale");
+        std::vector<RosterSquad> q(1);
+        q[0].key = "X"; q[0].apply = 1; q[0].saveChars = T802V("a", "b"); q[0].recChars = T802V("a");
+        if (RosterResolve(&q, T802V(0), &rc, &lm) != 0 || q[0].addBack != T802V("b") || !q[0].leftOut.empty())
+            Fail("t1062 F1: a person whose note predates the save (brought back by an older save's load) is copied back, not kept out");
+        LeftNoteMap(n1, &lm, 50, &stale);
+        if (lm.size() != 1 || stale != 0 || RosterResolve(&q, T802V(0), &rc, &lm) != 0 || q[0].leftOut != T802V("b") || !q[0].addBack.empty())
+            Fail("t1062 F1: a note newer than the save keeps the dead out");
+    }
+    /* N3: a save of the store lands after a death and drops no note - an OLDER named save loaded next keeps the dead out (and the
+       fallen list's row held); the newer save, made after the death, finds the note older than it */
+    {
+        std::vector<LeftNote> p;
+        LeftNote d; d.who = HandId(7, 1); d.kind = kLeftDied; d.at = 100;
+        LeftNoteAdd(&p, d);
+        const std::string afterSave = LeftNoteText(p);   /* the file as it stands once a save at time 200 has landed */
+        std::vector<LeftNote> rd;
+        std::map<std::string, int> lm;
+        int stale = -1;
+        if (LeftNoteParseAll(afterSave, &rd) != 0 || rd.size() != 1) Fail("t1062 N3: the note is still in the file after a save landed");
+        LeftNoteMap(rd, &lm, 50, &stale);
+        std::vector<RosterSquad> q(1);
+        q[0].key = "X"; q[0].apply = 1; q[0].saveChars = T802V("a", d.who.c_str()); q[0].recChars = T802V("a");
+        if (lm.size() != 1 || stale != 0 || RosterResolve(&q, T802V(0), &rc, &lm) != 0 || q[0].leftOut != T802V(d.who.c_str()) || !q[0].addBack.empty())
+            Fail("t1062 N3: an older save loaded after a later save landed - the dead stay dead");
+        if (!LeftNoteHoldsDeath(rd, 7, 50)) Fail("t1062 N3: the fallen list's row stays held at that load");
+        LeftNoteMap(rd, &lm, 200, &stale);
+        if (!lm.empty() || stale != 1 || LeftNoteHoldsDeath(rd, 7, 200)) Fail("t1062 N3: the save made after the death finds the note older than it");
+    }
+    /* N4: the loaded save's time - the mark's; else quick.save's write time less the margin (a death while the save was written
+       counts); else unknown */
+    {
+        if (LeftNoteSaveAt(true, 500, true, 900) != 500 || LeftNoteSaveAt(false, 0, true, 900) != 900 - kLeftNoteFileMargin
+            || LeftNoteSaveAt(false, 0, false, 900) != -1 || LeftNoteSaveAt(false, 0, true, 50) != 0 || kLeftNoteFileMargin != 120)
+            Fail("t1062 N4: the save time the notes are judged against");
+        LeftNote d; d.who = "b"; d.kind = kLeftDied; d.at = 850;   /* died while quick.save (file time 900) was being written */
+        if (!LeftNoteHonoured(d, LeftNoteSaveAt(false, 0, true, 900)) || LeftNoteHonoured(d, 900)) Fail("t1062 N4: a death during the save's write counts");
+    }
+    /* N1: a bring-back is refused while the row's own character is alive in the loaded world (swfallen::OriginalAlive) */
+    {
+        swfallen::Fallen f;
+        f.handSerial = 7; f.templateName = "tmplA"; f.race = "";
+        std::vector<swfallen::LiveChar> live(1);
+        live[0].serial = 7; live[0].templateName = "tmplA";
+        if (!swfallen::OriginalAlive(f, live)) Fail("t1062 N1: the row's own character alive - refused");
+        live[0].serial = 8;
+        if (swfallen::OriginalAlive(f, live)) Fail("t1062 N1: another serial - allowed");
+        live[0].serial = 7; f.handSerial = 0;
+        if (swfallen::OriginalAlive(f, live)) Fail("t1062 N1: an unknown serial - allowed");
+    }
+    /* F2: the ALIVE rule's exception, by hand serial */
+    {
+        std::vector<LeftNote> n2;
+        LeftNote d; d.who = HandId(7, 1); d.kind = kLeftDied; d.at = 300;
+        n2.push_back(d);
+        if (!LeftNoteHoldsDeath(n2, 7, 200) || LeftNoteHoldsDeath(n2, 7, 400) || !LeftNoteHoldsDeath(n2, 7, -1) || LeftNoteHoldsDeath(n2, 0, 200)
+            || LeftNoteHoldsDeath(n2, 70, 200) || LeftNoteHoldsDeath(std::vector<LeftNote>(), 7, 200))
+            Fail("t1062 F2: no ALIVE only for a died note of that serial newer than the loaded save");
+    }
+    /* F5: the walker copies a record byte for byte with no names to replace; a fresh name is above every name of its shape */
+    {
+        std::vector<GdcRecSpan> sp;
+        size_t e = 0;
+        std::map<std::string, std::string> noRen;
+        if (!GdcSpans(&two[0], two.size(), &e, &sp)) Fail("t1062 F5: setup");
+        for (size_t i = 0; i < sp.size(); ++i)
+        {
+            std::vector<char> o;
+            if (!GdcRenamedRec(&two[0], sp[i].from, sp[i].to, noRen, &o) || o != std::vector<char>(two.begin() + (long)sp[i].from, two.begin() + (long)sp[i].to))
+            { Fail("t1062 F5: a record copied with nothing renamed is the same bytes"); break; }
+        }
+        std::set<std::string> used;
+        used.insert("5812--INGAME"); used.insert("5900--INGAME"); used.insert("7-gamedata.base"); used.insert("x"); used.insert("x-1");
+        if (GdcFreshName("5812--INGAME", &used) != "5901--INGAME" || GdcFreshName("5812--INGAME", &used) != "5902--INGAME" || GdcFreshName("x", &used) != "x-2"
+            || used.count("5902--INGAME") != 1)
+            Fail("t1062 F5: fresh names");
+    }
+    /* F5 + F6: the record's copy (another session) names B's records as the save names A's - A comes back with his records renamed,
+       every reference following, his records just before the squad record */
+    {
+        std::vector<std::string> none;
+        std::vector<std::vector<std::string> > noSt;
+        std::vector<char> clash;
+        RecPutI32(&clash, 15); RecPutI32(&clash, 99); RecPutI32(&clash, 3);
+        T802Rec(&clash, 0x24, "a24", 22, -1, none, none, noSt);
+        T802Rec(&clash, 0x43, "aItem", 0, -1, none, none, noSt);
+        std::vector<std::vector<std::string> > st1(1, T802V("a24", "aItem"));
+        T802Rec(&clash, 0x1E, "sq", 0, 1, none, T802V("tmplB"), st1);
+        std::vector<char> got, back2;
+        std::vector<GdcRecSpan> sp;
+        size_t e = 0;
+        GdcScanOut sc;
+        if (GdcAddChar(&two[0], two.size(), &clash[0], clash.size(), A, &got) != kStripOk) Fail("t1062 F5: a copy-back whose names clash is made");
+        else if (!GdcSpans(&got[0], got.size(), &e, &sp) || e != got.size() || sp.size() != 7) Fail("t1062 F5: the result parses");
+        else
+        {
+            if (sp[0].sid != "a24" || sp[1].sid != "aItem" || sp[2].sid != "a24-1" || sp[3].sid != "a43" || sp[4].sid != "aItem-1" || sp[5].sid != "a29"
+                || sp[6].type != 0x1E)
+                Fail("t1062 F5/F6: his records renamed where they clash, placed just before the squad record");
+            if (sp[5].inst.size() != 1 || sp[5].inst[0].target != "aItem-1") Fail("t1062 F5: a reference to a renamed record follows it");
+            if (sp[6].inst.size() != 2 || sp[6].inst[1].states != T802V("a24-1", "a43", "a29") || sp[6].inst[0].states != T802V("a24", "aItem"))
+                Fail("t1062 F5: his instance names his renamed records, B's instance is untouched");
+            if (!GdcScan(&got[0], got.size(), "t", &sc) || std::count(sc.chars.begin(), sc.chars.end(), A) != 1 || std::count(sc.chars.begin(), sc.chars.end(), B) != 1)
+                Fail("t1062 F5: A and B once each");
+            if (GdcStripChar(&got[0], got.size(), A, &back2) != kStripOk || back2 != clash) Fail("t1062 F5: A stripped again gives the record's copy back");
+        }
+        /* F6 without a clash: the copy of B alone gets A's records before its squad record */
+        got.clear();
+        if (GdcAddChar(&two[0], two.size(), &onlyB[0], onlyB.size(), A, &got) != kStripOk || !GdcSpans(&got[0], got.size(), &e, &sp) || sp.size() != 7
+            || sp[0].sid != "b24" || sp[1].sid != "b43" || sp[2].sid != "a24" || sp[5].sid != "a29" || sp[6].type != 0x1E)
+            Fail("t1062 F6: his records go just before the squad record");
+        else if (sp[6].inst.size() != 2 || sp[6].inst[1].name != "i-tmplA") Fail("t1062 N2: an entry name with no clash is kept");
+    }
+    /* N2: the record's copy already has an entry named as his ("i-tmplA") - his entry is renamed, B's untouched, nothing else moves */
+    {
+        std::vector<std::string> none;
+        std::vector<std::vector<std::string> > noSt;
+        std::vector<char> dstE, got, back3;
+        RecPutI32(&dstE, 15); RecPutI32(&dstE, 99); RecPutI32(&dstE, 3);
+        T802Rec(&dstE, 0x24, "b24", 22, -1, none, none, noSt);
+        T802Rec(&dstE, 0x43, "b43", 0, -1, none, none, noSt);
+        std::vector<std::vector<std::string> > stB(1, T802V("b24", "b43"));
+        T802Rec(&dstE, 0x1E, "sq", 0, 1, none, T802V("tmplA"), stB);   /* B's entry: "i-tmplA" */
+        std::vector<GdcRecSpan> sp;
+        size_t e = 0;
+        if (GdcAddChar(&two[0], two.size(), &dstE[0], dstE.size(), A, &got) != kStripOk) Fail("t1062 N2: a copy-back whose entry name clashes is made");
+        else if (!GdcSpans(&got[0], got.size(), &e, &sp) || e != got.size() || sp.size() != 7 || sp[6].type != 0x1E) Fail("t1062 N2: the result parses");
+        else
+        {
+            if (sp[6].inst.size() != 2 || sp[6].inst[0].name != "i-tmplA" || sp[6].inst[1].name != "i-tmplA-1" || sp[6].inst[1].target != "tmplA"
+                || sp[6].inst[1].states != T802V("a24", "a43", "a29"))
+                Fail("t1062 N2: his entry renamed past the clash, its target and states unchanged");
+            if (GdcStripChar(&got[0], got.size(), A, &back3) != kStripOk || back3 != dstE) Fail("t1062 N2: A stripped again gives the record's copy back");
+        }
+    }
+    /* N5: his record a43 refers to a name outside the file ("a24-1") - a24, renamed past the record's copy's a24, never takes it */
+    {
+        std::vector<std::string> none;
+        std::vector<std::vector<std::string> > noSt;
+        std::vector<char> srcR, dstR, got;
+        RecPutI32(&srcR, 15); RecPutI32(&srcR, 99); RecPutI32(&srcR, 3);
+        T802Rec(&srcR, 0x24, "a24", 11, -1, none, none, noSt);
+        T802Rec(&srcR, 0x43, "a43", 0, -1, T802V("a24-1"), none, noSt);
+        std::vector<std::vector<std::string> > stA(1, T802V("a24", "a43"));
+        T802Rec(&srcR, 0x1E, "sq", 0, 1, none, T802V("tmplA"), stA);
+        RecPutI32(&dstR, 15); RecPutI32(&dstR, 99); RecPutI32(&dstR, 3);
+        T802Rec(&dstR, 0x24, "a24", 22, -1, none, none, noSt);
+        T802Rec(&dstR, 0x43, "aItem", 0, -1, none, none, noSt);
+        std::vector<std::vector<std::string> > stB(1, T802V("a24", "aItem"));
+        T802Rec(&dstR, 0x1E, "sq", 0, 1, none, T802V("tmplB"), stB);
+        std::vector<GdcRecSpan> sp;
+        size_t e = 0;
+        if (GdcAddChar(&srcR[0], srcR.size(), &dstR[0], dstR.size(), A, &got) != kStripOk) Fail("t1062 N5: the copy-back is made");
+        else if (!GdcSpans(&got[0], got.size(), &e, &sp) || sp.size() != 5) Fail("t1062 N5: the result parses");
+        else if (sp[2].sid != "a24-2" || sp[3].sid != "a43" || sp[3].listRefs != T802V("a24-1") || sp[4].inst.size() != 2 || sp[4].inst[1].states != T802V("a24-2", "a43"))
+            Fail("t1062 N5: a fresh name avoids every name his records refer to");
+    }
+    /* F7: the load's last resort - nobody settled is the check's own fixed point (a re-run refuses nothing more, changes nothing) */
+    {
+        std::vector<RosterSquad> f(2);
+        f[0].key = "X"; f[0].apply = 1; f[0].saveChars = T802V("a", "b"); f[0].recChars = T802V("a");
+        f[1].key = "Y"; f[1].apply = 1; f[1].saveChars = T802V("y"); f[1].recChars = T802V("y");
+        RosterNoSettle(&f);
+        if (RosterResolve(&f, T802V(0), &rc, &left) != 1 || f[0].apply || !f[0].conflict || !f[1].apply || !f[0].addBack.empty() || !f[0].leftOut.empty()
+            || rc.addBack != 0 || rc.leftOut != 0)
+            Fail("t1062 F7: with nobody settled a lost person refuses his squad (the rule before per-person settling)");
+        std::vector<RosterSquad> again2(f);
+        if (RosterResolve(&again2, T802V(0), &rc, &left) != 0 || again2[0].apply || !again2[1].apply || !again2[1].addBack.empty())
+            Fail("t1062 F7: the result is a fixed point");
+    }
+}
 void t_t802_fold2_strip_rules()
 {
     using namespace coopown;
@@ -22322,14 +23014,15 @@ void t_t823_restore_roster()
     /* the split: A had a and b at the save; b was split off into B, which the save does not have */
     std::vector<RosterSquad> today(1);
     today[0].key = "A"; today[0].apply = 1; today[0].saveChars = T802V("a", "b"); today[0].recChars = T802V("a");
-    if (RosterResolve(&today, T802V("e"), &rc) != 1 || today[0].apply || !today[0].conflict) Fail("t823 roster: without B's head the source is refused as before");
+    if (RosterResolve(&today, T802V("e"), &rc) != 0 || !today[0].apply || today[0].conflict || today[0].addBack != T802V("b"))
+        Fail("t823 roster (T-1062, design 3.3): without B the source applies with b copied back - the load cannot rebuild B, so b stays in A");
     std::vector<RosterSquad> r(2);
     r[0] = RosterSquad(); r[0].key = "A"; r[0].apply = 1; r[0].saveChars = T802V("a", "b"); r[0].recChars = T802V("a");
     r[1].key = "B"; r[1].apply = 1; r[1].restore = 1; r[1].recChars = T802V("b");
     if (RosterResolve(&r, T802V("e"), &rc) != 0 || !r[0].apply || !r[1].apply || rc.restored != 1 || rc.conflict != 0 || rc.empty != 0)
         Fail("t823 roster: the split's source passes with the split-off squad as a restore candidate");
-    /* the load's wiring: the live check (no restore candidates) refuses the source in place; the dry run starts from the roster
-       as it was before that check, so it sees the source pass - from the marked roster it never could */
+    /* the load's wiring: the live check (no restore candidates) applies the source with b copied back (T-1062); the dry run starts
+       from the roster as it was before that check and sees the source pass with b in B instead - nothing copied back */
     {
         std::vector<RosterSquad> unmarked(1);
         unmarked[0].key = "A"; unmarked[0].apply = 1; unmarked[0].saveChars = T802V("a", "b"); unmarked[0].recChars = T802V("a");
@@ -22338,13 +23031,11 @@ void t_t823_restore_roster()
         std::vector<RosterSquad> live(unmarked), shadow;
         RosterCounts rcLive, rc2;
         RosterResolve(&live, T802V("e"), &rcLive);
-        if (live[0].apply || rcLive.conflict != 1) Fail("t823 roster: the live check refuses the split's source");
-        if (RosterShadowRun(unmarked, live, restores, T802V("e"), &shadow, &rc2) != 1 || shadow.size() != 2 || !shadow[0].apply
-            || !shadow[1].apply || rc2.restored != 1 || rc2.conflict != 0)
-            Fail("t823 roster: the dry run from the unmarked roster sees the split's source pass (sourceWouldPass = 1)");
-        if (RosterShadowRun(live, live, restores, T802V("e"), &shadow, &rc2) != 0 || shadow[0].apply)
-            Fail("t823 roster: a dry run from the already-marked roster can never see the source pass (the trap the load avoids)");
-        if (unmarked[0].conflict || !unmarked[0].apply) Fail("t823 roster: the dry run leaves the unmarked roster alone");
+        if (!live[0].apply || rcLive.conflict != 0 || rcLive.addBack != 1) Fail("t823 roster: the live check applies the split's source with b copied back");
+        if (RosterShadowRun(unmarked, live, restores, T802V("e"), &shadow, &rc2) != 0 || shadow.size() != 2 || !shadow[0].apply
+            || !shadow[1].apply || rc2.restored != 1 || rc2.conflict != 0 || rc2.addBack != 0 || !shadow[0].addBack.empty())
+            Fail("t823 roster: the dry run sees the split's source pass with b in the restored squad (nothing copied back)");
+        if (unmarked[0].conflict || !unmarked[0].apply || !unmarked[0].addBack.empty()) Fail("t823 roster: the dry run leaves the unmarked roster alone");
     }
     /* a restore candidate whose record holds nobody is refused at once */
     r.assign(1, RosterSquad());
@@ -22364,7 +23055,8 @@ void t_t823_restore_roster()
     r.assign(2, RosterSquad());
     r[0].key = "X"; r[0].apply = 1; r[0].saveChars = T802V("a"); r[0].recChars = T802V("q");
     r[1].key = "Y"; r[1].apply = 1; r[1].saveChars = T802V("q"); r[1].recChars = T802V("z");
-    if (RosterResolve(&r, T802V(0), &rc) != 2 || r[0].apply || r[1].apply || rc.restored != 0) Fail("t823 roster: no restore candidate - one refusal at a time as before");
+    if (RosterResolve(&r, T802V(0), &rc) != 0 || !r[0].apply || !r[1].apply || rc.restored != 0 || r[0].addBack != T802V("a"))
+        Fail("t823 roster: no restore candidate - the lost person is copied back (T-1062)");
     r.assign(1, RosterSquad());
     r[0].key = "X"; r[0].apply = 1;
     if (RosterResolve(&r, T802V(0), &rc) != 1 || !r[0].empty) Fail("t823 roster: a squad of the save with no character is still refused (empty)");
@@ -22389,8 +23081,8 @@ void t_t802_real_squad_files()
     const std::string dir = "C:\\code\\kenshi-coop\\evidence\\T1000\\store-copy\\";
     struct _finddata_t fd;
     const intptr_t h = _findfirst((dir + "*.platoon").c_str(), &fd);
-    if (h == -1) return;
-    int files = 0, ok = 0, oneFiles = 0, okOne = 0;
+    if (h == -1) { Skip("the evidence folder " + dir + " holds no squad file - nothing checked"); return; }
+    int files = 0, ok = 0, oneFiles = 0, okOne = 0, clashes = 0;
     do
     {
         const std::string fn(fd.name);
@@ -22411,6 +23103,7 @@ void t_t802_real_squad_files()
         if (chars == 1) ++oneFiles;
         GdcScanOut before;
         GdcScan(b.data(), b.size(), fn, &before);
+        bool clashTried = false;
         for (size_t i = 0; i < rs.size(); ++i)
         {
             if (rs[i].type != 0x24) continue;
@@ -22427,6 +23120,53 @@ void t_t802_real_squad_files()
             {
                 Fail("t802 real: " + fn + " " + rs[i].hand + ": the copy does not parse or still holds the person");
                 continue;
+            }
+            {   /* T-1062: the person copied back from the save's file into the copy without him - he is in it once, and stripped again
+                   the copy comes back byte for byte (GdcAddChar's own self-check, run here on the engine's real files) */
+                std::vector<char> added;
+                GdcScanOut as;
+                const int ra = GdcAddChar(b.data(), b.size(), &out[0], out.size(), rs[i].hand, &added);
+                if (ra != kStripOk) Fail("t1062 real: " + fn + " " + rs[i].hand + " copy-back refused: " + StripWhyName(ra));
+                else if (!GdcScan(&added[0], added.size(), fn, &as) || as.chars.size() != before.chars.size()
+                         || std::count(as.chars.begin(), as.chars.end(), rs[i].hand) != 1)
+                    Fail("t1062 real: " + fn + " " + rs[i].hand + ": the copy-back does not hold the squad's people with him once");
+            }
+            if (chars >= 2 && !clashTried)
+            {   /* T-1062: the record's copy written by another session - its records renamed to the person's own names in the save's
+                   file (the engine's per-process counter can give both the same names): he still comes back, his records renamed,
+                   just before the squad record, every name in the result once */
+                clashTried = true;
+                std::set<std::string> outSids;
+                for (size_t j = 0; j < os.size(); ++j) outSids.insert(os[j].sid);
+                std::vector<std::string> his;
+                for (size_t j = 0; j < rs.size(); ++j) if (outSids.count(rs[j].sid) == 0) his.push_back(rs[j].sid);
+                std::map<std::string, std::string> ren;
+                size_t hk = 0;
+                for (size_t j = 0; j < os.size() && hk < his.size(); ++j) if (os[j].type != 0x1E) ren[os[j].sid] = his[hk++];
+                std::vector<char> clash(out.begin(), out.begin() + 12);
+                bool built = !ren.empty();
+                for (size_t j = 0; j < os.size() && built; ++j) built = GdcRenamedRec(&out[0], os[j].from, os[j].to, ren, &clash);
+                std::vector<GdcRecSpan> cs, gs;
+                size_t ce = 0, ge = 0;
+                std::vector<char> got;
+                GdcScanOut gsc;
+                if (!built || !GdcSpans(&clash[0], clash.size(), &ce, &cs) || ce != clash.size()) Fail("t1062 real clash: " + fn + ": the clashing copy could not be built");
+                else
+                {
+                    const int rc2 = GdcAddChar(b.data(), b.size(), &clash[0], clash.size(), rs[i].hand, &got);
+                    std::set<std::string> names;
+                    if (rc2 != kStripOk) Fail("t1062 real clash: " + fn + " " + rs[i].hand + " copy-back refused: " + StripWhyName(rc2));
+                    else if (!GdcSpans(&got[0], got.size(), &ge, &gs) || ge != got.size() || gs.empty() || gs.back().type != 0x1E
+                             || !GdcScan(&got[0], got.size(), fn, &gsc) || gsc.chars.size() != before.chars.size()
+                             || std::count(gsc.chars.begin(), gsc.chars.end(), rs[i].hand) != 1)
+                        Fail("t1062 real clash: " + fn + " " + rs[i].hand + ": the result does not parse, hold everyone once, or end with the squad record");
+                    else
+                    {
+                        for (size_t j = 0; j < gs.size(); ++j) names.insert(gs[j].sid);
+                        if (names.size() != gs.size()) Fail("t1062 real clash: " + fn + ": two records share a name in the result");
+                        else ++clashes;
+                    }
+                }
             }
             for (size_t j = 0; j < os.size(); ++j)
             {
@@ -22446,6 +23186,7 @@ void t_t802_real_squad_files()
     } while (_findnext(h, &fd) == 0);
     _findclose(h);
     if (files == 0 || ok - okOne == 0) Fail("t802 real: no squad file of two or more people was stripped");
+    if (clashes == 0) Fail("t1062 real clash: no clashing copy-back was made");
     if (oneFiles > 0 && okOne == 0) Fail("t802 real: no one-person squad file was stripped to an empty squad record");
 }
 
@@ -23964,31 +24705,38 @@ void t_hb_fold_oversized_record_admitted_into_an_empty_second()
     if (!coophb::BudgetAllows(0, 17000, 65536))  Fail("an ordinary first record of a second still passes");
 }
 
-/* (7) review-s2hb fold + fold 2 (recheck-s2hb): A GIANT DOES NOT BLOCK THE RING AND THE CURSOR IS NEVER STARVED. The
-   plugin's rules, modelled: 3 serialises a tick; the first pass (OWED oldest first, then dirty) takes at most 2 of them, so
-   the cursor always gets one; a budget deferral moves past the group and marks it owed. Fifty groups: one 288 KB giant, five
-   in a running fight (dirty every second - a demand of 2.5 serialises a tick). Python twin: the quiet groups' worst gap is
-   46 s with the reserve and 89 s without it; the owed giant publishes on the very next tick. */
+/* (7) A GIANT DOES NOT BLOCK THE RING, THE CURSOR IS NEVER STARVED, AND A RUN OF CHANGES DOES NOT HOLD AN OWED GIANT FOR EVER.
+   The plugin's rules, modelled: 3 serialises a tick; the first pass (changed groups oldest change first and owed ones oldest
+   deferral first, taking turns, with the debt's share putting an owed group that waited kDebtMaxWaitMs first once every
+   kDebtShareMs - coophb::PassOrder) takes at most 2 of them, so the cursor always gets one; a budget deferral moves
+   past the group and marks it owed. Fifty groups: one 288 KB giant, five in a running fight (changed every second - a demand of
+   2.5 serialises a tick, so without the share the giant would never meet an empty second). */
 void t_hb_fold_giant_does_not_block_the_ring()
 {
     const unsigned int N = 50, G = 1, CAP = 3;
     std::vector<unsigned int> lastPub(N, 0u), size(N, 17000u), pubs(N, 0u), owedAt(N, 0u);
     std::vector<int> owed(N, 0), dirty(N, 0);
+    std::vector<unsigned int> markAt(N, 0u);
     size[G] = 288056;
-    unsigned int ringAt = 0, worstQuiet = 0, giantWait = 0, t, k;
+    unsigned int ringAt = 0, worstQuiet = 0, giantWait = 0, worstFight = 0, shareAt = 0, t, k;
     for (t = 1000; t <= 300000; t += 1000)
     {
         unsigned int spent = 0, ser = 0;
-        for (k = 0; k < N; ++k) if (k % 10 == 5) dirty[k] = 1;
+        for (k = 0; k < N; ++k) if (k % 10 == 5) { if (!dirty[k]) markAt[k] = t; dirty[k] = 1; }
         std::vector<unsigned int> first;
+        std::vector<coophb::PassKey> keys;
         for (k = 0; k < N; ++k)
         {
-            if (!owed[k]) continue;
-            size_t at = first.size();
-            while (at > 0 && owedAt[first[at - 1]] > owedAt[k]) --at;   /* the oldest deferral first */
-            first.insert(first.begin() + at, k);
+            if (!owed[k] && !dirty[k]) continue;
+            coophb::PassKey c;
+            c.dirty = dirty[k]; c.markAgeMs = dirty[k] ? t - markAt[k] : 0u; c.owedAgeMs = owed[k] ? t - owedAt[k] : 0u;
+            const unsigned int at = coophb::PassInsertAt(keys.empty() ? 0 : &keys[0], (unsigned int)keys.size(), c);
+            keys.insert(keys.begin() + at, c); first.insert(first.begin() + at, k);
         }
-        for (k = 0; k < N; ++k) if (dirty[k] && !owed[k]) first.push_back(k);
+        std::vector<unsigned int> order(keys.size());
+        const unsigned int share = keys.empty() ? 0u : coophb::PassOrder(&keys[0], (unsigned int)keys.size(), t - shareAt, &order[0]);
+        const unsigned int shareK = share < keys.size() ? first[share] : N;
+        { std::vector<unsigned int> sending(keys.size()); for (size_t j = 0; j < order.size(); ++j) sending[j] = first[order[j]]; first.swap(sending); }
         size_t f;
         for (f = 0; f < first.size(); ++f)
         {
@@ -23998,6 +24746,8 @@ void t_hb_fold_giant_does_not_block_the_ring()
             if (!coophb::BudgetAllows(spent, size[k], 65536)) { if (!owed[k]) { owed[k] = 1; owedAt[k] = t; } continue; }
             if (owed[k] && k == G && t - owedAt[k] > giantWait) giantWait = t - owedAt[k];
             if (t > 60000 && k % 10 != 5 && k != G && t - lastPub[k] > worstQuiet) worstQuiet = t - lastPub[k];
+            if (t > 60000 && k % 10 == 5 && t - markAt[k] > worstFight) worstFight = t - markAt[k];
+            if (k == shareK) shareAt = t;
             owed[k] = 0; dirty[k] = 0; ++ser; spent += size[k]; lastPub[k] = t; if (t > 60000) ++pubs[k];
         }
         const unsigned int quota = coophb::CursorQuota(N, 30000, 1000, 0);
@@ -24015,9 +24765,317 @@ void t_hb_fold_giant_does_not_block_the_ring()
     }
     if (worstQuiet == 0) Fail("nothing published - an absence, not a pass");
     if (worstQuiet > 60000) Fail("the dirty pass starved the cursor: a quiet group waited " + UU(worstQuiet) + " ms (the first pass must leave the cursor one serialise a tick)");
-    if (giantWait > 1000) Fail("a deferred giant waited " + UU(giantWait) + " ms - owed groups go first, oldest first, on the very next tick");
+    if (giantWait > coophb::kDebtMaxWaitMs + coophb::kDebtShareMs + 1000)
+        Fail("a deferred giant waited " + UU(giantWait) + " ms under a run of changes - the debt's share must send it within kDebtMaxWaitMs + kDebtShareMs");
+    if (giantWait == 0) Fail("the giant was never deferred and sent after a wait - the share was not exercised");
+    if (worstFight > 10000) Fail("a changed group waited " + UU(worstFight) + " ms from its change to its send - seconds, not its 30 s floor");
     for (k = 0; k < N; ++k) if (pubs[k] == 0) { Fail("group " + UU(k) + (k == G ? " (the giant)" : "") + " never published in four measured minutes"); return; }
 }
+
+/* ================================ T-1084 step 4: A SQUAD EVENT MARKS ITS WORLD RECORD DUE ON THE EARLY ROAD ==========
+   A member's death, a member in or out, the squad's money, its home building: the squad's record goes within the heartbeat's 2 s
+   gap instead of waiting up to its 30 s floor (150 s for a giant). Each test runs the decisions store.cpp runs, from squadevent.h:
+   NoteAction (SqEventNote), MarkAccepted + MarkFlags (HbMarkDirty), DueForVisit (HbDue, the wake-only rule), EntryHolds
+   (SqEventMarkHolder), PotPlatoon / MoneyMarks / HomeChanged (the money and home hooks), the tagged ring (SqEventDrainTick). */
+
+/* one tracked squad's heartbeat fields, as store.cpp's HbEntry holds them */
+struct SqevEntry { int dirty, dirtyRecord, dirtyWriter, owed, slow, foreign; unsigned int lastVisit, lastBytes, publishes; };
+static SqevEntry SqevFresh(unsigned int lastBytes) { SqevEntry e = { 0, 0, 0, 0, 0, 0, 0, lastBytes, 0 }; return e; }
+/* HbMarkDirty: the gate, then the flags */
+static void SqevMark(SqevEntry* e, int registered, int isWake) { sqevent::MarkEntry(registered, e->foreign, isWake, &e->dirty, &e->dirtyRecord); }   /* HbMarkDirty's own routing */
+/* HeartbeatTick's dirty pass: a dirty entry that HbDue (DueForVisit) admits is published and its flags cleared, as HbPublishOne does */
+static void SqevDirtyPass(SqevEntry* e, unsigned int now)
+{
+    if (e->dirty == 0 || e->foreign != 0) return;
+    if (!sqevent::DueForVisit(true, e->slow, e->dirty, e->dirtyRecord, e->dirtyWriter, e->owed, now - e->lastVisit, e->lastBytes)) return;
+    e->dirty = 0; e->dirtyRecord = 0; e->dirtyWriter = 0; e->owed = 0; e->lastVisit = now; ++e->publishes;
+}
+
+void t_sqev_event_marks_the_record_due()
+{
+    if (sqevent::NoteAction(1, 0, 0) != sqevent::kActMarkNow) Fail("t1084: an event on the main thread, with a squad tracked and no load, is marked now");
+    if (sqevent::NoteAction(1, 1, 0) != sqevent::kActSkip || sqevent::NoteAction(1, 0, 1) != sqevent::kActSkip)
+        Fail("t1084: on the main thread nothing is marked with nothing tracked or during a load / teardown");
+    SqevEntry e = SqevFresh(300000u);   /* a giant record: its floor is 150 s */
+    SqevMark(&e, 1, 0);
+    if (e.dirty != 1 || e.dirtyRecord != 1) Fail("t1084: an event on a squad this game writes marks it dirty, as a change to its record");
+    const bool marked = e.dirtyRecord != 0;
+    SqevDirtyPass(&e, 1000);
+    if (e.publishes != 0) Fail("t1084: the mark waits for the 2 s gap after the last visit");
+    SqevDirtyPass(&e, 2000);
+    if (e.publishes != 1 || e.dirty != 0) Fail("t1084: the marked giant publishes at the gap (its floor does not hold an event) and the visit clears the mark");
+    /* the wake-only rule: a wake alone is not a change to the record, so a giant marked only by it waits as on the floor */
+    SqevEntry w = SqevFresh(300000u);
+    SqevMark(&w, 1, 1);
+    if (w.dirty != 1 || w.dirtyRecord != 0) Fail("t1084: a wake sets dirty alone");
+    SqevDirtyPass(&w, 2000);
+    if (w.publishes != 0) Fail("t1084: a giant marked by a wake alone is not published at the gap");
+    SqevMark(&w, 1, 0);
+    SqevDirtyPass(&w, 3000);
+    if (w.publishes != 1) Fail("t1084: an event after the wake makes the giant's mark a change to its record - published at the gap");
+    if (!coophb::BudgetAllowsGroup(marked, 200000u, 0u, 20000u, coophb::kBudgetBytesPerSec))
+        Fail("t1084: a marked squad's small record is held only to this second's own sends, not to an older record's debt");
+    if (coophb::BudgetAllowsGroup(marked, 200000u, 60000u, 20000u, coophb::kBudgetBytesPerSec))
+        Fail("t1084: a marked squad still keeps a second within the 64 KB/s budget");
+}
+
+void t_sqev_burst_of_events_is_one_send_per_window()
+{
+    SqevEntry e = SqevFresh(17000u);   /* published at t=0 */
+    unsigned int t;
+    for (t = 50; t <= 1950; t += 50) SqevMark(&e, 1, 0);   /* 39 deaths in a fight, inside one 2 s window */
+    if (e.dirty != 1 || e.dirtyRecord != 1) Fail("t1084: N marks leave the two flags as one mark does");
+    for (t = 1000; t <= 10000; t += 1000) SqevDirtyPass(&e, t);
+    if (e.publishes != 1) Fail("t1084: 39 events in one window must publish once, got " + UU(e.publishes));
+    for (t = 10050; t <= 10500; t += 50) SqevMark(&e, 1, 0);   /* a second burst, later */
+    for (t = 11000; t <= 20000; t += 1000) SqevDirtyPass(&e, t);
+    if (e.publishes != 2) Fail("t1084: a later burst publishes once more, got " + UU(e.publishes));
+}
+
+void t_sqev_member_set_changes()
+{
+    int c[5] = { 0, 0, 0, 0, 0 };
+    void* a[3] = { &c[0], &c[1], &c[2] };
+    void* b[3] = { &c[2], &c[0], &c[1] };   /* the same set in another order */
+    void* d[3] = { &c[0], &c[1], &c[3] };   /* c[2] left and c[3] joined between two looks */
+    void* f[2] = { &c[0], &c[1] };
+    const unsigned long long pa = sqevent::MemberPrint(a, 3);
+    if (sqevent::MemberPrint(b, 3) != pa) Fail("t1084: the member fingerprint does not depend on order");
+    if (sqevent::MembersChanged(-1, 0, 3, pa) != 0) Fail("t1084: the first look at a squad's members only records them");
+    if (sqevent::MembersChanged(3, pa, 3, pa) != 0) Fail("t1084: unchanged members are no event");
+    if (sqevent::MembersChanged(3, pa, 3, sqevent::MemberPrint(d, 3)) != 1) Fail("t1084: a leave and a join between two looks (same count) is an event");
+    if (sqevent::MembersChanged(3, pa, 2, sqevent::MemberPrint(f, 2)) != 1) Fail("t1084: a member out (a recruit, a transfer) is an event");
+    if (sqevent::MembersChanged(3, pa, -1, 0) != 0) Fail("t1084: an unread list is no event");
+    /* SqEventMarkHolder's per-entry decision */
+    if (sqevent::EntryHolds(0, 1, 3, a, &c[1]) != 1) Fail("t1084: a tracked squad this game writes holds its dead member (address compare)");
+    if (sqevent::EntryHolds(1, 1, 3, a, &c[1]) != 0) Fail("t1084: a squad another game writes is not marked for a death seen here");
+    if (sqevent::EntryHolds(0, 0, 3, a, &c[1]) != 0 || sqevent::EntryHolds(0, 1, 3, a, &c[4]) != 0) Fail("t1084: an unread list, or a character not in it, holds nothing");
+    if (sqevent::EntryHolds(0, 1, sqevent::kMaxMembers + 1, a, &c[1]) != -1) Fail("t1084: a list over kMaxMembers is not looked at (counted apart)");
+}
+
+void t_sqev_non_writer_event_sends_nothing()
+{
+    if (sqevent::MarkAccepted(1, 1) != 0) Fail("t1084: a squad another game writes takes no mark here");
+    if (sqevent::MarkAccepted(0, 0) != 0) Fail("t1084: a squad the heartbeat does not track takes no mark");
+    SqevEntry e = SqevFresh(17000u);
+    e.foreign = 1;
+    unsigned int t;
+    for (t = 100; t <= 1500; t += 100) SqevMark(&e, 1, 0);
+    for (t = 1000; t <= 20000; t += 1000) SqevDirtyPass(&e, t);
+    if (e.dirty != 0 || e.publishes != 0) Fail("t1084: another game's squad's events send nothing from this game");
+}
+
+void t_sqev_money_and_home_rules()
+{
+    if (sqevent::MoneyMarks(1, 120) != 1 || sqevent::MoneyMarks(1, -120) != 1) Fail("t1084: money taken, or given (a negative amount), marks");
+    if (sqevent::MoneyMarks(0, 120) != 0) Fail("t1084: a refused take (not enough money) changed nothing");
+    if (sqevent::MoneyMarks(1, 0) != 0) Fail("t1084: a take of 0 changed nothing");
+    char platoon[0x200];
+    if (sqevent::PotPlatoon(platoon + 0x148) != (void*)platoon) Fail("t1084: a pot names the platoon it is embedded in, 0x148 before it");
+    if (sqevent::PotPlatoon((const void*)0x100) != 0) Fail("t1084: an address below the pot's offset names no platoon");
+    unsigned char before[sqevent::kHomeHandBytes], after[sqevent::kHomeHandBytes];
+    std::memset(before, 0, sizeof(before)); std::memcpy(after, before, sizeof(after));
+    if (sqevent::HomeChanged(before, after) != 0) Fail("t1084: a home call that changed nothing (the engine fills only an empty home) is no event");
+    after[27] = 1;
+    if (sqevent::HomeChanged(before, after) != 1) Fail("t1084: any of the 28 bytes of the home hand changed is an event");
+}
+/* T-1084: the heartbeat's dirty pass (store.cpp HeartbeatTick, hbmath.h PassAhead / PassInsertAt): every marked group, owed or not,
+   goes ahead of every group only owed, so a death's record does not wait behind the routine debt an authority never empties. Marked
+   groups go oldest mark first, owed-only ones oldest deferral first, equals in the order they came. Built the way the store builds it. */
+void t_sqev_marked_groups_go_ahead_of_owed_ones()
+{
+    /* the candidates in registry order: { dirty, markAgeMs, owedAgeMs } */
+    const coophb::PassKey c[6] = {
+        { 0,    0u, 30000u },   /* 0: owed only, the oldest deferral */
+        { 1,  500u,     0u },   /* 1: marked, not owed */
+        { 1, 1200u,   900u },   /* 2: marked, then deferred by the budget (owed) - still a marked group */
+        { 0,    0u,  5000u },   /* 3: owed only */
+        { 1, 1200u,     0u },   /* 4: marked as long ago as 2 - after it, the order they came in */
+        { 0,    0u, 30000u } }; /* 5: owed only, as old as 0 - after it */
+    /* (a group marked by a wake or a writer lift alone and not owed is { 0, 0, 0 }: after every owed one - checked below) */
+    std::vector<coophb::PassKey> keys; std::vector<int> order;
+    for (int i = 0; i < 6; ++i)
+    {
+        const unsigned int at = coophb::PassInsertAt(keys.empty() ? 0 : &keys[0], (unsigned int)keys.size(), c[i]);
+        keys.insert(keys.begin() + at, c[i]); order.insert(order.begin() + at, i);
+    }
+    const int want[6] = { 2, 4, 1, 0, 5, 3 };
+    std::string got;
+    bool same = order.size() == 6;
+    for (size_t i = 0; i < order.size(); ++i) { got += std::string(i != 0 ? "," : "") + UU((unsigned int)order[i]); if (same && order[i] != want[i]) same = false; }
+    if (!same) Fail("t1084: the dirty pass's order must be marked groups oldest mark first, then owed-only oldest deferral first (want 2,4,1,0,5,3); got " + got);
+    const coophb::PassKey markedOwed = { 1, 100u, 100u }, oldOwed = { 0, 0u, 60000u }, markedNew = { 1, 10u, 0u }, markedOld = { 1, 9000u, 0u };
+    if (coophb::PassAhead(markedOwed, oldOwed) != 1 || coophb::PassAhead(oldOwed, markedOwed) != 0)
+        Fail("t1084: a marked group the budget deferred goes ahead of an older owed-only group");
+    if (coophb::PassAhead(markedOld, markedNew) != 1 || coophb::PassAhead(markedNew, markedOld) != 0) Fail("t1084: the oldest mark goes first");
+    if (coophb::PassAhead(markedOld, markedOld) != 0 || coophb::PassAhead(oldOwed, oldOwed) != 0) Fail("t1084: equals keep the order they came in");
+    if (coophb::PassInsertAt(0, 0u, oldOwed) != 0u) Fail("t1084: the first candidate goes at the front of an empty pass");
+    const coophb::PassKey wakeOnly = { 0, 0u, 0u }, youngOwed = { 0, 0u, 100u };
+    if (coophb::PassAhead(youngOwed, wakeOnly) != 1 || coophb::PassAhead(wakeOnly, youngOwed) != 0)
+        Fail("t1084: a group only woken (or lifted) and not owed goes after every owed group");
+    /* the debt's share: the first unchanged group in pass order goes first once every kDebtShareMs, if it waited kDebtMaxWaitMs */
+    const coophb::PassKey overdue = { 0, 0u, coophb::kDebtMaxWaitMs }, notYet = { 0, 0u, coophb::kDebtMaxWaitMs - 1u };
+    const coophb::PassKey p1[3] = { markedOld, markedNew, overdue };
+    if (coophb::DebtShareAt(p1, 3u, coophb::kDebtShareMs) != 2u) Fail("t1084: an owed group that waited kDebtMaxWaitMs takes the share");
+    if (coophb::DebtShareAt(p1, 3u, coophb::kDebtShareMs - 1u) != 3u) Fail("t1084: the share opens only once every kDebtShareMs");
+    const coophb::PassKey p2[3] = { markedOld, notYet, overdue };
+    if (coophb::DebtShareAt(p2, 3u, coophb::kDebtShareMs) != 3u) Fail("t1084: the share looks only at the oldest owed group (pass order), which has not waited long enough");
+    const coophb::PassKey p3[2] = { markedOld, markedNew };
+    if (coophb::DebtShareAt(p3, 2u, 0xFFFFFFFFu) != 2u || coophb::DebtShareAt(0, 0u, 0xFFFFFFFFu) != 0u) Fail("t1084: no owed group, no share");
+    /* the sending order: changed and the rest take turns, a changed one first; the share ahead of all */
+    {
+        const coophb::PassKey p[5] = { { 1, 900u, 0u }, { 1, 500u, 0u }, { 1, 100u, 0u }, { 0, 0u, 9000u }, { 0, 0u, 0u } };
+        unsigned int o[5];
+        std::string g;
+        if (coophb::PassOrder(p, 5u, 0u, o) != 5u) Fail("t1084: no share while none is due");
+        for (int i = 0; i < 5; ++i) g += UU(o[i]);
+        if (g != "03142") Fail("t1084: the changed groups and the rest take turns, a changed one first (want 03142); got " + g);
+        const coophb::PassKey q[4] = { { 1, 900u, 0u }, { 0, 0u, coophb::kDebtMaxWaitMs + 5u }, { 0, 0u, 9000u }, { 0, 0u, 0u } };
+        unsigned int o2[4];
+        g.clear();
+        if (coophb::PassOrder(q, 4u, coophb::kDebtShareMs, o2) != 1u) Fail("t1084: the overdue owed group is the share");
+        for (int i = 0; i < 4; ++i) g += UU(o2[i]);
+        if (g != "1023") Fail("t1084: the share goes ahead of all, then the turns without it (want 1023); got " + g);
+        const coophb::PassKey r[2] = { { 0, 0u, 100u }, { 0, 0u, 0u } };
+        unsigned int o3[2];
+        g.clear();
+        coophb::PassOrder(r, 2u, 0u, o3);
+        for (int i = 0; i < 2; ++i) g += UU(o3[i]);
+        if (g != "01") Fail("t1084: with no changed group the rest keep their order (want 01); got " + g);
+    }
+}
+/* T-1084: a restock note (store.cpp SqEventMatch, squadevent.h RestockNames) names the tracked squad at its address, or the tracked
+   squad whose active part is at its address - address compares only; a squad another game writes is never named */
+void t_sqev_restock_names_the_squad_or_its_active_part()
+{
+    char squad[0x200], active[0x80], other[0x40];
+    if (sqevent::RestockNames(0, squad, 1, active, squad) != 2) Fail("t1084: a restock note at the tracked squad's own address names it");
+    if (sqevent::RestockNames(0, squad, 0, 0, squad) != 2) Fail("t1084: the squad's own address names it without reading its active part");
+    if (sqevent::RestockNames(0, squad, 1, active, active) != 1) Fail("t1084: a restock note at the tracked squad's active part names it");
+    if (sqevent::RestockNames(0, squad, 0, active, active) != 0) Fail("t1084: an active part that was not read names nothing");
+    if (sqevent::RestockNames(1, squad, 1, active, squad) != 0 || sqevent::RestockNames(1, squad, 1, active, active) != 0)
+        Fail("t1084: a squad another game writes is never named by a restock note");
+    if (sqevent::RestockNames(0, squad, 1, active, other) != 0) Fail("t1084: an unrelated address names no squad");
+    if (sqevent::RestockNames(0, squad, 1, 0, 0) != 0) Fail("t1084: a null note names no squad, even one with no active part");
+    if (sqevent::NoteVerdict(sqevent::kKindRestock, 1, 0) != sqevent::kVerdictMark) Fail("t1084: a restock named outside the wake window marks");
+}
+
+void t_sqev_wake_window_and_note_verdict()
+{
+    /* a squad woke at clock 10 (window open): a note stamped 10..12 is inside it, one stamped 9 (before the wake) is not */
+    if (sqevent::WakeWindowHolds(1, 10, 1, 0, 10) != 1 || sqevent::WakeWindowHolds(1, 10, 1, 0, 12) != 1) Fail("t1084: a note taken while the wake window is open is inside it");
+    if (sqevent::WakeWindowHolds(1, 10, 1, 0, 9) != 0) Fail("t1084: a note taken before the wake is not inside its window");
+    /* the window closed at clock 14 (its first visit): a queued note stamped 13 was taken inside it - judged by its stamp, not the drain's time */
+    if (sqevent::WakeWindowHolds(1, 10, 0, 14, 13) != 1) Fail("t1084: a queued note taken before the window closed is judged by its stamp");
+    if (sqevent::WakeWindowHolds(1, 10, 0, 14, 14) != 0 || sqevent::WakeWindowHolds(1, 10, 0, 14, 20) != 0) Fail("t1084: a note after the first visit is outside the window");
+    if (sqevent::WakeWindowHolds(0, 0, 0, 0, 5) != 0) Fail("t1084: a squad that never woke here has no window");
+    if (sqevent::WakeWindowHolds(1, 0xFFFE, 0, 2, 0xFFFF) != 1 || sqevent::WakeWindowHolds(1, 0xFFFE, 0, 2, 1) != 1 || sqevent::WakeWindowHolds(1, 0xFFFE, 0, 2, 2) != 0)
+        Fail("t1084: the 16-bit clock wraps without changing the answer");
+    /* SqEventMatch's verdict (NoteVerdict): a home or a restock inside the wake window is the read - no mark, so the wake's skip of a
+       just-loaded record holds; a death or money is always a change; another game's squad, or none, is never marked */
+    if (sqevent::NoteVerdict(sqevent::kKindPotHome, 1, 1) != sqevent::kVerdictWakeRead || sqevent::NoteVerdict(sqevent::kKindRestock, 1, 1) != sqevent::kVerdictWakeRead)
+        Fail("t1084: a home or a restock inside the wake window takes no mark");
+    if (sqevent::NoteVerdict(sqevent::kKindPotHome, 1, 0) != sqevent::kVerdictMark || sqevent::NoteVerdict(sqevent::kKindRestock, 1, 0) != sqevent::kVerdictMark)
+        Fail("t1084: a home or a restock outside the wake window marks");
+    if (sqevent::NoteVerdict(sqevent::kKindCharacter, 1, 1) != sqevent::kVerdictMark || sqevent::NoteVerdict(sqevent::kKindPotMoney, 1, 1) != sqevent::kVerdictMark)
+        Fail("t1084: a death or money inside the wake window still marks");
+    if (sqevent::NoteVerdict(sqevent::kKindPotHome, 0, 0) != sqevent::kVerdictNotOurs) Fail("t1084: a squad this game does not write takes no mark");
+    /* the wake-only skip survives a home read in at the wake: through the real window, verdict and mark routing, the entry keeps dirty
+       without dirtyRecord, so HbDue (DueForVisit) treats it as a wake alone */
+    int dirty = 0, dirtyRecord = 0;
+    sqevent::WakeWindow w; sqevent::WindowReset(&w);
+    sqevent::MarkEntry(1, 0, 1, &dirty, &dirtyRecord);   /* the wake mark */
+    sqevent::WindowOpen(&w, 40);
+    if (sqevent::NoteVerdict(sqevent::kKindPotHome, 1, sqevent::WindowHolds(&w, 41)) == sqevent::kVerdictMark) sqevent::MarkEntry(1, 0, 0, &dirty, &dirtyRecord);
+    if (dirty != 1 || dirtyRecord != 0) Fail("t1084: a home read inside the wake leaves the wake's mark a wake alone");
+    if (sqevent::DueForVisit(true, 0, dirty, dirtyRecord, 0, 0, 2000, 300000u)) Fail("t1084: so a giant woken and read in still waits as a wake alone");
+}
+
+void t_sqev_window_closes_on_people_and_ends_after_drain()
+{
+    /* while the wake's people wait runs: no visit, no prune, the window stays open */
+    if (sqevent::VisitHeldForPeople(1) != 1 || sqevent::PruneKeeps(1) != 1 || sqevent::WindowClosesAtVisit(1) != 0)
+        Fail("t1084: a squad whose people are still coming is not visited, not pruned, and its window is not closed by a visit");
+    if (sqevent::VisitHeldForPeople(0) != 0 || sqevent::PruneKeeps(0) != 0 || sqevent::WindowClosesAtVisit(0) != 1)
+        Fail("t1084: with no people wait a visit runs, a people-less squad is pruned, and the first visit closes the window");
+    sqevent::WakeWindow w; sqevent::WindowReset(&w);
+    if (sqevent::WindowClose(&w, 5) != 0) Fail("t1084: a squad that never woke has no window to close");
+    sqevent::WindowOpen(&w, 100);
+    if (sqevent::WindowHolds(&w, 160) != 1) Fail("t1084: the window holds while the people are still coming");
+    if (sqevent::WindowClose(&w, 170) != 1 || sqevent::WindowClose(&w, 171) != 0) Fail("t1084: the people seen close the window once");
+    if (sqevent::WindowHolds(&w, 169) != 1 || sqevent::WindowHolds(&w, 170) != 0) Fail("t1084: a closed window still judges a note queued before it closed");
+    sqevent::WindowAfterDrain(&w);
+    if (w.has != 0 || sqevent::WindowHolds(&w, 169) != 0) Fail("t1084: after the next drain the window is gone");
+    if (sqevent::WindowHolds(&w, (100 + 0x10000u + 5u) & sqevent::kStampMask) != 0) Fail("t1084: a note 65,536 ticks later is never judged inside an old window");
+}
+
+void t_sqev_ring_reserves_before_it_fills()
+{
+    if (sqevent::ReserveAdmits(sqevent::kKindPotMoney, sqevent::kRingCap / 2) != 1 || sqevent::ReserveAdmits(sqevent::kKindPotMoney, sqevent::kRingCap / 2 + 1) != 0)
+        Fail("t1084: a money note keeps its reservation up to exactly half the ring");
+    if (sqevent::ReserveAdmits(sqevent::kKindCharacter, sqevent::kRingCap) != 1 || sqevent::ReserveAdmits(sqevent::kKindCharacter, sqevent::kRingCap + 1) != 0)
+        Fail("t1084: any note keeps its reservation up to the whole ring, never past it");
+    /* reservations already counted (pushes in flight on other threads) hold money back as filled slots do */
+    sqevent::EventRing r; int i;
+    for (i = 0; i < sqevent::kRingCap; ++i) r.slot[i] = 0;
+    r.used = sqevent::kRingCap / 2; r.next = 0;
+    long long obj = 0;
+    if (sqevent::RingPush(&r, &obj, sqevent::kKindPotMoney) != sqevent::kPushHalfRefused || r.used != sqevent::kRingCap / 2)
+        Fail("t1084: a refused reservation is backed out");
+    if (sqevent::RingPush(&r, &obj, sqevent::kKindPotHome) != sqevent::kPushQueued || r.used != sqevent::kRingCap / 2 + 1)
+        Fail("t1084: a home note reserves and fills a slot past the money half");
+}
+
+void t_sqev_ring_bounds_money_notes()
+{
+    if (sqevent::ReserveAdmits(sqevent::kKindPotMoney, sqevent::kRingCap / 2 + 1) != 0) Fail("t1084: a money note takes no slot once the ring is half full");
+    if (sqevent::ReserveAdmits(sqevent::kKindPotMoney, sqevent::kRingCap / 2) != 1) Fail("t1084: a money note takes a slot below half");
+    if (sqevent::ReserveAdmits(sqevent::kKindCharacter, sqevent::kRingCap) != 1 || sqevent::ReserveAdmits(sqevent::kKindPotHome, sqevent::kRingCap) != 1)
+        Fail("t1084: deaths and homes keep the other half");
+    sqevent::EventRing r; int i;
+    for (i = 0; i < sqevent::kRingCap; ++i) r.slot[i] = 0;
+    r.used = 0; r.next = 0;
+    long long obj[2] = { 0, 0 };
+    int queued = 0, refused = 0;
+    for (i = 0; i < sqevent::kRingCap; ++i)
+    {
+        const int pr = sqevent::RingPush(&r, sqevent::TagAddr(&obj[0], sqevent::kKindPotMoney, (unsigned int)i), sqevent::kKindPotMoney);
+        if (pr == sqevent::kPushQueued) ++queued; else if (pr == sqevent::kPushHalfRefused) ++refused;
+    }
+    if (queued != sqevent::kRingCap / 2 || refused != sqevent::kRingCap / 2) Fail("t1084: a flood of money notes fills half the ring, the rest are refused and counted");
+    if (sqevent::RingPush(&r, sqevent::TagAddr(&obj[1], sqevent::kKindCharacter, 0), sqevent::kKindCharacter) != sqevent::kPushQueued)
+        Fail("t1084: a death still finds a slot after a money flood");
+    void* got[sqevent::kRingCap];
+    if (sqevent::RingTake(&r, got, sqevent::kRingCap) != sqevent::kRingCap / 2 + 1 || r.used != 0) Fail("t1084: the take empties the ring and its count");
+}
+
+void t_sqev_off_thread_event_is_queued_not_applied()
+{
+    if (sqevent::NoteAction(0, 0, 0) != sqevent::kActQueue || sqevent::NoteAction(0, 1, 1) != sqevent::kActQueue)
+        Fail("t1084: an event off the main thread is queued whatever the registry - which it does not read");
+    if (sqevent::DrainUses(0, 0) != 1 || sqevent::DrainUses(1, 0) != 0 || sqevent::DrainUses(0, 1) != 0)
+        Fail("t1084: the drain matches only with a world up and a squad tracked; otherwise it drops (counted)");
+    sqevent::EventRing r; int i;
+    for (i = 0; i < sqevent::kRingCap; ++i) r.slot[i] = 0;
+    r.used = 0; r.next = 0;
+    long long chars[3] = { 0, 0, 0 };   /* 8-byte aligned, as the engine's objects are */
+    SqevEntry e = SqevFresh(17000u);
+    if (sqevent::RingPush(&r, sqevent::TagAddr(&chars[1], sqevent::kKindPotHome, 0x1234u), sqevent::kKindPotHome) != sqevent::kPushQueued) Fail("t1084: an empty ring takes the tagged address");
+    if (e.dirty != 0) Fail("t1084: queueing marks nothing - the squad map is the main thread's");
+    void* got[sqevent::kRingCap];
+    const int n = sqevent::RingTake(&r, got, sqevent::kRingCap);
+    int kind = -1; unsigned int stamp = 0;
+    if (n != 1 || sqevent::UntagAddr(got[0], &kind, &stamp) != (void*)&chars[1] || kind != sqevent::kKindPotHome || stamp != 0x1234u)
+        Fail("t1084: the main thread takes the address back with its kind and the stamp it was taken at");
+    if (sqevent::TagAddr((const char*)&chars[1] + 1, sqevent::kKindCharacter, 0) != 0) Fail("t1084: an unaligned address is not queued");
+    if (sqevent::TagAddr(&chars[1], sqevent::kKindCount, 0) != 0) Fail("t1084: an unknown kind is not queued");
+    if (sqevent::RingTake(&r, got, sqevent::kRingCap) != 0) Fail("t1084: a taken ring is empty");
+    for (i = 0; i < sqevent::kRingCap; ++i) if (sqevent::RingPush(&r, &chars[i % 3], sqevent::kKindCharacter) != sqevent::kPushQueued) Fail("t1084: the ring holds kRingCap addresses");
+    if (sqevent::RingPush(&r, &chars[0], sqevent::kKindCharacter) != sqevent::kPushFull) Fail("t1084: a full ring refuses (counted by the caller), it never overwrites");
+    if (sqevent::RingTake(&r, got, 10) != 10 || sqevent::RingTake(&r, got, sqevent::kRingCap) != sqevent::kRingCap - 10)
+        Fail("t1084: a take bounded by its room leaves the rest for the next take");
+}
+
 
 /* inv7c fold (review-inv7c): a live row relinked at link-up, the quiet clock paused while down, done-before-relinked ordering,
    three refusals -> the ground, the taker list's eviction. */
@@ -24477,7 +25535,7 @@ void t_t904_wall_hit()
     std::vector<char> b;
     if (!coopbuild::EncodeBuild(&b, h)) Fail("T-904: a HIT ask did not encode");
     const size_t at = 2 + h.key.size();   /* kind, key length, key */
-    if (b.size() != at + 13) Fail("T-904: a HIT is not kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict (" + I((int)b.size()) + " bytes)");
+    if (b.size() != at + 15) Fail("T-904: a HIT is not kind | key | u32 seq | f32 cut | f32 blunt | u8 verdict | i8 door | u8 repair (" + I((int)b.size()) + " bytes)");
     coopbuild::BuildMsg d;
     if (b.empty() || coopbuild::DecodeBuild(&b[0], b.size(), &d) != coopbuild::kBuildDecodeOk || d.kind != coopbuild::kBuildHit || d.key != h.key || d.seq != 77u
         || d.hitCut != 12.5f || d.hitBlunt != 3.25f || d.reason != coopbuild::kBuildHitAsk) Fail("T-904: a HIT ask did not round trip");
@@ -29117,6 +30175,442 @@ void t_p105b3_merged_give_split()
     if (MergedGiveSplit(1, lifted, now, &restore) != 0) { ours = lifted; theirs = restore; } else { ours = now; theirs = 0; }
     if (ours != 5 || theirs != 10 || ours + theirs != 15) Fail("P105b3 merged give: after the put-back nothing exists twice and nothing is lost");
 }
+/* T-1079: a move made without the cursor (the right-click; rcgive.h - the header items.cpp's ItRcGiveDrainPass / ItRcGiveRun call). Each
+   case folds the destination changes the engine rings for it (decomp_713150: one unit per call; a stack copies a unit and lowers the
+   source with a raw write, the last unit leaves as itself) and asks what happens to the units. */
+static int RcFold(const int* ops, const int* qty, const int* before, const unsigned long long* obj, int n, rcgive::Piece* pc, int* count)
+{
+    int uncounted = 0;
+    *count = 0;
+    for (int i = 0; i < n; ++i)
+        if (rcgive::AddEntry(pc, count, 4, obj[i], ops[i], qty[i], before[i], 0) == 0) ++uncounted;
+    return uncounted;
+}
+/* a shift-click of a whole stack of `q` into an empty part of a container: a copied unit lands (op 0), the next copies and finally
+   the source object itself are added onto it (op 2) */
+static int RcWholeStack(int q, int* ops, int* qty, int* before, unsigned long long* obj)
+{
+    ops[0] = 0; qty[0] = 1; before[0] = 0; obj[0] = 0xC1;
+    for (int i = 1; i < q; ++i) { ops[i] = 2; before[i] = i; qty[i] = i + 1; obj[i] = 0xC1; }
+    int units = 0;
+    for (int k = q; k >= 1; --k) units += rcgive::UnitsMoved(k, k > 1 ? 1 : 0, k > 1 ? k - 1 : -1);
+    return units;
+}
+void t_t1079_units_moved()
+{
+    using namespace rcgive;
+    if (UnitsMoved(9, 1, 8) != 1) Fail("T-1079: one unit off a stack of 9 - 1 moved");
+    if (UnitsMoved(1, 0, -1) != 1) Fail("T-1079: the last unit left as itself - 1 moved");
+    if (UnitsMoved(5, 1, 5) != 0) Fail("T-1079: the stack did not change - nothing moved");
+    if (UnitsMoved(5, 1, -1) != 0) Fail("T-1079: an unread count after the call - nothing counted");
+    if (UnitsMoved(0, 0, -1) != 0) Fail("T-1079: no count before the call - nothing counted");
+}
+void t_t1079_applies()
+{
+    using namespace rcgive;
+    if (Applies(1, 0, 1, 0) != 1) Fail("T-1079: our character and a container another game writes - this road");
+    if (Applies(1, 1, 1, 0) != 0) Fail("T-1079: our own box (or our own character) - everything as before");
+    if (Applies(1, 0, 0, 0) != 0) Fail("T-1079: a container nobody can be asked about - everything as before");
+    if (Applies(1, 0, 1, 1) != 0) Fail("T-1079: a shop's stock - the trade intercept's road, exactly as before");
+    if (Applies(0, 0, 1, 0) != 0) Fail("T-1079: our character is no longer this game's - not ours to give or take");
+    if (ChangeIsTheClicks(1, 0) != 0) Fail("T-1079: another item's change in the window is not the click's - left as it was");
+    if (ChangeIsTheClicks(1, 1) != 1 || ChangeIsTheClicks(0, 0) != 1) Fail("T-1079: the clicked item's change (or one not read) belongs to the click");
+}
+void t_t1079_give_whole_stack()
+{
+    using namespace rcgive;
+    int ops[9], qty[9], before[9]; unsigned long long obj[9];
+    const int units = RcWholeStack(9, ops, qty, before, obj);
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 9, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (units != 9 || un != 0 || count != 1 || pc[0].gain != 9) Fail("T-1079 give whole stack: 9 lost, one object gained 9");
+    if (Decide(units, 9, un, pc, count, same) != kPair) Fail("T-1079 give whole stack: paired - the box's writer is asked for 9");
+    if (PieceRoad(1, 1, 9, 9) != kPrWhole) Fail("T-1079 give whole stack: the object holds only our 9 - it comes back whole before the ask");
+}
+void t_t1079_give_part_stack()
+{
+    using namespace rcgive;
+    const int ops[3] = { 0, 2, 2 }, qty[3] = { 1, 2, 3 }, before[3] = { 0, 1, 2 };
+    const unsigned long long obj[3] = { 0xC1, 0xC1, 0xC1 };
+    const int units = UnitsMoved(10, 1, 9) + UnitsMoved(9, 1, 8) + UnitsMoved(8, 1, 7);
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 3, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (Decide(units, 3, un, pc, count, same) != kPair || pc[0].gain != 3) Fail("T-1079 give part stack: 3 of 10 - a give of 3");
+    if (PieceRoad(1, 0, 3, 3) != kPrSplit) Fail("T-1079 give part stack: the units go back onto our stack before the ask");
+}
+void t_t1079_give_onto_stack()
+{
+    using namespace rcgive;
+    const int ops[4] = { 2, 2, 2, 2 }, qty[4] = { 7, 8, 9, 10 }, before[4] = { 6, 7, 8, 9 };
+    const unsigned long long obj[4] = { 0xB0, 0xB0, 0xB0, 0xB0 };
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 4, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (Decide(4, 4, un, pc, count, same) != kPair || pc[0].gain != 4) Fail("T-1079 give onto a stack: their 6 + our 4 - a give of 4");
+    if (PieceRoad(1, 1, 10, 4) != kPrMergedGive) Fail("T-1079 give onto a stack, our stack gone: only our 4 come back, their 6 are rebuilt");
+    int restore = 0;
+    if (ownpick::MergedGiveSplit(1, 4, 10, &restore) != 1 || restore != 6) Fail("T-1079 give onto a stack: the put-back leaves their 6");
+    if (PieceRoad(1, 0, 10, 4) != kPrSplit) Fail("T-1079 give onto a stack, ours still there: the split undo lowers theirs by 4");
+}
+void t_t1079_give_spread()
+{
+    using namespace rcgive;
+    const int ops[5] = { 2, 2, 0, 2, 2 }, qty[5] = { 19, 20, 1, 2, 3 }, before[5] = { 18, 19, 0, 1, 2 };
+    const unsigned long long obj[5] = { 0xB0, 0xB0, 0xC1, 0xC1, 0xC1 };
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 5, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (Decide(5, 5, un, pc, count, same) != kPair || count != 2 || pc[0].gain != 2 || pc[1].gain != 3)
+        Fail("T-1079 give spread: 2 onto their stack and 3 as a new object - two asks, 5 in all");
+}
+void t_t1079_take_whole_stack()
+{
+    using namespace rcgive;
+    /* shift-click on their stack of 6 onto an empty part of our character: our new object ends with all 6, theirs is gone */
+    int ops[6], qty[6], before[6]; unsigned long long obj[6];
+    const int units = RcWholeStack(6, ops, qty, before, obj);
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 6, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (Decide(units, 6, un, pc, count, same) != kPair) Fail("T-1079 take whole stack: 6 lost there, 6 gained here - the writer is asked");
+    if (PieceRoad(0, 1, 6, 6) != kPrWhole) Fail("T-1079 take whole stack: our object holds only their 6 - it goes back whole into their cell");
+}
+void t_t1079_take_part_and_onto()
+{
+    using namespace rcgive;
+    /* two single right-clicks off their stack of 5 onto our stack of 3 (theirs stays at 3) */
+    const int ops[2] = { 2, 2 }, qty[2] = { 4, 5 }, before[2] = { 3, 4 };
+    const unsigned long long obj[2] = { 0xA0, 0xA0 };
+    const int units = UnitsMoved(5, 1, 4) + UnitsMoved(4, 1, 3);
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 2, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (Decide(units, 2, un, pc, count, same) != kPair || pc[0].gain != 2) Fail("T-1079 take part: 2 of their 5 onto our 3 - a take of 2");
+    if (PieceRoad(0, 0, 5, 2) != kPrSplit) Fail("T-1079 take part: their stack stays - our stack is lowered by 2 and theirs raised before the ask");
+    if (PieceRoad(0, 1, 5, 2) != kPrMergedTake) Fail("T-1079 take onto our stack with their object gone: only the 2 gained come off it and are asked for");
+    if (BackTakesWhole(5, 2) != 0 || BackTakesWhole(2, 2) != 1) Fail("T-1079 back: our stack is lowered; an object holding only the units leaves whole");
+}
+void t_t1079_take_merged_last_unit()
+{
+    using namespace rcgive;
+    /* T1581: a right-click on their last unit (their stack of 1) onto our stack of 3 - the engine merges it and their object is gone */
+    const int ops[1] = { 2 }, qty[1] = { 4 }, before[1] = { 3 };
+    const unsigned long long obj[1] = { 0xA0 };
+    const int units = UnitsMoved(1, 0, -1);
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 1, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (Decide(units, 1, un, pc, count, same) != kPair || count != 1 || pc[0].gain != 1)
+        Fail("T-1079 merged take: their last unit onto our 3 - paired by record and units, a take of 1");
+    if (PieceRoad(0, 1, 4, pc[0].gain) != kPrMergedTake) Fail("T-1079 merged take: sent to the box's writer, never put back unasked");
+    int keep = 0, back = 0;
+    if (MergedTakeSplit(4, pc[0].gain, &keep, &back) != 1 || keep != 3 || back != 1)
+        Fail("T-1079 merged take: the undo leaves our 3 and makes their 1 again in their cell");
+    /* units on both sides: ours before the click (3) is what the undo leaves, theirs (1) is what the request carries */
+    if (keep + back != 4 || keep != 4 - units || back != units) Fail("T-1079 merged take: no unit made or lost by the undo");
+}
+void t_t1079_take_merged_shift_click()
+{
+    using namespace rcgive;
+    /* shift-click on their stack of 5 onto our stack of 3: five rises on our object (3 -> 8), their object gone */
+    const int ops[5] = { 2, 2, 2, 2, 2 }, qty[5] = { 4, 5, 6, 7, 8 }, before[5] = { 3, 4, 5, 6, 7 };
+    const unsigned long long obj[5] = { 0xA0, 0xA0, 0xA0, 0xA0, 0xA0 };
+    int units = 0;
+    for (int k = 5; k >= 1; --k) units += UnitsMoved(k, k > 1 ? 1 : 0, k > 1 ? k - 1 : -1);
+    Piece pc[4]; int count = 0;
+    const int un = RcFold(ops, qty, before, obj, 5, pc, &count);
+    const int same[4] = { 1, 1, 1, 1 };
+    if (units != 5 || Decide(units, 5, un, pc, count, same) != kPair || count != 1 || pc[0].gain != 5)
+        Fail("T-1079 merged shift-click: 5 lost there, 5 gained on our stack - a take of 5");
+    if (PieceRoad(0, 1, 8, 5) != kPrMergedTake) Fail("T-1079 merged shift-click: only the 5 gained are split off and asked for");
+    int keep = 0, back = 0;
+    if (MergedTakeSplit(8, 5, &keep, &back) != 1 || keep != 3 || back != 5 || keep + back != 8)
+        Fail("T-1079 merged shift-click: the undo leaves our 3 and makes their 5 again - no unit made or lost");
+    if (MergedTakeSplit(5, 5, &keep, &back) != 0 || keep != 0 || back != 0)
+        Fail("T-1079 merged split: an object holding only the gained units is the whole road, not a split");
+    if (MergedTakeSplit(5, 0, &keep, &back) != 0) Fail("T-1079 merged split: nothing gained is nothing to split");
+    if (PieceRoad(0, 1, 5, 5) != kPrWhole) Fail("T-1079 take onto an empty cell: the object goes back whole, as before");
+}
+void t_t1079_give_merged_source_stays()
+{
+    using namespace rcgive;
+    /* a give of 4 off our stack of 9 that stays, onto their stack of 6: unchanged - the split undo lowers theirs by 4 */
+    if (PieceRoad(1, 0, 10, 4) != kPrSplit) Fail("T-1079 merged give, our stack stays: the split road as before");
+    if (PieceRoad(1, 1, 10, 4) != kPrMergedGive) Fail("T-1079 merged give, our stack gone: the merged-give road as before");
+    if (PieceRoad(0, 0, 10, 4) != kPrSplit) Fail("T-1079 merged take, their stack stays: the split road as before");
+}
+void t_t1079_mismatch_back()
+{
+    using namespace rcgive;
+    const int same[4] = { 1, 1, 1, 1 };
+    const int diff[4] = { 0, 1, 1, 1 };
+    Piece pc[4]; int count = 0;
+    {   /* one change did not reach the ring: 8 gained, 9 lost */
+        int ops[9], qty[9], before[9]; unsigned long long obj[9];
+        RcWholeStack(9, ops, qty, before, obj);
+        const int un = RcFold(ops, qty, before, obj, 8, pc, &count);
+        if (Decide(9, 8, un, pc, count, same) != kBack) Fail("T-1079 mismatch: 9 lost, 8 gained - back to the source, never an ask for 8");
+    }
+    {   /* the destination object carries another record */
+        const int ops[1] = { 0 }, qty[1] = { 1 }, before[1] = { 0 };
+        const unsigned long long obj[1] = { 0xC1 };
+        const int un = RcFold(ops, qty, before, obj, 1, pc, &count);
+        if (Decide(1, 1, un, pc, count, diff) != kBack) Fail("T-1079 mismatch: another item's record - back to the source");
+    }
+    {   /* an op 2 whose count before was not read */
+        const int ops[2] = { 0, 2 }, qty[2] = { 1, 2 }, before[2] = { 0, 0 };
+        const unsigned long long obj[2] = { 0xC1, 0xC1 };
+        const int un = RcFold(ops, qty, before, obj, 2, pc, &count);
+        if (un != 1 || Decide(2, 2, un, pc, count, same) != kBack) Fail("T-1079 mismatch: an uncounted change - back to the source");
+    }
+    {   /* something of the clicked item also left the destination inside the window */
+        const int ops[2] = { 0, 1 }, qty[2] = { 1, 1 }, before[2] = { 0, 0 };
+        const unsigned long long obj[2] = { 0xC1, 0xD1 };
+        const int un = RcFold(ops, qty, before, obj, 2, pc, &count);
+        if (Decide(1, 2, un, pc, count, same) != kBack) Fail("T-1079 mismatch: a removal in the destination - back to the source");
+    }
+    {   /* more objects than the pairing holds */
+        int ops[5], qty[5], before[5]; unsigned long long obj[5];
+        for (int i = 0; i < 5; ++i) { ops[i] = 0; qty[i] = 1; before[i] = 0; obj[i] = 0xC1 + (unsigned long long)i; }
+        const int un = RcFold(ops, qty, before, obj, 5, pc, &count);
+        if (Decide(5, 5, un, pc, count, same) != kBack) Fail("T-1079 mismatch: five objects - back to the source");
+    }
+    if (EntryGain(0, 0, 0) != -1 || EntryGain(2, 3, 5) != -1 || EntryGain(3, 1, 0) != -1) Fail("T-1079: an empty add, a fall and a split are not gains");
+    if (BackRaises(0, 1) != 1 || BackRaises(1, 0) != 0 || BackRaises(0, 0) != 0) Fail("T-1079 back: raised onto the source stack only while it is in its cell");
+}
+void t_t1079_not_this_road()
+{
+    using namespace rcgive;
+    const int same[4] = { 1, 1, 1, 1 };
+    Piece pc[4];
+    pc[0].obj = 0; pc[0].gain = 0;
+    if (Decide(3, 0, 0, pc, 0, same) != kNone) Fail("T-1079: no change of the clicked item in the destination - everything as before");
+    if (RefuseUnrecorded(1, -1) != 1) Fail("T-1079: a click with no record row left is refused before anything moves");
+    if (RefuseUnrecorded(1, 0) != 0 || RefuseUnrecorded(0, -1) != 0) Fail("T-1079: a recorded click, or one not this road's, runs");
+}
+/* T-1079 fold 2: the back road's one rule - units returned == units taken out of the destination, per object and in all - and the
+   guards around it (rcgive.h; the header ItRcMoveBack / ItRcGiveBack / ItRcGiveRun call). */
+static int RcBackRow(const int* now, const int* gain, const int* takeOk, int pieces, int lost, int* takenOut)
+{
+    int lacking = lost, returned = 0;
+    *takenOut = 0;
+    for (int p = 0; p < pieces; ++p)
+    {
+        const int want = rcgive::BackWant(gain[p], lacking);
+        const int got = rcgive::BackUnitsTaken(want > 0 ? takeOk[p] : 0, now[p], want);
+        if (takeOk[p] != 0 && want > 0) *takenOut += (rcgive::BackTakesWhole(now[p], want) != 0) ? now[p] : want;
+        returned += got;
+        lacking -= got;
+    }
+    return returned;
+}
+void t_t1079_back_conservation()
+{
+    using namespace rcgive;
+    int taken = 0;
+    {   /* whole stack: one new object holding all 9 - taken out whole, 9 back */
+        const int now[1] = { 9 }, gain[1] = { 9 }, ok[1] = { 1 };
+        if (RcBackRow(now, gain, ok, 1, 9, &taken) != 9 || taken != 9) Fail("T-1079 back whole stack: 9 out, 9 back");
+    }
+    {   /* part stack: 3 of 10 as a new object */
+        const int now[1] = { 3 }, gain[1] = { 3 }, ok[1] = { 1 };
+        if (RcBackRow(now, gain, ok, 1, 3, &taken) != 3 || taken != 3) Fail("T-1079 back part stack: 3 out, 3 back");
+    }
+    {   /* onto their stack of 6: lowered by our 4, their 6 stay */
+        const int now[1] = { 10 }, gain[1] = { 4 }, ok[1] = { 1 };
+        if (RcBackRow(now, gain, ok, 1, 4, &taken) != 4 || taken != 4) Fail("T-1079 back onto a stack: 4 out of their 10, 4 back");
+    }
+    {   /* spread: 2 onto their stack, 3 as a new object */
+        const int now[2] = { 20, 3 }, gain[2] = { 2, 3 }, ok[2] = { 1, 1 };
+        if (RcBackRow(now, gain, ok, 2, 5, &taken) != 5 || taken != 5) Fail("T-1079 back spread: 2 + 3 out, 5 back");
+    }
+    {   /* spread, the second object cannot be taken out: only the 2 come back, the 3 stay in the destination */
+        const int now[2] = { 20, 3 }, gain[2] = { 2, 3 }, ok[2] = { 1, 0 };
+        if (RcBackRow(now, gain, ok, 2, 5, &taken) != 2 || taken != 2) Fail("T-1079 back spread, one object stuck: 2 out, 2 back - never 5");
+    }
+    {   /* the destination shows more of the item than the source lost (another change of the same item): never more back than lost */
+        const int now[2] = { 4, 6 }, gain[2] = { 4, 6 }, ok[2] = { 1, 1 };
+        const int back = RcBackRow(now, gain, ok, 2, 7, &taken);
+        if (back != 7 || taken != 7) Fail("T-1079 back over-gain: 7 lost, 7 out, 7 back");
+    }
+    {   /* fewer listed than lost (a change missed): only what was listed and taken out comes back */
+        const int now[1] = { 8 }, gain[1] = { 8 }, ok[1] = { 1 };
+        if (RcBackRow(now, gain, ok, 1, 9, &taken) != 8 || taken != 8) Fail("T-1079 back under-listed: 8 out, 8 back, 1 left where it is");
+    }
+    if (BackUnitsTaken(0, 9, 9) != 0) Fail("T-1079 back: nothing taken out, nothing returned");
+    if (BackWant(5, 3) != 3 || BackWant(2, 3) != 2 || BackWant(4, 0) != 0) Fail("T-1079 back: an object is asked for its gain, never more than the source lacks");
+}
+void t_t1079_guards()
+{
+    using namespace rcgive;
+    if (RowFull(31, 32) != 0 || RowFull(32, 32) != 1) Fail("T-1079: a row closes at its call cap - every destination object stays listable");
+    if (RefuseOffMain(1, 0) != 1 || RefuseOffMain(1, 1) != 0 || RefuseOffMain(0, 0) != 0) Fail("T-1079: a click of this road off the main thread is refused");
+    if (FlushSourceOnDrop(1, 1) != 1 || FlushSourceOnDrop(0, 1) != 0 || FlushSourceOnDrop(1, 0) != 0)
+        Fail("T-1079: a dropped record publishes the source count only when this game writes it and the stack is in its cell");
+    if (PublishOriginalRemoval(1, 1, 1) != 1) Fail("T-1079: a whole-stack give that fell back publishes the original's removal");
+    if (PublishOriginalRemoval(1, 0, 1) != 0 || PublishOriginalRemoval(0, 1, 1) != 0 || PublishOriginalRemoval(1, 1, 0) != 0)
+        Fail("T-1079: no removal published for a stack that stays, a take, or a give that did not fall back");
+    /* the whole-stack give that falls back, as the other games see it: the original (9) is removed once, what came back (9) is added -
+       9 there, as here; without the removal they would hold 18 */
+    const int others = 9 - ((PublishOriginalRemoval(1, 1, 1) != 0) ? 9 : 0) + 9;
+    if (others != 9) Fail("T-1079: the other games end with the count this game has");
+}
+/* T-1079 fold 3 / 4, THE NET (rcgive.h - the functions items.cpp's ItRcNetPass, ItRcGiveJobBuild and ItRcGiveBack call). Containers:
+   1 = our character, 2 = their box, 3 = a second container. rel: the object the engine's call tied to the change. */
+static rcgive::NetChange NetC(int side, int container, unsigned long long obj, int op, int quantity, int qtyBefore, unsigned long long rel)
+{
+    rcgive::NetChange c;
+    c.side = side; c.container = container; c.obj = obj; c.rel = rel; c.op = op; c.quantity = quantity; c.qtyBefore = qtyBefore; c.inPack = 0;
+    return c;
+}
+void t_t1079_net_split_take()
+{
+    using namespace rcgive;
+    /* T1558: 1 taken off their stack of 2 (op 3 on the stack, which stays, handing back 0xB0) lands on our character as 0xB0 (op 0, x1) */
+    const NetChange c[2] = { NetC(kSideTheirs, 2, 0xA0, 3, 1, 0, 0xB0), NetC(kSideOurs, 1, 0xB0, 0, 1, 0, 0) };
+    NetPlan p;
+    if (NetDecide(c, 2, 32, &p) != kNetPair) { Fail("T-1079 net: T1558's split take pairs"); return; }
+    if (p.give != 0 || p.units != 1 || p.gone != 0 || p.srcObj != 0xA0 || p.src != 0) Fail("T-1079 net: a take of 1 off their stack that stays");
+    /* the job's roles: the split is the source's change, the landing a destination change of the record */
+    if (JobRole(1, 0, 1, 3, 1, 1, 0, 0, 1, 1) != kJobSource || JobRole(1, 0, 1, 0, 0, 0, 1, 0, 1, 1) != kJobDest)
+        Fail("T-1079 net: the job takes the split as the source and the landing as the destination");
+    Piece pc[4]; int count = 0;
+    AddEntry(pc, &count, 4, 0xB0, 0, 1, 0, 0);
+    const int same[1] = { 1 };
+    if (Decide(p.units, 1, 0, pc, count, same) != kPair || PieceRoad(p.give, p.gone, 1, 1) != kPrSplit)
+        Fail("T-1079 net: the split take goes the request road, undone onto their stack");
+}
+void t_t1079_net_merge_give()
+{
+    using namespace rcgive;
+    NetPlan p;
+    /* the report: our whole object of 6 (op 1) added onto their stack of 4 (op 2, 4 -> 10, merging 0xC0 in) */
+    const NetChange c[2] = { NetC(kSideOurs, 1, 0xC0, 1, 6, 0, 0), NetC(kSideTheirs, 2, 0xD0, 2, 10, 4, 0xC0) };
+    if (NetDecide(c, 2, 32, &p) != kNetPair || p.give != 1 || p.units != 6 || p.gone != 1) { Fail("T-1079 net: a give onto their stack pairs"); return; }
+    if (PieceRoad(p.give, p.gone, 10, 6) != kPrMergedGive) Fail("T-1079 net: only our 6 come back off their stack of 10 for the request");
+    /* 2 split off our stack of 9 (op 3 handing back 0xC2, the stack stays), 0xC2 merged onto their stack (op 2, 4 -> 6) */
+    const NetChange c2[2] = { NetC(kSideOurs, 1, 0xC1, 3, 2, 0, 0xC2), NetC(kSideTheirs, 2, 0xD0, 2, 6, 4, 0xC2) };
+    if (NetDecide(c2, 2, 32, &p) != kNetPair || p.give != 1 || p.units != 2 || p.gone != 0 || PieceRoad(1, 0, 6, 2) != kPrSplit)
+        Fail("T-1079 net: units split off our stack onto theirs pair and go back onto our stack for the request");
+    /* the same split object spread over their two stacks (+2, +4) */
+    const NetChange c3[3] = { NetC(kSideOurs, 1, 0xC1, 3, 6, 0, 0xC2), NetC(kSideTheirs, 2, 0xD0, 2, 6, 4, 0xC2), NetC(kSideTheirs, 2, 0xD1, 2, 9, 5, 0xC2) };
+    if (NetDecide(c3, 3, 32, &p) != kNetPair || p.units != 6) Fail("T-1079 net: a give spread over two of their stacks pairs");
+}
+void t_t1079_net_not_paired()
+{
+    using namespace rcgive;
+    NetPlan p;
+    /* THE GUARD: our character eats 1 (an op 2 fall, no object handed on) while their box gains 1 of the record from elsewhere */
+    const NetChange e1[2] = { NetC(kSideOurs, 1, 0xE0, 2, 3, 4, 0), NetC(kSideTheirs, 2, 0xF9, 0, 1, 0, 0) };
+    const NetChange e2[2] = { NetC(kSideOurs, 1, 0xE0, 2, 3, 4, 0), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0xF8) };
+    const NetChange e3[2] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0xF8) };
+    const NetChange e4[2] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0) };
+    if (NetDecide(e1, 2, 32, &p) != kNetUnlinked || NetDecide(e2, 2, 32, &p) != kNetUnlinked || NetDecide(e3, 2, 32, &p) != kNetUnlinked
+        || NetDecide(e4, 2, 32, &p) != kNetUnlinked)
+        Fail("T-1079 net: a gain the engine's calls do not tie to our loss is never paired");
+    /* two of our characters each split 1 off and their box gained it: either could be the giver */
+    const NetChange a[3] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideOurs, 3, 0xE1, 3, 1, 0, 0xE6), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0xE5) };
+    if (NetDecide(a, 3, 32, &p) != kNetAmbiguous) Fail("T-1079 net: two candidates of one record on our side are ambiguous");
+    const NetChange b[3] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0xE5), NetC(kSideTheirs, 3, 0xF1, 0, 1, 0, 0) };
+    if (NetDecide(b, 3, 32, &p) != kNetAmbiguous) Fail("T-1079 net: two candidates on their side are ambiguous");
+    const NetChange o[3] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideOursOther, 3, 0xE2, 0, 1, 0, 0), NetC(kSideTheirs, 2, 0xF0, 3, 2, 0, 0xF5) };
+    if (NetDecide(o, 3, 32, &p) != kNetAmbiguous) Fail("T-1079 net: our box and our character together are ambiguous");
+    /* counts that differ, a gain on both sides, losses off two objects, a change in a pack */
+    const NetChange u1[2] = { NetC(kSideOurs, 1, 0xE0, 3, 2, 0, 0xE5), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0xE5) };
+    const NetChange u2[2] = { NetC(kSideOurs, 1, 0xE0, 0, 1, 0, 0), NetC(kSideTheirs, 2, 0xF0, 0, 1, 0, 0) };
+    const NetChange u3[3] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideOurs, 1, 0xE3, 1, 1, 0, 0), NetC(kSideTheirs, 2, 0xF0, 2, 6, 4, 0xE5) };
+    NetChange u4[2] = { NetC(kSideOurs, 1, 0xE0, 3, 1, 0, 0xE5), NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0xE5) };
+    u4[1].inPack = 1;
+    if (NetDecide(u1, 2, 32, &p) != kNetUnbalanced || NetDecide(u2, 2, 32, &p) != kNetUnbalanced || NetDecide(u3, 3, 32, &p) != kNetUnbalanced
+        || NetDecide(u4, 2, 32, &p) != kNetUnbalanced)
+        Fail("T-1079 net: a shape that is not one move of equal units is not paired");
+    const NetChange l1[1] = { NetC(kSideTheirs, 2, 0xF0, 2, 5, 4, 0) };
+    const NetChange l2[1] = { NetC(kSideOurs, 1, 0xE0, 2, 3, 4, 0) };
+    if (NetDecide(l1, 1, 32, &p) != kNetNone || NetDecide(l2, 1, 32, &p) != kNetNone) Fail("T-1079 net: a one-sided change is today's road");
+    const NetChange h[2] = { NetC(kSideOursOther, 3, 0xE2, 0, 1, 0, 0), NetC(kSideTheirs, 2, 0xF0, 3, 1, 0, 0xE2) };
+    if (NetDecide(h, 2, 32, &p) != kNetNotCharacter) Fail("T-1079 net: a box of ours is not the net's road");
+    const NetChange m[4] = { NetC(kSideOurs, 1, 0xE0, 3, 3, 0, 0xE5), NetC(kSideTheirs, 2, 0xF0, 2, 2, 1, 0xE5), NetC(kSideTheirs, 2, 0xF1, 2, 2, 1, 0xE5),
+                             NetC(kSideTheirs, 2, 0xF2, 2, 2, 1, 0xE5) };
+    if (NetDecide(m, 4, 2, &p) != kNetTooMany || NetDecide(m, 4, 3, &p) != kNetPair) Fail("T-1079 net: the job's object cap is respected");
+    if (NetLoss(2, 3, 0) != -1 || NetLoss(2, 5, 4) != -1 || NetLoss(2, 3, 4) != 1 || NetLoss(0, 3, 0) != -1)
+        Fail("T-1079 net: a fall needs the count before it; a rise or an add is no loss");
+}
+void t_t1079_net_grouping()
+{
+    using namespace rcgive;
+    /* sides and the skip list as the drain asks them */
+    if (NetSideOf(1, 0, 1, 0, 0, 0) != kSideTheirs || NetSideOf(1, 0, 0, 1, 0, 0) != kSideOursOther || NetSideOf(1, 0, 0, 0, 0, 0) != -1)
+        Fail("T-1079 net: a box's side is its area verdict");
+    if (NetSideOf(0, 1, 0, 0, 7, 1) != kSideOurs || NetSideOf(0, 1, 0, 0, 7, 0) != kSideTheirs || NetSideOf(0, 1, 0, 0, 0, 1) != -1 || NetSideOf(0, 0, 0, 0, 7, 1) != -1)
+        Fail("T-1079 net: a character's side is its uid; no uid, or a pack, is not judged");
+    for (int b = 0; b < 8; ++b)
+    {
+        const int f[8] = { b == 0, b == 1, b == 2, b == 3, b == 4, b == 5, b == 6, b == 7 };
+        if (NetSkip(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]) != 1) Fail("T-1079 net: every claim of another road keeps a change out of the net");
+    }
+    if (NetSkip(0, 0, 0, 0, 0, 0, 0, 0) != 0) Fail("T-1079 net: an unclaimed, named change is the net's");
+    /* six changes as the drain numbers them: record 0 (k 0, 2, 5), record 1 (k 1, 4), one not live (k 3, record 0) */
+    NetIn in[6];
+    const int live[6] = { 1, 1, 1, 0, 1, 1 }, kind[6] = { 0, 1, 0, 0, 1, 0 }, side[6] = { 0, 1, 1, 1, 0, 1 }, cont[6] = { 0, 1, 2, 2, 0, 2 };
+    for (int k = 0; k < 6; ++k)
+    {
+        in[k].live = live[k]; in[k].kind = kind[k]; in[k].side = side[k]; in[k].container = cont[k];
+        in[k].obj = 0x100 + k; in[k].rel = 0; in[k].op = 2; in[k].quantity = 1; in[k].qtyBefore = 2; in[k].inPack = 0;
+    }
+    int done[6] = { 0, 0, 0, 0, 0, 0 }, grp[4], over = 0;
+    NetChange out[4];
+    const int g0 = NetGroup(in, 6, 0, done, grp, out, 4, &over);
+    if (g0 != 3 || grp[0] != 0 || grp[1] != 2 || grp[2] != 5 || over != 0 || done[3] != 0 || done[1] != 0 || out[1].container != 2 || out[1].side != 1)
+        Fail("T-1079 net: a group is every live change of one record, in drain order");
+    const int g1 = NetGroup(in, 6, 1, done, grp, out, 4, &over);
+    if (g1 != 2 || grp[0] != 1 || grp[1] != 4) Fail("T-1079 net: the next record's group");
+    int done2[6] = { 0, 0, 0, 0, 0, 0 };
+    if (NetGroup(in, 6, 0, done2, grp, out, 2, &over) != 2 || over != 1 || done2[5] != 1) Fail("T-1079 net: a group past its cap says so and is all marked");
+}
+void t_t1079_net_job_role()
+{
+    using namespace rcgive;
+    /* handled by another road, or outside the window: nothing */
+    if (JobRole(1, 1, 1, 0, 0, 0, 1, 0, 1, 1) != kJobNone || JobRole(1, 0, 0, 0, 0, 0, 1, 0, 1, 1) != kJobNone) Fail("T-1079 job: claimed or outside: nothing");
+    /* a click's source is only the clicked object's op 1; a net row's is every change of its source object */
+    if (JobRole(0, 0, 1, 3, 1, 1, 0, 0, 1, 1) != kJobNone || JobRole(0, 0, 1, 1, 1, 1, 0, 0, 1, 1) != kJobSource
+        || JobRole(1, 0, 1, 2, 1, 1, 0, 0, 1, 1) != kJobSource)
+        Fail("T-1079 job: the source's changes");
+    /* a destination change of an unread record: a click lists it (read live with its piece), a net row does not */
+    if (JobRole(0, 0, 1, 0, 0, 0, 1, 0, 0, 0) != kJobDest || JobRole(1, 0, 1, 0, 0, 0, 1, 0, 0, 0) != kJobNone)
+        Fail("T-1079 job: an unread record - the click's, never the net's");
+    if (JobRole(0, 0, 1, 0, 0, 0, 1, 0, 1, 0) != kJobNone || JobRole(1, 0, 1, 0, 0, 0, 1, 1, 0, 0) != kJobDest)
+        Fail("T-1079 job: another record is left; an object already listed stays the row's");
+}
+struct NetBackFake { const int* now; const int* takenOut; int calls; };
+static int NetBackFakeMove(void* ctx, int p, int want)
+{
+    NetBackFake* f = (NetBackFake*)ctx;
+    ++f->calls;
+    return rcgive::BackUnitsTaken(f->takenOut[p], f->now[p], want);
+}
+void t_t1079_net_refusal_units()
+{
+    using namespace rcgive;
+    /* a net give of 6 spread +2 / +4 over their two stacks (10 and 9 now) taking the back road: exactly 6 back, nothing doubled */
+    const int gain[2] = { 2, 4 }, ok[2] = { 1, 1 }, now[2] = { 10, 9 }, taken[2] = { 1, 1 };
+    NetBackFake f; f.now = now; f.takenOut = taken; f.calls = 0;
+    if (BackRun(6, gain, ok, 2, NetBackFakeMove, &f) != 0 || f.calls != 2) Fail("T-1079 net: the back road returns exactly the units the source lost");
+    /* a piece that cannot be taken out gives nothing back: its units stay where they are and are counted as lacking, never invented */
+    const int taken2[2] = { 1, 0 };
+    NetBackFake f2; f2.now = now; f2.takenOut = taken2; f2.calls = 0;
+    if (BackRun(6, gain, ok, 2, NetBackFakeMove, &f2) != 4) Fail("T-1079 net: a piece not taken out leaves its units lacking");
+    /* a piece not listed at the pass is never asked */
+    const int ok3[2] = { 0, 1 };
+    NetBackFake f3; f3.now = now; f3.takenOut = taken; f3.calls = 0;
+    if (BackRun(6, gain, ok3, 2, NetBackFakeMove, &f3) != 2 || f3.calls != 1) Fail("T-1079 net: an unlisted piece keeps its old road");
+    /* a whole object holding no more than its share comes back whole (3 of a 3), and the next piece is asked only for what still lacks */
+    const int gain4[2] = { 3, 4 }, now4[2] = { 3, 9 };
+    NetBackFake f4; f4.now = now4; f4.takenOut = taken; f4.calls = 0;
+    if (BackRun(5, gain4, ok, 2, NetBackFakeMove, &f4) != 0) Fail("T-1079 net: never more back in all than the source lost");
+}
 /* one unit off our stack of 10, dropped into a box another game writes, on every ending: what our game, the writer and a third game
    end up holding. `others` is what the other games show of our stack (the last count we published); the give road's put-back and
    escrow lift are silent, and the stack's count is published at the end of every drain that touched it (SplitCountPublish). */
@@ -31831,7 +33325,7 @@ void t_t313_feed_wire_malformed()
     }
     std::vector<char> t = o; t[0] = 0; if (coopfeed::FeedDecode(&t[0], t.size(), &m)) Fail("kind 0 decoded");
     t = o; t[0] = 5; if (coopfeed::FeedDecode(&t[0], t.size(), &m)) Fail("kind 5 decoded");
-    t = e; t[t.size() - 9] = 2; if (coopfeed::FeedDecode(&t[0], t.size(), &m)) Fail("a PAGE_END with last=2 decoded");
+    t = e; t[t.size() - 10] = 2; if (coopfeed::FeedDecode(&t[0], t.size(), &m)) Fail("a PAGE_END with last=2 decoded");   /* T-985 C2b fold 6: last sits before complete */
     t = a; t[4] = (char)0xFF; if (coopfeed::FeedDecode(&t[0], t.size(), &m)) Fail("an ASK whose key length runs past the message decoded");
     std::vector<char> big; std::string longKey(coopfeed::kFeedKeyMax + 1, 'x');
     if (coopfeed::FeedEncodeAsk(&big, longKey) || !big.empty()) Fail("an ASK over the key bound was encoded, or a refused encode appended bytes");
@@ -32006,13 +33500,13 @@ void t_t716_repair_removed()
 }
 void t_t313_protocol_63_both_sides()
 {
-    if (coopfeed::kFeedProtocol != 108 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 108) Fail("the feed's protocol/message numbers are not 108/58");
+    if (coopfeed::kFeedProtocol != 121 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 121) Fail("the feed's protocol/message numbers are not 121/58");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
-    if (plugin.find("const unsigned int kStoreProtocol = 108;") == std::string::npos) Fail("the plugin does not speak world-server protocol 108");
-    if (server.find("const unsigned int kProtocol = 108;") == std::string::npos) Fail("the world server does not speak protocol 108");
-    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 108u) Fail("OWED is not 63 (protocol 108) on both sides and in owedpop.h");
-    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 108u) Fail("TOWN_LOSS is not 64 (protocol 108) on both sides and in townrefill.h");
+    if (plugin.find("const unsigned int kStoreProtocol = 121;") == std::string::npos) Fail("the plugin does not speak world-server protocol 121");
+    if (server.find("const unsigned int kProtocol = 121;") == std::string::npos) Fail("the world server does not speak protocol 121");
+    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 121u) Fail("OWED is not 63 (protocol 121) on both sides and in owedpop.h");
+    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 121u) Fail("TOWN_LOSS is not 64 (protocol 121) on both sides and in townrefill.h");
     if (plugin.find("kStoreMsgBundle = 59;") == std::string::npos || server.find("MSG_BUNDLE = 59") == std::string::npos || coopbundle::kMsgBundle != 59u) Fail("BUNDLE is not 59 on both sides and in sendbundle.h");
     if (plugin.find("kStoreMsgRecordFeed = 58;") == std::string::npos || server.find("MSG_RECORD_FEED = 58") == std::string::npos) Fail("RECORD_FEED is not 58 on both sides");
 }
@@ -32598,23 +34092,224 @@ void t_t985s2b_server_sends_area_done()
 /* the protocol constants agree: world-server 107 in the header of every message that pins it, on both sides */
 void t_t985s2b_protocols()
 {
-    if (coopfeed::kFeedProtocol != 108u || cooppre::kPreProtocol != 108u || owedpop::kProtocol != 108u || townrefill::kProtocol != 108u) Fail("the feed, preload, OWED and TOWN_LOSS headers are not world-server protocol 108");
+    if (coopfeed::kFeedProtocol != 121u || cooppre::kPreProtocol != 121u || owedpop::kProtocol != 121u || townrefill::kProtocol != 121u) Fail("the feed, preload, OWED and TOWN_LOSS headers are not world-server protocol 121");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
-    if (plugin.find("const unsigned int kStoreProtocol = 108;") == std::string::npos || server.find("const unsigned int kProtocol = 108;") == std::string::npos) Fail("the game and the world server do not both speak protocol 108");
+    if (plugin.find("const unsigned int kStoreProtocol = 121;") == std::string::npos || server.find("const unsigned int kProtocol = 121;") == std::string::npos) Fail("the game and the world server do not both speak protocol 121");
     const char* const heads[] = { "../common/authproof.h", "../common/baseshow.h", "../common/boxrec.h", "../common/groundrec.h", "../common/keptwire.h",
                                   "../common/moneywire.h", "../common/owedpop.h", "../common/preload.h", "../common/recordfeed.h", "../common/townrefill.h",
-                                  "../common/piecerec.h" };
+                                  "../common/piecerec.h", "../common/shoprec.h" };
     for (size_t i = 0; i < sizeof(heads) / sizeof(heads[0]); ++i)
     {
         const std::string s = T313ReadFile(heads[i]);
-        if (s.empty() || s.find("= 107;") != std::string::npos || s.find("= 108;") == std::string::npos) Fail(std::string("a header does not pin world-server protocol 108: ") + heads[i]);
+        if (s.empty() || s.find("= 120;") != std::string::npos || s.find("= 121;") == std::string::npos) Fail(std::string("a header does not pin world-server protocol 121: ") + heads[i]);
     }
+}
+/* ---- THE LOAD'S FETCH BY AREA (src/common/preload.h): an index row's area and size, INDEX_ASK's area list, the ring rule ---- */
+void t_preload_aoi_wire()
+{
+    std::vector<char> b; cooppre::PreMsg m;
+    std::vector<cooppre::IndexEntry> es;
+    es.push_back(cooppre::IndexEntry("Holy Nation|42", 100ULL, 150ULL, 10, 20, 4096u));
+    es.push_back(cooppre::IndexEntry("zone.63.0", 101ULL, 0ULL, 63, 0, 77u));
+    es.push_back(cooppre::IndexEntry("nowhere", 102ULL, 0ULL, cooppre::kPreNoArea, cooppre::kPreNoArea, 0u));
+    es[0].flags = cooppre::kPreRowOwn;   /* T-985 C2b fold 1: the row's own flag */
+    if (!cooppre::PreEncodeIndexPage(&b, 3u, true, es) || !cooppre::PreDecode(&b[0], b.size(), &m) || m.entries.size() != 3) { Fail("an INDEX_PAGE with areas did not round-trip"); return; }
+    if (m.entries[0].ax != 10 || m.entries[0].ay != 20 || m.entries[0].bytes != 4096u || m.entries[1].ax != 63 || m.entries[1].ay != 0 || m.entries[1].bytes != 77u
+        || m.entries[2].ax != cooppre::kPreNoArea || m.entries[2].ay != cooppre::kPreNoArea || m.entries[2].bytes != 0u || m.entries[0].posAt != 150ULL
+        || m.entries[0].flags != cooppre::kPreRowOwn || m.entries[1].flags != 0u || m.entries[2].flags != 0u)
+        Fail("an index row's area or size did not round-trip, or 'none' did not stay none");
+    std::vector<cooppre::IndexEntry> off; off.push_back(cooppre::IndexEntry("k", 1ULL, 0ULL, 64, 3, 1u));
+    std::vector<char> ob;
+    if (!cooppre::PreEncodeIndexPage(&ob, 3u, true, off) || !cooppre::PreDecode(&ob[0], ob.size(), &m) || m.entries.size() != 1 || m.entries[0].ax != cooppre::kPreNoArea || m.entries[0].ay != cooppre::kPreNoArea)
+        Fail("an area off the grid was not sent as none");
+    const size_t row0Area = coopfeed::kFeedHeader + 4 + 1 + 4 + 4 + std::string("Holy Nation|42").size() + 16;
+    { std::vector<char> c = b; c[row0Area] = (char)0xFF; if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("a row with x none and y set was accepted"); }
+    { std::vector<char> c = b; c[row0Area] = (char)64; if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("a row with an area off the grid was accepted"); }
+    { std::vector<char> c = b; c[row0Area + 6] = (char)2; if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("a row with an unknown flag was accepted"); }
+    for (size_t cut = coopfeed::kFeedHeader; cut < b.size(); ++cut) if (cooppre::PreDecode(&b[0], cut, &m)) { Fail("a cut INDEX_PAGE was accepted"); break; }
+
+    std::vector<int> xy; xy.push_back(5); xy.push_back(6); xy.push_back(0); xy.push_back(63);
+    std::vector<char> full;
+    if (!cooppre::PreEncodeIndexAsk(&full, 9u, "k1", 2, xy) || !cooppre::PreDecode(&full[0], full.size(), &m) || m.kind != (unsigned)cooppre::kPreIndexAsk
+        || m.token != 9u || m.key != "k1" || m.ring != 2u || m.areas != xy) { Fail("INDEX_ASK with an area list did not round-trip"); return; }
+    b.clear();
+    if (!cooppre::PreEncodeIndexAsk(&b, 9u, "", 2, std::vector<int>()) || !cooppre::PreDecode(&b[0], b.size(), &m) || !m.areas.empty() || m.ring != 0u || b.size() != 16)
+        Fail("INDEX_ASK with no list is not the 16-byte form with ring 0 and no areas");
+    b.clear(); coopfeed::FeedHead(&b, cooppre::kPreIndexAsk); coopfeed::FeedPut32(&b, 9u); coopfeed::FeedPutKey(&b, "");
+    if (cooppre::PreDecode(&b[0], b.size(), &m)) Fail("the short INDEX_ASK (no area field) was accepted");
+    for (size_t cut = 0; cut < full.size(); ++cut) if (cut > 0 && cooppre::PreDecode(&full[0], cut, &m)) { Fail("a cut INDEX_ASK was accepted"); break; }
+    { std::vector<char> c = full; c.push_back(0); if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("an INDEX_ASK with a trailing byte was accepted"); }
+    const size_t tail = coopfeed::kFeedHeader + 4 + 4 + 2;
+    { std::vector<char> c = full; c[tail] = 2; if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("an unknown area-field version was accepted"); }
+    { std::vector<char> c = full; c[tail + 1] = (char)(cooppre::kPreRingMax + 1); if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("a ring over the bound was accepted"); }
+    { std::vector<char> c = full; c[tail + 4] = 64; if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("an asked area off the grid was accepted"); }
+    { std::vector<char> c; cooppre::PreEncodeIndexAsk(&c, 9u, "", 0, std::vector<int>()); c[tail - 2 + 1] = 1; if (cooppre::PreDecode(&c[0], c.size(), &m)) Fail("a ring with no areas was accepted"); }
+    std::vector<int> bad = xy; bad[2] = 64; b.clear();
+    if (cooppre::PreEncodeIndexAsk(&b, 9u, "", 2, bad) || !b.empty()) Fail("an area off the grid was encoded");
+    std::vector<int> odd = xy; odd.push_back(1); b.clear();
+    if (cooppre::PreEncodeIndexAsk(&b, 9u, "", 2, odd) || !b.empty()) Fail("half an area was encoded");
+    std::vector<int> most(cooppre::kPreAreaMax * 2, 7); b.clear();
+    if (!cooppre::PreEncodeIndexAsk(&b, 9u, "", 2, most) || !cooppre::PreDecode(&b[0], b.size(), &m) || m.areas.size() != most.size()) Fail("the largest area list did not round-trip");
+    most.push_back(7); most.push_back(7); b.clear();
+    if (cooppre::PreEncodeIndexAsk(&b, 9u, "", 2, most) || !b.empty()) Fail("an area list over the bound was encoded");
+}
+void t_preload_aoi_ring()
+{
+    if (cooppre::kPreRing != areafile::kRing || cooppre::kPreGrid != areafile::kGrid || cooppre::kPreAreaMax != areafile::kMaxAreas || cooppre::kPreRing != 2)
+        Fail("the load's fetch ring, grid or area bound is not the area file's (ring 2)");
+    std::vector<int> xy; xy.push_back(10); xy.push_back(10);
+    if (cooppre::PreAoiClass(10, 10, xy, cooppre::kPreRing) != cooppre::kPreAoiIn) Fail("the list's own area is not inside");
+    if (cooppre::PreAoiClass(12, 8, xy, cooppre::kPreRing) != cooppre::kPreAoiIn || cooppre::PreAoiClass(8, 12, xy, cooppre::kPreRing) != cooppre::kPreAoiIn
+        || cooppre::PreAoiClass(12, 10, xy, cooppre::kPreRing) != cooppre::kPreAoiIn) Fail("an area on the ring's edge (2 squares, straight or diagonal) is not inside");
+    if (cooppre::PreAoiClass(13, 10, xy, cooppre::kPreRing) != cooppre::kPreAoiOut || cooppre::PreAoiClass(10, 7, xy, cooppre::kPreRing) != cooppre::kPreAoiOut
+        || cooppre::PreAoiClass(13, 13, xy, cooppre::kPreRing) != cooppre::kPreAoiOut) Fail("an area 3 squares away is not outside");
+    if (cooppre::PreAoiClass(cooppre::kPreNoArea, cooppre::kPreNoArea, xy, cooppre::kPreRing) != cooppre::kPreAoiNoArea || cooppre::PreAoiClass(64, 0, xy, cooppre::kPreRing) != cooppre::kPreAoiNoArea)
+        Fail("a row with no area (or one off the grid) is not NOAREA");
+    if (cooppre::PreAoiFetches(cooppre::kPreAoiIn) != 1 || cooppre::PreAoiFetches(cooppre::kPreAoiNoArea) != 1 || cooppre::PreAoiFetches(cooppre::kPreAoiNoList) != 1
+        || cooppre::PreAoiFetches(cooppre::kPreAoiOut) != 0) Fail("only OUT rows are left out of the load's fetch");
+    const std::vector<int> none;
+    if (cooppre::PreAoiClass(13, 10, none, cooppre::kPreRing) != cooppre::kPreAoiNoList || cooppre::PreAoiClass(cooppre::kPreNoArea, cooppre::kPreNoArea, none, cooppre::kPreRing) != cooppre::kPreAoiNoList)
+        Fail("with no list a row is not NOLIST (fetched)");
+    xy.push_back(40); xy.push_back(40);
+    if (cooppre::PreAoiClass(42, 41, xy, cooppre::kPreRing) != cooppre::kPreAoiIn || cooppre::PreAoiClass(43, 40, xy, cooppre::kPreRing) != cooppre::kPreAoiOut) Fail("the second area's ring is wrong");
+    for (int x = 0; x < cooppre::kPreGrid; ++x)
+        for (int y = 0; y < cooppre::kPreGrid; ++y)
+            if ((cooppre::PreAoiClass(x, y, xy, cooppre::kPreRing) == cooppre::kPreAoiIn) != (areafile::InRing(x, y, xy, areafile::kRing) != 0)) { Fail("the fetch ring and the area file's measure disagree"); return; }
+    /* the whole choice, as the game makes it (preload.h PreRowChoose, T-985 C2b fold 1): newer here (PreWant), no copy here, not own */
+    struct Row { int ax, ay; unsigned long long file; };
+    const Row rows[] = { { 11, 11, 200ULL }, { 30, 30, 200ULL }, { cooppre::kPreNoArea, cooppre::kPreNoArea, 200ULL }, { 11, 11, 0ULL } };
+    int withList = 0, withoutList = 0;
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+    {
+        const int want = cooppre::PreWant(0, 0, 0, rows[i].file, 0ULL, 0, 0, 1);
+        if (cooppre::PreRowChoose(cooppre::PreAoiClass(rows[i].ax, rows[i].ay, xy, cooppre::kPreRing), cooppre::kPreAoiNoArea, 0, 0, 0, 0, want).fetch != 0) ++withList;
+        if (cooppre::PreRowChoose(cooppre::PreAoiClass(rows[i].ax, rows[i].ay, none, cooppre::kPreRing), cooppre::kPreAoiNoArea, 0, 0, 0, 0, want).fetch != 0) ++withoutList;
+    }
+    if (withList != 2) Fail("with a list the load's fetch is not the newer rows inside plus the newer row with no area");
+    if (withoutList != 3) Fail("with no list the load's fetch is not every newer row");
+}
+/* T-985 C2b fold 1: the load's fetch choice for one row (PreRowChoose), the world server's row flags (PreRowPlace) and the
+   stale-hold rule at a snapshot not seen whole (PreStaleHoldKeeps) */
+void t_preload_aoi_choose()
+{
+    const int vIn = cooppre::kPreAoiIn, vOut = cooppre::kPreAoiOut, vNa = cooppre::kPreAoiNoArea, vNl = cooppre::kPreAoiNoList;
+    cooppre::PreRowPick p;
+    p = cooppre::PreRowChoose(vIn, vNa, 0, 0, 1, 0, 1);
+    if (!p.fetch || !p.confirmFirst || p.confirmAfter || p.skipSet || p.skipCount || p.held || p.byLocal || p.byOwn) Fail("a newer row inside is not fetched with its kept key released first");
+    p = cooppre::PreRowChoose(vIn, vNa, 0, 0, 0, 0, 0);
+    if (p.fetch || !p.confirmFirst || p.skipSet || p.skipCount) Fail("a current row inside is fetched or put in the skipped list");
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 0, 0, 0, 1);
+    if (p.fetch || !p.confirmFirst || !p.skipCount || !p.skipSet || p.held || p.staleHeld) Fail("a newer row outside on both copies is not left for the feed");
+    p = cooppre::PreRowChoose(vOut, vNa, 0, 0, 0, 0, 1);
+    if (p.fetch || !p.skipSet) Fail("a newer row outside with no copy here is not left for the feed");
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 0, 0, 0, 0);
+    if (p.fetch || p.skipSet || p.skipCount) Fail("a row outside that is current here went into the skipped list");
+    /* review HIGH 1: the server's copy outside, this game's own copy inside - fetched, counted by the local copy */
+    p = cooppre::PreRowChoose(vOut, vIn, 0, 0, 0, 0, 1);
+    if (!p.fetch || !p.byLocal || p.byOwn || p.skipSet || p.skipCount) Fail("a group whose copy here stands inside the ring is not fetched");
+    p = cooppre::PreRowChoose(vOut, vIn, 0, 0, 1, 0, 1);
+    if (!p.fetch || !p.confirmFirst || p.held) Fail("a kept key whose copy here stands inside the ring is held instead of fetched");
+    /* review HIGH 2: outside on both copies, written by the asker's player - fetched, counted as own */
+    p = cooppre::PreRowChoose(vOut, vOut, 1, 0, 1, 0, 1);
+    if (!p.fetch || !p.byOwn || p.byLocal || p.skipSet || !p.confirmFirst) Fail("the player's own group outside the list is not fetched");
+    p = cooppre::PreRowChoose(vOut, vNa, 1, 0, 0, 0, 1);
+    if (!p.fetch || !p.byOwn) Fail("the player's own group with no copy here is not fetched");
+    p = cooppre::PreRowChoose(vIn, vNa, 1, 0, 0, 0, 1);
+    if (!p.fetch || p.byOwn) Fail("an own row inside is counted as fetched only because it is own");
+    /* a held-back kept key outside, newer there: stays held and stale-held, never released here */
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 0, 1, 0, 1);
+    if (p.fetch || p.confirmFirst || p.confirmAfter || !p.held || !p.staleHeld || !p.skipSet || !p.skipCount) Fail("a held-back kept key outside with a newer server copy is released or not stale-held");
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 0, 1, 0, 0);
+    if (p.fetch || p.confirmFirst || !p.confirmAfter || p.held || p.staleHeld || p.skipSet) Fail("a held-back kept key outside that is current here is not released");
+    /* review LOW 5: a kept row held beside, outside - held; in the skipped list only when the server's copy is newer */
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 0, 1, 1, 0);
+    if (p.fetch || p.confirmFirst || p.confirmAfter || !p.held || p.skipSet || p.skipCount || p.staleHeld) Fail("a kept row held beside, current there, went into the skipped list");
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 0, 1, 1, 1);
+    if (p.fetch || p.confirmFirst || !p.held || !p.skipSet || p.skipCount || p.staleHeld) Fail("a kept row held beside, newer there, is not in the skipped list");
+    /* a box or piece row: never fetched, never held - released as the index names it */
+    p = cooppre::PreRowChoose(vOut, vOut, 0, 1, 1, 0, 1);
+    if (p.fetch || !p.confirmFirst || p.held || p.skipSet || p.skipCount) Fail("a box or piece row is fetched, held or skipped");
+    /* no area, no list: fetched */
+    p = cooppre::PreRowChoose(vNa, vNa, 0, 0, 0, 0, 1);
+    if (!p.fetch || p.byLocal || p.byOwn) Fail("a newer row with no area is not fetched");
+    p = cooppre::PreRowChoose(vNl, vNl, 0, 0, 1, 0, 1);
+    if (!p.fetch || !p.confirmFirst || p.held) Fail("with no list a newer row is not fetched");
+    /* the world server's row: area and own flag */
+    cooppre::IndexEntry e;
+    cooppre::PreRowPlace(&e, 5, 6, 0, 1);
+    if (e.ax != 5 || e.ay != 6 || e.flags != cooppre::kPreRowOwn) Fail("a group of the asker's player faction is not flagged own");
+    cooppre::PreRowPlace(&e, 5, 6, 1, 1);
+    if (e.ax != 5 || e.flags != 0u) Fail("a key-named record the asker's player wrote is flagged own");
+    cooppre::PreRowPlace(&e, 5, 6, 0, 0);
+    if (e.flags != 0u) Fail("a group not of the asker's player faction is flagged own");
+    cooppre::PreRowPlace(&e, -1, -1, 0, 1);
+    if (e.ax != cooppre::kPreNoArea || e.ay != cooppre::kPreNoArea || e.flags != cooppre::kPreRowOwn) Fail("an own group with no area lost its flag or got an area");
+    cooppre::PreRowPlace(&e, 64, 0, 0, 0);
+    if (e.ax != cooppre::kPreNoArea || e.ay != cooppre::kPreNoArea) Fail("an area off the grid is not none");
+    /* T-985 C2b fold 2 (re-check MED 1) + fold 3: own = a group whose stored faction field is one of the asker's names */
+    {
+        std::vector<std::string> fac; fac.push_back("Nameless 2"); fac.push_back("Iron Hands");
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2", fac) != 1 || cooppre::PreRowOfAskersFaction(0, "Iron Hands", fac) != 1)
+            Fail("a group carrying any of the asker's names is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "12345-gamedata.base", fac) != 0) Fail("a world NPC group (an NPC faction's code) is own");
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 3", fac) != 0) Fail("another player's group is own");
+        if (cooppre::PreRowOfAskersFaction(1, "Nameless 2", fac) != 0) Fail("a key-named record of the asker's faction is own");
+        if (cooppre::PreRowOfAskersFaction(0, "", fac) != 0) Fail("a record with no faction field is own");
+        std::vector<std::string> none;
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2", none) != 0) Fail("an asker with no profile row gets own rows");
+        std::vector<std::string> blank(1, std::string());
+        if (cooppre::PreRowOfAskersFaction(0, "", blank) != 0) Fail("an empty faction name matches an empty field");
+        cooppre::PreRowPlace(&e, 5, 6, 0, cooppre::PreRowOfAskersFaction(0, "Nameless 2", fac));
+        if (e.flags != cooppre::kPreRowOwn) Fail("the faction rule's answer does not set the own flag");
+    }
+    /* T-985 C2b fold 3 (re-check MED, under-fetch): the asker's names - its profile's, and the clash and placeholder names a stand-in
+       for its slot takes on another game (each leg but the last three answered 0 by fold 2's rule, which held only the row's name) */
+    {
+        std::vector<std::string> n; cooppre::PreAskerFactionNames("Nameless 2", 3, &n);
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2", n) != 1) Fail("fold 3: the asker's own faction name is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2 (peer)", n) != 1) Fail("fold 3: a stand-in's first clash name is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2 (peer) (p3)", n) != 1) Fail("fold 3: a stand-in's clash name for the asker's slot is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Player 3", n) != 1) Fail("fold 3: the asker's slot's placeholder name is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Player 3 (2)", n) != 1 || cooppre::PreRowOfAskersFaction(0, "Player 3 (peer)", n) != 1
+            || cooppre::PreRowOfAskersFaction(0, "Player 3 (peer) (p3)", n) != 1) Fail("fold 3: a placeholder's other names for the asker's slot are not own");
+        { std::vector<std::string> m; cooppre::PreAskerFactionNames("ABCDEFGHIJKLMNOPQRST", 3, &m); std::string cut;
+          if (!coopprof::FactionForRow("ABCDEFGHIJKLMNOPQRST (peer)", &cut) || cooppre::PreRowOfAskersFaction(0, cut, m) != 1)
+              Fail("fold 3: a long name's clash name, cut as the row's form cuts a record's field, is not own"); }
+        /* fold 4 (re-check MED): the forms the stand-in naming paths also produce - each answered 0 by fold 3's set */
+        if (cooppre::PreRowOfAskersFaction(0, "Player 2", n) != 1) Fail("fold 4: the name a stand-in takes from an empty wire name is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2 (2)", n) != 1 || cooppre::PreRowOfAskersFaction(0, "Nameless 2 (2) (peer)", n) != 1)
+            Fail("fold 4: the player's name taken as the writing game's own faction name (and its clash form) is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Player 3 (2) (peer)", n) != 1 || cooppre::PreRowOfAskersFaction(0, "Player 3 (2) (peer) (p3)", n) != 1)
+            Fail("fold 4: a ' (2)' placeholder's clash names are not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Player 2 (2) (peer) (p3)", n) != 1) Fail("fold 4: the empty-name stand-in's clash name for the asker's slot is not own");
+        if (cooppre::PreRowOfAskersFaction(0, "Player 2 (peer) (p4)", n) != 0) Fail("fold 4: another slot's clash name of the empty-name stand-in is own");
+        if (cooppre::PreRowOfAskersFaction(0, "Nameless 2 (peer) (p4)", n) != 0) Fail("fold 3: another slot's clash name is own");
+        if (cooppre::PreRowOfAskersFaction(0, "Player 4", n) != 0) Fail("fold 3: another slot's placeholder name is own");
+        if (cooppre::PreRowOfAskersFaction(0, "12345-gamedata.base", n) != 0) Fail("fold 3: a world NPC group (an NPC faction's code) is own");
+        if (cooppre::PreRowOfAskersFaction(0, "", n) != 0) Fail("fold 3: a record with no faction field is own");
+        if (cooppre::PreRowOfAskersFaction(1, "Nameless 2 (peer)", n) != 0) Fail("fold 3: a key-named record carrying a clash name is own");
+        for (size_t i = 0; i < n.size(); ++i)
+        {
+            if (n[i].empty()) Fail("fold 3: the asker's names hold an empty name");
+            for (size_t j = i + 1; j < n.size(); ++j) if (n[i] == n[j]) Fail("fold 3: the asker's names hold a name twice");
+        }
+        std::vector<std::string> noSlot; cooppre::PreAskerFactionNames("Nameless 2", -1, &noSlot);
+        if (noSlot.size() != 1 || noSlot[0] != "Nameless 2") Fail("fold 3: with no slot, a name other than the profile's is used");
+        std::vector<std::string> noRow; cooppre::PreAskerFactionNames("", 3, &noRow);
+        if (cooppre::PreRowOfAskersFaction(0, "Player 3", noRow) != 1 || cooppre::PreRowOfAskersFaction(0, " (peer)", noRow) != 0
+            || cooppre::PreRowOfAskersFaction(0, "Nameless 2", noRow) != 0) Fail("fold 3: with no profile name, a name other than the slot's placeholder names is used");
+        std::vector<std::string> none(1, std::string("stale")); cooppre::PreAskerFactionNames("", -1, &none);
+        if (!none.empty()) Fail("fold 3: no profile name and no slot give a name (or the earlier set is kept)");
+    }
+    /* review MED 4: held past the first snapshot only when it was not whole */
+    if (cooppre::PreStaleHoldKeeps(0, 1, 1) != 1 || cooppre::PreStaleHoldKeeps(1, 1, 1) != 0 || cooppre::PreStaleHoldKeeps(0, 0, 1) != 0 || cooppre::PreStaleHoldKeeps(0, 1, 0) != 0)
+        Fail("a stale-held kept key is released by a snapshot not seen whole, or held past a whole one");
 }
 /* ---- T-346 slice 1: THE RECORDS BEFORE THE LOAD (src/common/preload.h; world-server protocol 67, RECORD_FEED kinds 5-8) ---- */
 void t_t346_wire_roundtrip()
 {
     std::vector<char> b; cooppre::PreMsg m;
-    if (!cooppre::PreEncodeIndexAsk(&b, 7u, "") || !cooppre::PreDecode(&b[0], b.size(), &m) || m.kind != (unsigned)cooppre::kPreIndexAsk || m.token != 7u || !m.key.empty() || b.size() != 12) Fail("INDEX_ASK(\"\") did not round-trip");
+    if (!cooppre::PreEncodeIndexAsk(&b, 7u, "") || !cooppre::PreDecode(&b[0], b.size(), &m) || m.kind != (unsigned)cooppre::kPreIndexAsk || m.token != 7u || !m.key.empty() || b.size() != 16) Fail("INDEX_ASK(\"\") did not round-trip");
     b.clear();
     if (!cooppre::PreEncodeIndexAsk(&b, 8u, "zone.3.4") || !cooppre::PreDecode(&b[0], b.size(), &m) || m.key != "zone.3.4" || m.token != 8u) Fail("INDEX_ASK(key) did not round-trip");
     std::vector<cooppre::IndexEntry> es; es.push_back(cooppre::IndexEntry("Holy Nation|42", 1700000000ULL, 1700000050ULL)); es.push_back(cooppre::IndexEntry("zone.1.2", 1700000001ULL, 0ULL));
@@ -37731,6 +39426,13 @@ void t_joblever_parse()
     if (joblever::JobWorkParse("work 5 key task=0", &w) || joblever::JobWorkParse("work 5 key task=1001", &w)
      || joblever::JobWorkParse("work 5 key task=x", &w)) Fail("jobtest work: task range");
     if (joblever::JobWorkParse("work 5 key extra", &w)) Fail("jobtest work: an unknown option must be refused");
+    if (!joblever::JobWorkParse("work 5 key plain task=95 door=0", &w) || w.door != 0 || w.task != 95 || w.plain != 1)
+        Fail("jobtest work: door=");
+    if (!joblever::JobWorkParse("work 5 key door=31 task=95", &w) || w.door != 31) Fail("jobtest work: door= in any order");
+    if (!joblever::JobWorkParse("work 5 key", &w) || w.door != -1) Fail("jobtest work: no door= is the building itself");
+    if (joblever::JobWorkParse("work 5 key door=32", &w) || joblever::JobWorkParse("work 5 key door=", &w)
+     || joblever::JobWorkParse("work 5 key door=x", &w) || joblever::JobWorkParse("work 5 key door=-1", &w)
+     || joblever::JobWorkParse("work 5 key door=1 door=2", &w)) Fail("jobtest work: door range");
     if (joblever::JobWorkParse("input 5 key", &w)) Fail("jobtest: input is not work");
     joblever::JobInput in;
     if (!joblever::JobInputParse("input Stove 52-gamedata.base 3", &in) || in.key != "Stove" || in.sid != "52-gamedata.base" || in.count != 3
@@ -40785,6 +42487,15 @@ void t_t580_holds()
     if (townpending::Holds(-1, -1, 0, -1, -1) != 1) Fail("no position and no asked area: held");
     if (townpending::Holds(40, 40, 1, -1, -1) != 1) Fail("an unread town area and a note loaded here: held");
     if (townpending::Holds(0, 0, 0, 1, 1) != 1 || townpending::Holds(63, 63, 0, 62, 62) != 1) Fail("ring 1 at the map edges");
+    /* T-985 C2b fold 2 (re-check LOW 2): a group row the load left for the feed holds a town only from the asked area or its ring 1 */
+    if (townpending::HoldsNear(10, 10, 40, 40) != 0) Fail("a skipped group far from the town holds it");
+    if (townpending::HoldsNear(40, 40, 40, 40) != 1 || townpending::HoldsNear(41, 39, 40, 40) != 1) Fail("a skipped group in or beside the town's area does not hold it");
+    if (townpending::HoldsNear(42, 40, 40, 40) != 0 || townpending::HoldsNear(40, 38, 40, 40) != 0) Fail("a skipped group two areas off holds the town");
+    if (townpending::HoldsNear(10, 10, -1, -1) != 1) Fail("an unread asked area does not hold (the safe answer)");
+    if (townpending::HoldsNear(-1, -1, 40, 40) != 1) Fail("a skipped group with no position does not hold");
+    /* T-985 C2b fold 3 (re-check LOW, thread race): the load's town wait's 60 s bound on GetTickCount's wrapping tick */
+    if (townpending::BoundPassed(1000u, 60999u, 60000u) != 0 || townpending::BoundPassed(1000u, 61000u, 60000u) != 1) Fail("fold 3: the town wait's bound is not 60 s");
+    if (townpending::BoundPassed(0xFFFFFF00u, 59000u, 60000u) != 0 || townpending::BoundPassed(0xFFFFFF00u, 60000u, 60000u) != 1) Fail("fold 3: the town wait's bound is wrong across the tick's wrap");
 }
 void t_t580_pending_combinations()
 {
@@ -44309,7 +46020,7 @@ void t_t605_store_gate()
 void t_t591_town_refill()
 {
     using namespace townrefill;
-    if (kMsgTownLoss != 64u || kProtocol != 108u) Fail("TOWN_LOSS is not message 64 of protocol 108");
+    if (kMsgTownLoss != 64u || kProtocol != 121u) Fail("TOWN_LOSS is not message 64 of protocol 121");
     Table t;
     if (AddLoss(&t, "town-a") != 1 || AddLoss(&t, "town-a") != 2) Fail("a loss did not add one to its town");
     if (AddLoss(&t, "") != 0 || AddLoss(&t, std::string(129, 'x')) != 0 || AddLoss(&t, "a\tb") != 0) Fail("a loss was taken for a town id that is not usable");
@@ -46294,7 +48005,7 @@ void t_t290s3a_proof()
     if (ht.size() != 32 || authproof::kHostTokenBytes != 32 || !authproof::HostTokenDecode(ht, tok2) || std::memcmp(tok2, tok, 32) != 0) Fail("HOST_TOKEN is not {token 32}, or its round trip");
     ht.push_back(0);
     if (authproof::HostTokenDecode(ht, tok2)) Fail("a 33-byte HOST_TOKEN is read");
-    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 108u)
+    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 121u)
         Fail("the message numbers are not 65/66/67/68 of protocol 101");
 }
 
@@ -47674,7 +49385,7 @@ void t_t36g_wire_and_rules()
     if (keptwire::RowOk(bad)) Fail("wire2: a door state of 4 is valid");
     bad = w; bad.p.doors.resize(keptwire::kMaxDoors + 1, d);
     if (keptwire::RowOk(bad)) Fail("wire2: a row of 33 doors is valid");
-    if (keptwire::kProtocol != 108u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 108");
+    if (keptwire::kProtocol != 121u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 121");
     /* RecordHoldsItems' 'has' mode (zonekeep::KeptItemsHas) and its 'all' mode count a pack's own items */
     std::vector<std::string> box(1, "4003-gamedata.base");
     if (zonekeep::KeptItemsHas(std::vector<zonekeep::KeptItem>(1, pack), box) != 1) Fail("has2: a box holding a kept pack's item is not 'has'");
@@ -47744,7 +49455,7 @@ void t_t36o_outposts()
     if (DecodeTownsFile("kept-towns\t1\nK\tk1\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a K line before any T line reads");
     if (DecodeTownsFile("kept-towns\t1\nT\t1\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\tx\nK\tk1\nK\tk1\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a key twice in one outpost reads");
     if (!DecodeTownsFile("kept-towns\t1\nT\t1\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\tx\nK\tk1\n", kKeptTownsHeader, true, &fr, &why) || fr.size() != 1 || fr[0].keys.size() != 1) Fail("outposts: a written-by-hand kept-towns.txt does not read: " + why);
-    if (DecodeTownsFile("kept-towns\t4\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a list of an unknown format reads");
+    if (DecodeTownsFile("kept-towns\t6\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a list of an unknown format reads");   /* T-940: format 5 is the anchor format */
     if (DecodeTownsFile("kept-towns\t1\nT\t1\t0\t0\t0\t0\t0\tzz\t0\t0\tx\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a bad float reads");
     if (DecodeTownsFile("", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: an empty file reads");
     if (DecodeTownsFile("kept-towns\t1\nX\t1\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: an unknown line reads");
@@ -48099,12 +49810,14 @@ void t_t36o_outposts_keys()
     TownRow tooMany(s); tooMany.keys.clear(); tooMany.cut = 0;
     for (size_t i = 0; i <= kMaxTownKeys; ++i) tooMany.keys.push_back("k" + zonekeep::ZkNum((long long)i));
     if (RowOk(tooMany, kOpSay)) Fail("outposts keys: a SAY row past the key cap is valid");
-    /* player-towns.txt: format 3 with keys, the cut field and the size level (T-811); formats 2 and 1 still read */
-    TownRow fr1(s); fr1.owner = 3;
+    /* player-towns.txt: format 4 with keys, the cut field, the size level (T-811) and the outpost id (T-1047 step 5); formats 3, 2
+       and 1 still read */
+    TownRow fr1(s); fr1.owner = 3; fr1.level = 2; fr1.id = 7u;
     const std::vector<TownRow> frs(1, fr1);
     const std::string pt = EncodeTownsFile(kPlayerTownsHeader, frs, true);
     std::vector<TownRow> fb; std::string why;
-    if (pt.compare(0, 15, "player-towns\t3\n") != 0 || !DecodeTownsFile(pt, kPlayerTownsHeader, true, &fb, &why) || fb.size() != 1 || fb[0].keys != fr1.keys || fb[0].cut != 1)
+    if (pt.compare(0, 15, "player-towns\t5\n") != 0 || !DecodeTownsFile(pt, kPlayerTownsHeader, true, &fb, &why) || fb.size() != 1 || fb[0].keys != fr1.keys || fb[0].cut != 1
+        || fb[0].level != 2 || fb[0].id != 7u || fb[0].name != fr1.name)
         Fail("outposts keys: player-towns.txt with keys does not round-trip: " + why);
     if (!DecodeTownsFile("player-towns\t1\nT\t3\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\tOld\n", kPlayerTownsHeader, true, &fb, &why) || fb.size() != 1
         || fb[0].name != "Old" || !fb[0].keys.empty() || fb[0].cut != 0)
@@ -49722,7 +51435,7 @@ bool T697RowSame(const coopgrec::GroundRow& a, const coopgrec::GroundRow& b)
 void t_t697_ground_record()
 {
     using namespace coopgrec;
-    if (kProtocol != 108u || kMsgGroundRefuse != 71u) Fail("T-697: ground records are not world-server protocol 108 / GROUND_REFUSE 71");
+    if (kProtocol != 121u || kMsgGroundRefuse != 71u) Fail("T-697: ground records are not world-server protocol 121 / GROUND_REFUSE 71");
     /* the id */
     if (GroundRecId(3, 41) != "ground.3.41" || GroundRecId(0, 0) != "ground.0.0" || GroundRecId(63, 63) != "ground.63.63") Fail("T-697: GroundRecId spelling");
     if (!GroundRecId(64, 0).empty() || !GroundRecId(0, -1).empty()) Fail("T-697: an out-of-range sector made an id");
@@ -50117,7 +51830,7 @@ void t_t697_made_rule()
     if (coopgrec::GrMadeRule(0, 0, 0) != 0 || coopgrec::GrMadeRule(0, 1, 1) != 0) Fail("T-697: an object with a link of its own is not the map's");
     if (coopgrec::GrMadeRule(1, 0, 1) != 0) Fail("T-697: after the registry overflowed an unlisted 0xB object still reads as made");
     if (coopgrec::GrMadeRule(-1, 0, 0) != 0) Fail("T-697: an unreadable object is not the map's");
-    if (coopgrec::kProtocol != 108u || coopgrec::kGrFormat != 2u) Fail("T-697: format-2 ground records are not world-server protocol 108");
+    if (coopgrec::kProtocol != 121u || coopgrec::kGrFormat != 2u) Fail("T-697: format-2 ground records are not world-server protocol 121");
 }
 /* T-697: the mark of what the mod makes or moves (coopgrec::GrMadeOfPlaced) and a map copy's entry after a pickup
    (coopgrec::GrPickKeepsMapCopy), every input walked. The engine makes any item picked up into an inventory made during play
@@ -50263,7 +51976,7 @@ std::vector<char> T1045Rec(const std::string& key, unsigned int gen, int writer,
 void t_t1045_piece_record()
 {
     using namespace piecerec;
-    if (kProtocol != 108u || kMsgPieceRefuse != 79u || kProtocol != coopbrec::kProtocol) Fail("piece records are not world-server protocol 108 / PIECE_REFUSE 79");
+    if (kProtocol != 121u || kMsgPieceRefuse != 79u || kProtocol != coopbrec::kProtocol) Fail("piece records are not world-server protocol 121 / PIECE_REFUSE 79");
 
     /* the id: the key with its height, the record name always in its hashed form */
     const std::string key = "12-wall.mod@3,41@1003,-205,100";
@@ -50321,7 +52034,7 @@ void t_t1045_piece_record()
         if (DecodePieceRecord(&t[0], t.size(), 0, 0) != kPrTrailing) Fail("bytes after the body were not refused");
         std::vector<char> mk(rec); mk[0] = (char)(mk[0] ^ 1);
         if (DecodePieceRecord(&mk[0], mk.size(), 0, 0) != kPrBadMarker) Fail("a wrong marker was not refused");
-        std::vector<char> fm(rec); fm[4] = 2;
+        std::vector<char> fm(rec); fm[4] = 3;
         if (DecodePieceRecord(&fm[0], fm.size(), 0, 0) != kPrBadFormat) Fail("an unknown format was not refused");
         std::vector<char> fl(rec); fl[kPrFixedBytes + key.size() + 4] = 4;
         if (DecodePieceRecord(&fl[0], fl.size(), 0, 0) != kPrBadHeader) Fail("an unknown flag was not refused");
@@ -50632,6 +52345,1081 @@ void t_t1045f5_refused_inputs()
     if (sends != 2) Fail("a change to the piece after the second refusal did not write exactly once");
     if (marked != 0 || PieceSendGate(1, &said, &edge) != kPsgSend || edge != 0) Fail("the gate after the change");
 }
+/* ---- per-piece world-server records, the read side: the apply (src/common/piecerec.h) ---- */
+void t_t1045b_piece_apply()
+{
+    using namespace piecerec;
+    /* wait until the area is loaded AND its record list is complete */
+    if (PieceApplyChoice(0, 1, 1, 1, 0, 0, 0, 1, 0, 1) != kPaWait) Fail("an area not loaded did not wait");
+    if (PieceApplyChoice(1, 0, 1, 1, 0, 0, 0, 1, 0, 1) != kPaWait) Fail("an area whose list is not complete did not wait");
+    if (PieceApplyChoice(1, 0, 0, 0, 0, 1, 0, 1, 0, 1) != kPaWait) Fail("no record before the list is complete did not wait");
+    /* make / state / reown */
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 0, 0, 1, 0, 1) != kPaMake) Fail("a live record of a missing piece was not made");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, -1, 0, 1, 0, 1) != kPaMake) Fail("a live record of a piece not known here did not go to the make road");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 1, 0, 1) != kPaState) Fail("a standing piece (own or another's) with a differing record did not take its state");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 1, 1, 1) != kPaNone) Fail("a standing piece already showing the record's state was sent to a road");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 0, 0, 1) != kPaReown) Fail("a standing piece of the wrong owner was not re-owned");
+    /* removal marks: only over the very placement, only where something stands or waits */
+    if (PieceApplyChoice(1, 1, 1, 1, 1, 1, 0, 1, 0, 1) != kPaRemove) Fail("a removal mark of the standing placement did not remove it");
+    if (PieceApplyChoice(1, 1, 1, 1, 1, 1, 0, 1, 0, 0) != kPaNone) Fail("a removal mark took down a piece rebuilt since (another placement)");
+    if (PieceApplyChoice(1, 1, 1, 1, 1, -1, 0, 1, 0, 1) != kPaRemove) Fail("a removal mark over a piece not known here did not go to the remove road");
+    if (PieceApplyChoice(1, 1, 1, 1, 1, 0, 1, 1, 0, 1) != kPaRemove) Fail("a removal mark did not drop a placement waiting at the key");
+    if (PieceApplyChoice(1, 1, 1, 1, 1, 0, 0, 1, 0, 1) != kPaNone) Fail("a removal mark with nothing at the key went to a road");
+    if (PieceApplyChoice(1, 1, 1, 0, 0, 1, 0, 1, 0, 1) != kPaUnreadable) Fail("an unreadable record was acted on");
+    /* no record never means removal, whatever stands */
+    for (int present = -1; present <= 1; ++present)
+        for (int pending = 0; pending <= 1; ++pending)
+            if (PieceApplyChoice(1, 1, 0, 0, 0, present, pending, 0, 0, 1) != kPaNone || PieceApplyChoice(1, 1, 0, 1, 1, present, pending, 1, 0, 1) != kPaNone)
+                Fail("a piece with no record was not left as loaded");
+    /* the same state: flags, progress within a thousandth, the same materials */
+    {
+        const float m1[2] = { 3.0f, 1.0f }, m2[2] = { 3.0f, 2.0f };
+        if (PieceStateSame(5.0f, 10.0f, 0, 0, 0, 2, m1, 5.0f, 10.0f, 0, 0, 0, 2, m1) != 1) Fail("an equal state read as different");
+        if (PieceStateSame(5.0f, 10.0f, 0, 0, 0, 2, m1, 5.5f, 10.0f, 0, 0, 0, 2, m1) != 0) Fail("a progress difference read as the same");
+        if (PieceStateSame(5.0f, 10.0f, 0, 0, 0, 2, m1, 5.0f, 10.0f, 0, 0, 0, 2, m2) != 0) Fail("a materials difference read as the same");
+        if (PieceStateSame(10.0f, 10.0f, 1, 1, 0, 2, m1, 10.0f, 10.0f, 1, 0, 0, 2, m1) != 0) Fail("a destroyed difference read as the same");
+        if (PieceStateSame(5.0f, 10.0f, 0, 0, 0, 2, m1, 5.0f, 10.0f, 0, 0, 0, -1, 0) != 0) Fail("unread materials read as the same");
+    }
+    /* the first look in this world yields to a holder's record and to a removal mark of its placement - never a seed over them */
+    if (PieceFirstLookYield(kPeFirst, 1, 0, 0, 1) != 1) Fail("the first look overwrote a holder's record with the save");
+    if (PieceFirstLookYield(kPeFirst, 1, 1, 0, 1) != 0) Fail("the first look over this game's own record yielded");
+    if (PieceFirstLookYield(kPeFirst, 1, 1, 1, 1) != 1) Fail("the first look seeded over a removal mark of its own placement");
+    if (PieceFirstLookYield(kPeFirst, 1, 1, 1, 0) != 0) Fail("a rebuilt piece's first look did not seed over the old removal mark");
+    if (PieceFirstLookYield(kPeMats, 1, 0, 0, 1) != 0 || PieceFirstLookYield(kPeFirst, 0, 0, 0, 1) != 0) Fail("the yield caught a real change or a piece with no record");
+    /* the state goes onto every standing or made piece, a finished one included; progress only onto an unfinished one */
+    if (PieceApplyStateGoes(1, 0) != 1 || PieceApplyStateGoes(0, 1) != 1 || PieceApplyStateGoes(0, 0) != 0) Fail("the state rule");
+    if (PieceApplyProgressGoes(0, 0) != 1) Fail("an unfinished piece did not take its record's progress");
+    if (PieceApplyProgressGoes(1, 0) != 0 || PieceApplyProgressGoes(0, 1) != 0 || PieceApplyProgressGoes(1, 1) != 0) Fail("a finished piece took progress");
+    if (std::strcmp(PieceApplyName(kPaMake), "made") != 0 || std::strcmp(PieceApplyName(kPaState), "state") != 0 || std::strcmp(PieceApplyName(kPaRemove), "removed") != 0
+        || std::strcmp(PieceApplyName(kPaReown), "reowned") != 0 || std::strcmp(PieceApplyName(kPaNone), "none") != 0) Fail("the apply words in the log lines");
+    /* pp.build at a world load: a lone game lays at once; online the row waits for the list, then its record decides */
+    if (PiecePpRowChoice(1, 1, 0, 1, 1) != kPpLay) Fail("a lone game's row was not laid at once");
+    if (PiecePpRowChoice(0, 0, 0, 0, 0) != kPpLay) Fail("a row with no record id was held");
+    if (PiecePpRowChoice(0, 1, 0, 0, 0) != kPpHold) Fail("an online row was laid before its area's list is complete");
+    if (PiecePpRowChoice(0, 1, 1, 0, 0) != kPpLay) Fail("a row with no record was not laid (and seeded)");
+    if (PiecePpRowChoice(0, 1, 1, 1, 0) != kPpFromRecord) Fail("a row with a live record did not give way to the record");
+    if (PiecePpRowChoice(0, 1, 1, 1, 1) != kPpDrop) Fail("a row under a removal mark was not dropped");
+    /* the protocol: placement, state and removal travel only in the records from 173 */
+    if (kGameProtocolRecordFeed != 173u || hovrec::kGameProtocol < kGameProtocolRecordFeed) Fail("the game-to-game protocol is not the record feed's");
+}
+/* ---- T-1047: a power piece's live values in its record (format 2; src/common/piecerec.h) ---- */
+void t_t1047_piece_live()
+{
+    using namespace piecerec;
+    if (kPrFormat != 1u || kPrFormatLive != 2u || kPieceLiveBatteryBands != 20 || kPeLive != kPeMax) Fail("t1047: the format numbers, the band count or the LIVE event");
+    if (kGameProtocolLiveRecord != 174u || hovrec::kGameProtocol < kGameProtocolLiveRecord) Fail("t1047: the game-to-game protocol is not the LIVE record's");
+    if (std::string(PieceEventName(kPeLive)) != "live" || PieceEventEndsMoving(kPeLive) != 0 || PieceWriteDue(1.0f, 1.0f, 10.0f, kPeLive) != 1) Fail("t1047: the LIVE event");
+
+    /* format 1 still reads, its LIVE values not known */
+    const std::string key = "12-wall.mod@3,41@1003,-205,100";
+    const std::vector<char> r1 = T1045Rec(key, 4, 1, 1, 0, 77, 5.0f);
+    if (r1.empty()) { Fail("t1047: no format-1 record made"); return; }
+    PieceHeader h;
+    PieceBody b;
+    if (DecodePieceRecord(&r1[0], r1.size(), &h, &b) != kPrOk || h.format != kPrFormat || b.live.have != 0) Fail("t1047: a format-1 record does not read with its LIVE values unknown");
+
+    /* format 2: the LIVE part round-trips */
+    b.live.have = 1; b.live.on = 1; b.live.gets = 0; b.live.battery = 37.5f; b.live.n = 2; b.live.stock[0] = 0.25f; b.live.stock[1] = 0.0f;
+    std::vector<char> r2;
+    if (!EncodePieceRecord(&r2, h, b)) { Fail("t1047: a format-2 record was not written"); return; }
+    PieceHeader h2;
+    PieceBody b2;
+    if (DecodePieceRecord(&r2[0], r2.size(), &h2, &b2) != kPrOk) { Fail("t1047: a format-2 record does not read"); return; }
+    if (h2.format != kPrFormatLive || b2.live.have != 1 || b2.live.on != 1 || b2.live.gets != 0 || b2.live.battery != 37.5f || b2.live.n != 2
+        || b2.live.stock[0] != 0.25f || b2.live.stock[1] != 0.0f || b2.place != b.place || b2.state != b.state) Fail("t1047: the LIVE part did not round-trip");
+    if (r2.size() != r1.size() + 4u + 12u + 8u) Fail("t1047: the LIVE part is not u32 length + flags, battery, count and two stocks");
+    {   /* the world server takes a format-2 write whole (its judge reads the record); a game keeps it with its LIVE part */
+        std::vector<int> loaded;
+        loaded.push_back(1);
+        PieceHeader jh;
+        (void)loaded;
+        /* the owner's seed of a piece with no record, carrying a LIVE part: taken whole */
+        const std::vector<char> s1 = T1045Rec(key, 4, 1, 1, kPrFlagSeed, 77, 5.0f);
+        PieceHeader sh;
+        PieceBody sb;
+        std::vector<char> s2;
+        if (s1.empty() || DecodePieceRecord(&s1[0], s1.size(), &sh, &sb) != kPrOk) Fail("t1047: no format-1 seed made");
+        else
+        {
+            sb.live = b.live;
+            if (!EncodePieceRecord(&s2, sh, sb) || s2.size() < 8u || s2[4] != (char)2) Fail("t1047: a format-2 seed was not written");
+            else
+            {
+                std::vector<int> nobody;
+                if (PieceJudgeWrite(MakePieceRecId(key), &s2[0], s2.size(), 1, -1, nobody, 0, 0, -1, 0, 0, &jh) != kPrAccept || jh.format != kPrFormatLive
+                    || jh.generation != 4) Fail("t1047: the world server does not take the owner's format-2 seed");
+            }
+        }
+        PieceHeader ih;
+        PieceBody ib;
+        int dw = 0;
+        if (PieceIntakeJudge(MakePieceRecId(key), &r2[0], r2.size(), 0, 0u, &ih, &ib, &dw) != kPiKeep || ib.live.have != 1 || ib.live.battery != 37.5f)
+            Fail("t1047: a game does not keep a format-2 record with its LIVE part");
+        PieceHeader hd;
+        if (DecodePieceHeader(&r2[0], r2.size(), &hd) != kPrOk || hd.format != kPrFormatLive) Fail("t1047: the world server's header read refuses format 2");
+    }
+    {   /* malformed LIVE parts are refused whole, at the encoder and at the decoder */
+        std::vector<char> x;
+        PieceBody bb = b; bb.live.on = 2;
+        if (EncodePieceRecord(&x, h, bb)) Fail("t1047: a switch that is not 0 / 1 was written");
+        bb = b; bb.live.battery = -1.0f;
+        if (EncodePieceRecord(&x, h, bb)) Fail("t1047: a negative battery was written");
+        bb = b; bb.live.n = 17;
+        if (EncodePieceRecord(&x, h, bb)) Fail("t1047: 17 stocks were written");
+        const size_t lf = r2.size() - 20u;   /* the LIVE part's flags */
+        std::vector<char> t(r2); t[lf] = (char)9;   /* bit 3: unknown (bit 2 is the bar's, T-1047 step 2b) */
+        if (DecodePieceRecord(&t[0], t.size(), 0, 0) != kPrBadBody) Fail("t1047: an unknown LIVE flag bit was not refused");
+        t = r2; t[lf + 8] = (char)3;
+        if (DecodePieceRecord(&t[0], t.size(), 0, 0) != kPrBadBody) Fail("t1047: a stock count that is not the part's length was not refused");
+        t = r2; t[lf + 4] = (char)0; t[lf + 5] = (char)0; t[lf + 6] = (char)0xC0; t[lf + 7] = (char)0x7F;
+        if (DecodePieceRecord(&t[0], t.size(), 0, 0) != kPrBadBody) Fail("t1047: a battery that is not a number was not refused");
+        t = r1; t[4] = (char)2;
+        if (DecodePieceRecord(&t[0], t.size(), 0, 0) != kPrBadBody) Fail("t1047: format 2 with no LIVE part was not refused");
+        t = r2; t[4] = (char)1;
+        if (DecodePieceRecord(&t[0], t.size(), 0, 0) != kPrBadBody) Fail("t1047: format 1 with a LIVE part was not refused");
+        const std::vector<char> rm = T1045Rec(key, 5, 1, 1, kPrFlagRemoved, 77, 0.0f);
+        if (rm.empty()) Fail("t1047: no removal mark made");
+        else { t = rm; t[4] = (char)2; if (DecodePieceRecord(&t[0], t.size(), 0, 0) == kPrOk) Fail("t1047: a format-2 removal mark was read"); }
+        PieceBody rb; rb.reason = coopbuild::kBuildReasonDismantled; rb.live = b.live;
+        PieceHeader rh = h; rh.flags = kPrFlagRemoved;
+        if (!EncodePieceRecord(&x, rh, rb) || x[4] != (char)1) Fail("t1047: a removal mark is not written as format 1");
+    }
+    {   /* the same test: a LIVE-only change is a difference */
+        PieceLive a = b.live, c = b.live, none;
+        if (PieceLiveSame(a, c) != 1 || PieceLiveEqual(a, c) != 1) Fail("t1047: equal LIVE values read as different");
+        c.on = 0;
+        if (PieceLiveSame(a, c) != 0) Fail("t1047: a switch change read as the same");
+        c = a; c.battery += 0.01f;
+        if (PieceLiveSame(a, c) != 0 || PieceLiveEqual(a, c) != 0) Fail("t1047: a battery change read as the same");
+        c = a; c.stock[0] = 0.2f;
+        if (PieceLiveSame(a, c) != 0) Fail("t1047: a stock change read as the same");
+        if (PieceLiveSame(a, none) != 0 || PieceLiveEqual(a, none) != 0 || PieceLiveEqual(none, none) != 1) Fail("t1047: not known read as the same as known");
+        if (PieceLiveApplyChoice(0, 1, 1, 0, 0, 0, kPaNone) != kPlaNow) Fail("t1047: a LIVE-only difference does not apply while the build state is the same");
+        if (PieceLiveApplyChoice(0, 1, 1, 0, 0, 0, kPaState) != kPlaNow) Fail("t1047: LIVE does not apply beside a state");
+        if (PieceLiveApplyChoice(0, 1, 0, 0, 0, 0, kPaNone) != kPlaNone) Fail("t1047: format 1 (LIVE not known) applied");
+        if (PieceLiveApplyChoice(0, 1, 1, 0, 1, 0, kPaNone) != kPlaNone) Fail("t1047: this game's own write applied while the area stayed loaded");
+        if (PieceLiveApplyChoice(0, 1, 1, 0, 1, 1, kPaNone) != kPlaNow) Fail("t1047: this game's own record not applied at the first apply since the world loaded");
+        if (PieceLiveApplyChoice(0, 1, 1, 0, 0, 0, kPaMake) != kPlaOwe) Fail("t1047: a make does not owe the LIVE values");
+        if (PieceLiveApplyChoice(0, 1, 1, 0, 0, 0, kPaRemove) != kPlaNone || PieceLiveApplyChoice(1, 1, 1, 0, 0, 0, kPaNone) != kPlaNone
+            || PieceLiveApplyChoice(0, 0, 1, 0, 0, 0, kPaNone) != kPlaNone || PieceLiveApplyChoice(0, 1, 1, 1, 0, 0, kPaNone) != kPlaNone)
+            Fail("t1047: a removal, an unreadable body or a seen generation applied LIVE values");
+    }
+    {   /* the band rule */
+        if (PieceLiveBand(0.0f, 100.0f) != 0 || PieceLiveBand(100.0f, 100.0f) != 21 || PieceLiveBand(50.0f, 100.0f) != 11 || PieceLiveBand(4.9f, 100.0f) != 1
+            || PieceLiveBand(5.0f, 100.0f) != 2 || PieceLiveBand(0.5f, 0.0f) != 11) Fail("t1047: the bands (empty 0, twentieths 1..20, full 21; no full = 1)");
+        PieceLive s, n;
+        s.have = 1; s.on = 1; s.battery = 50.0f; s.n = 1; s.stock[0] = 0.93f;
+        float peak[kPrLiveMaxStocks];
+        for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) peak[i] = 0.0f;
+        peak[0] = 1.0f;
+        n = s; n.battery = 52.0f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a battery step inside a band was due");
+        n = s; n.battery = 55.5f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a battery an edge hover past its band was due");
+        n = s; n.battery = 48.0f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a battery just below its band's lower edge was due");
+        n = s; n.battery = 58.0f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a battery half a band past its band was not due");
+        n = s; n.battery = 47.0f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a battery half a band below its band was not due");
+        {   /* at full under a flickering load: nothing until it is really down; at empty the same upward */
+            PieceLive fu = s; fu.battery = 100.0f;
+            n = fu; n.battery = 99.5f;
+            if (PieceLiveDue(fu, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a full battery's flicker was due");
+            n = fu; n.battery = 93.0f;
+            if (PieceLiveDue(fu, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a full battery's first fall out of full cost a write of its own");
+            n = fu; n.battery = 92.0f;
+            if (PieceLiveDue(fu, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a full battery a band and a half down was not due");
+            PieceLive em = s; em.battery = 0.0f;
+            n = em; n.battery = 2.0f;
+            if (PieceLiveDue(em, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: an empty battery's flicker was due");
+            n = em; n.battery = 3.0f;
+            if (PieceLiveDue(em, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a battery half a band out of empty was not due");
+            if (PieceLiveBandLeft(55.0f, 54.9f, 100.0f) != 0 || PieceLiveBandLeft(54.9f, 55.0f, 100.0f) != 0 || PieceLiveBandLeft(54.9f, 57.5f, 100.0f) != 1)
+                Fail("t1047: PieceLiveBandLeft at a band edge");
+        }
+        n = s; n.battery = 100.0f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a full battery was not due");
+        PieceLive e = s; e.battery = 2.0f; n = e; n.battery = 0.0f;
+        if (PieceLiveDue(e, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: an empty battery was not due");
+        n = s; n.stock[0] = 0.91f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a stock step inside a band was due");
+        n = s; n.stock[0] = 0.89f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a stock an edge hover below its band was due");
+        n = s; n.stock[0] = 0.87f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a stock half a band below its band was not due");
+        {   /* a refill written at its peak: its first fall out of full costs no write of its own */
+            PieceLive rf = s; rf.stock[0] = 1.0f;
+            n = rf; n.stock[0] = 0.96f;
+            if (PieceLiveDue(rf, peak, 100.0f, -1, n, -1) != 0) Fail("t1047: a refilled stock's first fall out of full was due");
+            n = rf; n.stock[0] = 0.92f;
+            if (PieceLiveDue(rf, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a refilled stock a band and a half down was not due");
+        }
+        n = s; n.stock[0] = 0.95f;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a stock that rose was not due");
+        PieceLive f = s; f.stock[0] = 0.02f; n = f; n.stock[0] = 0.0f;
+        if (PieceLiveDue(f, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a stock that reached 0 was not due");
+        n = s; n.n = 2;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a change in the number of stocks was not due");
+        n = s; n.on = 0;
+        if (PieceLiveDue(s, peak, 100.0f, -1, n, -1) != 1) Fail("t1047: a switch change was not due");
+        n = s;
+        if (PieceLiveDue(s, peak, 100.0f, 0, n, 1) != 1 || PieceLiveDue(s, peak, 100.0f, -1, n, 1) != 0) Fail("t1047: the grid's on-battery flip (or a flag not read)");
+        if (PieceLiveDue(PieceLive(), peak, 100.0f, -1, n, -1) != 1 || PieceLiveDue(s, peak, 100.0f, -1, PieceLive(), -1) != 0) Fail("t1047: nothing written / nothing known");
+        float pk[kPrLiveMaxStocks];
+        for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) pk[i] = 0.0f;
+        PieceLivePeakNote(pk, PieceLive(), s);
+        if (pk[0] != 0.93f) Fail("t1047: a first write does not set the stock's peak");
+        PieceLive lo = s; lo.stock[0] = 0.5f;
+        PieceLivePeakNote(pk, s, lo);
+        if (pk[0] != 0.93f) Fail("t1047: a stock that fell moved its peak");
+        PieceLive hi = s; hi.stock[0] = 1.0f;
+        PieceLivePeakNote(pk, lo, hi);
+        if (pk[0] != 1.0f) Fail("t1047: a stock that rose did not set its peak");
+    }
+    {   /* the writer side: who notes, the area's apply first, then one mark per change */
+        if (PieceLiveNoteChoice(0, 1, 1, 1, 0, 1, 1, 1, 0) != kPlnNone) Fail("t1047: a game that does not run the engine steps noted the values");
+        if (PieceLiveNoteChoice(1, 0, 1, 1, 1, 1, 1, 1, 0) != kPlnForget) Fail("t1047: values noted before the area's records were applied");
+        if (PieceLiveNoteChoice(1, 1, 1, 0, 1, 0, 1, 1, 0) != kPlnBook) Fail("t1047: a kept record with the same values was not booked as the baseline");
+        if (PieceLiveNoteChoice(1, 1, 1, 0, 1, 1, 1, 1, 0) != kPlnMark) Fail("t1047: a kept record that differs was not written over");
+        if (PieceLiveNoteChoice(1, 1, 1, 0, 0, 1, 1, 1, 0) != kPlnMark) Fail("t1047: no kept LIVE values: the first write was not marked");
+        if (PieceLiveNoteChoice(1, 1, 0, 0, 0, 1, 1, 1, 0) != kPlnNone) Fail("t1047: marked before the own piece's first build look");
+        if (PieceLiveNoteChoice(1, 1, 1, 1, 0, 1, 0, 1, 0) != kPlnNone) Fail("t1047: no change since the last write was marked");
+        if (PieceLiveNoteChoice(1, 1, 1, 1, 0, 1, 1, 0, 0) != kPlnNone) Fail("t1047: a change already marked was marked again");
+        if (PieceLiveNoteChoice(1, 1, 1, 1, 0, 1, 1, 1, 1) != kPlnNone) Fail("t1047: a piece already marked was marked again");
+        if (PieceLiveNoteChoice(1, 1, 1, 1, 0, 1, 1, 1, 0) != kPlnMark) Fail("t1047: a change was not marked");
+    }
+}
+/* ---- T-1047 step 2b: a production machine's bar and work state on its piece record (LIVE flag bit 2; src/common/piecerec.h) ---- */
+/* the most writes in one cycle of a sawtooth bar - 0.01 .. 0.99, then an item made and back at 0 - at `bands`, over three cycles */
+int T1047cSawWrites(int bands)
+{
+    using namespace piecerec;
+    PieceLive sent, now;
+    sent.have = 1; sent.hasBar = 1; sent.bar = 0.0f; sent.state = 2;
+    now = sent;
+    float peak[kPrLiveMaxStocks];
+    for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) peak[i] = 0.0f;
+    int most = 0;
+    for (int cyc = 0; cyc < 3; ++cyc)
+    {
+        int w = 0;
+        for (int i = 1; i <= 100; ++i)
+        {
+            now.bar = (i < 100) ? (float)i / 100.0f : 0.0f;
+            if (PieceLiveDue(sent, peak, 0.0f, -1, now, -1, bands) != 0) { sent = now; ++w; }
+        }
+        if (w > most) most = w;
+    }
+    return most;
+}
+/* T-1047 step 2b review: a sawtooth bar that reaches full 1.0 before its item is made, at `bands`, over three cycles - the most writes in
+   one cycle; *fullOk 1 = every cycle wrote the full bar */
+int T1047cSawFull(int bands, int* fullOk)
+{
+    using namespace piecerec;
+    PieceLive sent, now;
+    sent.have = 1; sent.hasBar = 1; sent.bar = 0.0f; sent.state = 2;
+    now = sent;
+    float peak[kPrLiveMaxStocks];
+    for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) peak[i] = 0.0f;
+    int most = 0;
+    *fullOk = 1;
+    for (int cyc = 0; cyc < 3; ++cyc)
+    {
+        int w = 0;
+        for (int i = 1; i <= 101; ++i)
+        {
+            now.bar = (i <= 100) ? (float)i / 100.0f : 0.0f;
+            if (PieceLiveDue(sent, peak, 0.0f, -1, now, -1, bands) != 0) { sent = now; ++w; }
+            if (i == 100 && sent.bar != 1.0f) *fullOk = 0;
+        }
+        if (w > most) most = w;
+    }
+    return most;
+}
+/* T-1047 step 2b review: a work state flapping 2 / 1 at each look every stepMs for ms, then held at 1 for holdMs, the bar unchanged, each
+   look with the hold clock (PieceLiveStateHeld) - the writes made */
+int T1047cFlapWrites(unsigned int stepMs, unsigned int ms, unsigned int holdMs)
+{
+    using namespace piecerec;
+    PieceLive sent, now;
+    sent.have = 1; sent.hasBar = 1; sent.bar = 0.5f; sent.state = 2;
+    now = sent;
+    float peak[kPrLiveMaxStocks];
+    for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) peak[i] = 0.0f;
+    int have = 0, seen = 0, w = 0;
+    unsigned int at = 0u, t = 0u;
+    for (; t <= ms; t += stepMs)
+    {
+        now.state = ((t / stepMs) % 2u == 0u) ? 2 : 1;
+        const unsigned int held = PieceLiveStateHeld(&have, &seen, &at, now.state, t);
+        if (PieceLiveDue(sent, peak, 0.0f, -1, now, -1, kPieceLiveBarBandsWorked, held) != 0) { sent = now; ++w; }
+    }
+    const unsigned int end = t + holdMs;
+    for (; t <= end; t += stepMs)
+    {
+        now.state = 1;
+        const unsigned int held = PieceLiveStateHeld(&have, &seen, &at, now.state, t);
+        if (PieceLiveDue(sent, peak, 0.0f, -1, now, -1, kPieceLiveBarBandsWorked, held) != 0) { sent = now; ++w; }
+    }
+    return w;
+}
+/* T-1047 step 3: a player-built door's health, lock level, door broken and lock broken in its piece's record (the LIVE part's doors), the
+   HIT's door and repair words, the door hit's route, the doors' band rule and the lock pick's rule */
+void t_t1047d_doors()
+{
+    using namespace piecerec;
+    if (kPrLiveFlagDoors != 8u || kPrLiveFlagNoPower != 16u || kPrLiveFlagsAll != 63u || kPrLiveMaxDoors != 16u || kPrLiveDoorFlagsAll != 7u || kPrLiveLockLevelMax != 100
+        || kPieceLiveDoorBands != 20 || kPrLiveMaxBytes != 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u)
+        Fail("t1047d: the doors part's flag bit, room, door flags, lock level range or band count");
+    if (kGameProtocolDoors != 176u || hovrec::kGameProtocol < kGameProtocolDoors || kProtocol != 121u) Fail("t1047d: the game-to-game protocol is not 176 or the world-server protocol not 121");
+
+    /* round trip: a power piece's values with two doors */
+    PieceLive l;
+    l.have = 1; l.on = 1; l.battery = 2.0f; l.n = 1; l.stock[0] = 0.25f; l.hasBar = 1; l.bar = 0.5f; l.state = 1;
+    l.hasDoors = 1; l.nd = 2;
+    l.doorHealth[0] = 120.0f; l.doorLevel[0] = 40; l.doorFlags[0] = kPrLiveDoorHasLock;
+    l.doorHealth[1] = 0.0f; l.doorLevel[1] = 100; l.doorFlags[1] = kPrLiveDoorBroken | kPrLiveDoorLockBroken | kPrLiveDoorHasLock;
+    std::vector<char> a;
+    PieceLivePut(&a, l);
+    PieceLive g;
+    if (a.size() != 12u + 4u + 8u + 4u + 2u * 12u || PieceLiveGet(&a[0], a.size(), &g) != 1 || g.hasDoors != 1 || g.nd != 2 || g.doorHealth[0] != 120.0f
+        || g.doorLevel[0] != 40 || g.doorLevel[1] != 100 || g.doorFlags[1] != 7u || g.hasBar != 1 || g.bar != 0.5f || PieceLiveEqual(g, l) != 1 || PieceLiveSame(g, l) != 1)
+        Fail("t1047d: the doors part did not round-trip");
+    if (((unsigned char)a[0] & 8u) == 0) Fail("t1047d: the doors' flag bit is not bit 3");
+    /* a piece with no power values: its power values ride as zero */
+    PieceLive o;
+    o.have = 1; o.hasPower = 0; o.hasDoors = 1; o.nd = 1; o.doorHealth[0] = 5.0f;
+    std::vector<char> ob;
+    PieceLivePut(&ob, o);
+    if (ob.size() != 12u + 4u + 12u || PieceLiveGet(&ob[0], ob.size(), &g) != 1 || g.on != 0 || g.gets != 0 || g.n != 0 || g.hasBar != 0 || g.nd != 1 || g.doorHealth[0] != 5.0f)
+        Fail("t1047d: a doors-only part did not round-trip");
+    /* an older part without the doors flag reads with the doors not known */
+    PieceLive p = l;
+    PieceDoorsClear(&p);
+    std::vector<char> pb;
+    PieceLivePut(&pb, p);
+    if (PieceLiveGet(&pb[0], pb.size(), &g) != 1 || g.hasDoors != 0 || g.nd != 0) Fail("t1047d: a part without the doors flag read doors");
+    if (PieceLiveEqual(g, l) != 0 || PieceLiveSame(g, l) != 0) Fail("t1047d: doors known on one side only read as the same");
+    {   /* the power flag: power and doors, doors only, power only - each reads back with its own hasPower */
+        if (((unsigned char)a[0] & 16u) != 0 || PieceLiveGet(&a[0], a.size(), &g) != 1 || g.hasPower != 1 || g.hasDoors != 1 || g.on != 1 || g.battery != 2.0f)
+            Fail("t1047d power flag: power and doors carried the no-power flag or did not round-trip");
+        if (((unsigned char)ob[0] & 16u) == 0 || PieceLiveGet(&ob[0], ob.size(), &g) != 1 || g.hasPower != 0 || g.hasDoors != 1 || PieceLivePowerKnown(g) != 0)
+            Fail("t1047d power flag: a doors-only part lacked the no-power flag or read power values");
+        if (((unsigned char)pb[0] & 16u) != 0 || PieceLiveGet(&pb[0], pb.size(), &g) != 1 || g.hasPower != 1 || g.hasDoors != 0 || g.n != 1 || g.stock[0] != 0.25f)
+            Fail("t1047d power flag: power only carried the no-power flag or did not round-trip");
+        PieceLive x = o; x.battery = 1.0f;
+        if (PieceLiveValid(x)) Fail("t1047d power flag: a part without power values that carries a battery was valid");
+        x = o; x.on = 1;
+        if (PieceLiveValid(x)) Fail("t1047d power flag: a part without power values that carries the switch was valid");
+        x = o; x.hasPower = 2;
+        if (PieceLiveValid(x)) Fail("t1047d power flag: hasPower 2 was valid");
+        std::vector<char> t(ob);
+        t[0] = (char)(t[0] | 1);   /* the switch bit with the no-power flag */
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d power flag: the switch bit with the no-power flag was read");
+        t = ob; t[4] = 0; t[5] = 0; t[6] = (char)0x80; t[7] = 0x3F;   /* battery 1.0 with the no-power flag */
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d power flag: a battery with the no-power flag was read");
+        std::vector<char> old;   /* an older part: flags bits 0-2 only (switch, gets battery, bar), battery 3, no stocks, bar 0.5, state 1 */
+        coopbrec::BrPutU32(&old, kPrLiveFlagOn | kPrLiveFlagGets | kPrLiveFlagBar); PrPutF32(&old, 3.0f); coopbrec::BrPutU32(&old, 0u);
+        PrPutF32(&old, 0.5f); coopbrec::BrPutU32(&old, 1u);
+        g = PieceLive();
+        if (PieceLiveGet(&old[0], old.size(), &g) != 1 || g.hasPower != 1 || PieceLivePowerKnown(g) != 1 || g.on != 1 || g.gets != 1 || g.battery != 3.0f
+            || g.hasBar != 1 || g.bar != 0.5f || g.state != 1 || g.hasDoors != 0)
+            Fail("t1047d power flag: an older part (bits 0-2 only) did not read as power known");
+        if (PieceLiveEqual(o, l) != 0 || PieceLiveSame(o, l) != 0) Fail("t1047d power flag: power known on one side only read as the same");
+    }
+    {   /* a doors-only part is never queued or owed as power: the power apply sees no power values, the doors apply still runs */
+        if (PieceLiveApplyChoice(0, 1, PieceLivePowerKnown(o), 0, 0, 1, kPaMake) != kPlaNone
+            || PieceLiveApplyChoice(0, 1, PieceLivePowerKnown(o), 0, 0, 1, kPaState) != kPlaNone)
+            Fail("t1047d power flag: a doors-only part was owed or queued as power");
+        if (PieceLiveApplyChoice(0, 1, o.have, 0, 0, 1, kPaMake) != kPlaOwe) Fail("t1047d power flag: a doors-only part's doors apply was not owed to the made piece");
+        if (PieceLiveApplyChoice(0, 1, PieceLivePowerKnown(l), 0, 0, 1, kPaMake) != kPlaOwe) Fail("t1047d power flag: a power part was not owed to the made piece");
+        if (PieceLivePowerKnown(PieceLive()) != 0) Fail("t1047d power flag: no LIVE part read as power known");
+        if (PieceLiveDue(l, 0, 10.0f, -1, o, -1) != 0) Fail("t1047d power flag: a doors-only look was a power write");
+        if (PieceLiveDue(o, 0, 10.0f, -1, l, -1) != 1) Fail("t1047d power flag: power values after a doors-only write were not a power write");
+    }
+    {   /* refused whole */
+        std::vector<char> t(a);
+        t[0] = (char)(t[0] | 64);   /* bit 6 (bit 5 is the outpost link since T-1047 step 5) */
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d: an unknown LIVE flag bit was read");
+        t = a; t.push_back(0);
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d: a byte after the doors was read");
+        t = a; t.pop_back();
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d: a doors part one byte short was read");
+        t = pb; t[0] = (char)(t[0] | 8);
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d: the doors' flag bit with no doors part was read");
+        t = ob; t[12] = 17;   /* flags, battery, no stocks, then the doors' count */
+        for (int i = 0; i < 16 * 12; ++i) t.push_back(0);
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047d: 17 doors were read");
+        PieceLive m = o;
+        m.nd = 17;
+        if (PieceLiveValid(m)) Fail("t1047d: 17 doors were valid");
+    }
+    {   /* values out of range */
+        const float bad[3] = { std::numeric_limits<float>::quiet_NaN(), -1.0f, kPrLiveValueLimit * 2.0f };
+        for (int i = 0; i < 3; ++i)
+        {
+            PieceLive x = o;
+            x.doorHealth[0] = bad[i];
+            std::vector<char> y;
+            PieceLivePut(&y, x);
+            if (PieceLiveValid(x) || PieceLiveGet(&y[0], y.size(), &g) != 0) Fail("t1047d: a door health out of range (or not a number) was valid or read");
+        }
+        PieceLive x = o;
+        x.doorLevel[0] = 101;
+        std::vector<char> y;
+        PieceLivePut(&y, x);
+        if (PieceLiveValid(x) || PieceLiveGet(&y[0], y.size(), &g) != 0) Fail("t1047d: a lock level over 100 was valid or read");
+        x = o; x.doorFlags[0] = 8u; y.clear(); PieceLivePut(&y, x);
+        if (PieceLiveValid(x) || PieceLiveGet(&y[0], y.size(), &g) != 0) Fail("t1047d: an unknown door flag bit was valid or read");
+        x = o; x.hasDoors = 2;
+        if (PieceLiveValid(x)) Fail("t1047d: a doors flag that is not 0 / 1 was valid");
+        x = o; x.hasDoors = 0; x.nd = 99;
+        if (!PieceLiveValid(x)) Fail("t1047d: a LIVE part with the doors not known was judged by its unused door fields");
+    }
+    {   /* kPrLiveMaxBytes holds the largest part */
+        PieceLive big;
+        big.have = 1; big.n = (int)kPrLiveMaxStocks; big.hasBar = 1; big.hasDoors = 1; big.nd = (int)kPrLiveMaxDoors; PieceTownSet(&big, 1u);   /* T-1047 step 5: the outpost link is part of the largest part */
+        std::vector<char> bb;
+        PieceLivePut(&bb, big);
+        if (bb.size() != (size_t)kPrLiveMaxBytes || PieceLiveGet(&bb[0], bb.size(), &g) != 1) Fail("t1047d: the largest LIVE part is not kPrLiveMaxBytes long, or did not read");
+    }
+    {   /* the band rule: judged on the last written doors */
+        float mx[kPrLiveMaxDoors];
+        for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) mx[i] = 200.0f;
+        PieceLive s = o;
+        s.doorHealth[0] = 105.0f;
+        PieceLive n2 = s;
+        n2.doorHealth[0] = 101.0f;
+        if (PieceDoorsDue(s, n2, mx) != 0) Fail("t1047d: a door's health inside its twentieth was due");
+        n2.doorHealth[0] = 99.0f;
+        if (PieceDoorsDue(s, n2, mx) != 1) Fail("t1047d: a door's health crossing a twentieth was not due");
+        n2 = s; n2.doorFlags[0] = kPrLiveDoorBroken;
+        if (PieceDoorsDue(s, n2, mx) != 1) Fail("t1047d: a door broken flip was not due");
+        n2 = s; n2.doorFlags[0] = kPrLiveDoorLockBroken;
+        if (PieceDoorsDue(s, n2, mx) != 1) Fail("t1047d: a lock broken flip was not due");
+        n2 = s; n2.doorLevel[0] = 7;
+        if (PieceDoorsDue(s, n2, mx) != 1) Fail("t1047d: a lock level change was not due");
+        n2 = s; n2.nd = 2;
+        if (PieceDoorsDue(s, n2, mx) != 1) Fail("t1047d: a door more was not due");
+        PieceLive none;
+        if (PieceDoorsDue(none, s, mx) != 1) Fail("t1047d: the first doors were not due");
+        if (PieceDoorsDue(s, none, mx) != 0 || PieceDoorsDue(s, s, mx) != 0) Fail("t1047d: no doors, or the same doors, were due");
+        if (PieceDoorsSame(s, s) != 1 || PieceDoorsSame(s, n2) != 0 || PieceDoorsSame(none, none) != 1) Fail("t1047d: PieceDoorsSame");
+    }
+    {   /* HIT: the door and the repair word */
+        coopbuild::BuildMsg h;
+        h.kind = coopbuild::kBuildHit; h.key = "k|1|2|3"; h.seq = 5; h.hitCut = 4.0f; h.hitBlunt = 1.0f; h.reason = coopbuild::kBuildHitAsk; h.hitDoor = 3;
+        std::vector<char> hb;
+        coopbuild::BuildMsg d;
+        if (!coopbuild::EncodeBuild(&hb, h) || hb.size() != 2u + h.key.size() + 15u || coopbuild::DecodeBuild(&hb[0], hb.size(), &d) != coopbuild::kBuildDecodeOk
+            || d.hitDoor != 3 || d.hitRepair != 0 || d.hitCut != 4.0f || d.hitBlunt != 1.0f || d.seq != 5u) Fail("t1047d: a HIT naming door 3 did not round-trip");
+        {
+            std::vector<char> t(hb);
+            t[t.size() - 2] = 16;
+            if (coopbuild::DecodeBuild(&t[0], t.size(), &d) == coopbuild::kBuildDecodeOk) Fail("t1047d: a HIT naming door 16 was read");
+            t = hb; t.pop_back();
+            if (coopbuild::DecodeBuild(&t[0], t.size(), &d) == coopbuild::kBuildDecodeOk) Fail("t1047d: a HIT without its repair word was read");
+        }
+        h.hitDoor = -1; hb.clear();
+        if (!coopbuild::EncodeBuild(&hb, h) || coopbuild::DecodeBuild(&hb[0], hb.size(), &d) != coopbuild::kBuildDecodeOk || d.hitDoor != -1) Fail("t1047d: a HIT on the piece itself (-1) did not round-trip");
+        coopbuild::BuildMsg r = h;
+        r.hitDoor = 0; r.hitRepair = 1; r.hitBlunt = 0.0f; r.hitCut = 12.5f; hb.clear();
+        if (!coopbuild::EncodeBuild(&hb, r) || coopbuild::DecodeBuild(&hb[0], hb.size(), &d) != coopbuild::kBuildDecodeOk || d.hitRepair != 1 || d.hitDoor != 0 || d.hitCut != 12.5f)
+            Fail("t1047d: a door repair ask did not round-trip");
+        coopbuild::BuildMsg x = h;
+        x.hitDoor = 16;
+        if (coopbuild::BuildEncodable(x)) Fail("t1047d: a HIT naming door 16 is encodable");
+        x = h; x.hitDoor = -2;
+        if (coopbuild::BuildEncodable(x)) Fail("t1047d: a HIT naming door -2 is encodable");
+        x = r; x.hitDoor = -1;
+        if (coopbuild::BuildEncodable(x)) Fail("t1047d: a repair naming no door is encodable");
+        x = r; x.hitBlunt = 1.0f;
+        if (coopbuild::BuildEncodable(x)) Fail("t1047d: a repair with a blunt part is encodable");
+        x = r; x.reason = coopbuild::kBuildHitApplied;
+        if (coopbuild::BuildEncodable(x)) Fail("t1047d: a repair word on an answer is encodable");
+        coopbuild::BuildMsg rs;
+        rs.kind = coopbuild::kBuildHit; rs.key = h.key; rs.seq = 9; rs.reason = coopbuild::kBuildHitResult; rs.hitDrop = 1.0f; rs.needed = 10.0f; rs.hitAfter = 1.0f;
+        if (!coopbuild::BuildEncodable(rs)) Fail("t1047d: a HIT result is not encodable");
+        rs.hitDoor = 0;
+        if (coopbuild::BuildEncodable(rs)) Fail("t1047d: a HIT result naming a door is encodable");
+    }
+    /* the door hit's route */
+    if (coopbuild::BuildDoorHitRoute(1, 0, 1, 1, 1, 0) != coopbuild::kBuildHitRouteQueue || coopbuild::BuildDoorHitRoute(1, 15, 1, 1, 1, 0) != coopbuild::kBuildHitRouteQueue)
+        Fail("t1047d: a player piece's door hit was not queued for the writer");
+    if (coopbuild::BuildDoorHitRoute(0, 0, 1, 1, 1, 0) != coopbuild::kBuildHitRouteEngine) Fail("t1047d: a hit on a target that is not a listed door left the engine");
+    if (coopbuild::BuildDoorHitRoute(1, -1, 1, 1, 1, 0) != coopbuild::kBuildHitRouteEngine || coopbuild::BuildDoorHitRoute(1, 16, 1, 1, 1, 0) != coopbuild::kBuildHitRouteEngine)
+        Fail("t1047d: a door with no index the record carries left the engine");
+    if (coopbuild::BuildDoorHitRoute(1, 0, 0, 1, 1, 0) != coopbuild::kBuildHitRouteEngine) Fail("t1047d: a town's or an unowned door's hit left the engine");
+    if (coopbuild::BuildDoorHitRoute(1, 0, 1, 0, 1, 0) != coopbuild::kBuildHitRouteEngine) Fail("t1047d: a lone game's door hit left the engine");
+    if (coopbuild::BuildDoorHitRoute(1, 0, 1, 1, 0, 0) != coopbuild::kBuildHitRouteEngine) Fail("t1047d: a door hit with an unread damage struct left the engine");
+    if (coopbuild::BuildDoorHitRoute(1, 0, 1, 1, 1, 1) != coopbuild::kBuildHitRouteEngine) Fail("t1047d: the mod's own replay of a door hit left the engine");
+    /* the lock pick */
+    if (coopdoor::LockPickedRule(1, 0, 1) != 1 || coopdoor::LockPickedRule(1, 0, 0) != 0 || coopdoor::LockPickedRule(0, 0, 1) != 0 || coopdoor::LockPickedRule(1, 1, 1) != 0)
+        Fail("t1047d: the lock pick's rule (an unlock of a door's lock only)");
+}
+
+void t_t1047d_doors_edges()
+{
+    using namespace piecerec;
+    PieceLive g;
+    {   /* the band rule with a max health of 0 or not a number (counted as 1), a full band, fewer doors */
+        float mx[kPrLiveMaxDoors];
+        PieceLive s;
+        s.have = 1; s.hasDoors = 1; s.nd = 2; s.doorHealth[0] = 105.0f; s.doorHealth[1] = 200.0f;
+        for (int k = 0; k < 2; ++k)
+        {
+            for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) mx[i] = (k == 0) ? 0.0f : std::numeric_limits<float>::quiet_NaN();
+            PieceLive n2 = s;
+            n2.doorHealth[0] = 50.0f;
+            if (PieceDoorsDue(s, n2, mx) != 0) Fail("t1047d doors edges: a door's health above a max of 0 / NaN (counted as 1) was due");
+            n2.doorHealth[0] = 0.0f;
+            if (PieceDoorsDue(s, n2, mx) != 1) Fail("t1047d doors edges: a door reaching 0 with a max of 0 / NaN was not due");
+        }
+        for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) mx[i] = 200.0f;
+        PieceLive n3 = s;
+        if (PieceDoorsDue(s, n3, mx) != 0) Fail("t1047d doors edges: a full door unchanged was due");
+        n3.doorHealth[1] = 199.5f;
+        if (PieceDoorsDue(s, n3, mx) != 1) Fail("t1047d doors edges: a door leaving full was not due (full is a band of its own)");
+        n3 = s; n3.nd = 1;
+        if (PieceDoorsDue(s, n3, mx) != 1) Fail("t1047d doors edges: fewer doors were not due");
+    }
+    {   /* PieceLiveSame's door tolerance; PieceLiveEqual is exact */
+        PieceLive a;
+        a.have = 1; a.hasDoors = 1; a.nd = 1; a.doorHealth[0] = 50.0f;
+        PieceLive b = a;
+        b.doorHealth[0] = 50.0f + kPrLiveEps * 0.5f;
+        if (PieceLiveSame(a, b) != 1 || PieceLiveEqual(a, b) != 0) Fail("t1047d doors edges: a door health inside the tolerance");
+        b.doorHealth[0] = 50.01f;
+        if (PieceLiveSame(a, b) != 0) Fail("t1047d doors edges: a door health past the tolerance was the same");
+        b = a; b.doorFlags[0] = kPrLiveDoorBroken;
+        if (PieceLiveSame(a, b) != 0) Fail("t1047d doors edges: a broken flag difference was the same");
+        PieceLive c = a; PieceLive d = a;
+        PieceDoorsClear(&c);
+        d.doorHealth[0] = 7.0f; PieceDoorsClear(&d);
+        if (PieceLiveSame(c, d) != 1) Fail("t1047d doors edges: two LIVE parts with their doors cleared were not the same");
+    }
+    {   /* PieceDoorsCopy clamps the count and keeps the power values */
+        PieceLive from;
+        from.have = 1; from.hasDoors = 1; from.nd = 20;
+        for (unsigned int i = 0; i < kPrLiveMaxDoors; ++i) from.doorHealth[i] = (float)i;
+        PieceLive to;
+        to.have = 1; to.battery = 3.0f; to.on = 1;
+        PieceDoorsCopy(&to, from);
+        if (to.nd != (int)kPrLiveMaxDoors || to.hasDoors != 1 || to.doorHealth[15] != 15.0f || to.battery != 3.0f || to.on != 1) Fail("t1047d doors edges: PieceDoorsCopy over 16 doors");
+        from.nd = -3;
+        PieceDoorsCopy(&to, from);
+        if (to.nd != 0 || to.hasDoors != 1) Fail("t1047d doors edges: PieceDoorsCopy with a count below 0");
+        PieceLive none;
+        PieceDoorsCopy(&to, none);
+        if (to.hasDoors != 0 || to.nd != 0 || to.battery != 3.0f) Fail("t1047d doors edges: PieceDoorsCopy of doors not known");
+    }
+    {   /* PieceLivePut with more than 16 doors writes 16, readable */
+        PieceLive m;
+        m.have = 1; m.hasDoors = 1; m.nd = 20;
+        std::vector<char> mb;
+        PieceLivePut(&mb, m);
+        if (mb.size() != 12u + 4u + 12u * kPrLiveMaxDoors || PieceLiveGet(&mb[0], mb.size(), &g) != 1 || g.nd != (int)kPrLiveMaxDoors)
+            Fail("t1047d doors edges: PieceLivePut over 16 doors did not write 16 readable doors");
+    }
+    {   /* a LIVE part with doors and stocks but no bar */
+        PieceLive l;
+        l.have = 1; l.gets = 1; l.battery = 1.5f; l.n = 2; l.stock[0] = 0.5f; l.stock[1] = 0.25f;
+        l.hasDoors = 1; l.nd = 1; l.doorHealth[0] = 80.0f; l.doorLevel[0] = 30; l.doorFlags[0] = kPrLiveDoorHasLock;
+        std::vector<char> lb;
+        PieceLivePut(&lb, l);
+        if (lb.size() != 12u + 8u + 4u + 12u || PieceLiveGet(&lb[0], lb.size(), &g) != 1 || g.hasBar != 0 || g.n != 2 || g.stock[1] != 0.25f
+            || g.nd != 1 || g.doorLevel[0] != 30 || PieceLiveEqual(g, l) != 1) Fail("t1047d doors edges: doors and stocks with no bar did not round-trip");
+    }
+    {   /* a HIT answer naming a door */
+        coopbuild::BuildMsg h;
+        h.kind = coopbuild::kBuildHit; h.key = "k|1|2|3"; h.seq = 7; h.reason = coopbuild::kBuildHitApplied; h.hitDoor = 2;
+        std::vector<char> hb;
+        coopbuild::BuildMsg d;
+        if (!coopbuild::BuildEncodable(h) || !coopbuild::EncodeBuild(&hb, h) || coopbuild::DecodeBuild(&hb[0], hb.size(), &d) != coopbuild::kBuildDecodeOk
+            || d.hitDoor != 2 || d.hitRepair != 0 || d.reason != coopbuild::kBuildHitApplied || d.seq != 7u) Fail("t1047d doors edges: a HIT answer naming door 2 did not round-trip");
+    }
+    {   /* the repair sum-and-due rule */
+        float sum = 0.0f, out = 0.0f;
+        unsigned int at = 0u;
+        int have = 0;
+        const unsigned int gap = coopbuild::kBuildDoorRepairGapMs;
+        if (gap != 250u) Fail("t1047d doors edges: the repair ask gap is not 250 ms");
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 1.0f, 1000u, gap, &out) != 1 || out != 1.0f || sum != 0.0f || at != 1000u || have != 1)
+            Fail("t1047d doors edges: a door's first repair gain was not asked at once");
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.5f, 1100u, gap, &out) != 0 || sum != 0.5f) Fail("t1047d doors edges: a gain inside the gap was asked");
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.5f, 1200u, gap, &out) != 0 || sum != 1.0f) Fail("t1047d doors edges: gains inside the gap were not summed");
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.0f, 1249u, gap, &out) != 0) Fail("t1047d doors edges: a sum was asked 249 ms after the last ask");
+        out = 0.0f;
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.0f, 1250u, gap, &out) != 1 || out != 1.0f || sum != 0.0f || at != 1250u) Fail("t1047d doors edges: the summed gains were not asked once the gap passed");
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.0f, 9000u, gap, &out) != 0) Fail("t1047d doors edges: nothing summed was asked");
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, std::numeric_limits<float>::quiet_NaN(), 9000u, gap, &out) != 0
+            || coopbuild::BuildRepairSumDue(&sum, &at, &have, -2.0f, 9000u, gap, &out) != 0
+            || coopbuild::BuildRepairSumDue(&sum, &at, &have, coopbuild::kBuildHitMax * 2.0f, 9000u, gap, &out) != 0 || sum != 0.0f)
+            Fail("t1047d doors edges: a gain not a number, below 0 or over the limit was summed");
+        sum = coopbuild::kBuildHitMax * 1.5f; have = 0;
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.0f, 9000u, gap, &out) != 1 || out != coopbuild::kBuildHitMax || !(sum > 0.0f))
+            Fail("t1047d doors edges: a sum over the HIT limit was not asked capped, the rest kept");
+        sum = 1.0f; at = 0xFFFFFF00u; have = 1;
+        if (coopbuild::BuildRepairSumDue(&sum, &at, &have, 0.0f, 0x00000100u, gap, &out) != 1) Fail("t1047d doors edges: the gap across the tick counter's wrap");
+        if (coopbuild::BuildRepairSumDue(0, &at, &have, 1.0f, 0u, gap, &out) != 0) Fail("t1047d doors edges: no sum");
+    }
+    /* the door road: a broken door keeps its state against a word to close it */
+    if (coopdoor::DoorBrokenKeeps(1, coopdoor::kDoorClosed) != 1 || coopdoor::DoorBrokenKeeps(1, coopdoor::kDoorClosing) != 1
+        || coopdoor::DoorBrokenKeeps(1, coopdoor::kDoorOpen) != 0 || coopdoor::DoorBrokenKeeps(1, coopdoor::kDoorOpening) != 0
+        || coopdoor::DoorBrokenKeeps(0, coopdoor::kDoorClosed) != 0) Fail("t1047d doors edges: the broken door's keep rule");
+}
+
+void t_t1047c_live_bar()
+{
+    using namespace piecerec;
+    if (kPrLiveFlagBar != 4u || kPrLiveFlagsAll != 63u || kPrLiveMaxBytes != 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u || kPrLiveBarLimit != 2.0f || kPrLiveStateMax != 2
+        || kPieceLiveBarBandsWorked != 20 || kPieceLiveBarBandsIdle != 4) Fail("t1047c: the bar's flag bit, the LIVE part's room, the bar's range or its band counts");
+    if (kGameProtocolLiveBar != 175u || hovrec::kGameProtocol < kGameProtocolLiveBar || kProtocol != 121u) Fail("t1047c: the game-to-game protocol is not 175 or the world-server protocol not 121");
+
+    /* the LIVE part's bytes, without the bar and with it */
+    PieceLive l;
+    l.have = 1; l.on = 1; l.gets = 1; l.battery = 3.0f; l.n = 1; l.stock[0] = 0.5f;
+    PieceLive g;
+    std::vector<char> a;
+    PieceLivePut(&a, l);
+    if (a.size() != 16u || PieceLiveGet(&a[0], a.size(), &g) != 1 || g.hasBar != 0 || PieceLiveEqual(g, l) != 1) Fail("t1047c: a LIVE part with no bar does not read, or reads a bar");
+    l.hasBar = 1; l.bar = 0.375f; l.state = 2;
+    std::vector<char> bb;
+    PieceLivePut(&bb, l);
+    g = PieceLive();
+    if (bb.size() != 24u || PieceLiveGet(&bb[0], bb.size(), &g) != 1 || g.hasBar != 1 || g.bar != 0.375f || g.state != 2 || g.n != 1 || g.stock[0] != 0.5f
+        || g.on != 1 || g.gets != 1 || g.battery != 3.0f || PieceLiveEqual(g, l) != 1) Fail("t1047c: the bar and work state did not round-trip");
+    if (((unsigned char)bb[0] & 4u) == 0 || ((unsigned char)a[0] & 4u) != 0) Fail("t1047c: the bar's flag bit is not bit 2");
+    {   /* refused whole */
+        std::vector<char> t(bb);
+        t.resize(t.size() - 4u);
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047c: a bar with no work state was read");
+        t = a; t[0] = (char)(t[0] | 4);
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047c: the bar's flag bit with no bar bytes was read");
+        t = bb; t[0] = (char)(t[0] | 64);   /* bit 6 (bit 5 is the outpost link since T-1047 step 5) */
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047c: an unknown LIVE flag bit was read");
+        t = bb; t.push_back(0);
+        if (PieceLiveGet(&t[0], t.size(), &g) != 0) Fail("t1047c: a byte after the work state was read");
+        float nanv = 0.0f;
+        const unsigned int nanBits = 0x7FC00000u;
+        std::memcpy(&nanv, &nanBits, 4);
+        const float bad[] = { -0.01f, 2.01f, nanv };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+        {
+            PieceLive x = l; x.bar = bad[i];
+            std::vector<char> y;
+            PieceLivePut(&y, x);
+            if (PieceLiveGet(&y[0], y.size(), &g) != 0 || PieceLiveValid(x)) Fail("t1047c: a bar out of [0, 2] (or not a number) was read or valid");
+        }
+        const int badState[] = { -1, 3 };
+        for (size_t i = 0; i < sizeof(badState) / sizeof(badState[0]); ++i)
+        {
+            PieceLive x = l; x.state = badState[i];
+            std::vector<char> y;
+            PieceLivePut(&y, x);
+            if (PieceLiveGet(&y[0], y.size(), &g) != 0 || PieceLiveValid(x)) Fail("t1047c: a work state out of 0..2 was read or valid");
+        }
+        PieceLive x = l; x.hasBar = 2;
+        if (PieceLiveValid(x)) Fail("t1047c: a bar flag that is not 0 / 1 was valid");
+        x = l; x.hasBar = 0; x.bar = 9.0f; x.state = 7;
+        if (!PieceLiveValid(x)) Fail("t1047c: a LIVE part with the bar not known was judged by its unused bar fields");
+    }
+    {   /* format-2 records: an earlier writer's (no bar: not known) still reads; with the bar round-trips; out of range is not written */
+        const std::string key = "12-wall.mod@3,41@1003,-205,100";
+        const std::vector<char> r1 = T1045Rec(key, 4, 1, 1, 0, 77, 5.0f);
+        PieceHeader h;
+        PieceBody b;
+        if (r1.empty() || DecodePieceRecord(&r1[0], r1.size(), &h, &b) != kPrOk) { Fail("t1047c: no record made"); return; }
+        PieceLive nb = l; nb.hasBar = 0;
+        b.live = nb;
+        std::vector<char> r2, r3, r4;
+        PieceHeader h2;
+        PieceBody b2;
+        if (!EncodePieceRecord(&r2, h, b) || DecodePieceRecord(&r2[0], r2.size(), &h2, &b2) != kPrOk || h2.format != kPrFormatLive || b2.live.have != 1
+            || b2.live.hasBar != 0) Fail("t1047c: a format-2 record with no bar does not read with its bar not known");
+        b.live = l;
+        if (!EncodePieceRecord(&r3, h, b) || r3.size() != r2.size() + 8u || DecodePieceRecord(&r3[0], r3.size(), &h2, &b2) != kPrOk || b2.live.hasBar != 1
+            || b2.live.bar != 0.375f || b2.live.state != 2) Fail("t1047c: a format-2 record with the bar does not round-trip");
+        PieceBody bad = b; bad.live.bar = 2.5f;
+        if (EncodePieceRecord(&r4, h, bad)) Fail("t1047c: a bar past its limit was written");
+        bad = b; bad.live.state = 3;
+        if (EncodePieceRecord(&r4, h, bad)) Fail("t1047c: a work state past 2 was written");
+    }
+    {   /* the same test and the equal test see a bar-only difference */
+        PieceLive c = l;
+        if (PieceLiveSame(l, c) != 1 || PieceLiveEqual(l, c) != 1) Fail("t1047c: equal bars read as different");
+        c.bar = 0.5f;
+        if (PieceLiveSame(l, c) != 0 || PieceLiveEqual(l, c) != 0) Fail("t1047c: a bar-only change read as the same");
+        c = l; c.state = 1;
+        if (PieceLiveSame(l, c) != 0 || PieceLiveEqual(l, c) != 0) Fail("t1047c: a work-state-only change read as the same");
+        c = l; c.hasBar = 0;
+        if (PieceLiveSame(l, c) != 0 || PieceLiveEqual(l, c) != 0) Fail("t1047c: a known bar read as the same as a bar not known");
+        c = l; c.bar += 0.00001f;
+        if (PieceLiveSame(l, c) != 1 || PieceLiveEqual(l, c) != 0) Fail("t1047c: a bar step under kPrLiveEps (same, not equal)");
+    }
+    {   /* the band rule for the bar: worked bands, idle bands, the state, the first known bar */
+        if (PieceLiveBarBands(1) != kPieceLiveBarBandsWorked || PieceLiveBarBands(0) != kPieceLiveBarBandsIdle) Fail("t1047c: the worked / idle band choice");
+        if (PieceLiveBandOf(0.0f, 1.0f, 4) != 0 || PieceLiveBandOf(0.3f, 1.0f, 4) != 2 || PieceLiveBandOf(1.0f, 1.0f, 4) != 5 || PieceLiveBandOf(1.5f, 1.0f, 4) != 5
+            || PieceLiveBand(50.0f, 100.0f) != PieceLiveBandOf(50.0f, 100.0f, kPieceLiveBatteryBands)) Fail("t1047c: the bands of a given count");
+        float peak[kPrLiveMaxStocks];
+        for (unsigned int i = 0; i < kPrLiveMaxStocks; ++i) peak[i] = 0.0f;
+        peak[0] = 1.0f;
+        PieceLive s = l; s.bar = 0.52f; s.state = 2;
+        PieceLive n = s; n.bar = 0.62f;
+        if (PieceLiveDue(s, peak, 0.0f, -1, n, -1, PieceLiveBarBands(1)) != 1) Fail("t1047c: a worked machine's bar two twentieths on was not due");
+        if (PieceLiveDue(s, peak, 0.0f, -1, n, -1, PieceLiveBarBands(0)) != 0) Fail("t1047c: an idle machine's bar inside its quarter was due");
+        n = s; n.bar = 0.54f;
+        if (PieceLiveDue(s, peak, 0.0f, -1, n, -1, PieceLiveBarBands(1)) != 0) Fail("t1047c: a worked machine's bar inside its twentieth was due");
+        n = s; n.state = 1;
+        if (PieceLiveDue(s, peak, 0.0f, -1, n, -1, PieceLiveBarBands(0)) != 1) Fail("t1047c: a work state change was not due");
+        n = s; n.bar = 0.0f;
+        if (PieceLiveDue(s, peak, 0.0f, -1, n, -1, PieceLiveBarBands(0)) != 1) Fail("t1047c: an item made (the bar back at 0) was not due");
+        n = s; n.hasBar = 0;
+        if (PieceLiveDue(s, peak, 0.0f, -1, n, -1, PieceLiveBarBands(1)) != 0) Fail("t1047c: a bar no longer known was due");
+        PieceLive nob = s; nob.hasBar = 0;
+        if (PieceLiveDue(nob, peak, 0.0f, -1, s, -1, PieceLiveBarBands(0)) != 1) Fail("t1047c: a first known bar over a record without one was not due");
+        const int idle = T1047cSawWrites(kPieceLiveBarBandsIdle), worked = T1047cSawWrites(kPieceLiveBarBandsWorked);
+        if (idle > 5 || idle < 4) Fail("t1047c: a sawtooth bar at idle bands does not write 4-5 times per cycle");
+        if (worked > 21 || worked < 16) Fail("t1047c: a sawtooth bar at worked bands does not write 16-21 times per cycle");
+    }
+    /* the apply's runner rule and MINE_STATE's sender skip / receiver drop */
+    if (PieceLiveBarWrite(1, 1, 0) != 1 || PieceLiveBarWrite(1, 1, 1) != 0 || PieceLiveBarWrite(0, 1, 0) != 0 || PieceLiveBarWrite(1, 0, 0) != 0)
+        Fail("t1047c: the bar is written only from a record that carries it, onto a piece with an output record, on a game that does not run it");
+    if (PieceBarStateSkip(1, 1, 1) != 1 || PieceBarStateSkip(1, 0, 1) != 0 || PieceBarStateSkip(0, 1, 1) != 0) Fail("t1047c: MINE_STATE's sender skip");
+    if (PieceBarStateDrop(1, 1) != 1 || PieceBarStateDrop(1, 0) != 0 || PieceBarStateDrop(0, 1) != 0) Fail("t1047c: MINE_STATE's receiver drop");
+    if (PieceBarStateDrop(1, PieceLiveStateDropRule(0)) != 1 || PieceBarStateDrop(1, PieceLiveStateDropRule(1)) != 0)
+        Fail("t1047c: MINE_STATE is not dropped as POWER_STATE is (dropped until the record's values land, applied after)");
+    /* ---- T-1047 step 2b review folds ---- */
+    {   /* fold 2: a work state change is due once it has held kPieceLiveStateHoldMs (MINE_STATE's own gap); a flapping state writes nothing */
+        if (kPieceLiveStateHoldMs != coopfarm::kMineStateGapMs) Fail("t1047c review: the work state's hold is not MINE_STATE's gap");
+        PieceLive s; s.have = 1; s.hasBar = 1; s.bar = 0.52f; s.state = 2;
+        PieceLive n = s; n.state = 1;
+        if (PieceLiveDue(s, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsWorked, 0u) != 0 || PieceLiveDue(s, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsWorked, kPieceLiveStateHoldMs - 1u) != 0)
+            Fail("t1047c review: a work state change under its hold was due");
+        if (PieceLiveDue(s, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsWorked, kPieceLiveStateHoldMs) != 1) Fail("t1047c review: a work state change that held was not due");
+        if (PieceLiveDue(s, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsWorked) != 1) Fail("t1047c review: the hold's default is not 'held'");
+        n.bar = 0.62f;
+        if (PieceLiveDue(s, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsWorked, 0u) != 1) Fail("t1047c review: a bar out of its band beside a state under its hold was not due");
+        PieceLive nob = s; nob.hasBar = 0;
+        if (PieceLiveDue(nob, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsWorked, 0u) != 1) Fail("t1047c review: a first known bar waited for the state's hold");
+        int have = 0, seen = 0;
+        unsigned int at = 0u;
+        if (PieceLiveStateHeld(&have, &seen, &at, 2, 100u) != 0u || PieceLiveStateHeld(&have, &seen, &at, 2, 1300u) != 1200u
+            || PieceLiveStateHeld(&have, &seen, &at, 1, 1400u) != 0u || PieceLiveStateHeld(&have, &seen, &at, 1, 1500u) != 100u) Fail("t1047c review: the hold clock");
+        have = 0;
+        if (PieceLiveStateHeld(&have, &seen, &at, 2, 0xFFFFFF00u) != 0u || PieceLiveStateHeld(&have, &seen, &at, 2, 0x100u) != 0x200u) Fail("t1047c review: the hold clock over a tick wrap");
+        if (T1047cFlapWrites(200u, 3000u, 0u) != 0) Fail("t1047c review: a flapping work state was written");
+        if (T1047cFlapWrites(200u, 3000u, 1200u) != 1) Fail("t1047c review: a work state held after its flapping was not written exactly once");
+    }
+    {   /* fold 3: the worker's stop writes what differs from the last write */
+        if (PieceLiveWorkStopped(1, 0) != 1 || PieceLiveWorkStopped(1, 1) != 0 || PieceLiveWorkStopped(0, 0) != 0 || PieceLiveWorkStopped(0, 1) != 0)
+            Fail("t1047c review: the worker's stop is worked 1 -> 0 only");
+        PieceLive s; s.have = 1; s.hasBar = 1; s.bar = 0.52f; s.state = 2;
+        PieceLive n = s; n.bar = 0.54f;
+        if (PieceLiveDue(s, 0, 0.0f, -1, n, -1, kPieceLiveBarBandsIdle) != 0) Fail("t1047c review: (setup) a bar inside its band was due");
+        if (PieceLiveFinalDue(1, s, n) != 1) Fail("t1047c review: the worker's stop did not write a bar that moved inside its band");
+        if (PieceLiveFinalDue(1, s, s) != 0) Fail("t1047c review: the worker's stop wrote values already written");
+        if (PieceLiveFinalDue(0, s, n) != 0) Fail("t1047c review: a look with no stop wrote a bar inside its band");
+        PieceLive nb = n; nb.hasBar = 0;
+        if (PieceLiveFinalDue(1, s, nb) != 0) Fail("t1047c review: a stop with no bar known wrote");
+        if (PieceLiveFinalDue(1, PieceLive(), n) != 1) Fail("t1047c review: a stop with nothing written yet did not write");
+    }
+    {   /* fold 1: the take-over - once, only a newer record another game wrote, on the runner */
+        if (PieceLiveBarTake(1, 1, 1, 1, 1, 1) != 1) Fail("t1047c review: a take-over did not take the record's bar");
+        if (PieceLiveBarTake(0, 1, 1, 1, 1, 1) != 0 || PieceLiveBarTake(1, 0, 1, 1, 1, 1) != 0 || PieceLiveBarTake(1, 1, 0, 1, 1, 1) != 0
+            || PieceLiveBarTake(1, 1, 1, 0, 1, 1) != 0 || PieceLiveBarTake(1, 1, 1, 1, 0, 1) != 0 || PieceLiveBarTake(1, 1, 1, 1, 1, 0) != 0)
+            Fail("t1047c review: the bar taken outside a moment, off the runner, with no bar, from this game's own record or an older one");
+        if (PieceLiveNewerThanMine(0, 0u, 0u, 5u) != 1 || PieceLiveNewerThanMine(1, 5u, 0u, 5u) != 0 || PieceLiveNewerThanMine(1, 5u, 0u, 6u) != 1
+            || PieceLiveNewerThanMine(1, 3u, 6u, 6u) != 0 || PieceLiveNewerThanMine(0, 0u, 6u, 7u) != 1) Fail("t1047c review: newer than this game's last write");
+        unsigned int taken = 0u, sentGen = 4u;
+        const unsigned int gen = 6u;
+        int n = 0;
+        for (int i = 0; i < 3; ++i) if (PieceLiveBarTake(1, 1, 1, 1, 1, PieceLiveNewerThanMine(1, sentGen, taken, gen)) != 0) { taken = gen; ++n; }
+        if (n != 1) Fail("t1047c review: the same record's bar was taken more than once");
+        sentGen = 7u;   /* this game's own write after the take: its record is never taken back */
+        if (PieceLiveNewerThanMine(1, sentGen, taken, 7u) != 0 || PieceLiveNewerThanMine(1, sentGen, taken, 8u) != 1) Fail("t1047c review: the take does not follow this game's own writes");
+        /* the hand-off's write goes on the box rule's last answer, as an unload's does; never a hit's, never without that answer */
+        if (PieceLiveWallLast(1, 0, 1, 0, 1, 1) != 1 || PieceLiveWallLast(0, 0, 1, 1, 0, 1) != 1) Fail("t1047c review: the hand-off or the unload did not go on the last answer");
+        if (PieceLiveWallLast(1, 0, 1, 1, 0, 1) != 0 || PieceLiveWallLast(1, 1, 1, 0, 1, 1) != 0 || PieceLiveWallLast(1, 0, 1, 0, 1, 0) != 0
+            || PieceLiveWallLast(1, 0, 0, 0, 1, 1) != 0 || PieceLiveWallLast(1, 0, 1, 0, 0, 1) != 0) Fail("t1047c review: the last answer used where the box rule is asked now");
+    }
+    {   /* fold 4: MINE_STATE is skipped only while the record carries the bar */
+        if (PieceBarStateSkip(1, 1, 1) != 1 || PieceBarStateSkip(1, 1, 0) != 0 || PieceBarStateSkip(1, 0, 1) != 0 || PieceBarStateSkip(0, 1, 1) != 0)
+            Fail("t1047c review: MINE_STATE skipped for a piece whose record carries no bar");
+    }
+    {   /* the sawtooth that reaches full 1.0 (full at once, then the item made) */
+        int fullIdle = 0, fullWorked = 0;
+        const int idle = T1047cSawFull(kPieceLiveBarBandsIdle, &fullIdle), worked = T1047cSawFull(kPieceLiveBarBandsWorked, &fullWorked);
+        if (fullIdle != 1 || fullWorked != 1) Fail("t1047c review: a bar that reached full 1.0 was not written at full");
+        if (idle < 5 || idle > 6) Fail("t1047c review: a sawtooth to full at idle bands does not write 5-6 times per cycle");
+        if (worked < 21 || worked > 22) Fail("t1047c review: a sawtooth to full at worked bands does not write 21-22 times per cycle");
+    }
+    {   /* fold 6: the source wiring */
+        const std::string src = T313ReadFile("../coop-plugin/build.cpp");
+        if (src.empty()) { Fail("t1047c review: could not read the plugin's build.cpp"); return; }
+        const size_t d = src.find("int PwMineStateDrop(void* b, const std::string& key)");
+        const size_t dEnd = (d != std::string::npos) ? src.find("\n}", d) : std::string::npos;
+        if (d == std::string::npos || dEnd == std::string::npos || src.find("PwStateDrop(b, key)", d) > dEnd)
+            Fail("t1047c review: PwMineStateDrop does not ask PwStateDrop (the POWER_STATE receiver's rule)");
+        const size_t s = src.find("int PwMineStateSkip(void* b, const char* key)");
+        const size_t sEnd = (s != std::string::npos) ? src.find("\n}", s) : std::string::npos;
+        if (s == std::string::npos || sEnd == std::string::npos || src.find("ri->second.barRead", s) > sEnd
+            || src.find("PieceBarStateSkip(carried, onRecord, barRead)", s) > sEnd) Fail("t1047c review: PwMineStateSkip does not ask the row's bar read");
+        if (src.find("PieceRecLiveHandOff(wasRecId);") == std::string::npos || src.find("PwBarTakeArm(r.key, r.recId);") == std::string::npos
+            || src.find("PieceLiveWallLast(pc != 0 ? 1 : 0, w.holder") == std::string::npos || src.find("PwBarTakeNow(take[i]);") == std::string::npos)
+            Fail("t1047c review: the hand-off's last answer or the take-over is not wired");
+    }
+}
+void t_t1047b_live_misses()
+{
+    using namespace piecerec;
+    /* a hit's state is sent again after a link loss only while a write carrying it is unanswered */
+    {
+        std::vector<PieceFly> f; PieceSrvView v;
+        PieceFlyAdd(&f, 1, 0, 100, 1);
+        if (PieceFlyHit(f) != 1) Fail("t1047b: an unanswered hit's write is not in flight");
+        PieceFlyAdd(&f, 2, 0, 101);
+        if (PieceFlyHit(f) != 1) Fail("t1047b: a LIVE-only write after an unanswered hit hid the hit");
+        if (PieceFlyTaken(&f, 1, 100, &v) != 1 || PieceFlyHit(f) != 0) Fail("t1047b: a taken hit's write still sends its state again");
+        /* the owner repairs; this game writes LIVE only and the link drops before the answer: the old hit's state does not go */
+        PieceFlyAdd(&f, 3, 0, 102);
+        if (PieceFlyHit(f) != 0) Fail("t1047b: a LIVE-only write after a taken hit carries the old hit");
+        PieceFlyLinkLost(&f, &v);
+        if (PieceFlyHit(f) != 0) Fail("t1047b: a hit in flight after a link loss");
+        PieceFlyAdd(&f, 4, 0, 103, 1); PieceFlyAdd(&f, 5, 0, 104);
+        if (PieceFlyRefused(&f, 4) != 1 || PieceFlyHit(f) != 0) Fail("t1047b: a refused hit's write still sends its state again");
+        /* the oldest write dropped at the cap keeps its hit in flight */
+        f.clear();
+        PieceFlyAdd(&f, 10, 0, 200, 1);
+        for (unsigned int g = 11; g < 11u + (unsigned int)kPieceFlyCap; ++g) PieceFlyAdd(&f, g, 0, 200 + g);
+        if (f.size() != kPieceFlyCap || f[0].gen != 11 || PieceFlyHit(f) != 1) Fail("t1047b: a hit was lost with the oldest write at the cap");
+        /* the dropped write's own late answer lets its carried hit go: a repair and a link loss then never send the old hit again */
+        if (PieceFlyTaken(&f, 1, 200, &v) != 0 || PieceFlyHit(f) != 0 || f.size() != kPieceFlyCap) Fail("t1047b: a taken answer for a write dropped at the cap left its hit in flight");
+        f.clear();
+        PieceFlyAdd(&f, 10, 0, 200, 1);
+        for (unsigned int g = 11; g < 11u + (unsigned int)kPieceFlyCap; ++g) PieceFlyAdd(&f, g, 0, 200 + g);
+        if (PieceFlyRefused(&f, 9) != 0 || PieceFlyHit(f) != 1) Fail("t1047b: an answer older than the dropped hit's write let its hit go");
+        if (PieceFlyRefused(&f, 10) != 0 || PieceFlyHit(f) != 0) Fail("t1047b: a refusal of the write dropped at the cap left its hit in flight");
+        /* two drops: the hit rides on to the next oldest, naming the newest dropped write */
+        f.clear();
+        PieceFlyAdd(&f, 10, 0, 200, 1);
+        for (unsigned int g = 11; g < 12u + (unsigned int)kPieceFlyCap; ++g) PieceFlyAdd(&f, g, 0, 200 + g);
+        if (f.size() != kPieceFlyCap || f[0].gen != 12 || f[0].carry != 1 || f[0].carryGen != 11 || PieceFlyHit(f) != 1) Fail("t1047b: a hit carried twice was lost");
+        if (PieceFlyTaken(&f, 1, 200, &v) != 0 || PieceFlyHit(f) != 1) Fail("t1047b: an answer for an older dropped write let a newer one's hit go");
+        if (PieceFlyTaken(&f, 1, 211, &v) != 0 || PieceFlyHit(f) != 0) Fail("t1047b: the newest dropped write's answer left its carried hit");
+        /* a write answered in the list still takes a carried hit with it */
+        f.clear();
+        PieceFlyAdd(&f, 10, 0, 200, 1);
+        for (unsigned int g = 11; g < 11u + (unsigned int)kPieceFlyCap; ++g) PieceFlyAdd(&f, g, 0, 200 + g);
+        if (PieceFlyTaken(&f, 1, 211, &v) != 1 || PieceFlyHit(f) != 0) Fail("t1047b: the carrying write taken left its hit");
+    }
+    /* another player's piece: a write's STATE comes from the newest write sent while a hit's write is unanswered, else the kept record */
+    {
+        if (PieceHolderStateFromFly(1, 0, 5, 4) != 1) Fail("t1047b: a LIVE-only write after an unanswered hit took the kept state");
+        if (PieceHolderStateFromFly(0, 0, 5, 4) != 0) Fail("t1047b: no hit in flight took the state from the in-flight write");
+        if (PieceHolderStateFromFly(1, 1, 5, 4) != 0) Fail("t1047b: a removal mark in flight gave the state");
+        if (PieceHolderStateFromFly(1, 0, 4, 4) != 0 || PieceHolderStateFromFly(1, 0, 3, 4) != 0) Fail("t1047b: an in-flight write not above the kept record gave the state");
+        std::vector<PieceFly> f; PieceSrvView v;
+        PieceFlyAdd(&f, 5, 0, 300, 1); PieceFlyAdd(&f, 6, 0, 301);
+        if (PieceHolderStateFromFly(PieceFlyHit(f), f.back().removed, f.back().gen, 4) != 1) Fail("t1047b: a second LIVE-only write lost the hit's state");
+        if (PieceFlyTaken(&f, 1, 301, &v) != 1 || PieceHolderStateFromFly(PieceFlyHit(f), 0, 7, 6) != 0) Fail("t1047b: the state came from flight after both were taken");
+    }
+    /* an apply dropped at a full queue, or given up, never counts as landed (the switch is not taken from the record) */
+    if (PieceLiveLandedRule(1, 0, 0, 0) != 1) Fail("t1047b: a landed apply");
+    if (PieceLiveLandedRule(1, 0, 1, 0) != 0) Fail("t1047b: an apply dropped at a full queue counts as landed");
+    if (PieceLiveLandedRule(1, 1, 0, 0) != 0 || PieceLiveLandedRule(0, 0, 0, 0) != 0) Fail("t1047b: a waiting apply or an area not applied counts as landed");
+    if (PieceLiveLandedRule(1, 0, 0, 1) != 0) Fail("t1047b: a given-up apply counts as landed");
+    if (PieceLiveStateDropRule(0) != 1 || PieceLiveStateDropRule(1) != 0) Fail("t1047b: the POWER_STATE drop rule");
+    if (PieceLiveStateDropRule(PieceLiveLandedRule(1, 0, 1, 0)) != 1) Fail("t1047b: a dropped apply takes POWER_STATE");
+    if (PieceLiveStateDropRule(PieceLiveLandedRule(1, 0, 0, 1)) != 1) Fail("t1047b: a given-up apply takes POWER_STATE (the writer keeps the record road)");
+    /* a given-up apply never blocks this game's notes; a waiting or dropped one does */
+    if (PieceLivePendingRule(0, 0, 1) != 0) Fail("t1047b: a given-up apply blocks the notes");
+    if (PieceLivePendingRule(1, 0, 0) != 1 || PieceLivePendingRule(0, 1, 0) != 1 || PieceLivePendingRule(0, 0, 0) != 0) Fail("t1047b: the notes' pending rule");
+    if (PieceLiveNoteChoice(1, PieceLivePendingRule(0, 0, 1) == 0 ? 1 : 0, 1, 1, 0, 1, 1, 1, 0) != kPlnMark) Fail("t1047b: a given-up piece's change was not marked");
+    /* a new record tries a given-up apply again; the next run of faults gives it up again at the cap */
+    {
+        int failed = 1, n = 0;
+        if (PieceLiveNewRecord(&failed) != 1 || failed != 0) Fail("t1047b: a new record did not try a given-up apply again");
+        if (PieceLiveNewRecord(&failed) != 0 || failed != 0) Fail("t1047b: a new record over a live apply counted as a retry");
+        for (int k = 1; k < kPieceLiveFaultCap; ++k) if (PieceLiveFaultStep(&n, -1, kPieceLiveFaultCap) != 0) Fail("t1047b: a retried apply given up before the cap");
+        if (PieceLiveFaultStep(&n, -1, kPieceLiveFaultCap) != 1) Fail("t1047b: a retried apply not given up at the cap");
+        if (PieceLiveNewRecord(0) != 0) Fail("t1047b: no flag");
+    }
+    /* the fault cap: kPieceLiveFaultCap faults in a row give the apply up; no piece here does not end the run, a landed apply does */
+    {
+        if (kPieceLiveFaultCap != 5) Fail("t1047b: the fault cap");
+        int n = 0;
+        for (int k = 1; k < kPieceLiveFaultCap; ++k) if (PieceLiveFaultStep(&n, -1, kPieceLiveFaultCap) != 0) Fail("t1047b: given up before the cap");
+        if (PieceLiveFaultStep(&n, 0, kPieceLiveFaultCap) != 0 || n != kPieceLiveFaultCap - 1) Fail("t1047b: no piece here changed the run");
+        if (PieceLiveFaultStep(&n, -1, kPieceLiveFaultCap) != 1) Fail("t1047b: not given up at the cap");
+        n = 3;
+        if (PieceLiveFaultStep(&n, 1, kPieceLiveFaultCap) != 0 || n != 0) Fail("t1047b: a written apply did not end the run");
+        n = 3;
+        if (PieceLiveFaultStep(&n, 2, kPieceLiveFaultCap) != 0 || n != 0) Fail("t1047b: a nothing-to-write apply did not end the run");
+        if (PieceLiveFaultStep(0, -1, kPieceLiveFaultCap) != 0) Fail("t1047b: no run");
+    }
+}
+/* ---- the apply's inputs and the own-piece state rule (src/common/piecerec.h) ---- */
+void t_t1045b2_piece_rules()
+{
+    using namespace piecerec;
+    /* present: an own piece by its row; another player's by its lookup; otherwise not known */
+    if (PieceApplyPresent(1, 1, 0, 0, 0, 0) != 1 || PieceApplyPresent(1, 0, 0, 1, 1, 0) != 0) Fail("an own piece's presence is not its own row");
+    if (PieceApplyPresent(0, 0, 1, 0, 1, 0) != 1 || PieceApplyPresent(0, 0, 1, 0, 0, 1) != 0 || PieceApplyPresent(0, 0, 1, 0, 0, 0) != -1) Fail("a copy's lookup");
+    if (PieceApplyPresent(0, 0, 0, 1, 0, 1) != 0 || PieceApplyPresent(0, 0, 0, 1, 1, 0) != 1) Fail("a removal mark's key lookup with no copy row");
+    if (PieceApplyPresent(0, 0, 0, 0, 1, 0) != -1) Fail("a live record with no copy row is not left to the make road's search");
+    /* placement: an own piece only when both numbers are known and equal; another player's unless both known and different */
+    if (PieceApplySamePlacement(1, 7u, 7u) != 1 || PieceApplySamePlacement(1, 7u, 8u) != 0) Fail("own placement equal / different");
+    if (PieceApplySamePlacement(1, 0u, 7u) != 0 || PieceApplySamePlacement(1, 7u, 0u) != 0 || PieceApplySamePlacement(1, 0u, 0u) != 0) Fail("an own piece was taken down with a placement number unknown");
+    if (PieceApplySamePlacement(0, 0u, 7u) != 1 || PieceApplySamePlacement(0, 7u, 8u) != 0) Fail("another player's placement rule");
+    if (PieceApplyChoice(1, 1, 1, 1, 1, 1, 0, 1, 0, PieceApplySamePlacement(1, 0u, 7u)) != kPaNone) Fail("a placement-0 removal mark took an own piece down");
+    /* a held pp.build row: an unreadable record lays it; a removal mark of another or an unknown placement lays it */
+    if (PiecePpRowFinal(kPpFromRecord, 0, 1) != kPpLay || PiecePpRowFinal(kPpFromRecord, 1, 1) != kPpFromRecord) Fail("a held row under an unreadable record");
+    if (PiecePpRowFinal(kPpDrop, 1, 0) != kPpLay || PiecePpRowFinal(kPpDrop, 1, 1) != kPpDrop || PiecePpRowFinal(kPpLay, 1, 0) != kPpLay) Fail("a held row under a removal mark");
+    /* ahead: more progress, or finished while the piece is not; behind and equal are not */
+    if (PieceRecordAhead(6.0f, 0, 5.0f, 0, 10.0f) != 1) Fail("more progress is not ahead");
+    if (PieceRecordAhead(4.0f, 0, 5.0f, 0, 10.0f) != 0 || PieceRecordAhead(5.0f, 0, 5.0f, 0, 10.0f) != 0) Fail("a record behind or equal read as ahead");
+    if (PieceRecordAhead(10.0f, 1, 9.0f, 0, 10.0f) != 1) Fail("finished while the piece is not is not ahead");
+    if (PieceRecordAhead(10.0f, 1, 10.0f, 1, 10.0f) != 0 || PieceRecordAhead(9.0f, 0, 10.0f, 1, 10.0f) != 0) Fail("a finished piece read as behind its record");
+    /* the own-piece state rule: a holder's record whole; this game's own record ahead at the first apply since load, materials kept */
+    if (PieceOwnStateRule(0, 1, 0, 0) != kPoWhole || PieceOwnStateRule(0, 0, 0, 0) != kPoWhole || PieceOwnStateRule(0, 1, 1, 1) != kPoNone) Fail("a holder's record");
+    if (PieceOwnStateRule(1, 1, 1, 0) != kPoAheadKeepMats) Fail("this game's own record ahead at the first apply since load was not laid");
+    if (PieceOwnStateRule(1, 0, 1, 0) != kPoNone) Fail("after a reconnect the own record won over the live piece");
+    if (PieceOwnStateRule(1, 1, 0, 0) != kPoNone || PieceOwnStateRule(1, 1, 0, 1) != kPoNone) Fail("an own record behind or equal was laid");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 1, PieceOwnStateRule(1, 1, PieceRecordAhead(10.0f, 1, 4.0f, 0, 10.0f), 0) == kPoNone ? 1 : 0, 1) != kPaState)
+        Fail("an own unfinished piece behind its own finished record did not take the state");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 1, PieceOwnStateRule(1, 1, PieceRecordAhead(4.0f, 0, 10.0f, 1, 10.0f), 0) == kPoNone ? 1 : 0, 1) != kPaNone)
+        Fail("an own finished piece took an unfinished record");
+    /* the first look yields to an own record ahead too; not to one behind */
+    if (PieceFirstLookYieldAhead(kPeFirst, 1, 1, 0, 1, 1) != 1 || PieceFirstLookYieldAhead(kPeFirst, 1, 1, 0, 1, 0) != 0) Fail("the first look and an own record ahead / behind");
+    if (PieceFirstLookYieldAhead(kPeFirst, 1, 0, 0, 1, 0) != 1 || PieceFirstLookYieldAhead(kPeMats, 1, 1, 0, 1, 1) != 0) Fail("the first look's other yields");
+}
+/* ---- the seen generation and the waiting placement (src/common/piecerec.h) ---- */
+void t_t1045b3_piece_seen()
+{
+    using namespace piecerec;
+    /* applied gen 5: a record of gen 5 is none, gen 6 applies */
+    unsigned int seen = PieceSeenGenNote(0u, 5u);
+    if (PieceSeenGenSkip(0, 1, seen, 5u) != 1) Fail("a record at the applied generation was applied again");
+    if (PieceSeenGenSkip(0, 1, seen, 6u) != 0) Fail("a newer record was not applied");
+    /* this game's own write at gen 7, then a record of gen 6: none */
+    seen = PieceSeenGenNote(seen, 7u);
+    if (seen != 7u || PieceSeenGenSkip(0, 1, seen, 6u) != 1) Fail("a record below this game's own write was applied");
+    if (PieceSeenGenNote(seen, 3u) != 7u) Fail("the seen generation went down");
+    /* the first apply after a world load takes every record; nothing seen takes every record */
+    if (PieceSeenGenSkip(1, 1, 7u, 6u) != 0 || PieceSeenGenSkip(0, 0, 0u, 1u) != 0) Fail("the first apply after load or an unseen piece skipped");
+    /* a placement (or re-make) already waiting: no second PLACE */
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 0, 1, 1, 0, 1) != kPaNone || PieceApplyChoice(1, 1, 1, 1, 0, -1, 1, 1, 0, 1) != kPaNone) Fail("a second placement was chosen");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 0, 0, 1, 0, 1) != kPaMake) Fail("a missing piece with nothing waiting was not made");
+}
+/* ---- the seen generation while the area stays loaded (src/common/piecerec.h) ---- */
+void t_t1045b4_piece_seen_area()
+{
+    using namespace piecerec;
+    const int state = PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 1, 0, 1), make = PieceApplyChoice(1, 1, 1, 1, 0, 0, 0, 1, 0, 1);
+    const int remove = PieceApplyChoice(1, 1, 1, 1, 1, 1, 0, 1, 0, 1);
+    /* seen gen 5, the area unloaded and loaded again (its seen generations forgotten): record gen 5 applies */
+    if (PieceSeenGenChoice(state, PieceSeenGenSkip(0, 0, 0u, 5u)) != kPaState || PieceSeenGenChoice(make, PieceSeenGenSkip(0, 0, 0u, 5u)) != kPaMake)
+        Fail("a record after the area reloaded was skipped");
+    /* seen gen 5, the area stayed loaded through a link loss: record gen 5 for a present piece is none */
+    if (PieceSeenGenChoice(state, PieceSeenGenSkip(0, 1, 5u, 5u)) != kPaNone) Fail("a reconnect's old record undid the live piece");
+    /* seen gen 5, the piece missing: record gen 5 makes it; a removal mark over a present piece removes it */
+    if (PieceSeenGenChoice(make, PieceSeenGenSkip(0, 1, 5u, 5u)) != kPaMake) Fail("a missing piece was not made under a seen generation");
+    if (PieceSeenGenChoice(remove, PieceSeenGenSkip(0, 1, 5u, 5u)) != kPaRemove) Fail("a removal mark was skipped under a seen generation");
+    if (PieceSeenGenChoice(state, PieceSeenGenSkip(0, 1, 5u, 6u)) != kPaState) Fail("a newer record's state was skipped");
+}
+/* ---- the seen generation per area load, and a waiting placement (src/common/piecerec.h) ---- */
+void t_t1045b5_piece_seen_load()
+{
+    using namespace piecerec;
+    const int state = PieceApplyChoice(1, 1, 1, 1, 0, 1, 0, 1, 0, 1);
+    /* seen gen 5 at load 1; the area reloaded (load 2) with the link down; record 5 for a present piece: applied */
+    if (PieceSeenGenChoice(state, PieceSeenGenSkip(0, PieceSeenGenValid(1, 1u, 2u), 5u, 5u)) != kPaState) Fail("a reload during an outage kept its old seen generation");
+    /* the same with no reload: none */
+    if (PieceSeenGenChoice(state, PieceSeenGenSkip(0, PieceSeenGenValid(1, 1u, 1u), 5u, 5u)) != kPaNone) Fail("a seen generation of the same load did not hold");
+    if (PieceSeenGenValid(0, 1u, 1u) != 0) Fail("nothing seen read as seen");
+    /* a placement waits: no second PLACE; the record is noted as seen only when the waiting entry carries its state */
+    if (PieceApplyChoice(1, 1, 1, 1, 0, 0, 1, 1, 0, 1) != kPaNone) Fail("a second placement was chosen");
+    if (PieceWaitNoteSeen(1) != 1 || PieceWaitNoteSeen(0) != 0) Fail("a waiting placement's newer record was noted seen without its state");
+}
+/* ---- run T1520: own records and own pieces made from them (src/common/piecerec.h) ---- */
+void t_t1045b6_piece_own_make()
+{
+    using namespace piecerec;
+    const std::string key = "12-wall.mod@3,41@1003,-205,100";
+    const std::string id = MakePieceRecId(key);
+    /* an accepted own write is kept as this game's own record; a refused one is not */
+    {
+        std::vector<PieceFly> f; PieceSrvView v;
+        PieceFlyAdd(&f, 4, 0, 500);
+        if (PieceFlyMatch(f, 1, 500) != 0 || PieceFlyMatch(f, 0, 0) != 0) Fail("the accepted write was not matched");
+        const std::vector<char> rec = T1045Rec(key, 4, 1, 1, kPrFlagSeed, 77, 2.5f);
+        PieceHeader h; PieceBody b; int why = 0;
+        if (PieceIntakeJudge(id, &rec[0], rec.size(), 0, 0u, &h, &b, &why) != kPiKeep || h.generation != 4u) Fail("the accepted own write was not kept as a record");
+        PieceFlyRefused(&f, 4);
+        if (PieceFlyMatch(f, 1, 500) != -1) Fail("a refused write was matched as accepted");
+        (void)v;
+    }
+    /* an own piece missing at an area reload (its row outlived the unload) with a kept own record: made again */
+    if (PieceApplyPresentLive(1, 1, 0, 0, 0, 1) != 0) Fail("a reloaded area without the own piece read it as standing");
+    if (PieceApplyChoice(1, 1, 1, 1, 0, PieceApplyPresentLive(1, 1, 0, 0, 0, 1), 0, 1, 0, 1) != kPaMake) Fail("the missing own piece was not made from its record");
+    if (PieceApplyPresentLive(1, 1, 0, 0, 1, 0) != 1 || PieceApplyPresentLive(1, 0, 0, 0, 0, 0) != 0 || PieceApplyPresentLive(1, 1, 0, 0, 0, 0) != -1) Fail("the own lookup");
+    /* a wall made from its record takes the record's state on the STATE road (progress too); a restore keeps its own write, walls none */
+    if (PieceMadeStateRoad(1, 1, 1) != kMsStateRoad || PieceMadeStateRoad(1, 1, 0) != kMsStateRoad) Fail("a piece made from its record skipped the STATE road");
+    if (PieceMadeStateRoad(0, 1, 0) != kMsInline || PieceMadeStateRoad(0, 1, 1) != kMsNone || PieceMadeStateRoad(1, 0, 1) != kMsNone) Fail("the restore's own write");
+    /* decision 1067 at a world load with the save's row: the record's progress, the save's materials; a reload in the same session: the record's */
+    /* (args: first after a world load, own rows read, the row at hand, the record ahead) */
+    if (PieceOwnMakeMats(1, 1, 1, 1) != kPmRecordSaveMats) Fail("the row's materials were not kept at a world load");
+    if (PieceOwnMakeMats(1, 1, 1, 0) != kPmSave) Fail("a record behind the row won");
+    if (PieceOwnMakeMats(0, 1, 1, 1) != kPmRecord || PieceOwnMakeMats(0, 0, 0, 1) != kPmRecord) Fail("a same-session reload did not take the record's materials");
+    /* rows read, no row (placed and gone within the write gap): the record's materials */
+    if (PieceOwnMakeMats(1, 1, 0, 1) != kPmRecord || PieceOwnMakeMats(1, 1, 0, 0) != kPmRecord) Fail("no row: the record's materials were not taken");
+    /* rows not read (own records off or unreadable): the items came from the game save - no materials */
+    if (PieceOwnMakeMats(1, 0, 0, 1) != kPmRecordNoMats || PieceOwnMakeMats(1, 0, 1, 1) != kPmRecordNoMats) Fail("rows not read: materials were laid");
+    /* the held row is the piece's only by key and placement, both known */
+    if (PieceHeldRowMatches(key, key, 77u, 77u) != 1) Fail("the piece's own held row was not matched");
+    if (PieceHeldRowMatches(key, key, 78u, 77u) != 0 || PieceHeldRowMatches("x", key, 77u, 77u) != 0) Fail("another placement's row was matched");
+    /* an older row with no placement number is still the piece's row: its materials, not the record's */
+    if (PieceHeldRowMatches(key, key, 0u, 77u) != 1 || PieceHeldRowMatches(key, key, 0u, 0u) != 1) Fail("a row with an unknown placement was taken as no row");
+    if (PieceOwnMakeMats(1, 1, PieceHeldRowMatches(key, key, 0u, 77u), 1) != kPmRecordSaveMats) Fail("an unknown-placement row did not give its materials");
+    /* asks again come from events: rows not handed - the restore point; an unfinished search - the area's walk */
+    if (PieceLookWhy(0, -1) != kPlRows || PieceLookWhy(-1, 1) != kPlSearch || PieceLookWhy(0, 1) != kPlNone) Fail("the reason a make waits");
+    if (PieceLookDue(kPlRows, kPlEvEdge) != 1 || PieceLookDue(kPlSearch, kPlEvWalk) != 1) Fail("an event did not ask its waiting make");
+    if (PieceLookDue(kPlRows, kPlEvWalk) != 0 || PieceLookDue(kPlSearch, kPlEvEdge) != 0 || PieceLookDue(kPlNone, kPlEvWalk) != 0) Fail("an event asked a make of another reason");
+    /* an unfinished search asks for one more walk, at most kPieceLookRewalkMax times; rows not handed never ask for a walk */
+    if (PieceLookRewalk(kPlSearch, 0) != 1 || PieceLookRewalk(kPlSearch, kPieceLookRewalkMax - 1) != 1) Fail("an unfinished search did not ask for a walk");
+    if (PieceLookRewalk(kPlSearch, kPieceLookRewalkMax) != 0 || PieceLookRewalk(kPlRows, 0) != 0) Fail("the re-walk bound");
+    /* an unfinished live search, or own rows not handed yet: never a make - asked again */
+    if (PieceApplyLookUnknown(1, kPaMake, -1, 1) != 1 || PieceApplyLookUnknown(1, kPaMake, 0, -1) != 1) Fail("a make on an unknown look went ahead");
+    if (PieceApplyLookUnknown(1, kPaMake, 0, 1) != 0 || PieceApplyLookUnknown(1, kPaRemove, -1, 1) != 0 || PieceApplyLookUnknown(1, kPaState, -1, -1) != 0) Fail("the unknown look held a known one");
+    /* another player's piece missing here with no copy row and no removal mark: the real present value (-1, not looked up here) goes to
+       the placement road - never held as an unknown look (run T1524) */
+    {
+        const int pOther = PieceApplyPresentLive(0, 0, 0, 0, 0, 0);
+        if (pOther != -1 || PieceApplyPresent(0, 0, 0, 0, 0, 0) != -1) Fail("another player's piece with no copy row did not read -1");
+        const int chOther = PieceApplyChoice(1, 1, 1, 1, 0, pOther, 0, 1, 0, 1);
+        if (chOther != kPaMake) Fail("another player's missing piece was not made");
+        if (PieceApplyLookUnknown(0, chOther, pOther, 1) != 0) Fail("another player's missing piece was held as an unknown look (T1524)");
+        const int pCopy = PieceApplyPresentLive(0, 0, 1, 0, 0, 0);   /* a copy row, an unfinished search: the re-make road as before */
+        if (pCopy != -1 || PieceApplyLookUnknown(0, PieceApplyChoice(1, 1, 1, 1, 0, pCopy, 0, 1, 0, 1), pCopy, 1) != 0) Fail("a copy's re-make was held");
+    }
+    /* an own record's state landed or dropped: the piece is marked for its look; another game's copy is not */
+    if (PieceStateDoneNote(1, 1) != 1 || PieceStateDoneNote(0, 1) != 0) Fail("a landed own record's state did not mark the piece");
+    /* a dropped own state marks no look: the piece's old state is never written over a newer record */
+    if (PieceStateDoneNote(1, 0) != 2 || PieceStateDoneNote(0, 0) != 0) Fail("a dropped own state marked a look");
+    /* rows not read: the record's progress with no materials */
+    {
+        coopbuild::BuildMsg st;
+        st.kind = coopbuild::kBuildState; st.progress = 3.0f; st.needed = 10.0f; st.complete = 0; st.nMats = 1; st.mats[0] = 1.0f;
+        PieceOwnMakeNoMats(&st);
+        if (st.mats[0] != 0.0f || st.nMats != 1 || st.progress != 3.0f || st.complete != 0) Fail("no-save-row make: materials not 0, or progress not the record's");
+    }
+    /* the baseline after a failed lay is the piece's: no yield once the area is applied and nothing is queued */
+    if (PieceFirstLookYieldPending(1, 1, 0) != 0) Fail("the first look kept yielding after the apply was done (the record's state booked as the baseline)");
+    if (PieceFirstLookYieldPending(1, 1, 1) != 1 || PieceFirstLookYieldPending(1, 0, 0) != 1 || PieceFirstLookYieldPending(0, 0, 1) != 0) Fail("the yield while the apply is to come");
+}
 void t_t1045f2_piece_answers()
 {
     using namespace piecerec;
@@ -50706,15 +53494,1242 @@ void t_t1045f2_piece_answers()
         if (PieceHolderBaseOk(0, 0, 0, 0, 0, 0) != 0 || PieceHolderBaseOk(1, 6, 1, 0, 0, 0) != 0) Fail("a holder writes with no live kept record");
     }
 }
+/* T-1047 step 4: a player's box takes its world-server record live on every game - the height id and the old id's read, the old
+   writer's flush, the live apply's choice and its holds, the removal at a piece's dismantle, the arrival ask left to the record */
+void t_t1047e_player_box()
+{
+    using namespace coopbrec;
+    if (kProtocol != 121u || hovrec::kGameProtocol != 180u) Fail("t1047e: the world-server protocol is not 121 or the game-to-game protocol not 180");
+    const std::string key = "12-box.mod@3,41@1003,-205,100";
+    const std::string hs = T823Hash("12-box.mod");
+    const std::string oldId = MakeBoxRecId(key);
+    const std::string hid = MakeBoxRecIdFor(key, 1);
+    /* the height id */
+    if (hid != "box.3.41." + hs + ".1003.-205.100") Fail("t1047e: a player's box id is not box.<sx>.<sy>.<hash>.<x10>.<z10>.<y10>: " + hid);
+    if (MakeBoxRecIdFor("12-box.mod@3,41@1003,-205,101", 1) == hid) Fail("t1047e: two stacked player boxes share one id");
+    if (!MakeBoxRecIdFor("12-box.mod@3,41@1003,-205", 1).empty()) Fail("t1047e: a key with no height made a player box id");
+    if (MakeBoxRecIdFor(key, 0) != oldId || oldId != "box.3.41." + hs + ".1003.-205") Fail("t1047e: a box no player owns changed its id");
+    if (MakeBoxRecIdFor("12-box.mod@3,41@1003,-205,-7", 1) != "box.3.41." + hs + ".1003.-205.-7") Fail("t1047e: a negative height did not make its id");
+    {
+        int sx = 0, sy = 0, hy = -1; long x = 0, z = 0, y = 0; std::string sid;
+        if (BoxRecIdParse(hid, &sx, &sy, &sid, &x, &z, &y, &hy) != 1 || sx != 3 || sy != 41 || sid != hs || x != 1003 || z != -205 || y != 100 || hy != 1)
+            Fail("t1047e: the height id did not parse");
+        hy = -1;
+        if (BoxRecIdParse(oldId, 0, 0, 0, 0, 0, &y, &hy) != 1 || hy != 0) Fail("t1047e: the id without the height did not parse as one");
+        const char* bad[] = { "box.3.41.#0123abcd.1.2.", "box.3.41.#0123abcd.1.2.03", "box.3.41.#0123abcd.1.2.-0", "box.3.41.#0123abcd.1.2.3.4",
+                              "box.3.41.#0123abcd.1.2.x", "box.3.41.#0123abcd.1.2.1234567890" };
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i)
+            if (BoxRecIdParse(bad[i], 0, 0, 0, 0, 0) != 0) Fail(std::string("t1047e: a bad height id parsed: ") + bad[i]);
+    }
+    /* a player's record names the height id; a shop's does not; a player's box needs a height in its key */
+    std::vector<cooppar::ParityItem> items;
+    items.push_back(T823BoxItem("katana", 0, 0, 1));
+    BoxHeader h; h.generation = 5; h.writerSlot = 1; h.kind = kBrKindBox; h.ownerSlot = 1; h.key = key;
+    if (BoxRecIdOfHeader(h) != hid) Fail("t1047e: a player's record does not name the height id");
+    { BoxHeader s = h; s.kind = kBrKindShop; s.ownerSlot = -1; if (BoxRecIdOfHeader(s) != oldId) Fail("t1047e: a shop's record names the height id"); }
+    { BoxHeader s = h; s.ownerSlot = -1; if (BoxRecIdOfHeader(s) != oldId) Fail("t1047e: a box no player owns names the height id"); }
+    { BoxHeader n = h; n.key = "12-box.mod@3,41@1003,-205"; std::vector<char> b; if (EncodeBoxRecord(&b, n, items)) Fail("t1047e: a player's box with no height in its key was encoded"); }
+    std::vector<char> rec;
+    if (!EncodeBoxRecord(&rec, h, items)) { Fail("t1047e: the player's record was not encoded"); return; }
+    std::vector<int> l1, l2; l1.push_back(1); l2.push_back(2);
+    if (BoxJudgeWrite(hid, &rec[0], rec.size(), 1, 1, l1, 1, 4, 1, kBrKindBox, 0, 0) != kBrAccept) Fail("t1047e: the owner's update under the height id was refused");
+    if (BoxJudgeWrite(oldId, &rec[0], rec.size(), 1, 1, l1, 1, 4, 1, kBrKindBox, 0, 0) != kBrRefuseWrongBox) Fail("t1047e: a player's record was taken under the id without the height");
+    /* the old id's read: a player's record stored under the id without the height is kept under its height id */
+    {
+        BoxHeader o; std::vector<cooppar::ParityItem> got;
+        if (BoxIntakeJudge(oldId, &rec[0], rec.size(), 0, 0u, &o, &got, 0) != kBiLegacy || o.generation != 5 || got.size() != 1 || BoxRecIdOfHeader(o) != hid)
+            Fail("t1047e: a player's record under the old id was not read as that box's record");
+        got.clear();
+        if (BoxIntakeJudge(hid, &rec[0], rec.size(), 1, 9u, &o, &got, 0) != kBiOlder) Fail("t1047e: an older record under the height id was kept");
+        if (BoxIntakeJudge(hid, &rec[0], rec.size(), 0, 0u, &o, &got, 0) != kBiKeep || got.size() != 1) Fail("t1047e: the record under its height id was not kept");
+        std::vector<char> shop; BoxHeader sh = h; sh.kind = kBrKindShop; sh.ownerSlot = -1;
+        if (!EncodeBoxRecord(&shop, sh, items)) Fail("t1047e: the shop record was not encoded");
+        else
+        {
+            got.clear();
+            if (BoxIntakeJudge(hid, &shop[0], shop.size(), 0, 0u, 0, &got, 0) != kBiWrongBox || !got.empty()) Fail("t1047e: a shop's record under a height id was kept");
+            if (BoxIntakeJudge(oldId, &shop[0], shop.size(), 0, 0u, 0, &got, 0) != kBiKeep) Fail("t1047e: a shop's record under its own id was not kept");
+        }
+    }
+    {   /* no write after the writer role moved is taken: one above the stored record from the game that wrote it is refused like any
+           non-writer's; a stored record carrying the retired bit still reads, and no write carries it */
+        BoxHeader f = h; f.ownerSlot = 2; f.writerSlot = 1; f.generation = 6; f.flags = 0;
+        std::vector<char> fr;
+        if (!EncodeBoxRecord(&fr, f, items)) { Fail("t1047g: the old writer's record was not encoded"); return; }
+        if (BoxJudgeWrite(hid, &fr[0], fr.size(), 1, 1, l2, 1, 5, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("t1047g: a write from a game no longer the writer was taken");
+        if (BoxJudgeWrite(hid, &fr[0], fr.size(), 2, 1, l2, 1, 5, 2, kBrKindBox, 0, 0) != kBrRefuseWriter) Fail("t1047g: a record naming another writer was not refused");
+        BoxHeader f2 = f; f2.writerSlot = 2;
+        std::vector<char> fr2;
+        if (!EncodeBoxRecord(&fr2, f2, items)) Fail("t1047g: the owner's record was not encoded");
+        else if (BoxJudgeWrite(hid, &fr2[0], fr2.size(), 2, 1, l2, 1, 5, 2, kBrKindBox, 0, 0) != kBrAccept) Fail("t1047g: the loaded owner's write was refused");
+        BoxHeader rb = f; rb.flags = kBrFlagRetired;
+        std::vector<char> rbb;
+        if (EncodeBoxRecord(&rbb, rb, items) || !rbb.empty()) Fail("t1047g: a write carrying the retired bit was encoded");
+        {   /* a stored record of an older game with the retired bit set (its flags word patched) reads whole */
+            std::vector<char> old = fr;
+            const size_t at = BoxHeaderBytes(f) - 8u;
+            old[at] = (char)kBrFlagRetired;
+            BoxHeader back;
+            if (DecodeBoxRecord(&old[0], old.size(), &back, 0) != kBrOk || back.flags != kBrFlagRetired || back.generation != 6u) Fail("t1047g: a stored record with the retired bit did not read");
+            old[at] = (char)16;
+            if (DecodeBoxRecord(&old[0], old.size(), &back, 0) == kBrOk) Fail("t1047g: a record with an unknown flag read");
+        }
+        BoxHeader bad = f; bad.flags = 16u;
+        std::vector<char> br;
+        if (EncodeBoxRecord(&br, bad, items)) Fail("t1047e: a record with an unknown flag was encoded");
+    }
+    /* the live apply's choice: only a newer generation, held while an ask is open, a move is pending, the cursor is over the window,
+       just after an ask closed, or items cannot be made */
+    if (BoxLiveChoice(1, 5u, 6u, 0, 0, 0, 0, 0) != kBlvApply || BoxLiveChoice(0, 0u, 1u, 0, 0, 0, 0, 0) != kBlvApply) Fail("t1047e: a newer record was not applied live");
+    if (BoxLiveChoice(1, 6u, 6u, 0, 0, 0, 0, 0) != kBlvNotNeeded || BoxLiveChoice(1, 7u, 6u, 0, 0, 0, 0, 0) != kBlvNotNeeded) Fail("t1047e: a record not above the box was applied");
+    if (BoxLiveChoice(1, 5u, 6u, 1, 0, 0, 0, 0) != kBlvHoldRequest || BoxLiveChoice(1, 5u, 6u, 1, 1, 1, 1, 1) != kBlvHoldRequest) Fail("t1047e: the live apply ran over an open ask");
+    if (BoxLiveChoice(1, 5u, 6u, 0, 1, 0, 0, 0) != kBlvHoldPending) Fail("t1047e: the live apply ran over a pending move");
+    if (BoxLiveChoice(1, 5u, 6u, 0, 0, 1, 0, 0) != kBlvHoldCursor) Fail("t1047e: the live apply ran with an item on the cursor over the box's window");
+    if (BoxLiveChoice(1, 5u, 6u, 0, 0, 0, 1, 0) != kBlvHoldAfterRequest) Fail("t1047e: the live apply ran just after an ask closed");
+    if (BoxLiveChoice(1, 5u, 6u, 0, 0, 0, 0, 1) != kBlvHoldMaker) Fail("t1047e: the live apply ran with no item maker");
+    if (BoxLiveChoice(1, 6u, 6u, 1, 1, 1, 1, 1) != kBlvNotNeeded) Fail("t1047e: a box already at the record was held");
+    /* after an ask closed: a record not above every generation kept while it was open waits (it may be the one written before the ask
+       was served), a higher one goes in at once; at most kBlvAfterRequestCapMs */
+    if (BoxLiveAfterRequest(1, 6u, 6u, 100u) != 1 || BoxLiveAfterRequest(1, 5u, 6u, 100u) != 1 || BoxLiveAfterRequest(1, 7u, 6u, 100u) != 0
+        || BoxLiveAfterRequest(1, 6u, 6u, kBlvAfterRequestCapMs) != 0 || BoxLiveAfterRequest(0, 6u, 6u, 0u) != 0)
+        Fail("t1047e: the wait after an ask closed is not until a record above the ask's generation or kBlvAfterRequestCapMs");
+    {   /* gen 5 kept, gen 6 written and kept as this game's own: after the area left and came back (the box's generation forgotten) the
+           apply puts gen 6 in (not 5), and the next write is 7 */
+        unsigned int g = 0;
+        if (BoxApplyNeeded(1, 6u, 0, 0u) != 1 || BoxWriteGen(1, 6u, 1, 6u, &g) != 0 || g != 7u) Fail("t1047e: the own kept write is not the base of the next load and write");
+    }
+    {   /* T-1047 step 4 fold 3: a mark's writer / later reading (BoxRecMark) - a fresh mark takes this change's answer; a mark over an owed
+           change adds to it; a reading that cannot be told keeps the last one */
+        int mw = 9, ml = 9;
+        if (BoxMarkRole(1, 0, 1, &mw, &ml) != 1 || mw != 1 || ml != 0) Fail("t1047f: a fresh change as the writer was not marked writer");
+        mw = 9; ml = 9;
+        if (BoxMarkRole(0, 1, 1, &mw, &ml) != 0 || mw != 0 || ml != 1) Fail("t1047f: a fresh change after the role moved was not marked later");
+        mw = 9; ml = 9;
+        if (BoxMarkRole(2, 1, 1, &mw, &ml) != 1 || mw != 1 || ml != 0) Fail("t1047f: a reading that cannot be told did not keep the last (this game)");
+        mw = 9; ml = 9;
+        if (BoxMarkRole(2, 0, 1, &mw, &ml) != 0 || mw != 0 || ml != 1) Fail("t1047f: a reading that cannot be told did not keep the last (another game)");
+        mw = 0; ml = 0;
+        if (BoxMarkRole(-1, 1, 1, &mw, &ml) != 0 || mw != 0 || ml != 1) Fail("t1047f: a box not found was read as written here");
+        mw = 1; ml = 0;
+        if (BoxMarkRole(0, 0, 0, &mw, &ml) != 0 || mw != 1 || ml != 1) Fail("t1047f: a later change cleared an owed writer change");
+        mw = 0; ml = 1;
+        if (BoxMarkRole(1, 1, 0, &mw, &ml) != 1 || mw != 1 || ml != 1) Fail("t1047f: a writer change over an owed later change cleared it");
+    }
+    /* a player's box: a kept record under either id decides, the later of two; the owner read only when none is kept */
+    if (BoxPlayerDecide(1, 1, 10u, 0, 0, 0u, 0) != 1 || BoxPlayerDecide(0, 0, 0u, 1, 0, 10u, 1) != 0 || BoxPlayerDecide(0, 0, 0u, 0, 0, 0u, 1) != 1
+        || BoxPlayerDecide(0, 0, 0u, 0, 0, 0u, 0) != 0)
+        Fail("t1047e: a kept record does not decide a player's box over the owner read");
+    if (BoxPlayerDecide(1, 1, 10u, 1, 0, 20u, 1) != 0 || BoxPlayerDecide(1, 1, 30u, 1, 0, 20u, 0) != 1 || BoxPlayerDecide(1, 1, 0xFFFFFFF0u, 1, 0, 5u, 1) != 0)
+        Fail("t1047e: of two kept records the later does not decide (tick wrap included)");
+    /* a player's box with no record anywhere: its writer's first write is a seed, never refused as not received */
+    {
+        unsigned int g = 0;
+        if (cooppar::ParityServeTrusted(1, 1, 0, 0) != 1 || BoxWriteGate(kBasNone, 0, 0, 0) != kBwgGo || BoxWriteGen(0, 0u, 0, 0u, &g) != 1 || g != 1u)
+            Fail("t1047e: a player's box with no record is not seeded by its writer");
+    }
+    if (BoxWriterLiveDue(1, 5u, 6u, 0) != 1 || BoxWriterLiveDue(1, 5u, 6u, 1) != 0 || BoxWriterLiveDue(1, 6u, 6u, 0) != 0) Fail("t1047e: the writer's live re-apply rule");
+    for (int c = 0; c <= kBlvMax; ++c) if (std::string(BoxLiveWhy(c)) == "?") Fail("t1047e: a live apply hold has no name");
+    /* the removal at a piece's dismantle */
+    if (BoxGoneAtDismantle(1, 0, 0) != kBgNew || BoxGoneAtDismantle(0, 1, 0) != kBgNew || BoxGoneAtDismantle(0, 0, 1) != kBgLegacy
+        || BoxGoneAtDismantle(1, 1, 1) != (kBgNew | kBgLegacy) || BoxGoneAtDismantle(0, 0, 0) != 0)
+        Fail("t1047e: the box records removed at a dismantle");
+    /* the arrival ask leaves a player's box to its record; a shared or unread owner's box keeps the ask */
+    if (coopown::ParityAskBoxClass(coopown::kOwnPeer) != coopown::kPaLeave || coopown::ParityAskBoxClass(coopown::kOwnMe) != coopown::kPaLeave
+        || coopown::ParityAskBoxClass(coopown::kOwnShared) != coopown::kPaByWriter || coopown::ParityAskBoxClass(coopown::kOwnNone) != coopown::kPaTake)
+        Fail("t1047e: the arrival ask's cut for a player's box");
+}
+/* ---- T-1047 the box hand-over (boxrec.h): the writer's journal, BOX_TAKEN, the ending of each journalled ask, and the retired flush ---- */
+void t_t1047g_handover()
+{
+    using namespace coopbrec;
+    const unsigned int kBjAnswerWaitMsTest = 60000u;   /* items.cpp kBjAnswerWaitMs */
+    if (kProtocol != 121u || kMsgBoxTaken != 80u || kMsgBoxRefuse != 72u) Fail("t1047g: BOX_TAKEN is not message 80 of world-server protocol 121");
+    /* BOX_TAKEN: sent only for a write the rule took, or the very same bytes again - never for a refusal */
+    if (BoxTakenNoteDue(kBrAccept) != 1 || BoxTakenNoteDue(kBrRepeat) != 1) Fail("t1047g: a taken write is not answered with BOX_TAKEN");
+    for (int r = 1; r <= kBrJudgeMax; ++r)
+        if (r != kBrRepeat && BoxTakenNoteDue(r) != 0) Fail("t1047g: a refused write (reason " + I(r) + ") was answered with BOX_TAKEN");
+    {   /* the note's bytes: whole or refused */
+        const std::string id = "box.3.41.#0a1b2c3d.1003.-205.100";
+        std::vector<char> b = EncodeBoxTaken(id, 0x01020304u);
+        std::string gid; unsigned int g = 0;
+        if (DecodeBoxTaken(b, &gid, &g) != 1 || gid != id || g != 0x01020304u) Fail("t1047g: BOX_TAKEN did not round-trip");
+        std::vector<char> cut1(b.begin(), b.end() - 1);
+        gid = "x"; g = 7u;
+        if (DecodeBoxTaken(cut1, &gid, &g) != 0 || gid != "x" || g != 7u) Fail("t1047g: a cut-short BOX_TAKEN was read or touched its outputs");
+        std::vector<char> extra = b; extra.push_back(0);
+        if (DecodeBoxTaken(extra, 0, 0) != 0 || DecodeBoxTaken(std::vector<char>(), 0, 0) != 0) Fail("t1047g: a BOX_TAKEN with bytes after it, or empty, was read");
+        if (DecodeBoxRefuse(b, 0, 0, 0, 0) != 0) Fail("t1047g: a BOX_TAKEN read as a BOX_REFUSE");
+    }
+    if (kMsgBoxAsk != 81u || kMsgBoxAsked != 82u) Fail("t1047g: BOX_ASK / BOX_ASKED are not messages 81 / 82");
+    {   /* BOX_ASK's bytes: whole, or refused untouched */
+        std::vector<std::string> ids; ids.push_back("box.3.41.#0a1b2c3d.1003.-205.100"); ids.push_back("box.4.40.#0a1b2c3e.1.2.3");
+        const std::vector<char> b = EncodeBoxAsk(ids);
+        std::vector<std::string> got;
+        if (DecodeBoxAsk(b, &got) != 1 || got != ids) Fail("t1047g: BOX_ASK did not round-trip");
+        std::vector<std::string> keep(1, "k");
+        std::vector<char> cut1(b.begin(), b.end() - 1), extra = b; extra.push_back(0);
+        if (DecodeBoxAsk(cut1, &keep) != 0 || DecodeBoxAsk(extra, &keep) != 0 || DecodeBoxAsk(std::vector<char>(), &keep) != 0 || keep.size() != 1)
+            Fail("t1047g: a cut-short, overlong or empty BOX_ASK was read or touched its output");
+        std::vector<std::string> many(kBoxAskMaxIds + 5, "box.1.1.#00000001.1.1.1");
+        std::vector<std::string> back;
+        if (DecodeBoxAsk(EncodeBoxAsk(many), &back) != 1 || back.size() != kBoxAskMaxIds) Fail("t1047g: BOX_ASK is not cut to its cap");
+    }
+    {   /* the world server's memory of each writer slot's stored writes: the highest kept, a seed starts again, the file round-trips */
+        std::map<int, unsigned int> m;
+        BoxSlotGenNote(&m, 0, 4u, 1); BoxSlotGenNote(&m, 1, 5u, 0); BoxSlotGenNote(&m, 0, 3u, 0);
+        if (BoxSlotGenOf(m, 0) != 4u || BoxSlotGenOf(m, 1) != 5u || BoxSlotGenOf(m, 2) != 0u) Fail("t1047g: a slot's stored generation is not its highest");
+        std::map<int, unsigned int> r;
+        if (DecodeSlotGens(EncodeSlotGens(m), &r) != 1 || r != m) Fail("t1047g: the slots' generations did not survive the file (a restart)");
+        std::map<int, unsigned int> keep; keep[9] = 9u;
+        if (DecodeSlotGens("0 4\nx\n", &keep) != 0 || DecodeSlotGens("0 4 5\n", &keep) != 0 || DecodeSlotGens("-1 4\n", &keep) != 0 || keep.size() != 1)
+            Fail("t1047g: a bad slot line was read or touched the output");
+        if (DecodeSlotGens("", &keep) != 1 || !keep.empty()) Fail("t1047g: an empty slot file is not 'no slot'");
+        BoxSlotGenNote(&m, 1, 1u, 1);
+        if (BoxSlotGenOf(m, 0) != 0u || BoxSlotGenOf(m, 1) != 1u) Fail("t1047g: a seed did not start the record's line again");
+        std::vector<unsigned int> chain; chain.push_back(4u); chain.push_back(6u); chain.push_back(7u);
+        if (BoxAskedStored(chain, 6u) != 6u || BoxAskedStored(chain, 5u) != 4u || BoxAskedStored(chain, 3u) != 0u || BoxAskedStored(chain, 9u) != 7u)
+            Fail("t1047g: BOX_ASKED's answer did not pick the newest stored write");
+    }
+    /* THE CHANGE IS THE BOX AGAINST ITS BASE: every kind of change, none worse than writing the box */
+    {
+        struct Mk { static cooppar::ParityItem It(const char* sid, int x, int y, int q) { cooppar::ParityItem p; p.section = "main"; p.x = x; p.y = y; p.quantity = q; p.baseSid = sid; return p; } };
+        std::vector<cooppar::ParityItem> base, now;
+        std::vector<BoxJrnDelta> d;
+        base.push_back(Mk::It("a", 0, 0, 5)); now.push_back(Mk::It("a", 2, 2, 5));
+        if (BoxJrnDiff(base, now, &d) != 1 || !d.empty()) Fail("t1047g: a move inside the box was a change");
+        base.clear(); now.clear(); base.push_back(Mk::It("a", 0, 0, 10)); now.push_back(Mk::It("a", 0, 0, 6)); now.push_back(Mk::It("a", 1, 0, 4));
+        if (BoxJrnDiff(base, now, &d) != 1 || !d.empty()) Fail("t1047g: a split inside the box was a change");
+        base.clear(); now.clear(); base.push_back(Mk::It("a", 0, 0, 5)); base.push_back(Mk::It("a", 1, 0, 5)); now.push_back(Mk::It("a", 0, 0, 10));
+        if (BoxJrnDiff(base, now, &d) != 1 || !d.empty()) Fail("t1047g: a merge inside the box was a change");
+        base.clear(); now.clear(); base.push_back(Mk::It("a", 0, 0, 10)); now.push_back(Mk::It("a", 0, 0, 6));
+        if (BoxJrnDiff(base, now, &d) != 1 || d.size() != 1 || d[0].dir != kBjTake || d[0].quantity != 4 || d[0].row.x != 0 || d[0].row.quantity != 10)
+            Fail("t1047g: part of a stack taken is not a take of those units at the base's cell");
+        base.clear(); now.clear(); base.push_back(Mk::It("a", 3, 1, 5)); now.push_back(Mk::It("a", 3, 1, 8));
+        if (BoxJrnDiff(base, now, &d) != 1 || d.size() != 1 || d[0].dir != kBjPut || d[0].quantity != 3 || d[0].row.x != 3)
+            Fail("t1047g: units merged onto a box stack are not a put of those units");
+        /* a split taken out and a merge in, in one change: the stack of 10 at (0,0) split, 4 taken; 2 of 'b' merged onto (5,0) */
+        base.clear(); now.clear();
+        base.push_back(Mk::It("a", 0, 0, 10)); base.push_back(Mk::It("b", 5, 0, 1));
+        now.push_back(Mk::It("b", 5, 0, 3)); now.push_back(Mk::It("a", 0, 0, 6));
+        if (BoxJrnDiff(base, now, &d) != 1 || d.size() != 2 || d[0].dir != kBjTake || d[0].row.baseSid != "a" || d[0].quantity != 4
+            || d[1].dir != kBjPut || d[1].row.baseSid != "b" || d[1].quantity != 2)
+            Fail("t1047g: a split taken and a merge put in one change are not a take then a put");
+        /* the same record at another quality is another item */
+        base.clear(); now.clear(); base.push_back(Mk::It("a", 0, 0, 1)); now.push_back(Mk::It("a", 0, 0, 1)); now[0].quality = 0.5f;
+        if (BoxJrnDiff(base, now, &d) != 1 || d.size() != 2 || d[0].dir != kBjTake || d[1].dir != kBjPut) Fail("t1047g: a changed item is not a take of the old and a put of the new");
+    }
+    {   /* A PACK IN THE BOX: its contents' change is asked inside it; a pack moved in or out goes whole; the endings are the items' own */
+        struct Mk { static cooppar::ParityItem It(const char* sid, int x, int y, int q) { cooppar::ParityItem p; p.section = "main"; p.x = x; p.y = y; p.quantity = q; p.baseSid = sid; return p; }
+                    static coopbag::BagRow Row(const char* sid, unsigned int x, unsigned int q) { coopbag::BagRow r; r.section = "backpack_content"; r.baseSid = sid; r.x = x; r.qty = q; return r; } };
+        std::vector<cooppar::ParityItem> base, now;
+        std::vector<BoxJrnDelta> d;
+        int nested = -1;
+        base.push_back(Mk::It("pack", 2, 1, 1)); base[0].bag.push_back(Mk::Row("c", 0, 3)); base[0].bag.push_back(Mk::Row("e", 1, 1));
+        now = base; now[0].bag[0].qty = 1;   /* 2 of c taken out of the pack */
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || nested != 0 || d.size() != 1 || d[0].dir != kBjTake || d[0].inPack != 1 || d[0].quantity != 2
+            || d[0].row.baseSid != "c" || d[0].row.section != "backpack_content" || d[0].row.x != 0 || d[0].packSection != "main" || d[0].packX != 2 || d[0].packY != 1 || d[0].packSid != "pack")
+            Fail("t1047g: items taken out of a pack in the box are not a take inside that pack");
+        if (BoxJrnEnding(d[0].dir, kBjaRefuse) != kBjDoRemoveChar || BoxJrnEnding(d[0].dir, kBjaTimeout) != (kBjDoRemoveChar | kBjDoPlacedNo))
+            Fail("t1047g: a refused take out of a pack does not take the units back off the character");
+        now = base; now[0].bag.push_back(Mk::Row("f", 2, 1));   /* f put into the pack */
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || d.size() != 1 || d[0].dir != kBjPut || d[0].inPack != 1 || d[0].row.baseSid != "f" || d[0].row.x != 2 || d[0].packX != 2)
+            Fail("t1047g: items put into a pack in the box are not a put inside that pack");
+        if (BoxJrnEnding(d[0].dir, kBjaRefuse) != kBjDoRemake || BoxJrnEnding(d[0].dir, kBjaTimeout) != (kBjDoRemake | kBjDoRevoke))
+            Fail("t1047g: a refused put into a pack does not make the item again on the character");
+        now.clear();   /* the pack taken whole */
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || d.size() != 1 || d[0].dir != kBjTake || d[0].inPack != 0 || d[0].row.bag.size() != 2)
+            Fail("t1047g: a pack taken whole is not a take of the pack with its contents");
+        if (BoxJrnEnding(d[0].dir, kBjaRefuse) != kBjDoRemoveChar) Fail("t1047g: a refused whole-pack take is not undone on the character");
+        if (BoxJrnDiffAll(now, base, &d, &nested) != 1 || d.size() != 1 || d[0].dir != kBjPut || d[0].inPack != 0 || d[0].row.bag.size() != 2)
+            Fail("t1047g: a pack put whole is not a put of the pack with its contents");
+        now = base; now[0].x = 5; now[0].bag[0].qty = 2;   /* moved inside the box and 1 of c taken out: asked at the pack's base cell */
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || d.size() != 1 || d[0].inPack != 1 || d[0].quantity != 1 || d[0].packX != 2)
+            Fail("t1047g: a pack moved inside the box is not addressed where the writer's box holds it");
+        now = base; now[0].bag[1].x = 4;   /* moved inside the pack: no change */
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || !d.empty()) Fail("t1047g: a move inside a pack was a change");
+        /* two packs of one kind: one taken whole, the other's contents changed */
+        base.push_back(Mk::It("pack", 0, 0, 1)); base[1].bag.push_back(Mk::Row("g", 0, 1));
+        now.clear(); now.push_back(base[1]); now[0].bag.push_back(Mk::Row("h", 1, 1));
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || d.size() != 2 || d[0].dir != kBjTake || d[0].inPack != 0 || d[0].row.x != 2
+            || d[1].dir != kBjPut || d[1].inPack != 1 || d[1].packX != 0 || d[1].row.baseSid != "h")
+            Fail("t1047g: two packs of one kind - the whole take and the other's contents are mixed up");
+        /* a pack holding a pack whose contents changed: counted, not asked */
+        base.clear(); base.push_back(Mk::It("pack", 0, 0, 1)); base[0].bag.push_back(Mk::Row("inner", 0, 1)); base[0].bag.push_back(Mk::Row("c", 0, 1)); base[0].bag[1].parent = 1;
+        now = base; now[0].bag[1].qty = 2;
+        if (BoxJrnDiffAll(base, now, &d, &nested) != 1 || nested != 1 || !d.empty()) Fail("t1047g: a change two packs deep is not counted");
+        /* BOX_ASKED's bytes, with the pending mark */
+        std::string gid; unsigned int g = 0; int pd = -1;
+        const std::vector<char> ab = EncodeBoxAsked("box.1.1.#00000001.1.1.1", 7u, 1);
+        if (DecodeBoxAsked(ab, &gid, &g, &pd) != 1 || gid != "box.1.1.#00000001.1.1.1" || g != 7u || pd != 1) Fail("t1047g: BOX_ASKED did not round-trip");
+        std::vector<char> bad = ab; bad[bad.size() - 4] = 2;
+        pd = -1;
+        if (DecodeBoxAsked(bad, &gid, &g, &pd) != 0 || pd != -1 || DecodeBoxAsked(EncodeBoxTaken("x", 1u), 0, 0, 0) != 0) Fail("t1047g: a bad BOX_ASKED was read");
+    }
+    /* THE LINK-LOSS SEQUENCE: the base, a write the link carried, the other writer writing above it, the reconnect, BOX_ASKED */
+    {
+        struct Mk { static std::vector<cooppar::ParityItem> Box(int q) { std::vector<cooppar::ParityItem> v; if (q > 0) { cooppar::ParityItem p; p.section = "main"; p.quantity = q; p.baseSid = "a"; v.push_back(p); } return v; } };
+        for (int stored = 0; stored <= 1; ++stored)
+        {
+            BoxJrnState j;
+            std::map<int, unsigned int> server;   /* the world server's slot memory: this game slot 0, the other game slot 1 */
+            BoxSlotGenNote(&server, 0, 3u, 1);
+            BoxJrnOpen(&j, Mk::Box(5), 3u);                    /* the box holds the stored gen 3: 5 units */
+            const std::vector<cooppar::ParityItem> latest = Mk::Box(2);   /* this game's character took 3 */
+            if (BoxJrnWrote(&j, 4u, latest, 100u) != 0) Fail("t1047g: a first write dropped another");
+            if (stored != 0) BoxSlotGenNote(&server, 0, 4u, 0);   /* the write landed before the link went (its BOX_TAKEN lost) */
+            BoxJrnLinkLost(&j);
+            if (j.lost != 1 || BoxJrnWaiting(j) != 1) Fail("t1047g: a write the link carried is not waiting for BOX_ASKED");
+            BoxSlotGenNote(&server, 1, 5u, 0);                  /* the other game writes the box above it */
+            std::map<int, unsigned int> restarted;
+            if (DecodeSlotGens(EncodeSlotGens(server), &restarted) != 1) Fail("t1047g: the slot file");
+            /* reconnect: BOX_ASKED for slot 0, through its bytes */
+            std::string gid; unsigned int g = 0;
+            if (DecodeBoxTaken(EncodeBoxTaken("box.1.1.#00000001.1.1.1", BoxSlotGenOf(restarted, 0)), &gid, &g) != 1) Fail("t1047g: BOX_ASKED's bytes");
+            if (BoxJrnAskDue(BoxJrnWaiting(j), 0, 0, 0) != 0) Fail("t1047g: asked while a lost write waits for BOX_ASKED");
+            if (BoxJrnAskSent(&j) != 4u) Fail("t1047g: BOX_ASK does not name the newest waiting write");
+            const unsigned int st = BoxJrnAsked(&j, g, 0, 0);
+            if (j.lost != 0 || BoxJrnWaiting(j) != 0) Fail("t1047g: BOX_ASKED did not answer the lost writes");
+            std::vector<BoxJrnDelta> d;
+            if (BoxJrnAskDue(BoxJrnWaiting(j), 0, 0, 0) != 1 || BoxJrnPlan(j, latest, &d) != 1) Fail("t1047g: the change was not planned after BOX_ASKED");
+            if (stored != 0 && (st != 4u || j.baseGen != 4u || !d.empty())) Fail("t1047g: a stored lost write was asked again (a double)");
+            if (stored == 0 && (st != 0u || j.baseGen != 3u || d.size() != 1 || d[0].dir != kBjTake || d[0].quantity != 3)) Fail("t1047g: an unstored lost write was not asked (a loss)");
+        }
+        {   /* BOX_TAKEN moves the base; BOX_REFUSE leaves the change against it; a write with no answer for a minute is asked about */
+            BoxJrnState j;
+            BoxJrnOpen(&j, Mk::Box(5), 3u);
+            BoxJrnWrote(&j, 4u, Mk::Box(4), 100u); BoxJrnWrote(&j, 5u, Mk::Box(2), 200u);
+            if (BoxJrnRefusedW(&j, 4u) != 1 || BoxJrnTaken(&j, 5u, 0) != 1 || j.baseGen != 5u || BoxJrnWaiting(j) != 0) Fail("t1047g: a later write's BOX_TAKEN did not move the base");
+            BoxJrnWrote(&j, 6u, Mk::Box(1), 300u);
+            if (BoxJrnRefusedW(&j, 6u) != 1 || BoxJrnRefusedW(&j, 6u) != 0) Fail("t1047g: a refusal");
+            std::vector<BoxJrnDelta> d;
+            if (BoxJrnPlan(j, Mk::Box(1), &d) != 1 || d.size() != 1 || d[0].quantity != 1) Fail("t1047g: a refused write's change is not asked");
+            BoxJrnWrote(&j, 7u, Mk::Box(1), 1000u);
+            if (BoxJrnStale(&j, 1000u + kBjAnswerWaitMsTest - 1u, kBjAnswerWaitMsTest) != 0 || BoxJrnStale(&j, 1000u + kBjAnswerWaitMsTest, kBjAnswerWaitMsTest) != 1 || j.lost != 1)
+                Fail("t1047g: a write with no answer is not asked about after its wait");
+            BoxJrnOpen(&j, Mk::Box(3), 9u);
+            if (BoxJrnWaiting(j) != 0 || j.lost != 0 || j.baseGen != 9u) Fail("t1047g: a record laid above the waiting writes did not answer them");
+            BoxJrnState n;
+            if (BoxJrnPlan(n, Mk::Box(1), &d) != 0) Fail("t1047g: a change with no base was planned");
+            for (size_t i = 0; i <= kBrChainMax; ++i)
+                if (BoxJrnWrote(&n, (unsigned int)(10 + i), Mk::Box(1), 0u) != (i == kBrChainMax ? 1 : 0)) Fail("t1047g: the waiting writes' bound");
+            BoxJrnClose(&j);
+            if (j.open != 0 || BoxJrnPlan(j, Mk::Box(1), &d) != 0) Fail("t1047g: a handed-over journal still plans");
+        }
+    }
+    /* which boxes hand their change over: never while a write waits; at once when another game writes the box; when the box is gone from
+       here only once no write of it can still be sent as this game's */
+    if (BoxJrnAskDue(1, 0, 1, 0) != 0 || BoxJrnAskDue(1, -1, 0, 0) != 0) Fail("t1047g: a change was asked while a write of it waits");
+    if (BoxJrnAskDue(0, 0, 1, 0) != 1 || BoxJrnAskDue(0, 0, 1, 1) != 1) Fail("t1047g: a change was not asked when another game writes the box");
+    if (BoxJrnAskDue(0, 1, 1, 0) != 0 || BoxJrnAskDue(0, 2, 0, 0) != 0) Fail("t1047g: a change was asked while this game writes the box, or before its writer is known");
+    if (BoxJrnAskDue(0, -1, 1, 1) != 0) Fail("t1047g: a change was asked while this game still owes the box's write as its writer");
+    if (BoxJrnAskDue(0, -1, 1, 0) != 1 || BoxJrnAskDue(0, -1, 0, 1) != 1 || BoxJrnAskDue(0, -1, -1, 0) != 1) Fail("t1047g: a change of a box gone from here was not asked");
+    {   /* a write after BOX_ASK, then the answer, then its BOX_TAKEN, then a role loss: no ask for that change (nothing doubled) */
+        struct Mk { static std::vector<cooppar::ParityItem> Box(int q) { std::vector<cooppar::ParityItem> v; if (q > 0) { cooppar::ParityItem p; p.section = "main"; p.quantity = q; p.baseSid = "a"; v.push_back(p); } return v; } };
+        BoxJrnState j;
+        BoxJrnOpen(&j, Mk::Box(5), 3u);
+        BoxJrnWrote(&j, 4u, Mk::Box(4), 100u);
+        BoxJrnLinkLost(&j);
+        BoxJrnAskSent(&j);
+        BoxJrnWrote(&j, 5u, Mk::Box(2), 200u);   /* sent on the new connection, after the ask */
+        unsigned int at = 0;
+        if (BoxJrnAskSent(&j) != 4u) Fail("t1047g: an ask sent again moved its cut-off past a write sent between the two asks");
+        if (BoxJrnAsked(&j, 3u, &at, 0) != 0 || BoxJrnWaiting(j) != 1 || j.waiting[0].gen != 5u || j.lost != 0) Fail("t1047g: a write after BOX_ASK was answered by it");
+        if (BoxJrnTaken(&j, 5u, &at) != 1 || j.baseGen != 5u || at != 200u || BoxJrnWaiting(j) != 0) Fail("t1047g: a write after BOX_ASK did not take its own BOX_TAKEN");
+        std::vector<BoxJrnDelta> d;
+        if (BoxJrnAskDue(BoxJrnWaiting(j), 0, 1, 0) != 1 || BoxJrnPlan(j, Mk::Box(2), &d) != 1 || !d.empty()) Fail("t1047g: a stored write's change was asked at the role loss");
+        /* the old connection's write 4 echoed late by the feed: below the base, the base stays */
+        (void)BoxJrnTaken(&j, 4u, 0);
+        if (j.baseGen != 5u || j.open != 1) Fail("t1047g: a late echo below the base moved it back");
+        /* a write dropped at the cap still moves the base when it is stored */
+        BoxJrnState c;
+        BoxJrnOpen(&c, Mk::Box(9), 1u);
+        for (unsigned int g = 2; g < 2u + (unsigned int)kBrChainMax + 1u; ++g) BoxJrnWrote(&c, g, Mk::Box((int)g), g);
+        if (c.waiting[0].gen != 3u || BoxJrnTaken(&c, 2u, 0) != 1 || c.baseGen != 2u) Fail("t1047g: a write dropped at the cap could not move the base");
+    }
+    {   /* an undo kept for an unloaded character owes only what is left: 5 owed, 2 removed on the first pass, then up to 3 */
+        int owed = 5;
+        if (BoxJrnOwe(&owed, 2) != 2 || owed != 3) Fail("t1047g: a partial removal is not kept");
+        if (BoxJrnOwe(&owed, 5) != 3 || owed != 0 || BoxJrnOwe(&owed, 1) != 0 || owed != 0) Fail("t1047g: a second pass removed more than was owed");
+        int neg = 2;
+        if (BoxJrnOwe(&neg, -1) != 0 || neg != 2 || BoxJrnOwe(0, 1) != 0) Fail("t1047g: the owed count");
+    }
+    /* a hint stays when it came after the stored write's read (across the tick count's wrap) */
+    if (BoxJrnHintStays(101u, 100u) != 1 || BoxJrnHintStays(100u, 100u) != 1 || BoxJrnHintStays(99u, 100u) != 0 || BoxJrnHintStays(5u, 0xFFFFFFF0u) != 1)
+        Fail("t1047g: a hint at or after the stored write did not stay, or one before it did");
+    {   /* BOX_ASKED marked pending: writes of the ask above the stored one keep waiting for their own echo, never counted not stored */
+        struct Mk { static std::vector<cooppar::ParityItem> Box(int q) { std::vector<cooppar::ParityItem> v; cooppar::ParityItem p; p.section = "main"; p.quantity = q; p.baseSid = "a"; v.push_back(p); return v; } };
+        BoxJrnState j;
+        BoxJrnOpen(&j, Mk::Box(5), 3u);
+        BoxJrnWrote(&j, 4u, Mk::Box(4), 1u); BoxJrnWrote(&j, 5u, Mk::Box(3), 2u);
+        BoxJrnLinkLost(&j); BoxJrnAskSent(&j);
+        if (BoxJrnAsked(&j, 4u, 0, 1) != 4u || j.baseGen != 4u || BoxJrnWaiting(j) != 1 || j.waiting[0].gen != 5u || j.lost != 0 || !j.done.empty())
+            Fail("t1047g: a pending BOX_ASKED counted a queued write not stored");
+        if (BoxJrnTaken(&j, 5u, 0) != 1 || j.baseGen != 5u) Fail("t1047g: the queued write's own echo did not move the base");
+    }
+    /* a stored record laid over a change not yet stored: never dropped silently */
+    if (BoxJrnRebaseDo(1, 0, 1, 0) != kRbHandOver || BoxJrnRebaseDo(1, 1, 1, 0) != kRbReapply
+        || BoxJrnRebaseDo(2, 1, 1, 0) != kRbKeep || BoxJrnRebaseDo(2, 0, 0, 0) != kRbKeep || BoxJrnRebaseDo(1, 0, 0, 0) != kRbNone || BoxJrnRebaseDo(1, 0, 1, 1) != kRbNone)
+        Fail("t1047g: a record laid over a pending change does not hand it over, lay it again as the writer, or read the held moves again");
+    /* the box already held the record (how 0): the record is the box with this game's change in it - never laid again, never asked again */
+    if (BoxJrnRebaseDo(0, 1, 1, 0) != kRbNone || BoxJrnRebaseDo(0, 0, 1, 0) != kRbNone || BoxJrnRebaseDo(0, 1, 0, 0) != kRbNone)
+        Fail("t1047g: a change whose record the box already held is laid again or handed over (made twice)");
+    {   /* A TAKE REFUSED AND PUT BACK: the mark read the box with the take (5 iron, 3 taken - the journal's latest 2); the take was refused
+           (no answer) and put back under the guard, which no hook rings - the box's building is noted and the latest read again (5): no
+           part is left, so neither a lay-again nor a hand-over moves a unit. A later real take of 1: only that 1 goes. Kept stale, the
+           hand-over asked the next writer to take 3 units the box still held - lost from the box */
+        cooppar::ParityItem iron; iron.section = "main"; iron.x = 1; iron.y = 1; iron.quantity = 5; iron.baseSid = "iron";
+        std::vector<cooppar::ParityItem> b5(1, iron), a2(1, iron), a4(1, iron);
+        a2[0].quantity = 2; a4[0].quantity = 4;
+        BoxJrnState js;
+        BoxJrnOpen(&js, b5, 7u);
+        std::vector<BoxJrnDelta> d;
+        if (BoxJrnPlan(js, a2, &d) == 0 || d.size() != 1 || d[0].quantity != 3) Fail("t1047g: the refused-take test's stale journal is not a take of 3");
+        BoxGuardNotes g;
+        int bldA = 0, bldB = 0;
+        BoxGuardNote(&g, &bldA);
+        BoxGuardNote(&g, &bldA);
+        if (BoxGuardAny(g) != 1 || g.n != 1 || BoxGuardHas(g, &bldA) != 1 || BoxGuardHas(g, &bldB) != 0)
+            Fail("t1047g: a box changed by this game's own guarded write is not noted, once");
+        std::vector<cooppar::ParityItem> latest = a2;
+        if (BoxGuardHas(g, &bldA) != 0) latest = b5;   /* BoxJrnGuardReread: the box as it is now */
+        BoxGuardClear(&g);
+        if (BoxGuardAny(g) != 0) Fail("t1047g: the notes stay after the reread");
+        if (BoxJrnPlan(js, latest, &d) == 0 || !d.empty()) Fail("t1047g: a take refused and put back stays a part of the journal's change");
+        const int pending = d.empty() ? 0 : 1;
+        if (BoxJrnRebaseDo(1, 1, pending, 0) != kRbNone || BoxJrnRebaseDo(1, 0, pending, 0) != kRbNone)
+            Fail("t1047g: a take refused and put back is laid again or handed over - units the box holds taken a second time");
+        if (BoxJrnPlan(js, a4, &d) == 0 || d.size() != 1 || d[0].dir != kBjTake || d[0].quantity != 1)
+            Fail("t1047g: a real take after a refused one hands over more than its own units");
+        BoxGuardNotes f;
+        static int many[kBoxGuardMax + 1];
+        for (int i = 0; i <= kBoxGuardMax; ++i) BoxGuardNote(&f, &many[i]);
+        if (f.all != 1 || BoxGuardHas(f, &bldB) != 1) Fail("t1047g: past the notes' cap a guarded write's box is not read again");
+        /* A PART-STACK TAKE REFUSED: 2 of 5 split off (the journal's latest 3), refused, and the 2 written straight back into the box's
+           stack (no hook rings a count written into a stack). Read again from the box (5) before the change can leave - the hand-over
+           decision, a refusal that hands it over, a record laid over it, a save: nothing left, nothing asked. Kept stale, the next
+           writer was asked to take 2 units the box still held */
+        std::vector<cooppar::ParityItem> a3(1, iron);
+        a3[0].quantity = 3;
+        if (BoxJrnPlan(js, a3, &d) == 0 || d.size() != 1 || d[0].quantity != 2) Fail("t1047g: the part-stack test's stale journal is not a take of 2");
+        if (BoxJrnReadAgainDue(1, 1, 0) != 1) Fail("t1047g: a box this game writes with a change journalled is not read again before its change leaves");
+        latest = b5;   /* BoxJrnReadAgain: the box as it is */
+        if (BoxJrnPlan(js, latest, &d) == 0 || !d.empty() || BoxJrnRebaseDo(1, 0, d.empty() ? 0 : 1, 0) != kRbNone)
+            Fail("t1047g: a part-stack take refused and its count written back is still handed over");
+        /* read again while this game holds a change of the box journalled and the box is loaded here, whichever game writes it now (the
+           role can leave before the change does). Never once this game marked it since as not its writer, whatever role is noted (the
+           noted role lags the mark): the box then shows this game's own asks at once, which are not the change - read in, a move made
+           after the role left went to the writer twice, in the journal's hand-over and as its own ask */
+        if (BoxJrnReadAgainDue(1, 0, 1) != 0 || BoxJrnReadAgainDue(1, 0, 0) != 0 || BoxJrnReadAgainDue(0, 1, 0) != 0)
+            Fail("t1047g: a box showing this game's own asks (whatever role is noted), one not loaded, or one with no change journalled is read into the journal");
+        if (BoxJrnReadAgainDue(1, 1, 1) != 0)
+            Fail("t1047g: a box marked by this game as not its writer is read into the journal while the noted role still says writer");
+        /* A NOTED BOX NOT READ AGAIN: its held change unsure (a parked change is never read again); read, or nothing held, it is not */
+        if (BoxJrnUnsureAfterRead(1, 1, 0) != 1 || BoxJrnUnsureAfterRead(1, 1, 1) != 0 || BoxJrnUnsureAfterRead(0, 1, 0) != 0 || BoxJrnUnsureAfterRead(1, 0, 0) != 0)
+            Fail("t1047g: a noted box whose change could not be read again is not made unsure, or a read or unnoted one is");
+        /* AT A SAVE, A PUT-BACK OF THIS FRAME (noted, the box tick not run yet): the box noted - or, with the boxes not to be looked up,
+           any pending note may be its own; with no note pending nothing is. Noted and not read (marked as not its writer, or parked):
+           unsure - its take never a row's, so the load cannot undo it a second time */
+        if (BoxJrnSaveNoted(1, 1, 1) != 1 || BoxJrnSaveNoted(1, 0, 0) != 1 || BoxJrnSaveNoted(1, 1, 0) != 0 || BoxJrnSaveNoted(0, 0, 1) != 0)
+            Fail("t1047g: a save does not take a pending note of a box as a change not read, or takes an unnoted box as one");
+        if (BoxJrnUnsureAfterRead(BoxJrnSaveNoted(1, 1, 1), 1, BoxJrnReadAgainDue(1, 1, 1)) != 1)
+            Fail("t1047g: at a save a box noted this frame and not read again (marked as not its writer) keeps its change's take as a row");
+        {   /* an unsure change's row beside a save: its takes never undone or asked at the load, in every list; its puts kept */
+            BoxOwedRow ro;
+            BoxJrnDelta tk, pt;
+            tk.dir = kBjTake; tk.quantity = 3; pt.dir = kBjPut; pt.quantity = 1;
+            ro.ifNone.push_back(tk); ro.ifNone.push_back(pt);
+            ro.ifStored.push_back(std::vector<BoxJrnDelta>(1, tk)); ro.ifStored.push_back(std::vector<BoxJrnDelta>(1, pt));
+            if (BoxOwedRowUnsure(&ro) != 2 || ro.ifNone.size() != 1 || ro.ifNone[0].dir != kBjPut || ro.ifStored.size() != 2
+                || !ro.ifStored[0].empty() || ro.ifStored[1].size() != 1 || ro.ifStored[1][0].dir != kBjPut || BoxOwedRowUnsure(0) != 0)
+                Fail("t1047g: an unsure change's row beside a save still undoes or asks its takes, or loses its puts");
+        }
+        {   /* AN UNSURE CHANGE: its take left on the character, its put kept - a copy too many at worst, never a loss */
+            std::vector<BoxJrnDelta> u(2);
+            u[0].dir = kBjTake; u[0].quantity = 2; u[1].dir = kBjPut; u[1].quantity = 1;
+            if (BoxJrnUnsureParts(&u) != 1 || u.size() != 1 || u[0].dir != kBjPut || u[0].quantity != 1 || BoxJrnUnsureParts(0) != 0)
+                Fail("t1047g: an unsure change's take is not left on the character, or its put not kept");
+        }
+        {   /* a park consumes its box's note; past the notes' cap every box stays noted */
+            BoxGuardNotes g;
+            int p1 = 0, p2 = 0;
+            BoxGuardNote(&g, &p1); BoxGuardNote(&g, &p2);
+            BoxGuardForget(&g, &p1);
+            if (BoxGuardHas(g, &p1) != 0 || BoxGuardHas(g, &p2) != 1 || g.n != 1) Fail("t1047g: a park does not consume its box's note alone");
+            g.all = 1; BoxGuardForget(&g, &p2);
+            if (BoxGuardHas(g, &p1) != 1) Fail("t1047g: past the notes' cap a forgotten box is no longer noted");
+        }
+    }
+    /* the swap's gates, in their order: any that holds means wait (the lay-again is never undone for one) */
+    if (BoxSwapGate(0, 0, 0, 0, 0, 0) != kSwGo || BoxSwapGate(1, 1, 1, 1, 1, 1) != kSwBlocked || BoxSwapGate(0, 1, 1, 1, 1, 1) != kSwPending
+        || BoxSwapGate(0, 0, 1, 1, 1, 1) != kSwCursor || BoxSwapGate(0, 0, 1, 0, 0, 0) != kSwGo || BoxSwapGate(0, 0, 0, 1, 0, 0) != kSwGo
+        || BoxSwapGate(0, 0, 0, 0, 1, 1) != kSwNoMaker || BoxSwapGate(0, 0, 0, 0, 0, 1) != kSwLoot)
+        Fail("t1047g: the swap's gates do not hold in their order (an item on the cursor over an open box, a move unpublished, no maker, research copies)");
+    /* the lay again waits only for a passing state; the box not here, unreadable, or a swap that did not start is undone at once */
+    for (int g = kSwGo; g <= kSwLoot; ++g)
+        for (int here = 0; here <= 1; ++here)
+            for (int ran = 0; ran <= 1; ++ran)
+            {
+                const int want = (here == 0) ? kRlUndo : (g != kSwGo) ? kRlWait : (ran == 0) ? kRlUndo : kRlLay;
+                if (BoxJrnReapplyStep(0, here, 1, g, ran) != want)
+                    Fail("t1047g: the lay again's wait or undo is wrong for gate " + I(g) + ", box here " + I(here) + ", swap started " + I(ran));
+                if (BoxJrnReapplyStep(1, here, 1, g, ran) != kRlWait) Fail("t1047g: the lay again does not wait while a box fill runs");
+                if (here == 1 && BoxJrnReapplyStep(0, 1, 0, g, ran) != kRlUndo) Fail("t1047g: an unreadable box waits instead of undoing the change");
+            }
+    if (kRlWait >= 0 || kRlUndo != 0 || kRlLay != 1) Fail("t1047g: the lay again's results are not BoxJrnReapply's -1 / 0 / 1");
+    if (BoxJrnParkSaveUndo(1, 0, kRbReapply) != 1 || BoxJrnParkSaveUndo(0, 0, kRbReapply) != 0 || BoxJrnParkSaveUndo(1, 1, kRbReapply) != 0
+        || BoxJrnParkSaveUndo(1, 0, kRbHandOver) != 0 || BoxJrnParkSaveUndo(1, 0, kRbNone) != 0)
+        Fail("t1047g: a save over a parked change does not undo exactly the change waiting only for the swap's gates");
+    {   /* THE BOX'S LEDGER: which changes a record holds, per slot, newest kBlMaxPerSlot; doubt; the floor; a new line */
+        BoxLedger l;
+        l.line = 0x1234ULL;
+        BoxLedgerAdd(&l, 3, 0x50ULL); BoxLedgerAdd(&l, 1, 0x40ULL | kBlDoubt); BoxLedgerAdd(&l, 1, 0x30ULL);
+        if (l.slots.size() != 2 || l.slots[0].slot != 1 || l.slots[1].slot != 3 || l.slots[0].ids.size() != 2 || BlId(l.slots[0].ids[0]) != 0x30ULL
+            || BoxLedgerFind(l, 1, 0x30ULL) != kBlExact || BoxLedgerFind(l, 1, 0x40ULL) != kBlDoubtful || BoxLedgerFind(l, 3, 0x50ULL) != kBlExact
+            || BoxLedgerFind(l, 2, 0x50ULL) != kBlAbsent || BoxLedgerFind(l, 3, 0x51ULL) != kBlAbsent)
+            Fail("t1047g: the ledger does not keep its ids by slot, in order, with their doubt");
+        BoxLedgerAdd(&l, 1, 0x40ULL);
+        BoxLedgerAdd(&l, 1, 0x30ULL | kBlDoubt);
+        if (BoxLedgerFind(l, 1, 0x40ULL) != kBlExact || BoxLedgerFind(l, 1, 0x30ULL) != kBlExact) Fail("t1047g: an exact entry does not win over a doubt");
+        BoxLedgerDel(&l, 1, 0x30ULL);
+        if (BoxLedgerFind(l, 1, 0x30ULL) != kBlAbsent || BoxLedgerFloor(l, 1) != 0ULL) Fail("t1047g: an ask put back stays in the ledger, or raises the floor");
+        {
+            BoxLedger c; c.line = 9ULL;
+            for (unsigned long long k = 1; k <= (unsigned long long)kBlMaxPerSlot + 2ULL; ++k) BoxLedgerAdd(&c, 4, 0x100ULL + k);
+            if (c.slots[0].ids.size() != kBlMaxPerSlot || BoxLedgerFloor(c, 4) != 0x102ULL || BoxLedgerFind(c, 4, 0x102ULL) != kBlAbsent || BoxLedgerFind(c, 4, 0x103ULL) != kBlExact)
+                Fail("t1047g: the ledger's cap does not raise the slot's floor to the ids it lets go");
+            BoxLedgerAdd(&c, 4, 0x101ULL);
+            if (BoxLedgerFind(c, 4, 0x101ULL) != kBlAbsent) Fail("t1047g: an id at or below the floor is taken back in");
+        }
+        {   /* the wire: whole or refused */
+            std::vector<char> b;
+            if (!BoxLedgerPut(&b, l)) Fail("t1047g: the ledger did not encode");
+            BoxLedger back; size_t off = 0;
+            if (!BoxLedgerGet(&b[0], b.size(), &off, &back) || off != b.size() || back.line != l.line || back.slots.size() != 2 || back.slots[1].ids != l.slots[1].ids
+                || BoxLedgerFind(back, 1, 0x40ULL) != kBlExact)
+                Fail("t1047g: the ledger does not round-trip");
+            for (size_t n = 0; n < b.size(); ++n) { size_t o = 0; BoxLedger x; if (BoxLedgerGet(&b[0], n, &o, &x)) { Fail("t1047g: a cut ledger was read"); break; } }
+            BoxLedger none;
+            std::vector<char> nb;
+            if (BoxLedgerPut(&nb, none)) Fail("t1047g: a ledger with no line was encoded");
+            std::vector<char> t = b; t[20] = 9;   /* the first slot's number above the next one's */
+            off = 0;
+            if (BoxLedgerGet(&t[0], t.size(), &off, &back)) Fail("t1047g: a ledger whose slots are out of order was read");
+        }
+        {   /* on the record: the flag set exactly with a ledger; the ledger out of the decoder, the intake and the world server's judge */
+            const std::string key = "12-box.mod@3,41@1003,-205,100";
+            const std::string id = MakeBoxRecIdFor(key, 1);
+            std::vector<cooppar::ParityItem> items(1, T823BoxItem("katana", 0, 0, 1));
+            BoxHeader h; h.generation = 6; h.writerSlot = 1; h.kind = kBrKindBox; h.ownerSlot = 1; h.key = key; h.flags = kBrFlagSeed;
+            std::vector<char> rec, plain;
+            if (!EncodeBoxRecord(&rec, h, items, &l) || !EncodeBoxRecord(&plain, h, items)) { Fail("t1047g: a record with a ledger was not encoded"); }
+            else
+            {
+                BoxHeader hd; std::vector<cooppar::ParityItem> it; BoxLedger ld;
+                if (DecodeBoxRecord(&rec[0], rec.size(), &hd, &it, &ld) != kBrOk || hd.flags != (kBrFlagSeed | kBrFlagLedger) || ld.line != l.line || it.size() != 1
+                    || BoxLedgerFind(ld, 3, 0x50ULL) != kBlExact)
+                    Fail("t1047g: a record's ledger does not come back with it");
+                if (DecodeBoxRecord(&plain[0], plain.size(), &hd, &it, &ld) != kBrOk || hd.flags != kBrFlagSeed || ld.line != 0ULL)
+                    Fail("t1047g: a record with no ledger reads with one");
+                std::vector<char> t = rec; t.push_back(0);
+                if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrTrailing) Fail("t1047g: a byte after a record's ledger was read");
+                t = rec; t.pop_back();
+                if (DecodeBoxRecord(&t[0], t.size(), 0, 0) == kBrOk) Fail("t1047g: a record with a cut ledger was read");
+                t = plain; t[BoxHeaderBytes(hd) - 8u] = (char)(kBrFlagSeed | kBrFlagLedger);
+                if (DecodeBoxRecord(&t[0], t.size(), 0, 0) == kBrOk) Fail("t1047g: a record with the ledger flag and no ledger was read");
+                BoxHeader hf = h; hf.flags = kBrFlagSeed | kBrFlagLedger;
+                std::vector<char> nf;
+                if (!EncodeBoxRecord(&nf, hf, items) || nf != plain) Fail("t1047g: the ledger flag is written with no ledger");
+                BoxLedger ik; int dw = -1;
+                if (BoxIntakeJudge(id, &rec[0], rec.size(), 0, 0u, &hd, &it, &dw, &ik) != kBiKeep || ik.line != l.line) Fail("t1047g: the intake does not keep a record's ledger");
+                const std::vector<int> none;
+                if (BoxJudgeWrite(id, &rec[0], rec.size(), 1, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrAccept) Fail("t1047g: the world server refuses a record with a ledger");
+            }
+        }
+        {   /* the ledger a write carries: its base's with the writer's entries on top, else a new line with what was kept as doubt */
+            BoxLedger base; base.line = 0x77ULL; BoxLedgerAdd(&base, 2, 0x10ULL); BoxLedgerAdd(&base, 5, 0x20ULL);
+            std::vector<BoxLedgerEntry> add, del;
+            add.push_back(BoxLedgerEntry(2, 0x11ULL)); add.push_back(BoxLedgerEntry(5, 0x21ULL | kBlDoubt)); del.push_back(BoxLedgerEntry(5, 0x20ULL));
+            BoxLedger out;
+            BoxLedgerForWrite(1, base, 1, base, 0x99ULL, add, del, &out);
+            if (out.line != 0x77ULL || BoxLedgerFind(out, 2, 0x10ULL) != kBlExact || BoxLedgerFind(out, 2, 0x11ULL) != kBlExact || BoxLedgerFind(out, 5, 0x20ULL) != kBlAbsent
+                || BoxLedgerFind(out, 5, 0x21ULL) != kBlDoubtful)
+                Fail("t1047g: a write on a known base does not carry its ledger with the writer's entries");
+            BoxLedgerForWrite(0, BoxLedger(), 1, base, 0x99ULL, add, std::vector<BoxLedgerEntry>(), &out);
+            if (out.line != 0x99ULL || BoxLedgerFind(out, 2, 0x10ULL) != kBlDoubtful || BoxLedgerFind(out, 2, 0x11ULL) != kBlExact)
+                Fail("t1047g: a write on an unknown base keeps the old line, or the kept ids as sure");
+            BoxLedgerPrune(&add, &del, base);
+            if (add.size() != 2 || del.size() != 1) Fail("t1047g: entries a kept record does not carry leave the writer's list");
+            BoxLedger o2 = base;
+            BoxLedgerAdd(&o2, 2, 0x11ULL); BoxLedgerDel(&o2, 5, 0x20ULL);
+            BoxLedgerPrune(&add, &del, o2);
+            if (add.size() != 1 || add[0].slot != 5 || !del.empty()) Fail("t1047g: entries a kept record carries stay in the writer's list");
+            {   /* a served ask put back: its removal stays while a write of this game waits (that write may hold the ask, and the record its
+                   answer makes would carry it again); it leaves once none waits */
+                std::vector<BoxLedgerEntry> a2, d2(1, BoxLedgerEntry(5, 0x30ULL));
+                BoxLedgerPrune(&a2, &d2, base, 1);
+                if (d2.size() != 1) Fail("t1047g: a served ask put back leaves the removals while the write that added it waits for its answer");
+                BoxLedgerPrune(&a2, &d2, base, 0);
+                if (!d2.empty()) Fail("t1047g: a removal the record no longer carries stays once no write waits");
+            }
+            std::vector<BoxLedgerEntry> v;
+            if (BoxLedgerEntrySet(&v, 1, 0x5ULL | kBlDoubt) != 1 || BoxLedgerEntrySet(&v, 1, 0x5ULL) != 0 || v.size() != 1 || v[0].id != 0x5ULL
+                || BoxLedgerEntryHas(v, 1, 0x5ULL) != 1 || BoxLedgerEntryDrop(&v, 1, 0x5ULL) != 1 || !v.empty())
+                Fail("t1047g: the writer's list of entries");
+            v.push_back(BoxLedgerEntry(1, 0x6ULL)); v.push_back(BoxLedgerEntry(2, 0x7ULL));
+            BoxLedgerEntryDoubt(&v, std::vector<BoxLedgerEntry>(1, BoxLedgerEntry(2, 0x7ULL)));
+            if (v[0].id != 0x6ULL || v[1].id != (0x7ULL | kBlDoubt)) Fail("t1047g: a change laid again in conflict does not mark exactly its own entries doubt");
+        }
+        {   /* the ask's id on the item request: the 'ASK1' trailer, last */
+            AskTail t; t.askId = 0x123456789ULL; t.slot = 3; t.carry.push_back(BoxLedgerEntry(2, 0x77ULL)); t.carry.push_back(BoxLedgerEntry(4, 0x88ULL | kBlDoubt));
+            std::vector<char> b(7, 'q');
+            PutAskTail(&b, t);
+            AskTail g; size_t len = 0;
+            if (b.size() != 7u + kAskTailFixed + 24u || TakeAskTail(&b[0], b.size(), &g, &len) != 1 || len != kAskTailFixed + 24u || g.askId != t.askId || g.slot != 3
+                || g.carry.size() != 2 || g.carry[1].slot != 4 || g.carry[1].id != (0x88ULL | kBlDoubt))
+                Fail("t1047g: the ASK1 trailer does not round-trip");
+            if (TakeAskTail(&b[0], b.size() - 1, &g, &len) != 0 || TakeAskTail(&b[0], 7, &g, &len) != 0) Fail("t1047g: a request without a whole ASK1 trailer is read");
+            AskTail none; none.slot = -1;
+            std::vector<char> nb;
+            PutAskTail(&nb, none);
+            if (TakeAskTail(&nb[0], nb.size(), &g, &len) != 1 || g.askId != 0ULL || g.slot != -1 || !g.carry.empty() || len != kAskTailFixed) Fail("t1047g: a request that is not a journalled ask");
+            for (int k = 0; k < 40; ++k) t.carry.push_back(BoxLedgerEntry(1, 1ULL + (unsigned long long)k));
+            std::vector<char> cb;
+            PutAskTail(&cb, t);
+            if (TakeAskTail(&cb[0], cb.size(), &g, &len) != 1 || g.carry.size() != kAskCarryMax) Fail("t1047g: the carried entries are not capped");
+        }
+        {   /* change ids and ask ids: above every earlier one; an ask of the same part keeps its id whatever its units */
+            unsigned long long last = 0ULL;
+            const unsigned long long a = BoxChangeIdNext(&last, 1000ULL), b = BoxChangeIdNext(&last, 1000ULL), c = BoxChangeIdNext(&last, 999ULL);
+            if (a != (1000ULL << 16) || b != a + 1ULL || c != b + 1ULL || (c & kBlDoubt) != 0) Fail("t1047g: change ids do not rise");
+            cooppar::ParityItem it; it.section = "main"; it.x = 1; it.y = 2; it.quantity = 5; it.baseSid = "iron";
+            BoxJrnDelta d1; d1.dir = kBjTake; d1.row = it; d1.quantity = 3;
+            BoxJrnDelta d2 = d1; d2.quantity = 4;
+            BoxJrnDelta d3 = d1; d3.row.x = 2;
+            std::map<std::string, unsigned long long> m;
+            std::vector<BoxJrnDelta> v1(1, d1), v2(1, d2), v3(1, d3);
+            BoxAskIdsAssign(&m, &v1, &last, 2000ULL); BoxAskIdsAssign(&m, &v2, &last, 2000ULL); BoxAskIdsAssign(&m, &v3, &last, 2000ULL);
+            if (v1[0].askId == 0ULL || v2[0].askId != v1[0].askId || v3[0].askId == v1[0].askId) Fail("t1047g: an ask of the same part does not keep the id a save holds");
+        }
+    }
+    {   /* THE BOX CHANGES A SAVE HOLDS UNRESOLVED: written beside the save, settled at its next load by the ids the change already has */
+        cooppar::ParityItem x; x.section = "main"; x.x = 0; x.y = 0; x.quantity = 3; x.baseSid = "x";
+        std::vector<cooppar::ParityItem> base(1, x), latest;   /* this game took the 3 x out of its box */
+        BoxJrnState s0;
+        BoxJrnOpen(&s0, base, 5);
+        BoxJrnWrote(&s0, 7, latest, 100, 0x70000ULL);           /* its write of that (gen 7) still waits at the save */
+        if (BoxOwedParkRow(kRbReapply, 1) != 1 || BoxOwedParkRow(kRbReapply, 0) != 0 || BoxOwedParkRow(kRbHandOver, 1) != 1 || BoxOwedParkRow(kRbHandOver, 0) != 1
+            || BoxOwedParkRow(kRbNone, 1) != 0)
+            Fail("t1047g: the parks a save holds as rows are not this game's own with a write waiting and every one handed to another writer");
+        BoxOwedRow r;
+        if (BoxOwedFromPark(s0, latest, 0x80000ULL, &r) != 1 || r.ids.size() != 2 || r.ids[0] != 0x70000ULL || r.ids[1] != 0x80000ULL || r.ifStored.size() != 2
+            || !r.ifStored[0].empty() || !r.ifStored[1].empty() || r.ifNone.size() != 1 || r.ifNone[0].dir != kBjTake || r.ifNone[0].quantity != 3)
+            Fail("t1047g: a parked change's row does not carry its write's id and the id its next write will carry");
+        {
+            BoxJrnState nz; BoxJrnOpen(&nz, base, 5); BoxJrnWrote(&nz, 7, latest, 100);
+            BoxOwedRow rz;
+            if (BoxOwedFromPark(nz, latest, 0ULL, &rz) != 0) Fail("t1047g: a row is made for a write with no id (it could never be settled)");
+        }
+        r.id = "box-1"; r.key = "k1"; r.pos[0] = 1.5f; r.slot = 2; r.line = 0x5000ULL;
+        r.ifNone[0].askId = 0x90000ULL;
+        BoxOwedWho who; who.where = "c:12;3"; who.section = "main"; r.who.push_back(who);
+        BoxOwedRow e; e.id = "box-2"; e.key = "k2"; e.ifNone = r.ifNone; e.decided = 1;   /* an undo decided while its character was not loaded */
+        std::vector<BoxOwedRow> rows, back;
+        rows.push_back(r); rows.push_back(e);
+        std::vector<char> b;
+        if (!EncodeBoxOwed(rows, &b) || b.empty() || DecodeBoxOwed(&b[0], b.size(), &back) != 1 || back.size() != 2 || back[0].ids != r.ids || back[0].slot != 2
+            || back[0].line != 0x5000ULL || back[0].decided != 0 || back[0].who.size() != 1 || back[0].who[0].where != who.where || back[0].who[0].section != "main"
+            || back[0].pos[0] != 1.5f || back[0].ifNone.size() != 1 || back[0].ifNone[0].row.baseSid != "x" || back[0].ifNone[0].quantity != 3
+            || back[0].ifNone[0].askId != 0x90000ULL || !back[1].ids.empty() || back[1].decided != 1 || back[1].ifNone.size() != 1)
+            Fail("t1047g: the rows do not round-trip through the file beside the save");
+        std::vector<char> bt = b; bt.push_back(0);
+        std::vector<BoxOwedRow> junk;
+        if (DecodeBoxOwed(&bt[0], bt.size(), &junk) != 0 || !junk.empty()) Fail("t1047g: a file beside the save with bytes after its rows is read");
+        bt = b; bt[4] = 1;
+        if (DecodeBoxOwed(&bt[0], bt.size(), &junk) != 0) Fail("t1047g: a file of the format before the ids is read as this one");
+        std::vector<BoxJrnDelta> left;
+        std::vector<int> how;
+        BoxLedger led; led.line = 0x5000ULL;
+        BoxLedgerAdd(&led, 2, 0x70000ULL);
+        if (BoxOwedResolve(back[0], 1, led, 1, &left, &how) != 1 || !left.empty()) Fail("t1047g: a write stored after the quit leaves the change owed on the character");
+        BoxLedger led2; led2.line = 0x5000ULL;
+        BoxLedgerAdd(&led2, 2, 0x80000ULL);
+        if (BoxOwedResolve(back[0], 1, led2, 1, &left, &how) != 1 || !left.empty()) Fail("t1047g: the write not sent at the save, stored under its reserved id, leaves the change owed");
+        {   /* THE IRON EXAMPLE: 3 of 5 iron taken, its write stored after the save, a friend adds 4 iron on top (the record's stack is 6): the
+               record's ledger holds the take's id - nothing removed from the character, whatever the stack. Settled by counting the stack,
+               the 6 iron the record holds (above the 2 the take left) would have removed 3 iron from the character. */
+            cooppar::ParityItem iron; iron.section = "main"; iron.x = 1; iron.y = 1; iron.quantity = 5; iron.baseSid = "iron";
+            std::vector<cooppar::ParityItem> b5(1, iron), a2(1, iron);
+            a2[0].quantity = 2;
+            BoxJrnState js;
+            BoxJrnOpen(&js, b5, 10);
+            BoxOwedRow ir;
+            if (BoxOwedFromJournal(js, 1, a2, 0xA0000ULL, &ir) != 1 || ir.ids.size() != 1 || ir.ids[0] != 0xA0000ULL || ir.ifNone.size() != 1 || ir.ifNone[0].quantity != 3
+                || ir.ifNone[0].row.quantity != 5)
+                Fail("t1047g: the iron take not written at the save is not a row under the id its write will carry");
+            ir.slot = 2; ir.line = 0x5000ULL; ir.who.push_back(who);
+            BoxLedger mine; mine.line = 0x5000ULL; BoxLedgerAdd(&mine, 2, 0xA0000ULL);
+            BoxLedger after;   /* the friend's write on top of this game's: the line and the take's id carried on */
+            BoxLedgerForWrite(1, mine, 1, mine, 0x1ULL, std::vector<BoxLedgerEntry>(1, BoxLedgerEntry(3, 0xB0000ULL)), std::vector<BoxLedgerEntry>(), &after);
+            if (BoxOwedResolve(ir, 1, after, 1, &left, &how) != 1 || !left.empty())
+                Fail("t1047g: THE IRON EXAMPLE: a take stored after the save is undone once a friend adds the same item - items deleted from the character");
+            /* A RESERVED NUMBER NEVER WRITTEN (the write refused, or the game ended first): absent from the very line, above the floor - not
+               stored, undone exactly: 3 */
+            BoxLedger refused; refused.line = 0x5000ULL; BoxLedgerAdd(&refused, 3, 0xB0000ULL); BoxLedgerAdd(&refused, 2, 0x9FFFFULL);
+            if (BoxOwedResolve(ir, 1, refused, 1, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUndo || left[0].quantity != 3
+                || BoxOwedAct(left[0].dir, how[0]) != kBjDoRemoveChar)
+                Fail("t1047g: a take under a reserved id never written is not undone on the character, exactly");
+            /* below the slot's floor: cannot be known - a take is left on the character */
+            BoxLedger fl; fl.line = 0x5000ULL;
+            for (unsigned long long k = 1; k <= (unsigned long long)kBlMaxPerSlot + 1ULL; ++k) BoxLedgerAdd(&fl, 2, 0xC0000ULL + k);
+            if (BoxOwedResolve(ir, 1, fl, 1, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUnsure || BoxOwedAct(kBjTake, kOpUnsure) != kBjDoNothing)
+                Fail("t1047g: a take whose id fell below the slot's floor is undone");
+            /* A SEED: the record started a new line - the take's id cannot be known absent: left on the character; a put made again */
+            BoxLedger seed; seed.line = 0x6000ULL;
+            if (BoxOwedResolve(ir, 1, seed, 1, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUnsure || BoxOwedAct(left[0].dir, how[0]) != kBjDoNothing)
+                Fail("t1047g: a seed's new line undoes a take - an item destroyed on an answer the world server can no longer give");
+            if (BoxOwedResolve(ir, 0, BoxLedger(), 1, &left, &how) != 1 || how.size() != 1 || how[0] != kOpUnsure) Fail("t1047g: a record with no ledger undoes a take");
+            BoxOwedRow pr = ir;
+            pr.ifNone[0].dir = kBjPut;
+            if (BoxOwedResolve(pr, 1, seed, 1, &left, &how) != 1 || how[0] != kOpUnsure || BoxOwedAct(kBjPut, how[0]) != kBjDoRemake)
+                Fail("t1047g: a put a seed's record cannot show is not made again (it would be lost)");
+            if (BoxOwedResolve(pr, 1, refused, 1, &left, &how) != 1 || how[0] != kOpUndo || BoxOwedAct(kBjPut, how[0]) != kBjDoRemake)
+                Fail("t1047g: a put never stored is not made again");
+            BoxLedger dbt = after; BoxLedgerDel(&dbt, 2, 0xA0000ULL); BoxLedgerAdd(&dbt, 2, 0xA0000ULL | kBlDoubt);
+            if (BoxOwedResolve(ir, 1, dbt, 1, &left, &how) != 1 || how.size() != 1 || how[0] != kOpUnsure) Fail("t1047g: a change laid again in conflict reads as sure");
+        }
+        {   /* AN ASK SERVED AFTER THE SAVE: an ask row (no write of this game) settled by its id in the writer's record */
+            BoxOwedRow ar;
+            ar.id = "box-3"; ar.key = "k3"; ar.slot = 2; ar.line = 0x5000ULL; ar.who.push_back(who);
+            BoxJrnDelta tk = r.ifNone[0]; tk.askId = 0xD0000ULL;
+            ar.ifNone.push_back(tk);
+            BoxLedger srv; srv.line = 0x5000ULL; BoxLedgerAdd(&srv, 4, 0xE0000ULL);
+            BoxLedgerAdd(&srv, 2, 0xD0000ULL);   /* the writer served it after the save */
+            if (BoxOwedResolve(ar, 1, srv, 0, &left, &how) != 1 || left.size() != 1 || how[0] != kOpStored)
+                Fail("t1047g: an ask served after the save is undone - by the stack, the take would be undone once a friend added to the cell");
+            BoxLedger nsv; nsv.line = 0x5000ULL; BoxLedgerAdd(&nsv, 4, 0xE0000ULL);
+            if (BoxOwedResolve(ar, 1, nsv, 0, &left, &how) != 0) Fail("t1047g: an ask not served yet is settled before its grace is over");
+            if (BoxOwedResolve(ar, 1, nsv, 1, &left, &how) != 1 || how[0] != kOpUndo) Fail("t1047g: an ask never served is not undone once its grace is over");
+            BoxLedger dsv = nsv; BoxLedgerAdd(&dsv, 2, 0xD0000ULL | kBlDoubt);
+            if (BoxOwedResolve(ar, 1, dsv, 1, &left, &how) != 1 || how[0] != kOpUnsure) Fail("t1047g: an ask carried as doubt reads as sure");
+            BoxOwedRow ao = ar; ao.line = 0x6000ULL;
+            if (BoxOwedResolve(ao, 1, nsv, 1, &left, &how) != 1 || how[0] != kOpUnsure) Fail("t1047g: an ask on another line is undone");
+            BoxOwedRow an = ar; an.ifNone[0].askId = 0ULL;
+            if (BoxOwedResolve(an, 1, nsv, 1, &left, &how) != 1 || how[0] != kOpUnsure) Fail("t1047g: a part with no id at all is settled as known");
+        }
+        {   /* A SAVE SEALS ITS ID - THE SWORD: a sword put into the box and saved before its write, then taken back before any write (the link
+               down, or the write skipped as unchanged). The save's row names the reserved id; the save seals it with the box as it stood and
+               releases it, so the take-back takes a new id. Left open, the reserved id went out with the write of the box without the sword
+               and read at the load as the put stored: the sword was in neither the box nor the character. */
+            cooppar::ParityItem sword; sword.section = "main"; sword.x = 2; sword.y = 1; sword.quantity = 1; sword.baseSid = "sword";
+            const std::vector<cooppar::ParityItem> empty0, withSword(1, sword);
+            BoxJrnState js;
+            BoxJrnOpen(&js, empty0, 10);
+            std::vector<BoxSeal> seals;
+            std::vector<unsigned long long> gone;
+            unsigned long long chgPend = 0xA1000ULL;   /* reserved at the put's mark */
+            unsigned long long pend = BoxSealMatch(seals, withSword, 0, BoxLedger(), 2, std::vector<BoxLedgerEntry>());
+            if (pend != 0ULL) Fail("t1047g: a box no save sealed reads as sealed");
+            pend = chgPend;
+            BoxOwedRow sr;
+            if (BoxOwedFromJournal(js, 1, withSword, pend, &sr) != 1 || sr.ids.size() != 1 || sr.ids[0] != 0xA1000ULL || sr.ifNone.size() != 1 || sr.ifNone[0].dir != kBjPut)
+                Fail("t1047g: the sword's put not written at the save is not a row under its reserved id");
+            if (BoxSealAdd(&seals, pend, withSword, &gone) != 1 || BoxSealAdd(&seals, pend, withSword, &gone) != 0 || seals.size() != 1 || !gone.empty())
+                Fail("t1047g: the save does not seal the id its row names, once");
+            chgPend = 0ULL;
+            if (BoxSealMatch(seals, withSword, 0, BoxLedger(), 2, std::vector<BoxLedgerEntry>()) != 0xA1000ULL) Fail("t1047g: a second note of the same save does not name the id the first sealed");
+            sr.slot = 2; sr.line = 0x5000ULL; sr.who.push_back(who);
+            BoxLedger base5; base5.line = 0x5000ULL; BoxLedgerAdd(&base5, 2, 0x90000ULL);
+            /* the sword taken back: a new id for the change after the save, and the write of the box without the sword */
+            chgPend = 0xA2000ULL;
+            std::vector<BoxLedgerEntry> add(1, BoxLedgerEntry(2, chgPend));
+            std::vector<BoxSeal> sc = seals;
+            BoxSealCarry(&sc, empty0, 1, base5, 2, &add);
+            BoxLedger out;
+            BoxLedgerForWrite(1, base5, 1, base5, 0x1ULL, add, std::vector<BoxLedgerEntry>(), &out);
+            if (sc.size() != 1 || BoxLedgerFind(out, 2, 0xA1000ULL) != kBlDoubtful || BoxLedgerFind(out, 2, 0xA2000ULL) != kBlExact)
+                Fail("t1047g: a write of the box after the save's change was altered carries the save's id as stored");
+            if (BoxOwedResolve(sr, 1, out, 1, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUnsure || BoxOwedAct(kBjPut, how[0]) != kBjDoRemake)
+                Fail("t1047g: THE SWORD: put, saved, taken back before its write - the load does not make the put again (the sword is nowhere)");
+            BoxLedger open = out; BoxLedgerDel(&open, 2, 0xA1000ULL); BoxLedgerAdd(&open, 2, 0xA1000ULL);
+            if (BoxOwedResolve(sr, 1, open, 1, &left, &how) != 1 || !left.empty())
+                Fail("t1047g: the test's open-id ledger does not read as the put stored");
+            /* the take-back's write skipped as unchanged (no write at all): the save's id never written - not stored, the put made again */
+            if (BoxOwedResolve(sr, 1, base5, 1, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUndo || BoxOwedAct(kBjPut, how[0]) != kBjDoRemake)
+                Fail("t1047g: THE SWORD with no write after the save: the put is not made again");
+            /* the box written as it stood at the save: the save's id exact - the put stored, nothing done */
+            std::vector<BoxLedgerEntry> addEq;
+            std::vector<BoxSeal> se = seals;
+            BoxSealCarry(&se, withSword, 1, base5, 2, &addEq);
+            BoxLedger outEq;
+            BoxLedgerForWrite(1, base5, 1, base5, 0x1ULL, addEq, std::vector<BoxLedgerEntry>(), &outEq);
+            if (BoxLedgerFind(outEq, 2, 0xA1000ULL) != kBlExact || BoxOwedResolve(sr, 1, outEq, 1, &left, &how) != 1 || !left.empty())
+                Fail("t1047g: a write of the box exactly as it stood at the save does not carry the save's id as stored");
+            {   /* T-1076 THE SWORD PUT BACK: put, saved (the save seals its id with the box holding the sword), taken back (the write of the
+                   empty box carries that id as doubt), put back and saved again, then stored. The second save finds a seal of the very box it
+                   holds, but its id is doubt in the kept record (or in a write still waiting) and a doubt stays doubt: named again, the stored
+                   change read as unsure at the load and the sword was made again - two swords. The save takes a new id */
+                std::vector<BoxSeal> s2 = sc;   /* the first save's seal, still kept after the take-back's write */
+                if (BoxSealMatch(s2, withSword, 0, BoxLedger(), 2, std::vector<BoxLedgerEntry>()) != 0xA1000ULL)
+                    Fail("t1047h: the put-back test's premise: the first save's seal does not match the box holding the sword again");
+                if (BoxSealMatch(s2, withSword, 1, out, 2, std::vector<BoxLedgerEntry>()) != 0ULL)
+                    Fail("t1047h: T-1076 a save names again an id the kept record carries as doubt");
+                if (BoxSealMatch(s2, withSword, 1, base5, 2, add) != 0ULL)
+                    Fail("t1047h: T-1076 a save names again an id a write still waiting carries as doubt");
+                const unsigned long long r2 = 0xA3000ULL;   /* reserved at the put-back's mark */
+                BoxJrnState j2;
+                BoxJrnOpen(&j2, empty0, 11);
+                BoxOwedRow pr2;
+                if (BoxOwedFromJournal(j2, 1, withSword, r2, &pr2) != 1) Fail("t1047h: the put-back at the second save is not a row");
+                pr2.slot = 2; pr2.line = 0x5000ULL; pr2.who.push_back(who);
+                (void)BoxSealAdd(&s2, r2, withSword, 0);
+                std::vector<BoxLedgerEntry> a2e(1, BoxLedgerEntry(2, 0xA4000ULL));
+                BoxSealCarry(&s2, withSword, 1, out, 2, &a2e);   /* the box written as it stood at the second save */
+                BoxLedger o2;
+                BoxLedgerForWrite(1, out, 1, out, 0x1ULL, a2e, std::vector<BoxLedgerEntry>(), &o2);
+                int swords = 1;   /* the stored box */
+                if (BoxOwedResolve(pr2, 1, o2, 1, &left, &how) != 1) Fail("t1047h: the put-back's row is not settled");
+                for (size_t k = 0; k < left.size(); ++k) if (BoxOwedAct(left[k].dir, how[k]) == kBjDoRemake) ++swords;
+                if (swords != 1) Fail("t1047h: T-1076 the sword put back, saved and stored exists " + I(swords) + " times after the load");
+                BoxOwedRow reused = pr2;
+                reused.ids.assign(1, 0xA1000ULL);
+                if (BoxOwedResolve(reused, 1, o2, 1, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUnsure || BoxOwedAct(kBjPut, how[0]) != kBjDoRemake)
+                    Fail("t1047h: the put-back test's control: the doubt id named again does not read unsure (the two-sword road)");
+            }
+            {   /* T-1075 THE SWORD AND THE SHIELD: both put in, saved before the write, the sword taken back before any write; the write of the
+                   box with the shield alone carries the save's id as doubt. At the load unsure is judged per part: the shield's put, which the
+                   record shows at its cell, is stored; the sword's put, which it does not show, is made again - each exists once. Judged for
+                   the whole change, the shield was made again on the character too: two shields */
+                cooppar::ParityItem shield; shield.section = "main"; shield.x = 4; shield.y = 1; shield.quantity = 1; shield.baseSid = "shield";
+                std::vector<cooppar::ParityItem> both;
+                both.push_back(sword); both.push_back(shield);
+                const std::vector<cooppar::ParityItem> onlyShield(1, shield);
+                BoxOwedRow br;
+                if (BoxOwedFromJournal(js, 1, both, 0xA5000ULL, &br) != 1 || br.ifNone.size() != 2) Fail("t1047h: the sword and shield at the save are not a row of two puts");
+                br.slot = 2; br.line = 0x5000ULL; br.who.push_back(who);
+                std::vector<BoxSeal> bs;
+                (void)BoxSealAdd(&bs, 0xA5000ULL, both, 0);
+                std::vector<BoxLedgerEntry> ba(1, BoxLedgerEntry(2, 0xA6000ULL));
+                BoxSealCarry(&bs, onlyShield, 1, base5, 2, &ba);
+                BoxLedger bo;
+                BoxLedgerForWrite(1, base5, 1, base5, 0x1ULL, ba, std::vector<BoxLedgerEntry>(), &bo);
+                if (BoxOwedResolve(br, 1, bo, 1, &left, &how) != 1 || left.size() != 2 || how[0] != kOpUnsure || how[1] != kOpUnsure)
+                    Fail("t1047h: the sword-and-shield test's premise: the save's id is not doubt in the record of the shield alone");
+                if (BoxOwedByPart(left, &how, onlyShield) != 1) Fail("t1047h: T-1075 not exactly one put (the shield's) is shown by the record");
+                int swords = 0, shields = 0;
+                for (size_t i = 0; i < onlyShield.size(); ++i) { if (onlyShield[i].baseSid == "sword") ++swords; if (onlyShield[i].baseSid == "shield") ++shields; }
+                for (size_t k = 0; k < left.size(); ++k)
+                    if (BoxOwedAct(left[k].dir, how[k]) == kBjDoRemake) { if (left[k].row.baseSid == "sword") ++swords; if (left[k].row.baseSid == "shield") ++shields; }
+                if (swords != 1 || shields != 1)
+                    Fail("t1047h: T-1075 after the load the sword and the shield do not each exist once (" + I(swords) + " swords, " + I(shields) + " shields)");
+                /* not shown: fewer units at the cell, another item there, a part inside a pack, a take - each stays unsure */
+                BoxJrnDelta pd; pd.dir = kBjPut; pd.row = shield; pd.row.quantity = 5; pd.quantity = 2;
+                std::vector<cooppar::ParityItem> three(1, shield);
+                three[0].quantity = 3;
+                BoxJrnDelta pk = pd; pk.row.quantity = 1; pk.inPack = 1;
+                BoxJrnDelta tk = pd; tk.dir = kBjTake; tk.row.quantity = 1;
+                BoxJrnDelta ot = pd; ot.row.quantity = 1; ot.row.baseSid = "helmet";
+                if (BoxOwedRecordShows(pd, three) != 0 || BoxOwedRecordShows(pk, onlyShield) != 0 || BoxOwedRecordShows(tk, onlyShield) != 0
+                    || BoxOwedRecordShows(ot, onlyShield) != 0)
+                    Fail("t1047h: a put with fewer units at its cell, another item there, a part in a pack, or a take is judged shown by the record");
+                std::vector<BoxJrnDelta> ul(1, pd);
+                std::vector<int> uh(1, kOpUndo);
+                three[0].quantity = 5;
+                if (BoxOwedByPart(ul, &uh, three) != 0 || uh[0] != kOpUndo) Fail("t1047h: a put the ledger says is not stored is made stored by the contents");
+            }
+            /* a doubt stays doubt: a later write of the box as it was at the save does not make it exact */
+            BoxSealCarry(&sc, withSword, 1, base5, 2, &add);
+            if (BoxLedgerEntryHas(add, 2, 0xA1000ULL) != 1) Fail("t1047g: a sealed id leaves the entries while its seal stays");
+            for (size_t i = 0; i < add.size(); ++i) if (BlId(add[i].id) == 0xA1000ULL && (add[i].id & kBlDoubt) == 0) Fail("t1047g: a sealed id carried as doubt becomes exact");
+            /* an exact entry of an earlier try is taken back when the box changed since */
+            BoxSealCarry(&se, empty0, 1, base5, 2, &addEq);
+            for (size_t i = 0; i < addEq.size(); ++i) if (BlId(addEq[i].id) == 0xA1000ULL && (addEq[i].id & kBlDoubt) == 0) Fail("t1047g: an earlier try's exact entry stays after the box changed");
+            /* the kept record carries the id: the seal leaves, with its entry */
+            BoxSealCarry(&se, empty0, 1, outEq, 2, &addEq);
+            if (!se.empty() || BoxLedgerEntryHas(addEq, 2, 0xA1000ULL) != 0) Fail("t1047g: a seal the kept record carries stays");
+            /* the cap: the oldest seal leaves, carried as doubt */
+            std::vector<BoxSeal> cap;
+            gone.clear();
+            for (unsigned long long k = 1; k <= (unsigned long long)kBoxSealMax + 1ULL; ++k) (void)BoxSealAdd(&cap, 0xB0000ULL + k, withSword, &gone);
+            if (cap.size() != kBoxSealMax || gone.size() != 1 || gone[0] != 0xB0001ULL) Fail("t1047g: the seals' cap");
+            std::vector<BoxLedgerEntry> ga(1, BoxLedgerEntry(2, 0xB0001ULL));
+            BoxSealDoubt(&ga, 2, 0xB0001ULL);
+            if (ga.size() != 1 || ga[0].id != (0xB0001ULL | kBlDoubt)) Fail("t1047g: a seal the cap pushes out is not carried as doubt");
+            /* a take partly put back after the save: 3 of 5 iron taken and saved, 1 put back before the write (the box holds 3) - the save's
+               id doubt: nothing removed from the character (the 2 still out are never lost) */
+            cooppar::ParityItem iron; iron.section = "main"; iron.x = 1; iron.y = 1; iron.quantity = 5; iron.baseSid = "iron";
+            std::vector<cooppar::ParityItem> b5(1, iron), a2(1, iron), a3(1, iron);
+            a2[0].quantity = 2; a3[0].quantity = 3;
+            BoxJrnState ji;
+            BoxJrnOpen(&ji, b5, 10);
+            BoxOwedRow tr;
+            if (BoxOwedFromJournal(ji, 1, a2, 0xC1000ULL, &tr) != 1) Fail("t1047g: the iron take at the save is not a row");
+            tr.slot = 2; tr.line = 0x5000ULL; tr.who.push_back(who);
+            std::vector<BoxSeal> si;
+            (void)BoxSealAdd(&si, 0xC1000ULL, a2, 0);
+            std::vector<BoxLedgerEntry> ai(1, BoxLedgerEntry(2, 0xC2000ULL));
+            BoxSealCarry(&si, a3, 1, base5, 2, &ai);
+            BoxLedger oi;
+            BoxLedgerForWrite(1, base5, 1, base5, 0x1ULL, ai, std::vector<BoxLedgerEntry>(), &oi);
+            if (BoxOwedResolve(tr, 1, oi, 1, &left, &how) != 1 || how.size() != 1 || how[0] != kOpUnsure || BoxOwedAct(kBjTake, how[0]) != kBjDoNothing)
+                Fail("t1047g: a take partly put back after the save is settled as stored or undone - items removed from the character the record lacks");
+        }
+        /* an undo decided at the save (engine writes blocked, its character not loaded): done as it is, whatever the record */
+        if (BoxOwedResolve(back[1], 0, BoxLedger(), 0, &left, &how) != 1 || left.size() != 1 || how[0] != kOpUndo || BoxOwedAct(left[0].dir, how[0]) != kBjDoRemoveChar)
+            Fail("t1047g: an undo decided at the save is not done at its next load");
+        /* two saves waiting at once each take the rows its own run noted; a save whose run noted none keeps its request's */
+        BoxOwedGuard g;
+        const long long n1 = BoxOwedGuardAt(g);
+        BoxOwedGuardNote(&g, "A", 8);
+        const long long n2 = BoxOwedGuardAt(g);
+        BoxOwedGuardNote(&g, "B", 8);
+        const long long n3 = BoxOwedGuardAt(g);
+        std::string t1 = "req1", t2 = "req2", t3 = "req3";
+        if (BoxOwedGuardClaim(&g, n1, &t1) != 1 || t1 != "A" || BoxOwedGuardClaim(&g, n2, &t2) != 1 || t2 != "B" || BoxOwedGuardClaim(&g, n3, &t3) != 0 || t3 != "req3")
+            Fail("t1047g: saves waiting at once share one note of the box changes");
+        /* a load that made no world drops its rows; a world takes only its own load's, once */
+        BoxOwedArm a;
+        BoxOwedArmAtPrepare(&a);
+        if (BoxOwedArmAtLoadEnd(&a, 4, 4) != 1 || BoxOwedArmTake(&a, 4) != 0) Fail("t1047g: a failed load's box-change rows are kept");
+        BoxOwedArmAtPrepare(&a);
+        if (BoxOwedArmAtLoadEnd(&a, 4, 5) != 0 || BoxOwedArmBound(a, 5) != 1 || BoxOwedArmTake(&a, 5) != 1 || BoxOwedArmTake(&a, 5) != 0 || BoxOwedArmBound(a, 5) != 0)
+            Fail("t1047g: the loaded save's box-change rows are not taken by its own world, once");
+        if (BoxOwedFileCurrent(10, 9) != 1 || BoxOwedFileCurrent(9, 9) != 1 || BoxOwedFileCurrent(8, 9) != 0 || BoxOwedFileCurrent(0, 9) != 0)
+            Fail("t1047g: an earlier save's box-change file is read");
+        /* the journal's change at a save: not written yet - a row under the id its write will carry; written and not answered - its write's id */
+        BoxJrnState j0;
+        BoxJrnOpen(&j0, base, 5);
+        BoxOwedRow jr;
+        if (BoxOwedFromJournal(j0, 1, latest, 0x11ULL, &jr) != 1 || jr.ids.size() != 1 || jr.ids[0] != 0x11ULL || jr.ifNone.size() != 1 || jr.ifNone[0].quantity != 3)
+            Fail("t1047g: a change of the box not written yet at the save is not a row under the id its write will carry");
+        BoxJrnWrote(&j0, 6, latest, 50, 0x10ULL);
+        if (BoxOwedFromJournal(j0, 1, latest, 0ULL, &jr) != 1 || jr.ids.size() != 1 || jr.ids[0] != 0x10ULL || !jr.ifStored[0].empty() || jr.ifNone.size() != 1)
+            Fail("t1047g: a write of the box not answered at the save is not a row with its id");
+        if (BoxOwedFromJournal(j0, 0, latest, 0ULL, &jr) != 0 || BoxOwedFromJournal(j0, 1, base, 0ULL, &jr) != 0) Fail("t1047g: a box with no change is a row beside the save");
+        /* only on the characters that made the change: none of them here - dropped, never another character */
+        if (BoxOwedWhoUse(0, 0, 1) != kWhoDrop || BoxOwedWhoUse(2, 1, 0) != kWhoWait || BoxOwedWhoUse(2, 1, 1) != kWhoGo || BoxOwedWhoUse(1, 0, 1) != kWhoDrop
+            || BoxOwedWhoUse(1, 1, 0) != kWhoGo || BoxOwedWhoUse(1, 0, 0) != kWhoWait)
+            Fail("t1047g: an undo of a save's box change can go to a character that did not make it");
+        /* the copy in the records store: a save that ended before the file beside it was written still loads its rows, never another request's */
+        const std::string rowsBytes(b.begin(), b.end());
+        const std::string cp = EncodeBoxOwedCopy(0x0000000500000007ULL, rowsBytes);
+        std::string cr;
+        unsigned long long rf = 0;
+        if (DecodeBoxOwedCopy(cp.data(), cp.size(), &rf, &cr) != 1 || rf != 0x0000000500000007ULL || cr != rowsBytes) Fail("t1047g: the copy of a save's box changes does not round-trip");
+        if (BoxOwedChoose(10, 9, 1, 8) != kOwUseBeside || BoxOwedChoose(8, 9, 1, 8) != kOwUseCopy || BoxOwedChoose(0, 9, 1, 9) != kOwUseCopy
+            || BoxOwedChoose(8, 9, 1, 10) != kOwUseNone || BoxOwedChoose(8, 9, 0, 0) != kOwUseNone || BoxOwedChoose(0, 0, 1, 1) != kOwUseNone)
+            Fail("t1047g: a save that ended before its box-change file was written does not load its copy, or loads a later request's");
+        if (BoxOwedCopyKey("C:/Saves/Kenshi/save/Camp/") != BoxOwedCopyKey("c:\\saves\\kenshi\\save\\camp") || BoxOwedCopyKey("C:\\A\\save\\Camp") == BoxOwedCopyKey("C:\\B\\save\\Camp"))
+            Fail("t1047g: the copy is not keyed by the save's folder (two saves of one name share a copy, or one save's two spellings do not)");
+        {
+            BoxOwedGuard pg;
+            BoxOwedGuardNote(&pg, "P", 8);
+            long long pn = 0;
+            std::string pb;
+            if (BoxOwedGuardPeek(pg, 0, &pn, &pb) != 1 || pn != 1 || pb != "P" || BoxOwedGuardClaim(&pg, 0, &pb) != 1 || pb != "P") Fail("t1047g: a peek of a save's note claims it");
+        }
+    }
+    {   /* packs paired by their contents first; a whole-pack take matches the pack with its contents */
+        struct Mk { static cooppar::ParityItem Pack(int x, const char* in) { cooppar::ParityItem p; p.section = "main"; p.x = x; p.y = 0; p.quantity = 1; p.baseSid = "pack";
+                                                                             coopbag::BagRow r; r.section = "backpack_content"; r.baseSid = in; r.qty = 1; p.bag.push_back(r); return p; } };
+        std::vector<cooppar::ParityItem> base, now, merged;
+        std::vector<BoxJrnDelta> d, undo;
+        std::vector<int> putAt;
+        base.push_back(Mk::Pack(0, "c")); base.push_back(Mk::Pack(1, "e"));
+        now.push_back(Mk::Pack(0, "e")); now.push_back(Mk::Pack(1, "c"));   /* the two packs swapped places, nothing taken out of either */
+        if (BoxJrnDiffAll(base, now, &d, 0) != 1 || !d.empty()) Fail("t1047g: two packs of one kind swapped (or rearranged) invented asks inside each");
+        now.clear(); now.push_back(Mk::Pack(1, "c"));   /* the pack holding e taken whole, the other moved to its cell */
+        if (BoxJrnDiffAll(base, now, &d, 0) != 1 || d.size() != 1 || d[0].dir != kBjTake || d[0].inPack != 0 || d[0].row.bag.empty() || d[0].row.bag[0].baseSid != "e")
+            Fail("t1047g: a pack taken whole beside a moved pack of its kind is not that pack's take");
+        /* the owner took the pack holding c; the other game took that same pack meanwhile: the record holds only the pack with e */
+        now.clear(); now.push_back(Mk::Pack(1, "e"));
+        if (BoxJrnDiffAll(base, now, &d, 0) != 1 || d.size() != 1 || d[0].row.bag[0].baseSid != "c") Fail("t1047g: the whole-pack take's change");
+        std::vector<cooppar::ParityItem> record; record.push_back(Mk::Pack(1, "e"));
+        if (BoxJrnMergeOnto(record, d, &merged, &undo, &putAt) != 1 || merged.size() != 1 || merged[0].bag[0].baseSid != "e" || undo.size() != 1)
+            Fail("t1047g: a whole-pack take removed a different pack of its kind on the lay again");
+        record.clear(); record.push_back(Mk::Pack(1, "e")); record.push_back(Mk::Pack(4, "c"));   /* the pack moved by the other game: still found */
+        if (BoxJrnMergeOnto(record, d, &merged, &undo, &putAt) != 1 || merged.size() != 1 || merged[0].bag[0].baseSid != "e" || !undo.empty())
+            Fail("t1047g: a whole-pack take did not find its pack moved to another cell");
+    }
+    {   /* THE OWNER BACK AS THE WRITER LAYS ITS OFFLINE CHANGE AGAIN ON TOP OF THE NEWER RECORD: only a real conflict is undone */
+        struct Mk { static cooppar::ParityItem It(const char* sid, int x, int y, int q) { cooppar::ParityItem p; p.section = "main"; p.x = x; p.y = y; p.quantity = q; p.baseSid = sid; return p; }
+                    static int Qty(const std::vector<cooppar::ParityItem>& v, const char* sid) { int n = 0; for (size_t i = 0; i < v.size(); ++i) if (v[i].baseSid == sid) n += v[i].quantity; return n; } };
+        std::vector<cooppar::ParityItem> base, latest, record, merged;
+        base.push_back(Mk::It("a", 0, 0, 5)); base.push_back(Mk::It("b", 1, 0, 1));
+        latest = base; latest[0].quantity = 2;   /* offline: the owner took 3 of a */
+        record = base; record.push_back(Mk::It("z", 4, 0, 1));   /* meanwhile the other game put z in */
+        std::vector<BoxJrnDelta> d, undo;
+        std::vector<int> putAt;
+        if (BoxJrnDiffAll(base, latest, &d, 0) != 1 || d.size() != 1) Fail("t1047g: the offline take's change");
+        if (BoxJrnMergeOnto(record, d, &merged, &undo, &putAt) != 1 || !undo.empty() || Mk::Qty(merged, "a") != 2 || Mk::Qty(merged, "z") != 1 || Mk::Qty(merged, "b") != 1)
+            Fail("t1047g: an offline take with no conflict was not kept (the box does not show the take, or the other game's put was lost)");
+        record = base; record[0].quantity = 1;   /* the other game took 4 of a: only 1 is left for the owner's take of 3 */
+        if (BoxJrnMergeOnto(record, d, &merged, &undo, &putAt) != 1 || undo.size() != 1 || undo[0].dir != kBjTake || undo[0].quantity != 2 || Mk::Qty(merged, "a") != 0)
+            Fail("t1047g: an offline take whose units the other game took did not undo exactly the missing units");
+        latest = base; latest.push_back(Mk::It("p", 2, 2, 1));   /* offline: the owner put p in */
+        if (BoxJrnDiffAll(base, latest, &d, 0) != 1 || d.size() != 1 || BoxJrnMergeOnto(base, d, &merged, &undo, &putAt) != 1 || !undo.empty()
+            || Mk::Qty(merged, "p") != 1 || putAt[0] < 0 || merged[putAt[0]].baseSid != "p")
+            Fail("t1047g: an offline put is not in the box");
+        /* the put's place refused at the lay (a full box): back on the character - the ending of a put undone */
+        if (BoxJrnEnding(d[0].dir, kBjaUnsent) != kBjDoRemake) Fail("t1047g: a put with a full box does not go back on the character");
+        /* inside a pack: a take out of it and a put into a cell the other game filled */
+        coopbag::BagRow r; r.section = "backpack_content"; r.baseSid = "c"; r.qty = 3;
+        base.clear(); base.push_back(Mk::It("pack", 0, 0, 1)); base[0].bag.push_back(r);
+        latest = base; latest[0].bag[0].qty = 1; coopbag::BagRow f = r; f.baseSid = "f"; f.x = 1; f.qty = 1; latest[0].bag.push_back(f);
+        record = base; coopbag::BagRow g = r; g.baseSid = "g"; g.x = 1; g.qty = 1; record[0].bag.push_back(g);
+        if (BoxJrnDiffAll(base, latest, &d, 0) != 1 || d.size() != 2) Fail("t1047g: the pack's offline change");
+        if (BoxJrnMergeOnto(record, d, &merged, &undo, &putAt) != 1 || undo.size() != 1 || undo[0].dir != kBjPut || undo[0].row.baseSid != "f"
+            || merged.size() != 1 || merged[0].bag.size() != 2 || merged[0].bag[0].qty != 1 || merged[0].bag[1].baseSid != "g")
+            Fail("t1047g: a pack's offline take was not kept, or a put into a cell now taken was not undone");
+    }
+    /* the game that takes the writer role lays a newer stored record first */
+    if (BoxRoleTakeApply(0, 1, 5u, 1, 4u) != 1 || BoxRoleTakeApply(1, 1, 5u, 1, 4u) != 0 || BoxRoleTakeApply(0, 1, 4u, 1, 4u) != 0 || BoxRoleTakeApply(0, 0, 5u, 1, 4u) != 0)
+        Fail("t1047g: the role taken over a newer stored record does not lay it first");
+    /* the ending of each answer - never lost, never doubled */
+    if (BoxJrnEnding(kBjTake, kBjaAccept) != kBjDoPlacedOk) Fail("t1047g: an accepted take did not keep the character's copy and free the writer's");
+    if (BoxJrnEnding(kBjTake, kBjaRefuse) != kBjDoRemoveChar || BoxJrnEnding(kBjTake, kBjaUnsent) != kBjDoRemoveChar)
+        Fail("t1047g: a refused or unsent take did not remove the character's copy");
+    if (BoxJrnEnding(kBjTake, kBjaTimeout) != (kBjDoRemoveChar | kBjDoPlacedNo)) Fail("t1047g: a timed-out take did not remove the character's copy and tell the writer PLACED no");
+    if (BoxJrnEnding(kBjTake, kBjaLateYes) != kBjDoPlacedNo) Fail("t1047g: a late yes to a take did not have the writer put its item back");
+    if (BoxJrnEnding(kBjTake, kBjaLateNo) != kBjDoNothing || BoxJrnEnding(kBjPut, kBjaLateNo) != kBjDoNothing) Fail("t1047g: a late no changed something");
+    if (BoxJrnEnding(kBjPut, kBjaAccept) != kBjDoNothing) Fail("t1047g: an accepted put changed the character");
+    if (BoxJrnEnding(kBjPut, kBjaRefuse) != kBjDoRemake || BoxJrnEnding(kBjPut, kBjaUnsent) != kBjDoRemake) Fail("t1047g: a refused or unsent put did not make the item again");
+    if (BoxJrnEnding(kBjPut, kBjaTimeout) != (kBjDoRemake | kBjDoRevoke)) Fail("t1047g: a timed-out put did not make the item again and revoke the writer's copy");
+    if (BoxJrnEnding(kBjPut, kBjaLateYes) != kBjDoRevoke) Fail("t1047g: a late yes to a put did not revoke the writer's copy");
+    if (BoxJrnEnding(7, kBjaAccept) != kBjDoNothing) Fail("t1047g: an unknown direction did something");
+    {   /* ONE COPY AFTER EVERY ENDING. The writer is modelled by what it did with the ask (served it or not, then what PLACED / REVOKE do
+           to it), the character by the ending's act; the count is never read from the ending's own table. A take: the unit is on this
+           game's character; the writer that serves removes it from its box into its escrow (PLACED ok destroys it, PLACED no or its own
+           expiry puts it back). A put: the unit is on neither; the writer that serves builds it in its box (REVOKE within its 20 s row
+           removes it). */
+        for (int dir = kBjTake; dir <= kBjPut; ++dir)
+            for (int ans = kBjaAccept; ans <= kBjaUnsent; ++ans)
+                for (int served = 0; served <= 1; ++served)
+                    for (int late = 0; late <= 1; ++late)
+                    {
+                        if (ans == kBjaLateYes || ans == kBjaLateNo) continue;
+                        if ((ans == kBjaAccept && served == 0) || ((ans == kBjaRefuse || ans == kBjaUnsent) && served == 1)) continue;   /* a yes is a serve, a no or unsent is not */
+                        if (late != 0 && (ans != kBjaTimeout || served != 0)) continue;   /* a late yes: the writer served after the timeout */
+                        int charHas = (dir == kBjTake) ? 1 : 0, boxHas = (dir == kBjTake) ? 1 : 0, escrow = 0;
+                        int srv = served;
+                        if (srv != 0) { if (dir == kBjTake) { boxHas = 0; escrow = 1; } else boxHas = 1; }
+                        int act = BoxJrnEnding(dir, ans);
+                        for (int step = 0; step < 2; ++step)
+                        {
+                            if ((act & kBjDoRemoveChar) != 0) charHas = 0;
+                            if ((act & kBjDoRemake) != 0) charHas = 1;
+                            if ((act & kBjDoPlacedOk) != 0 && escrow != 0) escrow = 0;
+                            if ((act & kBjDoPlacedNo) != 0 && escrow != 0) { escrow = 0; boxHas = 1; }
+                            if ((act & kBjDoRevoke) != 0 && dir == kBjPut && srv != 0) boxHas = 0;
+                            if (step == 0 && late != 0)
+                            {   /* the writer serves after the timeout and its yes arrives late */
+                                if (dir == kBjTake) { boxHas = 0; escrow = 1; } else boxHas = 1;
+                                srv = 1;
+                                act = BoxJrnEnding(dir, kBjaLateYes);
+                                continue;
+                            }
+                            break;
+                        }
+                        if (escrow != 0) { escrow = 0; boxHas = 1; }   /* the writer's own escrow expiry puts an unanswered take back */
+                        if (charHas + boxHas != 1)
+                            Fail("t1047g: dir " + I(dir) + " answer " + I(ans) + " served " + I(served) + " late " + I(late) + " ends with " + I(charHas + boxHas) + " copies");
+                    }
+    }
+    /* the retired road is gone from the source (and its tests with it) */
+    {
+        const std::string box = T313ReadFile("../common/boxrec.h"), items = T313ReadFile("../coop-plugin/items.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
+        if (box.empty() || items.empty() || server.empty()) Fail("t1047g: a source file could not be read");
+        const char* const gone[] = { "BoxFlushAccept", "BoxFlushDue", "BoxFlushChange", "BoxFlushMerge", "BoxRoleWait", "kBlvAfterRequestMs", "kBrFlagFlush",
+                                     "BoxRecFlushOne", "BoxChainRestoreAt", "BoxOwnRestore", "flushUsed", "baseItems", "kBfcFlush", "stored.flushed",
+                                     "BoxJrnStamp", "BoxJrnAfterRefuse", "BoxJrnCovered", "BoxJrnRoom", "kBjCap", "BoxJrnEntry", "BoxJrnNote(", "BoxTakenNoteDue(why)",
+                                     "g_bjSwap", "BoxJrnSwapNote", "BoxJrnHintHoldsPack", "BoxJrnSwapEnding", "BoxJrnPackSwap", "packSwap" };
+        for (size_t i = 0; i < sizeof(gone) / sizeof(gone[0]); ++i)
+            if (box.find(gone[i]) != std::string::npos || items.find(gone[i]) != std::string::npos || server.find(gone[i]) != std::string::npos)
+                Fail(std::string("t1047g: a retired name is still in the source: ") + gone[i]);
+        if (server.find("MSG_BOX_TAKEN = 80") == std::string::npos || server.find("BoxLanded(id, j->payload, peer)") == std::string::npos
+            || server.find("SendMsg(writer, (unsigned char)MSG_BOX_TAKEN") == std::string::npos || server.find("if (why == coopbrec::kBrRepeat) BoxTakenNote(") == std::string::npos)
+            Fail("t1047g: the world server does not send BOX_TAKEN once the write is on disk (or at once for the same bytes)");
+        if (server.find("MSG_BOX_ASK = 81, MSG_BOX_ASKED = 82") == std::string::npos || server.find("else if (type == MSG_BOX_ASK) OnBoxAsk(peer, payload);") == std::string::npos
+            || server.find("coopbrec::BoxSlotGenNote(&m, h.writerSlot, h.generation, seed);") == std::string::npos || server.find("BoxSlotGensWrite(id, m);") == std::string::npos)
+            Fail("t1047g: the world server does not keep each writer's stored writes or answer BOX_ASK");
+        {
+            const size_t oa = server.find("void OnBoxAsk("), of = server.find("if (!WriterFlushWithin(kBoxAskFlushMs))", oa), oe = server.find("SendMsg(peer, (unsigned char)MSG_BOX_ASKED", oa);
+            if (oa == std::string::npos || of == std::string::npos || oe == std::string::npos || of > oe) Fail("t1047g: BOX_ASKED is answered before the queued writes land");
+        }
+        {
+            const std::string plugin = T313ReadFile("../coop-plugin/store.cpp");
+            if (plugin.find("coop::BoxAskedArrive(m.payload)") == std::string::npos || plugin.find("m.type != (net::MsgType)coopbrec::kMsgBoxAsked &&") == std::string::npos)
+                Fail("t1047g: the game does not take BOX_ASKED");
+            size_t n = 0, at = 0;
+            while ((at = plugin.find("coop::ItemsBoxJrnBeforeSave(OnMainThread() ? 1 : 0);", at)) != std::string::npos) { ++n; ++at; }
+            if (n != 2) Fail("t1047g: a parked box change is not resolved before both save pre-hooks (" + I((int)n) + " of 2)");
+            const size_t sg = plugin.find("void* detour_saveGame("), sn = plugin.find("coop::ItemsBoxOwedNote(OnMainThread() ? 1 : 0);", sg), so = plugin.find("orig_saveGame(self, a, b);", sg);
+            const size_t sf = plugin.find("    if (OnMainThread()) BoxOwedCopyFollow();", sg);
+            if (sg == std::string::npos || sn == std::string::npos || so == std::string::npos || sn > so || sf == std::string::npos || sf < sn || sf > so
+                || plugin.find("g_bjOwedPend[slot] = coop::ItemsBoxOwedAsk(&g_bjOwedN0[slot]);") == std::string::npos
+                || plugin.find("coop::ItemsBoxOwedClaim(g_bjOwedN0[i], &ob);") == std::string::npos || plugin.find("if (BoxOwedWrite(dir, ob) != 0)") == std::string::npos
+                || plugin.find("                BoxOwedCopyDrop(g_bjOwedCopyAt[i]);") == std::string::npos
+                || plugin.find("g_bjOwedCopyAt[slot] = BoxOwedCopyPath(std::string(fbuf), std::string(nbuf));") == std::string::npos
+                || plugin.find("BoxOwedCopyWrite(g_bjOwedCopyAt[slot], g_bjOwedReqFt[slot], g_bjOwedPend[slot]);") == std::string::npos
+                || plugin.find("pp = BoxOwedCopyPath(std::string(fbuf), std::string(nbuf));") == std::string::npos
+                || plugin.find("const std::string low = coopbrec::BoxOwedCopyKey(dir);") == std::string::npos
+                || plugin.find("const int use = coopbrec::BoxOwedChoose(fft, sft, copyHave, reqFt);") == std::string::npos
+                || plugin.find("    BoxOwedLoad(folderStr, nameStr);") == std::string::npos || plugin.find("coop::ItemsBoxOwedLoadEnded(genAtPrepare); }") == std::string::npos)
+                Fail("t1047g: the box changes a save holds are not written beside it at its landing and read at its load");
+        }
+        {
+            size_t n = 0, at = 0;
+            while ((at = items.find("BoxJrnRebase(id, w, items, kh.generation, ", at)) != std::string::npos) { ++n; ++at; }
+            if (n != 4) Fail("t1047g: not every apply of a stored record is the journal's base (" + I((int)n) + " of 4)");
+            const size_t q = items.find("    BoxJrnQueueTick();"), ap = items.find("    BoxApplyScan((DWORD)now);");
+            if (q == std::string::npos || ap == std::string::npos || q > ap) Fail("t1047g: the queued asks do not go before the apply scan");
+        }
+        if (items.find("coopbrec::BoxJrnLinkLost(&w.jrn);") == std::string::npos || items.find("BoxJrnPermRefused(id, w, reason);") == std::string::npos
+            || items.find("BoxJrnRebase(id, w, items, kh.generation, (merging > 0) ? 2 : 1);") == std::string::npos || items.find("d.quantity = left;   /* what the row still owes */") == std::string::npos
+            || items.find("BoxJrnTreeFind(inv, cf, left, 0, &ex, &lg);") == std::string::npos || items.find("(void)coopbrec::BoxJrnAskSent(&w.jrn);") == std::string::npos
+            || items.find("BoxJrnHintsStored(w, at);") == std::string::npos || items.find("if (rq.dir == 0) rq.ownerBag.sid = d.row.baseSid;") == std::string::npos
+            || items.find("w.jrnParked = 1; w.jrnPark = w.jrn;") == std::string::npos || items.find("the change goes to it once no write waits") == std::string::npos
+            || items.find("coopbrec::DecodeBoxAsked(payload, &id, &gen, &pending)") == std::string::npos
+            || items.find("if (act == coopbrec::kRbReapply && BoxJrnReapply(id, w, d, hintsWere, gen, ledWas) != 1)") == std::string::npos
+            || items.find("const int gate = BoxSwapGateHere(b, inv, lk, key, items.size(), &win, &shop);") == std::string::npos
+            || items.find("const int step = coopbrec::BoxJrnReapplyStep(fill, inv != 0 ? 1 : 0, readable, gate, 1);") == std::string::npos
+            || items.find("if (coopbrec::BoxJrnReapplyStep(0, 1, 1, coopbrec::kSwGo, ran) == coopbrec::kRlUndo) { ++g_bjReapplyFailed; return 0; }") == std::string::npos
+            || items.find("if (coopbrec::BoxJrnParkSaveUndo(1, coopbrec::BoxJrnWaiting(w.jrnPark), act) == 0) continue;") == std::string::npos
+            || items.find("const int owed = BoxOwedAsked(id, gen, pending);") == std::string::npos
+            || items.find("if (coopbrec::BoxOwedFromJournal(w.jrn, w.jrnLatestHave, w.jrnLatest, pend, &r) != 0)") == std::string::npos
+            || items.find("if (sealNow != 0) { BoxSealKeep(w, pend, w.jrnLatest); w.chgPend = 0ULL; }") == std::string::npos
+            || items.find("unsigned long long pend = (w.jrnLatestHave != 0) ? coopbrec::BoxSealMatch(w.seals, w.jrnLatest, keptLed, kl, StoreMySlot(), w.ledAdd) : 0ULL;") == std::string::npos
+            || items.find("(void)coopbrec::BoxOwedByPart(left, &how, rec);") == std::string::npos
+            || items.find("if (w.jrnParkPend != 0ULL) BoxSealKeep(w, w.jrnParkPend, w.jrnParkLatest);") == std::string::npos
+            || items.find("if (coopbrec::BoxOwedResolve(l.r, ledHave, led, (now - l.takenAt >= kBjOwedAskGraceMs) ? 1 : 0, &left, &how) == 0) return 0;") == std::string::npos
+            || items.find("BoxOwedSettleUnits") != std::string::npos || box.find("BoxOwedUnitsAt") != std::string::npos || box.find("BoxOwedSettleUnits") != std::string::npos
+            || items.find("ItLootOwnChars(known != 0 ? l.r.pos : 0") != std::string::npos || items.find("    BoxOwedTick(now, welcomed, &askIds);") == std::string::npos
+            || items.find("const int act = coopbrec::BoxOwedAct(left[k].dir, how[k]);") == std::string::npos
+            || items.find("const int r = BoxJrnReapply(id, w, d, w.jrnParkHints, w.jrnParkGen, w.jrnParkLed);") == std::string::npos
+            || items.find("rq.ownerBag.packSid = d.packSid;") == std::string::npos || items.find("++g_bagReqWrongPack;") == std::string::npos
+            || server.find("const std::map<std::string, std::map<int, unsigned int> >::const_iterator mg = g_boxSlotGens.find(ids[i]);") == std::string::npos
+            || server.find("EncodeBoxAsked(ids[i], g, pending)") == std::string::npos || server.find("Sanitize(key) + \".gens\")") == std::string::npos
+            || server.find("if (coopbrec::IsBoxRecId(wid)) BoxSlotGensForget(wid);") == std::string::npos || server.find("if (!WriterFlushWithin(kBoxAskFlushMs))") == std::string::npos
+            || items.find("coopbrec::BoxRoleTakeApply(roleWas,") == std::string::npos || items.find("(void)coopbrec::BoxJrnWrote(&w.jrn, h.generation, items,") == std::string::npos)
+            Fail("t1047g: the journal's link loss, permanent refusal, role take or write is not wired");
+        if (items.find("BoxJrnAnswer(cf.id, cf.ok != 0 ? 1 : 0)") == std::string::npos || items.find("BoxJrnAnswer(lapsed.id, -1)") == std::string::npos)
+            Fail("t1047g: a journalled ask's answer or timeout does not reach its ending");
+        {   /* THE BOX'S LEDGER wired: each change's id reserved at its mark, each write carrying its ledger, a served ask recorded and put back,
+               the ask's id on the wire, an undo decided at the save done as it is */
+            const std::string sess = T313ReadFile("../coop-plugin/net/session.cpp");
+            if (items.find("if (w.chgPend == 0ULL) w.chgPend = BoxChangeIdNew();   /* the id the write of this change will carry") == std::string::npos
+                || items.find("BoxLedgerWriteFor(id, w, gen, 0, 1, w.snapItems, &chg, &led);") == std::string::npos
+                || items.find("coopbrec::BoxIsPlayerRec(h.kind, h.ownerSlot), items, &chg, &led);") == std::string::npos
+                || items.find("coopbrec::BoxLedgerPrune(&w.ledAdd, &w.ledDel, kept, waiting);") == std::string::npos
+                || items.find("if (playerBox != 0 && my >= 0) coopbrec::BoxSealCarry(&w.seals, items, keptHave, kept, my, &w.ledAdd);") == std::string::npos
+                || items.find("if (ItApplying()) { ::InterlockedIncrement64(&g_echoSkipped); ItGuardNoteSec(sec); return; }") == std::string::npos
+                || items.find("if (ItApplying()) { ::InterlockedIncrement64(&g_echoSkipped); ItGuardNoteSec(sec); return r; }") == std::string::npos
+                || items.find("if (ItApplying()) { ::InterlockedIncrement64(&g_echoSkipped); ItGuardNoteSec(section); return; }") == std::string::npos
+                || items.find("    BoxJrnGuardReread();   /* this game's own put-backs into a box it journals - with the link down too */") == std::string::npos
+                || items.find("    BoxJrnReadAgainAll(1);   /* a put-back not read yet is never a row */") == std::string::npos
+                || items.find("    if (BoxRecSnapTake(id, w, w.key, whileBlocked) == 0) return 0;") == std::string::npos
+                || items.find("|| (whileBlocked == 0 && EngineWritesBlocked())) return 0;") == std::string::npos
+                || items.find("    BoxSealForget(w);") == std::string::npos
+                || items.find("if (!coopbrec::EncodeBoxRecord(&bytes, h, w.snapItems, &led))") == std::string::npos
+                || items.find("if (!coopbrec::EncodeBoxRecord(&bytes, h, items, &led))") == std::string::npos
+                || items.find("BoxRecKeepOwn(id, w, h, items, led, chg);") == std::string::npos || items.find("&k.h, &k.items, &decodeWhy, &k.led);") == std::string::npos
+                || items.find("s.led = w.ownChain[ci].led;") == std::string::npos
+                || items.find("BoxLedgerServe(r.ownerBoxKey, r.askSlot, r.askId, r.askCarry, 1);") == std::string::npos
+                || items.find("BoxLedgerServe(askKey, askSlot, askId, std::vector<coopbrec::BoxLedgerEntry>(), 0);") == std::string::npos
+                || items.find("BoxLedgerServe(std::string(p->boxKey, strnlen(p->boxKey, kBoxKeyCap)), p->askSlot, p->askId, std::vector<coopbrec::BoxLedgerEntry>(), 0);") == std::string::npos
+                || items.find("rq.askId = d.askId; rq.askSlot = StoreMySlot(); rq.askCarry = q.carry;") == std::string::npos
+                || items.find("BoxAskIdsFor(askIdOf, &d);") == std::string::npos || items.find("BoxAskIdsFor(&w.askIdOf, &r.ifNone);") == std::string::npos
+                || items.find("r.decided = 1;") == std::string::npos || items.find("BoxJrnLedDrop(w, led);") == std::string::npos
+                || items.find("coopbrec::BoxLedgerEntryDoubt(&w.ledAdd, led);") == std::string::npos)
+                Fail("t1047g: the box's ledger is not wired through the journal, the writes and the served asks");
+            if (sess.empty() || sess.find("coopbrec::PutAskTail(&b, at);") == std::string::npos
+                || sess.find("!coopbrec::TakeAskTail(&m0.payload[0], m0.payload.size(), &ask, &askLen)") == std::string::npos
+                || sess.find("r.askId = ask.askId; r.askSlot = ask.slot; r.askCarry = ask.carry;") == std::string::npos
+                || sess.find("const unsigned int kProtocolVersion = 180;") == std::string::npos)
+                Fail("t1047g: the item request does not carry the ask's id (ASK1, game protocol 180)");
+            const size_t pt = sess.find("coopbrec::PutAskTail(&b, at);"), ph = sess.find("coophold::PutHoldTail(&b, ht);");
+            if (pt == std::string::npos || ph == std::string::npos || pt < ph) Fail("t1047g: the ASK1 trailer is not the last block of the item request");
+        }
+        {   /* every echo exit of the item hooks notes the building it changed; the box tick reads them again before its link gate */
+            size_t n = 0, at = 0;
+            while ((at = items.find("::InterlockedIncrement64(&g_echoSkipped); ItGuardNote", at)) != std::string::npos) { ++n; ++at; }
+            const size_t rr = items.find("    BoxJrnGuardReread();   /* this game's own put-backs"), lg = items.find("    if (!StoreRelayLinked() || StoreAreaDoneSec(kStoreAreaAny");
+            if (n != 6 || rr == std::string::npos || lg == std::string::npos || rr > lg)
+                Fail("t1047g: a guarded write into a box is not read again into its journal before the box tick's gates (" + I((int)n) + " of 6 exits)");
+        }
+        {   /* the counts written straight into a stack (the split's undo, the take-one undo, the held path's shown units, the merged give's
+               undo, an applied quantity) note their inventory beside the engine's markChanged; the box is read again before its change can
+               leave: the hand-over decision, a refusal that hands it over, both applies */
+            size_t n = 0, at = 0;
+            while ((at = items.find("markChanged(); ItGuardNoteInv(", at)) != std::string::npos) { ++n; ++at; }
+            size_t n2 = 0;
+            at = 0;
+            while ((at = items.find("if (inv != 0) { inv->markChanged(); ItGuardNoteInv(inv); inv->redrawPanel(); }", at)) != std::string::npos) { ++n2; ++at; }
+            const size_t sp = items.find("if (srcInv != 0) { srcInv->markChanged(); ItGuardNoteInv(srcInv); srcInv->redrawPanel(); }");
+            if (n != 8 || n2 != 2 || sp == std::string::npos)
+                Fail("t1047g: a count written straight into a box's stack under the guard is not noted for its journal (" + I((int)n) + " of 8)");
+            const size_t pr = items.find("(void)BoxJrnReadAgain(id, w, 0);   /* the box as it is, before its change goes as asks */");
+            const size_t ph = (pr == std::string::npos) ? std::string::npos : items.find("BoxJrnHandOver(id, w);", pr);
+            const size_t tr = items.find("(void)BoxJrnReadAgain(it->first, w, 0);   /* the box as it is, before its change can go to another writer */");
+            const size_t ta = (tr == std::string::npos) ? std::string::npos : items.find("if (coopbrec::BoxJrnAskDue(", tr);
+            size_t na = 0;
+            at = 0;
+            while ((at = items.find("BoxJrnReadBeforeLay(id, w, b);   /* the box as it is, before the record goes into it", at)) != std::string::npos) { ++na; ++at; }
+            if (pr == std::string::npos || ph == std::string::npos || ph - pr > 1500 || tr == std::string::npos || ta == std::string::npos || ta - tr > 800 || na != 2)
+                Fail("t1047g: the box is not read again before its change goes to another writer, by refusal or hand-over, or before a record goes into it");
+            /* the read again judged by the box (held change, loaded here, no ask of this game shown), not by the role; a noted box that
+               cannot be read again, and a noted park, made unsure; an unsure change's takes left on the character at every road out */
+            size_t nu = 0;
+            at = 0;
+            while ((at = items.find("coopbrec::BoxJrnUnsureParts(&d)", at)) != std::string::npos) { ++nu; ++at; }
+            if (items.find("BoxJrnReadAgainDue(w.jrnLatestHave, ItBoxResolve(w.key.c_str()) != 0 ? 1 : 0, w.jrnAskMix)") == std::string::npos
+                || items.find("if (asWriter == 0) w.jrnAskMix = 1;") == std::string::npos
+                || items.find("        BoxJrnNotedRead(it->first, w, 1, 0);") == std::string::npos
+                || items.find("if (coopbrec::BoxJrnUnsureAfterRead(noted, w.jrnLatestHave, ok) != 0 && w.jrnUnsure == 0) { w.jrnUnsure = 1;") == std::string::npos
+                || items.find("if (pb != 0) coopbrec::BoxGuardForget(&g_itGuard, pb);") == std::string::npos
+                || items.find("BoxJrnCarryOf(led), w.jrnUnsure);") == std::string::npos || items.find("BoxJrnCarryOf(w.jrnParkLed), w.jrnParkUnsure);") == std::string::npos
+                || nu != 4)
+                Fail("t1047g: a guarded write that noted a box after its last read does not make its change unsure, or the read again is judged by the role");
+            /* an unsure change's rows beside a save drop its takes (the parked change's and the journal's); a stored record laid into its
+               box is the mod's own write, not noted (all three lays); the notes go with the world */
+            size_t nl = 0;
+            at = 0;
+            while ((at = items.find("= BoxRecLay(inv, ", at)) != std::string::npos) { ++nl; ++at; }
+            if (items.find("if (w.jrnParkUnsure != 0) g_bjUnsureDropped += coopbrec::BoxOwedRowUnsure(&r);") == std::string::npos
+                || items.find("if (w.jrnUnsure != 0) g_bjUnsureDropped += coopbrec::BoxOwedRowUnsure(&r);") == std::string::npos
+                || items.find("if (g_itGuardQuiet > 0 || ItOnMainThread() == 0 || !ItPlaus(inv)) return;") == std::string::npos || nl != 3
+                || items.find("coopbrec::BoxGuardClear(&g_itGuard);   /* the notes name this world's buildings") == std::string::npos)
+                Fail("t1047g: an unsure change's save rows keep its takes, the mod's own lay noted, or the notes kept past the world");
+            /* the save handles the pending notes first (its rows and its park undo); the lay's quiet count lowered on every exit */
+            const size_t sv = items.find("void ItemsBoxJrnBeforeSave(int onMainThread)");
+            const size_t sr = (sv == std::string::npos) ? std::string::npos : items.find("BoxJrnReadAgainAll(1);   /* the pending notes first", sv);
+            if (sv == std::string::npos || sr == std::string::npos || sr - sv > 300
+                || items.find("BoxJrnNotedRead(it->first, w, coopbrec::BoxJrnSaveNoted(any, canResolve, has), whileBlocked);") == std::string::npos
+                || items.find("    __finally { --g_itGuardQuiet; }") == std::string::npos)
+                Fail("t1047g: a save builds its rows or undoes a park before the pending notes, or the lay's quiet count can stay raised");
+        }
+        {   /* the TEST-ONLY one-frame lever: box steps on one box, then the worldaway cut, in one call - every step read and the cut checked
+               before anything runs, the cut after the last step */
+            const std::string cmd = T313ReadFile("../coop-plugin/command_channel.cpp"), st = T313ReadFile("../coop-plugin/store.cpp");
+            const size_t cv = cmd.find("else if (verb == \"boxburst\")"), cr = cmd.find("const std::string refused = coop::StoreWorldAwayRefusal((long long)sec);"),
+                         cs = cmd.find("coop::ItemTake(\"box:\" + key, what[i], n1[i], n2[i], n3[i]) : coop::BoxTest(key, what[i], n1[i]);"),
+                         cc = cmd.find("const std::string cut = coop::StoreWorldAwayLever(secArg.str());");
+            if (cv == std::string::npos || cr == std::string::npos || cs == std::string::npos || cc == std::string::npos || !(cr < cs && cs < cc)
+                || cmd.find("WriteStatus(BoxBurstLever(Trim(rest)));") == std::string::npos
+                || st.find("const std::string refused = StoreWorldAwayRefusal(sec);") == std::string::npos)
+                Fail("t1047g: the boxburst lever does not run its steps and then the worldaway cut in one call, checked first");
+        }
+    }
+}
 void t_t823_box_record()
 {
     using namespace coopbrec;
-    if (kProtocol != 108u || kMsgBoxRefuse != 72u) Fail("T-823: box records are not world-server protocol 108 / BOX_REFUSE 72");
+    if (kProtocol != 121u || kMsgBoxRefuse != 72u) Fail("T-823: box records are not world-server protocol 121 / BOX_REFUSE 72");
 
     /* the id: the key without its height, the record name always in its hashed form */
     const std::string key = "12-box.mod@3,41@1003,-205,100";
     const std::string hs = T823Hash("12-box.mod");
     const std::string id = MakeBoxRecId(key);
+    const std::string pid = MakeBoxRecIdFor(key, 1);   /* a player's box: its id carries the height */
     if (hs.size() != 9 || id != "box.3.41." + hs + ".1003.-205") Fail("T-823: MakeBoxRecId spelling: " + id);
     if (MakeBoxRecId("12-box.mod@3,41@1003,-205,999") != id || MakeBoxRecId("12-box.mod@3,41@1003,-205") != id) Fail("T-823: the height changed the id");
     if (MakeBoxRecId("12-box.mod@3,41@01003,-205,100") != id) Fail("T-823: another spelling of the same key gave another id");
@@ -50815,7 +54830,7 @@ void t_t823_box_record()
     { std::vector<char> t = seed; const int w = -1; std::memcpy(&t[12], &w, 4); if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: a writer slot below 0 was not refused"); }
     { std::vector<char> t = seed; const int w = kBrMaxSlot + 1; std::memcpy(&t[12], &w, 4); if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: a writer slot above 65535 was not refused"); }
     { std::vector<char> t = seed; const int w = kBrMaxSlot + 1; std::memcpy(&t[17], &w, 4); if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: an owner slot above 65535 was not refused"); }
-    { std::vector<char> t = seed; t[25 + kl] = 2; if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: an unknown flag was not refused"); }
+    { std::vector<char> t = seed; t[25 + kl + 1] = 1; if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: an unknown flag was not refused"); }   /* bit 8: no flag uses it */
     { std::vector<char> t = seed; t[25 + 10] = 'x'; if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: a key that is not a position key was not refused"); }
     { std::vector<char> t = seed; const unsigned int z = 0; std::memcpy(&t[21], &z, 4); if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrBadHeader) Fail("T-823: an empty key was not refused"); }
     {   /* a key length over 255 bytes */
@@ -50916,31 +54931,36 @@ void t_t823_box_record()
     if (BoxJudgeWrite(id, &jseed[0], jseed.size() - 1, 1, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseUnreadable) Fail("T-823: the judge took a cut record");
     { std::vector<char> t = jseed; t[body + 2 + kl] ^= 1; if (BoxJudgeWrite(id, &t[0], t.size(), 1, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseUnreadable) Fail("T-823: the judge took a record whose digest is not its items'"); }
     if (BoxJudgeWrite(id, &jseed[0], jseed.size(), 1, 5, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took a seed from a game that is not the writer");
-    if (BoxJudgeWrite(id, &oseed[0], oseed.size(), 2, 1, l2, 0, 0, -1, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the loaded owner's seed");
-    if (BoxJudgeWrite(id, &oseed[0], oseed.size(), 2, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took a non-holder's seed naming itself the owner without the area loaded");
-    if (BoxJudgeWrite(id, &hoseed[0], hoseed.size(), 1, 1, l2, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took the holder's seed while the named owner has the area loaded");
-    if (BoxJudgeWrite(id, &hoseed[0], hoseed.size(), 1, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the holder's seed naming an owner who is away");
+    if (BoxJudgeWrite(pid, &oseed[0], oseed.size(), 2, 1, l2, 0, 0, -1, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the loaded owner's seed");
+    if (BoxJudgeWrite(pid, &oseed[0], oseed.size(), 2, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took a non-holder's seed naming itself the owner without the area loaded");
+    if (BoxJudgeWrite(pid, &hoseed[0], hoseed.size(), 1, 1, l2, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took the holder's seed while the named owner has the area loaded");
+    if (BoxJudgeWrite(pid, &hoseed[0], hoseed.size(), 1, 1, none, 0, 0, -1, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the holder's seed naming an owner who is away");
     if (BoxJudgeWrite(id, &shopseed[0], shopseed.size(), 2, 1, l2, 0, 0, -1, kBrKindBox, 0, 0) != kBrRefuseOwnerKind) Fail("T-823: the judge took a shop seed naming an owner");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 1, none, 1, 7, 2, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the holder's newer update while the owner is away");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 1, l2, 1, 7, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took the holder's update while the owner's game has the area loaded");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 1, none, 1, 9, 2, kBrKindBox, 0, 0) != kBrRefuseOlder) Fail("T-823: the judge took an older update");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 1, none, 1, 8, 2, kBrKindBox, 0, 0) != kBrRefuseSameGen) Fail("T-823: the judge took an equal generation with other bytes");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 1, none, 1, 8, 2, kBrKindBox, 1, 0) != kBrRepeat) Fail("T-823: the judge did not take the very same bytes as a repeat");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 4, none, 1, 7, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took an update from a game that is not the writer");
-    if (BoxJudgeWrite(id, &oupd[0], oupd.size(), 2, 1, l2, 1, 7, 2, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the loaded owner's update");
-    if (BoxJudgeWrite(id, &upd[0], upd.size(), 1, 1, none, 1, 7, 2, kBrKindShop, 0, 0) != kBrRefuseKindChange) Fail("T-823: the judge took an update changing the box's kind");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 1, none, 1, 7, 2, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the holder's newer update while the owner is away");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 1, l2, 1, 7, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took the holder's update while the owner's game has the area loaded");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 1, none, 1, 9, 2, kBrKindBox, 0, 0) != kBrRefuseOlder) Fail("T-823: the judge took an older update");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 1, none, 1, 8, 2, kBrKindBox, 0, 0) != kBrRefuseSameGen) Fail("T-823: the judge took an equal generation with other bytes");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 1, none, 1, 8, 2, kBrKindBox, 1, 0) != kBrRepeat) Fail("T-823: the judge did not take the very same bytes as a repeat");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 4, none, 1, 7, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took an update from a game that is not the writer");
+    if (BoxJudgeWrite(pid, &oupd[0], oupd.size(), 2, 1, l2, 1, 7, 2, kBrKindBox, 0, 0) != kBrAccept) Fail("T-823: the judge refused the loaded owner's update");
+    if (BoxJudgeWrite(pid, &upd[0], upd.size(), 1, 1, none, 1, 7, 2, kBrKindShop, 0, 0) != kBrRefuseKindChange) Fail("T-823: the judge took an update changing the box's kind");
     {
         std::vector<char> shopUpd; BoxHeader x = hj; x.kind = kBrKindShop; x.flags = 0; x.generation = 8; x.ownerSlot = 2;
         if (!EncodeBoxRecord(&shopUpd, x, items)) Fail("T-823: the shop update was not encoded");
         else if (BoxJudgeWrite(id, &shopUpd[0], shopUpd.size(), 1, 1, none, 1, 7, -1, kBrKindShop, 0, 0) != kBrRefuseOwnerKind) Fail("T-823: the judge took the holder's update giving a shop an owner");
     }
-    if (BoxJudgeWrite(id, &oupd[0], oupd.size(), 2, 1, none, 1, 7, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took the update of an owner without the area loaded");
+    if (BoxJudgeWrite(pid, &oupd[0], oupd.size(), 2, 1, none, 1, 7, 2, kBrKindBox, 0, 0) != kBrRefuseNotWriter) Fail("T-823: the judge took the update of an owner without the area loaded");
     /* BoxJudgeRemove(id, sender, holder, storedOwner, loaded) */
     if (BoxJudgeRemove(id, 1, 1, -1, none) != kBrAccept || BoxJudgeRemove(id, 1, 1, 2, none) != kBrAccept || BoxJudgeRemove(id, 2, 1, 2, l2) != kBrAccept)
         Fail("T-823: the one writer could not remove the box");
-    if (BoxJudgeRemove(id, 1, 1, 2, l2) != kBrRefuseNotWriter) Fail("T-823: the holder removed the box while the owner's game has the area loaded");
-    if (BoxJudgeRemove(id, 2, 1, 2, none) != kBrRefuseNotWriter || BoxJudgeRemove(id, 3, 1, 2, l2) != kBrRefuseNotWriter || BoxJudgeRemove(id, -1, -1, -1, l2) != kBrRefuseNotWriter)
-        Fail("T-823: a game that is not the writer removed the box");
+    /* the box's owner and the area's holder may both remove it: a dismantle queued while the owner's link was down is sent after the
+       writer role moved (the owner is no longer loaded there), and an owner change's removal of the old player record comes from the
+       holder while the old owner's game may still have the area loaded */
+    if (BoxJudgeRemove(id, 1, 1, 2, l2) != kBrAccept) Fail("t1047f: the holder could not remove the old player record while the owner's game has the area loaded");
+    if (BoxJudgeRemove(id, 2, 1, 2, none) != kBrAccept) Fail("t1047f: the owner could not remove its box (a dismantle) without the area loaded");
+    if (BoxJudgeRemove(id, 3, 1, 2, l2) != kBrRefuseNotWriter || BoxJudgeRemove(id, 3, 1, -1, none) != kBrRefuseNotWriter || BoxJudgeRemove(id, -1, -1, -1, l2) != kBrRefuseNotWriter
+        || BoxJudgeRemove(id, 3, -1, 2, none) != kBrRefuseNotWriter)
+        Fail("T-823: a game that is neither the owner nor the holder removed the box");
     if (BoxJudgeRemove("box.3.41", 1, 1, -1, none) != kBrRefuseBadId) Fail("T-823: a removal with a bad id was taken");
 
     /* BOX_REFUSE */
@@ -51114,7 +55134,7 @@ void t_t823c_box_apply()
         || coopown::ParityAskListsBox(coopown::kOwnPeer, 0, -1, -1) != 0)
         Fail("T-823 arrival ask: a player's box written by a game that is not the area's holder, by this game, by nobody or on a lone game is not listed");
     if (coopown::ParityAskBoxClass(coopown::kOwnMe) != coopown::kPaLeave || coopown::ParityAskBoxClass(coopown::kOwnNone) != coopown::kPaTake
-        || coopown::ParityAskBoxClass(coopown::kOwnUnreadable) != coopown::kPaTake || coopown::ParityAskBoxClass(coopown::kOwnPeer) != coopown::kPaByWriter
+        || coopown::ParityAskBoxClass(coopown::kOwnUnreadable) != coopown::kPaTake || coopown::ParityAskBoxClass(coopown::kOwnPeer) != coopown::kPaLeave
         || coopown::ParityAskBoxClass(coopown::kOwnShared) != coopown::kPaByWriter || coopown::ParityAskBoxClass(coopown::kOwnUnknown) != coopown::kPaByWriter)
         Fail("T-823 fold 3: the arrival ask's first cut by owner class (own box out, world box in, another player's to its writer)");
     {   /* the twice-refused writer stood at 7; a newer 9 arrives before its write: it goes in first, then the write is above it */
@@ -51164,7 +55184,7 @@ void t_t823a_box_intake()
     if (BoxKeepArrived(1, 5u, 4u) != 0 || BoxKeepArrived(1, 0xFFFFFFFFu, 0u) != 0) Fail("T-823 A: a lower generation is not kept");
 
     const std::string key = "12-box.mod@3,41@1003,-205,100";
-    const std::string id = MakeBoxRecId(key);
+    const std::string id = MakeBoxRecIdFor(key, 1);   /* the records below are a player's box (owner slot 1): the id carries the height */
     std::vector<cooppar::ParityItem> items;
     items.push_back(T823BoxItem("katana", 0, 0, 1));
     items.push_back(T823BoxItem("bread", 1, 0, 4));
@@ -51208,7 +55228,7 @@ void t_t823a_box_intake()
 void t_t811_base_show()
 {
     using namespace baseshow;
-    if (kMsgShow != 78u || kProtocol != 108u || kProtocol != keptwire::kProtocol || kProtocol != authproof::kProtocol) Fail("T-811: SHOW is not message 78 of world-server protocol 108");
+    if (kMsgShow != 78u || kProtocol != 121u || kProtocol != keptwire::kProtocol || kProtocol != authproof::kProtocol) Fail("T-811: SHOW is not message 78 of world-server protocol 121");
     std::vector<townkeep::TownRow> said;
     townkeep::TownRow a; a.owner = 1; a.name = "Rock Camp"; a.pos[0] = 100.0f; a.pos[1] = 5.0f; a.pos[2] = 200.0f; said.push_back(a);
     townkeep::TownRow b = a; b.owner = 2; b.name = "Hill Fort"; b.pos[0] = -50.0f; said.push_back(b);
@@ -51327,7 +55347,7 @@ void t_t811_base_show()
     if (LeftoverMark(2, 1, 0) != 1 || LeftoverMark(-1, 1, 0) != 0 || LeftoverMark(2, 0, 0) != 0 || LeftoverMark(2, 1, 1) != 0) Fail("LeftoverMark: stand-in, label form, not a kept outpost");
     if (std::string(IconNameOfLevel(0)) != "SmallPlace" || std::string(IconNameOfLevel(1)) != "Village" || std::string(IconNameOfLevel(2)) != "Outpost" || std::string(IconNameOfLevel(3)) != "Town")
         Fail("IconNameOfLevel: not the names 0x48CEE0 writes");
-    std::vector<char> l4(lw); const unsigned four = 4u; std::memcpy(&l4[l4.size() - 4], &four, 4);
+    std::vector<char> l4(lw); const unsigned four = 4u; std::memcpy(&l4[l4.size() - 4 - 28], &four, 4);   /* T-1047 step 5: the id, kind and handle words (28 bytes) follow the level */
     if (Decode(&l4[0], l4.size(), &f, &back) != 0) Fail("SHOW: size level 4 reads off the wire");
     std::vector<char> e4;
     if (Encode(&e4, 0, std::vector<ShowRow>(1, badLv))) Fail("SHOW: size level 4 encodes");
@@ -51400,7 +55420,7 @@ void t_t924_town_copies()
         if (back[i].owner != l[i].owner || !townkeep::HandSame(back[i].hand, l[i].hand) || !townkeep::HandSame(back[i].ownerHand, l[i].ownerHand)
             || back[i].pos[0] != l[i].pos[0] || back[i].pos[2] != l[i].pos[2] || back[i].name != l[i].name) Fail("t924: a copy row does not read back the same");
     const std::string good = EncodeCopyList(l);
-    if (DecodeCopyList("shown-town-copies\t2\n" + good.substr(good.find('\n') + 1), &back, &why) != 3 || !back.empty()) Fail("t924: a list of another format is read (its header and both rows bad)");
+    if (DecodeCopyList("shown-town-copies\t9\n" + good.substr(good.find('\n') + 1), &back, &why) != 3 || !back.empty()) Fail("t924: a list of another format is read (its header and both rows bad)");
     if (DecodeCopyList("shown-town-copies\t1\nC\t1\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\t0\t0\t0\t0\t0\tx\n", &back, &why) != 1 || !back.empty()) Fail("t924: a copy with no handle reads");
     if (DecodeCopyList("shown-town-copies\t1\r\n", &back, &why) != 0 || !back.empty()) Fail("t924: an empty list does not read");
     if (DecodeCopyList("", &back, &why) != 0 || !back.empty()) Fail("t924: an empty file does not read as an empty list");
@@ -51516,14 +55536,14 @@ void t_t924_town_copies()
     ApplyPlan p4;
     PlanApply(sh2, rows, std::vector<townkeep::TownRow>(), 0, 0, &p4);
     if (p4.held.size() != 1 || p4.held[0] != 0 || p4.gone.size() != 1 || p4.gone[0] != 1) Fail("t924: an owner with no row waiting has its base held");
-    if (kProtocol != 108u) Fail("t924: the world-server protocol changed (the owner's handle rides the same five words)");
+    if (kProtocol != 121u) Fail("t924: the world-server protocol changed (the owner's handle rides the same five words)");
 }
 /* owner 936 / 937 (protocol 101): TOWNS SHOW KEYS - the shown rows' piece keys (baseshow.h KeyRowsFor, townkeep.h EncodeShowKeys /
    ShowKeysTake), the wire fails closed, and the game's per-copy link decision (KeyRowOf, LinkStep) on every branch */
 void t_p47d_show_keys()
 {
     using namespace baseshow;
-    if (kProtocol != 108u || townkeep::kOpShowKeys != 3u || townkeep::kOpSay != 1u || townkeep::kOpList != 2u || townkeep::kMsgTowns != 70u)
+    if (kProtocol != 121u || townkeep::kOpShowKeys != 3u || townkeep::kOpSay != 1u || townkeep::kOpList != 2u || townkeep::kMsgTowns != 70u)
         Fail("p47d: SHOW KEYS is not TOWNS op 3 of world-server protocol 101");
     if (townkeep::kMaxShowKeyRows != kMaxShowRows) Fail("p47d: a SHOW KEYS list does not hold one row per shown row");
     /* KeyRowsFor: one key row per shown row, its keys and cut flag, (T-924) its owner's handle words; the viewer's own and a non-teammate's never */
@@ -52094,9 +56114,9 @@ void t_t889_wire_and_protocol()
     x = b; x[0] = (char)kMsgClosed; x[13] = 0; if (DecodeMsg(&x[0], x.size(), &d) != 0) Fail("t889: CLOSED 0 refused");
     x = b; x[0] = (char)kMsgQuery; x[13] = 2; if (DecodeMsg(&x[0], x.size(), &d) != 0) Fail("t889: QUERY 2 refused");
     if (b[1] != 1 || b[2] != 0 || b[5] != 2 || b[9] != 3) Fail("t889: little-endian on the wire");
-    /* the numbers: game-to-game protocol 172 (net/session.cpp's kProtocolVersion, which this test cannot see, asserts it equals
-       kGameProtocol); message 79 (free on main and outside 73-78) */
-    if (kGameProtocol != 172u) Fail("t889: the game-to-game protocol is 172");
+    /* the numbers: game-to-game protocol 180 (net/session.cpp's kProtocolVersion, which this test cannot see, asserts it equals
+       kGameProtocol; 178 has no shop tail kinds 2 / 3 and is refused); message 79 (free on main and outside 73-78) */
+    if (kGameProtocol != 180u) Fail("t889: the game-to-game protocol is 180");
     if (kMsgHandover != 79u || cooplive::kInnerItemHandover != 79u) Fail("t889: MSG_ITEM_HANDOVER is 79");
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerItemHandover)) Fail("t889: the world server road delivers it");
     if (!cooplive::LiveInnerWaitsForWorld(cooplive::kInnerItemHandover)) Fail("t889: it waits for the world like the other item messages");
@@ -52967,34 +56987,23 @@ void t_t923_build_near_town()
 void t_t923_town_pick_takes_mate()
 {
     using namespace buildnear;
-    /* inside a teammate's outpost */
-    if (TownPickTakesMate(1, 2, kZoneInside, 0, 0, 1) != 1 || TownPickTakesMate(1, 2, kZoneInside, 0, 1, 1) != 1) Fail("T-923: inside a teammate's outpost and in no own town - not taken");
-    /* inside an own town: never given away, whatever the zone */
-    if (TownPickTakesMate(1, 2, kZoneInside, 1, 1, 1) != 0 || TownPickTakesMate(1, 2, kZoneRing, 1, 0, 1) != 0) Fail("T-923: inside an own town too - the teammate's taken");
-    /* decision 973 a: the ring - taken only when the engine keeps no own town (it would found 'Your Outpost') */
-    if (TownPickTakesMate(1, 2, kZoneRing, 0, 0, 1) != 1) Fail("T-923 973 a: in the ring, no own town kept - not taken (a second outpost would be founded)");
-    if (TownPickTakesMate(1, 2, kZoneRing, 0, 1, 1) != 0) Fail("T-923 973 a: in the ring with an own town kept - the teammate's taken");
-    /* elsewhere: the engine's choice */
-    if (TownPickTakesMate(1, 2, kZoneOut, 0, 0, 1) != 0) Fail("T-923: outside the ring - taken");
+    /* inside a teammate's outpost (T-940: its fixed zone) */
+    if (TownPickTakesMate(1, 2, kZoneInside, 0, 1) != 1) Fail("T-923: inside a teammate's outpost and in no own town - not taken");
+    /* inside an own town: never given away */
+    if (TownPickTakesMate(1, 2, kZoneInside, 1, 1) != 0) Fail("T-923: inside an own town too - the teammate's taken");
+    /* elsewhere: the engine's choice (T-940: no ring - decision 973's ring replaced by the fixed zone) */
+    if (TownPickTakesMate(1, 2, kZoneOut, 0, 1) != 0) Fail("T-923: outside the teammate's zone - taken");
     /* unread answers are never a yes */
-    if (TownPickTakesMate(1, 2, kZoneInside, -1, 0, 1) != 0 || TownPickTakesMate(1, 2, -1, 0, 0, 1) != 0) Fail("T-923: an unread inside test - taken");
-    if (TownPickTakesMate(0, 2, kZoneInside, 0, 0, 1) != 0 || TownPickTakesMate(1, -1, kZoneInside, 0, 0, 1) != 0) Fail("T-923: no current teammate's town, yet taken");
-    /* the zone from the two engine tests */
-    if (MateZone(1, 1) != kZoneInside || MateZone(0, 1) != kZoneRing || MateZone(0, 0) != kZoneOut || MateZone(-1, 1) != -1 || MateZone(0, -1) != -1)
-        Fail("T-923 973 a: MateZone");
-    if (InsideFirst(0, 1999.0f) != 1 || InsideFirst(0, 2000.0f) != 0 || ScaleForKind(4) != 1.0f || ScaleForKind(1) != 2.5f) Fail("T-923 973 a: the ring is the near-town rule's");
+    if (TownPickTakesMate(1, 2, kZoneInside, -1, 1) != 0 || TownPickTakesMate(1, 2, -1, 0, 1) != 0) Fail("T-923: an unread inside test - taken");
+    if (TownPickTakesMate(0, 2, kZoneInside, 0, 1) != 0 || TownPickTakesMate(1, -1, kZoneInside, 0, 1) != 0) Fail("T-923: no current teammate's town, yet taken");
+    if (InsideFirst(0, 1999.0f) != 1 || InsideFirst(0, 2000.0f) != 0 || ScaleForKind(4) != 1.0f || ScaleForKind(1) != 2.5f) Fail("T-923: the near-town rule's ring");
     if (kTownKeepRange != 5000.0f) Fail("T-923: the confirm's keep range is not 5000");
     /* the caller's keep test (0x4D642F): within 5000 kept, past it or no town not, an unread distance unknown */
     if (TownKept(1, 5000.0f) != 1 || TownKept(1, 5000.5f) != 0 || TownKept(0, 10.0f) != 0 || TownKept(1, -1.0f) != -1) Fail("T-923: TownKept");
-    /* an own town whose distance did not read: the ring does not take the teammate's town over it (the piece stays this player's) */
-    if (TownPickWhy(1, 2, kZoneRing, 0, -1, 1) != kPickOwnUnread || TownPickTakesMate(1, 2, kZoneRing, 0, -1, 1) != 0)
-        Fail("T-923: in the ring with an own town whose distance did not read - the teammate's taken");
-    if (TownPickWhy(1, 2, kZoneRing, 0, 1, 1) != kPickOwnKept || TownPickWhy(1, 2, kZoneRing, 0, 0, 1) != kPickTaken) Fail("T-923: the ring's own-kept reasons");
-    /* a teammate's town past the caller's 5000, or whose distance did not read: never the answer, inside or ring (the caller would drop it) */
-    if (TownPickWhy(1, 2, kZoneRing, 0, 0, 0) != kPickMatePast || TownPickWhy(1, 2, kZoneInside, 0, 0, 0) != kPickMatePast
-        || TownPickWhy(1, 2, kZoneInside, 0, 1, -1) != kPickMatePast || TownPickTakesMate(1, 2, kZoneRing, 0, 0, 0) != 0)
+    /* a teammate's town past the caller's 5000, or whose distance did not read: never the answer (the caller would drop it) */
+    if (TownPickWhy(1, 2, kZoneInside, 0, 0) != kPickMatePast || TownPickWhy(1, 2, kZoneInside, 0, -1) != kPickMatePast || TownPickTakesMate(1, 2, kZoneInside, 0, 0) != 0)
         Fail("T-923: a teammate's town past 5000 or unread - taken");
-    if (TownPickWhy(0, 2, kZoneInside, 0, 0, 1) != kPickNoMate || TownPickWhy(1, 2, kZoneInside, 1, 0, 1) != kPickOwnInside || TownPickWhy(1, 2, kZoneOut, 0, 0, 1) != kPickOut)
+    if (TownPickWhy(0, 2, kZoneInside, 0, 1) != kPickNoMate || TownPickWhy(1, 2, kZoneInside, 1, 1) != kPickOwnInside || TownPickWhy(1, 2, kZoneOut, 0, 1) != kPickOut)
         Fail("T-923: TownPickWhy's other reasons");
 }
 /* T-923 review MED 2 (protocol 167): a handed outdoor PLACE carries the outpost's centre; with and without the nonce, round trip exact,
@@ -53343,6 +57352,644 @@ void t_t999_fold3()
     if (DiscardMarkErased(-2, 0) != 1) Fail("T-999 fold 3: a squad emptied by hiring or merging kept its discard mark");
     if (DiscardMarkErased(-2, 1) != 0) Fail("T-999 fold 3: a squad emptied by its area unload lost its discard mark at the empty keep question");
 }
+/* T-1080: a squad the orphan purge emptied keeps its record at its destroy; a wipe-out is deleted; the mark is used once */
+void t_t1080_purge_emptied_destroy()
+{
+    using namespace sqbirth;
+    if (DestroyDeleteMod(1, 1, 0, 0, -1, 0, 0) != kDelModKept) Fail("T-1080: a squad the purge emptied, not discarding, sent a delete at its destroy");
+    if (DestroyDeleteMod(1, 1, 0, 1, -2, 0, 0) != kDelModKept || DestroyDeleteMod(1, 1, 0, 1, 0, 0, 0) != kDelModKept) Fail("T-1080: a squad the purge emptied, discarding, off the unload road, sent a delete at its destroy");
+    if (DestroyDeleteMod(1, 1, 0, 1, -1, 0, 1) != kDelNone) Fail("T-1080: a purge-emptied squad of a same-id pair took another road than the same-id keep");
+    if (DestroyDeleteMod(0, 1, 1, 0, -1, 0, 0) != kDelPlain || DestroyDeleteMod(0, 1, 1, 1, 0, 0, 0) != kDelPlain) Fail("T-1080: a wipe-out the death watch saw was not deleted");
+    if (DestroyDeleteMod(1, 1, 1, 0, -1, 0, 0) != kDelPlain || DestroyDeleteMod(1, 1, 1, 1, -2, 1, 0) != kDelPlain) Fail("T-1080: a wipe-out the death watch saw was kept because the purge also marked it");
+    if (DestroyDeleteMod(1, 0, 0, 0, -1, 0, 0) != kDelNone || DestroyDeleteMod(1, 0, 1, 1, -2, 1, 0) != kDelNone) Fail("T-1080: an unbound squad's destroy sent a delete");
+    {   /* with no purge mark the destroy is DestroyDelete's, every input */
+        int same = 1;
+        for (int b = 0; b <= 1; ++b) for (int d = 0; d <= 1; ++d) for (int g = 0; g <= 1; ++g) for (int l = -2; l <= 3; ++l) for (int u = 0; u <= 1; ++u) for (int s = 0; s <= 1; ++s)
+            if (DestroyDeleteMod(0, b, d, g, l, u, s) != DestroyDelete(b, d, g, l, u, s)) same = 0;
+        if (same == 0) Fail("T-1080: a destroy with no purge mark took another road than DestroyDelete");
+    }
+    {   /* the mark: set when the purge reads the copy empty, taken once by the destroy */
+        std::set<void*> marks; int a = 0, b = 0; void* pa = &a; void* pb = &b;
+        if (coopsquad::NpcPurgeForgetStamp(1, 1, 0) == 1) marks.insert(pa);
+        if (coopsquad::NpcPurgeForgetStamp(1, 1, 2) == 1) marks.insert(pb);   /* the purge took people out, others are left: not marked */
+        if (ModRemovedTake(&marks, pb) != 0) Fail("T-1080: a squad the purge did not empty was marked");
+        const int first = ModRemovedTake(&marks, pa);
+        if (first != 1 || DestroyDeleteMod(first, 1, 0, 0, -1, 0, 0) != kDelModKept) Fail("T-1080: the purge-emptied mark was not used at the destroy");
+        const int second = ModRemovedTake(&marks, pa);
+        if (second != 0 || !marks.empty() || DestroyDeleteMod(second, 1, 0, 0, -1, 0, 0) != kDelPlain) Fail("T-1080: the purge-emptied mark outlived its destroy (a later squad at the address would keep its record)");
+        if (ModRemovedTake<void*>(0, pa) != 0) Fail("T-1080: no mark set answered marked");
+    }
+}
+/* T-1080 fold 1: the mark counts the living (bodies do not count, a failed read marks); the discard delete keeps its own rule */
+void t_t1080_fold1()
+{
+    using namespace sqbirth;
+    if (ModRemovedMark(1, 1, 0) != 1) Fail("T-1080 fold 1: the purge left only a body and the squad was not marked");
+    if (ModRemovedMark(1, 1, -2) != 1) Fail("T-1080 fold 1: the purge left no member and the squad was not marked");
+    if (ModRemovedMark(1, 1, -1) != 1) Fail("T-1080 fold 1: the members could not be read and the squad was not marked (a failed read would delete a world record)");
+    if (ModRemovedMark(1, 1, 1) != 0 || ModRemovedMark(1, 1, 3) != 0) Fail("T-1080 fold 1: a squad with someone living was marked");
+    if (ModRemovedMark(1, 0, 0) != 0 || ModRemovedMark(1, 0, -1) != 0) Fail("T-1080 fold 1: a squad the purge never touched was marked (a real wipe-out would keep its record)");
+    if (ModRemovedMark(0, 1, 0) != 0) Fail("T-1080 fold 1: not a world NPC squad, marked");
+    {   /* the body case end to end: one guard dead, the living purged - marked, then its destroy keeps the record */
+        std::set<void*> marks; int a = 0; void* pa = &a;
+        if (ModRemovedMark(1, 1, 0) == 1) marks.insert(pa);
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pa), 1, 0, 0, -1, 0, 0) != kDelModKept) Fail("T-1080 fold 1: a squad left holding a body sent the plain delete");
+    }
+    if (DestroyDeleteMod(1, 1, 0, 1, -2, 1, 0) != kDelDiscard || DestroyDeleteMod(1, 1, 0, 1, 3, 0, 0) != kDelDiscard || DestroyDeleteMod(1, 1, 0, 1, -1, 0, 0) != kDelDiscard)
+        Fail("T-1080 fold 1: the purge mark overrode the discard delete of a squad born not kept");
+    if (DestroyDeleteMod(1, 1, 0, 1, -2, 1, 1) != kDelNone) Fail("T-1080 fold 1: the purge mark overrode the same-id keep");
+    {   /* the mark only ever turns the plain delete into a keep */
+        int ok = 1;
+        for (int b = 0; b <= 1; ++b) for (int d = 0; d <= 1; ++d) for (int g = 0; g <= 1; ++g) for (int l = -2; l <= 3; ++l) for (int u = 0; u <= 1; ++u) for (int s = 0; s <= 1; ++s)
+        {
+            const int was = DestroyDelete(b, d, g, l, u, s), now = DestroyDeleteMod(1, b, d, g, l, u, s);
+            if (now != (was == kDelPlain && d == 0 ? (int)kDelModKept : was)) ok = 0;
+        }
+        if (ok == 0) Fail("T-1080 fold 1: the purge mark changed a destroy other than a plain delete with no wipe-out");
+    }
+}
+/* T-1080 fold 3: a squad carrying the mod-removal mark keeps its record; an unmarked emptied squad - its runner ending it - still
+   deletes; the wiring */
+static size_t T1080BodyEnd(const std::string& src, size_t at) { return at == std::string::npos ? std::string::npos : src.find("\n}", at); }
+/* the definition of `head` (an occurrence followed by '{' before any ';' - a declaration is skipped); npos = none */
+static size_t T1080DefAt(const std::string& src, const char* head)
+{
+    for (size_t s = src.find(head); s != std::string::npos; s = src.find(head, s + 1))
+        if (src.find('{', s) < src.find(';', s)) return s;
+    return std::string::npos;
+}
+static int T1080BodyHas(const std::string& src, const char* head, const char* needle)
+{
+    const size_t s = T1080DefAt(src, head), e = T1080BodyEnd(src, s);
+    return (s != std::string::npos && e != std::string::npos && src.find(needle, s) < e) ? 1 : 0;
+}
+void t_t1080_fold3()
+{
+    using namespace sqbirth;
+    /* the runner ending its squad: hired away, merged, the last member gone - no mark, the plain delete as before */
+    if (DestroyDeleteMod(0, 1, 0, 0, -1, 0, 0) != kDelPlain || DestroyDeleteMod(0, 1, 0, 0, -2, 0, 0) != kDelPlain) Fail("T-1080 fold 3: an unmarked emptied squad was not deleted");
+    if (DestroyDeleteMod(0, 1, 0, 1, -2, 0, 0) != kDelPlain) Fail("T-1080 fold 3: an unmarked squad emptied by hiring or merging while discarding was not deleted");
+    if (DestroyDeleteMod(0, 1, 1, 0, -1, 0, 0) != kDelPlain) Fail("T-1080 fold 3: a wipe-out was not deleted");
+    /* the same squad emptied by this game's own removal (the last living person removed): marked, kept */
+    {
+        std::set<void*> marks; int a = 0, b = 0; void* pa = &a; void* pb = &b;
+        if (ModRemovedMark(1, 1, 0) == 1) marks.insert(pa);
+        if (ModRemovedMark(1, 1, 2) == 1) marks.insert(pb);   /* the removal left two living: not marked */
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pa), 1, 0, 0, -1, 0, 0) != kDelModKept) Fail("T-1080 fold 3: a squad this game's own removal emptied was deleted");
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pb), 1, 0, 0, -2, 0, 0) != kDelPlain) Fail("T-1080 fold 3: a squad the removal left living ones in, later emptied by its runner, was kept");
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pa), 1, 0, 0, -1, 0, 0) != kDelPlain) Fail("T-1080 fold 3: the mark outlived its destroy");
+    }
+    if (DestroyDeleteMod(1, 1, 1, 0, -1, 0, 0) != kDelPlain) Fail("T-1080 fold 3: the mark kept a wipe-out the death watch marked");
+    if (DestroyDeleteMod(1, 1, 0, 1, 3, 0, 0) != kDelDiscard || DestroyDeleteMod(1, 1, 0, 1, -2, 1, 1) != kDelNone || DestroyDeleteMod(1, 0, 0, 0, -1, 0, 0) != kDelNone)
+        Fail("T-1080 fold 3: the mark changed the discard delete, the same-id keep or an unbound destroy");
+    /* the wiring */
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp");
+    const std::string wg = T313ReadFile("../coop-plugin/worldgen.cpp");
+    const std::string ws = T313ReadFile("../coop-plugin/worldstate.cpp");
+    if (st.empty() || wg.empty() || ws.empty()) { Fail("T-1080 fold 3: could not read the sources"); return; }
+    if (T1080BodyHas(st, "void detour_destroyPlatoon(void* faction, void* platoon)", "sqbirth::DestroyDeleteMod(modRemoved, 1,") == 0) Fail("T-1080 fold 3: the engine-destroy road does not ask the mark");
+    if (T1080BodyHas(st, "void DrainGoneEntry(", "sqbirth::DestroyDeleteMod(offMod,") == 0) Fail("T-1080 fold 3: the drained destroy does not ask the mark");
+    if (T1080BodyHas(st, "void StoreOrphanEmptiedSquad(", "ModRemovedMarkNow(platoon, 1, LivingMembersPod(platoon))") == 0) Fail("T-1080 fold 3: the purge does not mark");
+    {
+        const size_t s = T1080DefAt(wg, "bool DestroyLocalObject(void* obj)"), e = T1080BodyEnd(wg, s);
+        const size_t n = s == std::string::npos ? std::string::npos : wg.find("ModRemovalNote(obj);", s), w = s == std::string::npos ? std::string::npos : wg.find("w->destroy(", s);
+        if (e == std::string::npos || n > e || w > e || n > w) Fail("T-1080 fold 3: DestroyLocalObject does not note the removal before the destroy");
+    }
+    if (T1080BodyHas(ws, "int WsDupDestroyPod(::Character* c)", "ModRemovalNote(") != 0) Fail("T-1080 fold 3: the duplicate-named removal (this game's own extra body, in an area it runs) marks its squad");
+}
+/* T-1080 fold 4: a squad this game made from a record with no living member of its own here keeps its record at an empty destroy; a
+   squad whose own living members here all died deletes; the wiring */
+void t_t1080_fold4()
+{
+    using namespace sqbirth;
+    if (ModMarkClearedBy(1) != 1 || ModMarkClearedBy(3) != 1) Fail("T-1080 fold 4: a living member seen here did not clear the mark");
+    if (ModMarkClearedBy(0) != 0 || ModMarkClearedBy(-2) != 0 || ModMarkClearedBy(-1) != 0) Fail("T-1080 fold 4: bodies only, no members or an unread squad cleared the mark");
+    {   /* made from its record, woke with nobody, the engine destroys it empty: kept */
+        std::set<void*> marks; int a = 0; void* pa = &a;
+        marks.insert(pa);
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pa), 1, 0, 0, -2, 0, 0) != kDelModKept) Fail("T-1080 fold 4: a squad made from its record with nobody of its own here was deleted at its empty destroy");
+    }
+    {   /* made from its record, its people stood here (the watch saw them living), then all died */
+        std::set<void*> marks; int b = 0; void* pb = &b;
+        marks.insert(pb);
+        if (ModMarkClearedBy(2) != 0) marks.erase(pb);
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pb), 1, 1, 0, 0, 0, 0) != kDelPlain) Fail("T-1080 fold 4: a squad whose living members here died (the watch's wipe-out) was kept");
+        if (DestroyDeleteMod(ModRemovedTake(&marks, pb), 1, 0, 0, 0, 0, 0) != kDelPlain) Fail("T-1080 fold 4: a squad whose living members here died before the watch marked it was kept");
+    }
+    if (DestroyDeleteMod(1, 1, 1, 0, 0, 0, 0) != kDelPlain) Fail("T-1080 fold 4: a marked squad's wipe-out was kept");
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp");
+    if (st.empty()) { Fail("T-1080 fold 4: could not read store.cpp"); return; }
+    if (T1080BodyHas(st, "static bool CreateUnknownSquad(const Record& r)", "ModMadeNote(p, kModMadeCreated)") == 0) Fail("T-1080 fold 4: a squad made from its record is not marked");
+    if (T1080BodyHas(st, "void detour_activate(void* platoon)", "ModMadeNote(platoon, kModMadeLoaded)") == 0) Fail("T-1080 fold 4: the wake's reload does not mark");
+    if (T1080BodyHas(st, "unsigned char detour_loadFromDisk(", "ModMadeNote(applyPlatoon, kModMadeLoaded)") == 0) Fail("T-1080 fold 4: the engine's read of the record at a wake does not mark");
+    if (T1080BodyHas(st, "void DeathWatchTick()", "sqbirth::ModMarkClearedBy(living)") == 0) Fail("T-1080 fold 4: the death watch does not clear the mark on a living member");
+    if (T1080BodyHas(st, "void detour_deactivate(void* platoon, void* container)", "g_modRemoved.erase(") != 0 || T1080BodyHas(st, "int HbPublishOne(void* platoon, DWORD now, bool wasDirty)", "g_modRemoved.erase(") != 0)
+        Fail("T-1080 fold 4: a record write clears the mark");
+}
+/* T-1080 fold 5: placed from its record, woke with nobody, kept -> not placed again in this world; a squad only the purge emptied is
+   placed again when its area is this game's to run; the wiring */
+void t_t1080_fold5()
+{
+    using namespace sqbirth;
+    {   /* the made squad: CreateUnknownSquad marks it in both sets, it wakes with nobody (-2), the engine discards it */
+        std::set<void*> removed, made; int a = 0; void* pa = &a;
+        removed.insert(pa); made.insert(pa);
+        const int mod = ModRemovedTake(&removed, pa), mk = ModRemovedTake(&made, pa);
+        const int del = DestroyDeleteMod(mod, 1, 0, 0, -2, 0, 0);
+        if (del != kDelModKept) Fail("T-1080 fold 5: the squad made from its record that woke with nobody was not kept");
+        const int failed = MadeEmptyPlaceFailed(del, mk);
+        if (failed != 1) Fail("T-1080 fold 5: a kept made-empty squad was not entered as failed for this world");
+        const int place = townpending::Placeable(0, 0, -1, 1, failed);
+        if (place != townpending::kPlaceNoGame || townpending::PlaceNow(place, 0, 0, 1) != 0) Fail("T-1080 fold 5: a made-empty squad is placed again from the same record");
+        if (townpending::NoPlacer(place) != 1) Fail("T-1080 fold 5: a made-empty squad's note still holds its town back");
+    }
+    {   /* the purge-emptied squad: removal mark only - placed again from its record when its area is this game's */
+        const int del = DestroyDeleteMod(1, 1, 0, 0, -2, 0, 0);
+        const int failed = MadeEmptyPlaceFailed(del, 0);
+        if (del != kDelModKept || failed != 0) Fail("T-1080 fold 5: a purge-emptied squad was entered as failed");
+        const int place = townpending::Placeable(0, 0, -1, 1, failed);
+        if (place != townpending::kPlaceByThisGame || townpending::PlaceNow(place, 0, 0, 1) != 1) Fail("T-1080 fold 5: a purge-emptied squad is not placed from its record when its area is this game's");
+    }
+    if (MadeEmptyPlaceFailed(kDelPlain, 1) != 0 || MadeEmptyPlaceFailed(kDelDiscard, 1) != 0 || MadeEmptyPlaceFailed(kDelNone, 1) != 0)
+        Fail("T-1080 fold 5: a destroy that did not keep the record entered the squad as failed");
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp");
+    if (st.empty()) { Fail("T-1080 fold 5: could not read store.cpp"); return; }
+    if (T1080BodyHas(st, "void detour_destroyPlatoon(void* faction, void* platoon)", "sqbirth::MadeEmptyPlaceFailed(del, modMade)") == 0
+        || T1080BodyHas(st, "void DrainGoneEntry(", "sqbirth::MadeEmptyPlaceFailed(offDel, offMade)") == 0)
+        Fail("T-1080 fold 5: a destroy does not enter a made-empty squad as failed");
+    if (T1080BodyHas(st, "void MadeEmptyNotPlacedAgain(const std::string& worldId)", "g_notePlaceFailed.insert(worldId)") == 0) Fail("T-1080 fold 5: the made-empty entry is not the failed-creation registry");
+    if (T1080BodyHas(st, "void PlaceUnplacedNotes()", "NotePlaceable(") == 0 || T1080BodyHas(st, "int NotePlaceable(", "g_notePlaceFailed.count(worldId)") == 0)
+        Fail("T-1080 fold 5: the placement no longer asks the failed-creation registry");
+}
+/* T-1084 step 3 (build 1): the area-recorded mark - its wire, the holder rule, R6's refusal, R5's due rule, the authority's arm, the
+   key conversion, the freed-area trigger, the note reasons - branch by branch; the wiring by text */
+void t_t1084_step3()
+{
+    using namespace arearec;
+    /* the message number and protocol, on both sides */
+    if (kMsgAreaRecorded != 83u || kProtocol != 121u || kProtocol != authproof::kProtocol || kProtocol != coopfeed::kFeedProtocol) Fail("T-1084 s3: AREA_RECORDED is not message 83 of world-server protocol 121");
+    /* area keys: y * 64 + x, and the sweep's x * 64 + y converted both ways */
+    if (AreaKeyXY(5, 7) != 7 * 64 + 5 || AreaKeyXY(5, 7) != coopfeed::FeedAreaKey(5, 7) || AreaKeyXY(-1, 0) != kNoKey || AreaKeyXY(0, 64) != kNoKey) Fail("T-1084 s3: the area key is not the area map's");
+    if (AreaKeyX(AreaKeyXY(5, 7)) != 5 || AreaKeyY(AreaKeyXY(5, 7)) != 7) Fail("T-1084 s3: an area key's x / y");
+    if (AreaKeyOfSweep(5 * 64 + 7) != AreaKeyXY(5, 7) || SweepKeyOfArea(AreaKeyXY(5, 7)) != 5 * 64 + 7) Fail("T-1084 s3: the sweep's key was not converted");
+    if (AreaKeyOfSweep(5 * 64 + 7) != coopfeed::FeedSecXYAreaKey(5 * 64 + 7)) Fail("T-1084 s3: the sweep's key converts unlike recordfeed.h's");
+    if (AreaKeyOfSweep(-1) != kNoKey || AreaKeyOfSweep(4096) != kNoKey || SweepKeyOfArea(-1) != kNoKey || SweepKeyOfArea(4096) != kNoKey) Fail("T-1084 s3: a key off the grid converted");
+    for (int k = 0; k < kKeys; ++k) if (AreaKeyOfSweep(SweepKeyOfArea(k)) != k) { Fail("T-1084 s3: the key conversion does not round-trip"); break; }
+    /* the wire: up MARK */
+    {
+        std::vector<char> b; int key = 9;
+        EncodeMarkUp(&b, 63, 2);
+        if (b.size() != 2 || DecodeMarkUp(b, &key) != 1 || key != AreaKeyXY(63, 2)) Fail("T-1084 s3: the up MARK does not round-trip");
+        std::vector<char> bad(b); bad.push_back(0);
+        if (DecodeMarkUp(bad, &key) != 0 || key != kNoKey) Fail("T-1084 s3: a long up MARK was taken");
+        bad.assign(1, 0); if (DecodeMarkUp(bad, &key) != 0) Fail("T-1084 s3: a short up MARK was taken");
+        bad.assign(2, 0); bad[0] = (char)64; if (DecodeMarkUp(bad, &key) != 0) Fail("T-1084 s3: an up MARK off the grid was taken");
+    }
+    /* the wire: down LIST (marks + holder history), MARK and HOLDERS */
+    {
+        std::vector<int> keys; keys.push_back(AreaKeyXY(0, 0)); keys.push_back(AreaKeyXY(63, 63)); keys.push_back(AreaKeyXY(12, 40)); keys.push_back(-5); keys.push_back(4096);
+        std::vector<HolderRow> hs;
+        { HolderRow r; r.key = AreaKeyXY(42, 12); r.slots.push_back(0); r.slots.push_back(1); r.slots.push_back(300); hs.push_back(r); }
+        { HolderRow r; r.key = AreaKeyXY(1, 2); hs.push_back(r); }
+        { HolderRow r; r.key = 5000; r.slots.push_back(1); hs.push_back(r); }   /* off the grid: left out */
+        { HolderRow r; r.key = AreaKeyXY(3, 3); r.slots.push_back(70000); hs.push_back(r); }   /* a slot past u16: left out */
+        std::vector<char> b; EncodeDownList(&b, keys, hs);
+        int kind = 0; std::vector<int> got; std::vector<HolderRow> gh;
+        if (DecodeDown(b, &kind, &got, &gh) != 1 || kind != kDownList || got.size() != 3 || got[0] != AreaKeyXY(0, 0) || got[1] != AreaKeyXY(63, 63) || got[2] != AreaKeyXY(12, 40)) Fail("T-1084 s3: the LIST's marks do not round-trip (or kept a key off the grid)");
+        if (gh.size() != 2 || gh[0].key != AreaKeyXY(42, 12) || gh[0].slots.size() != 3 || gh[0].slots[2] != 300 || gh[1].key != AreaKeyXY(1, 2) || !gh[1].slots.empty()) Fail("T-1084 s3: the LIST's holder history does not round-trip (or kept a row off the wire)");
+        std::vector<int> none; std::vector<HolderRow> noRows; EncodeDownList(&b, none, noRows);
+        if (DecodeDown(b, &kind, &got, &gh) != 1 || kind != kDownList || !got.empty() || !gh.empty() || b.size() != 5) Fail("T-1084 s3: an empty LIST is not a LIST");
+        EncodeDownList(&b, keys, hs); b.pop_back();
+        if (DecodeDown(b, &kind, &got, &gh) != 0 || kind != 0 || !got.empty() || !gh.empty()) Fail("T-1084 s3: a torn LIST was taken");
+        EncodeDownList(&b, keys, hs); b.push_back(0);
+        if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: a LIST with bytes after its rows was taken");
+        b.assign(3, 0); b[0] = (char)kDownList;   /* the marks' count with no holder count after it (a build-1 LIST) */
+        if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: a LIST with no holder history was taken");
+        EncodeDownMark(&b, AreaKeyXY(30, 31));
+        if (DecodeDown(b, &kind, &got, &gh) != 1 || kind != kDownMark || got.size() != 1 || got[0] != AreaKeyXY(30, 31) || !gh.empty()) Fail("T-1084 s3: the down MARK does not round-trip");
+        b.push_back(0); if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: a long down MARK was taken");
+        b.assign(3, 0); b[0] = 9; if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: an unknown kind was taken");
+        b.clear(); if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: an empty message was taken");
+        b.assign(3, 0); b[0] = (char)kDownMark; b[1] = (char)70; if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: a down MARK off the grid was taken");
+        if (EncodeDownHolders(&b, hs[0]) != 1 || DecodeDown(b, &kind, &got, &gh) != 1 || kind != kDownHolders || !got.empty() || gh.size() != 1 || gh[0].key != hs[0].key || gh[0].slots != hs[0].slots) Fail("T-1084 s3: the HOLDERS row does not round-trip");
+        b.pop_back(); if (DecodeDown(b, &kind, &got, &gh) != 0) Fail("T-1084 s3: a torn HOLDERS row was taken");
+        if (EncodeDownHolders(&b, hs[2]) != 0 || EncodeDownHolders(&b, hs[3]) != 0) Fail("T-1084 s3: a HOLDERS row off the grid or past u16 was encoded");
+    }
+    /* the holder history: the file line, the growth, owner 1129 a's "another player visited" */
+    {
+        HolderRow r; r.key = AreaKeyXY(42, 12); r.slots.push_back(1); r.slots.push_back(0);
+        HolderRow g;
+        if (HolderLineFormat(r) != "42 12 1 0" || HolderLineParse("42 12 1 0", &g) != 1 || g.key != r.key || g.slots != r.slots) Fail("T-1084 s3 holders: the file line does not round-trip");
+        if (HolderLineParse("42 12", &g) != 1 || !g.slots.empty()) Fail("T-1084 s3 holders: a row with no slot was refused");
+        if (HolderLineParse("64 0 1", &g) != 0 || HolderLineParse("1 1 1 1", &g) != 0 || HolderLineParse("1 1 70000", &g) != 0 || HolderLineParse("1", &g) != 0
+            || HolderLineParse("1 x 2", &g) != 0 || HolderLineParse("1 -1 2", &g) != 0 || HolderLineParse("", &g) != 0) Fail("T-1084 s3 holders: a malformed line was taken");
+        HolderRow n; n.key = AreaKeyXY(1, 1);
+        if (HolderNote(&n, 2) != 1 || HolderNote(&n, 2) != 0 || HolderNote(&n, -1) != 0 || HolderNote(&n, 65536) != 0 || n.slots.size() != 1) Fail("T-1084 s3 holders: the growth rule");
+        std::vector<int> none, onlyMe, other; onlyMe.push_back(3); other.push_back(3); other.push_back(1);
+        if (VisitedByOther(none, 3) != kVisitNone || VisitedByOther(none, -1) != kVisitNone) Fail("T-1084 s3 holders: an area nobody held was visited");
+        if (VisitedByOther(onlyMe, 3) != kVisitNone) Fail("T-1084 s3 holders: this game's own holding counted as another player's");
+        if (VisitedByOther(other, 3) != kVisitOther) Fail("T-1084 s3 holders: another player's holding was not seen");
+        if (VisitedByOther(onlyMe, -1) != kVisitDoubt || VisitedByOther(other, -1) != kVisitDoubt) Fail("T-1084 s3 holders: with this game's slot unknown the answer was not a doubt");
+        /* fold 1: only a CONFIRMED hold is history - owner, unconfirmed, restored */
+        if (HolderConfirmed(2, 0, 0) != 1) Fail("T-1084 s3 holders: a confirmed hold was not noted");
+        if (HolderConfirmed(2, 1, 0) != 0) Fail("T-1084 s3 holders: a ring-1 lease given ahead of the report was noted");
+        if (HolderConfirmed(2, 0, 1) != 0) Fail("T-1084 s3 holders: a claim restored from areas.txt was noted before its holder reported");
+        if (HolderConfirmed(-1, 0, 0) != 0) Fail("T-1084 s3 holders: an area nobody holds was noted");
+    }
+    /* the mark-set rule (the world server): only the area's holder, by player id */
+    if (MarkTake(1, "p1", "p1", 0) != kTakeNew || MarkTake(1, "p1", "p1", 1) != kTakeAgain) Fail("T-1084 s3: the holder's mark was not taken");
+    if (MarkTake(1, "p2", "p1", 0) != kRefuseNotHolder) Fail("T-1084 s3: a mark from a game that does not hold the area was taken");
+    if (MarkTake(1, "p1", "", 0) != kRefuseNoHolder) Fail("T-1084 s3: a mark for an area nobody holds was taken");
+    if (MarkTake(1, "", "p1", 0) != kRefuseNoSender || MarkTake(1, "", "", 0) != kRefuseNoSender) Fail("T-1084 s3: a mark from a sender with no player id was taken");
+    if (MarkTake(0, "p1", "p1", 0) != kRefuseMalformed) Fail("T-1084 s3: a malformed mark was taken");
+    if (MarkTakes(kTakeNew) != 1 || MarkTakes(kTakeAgain) != 1 || MarkTakes(kRefuseNotHolder) != 0 || MarkTakes(kRefuseNoHolder) != 0 || MarkTakes(kRefuseNoSender) != 0 || MarkTakes(kRefuseMalformed) != 0) Fail("T-1084 s3: MarkTakes");
+    /* a full record: present, a file, written, not gone */
+    if (RecFull(1, 1, 5, 0) != 1) Fail("T-1084 s3 RecFull: a full record was not full");
+    if (RecFull(0, 1, 5, 0) != 0 || RecFull(1, 0, 5, 0) != 0 || RecFull(1, 1, 0, 0) != 0 || RecFull(1, 1, 5, 1) != 0) Fail("T-1084 s3 RecFull: a missing, file-less (position-only), unwritten or gone record was full");
+    /* which records may be matched: full, deleted, keepGated, placeFailed, copyHere, gateBuilds */
+    if (RecordCounts(1, 0, 0, 0, 1, 0) != 1 || RecordCounts(1, 0, 0, 0, 0, 1) != 1) Fail("T-1084 s3 match: a full record whose group stands (or will be built) here did not count");
+    if (RecordCounts(0, 0, 0, 0, 1, 1) != 0 || RecordCounts(1, 1, 0, 0, 1, 1) != 0 || RecordCounts(1, 0, 1, 0, 1, 1) != 0 || RecordCounts(1, 0, 0, 1, 1, 1) != 0) Fail("T-1084 s3 match: a non-full, deleted, held-back or failed record counted");
+    if (RecordCounts(1, 0, 0, 0, 0, 0) != 0) Fail("T-1084 s3 match: a record whose group is neither here nor built counted");
+    /* the matching rule: sameFaction, groupHome, recHome, groupTmpl, recTmpl, groupTown, recTown, sameArea */
+    if (MatchRecord(1, "bldA", "bldA", "tA", "tA", "", "", 0) != kMatchHomed) Fail("T-1084 s3 match: a homed group did not match its home's record of its template (anywhere, town unread)");
+    if (MatchRecord(1, "bldA", "bldA", "tA", "tB", "t1", "t1", 1) != kMatchNo) Fail("T-1084 s3 match: a homed group matched another template's record");
+    if (MatchRecord(1, "bldA", "bldB", "tA", "tA", "t1", "t1", 1) != kMatchNo || MatchRecord(1, "bldA", "", "tA", "tA", "t1", "t1", 1) != kMatchNo) Fail("T-1084 s3 match: a homed group matched another home's or a homeless record");
+    if (MatchRecord(0, "bldA", "bldA", "tA", "tA", "t1", "t1", 1) != kMatchNo || MatchRecord(0, "", "", "tA", "tA", "t1", "t1", 1) != kMatchNo) Fail("T-1084 s3 match: another faction's record matched");
+    if (MatchRecord(1, "", "", "tA", "tA", "t1", "t1", 1) != kMatchHomeless || MatchRecord(1, "", "", "tA", "tA", "-", "-", 1) != kMatchHomeless) Fail("T-1084 s3 match: a homeless group did not match its template's record in its town (or wilderness) and area");
+    if (MatchRecord(1, "", "", "tA", "tA", "t1", "t1", 0) != kMatchNo) Fail("T-1084 s3 match: a homeless group matched a record in another area");
+    if (MatchRecord(1, "", "bldA", "tA", "tA", "t1", "t1", 1) != kMatchNo) Fail("T-1084 s3 match: a homeless group matched a homed record");
+    if (MatchRecord(1, "", "", "", "", "t1", "t1", 1) != kMatchNo || MatchRecord(1, "", "", "tA", "tB", "t1", "t1", 1) != kMatchNo) Fail("T-1084 s3 match: an unread or other template matched");
+    if (MatchRecord(1, "", "", "tA", "tA", "t1", "t2", 1) != kMatchNo || MatchRecord(1, "", "", "tA", "tA", "", "", 1) != kMatchNo) Fail("T-1084 s3 match: another town, or an unread one, matched");
+    /* one-to-one, nearest first */
+    {
+        std::vector<MatchCand> c(4);
+        c[0].counts = 1; c[0].match = kMatchHomeless; c[0].d2 = 50.0f;
+        c[1].counts = 1; c[1].match = kMatchHomeless; c[1].d2 = 10.0f; c[1].claimed = 1;   /* nearer, but another group's double already */
+        c[2].counts = 0; c[2].match = kMatchHomeless; c[2].d2 = 1.0f;                       /* nearest, but does not count */
+        c[3].counts = 1; c[3].match = kMatchHomeless; c[3].d2 = 20.0f;
+        if (MatchPick(c) != 3) Fail("T-1084 s3 match: not the nearest counting unclaimed record");
+        c[3].match = kMatchNo; if (MatchPick(c) != 0) Fail("T-1084 s3 match: a record that does not match was picked");
+        c[0].claimed = 1; if (MatchPick(c) != -1) Fail("T-1084 s3 match: a claimed record was picked twice");
+        std::vector<MatchCand> e; if (MatchPick(e) != -1) Fail("T-1084 s3 match: an empty list picked");
+    }
+    /* THE DECISION AT THE WAKE, one rule in marked and unmarked areas (fold 1: the old R6 is gone), branch by branch - every case is
+       asked with the area marked and not marked and must answer the same */
+    for (int mk = 0; mk < 2; ++mk)
+    {
+        const char* const where = mk != 0 ? " (marked area)" : " (unmarked area)";
+        AwIn a; a.haveId = 1; a.worldFac = 1; a.floorRead = 1; a.floorKnown = 1; a.belowFloor = 1; a.areaKnown = 1; a.linkUp = 1; a.listHere = 1; a.feedDone = 1; a.marked = mk;
+        a.homeKnown = 1; a.tmplKnown = 1; a.matched = 1; a.homed = 1; a.townKnown = 1; a.visited = kVisitNone;
+        if (AtWakeDecide(a) != kAwRefuseDuplicate || AwAct(kAwRefuseDuplicate) != kActRefuse) Fail(std::string("T-1084 s3 wake: a save group doubling a record was not refused") + where);
+        AwIn b = a; b.haveId = 0; if (AtWakeDecide(b) != kAwNoId) Fail(std::string("T-1084 s3 wake: no id") + where);
+        b = a; b.worldFac = 0; if (AtWakeDecide(b) != kAwNotWorld) Fail(std::string("T-1084 s3 wake: not a world faction") + where);
+        b = a; b.playerSide = 1; if (AtWakeDecide(b) != kAwPlayerSide) Fail(std::string("T-1084 s3 wake: a player-side group was decided") + where);
+        b = a; b.context = 1; if (AtWakeDecide(b) != kAwContext) Fail(std::string("T-1084 s3 wake: a context platoon was decided") + where);
+        b = a; b.hasFull = 1; if (AtWakeDecide(b) != kAwRecorded) Fail(std::string("T-1084 s3 wake: a group with a full record was decided") + where);
+        b = a; b.floorKnown = 0; if (AtWakeDecide(b) != kAwFloorUnknown || AwAct(kAwFloorUnknown) != kActWake) Fail(std::string("T-1084 s3 wake: a faction with no floor after the read was decided, or not woken") + where);
+        /* the floors not read yet (a group woken during the world load): held pending, decided once they are read */
+        b = a; b.floorRead = 0; b.floorKnown = 0; b.belowFloor = 0;
+        if (AtWakeDecide(b) != kAwFloorPending || AwAct(kAwFloorPending) != kActPending) Fail(std::string("T-1084 s3 wake: a group seen before the load floors were read was not held pending") + where);
+        b.playerSide = 1; if (AtWakeDecide(b) != kAwPlayerSide) Fail(std::string("T-1084 s3 wake: a player-side group was held for the load floors") + where);
+        b = a; b.floorRead = 0; b.worldFac = 0; if (AtWakeDecide(b) != kAwNotWorld) Fail(std::string("T-1084 s3 wake: a player's faction's group was held for the load floors") + where);
+        b = a; b.floorRead = 0; b.context = 1; if (AtWakeDecide(b) != kAwContext) Fail(std::string("T-1084 s3 wake: a context platoon was held for the load floors") + where);
+        b = a; b.floorRead = 0; b.hasFull = 1; if (AtWakeDecide(b) != kAwRecorded) Fail(std::string("T-1084 s3 wake: a group with a full record was held for the load floors") + where);
+        b = a; b.belowFloor = 0; if (AtWakeDecide(b) != kAwNotSave) Fail(std::string("T-1084 s3 wake: a group made since the load was decided") + where);
+        b = a; b.areaKnown = 0; if (AtWakeDecide(b) != kAwNoArea) Fail(std::string("T-1084 s3 wake: a group with no area was decided") + where);
+        b = a; b.linkUp = 0; b.listHere = 0; b.feedDone = 0; if (AtWakeDecide(b) != kAwNoLink || AwAct(kAwNoLink) != kActWake) Fail(std::string("T-1084 s3 wake: with no link the group did not wake") + where);
+        b = a; b.listHere = 0; if (AtWakeDecide(b) != kAwPendingList || AwAct(kAwPendingList) != kActPending) Fail(std::string("T-1084 s3 wake: with no mark list the group was not held pending") + where);
+        /* review HIGH 1: records not all here -> pending, whether the area is marked or not (a marked area woke them before) */
+        b = a; b.feedDone = 0; if (AtWakeDecide(b) != kAwPendingFeed || AwAct(kAwPendingFeed) != kActPending) Fail(std::string("T-1084 s3 wake: before the area's records were all here the group was not held pending") + where);
+        b = a; b.unique = 1; if (AtWakeDecide(b) != kAwUnique || AwAct(kAwUnique) != kActWake) Fail(std::string("T-1084 s3 wake: a group that may hold a unique character was refused") + where);
+        b = a; b.homeKnown = 0; if (AtWakeDecide(b) != kAwHomeUnread || AwAct(kAwHomeUnread) != kActWake) Fail(std::string("T-1084 s3 wake: a group whose home was not read was refused") + where);
+        b = a; b.tmplKnown = 0; if (AtWakeDecide(b) != kAwTmplUnread || AwAct(kAwTmplUnread) != kActWake) Fail(std::string("T-1084 s3 wake: a group whose template was not read was refused") + where);
+        /* review HIGH 2: a homed resident with no match wakes and is recorded, in a marked area too */
+        b = a; b.matched = 0; if (AtWakeDecide(b) != kAwHomedUnmatched || AwAct(kAwHomedUnmatched) != kActWake) Fail(std::string("T-1084 s3 wake (1129 a): a homed unmatched group was not woken (and recorded)") + where);
+        b = a; b.matched = 0; b.homed = 0; b.visited = kVisitOther;
+        if (AtWakeDecide(b) != kAwRefuseHomeless || AwAct(kAwRefuseHomeless) != kActRefuse) Fail(std::string("T-1084 s3 wake (1129 a): a homeless unmatched group in an area another player held was not refused") + where);
+        b.townKnown = 0; if (AtWakeDecide(b) != kAwTownUnread || AwAct(kAwTownUnread) != kActWake) Fail(std::string("T-1084 s3 wake: a homeless group whose town was not read was refused") + where);
+        b.townKnown = 1; b.visited = kVisitDoubt; if (AtWakeDecide(b) != kAwVisitDoubt || AwAct(kAwVisitDoubt) != kActWake) Fail(std::string("T-1084 s3 wake: a doubt about the holders refused") + where);
+        b.visited = kVisitNone; if (AtWakeDecide(b) != kAwNotVisited || AwAct(kAwNotVisited) != kActWake) Fail(std::string("T-1084 s3 wake (1129 a): a homeless group in an area only this game held was not woken") + where);
+        /* the answer never depends on the mark */
+        AwIn m0 = b; m0.marked = 0; AwIn m1 = b; m1.marked = 1;
+        if (AtWakeDecide(m0) != AtWakeDecide(m1)) Fail(std::string("T-1084 s3 wake: the mark changed the decision") + where);
+    }
+    if (AwNeedsMatch(kAwNotVisited) != 1 || AwNeedsMatch(kAwRefuseDuplicate) != 0 || AwNeedsMatch(kAwPendingFeed) != 0 || AwNeedsMatch(kAwRecorded) != 0) Fail("T-1084 s3 wake: the costly reads are asked at the wrong answer");
+    if (kAwCount != 21 || kAwFloorPending != 20 || kAwNotVisited != 19) Fail("T-1084 s3 wake: the answers and the REPORT's 21 counters disagree (floorPending numbered last)");
+    if (AwNeedsMatch(kAwFloorPending) != 0) Fail("T-1084 s3 wake: the costly reads are asked while the load floors are unread");
+    /* settling a pending group: present, awake, adopted, sameLink, timedOut, againAct - an asleep group is never released or kept unwritten */
+    if (PendingSettle(0, 1, 0, 1, 0, kActRefuse) != kPsGone) Fail("T-1084 s3 settle: a freed group was settled");
+    if (PendingSettle(1, 1, 1, 1, 0, kActRefuse) != kPsKeepAdopted || PendingSettle(1, 1, 1, 0, 1, kActPending) != kPsKeepAdopted) Fail("T-1084 s3 settle: a group whose people were adopted was removed");
+    if (PendingSettle(1, 1, 0, 0, 0, kActRefuse) != kPsKeepLink) Fail("T-1084 s3 settle: a link drop did not keep an awake group");
+    if (PendingSettle(1, 0, 0, 0, 0, kActRefuse) != kPsWaitAsleep) Fail("T-1084 s3 settle: a link drop kept an asleep group unwritten");
+    if (PendingSettle(1, 1, 0, 1, 0, kActPending) != kPsWait || PendingSettle(1, 0, 0, 1, 0, kActPending) != kPsWait) Fail("T-1084 s3 settle: settled before the records were all here");
+    if (PendingSettle(1, 1, 0, 1, 1, kActPending) != kPsKeepBound) Fail("T-1084 s3 settle: the bound did not keep an awake group");
+    if (PendingSettle(1, 0, 0, 1, 1, kActPending) != kPsWaitAsleep) Fail("T-1084 s3 settle: the bound kept an asleep group unwritten");
+    if (PendingSettle(1, 1, 0, 1, 0, kActRefuse) != kPsRefuse || PendingSettle(1, 0, 0, 1, 1, kActRefuse) != kPsRefuse) Fail("T-1084 s3 settle: a double was not refused (awake or asleep)");
+    if (PendingSettle(1, 1, 0, 1, 0, kActWake) != kPsRelease) Fail("T-1084 s3 settle: an awake group to wake was not released");
+    if (PendingSettle(1, 0, 0, 1, 0, kActWake) != kPsWaitAsleep) Fail("T-1084 s3 settle: an asleep group was released unwritten");
+    if (SettleStucksArea(kPsKeepBound) != 1 || SettleStucksArea(kPsKeepLink) != 1 || SettleStucksArea(kPsKeepAdopted) != 0 || SettleStucksArea(kPsRelease) != 0 || SettleStucksArea(kPsRefuse) != 0 || SettleStucksArea(kPsWaitAsleep) != 0)
+        Fail("T-1084 s3 settle: 'stuck' is not narrowed to a group released by the bound");
+    if (kPendingBoundMs != 60000u || kPsCount != 8) Fail("T-1084 s3 settle: the bound is not 60 s, or the answers and the REPORT disagree");
+    /* the bound's clock: 60 s with neither the group's going-pending nor any feed progress */
+    if (PendingElapsed(100000u, 10000u, 0u) != 90000u) Fail("T-1084 s3 bound: with no feed progress the bound did not count from the going-pending");
+    if (PendingElapsed(100000u, 10000u, 95000u) != 5000u) Fail("T-1084 s3 bound: a feed still moving did not hold the bound back");
+    if (PendingElapsed(100000u, 99000u, 20000u) != 1000u) Fail("T-1084 s3 bound: a group pending since after the feed's last progress did not count from its own start");
+    if (PendingElapsed(5000u, 0xFFFFF000u, 0u) != 5000u + 0x1000u) Fail("T-1084 s3 bound: the tick count's wrap");
+    /* fold 2: a feed stamp made odd (| 1) in this same even millisecond is 1 ms AHEAD of now - 0 elapsed, never a wrap past the bound */
+    if (PendingElapsed(100000u, 10000u, 100001u) != 0u) Fail("T-1084 s3 bound: an odd feed stamp equal to now + 1 read as a whole wrap");
+    if (PendingElapsed(100000u, 100001u, 0u) != 0u || TicksSince(100000u, 100001u) != 0u || TicksSince(100001u, 100000u) != 1u) Fail("T-1084 s3 bound: a stamp ahead of now did not read as 0 elapsed");
+    if (TicksSince(5u, 0xFFFFFFF0u) != 0x15u) Fail("T-1084 s3 bound: TicksSince across the tick count's wrap");
+    /* the mark-send rule: mineHeld, listHere, marked, stuck, loaded, feedDone, pendingInK, sweepPending, sameLink, waiting */
+    if (MarkSendStep(1, 1, 0, 0, 1, 1, 0, 0, 1, 0) != kMkSend) Fail("T-1084 s3 mark: every write confirmed and nothing pending, the mark was not sent");
+    if (MarkSendStep(0, 1, 0, 0, 1, 1, 0, 0, 1, 0) != kMkLost || MarkSendStep(-2, 1, 0, 0, 1, 1, 0, 0, 1, 0) != kMkLost) Fail("T-1084 s3 mark: an area no longer held (or frozen) did not end the run");
+    if (MarkSendStep(1, 0, 0, 0, 1, 1, 0, 0, 1, 0) != kMkWaitList) Fail("T-1084 s3 mark: went on with no mark list");
+    if (MarkSendStep(1, 1, 1, 0, 1, 1, 0, 0, 1, 0) != kMkMarked) Fail("T-1084 s3 mark: a marked area was recorded again");
+    if (MarkSendStep(1, 1, 0, 1, 1, 1, 0, 0, 1, 0) != kMkStuck) Fail("T-1084 s3 mark: a stuck area was marked");
+    if (MarkSendStep(-1, 1, 0, 0, 1, 1, 0, 0, 1, 0) != kMkWaitMap) Fail("T-1084 s3 mark: went on with no fresh area map");
+    if (MarkSendStep(1, 1, 0, 0, 0, 1, 0, 0, 1, 0) != kMkWaitLoad) Fail("T-1084 s3 mark: went on before the area was loaded here");
+    if (MarkSendStep(1, 1, 0, 0, 1, 0, 0, 0, 1, 0) != kMkWaitFeed) Fail("T-1084 s3 mark: went on before the area's records were all here");
+    if (MarkSendStep(1, 1, 0, 0, 1, 1, 1, 0, 1, 0) != kMkWaitPending) Fail("T-1084 s3 mark: sent while a pending group stood in the area");
+    if (MarkSendStep(1, 1, 0, 0, 1, 1, 0, 1, 1, 0) != kMkWaitSweep) Fail("T-1084 s3 mark: went on while the newly-held sweep still waited for the area");
+    if (MarkSendStep(1, 1, 0, 0, 1, 1, 0, 0, 0, 0) != kMkAsk || MarkSendStep(1, 1, 0, 0, 1, 1, 0, 0, 0, 3) != kMkAsk) Fail("T-1084 s3 mark: a first run (or a new link) did not ask the writes");
+    if (MarkSendStep(1, 1, 0, 0, 1, 1, 0, 0, 1, 2) != kMkWaitWrites) Fail("T-1084 s3 mark: sent with writes unconfirmed");
+    if (MarkStepEnds(kMkLost) != 1 || MarkStepEnds(kMkMarked) != 1 || MarkStepEnds(kMkStuck) != 1 || MarkStepEnds(kMkSend) != 0 || MarkStepEnds(kMkAsk) != 0 || MarkStepEnds(kMkWaitPending) != 0) Fail("T-1084 s3 mark: the run's end answers");
+    /* completeness: echoConfirmed, fullAsNew, deleted, timedOut */
+    if (WriteDone(1, 0, 0, 1) != kWdDone || WriteDone(0, 1, 1, 1) != kWdDone) Fail("T-1084 s3 done: a confirmed write, or another game's full newer record, did not count");
+    if (WriteDone(0, 0, 1, 1) != kWdDeleted) Fail("T-1084 s3 done: a wiped-out group's write was waited for");
+    if (WriteDone(0, 0, 0, 0) != kWdWait) Fail("T-1084 s3 done: an unanswered write counted as done");
+    if (WriteDone(0, 0, 0, 1) != kWdStuck) Fail("T-1084 s3 done: a write never answered was not stuck");
+    if (kWriteBoundMs != 60000u) Fail("T-1084 s3 done: the write bound is not 60 s");
+    if (R5Confirmed(1, 101, 100) != 1 || R5Confirmed(1, 100, 100) != 0 || R5Confirmed(0, 500, 100) != 0) Fail("T-1084 s3 R5: a confirm older than the asked write, or with no stamp, counted");
+    /* the authority's arm: heldByOther */
+    if (AuthorityArm(0) != kAuthBuild || AuthorityArm(-1) != kAuthNoMap || AuthorityArm(1) != kAuthHeldElsewhere || AuthorityArm(-2) != kAuthHeldElsewhere) Fail("T-1084 s3: the authority's arm");
+    /* sweep trigger (d): before, now (HeldByOtherTS), mineHeld - the remembered answer is the last holder-or-nobody one (fold 1) */
+    {
+        int st = 9;
+        if (AreaFreedStep(1, 0, 0, &st) != 1 || st != 0) Fail("T-1084 s3 (d): an area another game held, now held by nobody, was not seen");
+        st = 9; if (AreaFreedStep(1, 0, 1, &st) != 0 || st != 0) Fail("T-1084 s3 (d): an area this game took over was seen as freed");
+        st = 9; if (AreaFreedStep(0, 0, 0, &st) != 0 || st != 0) Fail("T-1084 s3 (d): an area nobody held was seen as freed");
+        st = 9; if (AreaFreedStep(1, 1, 0, &st) != 0 || st != 1) Fail("T-1084 s3 (d): an area still held elsewhere was seen as freed");
+        st = 9; if (AreaFreedStep(1, -1, 0, &st) != 0 || st != 1) Fail("T-1084 s3 (d): no fresh map lost the remembered holder or fired");
+        st = 9; if (AreaFreedStep(1, -2, 0, &st) != 0 || st != 1) Fail("T-1084 s3 (d): frozen lost the remembered holder or fired");
+        st = 9; if (AreaFreedStep(0, -2, 0, &st) != 0 || st != 0) Fail("T-1084 s3 (d): frozen changed a remembered nobody");
+        st = 9; if (AreaFreedStep(0, 1, 0, &st) != 0 || st != 1) Fail("T-1084 s3 (d): a new holder was not remembered");
+        int mem = 0, fired = 0;
+        const int seq[] = { 1, -2, -1, -2, 0 };
+        for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); ++i) { int nx = 0; fired += AreaFreedStep(mem, seq[i], 0, &nx); mem = nx; }
+        if (fired != 1 || mem != 0) Fail("T-1084 s3 (d): held -> frozen -> nobody did not fire exactly once");
+        mem = 0; fired = 0;
+        const int seq2[] = { 1, -2, 1, 0, 0 };
+        for (size_t i = 0; i < sizeof(seq2) / sizeof(seq2[0]); ++i) { int nx = 0; fired += AreaFreedStep(mem, seq2[i], 0, &nx); mem = nx; }
+        if (fired != 1) Fail("T-1084 s3 (d): a freed area fired again while nobody held it");
+    }
+    if (MarkArrivalSweep(1, 1) != kMsSweep || MarkArrivalSweep(0, 1) != kMsNotLoaded || MarkArrivalSweep(1, 0) != kMsNotHeld || MarkArrivalSweep(1, -1) != kMsNotHeld) Fail("T-1084 s3: the mark's one-shot sweep");
+    /* a note that moved no copy: notNewer, foundUnderNoteKey, usable, hasCopy, failedBefore, mineHeld */
+    if (NoteSkipWhy(1, 1, 1, 1, 1, 1) != kNoteNotNewer || NoteSkipWhy(0, 1, 0, 0, 0, 0) != kNoteApplied) Fail("T-1084 s3 notes: not newer / applied");
+    if (NoteSkipWhy(0, 0, 0, 0, 0, 1) != kNoteNoRecord || NoteSkipWhy(0, 0, 1, 1, 0, 1) != kNoteOtherKey || NoteSkipWhy(0, 0, 1, 0, 1, 1) != kNoteFailedBefore) Fail("T-1084 s3 notes: no record / other key / failed before");
+    if (NoteSkipWhy(0, 0, 1, 0, 0, 0) != kNoteNotHeld || NoteSkipWhy(0, 0, 1, 0, 0, -1) != kNoteNotHeld || NoteSkipWhy(0, 0, 1, 0, 0, 1) != kNoteBuilt) Fail("T-1084 s3 notes: not held here / built");
+    if (NoteSkipWhy(0, 0, 1, 0, 0, 1) == kNoteBuilt && coopsquad::TravelInBuild(1, 0, 0, 1) != 1) Fail("T-1084 s3 notes: the built answer and the travel-in road disagree");
+    /* the world reset moves the marks and the holder history with the old world's records */
+    if (worldreset::ResetClassify("recorded_areas.txt", 0) != worldreset::kResetMove || worldreset::ResetClassify("area_holders.txt", 0) != worldreset::kResetMove) Fail("T-1084 s3: recorded_areas.txt / area_holders.txt is not moved by a world reset");
+    /* the wiring, by text */
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp"), sv = T313ReadFile("../coop-store/store_main.cpp"), tg = T313ReadFile("../coop-plugin/towngen.cpp"), ws = T313ReadFile("../coop-plugin/worldsync.cpp");
+    if (st.empty() || sv.empty() || tg.empty() || ws.empty()) { Fail("T-1084 s3: could not read store.cpp / store_main.cpp / towngen.cpp / worldsync.cpp"); return; }
+    if (st.find("const unsigned int kStoreMsgAreaRecorded = 83;") == std::string::npos || sv.find("const int MSG_AREA_RECORDED = 83;") == std::string::npos) Fail("T-1084 s3: the game and the world server do not both name message 83 AREA_RECORDED");
+    /* fold 1: R6 is gone - one decision at the wake, after T-300 */
+    if (st.find("UnrecordedWake(") != std::string::npos || st.find("g_unrecordedWake") != std::string::npos) Fail("T-1084 s3 fold 1: R6 (the marked-area refusal of every save group with no full record) is still there");
+    {
+        const size_t t300 = st.find("T300OtherHeld(rt->second) == 1 && T300WorldFaction(platoon) == 1"), dec = st.find("if (g_on && g_dirReady && ArWakeDecide(platoon) == 1)");
+        if (t300 == std::string::npos || dec == std::string::npos || dec < t300) Fail("T-1084 s3: the decision is not after T-300 at the wake");
+    }
+    if (T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "SquadLoadFloor(o->wid, q.faction, &o->num, &o->floor)") == 0) Fail("T-1084 s3 wake: the decision does not read the load floor");
+    if (T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "a.floorRead = g_loadFloorDone ? 1 : 0;") == 0) Fail("T-1084 s3 wake: the decision does not tell 'floors not read yet' from 'no floor for the faction'");
+    if (T1080BodyHas(st, "void ArPendStart(", "p.floorWait = r.in.floorRead == 0 ? 1 : 0;") == 0 || T1080BodyHas(st, "void ArSettleTick()", "pe.floorWait != 0 && r.in.floorRead != 0") == 0
+        || T1080BodyHas(st, "void ArSettleTick()", "(pe.link == link || pe.floorWait != 0)") == 0 || T1080BodyHas(st, "void ArSettleTick()", "it->second.at = now;") == 0)
+        Fail("T-1084 s3 settle: a group held for the load floors is not re-decided once they are read, or its bound counts the load's time");
+    if (T1080BodyHas(st, "void ArSettleTick()", "if (pe.via == kArViaWake) ++g_arWake[ans]; else ++g_arFirst[ans];") == 0)
+        Fail("T-1084 s3 settle: the answer a floor-held group gets once the floors are read is not counted by its own name");
+    if (st.find("visitDoubt,notVisited,floorPending]=") == std::string::npos || st.find("\"notVisited\", \"floorPending\" }") == std::string::npos) Fail("T-1084 s3: floorPending is not counted on the REPORT or named in the log");
+    if (T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "arearec::AtWakeDecide(") == 0 || T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "ArMatch(") == 0
+        || T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "arearec::VisitedByOther(") == 0 || T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "ArGroupUnique(platoon)") == 0
+        || T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "ArRecFullOf(o->wid)") == 0 || T1080BodyHas(st, "int ArDecideNow(void* platoon, int awake, ArRead* o)", "AreaDoneHeldGate(") == 0)
+        Fail("T-1084 s3 wake: the decision does not read a full record, the feed's end, the matching, the holder history or the unique answer");
+    if (T1080BodyHas(st, "std::string ArMatch(", "arearec::MatchRecord(") == 0 || T1080BodyHas(st, "std::string ArMatch(", "arearec::RecordCounts(") == 0 || T1080BodyHas(st, "std::string ArMatch(", "arearec::MatchPick(") == 0
+        || T1080BodyHas(st, "std::string ArMatch(", "g_arClaimed.find(id)") == 0 || T1080BodyHas(st, "std::string ArMatch(", "CopyGateNow(r.x, r.z)") == 0 || T1080BodyHas(st, "std::string ArMatch(", "MirrorKeepGated(id)") == 0)
+        Fail("T-1084 s3 match: the scan does not ask its rules, the claims, the copy gate or the held-back records");
+    if (T1080BodyHas(st, "void ArRefuse(", "g_arClaimed[r.matchId] = platoon;") == 0 || T1080BodyHas(st, "void ArRefuse(", "WakeDupQueue(platoon, r.wid);") == 0) Fail("T-1084 s3: a refusal does not claim its record or take the duplicate-wake road");
+    if (T1080BodyHas(st, "int ArGroupUnique(void* platoon)", "KillNamedIsUniquePod(") == 0) Fail("T-1084 s3: an awake group's members are not asked Character::isUnique");
+    if (T1080BodyHas(st, "void ArSettleTick()", "arearec::PendingSettle(") == 0 || T1080BodyHas(st, "void ArSettleTick()", "ArRefuse(p, r, ans,") == 0 || T1080BodyHas(st, "void ArSettleTick()", "arearec::SettleStucksArea(") == 0)
+        Fail("T-1084 s3 settle: pending groups are not settled by the rule, refused on the road, or their areas kept unmarked");
+    if (T1080BodyHas(st, "void ArFirstSight(void* platoon, int via)", "ArPendStart(platoon, r, via);") == 0 || T1080BodyHas(st, "void ArFirstSight(void* platoon, int via)", "kArProbeAdoptedFirst") == 0) Fail("T-1084 s3: the first sight does not hold a group pending or count an adoption before it");
+    /* the pending gates */
+    if (st.find("if (living > 0) { ++g_watchAlive; ArFirstSight(p, kArViaWatch); HbRegister(p);") == std::string::npos) Fail("T-1084 s3: DeathWatchTick's registration does not decide the first sight first");
+    if (T1080BodyHas(st, "int HbOwnedAwake(", "if (g_arPending.count(platoon) != 0) { ++g_arPendHbSkipped; return 0; }") == 0) Fail("T-1084 s3: the heartbeat publishes a pending group");
+    if (T1080BodyHas(st, "void detour_deactivate(void* platoon, void* container)", "if (g_arPending.count(platoon) != 0) { ++g_arPendSleepSkipped; return; }") == 0) Fail("T-1084 s3: the sleep writes a pending group");
+    if (T1080BodyHas(st, "int StoreArHoldPeople(void* platoon)", "ArFirstSight(platoon, kArViaSweep);") == 0 || ws.find("StoreArHoldPeople(psv.platoon) == 1") == std::string::npos) Fail("T-1084 s3: the people sweep adopts a pending group's people");
+    if (T1080BodyHas(st, "void PublishSleepingPositions()", "++g_arPosSkipped; continue;") == 0) Fail("T-1084 s3: a position-only note is made for a save group in an unmarked area");
+    if (T1080BodyHas(st, "void ForgetPlatoonRows(void* platoon, bool money)", "g_arPending.erase(platoon); g_arSeen.erase(platoon);") == 0) Fail("T-1084 s3: a freed platoon stays pending");
+    if (T1080BodyHas(st, "void ArRunsClear()", "g_arClaimed.clear();") == 0 || T1080BodyHas(st, "void ArRunsClear()", "g_arPending.clear();") == 0) Fail("T-1084 s3: the claims and the pending groups outlive the world");
+    /* the R5 run */
+    if (T1080BodyHas(st, "void ArTick()", "arearec::MarkSendStep(") == 0 || T1080BodyHas(st, "void ArTick()", "ArSettleTick();") == 0 || T1080BodyHas(st, "void ArTick()", "kStoreMsgAreaRecorded") == 0
+        || T1080BodyHas(st, "void ArTick()", "ArPendingIn(k)") == 0) Fail("T-1084 s3 R5: the run does not settle, ask its rule, wait for pending groups or send the mark");
+    if (st.find("int ArPass(") != std::string::npos || st.find("int ArSleepersIn(") != std::string::npos) Fail("T-1084 s3: the post-wake pass or the wait-for-wakes is still there");
+    if (T1080BodyHas(st, "int ArPendingIn(int k)", "ArAreaNow(it->first, &awake) == k && awake != 0") == 0) Fail("T-1084 s3 fold 1: a pending group's area is not read now, or an asleep one holds the mark");
+    if (T1080BodyHas(st, "void ArSettleTick()", "++g_arPendWentAsleep;") == 0 || T1080BodyHas(st, "void ArSettleTick()", "g_arPendAsleepNow = asleepNow;") == 0)
+        Fail("T-1084 s3 fold 2: an asleep pending group is decided every turn, or counted per second");
+    if (T1080BodyHas(sv, "void HolderHistoryNote()", "g_ahLastState.find(key)") == 0) Fail("T-1084 s3 fold 2: the holder counters count calls, not changes");
+    if (T1080BodyHas(st, "void ArSettleTick()", "arearec::PendingElapsed(") == 0 || T1080BodyHas(st, "void ArSettleTick()", "st == arearec::kPsWaitAsleep") == 0)
+        Fail("T-1084 s3 fold 1: the bound does not count from the feed's progress, or an asleep group is released unwritten");
+    if (T1080BodyHas(st, "bool StoreFeedSend(const std::vector<char>& b)", "g_arFeedProgressAt =") == 0 || T1080BodyHas(st, "void StoreFeedMarkerApply(const std::vector<char>& payload)", "g_arFeedProgressAt =") == 0)
+        Fail("T-1084 s3 fold 1: the feed's progress is not stamped");
+    if (T1080BodyHas(st, "void KeptRecordSweepTick()", "ArClaimFailNote(id)") == 0 || T1080BodyHas(st, "void MadeEmptyNotPlacedAgain(const std::string& worldId)", "ArClaimFailNote(worldId)") == 0)
+        Fail("T-1084 s3 fold 1: a claimed record's failed build is not counted");
+    if (T1080BodyHas(st, "void PublishSleepingPositions()", "ArMarked(") != 0) Fail("T-1084 s3 fold 1: the position-only note is refused only in unmarked areas");
+    if (T1080BodyHas(st, "int ArAskWrites(int k, ArRun* run, DWORD now)", "HbMarkDirty(ps[i], kHbCauseRecord)") == 0 || T1080BodyHas(st, "int ArAskWrites(int k, ArRun* run, DWORD now)", "ArRecFullOf(wid)") == 0
+        || T1080BodyHas(st, "void HbMarkDirty(void* platoon, int cause)", "cause == kHbCauseRecord") == 0) Fail("T-1084 s3 R5: the writes are not asked through the heartbeat for groups with no full record");
+    if (T1080BodyHas(st, "int ArWriteWaiting(int k, ArRun* run, DWORD now)", "arearec::WriteDone(") == 0) Fail("T-1084 s3 R5: completeness does not ask its rule");
+    if (T1080BodyHas(st, "void StoreApplyRecordSeq(const std::vector<char>& payload)", "ArRecordEcho(worldId, hasStamp,") == 0) Fail("T-1084 s3 R5: the RECORD_SEQ confirm does not reach the run");
+    if (T1080BodyHas(st, "void ArDownArrive(const std::vector<char>& payload)", "arearec::MarkArrivalSweep(") == 0 || T1080BodyHas(st, "void ArDownArrive(const std::vector<char>& payload)", "g_arHolders[rows[i].key] = rows[i].slots;") == 0
+        || st.find("ArDownArrive(m.payload);") == std::string::npos) Fail("T-1084 s3: the marks' and holders' arrival is not wired");
+    if (T1080BodyHas(st, "void StoreFeedOffAtLoad(const char* why)", "ArClear();") == 0 || (st.find("AreaDoneClear();   /* T-985 step 2B: and no area of it */\r\n            ArClear();") == std::string::npos && st.find("AreaDoneClear();   /* T-985 step 2B: and no area of it */\n            ArClear();") == std::string::npos)
+        || T1080BodyHas(st, "void ArClear()", "g_arHolders.clear();") == 0)
+        Fail("T-1084 s3: the mark list and the holder history are not cleared at the WELCOME and the world load");
+    if (tg.find("namespace coop { int TownGenRecipeUnique(void* platoon) { T2Recipe r; T2RecipeUnique(platoon, &r);") == std::string::npos) Fail("T-1084 s3: the unique answer is not the town rebuild's recipe walk");
+    if (T1080BodyHas(st, "int SquadOriginSlot(", "SquadLoadFloor(wid, faction, &n, &floorValue)") == 0) Fail("T-1084 s3: the origin and R6 do not share one load floor");
+    if (T1080BodyHas(st, "void KeptRecordSweepTick()", "SweepWaitsForMark") != 0) Fail("T-1084 s3 fold 1: the newly-held sweep still waits for the mark");
+    if (T1080BodyHas(st, "void KeptRecordSweepTick()", "arearec::AreaFreedStep(") == 0 || T1080BodyHas(st, "void KeptRecordSweepTick()", "KeptSweepQueue(kSweepFreed, &freed)") == 0
+        || T1080BodyHas(st, "void KeptRecordSweepTick()", "ArStartRuns(newly)") == 0)
+        Fail("T-1084 s3: the sweep does not see a freed area or start R5");
+    if (T1080BodyHas(st, "int CopyGateNow(float x, float z)", "HeldByOtherTS(SectorOf(x, z))") == 0) Fail("T-1084 s3: the authority's arm does not read who else holds the area");
+    if (T1080BodyHas(sv, "void OnAreaRecorded(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)", "arearec::MarkTake(") == 0
+        || T1080BodyHas(sv, "void OnAreaRecorded(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)", "ZoneHolderIdOf(") == 0
+        || T1080BodyHas(sv, "void OnAreaRecorded(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)", "WriteRecordedAreas();") == 0
+        || sv.find("OnAreaRecorded(host, peer, payload);") == std::string::npos || sv.find("SendRecordedAreasList(from);") == std::string::npos || sv.find("LoadRecordedAreas();   /* T-1084 step 3 */") == std::string::npos)
+        Fail("T-1084 s3: the world server does not judge, keep, load or send the marks");
+    if (T1080BodyHas(sv, "void WriteRecordedAreas()", "if (!g_arFileRead) { ++g_arWriteHeld; return; }") == 0 || T1080BodyHas(sv, "void LoadRecordedAreas()", "ERROR_FILE_NOT_FOUND") == 0)
+        Fail("T-1084 s3 fold 1: an unreadable marks file could be written over");
+    /* the holder history on the world server */
+    if (T1080BodyHas(sv, "void WriteAreasNow()", "HolderHistoryNote();") == 0 || T1080BodyHas(sv, "void HolderHistoryNote()", "arearec::HolderNote(") == 0 || T1080BodyHas(sv, "void HolderHistoryNote()", "arearec::EncodeDownHolders(") == 0
+        || T1080BodyHas(sv, "void SendRecordedAreasList(ENetPeer* to)", "arearec::EncodeDownList(&b, keys, rows);") == 0 || sv.find("LoadAreaHolders();   /* T-1084 step 3 (owner 1129 a)") == std::string::npos)
+        Fail("T-1084 s3 holders: the world server does not learn, send or load the holder history");
+    if (T1080BodyHas(sv, "void HolderHistoryNote()", "arearec::HolderConfirmed(") == 0 || sv.find("++g_areasUnconfirmedConfirmed;\r\n              HolderHistoryNote();") == std::string::npos && sv.find("++g_areasUnconfirmedConfirmed;\n              HolderHistoryNote();") == std::string::npos)
+        Fail("T-1084 s3 fold 1: the holder history notes unconfirmed holds, or misses a confirmation");
+    if (T1080BodyHas(sv, "void WriteAreaHolders()", "if (!g_ahFileRead) { ++g_ahWriteHeld; return; }") == 0 || T1080BodyHas(sv, "void LoadAreaHolders()", "ERROR_FILE_NOT_FOUND") == 0)
+        Fail("T-1084 s3 holders: an unreadable holder file could be written over");
+}
+/* T-1084 step 1: a sleeping copy is built from a record only by the off-screen authority, a game whose configured role is
+   single-player, or the game that holds the squad's area; the kept-records sweep and the travel-in road; the wiring */
+void t_t1084_copy_gate()
+{
+    using namespace coopsquad;
+    if (CopyBuildGate(0, 0, 0, 1) != kCopyNotOther) Fail("T-1084: a game that is not the authority built a copy in an area another game or nobody holds");
+    if (CopyBuildGate(0, 0, -2, -2) != kCopyNotOther) Fail("T-1084: a copy was built in a frozen area (its holder not in the world)");
+    if (CopyBuildGate(0, 0, -1, -1) != kCopyNotNoMap) Fail("T-1084: a copy was built with no fresh area map");
+    if (CopyBuildGate(1, 0, 0, 0) != kCopyBuild) Fail("T-1084: the off-screen authority did not build its copy for travel where no game holds the area");
+    /* T-1084 step 3: the authority's arm - only where no game holds the area (the T1571 loop) */
+    if (CopyBuildGate(1, 0, 0, 1) != kCopyNotOther || CopyBuildGate(1, 0, 0, -2) != kCopyNotOther) Fail("T-1084 step 3: the authority built a copy in an area another game holds, or a frozen one");
+    if (CopyBuildGate(1, 0, -1, -1) != kCopyNotNoMap) Fail("T-1084 step 3: the authority built a copy with no fresh area map");
+    if (CopyBuildGate(1, 0, 1, 0) != kCopyBuild || CopyBuildGate(1, 1, 0, 1) != kCopyBuild) Fail("T-1084 step 3: the authority that holds the area, or a single-player game, did not build");
+    if (CopyBuildGate(0, 1, 0, 1) != kCopyBuild) Fail("T-1084: a game configured single-player did not build its copy");
+    if (CopyBuildGate(0, 0, 1, 0) != kCopyBuild) Fail("T-1084: the game that holds the area did not take today's road");
+    /* the sweep's pick, branch by branch: usable, hasCopy, failedBefore, gate, loadedHere, newlyHeldHere, onlyNewlyHeld */
+    if (SweepPick(1, 0, 0, CopyBuildGate(1, 0, 0, 0), 0, 0, 0) != kSwBuild) Fail("T-1084 sweep: the new authority did not build a kept record");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, 1, 0), 0, 0, 0) != kSwBuild) Fail("T-1084 sweep: a kept record in an area this game holds was not built");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, 0, 1), 0, 0, 0) != kSwNoCopy) Fail("T-1084 sweep: a kept record in an area this game does not hold was built");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, -1, -1), 0, 0, 0) != kSwNoCopy) Fail("T-1084 sweep: a kept record was built with no fresh map");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, -2, -2), 0, 0, 0) != kSwNoCopy) Fail("T-1084 sweep: a kept record was built in a frozen area");
+    if (SweepPick(0, 0, 0, kCopyBuild, 0, 1, 1) != kSwGone) Fail("T-1084 sweep: a gone / deleted / kept-gated record was built");
+    if (SweepPick(1, 1, 0, kCopyBuild, 0, 1, 1) != kSwHasCopy) Fail("T-1084 sweep: a record with a copy here was built again");
+    if (SweepPick(1, 0, 1, kCopyBuild, 0, 1, 1) != kSwFailedBefore) Fail("T-1084 sweep: a record whose build failed in this world was tried again");
+    if (SweepPick(1, 0, 0, CopyBuildGate(1, 0, 0, 0), 1, 0, 0) != kSwDeferLoaded) Fail("T-1084 sweep: a record in an area loaded here was built beside the holder's group");
+    /* the newly-held trigger's selection */
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, 1, 0), 0, 1, 1) != kSwBuild) Fail("T-1084 sweep: a record inside a newly held area was not built");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, 1, 0), 1, 1, 1) != kSwBuild) Fail("T-1084 sweep: a record inside a newly held area loaded here was deferred (this game is the holder)");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, 1, 0), 0, 0, 1) != kSwOutside) Fail("T-1084 sweep: a record outside the newly held areas was taken by that trigger");
+    if (SweepPick(1, 0, 0, CopyBuildGate(0, 0, 0, 1), 0, 1, 1) != kSwNoCopy) Fail("T-1084 sweep: a newly held area that is no longer held was built in");
+    if (NewlyHeld(0, 1) != 1 || NewlyHeld(1, 1) != 0 || NewlyHeld(0, 0) != 0 || NewlyHeld(1, 0) != 0 || NewlyHeld(0, -2) != 0) Fail("T-1084: the newly-held edge");
+    /* travel in: usable, hasCopy, failedBefore, mineHeld */
+    if (TravelInBuild(1, 0, 0, 1) != 1) Fail("T-1084 travel-in: a squad moved into an area this game holds was not built");
+    if (TravelInBuild(1, 0, 0, 0) != 0 || TravelInBuild(1, 0, 0, -1) != 0 || TravelInBuild(1, 0, 0, -2) != 0) Fail("T-1084 travel-in: built in an area this game does not hold");
+    if (TravelInBuild(0, 0, 0, 1) != 0 || TravelInBuild(1, 1, 0, 1) != 0 || TravelInBuild(1, 0, 1, 1) != 0) Fail("T-1084 travel-in: built from a gone record, beside a copy, or after a failed build");
+    /* fold 2: the queue's area filter */
+    if (SweepQueueTakes(0, 0, 0) != 1 || SweepQueueTakes(0, 1, 1) != 1) Fail("T-1084 sweep queue: a record the trigger names was not queued");
+    if (SweepQueueTakes(0, 1, 0) != 0) Fail("T-1084 sweep queue: a record outside the newly held areas was queued by that trigger");
+    if (SweepQueueTakes(1, 0, 0) != 0 || SweepQueueTakes(1, 1, 1) != 0) Fail("T-1084 sweep queue: a zone record was queued");
+    /* the per-entry why and area */
+    if (SweepInNewlyHeld(kSweepWhyNewlyHeld, 77, 77) != 1 || SweepInNewlyHeld(kSweepWhyNewlyHeld | kSweepWhyAuthority, 77, 77) != 1) Fail("T-1084 sweep: a record still in the area it was queued for was not taken as newly held");
+    if (SweepInNewlyHeld(kSweepWhyNewlyHeld, 77, 78) != 0) Fail("T-1084 sweep: a record that left the area it was queued for was taken as newly held");
+    if (SweepInNewlyHeld(kSweepWhyAuthority, 77, 77) != 0 || SweepInNewlyHeld(kSweepWhyNewlyHeld, -1, -1) != 0) Fail("T-1084 sweep: an entry not queued as newly held was taken as newly held");
+    if (SweepOnlyNewlyHeld(kSweepWhyNewlyHeld) != 1 || SweepOnlyNewlyHeld(kSweepWhyNewlyHeld | kSweepWhyMapFresh) != 0 || SweepOnlyNewlyHeld(kSweepWhyAuthority) != 0) Fail("T-1084 sweep: the only-newly-held reason");
+    /* the change detection, area by area */
+    {
+        int n = 9;
+        if (SweepAreaStep(0, 1, &n) != 1 || n != 1) Fail("T-1084 area step: a newly held area was not seen");
+        n = 9; if (SweepAreaStep(1, 1, &n) != 1 || n != 0) Fail("T-1084 area step: an area held before was seen as newly held");
+        n = 9; if (SweepAreaStep(1, -1, &n) != 1 || n != 0) Fail("T-1084 area step: no fresh map changed the stored answer");
+        n = 9; if (SweepAreaStep(0, -1, &n) != 0 || n != 0) Fail("T-1084 area step: no fresh map made an area held");
+        n = 9; if (SweepAreaStep(1, 0, &n) != 0 || n != 0) Fail("T-1084 area step: an area given up was kept as held");
+        n = 9; if (SweepAreaStep(1, -2, &n) != 0 || n != 0) Fail("T-1084 area step: a frozen area was kept as held");
+        n = 9; if (SweepAreaStep(SweepAreaStep(1, -1, &n), 1, &n) != 1 || n != 0) Fail("T-1084 area step: a map gap then the same holder was seen as newly held");
+    }
+    /* the map sequence */
+    if (SweepMapApplied(5u, 5u) != 0 || SweepMapApplied(5u, 6u) != 1 || SweepMapApplied(0xFFFFFFFFu, 0u) != 1) Fail("T-1084 sweep: an applied area map");
+    if (SweepMapFreshFires(1, 1) != 1 || SweepMapFreshFires(1, 0) != 0 || SweepMapFreshFires(0, 1) != 0) Fail("T-1084 sweep: trigger (b)");
+    /* trigger (a): the turn to authority, on known answers only */
+    {
+        int last = 0;
+        if (SweepAuthorityTurned(0, 0, &last) != 0 || last != 0) Fail("T-1084 authority: an unknown answer fired or was stored");
+        if (SweepAuthorityTurned(1, 1, &last) != 1 || last != 1) Fail("T-1084 authority: the turn to authority did not fire");
+        if (SweepAuthorityTurned(0, 0, &last) != 0 || last != 1) Fail("T-1084 authority: a link drop changed the last known answer");
+        if (SweepAuthorityTurned(1, 1, &last) != 0) Fail("T-1084 authority: a relink fired as a new authority");
+        if (SweepAuthorityTurned(1, 0, &last) != 0 || last != 0) Fail("T-1084 authority: losing the authority fired or was not stored");
+        if (SweepAuthorityTurned(1, 1, &last) != 1) Fail("T-1084 authority: a later turn to authority did not fire");
+    }
+    /* an old world's leftover roaming squad */
+    if (SweepRetireRoad(1, 1) != kSwRoadRetire) Fail("T-1084 sweep: a leftover in an area this game holds was not retired");
+    if (SweepRetireRoad(0, 1) != kSwRoadLeftoverSkip) Fail("T-1084 sweep: a leftover in an area this game does not hold was retired or built");
+    if (SweepRetireRoad(1, 0) != kSwRoadBuild || SweepRetireRoad(0, 0) != kSwRoadBuild) Fail("T-1084 sweep: a squad that is no leftover was not built");
+    const std::string st = T313ReadFile("../coop-plugin/store.cpp");
+    if (st.empty()) { Fail("T-1084: could not read store.cpp"); return; }
+    if (T1080BodyHas(st, "int CopyGateNow(float x, float z)", "OffscreenAuthority()") == 0 || T1080BodyHas(st, "int CopyGateNow(float x, float z)", "MineHeldTS(SectorOf(x, z))") == 0
+        || T1080BodyHas(st, "int CopyGateNow(float x, float z)", "RoleIsSingle()") == 0)
+        Fail("T-1084: the gate does not read the exact states (the named authority, the configured role, the area map's holder)");
+    {
+        const size_t s = T1080DefAt(st, "void ApplyRemoteRecord("), e = T1080BodyEnd(st, s);
+        const size_t g = s == std::string::npos ? std::string::npos : st.find("CopyGateCount(CopyGateRecord(worldId, r), kCopyRoadRecv)", s);
+        const size_t c = s == std::string::npos ? std::string::npos : st.find("else if (CreateUnknownSquad(r))", s);
+        if (e == std::string::npos || g > e || c > e || g > c) Fail("T-1084: a record arriving for a squad unknown here is not gated before its copy is built");
+    }
+    if (T1080BodyHas(st, "int StoreRecreateSleepingFromRecord(const std::string& worldId, int runnerRestart)", "kCopyRoadRunnerRestart : kCopyRoadPeerDrop") == 0) Fail("T-1084: the re-create roads are not gated and counted apart");
+    if (T1080BodyHas(st, "void PlaceUnplacedNotes()", "kCopyRoadPlace") == 0 || T1080BodyHas(st, "void PlaceUnplacedNotes()", "if (CopyGateRecord(due[i], r) != coopsquad::kCopyBuild) continue;") == 0)
+        Fail("T-1084: the town-note placing is not gated at its due list and its creation");
+    if (T1080BodyHas(st, "void ApplyRemoteRecord(", "coopsquad::TravelInBuild(") == 0 || T1080BodyHas(st, "void ApplyRemoteRecord(", "RetireOldRoaming(tr)") == 0) Fail("T-1084: the travel-in road does not ask its rule and the retire rule");
+    if (T1080BodyHas(st, "void KeptRecordSweepTick()", "coopsquad::SweepPick(") == 0 || T1080BodyHas(st, "void KeptRecordSweepTick()", "coopsquad::SweepAreaStep(") == 0
+        || T1080BodyHas(st, "void KeptRecordSweepTick()", "coopsquad::SweepAuthorityTurned(") == 0 || T1080BodyHas(st, "void KeptRecordSweepTick()", "coopsquad::SweepRetireRoad(held, OldRoamingLeftover(r))") == 0
+        || T1080BodyHas(st, "void KeptRecordSweepTick()", "!g_noteRaiseDone") == 0 || T1080BodyHas(st, "void KeptRecordSweepTick()", "!g_sweepFirst.empty() ? g_sweepFirst : g_sweepPending") == 0
+        || T1080BodyHas(st, "void KeptSweepQueue(int why, const std::set<int>* sectors)", "coopsquad::SweepQueueTakes(") == 0
+        || T1080BodyHas(st, "void KeptRecordSweepTick()", "CreateUnknownSquad(r)") == 0)
+        Fail("T-1084: the kept-records sweep does not ask its rules on its three events");
+    if (T1080BodyHas(st, "int CopyGateCount(int gate, int road)", "g_sweepNoMapPending = true") == 0) Fail("T-1084: a no-map refusal does not arm the sweep");
+    /* T-1085 (owner 1131 a): a squad the engine does not keep - its copy is built only where its area is loaded here */
+    {
+        const int kNo = sqbirth::MadeKeptByte(sqbirth::kBirthDiscard), kKept = sqbirth::MadeKeptByte(sqbirth::kBirthKeep), kUnk = sqbirth::MadeKeptByte(sqbirth::kBirthUnknown);
+        if (kNo != 0 || kKept != 1 || kUnk != 1) Fail("T-1085: the kept answer the gate reads is not the copy's kept byte");
+        const int gates[6] = { CopyBuildGate(1, 0, 0, 0), CopyBuildGate(0, 0, 1, 0), CopyBuildGate(0, 1, 0, 1), CopyBuildGate(0, 0, 0, 1), CopyBuildGate(0, 0, -1, -1), CopyBuildGate(1, 0, 0, 1) };
+        for (int i = 0; i < 6; ++i)
+            for (int loaded = 0; loaded <= 1; ++loaded)
+                if (CopyKeptGate(gates[i], kKept, loaded) != gates[i] || CopyKeptGate(gates[i], kUnk, loaded) != gates[i])
+                    Fail("T-1085: a kept squad (or one whose record carries no flag) is not gated as before");
+        if (CopyKeptGate(CopyBuildGate(1, 0, 0, 0), kNo, 0) != kCopyNotKeptUnloaded) Fail("T-1085: the authority built a not-kept squad's copy in an area not loaded here");
+        if (CopyKeptGate(CopyBuildGate(1, 0, 0, 0), kNo, 1) != kCopyBuild) Fail("T-1085: the authority did not build a not-kept squad's copy in an area loaded here");
+        if (CopyKeptGate(CopyBuildGate(0, 0, 1, 0), kNo, 0) != kCopyNotKeptUnloaded) Fail("T-1085: the holder built a not-kept squad's copy in an area not loaded here");
+        if (CopyKeptGate(CopyBuildGate(0, 0, 1, 0), kNo, 1) != kCopyBuild) Fail("T-1085: the holder did not build a not-kept squad's copy in an area loaded here");
+        if (CopyKeptGate(CopyBuildGate(0, 1, 0, 1), kNo, 0) != kCopyNotKeptUnloaded || CopyKeptGate(CopyBuildGate(0, 1, 0, 1), kNo, 1) != kCopyBuild) Fail("T-1085: a single-player game's not-kept copy is not gated on its loaded area");
+        if (CopyKeptGate(CopyBuildGate(0, 0, -1, -1), kNo, 0) != kCopyNotNoMap || CopyKeptGate(CopyBuildGate(0, 0, -1, -1), kNo, 1) != kCopyNotNoMap
+            || CopyKeptGate(CopyBuildGate(1, 0, -1, -1), kNo, 1) != kCopyNotNoMap) Fail("T-1085: the no-map answer was not kept for a not-kept squad");
+        if (CopyKeptGate(CopyBuildGate(0, 0, 0, 1), kNo, 1) != kCopyNotOther || CopyKeptGate(CopyBuildGate(1, 0, 0, 1), kNo, 1) != kCopyNotOther) Fail("T-1085: a not-kept squad's copy was built in a loaded area another game holds");
+        if (CopyKeptGate(kCopyBuild, kNo, 0) != kCopyNotKeptUnloaded || CopyKeptGate(kCopyBuild, kNo, 1) != kCopyBuild) Fail("T-1085: the travel-in road's rule");
+        /* the engine's loaded byte could not be read (-1): not loaded - refused and waits; a kept squad is unchanged */
+        if (CopyKeptGate(kCopyBuild, kNo, -1) != kCopyNotKeptUnloaded || CopyKeptGate(CopyBuildGate(1, 0, 0, 0), kNo, -1) != kCopyNotKeptUnloaded
+            || CopyKeptGate(kCopyBuild, kKept, -1) != kCopyBuild) Fail("T-1085: an unreadable loaded byte was taken as loaded, or changed a kept squad");
+        /* the area-load re-ask: queued with its area, built even though the area is loaded here */
+        if (SweepInNewlyHeld(kSweepWhyLoaded, 77, 77) != 1 || SweepInNewlyHeld(kSweepWhyLoaded | kSweepWhyAuthority, 77, 77) != 1 || SweepInNewlyHeld(kSweepWhyLoaded, 77, 78) != 0)
+            Fail("T-1085 sweep: a record queued at its area's load is not judged by its area");
+        if (SweepOnlyNewlyHeld(kSweepWhyLoaded) != 1 || SweepOnlyNewlyHeld(kSweepWhyLoaded | kSweepWhyNewlyHeld) != 1 || SweepOnlyNewlyHeld(kSweepWhyLoaded | kSweepWhyMapFresh) != 0 || SweepOnlyNewlyHeld(0) != 0)
+            Fail("T-1085 sweep: the only-area-bound reason");
+        if (SweepPick(1, 0, 0, CopyKeptGate(CopyBuildGate(1, 0, 0, 0), kNo, 1), 1, SweepInNewlyHeld(kSweepWhyLoaded, 77, 77), SweepOnlyNewlyHeld(kSweepWhyLoaded)) != kSwBuild)
+            Fail("T-1085 sweep: a not-kept record whose area loaded here was not built");
+        if (SweepPick(1, 0, 0, CopyKeptGate(CopyBuildGate(1, 0, 0, 0), kNo, 0), 0, 0, 0) != kSwNoCopy) Fail("T-1085 sweep: a not-kept record was built in an area not loaded here");
+        if (SweepPick(1, 0, 0, CopyKeptGate(CopyBuildGate(1, 0, 0, 0), kKept, 0), 0, 0, 0) != kSwBuild) Fail("T-1085 sweep: a kept record is no longer built by the authority");
+        /* the wiring: the same kept-byte call as the creation, the loaded grid, every road */
+        if (T1080BodyHas(st, "static bool CreateUnknownSquad(const Record& r)", "SetPersistentPod(p, sqbirth::MadeKeptByte(r.birth) != 0)") == 0
+            || T1080BodyHas(st, "static int CopyGateKept(int gate, const std::string& id, const Record& r)", "sqbirth::MadeKeptByte(r.birth)") == 0
+            || T1080BodyHas(st, "static int CopyGateKept(int gate, const std::string& id, const Record& r)", "ZoneLoadedSectorTri(s.x, s.y)") == 0)
+            Fail("T-1085: the gate does not read the kept answer the creation writes, or the loaded area");
+        /* the loaded area is the engine's own byte (ZoneLoadedSectorTri), never the mod's once-a-second list, at the gate and the wait */
+        if (T1080BodyHas(st, "static int CopyGateKept(int gate, const std::string& id, const Record& r)", "SectorLoadedHereTS") != 0
+            || T1080BodyHas(st, "void KeptRecordSweepTick()", "const int zoneLoaded = ZoneLoadedSectorTri(s.x, s.y);") == 0
+            || T1080BodyHas(st, "void KeptRecordSweepTick()", "SectorLoadedHereTS") != 0)
+            Fail("T-1085: the not-kept gate or its wait reads the mod's loaded list, not the engine's loaded byte");
+        if (T1080BodyHas(st, "void KeptRecordSweepTick()", "gate = CopyGateRecord(id, rt->second);") == 0 || T1080BodyHas(st, "void KeptRecordSweepTick()", "e.why |= kSweepLoaded;") == 0
+            || T1080BodyHas(st, "void KeptRecordSweepTick()", "g_notKeptWait") == 0)
+            Fail("T-1085: the sweep does not gate not-kept records or ask them again when their area loads");
+        /* a waiting record whose squad has become kept leaves the wait unqueued (kSweepLoaded would skip the kept squads' loaded-area deferral) */
+        {
+            const std::string drop = "if (sqbirth::MadeKeptByte(rt->second.birth) != 0) { ++g_notKeptNowKept; g_notKeptWait.erase(it++); continue; }";
+            const size_t b = T1080DefAt(st, "void KeptRecordSweepTick()");
+            const size_t d = b == std::string::npos ? std::string::npos : st.find(drop, b);
+            const size_t q = b == std::string::npos ? std::string::npos : st.find("e.why |= kSweepLoaded;", b);
+            if (T1080BodyHas(st, "void KeptRecordSweepTick()", drop.c_str()) == 0 || d == std::string::npos || q == std::string::npos || d > q)
+                Fail("T-1085: the wait's scan does not drop a now-kept record before queuing it at its area's load");
+        }
+        if (T1080BodyHas(st, "void PlaceUnplacedNotes()", "const int gate = CopyGateRecord(it->first, *rp);") == 0
+            || T1080BodyHas(st, "int StoreRecreateSleepingFromRecord(const std::string& worldId, int runnerRestart)", "CopyGateRecord(worldId, it->second)") == 0
+            || T1080BodyHas(st, "void ApplyRemoteRecord(", "CopyGateKept(coopsquad::kCopyBuild, worldId, tr)") == 0)
+            Fail("T-1085: a road that builds a copy from its record does not ask the not-kept rule");
+        /* a squad made from its record is marked read when it is made: its first wake builds the record's people, not the template's */
+        if (T1080BodyHas(st, "static bool CreateUnknownSquad(const Record& r)", "MarkReadPod(cq.unloaded) == 1") == 0)
+            Fail("T-1085: a squad made from its record is not marked read when it is made");
+    }
+}
 /* T-999: the world server's judgement of a discard delete; the retire rule */
 void t_t999_server_and_retire()
 {
@@ -53389,6 +58036,1047 @@ void t_t999_birth_wire()
     if (!coopstore::MetaParse("v7\t1\t0\t0\t0\t0\tsid\tfac\tFac_1\t0\ttown\t0\t00000000\t3\thome\n", &b) || b.birth != -1 || b.home != "home") Fail("T-999: an older v7 line with a home does not read as unknown birth");
     b = coopstore::MetaLine();
     if (!coopstore::MetaParse("v7\t1\t0\t0\t0\t0\tsid\tfac\tFac_1\t0\ttown\t0\t00000000\t3\t\tq\n", &b) || b.birth != -1) Fail("T-999: an unknown birth text did not read as unknown");
+}
+#include "shoprec.h"   /* one shop building's restock state as one world-server record, and the restock gate's rules */
+/* A shop record: its id from the building's key (no height, the name hashed, prefix shop.), its bytes whole or refused, the world
+   server's rule (the area's holder only, named as the writer, a rising generation, the same bytes a repeat) and keeping by generation. */
+void t_t772_shop_record()
+{
+    using namespace shoprec;
+    const std::string key = "Hub bar@3,4@1234,-567,89";
+    const std::string id = MakeShopRecId(key);
+    if (id.empty() || id.compare(0, 5, "shop.") != 0) Fail("t772: no shop id from a position key");
+    if (id != MakeShopRecId("Hub bar@3,4@1234,-567,95")) Fail("t772: the height changed the shop id");
+    if (id.substr(5) != coopbrec::MakeBoxRecId(key).substr(4)) Fail("t772: the shop id is not the box id rule with the shop prefix");
+    int sx = -1, sy = -1;
+    if (ShopRecIdParse(id, &sx, &sy) != 1 || sx != 3 || sy != 4) Fail("t772: the shop id does not parse to its area square");
+    if (!IsShopRecId(id) || !IsShopRecId("SHOP.x") || IsShopRecId("box.3.4.#00000000.1.2") || coopbrec::IsBoxRecId(id)) Fail("t772: the id tests mix shop and box ids");
+    if (!MakeShopRecId("not a key").empty()) Fail("t772: a text that is not a position key made a shop id");
+    ShopRec r;
+    r.generation = 7; r.writerSlot = 2; r.key = key; r.deadline = 62.75; r.refills = 3; r.repairMark = kSrNoRepair;
+    ShopSquad a; a.name = "barman"; a.money = 5000; a.moneyChanges = 4; a.refillsApplied = 3;
+    ShopSquad b; b.name = "bar guards"; b.money = 0; b.moneyChanges = 1; b.refillsApplied = 2;
+    r.squads.push_back(a); r.squads.push_back(b);
+    std::vector<char> bytes;
+    if (!EncodeShopRec(&bytes, r)) Fail("t772: a valid shop record did not encode");
+    ShopRec back;
+    if (DecodeShopRec(&bytes[0], bytes.size(), &back) != kSrOk || back.generation != 7 || back.writerSlot != 2 || back.key != key
+        || back.deadline != 62.75 || back.refills != 3 || back.repairMark != kSrNoRepair || back.squads.size() != 2
+        || back.squads[0].name != "barman" || back.squads[0].money != 5000 || back.squads[0].moneyChanges != 4 || back.squads[1].refillsApplied != 2)
+        Fail("t772: the shop record did not round-trip");
+    std::vector<char> cut(bytes.begin(), bytes.end() - 1);
+    if (DecodeShopRec(&cut[0], cut.size(), 0) != kSrShort) Fail("t772: a record cut short was not refused");
+    std::vector<char> extra = bytes; extra.push_back(0);
+    if (DecodeShopRec(&extra[0], extra.size(), 0) != kSrTrailing) Fail("t772: bytes after the last squad were not refused");
+    std::vector<char> mark = bytes; mark[0] = 'X';
+    if (DecodeShopRec(&mark[0], mark.size(), 0) != kSrBadMarker) Fail("t772: a wrong marker was not refused");
+    ShopRec dup = r; dup.squads[1].name = "barman";
+    if (EncodeShopRec(&bytes, dup) || !bytes.empty()) Fail("t772: a record naming one squad twice encoded");
+    ShopRec neg = r; neg.squads[0].money = -1;
+    if (EncodeShopRec(&bytes, neg)) Fail("t772: negative money encoded");
+    ShopRec odd = r; odd.deadline = 0.0; odd.deadline = odd.deadline / odd.deadline;
+    if (EncodeShopRec(&bytes, odd)) Fail("t772: a deadline that is not a number encoded");
+    if (!EncodeShopRec(&bytes, r)) Fail("t772: the record did not encode again");
+    const char* p = &bytes[0]; const size_t n = bytes.size();
+    if (ShopJudgeWrite(id, p, n, 2, 2, 0, 0, 0, 0) != coopbrec::kBrAccept) Fail("t772: the holder's first record was not taken");
+    if (ShopJudgeWrite(id, p, n, 1, 2, 0, 0, 0, 0) != coopbrec::kBrRefuseWriter) Fail("t772: a record naming another writer was taken");
+    if (ShopJudgeWrite(id, p, n, 2, 1, 0, 0, 0, 0) != coopbrec::kBrRefuseNotWriter) Fail("t772: a write from a game that is not the holder was taken");
+    if (ShopJudgeWrite(id, p, n, 2, -1, 0, 0, 0, 0) != coopbrec::kBrRefuseNotWriter) Fail("t772: a write with nobody holding the area was taken");
+    if (ShopJudgeWrite(id, p, n, 2, 2, 1, 6, 0, 0) != coopbrec::kBrAccept) Fail("t772: a newer generation from the holder was refused");
+    if (ShopJudgeWrite(id, p, n, 2, 2, 1, 8, 0, 0) != coopbrec::kBrRefuseOlder) Fail("t772: an older generation was taken");
+    if (ShopJudgeWrite(id, p, n, 2, 2, 1, 7, 1, 0) != coopbrec::kBrRepeat) Fail("t772: the same bytes at the stored generation were not a repeat");
+    if (ShopJudgeWrite(id, p, n, 2, 2, 1, 7, 0, 0) != coopbrec::kBrRefuseSameGen) Fail("t772: other bytes at the stored generation were taken");
+    if (ShopJudgeWrite(MakeShopRecId("Other@3,4@1,1,1"), p, n, 2, 2, 0, 0, 0, 0) != coopbrec::kBrRefuseWrongBox) Fail("t772: a record under another shop's id was taken");
+    if (ShopJudgeWrite("shop.x", p, n, 2, 2, 0, 0, 0, 0) != coopbrec::kBrRefuseBadId) Fail("t772: a bad id was taken");
+    if (ShopIntakeKeep(0, 0, 1) != 1 || ShopIntakeKeep(1, 5, 6) != 1 || ShopIntakeKeep(1, 5, 5) != 0 || ShopIntakeKeep(1, 5, 4) != 0) Fail("t772: keeping by generation");
+    if (ShopNextGen(1, 5, 0) != 6 || ShopNextGen(1, 5, 9) != 10 || ShopNextGen(0, 0, 0) != 1) Fail("t772: the next write's generation");
+}
+/* The restock gate: only the holder by the current map; not before the record is known; a timed or holder-started refill only when
+   the building is due or the squad is behind; a forced refill only for a squad the record does not carry; held while any player is
+   inside; the refused restock leaves the record's time (or a short step) on the engine. */
+void t_t772_shop_gate()
+{
+    using namespace shoprec;
+    if (ShopGateDecide(kRoadTimed, 0, 1, 1, 1, 1, 0) != kGateRefuseNotHolder) Fail("t772: a game that is not the holder refilled");
+    if (ShopGateDecide(kRoadForced, 0, 1, 0, 0, 1, 0) != kGateRefuseNotHolder) Fail("t772: a forced refill ran on a game that is not the holder");
+    if (ShopGateDecide(kRoadLever, 0, 1, 1, 1, 1, 0) != kGateRefuseNotHolder) Fail("t772: the lever ran on a game that is not the holder");
+    if (ShopGateDecide(kRoadTimed, 1, 0, 0, 0, 1, 0) != kGateRefuseNotKnown) Fail("t772: the holder refilled before the record was known");
+    if (ShopGateDecide(kRoadForced, 1, 0, 0, 0, 1, 0) != kGateRefuseNotKnown) Fail("t772: a forced refill ran before the record was known");
+    if (ShopGateDecide(kRoadForced, 1, 1, 1, 1, 1, 0) != kGateRefuseHasRecord) Fail("t772: a forced refill ran over a record that carries the squad");
+    if (ShopGateDecide(kRoadForced, 1, 1, 1, 0, 1, 0) != kGateRun) Fail("t772: a forced refill for a squad the record does not carry was refused");
+    if (ShopGateDecide(kRoadForced, 1, 1, 0, 0, 1, 1) != kGateRun) Fail("t772: a forced refill with no record was refused");
+    if (ShopGateDecide(kRoadTimed, 1, 1, 1, 1, 0, 0) != kGateRefuseNotDue) Fail("t772: a timed refill ran before the shop's time");
+    if (ShopGateDecide(kRoadHolderStarted, 1, 1, 1, 1, 0, 0) != kGateRefuseNotDue) Fail("t772: a holder-started refill ran before the shop's time");
+    if (ShopGateDecide(kRoadTimed, 1, 1, 1, 1, 1, 0) != kGateRun) Fail("t772: a due refill on the holder did not run");
+    if (ShopGateDecide(kRoadTimed, 1, 1, 0, 0, 1, 0) != kGateRun) Fail("t772: the engine's own time with no record did not run");
+    if (ShopGateDecide(kRoadTimed, 1, 1, 1, 1, 1, 1) != kGateHeldPlayerInside) Fail("t772: a due refill ran while a player was inside");
+    if (ShopGateDecide(kRoadHolderStarted, 1, 1, 1, 1, 1, 1) != kGateHeldPlayerInside) Fail("t772: a holder-started refill ran while a player was inside");
+    if (ShopGateDecide(kRoadRepair, 1, 1, 1, 1, 1, 0) != kGateRun) Fail("t772: the repair's refill did not run when due");
+    if (ShopGateDecide(kRoadLever, 1, 0, 1, 1, 0, 1) != kGateRun) Fail("t772: the lever did not run on the holder");
+    ShopRec r; r.deadline = 100.0; r.refills = 4;
+    ShopSquad a; a.name = "a"; a.refillsApplied = 4; r.squads.push_back(a);
+    ShopSquad b; b.name = "b"; b.refillsApplied = 3; r.squads.push_back(b);
+    if (ShopDue(r, 0, 99.0) != 0) Fail("t772: a squad that answered the building's last refill was due before the time");
+    if (ShopDue(r, 0, 100.0) != 1) Fail("t772: the building's time passing did not make it due");
+    if (ShopDue(r, 1, 50.0) != 1) Fail("t772: a squad behind the building's refill was not due");
+    if (ShopDue(r, -1, 50.0) != 1) Fail("t772: a squad the record does not carry was not due");
+    if (ShopEngineTimer(1, 100.0, 50.0) != 100.0) Fail("t772: a refused restock did not leave the record's time on the engine");
+    if (ShopEngineTimer(1, 40.0, 50.0) != 50.0 + kSrRetryHours || ShopEngineTimer(0, 0.0, 50.0) != 50.0 + kSrRetryHours) Fail("t772: a past or missing time did not leave a short step");
+}
+/* After a refill on the holder: written only when the engine moved the squad's deadline; the building refills once and its time
+   becomes the engine's; a second squad answering the same refill only records it; money with a change count, applied by the runner
+   only when the count moved; the repair makes the shop due once per refill. */
+void t_t772_shop_after_run()
+{
+    using namespace shoprec;
+    ShopRec r; r.key = "Hub bar@3,4@1234,-567,89"; r.writerSlot = 1;
+    if (ShopAfterRun(&r, 0, "a", 0, 124.0, 100.0, 1, 900) != 0 || r.generation != 0) Fail("t772: a restock that refilled nothing was written");
+    if (ShopAfterRun(&r, 0, "a", 1, 124.0, 100.0, 1, 900) != 1) Fail("t772: the first refill was not written");
+    if (r.refills != 1 || r.deadline != 124.0 || r.generation != 1 || r.squads.size() != 1 || r.squads[0].money != 900
+        || r.squads[0].moneyChanges != 1 || r.squads[0].refillsApplied != 1) Fail("t772: the first refill's record");
+    if (ShopAfterRun(&r, 1, "b", 1, 125.0, 101.0, 1, 300) != 1 || r.refills != 1 || r.deadline != 124.0 || r.squads.size() != 2
+        || r.squads[1].refillsApplied != 1 || r.generation != 2) Fail("t772: a second squad of the building moved the building's refill");
+    if (ShopDue(r, 1, 101.0) != 0 || ShopDue(r, 0, 101.0) != 0) Fail("t772: a squad was due again after the building's refill");
+    if (ShopAfterRun(&r, 1, "a", 1, 150.0, 126.0, 1, 1000) != 1 || r.refills != 2 || r.deadline != 150.0 || r.squads[0].moneyChanges != 2)
+        Fail("t772: the building's next refill");
+    if (ShopDue(r, 1, 126.5) != 1) Fail("t772: the other squad was not due after the building refilled");
+    if (ShopAfterRun(&r, 1, "a", 1, 151.0, 127.0, 0, 0) != 1 || r.squads[0].money != 1000 || r.squads[0].moneyChanges != 2)
+        Fail("t772: an unread money changed the record's money");
+    if (ShopMoneyApplyDue(0, 0, 5) != 0) Fail("t772: the first look took the record's money");
+    if (ShopMoneyApplyDue(1, 5, 5) != 0) Fail("t772: a resend of the same change count changed the money again");
+    if (ShopMoneyApplyDue(1, 4, 5) != 1) Fail("t772: a new money change was not taken");
+    const unsigned int g = r.generation;
+    if (ShopMoneySet(&r, "a", 42) != 1 || r.squads[0].money != 42 || r.squads[0].moneyChanges != 3 || r.generation != g + 1) Fail("t772: the money set");
+    if (ShopMoneySet(&r, "zz", 42) != 0 || ShopMoneySet(&r, "a", -5) != 0) Fail("t772: a money set on no squad or below 0 changed the record");
+    if (ShopRepairAllowed(r) != 1) Fail("t772: a shop never repaired could not be repaired");
+    if (ShopRepairApply(&r, 130.0) != 1 || r.deadline != 130.0 || r.repairMark != r.refills) Fail("t772: the repair did not make the shop due now");
+    if (ShopRepairApply(&r, 131.0) != 0) Fail("t772: a second repair before any refill was asked");
+    if (ShopAfterRun(&r, 1, "a", 1, 155.0, 131.0, 1, 0) != 1 || ShopRepairApply(&r, 132.0) != 0) Fail("t772: a repair right after the repair's own refill was asked (a loop)");
+    if (ShopAfterRun(&r, 1, "a", 1, 180.0, 156.0, 1, 0) != 1 || ShopRepairApply(&r, 157.0) != 1) Fail("t772: a repair after a later refill was refused");
+}
+/* Trades through the shop record: a trade request is applied to the money once despite a resend (also from a new holder); two
+   players' requests are both kept; a game that is not the holder shows the record's money plus its own trades in flight the record
+   does not carry yet; a keeper the record does not carry keeps today's roads; the holder's pot becomes the record's money. */
+void t_t772_shop_money()
+{
+    using namespace shoprec;
+    ShopSquad s; s.name = "barman"; s.money = 1000;
+    if (ShopReqSeen(s, 5, 77, 1) != 0) Fail("t772m: a first request was taken as applied");
+    if (ShopReqNote(&s, 5, 77, 1) != 1 || ShopReqSeen(s, 5, 77, 1) != 1) Fail("t772m: an applied request was not remembered");
+    if (ShopReqNote(&s, 5, 77, 1) != 0) Fail("t772m: a resent request changed the record");
+    if (ShopReqSeen(s, 5, 77, 2) != 0) Fail("t772m: the asker's next request was taken as applied");
+    if (ShopReqNote(&s, 5, 77, 2) != 1 || ShopReqSeen(s, 5, 77, 1) != 1 || ShopReqSeen(s, 5, 77, 2) != 1) Fail("t772m: an older request of the same epoch was not covered");
+    if (ShopReqSeen(s, 5, 78, 1) != 0) Fail("t772m: a request of the asker's new process (epoch) was taken as applied");
+    if (ShopReqNote(&s, 9, 300, 4) != 1 || ShopReqSeen(s, 9, 300, 4) != 1 || ShopReqSeen(s, 5, 77, 2) != 1 || s.reqs.size() != 2)
+        Fail("t772m: two players' requests were not both kept");
+    if (ShopReqSeen(s, 9, 77, 2) != 0) Fail("t772m: one asker's request was taken as another's");
+    if (ShopReqNote(&s, 5, 78, 1) != 1 || ShopReqSeen(s, 5, 77, 2) != 0 || ShopReqSeen(s, 5, 78, 1) != 1 || s.reqs.size() != 2)
+        Fail("t772m: an asker's new epoch did not replace its old one");
+    ShopSquad full;
+    for (unsigned int a = 0; a < kSrMaxReqs + 3; ++a) ShopReqNote(&full, a, 1, 1);
+    if (full.reqs.size() != kSrMaxReqs || ShopReqSeen(full, kSrMaxReqs + 2, 1, 1) != 1 || ShopReqSeen(full, 0, 1, 1) != 0) Fail("t772m: a full asker list did not drop its oldest");
+    /* a resend after a holder change: the new holder reads the record the old holder wrote */
+    ShopRec r; r.key = "Hub bar@3,4@1234,-567,89"; r.writerSlot = 1; r.generation = 4; r.deadline = 30.0; r.refills = 1;
+    ShopSquad b; b.name = "barman"; b.money = 1000; b.moneyChanges = 2; b.refillsApplied = 1;
+    ShopReqNote(&b, 5, 77, 3);
+    r.squads.push_back(b);
+    std::vector<char> bytes;
+    if (!EncodeShopRec(&bytes, r)) Fail("t772m: a record with an asker list did not encode");
+    ShopRec back;
+    if (DecodeShopRec(&bytes[0], bytes.size(), &back) != kSrOk || back.squads[0].reqs.size() != 1 || back.squads[0].reqs[0].asker != 5
+        || back.squads[0].reqs[0].epoch != 77 || back.squads[0].reqs[0].done.size() != 1 || back.squads[0].reqs[0].done[0].id != 3)
+        Fail("t772m: the asker list did not round-trip");
+    if (ShopReqSeen(back.squads[0], 5, 77, 3) != 1) Fail("t772m: a resend to the new holder would be applied again");
+    ShopRec twice = r; ShopReq dup; dup.asker = 5; dup.epoch = 1; twice.squads[0].reqs.push_back(dup);
+    if (EncodeShopRec(&bytes, twice)) Fail("t772m: a record naming one asker twice encoded");
+    /* the holder's capture: a pot that differs from the record is a new change; the same pot is no change */
+    const unsigned int g = r.generation;
+    if (ShopMoneyFromPot(&r, "barman", 1000) != 0 || r.generation != g) Fail("t772m: an unchanged pot was written");
+    if (ShopMoneyFromPot(&r, "barman", 1250) != 1 || r.squads[0].money != 1250 || r.squads[0].moneyChanges != 3 || r.generation != g + 1)
+        Fail("t772m: a trade on the holder's pot did not become a change");
+    if (ShopMoneyFromPot(&r, "nobody", 5) != 0 || ShopMoneyFromPot(&r, "barman", -1) != 0) Fail("t772m: a pot of no squad, or below 0, was written");
+    /* the runner's pot: the record plus its own requests in flight the record does not carry */
+    if (ShopReqCovered(r.squads[0], 77, 3) != 1 || ShopReqCovered(r.squads[0], 77, 4) != 0 || ShopReqCovered(r.squads[0], 99, 1) != 0)
+        Fail("t772m: which of this game's requests the record carries");
+    if (ShopRunnerPot(1250, 0) != 1250 || ShopRunnerPot(1250, 300) != 1550 || ShopRunnerPot(1250, -400) != 850) Fail("t772m: the runner's pot with requests in flight");
+    if (ShopRunnerPot(100, -400) != 0 || ShopRunnerPot(kSrMoneyMax, 5) != kSrMoneyMax) Fail("t772m: the runner's pot left its range");
+    /* the roads */
+    if (ShopMoneyRoute(0, 1) != kMoneyToday || ShopMoneyRoute(0, 0) != kMoneyToday) Fail("t772m: a keeper without a record left today's roads");
+    if (ShopMoneyRoute(1, 1) != kMoneyHolderCapture || ShopMoneyRoute(1, 0) != kMoneyFromRecord) Fail("t772m: a recorded keeper's road");
+    /* a refused write: the working copy goes back to the world server's stored record (the last one received, or this game's own
+       accepted write of that generation); a record at the working copy's generation from another writer is taken */
+    {
+        ShopRec srv; srv.key = r.key; srv.writerSlot = 1; srv.generation = 9; srv.deadline = 30.0; srv.refills = 1;
+        ShopSquad sq; sq.name = "barman"; sq.money = 700; sq.moneyChanges = 5;
+        ShopReqNote(&sq, 5, 77, 11, 1, 300);
+        srv.squads.push_back(sq);
+        std::vector<ShopRec> own;
+        ShopRec base;
+        if (ShopRefusalBase(1, srv, own, 9, 9, &base) != 1 || base.writerSlot != 1 || base.squads[0].money != 700 || ShopReqSeen(base.squads[0], 5, 77, 11) != 1)
+            Fail("t772h: a refused write did not go back to the server's last record (its money and request marks)");
+        if (ShopRefusalBase(0, srv, own, 9, 9, &base) != 0) Fail("t772h: a refusal with no server record and no own write found a base");
+        ShopRec acc = srv; acc.writerSlot = 2; acc.generation = 10; acc.squads[0].money = 900;
+        own.push_back(acc);
+        if (ShopRefusalBase(1, srv, own, 10, 11, &base) != 1 || base.generation != 10 || base.squads[0].money != 900)
+            Fail("t772h: this game's own stored write was not the base after a later write's refusal");
+        if (ShopRefusalBase(1, srv, own, 10, 10, &base) != 0) Fail("t772h: the refused write itself was taken as the stored one");
+        if (ShopRefusalBase(1, srv, own, 12, 13, &base) != 0) Fail("t772h: an unknown stored generation found a base");
+        if (ShopRefusalBase(1, srv, own, 0, 1, &base) != 0) Fail("t772h: a refusal with nothing stored found a base");
+        if (ShopArrivalTakes(1, 9, 2, 0, 0, 9, 1) != 1) Fail("t772h: another writer's record at the working copy's generation was not taken");
+        if (ShopArrivalTakes(1, 9, 2, 0, 0, 9, 2) != 0) Fail("t772h: this game's own generation replaced the working copy");
+        if (ShopArrivalTakes(1, 10, 2, 0, 0, 9, 1) != 0) Fail("t772h: an older record replaced a newer working copy");
+        if (ShopArrivalTakes(1, 10, 2, 1, 9, 9, 1) != 1) Fail("t772h: a record at the stored generation after a refusal was not taken");
+        if (ShopArrivalTakes(1, 10, 2, 1, 9, 8, 1) != 0) Fail("t772h: a record below the stored generation ended the refused state");
+        if (ShopArrivalTakes(0, 0, 0, 0, 0, 1, 1) != 1 || ShopArrivalTakes(1, 4, 1, 0, 0, 5, 1) != 1) Fail("t772h: a first or a newer record was not taken");
+    }
+    /* a resend is answered from the entry (n, move); only that exact id counts as applied; a cancel marks it once */
+    {
+        ShopSquad q; q.name = "barman";
+        ShopReqNote(&q, 5, 77, 20, 2, 300);
+        ShopReqNote(&q, 5, 77, 22, 1, -120);
+        const ShopReqDone* d = ShopReqFind(q, 5, 77, 20);
+        if (d == 0 || d->n != 2 || d->move != 300 || d->revoked != 0) Fail("t772g: a resend did not find its applied entry");
+        if (ShopReqSeen(q, 5, 77, 21) != 0 || ShopReqSeen(q, 5, 77, 19) != 0) Fail("t772g: a lower id than the last applied was taken as applied");
+        if (ShopReqSeen(q, 5, 78, 20) != 0 || ShopReqSeen(q, 6, 77, 20) != 0) Fail("t772g: another epoch's or asker's request was taken as applied");
+        if (ShopReqCovered(q, 77, 21) != 0 || ShopReqCovered(q, 77, 22) != 1 || ShopReqCovered(q, 77, 20) != 1) Fail("t772g: an in-flight request covered by id range, not exactly");
+        int mv = 0;
+        if (ShopReqRevoke(&q, 5, 77, 20, &mv) != 1 || mv != 300 || ShopReqFind(q, 5, 77, 20) == 0 || ShopReqFind(q, 5, 77, 20)->revoked != 1)
+            Fail("t772g: a cancel was not marked with its money");
+        if (ShopReqRevoke(&q, 5, 77, 20, &mv) != 0 || mv != 0) Fail("t772g: a cancel was taken twice");
+        if (ShopReqNote(&q, 5, 77, 20, 2, 300) != 0) Fail("t772g: a cancelled request was noted as applied again");
+        ShopRec rr = r; rr.squads[0] = q;
+        std::vector<char> bb;
+        ShopRec back2;
+        if (!EncodeShopRec(&bb, rr) || DecodeShopRec(&bb[0], bb.size(), &back2) != kSrOk) Fail("t772g: a record with applied entries did not round-trip");
+        else
+        {
+            const ShopReqDone* e = ShopReqFind(back2.squads[0], 5, 77, 22);
+            const ShopReqDone* gq = ShopReqFind(back2.squads[0], 5, 77, 20);
+            if (e == 0 || e->move != -120 || e->n != 1 || gq == 0 || gq->revoked != 1) Fail("t772g: an applied entry did not round-trip");
+        }
+        for (unsigned int i = 0; i < kSrReqKeep + 2; ++i) ShopReqNote(&q, 5, 77, 100 + i, 1, 1);
+        if (q.reqs[0].done.size() != kSrReqKeep || ShopReqSeen(q, 5, 77, 100) != 0 || ShopReqSeen(q, 5, 77, 100 + kSrReqKeep + 1) != 1)
+            Fail("t772g: a full per-asker list did not keep its newest entries");
+        ShopRec big; big.key = r.key; big.writerSlot = 1; big.generation = 1;
+        for (unsigned int i = 0; i < kSrMaxSquads; ++i)
+        {
+            ShopSquad x; x.name = std::string(kSrNameMax, (char)('a' + (int)i));
+            for (unsigned int a = 0; a < kSrMaxReqs; ++a) for (unsigned int j = 0; j < kSrReqKeep; ++j) ShopReqNote(&x, a, 1, j + 1, 1, -1);
+            big.squads.push_back(x);
+        }
+        if (!EncodeShopRec(&bb, big)) Fail("t772g: a full record (every squad, asker and entry) did not fit the size cap");
+    }
+    /* who may move a recorded keeper's money: only the exact holder with a usable copy; the plain item road never (shop-tail only) */
+    if (ShopTradeRole(0, 0, 0) != 0 || ShopTradeRole(0, 1, 1) != 0) Fail("t772x: a keeper no record carries left today's roads");
+    if (ShopTradeRole(1, 1, 0) != 1) Fail("t772x: the exact holder with a usable copy could not record a trade");
+    if (ShopTradeRole(1, 0, 0) != 2) Fail("t772x: a game that is not the exact holder applied a recorded keeper's trade");
+    if (ShopTradeRole(1, 1, 1) != 2) Fail("t772x: a refused copy applied a recorded keeper's trade");
+    /* a record with no room for another squad refuses that squad's refill (no refill every pass with nothing written) */
+    {
+        ShopRec fr; fr.key = r.key; fr.writerSlot = 1; fr.deadline = 50.0; fr.refills = 1;
+        for (unsigned int i = 0; i < kSrMaxSquads; ++i) { ShopSquad x; x.name = std::string(1, (char)('a' + (int)i)); x.refillsApplied = 1; fr.squads.push_back(x); }
+        if (ShopRecFull(fr, -1) != 1 || ShopRecFull(fr, 0) != 0) Fail("t772l: a full record");
+        if (ShopGateDecide(kRoadTimed, 1, 1, 1, 0, 1, 0, 1) != kGateRefuseFull || ShopGateDecide(kRoadForced, 1, 1, 1, 0, 1, 0, 1) != kGateRefuseFull
+            || ShopGateDecide(kRoadHolderStarted, 1, 1, 1, 0, 1, 0, 1) != kGateRefuseFull) Fail("t772l: a 17th squad's refill ran");
+        if (ShopGateDecide(kRoadLever, 1, 1, 1, 0, 1, 0, 1) != kGateRun) Fail("t772l: the lever did not run on a full record");
+        const unsigned int g0 = fr.generation;
+        if (ShopAfterRun(&fr, 1, "zz", 1, 80.0, 60.0, 1, 5) != 0 || fr.generation != g0 || fr.squads.size() != kSrMaxSquads) Fail("t772l: a 17th squad was written");
+    }
+    /* the pot a game that is not the holder shows: every own in-flight trade that moved that pot here, whoever runs the keeper */
+    {
+        ShopSquad q; q.name = "barman"; q.money = 1000;
+        ShopReqNote(&q, 3, 77, 5, 1, 200);
+        int potA = 0, potB = 0;
+        long long sum = 0;
+        sum += ShopInFlightAdd(q, 77, 5, &potA, &potA, 200);    /* in the record already */
+        sum += ShopInFlightAdd(q, 77, 6, &potA, &potA, 150);    /* a runner's move */
+        sum += ShopInFlightAdd(q, 77, 7, &potA, &potA, -40);    /* a copy's move (another game runs the keeper) */
+        sum += ShopInFlightAdd(q, 77, 8, &potB, &potA, 999);    /* another pot */
+        sum += ShopInFlightAdd(q, 77, 9, 0, &potA, 999);        /* no pot read */
+        if (sum != 110 || ShopRunnerPot(q.money, sum) != 1110) Fail("t772p: the in-flight sum on the pot");
+    }
+    /* the holder's pot by change: the record's money plus its own trades since the pot last matched it */
+    if (ShopPotByChange(1100, 1050, 1050) != 1100 || ShopPotByChange(1150, 1060, 1050) != 1160 || ShopPotByChange(10, 0, 50) != 0
+        || ShopPotByChange(kSrMoneyMax, 10, 0) != kSrMoneyMax) Fail("t772d: the holder's pot by change");
+    /* REBASE at a holder change: A (old holder) wrote gen 5 = 1000 + 100; B (new holder, built on gen 4 = 1000) applied +50 and a
+       request, and wrote gen 5 - refused. Whichever arrives first, B ends with 1150 and both requests, never 1050 or 1100. */
+    {
+        std::vector<std::string> held(1, "barman");
+        ShopRec p4; p4.generation = 4; p4.writerSlot = 1; { ShopSquad s; s.name = "barman"; s.money = 1000; p4.squads.push_back(s); }
+        ShopRec a5 = p4; a5.generation = 5; a5.squads[0].money = 1100; a5.squads[0].moneyChanges = 1; ShopReqNote(&a5.squads[0], 7, 1, 2, 1, 100);
+        ShopRec b5 = p4; b5.generation = 5; b5.writerSlot = 2; b5.squads[0].money = 1050; b5.squads[0].moneyChanges = 1; ShopReqNote(&b5.squads[0], 3, 9, 4, 1, 50);
+        /* refusal first (B's copy stale), then A's 5 arrives: the parent is the server's last record before it (gen 4) */
+        std::vector<ShopRec> own;   /* B's refused write left its own list */
+        const ShopRec* par = ShopRebaseParent(1, p4, own, 4);
+        ShopRec out;
+        if (par == 0 || par->generation != 4) Fail("t772d: the parent of an arrival after a refusal");
+        else if (ShopRebase(a5, b5, *par, held, &out) != 2 || out.squads[0].money != 1150 || out.squads[0].moneyChanges != 2
+                 || ShopReqFind(out.squads[0], 7, 1, 2) == 0 || ShopReqFind(out.squads[0], 3, 9, 4) == 0)
+            Fail("t772d: A's arrival after B's refusal lost a change or a request");
+        /* A's 5 arrives first (same generation, another writer) while B's 5 is still in B's own list: B's 5 is not under A's 5,
+           so the parent is still gen 4 - the same rebase; B writes it as gen 6 */
+        std::vector<ShopRec> ownFirst(1, b5);
+        par = ShopRebaseParent(1, p4, ownFirst, 4);
+        if (par == 0 || par->generation != 4) Fail("t772d: the parent of an arrival at the generation of this game's own write");
+        ShopRec b6 = out; b6.generation = 6; b6.writerSlot = 2;
+        own.push_back(b6);
+        /* then the refusal of B's 5 names A's 5 as stored - the record B's copy is already built on: it stands (no double) */
+        if (ShopRefusalSuperseded(1, 5, 1, 5, 1) != 1) Fail("t772d: a refusal after its stored record's arrival made the copy fall back");
+        if (ShopRefusalSuperseded(1, 4, 1, 5, 1) != 0 || ShopRefusalSuperseded(1, 5, 2, 5, 1) != 0 || ShopRefusalSuperseded(0, 5, 1, 5, 1) != 0)
+            Fail("t772d: a refusal was taken as superseded with the copy built on another record");
+        par = ShopRebaseParent(1, a5, own, 5);
+        if (par == 0 || par->generation != 5 || par->writerSlot != 1) Fail("t772d: this game's write after its base was taken as under the base");
+        /* an ordinary hand-over: B's gen 5 was stored, A built gen 6 on it - nothing of B's goes on again */
+        std::vector<ShopRec> ownB(1, b5);
+        ShopRec a6 = b5; a6.generation = 6; a6.writerSlot = 1; a6.squads[0].money = 1150;
+        par = ShopRebaseParent(1, p4, ownB, 5);
+        if (par == 0 || par->generation != 5 || ShopRebase(a6, b5, *par, held, &out) != 0 || out.squads[0].money != 1150)
+            Fail("t772d: an arrival built on this game's stored write took its changes again");
+        /* a squad whose pot this game does not hold: the arrival is the truth */
+        if (ShopRebase(a5, b5, p4, std::vector<std::string>(), &out) != 0 || out.squads[0].money != 1100 || ShopReqFind(out.squads[0], 3, 9, 4) != 0)
+            Fail("t772d: a squad this game does not hold was rebased");
+        /* a cancel this game marked since the parent goes on as a mark */
+        ShopRec pc = a5; ShopRec wc = a5; int mv = 0;
+        ShopReqRevoke(&wc.squads[0], 7, 1, 2, &mv);
+        wc.squads[0].money -= 100;
+        ShopRec ac = a5; ac.generation = 6;
+        if (ShopRebase(ac, wc, pc, held, &out) != 2 || out.squads[0].money != 1000 || ShopReqFind(out.squads[0], 7, 1, 2) == 0
+            || ShopReqFind(out.squads[0], 7, 1, 2)->revoked != 1) Fail("t772d: a cancel's mark and undo did not go on top");
+        if (ShopRebaseParent(0, p4, std::vector<ShopRec>(), 9) != 0) Fail("t772d: a parent was found with none known");
+    }
+    /* the asker's floor: a full list drops its lowest id; an id at or below the floor that is not kept is refused, never applied */
+    {
+        ShopSquad f; f.name = "barman";
+        for (unsigned int i = 0; i < kSrReqKeep; ++i) ShopReqNote(&f, 5, 1, 17 - i, 1, 10);   /* ids 17 down to 10 */
+        if (ShopReqBelowFloor(f, 5, 1, 9) != 1 || ShopReqBelowFloor(f, 5, 1, 10) != 0) Fail("t772e: the floor of a full list");
+        if (ShopReqNote(&f, 5, 1, 18, 1, 10) != 1 || ShopReqSeen(f, 5, 1, 10) != 0 || ShopReqSeen(f, 5, 1, 11) != 1 || ShopReqSeen(f, 5, 1, 18) != 1)
+            Fail("t772e: a full list did not drop its lowest id");
+        if (ShopReqBelowFloor(f, 5, 1, 10) != 1 || ShopReqBelowFloor(f, 5, 1, 11) != 0 || ShopReqBelowFloor(f, 5, 1, 19) != 0)
+            Fail("t772e: a dropped id was not below the floor");
+        if (ShopReqBelowFloor(f, 5, 2, 3) != 0 || ShopReqBelowFloor(f, 6, 1, 3) != 0) Fail("t772e: another epoch or asker had a floor");
+        if (ShopReqNote(&f, 5, 1, 4, 1, 10) != 0 || ShopReqSeen(f, 5, 1, 4) != 0) Fail("t772e: an id below the floor was kept");
+        ShopSquad g; g.name = "barman"; ShopReqNote(&g, 5, 1, 3, 1, 10);
+        if (ShopReqBelowFloor(g, 5, 1, 1) != 0) Fail("t772e: a list that is not full had a floor");
+        /* the rebase does not bring back an id the arrival's list dropped */
+        ShopRec on; on.generation = 3; on.squads.push_back(f);
+        ShopRec par; par.generation = 1; { ShopSquad s; s.name = "barman"; par.squads.push_back(s); }
+        ShopRec wk = par; ShopReqNote(&wk.squads[0], 5, 1, 9, 1, 10);
+        ShopRec out;
+        if (ShopRebase(on, wk, par, std::vector<std::string>(1, "barman"), &out) != 0 || ShopReqSeen(out.squads[0], 5, 1, 9) != 0)
+            Fail("t772e: the rebase brought back an id below the floor");
+    }
+    /* a restock whose shop does not read: only a read leader with no home takes the old road */
+    if (ShopUnreadVerdict(1, 0) != 0 || ShopUnreadVerdict(0, 0) != 2 || ShopUnreadVerdict(0, 1) != 2 || ShopUnreadVerdict(1, 1) != 2)
+        Fail("t772u: the unread-shop verdict");
+    /* an asker's cancel: marked only by the exact holder with a usable copy; elsewhere counted, never undone through the record */
+    if (ShopRevokeRoad(0, 1, 0) != 0 || ShopRevokeRoad(1, 1, 0) != 1 || ShopRevokeRoad(1, 0, 0) != 2 || ShopRevokeRoad(1, 1, 1) != 2)
+        Fail("t772c: the cancel road");
+}
+/* T-772c: a home shop trade's cancel at the holder of the shop's area. The holder's step per case (not the holder before anything;
+   no record yet is no answer), the asker's ending per answer and which answer it takes, when it sends (a refusal held 10 s), the
+   settle-only road (this game holds the area: decided here; no holder: kept pending) and verdict (never a fresh apply), the cancelled
+   marker (it blocks a later fresh apply, marking twice changes nothing), the rebase (a cancelled entry's money out of the pot; a marker
+   never cancels an applied entry), the holder's steps on a fake record (undo once on a repeat and across a link loss, an echo after a
+   lost answer, a marker meeting a stored applied entry, a cancel naming another shop), the request flagged settle-only and the tail
+   kinds 2 / 3 on the wire (kind 4 and an answer out of range refused), and the write an echo answers. */
+void t_t772c_holder_cancel()
+{
+    using namespace shoprec;
+    using namespace coopshop;
+    int ans = -1;
+    /* the holder's step: npcBuy, caravan, stockOk, exact, carried, known, stale, entry, marker, stored (0 / 1 owed / 2 undone), appliedHere, descOk */
+    if (CancelHolderDecide(1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, &ans) != kChAnswerNow || ans != kCaRefused) Fail("t772c: an NPC purchase's cancel was not refused");
+    if (CancelHolderDecide(0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, &ans) != kChAnswerNow || ans != kCaRefused) Fail("t772c: a caravan's cancel by kind 2 was not refused");
+    if (CancelHolderDecide(0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, &ans) != kChAnswerNow || ans != kCaNotHolder) Fail("t772c: a shop that does not resolve or is held elsewhere was not not-holder");
+    if (CancelHolderDecide(0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, &ans) != kChAnswerNow || ans != kCaNotHolder) Fail("t772c: a game the area map does not name answered other than not-holder");
+    if (CancelHolderDecide(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, &ans) != kChAnswerNow || ans != kCaNotHolder) Fail("t772c: no record and not the exact holder was not not-holder");
+    if (CancelHolderDecide(0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, &ans) != kChNoAnswer) Fail("t772c: the exact holder with the record not arrived answered (it waits for the repeat)");
+    if (CancelHolderDecide(0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, &ans) != kChAnswerNow || ans != kCaUnknown) Fail("t772c: no record will come and no applied row was not unknown");
+    if (CancelHolderDecide(0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, &ans) != kChUndoLocal) Fail("t772c: no record and an applied row here was not undone from the row");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, &ans) != kChNoAnswer) Fail("t772c: a refused copy answered");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsBelowFloor, 0, 0, 0, 1, &ans) != kChAnswerNow || ans != kCaUnknown) Fail("t772c: below the floor was not unknown");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsRevoked, 1, 2, 0, 1, &ans) != kChAnswerNow || ans != kCaNotApplied) Fail("t772c: a stored marker was not not-applied");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsRevoked, 0, 2, 0, 1, &ans) != kChAnswerNow || ans != kCaUndone) Fail("t772c: a stored undone entry was not undone");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsRevoked, 0, 1, 0, 1, &ans) != kChWaitStored || ans != kCaUndone) Fail("t772c: an undone mark in this game's copy only was answered");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsRevoked, 1, 0, 0, 1, &ans) != kChWaitStored || ans != kCaNotApplied) Fail("t772c: a marker in this game's copy only was answered before it was stored");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsApplied, 0, 0, 0, 1, &ans) != kChMarkOwed) Fail("t772c: an applied entry was not marked owed first");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsOwed, 0, 0, 0, 1, &ans) != kChWaitStored) Fail("t772c: an owed mark in this game's copy only was undone");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsOwed, 0, 1, 0, 1, &ans) != kChWaitStored || ans != kCaUndone) Fail("t772c: the cancel step did not wait for the owed sweep");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsClaimed, 0, 1, 0, 1, &ans) != kChWaitStored || ans != kCaUndone) Fail("t772c: a claimed undo was not waited for");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsApplied, 0, 0, 0, 0, &ans) != kChAnswerNow || ans != kCaRefused) Fail("t772c: a cancel naming another item than the entry undid it");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsOwed, 0, 1, 0, 0, &ans) != kChAnswerNow || ans != kCaRefused) Fail("t772c: an owed undo ran for a cancel naming another item");
+    if (CancelHolderDecide(0, 0, 1, 1, 1, 1, 0, kRsNone, 0, 0, 0, 1, &ans) != kChMarker) Fail("t772c: no entry did not get a marker");
+    /* the asker's ending per answer, and which answer it takes: only from the game the cancel was last sent to */
+    if (CancelAskerOnAnswer(kCaUndone) != kCeEnd || CancelAskerOnAnswer(kCaNotApplied) != kCeEnd || CancelAskerOnAnswer(kCaRefused) != kCeEnd
+        || CancelAskerOnAnswer(kCaUnknown) != kCeEnd) Fail("t772c: an ending answer kept the cancel");
+    if (CancelAskerOnAnswer(kCaNotHolder) != kCeAwaitHolderChange || CancelAskerOnAnswer(kCaWriteRefused) != kCeAwaitHolderChange)
+        Fail("t772c: not-holder / write-refused ended the cancel");
+    if (CancelAnswerTake(2, 2, kCaUndone) != kTakeEnded || CancelAnswerTake(2, 2, kCaNotHolder) != kTakeKept || CancelAnswerTake(2, 2, kCaWriteRefused) != kTakeKept)
+        Fail("t772c: an answer from the game it was sent to was not taken");
+    if (CancelAnswerTake(3, 2, kCaUndone) != kTakeIgnored || CancelAnswerTake(-1, 2, kCaUndone) != kTakeIgnored || CancelAnswerTake(3, -1, kCaNotApplied) != kTakeIgnored)
+        Fail("t772c: an answer from a game the cancel was not last sent to was taken");
+    /* when the asker sends: holder, mySlot, refusedBy, refusedAgeMs */
+    if (CancelSendDue(-1, 0, -1, 0) != kCsWait || CancelSendDue(-2, 0, -1, 0) != kCsWait) Fail("t772c: a cancel went with no holder known (or a frozen area)");
+    if (CancelSendDue(2, 0, -1, 0) != kCsSend) Fail("t772c: an unanswered cancel was not sent to the holder (again each second)");
+    if (CancelSendDue(2, 0, 2, 0) != kCsWait || CancelSendDue(2, 0, 2, kRefusedHoldMs - 1) != kCsWait) Fail("t772c: a not-holder answer was sent again to the same game at once");
+    if (CancelSendDue(2, 0, 2, kRefusedHoldMs) != kCsSend) Fail("t772c: a refusal never expired (a holder briefly not exact leaves the cancel stuck)");
+    if (CancelSendDue(3, 0, 2, 0) != kCsSend) Fail("t772c: a not-holder answer was not sent to the next holder");
+    if (CancelSendDue(0, 0, 2, 0) != kCsLocal || CancelSendDue(0, 0, -1, 0) != kCsLocal) Fail("t772c: this game holding the area did not answer its own cancel");
+    if (CancelSendDue(0, -1, -1, 0) != kCsSend) Fail("t772c: a game with no slot took a holder slot for its own");
+    /* the settle-only road: homeStock, holder, mySlot, refusedBy (the game that could not answer), refusedAgeMs */
+    if (SettleOnlyDue(1, 2, 0, 1, 0) != kLrSettleOnly) Fail("t772c: a lapse with another holder was not asked settle-only");
+    if (SettleOnlyDue(0, 2, 0, 1, 0) != kLrLapse) Fail("t772c: a caravan was asked settle-only");
+    if (SettleOnlyDue(1, 0, 0, 1, 0) != kLrLocal) Fail("t772c: this game holding the area did not decide it from its own record");
+    if (SettleOnlyDue(1, -1, 0, 1, 0) != kLrWait || SettleOnlyDue(1, -2, 0, 1, 0) != kLrWait) Fail("t772c: no holder known (or the area frozen after its holder left) settled it as a refusal");
+    if (SettleOnlyDue(1, 1, 0, 1, 0) != kLrWait || SettleOnlyDue(1, 1, 0, 1, kRefusedHoldMs) != kLrSettleOnly) Fail("t772c: the game that could not answer was asked again at once, or never");
+    /* the settle-only verdict: keeperFound, exact, carried, known, stale, entry, stored */
+    if (SettleOnlyDecide(1, 1, 1, 1, 0, kRsApplied, 0) != kSoFromRecord || SettleOnlyDecide(1, 1, 1, 1, 0, kRsNone, 0) != kSoMarker) Fail("t772c: the settle-only verdict");
+    if (SettleOnlyDecide(1, 1, 1, 1, 0, kRsRevoked, 1) != kSoRefuse || SettleOnlyDecide(1, 1, 1, 1, 0, kRsBelowFloor, 0) != kSoRefuse || SettleOnlyDecide(1, 1, 0, 1, 0, kRsNone, 0) != kSoRefuse)
+        Fail("t772c: a settle-only ask with a stored cancel, below the floor, or no record that will come was not refused for good");
+    if (SettleOnlyDecide(1, 1, 1, 1, 0, kRsRevoked, 0) != kSoWaitStored) Fail("t772c: a settle-only refusal went before its marker was stored");
+    if (SettleOnlyDecide(0, 1, 1, 1, 0, kRsApplied, 0) != kSoNotHolder || SettleOnlyDecide(1, 0, 1, 1, 0, kRsApplied, 0) != kSoNotHolder
+        || SettleOnlyDecide(1, 1, 0, 0, 0, kRsNone, 0) != kSoNotHolder || SettleOnlyDecide(1, 1, 1, 1, 1, kRsApplied, 0) != kSoNotHolder)
+        Fail("t772c: a settle-only ask not answerable now was refused for good");
+    for (int bits = 0; bits < 64; ++bits)
+        for (int e = 0; e <= kRsBelowFloor; ++e)
+        {
+            const int v = SettleOnlyDecide(bits & 1, (bits >> 1) & 1, (bits >> 2) & 1, (bits >> 3) & 1, (bits >> 4) & 1, e, (bits >> 5) & 1);
+            if (v < kSoFromRecord || v > kSoWaitStored) Fail("t772c: a settle-only verdict outside its five answers");
+            if (v == kSoFromRecord && e != kRsApplied) Fail("t772c: a settle-only ask was answered ok with no applied entry");
+        }
+    /* the marker: an entry of no units and no money, cancelled - a resend finds it seen and cancelled, never applies it fresh */
+    ShopSquad s; s.name = "barman";
+    int mk = 0, mv = 0;
+    if (ShopReqMarker(&s, 5, 9, 3) != 1) Fail("t772c: no marker was written");
+    const ShopReqDone* d = ShopReqFind(s, 5, 9, 3);
+    if (d == 0 || d->revoked != 1 || d->n != 0 || d->move != 0) Fail("t772c: the marker is not a cancelled entry of nothing");
+    if (ShopReqState(s, 5, 9, 3, &mk) != kRsRevoked || mk != 1) Fail("t772c: the marker does not read as a marker");
+    if (ShopReqSeen(s, 5, 9, 3) != 1) Fail("t772c: a later resend of a marked request would be applied fresh");
+    if (ShopReqMarker(&s, 5, 9, 3) != 0 || ShopReqRevoke(&s, 5, 9, 3, &mv) != 0) Fail("t772c: a marked request was marked again");
+    /* an applied entry: marked once - the undo hangs on 'marked now' */
+    ShopReqNote(&s, 5, 9, 4, 2, 120);
+    if (ShopReqState(s, 5, 9, 4, &mk) != kRsApplied || ShopReqMarker(&s, 5, 9, 4) != 0) Fail("t772c: an applied entry took a marker");
+    if (ShopReqRevoke(&s, 5, 9, 4, &mv) != 1 || mv != 120) Fail("t772c: an applied entry was not marked with its money");
+    if (ShopReqRevoke(&s, 5, 9, 4, &mv) != 0 || mv != 0) Fail("t772c: a second mark would undo the trade again");
+    if (ShopReqState(s, 5, 9, 4, &mk) != kRsRevoked || mk != 0) Fail("t772c: an applied cancelled entry reads as a marker");
+    ShopSquad f; f.name = "barman";
+    for (unsigned int i = 0; i < kSrReqKeep; ++i) ShopReqNote(&f, 5, 1, 17 - i, 1, 10);
+    if (ShopReqState(f, 5, 1, 9, &mk) != kRsBelowFloor || ShopReqMarker(&f, 5, 1, 9) != 0) Fail("t772c: below the floor took a marker");
+    ShopRec rr; rr.squads.push_back(s);
+    if (ShopRecMarked(rr, "barman", 5, 9, 4) != 1 || ShopRecMarked(rr, "barman", 5, 9, 99) != 0 || ShopRecMarked(rr, "other", 5, 9, 4) != 0)
+        Fail("t772c: a stored record's mark was misread");
+    /* the rebase: a cancelled entry holds no money, whichever game marked it */
+    {
+        const std::vector<std::string> held(1, "barman");
+        ShopRec par; par.generation = 4; { ShopSquad q; q.name = "barman"; q.money = 1000; par.squads.push_back(q); }
+        ShopRec out;
+        ShopRec wk = par; ShopReqNote(&wk.squads[0], 7, 1, 2, 1, 100); wk.squads[0].money = 1100;
+        ShopRec on = par; on.generation = 5; ShopReqMarker(&on.squads[0], 7, 1, 2);
+        ShopRebase(on, wk, par, held, &out);
+        if (out.squads[0].money != 1100 || ShopRecMarked(out, "barman", 7, 1, 2) != 0 || ShopReqState(out.squads[0], 7, 1, 2, &mk) != kRsApplied)
+            Fail("t772c: another game's marker cancelled this game's applied trade (the trade happened: it stands)");
+        ShopRec on2 = par; on2.generation = 5; ShopReqNote(&on2.squads[0], 7, 1, 3, 1, 100); on2.squads[0].money = 1100;
+        ShopRec wk2 = par; ShopReqMarker(&wk2.squads[0], 7, 1, 3);
+        ShopRebase(on2, wk2, par, held, &out);
+        if (out.squads[0].money != 1100 || ShopRecMarked(out, "barman", 7, 1, 3) != 0 || ShopReqState(out.squads[0], 7, 1, 3, &mk) != kRsApplied)
+            Fail("t772c: this game's marker cancelled another holder's applied trade (the trade happened: it stands)");
+        ShopRec p3 = par; ShopReqNote(&p3.squads[0], 7, 1, 4, 1, 100); p3.squads[0].money = 1100;
+        ShopRec w3 = p3; ShopReqRevoke(&w3.squads[0], 7, 1, 4, &mv); w3.squads[0].money = 1000;
+        ShopRec o3 = w3; o3.generation = 6;
+        ShopRebase(o3, w3, p3, held, &out);
+        if (out.squads[0].money != 1000) Fail("t772c: an undo both games made was taken twice");
+        ShopRec o4 = p3; o4.generation = 6;
+        ShopRebase(o4, w3, p3, held, &out);
+        if (out.squads[0].money != 1000 || ShopRecMarked(out, "barman", 7, 1, 4) != 1) Fail("t772c: this game's own undo did not go on top once");
+    }
+    /* THE OWED UNDO ON A FAKE RECORD: asker 5, epoch 9, request 4 applied by a holder (2 units, 120 money), stored. Holder A (slot 1)
+       marks it owed; the owed sweep's decision (ShopOwedDue) claims it, applies it once under A's own stored claim, marks it undone. */
+    {
+        ShopRec srv; srv.generation = 7; srv.key = "Hub bar@3,4@1234,-567,89"; srv.repairMark = kSrNoRepair;
+        { ShopSquad q; q.name = "barman"; q.money = 1120; ShopReqNote(&q, 5, 9, 4, 2, 120); srv.squads.push_back(q); }
+        const std::vector<std::string> heldA(1, "barman");
+        std::vector<ShopReqKey> ranA;
+        ShopRec a = srv;
+        ShopCancelOut o = ShopCancelStep(&a, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, ShopKeyHas(ranA, 5, 9, 4), 1, 2);
+        if (o.step != kChMarkOwed || o.mark != 1 || o.undo != 0 || o.n != 2 || o.move != 120) Fail("t772c: a cancel did not mark the applied entry owed first");
+        o = ShopCancelStep(&a, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, ShopKeyHas(ranA, 5, 9, 4), 1, 2);
+        if (o.step != kChWaitStored || o.undo != 0 || o.mark != 0) Fail("t772c: a repeat before the owed mark was stored undid or marked again");
+        ShopRec back = srv;   /* the owed write refused: the copy is the stored record again - marked owed again, nothing undone */
+        o = ShopCancelStep(&back, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChMarkOwed || o.undo != 0) Fail("t772c: a refused owed write had undone something");
+        ShopRec s1 = a; s1.generation = 8;   /* the owed mark stored: the cancel step waits, the sweep claims */
+        o = ShopCancelStep(&a, 1, 1, s1, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChWaitStored || o.undo != 0) Fail("t772c: the cancel step applied an owed undo itself");
+        if (ShopOwedDue((int)kRevOwed, 0, (int)kRevOwed, 0, 1, 1, 1, 0) != kOwClaim) Fail("t772c: the exact holder did not claim a stored owed undo");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevOwed, 0, 1, 1, 1, 0) != kOwWait) Fail("t772c: a claim in flight was claimed again");
+        /* A HAND-OVER: A (slot 1) and B (slot 2) both read the owed mark and claim; the world server stores A's - B's rebases under it */
+        ShopRec aC = s1; ShopRec bC = s1;
+        if (ShopReqClaim(&aC.squads[0], 5, 9, 4, 1) != 1 || ShopReqClaim(&bC.squads[0], 5, 9, 4, 2) != 1 || ShopReqClaim(&aC.squads[0], 5, 9, 4, 1) != 0) Fail("t772c: a claim was not written once");
+        ShopRec stA = aC; stA.generation = 9;
+        ShopRec bOut;
+        ShopRebase(stA, bC, s1, heldA, &bOut);
+        const ShopReqDone* bd = ShopReqFind(bOut.squads[0], 5, 9, 4);
+        if (bd == 0 || bd->revoked != kRevClaimed || bd->claimer != 1) Fail("t772c: a second claim overwrote the stored claim in the rebase");
+        int applies = 0;
+        for (int slot = 1; slot <= 2; ++slot) if (ShopOwedDue((int)kRevClaimed, (unsigned int)slot, (int)kRevClaimed, 1, slot, 1, 1, 0) == kOwApply) ++applies;
+        if (applies != 1) Fail("t772c: an owed undo was applied by other than exactly one game (the one whose claim is stored)");
+        ShopRec bU = bC; int mv = 0; ShopReqRevoke(&bU.squads[0], 5, 9, 4, &mv);   /* B's undone mark over A's stored claim never goes on */
+        ShopRebase(stA, bU, s1, heldA, &bOut);
+        bd = ShopReqFind(bOut.squads[0], 5, 9, 4);
+        if (bd == 0 || bd->revoked != kRevClaimed || bd->claimer != 1) Fail("t772c: an undone mark went over another game's stored claim");
+        /* A applies (its undo memory), marks undone; the undone write lost: A marks undone again, never applies again */
+        ShopKeyAdd(&ranA, 5, 9, 4, 256);
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, ShopKeyHas(ranA, 5, 9, 4)) != kOwMarkUndone) Fail("t772c: a lost undone write made the claimer apply again");
+        if (ShopOwedDue((int)kRevUndone, 1, (int)kRevClaimed, 1, 1, 1, 1, 1) != kOwWait) Fail("t772c: an undone mark in flight was written again at once");
+        /* A quits and rejoins (a new world: its undo memory is empty) with the claim still stored: the shop's counters' records decide -
+           one that lists the undo: marked undone only; records without it: applied (t772c_goods_undo, the full case) */
+        std::vector<ShopReqKey> fresh;
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, ShopKeyHas(fresh, 5, 9, 4), kUgIn) != kOwMarkUndone) Fail("t772c: a claimer whose counters hold the undo applied it again");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, ShopKeyHas(fresh, 5, 9, 4), kUgOut) != kOwApply) Fail("t772c: a claimer whose counters lack the undo did not apply it");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, ShopKeyHas(fresh, 5, 9, 4), kUgWait) != kOwWait) Fail("t772c: a claimer applied with its counters not decided");
+        if (ShopOwedDue((int)kRevOwed, 0, (int)kRevOwed, 0, 1, 0, 1, 0) != kOwWait || ShopOwedDue((int)kRevOwed, 0, (int)kRevOwed, 0, 1, 1, 0, 0) != kOwWait
+            || ShopOwedDue((int)kRevOwed, 0, (int)kRevOwed, 0, -1, 1, 1, 0) != kOwWait || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 0, 1, 0) != kOwWait)
+            Fail("t772c: an owed undo was claimed or applied off the exact holder, with no slot or with nothing to undo from");
+        if (ShopOwedDue((int)kRevApplied, 0, (int)kRevApplied, 0, 1, 1, 1, 0) != kOwNone || ShopOwedDue((int)kRevUndone, 1, (int)kRevUndone, 1, 1, 1, 1, 1) != kOwNone || ShopOwedDue(-1, 0, -1, 0, 1, 1, 1, 0) != kOwNone)
+            Fail("t772c: the sweep acted on an entry with nothing owed");
+        /* this game's note that its change to a counter carries an undo: noted at the filing, ended when the counter is set from a stored
+           record or the world goes, kept while the counter's area is away */
+        if (ShopUndoNoteStands(0, kUnFiled) != 1 || ShopUndoNoteStands(1, kUnSet) != 0 || ShopUndoNoteStands(1, kUnWorldGone) != 0
+            || ShopUndoNoteStands(1, kUnAreaLeft) != 1 || ShopUndoNoteStands(0, kUnAreaLeft) != 0)
+            Fail("t1073a: the counter's undo note does not live from its filing until the counter is set from a stored record");
+        for (int oldRule = 0; oldRule < 2; ++oldRule)
+        {   /* T-1074 THE GOODS KEPT WHILE AWAY: A applies an undo (the goods filed in the counter, noted), the counter's area leaves A before
+               any write of it is stored, and comes back with the stored record the counter was last set from (not laid in again: the
+               counter keeps the goods). The note stands, so the change is written again with the undo's key and stored: goods once, the
+               refund once. oldRule: the note dropped at the area's leave - the goods read as lost and the undo was applied again: twice */
+            int goods = 0, coins = 0, note = 0, stored = 0, partial = 0;
+            goods += 1; note = ShopUndoNoteStands(note, kUnFiled);
+            note = (oldRule != 0) ? 0 : ShopUndoNoteStands(note, kUnAreaLeft);
+            std::vector<ShopUndoTouch> t(1);
+            t[0].stored = stored; t[0].inFlight = note;
+            int d = ShopUndoDurable(t, 0, &partial);
+            if (d == kUgWait) stored = 1;   /* written again from the note: the write carries the key and is stored */
+            else if (d == kUgOut)
+            {   /* judged lost: the counter's stored record decides */
+                std::vector<ShopUndoPiece> p(1);
+                p[0].localHas = note; p[0].haveRecord = 1; p[0].recordHas = stored; p[0].applyDone = 1; p[0].ownSeed = 0; p[0].never = 0;
+                if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, ShopUndoGoods(p)) == kOwApply) { goods += 1; stored = 1; }
+            }
+            t[0].stored = stored; t[0].inFlight = 0;
+            d = ShopUndoDurable(t, 0, &partial);
+            if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, d) == kOwMarkUndone) coins += 1;
+            if (oldRule == 0 && (goods != 1 || coins != 1))
+                Fail("t1073a: T-1074 an undo whose counter left with its area ends with " + I(goods) + " goods and " + I(coins) + " refunds (want 1 and 1)");
+            if (oldRule != 0 && goods != 2) Fail("t1073a: the T-1074 control (the note dropped at the area's leave) does not show the goods twice");
+        }
+        for (int oldRule = 0; oldRule < 2; ++oldRule)
+        {   /* T-1073 THE GOODS WIPED BY A NEWER RECORD: A applies an undo (goods filed, noted), its write not stored; the area goes to B, B
+               writes the counter from the record before A's change (no goods, no key); A gets the area back and that newer record is laid
+               into the counter - the goods are gone. The note ends at that set, so the counters' records decide: they lack the undo, it is
+               applied again once - goods once, the refund once. oldRule: the note kept past the set - the change was written again
+               without the goods but with the key, read as stored, and the money moved with no goods back */
+            int goods = 0, coins = 0, note = 0, stored = 0, partial = 0;
+            goods += 1; note = ShopUndoNoteStands(note, kUnFiled);
+            note = ShopUndoNoteStands(note, kUnAreaLeft);
+            goods = 0;   /* B's newer record laid in */
+            if (oldRule == 0) note = ShopUndoNoteStands(note, kUnSet);
+            std::vector<ShopUndoTouch> t(1);
+            t[0].stored = stored; t[0].inFlight = note;
+            int d = ShopUndoDurable(t, 0, &partial);
+            if (d == kUgWait) stored = 1;   /* written again from the note: the counter as it is now, with the key */
+            else if (d == kUgOut)
+            {
+                std::vector<ShopUndoPiece> p(1);
+                p[0].localHas = note; p[0].haveRecord = 1; p[0].recordHas = stored; p[0].applyDone = 1; p[0].ownSeed = 0; p[0].never = 0;
+                if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, ShopUndoGoods(p)) == kOwApply) { goods += 1; stored = 1; }
+            }
+            t[0].stored = stored; t[0].inFlight = 0;
+            d = ShopUndoDurable(t, 0, &partial);
+            if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, d) == kOwMarkUndone) coins += 1;
+            if (oldRule == 0 && (goods != 1 || coins != 1))
+                Fail("t1073a: T-1073 an undo whose goods a newer record wiped ends with " + I(goods) + " goods and " + I(coins) + " refunds (want 1 and 1)");
+            if (oldRule != 0 && (goods != 0 || coins != 1)) Fail("t1073a: the T-1073 control (the note kept past the set) does not show the refund with no goods");
+        }
+        {   /* the wiring: the note ends at every set of a counter from a stored record, and no longer at its area's leave */
+            const std::string itx = T313ReadFile("../coop-plugin/items.cpp");
+            size_t ns = 0, at = 0;
+            while ((at = itx.find("w.haveMine = 1; w.mineGen = kh.generation; ShopUndoNoteOn(id, shoprec::kUnSet);", at)) != std::string::npos) { ++ns; ++at; }
+            if (ns != 4 || itx.find("g_boxUndoLocal.erase(it->first);   /* the counter went with its area */") != std::string::npos
+                || itx.find("ShopUndoNoteOn(it->first, shoprec::kUnAreaLeft);") == std::string::npos)
+                Fail("t1073a: the counter's undo note is not ended at every set from a stored record, or still ends at its area's leave");
+        }
+        /* the undone mark stored: the cancel is answered undone */
+        ShopRec aU = stA; ShopReqRevoke(&aU.squads[0], 5, 9, 4, &mv);
+        ShopRec s3 = aU; s3.generation = 10;
+        o = ShopCancelStep(&aU, 1, 1, s3, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 1, 1, 2);
+        if (o.step != kChAnswerNow || o.answer != kCaUndone || o.undo != 0) Fail("t772c: a stored undone mark was not answered undone");
+        o = ShopCancelStep(&aU, 1, 1, stA, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 1, 1, 2);
+        if (o.step != kChWaitStored) Fail("t772c: an undone mark in this game's copy only was answered");
+        /* the claimed entry on the wire with its claimer; the owed count */
+        std::vector<char> cb; ShopRec cback;
+        if (!EncodeShopRec(&cb, stA) || DecodeShopRec(&cb[0], cb.size(), &cback) != kSrOk) Fail("t772c: a record with a claimed entry did not round-trip");
+        const ShopReqDone* cd = ShopReqFind(cback.squads[0], 5, 9, 4);
+        if (cd == 0 || cd->revoked != kRevClaimed || cd->claimer != 1) Fail("t772c: a claimed entry lost its claimer on the wire");
+        if (ShopRecOwedCount(stA) != 1 || ShopRecOwedCount(s3) != 0 || ShopRecOwedCount(srv) != 0) Fail("t772c: the owed count is wrong");
+        {   /* a record with no owed or claimed entry is byte for byte the released form, written out here field by field */
+            static const unsigned char kRel[] = {
+                0x53, 0x48, 0x50, 0x31,  2, 0, 0, 0,  10, 0, 0, 0,  0, 0, 0, 0,                  /* 'SHP1', format 2, generation 10, writer 0 */
+                24, 0, 0, 0,  'H', 'u', 'b', ' ', 'b', 'a', 'r', '@', '3', ',', '4', '@', '1', '2', '3', '4', ',', '-', '5', '6', '7', ',', '8', '9',
+                0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0,  0xFF, 0xFF, 0xFF, 0xFF,                    /* deadline 0.0, refills 0, no repair mark */
+                1, 0, 0, 0,  6, 0, 0, 0,  'b', 'a', 'r', 'm', 'a', 'n',  0x60, 0x04, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,   /* barman, 1120, 0, 0 */
+                1, 0, 0, 0,  5, 0, 0, 0,  9, 0, 0, 0,  1, 0, 0, 0,                              /* asker 5, epoch 9, one entry */
+                4, 0, 0, 0,  2, 0, 0, 0,  120, 0, 0, 0,  1, 0, 0, 0 };                          /* id 4, 2 units, 120, undone */
+            std::vector<char> rb; ShopRec rback;
+            int same = (EncodeShopRec(&rb, s3) && rb.size() == sizeof kRel) ? 1 : 0;
+            for (size_t i = 0; same != 0 && i < rb.size(); ++i) if ((unsigned char)rb[i] != kRel[i]) same = 0;
+            if (same == 0 || DecodeShopRec(&rb[0], rb.size(), &rback) != kSrOk || rback.generation != 10 || ShopRecRank(rback, "barman", 5, 9, 4) != 3)
+                Fail("t772c: a record with no owed entry is not byte for byte the released form");
+        }
+        /* the cancel names another shop, or fewer units than the entry moved: refused, nothing marked; the applied row here vouches for it */
+        ShopRec w2 = srv;
+        o = ShopCancelStep(&w2, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 0, 2);
+        if (o.step != kChAnswerNow || o.answer != kCaRefused || o.mark != 0 || o.undo != 0) Fail("t772c: a cancel naming another shop was marked");
+        o = ShopCancelStep(&w2, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1);
+        if (o.step != kChAnswerNow || o.answer != kCaRefused) Fail("t772c: a cancel naming fewer units than the entry was marked");
+        o = ShopCancelStep(&w2, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0);
+        if (o.step != kChMarkOwed || o.mark != 1) Fail("t772c: the applied row kept here did not vouch for its cancel");
+        /* no copy of the record: not arrived (no answer), none will come (unknown), the applied row here (undone once, a repeat answered) */
+        ShopRec none;
+        o = ShopCancelStep(&none, 0, 0, none, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 0, 0, 0, 1, 2);
+        if (o.step != kChNoAnswer) Fail("t772c: the exact holder answered with its record not arrived");
+        o = ShopCancelStep(&none, 0, 0, none, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChAnswerNow || o.answer != kCaUnknown) Fail("t772c: no record that will come was not unknown");
+        o = ShopCancelStep(&none, 0, 0, none, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 0, 1, 0, 1, 2);
+        if (o.step != kChUndoLocal || o.undo != 1 || o.answer != kCaUndone) Fail("t772c: the applied row here was not undone with no record");
+        o = ShopCancelStep(&none, 0, 0, none, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 0, 1, 1, 1, 2);
+        if (o.step != kChAnswerNow || o.undo != 0 || o.answer != kCaUndone) Fail("t772c: a repeat of an undo from the row undid it again");
+        /* not the exact holder: not-holder before anything, the copy untouched */
+        ShopRec w3 = srv;
+        o = ShopCancelStep(&w3, 1, 1, srv, "barman", 5, 9, 4, 0, 0, 1, 0, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChAnswerNow || o.answer != kCaNotHolder || o.mark != 0 || ShopRecMarked(w3, "barman", 5, 9, 4) != 0) Fail("t772c: a game not the exact holder marked the record");
+        /* the settle-only step: no entry - a marker, a repeat waits, refused once stored; an applied entry - ok from the record; an owed one refused once stored */
+        ShopRec w4 = srv;
+        ShopSettleOut so = ShopSettleOnlyStep(&w4, 1, 1, srv, "barman", 5, 9, 6, 1, 1, 0, 1);
+        if (so.v != kSoMarker || so.mark != 1 || ShopRecMarked(w4, "barman", 5, 9, 6) != 1) Fail("t772c: a settle-only ask with no entry wrote no marker");
+        so = ShopSettleOnlyStep(&w4, 1, 1, srv, "barman", 5, 9, 6, 1, 1, 0, 1);
+        if (so.v != kSoWaitStored || so.mark != 0) Fail("t772c: a settle-only refusal went before its marker was stored");
+        so = ShopSettleOnlyStep(&w4, 1, 1, w4, "barman", 5, 9, 6, 1, 1, 0, 1);
+        if (so.v != kSoRefuse) Fail("t772c: a stored settle-only marker was not refused for good");
+        so = ShopSettleOnlyStep(&w4, 1, 1, srv, "barman", 5, 9, 4, 1, 1, 0, 1);
+        if (so.v != kSoFromRecord || so.n != 2 || so.move != 120) Fail("t772c: a settle-only ask of an applied entry was not answered from it");
+        ShopRec w5 = srv;
+        so = ShopSettleOnlyStep(&w5, 1, 1, s1, "barman", 5, 9, 4, 1, 1, 0, 1);
+        if (so.v != kSoRefuse) Fail("t772c: a settle-only ask of an entry the stored record has owed was answered applied");
+        /* A MARKER AND AN APPLIED ENTRY MEETING, either way round: the trade happened - the applied entry stands, its money in the pot */
+        const std::vector<std::string> held(1, "barman");
+        ShopRec par; par.generation = 4; { ShopSquad q; q.name = "barman"; q.money = 1000; par.squads.push_back(q); }
+        ShopRec onto = par; onto.generation = 5; ShopReqNote(&onto.squads[0], 5, 9, 7, 1, 100); onto.squads[0].money = 1100;
+        ShopRec mine = par; ShopReqMarker(&mine.squads[0], 5, 9, 7);
+        ShopRec out;
+        ShopRebase(onto, mine, par, held, &out);
+        int mk = 0;
+        if (out.squads[0].money != 1100 || ShopReqState(out.squads[0], 5, 9, 7, &mk) != kRsApplied || ShopRecMarked(out, "barman", 5, 9, 7) != 0)
+            Fail("t772c: a marker cancelled an applied entry another holder stored");
+        ShopRec o5 = out;
+        so = ShopSettleOnlyStep(&o5, 1, 1, onto, "barman", 5, 9, 7, 1, 1, 0, 1);
+        if (so.v != kSoFromRecord || so.n != 1 || so.move != 100) Fail("t772c: a settle-only ask after its marker was dropped was not answered from the applied entry");
+        o = ShopCancelStep(&o5, 1, 1, onto, "barman", 5, 9, 7, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1);
+        if (o.step != kChMarkOwed || o.mark != 1) Fail("t772c: a cancel after its marker was dropped did not mark the applied entry owed");
+        /* the owed mark rebased: it goes on top of onto's applied entry with no money taken out (the undo has not run) */
+        ShopRec owedOut;
+        ShopRebase(onto, o5, out, held, &owedOut);
+        if (ShopRecRank(owedOut, "barman", 5, 9, 7) != 1 || owedOut.squads[0].money != 1100) Fail("t772c: an owed mark rebased took the money out before its undo");
+        /* THE ASKER: not-holder from slot 2, then the map names slot 3 - sent there; slot 2's late ending is ignored, slot 3's ends it */
+        int sentSlot = 2, refusedBy = -1;
+        if (CancelAnswerTake(sentSlot, 2, kCaNotHolder) != kTakeKept) Fail("t772c: the asker did not keep a not-holder cancel");
+        refusedBy = sentSlot;
+        if (CancelSendDue(2, 0, refusedBy, 0) != kCsWait) Fail("t772c: the asker asked the not-holder again at once");
+        if (CancelSendDue(3, 0, refusedBy, 0) != kCsSend) Fail("t772c: the asker did not ask the new holder");
+        sentSlot = 3;
+        if (CancelAnswerTake(sentSlot, 2, kCaUndone) != kTakeIgnored) Fail("t772c: the old holder's ending was taken after the cancel went to the new holder");
+        if (CancelAnswerTake(sentSlot, 3, kCaNotApplied) != kTakeEnded) Fail("t772c: the new holder's ending did not end the cancel");
+        /* A WAITING TRADE AROUND A SAVE AND AT TEARDOWN: used, soWait, dir (0 buy), held, haveEscrow */
+        if (PendSaveHold(1, 1, 0, 1, 0) != kPsPurse || PendSaveHold(1, 1, 1, 0, 1) != kPsEscrow) Fail("t772c: a waiting trade's price or item was not put back for the save");
+        if (PendSaveHold(1, 0, 0, 1, 0) != kPsNone || PendSaveHold(0, 1, 0, 1, 0) != kPsNone || PendSaveHold(1, 1, 0, 0, 0) != kPsNone || PendSaveHold(1, 1, 1, 0, 0) != kPsNone)
+            Fail("t772c: a save put back what a trade does not hold, or a trade not waiting");
+        /* A SAVE THAT DID NOT FINISH, through the save hold's own decision (PendSaveAct): a hold still put back is taken out first -
+           by the tick, and by the next save before it puts back - never put back twice */
+        {
+            int saveHeld = kPsNone;
+            if (PendSaveAct(0, saveHeld, 1, 1, 0, 1, 0) != kPaPurse) Fail("t772c: a waiting buy's reservation was not put back for the save");
+            saveHeld = kPsPurse;   /* put back; the save throws - no after-save step */
+            if (PendSaveAct(1, saveHeld, 1, 1, 0, 1, 0) != kPaTakeOut) Fail("t772c: the tick did not take out a hold left by a save that did not finish");
+            if (PendSaveAct(0, saveHeld, 1, 1, 0, 1, 0) != kPaTakeOut) Fail("t772c: the next save put a hold back over one still put back (twice)");
+            if (PendSaveAct(0, kPsEscrow, 0, 0, 1, 0, 1) != kPaTakeOut) Fail("t772c: the hold of a row no longer used was not taken out");
+            if (PendSaveAct(0, kPsNone, 1, 1, 1, 0, 1) != kPaEscrow || PendSaveAct(1, kPsNone, 1, 1, 0, 1, 0) != kPaNone || PendSaveAct(0, kPsNone, 1, 0, 0, 1, 0) != kPaNone)
+                Fail("t772c: the save hold put back at the wrong time or for a trade not waiting");
+            int held = 1, drop = 0;
+            if (PendSaveTakeEnd(kPsPurse, 0, &held, &drop) != 1 || held != 0 || drop != 0 || (Settle(0, 0, held) & kActRefund) != 0 || (Settle(0, 0, 1) & kActRefund) == 0)
+                Fail("t772c: a buy's failed take-out did not end the trade with no second refund");
+            int sheld = 0;
+            if (PendSaveTakeEnd(kPsEscrow, 0, &sheld, &drop) != 1 || drop != 1) Fail("t772c: a sale's failed take-out kept an escrow inside an inventory");
+            if (PendSaveTakeEnd(kPsPurse, 1, &held, &drop) != 0 || PendSaveTakeEnd(kPsNone, 0, &held, &drop) != 0) Fail("t772c: a take-out with nothing to end ended a trade");
+        }
+        /* AN OWED ENTRY CARRIES WHAT ITS UNDO NEEDS: on the wire, through the rebase, and taken by the step from the stored record */
+        {
+            ShopUndoDesc u; u.has = 1; u.keeperUid = 77; u.dir = 1; u.base = "sword"; u.company = "co"; u.material = "steel"; u.color = "red";
+            u.quality = 0.5f; u.charges = 2.0f; u.functionKind = 3; u.level = 4; u.unique = 1;
+            ShopRec wr; wr.generation = 3; wr.writerSlot = 1; wr.key = "Hub bar@3,4@1234,-567,89"; wr.repairMark = kSrNoRepair;
+            { ShopSquad q; q.name = "barman"; q.money = 500; ShopReqNote(&q, 5, 9, 11, 1, -40); ShopReqNote(&q, 5, 9, 12, 1, 60); wr.squads.push_back(q); }
+            if (ShopReqOwe(&wr.squads[0], 5, 9, 11, &u) != 1 || ShopReqOwe(&wr.squads[0], 5, 9, 11, &u) != 0) Fail("t772c: an owed mark was not written once");
+            std::vector<char> b;
+            ShopRec back;
+            if (!EncodeShopRec(&b, wr) || DecodeShopRec(&b[0], b.size(), &back) != kSrOk) Fail("t772c: a record with an owed entry did not round-trip");
+            const ShopReqDone* od = ShopReqFind(back.squads[0], 5, 9, 11);
+            if (od == 0 || od->revoked != kRevOwed || od->undo.has != 1 || od->undo.keeperUid != 77 || od->undo.dir != 1 || od->undo.base != "sword"
+                || od->undo.color != "red" || od->undo.quality != 0.5f || od->undo.charges != 2.0f || od->undo.level != 4 || od->undo.unique != 1)
+                Fail("t772c: an owed entry lost what its undo needs on the wire");
+            const ShopReqDone* ad = ShopReqFind(back.squads[0], 5, 9, 12);
+            if (ad == 0 || ad->revoked != kRevApplied || ad->undo.has != 0) Fail("t772c: an applied entry gained an undo description on the wire");
+            std::vector<char> cut = b; cut.resize(cut.size() - 1);
+            if (DecodeShopRec(&cut[0], cut.size(), &back) == kSrOk) Fail("t772c: a cut owed entry decoded");
+            /* the rebase carries the owed mark with its description onto another holder's record */
+            const std::vector<std::string> held2(1, "barman");
+            ShopRec par2 = wr; ShopReqDone* pd2 = ShopReqFindMut(&par2.squads[0], 5, 9, 11); pd2->revoked = kRevApplied; pd2->undo = ShopUndoDesc();
+            ShopRec onto2 = par2; onto2.generation = 4;
+            ShopRec out2;
+            ShopRebase(onto2, wr, par2, held2, &out2);
+            const ShopReqDone* rd2 = ShopReqFind(out2.squads[0], 5, 9, 11);
+            if (rd2 == 0 || rd2->revoked != kRevOwed || rd2->undo.base != "sword" || rd2->undo.keeperUid != 77) Fail("t772c: the rebase dropped an owed entry's description");
+            /* the next holder's copy behind the stored owed mark takes the description with the state */
+            ShopRec behind = par2;
+            ShopCancelOut oc = ShopCancelStep(&behind, 1, 1, wr, "barman", 5, 9, 11, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1);
+            const ShopReqDone* bd = ShopReqFind(behind.squads[0], 5, 9, 11);
+            if (oc.step != kChWaitStored || bd == 0 || bd->revoked != kRevOwed || bd->undo.keeperUid != 77) Fail("t772c: a copy took the stored owed state without its description");
+        }
+    }
+    /* the request flagged settle-only: 'SHS1', no price legs, decoded flagged; an unflagged one is not */
+    {
+        coopshop::ShopReq q; q.has = 1; q.keeperUid = 9; q.homeKey = "Hub bar@3,4@1,2,3"; q.sid = "sid"; q.n = 2; q.unitPrice = 50; q.entry = 0; q.epoch = 77;
+        q.stock = kStockHome; q.cult = 1.0f; q.local = 1.0f; q.settleOnly = 1;
+        std::vector<char> b;
+        if (!EncodeReq(&b, q) || !TagAt(&b[0], b.size(), 0, kReqTagSettle) || ReqTagAt(&b[0], b.size(), 0) == 0) Fail("t772c: a settle-only request did not encode as 'SHS1'");
+        coopshop::ShopReq g; size_t at = 0;
+        if (!DecodeReq(&b[0], b.size(), &at, &g) || at != b.size() || g.settleOnly != 1 || g.n != 2 || g.epoch != 77 || g.homeKey != q.homeKey || g.cult != 0.0f)
+            Fail("t772c: a settle-only request did not round-trip");
+        q.settleOnly = 0; b.clear(); at = 0;
+        if (!EncodeReq(&b, q) || !TagAt(&b[0], b.size(), 0, kReqTagV4) || !DecodeReq(&b[0], b.size(), &at, &g) || g.settleOnly != 0) Fail("t772c: an ordinary request read as settle-only");
+    }
+    /* the tail kinds 2 and 3; kind 4 and an answer out of range refused */
+    {
+        ShopCancel c; c.stock = kStockHome; c.homeKey = "Hub bar@3,4@1,2,3"; c.keeperUid = 9; c.dir = 1; c.n = 3; c.price = 150;
+        c.desc.baseSid = "sid"; c.desc.companySid = "co"; c.desc.quality = 0.5f; c.desc.charges = 2.0f; c.desc.functionKind = 4; c.desc.level = 2; c.desc.unique = 1;
+        std::vector<char> w(4, (char)0);
+        if (!EncodeCancelTail(&w, 77, c)) Fail("t772c: a cancel did not encode");
+        ShopTail t; size_t at = 4;
+        if (!TagAt(&w[0], w.size(), 4, kTailTag) || !DecodeTail(&w[0], w.size(), &at, &t) || at != w.size() || t.kind != kTailCancel || t.epoch != 77
+            || t.cancel.homeKey != c.homeKey || t.cancel.n != 3 || t.cancel.price != 150 || t.cancel.dir != 1 || t.cancel.keeperUid != 9 || SameDesc(t.cancel.desc, c.desc) != 1)
+            Fail("t772c: the cancel did not round-trip");
+        at = 4; if (DecodeTail(&w[0], w.size() - 1, &at, &t)) Fail("t772c: a cut cancel decoded");
+        ShopCancel bad = c; bad.homeKey = ""; std::vector<char> wb;
+        if (EncodeCancelTail(&wb, 77, bad) || !wb.empty() || EncodeCancelTail(&wb, 0, c)) Fail("t772c: a home cancel with no key, or epoch 0, encoded");
+        std::vector<char> a3;
+        if (!EncodeCancelAnswerTail(&a3, 77, kCaWriteRefused)) Fail("t772c: an answer did not encode");
+        ShopTail t3; at = 0;
+        if (!DecodeTail(&a3[0], a3.size(), &at, &t3) || at != a3.size() || t3.kind != kTailCancelAnswer || t3.answer != kCaWriteRefused || t3.epoch != 77)
+            Fail("t772c: the answer did not round-trip");
+        std::vector<char> a4 = a3; a4[a4.size() - 1] = (char)(kCaMax + 1); at = 0;
+        if (DecodeTail(&a4[0], a4.size(), &at, &t3) || EncodeCancelAnswerTail(&a4, 77, kCaMax + 1)) Fail("t772c: an answer out of range went through");
+        std::vector<char> k4; EncodeTail(&k4, 77, 4); k4.push_back((char)0); at = 0;
+        if (DecodeTail(&k4[0], k4.size(), &at, &t3)) Fail("t772c: a shop tail of kind 4 decoded");
+    }
+    /* the write an echo answers: the oldest write in flight sent with its stamp */
+    {
+        std::vector<ShopFlight> fl(3);
+        fl[0].gen = 5; fl[0].stamp = 100; fl[1].gen = 6; fl[1].stamp = 100; fl[2].gen = 7; fl[2].stamp = 101;
+        if (ShopFlightFor(fl, 100) != 0 || ShopFlightFor(fl, 101) != 2 || ShopFlightFor(fl, 99) != -1) Fail("t772c: an echo answered the wrong write");
+    }
+}
+/* AN OWED UNDO'S GOODS LIVE IN BOX RECORDS: a shop counter's record lists the undos its contents hold, so a claimer that loads an older
+   save (its counters' stock comes from those records) never applies an undo twice; the undone mark carries the undo's money in the same
+   record; a claim whose claimer has gone is re-claimed and applied only into goods that lack it; the rebase holds the owed cap. */
+void t_t772c_goods_undo()
+{
+    using namespace shoprec;
+    using namespace coopbrec;
+    const std::string ck = "12-counter.mod@3,4@1003,-205,100";
+    std::vector<cooppar::ParityItem> items;
+    items.push_back(T823BoxItem("katana", 0, 0, 1));
+    /* THE UNDO LIST: a counter's record with none is byte for byte the form without it; with one, that form plus the flag and the list */
+    BoxHeader h; h.flags = 0; h.generation = 5; h.writerSlot = 1; h.kind = kBrKindShop; h.ownerSlot = -1; h.key = ck;
+    std::vector<char> plain, listed;
+    if (!EncodeBoxRecord(&plain, h, items)) { Fail("t772c goods: a counter's record was not encoded"); return; }
+    BoxHeader hl = h;
+    BoxUndoKey k1; k1.asker = 5; k1.epoch = 9; k1.id = 4;
+    hl.undos.push_back(k1);
+    if (!EncodeBoxRecord(&listed, hl, items)) { Fail("t772c goods: a counter's record with an undo list was not encoded"); return; }
+    const size_t fo = (size_t)kBrFixedBytes + ck.size();   /* the flags field */
+    {
+        std::vector<char> want = plain;
+        const unsigned int f = kBrFlagUndos; std::memcpy(&want[fo], &f, 4);
+        BrPutU32(&want, 1u); BrPutU32(&want, 5u); BrPutU32(&want, 9u); BrPutU32(&want, 4u);
+        if (listed != want) Fail("t772c goods: a record with an undo list is not the form without it plus its flag and the list");
+    }
+    BoxHeader back; std::vector<cooppar::ParityItem> bi;
+    if (DecodeBoxRecord(&plain[0], plain.size(), &back, &bi) != kBrOk || !back.undos.empty() || back.flags != 0 || bi.size() != 1)
+        Fail("t772c goods: a record with no undo list did not read as before");
+    if (DecodeBoxRecord(&listed[0], listed.size(), &back, &bi) != kBrOk || back.undos.size() != 1 || BoxUndoHas(back.undos, 5, 9, 4) != 1
+        || (back.flags & kBrFlagUndos) == 0 || bi.size() != 1)
+        Fail("t772c goods: an undo list did not read back");
+    {   /* refused: cut short, a byte after the list, empty, a key twice, over the cap, on a record that is not a shop's */
+        for (size_t n = plain.size(); n < listed.size(); ++n) if (DecodeBoxRecord(&listed[0], n, 0, 0) == kBrOk) { Fail("t772c goods: a cut undo list was read"); break; }
+        std::vector<char> t = listed; t.push_back(0);
+        if (DecodeBoxRecord(&t[0], t.size(), 0, 0) != kBrTrailing) Fail("t772c goods: a byte after the undo list was read");
+        const unsigned int f = kBrFlagUndos;
+        std::vector<char> e = plain; std::memcpy(&e[fo], &f, 4); BrPutU32(&e, 0u);
+        if (DecodeBoxRecord(&e[0], e.size(), 0, 0) != kBrBadUndos) Fail("t772c goods: an empty undo list was read");
+        std::vector<char> tw = plain; std::memcpy(&tw[fo], &f, 4); BrPutU32(&tw, 2u);
+        for (int r = 0; r < 2; ++r) { BrPutU32(&tw, 5u); BrPutU32(&tw, 9u); BrPutU32(&tw, 4u); }
+        if (DecodeBoxRecord(&tw[0], tw.size(), 0, 0) != kBrBadUndos) Fail("t772c goods: an undo list naming a key twice was read");
+        std::vector<char> ov = plain; std::memcpy(&ov[fo], &f, 4); BrPutU32(&ov, kBrUndoMax + 1u);
+        for (unsigned int r = 0; r <= kBrUndoMax; ++r) { BrPutU32(&ov, 5u); BrPutU32(&ov, 9u); BrPutU32(&ov, r); }
+        if (DecodeBoxRecord(&ov[0], ov.size(), 0, 0) != kBrBadUndos) Fail("t772c goods: an undo list over its cap was read");
+        std::vector<char> bx = listed; bx[16] = (char)kBrKindBox;
+        if (DecodeBoxRecord(&bx[0], bx.size(), 0, 0) != kBrBadHeader) Fail("t772c goods: an undo list on a storage box's record was read");
+        std::vector<char> out;
+        BoxHeader d2 = hl; d2.undos.push_back(k1);
+        if (EncodeBoxRecord(&out, d2, items)) Fail("t772c goods: an undo list naming a key twice was written");
+        BoxHeader d3 = h;
+        for (unsigned int r = 0; r <= kBrUndoMax; ++r) { BoxUndoKey x; x.asker = 5; x.epoch = 9; x.id = r; d3.undos.push_back(x); }
+        if (EncodeBoxRecord(&out, d3, items)) Fail("t772c goods: an undo list over its cap was written");
+        BoxHeader d4 = hl; d4.kind = kBrKindBox;
+        if (EncodeBoxRecord(&out, d4, items)) Fail("t772c goods: a storage box's record carried an undo list");
+        BoxHeader d5 = h; d5.flags = kBrFlagUndos;   /* the flag follows the list: none, no flag */
+        if (!EncodeBoxRecord(&out, d5, items) || out != plain) Fail("t772c goods: a flag with no list was written");
+        const std::vector<int> loaded(1, 1);
+        if (BoxJudgeWrite(MakeBoxRecId(ck), &listed[0], listed.size(), 1, 1, loaded, 1, 4u, -1, kBrKindShop, 0, 0) != kBrAccept)
+            Fail("t772c goods: the world server refused a counter's record with an undo list");
+    }
+    {   /* THE CARRY: the kept record's keys, then this game's own, less the ones the shop record has done; past the cap the oldest go */
+        std::vector<BoxUndoKey> kept, local, done, out;
+        unsigned int dropped = 9;
+        BoxUndoKey a; a.asker = 1; a.epoch = 1; a.id = 1;
+        BoxUndoKey b = a; b.id = 2;
+        BoxUndoKey c = a; c.id = 3;
+        kept.push_back(a); kept.push_back(b); local.push_back(b); local.push_back(c); done.push_back(a);
+        BoxUndoCarry(kept, local, done, &out, &dropped);
+        if (out.size() != 2 || out[0].id != 2 || out[1].id != 3 || dropped != 0) Fail("t772c goods: the undo list carried is not the kept and own keys less the done ones");
+        kept.clear(); done.clear(); local.clear();
+        for (unsigned int r = 0; r < kBrUndoMax + 3u; ++r) { BoxUndoKey x = a; x.id = 100u + r; local.push_back(x); }
+        BoxUndoCarry(kept, local, done, &out, &dropped);
+        if (out.size() != kBrUndoMax || dropped != 3u || out[0].id != 103u) Fail("t772c goods: an undo list past its cap did not drop the oldest");
+    }
+    /* A CLAIMER THAT LOADS AN OLDER SAVE: A (slot 1) claimed the owed undo of trade {5, 9, 4}, applied it into counter 1 and wrote counter
+       1's record with the key (`listed`); its undone write was lost; it quit and loaded an older save - its undo memory is empty and its
+       counters' stock comes from their records. The record holds the undo: A writes undone only, it never applies it again. */
+    {
+        std::vector<ShopUndoPiece> p(2);
+        for (size_t i = 0; i < p.size(); ++i) { p[i].localHas = 0; p[i].haveRecord = 1; p[i].recordHas = 0; p[i].applyDone = 1; p[i].ownSeed = 0; }
+        BoxHeader rd;
+        if (DecodeBoxRecord(&listed[0], listed.size(), &rd, 0) != kBrOk) Fail("t772c goods: counter 1's record did not read");
+        p[0].recordHas = BoxUndoHas(rd.undos, 5, 9, 4);
+        std::vector<ShopReqKey> fresh;   /* the older save's world: no undo ran in it */
+        int g = ShopUndoGoods(p);
+        if (g != kUgIn || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, ShopKeyHas(fresh, 5, 9, 4), g) != kOwMarkUndone)
+            Fail("t772c goods: a claimer that loaded an older save applied an undo its counter's record holds a second time");
+        p[0].recordHas = 0;   /* the box write was lost too: the goods lack it - applied once */
+        g = ShopUndoGoods(p);
+        if (g != kUgOut || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, g) != kOwApply) Fail("t772c goods: goods without the undo did not take it");
+        p[1].applyDone = 0;   /* a counter's record not put in yet at this load */
+        g = ShopUndoGoods(p);
+        if (g != kUgWait || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, g) != kOwWait) Fail("t772c goods: an undo was applied with a counter's record not put in");
+        p[1].applyDone = 1; p[1].haveRecord = 0;
+        if (ShopUndoGoods(p) != kUgWait) Fail("t772c goods: an undo was applied into a counter with no record");
+        p[1].haveRecord = 1; p[1].ownSeed = 1;
+        if (ShopUndoGoods(p) != kUgWait) Fail("t772c goods: an undo was decided on this game's own unsettled first write");
+        p[1].ownSeed = 0; p[1].localHas = 1;   /* this game's own change, not stored yet */
+        if (ShopUndoGoods(p) != kUgWait) Fail("t772c goods: this game's own unstored change on a counter was decided");
+        const std::vector<ShopUndoPiece> none;
+        if (ShopUndoGoods(none) != kUgNever) Fail("t772c goods: a shop with no counter did not end the cancel");
+    }
+    const std::vector<std::string> held(1, "barman");
+    ShopRec claimed; claimed.generation = 9; claimed.key = "Hub bar@3,4@1234,-567,89"; claimed.repairMark = kSrNoRepair;
+    { ShopSquad q; q.name = "barman"; q.money = 1120; ShopReqNote(&q, 5, 9, 4, 2, 120); claimed.squads.push_back(q); }
+    ShopReqOwe(&claimed.squads[0], 5, 9, 4);
+    ShopReqClaim(&claimed.squads[0], 5, 9, 4, 1);
+    /* THE UNDONE MARK CARRIES THE UNDO'S MONEY in the same record: a lost write lost both, the mark written again takes it once; a
+       rebase onto a record already marked undone takes it once */
+    {
+        ShopRec mk = claimed; int mv = 0;
+        if (ShopReqUndo(&mk.squads[0], 5, 9, 4, &mv) != 1 || mv != 120 || mk.squads[0].money != 1000 || ShopRecRank(mk, "barman", 5, 9, 4) != 3)
+            Fail("t772c goods: the undone mark did not take the undo's money out of the record with it");
+        if (ShopReqUndo(&mk.squads[0], 5, 9, 4, &mv) != 0 || mk.squads[0].money != 1000) Fail("t772c goods: a second undone mark took the money again");
+        ShopRec again = claimed;   /* the write lost: the stored record still has the claim and the money */
+        if (ShopReqUndo(&again.squads[0], 5, 9, 4, &mv) != 1 || again.squads[0].money != 1000) Fail("t772c goods: the mark written again did not take the money once");
+        ShopRec onto = mk; onto.generation = 10;
+        ShopRec out;
+        ShopRebase(onto, mk, claimed, held, &out);
+        if (out.squads[0].money != 1000 || ShopRecRank(out, "barman", 5, 9, 4) != 3) Fail("t772c goods: a rebased undone mark took the undo's money twice");
+        ShopRec onto2 = claimed; onto2.generation = 10; onto2.squads[0].money = 1150;   /* another trade moved the money meanwhile */
+        ShopRebase(onto2, mk, claimed, held, &out);
+        if (out.squads[0].money != 1030 || ShopRecRank(out, "barman", 5, 9, 4) != 3) Fail("t772c goods: a rebased undone mark did not take its money once over another trade");
+    }
+    /* A CLAIM WHOSE CLAIMER HAS GONE: A (slot 1) claimed and left before its undone mark; B (slot 2) is the exact holder. B waits while it
+       has watched A's claim less than kReclaimMs, then re-claims; once its claim is stored B applies only into goods that lack the undo;
+       A, back as the holder, waits on B's claim. */
+    {
+        ShopClaimWatch cw;
+        if (ShopClaimGoneMs(&cw, 1, 1, 1000u) != 0 || ShopClaimGoneMs(&cw, 1, 1, 1000u + kReclaimMs - 1u) != kReclaimMs - 1u) Fail("t772c goods: the claim watch did not count");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 2, 1, 1, 0, kUgOut, kReclaimMs - 1u) != kOwWait)
+            Fail("t772c goods: a claim was re-claimed before its claimer had been away kReclaimMs");
+        const unsigned int gone = ShopClaimGoneMs(&cw, 1, 1, 1000u + kReclaimMs);
+        if (gone != kReclaimMs || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 2, 1, 1, 0, kUgOut, gone) != kOwReclaim)
+            Fail("t772c goods: a claim whose claimer had gone was not re-claimed (it would wait for ever and hold one of the owed places)");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 2, 0, 1, 0, kUgOut, gone) != kOwWait) Fail("t772c goods: a claim was re-claimed off the exact holder");
+        if (ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 1, 2, 1, 1, 0, kUgOut, gone) != kOwWait) Fail("t772c goods: a re-claim in flight was written again");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 2, 1, 0, 0, kUgOut, gone) != kOwWait) Fail("t772c goods: a claim was re-claimed with nothing to undo from");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 2, 1, 0, 0, kUgIn, gone) != kOwReclaim) Fail("t772c goods: a claim whose goods hold the undo was not re-claimed");
+        if (ShopClaimGoneMs(&cw, 0, 1, 1000u + kReclaimMs + 5u) != 0 || ShopClaimGoneMs(&cw, 1, 1, 1000u + kReclaimMs + 6u) != 0
+            || ShopClaimGoneMs(&cw, 1, 1, 1000u + kReclaimMs + 16u) != 10u)
+            Fail("t772c goods: the claim watch did not start again after this game stopped being the exact holder");
+        if (ShopClaimGoneMs(&cw, 1, 3, 1000u + 3u * kReclaimMs) != 0) Fail("t772c goods: the claim watch carried over to another claimer");
+        ShopRec b = claimed;
+        if (ShopReqReclaim(&b.squads[0], 5, 9, 4, 3, 2) != 0 || ShopReqReclaim(&b.squads[0], 5, 9, 4, 1, 1) != 0) Fail("t772c goods: a re-claim not over the named claimer's claim was written");
+        const ShopReqDone* bd = ShopReqFind(b.squads[0], 5, 9, 4);
+        if (ShopReqReclaim(&b.squads[0], 5, 9, 4, 1, 2) != 1 || bd == 0 || bd->claimer != 2 || bd->revoked != kRevClaimed) Fail("t772c goods: the re-claim was not written");
+        ShopRec ow = claimed; ShopReqFindMut(&ow.squads[0], 5, 9, 4)->revoked = kRevOwed;
+        if (ShopReqReclaim(&ow.squads[0], 5, 9, 4, 1, 2) != 0) Fail("t772c goods: an owed entry was re-claimed (it is claimed)");
+        if (ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 2, 2, 1, 1, 0, kUgIn) != kOwMarkUndone) Fail("t772c goods: the re-claimer applied an undo the old claimer's counter record holds");
+        if (ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 2, 2, 1, 1, 0, kUgOut) != kOwApply) Fail("t772c goods: the re-claimer did not apply an undo the goods lack");
+        if (ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 2, 2, 1, 1, 0, kUgWait) != kOwWait) Fail("t772c goods: the re-claimer applied with the goods not decided");
+        if (ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 2, 1, 1, 1, 1, kUgIn, 0) != kOwWait) Fail("t772c goods: the returning old claimer acted on another game's claim");
+        /* B's re-claim refused (A's undone mark landed first): A's mark and money stand */
+        ShopRec aDone = claimed; int mv = 0; ShopReqUndo(&aDone.squads[0], 5, 9, 4, &mv); aDone.generation = 10;
+        ShopRec out;
+        ShopRebase(aDone, b, claimed, held, &out);
+        if (ShopRecRank(out, "barman", 5, 9, 4) != 3 || out.squads[0].money != 1000) Fail("t772c goods: a refused re-claim went over the stored undone mark");
+        /* A's undone mark refused (B's re-claim stored first): B's claim stands, and the money A's mark took goes back with it */
+        ShopRec bStored = b; bStored.generation = 10;
+        ShopRebase(bStored, aDone, claimed, held, &out);
+        const ShopReqDone* od = ShopReqFind(out.squads[0], 5, 9, 4);
+        if (od == 0 || od->revoked != kRevClaimed || od->claimer != 2) Fail("t772c goods: the old claimer's undone mark went over the re-claim");
+        if (out.squads[0].money != 1120) Fail("t772c goods: the old claimer's undone mark left its money behind without the mark (the re-claimer would take it again)");
+    }
+    /* THE REBASE HOLDS THE OWED CAP: this game's owed entries past kSrOwedCap stay applied (their cancels ask again), so a merged record
+       never carries more undo descriptions than one record holds */
+    {
+        ShopRec par; par.generation = 4; par.key = "Hub bar@3,4@1234,-567,89"; par.repairMark = kSrNoRepair;
+        for (unsigned int s = 0; s < 6; ++s)
+        {
+            ShopSquad q; q.name = (s == 0) ? std::string("barman") : "keeper" + std::string(1, (char)('a' + s)); q.money = 1000;
+            for (unsigned int a = 0; a < kSrMaxReqs; ++a) for (unsigned int x = 0; x < kSrReqKeep; ++x) ShopReqNote(&q, 10u + a, 1u, 1u + x, 1, 0);
+            par.squads.push_back(q);
+        }
+        ShopRec onto = par; onto.generation = 5;
+        ShopRec work = par;
+        ShopUndoDesc u; u.has = 1; u.base = "katana"; u.keeperUid = 7;
+        unsigned int nOnto = 0, nWork = 0;
+        for (size_t s = 0; s < par.squads.size(); ++s)
+            for (unsigned int a = 0; a < kSrMaxReqs; ++a)
+                for (unsigned int x = 0; x < kSrReqKeep; ++x)
+                {
+                    if (s < 3 && nOnto < 30u && x < 2u) { ShopReqOwe(&onto.squads[s], 10u + a, 1u, 1u + x, &u); ++nOnto; }
+                    else if (s >= 3 && nWork < 10u && x < 2u) { ShopReqOwe(&work.squads[s], 10u + a, 1u, 1u + x, &u); ++nWork; }
+                }
+        if (ShopRecOwedCount(onto) != 30u || ShopRecOwedCount(work) != 10u) Fail("t772c goods: the cap case was not built");
+        std::vector<std::string> all;
+        for (size_t s = 0; s < par.squads.size(); ++s) all.push_back(par.squads[s].name);
+        ShopRec out; int capHeld = 0;
+        ShopRebase(onto, work, par, all, &out, &capHeld);
+        std::vector<char> ob;
+        if (ShopRecOwedCount(out) != kSrOwedCap || capHeld != 8) Fail("t772c goods: the rebase carried owed entries past the cap");
+        if (!EncodeShopRec(&ob, out)) Fail("t772c goods: the rebased record at the owed cap does not encode");
+    }
+}
+/* AN APPLIED OWED UNDO IS WRITTEN UNDONE (WITH ITS MONEY) ONLY ONCE THE GOODS ARE DURABLY UNDONE: every counter it changed has its
+   record stored with the undo's key; a change lost before that leaves the claim open and the undo goes again, once. A counter that can
+   never hold the undo in a record ends the cancel as refused - the trade stands, the asker is answered refused, the owed place is free. */
+void t_t772c_durable_undo()
+{
+    using namespace shoprec;
+    using namespace coopshop;
+    ShopRec claimed; claimed.generation = 9; claimed.key = "Hub bar@3,4@1234,-567,89"; claimed.repairMark = kSrNoRepair;
+    { ShopSquad q; q.name = "barman"; q.money = 1120; ShopReqNote(&q, 5, 9, 4, 2, 120); claimed.squads.push_back(q); }
+    ShopReqOwe(&claimed.squads[0], 5, 9, 4);
+    ShopReqClaim(&claimed.squads[0], 5, 9, 4, 1);
+    /* A (slot 1) applied the undo into one counter; that counter's write carrying the key is not stored yet: no undone mark, no money */
+    {
+        std::vector<ShopUndoTouch> t(1); t[0].stored = 0; t[0].inFlight = 1;
+        int partial = 9;
+        int g = ShopUndoDurable(t, 0, &partial);
+        if (g != kUgWait || partial != 0 || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, g) != kOwWait)
+            Fail("t772c durable: the undone mark (and its money) went out while the counter's write carrying the undo was not stored");
+        /* the counter's write is lost (its area left, the game quit, the holder moved): nothing stored, nothing in flight. The claim is
+           still open with the money in the record; the counters' stored records lack the key - the undo goes again, once */
+        t[0].inFlight = 0;
+        if (ShopUndoDurable(t, 0, &partial) != kUgOut) Fail("t772c durable: a counter change lost before its record stored it was not taken as lost");
+        if (ShopRecRank(claimed, "barman", 5, 9, 4) != 2 || claimed.squads[0].money != 1120) Fail("t772c durable: the open claim is not the stored record's");
+        std::vector<ShopUndoPiece> p(1); p[0].haveRecord = 1; p[0].applyDone = 1;
+        const int gr = ShopUndoGoods(p);
+        if (gr != kUgOut || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, gr) != kOwApply)
+            Fail("t772c durable: the claimer did not apply again an undo whose counter change was lost");
+        if (ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 2, 1, 1, 0, gr, kReclaimMs) != kOwReclaim
+            || ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 2, 2, 1, 1, 0, gr) != kOwApply)
+            Fail("t772c durable: a re-claimer did not apply an undo whose first apply was lost");
+        /* B's counter write is stored (its echo): now the undone mark and the money, once */
+        t[0].stored = 1;
+        g = ShopUndoDurable(t, 0, &partial);
+        if (g != kUgIn || ShopOwedDue((int)kRevClaimed, 2, (int)kRevClaimed, 2, 2, 1, 1, 0, g) != kOwMarkUndone)
+            Fail("t772c durable: a stored counter write did not let the undone mark go");
+        ShopRec b = claimed; int mv = 0;
+        if (ShopReqReclaim(&b.squads[0], 5, 9, 4, 1, 2) != 1 || ShopReqUndo(&b.squads[0], 5, 9, 4, &mv) != 1 || b.squads[0].money != 1000)
+            Fail("t772c durable: the money did not go once with the undone mark");
+        if (ShopUndoDurable(t, 1, &partial) != kUgWait) Fail("t772c durable: the undone mark went with the undo's units still kept, not filed");
+        const std::vector<ShopUndoTouch> none;
+        if (ShopUndoDurable(none, 0, &partial) != kUgIn) Fail("t772c durable: an undo that changed no counter waited");
+        std::vector<ShopUndoTouch> two(2); two[0].stored = 1; two[0].inFlight = 0; two[1].stored = 0; two[1].inFlight = 0;
+        if (ShopUndoDurable(two, 0, &partial) != kUgIn || partial != 1) Fail("t772c durable: a part stored and a part lost was applied again over the stored part");
+        two[1].inFlight = 1;
+        if (ShopUndoDurable(two, 0, &partial) != kUgWait || partial != 0) Fail("t772c durable: the mark went with a counter's write still in flight");
+        std::vector<ShopUndoPiece> q(1); q[0].haveRecord = 1; q[0].applyDone = 1; q[0].localHas = 1;
+        if (ShopUndoGoods(q) != kUgWait) Fail("t772c durable: this game's own unstored change was read as held");
+    }
+    /* EVERY COUNTER STATE ENDS: a record that failed to go in is not decided; a counter that can never hold the undo ends the cancel */
+    {
+        std::vector<ShopUndoPiece> p(2);
+        for (size_t i = 0; i < p.size(); ++i) { p[i].haveRecord = 1; p[i].applyDone = 1; }
+        p[1].applyDone = 0;   /* its record was refused at this load: the older save's stock stands, without the undo */
+        if (ShopUndoGoods(p) != kUgWait) Fail("t772c durable: a counter whose record failed to go in was decided");
+        p[1].never = 1;
+        int g = ShopUndoGoods(p);
+        if (g != kUgNever || ShopOwedDue((int)kRevClaimed, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, g) != kOwRefuse)
+            Fail("t772c durable: a counter that can never hold the undo did not end the cancel (it would hold an owed place for ever)");
+        p[0].recordHas = 1;
+        if (ShopUndoGoods(p) != kUgIn) Fail("t772c durable: a stored record holding the undo did not decide it");
+        const std::vector<ShopUndoPiece> none;
+        if (ShopUndoGoods(none) != kUgNever) Fail("t772c durable: a shop with no counter did not end the cancel");
+        ShopRec r = claimed;
+        const unsigned int before = ShopRecOwedCount(r);
+        if (ShopReqRefuse(&r.squads[0], 5, 9, 4) != 1 || ShopRecOwedCount(r) != before - 1u || r.squads[0].money != 1120 || ShopRecMarked(r, "barman", 5, 9, 4) != 0)
+            Fail("t772c durable: a refused cancel did not free its owed place, or moved money, or reads as cancelled");
+        int mk = 0;
+        if (ShopReqRefuse(&r.squads[0], 5, 9, 4) != 0 || ShopReqOwe(&r.squads[0], 5, 9, 4) != 0 || ShopReqState(r.squads[0], 5, 9, 4, &mk) != kRsCancelRefused)
+            Fail("t772c durable: a refused cancel was marked again");
+        if (ShopOwedDue((int)kRevRefused, 1, (int)kRevClaimed, 1, 1, 1, 1, 0, kUgNever) != kOwWait) Fail("t772c durable: a refusal in flight was written again");
+        std::vector<char> bytes; ShopRec back;
+        if (!EncodeShopRec(&bytes, r) || DecodeShopRec(&bytes[0], bytes.size(), &back) != kSrOk || ShopReqFind(back.squads[0], 5, 9, 4) == 0
+            || ShopReqFind(back.squads[0], 5, 9, 4)->revoked != kRevRefused)
+            Fail("t772c durable: a refused cancel did not round-trip");
+        ShopRec st = r; st.generation = 10;
+        ShopRec w1 = r;
+        ShopCancelOut o = ShopCancelStep(&w1, 1, 1, st, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChAnswerNow || o.answer != kCaRefused || o.undo != 0 || o.mark != 0 || CancelAnswerTake(3, 3, o.answer) != kTakeEnded)
+            Fail("t772c durable: the asker of a refused cancel was not answered refused (ending it)");
+        ShopRec w2 = r;
+        o = ShopCancelStep(&w2, 1, 1, claimed, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChWaitStored || o.answer != kCaRefused) Fail("t772c durable: a refusal in this game's copy only was answered");
+        ShopRec w3 = claimed;
+        o = ShopCancelStep(&w3, 1, 1, st, "barman", 5, 9, 4, 0, 0, 1, 1, 0, 1, 0, 0, 1, 2);
+        if (o.step != kChAnswerNow || o.answer != kCaRefused) Fail("t772c durable: a stored refusal was not taken into the copy");
+        ShopRec w4 = r;
+        ShopSettleOut so = ShopSettleOnlyStep(&w4, 1, 1, st, "barman", 5, 9, 4, 1, 1, 0, 1);
+        if (so.v != kSoFromRecord || so.n != 2 || so.move != 120) Fail("t772c durable: a settle-only ask of a refused cancel was not answered from the standing trade");
+    }
 }
 #include "setupstock.h"   /* a shop's set-up restock and a keeper's unknown money when the counters hold the world server's stock */
 /* A forced restock is refused only when the counters hold the world server's stock applied at this load and the call is neither the
@@ -53865,14 +59553,185 @@ void t_t985c1f1_server_behind()
         Fail("T-985 C1 fold 1: a header with an unreadable or zero seq was read");
     if (std::string(mirrorkeep::WhyName(mirrorkeep::kWhyServerBehind)).compare(0, 12, "serverBehind") != 0) Fail("T-985 C1 fold 1: the serverBehind reason");
 }
-/* T-985 C1: the unnamed-key drop runs only for a snapshot seen whole (an empty LAST page after full ones is a cut snapshot) */
+/* T-985 C1: the unnamed-key drop runs only for a snapshot seen whole - since T-985 C2b fold 6 the LAST PAGE_END's complete, nothing else */
 void t_t985c1f2_snapshot_whole()
 {
-    if (mirrorkeep::SnapshotWholeForDrop(10, 10, 3) != 1 || mirrorkeep::SnapshotWholeForDrop(0, 0, 0) != 1) Fail("T-985 C1: a whole snapshot (or an empty world's) was not taken as whole");
-    if (mirrorkeep::SnapshotWholeForDrop(10, 10, 0) != 0) Fail("T-985 C1: an empty LAST page after pages that carried records was taken as whole");
-    if (mirrorkeep::SnapshotWholeForDrop(10, 7, 2) != 0 || mirrorkeep::SnapshotWholeForDrop(10, 0, 0) != 0) Fail("T-985 C1: pages that carried fewer records than the BEGIN were taken as whole");
-    if (mirrorkeep::SnapshotWholeForDrop(5, 6, 1) != 1) Fail("T-985 C1: a snapshot that grew while it was paged was not taken as whole");
+    if (mirrorkeep::SnapshotWholeForDrop(1, 1) != 1) Fail("T-985 C2b fold 6: a LAST page that said complete was not taken as whole");
+    if (mirrorkeep::SnapshotWholeForDrop(1, 0) != 0) Fail("T-985 C2b fold 6: a LAST page that said NOT complete was taken as whole");
+    if (mirrorkeep::SnapshotWholeForDrop(0, 1) != 0 || mirrorkeep::SnapshotWholeForDrop(0, 0) != 0) Fail("T-985 C2b fold 6: a page that is not the last was taken as a whole snapshot");
     if (mirrorkeep::UnnamedDecide(0, 0, 1, 50, 50) != mirrorkeep::kUnnamedKeep) Fail("T-985 C1: a snapshot not seen whole dropped an unnamed key");
+}
+/* T-985 C2b fold 6: the world server judges the snapshot whole (coopfeed::FeedSnapshotComplete) and says so on the LAST PAGE_END; the
+   game's only test is that flag (mirrorkeep::SnapshotWholeForDrop). The world server's paging is run here on a map, three records a
+   page, through the wire, as store_main.cpp OnRecordFeed runs it: FeedPageWalk, FeedGoneTake, the refused sends, the cut. */
+struct T985f6Send
+{
+    const std::set<std::string>* refuse; unsigned int failed;
+    T985f6Send() : refuse(0), failed(0) {}
+    size_t operator()(const std::string& k, const int&) { if (refuse != 0 && refuse->count(k) != 0) ++failed; return 1; }
+};
+struct T985f6Feed
+{
+    std::map<std::string, int> live; std::set<std::string> beginKeys, refuse; std::string cursor;
+    long long begin, sent, gone, lastSent, sendFailed; unsigned int lastFlag, complete; bool hasList, done;
+    T985f6Feed() : begin(0), sent(0), gone(0), lastSent(0), sendFailed(0), lastFlag(0), complete(0), hasList(false), done(false) {}
+    void Fill(const char* keys) { live.clear(); for (const char* k = keys; *k != 0; ++k) live[std::string(1, *k)] = 1; }
+    void Begin()   /* the first-page ASK: the BEGIN's key list is taken and every total starts over (world server and game) */
+    {
+        beginKeys.clear();
+        for (std::map<std::string, int>::const_iterator k = live.begin(); k != live.end(); ++k) beginKeys.insert(k->first);
+        hasList = true; begin = (long long)live.size(); sent = 0; gone = 0; lastSent = 0; sendFailed = 0; lastFlag = 0; complete = 0; cursor.clear(); done = false;
+    }
+    bool Page()   /* one ASK's answer after cursor, read back from its PAGE_END as the game reads it */
+    {
+        T985f6Send s; s.refuse = &refuse; std::string lk; unsigned int n = 0;
+        bool last = coopfeed::FeedPageWalk(live, cursor, (size_t)1 << 30, 3, s, &lk, &n);
+        unsigned int g = hasList ? coopfeed::FeedGoneTake(&beginKeys, live, cursor, lk, last) : 0u;
+        sendFailed += (long long)s.failed;
+        const bool cut = lk.size() > coopfeed::kFeedKeyMax;
+        unsigned int c = coopfeed::FeedSnapshotComplete(last, hasList, beginKeys.size(), cut, sendFailed);
+        std::vector<char> pe; coopfeed::FeedMsg m;
+        if (!coopfeed::FeedEncodePageEnd(&pe, lk, n, last, 1ULL, g, c))
+        {   /* the world server's answer to a key over the wire's bound: an empty LAST page, never complete */
+            pe.clear(); g = 0; c = 0; last = true;
+            if (!coopfeed::FeedEncodePageEnd(&pe, std::string(), 0, true, 1ULL)) return false;
+        }
+        if (!coopfeed::FeedDecode(&pe[0], pe.size(), &m) || m.gone != g || m.complete != c || (m.last != 0) != last) return false;
+        sent += (long long)m.sent; gone += (long long)m.gone; lastSent = (long long)m.sent; lastFlag = m.last; complete = m.complete; cursor = m.key; done = m.last != 0;
+        return true;
+    }
+    bool Run() { for (int k = 0; k < 100 && !done; ++k) if (!Page()) return false; return done; }
+    int Whole() const { return mirrorkeep::SnapshotWholeForDrop(lastFlag, complete); }
+    bool CountSaysWhole() const { return sent + gone >= begin && !(lastSent == 0 && sent > 0); }   /* fold 5's count rule, kept here only to show it fooled */
+};
+void t_t985c2bf6_feed_complete()
+{
+    {   /* the rule's arms */
+        if (coopfeed::FeedSnapshotComplete(true, true, 0, false, 0) != 1u) Fail("fold 6: a whole snapshot was not complete");
+        if (coopfeed::FeedSnapshotComplete(false, true, 0, false, 0) != 0u) Fail("fold 6: a page that is not the last said complete");
+        if (coopfeed::FeedSnapshotComplete(true, false, 0, false, 0) != 0u) Fail("fold 6: a feed with no BEGIN key list said complete");
+        if (coopfeed::FeedSnapshotComplete(true, true, 1, false, 0) != 0u) Fail("fold 6: a BEGIN key no page judged was left and the snapshot said complete");
+        if (coopfeed::FeedSnapshotComplete(true, true, 0, true, 0) != 0u) Fail("fold 6: a cut page said complete");
+        if (coopfeed::FeedSnapshotComplete(true, true, 0, false, 1) != 0u) Fail("fold 6: a refused record send said complete");
+    }
+    {   /* all paged: seven records in three pages; an empty world */
+        T985f6Feed f; f.Fill("abcdefg"); f.Begin();
+        if (!f.Run() || f.sent != 7 || f.gone != 0 || f.Whole() != 1) Fail("fold 6: a snapshot with every record paged was not whole");
+        T985f6Feed e; e.Begin();
+        if (!e.Run() || e.sent != 0 || e.Whole() != 1) Fail("fold 6: an empty world's snapshot was not whole");
+    }
+    {   /* one deleted mid-feed, before its page reached it: whole (the delete is reported as gone) */
+        T985f6Feed f; f.Fill("abcdefg"); f.Begin();
+        if (!f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.live.erase("e");
+        if (!f.Run() || f.sent != 6 || f.gone != 1 || f.Whole() != 1) Fail("fold 6: a snapshot with a record deleted mid-feed was not whole");
+    }
+    {   /* a delete of a key already paged: whole, nothing reported gone */
+        T985f6Feed f; f.Fill("abcdefg"); f.Begin();
+        if (!f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.live.erase("b");
+        if (!f.Run() || f.sent != 7 || f.gone != 0 || f.Whole() != 1) Fail("fold 6: a delete of a key already paged changed the judgement");
+    }
+    {   /* fold 5's LOW 1: a create after the BEGIN plus one refused send - any count is fooled, the world server's flag is not */
+        T985f6Feed f; f.Fill("abcdefg"); f.Begin();
+        if (!f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.live["dd"] = 1; f.refuse.insert("f");
+        if (!f.Run() || f.sent != 8 || f.gone != 0 || !f.CountSaysWhole() || f.sendFailed != 1 || f.Whole() != 0) Fail("fold 6: a refused record send hidden by a create was taken as whole");
+    }
+    {   /* a refused send alone */
+        T985f6Feed f; f.Fill("abc"); f.refuse.insert("a"); f.Begin();
+        if (!f.Run() || f.Whole() != 0) Fail("fold 6: a snapshot with a refused record send was taken as whole");
+    }
+    {   /* a cut page: a key over the wire's bound ends the feed with an empty LAST page; the keys after it are never judged */
+        T985f6Feed f; f.Fill("abde"); f.live["c" + std::string(coopfeed::kFeedKeyMax, 'z')] = 1; f.Begin();
+        if (!f.Run() || f.lastFlag != 1u || f.lastSent != 0 || f.Whole() != 0 || f.beginKeys.size() != 2u) Fail("fold 6: a cut page mid-feed was taken as whole");
+        T985f6Feed t; t.Fill("ab"); t.live[std::string(coopfeed::kFeedKeyMax + 1, 'z')] = 1; t.Begin();
+        if (!t.Run() || !t.beginKeys.empty() || t.Whole() != 0) Fail("fold 6: a cut LAST page was taken as whole although every BEGIN key was judged");
+    }
+    {   /* fold 5's LOW 2: a create then delete after a page's last key - an empty LAST page with nothing gone is whole */
+        T985f6Feed f; f.Fill("abcdef"); f.Begin();
+        if (!f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.live["g"] = 1;
+        if (!f.Page() || f.done) Fail("fold 6: the page before the delete ended the feed");
+        f.live.erase("g");
+        if (!f.Run() || f.sent != 6 || f.gone != 0 || f.lastSent != 0 || f.CountSaysWhole() || f.Whole() != 1) Fail("fold 6: an empty LAST page after a create then delete was not whole");
+    }
+    {   /* a re-asked range counts nothing twice and the snapshot stays whole; a skipped range leaves BEGIN keys and is not */
+        T985f6Feed f; f.Fill("abcdefg"); f.Begin();
+        if (!f.Page() || !f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.cursor = "c";
+        if (!f.Run() || f.sent != 10 || f.gone != 0 || f.Whole() != 1) Fail("fold 6: a re-asked range changed the judgement");
+        T985f6Feed s; s.Fill("abcdefg"); s.Begin();
+        if (!s.Page()) Fail("fold 6: a page did not go through the wire");
+        s.cursor = "e";
+        if (!s.Run() || s.beginKeys.size() != 2u || s.Whole() != 0) Fail("fold 6: a snapshot whose ASKs skipped BEGIN keys was taken as whole");
+    }
+    {   /* an ASK with no BEGIN key list behind it (the list freed at OFF, the last page or a disconnect) is never complete */
+        T985f6Feed f; f.Fill("abc");
+        if (!f.Run() || f.Whole() != 0) Fail("fold 6: a feed with no BEGIN key list was taken as whole");
+    }
+    {   /* T1533's two-page shape: a record of the second page's range deleted between the BEGIN and that page */
+        T985f6Feed f; f.Fill("abcde"); f.Begin();
+        if (!f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.live.erase("e");
+        if (!f.Run() || f.begin != 5 || f.sent != 4 || f.gone != 1 || f.Whole() != 1) Fail("fold 6: T1533's two-page snapshot with a record deleted mid-feed was not whole");
+    }
+    {   /* a record deleted then created again before its page: paged, whole, nothing gone */
+        T985f6Feed f; f.Fill("abcdefg"); f.Begin();
+        if (!f.Page()) Fail("fold 6: a page did not go through the wire");
+        f.live.erase("e"); f.live["e"] = 1;
+        if (!f.Run() || f.sent != 7 || f.gone != 0 || f.Whole() != 1) Fail("fold 6: a record deleted and created again before its page changed the judgement");
+    }
+    {   /* FeedGoneTake: a range judged once counts nothing again; a range that runs backwards is not judged */
+        std::set<std::string> bk; bk.insert("a"); bk.insert("b"); bk.insert("c");
+        std::map<std::string, int> now; now["a"] = 1; now["c"] = 1;
+        if (coopfeed::FeedGoneTake(&bk, now, std::string(), "c", false) != 1u || !bk.empty() || coopfeed::FeedGoneTake(&bk, now, std::string(), "c", false) != 0u)
+            Fail("fold 5: a range was counted twice");
+        bk.insert("x");
+        if (coopfeed::FeedGoneTake(&bk, now, "z", "c", false) != 0u || bk.size() != 1u) Fail("fold 5: a page range that runs backwards was judged");
+    }
+    {   /* the wire: PAGE_END {.., u32 gone, u8 last, u8 complete, u64 seqHigh}; complete only on the LAST page; the fold 5 form no longer decodes */
+        std::vector<char> b; coopfeed::FeedMsg m;
+        if (!coopfeed::FeedEncodePageEnd(&b, "k", 5, true, 9ULL, 3, 1) || !coopfeed::FeedDecode(&b[0], b.size(), &m) || m.sent != 5u || m.gone != 3u || m.last != 1u || m.complete != 1u || m.seqHigh != 9ULL)
+            Fail("fold 6: a PAGE_END with complete did not round-trip");
+        std::vector<char> nl;
+        if (!coopfeed::FeedEncodePageEnd(&nl, "k", 5, false, 9ULL, 0, 1) || !coopfeed::FeedDecode(&nl[0], nl.size(), &m) || m.complete != 0u || m.last != 0u)
+            Fail("fold 6: a page that is not the last carried complete");
+        std::vector<char> bad(b); bad[bad.size() - 10] = 0;
+        if (coopfeed::FeedDecode(&bad[0], bad.size(), &m)) Fail("fold 6: complete on a page that is not the last decoded");
+        std::vector<char> two(b); two[two.size() - 9] = 2;
+        if (coopfeed::FeedDecode(&two[0], two.size(), &m)) Fail("fold 6: a complete byte over 1 decoded");
+        std::vector<char> old(b); old.erase(old.begin() + (old.size() - 9));
+        if (coopfeed::FeedDecode(&old[0], old.size(), &m)) Fail("fold 6: a PAGE_END without complete (the fold 5 form) decoded");
+    }
+    {   /* the sources: the game judges by the flag alone and starts its counts over at the first ask; the world server judges, counts
+           refused sends, and keeps the BEGIN key list per game only while that snapshot runs */
+        const std::string game = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
+        if (game.empty() || server.empty()) { Fail("fold 6: could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
+        if (game.find("const int whole = mirrorkeep::SnapshotWholeForDrop(m.last, m.complete);") == std::string::npos
+            || game.find("MirrorKeepSnapshotEnd(whole, g_indexExpected, g_feedSnapshotSent, g_feedSnapshotGone);") == std::string::npos
+            || game.find("MirrorKeepStaleHoldEnd(whole);") == std::string::npos || game.find("PreTownWaitEnd(whole);") == std::string::npos
+            || game.find("SnapshotWholeForDrop(g_indexExpected") != std::string::npos || game.find("SnapshotWholeByGoneOnly") != std::string::npos
+            || game.find("SnapshotWholeForDrop(beginTotal") != std::string::npos)
+            Fail("fold 6: a snapshot END is judged by something other than the LAST PAGE_END's complete");
+        if (game.find("++g_feedAsksFirst; g_snapshotApplied = false; g_feedSnapshotSent = 0; g_feedSnapshotGone = 0;") == std::string::npos)
+            Fail("fold 6: the game does not start its snapshot counts over at the first ask");
+        if (server.find("complete = coopfeed::FeedSnapshotComplete(last, bkc != g_feedBeginKeys.end()") == std::string::npos
+            || server.find("coopfeed::FeedEncodePageEnd(&pe, lastKey, sent, last, seqHigh, gone, complete)") == std::string::npos
+            || server.find("gone = coopfeed::FeedGoneTake(&bk->second, g_records, m.key, lastKey, last);") == std::string::npos
+            || server.find("if (!taken) ++failed;") == std::string::npos || server.find("if (!aoiSentOk) ++failed;") == std::string::npos
+            || server.find("tot.sendFailed += (long long)snd.failed;") == std::string::npos)
+            Fail("fold 6: the world server does not judge the snapshot (complete, refused sends) into its LAST PAGE_END");
+        if (server.find("std::set<std::string>& bk = g_feedBeginKeys[from]; bk.clear();") == std::string::npos)
+            Fail("fold 6: the world server does not clear the BEGIN key list on a new start");
+        if (server.find("g_feedSnap.erase(from); g_feedBeginKeys.erase(from);   /* its world is going away") == std::string::npos)
+            Fail("fold 6: the world server does not free the BEGIN key list on stop-feed (OFF)");
+        if (server.find("g_feedSnap.erase(from); g_feedBeginKeys.erase(from);   /* the snapshot is out") == std::string::npos)
+            Fail("fold 6: the world server does not free the BEGIN key list at the last page");
+        if (server.find("g_feedSnap.erase(p); g_feedBeginKeys.erase(p);   /* and the stamps it said it holds") == std::string::npos)
+            Fail("fold 6: the world server does not free the BEGIN key list with the connection");
+        if (game.find("PreTownWaitRefusedSay(\"the wait has ended by its time bound\");") == std::string::npos) Fail("fold 5: the town wait's time-bound end does not name the refused towns");
+    }
 }
 /* T-985 C1: the kept table's stored seq is judged at the first WELCOME, with or without its world numbers */
 void t_t985c1f2_seq_judge()
@@ -53920,6 +59779,85 @@ void t_t985c1f3_refuse_named()
     if (mirrorkeep::RefuseDrops(1, 50, 50, 0) != 1) Fail("T-985 C1: an unnamed key still the table's copy was kept from a refused table");
     if (mirrorkeep::RefuseDrops(1, 50, 50, 1) != 0) Fail("T-985 C1: a key the snapshot named was dropped by the refusal");
     if (mirrorkeep::RefuseDrops(1, 60, 50, 0) != 0 || mirrorkeep::RefuseDrops(0, 0, 50, 0) != 0) Fail("T-985 C1: a re-fetched or gone key was dropped by the refusal");
+}
+/* T-985: the area file's text with a correct end line, for the refusal cases */
+std::string T985AreaText(const std::string& above, unsigned long long rows)
+{
+    return above + "end\t" + mirrorkeep::U64Text(rows) + "\t" + mirrorkeep::Hex16(mirrorkeep::Fnv64(above)) + "\n";
+}
+/* T-985: the area file - player areas in order (followed first), each area once, loaded areas not already listed; written and read back */
+void t_t985_area_file_round_trip()
+{
+    const int ps[] = { 5, 5, 6, 5, 5, 5, 70, 1, -1, 3 };   /* a repeat, one off the grid, one unknown */
+    const int ld[] = { 6, 5, 7, 7, 7, 7, 8, 8, 5, 5 };     /* two player areas again, a repeat */
+    areafile::Content c;
+    areafile::Build(ps, 5, ld, 5, &c);
+    if (c.player.size() != 4 || c.player[0] != 5 || c.player[1] != 5 || c.player[2] != 6 || c.player[3] != 5) Fail("T-985: the player areas lost their order or a repeat stayed");
+    if (c.loaded.size() != 4 || c.loaded[0] != 7 || c.loaded[1] != 7 || c.loaded[2] != 8 || c.loaded[3] != 8) Fail("T-985: a loaded area that is a player area (or a repeat) was listed again");
+    std::string text;
+    if (!areafile::Format("world-1", "00112233aabbccdd", 1234567ULL, c, &text)) { Fail("T-985: the area file was not formatted"); return; }
+    areafile::Content back; unsigned long long stamp = 0;
+    if (areafile::Parse(text, "world-1", "00112233aabbccdd", &back, &stamp) != areafile::kOk || stamp != 1234567ULL || areafile::SameContent(back, c) == 0)
+        Fail("T-985: the area file did not read back as written");
+    areafile::Content none; areafile::Build(0, 0, 0, 0, &none);
+    if (!areafile::Format("world-1", "h", 1ULL, none, &text) || areafile::Parse(text, "world-1", "h", &back, 0) != areafile::kOk || !back.player.empty() || !back.loaded.empty())
+        Fail("T-985: an empty area file did not read back empty");
+    if (areafile::Format("", "h", 1ULL, c, &text) || areafile::Format("w\t1", "h", 1ULL, c, &text) || areafile::Format("w", "", 1ULL, c, &text))
+        Fail("T-985: an area file was formatted with no (or a bad) world id or identity");
+    const int follow[] = { 9, 9, 1, 1, 9, 9 };
+    const int loadFollow[] = { 1, 1, 9, 9, 2, 2 };
+    areafile::Build(follow, 3, loadFollow, 3, &c);
+    if (c.player.size() != 4 || c.player[0] != 9 || c.player[1] != 9 || c.loaded.size() != 2 || c.loaded[0] != 2) Fail("T-985: the followed character's area is not first, or was listed twice");
+    if (areafile::Rows(c, 0) != "p\t9\t9\np\t1\t1\nl\t2\t2\n") Fail("T-985: the area file's rows are not p before l in list order");
+}
+/* T-985: an area file of another world or player, torn, damaged or with a bad row is refused whole */
+void t_t985_area_file_refused()
+{
+    const int ps[] = { 3, 4, 10, 11 };
+    const int ld[] = { 3, 5 };
+    areafile::Content c; areafile::Build(ps, 2, ld, 1, &c);
+    std::string good;
+    if (!areafile::Format("world-1", "hash-1", 77ULL, c, &good)) { Fail("T-985: the area file was not formatted"); return; }
+    areafile::Content back;
+    if (areafile::Parse(good, "world-2", "hash-1", &back, 0) != areafile::kOtherWorld || !back.player.empty()) Fail("T-985: another world's area file was not refused");
+    if (areafile::Parse(good, "world-1", "hash-2", &back, 0) != areafile::kOtherPlayer || !back.player.empty()) Fail("T-985: another player's area file was not refused");
+    if (areafile::Parse("", "world-1", "hash-1", &back, 0) != areafile::kBadHeader || areafile::Parse("swkept\t1\tworld-1\thash-1\t77\nend\t0\tx\n", "world-1", "hash-1", &back, 0) != areafile::kBadHeader)
+        Fail("T-985: an empty file or a record table read as an area file");
+    for (size_t cut = good.find('\n') + 1; cut < good.size(); cut += 3)
+        if (areafile::Parse(good.substr(0, cut), "world-1", "hash-1", &back, 0) == areafile::kOk || !back.player.empty()) { Fail("T-985: a truncated area file was taken"); break; }
+    std::string bad = good;
+    const size_t row = bad.find("p\t10\t11");
+    if (row == std::string::npos) { Fail("T-985: the area file has no row for 10,11"); return; }
+    bad[row + 2] = '2';   /* p 20 11: the checksum no longer matches */
+    if (areafile::Parse(bad, "world-1", "hash-1", &back, 0) != areafile::kTorn || !back.player.empty()) Fail("T-985: an area file with a wrong checksum was taken");
+    const std::string head = "swareas\t1\tworld-1\thash-1\t77\n";
+    if (areafile::Parse(T985AreaText(head + "p\t1\t1\np\t1\t1\n", 2), "world-1", "hash-1", &back, 0) != areafile::kTorn) Fail("T-985: an area file naming an area twice was taken");
+    if (areafile::Parse(T985AreaText(head + "p\t1\t1\nl\t1\t1\n", 2), "world-1", "hash-1", &back, 0) != areafile::kTorn) Fail("T-985: an area file naming an area as player and loaded was taken");
+    if (areafile::Parse(T985AreaText(head + "p\t64\t1\n", 1), "world-1", "hash-1", &back, 0) != areafile::kTorn) Fail("T-985: an area file with an area off the grid was taken");
+    if (areafile::Parse(T985AreaText(head + "q\t1\t1\n", 1), "world-1", "hash-1", &back, 0) != areafile::kTorn) Fail("T-985: an area file with an unknown row was taken");
+    if (areafile::Parse(T985AreaText(head + "p\t1\t1\n", 2), "world-1", "hash-1", &back, 0) != areafile::kTorn) Fail("T-985: an area file whose row count is wrong was taken");
+    if (areafile::Parse(T985AreaText(head + "p\t1\t1\n", 1), "world-1", "hash-1", &back, 0) != areafile::kOk || back.player.size() != 2) Fail("T-985: a well-made hand-written area file was refused");
+}
+/* T-985: the measure - live player areas missing from the file, beyond its ring 2, and file areas in neither live list */
+void t_t985_area_file_missing()
+{
+    std::vector<int> file, live;
+    file.push_back(10); file.push_back(10); file.push_back(20); file.push_back(20);
+    live.push_back(10); live.push_back(10); live.push_back(12); live.push_back(11); live.push_back(30); live.push_back(30);
+    if (areafile::CountNotIn(live, file) != 2) Fail("T-985: live player areas missing from the file were miscounted");
+    if (areafile::CountBeyondRing(live, file, areafile::kRing) != 1) Fail("T-985: an area two squares from a file area is not inside its ring 2 (or one far away is)");
+    if (areafile::CountNotIn(file, live) != 1) Fail("T-985: file areas not in the live lists were miscounted");
+    std::vector<int> empty;
+    if (areafile::CountNotIn(live, empty) != 3 || areafile::CountBeyondRing(live, empty, areafile::kRing) != 3 || areafile::RingDistance(1, 1, empty) != -1)
+        Fail("T-985: an empty file did not count every live area missing");
+    if (areafile::RingDistance(13, 10, file) != 3 || areafile::InRing(12, 12, file, 2) != 1 || areafile::InRing(13, 13, file, 2) != 0) Fail("T-985: the ring distance is not Chebyshev");
+    areafile::Content a, b;
+    const int p1[] = { 1, 1, 2, 2 };
+    const int p2[] = { 2, 2, 1, 1 };
+    areafile::Build(p1, 2, 0, 0, &a); areafile::Build(p2, 2, 0, 0, &b);
+    if (areafile::SameContent(a, b) != 0) Fail("T-985: a new followed character (the order changed) did not count as a change");
+    areafile::Build(p1, 2, 0, 0, &b);
+    if (areafile::SameContent(a, b) == 0 || areafile::Rows(a, 0) != areafile::Rows(b, 0)) Fail("T-985: the same lists counted as a change");
 }
 
 
@@ -54323,6 +60261,1088 @@ void t_t948b_squad_split_decide()
     if (MoveDecide(-1, 0) != sqsplit::kMoveRun) Fail("T-948 b: an unsure answer refused the move (it counts as this game's own)");
 }
 
+/* T-948 d: a caged uid-less body that duplicates another game's registered copy leaves its cage the engine's own way and is removed;
+   a caged body that duplicates no live copy is never let out (orphanpurge.h Decide) */
+void t_t948d_caged_duplicate()
+{
+    using namespace coopor;
+    int why = -1;
+    Seen s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1;
+    if (Decide(s, &why) != kActCageOut) Fail("T-948 d: a caged duplicate of a live copy is let out of its cage first");
+    s.cageQueued = 1;
+    if (Decide(s, &why) != kActLater || why != kWhyCageWait) Fail("T-948 d: a queued cage-out waits for the safe point");
+    s.cageQueued = 0; s.cageTried = 1;
+    if (Decide(s, &why) != kActSkip || why != kWhyCageStuck) Fail("T-948 d: still caged after its cage-out ran - left standing, never called twice");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.cageAddr = 0;
+    if (Decide(s, &why) != kActSkip || why != kWhyCageNoAddr) Fail("T-948 d: no setPrisonMode address - never destroyed in its cage");
+    s = SeenNone(); s.dupOfLiveCopy = 1; s.cageTried = 1;
+    if (Decide(s, &why) != kActDestroy) Fail("T-948 d: a duplicate out of its cage is removed");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.nearPlayer = 1;
+    if (Decide(s, &why) != kActCageOut) Fail("T-948 d: a caged duplicate near a player is let out too");
+    /* a caged body that duplicates no live copy: today's skip, whatever its cage marks say */
+    s = SeenNone(); s.inSomething = 2;
+    if (Decide(s, &why) != kActSkip || why != kWhyCaged) Fail("T-948 d: a caged body with no live copy beside it is never let out");
+    s.cageQueued = 1; s.cageTried = 1; s.nearPlayer = 1;
+    if (Decide(s, &why) != kActSkip || why != kWhyCaged) Fail("T-948 d: a caged non-duplicate stays skipped");
+    /* the player-tie tests, the registration, the stand-in rule, the area and the waits still come first */
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.guarded = 1;
+    if (Decide(s, &why) != kActSkip || why != kWhyPlayerTied) Fail("T-948 d: a player-tied caged duplicate is never touched");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.beingCarried = 1; s.carrierFound = 1; s.carrierIsPlayer = 1;
+    if (Decide(s, &why) != kActSkip || why != kWhyCarriedByPlayer) Fail("T-948 d: a caged duplicate carried by a player is never touched");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.known = 1;
+    if (Decide(s, &why) != kActNone) Fail("T-948 d: a registered body is never a duplicate orphan");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.standIn = 1;
+    if (Decide(s, &why) != kActNone) Fail("T-948 d: a stand-in is the stand-in purge's");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.areaOther = 0;
+    if (Decide(s, &why) != kActNone) Fail("T-948 d: outside another game's area nothing is done");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.areaOther = -1;
+    if (Decide(s, &why) != kActNone) Fail("T-948 d: with no area map nothing is done");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.fightNear = 1;
+    if (Decide(s, &why) != kActLater || why != kWhyInCombatWithPlayer) Fail("T-948 d: a caged duplicate in a fight with a player waits");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.linkedMs = 0;
+    if (Decide(s, &why) != kActLater || why != kWhyLinkTooFresh) Fail("T-948 d: a caged duplicate waits for the link clock");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.notedMs = 0;
+    if (Decide(s, &why) != kActLater || why != kWhyNotedTooShort) Fail("T-948 d: a caged duplicate waits for the noted clock");
+    if (HoldWhilePending(kActLater, kWhyCageWait) != 1 || HoldWhilePending(kActCageOut, kWhyNone) != 1) Fail("T-948 d fold 1: a body is held from its let-out until it is removed");
+    if (HoldWhilePending(kActSkip, kWhyCageStuck) != 0 || HoldWhilePending(kActSkip, kWhyCaged) != 0) Fail("T-948 d fold 1: a body left standing is not held");
+    /* fold 1: the stronger caged test, and one copy for one body */
+    if (CagedDupMatch(50.0f, 0.0f, 0) != 0) Fail("T-948 d fold 1: a caged body 50 units from a same-kind copy is not its duplicate");
+    if (CagedDupMatch(2.5f, 0.0f, 0) != 1 || CagedDupMatch(0.0f, 3.0f, 0) != 1 || CagedDupMatch(3.1f, 0.0f, 0) != 0) Fail("T-948 d fold 1: the 3-unit caged radius");
+    if (CagedDupMatch(50.0f, 0.0f, 1) != 1 || CagedDupMatch(101.0f, 0.0f, 1) != 0) Fail("T-948 d fold 1: the same cage within 100 units matches, not beyond");
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = CagedDupMatch(50.0f, 0.0f, 0);
+    if (Decide(s, &why) != kActSkip || why != kWhyCaged) Fail("T-948 d fold 1: a caged body 50 units from a same-kind copy is skipped as caged");
+    {
+        const float dx[1] = { 1.0f }, dz[1] = { 0.0f }; const int match[1] = { 1 }; int taken[1] = { 0 };
+        const int first = PickPairedCopy(dx, dz, match, taken, 1);
+        if (first == 0) taken[0] = 1;
+        const int second = PickPairedCopy(dx, dz, match, taken, 1);
+        Seen a = SeenNone(); a.inSomething = 2; a.dupOfLiveCopy = first >= 0 ? 1 : 0;
+        Seen b = SeenNone(); b.inSomething = 2; b.dupOfLiveCopy = second >= 0 ? 1 : 0;
+        int out = 0;
+        if (Decide(a, &why) == kActCageOut) ++out;
+        if (Decide(b, &why) == kActCageOut) ++out;
+        if (first != 0 || second != -1 || out != 1) Fail("T-948 d fold 1: two caged bodies and one copy - only one is removed");
+    }
+    /* fold 3: two bodies in the copy's own cage on its spot are both its duplicates; one of them in another cage is not */
+    {
+        const float dx[1] = { 1.0f }, dz[1] = { 0.0f };
+        int m1[1], t1[1], m2[1], t2[1];
+        m1[0] = CagedDupMatch(1.0f, 0.0f, 1); t1[0] = CopyTakenFor(0, SameCageTight(1.0f, 0.0f, 1));
+        const int p1 = PickPairedCopy(dx, dz, m1, t1, 1);   /* the first body pairs with the copy */
+        m2[0] = CagedDupMatch(1.0f, 0.0f, 1); t2[0] = CopyTakenFor(p1 == 0 ? 1 : 0, SameCageTight(1.0f, 0.0f, 1));
+        const int p2same = PickPairedCopy(dx, dz, m2, t2, 1);
+        m2[0] = CagedDupMatch(1.0f, 0.0f, 0); t2[0] = CopyTakenFor(p1 == 0 ? 1 : 0, SameCageTight(1.0f, 0.0f, 0));
+        const int p2other = PickPairedCopy(dx, dz, m2, t2, 1);
+        Seen a = SeenNone(); a.inSomething = 2; a.dupOfLiveCopy = p1 >= 0 ? 1 : 0;
+        Seen b = SeenNone(); b.inSomething = 2; b.dupOfLiveCopy = p2same >= 0 ? 1 : 0;
+        Seen o = SeenNone(); o.inSomething = 2; o.dupOfLiveCopy = p2other >= 0 ? 1 : 0;
+        int same = 0, other = 0;
+        if (Decide(a, &why) == kActCageOut) { ++same; ++other; }
+        if (Decide(b, &why) == kActCageOut) ++same;
+        if (Decide(o, &why) == kActCageOut) ++other;
+        if (p1 != 0 || p2same != 0 || same != 2) Fail("T-948 d fold 3: two bodies in the copy's cage on its spot - both removed");
+        if (p2other != -1 || other != 1) Fail("T-948 d fold 3: two bodies on the copy's spot, one in another cage - only one removed");
+        if (SameCageTight(3.1f, 0.0f, 1) != 0 || SameCageTight(2.0f, 0.0f, 0) != 0 || CopyTakenFor(1, 0) != 1 || CopyTakenFor(0, 0) != 0)
+            Fail("T-948 d fold 3: the same-cage exception is only the copy's own cage within 3 units");
+    }
+    /* fold 4: the same-cage exception only where a second same-kind prisoner can only be a split */
+    if (SameCageExtraAllowed(1, 1) != 1 || SameCageExtraAllowed(1, 2) != 1) Fail("T-948 d fold 4: a one-place cage - the exception holds");
+    if (SameCageExtraAllowed(2, 2) != 0) Fail("T-948 d fold 4: two places holding two people - no exception");
+    if (SameCageExtraAllowed(2, 3) != 1) Fail("T-948 d fold 4: two places holding three people - the exception holds");
+    if (SameCageExtraAllowed(-1, 1) != 0 || SameCageExtraAllowed(2, -1) != 0 || SameCageExtraAllowed(-1, -1) != 0) Fail("T-948 d fold 4: unread - no exception");
+    {
+        const float dx[1] = { 1.0f }, dz[1] = { 0.0f }; const int m[1] = { 1 };
+        int t[1];
+        t[0] = CopyTakenFor(1, (SameCageTight(1.0f, 0.0f, 1) != 0 && SameCageExtraAllowed(2, 2) != 0) ? 1 : 0);
+        if (PickPairedCopy(dx, dz, m, t, 1) != -1) Fail("T-948 d fold 4: a second body in a two-place cage holding two is not the paired copy's duplicate");
+        t[0] = CopyTakenFor(1, (SameCageTight(1.0f, 0.0f, 1) != 0 && SameCageExtraAllowed(1, 2) != 0) ? 1 : 0);
+        if (PickPairedCopy(dx, dz, m, t, 1) != 0) Fail("T-948 d fold 4: a second body in a one-place cage is the copy's duplicate");
+    }
+    /* fold 2: a body the decision refuses does not hold the copy; only a queued let-out records it; a removal keeps it */
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.guarded = 1;
+    { const int a = Decide(s, &why); if (PairRecordOnAct(a) != 0 || PairReleaseOnAct(a) != 1) Fail("T-948 d fold 2: a player-tied body does not hold the copy"); }
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.cageAddr = 0;
+    { const int a = Decide(s, &why); if (PairRecordOnAct(a) != 0 || PairReleaseOnAct(a) != 1) Fail("T-948 d fold 2: a body with no let-out address does not hold the copy"); }
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.cageTried = 1;
+    { const int a = Decide(s, &why); if (PairRecordOnAct(a) != 0 || PairReleaseOnAct(a) != 1) Fail("T-948 d fold 2: a body still caged after its let-out releases the copy"); }
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.known = 1;
+    { const int a = Decide(s, &why); if (PairRecordOnAct(a) != 0 || PairReleaseOnAct(a) != 1) Fail("T-948 d fold 2: a body no longer an orphan releases the copy"); }
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1; s.fightNear = 1;
+    { const int a = Decide(s, &why); if (PairRecordOnAct(a) != 0 || PairReleaseOnAct(a) != 0) Fail("T-948 d fold 2: a waiting body neither takes nor gives up the copy"); }
+    s = SeenNone(); s.inSomething = 2; s.dupOfLiveCopy = 1;
+    { const int a = Decide(s, &why); if (PairRecordOnAct(a) != 1 || PairReleaseOnAct(a) != 0) Fail("T-948 d fold 2: a queued let-out records the copy"); }
+    s = SeenNone(); s.dupOfLiveCopy = 1; s.cageTried = 1;
+    { const int a = Decide(s, &why); if (a != kActDestroy || PairReleaseOnAct(a) != 0) Fail("T-948 d fold 2: a removal keeps the copy paired"); }
+    {
+        const float dx[2] = { 5.0f, 1.0f }, dz[2] = { 0.0f, 0.0f }; const int match[2] = { 1, 1 }; int taken[2] = { 0, 0 };
+        if (PickPairedCopy(dx, dz, match, taken, 2) != 1) Fail("T-948 d fold 1: the nearest copy is paired");
+        taken[1] = 1; if (PickPairedCopy(dx, dz, match, taken, 2) != 0) Fail("T-948 d fold 1: the next unpaired copy is taken");
+        const int none[2] = { 0, 1 }; if (PickPairedCopy(dx, dz, none, taken, 2) != -1) Fail("T-948 d fold 1: no unpaired matching copy - none");
+    }
+    if (std::string(WhyToken(kWhyCageNoAddr)) != "cageNoAddr" || std::string(WhyToken(kWhyCageWait)) != "cageWait"
+        || std::string(WhyToken(kWhyCageStuck)) != "cageStuck" || kWhyCount != 17) Fail("T-948 d: report tokens");
+}
+
+/* T-948 d: the squad a save split off another game's people is removed only when every input says so (squadorigin.h SaveSplitDrop) */
+void t_t948d_save_split_squad()
+{
+    using namespace sqorigin;
+    SaveSplitSeen s = SaveSplitSeenDroppable();
+    if (SaveSplitDrop(s) != kSplitDrop) Fail("T-948 d: the save-split squad (my block, decided as the holder's, empty, unbound, unrecorded) is removed");
+    s = SaveSplitSeenDroppable(); s.readable = 0;      if (SaveSplitDrop(s) != kSplitUnread) Fail("T-948 d squad: unread kept");
+    s = SaveSplitSeenDroppable(); s.worldFaction = 0;  if (SaveSplitDrop(s) != kSplitNotWorld) Fail("T-948 d squad: a player's / peer's / stand-in's squad kept");
+    s = SaveSplitSeenDroppable(); s.context = 1;       if (SaveSplitDrop(s) != kSplitContext) Fail("T-948 d squad: a context squad kept");
+    s = SaveSplitSeenDroppable(); s.bound = 1;         if (SaveSplitDrop(s) != kSplitBound) Fail("T-948 d squad: a bound squad kept");
+    s = SaveSplitSeenDroppable(); s.recorded = 1;      if (SaveSplitDrop(s) != kSplitRecorded) Fail("T-948 d squad: a recorded squad kept");
+    s = SaveSplitSeenDroppable(); s.handedOver = 1;    if (SaveSplitDrop(s) != kSplitHandedOver) Fail("T-948 d squad: a handed-over squad kept");
+    s = SaveSplitSeenDroppable(); s.queued = 1;        if (SaveSplitDrop(s) != kSplitQueued) Fail("T-948 d squad: one already on the removal road is left to it");
+    s = SaveSplitSeenDroppable(); s.uidMembers = 1; s.members = 1; if (SaveSplitDrop(s) != kSplitUidMember) Fail("T-948 d squad: a member with a uid keeps it");
+    s = SaveSplitSeenDroppable(); s.uidMembers = -1;   if (SaveSplitDrop(s) != kSplitUidMember) Fail("T-948 d squad: an unread uid count keeps it");
+    s = SaveSplitSeenDroppable(); s.members = 1;       if (SaveSplitDrop(s) != kSplitNotEmpty) Fail("T-948 d squad: a member still in it keeps it");
+    s = SaveSplitSeenDroppable(); s.saveMade = 0;      if (SaveSplitDrop(s) != kSplitNotSave) Fail("T-948 d squad: a squad made since the load kept");
+    s = SaveSplitSeenDroppable(); s.blockOwner = 0;    if (SaveSplitDrop(s) != kSplitNotMyBlock) Fail("T-948 d squad: another block's squad kept");
+    s = SaveSplitSeenDroppable(); s.mySlot = -1;       if (SaveSplitDrop(s) != kSplitNotMyBlock) Fail("T-948 d squad: no slot of my own - kept");
+    {
+        const int whys[5] = { kByFloor, kByHandover, kByMembers, kByRecord, kFallback };
+        for (int i = 0; i < 5; ++i)
+        {
+            s = SaveSplitSeenDroppable(); s.originWhy = whys[i];
+            if (SaveSplitDrop(s) != kSplitNotByHolder) Fail("T-948 d squad: an origin not from the area holder keeps it");
+        }
+    }
+    s = SaveSplitSeenDroppable(); s.originSlot = 1;    if (SaveSplitDrop(s) != kSplitOriginMine) Fail("T-948 d squad: decided as mine - kept");
+    s = SaveSplitSeenDroppable(); s.originSlot = -1;   if (SaveSplitDrop(s) != kSplitOriginMine) Fail("T-948 d squad: no origin slot - kept");
+    s = SaveSplitSeenDroppable(); s.heldByOther = -1;  if (SaveSplitDrop(s) != kSplitNoMap) Fail("T-948 d squad: no fresh area map - kept");
+    s = SaveSplitSeenDroppable(); s.heldByOther = 0;   if (SaveSplitDrop(s) != kSplitNotOtherHeld) Fail("T-948 d squad: an area no other game holds - kept");
+    s = SaveSplitSeenDroppable(); s.heldByOther = -2;  if (SaveSplitDrop(s) != kSplitNotOtherHeld) Fail("T-948 d squad: a frozen area - kept");
+    s = SaveSplitSeenDroppable(); s.holderInWorld = 0; if (SaveSplitDrop(s) != kSplitHolderAway) Fail("T-948 d squad: a holder not in the world - kept");
+    s = SaveSplitSeenDroppable(); s.holderSlot = -1;   if (SaveSplitDrop(s) != kSplitHolderAway) Fail("T-948 d squad: no holder - kept");
+    s = SaveSplitSeenDroppable(); s.holderSlot = 1;    if (SaveSplitDrop(s) != kSplitHolderAway) Fail("T-948 d squad: this game holds the area - kept");
+    s = SaveSplitSeenDroppable(); s.holderSlot = 2;    if (SaveSplitDrop(s) != kSplitHolderAway) Fail("T-948 d squad: the holder is not the origin's slot - kept");
+    /* every seat decides alike: the same squad on a game in slot 0 with the holder in slot 1, and in slot 5 with the holder in slot 2 */
+    s = SaveSplitSeenDroppable(); s.mySlot = 0; s.blockOwner = 0; s.originSlot = 1; s.holderSlot = 1;
+    if (SaveSplitDrop(s) != kSplitDrop) Fail("T-948 d squad: the rule on seat 0 differs");
+    s = SaveSplitSeenDroppable(); s.mySlot = 5; s.blockOwner = 5; s.originSlot = 2; s.holderSlot = 2;
+    if (SaveSplitDrop(s) != kSplitDrop) Fail("T-948 d squad: the rule on seat 5 differs");
+    /* fold 2: a sleeping squad goes only when its own sleep record reads 0 people - at the decision and at the removal tick */
+    s = SaveSplitSeenDroppable(); s.asleep = 1; s.sleepCount = 1;
+    if (SaveSplitDrop(s) != kSplitSleepMembers) Fail("T-948 d fold 2: a sleeping squad whose record counts 1 person is kept");
+    s.sleepCount = -1; if (SaveSplitDrop(s) != kSplitSleepUnread) Fail("T-948 d fold 2: a sleeping squad whose count is unreadable is kept");
+    s.sleepCount = 0; if (SaveSplitDrop(s) != kSplitDrop) Fail("T-948 d fold 2: a sleeping squad whose record counts 0 is removed");
+    s = SaveSplitSeenDroppable(); s.asleep = 0; s.sleepCount = -1; if (SaveSplitDrop(s) != kSplitDrop) Fail("T-948 d fold 2: an awake squad is not judged by a sleep record");
+    if (SaveSplitTickKeep(0, 0, 1) != 1 || SaveSplitTickKeep(0, 0, -1) != 1 || SaveSplitTickKeep(0, 0, 0) != 0) Fail("T-948 d fold 2: the tick keeps a sleeping squad unless its record reads 0");
+    if (SaveSplitTickKeep(1, 1, 0) != 1 || SaveSplitTickKeep(1, 0, 0) != 0 || SaveSplitTickKeep(1, 0, 5) != 0) Fail("T-948 d fold 2: the tick keeps an awake squad only while someone is in it");
+    for (int w = 1; w < kSplitWhyCount; ++w) if (std::string(SplitWhyToken(w)) == "?") Fail("T-948 d squad: a reason has no token");
+    if (std::string(SplitWhyToken(kSplitDrop)) != "?" || std::string(SplitWhyToken(kSplitWhyCount)) != "?") Fail("T-948 d squad: 0 / count are not reasons");
+}
+
+/* ---- T-1047 step 5: the outpost link (townkeep.h outpost id, baseshow.h every game a copy / HideStep, piecerec.h LIVE bit 5) ---- */
+townkeep::TownRow T1047fRow(int owner, float x, float z, unsigned id, const char* key)
+{
+    townkeep::TownRow t;
+    t.owner = owner; t.pos[0] = x; t.pos[1] = 0.0f; t.pos[2] = z; t.name = "Base"; t.id = id;
+    if (key != 0) t.keys.push_back(key);
+    return t;
+}
+/* the world server mints the id: a said row within 50 u of a row on file keeps its id, one sharing a key keeps that row's, one matching
+   neither takes a carried (reset) outpost's id by the same rule, else a new one past the highest on file */
+void t_t1047f_outpost_id_mint()
+{
+    using namespace townkeep;
+    if (NextOutpostId(std::vector<TownRow>(), std::vector<TownRow>()) != 1u) Fail("t1047f: the first outpost id is not 1");
+    std::vector<TownRow> all;
+    all.push_back(T1047fRow(1, 100.0f, 100.0f, 7u, "12-a.mod@3,41@1000,1000,0"));
+    all.push_back(T1047fRow(1, 5000.0f, 5000.0f, 9u, "12-b.mod@3,41@50000,50000,0"));
+    all.push_back(T1047fRow(2, 100.0f, 100.0f, 3u, 0));
+    std::vector<TownRow> carried;
+    carried.push_back(T1047fRow(1, 30000.0f, 30000.0f, 42u, 0));
+    unsigned next = NextOutpostId(all, carried);
+    if (next != 43u) Fail("t1047f: the next id is not one past the highest on file (both files): " + I((int)next));
+    std::vector<TownRow> said;
+    said.push_back(T1047fRow(-1, 120.0f, 110.0f, 0u, 0));                                  /* centre within 50 u of id 7 */
+    said.push_back(T1047fRow(-1, 9000.0f, 9000.0f, 0u, "12-b.mod@3,41@50000,50000,0"));    /* drifted, shares id 9's key */
+    said.push_back(T1047fRow(-1, 30010.0f, 30000.0f, 0u, 0));                              /* a reset carried it: id 42 */
+    said.push_back(T1047fRow(-1, 20000.0f, 20000.0f, 0u, 0));                              /* new */
+    for (size_t i = 0; i < said.size(); ++i) said[i].owner = -1;
+    ReplaceSlotTowns(&all, 1, said, 1, &next, &carried);
+    unsigned got[4] = { 0, 0, 0, 0 };
+    int other = 0;
+    for (size_t i = 0; i < all.size(); ++i)
+    {
+        if (all[i].owner != 1) { if (all[i].id == 3u) ++other; continue; }
+        for (size_t j = 0; j < said.size(); ++j) if (all[i].pos[0] == said[j].pos[0] && all[i].pos[2] == said[j].pos[2]) got[j] = all[i].id;
+    }
+    if (got[0] != 7u) Fail("t1047f: a said outpost at a row's centre did not keep its id: " + I((int)got[0]));
+    if (got[1] != 9u) Fail("t1047f: a said outpost sharing a key did not keep its row's id: " + I((int)got[1]));
+    if (got[2] != 42u) Fail("t1047f: a said outpost a reset carried did not take the carried id: " + I((int)got[2]));
+    if (got[3] != 43u || next != 44u) Fail("t1047f: a new outpost did not take a new id: " + I((int)got[3]));
+    if (other != 1) Fail("t1047f: another slot's row lost its id");
+    /* the same SAY again: every id kept, nothing minted */
+    std::vector<TownRow> again(all);
+    ReplaceSlotTowns(&again, 1, said, 1, &next, &carried);
+    if (next != 44u || EncodeTownsFile(kPlayerTownsHeader, again, true) != EncodeTownsFile(kPlayerTownsHeader, all, true)) Fail("t1047f: the same SAY again minted or moved an id");
+    /* a carried id a row of the slot already holds is never taken twice */
+    std::vector<TownRow> two;
+    two.push_back(T1047fRow(1, 30000.0f, 30000.0f, 42u, 0));
+    std::vector<TownRow> s2;
+    s2.push_back(T1047fRow(-1, 30000.0f, 30000.0f, 0u, 0));
+    s2.push_back(T1047fRow(-1, 30020.0f, 30000.0f, 0u, 0));
+    unsigned n2 = 50;
+    ReplaceSlotTowns(&two, 1, s2, 1, &n2, &carried);
+    if (two.size() != 2 || two[0].id != 42u || two[1].id != 50u) Fail("t1047f: a carried id was given to a second outpost");
+}
+/* the files carry the id (format 4); a format-3 file reads with no ids, which are then given (GiveMissingIds) - a duplicate too */
+void t_t1047f_towns_file_ids()
+{
+    using namespace townkeep;
+    std::vector<TownRow> rows;
+    rows.push_back(T1047fRow(1, 100.0f, 100.0f, 7u, "12-a.mod@3,41@1000,1000,0"));
+    rows.push_back(T1047fRow(2, 200.0f, 200.0f, 12u, 0));
+    const std::string text = EncodeTownsFile(kPlayerTownsHeader, rows, true);
+    std::vector<TownRow> back;
+    std::string why;
+    if (!DecodeTownsFile(text, kPlayerTownsHeader, true, &back, &why) || back.size() != 2 || back[0].id != 7u || back[1].id != 12u) Fail("t1047f: the outpost id does not survive the file: " + why);
+    if (text.find("player-towns\t5\n") != 0) Fail("t1047f: the file is not format 5 (T-940: with the anchor)");
+    /* format 3: the same lines without the id field */
+    std::string old = "player-towns\t3\n";
+    size_t at = text.find('\n') + 1;
+    while (at < text.size())
+    {
+        size_t e = text.find('\n', at);
+        std::string line = text.substr(at, e - at);
+        if (line.size() > 2 && line[0] == 'T') for (int k = 0; k < 3; ++k) line = line.substr(0, line.rfind('\t'));   /* the id and (T-940) the anchor x, z */
+        old += line + "\n";
+        at = e + 1;
+    }
+    if (!DecodeTownsFile(old, kPlayerTownsHeader, true, &back, &why) || back.size() != 2 || back[0].id != 0u || back[1].id != 0u || back[0].keys.size() != 1)
+        Fail("t1047f: a format-3 file does not read with no ids: " + why);
+    unsigned next = NextOutpostId(back, std::vector<TownRow>());
+    std::set<unsigned> taken;
+    if (next != 1u || GiveMissingIds(&back, &next, &taken) != 2 || back[0].id != 1u || back[1].id != 2u || next != 3u) Fail("t1047f: an older file's rows are not given ids");
+    back[1].id = 1u;   /* a hand-edited duplicate */
+    taken.clear(); next = 3u;
+    if (GiveMissingIds(&back, &next, &taken) != 1 || back[0].id != 1u || back[1].id != 3u) Fail("t1047f: a duplicate id is kept on two outposts");
+    std::string neg = text;
+    const size_t t1 = neg.find("\t7\t");
+    if (t1 == std::string::npos) { Fail("t1047f: the id field is not before the anchor on the line"); return; }
+    neg.replace(t1, 3, "\t-7\t");
+    if (DecodeTownsFile(neg, kPlayerTownsHeader, true, &back, &why)) Fail("t1047f: a negative outpost id is read");
+}
+/* the record's LIVE part carries the link (bit 5, last): round trip with and without doors; an older peer (mask 31) refuses it;
+   a link of 0 or past the cap, or a missing byte, refused */
+void t_t1047f_record_link()
+{
+    using namespace piecerec;
+    if (kProtocol != 121u || baseshow::kProtocol != 121u || hovrec::kGameProtocol != 180u) Fail("t1047f: the world-server protocol is not 121 or the game-to-game protocol not 180");
+    PieceLive l;
+    l.have = 1; l.hasPower = 0;
+    PieceTownSet(&l, 77u);
+    if (!PieceLiveValid(l) || PieceTownOf(l) != 77u) Fail("t1047f: a link-only LIVE part is not valid");
+    std::vector<char> b;
+    PieceLivePut(&b, l);
+    PieceLive back;
+    if (PieceLiveGet(&b[0], b.size(), &back) != 1 || back.hasTown != 1 || back.town != 77u || back.hasPower != 0) Fail("t1047f: the link does not survive the LIVE part");
+    unsigned int fl = 0;
+    std::memcpy(&fl, &b[0], 4);
+    if ((fl & kPrLiveFlagTown) == 0 || (fl & ~kPrLiveFlagsBeforeTown) == 0) Fail("t1047f: an older peer (protocol 115) would not refuse the linked part");
+    PieceLive d;
+    d.have = 1; d.hasPower = 1; d.on = 1; d.battery = 5.0f; d.hasDoors = 1; d.nd = 2; d.doorHealth[0] = 10.0f; d.doorHealth[1] = 20.0f;
+    PieceTownSet(&d, 9u);
+    b.clear();
+    PieceLivePut(&b, d);
+    if (PieceLiveGet(&b[0], b.size(), &back) != 1 || back.town != 9u || back.nd != 2 || back.doorHealth[1] != 20.0f || back.on != 1) Fail("t1047f: the link after the doors does not round trip");
+    if (PieceLiveGet(&b[0], b.size() - 1, &back) != 0) Fail("t1047f: a part cut short in its link reads");
+    std::vector<char> z(b);
+    std::memset(&z[z.size() - 4], 0, 4);
+    if (PieceLiveGet(&z[0], z.size(), &back) != 0) Fail("t1047f: a link of 0 reads");
+    PieceTownSet(&d, 0u);
+    if (d.hasTown != 0 || PieceTownOf(d) != 0u) Fail("t1047f: a link of 0 is not 'not known'");
+    b.clear();
+    PieceLivePut(&b, d);
+    if (PieceLiveGet(&b[0], b.size(), &back) != 1 || back.hasTown != 0) Fail("t1047f: a part with no link reads one");
+    PieceLive bad = l; bad.town = 0u;
+    if (PieceLiveValid(bad)) Fail("t1047f: a known link of 0 is valid");
+}
+/* the writer's value, the owner's mark, the apply step, and the drain's order (the link before the LIVE power) */
+void t_t1047f_link_apply_order()
+{
+    using namespace piecerec;
+    if (PieceTownWriteId(1, 5u, 3u) != 5u || PieceTownWriteId(1, 0u, 3u) != 3u || PieceTownWriteId(0, 5u, 3u) != 3u || PieceTownWriteId(0, 5u, 0u) != 0u)
+        Fail("t1047f: the link a write carries is not the owner's engine link, else the stored one");
+    if (PieceTownMarkDue(1, 1, 5u, 3u, 0u) != 1 || PieceTownMarkDue(1, 1, 5u, 5u, 0u) != 0 || PieceTownMarkDue(1, 1, 5u, 3u, 5u) != 0
+        || PieceTownMarkDue(0, 1, 5u, 3u, 0u) != 0 || PieceTownMarkDue(1, 0, 5u, 3u, 0u) != 0 || PieceTownMarkDue(1, 1, 0u, 3u, 0u) != 0)
+        Fail("t1047f: the owner's link write is marked when it should not be, or not when it should");
+    if (PieceTownApplyStep(0, 0, 0u, 1, 1, 0) != kTlUnknown) Fail("t1047f: a record with no link relinks");
+    if (PieceTownApplyStep(0, 1, 4u, 1, 1, 0) != kTlOwn) Fail("t1047f: a record's link is applied over the owner's own engine link");
+    if (PieceTownApplyStep(0, 0, 4u, 0, 1, 0) != kTlInside) Fail("t1047f: a piece inside a building is relinked");
+    if (PieceTownApplyStep(0, 0, 4u, 1, 0, 0) != kTlNoTown) Fail("t1047f: a link with no town here is not counted as such");
+    if (PieceTownApplyStep(0, 0, 4u, 1, 1, 1) != kTlSame || PieceTownApplyStep(0, 0, 4u, 1, 1, 0) != kTlRelink) Fail("t1047f: the relink step is wrong");
+    if (PieceTownApplyStep(1, 0, 4u, 1, 1, 0) != kTlUnknown) Fail("t1047f: a removal mark relinks");
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f: build.cpp not read"); return; }
+    const size_t link = s.find("TlApplyKey(ready[i]);"), live = s.find("const int res = PwLiveApply(ready[i], lv);");
+    if (link == std::string::npos || live == std::string::npos || link > live) Fail("t1047f: the drain does not apply the record's link before its LIVE power values");
+    if (s.find("if (w.removed == 0) PcrTownFill(id, w, slot, &b.live);") == std::string::npos) Fail("t1047f: a record write does not carry the link");
+    if (s.find("if (TlRecordLinkOf(r->first) != 0) { ++g_tlShowLinkYield; continue; }") == std::string::npos) Fail("t1047f: the key-row link fights the record's link");
+}
+/* every game gets every player's outposts (own, teammates', others'), with id, kind and handle words; another player's copy is hidden
+   until discovered (the engine's own mark); a discovered id is kept on the copy list */
+void t_t1047f_hidden_rule()
+{
+    using namespace baseshow;
+    if (HideStep(kShowOther, 1, 1, 0) != kHideHide) Fail("t1047f: another player's new copy is not hidden");
+    if (HideStep(kShowOther, 1, 0, 0) != kHideNone) Fail("t1047f: a hidden copy is hidden twice");
+    if (HideStep(kShowOther, 1, 0, 1) != kHideShow || HideStep(kShowOther, 1, 1, 1) != kHideNone) Fail("t1047f: a copy discovered earlier is hidden again");
+    if (HideStep(kShowOther, 0, 1, 0) != kHideNoted || HideStep(kShowOther, 0, 0, 0) != kHideNone || HideStep(kShowOther, 0, -1, 0) != kHideNone) Fail("t1047f: the discovery is not noted by the engine's mark");
+    if (HideStep(kShowMate, 1, 1, 0) != kHideNone || HideStep(kShowMate, 0, 0, 0) != kHideShow) Fail("t1047f: a teammate's copy is not on the map at once");
+    if (HideStep(kShowOwn, 1, 1, 0) != kHideNone) Fail("t1047f: the player's own outpost is touched");
+    std::vector<townkeep::TownRow> said;
+    said.push_back(T1047fRow(3, 1.0f, 1.0f, 30u, 0));
+    said.push_back(T1047fRow(0, 2.0f, 2.0f, 10u, 0));
+    said.push_back(T1047fRow(1, 3.0f, 3.0f, 11u, 0));
+    said[1].hand[0] = 7; said[1].hand[4] = 99;
+    std::set<int> mates; mates.insert(1);
+    std::map<int, std::string> names;
+    int cut = 0;
+    const std::vector<ShowRow> rows = RowsForAll(said, 0, mates, names, &cut);
+    if (rows.size() != 3 || rows[0].kind != kShowOwn || rows[0].id != 10u || rows[0].hand[4] != 99 || rows[1].kind != kShowMate || rows[1].id != 11u
+        || rows[2].kind != kShowOther || rows[2].id != 30u || cut != 0)
+        Fail("t1047f: SHOW does not carry every player's outposts, own first, others last, with id and handle words");
+    if (RowsFor(said, 0, mates, names, &cut).size() != 1) Fail("t1047f: the teammates' view changed");
+    std::vector<char> b;
+    unsigned flags = 9;
+    std::vector<ShowRow> back;
+    if (!Encode(&b, 0, rows) || Decode(&b[0], b.size(), &flags, &back) != 1 || back.size() != 3 || back[2].kind != kShowOther || back[2].id != 30u || back[0].hand[4] != 99 || back[0].hand[0] != 7)
+        Fail("t1047f: the SHOW row's id, kind and handle words do not round trip");
+    if (Decode(&b[0], b.size() - 20, &flags, &back) != 0) Fail("t1047f: a SHOW of the older row shape reads");
+    std::vector<ShowRow> badKind(rows);
+    badKind[0].kind = 3;
+    if (Encode(&b, 0, badKind)) Fail("t1047f: an unknown row kind is sent");
+    const std::vector<townkeep::TownRow> kr = KeyRowsFor(said, rows);
+    for (size_t i = 0; i < kr.size(); ++i) if (kr[i].owner == 0) Fail("t1047f: a key row is sent for the viewer's own outpost");
+    if (kr.size() != 2) Fail("t1047f: the copies' key rows are not sent");
+    /* pass 0: the id pairs a moved copy with its row */
+    std::vector<Shown> shown(1);
+    shown[0].owner = 3; shown[0].id = 30u; shown[0].pos[0] = 90000.0f; shown[0].pos[2] = 90000.0f;
+    std::vector<ShowRow> one(1, rows[2]);
+    std::vector<int> rowTo; std::vector<size_t> gone;
+    MatchIdent(shown, one, std::vector<townkeep::TownRow>(), &rowTo, &gone);
+    if (rowTo.size() != 1 || rowTo[0] != 0 || !gone.empty()) Fail("t1047f: a copy is not matched to its row by the outpost id");
+    /* fold 1: the discovered ids are kept per save (t1047f1_discovery_per_save), not on the copy list: format 1 as before */
+    std::vector<CopyRow> cb; std::string why;
+    if (EncodeCopyList(std::vector<CopyRow>()) != "shown-town-copies\t1\n" || DecodeCopyList("shown-town-copies\t1\n", &cb, &why) != 0) Fail("t1047f: the copy list is not format 1");
+}
+/* ---- T-1047 step 5 fold 1 ---- */
+/* fix 2: the world server mints ids 1..3, the owner's game then says only two outposts (the top id's outpost removed), the file is
+   written and read back as at a restart: the next new outpost takes 4, never 3 again (without the N line the next id would be one past
+   the highest on file: 3) */
+void t_t1047f1_id_never_reused()
+{
+    using namespace townkeep;
+    std::vector<TownRow> all;
+    std::vector<TownRow> said;
+    said.push_back(T1047fRow(-1, 100.0f, 100.0f, 0u, 0));
+    said.push_back(T1047fRow(-1, 9000.0f, 9000.0f, 0u, 0));
+    said.push_back(T1047fRow(-1, 30000.0f, 30000.0f, 0u, 0));
+    unsigned next = NextIdAtLoad(0u, all, std::vector<TownRow>());
+    ReplaceSlotTowns(&all, 1, said, 1, &next, 0);
+    if (all.size() != 3 || next != 4u) { Fail("t1047f1: three new outposts did not take ids 1..3"); return; }
+    said.pop_back();   /* the outpost with id 3 removed */
+    ReplaceSlotTowns(&all, 1, said, 1, &next, 0);
+    unsigned top = 0;
+    for (size_t i = 0; i < all.size(); ++i) if (all[i].id > top) top = all[i].id;
+    if (all.size() != 2 || top != 2u) { Fail("t1047f1: the removed outpost's row stayed"); return; }
+    const std::string file = EncodeTownsFile(kPlayerTownsHeader, all, true, next);
+    std::vector<TownRow> back;
+    std::string why;
+    unsigned fileNext = 0;
+    if (!DecodeTownsFile(file, kPlayerTownsHeader, true, &back, &why, &fileNext) || back.size() != 2 || fileNext != 4u) { Fail("t1047f1: the next id does not survive the file: " + why); return; }
+    unsigned restart = NextIdAtLoad(fileNext, back, std::vector<TownRow>());
+    if (restart != 4u) Fail("t1047f1: after a restart the next id is " + I((int)restart) + ", not 4 - a removed id would be minted again");
+    std::vector<TownRow> s2(said);
+    s2.push_back(T1047fRow(-1, 60000.0f, 60000.0f, 0u, 0));
+    ReplaceSlotTowns(&back, 1, s2, 1, &restart, 0);
+    int got4 = 0, got3 = 0;
+    for (size_t i = 0; i < back.size(); ++i) { if (back[i].id == 4u) ++got4; if (back[i].id == 3u) ++got3; }
+    if (got4 != 1 || got3 != 0) Fail("t1047f1: the new outpost after the restart did not take 4");
+    /* a file with no N line (written before) reads, its next id one past the highest; a bad or second N line is refused */
+    if (!DecodeTownsFile(EncodeTownsFile(kPlayerTownsHeader, all, true), kPlayerTownsHeader, true, &back, &why, &fileNext) || fileNext != 0u
+        || NextIdAtLoad(fileNext, back, std::vector<TownRow>()) != 3u)
+        Fail("t1047f1: a file with no next-id line does not read");
+    if (DecodeTownsFile("player-towns\t4\nN\t0\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: a next id of 0 reads");
+    if (DecodeTownsFile("player-towns\t4\nN\t5\nN\t6\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: two next-id lines read");
+    if (DecodeTownsFile("player-towns\t3\nN\t5\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: a format-3 file with a next-id line reads");
+    if (NextIdAtLoad(2u, all, std::vector<TownRow>()) != 3u) Fail("t1047f1: a next id below the ids on file is taken");
+}
+/* the outposts one game holds, for the link tests: its own (slot 1, id 10), a teammate's copy (slot 2, id 20), another player's copy
+   (slot 3, id 30) */
+std::vector<baseshow::IdTown> T1047f1Towns()
+{
+    std::vector<baseshow::IdTown> t(3);
+    t[0].id = 10u; t[0].owner = 1; t[0].team = 1; t[0].hand[0] = 4; t[0].hand[4] = 101;
+    t[1].id = 20u; t[1].owner = 2; t[1].team = 1; t[1].hand[0] = 4; t[1].hand[4] = 202;
+    t[2].id = 30u; t[2].owner = 3; t[2].team = 0; t[2].hand[0] = 4; t[2].hand[4] = 303;
+    return t;
+}
+/* fix 2: a record of slot 1's piece names outpost 30 (slot 3's, not a teammate): no game links it there; its own, or its teammate's
+   (T-923: a piece placed in a teammate's outpost), is linked */
+void t_t1047f1_link_owner_checked()
+{
+    using namespace baseshow;
+    const std::vector<IdTown> t = T1047f1Towns();
+    std::vector<int> same(3, 0);
+    same[1] = 1;   /* slot 2 and slot 1 are one team */
+    if (TownOfIdFor(t, 30u, 1, same) != kIdTownOwnerBad) Fail("t1047f1: a link into another player's outpost is not refused");
+    if (TownOfIdFor(t, 10u, 1, same) != 0) Fail("t1047f1: a link into the owner's own outpost is refused");
+    if (TownOfIdFor(t, 20u, 1, same) != 1) Fail("t1047f1: a link into a teammate's outpost is refused");
+    if (TownOfIdFor(t, 30u, 3, same) != 2) Fail("t1047f1: slot 3's own link is refused");
+    if (TownOfIdFor(t, 99u, 1, same) != kIdTownNone || TownOfIdFor(t, 0u, 1, same) != kIdTownNone) Fail("t1047f1: an unknown id names a town");
+    std::vector<IdTown> g(t);
+    g[0].going = 1;
+    if (TownOfIdFor(g, 10u, 1, same) != kIdTownNone) Fail("t1047f1: a going town is linked");
+    std::vector<int> none(3, 0);
+    if (TownOfIdFor(t, 20u, 1, none) != kIdTownOwnerBad) Fail("t1047f1: an ex-teammate's outpost is still linked");
+    if (LinkOwnerOk(-1, 1, 1) != 0 || LinkOwnerOk(2, -1, 1) != 0) Fail("t1047f1: an unknown owner passes");
+}
+/* fix 1: the owner's game reads its own piece's engine link - a non-teammate's copy is never written into the record (the stored
+   link is kept), and such a link is seen to move; its own and a teammate's outpost are written */
+void t_t1047f1_own_piece_team_only()
+{
+    using namespace baseshow;
+    const std::vector<IdTown> t = T1047f1Towns();
+    const int own[5] = { 4, 0, 0, 0, 101 }, mate[5] = { 4, 0, 0, 0, 202 }, other[5] = { 4, 0, 0, 0, 303 }, none[5] = { 4, 0, 0, 0, 404 };
+    const unsigned kept = 10u;
+    if (piecerec::PieceTownWriteId(1, IdOfHand(t, other, 1), kept) != kept) Fail("t1047f1: an own piece's write names a non-teammate's outpost");
+    if (piecerec::PieceTownMarkDue(1, 1, IdOfHand(t, other, 1), kept, 0u) != 0) Fail("t1047f1: a write is marked for a non-teammate's outpost");
+    if (piecerec::PieceTownWriteId(1, IdOfHand(t, mate, 1), kept) != 20u || piecerec::PieceTownWriteId(1, IdOfHand(t, own, 1), 20u) != 10u)
+        Fail("t1047f1: an own piece's write does not name its own team's outpost");
+    if (IdOfHand(t, other, 0) != 30u) Fail("t1047f1: another player's copy has no id for a copy's own link");
+    if (HandIsOtherCopy(t, other) != 1 || HandIsOtherCopy(t, mate) != 0 || HandIsOtherCopy(t, own) != 0 || HandIsOtherCopy(t, none) != 0)
+        Fail("t1047f1: a non-teammate's copy is not told from the own team's towns");
+    std::vector<IdTown> ex(t);
+    ex[1].team = 0;   /* the teammate left the team */
+    if (IdOfHand(ex, mate, 1) != 0 || HandIsOtherCopy(ex, mate) != 1) Fail("t1047f1: an ex-teammate's copy is still taken for an own piece");
+    /* the placement's pick and the redirect: source checks (engine code, no offline road) - the redirect asks the team table */
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f1: build.cpp not read"); return; }
+    const size_t ms = s.rfind("int BdTownMateSlot(void* tf, const int* hand, int* src)");   /* its definition (a declaration comes first) */
+    const size_t mm = s.find("if (PolicyTeammateSlotIsMate(so) == 0) return -1;", ms);
+    if (ms == std::string::npos || mm == std::string::npos || mm - ms > 300) Fail("t1047f1: the placement redirect takes a shown town without asking the team table");
+    if (s.find("engineId = TlTeamIdOfTownWords(bh);") == std::string::npos) Fail("t1047f1: an own piece's write takes any town's id");
+    if (s.find("if (TlOwnOutOfOther(k.h.key, b, k, towns) != 0) ++writes;") == std::string::npos) Fail("t1047f1: the look does not move an own piece out of a non-teammate's copy");
+}
+/* fix 3 / 6: a hidden copy discovered by the engine's rule inside the 5 s look's window is noted when it is taken out before a save,
+   written beside the save, read at its load, and the copy founded again then is not hidden again; a teammate's outpost counts as seen,
+   so after the team ends it stays shown; an older save's file is not taken */
+void t_t1047f1_discovery_per_save()
+{
+    using namespace baseshow;
+    Shown s;
+    s.owner = 3; s.id = 30u; s.kind = kShowOther; s.hidden = 1;
+    std::set<unsigned> disc;
+    if (NoteBeforeTakeOut(s, 0, &disc) != 0 || !disc.empty()) Fail("t1047f1: a copy not discovered is noted");
+    if (NoteBeforeTakeOut(s, -1, &disc) != 0) Fail("t1047f1: an unread mark is noted");
+    if (NoteBeforeTakeOut(s, 1, &disc) != 1 || disc.count(30u) != 1) Fail("t1047f1: a discovery is not noted at the take-out");
+    if (NoteBeforeTakeOut(s, 1, &disc) != 0) Fail("t1047f1: a discovery is noted twice");
+    Shown m;
+    m.owner = 2; m.id = 20u; m.kind = kShowMate;
+    if (NoteBeforeTakeOut(m, -1, &disc) != 1 || disc.count(20u) != 1) Fail("t1047f1: a teammate's outpost is not noted as seen");
+    Shown own;
+    own.owner = 1; own.id = 10u; own.kind = kShowOwn;
+    if (NoteBeforeTakeOut(own, 1, &disc) != 0) Fail("t1047f1: the player's own outpost is noted");
+    /* the save's file, and its load */
+    const std::string file = EncodeDiscovered(disc);
+    std::set<unsigned> loaded;
+    if (!DecodeDiscovered(file, &loaded) || loaded != disc) { Fail("t1047f1: the discovered outposts do not survive the file beside the save"); return; }
+    /* the copy founded again after the load: not hidden (the founding marks it discovered: 1) */
+    if (HideStep(kShowOther, 1, 1, loaded.count(30u) != 0 ? 1 : 0) == kHideHide) Fail("t1047f1: a copy discovered before the save is hidden again after it");
+    if (HideStep(kShowOther, 1, 1, 0) != kHideHide) Fail("t1047f1: without the note the copy would not be hidden (the test's premise)");
+    /* the ex-teammate (kind now kShowOther): shown, from the per-save set */
+    if (HideStep(kShowOther, 1, 1, loaded.count(20u) != 0 ? 1 : 0) == kHideHide || HideStep(kShowOther, 1, 0, loaded.count(20u) != 0 ? 1 : 0) != kHideShow)
+        Fail("t1047f1: an ex-teammate's outpost is hidden");
+    if (NoteDiscovered(kShowOther, 31u, 1, 0) != 1 || NoteDiscovered(kShowOther, 31u, 1, 1) != 0 || NoteDiscovered(kShowOther, 0u, 1, 0) != 0) Fail("t1047f1: the look's note is wrong");
+    std::set<unsigned> bad;
+    if (DecodeDiscovered("discovered-outposts\t1\nD\t0\n", &bad) || DecodeDiscovered("discovered-outposts\t2\n", &bad) || DecodeDiscovered("", &bad) || !bad.empty())
+        Fail("t1047f1: a bad discovered file reads");
+    if (!DecodeDiscovered("discovered-outposts\t1\n", &bad) || !bad.empty()) Fail("t1047f1: an empty discovered file does not read");
+    if (DiscoveredFileCurrent(100ULL, 200ULL) != 0 || DiscoveredFileCurrent(0ULL, 200ULL) != 0 || DiscoveredFileCurrent(300ULL, 200ULL) != 1 || DiscoveredFileCurrent(300ULL, 0ULL) != 0)
+        Fail("t1047f1: an older save's file is taken, or the save's own refused");
+    /* the take-out paths read the mark first (engine code: source checks) */
+    const std::string src = T313ReadFile("../coop-plugin/build.cpp");
+    const size_t to = src.find("int BdShowTakeOut(baseshow::Shown* s, const char* why)");
+    const size_t note = src.find("TlNoteTakeOut(*s, t);", to), destroy = src.find("BdTownDestroyPod(t)", to);
+    if (to == std::string::npos || note == std::string::npos || destroy == std::string::npos || note > destroy) Fail("t1047f1: a copy is taken out before its discovered mark is read");
+    const size_t sg = src.find("void BdShowSaveGuard()"), sgNote = src.find("TlNoteTakeOut(g_shown[i], nt);", sg), sgOut = src.find("BdShowTakeOut(&g_shown[i]", sg);
+    if (sg == std::string::npos || sgNote == std::string::npos || sgOut == std::string::npos || sgNote > sgOut) Fail("t1047f1: the save's take-out does not note the discoveries first");
+}
+/* fix 4: the relink's power cycle is an event - switched on again: nothing to reset, and a player's own flip noted before the relink
+   still asks; not on again: the record's switch written once (or left off with no record values); no time window in the power look */
+void t_t1047f1_relink_power_event()
+{
+    using namespace piecerec;
+    if (PieceTownCycleStep(kCycleBack, 1) != kCycleStepNothing || PieceTownCycleStep(kCycleNone, 1) != kCycleStepNothing) Fail("t1047f1: a switch back on is acted on");
+    if (PieceTownCycleStep(kCycleFailed, 1) != kCycleStepRecordSwitch) Fail("t1047f1: a failed switch-on does not write the record's switch");
+    if (PieceTownCycleStep(kCycleFailed, 0) != kCycleStepLeftOff) Fail("t1047f1: a failed switch-on with no record values is not counted");
+    /* the power look after a cycle back on: the switch reads as before - the writer's switch held here (on) against the live switch */
+    if (powerwire::PowerAskDue(1, 1, 1) != 0) Fail("t1047f1: a switch back on asks");
+    if (powerwire::PowerAskDue(1, 0, 1) != 1) Fail("t1047f1: a player's flip before the relink lost its ask");
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f1: build.cpp not read"); return; }
+    const size_t look = s.find("void PwLook(void* b, PwRow& r)"), lookEnd = s.find("void PwChargeGated(void* b)", look);
+    if (look == std::string::npos || lookEnd == std::string::npos) { Fail("t1047f1: PwLook not found"); return; }
+    if (s.substr(look, lookEnd - look).find("Tl") != std::string::npos) Fail("t1047f1: the power look still has a relink window");
+    if (s.find("int BdBuildingSetTownPod(void* b, void* t, int* cycle = 0)") == std::string::npos) Fail("t1047f1: the relink does not report its power cycle");
+}
+/* fix 5: a link write refused or lost (no write owed, none sent and unanswered, the stored record still not naming the engine's
+   link) is marked again at the next look; while it is owed or in flight it is not marked twice */
+void t_t1047f1_link_mark_again()
+{
+    using namespace piecerec;
+    const unsigned engine = 5u, kept = 3u;
+    if (PieceTownMarkDue(1, 1, engine, kept, PieceTownMarkStands(engine, 1, 0)) != 0 || PieceTownMarkDue(1, 1, engine, kept, PieceTownMarkStands(engine, 0, 1)) != 0)
+        Fail("t1047f1: a link write owed or in flight is marked twice");
+    if (PieceTownMarkDue(1, 1, engine, kept, PieceTownMarkStands(engine, 0, 0)) != 1) Fail("t1047f1: a refused or lost link write is never marked again");
+    if (PieceTownMarkDue(1, 1, engine, engine, PieceTownMarkStands(engine, 0, 0)) != 0) Fail("t1047f1: a taken link write is marked again");
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.find("markedId = piecerec::PieceTownMarkStands(m->second, w->marked, w->fly.empty() ? 0 : 1);") == std::string::npos) Fail("t1047f1: the owner's mark is not dropped once its write is settled");
+    if (s.find("TlForgetWorld();") == std::string::npos) Fail("t1047f1: the link marks outlive the world");
+}
+/* ---- T-1047 step 5 fold 2 ---- */
+/* fix 1: while the team list is not held nothing checks (so nothing moves) an own piece - the wait counted once - and once the list
+   arrives the owed check runs once; a placement while it is not held is not moved then, and is checked once it is */
+void t_t1047f2_own_waits_for_team()
+{
+    using namespace baseshow;
+    OwnCheck g(16);
+    unsigned char applied[16];
+    std::memset(applied, 0, sizeof applied);
+    applied[3] = 1;
+    int moves = 0;
+    OwnCheckAreaApplied(&g, 3);   /* the load: area 3's records applied while the list is not held (a reconnect) */
+    for (int tick = 0; tick < 5; ++tick)
+        if (OwnCheckAreasDue(&g, 0) != 0) { ++moves; OwnCheckAreaDone(&g, 3); }
+    if (moves != 0) Fail("t1047f2: an own piece is checked (and can be moved) while the team list is not held");
+    if (g.waits != 1) Fail("t1047f2: the wait for the team list is not counted once");
+    /* the team list arrives: held, teammate slot 2 */
+    std::vector<int> mates(1, 2);
+    OwnCheckTeamSeen(&g, 1, OwnCheckTeamSig(1, mates), applied, 16);
+    for (int tick = 0; tick < 5; ++tick)
+        if (OwnCheckAreasDue(&g, 1) != 0) { ++moves; OwnCheckAreaDone(&g, 3); }
+    if (moves != 1) Fail("t1047f2: the owed check does not run exactly once when the team list is held");
+    /* the placement during a drop: not checked then, checked once the list is held again */
+    OwnCheckTeamSeen(&g, 2, OwnCheckTeamSig(0, std::vector<int>()), applied, 16);   /* the drop clears the list */
+    if (OwnCheckAreasDue(&g, 0) != 0) Fail("t1047f2: a check runs during the drop");
+    applied[5] = 1;   /* the placement's area: its records applied here (fold 3: the real call passes no area - every applied one owed) */
+    if (OwnCheckPlacement(&g, 0, applied, 16) != 0) Fail("t1047f2: a placement is moved while the team list is not held");
+    if (g.pieceWaits != 1) Fail("t1047f2: the placement's skip is not counted");
+    if (OwnCheckAreasDue(&g, 0) != 0) Fail("t1047f2: the placement's area is checked during the drop");
+    OwnCheckTeamSeen(&g, 3, OwnCheckTeamSig(1, mates), applied, 16);   /* the list arrives again, same teammate */
+    if (OwnCheckAreasDue(&g, 1) != 1 || g.owed[5] == 0 || g.owed[3] == 0) Fail("t1047f2: the placement's area or the applied areas are not checked once the list is held");
+    if (OwnCheckPlacement(&g, 1, applied, 16) != 1) Fail("t1047f2: a placement with the list held is not checked at once");
+    /* a reconnect where the list goes stale with no clear (no table change number moved): the placement still owes its check */
+    OwnCheck h(16);
+    OwnCheckTeamSeen(&h, 7, OwnCheckTeamSig(1, mates), applied, 16);
+    for (int c = 0; c < 16; ++c) OwnCheckAreaDone(&h, c);
+    unsigned char ap4[16];
+    std::memset(ap4, 0, sizeof ap4);
+    ap4[4] = 1;   /* fold 3: the placement's area is owed by the applied-area loop, as the real call (area -1) */
+    if (OwnCheckPlacement(&h, 0, ap4, 16) != 0 || OwnCheckAreasDue(&h, 1) != 1 || h.owed[4] == 0) Fail("t1047f2: a placement skipped with no team change is never checked");
+}
+/* fix 2: the own-piece check runs on its three events only - an area's records applied (a load), the team list changed (a teammate
+   added or removed), a placement - and never as a sweep: ticks with no event check nothing */
+void t_t1047f2_own_check_events_only()
+{
+    using namespace baseshow;
+    OwnCheck g(8);
+    unsigned char applied[8];
+    std::memset(applied, 0, sizeof applied);
+    applied[1] = 1; applied[2] = 1;
+    std::vector<int> mates(1, 2);
+    OwnCheckTeamSeen(&g, 1, OwnCheckTeamSig(1, mates), applied, 8);   /* the first list */
+    for (int c = 0; c < 8; ++c) OwnCheckAreaDone(&g, c);
+    long long runs0 = g.runs;
+    for (int tick = 0; tick < 1000; ++tick) if (OwnCheckAreasDue(&g, 1) != 0) Fail("t1047f2: the own-piece check runs with no event (a sweep)");
+    if (g.runs != runs0) Fail("t1047f2: a run is counted with no event");
+    OwnCheckAreaApplied(&g, 1);   /* event 1: the load (area 1's records applied) */
+    if (OwnCheckAreasDue(&g, 1) != 1 || g.owed[1] == 0 || g.owed[2] != 0) Fail("t1047f2: an area's apply does not owe exactly its own pieces a check");
+    OwnCheckAreaDone(&g, 1);
+    if (OwnCheckAreasDue(&g, 1) != 0) Fail("t1047f2: the load's check runs twice");
+    if (OwnCheckTeamSeen(&g, 2, OwnCheckTeamSig(1, mates), applied, 8) != 0) Fail("t1047f2: a team list with the same teammates is taken for a change");
+    if (OwnCheckTeamSeen(&g, 2, OwnCheckTeamSig(1, std::vector<int>()), applied, 8) != 0) Fail("t1047f2: the same change number is read twice");
+    std::vector<int> more(mates);
+    more.push_back(4);
+    if (OwnCheckTeamSeen(&g, 3, OwnCheckTeamSig(1, more), applied, 8) != 1) Fail("t1047f2: a teammate added is no event");   /* event 2 */
+    if (OwnCheckAreasDue(&g, 1) != 1 || g.owed[1] == 0 || g.owed[2] == 0 || g.owed[0] != 0) Fail("t1047f2: a team change does not owe every applied area");
+    for (int c = 0; c < 8; ++c) OwnCheckAreaDone(&g, c);
+    std::vector<int> fewer(1, 4);
+    if (OwnCheckTeamSeen(&g, 4, OwnCheckTeamSig(1, fewer), applied, 8) != 1) Fail("t1047f2: a teammate removed is no event");
+    for (int c = 0; c < 8; ++c) OwnCheckAreaDone(&g, c);
+    if (OwnCheckPlacement(&g, 1, applied, 8) != 1) Fail("t1047f2: a placement is not checked");   /* event 3 */
+    if (OwnCheckAreasDue(&g, 1) != 0) Fail("t1047f2: a placement checked at once owes an area sweep too");
+    if (OwnCheckTeamSig(1, more) != OwnCheckTeamSig(1, std::vector<int>(more.rbegin(), more.rend()))) Fail("t1047f2: the teammates' order changes the team's signature");
+    OwnCheckAreaApplied(&g, 6);
+    OwnCheckForgetWorld(&g);
+    if (OwnCheckAreasDue(&g, 1) != 0) Fail("t1047f2: a check owed in a world gone runs in the next");
+    /* the engine glue: the 5 s look leaves the own pieces, the check is driven from the events (source checks - engine code) */
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f2: build.cpp not read"); return; }
+    if (s.find("if (k.h.ownerSlot == mySlot || link == 0) continue;") == std::string::npos) Fail("t1047f2: the 5 s look still looks at the own pieces");
+    if (s.find("PcaApplyArea(c, me);\r\n        TlOwnAreaApplied(c);") == std::string::npos && s.find("PcaApplyArea(c, me);\n        TlOwnAreaApplied(c);") == std::string::npos)
+        Fail("t1047f2: an area's apply does not owe its own pieces a check");
+    if (s.find("if (baseshow::OwnCheckPlacement(&g_tlOwn, TeamTableKnown() ? 1 : 0, g_pcaDone, ") == std::string::npos) Fail("t1047f2: the placement's move does not wait for the team list");
+}
+/* fix 3: a failed link copy still reports its power cycle (a piece left off is written back or counted) and is not tried again -
+   no repeated power cycle - until its record or a town changes */
+struct T1047f2Ops : baseshow::RelinkOps
+{
+    int result, cycleOut, copies, afters, lastCycle;
+    T1047f2Ops() : result(0), cycleOut(piecerec::kCycleFailed), copies(0), afters(0), lastCycle(-1) {}
+    int Copy(int* cycle) { ++copies; *cycle = cycleOut; return result; }
+    void CycleAfter(int cycle) { ++afters; lastCycle = cycle; }
+};
+void t_t1047f2_failed_copy_once()
+{
+    using namespace baseshow;
+    std::map<std::string, LinkFail> fails;
+    long long skipped = 0;
+    const int from[5] = { 4, 0, 0, 0, 7 }, to[5] = { 4, 0, 0, 0, 8 }, to2[5] = { 4, 0, 0, 0, 9 };
+    T1047f2Ops ops;
+    if (RelinkPiece(&ops, &fails, 16, "k1", 5u, from, to, &skipped) != kRelinkFailed) Fail("t1047f2: a failed copy is not reported failed");
+    if (ops.afters != 1 || ops.lastCycle != piecerec::kCycleFailed) Fail("t1047f2: a failed copy does not reach the power cycle's report");
+    if (piecerec::PieceTownCycleStep(ops.lastCycle, 1) != piecerec::kCycleStepRecordSwitch) Fail("t1047f2: the piece left off is not written back");
+    for (int look = 0; look < 10; ++look) RelinkPiece(&ops, &fails, 16, "k1", 5u, from, to, &skipped);
+    if (ops.copies != 1 || ops.afters != 1 || skipped != 10) Fail("t1047f2: a failing copy is tried (and power cycled) again with nothing changed");
+    RelinkPiece(&ops, &fails, 16, "k1", 6u, from, to, &skipped);   /* the record changed */
+    if (ops.copies != 2) Fail("t1047f2: a failed copy is not tried again once its record changed");
+    RelinkPiece(&ops, &fails, 16, "k1", 6u, from, to2, &skipped);   /* the town it goes to changed */
+    if (ops.copies != 3) Fail("t1047f2: a failed copy is not tried again once its town changed");
+    RelinkPiece(&ops, &fails, 16, "k1", 6u, to, to2, &skipped);     /* the town it stands in changed */
+    if (ops.copies != 4) Fail("t1047f2: a failed copy is not tried again once the town it stands in changed");
+    ops.result = 1; ops.cycleOut = piecerec::kCycleBack;
+    if (RelinkPiece(&ops, &fails, 16, "k1", 7u, to, to2, &skipped) != kRelinkDone || fails.count("k1") != 0 || ops.afters != 5) Fail("t1047f2: a copy that worked is still remembered failed");
+    ops.result = 0;
+    RelinkPiece(&ops, &fails, 1, "k2", 1u, from, to, &skipped);
+    RelinkPiece(&ops, &fails, 1, "k3", 1u, from, to, &skipped);
+    if (fails.size() != 1) Fail("t1047f2: the failed-copy memory passes its cap");
+    /* the engine glue: both relinks go through it (source checks - engine code) */
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f2: build.cpp not read"); return; }
+    if (s.find("if (TlRelink(key, b, t, k, bh, words, liveFollows) != baseshow::kRelinkDone) return 0;") == std::string::npos
+        || s.find("if (TlRelink(key, b, t, k, bh, words, 0) != baseshow::kRelinkDone) return 0;") == std::string::npos)
+        Fail("t1047f2: a relink does not go through the failed-copy rule");
+}
+/* fix 4: a load whose prepare read its save's discovered set and then failed (no new world) is disarmed - its set never applies to
+   a later world; a load that made a world binds the set to it; two waiting saves each get their own take-out's set */
+void t_t1047f2_failed_load_disarmed()
+{
+    using namespace baseshow;
+    DiscArm a;
+    DiscArmAtPrepare(&a);
+    if (DiscArmTake(&a, 5) != 0 || a.armed == 0) Fail("t1047f2: a set is taken while its load call is still running");
+    if (DiscArmAtLoadEnd(&a, 5, 5) != 1 || a.armed != 0) Fail("t1047f2: a load that made no world stays armed");
+    if (DiscArmTake(&a, 6) != 0) Fail("t1047f2: a failed load's set applies to the next world");
+    DiscArmAtPrepare(&a);
+    if (DiscArmAtLoadEnd(&a, 5, 6) != 0 || a.gen != 6) Fail("t1047f2: a load that made a world is not bound to it");
+    if (DiscArmTake(&a, 6) != 1 || DiscArmTake(&a, 6) != 0) Fail("t1047f2: the world a load made does not take its set once");
+    DiscArmAtPrepare(&a);
+    DiscArmAtLoadEnd(&a, 6, 7);
+    if (DiscArmTake(&a, 8) != 0 || a.armed != 0) Fail("t1047f2: a set bound to one world applies to another");
+    /* two waiting saves, both asked before either take-out */
+    std::map<long long, std::set<unsigned> > hist;
+    std::set<unsigned> s6, s7, got;
+    s6.insert(30u);
+    s7 = s6; s7.insert(31u);
+    DiscGuardNote(&hist, 6, s6, 8);
+    DiscGuardNote(&hist, 7, s7, 8);
+    if (DiscGuardClaim(&hist, 5, &got) != 1 || got != s6) Fail("t1047f2: the first save does not get its own take-out's set");
+    if (DiscGuardClaim(&hist, 5, &got) != 1 || got != s7) Fail("t1047f2: two waiting saves share one set");
+    if (DiscGuardClaim(&hist, 5, &got) != 0) Fail("t1047f2: a third save finds a set no take-out made for it");
+    for (long long n = 1; n <= 20; ++n) DiscGuardNote(&hist, n, s6, 8);
+    if (hist.size() != 8) Fail("t1047f2: the take-out sets pass their cap");
+}
+/* ---- T-1047 step 5 fold 3 ---- */
+/* fix 1: a TOWN EVENT - a town founded, taken up or moved owes the own pieces of its area and the 8 around it a check (the engine's
+   own-outpost founding 0x4D6300 hands this player's wilderness buildings to their nearest town once 0x933F40 has founded it); a copy
+   kept where it stood is no event; the team-held gate holds as for every event */
+void t_t1047f3_town_event()
+{
+    using namespace baseshow;
+    OwnCheck g(kOwnTownGrid * kOwnTownGrid);
+    if (OwnCheckTownAt(&g, 10, 20) != 9) Fail("t1047f3: a town event does not owe its area and the 8 around it");
+    for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+            if (g.owed[(size_t)((10 + dx) * kOwnTownGrid + 20 + dy)] == 0) Fail("t1047f3: an area around the town is not owed");
+    if (g.owed[(size_t)(12 * kOwnTownGrid + 20)] != 0) Fail("t1047f3: an area two away from the town is owed");
+    if (OwnCheckAreasDue(&g, 0) != 0) Fail("t1047f3: a town event is checked while the team list is not held");
+    if (OwnCheckAreasDue(&g, 1) != 1) Fail("t1047f3: a town event is not checked once the team list is held");
+    OwnCheck b(kOwnTownGrid * kOwnTownGrid);
+    if (OwnCheckTownAt(&b, 0, 0) != 4 || OwnCheckTownAt(&b, -1, 3) != 0 || OwnCheckTownAt(&b, 3, kOwnTownGrid) != 0) Fail("t1047f3: the grid's edge is not kept");
+    if (CopyTownChanged(kRowKeep, 0) != 0) Fail("t1047f3: a copy kept where it stood owes a check (a check at every apply)");
+    if (CopyTownChanged(kRowFound, 0) != 1 || CopyTownChanged(kRowTake, 0) != 1 || CopyTownChanged(kRowKeep, 1) != 1) Fail("t1047f3: a copy founded, taken up or moved is no event");
+    /* the engine glue: both roads raise it (source checks - engine code) */
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f3: build.cpp not read"); return; }
+    if (s.find("if (t != 0 && posOk != 0) TlOwnTownAt(p, ") == std::string::npos) Fail("t1047f3: a founding the hook saw is no town event");
+    if (s.find("if (baseshow::CopyTownChanged(step, (moveKind == townmove::kMove || moveKind == townmove::kRefound) ? 1 : 0) != 0)") == std::string::npos)
+        Fail("t1047f3: a copy town made or moved is no town event");
+    if (s.find("if (baseshow::OwnCheckTownAt(&g_tlOwn, sx, sy) == 0) return;") == std::string::npos) Fail("t1047f3: the town event does not owe the areas around it");
+}
+/* fix 2: the team-held gate of each engine step (move, mark, the record write's link read) and the town-link tick: the own-piece
+   check runs at every ready tick, so an event is checked at once - never only at the 5 s look, never while not ready */
+void t_t1047f3_gate_and_tick()
+{
+    using namespace baseshow;
+    if (OwnStepDue(0, 1) != 0) Fail("t1047f3: an own piece's step goes on while the team list is not held");
+    if (OwnStepDue(1, 1) != 1) Fail("t1047f3: an own piece's step is held back with the team list held");
+    if (OwnStepDue(1, 0) != 0 || OwnStepDue(1, -1) != 0 || OwnStepDue(0, 0) != 0) Fail("t1047f3: a piece inside a building (or unread) goes on");
+    OwnCheck g(8);
+    unsigned char applied[8];
+    std::memset(applied, 0, sizeof applied);
+    applied[2] = 1;
+    std::vector<int> mates(1, 3);
+    OwnCheckTeamSeen(&g, 1, OwnCheckTeamSig(1, mates), applied, 8);
+    for (int c = 0; c < 8; ++c) OwnCheckAreaDone(&g, c);
+    OwnCheckAreaApplied(&g, 2);   /* an event just after a look */
+    int ownRuns = 0, looks = 0;
+    unsigned since = 16;
+    for (int tick = 0; tick < 20; ++tick, since += 16)
+    {
+        const int plan = TownLinkTickPlan(1, 0, since, 5000u);
+        if ((plan & kTickOwnCheck) != 0 && OwnCheckAreasDue(&g, 1) != 0) { ++ownRuns; OwnCheckAreaDone(&g, 2); }
+        if ((plan & kTickLook) != 0) ++looks;
+    }
+    if (ownRuns != 1) Fail("t1047f3: an event's check waits for the 5 s look (or runs twice)");
+    if (looks != 0) Fail("t1047f3: the look runs before its 5 s");
+    if (TownLinkTickPlan(0, 0, 9999u, 5000u) != 0) Fail("t1047f3: a tick that is not ready (writes blocked, off the main thread, a save) checks or looks");
+    if (TownLinkTickPlan(1, -1, 10u, 5000u) != 0 || TownLinkTickPlan(1, -1, 5000u, 5000u) != kTickLook) Fail("t1047f3: with no slot the own check runs, or the look stops");
+    if (TownLinkTickPlan(1, 2, 5000u, 5000u) != (kTickOwnCheck | kTickLook)) Fail("t1047f3: a look's tick skips the own check");
+    /* the engine glue (source checks - engine code) */
+    const std::string s = T313ReadFile("../coop-plugin/build.cpp");
+    if (s.empty()) { Fail("t1047f3: build.cpp not read"); return; }
+    if (s.find("if (baseshow::OwnStepDue(TlOwnTeamHeld(), BdBuildingTopLevelPod(b)) == 0) return;") == std::string::npos) Fail("t1047f3: the mark does not wait for the team list");
+    if (s.find("if (baseshow::OwnStepDue(TlOwnTeamHeld(), BdBuildingTopLevelPod(b)) == 0) return 0;") == std::string::npos) Fail("t1047f3: the move does not wait for the team list");
+    if (s.find("baseshow::OwnStepDue(TlOwnTeamHeld(), top) != 0 && BdBuildingTownHandPod(pc, bh) != 0") == std::string::npos) Fail("t1047f3: the record write reads the engine link without the team list");
+    const size_t own = s.find("if ((plan & baseshow::kTickOwnCheck) != 0) TlOwnCheckTick(KeptMySlot());");
+    const size_t look = s.find("if ((plan & baseshow::kTickLook) == 0) return;");
+    if (s.find("const int plan = baseshow::TownLinkTickPlan(ready, KeptMySlot(), ") == std::string::npos || own == std::string::npos || look == std::string::npos || own > look)
+        Fail("t1047f3: the town-link tick does not reach the own-piece check before the look's clock");
+}
+/* fix 2: the load-end wiring (the generation read before the prepare, the end reached with it) and each save's own discovered set */
+struct T1047f3Load : baseshow::DiscLoadOps
+{
+    baseshow::DiscArm* arm; long gen; int makesWorld; std::string order;
+    T1047f3Load(baseshow::DiscArm* a, long g, int m) : arm(a), gen(g), makesWorld(m) {}
+    long Gen() { order += "G"; return gen; }
+    void Prepare() { order += "P"; baseshow::DiscArmAtPrepare(arm); }
+    int Load() { order += "L"; if (makesWorld != 0) ++gen; return makesWorld; }
+    void Ended(long genAtPrepare) { order += "E"; baseshow::DiscArmAtLoadEnd(arm, genAtPrepare, gen); }
+};
+void t_t1047f3_load_and_save_wiring()
+{
+    using namespace baseshow;
+    DiscArm a;
+    T1047f3Load bad(&a, 5, 0);
+    if (DiscLoadRun(&bad) != 0 || bad.order != "GPLE") Fail("t1047f3: the load's generation is not read before its prepare, or its end is not reached");
+    if (a.armed != 0 || DiscArmTake(&a, 6) != 0) Fail("t1047f3: a failed load's discovered set stays armed for a later world");
+    T1047f3Load good(&a, 6, 1);
+    DiscLoadRun(&good);
+    if (a.gen != 7 || DiscArmTake(&a, 7) != 1) Fail("t1047f3: a load that made a world does not bind its set to it");
+    DiscGuard dg;
+    std::set<unsigned> s6, s7, s8;
+    s6.insert(30u);
+    s7 = s6; s7.insert(31u);
+    long long na = -1, nb = -1, nc = -1;
+    std::string ta = DiscGuardAsk(dg, s6, &na), tb = DiscGuardAsk(dg, s6, &nb);   /* two saves asked before either take-out */
+    DiscGuardTakeOut(&dg, s6, 8);
+    DiscGuardTakeOut(&dg, s7, 8);   /* an outpost discovered between the two take-outs */
+    if (DiscGuardText(&dg, na, &ta) != 1 || ta != EncodeDiscovered(s6)) Fail("t1047f3: the first save does not get its own take-out's set");
+    if (DiscGuardText(&dg, nb, &tb) != 1 || tb != EncodeDiscovered(s7)) Fail("t1047f3: the second save does not get its own take-out's set");
+    s8 = s7; s8.insert(32u);
+    std::string tc = DiscGuardAsk(dg, s8, &nc);
+    if (DiscGuardText(&dg, nc, &tc) != 0 || tc != EncodeDiscovered(s8)) Fail("t1047f3: a save with no take-out since its request loses its request's set");
+    /* the engine glue (source checks - engine code) */
+    const std::string b = T313ReadFile("../coop-plugin/build.cpp"), st = T313ReadFile("../coop-plugin/store.cpp");
+    if (b.empty() || st.empty()) { Fail("t1047f3: build.cpp or store.cpp not read"); return; }
+    if (b.find("return baseshow::DiscGuardText(&g_tlGuard, guardN0, text);") == std::string::npos
+        || b.find("baseshow::DiscGuardTakeOut(&g_tlGuard, g_tlDiscovered, kTlGuardHistCap);") == std::string::npos
+        || b.find("return baseshow::DiscGuardAsk(g_tlGuard, g_tlDiscovered, guardN);") == std::string::npos)
+        Fail("t1047f3: the save's discovered set does not go through baseshow::DiscGuard");
+    if (st.find("return baseshow::DiscLoadRun(&ops);") == std::string::npos || st.find("void Ended(long genAtPrepare) { coop::BuildDiscoveredLoadEnded(genAtPrepare); coop::ItemsBoxOwedLoadEnded(genAtPrepare); }") == std::string::npos)
+        Fail("t1047f3: the load does not end through baseshow::DiscLoadRun");
+    if (st.find("coop::BuildDiscoveredGuard(g_discGuardN0[i], &dt);") == std::string::npos) Fail("t1047f3: a landed save does not ask for its own set");
+}
+/* ---- T-940: every player outpost's fixed zone (townkeep.h THE FIXED ANCHOR, baseshow.h SHOW's anchor, buildnear.h ZoneVerdict) ---- */
+/* the anchor is the first said centre, kept through the centre's drift (a SAY at a drifted centre still inherits the row by its key),
+   through a carried (reset) outpost's id, and through a file round trip; an older file's row takes its centre at the read */
+void t_t940_anchor_fixed()
+{
+    using namespace townkeep;
+    std::vector<TownRow> all;
+    std::vector<TownRow> said;
+    said.push_back(T1047fRow(-1, 1000.0f, 2000.0f, 0u, "12-a.mod@3,41@1000,2000,0"));
+    unsigned next = 1;
+    ReplaceSlotTowns(&all, 1, said, 1, &next, 0);
+    float ax = 0.0f, az = 0.0f;
+    if (all.size() != 1 || all[0].anchored != 1) { Fail("t940: a new outpost row has no anchor"); return; }
+    AnchorOf(all[0], &ax, &az);
+    if (ax != 1000.0f || az != 2000.0f) Fail("t940: a new outpost's anchor is not its founding spot");
+    /* the engine moves the centre toward the buildings: 40 u (a centre match), then 900 u more (only the key matches) */
+    said[0].pos[0] = 1040.0f;
+    ReplaceSlotTowns(&all, 1, said, 1, &next, 0);
+    said[0].pos[0] = 1940.0f; said[0].pos[2] = 2300.0f;
+    ReplaceSlotTowns(&all, 1, said, 1, &next, 0);
+    AnchorOf(all[0], &ax, &az);
+    if (all.size() != 1 || all[0].pos[0] != 1940.0f || ax != 1000.0f || az != 2000.0f || all[0].id != 1u) Fail("t940: the anchor moved with the centre's drift");
+    /* a file round trip keeps it */
+    const std::string text = EncodeTownsFile(kPlayerTownsHeader, all, true, next);
+    std::vector<TownRow> back;
+    std::string why;
+    if (!DecodeTownsFile(text, kPlayerTownsHeader, true, &back, &why) || back.size() != 1) { Fail("t940: the file does not read back: " + why); return; }
+    AnchorOf(back[0], &ax, &az);
+    if (back[0].anchored != 1 || ax != 1000.0f || az != 2000.0f || back[0].pos[0] != 1940.0f) Fail("t940: the anchor does not survive the file");
+    /* an older file (format 4: no anchor fields) - the centre at the read is the anchor, and it stays from then on */
+    std::string old = "player-towns\t4\n";
+    size_t at = text.find('\n') + 1;
+    while (at < text.size())
+    {
+        size_t e = text.find('\n', at);
+        std::string line = text.substr(at, e - at);
+        if (line.size() > 2 && line[0] == 'T') for (int k = 0; k < 2; ++k) line = line.substr(0, line.rfind('\t'));
+        old += line + "\n";
+        at = e + 1;
+    }
+    if (!DecodeTownsFile(old, kPlayerTownsHeader, true, &back, &why) || back.size() != 1) { Fail("t940: a format-4 file does not read: " + why); return; }
+    AnchorOf(back[0], &ax, &az);
+    if (back[0].anchored != 1 || ax != 1940.0f || az != 2300.0f) Fail("t940: a format-4 row's anchor is not its centre at the read");
+    said[0].pos[0] = 2500.0f;
+    ReplaceSlotTowns(&back, 1, said, 1, &next, 0);
+    AnchorOf(back[0], &ax, &az);
+    if (ax != 1940.0f || az != 2300.0f) Fail("t940: an older file's anchor moved at the next SAY");
+    /* a reset carried the outpost (kept-towns.txt): a new SAY far from it takes its id by key - and its anchor */
+    std::vector<TownRow> carried(1, all[0]);
+    carried[0].owner = 1;
+    std::vector<TownRow> fresh;
+    std::vector<TownRow> s2(1, T1047fRow(-1, 9000.0f, 9000.0f, 0u, "12-a.mod@3,41@1000,2000,0"));
+    unsigned n2 = 5;
+    ReplaceSlotTowns(&fresh, 1, s2, 1, &n2, &carried);
+    AnchorOf(fresh[0], &ax, &az);
+    if (fresh.size() != 1 || fresh[0].id != 1u || ax != 1000.0f || az != 2000.0f) Fail("t940: a carried outpost's anchor is not kept with its id");
+}
+/* SHOW carries each row's anchor (protocol 119): round trip, and a game reading the 116 layout refuses the longer row */
+void t_t940_show_anchor()
+{
+    using namespace baseshow;
+    if (kProtocol != 121u || townkeep::kTownsFormat != 5) Fail("t940: SHOW is not world-server protocol 121 / the files not format 5");
+    std::vector<townkeep::TownRow> said;
+    said.push_back(T1047fRow(2, 7000.0f, 8000.0f, 4u, 0));
+    townkeep::SetAnchor(&said[0], 6500.0f, 7500.0f);
+    std::set<int> mates;
+    std::map<int, std::string> names;
+    int cut = 0;
+    const std::vector<ShowRow> rows = RowsForAll(said, 0, mates, names, &cut);
+    if (rows.size() != 1 || rows[0].anchor[0] != 6500.0f || rows[0].anchor[1] != 7500.0f) { Fail("t940: SHOW's row does not carry the anchor"); return; }
+    std::vector<char> b;
+    if (!Encode(&b, 0, rows)) { Fail("t940: SHOW does not encode"); return; }
+    unsigned f = 9;
+    std::vector<ShowRow> back;
+    if (Decode(&b[0], b.size(), &f, &back) != 1 || back.size() != 1 || back[0].anchor[0] != 6500.0f || back[0].anchor[1] != 7500.0f || back[0].id != 4u)
+        Fail("t940: SHOW's anchor does not survive the wire");
+    if (Decode(&b[0], b.size() - 8, &f, &back) != 0) Fail("t940: a SHOW row without the anchor (the 116 layout) is read");
+}
+/* the zone rule: a stranger's anchor refuses within 7000 u (allowed at 7001); own (or a teammate's) zone always buildable; founding
+   refused under 12000 u; teammates never refuse; no anchors = the game's own rule alone (NPC towns untouched) */
+void t_t940_zone_verdict()
+{
+    using namespace buildnear;
+    if (kZoneRadius != 5000.0f || kZoneGap != 2000.0f || kZoneRefuse != 7000.0f || kAnchorApart != 12000.0f) Fail("t940: the zone sizes are not 500 m + 200 m, 1.2 km apart");
+    ZoneAnchor a[3];
+    a[0].owner = 4; a[0].id = 21u; a[0].x = 0.0f; a[0].z = 0.0f; a[0].rel = kRelOther;      /* a stranger's outpost */
+    int w = -1;
+    float d = -1.0f;
+    if (ZoneVerdict(a, 1, 6999.0f, 0.0f, 0, &w, &d) != kZoneRefusedGap || w != 0 || d < 6998.0f || d > 7000.0f) Fail("t940: a spot 6999 u from a stranger's anchor is not refused");
+    if (ZoneVerdict(a, 1, 7000.0f, 0.0f, 0, &w, &d) != kZoneRefusedGap) Fail("t940: a spot at 7000 u is not refused");
+    if (ZoneVerdict(a, 1, 7001.0f, 0.0f, 0, &w, &d) != kZoneFree || w != -1) Fail("t940: a spot at 7001 u is refused");
+    if (ZoneAllowed(kZoneRefusedGap) != 0 || ZoneAllowed(kZoneRefusedFound) != 0 || ZoneAllowed(kZoneOwnOverGap) != 1 || ZoneAllowed(kZoneFree) != 1) Fail("t940: ZoneAllowed");
+    /* founding: refused under 12000 u, allowed at 12000; a joining piece at 8000 is allowed */
+    if (ZoneVerdict(a, 1, 0.0f, 11999.0f, 1, &w, &d) != kZoneRefusedFound || w != 0) Fail("t940: founding 11999 u from a stranger's anchor is not refused");
+    if (ZoneVerdict(a, 1, 0.0f, 12000.0f, 1, &w, &d) != kZoneFree) Fail("t940: founding 12000 u away is refused");
+    if (ZoneVerdict(a, 1, 0.0f, 8000.0f, 0, &w, &d) != kZoneFree || ZoneVerdict(a, 1, 0.0f, 8000.0f, -1, &w, &d) != kZoneFree) Fail("t940: a piece that founds nothing (or unknown) is refused past the gap");
+    /* an old world: own anchor 9000 u from the stranger's - own zone wins inside it, the stranger's gap outside it */
+    a[1].owner = 1; a[1].id = 3u; a[1].x = 9000.0f; a[1].z = 0.0f; a[1].rel = kRelOwn;
+    if (ZoneVerdict(a, 2, 5000.0f, 0.0f, 0, &w, &d) != kZoneOwnOverGap || w != 0) Fail("t940: inside own zone within a stranger's gap is not allowed");
+    if (ZoneVerdict(a, 2, 9000.0f, 4000.0f, 1, &w, &d) != kZoneOwnInside || w != 1) Fail("t940: inside own zone is not allowed");
+    if (ZoneVerdict(a, 2, 3000.0f, 3000.0f, 0, &w, &d) != kZoneRefusedGap) Fail("t940: the stranger's zone outside own zone is not refused");
+    if (OwnZoneAt(a, 2, 9000.0f, 4999.0f) != 1 || OwnZoneAt(a, 2, 9000.0f, 5001.0f) != -1 || OwnZoneAt(a, 2, 0.0f, 0.0f) != -1) Fail("t940: OwnZoneAt");
+    /* a teammate never refuses, and its zone is buildable even inside a stranger's gap */
+    a[2].owner = 2; a[2].id = 8u; a[2].x = 0.0f; a[2].z = -9000.0f; a[2].rel = kRelMate;
+    if (ZoneVerdict(a + 2, 1, 0.0f, -9000.0f, 1, &w, &d) != kZoneMateInside || ZoneVerdict(a + 2, 1, 0.0f, -3000.0f, 1, &w, &d) != kZoneFree)
+        Fail("t940: a teammate's outpost refuses or its zone is not its zone");
+    if (ZoneVerdict(a, 3, 0.0f, -5000.0f, 0, &w, &d) != kZoneOwnOverGap) Fail("t940: a teammate's zone within a stranger's gap is not allowed");
+    /* decision 973's rings replaced: inside the teammate's fixed zone only */
+    if (MateZoneFixed(5000.0f) != kZoneInside || MateZoneFixed(5001.0f) != kZoneOut || MateZoneFixed(-1.0f) != -1) Fail("t940: the teammate's fixed zone");
+    if (TownPickTakesMate(1, 2, MateZoneFixed(4000.0f), 0, 1) != 1 || TownPickTakesMate(1, 2, MateZoneFixed(6000.0f), 0, 1) != 0)
+        Fail("t940: a piece inside a teammate's fixed zone does not join it, or one outside it does");
+    /* no anchors: the game's own rule alone (an NPC town's refusal unchanged) */
+    if (ZoneVerdict(a, 0, 0.0f, 0.0f, 1, &w, &d) != kZoneFree || Refused(1, 1, 0, 1, 1) != 1) Fail("t940: with no outposts the game's own rule is not the answer");
+}
+
+/* T-940: the build cursor's zone stub at 0x4DB2F6 - golden bytes typed from a hand listing (not from ZoneStubBuild), site
+   0x1404DB2F6, callee 0x1122334455667788:
+      0  push rax rcx rdx r8 r9 r10 r11    11  sub rsp, 0x88    18  movdqu [rsp+0x20+16i], xmm i (i 0..5)
+     54  mov rcx, rsi    57  mov rax, callee    67  call rax    69  movdqu xmm i, [rsp+0x20+16i]    105  add rsp, 0x88
+    112  pop r11 r10 r9 r8 rdx rcx rax    123  cmp dword [rsi+0x38], 0    127  jne +14
+    129  jmp [rip] -> 0x1404DB2FC (site + 6)    143  jmp [rip] -> 0x1404DB365 (site + 0x6F, the jne's own target)    157 bytes */
+void t_t940_cursor_stub()
+{
+    using namespace buildnear;
+    static const unsigned char gold[157] = {
+        0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+        0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00,
+        0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x20, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x30, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x60, 0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x70,
+        0x48, 0x89, 0xF1,
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0xFF, 0xD0,
+        0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x20, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x30, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x50, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x60, 0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x70,
+        0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00,
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58,
+        0x83, 0x7E, 0x38, 0x00,
+        0x75, 0x0E,
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0xFC, 0xB2, 0x4D, 0x40, 0x01, 0x00, 0x00, 0x00,
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x65, 0xB3, 0x4D, 0x40, 0x01, 0x00, 0x00, 0x00 };
+    unsigned char p[200];
+    for (int i = 0; i < 200; ++i) p[i] = 0xCC;
+    const int n = ZoneStubBuild(p, 0x1404DB2F6ULL, 0x1122334455667788ULL);
+    if (n != 157 || kZoneStubLen != 157) { Fail("t940: the zone stub is not 157 bytes (" + I(n) + ")"); return; }
+    for (int i = 0; i < 157; ++i)
+        if (p[i] != gold[i]) { Fail("t940: zone stub byte " + I(i) + " is " + I((int)p[i]) + ", the listing says " + I((int)gold[i])); break; }
+    if (p[157] != 0xCC) Fail("t940: the zone stub wrote past its length");
+    /* the stack at the call, read from the emitted bytes - every push before the `sub rsp, imm32` (50..57, or 41 50..57), the
+       imm32, and the call (FF D0) after it: rsp 16-aligned at the site must stay 16-aligned at the call */
+    {
+        int at = 0, pushed = 0, sub = -1, callAt = -1;
+        while (at < n)
+        {
+            if (p[at] >= 0x50 && p[at] <= 0x57) { pushed += 8; ++at; continue; }
+            if (p[at] == 0x41 && at + 1 < n && p[at + 1] >= 0x50 && p[at + 1] <= 0x57) { pushed += 8; at += 2; continue; }
+            break;
+        }
+        if (at + 7 <= n && p[at] == 0x48 && p[at + 1] == 0x81 && p[at + 2] == 0xEC) sub = (int)p[at + 3] | ((int)p[at + 4] << 8) | ((int)p[at + 5] << 16) | ((int)p[at + 6] << 24);
+        for (int i = at; i + 1 < n; ++i) if (p[i] == 0xFF && p[i + 1] == 0xD0) { callAt = i; break; }
+        if (sub < 0x20 + 6 * 16 || callAt < 0 || (pushed + sub) % 16 != 0) Fail("t940: the emitted stub misaligns the stack at its call (pushed " + I(pushed) + ", sub " + I(sub) + ")");
+        /* the add before the pops gives back what the sub took */
+        int addOk = 0;
+        for (int i = callAt; i + 7 <= n; ++i) if (p[i] == 0x48 && p[i + 1] == 0x81 && p[i + 2] == 0xC4) { addOk = ((int)p[i + 3] | ((int)p[i + 4] << 8)) == sub ? 1 : 0; break; }
+        if (addOk != 1) Fail("t940: the emitted stub does not give back its stack");
+    }
+    /* the site's six bytes, read from the emitter's own output - its re-done compare is the site's first four, and its two exits
+       are site + 6 (fall through) and the jne's own target, site + 6 + the jne's rel8 (the site's byte 5) */
+    {
+        if (kZoneSitePatchLen != 6 || kZoneSiteOrig[4] != 0x75) Fail("t940: the site's fifth byte is not a short jne");
+        for (int i = 0; i < 4; ++i) if (p[123 + i] != kZoneSiteOrig[i]) Fail("t940: the stub's re-done compare is not the site's own bytes");
+        if (p[127] != 0x75) Fail("t940: the stub's branch is not a jne (the site's)");
+        unsigned long long fall = 0, jt = 0;
+        for (int i = 7; i >= 0; --i) { fall = (fall << 8) | p[135 + i]; jt = (jt << 8) | p[149 + i]; }
+        if (fall != 0x1404DB2F6ULL + 6 || jt != 0x1404DB2F6ULL + 6 + kZoneSiteOrig[5] || kZoneSiteJneTo != 6 + kZoneSiteOrig[5])
+            Fail("t940: the stub's exits are not site + 6 and the site's jne target");
+    }
+    unsigned char pt[6];
+    if (ZoneSitePatch(pt, 0x1404DB2F6ULL, 0x1404EB2F6ULL) != 1 || pt[0] != 0xE9 || pt[1] != 0xFB || pt[2] != 0xFF || pt[3] != 0x00 || pt[4] != 0x00 || pt[5] != 0x90)
+        Fail("t940: the site patch is not jmp rel32 (stub - site - 5) + nop");
+    if (ZoneSitePatch(pt, 0x1404DB2F6ULL, 0x1404DB2F6ULL - 0x100ULL) != 1 || pt[1] != 0xFB || pt[2] != 0xFE || pt[3] != 0xFF || pt[4] != 0xFF) Fail("t940: a stub below the site");
+    if (ZoneSitePatch(pt, 0x1404DB2F6ULL, 0x1404DB2F6ULL + 0x90000000ULL) != 0) Fail("t940: a stub out of rel32 reach is patched");
+}
+/* T-940: whose another player's row is - unknown (no zone, no gap) until the team table is held, so it can never refuse a teammate;
+   an unread own-town lookup never founds */
+void t_t940f1_team_wait_and_unread()
+{
+    using namespace buildnear;
+    if (ZoneRelOf(1, 0, 0) != kRelOwn || ZoneRelOf(0, 0, 1) != kRelUnknown || ZoneRelOf(0, 0, 0) != kRelUnknown || ZoneRelOf(0, 1, 1) != kRelMate || ZoneRelOf(0, 1, 0) != kRelOther)
+        Fail("t940f1: ZoneRelOf");
+    ZoneAnchor a[2];
+    a[0].owner = 2; a[0].id = 5u; a[0].x = 0.0f; a[0].z = 0.0f; a[0].rel = ZoneRelOf(0, 0, 1);   /* a teammate, table not held */
+    int w = -1;
+    float d = -1.0f;
+    if (ZoneVerdict(a, 1, 1000.0f, 0.0f, 1, &w, &d) != kZoneFree || ZoneVerdict(a, 1, 8000.0f, 0.0f, 1, &w, &d) != kZoneFree)
+        Fail("t940f1: a player's row refuses before the team table is held");
+    a[0].rel = ZoneRelOf(0, 1, 0);   /* the table held: a stranger refuses */
+    if (ZoneVerdict(a, 1, 1000.0f, 0.0f, 0, &w, &d) != kZoneRefusedGap) Fail("t940f1: a stranger's row does not refuse once the table is held");
+    /* an unknown row is no zone either: it does not let a stranger's gap through */
+    a[0].rel = kRelUnknown; a[1].owner = 4; a[1].id = 6u; a[1].x = 3000.0f; a[1].z = 0.0f; a[1].rel = kRelOther;
+    if (ZoneVerdict(a, 2, 0.0f, 0.0f, 0, &w, &d) != kZoneRefusedGap || w != 1) Fail("t940f1: an unknown row grants a zone");
+    /* a faulted or missing own-town lookup (ownNear -1) never founds, so never refuses as a founding */
+    if (ZoneFounds(1, -1) != -1) Fail("t940f1: an unread own-town lookup founds");
+    a[1].x = 9000.0f;
+    if (ZoneVerdict(a + 1, 1, 0.0f, 0.0f, ZoneFounds(1, -1), &w, &d) != kZoneFree) Fail("t940f1: an unread own-town lookup refuses as a founding");
+}
+/* T-940: what the hook does with preview+0x90 for every town kind it can hold, refused and allowed; the founding read */
+void t_t940_cursor_act()
+{
+    using namespace buildnear;
+    const int refusing[2] = { kZoneRefusedGap, kZoneRefusedFound };
+    for (int k = 0; k < 2; ++k)
+    {
+        const int v = refusing[k];
+        if (ZoneCursorAct(v, kHeldNone, 1) != kActRefuse || ZoneCursorAct(v, kHeldNone, 0) != kActNoCopy) Fail("t940: a refused spot with no town held - not refused with the copy / no-copy not said");
+        if (ZoneCursorAct(v, kHeldNpc, 1) != kActLeave || ZoneCursorAct(v, kHeldNpc, 0) != kActLeave) Fail("t940: an NPC town's refusal is touched");
+        if (ZoneCursorAct(v, kHeldOtherPlayer, 1) != kActRefuse || ZoneCursorAct(v, kHeldOtherPlayer, 0) != kActLeave) Fail("t940: another player's copy held, refused - wrong act");
+        if (ZoneCursorAct(v, kHeldOwnOrMate, 1) != kActRefuse || ZoneCursorAct(v, kHeldOwnOrMate, 0) != kActNoCopy) Fail("t940: own / teammate town held, refused - wrong act");
+        if (ZoneCursorAct(v, -1, 1) != kActLeave) Fail("t940: an unread held town is touched");
+    }
+    const int allowing[4] = { kZoneFree, kZoneOwnInside, kZoneMateInside, kZoneOwnOverGap };
+    for (int k = 0; k < 4; ++k)
+    {
+        const int v = allowing[k];
+        if (ZoneCursorAct(v, kHeldOtherPlayer, 0) != kActClear || ZoneCursorAct(v, kHeldOtherPlayer, 1) != kActClear) Fail("t940: another player's copy held where the rule allows - not cleared");
+        if (ZoneCursorAct(v, kHeldNpc, 0) != kActLeave || ZoneCursorAct(v, kHeldOwnOrMate, 0) != kActLeave || ZoneCursorAct(v, kHeldNone, 0) != kActLeave || ZoneCursorAct(v, -1, 0) != kActLeave)
+            Fail("t940: an NPC, own, teammate or no town touched where the rule allows");
+    }
+    /* founding: the creates-town record and no own outpost within 5000; unread never founds */
+    if (ZoneFounds(1, 0) != 1 || ZoneFounds(1, 1) != 0 || ZoneFounds(0, 0) != 0 || ZoneFounds(-1, 0) != -1 || ZoneFounds(1, -1) != -1) Fail("t940: ZoneFounds");
+    /* the founding test end to end: a founding piece 9000 u from a stranger's anchor is refused, a joining one is not */
+    ZoneAnchor a[1];
+    a[0].owner = 4; a[0].id = 21u; a[0].x = 0.0f; a[0].z = 0.0f; a[0].rel = kRelOther;
+    int w = -1;
+    float d = -1.0f;
+    if (ZoneCursorAct(ZoneVerdict(a, 1, 9000.0f, 0.0f, ZoneFounds(1, 0), &w, &d), kHeldNone, 1) != kActRefuse
+        || ZoneCursorAct(ZoneVerdict(a, 1, 9000.0f, 0.0f, ZoneFounds(1, 1), &w, &d), kHeldNone, 1) != kActLeave)
+        Fail("t940: founding 9000 u from a stranger's anchor - not refused, or a joining piece refused");
+}
+
+/* T-940 (run T1550): an NPC town whose ring the engine would refuse, hidden behind a player's town nearer to the spot, goes into the
+   cursor's town slot - behind a teammate's copy the T-923 stub forgot, and behind a stranger's copy the zone rule clears; the zone
+   rule's own refusal (the stranger's copy) wins over it; an NPC town already held is never asked about */
+void t_t940_npc_behind()
+{
+    using namespace buildnear;
+    /* the look-up's per-town kind: own / teammate's = a candidate meaning no NPC town, NPC = a candidate, a stranger's copy or unread = left out */
+    if (NpcBehindKind(kHeldOwnOrMate) != kNbOwn || NpcBehindKind(kHeldNpc) != kNbNpc || NpcBehindKind(kHeldOtherPlayer) != kNbSkip || NpcBehindKind(-1) != kNbSkip)
+        Fail("t940: the NPC-town look-up judges a town wrongly (own / teammate's, NPC, stranger's copy, unread)");
+    /* a teammate's copy nearest: the stub forgot it, the slot is empty, the zone rule allows; the look-up meets the teammate's copy first
+       and answers no NPC town (npcRefuses 0), so the slot is left as the engine set it */
+    const int mateAct = ZoneCursorAct(kZoneMateInside, kHeldNone, 0);
+    if (mateAct != kActLeave || ZoneNpcAsk(mateAct, kHeldNone, 1) != 1) Fail("t940: behind a teammate's forgotten copy the look-up is not asked");
+    if (ZoneCursorSlot(mateAct, kHeldNone, 1, 0) != kSlotLeave) Fail("t940: a teammate's copy nearest - the slot is touched");
+    /* a stranger's copy outside its own ring nearest (slot empty, zone rule free), an NPC ring behind it refusing: the NPC town is held */
+    if (ZoneCursorSlot(ZoneCursorAct(kZoneFree, kHeldNone, 0), kHeldNone, 1, 1) != kSlotNpc) Fail("t940: a stranger's copy nearest + an NPC ring refusing - the NPC town is not held");
+    if (ZoneNpcAsk(ZoneCursorAct(kZoneFree, kHeldNone, 0), kHeldNone, 0) != 0 || ZoneCursorSlot(kActLeave, kHeldNone, 0, 1) != kSlotLeave)
+        Fail("t940: with no player's town nearest the engine's own answer (none) is changed");
+    /* a stranger's copy the rule clears */
+    const int clearAct = ZoneCursorAct(kZoneFree, kHeldOtherPlayer, 0);
+    if (clearAct != kActClear || ZoneCursorSlot(clearAct, kHeldOtherPlayer, 0, 1) != kSlotNpc) Fail("t940: a stranger's copy cleared + an NPC ring refusing - the NPC town is not held");
+    if (ZoneCursorSlot(clearAct, kHeldOtherPlayer, 0, 0) != kSlotNone) Fail("t940: a stranger's copy cleared, no NPC ring - the slot is not emptied");
+    /* the zone rule refuses: the stranger's copy wins, the NPC town is not even asked about */
+    const int refuseAct = ZoneCursorAct(kZoneRefusedGap, kHeldNone, 1);
+    if (refuseAct != kActRefuse || ZoneNpcAsk(refuseAct, kHeldNone, 1) != 0 || ZoneCursorSlot(refuseAct, kHeldNone, 1, 1) != kSlotCopy)
+        Fail("t940: an NPC ring wins over the zone rule's refusal");
+    /* refused with no copy to show it: an NPC ring refusing still shows a refusal */
+    if (ZoneCursorSlot(ZoneCursorAct(kZoneRefusedFound, kHeldNone, 0), kHeldNone, 0, 1) != kSlotNpc) Fail("t940: no copy, an NPC ring refusing - not held");
+    /* an NPC town already held (the engine's own refusal), or an unread slot: never asked, never touched */
+    if (ZoneNpcAsk(kActLeave, kHeldNpc, 1) != 0 || ZoneCursorSlot(kActLeave, kHeldNpc, 1, 1) != kSlotLeave || ZoneCursorSlot(kActLeave, -1, 1, 1) != kSlotLeave)
+        Fail("t940: an NPC town held or an unread slot is touched");
+}
+
 const TestRow kTests[] =
 {
     { "t923_town_pick_takes_mate",                            t_t923_town_pick_takes_mate },
@@ -54583,6 +61603,7 @@ const TestRow kTests[] =
     { "help1_fold4",                                                 t_help1_fold4 },   /* help1 fold 4 */
     { "help1_fold5",                                                 t_help1_fold5 },   /* help1 fold 5 */
     { "t274_zonescan",                                               t_t274_zonescan },   /* T-274 */
+    { "t988_piececheck",                                             t_t988_piececheck },   /* T-988 */
     { "house2_task_gate",                                            t_house2_task_gate },
     { "house2_late_place",                                           t_house2_late_place },
     { "house2_owed_merge",                                           t_house2_owed_merge },
@@ -54713,6 +61734,18 @@ const TestRow kTests[] =
 
     { "hb_fold_oversized_record_admitted_into_an_empty_second",       t_hb_fold_oversized_record_admitted_into_an_empty_second },
     { "hb_fold_giant_does_not_block_the_ring",                        t_hb_fold_giant_does_not_block_the_ring },
+    { "sqev_event_marks_the_record_due",                               t_sqev_event_marks_the_record_due },
+    { "sqev_burst_of_events_is_one_send_per_window",                   t_sqev_burst_of_events_is_one_send_per_window },
+    { "sqev_non_writer_event_sends_nothing",                           t_sqev_non_writer_event_sends_nothing },
+    { "sqev_member_set_changes",                                       t_sqev_member_set_changes },
+    { "sqev_money_and_home_rules",                                     t_sqev_money_and_home_rules },
+    { "sqev_wake_window_and_note_verdict",                             t_sqev_wake_window_and_note_verdict },
+    { "sqev_ring_bounds_money_notes",                                  t_sqev_ring_bounds_money_notes },
+    { "sqev_window_closes_on_people_and_ends_after_drain",             t_sqev_window_closes_on_people_and_ends_after_drain },
+    { "sqev_ring_reserves_before_it_fills",                            t_sqev_ring_reserves_before_it_fills },
+    { "sqev_off_thread_event_is_queued_not_applied",                   t_sqev_off_thread_event_is_queued_not_applied },
+    { "sqev_marked_groups_go_ahead_of_owed_ones",                      t_sqev_marked_groups_go_ahead_of_owed_ones },
+    { "sqev_restock_names_the_squad_or_its_active_part",               t_sqev_restock_names_the_squad_or_its_active_part },
     { "tickwait_ensuredir_every_folder_level",                         t_tickwait_dir_levels },
 
     { "inv7d_owner_arrive_edge_wait_timeout_apply",                   t_inv7d_owner_arrive },
@@ -55050,6 +62083,9 @@ const TestRow kTests[] =
     { "t985s2b_server_sends_area_done",                              t_t985s2b_server_sends_area_done },
     { "t985s2b_protocols",                                           t_t985s2b_protocols },
     { "t346_wire_roundtrip",                                         t_t346_wire_roundtrip },
+    { "preload_aoi_wire",                                            t_preload_aoi_wire },
+    { "preload_aoi_ring",                                            t_preload_aoi_ring },
+    { "preload_aoi_choose",                                          t_preload_aoi_choose },
     { "t346_want_rule",                                              t_t346_want_rule },
     { "t346_index_walk_pages",                                       t_t346_index_walk_pages },
     { "t346_flow_fetches_exactly_the_newer",                         t_t346_flow_fetches_exactly_the_newer },
@@ -55151,6 +62187,27 @@ const TestRow kTests[] =
     { "p105b3_split_drop_road",                                      t_p105b3_split_drop_road },
     { "p105b3_scenario_split_give",                                  t_p105b3_scenario_split_give },
     { "p105b3_merged_give_split",                                    t_p105b3_merged_give_split },
+    { "t1079_units_moved",                                            t_t1079_units_moved },
+    { "t1079_applies",                                                t_t1079_applies },
+    { "t1079_give_whole_stack",                                       t_t1079_give_whole_stack },
+    { "t1079_give_part_stack",                                        t_t1079_give_part_stack },
+    { "t1079_give_onto_stack",                                        t_t1079_give_onto_stack },
+    { "t1079_give_spread",                                            t_t1079_give_spread },
+    { "t1079_take_whole_stack",                                       t_t1079_take_whole_stack },
+    { "t1079_take_part_and_onto",                                     t_t1079_take_part_and_onto },
+    { "t1079_take_merged_last_unit",                                  t_t1079_take_merged_last_unit },
+    { "t1079_take_merged_shift_click",                                t_t1079_take_merged_shift_click },
+    { "t1079_give_merged_source_stays",                               t_t1079_give_merged_source_stays },
+    { "t1079_mismatch_back",                                          t_t1079_mismatch_back },
+    { "t1079_not_this_road",                                          t_t1079_not_this_road },
+    { "t1079_back_conservation",                                      t_t1079_back_conservation },
+    { "t1079_guards",                                                 t_t1079_guards },
+    { "t1079_net_split_take",                                         t_t1079_net_split_take },
+    { "t1079_net_merge_give",                                         t_t1079_net_merge_give },
+    { "t1079_net_not_paired",                                         t_t1079_net_not_paired },
+    { "t1079_net_refusal_units",                                      t_t1079_net_refusal_units },
+    { "t1079_net_grouping",                                           t_t1079_net_grouping },
+    { "t1079_net_job_role",                                           t_t1079_net_job_role },
     { "p105g_rest_and_shortfall",                                    t_p105g_rest_and_shortfall },
     { "a1b1_world_first_route",                                      t_a1b1_world_first_route },   /* M7a A1 build 1 [a1b1-t1] */
     { "a1b1_roster_hash",                                            t_a1b1_roster_hash },
@@ -55586,6 +62643,7 @@ const TestRow kTests[] =
     , { "t799_holder_restock", t_t799_holder_restock }
     , { "t799_money_list", t_t799_money_list }
     , { "t802_moved_after_save", t_t802_moved_after_save }
+    , { "t1062_settle_per_person", t_t1062_settle_per_person }
     , { "t802_real_squad_files", t_t802_real_squad_files }
     , { "t802_fold2_strip_rules", t_t802_fold2_strip_rules }
     , { "t802_strip_last_member", t_t802_strip_last_member }
@@ -55632,6 +62690,18 @@ const TestRow kTests[] =
     , { "t1045_piece_record", t_t1045_piece_record }
     , { "t1045f1_piece_fold", t_t1045f1_piece_fold }
     , { "t1045f2_piece_answers", t_t1045f2_piece_answers }
+    , { "t1045b_piece_apply", t_t1045b_piece_apply }
+    , { "t1045b2_piece_rules", t_t1045b2_piece_rules }
+    , { "t1045b3_piece_seen", t_t1045b3_piece_seen }
+    , { "t1047_piece_live", t_t1047_piece_live }   /* record format 2: the LIVE part round trip, malformed refused, the band rule, the writer and apply choices */
+    , { "t1047e_player_box", t_t1047e_player_box }   /* T-1047 step 4: a player's box live on every game - the height id, the old id's read, the live choice, the dismantle removal */
+    , { "t1047d_doors", t_t1047d_doors }   /* T-1047 step 3: a player-built door's values in its piece's record, HIT's door and repair words, the route, the band rule, the lock pick */
+    , { "t1047d_doors_edges", t_t1047d_doors_edges }   /* a player-built door's record: the band rule's edges, the door tolerance, the copy and put clamps, the repair ask spacing, the broken door's keep rule */
+    , { "t1047c_live_bar", t_t1047c_live_bar }   /* T-1047 step 2b: the bar and work state in the LIVE part, its bands, the runner rule, MINE_STATE's skip and drop */
+    , { "t1047b_live_misses", t_t1047b_live_misses }   /* a hit's state in flight, a dropped or given-up LIVE apply not landed, the fault cap */
+    , { "t1045b4_piece_seen_area", t_t1045b4_piece_seen_area }
+    , { "t1045b5_piece_seen_load", t_t1045b5_piece_seen_load }
+    , { "t1045b6_piece_own_make", t_t1045b6_piece_own_make }
     , { "t1045f3_writer_gate", t_t1045f3_writer_gate }   /* fold 3 (T1506) */
     , { "t1045f4_writer_events", t_t1045f4_writer_events }   /* fold 4 (review) */
     , { "t1045f5_refused_inputs", t_t1045f5_refused_inputs }   /* fold 5 (re-check) */
@@ -55695,6 +62765,13 @@ const TestRow kTests[] =
     , { "t999_fold1", t_t999_fold1 }   /* T-999 fold 1: the flag a keep question uses, the flag published, the index reader's field 16 */
     , { "t999_fold2", t_t999_fold2 }   /* T-999 fold 2: a squad not read is kept, its discard; the world server's held discard deletes */
     , { "t999_fold3", t_t999_fold3 }   /* T-999 fold 3: a squad emptied by its area unload keeps its discard mark and its discard delete */
+    , { "t1080_purge_emptied_destroy", t_t1080_purge_emptied_destroy }   /* T-1080: a purge-emptied squad's destroy keeps its record; a wipe-out is deleted */
+    , { "t1080_fold1", t_t1080_fold1 }   /* T-1080 fold 1: bodies do not count, a failed read marks, the discard delete keeps its rule */
+    , { "t1080_fold3", t_t1080_fold3 }   /* T-1080 fold 3: a marked squad keeps its record, an unmarked emptied one still deletes; the wiring */
+    , { "t1080_fold4", t_t1080_fold4 }   /* T-1080 fold 4: a squad made from its record keeps it until a living member stands here; a real death deletes */
+    , { "t1084_step3", t_t1084_step3 }   /* T-1084 step 3 build 1: the area-recorded mark (R5), the unrecorded-wake refusal (R6), the authority's arm */
+    , { "t1084_copy_gate", t_t1084_copy_gate }   /* T-1084 step 1: no sleeping copy outside the areas this game runs, but for the authority */
+    , { "t1080_fold5", t_t1080_fold5 }   /* T-1080 fold 5: a made-empty squad keeps its record and is not placed again in this world */
     , { "t924f_town_move_decide", t_t924f_town_move_decide }   /* T-924 fault 2: the copy move's decision */
     , { "t924f_fold1_refound_offmap_height", t_t924f_fold1_refound_offmap_height }   /* T-924 fold 1: a far copy re-founded; off map; no ground */
     , { "t924f_fold2_refound_limits", t_t924f_fold2_refound_limits }   /* T-924 fold 2: refounds refused off the map and as repeats; the wait limit; a ground not a number */
@@ -55712,11 +62789,22 @@ const TestRow kTests[] =
     , { "t985c1f1_reset_kept_mirror", t_t985c1f1_reset_kept_mirror }
     , { "t985c1f1_server_behind", t_t985c1f1_server_behind }   /* T-985 C1 fold 1, finding 3 */
     , { "t985c1f2_snapshot_whole", t_t985c1f2_snapshot_whole }
+    , { "t985c2bf6_feed_complete", t_t985c2bf6_feed_complete }   /* T-985 C2b fold 6: the world server judges the snapshot whole (PAGE_END complete) */
     , { "t985c1f2_seq_judge", t_t985c1f2_seq_judge }
     , { "t985c1f2_list_unclashed", t_t985c1f2_list_unclashed }
     , { "t985c1f2_kept_beside", t_t985c1f2_kept_beside }
     , { "t985c1f3_refuse_named", t_t985c1f3_refuse_named }
+    , { "t985_area_file_round_trip", t_t985_area_file_round_trip }   /* T-985: this game's area file */
+    , { "t985_area_file_refused", t_t985_area_file_refused }
+    , { "t985_area_file_missing", t_t985_area_file_missing }
     , { "t1018_setup_restock", t_t1018_setup_restock }   /* T-1018: a forced restock over the world server's stock */
+    , { "t772_shop_record", t_t772_shop_record }   /* a shop record: id, bytes, refusals on read, the world server's rule, keeping by generation */
+    , { "t772_shop_gate", t_t772_shop_gate }   /* the restock gate: holder, known, due, forced only without a record, held while a player is inside */
+    , { "t772c_holder_cancel", t_t772c_holder_cancel }   /* a home shop trade's cancel at the area's holder: each answer's ending, settle-only, the marker, the rebase's money, the wire */
+    , { "t772c_durable_undo", t_t772c_durable_undo }   /* the undone mark waits for the counters' stored records; a lost change applied again once; a counter that never records ends the cancel */
+    , { "t772c_goods_undo", t_t772c_goods_undo }   /* an owed undo's goods in box records: the undo list, an older save, the mark's money, a gone claimer re-claimed, the owed cap */
+    , { "t772_shop_money", t_t772_shop_money }   /* trades through the record: a resend once, two askers kept, the runner's pot with requests in flight, no record = today */
+    , { "t772_shop_after_run", t_t772_shop_after_run }   /* a refill writes once per building refill; money with a change count; the repair once per refill */
     , { "t1018_keeper_unknown_money", t_t1018_keeper_unknown_money }   /* T-1018: a keeper's unknown money over that stock */
     , { "t922_template_sid_sender", t_t922_template_sid_sender }   /* T-922: the stringID a SPAWN carries */
     , { "t922_template_lookup_order", t_t922_template_lookup_order }   /* T-922: id first, then the shown name */
@@ -55729,6 +62817,42 @@ const TestRow kTests[] =
     , { "t752_squad_held_by_member", t_t752_squad_held_by_member }   /* T-752: a squad is held by its spot or any member's own spot */
     , { "t752_member_rows", t_t752_member_rows }   /* T-752: dead members do not count; a squad above the reader's cap answers per member */
     , { "t948b_squad_split_decide", t_t948b_squad_split_decide }   /* T-948 b: a squad of copies is not split; a copy is not moved to a new squad */
+    , { "t948d_caged_duplicate", t_t948d_caged_duplicate }   /* T-948 d: a caged duplicate leaves its cage and is removed; a caged non-duplicate never */
+    , { "t948d_save_split_squad", t_t948d_save_split_squad }   /* T-948 d: the save-split squad's removal rule, every refusal */
+    , { "t1076_ring1_party", t_t1076_ring1_party }   /* T-1076: ring 1 from any player character of this game; the lower slot grants */
+    , { "t1076_mid_load_defer", t_t1076_mid_load_defer }   /* T-1076: mid-load set aside as loading, loaded judged as before */
+    , { "t1077_area_assign_list", t_t1077_area_assign_list }   /* a slot's second player-character area wins the assignment beside it */
+    , { "t1077_player_sector_wire", t_t1077_player_sector_wire }   /* AREAS' player-sector list: round trip, m = 0, over the cap refused */
+    , { "t1077_player_sector_list", t_t1077_player_sector_list }   /* the list a game sends: followed first, each party once, capped */
+    , { "t1077_receipt_and_roster_near", t_t1077_receipt_and_roster_near }   /* a slot expected once; "near any own row" */
+    , { "t1077_onareas_rows", t_t1077_onareas_rows }   /* the world server's per-slot rows: m = 0 erases, a list replaces whole, malformed changes nothing */
+    , { "t1077_party_halo_list", t_t1077_party_halo_list }   /* this game's own party halo is the capped list it sends */
+    , { "t1047f_outpost_id_mint", t_t1047f_outpost_id_mint }   /* T-1047 step 5: the world server's outpost id - centre, key, carried, new */
+    , { "t1047f_towns_file_ids", t_t1047f_towns_file_ids }   /* the id in both files (format 4); older files read and given ids */
+    , { "t1047f_record_link", t_t1047f_record_link }   /* the LIVE part's outpost link (bit 5): round trip, refused by an older peer; protocol 121 */
+    , { "t1047f_link_apply_order", t_t1047f_link_apply_order }   /* the writer's link, the apply step, the link before the LIVE power */
+    , { "t1047f_hidden_rule", t_t1047f_hidden_rule }   /* every player's outposts to every game; another player's copy hidden until discovered */
+    , { "t1047f1_id_never_reused", t_t1047f1_id_never_reused }   /* fold 1: the next id kept in player-towns.txt - a removed top id never minted again after a restart */
+    , { "t1047f1_link_owner_checked", t_t1047f1_link_owner_checked }   /* fold 1: a record's link into another player's outpost (not the owner's, not a teammate's) refused */
+    , { "t1047f1_own_piece_team_only", t_t1047f1_own_piece_team_only }   /* fold 1: an own piece's write never names a non-teammate's outpost; such a link is moved */
+    , { "t1047f1_discovery_per_save", t_t1047f1_discovery_per_save }   /* fold 1: a discovery noted at the take-out survives the save and the re-found; an ex-teammate's stays */
+    , { "t1047f1_relink_power_event", t_t1047f1_relink_power_event }   /* fold 1: the relink's power cycle as an event - no time window */
+    , { "t1047f1_link_mark_again", t_t1047f1_link_mark_again }   /* fold 1: a refused or lost link write is marked again */
+    , { "t1047f2_own_waits_for_team", t_t1047f2_own_waits_for_team }   /* fold 2: no own-piece check or move until the team list is held, then once */
+    , { "t1047f2_own_check_events_only", t_t1047f2_own_check_events_only }   /* fold 2: the own-piece check on its three events, never a sweep */
+    , { "t1047f2_failed_copy_once", t_t1047f2_failed_copy_once }   /* fold 2: a failed link copy reports its cycle and waits for an event */
+    , { "t1047f3_town_event", t_t1047f3_town_event }   /* fold 3: a town founded, taken up or moved owes the own pieces around it a check */
+    , { "t1047f3_gate_and_tick", t_t1047f3_gate_and_tick }   /* fold 3: the team-held gate of each step; the tick checks an event at once */
+    , { "t1047f3_load_and_save_wiring", t_t1047f3_load_and_save_wiring }   /* fold 3: the load-end order; each save its own discovered set */
+    , { "t1047g_handover", t_t1047g_handover }   /* the box hand-over: the writer's journal, BOX_TAKEN, every journalled ask's ending, the flush retired */
+    , { "t1047f2_failed_load_disarmed", t_t1047f2_failed_load_disarmed }   /* fold 2: a failed load's discovered set disarmed; each save its own set */
+    , { "t940_anchor_fixed", t_t940_anchor_fixed }   /* T-940: an outpost's fixed anchor - its founding spot, kept through drift, a reset and the file; older files */
+    , { "t940_show_anchor", t_t940_show_anchor }   /* T-940: SHOW carries each outpost's anchor (world-server protocol 119) */
+    , { "t940_zone_verdict", t_t940_zone_verdict }   /* T-940: 7000 u gap refusal, own / teammate zone wins, founding 12000 u apart, NPC towns untouched */
+    , { "t940_cursor_stub", t_t940_cursor_stub }   /* T-940: the cursor zone stub's golden bytes, the site patch, rsp aligned at the call */
+    , { "t940_npc_behind", t_t940_npc_behind }   /* run T1550: an NPC town hidden behind a player's town still refuses; the zone rule's refusal wins */
+    , { "t940_cursor_act", t_t940_cursor_act }   /* T-940: refuse / clear / leave for each town +0x90 can hold; the founding read */
+    , { "t940f1_team_wait_and_unread", t_t940f1_team_wait_and_unread }   /* no player row refuses before the team table; an unread own-town lookup never founds */
 };
 
 }   /* anonymous namespace */
@@ -55742,11 +62866,13 @@ int main()
     {
         g_name = kTests[i].name;
         g_thisFailed = 0;
+        g_thisSkipped = 0;
         ++g_tests;
         kTests[i].fn();
         if (g_thisFailed) ++g_failed;
+        else if (g_thisSkipped) ++g_skipped;
         else std::printf("ok %s\n", g_name);
     }
-    std::printf("%d tests, %d failed\n", g_tests, g_failed);
+    std::printf("%d tests, %d failed, %d skipped\n", g_tests, g_failed, g_skipped);
     return g_failed ? 1 : 0;
 }

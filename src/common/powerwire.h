@@ -28,7 +28,7 @@
 
 namespace powerwire {
 
-const unsigned char kPowerState = 16;
+const unsigned char kPowerState = 16;        /* pieces no player owns: a player's power piece rides its piece record (piecerec.h format 2) */
 const unsigned char kPowerAsk = 17;
 const unsigned char kAskSwitch = 1;          /* POWER_ASK's what: the only one there is */
 const unsigned char kFlagOn = 1, kFlagGets = 2;

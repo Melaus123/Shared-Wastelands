@@ -6966,6 +6966,27 @@ bool PeerPlayerPosition(float* x, float* y, float* z, double* ageSec)
     if (ageSec != 0) *ageSec = now - best->lastMoveAt;
     return true;
 }
+/* see replicate.h: every party of the other players, not only the freshest copy - the no-relay ring-1 yield asks "beside any of
+   them". The cap counts distinct areas, so many copies standing in one area cannot push another party's area out of the list. */
+int PeerPlayerSectors(int* xs, int* ys, int cap, double maxAgeSec)
+{
+    if (xs == 0 || ys == 0 || cap <= 0) return 0;
+    const double now = NowSeconds();
+    int n = 0;
+    for (std::map<unsigned int, Puppet>::const_iterator it = g_puppets.begin(); it != g_puppets.end() && n < cap; ++it)
+    {
+        const Puppet& p = it->second;
+        if (!PlausibleObj(p.ch) || IsRetiredObject(p.ch)) continue;
+        if (PeerFactionPod(p.ch) != 1) continue;
+        const double age = now - p.lastMoveAt;
+        if (age < 0.0 || age > maxAgeSec) continue;
+        const Sector q = SectorOf(p.tx, p.tz);
+        int have = 0;
+        for (int k = 0; k < n; ++k) if (xs[k] == q.x && ys[k] == q.y) { have = 1; break; }
+        if (have == 0) { xs[n] = q.x; ys[n] = q.y; ++n; }
+    }
+    return n;
+}
 
 /* P25 interior keep (owner 296 a / 315 a; scratchpad p25-interior-design.md option a). Every frame the engine's interior loader
    (1.0.65 0x7F6690 / 1.0.68 0x7F7230) walks PlayerInterface+0x2B0 - this game's player-faction characters in active squads - and
@@ -7102,10 +7123,10 @@ static void IkOwnerSay(unsigned int uid, ::Character* c, double now)
     const bool ever = (f != g_ikSaid.end());
     if (!p25inside::InsideSendDue(ever, ever ? f->second.inside : 0, ever ? f->second.key : "", inside, key, ever ? f->second.at : 0.0, now)) return;
     const bool changed = !ever || f->second.inside != inside || std::strcmp(f->second.key, key) != 0;
-    if (!net::SendInside(uid, inside, key)) { ++g_ikSaySendFailed; return; }
-    ++g_ikSaySent;
-    IkSaid& r = g_ikSaid[uid];
+    IkSaid& r = g_ikSaid[uid];   /* kept before the send: this game's own reading of who is inside (a shop's refill hold) needs no peer */
     r.inside = inside; std::memcpy(r.key, key, std::strlen(key) + 1); r.at = now;
+    if (!net::SendInside(uid, inside, key)) { ++g_ikSaySendFailed; return; }   /* sent again at the next refresh */
+    ++g_ikSaySent;
     if (changed)
         IkLog("[P25] interior told the other games: own uid=" + N2((long long)uid)
               + (inside ? (key[0] != 0 ? " is INSIDE building key=" + std::string(key) : std::string(" is inside a building whose key this game could not build (keyFail)"))
@@ -7120,6 +7141,21 @@ struct IkMiss { char key[p25inside::kInsideKeyMax + 1]; double at; };
 static std::map<unsigned int, IkMiss> g_ikMiss;
 static double g_ikLastPass = -1.0;
 long long g_ikMissBackoffSkips = 0;
+/* Every player character's building as its owner last said it: this game's own characters' words as sent (IkOwnerSay) and the
+   other games' words as received, fresh ones only (p25inside::InsideVerdict kSaidIn; a word with no key is not one). The shop restock
+   holds a due refill while one of them is inside the shop building. MAIN THREAD. The count appended. */
+int PlayersInsideKeys(std::vector<std::string>* keys)
+{
+    const double now = NowSeconds();
+    int n = 0;
+    for (std::map<unsigned int, IkSaid>::const_iterator it = g_ikSaid.begin(); it != g_ikSaid.end(); ++it)
+        if (p25inside::InsideVerdict(it->second.inside, std::strlen(it->second.key), it->second.at, now) == p25inside::kSaidIn)
+        { keys->push_back(std::string(it->second.key)); ++n; }
+    for (std::map<unsigned int, Puppet>::const_iterator it = g_puppets.begin(); it != g_puppets.end(); ++it)
+        if (p25inside::InsideVerdict(it->second.insideSaid, std::strlen(it->second.insideKey), it->second.insideAt, now) == p25inside::kSaidIn)
+        { keys->push_back(std::string(it->second.insideKey)); ++n; }
+    return n;
+}
 void InteriorKeepTick()
 {
     if (g_ikOff || kIkKeepRva == 0 || !AddrOk()) return;

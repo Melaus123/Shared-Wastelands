@@ -163,6 +163,20 @@ inline int ReceiptExpected(int slotInWorld, int playerSectorKnown, int cheb, int
     return (slotInWorld == 1 && playerSectorKnown && cheb >= 0 && cheb <= radius) ? 1 : 0;
 }
 inline int Cheb(int ax, int ay, int bx, int by) { const int dx = ax > bx ? ax - bx : bx - ax, dy = ay > by ? ay - by : by - ay; return dx > dy ? dx : dy; }
+/* the player-sector table carries a row per player-character area, so one slot can have several rows: `slot` is added to *out only
+   when it is not there yet. 1 = added. */
+inline int SlotAddOnce(std::vector<int>* out, int slot)
+{
+    for (size_t i = 0; i < out->size(); ++i) if ((*out)[i] == slot) return 0;
+    out->push_back(slot);
+    return 1;
+}
+/* is area (ax, ay) within `within` areas (Chebyshev) of ANY of the n areas (xs[i], ys[i]) - this game's own player-character rows */
+inline int NearAnyArea(const int* xs, const int* ys, int n, int ax, int ay, int within)
+{
+    for (int i = 0; i < n; ++i) if (Cheb(xs[i], ys[i], ax, ay) <= within) return 1;
+    return 0;
+}
 inline double ReceiptBackoffSec(int sends) { return sends <= 1 ? 2.0 : (sends == 2 ? 4.0 : 8.0); }
 enum { kRcWait = 0, kRcResend = 1, kRcDoneAcked = 2, kRcDoneRoster = 3, kRcDoneGone = 4, kRcGiveUp = 5 };
 /* per (row, slot). sinceLast: seconds since the last send to that slot; roadUpSec: road-up seconds since the first send. */

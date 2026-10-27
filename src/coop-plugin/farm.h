@@ -33,6 +33,14 @@ void MineWorkedNote(void* pb);
 // ANY THREAD, crash-guarded, read-only: a production building's bar *(+0x448) and state +0x468. 1 both read, 2 the state
 // only (no output record), 0 unreadable.
 int  MineBarReadPod(void* b, float* progress, int* state);
+// T-1047 step 2b, ANY THREAD: 1 = a worker's step ran here on the production building at this P7n key within the last
+// coopfarm::kMineStateWorkedMs (MINE_STATE's worked window, the table MineWorkedNote marks) - its piece record's bar bands are fine then
+int  MineWorkedRecently(const char* key);
+// T-1047 step 2b, MAIN THREAD (defined in build.cpp's power section): a player's power piece's bar and work state ride its piece record.
+// PwMineStateSkip: 1 = no MINE_STATE is sent for b (its record carries them from this game). PwMineStateDrop: 1 = a received MINE_STATE
+// for b is dropped (the POWER_STATE receiver's rule, PwStateDrop: its record's values are still to land here).
+int  PwMineStateSkip(void* b, const char* key);
+int  PwMineStateDrop(void* b, const std::string& key);
 int  FarmKeptLay(void* b, float growth, float death, float start, int harvested, int* plants);   // KEPT, K2: a kept farm onto the live one
 int  FarmKeptRead(void* b, float* growth, float* death, float* start, int* harvested, int* plants);   // KEPT / bldstate: read-only
 }

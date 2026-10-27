@@ -86,6 +86,72 @@ std::string Trim(const std::string& s)
     return s.substr(b, e - b + 1);
 }
 
+/* TEST-ONLY `boxburst <box key or part> <seconds 5-600> <step> [<step> ...]` (1 to 6 steps), MAIN THREAD: in this one call - one frame,
+   so no box write cycle runs between them - each step on that one loaded box in order, then this game's world-server link cut exactly as
+   `worldaway <seconds>` cuts it. A step: `take:<section>:<x>:<y>[:<qty>]` - the item at that cell of the box into this game's own
+   character, as `itemtake box:<key> <section> <x> <y> [qty]` (no qty: the whole stack); `add:<base sid>[:<count>]` - that item made and
+   put into the box, as `boxtest <key> <sid> [count]`. Every step is read and the cut checked before anything runs (a bad step or a cut
+   that would be refused runs nothing). One [BOXBURST] line per step and one for the cut. */
+int BurstNum(const std::string& t, int* v)
+{
+    if (t.empty() || t.size() > 6) return 0;
+    int n = 0;
+    for (size_t i = 0; i < t.size(); ++i) { if (t[i] < '0' || t[i] > '9') return 0; n = n * 10 + (t[i] - '0'); }
+    *v = n;
+    return 1;
+}
+std::string BoxBurstLever(const std::string& args)
+{
+    const char* const usage = "error boxburst usage: boxburst <box key or part> <seconds 5-600> <take:<section>:<x>:<y>[:<qty>] | add:<sid>[:<count>]> (1 to 6 steps)";
+    std::istringstream is(args);
+    std::string key, secText, t;
+    std::vector<std::string> steps;
+    int sec = 0;
+    if (!(is >> key >> secText) || BurstNum(secText, &sec) == 0) return usage;
+    while (is >> t) steps.push_back(t);
+    if (steps.empty() || steps.size() > 6) return usage;
+    std::vector<int> take(steps.size(), 0), n1(steps.size(), 0), n2(steps.size(), 0), n3(steps.size(), 0);
+    std::vector<std::string> what(steps.size());
+    for (size_t i = 0; i < steps.size(); ++i)
+    {
+        std::vector<std::string> f;
+        {
+            std::string rest = steps[i];
+            std::string::size_type p;
+            while ((p = rest.find(':')) != std::string::npos) { f.push_back(rest.substr(0, p)); rest.erase(0, p + 1); }
+            f.push_back(rest);
+        }
+        int ok = 0;
+        if (f[0] == "take" && (f.size() == 4 || f.size() == 5) && !f[1].empty() && BurstNum(f[2], &n1[i]) != 0 && BurstNum(f[3], &n2[i]) != 0
+            && (f.size() == 4 || BurstNum(f[4], &n3[i]) != 0))
+        { take[i] = 1; what[i] = f[1]; ok = 1; }
+        else if (f[0] == "add" && (f.size() == 2 || f.size() == 3) && !f[1].empty() && (f.size() == 2 || BurstNum(f[2], &n1[i]) != 0))
+        { what[i] = f[1]; if (f.size() == 2) n1[i] = 1; ok = (n1[i] >= 1) ? 1 : 0; }
+        if (ok == 0) return std::string(usage) + " - step " + steps[i] + " does not read";
+    }
+    const std::string refused = coop::StoreWorldAwayRefusal((long long)sec);
+    if (!refused.empty()) return "error boxburst: nothing done - the cut would be refused (" + refused + ")";
+    int done = 0;
+    for (size_t i = 0; i < steps.size(); ++i)
+    {
+        const bool ok = (take[i] != 0) ? coop::ItemTake("box:" + key, what[i], n1[i], n2[i], n3[i]) : coop::BoxTest(key, what[i], n1[i]);
+        if (ok) ++done;
+        std::ostringstream ln;
+        ln << "[BOXBURST] step " << (i + 1) << "/" << steps.size() << " " << steps[i] << " on box '" << key << "': " << (ok ? "ok" : "error")
+           << " (TEST-ONLY; the same frame as the cut)";
+        DebugLog(ln.str());
+    }
+    std::ostringstream secArg;
+    secArg << sec;
+    const std::string cut = coop::StoreWorldAwayLever(secArg.str());
+    std::ostringstream ln;
+    ln << "[BOXBURST] cut: " << cut << " - in the same frame as the " << steps.size() << " steps (" << done << " ok; TEST-ONLY)";
+    DebugLog(ln.str());
+    std::ostringstream st;
+    st << ((done == (int)steps.size() && cut.compare(0, 3, "ok ") == 0) ? "ok" : "error") << " boxburst steps=" << done << "/" << steps.size() << " cut=" << cut;
+    return st.str();
+}
+
 /* A command line as the log shows it. hostpw and joinpw carry a password, so for them the verb alone is shown, then <hidden>; so does
    `uitype <field> <text>` into a password box (coopui::UiDriveTypedHidden), shown as `uitype <field> <hidden>` (a nonce before the bar
    stays: it names the write, not the password). Every other line is shown whole. */
@@ -919,6 +985,25 @@ void CommandChannelTick()
         }
         finished = true;
     }
+    // T-772 T1544 (TEST-ONLY). `areaquiet <x>,<y> on|off` - while on, this game leaves that one area out of its AREAS report
+    // (zones.cpp ZonesTick) and changes nothing else: the area stays loaded here and the people this game runs there stay its
+    // own, so once this game has been silent on it past the world server's grace, another game that reports the area becomes
+    // its holder - the split town (a keeper run by the game that does not hold its area) on demand. `off` reports it again; it
+    // does not take the area back (a held area moves only when its holder goes silent). Validated strictly, as every on|off here.
+    else if (verb == "areaquiet")
+    {
+        std::string at, mode; is >> at >> mode;
+        const size_t comma = at.find(',');
+        const bool atOk = comma != std::string::npos && comma > 0 && comma + 1 < at.size() && at.find(',', comma + 1) == std::string::npos
+                          && at.find_first_not_of("0123456789,") == std::string::npos;
+        if (!atOk || (mode != "on" && mode != "off"))
+        {
+            ErrorLog("[cmd] areaquiet: expected '<x>,<y> on|off', got '" + at + " " + mode + "' - REFUSED, nothing changed");
+            WriteStatus("error areaquiet needs <x>,<y> on|off");
+        }
+        else WriteStatus(ZonesAreaQuietCommand(std::atoi(at.substr(0, comma).c_str()), std::atoi(at.substr(comma + 1).c_str()), mode == "on" ? 1 : 0));
+        finished = true;
+    }
     // F305. `drivespeed <n>` - the MAGNITUDE of a puppet drive. -2 IS THE DEFAULT since AUD 2026-09-17:
     // each puppet is driven at the authority's own STREAMED desiredSpeed (-3 = its streamed velocity).
     // `drivespeed 0` is the control - it leaves the engine's own `desiredSpeed` alone; -1 = each puppet
@@ -1128,6 +1213,13 @@ void CommandChannelTick()
     {
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::StoreWorldAwayLever(Trim(rest)));
+        finished = true;
+    }
+    else if (verb == "boxburst")   /* TEST-ONLY: boxburst <box key or part> <seconds 5-600> <step> [<step> ...] - box steps on one box, then the
+                                      worldaway cut, all in one frame ([BOXBURST] lines; BoxBurstLever) */
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(BoxBurstLever(Trim(rest)));
         finished = true;
     }
     else if (verb == "leave")
@@ -1603,6 +1695,9 @@ void CommandChannelTick()
         /* give1: `itemtest confirmdelay <0..30>` - TEST-ONLY (T396): this game, as the OWNER of a request, holds each outgoing
            ITEM_CONFIRM that many seconds before sending it (0 = off, the default), so a run can show a late answer to a give. */
         const bool cfDelay = (rest.compare(0, 12, "confirmdelay") == 0 && (rest.size() == 12 || rest[12] == ' '));
+        /* `itemtest shoplapse <0..30>` - TEST-ONLY: as the ASKER, the next home-shop trade still unanswered that many seconds after its
+           send is settled here as a refusal (no settle-only ask, no record mark), so the holder's held ok arrives late (0 = off). */
+        const bool shopLapse = (rest.compare(0, 9, "shoplapse") == 0 && (rest.size() == 9 || rest[9] == ' '));
         /* T-1 B4-1: `itemtest refusenext [n] [reason]` - TEST-ONLY: as the HOLDER, refuse the next n priced shop requests. */
         const bool refuseNext = (rest.compare(0, 10, "refusenext") == 0 && (rest.size() == 10 || rest[10] == ' '));
         /* T-164 B4-2: `itemtest refusehere <gate> [n]` - TEST-ONLY: as the REQUESTER, take that refusal exit after the put-back. */
@@ -1625,6 +1720,11 @@ void CommandChannelTick()
         const bool ownDrift = (rest.compare(0, 5, "drift") == 0 && (rest.size() == 5 || rest[5] == ' '));
         /* T-608 (c): `itemtest ownerfull on|off` - TEST-ONLY: as the OWNER, read the owner table as full (every character and box take / give refused busy). */
         const bool ownerFull = (rest.compare(0, 9, "ownerfull") == 0 && (rest.size() == 9 || rest[9] == ' '));
+        /* T-1079: `itemtest rcgive <boxKeyPart|peer> <sid|any> [all] [take]` - TEST-ONLY: a give / take without the cursor, through the engine's right-click;
+           `itemtest rcgive <boxKeyPart> <sid|any> [<n>|all] [take] click` - the box opened by a real click order, the calls made as the shift-click loop makes them. */
+        const bool rcGive = (rest.compare(0, 6, "rcgive") == 0 && (rest.size() == 6 || rest[6] == ' '));
+        /* T-1079: `itemtest stackgive <boxKeyPart> <sid> <n>` - TEST-ONLY: n units off our character onto the box's stack of that record, no window. */
+        const bool stackGive = (rest.compare(0, 9, "stackgive") == 0 && (rest.size() == 9 || rest[9] == ' '));
         std::vector<std::string> tok; std::string t;
         {
             std::istringstream ts(rest);
@@ -1652,6 +1752,7 @@ void CommandChannelTick()
         else if (refuseHere) WriteStatus(coop::ItemTestRefuseHereCommand(Trim(rest.substr(10))));
         else if (packItem) WriteStatus(coop::ItemTestPackItemCommand(Trim(rest.substr(8))));
         else if (cfDelay) WriteStatus(coop::ItemTestConfirmDelayCommand(Trim(rest.substr(12))));
+        else if (shopLapse) WriteStatus(coop::ItemTestShopLapseCommand(Trim(rest.substr(9))));
         else if (takeOne) WriteStatus(coop::ItemTestTakeOneCommand(Trim(rest.substr(7))));
         else if (ownSteal) WriteStatus(coop::ItemTestStealCommand(Trim(rest.substr(5))));
         else if (ownStolen) WriteStatus(coop::ItemTestStolenCommand(Trim(rest.substr(6))));
@@ -1660,6 +1761,8 @@ void CommandChannelTick()
         else if (ownSet) WriteStatus(coop::ItemTestSetCommand(Trim(rest.substr(3))));
         else if (ownDrift) WriteStatus(coop::ItemTestDriftCommand(Trim(rest.substr(5))));   /* T-172 disp */
         else if (ownerFull) WriteStatus(coop::ItemTestOwnerFullCommand(Trim(rest.substr(9))));   /* T-608 (c) */
+        else if (rcGive) WriteStatus(coop::ItemTestRcGiveCommand(Trim(rest.substr(6))));   /* T-1079 */
+        else if (stackGive) WriteStatus(coop::ItemTestStackGiveCommand(Trim(rest.substr(9))));   /* T-1079 */
         else WriteStatus(coop::ItemTest(nm, sid, cnt) ? "ok itemtest" : "error itemtest");
         finished = true;
     }
@@ -1841,6 +1944,8 @@ void CommandChannelTick()
     }
     else if (verb == "itemtake")
     {
+        // itemtake box:<boxKey> <section> <x> <y> [qty]   - the same, out of that loaded storage box: on a game that does not
+        // write the box (another player's box) the take is shown at once and asked of the writer, undone on its refusal.
         // itemtake <name substring> <section> <x> <y> [qty]   - E34: take the item at (section, x, y) out of a
         // LOADED character this game does NOT own (a ghost) and put it into the local player's first
         // player-faction character, through the engine's own transfer calls - so the item hooks ring a REMOVE
@@ -2084,6 +2189,8 @@ void CommandChannelTick()
         // [PARITY] boxdigest total boxes=N items=M. No argument or `ring` = ring 1 of the player's sector. Read-only: it
         // creates, moves and sends nothing.
         // boxdigest [<x>,<y>|ring|all] players   - the same with player-owned boxes too, so two games' machines can be compared.
+        //                                          A player's box's line also carries rec=<height id> recGen= recItems= recDigest=
+        //                                          recWriter= and this game's mineGen= applyState= marked= held= (its live apply).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BoxDigestCommand(Trim(arg))); finished = true;
     }
@@ -2356,6 +2463,9 @@ void CommandChannelTick()
         // bldset <key-substring|key> pause|power 0|1 | battery|progress|stock <value> | locklvl|doorlvl <0-100> - TEST-ONLY lever: one
         // field of the piece written as the kept lay writes it (power through the engine's setPowerOn; stock = input record 0; locklvl =
         // the piece's own lock, doorlvl = door 0's lock), at the K2 safe point. [BUILD] bldset line with the value before and after.
+        // bldset <key> doorlock <door> 0|1 locks / unlocks that door through the engine's lock calls; bldset <key> doorpick <door> runs
+        // the lock pick's tick on its lock until it opens (at most 200 calls). doorlvl and doorlock note the doors for the piece record
+        // on its writer (BldsetDoorVerbs).
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::BuildSetArm(Trim(arg))); finished = true;
     }
@@ -2399,6 +2509,23 @@ void CommandChannelTick()
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::ShopListCommand(Trim(arg))); finished = true;
     }
+    else if (verb == "restockdue")
+    {
+        // restockdue <homeKey>   - TEST: on the holder of the shop's area, the shop record's restock time becomes now through the
+        // record, so the holder's next pass refills every keeper squad of that building once (items.cpp ShopRestockDueCommand).
+        std::string arg; std::getline(is, arg);
+        WriteStatus(coop::ShopRestockDueCommand(Trim(arg))); finished = true;
+    }
+    else if (verb == "keepermoney")
+    {
+        // keepermoney <homeKey> <squad> <amount>   - TEST: on the holder of the shop's area, the money of a keeper squad of that shop
+        // building (the squad's world id or its template's string id) becomes <amount> through the shop record; the game running the keeper takes it (items.cpp
+        // ShopKeeperMoneyCommand).
+        std::string hk, sq; long long amount = -1;
+        if (!(is >> hk >> sq >> amount)) WriteStatus("error keepermoney: needs <homeKey> <squad> <amount> (a whole number) - nothing set");
+        else WriteStatus(coop::ShopKeeperMoneyCommand(hk, sq, (amount < 0 || amount > 2000000000LL) ? -1 : (int)amount));
+        finished = true;
+    }
     else if (verb == "keeperlist")
     {
         // keeperlist [<x>,<y>|all] [<page>]   - T-164 B4-0 (TEST, read-only): every loaded NPC squad with a home building,
@@ -2432,6 +2559,7 @@ void CommandChannelTick()
         // jobtest work <characterUid> <buildingKey> [plain] [task=<n>]   - P17 TEST-ONLY lever (items.cpp JobTestCommand): this game's
         // own character gets the engine's own giveOrder 0x5D1640 on the first loaded building whose key or instance id contains the
         // text - default task 87 OPERATE_MACHINERY, as a player's order (`plain` = without the player-order argument).
+        // door=<i> (0-31) gives the order on door i of that building instead (a gate's door: REPAIR is task 95).
         // jobtest input <buildingKey> <itemSid> <n> [section=<name>]   - TEST-ONLY: n of the item into that machine's input section
         // (boxtest's path, the section whose limit list names the item unless one is named). jobtest show <buildingKey> - read-only.
         // jobtest stop <characterUid>   - T-610 TEST-ONLY: this game's own character's orders dropped (dropAllOrders 0x506A10), its order

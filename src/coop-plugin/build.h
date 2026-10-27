@@ -27,6 +27,10 @@ std::string OutpostTestCommand(const std::string& arg);   // OUTPOSTS, TEST-ONLY
 void BuildTownsNote(const char* p, size_t n);            // OUTPOSTS, MAIN THREAD (store.cpp): a TOWNS LIST from the world server - the kept outposts and their pieces' keys
 void BuildShowNote(const char* p, size_t n);             // T-811, MAIN THREAD (store.cpp): a SHOW from the world server - the teammates' outposts, shown at the next drain
 void BuildShowBeforeSave(int onMainThread);              // T-811 (store.cpp saveGame pre-hook): counts the bases founded here still standing at the save (no engine write)
+std::string BuildDiscoveredText(long long* guardN);      // T-1047 step 5 fold 1, MAIN THREAD (store.cpp, a save request): the outposts this player discovered in this save, as the file beside it holds them (baseshow kDiscoveredFile); *guardN: the save take-outs noted so far
+int BuildDiscoveredGuard(long long guardN0, std::string* text);   // T-1047 step 5 fold 1, MAIN THREAD (store.cpp, the save landed): 1 = a save take-out was noted since guardN0 - *text the set as it noted it
+void BuildDiscoveredLoaded(const std::string& text, int have);   // T-1047 step 5 fold 1, MAIN THREAD (store.cpp, a load's prepare): the loading save's file (have 0: none of that save) - the new world's discovered outposts
+void BuildDiscoveredLoadEnded(long genAtPrepare);   // T-1047 step 5 fold 2, MAIN THREAD (store.cpp, the end of the engine's load call): a load that made no new world is disarmed
 std::string BuildKeptListCommand();                  // KEPT, TEST-ONLY, MAIN THREAD, read-only: `keptlist` - the kept rows this game holds, their state, claims and the key search here
 std::string StandInCommand(const std::string& arg);     // TEST-ONLY, MAIN THREAD: `standin <slot> [read]` - make (or take into the table) / read back that player's stand-in and the loaded buildings it owns
 std::string BuildGiveCommand(const std::string& arg);   // TEST-ONLY, MAIN THREAD: `buildgive <key-substring|nearest> <slot>` - give a loaded building to that player's faction; T-608 T1389: `buildgive counter=<full box key> <slot>` - one shop counter only
@@ -45,6 +49,7 @@ void BuildOwnDirtyClear();                            // MAIN THREAD: store.cpp 
 void BuildOwnRetiredTaken(const std::vector<std::string>& taken);   // mmo8a2 (review-mmo8a M2), MAIN THREAD: the writer's record now drops these retired keys
 void BuildOwnDirtyMark(int level);                    // MAIN THREAD: raise the mark (store.cpp, a held write asks again)
 int  BuildRestoreQueue(const std::vector<coopown::BuildRow>& rows);   // MAIN THREAD, the own-records restore edge: each row -> the copy queue with the RESTORE flag; returns rows queued
+void BuildRestoreEdgeDone();   // MAIN THREAD, after the restore edge (or a disarmed load): areas applied before it take their held rows, waiting makes are asked again
 unsigned long BuildSaveAccepted();                    // P87 rf1, MAIN THREAD (store.cpp): the engine accepted a save request - its number (1, 2, ...)
 void BuildSaveLanded(unsigned long reqNo, const char* name);   // P87 rf1, MAIN THREAD (store.cpp): that save landed - removed marks set before its request retire
 void BuildCopyListFromBase(const std::vector<coopown::BuildRow>& rows, const char* why);   // P87 rf1, MAIN THREAD (store.cpp): this world's copy list from the pp.build base

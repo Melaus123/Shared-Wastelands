@@ -166,6 +166,101 @@ inline int OriginLineDue(long long nth)
     return (nth <= 40 || nth % 50 == 0) ? 1 : 0;
 }
 
+/* A SQUAD THIS GAME'S SAVE SPLIT OFF ANOTHER GAME'S PEOPLE. The engine can split a person into a squad of their own (a cage step
+   does), and a save written then holds that squad with a body standing on another game's registered copy. The orphan clean-up removes
+   the body (orphanpurge.h Decide, the duplicate rule); the squad it leaves behind is no one's record, so no other road removes it and
+   it would go into the next save. It is removed (the duplicate-wake road: on ice, then destroyed under the admin flag) only when every
+   input below says it is such a squad; anything unread or uncertain keeps it. The same rule on every seat: no slot number is special.
+   Read when the orphan clean-up has removed people of the squad (the moment its last member goes). */
+struct SaveSplitSeen
+{
+    int readable;       /* 1 = the squad, its members and the removed people's spot were read */
+    int worldFaction;   /* 1 = a world faction's squad (not a player's, a peer's or a stand-in record's) */
+    int context;        /* 1 = a context platoon (another game's squad shown here) */
+    int bound;          /* 1 = the store's binding map holds it */
+    int recorded;       /* 1 = the store holds a record under its id */
+    int handedOver;     /* 1 = the hand-over index names it */
+    int queued;         /* 1 = already on the context removal road */
+    int members;        /* members still in it, the people just removed not counted */
+    int uidMembers;     /* of those, members the session knows by a uid */
+    int saveMade;       /* 1 = its number is below its faction's load floor (the save made it) */
+    int mySlot;         /* this game's slot, -1 unknown */
+    int blockOwner;     /* the block of its number (number / 65,536), -1 no number */
+    int originSlot;     /* SquadOrigin's answer at the removed people's spot */
+    int originWhy;      /* the source of that answer (kBy...) */
+    int heldByOther;    /* the area map there: 1 another game holds it, 0 not, -1 no fresh map, -2 its holder is not in the world */
+    int holderSlot;     /* the area holder's slot there, -1 unknown */
+    int holderInWorld;  /* 1 = the roster lists that slot in the world */
+    int asleep;         /* 1 = the squad is asleep (found in its faction's sleeping list) */
+    int sleepCount;     /* asleep: the "char count" of its own sleep record, -1 unreadable */
+};
+/* the answer: kSplitDrop removes it; every other value keeps it and names the first input that did */
+const int kSplitDrop = 0, kSplitUnread = 1, kSplitNotWorld = 2, kSplitContext = 3, kSplitBound = 4, kSplitRecorded = 5,
+          kSplitHandedOver = 6, kSplitQueued = 7, kSplitUidMember = 8, kSplitNotEmpty = 9, kSplitNotSave = 10, kSplitNotMyBlock = 11,
+          kSplitNotByHolder = 12, kSplitOriginMine = 13, kSplitNoMap = 14, kSplitNotOtherHeld = 15, kSplitHolderAway = 16, kSplitSleepMembers = 17, kSplitSleepUnread = 18, kSplitWhyCount = 19;
+/* every input set to the values that remove the squad (this game in slot 1, the holder in slot 0) - the tests change one at a time */
+inline SaveSplitSeen SaveSplitSeenDroppable()
+{
+    SaveSplitSeen s;
+    s.readable = 1; s.worldFaction = 1; s.context = 0; s.bound = 0; s.recorded = 0; s.handedOver = 0; s.queued = 0;
+    s.members = 0; s.uidMembers = 0; s.saveMade = 1; s.mySlot = 1; s.blockOwner = 1; s.originSlot = 0; s.originWhy = kByHolder;
+    s.heldByOther = 1; s.holderSlot = 0; s.holderInWorld = 1;
+    s.asleep = 0; s.sleepCount = 0;
+    return s;
+}
+inline int SaveSplitDrop(const SaveSplitSeen& s)
+{
+    if (s.readable == 0) return kSplitUnread;
+    if (s.worldFaction == 0) return kSplitNotWorld;
+    if (s.context != 0) return kSplitContext;
+    if (s.bound != 0) return kSplitBound;
+    if (s.recorded != 0) return kSplitRecorded;
+    if (s.handedOver != 0) return kSplitHandedOver;
+    if (s.queued != 0) return kSplitQueued;
+    if (s.uidMembers != 0) return kSplitUidMember;      /* a member the session knows (or an unread count) - never */
+    if (s.members != 0) return kSplitNotEmpty;          /* someone is still in it: asked again when the next one is removed */
+    if (s.asleep != 0 && s.sleepCount != 0) return s.sleepCount < 0 ? kSplitSleepUnread : kSplitSleepMembers;   /* asleep: only a sleep record read as 0 people */
+    if (s.saveMade == 0) return kSplitNotSave;
+    if (SlotOk(s.mySlot) == 0 || s.blockOwner != s.mySlot) return kSplitNotMyBlock;
+    if (s.originWhy != kByHolder) return kSplitNotByHolder;   /* handed over, its members, a record, the number: not this rule's */
+    if (SlotOk(s.originSlot) == 0 || s.originSlot == s.mySlot) return kSplitOriginMine;
+    if (s.heldByOther == -1) return kSplitNoMap;
+    if (s.heldByOther != 1) return kSplitNotOtherHeld;
+    if (SlotOk(s.holderSlot) == 0 || s.holderSlot == s.mySlot || s.holderSlot != s.originSlot || s.holderInWorld != 1) return kSplitHolderAway;
+    return kSplitDrop;
+}
+/* At the removal tick, read there: awake - its member count; asleep - its sleep record's count (-1 unreadable). 1 = keep it now. */
+inline int SaveSplitTickKeep(int awake, int activeChars, int sleepCount)
+{
+    if (awake != 0) return activeChars != 0 ? 1 : 0;
+    return sleepCount != 0 ? 1 : 0;
+}
+inline const char* SplitWhyToken(int why)
+{
+    switch (why)
+    {
+    case kSplitUnread:       return "unread";
+    case kSplitNotWorld:     return "notWorld";
+    case kSplitContext:      return "context";
+    case kSplitBound:        return "bound";
+    case kSplitRecorded:     return "recorded";
+    case kSplitHandedOver:   return "handedOver";
+    case kSplitQueued:       return "queued";
+    case kSplitUidMember:    return "uidMember";
+    case kSplitNotEmpty:     return "notEmpty";
+    case kSplitNotSave:      return "notSave";
+    case kSplitNotMyBlock:   return "notMyBlock";
+    case kSplitNotByHolder:  return "notByHolder";
+    case kSplitOriginMine:   return "originMine";
+    case kSplitNoMap:        return "noMap";
+    case kSplitNotOtherHeld: return "notOtherHeld";
+    case kSplitHolderAway:   return "holderAway";
+    case kSplitSleepMembers: return "sleepMembers";
+    case kSplitSleepUnread:  return "sleepUnread";
+    default:                 return "?";
+    }
+}
+
 } // namespace sqorigin
 
 #endif

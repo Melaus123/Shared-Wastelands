@@ -44,11 +44,28 @@
            (1..47 bytes, each once), u32 size level 0..kLevelMax (T-811, protocol 100: the outpost's plevel, Town+0x388 - which outpost
            icon the map draws)
      str = u32 length, the bytes.
-   FILES (player-towns.txt, kept-towns.txt): TAB-separated, LF line ends (a CR before it is read as nothing); line 1 "<header><TAB>3"
+   FILES (player-towns.txt, kept-towns.txt): TAB-separated, LF line ends (a CR before it is read as nothing); line 1 "<header><TAB>4"
    (player-towns / kept-towns), then per outpost
-     T <owner slot> <type> <container> <container stamp> <index> <serial> <x> <y> <z> <name> <cut 0 or 1> <size level 0..3>
+     T <owner slot> <type> <container> <container stamp> <index> <serial> <x> <y> <z> <name> <cut 0 or 1> <size level 0..3> <outpost id>
+       <anchor x> <anchor z>   (format 5, T-940: the outpost's fixed anchor - THE FIXED ANCHOR below)
      K <key>     (after its outpost's T line: one key of that outpost - a said piece in player-towns, a kept piece in kept-towns)
-   Formats 1 (no cut field) and 2 (no size level: read as 0) are still read. A float is the 8 lower-case hex digits of its IEEE bits, an int decimal, text escaped as
+     N <next id> (format 4, at most once, before the outposts: the next new outpost id - T-1047 step 5 fold 1, so an id is never
+                 minted twice, even after its outpost was removed and the world server started again; absent = one past the
+                 highest id on file)
+   Formats 1 (no cut field), 2 (no size level: read as 0), 3 (no outpost id: read as 0, given one at load - GiveMissingIds) and 4 (no
+   anchor: the row's centre at that read becomes its anchor) are still read.
+   THE OUTPOST ID (T-1047 step 5, owner 1043 / 1102 a): the world server's own stable number for one player outpost, 1..kOutpostIdMax
+   (0 = none yet). Never a town handle (they differ between games) nor a centre (it drifts). Minted in ReplaceSlotTowns: a said row
+   that inherits a row on file (its centre within kTownSameRadius, or a shared key) keeps that row's id; one that inherits none takes
+   the id of an outpost a reset carried for its owner by the same rule (kept-towns.txt), else a new id (NextOutpostId: one past the
+   highest on file, or the file's N line when higher - NextIdAtLoad - and never lower afterwards). Sent to every game with the outposts (baseshow.h SHOW); a piece's record names its outpost by it (piecerec.h).
+   The TOWNS wire does not carry it.
+   THE FIXED ANCHOR (T-940, owner 1107 b, 2026-10-25): each outpost row's zone centre - the spot it was first said at (its founding
+   spot), set once when the row is new and never moved by the centre's later drift (the engine moves a player town's centre toward its
+   buildings, 0x547E60). A said row that inherits a row on file (or a carried outpost, by the id rule above) keeps that row's anchor
+   (ReplaceSlotTowns / SaidRowId); a row of an older file takes its centre at that read. Kept in both files and sent to every game with
+   the outposts (baseshow.h SHOW, since world-server protocol 119); the game's building zones (buildnear.h ZoneVerdict) measure from it.
+   The TOWNS wire does not carry it either. A float is the 8 lower-case hex digits of its IEEE bits, an int decimal, text escaped as
    zonekeep.h's list (\\ \t \n \r). */
 #include <string>
 #include <vector>
@@ -70,7 +87,10 @@ const char* const kPlayerTownsFile = "player-towns.txt";
 const char* const kPlayerTownsHeader = "player-towns";
 const char* const kKeptTownsFile = "kept-towns.txt";
 const char* const kKeptTownsHeader = "kept-towns";
-const int kTownsFormat = 3;   /* the outpost list files' format this build writes (3: with the size level, T-811) */
+const int kTownsFormat = 5;   /* the outpost list files' format this build writes (5: with the fixed anchor, T-940) */
+const int kTownsFormatId = 4;   /* the format before it (with the outpost id, T-1047 step 5; no anchor: the centre at the read) */
+const int kTownsFormatLevel = 3;   /* the format before it (with the size level, T-811; no outpost id: read as 0) */
+const unsigned kOutpostIdMax = 0x7FFFFFFFu;   /* an outpost id: 1..this (0 = none) */
 const int kTownsFormatCut = 2;   /* the format before it (no size level): still read, as level 0 */
 const int kLevelMax = 3;   /* an outpost's size level (Town+0x388 'plevel', set by the engine 0x48B770 from the buildings near it): 0..3 */
 const int kTownsFormatKeyless = 1;   /* the format before it (no cut field): still read */
@@ -89,8 +109,18 @@ struct TownRow
     std::vector<std::string> keys;   /* SAY and player-towns.txt: the pieces linked to the outpost; LIST and kept-towns.txt: its kept pieces */
     int cut;                         /* 1 = the outpost has pieces keys does not name (its game's list was cut, or not every piece could be read) */
     int level;                       /* T-811: the outpost's size level 0..kLevelMax as its owner's game reads it (0 in a LIST and kept-towns.txt) */
-    TownRow() : owner(-1), cut(0), level(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; }
+    unsigned id;                     /* T-1047 step 5: the world server's outpost id (0 = none yet; never on the TOWNS wire) */
+    float anchor[2];                 /* T-940: the fixed anchor x, z (valid when anchored is 1; never on the TOWNS wire) */
+    int anchored;                    /* T-940: 1 = anchor is set (a row on file or inherited); 0 = not yet (a said row before ReplaceSlotTowns) */
+    TownRow() : owner(-1), cut(0), level(0), id(0), anchored(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; anchor[0] = anchor[1] = 0.0f; }
 };
+/* T-940: the row's fixed anchor (x, z): its anchor when set, else its centre */
+inline void AnchorOf(const TownRow& t, float* ax, float* az)
+{
+    if (t.anchored != 0) { *ax = t.anchor[0]; *az = t.anchor[1]; }
+    else { *ax = t.pos[0]; *az = t.pos[2]; }
+}
+inline void SetAnchor(TownRow* t, float ax, float az) { t->anchor[0] = ax; t->anchor[1] = az; t->anchored = 1; }
 
 inline bool HandSame(const int* a, const int* b) { for (int i = 0; i < 5; ++i) if (a[i] != b[i]) return false; return true; }
 /* a handle a game read (an outpost made from kept pieces has none: all five words 0) */
@@ -109,8 +139,9 @@ inline bool RowOk(const TownRow& t, unsigned op)
     if (op == kOpSay) { if (t.owner != -1) return false; }
     else if (op == kOpList || op == kOpShowKeys) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
     else return false;
-    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.level < 0 || t.level > kLevelMax) return false;
+    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.level < 0 || t.level > kLevelMax || t.id > kOutpostIdMax) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(t.pos[j])) return false;
+    if (t.anchored != 0 && (!keptwire::FloatOk(t.anchor[0]) || !keptwire::FloatOk(t.anchor[1]))) return false;   /* T-940 */
     if (!keptwire::TextOk(t.name, keptwire::kStrMax, true)) return false;
     std::set<std::string> seen;
     for (size_t k = 0; k < t.keys.size(); ++k) if (!keptwire::TextOk(t.keys[k], keptwire::kKeyMax, false) || !seen.insert(t.keys[k]).second) return false;
@@ -298,25 +329,34 @@ inline int ShowKeysTake(ShowKeysAssembly* a, unsigned flags, const std::vector<T
 }
 
 /* ---- the files ---- */
-inline std::string EncodeTownsFile(const char* header, const std::vector<TownRow>& rows, bool withKeys)
+/* nextId: the N line's next new outpost id (0 = none written: kept-towns.txt) */
+inline std::string EncodeTownsFile(const char* header, const std::vector<TownRow>& rows, bool withKeys, unsigned nextId = 0)
 {
     std::string o = std::string(header) + "\t" + zonekeep::ZkNum(kTownsFormat) + "\n";
+    if (nextId != 0) o += "N\t" + zonekeep::ZkNum((long long)nextId) + "\n";   /* T-1047 step 5 fold 1 */
     for (size_t i = 0; i < rows.size(); ++i)
     {
         const TownRow& t = rows[i];
         o += "T\t" + zonekeep::ZkNum(t.owner);
         for (int j = 0; j < 5; ++j) o += "\t" + zonekeep::ZkNum(t.hand[j]);
         for (int j = 0; j < 3; ++j) o += "\t" + zonekeep::FloatHex(t.pos[j]);
-        o += "\t" + zonekeep::Esc(t.name) + "\t" + zonekeep::ZkNum(t.cut) + "\t" + zonekeep::ZkNum(t.level) + "\n";
+        float ax = 0.0f, az = 0.0f;
+        AnchorOf(t, &ax, &az);   /* T-940: a row with no anchor yet is written with its centre - fixed from then on */
+        o += "\t" + zonekeep::Esc(t.name) + "\t" + zonekeep::ZkNum(t.cut) + "\t" + zonekeep::ZkNum(t.level) + "\t" + zonekeep::ZkNum((long long)t.id)
+             + "\t" + zonekeep::FloatHex(ax) + "\t" + zonekeep::FloatHex(az) + "\n";
         if (withKeys) for (size_t k = 0; k < t.keys.size(); ++k) o += "K\t" + zonekeep::Esc(t.keys[k]) + "\n";
     }
     return o;
 }
 /* The rows back, of format kTownsFormat or kTownsFormatKeyless. False = not a list this build reads (*why names the line); *out then
-   holds nothing. withKeys: K lines allowed; every row must be valid as a LIST row. */
-inline bool DecodeTownsFile(const std::string& text, const char* header, bool withKeys, std::vector<TownRow>* out, std::string* why)
+   holds nothing. withKeys: K lines allowed; every row must be valid as a LIST row. nextId (when not 0): the N line's next new outpost
+   id (0 = no N line) */
+inline bool DecodeTownsFile(const std::string& text, const char* header, bool withKeys, std::vector<TownRow>* out, std::string* why, unsigned* nextId = 0)
 {
     out->clear();
+    if (nextId != 0) *nextId = 0;
+    unsigned nNext = 0;
+    int nSeen = 0;
     int fmt = kTownsFormat;
     std::vector<TownRow> rows;
     std::vector<std::string> f;
@@ -335,8 +375,8 @@ inline bool DecodeTownsFile(const std::string& text, const char* header, bool wi
         if (lineNo == 1)
         {
             int v = 0;
-            if (f.size() != 2 || f[0] != header || !zonekeep::DecInt(f[1], &v) || (v != kTownsFormat && v != kTownsFormatCut && v != kTownsFormatKeyless))
-            { *why = where + "not a " + header + " list of format " + zonekeep::ZkNum(kTownsFormatKeyless) + ", " + zonekeep::ZkNum(kTownsFormatCut) + " or " + zonekeep::ZkNum(kTownsFormat); return false; }
+            if (f.size() != 2 || f[0] != header || !zonekeep::DecInt(f[1], &v) || (v != kTownsFormat && v != kTownsFormatId && v != kTownsFormatLevel && v != kTownsFormatCut && v != kTownsFormatKeyless))
+            { *why = where + "not a " + header + " list of format " + zonekeep::ZkNum(kTownsFormatKeyless) + ", " + zonekeep::ZkNum(kTownsFormatCut) + ", " + zonekeep::ZkNum(kTownsFormatLevel) + ", " + zonekeep::ZkNum(kTownsFormatId) + " or " + zonekeep::ZkNum(kTownsFormat); return false; }
             fmt = v;
             continue;
         }
@@ -344,11 +384,14 @@ inline bool DecodeTownsFile(const std::string& text, const char* header, bool wi
         if (f[0] == "T")
         {
             TownRow t;
-            bool ok = f.size() == (fmt == kTownsFormatKeyless ? 11u : fmt == kTownsFormatCut ? 12u : 13u) && zonekeep::DecInt(f[1], &t.owner);
+            bool ok = f.size() == (fmt == kTownsFormatKeyless ? 11u : fmt == kTownsFormatCut ? 12u : fmt == kTownsFormatLevel ? 13u : fmt == kTownsFormatId ? 14u : 16u) && zonekeep::DecInt(f[1], &t.owner);
             for (int j = 0; ok && j < 5; ++j) ok = zonekeep::DecInt(f[(size_t)(2 + j)], &t.hand[j]);
             for (int j = 0; ok && j < 3; ++j) ok = zonekeep::HexFloat(f[(size_t)(7 + j)], &t.pos[j]);
             if (ok && fmt != kTownsFormatKeyless) ok = zonekeep::DecInt(f[11], &t.cut);
-            if (ok && fmt == kTownsFormat) ok = zonekeep::DecInt(f[12], &t.level);
+            if (ok && (fmt == kTownsFormat || fmt == kTownsFormatId || fmt == kTownsFormatLevel)) ok = zonekeep::DecInt(f[12], &t.level);
+            if (ok && (fmt == kTownsFormat || fmt == kTownsFormatId)) { int id = -1; ok = zonekeep::DecInt(f[13], &id) && id >= 0; t.id = ok ? (unsigned)id : 0u; }   /* T-1047 step 5 */
+            if (ok && fmt == kTownsFormat) { float ax = 0.0f, az = 0.0f; ok = zonekeep::HexFloat(f[14], &ax) && zonekeep::HexFloat(f[15], &az); if (ok) SetAnchor(&t, ax, az); }   /* T-940 */
+            else if (ok) SetAnchor(&t, t.pos[0], t.pos[2]);   /* T-940: an older file - the centre at this read is the anchor */
             ok = ok && zonekeep::Unesc(f[10], &t.name) && RowOk(t, kOpList);
             if (!ok) { *why = where + "an outpost line this build cannot read"; return false; }
             rows.push_back(t);
@@ -360,10 +403,18 @@ inline bool DecodeTownsFile(const std::string& text, const char* header, bool wi
             if (ok) { rows.back().keys.push_back(k); ok = RowOk(rows.back(), kOpList); }
             if (!ok) { *why = where + "a kept piece line this build cannot read (or one with no outpost line before it, or twice)"; return false; }
         }
+        else if (f[0] == "N")
+        {   /* T-1047 step 5 fold 1: the next new outpost id */
+            int v = 0;
+            const bool ok = (fmt == kTownsFormat || fmt == kTownsFormatId) && nSeen == 0 && f.size() == 2 && zonekeep::DecInt(f[1], &v) && v >= 1;
+            if (!ok) { *why = where + "a next-id line this build cannot read (or a second one)"; return false; }
+            nSeen = 1; nNext = (unsigned)v;
+        }
         else { *why = where + "a line of a kind this build does not know"; return false; }
     }
     if (lineNo == 0) { *why = "the list is empty (no header line)"; return false; }
     out->swap(rows);
+    if (nextId != 0) *nextId = nNext;
     return true;
 }
 
@@ -445,13 +496,98 @@ inline int TownStands(const float* livePos, const TownRow& t) { return keptwire:
    (TownKeysSame); a said row whose list is cut takes that row's keys it does not name (up to kMaxTownKeys), so keys the game could
    not say are not dropped. A SAY not read whole keeps the slot's rows it does not name. Every other slot's rows stay as they are, in
    their order. */
-inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vector<TownRow>& said, int whole = 1)
+/* ---- T-1047 step 5: THE OUTPOST ID ---- */
+/* one past the highest id in a and b (1 when none): the next new id */
+inline unsigned NextOutpostId(const std::vector<TownRow>& a, const std::vector<TownRow>& b)
+{
+    unsigned m = 0;
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].id > m) m = a[i].id;
+    for (size_t i = 0; i < b.size(); ++i) if (b[i].id > m) m = b[i].id;
+    return m >= kOutpostIdMax ? kOutpostIdMax : m + 1;
+}
+/* T-1047 step 5 fold 1: the next new id at the world server's start - the file's N line (fileNext; 0 = none) or one past the highest
+   id on file, whichever is higher: an id once minted is never minted again, even when its outpost was removed before the restart */
+inline unsigned NextIdAtLoad(unsigned fileNext, const std::vector<TownRow>& a, const std::vector<TownRow>& b)
+{
+    const unsigned onFile = NextOutpostId(a, b);
+    const unsigned n = fileNext > onFile ? fileNext : onFile;
+    return n > kOutpostIdMax ? kOutpostIdMax : n;
+}
+/* a new id from *next (0 when the ids are used up - 2^31 outposts) */
+inline unsigned MintOutpostId(unsigned* next)
+{
+    if (next == 0 || *next == 0 || *next > kOutpostIdMax) return 0;
+    const unsigned id = *next;
+    *next = (id >= kOutpostIdMax) ? 0u : id + 1;
+    return id;
+}
+/* every row with no id (a file of format 1..3) given a new one, in order; also a second row carrying an id already given (a
+   hand-edited file) - an id names one outpost. taken: the ids already in use (filled as ids are given). The number given */
+inline int GiveMissingIds(std::vector<TownRow>* rows, unsigned* next, std::set<unsigned>* taken)
+{
+    int n = 0;
+    for (size_t i = 0; i < rows->size(); ++i)
+    {
+        TownRow& t = (*rows)[i];
+        if (t.id != 0 && taken->insert(t.id).second) continue;
+        t.id = MintOutpostId(next);
+        if (t.id != 0) { taken->insert(t.id); ++n; }
+    }
+    return n;
+}
+/* the outpost a said row of `slot` inherits among rows (only rows of that owner whose used[j] is 0): its centre within
+   kTownSameRadius (TownStands), else one sharing a key (TownKeysSame); -1 none */
+inline int InheritRow(const TownRow& t, int slot, const std::vector<TownRow>& rows, const std::vector<int>& used)
+{
+    for (size_t j = 0; j < rows.size(); ++j) if (rows[j].owner == slot && used[j] == 0 && TownStands(t.pos, rows[j]) != 0) return (int)j;
+    for (size_t j = 0; j < rows.size(); ++j)
+    {
+        if (rows[j].owner != slot || used[j] != 0) continue;
+        for (size_t k = 0; k < t.keys.size(); ++k)
+            for (size_t m = 0; m < rows[j].keys.size(); ++m) if (TownKeysSame(t.keys[k], rows[j].keys[m]) != 0) return (int)j;
+    }
+    return -1;
+}
+/* T-1047 step 5: the id a said row takes - the row on file it inherits (at >= 0, its id when it has one), else an outpost a reset
+   carried for its owner (carried: kept-towns.txt) by the same rule whose id no row of the slot holds, else a new one (MintOutpostId) */
+/* T-940: *anchor (when not 0; two floats x, z) = the fixed anchor the row takes with it - the inherited row's (at >= 0), the carried
+   outpost's whose id it takes, else its own centre (a new outpost: its founding spot) */
+inline unsigned SaidRowId(const TownRow& t, int slot, int at, const std::vector<TownRow>& old, const std::vector<TownRow>* carried,
+                          std::vector<int>* carriedUsed, const std::set<unsigned>& holds, unsigned* next, float* anchor = 0)
+{
+    if (anchor != 0)
+    {
+        if (at >= 0) AnchorOf(old[(size_t)at], &anchor[0], &anchor[1]);
+        else { anchor[0] = t.pos[0]; anchor[1] = t.pos[2]; }
+    }
+    if (at >= 0 && old[(size_t)at].id != 0) return old[(size_t)at].id;
+    if (carried != 0)
+    {
+        if (carriedUsed->size() != carried->size()) carriedUsed->assign(carried->size(), 0);
+        for (size_t j = 0; j < carried->size(); ++j) if ((*carried)[j].id == 0 || holds.count((*carried)[j].id) != 0) (*carriedUsed)[j] = 1;
+        const int c = InheritRow(t, slot, *carried, *carriedUsed);
+        if (c >= 0)
+        {
+            (*carriedUsed)[(size_t)c] = 1;
+            if (anchor != 0 && at < 0) AnchorOf((*carried)[(size_t)c], &anchor[0], &anchor[1]);   /* T-940: the carried outpost's anchor */
+            return (*carried)[(size_t)c].id;
+        }
+    }
+    return MintOutpostId(next);
+}
+/* T-1047 step 5: nextId (one past the highest id on file, NextOutpostId) mints the id of a said row that inherits no outpost (SaidRowId;
+   0 = no minting: such a row keeps id 0); carried: the outposts a reset carried (kept-towns.txt), whose ids a row of their owner takes
+   before a new one is minted */
+inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vector<TownRow>& said, int whole = 1, unsigned* nextId = 0,
+                             const std::vector<TownRow>* carried = 0)
 {
     std::vector<TownRow> o, old;
     for (size_t i = 0; i < all->size(); ++i) { if ((*all)[i].owner != slot) o.push_back((*all)[i]); else old.push_back((*all)[i]); }
     TownKeyFinder oldKeys;
     for (size_t j = 0; j < old.size(); ++j) for (size_t k = 0; k < old[j].keys.size(); ++k) oldKeys.Add(slot, old[j].keys[k], j);
-    std::vector<int> used(old.size(), 0);
+    std::vector<int> used(old.size(), 0), carriedUsed;
+    std::set<unsigned> holds;   /* T-1047 step 5: the ids the slot's rows hold now (a carried outpost's id is never taken twice) */
+    for (size_t j = 0; j < old.size(); ++j) if (old[j].id != 0) holds.insert(old[j].id);
     size_t mine = 0;
     for (size_t i = 0; i < said.size() && mine < kMaxTownsPerSlot; ++i)
     {
@@ -460,6 +596,10 @@ inline void ReplaceSlotTowns(std::vector<TownRow>* all, int slot, const std::vec
         int at = -1;
         for (size_t j = 0; j < old.size() && at < 0; ++j) if (used[j] == 0 && TownStands(t.pos, old[j]) != 0) at = (int)j;
         for (size_t k = 0; k < t.keys.size() && at < 0; ++k) { size_t j = 0; if (oldKeys.Find(slot, t.keys[k], &j) != 0 && used[j] == 0) at = (int)j; }
+        float an[2] = { 0.0f, 0.0f };
+        t.id = SaidRowId(t, slot, at, old, carried, &carriedUsed, holds, nextId, an);
+        SetAnchor(&t, an[0], an[1]);   /* T-940: kept from the row it inherits, else its founding spot - never moved by the centre's drift */
+        if (t.id != 0) holds.insert(t.id);
         if (at >= 0)
         {
             used[(size_t)at] = 1;

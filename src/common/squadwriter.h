@@ -14,6 +14,7 @@
 #ifndef COOP_COMMON_SQUADWRITER_H
 #define COOP_COMMON_SQUADWRITER_H
 
+#include "arearec.h"   /* T-1084 step 3: the off-screen authority's build arm (AuthorityArm) */
 namespace coopsquad {
 /* M7a A1 build 2 [a1b2-sw0]: the put-away / owed / hand-back / mark decisions are RETIRED (design 2.2) - their replacements are in
    liveowner.h (AdoptDecide, AreaReceiverOrder, ReleaseStep, GiverSettleOnAck, SquadGivenEffective). */
@@ -379,6 +380,107 @@ inline int NpcWakeSkipLoad(int npcSquad, int heldByOther)
 inline int NpcPurgeForgetStamp(int npcSquad, int purgeTouched, int members)
 {
     return (npcSquad != 0 && purgeTouched != 0 && members == 0) ? 1 : 0;
+}
+/* T-1084 (owner decisions 1125 a, 1126 a): may this game build a sleeping copy of a squad from its world record? A game holds only the
+   NPCs of the areas it runs; the one exception is the off-screen authority the world server names, which moves every sleeping squad
+   across the map off-screen and holds one sleeping copy of each for that travel. authority: this game is that authority; single: this
+   game's configured role is single-player (RoleIsSingle - the configured role, which does not change when other games leave); mineHeld: the world server's area map at the squad's position (zones MineHeldTS: 1 this game holds the area,
+   0 another game or nobody does, -1 no fresh map, -2 frozen - its holder is a player not in the world). kCopyBuild: build (the road's
+   own tests decide the rest); otherwise the record is kept and no copy is built. heldByOther: HeldByOtherTS at the same position - the
+   authority's arm (arearec.h AuthorityArm). A squad the engine does not keep is further held back by CopyKeptGate below. */
+enum { kCopyNotOther = 0, kCopyBuild = 1, kCopyNotNoMap = 2, kCopyNotKeptUnloaded = 3 };
+inline int CopyBuildGate(int authority, int single, int mineHeld, int heldByOther)
+{
+    if (single != 0 || mineHeld == 1) return kCopyBuild;
+    if (authority != 0)
+    {   /* T-1084 step 3: the authority builds only where no game holds the area (heldByOther: HeldByOtherTS, 1 another game, 0 nobody
+           else, -1 no fresh map, -2 frozen) - beside the holder's live group its copy is refused as handed and rebuilt by the runner's
+           next write (the T1571 loop) */
+        const int arm = arearec::AuthorityArm(heldByOther);
+        return arm == arearec::kAuthBuild ? kCopyBuild : (arm == arearec::kAuthNoMap ? kCopyNotNoMap : kCopyNotOther);
+    }
+    return mineHeld == -1 ? kCopyNotNoMap : kCopyNotOther;
+}
+/* A squad the engine does not keep (its record says 'discard': the kept byte its copy would get, squadbirth.h MadeKeptByte, is 0) is
+   woken by the engine after its short non-persistent lifetime wherever it sleeps; where its area is not loaded no people are built and
+   the engine destroys it. So its copy is built only where its area is loaded on this game; elsewhere it stays a record. gate:
+   CopyBuildGate's answer (or kCopyBuild for a road with its own rule); keptByRecord: MadeKeptByte of the record's birth flag - the same
+   call that sets the copy's kept byte, so the two never disagree; areaLoadedHere: the engine's own loaded byte of the area at the
+   record's position (zones ZoneLoadedSectorTri: 1 loaded here; 0 not and -1 unreadable are both refused). Every refusal of CopyBuildGate is kept as it is (a no-map answer still arms the sweep); a kept squad is unchanged. */
+inline int CopyKeptGate(int gate, int keptByRecord, int areaLoadedHere)
+{
+    if (gate != kCopyBuild || keptByRecord != 0) return gate;
+    return areaLoadedHere == 1 ? kCopyBuild : kCopyNotKeptUnloaded;
+}
+/* T-1084: the kept-records sweep's answer for one kept record (store.cpp KeptRecordSweepTick). usable: the record is here with a file
+   and a position, not gone, not deleted, not held back by the world server's kept list; hasCopy: a squad of its id is bound here, or
+   asleep or awake in its faction (looked up under the record's own faction key); failedBefore: a build of it from this record failed in
+   this world; gate: CopyBuildGate now; loadedHere: its position is in an area loaded here; newlyHeldHere: the sweep was started because
+   this game newly holds the area the record stands in; onlyNewlyHeld: that is the only reason it was queued. A record in an area loaded
+   here waits (the arrival road's deferral: a copy would wake at once beside the holder's group) unless this game newly holds that area -
+   then this game is the holder and the engine wakes it in place. */
+enum { kSwBuild = 0, kSwGone = 1, kSwHasCopy = 2, kSwFailedBefore = 3, kSwOutside = 4, kSwNoCopy = 5, kSwDeferLoaded = 6 };
+inline int SweepPick(int usable, int hasCopy, int failedBefore, int gate, int loadedHere, int newlyHeldHere, int onlyNewlyHeld)
+{
+    if (usable == 0) return kSwGone;
+    if (hasCopy != 0) return kSwHasCopy;
+    if (failedBefore != 0) return kSwFailedBefore;
+    if (onlyNewlyHeld != 0 && newlyHeldHere == 0) return kSwOutside;
+    if (gate != kCopyBuild) return kSwNoCopy;
+    if (loadedHere != 0 && newlyHeldHere == 0) return kSwDeferLoaded;
+    return kSwBuild;
+}
+/* T-1084: 1 = the authority's position-only note that moved a squad with no copy here into an area this game holds (mineHeld ==
+   MineHeldTS == 1) builds it here from its record; the same usable / hasCopy / failedBefore as SweepPick */
+inline int TravelInBuild(int usable, int hasCopy, int failedBefore, int mineHeld)
+{
+    return (usable != 0 && hasCopy == 0 && failedBefore == 0 && mineHeld == 1) ? 1 : 0;
+}
+/* T-1084 / owner 1127 a: 1 = an applied area map names this game as an area's holder (now: MineHeldTS == 1) where the previous map
+   did not (before: this game's last known answer for the area, 1 held) */
+inline int NewlyHeld(int before, int now) { return (now == 1 && before != 1) ? 1 : 0; }
+/* T-1084: the kept-records sweep's queue (store.cpp KeptSweepQueue / KeptRecordSweepTick). Why a record was queued, kept per entry:
+   this game became the off-screen authority / an area map came after a no-map refusal / this game newly holds the record's area. */
+enum { kSweepWhyAuthority = 1, kSweepWhyMapFresh = 2, kSweepWhyNewlyHeld = 4, kSweepWhyFreed = 8, kSweepWhyLoaded = 16 };   /* T-1084 step 3: kSweepWhyFreed - the off-screen authority, an area another game held is held by nobody now (arearec.h AreaFreedStep). kSweepWhyLoaded: a record refused as kCopyNotKeptUnloaded whose area is loaded here now - queued with its area, as a newly held one */
+/* 1 = a record is queued: not a zone record, and inside the trigger's areas when the trigger names areas (filtered) */
+inline int SweepQueueTakes(int isZone, int filtered, int inFilter) { return (isZone == 0 && (filtered == 0 || inFilter != 0)) ? 1 : 0; }
+/* 1 = the record stands, at its turn (nowSector), in the area it was queued for as newly held, or as loaded here now for a squad the
+   engine does not keep (queuedSector; area key x * 64 + y) - either way this game runs that area and the engine wakes it in place */
+inline int SweepInNewlyHeld(int why, int queuedSector, int nowSector)
+{
+    return ((why & (kSweepWhyNewlyHeld | kSweepWhyLoaded)) != 0 && queuedSector >= 0 && queuedSector == nowSector) ? 1 : 0;
+}
+/* 1 = the area-bound triggers (newly held, loaded here) are the record's only reasons (then a record outside its area is not built by
+   the sweep) */
+inline int SweepOnlyNewlyHeld(int why) { return (why != 0 && (why & ~(kSweepWhyNewlyHeld | kSweepWhyLoaded)) == 0) ? 1 : 0; }
+/* one area at an applied area map: before = this game's stored answer (1 held, 0 not), now = MineHeldTS (1 / 0 / -1 no fresh map /
+   -2 frozen); *newly = 1 when this game newly holds it; returns the answer to store (no fresh map keeps the stored one) */
+inline int SweepAreaStep(int before, int now, int* newly)
+{
+    if (now == -1) { *newly = 0; return before; }
+    *newly = NewlyHeld(before, now);
+    return now == 1 ? 1 : 0;
+}
+/* 1 = an area map was applied since the sweep last looked (the map's apply count, zones AreaMapApplySeqTS, moved) */
+inline int SweepMapApplied(unsigned lastSeq, unsigned seq) { return seq != lastSeq ? 1 : 0; }
+/* 1 = trigger (b): a map was applied and a copy was refused for want of a fresh map before it */
+inline int SweepMapFreshFires(int mapApplied, int noMapPending) { return (mapApplied != 0 && noMapPending != 0) ? 1 : 0; }
+/* trigger (a): known = the world server has answered on this link (welcomed), now = its answer; *last = the last known answer, kept
+   across link drops (a relink is not a new authority). 1 = this game turned from not-authority to authority. */
+inline int SweepAuthorityTurned(int known, int now, int* last)
+{
+    if (known == 0) return 0;
+    const int fire = (now != 0 && *last == 0) ? 1 : 0;
+    *last = now != 0 ? 1 : 0;
+    return fire;
+}
+/* the sweep and an old world's leftover roaming squad (store.cpp OldRoamingLeftover): retired (a world-wide delete) only by the game
+   that holds its area, as at the town-note placing; elsewhere neither retired nor built */
+enum { kSwRoadBuild = 0, kSwRoadRetire = 1, kSwRoadLeftoverSkip = 2 };
+inline int SweepRetireRoad(int held, int leftover)
+{
+    if (leftover == 0) return kSwRoadBuild;
+    return held != 0 ? kSwRoadRetire : kSwRoadLeftoverSkip;
 }
 /* The world's version of a world NPC squad. haveRecord - a full record of it is known (writtenAt > 0); owner - the slot that wrote the
    newest record (-1 none); recordAt - its writtenAt; haveStamp / stamp - the newest record this copy wrote or loaded (g_localWrittenAt).

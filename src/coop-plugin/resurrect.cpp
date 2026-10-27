@@ -81,6 +81,7 @@
 #include "resurrect.h"
 #include "spawn.h"           // FindSpawned, FindSpawnedUid, MirrorSlot, SafeReadPosition, CreateOwnInSquad, NameOf, NameSetOwn
 #include "store.h"           // EngineWritesBlocked
+#include "ownstore.h"        // OwnLeftNoteDeath (T-1062)
 #include "net/session.h"     // IsUidMine, IsUidMineAnyThread, SendSpawn
 #include "playerfaction.h"   // IsPlayerFaction, LocalPlayerFaction, WireFactionName
 #include "appearance.h"      // GroundRaceName
@@ -167,6 +168,9 @@ volatile LONG64 g_noted = 0, g_ringFull = 0, g_notMine = 0;
 long long g_snaps = 0, g_snapGone = 0, g_snapNotOwnFaction = 0, g_snapNoStats = 0, g_snapNoLook = 0;
 long long g_snapAnimals = 0, g_snapUniques = 0, g_backs = 0, g_backRefused = 0, g_backRecruit = 0, g_backLookApplied = 0;
 long long g_backLookFailed = 0, g_snapRepeat = 0, g_snapBlocked = 0, g_snapFault = 0;
+long long g_snapGoneEarly = 0;     // T-1062: gone before its snapshot read anything - no left note (ResurrectLeftMissWords)
+long long g_aliveHeldByNote = 0;   // T-1062: a listed row alive in the loaded world whose left note says the death came after the save - no ALIVE
+long long g_backOriginalHere = 0;  // T-1062: bring-backs refused because the row's own character is alive in the loaded world
 long long g_besideRefused[swfallen::kBesideCodes] = { 0 };   // bring-backs refused by the placement rules, per reason
 long long g_enemyUnable = 0, g_enemyListBad = 0;   // near enemies that could not fight (not counted) / enemy walks refused: no readable list
 long long g_besideAllowed = 0, g_besideNamed = 0, g_enemyUnknown = 0, g_placeKnown = 0, g_placeNone = 0, g_placeNoList = 0, g_killOther = 0;
@@ -235,6 +239,12 @@ void* SquadPod(::Character* c)
 int HandPod(::Character* c, unsigned int* index, unsigned int* serial)
 {
     __try { const hand& h = c->getHandle(); *index = h.index; *serial = h.serial; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// The character's hand serial and type - the person id the squad files use (coopown::HandId); 0 = a fault.
+int HandIdPod(::Character* c, int* serial, int* type)
+{
+    __try { const hand& h = c->getHandle(); *serial = (int)h.serial; *type = (int)h.type; return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
@@ -641,13 +651,19 @@ __declspec(noinline) void TakeSnapshot(unsigned int uid, int cause, int unique)
 {
     if (!swfallen::FallenNoteOnce(&g_seen, uid)) { ++g_snapRepeat; return; }
     ::Character* c = FindSpawned(uid);
-    if (c == 0) { ++g_snapGone; DebugLog("[FALLEN] uid=" + N(uid) + " died and was gone before its snapshot (snapGone=" + N(g_snapGone) + ")"); return; }
+    if (c == 0) { ++g_snapGone; ++g_snapGoneEarly; DebugLog("[FALLEN] uid=" + N(uid) + " died and was gone before its snapshot (snapGone=" + N(g_snapGone) + ")"); return; }
     ::Faction* f = c->getOwnerFactionDirect();
     if (!IsPlayerFaction(f))
     {
         ++g_snapNotOwnFaction;
         if (g_notOwnLogged < 10) { ++g_notOwnLogged; DebugLog("[FALLEN] uid=" + N(uid) + " died - not of this player's faction, not kept (snapNotOwnFaction=" + N(g_snapNotOwnFaction) + ")"); }
         return;
+    }
+    {   // T-1062: the left note first - a load whose newer squad record no longer holds him then keeps him out (the record is
+        // written only after this snapshot: OwnWriteSquad waits on ResurrectDeathsWaiting)
+        int hs = 0, ht = 0;
+        if (HandIdPod(c, &hs, &ht)) OwnLeftNoteDeath(hs, ht, uid);
+        else OwnLeftNoteDeath(0, -1, uid);
     }
     swfallen::Fallen s;
     s.uid = uid;
@@ -998,6 +1014,16 @@ void Reconcile(int gen)
         bool held = false;
         for (size_t t = 0; t < g_taken.size(); ++t) if (g_taken[t].uid == out.alive[i]) { held = true; break; }
         if (held) continue;
+        unsigned int rowSerial = 0;
+        for (size_t k = 0; k < g_list.size(); ++k) if (g_list[k].uid == out.alive[i]) { rowSerial = g_list[k].handSerial; break; }
+        if (OwnLeftNoteHoldsDeath(rowSerial) != 0)   // T-1062: the death came after the loaded save (coopown::LeftNoteHoldsDeath)
+        {
+            ++g_aliveHeldByNote;
+            DebugLog("[FALLEN] uid " + N(out.alive[i]) + " '" + RowName(out.alive[i]) + "' is alive in this game's loaded world, but this game's left note"
+                     " says he died AFTER the loaded save (his squad's newer record was not laid at this load - see the [OWNSAVE] MISMATCH line)"
+                     " - no ALIVE sent, the row stays on the list aliveHeldByNote=" + N(g_aliveHeldByNote));
+            continue;
+        }
         std::vector<char> b; swfallen::EncodeAlive(&b, out.alive[i]);
         swfallen::Taken tk; tk.uid = out.alive[i]; tk.kind = swfallen::kUpAlive; tk.epoch = g_worldEpoch;
         for (size_t k = 0; k < g_list.size(); ++k) if (g_list[k].uid == out.alive[i]) { tk.rowSerial = g_list[k].handSerial; g_list.erase(g_list.begin() + (long)k); break; }
@@ -1057,6 +1083,19 @@ void ResurrectNoteDeath(void* character, unsigned long long callerRet, int uniqu
     for (int i = 0; i < kRing; ++i)
         if (::InterlockedCompareExchange64(&g_ring[i], v, 0) == 0) { ::InterlockedIncrement64(&g_noted); return; }
     ::InterlockedIncrement64(&g_ringFull);
+}
+
+int ResurrectDeathsWaiting()
+{
+    for (int i = 0; i < kRing; ++i)
+        if (::InterlockedCompareExchange64(&g_ring[i], 0, 0) != 0) return 1;
+    return 0;
+}
+
+std::string ResurrectLeftMissWords()
+{
+    return ",leftMissed[queueFull=" + N((long long)::InterlockedCompareExchange64(&g_ringFull, 0, 0)) + ",blocked=" + N(g_snapBlocked)
+           + ",gone=" + N(g_snapGoneEarly) + ",fault=" + N(g_snapFault) + "],leftRepeat=" + N(g_snapRepeat);
 }
 
 void ResurrectTick()
@@ -1191,6 +1230,18 @@ static std::string BringBack(const char* src, const std::string& args, int n, in
     else if (EngineWritesBlocked()) { why = "the world is loading or closing"; ref = swtab::kRefNoWorld; }
     else if (StoreWelcomedThisLink() == 0) { why = "no world-server link (the list and the bring-back are the world server's)"; ref = swtab::kRefNoWorld; }
     else if (n < 0 || n >= (int)g_list.size()) { why = "no such entry on the fallen list"; ref = swtab::kRefFailed; }
+    if (why == 0)
+    {   // the row's own character alive in this loaded world (his squad's older save version brought him back while the row stays
+        // held): a bring-back would make a second copy of him
+        std::vector<swfallen::LiveChar> live;
+        ReadLive(&live);
+        if (swfallen::OriginalAlive(g_list[(size_t)n], live))
+        {
+            ++g_backOriginalHere;
+            why = "this person is alive in the loaded world (an older save brought him back) - a bring-back would make a second copy";
+            ref = swtab::kRefFailed;
+        }
+    }
     std::vector<swfallen::SquadRow> rows; std::vector< ::Character*> chars; int alive = 0, dead = 0, squads = 0;
     ::Character* anchor = 0;
     unsigned int anchorUid = besideUid;
@@ -1770,7 +1821,7 @@ std::string ResurrectReportLine()
          + " tableMalformed=" + N(g_tableMalformed) + " asks=" + N(g_asks) + " list=" + N((long long)g_list.size())
          + " takesSent=" + N(g_takesSent) + " takesNotSent=" + N(g_takesNotSent) + " takesResent=" + N(g_takesResent)
          + " takenWaiting=" + N((long long)g_taken.size()) + " namedBack=" + N(g_backUniques) + " addsResent=" + N(g_addsResent)
-         + " addsWaiting=" + N((long long)g_addWait.size()) + " addsDropped=" + N(g_addsDropped) + " aliveSent=" + N(g_aliveSent)
+         + " addsWaiting=" + N((long long)g_addWait.size()) + " addsDropped=" + N(g_addsDropped) + " aliveSent=" + N(g_aliveSent) + " aliveHeldByNote=" + N(g_aliveHeldByNote) + " backOriginalHere=" + N(g_backOriginalHere)
          + " savedSent=" + N(g_savedSent) + " undoSent=" + N(g_undoSent) + " unsaved=" + N((long long)g_unsaved.size())
          + " savedOwed=" + N((long long)g_savedOwed.size()) + " pending=" + N((long long)g_pendWire.size()) + " settledLoads=" + N(g_reconRuns)
          + " broughtBack=" + N(g_backs) + " refused=" + N(g_backRefused) + " recruitRoad=" + N(g_backRecruit)

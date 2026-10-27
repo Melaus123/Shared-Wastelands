@@ -198,8 +198,8 @@ inline int ParityAskListsBox(int cls, int writerHeld, int writerSlot, int areaSl
 const int kPaTake = 0, kPaLeave = 1, kPaByWriter = 2;
 inline int ParityAskBoxClass(int cls)
 {
-    if (cls == kOwnMe) return kPaLeave;
-    if (cls == kOwnPeer || cls == kOwnShared || cls == kOwnUnknown) return kPaByWriter;
+    if (cls == kOwnMe || cls == kOwnPeer) return kPaLeave;   /* a player's box: its world-server record is applied at the load (items.cpp BoxLiveApplyOne) */
+    if (cls == kOwnShared || cls == kOwnUnknown) return kPaByWriter;
     return kPaTake;
 }
 

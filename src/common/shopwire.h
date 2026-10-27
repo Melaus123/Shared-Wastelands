@@ -26,7 +26,9 @@
  *   Encode/Decode - the two tagged blocks ('SHR3' on the request - T-1 B5, 'SHR2' + the stock kind; 'SHR2' is still read as a
  *                   home's - and 'SHC1' on the confirm), after the trade block.
  *   StackMax/StackRoom - fold 2 (MED 1): the engine's stack limit (FUN_14075D550's rule) and what a matching stack can still take.
- *   Tail          - fold 2 (MED 2): 'SHK1' after MSG_ITEM_REVOKE's id - kind 0 the shop revoke, kind 1 the SHOP ACK.
+ *   Tail          - fold 2 (MED 2): 'SHK1' after MSG_ITEM_REVOKE's id - kind 0 a caravan's revoke, 1 the SHOP ACK, 2 the CANCEL to
+ *                   the area's holder, 3 its answer (CancelHolderDecide / CancelAskerOnAnswer / CancelSendDue).
+ *   SettleOnlyDue / SettleOnlyDecide - a lapsed home-shop trade asked of the area's current holder settle-only ('SHS1').
  *   Record*       - fold 2 (MED 2): the holder's applied record, kept until the ack (no expiry, never evicted; full = kVBusy).
  *   MakeEpoch/SameRecord - fold 2 (item 12): the requester's per-process epoch keys the record, so ids that restart never match. */
 #ifndef COOP_SHOPWIRE_H
@@ -41,6 +43,7 @@ namespace coopshop {
 const unsigned int kReqTag = 0x33524853u;   /* 'SHR3' little-endian (T-1 B5, protocol 121: 'SHR2' + u8 stock kind after the epoch) */
 const unsigned int kReqTagV4 = 0x34524853u; /* 'SHR4' (T-619): 'SHR3' + the requester's culture and local price multipliers (2 x f32) */
 const unsigned int kReqTagV2 = 0x32524853u; /* 'SHR2' (fold 2, protocol 96: + u32 epoch after entry; 'SHR1' was 92-94) - still decoded, as a home's stock */
+const unsigned int kReqTagSettle = 0x31534853u; /* 'SHS1': the 'SHR3' layout, a SETTLE-ONLY request (no price legs) */
 const unsigned int kCfTag = 0x31434853u;    /* 'SHC1' little-endian */
 const int kMaxStr = 96;                     /* a box key or a record sid; longer is refused */
 const int kMaxPieces = 32;                  /* piece keys a confirm may name */
@@ -72,7 +75,8 @@ struct ShopReq
     int stock;                /* T-1 B5: kStock* (an 'SHR2' block decodes as kStockHome) */
     float cult;               /* T-619: the culture multiplier the requester's price used (0 = not sent: an 'SHR3' block) */
     float local;              /* T-619: the local multiplier the requester's price used (0 = not sent) */
-    ShopReq() : has(0), keeperUid(0), n(0), unitPrice(0), entry(0), epoch(0), stock(kStockHome), cult(0.0f), local(0.0f) {}
+    int settleOnly;           /* 1 = SETTLE-ONLY ('SHS1'): answered from the shop record only, never applied fresh (SettleOnlyDue) */
+    ShopReq() : has(0), keeperUid(0), n(0), unitPrice(0), entry(0), epoch(0), stock(kStockHome), cult(0.0f), local(0.0f), settleOnly(0) {}
 };
 struct ShopCf
 {
@@ -466,6 +470,7 @@ const int kVFault = 9;         /* an engine call failed */
 const int kVMismatch = 10;     /* a malformed shop block (n / price / dir) */
 const int kVBusy = 11;         /* the holder's applied-record table is full (unacked records) - refused before anything moves */
 const int kVBuyerShort = 12;   /* an NPC purchase whose unit price is above the NPC's budget - refused, nothing moves */
+const int kVNotApplied = 13;   /* a settle-only request no holder applied (its cancelled marker is stored), or one no record can answer - refused for good */
 inline int HolderCommon(int homeFound, int heldHere, int keeperOk, int policyOk, int refuseNext, int blockOk)
 {
     if (blockOk == 0) return kVMismatch;
@@ -675,16 +680,16 @@ inline int NpcBuyShapeOk(int stock, unsigned int keeperUid, int n, int entry)
     return (keeperUid == 0 && n == 1 && entry == kEntryOne) ? 1 : 0;
 }
 /* T-1 B5: a request block of either form starts at `at` ('SHR3', or the older 'SHR2'). */
-inline int ReqTagAt(const char* p, size_t size, size_t at) { return (TagAt(p, size, at, kReqTag) != 0 || TagAt(p, size, at, kReqTagV2) != 0 || TagAt(p, size, at, kReqTagV4) != 0) ? 1 : 0; }
+inline int ReqTagAt(const char* p, size_t size, size_t at) { return (TagAt(p, size, at, kReqTag) != 0 || TagAt(p, size, at, kReqTagV2) != 0 || TagAt(p, size, at, kReqTagV4) != 0 || TagAt(p, size, at, kReqTagSettle) != 0) ? 1 : 0; }
 inline int EncodeReq(std::vector<char>* b, const ShopReq& r)
 {
     if (r.n <= 0 || r.n > kMaxUnits || r.unitPrice < 0 || r.entry < 0 || r.entry > kEntryDrag || StockKeyOk(r.stock, r.homeKey) == 0 || r.sid.empty() || r.epoch == 0) return 0;
     if (NpcBuyShapeOk(r.stock, r.keeperUid, r.n, r.entry) == 0) return 0;   /* T-608 */
     /* T-619: an 'SHR4' block carries the two price legs when both are numbers above 0 and below 100; a missing, out-of-range or NaN
        leg sends the 'SHR3' block - the trade goes on and the holder counts its legs unsent */
-    const int legs = (r.cult > 0.0f && r.cult < 100.0f && r.local > 0.0f && r.local < 100.0f) ? 1 : 0;
+    const int legs = (r.settleOnly == 0 && r.cult > 0.0f && r.cult < 100.0f && r.local > 0.0f && r.local < 100.0f) ? 1 : 0;
     std::vector<char> t;
-    PutU32(&t, (legs != 0) ? kReqTagV4 : kReqTag); PutU32(&t, r.keeperUid);
+    PutU32(&t, (r.settleOnly != 0) ? kReqTagSettle : ((legs != 0) ? kReqTagV4 : kReqTag)); PutU32(&t, r.keeperUid);
     if (!PutS(&t, r.homeKey) || !PutS(&t, r.sid)) return 0;
     PutU32(&t, (unsigned int)r.n); PutU32(&t, (unsigned int)r.unitPrice); t.push_back((char)(unsigned char)r.entry); PutU32(&t, r.epoch);
     t.push_back((char)(unsigned char)r.stock);   /* T-1 B5 ('SHR3'): the stock kind */
@@ -697,13 +702,13 @@ inline int EncodeReq(std::vector<char>* b, const ShopReq& r)
 inline int DecodeReq(const char* p, size_t size, size_t* at, ShopReq* r)
 {
     size_t a = *at; unsigned int tag = 0, n = 0, up = 0;
-    if (!GetU32(p, size, &a, &tag) || (tag != kReqTag && tag != kReqTagV2 && tag != kReqTagV4) || !GetU32(p, size, &a, &r->keeperUid)) return 0;
+    if (!GetU32(p, size, &a, &tag) || (tag != kReqTag && tag != kReqTagV2 && tag != kReqTagV4 && tag != kReqTagSettle) || !GetU32(p, size, &a, &r->keeperUid)) return 0;
     if (!GetS(p, size, &a, &r->homeKey) || !GetS(p, size, &a, &r->sid) || r->sid.empty()) return 0;
     if (!GetU32(p, size, &a, &n) || !GetU32(p, size, &a, &up) || a + 1 > size) return 0;
     r->entry = (unsigned char)p[a]; ++a;
     if (!GetU32(p, size, &a, &r->epoch) || r->epoch == 0) return 0;   /* fold 2 (item 12): the epoch, never 0 */
-    r->stock = kStockHome; r->cult = 0.0f; r->local = 0.0f;
-    if (tag == kReqTag || tag == kReqTagV4) { if (a + 1 > size) return 0; r->stock = (unsigned char)p[a]; ++a; }
+    r->stock = kStockHome; r->cult = 0.0f; r->local = 0.0f; r->settleOnly = (tag == kReqTagSettle) ? 1 : 0;
+    if (tag == kReqTag || tag == kReqTagV4 || tag == kReqTagSettle) { if (a + 1 > size) return 0; r->stock = (unsigned char)p[a]; ++a; }
     if (tag == kReqTagV4)
     {   /* T-619: the requester's two price legs, each a number above 0 and below 100 */
         unsigned int cb = 0, lb = 0;
@@ -748,21 +753,239 @@ inline int DecodeCf(const char* p, size_t size, size_t* at, ShopCf* c)
 
 /* ---------------- fold 2 (MED 2): the shop tail, the ack and the holder's record ---------------- */
 /* MSG_ITEM_REVOKE {u32 id} may carry 'SHK1' {u32 tag, u32 epoch, u8 kind} after the id: kind 0 = the SHOP REVOKE (the requester's
-   answer to a late ok - the holder undoes its halves), kind 1 = the SHOP ACK (the requester settled that ok - the holder drops its
-   record). A revoke with no tail is the E22b give revoke, unchanged. epoch = the requester's (never 0). */
+   answer to a late ok from a CARAVAN's holder - that game undoes its halves), kind 1 = the SHOP ACK (the requester settled that ok -
+   the holder drops its record), kind 2 = the CANCEL of a HOME shop's trade, to the game holding the shop's area now (the cancel body
+   below follows), kind 3 = that holder's CANCEL ANSWER (u8 kCa* follows). A revoke with no tail is the E22b give revoke, unchanged.
+   epoch = the requester's (never 0); any other kind is refused. */
 const unsigned int kTailTag = 0x314B4853u;   /* 'SHK1' little-endian */
-const int kTailRevoke = 0, kTailAck = 1;
-struct ShopTail { int has; unsigned int epoch; int kind; ShopTail() : has(0), epoch(0), kind(0) {} };
+const int kTailRevoke = 0, kTailAck = 1, kTailCancel = 2, kTailCancelAnswer = 3;
+/* THE CANCEL (kind 2). A late or repeated ok to a home shop's trade this game settled as a refusal goes to the game the area map names
+   as the holder of the shop's area NOW - never to the game first asked, which may no longer hold it - with what that holder needs to
+   undo a trade it may never have applied itself (an earlier holder applied it; the shop record names its units and money):
+   u8 stock | str home key | u32 keeper uid | u8 dir (0 buy, 1 sale) | u32 n | u32 price | str base sid | str company sid |
+   str material sid | str colour sid | f32 quality | f32 charges | u32 function kind | u32 level | u32 unique. */
+struct ShopCancel
+{
+    int stock;
+    std::string homeKey;
+    unsigned int keeperUid;
+    int dir, n, price;
+    Desc desc;
+    ShopCancel() : stock(kStockHome), keeperUid(0), dir(0), n(0), price(0) {}
+};
+struct ShopTail { int has; unsigned int epoch; int kind; ShopCancel cancel; int answer; ShopTail() : has(0), epoch(0), kind(0), answer(0) {} };
+/* THE HOLDER'S ANSWER (kind 3). kCaUndone: the record's entry was applied and its cancelled mark is in a STORED record (this game's
+   write echoed, or a record from the world server carries it); goods and money were undone here. kCaNotApplied: no holder applied
+   it - a cancelled marker is in a stored record, so no holder applies it later. kCaNotHolder: this game does not hold the shop's area
+   (or the shop does not resolve here). kCaUnknown: nothing can tell whether it was applied (below the asker's floor in the record, or
+   no record carries the keeper and no applied row is kept here). kCaRefused: an NPC purchase or a caravan - never undone this way.
+   kCaWriteRefused: the world server refused this game's write of the mark (it lost the area), or its copy is under a refusal. */
+const int kCaUndone = 0, kCaNotApplied = 1, kCaNotHolder = 2, kCaUnknown = 3, kCaRefused = 4, kCaWriteRefused = 5, kCaMax = 5;
+inline const char* CancelAnswerName(int a)
+{
+    return a == kCaUndone ? "undone" : a == kCaNotApplied ? "not-applied" : a == kCaNotHolder ? "not-holder" : a == kCaUnknown ? "unknown"
+         : a == kCaRefused ? "refused" : a == kCaWriteRefused ? "write-refused" : "?";
+}
+inline int CancelBodyOk(const ShopCancel& c)
+{
+    if (StockKeyOk(c.stock, c.homeKey) == 0 || c.dir < 0 || c.dir > 1 || c.n < 0 || c.n > kMaxUnits || c.price < 0) return 0;
+    if (c.desc.baseSid.empty() || !(c.desc.quality == c.desc.quality) || !(c.desc.charges == c.desc.charges)) return 0;
+    return 1;
+}
 inline void EncodeTail(std::vector<char>* b, unsigned int epoch, int kind)
 { PutU32(b, kTailTag); PutU32(b, epoch); b->push_back((char)(unsigned char)kind); }
+/* 1 = the kind-2 tail went on; 0 = nothing went on (epoch 0, a body out of range, a string over kMaxStr) */
+inline int EncodeCancelTail(std::vector<char>* b, unsigned int epoch, const ShopCancel& c)
+{
+    if (epoch == 0 || CancelBodyOk(c) == 0) return 0;
+    std::vector<char> t;
+    EncodeTail(&t, epoch, kTailCancel);
+    t.push_back((char)(unsigned char)c.stock);
+    if (!PutS(&t, c.homeKey)) return 0;
+    PutU32(&t, c.keeperUid); t.push_back((char)(unsigned char)c.dir); PutU32(&t, (unsigned int)c.n); PutU32(&t, (unsigned int)c.price);
+    if (!PutS(&t, c.desc.baseSid) || !PutS(&t, c.desc.companySid) || !PutS(&t, c.desc.materialSid) || !PutS(&t, c.desc.colorSid)) return 0;
+    unsigned int q = 0, ch = 0;
+    std::memcpy(&q, &c.desc.quality, 4); std::memcpy(&ch, &c.desc.charges, 4);
+    PutU32(&t, q); PutU32(&t, ch); PutU32(&t, (unsigned int)c.desc.functionKind); PutU32(&t, (unsigned int)c.desc.level); PutU32(&t, (unsigned int)c.desc.unique);
+    b->insert(b->end(), t.begin(), t.end());
+    return 1;
+}
+inline int EncodeCancelAnswerTail(std::vector<char>* b, unsigned int epoch, int answer)
+{
+    if (epoch == 0 || answer < 0 || answer > kCaMax) return 0;
+    EncodeTail(b, epoch, kTailCancelAnswer);
+    b->push_back((char)(unsigned char)answer);
+    return 1;
+}
+inline int DecodeCancelBody(const char* p, size_t size, size_t* at, ShopCancel* c)
+{
+    size_t a = *at;
+    unsigned int ku = 0, n = 0, pr = 0, q = 0, ch = 0, fk = 0, lv = 0, un = 0;
+    if (a + 1 > size) return 0;
+    c->stock = (unsigned char)p[a]; ++a;
+    if (!GetS(p, size, &a, &c->homeKey) || !GetU32(p, size, &a, &ku) || a + 1 > size) return 0;
+    c->dir = (unsigned char)p[a]; ++a;
+    if (!GetU32(p, size, &a, &n) || !GetU32(p, size, &a, &pr)) return 0;
+    if (!GetS(p, size, &a, &c->desc.baseSid) || !GetS(p, size, &a, &c->desc.companySid) || !GetS(p, size, &a, &c->desc.materialSid)
+        || !GetS(p, size, &a, &c->desc.colorSid)) return 0;
+    if (!GetU32(p, size, &a, &q) || !GetU32(p, size, &a, &ch) || !GetU32(p, size, &a, &fk) || !GetU32(p, size, &a, &lv) || !GetU32(p, size, &a, &un)) return 0;
+    if (n > (unsigned int)kMaxUnits || pr > 0x7FFFFFFFu) return 0;
+    c->keeperUid = ku; c->n = (int)n; c->price = (int)pr;
+    std::memcpy(&c->desc.quality, &q, 4); std::memcpy(&c->desc.charges, &ch, 4);
+    c->desc.functionKind = (int)fk; c->desc.level = (int)lv; c->desc.unique = (int)un;
+    if (CancelBodyOk(*c) == 0) return 0;
+    *at = a;
+    return 1;
+}
 inline int DecodeTail(const char* p, size_t size, size_t* at, ShopTail* t)
 {
     size_t a = *at; unsigned int tag = 0;
     if (!GetU32(p, size, &a, &tag) || tag != kTailTag || !GetU32(p, size, &a, &t->epoch) || a + 1 > size) return 0;
     t->kind = (unsigned char)p[a]; ++a;
-    if (t->kind > kTailAck || t->epoch == 0) return 0;
+    if (t->kind > kTailCancelAnswer || t->epoch == 0) return 0;
+    if (t->kind == kTailCancel && DecodeCancelBody(p, size, &a, &t->cancel) == 0) return 0;
+    if (t->kind == kTailCancelAnswer)
+    {
+        if (a + 1 > size) return 0;
+        t->answer = (unsigned char)p[a]; ++a;
+        if (t->answer > kCaMax) return 0;
+    }
     t->has = 1; *at = a;
     return 1;
+}
+/* THE HOLDER'S STEP ON A CANCEL. npcBuy / caravan: the stock kind named; stockOk: the stock resolves here and this game holds it
+   (ShopStockResolve); exact: the current area map names this game as the holder of the shop's area; carried: a kept shop record names
+   the keeper's squad; known: no record will carry it (a record is kept here without the squad, or the world server's records of the
+   area have all arrived and none is there); stale: this game's copy is under a refusal; entry: the request's entry (shoprec kRs*: 0
+   none, 1 applied, 2 undone, 3 below the asker's floor, 4 cancelled with its undo owed, 5 its undo claimed, 6 the cancel refused - the
+   trade stands: answered kCaRefused once stored); marker: the undone
+   entry moved nothing; stored: the entry in the world server's last record here (0 applied or none, 1 owed or claimed, 2 undone); appliedHere: this game keeps the
+   applied row (it applied it); descOk: the cancel names this record's shop and no fewer units than the entry moved (always 1 with the
+   applied row here).
+   kChAnswerNow: *answer goes back at once. kChMarkOwed: mark the applied entry owed - nothing is undone here; the exact holder that
+   reads the owed mark stored claims the undo, applies it once its claim is stored and marks it undone (the owed sweep) - the answer
+   kCaUndone waits for that. kChMarker: write a marker, answer kCaNotApplied once it is stored. kChUndoLocal: no record carries
+   the keeper - undo from the applied row kept here, answer kCaUndone at once. kChWaitStored: a mark in this game's copy only - the
+   answer waits until it is stored. kChNoAnswer: not answerable yet (the shop's record has not arrived here, or the copy is under a
+   refusal) - nothing is answered; the asker's repeat asks again. */
+const int kChAnswerNow = 0, kChMarkOwed = 1, kChMarker = 2, kChUndoLocal = 3, kChWaitStored = 4, kChNoAnswer = 5;
+inline int CancelHolderDecide(int npcBuy, int caravan, int stockOk, int exact, int carried, int known, int stale, int entry, int marker,
+                              int stored, int appliedHere, int descOk, int* answer)
+{
+    *answer = kCaUnknown;
+    if (npcBuy != 0 || caravan != 0) { *answer = kCaRefused; return kChAnswerNow; }
+    if (stockOk == 0 || exact == 0) { *answer = kCaNotHolder; return kChAnswerNow; }
+    if (carried == 0)
+    {
+        if (appliedHere != 0) return kChUndoLocal;
+        return (known != 0) ? kChAnswerNow : kChNoAnswer;
+    }
+    if (stale != 0) return kChNoAnswer;
+    if (entry == 3) return kChAnswerNow;
+    if (entry == 6) { *answer = kCaRefused; return (stored >= 2) ? kChAnswerNow : kChWaitStored; }
+    if (entry == 2)
+    {
+        *answer = (marker != 0) ? kCaNotApplied : kCaUndone;
+        return (stored >= 2) ? kChAnswerNow : kChWaitStored;
+    }
+    if (entry == 1 || entry == 4 || entry == 5)
+    {
+        if (descOk == 0) { *answer = kCaRefused; return kChAnswerNow; }
+        *answer = kCaUndone;
+        return (entry == 1) ? kChMarkOwed : kChWaitStored;
+    }
+    return kChMarker;
+}
+/* THE ASKER'S ENDING PER ANSWER: undone, not applied, refused and unknown end the cancel (unknown is counted: the two games may be one
+   trade apart); not holder and write refused keep it. */
+const int kCeEnd = 0, kCeAwaitHolderChange = 1;
+inline int CancelAskerOnAnswer(int answer) { return (answer == kCaNotHolder || answer == kCaWriteRefused) ? kCeAwaitHolderChange : kCeEnd; }
+/* WHICH ANSWER THE ASKER TAKES: only one from the game the cancel was last sent to (an earlier holder's answer may describe a record
+   that has moved on). kTakeIgnored; kTakeEnded; kTakeKept (not holder / write refused: that game is not asked again for kRefusedHoldMs
+   unless the map names another holder). */
+const int kTakeIgnored = 0, kTakeEnded = 1, kTakeKept = 2;
+inline int CancelAnswerTake(int sentSlot, int fromSlot, int answer)
+{
+    if (sentSlot < 0 || fromSlot != sentSlot) return kTakeIgnored;
+    return (CancelAskerOnAnswer(answer) == kCeEnd) ? kTakeEnded : kTakeKept;
+}
+/* WHEN THE ASKER SENDS A KEPT CANCEL - its once-a-second step, until an ending answer: no event marks a cancel or an answer lost on
+   the way, so an unanswered cancel goes again each second, as a pending request does, and the holder answers a repeat from its record.
+   holder: the slot the area map names as the holder of the shop's area now (-1 not known, -2 frozen: its holder left the world);
+   mySlot: this game's; refusedBy / refusedAgeMs: the slot that answered not-holder / write-refused and how long ago - not asked again
+   until the map names another holder or kRefusedHoldMs passed (a holder briefly not exact, in its load window, is asked again).
+   kCsLocal: this game holds the area - its own holder step answers it here. */
+const unsigned int kRefusedHoldMs = 10000u;
+const int kCsWait = 0, kCsSend = 1, kCsLocal = 2;
+inline int CancelSendDue(int holder, int mySlot, int refusedBy, unsigned int refusedAgeMs)
+{
+    if (holder < 0) return kCsWait;
+    if (refusedBy >= 0 && holder == refusedBy && refusedAgeMs < kRefusedHoldMs) return kCsWait;
+    return (mySlot >= 0 && holder == mySlot) ? kCsLocal : kCsSend;
+}
+/* A PENDING HOME-SHOP TRADE WHOSE ASKED GAME CANNOT ANSWER, or whose settle-only holder could not answer from a record (kVNotHolder).
+   homeStock: a home shop with a known area square; holder: as CancelSendDue; refusedBy / refusedAgeMs: the game that could not answer.
+   kLrSettleOnly: the SAME request (same id, same process epoch) goes to that holder flagged settle-only - answered from the shop record
+   only, never applied fresh; kLrLocal: this game holds the area - its own record decides (the settle-only decision run here); kLrWait:
+   no holder known (or only the game that could not answer, within kRefusedHoldMs) - the trade stays pending and is asked once the map
+   names a holder (world teardown forgets it, as any pending trade); kLrLapse: a caravan, or a shop with no area square - settled here
+   as a refusal. */
+const int kLrLapse = 0, kLrSettleOnly = 1, kLrLocal = 2, kLrWait = 3;
+inline int SettleOnlyDue(int homeStock, int holder, int mySlot, int refusedBy, unsigned int refusedAgeMs)
+{
+    if (homeStock == 0) return kLrLapse;
+    const int s = CancelSendDue(holder, mySlot, refusedBy, refusedAgeMs);
+    return (s == kCsWait) ? kLrWait : ((s == kCsLocal) ? kLrLocal : kLrSettleOnly);
+}
+/* A PENDING HOME-SHOP TRADE WAITING FOR A HOLDER (soWait) AROUND A GAME SAVE: what it holds out of the save goes back in for it and
+   is taken out again when the save returns - a buy's reserved price into the purse (kPsPurse), a sale's escrowed item into the
+   seller's inventory (kPsEscrow); kPsNone: nothing held, or not waiting (a trade asked of a game is answered within seconds). World
+   teardown drops a waiting trade with the world (its characters are gone by then), counted. */
+const int kPsNone = 0, kPsPurse = 1, kPsEscrow = 2;
+inline int PendSaveHold(int used, int soWait, int dir, int held, int haveEscrow)
+{
+    if (used == 0 || soWait == 0) return kPsNone;
+    if (dir == 0) return (held != 0) ? kPsPurse : kPsNone;
+    return (haveEscrow != 0) ? kPsEscrow : kPsNone;
+}
+/* WHAT ONE PENDING ROW NEEDS AROUND A SAVE (phase 0 before it; 1 after it, and each tick, answer or leave): a hold still put back
+   is taken out FIRST, whatever the phase (a save that did not finish left it) - never put back over it; only then, before a save,
+   does a waiting trade put its hold back (PendSaveHold). kPaNone, kPaTakeOut, kPaPurse, kPaEscrow. */
+const int kPaNone = 0, kPaTakeOut = 1, kPaPurse = 2, kPaEscrow = 3;
+inline int PendSaveAct(int phase, int saveHeld, int used, int soWait, int dir, int held, int haveEscrow)
+{
+    if (saveHeld != kPsNone) return kPaTakeOut;
+    if (phase != 0) return kPaNone;
+    const int h = PendSaveHold(used, soWait, dir, held, haveEscrow);
+    return (h == kPsPurse) ? kPaPurse : ((h == kPsEscrow) ? kPaEscrow : kPaNone);
+}
+/* A HOLD TAKEN OUT AGAIN - after the save, or a save that did not finish (taken out first at the next save's start, each tick, an answer
+   or a leave, before anything reads the row): tookOut 0 ends the trade as a refusal with the give-back already in place - *held 0 (a
+   buy's price stays with the buyer: no refund follows), *dropEscrow 1 (a sale's item stays with the seller: nothing is destroyed or
+   given back) - and a later ok from a holder is answered by a cancel. 1 = end the trade. */
+inline int PendSaveTakeEnd(int saveHeld, int tookOut, int* held, int* dropEscrow)
+{
+    *dropEscrow = 0;
+    if (saveHeld == kPsNone || tookOut != 0) return 0;
+    if (saveHeld == kPsPurse) *held = 0; else *dropEscrow = 1;
+    return 1;
+}
+/* THE HOLDER'S ANSWER TO A SETTLE-ONLY REQUEST, from the shop record only. keeperFound: the keeper resolves here; exact / carried /
+   known / stale / entry / stored: as CancelHolderDecide. kSoFromRecord: a holder applied it - ok from the entry, nothing moves;
+   kSoMarker: no entry - a cancelled marker is written and the refusal waits until it is stored (a refused write decides again: an
+   applied entry stored meanwhile is answered from); kSoRefuse: refused for good (kVNotApplied: cancelled and stored, below the asker's
+   floor, or no record will carry the keeper); kSoNotHolder: not answerable here now (not the exact holder, the record not arrived, a
+   refused copy) - refused with kVNotHolder, the asker asks again; kSoWaitStored: cancelled in this game's copy only - waits. */
+const int kSoFromRecord = 0, kSoMarker = 1, kSoRefuse = 2, kSoNotHolder = 3, kSoWaitStored = 4;
+inline int SettleOnlyDecide(int keeperFound, int exact, int carried, int known, int stale, int entry, int stored)
+{
+    if (keeperFound == 0 || exact == 0) return kSoNotHolder;
+    if (carried == 0) return (known != 0) ? kSoRefuse : kSoNotHolder;
+    if (stale != 0) return kSoNotHolder;
+    if (entry == 1) return kSoFromRecord;
+    if (entry == 0) return kSoMarker;
+    if (entry == 2) return (stored != 0) ? kSoRefuse : kSoWaitStored;
+    return kSoRefuse;
 }
 /* The holder's applied record: kept until the requester's ACK - no time expiry, never evicted. Keyed {peer, epoch, id}: request ids
    restart with the requester's process, the epoch does not (item 12). */

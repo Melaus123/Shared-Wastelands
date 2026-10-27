@@ -31,6 +31,7 @@ namespace coop {
 namespace {
 std::vector<swteam::WireTeam> g_table;
 int g_tableGen = -1;                 // StoreLinkGen() of the link that sent g_table (-1 = none: never sent, or cleared)
+volatile long g_tableNo = 0;           // T-1047 step 5 fold 2: the table's change number - moved at every table that arrives and every clear (TeamTableNo)
 int g_askedGen = -1;                 // StoreLinkGen() of the link an ASK went on since the copy was cleared (-1 = none)
 std::string g_tableSaid;
 struct WaitingInvite { int on; unsigned fromSlot; std::string teamName; unsigned long at; unsigned serial; bool answered; WaitingInvite() : on(0), fromSlot(0), at(0), serial(0), answered(false) {} };
@@ -886,6 +887,7 @@ void TeamArrive(const std::vector<char>& payload)
     if (d.kind == swteam::kDnTable)
     {
         g_table = d.table; g_tableGen = StoreLinkGen();
+        ::InterlockedIncrement(&g_tableNo);   /* T-1047 step 5 fold 2: the own-piece check reads the change (TeamTableNo) */
         {   /* teammates who left (left, removed, or the team ended): the founder's fill waits for the next record; the marks of this
                game's side towards them not gathered yet (the pin's own writes) are dropped, so no gather sends the pin's value as the
                team's stance; the own-change number now is kept (an own change after it wins over the departure's side). The last
@@ -1080,6 +1082,7 @@ void TeamForget(const char* why, bool linkLost)
     }
     const bool hadTable = g_tableGen >= 0;
     g_table.clear(); g_tableGen = -1; g_askedGen = -1; g_tableSaid.clear();
+    ::InterlockedIncrement(&g_tableNo);   /* T-1047 step 5 fold 2 */
     g_pinned.clear(); g_pinLookOwed = false;
     g_pinFailSaid.clear();
     PolicyTeammateFactions(0, 0); g_cellsOwed = true;   /* the box stub's cells empty: the factions they named may be freed */
@@ -1300,6 +1303,7 @@ bool TeamIsFounder(int slot)
 }
 std::string TeamPlayerName(int slot) { return slot < 0 ? std::string() : ScreenNameOf((unsigned)slot); }
 bool TeamTableKnown() { return g_tableGen >= 0 && g_tableGen == StoreLinkGen(); }
+long TeamTableNo() { return ::InterlockedCompareExchange(&g_tableNo, 0, 0); }
 bool TeamMatesSettling() { return teamscreen::MatesSettling(g_matesChangedMs, ::GetTickCount()); }
 bool TeamMateQuietAnyThread(int me, int slot)
 {

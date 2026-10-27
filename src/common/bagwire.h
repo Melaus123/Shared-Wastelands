@@ -399,7 +399,7 @@ inline int DecodeKitBags(const char* p, size_t size, size_t at, size_t kitCount,
    pack names the pack by where it sits - the parent's (a character uid or a box key, carried by the message itself) section and
    cell - and the message's own section / x / y name the cell inside the pack. It rides LAST on MSG_ITEM_MOVE (after everything
    else: op 0 after its BAG1 / OWN1 tail, op 2 after its base sid) and on MSG_ITEM_REQUEST (after its OWN1 block):
-     marker u32 'BAGP' | str section (1..kBagMaxSection) | u32 x | u32 y (each < kBagMaxCell) | str sid (0..kBagMaxSid)
+     marker u32 'BAGP' | str section (1..kBagMaxSection) | u32 x | u32 y (each < kBagMaxCell) | str sid (0..kBagMaxSid) | str packSid (0..kBagMaxSid)
    `sid` is the record at the inner cell when the sender knows it (a request's TAKE: S2-66's same-record search); empty on a move.
    Absent = the move is not inside a pack. Cut or out of range: the reader refuses the message - never a guess at a path. */
 const unsigned int kBagPathMarker = 0x50474142u;   /* 'B','A','G','P' little-endian */
@@ -410,6 +410,8 @@ struct BagPath
     std::string section;       /* the PARENT's section the pack sits in, e.g. "backpack_attach" */
     unsigned int x, y;         /* the pack's cell there */
     std::string sid;           /* the record at the inner cell (a request only; may be empty) */
+    std::string packSid;       /* the record of the pack at that cell (a request only; may be empty): the writer refuses a request whose
+                                  cell holds a pack of another record */
     BagPath() : has(0), x(0), y(0) {}
 };
 
@@ -425,13 +427,15 @@ inline bool EncodeBagPath(std::vector<char>* b, const BagPath& p)
 {
     if (b == 0) return false;
     if (p.has == 0) return true;
-    if (p.section.empty() || p.section.size() > kBagMaxSection || p.sid.size() > kBagMaxSid || p.x >= kBagMaxCell || p.y >= kBagMaxCell)
+    if (p.section.empty() || p.section.size() > kBagMaxSection || p.sid.size() > kBagMaxSid || p.packSid.size() > kBagMaxSid || p.x >= kBagMaxCell
+        || p.y >= kBagMaxCell)
         return false;
     BagPutU32(b, kBagPathMarker);
     BagPutStr(b, p.section);
     BagPutU32(b, p.x);
     BagPutU32(b, p.y);
     BagPutStr(b, p.sid);
+    BagPutStr(b, p.packSid);
     return true;
 }
 
@@ -446,6 +450,7 @@ inline int DecodeBagPath(const char* p, size_t size, size_t at, BagPath* out, si
     if (!BagGetStr(p, size, &off, kBagMaxSection, &r.section) || r.section.empty()) return kBagBad;
     if (!BagGetU32(p, size, &off, &r.x) || !BagGetU32(p, size, &off, &r.y) || r.x >= kBagMaxCell || r.y >= kBagMaxCell) return kBagBad;
     if (!BagGetStr(p, size, &off, kBagMaxSid, &r.sid)) return kBagBad;
+    if (!BagGetStr(p, size, &off, kBagMaxSid, &r.packSid)) return kBagBad;
     r.has = 1;
     if (out) *out = r;
     if (end) *end = off;

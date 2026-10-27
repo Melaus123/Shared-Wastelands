@@ -68,6 +68,7 @@ bool TeamInvitationWaiting(int* fromSlot, std::string* teamName, unsigned* seria
 // MAIN THREAD: this game holds the membership table the current link sent (false while the link is down or before its table) -
 // only then is what the screens read of the table current.
 bool TeamTableKnown();
+long TeamTableNo();   // T-1047 step 5 fold 2: the team table's change number (moves at every table that arrives and every clear), any thread
 // MAIN THREAD: this player's teammates changed within teamscreen::kMatesSettleMs - the PLAYERS table waits for the settled values.
 bool TeamMatesSettling();
 // ANY THREAD: player `slot`'s side towards player `me` moved by the team's own write (the two share a faction, or joined or

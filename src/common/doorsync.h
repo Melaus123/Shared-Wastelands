@@ -726,4 +726,18 @@ inline int DoorWordLinePrints(int hasSlot, long keyLines, long totalLines, int i
     return (totalLines <= totalCap) ? 1 : 0;
 }
 
+/* A lock pick's tick (0x297E10) on the door road: 1 = the tick unlocked the lock (locked 1 before it, 0 after) and the lock belongs to a
+   door (lockOfDoor: the lock's owner is a door whose lock is this one) - the door road notes the door. A cage's, a box's or shackles'
+   lock, or a tick that did not unlock, notes nothing. */
+inline int LockPickedRule(int lockedBefore, int lockedAfter, int lockOfDoor)
+{
+    return (lockedBefore != 0 && lockedAfter == 0 && lockOfDoor != 0) ? 1 : 0;
+}
+
+/* DoorBrokenKeeps: a broken door stands open (the engine's break opens it and nothing shuts it until a repair mends it) - a word
+   that would close it (holder state closed or closing) is not applied; the door keeps its own state. 1 = keep */
+inline int DoorBrokenKeeps(int broken, int holderState)
+{
+    return (broken != 0 && holderState != kDoorOpen && holderState != kDoorOpening) ? 1 : 0;
+}
 }   /* namespace coopdoor */

@@ -132,6 +132,62 @@ inline int WriterLiftMarks(int wasForeign, int nowForeign)
     return (wasForeign != 0 && nowForeign == 0) ? 1 : 0;
 }
 
+/* THE DIRTY PASS'S ORDER (store.cpp HeartbeatTick). A candidate is a group marked dirty, owed a visit the byte budget deferred,
+ * or both. `dirty` here = the mark includes a change to the record (dirtyItem: an item move, a death, a member leaving, money, a
+ * restock, a home); a wake or a writer lift alone is not one. Every CHANGED group goes ahead of the rest: on a game that writes many
+ * groups the routine debt never empties, and a changed group queued behind it would wait for its 30 s floor instead of the 2 s gap.
+ * Changed groups go oldest change first (a group deferred after its change keeps its place); the rest oldest deferral first, so a
+ * group only woken or lifted and not owed (owedAgeMs 0) comes after the owed ones. `markAgeMs` = now - when its change was first
+ * marked; `owedAgeMs` = now - when it was first deferred (0 when not owed). */
+struct PassKey { int dirty; unsigned int markAgeMs; unsigned int owedAgeMs; };
+/* 1 = `a` goes ahead of `b`; 0 for equals, so a list built with PassInsertAt keeps the order the candidates came in */
+inline int PassAhead(const PassKey& a, const PassKey& b)
+{
+    if ((a.dirty != 0) != (b.dirty != 0)) return a.dirty != 0 ? 1 : 0;
+    if (a.dirty != 0) return a.markAgeMs > b.markAgeMs ? 1 : 0;
+    return a.owedAgeMs > b.owedAgeMs ? 1 : 0;
+}
+/* where a new candidate `c` goes in `keys` (n of them, already in pass order): after every candidate it does not go ahead of */
+inline unsigned int PassInsertAt(const PassKey* keys, unsigned int n, const PassKey& c)
+{
+    unsigned int at = n;
+    while (at > 0 && PassAhead(c, keys[at - 1]) != 0) --at;
+    return at;
+}
+/* THE DEBT'S SHARE. Changed groups go first, so under a long run of changes (a fight, a busy shop) a group that is only owed could
+ * wait for ever: a giant needs an empty second and a changed group sent ahead of it fills that second, and a normal record finds
+ * the second's budget spent. So once every kDebtShareMs the first group with no change in the pass - the oldest owed one, by the
+ * pass's order - goes first instead, if it has waited kDebtMaxWaitMs behind the budget. A changed group then waits at most one
+ * pass more in kDebtShareMs. Returns that group's place in `keys` (pass order), or n for none. `sinceLastShareMs` = the time since
+ * a share last went out. */
+const unsigned int kDebtShareMs = 5000;
+inline unsigned int DebtShareAt(const PassKey* keys, unsigned int n, unsigned int sinceLastShareMs)
+{
+    if (sinceLastShareMs < kDebtShareMs) return n;
+    for (unsigned int i = 0; i < n; ++i)
+        if (keys[i].dirty == 0) return keys[i].owedAgeMs >= kDebtMaxWaitMs ? i : n;
+    return n;
+}
+/* THE PASS'S SENDING ORDER. `keys` in pass order (PassInsertAt: the changed groups, then the rest). The changed groups and the rest
+ * take turns, a changed group first: a change goes out at the pass's first serialise, and a run of changes (a fight) cannot hold
+ * the owed groups past their floor, since every other place is theirs. The debt's share, when there is one (DebtShareAt), goes
+ * ahead of all. `order` gets the n places into `keys`; returns the share's place in `keys`, or n for none. */
+inline unsigned int PassOrder(const PassKey* keys, unsigned int n, unsigned int sinceLastShareMs, unsigned int* order)
+{
+    const unsigned int share = DebtShareAt(keys, n, sinceLastShareMs);
+    unsigned int nc = 0;
+    while (nc < n && keys[nc].dirty != 0) ++nc;
+    unsigned int c = 0, r = nc, o = 0;
+    if (share < n) order[o++] = share;
+    while (c < nc || r < n)
+    {
+        if (c < nc) order[o++] = c++;
+        while (r < n && r == share) ++r;
+        if (r < n) order[o++] = r++;
+    }
+    return share;
+}
+
 }   /* namespace coophb */
 
 #endif

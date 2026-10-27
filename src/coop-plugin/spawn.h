@@ -520,6 +520,9 @@ std::string NameReportLine();                                     // "[NAME] REP
 // slave1: a copy's slave state follows its owner (MSG_SLAVE, protocol 65). Hooks: StateBroadcastData::setSlaveState 0x5A3EB0
 // (table "SlaveStateSet") and StateBroadcastData::periodicUpdate 0x5A44C0 ("SlaveStatePeriodic"), both on the AI worker.
 void InstallSlaves();
+// T-1084: Ownerships::setHomeBuilding hooked - a world squad's home building set by the engine marks its record due (spawn.cpp).
+void InstallHomeWatch();
+std::string HomeWatchReport();   // the homeHook[...] counts for the [SAVE] heartbeat line (plain counter reads)
 /* PROBE P140 BEGIN */
 /* PROBE P140 (T-806, log only): the cage-use task start 0x357FE0 hooked (table row CageUseStart), and a player's use-cage order
    (task 0x6B) logged per selected character from build.cpp's order / Shift-job hooks. MAIN THREAD install; P140PlayerOrder ANY

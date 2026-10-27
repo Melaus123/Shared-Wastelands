@@ -142,6 +142,10 @@ long long g_doorApplyIneffective = 0;        /* the write was made and the state
 long long g_doorGaveUp = 0;                  /* three ineffective corrections on one door - stopped trying */
 /* ---- T-160: THE PLAYED SWING AND THE APPLIED LOCK ---- */
 long long g_doorPlayStarted = 0;             /* applies made by openDoor / closeDoor (a SPAN of doorApplied) */
+long long g_doorBrokenKept = 0;              /* words to close a broken door not applied: it keeps its own state (DoorBrokenKeeps) */
+long long g_doorRecBrokenOpened = 0;         /* broken doors the record's apply found closed and opened */
+long long g_doorRecBreak = 0, g_doorRecMend = 0, g_doorRecLevel = 0, g_doorRecLockBroken = 0, g_doorRecHealth = 0;   /* the record's apply, per value written */
+long long g_doorRecMendReArmed = 0;          /* doors the record mended whose row takes the holder's word again (DoorsRecApply) */
 long long g_doorSnapped = 0;                 /* applies made by setDoorState (the other SPAN): played + snapped = doorApplied */
 long long g_doorPlayRefused = 0;             /* openDoor / closeDoor left the door unmoved - snapped instead */
 long long g_doorPlayLanded = 0;              /* played swings that reached the holder's state */
@@ -1778,6 +1782,14 @@ int ApplyToRow(DoorRow* r, DoorHeldRow* h, int reason)
                 return 0;
             }
         }
+        if (coopdoor::DoorBrokenKeeps(broken, (int)h->state) != 0)
+        {   /* a broken door stands open until a repair mends it: the word to close it is not applied, and the row stops asking until
+               a new word lands (the door's own state is what this game shows) */
+            ++g_doorBrokenKept;
+            ::InterlockedExchange(&r->holderWord, 0);
+            ::InterlockedExchange(&r->forcedOpen, 0);
+            return 0;
+        }
         /* T-160: PLAYED OR SNAPPED (coopdoor::DoorApplyHow).  A played swing is measured by what the
            engine call left behind - OPENING or CLOSING - and a call that left the door unmoved falls
            through to the snap on the same visit. */
@@ -1931,6 +1943,58 @@ void DoorsForgetOwner(void* building)
     }
 }
 
+/* ---- A PICKED LOCK ON THE DOOR ROAD ----
+   The lock pick's tick 0x297E10 (lock, skill difference, amount), called each tick by the pick-lock job, writes only the lock's locked
+   byte (+0x20 = 0) when it succeeds - none of the door road's hooks sees that until the door next moves. Hooked: after the engine's
+   tick, a lock that went from locked to unlocked and belongs to a door (the lock's owner +0x08 is a door whose DoorLock +0x370 is this
+   lock and whose parent lists it) is noted, so the door road carries the unlock - every door, a town's too. Cages, boxes and shackles
+   use the same routine and are left alone (coopdoor::LockPickedRule). */
+unsigned long long kLockPickTickRva = 0; static coop::AddrReg kLockPickTickRva_reg("LockPickTick", &kLockPickTickRva);   /* Steam_1.0.65 0x297E10, 1.0.68 0x297E50 */
+const unsigned char kPrologueLockPick[8] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0xF3, 0x0F };
+const size_t kLockOwner = 0x08;   /* DoorLock+0x08: the object the lock belongs to (0x297E10 calls its vt+0x228 on success) */
+typedef unsigned char (*LockPickTickFn)(void* lock, float skillDiff, float amount);
+LockPickTickFn orig_lockPickTick = 0;
+volatile LONG64 g_doorPicked = 0, g_lockPickedNotDoor = 0;
+/* the lock's locked byte and its owner, in one guarded frame. POD ONLY (C2712) */
+int LockPickReadPod(void* lock, int* locked, void** owner)
+{
+    __try
+    {
+        *locked = (*(const unsigned char*)((const char*)lock + kLockLocked) != 0) ? 1 : 0;
+        *owner = *(void* const*)((const char*)lock + kLockOwner);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+unsigned char detour_lockPickTick(void* lock, float skillDiff, float amount)
+{
+    const uintptr_t ret = RetRva(_ReturnAddress());
+    int l0 = 0, l1 = 0;
+    void* o0 = 0;
+    void* own = 0;
+    const int r0 = (lock != 0) ? LockPickReadPod(lock, &l0, &o0) : 0;
+    const unsigned char rc = orig_lockPickTick(lock, skillDiff, amount);
+    if (r0 == 0 || LockPickReadPod(lock, &l1, &own) == 0) return rc;
+    void* parent = 0;
+    int index = -1, s = 0, d = 0, lk = 0, wt = 0, br = 0;
+    const int doorLock = (own != 0 && DoorPlausible(own) != 0 && DoorsLockOf(own) == lock && DoorReadPod(own, &s, &d, &lk, &wt, &br) != 0
+                          && DoorsDoorOfParent(own, &parent, &index) != 0) ? 1 : 0;
+    if (coopdoor::LockPickedRule(l0, l1, doorLock) != 0)
+    {
+        const long long n = (long long)::InterlockedIncrement64(&g_doorPicked);
+        NoteDoor(own, ret, "pickLock", 0);
+        if (n <= 20)
+        {
+            char t[200];
+            _snprintf(t, 199, "[DOOR] a door's lock was picked here (door %p, index %d in its piece) - noted on the door road; doorPicked=%lld", own, index, n);
+            t[199] = 0;
+            DebugLog(t);
+        }
+    }
+    else if (l0 != 0 && l1 == 0) ::InterlockedIncrement64(&g_lockPickedNotDoor);
+    return rc;
+}
+
 void InstallDoors()
 {
     g_base = (uintptr_t)::GetModuleHandleA(0);
@@ -1987,6 +2051,11 @@ void InstallDoors()
             ErrorLog("[DOOR] AddHook lockDoor 0x2969B0 FAILED - the re-lock of a closing door is not seen");
         else ++g_hooked;
     }
+    if (kLockPickTickRva == 0 || PrologueMatches(kLockPickTickRva, kPrologueLockPick, 8) == 0)
+        ErrorLog("[DOOR] lock pick tick 0x297E10 prologue mismatch (or no address row) - a picked lock is carried only when the door next moves");
+    else if (coop::AddHook((void*)(g_base + kLockPickTickRva), (void*)&detour_lockPickTick, (void**)&orig_lockPickTick) != coop::SUCCESS)
+        ErrorLog("[DOOR] AddHook lock pick tick 0x297E10 FAILED - a picked lock is carried only when the door next moves");
+    else DebugLog("[DOOR] lock pick tick 0x297E10 hooked: a door's picked lock is noted on the door road");
     if (kLockButtonRva == 0 || PrologueMatches(kLockButtonRva, kPrologueLockButton, 8) == 0)
         ErrorLog("[DOOR] lockButton 0x5465D0 prologue mismatch - a lock press is not seen");
     else
@@ -3138,6 +3207,209 @@ void* DoorsLockOf(void* door)
     if (door == 0) return 0;
     __try { return *(void* const*)((const char*)door + kDoorLockPtr); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* ---- A BUILT PIECE'S DOORS ON ITS RECORD (build.cpp PcrDoorsRead / PcdApplyDoors / BdDoorHitHere) ---- */
+const size_t kDoorRecHealth = 0x164, kDoorRecHealthMax = 0x188;   /* the door's health (vt+0x228 returns this+0x160; the hit and the repair move +4) and its max */
+const size_t kDoorRecLockLevel = 0x00, kDoorRecLockBroken = 0x21;   /* the DoorLock's level (0..100) and its broken flag */
+const size_t kVtDoorSetBroken = 0x310;   /* DoorStuff::setBroken (1.0.65 0x2ADC60): writes +0x3EC only */
+typedef void (*DoorSetBrokenFn)(void* door, bool broken);
+/* 1 = the door's parent (+0x368) lists it, at *indexOut. ANY THREAD: guarded plain reads and pointer compares only */
+int DoorsDoorOfParent(void* door, void** parentOut, int* indexOut)
+{
+    *parentOut = 0;
+    *indexOut = -1;
+    void* parent = 0;
+    if (door == 0 || DoorParentPod(door, &parent) == 0 || parent == 0) return 0;
+    void* elems[32];
+    int cnt = 0, raw = 0;
+    if (DoorArrayPod(parent, elems, 32, &cnt, &raw) == 0) return 0;
+    for (int i = 0; i < cnt; ++i) if (elems[i] == door) { *parentOut = parent; *indexOut = i; return 1; }
+    return 0;
+}
+/* POD ONLY (C2712): one guarded frame */
+int DoorsRecReadPod(void* door, float* health, float* maxHealth, int* broken, int* hasLock, int* level, int* lockBroken)
+{
+    __try
+    {
+        const char* c = (const char*)door;
+        const char* lk = *(const char* const*)(c + kDoorLockPtr);
+        *health = *(const float*)(c + kDoorRecHealth);
+        *maxHealth = *(const float*)(c + kDoorRecHealthMax);
+        *broken = (*(const unsigned char*)(c + kDoorBroken) != 0) ? 1 : 0;
+        *hasLock = (lk != 0) ? 1 : 0;
+        *level = (lk != 0) ? *(const int*)(lk + kDoorRecLockLevel) : 0;
+        *lockBroken = (lk != 0 && *(const unsigned char*)(lk + kDoorRecLockBroken) != 0) ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int DoorsRecSetBrokenPod(void* door, int broken)
+{
+    __try
+    {
+        void** vt = *(void***)door;
+        ((DoorSetBrokenFn)vt[kVtDoorSetBroken / 8])(door, broken != 0);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* health, and (writeLock) the lock's level and broken flag */
+int DoorsRecWritePod(void* door, float health, int writeLock, int level, int lockBroken)
+{
+    __try
+    {
+        char* c = (char*)door;
+        *(float*)(c + kDoorRecHealth) = health;
+        if (writeLock != 0)
+        {
+            char* lk = *(char* const*)(c + kDoorLockPtr);
+            if (lk != 0) { *(int*)(lk + kDoorRecLockLevel) = level; *(unsigned char*)(lk + kDoorRecLockBroken) = (unsigned char)(lockBroken != 0 ? 1 : 0); }
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the lock's locked = 0, as the engine's hit writes it when the door breaks */
+int DoorsRecUnlockPod(void* door)
+{
+    __try
+    {
+        unsigned char* lk = *(unsigned char* const*)((const char*)door + kDoorLockPtr);
+        if (lk != 0) *(volatile unsigned char*)(lk + kLockLocked) = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* MAIN THREAD. Health and the lock first; then a break the way the engine's hit makes it - setBroken(1), the unlock, openDoor (inside
+   the applier's bracket, as the door road applies a received word) - or a mend after the health: setBroken(0) */
+int DoorsRecApply(void* door, float health, int broken, int hasLock, int level, int lockBroken)
+{
+    float h0 = 0.0f, mx = 0.0f;
+    int b0 = 0, hl = 0, lv0 = 0, lb0 = 0;
+    if (door == 0 || DoorsRecReadPod(door, &h0, &mx, &b0, &hl, &lv0, &lb0) == 0) return -1;
+    int changed = 0;
+    const int lockDiff = (hl != 0 && hasLock != 0 && (lv0 != level || (lb0 != 0) != (lockBroken != 0))) ? 1 : 0;
+    if (h0 != health || lockDiff != 0)
+    {
+        if (DoorsRecWritePod(door, health, lockDiff, level, lockBroken) == 0) return -1;
+        if (h0 != health) ++g_doorRecHealth;
+        if (lockDiff != 0 && lv0 != level) ++g_doorRecLevel;
+        if (lockDiff != 0 && (lb0 != 0) != (lockBroken != 0)) ++g_doorRecLockBroken;
+        changed = 1;
+    }
+    if (b0 == 0 && broken != 0)
+    {
+        if (DoorsRecSetBrokenPod(door, 1) == 0) return -1;
+        DoorsRecUnlockPod(door);
+        if (g_playOpen != 0) ApplyPlayPod(g_playOpen, door);
+        ++g_doorRecBreak;
+        changed = 1;
+    }
+    else if (b0 != 0 && broken == 0)
+    {
+        if (DoorsRecSetBrokenPod(door, 0) == 0) return -1;
+        ++g_doorRecMend;
+        DoorRow* rr = RowByDoor(door);
+        if (rr != 0)
+        {   /* while the door was broken the door road's broken keep cleared this row's holder word, so nothing would put the
+               holder's state back until the door next changes: the row is marked as holding the holder's word again and the door
+               tick is woken, so its apply pass plays the holder's stored state onto the mended door */
+            ::InterlockedExchange(&rr->holderWord, 1);
+            ::InterlockedExchange(&g_dirty, 1);
+            ++g_doorRecMendReArmed;
+        }
+        changed = 1;
+    }
+    else if (b0 != 0 && broken != 0)
+    {   /* broken here and in the record: a broken door stands open - one that reads closed (or closing) is opened the way the break
+           above opens it */
+        int s = 0, d = 0, l = 0, wn = 0, bk = 0;
+        if (g_playOpen != 0 && DoorReadPod(door, &s, &d, &l, &wn, &bk) != 0 && bk != 0 && (s == coopdoor::kDoorClosed || s == coopdoor::kDoorClosing))
+        {
+            ApplyPlayPod(g_playOpen, door);
+            ++g_doorRecBrokenOpened;
+            changed = 1;
+        }
+    }
+    return changed;
+}
+int DoorsRecRepair(void* door, float gain)
+{
+    float h0 = 0.0f, mx = 0.0f;
+    int b0 = 0, hl = 0, lv = 0, lb = 0;
+    if (door == 0 || !(gain > 0.0f) || DoorsRecReadPod(door, &h0, &mx, &b0, &hl, &lv, &lb) == 0) return 0;
+    float h1 = h0 + gain;
+    if (mx > 0.0f && h1 > mx) h1 = mx;
+    if (DoorsRecWritePod(door, h1, 0, 0, 0) == 0) return 0;
+    if (b0 != 0 && h1 > 0.0f) DoorsRecSetBrokenPod(door, 0);
+    return 1;
+}
+/* the pieceLive REPORT line's door counts (DoorsRecCountsOut) */
+void DoorsRecCounts(long long* out, int n)
+{
+    const long long v[10] = { g_doorRecBreak, g_doorRecMend, g_doorRecLevel, g_doorRecLockBroken, g_doorRecHealth, g_doorBrokenKept,
+                              g_doorRecBrokenOpened, g_doorRecMendReArmed, (long long)g_doorPicked, (long long)g_lockPickedNotDoor };
+    for (int i = 0; i < n && i < 10; ++i) out[i] = v[i];
+}
+/* TEST-ONLY (bldstate, bldset): the door's state and its lock's locked byte, through the guarded door read */
+int DoorsTestStatePod(void* door, int* state, int* locked)
+{
+    int d = 0, w = 0, b = 0;
+    *state = -1; *locked = -1;
+    if (door == 0) return 0;
+    return DoorReadPod(door, state, &d, locked, &w, &b);
+}
+/* TEST-ONLY (bldset doorpick): one call of the lock pick's tick at its entry, so the hook (detour_lockPickTick) runs as for the
+   pick-lock job. POD ONLY (C2712) */
+int DoorsTestPickCallPod(void* lock, float skillDiff, float amount)
+{
+    __try { ((LockPickTickFn)(g_base + (uintptr_t)kLockPickTickRva))(lock, skillDiff, amount); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the pick's progress (+0x18) and threshold (+0x1C), read as floats (their type is not read from the code) */
+int DoorsTestPickReadPod(void* lock, float* progress, float* threshold)
+{
+    __try
+    {
+        *progress = *(const float*)((const char*)lock + 0x18);
+        *threshold = *(const float*)((const char*)lock + 0x1C);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* TEST-ONLY (bldset doorpick), MAIN THREAD: the lock pick's tick called with a large skill difference and amount until the lock
+   reads unlocked or maxCalls calls are made - only while the tick is hooked here, so the door road notes the pick as the pick-lock
+   job's would be */
+std::string DoorsTestPick(void* door, int maxCalls, int* lockedBefore, int* lockedAfter)
+{
+    *lockedBefore = -1; *lockedAfter = -1;
+    void* lk = DoorsLockOf(door);
+    void* own = 0;
+    if (lk == 0 || LockPickReadPod(lk, lockedBefore, &own) == 0) return std::string("REFUSED (no lock on the door, or it did not read)");
+    if (orig_lockPickTick == 0 || kLockPickTickRva == 0)
+    {
+        *lockedAfter = *lockedBefore;
+        return std::string("REFUSED (the lock pick tick is not hooked here: no address row or a prologue mismatch)");
+    }
+    const long long picked0 = (long long)g_doorPicked;
+    float p0 = 0.0f, t0 = 0.0f, p1 = 0.0f, t1 = 0.0f;
+    DoorsTestPickReadPod(lk, &p0, &t0);
+    int locked = *lockedBefore, calls = 0, fault = 0;
+    while (locked != 0 && calls < maxCalls)
+    {
+        if (DoorsTestPickCallPod(lk, 100.0f, 100.0f) == 0) { fault = 1; break; }
+        ++calls;
+        if (LockPickReadPod(lk, &locked, &own) == 0) { fault = 1; break; }
+    }
+    *lockedAfter = locked;
+    DoorsTestPickReadPod(lk, &p1, &t1);
+    char o[300];
+    _snprintf(o, 299, "CALLED the lock pick tick %d time(s)%s (skill difference 100, amount 100): locked %d -> %d;"
+              " lock+0x18/+0x1C as floats %g/%g -> %g/%g; doorPicked +%lld", calls, fault != 0 ? " FAULTED" : "", *lockedBefore, locked,
+              p0, t0, p1, t1, (long long)g_doorPicked - picked0);
+    o[299] = 0;
+    return std::string(o);
 }
 
 } // namespace coop

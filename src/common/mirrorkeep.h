@@ -373,20 +373,19 @@ inline long long ListUnclashed(const std::vector<KeptRow>& rows, const std::vect
     return n;
 }
 
-/* WAS THE SNAPSHOT SEEN WHOLE (the unnamed-key drop's snapshotWhole, store.cpp MirrorKeepSnapshotEnd). The wire has no truncation
-   flag; the PAGE_END marker carries its page's record count, and the BEGIN the world server's record total. beginTotal = the BEGIN's
-   total, sentTotal = the records every PAGE_END of this snapshot counted, lastSent = the LAST page's count. 0 (not whole) when:
-   - the LAST page carried no record while earlier pages carried some: a page walk stops only where another record follows, so an
-     empty last page after full ones is the world server's answer to a key too long for the wire (its records went, its PAGE_END
-     did not count them, and the keys after it were never sent) - or records deleted between two pages;
-   - the pages carried fewer records than the BEGIN said (a cut page, or records deleted while the snapshot was paged).
-   A record added while the snapshot was paged only raises sentTotal. A snapshot not whole drops no unnamed key: those keys stay
-   until named or re-fetched. */
-inline int SnapshotWholeForDrop(long long beginTotal, long long sentTotal, long long lastSent)
+/* WAS THE SNAPSHOT SEEN WHOLE (the unnamed-key drop's snapshotWhole; store.cpp StoreFeedMarkerApply judges it once and hands it to
+   MirrorKeepSnapshotEnd, MirrorKeepStaleHoldEnd and the town wait's PreTownWaitEnd). T-985 C2b fold 6: the world server judges it and
+   says so on the LAST PAGE_END (complete, coopfeed::FeedSnapshotComplete: every key its BEGIN counted was paged or deleted, no page
+   was cut, no record send was refused). last / complete = that PAGE_END's two flags; nothing else is asked.
+   History: until fold 6 the game counted (pages + deleted >= the BEGIN's total; an empty last page read as the world server's
+   answer to a key too long for the wire). T1533 (2026-10-25): the raw count made a snapshot NOT whole when another game deleted a
+   record between the BEGIN and its page (fold 5 added the deleted ones); fold 5's review: a record created after the BEGIN hid one
+   whose send was refused (a false whole), and one created and deleted after a page's last key left an empty last page that looked
+   like a cut (a false not-whole). 07-bug-classes: a completeness test by count on a set that changes while it is read.
+   A snapshot not whole drops no unnamed key: those keys stay until named or re-fetched. */
+inline int SnapshotWholeForDrop(unsigned int last, unsigned int complete)
 {
-    if (lastSent == 0 && sentTotal > 0) return 0;
-    if (sentTotal < beginTotal) return 0;
-    return 1;
+    return (last == 1u && complete == 1u) ? 1 : 0;
 }
 
 /* THE TABLE'S STORED SEQ AGAINST THE WORLD SERVER (store.cpp MirrorKeepWelcomeSeq / MirrorKeepSnapshotEnd), judged once, while every

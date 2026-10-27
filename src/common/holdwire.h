@@ -12,7 +12,8 @@
    Every publication the writer makes for a HOLD / LAND carries a request tag 'RQT1' {request id, the asker's slot}; the asker never
    applies a publication tagged with its own slot - it already shows that change (the absorb rule, design 3.4).
 
-   THE WIRE (protocol 126; 138: a LAND's taker box key may name another box). Every block below is a fixed-size TRAILER, the last bytes of its message, announced by the message's own
+   THE WIRE (protocol 126; 138: a LAND's taker box key may name another box). Every block below is a fixed-size TRAILER, the last bytes of its message (an ITEM_REQUEST's
+   'HLD1' sits just before the 'ASK1' trailer every request ends with, game protocol 180: boxrec.h AskTail), announced by the message's own
    leading byte so no reader ever has to guess whether it is there:
      ITEM_REQUEST  dir byte 2 (HOLD) / 3 (LAND)  ->  'HLD1' {u32 tag, u32 hold id, u8 how, u32 asker slot}         13 bytes
      ITEM_CONFIRM  ok byte 2 (= ok, with where)   ->  'LND1' {u32 tag, u8 where, u32 x, u32 y}                      13 bytes

@@ -1380,6 +1380,15 @@ void WorldSyncTick()
                     continue;
                 }
             }
+            /* T-1084 step 3: a person of a save's group held PENDING (store.cpp ArWakeDecide / ArFirstSight: its area's records are not all
+               here yet, so whether the group is a double is not known) is not adopted until the group is settled (counted on the store
+               REPORT's arPend[peopleSkipped]). The sweep runs every 6 ticks and DeathWatchTick every 118, so a group loaded awake is often
+               first seen here: StoreArHoldPeople decides it before any of its people can be adopted. */
+            if (!sweepPlayerF)
+            {
+                SquadView psv;
+                if (ReadSquadOf(c, &psv) == 1 && StoreArHoldPeople(psv.platoon) == 1) continue;
+            }
             /* M7a3f3 T-425 [m7a3f3-ws3]: a rebuilt person of a squad this game HANDED to another game (its own world data still holds the squad;
                a walk-back, a wake or an in-ring put-away re-creates it) is not adopted while that game runs a live copy of the squad here or
                the area is not known to be this game's alone (HeldByOtherTS 1 or -1) - adopting it SPAWNed a fresh uid to the other game,

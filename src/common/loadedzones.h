@@ -75,5 +75,81 @@ inline void CountSources(const std::vector<Area>& v, int cx, int cy, int ring, S
         if (cx < 0 || cy < 0 || dx > ring || dy > ring) ++s->outsideRing;
     }
 }
+
+// T-1076 (owner decision 1076 c): RING 1 - is area (sx, sy) within one area of ANY of this game's player characters.
+// `fx, fy` = the followed character's area (-1 = unset); `party` = kGrid x kGrid bytes, index x * kGrid + y, 1 where the
+// engine's active-zone list keeps the area for a player character of this game (kWhyPlayer). *partyOnly = 1 when only the
+// party grid answered (the followed character is not beside it). Off the grid: 0.
+inline int Ring1Of(int fx, int fy, const unsigned char* party, int sx, int sy, int* partyOnly)
+{
+    if (partyOnly != 0) *partyOnly = 0;
+    if (InGrid(sx, sy) == 0) return 0;
+    if (fx >= 0 && fy >= 0)
+    {
+        const int dx = sx > fx ? sx - fx : fx - sx, dy = sy > fy ? sy - fy : fy - sy;
+        if (dx <= 1 && dy <= 1) return 1;
+    }
+    if (party == 0) return 0;
+    for (int ox = -1; ox <= 1; ++ox)
+        for (int oy = -1; oy <= 1; ++oy)
+        {
+            const int x = sx + ox, y = sy + oy;
+            if (InGrid(x, y) != 0 && party[x * kGrid + y] != 0) { if (partyOnly != 0) *partyOnly = 1; return 1; }
+        }
+    return 0;
+}
+// THE RING-1 GRANT (zones' MayInventFromView, its last rule). Next to any of this game's player characters and nobody else beside the
+// area, or someone is and this game's slot is lower. A ring 1 that only a non-followed character gives is judged the same way: every
+// game sends the areas of all its player characters, so the other game sees this game's party beside the area and the lowest slot
+// wins on both sides.
+inline int Ring1Grants(int ring1, int peerRing1, int mySlotLower)
+{
+    if (ring1 != 1) return 0;
+    if (peerRing1 != 1) return 1;
+    return mySlotLower != 0 ? 1 : 0;
+}
+// THIS GAME'S PLAYER-CHARACTER AREAS FOR THE WORLD SERVER (the AREAS player-sector list). The followed character's area (fx, fy; off
+// the grid = unknown) first, then - when useMarks is 1 - every other area the engine's active-zone list keeps for a player character
+// (kWhyPlayer), each once, at most `cap` in all. *xy = x,y pairs. Returns how many marked areas did not fit (0 = none left out).
+inline int PlayerSectorList(int fx, int fy, const std::vector<Area>& areas, int useMarks, int cap, std::vector<int>* xy)
+{
+    xy->clear();
+    if (cap > 0 && InGrid(fx, fy) != 0) { xy->push_back(fx); xy->push_back(fy); }
+    if (useMarks == 0) return 0;
+    int left = 0;
+    for (size_t i = 0; i < areas.size(); ++i)
+    {
+        const Area& a = areas[i];
+        if ((a.why & kWhyPlayer) == 0 || InGrid(a.x, a.y) == 0) continue;
+        int have = 0;
+        for (size_t k = 0; k + 1 < xy->size(); k += 2) if ((*xy)[k] == a.x && (*xy)[k + 1] == a.y) { have = 1; break; }
+        if (have != 0) continue;
+        if ((int)(xy->size() / 2) >= cap) { ++left; continue; }
+        xy->push_back(a.x); xy->push_back(a.y);
+    }
+    return left;
+}
+// THE PARTY HALO FROM THE LIST SENT. grid = kGrid x kGrid bytes (index x * kGrid + y): cleared, then 1 at each on-grid entry of xy
+// (PlayerSectorList's pairs) - the same capped list the world server gets, so this game is never beside an area by a party the other
+// games were not told of. followedFirst = 1 when xy's first pair is the followed character's area; skipFollowed = 1 (orphaned: that
+// area is only the last known position) leaves it out, unless an area of `areas` marked kWhyPlayer names it too (a live party there).
+inline void PartyHaloFromList(const std::vector<int>& xy, int followedFirst, int skipFollowed, const std::vector<Area>& areas, unsigned char* grid)
+{
+    if (grid == 0) return;
+    for (int i = 0; i < kGrid * kGrid; ++i) grid[i] = 0;
+    for (size_t k = 0; k + 1 < xy.size(); k += 2)
+    {
+        const int x = xy[k], y = xy[k + 1];
+        if (InGrid(x, y) == 0) continue;
+        if (k == 0 && followedFirst != 0 && skipFollowed != 0)
+        {
+            int marked = 0;
+            for (size_t i = 0; i < areas.size(); ++i)
+                if ((areas[i].why & kWhyPlayer) != 0 && areas[i].x == x && areas[i].y == y) { marked = 1; break; }
+            if (marked == 0) continue;
+        }
+        grid[x * kGrid + y] = 1;
+    }
+}
 }   // namespace loadedzones
 #endif

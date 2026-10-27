@@ -17,6 +17,17 @@ void ResurrectNoteDeath(void* character, unsigned long long callerRet, int uniqu
 // look waits for its body.
 void ResurrectTick();
 
+// ANY THREAD (T-1062): 1 while a death noted by ResurrectNoteDeath waits for its snapshot (the snapshot writes the person's
+// left note, OwnLeftNoteDeath), else 0. Plain reads of the ring.
+int ResurrectDeathsWaiting();
+
+// MAIN THREAD (T-1062, the records report line): the deaths whose left note was never asked for, by why - the death queue full
+// (queueFull), dropped while a world loaded or closed (blocked), the character gone before its snapshot (gone), the snapshot's
+// read faulted (fault, the note may or may not be written); then leftRepeat, a death of a uid already snapshotted (its note was
+// written then, so none is missed). These count deaths of any faction this game drives: the faction is read only by the snapshot.
+// ",leftMissed[...],leftRepeat=n".
+std::string ResurrectLeftMissWords();
+
 // MAIN THREAD (the command channel). TEST-ONLY lever: `resurrect list` | `resurrect <n> [squad <i> | beside <uid>]` |
 // `resurrect killlast` | `resurrect killother <uid>` | `resurrect host on|off` | `resurrect host fee <amount>` |
 // `resurrect host growth steady|steep` | `resurrect price` | `resurrect money <n>` | `resurrect tab ...` (fallentab.h).

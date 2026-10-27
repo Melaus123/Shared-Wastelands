@@ -118,6 +118,13 @@ inline int Holds(int recSx, int recSy, int recLoadedHere, int askSx, int askSy)
     const int dy = recSy > askSy ? recSy - askSy : askSy - recSy;
     return (dx <= 1 && dy <= 1) ? 1 : 0;
 }
+// HoldsNear (T-985 C2b fold 2): Holds without the loaded-here arm, for a group row the load left for the feed. Such a row is not a
+// note of the asked town (its town is not known here), so its area being loaded here says nothing about this town: it holds only
+// from the asked area or its ring 1, with no position known, or when the asked area is unread.
+inline int HoldsNear(int recSx, int recSy, int askSx, int askSy) { return Holds(recSx, recSy, 0, askSx, askSy); }
+// BoundPassed (T-985 C2b fold 3): 1 = boundMs or more have passed from startTick to nowTick on a 32-bit millisecond tick that wraps
+// (GetTickCount) - the load's town wait's bound after a snapshot END not seen whole (store.cpp PreTownWaitAsk).
+inline int BoundPassed(unsigned int startTick, unsigned int nowTick, unsigned int boundMs) { return (unsigned int)(nowTick - startTick) >= boundMs ? 1 : 0; }
 
 // Pending: the whole rule for one note, as the store and the gate apply it together. 1 = it holds the town's creation back.
 inline int Pending(int hasTown, int deleted, int placedHere, int hasPos, int recSx, int recSy, int recLoadedHere, int askSx, int askSy)

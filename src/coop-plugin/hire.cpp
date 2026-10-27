@@ -1087,7 +1087,7 @@ std::string CopySquadNearestLever()
     return CopySquadLever(uid);
 }
 
-/* TEST-ONLY lever `splitsquad [n]`: the last n members (default 1) of this game's first player squad - the squad of its first own
+/* TEST-ONLY lever `splitsquad [n] [at <x> <z>]` (at: the new squad is made at that point and its members are put on the terrain there, 3 apart): the last n members (default 1) of this game's first player squad - the squad of its first own
    living player-faction character (MyHirer's rule) - are moved into a NEW squad of the player faction, so a test can make a player
    squad that the last engine save does not hold. The verb only ARMS it (MAIN THREAD, the command channel); SplitSquadDrain runs it at
    the K2 safe point 0x7D17E0 (combat.cpp, the AI worker paused) and writes the result to the status file.
@@ -1097,6 +1097,7 @@ std::string CopySquadNearestLever()
    ActivePlatoon): the old squad's removal (ActivePlatoon vt+0x18) and the new squad's addMember (vt+0x10 0x7966A0) - the engine's own
    join the hire flow uses. The squad screen's drag-and-drop mover 0x795A80 makes the same old-squad removal and an insert at a
    chosen place; it has no address-table row, so the lever does not call it. */
+int GroundTerrainHeightAt(float x, float z, float* out);   /* combat.cpp: the terrain height at (x,z) - 1 height, 0 no terrain, -1 no row / faulted. MAIN THREAD */
 namespace {
 typedef void* (*SsSpawnEmptySquadFn)(void* faction, void* squadTemplate, bool permanent, const Ogre::Vector3* p);
 typedef std::string* (*SsPlatoonSidFn)(const void* platoon, std::string* out);
@@ -1106,6 +1107,7 @@ const size_t kSsActivePlatoonOff = 0x1D8;   /* Platoon -> ActivePlatoon (handoff
 const int kSsMaxN = kSquadViewCap - 1;
 const int kSsWaitMax = 600;                 /* safe points to wait while engine writes are blocked */
 int g_ssArmed = 0, g_ssN = 1, g_ssWaits = 0;
+int g_ssAt = 0; float g_ssAtX = 0.0f, g_ssAtZ = 0.0f;   /* `at <x> <z>`: the new squad is made there and its members are put on the ground there */
 long long g_ssRuns = 0, g_ssRefused = 0;
 
 /* POD only (C2712): the engine call; 0 = faulted or no squad made */
@@ -1163,6 +1165,12 @@ std::string SsRun(int n)
     }
     Ogre::Vector3 pos(sv.x, sv.y, sv.z);
     if (!SafeReadPosition(moving[0], &pos) && !sv.posUsable) pos = Ogre::Vector3(0.0f, 0.0f, 0.0f);
+    if (g_ssAt != 0)
+    {
+        float gy = 0.0f;
+        if (GroundTerrainHeightAt(g_ssAtX, g_ssAtZ, &gy) != 1) return SsRefuse("no terrain height at " + N((long long)g_ssAtX) + "," + N((long long)g_ssAtZ));
+        pos = Ogre::Vector3(g_ssAtX, gy, g_ssAtZ);
+    }
     const std::string fromSid = SsSid(sv.platoon);
     void* newAp = 0;
     void* newPlatoon = SsSpawnEmptySquadPod((void*)f, &pos, &newAp);
@@ -1186,8 +1194,20 @@ std::string SsRun(int n)
     ++g_ssRuns;
     char b[160];
     _snprintf(b, 159, " moved=%d/%d members=%d left=%d pos=%.0f,%.0f,%.0f runs=%lld", moved, n, newCount, oldCount, pos.x, pos.y, pos.z, g_ssRuns); b[159] = 0;
-    const std::string body = "from=" + fromSid + " squad=" + newSid + " uids=" + uidList + std::string(b);
+    std::string body = "from=" + fromSid + " squad=" + newSid + " uids=" + uidList + std::string(b);
     if (moved != n) return SsRefuse("not every member reached the new squad: " + body);
+    if (g_ssAt != 0)
+    {
+        int put = 0;
+        for (size_t i = 0; i < moving.size(); ++i)
+        {
+            const float px = g_ssAtX + 3.0f * (float)i;
+            float gy = 0.0f;
+            if (GroundTerrainHeightAt(px, g_ssAtZ, &gy) == 1 && TeleportCharacter(moving[i], px, gy, g_ssAtZ)) ++put;
+        }
+        char pb[96]; _snprintf(pb, 95, " placed=%d/%d at %.0f,%.0f", put, (int)moving.size(), g_ssAtX, g_ssAtZ); pb[95] = 0;
+        body += pb;
+    }
     DebugLog("[SQUAD] splitsquad " + body);
     return "ok splitsquad " + body;
 }
@@ -1197,15 +1217,18 @@ void CommandStatusLate(const std::string& text);   /* command_channel.cpp (ui.h)
 
 std::string SplitSquadArm(const std::string& arg)
 {
-    int n = 1;
+    int n = 1, at = 0; float ax = 0.0f, az = 0.0f;
     if (!arg.empty())
     {
         char extra = 0;
-        if (std::sscanf(arg.c_str(), "%d %c", &n, &extra) != 1 || n < 1 || n > kSsMaxN)
-            return SsRefuse("usage splitsquad [n] (members to move, 1.." + N(kSsMaxN) + ", default 1)");
+        const int k = std::sscanf(arg.c_str(), "%d at %f %f %c", &n, &ax, &az, &extra);
+        if (k == 3) at = 1;
+        else if (k != 1 || std::sscanf(arg.c_str(), "%d %c", &n, &extra) != 1) n = -1;
+        if (n < 1 || n > kSsMaxN)
+            return SsRefuse("usage splitsquad [n] [at <x> <z>] (members to move, 1.." + N(kSsMaxN) + ", default 1; at: the new squad made and put on the ground there)");
     }
     if (kSsSpawnEmptySquadRva == 0 || kSsPlatoonSidRva == 0) return SsRefuse("Faction_spawnEmptySquad / PlatoonSid not in the address table");
-    g_ssArmed = 1; g_ssN = n; g_ssWaits = 0;
+    g_ssArmed = 1; g_ssN = n; g_ssWaits = 0; g_ssAt = at; g_ssAtX = ax; g_ssAtZ = az;
     return "ok splitsquad armed n=" + N(n) + " (runs at the next safe point; the result replaces this line)";
 }
 

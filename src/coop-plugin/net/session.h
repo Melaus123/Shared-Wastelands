@@ -21,6 +21,8 @@ namespace meleewire { struct MeleeMsg; }   /* src/common/meleewire.h */
 
 #include "../identity.h"
 
+namespace coopshop { struct ShopCancel; }   /* src/common/shopwire.h: the cancel body of the shop tail kind 2 */
+
 namespace coop {
 
 struct RecordCopy;
@@ -395,6 +397,9 @@ bool SendItemHandover(int kind, unsigned int asker, unsigned int reqId, unsigned
 bool SendItemPlaced(unsigned int id, int ok);
 bool SendItemRevoke(unsigned int id);
 bool SendShopTail(unsigned int id, unsigned int epoch, int kind);   // T-164 B4-4 fold 2: MSG_ITEM_REVOKE + 'SHK1' - kind 0 shop revoke, 1 shop ack
+bool SendItemRequestToSlot(const ItemRequestMsg& r, int toSlot);   // a request to one named game (a lapsed shop trade's settle-only ask); MAIN THREAD
+bool SendShopCancel(unsigned int id, unsigned int epoch, int toSlot, const coopshop::ShopCancel& c);   // 'SHK1' kind 2: a home shop trade's cancel to the area's holder
+bool SendShopCancelAnswer(unsigned int id, unsigned int epoch, unsigned int toKey, int answer);   // 'SHK1' kind 3: the holder's answer (coopshop::kCa*) to the asker
 // M7b slice 2 (T-197; protocol 115): the request id remembers the game it was asked of (PLACED / REVOKE / the shop tail go back
 // to it). MAIN THREAD. ItemAnswerFromAsked: is fromPeer that game (true when no ask is on record). ItemAskedSlot: its slot
 // (LinkPeerSlot when none is on record - the legacy reading). PlayerSlotOfKey: a sender key's slot (the session peer's raw key:

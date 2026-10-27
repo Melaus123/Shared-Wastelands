@@ -21,12 +21,24 @@ const int kDefNoNotebook = 3;   // no notebook link yet
 const int kDefTestLever = 4;   // T-581: the TEST-ONLY `owedtest aside on` - work this game would make now is set aside
 const int kDefOwed = 5;        // T-581: work this game would make now is an owed row it does not hold (made under a claim, owedpop.h)
 const int kDefPending = 6;    // a note of the town holds its creations (decision 34) - a building made here sets its residents aside
+const int kDefLoading = 7;    // T-1076 (owner decision 1076 c): the area is not yet in this game's loaded list - judged once it is
 inline int DeferCause(int linked, int may, int held)
 {
     if (linked == 0) return kDefNoNotebook;
     if (may == -1) return kDefNoMap;
     if (may == 0 && held != 1) return kDefNobody;
     return kDefNone;
+}
+// T-1076: DeferCause plus the area's state on this game. `loadedHere` = AreaViewTS's loadedHere (1 = in this game's loaded
+// list). An area still loading is not judged "nobody": the work is set aside as kDefLoading on the same road, and the town's
+// check-up judges it again (Decide waits while may is 0 and nobody else holds the area).
+// Only the plain "nobody holds it" answer (held 0) becomes kDefLoading; a frozen area (held -2) or one with no map row (held -1)
+// keeps the label DeferCause gives it.
+inline int DeferCauseAt(int linked, int may, int held, int loadedHere)
+{
+    const int c = DeferCause(linked, may, held);
+    if (c == kDefNobody && held == 0 && loadedHere != 1) return kDefLoading;
+    return c;
 }
 inline const char* DeferCauseName(int c)
 {
@@ -36,6 +48,7 @@ inline const char* DeferCauseName(int c)
     if (c == kDefTestLever) return "test-lever";
     if (c == kDefOwed) return "owed";
     if (c == kDefPending) return "notebook-pending";
+    if (c == kDefLoading) return "loading";   /* T-1076 */
     return "none";
 }
 

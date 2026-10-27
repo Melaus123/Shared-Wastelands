@@ -85,6 +85,12 @@ void BuildSaveTrackNote(void* saveMgr, const void* nameStr, int before, int afte
 void BuildSaveTrackTick();                        /* P87 rf1, MAIN THREAD, every frame (from OwnMarkSaveTick): a tracked save landed -> BuildSaveLanded */
 void OwnBuildCopyListFeed();                      /* P87 rf1, MAIN THREAD: the copy list from the pp.build base when the load edge does not hand it */
 void OwnOverlayPrepare(const void* folderStr, const void* nameStr);   /* MAIN THREAD: loadGame, before orig - the overlay set + roster check */
+/* T-1062, MAIN THREAD (resurrect.cpp TakeSnapshot): this game's own character died - its left note (coopown::LeftNote, person id =
+   hand serial + type) to the records store's LeftNoteFile, so a load whose newer record lacks him keeps him out. uid: for the log. */
+void OwnLeftNoteDeath(int handSerial, int handType, unsigned int uid);
+/* T-1062, MAIN THREAD (resurrect.cpp Reconcile): 1 = a died note of this hand serial counts for the loaded save (the death came after
+   it) - the fallen list's row stays, no ALIVE (coopown::LeftNoteHoldsDeath); 0 = no such note, or serial 0. */
+int OwnLeftNoteHoldsDeath(unsigned int handSerial);
 void OwnResetImportRestoreArm(const std::string& carriedFolder, const std::string& oldStore);   /* T-36, MAIN THREAD: the load gate let the reset world's import through - money, research, map and faction armed as at a load */
 /* ANY THREAD (detour_loadFromDisk): 0..n = this container's file was swapped to its own record (put it back with
    OwnOverlayDone after the engine's load); -1 = not an overlaid squad. */

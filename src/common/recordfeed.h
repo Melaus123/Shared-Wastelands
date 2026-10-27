@@ -12,7 +12,11 @@
  *                                    BEGIN, every unique state, then records);
  *   up   2 OFF      {}               this game's world is going away - stop the live RECORD / UNIQUE_STATE;
  *   down 3 BEGIN    {u32 records, u32 uniques, u64 seqHigh}              the first page only, before its unique states;
- *   down 4 PAGE_END {str lastKey, u32 sent, u8 last, u64 seqHigh}        after each page's records.
+ *   down 4 PAGE_END {str lastKey, u32 sent, u32 gone, u8 last, u8 complete, u64 seqHigh}   after each page's records
+ *                                    (protocol 112). gone (T-985 C2b fold 5) = the records the BEGIN counted that were deleted
+ *                                    before this page reached them (FeedGoneTake) - the game only reports it. complete (fold 6)
+ *                                    = 1 on the LAST page when the world server judged the snapshot whole
+ *                                    (FeedSnapshotComplete) - the game's only test of it.
  * The world server subscribes a connection at its ASK (before the page is sent), unsubscribes it at OFF or disconnect, and sends
  * the page and the PAGE_END on reliable channel 0 in one pass - so every live forward queued after the ASK arrives after the
  * page. RECORD_GONE still goes to every game (T-313 review H1: a game not subscribed - the title, a load - is told of a deletion
@@ -31,15 +35,18 @@
 
 #include <cstddef>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include "groundrec.h"   /* T-985 fold 1: IsGroundRecId - a ground record never goes as its header only */
 #include "boxrec.h"      /* T-985 fold 1: IsBoxRecId - nor a box record */
 #include "piecerec.h"    /* IsPieceRecId - nor a piece record */
+#include "shoprec.h"     /* IsShopRecId - nor a shop record */
 
 namespace coopfeed {
 
-const unsigned int kFeedProtocol = 108;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+const unsigned int kFeedProtocol = 121;     /* the world-server protocol that carries RECORD_FEED (both sides check it at compile time); it moves with store_main.cpp kProtocol, the reason in the commit message (owner 356, 2026-10-02) */
+
 
 
 const unsigned int kMsgRecordFeed = 58;    /* 54/55 are effort/m11a's, 57 effort/m8's */
@@ -64,9 +71,9 @@ struct FeedMsg
 {
     unsigned int kind;
     std::string key;           /* ASK: afterKey; PAGE_END: lastKey */
-    unsigned int records, uniques, sent, last;
+    unsigned int records, uniques, sent, last, gone, complete;   /* gone, complete: PAGE_END only (T-985 C2b fold 5, fold 6) */
     unsigned long long seqHigh;
-    FeedMsg() : kind(0), records(0), uniques(0), sent(0), last(0), seqHigh(0ULL) {}
+    FeedMsg() : kind(0), records(0), uniques(0), sent(0), last(0), gone(0), complete(0), seqHigh(0ULL) {}
 };
 
 inline void FeedPut32(std::vector<char>* b, unsigned int v) { for (int i = 0; i < 4; ++i) b->push_back((char)((v >> (8 * i)) & 0xFFu)); }
@@ -97,10 +104,13 @@ inline void FeedEncodeBegin(std::vector<char>* b, unsigned int records, unsigned
 {
     FeedHead(b, kFeedBegin); FeedPut32(b, records); FeedPut32(b, uniques); FeedPut64(b, seqHigh);
 }
-inline bool FeedEncodePageEnd(std::vector<char>* b, const std::string& lastKey, unsigned int sent, bool last, unsigned long long seqHigh)
+/* gone (T-985 C2b fold 5): FeedGoneTake's count for this page; 0 on the empty LAST page that answers a key over the wire's bound.
+   complete (fold 6): FeedSnapshotComplete's answer - written only on the LAST page (a page that is not the last carries 0) */
+inline bool FeedEncodePageEnd(std::vector<char>* b, const std::string& lastKey, unsigned int sent, bool last, unsigned long long seqHigh, unsigned int gone = 0, unsigned int complete = 0)
 {
     if (lastKey.size() > kFeedKeyMax) return false;
-    FeedHead(b, kFeedPageEnd); FeedPutKey(b, lastKey); FeedPut32(b, sent); b->push_back(last ? (char)1 : (char)0); FeedPut64(b, seqHigh);
+    FeedHead(b, kFeedPageEnd); FeedPutKey(b, lastKey); FeedPut32(b, sent); FeedPut32(b, gone); b->push_back(last ? (char)1 : (char)0);
+    b->push_back((last && complete != 0) ? (char)1 : (char)0); FeedPut64(b, seqHigh);
     return true;
 }
 inline bool FeedDecode(const char* p, size_t n, FeedMsg* out)
@@ -123,9 +133,10 @@ inline bool FeedDecode(const char* p, size_t n, FeedMsg* out)
     }
     else if (m.kind == (unsigned int)kFeedPageEnd)
     {
-        if (n - at < 13) return false;
-        m.sent = FeedGet32(p + at); m.last = (unsigned int)(unsigned char)p[at + 4]; m.seqHigh = FeedGet64(p + at + 5); at += 13;
-        if (m.last > 1) return false;
+        if (n - at < 18) return false;
+        m.sent = FeedGet32(p + at); m.gone = FeedGet32(p + at + 4); m.last = (unsigned int)(unsigned char)p[at + 8];
+        m.complete = (unsigned int)(unsigned char)p[at + 9]; m.seqHigh = FeedGet64(p + at + 10); at += 18;
+        if (m.last > 1 || m.complete > 1 || (m.complete != 0 && m.last == 0)) return false;   /* fold 6: complete only on the LAST page */
     }
     else return false;
     if (at != n) return false;
@@ -225,9 +236,10 @@ inline long long FeedHeldHeaderStamp(int srvHasFile, long long srvFile, long lon
    the prefix counts, as in the id tests. The game leaves them out of its HELD list; the world server never judges them held. */
 inline bool FeedHeldKeyListed(const std::string& key)
 {
-    return !coopgrec::IsGroundRecId(key) && !coopbrec::IsBoxRecId(key) && !piecerec::IsPieceRecId(key);   /* a piece record too */
+    return !coopgrec::IsGroundRecId(key) && !coopbrec::IsBoxRecId(key) && !piecerec::IsPieceRecId(key) && !shoprec::IsShopRecId(key);   /* a piece or shop record too */
 }
-/* the world server's judgement for one record of a snapshot page: 0 for a ground or box id (always in full), else FeedHeldCovers */
+/* the world server's judgement for one record of a snapshot page: 0 for a ground, box, piece or shop id (always sent in full,
+   FeedHeldKeyListed), else FeedHeldCovers */
 inline int FeedHeldCoversKey(const std::string& key, long long heldFile, long long heldPos, unsigned int heldOwner, int srvHasFile, long long srvFile, long long srvPos, unsigned int srvOwner)
 {
     if (!FeedHeldKeyListed(key)) return 0;
@@ -268,6 +280,47 @@ template <class V, class Sender>
 inline bool FeedPageWalk(const std::map<std::string, V>& m, const std::string& afterKey, size_t budget, Sender& send, std::string* lastKey, unsigned int* sent)
 {
     return FeedPageWalk(m, afterKey, budget, kFeedPageRecords, send, lastKey, sent);
+}
+/* THE RECORDS A PAGE COULD NOT CARRY BECAUSE THEY WERE DELETED (world server; T-985 C2b fold 5, protocol 112's PAGE_END gone).
+   beginKeys = the keys the BEGIN counted (taken with its total) that no page has judged yet; now = the records held now; the page
+   walked the keys after afterKey through lastKey (through the end when last). Every BEGIN key in that range is judged here and
+   taken out of beginKeys: one still held was paged (FeedPageWalk carries every key of its range), one not held was deleted before
+   this page reached it and is counted. Returns that count. A key is judged once, so an ASK repeated for a range counts nothing
+   again; a key added after the BEGIN is not in beginKeys, so a record added and deleted while the snapshot was paged is never
+   counted. The game reports the counts (store.cpp recordFeed snapshotGone); whether the snapshot is whole is FeedSnapshotComplete's
+   (fold 6) - this take empties beginKeys for it. Counted here and not by the game from the
+   RECORD_GONEs it is sent: the world server leaves a record out of what it pages when its delete is QUEUED (OnRecordGoneFrom) but
+   tells the games only when the files are gone (WriterApplyOne), which can be after the page that walked past the key. */
+template <class V>
+inline unsigned int FeedGoneTake(std::set<std::string>* beginKeys, const std::map<std::string, V>& now, const std::string& afterKey, const std::string& lastKey, bool last)
+{
+    if (beginKeys == 0 || (!last && !(afterKey < lastKey))) return 0;   /* a page that is not the last carried a record after afterKey */
+    std::set<std::string>::iterator it = afterKey.empty() ? beginKeys->begin() : beginKeys->upper_bound(afterKey);
+    const std::set<std::string>::iterator end = last ? beginKeys->end() : beginKeys->upper_bound(lastKey);
+    unsigned int n = 0;
+    while (it != end)
+    {
+        if (now.find(*it) == now.end()) ++n;
+        beginKeys->erase(it++);
+    }
+    return n;
+}
+/* IS THE SNAPSHOT WHOLE (world server; T-985 C2b fold 6, protocol 112's PAGE_END complete - the game's only test of it,
+   mirrorkeep::SnapshotWholeForDrop). The world server knows it exactly; the game used to guess it from counts (pages + deleted >=
+   the BEGIN's total, an empty last page = a cut), and a count is fooled both ways: a record created after the BEGIN is paged and
+   counted, so it hides one whose send was refused (a false whole - the kept-table drop then removes kept records the world
+   server still holds); a record created and deleted after a page's last key leaves an empty last page with nothing deleted that
+   the BEGIN counted, which looked exactly like a cut (a false not-whole). 1 only when ALL hold:
+   - last: this is the LAST page;
+   - hasList: this game's BEGIN key list exists (taken at its first-page ASK; an ASK with no BEGIN behind it has nothing to judge);
+   - keysLeft == 0: every key the BEGIN counted was judged by a page (FeedGoneTake: paged, or deleted before its page reached it)
+     - a key left is one no page range covered (an ASK that skipped past it);
+   - !cut: no page was cut (a key over the wire's bound: that page is answered with an empty LAST page, the keys after it unsent);
+   - sendFailed == 0: the send path took every record message of this feed (store_main.cpp FeedPageSender).
+   A record created after the BEGIN takes no part: it is not a key the BEGIN counted. */
+inline unsigned int FeedSnapshotComplete(bool last, bool hasList, size_t keysLeft, bool cut, long long sendFailed)
+{
+    return (last && hasList && keysLeft == 0 && !cut && sendFailed == 0) ? 1u : 0u;
 }
 
 /* THE ASK DECISION (game). The first page is asked on the first tick on which this game is welcomed on a link it speaks and

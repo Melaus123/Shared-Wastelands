@@ -12,6 +12,7 @@
 #define SQUADBIRTH_H
 
 #include <string>
+#include <set>
 #include <vector>
 
 namespace sqbirth {
@@ -112,7 +113,7 @@ inline int MadeKeptByte(int birth) { return birth == kBirthDiscard ? 0 : 1; }
    unload road - a squad emptied by hiring or merging has none (-2), and its destroy stays the plain delete; -1, its members not read,
    stays on the unload road: a squad marked discarding had living members at its last keep question); idShared: another squad here
    is bound to the same id, whose record the discard of this one must not delete (nothing is sent). */
-enum { kDelNone = 0, kDelPlain = 1, kDelDiscard = 2 };
+enum { kDelNone = 0, kDelPlain = 1, kDelDiscard = 2, kDelModKept = 3 };   /* kDelModKept: DestroyDeleteMod */
 /* fold 3: 1 = the keep question's 'no living members' answer erases the squad's discard mark - everyone dead (0), or an empty squad
    (-2) the engine's own unload removals did not empty (hiring, merging). An unload-emptied one keeps the mark for its destroy: at an
    area unload the squad walk asks with the members there, removes them all ('wandered out of zone'), and the faction update asks again
@@ -127,6 +128,40 @@ inline int DestroyDelete(int bound, int diedOut, int discarding, int livingAtDes
     if (diedOut == 0 && discarding != 0 && LivingUnloadRoad(livingAtDestroy, emptiedByUnload) != 0) return idShared != 0 ? kDelNone : kDelDiscard;
     return kDelPlain;
 }
+/* T-1080: the mod-removal mark. npcSquad: the squad may carry it (the orphan purge asks it of world NPC squads only; a removal of a
+   person through ModRemovalNote, of any recorded squad); removing: this game's own removal took or is taking people out of it (the
+   purge's g_npcPurged, or the removal under way); living: its living members after that removal (> 0 living, 0 only bodies left, -2
+   no members, -1 not read). Marked when nobody living is left - bodies do not count - or the members cannot be read: a failed read
+   never deletes a world record. 1 = mark. */
+inline int ModRemovedMark(int npcSquad, int removing, int living)
+{
+    return (npcSquad != 0 && removing != 0 && living <= 0) ? 1 : 0;
+}
+/* T-1080: the delete the destroy of a squad sends when this game's own removal of people may have emptied it. modRemoved: the squad
+   carries the mark (store.cpp g_modRemoved - set by ModRemovedMark, and when this game makes the squad's content from a world record:
+   CreateUnknownSquad, a wake's reload, the engine's read of the record at a wake; erased only when this game sees a living member of
+   its own in the squad (ModMarkClearedBy), at the world teardown, and taken by its destroy). A removal of people this game makes (the
+   orphan purge in an area another game holds, the stand-in purge, the removal of another game's copies at its link loss, its
+   departure or its withdrawal), or a squad this game made from a record that never had a living member here, is this game's own
+   doing; it does not end the squad: a plain delete becomes no delete, here or on the world server, and the record stays
+   (kDelModKept). A squad the death watch marked wiped out (diedOut) is deleted as before; the discard delete of a squad born not
+   kept and the same-id keep stay DestroyDelete's answers. */
+inline int DestroyDeleteMod(int modRemoved, int bound, int diedOut, int discarding, int livingAtDestroy, int emptiedByUnload, int idShared)
+{
+    const int del = DestroyDelete(bound, diedOut, discarding, livingAtDestroy, emptiedByUnload, idShared);
+    return (del == kDelPlain && diedOut == 0 && modRemoved != 0) ? kDelModKept : del;
+}
+/* T-1080: 1 = the mark goes - this game sees `living` (LivingMembersPod: > 0 living, 0 only bodies, -2 none, -1 not read) living
+   members of the squad's own here. A squad that had living members here which all died is then unmarked and deletes as before. */
+inline int ModMarkClearedBy(int living) { return living > 0 ? 1 : 0; }
+/* T-1080: 1 = the destroy (del: DestroyDeleteMod's answer) kept the record of a squad this game made from that record (madeMark:
+   CreateUnknownSquad, a wake's reload or the engine's read of the record) that never had a living member of its own here. Such a
+   squad is not placed from the record again in this world (store.cpp g_notePlaceFailed, as a creation that failed): placing it again
+   would build the same empty squad from the same record, lose it again and repeat every placement pass. A squad only this game's
+   removal of people emptied (the purge) is still placed from its record when its area is this game's to run. */
+inline int MadeEmptyPlaceFailed(int del, int madeMark) { return (del == kDelModKept && madeMark != 0) ? 1 : 0; }
+/* takes one squad's mark: 1 = it was marked; the mark is gone afterwards (a destroy uses it once) */
+template <class K> inline int ModRemovedTake(std::set<K>* marks, const K& key) { return (marks != 0 && marks->erase(key) != 0) ? 1 : 0; }
 
 /* ---- the world server's judgement of a discard delete ----
    holderId: the player the area map names as the holder of the record's area ("" = nobody); senderId: the sending game's player;

@@ -1747,6 +1747,21 @@ std::string PolicyTeamClick(int ownerSlot, const std::string& cls)
              + (boxHits < 0 ? std::string("n/a (not patched: ") + g_boxWhy + ")" : PN(boxHits)) + " (cells held " + PN((long long)g_boxHeld) + "; clicks " + PN(g_clicks) + ")");
     return std::string("ok team click member=") + (member ? "1" : "0") + " called=" + (called ? "1" : "0") + " hooks=" + moved + " boxHits=" + (boxHits < 0 ? std::string("n/a") : PN(boxHits));
 }
+/* T-1079 TEST-ONLY: the `team click` road on a building the caller names (the rcgive lever's box, found by its key): the engine's own
+   PlayerInterface::buildingSelected with the click byte set for the call and put back, so the order goes to whatever this player has
+   selected and the engine's own task opens the window. MAIN THREAD. */
+int PolicyClickBuilding(void* building, int* answer, int* byteWas)
+{
+    *answer = 0; *byteWas = -1;
+    if (EngineWritesBlocked() || kBuildingSelectedRva == 0 || g_base == 0 || !Plaus(building)) return -1;
+    void* pi = PlayerInterfacePod((void*)LocalPlayerFaction());
+    if (!Plaus(pi)) return -2;
+    float pos[3] = { 0, 0, 0 };
+    if (BuildingPosPod(building, pos) != 1) return -3;
+    const int called = ClickPod(pi, building, pos, answer, byteWas);
+    ++g_clicks;
+    return called;
+}
 
 /* T-546 step 7: the `team orders <slot>` lever (TEST-ONLY). For this game's own first character and for the first character of player
    `slot`'s faction: the engine's PlayerInterface::isEnemy through its hooked address; the engine's interaction menu built on the

@@ -973,6 +973,7 @@ void detour_declareDead(void* self)
     orig_declareDead(self);
     if (copyDeath) RelationsCopyDeathMark(deathMarkWas);
     coop::ResurrectNoteDeath(self, ret, unique != 0 ? 1 : 0);   /* T-556: this game's own dead are snapshotted on the main thread */
+    if (!WsApplying()) coop::StoreNoteSquadEvent(self);   /* T-1084: the world squad this game writes that holds the dead member is marked due on the early road (queued off the main thread); a death this game applies from the shared state is not a change it publishes */
     if (unique == 0) return;
     if (gd != 0 && !WsApplying()) WsQueue(gd);
 }

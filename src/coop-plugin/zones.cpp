@@ -287,6 +287,15 @@ long long g_tick = 0;
 std::vector<Sector> g_loaded;              // this instance's loaded set, last computed
 std::string g_zonesListShown;              /* the loaded list the last [ZONES] summary printed - it prints again on a change */
 Sector g_playerSector = { -1, -1 };
+/* T-772 T1544 (TEST-ONLY lever `areaquiet <x>,<y> on|off`, command_channel.cpp; ZonesAreaQuietCommand below): the areas this game LEAVES
+   OUT of its AREAS report. Only the report changes - the area stays in g_loaded / g_loadedHere, the player-sector list and the party halo
+   are built as before, and the people this game runs stay its own - so once this game has been silent on the area past the world
+   server's grace (store_main.cpp: the holder's lastSeenOwner moves only when its report lists the area), another game that reports it
+   becomes its holder: a split town on demand. MAIN THREAD only (the command channel and ZonesTick); kept across a world load until `off`.
+   g_areaQuietLogged: the one log line per `on` when a report first leaves the area out. */
+unsigned char g_areaQuiet[64][64];
+unsigned char g_areaQuietLogged[64][64];
+long long g_areaQuietReports = 0;   /* reports sent that left at least one quiet area out */
 long long g_ticks = 0, g_probes = 0, g_probeFaults = 0, g_noZoneManager = 0, g_noPlayer = 0;   /* M2 (decisions 32/44/54): sent / recv, the session-link ZONES counters, are retired with the message - a readout writes ABSENT */
 // review-p5j MEDIUM-4: IsPositionLoadedHere answered "not loaded" for a probe that FAULTED, and E15 wired that answer
 // into both of its legs - so an unreadable zone manager during a world transition would withdraw every announced
@@ -303,7 +312,7 @@ long long g_posLoadedFault = 0, g_posLoadedNoZm = 0;
    manager ruling on the review of 584c3b71 - a dead or spectating player's game keeps streaming what its camera sees, like a
    live one; worldsync reads this report as "the areas I can see", and the notebook's own lease and hand-over rules decide who
    holds what, exactly as for a live player whose camera moves). It differs from a live tick in two things only: the ring-1
-   halo stays cleared, and from the second consecutive orphaned tick (cooporphan::OrphanSendUnknownSector) the player sector
+   halo round the followed character stays cleared (its other parties' areas still count), and from the second consecutive orphaned tick (cooporphan::OrphanSendUnknownSector) the player sector
    goes out as unknown (kNoSector) - one unreadable tick while alive must not erase this game's player row at the notebook.
    Main thread only; the world teardown forgets the centre. */
 int g_orphanCentreValid = 0; float g_orphanX = 0.0f, g_orphanY = 0.0f, g_orphanZ = 0.0f;
@@ -454,7 +463,19 @@ Sector g_playerSectorTS = { -1, -1 };
 // PeerPlayerPosition), on the main thread at the zone tick, under the same lock and out of the same tick as
 // g_playerSectorTS - so the two halves of the tie-break cannot come from different moments. (-1,-1 = unset, and it
 // answers 0, exactly as an unset player sector does.)
-Sector g_peerSectorTS = { -1, -1 };
+// x, y = the freshest copy's area (-1 = none - every clear sets only x, y, and the list is not read then); n, xs, ys = every area a
+// copy of another player's player-faction character stood in within kPeerSectorMaxAgeSec, each once, at most kPeerPartyMax, so the
+// no-relay answer sees each of the other players' parties.
+const int kPeerPartyMax = coopdrop::kAreasPlayerSectorsMax;
+struct PeerPartyTS { int x, y, n; int xs[kPeerPartyMax], ys[kPeerPartyMax]; };
+PeerPartyTS g_peerSectorTS = { -1, -1, 0 };
+// T-1076 (owner decision 1076 c): THE PARTY HALO. 1 where the engine's active-zone list keeps the area for a player character of
+// this game (the 'p' reason - Character::fourFrameUpdate calls playerActivate for every character whose faction is the player's),
+// written by the zone tick under g_heldLock out of the same pass as g_loadedHere; AreaViewTS's ring1 is 1 next to any of them.
+// Drawn from the player-sector list the tick sends (PlayerSectorList, capped), so it is exactly what the other games are told. Cleared
+// at no zone manager, no player and world teardown; orphaned, it keeps the other parties' areas and leaves out the followed
+// character's last area (PartyHaloFromList). Read only by AreaViewTS.
+unsigned char g_partyAreaTS[64][64];
 // E25 RE-DESIGNED (verify-p5t HIGH-1, decision 37 amended 2026-09-04) - THE OTHER PLAYER'S SECTOR FROM THE NOTEBOOK
 // PROCESS, which is the only source that still answers inside the window the tie-break exists for.
 // g_peerSectorTS above comes from PeerPlayerPosition, i.e. from the copies of the peer's characters this game holds
@@ -470,7 +491,7 @@ Sector g_peerSectorTS = { -1, -1 };
 // the grids: the relay sends every current sector every second, so a slot missing from a message is a slot that has
 // gone quiet and must stop answering here too.
 struct PeerSectorRow { int slot, x, y, valid; double at; };   /* area2 fold: at = when the notebook last heard the row (NowSec), 0 = unknown. M9 (T-197): slot = the player's slot - a row per player in message order; the table is KEYED by slot (any of 0..65519), no longer indexed by it */
-const int kPeerSectorRows = 256;   /* M9: the world server links at most 256 games at once */
+const int kPeerSectorRows = coopdrop::kPlayerSectorsMaxRows;   /* every row PLAYERSECTORS can carry */
 PeerSectorRow g_peerSectorRelay[kPeerSectorRows];
 /* recruit3: every slot the relay's player-sector table has ever named in this process (sticky; bit = slot) - `recruitmult auto` counts it */
 std::vector<int> g_slotsSeen;   /* M9 (T-197): the distinct slots (sorted), any number - the 16-bit mask keyed by slot could not hold slot 40000. Under g_heldLock */
@@ -517,6 +538,7 @@ volatile LONG64 g_peerSectPreWelcomeIgnored = 0;
 // counts the sends it used to drop, so "the notebook knew where each player was throughout the arrival window" is a
 // number rather than a hope.
 long long g_areasSentEmpty = 0;
+long long g_psSentEntries = 0, g_psSentCapped = 0, g_psSentNone = 0;   /* player-sector list entries sent; sends that left marked areas out at the cap; sends saying "not known" */
 /* P8a (build/read-roster-t236.md 4b): THE COUNTER THAT DID NOT EXIST.  T236a could not tell whether the host
    ever reported its areas to the notebook, because `[ZONES] REPORT`'s sent= is g_sent - the SESSION-link
    ZONES message, which only a client sends - and areasSentEmpty only moves when the loaded set is EMPTY.
@@ -536,7 +558,7 @@ const double kPeerLowRowFreshSec = 2.0;   /* area2 fold (review-area2 MED): the 
 // halo that outlived the relay's own patience is a frozen inference of exactly the kind E25.7 removes below.
 const double kPeerSectorMaxAgeSec = 10.0;
 // review-p4b HIGH-1: initialised ONCE at install on the main thread (ZonesInitLocks); the lazy form raced from worker threads and its memset could zero a filled grid
-void HeldLockInit() { if (!g_heldLockInit) { ::InitializeCriticalSection(&g_heldLock); g_heldLockInit = true; std::memset(g_hostHeld, 0, sizeof(g_hostHeld)); std::memset(g_otherLoaded, 0, sizeof(g_otherLoaded)); std::memset(g_effMask, 0, sizeof(g_effMask)); /* W1-b */ std::memset(g_mineHeld, 0, sizeof(g_mineHeld)); std::memset(g_loadedHere, 0, sizeof(g_loadedHere)); std::memset(g_peerSectorRelay, 0, sizeof(g_peerSectorRelay)); g_peerSectorRelayAt = 0.0; g_peerSectorRelayGen = -1; /* E25: the relay's player-sector table starts empty and unstamped, so it answers "no fresh table" until one lands */   /* P6q: and belongs to no link */ OwnerSlotClear(); /* M7b slice 2: -2 = no row (an int grid - no longer a memset) */ g_playerSectorTS.x = -1; g_playerSectorTS.y = -1; g_peerSectorTS.x = -1; g_peerSectorTS.y = -1; /* E13 attempt 2: unset, not 0,0 - sector 0,0 is a real sector. E25: the peer's halo starts unset too */ } }
+void HeldLockInit() { if (!g_heldLockInit) { ::InitializeCriticalSection(&g_heldLock); g_heldLockInit = true; std::memset(g_hostHeld, 0, sizeof(g_hostHeld)); std::memset(g_otherLoaded, 0, sizeof(g_otherLoaded)); std::memset(g_effMask, 0, sizeof(g_effMask)); /* W1-b */ std::memset(g_mineHeld, 0, sizeof(g_mineHeld)); std::memset(g_loadedHere, 0, sizeof(g_loadedHere)); std::memset(g_peerSectorRelay, 0, sizeof(g_peerSectorRelay)); g_peerSectorRelayAt = 0.0; g_peerSectorRelayGen = -1; /* E25: the relay's player-sector table starts empty and unstamped, so it answers "no fresh table" until one lands */   /* P6q: and belongs to no link */ OwnerSlotClear(); /* M7b slice 2: -2 = no row (an int grid - no longer a memset) */ std::memset(g_partyAreaTS, 0, sizeof(g_partyAreaTS)); /* T-1076 */ g_playerSectorTS.x = -1; g_playerSectorTS.y = -1; g_peerSectorTS.x = -1; g_peerSectorTS.y = -1; /* E13 attempt 2: unset, not 0,0 - sector 0,0 is a real sector. E25: the peer's halo starts unset too */ } }
 // E25.7 / review-p5p MEDIUM-2 - THE HALO EXPIRES WITH THE TICK THAT DRAWS IT. Every other grid in the view either
 // carries a 5 s clock and answers -1 when it goes stale, or is rewritten wholesale by each completed tick.
 // g_playerSectorTS is written ONLY by a completed tick, and the tick bails out for good the moment the watched
@@ -554,6 +576,7 @@ void ForgetPlayerHaloTS()
     ::EnterCriticalSection(&g_heldLock);
     g_playerSectorTS.x = -1; g_playerSectorTS.y = -1;
     g_peerSectorTS.x = -1; g_peerSectorTS.y = -1;
+    std::memset(g_partyAreaTS, 0, sizeof(g_partyAreaTS));   /* T-1076: the party halo goes with the followed character's */
     /* E25: the relay's table is NOT cleared here. ForgetPlayerHaloTS runs when THIS game's zone tick cannot answer
        where its own player is, which says nothing at all about where the other player is - and the relay's answer
        has its own clock and expires on it. Clearing it here would let one game's bail-out grant the presumption to
@@ -816,6 +839,14 @@ static int MySectorForRelayX() { return (g_playerSector.x >= 0 && g_playerSector
 static int MySectorForRelayY() { return (g_playerSector.x >= 0 && g_playerSector.y >= 0) ? g_playerSector.y : kNoSector; }
 /* T-306 fold 1: a player sector as it went on the wire - "unknown" for kNoSector (any negative), else "x,y". */
 static std::string SentSectorString(int x, int y) { return (x < 0 || y < 0) ? std::string("unknown") : (N(x) + "," + N(y)); }
+/* the player-sector list as it went on the wire: "x,y;x,y" in order (the followed character's first), "unknown" for none */
+static std::string PlayerAreasString(const std::vector<int>& xy)
+{
+    if (xy.size() < 2) return std::string("unknown");
+    std::string o;
+    for (size_t i = 0; i + 1 < xy.size(); i += 2) { if (i != 0) o += ";"; o += N(xy[i]) + "," + N(xy[i + 1]); }
+    return o;
+}
 /* M6 fold 1 (review of 49bac485, MED 2) - LEAVING A WORLD EMPTIES THIS GAME'S AREA SETS AT ONCE. A game with no world sends no
    AREAS (the two bail-outs in ZonesTick), so the world server kept its last delivery set for up to its 10 s grace and AREA
    traffic kept reaching a game with no world (owner decision 57). ONE AREAS with count 0 and no player sector goes out on the
@@ -826,7 +857,7 @@ static std::string SentSectorString(int x, int y) { return (x < 0 || y < 0) ? st
 void ZonesAreasLeave(const char* why)
 {
     if (g_areasLastNonEmpty == 0) { g_areasLeaveOwed = 0; return; }
-    if (!StoreSendAreas(0, 0, kNoSector, kNoSector)) return;   /* no notebook link: its PeerGone already dropped the sets; tried again on the next bail-out */
+    if (!StoreSendAreas(0, 0, 0, 0)) return;   /* no notebook link: its PeerGone already dropped the sets; tried again on the next bail-out */
     g_areasLastNonEmpty = 0; g_areasLeaveOwed = 0; ++g_areasLeaveSent;
     DebugLog(std::string("[ZONES] M6 fold 1: one empty AREAS sent (") + (why != 0 ? why : "?") + ") - the world server stops sending this game AREA traffic now (areasLeaveSent "
              + N(g_areasLeaveSent) + ")");
@@ -937,6 +968,16 @@ void ZonesTick()
     const int sendUnknown = (orphan != 0 && cooporphan::OrphanSendUnknownSector(g_orphanRun) != 0) ? 1 : 0;
     const int sendX = sendUnknown ? kNoSector : MySectorForRelayX();
     const int sendY = sendUnknown ? kNoSector : MySectorForRelayY();
+    /* THE PLAYER-SECTOR LIST, built once a tick: the followed character's area (sendX, sendY) first, then every other area the engine's
+       list keeps for a player character of this game, at most kAreasPlayerSectorsMax in all. The same list goes to the world server and
+       draws this game's own party halo (partyNow), so this game never counts itself beside an area by a party the other games were not
+       told of. The marks are kept while orphaned - another party of this game beside a town is still there; only the followed
+       character's own area is a last known position then. The probe fallback (fromList 0) has no marks. Empty ("not known", m = 0)
+       only when there is neither a followed area nor a mark. */
+    std::vector<int> psXY;
+    const int psLeftOut = loadedzones::PlayerSectorList(sendX, sendY, areas, fromList == 1 ? 1 : 0, coopdrop::kAreasPlayerSectorsMax, &psXY);
+    unsigned char partyNow[loadedzones::kGrid * loadedzones::kGrid];
+    loadedzones::PartyHaloFromList(psXY, loadedzones::InGrid(sendX, sendY), orphan, areas, partyNow);
     g_loaded = loaded;
     /* decision 37 amended (review-p5g HIGH-2): the same set as a locked grid, so a worker thread can ask "have I got this area
        loaded" without touching the std::vector the main thread reassigns here every second. Written under g_heldLock at the one
@@ -945,10 +986,22 @@ void ZonesTick()
        puppet map, and no engine-side walk belongs inside g_heldLock (every holder of that lock is a bounded memset
        or grid loop, and review-p4z audited them all on that basis). An answer older than the relay's own ownership
        grace is discarded rather than used: a stale peer halo would make this game YIELD a town it is entitled to. */
-    Sector peerSec; peerSec.x = -1; peerSec.y = -1;
+    PeerPartyTS peerSec; peerSec.x = -1; peerSec.y = -1; peerSec.n = 0;
     {
         float qx = 0, qy = 0, qz = 0; double qAge = -1.0;
-        if (PeerPlayerPosition(&qx, &qy, &qz, &qAge) && qAge >= 0.0 && qAge <= kPeerSectorMaxAgeSec) peerSec = SectorOf(qx, qz);
+        if (PeerPlayerPosition(&qx, &qy, &qz, &qAge) && qAge >= 0.0 && qAge <= kPeerSectorMaxAgeSec)
+        {
+            const Sector f = SectorOf(qx, qz); peerSec.x = f.x; peerSec.y = f.y;
+            peerSec.xs[0] = f.x; peerSec.ys[0] = f.y; peerSec.n = 1;   /* the freshest copy's area first */
+            int qxs[kPeerPartyMax], qys[kPeerPartyMax];
+            const int qn = PeerPlayerSectors(qxs, qys, kPeerPartyMax, kPeerSectorMaxAgeSec);   /* every copy looked at, each area once */
+            for (int pq = 0; pq < qn && peerSec.n < kPeerPartyMax; ++pq)
+            {
+                int have = 0;
+                for (int k = 0; k < peerSec.n; ++k) if (peerSec.xs[k] == qxs[pq] && peerSec.ys[k] == qys[pq]) { have = 1; break; }
+                if (have == 0) { peerSec.xs[peerSec.n] = qxs[pq]; peerSec.ys[peerSec.n] = qys[pq]; ++peerSec.n; }
+            }
+        }
     }
     HeldLockInit();
     ::EnterCriticalSection(&g_heldLock);
@@ -958,6 +1011,9 @@ void ZonesTick()
     g_playerYTS = py;                    /* B10-b (review-b10 M-6): out of the SAME pass as the grids */
     g_playerSectorTS = g_playerSector;   /* E13 attempt 2: the ring-1 answer comes off the same locked read as the three grids, and out of the same tick that produced them */
     g_peerSectorTS = peerSec;            /* E25: and the tie-break's other half out of the same one */
+    /* the party halo out of the same pass, from exactly the list this tick sends (partyNow above). The probe fallback (fromList 0)
+       carries no marks, so ring1 then follows the followed character alone. */
+    std::memcpy(g_partyAreaTS, partyNow, sizeof(g_partyAreaTS));
     if (orphan != 0) { g_playerSectorTS.x = -1; g_playerSectorTS.y = -1; g_peerSectorTS.x = -1; g_peerSectorTS.y = -1; }   /* T-306: orphaned, there is no player to draw a halo round (ForgetPlayerHaloTS above) - keep it cleared */
     ::LeaveCriticalSection(&g_heldLock);
     // PROBE-START: P025
@@ -1005,7 +1061,7 @@ void ZonesTick()
         (void)zonesChanged;
         DebugLog("[ZONES] player sector=" + SectorString(g_playerSector) + " loaded(" + N((long long)loaded.size()) + ")=" + list
                  + (orphan != 0 ? " orphan=1 (last known position, no live watched character; orphaned tick " + N((long long)g_orphanRun)
-                                  + ") sent=" + SentSectorString(sendX, sendY) : std::string()));   /* T-306 fold 1: what actually went out while orphaned */
+                                  + ") sent=" + SentSectorString(sendX, sendY) : std::string()) + " playerAreas=" + PlayerAreasString(psXY));   /* T-306 fold 1: what actually went out while orphaned */
         // F478: the engine's own active-zone list with the reason each is alive - c = camera, p = player character, t = town
         // (ZoneMap::isActivationType 0xA07B70 over activatedCountdown[3] at +0xC0) and the seconds left on its deactivation.
         DebugLog("[ZONES] active: " + ActiveZoneReasons(zm));
@@ -1017,19 +1073,42 @@ void ZonesTick()
        P6c (p5z HIGH-2) - NO !empty GUARD. An empty loaded set is a REPORT, not a reason to stay silent: this message
        also carries where this game's own player is standing, and the window in which the set is empty (the 10-12 s
        after a teleport, while the engine's zone-loaded flag is still down) is the window the other game needs that
-       answer in. StoreSendAreas accepts count 0 and builds a valid 12-byte payload for it. The pointer is 0 rather
+       answer in. StoreSendAreas accepts count 0 and builds a valid payload for it. The pointer is 0 rather
        than &v[0] because taking the first element of an empty vector is undefined even when nothing reads it.
        P6j (verify-p6c MEDIUM-1): THE SEND, NOT THE TICK - StoreSendAreas refuses with no notebook link and when the
        send fails, and the counters read its answer. */
     {
         if (g_areasLeaveOwed != 0) ZonesAreasLeave("world torn down");   /* M6 fold 1: an unwind skipped the teardown's send - the empty report goes BEFORE the new world's first one */
         std::vector<int> xy; xy.reserve(loaded.size() * 2);
-        for (size_t i = 0; i < loaded.size(); ++i) { xy.push_back(loaded[i].x); xy.push_back(loaded[i].y); }
-        const bool sentAreas = StoreSendAreas(xy.empty() ? 0 : &xy[0], (int)loaded.size(), sendX, sendY);   /* T-306 fold 1: sendX/sendY - the live sector, or unknown from the second orphaned tick */   /* decision 32: the notebook keeps the map */   /* E25: and the player sector, out of the same tick as the halo above */
+        /* T-772 T1544 (TEST-ONLY): what this report names - the loaded set less any `areaquiet` area (g_areaQuiet). The stamps
+           (ZonesNoteReported) and the area file take the same list, because each says what was SENT; `loaded` itself is untouched. */
+        std::vector<Sector> reported; reported.reserve(loaded.size());
+        int quietOut = 0;
+        for (size_t i = 0; i < loaded.size(); ++i)
+        {
+            const Sector& s = loaded[i];
+            if (s.x >= 0 && s.x < 64 && s.y >= 0 && s.y < 64 && g_areaQuiet[s.x][s.y] != 0)
+            {
+                ++quietOut;
+                if (g_areaQuietLogged[s.x][s.y] == 0)
+                {
+                    g_areaQuietLogged[s.x][s.y] = 1;
+                    DebugLog("[ZONES] areaquiet: this AREAS report leaves out " + SectorString(s) + " (TEST-ONLY lever) - still loaded here and"
+                             " the people this game runs there stay its own; the world server moves the area's holder once this game has been"
+                             " silent on it past its grace, if another game reports it");
+                }
+                continue;
+            }
+            reported.push_back(s); xy.push_back(s.x); xy.push_back(s.y);
+        }
+        const bool sentAreas = StoreSendAreas(xy.empty() ? 0 : &xy[0], (int)reported.size(), psXY.empty() ? 0 : &psXY[0], (int)(psXY.size() / 2));   /* T-306 fold 1: sendX/sendY - the live sector, or unknown from the second orphaned tick */   /* decision 32: the notebook keeps the map */   /* E25: and the player sector, out of the same tick as the halo above */
         if (sentAreas) ++g_areasSent;
-        if (sentAreas && StoreAreasTaken() != 0) ZonesNoteReported(loaded);   /* fold 3 (T1506): what the world server now reads as loaded here - the piece writer's question; fold 4 (review): only a report the world server takes (JoinAreasAdmit) */
+        if (sentAreas && quietOut > 0) ++g_areaQuietReports;   /* T-772 T1544 */
+        StoreAreaFileNote(xy.empty() ? 0 : &xy[0], (int)reported.size(), psXY.empty() ? 0 : &psXY[0], (int)(psXY.size() / 2));   /* this game's area file: the same lists, sent or not */
+        if (sentAreas && StoreAreasTaken() != 0) ZonesNoteReported(reported);   /* fold 3 (T1506): what the world server now reads as loaded here - the piece writer's question; fold 4 (review): only a report the world server takes (JoinAreasAdmit) */
         if (sentAreas) { g_lastSentAny = 1; g_lastSentX = sendX; g_lastSentY = sendY; if (sendUnknown != 0) ++g_orphanSentUnknown; }   /* T-306 fold 1: for the VERDICT */
         if (sentAreas && xy.empty()) ++g_areasSentEmpty;
+        if (sentAreas) { g_psSentEntries += (long long)(psXY.size() / 2); if (psLeftOut > 0) ++g_psSentCapped; if (psXY.empty()) ++g_psSentNone; }
         if (sentAreas) g_areasLastNonEmpty = xy.empty() ? 0 : 1;   /* M6 fold 1: what ZonesAreasLeave reads */
     }
 }
@@ -1157,7 +1236,7 @@ void ReportZones()
              + "," + N(g_zlNotLoaded) + "," + N(g_zlNotInArray) + "," + N(g_zlHeaderDiffers) + "," + N(g_zlUnplaced) + "," + N(g_zlProbeFaults) + "," + N(g_zlChanges)
              + " playerSector=" + SectorString(g_playerSector) + " loaded=" + N((long long)g_loaded.size())
              + " yieldedStale=" + N((long long)g_yieldedStale) + " peerSect[recv,valid,ring1Relay,ring1Puppet,presumedEmptyGranted,preWelcomeIgnored]=" + N((long long)g_peerSectRecv) + "," + N((long long)g_peerSectValid) + "," + N((long long)g_peerSectRing1Relay) + "," + N((long long)g_peerSectRing1Puppet) + "," + N((long long)g_peerSectPresumedEmpty) + "," + N((long long)g_peerSectPreWelcomeIgnored) + "   (P6q: presumedEmptyGranted is NOT the old presumedEmpty - it counts ring-1 presumptions actually GRANTED, where the old name counted views on which one was on offer; preWelcomeIgnored is PLAYERSECTORS tables dropped because this link's WELCOME had not been processed yet)"
-             + " areasSent=" + N(g_areasSent) + " areasSentEmpty=" + N(g_areasSentEmpty) + " areasLeaveSent=" + N(g_areasLeaveSent) + " inventRefusedTeardown=" + N((long long)g_inventRefusedTeardown)
+             + " areasSent=" + N(g_areasSent) + " areasSentEmpty=" + N(g_areasSentEmpty) + " playerSecSent[entries,capped,unknown]=" + N(g_psSentEntries) + "," + N(g_psSentCapped) + "," + N(g_psSentNone) + " areasLeaveSent=" + N(g_areasLeaveSent) + " inventRefusedTeardown=" + N((long long)g_inventRefusedTeardown)
              + "   (P8a: areasSent is AREAS messages this game got onto the wire to the NOTEBOOK; areasSentEmpty is"
                " the span of those whose loaded set was empty. A zero here on a linked game is a game never reporting"
                " its areas. M2: mapSent, mapRecv, mapSkippedRelay, sent and recv - the session-link SECTORMAP / ZONES"
@@ -1250,6 +1329,27 @@ void ZonesNoteReported(const std::vector<Sector>& loaded)
         if (loaded[i].x >= 0 && loaded[i].x < 64 && loaded[i].y >= 0 && loaded[i].y < 64)
         { g_reportedAt[loaded[i].x][loaded[i].y] = now > 0.0 ? now : 1e-9; g_reportSeqAt[loaded[i].x][loaded[i].y] = g_reportSeq; }
     ::LeaveCriticalSection(&g_heldLock);
+}
+/* T-772 T1544 (TEST-ONLY): `areaquiet <x>,<y> on|off` - sets g_areaQuiet for one area (see its comment above ZonesTick's globals) and
+   answers one status line: what it was, whether the area is loaded here, and the holder the last area map names (-1 nobody, `?` no map
+   on this link). Changes nothing else. MAIN THREAD (the command channel). */
+std::string ZonesAreaQuietCommand(int x, int y, int on)
+{
+    if (x < 0 || x >= 64 || y < 0 || y >= 64) return "error areaquiet: area " + N((long long)x) + "," + N((long long)y) + " is off the 64x64 grid - nothing changed";
+    const int was = g_areaQuiet[x][y] != 0 ? 1 : 0;
+    g_areaQuiet[x][y] = (unsigned char)(on != 0 ? 1 : 0);
+    if (on != 0 && was == 0) g_areaQuietLogged[x][y] = 0;   /* a new `on`: its first left-out report logs again */
+    Sector s; s.x = x; s.y = y;
+    int loadedHere = 0;
+    for (size_t i = 0; i < g_loaded.size(); ++i) if (g_loaded[i].x == x && g_loaded[i].y == y) { loadedHere = 1; break; }
+    int holder = -1;
+    const int haveMap = AreaMapRawViewTS(s, StoreMySlot(), &holder);
+    const std::string line = std::string("ok areaquiet ") + SectorString(s) + (on != 0 ? " on" : " off") + " was=" + (was != 0 ? "on" : "off")
+                             + " loadedHere=" + N((long long)loadedHere) + " holder=" + (haveMap < 0 ? std::string("?") : N((long long)holder))
+                             + " mySlot=" + N((long long)StoreMySlot()) + " reportsLeftOut=" + N(g_areaQuietReports);
+    DebugLog("[ZONES] " + line + (on != 0 ? " (TEST-ONLY: this game's AREAS report leaves the area out from its next send; nothing else changes)"
+                                          : " (TEST-ONLY: the area is reported again from the next send when loaded here)"));
+    return line;
 }
 double SectorReportedAgoTS(const Sector& s)
 {
@@ -1488,6 +1588,7 @@ namespace coop { void ZonesForgetHeldGrid(int keepRelayGrid)
     }
     std::memset(g_loadedHere, 0, sizeof(g_loadedHere));
     ZonesReportedClearLocked();   /* fold 4 (review): this world's loaded-report stamps go at its teardown */
+    std::memset(g_partyAreaTS, 0, sizeof(g_partyAreaTS));   /* T-1076: the party halo is this world's too */
     g_playerSectorTS.x = -1; g_playerSectorTS.y = -1; g_peerSectorTS.x = -1; g_peerSectorTS.y = -1;   /* E13 attempt 2: the player's sector is stale world state too, and it is cleared UNDER THE LOCK because a worker reads it. E25: the peer's with it */
     ::LeaveCriticalSection(&g_heldLock);
     g_loaded.clear(); g_playerSector.x = -1; g_playerSector.y = -1;
@@ -1501,9 +1602,10 @@ namespace coop {
 // "held == 0" from a populated map, an empty AREAMAP zeroed both clocks, and the follow-up reads came back -1 from a map that
 // no longer existed. The three single queries above are untouched - they still serve their own callers.
 // Out of range answers 0 in every slot, exactly as those queries do; -1 means "no fresh map for that grid".
-void AreaViewTS(const Sector& s, int* held, int* mine, int* otherLoaded, int* loadedHere, int* ring1, int* peerRing1, int* peerRing1LowestSlot, int* presumedEmptyOffer, int* peerLowFresh)
+void AreaViewTS(const Sector& s, int* held, int* mine, int* otherLoaded, int* loadedHere, int* ring1, int* peerRing1, int* peerRing1LowestSlot, int* presumedEmptyOffer, int* peerLowFresh, int* ring1PartyOnly)
 {
     int h = 0, m = 0, o = 0, l = 0, r1 = 0, pr1 = 0, low = -2, pe = 0;
+    int po = 0;   /* T-1076: ring 1 came only from a non-followed player character of this game */
     int lf = 1;   /* area2 fold: the lowest ring-1 slot's row is <= 2 s old (or its age is unknown) */
     const int mySlot = StoreMySlot();   /* read OUTSIDE the lock: a plain aligned int the main thread writes once per WELCOME, exactly as MySlotLower has always read it */
     /* P6j (verify-p6c HIGH-2): and the slot this game was LAST given, read the same way. The row-skip below needs it
@@ -1531,8 +1633,8 @@ void AreaViewTS(const Sector& s, int* held, int* mine, int* otherLoaded, int* lo
         l = (int)g_loadedHere[s.x][s.y];   /* decision 37 amended: no clock - my own loaded set is never "stale", only empty */
         /* E13 attempt 2: Chebyshev distance <= 1 from THIS game's own player, off the locked copy of the sector so it
            cannot come from a different tick than l did. An unset player sector (-1,-1) answers 0, never 1. */
-        r1 = (g_playerSectorTS.x >= 0 && g_playerSectorTS.y >= 0
-              && abs(s.x - g_playerSectorTS.x) <= 1 && abs(s.y - g_playerSectorTS.y) <= 1) ? 1 : 0;
+        /* T-1076 (owner decision 1076 c): or from ANY player character of this game - the party halo, same lock, same tick. */
+        r1 = loadedzones::Ring1Of(g_playerSectorTS.x, g_playerSectorTS.y, &g_partyAreaTS[0][0], s.x, s.y, &po);
         /* E25 RE-DESIGNED (verify-p5t HIGH-1): the same test about the OTHER player, off the same locked read, so
            "I am beside it" and "they are beside it" can never come from two different ticks - but asked of the
            NOTEBOOK PROCESS'S table when that table is fresh. Any slot other than mine whose player is within
@@ -1584,8 +1686,10 @@ void AreaViewTS(const Sector& s, int* held, int* mine, int* otherLoaded, int* lo
         }
         else
         {
-            pr1 = (g_peerSectorTS.x >= 0 && g_peerSectorTS.y >= 0
-                   && abs(s.x - g_peerSectorTS.x) <= 1 && abs(s.y - g_peerSectorTS.y) <= 1) ? 1 : 0;
+            /* beside ANY of the other players' parties this game holds copies of (g_peerSectorTS's list) */
+            if (g_peerSectorTS.x >= 0 && g_peerSectorTS.y >= 0)
+                for (int pk = 0; pk < g_peerSectorTS.n && pk < kPeerPartyMax; ++pk)
+                    if (abs(s.x - g_peerSectorTS.xs[pk]) <= 1 && abs(s.y - g_peerSectorTS.ys[pk]) <= 1) { pr1 = 1; break; }
             if (pr1 == 1) ::InterlockedIncrement64(&g_peerSectRing1Puppet);
         }
         ::LeaveCriticalSection(&g_heldLock);
@@ -1599,6 +1703,7 @@ void AreaViewTS(const Sector& s, int* held, int* mine, int* otherLoaded, int* lo
     if (peerRing1LowestSlot != 0) *peerRing1LowestSlot = low;
     if (peerLowFresh != 0) *peerLowFresh = lf;
     if (presumedEmptyOffer != 0) *presumedEmptyOffer = pe;   /* P6j (verify-p6c MEDIUM-4) */
+    if (ring1PartyOnly != 0) *ring1PartyOnly = po;   /* T-1076 */
 }
 // PROBE-START: P025
 // P025 (F527/E13): the two inputs AreaViewTS does not return - WHICH slot the relay's map named for this area, and HOW OLD
@@ -1767,7 +1872,9 @@ int MayInventFromView(int held, int mine, int loadedHere, int ring1, int peerRin
        already returned above, so reaching this line with the offer set is the one event the counter claims to
        describe. `presumedEmptyOffer` says the table was fresh and named nobody; the rest of the condition is the
        ring-1 rule itself, so a yield to a lower slot is not counted as a presumption either. */
-    if (ring1 == 1 && (peerRing1 != 1 || mySlotLower != 0))
+    /* the rule lives in loadedzones::Ring1Grants: next to any of this game's player characters, and nobody else beside it or this
+       game's slot is lower - the other games see every party of this game in the player-sector list and yield to it the same way. */
+    if (loadedzones::Ring1Grants(ring1, peerRing1, mySlotLower) == 1)
     {
         if (presumedEmptyOffer == 1) ::InterlockedIncrement64(&g_peerSectPresumedEmpty);
         return 1;
@@ -1830,11 +1937,11 @@ void ApplyRelayPlayerSectors(const char* buf, int n, const char* ages)
     for (int i = 0; i < n; ++i)
     {
         ::InterlockedIncrement64(&g_peerSectRecv);
-        /* M9 (T-197; world-server protocol 65): 10 bytes a row - u16 slot, i32 x, i32 y. A row per player, keyed by its slot. */
+        /* M9 (T-197; world-server protocol 65): 10 bytes a row - u16 slot, i32 x, i32 y. A row per player-character area: several rows can name one slot. */
         const int slot = (int)(unsigned char)buf[i * 10] | ((int)(unsigned char)buf[i * 10 + 1] << 8);
         int px = 0, py = 0;
         std::memcpy(&px, buf + i * 10 + 2, 4); std::memcpy(&py, buf + i * 10 + 6, 4);
-        if (rows >= kPeerSectorRows) continue;                        // more rows than the 256 players the world server links: recv > valid
+        if (rows >= kPeerSectorRows) continue;                        // more rows than the table holds: recv > valid
         if (px < 0 || px >= 64 || py < 0 || py >= 64) continue;      // INT_MIN ("I do not know") and anything off the grid
         PeerSectorRow& pr = g_peerSectorRelay[rows++];
         pr.slot = slot; pr.x = px; pr.y = py; pr.valid = 1;

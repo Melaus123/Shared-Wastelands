@@ -17,7 +17,21 @@
    WIRE (little-endian, as every world-server message): u32 flags (kFlagCut: the list was cut, so a missing row is not a removed
    one), u32 count 0..kMaxShowRows, count x ROW
      ROW  i32 owner slot, f32 x, f32 y (height), f32 z, str outpost name (0..128 bytes, no control characters),
-          str owner's player name (0..128 bytes, no control characters; empty = not known), u32 size level 0..townkeep::kLevelMax
+          str owner's player name (0..128 bytes, no control characters; empty = not known), u32 size level 0..townkeep::kLevelMax,
+          T-1047 step 5 (protocol 116): u32 outpost id 0..townkeep::kOutpostIdMax (0 = none yet), u32 kind (kShowOther 0 / kShowMate 1 /
+          kShowOwn 2), 5 x i32 the handle words the owner's game said for the outpost (0 = none said),
+          T-940 (protocol 119): f32 anchor x, f32 anchor z - the outpost's fixed anchor (townkeep.h THE FIXED ANCHOR), the centre of
+          its building zone (buildnear.h ZoneVerdict)
+   EVERY GAME A COPY (T-1047 step 5, owner 1102 a, 2026-10-25): SHOW carries every player's outposts (RowsForAll): the viewer's own
+   (kShowOwn - no copy is made; its id and handle words let the game name its own outposts by id), its teammates' (kShowMate, the
+   T-546 team, as before) and every other player's (kShowOther). A teammate's copy is on the map at once; another player's copy is
+   made HIDDEN - the engine's own discovered mark cleared (Town vt+0x330(0), TownBase+0x180, and the name-known mark vt+0x348(0)) -
+   and the engine's discovery tick (0x92E7E0) discovers it by the game's own rule when this player's people come near it, exactly as
+   an undiscovered town (HideStep). The outpost ids this player has discovered (NoteDiscovered: another player's outpost the engine
+   marked discovered here, and every outpost shown as a teammate's - seen on the map, so an ex-teammate's stays shown) are kept PER
+   SAVE, as the game keeps its own towns' discovered marks (fold 1, manager call 2026-10-25): written beside each save
+   (kDiscoveredFile, EncodeDiscovered; store.cpp, the road of multiplayer.money) and read at that save's load, so a copy made again
+   (after a save, a reload) is not hidden again and a load of an older save forgets what was discovered after it.
    THE ICON (owner 874 a): the engine draws the growing outpost icon only for a town of this game's own player faction (0x48CEE0:
    Faction+0x250 set -> its icon by Town+0x388, the size level; else by the town type Town+0xD8). build.cpp hooks Town vt+0x378 /
    +0x380 for the towns it shows for a teammate: the icon the engine gives a player outpost of the row's size level
@@ -41,12 +55,15 @@
 #include <set>
 #include <map>
 #include <cstring>
+#include <cstdio>
 #include "townkeep.h"   /* the said outposts (TownRow), keptwire's PutU32 / PutStr / TextOk / FloatOk / NearXZ */
 
 namespace baseshow {
 
 const unsigned kMsgShow = 78;
-const unsigned kProtocol = 108;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW) */
+const unsigned kProtocol = 121;   /* the world-server protocol that carries SHOW (101: SHOW KEYS follows each SHOW; 116: every player's outposts, each with its id, kind and handle words; 119: each with its fixed anchor, T-940) */
+
+const int kShowOther = 0, kShowMate = 1, kShowOwn = 2;   /* T-1047 step 5: a SHOW row's kind */
 const unsigned kFlagCut = 1;
 const size_t kMaxShowRows = 256;   /* teammate outposts in one SHOW */
 const size_t kShowMsgBytes = townkeep::kTownsMsgBytes;   /* one SHOW at most: under the world-server road's 64 KiB */
@@ -59,43 +76,74 @@ struct ShowRow
     std::string name;     /* the outpost's name as its owner's game reads it */
     std::string ownerName;   /* the owner's player name ("" = not known) */
     int level;            /* the outpost's size level 0..townkeep::kLevelMax */
-    ShowRow() : owner(-1), level(0) { pos[0] = pos[1] = pos[2] = 0.0f; }
+    unsigned id;          /* T-1047 step 5: the world server's outpost id (townkeep.h; 0 = none yet) */
+    int kind;             /* T-1047 step 5: kShowOther, kShowMate or kShowOwn */
+    int hand[5];          /* T-1047 step 5: the handle words the owner's game said for the outpost (a town on THAT game only) */
+    float anchor[2];      /* T-940: the outpost's fixed anchor x, z (its zone's centre; never moved by the centre's drift) */
+    ShowRow() : owner(-1), level(0), id(0), kind(kShowMate) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) hand[i] = 0; anchor[0] = anchor[1] = 0.0f; }
 };
 
 inline bool RowOk(const ShowRow& r)
 {
     if (r.owner < 0 || r.owner > townkeep::kOwnerMax || r.level < 0 || r.level > townkeep::kLevelMax) return false;
+    if (r.id > townkeep::kOutpostIdMax || r.kind < kShowOther || r.kind > kShowOwn) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(r.pos[j])) return false;
+    if (!keptwire::FloatOk(r.anchor[0]) || !keptwire::FloatOk(r.anchor[1])) return false;   /* T-940 */
     return keptwire::TextOk(r.name, keptwire::kStrMax, true) && keptwire::TextOk(r.ownerName, keptwire::kStrMax, true);
 }
-inline size_t RowBytes(const ShowRow& r) { return 4 + 12 + 4 + r.name.size() + 4 + r.ownerName.size() + 4; }
+inline size_t RowBytes(const ShowRow& r) { return 4 + 12 + 4 + r.name.size() + 4 + r.ownerName.size() + 4 + 4 + 4 + 20 + 8; }
 
 /* the rows one game is sent: the said outposts of every slot in `mates` (the viewer's teammates), never the viewer's own, each with
    its owner's name; a row that is not sendable is left out. At most kMaxShowRows rows and kShowMsgBytes bytes: *cut = 1 when a row
    was left out for room. */
-inline std::vector<ShowRow> RowsFor(const std::vector<townkeep::TownRow>& said, int viewer, const std::set<int>& mates,
-                                    const std::map<int, std::string>& names, int* cut)
+/* T-1047 step 5: the rows of the kinds in `kinds` (bit 1 << kind), in three passes - the viewer's own, its teammates', every other
+   player's - so a cut leaves out other players' rows first */
+inline std::vector<ShowRow> RowsOfKinds(const std::vector<townkeep::TownRow>& said, int viewer, const std::set<int>& mates,
+                                        const std::map<int, std::string>& names, int* cut, unsigned kinds)
 {
     std::vector<ShowRow> out;
     size_t bytes = 8;
     if (cut != 0) *cut = 0;
-    for (size_t i = 0; i < said.size(); ++i)
+    const int order[3] = { kShowOwn, kShowMate, kShowOther };
+    for (int pass = 0; pass < 3; ++pass)
     {
-        const townkeep::TownRow& t = said[i];
-        if (t.owner == viewer || mates.count(t.owner) == 0) continue;
-        ShowRow r;
-        r.owner = t.owner;
-        for (int j = 0; j < 3; ++j) r.pos[j] = t.pos[j];
-        r.name = townkeep::NameFit(t.name);
-        r.level = t.level;
-        std::map<int, std::string>::const_iterator nm = names.find(t.owner);
-        if (nm != names.end()) r.ownerName = townkeep::NameFit(nm->second);
-        if (!RowOk(r)) continue;
-        if (out.size() >= kMaxShowRows || bytes + RowBytes(r) > kShowMsgBytes) { if (cut != 0) *cut = 1; continue; }
-        bytes += RowBytes(r);
-        out.push_back(r);
+        if ((kinds & (1u << order[pass])) == 0) continue;
+        for (size_t i = 0; i < said.size(); ++i)
+        {
+            const townkeep::TownRow& t = said[i];
+            const int kind = (t.owner == viewer) ? kShowOwn : (mates.count(t.owner) != 0 ? kShowMate : kShowOther);
+            if (kind != order[pass]) continue;
+            ShowRow r;
+            r.owner = t.owner;
+            for (int j = 0; j < 3; ++j) r.pos[j] = t.pos[j];
+            r.name = townkeep::NameFit(t.name);
+            r.level = t.level;
+            r.id = t.id;
+            r.kind = kind;
+            for (int j = 0; j < 5; ++j) r.hand[j] = t.hand[j];
+            townkeep::AnchorOf(t, &r.anchor[0], &r.anchor[1]);   /* T-940 */
+            std::map<int, std::string>::const_iterator nm = names.find(t.owner);
+            if (nm != names.end()) r.ownerName = townkeep::NameFit(nm->second);
+            if (!RowOk(r)) continue;
+            if (out.size() >= kMaxShowRows || bytes + RowBytes(r) > kShowMsgBytes) { if (cut != 0) *cut = 1; continue; }
+            bytes += RowBytes(r);
+            out.push_back(r);
+        }
     }
     return out;
+}
+/* the viewer's teammates' rows alone (kShowMate) */
+inline std::vector<ShowRow> RowsFor(const std::vector<townkeep::TownRow>& said, int viewer, const std::set<int>& mates,
+                                    const std::map<int, std::string>& names, int* cut)
+{
+    return RowsOfKinds(said, viewer, mates, names, cut, 1u << kShowMate);
+}
+/* T-1047 step 5 (owner 1102 a): what the world server sends - every player's outposts: the viewer's own, its teammates', every other
+   player's (names: every owner's player name) */
+inline std::vector<ShowRow> RowsForAll(const std::vector<townkeep::TownRow>& said, int viewer, const std::set<int>& mates,
+                                       const std::map<int, std::string>& names, int* cut)
+{
+    return RowsOfKinds(said, viewer, mates, names, cut, (1u << kShowOwn) | (1u << kShowMate) | (1u << kShowOther));
 }
 
 /* SHOW KEYS (townkeep.h kOpShowKeys): one row per shown row, in its order - the first said outpost of the row's owner at exactly the
@@ -106,7 +154,7 @@ inline std::vector<townkeep::TownRow> KeyRowsFor(const std::vector<townkeep::Tow
 {
     std::vector<townkeep::TownRow> out;
     for (size_t r = 0; r < shown.size() && out.size() < townkeep::kMaxShowKeyRows; ++r)
-        for (size_t i = 0; i < said.size(); ++i)
+        for (size_t i = 0; i < said.size() && shown[r].kind != kShowOwn; ++i)   /* T-1047 step 5: no copy of the viewer's own outpost: no key row */
         {
             const townkeep::TownRow& t = said[i];
             if (t.owner != shown[r].owner || t.pos[0] != shown[r].pos[0] || t.pos[1] != shown[r].pos[1] || t.pos[2] != shown[r].pos[2]) continue;
@@ -139,6 +187,10 @@ inline bool Encode(std::vector<char>* out, unsigned flags, const std::vector<Sho
         keptwire::PutStr(&b, r.name);
         keptwire::PutStr(&b, r.ownerName);
         keptwire::PutU32(&b, (unsigned)r.level);
+        keptwire::PutU32(&b, r.id);                   /* T-1047 step 5 */
+        keptwire::PutU32(&b, (unsigned)r.kind);
+        for (int j = 0; j < 5; ++j) { std::memcpy(&u, &r.hand[j], 4); keptwire::PutU32(&b, u); }
+        for (int j = 0; j < 2; ++j) { std::memcpy(&u, &r.anchor[j], 4); keptwire::PutU32(&b, u); }   /* T-940 */
     }
     if (b.size() > kShowMsgBytes) return false;
     out->swap(b);
@@ -165,7 +217,12 @@ inline int Decode(const char* p, size_t n, unsigned* flags, std::vector<ShowRow>
         r.ownerName.assign(p + rd.at, lo); rd.at += lo;
         const unsigned lv = rd.U32();
         r.level = lv > (unsigned)townkeep::kLevelMax ? -1 : (int)lv;   /* -1: refused by RowOk */
-        if (!RowOk(r)) return 0;
+        r.id = rd.U32();                               /* T-1047 step 5: past kOutpostIdMax refused by RowOk */
+        const unsigned kd = rd.U32();
+        r.kind = kd > (unsigned)kShowOwn ? -1 : (int)kd;   /* -1: refused by RowOk */
+        for (int j = 0; j < 5; ++j) r.hand[j] = rd.I32();
+        for (int j = 0; j < 2; ++j) r.anchor[j] = rd.F32();   /* T-940 */
+        if (rd.bad || !RowOk(r)) return 0;
         got.push_back(r);
     }
     if (rd.bad || rd.at != n) return 0;
@@ -212,7 +269,10 @@ struct Shown
     std::string markSaid;   /* T-811 log: the icon / colour last written in its [TEAMBASE] map marker line ("" = none yet) */
     int ownerHand[5];       /* T-924: the owner's own town handle words, from its key row (all 0: not known) */
     std::set<std::string> keys;   /* T-924: the keys its key row last named (a re-founded outpost keeps its pieces' keys) */
-    Shown() : owner(-1), ours(0), level(0), going(0), drawn(0) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) { hand[i] = 0; ownerHand[i] = 0; } }
+    unsigned id;            /* T-1047 step 5: its row's outpost id (0 = not known) */
+    int kind;               /* T-1047 step 5: its row's kind (kShowMate / kShowOther) */
+    int hidden;             /* T-1047 step 5: 1 = this game cleared its town's discovered mark (HideStep); its discovery is watched */
+    Shown() : owner(-1), ours(0), level(0), going(0), drawn(0), id(0), kind(kShowMate), hidden(0) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) { hand[i] = 0; ownerHand[i] = 0; } }
 };
 /* T-924 IDENTITY: the key row of a SHOW row - the one of the same owner at exactly its centre (KeyRowsFor copies it bit for bit;
    -1 none: the SHOW KEYS for it has not come yet) */
@@ -247,7 +307,14 @@ inline void MatchIdent(const std::vector<Shown>& shown, const std::vector<ShowRo
     std::vector<int> kr(rows.size(), -1);
     for (size_t r = 0; r < rows.size(); ++r) kr[r] = KeyRowOfRow(rows[r], keyRows);
     for (size_t r = 0; r < rows.size(); ++r)
+    {   /* T-1047 step 5, pass 0: the same outpost id (the world server's identity, both sides knowing it) */
+        if (rows[r].id == 0) continue;
+        for (size_t s = 0; s < shown.size(); ++s)
+            if (used[s] == 0 && shown[s].owner == rows[r].owner && shown[s].id == rows[r].id) { used[s] = 1; (*rowTo)[r] = (int)s; break; }
+    }
+    for (size_t r = 0; r < rows.size(); ++r)
     {
+        if ((*rowTo)[r] >= 0) continue;
         if (kr[r] < 0 || !townkeep::HandKnown(keyRows[(size_t)kr[r]].hand)) continue;
         for (size_t s = 0; s < shown.size(); ++s)
             if (used[s] == 0 && shown[s].owner == rows[r].owner && townkeep::HandKnown(shown[s].ownerHand) && townkeep::HandSame(shown[s].ownerHand, keyRows[(size_t)kr[r]].hand))
@@ -635,6 +702,138 @@ inline void PlanApply(const std::vector<Shown>& shown, const std::vector<ShowRow
         else p->gone.push_back(unmatched[i]);
     }
 }
+/* ---- T-1047 step 5 (owner 1102 a): ANOTHER PLAYER'S OUTPOST IS HIDDEN UNTIL THIS PLAYER DISCOVERS IT ----
+   The engine's own discovery state: Town vt+0x328 reads, vt+0x330 writes the discovered byte TownBase+0x180 (the founding helper
+   0x4D06B0 calls vt+0x330(1) and vt+0x348(1); the map's town list 0x490C70 lists only a town whose vt+0x328 answers true; the
+   discovery tick 0x92E7E0 calls vt+0x330(1) for a town not yet discovered when a player character is within its type's radius, and
+   vt+0x348(1) + vt+0x330(1) nearer still - with "Discovered {1}"). The step for one shown base at an apply or a look:
+   kind: its row's kind; madeNow: its town was founded or taken up by this apply; discovered: the town's vt+0x328 (1 yes, 0 no, -1 not
+   read); remembered: this player discovered the outpost id earlier (in this save: the discovered set). */
+const int kHideNone = 0, kHideHide = 1, kHideShow = 2, kHideNoted = 3;
+inline int HideStep(int kind, int madeNow, int discovered, int remembered)
+{
+    if (kind == kShowMate) return discovered == 0 ? kHideShow : kHideNone;   /* a teammate's outpost is on the map at once */
+    if (kind != kShowOther || discovered < 0) return kHideNone;
+    if (madeNow != 0) return remembered != 0 ? (discovered == 0 ? kHideShow : kHideNone) : (discovered != 0 ? kHideHide : kHideNone);
+    return (discovered == 1 && remembered == 0) ? kHideNoted : kHideNone;   /* discovered by the engine's rule since: remembered */
+}
+const size_t kDiscoveredCap = 4096;   /* outpost ids remembered as discovered */
+/* T-1047 step 5 fold 1: 1 = the outpost id is noted as discovered by this player now - another player's copy the engine marked
+   discovered (its own rule), or a teammate's outpost (on the map at once: seen - so an ex-teammate's stays shown, manager call
+   2026-10-25); not when already remembered, nor the player's own (kind kShowOwn: no copy), nor with no id or a mark not read */
+inline int NoteDiscovered(int kind, unsigned id, int discovered, int remembered)
+{
+    if (id == 0 || remembered != 0) return 0;
+    if (kind == kShowMate) return 1;
+    return (kind == kShowOther && discovered == 1) ? 1 : 0;
+}
+/* T-1047 step 5 fold 1: the read made BEFORE a copy is taken out (a save, its row gone, a re-found): the discovered mark of its town
+   (discovered: vt+0x328, -1 not read) noted into *disc by NoteDiscovered, so a discovery the 5 s look has not seen yet is never lost
+   with the town. 1 = noted */
+inline int NoteBeforeTakeOut(const Shown& s, int discovered, std::set<unsigned>* disc)
+{
+    if (disc == 0 || disc->size() >= kDiscoveredCap) return 0;
+    if (NoteDiscovered(s.kind, s.id, discovered, disc->count(s.id) != 0 ? 1 : 0) == 0) return 0;
+    disc->insert(s.id);
+    return 1;
+}
+/* ---- T-1047 step 5 fold 1: THE DISCOVERED OUTPOSTS BESIDE A SAVE ----
+   kDiscoveredFile in the save's folder (store.cpp: made at the save's request, brought up to date at the take-out before the save
+   runs - build.cpp BdShowSaveGuard - and written once the save has landed, beside multiplayer.mark; read at that save's load before
+   the engine reads a file, and only when written after the save's quick.save - DiscoveredFileCurrent - so an older save's file is
+   never taken for it). Text, LF line ends: line 1 "<kDiscoveredHeader><TAB>1", then one "D<TAB><outpost id>" per id. */
+const char* const kDiscoveredFile = "multiplayer.outposts";
+const char* const kDiscoveredHeader = "discovered-outposts";
+const int kDiscoveredFormat = 1;
+inline std::string EncodeDiscovered(const std::set<unsigned>& d)
+{
+    std::string o = std::string(kDiscoveredHeader) + "\t" + zonekeep::ZkNum(kDiscoveredFormat) + "\n";
+    size_t n = 0;
+    for (std::set<unsigned>::const_iterator it = d.begin(); it != d.end() && n < kDiscoveredCap; ++it)
+        if (*it != 0 && *it <= townkeep::kOutpostIdMax) { o += "D\t" + zonekeep::ZkNum((long long)*it) + "\n"; ++n; }
+    return o;
+}
+/* false = not such a file (nothing kept: *out empty); a bad D line refuses the whole file */
+inline bool DecodeDiscovered(const std::string& text, std::set<unsigned>* out)
+{
+    out->clear();
+    std::set<unsigned> d;
+    std::vector<std::string> f;
+    size_t at = 0;
+    int lineNo = 0;
+    while (at < text.size())
+    {
+        size_t e = text.find('\n', at);
+        if (e == std::string::npos) e = text.size();
+        std::string line = text.substr(at, e - at);
+        at = e + 1;
+        ++lineNo;
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        zonekeep::SplitTabs(line, &f);
+        if (lineNo == 1)
+        {
+            int v = 0;
+            if (f.size() != 2 || f[0] != kDiscoveredHeader || !zonekeep::DecInt(f[1], &v) || v != kDiscoveredFormat) return false;
+            continue;
+        }
+        if (line.empty()) continue;
+        int id = 0;
+        if (f.size() != 2u || f[0] != "D" || !zonekeep::DecInt(f[1], &id) || id <= 0 || d.size() >= kDiscoveredCap) return false;
+        d.insert((unsigned)id);
+    }
+    if (lineNo == 0) return false;
+    out->swap(d);
+    return true;
+}
+/* 1 = the file beside a save is that save's: written (fileFt, FILETIME) at or after its quick.save (saveFt); 0 = none, or an older
+   save's left behind (a save whose file was not written) */
+inline int DiscoveredFileCurrent(unsigned long long fileFt, unsigned long long saveFt)
+{
+    return (fileFt != 0ULL && saveFt != 0ULL && fileFt >= saveFt) ? 1 : 0;
+}
+/* ---- T-1047 step 5 fold 1: WHICH OUTPOST A TOWN OR AN ID NAMES ON THIS GAME ----
+   Every outpost town this game holds, by id: its own (SHOW kShowOwn rows: the words this game said) and each copy (a shown base).
+   team: 1 = the viewer's own or a current teammate's outpost. */
+struct IdTown { unsigned id; int owner; int hand[5]; int team; int going; IdTown() : id(0), owner(-1), team(0), going(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; } };
+/* the id of the town whose words are w; teamOnly: only an own or teammate's outpost (a player's OWN piece is only ever linked to its
+   own team's outposts - never a non-teammate's copy, manager call 2026-10-25); 0 = none */
+inline unsigned IdOfHand(const std::vector<IdTown>& t, const int* w, int teamOnly)
+{
+    if (w == 0 || !townkeep::HandKnown(w)) return 0;
+    for (size_t i = 0; i < t.size(); ++i)
+        if (t[i].id != 0 && townkeep::HandSame(t[i].hand, w)) return (teamOnly != 0 && t[i].team == 0) ? 0u : t[i].id;
+    return 0;
+}
+/* 1 = the town at w is a non-teammate's copy (an IdTown that is not team) */
+inline int HandIsOtherCopy(const std::vector<IdTown>& t, const int* w)
+{
+    if (w == 0 || !townkeep::HandKnown(w)) return 0;
+    for (size_t i = 0; i < t.size(); ++i) if (townkeep::HandSame(t[i].hand, w)) return t[i].team == 0 ? 1 : 0;
+    return 0;
+}
+/* a piece record's link may name an outpost of its own owner or of the owner's teammate (T-923: a piece placed in a teammate's
+   outpost); sameTeam: the two slots are in one team now */
+inline int LinkOwnerOk(int outpostOwner, int recordOwner, int sameTeam)
+{
+    if (outpostOwner < 0 || recordOwner < 0) return 0;
+    return (outpostOwner == recordOwner || sameTeam != 0) ? 1 : 0;
+}
+const int kIdTownNone = -1, kIdTownOwnerBad = -2;
+/* the town for a record's link: the index of the first town of that id not going whose owner LinkOwnerOk allows for the record's
+   owner (sameTeam[i]: towns[i].owner and the record's owner in one team now); kIdTownOwnerBad = one of that id stands but its owner
+   is neither the record's owner nor a teammate of it (refused, counted); kIdTownNone = none here */
+inline int TownOfIdFor(const std::vector<IdTown>& t, unsigned id, int recordOwner, const std::vector<int>& sameTeam)
+{
+    if (id == 0) return kIdTownNone;
+    int bad = 0;
+    for (size_t i = 0; i < t.size(); ++i)
+    {
+        if (t[i].id != id || t[i].going != 0) continue;
+        if (LinkOwnerOk(t[i].owner, recordOwner, i < sameTeam.size() ? sameTeam[i] : 0) != 0) return (int)i;
+        bad = 1;
+    }
+    return bad != 0 ? kIdTownOwnerBad : kIdTownNone;
+}
 inline std::string EncodeCopyList(const std::vector<CopyRow>& l)
 {
     std::string o = std::string(kCopyListHeader) + "\t" + zonekeep::ZkNum(kCopyListFormat) + "\n";
@@ -694,4 +893,234 @@ inline size_t DecodeCopyList(const std::string& text, std::vector<CopyRow>* out,
     return bad;
 }
 
+/* ---- T-1047 step 5 fold 2 ----
+   THE OWN-PIECE CHECK'S EVENTS (the owner's game: TlOwnOutOfOther moves an own piece out of a non-teammate's copy, TlOwnMark marks a
+   write for a changed engine link). It runs on events only, never as a periodic sweep: one piece at its placement, an area's own
+   pieces once that area's records are applied here (a load, a return to it, a reconnect), and every applied area's once the team
+   list changes (a teammate added or removed, or the list held again after a connection drop). While this game does not hold the
+   team list (a drop, or a reconnect before the list arrives) a teammate's outpost cannot be told from a stranger's: nothing runs, the
+   skip is counted, and what was owed runs once the list is held. */
+struct OwnCheck
+{
+    std::vector<unsigned char> owed;   /* by area: its own pieces are to be checked */
+    long teamNo;                       /* the team list's change number last seen (-1 = none yet) */
+    std::string teamSig;               /* "-" = not held; else "k:" and the teammates' slots */
+    long long waits, pieceWaits, runs, teamEvents;
+    int waitCounted;                   /* this wait is counted already */
+    int anyOwed;                       /* an area may be owed (the per-frame look reads no further while 0) */
+    explicit OwnCheck(int areas) : owed((size_t)(areas > 0 ? areas : 0), 0), teamNo(-1), teamSig("-"), waits(0), pieceWaits(0), runs(0), teamEvents(0), waitCounted(0), anyOwed(0) {}
+};
+inline std::string OwnCheckTeamSig(int held, const std::vector<int>& mates)
+{
+    if (held == 0) return "-";
+    std::set<int> m(mates.begin(), mates.end());
+    std::string s("k:");
+    char b[16];
+    for (std::set<int>::const_iterator i = m.begin(); i != m.end(); ++i) { _snprintf(b, sizeof(b) - 1, "%d,", *i); b[sizeof(b) - 1] = 0; s += b; }
+    return s;
+}
+/* an area's records were applied here: its own pieces owed a check */
+inline void OwnCheckAreaApplied(OwnCheck* g, int area)
+{
+    if (area >= 0 && (size_t)area < g->owed.size()) { g->owed[(size_t)area] = 1; g->anyOwed = 1; }
+}
+/* the team list's change number now (teamNo) with its signature (OwnCheckTeamSig): a changed team owes every applied area
+   (applied[area] != 0) a check. 1 = owed now */
+inline int OwnCheckTeamSeen(OwnCheck* g, long teamNo, const std::string& sig, const unsigned char* applied, int n)
+{
+    if (teamNo == g->teamNo) return 0;
+    g->teamNo = teamNo;
+    if (sig == g->teamSig) return 0;
+    g->teamSig = sig;
+    ++g->teamEvents;
+    for (int c = 0; c < n && (size_t)c < g->owed.size(); ++c) if (applied[c] != 0) { g->owed[(size_t)c] = 1; g->anyOwed = 1; }
+    return 1;
+}
+/* one piece at its placement: 1 = check it now (the team list is held); 0 = skipped (counted), its area owed for when it is */
+inline int OwnCheckPieceNow(OwnCheck* g, int teamHeld, int area)
+{
+    if (teamHeld != 0) return 1;
+    ++g->pieceWaits;
+    OwnCheckAreaApplied(g, area);
+    return 0;
+}
+/* 1 = the owed areas are to be checked now (then OwnCheckAreaDone for each one finished); 0 = none owed, or the team list is not held
+   (that wait counted once) */
+inline int OwnCheckAreasDue(OwnCheck* g, int teamHeld)
+{
+    if (g->anyOwed == 0) return 0;
+    int any = 0;
+    for (size_t c = 0; c < g->owed.size() && any == 0; ++c) any = g->owed[c] != 0 ? 1 : 0;
+    if (any == 0) { g->anyOwed = 0; return 0; }
+    if (teamHeld == 0) { if (g->waitCounted == 0) { g->waitCounted = 1; ++g->waits; } return 0; }
+    g->waitCounted = 0;
+    ++g->runs;
+    return 1;
+}
+inline void OwnCheckAreaDone(OwnCheck* g, int area)
+{
+    if (area >= 0 && (size_t)area < g->owed.size()) g->owed[(size_t)area] = 0;
+}
+/* a world teardown: nothing owed (the next world's areas are owed as their records are applied); the team seen stays */
+inline void OwnCheckForgetWorld(OwnCheck* g)
+{
+    for (size_t c = 0; c < g->owed.size(); ++c) g->owed[c] = 0;
+    g->waitCounted = 0; g->anyOwed = 0;
+}
+/* ONE RELINK OF A PIECE (TlApplyPiece, TlOwnOutOfOther): the link copy is tried only when due - a copy that failed on this piece is
+   not tried again until an event changes what it was tried with (the record's generation, the town it stands in, the town it goes
+   to) - and the power cycle the copy made is always reported (CycleAfter), after a failed copy too, so a piece left off is written
+   back or counted. */
+struct LinkFail { unsigned gen; int from[5]; int to[5]; };
+struct RelinkOps
+{
+    virtual int Copy(int* cycle) = 0;          /* the link copy: 1 = written; *cycle = what the power cycle did */
+    virtual void CycleAfter(int cycle) = 0;    /* the cycle reported */
+    virtual ~RelinkOps() {}
+};
+const int kRelinkSkipped = -1, kRelinkFailed = 0, kRelinkDone = 1;
+inline int LinkRetryDue(const std::map<std::string, LinkFail>& fails, const std::string& key, unsigned gen, const int* from, const int* to)
+{
+    std::map<std::string, LinkFail>::const_iterator f = fails.find(key);
+    if (f == fails.end()) return 1;
+    return (f->second.gen != gen || !townkeep::HandSame(f->second.from, from) || !townkeep::HandSame(f->second.to, to)) ? 1 : 0;
+}
+inline int RelinkPiece(RelinkOps* ops, std::map<std::string, LinkFail>* fails, size_t cap, const std::string& key, unsigned gen,
+                       const int* from, const int* to, long long* skipped)
+{
+    if (LinkRetryDue(*fails, key, gen, from, to) == 0) { if (skipped != 0) ++*skipped; return kRelinkSkipped; }
+    int cycle = 0;
+    const int set = ops->Copy(&cycle);
+    ops->CycleAfter(cycle);
+    std::map<std::string, LinkFail>::iterator f = fails->find(key);
+    if (set == 1) { if (f != fails->end()) fails->erase(f); return kRelinkDone; }
+    if (f != fails->end() || fails->size() < cap)
+    {
+        LinkFail l;
+        l.gen = gen;
+        for (int i = 0; i < 5; ++i) { l.from[i] = from[i]; l.to[i] = to[i]; }
+        (*fails)[key] = l;
+    }
+    return kRelinkFailed;
+}
+/* THE DISCOVERED SET OF A LOADING SAVE (BuildDiscoveredLoaded): armed at the load's prepare, bound at the load call's end to the world
+   that load made (the world generation moves inside the engine's load, in its resetGame); a load that ends with no new world (it
+   failed) is disarmed. Taken only by the world it was bound to, never by a later one. */
+struct DiscArm { int armed; long gen; DiscArm() : armed(0), gen(-1) {} };   /* gen -1: its load call still running */
+inline void DiscArmAtPrepare(DiscArm* a) { a->armed = 1; a->gen = -1; }
+/* 1 = disarmed (the load made no world) */
+inline int DiscArmAtLoadEnd(DiscArm* a, long genAtPrepare, long genNow)
+{
+    if (a->armed == 0 || a->gen != -1) return 0;
+    if (genNow == genAtPrepare) { a->armed = 0; return 1; }
+    a->gen = genNow;
+    return 0;
+}
+/* at an apply in world worldGen: 1 = this world takes the set (then disarmed); a set bound to another world is disarmed */
+inline int DiscArmTake(DiscArm* a, long worldGen)
+{
+    if (a->armed == 0 || a->gen == -1) return 0;
+    const int take = (a->gen == worldGen) ? 1 : 0;
+    a->armed = 0; a->gen = -1;
+    return take;
+}
+/* THE SET EACH WAITING SAVE IS WRITTEN WITH: every save take-out's set kept by its number (at most cap), and each save landing claims
+   the first take-out after its request (guardN0) not claimed by an earlier save - two waiting saves never share one set. 1 = found */
+inline void DiscGuardNote(std::map<long long, std::set<unsigned> >* hist, long long n, const std::set<unsigned>& set, size_t cap)
+{
+    (*hist)[n] = set;
+    while (hist->size() > cap) hist->erase(hist->begin());
+}
+inline int DiscGuardClaim(std::map<long long, std::set<unsigned> >* hist, long long guardN0, std::set<unsigned>* out)
+{
+    std::map<long long, std::set<unsigned> >::iterator h = hist->upper_bound(guardN0);
+    if (h == hist->end()) return 0;
+    out->swap(h->second);
+    hist->erase(h);
+    return 1;
+}
+
+/* ---- T-1047 step 5 fold 3 ----
+   A TOWN EVENT: a town founded, taken up or moved at area (sx, sy) of the 64 x 64 grid owes the own pieces of that area and the 8
+   around it a check - a standing building's nearest town can now be that town (the engine's own-outpost founding 0x4D6300 hands
+   this player's wilderness buildings to their nearest town once 0x933F40 has founded it, decomp_4d6300:158-180). Gated as every
+   event: TlOwnCheckTick runs it only while the team list is held. Returns the areas owed (0 = off the grid). */
+const int kOwnTownGrid = 64;
+inline int OwnCheckTownAt(OwnCheck* g, int sx, int sy)
+{
+    if (sx < 0 || sy < 0 || sx >= kOwnTownGrid || sy >= kOwnTownGrid) return 0;
+    int n = 0;
+    for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            const int x = sx + dx, y = sy + dy;
+            if (x < 0 || y < 0 || x >= kOwnTownGrid || y >= kOwnTownGrid) continue;
+            OwnCheckAreaApplied(g, x * kOwnTownGrid + y);
+            ++n;
+        }
+    return n;
+}
+/* a copy's apply made or moved its town (founded, taken up, moved or founded again: step a kRow* step, moved 1 = the copy moved):
+   a town event. A copy kept where it stood is none - no check at every apply */
+inline int CopyTownChanged(int step, int moved) { return (step != kRowKeep || moved != 0) ? 1 : 0; }
+/* a placement in another player's town (BdLeaveStrangerTown): 1 = check it now (the team list is held); 0 = not now - every area
+   whose records are applied here (applied[area] != 0, the piece's own among them) owed a check for when the list is held */
+inline int OwnCheckPlacement(OwnCheck* g, int teamHeld, const unsigned char* applied, int n)
+{
+    if (OwnCheckPieceNow(g, teamHeld, -1) != 0) return 1;
+    for (int c = 0; c < n && (size_t)c < g->owed.size(); ++c) if (applied[c] != 0) OwnCheckAreaApplied(g, c);
+    return 0;
+}
+/* the team-held gate of the own-piece check's engine steps (TlOwnOutOfOther's move, TlOwnMark's mark, the record write's read of
+   the engine link): 1 = go on - a top-level piece (topLevel 1) while the team list is held */
+inline int OwnStepDue(int teamHeld, int topLevel) { return (teamHeld != 0 && topLevel == 1) ? 1 : 0; }
+/* the town-link tick (TlTick): ready = engine writes open, the main thread, no save held or pending; mySlot = this player's slot;
+   sinceLook = ms since the last look. The own-piece check runs at every ready tick (an event is checked at once, not at the next
+   look); the look of the other games' links once lookMs has passed */
+const int kTickOwnCheck = 1, kTickLook = 2;
+inline int TownLinkTickPlan(int ready, int mySlot, unsigned sinceLook, unsigned lookMs)
+{
+    if (ready == 0) return 0;
+    return (mySlot >= 0 ? kTickOwnCheck : 0) | (sinceLook >= lookMs ? kTickLook : 0);
+}
+/* an allowed load (store.cpp LoadGamePrepared): the world generation read BEFORE the prepare (which arms the save's discovered set),
+   then the engine's load, then its end with that generation (a load that made no world is disarmed) */
+struct DiscLoadOps
+{
+    virtual long Gen() = 0;
+    virtual void Prepare() = 0;
+    virtual int Load() = 0;
+    virtual void Ended(long genAtPrepare) = 0;
+    virtual ~DiscLoadOps() {}
+};
+inline int DiscLoadRun(DiscLoadOps* o)
+{
+    const long g = o->Gen();
+    o->Prepare();
+    const int r = o->Load();
+    o->Ended(g);
+    return r;
+}
+/* the discovered set of each save: asked at its request (the take-outs noted so far, the set now as text), noted at each save
+   take-out under the next number, and at the landing the set its own take-out noted (DiscGuardClaim) - else its request's text */
+struct DiscGuard { std::map<long long, std::set<unsigned> > hist; long long n; DiscGuard() : n(0) {} };
+inline std::string DiscGuardAsk(const DiscGuard& g, const std::set<unsigned>& now, long long* n0)
+{
+    if (n0 != 0) *n0 = g.n;
+    return EncodeDiscovered(now);
+}
+inline void DiscGuardTakeOut(DiscGuard* g, const std::set<unsigned>& set, size_t cap)
+{
+    ++g->n;
+    DiscGuardNote(&g->hist, g->n, set, cap);
+}
+inline int DiscGuardText(DiscGuard* g, long long n0, std::string* text)
+{
+    std::set<unsigned> s;
+    if (DiscGuardClaim(&g->hist, n0, &s) == 0) return 0;
+    *text = EncodeDiscovered(s);
+    return 1;
+}
+
 }   /* namespace baseshow */
+
