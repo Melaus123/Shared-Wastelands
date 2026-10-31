@@ -14476,6 +14476,46 @@ int HovSave(const std::vector<std::string>& lines)
     for (size_t i = 0; i < lines.size(); ++i) { all += lines[i]; all += '\n'; }
     return coop::OwnTextReplace(hovrec::HandFile(), all) ? 1 : 0;   /* temp file, flush, rename over (OwnLedgerAppend's pattern) */
 }
+/* Dedicated fork, 10-29: THE SETTLED LIST (pp.handover-settled, beside pp.handover): the transfers of a GIVE placed here whose in
+   line was let go because its holder keeps no line for it (CLOSED 4). A later QUERY for one of them is answered "holds" from here, never
+   "not placed" - that answer makes the giver revoke and destroy the item that arrived (10-28: an hand-cleared ledger cost Arkanite
+   crystals). Without it those lines were kept for good and filled the 256-line file, after which every hand-over was refused.
+   One "asker reqId holder" per line, the newest last, at most kHovSettledCap. */
+const char* const kHovSettledFile = "pp.handover-settled";
+const size_t kHovSettledCap = 8192;
+long long g_hovSettledAdded = 0, g_hovSettledAnswered = 0;
+std::string HovSettledKey(int asker, unsigned int reqId, int holder) { return N((long long)asker) + " " + N((long long)reqId) + " " + N((long long)holder); }
+int HovSettledHas(int asker, unsigned int reqId, int holder)
+{
+    std::string text; int notFound = 0;
+    if (!coop::OwnTextRead(kHovSettledFile, &text, &notFound)) return 0;
+    const std::string k = HovSettledKey(asker, reqId, holder);
+    size_t at = 0;
+    while ((at = text.find(k, at)) != std::string::npos)
+    {
+        const bool startOk = (at == 0 || text[at - 1] == '\n');
+        const size_t end = at + k.size();
+        if (startOk && (end == text.size() || text[end] == '\n' || text[end] == '\r')) return 1;
+        at = end;
+    }
+    return 0;
+}
+int HovSettledAdd(int asker, unsigned int reqId, int holder)
+{
+    std::string text; int notFound = 0;
+    if (!coop::OwnTextRead(kHovSettledFile, &text, &notFound) && notFound == 0) return 0;
+    if (HovSettledHas(asker, reqId, holder)) return 1;
+    std::vector<std::string> lines;
+    size_t a = 0;
+    while (a < text.size()) { size_t e = text.find('\n', a); if (e == std::string::npos) e = text.size(); if (e > a) lines.push_back(text.substr(a, e - a)); a = e + 1; }
+    lines.push_back(HovSettledKey(asker, reqId, holder));
+    const size_t from = (lines.size() > kHovSettledCap) ? lines.size() - kHovSettledCap : 0;
+    std::string all;
+    for (size_t i = from; i < lines.size(); ++i) { all += lines[i]; all += '\n'; }
+    if (!coop::OwnTextReplace(kHovSettledFile, all)) return 0;
+    ++g_hovSettledAdded;
+    return 1;
+}
 /* 1 written; 0 the file could not be read / written (lineFail); -1 an open line does not fit the cap (lineFull) */
 int HovPut(const hovrec::HandLine& l)
 {
@@ -15854,7 +15894,10 @@ void HovOnQueryAsReceiver(const hovrec::HandMsg& m, int from)
     const int markRule = coop::OwnOverlayMarkRule();
     int live = 0, looked = -2;
     unsigned long long applied = 0ULL;
+    const int settled = (have == 0 && f >= 0 && HovSettledHas((int)m.asker, m.reqId, (int)m.holder)) ? 1 : 0;   /* a give placed here whose line was let go */
+    if (settled != 0) ++g_hovSettledAnswered;
     const int v = (have != 0) ? HovReceiverVerdict(&l, key, &live, &applied, &looked)   /* T-889 fold 5: shared with CLOSED 1 after a load */
+                              : settled != 0 ? hovrec::kVHolds
                               : hovrec::Verdict(0, hovrec::kVNone, 0, 0, 0, markRule, 1, (f >= 0) ? 1 : 0);
     HovSend(hovrec::kMsgVerdict, (int)m.asker, m.reqId, (int)m.holder, v, from);
     DebugLog("[ITEMS] T-889 VERDICT " + N((long long)v) + " for " + HovWhy((int)m.asker, m.reqId, (int)m.holder) + " to slot " + N((long long)from)
@@ -15993,6 +16036,15 @@ void HovOnClosed(const hovrec::HandMsg& m, int from)
     if (m.value == hovrec::kClosedPlaced && HovClosedPlacedWaits(&l, key) != 0) return;   /* T-889 fold 5: kept, no ACK */
     const int liveCopy = (HovLiveNow(key) != 0 || l.frozen == hovrec::kVHolds) ? 1 : 0;
     const int rc = hovrec::ReceiverOnClosed(1, m.value, liveCopy, l.kind);
+    if (rc == hovrec::kRcKeep && l.kind == hovrec::kKindGive && (liveCopy != 0 || l.plHas != 0)
+        && HovSettledAdd((int)m.asker, m.reqId, (int)m.holder) != 0)
+    {   /* Dedicated fork, 10-29: the item is here and its giver keeps no line - settled (it answers "holds" from now on), the line goes */
+        if (HovSay(g_hovSettledAdded))
+            DebugLog("[ITEMS] T-889 " + HovWhy((int)m.asker, m.reqId, (int)m.holder) + ": CLOSED 4 on a give placed here - settled (pp.handover-settled), the in line dropped (settled " + N(g_hovSettledAdded) + ")");
+        HovDrop((int)m.asker, m.reqId, (int)m.holder, hovrec::kRoleDst);
+        g_hovLive.erase(key); g_hovAsk.erase(key); g_hovTakerRb.erase(key);
+        return;
+    }
     if (rc == hovrec::kRcKeep)
     {
         ++g_hovClosedUnknown;
@@ -55693,4 +55745,189 @@ int CageCandidatesNear(const float* from, void** out, float* distOut, std::strin
 /* TEST-ONLY: the `name:<Name>` / `deadname:<Name>` forms for levers outside the item code (kill). */
 int LeverNameUid(const std::string& w, unsigned int* uid, std::string* label) { return P105NameUid(w, uid, label); }
 void LeverNoteSpawned(const std::string& templateName, unsigned int uid) { LeverSpawnedNote(templateName, uid); }
+}   /* namespace coop */
+
+// ===================== CHATLINK: THE ITEM UNDER THE MOUSE, for the chat's item links (src/common/chatlink.h) =====================
+// With the chat's typing line open, Shift + middle-click on an item puts a link to it in the line. chat.cpp hands over the MyGUI
+// widget under the mouse and where it is on screen; this block answers which item of which inventory window that is, and what the
+// link says about it. NO ENGINE FUNCTION IS CALLED and NO NEW ADDRESS IS USED: every load is a guarded POD read of a structure the
+// engine's own InventoryGUI::getMouseItem reads (1.0.68 0x712250 = 1.0.65 0x711680, read 2026-10-25), plus the two vtable reads
+// this file already makes (InventoryGUI +0x70 getInventory, InventoryItemBase +0x2B8 getLevel). getMouseItem itself is NOT called:
+// it has no address-table row, and on a shop window it can put up the game's own "gui_notrade" message.
+//   * the open windows: the window-record map InvGuiRecordMap (already walked by ShopWinRecFlagPod; key = the InventoryGUI*);
+//   * the window's section widgets: InventoryGUI+0x60 is a std::map<section name, SectionGUI*> (getMouseItem: `lea rcx,[gui+0x60]`
+//     then operator[] 0x161D60, which returns &node+0x40; the head is at map+8). A SectionGUI's first word is the section's MyGUI
+//     widget (getMouseItem reads [widget+0x30]/[+0x34], the widget's absolute left/top; the fill loop at 1.0.68 0x14EFC0 makes the
+//     0x28-byte SectionGUI from the widget it finds by the section's own name, and sizes that widget to cells x cell size);
+//   * the window's inventory's sections: the lektor<InventorySection*> at Inventory+0x68 (count +0x70, elements +0x78), the array
+//     that same fill loop walks; each section is checked to name the inventory back (+0xC8 parentInventory);
+//   * the cell: the section widget is (content width x cell size) wide, so the column is (mouse - left) * width / pixels; the item is
+//     the SectionItem whose footprint covers that cell (InventorySection::items, game/Inventory.h).
+// A read that faults, or a layout that does not hold together, answers "no item" with a reason; nothing is written anywhere.
+namespace coop {
+namespace {
+const size_t kClkGuiSecMap    = 0x60;    /* InventoryGUI: std::map<std::string, SectionGUI*> */
+const size_t kClkMapHead      = 0x08;    /* a std::map's head node, 8 bytes in (the record map's walk reads it there too) */
+const size_t kClkNodeParent   = 0x08;    /* a tree node: left +0, parent (the head's parent is the root) +8, right +0x10 */
+const size_t kClkNodeRight    = 0x10;
+const size_t kClkSecNodeValue = 0x40;    /* the section map's node: key std::string from +0x18, the SectionGUI* at +0x40 (0x161D60) */
+const size_t kClkRecNodeKey   = 0x18;    /* the record map's node: the InventoryGUI* key (ShopWinRecFlagPod) */
+const size_t kClkRecNodeNil   = 0x51;
+const size_t kClkInvSecCount  = 0x70;    /* Inventory: lektor<InventorySection*> at +0x68 - count */
+const size_t kClkInvSecArray  = 0x78;    /* ... elements */
+const size_t kClkGdName       = 0x28;    /* GameData::name */
+const size_t kClkGdType       = 0x50;    /* GameData::type (itemType) */
+const size_t kClkGdSid        = 0x58;    /* GameData::stringID */
+const int    kClkMaxNodes     = 512;
+const int    kClkMaxGuis      = 64;
+const int    kClkMaxSections  = 64;
+
+/* the InventoryGUI of every open window, out of the record map; -1 = the map is not bound or unreadable */
+int ClkRecordGuis(void** guis, int cap)
+{
+    if (g_base == 0 || kInvGuiRecordMapRva == 0) return -1;
+    void* head = 0;
+    if (ItPtrPod((const void*)(g_base + kInvGuiRecordMapRva), kClkMapHead, &head) == 0 || !ItPlaus(head)) return -1;
+    void* root = 0;
+    if (ItPtrPod(head, kClkNodeParent, &root) == 0) return -1;
+    void* st[64];
+    int sp = 0, n = 0, steps = 0;
+    if (ItPlaus(root) && root != head) st[sp++] = root;
+    while (sp > 0 && ++steps <= kClkMaxNodes)
+    {
+        void* node = st[--sp];
+        int nil = 1;
+        if (ItBytePod(node, kClkRecNodeNil, &nil) == 0 || nil != 0) continue;
+        void* key = 0;
+        if (ItPtrPod(node, kClkRecNodeKey, &key) != 0 && ItPlaus(key) && n < cap) guis[n++] = key;
+        void* l = 0; void* r = 0;
+        if (ItPtrPod(node, 0, &l) != 0 && ItPlaus(l) && l != head && sp < 64) st[sp++] = l;
+        if (ItPtrPod(node, kClkNodeRight, &r) != 0 && ItPlaus(r) && r != head && sp < 64) st[sp++] = r;
+    }
+    return n;
+}
+/* 1 = one of this window's sections is drawn by `widget` */
+int ClkGuiOwnsWidget(void* gui, const void* widget)
+{
+    void* head = 0; void* root = 0;
+    if (ItPtrPod(gui, kClkGuiSecMap + kClkMapHead, &head) == 0 || !ItPlaus(head)) return 0;
+    if (ItPtrPod(head, kClkNodeParent, &root) == 0) return 0;
+    void* st[64];
+    int sp = 0, steps = 0;
+    if (ItPlaus(root) && root != head) st[sp++] = root;
+    while (sp > 0 && ++steps <= kClkMaxNodes)
+    {
+        void* node = st[--sp];
+        void* sg = 0; void* w = 0;
+        if (ItPtrPod(node, kClkSecNodeValue, &sg) != 0 && ItPlaus(sg))
+        {
+            if (sg == widget) return 1;
+            if (ItPtrPod(sg, 0, &w) != 0 && w == widget) return 1;
+        }
+        void* l = 0; void* r = 0;
+        if (ItPtrPod(node, 0, &l) != 0 && ItPlaus(l) && l != head && sp < 64) st[sp++] = l;
+        if (ItPtrPod(node, kClkNodeRight, &r) != 0 && ItPlaus(r) && r != head && sp < 64) st[sp++] = r;
+    }
+    return 0;
+}
+/* the section of `inv` the widget named `wname` draws: its own name, or the end of the widget's (a layout prefix) - the longest */
+void* ClkSectionNamed(void* inv, const char* wname)
+{
+    int count = 0; void* arr = 0;
+    if (ItIntPod(inv, kClkInvSecCount, &count) == 0 || ItPtrPod(inv, kClkInvSecArray, &arr) == 0 || !ItPlaus(arr)) return 0;
+    if (count <= 0 || count > kClkMaxSections) return 0;
+    const size_t wl = std::strlen(wname);
+    void* best = 0;
+    size_t bestLen = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        void* sec = 0;
+        if (ItPtrPod(arr, (size_t)i * 8, &sec) == 0 || !ItPlaus(sec)) continue;
+        void* back = 0;
+        if (ItPtrPod(sec, kSecParentInv, &back) == 0 || back != inv) continue;
+        char nm[96]; nm[0] = 0;
+        if (ItStrPod((const char*)sec + kSecName, nm, (int)sizeof nm) == 0) continue;
+        const size_t nl = std::strlen(nm);
+        if (nl == 0 || nl > wl || std::strcmp(wname + (wl - nl), nm) != 0) continue;
+        if (nl > bestLen) { best = sec; bestLen = nl; }
+    }
+    return best;
+}
+/* the item whose footprint covers cell (cx, cy): 1 read (*out may be 0, an empty cell), 0 faulted */
+int ClkItemAtCell(::InventorySection* sec, int cx, int cy, void** out)
+{
+    *out = 0;
+    __try
+    {
+        const Ogre::vector< ::InventorySection::SectionItem>::type& si = sec->items;
+        const size_t n = si.size();
+        if (n > 4096) return 0;
+        for (size_t k = 0; k < n; ++k)
+        {
+            const ::InventorySection::SectionItem& s = si[k];
+            if (cx >= (int)s.x && cx < (int)s.x + (int)s.w && cy >= (int)s.y && cy < (int)s.y + (int)s.h) { *out = (void*)s.item; return 1; }
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return 0; }
+}
+}   /* anonymous namespace */
+
+int ItemLinkUnderMouse(const void* widget, const char* widgetName, int absLeft, int absTop, int width, int height,
+                       int mouseX, int mouseY, ItemLinkFacts* out)
+{
+    out->name[0] = 0; out->model[0] = 0; out->sid[0] = 0; out->type = -1; out->level = 0; out->artifact = 0;
+    if (widget == 0 || widgetName == 0 || widgetName[0] == 0 || width <= 0 || height <= 0) return kLinkNoWindow;
+    void* guis[kClkMaxGuis];
+    const int n = ClkRecordGuis(guis, kClkMaxGuis);
+    if (n < 0) return kLinkNoTable;
+    void* gui = 0;
+    for (int i = 0; i < n && gui == 0; ++i) if (ClkGuiOwnsWidget(guis[i], widget) != 0) gui = guis[i];
+    if (gui == 0) return kLinkNoWindow;
+    void* inv = 0;
+    if (ItGuiInventoryCall(gui, &inv) == 0 || !ItPlaus(inv)) return kLinkUnreadable;
+    ::InventorySection* sec = (::InventorySection*)ClkSectionNamed(inv, widgetName);
+    if (sec == 0) return kLinkNoSection;
+    int cw = 0, ch = 0;
+    if (ItIntPod(sec, kSecContentW, &cw) == 0 || ItIntPod(sec, kSecContentH, &ch) == 0 || cw <= 0 || ch <= 0 || cw > 256 || ch > 256) return kLinkUnreadable;
+    const long long dx = (long long)mouseX - absLeft, dy = (long long)mouseY - absTop;
+    if (dx < 0 || dy < 0 || dx >= width || dy >= height) return kLinkEmpty;
+    const int cx = (int)(dx * cw / width), cy = (int)(dy * ch / height);
+    void* item = 0;
+    if (ClkItemAtCell(sec, cx, cy, &item) == 0) return kLinkUnreadable;
+    if (!ItPlaus(item)) return kLinkEmpty;
+    void* gd = 0;
+    if (ItPtrPod(item, kObjData, &gd) == 0 || !ItPlaus(gd)) return kLinkUnreadable;
+    if (ItStrPod((const char*)gd + kClkGdName, out->name, (int)sizeof out->name) == 0) return kLinkUnreadable;
+    ItStrPod((const char*)gd + kClkGdSid, out->sid, (int)sizeof out->sid);
+    ItIntPod(gd, kClkGdType, &out->type);
+    void* mat = 0;
+    if (ItPtrPod(item, kItemMaterial, &mat) != 0 && ItPlaus(mat)) ItStrPod((const char*)mat + kClkGdName, out->model, (int)sizeof out->model);
+    int lv = 0;
+    if (ItLevelCall(item, &lv) != 0) out->level = lv;
+    int art = 0;
+    if (ItBytePod(item, kItemArtifact, &art) != 0) out->artifact = art;
+    return kLinkFound;
+}
+}   /* namespace coop */
+// ===================== end CHATLINK =====================
+
+// ===================== the Kenshi API (kapi.cpp) =====================
+namespace coop {
+/* ANY THREAD. The character whose inventory holds this section, and the section's name: 1 = a character's section (name copied,
+   at most kSecCap - 1 letters), 0 = anything else or unreadable. The same reads detour_secAddItem makes (+0xC8, ItOwnerOf). */
+int KapiSectionOwner(void* sec, void** character, char* name, size_t cap)
+{
+    if (character != 0) *character = 0;
+    if (name != 0 && cap > 0) name[0] = 0;
+    if (sec == 0 || !ItPlaus(sec) || name == 0 || cap < (size_t)kSecCap) return 0;
+    void* inv = 0;
+    if (ItPtrPod(sec, kSecParentInv, &inv) == 0 || inv == 0) return 0;
+    int why = kOwnUnknown;
+    void* const owner = ItOwnerOf(inv, &why);
+    if (why != kOwnChar || owner == 0) return 0;
+    if (ItStrPodWhy((const char*)sec + kSecName, name, kSecCap) != 1) return 0;
+    if (character != 0) *character = owner;
+    return 1;
+}
 }   /* namespace coop */

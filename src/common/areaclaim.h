@@ -275,7 +275,8 @@ enum OwnerSource
     kOwnerSourceNone     = 0,   /* nobody is the operator yet */
     kOwnerSourceArg      = 1,   /* --owner on the command line: the panel or the harness started this notebook FOR that player */
     kOwnerSourceFirst    = 2,   /* no --owner was ever given, so the first game to talk to this notebook after its WELCOME became the operator (W3-f; before it, the first HELLO) */
-    kOwnerSourceRestored = 3    /* owner.txt said so - which is the whole reason the file exists */
+    kOwnerSourceRestored = 3,   /* owner.txt said so - which is the whole reason the file exists */
+    kOwnerSourceSteward  = 4    /* --dedicated: the operator left and a game still in the world took the duties over (never written to owner.txt) */
 };
 
 /* W3-f (review-w3 item 2): WHEN A WORLD WITH NO OPERATOR APPOINTS ONE - at a game's first message AFTER its WELCOME,
@@ -291,6 +292,7 @@ inline const char* OwnerSourceName(int src)
     if (src == kOwnerSourceArg)      return "arg";
     if (src == kOwnerSourceFirst)    return "first";
     if (src == kOwnerSourceRestored) return "restored";
+    if (src == kOwnerSourceSteward)  return "steward";
     return "none";
 }
 

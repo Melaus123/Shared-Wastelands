@@ -1,8 +1,12 @@
 // tags.cpp - the name tags over OTHER players' characters.
 //
-// WHAT IT SAYS.  Two lines (src/common/nametag.h): the PLAYER's name as they typed it when joining (the world server's PLAYERS
-// roster, by the slot of the stand-in faction the copy stands in), and below it that player's faction name, smaller and dimmer.
-// With no roster name for that slot the faction name takes line 1 and line 2 is left out.  Both lines are coloured by how this
+// WHAT IT SAYS.  Two lines (src/common/nametag.h, src/common/tagstack.h): the PLAYER's name as they typed it when joining (the
+// world server's PLAYERS roster, by the slot of the stand-in faction the copy stands in), and below it, smaller and dimmer, the
+// CHARACTER's own name (names1: the name its owner gave it) then that player's faction name - "Rex - Tech Hunters".  With no
+// roster name for that slot that second line takes line 1 and line 2 is left out.  When several characters of one player stand
+// together on screen (their tags would overlap), only the squad leader's tag keeps line 1 and the others show line 2 alone,
+// stacked above one another so none overlaps (tagstack::Plan).  A rename of the copy (spawn.cpp NameApplyToCopy) rebuilds the
+// tags like any other caption change.  Both lines are coloured by how this
 // game's player faction and that player's faction stand - the worse of the two directions: green friendly, yellow neutral,
 // red hostile.  A player who shares this game's player's faction (a team on the world server's table, team.cpp) is team
 // blue instead, and line 2 of every player in a team names the team - its founder's faction name (decisions 478 / 479).
@@ -53,6 +57,8 @@
 #include "addresses.h"
 #include "../common/nametag.h"   // the two lines and the colour - pure, swept by the offline suite
 #include "../common/teameffect.h"   // TagColourClass - team blue or the standing's colour (T-546 step 4)
+#include "../common/tagstack.h"     // line 2 with the character's own name; one player's tags standing together
+#include "handoff.h"        // ReadSquadOf - is the copy its squad's formal leader (the head of a group of tags)
 
 #include "coop_log.h"
 #include "game/Character.h"
@@ -71,6 +77,7 @@
 #include <sstream>
 #include <locale>
 #include <cstring>
+#include <vector>
 
 namespace coop {
 
@@ -116,7 +123,7 @@ enum Hide { kShown = 0, kHideOff, kHideUi, kHideBlocked, kHideNotPeer, kHideOffs
 struct Label
 {
     MyGUI::TextBox* w;      // line 1: the player's name
-    MyGUI::TextBox* w2;     // line 2: the player's faction name (hidden when the line is empty)
+    MyGUI::TextBox* w2;     // line 2: the character's name and the player's faction name (hidden when the line is empty)
     MyGUI::TextBox* e[nametag::kOutlineCopies];    // line 1's outline: black copies of line 1, drawn behind it
     MyGUI::TextBox* e2[nametag::kOutlineCopies];   // line 2's outline
     std::string widgetName, widgetName2;
@@ -128,6 +135,8 @@ struct Label
     int level;         // nametag::Level the colour shows; kUnknown before the first build
     int teammate;      // 1 = the colour is team blue (that player shares this player's team), whatever `level` reads
     int createFails;   // createWidgetT refusals for this label; it stops asking after kCreateTries
+    int slot;          // the owner's slot (StandInSlotOf) at the last build; -1 unknown - groups tags of one player
+    int vis1, vis2;    // line 1 / line 2 shown right now (with their outlines)
 };
 
 std::map<unsigned int, Label> g_labels;   // MAIN THREAD ONLY - the registry; the per-frame loop walks this and nothing else
@@ -151,6 +160,9 @@ long long g_created = 0, g_destroyed = 0, g_hiddenOffscreen = 0, g_hiddenRange =
 long long g_byRoster = 0, g_byFaction = 0, g_recolours = 0, g_changesLogged = 0;   // builds that named the player from the roster / fell back to the faction name; colour changes
 long long g_levelBuilds[3] = { 0, 0, 0 };                                            // builds by colour: friendly, neutral, hostile
 long long g_teamBuilds = 0, g_teamLineBuilds = 0;                                    // builds in team blue; builds whose line 2 named a team
+long long g_charNamed = 0, g_charUnnamed = 0;   // builds whose line 2 carried the character's own name / could not read it
+long long g_stackFrames = 0, g_stackTucked = 0; // frames with one player's tags standing together; tags shown without line 1 (transitions)
+int g_stackGroups = 0, g_stackLifted = 0;       // this frame: groups of two or more; tags moved up
 int g_visibleNow = 0;
 
 std::string N(long long v) { std::ostringstream s; s.imbue(std::locale::classic()); s << v; return s.str(); }
@@ -304,6 +316,14 @@ void ShowLine(MyGUI::TextBox* w, MyGUI::TextBox* const* e, bool show)
     if (w != 0) w->setVisible(show);
 }
 
+/* The two lines of a label shown or hidden, each touched only when it changes. */
+void ShowParts(Label& L, bool one, bool two)
+{
+    const int o = one ? 1 : 0, t = two ? 1 : 0;
+    if (L.vis1 != o) { ShowLine(L.w, L.e, one); L.vis1 = o; }
+    if (L.vis2 != t) { ShowLine(L.w2, L.e2, two); L.vis2 = t; }
+}
+
 /* A line at (x, y) and each outline copy at its 1 px offset from it. */
 void PlaceLine(MyGUI::TextBox* w, MyGUI::TextBox* const* e, int x, int y)
 {
@@ -340,8 +360,7 @@ void SetHidden(Label& L, int why)
     case kHideWithdrawn: ++g_hiddenWithdrawn; break;
     default: break;
     }
-    ShowLine(L.w, L.e, false);
-    ShowLine(L.w2, L.e2, false);
+    ShowParts(L, false, false);
 }
 
 ::Faction* TagFactionPod(::Character* c)   /* stand1: the copy's own faction, fault-guarded */
@@ -378,7 +397,10 @@ void BuildCaption(unsigned int uid, ::Character* c, Label& L, ::Faction* mine, b
     std::string facLine; bool mate = false;
     TeamTagFor(slot, fac, &facLine, &mate);   /* a player in a team: the team's name; a teammate: team blue */
     const int teammate = swteam::TagColourClass(mate) == swteam::kTagTeam ? 1 : 0;
-    const nametag::Caption cap = nametag::CaptionFor(named == 1 ? player : std::string(), facLine);
+    std::string who;   /* the character's own name: names1 sets the owner's name on the copy */
+    if (NameOf(c, &who) && !nametag::Trimmed(who).empty()) ++g_charNamed; else { who.clear(); ++g_charUnnamed; }
+    const nametag::Caption cap = tagstack::CaptionFor(named == 1 ? player : std::string(), who, facLine);
+    L.slot = slot;
     int reads = 0;
     const int level = RelationsTagLevel(mine, f, &reads);
     /* the refresh counts as done only when the colour came from a real read; otherwise the next frame tries again */
@@ -415,8 +437,7 @@ void BuildCaption(unsigned int uid, ::Character* c, Label& L, ::Faction* mine, b
         if (L.w2 != 0)
         {
             SetLine(L.w2, L.e2, L.caption2, &L.tw2, &L.th2);
-            if (L.caption2.empty()) ShowLine(L.w2, L.e2, false);
-            else if (L.hide == kShown) ShowLine(L.w2, L.e2, true);
+            if (L.caption2.empty()) ShowParts(L, L.vis1 != 0, false);   /* a shown line 2 comes back at the next placement */
         }
         ++g_captionSets;
     }
@@ -488,6 +509,7 @@ bool CreateWidget(unsigned int uid, ::Character* c, Label& L, MineOnce& mine)
     L.w = t; L.w2 = t2;
     L.caption.clear(); L.caption2.clear(); L.level = nametag::kUnknown; L.teammate = 0;
     L.tw = L.th = L.tw2 = L.th2 = 0;
+    L.vis1 = L.vis2 = 0;
     ++g_created;
     BuildCaption(uid, c, L, mine.Get(), g_created <= kLogCreations);
     return true;
@@ -515,6 +537,58 @@ void PollKey()
     TagsSetOn(!g_on);
 }
 
+/* A label that passed every hide test this frame, waiting for the group layout (tagstack::Plan) before it is placed. */
+struct Pending { Label* L; ::Character* c; unsigned int uid; int sx, sy; };
+
+/* Is the copy its own squad's formal leader (ActivePlatoon +0xA0) - the plain-read squad reader, never getSquadLeader. */
+bool IsSquadLeader(::Character* c)
+{
+    SquadView sv;
+    return ReadSquadOf(c, &sv) == 1 && sv.leader == c;
+}
+
+/* Every pending label placed: alone where its character is; one player's tags standing together laid out as one group. */
+void PlaceAll(std::vector<Pending>& pend)
+{
+    std::vector<tagstack::Tag> tags(pend.size());
+    for (size_t i = 0; i < pend.size(); ++i)
+    {
+        const Label& L = *pend[i].L;
+        tagstack::Tag& t = tags[i];
+        t.uid = pend[i].uid; t.owner = L.slot; t.leader = false;
+        t.cx = pend[i].sx; t.bottom = pend[i].sy;
+        t.w1 = L.tw; t.h1 = L.th; t.w2 = L.caption2.empty() ? 0 : L.tw2; t.h2 = L.caption2.empty() ? 0 : L.th2;
+    }
+    /* the leader read only for a tag that has another of the same player on screen */
+    for (size_t i = 0; i < tags.size(); ++i)
+        for (size_t j = 0; j < tags.size(); ++j)
+            if (i != j && tags[i].owner >= 0 && tags[i].owner == tags[j].owner) { tags[i].leader = IsSquadLeader(pend[i].c); break; }
+    std::vector<tagstack::Place> plan;
+    tagstack::Plan(tags, &plan);
+    g_stackGroups = 0; g_stackLifted = 0;
+    for (size_t i = 0; i < pend.size(); ++i)
+    {
+        Label& L = *pend[i].L;
+        const tagstack::Place& pl = plan[i];
+        if (pl.group == (int)i) ++g_stackGroups;
+        if (pl.dy != 0) ++g_stackLifted;
+        const bool two = !L.caption2.empty();
+        const bool one = pl.line1 || !two;
+        const int bottom = pend[i].sy + pl.dy;
+        const int top2 = bottom - (two ? L.th2 : 0);
+        if (one) PlaceLine(L.w, L.e, pend[i].sx - L.tw / 2, top2 - L.th);
+        if (two) PlaceLine(L.w2, L.e2, pend[i].sx - L.tw2 / 2, top2);
+        if (!one && L.vis1 != 0) ++g_stackTucked;
+        if (L.hide != kShown)
+        {
+            L.hide = kShown;
+            ++g_visibleNow;
+        }
+        ShowParts(L, one, two);
+    }
+    if (g_stackGroups > 0) ++g_stackFrames;
+}
+
 void TickBody()
 {
     ProcessDropAll();
@@ -538,6 +612,7 @@ void TickBody()
     float ox = 0, oy = 0, oz = 0;
     const bool originOk = (global == kShown) && RelativeOriginPod(RelativeOriginFn(), &ox, &oy, &oz);
     MineOnce mine;
+    std::vector<Pending> pend;
 
     for (std::map<unsigned int, Label>::iterator it = g_labels.begin(); it != g_labels.end(); )
     {
@@ -584,21 +659,16 @@ void TickBody()
         const int pr = ProjectPod(hx, hy, hz, &sx, &sy);
         if (pr < 0) { ++g_projectFail; SetHidden(L, kHideProject); continue; }
         if (pr == 0) { SetHidden(L, kHideOffscreen); continue; }
-        /* The two lines stand as one block whose bottom is at the projected point: the name on top, the faction under it,
-           each centred on the character. */
+        /* The two lines stand as one block whose bottom is at the projected point: the name on top, the character and
+           faction under it, each centred on the character (PlaceAll; a group of one player's tags may lift it). */
         const int bw = L.tw > L.tw2 ? L.tw : L.tw2, bh = L.th + L.th2;
         const int left = (int)sx - bw / 2, top = (int)sy - bh;
         if (viewW > 0 && (left + bw < 0 || top + bh < 0 || left > viewW || top > viewH)) { SetHidden(L, kHideOffscreen); continue; }
-        PlaceLine(L.w, L.e, (int)sx - L.tw / 2, top);
-        PlaceLine(L.w2, L.e2, (int)sx - L.tw2 / 2, top + L.th);
-        if (L.hide != kShown)
-        {
-            L.hide = kShown;
-            ++g_visibleNow;
-            ShowLine(L.w, L.e, true);
-            ShowLine(L.w2, L.e2, !L.caption2.empty());
-        }
+        Pending pd; pd.L = &L; pd.c = c; pd.uid = uid; pd.sx = (int)sx; pd.sy = (int)sy;
+        pend.push_back(pd);
     }
+    if (!pend.empty()) PlaceAll(pend);
+    else { g_stackGroups = 0; g_stackLifted = 0; }
 }
 
 /* review-tags1 3: a fault switches the labels off for the process - and then ONE guarded pass hides every widget still
@@ -609,6 +679,7 @@ void HideAllBody()
     {
         ShowLine(it->second.w, it->second.e, false);
         ShowLine(it->second.w2, it->second.e2, false);
+        it->second.vis1 = it->second.vis2 = 0;
         it->second.hide = kHideOff;
     }
     g_visibleNow = 0;
@@ -676,6 +747,7 @@ void TagsNoteCopy(unsigned int uid)
     L.w = 0; L.w2 = 0;
     for (int k = 0; k < nametag::kOutlineCopies; ++k) { L.e[k] = 0; L.e2[k] = 0; }
     L.gen = 0; L.hide = kHideNew; L.tw = 8; L.th = 8; L.tw2 = 0; L.th2 = 0; L.level = nametag::kUnknown; L.teammate = 0; L.createFails = 0;
+    L.slot = -1; L.vis1 = L.vis2 = 0;
     g_labels[uid] = L;   // the widgets are made on the first tick that would show them
 }
 
@@ -743,6 +815,8 @@ std::string TagsReportLine()
          + " colourBuilds[friendly,neutral,hostile]=" + N(g_levelBuilds[0]) + "," + N(g_levelBuilds[1]) + "," + N(g_levelBuilds[2])
          + " teamBuilds[blue,teamLine]=" + N(g_teamBuilds) + "," + N(g_teamLineBuilds)
          + " recolours=" + N(g_recolours)
+         + " charName[named,unnamed]=" + N(g_charNamed) + "," + N(g_charUnnamed)
+         + " stack[frames,tucked,groupsNow,liftedNow]=" + N(g_stackFrames) + "," + N(g_stackTucked) + "," + N((long long)g_stackGroups) + "," + N((long long)g_stackLifted)
          + " faults=" + N(g_faults) + " uiShown=" + N(ReadUiShownPod())
          + " lift=" + Fl(g_liftSet > 0.0f ? g_liftSet : (g_liftAuto > 0.0f ? g_liftAuto : kLiftFallback))
          + (g_liftSet > 0.0f ? "(set)" : (g_liftAuto > 0.0f ? "(own-tag)" : "(fallback)"));

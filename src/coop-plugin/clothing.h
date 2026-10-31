@@ -117,6 +117,12 @@ void ApplyOwnerLimbs(unsigned int uid, int has, const cooplimb::LimbsWire& w, un
 // paused): each recorded block onto its copy through the engine's own calls, a limb at a time and only where they differ;
 // then the limbtest lever's one armed request.
 void LimbSafePointDrain();
+// THE ADMIN'S TOYCHEST /restore. MAIN THREAD. Ask for this game's own character's stump / crushed limbs to be grown back at the next
+// K2 safe point (clothing.cpp says how; a fitted robotic limb is left alone); then the result: -1 not done yet, 1 every limb that
+// needed it regrown (*regrown, *robotKept), 0 not (*why). A result is read once. Forget drops a request (the job gave up).
+void LimbRegrowRequest(unsigned int uid);
+int LimbRegrowResult(unsigned int uid, int* regrown, int* robotKept, std::string* why);
+void LimbRegrowForget(unsigned int uid);
 
 // LIMBS. MAIN THREAD. The copy `uid` is gone (removed, despawned, retired): its recorded block and per-limb marks go too.
 void LimbsForgetUid(unsigned int uid);

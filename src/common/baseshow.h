@@ -18,6 +18,8 @@
    one), u32 count 0..kMaxShowRows, count x ROW
      ROW  i32 owner slot, f32 x, f32 y (height), f32 z, str outpost name (0..128 bytes, no control characters),
           str owner's player name (0..128 bytes, no control characters; empty = not known), u32 size level 0..townkeep::kLevelMax,
+          (with townkeep::kLevelPublic set, protocol 109 of the dedicated fork: the outpost is open to the public on its owner's game -
+          the base shown for it here takes that setting, Town+0x380),
           T-1047 step 5 (protocol 116): u32 outpost id 0..townkeep::kOutpostIdMax (0 = none yet), u32 kind (kShowOther 0 / kShowMate 1 /
           kShowOwn 2), 5 x i32 the handle words the owner's game said for the outpost (0 = none said),
           T-940 (protocol 119): f32 anchor x, f32 anchor z - the outpost's fixed anchor (townkeep.h THE FIXED ANCHOR), the centre of
@@ -55,7 +57,9 @@
 #include <set>
 #include <map>
 #include <cstring>
+#include <cmath>
 #include <cstdio>
+#include "buildnear.h"   /* DUPLICATE OUTPOSTS: the near-town test (InsideFirst, ScaleForKind) */
 #include "townkeep.h"   /* the said outposts (TownRow), keptwire's PutU32 / PutStr / TextOk / FloatOk / NearXZ */
 
 namespace baseshow {
@@ -76,16 +80,17 @@ struct ShowRow
     std::string name;     /* the outpost's name as its owner's game reads it */
     std::string ownerName;   /* the owner's player name ("" = not known) */
     int level;            /* the outpost's size level 0..townkeep::kLevelMax */
+    int pub;              /* protocol 109: the outpost is open to the public on its owner's game (0 or 1) */
     unsigned id;          /* T-1047 step 5: the world server's outpost id (townkeep.h; 0 = none yet) */
     int kind;             /* T-1047 step 5: kShowOther, kShowMate or kShowOwn */
     int hand[5];          /* T-1047 step 5: the handle words the owner's game said for the outpost (a town on THAT game only) */
     float anchor[2];      /* T-940: the outpost's fixed anchor x, z (its zone's centre; never moved by the centre's drift) */
-    ShowRow() : owner(-1), level(0), id(0), kind(kShowMate) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) hand[i] = 0; anchor[0] = anchor[1] = 0.0f; }
+    ShowRow() : owner(-1), level(0), pub(0), id(0), kind(kShowMate) { pos[0] = pos[1] = pos[2] = 0.0f; for (int i = 0; i < 5; ++i) hand[i] = 0; anchor[0] = anchor[1] = 0.0f; }
 };
 
 inline bool RowOk(const ShowRow& r)
 {
-    if (r.owner < 0 || r.owner > townkeep::kOwnerMax || r.level < 0 || r.level > townkeep::kLevelMax) return false;
+    if (r.owner < 0 || r.owner > townkeep::kOwnerMax || r.level < 0 || r.level > townkeep::kLevelMax || (r.pub != 0 && r.pub != 1)) return false;
     if (r.id > townkeep::kOutpostIdMax || r.kind < kShowOther || r.kind > kShowOwn) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(r.pos[j])) return false;
     if (!keptwire::FloatOk(r.anchor[0]) || !keptwire::FloatOk(r.anchor[1])) return false;   /* T-940 */
@@ -118,6 +123,7 @@ inline std::vector<ShowRow> RowsOfKinds(const std::vector<townkeep::TownRow>& sa
             for (int j = 0; j < 3; ++j) r.pos[j] = t.pos[j];
             r.name = townkeep::NameFit(t.name);
             r.level = t.level;
+            r.pub = t.pub != 0 ? 1 : 0;   /* the dedicated fork: open to the public */
             r.id = t.id;
             r.kind = kind;
             for (int j = 0; j < 5; ++j) r.hand[j] = t.hand[j];
@@ -186,7 +192,7 @@ inline bool Encode(std::vector<char>* out, unsigned flags, const std::vector<Sho
         for (int j = 0; j < 3; ++j) { std::memcpy(&u, &r.pos[j], 4); keptwire::PutU32(&b, u); }
         keptwire::PutStr(&b, r.name);
         keptwire::PutStr(&b, r.ownerName);
-        keptwire::PutU32(&b, (unsigned)r.level);
+        keptwire::PutU32(&b, (unsigned)r.level | (r.pub != 0 ? townkeep::kLevelPublic : 0u));
         keptwire::PutU32(&b, r.id);                   /* T-1047 step 5 */
         keptwire::PutU32(&b, (unsigned)r.kind);
         for (int j = 0; j < 5; ++j) { std::memcpy(&u, &r.hand[j], 4); keptwire::PutU32(&b, u); }
@@ -215,8 +221,9 @@ inline int Decode(const char* p, size_t n, unsigned* flags, std::vector<ShowRow>
         const unsigned lo = rd.U32();
         if (rd.bad || lo > keptwire::kStrMax || n - rd.at < lo) return 0;
         r.ownerName.assign(p + rd.at, lo); rd.at += lo;
-        const unsigned lv = rd.U32();
+        const unsigned lvw = rd.U32(), lv = lvw & ~townkeep::kLevelPublic;
         r.level = lv > (unsigned)townkeep::kLevelMax ? -1 : (int)lv;   /* -1: refused by RowOk */
+        r.pub = (lvw & townkeep::kLevelPublic) != 0 ? 1 : 0;
         r.id = rd.U32();                               /* T-1047 step 5: past kOutpostIdMax refused by RowOk */
         const unsigned kd = rd.U32();
         r.kind = kd > (unsigned)kShowOwn ? -1 : (int)kd;   /* -1: refused by RowOk */
@@ -891,6 +898,89 @@ inline size_t DecodeCopyList(const std::string& text, std::vector<CopyRow>* out,
     }
     out->swap(rows);
     return bad;
+}
+/* ---- DUPLICATE OUTPOSTS (a teammate builds at the founder's fresh outpost before it is shown on his game) ----
+   A new outpost reaches a teammate's game only after its owner's next look (5 s), the world server and his next drain. A building he
+   places there before that founds his OWN outpost on top of it (the placement 0x4DB180 finds no town of his faction within 16000 and
+   calls TownFoundPlayer). Said to the world server, that outpost is shown on the founder's game as a second base at the same spot; the
+   engine's placement check takes the nearest town of any faction and refuses "too close to another town" for a faction with no
+   PlayerInterface - a stand-in - so each player was refused building at the place (before T-923). Two rules here:
+   - FoundInMateClaim: the engine's own founding at a spot a teammate's outpost (held SHOW row) claims marks the new town as founded
+     inside a teammate's claim (DupeMark, by its handle words, for this world): it is never said (SayUnlessDupe), so it never becomes an
+     outpost of this player on any other game - the earlier, the founder's, outpost wins. (The founding itself goes ahead: the engine's
+     placement needs a town back. Once the teammate's base STANDS here, T-923's town pick joins the piece to it instead and no
+     outpost is founded; this rule covers the seconds before it stands, while its row is held.)
+   - HiddenOverOwn: a teammate's row whose centre lies in the claim of one of this player's own outposts (one not marked above) is not
+     shown here - no base is founded or taken for it, one already shown is taken out as a row that went. Each player's own outpost wins on
+     his own game, so neither is refused at his own outpost, also when both games said their outposts before seeing the other's (a race)
+     and in a save where both bases already stand.
+   THE CLAIM is the engine's own near-town test (buildnear.h, T-923: InsideFirst at ScaleForKind, or the centre within kCentreRange).
+   SINCE 0.3.4 (T-923) a teammate's base that STANDS here is never refused as "too close" and a piece placed in it joins it, so these
+   two rules are needed only for the window before it stands (its row held, its base not founded yet - FoundWait can hold it up to
+   kShowKeysWaitMs) and for two outposts said at one place before either game saw the other's. The PR's third rule (a shown base's
+   stand-in faction put back) went: T-924's copy list gives a copy its stand-in faction back (TakeUpSlot and the copy reclaim). */
+/* inside a town's claim: the engine's contains answer at ScaleForKind, or the centre near (dx, dz: spot - centre) */
+inline bool InClaimZone(int contains, float dx, float dz) { return buildnear::InsideFirst(contains, std::sqrt(dx * dx + dz * dz)) != 0; }
+/* one town (or held row) a spot is tested against: skip = not counted (not a teammate's, or this player's marked duplicate) */
+struct ClaimTown { int skip; int contains; float dx, dz; };
+/* of the towns not skipped whose claim holds the spot, the one with the nearest centre (the first on a tie); -1 = none */
+inline int ClaimPick(const ClaimTown* t, int n)
+{
+    int best = -1; float bd = 0.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        if (t[i].skip != 0 || !InClaimZone(t[i].contains, t[i].dx, t[i].dz)) continue;
+        const float d = t[i].dx * t[i].dx + t[i].dz * t[i].dz;
+        if (best < 0 || d < bd) { best = i; bd = d; }
+    }
+    return best;
+}
+/* 1 = the engine's own founding (not the mod's, modFounding 0) lands in a teammate's claim: rows = the held SHOW rows as tested at the
+   spot (skip = this player's own row or not a teammate) */
+inline int FoundInMateClaim(int modFounding, const ClaimTown* rows, int n) { return (modFounding == 0 && ClaimPick(rows, n) >= 0) ? 1 : 0; }
+/* 1 = a teammate's row is not shown here: own = this player's outposts as tested at the row's centre (skip = a marked duplicate) */
+inline int HiddenOverOwn(const ClaimTown* own, int n) { return ClaimPick(own, n) >= 0 ? 1 : 0; }
+/* 1 = this player's own outpost is said to the world server (0: it was founded inside a teammate's claim); asked after SayOwnTown */
+inline int SayUnlessDupe(int dupeMarked) { return dupeMarked == 0 ? 1 : 0; }
+/* the duplicates this game marked in this world: by the town's handle words, else (words not read at the founding) by the address the
+   founding returned - only ever COMPARED with the player-town list's addresses, and replaced by the words at the first match
+   (townwake.h's rule). At most cap: a full list notes no more (that town is then said as before this rule). */
+struct DupeMark { int h[5]; unsigned long long ptr; };
+/* the mark of a town (its words h, its address ptr), -1 = none: by the words when both are known, else by the address */
+inline int DupeMarkOf(const std::vector<DupeMark>& marks, const int* h, unsigned long long ptr)
+{
+    for (size_t i = 0; i < marks.size(); ++i)
+    {
+        const DupeMark& m = marks[i];
+        if (townkeep::HandKnown(m.h) && townkeep::HandKnown(h)) { if (townkeep::HandSame(m.h, h)) return (int)i; }
+        else if (m.ptr != 0 && m.ptr == ptr) return (int)i;
+    }
+    return -1;
+}
+/* 1 = noted; 0 = known already, nothing to know it by, or the list is full */
+inline int DupeMarkAdd(std::vector<DupeMark>* marks, const int* h, unsigned long long ptr, size_t cap)
+{
+    if ((!townkeep::HandKnown(h) && ptr == 0) || DupeMarkOf(*marks, h, ptr) >= 0 || marks->size() >= cap) return 0;
+    DupeMark m;
+    for (int i = 0; i < 5; ++i) m.h[i] = h[i];
+    m.ptr = ptr;
+    marks->push_back(m);
+    return 1;
+}
+/* a marked town seen with its words: 1 = the mark is a town marked by its address alone and now carries its words */
+inline int DupeMarkLearn(std::vector<DupeMark>* marks, int at, const int* h)
+{
+    if (at < 0 || (size_t)at >= marks->size() || townkeep::HandKnown((*marks)[(size_t)at].h) || !townkeep::HandKnown(h)) return 0;
+    for (int i = 0; i < 5; ++i) (*marks)[(size_t)at].h[i] = h[i];
+    return 1;
+}
+const size_t kDupeMarkCap = 64;   /* duplicates marked in one world */
+/* the rows BdShowApply works from: the held rows less the hidden ones (hidden[r] != 0), in order */
+inline std::vector<ShowRow> RowsShown(const std::vector<ShowRow>& rows, const std::vector<int>& hidden)
+{
+    std::vector<ShowRow> out;
+    for (size_t r = 0; r < rows.size(); ++r) if (r >= hidden.size() || hidden[r] == 0) out.push_back(rows[r]);
+    return out;
 }
 
 /* ---- T-1047 step 5 fold 2 ----

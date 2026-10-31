@@ -34,6 +34,8 @@
 #include "game/Faction.h"
 #include "game/FactionRelations.h"
 #include "hooks.h"   /* mig1: coop::AddHook (own MinHook) */
+#include "admin.h"   /* the Admin's Toychest god mode: AdminGodAnyThread / AdminGodCountAnyThread */
+#include "medical.h"   /* GodMedicalTokens: the god hit / knockout gates' counters on the report line */
 #include <Windows.h>
 #include <intrin.h>   /* _ReturnAddress: WHICH caller is asking the ally question (F619, the kClickRets pattern) */
 #include <cstring>
@@ -163,6 +165,13 @@ int PeaceHooksBypassedHere()
 
 /* 1 = this return address is one of the two fight-picking call sites. A return address below the module base
    or an uninstalled base answers 0 - the engine's own answer stands, which is the safe direction. */
+int PeaceAllyRetIndex(const void* ret)
+{
+    if (g_moduleBase == 0 || (uintptr_t)ret <= g_moduleBase) return -1;
+    const uintptr_t rva = (uintptr_t)ret - g_moduleBase;
+    for (unsigned int i = 0; i < kAllyRetCount; ++i) if (kAllyRets[i] != 0 && rva == (uintptr_t)kAllyRets[i]) return (int)i;
+    return -1;
+}
 int PeaceAllyRetAnswered(const void* ret)
 {
     if (g_moduleBase == 0 || (uintptr_t)ret <= g_moduleBase) return 0;
@@ -173,6 +182,18 @@ int PeaceAllyRetAnswered(const void* ret)
     }
     return 0;
 }
+
+/* THE ADMIN'S TOYCHEST GOD MODE - UNTARGETABLE, THROUGH THE ENGINE'S OWN TWO QUESTIONS. A god character (admin.cpp's table, the
+   world server's GOD_TABLE: the same on every game) is answered NOT AN ENEMY by isEnemyOf for every caller, whichever side it is
+   on - so no target picker that asks the hostility question (the AI's enemy scans, aggro, the bounty and race-hate roads that all
+   enter through isEnemyOf) takes it, and it takes nobody of its own accord either - and AN ALLY at the two fight-picking call sites,
+   but only when it is the CANDIDATE there: getNearestEnemyInAttackZone asks candidate->isAllyOf(me) (Steam 1.0.68 0x60995A: rcx =
+   the candidate, rdx = [rsi+0x188] the asking combat's character), findMeleeOpponent asks me->isAllyOf(candidate) (0x59FB99: rcx =
+   [r15+0x2F8] the AI's character, rdx = the candidate). So the index of the allowlisted site says which argument is the candidate.
+   Every other isAllyOf caller (medics, carrying, squads) keeps the engine's answer. Pointer compares only - AI-thread safe. */
+volatile LONG64 g_godNotEnemy = 0, g_godAllyForced = 0;
+/* -1 = not a fight-picking site; else its index in kAllyRets (0 = getNearestEnemyInAttackZone, 1 = findMeleeOpponent) */
+int PeaceAllyRetIndex(const void* ret);
 
 /* T-546 (owner 512): THE TEAM SET - this game's player faction and its teammates' factions (swteamally::CellsWrite), written by
    the main thread at every write of the team cells (policy.cpp PolicyTeammateFactions, from team.cpp), read by any thread as
@@ -286,6 +307,8 @@ char detour_isEnemy(void* self, void* who, char disguises)
        and while the bypass is up this detour is a pass-through as well - otherwise the probe would measure an
        engine we are still modifying, which is the very thing it exists to escape. */
     if (PeaceHooksBypassedHere() != 0) return orig_isEnemy(self, who, disguises);
+    if (coop::AdminGodCountAnyThread() != 0 && (coop::AdminGodAnyThread(self) || coop::AdminGodAnyThread(who)))
+    { ::InterlockedIncrement64(&g_godNotEnemy); return 0; }   /* god mode: nobody's enemy, and nobody is its */
     if (g_teamHeld != 0)
     {
         /* T-546 (owner 512): a team pair is answered as the engine answers one faction - not an enemy, before anything else */
@@ -337,6 +360,11 @@ char detour_isAlly(void* self, void* who, char disguises)
     /* THE RETURN ADDRESS IS TAKEN FIRST, before anything else can disturb the frame. */
     const void* const ret = _ReturnAddress();
     if (PeaceHooksBypassedHere() != 0) return orig_isAlly(self, who, disguises);
+    if (coop::AdminGodCountAnyThread() != 0)
+    {
+        const int site = PeaceAllyRetIndex(ret);   /* god mode: at a fight picker, a god CANDIDATE is an ally - never picked */
+        if ((site == 0 && coop::AdminGodAnyThread(self)) || (site == 1 && coop::AdminGodAnyThread(who))) { ::InterlockedIncrement64(&g_godAllyForced); return 1; }
+    }
     if (g_teamHeld != 0)
     {
         /* T-546 (owner 512): a team pair is answered as the engine answers one faction - an ally, before anything else, for
@@ -569,6 +597,11 @@ int PeaceTeamPairOfCharacters(void* a, void* b)
     return TeamPairPod(a, b);
 }
 
+std::string PeaceGodTokens()
+{
+    return " god[notEnemy,allyForced]=" + S((long long)g_godNotEnemy) + "," + S((long long)g_godAllyForced);
+}
+
 std::string PeaceTeamTokens()
 {
     return " team[held,ally,notEnemy,doubt,writes]=" + S((long long)g_teamHeld) + "," + S((long long)g_teamAlly) + "," + S((long long)g_teamNotEnemy)
@@ -691,9 +724,11 @@ void ReportPeace()
              + " walksWithNoWorld=" + S(g_walkNoWorld)
              + " fight[on,exempt,players,exemptPairs,edges]=" + S((long long)(g_peaceFight != 0 ? 1 : 0)) + "," + S((long long)g_peaceExemptHeld)
              + "," + S((long long)g_fightPlayers) + "," + S((long long)g_fightExempt) + "," + S(g_fightEdges)
-             + PeaceTeamTokens()
+             + PeaceTeamTokens() + PeaceGodTokens() + AdminGodTokens() + GodMedicalTokens()
              + "  |  fight[...]: the TEST-ONLY fight form (owner 1205 a); players and exemptPairs are gate answers 'not covered' for two"
                " player-side characters and for a pair whose non-player side is exempt - both are inside neitherSidePlayer."
+             + "  |  god[...]: the Admin's Toychest god characters answered not-enemy (isEnemyOf, either side) and ally where they are a"
+               " fight picker's candidate."
              + "  |  team[...]: this game's player faction and its teammates' factions are answered ally / not-enemy for each other"
                " before the engine is asked, as it answers one faction (T-546, owner 512); held = factions in the team set (0 = no team)."
              + "  |  peace[on,queriesAnswered,hostileSuppressed,allyForced,fallthrough]."

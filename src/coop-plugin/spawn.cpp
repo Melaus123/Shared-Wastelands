@@ -11730,6 +11730,7 @@ bool NameApplyToCopy(unsigned int uid, ::Character* c, const std::string& name, 
     ::InterlockedExchange(&g_nameApplyTid, 0);
     if (!ok) { ++g_nameApplyFailed; ErrorLog("[NAME] setName FAULTED on the copy of uid " + S((long long)uid)); return false; }
     ++g_nameApplied;
+    if (name != old) TagsCaptionsDirty();   // the name tag's line 2 names the character: rebuilt next frame (tags.cpp)
     if (g_nameLogged < 20)
     {
         ++g_nameLogged;

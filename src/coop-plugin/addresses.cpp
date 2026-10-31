@@ -49,7 +49,7 @@ namespace {
 const int kMaxRegs = kAddrMaxRegs;
 typedef AddrSlot RegSlot;   /* gog1 fold 2: addrtable.h's POD, so AddrSettleSlots binds and clears these very slots */
 RegSlot g_regs[kMaxRegs];
-unsigned char g_regUse[kMaxRegs];   /* rk1: beside g_regs[i] - 1 = kAddrUseCallOnly, 0 = strict (zero-initialised: strict) */
+unsigned char g_regUse[kMaxRegs];   /* rk1: beside g_regs[i] - 1 = kAddrUseCallOnly, 2 = kAddrUseOptional, 0 = strict (zero-initialised: strict) */
 int     g_regCount = 0;
 int     g_regOverflow = 0;
 
@@ -68,6 +68,7 @@ long long g_hookedFirst = 0;      /* addrLooksHooked    - a mismatch whose first
 long long g_hookedAccepted = 0;   /* addrHookedAccepted - rk1: a call-only row hooked by another mod, the rest matching:
                                      accepted, NOT in addrMismatch nor addrLooksHooked (src/common/addrhooked.h) */
 long long g_bindMissing = 0;      /* addrBindMissing    - a registered name the table does not carry */
+long long g_optionalOff = 0;      /* addrOptionalOff    - optional rows that mismatched or are missing - their feature is off */
 long long g_badLines    = 0;
 std::string g_firstMismatch;      /* the FIRST mismatching entry, named - a refusal that names nothing is not a measurement */
 std::string g_fingerprint;
@@ -164,6 +165,19 @@ int RowCallOnly(const char* name)
         uses[n++] = g_regUse[i];
     }
     return AddrUsesAllCallOnly(uses, n);   /* review S2: the rule itself, offline-tested (src/common/addrhooked.h) */
+}
+/* 1 when EVERY registration of `name` is kAddrUseOptional (and there is one, and no registry overflow). */
+int RowOptional(const char* name)
+{
+    unsigned char uses[kMaxRegs];
+    int i, n = 0;
+    if (name == 0 || g_regOverflow != 0) return 0;
+    for (i = 0; i < g_regCount; ++i)
+    {
+        if (g_regs[i].name == 0 || std::strcmp(g_regs[i].name, name) != 0) continue;
+        uses[n++] = g_regUse[i];
+    }
+    return AddrUsesAllOptional(uses, n);
 }
 
 /* ---- one entry, verified -------------------------------------------------------------------------------- */
@@ -313,7 +327,7 @@ AddrReg::AddrReg(const char* name, unsigned long long* slot, int use)
     if (g_regCount >= kMaxRegs) { ++g_regOverflow; return; }
     g_regs[g_regCount].name = name;
     g_regs[g_regCount].slot = slot;
-    g_regUse[g_regCount] = (unsigned char)(use == kAddrUseCallOnly ? 1 : 0);   /* rk1: anything else is strict */
+    g_regUse[g_regCount] = (unsigned char)(use == kAddrUseCallOnly ? 1 : use == kAddrUseOptional ? 2 : 0);   /* rk1: anything else is strict */
     ++g_regCount;
 }
 
@@ -411,8 +425,18 @@ static int PatternResolve(const std::string& exe, std::string* why)
         *why = "the executable file has no readable .text section for the signature search";
         return 0;
     }
+    /* the rows every registration of which is kAddrUseOptional: on this road too, one that is not found (or fails its own check or a
+       cross-check) is dropped and only its feature is off - the same rule as a table row that does not match (RowOptional) */
+    std::vector<std::string> optionalNames;
+    for (int r = 0; r < g_regCount; ++r)
+    {
+        if (g_regs[r].name == 0 || !RowOptional(g_regs[r].name)) continue;
+        bool have = false;
+        for (size_t k = 0; k < optionalNames.size(); ++k) if (optionalNames[k] == g_regs[r].name) { have = true; break; }
+        if (!have) optionalNames.push_back(g_regs[r].name);
+    }
     coopsigtab::SigOutcome oc;
-    const int n = coopsigtab::SigResolveAll(pe, sf, g_entries, kAddrMaxEntries, &oc);
+    const int n = coopsigtab::SigResolveSome(pe, sf, g_entries, kAddrMaxEntries, optionalNames, &oc);
     if (n <= 0)
     {
         *why = "the signature search did not find every row: " + N((long long)sf.rows.size() + (long long)sf.nosig.size())
@@ -429,9 +453,15 @@ static int PatternResolve(const std::string& exe, std::string* why)
     g_entryCount = n;
     g_version = "pattern:" + g_fingerprint;
     g_tablePath = sigPath;
-    DebugLog("[ADDR] no address table for fingerprint " + g_fingerprint + ": all " + N(n) + " rows found by signature"
-             " in '" + exe + "' (each exactly once, each passing its own check). This build is NOT one the signatures"
-             " were proven on (Steam 1.0.65 / 1.0.68); the per-row verification below still decides.");
+    for (size_t k = 0; k < oc.dropped.size(); ++k)
+    {
+        ++g_optionalOff;
+        ErrorLog("[ADDR] OPTIONAL row not found by its signature (" + oc.dropped[k] + ") - it is left unbound and only the feature that"
+                 " needs it is OFF (the rest of the mod runs). addrOptionalOff=" + N(g_optionalOff));
+    }
+    DebugLog("[ADDR] no address table for fingerprint " + g_fingerprint + ": " + N(oc.resolved) + " of " + N(n) + " rows found by signature"
+             " in '" + exe + "' (each exactly once, each passing its own check" + (oc.dropped.empty() ? std::string("") : "; " + N((long long)oc.dropped.size()) + " optional row(s) left out")
+             + "). This build is NOT one the signatures were proven on (Steam 1.0.65 / 1.0.68); the per-row verification below still decides.");
     return 1;
 }
 
@@ -539,6 +569,7 @@ static int AddrInitBody()
         const uintptr_t base = Base();
         for (i = 0; i < g_entryCount; ++i)
         {
+            if (g_entries[i].name[0] == 0) continue;   /* an optional row the signature road left out (PatternResolve): nothing to verify */
             std::string detail;
             /* rk1: the signature road keeps the strict check for every row (callOnly 0) - its bytes come from the file's
                own signature match, and a hooked row there is refused exactly as before */
@@ -553,6 +584,16 @@ static int AddrInitBody()
                          " mod's jump (hooked); the rest of its bytes match and this mod only calls it, so it is accepted ("
                          + detail + ")");
             }
+            if (v == 0 && RowOptional(g_entries[i].name))   /* on either road */
+            {
+                /* an optional row that does not match - its feature is off, the mod is not */
+                ++g_optionalOff;
+                ErrorLog(std::string("[ADDR] OPTIONAL row ") + g_entries[i].name + " (" + AddrKindName(g_entries[i].kind) + ", rva " + H(g_entries[i].rva)
+                         + ") does not match this game (" + detail + ") - it is left unbound and only the feature that needs it is OFF"
+                         " (the rest of the mod runs). addrOptionalOff=" + N(g_optionalOff));
+                g_entries[i].name[0] = 0;   /* dropped: AddrSettleSlots finds no entry and leaves the optional slot at 0 */
+                continue;
+            }
             if (v == 0)
             {
                 ++g_mismatch;
@@ -565,11 +606,17 @@ static int AddrInitBody()
 
     /* Fill every registered slot, and treat a name the table does not carry exactly like a mismatch: a slot
        left at zero would make `base + 0` a call target, which is the crash this whole file exists to stop. */
-    int missing = 0, firstMissing = -1;
+    int missing = 0, firstMissing = -1, optMissing = 0;
+    unsigned char optional[kMaxRegs];
+    for (i = 0; i < g_regCount; ++i) optional[i] = (unsigned char)(g_regUse[i] == kHookUseOptional ? 1 : 0);   /* both roads: an optional row's feature goes off, not the mod */
     const int settled = AddrSettleSlots(g_entries, g_entryCount, g_regs, g_regCount,
                                         (g_mismatch != 0 || g_regOverflow != 0) ? 1 : 0, byPattern ? 1 : 0,
-                                        &missing, &firstMissing);   /* gog1 fold 2: bind; a pattern-road refusal clears every slot */
+                                        &missing, &firstMissing, optional, &optMissing);   /* gog1 fold 2: bind; a pattern-road refusal clears every slot */
     g_bindMissing += missing;
+    for (i = 0; i < g_regCount; ++i)
+        if (optional[i] != 0 && g_regs[i].slot != 0 && *g_regs[i].slot == 0 && AddrFind(g_entries, g_entryCount, g_regs[i].name) == 0 && g_regs[i].name != 0)
+            DebugLog(std::string("[ADDR] optional row ") + g_regs[i].name + " is unbound in this table (missing, or dropped above) - its feature is off");
+    if (optMissing > g_optionalOff) g_optionalOff = optMissing;   /* the slots left unbound: the mismatched rows dropped above and any the table lacks */
     if (g_regOverflow != 0 && g_firstMismatch.empty())
         g_firstMismatch = "the plugin binds more addresses than its registry holds (" + N((long long)kMaxRegs) + ") - " + N((long long)g_regOverflow) + " left out";
     if (firstMissing >= 0 && g_firstMismatch.empty())
@@ -607,7 +654,7 @@ static int AddrInitBody()
     ::InterlockedExchange(&g_ok, 1);
     DebugLog("[ADDR] address table '" + g_version + "' matched this executable: fingerprint " + g_fingerprint
              + ", addrTableLoaded=1 addrEntriesChecked=" + N(g_checked) + " addrMismatch=0 addrVarEntries="
-             + N(g_varEntries) + " addrHookedAccepted=" + N(g_hookedAccepted) + " addrBound=" + N(g_regCount)
+             + N(g_varEntries) + " addrHookedAccepted=" + N(g_hookedAccepted) + " addrOptionalOff=" + N(g_optionalOff) + " addrBound=" + N(g_regCount)
              + " from '" + g_tablePath + "'."
              " addrVarEntries are writable globals - they have no constant bytes to compare and are NOT part of"
              " addrEntriesChecked; they ride on the other entries and on the fingerprint (build/prep-p8h.md).");

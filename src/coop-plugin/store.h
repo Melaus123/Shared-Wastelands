@@ -211,6 +211,9 @@ std::string StoreLiveProbe();
 void StoreNoteCatchupAnswer(bool decoded, bool sent, long long chars);
 void WorldsyncCatchupAsk(const std::vector<char>& payload);
 bool StoreSendTeam(const std::vector<char>& payload);   /* T-546 step 3: MAIN THREAD - an encoded TEAM request to the world server; false = the link is down */
+bool StoreSendAdmin(unsigned type, const std::vector<char>& b);   /* the Admin's Toychest: MAIN THREAD - an ADMIN_REQ / ADMIN_DONE / ADMIN_GOD (src/common/admincmd.h) to the world server; false = the link is down */
+int StoreAdminSaveBegin(long long* endSeen, std::string* why);   /* the Admin's Toychest /save: this profile's own slot saved now (the leave save's road, nothing continues after); 1 started or joined, 0 not wanted (*why). MAIN THREAD */
+int StoreAdminSaveResult(long long endSeen, std::string* why);    /* ... -1 still running, 1 completed, 0 ended otherwise (*why). MAIN THREAD */
 bool StoreSendFallen(const std::vector<char>& payload);   /* T-556: MAIN THREAD - an encoded FALLEN request (ADD / TAKE / ASK) to the world server; false = the link is down */
 // T-810 (money.cpp; src/common/moneywire.h): this game's money and the ledger its pp.money record carries. MAIN THREAD.
 // StoreMoneyReady: 1 = the money may change now - a records store open and writing, a live world, no records restore waiting,
@@ -263,6 +266,7 @@ int  StoreJoinHoldPoll(int holdKind);                      // a held load of tha
 int  StoreRosterSlotInWorld(int slot);   // M7a fold F1, MAIN THREAD: 1 = that slot is IN_WORLD on THIS link's PLAYERS roster, 0 = it is not, -1 = no roster on this link / no slot
 int  StoreRosterNames(std::vector<std::string>* others);   // the other players on THIS link's PLAYERS roster; -1 = no roster on this link
 int  StoreWorldPlayerCount();                              // MAIN THREAD: every player number the world server ever gave in this world (THIS link's PLAYERS roster); -1 = no roster on this link
+int  StoreDedicatedBadge(int slot, std::string* prefix, std::string* status);   // DEDICATED, MAIN THREAD: the PLAYERS tab's words for that slot from the server's DEDINFO (common/dedinfo.h); 1 = something to show
 int  StoreRosterNameOf(int slot, std::string* name);   // MAIN THREAD: the player name the last PLAYERS roster gives that slot; 1 = a name, 0 = listed without one or not listed, -1 = no roster yet
 /* M11 C1 (T-197, to-do M11; src/common/presence.h): is another player in this world - the old game-to-game link up, OR this link's
    PLAYERS roster shows another slot IN_WORLD. The seven single-writer sites ask this instead of the old link alone. */
@@ -442,6 +446,9 @@ void GameSpeedSweepTick();
 // mode byte carried in the notebook's CLOCK message, which the notebook derives from its own options.txt row -
 // one authority for the rule, never two that can disagree.
 const char* TimeModeName();
+/* DEDICATED: the PLAYERS footer's Time (kmode.cpp StartModeFooter). dedHere = a DEDINFO arrived on this link (dedMode its mode);
+   haveClock = the world's CLOCK arrived (speed = the world's speed, clockMode 0 fixed / 1 consensus). MAIN THREAD. */
+void StoreFooterTimeFacts(int* dedHere, unsigned* dedMode, int* haveClock, float* speed, int* clockMode);
 // MAIN THREAD: ask the notebook process to store an option. The relay accepts it only from the game it calls
 // the authority and broadcasts the stored map back to everyone; false here means only that it could not be
 // SENT (no relay link), never that it was refused - a refusal is the relay's to log and to not broadcast.

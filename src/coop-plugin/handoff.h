@@ -76,6 +76,9 @@ bool PlayerTeleportGround();
 // character (the copy that is its own squad's leader, else the lowest uid). 1 done (*out = "target uid=.. lead=.. dist=.."),
 // 0 refused (*out = why), 2 no copy of the other player's characters loaded yet (the command waits and retries).
 int PlayerTeleportPeer(std::string* out);
+// THE ADMIN'S TOYCHEST: one character this game drives to an ABSOLUTE x,z on the ground (handoff.cpp says how). 1 moved, 0 refused
+// (*why), 2 down. MAIN THREAD.
+int AdminMoveCharacter(::Character* c, float x, float z, bool haveY, float carriedY, bool focus, std::string* why);
 // par23b: the engine's own whole-character teleport (Character::teleport 0x5C9BF0) for ONE character - the same
 // call PlayerTeleport makes, exposed for the packbuytest test lever. false = the call faulted.
 bool TeleportCharacter(::Character* c, float x, float y, float z);

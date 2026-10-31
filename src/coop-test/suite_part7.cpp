@@ -6423,7 +6423,7 @@ void t_t1047f_towns_file_ids()
     std::vector<TownRow> back;
     std::string why;
     if (!DecodeTownsFile(text, kPlayerTownsHeader, true, &back, &why) || back.size() != 2 || back[0].id != 7u || back[1].id != 12u) Fail("t1047f: the outpost id does not survive the file: " + why);
-    if (text.find("player-towns\t5\n") != 0) Fail("t1047f: the file is not format 5 (T-940: with the anchor)");
+    if (text.find("player-towns\t6\n") != 0) Fail("t1047f: the file is not format 6 (T-940: with the anchor, and the public field)");
     /* format 3: the same lines without the id field */
     std::string old = "player-towns\t3\n";
     size_t at = text.find('\n') + 1;
@@ -6431,7 +6431,7 @@ void t_t1047f_towns_file_ids()
     {
         size_t e = text.find('\n', at);
         std::string line = text.substr(at, e - at);
-        if (line.size() > 2 && line[0] == 'T') for (int k = 0; k < 3; ++k) line = line.substr(0, line.rfind('\t'));   /* the id and (T-940) the anchor x, z */
+        if (line.size() > 2 && line[0] == 'T') for (int k = 0; k < 4; ++k) line = line.substr(0, line.rfind('\t'));   /* the id, (T-940) the anchor x, z and the public field */
         old += line + "\n";
         at = e + 1;
     }
@@ -6555,8 +6555,8 @@ void t_t1047f1_id_never_reused()
     if (!DecodeTownsFile(EncodeTownsFile(kPlayerTownsHeader, all, true), kPlayerTownsHeader, true, &back, &why, &fileNext) || fileNext != 0u
         || NextIdAtLoad(fileNext, back, std::vector<TownRow>()) != 3u)
         Fail("t1047f1: a file with no next-id line does not read");
-    if (DecodeTownsFile("player-towns\t4\nN\t0\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: a next id of 0 reads");
-    if (DecodeTownsFile("player-towns\t4\nN\t5\nN\t6\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: two next-id lines read");
+    if (DecodeTownsFile("player-towns\t6\nN\t0\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: a next id of 0 reads");
+    if (DecodeTownsFile("player-towns\t6\nN\t5\nN\t6\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: two next-id lines read");
     if (DecodeTownsFile("player-towns\t3\nN\t5\n", kPlayerTownsHeader, true, &back, &why, &fileNext)) Fail("t1047f1: a format-3 file with a next-id line reads");
     if (NextIdAtLoad(2u, all, std::vector<TownRow>()) != 3u) Fail("t1047f1: a next id below the ids on file is taken");
 }
@@ -6986,14 +6986,15 @@ void t_t940_anchor_fixed()
     if (!DecodeTownsFile(text, kPlayerTownsHeader, true, &back, &why) || back.size() != 1) { Fail("t940: the file does not read back: " + why); return; }
     AnchorOf(back[0], &ax, &az);
     if (back[0].anchored != 1 || ax != 1000.0f || az != 2000.0f || back[0].pos[0] != 1940.0f) Fail("t940: the anchor does not survive the file");
-    /* an older file (format 4: no anchor fields) - the centre at the read is the anchor, and it stays from then on */
+    /* an older file (format 4, the dedicated fork's: the public field, no id, no anchor) - the centre at the read is the anchor, and it stays from then on */
     std::string old = "player-towns\t4\n";
     size_t at = text.find('\n') + 1;
     while (at < text.size())
     {
         size_t e = text.find('\n', at);
         std::string line = text.substr(at, e - at);
-        if (line.size() > 2 && line[0] == 'T') for (int k = 0; k < 2; ++k) line = line.substr(0, line.rfind('\t'));
+        if (line.size() > 1 && line[0] == 'N') { at = e + 1; continue; }   /* format 4 has no next-id line */
+        if (line.size() > 2 && line[0] == 'T') { for (int k = 0; k < 4; ++k) line = line.substr(0, line.rfind('\t')); line += "\t0"; }
         old += line + "\n";
         at = e + 1;
     }

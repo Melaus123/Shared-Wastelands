@@ -33,6 +33,10 @@ void ChatOpenTo(int slot);
 // kept for the window as a join line is; `slot` is the other player's (-1 none). MAIN THREAD.
 void ChatMoneyLine(int slot, const std::string& name, const std::string& sentence);
 
+// A grey notice line of this game's own, kept as a money line is (e.g. hire.cpp: "That character already belongs to Bob.");
+// `slot` is the player it names (-1 none). MAIN THREAD.
+void ChatNoticeLine(int slot, const std::string& name, const std::string& sentence);
+
 // T-546 (owner 521 / T-634): one of the game's own interface sounds by its event name (e.g. "Prospect_Click"), on T-815's road -
 // the SoundPostEvent row, the interface object and the fault latch the message sounds use (a fault turns both off for the process).
 // Not a chat message: no chat.cfg switch governs it. 1 = played, 0 = the sound engine refused it, -1 = no world running,

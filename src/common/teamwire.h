@@ -96,6 +96,12 @@
 //   up   13 LEVEL {u32 level}
 //   down 26 LEVEL {u32 team, u32 level, u32 bySlot}
 //   file L <team> <hex player> <level>                                      (after its team's M lines)
+//
+// THE TEAM-BASES PR (world-server protocol 109; see the ops' comment below kDnLevel):
+//   up   14 WORK {u32 bench owner's slot, f32 amount}          down 27 WORK {u32 worker's slot, f32 amount}
+//   up   15 WORK STATE {u8 idle, str tech, f32 progress}       down 28 WORK STATE {u32 member's slot, u8 idle, str tech, f32 progress}
+//   up   16 BANK {u8 op, u32 txn, u32 amount}                  down 29 BANK {u8 op, u32 txn, u8 result, u32 bySlot, u32 balance}
+//   file B <team> <balance>                                                 (after its team's T line; only a balance above 0)
 #include <string>
 #include <vector>
 #include <map>
@@ -124,8 +130,41 @@ const unsigned kMaxSides = 256;           // recorded sides in one team / one RE
 const float kRecLow = -100.0f, kRecHigh = 100.0f;   // the engine's standing scale
 
 enum { kUpInvite = 1, kUpAnswer = 2, kUpLeave = 3, kUpRemove = 4, kUpDisband = 5, kUpRestoreDone = 6, kUpAsk = 7,
-       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpLevel = 13 };
-enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnLevel = 26 };
+       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpLevel = 13, kUpWork = 14, kUpWorkState = 15, kUpBank = 16 };
+enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnLevel = 26, kDnWork = 27, kDnWorkState = 28,
+       kDnBank = 29 };
+/* WORK / WORK STATE / BANK (world-server protocol 109): the team-bases PR's ops, numbered after LEVEL (13 / 26).
+   WORK: research work a member's characters did at a teammate's research bench, for that teammate's research (up: the bench owner's
+   slot and the amount; down: the worker's slot and the amount). The world server passes it to the owner's game when both are in one
+   team and the owner is connected; the owner's game adds it to its current research. Amounts above kMaxWork are refused.
+   WORK STATE: a member's research is idle (1, nothing queued) or running (0), with its current tech's stringID (empty when idle) and its
+   progress (0..1); the world server passes it to the other connected members of its team: their workers at that member's bench stop
+   while it is idle, and their panel of that member's town shows its research (up: flags = idle, name = tech, rel = progress; down:
+   fromSlot, workIdle, workTech, workFrac).
+   BANK (SW Bank: a team's shared cats). Up: u8 op (kBankDeposit / Withdraw / Ask), u32 txn, u32 amount. Down: u8 op, u32 txn, u8 result,
+   u32 bySlot, u32 balance. The server decides and saves before it answers; a deposit's cats left the purse first (refunded on a refusal).
+   EXACTLY ONCE (protocol 112): txn is the game's request number (moneywire.h BankTxnMake: 0x80000000 | 31 random bits, kept in the
+   deposit's own pp.money row). A deposit or withdraw whose txn lacks that bit (a build before 112 counted 1, 2, 3... per session) is
+   refused as kBankBad, never remembered and never answered from a record. The world server keeps each player's last kBankSeenEach decided
+   requests, kBankSeenMax in all (BankSeen, the teams.txt X lines): an OK is remembered in the same teams.txt write as the balance it
+   changes; a refusal is remembered in memory and reaches teams.txt with the next write of the team book. A request it has already
+   decided - the game sends a deposit again on every new link until it is answered - gets the recorded answer again and changes nothing.
+   Limits: a request resent after its record has aged out (kBankSeenEach newer decisions for that player, or kBankSeenMax in all) is
+   decided again; two of one player's requests share a txn only by chance. One amount is at most kMaxBankMove. */
+const float kMaxWork = 100000.0f;
+enum { kBankDeposit = 1, kBankWithdraw = 2, kBankAsk = 3 };
+enum { kBankOk = 0, kBankNoTeam = 1, kBankShort = 2, kBankFull = 3, kBankNotSaved = 4, kBankBad = 5 };
+const unsigned kMaxBank = 2000000000u;   /* a team's balance and any one amount stay at or under this */
+const unsigned kMaxBankMove = 10000000u; /* one deposit or withdraw: at most this many cats (the world server refuses more as kBankBad; the
+                                            game says so before it sends). The server cannot see a purse: this caps what one request can claim */
+const unsigned kBankSeenEach = 64;       /* decided requests kept per player (the game holds at most moneyw::kBankPendingMax + withdraws waiting) */
+const unsigned kBankSeenMax = 8192;      /* decided requests kept in all; the oldest goes first */
+/* THE BANK'S BUILDING. The bank box opens from the Cat Vault, a building of the separate Cat Pouch mod (its
+   record id below) - so the bank NEEDS that mod: without it there is no Cat Vault and no way to open the box (nothing else changes).
+   The vault is taken over ONLY in linked team play - this game linked to a world server and its player in a faction of players; in
+   single player, hosted play without a team, or with the link down, the vault keeps its own menu. */
+const char* const kBankVaultSid = "5007295-Cat Pouch.mod";
+inline bool BankTakesVault(bool linkUp, bool inTeam, bool isVault) { return linkUp && inTeam && isVault; }
 const unsigned kMaxTechs = 4096;          // techs in a team's research and in one RESEARCH message
 const unsigned kMaxLevel = 100;           // a research level a LEVEL report may carry
 /* results: 0 = done; every other number is the reason a request was refused */
@@ -208,7 +247,8 @@ struct Team
     std::vector<SideSnap> sides;     // members' sides towards teammates as they stood before the pin
     std::vector<std::string> research;   // every tech any member has finished (stringIDs, sorted, unique)
     std::vector<std::pair<std::string, unsigned> > levels;   // each player's last reported bench level (profile id, level)
-    Team() : no(0), founderSnapRows(0) {}
+    unsigned bank;                   // SW Bank: the team's shared cats (the B line)
+    Team() : no(0), founderSnapRows(0), bank(0) {}
 };
 struct Owed
 {
@@ -231,10 +271,17 @@ struct Invite
     double expiresAt;                // the world server's own seconds clock
     Invite() : expiresAt(0.0) {}
 };
+struct BankSeen                      // SW Bank: one decided deposit / withdraw (the X line) - a repeat gets this answer again
+{
+    std::string id;                  // the player's profile id
+    unsigned txn, op, amount, result;
+    BankSeen() : txn(0), op(0), amount(0), result(0) {}
+};
 struct Book
 {
     std::vector<Team> teams;
     std::vector<Owed> owed;
+    std::vector<BankSeen> bankSeen;  // oldest first (BankSeenAdd)
     std::vector<Invite> invites;     // never written to the file: an invitation is for connected players only
     std::vector<Invite> declined;    // memory only: a DECLINE's inviter and invitee, expiresAt = the decline + kDeclineWaitSeconds
     std::vector<unsigned> loadRefused;   // while teams.txt is read: team numbers whose T line was refused (their M lines are too)
@@ -922,7 +969,8 @@ struct Up
     std::vector<char> snap;
     TeamRec rec;                     // SEED
     std::vector<Delta> deltas;       // DELTA
-    float rel; unsigned flags;       // STANCE / SIDE (with slot)
+    float rel; unsigned flags;       // STANCE / SIDE (with slot); WORK: rel = the amount, slot = the bench owner; WORK STATE: flags = idle,
+                                     // name = the tech, rel = its progress; BANK: flags = the op, no = the txn, slot = the amount
     unsigned whole;                  // RESEARCH: 1 = this game's whole finished list, 0 = techs its own player finished now
     std::vector<std::string> techs;  // RESEARCH
     unsigned level;                  // LEVEL
@@ -976,6 +1024,15 @@ inline bool EncodeResearchUp(std::vector<char>* b, bool whole, const std::vector
     return true;
 }
 inline void EncodeLevelUp(std::vector<char>* b, unsigned level) { b->clear(); PutU8(b, kUpLevel); PutU32(b, level); }
+/* false = an amount that is not above 0 and at most kMaxWork (NaN included; nothing is encoded) */
+inline bool EncodeWork(std::vector<char>* b, unsigned toSlot, float amount)
+{ b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kUpWork); PutU32(b, toSlot); PutF32(b, amount); return true; }
+/* false = a progress outside 0..1 (NaN included) or a stringID over kMaxName (nothing is encoded) */
+inline bool EncodeWorkState(std::vector<char>* b, bool idle, const std::string& tech, float frac)
+{ b->clear(); if (!(frac >= 0.0f && frac <= 1.0f) || tech.size() > kMaxName) return false; PutU8(b, kUpWorkState); PutU8(b, idle ? 1u : 0u); PutStr(b, tech); PutF32(b, frac); return true; }
+/* false = an op that is not one of the three, an amount over kMaxBank, or a deposit / withdraw of 0 */
+inline bool EncodeBank(std::vector<char>* b, unsigned op, unsigned txn, unsigned amount)
+{ b->clear(); if (op < kBankDeposit || op > kBankAsk || amount > kMaxBank || (op != kBankAsk && amount == 0)) return false; PutU8(b, kUpBank); PutU8(b, op); PutU32(b, txn); PutU32(b, amount); return true; }
 /* false = not an up message this header knows, or malformed (trailing bytes included) */
 inline bool DecodeUp(const char* p, size_t n, Up* u)
 {
@@ -1003,6 +1060,9 @@ inline bool DecodeUp(const char* p, size_t n, Up* u)
     else if (u->kind == kUpStance || u->kind == kUpSide) { u->slot = GetU32(&c); u->rel = GetF32(&c); u->flags = GetU32(&c); }
     else if (u->kind == kUpResearch) { u->whole = GetU8(&c); if (u->whole > 1) c.bad = true; GetTechs(&c, &u->techs); }
     else if (u->kind == kUpLevel) u->level = GetU32(&c);
+    else if (u->kind == kUpWork) { u->slot = GetU32(&c); u->rel = GetF32(&c); if (!(u->rel > 0.0f && u->rel <= kMaxWork)) c.bad = true; }
+    else if (u->kind == kUpWorkState) { u->flags = GetU8(&c); GetStr(&c, &u->name, kMaxName); u->rel = GetF32(&c); if (u->flags > 1 || !(u->rel >= 0.0f && u->rel <= 1.0f)) c.bad = true; }
+    else if (u->kind == kUpBank) { u->flags = GetU8(&c); u->no = GetU32(&c); u->slot = GetU32(&c); if (u->flags < kBankDeposit || u->flags > kBankAsk || u->slot > kMaxBank || (u->flags != kBankAsk && u->slot == 0)) c.bad = true; }
     else if (u->kind != kUpLeave && u->kind != kUpDisband && u->kind != kUpAsk) return false;
     return !c.bad && c.at == n;
 }
@@ -1029,7 +1089,10 @@ struct Down
     unsigned resTeam, resWhole, resBy;                   // RESEARCH (resBy: the game a reply answers, or the finisher of an OWN tech; 0xFFFFFFFF = for all)
     std::vector<std::string> techs;                      // RESEARCH
     unsigned lvTeam, lvLevel, lvBy;                      // LEVEL (lvBy: the reporter a reply answers; 0xFFFFFFFF = for all)
-    Down() : lvTeam(0), lvLevel(0), lvBy(0xFFFFFFFFu), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
+    float work;                                          // WORK (fromSlot: the worker)
+    unsigned workIdle; std::string workTech; float workFrac;   // WORK STATE (fromSlot: the member): idle, its current tech, progress 0..1
+    unsigned bankOp, bankTxn, bankBalance;               // BANK (result; fromSlot: the player it was for)
+    Down() : work(0.0f), workIdle(0), workFrac(0.0f), bankOp(0), bankTxn(0), bankBalance(0), lvTeam(0), lvLevel(0), lvBy(0xFFFFFFFFu), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
 };
 /* the table as the games see it: profile ids turned into slots (slotOf: profile id -> slot; a player with no slot is skipped) */
 inline std::vector<WireTeam> ToWire(const Book& b, const std::map<std::string, unsigned>& slotOf)
@@ -1081,6 +1144,56 @@ inline void EncodeLevelDown(std::vector<char>* b, unsigned team, unsigned level,
 {
     b->clear(); PutU8(b, kDnLevel); PutU32(b, team); PutU32(b, level); PutU32(b, bySlot);
 }
+inline bool EncodeWorkDown(std::vector<char>* b, unsigned fromSlot, float amount)
+{ b->clear(); if (!(amount > 0.0f && amount <= kMaxWork)) return false; PutU8(b, kDnWork); PutU32(b, fromSlot); PutF32(b, amount); return true; }
+inline bool EncodeWorkStateDown(std::vector<char>* b, unsigned fromSlot, bool idle, const std::string& tech, float frac)
+{ b->clear(); if (!(frac >= 0.0f && frac <= 1.0f) || tech.size() > kMaxName) return false; PutU8(b, kDnWorkState); PutU32(b, fromSlot); PutU8(b, idle ? 1u : 0u); PutStr(b, tech); PutF32(b, frac); return true; }
+inline bool EncodeBankDown(std::vector<char>* b, unsigned op, unsigned txn, unsigned result, unsigned bySlot, unsigned balance)
+{ b->clear(); if (op < kBankDeposit || op > kBankAsk || result > kBankBad || balance > kMaxBank) return false; PutU8(b, kDnBank); PutU8(b, op); PutU32(b, txn); PutU8(b, result); PutU32(b, bySlot); PutU32(b, balance); return true; }
+/* the server's decision for one BANK request on a team's balance (pure: the caller saves before it answers) */
+inline unsigned BankDecide(unsigned balance, unsigned op, unsigned amount, unsigned* after)
+{
+    *after = balance;
+    if (op == kBankAsk) return kBankOk;
+    if (amount == 0 || amount > kMaxBank || amount > kMaxBankMove) return kBankBad;
+    if (op == kBankDeposit) { if (amount > kMaxBank - balance) return kBankFull; *after = balance + amount; return kBankOk; }
+    if (op == kBankWithdraw) { if (amount > balance) return kBankShort; *after = balance - amount; return kBankOk; }
+    return kBankBad;
+}
+/* a decided request that may be remembered (and that an X line may hold): a deposit or withdraw, a txn of protocol 112 or an
+   earlier non-zero one (the loader keeps those; the server never decides a new request without the bit), an amount and a result in range.
+   The server remembers only what passes, so a junk request is never written as an X line the loader would refuse. */
+inline bool BankSeenOk(unsigned txn, unsigned op, unsigned amount, unsigned result)
+{
+    return txn != 0 && (op == kBankDeposit || op == kBankWithdraw) && amount <= kMaxBank && result <= kBankBad;
+}
+/* EXACTLY ONCE: the request a player already had decided, or -1 */
+inline int BankSeenFind(const Book& b, const std::string& id, unsigned txn)
+{
+    for (size_t i = 0; i < b.bankSeen.size(); ++i) if (b.bankSeen[i].txn == txn && b.bankSeen[i].id == id) return (int)i;
+    return -1;
+}
+/* a deposit / withdraw from `id`: 1 = already decided (*result = the answer it had; a txn used before for another op or amount answers
+   kBankBad - nothing changes either way), 0 = a new request (decide it, then BankSeenAdd) */
+inline int BankRepeat(const Book& b, const std::string& id, unsigned txn, unsigned op, unsigned amount, unsigned* result)
+{
+    const int i = BankSeenFind(b, id, txn);
+    if (i < 0) return 0;
+    const BankSeen& s = b.bankSeen[(size_t)i];
+    *result = (s.op == op && s.amount == amount) ? s.result : (unsigned)kBankBad;
+    return 1;
+}
+/* one decided request remembered: the player's oldest goes past kBankSeenEach, the book's oldest past kBankSeenMax */
+inline void BankSeenAdd(Book* b, const std::string& id, unsigned txn, unsigned op, unsigned amount, unsigned result)
+{
+    if (!BankSeenOk(txn, op, amount, result) || BankSeenFind(*b, id, txn) >= 0) return;
+    size_t mine = 0, oldest = b->bankSeen.size();
+    for (size_t i = 0; i < b->bankSeen.size(); ++i) if (b->bankSeen[i].id == id) { if (mine == 0) oldest = i; ++mine; }
+    if (mine >= kBankSeenEach && oldest < b->bankSeen.size()) b->bankSeen.erase(b->bankSeen.begin() + (long)oldest);
+    if (b->bankSeen.size() >= kBankSeenMax) b->bankSeen.erase(b->bankSeen.begin());
+    BankSeen s; s.id = id; s.txn = txn; s.op = op; s.amount = amount; s.result = result;
+    b->bankSeen.push_back(s);
+}
 inline bool DecodeDown(const char* p, size_t n, Down* d)
 {
     if (d == 0) return false;
@@ -1116,6 +1229,9 @@ inline bool DecodeDown(const char* p, size_t n, Down* d)
     }
     else if (d->kind == kDnResearch) { d->resTeam = GetU32(&c); d->resWhole = GetU8(&c); d->resBy = GetU32(&c); if (d->resWhole > 1) c.bad = true; GetTechs(&c, &d->techs); }
     else if (d->kind == kDnLevel) { d->lvTeam = GetU32(&c); d->lvLevel = GetU32(&c); d->lvBy = GetU32(&c); }
+    else if (d->kind == kDnWork) { d->fromSlot = GetU32(&c); d->work = GetF32(&c); if (!(d->work > 0.0f && d->work <= kMaxWork)) c.bad = true; }
+    else if (d->kind == kDnWorkState) { d->fromSlot = GetU32(&c); d->workIdle = GetU8(&c); GetStr(&c, &d->workTech, kMaxName); d->workFrac = GetF32(&c); if (d->workIdle > 1 || !(d->workFrac >= 0.0f && d->workFrac <= 1.0f)) c.bad = true; }
+    else if (d->kind == kDnBank) { d->bankOp = GetU8(&c); d->bankTxn = GetU32(&c); d->result = GetU8(&c); d->fromSlot = GetU32(&c); d->bankBalance = GetU32(&c); if (d->bankOp < kBankDeposit || d->bankOp > kBankAsk || d->result > kBankBad || d->bankBalance > kMaxBank) c.bad = true; }
     else return false;
     return !c.bad && c.at == n;
 }
@@ -1238,6 +1354,12 @@ inline std::string BookFile(const Book& b)
         for (size_t k = 0; k < b.teams[t].levels.size(); ++k)
             if (InTeam(b.teams[t], b.teams[t].levels[k].first))
                 s += "L " + U(b.teams[t].no) + " " + Hex(b.teams[t].levels[k].first) + " " + U(b.teams[t].levels[k].second) + "\n";
+        if (b.teams[t].bank != 0) s += "B " + U(b.teams[t].no) + " " + U(b.teams[t].bank) + "\n";   // SW Bank: the team's shared cats
+    }
+    for (size_t i = 0; i < b.bankSeen.size(); ++i)   // SW Bank: the decided requests (exactly once), oldest first
+    {
+        const BankSeen& x = b.bankSeen[i];
+        s += "X " + Hex(x.id) + " " + U(x.txn) + " " + U(x.op) + " " + U(x.amount) + " " + U(x.result) + "\n";
     }
     for (size_t i = 0; i < b.owed.size(); ++i)
     {
@@ -1384,6 +1506,30 @@ inline bool BookParseLine(const std::string& raw, Book* b, int* why = 0)
                 return true;
             }
         return false;
+    }
+    if (tag == "B")
+    {   // SW Bank: B <team no> <balance>, after its team's line; a second B line for one team is a duplicate
+        unsigned no = 0, bal = 0;
+        if (!(is >> no >> bal) || bal > kMaxBank) return false;
+        for (size_t k = 0; k < b->loadRefused.size(); ++k) if (b->loadRefused[k] == no) return false;
+        for (size_t t = 0; t < b->teams.size(); ++t)
+            if (b->teams[t].no == no)
+            {
+                if (b->teams[t].bank != 0) { if (why != 0) *why = kLineDuplicate; return false; }
+                b->teams[t].bank = bal;
+                if (why != 0) *why = kLineOk;
+                return true;
+            }
+        return false;
+    }
+    if (tag == "X")
+    {   // SW Bank: X <player hex> <txn> <op> <amount> <result> - one decided request; a second line for one player and txn is a duplicate
+        std::string hex; BankSeen x;
+        if (!(is >> hex >> x.txn >> x.op >> x.amount >> x.result) || !UnhexS(hex, &x.id) || x.id.empty() || !BankSeenOk(x.txn, x.op, x.amount, x.result)) return false;
+        if (BankSeenFind(*b, x.id, x.txn) >= 0) { if (why != 0) *why = kLineDuplicate; return false; }
+        BankSeenAdd(b, x.id, x.txn, x.op, x.amount, x.result);
+        if (why != 0) *why = kLineOk;
+        return true;
     }
     if (tag == "O")
     {

@@ -51,6 +51,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include "chat.h"
+#include "admin.h"                         /* the Admin's Toychest: a line starting with '/' is a command, not a message */
+#include "../common/admincmd.h"
+#include "../common/adminauth.h"   /* admin two-factor: /login and /logout never leave this game as chat */
 #include "ui.h"                            /* UiPauseMenuVisible, UiMenuCommand */
 #include "store.h"                         /* StoreSendLive, StoreLiveReady, StoreMySlot, StoreRosterSlotInWorld, StoreWorldPlayerCount */
 #include "team.h"                          /* TeamMatesOfMine, TeamPlayerName */
@@ -65,6 +68,8 @@
 #include "../common/bugreport.h"           /* coopbug::CaptionToPlain */
 #include "../common/playerstab.h"          /* playerstab::EscapeHash */
 #include "../common/slotwire.h"            /* coopslot::PlaceholderName */
+#include "../common/chatlink.h"           /* CHATLINK: item links - the words, the colours, the bytes */
+#include "items.h"                        /* CHATLINK: ItemLinkUnderMouse - the item under the mouse */
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -211,7 +216,13 @@ std::string g_shownTo, g_rectShown, g_partsShown;
 struct Words { std::string name, faction; long long ms; bool have; Words() : ms(0), have(false) {} };
 std::map<int, Words> g_words;
 /* one label of a line, laid out at the canvas width it was measured for */
-struct Piece { int x, row, w, colour, slot; bool click; std::string text; };
+struct Piece
+{
+    int x, row, w, colour, slot; bool click; std::string text;
+    int rgb;               /* CHATLINK: an item link's own colour (0xRRGGBB); -1 = the line's colour */
+    chatlink::Link link;   /* CHATLINK: the link this piece shows, when rgb >= 0 (v2's click reads it) */
+    Piece() : x(0), row(0), w(0), colour(0), slot(-1), click(false), rgb(-1) {}
+};
 std::map<long long, std::vector<Piece> > g_pieces;   /* by line seq */
 int g_piecesW = -1;
 long long g_softStrikes = 0;
@@ -619,6 +630,95 @@ std::vector<std::string> Wrap(MyGUI::TextBox* m, const std::string& text, int fi
     if (!cur.empty() || out.empty()) out.push_back(cur);
     return out;
 }
+/* ---- CHATLINK: a line with item links in it (src/common/chatlink.h) ----
+   The words after the name, cut into runs: each plain word (with the spaces before it) and each link is one run; a run goes on the
+   row while it fits and starts the next row when it does not (a link wider than a whole row is cut inside, as Wrap cuts a long
+   word). Runs of one look next to each other on one row are one label. */
+struct LinkRun { std::string words; int rgb; chatlink::Link link; };
+void LinkPush(std::vector<Piece>* ps, int row, int x, int colour, const LinkRun& r, MyGUI::TextBox* m)
+{
+    Piece p; p.x = x; p.row = row; p.text = r.words; p.w = Measure(m, r.words) + 4; p.colour = colour; p.rgb = r.rgb; p.link = r.link;
+    ps->push_back(p);
+}
+void LinkFlow(MyGUI::TextBox* m, const std::string& post, int x0, int cw, int colour, std::vector<Piece>* ps)
+{
+    std::vector<LinkRun> runs;
+    const std::vector<chatlink::Seg> segs = chatlink::Split(post);
+    for (size_t s = 0; s < segs.size(); ++s)
+    {
+        if (segs[s].link) { LinkRun r; r.words = segs[s].text; r.rgb = (int)chatlink::LinkRgb(segs[s].k); r.link = segs[s].k; runs.push_back(r); continue; }
+        const std::string& t = segs[s].text;
+        size_t i = 0;
+        while (i < t.size())
+        {
+            size_t j = i;
+            while (j < t.size() && t[j] == ' ') ++j;
+            while (j < t.size() && t[j] != ' ') ++j;
+            LinkRun r; r.words = t.substr(i, j - i); r.rgb = -1; runs.push_back(r);
+            i = j;
+        }
+    }
+    int row = 0, x = x0;
+    LinkRun cur; cur.rgb = -2;   /* the label being filled; -2 = none yet */
+    int curX = x0;
+    for (size_t k = 0; k < runs.size(); ++k)
+    {
+        LinkRun r = runs[k];
+        int w = Measure(m, r.words);
+        if (x + w > cw && x > 0)
+        {
+            if (cur.rgb != -2 && !cur.words.empty()) LinkPush(ps, row, curX, colour, cur, m);
+            cur.rgb = -2; cur.words.clear();
+            ++row; x = 0; curX = 0;
+            size_t a = 0;
+            while (a < r.words.size() && r.words[a] == ' ') ++a;
+            r.words = r.words.substr(a);
+            w = Measure(m, r.words);
+        }
+        while (w > cw && !r.words.empty())   /* wider than a whole row: as much as fits, then the rest on the next row */
+        {
+            size_t n = 0, last = 0;
+            while (n < r.words.size())
+            {
+                size_t e = n + 1;
+                while (e < r.words.size() && chatwire::IsCont((unsigned char)r.words[e])) ++e;
+                if (last != 0 && Measure(m, r.words.substr(0, e)) > cw) break;
+                last = e; n = e;
+            }
+            LinkRun head = r; head.words = r.words.substr(0, last);
+            if (cur.rgb != -2 && !cur.words.empty()) LinkPush(ps, row, curX, colour, cur, m);
+            LinkPush(ps, row, 0, colour, head, m);
+            cur.rgb = -2; cur.words.clear();
+            ++row; x = 0; curX = 0;
+            r.words = r.words.substr(last);
+            w = Measure(m, r.words);
+        }
+        if (r.words.empty()) continue;
+        if (cur.rgb != r.rgb || (r.rgb >= 0 && !cur.words.empty()))   /* a link is always its own label */
+        {
+            if (cur.rgb != -2 && !cur.words.empty()) LinkPush(ps, row, curX, colour, cur, m);
+            cur = r; curX = x;
+        }
+        else cur.words += r.words;
+        x += w;
+    }
+    if (cur.rgb != -2 && !cur.words.empty()) LinkPush(ps, row, curX, colour, cur, m);
+    if (ps->empty() || runs.empty()) { Piece p; p.x = x0; p.row = 0; p.w = 4; p.colour = colour; ps->push_back(p); }
+}
+MyGUI::Colour RgbCol(int rgb) { return MyGUI::Colour(((rgb >> 16) & 255) / 255.0f, ((rgb >> 8) & 255) / 255.0f, (rgb & 255) / 255.0f, 1.0f); }
+/* v2's hook: a link's label is made here. It carries the link's sid, level and kind; it takes no clicks yet (a click on it will
+   open the item's stat panel - wire the label's eventMouseButtonClick here and setNeedMouseFocus(true)). */
+void ChatLinkLabelMade(MyGUI::Widget* l, const chatlink::Link& k)
+{
+    l->setUserString("linksid", k.sid);
+    l->setUserString("linklevel", N(k.level));
+    l->setUserString("linkkind", std::string(1, k.kind));
+}
+/* the links put in the typing line since it was last empty, in order; SendText swaps their words for the link (chatlink::Expand) */
+std::vector<chatlink::Link> g_links;
+long long g_linkPut = 0, g_linkMiss = 0, g_linkSent = 0;
+bool g_midWas = false;
+
 void PartsOf(const chatwire::Entry& e, std::string* pre, std::string* nm, std::string* post)
 {
     pre->clear(); nm->clear(); post->clear();
@@ -642,6 +742,7 @@ const std::vector<Piece>& PiecesOf(MyGUI::TextBox* m, const chatwire::Entry& e, 
         p.click = e.slot >= 0 && e.slot != me;   /* another player's name: clicking it sets TO to that player */
         ps.push_back(p); x += p.w;
     }
+    if (chatlink::HasLink(post)) { LinkFlow(m, post, x, cw, colour, &ps); return ps; }   /* CHATLINK */
     const std::vector<std::string> rows = Wrap(m, post, cw - x, cw);
     for (size_t r = 0; r < rows.size(); ++r)
     {
@@ -721,7 +822,8 @@ void RebuildLines(MyGUI::Gui* gui, long long now)
             if (p.text.empty()) continue;
             MyGUI::Widget* l = Mk(canvas, "TextBox", "Kenshi_TextboxStandardText", p.x + 3, y + p.row * g_rowH, p.w, g_rowH, "");
             if (l == 0) continue;
-            Style(l, p.text, MyGUI::Align::Left | MyGUI::Align::VCenter, Col(p.colour));
+            Style(l, p.text, MyGUI::Align::Left | MyGUI::Align::VCenter, p.rgb >= 0 ? RgbCol(p.rgb) : Col(p.colour));
+            if (p.rgb >= 0) ChatLinkLabelMade(l, p.link);   /* CHATLINK */
             l->setUserString("ms", ms);
             l->setUserString("seq", seq);
             l->setNeedMouseFocus(p.click);
@@ -977,8 +1079,10 @@ std::vector<int> MatesInWorld(int* all)
     return out;
 }
 /* one message to whoever TO names: returns the chatwire::Plan that was followed */
-int SendText(const std::string& text, long long now)
+int SendText(const std::string& typed, long long now)
 {
+    const std::string text = g_links.empty() ? typed : chatlink::Expand(typed, g_links, chatwire::kMaxBytes);   /* CHATLINK: the links' words become links */
+    if (!g_links.empty()) g_linkSent += chatlink::HasLink(text) ? 1 : 0;
     const int kind = g_to == chatwire::kToEveryone ? chatwire::kEveryone : (g_to == chatwire::kToFaction ? chatwire::kFaction : chatwire::kPrivate);
     int mateCount = 0;
     const std::vector<int> mates = kind == chatwire::kFaction ? MatesInWorld(&mateCount) : std::vector<int>();
@@ -1033,8 +1137,16 @@ void SendFromBox(MyGUI::Gui* gui, long long now)
 {
     MyGUI::EditBox* e = As<MyGUI::EditBox>(Find(gui, kEdit));
     if (e == 0) return;
-    const std::string text = chatwire::CleanTyped(coopbug::CaptionToPlain(e->getCaption().asUTF8()));
+    std::string text = chatwire::CleanTyped(coopbug::CaptionToPlain(e->getCaption().asUTF8()));
     if (text.empty()) { Close(gui, "nothing typed", true); return; }
+    /* admin two-factor (adminauth.h): "/login <password>" and "/logout" are taken HERE, on every world and with or without a link - never
+       sent as chat, never as a command, never logged. AdminLoginTyped wipes the text; Close clears the box. */
+    if (adminauth::IsLoginLine(text) || adminauth::IsLogoutLine(text)) { coop::AdminLoginTyped(&text); Close(gui, "login", true); return; }
+    /* the Admin's Toychest: a toychest verb on a linked DEDICATED world is a command - never sent as chat, the world server judges it.
+       Anything else starting with '/' (and every line in single player, a hosted world or with no link) is ordinary chat (admincmd.h ChatTakesCommand) */
+    int dedHere = 0, haveClock = 0, clockMode = 0; unsigned dedMode = 0; float speed = 0.0f;
+    StoreFooterTimeFacts(&dedHere, &dedMode, &haveClock, &speed, &clockMode);
+    if (admincmd::ChatTakesCommand(text, StoreLinkIsUp(), dedHere != 0)) { coop::AdminTyped(text); Close(gui, "command", true); return; }
     const int plan = SendText(text, now);
     if (plan == chatwire::kPlanSend || plan == chatwire::kPlanSelfOnly) Close(gui, "sent", true);
     /* gone / not connected: the window stays open with the text in the line, to send again */
@@ -1184,6 +1296,76 @@ std::string StateLine(MyGUI::Gui* gui, long long now)
          + "/" + N(g_soundPlayed[2]) + " sound-quiet=" + N(g_soundQuiet) + " sound-refused=" + N(g_soundRefused);
 }
 
+/* ---- CHATLINK: Shift + middle-click on an item puts a link to it in the typing line ----
+   The button and Shift are read from the keys' own state, as Enter is (EnterPressed): Kenshi takes its mouse through DirectInput,
+   and this only READS the state. What is under the mouse is MyGUI's own mouse-focus widget - an inventory window's section grid
+   (its item icons take no mouse: Kenshi_InventoryItem.layout NeedMouse false); items.cpp says which item of which window's
+   inventory that cell holds. Only while the chat's typing line is open; a click on the chat itself does nothing. */
+bool LinkClickPressed()
+{
+    const bool down = (::GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    const bool edge = down && !g_midWas;
+    g_midWas = down;
+    if (!edge || (::GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) return false;
+    HWND fg = ::GetForegroundWindow();
+    DWORD pid = 0;
+    return fg != 0 && (::GetWindowThreadProcessId(fg, &pid), pid) == ::GetCurrentProcessId();
+}
+const char* LinkMissWords(int why)
+{
+    switch (why)
+    {
+    case kLinkNoWindow:   return "not an inventory window's grid";
+    case kLinkNoSection:  return "the window's section was not found";
+    case kLinkEmpty:      return "an empty cell";
+    case kLinkNoTable:    return "the window map is not bound";
+    default:              return "unreadable";
+    }
+}
+void LinkTick(MyGUI::Gui* gui, bool click)
+{
+    MyGUI::EditBox* e = As<MyGUI::EditBox>(Find(gui, kEdit));
+    if (e == 0) return;
+    if (e->getTextLength() == 0 && !g_links.empty()) g_links.clear();   /* an empty line has no links */
+    if (!click) return;
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    if (im == 0 || im->isModalAny()) return;
+    MyGUI::Widget* w = im->getMouseFocusWidget();
+    if (w == 0 || Inside(w, Find(gui, kRoot)) || (Find(gui, kPop) != 0 && Inside(w, Find(gui, kPop)))) return;
+    const MyGUI::IntPoint mp = im->getMousePosition();
+    coop::ItemLinkFacts f;
+    int why = kLinkNoWindow;
+    for (int d = 0; w != 0 && d < 3; ++d, w = w->getParent())   /* the grid, or a child of it */
+    {
+        const MyGUI::IntCoord c = w->getAbsoluteCoord();
+        why = coop::ItemLinkUnderMouse(w, w->getName().c_str(), c.left, c.top, c.width, c.height, mp.left, mp.top, &f);
+        if (why == kLinkFound || why == kLinkEmpty || why == kLinkUnreadable) break;
+    }
+    chatlink::Link k;
+    if (why != kLinkFound || !chatlink::Make(f.name, f.model, f.sid, f.type, f.level, f.artifact != 0, &k))
+    {
+        if (++g_linkMiss <= 20) DebugLog(std::string("[CHAT] link click: no item (") + (why == kLinkFound ? "the item has no name" : LinkMissWords(why)) + ")");
+        return;
+    }
+    const std::string shown = chatlink::Shown(k);
+    const size_t add = chatwire::Utf8Chars(shown);
+    if (e->getTextLength() + add > e->getMaxTextLength())
+    {
+        DebugLog("[CHAT] link click: the line has no room for it (" + N((long long)add) + " more characters)");
+        return;
+    }
+    const MyGUI::Colour tc = e->getTextColour();
+    const unsigned lineRgb = ((unsigned)(tc.red * 255.0f + 0.5f) << 16) | ((unsigned)(tc.green * 255.0f + 0.5f) << 8) | (unsigned)(tc.blue * 255.0f + 0.5f);
+    const size_t at = e->getTextCursor();
+    e->insertText(MyGUI::UString(chatlink::Tagged(k, lineRgb)), at);
+    e->setTextCursor(at + add);
+    g_links.push_back(k);
+    FocusEdit(gui);
+    ++g_linkPut;
+    DebugLog("[CHAT] link put in the line (kind " + std::string(1, k.kind) + " level " + N(k.level) + " type " + N(f.type)
+             + " links " + N((long long)g_links.size()) + " put " + N(g_linkPut) + " sent " + N(g_linkSent) + ")");
+}
+
 void TickBody()
 {
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
@@ -1203,6 +1385,7 @@ void TickBody()
     const int pickHas = (int)::InterlockedExchange(&g_pickHas, 0);
     const int openReq = (int)::InterlockedExchange(&g_openReq, 0);
     const bool enter = EnterPressed();   /* every frame, so a held key is one press */
+    const bool linkClick = LinkClickPressed();   /* CHATLINK: Shift + middle-click, every frame for the same reason */
     if (enter && g_st == kStOpen) g_enterOpenHeld = false;   /* a new press while the box is open is the player's own Enter */
     if (g_st != kStOpen)
     {
@@ -1244,6 +1427,7 @@ void TickBody()
             else { Close(gui, "esc", true); EscHoldStart(); }
         }
         OptTick(gui, now);
+        if (g_st == kStOpen) LinkTick(gui, linkClick);   /* CHATLINK */
     }
     if (g_st == kStNone && !g_ring.lines.empty() && !EnsureBuilt(gui)) return;
     if (g_st == kStNone) return;
@@ -1624,6 +1808,12 @@ void ChatMoneyLine(int slot, const std::string& name, const std::string& sentenc
 {
     PushGrey(chatwire::kLineMoney, slot, name, sentence, NowMs());
     DebugLog("[CHAT] money line kept (slot " + N(slot) + ")");
+}
+/* a grey notice line (hire.cpp's refused recruit), on the money line's road */
+void ChatNoticeLine(int slot, const std::string& name, const std::string& sentence)
+{
+    PushGrey(chatwire::kLineMoney, slot, name, sentence, NowMs());
+    DebugLog("[CHAT] notice line kept (slot " + N(slot) + ")");
 }
 /* T-546: an interface sound by event name on the message sounds' road (PostEventGuarded, kUiSoundObject, g_soundOff) */
 int ChatPlayUiEvent(const char* ev)

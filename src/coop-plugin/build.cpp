@@ -115,6 +115,7 @@ namespace coop { int AiWorkerBusyNow(); }   /* coop.cpp - the engine's own AI-wo
 #include "../common/keptwire.h"    /* KEPT: the players' kept pieces laid back into a reset world (and zonekeep.h) */
 #include "../common/townkeep.h"    /* TOWNS: the players' outposts carried into a reset world */
 #include "../common/baseshow.h"    /* T-811: SHOW - the teammates' outposts on the map */
+#include "../common/admincmd.h"    /* LogSafe: a teammate's research name (its stringID when this game has no such record) on a log line */
 #include "../common/townmove.h"    /* T-924 fault 2: a teammate's outpost copy moved to the sent centre (the pure decision) */
 #include "../common/boxowner.h"    /* WorldNodeOf - a world resource node is nobody's piece */
 #include "../common/slotwire.h"    /* P18 fold 2: StandInSlotOfId / IsLegacyPeerId - a saved owner id read as a stand-in record */
@@ -152,6 +153,10 @@ namespace coop { int AiWorkerBusyNow(); }   /* coop.cpp - the engine's own AI-wo
 #include <sstream>
 #include <string>
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
+#include "../common/teammap.h"   /* TEAMMAP: the team-bases PR's decisions (research at a teammate's bench) */
+#include "../common/teamwire.h"  /* TEAMMAP: kMaxWork - research work at a teammate's bench (TEAM WORK) */
+#include <mygui/MyGUI_UString.h>        /* TEAMMAP: a teammate's research shown on a panel of that teammate's town */
+#include <mygui/MyGUI_ProgressBar.h>
 
 namespace coop {
 
@@ -172,6 +177,8 @@ int BdContainsRowPod(void* t, const float* pos, float scale);           /* T-923
 void* BdCommitTownCheck(void* town, int* why);                          /* T-923 review MED 1: below. MAIN THREAD */
 const char* BdCommitTownWhy(int why);                                   /* T-923 review MED 1: below */
 float BdTownDistXZ(void* t, const float* pos);   /* T-923: below, with the confirm's town pick */
+void* BdRestoreTownFor(const std::string& key, const float* pos, float* dist, int* fromRow);   /* town crash-safety: below, beside BdKeptTownForKey. MAIN THREAD */
+long long g_rsTownByRow = 0, g_rsTownNear = 0, g_rsTownNone = 0;   /* town crash-safety: the town a piece rebuilt from this game's own record was made in */
 void* BdOwnTownAt(const float* xz, float* off, int* route);  /* T-923 review MED 2 / fold 3 (b): below, with the review fold's helpers. MAIN THREAD */
 int BdHandByActualTown(void* b, void* argTown, int* why, int posOk, void** handTown);   /* T-923 fold 3 LOW B: below. MAIN THREAD */
 int BdTownWireCentre(void* t, float* xz);        /* T-923 review MED 2: below */
@@ -4087,6 +4094,13 @@ void detour_order(void* pi, void* indoors, void* task, void* subject, void* shif
                     t, road, g_orderSkipped, g_orderBlocked);
         BdLogCapped(line);
         return;
+    }
+    /* SW Bank: any order other than build / add-materials / repair / dismantle on the ATM building opens the bank box instead - in linked
+       team play only (BankTakesVaultNow); otherwise the Cat Vault keeps its own menu */
+    if (subject != 0 && !coopbuild::BuildTaskGated(t) && BdOnMain() != 0 && g_inOrderLever == 0)
+    {
+        char sid[128]; BdSidOf(subject, sid, (int)sizeof(sid));
+        if (BankTakesVaultNow(sid)) { BankOpen(); return; }
     }
     orig_order(pi, indoors, task, subject, shift, addDontClear, location);
 }
@@ -8915,6 +8929,18 @@ static int BdCopyOneBody(BdPending& p, int* called)
         if (m.townHand != 0) { handTown = BdOwnTownAt(m.townPos, &handTownOff, &handTownRoute); if (handTown != 0) { handTownBy = 1; handTownD = BdTownDistXZ(handTown, pos); ++g_handTownByCentre; if (handTownRoute == 2) ++g_handTownByArea; } else ++g_handTownCentreMissed; }
         if (handTown == 0) { handTown = BdOwnTownNear(pos, buildnear::kTownKeepRange, &handTownD); if (handTown != 0) handTownBy = 2; }
     }
+    /* town crash-safety: an outdoor piece rebuilt from this game's own record (pp.build - a crash lost it from the save) is made in this
+       player's own outpost, as the player's own placement would be: the outpost the world server sent back for its key (taken or
+       founded at its centre, BdKeptTownForKey), else this player's own town nearest it within 5000 (the confirm's rule, 0x4D6300);
+       none: town 0 as before, and the outpost loop (BdTownsLoadedTick) links it once the world server sends the outpost back. A kept
+       row's restore (keptRow) takes its outpost after the make (BdKeptPendDone), as it always did. */
+    int rsTown = 0;   /* 1 = the outpost sent back for its key, 2 = the nearest own town */
+    if (p.restore != 0 && furn == 0 && p.keptRow < 0)
+    {
+        int fromRow = 0;
+        handTown = BdRestoreTownFor(m.key, pos, &handTownD, &fromRow);
+        if (handTown != 0) { rsTown = fromRow != 0 ? 1 : 2; if (fromRow != 0) ++g_rsTownByRow; else ++g_rsTownNear; } else ++g_rsTownNone;
+    }
     void* b = (furn != 0)   /* build1-e: furnitureOf rebuilt from THIS game's host in the builder's form, isIndoorsOf = host */
         ? BdCallCreateEx(fn, factory, gd, pos, (void*)want, rot, fo, host, m.complete != 0, m.floor, m.outside != 0, &faulted)
         : BdCallCreateTown(fn, factory, gd, pos, handTown, (void*)want, rot, m.complete != 0, &faulted);
@@ -8986,6 +9012,15 @@ static int BdCopyOneBody(BdPending& p, int* called)
     P165Note(b, m.key, p.restore != 0 ? "copy made (restored)" : "copy made (created)", "-", -2, "");
     // PROBE-END: P165
 #endif
+    if (p.restore != 0 && furn == 0 && p.keptRow < 0)   /* town crash-safety: which town the rebuilt piece stands in here */
+    {
+        char tl[400];
+        const std::string now = BdTownName(BdBuildingTownPod(b));
+        _snprintf_s(tl, sizeof(tl), _TRUNCATE, "[BUILD] restore key=%.63s made with town %s '%.80s' dist=%.0f - its town now '%.80s'; restoreTown[byRow,nearest,none]=%lld,%lld,%lld", m.key.c_str(),
+                    rsTown == 1 ? "= its outpost as the world server sent it back" : rsTown == 2 ? "= this player's own town nearest within 5000" : "0 (no own town within 5000 and no outpost sent back yet: linked when it comes)",
+                    handTown != 0 ? BdTownName(handTown).c_str() : "-", handTownD, now.c_str(), g_rsTownByRow, g_rsTownNear, g_rsTownNone);
+        BdLogCapped(tl);
+    }
     if (toMe != 0 && furn == 0 && p.restore == 0)   /* T-923: which town the handed outdoor piece stands in here */
     {
         char tl[400];
@@ -13019,6 +13054,8 @@ int g_hkMapIcon = -2, g_hkMapLayer = -2;
 void InstallPower();   /* P47: below */
 void PowerMarkPiece(void* b);   /* P47: below - a power piece the mod wrote, looked at by the next K2 drain */
 int BdInstallTownWake(uintptr_t base);   /* T-936: below, beside BdShowTownByHand (this namespace) */
+void InstallTeamMap();   /* TEAMMAP: below, after the T-811 map hooks (this namespace) */
+void BdTeamMapTick();    /* TEAMMAP: below (MAIN THREAD, BuildCopyDrain) */
 void InstallBuild()
 {
     if (g_installed != 0) return;
@@ -13174,6 +13211,7 @@ void InstallBuild()
         + (g_hkMapLayer == -3 ? "not tried (the icon hook is not installed)" : HkWord(g_hkMapLayer));
     if (g_hkMapIcon == 1 && g_hkMapLayer == 1) DebugLog(smsg);
     else ErrorLog(smsg);
+    InstallTeamMap();   /* TEAMMAP: teammates' bases in this player's colour, researching at a teammate's bench */
     /* T-609 U: Building::upgrade / downgrade - each call logged with the building's key and record before and after */
     g_hkUpgrade = BdHook(base, kBdUpgradeRva, (void*)&detour_upgrade, (void**)&orig_upgrade);
     g_hkDowngrade = BdHook(base, kBdDowngradeRva, (void*)&detour_downgrade, (void**)&orig_downgrade);
@@ -16061,12 +16099,17 @@ int BdTownReadPod(void* t, float* pos, int* hand, void** faction)
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 /* TownFoundPlayer(TownList*, const Vector3*): the new Town (0 = missing from the table, faulted or none) */
+int g_bdModFound = 0;   /* MAIN THREAD: > 0 while the mod's own founding runs (the founding hook does not take it for the engine's) */
 void* BdTownFoundPod(const float* pos)
 {
     void* tl = BdTownListPtr();
     if (tl == 0 || kBdTownFoundRva == 0) return 0;
-    __try { return ((BdTownFoundFn)(uintptr_t)AddrAbs(kBdTownFoundRva))(tl, pos); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    void* t = 0;
+    ++g_bdModFound;
+    __try { t = ((BdTownFoundFn)(uintptr_t)AddrAbs(kBdTownFoundRva))(tl, pos); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { t = 0; }
+    --g_bdModFound;
+    return t;
 }
 int BdTownSetNamePod(void* t, const std::string* s)
 {
@@ -16086,6 +16129,18 @@ int BdTownLevelPod(void* t)
     __try { v = *(const int*)((const char*)t + kTownLevel); }
     __except (EXCEPTION_EXECUTE_HANDLER) { v = 0; }
     return (v < 0 || v > townkeep::kLevelMax) ? 0 : v;
+}
+/* TEAMMAP: a town's "open to public" setting (Town+0x380 - the town panel's checkbox flips this byte, 0x721E50): 1 / 0, -1 unreadable */
+const size_t kTownPublic = 0x380;
+int BdTownPublicPod(void* t)
+{
+    __try { return *((const unsigned char*)t + kTownPublic) != 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int BdTownSetPublicPod(void* t, int pub)
+{
+    __try { *((unsigned char*)t + kTownPublic) = (unsigned char)(pub != 0 ? 1 : 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 void* TownOfBuilding(void* building);   /* spawn.cpp (namespace coop): the engine's BuildingGetTown, guarded, ANY THREAD */
 /* a building's town: the engine's own lookup (BuildingGetTown - the top parent's town, hand +0x1D0, else the nearest town by position;
@@ -17049,6 +17104,28 @@ void BdKeptTownHostNote(long row, const std::string& pieceKey)
    only; a piece standing inside a building keeps its host's town). 1 = linked, already in it (its own handle words are the town's),
    or stands inside a building (nothing to do); 0 = no piece or no town, or the write faulted */
 void* BdKeptTownFor(const keptwire::Row& w, ::Faction* fac) { return BdKeptTownForKey(w.p.key, fac); }
+/* town crash-safety: the town a piece rebuilt from this game's own record (pp.build) is made in - its outpost when the world server's list
+   names its key as one of this player's own (taken or founded, BdKeptTownForKey: *fromRow 1), else this player's own town nearest pos
+   within 5000 (BdOwnTownNear); 0 = neither. MAIN THREAD (the copy drain) */
+void* BdRestoreTownFor(const std::string& key, const float* pos, float* dist, int* fromRow)
+{
+    *dist = -1.0f; *fromRow = 0;
+    ::Faction* fac = LocalPlayerFaction();
+    if (fac == 0) return 0;
+    const int mySlot = KeptMySlot();
+    std::map<std::string, size_t>::const_iterator ki = BdTownKeyOf(key);
+    if (ki == g_townKeyIdx.end())
+    {   /* the SAY names a long key by its wire form ('#' + the record name's hash, poskey.h WireForm); pp.build may hold the plain text */
+        char wk[poskey::kKeyCap];
+        if (poskey::WireForm(key.c_str(), wk, (int)sizeof wk) == 2) ki = BdTownKeyOf(std::string(wk));
+    }
+    if (mySlot >= 0 && ki != g_townKeyIdx.end() && ki->second < g_townRows.size() && g_townRows[ki->second].owner == mySlot)
+    {
+        void* t = BdKeptTownForKey(ki->first, fac);
+        if (t != 0) { *fromRow = 1; *dist = BdTownDistXZ(t, pos); return t; }
+    }
+    return BdOwnTownNear(pos, buildnear::kTownKeepRange, dist);
+}
 int BdKeptTownLinkKey(long row, const std::string& pieceKey, void* b, void* town, ::Faction* fac, int madeHere)
 {
     if (b == 0 || town == 0) return 0;
@@ -17566,6 +17643,8 @@ int BdTownCopyLoadWatched()
 int BdTownCopyAt(const int* h, const float* lp) { return baseshow::CopyAt(g_townCopyList, h, lp); }
 /* SAY: this game's own outposts to the world server, each with the keys of its pieces (looked at every kTownLookMs; sent when changed,
    on a new slot, and every kTownSayAgainMs; split over several messages when it would pass one) */
+std::vector<baseshow::DupeMark>& BdDupeMarks();   /* below, with the founding hook: this world's duplicates, never said */
+extern long long g_dupeUnsaid;
 void BdTownsSayTick()
 {
     const DWORD now = ::GetTickCount();
@@ -17612,9 +17691,16 @@ void BdTownsSayTick()
             }
             continue;
         }
+        {   /* a duplicate this game founded inside a teammate's claim: never said - the founder's outpost is the one there (baseshow.h) */
+            std::vector<baseshow::DupeMark>& marks = BdDupeMarks();
+            const int at = baseshow::DupeMarkOf(marks, t.hand, (unsigned long long)(uintptr_t)towns[i]);
+            baseshow::DupeMarkLearn(&marks, at, t.hand);
+            if (baseshow::SayUnlessDupe(at >= 0 ? 1 : 0) == 0) { ++g_dupeUnsaid; continue; }
+        }
         if (rows.size() >= townkeep::kMaxTownsPerSlot) { whole = 0; continue; }
         t.name = townkeep::NameFit(BdTownName(towns[i]));
         t.level = BdTownLevelPod(towns[i]);   /* T-811: the size level - a teammate's game draws this outpost with the icon of it */
+        t.pub = BdTownPublicPod(towns[i]) == 1 ? 1 : 0;   /* TEAMMAP: its "open to public" setting, which a teammate's base of it takes */
         rows.push_back(t);
         rowTown.push_back(towns[i]);
     }
@@ -17683,6 +17769,7 @@ DWORD g_showInAt = 0;                         /* T-924: the tick the last SHOW c
 long long g_showFoundWait = 0;                /* T-924: rows whose founding waited for their SHOW KEYS */
 long long g_showIn = 0, g_showBad = 0, g_showFounded = 0, g_showTaken = 0, g_showRenamed = 0, g_showRemoved = 0, g_showLeft = 0, g_showFoundFail = 0;
 long long g_showNoFaction = 0, g_showSaveOut = 0, g_showSaveOffThread = 0;
+long long g_showPublicSet = 0;   /* TEAMMAP: open-to-public settings taken from the owners' rows */
 long long g_townKeepStore = 0;                       /* P47 store gate: take-outs refused while the town's model-piece store held pieces */
 std::vector<baseshow::StoreLogged> g_townKeepLogged;  /* the towns a store-gate refusal was logged for (this world) */
 const size_t kTownKeepLogCap = 256;
@@ -17879,11 +17966,77 @@ void BdTownWakeQueue(void* t)
     if (r == townwake::kPushQueued) ::InterlockedIncrement64(&g_twQueued);
     else if (r == townwake::kPushFull) ::InterlockedIncrement64(&g_twDropped);
 }
-/* TownFoundPlayer(TownList*, const Vector3*): called through; a new town is only queued - never woken inside the engine's founding */
+/* ---- DUPLICATE OUTPOSTS (src/common/baseshow.h, "DUPLICATE OUTPOSTS"). MAIN THREAD. The claim of a town is the engine's own near-town
+   test (buildnear.h InsideFirst, T-923): TownContainsPoint at buildnear::ScaleForKind of the town's kind (Town+0xD8), or the centre
+   within buildnear::kCentreRange. T-923's town pick covers a teammate's base that already STANDS here; this covers the seconds before
+   it does (the row held, its base not founded yet) and the race where both games said an outpost at one place. ---- */
+std::vector<baseshow::DupeMark> g_dupeMarks;   /* this player's outposts founded inside a teammate's claim, in this world: never said */
+long g_dupeWorldGen = -1;                      /* StoreWorldGenNow() g_dupeMarks belongs to */
+long long g_dupeMarked = 0, g_dupeUnmarked = 0, g_dupeUnsaid = 0, g_showHidden = 0;
+/* 1 = the spot is inside the town's area at the near-town rule's scale; 0 = not, unread, or no address row (TownContainsPoint, its own row) */
+int BdTownContainsPod(void* t, const float* pos)
+{
+    int kind = 0;
+    if (t == 0 || BdIntAt(t, kTownState, &kind) == 0) return 0;
+    return BdContainsRowPod(t, pos, buildnear::ScaleForKind(kind)) == 1 ? 1 : 0;
+}
+/* g_dupeMarks of this world (another world's are dropped) */
+std::vector<baseshow::DupeMark>& BdDupeMarks()
+{
+    const long gen = StoreWorldGenNow();
+    if (gen != g_dupeWorldGen) { g_dupeWorldGen = gen; g_dupeMarks.clear(); }
+    return g_dupeMarks;
+}
+/* the town standing here for a held row: the tracked base of its owner at its centre (0 = none) */
+void* BdShowTownForRow(const baseshow::ShowRow& row)
+{
+    for (size_t s = 0; s < g_shown.size(); ++s)
+        if (g_shown[s].owner == row.owner && keptwire::NearXZ(g_shown[s].pos[0], g_shown[s].pos[2], row.pos[0], row.pos[2], baseshow::kSameBaseRadius) != 0)
+            return BdShowTownByHand(g_shown[s].hand);
+    return 0;
+}
+/* the held SHOW row of a teammate whose outpost claims the spot - its base shown here or not yet (-1 = none) */
+int BdMateClaimRow(const float* pos)
+{
+    const int me = KeptMySlot();
+    if (me < 0 || g_showRows.empty()) return -1;
+    std::vector<baseshow::ClaimTown> c(g_showRows.size());
+    for (size_t r = 0; r < g_showRows.size(); ++r)
+    {
+        const baseshow::ShowRow& row = g_showRows[r];
+        c[r].skip = (row.owner == me || !TeamSameAnyThread(me, row.owner)) ? 1 : 0;
+        c[r].dx = pos[0] - row.pos[0];
+        c[r].dz = pos[2] - row.pos[2];
+        c[r].contains = (c[r].skip == 0) ? BdTownContainsPod(BdShowTownForRow(row), pos) : 0;
+    }
+    if (baseshow::FoundInMateClaim(0, &c[0], (int)c.size()) == 0) return -1;
+    return baseshow::ClaimPick(&c[0], (int)c.size());
+}
+/* TownFoundPlayer(TownList*, const Vector3*): called through; a new town is only queued - never woken inside the engine's founding.
+   The engine's own founding (not the mod's) at a spot a teammate's outpost claims marks the new town as a duplicate: never said to the
+   world server (BdTownsSayTick), so the founder's outpost stays the only one there on every other game; the teammate's base is shown at
+   the next drain. */
 void* detour_townFound(void* list, const float* pos)
 {
+    const int engineOnMain = (pos != 0 && BdOnMain() != 0 && g_bdModFound == 0 && g_bdSelf == 0) ? 1 : 0;
+    const int mate = engineOnMain != 0 ? BdMateClaimRow(pos) : -1;   /* before the founding: the held rows as they are */
     void* t = orig_townFound(list, pos);
     if (t != 0) BdTownWakeQueue(t);
+    if (t != 0 && engineOnMain != 0) g_showDirty = 1;   /* a new own outpost: the teammates' rows over it looked at again (HiddenOverOwn) */
+    if (t != 0 && mate >= 0 && (size_t)mate < g_showRows.size())
+    {
+        int h[5] = { 0, 0, 0, 0, 0 };
+        if (BdTownHandPod(t, h) == 0) std::memset(h, 0, sizeof h);
+        const int added = baseshow::DupeMarkAdd(&BdDupeMarks(), h, (unsigned long long)(uintptr_t)t, baseshow::kDupeMarkCap);
+        if (added != 0) ++g_dupeMarked; else ++g_dupeUnmarked;
+        const baseshow::ShowRow& row = g_showRows[(size_t)mate];
+        char line[400];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[SHOW] an outpost this game founded at (%.1f, %.1f) lies in the claim of slot %d's outpost '%.80s' at (%.1f, %.1f)%s;"
+                    " dupeMarked=%lld dupeUnmarked=%lld", pos[0], pos[2], row.owner, row.name.c_str(), row.pos[0], row.pos[2],
+                    added != 0 ? " - kept on this game only, never said to the world server" : " - NOT marked (list full or no handle): said as before",
+                    g_dupeMarked, g_dupeUnmarked);
+        if (added != 0) DebugLog(line); else ErrorLog(line);
+    }
     return t;
 }
 /* InstallBuild: the founding hook (the TownFoundPlayer row: Steam_1.0.65 0x933F40, 1.0.68 0x934E10) */
@@ -19028,6 +19181,7 @@ typedef void* (*BdTmRegionFn)(void* mgr, const float* pos);
 typedef void  (*BdTmAddAreaFn)(void* town, void* area);
 const size_t kTownRegionWord = 0x1A0;                  /* Town: the setup's third write */
 const size_t kZoneArray = 0xC8, kZoneSize = 0x168;    /* ZoneManager: the 64 x 64 zones (0xA07C10) */
+long long g_tmMovedFar = 0;   /* T-924 SAME HANDLE: moves over townmove::kMaxGap (the owner's handle unchanged) */
 long long g_tmMoved = 0, g_tmSame = 0, g_tmTooFar = 0, g_tmGuarded = 0, g_tmBlocked = 0, g_tmFaulted = 0, g_tmLines = 0, g_tmSuppressed = 0;
 long long g_tmRefounded = 0, g_tmOffMap = 0;   /* T-924 fold 1: copies retired and founded again at the sent centre; fold 2: moves REFUSED, the sent centre off the map (nothing written) */
 long long g_tmRefoundOffMap = 0, g_tmRefoundWaiting = 0, g_tmRefoundFoundFail = 0, g_tmRefoundRepeat = 0;   /* T-924: refounds refused off the map; applies a refound waited (unread, its copies being put back, its take-out refused); old copies taken out and the new one not founded; refounds refused as repeats */
@@ -19147,7 +19301,9 @@ void BdTmLine(int err, const char* line)
    faulted). T-924 FOLD 1: townmove::kRefound - a gap over kMaxGap, guard passed, rows in - is NOT acted on here: BdShowApply retires
    the copy and founds a new one at the sent centre (and says it). T-924 FOLD 2 (townmove::Refusal): an off-map sent centre is refused
    (kOffMap) and a base refounded once this world - baseKey, BdTmBaseKey - is not refounded again (kRepeat). MAIN THREAD */
-int BdShowMoveCopy(void* t, int step, int ours, const baseshow::ShowRow& row, ::Faction* fac, const std::string& baseKey)
+/* sameHand: 1 = the owner's town handle is the one this base was matched by at the last apply (townmove::DecideHand: a gap over
+   kMaxGap is then the same outpost re-centred - a move, never a re-found) */
+int BdShowMoveCopy(void* t, int step, int ours, const baseshow::ShowRow& row, ::Faction* fac, const std::string& baseKey, int sameHand)
 {
     if (t == 0 || townmove::Decide(step, ours, 0.0f, 0.0f, 0, 0) == townmove::kNotOurs) return townmove::kNotOurs;
     const long gen = StoreWorldGenNow();
@@ -19163,15 +19319,15 @@ int BdShowMoveCopy(void* t, int step, int ours, const baseshow::ShowRow& row, ::
     }
     const std::string hand = zonekeep::TownHandText(h);
     const float dx = row.pos[0] - lp[0], dz = row.pos[2] - lp[2];
-    const int refound0 = townmove::Decide(step, ours, dx, dz, 0, 0) == townmove::kRefound ? 1 : 0;   /* fold 1: its rows are the found's and the take-out's */
+    const int refound0 = townmove::DecideHand(step, ours, dx, dz, 0, 0, sameHand) == townmove::kRefound ? 1 : 0;   /* fold 1: its rows are the found's and the take-out's */
     const int rowsOk = refound0 != 0 ? BdTownRefoundRowsOk() : BdTownMoveRowsOk();
     const int blocked = (EngineWritesBlocked() || BdOnMain() == 0 || rowsOk == 0) ? 1 : 0;
-    int kind = townmove::Decide(step, ours, dx, dz, 0, blocked);
+    int kind = townmove::DecideHand(step, ours, dx, dz, 0, blocked, sameHand);
     kind = townmove::Refusal(kind, row.pos[0], row.pos[2], g_tmRefoundDone.count(baseKey) != 0 ? 1 : 0);   /* T-924 fold 2: off the map, or a repeat refound - refused before the guard and any write */
     if (kind == townmove::kMove || kind == townmove::kRefound)
     {   /* the guard, for a move and a new copy alike: never into another town's radius (the copy itself left out) */
         const int g = BdTownMoveGuardPod(t, tf, (void*)fac, (void*)LocalPlayerFaction(), row.pos[0], row.pos[2]);
-        kind = townmove::Decide(step, ours, dx, dz, g != 0 ? 1 : 0, blocked);
+        kind = townmove::DecideHand(step, ours, dx, dz, g != 0 ? 1 : 0, blocked, sameHand);
     }
     const float d = townmove::GapXZ(dx, dz);
     if (kind == townmove::kSame) { ++g_tmSame; return kind; }
@@ -19199,7 +19355,7 @@ int BdShowMoveCopy(void* t, int step, int ours, const baseshow::ShowRow& row, ::
                         hand.c_str(), row.owner, lp[0], lp[2], row.pos[0], row.pos[2], d, g_tmTooFar);
         else
             _snprintf_s(line, sizeof(line), _TRUNCATE, "[SHOW] T-924 copy %s of slot %d not %s (guarded): another town of its faction or this player's holds the sent centre (%.1f,%.1f) inside its radius (or the town list did not read); d=%.1f t924moveGuarded=%lld",
-                        hand.c_str(), row.owner, d > townmove::kMaxGap ? "re-founded" : "moved", row.pos[0], row.pos[2], d, g_tmGuarded);
+                        hand.c_str(), row.owner, refound0 != 0 ? "re-founded" : "moved", row.pos[0], row.pos[2], d, g_tmGuarded);
         BdTmLine(0, line);
         return kind;
     }
@@ -19216,13 +19372,15 @@ int BdShowMoveCopy(void* t, int step, int ours, const baseshow::ShowRow& row, ::
         return -1;
     }
     ++g_tmMoved;
+    if (townmove::GapXZ(dx, dz) > townmove::kMaxGap) ++g_tmMovedFar;   /* T-924 SAME HANDLE: the same outpost re-centred far - moved, not re-founded */
     /* fold 2: an off-map centre never reaches here (townmove::Refusal; BdTownMovePod refuses it before any write) */
     g_showLinkDue = 1;   /* owner 936: the copies' links to the shown towns looked at the next drain (the handle is unchanged) */
     float np[3] = { row.pos[0], row.pos[1], row.pos[2] }; int nh[5]; void* nf = 0;
     BdTownReadPod(t, np, nh, &nf);
-    _snprintf_s(line, sizeof(line), _TRUNCATE, "[SHOW] T-924 copy %s of slot %d moved (%.1f,%.1f)->(%.1f,%.1f) d=%.1f area %s; height %.1f; t924moveMoved=%lld",
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[SHOW] T-924 copy %s of slot %d moved (%.1f,%.1f)->(%.1f,%.1f) d=%.1f area %s; height %.1f; %st924moveMoved=%lld movedFar=%lld",
                 hand.c_str(), row.owner, lp[0], lp[2], np[0], np[2], d, areaChanged == 1 ? "changed" : areaChanged == 2 ? "changed (its add FAULTED)"
-                : areaChanged == 3 ? "not added (the centre is off the map)" : "same", np[1], g_tmMoved);
+                : areaChanged == 3 ? "not added (the centre is off the map)" : "same", np[1],
+                d > townmove::kMaxGap ? "the owner's handle unchanged: its outpost re-centred, not founded again; " : "", g_tmMoved, g_tmMovedFar);
     BdTmLine(areaChanged == 2 ? 1 : 0, line);
     return kind;
 }
@@ -19297,10 +19455,48 @@ void BdShowApply()
         }
         for (size_t m = 0; m < marked.size(); ++m) if (BdTownCopyNote(marked[m], 0) != 0) copyChanged = 1;
     }
+    /* DUPLICATE OUTPOSTS (baseshow.h HiddenOverOwn): a teammate's row whose centre lies in the claim of this player's own outpost (not a
+       duplicate this game marked) is not shown here - a base shown for it is taken out below as one whose row went */
+    std::vector<int> hidden(g_showRows.size(), 0);
+    long long hiddenNow = 0;
+    {
+        ::Faction* mine = LocalPlayerFaction();
+        std::vector<baseshow::DupeMark>& marks = BdDupeMarks();
+        void* own[kTownWalkCap]; float op[kTownWalkCap][3]; int dupe[kTownWalkCap];
+        void* pt[kTownWalkCap];
+        const int pn = BdPlayerTownsPod(pt, kTownWalkCap);
+        int on = 0;
+        for (int i = 0; i < pn; ++i)
+        {
+            int h[5]; void* f = 0;
+            if (BdTownReadPod(pt[i], op[on], h, &f) == 0 || f != (void*)mine) continue;
+            own[on] = pt[i];
+            dupe[on] = baseshow::DupeMarkOf(marks, h, (unsigned long long)(uintptr_t)pt[i]) >= 0 ? 1 : 0;
+            ++on;
+        }
+        std::vector<baseshow::ClaimTown> c((size_t)(on > 0 ? on : 1));
+        for (size_t r = 0; r < g_showRows.size() && on > 0; ++r)
+        {
+            const baseshow::ShowRow& row = g_showRows[r];
+            if (row.owner == mySlot) continue;
+            for (int i = 0; i < on; ++i)
+            {
+                c[(size_t)i].skip = dupe[i];
+                c[(size_t)i].dx = row.pos[0] - op[i][0];
+                c[(size_t)i].dz = row.pos[2] - op[i][2];
+                c[(size_t)i].contains = dupe[i] == 0 ? BdTownContainsPod(own[i], row.pos) : 0;
+            }
+            hidden[r] = baseshow::HiddenOverOwn(&c[0], on);
+            if (hidden[r] != 0) ++hiddenNow;
+        }
+    }
+    const std::vector<baseshow::ShowRow> rows = baseshow::RowsShown(g_showRows, hidden);
+    const long long hidden0 = g_showHidden;
+    g_showHidden = hiddenNow;
     std::vector<int> rowTo;
     std::vector<size_t> gone;
     baseshow::ApplyPlan plan;   /* T-924: the owner's handle, a shared key, then distance; founding and take-outs wait for the SHOW KEYS */
-    baseshow::PlanApply(g_shown, g_showRows, g_showKeyRows, g_showKeysSinceShow, (unsigned long)(now - g_showInAt), &plan);
+    baseshow::PlanApply(g_shown, rows, g_showKeyRows, g_showKeysSinceShow, (unsigned long)(now - g_showInAt), &plan);   /* DUPLICATE OUTPOSTS: the rows less the hidden ones */
     rowTo.swap(plan.rowTo);
     gone.swap(plan.gone);
     std::vector<baseshow::Shown> next;
@@ -19321,9 +19517,9 @@ void BdShowApply()
     }
     void* towns[kTownWalkCap];
     const int n = BdPlayerTownsPod(towns, kTownWalkCap);   /* read after the take-outs: no town taken out above is in it */
-    for (size_t r = 0; r < g_showRows.size(); ++r)
+    for (size_t r = 0; r < rows.size(); ++r)
     {
-        const baseshow::ShowRow& row = g_showRows[r];
+        const baseshow::ShowRow& row = rows[r];
         if (row.owner == mySlot) continue;
         ::Faction* fac = OwnerFactionForSlot(row.owner, true);
         if (fac == 0)
@@ -19336,6 +19532,8 @@ void BdShowApply()
         if (rowTo[r] >= 0) s = g_shown[(size_t)rowTo[r]];
         const std::string prevKey = rowTo[r] >= 0 ? BdTmBaseKey(s.owner, s.ownerHand, s.pos) : std::string();   /* T-924: its base's key at the last apply */
         s.going = 0;
+        int prevOwnerHand[5];   /* T-924 SAME HANDLE: the owner's handle this base was matched by before (all 0: not known) */
+        for (int j = 0; j < 5; ++j) prevOwnerHand[j] = rowTo[r] >= 0 ? s.ownerHand[j] : 0;
         const int kr = baseshow::KeyRowOfRow(row, g_showKeyRows);   /* T-924: the row's identity (the owner's town handle, its keys) */
         if (kr >= 0) baseshow::ShownIdentity(&s, g_showKeyRows[(size_t)kr]);
         s.owner = row.owner;
@@ -19384,7 +19582,7 @@ void BdShowApply()
         /* T-924 fault 2: a copy whose owner's town moved is moved to the sent centre (read below) */
         const std::string baseKey = BdTmBaseKey(row.owner, s.ownerHand, row.pos);   /* T-924: the refound's once-per-world and pending records */
         if (!prevKey.empty() && prevKey != baseKey) g_tmRefoundPending.erase(prevKey);   /* the owner's handle or the centre changed: the old key's wait dropped */
-        const int moveKind = BdShowMoveCopy(t, step, s.ours, row, fac, baseKey);
+        const int moveKind = BdShowMoveCopy(t, step, s.ours, row, fac, baseKey, townmove::SameHand(prevOwnerHand, s.ownerHand));
         if (townmove::PendingDrop(moveKind) != 0) g_tmRefoundPending.erase(baseKey);   /* founded by another road, at the sent centre, or refused: no re-found waits */
         if (moveKind == townmove::kRefound)
         {   /* T-924 (05-findings "T1453 CAUSES"): the owner founded its outpost again over townmove::kMaxGap away (a new town
@@ -19497,6 +19695,14 @@ void BdShowApply()
         if (player.empty()) { char pn[40]; _snprintf_s(pn, sizeof(pn), _TRUNCATE, "Player %d", row.owner); player = pn; }
         const std::string label = baseshow::Label(row.name, player);
         if (BdTownName(t) != label && BdTownSetNamePod(t, &label) != 0) ++g_showRenamed;
+        /* TEAMMAP: the owner's "open to public" setting (protocol 109) - the base shown here takes it, as its owner set it */
+        const int pubNow = BdTownPublicPod(t);
+        if (pubNow >= 0 && pubNow != row.pub && BdTownSetPublicPod(t, row.pub) != 0 && ++g_showPublicSet <= 20)
+        {
+            char pl[240];
+            _snprintf_s(pl, sizeof(pl), _TRUNCATE, "[SHOW] teammate slot %d's outpost '%.80s' open to public %s as its owner set it", row.owner, row.name.c_str(), row.pub != 0 ? "ON" : "OFF");
+            DebugLog(std::string(pl));
+        }
         if (s.ours != 0 && tRead != 0)
         {   /* T-924: this game's copy on the copy list (founded, taken up, or its identity learnt) */
             baseshow::CopyRow c;
@@ -19521,14 +19727,16 @@ void BdShowApply()
     /* P47 review: a base kept by the store gate is retried every kShowRetryMs - the line only when this apply changed something */
     static int s_lastWaiting = -1; static size_t s_lastRows = (size_t)-1, s_lastShown = (size_t)-1;
     const bool quiet = g_showTakenUp == up0 && g_showFounded == founded0 && g_showTaken == taken0 && g_showRenamed == renamed0 && g_showRemoved == removed0
-                       && waiting == s_lastWaiting && g_showRows.size() == s_lastRows && g_shown.size() == s_lastShown && removeOk;
+                       && waiting == s_lastWaiting && g_showRows.size() == s_lastRows && g_shown.size() == s_lastShown && removeOk
+                       && g_showHidden == hidden0;
     s_lastWaiting = waiting; s_lastRows = g_showRows.size(); s_lastShown = g_shown.size();
     if (quiet) return;
-    char line[460];
+    char line[700];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[SHOW] applied %u row(s)%s: %u base(s) tracked, taken up +%lld founded +%lld taken +%lld named +%lld taken out +%lld, %d waiting;"
-                " founded=%lld taken=%lld takenOut=%lld left=%lld foundFail=%lld noFaction=%lld townKeepStore=%lld", (unsigned)g_showRows.size(), removeOk ? "" : " (list cut: none taken out)",
+                " founded=%lld taken=%lld takenOut=%lld left=%lld foundFail=%lld noFaction=%lld townKeepStore=%lld; %lld row(s) over this player's own outpost not shown,"
+                " dupeMarked=%lld dupeUnsaid=%lld", (unsigned)g_showRows.size(), removeOk ? "" : " (list cut: none taken out)",
                 (unsigned)g_shown.size(), g_showTakenUp - up0, g_showFounded - founded0, g_showTaken - taken0, g_showRenamed - renamed0, g_showRemoved - removed0, waiting,
-                g_showFounded, g_showTaken, g_showRemoved, g_showLeft, g_showFoundFail, g_showNoFaction, g_townKeepStore);
+                g_showFounded, g_showTaken, g_showRemoved, g_showLeft, g_showFoundFail, g_showNoFaction, g_townKeepStore, g_showHidden, g_dupeMarked, g_dupeUnsaid);
     DebugLog(line);
 }
 /* the map hooks (owner 874 a; installed in InstallBuild): a town this game shows for a teammate - found by its handle words among the
@@ -19583,6 +19791,433 @@ unsigned detour_townMapLayer(void* town)
 {
     if (BdOnMain() != 0 && BdShowLevelOf(town) >= 0) return baseshow::kOutpostMapLayer;
     return orig_townMapLayer(town);
+}
+// ------------------------------------------------------------------------------------------------------------------
+/* ---- TEAMMAP: THE TEAM-BASES PR ON TOP OF T-811 AND T-923 (src/common/teammap.h). MAIN THREAD unless a hook says
+   otherwise. No player slot is special (a dedicated server has no host game).
+   Building at a teammate's outpost (no "too close" refusal, the piece joining that town, no "Your Outpost" founded inside it, a copy
+   made in the town it was placed in) is T-923's (policy.cpp PreviewTownOwnerTest / PlacementGroupTownTest, BdTownPickRedirect, the
+   hand-over); the PR's own claim-zone hooks were dropped for it.
+   T-811 shows each teammate's outpost here as a town of the teammate's stand-in faction (BdShowApply) with the engine's growing outpost
+   icon (detour_townMapIcon). On top of it:
+   - THE MARKER COLOUR: the engine's colour pick (MapMarkerColour) answers MarkerPlayer - this player's own colour - for a base this game
+     shows for a teammate; the engine gives a town of a faction with no PlayerInterface (+0x250) the ally, neutral or enemy colour.
+   - RESEARCH AT A TEAMMATE'S BENCH (ResearchBenchWork, after the engine's own tick): the engine counts nothing at a bench whose faction
+     has no PlayerInterface. Work at a bench whose town (else the bench) belongs to a teammate (teammap.h BenchRoute) - the bench's rate
+     vt+0x3C0 x its efficiency vt+0x368 x the work - is gathered and sent once a second to THAT teammate's research (teamwire.h WORK); its
+     game adds it (Research::addProgress). A bench of this player's own feeds this player, as vanilla. A teammate's bench is also this
+     player's own for Research's bench data (policy.cpp, ResearchBenchDataRet). Only the WORKER's own game counts a tick (teammap.h
+     BenchTickFor, the copy rule): the copies other games run of that worker gather nothing and, at their own player's bench, are not
+     counted by that engine either.
+   - WORKERS FOLLOW THE RESEARCH THEY FEED (ResearchBenchIdle, vt+0x4E8): a bench routed to a teammate answers that teammate's research
+     state (WORK STATE - every game in a team says its own once a second while it runs and every kWorkStateAgainMs while idle).
+   - A TEAMMATE'S TOWN PANEL (TownPanelUpdate): a panel of a teammate's town shows that teammate's research (WORK STATE's tech and
+     progress) instead of this player's own. The town's "open to public" setting rides with each said outpost (townkeep.h kLevelPublic;
+     BdShowApply). */
+static unsigned long long kBdResWorkRva = 0;      static AddrReg kBdResWorkRva_reg("ResearchBenchWork", &kBdResWorkRva, kAddrUseOptional);                 /* 1.0.68 0x29B8D0 (1.0.65 0x29B890): ResearchBuilding vt+0x4B0 */
+static unsigned long long kBdResAddRva = 0;       static AddrReg kBdResAddRva_reg("ResearchAddProgress", &kBdResAddRva, kAddrUseOptional);                 /* 1.0.68 0x836B70 (1.0.65 0x835CA0): Research::addProgress */
+static unsigned long long kBdResProgRva = 0;      static AddrReg kBdResProgRva_reg("ResearchCurrentProgress", &kBdResProgRva, kAddrUseOptional);           /* 1.0.68 0x82F090 (1.0.65 0x82E1C0): the current tech's progress 0..1 */
+static unsigned long long kBdBenchIdleRva = 0;    static AddrReg kBdBenchIdleRva_reg("ResearchBenchIdle", &kBdBenchIdleRva, kAddrUseOptional);             /* 1.0.68 0x2995E0 (1.0.65 0x2995A0): ResearchBuilding vt+0x4E8 */
+static unsigned long long kBdTownPanelRva = 0;    static AddrReg kBdTownPanelRva_reg("TownPanelUpdate", &kBdTownPanelRva, kAddrUseOptional);               /* 1.0.68 0x727380 (1.0.65 0x726850): the town panel's update */
+typedef void (*BdResWorkFn)(void* bench, void* worker, float work);
+typedef void (*BdResAddFn)(void* research, float amount);
+typedef float (*BdResProgFn)(void* research, int index);
+typedef bool (*BdBenchIdleFn)(void* bench);
+typedef void (*BdTownPanelFn)(void* panel);
+typedef float (*BdBenchFloatFn)(void* bench);
+typedef int (*BdBenchIntFn)(void* bench);
+BdMapMarkerColourFn orig_mapMarkerColour = 0;
+BdResWorkFn orig_resWork = 0;
+BdBenchIdleFn orig_benchIdle = 0;
+BdTownPanelFn orig_townPanel = 0;
+int g_hkTmColour = -2, g_hkTmResWork = -2, g_hkTmBenchIdle = -2, g_hkTmPanel = -2;
+int g_tmMates = 0;            /* this player's teammates (0 = in no team) */
+DWORD g_tmLookAt = 0;
+long long g_tmColoured = 0;
+long long g_tmResFaults = 0, g_tmWorkSends = 0, g_tmWorkSendFails = 0, g_tmWorkArrived = 0, g_tmWorkFaults = 0, g_tmPanelShown = 0, g_tmPanelFaults = 0;
+std::map<int, float> g_tmWorkOwed;   /* research work gathered at each teammate's benches (by slot), not sent yet */
+DWORD g_tmWorkSentAt = 0;
+struct TmResearch { int idle; std::string tech; float frac; TmResearch() : idle(0), frac(0.0f) {} };
+std::map<int, TmResearch> g_tmMateResearch;   /* each teammate's research as its game last said it (WORK STATE), by slot */
+int g_tmIdleSent = -1;        /* this player's idle state last said (-1 = none) */
+DWORD g_tmIdleSentAt = 0, g_tmTechReadAt = 0;
+std::string g_tmTechNow;      /* this player's queue's front tech, read at most every kTmTechReadMs */
+const DWORD kTmTechReadMs = 5000;
+/* a faction is a teammate's (a stand-in or a save's coop-p<n> faction of a player in this player's team). ANY THREAD */
+bool BdTmMate(void* f) { return f != 0 && PolicyTeammateFaction(f); }
+/* the player slot a faction is (this player's own, a stand-in, a save's coop-p<n>); -1 = not a player's */
+int BdTmSlotOf(void* f)
+{
+    if (f == 0) return -1;
+    if (f == (void*)LocalPlayerFaction()) return KeptMySlot();
+    int s = StandInSlotOf((::Faction*)f);
+    if (s < 0) s = StandInRecordSlot((::Faction*)f);
+    return s >= 0 ? s : -1;
+}
+/* this player's research (PlayerInterface+0x38), 0 = none or unread */
+void* BdTmResearchPod()
+{
+    if (kBdPlayerIfaceRva == 0) return 0;
+    __try
+    {
+        void* pi = *(void**)(uintptr_t)AddrAbs(kBdPlayerIfaceRva);
+        return pi != 0 ? *(void**)((char*)pi + 0x38) : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* the engine's own amount for a bench's work tick (rate x efficiency x work), as its research event; 1 = read, 0 = the bench does not
+   count (+0x160, the engine's own first test in the tick), -1 = faulted */
+int BdTmBenchAmountPod(void* bench, float work, float* amount)
+{
+    __try
+    {
+        if (*((const unsigned char*)bench + 0x160) == 0) return 0;
+        void** vt = *(void***)bench;
+        *amount = ((BdBenchFloatFn)vt[0x3C0 / 8])(bench) * ((BdBenchFloatFn)vt[0x368 / 8])(bench) * work;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* Research::addProgress on this player's research; 1 = added, 0 = no research, -1 = faulted */
+int BdTmResearchAddPod(float amount)
+{
+    void* research = BdTmResearchPod();
+    if (research == 0 || kBdResAddRva == 0) return 0;
+    __try
+    {
+        if (amount > 0.0f) ((BdResAddFn)(uintptr_t)AddrAbs(kBdResAddRva))(research, amount);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* this game's research: 1 = nothing queued (the engine's own test, vt+0x4E8: Research+0x58), 0 = running, -1 = unread */
+int BdTmLocalIdlePod()
+{
+    void* research = BdTmResearchPod();
+    if (research == 0) return -1;
+    __try { return *(void**)((char*)research + 0x58) == 0 ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the current tech's progress 0..1; 1 = read */
+int BdTmProgressPod(float* frac)
+{
+    void* research = BdTmResearchPod();
+    if (research == 0 || kBdResProgRva == 0) return 0;
+    __try { *frac = ((BdResProgFn)(uintptr_t)AddrAbs(kBdResProgRva))(research, 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* ---- the bench hooks' ANY-THREAD half (teammap.h "RESEARCH WORK OFF THE MAIN THREAD"): the work tick and the idle test run on the AI
+   worker thread. They read only these cells, pointer compares, guarded engine reads (TownOfBuilding, the owner call, the record id)
+   and the bench's own rate / efficiency calls the engine's tick makes on that thread; no lock, no allocation, no log line - the
+   main thread (BdTeamMapTick) takes the gathered work, sends it and writes the summary line. */
+volatile LONG g_tmMatesAny = 0;                         /* g_tmMates for any thread */
+void* volatile g_tmMyFacAny = 0;                         /* this player's faction (LocalPlayerFaction), written by the main look */
+volatile LONG g_tmMySlotAny = -1;                        /* KeptMySlot(), written by the main look */
+volatile LONG g_tmOwedBits[teammap::kCellSlots];        /* the work gathered for each teammate slot (a float's bits; 0 = none) */
+volatile LONG g_tmMateCell[teammap::kCellSlots];        /* each teammate's research state (teammap::kMate*), written by the main thread */
+volatile LONG64 g_tmTickWhy[teammap::kWhyN];             /* work ticks by BenchRouteWhy */
+volatile LONG64 g_tmTickGathered = 0, g_tmTickNoCount = 0, g_tmTickFaults = 0, g_tmIdleAsked = 0, g_tmIdleFollowed = 0;
+volatile LONG64 g_tmTickCopy = 0, g_tmTickCopySkipped = 0;   /* teammap.h BenchTickFor: copies' ticks run for the engine only / not run here */
+volatile LONG g_tmLastTo = -1;                           /* the slot the last gathered tick was for */
+/* the player slot a faction is, for any thread: this player's own (the main look's copy), a stand-in, a save's coop-p<n>; -1 = none */
+int BdTmSlotOfAny(void* f)
+{
+    if (f == 0) return -1;
+    if (f == g_tmMyFacAny) return (int)::InterlockedCompareExchange(&g_tmMySlotAny, 0, 0);
+    int s = StandInSlotOf((::Faction*)f);
+    if (s < 0) s = StandInRecordSlot((::Faction*)f);
+    return s >= 0 ? s : -1;
+}
+/* the teammate slot a bench's work feeds (teammap.h BenchRoute: its town's owner first, else the bench's); kBenchEngine = the engine's.
+   *why = teammap::BenchRouteWhy. ANY THREAD */
+int BdTmBenchRoute(void* bench, int* why)
+{
+    void* const town = TownOfBuilding(bench);
+    void* const tf = town != 0 ? BdOwnerPod(town) : 0;
+    void* const bf = BdOwnerPod(bench);
+    const int ts = BdTmSlotOfAny(tf), tm = BdTmMate(tf) ? 1 : 0, bs = BdTmSlotOfAny(bf), bm = BdTmMate(bf) ? 1 : 0;
+    const int me = (int)::InterlockedCompareExchange(&g_tmMySlotAny, 0, 0);
+    if (why != 0) *why = teammap::BenchRouteWhy(ts, tm, bs, bm, me);
+    return teammap::BenchRoute(ts, tm, bs, bm, me);
+}
+/* one tick's work added to slot's cell (a compare-exchange loop on the float's bits). ANY THREAD */
+void BdTmOwedAdd(int slot, float amount)
+{
+    if (teammap::CellSlotOk(slot) == 0) return;
+    volatile LONG* const c = &g_tmOwedBits[slot];
+    for (int i = 0; i < 64; ++i)
+    {
+        const LONG was = ::InterlockedCompareExchange(c, 0, 0);
+        float f = 0.0f; std::memcpy(&f, &was, 4);
+        const float now = teammap::OwedAdd(f, amount);
+        LONG nb = 0; std::memcpy(&nb, &now, 4);
+        if (::InterlockedCompareExchange(c, nb, was) == was) return;
+    }
+}
+/* slot's gathered work taken (the cell left at 0). MAIN THREAD */
+float BdTmOwedTake(int slot)
+{
+    if (teammap::CellSlotOk(slot) == 0) return 0.0f;
+    const LONG b = ::InterlockedExchange(&g_tmOwedBits[slot], 0);
+    float f = 0.0f; std::memcpy(&f, &b, 4);
+    return teammap::OwedAdd(0.0f, f);   /* a cell that is not a positive number in range gives 0 */
+}
+/* the marker colour: MarkerPlayer for a base shown for a teammate (the map refresh runs it on the main thread) */
+const float* detour_mapMarkerColour(void* obj)
+{
+    const float* c = orig_mapMarkerColour(obj);
+    if (obj == 0 || g_shown.empty() || kBdMapMarkerSlotsRva == 0 || BdOnMain() == 0 || BdShowIndexOf(obj) < 0) return c;
+    ++g_tmColoured;
+    return (const float*)(uintptr_t)(AddrAbs(kBdMapMarkerSlotsRva) + (unsigned long long)teammap::kMarkerOwn * baseshow::kMarkerColourBytes);
+}
+/* the bench's work tick - ON THE AI WORKER THREAD (the worker's task; never the main thread): the work at a bench routed to a teammate
+   gathered into that slot's cell (BdTeamMapTick sends it). Only this game's OWN workers count here (teammap.h BenchTickFor): a copy of
+   another game's character gathers nothing, and a teammate's copy at this player's own bench does not run the engine's tick - its own
+   game sends that work - so no tick is counted on two games */
+void detour_resWork(void* bench, void* worker, float work)
+{
+    if (::InterlockedCompareExchange(&g_tmMatesAny, 0, 0) == 0 || bench == 0) { orig_resWork(bench, worker, work); return; }
+    int why = teammap::kWhyNobody;
+    const int to = BdTmBenchRoute(bench, &why);
+    /* the copy rule (teammap.h BenchTickFor): only the worker's own game counts its work - the same any-thread copy test as production's */
+    const unsigned int wUid = worker != 0 ? FindSpawnedUid(worker) : 0;
+    const int wCopy = wUid != 0 ? coopfarm::WorkerIsCopy(wUid, net::IsUidMineAnyThread(wUid) ? 1 : 0, net::OwnedMirrorExactAnyThread() ? 1 : 0) : 0;
+    const int tick = teammap::BenchTickFor(wCopy, (wCopy != 0 && BdTmMate(BdOwnerPod(worker))) ? 1 : 0, why == teammap::kWhyOwn ? 1 : 0);
+    if (tick == teammap::kTickSkip) { ::InterlockedIncrement64(&g_tmTickCopySkipped); return; }   /* its own game sends this work to this player */
+    orig_resWork(bench, worker, work);
+    if (tick != teammap::kTickRun) { ::InterlockedIncrement64(&g_tmTickCopy); return; }   /* a copy: its own game counts or sends its work */
+    if (why >= 0 && why < teammap::kWhyN) ::InterlockedIncrement64(&g_tmTickWhy[why]);
+    if (to == teammap::kBenchEngine) return;
+    float amount = 0.0f;
+    const int r = BdTmBenchAmountPod(bench, work, &amount);
+    if (r == -1) { ::InterlockedIncrement64(&g_tmTickFaults); return; }
+    if (r != 1 || !(amount > 0.0f) || teammap::CellSlotOk(to) == 0) { ::InterlockedIncrement64(&g_tmTickNoCount); return; }
+    BdTmOwedAdd(to, amount);
+    ::InterlockedExchange(&g_tmLastTo, (LONG)to);
+    ::InterlockedIncrement64(&g_tmTickGathered);
+}
+/* the bench's "nothing to research" test - ON THE AI WORKER THREAD too: a bench routed to a teammate answers that teammate's research
+   as its game last said it (its cell) */
+bool detour_benchIdle(void* bench)
+{
+    const bool r = orig_benchIdle(bench);
+    if (::InterlockedCompareExchange(&g_tmMatesAny, 0, 0) == 0 || bench == 0) return r;
+    const int to = BdTmBenchRoute(bench, 0);
+    if (to == teammap::kBenchEngine || teammap::CellSlotOk(to) == 0) return r;
+    ::InterlockedIncrement64(&g_tmIdleAsked);
+    const int cell = (int)::InterlockedCompareExchange(&g_tmMateCell[to], 0, 0);
+    const int a = teammap::BenchIdleFromCell(r ? 1 : 0, to, cell);
+    if (a != (r ? 1 : 0)) ::InterlockedIncrement64(&g_tmIdleFollowed);
+    return a != 0;
+}
+/* the panel's town (its first field), its "Research:" line (+0x30) and bar (+0x28); 1 = read */
+int BdTmPanelPod(void* panel, void** town, void** caption, void** bar)
+{
+    __try { *town = *(void**)panel; *caption = *(void**)((char*)panel + 0x30); *bar = *(void**)((char*)panel + 0x28); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+typedef void (*BdSetCaptionFn)(void* widget, const MyGUI::UString* text);
+int BdTmPanelWritePod(void* caption, void* bar, const MyGUI::UString* text, size_t pos)
+{
+    __try
+    {
+        if (caption != 0) ((BdSetCaptionFn)((*(void***)caption)[0x88 / 8]))(caption, text);   /* the panel's own call (vt+0x88) */
+        if (bar != 0) ((MyGUI::ProgressBar*)bar)->setProgressPosition(pos);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void detour_townPanel(void* panel)
+{
+    orig_townPanel(panel);
+    if (panel == 0 || g_tmMates == 0 || g_tmMateResearch.empty() || BdOnMain() == 0) return;
+    void* town = 0; void* caption = 0; void* bar = 0;
+    if (BdTmPanelPod(panel, &town, &caption, &bar) == 0 || town == 0) return;
+    void* const f = BdOwnerPod(town);
+    if (!BdTmMate(f)) return;
+    std::map<int, TmResearch>::const_iterator it = g_tmMateResearch.find(BdTmSlotOf(f));
+    if (it == g_tmMateResearch.end()) return;
+    const TmResearch& m = it->second;
+    const std::string name = (m.idle != 0 || m.tech.empty()) ? std::string("None") : StoreResearchNameOf(m.tech);
+    const MyGUI::UString text(name);
+    const size_t pos = (m.idle != 0) ? 0 : (size_t)teammap::PanelPos(m.frac);
+    if (BdTmPanelWritePod(caption, bar, &text, pos) == 0) { if (++g_tmPanelFaults <= 3) ErrorLog("[TEAMMAP] a teammate's research on this panel FAULTED - the panel shows this player's own"); return; }
+    if (++g_tmPanelShown == 1) DebugLog("[TEAMMAP] a panel of a teammate's town shows that teammate's research '" + admincmd::LogSafe(name, 96) + "' (the first; later ones are counted)");
+}
+/* TEAM WORK down: research work a teammate did at one of this player's benches, added to this player's current research (team.cpp) */
+long long g_tmWorkIn = 0, g_tmWorkNotAdded = 0;
+void TeamWorkArrived(unsigned fromSlot, float amount)
+{
+    ++g_tmWorkIn;
+    char line[260];
+    if (!BdOnMain() || EngineWritesBlocked())
+    {
+        if (teammap::SayCount(++g_tmWorkNotAdded) != 0)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research work %.4f from teammate slot %u arrived, NOT added: %s (in=%lld notAdded=%lld)", amount, fromSlot,
+                        BdOnMain() ? "engine writes are blocked (a load or save)" : "not on the main thread", g_tmWorkIn, g_tmWorkNotAdded);
+            DebugLog(std::string(line));
+        }
+        return;
+    }
+    const int r = BdTmResearchAddPod(amount);
+    if (r == -1) { if (++g_tmWorkFaults <= 3) ErrorLog("[TEAMMAP] research work from a teammate FAULTED - not added"); return; }
+    if (r == 0)
+    {
+        if (teammap::SayCount(++g_tmWorkNotAdded) != 0)
+        {
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research work %.4f from teammate slot %u arrived, NOT added: this player's research did not read (in=%lld notAdded=%lld)", amount, fromSlot, g_tmWorkIn, g_tmWorkNotAdded);
+            DebugLog(std::string(line));
+        }
+        return;
+    }
+    if (teammap::SayCount(++g_tmWorkArrived) != 0)
+    {
+        float frac = -1.0f;
+        if (BdTmProgressPod(&frac) != 1) frac = -1.0f;
+        const int idle = BdTmLocalIdlePod();
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research work %.4f from teammate slot %u at this player's bench added to this player's research (%s, progress now %.3f; arrived=%lld)",
+                    amount, fromSlot, idle == 1 ? "IDLE - nothing queued, the work is lost" : idle == 0 ? "running" : "state unread", frac, g_tmWorkArrived);
+        DebugLog(std::string(line));
+    }
+}
+/* TEAM WORK STATE down: a teammate's research idle or running, its tech and progress (team.cpp) */
+void TeamWorkStateArrived(unsigned fromSlot, bool idle, const std::string& tech, float frac)
+{
+    const int slot = (int)fromSlot;
+    if (slot < 0 || slot == KeptMySlot()) return;
+    std::map<int, TmResearch>::iterator it = g_tmMateResearch.find(slot);
+    if (it == g_tmMateResearch.end() || (it->second.idle != 0) != idle)
+    {
+        char line[200];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] teammate slot %d's research is %s", slot, idle ? "IDLE - workers at its benches stop" : "running - workers at its benches work");
+        DebugLog(std::string(line));
+    }
+    TmResearch& m = g_tmMateResearch[slot];
+    m.idle = idle ? 1 : 0; m.tech = tech; m.frac = frac;
+    if (teammap::CellSlotOk(slot) != 0) ::InterlockedExchange(&g_tmMateCell[slot], (LONG)teammap::MateCell(idle ? 1 : 0));   /* the idle hook's copy (any thread) */
+}
+long long g_tmWorkDropped = 0;
+double g_tmWorkGatheredSum = 0.0, g_tmWorkSentSum = 0.0;
+DWORD g_tmSumAt = 0;
+int g_tmSumSaid = 0;
+long long g_tmSumLast[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+/* MAIN THREAD: the bench hooks' counts (AI worker thread) and this game's sends / arrivals in one line, when one moved, at most once a
+   teammap::kWorkLogMs */
+void BdTmWorkSummary(DWORD now)
+{
+    long long c[8];
+    for (int k = 0; k < teammap::kWhyN; ++k) c[k] = (long long)::InterlockedCompareExchange64(&g_tmTickWhy[k], 0, 0);
+    c[4] = (long long)::InterlockedCompareExchange64(&g_tmTickGathered, 0, 0);
+    c[5] = (long long)::InterlockedCompareExchange64(&g_tmIdleFollowed, 0, 0);
+    c[6] = g_tmWorkSends;
+    c[7] = g_tmWorkArrived + g_tmWorkNotAdded;
+    int moved = 0;
+    for (int k = 0; k < 8; ++k) if (c[k] != g_tmSumLast[k]) moved = 1;
+    if (teammap::SummaryDue(moved, g_tmSumSaid, (unsigned long)(now - g_tmSumAt)) == 0) return;
+    for (int k = 0; k < 8; ++k) g_tmSumLast[k] = c[k];
+    g_tmSumSaid = 1; g_tmSumAt = now;
+    char line[800];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] bench work (ticks on the AI worker thread, since start): routed own=%lld town=%lld bench=%lld nobody=%lld;"
+                " gathered=%lld notCounted=%lld faulted=%lld copies=%lld copiesSkipped=%lld lastTo=s%ld; idle asked=%lld followed=%lld | sent=%lld (%.3f of %.3f gathered) notSent=%lld dropped=%lld"
+                " | arrived=%lld (added) notAdded=%lld | mates=%d me=s%ld",
+                c[teammap::kWhyOwn], c[teammap::kWhyTown], c[teammap::kWhyBench], c[teammap::kWhyNobody], c[4],
+                (long long)::InterlockedCompareExchange64(&g_tmTickNoCount, 0, 0), (long long)::InterlockedCompareExchange64(&g_tmTickFaults, 0, 0),
+                (long long)::InterlockedCompareExchange64(&g_tmTickCopy, 0, 0), (long long)::InterlockedCompareExchange64(&g_tmTickCopySkipped, 0, 0),
+                (long)::InterlockedCompareExchange(&g_tmLastTo, 0, 0), (long long)::InterlockedCompareExchange64(&g_tmIdleAsked, 0, 0), c[5],
+                g_tmWorkSends, g_tmWorkSentSum, g_tmWorkGatheredSum, g_tmWorkSendFails, g_tmWorkDropped, g_tmWorkArrived, g_tmWorkNotAdded, g_tmMates,
+                (long)::InterlockedCompareExchange(&g_tmMySlotAny, 0, 0));
+    DebugLog(std::string(line));
+}
+/* MAIN THREAD (BuildCopyDrain), its own kLookMs look: the work gathered at teammates' benches sent to each, and this player's research
+   state said to the team */
+void BdTeamMapTick()
+{
+    const DWORD now = ::GetTickCount();
+    if (g_tmLookAt != 0 && now - g_tmLookAt < teammap::kLookMs) return;
+    g_tmLookAt = now;
+    const std::vector<int> mates = TeamMatesOfMine();
+    const int hadMates = g_tmMates;
+    g_tmMates = (int)mates.size();
+    g_tmMyFacAny = (void*)LocalPlayerFaction();   /* the bench hooks' copies (they run on the AI worker thread) */
+    ::InterlockedExchange(&g_tmMySlotAny, (LONG)KeptMySlot());
+    ::InterlockedExchange(&g_tmMatesAny, (LONG)g_tmMates);
+    if (g_tmMates == 0)
+    {
+        g_tmMateResearch.clear(); g_tmWorkOwed.clear(); g_tmIdleSent = -1;
+        if (hadMates != 0) for (int k = 0; k < teammap::kCellSlots; ++k) { ::InterlockedExchange(&g_tmMateCell[k], 0); ::InterlockedExchange(&g_tmOwedBits[k], 0); }
+        return;
+    }
+    for (std::map<int, TmResearch>::iterator it = g_tmMateResearch.begin(); it != g_tmMateResearch.end();)   /* a player who left the team */
+        if (std::find(mates.begin(), mates.end(), it->first) == mates.end())
+        { if (teammap::CellSlotOk(it->first) != 0) ::InterlockedExchange(&g_tmMateCell[it->first], 0); g_tmMateResearch.erase(it++); }
+        else ++it;
+    /* the work the bench hook gathered on the AI worker thread: a teammate's into its owed sum, any other slot's dropped */
+    for (int k = 0; k < teammap::kCellSlots; ++k)
+    {
+        if (::InterlockedCompareExchange(&g_tmOwedBits[k], 0, 0) == 0) continue;
+        const float got = BdTmOwedTake(k);
+        if (!(got > 0.0f)) continue;
+        if (std::find(mates.begin(), mates.end(), k) == mates.end()) { ++g_tmWorkDropped; continue; }
+        g_tmWorkOwed[k] = teammap::OwedAdd(g_tmWorkOwed[k], got);
+        g_tmWorkGatheredSum += got;
+    }
+    BdTmWorkSummary(now);
+    if (EngineWritesBlocked()) return;
+    /* the work gathered at each teammate's benches, at most once a kWorkSendMs */
+    if (!g_tmWorkOwed.empty() && (g_tmWorkSentAt == 0 || now - g_tmWorkSentAt >= teammap::kWorkSendMs))
+    {
+        g_tmWorkSentAt = now;
+        for (std::map<int, float>::iterator it = g_tmWorkOwed.begin(); it != g_tmWorkOwed.end();)
+        {
+            if (std::find(mates.begin(), mates.end(), it->first) == mates.end() || !(it->second > 0.0f)) { g_tmWorkOwed.erase(it++); continue; }   /* no longer a teammate */
+            const float send = teammap::WorkSendAmount(it->second);
+            if (!TeamWorkSend((unsigned)it->first, send))
+            { if (teammap::SayCount(++g_tmWorkSendFails) != 0) DebugLog("[TEAMMAP] research work at a teammate's bench NOT sent (no link, or an amount out of range) - kept and tried again (notSent=" + std::to_string((long long)g_tmWorkSendFails) + ")"); ++it; continue; }
+            it->second -= send;
+            g_tmWorkSentSum += send;
+            if (teammap::SayCount(++g_tmWorkSends) != 0)
+            {
+                char line[200];
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[TEAMMAP] research work %.4f at teammate slot %d's bench sent for its research (sends=%lld)", send, it->first, g_tmWorkSends);
+                DebugLog(std::string(line));
+            }
+            if (!(it->second > 0.0f)) g_tmWorkOwed.erase(it++); else ++it;
+        }
+    }
+    /* this player's research state to its teammates: idle at a change and every kWorkStateAgainMs, running every look (their panels
+       follow the progress bar) */
+    const int idle = BdTmLocalIdlePod();
+    if (idle < 0) return;
+    if (idle == 1) g_tmTechNow.clear();
+    else if (g_tmTechReadAt == 0 || now - g_tmTechReadAt >= kTmTechReadMs || g_tmTechNow.empty())
+    {   /* the queue's front tech, read through Research::save (StoreResearchQueue) - not every second */
+        g_tmTechReadAt = now;
+        std::vector<std::pair<std::string, float> > q; std::string qt, qwhy;
+        if (StoreResearchQueue(&q, &qt, &qwhy) && !q.empty() && q[0].first.size() <= swteam::kMaxName) g_tmTechNow = q[0].first;
+    }
+    float frac = 0.0f;
+    if (idle == 0 && BdTmProgressPod(&frac) != 1) frac = 0.0f;
+    if (!(frac >= 0.0f)) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    if (idle == 1 && idle == g_tmIdleSent && g_tmIdleSentAt != 0 && now - g_tmIdleSentAt < teammap::kWorkStateAgainMs) return;
+    if (!TeamWorkStateSend(idle == 1, idle == 1 ? std::string() : g_tmTechNow, frac)) return;
+    if (idle != g_tmIdleSent) DebugLog(std::string("[TEAMMAP] this player's research is ") + (idle == 1 ? "IDLE" : "running") + " - told to the team");
+    g_tmIdleSent = idle; g_tmIdleSentAt = now;
+}
+/* InstallBuild: the TEAMMAP hooks */
+void InstallTeamMap()
+{
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    g_hkTmColour = (kBdMapMarkerSlotsRva == 0) ? -2 : BdHook(base, kBdMapMarkerColourRva, (void*)&detour_mapMarkerColour, (void**)&orig_mapMarkerColour);
+    g_hkTmResWork = (kBdResAddRva == 0 || kBdPlayerIfaceRva == 0) ? -2 : BdHook(base, kBdResWorkRva, (void*)&detour_resWork, (void**)&orig_resWork);
+    g_hkTmBenchIdle = (kBdPlayerIfaceRva == 0) ? -2 : BdHook(base, kBdBenchIdleRva, (void*)&detour_benchIdle, (void**)&orig_benchIdle);
+    g_hkTmPanel = BdHook(base, kBdTownPanelRva, (void*)&detour_townPanel, (void**)&orig_townPanel);
+    const std::string msg = std::string("[TEAMMAP] team-bases hooks: marker colour ") + HkWord(g_hkTmColour) + ", research bench work " + HkWord(g_hkTmResWork)
+        + ", research bench idle " + HkWord(g_hkTmBenchIdle) + ", town panel " + HkWord(g_hkTmPanel);
+    if (g_hkTmColour == 1 && g_hkTmResWork == 1 && g_hkTmBenchIdle == 1 && g_hkTmPanel == 1)
+        DebugLog(msg);
+    else ErrorLog(msg);
 }
 /* ---- T-811 log (decisions 874 a / 875): what the map draws for each teammate base, read live from the game ----
    The icon: the town's own icon call (Town vt+0x378, the call the marker set-up 0x48D7A0 makes - for a teammate's base it runs through
@@ -21941,6 +22576,7 @@ void BuildCopyDrain()
     BdTownsSayTick();   /* this game's own outposts to the world server, every drain whatever is pending (its own checks: the 5 s look, a slot, the town list, engine writes, a faction) */
     if (!g_townRows.empty()) { BdSelfScope townScope; BdTownsLoadedTick(); }   /* every game: the kept outposts' pieces loaded here linked to their towns, whatever is pending (its own 5 s look and engine-write check) */
     if (!g_shown.empty() || g_showSaveHeld != 0) BdShowSaveGuard();   /* T-811: a save the engine was asked for - the bases founded here go before it runs (this safe point) */
+    BdTeamMapTick();   /* TEAMMAP: the work gathered at teammates' benches sent, this player's research state said to the team (its own 1 s look) */
     if (!g_tmRefoundPending.empty()) BdTmRefoundPendingWake();   /* T-924: a re-found waiting for its area to unload, applied again once a zone is taken apart */
     if (g_showDirty != 0 || StoreWorldGenNow() != g_showWorldGen || g_townRowsGen != g_showKeptSeen || (g_showRetryAt != 0 && (long)(::GetTickCount() - g_showRetryAt) >= 0))
     { BdSelfScope showScope; BdShowApply(); }   /* T-811: the teammates' bases on the map - after a SHOW, a world load, the kept list, a save, or a due retry */
@@ -25022,3 +25658,8 @@ int BuildKeyPlayerPiece(const char* key)
 }
 
 } // namespace coop
+
+namespace coop {
+/* Dedicated fork, 10-29: speech.cpp's caged-prisoner talk asks for this game's own character nearest a position. MAIN THREAD. */
+::Character* NearestOwnCharacter(const float* pos) { return BdNearestOwnChar(pos); }
+}

@@ -241,5 +241,6 @@ unsigned int KoSelfLastUid();
 // 1 = an animal (the appearance vtable holds AppearanceAnimal::createBody 0x539C50), 0 = another class, -1 = unreadable.
 int GroundAnimalAppPod(::Character* c);
 std::string GroundRaceName(::Character* c);   // the appearance's race record name, "?" = unreadable
+bool KapiRaceOf(::Character* c, std::string* sid, std::string* name);   // the Kenshi API: the race record's string id and name
 
 } // namespace coop

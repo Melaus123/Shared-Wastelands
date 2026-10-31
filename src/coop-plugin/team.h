@@ -45,6 +45,25 @@ unsigned TeamNoOfSlotAnyThread(int slot);
 bool TeamSameAnyThread(int a, int b);
 // MAIN THREAD: the slots that share this game's player's team on its copy of the table (none without a table or a team).
 std::vector<int> TeamMatesOfMine();
+// TEAMMAP (teamwire.h WORK / WORK STATE, protocol 109). MAIN THREAD: research work this game's characters did at a bench of a
+// teammate's town (else a teammate's bench), sent to the world server for that teammate's game; false = not encoded or no link.
+bool TeamWorkSend(unsigned toSlot, float amount);
+// MAIN THREAD: this player's research idle or running, its current tech and progress, to the teammates; false = not encoded or no link.
+bool TeamWorkStateSend(bool idle, const std::string& tech, float frac);
+// MAIN THREAD (build.cpp): research work a teammate did at one of this player's benches, added to this player's current research.
+void TeamWorkArrived(unsigned fromSlot, float amount);
+// MAIN THREAD (build.cpp): a teammate's research idle or running, with its tech and progress (kept per teammate).
+void TeamWorkStateArrived(unsigned fromSlot, bool idle, const std::string& tech, float frac);
+// SW Bank (teamwire.h BANK, protocol 109): a team's shared cats on the world server. BankIsAtm: the building (its stringID) whose use
+// opens the bank box. BankOpen: MAIN THREAD, the box (team balance, this player's cats, an amount, DEPOSIT / WITHDRAW / CLOSE).
+bool BankIsAtm(const char* buildingSid);
+// MAIN THREAD (build.cpp's order gate): the building is the Cat Vault AND this game is in linked team play (swteam::BankTakesVault) -
+// the order opens the bank box instead; false = the vault's own menu (single player, hosted play without a team, no link).
+bool BankTakesVaultNow(const char* buildingSid);
+void BankOpen();
+// SW Bank: one BANK request (deposit / withdraw / ask) on the TEAM message - money.cpp sends a waiting deposit or withdraw with it. false =
+// not encodable or no link. MAIN THREAD.
+bool TeamBankSend(unsigned op, unsigned txn, unsigned amount);
 // MAIN THREAD (476): this game's player is a member (not the founder) and `slot` is outside its team - its stance is the founder's.
 bool TeamStanceIsFounders(int slot);
 // MAIN THREAD (476, either side): the other members of `slot`'s team when this game's player is not in it (else none).

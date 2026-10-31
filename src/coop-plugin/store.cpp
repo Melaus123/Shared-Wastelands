@@ -65,6 +65,10 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "../common/fallenwire.h"   /* T-556: FALLEN (61) */
 #include "../common/keptwire.h"   /* KEPT (69): the players' kept pieces laid back into a reset world */
 #include "../common/townkeep.h"   /* TOWNS (70): the players' outposts carried into a reset world */
+#include "../common/admincmd.h"   /* DEDICATED: the Admin's Toychest - ADMIN_REQ / DO / DONE / REPLY (97-100) */
+#include "../common/adminauth.h"   /* DEDICATED: admin two-factor - ADMIN_LOGIN (103) */
+#include "admin.h"
+#include "../common/dedinfo.h"   /* DEDICATED: DEDINFO (96) - the PLAYERS tab's host / vote / admin words */
 #include "../common/baseshow.h"   /* T-811: SHOW (78) - the teammates' outposts for the map */
 // review-p3o H2: the other modules' world-teardown resets, all called from detour_worldTeardown
 #include "replicate.h"
@@ -114,6 +118,7 @@ namespace coop { int TownGenRecipeUnique(void* platoon); }   /* towngen.cpp: T-1
 #include "../common/sendbundle.h"   /* M13: BUNDLE (59) - the messages of one pass as one packet per lane; the SAME header the world server and the offline suite compile */
 #include "../common/writerladder.h"   /* B10 (audit C11): coopwriter::ZoneWriterDecide - ZoneWriteIsMine takes THE SAME ladder items.cpp takes for a box, a door and a shop, and the offline suite sweeps the whole rule without a game. */
 #include "settings.h"   /* settings2 S2: the OPTIONS handler hands the gp.* keys to settings.cpp */
+#include "kmode.h"      /* DEDICATED: the OPTIONS handler hands startmode to kmode.cpp */
 #include "../common/weatherwire.h"   /* P7s (F553): MSG_WEATHER names its region by FCS stringID - EncodeWeather / DecodeWeather, the SAME pair the notebook and the offline suite compile */
 #include "../common/hbmath.h"   /* E47-S2: the heartbeat cursor/budget/period arithmetic, header-only; the offline suite includes the same file */
 #include "../common/squadevent.h"   /* T-1084: a world squad's discrete events (a death, a member in or out, money, a home) mark its record due; the offline suite includes the same file */
@@ -3680,6 +3685,7 @@ typedef char StorePieceNumberAgrees[(kStoreProtocol == piecerec::kProtocol) ? 1 
 typedef char StoreShowNumberAgrees[(kStoreMsgShow == baseshow::kMsgShow && kStoreProtocol == baseshow::kProtocol) ? 1 : -1];   /* a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgFallen = 61;   /* T-556: FALLEN - up ADD / TAKE / ASK, down TABLE (src/common/fallenwire.h) */
 typedef char T556StoreFallenNumberAgrees[(kStoreMsgFallen == swfallen::kMsgFallen) ? 1 : -1];   /* a compile error here = the header and this file disagree */
+typedef char StoreAdminProtocolAgrees[(kStoreProtocol == admincmd::kProtocol) ? 1 : -1];   /* the Admin's Toychest: a compile error here = admincmd.h and this file disagree */
 typedef char T810StoreMoneyProtocolAgrees[(kStoreProtocol == moneyw::kProtocol) ? 1 : -1];   /* T-810: MONEY (73-77) are src/common/moneywire.h's numbers; a compile error here = the header and this file disagree */
 const unsigned int kStoreMsgWorldRel = 51;   /* par24 (store protocol 54; 55 since re-check D): WORLD_REL - world-vs-world standing rows (src/common/worldrelwire.h); up SEED / CHANGE / SEED_END, down every row at WELCOME, each row the notebook took, and ECHO (this game's own CHANGE rows answered) */
 const unsigned int kStoreMsgTownBar = 47;   /* refill1 (store protocol 50): TOWN_BAR - town bar rows (src/common/barwire.h); up this game's writes, down every row at WELCOME and each changed one. 46 is loot2c's RESEARCH_TAKE */
@@ -8106,12 +8112,14 @@ long long g_joinInWorldResent = 0;   /* M11 C5: IN_WORLD sent again on a new lin
 long g_joinLoadingSentGen = -1, g_joinInWorldSentGen = -1, g_joinGateSaidGen = -1;
 bool StoreJoinViaWorld() { return ConfigRole() == kRoleClient; }   /* every joining game comes in through the world server */
 /* The STORE_HELLO's tail, after the profile u32 - both HELLO sends (the link-up edge and a profile pick) append it. */
+unsigned long long SteamSelfIdNow();   /* net/steam_friends.cpp */
 void StoreHelloTailAppend(std::vector<char>* b)
 {
     coopjoin::HelloTail t;
     t.liveProto = net::SessionProtocolVersion();
     t.road = StoreJoinViaWorld() ? (unsigned)coopjoin::kRoadWorld : (unsigned)coopjoin::kRoadSession;
     t.name = ConfigFilePlayerName();
+    t.steamSelf = SteamSelfIdNow();   /* DEDICATED: for the server's admin list (timemode admin) */
     float vd = 0.0f;
     if (!EngineWritesBlocked() && LocalViewDistance(&vd) && vd > 1.0f) t.viewDist = vd;   /* 0 = "I cannot tell you", as the session HELLO says it */
     coopjoin::HelloTailEncode(t, b);
@@ -8125,7 +8133,8 @@ static bool JoinStageSend(unsigned stage)
 int StoreJoinGateVerdict()
 {
     const bool welcomed = LinkUp() && StoreWelcomedThisLink() != 0;
-    const bool opIn = g_rosterLinkGen == (long)StoreLinkGen() && coopjoin::RosterOperatorInWorld(g_roster);
+    /* DEDICATED: a game that IS the world's authority waits for nobody - with no host game, the steward's own load brings the world in */
+    const bool opIn = g_storeAuthority || (g_rosterLinkGen == (long)StoreLinkGen() && coopjoin::RosterOperatorInWorld(g_roster));
     return coopjoin::JoinLoadAllowed(welcomed, coopjoin::kRelayCarriesLiveStream, opIn);
 }
 /* THE HELD JOIN LOAD (coopjoin::JoinHoldOnRefusal / JoinHoldDecide): a load the JOIN gate refused ONLY because the world's operator
@@ -8323,6 +8332,15 @@ bool StoreRosterArrive(const std::vector<char>& p)   /* review fold F5: true = d
 }
 /* The player's name the roster gives a slot. The last roster received is used even while the link is down: a player's name
    does not change with the link, and a name tag should not flip back to the faction name during a reconnect. */
+/* DEDICATED: the last DEDINFO from a --dedicated notebook (it forgets nothing on its own: a non-dedicated notebook never sends one) */
+unsigned g_dedInfoMode = 0; std::vector<dedinfo::Row> g_dedInfoRows; long g_dedInfoLinkGen = -1;
+int StoreDedicatedBadge(int slot, std::string* prefix, std::string* status)
+{
+    if (g_dedInfoLinkGen != (long)StoreLinkGen()) return 0;   /* another link's words are not this one's */
+    for (size_t i = 0; i < g_dedInfoRows.size(); ++i)
+        if ((int)g_dedInfoRows[i].slot == slot) { dedinfo::Badge(g_dedInfoMode, g_dedInfoRows[i], prefix, status); return (!prefix->empty() || !status->empty()) ? 1 : 0; }
+    return 0;
+}
 int StoreRosterNameOf(int slot, std::string* name)
 {
     if (name == 0) return -1;
@@ -11279,6 +11297,7 @@ void TeardownBroadcast(const char* why)
     g_loadOverrideRestoredLogged = 0; g_loadOverrideFailedLogged = 0; g_loadOverrideMissingLogged = 0;   // review-p3x P3X-4: first-only per world
     ResetPlayerFactionState(); ForgetContextPlatoons(); RelationsForgetQueue(); PlayersTabForgetWorld(); FallenTabForgetWorld(); coop::UiEditorForgetWorld();
     coop::TeamForget("the world was torn down - leaving to the title, or another load", false);   /* T-546: asked again once a world is loaded */
+    coop::AdminForget("the world was torn down", false);   /* the toychest's jobs belong to the world that is going */
     OwnResBenchForget();   /* the team research level: the next world's own benches give this game's own level */
     g_ctxSleptMine.clear(); g_ctxDrops.clear(); g_wakeDup.clear(); g_saveSplit.clear();   /* the context wake rule's platoons and the refused duplicate wakes belong to the freed world */
     coop::BuildForgetWorld();   /* build1-c (review-build1b M2): the other game's pending PLACEs / STATEs and copy rows die with the world */
@@ -12144,6 +12163,24 @@ void WorldGenOnWelcome(const std::vector<char>& payload, bool auth)
     DebugLog("[STORE] world guard: the notebook's row for profile " + m.profile + ": worldGen=" + N((long long)v.gen) + " seqHigh=" + N((long long)v.seqHigh)
              + " epoch=" + N((long long)v.epoch) + " numberedProfiles=" + N((long long)m.numbered) + " operator=" + N((long long)(auth ? 1 : 0))
              + " pendingStamp=" + N((long long)g_wgPendGen));
+}
+/* DEDICATED (steward move): a game made the authority AFTER its WELCOME gets the WELCOME's operator-only half - the key scan, the
+   behind-live check and the pending stamp's resend - against the notebook row it already holds (the WELCOME's, raised by answers). */
+void WorldGenOnPromoted()
+{
+    if (g_wgScannedProfile != ProfileForKey()) WorldGenScanKeys();
+    const restoreguard::WorldState v = g_wgNotebook;
+    if (!v.known) { DebugLog("[STORE] world guard: promoted with no notebook row known - the pending stamp waits for the next save"); return; }
+    if (restoreguard::NotebookBehindLive(v, g_wgSeqSeen, g_wgAckedGen))
+    {
+        ++g_wgNotebookBehindLive;
+        ErrorLog("[STORE] promoted, and the notebook is OLDER than this game's world (seqHigh " + N((long long)v.seqHigh) + " < seen " + N((long long)g_wgSeqSeen)
+                 + " / gen " + N((long long)v.gen) + " < acked " + N((long long)g_wgAckedGen) + ") - the pending stamp is NOT re-sent. notebookBehindLive=" + N(g_wgNotebookBehindLive));
+        return;
+    }
+    if (g_wgPendGen != 0 && g_wgPendGen <= v.gen) { g_wgPendGen = 0; g_wgPendSeq = 0ULL; }   /* the notebook already holds it */
+    if (restoreguard::ResendDecide(true, false, g_wgPendGen, v.gen) && WorldSavedSend(g_wgPendGen, g_wgPendSeq)) ++g_wgStampResent;
+    DebugLog("[STORE] world guard: promoted to the world's authority - notebook worldGen=" + N((long long)v.gen) + " pendingStamp=" + N((long long)g_wgPendGen));
 }
 void WorldGenOnAnswer(const std::vector<char>& payload)
 {
@@ -16958,6 +16995,7 @@ void NotebookLinkDown(const std::string& why)
     ::InterlockedIncrement(&g_moneyEdge);   /* T-810: the money that came on this link was its WELCOME's */
     DebugLog("[STORE] link DOWN - " + why);
     coop::TeamForget("the world-server link went down", true);   /* T-546: the membership table belongs to this link */
+    coop::AdminForget("the world-server link went down", true);   /* god rows, jobs and replies belong to this link */
     coop::ResurrectLinkLost();   /* T-556: the fallen list is the world server's - with no link this game has none */
     JoinHoldDrop("the world-server link went down");   /* a load held for the operator ends here: the re-dial / CAN'T JOIN path applies */
 }
@@ -17634,7 +17672,7 @@ void PumpLink()
                ending the drain: the next option is meant to cost no protocol bump. */
             unsigned int on = 0; size_t oat = 4;
             if (!GetU32S(m.payload, 0, &on) || on > 64) ErrorLog("[STORE] malformed OPTIONS from the store - ignored");
-            else { coop::SettingsWorldOptionsBegin(); coop::RecruitMultMapBegin(); coop::ResearchModeMapBegin(); coop::ResurrectOptionsMapBegin(); bool gpComplete = true, rcRefusal = false;   /* settings2 S2: the gp.* rows of THIS map; a map cut short is not a record */
+            else { coop::SettingsWorldOptionsBegin(); coop::RecruitMultMapBegin(); coop::ResearchModeMapBegin(); coop::ResurrectOptionsMapBegin(); coop::StartModeOptionsBegin(); bool gpComplete = true, rcRefusal = false;   /* settings2 S2: the gp.* rows of THIS map; a map cut short is not a record */
             for (unsigned int oi = 0; oi < on; ++oi)
             {
                 std::string ok2, ov;
@@ -17653,9 +17691,10 @@ void PumpLink()
                    mode this game reports is the byte inside MSG_CLOCK, which the notebook derives from this very
                    option - one authority, not two that can disagree. Named rather than logged as unknown. */
                 if (coop::ResurrectOption(ok2, ov)) continue;   /* T-556: the host's resurrection options - on/off, the fee amount, its growth (resurrect.cpp) */
+                if (coop::StartModeOption(ok2, ov)) continue;   /* DEDICATED: the world's start mode, freeplay | kenshi (kmode.cpp) */
                 if (ok2 == "researchmode") { coop::ResearchModeOption(ov); continue; }   /* loot2b: the host option - research items lifted out of opened boxes (items.cpp) */
                 if (ok2 == "recruitmult") { coop::RecruitMultOption(ov); continue; }   /* recruit3: the host option - bar hire lists x players (towngen.cpp) */
-                if (ok2 == "timemode") { DebugLog(std::string("[TIME] the world's time mode is '") + ov + "' (" + (ov == "consensus" ? "every player's speed setting is a vote and the slowest wins, pause included" : "the host sets the pace and every game follows") + "). This game acts on the mode carried in the notebook's CLOCK, which is derived from this same option."); continue; }
+                if (ok2 == "timemode") { coop::StartModeTimeOption(ov); DebugLog(std::string("[TIME] the world's time mode is '") + ov + "' (" + (ov == "consensus" ? "every player's speed setting is a vote and the slowest wins, pause included" : "the host sets the pace and every game follows") + "). This game acts on the mode carried in the notebook's CLOCK, which is derived from this same option."); continue; }
                 if (ok2 != "basepolicy") { DebugLog("[STORE] OPTIONS: the notebook sent '" + ok2 + "' = '" + ov + "', which this build does not know - ignored, nothing else in the map is affected"); continue; }
                 const int was = g_basePolicy;
                 const int sent = (ov == "shared") ? coop::kPolicyShared : (ov == "owner") ? coop::kPolicyOwner : (ov == "locked") ? coop::kPolicyLocked : coop::kPolicyUnknown;
@@ -17672,7 +17711,7 @@ void PumpLink()
                                : g_basePolicy == coop::kPolicyOwner  ? "a box is usable only by the faction that owns the building"
                                                                      : "the owner may use it; everyone else gets the engine's own lock-and-pick behaviour"));
             }
-            coop::SettingsWorldOptionsEnd(gpComplete); coop::RecruitMultMapEnd(gpComplete && !rcRefusal); coop::ResearchModeMapEnd(gpComplete && !rcRefusal); coop::ResurrectOptionsMapEnd(gpComplete && !rcRefusal); }   /* settings2 S2: apply the world record now (every game), and let the authority record what is absent */
+            coop::SettingsWorldOptionsEnd(gpComplete); coop::RecruitMultMapEnd(gpComplete && !rcRefusal); coop::ResearchModeMapEnd(gpComplete && !rcRefusal); coop::ResurrectOptionsMapEnd(gpComplete && !rcRefusal); coop::StartModeOptionsEnd(gpComplete, rcRefusal); }   /* settings2 S2: apply the world record now (every game), and let the authority record what is absent */
         }
         else if (m.type == (net::MsgType)kStoreMsgClock)
         {
@@ -17703,6 +17742,13 @@ void PumpLink()
         else if (m.type == (net::MsgType)coopbrec::kMsgBoxTaken) coop::BoxTakenArrive(m.payload);   /* this game's box record of that generation is stored: the box's journal base */
         else if (m.type == (net::MsgType)coopbrec::kMsgBoxAsked) coop::BoxAskedArrive(m.payload);   /* after a link loss: this game's newest stored write of a box */
         else if (m.type == (net::MsgType)coopgrec::kMsgGroundRefuse) coop::GroundRefuseArrive(m.payload);   /* T-697 step 2: the world server did not take this game's ground record - a ground-table write; GroundDrain acts on it */
+        else if (m.type == (net::MsgType)dedinfo::kMsgDedInfo)
+        {
+            unsigned mode = 0, startMode = 0; std::vector<dedinfo::Row> rows;
+            if (dedinfo::Decode(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &mode, &startMode, &rows)) { g_dedInfoMode = mode; g_dedInfoRows = rows; g_dedInfoLinkGen = (long)StoreLinkGen(); coop::StartModeDedInfo(startMode); }
+            else DebugLog("[STORE] DEDINFO malformed - ignored");
+        }
+        else if (m.type == (net::MsgType)admincmd::kMsgAdminDo || m.type == (net::MsgType)admincmd::kMsgAdminReply || m.type == (net::MsgType)adminauth::kMsgAdminLogin || m.type == (net::MsgType)admincmd::kMsgGodTable) coop::AdminArrive((unsigned)m.type, m.payload);   /* the Admin's Toychest: a job for this game, or the answer to this admin's command - noted only; AdminTick acts */
         else if (m.type == (net::MsgType)kStoreMsgShow) coop::BuildShowNote(m.payload.empty() ? 0 : &m.payload[0], m.payload.size());   /* T-811: the teammates' outposts, shown at the next drain */
         else if (m.type == (net::MsgType)kStoreMsgTownLoss) coop::TownLossNoteRows(m.payload);   /* each town's recorded losses and refilled flag - a table write only; the town check-up acts on it */
         else if (m.type == (net::MsgType)kStoreMsgResearch)
@@ -17775,8 +17821,11 @@ void PumpLink()
         }
         else if (m.type == net::MSG_STORE_AUTH && m.payload.size() >= 4)
         {
-            unsigned int auth = 0; std::memcpy(&auth, &m.payload[0], 4); g_storeAuthority = auth != 0; g_wgOperator = auth != 0 ? 1 : 0;   /* restore1a: the stamp follows the operator flag */
-            DebugLog("[STORE] AUTH from the store: authority=" + N(auth));
+            unsigned int auth = 0; std::memcpy(&auth, &m.payload[0], 4);
+            const bool promoted = auth != 0 && !g_storeAuthority;
+            g_storeAuthority = auth != 0; g_wgOperator = auth != 0 ? 1 : 0;   /* restore1a: the stamp follows the operator flag */
+            if (promoted) { WorldGenOnPromoted(); JoinHoldOnRoster(); }   /* DEDICATED: a load held for "the operator" starts now - this game is it */   /* DEDICATED (steward move): the WELCOME's operator-only world-guard half, for a game made the authority after it */
+            DebugLog("[STORE] AUTH from the store: authority=" + N(auth) + (promoted ? " (this game now holds the world's duties)" : ""));
         }
     }
     g_publishSuppressed = false;
@@ -22832,6 +22881,7 @@ void OwnMarkSaveTick()
         {
             ++g_ownMarkWritten;
             g_ownSaveDirLast = dir;   /* T-710: the TEST lever savesquadclash works in this folder */
+            coop::StartModeSaveWritten(dir);   /* DEDICATED: the kenshi-mode lean's key file beside this save, when owed (kmode.cpp) */
             DebugLog("[OWNSAVE] mark written: '" + path + "' store=" + mi.store + " seq=" + N((long long)m.seq) + " world='" + mi.world
                      + "' profile='" + mi.profile + "' (the own-records sequence when the save was requested; resolvedBy=" + how
                      + " waitedMs=" + N((long long)waited) + ")");
@@ -23727,6 +23777,7 @@ void OwnOverlayPrepare(const void* folderStr, const void* nameStr)
     const char* how = "";
     const std::string saveDir = SlotDirFor(std::string(fbuf), std::string(nbuf), &how);
     g_ownSaveDirLast = saveDir;   /* T-710: the TEST lever savesquadclash works in this folder */
+    coop::StartModeSaveLoaded(saveDir);   /* DEDICATED: this character's kenshi-mode lean, from its save folder's key file (kmode.cpp) */
     /* the writer thread idle, so the index names the last record made before the leave/crash */
     const DWORD w0 = ::GetTickCount();
     for (;;)
@@ -24807,6 +24858,10 @@ struct OwnLeaveSave
     char  target[260];   /* T-251: the profile save folder's name */
     char  where[16];
     int   holdWhy;                   /* restore1b1 fold 2: the finished save's why, kept while the continuation waits for the leave checkpoint (phase kLsFinished) */
+    int   handBack;                  /* 1 = a leave / exit / host-left rides on this save (coopown::LeaveSaveHandsBack): its start hands escrow back; 0 = the admin's /save, the background save, the created save */
+    int   againCont;                 /* coopown::LeaveJoinSavesAgain: a leave / exit / host-left that joined this routine save after its request - */
+    char  againWhere[16];            /* its continuation and its name ("" = none): a leave save of its own runs after this one ends */
+    long  againGen;                  /* the session link generation when it joined */
 };
 OwnLeaveSave  g_ownLs;                 /* zero-initialised = kLsIdle; MAIN THREAD */
 volatile LONG g_ownSaveOurs = 0;       /* our own request (the save verb / the leave save) is inside detour_saveManagerSave */
@@ -24814,6 +24869,7 @@ int           g_ownLsResuming = 0;     /* the quit is being resumed by the tick:
 long long g_ownLsStarted = 0, g_ownLsRequested = 0, g_ownLsCompleted = 0, g_ownLsMs = -1, g_ownLsGaveUp = 0, g_ownLsNotWanted = 0,
           g_ownLsDrainSlow = 0, g_ownLsExitHeld = 0, g_ownLsExitResumed = 0, g_ownLsLeaveResumed = 0, g_ownEngineSuppressed = 0,
           g_ownLsWorldChanged = 0, g_ownLsStopping = 0, g_ownLsLeaveSkippedGen = 0, g_ownLsExitCancelled = 0, g_ownLsStale = 0;
+long long g_ownLsAgainJoined = 0, g_ownLsAgainStarted = 0;   /* coopown::LeaveJoinSavesAgain: leaves that joined a routine save late / their own saves started */
 long long g_ownLsEnded = 0; int g_ownLsEndWhy = 0;   /* T-251 part 2: each leave save's end (count, reason) - the created trigger learns its save's outcome */
 static int QuitConfirmCallPod(uintptr_t fn);   /* below, beside QuitViaMenu (the same namespace) */
 
@@ -24876,7 +24932,19 @@ bool OwnLeaveSaveBegin(const char* where, int cont)
     OwnLeaveSave& L = g_ownLs;
     if (L.phase != coopown::kLsIdle)
     {
+        const int rides = coopown::LeaveSaveHandsBack(where);
+        if (L.againWhere[0] != 0 || coopown::LeaveJoinSavesAgain(L.phase, L.handBack, rides))
+        {   /* a routine save already past its request: this leave's hand-back may miss its snapshot - a leave save of its own follows it */
+            if (L.againWhere[0] == 0) { _snprintf(L.againWhere, 15, "%s", where); L.againWhere[15] = 0; L.againGen = net::SessionLinkGen(); }
+            L.againCont |= cont;
+            ++g_ownLsAgainJoined;
+            DebugLog("[OWNSAVE] leave save: the " + std::string(where) + " came while a routine save of '" + std::string(L.target) + "' is past its request (phase "
+                     + N((long long)L.phase) + ") - its escrow hand-back may not be in that save, so a leave save of its own runs once that one ends, and the "
+                     + std::string(where) + " continues at ITS completion edge");
+            return true;
+        }
         L.cont |= cont;
+        L.handBack |= rides;   /* a leave / exit / host-left joining an admin or background save before its request: escrow goes back at its start */
         DebugLog("[OWNSAVE] leave save: the " + std::string(where) + " joins the leave save already running for '" + std::string(L.target)
                  + "' (phase " + N((long long)L.phase) + ") - it continues at that save's completion edge");
         return true;
@@ -24891,6 +24959,7 @@ bool OwnLeaveSaveBegin(const char* where, int cont)
     }
     std::memset(&L, 0, sizeof(L));
     L.phase = coopown::kLsDrain; L.cont = cont; L.startAt = ::GetTickCount(); L.phaseAt = L.startAt;
+    L.handBack = coopown::LeaveSaveHandsBack(where);   /* only a save the session ends behind hands escrow back at its start */
     L.linkGen = net::SessionLinkGen();
     L.worldReset = ::InterlockedCompareExchange(&g_ownWorldReset, 0, 0);
     L.drainSeq = g_ownSeq;
@@ -24905,6 +24974,30 @@ bool OwnLeaveSaveBegin(const char* where, int cont)
     return true;
 }
 
+/* THE ADMIN'S TOYCHEST /save (admin.cpp): the leave save's own road with nothing to continue at its completion edge - the profile's
+   own slot saved now, as at a leave, the session and the game going on. 1 started (or joined one already running: *endSeen = the
+   end count to wait past), 0 not wanted now (*why the terms). MAIN THREAD. */
+int StoreAdminSaveBegin(long long* endSeen, std::string* why)
+{
+    why->clear();
+    *endSeen = g_ownLsEnded;
+    if (!OnMainThread()) { *why = "not on the main thread"; return 0; }
+    if (g_ownLs.phase != coopown::kLsIdle) { DebugLog("[ADMIN] /save: a save is already running - it is waited for"); return 1; }
+    /* NO escrow hand-back here: the session goes on, so an item in transit still reaches its taker - handing it back too would double
+       it on every /save and background save. Its hand-over line keeps the save and the records in step (coopown::LeaveSaveHandsBack). */
+    if (OwnLeaveSaveBegin("admin", 0)) return 1;
+    std::string target;
+    OwnLeaveSaveWantedNow(&target, why);
+    if (why->empty()) *why = "the save is not wanted now";
+    return 0;
+}
+/* -1 still running; 1 completed; 0 ended otherwise (*why = how). MAIN THREAD. */
+int StoreAdminSaveResult(long long endSeen, std::string* why)
+{
+    if (g_ownLsEnded == endSeen || g_ownLs.phase != coopown::kLsIdle) return -1;
+    *why = coopown::LeaveSaveWhyName(g_ownLsEndWhy);
+    return g_ownLsEndWhy == coopown::kLsWhyCompleted ? 1 : 0;
+}
 int OwnLeaveSaveForLeave()
 {
     if (!OnMainThread()) return 0;
@@ -24912,7 +25005,7 @@ int OwnLeaveSaveForLeave()
     return OwnLeaveSaveBegin("leave", coopown::kLsContLeave) ? 1 : 0;
 }
 /* inv7c fold 2 (recheck 1): the leave, the Exit-held quit and the host-left save all run through OwnLeaveSaveBegin. */
-int OwnEdgeSaveRunning() { return (g_ownLs.phase != coopown::kLsIdle) ? 1 : 0; }
+int OwnEdgeSaveRunning() { return coopown::SaveStartHandsBack(g_ownLs.phase != coopown::kLsIdle ? 1 : 0, g_ownLs.handBack); }   /* not the admin / background / created save */
 
 bool OwnLeaveSaveHoldQuit(void* sender)
 {
@@ -24933,7 +25026,7 @@ void OwnLeaveSaveCancelQuit(int result, void* sender)
 {
     if (g_ownLsResuming != 0 || !OnMainThread()) return;
     OwnLeaveSave& L = g_ownLs;
-    if (L.phase == coopown::kLsIdle || (L.cont & coopown::kLsContQuit) == 0) return;
+    if (L.phase == coopown::kLsIdle || ((L.cont | L.againCont) & coopown::kLsContQuit) == 0) return;
     if (coopown::LeaveCancelIgnored(L.holdSenderSet != 0, L.holdSender, sender))
     {
         ++g_ownLsCancelIgnored;
@@ -24942,6 +25035,7 @@ void OwnLeaveSaveCancelQuit(int result, void* sender)
         return;
     }
     L.cont = coopown::LeaveCancelQuit(L.cont);
+    L.againCont = coopown::LeaveCancelQuit(L.againCont);   /* an Exit that joined a routine save late is held on againCont */
     ++g_ownLsExitCancelled;
     DebugLog("[OWNSAVE] Exit CANCELLED: the confirm answered result=" + N((long long)result) + " (not 2) while a quit was held - it"
              " will not be resumed; the leave save of '" + std::string(L.target) + "' still finishes");
@@ -25030,14 +25124,35 @@ void OwnLeaveSaveTick()
         { L.holdWhy = why; L.phase = coopown::kLsFinished; L.phaseAt = now; return; }   /* fold 2: HOLD the continuation until the writer has written it */
     }
     g_ownLsEndWhy = why; ++g_ownLsEnded;   /* T-251 part 2: the created trigger reads this save's outcome */
+    char againWhere[16]; _snprintf(againWhere, 15, "%s", L.againWhere); againWhere[15] = 0;
+    const int againCont = L.againCont;
+    const long againGen = L.againGen;
+    void* const holdSender = L.holdSender; const int holdSenderSet = L.holdSenderSet;
     std::memset(&L, 0, sizeof(L));   /* idle BEFORE the continuation: the resumed quit re-enters the menu detour */
+    int contNow = cont;
+    long genFor = genAt;
+    if (againWhere[0] != 0)
+    {   /* coopown::LeaveJoinSavesAgain: the leave / exit / host-left that joined this routine save late gets a leave save of its own now */
+        if (coopown::LeaveAgainStarts(cont, why) && OwnLeaveSaveBegin(againWhere, againCont))
+        {
+            g_ownLs.linkGen = againGen;   /* the leave belongs to the link it was asked on */
+            g_ownLs.holdSender = holdSender; g_ownLs.holdSenderSet = holdSenderSet;   /* a held Exit's sender (mmo5 LOW) goes with it */
+            ++g_ownLsAgainStarted;
+            DebugLog("[OWNSAVE] leave save: the routine save ended (" + std::string(coopown::LeaveSaveWhyName(why)) + ") - the " + std::string(againWhere)
+                     + "'s own leave save starts now (escrow goes back at its start); it continues at that save's edge (again " + N(g_ownLsAgainStarted) + ")");
+            return;
+        }
+        contNow |= againCont; genFor = againGen;
+        DebugLog("[OWNSAVE] leave save: the " + std::string(againWhere) + " that joined late continues now, without a save of its own ("
+                 + std::string(coopown::LeaveSaveWhyName(why)) + ")");
+    }
     int doLeave = 0, doQuit = 0;
-    coopown::LeaveContinue(cont, why, genAt, genNow, &doLeave, &doQuit);
-    if ((cont & coopown::kLsContLeave) != 0 && doLeave == 0)
+    coopown::LeaveContinue(contNow, why, genFor, genNow, &doLeave, &doQuit);
+    if ((contNow & coopown::kLsContLeave) != 0 && doLeave == 0)
     {
         ++g_ownLsLeaveSkippedGen;
         DebugLog("[OWNSAVE] leave save: SessionLeave NOT called - the session link changed since the `leave` was asked (gen "
-                 + N((long long)genAt) + " -> " + N((long long)genNow) + "); that leave belonged to a session that is gone");
+                 + N((long long)genFor) + " -> " + N((long long)genNow) + "); that leave belonged to a session that is gone");
     }
     if (doLeave != 0)
     {
@@ -25052,7 +25167,7 @@ void OwnLeaveSaveTick()
         DebugLog("[OWNSAVE] leave save: the held quit is NOT resumed - the game is already stopping (quit byte / teardown),"
                  " re-checked just before the resume (mmo5 LOW)");
     }
-    if ((cont & coopown::kLsContQuit) != 0 && doQuit == 0)
+    if ((contNow & coopown::kLsContQuit) != 0 && doQuit == 0)
         DebugLog("[OWNSAVE] leave save: Exit NOT resumed (" + std::string(coopown::LeaveSaveWhyName(why)) + ") - the world changed or"
                  " the game is already stopping; the confirm path is not called again");
     if (doQuit != 0)
@@ -30372,6 +30487,13 @@ bool StoreSendTeam(const std::vector<char>& b)
     if (!LinkUp() || b.empty()) return false;
     return g_link->Send(0, (net::MsgType)kStoreMsgTeam, &b[0], b.size(), net::CH_RELIABLE);
 }
+/* the Admin's Toychest: MAIN THREAD - an ADMIN_REQ, ADMIN_DONE or ADMIN_GOD (src/common/admincmd.h) to the world server */
+bool StoreSendAdmin(unsigned type, const std::vector<char>& b)
+{
+    if (type == adminauth::kMsgAdminLogin) return LinkUp() && !b.empty() && g_link->Send(0, (net::MsgType)type, &b[0], b.size(), net::CH_RELIABLE);   /* admin two-factor: ASK, PROOF, LOGOUT - never a password */
+    if (!LinkUp() || b.empty() || (type != admincmd::kMsgAdminReq && type != admincmd::kMsgAdminDone && type != admincmd::kMsgAdminGod)) return false;
+    return g_link->Send(0, (net::MsgType)type, &b[0], b.size(), net::CH_RELIABLE);
+}
 /* T-556: MAIN THREAD - one FALLEN request (an encoded up message, src/common/fallenwire.h) to the world server */
 bool StoreSendFallen(const std::vector<char>& b)
 {
@@ -30516,6 +30638,14 @@ const char* BasePolicyName() { return BasePolicyNameOf(g_basePolicy); }
    property a run has to be able to exercise deliberately. The engine ignores injected input (F010), so a lever
    is the only way a run can press pause at all. */
 const char* TimeModeName() { return g_srvHours < 0.0 ? "unknown (no notebook clock yet)" : (g_srvMode == 1 ? "consensus" : "fixed"); }
+void StoreFooterTimeFacts(int* dedHere, unsigned* dedMode, int* haveClock, float* speed, int* clockMode)
+{
+    *dedHere = g_dedInfoLinkGen == (long)StoreLinkGen() ? 1 : 0;
+    *dedMode = g_dedInfoMode;
+    *haveClock = g_srvHours >= 0.0 ? 1 : 0;
+    *speed = g_srvSpeed;
+    *clockMode = g_srvMode == 1 ? 1 : 0;
+}
 bool SpeedVoteCommand(float speed)
 {
     if (!coopclock::ClockSpeedIsValid(speed)) return false;   /* the shared predicate */

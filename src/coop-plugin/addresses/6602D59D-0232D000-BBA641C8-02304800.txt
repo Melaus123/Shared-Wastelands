@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 625
+!count 633
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -637,3 +637,13 @@ NpcMemPlayerTest11                             code 00678857 00678857 4883B85002
 NpcMemPlayerTest12                             code 00678884 00678884 4883B850020000007407E886579BFFEB
 NpcMemPlayerTest13                             code 006788F7 006788F7 4883B850020000007404C6472800488B
 NpcMemPlayerTest14                             code 00678914 00678914 4883B850020000007407E8F6569BFFEB
+ResearchBenchWork                              code 0029B8D0 0029B8D0 48895C2408574881ECA000000080B960
+ResearchBenchIdle                              code 002995E0 002995E0 40534883EC20488B01488BD9FF505848
+ResearchAddProgress                            code 00836B70 00836B70 40534883EC70488BD98B89740100000F
+ResearchCurrentProgress                        code 0082F090 0082F090 40534883EC60488BDA4885D275534839
+TownPanelUpdate                                code 00727380 00727380 488BC455488DA8A8FDFFFF4881EC5003
+ResearchBenchDataRet                           ret  0082ECBE 0082ECB9 E8914C82FF
+# KENSHI API skill_xp (2026-10-31): the skill XP sink and the task XP adder. 1.0.68 rows read from the exe; the 1.0.65 rows are
+# derived (1.0.68 less 0xED0, the shift the neighbouring rows agree on), NOT read from a 1.0.65 exe. Optional rows: a mismatch only turns skill_xp off.
+Kapi_SkillXpGain                               code 008C5DF0 008C5DF0 40534883EC30F30F10050A65DB000F29
+Kapi_SkillXpTask                               code 008C6130 008C6130 4885D20F840801000048895C24185748

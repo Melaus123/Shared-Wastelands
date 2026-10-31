@@ -252,6 +252,27 @@ int StatsRecalcCopy(unsigned int uid, void* character)
     return rc;
 }
 
+/* THE ADMIN'S TOYCHEST /restore: the same two calls for a character THIS game drives, after its limbs grew back - the engine's
+   own limb calls recalculate on their own, the regrow (clothing.cpp) does not. No blood keep: the medical push sets blood to the
+   engine's maximum, which /restore wants. Same returns as StatsRecalcCopy. MAIN THREAD. */
+int StatsRecalcOwned(unsigned int uid, void* character)
+{
+    if (character == 0 || !net::IsUidMine(uid)) return 0;
+    if (EngineWritesBlocked()) { InterlockedIncrement64(&g_statsBlocked); return 0; }
+    if (kCharStatsVftRva == 0 || kMedicalVftRva == 0) return 0;
+    char* s = StatsObjPod(character);
+    if (!PlausibleHeap(s)) { InterlockedIncrement64(&g_statsFault); return 0; }
+    int animal = 0, bloodKept = 0;
+    float bloodBefore = 0.0f, bloodAfterPush = 0.0f;
+    const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
+    const int rc = StatsRecalcPod(s, base + (uintptr_t)kCharStatsVftRva,
+                                  kCharStatsAnimalVftRva != 0 ? base + (uintptr_t)kCharStatsAnimalVftRva : 0,
+                                  base + (uintptr_t)kMedicalVftRva, &animal, 0, &bloodBefore, &bloodAfterPush, &bloodKept);
+    if (rc == -1) InterlockedIncrement64(&g_statsFault);
+    if (rc == -2) InterlockedIncrement64(&g_statsMedFault);
+    return rc;
+}
+
 bool ApplyRemoteStats(unsigned int uid, const unsigned int* raw44, const char* why)
 {
     if (raw44 == 0) return false;

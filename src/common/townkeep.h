@@ -42,18 +42,20 @@
      TOWN  i32 owner slot (SAY: -1, the sender), 5 x i32 handle words, f32 x, f32 y (height), f32 z, str name (0..128 bytes, no control
            characters), u32 keys 0..kMaxTownKeys (with kKeysCut set: the outpost has pieces the list does not name), keys x str
            (1..47 bytes, each once), u32 size level 0..kLevelMax (T-811, protocol 100: the outpost's plevel, Town+0x388 - which outpost
-           icon the map draws)
+           icon the map draws), with kLevelPublic set (protocol 109) when the outpost is open to the public on its owner's game
+           (Town+0x380, the town panel's checkbox) - a teammate's copy takes the owner's setting
      str = u32 length, the bytes.
    FILES (player-towns.txt, kept-towns.txt): TAB-separated, LF line ends (a CR before it is read as nothing); line 1 "<header><TAB>4"
    (player-towns / kept-towns), then per outpost
      T <owner slot> <type> <container> <container stamp> <index> <serial> <x> <y> <z> <name> <cut 0 or 1> <size level 0..3> <outpost id>
-       <anchor x> <anchor z>   (format 5, T-940: the outpost's fixed anchor - THE FIXED ANCHOR below)
+       <anchor x> <anchor z> <public 0 or 1>   (format 5, T-940: the outpost's fixed anchor - THE FIXED ANCHOR below; format 6 adds the open-to-public field)
      K <key>     (after its outpost's T line: one key of that outpost - a said piece in player-towns, a kept piece in kept-towns)
      N <next id> (format 4, at most once, before the outposts: the next new outpost id - T-1047 step 5 fold 1, so an id is never
                  minted twice, even after its outpost was removed and the world server started again; absent = one past the
                  highest id on file)
-   Formats 1 (no cut field), 2 (no size level: read as 0), 3 (no outpost id: read as 0, given one at load - GiveMissingIds) and 4 (no
-   anchor: the row's centre at that read becomes its anchor) are still read.
+   Formats 1 (no cut field), 2 (no size level: read as 0), 3 (no outpost id: read as 0, given one at load - GiveMissingIds), 4 (the
+   dedicated fork's: the public field in the id's place, no id, no anchor) and 5 (upstream 0.3.5: no public field, read as 0) are still read;
+   a format 3 or 4 row's centre at that read becomes its anchor. Format 4 is the dedicated fork's 0.3.4 format, not upstream's interim one.
    THE OUTPOST ID (T-1047 step 5, owner 1043 / 1102 a): the world server's own stable number for one player outpost, 1..kOutpostIdMax
    (0 = none yet). Never a town handle (they differ between games) nor a centre (it drifts). Minted in ReplaceSlotTowns: a said row
    that inherits a row on file (its centre within kTownSameRadius, or a shared key) keeps that row's id; one that inherits none takes
@@ -87,12 +89,15 @@ const char* const kPlayerTownsFile = "player-towns.txt";
 const char* const kPlayerTownsHeader = "player-towns";
 const char* const kKeptTownsFile = "kept-towns.txt";
 const char* const kKeptTownsHeader = "kept-towns";
-const int kTownsFormat = 5;   /* the outpost list files' format this build writes (5: with the fixed anchor, T-940) */
-const int kTownsFormatId = 4;   /* the format before it (with the outpost id, T-1047 step 5; no anchor: the centre at the read) */
-const int kTownsFormatLevel = 3;   /* the format before it (with the size level, T-811; no outpost id: read as 0) */
+const int kTownsFormat = 6;   /* the outpost list files' format this build writes (6: with the fixed anchor and the open-to-public field) */
+const int kTownsFormatAnchor = 5;   /* upstream 0.3.5's (outpost id + fixed anchor, T-940; no public field: read as 0) */
+const int kTownsFormatPub = 4;   /* the dedicated fork's 0.3.4 one (the public field; no outpost id, no anchor: the centre at the read) */
+const int kTownsFormatLevel = 3;   /* the format before them (with the size level, T-811; no outpost id, not public) */
 const unsigned kOutpostIdMax = 0x7FFFFFFFu;   /* an outpost id: 1..this (0 = none) */
 const int kTownsFormatCut = 2;   /* the format before it (no size level): still read, as level 0 */
 const int kLevelMax = 3;   /* an outpost's size level (Town+0x388 'plevel', set by the engine 0x48B770 from the buildings near it): 0..3 */
+const unsigned kLevelPublic = 0x100u;   /* on a TOWN's size level word (protocol 109): the outpost is open to the public (TownRow::pub); every other
+                                           bit above the level is refused */
 const int kTownsFormatKeyless = 1;   /* the format before it (no cut field): still read */
 const unsigned kSayFirst = 1, kSayMore = 2, kSayWhole = 4;   /* a SAY's flags word */
 const unsigned kKeysCut = 0x80000000u;   /* on a TOWN's key count: the outpost has pieces its list does not name */
@@ -109,10 +114,11 @@ struct TownRow
     std::vector<std::string> keys;   /* SAY and player-towns.txt: the pieces linked to the outpost; LIST and kept-towns.txt: its kept pieces */
     int cut;                         /* 1 = the outpost has pieces keys does not name (its game's list was cut, or not every piece could be read) */
     int level;                       /* T-811: the outpost's size level 0..kLevelMax as its owner's game reads it (0 in a LIST and kept-towns.txt) */
+    int pub;                         /* the outpost's "open to public" setting on its owner's game (Town+0x380), so a teammate's copy takes it: 0 or 1 */
     unsigned id;                     /* T-1047 step 5: the world server's outpost id (0 = none yet; never on the TOWNS wire) */
     float anchor[2];                 /* T-940: the fixed anchor x, z (valid when anchored is 1; never on the TOWNS wire) */
     int anchored;                    /* T-940: 1 = anchor is set (a row on file or inherited); 0 = not yet (a said row before ReplaceSlotTowns) */
-    TownRow() : owner(-1), cut(0), level(0), id(0), anchored(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; anchor[0] = anchor[1] = 0.0f; }
+    TownRow() : owner(-1), cut(0), level(0), pub(0), id(0), anchored(0) { for (int i = 0; i < 5; ++i) hand[i] = 0; pos[0] = pos[1] = pos[2] = 0.0f; anchor[0] = anchor[1] = 0.0f; }
 };
 /* T-940: the row's fixed anchor (x, z): its anchor when set, else its centre */
 inline void AnchorOf(const TownRow& t, float* ax, float* az)
@@ -139,7 +145,7 @@ inline bool RowOk(const TownRow& t, unsigned op)
     if (op == kOpSay) { if (t.owner != -1) return false; }
     else if (op == kOpList || op == kOpShowKeys) { if (t.owner < 0 || t.owner > kOwnerMax) return false; }
     else return false;
-    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.level < 0 || t.level > kLevelMax || t.id > kOutpostIdMax) return false;
+    if (t.keys.size() > kMaxTownKeys || (t.cut != 0 && t.cut != 1) || t.level < 0 || t.level > kLevelMax || (t.pub != 0 && t.pub != 1) || t.id > kOutpostIdMax) return false;
     for (int j = 0; j < 3; ++j) if (!keptwire::FloatOk(t.pos[j])) return false;
     if (t.anchored != 0 && (!keptwire::FloatOk(t.anchor[0]) || !keptwire::FloatOk(t.anchor[1]))) return false;   /* T-940 */
     if (!keptwire::TextOk(t.name, keptwire::kStrMax, true)) return false;
@@ -192,7 +198,7 @@ inline bool EncodeTowns(std::vector<char>* out, unsigned op, int first, const st
         keptwire::PutStr(out, t.name);
         keptwire::PutU32(out, (unsigned)t.keys.size() | (t.cut != 0 ? kKeysCut : 0u));
         for (size_t k = 0; k < t.keys.size(); ++k) keptwire::PutStr(out, t.keys[k]);
-        keptwire::PutU32(out, (unsigned)t.level);
+        keptwire::PutU32(out, (unsigned)t.level | (t.pub != 0 ? kLevelPublic : 0u));
     }
     return true;
 }
@@ -215,8 +221,9 @@ inline int DecodeTowns(const char* p, size_t n, unsigned* op, int* first, std::v
         t.cut = (nkw & kKeysCut) != 0 ? 1 : 0;
         if (r.bad || nk > kMaxTownKeys || (size_t)nk > (r.n - r.at) / 5) return 0;   /* a key takes 5 bytes at least */
         for (unsigned k = 0; k < nk && !r.bad; ++k) t.keys.push_back(r.Str(keptwire::kKeyMax, false));
-        const unsigned lv = r.U32();
+        const unsigned lvw = r.U32(), lv = lvw & ~kLevelPublic;
         t.level = lv > (unsigned)kLevelMax ? -1 : (int)lv;   /* -1: refused by RowOk */
+        t.pub = (lvw & kLevelPublic) != 0 ? 1 : 0;
         if (r.bad || !RowOk(t, o)) return 0;
         v.push_back(t);
     }
@@ -343,7 +350,7 @@ inline std::string EncodeTownsFile(const char* header, const std::vector<TownRow
         float ax = 0.0f, az = 0.0f;
         AnchorOf(t, &ax, &az);   /* T-940: a row with no anchor yet is written with its centre - fixed from then on */
         o += "\t" + zonekeep::Esc(t.name) + "\t" + zonekeep::ZkNum(t.cut) + "\t" + zonekeep::ZkNum(t.level) + "\t" + zonekeep::ZkNum((long long)t.id)
-             + "\t" + zonekeep::FloatHex(ax) + "\t" + zonekeep::FloatHex(az) + "\n";
+             + "\t" + zonekeep::FloatHex(ax) + "\t" + zonekeep::FloatHex(az) + "\t" + zonekeep::ZkNum(t.pub) + "\n";
         if (withKeys) for (size_t k = 0; k < t.keys.size(); ++k) o += "K\t" + zonekeep::Esc(t.keys[k]) + "\n";
     }
     return o;
@@ -375,8 +382,8 @@ inline bool DecodeTownsFile(const std::string& text, const char* header, bool wi
         if (lineNo == 1)
         {
             int v = 0;
-            if (f.size() != 2 || f[0] != header || !zonekeep::DecInt(f[1], &v) || (v != kTownsFormat && v != kTownsFormatId && v != kTownsFormatLevel && v != kTownsFormatCut && v != kTownsFormatKeyless))
-            { *why = where + "not a " + header + " list of format " + zonekeep::ZkNum(kTownsFormatKeyless) + ", " + zonekeep::ZkNum(kTownsFormatCut) + ", " + zonekeep::ZkNum(kTownsFormatLevel) + ", " + zonekeep::ZkNum(kTownsFormatId) + " or " + zonekeep::ZkNum(kTownsFormat); return false; }
+            if (f.size() != 2 || f[0] != header || !zonekeep::DecInt(f[1], &v) || (v != kTownsFormat && v != kTownsFormatAnchor && v != kTownsFormatPub && v != kTownsFormatLevel && v != kTownsFormatCut && v != kTownsFormatKeyless))
+            { *why = where + "not a " + header + " list of format " + zonekeep::ZkNum(kTownsFormatKeyless) + ", " + zonekeep::ZkNum(kTownsFormatCut) + ", " + zonekeep::ZkNum(kTownsFormatLevel) + ", " + zonekeep::ZkNum(kTownsFormatPub) + ", " + zonekeep::ZkNum(kTownsFormatAnchor) + " or " + zonekeep::ZkNum(kTownsFormat); return false; }
             fmt = v;
             continue;
         }
@@ -384,14 +391,16 @@ inline bool DecodeTownsFile(const std::string& text, const char* header, bool wi
         if (f[0] == "T")
         {
             TownRow t;
-            bool ok = f.size() == (fmt == kTownsFormatKeyless ? 11u : fmt == kTownsFormatCut ? 12u : fmt == kTownsFormatLevel ? 13u : fmt == kTownsFormatId ? 14u : 16u) && zonekeep::DecInt(f[1], &t.owner);
+            bool ok = f.size() == (fmt == kTownsFormatKeyless ? 11u : fmt == kTownsFormatCut ? 12u : fmt == kTownsFormatLevel ? 13u : fmt == kTownsFormatPub ? 14u : fmt == kTownsFormatAnchor ? 16u : 17u) && zonekeep::DecInt(f[1], &t.owner);
             for (int j = 0; ok && j < 5; ++j) ok = zonekeep::DecInt(f[(size_t)(2 + j)], &t.hand[j]);
             for (int j = 0; ok && j < 3; ++j) ok = zonekeep::HexFloat(f[(size_t)(7 + j)], &t.pos[j]);
             if (ok && fmt != kTownsFormatKeyless) ok = zonekeep::DecInt(f[11], &t.cut);
-            if (ok && (fmt == kTownsFormat || fmt == kTownsFormatId || fmt == kTownsFormatLevel)) ok = zonekeep::DecInt(f[12], &t.level);
-            if (ok && (fmt == kTownsFormat || fmt == kTownsFormatId)) { int id = -1; ok = zonekeep::DecInt(f[13], &id) && id >= 0; t.id = ok ? (unsigned)id : 0u; }   /* T-1047 step 5 */
-            if (ok && fmt == kTownsFormat) { float ax = 0.0f, az = 0.0f; ok = zonekeep::HexFloat(f[14], &ax) && zonekeep::HexFloat(f[15], &az); if (ok) SetAnchor(&t, ax, az); }   /* T-940 */
+            if (ok && fmt != kTownsFormatKeyless && fmt != kTownsFormatCut) ok = zonekeep::DecInt(f[12], &t.level);
+            if (ok && fmt == kTownsFormatPub) ok = zonekeep::DecInt(f[13], &t.pub);   /* the dedicated fork's format 4 */
+            if (ok && (fmt == kTownsFormat || fmt == kTownsFormatAnchor)) { int id = -1; ok = zonekeep::DecInt(f[13], &id) && id >= 0; t.id = ok ? (unsigned)id : 0u; }   /* T-1047 step 5 */
+            if (ok && (fmt == kTownsFormat || fmt == kTownsFormatAnchor)) { float ax = 0.0f, az = 0.0f; ok = zonekeep::HexFloat(f[14], &ax) && zonekeep::HexFloat(f[15], &az); if (ok) SetAnchor(&t, ax, az); }   /* T-940 */
             else if (ok) SetAnchor(&t, t.pos[0], t.pos[2]);   /* T-940: an older file - the centre at this read is the anchor */
+            if (ok && fmt == kTownsFormat) ok = zonekeep::DecInt(f[16], &t.pub);
             ok = ok && zonekeep::Unesc(f[10], &t.name) && RowOk(t, kOpList);
             if (!ok) { *why = where + "an outpost line this build cannot read"; return false; }
             rows.push_back(t);
@@ -406,7 +415,7 @@ inline bool DecodeTownsFile(const std::string& text, const char* header, bool wi
         else if (f[0] == "N")
         {   /* T-1047 step 5 fold 1: the next new outpost id */
             int v = 0;
-            const bool ok = (fmt == kTownsFormat || fmt == kTownsFormatId) && nSeen == 0 && f.size() == 2 && zonekeep::DecInt(f[1], &v) && v >= 1;
+            const bool ok = (fmt == kTownsFormat || fmt == kTownsFormatAnchor) && nSeen == 0 && f.size() == 2 && zonekeep::DecInt(f[1], &v) && v >= 1;
             if (!ok) { *why = where + "a next-id line this build cannot read (or a second one)"; return false; }
             nSeen = 1; nNext = (unsigned)v;
         }
@@ -1251,6 +1260,97 @@ inline int PendingStep(int standing, int dead, int rowOk)
     if (standing == 0) return kPendGone;
     if (dead != 0) return kPendDead;
     return rowOk != 0 ? kPendTry : kPendGone;
+}
+
+/* ---- A PLAYER'S OUTPOST IS NOT GIVEN UP WHILE ITS BUILDINGS STAND (town crash-safety) ----
+   A game that crashed loads its last engine save, which can be older than an outpost its player founded since; the mod's own records
+   rebuild that outpost's pieces, but not the town. Its SAYs then name no outpost there, and the world server used to take the
+   kEmptyWholeToClear-th such SAY as "the player gave it up" and dropped the row from player-towns.txt. Now a row of the slot that a
+   whole SAY does not hold (no said outpost stands at its centre or names one of its pieces - ReplaceSlotTowns' own match) is KEPT on
+   file while a piece of the slot still stands in its area (the world server's live piece records: within kOutpostTakeRadius of the
+   row's centre, or at one of its keys' spots), and the world server sends it back to that game in a LIST, so the game takes or founds
+   the town there and links the pieces to it, as it does for a reset world's kept outposts. A row with no piece of its player standing
+   in its area is let go as before (the player really gave it up). */
+struct StandingPiece
+{
+    int owner;        /* the piece's owner slot (its piece record's header) */
+    float pos[3];     /* x, height, z (the piece record's id) */
+    StandingPiece() : owner(-1) { pos[0] = pos[1] = pos[2] = 0.0f; }
+};
+const float kStandKeyRadius = 1.0f;   /* a standing piece this close (x, z) to a key's spot is that key's piece (a key is in tenths) */
+/* 1 = a piece of t's owner stands in t's area: within kOutpostTakeRadius of its centre, or at one of its keys' spots */
+inline int RowHasStanding(const TownRow& t, const std::vector<StandingPiece>& pieces)
+{
+    std::vector<TkSpot> spots;
+    for (size_t k = 0; k < t.keys.size(); ++k) { const TkSpot s = SpotOfKey(t.keys[k]); if (s.ok != 0) spots.push_back(s); }
+    for (size_t i = 0; i < pieces.size(); ++i)
+    {
+        const StandingPiece& p = pieces[i];
+        if (p.owner != t.owner) continue;
+        if (keptwire::NearXZ(p.pos[0], p.pos[2], t.pos[0], t.pos[2], kOutpostTakeRadius)) return 1;
+        for (size_t k = 0; k < spots.size(); ++k)
+            if (keptwire::NearXZ(p.pos[0], p.pos[2], (float)spots[k].x10 / 10.0f, (float)spots[k].z10 / 10.0f, kStandKeyRadius)) return 1;
+    }
+    return 0;
+}
+/* 1 = the said rows hold on-file row t: a said outpost stands at its centre (TownStands) or names one of its pieces (TownKeysSame) */
+inline int SaidHolds(const std::vector<TownRow>& said, const TownRow& t)
+{
+    for (size_t i = 0; i < said.size(); ++i) if (TownStands(said[i].pos, t) != 0) return 1;
+    TownKeyFinder keys;
+    for (size_t j = 0; j < t.keys.size(); ++j) keys.Add(0, t.keys[j], j);
+    for (size_t i = 0; i < said.size(); ++i)
+        for (size_t k = 0; k < said[i].keys.size(); ++k) if (keys.Find(0, said[i].keys[k], 0) != 0) return 1;
+    return 0;
+}
+/* WHERE IT RUNS: on a DEDICATED world server only (--dedicated; an always-on world). A hosted world takes every whole
+   SAY exactly as 0.3.4 does (a row its owner's game no longer says is let go). 1 = look for rows to keep. */
+inline int CrashSafetyOn(int dedicated, int whole) { return (dedicated != 0 && whole != 0) ? 1 : 0; }
+/* the slot's rows on file a whole SAY (said) does not hold - 0 = none (the caller then needs no piece list) */
+inline size_t RowsUnheld(const std::vector<TownRow>& all, int slot, const std::vector<TownRow>& said)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < all.size(); ++i) if (all[i].owner == slot && SaidHolds(said, all[i]) == 0) ++n;
+    return n;
+}
+/* THE ROWS KEPT FOR THE SLOT: its rows on file the whole SAY does not hold while a piece of the slot stands in their area, in their
+   order (owner = slot). Empty = the SAY is taken as it always was. */
+inline std::vector<TownRow> LostWhileStanding(const std::vector<TownRow>& all, int slot, const std::vector<TownRow>& said, const std::vector<StandingPiece>& pieces)
+{
+    std::vector<TownRow> o;
+    for (size_t i = 0; i < all.size(); ++i)
+        if (all[i].owner == slot && SaidHolds(said, all[i]) == 0 && RowHasStanding(all[i], pieces) != 0) o.push_back(all[i]);
+    return o;
+}
+/* after ReplaceSlotTowns took the SAY: the kept rows back on file, behind the said ones, while the slot has fewer than kMaxTownsPerSlot */
+inline void KeepLostRows(std::vector<TownRow>* all, int slot, const std::vector<TownRow>& lost)
+{
+    size_t mine = 0;
+    for (size_t i = 0; i < all->size(); ++i) if ((*all)[i].owner == slot) ++mine;
+    for (size_t i = 0; i < lost.size() && mine < kMaxTownsPerSlot; ++i)
+    {
+        if (SaidHolds(*all, lost[i]) != 0) continue;   /* already on file (a SAY not read whole keeps the rows it does not name) */
+        TownRow t = lost[i]; t.owner = slot;
+        all->push_back(t); ++mine;
+    }
+}
+/* THE LIST A GAME IS SENT: the reset's kept outposts, then the kept rows of its own player (owner = its slot, size level 0 as a LIST
+   row carries it) that no kept outpost already stands for; rows a LIST cannot carry are counted in *bad */
+inline std::vector<TownRow> ListWithOwn(const std::vector<TownRow>& kept, const std::vector<TownRow>& own, int slot, size_t* bad)
+{
+    std::vector<TownRow> o;
+    if (bad) *bad = 0;
+    for (size_t i = 0; i < kept.size(); ++i) { if (RowOk(kept[i], kOpList)) o.push_back(kept[i]); else if (bad) ++*bad; }
+    const size_t keptN = o.size();
+    for (size_t i = 0; i < own.size(); ++i)
+    {
+        TownRow t = own[i]; t.owner = slot; t.level = 0;
+        int dup = 0;
+        for (size_t j = 0; j < keptN && dup == 0; ++j) if (o[j].owner == slot && TownStands(t.pos, o[j]) != 0) dup = 1;
+        if (dup != 0) continue;
+        if (RowOk(t, kOpList)) o.push_back(t); else if (bad) ++*bad;
+    }
+    return o;
 }
 
 }   /* namespace townkeep */

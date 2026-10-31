@@ -1896,6 +1896,7 @@ void t_t942_item_notice();
 void t_t943_npc_sites();
 void t_t943_npc_stub();
 void t_t943_npc_list();
+void t_addr_signatures_optional_rows_dropped();   /* TEAMMAP: the six research rows are optional on the signature road (suite_part1.cpp, beside sigt) */
 
 }   /* namespace suite */
 

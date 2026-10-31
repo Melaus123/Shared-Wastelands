@@ -458,6 +458,7 @@ int SteamFriendsShows(std::vector<steamfriends::FriendRow>* rows)
 }
 
 long SteamFriendsGen() { return g_gen; }
+unsigned long long SteamSelfIdNow() { return g_self; }   /* DEDICATED: the HELLO tail reports it (0 = Steam not read yet) */
 
 void SteamFriendsRefresh()
 {

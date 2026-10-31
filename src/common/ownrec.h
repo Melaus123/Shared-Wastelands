@@ -1853,6 +1853,37 @@ inline std::string LeaveSaveTarget(const std::string& profileFolder)
 {
     return profileFolder;
 }
+/* WHICH SAVES HAND ESCROW BACK (inv7c fold 2, recheck 1): only a save the session ends behind - a leave, the Exit-held quit, the
+   host-left save. After those no PLACED can settle an escrowed TAKE in this session, so each row goes back to its owner first (D6:
+   a duplicate rather than a loss), or, with a hand-over line, is left to its line (T-889 A6). Every other road through the leave
+   save - the admin's /save, the world server's background save (that same /save, every `autosave` minutes) and the save after a new
+   character - is a save in the MIDDLE of a live session: the transfer still completes on the other game, so a hand-back there puts
+   the item back with its owner while the taker keeps it too (a duplicate on every background save). Those saves leave escrow alive,
+   as any routine save does. The save and the records still agree: the holder's hand-over line (handrec.h, written with E_h before the
+   item could appear on the other game) is drained into the records ahead of the save, and after a reload its QUERY / VERDICT settle
+   the item either way - placed (closed) or rebuilt from the line's bytes (returned). */
+inline int LeaveSaveHandsBack(const char* where)
+{
+    if (where == 0) return 0;
+    const std::string w(where);
+    return (w == "leave" || w == "exit" || w == "host-left") ? 1 : 0;
+}
+/* the save-start hand-back (store.cpp detour_saveManagerSave, through OwnEdgeSaveRunning): a leave save is running AND an edge rides on
+   it - the save was started by a leave / exit / host-left, or one of those joined it before its request. */
+inline int SaveStartHandsBack(int leaveSaveRunning, int edgeRides) { return (leaveSaveRunning != 0 && edgeRides != 0) ? 1 : 0; }
+/* A LEAVE THAT JOINS A ROUTINE SAVE TOO LATE (audit: escrow vs a running background save). A leave / exit / host-left hands escrow back
+   just before it joins a running save. A routine save (the admin's /save, the background save, the created save: no hand-back of its
+   own) whose request the engine has already ACCEPTED (kLsWait, or finished and held for its checkpoint) took or is taking its snapshot -
+   the hand-back may not be in it. Then the leave does NOT ride on that save: it waits for it to end, and a leave save of its own (which
+   hands escrow back at its start, before its snapshot) runs next; the leave / exit continues at THAT save's edge. A join before the
+   request (kLsDrain, kLsRequest) rides as before: its hand-back is already done when the request is made. 1 = save again after it. */
+inline int LeaveJoinSavesAgain(int phase, int runningHandsBack, int joinHandsBack)
+{
+    return (joinHandsBack != 0 && runningHandsBack == 0 && (phase == kLsWait || phase == kLsFinished)) ? 1 : 0;
+}
+/* the second save starts when the first had nothing of its own to continue (a routine save) and the world did not change or start
+   stopping under it; otherwise the leave continues at the first save's edge, as before */
+inline int LeaveAgainStarts(int firstCont, int why) { return (firstCont == 0 && why != kLsWhyWorldChanged && why != kLsWhyStopping) ? 1 : 0; }
 /* ---- T-251 part 2 (owner design: the MMO save - one save moment is RIGHT AFTER A NEW CHARACTER IS MADE; manager decisions
    2026-09-29) ----
    THE EDGE, each main-thread tick: win = the character editor window (ForgottenGUI+0x1C0, 0 = none), mode = the window's byte

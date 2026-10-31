@@ -63,6 +63,18 @@ inline int AddrHookedVerdict(const unsigned char* expected, const unsigned char*
    hook is about to be installed at - when it is call-only, coop::AddHook refuses: the gate may have accepted another
    mod's jump there, and this mod promised only to call it). */
 const unsigned char kHookUseCallOnly = 1;
+/* AN OPTIONAL ROW (2 = kAddrUseOptional in src/coop-plugin/addresses.h). A row whose registrations are ALL
+   optional may fail its byte check, or be missing from the table, without disabling the mod: its slots stay 0 and only the feature
+   that needs it is off (its code tests the slot for 0 before any use). An optional registration is never call-only. */
+const unsigned char kHookUseOptional = 2;
+inline int AddrUsesAllOptional(const unsigned char* uses, int n)
+{
+    int i;
+    if (uses == 0 || n <= 0) return 0;
+    for (i = 0; i < n; ++i)
+        if (uses[i] != kHookUseOptional) return 0;
+    return 1;
+}
 
 inline int AddrUsesAllCallOnly(const unsigned char* uses, int n)
 {

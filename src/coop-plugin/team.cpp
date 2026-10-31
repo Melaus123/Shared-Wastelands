@@ -4,6 +4,7 @@
 #include "relations.h"      /* RelationsOwnRecord: this game's faction standing with every NPC faction, read for the ACCEPT */
 #include "playerfaction.h"  /* LocalPlayerFaction */
 #include "soak.h"           /* GameplayRunning */
+#include "kmode.h"          /* GameRecordLoaded: is the Cat Vault (Cat Pouch mod) loaded at all */
 #include "tags.h"           /* TagsCaptionsDirty: a team change recolours and renames the name tags */
 #include "policy.h"         /* PolicyTeamAccessProbe: the `team access` lever */
 #include "playerstab.h"     /* PlayersTabOwedWhileAway: the FACTION box at the next join */
@@ -15,11 +16,20 @@
 #include "../common/teamstanding.h"   /* step 5: the pre-join snapshot, the join set, the founder's stance, the restore */
 #include "../common/teamresearch.h"   /* step 6: the shared research - what is new here, the echo rule, the lines */
 #include "../common/teamscreens.h"    /* the faction screens' words: the message lines */
+#include "../common/playerstab.h"     /* SW Bank: playerstab::EscapeHash - the bank box's text */
 #include "chat.h"           /* ChatPlayNotification: a teammate's research line plays the game's research-complete sound */
+#include "money.h"          /* SW Bank: MoneyBankDeposit / Withdraw / Answer - the cats move on the money ledger (exactly once) */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>   /* GetTickCount */
+#include <mygui/MyGUI_Gui.h>             /* SW Bank: the bank box */
+#include <mygui/MyGUI_Widget.h>
+#include <mygui/MyGUI_Button.h>
+#include <mygui/MyGUI_EditBox.h>
+#include <mygui/MyGUI_Window.h>
+#include <mygui/MyGUI_InputManager.h>
+#include <mygui/MyGUI_RenderManager.h>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -28,6 +38,8 @@
 #include <vector>
 
 namespace coop {
+void BankArrived(unsigned op, unsigned txn, unsigned result, unsigned balance);   /* SW Bank: below - a BANK answer from the world server */
+int BankPurseMoney();                   /* resurrect.cpp: the player's cats, -1 no purse */
 namespace {
 std::vector<swteam::WireTeam> g_table;
 int g_tableGen = -1;                 // StoreLinkGen() of the link that sent g_table (-1 = none: never sent, or cleared)
@@ -1013,6 +1025,9 @@ void TeamArrive(const std::vector<char>& payload)
             DebugLog("[TEAM] research level: team " + N((long long)d.lvTeam) + "'s level is " + N((long long)d.lvLevel) + " from the world server (" + (answer ? std::string("the answer to this game's report") : std::string("the team's level changed"))
                      + ") - this game's engine is raised to it when lower (in " + N(g_lvIn) + ")");
     }
+    else if (d.kind == swteam::kDnWork) TeamWorkArrived(d.fromSlot, d.work);   /* TEAMMAP: research work at one of this player's benches */
+    else if (d.kind == swteam::kDnWorkState) TeamWorkStateArrived(d.fromSlot, d.workIdle != 0, d.workTech, d.workFrac);   /* TEAMMAP: a teammate's research state */
+    else if (d.kind == swteam::kDnBank) BankArrived(d.bankOp, d.bankTxn, d.result, d.bankBalance);   /* SW Bank */
     else if (d.kind == swteam::kDnRestore)
     {
         ++g_restores; if (d.away) ++g_restoresAway;
@@ -1035,6 +1050,8 @@ void TeamArrive(const std::vector<char>& payload)
     }
 }
 
+void BankVaultCheckTick();   /* below, with the bank */
+
 void TeamTick()
 {
     /* a world torn down or loading: the box stub's cells are emptied, so no faction of the next world can match an old teammate's
@@ -1047,6 +1064,7 @@ void TeamTick()
     ResearchTick();
     LevelTick();
     CellsTick();
+    BankVaultCheckTick();
     const int gen = StoreLinkGen();
     if (g_tableGen == gen || g_askedGen == gen || StoreWelcomedThisLink() == 0) return;
     g_askedGen = gen;   /* once per link and per clearing, sent or not: a new link's WELCOME brings the table anyway */
@@ -1317,5 +1335,224 @@ bool TeamInvitationWaiting(int* fromSlot, std::string* teamName, unsigned* seria
     if (teamName != 0) *teamName = g_invite.teamName;
     if (serial != 0) *serial = g_invite.serial;
     return true;
+}
+bool TeamWorkSend(unsigned toSlot, float amount)
+{
+    std::vector<char> b;
+    if (!swteam::EncodeWork(&b, toSlot, amount)) return false;
+    return Send(b);
+}
+bool TeamWorkStateSend(bool idle, const std::string& tech, float frac)
+{
+    std::vector<char> b;
+    if (!swteam::EncodeWorkState(&b, idle, tech, frac)) return false;
+    return Send(b);
+}
+bool TeamBankSend(unsigned op, unsigned txn, unsigned amount)
+{
+    std::vector<char> b;
+    if (!swteam::EncodeBank(&b, op, txn, amount)) return false;
+    return Send(b);
+}
+
+/* ---- SW Bank: a team's shared cats on the world server (teamwire.h BANK, protocol 109). The bank box (the ATM: the Cat Vault building)
+   opens an amount box; DEPOSIT takes the cats from this player's purse and writes the deposit with the new balance in one pp.money write
+   before it is sent, WITHDRAW asks the world server and pays out on its yes - both on the money ledger (money.cpp MoneyBank*, exactly
+   once: a waiting request is sent again on every new link and the world server answers a decided one with the same answer). The world
+   server decides and saves before it answers (store_main.cpp kUpBank); a refused deposit's cats come back (money.cpp).
+   MAIN THREAD (the order gate, build.cpp detour_order; the TEAM dispatch; the box's own clicks). Player-to-player GIVE MONEY
+   (moneywire.h) is untouched: the bank is in addition. ---- */
+namespace {
+const char* const kBankBuildingSid = swteam::kBankVaultSid;   // the Cat Vault (Cat Pouch mod) is the ATM - in linked team play only (BankTakesVaultNow)
+int g_bankVaultCheckedGen = -1;     // the link whose team play was checked for the Cat Vault record (BankVaultCheckTick)
+bool g_bankVaultOwnSaid = false;    // "the vault keeps its own menu here" said once
+MyGUI::Widget* g_bankWin = 0;
+MyGUI::EditBox* g_bankAmount = 0;
+MyGUI::EditBox* g_bankInfo = 0;
+unsigned g_bankBalance = 0;
+int g_bankBalanceKnown = 0;
+std::map<unsigned, unsigned> g_bankDeposits;   // txn -> cats taken from the purse, waiting for the world server (the box's words; money.cpp moves the cats)
+std::map<unsigned, unsigned> g_bankWithdraws;  // txn -> cats asked for (the box's words)
+std::string g_bankNote;
+
+std::string BankCats(unsigned v)
+{
+    const std::string d = N((long long)v);
+    std::string out;
+    for (size_t i = 0; i < d.size(); ++i) { if (i != 0 && (d.size() - i) % 3 == 0) out += ','; out += d[i]; }
+    return "c." + out;
+}
+MyGUI::UString BankU(const std::string& s) { return MyGUI::UString(playerstab::EscapeHash(s).c_str()); }
+MyGUI::Colour BankLit() { return MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f); }
+void BankRefresh()
+{
+    if (g_bankInfo == 0) return;
+    const int p = BankPurseMoney();
+    std::string t = "Team bank: " + std::string(g_bankBalanceKnown ? BankCats(g_bankBalance) : "asking the world server...") + "\n";
+    t += "Your cats: " + std::string(p >= 0 ? BankCats((unsigned)p) : "-") + "\n";
+    if (!g_bankNote.empty()) t += "\n" + g_bankNote;
+    g_bankInfo->setCaption(BankU(t));
+}
+unsigned BankAmountTyped()
+{
+    if (g_bankAmount == 0) return 0;
+    const std::string s = g_bankAmount->getOnlyText().asUTF8();
+    unsigned long long v = 0;
+    for (size_t i = 0; i < s.size(); ++i) { if (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (unsigned)(s[i] - '0'); if (v > swteam::kMaxBank) return swteam::kMaxBank + 1; } }
+    return (unsigned)v;
+}
+void BankClose()
+{
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (g_bankWin != 0 && gui != 0)
+    {
+        MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+        if (im != 0) im->removeWidgetModal(g_bankWin);
+        gui->destroyWidget(g_bankWin);
+    }
+    g_bankWin = 0; g_bankAmount = 0; g_bankInfo = 0;
+}
+void BankDeposit()
+{
+    const unsigned n = BankAmountTyped();
+    if (n == 0 || n > swteam::kMaxBankMove) { g_bankNote = "Type how many cats (at most " + BankCats(swteam::kMaxBankMove) + " at a time)."; BankRefresh(); return; }
+    std::string why; unsigned txn = 0;
+    if (!MoneyBankDeposit(n, &why, &txn)) { g_bankNote = why; BankRefresh(); return; }   /* nothing taken */
+    g_bankDeposits[txn] = n;
+    g_bankNote = "Depositing " + BankCats(n) + "...";
+    BankRefresh();
+}
+void BankWithdraw()
+{
+    const unsigned n = BankAmountTyped();
+    if (n == 0 || n > swteam::kMaxBankMove) { g_bankNote = "Type how many cats (at most " + BankCats(swteam::kMaxBankMove) + " at a time)."; BankRefresh(); return; }
+    std::string why; unsigned txn = 0;
+    if (!MoneyBankWithdraw(n, &why, &txn)) { g_bankNote = why; BankRefresh(); return; }
+    g_bankWithdraws[txn] = n;
+    g_bankNote = "Withdrawing " + BankCats(n) + "...";
+    BankRefresh();
+}
+void BankSafeRefresh() { __try { BankRefresh(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+void BankOnDeposit(MyGUI::Widget*) { __try { BankDeposit(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+void BankOnWithdraw(MyGUI::Widget*) { __try { BankWithdraw(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+void BankOnClose(MyGUI::Widget*) { __try { BankClose(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+MyGUI::Widget* BankMk(MyGUI::Widget* parent, const char* type, const char* skin, int l, int t, int w, int h)
+{ return parent->createWidgetT(std::string(type), std::string(skin), MyGUI::IntCoord(l, t, w, h), MyGUI::Align::Default); }
+bool BankOpenBox()
+{
+    if (g_bankWin != 0) return true;
+    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+    if (gui == 0) return false;
+    int vw = 1280, vh = 720;
+    MyGUI::RenderManager* rm = MyGUI::RenderManager::getInstancePtr();
+    if (rm != 0) { const MyGUI::IntSize& sz = rm->getViewSize(); if (sz.width > 0 && sz.height > 0) { vw = sz.width; vh = sz.height; } }
+    const int w = 440, h = 270;
+    MyGUI::Widget* raw = 0;
+    static const char* const kLayers[2] = { "Info", "Popup" };
+    for (int k = 0; k < 2 && raw == 0; ++k)
+    {
+        raw = gui->createWidgetT(std::string("Window"), std::string("Kenshi_WindowC"), MyGUI::IntCoord((vw - w) / 2, (vh - h) / 2, w, h),
+                                 MyGUI::Align::Default, std::string(kLayers[k]), std::string("SWBankBox"));
+        if (raw != 0 && raw->getLayer() == 0) { gui->destroyWidget(raw); raw = 0; }
+    }
+    MyGUI::Window* win = raw != 0 ? raw->castType<MyGUI::Window>(false) : 0;
+    MyGUI::Widget* cl = win != 0 ? win->getClientWidget() : 0;
+    if (cl == 0) { if (raw != 0) gui->destroyWidget(raw); return false; }
+    win->setMovable(true);
+    win->setCaption(MyGUI::UString("BANK"));
+    const int W = cl->getWidth(), H = cl->getHeight();
+    MyGUI::Widget* iw = BankMk(cl, "EditBox", "Kenshi_WordWrapEmpty", 10, 8, W - 20, H - 100);
+    MyGUI::Widget* aw = BankMk(cl, "EditBox", "Kenshi_EditBox", 10, H - 86, W - 20, 30);
+    const int bw = (W - 40) / 3;
+    MyGUI::Widget* d = BankMk(cl, "Button", "Kenshi_Button2", 10, H - 46, bw, 36);
+    MyGUI::Widget* x = BankMk(cl, "Button", "Kenshi_Button2", 20 + bw, H - 46, bw, 36);
+    MyGUI::Widget* c = BankMk(cl, "Button", "Kenshi_Button2", 30 + 2 * bw, H - 46, bw, 36);
+    g_bankInfo = iw != 0 ? iw->castType<MyGUI::EditBox>(false) : 0;
+    g_bankAmount = aw != 0 ? aw->castType<MyGUI::EditBox>(false) : 0;
+    MyGUI::Button* bd = d != 0 ? d->castType<MyGUI::Button>(false) : 0;
+    MyGUI::Button* bx = x != 0 ? x->castType<MyGUI::Button>(false) : 0;
+    MyGUI::Button* bc = c != 0 ? c->castType<MyGUI::Button>(false) : 0;
+    if (g_bankInfo == 0 || g_bankAmount == 0 || bd == 0 || bx == 0 || bc == 0) { gui->destroyWidget(raw); g_bankInfo = 0; g_bankAmount = 0; return false; }
+    g_bankWin = raw;
+    g_bankInfo->setEditStatic(true); g_bankInfo->setEditReadOnly(true); g_bankInfo->setEditMultiLine(true); g_bankInfo->setEditWordWrap(true);
+    g_bankInfo->setTextAlign(MyGUI::Align::Left | MyGUI::Align::Top); g_bankInfo->setTextColour(BankLit());
+    g_bankAmount->setMaxTextLength(10); g_bankAmount->setTextColour(BankLit()); g_bankAmount->setCaption(MyGUI::UString("1000"));
+    bd->setCaption(MyGUI::UString("DEPOSIT")); bd->setTextColour(BankLit());
+    bx->setCaption(MyGUI::UString("WITHDRAW")); bx->setTextColour(BankLit());
+    bc->setCaption(MyGUI::UString("CLOSE")); bc->setTextColour(BankLit());
+    bd->eventMouseButtonClick += MyGUI::newDelegate(BankOnDeposit);
+    bx->eventMouseButtonClick += MyGUI::newDelegate(BankOnWithdraw);
+    bc->eventMouseButtonClick += MyGUI::newDelegate(BankOnClose);
+    MyGUI::InputManager* im = MyGUI::InputManager::getInstancePtr();
+    if (im != 0) { im->addWidgetModal(raw); im->setKeyFocusWidget(g_bankAmount); }
+    g_bankNote.clear();
+    BankRefresh();
+    std::vector<char> b;
+    if (swteam::EncodeBank(&b, swteam::kBankAsk, 0, 0)) Send(b);
+    DebugLog("[BANK] box opened");
+    return true;
+}
+}   // namespace
+bool BankIsAtm(const char* sid) { return sid != 0 && std::string(sid) == kBankBuildingSid; }
+bool BankTakesVaultNow(const char* sid)
+{
+    const bool vault = BankIsAtm(sid);
+    if (!vault) return false;
+    const bool take = swteam::BankTakesVault(StoreLinkIsUp(), TeamMyRole(0, 0) != 0, vault);
+    if (!take && !g_bankVaultOwnSaid)
+    {
+        g_bankVaultOwnSaid = true;
+        DebugLog("[BANK] the Cat Vault was used outside linked team play - it keeps its own menu (the team bank takes it over only while"
+                 " linked to a world server and in a faction of players)");
+    }
+    return take;
+}
+/* once per link, when this game's player is in a team with a world loaded: is the Cat Vault (Cat Pouch mod) here at all? */
+void BankVaultCheckTick()
+{
+    const int gen = StoreLinkGen();
+    if (gen == g_bankVaultCheckedGen || !StoreLinkIsUp() || !GameplayRunning() || TeamMyRole(0, 0) == 0) return;
+    g_bankVaultCheckedGen = gen;
+    if (GameRecordLoaded(swteam::kBankVaultSid))
+        DebugLog("[BANK] the Cat Vault (Cat Pouch mod) is loaded - the team bank opens from it in this team play");
+    else
+        DebugLog("[BANK] the Cat Vault record " + std::string(swteam::kBankVaultSid) + " is NOT loaded (the Cat Pouch mod is not switched on) - the team"
+                 " bank has no building to open from in this game; nothing else changes");
+}
+void BankOpen() { __try { BankOpenBox(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+void BankArrived(unsigned op, unsigned txn, unsigned result, unsigned balance)
+{
+    g_bankBalance = balance; g_bankBalanceKnown = 1;
+    static const char* const kWhy[] = { "", "you're not in a team", "the bank doesn't have that much", "the bank is full", "the world server couldn't save", "a bad request" };
+    const char* why = kWhy[result <= 5 ? result : 5];
+    if (op == swteam::kBankDeposit || op == swteam::kBankWithdraw) MoneyBankAnswer(op, txn, result);   /* the cats move there (once) */
+    const bool notSaved = result == swteam::kBankNotSaved;   /* kept and sent again: not the end of the request */
+    if (op == swteam::kBankDeposit)
+    {
+        std::map<unsigned, unsigned>::iterator it = g_bankDeposits.find(txn);
+        const unsigned n = it != g_bankDeposits.end() ? it->second : 0;
+        if (it != g_bankDeposits.end() && !notSaved) g_bankDeposits.erase(it);
+        if (n != 0)
+        {
+            if (result == swteam::kBankOk) g_bankNote = "Deposited " + BankCats(n) + ".";
+            else if (notSaved) g_bankNote = "The world server couldn't save - the deposit of " + BankCats(n) + " is sent again shortly.";
+            else g_bankNote = "Deposit refused (" + std::string(why) + ") - " + BankCats(n) + " given back.";
+        }
+        DebugLog("[BANK] deposit txn " + N((long long)txn) + " " + (result == swteam::kBankOk ? std::string("OK") : std::string("REFUSED: ") + why) + ", bank " + N((long long)balance));
+    }
+    else if (op == swteam::kBankWithdraw)
+    {
+        std::map<unsigned, unsigned>::iterator it = g_bankWithdraws.find(txn);
+        const unsigned n = it != g_bankWithdraws.end() ? it->second : 0;
+        if (it != g_bankWithdraws.end() && !notSaved) g_bankWithdraws.erase(it);
+        if (n != 0)
+        {
+            if (result == swteam::kBankOk) g_bankNote = "Withdrew " + BankCats(n) + ".";
+            else if (notSaved) g_bankNote = "The world server couldn't save - the withdraw of " + BankCats(n) + " is asked again shortly.";
+            else g_bankNote = "Withdraw refused: " + std::string(why) + ".";
+        }
+        DebugLog("[BANK] withdraw txn " + N((long long)txn) + " " + (result == swteam::kBankOk ? std::string("OK") : std::string("REFUSED: ") + why) + ", bank " + N((long long)balance));
+    }
+    BankSafeRefresh();
 }
 }   // namespace coop

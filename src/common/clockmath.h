@@ -211,6 +211,10 @@ float EffectiveSpeedFrom(const std::vector<void*>& order,
    the engine (today's behaviour), 0 = skip it. */
 int DialoguePauseLetThrough(int site, int linked, int* suppressed);
 
+/* DEDICATED timemode `vote`: every voter must say the same speed (pause included) for it to be the world's; no votes, or any
+   disagreement, is 1x. `votes` holds only the games that count (in the world, and have voted). */
+float EffectiveSpeedAgree(const std::vector<float>& votes);
+
 }   /* namespace coopclock */
 
 #endif

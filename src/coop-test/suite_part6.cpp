@@ -7236,7 +7236,7 @@ void t_t36o_outposts()
     if (DecodeTownsFile("kept-towns\t1\nK\tk1\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a K line before any T line reads");
     if (DecodeTownsFile("kept-towns\t1\nT\t1\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\tx\nK\tk1\nK\tk1\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a key twice in one outpost reads");
     if (!DecodeTownsFile("kept-towns\t1\nT\t1\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\tx\nK\tk1\n", kKeptTownsHeader, true, &fr, &why) || fr.size() != 1 || fr[0].keys.size() != 1) Fail("outposts: a written-by-hand kept-towns.txt does not read: " + why);
-    if (DecodeTownsFile("kept-towns\t6\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a list of an unknown format reads");   /* T-940: format 5 is the anchor format */
+    if (DecodeTownsFile("kept-towns\t7\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a list of an unknown format reads");   /* format 6 is the anchor + public format */
     if (DecodeTownsFile("kept-towns\t1\nT\t1\t0\t0\t0\t0\t0\tzz\t0\t0\tx\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: a bad float reads");
     if (DecodeTownsFile("", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: an empty file reads");
     if (DecodeTownsFile("kept-towns\t1\nX\t1\n", kKeptTownsHeader, true, &fr, &why)) Fail("outposts: an unknown line reads");
@@ -7596,7 +7596,7 @@ void t_t36o_outposts_keys()
     const std::vector<TownRow> frs(1, fr1);
     const std::string pt = EncodeTownsFile(kPlayerTownsHeader, frs, true);
     std::vector<TownRow> fb; std::string why;
-    if (pt.compare(0, 15, "player-towns\t5\n") != 0 || !DecodeTownsFile(pt, kPlayerTownsHeader, true, &fb, &why) || fb.size() != 1 || fb[0].keys != fr1.keys || fb[0].cut != 1
+    if (pt.compare(0, 15, "player-towns\t6\n") != 0 || !DecodeTownsFile(pt, kPlayerTownsHeader, true, &fb, &why) || fb.size() != 1 || fb[0].keys != fr1.keys || fb[0].cut != 1
         || fb[0].level != 2 || fb[0].id != 7u || fb[0].name != fr1.name)
         Fail("outposts keys: player-towns.txt with keys does not round-trip: " + why);
     if (!DecodeTownsFile("player-towns\t1\nT\t3\t0\t0\t0\t0\t0\t00000000\t00000000\t00000000\tOld\n", kPlayerTownsHeader, true, &fb, &why) || fb.size() != 1

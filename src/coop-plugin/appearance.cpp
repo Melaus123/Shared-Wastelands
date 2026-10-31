@@ -3136,4 +3136,15 @@ std::string GroundRaceName(::Character* c)
     return gd != 0 ? gd->name : std::string("?");
 }
 
+// The Kenshi API (kapi.cpp): the race record's string id and name for a rule lookup. False = no race readable (the rules then
+// give Kenshi's own behaviour). Any thread: the race pointer is read under SEH, the record itself is the game's static data.
+bool KapiRaceOf(::Character* c, std::string* sid, std::string* name)
+{
+    ::GameData* gd = (c != 0) ? GroundRacePod(c) : 0;
+    if (gd == 0) return false;
+    if (sid != 0) *sid = gd->stringID;
+    if (name != 0) *name = gd->name;
+    return true;
+}
+
 } // namespace coop

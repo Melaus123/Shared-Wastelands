@@ -15,7 +15,7 @@
  * replaced by a 5-byte E9 jump, every later byte the table names still matching) when every registration of that row
  * is kAddrUseCallOnly - this mod only calls it, as the game itself does through the other mod's jump. Counted as
  * addrHookedAccepted, one [ADDR] line each, never in addrMismatch (src/common/addrhooked.h decides). Any other
- * difference, any row this mod hooks or patches, and every row on the signature road still refuse.
+ * difference, any row this mod hooks or patches, and every strict row on the signature road still refuse.
  *
  * WHAT THIS IS NOT. It is not a tamper check and it is not a guarantee that an address is the right FUNCTION -
  * only that the bytes there are the bytes this build was read against, which is F038's distinction and is all
@@ -49,7 +49,11 @@ namespace coop {
    gate then also accepts another mod's 5-byte jump at its start (src/common/addrhooked.h). Give kAddrUseCallOnly only
    when EVERY use of the bound constant is a plain call through it; a name registered twice is call-only only when
    every registration says so. */
-enum { kAddrUseStrict = 0, kAddrUseCallOnly = 1 };
+/* kAddrUseOptional = a row that only a self-contained feature needs (every use tests the bound constant for 0
+   first). On the table road a mismatch or a missing row then switches off THAT feature (the slot stays 0, one [ADDR] line names it)
+   instead of disabling the whole mod. The signature road (no table for the executable) does the same: an optional row its search
+   cannot place (found nowhere, failing its own check or a cross-check) is left out (coopsigtab::SigResolveSome), every other row stays strict. */
+enum { kAddrUseStrict = 0, kAddrUseCallOnly = 1, kAddrUseOptional = 2 };
 struct AddrReg
 {
     AddrReg(const char* name, unsigned long long* slot, int use = kAddrUseStrict);

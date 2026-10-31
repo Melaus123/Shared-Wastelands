@@ -49,6 +49,7 @@
 #include "playerfaction.h"  /* crimetest: IsPlayerFaction / IsPeerFaction */
 #include "relations.h"      /* crime7: RelationsWireSid - the optional victim-faction filter */
 #include "replicate.h"      /* pvp1: AttackLocal - `crimetest attackplayer` */
+#include "medical.h"        /* OwnedUnconscious: a P25 REQUEST refuses only a dead or knocked-out NPC */
 #include "coop_log.h"
 #include "game/Character.h"   /* crimetest: Character::getOwnerFactionDirect */
 #include "game/Faction.h"     /* talktest nearestfaction: Faction::getName */
@@ -79,6 +80,7 @@
 #pragma intrinsic(_ReturnAddress)
 
 namespace coop {
+::Character* NearestOwnCharacter(const float* pos);   /* build.cpp, MAIN THREAD: this game's own character nearest a position */
 int GroundTerrainHeightAt(float x, float z, float* out);   /* P26lvl maxdy: combat.cpp - the terrain height at (x,z) (groundline's SEH-wrapped getTerrainHeightFast): 1 height, 0 no terrain (-99), -1 no row / faulted. MAIN THREAD */
 int GroundAnimalAppPod(::Character* c);   /* P26f3: appearance.cpp - the P10 class test (appearance vtable == AppearanceAnimalVt): 1 animal, 0 not, -1 unreadable. MAIN THREAD */
 int AiWorkerBusyNow();   /* T-804: coop.cpp - the engine's own AI-worker busy test (0x25C690 on GameWorld+0x790): 1 running, 0 idle, -1 unreadable. MAIN THREAD */
@@ -1000,6 +1002,7 @@ void TkLogP25(int kind, const std::string& s)
 
 /* 1 = who is a character of a peer's stand-in faction (a copy the other player drives). ANY THREAD: one guarded read, then
    pointer compares (IsPeerFaction). No C++ object here (C2712). */
+volatile LONG64 g_tkPeerSpeakerRefused = 0;   /* conversations refused: the speaker is another player's character */
 int TkPeerTarget(void* who)
 {
     if (who == 0) return 0;
@@ -1898,6 +1901,10 @@ static unsigned long long TkP25CallStart(void* dlg, void* who, void* line, P25Ga
 
 unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)
 {
+    /* Dedicated fork, 10-28: a conversation whose SPEAKER is another player's character (a peer-faction copy here) never starts:
+       its dialogue package is the NPC it once was (a hired mercenary still offers "hire me"), so a teammate could be offered
+       another player's character. Players talk by chat. The engine's own "not started" (0). Any thread: two guarded reads. */
+    if (dlg != 0 && TkPeerTarget(SayReadPtr(dlg, kDlgMe))) { ::InterlockedIncrement64(&g_tkPeerSpeakerRefused); return 0; }
     /* P26 stages 1-3: a start toward the OTHER player's character is marked FIRST (any thread), so this game's window stays shut;
        with no free mark the start is refused (the NPC simply does not start - never a window for the other player's character) */
     /* P26s1 fold 1 H1: a start on a MARKED Dialogue toward anyone else releases the mark first (TkRelease). */
@@ -3947,7 +3954,9 @@ static void TkApplyRequest(const cooptalk::TalkMsg& m, unsigned int peer)
     ::Faction* nf = 0;
     const int npcOurs = (npc != 0 && dlg != 0 && net::IsUidMine(m.npcUid) && !TkPeerTarget(npc) && CrimeFactionOf(npc, &nf) && nf != 0
                          && !IsPlayerFaction(nf)) ? 1 : 0;
-    const int down = (npcOurs && (CrimeIsDead(npc) != 0 || IsDownedCharacter(npc))) ? 1 : 0;
+    /* "down" = dead or knocked out (the engine's own medical flag; unreadable counts as down). Not the prone/ragdoll pose: a
+       caged or shackled prisoner lies in it while awake, and the RecruitPrisoners talk must still reach it. */
+    const int down = (npcOurs && (CrimeIsDead(npc) != 0 || OwnedUnconscious(m.npcUid) != 0)) ? 1 : 0;
     const int copyOk = (cp != 0 && cdlg != 0 && net::UidOwnedByPeer(m.targetUid, peer) && TkPeerTarget(cp)) ? 1 : 0;
     void* const win = TkWindowDlg();
     const int busy = ((dlg != 0 && (TkDlgBusy(dlg) || win == dlg || TkMarkFind(dlg) >= 0)) || (cdlg != 0 && TkDlgBusy(cdlg))) ? 1 : 0;
@@ -7566,6 +7575,34 @@ bool TcHover(void* dlg, void* npc)
 
 /* Dialogue 0x679FC0 (ANY THREAD): passed through untouched except inside characterSelected or the order menu's build on this thread
    for an NPC another game drives (TkS6Owner 0, not a player's character). */
+long long g_tcSubPicked = 0, g_tcSubTried = 0;
+/* Dedicated fork, 10-29: A CAGED PRISONER TALKS TO A TEAMMATE AS TO THIS GAME'S PLAYER. _chooseDialog scores a dialogue +2 when
+   the listener's faction is on its target list (0x671BB0), so a RecruitPrisoners dialogue aimed at the player faction loses to the
+   plain ones for another player's character (a stand-in faction) and is never even checked. When the pick for that character on a
+   caged NPC this game drives finds nothing, it is made again with this game's own character nearest the NPC as the listener; the
+   line found is then started with the teammate as usual (the conversation, its replies and actions are the P25/P26 road).
+   MAIN THREAD only (NearestOwnCharacter); anything else returns the first pick. */
+static void* TcChooseCallPod(TcChooseFn fn, void* dlg, void* list, void* who, char flag)   /* no C++ object */
+{
+    __try { return fn(dlg, list, who, flag); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void* TcChooseOrSub(TcChooseFn fn, void* dlg, void* list, void* speaker, char flag, void* first)
+{
+    if (first != 0 || speaker == 0 || !TkPeerTarget(speaker) || SayOnMainThread() == 0) return first;
+    void* const npc = SayReadPtr(dlg, kDlgMe);
+    if (npc == 0 || TkS6Owner(npc) != 1 || CrimeInSomethingPod((::Character*)npc) != 2) return first;
+    Ogre::Vector3 p;
+    if (!SafeReadPosition((::Character*)npc, &p)) return first;
+    const float pos[3] = { p.x, p.y, p.z };
+    ::Character* const sub = NearestOwnCharacter(pos);
+    if (sub == 0) return first;
+    ++g_tcSubTried;
+    void* const line = TcChooseCallPod(fn, dlg, list, sub, flag);
+    if (line != 0 && ++g_tcSubPicked <= 20)
+        DebugLog("[TALK] caged NPC uid=" + TkU(FindSpawnedUid((::Character*)npc)) + ": a teammate's talk takes the line this game's own player would get (picked #" + TkI((int)g_tcSubPicked) + ")");
+    return line != 0 ? line : first;
+}
 bool detour_tcCanTalk(void* dlg)
 {
     if (g_tcCsTid == 0 || g_tcCsTid != ::GetCurrentThreadId() || g_tcCapTid != 0) return orig_tcCanTalk(dlg);
@@ -7585,7 +7622,8 @@ void* detour_tcChoose(void* dlg, void* list, void* speaker, char flag)
         g_tcCapHit = 1;
         return 0;
     }
-    return orig_tcChoose(dlg, list, speaker, flag);
+    void* const first = orig_tcChoose(dlg, list, speaker, flag);
+    return TcChooseOrSub(orig_tcChoose, dlg, list, speaker, flag, first);
 }
 
 void TcForgetAll()
@@ -7752,6 +7790,8 @@ void TalkCursorApplyAsk(const cooptalk::TalkMsg& m, unsigned int peer)
             {
                 if (m.purse >= 0) TkPurseNote(m.targetUid, m.purse, peer);   /* the money condition is answered by the talker's purse */
                 called = TcChoosePod(dlg, list, cp, &line);
+                if (called && line == 0)
+                    line = TcChooseOrSub((orig_tcChoose != 0) ? orig_tcChoose : (TcChooseFn)(g_base + (uintptr_t)kTcChooseRva), dlg, list, cp, 0, 0);
                 TkPurseTalkEnded(m.targetUid);   /* kept only while a conversation with that character is open here */
             }
             if (called) answer = cooptalk::TalkCursorNpcAnswer(parked, hasList, dead, pf, line != 0 ? 1 : 0);

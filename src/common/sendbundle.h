@@ -109,6 +109,10 @@ struct Entry
 };
 /* A bundle's payload (after the 5-byte frame header) into its entries, in order. false (and *out empty) for a payload
    that is empty, has an entry cut short or running past the end, or nests a bundle - the whole bundle is refused. */
+/* the world server's unpacking (store_main.cpp OnBundle): a message inside a bundle can make the server CLOSE the sender's connection (its
+   SESSION_CLOSING on a dedicated world, an eviction) - the messages after it are then not handled: the peer is reset and may already be
+   reused. 1 = handle the next message. */
+inline int BundleGoesOn(int senderClosed) { return senderClosed == 0 ? 1 : 0; }
 inline bool Decode(const char* p, size_t n, std::vector<Entry>* out)
 {
     out->clear();

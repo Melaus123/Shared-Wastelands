@@ -23,4 +23,13 @@ void MoneyArrive(unsigned type, const std::vector<char>& payload);
 int MoneyHave(int* money);
 int MoneySend(int slot, const std::string& name, const std::string& typed, std::string* hint);
 
+// SW Bank (team.cpp's bank box; moneywire.h "SW Bank"). MoneyBankDeposit: the cats taken with the game's own take and the deposit's
+// outbox row written with the balance in one pp.money write - 1 = taken and on its way (*txn its request number), 0 = refused, nothing
+// changed (*why the box's line). MoneyBankWithdraw: a request number taken and the withdraw kept until answered - 1 = asked, 0 = refused.
+// MoneyBankAnswer: a BANK answer for this game's deposit or withdraw (team.cpp's TEAM dispatch) - noted; MoneyTick acts on it (an OK
+// deposit's row dropped, a refused one's cats given back; an OK withdraw's cats added). MAIN THREAD.
+int MoneyBankDeposit(unsigned amount, std::string* why, unsigned* txn);
+int MoneyBankWithdraw(unsigned amount, std::string* why, unsigned* txn);
+void MoneyBankAnswer(unsigned op, unsigned txn, unsigned result);
+
 }

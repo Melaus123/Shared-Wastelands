@@ -26,6 +26,8 @@
 #include "crime.h"    /* pvp1: InstallCrime */
 #include "build.h"    /* build1-a: InstallBuild */
 #include "settings.h" /* settings2 S2: InstallSettings */
+#include "kapi.h"     /* Kenshi API skeleton: InstallKapi */
+#include "kmode.h"    /* DEDICATED: the start mode's data mod (InstallStartModeData) */
 #include "policy.h"
 #include "spawn.h"   // P011 WatchTaskTick rides the in-game pump
 #include "replicate.h"   /* P25: InteriorKeepTick rides the in-game pump */
@@ -38,6 +40,7 @@
 #include "fallentab.h"   /* T-556: the FALLEN tab */
 #include "chat.h"        /* in-game text chat */
 #include "money.h"       /* T-810: money between players */
+#include "admin.h"       /* the Admin's Toychest: /heal /revive /bring /goto /tp /where */
 #include "titleart.h"  /* T-513: the mod's own title-screen art */
 #include "config.h"   /* E38 / decisions 42-43: shared_wastelands.cfg - the role and the addresses */
 #include "addresses.h" /* P8h: the executable fingerprint and its address table - the gate below */
@@ -264,6 +267,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
     coop::MoneyTick();        /* T-810: money between players - given back, added, acknowledged, sent once on disk */
+    coop::AdminTick();        /* the Admin's Toychest: replies shown; this game's jobs done at a safe point, answered */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
 }
 
@@ -866,6 +870,8 @@ static void startPluginOn(const char* road)
     /* PROBE P140 BEGIN */ coop::InstallP140();   /* T-806: who starts the cage-use task (0x357FE0), log only */ /* PROBE P140 END */
     coop::InstallHire();       /* recruit1 R0-a: Dialogue::_doActions 0x67FAD0, LOG ONLY */
     coop::InstallWorldGen();
+    coop::InstallKapi();       /* Kenshi API skeleton: kenshi_api.cfg + its named hook points (none installed without a table row) */
+    coop::InstallStartModeData();   /* DEDICATED: dedicatedserver.mod into <Kenshi>\mods and switched on only when the last world joined was kenshi mode - inside Root::initialise, before Kenshi loads its data */
     logHookCounts();   /* mig1: every install above went through coop::AddHook (hooks.cpp, our own MinHook) */
     LARGE_INTEGER t1;
     ::QueryPerformanceCounter(&t1);

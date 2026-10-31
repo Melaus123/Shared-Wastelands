@@ -28,6 +28,9 @@
 #include "handoff.h"        // SquadActivePlatoonOf - reads a character's squad without making one
 #include "coop_log.h"
 #include "../common/peergone.h"   // PlayerGoneTakesRow: a player who leaves takes only its own rows
+#include "../common/recruitguard.h"   // another player's character is never recruited (every road to recruit 0x693010)
+#include "chat.h"           // ChatNoticeLine - the refused player's grey line
+#include "team.h"           // TeamPlayerName - the owning player's name for that line
 #include "game/Character.h"
 #include "game/Faction.h"
 #include "game/hand.h"
@@ -80,6 +83,8 @@ typedef void (*EndDialogueFn)(void* dlg, char a2);   /* 0x673DA0 (Read decomp_67
 
 DoActionsFn g_doActionsOrig = 0;
 int g_doActionsHook = 0;   // 1 armed, -1 AddHook failed, -2 no table address
+RecruitFn g_recruitOrig = 0;
+int g_recruitHook = 0;     // the 0x693010 detour (recruitguard.h): 1 armed, -1 AddHook failed, -2 no table address
 
 struct Pending { unsigned int reqId; unsigned int hirerUid; int price; int joinType; std::string faction; int ownerSlot; };   // ownerSlot: the player the REQ went to (the person's owner then; -1 unknown)
 struct Reserved { unsigned int reqId; unsigned int hirerUid; unsigned int peer; int slot; };   // slot: the player the promise is made to (the asker; -1 unknown)
@@ -102,6 +107,8 @@ long long g_cancelledLinkDown = 0, g_otherActs = 0, g_bad = 0, g_sendFailed = 0,
 long long g_localHires = 0, g_localRefused = 0, g_testRuns = 0, g_testNoPerson = 0, g_testNoHirer = 0, g_noPeerFaction = 0;
 long long g_linesSeen = 0, g_linesPlayer = 0, g_linesLogged = 0, g_linesUnread = 0, g_setFactionFault = 0;
 volatile LONGLONG g_linesOffMain = 0;   // any thread (the detour runs wherever the engine calls it)
+long long g_ownedHeld = 0, g_ownedOwnerNo = 0, g_ownedTake = 0, g_ownedLocal = 0, g_ownedNoticed = 0;   // recruitguard.h refusals: hire line, owner NO, hirer re-check, lever / talk
+volatile LONGLONG g_ownedEngine = 0;   // the 0x693010 detour refused (any thread)
 long long g_linesHeld = 0, g_linesOwn = 0, g_linesNoUid = 0, g_linesNoHirer = 0, g_linesNoAddr = 0, g_endFault = 0;
 std::map<int, long long> g_otherActTypes;   // held lines: action type -> count (not run)
 
@@ -159,10 +166,18 @@ int TakeMoneyPod(void* own, int amount)   // 1 paid, 0 refused (short), -1 fault
     __try { TakeMoneyFn fn = (TakeMoneyFn)(*(void***)own)[0]; return fn(own, amount) ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-int RecruitPod(void* pi, ::Character* c, bool edit)   // 1 joined, 0 refused (squad full / limit), -1 fault
+int g_recruitPodDepth = 0;   /* > 0 while one of this file's own hire roads runs the engine's recruit (they sync the person themselves) */
+static int RecruitPodCall(void* pi, ::Character* c, bool edit)
 {
     __try { RecruitFn fn = (RecruitFn)(Base() + (uintptr_t)kRecruitRva); return fn(pi, c, edit) != 0 ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+int RecruitPod(void* pi, ::Character* c, bool edit)   // 1 joined, 0 refused (squad full / limit), -1 fault
+{
+    ++g_recruitPodDepth;
+    const int r = RecruitPodCall(pi, c, edit);
+    --g_recruitPodDepth;
+    return r;
 }
 void* PlayerInterfacePod()
 {
@@ -206,7 +221,36 @@ int ReadLinePod(void* dlg, void* line, int* types, int* values, int cap, int* to
 
 // ---- helpers ----
 std::string FactionName(::Faction* f) { return Plaus(f) ? f->getName() : std::string(); }
+/* a faction's name for the log: another player's faction is named by that player, so only printable ASCII, at most 64 bytes */
+std::string FacLog(::Faction* f)
+{
+    const std::string n = FactionName(f);
+    std::string o;
+    for (size_t i = 0; i < n.size() && o.size() < 64; ++i) { const unsigned char c = (unsigned char)n[i]; o += (c >= 0x20 && c <= 0x7E && c != '\'') ? (char)c : '?'; }
+    return o;
+}
 bool Alive(::Character* c) { return Plaus(c) && !IsDownedCharacter(c); }
+
+// recruitguard.h: the person as this game sees it - kRecruitRefuseOwned when it is in a player's faction that is not this game's own
+// player's (another player's stand-in coop-p<slot>, or a recorded stand-in). An NPC, or an unreadable faction, is allowed. ANY THREAD.
+int OwnedVerdict(::Character* c)
+{
+    ::Faction* f = Plaus(c) ? FactionOfPod(c) : 0;
+    if (!Plaus(f)) return cooprecruit::kRecruitAllow;
+    return cooprecruit::LocalRecruitDecide(AnyPlayersFaction(f) ? 1 : 0, IsPlayerFaction(f) ? 1 : 0);
+}
+// The refused player's grey chat line, naming the player the person belongs to when this game knows it. MAIN THREAD.
+void NoticeOwned(::Character* c)
+{
+    ::Faction* f = Plaus(c) ? FactionOfPod(c) : 0;
+    int slot = Plaus(f) ? StandInSlotOf(f) : -1;
+    if (slot < 0 && Plaus(f)) { const int r = StandInRecordSlot(f); slot = r >= 0 ? r : -1; }
+    const std::string name = TeamPlayerName(slot);
+    std::string fac = Plaus(f) ? StandInDisplayName(f) : std::string();
+    if (fac.empty() && Plaus(f) && !IsPlayerFaction(f) && AnyPlayersFaction(f)) fac = FactionName(f);
+    ChatNoticeLine(slot, name, cooprecruit::OwnedLine(name, fac));
+    ++g_ownedNoticed;
+}
 
 bool Send(const coophire::HireMsg& m, unsigned int toPeer)
 {
@@ -258,6 +302,13 @@ void ForgetEmptiedCopySquad(void* oldActive)
 // Hire on the game that runs the person (design step 2, and the lever's positive control). MAIN THREAD, K2.
 void LocalHire(unsigned int uid, ::Character* person, ::Character* hirer, unsigned int hirerUid, int price, int joinType)
 {
+    if (OwnedVerdict(person) != cooprecruit::kRecruitAllow)
+    {
+        ++g_ownedLocal;
+        DebugLog("[HIRE] own hire uid=" + N(uid) + " refused: another player's character (fac='" + FacLog(FactionOfPod(person)) + "')");
+        NoticeOwned(person);
+        return;
+    }
     std::map<unsigned int, Reserved>::iterator r = g_reserved.find(uid);
     if (r != g_reserved.end())
     {
@@ -285,6 +336,13 @@ void LocalHire(unsigned int uid, ::Character* person, ::Character* hirer, unsign
 void Hold(unsigned int uid, ::Character* person, unsigned int hirerUid, int price, int joinType)
 {
     if (g_pending.find(uid) != g_pending.end()) { DebugLog("[HIRE] hold uid=" + N(uid) + " already pending - not asked twice"); return; }
+    if (OwnedVerdict(person) != cooprecruit::kRecruitAllow)   /* recruitguard.h: never asked for another player's character */
+    {
+        ++g_ownedLocal;
+        DebugLog("[HIRE] hold uid=" + N(uid) + " refused: another player's character (fac='" + FacLog(FactionOfPod(person)) + "') - not asked");
+        NoticeOwned(person);
+        return;
+    }
     Pending p; p.reqId = g_nextReqId++; p.hirerUid = hirerUid; p.price = price; p.joinType = joinType; p.faction = FactionName(FactionOfPod(person));
     p.ownerSlot = net::OwnerSlotOf(uid);
     coophire::HireMsg m; m.kind = coophire::kHireReq; m.reqId = p.reqId; m.uid = uid; m.hirerUid = hirerUid; m.price = price; m.joinType = joinType;
@@ -307,10 +365,12 @@ void OwnerCheck(const coophire::HireMsg& m, unsigned int peer)
     else if (g_reserved.find(m.uid) != g_reserved.end()) reason = coophire::kNoReserved;
     else
     {
-        // The hirer's game already ran the game's own dialogue, which offered the hire; the owner adds no rules of its own and
-        // refuses only a person whose faction, cage state or slave state it cannot read.
+        // The hirer's game already ran the game's own dialogue, which offered the hire; the owner refuses a person whose faction,
+        // cage state or slave state it cannot read - and (recruitguard.h) a person in ANY player's faction: its own player's recruit
+        // (the hire dialogue still runs on the other games' copies) or a stand-in's. A player's recruit is never hired away.
         ::Faction* f = FactionOfPod(c);
         if (!Plaus(f)) reason = coophire::kNoFaction;
+        else if (cooprecruit::OwnerHireReason(AnyPlayersFaction(f) ? 1 : 0) != coophire::kNoNone) { reason = coophire::kNoFaction; ++g_ownedOwnerNo; }
         else if (InSomethingPod(c) < 0) reason = coophire::kNoCaged;
         else if (SlaveStateOfCharacter(c) < 0) reason = coophire::kNoSlave;
     }
@@ -356,6 +416,17 @@ void TakeAndHire(const coophire::HireMsg& m, unsigned int peer)   // peer: the g
         SendDone(peer, m.reqId, m.uid, p.hirerUid, 0, 0);
         return;
     }
+    // recruitguard.h: re-checked before the take - the person joined another player between REQ and OK (its copy is in that
+    // player's stand-in here): nothing is taken, DONE {taken 0} clears the owner's promise.
+    if (OwnedVerdict(person) != cooprecruit::kRecruitAllow)
+    {
+        ++g_ownedTake;
+        DebugLog("[HIRE] take uid=" + N(m.uid) + " abandoned: another player's character (fac='" + FacLog(FactionOfPod(person)) + "') - DONE taken=0");
+        SendDone(peer, m.reqId, m.uid, p.hirerUid, 0, 0);
+        NoticeOwned(person);
+        SayRefusal(m.uid);
+        return;
+    }
     void* own = OwnershipsPod(FactionOfPod(hirer)); int money = 0;
     void* pi = PlayerInterfacePod();
     if (own == 0 || !MoneyPod(own, &money) || money < p.price || pi == 0)
@@ -399,6 +470,12 @@ void Refused(const coophire::HireMsg& m)
     const bool mine = it != g_pending.end() && it->second.reqId == m.reqId;
     if (mine) g_pending.erase(it);
     DebugLog("[HIRE] refused uid=" + N(m.uid) + " reason=" + N(m.reason) + " req=" + N(m.reqId) + (mine ? "" : " (nothing pending)"));
+    if (mine && m.reason == coophire::kNoFaction)   /* recruitguard.h: the owner's word for a player's character */
+    {
+        ::Character* c = FindSpawned(m.uid);
+        if (Plaus(c) && OwnedVerdict(c) != cooprecruit::kRecruitAllow) NoticeOwned(c);
+        else { ChatNoticeLine(-1, std::string(), cooprecruit::OwnedLine(std::string(), std::string())); ++g_ownedNoticed; }
+    }
     if (mine) SayRefusal(m.uid);
 }
 
@@ -528,6 +605,19 @@ bool HoldLine(void* dlg, void* line)
     const unsigned int uid = Plaus(person) ? FindSpawnedUid(person) : 0;
     const unsigned int hirerUid = FindSpawnedUid(target);
     const bool mine = uid != 0 && net::IsUidMine(uid);
+    /* recruitguard.h: a hire reply on ANOTHER PLAYER'S character (its copy here is in that player's stand-in coop-p<slot>) is not
+       run - none of its actions (the price included) - and the chat is closed: the hire dialogue the copy still carries never takes
+       a player's recruit. Without endDialogue in the table the line runs and the 0x693010 detour refuses the recruit itself. */
+    if (kEndDialogueRva != 0 && Plaus(person) && OwnedVerdict(person) != cooprecruit::kRecruitAllow)
+    {
+        ++g_ownedHeld;
+        DebugLog("[HIRE] line person=" + N(uid) + " mine=" + N(mine ? 1 : 0) + " target=" + N(hirerUid) + " acts=[" + acts + "] REFUSED - another player's character (fac='"
+                 + FacLog(FactionOfPod(person)) + "'); not run, chat closed by endDialogue");
+        if (EndDialoguePod(dlg) != 1) { ++g_endFault; ErrorLog("[HIRE] endDialogue 0x673DA0 faulted on a refused hire of another player's character uid=" + N(uid)); }
+        NoticeOwned(person);
+        SayOnCopy(person, kRefusalLine);
+        return true;
+    }
     /* review-recruit2 3: the OWNER's own dialogue hire of a person RESERVED for the other game's pending request is
        refused (the lever's own-hire path already checks this) - otherwise both games hire the same person. */
     if (mine && kEndDialogueRva != 0 && g_reserved.find(uid) != g_reserved.end())
@@ -583,6 +673,44 @@ void detour_doActions(void* dlg, void* line, void* a3, void* a4)
     if (s6Target != 0) TalkS6LeaderOrder(dlg, s6Target);   /* P26s6 S6-3: the walk-over the engine gives a player target */
 }
 
+// ---- the 0x693010 detour (recruitguard.h): the engine's own recruit refuses another player's character ----
+// Every road ends here - a dialogue line's act 3 / 18 that ran unheld, this file's own RecruitPod (the lever, TakeAndHire,
+// resurrect.cpp's HireRecruitNoEdit), any other engine caller. A refusal answers 0, the engine's own "not recruited" (squad full /
+// limit): _doActions then closes the chat with endDialogue and returns (Read 67fad0:1225-1229). The roads above refuse earlier, so
+// this one fires only for a road they do not see. An NPC, or this game's own character, goes to the engine unchanged.
+char detour_recruit(void* pi, ::Character* c, bool edit)
+{
+    if (Plaus(c) && OwnedVerdict(c) != cooprecruit::kRecruitAllow)
+    {
+        ::InterlockedIncrement64(&g_ownedEngine);
+        const unsigned long mt = StoreMainThreadId();
+        if (mt != 0 && ::GetCurrentThreadId() == mt)
+        {
+            DebugLog("[HIRE] recruit 0x693010 REFUSED: another player's character uid=" + N(FindSpawnedUid(c)) + " fac='" + FacLog(FactionOfPod(c)) + "'");
+            NoticeOwned(c);
+        }
+        return 0;
+    }
+    const char r = g_recruitOrig(pi, c, edit);
+    /* A recruit of this game's OWN world character by the engine's own road (a dialogue line: a bar hire, RecruitPrisoners): the other
+       games' copies learned its faction only at its SPAWN, so they would keep the old one (a recruited prisoner stayed a Dust Bandit
+       there, 10-28). Re-announce it: UNLOAD (this game still runs it) and the announce pass sends a new SPAWN with its new faction.
+       This file's own hire roads (g_recruitPodDepth) sync the person themselves. MAIN THREAD only. */
+    const unsigned long mt = StoreMainThreadId();
+    if (r != 0 && g_recruitPodDepth == 0 && Plaus(c) && mt != 0 && ::GetCurrentThreadId() == mt)
+    {
+        const unsigned int uid = FindSpawnedUid(c);
+        if (uid != 0 && net::IsUidMine(uid) && AnnouncedToPeerQuiet(uid))
+        {
+            const bool sent = net::SendUnload(uid, 1);
+            if (sent) NoteNotAnnounced(uid);
+            DebugLog("[HIRE] own recruit uid=" + N(uid) + " fac='" + FacLog(FactionOfPod(c)) + "' - re-announced to the other games (unload "
+                     + std::string(sent ? "sent" : "NOT sent: link down") + ")");
+        }
+    }
+    return r;
+}
+
 } // namespace
 
 int HireDoActionsHookState() { return g_doActionsHook; }   /* P26s1 fold 1 M3 (declared in speech.h, namespace coop) */
@@ -609,6 +737,7 @@ int HireForTalk(unsigned int npcUid, unsigned int hirerUid, int price, int joinT
     if (hirerUid == 0 || !net::IsUidMine(hirerUid)) { *why = "the addressed character is not this game's"; return 0; }
     if (kEndDialogueRva == 0 || kRecruitRva == 0 || kPlayerIfaceRva == 0) { *why = "endDialogue / recruit / PlayerInterface not in the address table"; return 0; }
     if (g_pending.find(npcUid) != g_pending.end()) { *why = "a hire of that NPC is already pending"; return 0; }
+    if (OwnedVerdict(person) != cooprecruit::kRecruitAllow) { ++g_ownedLocal; NoticeOwned(person); *why = "another player's character (recruitguard.h)"; return 0; }
     DebugLog("[HIRE] talk hire uid=" + N(npcUid) + " hirer=" + N(hirerUid) + " price=" + N(price) + " type=" + N(joinType)
              + " - the other game's NPC joins this game's squad through the owner's REQ (P26 stage 5)");
     Hold(npcUid, person, hirerUid, price, joinType);
@@ -620,9 +749,11 @@ void InstallHire()
 {
     if (kDoActionsRva == 0) g_doActionsHook = -2;
     else g_doActionsHook = (coop::AddHook((void*)(Base() + (uintptr_t)kDoActionsRva), (void*)&detour_doActions, (void**)&g_doActionsOrig) == coop::SUCCESS) ? 1 : -1;
+    if (kRecruitRva == 0) g_recruitHook = -2;
+    else g_recruitHook = (coop::AddHook((void*)(Base() + (uintptr_t)kRecruitRva), (void*)&detour_recruit, (void**)&g_recruitOrig) == coop::SUCCESS) ? 1 : -1;
     const std::string line = "[HIRE] hooks: Dialogue::_doActions 0x67FAD0=" + N(g_doActionsHook) + " (R0-b hold; 1 armed, -1 AddHook failed, -2 no table address)"
-        + " recruit 0x693010=" + N(kRecruitRva != 0 ? 1 : 0) + " PlayerInterface=" + N(kPlayerIfaceRva != 0 ? 1 : 0) + " endDialogue 0x673DA0=" + N(kEndDialogueRva != 0 ? 1 : 0);
-    if (g_doActionsHook == 1 && kRecruitRva != 0 && kPlayerIfaceRva != 0 && kEndDialogueRva != 0) DebugLog(line); else ErrorLog(line);
+        + " recruit 0x693010=" + N(kRecruitRva != 0 ? 1 : 0) + " recruitGuard=" + N(g_recruitHook) + " PlayerInterface=" + N(kPlayerIfaceRva != 0 ? 1 : 0) + " endDialogue 0x673DA0=" + N(kEndDialogueRva != 0 ? 1 : 0);
+    if (g_doActionsHook == 1 && g_recruitHook == 1 && kRecruitRva != 0 && kPlayerIfaceRva != 0 && kEndDialogueRva != 0) DebugLog(line); else ErrorLog(line);
 }
 
 void HireNoteRecv(const coophire::HireMsg& m, unsigned int fromPeer)
@@ -984,7 +1115,8 @@ void ReportHire()
     for (int r = 1; r <= coophire::kNoReasonMax; ++r) no += (r > 1 ? "/" : "") + N(g_noOut[r]);
     DebugLog("[HIRE] REPORT reqOut=" + N(g_reqOut) + " reqIn=" + N(g_reqIn) + " okOut=" + N(g_okOut) + " okIn=" + N(g_okIn)
              + " noOut=" + no + " noIn=" + N(g_noIn) + " doneOut=" + N(g_doneOut) + " doneIn=" + N(g_doneIn) + " taken=" + N(g_taken)
-             + " recruitRefused=" + N(g_recruitRefused) + " purseShort=" + N(g_purseShort) + " released=" + N(g_released)
+             + " recruitRefused=" + N(g_recruitRefused) + " owned[held,ownerNo,take,local,engine,noticed]=" + N(g_ownedHeld) + "," + N(g_ownedOwnerNo) + ","
+             + N(g_ownedTake) + "," + N(g_ownedLocal) + "," + N((long long)g_ownedEngine) + "," + N(g_ownedNoticed) + " purseShort=" + N(g_purseShort) + " released=" + N(g_released)
              + " factionSet=" + N(g_factionSet) + " joinedApplied=" + N(g_joinedApplied) + " lateOk=" + N(g_lateOk)
              + " cancelledLinkDown=" + N(g_cancelledLinkDown) + " otherActs=" + N(g_otherActs) + " otherActTypes=[" + OtherActTypes() + "]"
              + " pendingNow=" + N((long long)g_pending.size()) + " reservedNow=" + N((long long)g_reserved.size())

@@ -100,6 +100,8 @@ static unsigned long long kMig3CloseTheOtherBits = 0; static coop::AddrReg kMig3
 #include "../common/upnpplan.h"          /* T-53: MapOnHostStart */
 #include "../common/names.h"   /* the on-disk names (mod folder, files, window texts) */
 #include "settings.h"                     /* mp5: SettingsHostChoices / SettingsLiveValue - the Game options screen */
+#include "kmode.h"                        /* DEDICATED: the world's start mode, named when the NEW GAME window opens */
+#include "../common/startmode.h"
 #include "command_channel.h"              /* U2: PathNextToDll - where SharedWastelandsServer.exe and the mod folder are */
 #include "../common/panelfit.h"           /* P8i-b: the size refusal as a pure, swept decision */
 #include "../common/panelstatus.h"        /* U2: every sentence the status area can say, as a pure decision */
@@ -1084,6 +1086,7 @@ static std::string g_noticeTitle;           /* T-201 N1: the error box's title w
 static int g_prepPhase = coopui::kPrepNone;
 static int g_prepMode = 0;        /* 1 HOST, 2 JOIN */
 static int g_prepUnreadSaid = 0;  /* the unreadable-request line, once per press */
+static int g_kmSkipWanted = 0;   /* DEDICATED: the autoload decided NEW GAME in a kenshi start mode world - the window it opens is pressed through (KmSkipTick) */
 static DWORD g_prepAtMs = 0;      /* kPrepWindowWait: when the press opened the NEW GAME window */
 static volatile LONG64 g_prepArmed = 0, g_prepSeen = 0, g_prepCancelled = 0;
 static int UiNewGameWindowShown(MyGUI::Gui* gui);
@@ -3433,6 +3436,15 @@ static int LoadTick()
     const int gate = StoreJoinGateAsk("the JOIN press's automatic load", coopjoin::kHoldPress, std::string());   /* the world road only; read live */
     if (gate == 2) { g_loadHeld = 1; return 0; }   /* refused for the operator alone: HELD, not cancelled - nothing new on screen */
     if (gate != 0) { LoadCancel("M11a S1: the join gate refused the load - the [STORE] JOIN gate line says why"); return 1; }
+    const int kmNew = v == coopprof::kAutoLoadNewGame ? 1 : 0, kmMode = coop::StartModeWorld();   /* StartModeWorld is freeplay unless linked to that world */
+    std::string kmWhy;
+    const int kmLoaded = kmNew != 0 && kmMode == swstart::kKenshi ? (coop::DrifterStartsLoaded(&kmWhy) ? 1 : 0) : 1;
+    g_kmSkipWanted = swstart::SkipArm(kmNew, kmMode, 1, kmLoaded) ? 1 : 0;
+    if (g_kmSkipWanted != 0)
+        DebugLog("[KMODE] a new character in a kenshi start mode world: the NEW GAME window opens and its BEGIN is pressed for the player one frame later; the start is replaced by a random Drifter start");
+    else if (kmNew != 0 && kmMode == swstart::kKenshi)
+        DebugLog("[KMODE] a new character in a kenshi start mode world: the start skip is not armed - " + kmWhy + " (" + swstart::kDataModFile
+                 + " is not on in this run - after a first join it is from the next launch); the NEW GAME window stays up and the start the player picks stands");
     g_loadVerdict = v; g_loadFolder = folder; g_loadProfile = prof; g_loadStage = 2; g_loadAtMs = ::GetTickCount(); g_loadTries = 0;
     const bool moving = v == coopprof::kAutoLoadLoad && StoreResetCarryMoving() != 0;   /* T-36: this load is Kenshi's import into the reset world */
     const std::string line = moving ? std::string(coopui::kResetMovingText) : coopui::LoadLineOf(v, prof);
@@ -8919,9 +8931,63 @@ static int UiNewGameWindowShown(MyGUI::Gui* gui)
     }
     return shown;
 }
+/* DEDICATED (kmode.cpp): THE START WINDOW SKIPPED. Armed when the autoload's NEW GAME click opened the window for a new character in a
+   kenshi start mode world (g_kmSkipWanted, set at that decision); on a LATER frame's tail - the window built and shown a frame ago, on
+   the main thread, after the engine's own update - its BEGIN button (found by its layout name, as NewGameButton is) is fired through
+   its own eventMouseButtonClick delegate: NewGameWindow::newGameStart (startmode.h has the RE). The newGame pre-hook then swaps the
+   start. swstart::SkipStep decides; anything unsure leaves the window up (the swap on BEGIN stands) and is logged. Once per open. */
+static int g_kmSkipArmed = 0;
+static int g_kmSkipWaitSaid = 0;
+static DWORD g_kmSkipAtMs = 0;
+static long long g_kmSkipped = 0, g_kmSkipGaveUp = 0;
+static void KmSkipTick(int atTitle)
+{
+    if (g_kmSkipArmed == 0) return;
+    swstart::SkipFacts f;
+    f.armed = 1;
+    f.atTitle = atTitle;
+    f.kenshiLinked = coop::StartModeWorld() == swstart::kKenshi ? 1 : 0;
+    f.panelWanted = ::InterlockedCompareExchange(&g_panelWanted, 0, 0) != 0 ? 1 : 0;
+    f.waitedMs = (unsigned)(DWORD)(::GetTickCount() - g_kmSkipAtMs);
+    std::string why;
+    MyGUI::Widget* begin = 0;
+    if (atTitle != 0)
+    {
+        f.requestCode = SaveRequestCodeNow();
+        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+        if (gui == 0) why = "no GUI";
+        else begin = UiDriveEngine(gui, "BeginButton", 1, &why);
+        if (begin != 0 && !UiDriveMouseReach(begin, &why)) begin = 0;
+        f.beginReachable = begin != 0 ? 1 : 0;
+    }
+    const int step = swstart::SkipStep(f);
+    if (step == swstart::kSkipWait)
+    {
+        if (g_kmSkipWaitSaid++ == 0) DebugLog("[KMODE] start window: BEGIN not reachable yet (" + why + ") - asked again next frame, for up to "
+                                             + coopui::PanelNum((long long)swstart::kSkipWaitMs) + " ms");
+        return;
+    }
+    g_kmSkipArmed = 0;   /* cleared FIRST: the press below never repeats, whatever its handler does */
+    if (step == swstart::kSkipFire)
+    {
+        const std::string name = begin->getName();   /* read BEFORE the click: the handler hides the window */
+        begin->eventMouseButtonClick(begin);
+        ++g_kmSkipped;
+        DebugLog("[KMODE] start window skipped (BEGIN pressed for the player " + coopui::PanelNum((long long)f.waitedMs) + " ms after the window opened, widget "
+                 + name + ") - the start is replaced by a random Drifter start at newGame; skipped=" + coopui::PanelNum(g_kmSkipped));
+        return;
+    }
+    if (step == swstart::kSkipGiveUp)
+    {
+        ++g_kmSkipGaveUp;
+        ErrorLog(std::string("[KMODE] start window NOT skipped: ") + swstart::SkipGiveUpWhy(f) + (why.empty() ? std::string() : " (" + why + ")")
+                 + " - the window is left as it is; a start picked there is still replaced by a random Drifter start. notSkipped=" + coopui::PanelNum(g_kmSkipGaveUp));
+    }
+}
 /* atTitle: 1 = after the title's own update (coop.cpp's title hook), 0 = the in-world tail - which never posts: the title that decided is gone. */
 static void LoadTailAct(int atTitle)
 {
+    KmSkipTick(atTitle);   /* a frame after the autoload opened the NEW GAME window (armed below) */
     if (atTitle != 0 && StoreNewGameReshowTake() != 0 && UiEngineNewGameClick("the refused NEW GAME (PP5 gate, F1)")) PrepWindowOpened();
     if (g_loadStage != 3) return;
     if (atTitle == 0)   /* T-220: reachable - between the panel closing (stage 3) and this tail the title menu is live, so the engine's own
@@ -8983,6 +9049,12 @@ static void LoadTailAct(int atTitle)
     { LoadFail(coopui::kLoadFailText, "CAN'T LOAD", "the NEW GAME button was not found"); return; }   /* owner 176 A: the world is left */
     g_loadStage = 0; g_loadMode = 0; g_profBusy = 0;
     PrepWindowOpened();
+    if (g_kmSkipWanted != 0)
+    {
+        g_kmSkipWanted = 0;
+        g_kmSkipArmed = 1; g_kmSkipWaitSaid = 0; g_kmSkipAtMs = ::GetTickCount();
+        DebugLog("[KMODE] start window: armed - its BEGIN is pressed at the end of a later title frame, once it is reachable");
+    }
 }
 void UiDriveEngineClickFlush(int atTitle)
 {

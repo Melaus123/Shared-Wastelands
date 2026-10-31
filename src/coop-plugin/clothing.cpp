@@ -16,11 +16,13 @@
 #include "store.h"   /* LIMBS: EngineWritesBlocked, StoreIsDeadPod */
 #include "policy.h"   /* LIMBS: PolicyVtableRvaPod / PolicyClassNamePod - the made limb item's RTTI class */
 #include "combat.h"   /* copy3: ReadAnimalAge01 - the animal test (CharacterAnimal getter offset) */
+#include "admin.h"    /* the Admin's Toychest god mode: AdminGodAnyThread - no limb lost */
 #include "stats.h"    /* LIMBS: StatsRecalcCopy - a copy's stats recalculated after its limb changes */
 
 #include "coop_log.h"
 #include <stdint.h>   /* mig3: what <core/Functions.h> also brought in */
 #include "game/Character.h"
+#include "game/MedicalSystem.h"   /* the Admin's Toychest /restore: the regrown limb's health part */
 #include "addresses.h"   /* mig3: coop::GameWorldPtr() / OptionsPtr() - our rows for what `ou` / `options` imported */
 #include "game/GameWorld.h"
 #include "game/GameData.h"
@@ -958,6 +960,7 @@ volatile LONG  g_limbApplyThread = 0;   // the thread inside the mod's own amput
 volatile LONG64 g_copyAmputateRefused  = 0;   // a copy's own amputate refused: its limbs come from its owner
 volatile LONG64 g_copyAmputateApplying = 0;   // a copy's amputate let through: ApplyOwnerLimbs is applying the owner's word
 volatile LONG64 g_copyAmputatePassed   = 0;   // amputate on a character this game drives, or not replicated: original ran
+volatile LONG64 g_godAmputateRefused  = 0;   // the Admin's Toychest god mode: a god character's amputation refused (any game)
 long long g_limbCarried = 0, g_limbReadFault = 0, g_limbAbsent = 0, g_limbRefusedMine = 0, g_limbNoCopy = 0, g_limbDeferredRebuild = 0;
 long long g_limbDeferredCarry = 0, g_limbWriterChanged = 0, g_limbFitFaultKept = 0;
 long long g_limbAmputated = 0, g_limbUnfitted = 0, g_limbFitted = 0, g_limbFitUnresolved = 0, g_limbFitKnownBad = 0;
@@ -1046,6 +1049,126 @@ static int LimbSetRobotCall(void* med, int limb, void* item)
     ItemApplyingLeave(prevItems);
     return rc;
 }
+
+/* THE ADMIN'S TOYCHEST /restore AND THE COPY'S REGROW (cooplimb::kLimbStepRegrow): a stump (or crushed) limb back to flesh.
+   The engine has no regrow call of its own, but its limb-slot writer RobotLimbs::setLimb(limb, state, item) - the call
+   setRobotLimbItem makes for both a fit and a take-off - takes LIMB_ORIGINAL with no item: it destroys the stump's own item (the
+   'limb replacement' it made at the amputation), writes the slot and takes the limb attachment off the body (decompiled from Steam
+   1.0.68 0xCFDD0). setLimb has no address-table row: it is read out of setRobotLimbItem's own call to it -
+   MedicalSystem_setRobotLimbItem + 0x85: 45 33 C9 / 44 8D 45 01 / E8 rel32 (xor r9d,r9d; lea r8d,[rbp+1]; call setLimb) - and
+   those bytes are verified before anything is called; unverified, there is no regrow (said once). The health part of a stump is
+   left at 5 (setRobotLimbItem's own stump value), so the OWNER's regrow gives it back a whole limb's maximum (LimbRegrowOwnedNow);
+   a copy's comes from the owner's STATE. Done at the K2 safe point only (the AI worker paused). */
+static std::string LimbF(float v);
+static std::string LimbStateText(::Character* c);
+const size_t kSetLimbCallOff = 0x85;
+const unsigned char kSetLimbCallBytes[8] = { 0x45, 0x33, 0xC9, 0x44, 0x8D, 0x45, 0x01, 0xE8 };
+typedef void (*LimbSetSlotFn)(void* robotLimbs, int limb, int state, void* item);
+static uintptr_t g_setLimbFn = 0;
+static int g_setLimbState = 0;   /* 0 not tried, 1 verified, -1 not */
+long long g_limbRegrown = 0, g_limbRegrowFault = 0, g_limbRegrowNoRoad = 0;
+static uintptr_t LimbSetSlotResolvePod(uintptr_t setRobot)
+{
+    __try
+    {
+        uintptr_t f = setRobot;
+        for (int i = 0; i < 3 && *(const unsigned char*)f == 0xE9; ++i) f = f + 5 + (intptr_t)*(const int*)(f + 1);
+        const unsigned char* p = (const unsigned char*)(f + kSetLimbCallOff);
+        if (std::memcmp(p, kSetLimbCallBytes, 8) != 0) return 0;
+        uintptr_t t = (uintptr_t)(p + 12) + (intptr_t)*(const int*)(p + 8);
+        for (int i = 0; i < 3 && *(const unsigned char*)t == 0xE9; ++i) t = t + 5 + (intptr_t)*(const int*)(t + 1);
+        return t;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static bool LimbSetSlotReady()
+{
+    if (g_setLimbState == 0)
+    {
+        const unsigned long long sr = AddrAbs(kLimbSetRobotRva);
+        g_setLimbFn = (kLimbSetRobotRva != 0 && sr != 0) ? LimbSetSlotResolvePod((uintptr_t)sr) : 0;
+        g_setLimbState = g_setLimbFn != 0 ? 1 : -1;
+        DebugLog(g_setLimbState == 1 ? "[LIMBS] regrow road: RobotLimbs::setLimb found inside setRobotLimbItem (+0x85 bytes verified) - /restore and a copy's regrow use it"
+                                     : "[LIMBS] regrow road: the setLimb call inside setRobotLimbItem did NOT verify (another build?) - no limb is regrown");
+    }
+    return g_setLimbState == 1;
+}
+static int LimbSetSlotPod(void* rl, int limb)
+{
+    __try { ((LimbSetSlotFn)g_setLimbFn)(rl, limb, (int)cooplimb::kLimbOriginal, 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* the slot of one stump / crushed limb back to whole. 1 done, -1 faulted, -2 no road, 0 no RobotLimbs record (nothing to regrow) */
+static int LimbRegrowSlot(::Character* c, int limb)
+{
+    if (!LimbSetSlotReady()) { ++g_limbRegrowNoRoad; return -2; }
+    void* rl = 0;
+    __try { rl = *(void**)((char*)c + kLimbMedical + kLimbMedRobot); } __except (EXCEPTION_EXECUTE_HANDLER) { rl = 0; }
+    if (rl == 0) return 0;
+    const long prevItems = ItemApplyingEnter();
+    const LONG prevThread = InterlockedExchange(&g_limbApplyThread, (LONG)::GetCurrentThreadId());
+    const int rc = LimbSetSlotPod(rl, limb);
+    InterlockedExchange(&g_limbApplyThread, prevThread);
+    ItemApplyingLeave(prevItems);
+    if (rc == 1) ++g_limbRegrown; else ++g_limbRegrowFault;
+    return rc;
+}
+/* the owner's regrow: every stump / crushed limb, its health part given a whole limb's maximum - the partner limb's when that one is
+   flesh, else the largest maximum among the flesh parts (a stump's 5 is never one) - full flesh, no wear, no stun. *regrown, *robotKept
+   (robotic limbs left fitted). true = every limb that needed it was regrown. MAIN THREAD, the safe point. */
+static bool LimbRegrowOwnedNow(unsigned int uid, int* regrown, int* robotKept, std::string* why)
+{
+    *regrown = 0; *robotKept = 0; why->clear();
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !net::IsUidMine(uid)) { *why = "not this game's character"; return false; }
+    int st[cooplimb::kLimbCount]; void* it[cooplimb::kLimbCount];
+    const int r = ReadLimbsPod(c, st, it);
+    if (r < 0) { *why = "its limbs could not be read"; return false; }
+    if (r == 0) return true;   /* no RobotLimbs record: all four whole */
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kLimbMedical);
+    const int count = med->countBodyParts();
+    if (count <= 0 || count > 32) { *why = "its body parts could not be read"; return false; }
+    MedicalSystem::HealthPartStatus* partOf[cooplimb::kLimbCount] = { 0, 0, 0, 0 };
+    float best = 0.0f;
+    for (int i = 0; i < count; ++i)
+    {
+        MedicalSystem::HealthPartStatus* p = med->partAt((unsigned __int64)i);
+        if (!Ptr(p)) continue;
+        const int l = cooplimb::LimbOfPart((int)p->partKind, (int)p->side);
+        if (l >= 0 && partOf[l] == 0) partOf[l] = p;
+        const bool flesh = p->prosthetic == 0 && (l < 0 || st[l] == (int)cooplimb::kLimbOriginal);
+        if (flesh && p->maxHealthBase == p->maxHealthBase && p->maxHealthBase > best) best = p->maxHealthBase;
+    }
+    bool all = true;
+    for (unsigned int i = 0; i < cooplimb::kLimbCount; ++i)
+    {
+        if (st[i] == (int)cooplimb::kLimbReplaced) { ++*robotKept; continue; }
+        if (st[i] != (int)cooplimb::kLimbStump && st[i] != (int)cooplimb::kLimbCrushed) continue;
+        const int rc = LimbRegrowSlot(c, (int)i);
+        if (rc != 1) { all = false; *why = rc == -2 ? "this game has no road to regrow a limb" : "the engine's limb call faulted"; continue; }
+        ++*regrown;
+        MedicalSystem::HealthPartStatus* p = partOf[i];
+        if (p == 0) continue;
+        const int partner = cooplimb::LimbPartner((int)i);
+        float maxBase = best;
+        if (partner >= 0 && st[partner] == (int)cooplimb::kLimbOriginal && partOf[partner] != 0 && partOf[partner]->prosthetic == 0 && partOf[partner]->maxHealthBase > 5.5f)
+            maxBase = partOf[partner]->maxHealthBase;
+        if (maxBase > 5.5f) p->maxHealthBase = maxBase;
+        p->limbWear = 0.0f; p->stunDamage = 0.0f;
+        p->flesh = p->age * p->maxHealthBase * p->healthScale;
+        p->recomputeHealth();
+        DebugLog("[LIMBS] /restore uid=" + S((long long)uid) + " " + cooplimb::LimbName(i) + " regrown: maxHealthBase=" + LimbF(p->maxHealthBase) + " flesh=" + LimbF(p->flesh)
+                 + " (" + (maxBase == best ? "the largest flesh part's maximum" : "its partner limb's maximum") + ")");
+    }
+    if (*regrown > 0)
+    {
+        const int rc = StatsRecalcOwned(uid, c);
+        DebugLog("[LIMBS] /restore uid=" + S((long long)uid) + " " + S((long long)*regrown) + " limb(s) regrown, stats recalculated rc=" + S((long long)rc) + " now [" + LimbStateText(c) + "]");
+    }
+    return all;
+}
+struct RegrowJob { int done, ok, regrown, robotKept; std::string why; RegrowJob() : done(0), ok(0), regrown(0), robotKept(0) {} };
+static std::map<unsigned int, RegrowJob> s_regrow;
 
 /* A robotic limb item from its sid, made as the kit makes a worn item, with the owner's quality. level >= 0 goes into the record
    before the item is made, as the kit does, because the engine builds a limb at the level its record holds then; -1 leaves the
@@ -1277,6 +1400,13 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
         const int step = cooplimb::PlanLimbQL(cs, here, hereQ, hereLv, w.state[i], w.sid[i], w.quality[i], w.level[i]);
         if (step == cooplimb::kLimbStepNone) { s_limbQualityTried.erase(key); s_limbNoEffectTried.erase(key); continue; }
         if (step == cooplimb::kLimbStepCannotRegrow) { ++g_limbCannotRegrow; continue; }
+        if (step == cooplimb::kLimbStepRegrow)
+        {
+            const int rc = dead ? -3 : LimbRegrowSlot(c, (int)i);
+            if (rc == 1) changed = true;
+            LimbLog(uid, i, step, cs, w.state[i], w.sid[i], w.level[i], fromPeer, rc == 1 ? "regrown (the owner's /restore)" : rc == -3 ? "left: the copy is dead" : rc == -2 ? "left: no regrow road here" : rc == 0 ? "left: no limb record" : "setLimb faulted");
+            continue;
+        }
         if (step == cooplimb::kLimbStepNoCrushRoad) { ++g_limbNoCrushRoad; continue; }
         if (step == cooplimb::kLimbStepUnnamed) { ++g_limbUnnamed; continue; }
         const bool sameItem = step == cooplimb::kLimbStepRefit && here[0] != 0 && std::strcmp(here, w.sid[i]) == 0;
@@ -1524,6 +1654,13 @@ static void LimbTestDrain()
 void LimbSafePointDrain()
 {
     LimbTestDrain();
+    if (!s_regrow.empty() && !EngineWritesBlocked())
+        for (std::map<unsigned int, RegrowJob>::iterator r = s_regrow.begin(); r != s_regrow.end(); ++r)
+        {
+            if (r->second.done) continue;
+            r->second.ok = LimbRegrowOwnedNow(r->first, &r->second.regrown, &r->second.robotKept, &r->second.why) ? 1 : 0;
+            r->second.done = 1;
+        }
     if (s_limbWant.empty()) return;
     if (EngineWritesBlocked())
     {
@@ -1536,6 +1673,19 @@ void LimbSafePointDrain()
     for (std::map<unsigned int, LimbWant>::const_iterator i = q.begin(); i != q.end(); ++i)
         ApplyOwnerLimbsNow(i->first, i->second.w, i->second.fromPeer);
 }
+
+void LimbRegrowRequest(unsigned int uid) { s_regrow[uid] = RegrowJob(); }
+int LimbRegrowResult(unsigned int uid, int* regrown, int* robotKept, std::string* why)
+{
+    std::map<unsigned int, RegrowJob>::iterator r = s_regrow.find(uid);
+    if (r == s_regrow.end()) { *why = "no regrow was asked"; return 0; }
+    if (!r->second.done) return -1;
+    *regrown = r->second.regrown; *robotKept = r->second.robotKept; *why = r->second.why;
+    const int ok = r->second.ok;
+    s_regrow.erase(r);
+    return ok;
+}
+void LimbRegrowForget(unsigned int uid) { s_regrow.erase(uid); }
 
 std::string LimbTestLever(const std::string& args)
 {
@@ -1593,6 +1743,11 @@ std::string LimbTestLever(const std::string& args)
 void detour_limbAmputate(void* med, int limb, bool createSeveredItem, const float* force)
 {
     const void* who = (med != 0) ? *(void* const*)((const char*)med + kLimbMedOwner) : 0;
+    if (who != 0 && AdminGodAnyThread(who) && (g_limbApplyThread == 0 || g_limbApplyThread != (LONG)::GetCurrentThreadId()))
+    {
+        InterlockedIncrement64(&g_godAmputateRefused);   /* the Admin's Toychest god mode: no limb is lost */
+        return;
+    }
     const unsigned int uid = (who != 0) ? FindSpawnedUid(who) : 0;
     if (uid != 0 && !net::IsUidMineAnyThread(uid))
     {
@@ -1631,6 +1786,7 @@ static void ReportLimbCounters()
              + " failed[fitUnresolved,fitKnownBad,callFault,noRow,noEffect,itemDestroyFault]=" + S(g_limbFitUnresolved) + ","
              + S(g_limbFitKnownBad) + "," + S(g_limbCallFault) + "," + S(g_limbNoRow) + "," + S(g_limbNoEffect) + "," + S(g_limbItemDestroyFault)
              + " leftAlonePerState[cannotRegrow,noCrushRoad,unnamed]=" + S(g_limbCannotRegrow) + "," + S(g_limbNoCrushRoad) + "," + S(g_limbUnnamed)
+             + " regrow[done,fault,noRoad,godAmputateRefused]=" + S(g_limbRegrown) + "," + S(g_limbRegrowFault) + "," + S(g_limbRegrowNoRoad) + "," + S((long long)g_godAmputateRefused)
              + " safePoint[queued,queueFull,blockedDropped,notBuilt,deadSkip,implausible,forgot]=" + S(g_limbQueued) + "," + S(g_limbQueueFull) + ","
              + S(g_limbDrainBlocked) + "," + S(g_limbNotBuilt) + "," + S(g_limbDeadSkip) + "," + S(g_limbImplausible) + "," + S(g_limbForgot)
              + " fitNotRobot=" + S(g_limbFitNotRobot) + " noEffectKept=" + S(g_limbNoEffectKept) + " qualityRefit=" + S(g_limbQualityRefit) + " limbtestRuns=" + S(g_limbTestRuns)

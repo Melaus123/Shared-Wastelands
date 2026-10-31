@@ -218,6 +218,83 @@ inline bool LedgerDropOut(Ledger* l, unsigned long long transfer, OutRow* gone)
     return false;
 }
 
+/* ---- SW Bank (teamwire.h BANK) on the same ledger: a DEPOSIT is an outbox row whose receiver is the team bank (kBankSlot). Its cats
+   leave the purse with the game's own take and the row goes in the SAME pp.money write as the new balance, so a game that crashes or
+   loads an older save has the cats and the row together or neither (never the cats AND a deposit the world server took). The row is
+   sent as a BANK deposit - never as MONEY_SEND - once that write is on disk and again on every new link until the world server answers:
+   its OK drops the row, a final refusal gives the cats back with the row's removal (money.cpp). The world server answers a request it has
+   already decided with the answer it had (teamwire.h BankRepeat), so a deposit sent again after a lost answer, a reload or a new link is
+   counted once - within the limits below.
+   THE REQUEST NUMBER (txn, protocol 112). A deposit's txn is kept IN ITS ROW: the row's receiver field is the txn itself (top bit set, so it
+   can never be a player slot), so it is written in the same pp.money write as the cats and survives a reload unchanged. A new txn is
+   0x80000000 | 31 random bits (BankTxnMake, from the caller's random source), never one a waiting deposit or withdraw holds; a withdraw takes one the
+   same way and is kept in memory only. Random rather than counted: a second PC, a copied or older save or a clock set back cannot walk
+   one player's numbers onto each other in order - two requests share a number only by chance (2^-31 each against each remembered one).
+   The world server refuses a txn without the top bit (BankTxnNew) as kBankBad and neither remembers nor answers it from its record: the
+   builds before protocol 112 numbered requests 1, 2, 3... per session (and then by seconds), and such numbers must never be answered
+   from another request's record. A row whose receiver is the old kBankSlot (written by such a build) is sent under its old number, is
+   refused, and its cats come back.
+   LIMITS (honest): the world server remembers each player's last swteam::kBankSeenEach decided requests and kBankSeenMax in all; a
+   request resent after more than that many newer decisions is decided again. A game WITHOUT bank support would send a bank row as
+   MONEY_SEND to its receiver (above 0x7FFFFFFF), which the world server refuses as no-such-player - the cats come back. */
+const unsigned kBankSlot = 0xFFFFFFFEu;      /* the receiver of a bank row written before protocol 112 (its txn was BankTxnOf(transfer)) */
+const unsigned kBankTxnBit = 0x80000000u;    /* every txn of protocol 112 has this bit; no player slot has it */
+const size_t kBankPendingMax = 8;            /* bank deposits waiting at most; one more is refused (not now) */
+inline bool IsBankRow(const OutRow& r) { return r.toSlot >= kBankTxnBit && r.toSlot != 0xFFFFFFFFu; }
+inline unsigned BankTxnOf(unsigned long long transfer) { return (unsigned)((transfer >> 16) & 0xFFFFFFFFULL); }
+inline bool BankTxnNew(unsigned txn) { return (txn & kBankTxnBit) != 0; }
+/* a bank row's request number: the receiver field, or (a row from before protocol 112) its transfer number's seconds */
+inline unsigned BankRowTxn(const OutRow& r) { return r.toSlot == kBankSlot ? BankTxnOf(r.transfer) : r.toSlot; }
+/* a txn from 32 random bits: the top bit set, never 0xFFFFFFFE (the old bank receiver) or 0xFFFFFFFF (no slot) */
+inline unsigned BankTxnMake(unsigned rnd)
+{
+    unsigned t = kBankTxnBit | (rnd & 0x7FFFFFFFu);
+    if (t >= kBankSlot) t -= 2u;
+    return t;
+}
+/* splitmix64: the game's random source for txns (money.cpp seeds it once per run from its clocks and process) */
+inline unsigned long long BankMix(unsigned long long* state)
+{
+    unsigned long long z = (*state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+inline size_t BankRowsWaiting(const Ledger& l)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < l.out.size(); ++i) if (IsBankRow(l.out[i])) ++n;
+    return n;
+}
+/* the bank row a BANK answer names (by its txn) */
+inline bool LedgerFindBank(const Ledger& l, unsigned txn, OutRow* row)
+{
+    for (size_t i = 0; i < l.out.size(); ++i) if (IsBankRow(l.out[i]) && BankRowTxn(l.out[i]) == txn) { if (row) *row = l.out[i]; return true; }
+    return false;
+}
+/* the txn after t: one up, wrapping from 0xFFFFFFFD to 0x80000000 (never the old bank receiver or no-slot), so a walk visits every
+   txn once and always ends */
+inline unsigned BankTxnNext(unsigned t) { return (t + 1u >= kBankSlot || t + 1u < kBankTxnBit) ? kBankTxnBit : t + 1u; }
+/* a new txn from `rnd` that no waiting deposit holds, nor any txn in *avoid (the waiting withdraws; 0 = none): the next one up when it
+   is taken. At most kOutMax + the caller's few are held, of 2^31 - 2, so the walk is short. */
+inline unsigned LedgerBankTxn(const Ledger& l, unsigned rnd, const std::set<unsigned>* avoid = 0)
+{
+    unsigned t = BankTxnMake(rnd);
+    while (LedgerFindBank(l, t, 0) || (avoid != 0 && avoid->count(t) != 0)) t = BankTxnNext(t);
+    return t;
+}
+/* a deposit's row (the caller takes the cats and writes pp.money; *avoid = the txns of the waiting withdraws); false = no room (kOutMax, kBankPendingMax) or not an amount.
+   The row takes the next transfer number (ordering only) and carries its txn as its receiver. */
+inline bool LedgerAddBank(Ledger* l, unsigned long long nowSec, int amount, unsigned rnd, OutRow* made, const std::set<unsigned>* avoid = 0)
+{
+    if (l->out.size() >= kOutMax || BankRowsWaiting(*l) >= kBankPendingMax || amount <= 0) return false;
+    OutRow r; r.transfer = NextNumber(l->nextTransfer, nowSec); r.toSlot = LedgerBankTxn(*l, rnd, avoid); r.amount = amount;
+    l->nextTransfer = r.transfer + 1;
+    l->out.push_back(r);
+    *made = r;
+    return true;
+}
+
 /* THE pp.money RECORD. Version 1 (mmo3, ownrec.h EncodeMoney): the tag "om3m" (int32 length + bytes) and the int32 balance.
    Version 2 (T-810) adds, after the balance: int32 2, u64 nextTransfer, u64 applied, u32 rows, rows * {u64 transfer, u32
    receiver slot, i32 amount}. A version-1 record reads as an empty ledger. */

@@ -42,6 +42,8 @@
 #include "store.h"   /* EngineWritesBlocked */
 #include "config.h"  /* settings5 S5: ConfigModFingerprintSalt */
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
+#include "kmode.h"    /* DEDICATED: the world's start mode at SaveManager::newGame */
+#include "../common/dedinfo.h"   /* DEDICATED: StewardKeepsWorldValues - the steward rule on a dedicated world only */
 
 namespace coop {
 namespace {
@@ -1095,7 +1097,12 @@ unsigned long long detour_smNewGame(void* self, void* a2, void* a3, void* a4)
         DebugLog("[SETTINGS] New Game commit: global rewritten from the world (changed=" + I(changed) + ")");
     }
     else DebugLog("[SETTINGS] New Game commit: this game's own advanced options stand (" + why + ")");
-    return orig_smNewGame(self, a2, a3, a4);
+    /* DEDICATED (kmode.cpp): a2 is the start record's string id the NEW GAME window chose (newGameStart passes starts[i]->stringID; the
+       engine copies it into SaveManager+0xB0 and its pump looks it up as a START record). A kenshi-mode world swaps it for a Drifter's. */
+    std::string kmodeStart;
+    void* start = a2;
+    if (coop::StartModeNewGame(a2, &kmodeStart)) start = &kmodeStart;
+    return orig_smNewGame(self, start, a3, a4);
 }
 
 /* ============ mp5 (docs/design-mpmenu1.md section 5) - THE HOST'S GAME OPTIONS, chosen on the title screen ============
@@ -1214,7 +1221,19 @@ void SettingsTick()
        live values are its own and the truth from that moment. */
     static int s_auth = 0;
     const int auth = StoreIsWorldAuthority() ? 1 : 0;
-    if (auth && !s_auth) GtRestore("this game became the world's authority");
+    if (auth && !s_auth)
+    {
+        /* DEDICATED (steward move): on a DEDICATED world (its DEDINFO came on this link) a game made the authority MID-WORLD, with the
+           world's record already followed, keeps the world's values - restoring its own here would push them over everyone's world. Its
+           own come back at world leave, as always. On a hosted world nothing changed: the new authority restores its own, as 0.3.4 does
+           (dedinfo.h StewardKeepsWorldValues). */
+        int dedHere = 0, haveClock = 0, clockMode = 0; unsigned dedMode = 0; float speed = 0.0f;
+        StoreFooterTimeFacts(&dedHere, &dedMode, &haveClock, &speed, &clockMode);
+        std::map<std::string, std::string> recNow;
+        const bool haveRec = dedHere != 0 && relay && run && RecSnapshot(&recNow);
+        if (dedinfo::StewardKeepsWorldValues(relay != 0, run != 0, haveRec, dedHere != 0)) DebugLog("[SETTINGS] this game became the dedicated world's authority mid-world - it keeps the world's values (steward)");
+        else GtRestore("this game became the world's authority");
+    }
     s_auth = auth;
     ::InterlockedExchange(&g_hcNotAuth, (relay && !auth) ? 1 : 0);   /* mp5: the load hook never writes the host's choices over another authority's world */
     if (!relay && s_relay) { { RecLock l; g_rec.clear(); g_recKnown = 0; } DebugLog("[SETTINGS] notebook link down - the world record is forgotten until the next WELCOME's OPTIONS map"); }

@@ -201,16 +201,25 @@ struct HelloTail
     unsigned road;        /* kRoadSession / kRoadWorld */
     std::string name;     /* the player's name (shared_wastelands.cfg playername=), "" = none */
     float viewDist;       /* this game's view distance, 0 = "I cannot tell you" */
-    HelloTail() : liveProto(0), road(0), viewDist(0.0f) {}
+    unsigned long long steamSelf;   /* DEDICATED: this player's own Steam id as Steam told the game, 0 = unknown. OPTIONAL trailing field:
+                                       an older reader stops before it, and an older game's HELLO decodes as 0. Self-reported, NOT proven */
+    HelloTail() : liveProto(0), road(0), viewDist(0.0f), steamSelf(0ULL) {}
 };
 inline void HelloTailEncode(const HelloTail& t, std::vector<char>* b)
 {
     JsPut32(b, t.liveProto); JsPut32(b, t.road); JsPutStr(b, t.name); JsPutF32(b, t.viewDist);
+    JsPut32(b, (unsigned)(t.steamSelf & 0xFFFFFFFFULL)); JsPut32(b, (unsigned)(t.steamSelf >> 32));
 }
 inline bool HelloTailDecode(const char* p, size_t n, size_t at, HelloTail* t)
 {
     HelloTail r;
     if (!JsGet32(p, n, &at, &r.liveProto) || !JsGet32(p, n, &at, &r.road) || !JsGetStr(p, n, &at, &r.name) || !JsGetF32(p, n, &at, &r.viewDist)) return false;
+    if (at < n)   /* the optional Steam id: absent (an older game) is fine; PART of one is a cut message, refused like any short tail */
+    {
+        unsigned lo = 0, hi = 0;
+        if (!JsGet32(p, n, &at, &lo) || !JsGet32(p, n, &at, &hi)) return false;
+        r.steamSelf = ((unsigned long long)hi << 32) | lo;
+    }
     if (r.road != (unsigned)kRoadSession && r.road != (unsigned)kRoadWorld) return false;
     *t = r;
     return true;

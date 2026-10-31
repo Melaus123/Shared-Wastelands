@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 625
+!count 633
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -636,3 +636,16 @@ NpcMemPlayerTest11                             code 00677DC7 00677DC7 4883B85002
 NpcMemPlayerTest12                             code 00677DF4 00677DF4 4883B850020000007407E8F8619BFFEB
 NpcMemPlayerTest13                             code 00677E67 00677E67 4883B850020000007404C6472800488B
 NpcMemPlayerTest14                             code 00677E84 00677E84 4883B850020000007407E868619BFFEB
+# TEAMMAP (team-bases PR port, 2026-10-19): the six rows below were NOT read from the 1.0.65 exe (none was at hand). Each rva is the
+# 1.0.68 rva less the shift both neighbouring rows agree on (0x40 / 0xA90 / 0xB30 / 0xED0); the bytes are 1.0.68's (no rel32 or RIP
+# field in them; the ret row's call is re-aimed at the 1.0.65 OwnedByAPlayerFaction thunk 0x53913). Verify on a 1.0.65 install.
+ResearchBenchWork                              code 0029B890 0029B890 48895C2408574881ECA000000080B960
+ResearchBenchIdle                              code 002995A0 002995A0 40534883EC20488B01488BD9FF505848
+ResearchAddProgress                            code 00835CA0 00835CA0 40534883EC70488BD98B89740100000F
+ResearchCurrentProgress                        code 0082E1C0 0082E1C0 40534883EC60488BDA4885D275534839
+TownPanelUpdate                                code 00726850 00726850 488BC455488DA8A8FDFFFF4881EC5003
+ResearchBenchDataRet                           ret  0082DDEE 0082DDE9 E8255B82FF
+# KENSHI API skill_xp (2026-10-31): the skill XP sink and the task XP adder. 1.0.68 rows read from the exe; the 1.0.65 rows are
+# derived (1.0.68 less 0xED0, the shift the neighbouring rows agree on), NOT read from a 1.0.65 exe. Optional rows: a mismatch only turns skill_xp off.
+Kapi_SkillXpGain                               code 008C4F20 008C4F20 40534883EC30F30F10050A65DB000F29
+Kapi_SkillXpTask                               code 008C5260 008C5260 4885D20F840801000048895C24185748

@@ -131,7 +131,10 @@ void AddrClearSlots(const AddrSlot* slots, int n);
    clears EVERY slot, so a signature set that failed its check gives no address to anyone. On the table road a
    refusal leaves the slots filled (addresses.h, AddrAbs: a refusal does not mean 0). */
 int AddrSettleSlots(const AddrEntry* entries, int count, const AddrSlot* slots, int n, int mismatched, int byPattern,
-                    int* missing, int* firstMissing);
+                    int* missing, int* firstMissing, const unsigned char* optional = 0, int* optionalMissing = 0);
+/* `optional` (may be 0) holds one flag per slot; a slot flagged 1 whose name has no entry is NOT counted in
+   *missing - it is set to 0 and counted in *optionalMissing (when given). The plugin also drops an optional row that failed its byte
+   check from `entries` before this call, so it lands here as a missing optional name. */
 
 }   /* namespace coopaddr */
 

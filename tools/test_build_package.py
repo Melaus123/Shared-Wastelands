@@ -66,6 +66,7 @@ def make_tree(name):
         "mod-package/Shared Wastelands/_Shared Wastelands.info": "<info/>\n",
         "mod-package/Shared Wastelands/shared-wastelands.loader.txt": "# marker\nformat=1\ndll=SharedWastelands.dll\nstart=coopEarlyStart\n",
         "mod-package/Shared Wastelands/title-background.png": b"\x89PNG\r\n\x1a\n title art stub",
+        "mod-package/Shared Wastelands/dedicatedserver/dedicatedserver.mod": b"\x10\x00dedicated stub",
     }
     for rel, data in src.items():
         write(os.path.join(t, rel), data)
@@ -114,7 +115,8 @@ class BuildPackage(unittest.TestCase):
         mod = os.path.join(out, "pkg", "Shared Wastelands")
         manifest = os.path.join(out, "pkg", "PACKAGE-MANIFEST.txt")   # beside the mod folder, not in it (owner 244)
         for f in ("SharedWastelands.dll", "SharedWastelandsLoader.dll", "SharedWastelandsSetup.exe", "SharedWastelandsServer.exe", "Shared Wastelands.mod",
-                  "_Shared Wastelands.info", "shared-wastelands.loader.txt", "title-background.png", "RE_Kenshi.json", "addresses/signatures.sig",
+                  "_Shared Wastelands.info", "shared-wastelands.loader.txt", "title-background.png", "dedicatedserver/dedicatedserver.mod",
+                  "RE_Kenshi.json", "addresses/signatures.sig",
                   "licenses/ENet-LICENSE.txt", "licenses/MinHook-LICENSE.txt", "licenses/MyGUI-COPYING.MIT.txt",
                   "licenses/Ogre-LICENSE.txt", "THIRD-PARTY-NOTICES.txt"):
             self.assertTrue(os.path.isfile(os.path.join(mod, f)), f)

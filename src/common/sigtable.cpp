@@ -17,6 +17,17 @@ SigOutcome::SigOutcome() : resolved(0), failed(0) {}
 
 namespace {
 
+void SigPushPair(std::vector<std::vector<std::size_t> >* rowsOf, std::size_t a, std::size_t b)
+{
+    std::vector<std::size_t> v; v.push_back(a); v.push_back(b); rowsOf->push_back(v);
+}
+
+bool SigNameIn(const std::vector<std::string>& names, const std::string& n)
+{
+    for (std::size_t i = 0; i < names.size(); ++i) if (names[i] == n) return true;
+    return false;
+}
+
 int HexNib(char ch)
 {
     if (ch >= '0' && ch <= '9') return ch - '0';
@@ -455,16 +466,27 @@ int SigRowEntry(const PeView& pe, const SigRow& r, unsigned int patRva, coopaddr
 int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry* out, const std::vector<unsigned int>& starts,
                   const std::vector<int>& counts, const std::vector<unsigned int>& firsts, SigOutcome* oc)
 {
+    return SigCrossCheckSome(pe, f, out, starts, counts, firsts, std::vector<unsigned char>(), oc, 0);
+}
+
+int SigCrossCheckSome(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry* out, const std::vector<unsigned int>& starts,
+                      const std::vector<int>& counts, const std::vector<unsigned int>& firsts, const std::vector<unsigned char>& skip,
+                      SigOutcome* oc, std::vector<std::vector<std::size_t> >* rowsOf)
+{
     const std::size_t nr = f.rows.size();
     int bad = 0;
     std::size_t i, j;
+    /* a dropped row (skip[i] != 0) takes part in no check; each failure's rows go to rowsOf, in the order of oc->fails */
+#define SIG_SKIP(r) ((r) < skip.size() && skip[(r)] != 0)
+#define SIG_ROWS1(a) if (rowsOf != 0) rowsOf->push_back(std::vector<std::size_t>(1, (std::size_t)(a)))
+#define SIG_ROWS2(a, b) if (rowsOf != 0) SigPushPair(rowsOf, (std::size_t)(a), (std::size_t)(b))
     /* (a) ORDER: within each class, sorted by rank, the addresses strictly rise (a repeated rank is already an unreadable
        line - SigParseFile - and a tie is refused here too) */
     int cl;
     for (cl = 0; cl < 3; ++cl)
     {
         std::vector<std::size_t> ix;
-        for (i = 0; i < nr; ++i) if (ClassOf(f.rows[i].kind) == cl) ix.push_back(i);
+        for (i = 0; i < nr; ++i) if (ClassOf(f.rows[i].kind) == cl && !SIG_SKIP(i)) ix.push_back(i);
         for (i = 1; i < ix.size(); ++i)   /* insertion sort by rank: a few hundred rows, once */
         {
             const std::size_t v = ix[i];
@@ -478,6 +500,7 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
             if (x.rank == y.rank || out[ix[i - 1]].rva >= out[ix[i]].rva)
             {
                 ++bad;
+                SIG_ROWS2(ix[i - 1], ix[i]);
                 oc->fails.push_back(std::string("ORDER (") + kClassName[cl] + "): " + x.name + " (rank " + Hx((unsigned long long)x.rank)
                                     + ") at " + Hx(out[ix[i - 1]].rva) + " is not below " + y.name + " (rank " + Hx((unsigned long long)y.rank)
                                     + ") at " + Hx(out[ix[i]].rva));
@@ -487,7 +510,7 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
     /* (b) DISTINCT: no two rows at one address */
     {
         std::vector<unsigned long long> k;
-        for (i = 0; i < nr; ++i) k.push_back(((unsigned long long)out[i].rva << 20) | (unsigned long long)i);
+        for (i = 0; i < nr; ++i) if (!SIG_SKIP(i)) k.push_back(((unsigned long long)out[i].rva << 20) | (unsigned long long)i);
         for (i = 1; i < k.size(); ++i)
         {
             const unsigned long long v = k[i];
@@ -498,6 +521,7 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
             if ((k[i - 1] >> 20) == (k[i] >> 20))
             {
                 ++bad;
+                SIG_ROWS2(k[i - 1] & 0xFFFFF, k[i] & 0xFFFFF);
                 oc->fails.push_back("DISTINCT: " + f.rows[(std::size_t)(k[i - 1] & 0xFFFFF)].name + " and "
                                     + f.rows[(std::size_t)(k[i] & 0xFFFFF)].name + " resolve to the same address " + Hx(k[i] >> 20));
             }
@@ -506,6 +530,7 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
     for (j = 0; j < f.g2.size(); ++j)
     {
         const std::size_t o = (std::size_t)f.g2Of[j];
+        if (SIG_SKIP(o)) continue;
         const SigRow& g = f.g2[j];
         const int cnt = counts[nr + j];
         long long t2 = 0;
@@ -515,12 +540,16 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
         else if (!DataTarget(pe, firsts[nr + j], g.a, g.b, g.c, &t2)) why = "its second displacement is not readable";
         else if (ins2 == ins1) why = "its second reference is the first one";
         else if (t2 != (long long)out[o].rva) why = "its second reference names " + Hx((unsigned long long)t2) + ", the first " + Hx(out[o].rva);
-        if (!why.empty()) { ++bad; oc->fails.push_back("GLOBAL TWICE: " + f.rows[o].name + ": " + why); }
+        if (!why.empty()) { ++bad; SIG_ROWS1(o); oc->fails.push_back("GLOBAL TWICE: " + f.rows[o].name + ": " + why); }
     }
     /* (d) CALL TARGETS: the recorded call, through up to four jmp stubs, lands on its code row */
     for (j = 0; j < f.calls.size(); ++j)
     {
         const SigCall& c = f.calls[j];
+        if (SIG_SKIP((std::size_t)c.row)) continue;
+        std::size_t tix = nr;   /* the target's row, when the file names it */
+        for (i = 0; i < nr; ++i) if (f.rows[i].name == c.target) { tix = i; break; }
+        if (tix < nr && SIG_SKIP(tix)) continue;   /* its target was dropped: nothing to land on */
         const unsigned long long at = (unsigned long long)starts[(std::size_t)c.row] + (unsigned long long)c.off;
         const unsigned char* q = PeAt(pe, at, 5);
         const coopaddr::AddrEntry* t = coopaddr::AddrFind(out, (int)nr, c.target.c_str());
@@ -539,19 +568,29 @@ int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry*
             }
             if (d != (unsigned long long)t->rva) why = "the call lands on " + Hx(d) + ", not on " + c.target + " at " + Hx(t->rva);
         }
-        if (!why.empty()) { ++bad; oc->fails.push_back("CALL TARGET: " + f.rows[(std::size_t)c.row].name + ": " + why); }
+        if (!why.empty()) { ++bad; if (rowsOf != 0) { if (tix < nr) SigPushPair(rowsOf, (std::size_t)c.row, tix); else rowsOf->push_back(std::vector<std::size_t>(1, (std::size_t)c.row)); } oc->fails.push_back("CALL TARGET: " + f.rows[(std::size_t)c.row].name + ": " + why); }
     }
+#undef SIG_SKIP
+#undef SIG_ROWS1
+#undef SIG_ROWS2
     return bad;
 }
 
 int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, SigOutcome* oc)
 {
+    return SigResolveSome(pe, f, out, maxEntries, std::vector<std::string>(), oc);
+}
+
+int SigResolveSome(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, const std::vector<std::string>& optional, SigOutcome* oc)
+{
     oc->resolved = 0;
     oc->failed = 0;
     oc->fails.clear();
+    oc->dropped.clear();
     std::size_t i;
     for (i = 0; i < f.nosig.size(); ++i)
     {
+        if (SigNameIn(optional, f.nosig[i])) { oc->dropped.push_back(f.nosig[i] + ": the generator could not make a unique pattern for it"); continue; }
         ++oc->failed;
         oc->fails.push_back(f.nosig[i] + ": the generator could not make a unique pattern for it");
     }
@@ -568,6 +607,7 @@ int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, 
     std::vector<unsigned int> firsts;
     SigScanAll(pe, f, &counts, &firsts);
     std::vector<unsigned int> starts(f.rows.size(), 0u);
+    std::vector<unsigned char> skip(f.rows.size(), 0);
     for (i = 0; i < f.rows.size(); ++i)
     {
         std::string why;
@@ -579,11 +619,37 @@ int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, 
             ++oc->resolved;
             continue;
         }
+        if (SigNameIn(optional, f.rows[i].name)) { skip[i] = 1; oc->dropped.push_back(f.rows[i].name + ": " + why); continue; }   /* optional: its feature goes off */
         ++oc->failed;
         oc->fails.push_back(f.rows[i].name + ": " + why);
     }
-    if (oc->failed == 0) oc->failed = SigCrossCheck(pe, f, out, starts, counts, firsts, oc);   /* only over a full set */
-    return oc->failed == 0 ? oc->resolved : 0;
+    if (oc->failed != 0) return 0;
+    /* THE CROSS-CHECKS over every row still in the set. A failure that names an optional row drops that row (its feature goes off) and
+       the checks run again over the rest; a failure that names no optional row refuses the set, as it always did. */
+    for (std::size_t round = 0; round <= f.rows.size(); ++round)
+    {
+        std::vector<std::vector<std::size_t> > rowsOf;
+        const std::size_t before = oc->fails.size();
+        const int bad = SigCrossCheckSome(pe, f, out, starts, counts, firsts, skip, oc, &rowsOf);
+        if (bad == 0) break;
+        bool fatal = false, droppedNow = false;
+        for (std::size_t k = 0; k < rowsOf.size(); ++k)
+        {
+            bool anyOpt = false;
+            for (std::size_t m = 0; m < rowsOf[k].size(); ++m)
+            {
+                const std::size_t r = rowsOf[k][m];
+                if (r >= f.rows.size() || !SigNameIn(optional, f.rows[r].name)) continue;
+                anyOpt = true;
+                if (skip[r] == 0) { skip[r] = 1; --oc->resolved; droppedNow = true; oc->dropped.push_back(oc->fails[before + k]); }
+            }
+            if (!anyOpt) fatal = true;
+        }
+        if (fatal || !droppedNow || rowsOf.size() != (std::size_t)bad) { oc->failed = bad; return 0; }
+        oc->fails.resize(before);   /* the failures were the dropped rows': the checks run again without them */
+    }
+    for (i = 0; i < f.rows.size(); ++i) if (skip[i] != 0) out[i] = coopaddr::AddrEntry();   /* no name: nothing binds to a dropped row */
+    return (int)f.rows.size();
 }
 
 }   /* namespace coopsigtab */

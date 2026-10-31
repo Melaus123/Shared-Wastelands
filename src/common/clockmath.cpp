@@ -254,6 +254,13 @@ float EffectiveSpeedFrom(const std::vector<void*>& order,
     }
 }
 
+float EffectiveSpeedAgree(const std::vector<float>& votes)
+{
+    if (votes.empty()) return 1.0f;
+    for (std::size_t i = 1; i < votes.size(); ++i) if (votes[i] != votes[0]) return 1.0f;
+    return votes[0];
+}
+
 int DialoguePauseLetThrough(int site, int linked, int* suppressed)
 {
     if (suppressed == 0) return 1;

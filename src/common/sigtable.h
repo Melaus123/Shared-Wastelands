@@ -25,7 +25,9 @@
  * extra    '-' or comma-separated: g:<anchor>:<pattern>:<a>:<b>:<c> (a var row's second referencing instruction),
  *          k:<off>:<row> (a direct CALL at pattern offset off whose target, through up to four jmp stubs, is <row>)
  * EVERY row must match exactly once; a row with no signature ('!nosig') or any row that matches 0 or 2+ times, or
- * fails its check, makes SigResolveAll return 0 and the caller refuses exactly as it does with no table.
+ * fails its check, makes SigResolveAll return 0 and the caller refuses exactly as it does with no table. The one
+ * exception is an OPTIONAL row (the plugin's kAddrUseOptional registrations, SigResolveSome): it is dropped instead,
+ * so only the feature that needs it is off - the same rule the table road applies to a row that does not match.
  * THE CROSS-CHECKS (T-63 gog1 fold; the per-row check against the running process copies its expected bytes from the
  * same file that was searched, so it cannot catch a pattern that found the WRONG place - these can): after every row
  * resolved, (a) ORDER - within each class the addresses rise in rank order (0 inversions between the two Steam builds,
@@ -129,6 +131,7 @@ struct SigOutcome
     int                      resolved;
     int                      failed;       /* rows that matched 0 or 2+ times or failed a check, plus !nosig rows */
     std::vector<std::string> fails;        /* "<name>: <why>", every one */
+    std::vector<std::string> dropped;      /* SigResolveSome: "<name or check>: <why>" for every OPTIONAL row left out of the set */
     SigOutcome();
 };
 /* The four cross-checks over a fully resolved set: out[i] is rows[i]'s entry, starts[i] its pattern start, counts and
@@ -136,10 +139,23 @@ struct SigOutcome
 int SigCrossCheck(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry* out, const std::vector<unsigned int>& starts,
                   const std::vector<int>& counts, const std::vector<unsigned int>& firsts, SigOutcome* oc);
 
+/* SigCrossCheck over the rows whose skip[i] is 0 (a shorter skip leaves the rest in): a dropped row takes part in no check
+   (an ORDER or DISTINCT neighbour, a second global reference, a call made from it or landing on it). rowsOf (may be 0) gets,
+   for each failure appended to oc->fails, the rows it names, in the same order. */
+int SigCrossCheckSome(const PeView& pe, const SigFile& f, const coopaddr::AddrEntry* out, const std::vector<unsigned int>& starts,
+                      const std::vector<int>& counts, const std::vector<unsigned int>& firsts, const std::vector<unsigned char>& skip,
+                      SigOutcome* oc, std::vector<std::vector<std::size_t> >* rowsOf);
+
 /* Resolves every row. Returns the number of entries written to out ONLY when every row resolved and every cross-check
    passed (and the file is !sigversion 2 with no bad lines, no !nosig rows and its !count agrees); otherwise 0 and
    oc->fails says why, row by row. */
 int SigResolveAll(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, SigOutcome* oc);
+/* SigResolveAll with OPTIONAL rows (the names in `optional`: the plugin's kAddrUseOptional rows). An optional row that is not found
+   exactly once, fails its own check, is !nosig, or is named by a failed cross-check is DROPPED: its entry is left empty (no name, so
+   nothing binds to it - the feature that needs it is off), it is listed in oc->dropped, and the cross-checks run again over the rest.
+   Anything else refuses the whole set exactly as SigResolveAll does. Returns f.rows.size() (out[i] is rows[i]'s entry, an empty one for
+   a dropped row) or 0. With no optional names it is SigResolveAll. */
+int SigResolveSome(const PeView& pe, const SigFile& f, coopaddr::AddrEntry* out, int maxEntries, const std::vector<std::string>& optional, SigOutcome* oc);
 
 }   /* namespace coopsigtab */
 

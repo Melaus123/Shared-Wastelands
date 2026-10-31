@@ -1057,6 +1057,8 @@ void Reconcile(int gen)
 }
 
 } // namespace
+/* SW Bank (team.cpp): the purse, read through the same pointer the bring-back fee uses (the box shows it; the cats move on the money ledger) */
+int BankPurseMoney() { int m = -1; void* o = PursePod(); return (o != 0 && PurseMoneyPod(o, &m) == 1) ? m : -1; }
 
 void ResurrectSaveFinished(const std::string& saveName)
 {

@@ -50,6 +50,7 @@
 #include "../common/fightchoice.h"   /* T-1101 design (c): the owner's fight choices and its copies' decide step */
 #include "../common/statewire.h"   /* fight parity: the stance buttons in STATE latchBits */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
+#include "admin.h"   /* the Admin's Toychest: AdminSafePointDrain (/additem) at the K2 safe point */
 #include "../common/windowbound.h"   /* T-986 fold 1: which close leaves combat mode (winbound::CloseKind) */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
 namespace coop { void TraderSpawnDrain(); }   /* traderspawn: items.cpp - the `traderspawn` lever runs at this same safe point */
@@ -12478,6 +12479,7 @@ void detour_tsRagdollUpdates(void* gameWorld)
        world's two character sets (+0x720, +0x768) and call 0x5D21A0 on each entry right after that destroy. */
     coop::EffectSafePointDrain();   /* MSG_EFFECT EAT: the other game's eater's bites on our own character; the eatbite lever */
     coop::LimbSafePointDrain();     /* LIMBS: amputate / setRobotLimbItem / limb item destroys, after the ragdoll pass, worker still paused */
+    coop::AdminSafePointDrain();    /* the Admin's Toychest /additem: the books made and added, worker still paused */
 }
 
 } // namespace (K2)

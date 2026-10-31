@@ -151,9 +151,11 @@ const int kLimbStepAmputate      = 1;   /* whole (or crushed) here, a stump on t
 const int kLimbStepUnfit         = 2;   /* a robotic limb here, a stump on the owner: setRobotLimbItem(limb, 0), the old item destroyed */
 const int kLimbStepFit           = 3;   /* the owner has a robotic limb fitted, none here: make the item, setRobotLimbItem(limb, item) */
 const int kLimbStepRefit         = 4;   /* both fitted, different items: unfit then fit */
-const int kLimbStepCannotRegrow  = 5;   /* whole on the owner, not here: the engine has no road back to flesh - left, counted */
+const int kLimbStepCannotRegrow  = 5;   /* whole on the owner, a robotic limb here: the engine has no road back to flesh from a fitted limb - left, counted */
 const int kLimbStepNoCrushRoad   = 6;   /* crushed on the owner: the engine's crushLimb is an empty function - left, counted */
 const int kLimbStepUnnamed       = 7;   /* fitted on the owner, but its item has no name on the wire - left, counted */
+const int kLimbStepRegrow        = 8;   /* whole on the owner (an admin's /restore), a stump or crushed here: the slot back to whole through
+                                           RobotLimbs::setLimb (clothing.cpp LimbRegrowSlot); its health comes in the same STATE */
 
 inline int PlanLimb(unsigned char copyState, const char* copySid, unsigned char ownerState, const char* ownerSid)
 {
@@ -165,7 +167,7 @@ inline int PlanLimb(unsigned char copyState, const char* copySid, unsigned char 
         if (copySid != 0 && std::strcmp(copySid, ownerSid) == 0) return kLimbStepNone;
         return kLimbStepRefit;
     }
-    if (ownerState == kLimbOriginal) return kLimbStepCannotRegrow;
+    if (ownerState == kLimbOriginal) return (copyState == kLimbStump || copyState == kLimbCrushed) ? kLimbStepRegrow : kLimbStepCannotRegrow;
     if (ownerState == kLimbCrushed) return kLimbStepNoCrushRoad;
     if (ownerState == kLimbStump) return (copyState == kLimbReplaced) ? kLimbStepUnfit : kLimbStepAmputate;
     /* ownerState == kLimbReplaced */
@@ -285,9 +287,21 @@ inline const char* LimbStepName(int step)
     case kLimbStepCannotRegrow: return "cannotRegrow";
     case kLimbStepNoCrushRoad:  return "noCrushRoad";
     case kLimbStepUnnamed:      return "unnamed";
+    case kLimbStepRegrow:       return "regrow";
     default:                    return "?";
     }
 }
+
+/* The limb (0 left arm .. 3 right leg) a body part is, from its HealthPartStatus kind (+0x08) and side (+0x20) - the engine's own
+   mapping (MedicalSystem's part-of-limb lookup, Steam 1.0.68 0x657590: kind 2 = an arm, kind 1 = a leg, side 1 = left); -1 = no limb. */
+inline int LimbOfPart(int kind, int side)
+{
+    if (kind == 2) return side == 1 ? 0 : 1;
+    if (kind == 1) return side == 1 ? 2 : 3;
+    return -1;
+}
+/* the other limb of the pair (the left arm's is the right arm) */
+inline int LimbPartner(int limb) { return (limb >= 0 && limb < (int)kLimbCount) ? (limb ^ 1) : -1; }
 
 inline const char* LimbName(unsigned int i)
 {

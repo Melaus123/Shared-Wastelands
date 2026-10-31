@@ -4658,6 +4658,68 @@ std::string Swap(const std::string& s, const std::string& from, const std::strin
 }
 }   /* namespace sigt */
 
+void t_addr_signatures_optional_rows_dropped()
+{
+    const std::vector<unsigned char> img = sigt::Image();
+    coopaddr::AddrEntry e[16];
+    coopsigtab::SigFile f; coopsigtab::PeView pe;
+    if (!coopsigtab::SigParsePe(&img[0], img.size(), &pe)) { Fail("the synthetic image does not parse"); return; }
+    std::vector<std::string> opt;
+    {   /* no optional names: SigResolveSome is SigResolveAll */
+        coopsigtab::SigOutcome oc;
+        coopsigtab::SigParseFile(sigt::kGood, std::strlen(sigt::kGood), &f);
+        if (coopsigtab::SigResolveSome(pe, f, e, 16, opt, &oc) != 5 || !oc.dropped.empty()) Fail("the good file with no optional rows did not resolve whole");
+    }
+    {   /* an optional ro row whose constant differs: dropped, the other four stand */
+        const std::string t = sigt::Swap(sigt::kGood, "0000803F00000040", "0000803F00000041");
+        coopsigtab::SigFile g; coopsigtab::SigParseFile(t.c_str(), t.size(), &g);
+        coopsigtab::SigOutcome oc;
+        if (coopsigtab::SigResolveSome(pe, g, e, 16, opt, &oc) != 0) Fail("a strict row that fails its check was accepted");
+        opt.push_back("Konst");
+        coopsigtab::SigOutcome o2;
+        const int n = coopsigtab::SigResolveSome(pe, g, e, 16, opt, &o2);
+        if (n != 5 || o2.resolved != 4 || o2.dropped.size() != 1 || o2.dropped[0].find("Konst:") != 0 || coopaddr::AddrFind(e, n, "Konst") != 0
+            || coopaddr::AddrFind(e, n, "Fn") == 0 || coopaddr::AddrFind(e, n, "Vt") == 0)
+            Fail("an optional row failing its check was not dropped alone: n=" + I(n) + " resolved=" + I(o2.resolved) + " dropped=" + I((int)o2.dropped.size()));
+        opt.clear();
+    }
+    {   /* an optional code row found nowhere: dropped, and the call made to it from Ret is not checked against nothing */
+        const std::string t = sigt::Swap(sigt::kGood, "Fn code 0 48895C2408574883EC20488B05????????90C3", "Fn code 0 48895C2408574883EC20488B05????????90C2");
+        coopsigtab::SigFile g; coopsigtab::SigParseFile(t.c_str(), t.size(), &g);
+        opt.push_back("Fn");
+        coopsigtab::SigOutcome oc;
+        const int n = coopsigtab::SigResolveSome(pe, g, e, 16, opt, &oc);
+        if (n != 5 || coopaddr::AddrFind(e, n, "Fn") != 0 || coopaddr::AddrFind(e, n, "Ret") == 0 || oc.dropped.size() != 1)
+            Fail("an optional row found nowhere was not dropped alone: n=" + I(n) + (oc.fails.empty() ? std::string("") : ": " + oc.fails[0]));
+        opt.clear();
+    }
+    {   /* the cross-checks: a swapped pair of code rows. With only Tg optional the strict rows' own ORDER failure still refuses; with Fn and Tg
+           optional both are dropped and the rest stands */
+        const std::string plus = sigt::Swap(sigt::kGood, "!count 5", "!count 6") + "Tg code 0 40534883EC20C3 0 0 7 0 - .text 2 -\n";
+        std::string sw = sigt::Swap(plus, "Fn code 0 48895C2408574883EC20488B05????????90C3 0 0 16 0", "Fn code 0 40534883EC20C3 0 0 7 0");
+        sw = sigt::Swap(sw, "Tg code 0 40534883EC20C3 0 0 7 0", "Tg code 0 48895C2408574883EC20488B05????????90C3 0 0 16 0");
+        coopsigtab::SigFile g; coopsigtab::SigParseFile(sw.c_str(), sw.size(), &g);
+        opt.push_back("Tg");
+        coopsigtab::SigOutcome oc;
+        if (coopsigtab::SigResolveSome(pe, g, e, 16, opt, &oc) != 0 || !sigt::Mentions(oc, "ORDER (code+ret): Fn")) Fail("a cross-check failure between strict rows was not a refusal");
+        opt.push_back("Fn");
+        coopsigtab::SigOutcome o2;
+        const int n = coopsigtab::SigResolveSome(pe, g, e, 16, opt, &o2);
+        if (n != 6 || coopaddr::AddrFind(e, n, "Fn") != 0 || coopaddr::AddrFind(e, n, "Tg") != 0 || coopaddr::AddrFind(e, n, "Ret") == 0 || !o2.fails.empty() || o2.resolved != 4)
+            Fail("optional rows named by the cross-checks were not dropped: n=" + I(n) + " resolved=" + I(o2.resolved) + (o2.fails.empty() ? std::string("") : ": " + o2.fails[0]));
+        opt.clear();
+    }
+    {   /* a !nosig row that is optional is dropped; a strict one still refuses */
+        const std::string t = sigt::Swap(sigt::kGood, "!nosigcount 0\n", "!nosigcount 1\n!nosig Lost\n");
+        coopsigtab::SigFile g; coopsigtab::SigParseFile(t.c_str(), t.size(), &g);
+        coopsigtab::SigOutcome oc;
+        if (coopsigtab::SigResolveSome(pe, g, e, 16, opt, &oc) != 0) Fail("a strict !nosig row was accepted");
+        opt.push_back("Lost");
+        coopsigtab::SigOutcome o2;
+        if (coopsigtab::SigResolveSome(pe, g, e, 16, opt, &o2) != 5 || o2.dropped.size() != 1) Fail("an optional !nosig row was not dropped");
+    }
+}
+
 /* gog1 fold 2: EVERY SLOT CLEARED after a pattern set fails its running-game check (addrtable.cpp AddrSettleSlots, the
    bind AddrInit makes in addresses.cpp). Literal inputs: two entries, slots preset to a marker. */
 void t_addr_pattern_refusal_clears_every_slot()
@@ -7273,7 +7335,8 @@ void t_limbs_plan_limb_per_owner_and_copy_state()
         { 2, "",  2, "x", cooplimb::kLimbStepRefit },
         { 2, "x", 2, "",  cooplimb::kLimbStepNone },
         { 1, "",  2, "",  cooplimb::kLimbStepUnnamed },
-        { 1, "",  0, "",  cooplimb::kLimbStepCannotRegrow },
+        { 1, "",  0, "",  cooplimb::kLimbStepRegrow },
+        { 3, "",  0, "",  cooplimb::kLimbStepRegrow },
         { 2, "x", 0, "",  cooplimb::kLimbStepCannotRegrow },
         { 0, "",  3, "",  cooplimb::kLimbStepNoCrushRoad },
         { 0, "",  4, "",  cooplimb::kLimbStepNone }
@@ -7287,6 +7350,11 @@ void t_limbs_plan_limb_per_owner_and_copy_state()
     if (cooplimb::PlanLimb(2, 0, 2, "x") != cooplimb::kLimbStepRefit || cooplimb::PlanLimb(0, 0, 2, 0) != cooplimb::kLimbStepUnnamed)
         Fail("PlanLimb must take null sids");
     if (std::strcmp(cooplimb::LimbName(3), "rightLeg") != 0 || std::strcmp(cooplimb::LimbName(4), "?") != 0) Fail("LimbName order");
+    /* the Admin's Toychest /restore: a body part's limb, the engine's own mapping (kind 2 arm, kind 1 leg, side 1 left), and the pair */
+    if (cooplimb::LimbOfPart(2, 1) != 0 || cooplimb::LimbOfPart(2, 0) != 1 || cooplimb::LimbOfPart(1, 1) != 2 || cooplimb::LimbOfPart(1, 0) != 3 || cooplimb::LimbOfPart(3, 1) != -1 || cooplimb::LimbOfPart(0, 0) != -1)
+        Fail("LimbOfPart: arms are kind 2, legs kind 1, left is side 1, the head and torso are no limb");
+    if (cooplimb::LimbPartner(0) != 1 || cooplimb::LimbPartner(3) != 2 || cooplimb::LimbPartner(4) != -1) Fail("LimbPartner pairs the arms and the legs");
+    if (std::strcmp(cooplimb::LimbStepName(cooplimb::kLimbStepRegrow), "regrow") != 0) Fail("the regrow step's name");
 }
 
 /* LIMBS: a same-item quality refit, the robotic limb class test and the limbtest lever's arguments. */

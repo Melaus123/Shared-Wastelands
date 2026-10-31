@@ -37,6 +37,7 @@ namespace coop { std::string StoreWorldIdOf(void* platoon); }   /* M7a3f3 T-425 
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* P25 fold 2: combat.cpp - 1 height, 0 no terrain, -1 no row / faulted. MAIN THREAD */
 namespace coop { int ItTraderHomePos(void* ap, void* platoon, void* leader, float* x, float* z); }   /* T-164 B4-3 (M4): items.cpp - a trader squad's home building position */   /* T-1 B3 fold (M2): items.cpp - net of this game's in-flight predictions */
 namespace coop { bool StoreLiveReady(); int StoreRosterSlotInWorld(int slot); int StoreMySlot(); bool EngineWritesBlocked(); }   /* M7a A1 build 2 [a1b2-hd9]: store.cpp (store.h) */
+#include "../common/admincmd.h"   /* the Admin's Toychest: MoveHeight */
 #include <algorithm>
 namespace coop { int ShopKeeperRecorded(void* character, int countIt); }   /* items.cpp: 1 = the shop record carries that keeper's money */
 
@@ -2521,6 +2522,29 @@ bool PlayerTeleport(float dx, float dz)
     if (cam != 1) DebugLog("[XFER] camera focus " + std::string(cam == 0 ? "skipped (no PlayerInterface)" : "FAULTED"));
     DebugLog("[XFER] player teleported by " + F1(dx) + "," + F1(dz) + " to " + F1(x + dx) + "," + F1(y) + "," + F1(z + dz) + " (sector " + SectorString(SectorOf(x + dx, z + dz)) + ")");
     return true;
+}
+// THE ADMIN'S TOYCHEST (admin.cpp /bring /goto /tp): ONE character this game drives to the ABSOLUTE x,z it was given - never a copy
+// lookup (the target need not be loaded here) - at the terrain's height there (GroundTerrainHeightAt, the `abs ... ground` path),
+// else at haveY's y (the requester's own feet), else refused. A downed character is refused (2): the engine's teleport leaves its
+// ragdoll behind and it snaps back (T1338 / T1342) - the caller heals it and waits for it to stand first. focus: the camera follows
+// (the moved character is this player's lead). 1 moved, 0 refused (*why), 2 down. MAIN THREAD.
+int AdminMoveCharacter(::Character* c, float x, float z, bool haveY, float carriedY, bool focus, std::string* why)
+{
+    why->clear();
+    if (!admincmd::PosOk(x, haveY ? carriedY : 0.0f, z)) { *why = "the position it was given is not a usable number"; return 0; }   /* a relayed spot */
+    float cx = 0, cy = 0, cz = 0;
+    if (!Plaus(c) || !ReadPos(c, &cx, &cy, &cz)) { *why = "its position could not be read"; return 0; }
+    if (IsDownedCharacter(c)) { *why = "it is down"; return 2; }
+    float th = 0.0f, ty = 0.0f;
+    const int tr = GroundTerrainHeightAt(x, z, &th);
+    if (!admincmd::MoveHeight(tr, th, haveY ? (unsigned)admincmd::kFlagHaveY : 0u, carriedY, &ty))
+    { *why = "this game reads no ground height at " + F1(x) + ", " + F1(z); return 0; }
+    if (!Teleport(c, x, ty, z)) { *why = "the engine's teleport faulted"; return 0; }
+    ++g_teleports;
+    const int cam = focus ? FocusCameraPod(x, ty, z) : 0;
+    DebugLog("[ADMIN] teleported from " + F1(cx) + "," + F1(cy) + "," + F1(cz) + " to " + F1(x) + "," + F1(ty) + "," + F1(z) + " (sector "
+             + SectorString(SectorOf(x, z)) + ") height " + (tr == 1 ? "the terrain's" : "carried") + " camera=" + N(cam));
+    return 1;
 }
 // P25 fold 2 (T780, TEST LEVER). `playerteleport abs <x> <z> <y | ground>` / `playerteleport ground`: the same teleport, camera
 // follow and [XFER] line as PlayerTeleport, at a GIVEN height (T776 kept the player's own and landed B on an upper floor, Y 1645.3)

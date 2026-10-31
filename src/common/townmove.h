@@ -59,6 +59,29 @@ inline int Decide(int step, int ours, float dx, float dz, int sameFactionNear, i
     return (d2 <= kMaxGap * kMaxGap) ? kMove : kRefound;
 }
 
+// T-924 SAME HANDLE (live 2026-10-25): the owner's game re-centres a player town in place on its pieces as they are built or taken
+// down, keeping its handle - one outpost 'The Hub', handle 13/357/1671630848, went (-7610,26004) -> (-7594,26004) -> (-7400,25718) ->
+// (-7396,25692) in one evening. Read only by the gap, a 26- or 345-unit step was taken for an outpost founded again (kRefound), whose
+// re-found waits for the old copy's area to unload - never, while the teammate plays in it - so the copy stayed where the outpost
+// was. sameHand = 1: the owner's handle is the one the copy was matched by before (SameHand) - the same outpost moved: a gap over kMaxGap
+// up to kMaxSameHandGap is a move, as a small one is. Every other answer as Decide gives it.
+const float kMaxSameHandGap = 2000.0f;
+// 1 = both handles are known (not all 0) and the same words
+inline int SameHand(const int* a, const int* b)
+{
+    if (a == 0 || b == 0) return 0;
+    int known = 0;
+    for (int i = 0; i < 5; ++i) { if (a[i] != b[i]) return 0; if (a[i] != 0) known = 1; }
+    return known;
+}
+inline int DecideHand(int step, int ours, float dx, float dz, int sameFactionNear, int writesBlocked, int sameHand)
+{
+    const int k = Decide(step, ours, dx, dz, sameFactionNear, writesBlocked);
+    if (k != kRefound || sameHand == 0) return k;
+    const float d2 = dx * dx + dz * dz;
+    return (d2 <= kMaxSameHandGap * kMaxSameHandGap) ? kMove : kRefound;
+}
+
 // the load sweep's test (0x929FB0: x/z squared distance strictly below the other town's radius squared); a radius that is not a
 // number counts as inside (the copy is not moved)
 inline int InsideRadius(float x, float z, float ox, float oz, float radius)

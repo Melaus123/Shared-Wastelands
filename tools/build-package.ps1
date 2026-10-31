@@ -25,6 +25,10 @@
 #                                  (addresses.cpp); signatures.sig is the pattern road for a build with no table.
 #   Shared Wastelands.mod, _Shared Wastelands.info   the mod list entry; SharedWastelandsLoader and coopEarlyStart start the mod only
 #                                  when a .mod in its folder is switched on in Kenshi's mod list (coop.cpp modSwitchedOn).
+#   dedicatedserver\dedicatedserver.mod   the Drifter starts of a dedicated server's startmode=kenshi (src/common/startmode.h). In a
+#                                  SUBFOLDER: Kenshi registers one .mod per mod folder, so beside "Shared Wastelands.mod" it would
+#                                  not load (or could hide ours). The plugin copies it to <Kenshi>\mods\dedicatedserver\ and switches
+#                                  it on (src\coop-plugin\kmode.cpp). Built by mod-package\dedicatedserver\build_dedicatedserver.py.
 #   title-background.png          the title screen's art (owner 446/447): the plugin shows it in place of Kenshi's title
 #                                  background (src\coop-plugin\titleart.cpp; its name is src\common\titleart.h kTitleArtFile).
 #                                  Without it Kenshi's own art stays.
@@ -211,6 +215,7 @@ try {
         @{ Dst = '_Shared Wastelands.info';      Src = "mod-package/$modDirName/_Shared Wastelands.info" }
         @{ Dst = $markerName;              Src = "mod-package/$modDirName/$markerName" }
         @{ Dst = 'title-background.png';   Src = "mod-package/$modDirName/title-background.png" }
+        @{ Dst = 'dedicatedserver\dedicatedserver.mod'; Src = "mod-package/$modDirName/dedicatedserver/dedicatedserver.mod" }
         @{ Dst = 'licenses\ENet-LICENSE.txt';     Src = 'src/coop-plugin/third_party/enet/LICENSE' }
         @{ Dst = 'licenses\MinHook-LICENSE.txt';  Src = 'src/coop-plugin/third_party/minhook/LICENSE.txt' }
         @{ Dst = 'licenses\MyGUI-COPYING.MIT.txt'; Src = 'src/coop-plugin/third_party/ogre-mygui/include/mygui/COPYING.MIT' }
@@ -239,6 +244,7 @@ try {
     $stageMod = Join-Path $staging $modDirName
     New-Item -ItemType Directory -Path (Join-Path $stageMod 'addresses') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stageMod 'licenses') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $stageMod 'dedicatedserver') -Force | Out-Null
 
     $rows = New-Object System.Collections.Generic.List[object]
     $corrupt = $env:KCOOP_PACKAGE_TEST_CORRUPT

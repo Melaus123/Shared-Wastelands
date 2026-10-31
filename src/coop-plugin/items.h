@@ -818,4 +818,15 @@ std::string ItemsKeeperRepairToken();
 std::string SnapshotCommand(const std::string& tag);
 void SnapshotTick();
 
+/* CHATLINK (src/common/chatlink.h), MAIN THREAD: the item under the mouse in an open inventory window, for the chat's item links.
+   `widget` is the MyGUI widget under the mouse (InputManager::getMouseFocusWidget), `widgetName` its name, then its absolute left,
+   top, width and height and the mouse's absolute position. Guarded POD reads only (items.cpp, the CHATLINK block); no engine call
+   beyond the getInventory / getLevel virtuals this file already makes, and no new address. On kLinkFound *out holds the item's
+   GameData name, its material record's name (a weapon's model), its string id, its GameData type, its level and its artifact
+   flag; any other answer says why there is no item. */
+struct ItemLinkFacts { char name[128]; char model[128]; char sid[128]; int type; int level; int artifact; };
+enum { kLinkFound = 1, kLinkNoWindow = 2, kLinkNoSection = 3, kLinkEmpty = 4, kLinkUnreadable = 5, kLinkNoTable = 6 };
+int ItemLinkUnderMouse(const void* widget, const char* widgetName, int absLeft, int absTop, int width, int height,
+                       int mouseX, int mouseY, ItemLinkFacts* out);
+
 }

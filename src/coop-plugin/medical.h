@@ -75,6 +75,15 @@ int StealthKnockOutOwned(unsigned int uid, float skill01, float* koTimerOut);
 // P11 fold 1 (T652) TEST-ONLY (`koself`): hold an owned character's wake-up clock at least `seconds` (never shorter),
 // then push its STATE. The clock after, -1 = not ours / no character / unreadable. MAIN THREAD.
 float KnockClockAtLeastOwned(unsigned int uid, float seconds);
+// THE ADMIN'S TOYCHEST (/heal): an owned living character to full health, its knockout latches cleared and its wake-up clock run out
+// (medical.cpp says what, and that blood is not raised). 1 healed, -1 not ours / unreadable, -2 dead. MAIN THREAD.
+int HealOwnedFull(unsigned int uid, int* parts, int* wasDown);
+int OwnedUnconscious(unsigned int uid);   // 1 unconscious, 0 not, -1 unreadable. MAIN THREAD.
+// THE ADMIN'S TOYCHEST v2: the healing tiers (admincmd::kTierMedic / kTierHeal / kTierRestore - medical.cpp says what each writes;
+// RESTORE's limbs are clothing.cpp's, done first). push = its STATE at once. 1 healed (*changed = a value moved enough to matter),
+// -1 not ours / unreadable, -2 dead. MAIN THREAD. HealOwnedFull is the MEDIC tier, pushed.
+int HealOwnedTier(unsigned int uid, int tier, bool push, int* parts, int* wasDown, int* changed);
+std::string GodMedicalTokens();   // " god[koRefused,hitsSkipped]=..": the god gates' counters (the AI-thread detours)
 
 // PROBE P017 (H011 / F134) - DIAGNOSTIC ONLY, changes nothing.
 //

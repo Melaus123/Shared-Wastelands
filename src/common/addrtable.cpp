@@ -274,14 +274,21 @@ void AddrClearSlots(const AddrSlot* slots, int n)
 }
 
 int AddrSettleSlots(const AddrEntry* entries, int count, const AddrSlot* slots, int n, int mismatched, int byPattern,
-                    int* missing, int* firstMissing)
+                    int* missing, int* firstMissing, const unsigned char* optional, int* optionalMissing)
 {
     int i;
     *missing = 0;
     *firstMissing = -1;
+    if (optionalMissing != 0) *optionalMissing = 0;
     for (i = 0; i < n; ++i)
     {
         const AddrEntry* e = AddrFind(entries, count, slots[i].name);
+        if (e == 0 && optional != 0 && optional[i] != 0)
+        {
+            *(slots[i].slot) = 0;   /* optional: the feature that needs it tests for 0 and stays off */
+            if (optionalMissing != 0) ++*optionalMissing;
+            continue;
+        }
         if (e == 0)
         {
             if (*firstMissing < 0) *firstMissing = i;

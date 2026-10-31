@@ -46,6 +46,9 @@
 #include "../common/corpsedecay.h"   // a copy's dead body is held short of the rot limit
 #include "replicate.h"   // PuppetUidsSnapshot - the copies this game holds
 #include "effect.h"      // EffectKoAwaitingReq: a sneak knockout whose victim's owner applies the knockout
+#include "admin.h"       // AdminGodAnyThread: the Admin's Toychest god mode - no damage, no knockout
+#include "../common/admincmd.h"   // the healing tiers, kHungerFull
+#include <cstring>         // the max-blood call's bytes compared
 #include <intrin.h>        // C2-b: _ReturnAddress - which caller is applying the damage
 
 #include "coop_log.h"
@@ -436,8 +439,10 @@ bool PuppetKoAllowed(MedicalSystem* self, int fn, float arg, unsigned long long 
     return false;
 }
 
+volatile LONG64 g_godKoRefused = 0, g_godDamageSkipped = 0;   /* the Admin's Toychest god mode: knockouts / hits refused a god character */
 void detour_startKnockoutTimer(MedicalSystem* self)
 {
+    if (self != 0 && AdminGodAnyThread((const char*)self - kMedicalOffset)) { InterlockedIncrement64(&g_godKoRefused); return; }   // god mode: never knocked out
     if (!PuppetKoAllowed(self, 1, 0.0f, 0)) return;   // refused: no clock started on this copy
     orig_startKnockoutTimer(self);
 }
@@ -445,6 +450,7 @@ void detour_startKnockoutTimer(MedicalSystem* self)
 void detour_knockout(MedicalSystem* self, float skill01)
 {
     const unsigned long long ret = (unsigned long long)(uintptr_t)_ReturnAddress();   // first: which engine call is knocking out
+    if (self != 0 && AdminGodAnyThread((const char*)self - kMedicalOffset)) { InterlockedIncrement64(&g_godKoRefused); return; }   // god mode: never knocked out
     if (!PuppetKoAllowed(self, 2, skill01, ret)) return;   // refused: no clock started on this copy
     orig_knockout(self, skill01);
 }
@@ -512,6 +518,7 @@ void detour_applyDamage(MedicalSystem* self, void* part, float* dmg, char a4, ch
         return;
     }
     const void* who = (self != 0) ? *(void* const*)((const char*)self + 0xE0) : 0;   /* the owning Character */
+    if (who != 0 && AdminGodAnyThread(who)) { InterlockedIncrement64(&g_godDamageSkipped); return; }   /* the Admin's Toychest god mode: no hit lands, on any game */
     const unsigned int uid = (who != 0) ? FindSpawnedUid(who) : 0;
     if (uid != 0 && !net::IsUidMineAnyThread(uid))   /* O1-b: hits and ranged hits can run on an AI worker */
     {
@@ -899,6 +906,120 @@ float KnockClockAtLeastOwned(unsigned int uid, float seconds)
     DebugLog("[P11] koself hold (TEST) owned uid=" + N(uid) + " koTimer " + F2(before) + " -> " + F2(med->knockoutClock)
              + " unconcious=" + N(med->unconcious ? 1 : 0) + " pushed=" + N(pushed ? 1 : 0));
     return med->knockoutClock;
+}
+
+// THE ADMIN'S TOYCHEST v2: THE HEALING TIERS (admin.cpp /medic /heal /restore, and every god character's tick). An owned, living
+// character:
+//   MEDIC (the v1 /heal) - every body part's flesh up to the ceiling the engine clamps against (age * maxHealthBase * healthScale -
+//     limbWear, F131) and its stun damage to 0, each part recomputed by the engine's own recomputeHealth; the bleed rate 0; the
+//     knockout latches (lowHealthKnockout, bloodLossShock) cleared and the wake-up clock (knockoutClock) run out, so the engine's own
+//     medical tick stands a knocked-out character up. `unconcious` is left to that tick.
+//   HEAL - MEDIC with every part's limb wear 0 first (a crippled limb is whole again: its ceiling is the part's full one), blood up
+//     to the engine's own maximum and hunger up to at least admincmd::kHungerFull. The maximum is the engine's: MedicalSystem::
+//     updateStats (MedicalSystem_vftable slot +8) ends `blood = <its max-blood function>(this)` (Steam 1.0.68: +0x59 48 8B CB E8
+//     rel32, then F3 0F 11 43 70 movss [rbx+0x70],xmm0) - that call is read out of those bytes, verified, and called alone (the
+//     rest of updateStats pushes stats this must not touch). Unverified bytes: blood is left (said in the log once).
+//   RESTORE - HEAL after the limbs (clothing.cpp LimbRegrowRequest at the safe point, before this is called).
+// Then its STATE at once when `push`. 1 healed (*parts = the parts written, *wasDown = it was unconscious, *changed = a value moved
+// enough to matter), -1 not ours / no character / unreadable / implausible part count, -2 dead. MAIN THREAD.
+namespace {
+unsigned long long kAdmMedVftRva = 0; coop::AddrReg kAdmMedVftRva_reg("MedicalSystem_vftable", &kAdmMedVftRva);   /* the same row stats.cpp reads */
+typedef float (*MaxBloodFn)(MedicalSystem*);
+uintptr_t g_maxBloodFn = 0; int g_maxBloodState = 0;   /* 0 not tried, 1 found, -1 the bytes did not verify */
+uintptr_t FollowE9Pod(uintptr_t a)
+{
+    __try { for (int i = 0; i < 3 && *(const unsigned char*)a == 0xE9; ++i) a = a + 5 + (intptr_t)*(const int*)(a + 1); return a; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int MaxBloodResolvePod(uintptr_t vft)
+{
+    __try
+    {
+        const uintptr_t upd = FollowE9Pod(*(const uintptr_t*)(vft + 8));
+        if (upd == 0) return 0;
+        const unsigned char* p = (const unsigned char*)(upd + 0x59);
+        const unsigned char head[4] = { 0x48, 0x8B, 0xCB, 0xE8 }, tail[5] = { 0xF3, 0x0F, 0x11, 0x43, 0x70 };
+        if (std::memcmp(p, head, 4) != 0 || std::memcmp(p + 8, tail, 5) != 0) return 0;
+        g_maxBloodFn = FollowE9Pod((uintptr_t)(p + 8) + (intptr_t)*(const int*)(p + 4));
+        return g_maxBloodFn != 0 ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+bool MaxBloodOf(MedicalSystem* med, float* out)
+{
+    if (g_maxBloodState == 0)
+    {
+        const uintptr_t vft = kAdmMedVftRva != 0 ? (uintptr_t)coop::AddrAbs(kAdmMedVftRva) : 0;
+        g_maxBloodState = (vft != 0 && MaxBloodResolvePod(vft) == 1) ? 1 : -1;
+        DebugLog(g_maxBloodState == 1 ? "[ADMIN] max blood: MedicalSystem::updateStats' own max-blood call found and verified - /heal fills blood to it"
+                                      : "[ADMIN] max blood: the call inside MedicalSystem::updateStats did NOT verify (another build?) - /heal leaves blood to the game");
+    }
+    if (g_maxBloodState != 1) return false;
+    __try { const float m = ((MaxBloodFn)g_maxBloodFn)(med); if (!(m == m) || m <= 0.0f || m > 100000.0f) return false; *out = m; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+}   // namespace
+int HealOwnedTier(unsigned int uid, int tier, bool push, int* parts, int* wasDown, int* changed)
+{
+    *parts = 0; *wasDown = 0; *changed = 0;
+    if (!net::IsUidMine(uid)) return -1;
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausiblePtr(c)) return -1;
+    if (c->hasDied()) return -2;
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
+    if (!PlausiblePtr(med)) return -1;
+    const int count = med->countBodyParts();
+    if (count <= 0 || count > 32) return -1;
+    for (int i = 0; i < count; ++i) if (!PlausiblePtr(med->partAt((unsigned __int64)i))) return -1;   /* all or nothing */
+    *wasDown = med->unconcious ? 1 : 0;
+    int moved = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        MedicalSystem::HealthPartStatus* p = med->partAt((unsigned __int64)i);
+        if (tier >= admincmd::kTierHeal && p->limbWear != 0.0f && p->limbWear == p->limbWear) { p->limbWear = 0.0f; ++moved; }
+        const float ceil = p->age * p->maxHealthBase * p->healthScale - p->limbWear;
+        if (ceil == ceil && ceil > p->flesh) { if (ceil - p->flesh > 0.5f) ++moved; p->flesh = ceil; }
+        if (p->stunDamage > 0.5f) ++moved;
+        p->stunDamage = 0.0f;
+        p->recomputeHealth();
+    }
+    if (med->bleedRate != 0.0f) ++moved;
+    med->bleedRate = 0.0f;
+    if (med->lowHealthKnockout || med->bloodLossShock) ++moved;
+    med->lowHealthKnockout = false;
+    med->bloodLossShock = false;
+    if (med->knockoutClock > 0.0f) { med->knockoutClock = 0.0f; ++moved; }
+    float maxBlood = -1.0f;
+    if (tier >= admincmd::kTierHeal)
+    {
+        if (MaxBloodOf(med, &maxBlood) && med->blood < maxBlood) { if (maxBlood - med->blood > 0.5f) ++moved; med->blood = maxBlood; }
+        if (med->hunger == med->hunger && med->hunger < admincmd::kHungerFull) { if (admincmd::kHungerFull - med->hunger > 1.0f) ++moved; med->hunger = admincmd::kHungerFull; }
+    }
+    *parts = count;
+    *changed = moved > 0 ? 1 : 0;
+    const bool pushed = push && StatePush(uid);
+    if (push)
+        DebugLog("[ADMIN] heal owned uid=" + N(uid) + " tier=" + N(tier) + " parts=" + N(count) + " blood=" + F2(med->blood) + (maxBlood > 0.0f ? "/" + F2(maxBlood) : std::string())
+                 + " hunger=" + F2(med->hunger) + " wasUnconscious=" + N(*wasDown) + " moved=" + N(moved) + " pushed=" + N(pushed ? 1 : 0));
+    return 1;
+}
+int HealOwnedFull(unsigned int uid, int* parts, int* wasDown)
+{
+    int changed = 0;
+    return HealOwnedTier(uid, admincmd::kTierMedic, true, parts, wasDown, &changed);
+}
+std::string GodMedicalTokens()
+{
+    return " god[koRefused,hitsSkipped]=" + N((long long)g_godKoRefused) + "," + N((long long)g_godDamageSkipped);
+}
+// The same character's knockout as the engine holds it now: 1 unconscious, 0 not, -1 unreadable. MAIN THREAD.
+int OwnedUnconscious(unsigned int uid)
+{
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausiblePtr(c)) return -1;
+    MedicalSystem* med = (MedicalSystem*)((char*)c + kMedicalOffset);
+    if (!PlausiblePtr(med)) return -1;
+    return med->unconcious ? 1 : 0;
 }
 
 // crash1b (T323): the owner's last STATE said this character is knocked out (the table OwnerSaysKo reads). ANY THREAD.

@@ -14,6 +14,7 @@ std::string FactionKey(::Faction* f, bool* isCode = 0);    // factionkey.h: an N
 std::string RekeyFactionKey(const std::string& key);       // factionkey.h: a world-store row's key, an NPC faction's name replaced by its stringID - MAIN THREAD
 bool IsPlayerFaction(::Faction* f);                        // this game's own player faction (Faction+0x250 PlayerInterface* != 0)
 bool IsPeerFaction(::Faction* f);
+bool AnyPlayersFaction(::Faction* f);                      // any player's faction: this game's own, a stand-in, or a stand-in record a save carries (an unreadable kind counts as a player's)
 ::Faction* LocalPlayerFaction();
 bool PeerFactionExists();
 ::Faction* PeerFactionAny();   /* pvp1 (review-pvp1 4): MAIN THREAD - the peer faction created here, else a `coop-peer` a loaded save carries, else 0 */   /* Z1-b: MAIN THREAD - the peer faction created here, or a `coop-peer` the loaded world already has */

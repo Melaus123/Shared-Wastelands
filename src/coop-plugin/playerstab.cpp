@@ -26,6 +26,8 @@
 #include "playerfaction.h"
 #include "relations.h"
 #include "store.h"
+#include "kmode.h"   /* DEDICATED: the footer's Server / Time / Start / Class lines (StartModeFooter) */
+#include "../common/startmode.h"   /* swstart::kFooterLines, FooterLabel, FooterWrap */
 #include "team.h"   /* T-546 step 4: TeamSameAnyThread - towards a teammate only ALLY */
 #include "chat.h"   /* MESSAGE opens the chat with TO set to the selected player */
 #include "money.h"   /* T-810: GIVE MONEY - money.cpp takes SEND from the box */
@@ -86,6 +88,9 @@ const char* const kMsgName = "SWPlayersMessageBtn";   /* MESSAGE: the chat with 
 const char* const kGiveName = "SWPlayersGiveMoneyBtn";   /* T-810 GIVE MONEY: the GIVE MONEY box for the selected player */
 const char* const kBoxAmount = "SWGiveMoneyAmount";   /* the GIVE MONEY box's typing box and its hint line */
 const char* const kBoxHint = "SWGiveMoneyHint";
+/* the footer under the table: a block of label / value lines (Server, Time, Start, Class - kmode.cpp's words), one row each */
+const char* const kFootLabelName[swstart::kFooterLines] = { "SWPlayersFooterLabel1", "SWPlayersFooterLabel2", "SWPlayersFooterLabel3", "SWPlayersFooterLabel4" };
+const char* const kFootValueName[swstart::kFooterLines] = { "SWPlayersFooterValue1", "SWPlayersFooterValue2", "SWPlayersFooterValue3", "SWPlayersFooterValue4" };
 const int kBoxGiveMoney = 1000;   /* the GIVE MONEY box: this module's own box kind, beside teamscreen::kBox* */
 /* the one box this module shows at a time: SET HOSTILE, FACTION INVITATION, LEAVE / REMOVE FROM / DISBAND FACTION, FACTION */
 const char* const kBoxName    = "SWFactionBox";
@@ -103,6 +108,12 @@ MyGUI::TabItem* g_item = 0;
 MyGUI::MultiListBox* g_list = 0;
 MyGUI::TextBox* g_line = 0;
 MyGUI::TextBox* g_select = 0;
+MyGUI::TextBox* g_footLabel[swstart::kFooterLines] = { 0, 0, 0, 0 };
+MyGUI::TextBox* g_footValue[swstart::kFooterLines] = { 0, 0, 0, 0 };
+std::string g_footShown;             /* the lines FooterRefresh last laid out ("label|value\n"...) */
+int g_footLineH = 0;                 /* one footer row's height (the stance line's) */
+int g_footFromBottom = 0;            /* the block's bottom edge, this far above the page's bottom (over the stance line) */
+int g_footPad = 0;                   /* the gap between the table and the block */
 MyGUI::Button* g_btn[3] = { 0, 0, 0 };
 MyGUI::Widget* g_box = 0;
 std::string g_fitShown;              /* the tab widths MgmtTabsFit last logged */
@@ -201,6 +212,11 @@ public:
         if (g_list != 0 && Inside(g_list, w)) g_list = 0;
         if (g_line != 0 && Inside(g_line, w)) g_line = 0;
         if (g_select != 0 && Inside(g_select, w)) g_select = 0;
+        for (int k = 0; k < swstart::kFooterLines; ++k)
+        {
+            if (g_footLabel[k] != 0 && Inside(g_footLabel[k], w)) g_footLabel[k] = 0;
+            if (g_footValue[k] != 0 && Inside(g_footValue[k], w)) g_footValue[k] = 0;
+        }
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0 && Inside(g_btn[k], w)) g_btn[k] = 0;
         for (int k = 0; k < 2; ++k) if (g_act[k] != 0 && Inside(g_act[k], w)) g_act[k] = 0;
         if (g_note != 0 && Inside(g_note, w)) g_note = 0;
@@ -315,6 +331,14 @@ std::vector<playerstab::RowView> BuildRows()
         in.inTeam = coop::TeamNoOfSlotAnyThread(in.slot) != 0;
         { std::string line2; bool mate = false; coop::TeamTagFor(in.slot, in.faction, &line2, &mate); in.faction = line2; }   /* in a faction of players: its name (478) */
         rows.push_back(playerstab::RowFor(in));
+        {   /* DEDICATED: the server's rules on this row - an announced admin's star, and Host / its vote / Admin after the status word */
+            std::string pre, st;
+            if (coop::StoreDedicatedBadge(in.slot, &pre, &st) == 1)
+            {
+                if (!pre.empty()) rows.back().cell[0] = pre + rows.back().cell[0];
+                if (!st.empty()) rows.back().cell[4] += " - " + st;
+            }
+        }
     }
     playerstab::SortBySlot(&rows);
     return rows;
@@ -376,6 +400,8 @@ void ForgetTab()
 {
     g_act[0] = g_act[1] = 0; g_note = 0; g_actShown[0] = g_actShown[1] = 0; g_shownView.clear(); g_view = teamscreen::View(); g_viewSelected = false;
     g_tabs = 0; g_item = 0; g_list = 0; g_line = 0; g_select = 0; g_btn[0] = g_btn[1] = g_btn[2] = 0;
+    for (int k = 0; k < swstart::kFooterLines; ++k) { g_footLabel[k] = 0; g_footValue[k] = 0; }
+    g_footShown.clear();
     g_msg = 0; g_msgShown = -1;
     g_give = 0; g_giveShown = -1;
     g_rows.clear(); g_selSlot = -1; g_shownLine.clear(); g_shownSelect.clear(); g_shownTicked = -2; g_shownSelected = -1; g_shownLocked = -1; g_rowsEpoch = -1;
@@ -405,7 +431,14 @@ bool BuildPage(MyGUI::TabItem* item)
     const int lineH = Clamp(H * 32 / 1000, 18, 32);
     const int btnY = H - pad - btnH;
     const int lineY = btnY - pad / 2 - lineH;
-    const int listY = pad, listH = lineY - pad - listY;
+    /* the footer: a block of up to kFooterLines painted rows under the table, over the stance line - its height is always taken
+       from the table (sized for every line, so the table does not move as lines arrive), never from the text */
+    /* its bottom sits a half pad above the stance line's row, or above GIVE MONEY / MESSAGE on that row when they are taller
+       than the line (they are centred on it), so the block never meets that row or the buttons under it */
+    const int lineRowTop = btnH > lineH ? lineY - (btnH - lineH + 1) / 2 : lineY;
+    const int footBottom = lineRowTop - pad / 2;
+    const int footY = footBottom - swstart::kFooterLines * lineH;
+    const int listY = pad, listH = footY - pad - listY;
     if (listH < 60) return false;
     MyGUI::Widget* lw = Mk(item, "MultiListBox", "Kenshi_MultiListBox", 0, listY, W, listH, MyGUI::Align::Stretch, kListName);
     MyGUI::Widget* line = Mk(item, "TextBox", "Kenshi_TextboxPaintedText", 0, lineY, W, lineH, MyGUI::Align::HStretch | MyGUI::Align::Bottom, kLineName);
@@ -422,6 +455,40 @@ bool BuildPage(MyGUI::TabItem* item)
         const int inset = Clamp((lc != 0 && lc != list ? lc->getAbsoluteCoord().left - list->getAbsoluteCoord().left : 0) + kTextMargin, kTextMargin, W / 4);
         lt->setCoord(MyGUI::IntCoord(inset, lineY, W - inset, lineH));
         st->setCoord(MyGUI::IntCoord(inset, lineY, W - inset, lineH));
+        /* the footer: per row a label box (the label column, as wide as the widest label plus a gap, so the values line up) and
+           a value box over the rest of the line's width - the window's label face and colour, as the stance line; never a mouse
+           target. The rows are placed and filled by FooterRefresh (a value too wide for its box is wrapped there, never cut). */
+        const int span = W - 2 * inset;
+        const int labelGap = Clamp(lineH / 2, 6, 16);
+        int labelW = 0;
+        for (int k = 0; k < swstart::kFooterLines; ++k)
+        {
+            MyGUI::Widget* lbw = Mk(item, "TextBox", "Kenshi_TextboxPaintedText", inset, footY + k * lineH, span / 2, lineH, MyGUI::Align::Left | MyGUI::Align::Bottom, kFootLabelName[k]);
+            MyGUI::Widget* vw = Mk(item, "TextBox", "Kenshi_TextboxPaintedText", inset + span / 2, footY + k * lineH, span - span / 2, lineH, MyGUI::Align::HStretch | MyGUI::Align::Bottom, kFootValueName[k]);
+            MyGUI::TextBox* lb = lbw != 0 ? lbw->castType<MyGUI::TextBox>(false) : 0;
+            MyGUI::TextBox* vt = vw != 0 ? vw->castType<MyGUI::TextBox>(false) : 0;
+            if (lb == 0 || vt == 0) return false;
+            lb->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
+            vt->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
+            lb->setNeedMouseFocus(false);
+            vt->setNeedMouseFocus(false);
+            lb->setCaption(MyGUI::UString(swstart::FooterLabel(k)));   /* measured: the label column fits the widest label */
+            if (lb->getTextSize().width > labelW) labelW = lb->getTextSize().width;
+            g_footLabel[k] = lb; g_footValue[k] = vt;
+        }
+        labelW = Clamp(labelW + labelGap, labelGap, span / 2);
+        for (int k = 0; k < swstart::kFooterLines; ++k)
+        {
+            g_footLabel[k]->setCoord(MyGUI::IntCoord(inset, footY + k * lineH, labelW, lineH));
+            g_footValue[k]->setCoord(MyGUI::IntCoord(inset + labelW, footY + k * lineH, span - labelW, lineH));
+            g_footLabel[k]->setCaption(MyGUI::UString(""));
+            g_footValue[k]->setCaption(MyGUI::UString(""));
+            g_footLabel[k]->setVisible(false);
+            g_footValue[k]->setVisible(false);
+        }
+        g_footLineH = lineH; g_footFromBottom = H - footBottom; g_footPad = pad; g_footShown.clear();
+        DebugLog("[UI] rect playerstab footer y=" + S(footY) + " rows=" + S(swstart::kFooterLines) + "x" + S(lineH) + " label x=" + S(inset) + " w=" + S(labelW)
+                 + " value x=" + S(inset + labelW) + " w=" + S(span - labelW) + "; table y=" + S(listY) + " h=" + S(listH) + " (the block under the table, over the stance line)");
         DebugLog("[UI] rect playerstab line inset x=" + S(inset) + " (the list's client area " + S(lc != 0 && lc != list ? lc->getAbsoluteCoord().left - list->getAbsoluteCoord().left : -1) + " + " + S(kTextMargin) + ")");
     }
     int cw[playerstab::kColumns];
@@ -660,6 +727,71 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0) g_btn[k]->setEnabled(playerstab::ButtonEnabled(b, k));
     }
 }
+/* FooterWrap's measure: the width `text` takes in the value box `ctx` (its own face) */
+int FooterMeasureOn(const std::string& text, void* ctx)
+{
+    MyGUI::TextBox* t = (MyGUI::TextBox*)ctx;
+    t->setCaption(MyGUI::UString(text.c_str()));
+    return t->getTextSize().width;
+}
+/* the footer's lines (kmode.cpp StartModeFooter; swstart::FooterLines decides them), laid out only when they change: from the
+   block's top, one row per line, the lines with no value left out (the rest move up, the unused rows at the bottom hidden). A value
+   wider than its box is wrapped onto the rows below (FooterWrap), never cut; should the wrapped lines ever need more rows than the
+   block holds, the block grows upward and the table gives up the height - the text never shrinks. */
+void FooterRefresh()
+{
+    std::vector<std::string> lab, val;
+    coop::StartModeFooter(&lab, &val);
+    for (int k = 0; k < swstart::kFooterLines; ++k) if (g_footLabel[k] == 0 || g_footValue[k] == 0) return;
+    MyGUI::Widget* page = g_footValue[0]->getParent();
+    if (page == 0 || g_footLineH <= 0) return;
+    std::string sig;
+    for (size_t k = 0; k < lab.size(); ++k) sig += lab[k] + "|" + val[k] + "\n";
+    sig += "@" + S(g_footValue[0]->getWidth());   /* a resized window re-wraps */
+    if (sig == g_footShown) return;
+    const int n = (int)lab.size() < (int)swstart::kFooterLines ? (int)lab.size() : (int)swstart::kFooterLines;
+    std::vector<std::string> wrapped[swstart::kFooterLines];
+    int rows = 0;
+    for (int k = 0; k < n; ++k)
+    {
+        wrapped[k] = swstart::FooterWrap(val[(size_t)k], g_footValue[k]->getWidth(), FooterMeasureOn, g_footValue[k]);
+        rows += (int)wrapped[k].size();
+    }
+    const int blockRows = rows > (int)swstart::kFooterLines ? rows : (int)swstart::kFooterLines;
+    const int bottom = page->getHeight() - g_footFromBottom;
+    const int top = bottom - blockRows * g_footLineH;
+    int y = top;
+    std::string shown;
+    for (int k = 0; k < swstart::kFooterLines; ++k)
+    {
+        MyGUI::TextBox* lb = g_footLabel[k];
+        MyGUI::TextBox* vt = g_footValue[k];
+        if (k >= n)
+        {
+            lb->setCaption(MyGUI::UString("")); vt->setCaption(MyGUI::UString(""));
+            lb->setVisible(false); vt->setVisible(false);
+            continue;
+        }
+        const int h = (int)wrapped[k].size() * g_footLineH;
+        std::string text;
+        for (size_t j = 0; j < wrapped[k].size(); ++j) text += (j > 0 ? "\n" : "") + wrapped[k][j];
+        lb->setCoord(MyGUI::IntCoord(lb->getLeft(), y, lb->getWidth(), h));
+        vt->setCoord(MyGUI::IntCoord(vt->getLeft(), y, vt->getWidth(), h));
+        lb->setCaption(MyGUI::UString(lab[(size_t)k].c_str()));
+        vt->setCaption(MyGUI::UString(text.c_str()));
+        lb->setVisible(true); vt->setVisible(true);
+        shown += (shown.empty() ? "" : " / ") + lab[(size_t)k] + " " + val[(size_t)k] + (wrapped[k].size() > 1 ? " (wrapped " + S((int)wrapped[k].size()) + ")" : "");
+        y += h;
+    }
+    /* the table ends a pad above the block (only an overflowing wrap changes it from the height BuildPage gave it) */
+    if (g_list != 0)
+    {
+        const int listH = top - g_footPad - g_list->getTop();
+        if (listH > 0 && listH != g_list->getHeight()) g_list->setSize(g_list->getWidth(), listH);
+    }
+    DebugLog("[PLAYERS] footer now " + S(n) + " line(s), " + S(rows) + " row(s): '" + shown + "'");
+    g_footShown = sig;
+}
 /* the rows' inputs moved since they were built: a standing with this game's player faction (RelationsPlayerPairEpoch), or
    kRowsEveryMs passed (the roster's names and who is online, a player's faction arriving) */
 bool RowsStale()
@@ -702,6 +834,7 @@ void Refresh()
     }
     g_rows = rows;
     ApplyBottom(g_rows);
+    FooterRefresh();
 }
 /* Each frame: other players' factions made known; with our tab in (its widgets kept; the destroy notice drops them with the
    window), the table rebuilt while it shows when its inputs moved, and the tab taken out - the window closed - once the world
