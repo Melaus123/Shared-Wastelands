@@ -6,14 +6,15 @@ rem Keep this file pure ASCII (see note in tools\vc2010-env.bat). VS2010 cl want
 rem NO /GL and NO /LTCG: the plugin keeps them only so its own code generation matches its earlier builds; this
 rem exe links nothing but the CRT.
 setlocal
-call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
+call "%~dp0..\..\tools\vc2010-env.bat"
+if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 
 rem /bigobj: test_main.cpp held more sections than the default object format allows (error C1128); kept for each part.
 rem Owner decision 1204: the suite is test_main.cpp (the runner, the table, the newer tests) plus suite_part1..7.cpp
 rem (older tests) sharing suite.h, so /MP8 compiles them side by side. The run order is kTests in test_main.cpp.
 echo [STEP] offline suite compile %time%
-cl /nologo /MP8 /O2 /EHsc /MD /W4 /bigobj /D_CRT_SECURE_NO_WARNINGS ^
+cl /nologo %SW_MP% /O2 /EHsc /MD /W4 /bigobj /D_CRT_SECURE_NO_WARNINGS ^
    /I ..\common ^
    test_main.cpp suite_part1.cpp suite_part2.cpp suite_part3.cpp suite_part4.cpp suite_part5.cpp suite_part6.cpp suite_part7.cpp ^
    ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^

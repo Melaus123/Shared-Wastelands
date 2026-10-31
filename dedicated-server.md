@@ -46,13 +46,17 @@ The short version: the VS2010 x64 compiler runs fine under Wine if you don't let
 
    The plugin is the same deal in `src/coop-plugin`, and that one also runs the whole offline test suite.
 
-Stuff that'll bite you (fix it in your local copy of the .bat files, don't commit it, it's all Wine nonsense):
+The .bat files know when they're running under Wine (they look for Wine's own registry key) and switch themselves, so you don't
+edit anything. Under Wine you'll see a line saying so, and they:
 
-- Wine's cmd gets `call something || exit /b 1` wrong and bails even when the call worked. Drop the `|| exit /b 1` after the calls.
-- At the end of `tools/vc2010-env.bat`, `goto :eof` leaves a stale errorlevel behind. Make it `exit /b 0`.
-- Add `/DBOOST_ALL_NO_LIB /DBOOST_ERROR_CODE_HEADER_ONLY` to the cl line, or Ogre's headers try to auto link Boost libs you don't have.
-- The server won't link with `server_version.res` under Wine (cvtres throws LNK1123). Link it without the .res. The exe just has no version info, it runs fine.
-- Run the python gates (`check_tables`, `scan_hardcoded_rva`) from the repo root with plain `python3` on the Linux side instead of inside the bat. Python under Wine isn't worth the headache.
+- compile one file at a time instead of `/MP8` (Wine's cl can't start the extra compilers, error D8040),
+- turn Boost auto-linking off (`/DBOOST_ALL_NO_LIB /DBOOST_ERROR_CODE_HEADER_ONLY`),
+- link the server without `server_version.res` (cvtres throws LNK1123 under Wine; the exe just has no version info),
+- skip the python and dumpbin gates with a `[WINE] skipped:` line. Run the table and address gates yourself from the repo root on the
+  Linux side: `python3 tools/check_tables.py src/coop-plugin/addresses` and `python3 tools/scan_hardcoded_rva.py`.
+
+On Windows nothing changes. One thing is still on you:
+
 - The source files are CRLF. If you edit on Linux keep them CRLF or your diffs turn into soup.
 
 Plugin build plus tests is about 5 or 6 minutes, the server about 2.

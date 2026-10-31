@@ -32,7 +32,22 @@ rem boost stage\lib: the plugin includes only header-only boost headers (unorder
 rem support, measured with /showIncludes) and never boost/config/auto_link.hpp, so no boost library is linked.
 rem stage\lib stays on LIB until the owner decides (the headers are not vendored either).
 set LIB=%VC2010%\VC\lib\amd64;%VC2010%\SDK\Lib\x64;%COOP_OGRE_MYGUI%\lib;%COOP_BOOST%\stage\lib
-goto :eof
+rem BUILDING UNDER WINE (Linux): the key HKCU\Software\Wine exists only inside Wine. When it does, SW_WINE=1 and the build files
+rem switch to what works there: no /MP8 (Wine's cl cannot start the extra compilers, error D8040), Boost auto-linking off, the server
+rem linked without server_version.res (cvtres fails under Wine), and the python / dumpbin gates skipped with a line saying so - run
+rem them on the Linux side instead (dedicated-server.md, Linux). On Windows nothing changes: SW_MP=/MP8, the rest empty.
+rem No && / || here or after a call: Wine's cmd runs both sides of them.
+set SW_WINE=
+reg query "HKCU\Software\Wine" >nul 2>&1
+if not errorlevel 1 set SW_WINE=1
+set SW_MP=/MP8
+set SW_WINEDEFS=
+set SW_RES=server_version.res
+if defined SW_WINE set SW_MP=
+if defined SW_WINE set SW_WINEDEFS=/DBOOST_ALL_NO_LIB /DBOOST_ERROR_CODE_HEADER_ONLY
+if defined SW_WINE set SW_RES=
+if defined SW_WINE echo vc2010-env: building under Wine - /MP8 off, Boost auto-link off, no version resource, python/dumpbin gates skipped
+exit /b 0
 
 rem findboost <checkout folder>: sets COOP_BOOST when that checkout has reference\boost_1_60_0\boost\ or
 rem reference\<folder>\boost_1_60_0\boost\.

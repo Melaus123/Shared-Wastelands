@@ -7,7 +7,8 @@ rem
 rem NO C RUNTIME (loader.cpp's header says why): /NODEFAULTLIB, our own entry point, /GS- (the security cookie is a
 rem CRT symbol). /Zl keeps the object from naming a default CRT library at all. No /GL: nothing here needs it.
 setlocal
-call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
+call "%~dp0..\..\tools\vc2010-env.bat"
+if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 
 cl /nologo /c /O1 /GS- /Zl /W4 /EHs-c- /DUNICODE /D_UNICODE ^
@@ -29,6 +30,8 @@ rem KERNEL32.dll and NOTHING else (a C runtime or any other DLL coming back onto
 rem every game start), and it must export dllStartPlugin and dllStopPlugin by those exact names (Ogre looks both up).
 rem A unique name per build, a fresh random id from Python: cmd's %RANDOM% is seeded from the clock, so two builds started
 rem in the same second would share these files and read each other's half-written lists.
+if defined SW_WINE echo [WINE] skipped: the loader import / export gate - python under Wine
+if defined SW_WINE goto sw_wine_skip_loadergate
 for /f "delims=" %%G in ('python -c "import uuid;print(uuid.uuid4().hex)"') do set LGATEID=%%G
 if "%LGATEID%"=="" (
     echo BUILD FAILED ^(could not make a unique temp name: python did not answer^)
@@ -55,4 +58,5 @@ if errorlevel 1 (
     echo BUILD FAILED ^(loader gate: dllStartPlugin / dllStopPlugin not exported by name^)
     exit /b 1
 )
+:sw_wine_skip_loadergate
 endlocal

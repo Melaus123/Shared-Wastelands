@@ -4,7 +4,8 @@ rem The file names below repeat src\common\names.h (a .bat cannot include it): c
 rem STANDALONE, like src\coop-store\build.bat: src\coop-plugin\build.bat does not call it.
 rem Keep this file pure ASCII (see note in tools\vc2010-env.bat). VS2010 cl wants /FeNAME with NO colon (F025).
 setlocal
-call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
+call "%~dp0..\..\tools\vc2010-env.bat"
+if errorlevel 1 exit /b 1
 
 rem --- Step 0: THE OFFLINE SUITE - this exe compiles src\common\installtext.h, which the suite tests --------
 call "%~dp0..\coop-test\build.bat"

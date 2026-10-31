@@ -4,7 +4,8 @@ rem The file names below repeat src\common\names.h (a .bat cannot include it): c
 rem Keep this file pure ASCII (see note in tools\vc2010-env.bat).
 setlocal
 rem mig5: THIS tree's env script (relative to this file), so a worktree builds with its own env change.
-call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
+call "%~dp0..\..\tools\vc2010-env.bat"
+if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 
 rem THE BUILD FORM. "build.bat dev" compiles the mod's own sources with /DSW_DEV_BUILD: the test-only probes are compiled in and
@@ -51,7 +52,7 @@ rem linkage identical - the symbols stay unmangled and our C++ links against the
 rem WINVER/_WIN32_WINNT 0x0501: ENet needs the XP-era socket API surface under v100.
 rem win32.c/unix.c self-guard on _WIN32, so both may be listed; only win32 compiles.
 echo [STEP] enet %time%
-cl /nologo /MP8 /c /TP /O2 /GL /MD /D_CRT_SECURE_NO_WARNINGS ^
+cl /nologo %SW_MP% /c /TP /O2 /GL /MD /D_CRT_SECURE_NO_WARNINGS ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include ^
    third_party\enet\callbacks.c third_party\enet\compress.c third_party\enet\host.c ^
@@ -71,7 +72,7 @@ rem character set (hook.c passes a wide string to GetModuleHandle). NDEBUG/STRIC
 rem The objects go to obj\minhook\ so none can collide with the ENet objects in this folder.
 if not exist obj\minhook mkdir obj\minhook
 echo [STEP] minhook %time%
-cl /nologo /MP8 /c /TP /O2 /GL /EHsc /MD /DSTRICT /DNDEBUG /DUNICODE /D_UNICODE /FIstddef.h ^
+cl /nologo %SW_MP% /c /TP /O2 /GL /EHsc /MD /DSTRICT /DNDEBUG /DUNICODE /D_UNICODE /FIstddef.h ^
    /I third_party\minhook\include /Foobj\minhook\ ^
    third_party\minhook\src\buffer.c third_party\minhook\src\hook.c third_party\minhook\src\trampoline.c ^
    third_party\minhook\src\hde\hde32.c third_party\minhook\src\hde\hde64.c
@@ -85,11 +86,14 @@ rem The mod picks addresses\<fingerprint>.txt by the game's fingerprint and refu
 rem is missing (addrBindMissing). A row added to the 1.0.65 table only would disable the mod on Steam 1.0.68 alone,
 rem which no 1.0.65 bench run would notice - so the build fails here instead. Fix: re-run tools\gen_table_1068.py.
 echo [STEP] table checks %time%
+if defined SW_WINE echo [WINE] skipped: check_tables.py - run it on the Linux side with python3
+if defined SW_WINE goto sw_wine_skip_check_tables
 python "%~dp0..\..\tools\check_tables.py" "%~dp0addresses"
 if errorlevel 1 (
     echo BUILD FAILED ^(address tables disagree - see TABLE CHECK FAILED above^)
     exit /b 1
 )
+:sw_wine_skip_check_tables
 
 rem --- Step 1b2b: THE SIGNATURES REPRODUCE BOTH STEAM TABLES (T-63 gog1 fold, 2026-09-29) --------------------------------
 rem tools\prove_signatures.py runs the plugin's pattern resolver (src\common\sigtable.cpp, re-implemented step for step) on
@@ -101,22 +105,28 @@ rem Owner decision 1204: --stamp skips the proof (one SKIPPED line) when no file
 rem executable (its size and time) changed since its last PASS in this tree; the stamp is written only after a PASS and is
 rem not committed (obj\ is in .gitignore). A missing or different stamp runs the proof as before.
 echo [STEP] signature proof %time%
+if defined SW_WINE echo [WINE] skipped: prove_signatures.py - run it on the Linux side with python3
+if defined SW_WINE goto sw_wine_skip_prove_signatures
 python "%~dp0..\..\tools\prove_signatures.py" --stamp "%~dp0obj\signatures.proved"
 if errorlevel 1 (
     echo BUILD FAILED ^(signatures do not reproduce both Steam tables - see PROOF above^)
     exit /b 1
 )
+:sw_wine_skip_prove_signatures
 
 rem --- Step 1b3: NO ENGINE ADDRESS WRITTEN INTO THE CODE (stage 7/9, 2026-09-29) ---------------------------------
 rem Every engine address comes from the address table (AddrReg); a number typed into the code is a 1.0.65 number and
 rem calls the wrong code on Steam 1.0.68. tools\scan_hardcoded_rva.py lists every such literal (its rules are in its
 rem header; tools\scan_hardcoded_rva.allow holds only proven non-addresses) and fails the build on any hit.
 echo [STEP] address scan %time%
+if defined SW_WINE echo [WINE] skipped: scan_hardcoded_rva.py - run it on the Linux side with python3
+if defined SW_WINE goto sw_wine_skip_scan_hardcoded_rva
 python "%~dp0..\..\tools\scan_hardcoded_rva.py"
 if errorlevel 1 (
     echo BUILD FAILED ^(an engine address is written into the code - see RVA SCAN above^)
     exit /b 1
 )
+:sw_wine_skip_scan_hardcoded_rva
 
 echo [STEP] layout check %time%
 rem --- Step 1c: THE LAYOUT CHECK -----------------------------------------------------------------------------
@@ -124,7 +134,7 @@ rem game\decl_check.cpp static_asserts OUR declarations (game\*.h) against the n
 rem list is game\layout_asserts.inl). Compiled with the DLL's flags plus /c; the object goes to obj\layout\ and is
 rem NEVER linked. A declaration that drifts from its number stops the build here, before the DLL step.
 if not exist obj\layout mkdir obj\layout
-cl /nologo /c /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
+cl /nologo /c /O2 /GL /EHsc /MD %SW_WINEDEFS% /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 /Foobj\layout\ game\decl_check.cpp
 if errorlevel 1 (
     echo BUILD FAILED ^(layout check: our declarations disagree with game\gamelayout.h^)
@@ -145,7 +155,7 @@ set PLUGIN_SRC=coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_
    ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp
 if not exist obj\plugin mkdir obj\plugin
 echo [STEP] plugin compile %time%
-cl /nologo /MP8 /c /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
+cl /nologo %SW_MP% /c /LD /O2 /GL /EHsc /MD %SW_WINEDEFS% /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include /I third_party\minhook\include ^
    /Foobj\plugin\ %PLUGIN_SRC%
@@ -166,6 +176,8 @@ if errorlevel 1 (
 )
 
 echo [STEP] import gates %time%
+if defined SW_WINE echo [WINE] skipped: the MyGUI import gate, the DLL import gate and the export gate - python and findstr under Wine
+if defined SW_WINE goto sw_wine_skip_dllgates
 rem --- Step 3: THE MyGUI IMPORT NAME GATE, AFTER THE LINK (P8i / design-ui-panel V1h) ---------
 rem F654 checked, by hand and once, that all 18 MyGUI symbols the one button imported exist by name
 rem in the MyGUIEngine_x64.dll the game ships. The panel imports Window, EditBox, TextBox,
@@ -231,6 +243,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:sw_wine_skip_dllgates
 rem --- Step 5: SharedWastelandsLoader.dll (mig6, RE_Kenshi migration stage 6) - its own build.bat, the same VS2010 toolset -----
 rem The Ogre plugin the game's Plugins_x64.cfg names (owner 117). Its own gate runs inside: KERNEL32.dll the only import,
 rem dllStartPlugin and dllStopPlugin exported. A failure there fails this build.

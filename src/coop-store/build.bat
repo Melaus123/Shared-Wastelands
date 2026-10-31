@@ -4,7 +4,8 @@ rem The file names below repeat src\common\names.h (a .bat cannot include it): c
 rem Reuses the ENet objects the plugin's build.bat compiles into src\coop-plugin (run that first).
 rem Compiles the plugin's ..\coop-plugin\u8file.cpp in as well: the same UTF-8 file-call wrappers over the wide Windows calls.
 setlocal
-call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
+call "%~dp0..\..\tools\vc2010-env.bat"
+if errorlevel 1 exit /b 1
 
 rem --- Step 0: THE OFFLINE SUITE, HERE TOO (P7w, folding review-p7u M-1 / F580) ------------------
 rem This exe compiles ..\common\clockmath.cpp into itself, so a failing assertion about that file must
@@ -32,13 +33,13 @@ if not exist "%OBJ%\host.obj" (
 )
 rem owner 244: the exe carries a version resource (Explorer and Task Manager show "Shared Wastelands world server").
 rem The toolchain has no rc.exe, so make_version.py writes server_version.res directly (as src\installer\make_icon.py does).
-if not exist server_version.res (
+if not defined SW_WINE if not exist server_version.res (
     echo BUILD FAILED ^(world server: server_version.res missing - run python make_version.py^)
     exit /b 1
 )
 cl /nologo /O2 /EHsc /MD /D_CRT_SECURE_NO_WARNINGS /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I ..\coop-plugin\third_party\enet\include ^
-   store_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\cfgtext.cpp ..\coop-plugin\u8file.cpp server_version.res ^
+   store_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\cfgtext.cpp ..\coop-plugin\u8file.cpp %SW_RES% ^
    %OBJ%\callbacks.obj %OBJ%\compress.obj %OBJ%\host.obj %OBJ%\list.obj %OBJ%\packet.obj %OBJ%\peer.obj %OBJ%\protocol.obj %OBJ%\win32.obj ^
    /FeSharedWastelandsServer.exe ^
    /link /MACHINE:X64 /SUBSYSTEM:CONSOLE ws2_32.lib winmm.lib
