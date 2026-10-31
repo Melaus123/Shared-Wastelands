@@ -151,5 +151,29 @@ inline void PartyHaloFromList(const std::vector<int>& xy, int followedFirst, int
         grid[x * kGrid + y] = 1;
     }
 }
+
+// T-959: an area's first-time flag as createBuilding 0x57C1E0 reads it (Steam_1.0.65 decomp_57c1e0.txt:243-264, 360, 513-518):
+// 0xA07C10(zoneManager, sx, sy) answers the ZoneMap zoneManager + 200 (0xC8) + (sx*64 + sy)*0x168, or none off the 64x64 grid
+// (decomp_a07c10.txt); the engine returns no piece when that is none (:259) or when the pointer AT the ZoneMap is null (:262-264,
+// local_490 = *local_438); the flag is the byte at that pointer + 0xA8 (:360, :513, :518). Not the byte at ZoneMap + 0xA8.
+const unsigned long long kZoneMapArea = 0;             // ZoneMap + 0: the area object createBuilding works with
+const unsigned long long kAreaFirstTimeFlag = 0xA8;    // area + 0xA8: the first-time flag (non-zero = set)
+// the ZoneMap's address for area sx, sy (0xA07C10's sum); 0 = no zone manager or off the grid
+inline unsigned long long ZoneMapAddr(unsigned long long zoneManager, int sx, int sy)
+{
+    if (zoneManager == 0 || InGrid(sx, sy) == 0) return 0;
+    return zoneManager + kZoneArrayAt + ((unsigned long long)sx * (unsigned long long)kGrid + (unsigned long long)sy) * kZoneMapSize;
+}
+// the flag read's answer: 0 / 1 = the flag; kFlagNoZone = no zone manager or off the grid; kFlagNoArea = the area pointer is null
+// (createBuilding would return no piece there); kFlagUnread = a read faulted
+enum { kFlagNoZone = -3, kFlagNoArea = -2, kFlagUnread = -1 };
+inline int AreaFlagOf(int zoneMapOk, int areaReadOk, unsigned long long area, int byteReadOk, int byteVal)
+{
+    if (zoneMapOk == 0) return kFlagNoZone;
+    if (areaReadOk == 0) return kFlagUnread;
+    if (area == 0) return kFlagNoArea;
+    if (byteReadOk == 0) return kFlagUnread;
+    return byteVal != 0 ? 1 : 0;
+}
 }   // namespace loadedzones
 #endif

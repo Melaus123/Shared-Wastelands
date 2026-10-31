@@ -94,7 +94,7 @@ int  CreateLastRefusal();
 bool SendContextFor(unsigned int uid, ::Character* c);
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth);   // + the squad's birth flag (squadbirth.h, -1 unknown). P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth, unsigned int peerOriginWire);   // + where the sender's copy came from (sameidpair.h WireOfOrigin, 0xFFFFFFFF unknown); + the squad's birth flag (squadbirth.h, -1 unknown). P1: + the sender's platoon id; + the age of the sender's current world load in ms (squadorigin.h kLoadAgeUnknown unknown); + the sending game's seat (-1 unknown)
 // M-B / H026 - `context on|off`, DEFAULT OFF: when on, a SPAWN whose CONTEXT arrived first creates the copy the way
 // the engine creates a town NPC (npc-context.md section 6): a platoon from the same squad template, the same
 // SquadType, home town and home building, the copy created INTO that platoon with that home, then the same
@@ -522,7 +522,11 @@ std::string NameReportLine();                                     // "[NAME] REP
 void InstallSlaves();
 // T-1084: Ownerships::setHomeBuilding hooked - a world squad's home building set by the engine marks its record due (spawn.cpp).
 void InstallHomeWatch();
+// T-307: the AnimationClass layer play hooked (table rows AnimLayerPlay, AnimCtl*, the 11 layer-only tasks): who started each layer state, so only a listed
+// task's layer state is sent as a pose (common/poselayer.h 3). MAIN THREAD install; the detour runs on any thread.
+void InstallPoseLayerStart();
 std::string HomeWatchReport();   // the homeHook[...] counts for the [SAVE] heartbeat line (plain counter reads)
+std::string SameIdCopyReport();   /* the same-id copy rule's sameIdCopy[...] and sameIdYield[...] counts for the [SAVE] heartbeat line (MAIN THREAD) */
 /* PROBE P140 BEGIN */
 /* PROBE P140 (T-806, log only): the cage-use task start 0x357FE0 hooked (table row CageUseStart), and a player's use-cage order
    (task 0x6B) logged per selected character from build.cpp's order / Shift-job hooks. MAIN THREAD install; P140PlayerOrder ANY
@@ -628,6 +632,16 @@ void PoseApplyTick();
 bool PoseHoldsCopy(unsigned int uid);
 // replicate.cpp: one frame of a posed copy held still (poseHeldFrames).
 void PoseNoteHeldFrame();
+// T-890 (T1625): the engine's animation update, inside a character's own Character::update on the main thread, clears a
+// looped action every frame; the owner's seat / machine task plays it again after that, before the animation picker. A held
+// copy's action is therefore played again right after its own update (the same play as PoseApplyTick's). PoseApplyTick plays
+// only the first time and when the last after-update play did not happen - one play per frame. The copy gets no task and
+// no seat or machine registration. MAIN THREAD (ai_spike.cpp detour_update).
+void PoseReplayAfterUpdate(::Character* c);
+// True while the copy `uid` is held in an ACTION pose (seat / work), not a bed or cage - replicate.cpp turns only those.
+bool PoseHoldsActionCopy(unsigned int uid);
+// replicate.cpp: a copy held in an action pose was turned to its owner's streamed facing (poseFacingApplied).
+void PoseNoteFacingApplied();
 // " poseSent=.. poseAppliedAction=.. ..." for the [P014] REPORT line.
 std::string PoseReportToken();
 

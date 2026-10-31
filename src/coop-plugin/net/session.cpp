@@ -48,8 +48,14 @@
 #include "../../common/slavewire.h"  /* slave1: the MSG_SLAVE payload */
 #include "../../common/shotwire.h"   /* P104 fix: the MSG_SHOT payload */
 #include "../../common/meleewire.h"   /* the MSG_MELEE_DECIDED payload */
+#include "../../common/blockpick.h"   /* T-1101 step 5: the MSG_BLOCK_PICK payload */
+#include "../../common/shotgate.h"   /* the MSG_SHOT_FIRED payload */
+#include "../../common/handwire.h"   /* the MSG_HAND payload */
+#include "../../common/hitwire.h"   /* T-1101: the decided blow on HIT, the attack move on SWING */
+#include "../../common/fightchoice.h"   /* T-1101 design (c): the MSG_FIGHT_CHOICE payload */
 #include "../../common/squadbirth.h"   /* CONTEXT's birth word */
 #include "../../common/handrec.h"   /* T-889 step 2: MSG_ITEM_HANDOVER and the game-to-game protocol number */
+#include "../../common/givelate.h"   /* coopgive::kPlacedGiveDone - MSG_ITEM_PLACED's 'give done' value */
 #include "../../common/effectwire.h"   /* T-327: the MSG_EFFECT payload and its road */
 #include "../effect.h"                 /* T-327: EffectOnNet */
 #include "../hire.h"   /* recruit1: MSG_HIRE - HireNoteRecv / HireForgetPeer */
@@ -179,7 +185,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 180;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 187;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 typedef char PieceFeedProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolRecordFeed) ? 1 : -1];   /* PLACE / STATE / REMOVE / ROSTER_REQUEST are no longer sent */
 typedef char PieceLiveBarProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveBar) ? 1 : -1];   /* T-1047 step 2b (175): a player's power piece's production bar and work state ride its record's LIVE part - no MINE_STATE for it */
 typedef char PieceLiveProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveRecord) ? 1 : -1];   /* a player's power piece: no POWER_STATE, its record's LIVE part */
@@ -663,9 +669,10 @@ void OnCombatMode(const Message& m)
 // F348 - THE SWING. Combat mode (17) is a LEVEL: it says a fight is on, and T067 verified the peer
 // adopts it. This is an EDGE: the authority's character has just begun a blow.
 //
-// It is the same H010b shape and for the same reason. Nothing about the animation, the technique
-// or the weapon crosses the wire - only "uid U is now attacking uid V". The peer's own engine
-// picks its own technique for its own gap and plays it. What makes that possible is F348: the
+// It is the same H010b shape and for the same reason: "uid U is now attacking uid V", and the name of
+// the attack move the owner's swing started (hitwire.h). The peer's own engine picks the technique for
+// its own gap - the owner's move when the copy's own move list holds it (combat.cpp detour_fpPickAttack) -
+// and plays it. What makes that possible is F348: the
 // engine authorizes a swing with three field writes and NO AI decision anywhere in the path, so
 // the puppet's decision gate stays fully closed - which is what every previous attempt at this
 // had to open, and what cost T071/T075/T076 their runs.
@@ -677,7 +684,111 @@ void OnSwing(const Message& m)
         ErrorLog("[net] malformed SWING (too short) - ignored");
         return;
     }
-    coop::ApplyRemoteSwing(uid, targetUid);
+    // The attack move the owner's swing started (hitwire.h); absent or refused = the copy's engine picks its own.
+    char move[hitwire::kNameBuf];
+    move[0] = 0;
+    if (m.payload.size() > 8) hitwire::DecodeSwingMove(&m.payload[8], m.payload.size() - 8, move);
+    coop::ApplyRemoteSwing(uid, targetUid, move);
+}
+
+// SWING_END (hitwire.h): the owner's swing of uid ended on its game; the copy here drops the swing credit it did not spend in
+// time (combat.cpp ApplyRemoteSwingEnd). Refused whole when it does not decode. A relayed one passes SWING's relayed-owner gate
+// (liverelay.h CharStreamNeedsOwnerGate); ApplyRemoteSwingEnd refuses a uid this game runs.
+void OnSwingEnd(const Message& m)
+{
+    unsigned int uid = 0, targetUid = 0;
+    const int dc = hitwire::DecodeSwingEnd(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &uid, &targetUid);
+    if (dc != hitwire::kDecodeOk)
+    {
+        ErrorLog("[net] malformed SWING_END (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
+                 + N((long long)m.peer) + " - ignored");
+        return;
+    }
+    coop::ApplyRemoteSwingEnd(uid, targetUid);
+}
+
+// FIGHT_CHOICE (fightchoice.h): the owner's fight decide step chose for its own player character; the copy here follows it at its own
+// decide step (combat.cpp ApplyRemoteFightChoice). One that does not decode is counted there (refused) and not used; one whose
+// sender does not run the character (RemoteMayWrite, on either road) is counted there (notOwner) and not used. ApplyRemoteFightChoice
+// takes it only for a copy here.
+typedef char FightChoiceNumber[((int)MSG_FIGHT_CHOICE == (int)fightchoice::kMsgFightChoice) ? 1 : -1];
+void OnFightChoice(const Message& m)
+{
+    fightchoice::Choice c;
+    std::memset(&c, 0, sizeof(c));
+    const int dc = fightchoice::Decode(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &c);
+    if (dc != fightchoice::kDecodeOk)
+    {
+        static long long s_bad = 0;
+        if (++s_bad <= 5)
+            ErrorLog("[net] malformed FIGHT_CHOICE (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
+                     + N((long long)m.peer) + " - ignored (the first 5 are logged; all are counted fightChoice refused)");
+    }
+    const int refusal = (dc != fightchoice::kDecodeOk) ? dc : (!RemoteMayWrite(c.uid, m.peer) ? fightchoice::kNotOwner : 0);
+    coop::ApplyRemoteFightChoice(c.uid, c.targetUid, c.seq, c.state, c.next, c.readyTimer, refusal);
+}
+
+// T-1101 step 5 - BLOCK_PICK (blockpick.h): the defender's owner's block-pose pick (an empty name = no block) for its character
+// against ours. Refused whole when it does not decode; we must run the attacker and the sender must run the defender
+// (RemoteMayWrite) - every other game in the area hears it too and refuses it here, counted. combat.cpp keeps it for our copy's
+// pick.
+void OnBlockPick(const Message& m)
+{
+    blockpick::Pick p;
+    const int dc = blockpick::Decode(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &p);
+    if (dc != blockpick::kDecodeOk)
+    {
+        ErrorLog("[net] malformed BLOCK_PICK (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
+                 + N((long long)m.peer) + " - ignored");
+        coop::ApplyRemoteBlockPick(0u, 0u, 0, 3);
+        return;
+    }
+    int refusal = 0;
+    if (!IsUidMine(p.attackerUid)) refusal = 1;
+    else if (!RemoteMayWrite(p.defenderUid, m.peer)) refusal = 2;
+    coop::ApplyRemoteBlockPick(p.defenderUid, p.attackerUid, p.name, refusal);
+}
+
+// SHOT_FIRED (shotgate.h): the game that runs the shooter says its engine fired one bolt at the target (0 = no replicated
+// character) and where it aimed - our copy of the shooter fires that bolt here. Refused whole when it does not decode; the
+// shooter must not be ours and the sender must run it (RemoteMayWrite) - every other game in the area hears it too. Counted in
+// combat.cpp.
+void OnShotFired(const Message& m)
+{
+    shotgate::Fired f;
+    const int dc = shotgate::Decode(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &f);
+    if (dc != shotgate::kDecodeOk)
+    {
+        ErrorLog("[net] malformed SHOT_FIRED (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
+                 + N((long long)m.peer) + " - ignored");
+        coop::ApplyRemoteShotFired(0u, 0u, 0, 0, 3);
+        return;
+    }
+    int refusal = 0;
+    if (IsUidMine(f.shooterUid)) refusal = 1;
+    else if (!RemoteMayWrite(f.shooterUid, m.peer)) refusal = 2;
+    coop::ApplyRemoteShotFired(f.shooterUid, f.targetUid, f.aim, f.targetAt, refusal);
+}
+
+// HAND (handwire.h): the game that runs a character says what its hands hold now - an item named by section, slot and base sid,
+// or bare hands; our copy of it is made to hold the same at the K2 safe point. Refused whole when it does not decode; the
+// character must not be ours and the sender must run it (RemoteMayWrite). Counted in combat.cpp.
+typedef char HandWireNumber[(handwire::kMsgHand == (unsigned int)MSG_HAND) ? 1 : -1];
+void OnHand(const Message& m)
+{
+    handwire::Hand h;
+    const int dc = handwire::Decode(m.payload.empty() ? 0 : &m.payload[0], m.payload.size(), &h);
+    if (dc != handwire::kDecodeOk)
+    {
+        ErrorLog("[net] malformed HAND (decode " + N((long long)dc) + ", " + N((long long)m.payload.size()) + " bytes) from peer "
+                 + N((long long)m.peer) + " - ignored");
+        coop::ApplyRemoteHand(h, 3);
+        return;
+    }
+    int refusal = 0;
+    if (IsUidMine(h.uid)) refusal = 1;
+    else if (!RemoteMayWrite(h.uid, m.peer)) refusal = 2;
+    coop::ApplyRemoteHand(h, refusal);
 }
 
 void OnContext(const Message& m)
@@ -693,15 +804,16 @@ void OnContext(const Message& m)
     std::string squadSid(&m.payload[off + 4], sl); off += 4 + sl;
     if (!GetU32(m.payload, off, &tl) || m.payload.size() < off + 4 + tl) { ErrorLog("[net] malformed CONTEXT (town sid) - ignored"); return; }
     std::string townSid(&m.payload[off + 4], tl); off += 4 + tl;
-    std::string platoonId; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu; unsigned int birthWire = sqbirth::kWireBirthUnknown;
+    std::string platoonId; unsigned int pl = 0; unsigned int peerLoadAgeMs = 0xFFFFFFFFu; unsigned int birthWire = sqbirth::kWireBirthUnknown; unsigned int originWire = 0xFFFFFFFFu;
     if (GetU32(m.payload, off, &pl) && m.payload.size() >= off + 4 + pl)
     {
         platoonId.assign(&m.payload[off + 4], pl); off += 4 + pl;   // P1 (older senders: empty)
         { unsigned int bw = sqbirth::kWireBirthUnknown; if (GetU32(m.payload, off + 4, &bw)) birthWire = bw; }   /* the squad's birth flag after the load age (squadbirth.h); absent = unknown */
         { unsigned int age = 0; if (GetU32(m.payload, off, &age)) peerLoadAgeMs = age; }   /* the age of the sender's current world load in ms (0xFFFFFFFF unknown, also when absent) */
+        { unsigned int ow = 0xFFFFFFFFu; if (GetU32(m.payload, off + 8, &ow)) originWire = ow; }   /* where the sender's copy came from, after the birth flag (sameidpair.h WireOfOrigin); absent = unknown */
     }
     const int senderSlot = PeerSlotOfKey(m.peer);   /* the seat of the game this CONTEXT came from (the link it arrived on), -1 unknown */
-    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot, sqbirth::BirthOfWire(birthWire));
+    coop::ApplyRemoteContext(uid, squadSid, (int)st, townSid, hraw, craw, bp[0], bp[1], bp[2], (int)mt, platoonId, peerLoadAgeMs, senderSlot, sqbirth::BirthOfWire(birthWire), originWire);
 }
 
 void OnIntent(const Message& m)
@@ -991,13 +1103,25 @@ void OnHit(const Message& m)
     if (m.payload.size() >= bloodAt + 24 + 2)
         attackerPlayed = (unsigned char)m.payload[bloodAt + 25];
 
+    // The decided blow (hitwire.h) after the attackerPlayed byte: what the victim's game's engine answered and the stumble it
+    // played; this game's engine plays that instead of deciding the blow again. Absent or refused = this engine decides it.
+    hitwire::Blow blow;
+    hitwire::ClearBlow(&blow);
+    int blowRc = hitwire::kDecodeAbsent;
+    if (m.payload.size() > bloodAt + 24 + 2)
+        blowRc = hitwire::DecodeBlow(&m.payload[bloodAt + 26], m.payload.size() - (bloodAt + 26), &blow);
+    if (blowRc != hitwire::kDecodeOk && blowRc != hitwire::kDecodeAbsent)
+        ErrorLog("[net] HIT uid=" + N(uid) + ": its decided blow is malformed (hitwire " + N(blowRc) + ") - this game's engine decides the blow");
+
     DebugLog("[net] <- HIT uid=" + N(uid) + " attacker=" + N(attackerUid) + " dir=" + N(cutDir)
              + " healthParts=" + N(partCount)
              + (coop::ObjIdValid(attackerId) ? " attackerId=" + coop::ObjIdString(attackerId)
                                              : std::string(" attackerId=none"))
-             + " knock=" + N(knock != 0 ? 1 : 0) + " attackerPlayed=" + N(attackerPlayed != 0 ? 1 : 0));
+             + " knock=" + N(knock != 0 ? 1 : 0) + " attackerPlayed=" + N(attackerPlayed != 0 ? 1 : 0)
+             + " blow=" + (blowRc == hitwire::kDecodeOk ? N(blow.result) : std::string("-")));
     coop::ApplyRemoteHit(uid, attackerUid, cutDir, &m.payload[16], comboId,
-                         parts, (int)partCount, blood, attackerId, knock != 0, attackerPlayed != 0);
+                         parts, (int)partCount, blood, attackerId, knock != 0, attackerPlayed != 0,
+                         blowRc == hitwire::kDecodeOk ? &blow : 0);
 }
 
 /* M7a A1 build 1 [a1b1-sp2] - a withdrawal (UNLOAD / DESPAWN) as received: a receipt is owed whenever this game's slot is listed,
@@ -1051,6 +1175,7 @@ void OnDespawn(const Message& m)
     coop::SquadIdxOwnerWithdrew(uid, 0);   /* M7a A1 build 2 [a1b2-sp1] (design 2.3): its recorded owner says it died - out of the squad index's given */
     coop::ApplyRemoteDespawn(uid);
     coop::TalkCursorForgetNpc(uid);   /* T-737: its talk-cursor answers go with the copy */
+    coop::HandCopyDespawned(uid);   /* its kept hand word goes with the copy; a later SPAWN brings the current one */
     LostCopyForget(uid, "the owner removed it (DESPAWN)");   /* nothing to ask for */
 }
 
@@ -1436,7 +1561,8 @@ static bool CharSend(MsgType type, unsigned int uid, const char* b, size_t n, Ch
 bool SendHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
              const char* damages24, int comboId,
              const float* parts, int partCount, float blood,
-             const ObjId& attackerId, unsigned char knock, unsigned char attackerPlayed)
+             const ObjId& attackerId, unsigned char knock, unsigned char attackerPlayed,
+             const hitwire::Blow* blow)
 {
     /* M7b slice 1: no session-link gate here - the character stream's road (CharRoadNow) decides, below */
     // uid(u32) | attackerUid(u32) | cutDir(i32) | comboId(i32) | Damages(24)
@@ -1482,6 +1608,9 @@ bool SendHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
     b.push_back((char)(knock != 0 ? 1 : 0));
     // A second trailing byte, at bloodAt + 25: 1 = the blow was decided and already played on the attacker's game.
     b.push_back((char)(attackerPlayed != 0 ? 1 : 0));
+    // The decided blow after it (hitwire.h): what this game's engine answered and the stumble it played, for the other games'
+    // replay. Nothing when not carried.
+    if (blow != 0) hitwire::EncodeBlow(&b, *blow);
 
     /* M7b slice 1: a HIT is the VICTIM'S OWNER's report (this game runs the victim - OnHit's RemoteMayWrite) to every game that
        holds a copy, so it rides the character stream's road like the SWING that caused it: the session link while the session
@@ -2714,22 +2843,89 @@ void OnKeeperRestock(const Message& m)
 }
 
 
-bool SendSwing(unsigned int uid, unsigned int targetUid)
+bool SendSwing(unsigned int uid, unsigned int targetUid, const char* move)
 {
     if (!CharRoadOpen()) return false;   /* M7a: the notebook road, or the session link while it is down */
 
-    char b[8];
-    std::memcpy(b,     &uid,       4);
-    std::memcpy(b + 4, &targetUid, 4);
-    return CharSend(MSG_SWING, uid, b, sizeof(b), CH_RELIABLE, -1);   /* M7a */
+    // uid u32 | targetUid u32 | the attack move the swing started (hitwire.h; nothing when it could not be read)
+    std::vector<char> b(8);
+    std::memcpy(&b[0], &uid,       4);
+    std::memcpy(&b[4], &targetUid, 4);
+    if (move != 0) hitwire::EncodeSwingMove(&b, move);
+    return CharSend(MSG_SWING, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* M7a */
+}
+
+bool SendSwingEnd(unsigned int uid, unsigned int targetUid)
+{
+    if (!CharRoadOpen()) return false;
+    std::vector<char> b;
+    if (!hitwire::EncodeSwingEnd(&b, uid, targetUid)) return false;
+    return CharSend(MSG_SWING_END, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* SWING's road and lane: never ahead of its SWING */
+}
+
+bool SendFightChoice(unsigned int uid, unsigned int targetUid, unsigned int seq, int state, int next, float readyTimer)
+{
+    if (!CharRoadOpen()) return false;
+    fightchoice::Choice c;
+    c.uid = uid; c.targetUid = targetUid; c.seq = seq; c.state = state; c.next = next; c.readyTimer = readyTimer;
+    std::vector<char> b;
+    if (!fightchoice::Encode(&b, c)) return false;
+    return CharSend(MSG_FIGHT_CHOICE, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* SWING's road and lane: never ahead of a SWING / SWING_END */
+}
+
+bool SendBlockPick(unsigned int defenderUid, unsigned int attackerUid, const char* name)
+{
+    if (!CharRoadOpen() || name == 0) return false;
+    blockpick::Pick p;
+    p.defenderUid = defenderUid;
+    p.attackerUid = attackerUid;
+    if (!hitwire::SetName(p.name, name)) return false;
+    std::vector<char> b;
+    if (!blockpick::Encode(&b, p)) return false;
+    return CharSend(MSG_BLOCK_PICK, defenderUid, &b[0], b.size(), CH_RELIABLE, -1);   /* the character stream's road: our defender's area */
+}
+
+bool SendShotFired(unsigned int shooterUid, unsigned int targetUid, const float* aim3, const float* targetAt3)
+{
+    if (!CharRoadOpen() || aim3 == 0 || targetAt3 == 0) return false;
+    shotgate::Fired f;
+    f.shooterUid = shooterUid;
+    f.targetUid = targetUid;
+    for (int i = 0; i < 3; ++i) { f.aim[i] = aim3[i]; f.targetAt[i] = targetAt3[i]; }
+    std::vector<char> b;
+    if (!shotgate::Encode(&b, f)) return false;
+    return CharSend(MSG_SHOT_FIRED, shooterUid, &b[0], b.size(), CH_RELIABLE, -1);   /* the character stream's road: our shooter's area */
+}
+
+bool SendHand(unsigned int uid, int has, const char* section, int x, int y, const char* sid)
+{
+    if (!CharRoadOpen()) return false;
+    handwire::Hand h;
+    handwire::Clear(&h);
+    h.uid = uid;
+    h.has = has ? 1 : 0;
+    if (h.has)
+    {
+        if (section == 0 || sid == 0) return false;
+        const size_t ns = std::strlen(section), nd = std::strlen(sid);
+        if (ns > (size_t)handwire::kSecMax || nd > (size_t)handwire::kSidMax) return false;
+        std::memcpy(h.section, section, ns + 1);
+        std::memcpy(h.sid, sid, nd + 1);
+        h.x = x;
+        h.y = y;
+    }
+    std::vector<char> b;
+    if (!handwire::Encode(&b, h)) return false;
+    return CharSend(MSG_HAND, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* the character stream's road: our character's area */
 }
 
 // M-B / P064 / H027 - CONTEXT: uid(u32) | squadType(i32) | memberType(i32) | buildingHand(32 B) | charHand(32 B) | bx,by,bz(3f) | squadSidLen(u32) squadSid | townSidLen(u32) townSid
 //   | platoonIdLen(u32) platoonId | loadAgeMs(u32: ms since the sender's current world load finished, 0xFFFFFFFF unknown; squadorigin.h OwnIdLiftedByLoadAge)
 //   | birth(u32: the squad's birth flag, squadbirth.h WireOfBirth - 1 kept, 0 not kept, 0xFFFFFFFF unknown)
+//   | origin(u32: where the sender's copy of the squad came from, sameidpair.h WireOfOrigin - 0 running, 1 from the record, 2 from the save, 0xFFFFFFFF unknown)
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire)
+                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire, unsigned int originWire)
 {
     if (!CharRoadOpen()) return false;   /* M7a: the notebook road, or the session link while it is down */
     std::vector<char> b;
@@ -2743,6 +2939,7 @@ bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, c
     PutU32(&b, (unsigned int)platoonId.size()); b.insert(b.end(), platoonId.begin(), platoonId.end());   // P1: the sender's platoon id = the squad's world id
     PutU32(&b, loadAgeMs);   /* the age of this game's current world load; a receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
     PutU32(&b, birthWire);   /* the squad's birth flag (squadbirth.h WireOfBirth): the receiver's copy takes its kept byte from it */
+    PutU32(&b, originWire);  /* where this game's copy came from (sameidpair.h WireOfOrigin): a receiver's copy from a record or a save gives way to a running one */
     return CharSend(MSG_CONTEXT, uid, &b[0], b.size(), CH_RELIABLE, -1);   /* M7a */
 }
 
@@ -3539,6 +3736,16 @@ bool SendItemPlaced(unsigned int id, int ok)
     b.push_back((char)(unsigned char)(ok != 0 ? 1 : 0));
     return ItemSendTo(MSG_ITEM_PLACED, ItemToAskedOf(id), &b[0], b.size(), 0u, 0);   /* M7b slice 2: to the game request `id` was asked of */
 }
+/* The giver's 'give done' for GIVE `id` (coopgive::kPlacedGiveDone in MSG_ITEM_PLACED's value byte): its yes came in time and its own
+   copy is gone, so the owner's GIVE row may end now. RELIABLE, sent once; a lost one leaves the owner's stand window as the ending. */
+bool SendItemGiveDone(unsigned int id)
+{
+    if (CharRoadNow() == cooplive::kCharRoadNone) return false;
+    std::vector<char> b;
+    PutU32(&b, id);
+    b.push_back((char)(unsigned char)coopgive::kPlacedGiveDone);
+    return ItemSendTo(MSG_ITEM_PLACED, ItemToAskedOf(id), &b[0], b.size(), 0u, 0);   /* to the game the give was asked of */
+}
 
 /* T-889 step 2: MSG_ITEM_HANDOVER (79) - QUERY / VERDICT / CLOSED about one hand-over line, to one player by slot (src/common/handrec.h).
    RELIABLE; false = no road to that player now (the 60 s re-ask repeats it) or a kind / value out of range. */
@@ -3851,10 +4058,11 @@ bool SendShot(const coopshot::ShotMsg& m)
     return SendToOwner(MSG_SHOT, m.victimUid, &b[0], b.size());   /* M7b slice 1: to the victim's owner */
 }
 /* Reliable: one MSG_MELEE_DECIDED (combat.cpp MeleeDecidedDrain; false = no owner known, no road, or not encodable - counted there). */
-bool SendMeleeDecided(const meleewire::MeleeMsg& m)
+bool SendMeleeDecided(const meleewire::MeleeMsg& m, const hitwire::Blow* blow)
 {
     std::vector<char> b;
     if (!meleewire::EncodeMelee(&b, m)) return false;
+    if (blow != 0) hitwire::EncodeBlow(&b, *blow);   /* the decided blow after the 41 bytes; nothing when not carried */
     return SendToOwner(MSG_MELEE_DECIDED, m.victimUid, &b[0], b.size());   /* to the victim's owner */
 }
 /* recruit1.  Reliable: one MSG_HIRE (hire.cpp; queued there, applied at the K2 safe point on arrival). */
@@ -4089,7 +4297,12 @@ void OnMeleeDecided(const Message& m)
     int refusal = 0;
     if (!IsUidMine(s.victimUid)) refusal = 1;
     else if (!RemoteMayWrite(s.attackerUid, m.peer)) refusal = 2;
-    coop::MeleeOnNet(s.victimUid, s.attackerUid, s.cutDir, s.comboId, s.damages, s.techFlag, refusal);
+    /* the decided blow after the 41 bytes (hitwire.h): absent or refused = the NPC's game's HIT carries none */
+    hitwire::Blow blow;
+    hitwire::ClearBlow(&blow);
+    const bool haveBlow = m.payload.size() > meleewire::kMeleeWireSize
+        && hitwire::DecodeBlow(&m.payload[meleewire::kMeleeWireSize], m.payload.size() - meleewire::kMeleeWireSize, &blow) == hitwire::kDecodeOk;
+    coop::MeleeOnNet(s.victimUid, s.attackerUid, s.cutDir, s.comboId, s.damages, s.techFlag, refusal, haveBlow ? &blow : 0);
 }
 /* T-327 (protocol 111) - MSG_EFFECT. g_effViaRelay: did the message SessionDispatchQueued is dispatching come through the notebook
    (m.peer is the player key on both roads, so the road is read there, from the raw sender). */
@@ -5186,8 +5399,9 @@ void OnItemRequest(const Message& m0)
     OnItemRequestBody(m, 0, 0, ask);
 }
 
-// E22b-2 (P6b) - MSG_ITEM_PLACED: the taker's answer about a TAKE we granted. Refused whole if it is short:
-// a half-read id would name somebody else's pending request.
+// E22b-2 (P6b) - MSG_ITEM_PLACED: the taker's answer about a TAKE we granted (0 / 1), or a giver's 'give done' (2,
+// coopgive::kPlacedGiveDone) - the byte is passed as it came. Refused whole if it is short: a half-read id would name somebody
+// else's pending request.
 void OnItemPlaced(const Message& m)
 {
     unsigned int id = 0;
@@ -5458,6 +5672,7 @@ void SessionForgetRows(bool keepWorldRows, const char* why)
     if (!keepWorldRows)
     {
         g_sessEndCleared += (long long)g_owner.size();
+        for (std::map<unsigned int, unsigned int>::const_iterator ro = g_owner.begin(); ro != g_owner.end(); ++ro) coop::RangedModeOwnerGone(ro->first);   /* the copies' ranged mode written for their owners goes OFF */
         g_owner.clear(); g_copyGen.clear(); coop::net::RosterStreamForgetAll(); LostCopyForgetAll();   /* copy gens live with g_owner; g_mineGen lives with g_localOwned */
         return;
     }
@@ -5466,6 +5681,7 @@ void SessionForgetRows(bool keepWorldRows, const char* why)
     {
         if (cooppg::SessionEndKeepsRow(true, g_localOwned.find(it->first) != g_localOwned.end(), it->second)) { ++kept; ++it; continue; }
         const unsigned int uid = it->first;
+        coop::RangedModeOwnerGone(uid);   /* the copy's ranged mode written for its owner goes OFF */
         g_copyGen.erase(uid); coop::net::RosterStreamForget(uid); LostCopyForget(uid, "its owner row ended with the session");
         g_owner.erase(it++); ++cleared;
     }
@@ -5765,6 +5981,11 @@ void SessionDispatchOne(const Message& m)
     case MSG_PARITY_BOX:   OnParityBox(m);   break;   /* par1: the holder's answer for one of our boxes */
     case MSG_COMBATMODE: OnCombatMode(m); break;
     case MSG_SWING:      OnSwing(m);      break;
+    case MSG_BLOCK_PICK: OnBlockPick(m);  break;   /* T-1101 step 5: the defender's owner's block pick, for our copy of its defender */
+    case MSG_SWING_END:  OnSwingEnd(m);   break;   /* the owner's swing ended: its copy drops the credit it did not spend */
+    case MSG_FIGHT_CHOICE: OnFightChoice(m); break;   /* T-1101 design (c): the owner's fight choice, for its copy's decide step */
+    case MSG_HAND:       OnHand(m);       break;   /* the owner's hand item, for our copy of its character */
+    case MSG_SHOT_FIRED: OnShotFired(m);  break;   /* the shooter's game's fire: our copy of the shooter fires that bolt */
     case MSG_XFER:       OnXfer(m);       break;
     case MSG_XFER_ACK:   OnXferAck(m);    break;
     case MSG_SQUAD_LEAD: OnSquadLead(m);  break;   /* T-1 B1 restructure: the other game's announced squad leaders */
@@ -6237,6 +6458,7 @@ void OnPeerGone(int goneSlot)
     coop::ShopAppliedResendTo(goneSlot);   /* T-1007 (J4): that player's unacked shop confirms again, by the road that still reaches it */
     coop::ShopPendAskedGone(goneSlot, 1);   /* T-1007 (J): the link went down - the shop requests asked before it are settled */
     coop::ItParityForgetAsker(goneSlot);   /* the gone peer's sector asks no longer route fill pushes to it (every game's while its slot is unknown) */
+    coop::FightChoiceForget("link down");   /* copies' fight-choice rows: a hold or a waiting choice has no feed now */
 
     const int platoons = RetirePeerContextPlatoons(goneSlot);
 
@@ -6413,6 +6635,7 @@ void PlayerGoneTakeOverTick()
             continue;
         }
         ++g_gtEnded;
+        coop::RangedModeOwnerGone(w.uid);   /* a copy left loaded does not keep the ranged mode written for its owner */
         const int r = DropPeerOwnedCopy(w.uid, 1);   /* T-1007 (J2): a departure */
         net::g_owner.erase(w.uid); net::g_copyGen.erase(w.uid); coop::net::RosterStreamForget(w.uid); net::g_departedPending.erase(w.uid);
         dropped.push_back(w.uid); droppedSlots.insert(w.slot);
@@ -6442,6 +6665,7 @@ void OnPlayerGone(unsigned int slot, const char* how, int standIn)
     cooppg::PeerGoneSelect(net::g_owner, net::g_localOwned, slot, &uids);
     coop::TalkForgetPeer(cooplive::RelayPeerId(slot));   /* that player's conversations end before its copies go (P26s1 L7) */
     const std::string takeOver = GoneTakeOverSplit(slot, standIn, &uids);   /* the NPCs this game takes, or keeps for the area's taker, leave the list */
+    for (size_t i = 0; i < uids.size(); ++i) coop::RangedModeOwnerGone(uids[i]);   /* a copy left loaded does not keep the ranged mode written for its owner */
     long long destroyed = 0, withdrawn = 0, absent = 0, cleared = 0;
     for (size_t i = 0; i < uids.size(); ++i)
     {

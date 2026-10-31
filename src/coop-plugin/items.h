@@ -288,6 +288,10 @@ void ItemRequestRefusedHere(unsigned int id, unsigned int fromPeer);
 const int kItemRefuseConfirm = 1;
 const int kItemRefuseRequest = 2;
 int ItemRefuseNextFires(int kind, unsigned int id);   /* 1 = the lever was armed for this kind: refuse this message (the lever is now off) */
+/* TEST-ONLY `itemrefuse next take [gone|short|wrong]`: called by ApplyItemRequest where a direction-0 take (box or character, not a
+   shop trade) would be taken out. Armed: returns the take decision's refusal reason (kRefNoItem / kRefShort / kRefWrongItem), logs
+   [ITEMS] itemrefuse fired take, and turns the lever off - the take is then refused on its ordinary road. 0 = not armed or not a take. */
+int ItemRefuseTakeFires(const ItemRequestMsg& r, unsigned int fromPeer);
 std::string ItemRefuseCommand(const std::string& arg);
 // E22a TEST LEVER, MAIN THREAD, command channel only: give `count` of the item named by `baseSid` to the
 // first LOADED character whose name contains `needle` AND whose uid this game owns, through the engine
@@ -319,10 +323,13 @@ bool BoxTest(const std::string& needle, const std::string& baseSid, int count);
 /* P17 TEST LEVER: boxtest's path into one chosen section - `input` = the section whose limit list names the item, any other text =
    the section of that name; no whole-inventory fallback after a refusal. MAIN THREAD, command channel only. */
 bool BoxTestIn(const std::string& needle, const std::string& baseSid, int count, const std::string& sectionWant);
-/* P17 TEST LEVER `jobtest work <characterUid> <buildingKey> [plain] [task=<n>]` (this game's own character gets the engine's own
-   giveOrder 0x5D1640, default task OPERATE_MACHINERY 87, on the building) | `jobtest input <buildingKey> <itemSid> <n>
-   [section=<name>]` (n of the item into the machine's input section) | `jobtest show <buildingKey>` (read-only). Every form prints
-   the machine: name, product, inputs, sections. [JOB] lines. MAIN THREAD, command channel only. */
+/* P17 TEST LEVER `jobtest work <characterUid> <needle> [plain] [task=<n>] [door=<i>] [near=<x>,<z>]` (this game's own character
+   gets the engine's own giveOrder 0x5D1640, default task OPERATE_MACHINERY 87, on the building) | `jobtest input <buildingKey>
+   <itemSid> <n> [section=<name>]` (n of the item into the machine's input section) | `jobtest show <needle> [near=<x>,<z>]`
+   (read-only). Every form prints the machine: name, product, inputs, sections. `jobtest list <needle> [radius]` (read-only) lists
+   every loaded building, furniture row and interior piece whose instance id, position key, record id or name holds the needle
+   (any case, one or more words); show and work take the first such match, or with near= the one nearest that x,z.
+   [JOB] lines. MAIN THREAD, command channel only. */
 std::string JobTestCommand(const std::string& arg);
 /* P43 TEST LEVER cagetest's candidates: up to `cap` loaded buildings (flat walk and furniture rows) whose record name says cage
    and whose class is UseableStuff, nearest to `from` first, with their position keys and names. Counts what was scanned, how

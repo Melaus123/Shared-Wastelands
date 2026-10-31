@@ -862,6 +862,7 @@ static void startPluginOn(const char* road)
     coop::InstallCapture();    /* P11: task bodies 0x35A9C0 / 0x34E750 + the strip / dress / owner / shave hooks */
     coop::InstallSlaves();     /* slave1: setSlaveState 0x5A3EB0 + StateBroadcastData::periodicUpdate 0x5A44C0 */
     coop::InstallHomeWatch();  /* T-1084: Ownerships::setHomeBuilding - a world squad's new home marks its record due */
+    coop::InstallPoseLayerStart();   /* T-307: the layer play 0x5B7030 - only a task's layer state is sent as a pose */
     /* PROBE P140 BEGIN */ coop::InstallP140();   /* T-806: who starts the cage-use task (0x357FE0), log only */ /* PROBE P140 END */
     coop::InstallHire();       /* recruit1 R0-a: Dialogue::_doActions 0x67FAD0, LOG ONLY */
     coop::InstallWorldGen();

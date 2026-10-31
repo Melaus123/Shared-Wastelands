@@ -420,7 +420,9 @@ inline int AnnounceMemberRow(int deadFlag, int spotRead, int spotHeld, int spotN
 inline bool CharStreamNeedsOwnerGate(unsigned int t)
 {
     return t == kInnerAppearance || t == kInnerClothing || t == kInnerCombatMode || t == kInnerSwing || t == kInnerIntent || t == kInnerContext
-        || t == kInnerInside;   /* P25 fold 2: its handler, like INTENT's, asks only for a puppet row */
+        || t == kInnerInside   /* P25 fold 2: its handler, like INTENT's, asks only for a puppet row */
+        || t == kInnerSwingEnd   /* its handler, like SWING's, asks only for a copy */
+        || t == kInnerFightChoice;   /* its handler, like SWING's, asks only for a copy */
 }
 enum { kStreamGatePass = 0, kStreamGateOwnedHere = 1, kStreamGateOtherOwner = 2 };
 inline int RelayedStreamGate(bool ownedHere, bool ownerKnown, bool ownerIsSender)

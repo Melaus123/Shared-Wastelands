@@ -22,6 +22,14 @@ void ApplyRemoteXferAck(unsigned int leader, const unsigned int* takenUids, int 
    RELEASE_ACK (69) handlers (net/session.cpp). SquadIdxTaken: net::TakeLocalOwner - out of the squad index. SquadIdxOwnerWithdrew:
    the recorded owner's DESPAWN (unload 0) or UNLOAD / NOT-LIVE answer (unload 1) [review F9]. */
 void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole);
+/* MAIN THREAD. A same-id retire (spawn.cpp: this game's copy of a squad another game's running copy replaces - the yield, or the
+   reloaded-copy retire): SameIdWithdrawMark before StoreRetireLocalCopy names the squad's own-uid people (kind kSameIdYield /
+   kSameIdReload); their put-away is not offered (ReleaseOnPutAway, releaseSkip yield / reloadRetire) and, put away while their XFER
+   flew and not taken, their held UNLOAD goes (ReleaseOpenFromFlight, releaseFlight sameIdUnload). SameIdWithdrawDone after the
+   retire's withdrawals drops every entry no XFER flight holds; the flight's end drops the rest; the world teardown clears all. */
+enum { kSameIdYield = 1, kSameIdReload = 2 };
+void SameIdWithdrawMark(const unsigned int* uids, int n, int kind);
+void SameIdWithdrawDone();
 bool ReleasePendingHas(unsigned int uid);
 void ApplyRemoteRelease(const cooplo::ReleaseMsg& m, unsigned int fromPeer);
 void ApplyRemoteReleaseAck(const cooplo::ReleaseAckMsg& a, unsigned int fromPeer);

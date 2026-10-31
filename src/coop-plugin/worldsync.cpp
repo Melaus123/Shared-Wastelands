@@ -730,6 +730,7 @@ int WithdrawReloadedCopy(unsigned int uid, bool wasAnnounced)
         }
     if (!wasAnnounced) return 0;
     if (!AnnouncedExplicit(uid)) return 1;               /* E9's unload-destroy path already sent the UNLOAD */
+    if (ReleasePendingHas(uid)) return 3;                /* held: an open release, its batch or an XFER flight decides; nothing sent yet */
     if (WithdrawAnnouncedOnOwnUnload(uid, kUnloadWhyReloaded)) return 1;
     RetireWithdrawNote(uid, cooprw::kEvRetire);         /* declined: owed - the P8m drain sends it */
     return 2;
@@ -2104,7 +2105,7 @@ static bool CatchupWire(::Character* c, GameData** gd, Faction** f)
     return PlausibleObject(*gd) && PlausibleObject(*f) && !coopslot::WireLacksSlot(WireFactionName(*f));
 }
 /* ONE CHARACTER'S FULL STATE - CONTEXT, SPAWN, then APPEARANCE + CLOTHING when its roll has settled, STATE, COMBATMODE (OFF too) and
-   (M7a2 item 9) INTENT. The road is the caller's: net::CharStreamToSlot(slot) for one game, -1 for AREA. */
+   (M7a2 item 9) INTENT, and HAND. The road is the caller's: net::CharStreamToSlot(slot) for one game, -1 for AREA. */
 static bool CatchupSendState(unsigned int uid, ::Character* c, GameData* gd, Faction* f, const Ogre::Vector3& pos)
 {
     SendContextFor(uid, c);
@@ -2113,6 +2114,7 @@ static bool CatchupSendState(unsigned int uid, ::Character* c, GameData* gd, Fac
     if (StatePush(uid)) ++g_cuState;
     if (CombatModeResendOwned(uid)) ++g_cuCombat;
     if (IntentResendOwned(uid)) ++g_cuIntent;
+    HandResendOwned(uid);   /* what its hands hold, bare hands too (counted in combat.cpp) */
     return true;
 }
 
@@ -2183,7 +2185,7 @@ void WorldsyncCatchupAsk(const std::vector<char>& payload)
         if (ann == cooplive::kAnnSpawn)
         {
             SendContextFor(uid, c);
-            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++announced; ++g_cuAnnounced; PushStateIfDown(uid, c); }
+            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++announced; ++g_cuAnnounced; PushStateIfDown(uid, c); HandResendOwned(uid); }
             else { ++failed; ++g_cuFailed; }
             continue;
         }
@@ -2255,7 +2257,7 @@ void WorldsyncCatchupReverseTick()
         if (ann == cooplive::kAnnSpawn)
         {
             SendContextFor(uid, c);
-            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++g_cuRevPassAnnounced; PushStateIfDown(uid, c); }
+            if (net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) { WatchLocalRoll(uid); g_announced[uid] = 1; ++g_cuRevPassAnnounced; PushStateIfDown(uid, c); HandResendOwned(uid); }
             else ++g_cuRevPassFailed;
             continue;
         }

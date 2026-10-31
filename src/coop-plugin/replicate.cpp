@@ -2719,14 +2719,17 @@ static bool CopyFacing(CharMovement* mv, float* fx, float* fz)
     if (!Finite(n) || n < 0.001f) return false;
     *fx = x / n; *fz = z / n; return true;
 }
-static void ApplyFacingIfStationary(Puppet& p, CharMovement* mv, const Ogre::Vector3& cur)
+// true = the copy was turned this call (T-890 counts it for a posed copy)
+static bool ApplyFacingIfStationary(Puppet& p, CharMovement* mv, const Ogre::Vector3& cur)
 {
-    if (p.faceX == 0.0f && p.faceZ == 0.0f) { ++g_faceSkippedNoVector; return; }
-    if (g_tick - p.faceTick < kFaceApplyEveryTicks) return;
+    if (p.faceX == 0.0f && p.faceZ == 0.0f) { ++g_faceSkippedNoVector; return false; }
+    if (g_tick - p.faceTick < kFaceApplyEveryTicks) return false;
     float cx = 0.0f, cz = 0.0f;
-    if (CopyFacing(mv, &cx, &cz) && (cx * p.faceX + cz * p.faceZ) > kFaceApplyCos) return;   // already facing that way
+    if (CopyFacing(mv, &cx, &cz) && (cx * p.faceX + cz * p.faceZ) > kFaceApplyCos) return false;   // already facing that way
     p.faceTick = g_tick;
-    if (SafeLookAt(p.ch, cur.x + p.faceX * 10.0f, cur.y, cur.z + p.faceZ * 10.0f)) ++g_faceWrites; else ++g_faceWriteFailed;
+    if (SafeLookAt(p.ch, cur.x + p.faceX * 10.0f, cur.y, cur.z + p.faceZ * 10.0f)) { ++g_faceWrites; return true; }
+    ++g_faceWriteFailed;
+    return false;
 }
 
 // H023 - has the copy's AI consumed its order? needGOAP 0 with a running action = yes (F424/F430).
@@ -3695,6 +3698,10 @@ void DrivePuppet(unsigned int uid, Puppet& p)
         if (p.driving) { if (PlausibleObj(p.ch->movement)) SafeStopMovement(p.ch->movement); p.driving = false; }
         PoseNoteHeldFrame();
         FloorPendingDrop(uid, p, "the pose hold");   // T-986 g3: the pose places the copy itself
+        // T-890: a copy seated or at work faces where its owner faces (every movement message carries the owner's facing,
+        // standing too); a bed or cage places the body itself and is not turned
+        if (PoseHoldsActionCopy(uid) && PlausibleObj(p.ch->movement) && ApplyFacingIfStationary(p, p.ch->movement, cur))
+            PoseNoteFacingApplied();
         return;
     }
 

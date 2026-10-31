@@ -22,6 +22,7 @@
 #include "resurrect.h"   /* T-556: ResurrectTick and the TEST-ONLY `resurrect` lever */
 #include "fallentab.h"   /* T-556: ReportFallenTab */
 #include "store.h"
+#include "policy.h"   /* T-942: PolicyKitTick */
 #include "ownstore.h"   /* mmo1: ownsave verb, [OWNSAVE] report */
 #include "playerfaction.h"
 #include "tags.h"   /* tags1: `tags on|off|lift <n>` */
@@ -36,10 +37,12 @@
 #include "hire.h"       /* recruit1: hiretest, ReportHire */
 #include "worldgen.h"
 #include "worldstate.h"
+#include "townver.h"   /* TownVerTick */
 #include "items.h"
 namespace coop { std::string RangedTestLever(const std::string& args); }   /* P104: combat.cpp */
 namespace coop { std::string GroundLineLever(const std::string& args); std::string GroundFindLever(const std::string& args); }   /* T-310: combat.cpp */
 namespace coop { bool GroundFindLastPick(bool target, float* x, float* z, long long* id); }   /* T-310: combat.cpp, playerteleport groundpick */
+namespace coop { int FocusCameraPod(float x, float y, float z); int GroundTerrainHeightAt(float x, float z, float* out); }   /* TEST-ONLY lever camlook: handoff.cpp (PlayerInterface::focusCamera, row FocusCameraOn) / combat.cpp (1 height, 0 no terrain, -1 no row or a fault). MAIN THREAD */
 #include "speech.h"   /* ReportCrimeTest */
 #include "../common/saywire.h"   /* the name levers' argument shapes (koself name, talkcarriers ev/act) */
 #include "build.h"    /* build1-a: buildtest, buildlist, ReportBuild, BuildTick */
@@ -456,6 +459,55 @@ static void TalkWaitStep()
     DebugLog(wo.str());
 }
 
+#ifdef SW_DEV_BUILD
+/* TEST-ONLY lever camfollow (DEV build): `camfollow <uid>` keeps this game's camera on that character - the owner's own character
+   or the copy of another game's character - by aiming PlayerInterface::focusCamera (handoff.cpp FocusCameraPod, the call camlook
+   and playerteleport make) at its position once a frame, here on the main thread. The mod knows no engine call that makes the
+   camera follow a character by itself, so it is re-aimed every frame. It stops on `camfollow off`, on `camlook`, or when the uid
+   no longer names a live character on this game (`lost`). Nothing is moved, selected or ordered. */
+static unsigned int g_camFollowUid = 0;
+static long long g_camFollowFrames = 0;
+static float g_camFollowX = 0.0f, g_camFollowY = 0.0f, g_camFollowZ = 0.0f;
+static std::string CamFollowWhere()
+{
+    std::ostringstream o; o.setf(std::ios::fixed); o.precision(1);
+    o << g_camFollowX << "," << g_camFollowY << "," << g_camFollowZ;
+    return o.str();
+}
+static void CamFollowOff(const char* why)
+{
+    if (g_camFollowUid == 0) return;
+    std::ostringstream o; o << "[CAMFOLLOW] off uid=" << g_camFollowUid << " frames=" << g_camFollowFrames << " last=" << CamFollowWhere() << " (" << why << ")";
+    DebugLog(o.str());
+    g_camFollowUid = 0;
+}
+static void CamFollowStep()
+{
+    if (g_camFollowUid == 0) return;
+    ::Character* c = coop::FindSpawned(g_camFollowUid);
+    Ogre::Vector3 p;
+    if (c == 0 || !coop::SafeReadPosition(c, &p))
+    {
+        std::ostringstream o; o << "[CAMFOLLOW] lost uid=" << g_camFollowUid << " frames=" << g_camFollowFrames << " last=" << CamFollowWhere()
+                                << " (no live character with that uid on this game - the follow stops)";
+        DebugLog(o.str());
+        g_camFollowUid = 0;
+        return;
+    }
+    const int cam = coop::FocusCameraPod(p.x, p.y, p.z);
+    if (cam != 1)
+    {
+        std::ostringstream o; o << "[CAMFOLLOW] off uid=" << g_camFollowUid << " frames=" << g_camFollowFrames
+                                << (cam == 0 ? " (no PlayerInterface or no FocusCameraOn row)" : " (the focus call FAULTED)");
+        DebugLog(o.str());
+        g_camFollowUid = 0;
+        return;
+    }
+    g_camFollowX = p.x; g_camFollowY = p.y; g_camFollowZ = p.z;
+    ++g_camFollowFrames;
+}
+#endif
+
 void CommandChannelTick()
 {
     // F322. THIS function IS the main thread, by definition - everything below it is documented
@@ -496,6 +548,9 @@ void CommandChannelTick()
     coop::SnapshotTick();    /* snap1 (user decision 2026-09-26): an armed snapshot is taken at its world minute; its block is written 64 lines a tick */
     TalkWaitStep();          /* P26 T718 (TEST): a pending playerteleport near / talksight wait for a character to load, every 500 ms */
     PeerTpWaitStep();        /* TEST: a pending playerteleport peer wait for a copy of the other player's character, every 500 ms */
+#ifdef SW_DEV_BUILD
+    CamFollowStep();         /* TEST-ONLY camfollow: the camera re-aimed at the followed character, every frame */
+#endif
     /* E24.3 (review-p5o HIGH-3): THE DRAIN RUNS BEFORE THE LINK PUMP. StoreTick pumps the notebook link, and an
        inbound UNIQUE_STATE is APPLIED inside that pump - it writes the engine's state table. With the drain after
        it, a change a worker thread pushed in the previous frame was read AFTER the apply had already overwritten
@@ -503,6 +558,7 @@ void CommandChannelTick()
        published. Reading first costs nothing and removes the window entirely. */
     coop::WorldStateTick();    /* E5: drains the unique-NPC state changes the writers' detours queued */
     coop::StoreTick();       // P1 persistence (1 Hz inside)
+    coop::TownVerTick();     /* stored town versions onto towns whose area is not loaded here; old-world seeds */
     coop::RelationsTick();   // P3 piece 2 (link-up snapshot; live changes; the queue drain)
     coop::PlayerFactionTick(); // a rename of my faction is a state change seen here (review-p3r H1)
     coop::TownGenTick();       // P4c: the main thread id, captured here
@@ -512,6 +568,7 @@ void CommandChannelTick()
     coop::BuildTick();       /* build1-a: logs the construction events the detours queued (P082) */
     coop::SettingsTick();    /* settings1 S1: [SETTINGS]/[MODS] at the link-up and world-live edges (look only) */
     coop::TeamTick();        /* T-546: held RESTORE rows answered once the world is loaded; the table asked for after a world teardown */
+    coop::PolicyKitTick();   /* T-942: another player's box / character judged teammate, friend or stranger again when anything it rests on changed */
     coop::CaptureTestTick();   /* P11 (test-only lever): nothing unless `capturetest` armed it */
     coop::WorldSyncTick();   // P033: adopts world characters, throttled; no-op when off
 
@@ -1988,7 +2045,7 @@ void CommandChannelTick()
     }
     else if (verb == "cursortest")
     {
-        // cursortest open <boxKey> | close | pick <boxKey|me|peer> <section> <x> <y> [all] | drop <boxKey|me|peer> <section> <x> <y>
+        // cursortest open <boxKey> | close | pick <boxKey|me|peer> <section> <x> <y> [all] | drop <boxKey|me|peer> <section> <x> <y> [merge]
         // | back | list   - p105h TEST-ONLY lever (p105 design 10 / 15.1 / 15.2): the engine's own cursor pickup 0x712DD0 (the mouse
         // position set to the square around the call), drop 0x714990 (the square's top-left pixel) and return 0x70D000, on a container
         // whose window is open (open = the engine's loot open, boxopen's road). One [ITEMS] p105 cursortest line each (coop::CursorTestCommand).
@@ -2018,6 +2075,8 @@ void CommandChannelTick()
         // itemrefuse next confirm|request | off | show   - TEST-ONLY lever: the next ITEM_CONFIRM (or ITEM_REQUEST) this game receives is
         // refused by the reader as a malformed backpack block, so the refused-here answer runs. One-shot. One [ITEMS] itemrefuse line each
         // (coop::ItemRefuseCommand); a firing logs [ITEMS] itemrefuse fired.
+        // itemrefuse next take [gone|short|wrong]   - the next TAKE request this game is asked (direction 0: not a HOLD / LAND hand-back,
+        // give, shop trade or ground take) is refused by the take decision itself, after decoding, as that reason (default gone). One-shot.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::ItemRefuseCommand(Trim(arg))); finished = true;
     }
@@ -2025,6 +2084,15 @@ void CommandChannelTick()
     {
         std::string rest; std::getline(is, rest); rest = Trim(rest);
         WriteStatus(coop::PlatoonWipe(rest) ? "ok platoonwipe" : "error platoonwipe"); finished = true;
+    }
+    // clearnear <x> <z> <r> | clearnear here <r> - owner 1205 a, TEST-ONLY (store.cpp ClearNearLever): every awake outside squad with
+    // a member within r of (x, z) - `here`: of this game's watched player character - that this game runs is removed through the
+    // platoonwipe path (wandering groups only); player-side squads, the run's own spawns, a town's own squads and squads another game
+    // runs are kept. [CLEARNEAR] lines.
+    else if (verb == "clearnear")
+    {
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::ClearNearLever(Trim(rest))); finished = true;
     }
     else if (verb == "platoonnudge")
     {
@@ -2421,6 +2489,7 @@ void CommandChannelTick()
         // (also mats / destroy / into, and broken <key-substring> 0|1: the engine's own setBroken on the piece)
         // (upgrade|downgrade <key-substring>: the engine's own upgrade / downgrade on an own, complete piece - T-609 U)
         // (town <sid|key-substring>: a registered piece's town, read now - T-899)
+        // (areaflag <x,y>: an area's first-time flag read as createBuilding reads it, nothing written - T-959)
         // (canbuild <sid> [dx dz | abs <x> <z>]: the engine's "Can't build too close to another town." decision re-asked at my first character
         //  + (dx, 0, dz), nothing placed; one [BUILD] canbuild line - T-923)
         // (build1-a, docs/design-build1.md s3): armed here, run at the K2 safe point (build.cpp BuildTestDrain).
@@ -2538,11 +2607,11 @@ void CommandChannelTick()
     }
     else if (verb == "buildings") { WriteStatus(coop::BuildingsCommand()); finished = true; }
     else if (verb == "towns") { WriteStatus(coop::TownsCommand()); finished = true; }
-    else if (verb == "pendnote")   /* TEST-ONLY verb (T-580): pendnote add <townSid> <x> <z> [stale|asleep] | clear | show <townSid> <x> <z> - a test note of a town at a world position in decision 34's pending set (store.cpp StorePendNoteCommand) */
+    else if (verb == "pendnote")   /* TEST-ONLY verb (T-580): pendnote add <townSid> <x> <z> [stale|asleep|home <buildingKey>] | clear | show <townSid> <x> <z> - a test note of a town at a world position in decision 34's pending set; home: a note homed at that building only (T-1099) (store.cpp StorePendNoteCommand) */
     {
-        std::string op, town, kind; float x = 0.0f, z = 0.0f; is >> op;
+        std::string op, town, kind, homeKey; float x = 0.0f, z = 0.0f; is >> op;
         if (op != "clear" && !(is >> town >> x >> z)) WriteStatus("error pendnote: add / show need <townSid> <x> <z> (numbers) - nothing added");
-        else { if (op == "add") is >> kind; WriteStatus(coop::StorePendNoteCommand(op, town, x, z, kind)); }
+        else { if (op == "add") { is >> kind; if (kind == "home") { std::string rest; std::getline(is, rest); homeKey = Trim(rest); } } WriteStatus(coop::StorePendNoteCommand(op, town, x, z, kind, homeKey)); }
         finished = true;
     }
     else if (verb == "storetest")
@@ -2553,15 +2622,18 @@ void CommandChannelTick()
         WriteStatus(coop::StoreTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "townlist") { WriteStatus(coop::TownListCommand()); finished = true; }   // towns1: read-only, every town with name and position
+    else if (verb == "townparity") { WriteStatus(coop::TownParityCommand()); finished = true; }   /* TEST, read-only: one [TOWNPARITY] row per placed town + a digest line */
     else if (verb == "ownbuilding") { WriteStatus(coop::OwnBuildingCommand()); finished = true; }
     else if (verb == "jobtest")
     {
         // jobtest work <characterUid> <buildingKey> [plain] [task=<n>]   - P17 TEST-ONLY lever (items.cpp JobTestCommand): this game's
-        // own character gets the engine's own giveOrder 0x5D1640 on the first loaded building whose key or instance id contains the
-        // text - default task 87 OPERATE_MACHINERY, as a player's order (`plain` = without the player-order argument).
+        // own character gets the engine's own giveOrder 0x5D1640 on the first loaded building, furniture row or interior piece whose
+        // key, instance id, record id or name contains the text (any case, one or more words; near=<x>,<z> takes the match nearest
+        // that point) - default task 87 OPERATE_MACHINERY, as a player's order (`plain` = without the player-order argument).
         // door=<i> (0-31) gives the order on door i of that building instead (a gate's door: REPAIR is task 95).
         // jobtest input <buildingKey> <itemSid> <n> [section=<name>]   - TEST-ONLY: n of the item into that machine's input section
-        // (boxtest's path, the section whose limit list names the item unless one is named). jobtest show <buildingKey> - read-only.
+        // (boxtest's path, the section whose limit list names the item unless one is named). jobtest show <needle> [near=<x>,<z>] -
+        // read-only. jobtest list <needle> [radius] - read-only, every match with its position and distance.
         // jobtest stop <characterUid>   - T-610 TEST-ONLY: this game's own character's orders dropped (dropAllOrders 0x506A10), its order
         // target reset (0x506AA0), its standing jobs dropped (0x5067F0) and its current task ended (the task's end flag); ok only when
         // the order list and the standing job list both read empty after.
@@ -2811,8 +2883,16 @@ void CommandChannelTick()
         // decisions the ENGINE asks (Character::isEnemyOf / isAllyOf). It changes NO stored
         // relation value: nothing goes on the wire, nothing reaches the save, and relations.cpp is
         // neither consulted nor disturbed. Default OFF; both games run it locally.
+        // peace fight <faction>[,<faction>] - owner 1205 a, TEST-ONLY: the same lever in its FIGHT form (peace.cpp PeaceFightLever):
+        // two player-side characters, and a pair whose non-player side is in one of the named factions (the run's own opponent,
+        // spawned with `spawnfaction`), are left to the engine. `peace on` is plain peace again; `peace off` ends both.
         std::string mode; is >> mode;
-        if (mode != "on" && mode != "off") { WriteStatus("error peace usage: peace on|off"); }
+        if (mode == "fight")
+        {
+            std::string rest; std::getline(is, rest);
+            WriteStatus(coop::PeaceFightLever(Trim(rest)));
+        }
+        else if (mode != "on" && mode != "off") { WriteStatus("error peace usage: peace on|off | peace fight <faction>[,<faction>]"); }
         else { coop::SetPeaceOn(mode == "on"); WriteStatus("ok peace"); }
         finished = true;
     }
@@ -3201,6 +3281,16 @@ void CommandChannelTick()
         WriteStatus(coop::StatsTestLever(Trim(rest)));
         finished = true;
     }
+    else if (verb == "stancetest")
+    {
+        // stancetest <uid> <block|ranged|taunt|hold|passive|chase> <0|1> | stancetest <uid> show  - TEST-ONLY lever
+        // (combat.cpp StanceTestLever): that stance button's saved mode of a character this game runs (a copy is refused),
+        // set through the engine's own setter (Character vtable +0x308) as the panel's stance buttons set it, then read
+        // back; show: the six stance bytes of any loaded character (own or copy), read now. [TEST] stancetest lines.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::StanceTestLever(Trim(rest)));
+        finished = true;
+    }
     else if (verb == "sneaktest")
     {
         // sneaktest <ownUid> on|off   - P40 TEST-ONLY lever (spawn.cpp SneakTestCommand): this game's own character in or out of
@@ -3279,9 +3369,21 @@ void CommandChannelTick()
         // bodytest pending <copyUid>  - TEST-ONLY lever (appearance.cpp BodyTestLever), on the game that holds the COPY: at the
         // end of the copy's next get-up blend the appearance's rebuild-pending byte is set inside the engine's ragdoll pass, so
         // the blend's last update meets a queued body rebuild; the copy body-rebuild guard must hold it. [BODYTEST] lines.
-        std::string sub; unsigned int uid = 0;
-        is >> sub >> uid;
-        WriteStatus(coop::BodyTestLever(sub, uid));
+        // bodytest ragdoll <copyUid> | name:<Name> | spawned:<Template>  - TEST-ONLY, the same lever, on the game that holds the
+        // COPY: on the copy's next ordinary update outside the engine's ragdoll pass while it lies in ragdoll with a body and no
+        // rebuild pending, the rebuild-pending byte is set once (the state a carried, knocked-out copy reaches by itself); the
+        // [BODYTEST] lines say whether the copy body-rebuild guard ran or held that rebuild (a human runs - held instead while its
+        // animation's has-body byte +0x88 reads 0 - and an animal is held).
+        // Either mode takes the name forms (coop::LeverNameUid).
+        std::string sub, who, lab; unsigned int uid = 0;
+        is >> sub >> who;
+        const int nr = coop::LeverNameUid(who, &uid, &lab);
+        if (nr < 0) WriteStatus("error bodytest: " + lab);
+        else
+        {
+            if (nr == 0) uid = (unsigned int)strtoul(who.c_str(), 0, 10);
+            WriteStatus(coop::BodyTestLever(sub, uid) + (nr > 0 ? " (" + lab + ")" : std::string()));
+        }
         finished = true;
     }
     else if (verb == "looktest")
@@ -3516,6 +3618,95 @@ void CommandChannelTick()
         }
         finished = true;
     }
+#ifdef SW_DEV_BUILD
+    else if (verb == "camlook")
+    {
+        /* TEST-ONLY lever (DEV build): camlook <x> <z> [y] - the camera is aimed at world x,z through PlayerInterface::focusCamera
+           (handoff.cpp FocusCameraPod, the call playerteleport makes after its teleport), at the terrain's height there or at y.
+           No character is moved and no order is given; the engine then loads the area for the camera as it does when a player
+           scrolls there. */
+        double x = 0, z = 0, y = 0;
+        is >> x >> z;
+        const bool argsOk = !is.fail();
+        bool haveY = false;
+        if (argsOk) { is >> y; haveY = !is.fail(); }
+        if (!argsOk) { DebugLog("[CAMLOOK] refused: usage camlook <x> <z> [y]"); WriteStatus("error camlook: usage camlook <x> <z> [y]"); }
+        else
+        {
+            float th = 0.0f;
+            const int hr = haveY ? 1 : coop::GroundTerrainHeightAt((float)x, (float)z, &th);
+            if (!haveY && hr != 1)
+            {
+                DebugLog(std::string("[CAMLOOK] refused: ") + (hr == 0 ? "no terrain at x,z" : "the terrain height could not be read") + " - give y");
+                WriteStatus("error camlook: no terrain height - give y");
+            }
+            else
+            {
+                const float fy = haveY ? (float)y : th;
+                CamFollowOff("camlook aims at a fixed spot");
+                const int cam = coop::FocusCameraPod((float)x, fy, (float)z);
+                std::ostringstream o; o.setf(std::ios::fixed); o.precision(1);
+                o << "[CAMLOOK] " << (cam == 1 ? "camera focused on " : (cam == 0 ? "NOT focused (no PlayerInterface or no FocusCameraOn row) at " : "focus FAULTED at "))
+                  << x << "," << fy << "," << z << " (" << (haveY ? "y given" : "terrain height") << "; no character moved)";
+                DebugLog(o.str());
+                WriteStatus(cam == 1 ? "ok camlook" : (cam == 0 ? "error camlook: no PlayerInterface or no FocusCameraOn row" : "error camlook: the focus call faulted"));
+            }
+        }
+        finished = true;
+    }
+    else if (verb == "camfollow")
+    {
+        /* TEST-ONLY lever (DEV build): camfollow <uid> | camfollow off | camfollow <uid> off | camfollow show - the camera is kept on
+           that character every frame (CamFollowStep above) until off, camlook, or the character is gone here. show logs what is
+           followed and where the camera was last aimed, so a screenshot can be checked against the character's position. */
+        std::string a, b;
+        is >> a;
+        if (!is.fail()) is >> b;
+        unsigned int uid = 0;
+        { std::istringstream ns(a); ns >> uid; if (ns.fail()) uid = 0; }
+        if (a == "off" || b == "off")
+        {
+            if (g_camFollowUid == 0) DebugLog("[CAMFOLLOW] off (nothing was followed)");
+            CamFollowOff("camfollow off");
+            WriteStatus("ok camfollow off");
+        }
+        else if (a == "show")
+        {
+            std::ostringstream o;
+            if (g_camFollowUid == 0) o << "[CAMFOLLOW] show: nothing followed";
+            else o << "[CAMFOLLOW] show uid=" << g_camFollowUid << " frames=" << g_camFollowFrames << " aimedAt=" << CamFollowWhere();
+            DebugLog(o.str());
+            WriteStatus("ok camfollow show");
+        }
+        else if (uid == 0)
+        {
+            DebugLog("[CAMFOLLOW] refused: usage camfollow <uid> | off | <uid> off | show");
+            WriteStatus("error camfollow: usage camfollow <uid> | off | <uid> off | show");
+        }
+        else
+        {
+            ::Character* c = coop::FindSpawned(uid);
+            Ogre::Vector3 p;
+            if (c == 0 || !coop::SafeReadPosition(c, &p))
+            {
+                std::ostringstream o; o << "[CAMFOLLOW] refused uid=" << uid << ": no live character with that uid on this game";
+                DebugLog(o.str());
+                WriteStatus("error camfollow: no live character with that uid here");
+            }
+            else
+            {
+                CamFollowOff("another character followed");
+                g_camFollowUid = uid; g_camFollowFrames = 0;
+                g_camFollowX = p.x; g_camFollowY = p.y; g_camFollowZ = p.z;
+                std::ostringstream o; o << "[CAMFOLLOW] on uid=" << uid << " mine=" << (coop::net::IsUidMine(uid) ? 1 : 0) << " at=" << CamFollowWhere()
+                                        << " (the camera aimed at it every frame through focusCamera; nothing moved or selected)";
+                DebugLog(o.str());
+                WriteStatus("ok camfollow");
+            }
+        }
+        finished = true;
+    }
+#endif
     else if (verb == "aifreeze")
     {
         int v = 0;

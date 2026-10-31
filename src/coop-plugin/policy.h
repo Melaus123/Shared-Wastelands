@@ -115,5 +115,13 @@ std::string PolicyTeamOrders(int slot);
 // T-805: `faction` (a building's owner) is the faction of a player who shares this game's player's team - the test the cursor hooks
 // make (false while this game's player is in no team). ANY THREAD.
 bool PolicyTeammateFaction(void* faction);
+// T-942 (owner 1187 a, 1188, 1189 a): MAIN THREAD, every frame (cheap: it compares a few numbers) - the kit table of every other
+// player's faction on this game, each judged teammate / friend allowed / friend refused / stranger (src/common/thingaccess.h), judged
+// again when the team, a standing between players, the base-access option or this game's slot changes. The stealing decision, the
+// item hover cursor, the trade / loot window choice and the box click read it.
+void PolicyKitTick();
+// T-942: the class of `faction` in the kit table (swaccess::Who: own by its PlayerInterface, else the table's row, else not a
+// player). ANY THREAD.
+int PolicyKitClassOf(void* faction);
 
 }

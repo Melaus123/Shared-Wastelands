@@ -177,8 +177,8 @@ inline int InRun(unsigned long runTid, unsigned long curTid)
     return (runTid != 0 && runTid == curTid) ? 1 : 0;
 }
 
-// KeptGiveUp: a building whose re-run is kept waiting by RerunKeep is re-run at most kMaxKeptReruns times in a session; the
-// re-run that reaches the bound gives the entry up (it is not offered again until the next session).
+// KeptGiveUp: a building whose re-run is kept waiting by RerunKeep is re-run at most kMaxKeptReruns times; the re-run that
+// reaches the bound parks the entry under the note that refused it (ParkStays says when it is offered again).
 const int kMaxKeptReruns = 5;
 inline int KeptGiveUp(int keptSoFar)
 {
@@ -206,6 +206,34 @@ inline int NoteHoldsBuilding(int testNote, const std::string& noteHome, const st
     if (recHere == 0 || tmplKnown == 0 || posKnown == 0) return 1;   // cannot be told: it holds
     if (tmplMatch == 0) return 0;
     return (dx * dx + dz * dz <= radius * radius) ? 1 : 0;
+}
+
+// T-1099: CreationAsk - which pending question one town creation asks. On a residents re-run's own thread (inRun) whose slot
+// names the building being re-run, the building's own question (a note holds only the building it is homed at, or a keyless
+// note of its template beside it) - the question the re-offer's decision asked before the run; a note of the town homed at
+// another building must not refuse this building's residents. Every other creation asks the town's question.
+const int kAskTown = 0, kAskBuilding = 1;
+inline int CreationAsk(int inRun, int slotNamesBuilding)
+{
+    return (inRun != 0 && slotNamesBuilding != 0) ? kAskBuilding : kAskTown;
+}
+
+// T-1099: NoteIdOfHolder - the note a holder text names: its first word ("<worldId> in area x,y (...)").
+inline std::string NoteIdOfHolder(const std::string& holder)
+{
+    const size_t sp = holder.find(' ');
+    return sp == std::string::npos ? holder : holder.substr(0, sp);
+}
+
+// T-1099: ParkStays - a building parked under the note that refused its re-run stays parked while the building's own question
+// (answer, with holderNow) is still held BY THAT NOTE. Not held (the note gone, released, or no longer homed there), or held
+// by another note (the re-offer's own decision then waits on that one, without a run), un-parks it. A park that names no
+// note stays only while the building is held.
+inline int ParkStays(int answer, const std::string& parkedNote, const std::string& holderNow)
+{
+    if (answer != kTownHeld) return 0;
+    if (parkedNote.empty()) return 1;
+    return NoteIdOfHolder(holderNow) == parkedNote ? 1 : 0;
 }
 
 }   // namespace townpending

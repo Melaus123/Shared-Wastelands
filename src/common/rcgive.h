@@ -113,6 +113,34 @@ inline int MergedTakeSplit(int now, int gain, int* keep, int* back)
     return 1;
 }
 
+/* A DRAG's whole stack taken out of their container and dropped on a matching stack we already held: the engine's drop
+   (decomp_714990 :563-611) folds our stack into the carried object, destroys our object and files the carried one in our square, so
+   the carried object then holds our units too. give: 1 a give; split: 1 the pickup split units off a stack (op 3); sameObj: 1 the
+   object in the drop square is the carried object; now: its live count; carried: the units carried at the pickup.
+   1 = only the carried units come off it and are made again in their square (*keep stays ours, *back is asked for);
+   0 = not this road - the object holds only what was carried, or this is not a whole-stack drag take. */
+inline int DragMergedTake(int give, int split, int sameObj, int now, int carried, int* keep, int* back)
+{
+    *keep = 0; *back = 0;
+    if (give != 0 || split != 0 || sameObj == 0) return 0;
+    return MergedTakeSplit(now, carried, keep, back);
+}
+
+/* Where a merged drag take's carried units go back in their container. ownFits: their own square takes them; otherFree: another free
+   square of that container does. kDtOwn: their own square - the request is sent (it names that square, as the writer holds it);
+   kDtOther: another square - the units leave our stack but nothing is asked (the request's square would not be where they are), the
+   writer is re-asked for the container; kDtNone: nowhere - the move stands, the writer is re-asked. */
+const int kDtOwn = 0, kDtOther = 1, kDtNone = 2;
+inline int DragTakeBackPlace(int ownFits, int otherFree)
+{
+    if (ownFits != 0) return kDtOwn;
+    return (otherFree != 0) ? kDtOther : kDtNone;
+}
+inline int DragTakeAsks(int place)
+{
+    return (place == kDtOwn) ? 1 : 0;
+}
+
 /* Back to the source: 1 = raise the source stack by the units (it is still the object in its cell); 0 = make the units again there
    from the record read before the call. */
 inline int BackRaises(int gone, int stillThere)

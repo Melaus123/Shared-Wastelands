@@ -484,6 +484,15 @@ inline int ReleaseStep(int haveCandidate, int candidatesLeft, int myLinkUp, int 
    here: the ACK path opens a release for it) */
 enum { kPadCollect = 0, kPadLeaveToAck = 1 };
 inline int PutAwayDuringFlight(int inXferFlight) { return inXferFlight != 0 ? kPadLeaveToAck : kPadCollect; }
+/* a put-away of a person a same-id retire withdraws (this game's copy of a squad that another game's running copy replaces: the same-id yield,
+   sameidpair.h CopyYield, or the reloaded-copy retire - handoff.cpp g_sameIdWd) is never offered: the other game already runs that person,
+   so its UNLOAD goes (removed from the other games). Asked first; else the flight rule above */
+enum { kPadUnloadSameId = 2 };
+inline int PutAwayRoad(int sameIdWithdrawn, int inXferFlight) { return sameIdWithdrawn != 0 ? kPadUnloadSameId : PutAwayDuringFlight(inXferFlight); }
+/* the ACK path's road for a member of this game's XFER that was not taken and whose body was put away while it flew: a person a same-id
+   retire withdraws has its held UNLOAD sent (never offered); one with no squad key sleeps here and its held UNLOAD goes; else a release */
+enum { kFprRelease = 0, kFprUnloadNoKey = 1, kFprUnloadSameId = 2 };
+inline int FlightPutAwayRoad(int sameIdWithdrawn, int hasKey) { return sameIdWithdrawn != 0 ? kFprUnloadSameId : (hasKey != 0 ? kFprRelease : kFprUnloadNoKey); }
 /* the gen a candidate holds if it adopts - strictly rising with each candidate tried [review F6] */
 inline unsigned int ReleaseOfferGen(unsigned int baseGen, int nTried) { return baseGen + 1u + (unsigned int)nTried; }
 

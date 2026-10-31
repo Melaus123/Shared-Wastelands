@@ -30,6 +30,10 @@ std::string RelationsWireSid(::Faction* f);
 int RelationsTagLevel(::Faction* mine, ::Faction* theirs, int* reads);   // *reads = directions actually read (0..2)
 // T-545: both directions' levels (mine -> theirs, theirs -> mine), nametag levels, kUnknown when unread. MAIN THREAD.
 void RelationsStanceLevels(::Faction* mine, ::Faction* theirs, int* you, int* them);
+// T-942: another player's OWN side towards this game's player (theirs -> mine), raw: the relation value and the flags (1 ally flag,
+// 2 at war), with no team fold. 1 = read, 0 = not readable (no address, a faction missing, the entry would not read). MAIN THREAD -
+// the same inserting accessor as above.
+int RelationsTheirSideRaw(::Faction* theirs, ::Faction* mine, float* v, unsigned* flags);
 // ANY THREAD: a count bumped each time a standing with this game's player faction on either side may have moved (a hooked
 // changer, a write from the wire, a put-back) - the PLAYERS tab rebuilds its rows when it moves.
 long long RelationsPlayerPairEpoch();

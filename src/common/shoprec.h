@@ -41,7 +41,7 @@
 
 namespace shoprec {
 
-const unsigned int kProtocol = 121;            /* the world-server protocol that carries shop records */
+const unsigned int kProtocol = 125;            /* the world-server protocol that carries shop records */
 
 
 const unsigned int kSrMarker = 0x31504853u;    /* 'S','H','P','1' little-endian */
@@ -401,6 +401,20 @@ inline int ShopGateDecide(int road, int holder, int known, int haveRecord, int h
 inline double ShopEngineTimer(int haveRecord, double recDeadline, double now)
 {
     return (haveRecord != 0 && recDeadline > now) ? recDeadline : now + kSrRetryHours;
+}
+/* THE OWED FORCED FILL (parked). The engine forces a squad's refill once, when it builds the keepers; refused, it never forces it
+   again, and its later timed call is skipped while the shop's inside is shown. So a forced call refused for a reason that clears
+   (not the holder yet, the record not known yet) is kept owed: the holder's pass asks it again as forced, and a timed call of an
+   owed squad counts as forced. The mark is dropped when the forced fill can never run (the record already carries the squad, or has
+   no room for it) and after a run that moved the engine's deadline; a run that refilled nothing keeps it owed. ran: the restock ran
+   (verdict kGateRun); timerChanged: the run moved the engine's deadline. Returns kParkPark, kParkUnpark or kParkLeave. */
+const int kParkLeave = 0, kParkPark = 1, kParkUnpark = 2;
+inline int ShopParkDecide(int verdict, int road, int ran, int timerChanged)
+{
+    if (ran != 0) return (timerChanged != 0) ? kParkUnpark : kParkLeave;
+    if (verdict == kGateRefuseHasRecord || verdict == kGateRefuseFull) return kParkUnpark;
+    if ((verdict == kGateRefuseNotHolder || verdict == kGateRefuseNotKnown) && road == kRoadForced) return kParkPark;
+    return kParkLeave;
 }
 /* AFTER A RESTOCK RAN on the holder. timerChanged: the engine moved the squad's deadline (it returns early, refilling nothing, while
    the shop's inside is shown or with no home - then nothing is written); newDeadline: the deadline the engine wrote (now + the

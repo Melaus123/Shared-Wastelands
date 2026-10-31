@@ -198,6 +198,12 @@ long long g_relSent = 0, g_relAdopted = 0, g_relDropped = 0, g_relDeferred = 0, 
 long long g_relOffers = 0, g_relHeld = 0, g_relNext = 0, g_relLateAccepted = 0, g_relAckWrongSender = 0, g_relAckStale = 0, g_relAckUnknown = 0;
 long long g_relDupAck = 0, g_relNotMine = 0, g_relLogged = 0, g_relWorldCleared = 0;   /* T-650 fold 1: cornerGiver / cornerRecv went with both corner rules */
 long long g_relSkipOffThread = 0, g_relSkipUnread = 0, g_relSkipPlayer = 0, g_relSkipNotAnnounced = 0, g_relSkipInFlight = 0, g_relFlightNotTaken = 0, g_relFlightAbandoned = 0;
+/* the people a same-id retire withdraws (handoff.h SameIdWithdrawMark): uid -> kSameIdYield / kSameIdReload, at most kSameIdWdCap (a uid
+   not marked when full goes the release road). g_relSkipYield / g_relSkipReload: their put-aways not offered, by kind; g_relFlightSameId:
+   their held UNLOADs sent at the flight's end; g_sameIdWdMarked / g_sameIdWdFull: marked, refused for the cap */
+static std::map<unsigned int, int> g_sameIdWd;
+static const size_t kSameIdWdCap = 512;
+static long long g_relSkipYield = 0, g_relSkipReload = 0, g_relFlightSameId = 0, g_sameIdWdMarked = 0, g_sameIdWdFull = 0;
 /* the receiver side: offers read and each member's verdict; REVOKEs read and what they did */
 long long g_relInOffers = 0, g_relInAdopted = 0, g_relInDup = 0, g_relInDropped = 0, g_relInStale = 0, g_relInDeferred = 0;
 long long g_relInRevokes = 0, g_relInPuppeted = 0, g_relInRemoved = 0, g_relInRevokeIgnored = 0;
@@ -658,6 +664,7 @@ static void ReleaseForgetDrain()
     for (std::map<unsigned int, ReleaseRec>::const_iterator it = g_release.begin(); it != g_release.end(); ++it)
         DebugLog("[RELEASE] id=" + N((long long)it->first) + " END cleared by the world teardown (" + N((long long)it->second.mem.size()) + " member(s) open)");
     g_release.clear(); g_relBatch.clear(); g_relLate.clear(); g_squadIdx.clear(); g_idxOf.clear(); g_keptRecent.clear(); g_keyCache.clear(); g_keepNoted.clear(); g_niwNoted.clear(); g_forcedTry.clear();   /* [a1b2f1-hd3]; T-650 fold 1: the forced hand-over's notes and back-offs */
+    g_sameIdWd.clear();   /* the same-id retire's marks name uids of the world being freed */
     /* [a1b2f2-hd3] [review G2]: the REVOKEs waiting to be applied and owed to be sent name uids of the world being freed - never applied in the next */
     const long long rw = (long long)g_relRevokeWait.size(), ro = (long long)g_relRevokeOwed.size();
     g_relRevokeWait.clear(); g_relRevokeOwed.clear(); g_relRevokeWaitWorldCleared += rw; g_relRevokeOwedWorldCleared += ro;
@@ -1285,12 +1292,21 @@ static void ReleaseOpenFromFlight(unsigned int leader, const Pending& p, const s
     for (size_t k = 0; k < p.members.size(); ++k)
     {
         const unsigned int u = p.members[k].uid;
+        std::map<unsigned int, int>::iterator sw = g_sameIdWd.find(u);
+        const int sameIdWd = (sw != g_sameIdWd.end()) ? 1 : 0;
+        if (sameIdWd != 0) g_sameIdWd.erase(sw);   /* its flight ends here: the mark leaves */
         if (std::find(taken.begin(), taken.end(), u) != taken.end()) continue;
         if (!net::IsUidMine(u) || Plaus(FindSpawned(u)) || RelHolds(u)) continue;   /* live here: still this game's - the pass decides */
         RelMember rm; rm.m = p.members[k]; rm.baseGen = net::MineGenOf(u);
         std::map<unsigned int, HoKey>::const_iterator kk = p.keyOf.find(u);
         if (kk != p.keyOf.end()) { rm.key = kk->second; rm.hasKey = 1; }
-        if (rm.hasKey == 0)
+        const int fpr = cooplo::FlightPutAwayRoad(sameIdWd, rm.hasKey);
+        if (fpr == cooplo::kFprUnloadSameId)
+        {   /* a same-id retire withdrew it: another game runs this person - its held UNLOAD goes, never offered */
+            ++g_relFlightSameId; WithdrawHeldUnload(u);
+            continue;
+        }
+        if (fpr == cooplo::kFprUnloadNoKey)
         {   /* [a1b2f1-hd11] [review F3]: no squad key - never offered (a re-wake could not cancel it): it sleeps here, its held UNLOAD goes now */
             ++g_relFlightNoKey; IdxKeepKey(u, HoKey(), 0); WithdrawHeldUnload(u);
             continue;
@@ -2063,11 +2079,38 @@ static void P119KeepSample(const std::map<void*, std::vector<unsigned int> >& sq
    the engine squad (ReleaseFlush opens it next frame). No judgement here. Not collected: a person in an XFER awaiting its ACK (the ACK's),
    an off-thread drain (objWhole 0: nothing read), an unreadable object, a player's person, one the other games were never told about
    (nobody holds a copy) - their UNLOAD goes as before. */
+void SameIdWithdrawMark(const unsigned int* uids, int n, int kind)
+{
+    ReleaseForgetDrain();   /* a teardown's pending clean-up runs now, never between these marks and the retire's put-aways */
+    for (int i = 0; i < n; ++i)
+    {
+        const unsigned int u = uids[i];
+        if (u == 0 || !net::IsUidMine(u)) continue;
+        if (g_sameIdWd.find(u) == g_sameIdWd.end() && g_sameIdWd.size() >= kSameIdWdCap) { ++g_sameIdWdFull; continue; }
+        g_sameIdWd[u] = kind; ++g_sameIdWdMarked;
+    }
+}
+void SameIdWithdrawDone()
+{
+    for (std::map<unsigned int, int>::iterator it = g_sameIdWd.begin(); it != g_sameIdWd.end(); )
+    {
+        /* kept only for a person whose body the retire put away while its XFER is in flight (ReleaseOpenFromFlight drops it); a person
+           the retire did not put away loses the mark, so a later ordinary put-away is offered as usual */
+        if (HandoffPendingHas(it->first) && !Plaus(FindSpawned(it->first))) ++it; else g_sameIdWd.erase(it++);
+    }
+}
 void ReleaseOnPutAway(unsigned int uid, const void* obj, int objWhole)
 {
     ReleaseForgetDrain();
     if (uid == 0 || !net::IsUidMine(uid)) return;
-    if (cooplo::PutAwayDuringFlight(HandoffPendingHas(uid) ? 1 : 0) == cooplo::kPadLeaveToAck) { ++g_relSkipInFlight; return; }
+    const std::map<unsigned int, int>::const_iterator sw = g_sameIdWd.find(uid);
+    const int padRoad = cooplo::PutAwayRoad(sw != g_sameIdWd.end() ? 1 : 0, HandoffPendingHas(uid) ? 1 : 0);
+    if (padRoad == cooplo::kPadUnloadSameId)
+    {   /* a same-id retire withdrew it: the other game runs this person - unloaded, never offered */
+        if (sw->second == kSameIdReload) ++g_relSkipReload; else ++g_relSkipYield;
+        return;
+    }
+    if (padRoad == cooplo::kPadLeaveToAck) { ++g_relSkipInFlight; return; }
     /* [a1b2f1-hd14] [review F5]: a person not offered stays in this game's world data only - kept here (its key from the body when whole,
        else the 1 Hz cache), so a partly given squad is never treated as wholly given */
     if (objWhole == 0) { ++g_relSkipOffThread; IdxKeep(uid, 0); return; }
@@ -2172,8 +2215,9 @@ std::string HandoffReleaseReportToken()
            + "," + N(g_relWorldCleared) + "," + N(g_relLogged)
            + " releaseHolder[offer,none,hold,keep,keepUnknown,leave,notInWorld,backoff]=" + N(g_holderOffer) + "," + N(g_holderNone) + "," + N(g_holderHold) + "," + N(g_holderKeep)
            + "," + N(g_holderKeepUnknown) + "," + N(g_holderLeave) + "," + N(g_holderNotInWorld) + "," + N(g_holderBackoff)
-           + " releaseSkip[inFlight,offThread,unread,player,notAnnounced]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer) + "," + N(g_relSkipNotAnnounced)
-           + " releaseFlight[notTaken,abandoned]=" + N(g_relFlightNotTaken) + "," + N(g_relFlightAbandoned)
+           + " releaseSkip[inFlight,offThread,unread,player,notAnnounced,yield,reloadRetire]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer) + "," + N(g_relSkipNotAnnounced) + "," + N(g_relSkipYield) + "," + N(g_relSkipReload)
+           + " releaseFlight[notTaken,abandoned,sameIdUnload]=" + N(g_relFlightNotTaken) + "," + N(g_relFlightAbandoned) + "," + N(g_relFlightSameId)
+           + " sameIdWithdrawn[marked,full,open]=" + N(g_sameIdWdMarked) + "," + N(g_sameIdWdFull) + "," + N((long long)g_sameIdWd.size())
            + " releaseIn[offers,adopted,dup,dropped,stale,deferred,revokes,puppeted,removed,revokeIgnored]=" + N(g_relInOffers) + "," + N(g_relInAdopted) + "," + N(g_relInDup) + "," + N(g_relInDropped)
            + "," + N(g_relInStale) + "," + N(g_relInDeferred) + "," + N(g_relInRevokes) + "," + N(g_relInPuppeted) + "," + N(g_relInRemoved) + "," + N(g_relInRevokeIgnored)
            + " index[given,asleepHere,noKey,givenClearedByOwnerUnload]=" + N(g_idxGiven) + "," + N(g_idxAsleepHere) + "," + N(g_idxNoKey) + "," + N(g_idxClearedByOwnerUnload) + " givenKeptOnAnnounce=" + N(g_idxKeptOnAnnounce)
@@ -2273,8 +2317,8 @@ void ReportHandoff()
              + "," + N(g_holderKeepUnknown) + "," + N(g_holderLeave) + "," + N(g_holderNotInWorld) + "," + N(g_holderBackoff)
              + " keep[notKeep,asleepNoKeep,readFailTake,readFailForced,forcedListed]=" + N(g_keepNotKeep) + "," + N(g_keepAsleepNoKeep) + "," + N(g_keepReadFailTake)
              + "," + N(g_keepReadFailForced) + "," + N(g_keepForcedListed)
-             + " releaseSkip[inFlight,offThread,unread,player,notAnnounced]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer)
-             + "," + N(g_relSkipNotAnnounced)
+             + " releaseSkip[inFlight,offThread,unread,player,notAnnounced,yield,reloadRetire]=" + N(g_relSkipInFlight) + "," + N(g_relSkipOffThread) + "," + N(g_relSkipUnread) + "," + N(g_relSkipPlayer)
+             + "," + N(g_relSkipNotAnnounced) + "," + N(g_relSkipYield) + "," + N(g_relSkipReload)
              + " release[sent,adopted,asleep]=" + N(g_relSent) + "," + N(g_relAdopted) + "," + N(g_relAsleep) + " releaseOpen=" + N((long long)g_release.size()));
     SW_DEVLOG("[VERDICT] {" + q + "ev" + q + ":" + q + "xfer_report" + q + "," + q + "xferOut" + q + ":" + N(g_xferOut) + "," + q + "ackIn" + q + ":" + N(g_ackIn) + "," + q + "released" + q + ":" + N(g_released)
              + "," + q + "abandoned" + q + ":" + N(g_xferAbandoned) + "," + q + "xferIn" + q + ":" + N(g_xferIn) + "," + q + "taken" + q + ":" + N(g_taken) + "," + q + "ackOut" + q + ":" + N(g_ackOut) + "," + q + "pending" + q + ":" + N((long long)g_pending.size()) + "}");

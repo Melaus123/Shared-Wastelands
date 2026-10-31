@@ -28,6 +28,7 @@
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "playerfaction.h"
 #include "../common/teamally.h"   /* T-546 (owner 512): the team pair - ally / not-enemy as for one faction */
+#include "../common/peacegate.h"   /* owner 1205 a: the gate's plain and fight forms */
 #include "coop_log.h"
 #include "game/GameWorld.h"
 #include "game/Faction.h"
@@ -112,6 +113,16 @@ IsAllyFn  orig_isAlly  = 0;
 /* THE GATE. 0 = the engine answers, unmodified. Written only by SetPeaceOn (main thread), read by the two
    detours on the AI worker thread. */
 volatile LONG g_peaceOn = 0;
+/* Owner 1205 a - THE FIGHT FORM (TEST-ONLY, `peace fight <faction>[,<faction>]`). 0 = plain peace. Written only by the main thread
+   (PeaceFightLever / SetPeaceOn): turning it on writes the exempt cells first and the flag after, turning it off clears the flag
+   first and the cells after, so a detour that read the flag on never sees a half-written list. The cells are compared, never
+   followed. fightPlayers / fightExempt count the gate's "not covered" answers for a pair of two player-side characters and for a
+   pair whose non-player side is exempt. */
+volatile LONG g_peaceFight = 0;
+void* volatile g_peaceExempt[swpeacegate::kExemptCells] = { 0, 0, 0, 0 };
+volatile LONG g_peaceExemptHeld = 0;
+volatile LONG64 g_fightPlayers = 0, g_fightExempt = 0;
+long long g_fightEdges = 0;
 
 /* The counters. Every one of them is touched from the AI worker thread, so every one is interlocked and none of
    them is a std::string. What each MEASURES is spelled out in ReportPeace's own line, because
@@ -224,9 +235,10 @@ int ReadBytesPod(const void* p, unsigned char* out, unsigned n)
    stand-in for the other player), 0 = it definitely is not, -1 = a read gave doubt.
    The faction is read through the object's OWN vtable slot +0x58 - the same call the original already makes -
    so the detour dereferences nothing the callee would not. AI-THREAD SAFE: no allocation, no string, no lock. */
-int PlayerFactionSidePod(void* obj)
+int PlayerFactionSidePod(void* obj, void** factionOut)
 {
     void* f = 0;
+    *factionOut = 0;
     __try
     {
         if (obj == 0) return 0;                       /* the engine's own first statement is: if (!who) return false */
@@ -240,6 +252,7 @@ int PlayerFactionSidePod(void* obj)
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     if (f == 0) return 0;
     if (!PlausiblePtr(f)) return -1;
+    *factionOut = f;   /* compared against the fight form's exempt cells only, never followed there */
     int isPlayer = 0;
     __try { isPlayer = (*(void**)((char*)f + 0x250) != 0) ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
@@ -249,15 +262,22 @@ int PlayerFactionSidePod(void* obj)
 }
 
 /* ONE predicate, asked by BOTH detours, so the two cannot be kept in step by hand and drift apart (lesson 11).
-   1 = the lever's gate is met, 0 = it is not, -1 = doubt (fail open to the engine's own answer). */
+   1 = the lever's gate is met, 0 = it is not, -1 = doubt (fail open to the engine's own answer).
+   The decision is swpeacegate::Decide (src/common/peacegate.h). Plain peace reads the second side only when the first is not
+   player-side, as it always has; the fight form (owner 1205 a) needs both sides and their factions. ANY THREAD: the flag is read
+   once, the exempt cells are pointer compares. */
 int PeaceGate(void* self, void* who)
 {
-    const int a = PlayerFactionSidePod(self);
-    if (a == 1) return 1;
-    const int b = PlayerFactionSidePod(who);
-    if (b == 1) return 1;
-    if (a < 0 || b < 0) return -1;
-    return 0;
+    const int fight = (g_peaceFight != 0) ? 1 : 0;
+    void* fa = 0; void* fb = 0;
+    const int a = PlayerFactionSidePod(self, &fa);
+    if (a == 1 && fight == 0) return 1;
+    const int b = PlayerFactionSidePod(who, &fb);
+    int why = swpeacegate::kWhyNone;
+    const int gate = swpeacegate::Decide(a, b, fa, fb, fight, g_peaceExempt, swpeacegate::kExemptCells, &why);
+    if (why == swpeacegate::kWhyPlayers) ::InterlockedIncrement64(&g_fightPlayers);
+    else if (why == swpeacegate::kWhyExempt) ::InterlockedIncrement64(&g_fightExempt);
+    return gate;
 }
 
 char detour_isEnemy(void* self, void* who, char disguises)
@@ -562,7 +582,75 @@ void InstallPeace()
     InstallHooks();
 }
 
+/* Owner 1205 a: the fight form off - the flag first, then the cells (see g_peaceFight). MAIN THREAD. */
+static void PeaceFightClear()
+{
+    if (g_peaceFight == 0 && g_peaceExemptHeld == 0) return;
+    ::InterlockedExchange(&g_peaceFight, 0);
+    swpeacegate::CellsWrite(g_peaceExempt, swpeacegate::kExemptCells, 0, 0);
+    ::InterlockedExchange(&g_peaceExemptHeld, 0);
+    DebugLog("[PEACE] fight form off - plain peace (or none) again: every pair with a player-side character is covered while the lever is on");
+}
+
+static void SetPeaceOnImpl(bool on);
+
 void SetPeaceOn(bool on)
+{
+    PeaceFightClear();   /* `peace on` is plain peace and `peace off` ends both forms */
+    SetPeaceOnImpl(on);
+}
+
+std::string PeaceFightLever(const std::string& listIn)
+{
+    std::vector<std::string> names;
+    {
+        std::string cur;
+        for (size_t i = 0; i <= listIn.size(); ++i)
+        {
+            if (i == listIn.size() || listIn[i] == ',')
+            {
+                const size_t s = cur.find_first_not_of(" \t"), e = cur.find_last_not_of(" \t");
+                if (s != std::string::npos) names.push_back(cur.substr(s, e - s + 1));
+                cur.clear();
+            }
+            else cur += listIn[i];
+        }
+    }
+    if (names.size() > (size_t)swpeacegate::kExemptCells)
+        return "error peace fight: at most " + S((long long)swpeacegate::kExemptCells) + " factions, comma-separated";
+    if (!PlausiblePtr(coop::GameWorldPtr()) || !PlausiblePtr(coop::GameWorldPtr()->factionDirectory))
+        return "error peace fight: no world (the faction names are looked up in the loaded world)";
+    void* found[swpeacegate::kExemptCells] = { 0, 0, 0, 0 };
+    std::string listed;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        ::Faction* f = coop::GameWorldPtr()->factionDirectory->findFactionByName(names[i]);   /* as `spawnfaction` resolves its name */
+        if (!PlausiblePtr(f))
+        {
+            ErrorLog("[PEACE] peace fight REFUSED: '" + names[i] + "' did not resolve to a faction - nothing changed (the 'factions' command lists real names)");
+            return "error peace fight: '" + names[i] + "' did not resolve";
+        }
+        if (coop::IsPlayerFaction(f) || coop::IsStandInFaction(f))
+        {
+            ErrorLog("[PEACE] peace fight REFUSED: '" + names[i] + "' is a player-side faction - the exempt list names the run's opponent - nothing changed");
+            return "error peace fight: '" + names[i] + "' is a player-side faction";
+        }
+        found[i] = f;
+        listed += (listed.empty() ? "" : ", ") + names[i];
+    }
+    /* the cells first, then the flag (g_peaceFight) */
+    const int held = swpeacegate::CellsWrite(g_peaceExempt, swpeacegate::kExemptCells, found, (int)names.size());
+    ::InterlockedExchange(&g_peaceExemptHeld, (LONG)held);
+    if (g_peaceFight == 0) ++g_fightEdges;
+    ::InterlockedExchange(&g_peaceFight, 1);
+    DebugLog("[PEACE] fight form on (TEST-ONLY, owner 1205 a): exempt=" + S((long long)held) + " [" + listed + "]."
+             " Covered as plain peace EXCEPT two player-side characters (they fight as the engine decides) and a pair whose"
+             " non-player side's faction is exempt (the run's own opponent).");
+    SetPeaceOnImpl(true);
+    return "ok peace fight exempt=" + S((long long)held);
+}
+
+static void SetPeaceOnImpl(bool on)
 {
     const bool was = (g_peaceOn != 0);
     ::InterlockedExchange(&g_peaceOn, on ? 1 : 0);
@@ -601,7 +689,11 @@ void ReportPeace()
              + " hooks(treatsAsEnemy,isAlly)=" + S((long long)g_enemyHook) + "," + S((long long)g_allyHook)
              + " onEdges=" + S(g_onEdges) + " offEdges=" + S(g_offEdges) + " walks=" + S(g_walks)
              + " walksWithNoWorld=" + S(g_walkNoWorld)
+             + " fight[on,exempt,players,exemptPairs,edges]=" + S((long long)(g_peaceFight != 0 ? 1 : 0)) + "," + S((long long)g_peaceExemptHeld)
+             + "," + S((long long)g_fightPlayers) + "," + S((long long)g_fightExempt) + "," + S(g_fightEdges)
              + PeaceTeamTokens()
+             + "  |  fight[...]: the TEST-ONLY fight form (owner 1205 a); players and exemptPairs are gate answers 'not covered' for two"
+               " player-side characters and for a pair whose non-player side is exempt - both are inside neitherSidePlayer."
              + "  |  team[...]: this game's player faction and its teammates' factions are answered ally / not-enemy for each other"
                " before the engine is asked, as it answers one faction (T-546, owner 512); held = factions in the team set (0 = no team)."
              + "  |  peace[on,queriesAnswered,hostileSuppressed,allyForced,fallthrough]."

@@ -101,6 +101,25 @@ const unsigned int kInnerMeleeDecided = 77;
 /* T-889 step 2: ITEM_HANDOVER - QUERY / VERDICT / CLOSED about one item hand-over's record line (src/common/handrec.h), to one player by
    slot; its handler takes each kind only from the player the line names. net/transport.h number; store.cpp asserts it. */
 const unsigned int kInnerItemHandover = 79;
+/* T-1101 step 5: BLOCK_PICK - the defender's owner's block-pose pick for its own character, on the character stream's road
+   (AREA, like SWING); its handler takes it only for an attacker the receiving game runs, from the game that runs the defender
+   (RemoteMayWrite). net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerBlockPick = 80;
+/* SWING_END - the owner's swing of a character ended; on the character stream's road (AREA, like SWING) and through its
+   relayed-owner gate (liverelay.h CharStreamNeedsOwnerGate). net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerSwingEnd = 81;
+/* SHOT_FIRED - the shooter's game's word that its character fired one bolt, on the character stream's road (AREA, like SWING);
+   its handler takes it only for a shooter the receiving game does not run, from the game that runs it (RemoteMayWrite).
+   net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerShotFired = 82;
+/* T-1101 design (c) build A: FIGHT_CHOICE - the owner's fight decide step's choice for its own player character, on the character
+   stream's road (AREA) and lane like SWING and through its relayed-owner gate (liverelay.h CharStreamNeedsOwnerGate); its handler
+   takes it only for a copy here (src/common/fightchoice.h). net/transport.h number; store.cpp asserts it. */
+const unsigned int kInnerFightChoice = 83;
+/* HAND - the game that runs a character says what its hands hold, on the character stream's road (AREA, like SWING); its handler
+   takes it only for a character the receiving game does not run, from the game that runs it (RemoteMayWrite). net/transport.h
+   number; store.cpp asserts it. */
+const unsigned int kInnerHand = 84;
 
 struct LiveUp
 {
@@ -403,7 +422,12 @@ inline bool LiveInnerAccepted(unsigned int t)
         || t == kInnerTownPrices   /* taken only from the price source (items.cpp PtNote) */
         || t == kInnerKeeperRestock   /* written only for a leader the receiving game runs (handoff.cpp) */
         || t == kInnerMeleeDecided   /* applied only to a victim the receiving game runs, from the attacker's game (combat.cpp) */
-        || t == kInnerItemHandover;   /* T-889 step 2: taken only from the player the hand-over line names (items.cpp ApplyItemHandover) */
+        || t == kInnerItemHandover   /* T-889 step 2: taken only from the player the hand-over line names (items.cpp ApplyItemHandover) */
+        || t == kInnerBlockPick   /* T-1101 step 5: taken only for an attacker the receiving game runs, from the defender's game */
+        || t == kInnerShotFired   /* taken only for a copy of the shooter, from the game that runs it (combat.cpp) */
+        || t == kInnerHand   /* taken only for a copy of the character, from the game that runs it (combat.cpp) */
+        || t == kInnerSwingEnd   /* the relayed-owner gate, as SWING */
+        || t == kInnerFightChoice;   /* the relayed-owner gate, as SWING; applied only to a copy here (combat.cpp) */
 }
 
 /* M7b slice 2 fold 1: the relayed types that WAIT in the arrival queue while this game has no running world (store.cpp), as they

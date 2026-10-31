@@ -163,6 +163,7 @@
 #include "../common/fallenwire.h"   /* T-556: FALLEN (61) - each profile's fallen list, and a named character brought back - the SAME header the plugin and the offline suite compile */
 #include "../common/owedpop.h"   /* T-581: OWED (63) - the owed town populations; the SAME header the game and the offline suite compile */
 #include "../common/squadbirth.h"   /* a squad's birth flag: the RECORD flags bits, the index line's field 16, the discard delete's judgement */
+#include "../common/squadwriterreg.h"   /* T-1084 step 5: the per-squad writer register - SQUAD_TAKE / SQUAD_WRITER, the index line's field 17 */
 #include "../common/townrefill.h"   /* TOWN_LOSS (64) and RECORD_GONE's town - each town's recorded losses and its one refill; the SAME header the game and the offline suite compile */
 #include "../common/factionkey.h"   /* a position update re-keys a row's faction from a displayed name to its game-data code */
 #include "../common/worldkeep.h"   /* the rolling .1 backups, the start-up slots.txt shrink check, the world export manifest and the alias table */
@@ -182,14 +183,19 @@
 #include "../common/piecerec.h"   /* one built piece as one record, piece.<sx>.<sy>.<sid>.<x10>.<z10>.<y10>: its format and the rule that takes it */
 #include "../common/shoprec.h"    /* one shop building's restock state as one record, shop.<sx>.<sy>.<sid>.<x10>.<z10>: its format and the rule that takes it */
 #include "../common/arearec.h"   /* T-1084 step 3: AREA_RECORDED (83) - the area-recorded marks, their wire and the holder rule */
+#include "../common/townverwire.h"   /* TOWN_VER (87): one town version per placed town, the revision rule */
 #include "../common/zonerec.h"   /* T-609 part 2 (W): a zone record, zone.<X>.<Y>, is taken only from its area's holder */
 #include "../common/dupsquad.h"   /* the duplicate report: each squad record's members grouped by the strict key, read only */
 
 namespace {
 
-const unsigned int kProtocol = 121;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 125;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_HOST_TOKEN = 68, MSG_KEPT = 69, MSG_GROUND_REFUSE = 71, MSG_BOX_REFUSE = 72, MSG_MONEY_SEND = 73, MSG_MONEY_SENT_OK = 74, MSG_MONEY_DELIVER = 75, MSG_MONEY_APPLIED = 76, MSG_MONEY_REFUSE = 77, MSG_PIECE_REFUSE = 79, MSG_BOX_TAKEN = 80, MSG_BOX_ASK = 81, MSG_BOX_ASKED = 82 };   /* T-810: MONEY (73-77) - src/common/moneywire.h */
 const int MSG_AREA_RECORDED = 83;   /* T-1084 step 3 (protocol 121): AREA_RECORDED, up MARK / down LIST, MARK - src/common/arearec.h */
+const int MSG_SQUAD_TAKE = 84, MSG_SQUAD_WRITER = 85, MSG_SQUAD_RELEASE = 86;   /* T-1084 step 5 (protocol 122): a take up, the writer register's answer down, the writer's release up - src/common/squadwriterreg.h */
+const int MSG_TOWN_VER = 87;   /* up WRITE, down STORED / REFUSED - src/common/townverwire.h */
+typedef char TownVerNumbersAgree[(MSG_TOWN_VER == (int)cooptv::kMsgTownVer && kProtocol == cooptv::kTvProtocol) ? 1 : -1];   /* a compile error here = townverwire.h and this file disagree */
+typedef char SquadWriterNumbersAgree[(MSG_SQUAD_TAKE == (int)sqwreg::kMsgSquadTake && MSG_SQUAD_WRITER == (int)sqwreg::kMsgSquadWriter && MSG_SQUAD_RELEASE == (int)sqwreg::kMsgSquadRelease && kProtocol == sqwreg::kProtocol) ? 1 : -1];   /* a compile error here = squadwriterreg.h and this file disagree */
 const int MSG_SHOW = 78;   /* T-811 (protocol 100): SHOW, down only - src/common/baseshow.h */   /* KEPT (69) - src/common/keptwire.h */   /* AUTH_CHALLENGE / AUTH_PROOF / STEAM_ID / HOST_TOKEN (65-68) - src/common/authproof.h */   /* FALLEN (61) - src/common/fallenwire.h */   /* T-546 step 3 (protocol 72): TEAM (60) - src/common/teamwire.h */   /* M13 (protocol 68): BUNDLE (59) - src/common/sendbundle.h */   /* M8 (protocol 62): PLAYER_GONE (57) {u16 slot} down to every remaining admitted game - src/common/peergone.h */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* 50 is unused (REPAIR, the world repair removed in T-716) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi} (the stamp: the writtenAt of the write it answers), sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
 typedef char T581OwedNumbersAgree[(MSG_OWED == (int)owedpop::kMsgOwed && kProtocol == owedpop::kProtocol) ? 1 : -1];   /* T-581: a compile error here = owedpop.h and this file disagree */
 typedef char TownLossNumbersAgree[(MSG_TOWN_LOSS == (int)townrefill::kMsgTownLoss && kProtocol == townrefill::kProtocol) ? 1 : -1];   /* a compile error here = townrefill.h and this file disagree */
@@ -212,7 +218,7 @@ typedef char M13EnetSizesAgree[(sizeof(ENetProtocolHeader) == coopbundle::kEnetP
 typedef char T313FeedNumbersAgree[(kProtocol == coopfeed::kFeedProtocol && MSG_RECORD_FEED == (int)coopfeed::kMsgRecordFeed && MSG_RECORD == (int)coopfeed::kMsgRecord && MSG_RECORD_GONE == (int)coopfeed::kMsgRecordGone && MSG_DELETED_BITS == (int)coopfeed::kMsgDeletedBits && MSG_UNIQUE_STATE == (int)coopfeed::kMsgUniqueState) ? 1 : -1];   /* T-313: a compile error here = the header and this file disagree */   /* M6 (protocol 60): CATCHUP (56) - src/common/liverelay.h; 54 and 55 are left for M11a (PLAYERS, JOIN_STAGE) */   /* M5a (protocol 59): LIVE (53) - src/common/liveenvelope.h */   /* M4 fold (protocol 58): UID_BLOCK (52) - src/common/uidblock.h */   /* par24: WORLD_REL (51) - src/common/worldrelwire.h */   /* 50 is unused (REPAIR, the world repair removed in T-716) */   /* restore1b1 (protocol 53 since its fold): OWN_HIGH (49) - src/common/restoreguard.h */   /* refill1 (protocol 50): TOWN_BAR (47) - src/common/barwire.h */   /* loot2c (protocol 49): RESEARCH_TAKE (46; 45 before the prof1 merge) - src/common/researchwire.h */   /* loot2b (protocol 47): RESEARCH_BOX (44) - src/common/researchwire.h */   /* B12-b (decision 52, protocol 41 - no further bump): RECORD_SEQ (43) - {str worldId, u32 seq lo, u32 seq hi, u32 stamp lo, u32 stamp hi} (the stamp: the writtenAt of the write it answers), sent to THE WRITER ALONE the moment this notebook has committed its record and stamped the number. It carries no payload and may not create a record on the receiving side; it exists so a game's cached seq for a key IT wrote is not one behind, which is what made a later queued change to that key read as another writer's. */   /* B10-b (review-b10 M-7): REFUSE (42) - {u32 this store's protocol, u32 the protocol the game sent}. It REPLACES the WELCOME for a game this store does not speak; no records follow it and the peer is disconnected. */   /* E40 / decision 45 */
 
 /* home: the group's home building key (storemeta.h, optional field 15 of a v7 line; RECORD: after the flags byte) */
-struct Record { std::string worldId, squadSid, factionName, town, home; float x, y, z; long long writtenAt, posAt; unsigned owner; bool hasFile; int gone; long long len; unsigned crc; unsigned long long seq; unsigned flags; Record() : x(0), y(0), z(0), writtenAt(0), posAt(0), owner(0), hasFile(false), gone(0), len(0), crc(0), seq(0), flags(0) {} };   /* B12 (decision 52): seq is stamped by THIS process on every record it accepts and is what a game's queued write is conflict-checked against */   /* P8b: len + crc = what the payload file IS, so a torn one can be told from a whole one */
+struct Record { std::string worldId, squadSid, factionName, town, home; float x, y, z; long long writtenAt, posAt; unsigned owner; bool hasFile; int gone; long long len; unsigned crc; unsigned long long seq; unsigned flags; int wslot; unsigned wgen; Record() : x(0), y(0), z(0), writtenAt(0), posAt(0), owner(0), hasFile(false), gone(0), len(0), crc(0), seq(0), flags(0), wslot(-1), wgen(0) {} };   /* wslot / wgen: the squad's registered writer and its generation (squadwriterreg.h; index line field 17), -1 unregistered */   /* B12 (decision 52): seq is stamped by THIS process on every record it accepts and is what a game's queued write is conflict-checked against */   /* P8b: len + crc = what the payload file IS, so a torn one can be told from a whole one */
 std::map<std::string, Record> g_records;
 /* P8d (review-p8c Q1(b) / M-2) - THE SECOND DOOR IS A QUEUE, NOT A DROP. A record whose payload could not
    be read at start is served exactly as the pre-P8b loader served it (its position now, its squad as soon
@@ -1842,6 +1848,83 @@ void OnTownBar(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
     std::vector<char> m;
     if (!coopbar::EncodeBarRows(&m, changed)) { Log("bars: the changed rows did not re-encode - not broadcast"); return; }
     for (size_t p = 0; p < host->peerCount; ++p) { ENetPeer* q = &host->peers[p]; if (q->state == ENET_PEER_STATE_CONNECTED) SendMsg(q, MSG_TOWN_BAR, m); }
+}
+/* ONE TOWN VERSION PER PLACED TOWN (src/common/townverwire.h, TOWN_VER 87), kept in town_versions.txt for this world (it survives
+   every restart). Only the game running a town's area writes. THE REVISION RULE: a write is stored only when its revision is the
+   stored one + 1 (1 when nothing is stored); otherwise the writer is sent the stored record (REFUSED) and takes it. A file on disk
+   that could not be read is never written over: every write is refused this session. A record is never removed. */
+std::map<std::string, cooptv::TownVer> g_townVers;
+int g_townVersLoadBad = 0;
+long long g_townVerStored = 0, g_townVerRefused = 0, g_townVerMalformed = 0, g_townVerWriteFailed = 0, g_townVerUnreadableRefused = 0;
+long long g_townVerNotAdmitted = 0, g_townVerForwarded = 0, g_townVerListsSent = 0;
+std::string TownVersFile() { return g_dir + "\\town_versions.txt"; }
+bool WriteTownVers()
+{
+    if (g_townVersLoadBad) return false;   /* the file is on disk and could not be read at start: rewriting it whole would erase its rows */
+    std::string body;
+    for (std::map<std::string, cooptv::TownVer>::const_iterator it = g_townVers.begin(); it != g_townVers.end(); ++it) body += cooptv::TvFileLine(it->second) + "\n";
+    return WriteWholeFile(TownVersFile(), body);
+}
+void LoadTownVers()
+{
+    g_townVers.clear();
+    const FileProbe up = ProbeFile(TownVersFile());
+    if (up.kind == coopstore::kFileUnreadable)
+    {
+        g_townVersLoadBad = 1;
+        Log("towns: town_versions.txt is ON DISK (" + N(up.attrLen) + " bytes) and could NOT BE READ (error " + N((long long)up.err)
+            + ") - no town version is loaded this session and EVERY TOWN_VER write is REFUSED (nothing is written over the file)");
+        return;
+    }
+    g_townVersLoadBad = 0;
+    if (up.kind != coopstore::kFileReadable) { Log("towns: no town_versions.txt - no placed town has another version yet"); return; }
+    std::istringstream f(TextOf(up)); std::string line; long long n = 0, bad = 0;
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line == "\r") continue;
+        cooptv::TownVer r;
+        if (cooptv::TvParseLine(line, &r)) { g_townVers[r.key] = r; ++n; } else ++bad;
+    }
+    Log("towns: " + N(n) + " town versions loaded from town_versions.txt (" + N(bad) + " unreadable lines skipped)");
+}
+/* every stored record to one game: before its first index page (preload) and in its record feed's first page */
+void TownVersSendAll(ENetPeer* to)
+{
+    for (std::map<std::string, cooptv::TownVer>::const_iterator it = g_townVers.begin(); it != g_townVers.end(); ++it)
+    { std::vector<char> m; if (cooptv::TvEncode(&m, cooptv::kTvStored, it->second)) SendMsg(to, (unsigned char)MSG_TOWN_VER, m); }
+    ++g_townVerListsSent;
+}
+void OnTownVer(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
+{
+    if (SlotOf(from) < 0) { ++g_townVerNotAdmitted; Log("TOWN_VER from " + PeerName(from) + ", a connection with no player slot - ignored"); return; }
+    cooptv::TvMsg m;
+    if (payload.empty() || !cooptv::TvDecode(&payload[0], payload.size(), &m) || m.kind != (unsigned)cooptv::kTvWrite)
+    { ++g_townVerMalformed; Log("malformed TOWN_VER from " + PeerName(from) + " - ignored"); return; }
+    std::map<std::string, cooptv::TownVer>::const_iterator ex = g_townVers.find(m.rec.key);
+    const int have = ex != g_townVers.end() ? 1 : 0;
+    cooptv::TownVer stored; if (have) stored = ex->second; else stored.key = m.rec.key;
+    if (g_townVersLoadBad || !cooptv::TvAccept(have, stored.rev, m.rec.rev))
+    {
+        if (g_townVersLoadBad) ++g_townVerUnreadableRefused; else ++g_townVerRefused;
+        std::vector<char> rb; if (cooptv::TvEncode(&rb, cooptv::kTvRefused, stored)) SendMsg(from, (unsigned char)MSG_TOWN_VER, rb);
+        Log("TOWNVER REFUSED '" + SanitizeForLog(m.rec.key) + "' rev " + N((long long)m.rec.rev) + " from " + PeerName(from) + " slot " + N((long long)SlotOf(from))
+            + " - the stored revision is " + N((long long)stored.rev) + (g_townVersLoadBad ? " (town_versions.txt is unreadable this session)" : "")
+            + "; the stored record was sent back");
+        return;
+    }
+    cooptv::TownVer r = m.rec; r.slot = SlotOf(from);
+    g_townVers[r.key] = r;
+    if (!WriteTownVers()) { ++g_townVerWriteFailed; Log("towns: town_versions.txt could NOT be written - the record is held in memory and forwarded"); }
+    ++g_townVerStored;
+    std::vector<char> fw;
+    if (cooptv::TvEncode(&fw, cooptv::kTvStored, r))
+        for (size_t i = 0; i < host->peerCount; ++i)
+        {
+            ENetPeer* p = &host->peers[i];
+            if (cooptv::TvForwardTo(p->state == ENET_PEER_STATE_CONNECTED ? 1 : 0, p == from ? 1 : 0, FeedOn(p) ? 1 : 0) && SendMsg(p, (unsigned char)MSG_TOWN_VER, fw)) ++g_townVerForwarded;
+        }
+    Log("TOWNVER '" + SanitizeForLog(r.key) + "' -> ver '" + SanitizeForLog(r.ver) + "' fac '" + SanitizeForLog(r.fac) + "' rev " + N((long long)r.rev)
+        + " slot " + N((long long)r.slot) + " (from " + PeerName(from) + "; stored " + N(g_townVerStored) + ", refused " + N(g_townVerRefused) + ", forwarded " + N(g_townVerForwarded) + ")");
 }
 /* EACH TOWN'S RECORDED LOSSES AND ITS ONE REFILL (src/common/townrefill.h). town_losses.txt holds one line per town, keyed by the
    town's FCS stringID: how many of its groups were deleted here, and whether the game holding it has refilled its buildings once
@@ -4131,6 +4214,7 @@ std::string HX8(unsigned v) { char b[16]; sprintf(b, "%08x", v); return b; }
 std::string WriteQueueToken();   /* M14: defined with the writer thread, below */
 std::string SendBoundToken();    /* M16: defined after the write gate, below */
 std::string BundleToken();       /* M13: defined after the write gate, below */
+std::string SquadWriteToken();   /* T-1084 step 5: defined with the writer register, below */
 std::string TickToken();   /* M15: defined with the loop's wait, below */
 /* T-999 fold 2: a refused discard delete is HELD and judged again (squadbirth.h PendingDiscardStep) when its area's holder changes
    (WriteAreasNow), when a game's report drops the area (LiveAreasReport) and when a game's link closes; applied when the judge says
@@ -4151,6 +4235,7 @@ std::string SquadDeleteBySlotText()
 }
 long long g_discardApplied = 0, g_discardRefused = 0, g_discardRefusedLoaded = 0;   /* discard deletes (squadbirth.h): taken / refused while another game held or had loaded the record's area / of those, refused for another game's loaded area */
 std::string ZoneCounters();   /* T-609 part 2 (W): defined with the zone holder rule, below */
+std::string OwedReopenToken();   /* the REOPEN verdicts, defined with the owed rows below */
 long long g_earlierCarried = 0, g_earlierLeft = 0;   /* CarryEarlierNames: pairs moved to the names FileName gives / pairs left */
 long long g_earlierSkipped = 0;   /* index files the two index walks passed over: under their id's earlier name */
 void LogStoreCounters()
@@ -4286,7 +4371,9 @@ void LogStoreCounters()
         /* M13: what bundling did - see BundleToken. */
         + BundleToken()
         /* T-609 part 2 (W), fold 1 (F7): the zone records taken and refused by the holder rule, on every counters line */
-        + " " + ZoneCounters());
+        + " " + ZoneCounters() + OwedReopenToken()
+        /* T-1084 step 5: the squad records' writer register - see SquadWriteToken */
+        + " " + SquadWriteToken());
 }
 /* P8d (review-p8c M-3), replacing P8c's sentence, whose arithmetic did not mean what it said. `loaded -
    positionOnly` counts every record whose LINE claims a squad - which includes every refused and every
@@ -4580,6 +4667,7 @@ void MetaFromRecord(const Record& r, coopstore::MetaLine* m)
     m->len = r.len; m->crc = r.crc;
     m->home = r.home;   /* written as field 15 only when there is one */
     m->birth = sqbirth::BirthOfFlags(r.flags);   /* field 16, only when the squad's birth flag is known */
+    m->wslot = r.wslot; m->wgen = r.wgen;   /* field 17, only when the squad has a registered writer */
 }
 void RecordFromMeta(const coopstore::MetaLine& m, Record* r)
 {
@@ -4598,6 +4686,7 @@ void RecordFromMeta(const coopstore::MetaLine& m, Record* r)
     r->seq = m.seq;   /* B12: 0 for a v6 line and below - the notebook stamped nothing before format 7 */
     r->home = m.home;   /* "" for a line without field 15 */
     r->flags = (r->flags & ~sqbirth::kRecBirthMask) | sqbirth::FlagsOfBirth(m.birth);   /* the birth bits the line keeps (field 16); none = unknown */
+    r->wslot = m.wslot; r->wgen = m.wgen;   /* the registered writer (field 17); a line without it is unregistered */
     r->gone = 0;        // decision 28: a v3 line from the superseded build is read as live
     r->hasFile = false; // set by the caller once the payload has been judged
 }
@@ -4694,7 +4783,7 @@ int PositionRotateMode(const Record& r) { return r.len > 0 ? kRotateNone : kRota
    STILL ON THE LOOP (M14 LEFTOVER): the whole-file rewrites of the small non-record files (options, uniques,
    bits, clock, areas, slots, ...), whose callers act on the result at once. */
 enum { kJobCommit = 0, kJobDelete = 1 };
-enum { kFromSquad = 0, kFromPosition = 1, kFromHeldPosition = 2, kFromDelete = 3 };
+enum { kFromSquad = 0, kFromPosition = 1, kFromHeldPosition = 2, kFromDelete = 3, kFromWriterMark = 4 };   /* kFromWriterMark: a squad's new registered writer, the index line only (T-1084 step 5) */
 struct WriteJob
 {
     int kind, from; std::string key, gate;   /* key = the record id (its files); gate = coopwq::GateKey(key), what the per-file gate is keyed on (M14 fold) */
@@ -6206,6 +6295,7 @@ void LoadIndex()
     LoadResearch();   /* loot2b: research_boxes.txt */
     LoadTakes();      /* loot2c: research_takes.txt */
     LoadBars();   /* refill1: town_bars.txt */
+    LoadTownVers();   /* town_versions.txt: one town version per placed town */
     LoadTownLosses();   /* town_losses.txt: each town's recorded losses and its refilled flag */
     LoadKept();   /* kept-pieces.txt and kept-state.txt: the players' pieces a reset kept, and how far each is laid back */
     LoadTowns();   /* player-towns.txt and kept-towns.txt: the outposts the players said they hold, and the ones a reset kept */
@@ -6411,21 +6501,98 @@ void AnnounceAuthority(ENetHost* host)
     Log("authority: the operator is '" + (g_ownerId.empty() ? std::string("(nobody yet)") : g_ownerId) + "' (decision 49)");
 }
 
-void OnDeletedBits(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
+/* T-1084 step 5: the writer register's counters (squadWrite[...] on the REPORT line, SquadWriteToken) - defined here, above their first
+   use in OnDeletedBitsFrom; the register itself is defined beside OnRecordGoneFrom. LOOP THREAD. */
+long long g_swTaken = 0, g_swWriter = 0, g_swTakeover = 0, g_swRefusedNotWriter = 0, g_swRefusedOldGen = 0, g_swNoHolderPos = 0, g_swRefusedPos = 0;
+long long g_swBitsKept = 0, g_swMarkFailed = 0, g_swTakeNoRecord = 0, g_swLines = 0;
+long long g_swBitsHeld = 0, g_swDiscardNotWriter = 0;   /* a DELETED_BITS held behind a write of one of its squad records; a held discard dropped because another game is now the writer */
+long long g_swReleaseTaken = 0, g_swReleaseNotWriter = 0, g_swAskAgainSent = 0, g_swReleaseNoRecord = 0;   /* SQUAD_RELEASE taken / from a game that is not the writer / ASK_AGAIN notes sent / a release of an id with no record */
+long long g_swReleasedByDelete = 0;   /* the writer's own plain or discard delete taken as its release (squadwriterreg.h DeleteReleases) */
+long long g_swReleasedAtLeave = 0, g_swReleasedDeleteRefused = 0;   /* squads marked released at their writer's link close; a released writer's delete refused at once because the held list is full */
+long long g_swDeleteHeld = 0, g_swHeldApplied = 0, g_swHeldDropped = 0, g_swHeldRefused = 0;   /* held deletes (squadwriterreg.h kSwHoldDelete): held / applied later / dropped / refused when another game took the squad */
+/* a released writer's delete held while another live game has the area loaded: keyed by (record id, 1 = a DELETED_BITS number / 0 = RECORD_GONE) */
+struct SwHeldDelete { int sender; std::string senderId, fromName; ENetPeer* peer; unsigned connect; std::vector<char> payload; long long writtenAt; int area; SwHeldDelete() : sender(-1), peer(0), connect(0), writtenAt(0), area(-1) {} };
+std::map<std::pair<std::string, int>, SwHeldDelete> g_swHeldDelete;
+int SwHeldDeleteHold(const std::string& id, int isBits, ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& fromId, const std::vector<char>& payload, int sender);
+void SwHeldDeleteRejudgeAll();
+void SwHeldDeleteRejudgeGate(const std::string& gate);
+void SwHeldDeleteOnReport(const std::set<int>& before, const std::set<int>& after);
+void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId);
+/* one DELETED_BITS number as a message of its own (the payload a held number is judged again with) */
+std::vector<char> SwOneBitPayload(const std::string& fac, size_t byte, int bit)
 {
+    std::vector<char> p; PutStr(&p, fac); PutU32(&p, (unsigned)(byte + 1));
+    std::vector<char> bits(byte + 1, 0); bits[byte] = (char)(1u << bit); p.insert(p.end(), bits.begin(), bits.end());
+    return p;
+}
+std::set<std::string> g_swSaid;   /* "<id>|<verdict>|<kind>": one line each, the first 300 */
+bool SquadRegId(const std::string& id);
+int SquadSenderSlot(ENetPeer* from, unsigned connect, const std::string& fromId);
+int SquadJudge(const std::string& id, int kind, int basis, int sender, float x, float z, unsigned seenGen, sqwreg::WriterRow* after);
+void SquadNoteVerdict(const std::string& id, int verdict, int kind, int basis);
+void OnSquadReleaseFrom(ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId);
+void SquadWriterLinkClosed(int slot);
+void SquadNoteCheck(const std::string& id);   /* the writer notes [t1084i-srv]: defined beside SquadWriterLinkClosed */
+void SquadNoteSlotGone(int slot);
+void SquadNotesPush(ENetPeer* to);
+void SquadRefuse(ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, int verdict, int kind, const sqwreg::WriterRow& row);
+void OnDeletedBitsFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId, int rerun);
+void OnDeletedBits(ENetHost* host, ENetPeer* from, const std::vector<char>& payload) { OnDeletedBitsFrom(host, from, from->connectID, PeerName(from), payload, PeerIdOf(from), 0); }
+/* connect / fromName / fromId as OnRecordFrom's: a DELETED_BITS that newly marks a squad record with a write out is held behind that
+   write (WriterApplyDone) and judged here once it has landed, against the register as it then stands - as RECORD_GONE is. rerun 1 = that
+   held message run again: its trim and its hold were counted when it arrived */
+void OnDeletedBitsFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId, int rerun)
+{
+    const bool liveFrom = from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect;
     std::string fac; size_t at = 0; unsigned n = 0;
-    if (!GetStr(payload, &at, &fac) || !GetU32(payload, at, &n) || payload.size() < at + 4 + n) { Log("malformed DELETED_BITS from " + PeerName(from)); return; }
+    if (!GetStr(payload, &at, &fac) || !GetU32(payload, at, &n) || payload.size() < at + 4 + n) { Log("malformed DELETED_BITS from " + fromName); return; }
     if (!storegate::DeletedBitsFactionOk(fac)) { GateMalformed(from, "DELETED_BITS"); return; }   /* a faction key */
     /* only the first kBitsBytesMax bytes are used: group numbers from 1,048,576 up are ignored on both sides (SplitGroupId), and a
        list from a world made before that bound can be longer - refusing it would refuse that faction's deletions for good */
     const unsigned used = storegate::BitsBytesUsed(n);
-    if (used < n) { ++g_gateBitsTrimmed; if (GateSayOnce(from, 8)) Log("DELETED-BITS '" + SanitizeForLog(fac) + "' from " + PeerName(from) + " is " + N((long long)n) + " bytes - the first " + N((long long)used) + " are used (counted gate[bitsTrimmed])"); }
+    if (used < n && rerun == 0) { ++g_gateBitsTrimmed; if (GateSayOnce(from, 8)) Log("DELETED-BITS '" + SanitizeForLog(fac) + "' from " + fromName + " is " + N((long long)n) + " bytes - the first " + N((long long)used) + " are used (counted gate[bitsTrimmed])"); }
+    std::vector<char> pl(payload);   /* T-1084 step 5: the bits as taken - a newly marked number whose squad record another game writes is left out */
+    {
+        std::vector<std::string> freshIds; std::vector<size_t> freshByte; std::vector<int> freshBit;   /* the squad records this message newly marks */
+        const std::vector<char>& old = g_bits[fac];
+        for (size_t i = 0; i < used; ++i)
+        {
+            const unsigned char fresh = (unsigned char)((unsigned char)pl[at + 4 + i] & (unsigned char)~(i < old.size() ? (unsigned char)old[i] : 0u));
+            if (fresh == 0) continue;
+            for (int k = 0; k < 8; ++k)
+            {
+                if (((fresh >> k) & 1) == 0) continue;
+                const std::string fid = fac + "_" + N((long long)(i * 8 + (size_t)k));
+                if (g_records.find(fid) == g_records.end() || !SquadRegId(fid)) continue;
+                if (g_wqGate.Busy(coopwq::GateKey(fid)))
+                {   /* a write of this record is out (a take-over's line among them): the whole message waits for it, in arrival order */
+                    if (rerun == 0) ++g_swBitsHeld;
+                    WriterHold(fid, MSG_DELETED_BITS, from, connect, fromName, payload, coopwq::kHeldOther, 0, fromId);
+                    return;
+                }
+                freshIds.push_back(fid); freshByte.push_back(i); freshBit.push_back(k);
+            }
+        }
+        const int sender = SquadSenderSlot(from, connect, fromId);
+        for (size_t f = 0; f < freshIds.size(); ++f)
+        {
+            const std::string& id = freshIds[f];
+            const std::map<std::string, Record>::const_iterator sr = g_records.find(id);
+            sqwreg::WriterRow row;
+            const int v = SquadJudge(id, sqwreg::kKindDelete, sqwreg::kBasisNone, sender, sr->second.x, sr->second.z, 0u, &row);
+            if (sqwreg::Takes(v)) continue;
+            pl[at + 4 + freshByte[f]] = (char)((unsigned char)pl[at + 4 + freshByte[f]] & (unsigned char)~(1u << freshBit[f]));
+            if (v == sqwreg::kSwHoldDelete && SwHeldDeleteHold(id, 1, from, connect, fromName, fromId, SwOneBitPayload(fac, freshByte[f], freshBit[f]), sender) != 0) continue;   /* held: not marked now, judged again when the area empties */
+            ++g_swBitsKept;
+            SquadRefuse(from, connect, fromName, id, v == sqwreg::kSwHoldDelete ? (int)sqwreg::kSwRefuseNotWriter : v, sqwreg::kKindDelete, row);
+        }
+    }
     std::vector<char>& b = g_bits[fac]; if (b.size() < used) b.resize(used, 0);
-    for (size_t i = 0; i < used; ++i) b[i] = (char)((unsigned char)b[i] | (unsigned char)payload[at + 4 + i]);
-    WriteBits(fac); Log("DELETED-BITS '" + SanitizeForLog(fac) + "' " + N((long long)used) + " bytes from " + PeerName(from));
-    std::vector<char> fwd(payload.begin(), payload.begin() + at); PutU32(&fwd, used); fwd.insert(fwd.end(), payload.begin() + at + 4, payload.begin() + at + 4 + used);   /* forwarded as used */
+    for (size_t i = 0; i < used; ++i) b[i] = (char)((unsigned char)b[i] | (unsigned char)pl[at + 4 + i]);
+    WriteBits(fac); Log("DELETED-BITS '" + SanitizeForLog(fac) + "' " + N((long long)used) + " bytes from " + fromName);
+    std::vector<char> fwd(payload.begin(), payload.begin() + at); PutU32(&fwd, used); fwd.insert(fwd.end(), pl.begin() + at + 4, pl.begin() + at + 4 + used);   /* forwarded as used (and as taken) */
     std::vector<char> buf(5 + fwd.size()); buf[0] = (char)MSG_DELETED_BITS; unsigned len = (unsigned)fwd.size(); memcpy(&buf[1], &len, 4); memcpy(&buf[5], &fwd[0], fwd.size());
-    for (size_t i = 0; i < host->peerCount; ++i) { ENetPeer* p = &host->peers[i]; if (p->state == ENET_PEER_STATE_CONNECTED && p != from) SbSendRel(p, buf); }
+    for (size_t i = 0; i < host->peerCount; ++i) { ENetPeer* p = &host->peers[i]; if (p->state == ENET_PEER_STATE_CONNECTED && !(liveFrom && p == from)) SbSendRel(p, buf); }   /* a game that has since taken the sender's place is told like any other */
 }
 void UniqueBroadcast(ENetHost* host, ENetPeer* from, const std::string& sid, const UniqueRow& r);
 void OnUniqueState(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
@@ -7201,6 +7368,10 @@ void PendingDiscardRejudgeOne(const std::string& wid)
                                                  sqbirth::PendingDiscardSenderReturned(it->second.senderLeft, senderThere));
     if (step == sqbirth::kPdKeep) return;
     if (step == sqbirth::kPdDrop) { PendingDiscardErase(it); ++g_pdDropped; return; }
+    if (rec != g_records.end() && rec->second.wslot >= 0 && rec->second.wslot != it->second.senderSlot)
+    {   /* T-1084 step 5: another game took the squad over since this delete was held - the delete is not its writer's any more */
+        PendingDiscardErase(it); ++g_pdDropped; ++g_swDiscardNotWriter; return;
+    }
     const PendingDiscard pd = it->second;
     PendingDiscardErase(it);
     g_records.erase(rec);
@@ -7220,6 +7391,7 @@ void PendingDiscardRejudgeArea(int area)
 /* an area's holder changed, or a game's link closed: every held discard delete is judged again (at most kPendingDiscardCap) */
 void PendingDiscardRejudgeAll()
 {
+    SwHeldDeleteRejudgeAll();   /* T-1084 step 5: the held squad deletes are judged at the same events */
     if (g_pendingDiscard.empty()) return;
     std::vector<std::string> ids;
     for (std::map<std::string, PendingDiscard>::const_iterator it = g_pendingDiscard.begin(); it != g_pendingDiscard.end(); ++it) ids.push_back(it->first);
@@ -7229,6 +7401,7 @@ void PendingDiscardRejudgeAll()
    its previous set and not in this one judges the discard deletes held there again */
 void PendingDiscardOnReport(int slot, const std::set<int>& before, const std::set<int>& after)
 {
+    SwHeldDeleteOnReport(before, after);   /* T-1084 step 5: the held squad deletes in the areas this report dropped */
     if (g_pendingDiscard.empty()) return;
     for (std::map<std::string, PendingDiscard>::iterator it = g_pendingDiscard.begin(); it != g_pendingDiscard.end(); ++it)
         if (it->second.senderSlot == slot && it->second.senderLeft == 0 && after.count(it->second.area) == 0) it->second.senderLeft = 1;
@@ -7242,7 +7415,346 @@ void PendingDiscardLinkClosed(int slot)
         if (it->second.senderSlot == slot) it->second.senderLeft = 1;
     PendingDiscardRejudgeAll();
 }
-void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload)
+/* T-1084 STEP 5 - ONE GAME WRITES EACH SQUAD'S RECORD (owner 1158 a). The per-squad writer register: the rules are squadwriterreg.h
+   Judge, read here at the moment of each write against this process's own area table. LOOP THREAD. */
+/* the counters are defined above OnDeletedBitsFrom */
+/* the register's two marks per squad, in memory only (squadwriterreg.h): released - the writer said its engine put the squad away;
+   keeper - the writer registered for a sleeping squad. An id with no entry was registered before this process started (read back from
+   its index line): released until its writer writes it or takes it again. */
+struct SwMarks { int released, keeper, runs; SwMarks() : released(1), keeper(0), runs(0) {} };   /* runs: the note-only mark (squadwriterreg.h RunsAfter) [t1084i-f1-srv] */
+std::map<std::string, SwMarks> g_swMarks;
+std::map<std::string, std::set<int> > g_swRefusedBy;   /* squad id -> the slots refused since its writer last became away: each is told ASK_AGAIN */
+std::map<std::string, int> g_swTakeBasisOut;   /* squad id -> the basis of the take whose index line is being written (WriterApplyOne) */
+std::map<std::string, sqwreg::WriterRow> g_swNoteSent;   /* squad id -> the game running it as last told to every game (squadwriterreg.h writer notes); absent = nobody runs it */
+long long g_swNotesSent = 0, g_swNoteSlotGoneSent = 0, g_swNotePushed = 0;
+std::map<int, double> g_swSlotGoneHold;   /* a closed game's permanent slot -> when its link closed: SLOT GONE waits kGraceSec (SquadNoteSlotGoneTick) */
+long long g_swSlotGoneCancelled = 0, g_swSlotGoneLiveAgain = 0;   /* holds cancelled by the game's return; closes of an old link with the game live again on a newer one */   /* note messages sent; link closes told; RUNS notes in the lists after a WELCOME */
+SwMarks SquadMarksOf(const std::string& id) { const std::map<std::string, SwMarks>::const_iterator m = g_swMarks.find(id); return m == g_swMarks.end() ? SwMarks() : m->second; }
+/* a verdict that took a write moves the marks (squadwriterreg.h ReleasedAfter / KeeperAfter) */
+void SquadNoteVerdict(const std::string& id, int verdict, int kind, int basis)
+{
+    if (!sqwreg::Takes(verdict)) return;
+    const SwMarks was = SquadMarksOf(id);
+    SwMarks now; now.released = sqwreg::ReleasedAfter(verdict, kind, basis, was.released); now.keeper = sqwreg::KeeperAfter(verdict, kind, basis, was.keeper); now.runs = sqwreg::RunsAfter(verdict, kind, basis, was.runs);
+    g_swMarks[id] = now;
+    if (verdict == sqwreg::kSwTakeover || (verdict == sqwreg::kSwTaken && kind == sqwreg::kKindFull)) g_swRefusedBy.erase(id);   /* a new writer: the refusals were of the last one */
+}
+/* a squad group id the register covers: "<faction>_<n>", not a zone, ground, box, piece or shop record */
+bool SquadRegId(const std::string& id)
+{
+    int zx = 0, zy = 0; std::string fac; unsigned n = 0;
+    if (coopgrec::IsGroundRecId(id) || coopbrec::IsBoxRecId(id) || piecerec::IsPieceRecId(id) || shoprec::IsShopRecId(id) || zonerec::ZoneRecIdParse(id, &zx, &zy) != 0) return false;
+    return SplitGroupId(id, &fac, &n);
+}
+/* the sender's slot: its connection while it is still that one, else the slot of the player id it arrived with (a held message) */
+int SquadSenderSlot(ENetPeer* from, unsigned connect, const std::string& fromId)
+{
+    if (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) return SlotOf(from);
+    if (fromId.empty()) return -1;
+    const std::map<std::string, int>::const_iterator s = g_slotById.find(fromId);
+    return s == g_slotById.end() ? -1 : s->second;
+}
+/* 1 = a connected game has this slot; *authority = it is the off-screen authority (PeerIsAuthority, the game the WELCOME names) */
+int SquadSlotLive(int slot, int* authority)
+{
+    if (authority != 0) *authority = 0;
+    if (slot < 0) return 0;
+    for (std::map<ENetPeer*, int>::const_iterator it = g_slot.begin(); it != g_slot.end(); ++it)
+        if (it->second == slot && it->first != 0 && it->first->state == ENET_PEER_STATE_CONNECTED) { if (authority != 0) *authority = PeerIsAuthority(it->first) ? 1 : 0; return 1; }
+    return 0;
+}
+/* 1 = a live game other than sender lists area (sx, sy) in its latest AREAS report */
+int SquadOtherLoaded(int sender, int sx, int sy)
+{
+    for (std::map<ENetPeer*, int>::const_iterator p = g_slot.begin(); p != g_slot.end(); ++p)
+        if (p->second >= 0 && p->second != sender && p->first != 0 && p->first->state == ENET_PEER_STATE_CONNECTED && AreaListedBy(p->second, sx, sy) != 0) return 1;
+    return 0;
+}
+/* the verdict for one write of a squad record; *after = the registration it leaves (unchanged on a refusal). x, z: the write's own
+   position, used only when nothing is stored for the id. */
+int SquadJudge(const std::string& id, int kind, int basis, int sender, float x, float z, unsigned seenGen, sqwreg::WriterRow* after)
+{
+    const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+    sqwreg::WriterRow was;
+    if (it != g_records.end()) { was.slot = it->second.wslot; was.gen = it->second.wgen; }
+    int sx = 0, sy = 0;
+    poskey::SectorOf(it != g_records.end() ? it->second.x : x, it != g_records.end() ? it->second.z : z, &sx, &sy);
+    const std::map<long long, AreaRow>::const_iterator a = g_areas.find((long long)sy * 64 + sx);
+    sqwreg::JudgeIn in;
+    in.kind = kind; in.basis = basis; in.sender = sender; in.seenGen = seenGen;
+    SquadSlotLive(sender, &in.senderAuthority);
+    in.registered = was.slot >= 0 ? 1 : 0; in.writer = was.slot; in.storedGen = was.gen;
+    in.holder = (a == g_areas.end() || zonerec::AreaRowHeld(a->second.ownerId, a->second.owner) == 0) ? -1 : a->second.owner;
+    in.holderLive = in.holder >= 0 ? SquadSlotLive(in.holder, 0) : 0;   /* a claim lingering after its game left, or restored after a restart, is nobody's */
+    in.senderLoadedHere = AreaListedBy(sender, sx, sy);   /* the sender's latest AREAS report lists the area */
+    if (was.slot >= 0)
+    {
+        in.writerLive = SquadSlotLive(was.slot, &in.writerAuthority);
+        const SwMarks mk = SquadMarksOf(id);
+        in.writerReleased = mk.released; in.writerKeeper = mk.keeper;   /* the writer's own events, never its silence */
+        if (a != g_areas.end())
+        {
+            const std::map<int, double>::const_iterator ls = a->second.lastSeen.find(was.slot);
+            in.writerLoadedHere = (ls != a->second.lastSeen.end() && NowSec() - ls->second <= kGraceSec) ? 1 : 0;
+        }
+    }
+    if (kind == sqwreg::kKindDelete && was.slot >= 0 && was.slot == sender && in.writerReleased != 0) in.otherLoadedHere = SquadOtherLoaded(sender, sx, sy);   /* a released writer's delete */
+    const int v = sqwreg::Judge(in);
+    *after = sqwreg::Apply(was, v, kind, sender);
+    return v;
+}
+/* a verdict that took the write, counted once it is acted on */
+void SquadCount(int v)
+{
+    if (v == sqwreg::kSwTaken) ++g_swTaken; else if (v == sqwreg::kSwWriter) ++g_swWriter; else if (v == sqwreg::kSwTakeover) ++g_swTakeover;
+    else if (v == sqwreg::kSwNoHolderPos) ++g_swNoHolderPos;
+}
+void SquadSay(const std::string& id, int verdict, int kind, const std::string& fromName, const sqwreg::WriterRow& row)
+{
+    if (g_swLines >= 300 || !g_swSaid.insert(id + "|" + N((long long)verdict) + "|" + N((long long)kind)).second) return;
+    ++g_swLines;
+    Log("SQUAD " + SanitizeForLog(id) + " " + sqwreg::KindName(kind) + " from " + fromName + " " + sqwreg::VerdictName(verdict) + " (registered writer slot "
+        + N((long long)row.slot) + ", generation " + N((long long)row.gen) + "; the first line per id, verdict and kind, 300 at most; squadWrite[...] on the REPORT line)");
+}
+/* a refusal: counted, logged once per id and kind, answered with SQUAD_WRITER (while the sender is still that connection) and, for a
+   refused write or delete, the record this process holds, so the refused game's rolled-back copy is the world's version */
+void SquadRefuse(ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& id, int verdict, int kind, const sqwreg::WriterRow& row)
+{
+    if (verdict == sqwreg::kSwRefuseOldGen) ++g_swRefusedOldGen; else if (verdict == sqwreg::kSwRefusePos) ++g_swRefusedPos; else ++g_swRefusedNotWriter;
+    SquadSay(id, verdict, kind, fromName, row);
+    if (from == 0 || from->state != ENET_PEER_STATE_CONNECTED || from->connectID != connect) return;
+    { const int rs = SlotOf(from); if (rs >= 0) g_swRefusedBy[id].insert(rs); }   /* told ASK_AGAIN when the writer releases the squad or leaves */
+    sqwreg::WriterReply r; r.id = id; r.verdict = verdict; r.kind = kind; r.writerSlot = row.slot; r.gen = row.gen;
+    SendMsg(from, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r));
+    if (kind == sqwreg::kKindTake) return;   /* a refused take changed nothing on the game: no record follows */
+    const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+    if (it != g_records.end() && it->second.gone == 0) SendRecordTo(from, it->second);
+}
+std::string SquadWriteToken()
+{
+    long long reg = 0;
+    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it) if (it->second.wslot >= 0) ++reg;
+    return "squadWrite[taken=" + N(g_swTaken) + ",writer=" + N(g_swWriter) + ",takeover=" + N(g_swTakeover) + ",refusedNotWriter=" + N(g_swRefusedNotWriter)
+        + ",refusedOldGen=" + N(g_swRefusedOldGen) + ",noHolderPos=" + N(g_swNoHolderPos) + ",refusedPos=" + N(g_swRefusedPos)
+        + ";bitsKept=" + N(g_swBitsKept) + ",takeNoRecord=" + N(g_swTakeNoRecord) + ",markFailed=" + N(g_swMarkFailed) + ",registered=" + N(reg)
+        + ",bitsHeld=" + N(g_swBitsHeld) + ",discardNotWriter=" + N(g_swDiscardNotWriter)
+        + ",releaseTaken=" + N(g_swReleaseTaken) + ",releaseNotWriter=" + N(g_swReleaseNotWriter) + ",askAgainSent=" + N(g_swAskAgainSent) + ",releaseNoRecord=" + N(g_swReleaseNoRecord) + ",releasedByDelete=" + N(g_swReleasedByDelete)
+        + ",releasedAtLeave=" + N(g_swReleasedAtLeave) + ",releasedDeleteRefused=" + N(g_swReleasedDeleteRefused)
+        + ",deleteHeld=" + N(g_swDeleteHeld) + ",heldApplied=" + N(g_swHeldApplied) + ",heldDropped=" + N(g_swHeldDropped) + ",heldRefused=" + N(g_swHeldRefused) + ",heldNow=" + N((long long)g_swHeldDelete.size())
+        + ",broadcastsSent=" + N(g_swNotesSent) + ",slotGoneSent=" + N(g_swNoteSlotGoneSent) + ",notesPushed=" + N(g_swNotePushed) + ",runningNow=" + N((long long)g_swNoteSent.size())
+        + ",slotGoneHeldNow=" + N((long long)g_swSlotGoneHold.size()) + ",slotGoneCancelled=" + N(g_swSlotGoneCancelled) + ",slotGoneLiveAgain=" + N(g_swSlotGoneLiveAgain) + "]";
+}
+/* the writer of id became away (it released the squad, or its game left): each game refused since is told ASK_AGAIN - it takes the
+   squad when it runs or keeps it (squadwriterreg.h AskAgainTake) */
+void SquadAskAgain(const std::string& id)
+{
+    const std::map<std::string, std::set<int> >::iterator rb = g_swRefusedBy.find(id);
+    if (rb == g_swRefusedBy.end()) return;
+    const std::set<int> slots(rb->second);
+    g_swRefusedBy.erase(rb);
+    const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+    sqwreg::WriterReply r; r.id = id; r.verdict = sqwreg::kSwAskAgain; r.kind = sqwreg::kKindRelease;
+    if (it != g_records.end()) { r.writerSlot = it->second.wslot; r.gen = it->second.wgen; }
+    for (std::map<ENetPeer*, int>::const_iterator p = g_slot.begin(); p != g_slot.end(); ++p)
+        if (p->first != 0 && p->first->state == ENET_PEER_STATE_CONNECTED && slots.count(p->second) != 0) { SendMsg(p->first, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r)); ++g_swAskAgainSent; }
+}
+/* SQUAD_RELEASE: the writer's engine put the squad away - it runs none of its people now. Taken only from the registered writer;
+   fromId as OnRecordFrom's. */
+void OnSquadReleaseFrom(ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId)
+{
+    std::string id;
+    if (!sqwreg::DecodeRelease(payload, &id) || !SquadRegId(id)) { Log("malformed SQUAD_RELEASE from " + fromName); return; }
+    if (g_wqGate.Busy(coopwq::GateKey(id))) { WriterHold(id, MSG_SQUAD_RELEASE, from, connect, fromName, payload, coopwq::kHeldOther, 0, fromId); return; }   /* the sleep write before it lands first */
+    const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+    if (it == g_records.end() || it->second.gone != 0) { ++g_swReleaseNoRecord; return; }
+    const int sender = SquadSenderSlot(from, connect, fromId);
+    if (!sqwreg::ReleaseTaken(it->second.wslot >= 0 ? 1 : 0, it->second.wslot, sender)) { ++g_swReleaseNotWriter; return; }
+    SwMarks mk = SquadMarksOf(id); mk.released = 1; mk.runs = 0; g_swMarks[id] = mk;
+    ++g_swReleaseTaken;
+    { sqwreg::WriterRow w; w.slot = it->second.wslot; w.gen = it->second.wgen; SquadSay(id, sqwreg::kSwAskAgain, sqwreg::kKindRelease, fromName, w); }
+    SquadAskAgain(id);
+    SquadNoteCheck(id);   /* it runs the squad no more: every game is told */
+}
+/* a game's link closed (a crash or a quit sends no release): every squad registered to it is marked released, so the game does not block
+   them when it comes back (if it still runs one, its next RUNS take renews it), and the games refused for them are told */
+void SquadWriterLinkClosed(int slot)
+{
+    if (slot < 0) return;
+    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it)
+    {
+        if (it->second.wslot != slot) continue;
+        SwMarks mk = SquadMarksOf(it->first);
+        const int rel = sqwreg::ReleasedAtLinkClose(it->second.wslot, slot, mk.released);
+        if (rel != mk.released) { mk.released = rel; g_swMarks[it->first] = mk; ++g_swReleasedAtLeave; }
+    }
+    std::vector<std::string> ids;
+    for (std::map<std::string, std::set<int> >::const_iterator rb = g_swRefusedBy.begin(); rb != g_swRefusedBy.end(); ++rb)
+    {
+        const std::map<std::string, Record>::const_iterator it = g_records.find(rb->first);
+        if (it != g_records.end() && it->second.wslot == slot) ids.push_back(rb->first);
+    }
+    for (size_t i = 0; i < ids.size(); ++i) SquadAskAgain(ids[i]);
+}
+/* THE WRITER NOTES (squadwriterreg.h): every game hears when a game starts or stops running a squad, so none builds or wakes a copy of a
+   squad another game runs. LOOP THREAD. */
+/* the game running id now (squadwriterreg.h NoteRuns): slot -1 = nobody */
+sqwreg::WriterRow SquadRunningWriter(const std::string& id)
+{
+    sqwreg::WriterRow w;
+    const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+    if (it == g_records.end() || it->second.wslot < 0) return w;
+    const SwMarks mk = SquadMarksOf(id);
+    if (sqwreg::NoteRuns(1, SquadSlotLive(it->second.wslot, 0), (mk.released != 0 || mk.runs == 0) ? 1 : 0, mk.keeper, it->second.gone) != 0)   /* released, or its last event was not one of running it */ { w.slot = it->second.wslot; w.gen = it->second.wgen; }
+    return w;
+}
+void SquadNoteSend(ENetPeer* to, const std::string& id, int verdict, int slot, unsigned gen)
+{
+    sqwreg::WriterReply r; r.id = id; r.verdict = verdict; r.kind = sqwreg::kKindNote; r.writerSlot = slot; r.gen = gen;
+    if (SendMsg(to, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r))) ++g_swNotesSent;
+}
+/* asked wherever the register or its marks may have changed: a change of the game running the squad is told to every connected game
+   (squadwriterreg.h NoteDue / NoteFor) */
+void SquadNoteCheck(const std::string& id)
+{
+    if (!SquadRegId(id)) return;
+    const sqwreg::WriterRow now = SquadRunningWriter(id);
+    sqwreg::WriterRow was;
+    const std::map<std::string, sqwreg::WriterRow>::const_iterator ws = g_swNoteSent.find(id);
+    if (ws != g_swNoteSent.end()) was = ws->second;
+    const int due = sqwreg::NoteDue(was.slot, was.gen, now.slot, now.gen);
+    if (due == 0) return;
+    if (now.slot >= 0) g_swNoteSent[id] = now; else g_swNoteSent.erase(id);
+    for (std::map<ENetPeer*, int>::const_iterator p = g_slot.begin(); p != g_slot.end(); ++p)
+    {
+        if (p->first == 0 || p->first->state != ENET_PEER_STATE_CONNECTED) continue;
+        int slot = -1;
+        const int v = sqwreg::NoteFor(p->second, due, was.slot, now.slot, &slot);
+        if (v != 0) SquadNoteSend(p->first, id, v, slot, v == sqwreg::kSwNoteRuns ? now.gen : was.gen);
+    }
+}
+/* a game's link closed: the squads it ran are nobody's now - their notes go, and every other connected game is told SLOT GONE once */
+void SquadNoteSlotGone(int slot)
+{
+    if (slot < 0) return;
+    for (std::map<std::string, sqwreg::WriterRow>::iterator it = g_swNoteSent.begin(); it != g_swNoteSent.end(); )
+    {
+        if (it->second.slot == slot) g_swNoteSent.erase(it++); else ++it;
+    }
+    ++g_swNoteSlotGoneSent;
+    for (std::map<ENetPeer*, int>::const_iterator p = g_slot.begin(); p != g_slot.end(); ++p)
+        if (p->first != 0 && p->first->state == ENET_PEER_STATE_CONNECTED && p->second != slot) SquadNoteSend(p->first, std::string(sqwreg::kNoteAllId), sqwreg::kSwNoteSlotGone, slot, 0u);
+}
+/* inside a game's WELCOME push, before any record reaches it: one RUNS note per squad another live game runs, then LIST END - the game's
+   list of them is rebuilt from this, never kept from its last link */
+void SquadNotesPush(ENetPeer* to)
+{
+    const int mine = SlotOf(to);
+    for (std::map<std::string, sqwreg::WriterRow>::const_iterator it = g_swNoteSent.begin(); it != g_swNoteSent.end(); ++it)
+        if (it->second.slot != mine) { SquadNoteSend(to, it->first, sqwreg::kSwNoteRuns, it->second.slot, it->second.gen); ++g_swNotePushed; }
+    SquadNoteSend(to, std::string(sqwreg::kNoteAllId), sqwreg::kSwNoteListEnd, -1, 0u);
+}
+/* a released writer's delete that met another live game with the area loaded (verdict kSwHoldDelete): kept and judged again
+   (SwHeldDeleteRejudgeKey). 1 = held; 0 = the list is full (squadwriterreg.h kSwHeldDeleteCap) or the record is gone - the caller refuses */
+int SwHeldDeleteHold(const std::string& id, int isBits, ENetPeer* from, unsigned connect, const std::string& fromName, const std::string& fromId, const std::vector<char>& payload, int sender)
+{
+    const std::pair<std::string, int> key(id, isBits != 0 ? 1 : 0);
+    const std::map<std::pair<std::string, int>, SwHeldDelete>::iterator it = g_swHeldDelete.find(key);
+    if (sqwreg::SwHeldDeleteAdmit(g_swHeldDelete.size(), sqwreg::kSwHeldDeleteCap, it != g_swHeldDelete.end() ? 1 : 0) == 0) { ++g_swReleasedDeleteRefused; return 0; }   /* full: refused at once */
+    const std::map<std::string, Record>::const_iterator rec = g_records.find(id);
+    if (rec == g_records.end()) return 0;
+    int sx = 0, sy = 0; poskey::SectorOf(rec->second.x, rec->second.z, &sx, &sy);
+    SwHeldDelete h; h.sender = sender; h.senderId = fromId; h.fromName = fromName; h.peer = from; h.connect = connect; h.payload = payload; h.writtenAt = rec->second.writtenAt; h.area = cooplive::AreaKey(sx, sy);
+    if (it == g_swHeldDelete.end()) ++g_swDeleteHeld;
+    g_swHeldDelete[key] = h;
+    { sqwreg::WriterRow w; w.slot = rec->second.wslot; w.gen = rec->second.wgen; SquadSay(id, sqwreg::kSwHoldDelete, sqwreg::kKindDelete, fromName, w); }
+    return 1;
+}
+/* one held delete judged again (squadwriterreg.h HeldDeleteStep) against the record and the games with its area loaded now: applied by
+   running the held message again (it is judged as the writer's delete then), refused with the SQUAD_WRITER reply, dropped, or kept */
+void SwHeldDeleteRejudgeKey(const std::pair<std::string, int>& key)
+{
+    const std::map<std::pair<std::string, int>, SwHeldDelete>::iterator it = g_swHeldDelete.find(key);
+    if (it == g_swHeldDelete.end()) return;
+    if (g_wqGate.Busy(coopwq::GateKey(key.first))) return;   /* a write of this record is out: judged again when it lands (SwHeldDeleteRejudgeGate) */
+    const std::map<std::string, Record>::const_iterator rec = g_records.find(key.first);
+    int other = 0;
+    if (rec != g_records.end()) { int sx = 0, sy = 0; poskey::SectorOf(rec->second.x, rec->second.z, &sx, &sy); other = SquadOtherLoaded(it->second.sender, sx, sy); }
+    const int step = sqwreg::HeldDeleteStep(rec != g_records.end() ? 1 : 0, rec != g_records.end() ? rec->second.wslot : -1, it->second.sender,
+                                            rec != g_records.end() ? rec->second.writtenAt : 0, it->second.writtenAt, other);
+    if (step == sqwreg::kHdKeep) return;
+    const SwHeldDelete h = it->second;
+    g_swHeldDelete.erase(it);
+    if (step == sqwreg::kHdDrop) { ++g_swHeldDropped; return; }
+    if (step == sqwreg::kHdRefuse)
+    {   /* another game took the squad meanwhile: the sender is told, and its local delete is taken back */
+        ++g_swHeldRefused;
+        sqwreg::WriterRow w; w.slot = rec->second.wslot; w.gen = rec->second.wgen;
+        SquadRefuse(h.peer, h.connect, h.fromName, key.first, sqwreg::kSwRefuseNotWriter, sqwreg::kKindDelete, w);
+        return;
+    }
+    ++g_swHeldApplied;
+    if (key.second != 0) OnDeletedBitsFrom(g_wqHost, h.peer, h.connect, h.fromName, h.payload, h.senderId, 1);
+    else OnRecordGoneFrom(g_wqHost, h.peer, h.connect, h.fromName, h.payload, h.senderId);
+}
+/* an area's holder changed, or a game's link closed: every held delete is judged again (at most kSwHeldDeleteCap) */
+void SwHeldDeleteRejudgeAll()
+{
+    if (g_swHeldDelete.empty()) return;
+    std::vector<std::pair<std::string, int> > keys;
+    for (std::map<std::pair<std::string, int>, SwHeldDelete>::const_iterator it = g_swHeldDelete.begin(); it != g_swHeldDelete.end(); ++it) keys.push_back(it->first);
+    for (size_t i = 0; i < keys.size(); ++i) SwHeldDeleteRejudgeKey(keys[i]);
+}
+/* a write of a record landed (gate: its write gate): the deletes held for it are judged again - a take-over by another game refuses them */
+void SwHeldDeleteRejudgeGate(const std::string& gate)
+{
+    if (g_swHeldDelete.empty()) return;
+    std::vector<std::pair<std::string, int> > keys;
+    for (std::map<std::pair<std::string, int>, SwHeldDelete>::const_iterator it = g_swHeldDelete.begin(); it != g_swHeldDelete.end(); ++it) if (coopwq::GateKey(it->first.first) == gate) keys.push_back(it->first);
+    for (size_t i = 0; i < keys.size(); ++i) SwHeldDeleteRejudgeKey(keys[i]);
+}
+/* a game's AREAS report: the deletes held in each area its previous set lists and this one does not are judged again */
+void SwHeldDeleteOnReport(const std::set<int>& before, const std::set<int>& after)
+{
+    if (g_swHeldDelete.empty()) return;
+    std::vector<std::pair<std::string, int> > keys;
+    for (std::map<std::pair<std::string, int>, SwHeldDelete>::const_iterator it = g_swHeldDelete.begin(); it != g_swHeldDelete.end(); ++it)
+        if (before.count(it->second.area) != 0 && after.count(it->second.area) == 0) keys.push_back(it->first);
+    for (size_t i = 0; i < keys.size(); ++i) SwHeldDeleteRejudgeKey(keys[i]);
+}
+/* SQUAD_TAKE: a game that runs a squad's people (RUNS, at each wake of it there) or keeps a sleeping squad in an area it holds (KEEP)
+   asks to be its writer (squadwriterreg.h). fromId as OnRecordFrom's. */
+void OnSquadTakeFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId)
+{
+    (void)host;
+    std::string id; unsigned seen = 0; int basis = 0;
+    if (!sqwreg::DecodeTake(payload, &id, &seen, &basis) || !SquadRegId(id)) { Log("malformed SQUAD_TAKE from " + fromName); return; }
+    if (g_wqGate.Busy(coopwq::GateKey(id))) { WriterHold(id, MSG_SQUAD_TAKE, from, connect, fromName, payload, coopwq::kHeldOther, 0, fromId); return; }   /* judged once the write of this id out now has landed */
+    const std::map<std::string, Record>::const_iterator it = g_records.find(id);
+    sqwreg::WriterRow row;
+    if (it == g_records.end() || it->second.gone != 0)
+    {   /* nothing stored to take: answered, so the game does not wait on it */
+        ++g_swTakeNoRecord;
+        if (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect)
+        { sqwreg::WriterReply r; r.id = id; r.verdict = sqwreg::kSwRefuseNotWriter; r.kind = sqwreg::kKindTake; SendMsg(from, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r)); }
+        return;
+    }
+    const int sender = SquadSenderSlot(from, connect, fromId);
+    const int v = SquadJudge(id, sqwreg::kKindTake, basis, sender, it->second.x, it->second.z, seen, &row);
+    if (!sqwreg::Takes(v)) { SquadRefuse(from, connect, fromName, id, v, sqwreg::kKindTake, row); return; }
+    if (v != sqwreg::kSwTakeover)
+    {   /* already this game's: answered with the registration as it stands (a RUNS take clears its released mark) */
+        SquadCount(v); SquadNoteVerdict(id, v, sqwreg::kKindTake, basis);
+        SquadNoteCheck(id);   /* its released writer's RUNS take: it runs the squad again */
+        if (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect)
+        { sqwreg::WriterReply r; r.id = id; r.verdict = v; r.kind = sqwreg::kKindTake; r.writerSlot = row.slot; r.gen = row.gen; SendMsg(from, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r)); }
+        return;
+    }
+    Record upd = it->second; upd.wslot = row.slot; upd.wgen = row.gen;   /* the index line carries the new writer; the record's data and sequence are unchanged */
+    SquadSay(id, v, sqwreg::kKindTake, fromName, row);
+    g_swTakeBasisOut[id] = basis;   /* the marks move with the line (WriterApplyOne) */
+    WriterQueueCommit(kFromWriterMark, upd, 0, PositionRotateMode(upd), from, connect, upd, fromName);   /* the register moves and the taker is answered when the line is on disk (WriterApplyOne) */
+}
+void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::string& fromName, const std::vector<char>& payload, const std::string& fromId)
 {
     std::string wid; size_t at = 0; unsigned lo = 0, hi = 0;
     if (!GetStr(payload, &at, &wid) || !GetU32(payload, at, &lo) || !GetU32(payload, at + 4, &hi)) { Log("malformed RECORD_GONE from " + fromName); return; }
@@ -7250,7 +7762,7 @@ void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const st
     const long long stamp = (long long)(((unsigned long long)hi << 32) | lo);
     /* M14 rule (1): a job for this record's files is out - the delete waits behind it, in arrival order, and is
        decided when that write has landed (WriterApplyDone). A delete is never merged. */
-    if (g_wqGate.Busy(coopwq::GateKey(wid))) { WriterHold(wid, MSG_RECORD_GONE, from, connect, fromName, payload, coopwq::kHeldOther, stamp, (from != 0 && from->state == ENET_PEER_STATE_CONNECTED && from->connectID == connect) ? PeerIdOf(from) : std::string()); return; }
+    if (g_wqGate.Busy(coopwq::GateKey(wid))) { WriterHold(wid, MSG_RECORD_GONE, from, connect, fromName, payload, coopwq::kHeldOther, stamp, fromId); return; }   /* fromId: the sender's player id as the message arrived */
     if (coopgrec::IsGroundRecId(wid))
     {   /* a ground record is removed only by the game the area map names as its area's holder - judged here, after any write of this
            id has landed (T-697 step 2: it was judged above the hold, before an in-flight write; now it waits as a box removal does) */
@@ -7276,6 +7788,33 @@ void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const st
         return;
     }
     const int discard = townrefill::GoneIsDiscard(payload.empty() ? 0 : &payload[0], payload.size(), at + 8);
+    if (SquadRegId(wid) && g_records.find(wid) != g_records.end())
+    {   /* T-1084 step 5: a plain, wipe-out or discard delete of a squad record is its registered writer's (squadwriterreg.h); a discard
+           taken here still meets the discard hold below */
+        const std::map<std::string, Record>::const_iterator sr = g_records.find(wid);
+        sqwreg::WriterRow row;
+        const int kind = discard != 0 ? sqwreg::kKindDiscard : sqwreg::kKindDelete;
+        const int v = SquadJudge(wid, kind, sqwreg::kBasisNone, SquadSenderSlot(from, connect, fromId), sr->second.x, sr->second.z, 0u, &row);
+        if (v == sqwreg::kSwHoldDelete && SwHeldDeleteHold(wid, 0, from, connect, fromName, fromId, payload, SquadSenderSlot(from, connect, fromId)) != 0) return;   /* held: judged again when the area empties */
+        if (!sqwreg::Takes(v)) { SquadRefuse(from, connect, fromName, wid, v == sqwreg::kSwHoldDelete ? (int)sqwreg::kSwRefuseNotWriter : v, kind, row); return; }
+        std::set<int> refusedWas;   /* the games refused for it: kept before the verdict note, which forgets them when the delete makes its sender the writer */
+        { const std::map<std::string, std::set<int> >::const_iterator rb = g_swRefusedBy.find(wid); if (rb != g_swRefusedBy.end()) refusedWas = rb->second; }
+        SquadCount(v); SquadNoteVerdict(wid, v, kind, sqwreg::kBasisNone);
+        if (v == sqwreg::kSwTakeover)
+        {   /* the delete's sender is the writer now: a discard held below is judged again as its writer's (PendingDiscardRejudgeOne) */
+            Record& rr = g_records[wid]; rr.wslot = row.slot; rr.wgen = row.gen;
+        }
+        if (sqwreg::DeleteReleases(v, kind) != 0)
+        {   /* the writer's own game no longer has the squad: released (SquadNoteVerdict) as at SQUAD_RELEASE, and the games refused for it
+               are told ASK_AGAIN - also when the discard hold below keeps the record */
+            ++g_swReleasedByDelete;
+            std::set<int>& told = g_swRefusedBy[wid];
+            told.insert(refusedWas.begin(), refusedWas.end());
+            told.erase(SquadSenderSlot(from, connect, fromId));   /* the delete's sender is the writer: it is not told */
+            if (!told.empty()) { sqwreg::WriterRow w; w.slot = row.slot; w.gen = row.gen; SquadSay(wid, sqwreg::kSwAskAgain, kind, fromName, w); }
+            SquadAskAgain(wid);   /* tells each game in g_swRefusedBy[wid] and erases the entry (also an empty one) */
+        }
+    }
     if (discard != 0)
     {   /* a squad its game discarded at an area unload: the delete waits while another game holds the record's area, which still
            shows the squad - the game that drops the area last sends the delete that lands (squadbirth.h ServerDiscardJudge) */
@@ -7292,11 +7831,12 @@ void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const st
             ++g_discardRefused; if (judged == sqbirth::kSrvRefuseOtherLoaded) ++g_discardRefusedLoaded;
             if (g_discardRefused <= 20) Log("DELETE " + SanitizeForLog(wid) + " (discard) from " + fromName + " REFUSED - " + (judged == sqbirth::kSrvRefuseOtherLoaded ? "another game has its area loaded (" + N((long long)otherLoaded) + ")" : "another game (" + SanitizeForLog(holder) + ") holds its area") + "; the record stays, the delete held and judged again (the first 20 logged; discardDelete on the REPORT line)");
             PendingDiscardHold(wid, stamp, liveFrom ? SlotOf(from) : -1, sender, fromName, liveFrom ? from : 0, connect, payload, dArea);   /* T-999 fold 2 */
+            SquadNoteCheck(wid);   /* the record stays: a delete that released its writer is told now (an erased record's STOPPED goes after its delete, WriterApplyDone) */
             return;
         }
     }
     std::map<std::string, Record>::iterator it = g_records.find(wid);
-    if (it != g_records.end() && it->second.writtenAt > stamp) { Log("DELETE " + SanitizeForLog(wid) + " older than the record here - ignored"); return; }
+    if (it != g_records.end() && it->second.writtenAt > stamp) { Log("DELETE " + SanitizeForLog(wid) + " older than the record here - ignored"); SquadNoteCheck(wid); return; }
     if (discard != 0) ++g_discardApplied;   /* a discard delete taken: no other game held the area */
     if (discard == 0 && !coopgrec::IsGroundRecId(wid) && !coopbrec::IsBoxRecId(wid)) TownLossFromGone(host, payload, at + 8, it != g_records.end() ? &it->second : 0, wid, fromName);   /* a ground or box record's removal is never a town loss */   /* before the record leaves memory: the town it names, and whether it was here */
     PendingDiscardForget(wid);   /* T-999 fold 2: a discard delete held for this record goes with it (deleted another way, or this one taken) */
@@ -7326,7 +7866,7 @@ void OnRecordGoneFrom(ENetHost* host, ENetPeer* from, unsigned connect, const st
        GONE - they run in WriterApplyOne when this job has landed, not here. Leaving the record out of memory
        now is safe: the gate holds every later message for this record until then. */
 }
-void OnRecordGone(ENetHost* host, ENetPeer* from, const std::vector<char>& payload) { OnRecordGoneFrom(host, from, from->connectID, PeerName(from), payload); }
+void OnRecordGone(ENetHost* host, ENetPeer* from, const std::vector<char>& payload) { OnRecordGoneFrom(host, from, from->connectID, PeerName(from), payload, PeerIdOf(from)); }
 /* M14: `connect` is the ENet connection id `from` had when the message ARRIVED - a held message is handled
    later, and the echo it earns must not reach a different game that has since taken the same peer slot. */
 /* T-609 fold 1 (F3): fromId is the sender's player id AS THE MESSAGE ARRIVED (OnRecord: its id now; a held message: the id kept with
@@ -7465,6 +8005,17 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
     }
     { std::string fac; unsigned n = 0; if (SplitGroupId(r.worldId, &fac, &n)) { std::map<std::string, std::vector<char> >::const_iterator bt = g_bits.find(fac); if (bt != g_bits.end() && (n >> 3) < bt->second.size() && (((unsigned char)bt->second[n >> 3] >> (n & 7)) & 1)) { Log("RECORD " + SanitizeForLog(r.worldId) + " refused - its number is marked deleted"); return; } } }   /* review-p4h M2 */
     std::map<std::string, Record>::iterator it = g_records.find(r.worldId);
+    int swVerdict = 0;   /* T-1084 step 5: the writer register's verdict on a squad record (0 = not one) */
+    sqwreg::WriterRow swRow;
+    int swSender = -1, swKind = 0;
+    if (SquadRegId(r.worldId))
+    {
+        const int kind = bytes.empty() ? sqwreg::kKindPosition : sqwreg::kKindFull;
+        swSender = SquadSenderSlot(from, connect, fromId);
+        swVerdict = SquadJudge(r.worldId, kind, sqwreg::kBasisNone, swSender, r.x, r.z, 0u, &swRow);
+        swKind = kind;
+        if (!sqwreg::Takes(swVerdict)) { SquadRefuse(from, connect, fromName, r.worldId, swVerdict, kind, swRow); return; }
+    }
     if (it != g_records.end()) r.home = coopstore::MetaHomeMerge(it->second.home, r.home);   /* a write that carries no home keeps the one held here */
     if (it != g_records.end()) r.flags = sqbirth::FlagsMerge(it->second.flags, r.flags);   /* a write that does not know the squad's birth flag keeps the one held here */
     if (bytes.empty())
@@ -7503,6 +8054,8 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
         /* THE C-1 REPAIR OF review-p8c: a record that CARRIES a squad does NOT rotate its index line here.
            <id>.meta.prev is the only description of <id>.platoon.prev, and P8c overwrote it on every
            position update, which orphaned the squad the previous-version net exists to recover. */
+        if (swVerdict != 0) { SquadCount(swVerdict); SquadNoteVerdict(r.worldId, swVerdict, swKind, sqwreg::kBasisNone); }   /* a position note registers nobody, except the holder's own note of a squad whose writer is away (a take-over) */
+        if (swVerdict == sqwreg::kSwTakeover) { upd.wslot = swRow.slot; upd.wgen = swRow.gen; }
         upd.seq = NextSeq();   /* B12 (decision 52): a position update IS a write this notebook accepted, so it advances the record's sequence number and a game holding an older seq for this key loses its queued replay to it */
         r.seq = upd.seq;   /* B12-c (review-b12 H-1): the forward carries the same stamped number */
         /* M14: THE COMMIT IS A JOB ON THE WRITER THREAD. Its failure line, the record in memory, the seq echo
@@ -7517,6 +8070,8 @@ void OnRecordFrom(ENetHost* host, ENetPeer* from, unsigned connect, const std::s
         if (it != g_records.end() && it->second.writtenAt >= r.writtenAt) { Log("RECORD " + SanitizeForLog(r.worldId) + " not newer - ignored"); return; }
         r.posAt = r.writtenAt; r.hasFile = true; r.gone = 0;
         r.len = (long long)bytes.size(); r.crc = coopstore::Crc32(&bytes[0], bytes.size());   /* P8b: the index line carries what the payload IS, not merely that a file exists */
+        if (swVerdict != 0) { r.wslot = swRow.slot; r.wgen = swRow.gen; SquadCount(swVerdict); SquadNoteVerdict(r.worldId, swVerdict, swKind, sqwreg::kBasisNone); }   /* T-1084 step 5: the registration this write leaves, on its index line */
+        else if (it != g_records.end()) { r.wslot = it->second.wslot; r.wgen = it->second.wgen; }
         r.seq = NextSeq();   /* B12 (decision 52): stamped HERE, after the not-newer refusal above, so a refused message never consumes a number - the sender's own seq in the message is ignored */
         /* PAYLOAD FIRST, THEN META, and the meta line is the COMMIT POINT: a crash between the two leaves a
            good payload with a stale index line, which the next record for this group simply overwrites. */
@@ -7569,6 +8124,7 @@ void WriterApplyOne(WriteJob* j)
         const Record& r = j->rec;
         g_records[id] = r;
         AoiIndexPut(id, r);   /* T-985 step 2A */
+        SquadNoteCheck(id);   /* before the forward below: a game that gets this record has heard who runs the squad first */
         SendSeqEcho(peer, id, r.seq, r.writtenAt);   /* B12-b: the writer learns the number its record got - now that it is on disk - and the stamp of the write it answers */
         DropPendingIfSuperseded(id, r.posAt);
         Log("RECORD " + SanitizeForLog(r.worldId) + " squad='" + SanitizeForLog(r.squadSid) + "' faction='" + SanitizeForLog(r.factionName) + "' pos=" + F1(r.x) + "," + F1(r.y) + "," + F1(r.z) + " bytes=" + N((long long)j->payload.size()) + " crc=" + HX8(r.crc) + " seq=" + N((long long)r.seq) + " from " + j->peerName);
@@ -7585,9 +8141,38 @@ void WriterApplyOne(WriteJob* j)
         g_records[id] = j->rec;
         AoiIndexPut(id, j->rec);   /* T-985 step 2A */
         SendSeqEcho(peer, id, j->rec.seq, j->rec.posAt);   /* B12-b: the writer learns the number its position update got; its stamp is the posAt it was sent with */
+        SquadNoteCheck(id);   /* before the forward below */
         DropPendingIfSuperseded(id, j->rec.posAt);
         const std::vector<char> none;
         RecordForward(g_wqHost, peer, j->fwd, none);
+    }
+    else if (j->from == kFromWriterMark)
+    {   /* T-1084 step 5: a take-over's index line is on disk - the register moves now, and the taker is told */
+        std::map<std::string, Record>::iterator cur = g_records.find(id);
+        if (!j->ok || cur == g_records.end())
+        {   /* the line could not be written, or the record was deleted meanwhile: the register is unchanged, and the taker is answered so
+               no take of its is left out */
+            g_swTakeBasisOut.erase(id);
+            if (!j->ok) { ++g_swMarkFailed; Log("SQUAD " + SanitizeForLog(id) + " take-over - could not write " + MetaOf(id) + "; the register is unchanged and the taker is answered refused (squadWrite[markFailed])"); }
+            else ++g_swTakeNoRecord;
+            if (peer != 0)
+            {
+                sqwreg::WriterReply r; r.id = id; r.verdict = sqwreg::kSwRefuseNotWriter; r.kind = sqwreg::kKindTake;
+                if (cur != g_records.end()) { r.writerSlot = cur->second.wslot; r.gen = cur->second.wgen; }
+                SendMsg(peer, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r));
+            }
+            return;
+        }
+        cur->second.wslot = j->rec.wslot; cur->second.wgen = j->rec.wgen;
+        { const std::map<std::string, int>::iterator tb = g_swTakeBasisOut.find(id); const int basis = tb != g_swTakeBasisOut.end() ? tb->second : sqwreg::kBasisRuns; if (tb != g_swTakeBasisOut.end()) g_swTakeBasisOut.erase(tb);
+          SquadNoteVerdict(id, sqwreg::kSwTakeover, sqwreg::kKindTake, basis); }   /* released 0; keeper for a KEEP take */
+        SquadNoteCheck(id);   /* the taker runs the squad now (a RUNS take) */
+        ++g_swTakeover;
+        {   /* a discard delete held for this record from another game is not its writer's any more: dropped (as PendingDiscardRejudgeOne drops it) */
+            const std::map<std::string, PendingDiscard>::iterator pd = g_pendingDiscard.find(id);
+            if (pd != g_pendingDiscard.end() && pd->second.senderSlot != j->rec.wslot) { PendingDiscardErase(pd); ++g_pdDropped; ++g_swDiscardNotWriter; }
+        }
+        if (peer != 0) { sqwreg::WriterReply r; r.id = id; r.verdict = sqwreg::kSwTakeover; r.kind = sqwreg::kKindTake; r.writerSlot = j->rec.wslot; r.gen = j->rec.wgen; SendMsg(peer, (unsigned char)MSG_SQUAD_WRITER, sqwreg::EncodeReply(r)); }
     }
     else if (j->from == kFromHeldPosition)
     {
@@ -7633,13 +8218,18 @@ void WriterApplyDone()
         const std::string key = j->gate;
         g_wqGate.Finish(key);
         WriterApplyOne(j);
+        SquadNoteCheck(j->key);   /* every landed write of a squad record (a delete's gone mark among them) */
         delete j;
         HeldMsg m;
         while (g_wqGate.TakeHeld(key, &m))
         {
             if (m.type == MSG_RECORD) OnRecordFrom(g_wqHost, m.peer, m.connect, m.peerName, m.payload, m.peerId);   /* fold 1 (F3) */
-            else OnRecordGoneFrom(g_wqHost, m.peer, m.connect, m.peerName, m.payload);
+            else if (m.type == MSG_SQUAD_TAKE) OnSquadTakeFrom(g_wqHost, m.peer, m.connect, m.peerName, m.payload, m.peerId);   /* T-1084 step 5 */
+            else if (m.type == MSG_DELETED_BITS) OnDeletedBitsFrom(g_wqHost, m.peer, m.connect, m.peerName, m.payload, m.peerId, 1);   /* held behind a write of one of its squad records */
+            else if (m.type == MSG_SQUAD_RELEASE) OnSquadReleaseFrom(m.peer, m.connect, m.peerName, m.payload, m.peerId);   /* held behind a write of that squad record */
+            else OnRecordGoneFrom(g_wqHost, m.peer, m.connect, m.peerName, m.payload, m.peerId);
         }
+        SwHeldDeleteRejudgeGate(key);   /* T-1084 step 5: a write of this record landed (another game's take among them): its held deletes are judged again */
     }
 }
 /* rule (2), THE DRAINING HALF: every write out lands and is applied - and every message held behind one is
@@ -7744,6 +8334,7 @@ void OnPreload(ENetPeer* from, const std::vector<char>& payload)
     {
         ++g_preIndexAsks;
         if (m.key.empty()) WriterFlushAll();
+        if (m.key.empty()) TownVersSendAll(from);   /* every town version before the first index page: the game puts them on as its save loads */
         std::vector<cooppre::IndexEntry> es; std::string lastKey; PreStampRec st;
         bool last = cooppre::PreIndexWalk(g_records, m.key, cooppre::kPreIndexPageEntries, cooppre::kPreIndexPageBytes, st, &es, &lastKey);
         std::vector<std::string> askFac; PreAskerFactions(from, &askFac);   /* T-985 C2b fold 2: the asker's player faction names, once per page */
@@ -7886,6 +8477,7 @@ void OnRecordFeed(ENetPeer* from, const std::vector<char>& payload)
         SendMsg(from, MSG_RECORD_FEED, bg); ++g_feedBegins;
         for (std::map<std::string, UniqueRow>::const_iterator ut = g_uniques.begin(); ut != g_uniques.end(); ++ut) SendMsg(from, MSG_UNIQUE_STATE, EncodeUnique(ut->first, ut->second));   /* decision 31(c): the whole state map, before the records */
         SendRecordedAreasList(from);   /* T-1084 step 3: the marks of this world, before the records (the game cleared its list at its WELCOME and its world load) */
+        TownVersSendAll(from);   /* every town version, before the records */
         Log("FEED BEGIN to " + PeerName(from) + ": " + N((long long)g_records.size()) + " records, " + N((long long)g_uniques.size()) + " unique states, seqHigh " + N((long long)seqHigh));
     }
     if (m.key.empty()) g_feedSnap[from] = FeedSnapTotals();   /* a new snapshot: its totals start over */
@@ -8127,6 +8719,41 @@ void PlayerGoneHoldTick()
         done.push_back(it->first);
     }
     for (size_t i = 0; i < done.size(); ++i) g_playerGoneHolds.erase(done[i]);
+}
+
+/* SLOT GONE, held as the PLAYER_GONE news is (squadwriterreg.h SlotGoneHoldStart / SlotGoneHoldStep): a link blip is not a leave. A
+   close of an old link while the same game (its permanent slot) is live again on a newer one starts nothing. */
+int SquadSlotLiveElsewhere(int slot, ENetPeer* except)
+{
+    for (std::map<ENetPeer*, int>::const_iterator q = g_slot.begin(); q != g_slot.end(); ++q)
+        if (q->first != except && q->first != 0 && q->second == slot && q->first->state == ENET_PEER_STATE_CONNECTED && g_peerId.count(q->first) != 0) return 1;
+    return 0;
+}
+void SquadNoteLinkClosed(ENetPeer* gone, int slot)
+{
+    if (slot < 0) return;
+    if (sqwreg::SlotGoneHoldStart(slot, SquadSlotLiveElsewhere(slot, gone)) == 0) { ++g_swSlotGoneLiveAgain; return; }
+    g_swSlotGoneHold[slot] = NowSec();
+}
+/* the game of `slot` is admitted again (OnHello): its held SLOT GONE is cancelled */
+void SquadNoteSlotGoneReturned(int slot)
+{
+    if (slot >= 0 && g_swSlotGoneHold.erase(slot) != 0) ++g_swSlotGoneCancelled;
+}
+/* 1 Hz: past kGraceSec with the game still away its SLOT GONE goes (SquadNoteSlotGone); a game found connected again cancels it */
+void SquadNoteSlotGoneTick()
+{
+    if (g_swSlotGoneHold.empty()) return;
+    const double now = NowSec();
+    std::vector<int> done;
+    for (std::map<int, double>::const_iterator it = g_swSlotGoneHold.begin(); it != g_swSlotGoneHold.end(); ++it)
+    {
+        const int act = sqwreg::SlotGoneHoldStep(it->second, now, kGraceSec, SquadSlotLiveElsewhere(it->first, 0));
+        if (act == sqwreg::kSgWait) continue;
+        if (act == sqwreg::kSgSend) SquadNoteSlotGone(it->first); else ++g_swSlotGoneCancelled;
+        done.push_back(it->first);
+    }
+    for (size_t i = 0; i < done.size(); ++i) g_swSlotGoneHold.erase(done[i]);
 }
 
 typedef char T546TeamNumberAgrees[(MSG_TEAM == (int)swteam::kMsgTeam) ? 1 : -1];   /* a compile error here = teamwire.h and this file disagree */
@@ -9377,6 +10004,58 @@ void OwedSendGone(ENetPeer* to, unsigned kind, const std::string& key, unsigned 
     std::vector<char> m;
     if (owedpop::EncodeDone(&m, owedpop::kOpGone, kind, key, why)) SendMsg(to, MSG_OWED, m);
 }
+/* A REOPEN's live reads, taken when it is judged: the slot + 1 the area map names as the holder of the building's area (0 = nobody;
+   the one holder rule, zonerec::AreaRowHeld), and the living records naming the building as their group's home. No index by home is
+   kept here, so the records are walked - only for a REOPEN of a filled building whose other answers already allow it, at most once
+   per building per repair look of the game holding it. */
+int OwedHolderOf(float x, float z)
+{
+    int sx = 0, sy = 0; poskey::SectorOf(x, z, &sx, &sy);
+    const std::map<long long, AreaRow>::const_iterator a = g_areas.find((long long)sy * 64 + sx);
+    return (a == g_areas.end() || zonerec::AreaRowHeld(a->second.ownerId, a->second.owner) == 0) ? 0 : a->second.owner + 1;
+}
+int OwedLivingHomes(const std::string& key)
+{
+    int n = 0;
+    for (std::map<std::string, Record>::const_iterator it = g_records.begin(); it != g_records.end(); ++it) if (it->second.gone == 0 && it->second.home == key) ++n;
+    return n;
+}
+long long g_owedReopen[owedpop::kReopenVerdicts] = { 0, 0, 0, 0, 0 };   /* by owedpop::kReopen* verdict */
+std::set<std::string> g_owedReopenLogged;   /* verdict|building - one line each, the first kOwedReopenLines */
+const size_t kOwedReopenLines = 200;
+long long g_owedReopenFullRestored = 0;   /* accepted REOPENs whose row did not fit (sender's table full): the filled mark put back */
+int g_owedSeedFilled = 0;   /* --owed-seed-filled (TEST ONLY): how many new residents ADDs this process marks filled instead of storing */
+long long g_owedSeeded = 0;   /* how many it has marked so far (owedSeeded= on the counters line) */
+std::vector<std::string> g_owedSeedKeys;   /* --owed-seed-key (TEST ONLY): --owed-seed-filled seeds only a building key holding one of these; empty = any */
+std::string OwedReopenToken()
+{
+    return " reopen[accepted,notHolder,townLoss,livingHome,unknown]=" + N(g_owedReopen[owedpop::kReopenAccepted]) + "," + N(g_owedReopen[owedpop::kReopenNotHolder]) + ","
+        + N(g_owedReopen[owedpop::kReopenTownLoss]) + "," + N(g_owedReopen[owedpop::kReopenLivingHome]) + "," + N(g_owedReopen[owedpop::kReopenUnknown]) + " reopenFullRestored=" + N(g_owedReopenFullRestored) + " owedSeeded=" + N(g_owedSeeded);
+}
+/* a REOPEN of a building on the filled list (owedpop::ReopenDecide). true = accepted: the mark is lifted and written, and the caller
+   stores the row as an ADD. A refusal answers the sender GONE with the reason and the mark stays. */
+bool OwedReopenJudge(ENetPeer* from, const owedpop::Msg& m, int who)
+{
+    const std::string tk = owedpop::TableKey(m.row.kind, m.row.key);
+    const int holder = OwedHolderOf(m.row.x, m.row.z);
+    const townrefill::Table::const_iterator lr = g_tloss.find(m.row.sid);
+    const unsigned losses = (lr != g_tloss.end()) ? lr->second.losses : 0u;
+    const int lossKnown = (g_tlossLoadDeferred == 0) ? 1 : 0;
+    const bool walk = holder == who && lossKnown != 0 && losses == 0;   /* the records are walked only when they decide */
+    const int homes = walk ? OwedLivingHomes(m.row.key) : 0;
+    const int v = owedpop::ReopenDecide(holder, who, lossKnown, losses, homes);
+    ++g_owedReopen[v];
+    if (g_owedReopenLogged.size() < kOwedReopenLines && g_owedReopenLogged.insert(std::string(owedpop::ReopenName(v)) + "|" + tk).second)
+        Log("OWED REOPEN " + OwedRowText(m.row.kind, m.row.key, m.row.sid) + " from slot " + N((long long)(who - 1)) + " - " + owedpop::ReopenName(v)
+            + " (area holder " + (holder > 0 ? "slot " + N((long long)(holder - 1)) : std::string("nobody")) + ", town losses " + (lossKnown != 0 ? N((long long)losses) : std::string("unread"))
+            + ", living homes " + (walk ? N((long long)homes) : std::string("not read")) + ")"
+            + (v == owedpop::kReopenAccepted ? std::string(": the filled mark is lifted and the row stored as an ADD") : std::string(": answered gone, the filled mark stays"))
+            + " (one line per building per verdict, the first " + N((long long)kOwedReopenLines) + "; reopen[...] counts all)");
+    if (v != owedpop::kReopenAccepted) { OwedSendGone(from, m.row.kind, m.row.key, owedpop::ReopenRefusalWhy(v)); return false; }
+    owedpop::ReopenApply(&g_owedDone, m.row.kind, m.row.key, v);
+    if (!WriteOwedDone()) { ++g_owedDoneWriteFailed; Log("owed: owed_done.txt could NOT be written - the lifted mark holds in memory only; a restart reads the building filled again (owedDoneWriteFailed=" + N(g_owedDoneWriteFailed) + ")"); }
+    return true;
+}
 /* every row to one game, in chunks of 256, each marked as that game's own or not */
 void SendOwedPush(ENetPeer* to)
 {
@@ -9403,9 +10082,25 @@ void OnOwed(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
     const int who = SlotOf(from) + 1;
     if (who <= 0) { ++g_owedBadIn; Log("OWED from " + PeerName(from) + " before it was admitted - ignored"); return; }
     const std::string tk = owedpop::TableKey(m.kind, m.key);
-    if (m.op == owedpop::kOpAdd)
+    if (m.op == owedpop::kOpAdd || m.op == owedpop::kOpReopen)
     {
         ++g_owedAddsIn;
+        int lifted = 0;
+        if (m.op == owedpop::kOpReopen && owedpop::AddIsDone(g_owedDone, m.row.kind, m.row.key) != 0) { if (!OwedReopenJudge(from, m, who)) return; lifted = 1; }   /* refused: answered GONE with the reason; accepted: the mark is lifted and it goes on as an ADD */
+        if (lifted == 0 && m.row.kind == owedpop::kKindResidents && g_owedSeeded < (long long)g_owedSeedFilled
+            && owedpop::AddIsDone(g_owedDone, m.row.kind, m.row.key) == 0 && g_owedRows.find(owedpop::TableKey(m.row.kind, m.row.key)) == g_owedRows.end()
+            && owedpop::SeedKeyMatches(g_owedSeedKeys, m.row.key) != 0)   /* --owed-seed-key (TEST ONLY): only a named building */
+        {   /* --owed-seed-filled (TEST ONLY): a new residents ADD, or a REOPEN of a building not marked filled (the repair's plain ADD),
+               is answered as for a building already filled, so the building is left marked filled with nobody made - the state a REOPEN
+               exists to repair. A lifted REOPEN, a resent row or one already stored is not seeded. */
+            ++g_owedSeeded;
+            g_owedDone.insert(owedpop::TableKey(m.row.kind, m.row.key));
+            if (!WriteOwedDone()) { ++g_owedDoneWriteFailed; Log("owed: owed_done.txt could NOT be written - the seeded mark holds in memory only (owedDoneWriteFailed=" + N(g_owedDoneWriteFailed) + ")"); }
+            Log("OWED SEED filled " + OwedRowText(m.row.kind, m.row.key, m.row.sid) + " from slot " + N((long long)(who - 1)) + " - TEST-ONLY: marked filled and answered gone has, nobody is made (seeded "
+                + N(g_owedSeeded) + " of " + N((long long)g_owedSeedFilled) + ")");
+            OwedSendGone(from, m.row.kind, m.row.key, owedpop::kWhyHas);
+            return;
+        }
         if (owedpop::AddIsDone(g_owedDone, m.row.kind, m.row.key) != 0)
         {   /* T-798 (d): that building was reported filled - its people exist; the game drops its own copy on GONE has */
             ++g_owedAddsDone;
@@ -9419,10 +10114,17 @@ void OnOwed(ENetHost* host, ENetPeer* from, const std::vector<char>& payload)
             ++g_owedCapRefused;
             if (g_owedCapSaid.insert(who).second)
                 Log("OWED ADD from slot " + N((long long)(who - 1)) + " REFUSED - that game already stored " + N((long long)owedpop::kRowsPerGame) + " owed rows (said once per game; owedCapRefused counts every refusal)");
+            if (owedpop::ReopenUndoOnFull(&g_owedDone, m.row.kind, m.row.key, lifted, a) != 0)
+            {   /* the sender makes the people itself with no row to report them done: the building is filled again here */
+                ++g_owedReopenFullRestored;
+                if (!WriteOwedDone()) { ++g_owedDoneWriteFailed; Log("owed: owed_done.txt could NOT be written - the restored mark holds in memory only (owedDoneWriteFailed=" + N(g_owedDoneWriteFailed) + ")"); }
+                Log("OWED REOPEN " + OwedRowText(m.row.kind, m.row.key, m.row.sid) + " from slot " + N((long long)(who - 1)) + " - its table is full, so the game makes the people itself: the filled mark is put back (reopenFullRestored=" + N(g_owedReopenFullRestored) + ")");
+            }
             OwedSendGone(from, m.row.kind, m.row.key, owedpop::kWhyFull);   /* the game keeps the work and makes it itself, as before */
             return;
         }
-        if (a != 1) return;   /* already owed: nothing changes */
+        if (a != 1)   /* already owed: nothing changes; a REOPEN's sender is sent the row as its answer */
+        { if (m.op == owedpop::kOpReopen && g_owedRows.find(tk) != g_owedRows.end()) OwedSendRowTo(from, g_owedRows[tk]); return; }
         if (!WriteOwed()) { ++g_owedWriteFailed; Log("owed: owed_people.txt could NOT be written - the row stays in memory and is broadcast (owedWriteFailed=" + N(g_owedWriteFailed) + ")"); }
         Log("OWED stored " + OwedRowText(m.row.kind, m.row.key, m.row.sid) + " at " + F1(m.row.x) + "," + F1(m.row.z) + " from slot " + N((long long)(who - 1)) + " (rows=" + N((long long)g_owedRows.size()) + ")");
         OwedBroadcastRow(host, g_owedRows[tk]);
@@ -9561,7 +10263,7 @@ bool PeerGone(ENetPeer* p, const char* how)
     g_feedHeld.erase(p); g_feedSnap.erase(p); g_feedBeginKeys.erase(p);   /* and the stamps it said it holds, with its snapshot's totals */
     const bool wasAuth = PeerIsAuthority(p);   /* B13: the operator left. Nobody inherits the flag - it is that player's until owner.txt says otherwise - but everyone is re-told, so no game is left believing it is still the authority */
     for (size_t i = 0; i < g_order.size(); ++i) if (g_order[i] == p) { g_order.erase(g_order.begin() + i); break; }
-    { const int goneSlot = SlotOf(p); if (goneSlot >= 0) { g_playerSec.erase(goneSlot); g_liveAreas.erase(goneSlot); PlayerGoneHoldStart(p, goneSlot, how); PendingDiscardLinkClosed(goneSlot); } }   /* M8 review F1: the news is HELD for kGraceSec and cancelled if that player is admitted again; PlayerGoneHoldTick sends it and drops the loaded marks then */   /* M6: the delivery set goes with the connection - a returning game reports afresh and is caught up */   /* E25: the player sector goes with the slot - the freshness window would drop it anyway, but a slot handed to the NEXT game to connect must not inherit where the last one's player stood */
+    { const int goneSlot = SlotOf(p); if (goneSlot >= 0) { g_playerSec.erase(goneSlot); g_liveAreas.erase(goneSlot); PlayerGoneHoldStart(p, goneSlot, how); PendingDiscardLinkClosed(goneSlot); SquadWriterLinkClosed(goneSlot); SquadNoteLinkClosed(p, goneSlot); } }   /* M8 review F1: the news is HELD for kGraceSec and cancelled if that player is admitted again; PlayerGoneHoldTick sends it and drops the loaded marks then */   /* M6: the delivery set goes with the connection - a returning game reports afresh and is caught up */   /* E25: the player sector goes with the slot - the freshness window would drop it anyway, but a slot handed to the NEXT game to connect must not inherit where the last one's player stood */
     /* B13: the CONNECTION loses its number; the PLAYER keeps it. g_slotById and slots.txt are not
        touched here, which is the whole point - a player who logs off and comes back gets the same
        number, and the areas and records that carry it still name them. */
@@ -10571,7 +11273,8 @@ void OnHello(ENetPeer* from, const std::vector<char>& payload)
     g_peerId[from] = playerId;
     TakenSendTo(from);   /* T-368: the faction names this profile may not take */
     FacOwedSendTo(from);   /* T-368: a FACTION answer this profile's game has not acknowledged */
-    PlayerGoneHoldReturned(SlotOf(from), from);   /* M8 review F1: this player is back - a PLAYER_GONE held for it is cancelled, never sent */
+    PlayerGoneHoldReturned(SlotOf(from), from);
+    SquadNoteSlotGoneReturned(SlotOf(from));   /* and its held SLOT GONE: its squads stay its (its next takes and releases say what it runs) */   /* M8 review F1: this player is back - a PLAYER_GONE held for it is cancelled, never sent */
     RowHoldReturned(SlotOf(from));   /* T-630: and its owed rows and kept-row claims, held for it, stay its own */
     { JoinConn jc; jc.stage = coopjoin::kStageTitle; jc.road = helloTail.road; jc.liveProto = helloTail.liveProto; jc.name = coopworld::DisplayNameOk(helloTail.name, 0) ? helloTail.name : std::string(); jc.viewDist = helloTail.viewDist; g_join[from] = jc; }   /* M11a S1: admitted = TITLE (slot + seat); a LIVE destination only once in the world. S1 fold (review L1): a name that fails coopworld::DisplayNameOk is stored empty */
     if (PeerIsAuthority(from))   /* S1 fold (review M2): THE HOST'S VERSION WINS - an admitted game whose game-to-game protocol differs from the arriving operator's is refused with reason 7 (its existing sentence) and disconnected, as ModsRecheckAll does to a game whose mods no longer match: left in, it would misread the operator's live messages once both are in the world */
@@ -10686,6 +11389,7 @@ void OnHello(ENetPeer* from, const std::vector<char>& payload)
     SendBarsPush(from);   /* refill1: every town bar row, after the research boxes and the take rows (the game counts TOWN_BAR inside its opening push) */
     SendTownLossPush(from);   /* every town's recorded losses and refilled flag (inside the opening push) */
     SendOwedPush(from);   /* T-581: every owed row, each marked as this game's own or not (inside the opening push) */
+    SquadNotesPush(from);   /* the squads other games run now, then LIST END (inside the opening push, before the record feed) */
     /* T-313 (protocol 63): NO RECORDS HERE. They are paged by OnRecordFeed when this game asks - which it does once it has a world -
        so a game waiting at the title is not handed records it cannot apply. The WELCOME's record count stays, informational. */
     Log("welcomed " + PeerName(from) + " - its " + N((long long)g_records.size()) + " records and " + N((long long)g_uniques.size())
@@ -11204,7 +11908,7 @@ void PeriodicPass(ENetHost* host)
     if (skipped > 0)
         Log("M15: the once-a-second jobs ran " + N((late + 500) / 1000) + " ms late - " + N(skipped) + " slot(s) skipped, not caught up"
             " (one piece of work held the loop that long; loopGapMaxMs on the next counters line)");
-    AreaTick(host); ClockTick(host); PendingPosTick(); PendingPosCountTick(); OwnerWatchTick(); DeferredLoadTick(host); WorldRelFlushTick(host); TeamTick(); StoreCountersTick(); HelloDeadlineTick(); PlayerGoneHoldTick(); RowHoldTick(); RecycleHourTick();   /* E40 / decision 45: the world's clock advances on THIS process's wall clock, not on any game's frame rate */
+    AreaTick(host); ClockTick(host); PendingPosTick(); PendingPosCountTick(); OwnerWatchTick(); DeferredLoadTick(host); WorldRelFlushTick(host); TeamTick(); StoreCountersTick(); HelloDeadlineTick(); PlayerGoneHoldTick(); SquadNoteSlotGoneTick(); RowHoldTick(); RecycleHourTick();   /* E40 / decision 45: the world's clock advances on THIS process's wall clock, not on any game's frame rate */
 }
 /* ONE MESSAGE FROM A GAME, by its type - a frame's own, or each message inside a BUNDLE in its order. `channel` is the one the
    packet arrived on (a bundle's messages share it). */
@@ -11263,6 +11967,9 @@ void OnGameMessage(ENetHost* host, ENetPeer* peer, unsigned char type, const std
     else if (type == MSG_FALLEN) OnFallen(host, peer, payload);   /* T-556: ADD / TAKE / ASK */
     else if (type == MSG_MONEY_SEND || type == MSG_MONEY_APPLIED) OnMoney(peer, type, payload);   /* T-810: a transfer, or the receiver's applied number */
     else if (type == MSG_AREA_RECORDED) OnAreaRecorded(host, peer, payload);   /* T-1084 step 3: a holder marks its area recorded */
+    else if (type == MSG_TOWN_VER) OnTownVer(host, peer, payload);   /* a holder's town version, judged by the revision rule */
+    else if (type == MSG_SQUAD_TAKE) OnSquadTakeFrom(host, peer, peer->connectID, PeerName(peer), payload, PeerIdOf(peer));   /* T-1084 step 5: a game that runs a squad, or keeps a sleeping one, asks to write it */
+    else if (type == MSG_SQUAD_RELEASE) OnSquadReleaseFrom(peer, peer->connectID, PeerName(peer), payload, PeerIdOf(peer));   /* T-1084 step 5: the writer's engine put a squad away */
     else if (type == MSG_BOX_ASK) OnBoxAsk(peer, payload);   /* a game back after a link loss: its newest stored write of each box named */
     else if (type == MSG_WORLD_SAVED) OnWorldSaved(peer, payload);   /* restore1a */
     else if (type == MSG_OWN_HIGH) OnOwnHigh(peer, payload);   /* restore1b1 */
@@ -12465,6 +13172,19 @@ int ServerMain(int argc, char** argv)
         else if (!strcmp(argv[i], "--alias")) aliasAdd = argv[i + 1];
         else if (!strcmp(argv[i], "--unalias")) aliasRemove = argv[i + 1];
         else if (!strcmp(argv[i], "--stop-areamaps-after")) g_stopAreaMapsAfter = atof(argv[i + 1]);
+        else if (!strcmp(argv[i], "--owed-seed-filled"))   /* TEST ONLY: the first n new residents ADDs are marked filled and answered gone has (OnOwed) */
+        {   /* 0 = off; a value out of 0..8 is clamped into it, one that is not a whole number is ignored, as --max-connected */
+            char* end = 0; const long v = strtol(argv[i + 1], &end, 10);
+            if (end == argv[i + 1] || *end != 0) { argNotes.push_back(std::string(argv[i]) + " '" + argv[i + 1] + "' is not a whole number - IGNORED"); continue; }
+            const long c = v < 0L ? 0L : (v > 8L ? 8L : v);
+            if (c != v) argNotes.push_back(std::string(argv[i]) + " " + argv[i + 1] + " is outside 0..8 - CLAMPED to " + N((long long)c));
+            g_owedSeedFilled = (int)c;
+        }
+        else if (!strcmp(argv[i], "--owed-seed-key"))   /* TEST ONLY: --owed-seed-filled seeds only residents rows whose building key holds one of these substrings, '+' between them (OnOwed) */
+        {
+            g_owedSeedKeys = owedpop::SeedKeyList(argv[i + 1]);
+            if (g_owedSeedKeys.empty()) argNotes.push_back(std::string(argv[i]) + " '" + argv[i + 1] + "' names no key - IGNORED (any key may be seeded)");
+        }
         /* M1-b (review-m1 H1): M1 named these two TEST options and never read them, so g_maxConnected and
            g_firstSlot always stayed at their defaults. A value out of range is clamped into it; one that is not
            a whole number is ignored. Either way it is said in the log, below. */
@@ -12768,6 +13488,16 @@ int ServerMain(int argc, char** argv)
     if (g_stopAreaMapsAfter >= 0.0)
         Log("--stop-areamaps-after " + N((long long)g_stopAreaMapsAfter) + " s: this relay will STOP BROADCASTING"
             " AREA MAPS after that many seconds and keep servicing its socket. TEST ONLY.");
+    if (g_owedSeedFilled > 0)
+        Log("--owed-seed-filled " + N((long long)g_owedSeedFilled) + ": the first " + N((long long)g_owedSeedFilled) + " new residents ADDs this process receives are"
+            " marked filled (owed_done.txt) and answered gone has, so nobody is made for those buildings. TEST ONLY.");
+    if (!g_owedSeedKeys.empty())
+    {
+        std::string ks;
+        for (size_t k = 0; k < g_owedSeedKeys.size(); ++k) ks += (k != 0 ? " " : "") + g_owedSeedKeys[k];
+        Log("--owed-seed-key " + ks + ": --owed-seed-filled seeds only residents rows whose building key holds one of these " + N((long long)g_owedSeedKeys.size())
+            + " substring(s)" + (g_owedSeedFilled > 0 ? std::string() : std::string(" (--owed-seed-filled is 0: nothing is seeded)")) + ". TEST ONLY.");
+    }
     Log("listening");
     g_tick.Start(MonoUs());   /* M15: the first pass of the jobs is due at once */
     InterlockedExchange(&g_loopRunning, 1);   /* a quit door on another thread now asks this loop for the final save */

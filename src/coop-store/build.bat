@@ -11,11 +11,18 @@ rem This exe compiles ..\common\clockmath.cpp into itself, so a failing assertio
 rem stop THIS build as well. Until P7w only src\coop-plugin\build.bat called the suite, and this file's
 rem only precondition was that host.obj existed from some earlier plugin build - which says nothing about
 rem whether the tests pass. The relay was ungated.
-call "%~dp0..\coop-test\build.bat"
-if errorlevel 1 (
-    echo BUILD FAILED ^(offline tests - SharedWastelandsServer.exe was NOT rebuilt^)
-    exit /b 1
+rem Owner decision 1202: a caller that has just built the plugin in THIS tree (whose build.bat runs the same suite as its
+rem gate) sets SW_SUITE_PASSED=1 for this step only, and the suite is not built and run a second time; without it, as before.
+if "%SW_SUITE_PASSED%"=="1" (
+    echo offline suite: passed in this build's plugin step - not run again
+) else (
+    call "%~dp0..\coop-test\build.bat"
+    if errorlevel 1 (
+        echo BUILD FAILED ^(offline tests - SharedWastelandsServer.exe was NOT rebuilt^)
+        exit /b 1
+    )
 )
+echo [STEP] world server compile %time%
 
 cd /d "%~dp0"
 set OBJ=..\coop-plugin

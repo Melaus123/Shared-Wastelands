@@ -30,6 +30,7 @@
 #include "../common/townreoffer.h"   /* T-392 (owner 335 a): the set-aside causes and the re-offer decision - the SAME header the offline suite compiles */
 #include "../common/layouthold.h"   /* T-966: whether the re-run holds the interior's plan load - the SAME header the offline suite compiles */
 #include "../common/owedpop.h"   /* T-581: the owed town populations kept on the world server - the SAME header the world server and the offline suite compile */
+#include "../common/tplnobody.h"   /* T-1090: whether a building's resident template makes anyone - the SAME header the offline suite compiles */
 #include "../common/barwire.h"  /* refill1: the shared bar record, the due decision and the per-entry counts - the SAME header the notebook and the offline suite compile */
 #include "../common/townrefill.h"   /* each town's recorded losses, the record tally and the one-refill decision - the SAME header the world server and the offline suite compile */
 #include "../common/emptytown.h"   /* the unexplained-empty-town facts, verdict, once-per-town rule and line - the SAME header the offline suite compiles */
@@ -225,6 +226,23 @@ static int T392PopSector(int* sx, int* sy);   /* T-580: defined below */
    area (the fallback the re-offer asked with) and what that call made / had refused notebook-pending. Only the re-run's own
    thread writes the counts, so no other building fill can count for it; the shared building-context slot is not used. */
 volatile DWORD g_t580RunTid = 0; int g_t580RunSx = -1, g_t580RunSy = -1; long long g_t580RunMade = 0, g_t580RunPending = 0;
+/* T-1099: THE BUILDING A RESIDENTS RE-OFFER RE-RUNS, in the same slot (raised and lowered with g_t580RunTid; named only by
+   T392ReofferOne's run - the town refill's run names none): the arguments the re-offer's decision asked the building's own pending
+   question with (StoreBuildingPeoplePending), so a creation inside the run asks that same question (T1099CreationAsk); and the
+   first note that refused a creation of the run, readable until the next run (a run kept at the bound is parked under it). */
+struct T1099Bld { const char* sid; const char* key; void* bt; float x, z; int ax, ay; };
+int g_t1099RunBld = 0; char g_t1099RunSid[128] = { 0 }; char g_t1099RunKey[128] = { 0 }; void* g_t1099RunBt = 0; float g_t1099RunX = 0.0f, g_t1099RunZ = 0.0f;
+int g_t1099RunAx = -1, g_t1099RunAy = -1; char g_t1099RunHolder[192] = { 0 }; long long g_t1099AskBuilding = 0;
+static void T1099SlotSet(const T1099Bld* b)
+{
+    g_t1099RunHolder[0] = 0;
+    g_t1099RunBld = 0;
+    if (b == 0 || b->sid == 0 || b->key == 0 || b->key[0] == 0) return;
+    std::strncpy(g_t1099RunSid, b->sid, 127); g_t1099RunSid[127] = 0;
+    std::strncpy(g_t1099RunKey, b->key, 127); g_t1099RunKey[127] = 0;
+    g_t1099RunBt = b->bt; g_t1099RunX = b->x; g_t1099RunZ = b->z; g_t1099RunAx = b->ax; g_t1099RunAy = b->ay;
+    g_t1099RunBld = 1;
+}
 /* owner 809 b: a purchase's held re-offer (TownGenBuyHeld) keeps the groups its run makes (T580NoteMade, on that run's own thread), so
    the buy callback can log each one's new home after the engine's purchase. MAIN THREAD; on only during that run. */
 const unsigned kT805BuyCap = 64;
@@ -254,6 +272,20 @@ static int TownPendingAsk(void* town, const void* pos, const char* sid, char* ho
         if (first) DebugLog(std::string("[TG] town '") + sid + "': the notebook lists groups of this town that this game has not placed, none in an area loaded here or in or beside the town's area - decision 34 does not hold its creations back; they go on to the area gates (first only per town; pendingElsewhere[...] in the report counts them)");
     }
     return a;
+}
+/* T-1099 - THE PENDING QUESTION ONE TOWN CREATION ASKS (ANY THREAD). On a residents re-offer's own re-run (the main thread, its slot
+   naming the building), the building's own question with the arguments the re-offer's decision used (StoreBuildingPeoplePending):
+   a note of the town homed at another building does not refuse this building's residents, as it did not hold back the decision.
+   Every other creation asks the town's question (TownPendingAsk). */
+static int T1099CreationAsk(void* town, const void* pos, const char* sid, char* holder, int holderCap)
+{
+    const int inRun = townpending::InRun(g_t580RunTid, ::GetCurrentThreadId());
+    if (townpending::CreationAsk(inRun, g_t1099RunBld) == townpending::kAskBuilding)
+    {
+        ++g_t1099AskBuilding;
+        return StoreBuildingPeoplePending(g_t1099RunSid, g_t1099RunKey, g_t1099RunBt, g_t1099RunX, g_t1099RunZ, g_t1099RunAx, g_t1099RunAy, holder, holderCap);
+    }
+    return TownPendingAsk(town, pos, sid, holder, holderCap);
 }
 /* T-580: books one notebook-pending refusal under `key`; true = log it now (the first, then the first after every 5 minutes). */
 static bool PendingRefusalBook(const std::string& key, bool* firstOut, long long* countOut)
@@ -302,9 +334,15 @@ static int T392PopSector(int* sx, int* sy)
     *sx = (int)g_t392PopSx; *sy = (int)g_t392PopSy;
     return 1;
 }
-/* T-580: re-runs kept waiting on townpending::RerunKeep, re-runs given up at the bound (KeptGiveUp), kept re-runs per building key
-   this session (under g_tgLock). A squad made on a re-run's own thread counts for it (T580NoteMade). */
+/* T-580: re-runs kept waiting on townpending::RerunKeep, re-runs that reached the bound (KeptGiveUp - now parked, T-1099), kept re-runs per
+   building key since it was last un-parked (under g_tgLock). A squad made on a re-run's own thread counts for it (T580NoteMade). */
 long long g_t580RerunKept = 0, g_t580RerunGivenUp = 0; std::map<std::string, int> g_t580KeptByKey;
+/* T-1099: PARKED residents buildings, by building key (under g_tgLock): a re-run kept at the bound waits for the note that refused it
+   (its id, from the run's holder text) instead of being dropped for the session. The check-up, a purchase and the repair skip a parked
+   building; the end of every pending-notes publish asks the building's own question again with the decision's arguments and un-parks
+   it once that note no longer holds it (TownGenUnparkAfterPublish). Cleared with the world. */
+struct T1099ParkRow { std::string sid, note; void* bt; float x, z; int ax, ay; T1099ParkRow() : bt(0), x(0.0f), z(0.0f), ax(-1), ay(-1) {} };
+std::map<std::string, T1099ParkRow> g_t1099Parked; long long g_t1099ParkN = 0, g_t1099UnparkN = 0;
 static void T580NoteMade(void* p)
 {
     if (p == 0 || townpending::InRun(g_t580RunTid, ::GetCurrentThreadId()) == 0) return;
@@ -464,10 +502,10 @@ void* detour_create(void* self, void* faction, void* pos, void* town, unsigned l
     if (!RoleIsSingle())
     {
         char sidP[128]; char holderP[192];
-        if (TownSidPod(town, sidP, 128) != 0 && TownPendingAsk(town, pos, sidP, holderP, 192) == townpending::kTownHeld)
+        if (TownSidPod(town, sidP, 128) != 0 && T1099CreationAsk(town, pos, sidP, holderP, 192) == townpending::kTownHeld)
         {
             ::InterlockedIncrement64(&g_refusedPending);
-            if (townpending::InRun(g_t580RunTid, ::GetCurrentThreadId()) != 0) ++g_t580RunPending;   /* T-580: on a residents re-run's own thread - that re-run reads it */
+            if (townpending::InRun(g_t580RunTid, ::GetCurrentThreadId()) != 0) { ++g_t580RunPending; if (g_t1099RunHolder[0] == 0) { std::strncpy(g_t1099RunHolder, holderP, 191); g_t1099RunHolder[191] = 0; } }   /* T-580: on a residents re-run's own thread - that re-run reads it (and the first refusing note: T-1099's park) */
             const std::string keyP = std::string(sidP) + " (notebook people pending)";
             bool firstP = false; long long nP = 0;
             const bool dueP = PendingRefusalBook(keyP, &firstP, &nP);
@@ -831,7 +869,7 @@ void RecruitReport()   // MAIN THREAD
    sector, position in tenths - ObjectPositionKey), never by pointer, with the stringID of the building's town and its x/z.
    Both are offered again from the engine's own per-town check-up (T392Reoffer, beside RefillCheck). Cleared at every world
    teardown, beside g_barPend. Under g_tgLock. */
-struct T392ResPend { std::string sid; float x, z; long tries; int stateAtLoad; long sentGen; int acked; int pendAside; T392ResPend() : x(0.0f), z(0.0f), tries(0), stateAtLoad(0), sentGen(0), acked(0), pendAside(0) {} };   /* pendAside = set aside because a note of the town held (T591PendingAside) */   /* sentGen = the link generation this entry's ADD went out on (0 = not sent; -1 = not sendable) */   /* stateAtLoad = the building-state step ran when the squads were set aside */
+struct T392ResPend { std::string sid; float x, z; long tries; int stateAtLoad; long sentGen; int acked; int pendAside; int reopen; T392ResPend() : x(0.0f), z(0.0f), tries(0), stateAtLoad(0), sentGen(0), acked(0), pendAside(0), reopen(0) {} };   /* reopen = set aside by the empty-building repair: its row goes up as REOPEN, not ADD */   /* pendAside = set aside because a note of the town held (T591PendingAside) */   /* sentGen = the link generation this entry's ADD went out on (0 = not sent; -1 = not sendable) */   /* stateAtLoad = the building-state step ran when the squads were set aside */
 std::map<std::string, T392ResPend> g_t392Res;   /* T-392 fold (owner 317 a): grows as needed, never refuses */
 std::map<std::string, std::string> g_t392ResCursor;   /* T-392 fold (review MED): town sid -> the last key its check-up looked at (round-robin) */
 std::set<std::string> g_t392DeferLogged, g_t392WaitLogged;   /* "<kind>|<town sid>": the first-per-town lines */
@@ -853,6 +891,20 @@ std::set<std::string> g_t392Repaired, g_t392AsideTowns;
 long long g_t392RepairLooked = 0, g_t392RepairSetAside = 0, g_t392RepairListFull = 0, g_t392RepairLines = 0, g_t392RepairGateShut = 0,
           g_t392RepairNotPop = 0, g_t392RepairRefused = 0;
 std::set<std::string> g_t392RepairRefusedLogged;   /* MAIN THREAD: towns whose first refused building was logged this session */
+/* the repair's REOPENs (owedpop::ReopenDecide on the world server): sent, accepted (the row came back stored), refused (GONE with a
+   reason - the building's repaired mark is cleared so the next repair look reads it again live); the buildings waiting for a verdict
+   and the lines written (one per building per verdict, the first kRepairReopenLines), both under g_tgLock */
+long long g_repairReopenSent = 0, g_repairReopenAccepted = 0, g_repairReopenRefused = 0, g_repairReopenFull = 0;   /* accepted = a row came back for an asked building (stored); full = the world server's table was full, this game makes the people */
+std::set<std::string> g_repairReopenAsked, g_repairReopenLogged;
+const size_t kRepairReopenLines = 60;
+static void RepairReopenLine(const std::string& verdict, const std::string& key, const std::string& line)
+{
+    bool first = false;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    if (g_repairReopenLogged.size() < kRepairReopenLines) first = g_repairReopenLogged.insert(verdict + "|" + key).second;
+    ::LeaveCriticalSection(&g_tgLock);
+    if (first) OwedLine(line + " (one line per building per verdict, the first " + N((long long)kRepairReopenLines) + "; repairReopen[...] counts all)");
+}
 void* g_t392Factory = 0;   /* the engine's one RootObjectFactory (chooseResidents passes the global DAT_142133550); cleared at teardown, set again by the next populateBuilding */
 static void T392DeferLog(const char* kind, const std::string& sid, int sx, int sy, const char* cause, const char* bkey)
 {
@@ -964,6 +1016,87 @@ static int T515BldTemplatePod(void* b, void** out)
     *out = 0;
     __try { *out = *(void* const*)((const char*)b + 0xF0); return 1; }   /* the building's resident template (decomp_57ea30:28) */
     __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return 0; }
+}
+/* T-1090: CAN A BUILDING'S RESIDENT TEMPLATE MAKE ANYONE (src/common/tplnobody.h). bt = Building+0xF0, the squad template
+   populateBuilding makes the building's residents from. Its reference lists (map +0x2B8: node next +0, name +0x10, entries
+   +0x38..+0x40 of 0x40 bytes each - the walk T2TplPod does) are counted by name, and its two random counts are read from its int map
+   +0x178 (node: name +0x10, the int +0x38; decomp_582f80:504-522). The template's stringID (+0x58) is copied into sidOut ("?" unread).
+   Returns 1 it can make people, 0 it makes nobody, -1 not read (no template, a fault or a malformed list: the caller keeps today's
+   behaviour). Reads only; the thread that may read the building. */
+static int T1090TplCanMakePod(const void* bt, char* sidOut, int sidCap)
+{
+    if (sidOut != 0 && sidCap >= 2) { sidOut[0] = '?'; sidOut[1] = 0; }
+    if (bt == 0) return -1;
+    int counts[tplnobody::kLists];
+    for (int i = 0; i < tplnobody::kLists; ++i) counts[i] = 0;
+    int randMin = 0, randMax = 0;
+    __try
+    {
+        const char* t = (const char*)bt;
+        if (sidOut != 0 && sidCap >= 2)
+        {
+            const char* s = t + 0x58;
+            const unsigned long long len = *(const unsigned long long*)(s + 0x10), sc = *(const unsigned long long*)(s + 0x18);
+            const char* txt = (sc > 15) ? *(const char* const*)s : s;
+            const unsigned long long k = len < (unsigned long long)(sidCap - 1) ? len : (unsigned long long)(sidCap - 1);
+            std::memcpy(sidOut, txt, (size_t)k);
+            sidOut[k] = 0;
+        }
+        const char* m = t + 0x2B8;
+        if (*(const unsigned long long*)(m + 0x20) != 0)
+        {
+            const char* node = *(const char* const*)(*(const char* const*)(m + 0x38) + *(const long long*)(m + 0x18) * 8);
+            for (int guard = 0; node != 0; node = *(const char* const*)node)
+            {
+                if (++guard > 4096) return -1;
+                const char* s = node + 0x10;
+                const unsigned long long len = *(const unsigned long long*)(s + 0x10), sc = *(const unsigned long long*)(s + 0x18);
+                const int li = tplnobody::ListIndex((sc > 15) ? *(const char* const*)s : s, len);
+                if (li < 0) continue;
+                const char* b = *(const char* const*)(node + 0x38);
+                const char* e = *(const char* const*)(node + 0x40);
+                if (e < b || ((e - b) % 0x40) != 0) return -1;
+                counts[li] += (int)((e - b) / 0x40);
+            }
+        }
+        const char* im = t + 0x178;
+        if (*(const unsigned long long*)(im + 0x20) != 0)
+        {
+            const char* node = *(const char* const*)(*(const char* const*)(im + 0x38) + *(const long long*)(im + 0x18) * 8);
+            for (int guard = 0; node != 0; node = *(const char* const*)node)
+            {
+                if (++guard > 4096) return -1;
+                const char* s = node + 0x10;
+                const unsigned long long len = *(const unsigned long long*)(s + 0x10), sc = *(const unsigned long long*)(s + 0x18);
+                const int rk = tplnobody::RandomKey((sc > 15) ? *(const char* const*)s : s, len);
+                if (rk == 1) randMin = *(const int*)(node + 0x38);
+                else if (rk == 2) randMax = *(const int*)(node + 0x38);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return tplnobody::CanMakePeople(counts, randMin, randMax);
+}
+/* T-1090: 1 = building b's resident template was read and makes nobody (tsid: its stringID); 0 = it can make people or was not read */
+static int T1090TemplateNobody(void* b, char* tsid, int cap)
+{
+    void* bt = 0;
+    if (cap >= 2) { tsid[0] = '?'; tsid[1] = 0; }
+    if (b == 0 || T515BldTemplatePod(b, &bt) == 0 || bt == 0) return 0;
+    return tplnobody::Skips(T1090TplCanMakePod(bt, tsid, cap));
+}
+/* T-1090: the buildings each road skipped because their template makes nobody (the [TG] line: repairNobody=,
+   templateNobody[aside,reoffer]=), and the road|building pairs already named - one line each (the set under g_tgLock) */
+long long g_t1090RepairNobody = 0, g_t1090ReofferNobody = 0;   /* MAIN THREAD */
+long long g_t1090AsideNobody = 0;   /* the load-time gate's thread: interlocked */
+std::set<std::string> g_t1090NobodySaid;
+static void T1090NobodyLine(const char* road, const std::string& key, const std::string& line)
+{
+    bool first = false;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    if (g_t1090NobodySaid.size() < 4096) first = g_t1090NobodySaid.insert(std::string(road) + "|" + key).second;
+    ::LeaveCriticalSection(&g_tgLock);
+    if (first) DebugLog(line);
 }
 static int T515StatePod(void* b, void* t)
 {
@@ -1258,9 +1391,20 @@ static int T392ResidentsGate(void* factory, void* building)
     }
     if (keyOk < 0) keyOk = T392Key(building, key);
     if (keyOk == 0) { ::InterlockedIncrement64(&g_t392ResNoKey); return 1; }   /* no key = no way to find it again: as today */
-    T392ResRecord(key, sid, bp[0], bp[2]);
-    if (dc == townreoffer::kDefLoading) T1076MarkLoading(std::string("res|") + key);   /* T-1076 */
-    T392DeferLog("residents", std::string(sid), s.x, s.y, townreoffer::DeferCauseName(dc), key);
+    char tsN[96];
+    if (T1090TemplateNobody(building, tsN, (int)sizeof tsN) != 0)
+    {
+        /* T-1090: the building's template makes nobody - it is not set aside, so no ADD goes; the run below still refuses any squad */
+        ::InterlockedIncrement64(&g_t1090AsideNobody);
+        T1090NobodyLine("aside", std::string(key), "[TOWN] set aside kind=residents town=" + std::string(sid) + " not-set-aside why=template-nobody bld=" + std::string(key)
+                        + " template=" + std::string(tsN) + " cause=" + townreoffer::DeferCauseName(dc) + " (first per building; templateNobody[aside,..] counts all)");
+    }
+    else
+    {
+        T392ResRecord(key, sid, bp[0], bp[2]);
+        if (dc == townreoffer::kDefLoading) T1076MarkLoading(std::string("res|") + key);   /* T-1076 */
+        T392DeferLog("residents", std::string(sid), s.x, s.y, townreoffer::DeferCauseName(dc), key);
+    }
     /* T-438: populateBuilding still runs (interior/furniture, owner faction - at this load event); its squads are refused as SET
        ASIDE inside the creation detour, judged by THIS building-sector context. The caller lowers the flag (TownGenResidentsDone). */
     g_t392PopAside = 1; g_t392PopAsideN = 0; g_t392PopBld = building; g_t392PopTown = t;
@@ -2876,7 +3020,7 @@ static void OwedFlush()
     if (RoleIsSingle() || g_linkedCached == 0) return;
     const long gen = (long)StoreLinkGen();
     if (gen <= 0) return;
-    std::vector<owedpop::Row> adds; std::vector<int> inTable; std::vector<OwedDone> dones;
+    std::vector<owedpop::Row> adds; std::vector<int> inTable, reopen; std::vector<OwedDone> dones;
     TgLockInit(); ::EnterCriticalSection(&g_tgLock);
     /* owedpop::FlushStep: an entry whose row was in the table on an earlier link and is absent from this link's opening push was
        made or seen there while this game was away (the removal was missed) - settled, dropped here, never sent again */
@@ -2889,7 +3033,7 @@ static void OwedFlush()
         else if (step == owedpop::kFlushSend)
         {
             owedpop::Row r; r.kind = owedpop::kKindResidents; r.key = it->first; r.sid = it->second.sid; r.x = it->second.x; r.z = it->second.z;
-            adds.push_back(r); inTable.push_back(0);
+            adds.push_back(r); inTable.push_back(0); reopen.push_back(it->second.reopen);
         }
     }
     for (std::map<std::string, OwedBarLocal>::iterator it = g_owedBars.begin(); it != g_owedBars.end(); ++it)
@@ -2900,7 +3044,7 @@ static void OwedFlush()
         else if (step == owedpop::kFlushSend)
         {
             owedpop::Row r; r.kind = owedpop::kKindBar; r.key = it->first; r.sid = it->first; r.x = it->second.x; r.z = it->second.z;
-            adds.push_back(r); inTable.push_back(0);
+            adds.push_back(r); inTable.push_back(0); reopen.push_back(0);
         }
     }
     for (size_t i = 0; i < settledRes.size(); ++i) { g_t392Res.erase(settledRes[i]); g_t1076Loading.erase("res|" + settledRes[i]); }   /* settled: no longer waiting on its area loading */
@@ -2916,8 +3060,14 @@ static void OwedFlush()
         if (inTable[i] == 0)
         {
             std::vector<char> b;
-            if (!owedpop::EncodeAdd(&b, r)) { mark = -1; ++g_owedBad; ErrorLog("[OWED] set-aside work " + OwedText(r.kind, r.key, r.sid) + " is not a valid row - kept on this game only"); }
+            if (!(reopen[i] != 0 ? owedpop::EncodeReopen(&b, r) : owedpop::EncodeAdd(&b, r))) { mark = -1; ++g_owedBad; ErrorLog("[OWED] set-aside work " + OwedText(r.kind, r.key, r.sid) + " is not a valid row - kept on this game only"); }
             else if (!StoreSendOwed(b)) { ++g_owedSendFailed; continue; }
+            else if (reopen[i] != 0)   /* found empty by the repair: the world server judges it live and may lift its filled mark */
+            {
+                ++g_repairReopenSent;
+                TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_repairReopenAsked.insert(r.key); ::LeaveCriticalSection(&g_tgLock);
+                RepairReopenLine("sent", r.key, "[OWED] reopen asked " + OwedText(r.kind, r.key, r.sid) + " - found empty here; the world server judges the area's holder, the town's losses and living homes now");
+            }
             else { ++g_owedAdds; char pb[64]; _snprintf(pb, 63, "%.0f,%.0f", r.x, r.z); pb[63] = 0; OwedLine("[OWED] stored " + OwedText(r.kind, r.key, r.sid) + " at=" + pb + " (kept on the world server until it is made)"); }
         }
         TgLockInit(); ::EnterCriticalSection(&g_tgLock);
@@ -3315,14 +3465,14 @@ static int T966SetNamePod(void* b, const std::string* s)
    until the next run), the building-state step skipped when it already ran for the building (atLoad 1), and this run's
    own add to the town's resident budget undone. Returns WorldGenRerunPopulate's answer (1 ran, 0 set aside, -1 no
    original or a fault); *st and *pa name the state step and the budget for the caller's line. */
-static int T392RerunBuilding(void* town, void* factory, void* b, const Sector& s, int atLoad, std::string* st, std::string* pa)
+static int T392RerunBuilding(void* town, void* factory, void* b, const Sector& s, int atLoad, std::string* st, std::string* pa, const T1099Bld* bld)
 {
     int b0n = 0; float b0f = 0.0f; const int b0ok = T392ResBudgetPod(town, &b0n, &b0f);   /* the town's resident budget right before this SECOND engine call (decomp_57ed90:198-199 adds to it) */
     int rr0 = -1, rd0 = -1, rr1 = -1, rd1 = -1;
     T515RuinPod(b, &rr0, &rd0);
     const long long skip0 = g_t515RerunSkipped;
     g_t515RerunBld = b; g_t515RerunAtLoad = atLoad;   /* detour_bldState skips the step for this building when it ran at load */
-    g_t580RunMade = 0; g_t580RunPending = 0; g_t581RunAsked = 0; g_t581RunReached = 0; g_t580RunSx = s.x; g_t580RunSy = s.y; g_t580RunTid = ::GetCurrentThreadId();   /* this re-run's own slot */
+    g_t580RunMade = 0; g_t580RunPending = 0; g_t581RunAsked = 0; g_t581RunReached = 0; g_t580RunSx = s.x; g_t580RunSy = s.y; T1099SlotSet(bld); g_t580RunTid = ::GetCurrentThreadId();   /* this re-run's own slot (T-1099: and its building, when the re-offer names one) */
     /* T-966: a building loaded from a save keeps its saved pieces - when the engine call's switch-on would load the plan over
        them (layouthold::Decide), the plan name is blank for the call and put back right after it. WorldGenRerunPopulate catches
        a fault inside the engine call, so the line after it always runs. */
@@ -3344,6 +3494,7 @@ static int T392RerunBuilding(void* town, void* factory, void* b, const Sector& s
                     + " (first 40 lines; t966[...] on the [TG] line counts every re-run)");
     }
     g_t580RunTid = 0;
+    g_t1099RunBld = 0;
     g_t515RerunBld = 0; g_t515RerunAtLoad = 0;
     T515RuinPod(b, &rr1, &rd1);
     *st = " stateAtLoad=" + N(atLoad) + " stateSkipped=" + N(g_t515RerunSkipped - skip0)
@@ -3427,13 +3578,26 @@ static int T392ReofferOne(void* town, void* factory, const std::string& sid, con
     if (act == owedpop::kActForget) { T392ResErase(key.c_str()); ::InterlockedIncrement64(&g_t392ReOther); T392ReofferLog("residents", sid, "answered-other", extra + (has < 0 ? " why=other-holds residents=unread ran=no" : " why=other-holds ran=no")); return townreoffer::kOneOther; }
     /* kActMake: this game holds the area with the zone live, the building has no residents, and the row is this game's (or
        only this game knows the work) */
+    char tsN[96];
+    if (T1090TemplateNobody(b, tsN, (int)sizeof tsN) != 0)
+    {
+        /* T-1090: the building's template makes nobody - no engine run; it ends as a run that chose no residents ends (an owed row: DONE empty) */
+        T392ResErase(key.c_str());
+        if (stored == 1) OwedSendDone(owedpop::kKindResidents, key, owedpop::kWhyEmpty);
+        ++g_t1090ReofferNobody;
+        o1->made = 0;
+        T1090NobodyLine("reoffer", key, "[TOWN] reoffer kind=residents town=" + sid + " result=answered-empty why=template-nobody bld=" + key + " template=" + std::string(tsN)
+                        + " owed=" + N((long long)stored) + (stored == 1 ? " (DONE empty sent)" : " (its entry ends)") + " (first per building; templateNobody[..,reoffer] counts all)");
+        return townreoffer::kOneMade;
+    }
     int atLoad = 1;   /* T-515: read LIVE under the lock - the step may have marked the entry after this check-up copied its rows; an owed row with no entry here: 1 (above) */
     TgLockInit(); ::EnterCriticalSection(&g_tgLock);
     { const std::map<std::string, T392ResPend>::const_iterator e = g_t392Res.find(key); if (e != g_t392Res.end()) atLoad = e->second.stateAtLoad; }
     ::LeaveCriticalSection(&g_tgLock);
     std::string st, pa;
     const long long skip805 = g_t805RerunSkipped;   /* LOW 8: a player's house is skipped inside the run (TownGenPlayerHouseSkip) */
-    const int r = T392RerunBuilding(town, factory, b, s, atLoad, &st, &pa);   /* the entry stays until the run actually happened */
+    T1099Bld bb; bb.sid = sid.c_str(); bb.key = key.c_str(); bb.bt = bt; bb.x = row.x; bb.z = row.z; bb.ax = rSx >= 0 ? rSx : s.x; bb.ay = rSx >= 0 ? rSy : s.y;   /* T-1099: the decision's own arguments, above */
+    const int r = T392RerunBuilding(town, factory, b, s, atLoad, &st, &pa, &bb);   /* the entry stays until the run actually happened */
     const int phSkip = (g_t805RerunSkipped != skip805) ? 1 : 0;
     o1->ran = r;
     if (r < 0) { T392ResErase(key.c_str()); if (stored != 0) OwedSendDone(owedpop::kKindResidents, key, owedpop::kWhyFault); ::InterlockedIncrement64(&g_t392ReFault); T392ReofferLog("residents", sid, "fault", extra); return townreoffer::kOneFault; }   /* an owed row is handed back and tried again, spaced; work only this game knows is not retried */
@@ -3456,17 +3620,22 @@ static int T392ReofferOne(void* town, void* factory, const std::string& sid, con
         if (after == owedpop::kRunKeep)   /* T-580: no residents made - the entry stays, up to the bound; an owed row stays this game's (no DONE) */
         {
             if (kept == 1) DebugLog("[TOWN] reoffer kind=residents town=" + sid + " result=waiting why=notebook-pending-in-rerun" + extra + " made=0 refused=" + N(pendR) + pa + st
-                                    + " (the entry stays; first only per building; given up after " + N((long long)townpending::kMaxKeptReruns) + " such re-runs this session)");
+                                    + " (the entry stays; first only per building; parked after " + N((long long)townpending::kMaxKeptReruns) + " such re-runs until the refusing note no longer holds the building)");
             return townreoffer::kOneKept;
         }
         if (after == owedpop::kRunGiveUpRelease || after == owedpop::kRunGiveUpLocal)
         {
-            T392ResErase(key.c_str()); ++g_t580RerunGivenUp;
-            /* T-581: the owed row is NOT removed - it is handed back (RELEASE) so another holder, or a later session, offers it
-               again; this game skips it for the rest of the session (g_t580KeptByKey, cleared with the world) */
-            if (after == owedpop::kRunGiveUpRelease) OwedSendKey(owedpop::kOpRelease, owedpop::kKindResidents, key, " why=notebook-pending-in-rerun given up this session");
-            DebugLog("[TOWN] reoffer kind=residents town=" + sid + " result=given-up why=notebook-pending-in-rerun" + extra + " reruns=" + N((long long)kept)
-                     + " - the building's residents are not offered again this session" + (after == owedpop::kRunGiveUpRelease ? std::string(" (owed row handed back)") : std::string()));
+            /* T-1099: PARKED under the note that refused the run, not dropped: the entry stays (the check-up, a purchase and the repair skip
+               a parked building) and an owed row is handed back (RELEASE) so another holder may offer it; the end of every pending-notes
+               publish un-parks it once that note no longer holds the building (TownGenUnparkAfterPublish), and the check-up offers it again */
+            const std::string note = townpending::NoteIdOfHolder(std::string(g_t1099RunHolder));
+            T1099ParkRow pr; pr.sid = sid; pr.note = note; pr.bt = bt; pr.x = row.x; pr.z = row.z; pr.ax = rSx >= 0 ? rSx : s.x; pr.ay = rSx >= 0 ? rSy : s.y;
+            TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_t1099Parked[key] = pr; ::LeaveCriticalSection(&g_tgLock);
+            ++g_t580RerunGivenUp; ++g_t1099ParkN;
+            if (after == owedpop::kRunGiveUpRelease) OwedSendKey(owedpop::kOpRelease, owedpop::kKindResidents, key, " why=notebook-pending-in-rerun parked");
+            DebugLog("[TOWN] reoffer kind=residents town=" + sid + " result=parked why=notebook-pending-in-rerun" + extra + " reruns=" + N((long long)kept)
+                     + " note=" + (note.empty() ? std::string("?") : note) + " holder=" + std::string(g_t1099RunHolder[0] != 0 ? g_t1099RunHolder : "?")
+                     + " - offered again once that note no longer holds the building" + (after == owedpop::kRunGiveUpRelease ? std::string(" (owed row handed back)") : std::string()));
             return townreoffer::kOneGivenUp;
         }
         T392ResErase(key.c_str());   /* it ran: a squad was made, or the engine chose none and nothing refused it */
@@ -3491,10 +3660,10 @@ static void T392ReofferResidents(void* town, const std::string& sid)
            before its residents were made, here or on another game). An owed row's building-state step ran when its zone was first
            loaded on this game - set aside, refused or made - so the re-run never repeats it (stateAtLoad 1). */
         std::map<std::string, T392ResPend> view;
-        for (std::map<std::string, T392ResPend>::const_iterator it = g_t392Res.begin(); it != g_t392Res.end(); ++it) if (it->second.sid == sid) view[it->first] = it->second;
+        for (std::map<std::string, T392ResPend>::const_iterator it = g_t392Res.begin(); it != g_t392Res.end(); ++it) if (it->second.sid == sid && g_t1099Parked.count(it->first) == 0) view[it->first] = it->second;   /* T-1099: a parked building waits for its note */
         for (owedpop::Table::const_iterator o = g_owed.begin(); o != g_owed.end(); ++o)
             if (o->second.kind == owedpop::kKindResidents && o->second.sid == sid && view.find(o->second.key) == view.end()
-                && townpending::KeptGiveUp(g_t580KeptByKey.count(o->second.key) != 0 ? g_t580KeptByKey[o->second.key] : 0) == 0)   /* T-580's give-up holds for the session: the row was handed back */
+                && g_t1099Parked.count(o->second.key) == 0)   /* T-1099: a parked building waits for its note (the row was handed back) */
             { T392ResPend p; p.sid = sid; p.x = o->second.x; p.z = o->second.z; p.stateAtLoad = 1; view[o->second.key] = p; }
         /* T-392 fold (review MED): ROUND-ROBIN - start just after the last key this town's check-up looked at and wrap once, so
            every waiting building is looked at however many wait; at most 8 per check-up */
@@ -3517,6 +3686,37 @@ static void T392ReofferResidents(void* town, const std::string& sid)
         T392ReofferOne(town, factory, sid, keys[i], rows[i], rSx, rSy, &o1);
     }
 }
+/* T-1099 - UN-PARK, MAIN THREAD (the end of every pending-notes publish, store.cpp PublishPendingTowns): only the parked list is walked.
+   A building whose note no longer holds it by the building's own question, asked with the decision's arguments (the note gone, released,
+   no longer homed there, or another note named), is un-parked: its kept count starts again and the town's next check-up offers it as any
+   waiting building (its own decision waits on a note that still holds it, without a run). */
+static void T1099UnparkWalk()
+{
+    if (g_mainThread == 0 || ::GetCurrentThreadId() != g_mainThread) return;
+    std::vector<std::pair<std::string, T1099ParkRow> > parked;
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+    for (std::map<std::string, T1099ParkRow>::const_iterator it = g_t1099Parked.begin(); it != g_t1099Parked.end(); ++it) parked.push_back(*it);
+    ::LeaveCriticalSection(&g_tgLock);
+    for (size_t i = 0; i < parked.size(); ++i)
+    {
+        const std::string& key = parked[i].first;
+        const T1099ParkRow& p = parked[i].second;
+        char holder[192]; holder[0] = 0;
+        const int a = StoreBuildingPeoplePending(p.sid.c_str(), key.c_str(), p.bt, p.x, p.z, p.ax, p.ay, holder, 192);
+        holder[191] = 0;
+        if (townpending::ParkStays(a, p.note, std::string(holder)) != 0) continue;
+        bool erased = false;
+        TgLockInit(); ::EnterCriticalSection(&g_tgLock);
+        erased = g_t1099Parked.erase(key) != 0;
+        if (erased) g_t580KeptByKey.erase(key);
+        ::LeaveCriticalSection(&g_tgLock);
+        if (!erased) continue;
+        ++g_t1099UnparkN;
+        DebugLog("[TOWN] reoffer kind=residents town=" + p.sid + " result=unparked building=" + key + " note=" + (p.note.empty() ? std::string("?") : p.note)
+                 + " now=" + std::string(a == townpending::kTownHeld ? "held by " + std::string(holder) : a == townpending::kTownElsewhere ? "listed elsewhere" : "not listed")
+                 + " - the town's next check-up offers it again");
+    }
+}
 /* OWNER DECISIONS 809 b / 813 b - A PURCHASE OF A HOUSE WHOSE RESIDENTS ARE ON HOLD, MAIN THREAD (build.cpp's buy-callback detour,
    and BdCopyOneBody before it applies another game's purchase). The house's waiting entry - this game's own, else an owed residents row
    for its key - is offered NOW through the check-up's own steps (T392ReofferOne: the same gate, so it may set the residents aside
@@ -3536,14 +3736,22 @@ static int T805BuyHeld(void* b)
     TgLockInit(); ::EnterCriticalSection(&g_tgLock);
     {
         const std::map<std::string, T392ResPend>::const_iterator e = g_t392Res.find(key);
-        if (e != g_t392Res.end()) { row = e->second; has = 1; }
+        if (e != g_t392Res.end()) { if (g_t1099Parked.count(key) == 0) { row = e->second; has = 1; } }   /* T-1099: a parked building waits for its note */
         else
             for (owedpop::Table::const_iterator o = g_owed.begin(); o != g_owed.end(); ++o)   /* as the check-up's view: an owed row this game has no entry for */
                 if (o->second.kind == owedpop::kKindResidents && o->second.key == key
-                    && townpending::KeptGiveUp(g_t580KeptByKey.count(key) != 0 ? g_t580KeptByKey[key] : 0) == 0)
+                    && g_t1099Parked.count(key) == 0)
                 { row.sid = o->second.sid; row.x = o->second.x; row.z = o->second.z; row.stateAtLoad = 1; has = 1; break; }
     }
+    int wasParked = 0;
+    if (has == 0 && g_t1099Parked.count(key) != 0) { g_t1099Parked.erase(key); wasParked = 1; }   /* bought while parked: the purchase goes on without its residents (owner 813 b) */
     ::LeaveCriticalSection(&g_tgLock);
+    if (wasParked != 0)
+    {
+        T392ResErase(key.c_str());
+        DebugLog("[TOWN] buy of a parked building key=" + key + ": its waiting residents dropped and the park cleared - the purchase goes on without them");
+        return 0;
+    }
     if (has == 0) return 0;
     ++g_t805BuyAsked;
     void* const town = TownOfBuilding(b);
@@ -3612,7 +3820,7 @@ static void T392Reoffer(void* town)
 }
 static void T392Teardown()
 {
-    TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_t392Res.clear(); g_t392ResCursor.clear(); g_t798WhyLogged.clear(); g_t798GroupFaults.clear(); g_t392RepairCursor.clear(); g_t392Repaired.clear(); g_t392AsideTowns.clear(); g_t392DeferLogged.clear(); g_t392WaitLogged.clear(); g_t392AsideLogged.clear(); g_owedBars.clear(); g_owedBarSettled.clear(); g_t805Logged.clear(); g_t1076Loading.clear(); g_t1076LoadingBars.clear(); /* T-1076 */ ::LeaveCriticalSection(&g_tgLock);   /* T-581: this game's own owed work belongs to the world that set it aside; the world server's rows stay */
+    TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_t392Res.clear(); g_t392ResCursor.clear(); g_t798WhyLogged.clear(); g_t798GroupFaults.clear(); g_t392RepairCursor.clear(); g_t392Repaired.clear(); g_t392AsideTowns.clear(); g_repairReopenAsked.clear(); g_t392DeferLogged.clear(); g_t392WaitLogged.clear(); g_t392AsideLogged.clear(); g_owedBars.clear(); g_owedBarSettled.clear(); g_t805Logged.clear(); g_t1076Loading.clear(); g_t1076LoadingBars.clear(); /* T-1076 */ ::LeaveCriticalSection(&g_tgLock);   /* T-581: this game's own owed work belongs to the world that set it aside; the world server's rows stay */
     g_t392Factory = 0; g_t392PopTid = 0; g_t392PopAside = 0;
     /* the people this world made are gone with it unless a save asked for after their make is still being written
        (owedpop::SettleKeep: that save settles them when it finishes, or OwedTick drops them when it does not); a dropped row stays
@@ -3686,16 +3894,17 @@ static void OwedArrive(const std::vector<char>& payload)
         {
             const owedpop::Row& r = m.rows[i];
             const std::string tk = owedpop::TableKey(r.kind, r.key);
-            bool grant = false;
+            bool grant = false, reopened = false;
             TgLockInit(); ::EnterCriticalSection(&g_tgLock);
             { const owedpop::Table::const_iterator p = g_owed.find(tk); grant = r.claimant == (int)owedpop::kClaimYou && (p == g_owed.end() || p->second.claimant != (int)owedpop::kClaimYou); }
             g_owed[tk] = r;
-            if (r.kind == owedpop::kKindResidents) { const std::map<std::string, T392ResPend>::iterator l = g_t392Res.find(r.key); if (l != g_t392Res.end()) l->second.acked = 1; }
+            if (r.kind == owedpop::kKindResidents) { const std::map<std::string, T392ResPend>::iterator l = g_t392Res.find(r.key); if (l != g_t392Res.end()) l->second.acked = 1; reopened = g_repairReopenAsked.erase(r.key) != 0; }
             else { const std::map<std::string, OwedBarLocal>::iterator l = g_owedBars.find(r.key); if (l != g_owedBars.end()) l->second.acked = 1; }
             ::LeaveCriticalSection(&g_tgLock);
             g_owedAsked.erase(tk); g_owedReleased.erase(tk);
             ++g_owedRowsIn;
             if (r.claimant == (int)owedpop::kClaimYou) ++mineN;
+            if (reopened) { ++g_repairReopenAccepted; RepairReopenLine("accepted", r.key, "[OWED] reopen accepted " + OwedText(r.kind, r.key, r.sid) + " - its filled mark is lifted and the row stored; the game holding the area claims and makes it"); }
             if (grant) { ++g_owedGrants; OwedLine("[OWED] given " + OwedText(r.kind, r.key, r.sid) + " to this game (it makes it at its next town check-up while it holds the area)"); }
         }
         const std::string rowsLine = "[OWED] rows in=" + N((long long)m.rows.size()) + " thisGame's=" + N(mineN) + " table=" + N((long long)OwedRowCount());
@@ -3716,9 +3925,20 @@ static void OwedArrive(const std::vector<char>& payload)
     }
     else if (m.kind == owedpop::kKindResidents) { g_t392Res.erase(m.key); g_t1076Loading.erase("res|" + m.key); }   /* made, or seen there, by some game: this game's own entry ends too */
     else { g_owedBars.erase(m.key); g_owedBarSettled.insert(m.key); }
+    const bool reopenNo = m.kind == owedpop::kKindResidents && owedpop::ReopenRefused(m.why) != 0;
+    const bool reopenFull = m.kind == owedpop::kKindResidents && owedpop::GoneKeepsLocal(m.why) != 0 && g_repairReopenAsked.count(m.key) != 0;
+    if (m.kind == owedpop::kKindResidents) g_repairReopenAsked.erase(m.key);
+    if (reopenNo) g_t392Repaired.erase(m.key);   /* refused: the next repair look reads the building again, live */
     ::LeaveCriticalSection(&g_tgLock);
     g_owedAsked.erase(tk); g_owedReleased.erase(tk);
     if (owedpop::GoneKeepsLocal(m.why) != 0) ++g_owedRefusedFull; else ++g_owedGoneIn;
+    if (reopenFull) ++g_repairReopenFull;
+    if (reopenNo)
+    {
+        ++g_repairReopenRefused;
+        RepairReopenLine(owedpop::WhyName(m.why), m.key, "[OWED] reopen refused " + OwedText(m.kind, m.key, sid) + " why=" + owedpop::WhyName(m.why)
+                         + " - the filled mark stays; the building's repaired mark is cleared, so the next repair look reads it again live");
+    }
     OwedLine("[OWED] removed " + OwedText(m.kind, m.key, sid) + " why=" + owedpop::WhyName(m.why)
              + (wasSettling ? std::string(" (made here and not saved yet - removed on another game's report)") : std::string()));
 }
@@ -4211,8 +4431,10 @@ static int TfBuildingPod(void* b, void* town, int* owned, int* pop)
    while the town refill's own gate is open (ErTownGate: held strictly, settled, the push, snapshot and link in) and once per town
    per kErLookMs, the town's buildings loaded in any zone (LoadedBuildings, kept when the building's town is this town and it can hold residents, by its key) are looked at, at most
    kT392RepairPerCheckup per check-up, round-robin; one owedpop::T392MayRepairEmpty allows is set aside again (T392ResRecord, its
-   building-state step marked as run - it ran when the zone first loaded). Its ADD goes up at this check-up's end; a later check-up
-   offers it like any set-aside building, every gate asked again live; a world server that has it as filled answers GONE has. */
+   building-state step marked as run - it ran when the zone first loaded). It goes up as REOPEN (owedpop::ReopenDecide) at this
+   check-up's end: a world server that has it as filled lifts the mark only for the area's holder with no town loss and no living
+   record homed there, and stores it as an ADD; a refusal clears its repaired mark (OwedArrive) so the next look here reads it again.
+   A later check-up offers it like any set-aside building, every gate asked again live. */
 const int kT392RepairPerCheckup = 8;
 static void T392RepairEmpty(void* town, const std::string& sid)
 {
@@ -4273,7 +4495,7 @@ static void T392RepairEmpty(void* town, const std::string& sid)
         int entry = 0, repairedBefore = 0;
         TgLockInit(); ::EnterCriticalSection(&g_tgLock);
         entry = g_t392Res.count(keys[i]) != 0 ? 1 : 0;
-        repairedBefore = (g_t392Repaired.count(keys[i]) != 0 || townpending::KeptGiveUp(g_t580KeptByKey.count(keys[i]) != 0 ? g_t580KeptByKey[keys[i]] : 0) != 0) ? 1 : 0;
+        repairedBefore = (g_t392Repaired.count(keys[i]) != 0 || g_t1099Parked.count(keys[i]) != 0) ? 1 : 0;   /* T-1099: a parked building waits for its note */
         ::LeaveCriticalSection(&g_tgLock);
         const int recordsHome = StoreRecordsHomedAt(keys[i]) > 0 ? 1 : 0;
         void* bt = 0;
@@ -4290,16 +4512,27 @@ static void T392RepairEmpty(void* town, const std::string& sid)
                          + " townAsideBefore=" + N((long long)asideBefore) + " candidates=" + N((long long)mine.size()));
             continue;
         }
+        {
+            char tsN[96];
+            if (bt != 0 && tplnobody::Skips(T1090TplCanMakePod(bt, tsN, (int)sizeof tsN)) != 0)
+            {
+                /* T-1090: the building's template makes nobody - not set aside, no REOPEN and no ADD */
+                ++g_t1090RepairNobody;
+                T1090NobodyLine("repair", keys[i], "[TOWN] repair kind=residents town=" + sid + " not-repaired why=template-nobody bld=" + keys[i] + " template=" + std::string(tsN)
+                                + " (first per building; repairNobody= counts all)");
+                continue;
+            }
+        }
         T392ResRecord(keys[i].c_str(), sid.c_str(), bp[0], bp[2]);
         TgLockInit(); ::EnterCriticalSection(&g_tgLock);
-        { const std::map<std::string, T392ResPend>::iterator e = g_t392Res.find(keys[i]); if (e != g_t392Res.end()) e->second.stateAtLoad = 1; }
+        { const std::map<std::string, T392ResPend>::iterator e = g_t392Res.find(keys[i]); if (e != g_t392Res.end()) { e->second.stateAtLoad = 1; e->second.reopen = 1; } }   /* its row goes up as REOPEN */
         g_t392Repaired.insert(keys[i]);
         ::LeaveCriticalSection(&g_tgLock);
         ++g_t392RepairSetAside;
         if (++g_t392RepairLines <= 40)
             DebugLog("[TOWN] repair kind=residents town=" + sid + " building=" + keys[i] + " result=set-aside why=empty-nothing-owed"
                      + " repairOldWorlds=" + N((long long)owedpop::kT392RepairOldWorlds)
-                     + " (its ADD goes now and a later check-up offers it; first 40, residentsRepaired[...] counts all)");
+                     + " (its REOPEN goes now - the world server judges it live and may lift a filled mark - and a later check-up offers it; first 40, residentsRepaired[...] counts all)");
     }
 }
 static void TfEndTown(const std::map<std::string, TfTown>::iterator& it, const std::string& why)
@@ -4416,7 +4649,7 @@ static void TownFillTick()
         if (factory == 0) { ++g_tfNoFactory; if (TfPutOff(sid, B, now, "no-factory") != 0) ++T.cursor; else T.left.erase(T.left.begin() + T.cursor); continue; }   /* no RootObjectFactory known yet */
         ++runs; ++B.tries;
         std::string st, pa;
-        const int r = T392RerunBuilding(town, factory, b, bs, 1, &st, &pa);   /* 1: the building's state step ran when its zone first loaded - not repeated */
+        const int r = T392RerunBuilding(town, factory, b, bs, 1, &st, &pa, 0);   /* 1: the building's state step ran when its zone first loaded - not repeated; 0: no building named - its creations ask the town's question */
         const long long made = g_t580RunMade;
         const long long refused = (g_t581RunAsked - g_t581RunReached) + g_t580RunPending;
         const int after = townrefill::FillAfterRun(r, made, refused, B.tries);
@@ -4604,7 +4837,7 @@ void SetTownGenOn(bool on) { g_on = on; DebugLog(std::string("[TOWN] towngen ") 
 /* P8a: the world's groups are gone with the world, so the id set goes with the refusal keys beside it - a recycled
    pointer or a re-used id from a previous world must never answer `towngen` for a character in this one. */
 void TownGenWorldTeardown() { TownRefillTeardown(); ZonesSlotsSeenReset("world teardown");   /* review-recruit3 5b: auto counts THIS world's players only */
-                             TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_refusedTowns.clear(); g_refusedByTown.clear(); g_pendingLogAt.clear(); g_elsewhereByTown.clear(); g_t580KeptByKey.clear(); g_allowedTowns.clear(); g_tgCreatedIds.clear(); ::LeaveCriticalSection(&g_tgLock); { TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_barPend.clear(); ::LeaveCriticalSection(&g_tgLock); } /* T-392 */ T392Teardown(); /* PROBE P085 */ for (int p085i = 0; p085i < 4096; ++p085i) { g_p085Squads[p085i] = 0; g_p085Residents[p085i] = 0; } /* refill1 */ RefillTeardown(); /* towns2 */ Towns2Teardown(); }   /* F666: a Town pointer belongs to the world that made it */
+                             TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_refusedTowns.clear(); g_refusedByTown.clear(); g_pendingLogAt.clear(); g_elsewhereByTown.clear(); g_t580KeptByKey.clear(); g_t1099Parked.clear(); g_allowedTowns.clear(); g_tgCreatedIds.clear(); ::LeaveCriticalSection(&g_tgLock); { TgLockInit(); ::EnterCriticalSection(&g_tgLock); g_barPend.clear(); ::LeaveCriticalSection(&g_tgLock); } /* T-392 */ T392Teardown(); /* PROBE P085 */ for (int p085i = 0; p085i < 4096; ++p085i) { g_p085Squads[p085i] = 0; g_p085Residents[p085i] = 0; } /* refill1 */ RefillTeardown(); /* towns2 */ Towns2Teardown(); }   /* F666: a Town pointer belongs to the world that made it */
 int TownGenMadeThisPlatoon(const char* platoonId)
 {
     if (platoonId == 0 || platoonId[0] == 0) return 0;
@@ -4623,7 +4856,8 @@ static std::string PerTownCounts()
     TgLockInit(); ::EnterCriticalSection(&g_tgLock);
     for (std::map<std::string, long long>::const_iterator it = g_refusedByTown.begin(); it != g_refusedByTown.end(); ++it) s += " refused['" + it->first + "']=" + N(it->second);
     if (g_pendingElsewhere != 0) s += " pendingElsewhere=" + N(g_pendingElsewhere);   /* T-580: town checks (squad creations and bar-resident rolls) decision 34 let through because every listed note of the town has a known position in an area that does not hold it */
-    if (g_t580RerunKept != 0) s += " rerunKeptPending=" + N(g_t580RerunKept) + " rerunGivenUpPending=" + N(g_t580RerunGivenUp);   /* T-580: residents re-runs that made nothing because decision 34 refused (kept, or given up at the bound) */
+    if (g_t580RerunKept != 0) s += " rerunKeptPending=" + N(g_t580RerunKept) + " rerunGivenUpPending=" + N(g_t580RerunGivenUp);   /* T-580: residents re-runs that made nothing because decision 34 refused (kept, or parked at the bound - the same count as rerunParked) */
+    if (g_t1099ParkN != 0 || g_t1099AskBuilding != 0) s += " rerunAskBuilding=" + N(g_t1099AskBuilding) + " rerunParked=" + N(g_t1099ParkN) + " rerunUnparked=" + N(g_t1099UnparkN) + " parkedNow=" + N((long long)g_t1099Parked.size());   /* T-1099: re-run creations asked the building's own question; re-runs parked at the bound, un-parked, parked now */
     for (std::map<std::string, long long>::const_iterator it = g_elsewhereByTown.begin(); it != g_elsewhereByTown.end(); ++it) s += " pendingElsewhere['" + it->first + "']=" + N(it->second);
     ::LeaveCriticalSection(&g_tgLock);
     return s;
@@ -4661,9 +4895,11 @@ void ReportTownGen()
              + OwedReport() + TownRefillReport()
              + " pending[refused,barFliesDeferred,residentsSetAside,residentsSetAsideNoKey,residentsSetAsideWaitingNow,reofferWaitsOnNote,homesGivenAtCheck]=" + N(g_refusedPending) + "," + N(g_barFliesDeferredPending) + "," + N(g_t591PendAside) + "," + N(g_t591PendAsideNoKey) + "," + N(T591WaitingNow()) + "," + N(g_t591WaitOnNote) + "," + N(g_t591HomeGivenAtCheck) + StoreHomeReport() + T805Report() + " residentsKeylessWaits=" + N(g_t591KeylessWaits)
              + " residentsWaitWhy[listUnread,groupHomeUnread,keylessGroup,handUnread,buildingNotFound]=" + N(g_t798WaitWhy[0]) + "," + N(g_t798WaitWhy[1]) + "," + N(g_t798WaitWhy[2]) + "," + N(g_t798WaitWhy[3]) + "," + N(g_t798WaitWhy[4])
+             + " repairNobody=" + N(g_t1090RepairNobody) + " templateNobody[aside,reoffer]=" + N(g_t1090AsideNobody) + "," + N(g_t1090ReofferNobody)
              + " residentsRepaired[looked,setAside,listFull,gateShut,notPopulatable,refused]=" + N(g_t392RepairLooked) + "," + N(g_t392RepairSetAside) + "," + N(g_t392RepairListFull) + "," + N(g_t392RepairGateShut) + "," + N(g_t392RepairNotPop) + "," + N(g_t392RepairRefused)
              + " residentsGroupFaultGivenUp=" + N(g_t798GroupFaultGivenUp) + " cached[linked]=" + N((long long)g_linkedCached)
              + " mainThread=" + N((long long)g_mainThread) + (g_mainThreadFromTick ? "(tick)" : "(preload)") + " barFlies[seen=leverOff+noTown+readFault+allowed+refused+refusedUnlinked; off; drainFault; drainOddCount; budgetEntriesDropped(each 0..N squads)]=" + N(g_barFliesSeen) + "=" + N(g_barFliesLeverOff) + "+" + N(g_barFliesNoTown) + "+" + N(g_barFliesReadFault) + "+" + N(g_barFliesAllowed) + "+" + N(g_barFliesRefused) + "+" + N(g_barFliesRefusedUnlinked) + " deferredNotDrained=" + N(g_barFliesDeferred) + ";" + N(g_barFliesOff) + ";" + N(g_barFliesDrainFault) + ";" + N(g_barFliesDrainOdd) + ";" + N(g_barFliesDropped) + PerTownCounts()
+             + " repairReopen[sent,stored,refused,full]=" + N(g_repairReopenSent) + "," + N(g_repairReopenAccepted) + "," + N(g_repairReopenRefused) + "," + N(g_repairReopenFull)
              + "  |  seen = leverOff + noTown + refusedUnlinked + unlinkedAllowed + readFault + noLease + refusedNoLease + allowed + refused + t392 squadsSetAside (T-438); offThread spans ALL buckets, off[] only the six lease ones; sum(refused[...]) = refused + refusedNoLease + refusedUnlinked + barFlies refused + barFlies refusedUnlinked (creations and bar passes mixed; keys reset per world, totals never)."
                "  DECISION 48 (P8a): the three towngen* numbers are the whole rule, and THEIR UNIT IS CREATION DECISIONS,"
                " NOT PEOPLE - a town-squad creation and one whole bar-resident pass each count 1, and the two gates are"
@@ -4696,6 +4932,7 @@ namespace coop { int TownGenResidentsGate(void* factory, void* building) { retur
 namespace coop { int TownGenPlatoonHomeKey(const void* platoon, char* out, int cap) { return T591HomeKey(platoon, out, cap); } }   /* see towngen.h */
 namespace coop { int TownGenRepairMarks(const std::string& buildingKey, int* repaired, int* owedSettling) { *repaired = 0; *owedSettling = 0; if (buildingKey.empty()) return 0; TgLockInit(); ::EnterCriticalSection(&g_tgLock); *repaired = (g_t392Repaired.count(buildingKey) != 0) ? 1 : 0; ::LeaveCriticalSection(&g_tgLock); *owedSettling = OwedSettling(owedpop::kKindResidents, buildingKey); return 1; } }   /* T-984 (TEST lever's read): see towngen.h */
 namespace coop { int TownGenGiveHomeTo(void* platoon, void* building) { return T591GiveHomeTo(platoon, building); } }   /* see towngen.h */
+namespace coop { void TownGenUnparkAfterPublish() { T1099UnparkWalk(); } }   /* T-1099: see towngen.h */
 namespace coop { int TownGenGiveHomeByKey(void* platoon, const char* key) { if (platoon == 0 || key == 0 || key[0] == 0) return 0; void* const b = ObjectByPositionKey(key); return b == 0 ? 3 : T591GiveHomeTo(platoon, b); } }   /* see towngen.h */
 namespace coop { int TownGenPlayerHouse(void* building) { return T805PlayerHouse(building); } }   /* see towngen.h */
 namespace coop { int TownGenPlayerHouseSkip(void* building, int rerun) { return T805PopulateSkip(building, rerun); } }   /* see towngen.h */

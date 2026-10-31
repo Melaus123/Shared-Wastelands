@@ -104,7 +104,7 @@ int StoreTownGoneUnsent(const std::string& townSid);   /* MAIN THREAD - this gam
 int StoreRecordFacts(const std::string& worldId, int* owner, long long* writtenAt, int* gone, std::string* home);   /* T-984 (TEST lever's read), MAIN THREAD: 1 = a record of this world id is held here (*owner = the slot that wrote it, *writtenAt its stamp - 0 = a position-only entry, *gone = wiped out / thrown away); *home = the home key the records carry (g_homeOf: "" none, "-" cleared) either way */
 int StoreRecordsHomedAt(const std::string& buildingKey);   /* MAIN THREAD - living world records whose group's home building is this key (the town refill's home test) */
 int StoreTownGoneThisLaunch(const std::string& townSid);   /* MAIN THREAD - groups of this town this game deleted since it started */
-std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id */
+std::string StorePendNoteCommand(const std::string& op, const std::string& town, float x, float z, const std::string& kind = std::string(), const std::string& homeKey = std::string());   /* TEST-ONLY (pendnote verb, T-580), main thread: test notes in decision 34's pending set; kind "" / stale / asleep picks the note's id; kind home (T-1099): a note homed at building homeKey */
 std::string StoreTestCommand(const std::string& arg);   /* TEST-ONLY (storetest verb), main thread: storetest nopos <worldId or part of one> | storetest nopos off */
 std::string DialoguePauseTestCommand(const std::string& arg);   /* TEST-ONLY (talkpause verb), main thread: talkpause on|off - a conversation window pauses the game as in single player */
 void NoteTownPeople(const std::string& worldId, const std::string& town);   /* main thread: a received note names its home town ("" = none) */
@@ -124,6 +124,8 @@ int StoreArHoldPeople(void* platoon);   /* T-1084 step 3: 1 = a save's group hel
 int StoreIsWakeDup(void* platoon);   /* 1 = a save copy whose wake was refused beside this game's live copy of the squad (its people are not adopted; it is destroyed); MAIN THREAD */
 int PlatoonHasSessionMembers(void* platoon);                          // section 13: 1 if any live member is a session uid
 int StoreIdOriginSlot(void* faction, const std::string& worldId, const void* skip, int* mySlot, int* numberBlock, int* why);   /* the squad's origin slot (squadorigin.h: its number's block, or for a save squad the game that runs it now; -1 = no answer); skip = a platoon not to read; *mySlot = this game's slot (-1 = no relay); *numberBlock = the number's own block; *why = the source that decided it (sqorigin::kBy...) */
+int StorePlatoonCopyOrigin(void* platoon, void* faction, const std::string& worldId);   /* sameidpair.h kCopyLive / kCopyFromRecord / kCopyFromSave: where this game's platoon of the squad came from. MAIN THREAD */
+int StorePlatoonOwnCopyOrigin(void* platoon, const std::string& worldId);   /* the same, under the platoon's own faction - what CONTEXT carries (sameidpair.h WireOfOrigin); kCopyUnknown unreadable. MAIN THREAD */
 int StorePlatoonActiveChars(void* platoon);                           /* inv7a3: the platoon's live member count, -1 if unreadable */
 int StoreRetireLocalCopy(void* platoon);
 int StorePlatoonBound(void* platoon);   /* 1 = the store keeps this squad (it answers 'persistent' for it), 0 = the engine's own rule decides. MAIN THREAD */
@@ -131,6 +133,18 @@ void StoreNoteUnloadEmptied(void* platoon, int offThread);   /* T-999 fold 3, MA
 void StoreModRemovalMark(void* platoon, int livingAfter);   /* T-1080: this game is about to remove a person of platoon; livingAfter = its living members left (-1 not read) - a squad left with nobody living keeps its record at its discard */
 void StoreOrphanEmptiedSquad(void* faction, void* active, void* platoonHint, int havePos, float x, float z, const void* const* gone, int goneN);   /* havePos / x / z: where the last person removed stood; gone: the people removed (compared by address only); platoonHint: their squad read before the destroy, looked up by address in the sleeping list when the squad is no longer awake - a squad this game's save split off another game's people is removed once empty (squadorigin.h SaveSplitDrop) */   /* T-300 fix 2, MAIN THREAD: the orphan purge removed people of this ActivePlatoon - another game's file-built squad in an area another game holds is thrown away once empty; a world NPC squad's copy forgets its record stamp once empty (squadwriter.h NpcPurgeForgetStamp) */
 bool PlatoonWipe(const std::string& worldId);
+// Owner 1205 a, TEST-ONLY lever `clearnear <x> <z> <r>` / `clearnear here <r>` (src/common/clearnear.h): every AWAKE outside squad
+// with a member within r of (x, z) - `here`: of this game's watched player character - that this game runs is removed through
+// PlatoonWipe (wandering groups only); player-side squads, squads the run spawned, a town's own squads (a home town that is a real
+// town - a nest home is not kept) and squads this game does not run are kept. `here` also sweeps around each other player's
+// character this game knows. One [CLEARNEAR] line per wiped squad. Returns the status line
+// `ok clearnear wiped=<n> base=<n> kept=<n> (players=<n> runSpawned=<n> notHolder=<n> town=<n>) faults=<n>`.
+// MAIN THREAD.
+std::string ClearNearLever(const std::string& args);
+// The run's own spawns, kept by clearnear: a character a spawn lever made (by its uid) and a squad a lever made (by its Platoon).
+// MAIN THREAD; bounded sets, written only by the TEST-ONLY spawn levers.
+void ClearNearNoteRunUid(unsigned int uid);
+void ClearNearNoteRunSquad(void* platoon);
 // E30-3 (P6p) lever, MAIN THREAD: quit through the GAME'S OWN pause-menu exit path, so a harness run
 // exercises the P6l hook on the confirm dialog's accept path without a human pressing Escape (F010: the
 // engine ignores injected input, so there is no other way to reach it). Returns false and logs WHY if it
@@ -223,6 +237,8 @@ long StoreMoneyLink();
 long StoreMoneyEdge();
 long long StoreMoneyBaseReads();
 bool StoreSendWorldRel(const std::vector<char>& payload);   /* par24: MAIN THREAD - an encoded WORLD_REL (SEED or CHANGE) to the notebook; false = the link is down */
+bool StoreSendTownVer(const std::vector<char>& b);   /* MAIN THREAD - an encoded TOWN_VER WRITE to the world server; false = the link is down */
+bool StoreTownVerLinkUp();                           /* MAIN THREAD - the world-server link is up and speaks this protocol */
 bool StoreSendTownBar(const std::vector<char>& payload);   /* refill1: MAIN THREAD - encoded TOWN_BAR rows to the notebook; false = the link is down */
 bool StoreSendOwed(const std::vector<char>& payload);   /* T-581: MAIN THREAD - one encoded OWED up message (src/common/owedpop.h); false = the link is down */
 bool StoreSendTownLoss(const std::vector<char>& payload);   /* MAIN THREAD - one encoded TOWN_LOSS up message (REFILLED, src/common/townrefill.h); false = the link is down */

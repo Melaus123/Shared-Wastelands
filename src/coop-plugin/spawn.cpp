@@ -19,6 +19,7 @@
 #include "handoff.h"   /* T-1 B1: SquadActivePlatoonOf - the verified squad reader */
 #include "../common/squadwriter.h"   /* M7a3f3 T-425 [m7a3f3-sc0]: SupersedeOwnIdAfterHandover */
 #include "../common/squadorigin.h"   /* the same-id supersede: OwnIdLiftedByLoadAge */
+#include "../common/sameidpair.h"   /* one live platoon per world squad id: the same-id copy yield and its twin step */
 #include "spawn.h"
 #include "addresses.h"   /* P8h: kXxxRva below is filled from the address table, not hard-coded */
 #include "playerfaction.h"   // P3: ResolveWireFaction (decision 23)
@@ -27,6 +28,7 @@
 #include "../common/lostcopy.h"   /* kCr*: which creation refusals would repeat on a re-send */
 #include "../common/templatekey.h"   /* T-922: a template travels by its stringID, a shown name only as the fallback */
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
+#include "../common/poselayer.h"  /* T-307: the layer table's held state as a pose - the pick and the settle rule */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
 #include "../common/squadevent.h"   // T-1084: sqevent::HomeChanged - a home hand that changed marks the squad's record due
@@ -105,6 +107,7 @@ namespace { swlogbudget::Gate g_qM1IntoNull, g_qM1IntoRef, g_qM1IntoCtx, g_qCtxR
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <intrin.h>   /* T-307: _ReturnAddress in the layer-play detour */
 
 #include <map>
 #include <set>
@@ -1401,6 +1404,7 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
 
     // We made it, so we are its authority - recorded unconditionally, session or not.
     net::SetLocalOwner(uid);
+    coop::ClearNearNoteRunUid(uid);   /* owner 1205 a: a lever's spawn is the run's own - the TEST-ONLY clearnear keeps its squad */
 
     if (replicate)
     {
@@ -1449,6 +1453,7 @@ bool SpawnTemplateNear(const std::string& templateName, unsigned int anchorUid, 
     if (!CreateAt(uid, templateName, std::string(), pos, "local", factionName, keepContainer, 0, 0, 0.0f))
         return false;
     net::SetLocalOwner(uid);
+    coop::ClearNearNoteRunUid(uid);   /* owner 1205 a: the run's own spawn - kept by the TEST-ONLY clearnear */
     net::SendSpawn(uid, templateName, pos.x, pos.y, pos.z, factionName, keepContainer, FindSpawned(uid));
     WatchLocalRoll(uid);
     if (uidOut) *uidOut = uid;
@@ -1485,7 +1490,7 @@ bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos,
 bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, const Ogre::Vector3& pos,
                             RootObjectContainer** containerOut, Building** buildingOut, int* memberOut);
 void FinishContextForSpawn(unsigned int uid, int memberType);
-bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos);
+bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos, const std::string& factionName);
 
 bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName, const std::string& templateSid,
                       float x, float y, float z,
@@ -1508,7 +1513,7 @@ bool ApplyRemoteSpawn(unsigned int uid, const std::string& templateName, const s
     // channel), build or reuse the platoon it names and create the copy INTO it, with its home building.
     // H027 (F435): if this instance ALREADY holds the character by the same handle (the save-derived dozen both
     // machines load), adopt that character as the puppet instead of creating a twin.
-    if (g_contextOn && AdoptExistingTwin(uid, Ogre::Vector3(x, y, z)))
+    if (g_contextOn && AdoptExistingTwin(uid, Ogre::Vector3(x, y, z), factionName))
     {
         AdoptRemotePuppet(uid);
         if (stats44 != 0) ApplyRemoteStats(uid, stats44, "SPAWN adopt");   // S1: the twin rolled its own stats too
@@ -5206,6 +5211,8 @@ bool ApplyHealth(unsigned int uid, const float* parts, int count, float blood)
 
 namespace { int GetupIsRagdoll(::Character* c); }   // T-178 crawl1: G1's guarded inRagdoll read (defined below)
 namespace { int SneakRead(const void* c); }   // the guarded stealth-mode read (Character +0xD4), defined below
+unsigned int StanceStateBits(const void* c);   // combat.cpp: the six stance buttons as STATE latchBits bits 8-14, the ranged mode 15-16 (statewire.h)
+void ApplyRemoteStance(unsigned int uid, void* c, unsigned int latchBits);   // combat.cpp: the owner's stance buttons onto its copy
 
 int SnapshotState(unsigned int uid, float* parts, int maxParts, float* blood,
                   int* prone, int* dead, unsigned int* latchBits, float* nextKnockoutAt, float* koTimer)
@@ -5224,6 +5231,7 @@ int SnapshotState(unsigned int uid, float* parts, int maxParts, float* blood,
     // positive evidence. ApplyLatch reads only bits 0-5.
     if (GetupIsRagdoll(c) != 0) bits |= coopgetup::kStateOwnerRagdollBit;
     bits = coopsneak::WithSneak(bits, SneakRead(c));   // the stealth mode rides as bit 7 (sneakwire.h); unreadable = not sneaking
+    bits |= StanceStateBits(c);   // the six stance buttons ride as bits 8-13, bit 14 = read (statewire.h WithStance); the ranged mode as bits 15-16 (WithRangedMode)
     if (latchBits)  *latchBits  = bits;
     if (nextKnockoutAt) *nextKnockoutAt = nk;
     if (koTimer)    *koTimer    = kt;
@@ -5295,7 +5303,7 @@ long long g_carryRateCapped = 0;        // copy: a wish held back by the 3-per-3
 long long g_carryConflictMine = 0;      // copy: the carrier to drop / swap / hand over is one THIS game drives - left alone (review-k1 item 2)
 long long g_carrySkippedBodyMine = 0;   // copy: the named body is one THIS game drives - no pickupObject (review-k1 item 3)
 long long g_carryBodyMineLogged = 0;
-long long g_proneStandSkippedUnconscious = 0;   // ApplyState: prone=0 not written over an owner latch 'unconscious, timer > 0' (review-k1 item 6)
+long long g_proneStandSkippedUnconscious = 0;   // ApplyState: prone=0 not written over an owner latch 'unconscious' (the clock is not asked: it reads 0 while carried)
 long long g_proneSkippedCarried = 0;    // ApplyState / ProneParkTick: prone NOT written while the copy is carried
 long long g_carryLogged = 0;
 long long g_carryOwnApplied = 0;        // arrest1: this game's own (helpless) body picked up by a copy carrier here
@@ -6060,7 +6068,8 @@ void GetupLogAfter(unsigned int uid, GetupWatch& w, ::Character* c)
 // wait, then goes ahead (counted once) - the looks then wait for the copy to stand instead (appearance.cpp). While it
 // holds, a copy whose owner says knocked out takes its first look standing (CopyKnockdownHeld, src/common/kolook.h). A copy that
 // is already LIMP (CopyLimpPod != 0 - crash1b: not merely flagged unconscious) never waits here: its looks wait until it stands
-// (appearance.cpp), and a body rebuild queued on it by another route is held by the createBody guard while it lies in ragdoll.
+// (appearance.cpp), and a body rebuild queued on it by another route is held by the createBody guard inside the ragdoll pass (an animal
+// also while it lies in ragdoll).
 static bool KnockdownMustWait(unsigned int uid, Character* c)
 {
     // crash1b (T323): only a copy that is ACTUALLY limp skips the wait - a copy merely flagged unconscious can still be
@@ -6380,13 +6389,16 @@ bool ApplyState(unsigned int uid, const float* parts, int count, float blood,
     NoteGetupState(uid, c, prone, latchBits, koTimer, fromPeer);   // T-178 crawl1: + the copy (carried / posed)
     // The owner's word on sneaking (bit 7); SneakApplyTick puts the copy in or out of stealth mode through the engine.
     NoteSneakWant(uid, latchBits, fromPeer);
+    // The owner's stance buttons (bits 8-13): set on a player character's copy through the engine's own setter (combat.cpp).
+    ApplyRemoteStance(uid, c, latchBits);
     // K1 item 3: while the copy is carried its prone state is NOT written - the owner reads prone=0 while
     // carried. Health and the latch (above) still apply.
     if (before != prone && BeingCarried(c)) { ++g_proneSkippedCarried; return false; }
-    // review-k1 item 6: while carried the owner reads 'standing + unconscious' (prone=0, the latch saying unconscious,
-    // the wake-up clock running). A knocked-out copy is not stood up for that - it would stand in the moment before
-    // its pick-up. Health and the latch (above) still apply.
-    if (before != prone && prone == 0 && (latchBits & coop::kLatchUnconcious) != 0 && koTimer > 0.0f)
+    // A copy its owner says is unconscious is not stood up by this write. While a knocked-out body is carried the owner
+    // reads 'standing + unconscious' (prone=0, the latch's unconscious bit - the engine's own MedicalSystem flag), and its
+    // wake-up clock reads 0 there, so the clock is not asked: standing the copy up would only have this game's engine drop
+    // it again, over and over, and in the moment before its pick-up it would stand. Health and the latch (above) still apply.
+    if (before != prone && prone == 0 && (latchBits & coop::kLatchUnconcious) != 0)
     { ++g_proneStandSkippedUnconscious; return false; }
 
     if (before != prone && !c->hasDied())
@@ -7285,6 +7297,33 @@ std::string GetupReportToken()
 unsigned long long kSetBedModeRva = 0; static coop::AddrReg kSetBedModeRva_reg("SetBedMode", &kSetBedModeRva);   /* the address table fills this. Steam_1.0.65 0x32E2B0 */   /* Character::setBedMode(bool on, UseableStuff* h) */
 unsigned long long kPlayActionByNameRva = 0; static coop::AddrReg kPlayActionByNameRva_reg("PlayActionByName", &kPlayActionByNameRva);   /* Steam_1.0.65 0x51F920 */   /* AnimationClass::playAction(const std::string&, float speedMult, float initialWeight, bool isStumble) */
 unsigned long long kStopActionRva = 0; static coop::AddrReg kStopActionRva_reg("StopAction", &kStopActionRva);   /* Steam_1.0.65 0x51D510 */   /* bool AnimationClass::stopAction() */
+/* T-307 (common/poselayer.h 3): the layer play - hooked - and the code that calls it: the animation update's controllers and
+   the layer-only tasks (their code ranges only; never called, so registered call-only - another mod's hook at one of their
+   entries does not stop the mod). AnimationClass layer play (anim, AnimationData*, float speed in xmm2, int layer, float on
+   the stack) - decomp_5b7030.txt:2-3, call sites decomp_51c920.txt:46 / decomp_353450.txt:106 (xmm2 / r9d / [rsp+0x20], Read). */
+unsigned long long kAnimLayerPlayRva = 0; static coop::AddrReg kAnimLayerPlayRva_reg("AnimLayerPlay", &kAnimLayerPlayRva);   /* Steam_1.0.65 0x5B7030, 1.0.68 0x5B7AC0 */
+unsigned long long kAnimCtlIdleRva = 0; static coop::AddrReg kAnimCtlIdleRva_reg("AnimCtlIdle", &kAnimCtlIdleRva, coop::kAddrUseCallOnly);   /* idle chooser, Steam_1.0.65 0x51C920, 1.0.68 0x51D3B0 */
+unsigned long long kAnimCtlLocoBlendRva = 0; static coop::AddrReg kAnimCtlLocoBlendRva_reg("AnimCtlLocoBlend", &kAnimCtlLocoBlendRva, coop::kAddrUseCallOnly);   /* walk / run blend, Steam_1.0.65 0x51CE50, 1.0.68 0x51D8E0 */
+unsigned long long kAnimCtlHeadTurnRva = 0; static coop::AddrReg kAnimCtlHeadTurnRva_reg("AnimCtlHeadTurn", &kAnimCtlHeadTurnRva, coop::kAddrUseCallOnly);   /* head turn, Steam_1.0.65 0x5B79A0, 1.0.68 0x5B8430 */
+unsigned long long kAnimCtlOtherRva = 0; static coop::AddrReg kAnimCtlOtherRva_reg("AnimCtlOther", &kAnimCtlOtherRva, coop::kAddrUseCallOnly);   /* role unread, treated as a controller, Steam_1.0.65 0x5F0C10, 1.0.68 0x5F16A0 */
+unsigned long long kAnimCtlMainSlotFillRva = 0; static coop::AddrReg kAnimCtlMainSlotFillRva_reg("AnimCtlMainSlotFill", &kAnimCtlMainSlotFillRva, coop::kAddrUseCallOnly);   /* the main-slot fill under playAction, Steam_1.0.65 0x51E020, 1.0.68 0x51EAB0 */
+/* the layer-only tasks (Steam 1.0.65 / 1.0.68; five rows are shared with the mod's own task hooks, which keep them strict) */
+const int kLayerTasks = 14;
+unsigned long long g_layerTaskRva[kLayerTasks] = { 0 };
+static coop::AddrReg kLayerTask0_reg("TaskAddMaterialsBody", &g_layerTaskRva[0], coop::kAddrUseCallOnly);   /* 'medic' 0x348810 / 0x348870 */
+static coop::AddrReg kLayerTask1_reg("TaskBuildBody", &g_layerTaskRva[1], coop::kAddrUseCallOnly);          /* 'medic' 0x34A3E0 / 0x34A440 */
+static coop::AddrReg kLayerTask2_reg("MedicTaskBody", &g_layerTaskRva[2], coop::kAddrUseCallOnly);          /* 'medic' 0x34E240 / 0x34E2A0 */
+static coop::AddrReg kLayerTask3_reg("AnimTaskRestrain", &g_layerTaskRva[3], coop::kAddrUseCallOnly);       /* 'Restraining' 0x34AEC0 / 0x34AF20 */
+static coop::AddrReg kLayerTask4_reg("TaskProcessSlaveBody", &g_layerTaskRva[4], coop::kAddrUseCallOnly);   /* 0x35A9C0 / 0x35AA20 */
+static coop::AddrReg kLayerTask5_reg("AnimTaskLoot", &g_layerTaskRva[5], coop::kAddrUseCallOnly);           /* 'medic' (loot) 0x34D8D0 / 0x34D930 */
+static coop::AddrReg kLayerTask6_reg("AnimTaskChopStatic", &g_layerTaskRva[6], coop::kAddrUseCallOnly);     /* 'chop down static' 0x353450 / 0x3534B0 */
+static coop::AddrReg kLayerTask7_reg("AnimTaskUnshackle", &g_layerTaskRva[7], coop::kAddrUseCallOnly);      /* shackles cut 0x359F20 / 0x359F80 */
+static coop::AddrReg kLayerTask8_reg("AnimTaskOther1", &g_layerTaskRva[8], coop::kAddrUseCallOnly);         /* 0x353BF0 / 0x353C50 */
+static coop::AddrReg kLayerTask9_reg("AnimTaskOther2", &g_layerTaskRva[9], coop::kAddrUseCallOnly);         /* 0x349230 / 0x349290 */
+static coop::AddrReg kLayerTask10_reg("AnimTaskCombatStance", &g_layerTaskRva[10], coop::kAddrUseCallOnly); /* 'combatstance' 0x347490 / 0x3474F0 */
+static coop::AddrReg kLayerTask11_reg("AnimTaskProspect", &g_layerTaskRva[11], coop::kAddrUseCallOnly);     /* Task_Prospecting run step (vtable +0x10), 'medic' 0x3485B0 / 0x348610 */
+static coop::AddrReg kLayerTask12_reg("TaskStripWeaponsBody", &g_layerTaskRva[12], coop::kAddrUseCallOnly); /* Task_StripWeapons run step (vtable +0x10), 'medic' 0x34E750 / 0x34E7B0 */
+static coop::AddrReg kLayerTask13_reg("AnimTaskTrainingDummy", &g_layerTaskRva[13], coop::kAddrUseCallOnly); /* Task_UseTrainingDummy run step (vtable +0x10), the dummy's own animation (named by 0x2972F0) 0x35C180 / 0x35C1E0 */
 unsigned long long kGetDroppedRva = 0; static coop::AddrReg kGetDroppedRva_reg("GetDropped", &kGetDroppedRva);   /* Steam_1.0.65 0x5CC110 */   /* Character::getDropped(bool, bool) - a carried body put down */
 unsigned long long kSetPrisonModeRva = 0; static coop::AddrReg kSetPrisonModeRva_reg("SetPrisonMode", &kSetPrisonModeRva);   /* arrest2: Steam_1.0.65 0x3305C0 */   /* Character::setPrisonMode(bool on, UseableStuff* cage) - prototype per the arrest2 engine read */
 
@@ -7312,6 +7351,13 @@ const size_t kPoseStumbleOff     = 0x228;   // AnimationClass : stumble - playAc
 const size_t kPoseVisualsOff     = 0xA8;    // AnimationClass : visuals - playAction needs them
 const size_t kPoseActNameOff     = 0x8;     // AnimationData : std::string name
 const size_t kPoseActLoopedOff   = 0x8A;    // AnimationData : looped flag (POSE-b: only a looped action is a pose)
+const size_t kPoseLayerTableOff  = 0xE0;    // T-307 AnimationClass : the layer table (an array of layer pointers; P185 / T1630)
+const size_t kPoseLayerCountOff  = 0x8;     // T-307 layer : state count
+const size_t kPoseLayerArrayOff  = 0x10;    // T-307 layer : state pointer array
+const size_t kPoseStateDataOff   = 0x30;    // T-307 layer state : AnimationData* (its name at +0x8, as the current action's)
+const size_t kPoseStateWeightOff = 0x44;    // T-307 layer state : weight (float)
+const size_t kPoseStateLoopedOff = 0x5D;    // T-307 layer state : looped flag
+typedef char kPoseLayerStrMaxSame[(poselayer::kStrMax == coopstate::kPoseStrMax) ? 1 : -1];   /* T-307: one name size */
 const size_t kPoseMoveSpeedOff   = 0xB8;    // CharMovement : speedNow (as replicate.cpp reads it)
 const float  kPoseOwnerStillSpeed = 0.5f;  // POSE-b: the owner counts as standing still below this (units/s)
 const float  kPoseApproachDist   = 1.6f;    // POSE-b: the copy poses only this close (horizontal) to the owner's streamed spot;
@@ -7343,6 +7389,19 @@ long long g_poseActionRefused = 0;   // copy: playAction refused (stumble / no v
 long long g_poseHeldFrames = 0;      // copy: frames its movement drive held it still
 long long g_poseOneOffSeen = 0;      // owner: a change whose action was a one-off (not looped) - not sent (POSE-b)
 long long g_poseOwnerMovingSeen = 0; // owner: a change whose looped action ran while the owner moved - not sent (POSE-b)
+long long g_poseHeldAfterUpdate = 0; // copy: T-890 - a held action played right after the copy's own Character::update
+long long g_poseFacingApplied = 0;   // copy: T-890 - a copy held in an action pose turned to its owner's streamed facing
+long long g_poseFromLayer = 0;       // owner: T-307 - a changed pose sent whose action came from the layer table (+0x210 empty)
+long long g_poseLayerBusySkip = 0;   // owner: T-307 - a layer-table read skipped: the AI worker ran (or could not be told)
+long long g_poseLayerFaults = 0;     // owner: T-307 - a layer-table read faulted part way
+long long g_poseLayerLogged = 0;     // owner: T-307 - '[POSE] layer send' lines printed
+const long long kPoseLayerLogLimit = 40;
+long long g_poseLayerNotAllowed = 0;  // owner: T-307 - a looped full-weight layer-1 pick refused, not started by a task (each time a character's refused name or caller type changes)
+long long g_poseLayerNotAllowedLogged = 0;   // owner: T-307 - '[POSE] layer pick refused' lines printed (one per distinct name and caller type)
+const long long kPoseLayerNotAllowedLogLimit = 20;
+std::set<std::string> g_poseLayerNotAllowedSeen;   // owner: T-307 - the refused 'name|caller type' keys already logged (MAIN THREAD)
+long long g_posePcLogged = 0;        // copy: T-307 - apply lines a player character's copy printed past the shared cap
+const long long kPosePcLogLimit = 32;
 long long g_posePendingApproach = 0; // copy: an action pose waiting for the copy to reach the owner's spot (once per want)
 long long g_poseUndoneHandoff = 0;   // copy: an applied pose undone because a handoff dropped its record (POSE-b)
 long long g_poseExpired = 0;         // copy: a pose no STATE re-confirmed for 10 s - undone and dropped (POSE-b)
@@ -7360,6 +7419,146 @@ struct PoseOwn
     DWORD pushedAt;                     // when this game last sent this character's pose
 };
 std::map<unsigned int, PoseOwn> g_poseOwn;
+std::map<unsigned int, poselayer::Cand> g_poseLayerCand;   // owner: T-307 - each owned character's layer pick (MAIN THREAD)
+std::map<unsigned int, std::string> g_poseLayerNotAllowedLast;   // owner: T-307 - each owned character's last refused 'name|caller type' (MAIN THREAD)
+
+// T-307 (common/poselayer.h 3): who put each layer state there. The layer-play detour runs on whatever thread the engine plays
+// an animation (the main thread or the AI worker - bug classes 'main-thread-only container read from an engine worker
+// detour' and 'engine callback assumed to run on the main thread'): it touches only the lock-free start table, the task and
+// controller ranges (written once at install, before the hook goes in) and counters - no std:: container, no log.
+typedef void (*AnimLayerPlayFn)(void* anim, void* rec, float speed, int layer, float weight);
+typedef unsigned short (WINAPI *LayerCaptureFn)(unsigned long skip, unsigned long count, void** frames, unsigned long* hash);
+AnimLayerPlayFn g_layerPlayOrig = 0;
+LayerCaptureFn g_layerCapture = 0;      // RtlCaptureStackBackTrace (ntdll), 0 = a caller outside the game stays no start
+const int kLayerStackDepth = 8;
+int g_layerStartOn = 0;                 // 1 the hook is in and every controller's code was found; 0 the layer rule refuses every pick
+poselayer::StartTable g_layerStarts;    // ANY THREAD writes (the detour), MAIN THREAD reads
+poselayer::Range g_layerTaskRanges[poselayer::kRangeCap];
+int g_layerTaskRangeCount = 0;
+poselayer::Range g_layerCtlRanges[poselayer::kRangeCap];
+int g_layerCtlRangeCount = 0;
+unsigned long long g_layerImageBegin = 0, g_layerImageEnd = 0;
+long long g_layerCallsMain = 0;         // detour: layer-play calls on the main thread (only that thread writes it)
+long long g_layerCallsOffMain = 0;      // detour: ... off the main thread (interlocked)
+long long g_layerNoteTask = 0;          // detour: notes written (not unchanged) for a task's call (interlocked)
+long long g_layerNoteCtl = 0;           // detour: ... a controller's call
+long long g_layerNoteUnknown = 0;       // detour: ... a call from game code that is neither a listed task nor a controller
+long long g_layerOutside = 0;           // detour: the return address lay outside the game (another mod's hook): the stack walked
+long long g_layerOutsideLost = 0;       // detour: ... and no frame inside the game was found (noted as no start: refused)
+long long g_layerNoteEvicted = 0;       // detour: the pair's slots were all taken - a note pushed out (table full)
+long long g_layerNoteDropped = 0;       // detour: every slot of the pair's window stayed busy with other writers - not noted
+long long g_poseLayerRefusedCtl = 0;    // owner: a looped full-weight layer-1 pick refused - a controller started it
+long long g_poseLayerRefusedUnknown = 0;   // owner: ... refused - an unknown caller started it
+long long g_poseLayerRefusedNone = 0;   // owner: ... refused - no start note (hook off, started before it, or pushed out)
+int g_layerOutsideLogged = 0;           // MAIN THREAD: the 'most calls come from outside the game' line printed
+
+void detour_animLayerPlay(void* anim, void* rec, float speed, int layer, float weight)
+{
+    unsigned long long ret = (unsigned long long)_ReturnAddress();
+    const unsigned long mainId = StoreMainThreadId();
+    if (mainId != 0 && ::GetCurrentThreadId() == mainId) ++g_layerCallsMain;
+    else ::InterlockedIncrement64(&g_layerCallsOffMain);
+    if (anim != 0 && rec != 0)
+    {
+        int kind = poselayer::CallerKind(ret, g_layerImageBegin, g_layerImageEnd, g_layerTaskRanges, g_layerTaskRangeCount,
+                                         g_layerCtlRanges, g_layerCtlRangeCount);
+        if (kind == poselayer::kCallerNone)   // only here: another mod's code called (or hooked) the layer play
+        {
+            ::InterlockedIncrement64(&g_layerOutside);
+            void* fr[kLayerStackDepth];
+            unsigned long long frames[kLayerStackDepth];
+            const int got = (g_layerCapture != 0) ? (int)g_layerCapture(0, kLayerStackDepth, fr, 0) : 0;
+            for (int i = 0; i < got && i < kLayerStackDepth; ++i) frames[i] = (unsigned long long)fr[i];
+            int at = -1;
+            kind = poselayer::FirstGameFrameKind(frames, got < kLayerStackDepth ? got : kLayerStackDepth, g_layerImageBegin,
+                                                 g_layerImageEnd, g_layerTaskRanges, g_layerTaskRangeCount,
+                                                 g_layerCtlRanges, g_layerCtlRangeCount, &at);
+            if (at >= 0) ret = frames[at];
+            else ::InterlockedIncrement64(&g_layerOutsideLost);
+        }
+        const unsigned int rv = (kind != poselayer::kCallerNone) ? (unsigned int)(ret - g_layerImageBegin) : 0u;
+        const int r = poselayer::StartNote(&g_layerStarts, anim, rec, kind, rv, ::GetTickCount());
+        if (r != poselayer::kNoteSame && r != poselayer::kNoteDropped)
+        {
+            if (kind == poselayer::kCallerTask) ::InterlockedIncrement64(&g_layerNoteTask);
+            else if (kind == poselayer::kCallerController) ::InterlockedIncrement64(&g_layerNoteCtl);
+            else if (kind == poselayer::kCallerUnknown) ::InterlockedIncrement64(&g_layerNoteUnknown);
+        }
+        if (r == poselayer::kNoteEvicted) ::InterlockedIncrement64(&g_layerNoteEvicted);
+        else if (r == poselayer::kNoteDropped) ::InterlockedIncrement64(&g_layerNoteDropped);
+    }
+    g_layerPlayOrig(anim, rec, speed, layer, weight);
+}
+
+struct PoseLayerRf { DWORD begin; DWORD end; DWORD unwind; };   /* an x64 function-table entry (RUNTIME_FUNCTION) */
+const int kLayerCallerCap = 64;
+
+// THE INSTALL'S READ OF THE GAME'S CODE (MAIN THREAD, before the hook): the function table copied with each entry's function
+// (an entry whose unwind chain leads to another belongs to that one - 0x51E020's and 0x5F0C10's layer-play calls sit in
+// such separated pieces), the task and controller ranges (poselayer CollectRanges), and every direct call of the layer play
+// (or of a jump stub to it) in the code sections, grouped by calling function (TallyCallSite). 1 read; 0 no function table,
+// a range list over its cap, or more calling functions than kLayerCallerCap; -1 a fault. POD only (C2712).
+int PoseLayerScanImage(unsigned long long playRva, const unsigned int* task, int nTask, const unsigned int* ctl, int nCtl,
+                       poselayer::Range* taskOut, int* nTaskOut, poselayer::Range* ctlOut, int* nCtlOut,
+                       poselayer::CallerTally* callers, int* nCallers, int* sitesUnplaced)
+{
+    const unsigned int kUnwChainInfo = 0x4;
+    *nTaskOut = 0; *nCtlOut = 0; *nCallers = 0; *sitesUnplaced = 0;
+    poselayer::FnPiece* pieces = 0;
+    int result = 1;
+    __try
+    {
+        const unsigned char* image = (const unsigned char*)::GetModuleHandleA(0);
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)image;
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(image + dos->e_lfanew);
+        const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (dir.VirtualAddress == 0 || dir.Size < sizeof(PoseLayerRf)) return 0;
+        const PoseLayerRf* rf = (const PoseLayerRf*)(image + dir.VirtualAddress);
+        const int n = (int)(dir.Size / (unsigned int)sizeof(PoseLayerRf));
+        pieces = (poselayer::FnPiece*)::HeapAlloc(::GetProcessHeap(), 0, (SIZE_T)n * sizeof(poselayer::FnPiece));
+        if (pieces == 0) return 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const PoseLayerRf* root = &rf[i];
+            for (int depth = 0; depth < 8; ++depth)
+            {
+                const unsigned int ud = root->unwind;
+                if ((ud & 1u) != 0) { root = (const PoseLayerRf*)(image + (ud & ~1u)); continue; }
+                const unsigned char* ui = image + ud;
+                if ((((unsigned int)ui[0] >> 3) & kUnwChainInfo) == 0) break;
+                root = (const PoseLayerRf*)(ui + 4 + (((unsigned int)ui[2] + 1u) & ~1u) * 2u);
+            }
+            pieces[i].begin = rf[i].begin;
+            pieces[i].end = rf[i].end;
+            pieces[i].root = root->begin;
+        }
+        *nTaskOut = poselayer::CollectRanges(pieces, n, task, nTask, (unsigned long long)image, taskOut, poselayer::kRangeCap);
+        *nCtlOut = poselayer::CollectRanges(pieces, n, ctl, nCtl, (unsigned long long)image, ctlOut, poselayer::kRangeCap);
+        if (*nTaskOut < 0 || *nCtlOut < 0) result = 0;
+        const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        for (int s = 0; s < (int)nt->FileHeader.NumberOfSections && result == 1; ++s)
+        {
+            if ((sec[s].Characteristics & IMAGE_SCN_CNT_CODE) == 0) continue;
+            const unsigned long long lo = sec[s].VirtualAddress;
+            const unsigned long long hi = lo + sec[s].Misc.VirtualSize;
+            for (unsigned long long a = lo; a + 5 <= hi; ++a)
+            {
+                if (image[a] != 0xE8) continue;
+                const long long tgt = (long long)a + 5 + *(const int*)(image + a + 1);
+                bool hit = (unsigned long long)tgt == playRva;
+                if (!hit && tgt >= (long long)lo && (unsigned long long)tgt + 5 <= hi && image[tgt] == 0xE9)
+                    hit = (unsigned long long)(tgt + 5 + *(const int*)(image + tgt + 1)) == playRva;
+                if (!hit) continue;
+                if (poselayer::PieceFind(pieces, n, (unsigned int)a) < 0) ++*sitesUnplaced;
+                if (poselayer::TallyCallSite(pieces, n, (unsigned int)a, callers, nCallers, kLayerCallerCap) == 0) { result = 0; break; }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { result = -1; }
+    if (pieces != 0) ::HeapFree(::GetProcessHeap(), 0, pieces);
+    if (result != 1) { *nTaskOut = 0; *nCtlOut = 0; }
+    return result;
+}
 
 struct PoseWant
 {
@@ -7372,6 +7571,8 @@ struct PoseWant
     bool bedMiss;         // the bed's key resolved to nothing at the last try
     bool bedMissCounted;
     bool refusedNow;      // the last playAction was refused (edge counting)
+    bool playedBefore;    // T-890: PoseApplyTick played the action this frame (first play, or the after-update play missed)
+    bool afterUpdate;     // T-890: the play after the copy's own update happened - PoseApplyTick leaves the next play to it
     DWORD bedAt;          // last resolve + setBedMode try (0 = never)
     bool approachCounted; // posePendingApproach booked for this want
     DWORD confirmedAt;    // the last STATE that carried this want (POSE-b: 10 s without one = expired)
@@ -7415,6 +7616,70 @@ int PoseReadPod(const void* c, int* inSomething, unsigned char* hand, char* act,
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// T-307: a std::string in the game's layout (16-byte buffer, size +0x10, capacity +0x18) copied whole into out: 1 read,
+// 0 empty / longer than out / not plausible / a fault. POD only (C2712).
+int PoseStrPod(const char* p, char* out, size_t outBytes)
+{
+    out[0] = 0;
+    __try
+    {
+        const unsigned long long len = *(const unsigned long long*)(p + 0x10);
+        const unsigned long long cap = *(const unsigned long long*)(p + 0x18);
+        if (cap < 15 || len > cap || len == 0 || len > (unsigned long long)(outBytes - 1)) return 0;
+        const char* text = (cap > 15) ? *(const char* const*)p : p;
+        if (text == 0) return 0;
+        for (size_t i = 0; i < (size_t)len; ++i) out[i] = text[i];
+        out[(size_t)len] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+
+// T-307: the layer table's held state (common/poselayer.h - the layers it allows, at most kStateCap states, the pick):
+// 1 a pick, its name in out, its AnimationClass in *animOut and its AnimationData in *recOut (the start table's key);
+// 0 none; -1 a fault part way. POD only (C2712). MAIN THREAD, the AI worker idle.
+int PoseLayerReadPod(const void* c, char* out, size_t outBytes, const void** animOut, const void** recOut)
+{
+    out[0] = 0;
+    *animOut = 0;
+    *recOut = 0;
+    poselayer::State s[poselayer::kStateCap];
+    const char* data[poselayer::kStateCap];
+    int n = 0;
+    __try
+    {
+        const char* anim = *(const char* const*)((const char*)c + kPoseAnimOff);
+        if (anim == 0) return 0;
+        const char* const* table = *(const char* const* const*)(anim + kPoseLayerTableOff);
+        if (table == 0) return 0;
+        for (int L = 0; L < poselayer::kLayers && n < poselayer::kStateCap; ++L)
+        {
+            if ((poselayer::kLayerMask & (1u << L)) == 0) continue;
+            const char* layer = table[L];
+            if (layer == 0) continue;
+            const unsigned int cnt = *(const unsigned int*)(layer + kPoseLayerCountOff);
+            const char* const* arr = *(const char* const* const*)(layer + kPoseLayerArrayOff);
+            if (arr == 0 || cnt > poselayer::kLayerCountMax) continue;
+            for (unsigned int i = 0; i < cnt && n < poselayer::kStateCap; ++i)
+            {
+                const char* st = arr[i];
+                if (st == 0) continue;
+                s[n].layer = L;
+                s[n].weight = *(const float*)(st + kPoseStateWeightOff);
+                s[n].looped = (*(const unsigned char*)(st + kPoseStateLoopedOff) != 0) ? 1 : 0;
+                data[n] = *(const char* const*)(st + kPoseStateDataOff);
+                ++n;
+            }
+        }
+        const int k = poselayer::LayerPick(s, n, poselayer::kLayerMask, poselayer::kFullWeight);
+        if (k < 0 || data[k] == 0) return 0;
+        *animOut = anim;
+        *recOut = data[k];
+        return PoseStrPod(data[k] + kPoseActNameOff, out, outBytes);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return -1; }
 }
 
 int PoseInSomethingPod(const void* c)
@@ -7886,7 +8151,13 @@ void PoseUndo(::Character* c, PoseWant& w, bool cageOut = true)
 
 void PoseLogApply(unsigned int uid, const PoseWant& w, int kind)
 {
-    if (g_poseLogged >= kPoseLogLimit) return;
+    if (g_poseLogged >= kPoseLogLimit)
+    {
+        // T-307: NPC seats spend the shared cap within the first minute (T1630: 16 lines by 73 s); a player character's
+        // copy still prints, under its own cap
+        if (IsUidPlayerCharAnyThread(uid) != 1 || g_posePcLogged >= kPosePcLogLimit) return;
+        ++g_posePcLogged;
+    }
     ++g_poseLogged;
     DebugLog("[POSE] apply #" + S(g_poseLogged) + " uid=" + S((long long)uid) + " kind=" + S((long long)kind)
              + " action='" + std::string(w.pw.action) + "' bedKey='" + std::string(w.pw.bedKey) + "'"
@@ -8167,21 +8438,121 @@ bool PoseOfOwned(unsigned int uid, coopstate::PoseWire* out)
     return true;
 }
 
+int AiWorkerBusyNow();   /* coop.cpp - the engine's own AI-worker busy test: 1 running, 0 idle, -1 cannot be told. MAIN THREAD */
+
+// T-307: a picked layer-1 state not started by a task (common/poselayer.h 3) - counted once per character per name and caller
+// type, one capped line per distinct name and type a process, naming who started it, so a refused held action is found
+// from the logs.
+static void PoseLayerNotAllowedSeen(unsigned int uid, const char* name, int kind, unsigned int retRva)
+{
+    const char* who = (kind == poselayer::kCallerController) ? "controller"
+                    : (kind == poselayer::kCallerUnknown ? "unknown caller" : (kind == poselayer::kCallerTask ? "task" : "no start note"));
+    char rv[24];
+    _snprintf_s(rv, sizeof(rv), _TRUNCATE, "0x%X", retRva);
+    const std::string n = std::string(name) + "|" + who + "|" + rv;
+    std::map<unsigned int, std::string>::iterator last = g_poseLayerNotAllowedLast.find(uid);
+    if (last != g_poseLayerNotAllowedLast.end() && last->second == n) return;
+    g_poseLayerNotAllowedLast[uid] = n;
+    ++g_poseLayerNotAllowed;
+    if (kind == poselayer::kCallerController) ++g_poseLayerRefusedCtl;
+    else if (kind == poselayer::kCallerUnknown) ++g_poseLayerRefusedUnknown;
+    else ++g_poseLayerRefusedNone;
+    if (g_poseLayerNotAllowedLogged >= kPoseLayerNotAllowedLogLimit) return;
+    if (!g_poseLayerNotAllowedSeen.insert(n).second) return;
+    ++g_poseLayerNotAllowedLogged;
+    std::string tail;
+    if (kind == poselayer::kCallerController) tail = std::string(" (caller rva ") + rv + ")";
+    else if (kind == poselayer::kCallerUnknown) tail = std::string(" (caller rva ") + rv + ": game code that is neither a listed task nor a listed controller)";
+    else tail = (g_layerStartOn == 1) ? std::string(" (started before the hook, pushed out, or played from outside the game)")
+                                      : std::string(" (the layer-play hook is off)");
+    DebugLog("[POSE] layer pick refused '" + std::string(name) + "' uid=" + S((long long)uid) + " started by " + who + tail
+             + " - layer 1, looped, full weight: not sent (only a listed task's layer state is a pose)");
+}
+
+// MAIN THREAD, once per frame: one line the first time most layer-play calls came from outside the game's code - another
+// mod hooks the layer play, and each of its calls costs a stack walk.
+static void PoseLayerOutsideCheck()
+{
+    if (g_layerOutsideLogged != 0 || g_layerStartOn != 1) return;
+    const long long total = g_layerCallsMain + ::InterlockedCompareExchange64(&g_layerCallsOffMain, 0, 0);
+    const long long outside = ::InterlockedCompareExchange64(&g_layerOutside, 0, 0);
+    if (total < 1000 || outside * 2 <= total) return;
+    g_layerOutsideLogged = 1;
+    DebugLog("[POSE] layer play: " + S(outside) + " of " + S(total) + " calls returned outside the game's code (another mod hooks"
+             " the layer play); each was traced up the stack to the game's caller, " + S(::InterlockedCompareExchange64(&g_layerOutsideLost, 0, 0))
+             + " without one (refused)");
+}
+
+// T-307 (owner, MAIN THREAD, PoseWatchTick - after TickWaitAi): the layer table's held state of an owned character whose
+// current-action slot is empty, read only while the AI worker is idle - its pass writes the table (bug classes 188 / 266).
+// *busy is the frame's one worker test (2 = not asked yet); a skipped read keeps a settled pick, so a busy frame never
+// clears a pose. 1 act holds the name (looped set) and *startRva the task that started it (0 not read this frame), 0 nothing
+// from the layer.
+static int PoseLayerAction(unsigned int uid, const void* c, int* busy, char* act, int* looped, unsigned int* startRva)
+{
+    *startRva = 0;
+    if (*busy == 2) *busy = AiWorkerBusyNow();
+    std::map<unsigned int, poselayer::Cand>::iterator it = g_poseLayerCand.find(uid);
+    if (*busy != 0)
+    {
+        ++g_poseLayerBusySkip;
+        if (it == g_poseLayerCand.end() || it->second.active == 0) return 0;
+        std::memcpy(act, it->second.name, sizeof(it->second.name));
+        *looped = 1;
+        return 1;
+    }
+    char name[poselayer::kStrMax + 1];
+    const void* anim = 0;
+    const void* rec = 0;
+    const int r = PoseLayerReadPod(c, name, sizeof(name), &anim, &rec);
+    if (r < 0) ++g_poseLayerFaults;
+    if (r != 1) { if (it != g_poseLayerCand.end()) g_poseLayerCand.erase(it); g_poseLayerNotAllowedLast.erase(uid); return 0; }
+    unsigned int rv = 0;
+    const int kind = (g_layerStartOn == 1) ? poselayer::StartFind(&g_layerStarts, anim, rec, &rv) : poselayer::kCallerNone;
+    if (!poselayer::LayerStartSendable(kind))   // only a task's layer state is a pose (layer 1 also holds 'jog upper')
+    {
+        PoseLayerNotAllowedSeen(uid, name, kind, rv);
+        if (it != g_poseLayerCand.end()) g_poseLayerCand.erase(it);
+        return 0;
+    }
+    g_poseLayerNotAllowedLast.erase(uid);
+    if (it == g_poseLayerCand.end())
+    {
+        poselayer::Cand fresh;
+        poselayer::CandClear(&fresh);
+        it = g_poseLayerCand.insert(std::make_pair(uid, fresh)).first;
+    }
+    if (poselayer::CandStep(&it->second, name, ::GetTickCount(), poselayer::kSettleMs) == 0) return 0;
+    std::memcpy(act, it->second.name, sizeof(it->second.name));
+    *looped = 1;
+    *startRva = rv;
+    return 1;
+}
+
 void PoseWatchTick()
 {
+    PoseLayerOutsideCheck();   // T-307
+    int layerBusy = 2;   // T-307: the frame's one AI-worker test, asked at the first layer read
     for (int i = 0; i < MirrorCapacity(); ++i)
     {
         unsigned int uid = 0;
         ::Character* c = 0;
         if (!MirrorSlot(i, &uid, &c)) continue;
         std::map<unsigned int, PoseOwn>::iterator it = g_poseOwn.find(uid);
-        if (!net::IsUidMine(uid)) { if (it != g_poseOwn.end()) g_poseOwn.erase(it); continue; }
+        if (!net::IsUidMine(uid)) { if (it != g_poseOwn.end()) g_poseOwn.erase(it); g_poseLayerCand.erase(uid); g_poseLayerNotAllowedLast.erase(uid); continue; }
         if (!PlausibleObject(c)) continue;
         int ins = 0, actLong = 0, stumble = 0, looped = 0;
         float speed = 0.0f;
         unsigned char hd[kHandIdBytes];
         char act[coopstate::kPoseStrMax + 1];
         if (!PoseReadPod(c, &ins, hd, act, &actLong, &stumble, &looped, &speed)) continue;
+        // T-307: an empty current-action slot of a character standing still and not in a bed or cage - the layer table's
+        // held state (an NPC-type loot plays 'medic' only there, T1630); the rules below decide as for +0x210
+        bool fromLayer = false;
+        unsigned int layerStartRva = 0;   // the task that started the layer state (0 = a busy frame kept the settled pick)
+        if (ins == 0 && act[0] == 0 && actLong == 0 && speed < kPoseOwnerStillSpeed)
+            fromLayer = PoseLayerAction(uid, c, &layerBusy, act, &looped, &layerStartRva) == 1;
+        else { g_poseLayerCand.erase(uid); g_poseLayerNotAllowedLast.erase(uid); }
 
         coopstate::PoseWire pw;
         coopstate::PoseClear(&pw);
@@ -8246,7 +8617,23 @@ void PoseWatchTick()
             o.pushedAt = ::GetTickCount();
             g_poseOwn[uid] = o;
         }
-        if (StatePush(uid)) ++g_poseSent;   // like prone/dead (F140): at once, not on the round-robin
+        if (StatePush(uid))   // like prone/dead (F140): at once, not on the round-robin
+        {
+            ++g_poseSent;
+            if (fromLayer && pw.action[0] != 0)   // T-307
+            {
+                ++g_poseFromLayer;
+                if (g_poseLayerLogged < kPoseLayerLogLimit)
+                {
+                    ++g_poseLayerLogged;
+                    char srv[24];
+                    _snprintf_s(srv, sizeof(srv), _TRUNCATE, "0x%X", layerStartRva);
+                    DebugLog("[POSE] layer send #" + S(g_poseLayerLogged) + " uid=" + S((long long)uid) + " action='"
+                             + std::string(pw.action) + "' started by task rva " + srv
+                             + " (current-action slot empty: the layer table's held state)");
+                }
+            }
+        }
     }
 }
 
@@ -8261,6 +8648,7 @@ void NotePoseWant(unsigned int uid, const coopstate::PoseWire& pose, unsigned in
         w.pw = pose; w.action = pose.action; w.peer = fromPeer; w.applied = 0; w.held = false; w.counted = false;
         w.bedMiss = false; w.bedMissCounted = false; w.refusedNow = false; w.bedAt = 0;
         w.approachCounted = false; w.confirmedAt = ::GetTickCount();
+        w.playedBefore = false; w.afterUpdate = false;   /* T-890 */
         PoseWantResetBed(w);   /* BED1 */
         g_poseWant[uid] = w;
         return;
@@ -8425,11 +8813,17 @@ void PoseApplyTick()
         }
         if (wantAction && !w.action.empty())
         {
-            // re-issued every tick while posed - the engine's own tasks do exactly that
+            // T-890: the copy's own Character::update, which runs after this tick, clears a looped action, so the steady
+            // per-frame play is PoseReplayAfterUpdate's, right after that update. This tick plays only the first time (the
+            // walk-there gate just opened) or when last frame's after-update play did not happen (refused, or the copy
+            // was not updated) - one play per frame.
+            const bool viaUpdate = (w.applied == 1 && w.afterUpdate);
+            w.afterUpdate = false; w.playedBefore = false;
+            if (viaUpdate) { w.held = true; ++it; continue; }
             const int r = PosePlayPod(play, c, &w.action);
             if (r == 1)
             {
-                w.refusedNow = false; w.applied = 1; w.held = true;
+                w.refusedNow = false; w.applied = 1; w.held = true; w.playedBefore = true;
                 if (!w.counted) { w.counted = true; ++g_poseAppliedAction; PoseLogApply(uid, w, 1); }
             }
             else if (!w.refusedNow) { w.refusedNow = true; ++g_poseActionRefused; }
@@ -8448,6 +8842,39 @@ bool PoseHoldsCopy(unsigned int uid)
 
 void PoseNoteHeldFrame() { ++g_poseHeldFrames; }
 
+// T-890 (T1625). Called for every character right after its Character::update; only a copy PoseApplyTick held in an action
+// pose this frame is touched. MAIN THREAD.
+void PoseReplayAfterUpdate(::Character* c)
+{
+    if (g_poseWant.empty()) return;
+    const unsigned int uid = FindSpawnedUid(c);
+    if (uid == 0) return;
+    std::map<unsigned int, PoseWant>::iterator it = g_poseWant.find(uid);
+    if (it == g_poseWant.end()) return;
+    PoseWant& w = it->second;
+    // held with an action by this frame's PoseApplyTick: the gate open, the action played, not carried, limp or dead then
+    if (!w.held || w.applied != 1 || w.action.empty()) return;
+    // a play PoseApplyTick made this frame was just cleared by this update: it is played again here all the same
+    w.playedBefore = false;
+    if (EngineWritesBlocked() || kPlayActionByNameRva == 0) return;
+    // changed since PoseApplyTick: no play here; afterUpdate stays false, so the next PoseApplyTick decides
+    if (net::IsUidMine(uid) || BeingCarried(c) || RagdollActive(c) || c->hasDied()) return;
+    const PlayActionByNameFn play = (PlayActionByNameFn)((uintptr_t)::GetModuleHandleA(0) + kPlayActionByNameRva);
+    const int r = PosePlayPod(play, c, &w.action);
+    if (r == 1) { w.afterUpdate = true; w.refusedNow = false; ++g_poseHeldAfterUpdate; return; }
+    w.held = false;   // not posed this frame; the next PoseApplyTick plays before the next update
+    if (!w.refusedNow) { w.refusedNow = true; ++g_poseActionRefused; }
+}
+
+bool PoseHoldsActionCopy(unsigned int uid)
+{
+    if (g_poseWant.empty()) return false;
+    std::map<unsigned int, PoseWant>::const_iterator it = g_poseWant.find(uid);
+    return it != g_poseWant.end() && it->second.held && it->second.applied == 1;
+}
+
+void PoseNoteFacingApplied() { ++g_poseFacingApplied; }
+
 std::string PoseReportToken()
 {
     return " poseSent=" + S(g_poseSent) + " poseRepushed=" + S(g_poseRepushed) + " poseExcludedSeen=" + S(g_poseExcludedSeen)
@@ -8460,7 +8887,107 @@ std::string PoseReportToken()
          + " poseExpired=" + S(g_poseExpired)
          + " poseBedViaLayout=" + S(g_poseBedViaLayout) + " poseBedOuterMissing=" + S(g_poseBedOuterMissing)
          + " poseBedLayoutMiss=" + S(g_poseBedLayoutMiss)
-         + " poseAppliedCage=" + S(g_poseAppliedCage) + " poseCageHeld=" + S(g_poseCageHeld);   // arrest2
+         + " poseAppliedCage=" + S(g_poseAppliedCage) + " poseCageHeld=" + S(g_poseCageHeld)   // arrest2
+         + " poseHeldAfterUpdate=" + S(g_poseHeldAfterUpdate) + " poseFacingApplied=" + S(g_poseFacingApplied)   /* T-890 */
+         + " poseFromLayer=" + S(g_poseFromLayer) + " poseLayerBusySkip=" + S(g_poseLayerBusySkip)
+         + " poseLayerFaults=" + S(g_poseLayerFaults)   /* T-307 */
+         + " poseLayerNotAllowed=" + S(g_poseLayerNotAllowed)   /* T-307 review */
+         + " poseLayerStart[on,callsMain,callsOffMain,task,ctl,unknown,outside,outsideLost,full,dropped,refCtl,refUnknown,refNone]="
+         + S((long long)g_layerStartOn) + "," + S(g_layerCallsMain) + "," + S(::InterlockedCompareExchange64(&g_layerCallsOffMain, 0, 0))
+         + "," + S(::InterlockedCompareExchange64(&g_layerNoteTask, 0, 0)) + "," + S(::InterlockedCompareExchange64(&g_layerNoteCtl, 0, 0))
+         + "," + S(::InterlockedCompareExchange64(&g_layerNoteUnknown, 0, 0)) + "," + S(::InterlockedCompareExchange64(&g_layerOutside, 0, 0))
+         + "," + S(::InterlockedCompareExchange64(&g_layerOutsideLost, 0, 0)) + "," + S(::InterlockedCompareExchange64(&g_layerNoteEvicted, 0, 0))
+         + "," + S(::InterlockedCompareExchange64(&g_layerNoteDropped, 0, 0)) + "," + S(g_poseLayerRefusedCtl)
+         + "," + S(g_poseLayerRefusedUnknown) + "," + S(g_poseLayerRefusedNone)
+         ;
+}
+
+/* T-307: the layer-play hook (common/poselayer.h 3). MAIN THREAD, once at start. Every row present, the game's code read
+   (the task and controller ranges, and every caller of the layer play - one line per calling function with its kind), every
+   controller seen calling it, then the hook; anything less leaves it off and the layer rule refuses every layer pick (one
+   line says why). A listed task with no call found only loses its poses (its line says 0). */
+void InstallPoseLayerStart()
+{
+    poselayer::StartClear(&g_layerStarts);
+    const unsigned long long base = (unsigned long long)::GetModuleHandleA(0);
+    const HMODULE ntdll = ::GetModuleHandleA("ntdll.dll");
+    if (ntdll != 0) g_layerCapture = (LayerCaptureFn)::GetProcAddress(ntdll, "RtlCaptureStackBackTrace");
+    const char* const ctlName[5] = { "AnimCtlIdle", "AnimCtlLocoBlend", "AnimCtlHeadTurn", "AnimCtlOther", "AnimCtlMainSlotFill" };
+    const unsigned long long ctl64[5] = { kAnimCtlIdleRva, kAnimCtlLocoBlendRva, kAnimCtlHeadTurnRva, kAnimCtlOtherRva, kAnimCtlMainSlotFillRva };
+    unsigned int ctl[5];
+    unsigned int task[kLayerTasks];
+    std::string why;
+    if (kAnimLayerPlayRva == 0) why = "no table row AnimLayerPlay";
+    for (int c = 0; c < 5; ++c)
+    {
+        ctl[c] = (unsigned int)ctl64[c];
+        if (ctl64[c] == 0 && why.empty()) why = std::string("no table row ") + ctlName[c];
+    }
+    int tasksMissing = 0;
+    for (int i = 0; i < kLayerTasks; ++i) { task[i] = (unsigned int)g_layerTaskRva[i]; if (task[i] == 0) ++tasksMissing; }
+    poselayer::Range taskRanges[poselayer::kRangeCap];
+    poselayer::Range ctlRanges[poselayer::kRangeCap];
+    poselayer::CallerTally callers[kLayerCallerCap];
+    int nTask = 0, nCtl = 0, nCallers = 0, unplaced = 0;
+    if (why.empty())
+    {
+        const int r = PoseLayerScanImage(kAnimLayerPlayRva, task, kLayerTasks, ctl, 5, taskRanges, &nTask, ctlRanges, &nCtl,
+                                         callers, &nCallers, &unplaced);
+        if (r < 0) why = "reading the game's code faulted";
+        else if (r == 0) why = "the game's function table is missing, or its task / controller code or callers overflow the mod's lists";
+    }
+    int unknownFns = 0;
+    for (int i = 0; i < nCallers; ++i)
+    {
+        const int k = (callers[i].fn == 0) ? poselayer::kCallerUnknown : poselayer::KindOfFunction(callers[i].fn, task, kLayerTasks, ctl, 5);
+        if (k == poselayer::kCallerUnknown) ++unknownFns;
+        char line[160];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[POSE] layer play caller 0x%X %s calls=%d", callers[i].fn,
+                    k == poselayer::kCallerTask ? "task" : (k == poselayer::kCallerController ? "controller" : "UNKNOWN (refused)"), callers[i].calls);
+        DebugLog(line);
+    }
+    for (int c = 0; c < 5 && why.empty(); ++c)
+    {
+        int seen = 0;
+        for (int i = 0; i < nCallers; ++i) if (callers[i].fn == ctl[c]) seen = callers[i].calls;
+        if (seen == 0) why = std::string("no call of the layer play found in ") + ctlName[c] + "'s code";
+    }
+    int tasksSilent = 0;
+    for (int t = 0; t < kLayerTasks; ++t)
+    {
+        int seen = 0;
+        for (int i = 0; i < nCallers; ++i) if (task[t] != 0 && callers[i].fn == task[t]) seen = callers[i].calls;
+        if (seen == 0) ++tasksSilent;
+    }
+    if (why.empty())
+    {
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+        g_layerImageBegin = base;
+        g_layerImageEnd = base + nt->OptionalHeader.SizeOfImage;
+        for (int i = 0; i < nTask; ++i) g_layerTaskRanges[i] = taskRanges[i];
+        g_layerTaskRangeCount = nTask;
+        for (int i = 0; i < nCtl; ++i) g_layerCtlRanges[i] = ctlRanges[i];
+        g_layerCtlRangeCount = nCtl;
+        if (coop::AddHook((void*)(base + kAnimLayerPlayRva), (void*)&detour_animLayerPlay, (void**)&g_layerPlayOrig) != coop::SUCCESS
+            || g_layerPlayOrig == 0)
+            why = "AddHook on the layer play failed";
+    }
+    const std::string counts = S((long long)nCallers) + " calling functions (" + S((long long)unknownFns) + " unknown, "
+        + S((long long)unplaced) + " call sites in no function), " + S((long long)nTask) + " task and " + S((long long)nCtl)
+        + " controller code ranges, listed tasks without a row " + S((long long)tasksMissing) + ", without a call "
+        + S((long long)tasksSilent) + ", stack walk " + (g_layerCapture != 0 ? "found" : "MISSING");
+    if (why.empty())
+    {
+        g_layerStartOn = 1;
+        DebugLog("[POSE] layer start hook ON: the layer play hooked; " + counts
+                 + " - a layer-1 state is a pose only when a listed task started it");
+    }
+    else
+    {
+        g_layerStartOn = 0;
+        ErrorLog("[POSE] layer start hook OFF: " + why + " (" + counts
+                 + ") - no layer state is sent as a pose on this game; main-slot poses are unaffected");
+    }
 }
 
 // ---- arrest2 (docs/design-arrest.md 3 "arrest2"): a guard's game caged the other game's character ------------------------
@@ -12714,6 +13241,19 @@ void WatchTaskTick()
     }
 }
 
+/* tasks: the animation the character plays now, from the pose reading (PoseReadPod): its name, whether it loops, the character's
+   own movement speed (the pose rule's 'standing still' input, not the animation's playback rate) and the stumble flag. Read-only. */
+static std::string TaskAnimWords(::Character* c)
+{
+    int ins = 0, actLong = 0, stumble = 0, looped = 0;
+    float speed = 0.0f;
+    unsigned char hd[kHandIdBytes];
+    char act[coopstate::kPoseStrMax + 1];
+    if (!PoseReadPod(c, &ins, hd, act, &actLong, &stumble, &looped, &speed)) return " anim=(unreadable)";
+    const std::string name = actLong != 0 ? std::string("(name too long)") : (act[0] != 0 ? "'" + std::string(act) + "'" : std::string("(none)"));
+    return " anim=" + name + " animLooped=" + S((long long)looped) + " moveSpeed=" + F1(speed) + " stumble=" + S((long long)stumble);
+}
+
 void ReportTask(unsigned int uid)
 {
     Character* c = FindSpawned(uid);
@@ -12743,7 +13283,7 @@ void ReportTask(unsigned int uid)
     Ogre::Vector3 p = c->worldPosition();
     DebugLog("[M1] tasks uid=" + S(uid) + " goal='" + ts->describeCurrentGoal() + "'"
              + " pos=" + F1(p.x) + "," + F1(p.y) + "," + F1(p.z)
-             + " hasOrders=" + S(ts->hasPendingOrders() ? 1 : 0) + OrderListWords(c));
+             + " hasOrders=" + S(ts->hasPendingOrders() ? 1 : 0) + OrderListWords(c) + TaskAnimWords(c));
 }
 
 /* The order system's three lists, read in place (POD, SEH-guarded). The order system is the AI's +0x20. Its ORDER QUEUE is the
@@ -12952,7 +13492,7 @@ void* BuildingGetTown(void* building)
 }
 long long g_ctxSent = 0, g_ctxSendFailed = 0, g_ctxRecv = 0;
 // M-B / H026 - the apply side.
-struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; int birth; };   /* birth: the squad's birth flag (squadbirth.h), -1 unknown */   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
+struct PendingContext { std::string squadSid, townSid, platoonId; int squadType, memberType; unsigned char hand[32]; unsigned char chand[32]; float bx, by, bz; unsigned int peerLoadAgeMs; unsigned long recvMs; int peerSlot; int birth; int peerOrigin; };   /* birth: the squad's birth flag (squadbirth.h), -1 unknown; peerOrigin: where the sender's copy came from (sameidpair.h, kCopyUnknown unknown) */   /* peerLoadAgeMs: the age of the sender's current world load at send (squadorigin.h kLoadAgeUnknown unknown); recvMs: GetTickCount at receipt; peerSlot: the seat of the game it came from (-1 unknown) */
 std::map<unsigned int, PendingContext> g_pendingCtx;
 bool PendingCtxHasUid(unsigned int uid) { return g_pendingCtx.find(uid) != g_pendingCtx.end(); }   // M4 fold: AllocateUid's row check (declared above it, same namespace)
 std::map<std::string, void*> g_ctxPlatoons;   // key: id|<squad id>|<faction> (ctxkey.h, CtxIdKey); older senders: squadSid|hand index:serial|townSid -> Platoon*
@@ -13024,6 +13564,12 @@ long long g_ctxOwnIdLiftWithheldLowerSeat = 0; std::set<std::string> g_ctxOwnIdL
 long long g_ctxHandedOverKeptMine = 0; std::set<std::string> g_ctxHandedOverKeptMineSeen;   /* M7a3f4 item 1 [m7a3f4-sc1]: a handed-over squad's own awake copy kept - a person this game runs is in it */
 long long g_ctxHandedOverSupersede = 0; std::set<std::string> g_ctxHandedOverSeen;   /* M7a3f3 T-425 [m7a3f3-sc1]: my own id, but a squad I handed over */
 std::set<std::string> g_ctxAwakeSameIdSeen; long long g_ctxAwakeSameId = 0, g_ctxRetiredAwake = 0, g_ctxRetireFailed = 0, g_ctxRetireSkippedSession = 0;
+/* the same-id copy rule (sameidpair.h): each verdict at an announcement that found this game's awake platoon of the squad (one line per
+   id and verdict); the copies put away by origin, the registered people withdrawn with them, the put-aways that failed, and the twins
+   not adopted because their platoon is put away */
+long long g_ctxSameIdYield[sameid::kVerdictCount] = { 0 }; std::set<std::string> g_ctxSameIdYieldSeen;
+long long g_ctxSameIdYieldRecord = 0, g_ctxSameIdYieldSave = 0, g_ctxSameIdYieldWithdrawn = 0, g_ctxSameIdYieldFailed = 0, g_ctxTwinNotAdoptedYield = 0; std::set<std::string> g_ctxTwinNotAdoptedSeen;
+const char* SameIdOriginWords(int origin) { return origin == sameid::kCopyFromRecord ? "from the world record" : (origin == sameid::kCopyFromSave ? "from this game's save" : "made live here"); }
 /* inv7e2 (T418): the reloaded save's copies of the peer's squads - retired, withdrawn, or kept for an earlier generation */
 long long g_staleRetiredReloaded = 0, g_staleWithdrawnReloaded = 0, g_staleKeptEarlierGen = 0; std::set<std::string> g_staleKeptSeen;
 long long g_staleKeptNotReloaded = 0, g_staleKeptNoSlot = 0;   /* inv7e2 fold: this game did not reload since its last link-down / its slot is unknown */
@@ -13307,6 +13853,14 @@ std::string HomeWatchReport()
          + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeUnchanged, 0, 0)) + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeOwnPassed, 0, 0))
          + "," + std::to_string((long long)::InterlockedCompareExchange64(&g_homeUnread, 0, 0));
 }
+std::string SameIdCopyReport()
+{
+    std::string v;
+    for (int i = 0; i < sameid::kVerdictCount; ++i) { if (i != 0) v += ","; v += std::to_string(g_ctxSameIdYield[i]); }
+    return " sameIdCopy[today,yield,keepLive,keepPlayerSide,keepHandedOverMine,keepLoadAge,keepOthersAboard,keepUnread,keepTurn,keepLate,keepOwnerMoved]=" + v
+         + " sameIdYield[record,save,withdrawn,failed,twinNotAdopted]=" + std::to_string(g_ctxSameIdYieldRecord) + "," + std::to_string(g_ctxSameIdYieldSave)
+         + "," + std::to_string(g_ctxSameIdYieldWithdrawn) + "," + std::to_string(g_ctxSameIdYieldFailed) + "," + std::to_string(g_ctxTwinNotAdoptedYield);
+}
 
 /* A character a hire moved into a NEW squad of a stand-in faction (setFaction with no squad given: the faction's
    addMember makes the squad, numbered by the stand-in's own counter - the clash a copy squad made here can meet).
@@ -13444,10 +13998,13 @@ bool SendContextFor(unsigned int uid, ::Character* c)
        receiver weighs it against its own (squadorigin.h OwnIdLiftedByLoadAge) */
     const unsigned int loadAgeMs = coop::StoreWorldLoadAgeMs();
     const unsigned int birthWire = sqbirth::WireOfBirth(PlausibleObject(platoon) ? coop::StoreBirthOfPlatoon(platoon) : sqbirth::kBirthUnknown);   /* the squad's birth flag: the copy takes its kept byte from it */
-    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs, birthWire)) { ++g_ctxSendFailed; return false; }
+    /* where this game's copy came from, read from its own state (built from the record, from the save, or running here): a receiver's
+       copy from a record or a save gives way to a running one (sameidpair.h YieldOrder) */
+    const int copyOrigin = (PlausibleObject(platoon) && !platoonId.empty()) ? coop::StorePlatoonOwnCopyOrigin(platoon, platoonId) : sameid::kCopyUnknown;
+    if (!net::SendContext(uid, squadSid, squadType, townSid, hraw, craw, bx, by, bz, memberType, platoonId, loadAgeMs, birthWire, sameid::WireOfOrigin(copyOrigin))) { ++g_ctxSendFailed; return false; }
     ++g_ctxSent;
     SW_QUIETLOG(g_qCtxSent, "[CTX] ->", 0, 0, "[CTX] -> uid=" + std::string(S(uid)) + " squad='" + squadSid + "' squadType=" + S(squadType) + " town='" + townSid
-             + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)));
+             + "' building=" + (bld ? "resolved" : "none") + " bpos=" + F1(bx) + "," + F1(by) + "," + F1(bz) + " member=" + S(memberType) + " loadAgeMs=" + (loadAgeMs == sqorigin::kLoadAgeUnknown ? std::string("unknown") : S((long long)loadAgeMs)) + " origin=" + sameid::OriginWord(copyOrigin));
     return true;
 }
 
@@ -13596,7 +14153,7 @@ void WorldRosterFull(int page)
 
 void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                         const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth)
+                        const std::string& platoonId, unsigned int peerLoadAgeMs, int senderSlot, int birth, unsigned int peerOriginWire)
 {
     ::Character* twin = RawHandIsEmpty(charRaw32) ? 0 : SafeHandToCharacter(LocalHandFromRaw(charRaw32));   // H027
     ++g_ctxRecv;
@@ -13620,7 +14177,7 @@ void ApplyRemoteContext(unsigned int uid, const std::string& squadSid, int squad
              + "," + q + "squadType" + q + ":" + S(squadType) + "," + q + "memberType" + q + ":" + S(memberType)
              + "," + q + "twinLocal" + q + ":" + (PlausibleObject(twin) ? "1" : "0") + "}");
     PendingContext pc; pc.squadSid = squadSid; pc.townSid = townSid; pc.platoonId = platoonId; pc.squadType = squadType; pc.memberType = memberType;
-    std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz; pc.peerLoadAgeMs = peerLoadAgeMs; pc.recvMs = ::GetTickCount(); pc.peerSlot = senderSlot; pc.birth = birth;
+    std::memcpy(pc.hand, handRaw32, 32); std::memcpy(pc.chand, charRaw32, 32); pc.bx = bx; pc.by = by; pc.bz = bz; pc.peerLoadAgeMs = peerLoadAgeMs; pc.recvMs = ::GetTickCount(); pc.peerSlot = senderSlot; pc.birth = birth; pc.peerOrigin = sameid::OriginOfWire(peerOriginWire);
     g_pendingCtx[uid] = pc;
     /* T-1 B1 restructure (protocol 85): CONTEXT's member type is no longer read as the squad leader - MSG_SQUAD_LEAD carries it (handoff.cpp ApplyRemoteSquadLead). */
 }
@@ -13640,6 +14197,38 @@ int CtxPlatoonLiveForId(const void* faction, const std::string& platoonId)
 }
 
 namespace { void* ReadPlatoonFactionPod(void* platoon); }   // Platoon+0x10, guarded - defined below (RetirePeerContextPlatoons), in the same (anonymous) namespace
+
+/* THE SAME-ID COPY RULE (sameidpair.h CopyYield): this game's AWAKE platoon of squad `platoonId` under `faction`, other than `ctxOwn`
+   (the announcement's own copy here), judged against another game's announcement of the squad. ownId / why: the id test's answer
+   (after the hand-over and load-age tests) and its source (sqorigin::kBy...); handedOver: this game handed the squad over.
+   *platoonOut = the platoon judged (0 = none: kVerdictToday); *originOut = where it came from. A yield passes the gates (sameidpair.h
+   YieldGate): the announcement still stands - pc.peerSlot IN_WORLD on this link's roster (StoreRosterSlotInWorld) and uid's recorded
+   owner that game (net::OwnerSlotOf) - and the yield's order names this game's copy (YieldOrder: at once against an announced running
+   copy, otherwise the load-age order; mySeat: this game's seat). Reads only. MAIN THREAD. */
+static int SameIdCopyJudge(Faction* faction, const PendingContext& pc, unsigned int uid, const void* ctxOwn, int ownId, int why, int handedOver, int mySeat, void** platoonOut, int* originOut)
+{
+    const std::string& platoonId = pc.platoonId;
+    *platoonOut = 0; *originOut = sameid::kCopyLive;
+    if (platoonId.empty()) return sameid::kVerdictToday;
+    void* p = FindAwakePlatoon(faction, platoonId);
+    if (p == 0 || p == ctxOwn) return sameid::kVerdictToday;
+    *platoonOut = p;
+    *originOut = StorePlatoonCopyOrigin(p, (void*)faction, platoonId);
+    const int playerSide = (IsPlayerFaction(faction) || IsStandInFaction(faction)) ? 1 : 0;   /* a stand-in, or an old save's coop-peer faction */
+    const int hoKeep = handedOver != 0 ? coopsquad::HandedOverRetireRefuse(handedOver, StorePlatoonMineMembers(p)) : 0;
+    unsigned int su[256];
+    const int sess = PlatoonSessionMemberUids(p, su, 256);
+    const int mine = sess > 0 ? StorePlatoonMineMembers(p) : 0;
+    const int v = sameid::CopyYield(*originOut, ownId, why == sqorigin::kByMembers ? 1 : 0, playerSide, hoKeep, sess, mine);
+    if (v != sameid::kVerdictYield) return v;
+    const int inWorld = (pc.peerSlot >= 0 && StoreRosterSlotInWorld(pc.peerSlot) == 1) ? 1 : 0;
+    const int ownerIsAnnouncer = (pc.peerSlot >= 0 && net::OwnerSlotOf(uid) == pc.peerSlot) ? 1 : 0;
+    const unsigned int ownAge = coop::StoreWorldLoadAgeMs();
+    /* the announcer's age at send, brought to now. An announcer that reloaded after this CONTEXT arrived reads too old here until its
+       next CONTEXT replaces this one: a narrow window in which the load-age order can name both sides */
+    const unsigned int peerAge = sqorigin::LoadAgeAdvance(pc.peerLoadAgeMs, (unsigned int)(::GetTickCount() - pc.recvMs));
+    return sameid::YieldGate(v, inWorld, ownerIsAnnouncer, sameid::YieldOrder(*originOut, pc.peerOrigin, ownAge, peerAge, mySeat, pc.peerSlot));
+}
 
 // M-B / H026 - before CreateAt: build (or reuse) the platoon this uid's context names. Returns true when a
 // container + home were produced; false leaves the old path (container NULL) untouched and counts why.
@@ -13699,7 +14288,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
             const int sv = (self != 0 && self != ctxOwn && PlatoonHasSessionMembers(self) > 0) ? ReloadVerdict(self, mySlot, su, 256, &sn, 1) : coopsp::kReloadNoSession;
             const int peerSeat = pc.peerSlot;   /* the announcer: the game this CONTEXT came from (net::PeerSlotOfKey of its link), not the person's recorded owner */
             const unsigned int ownAge = coop::StoreWorldLoadAgeMs();
-            const unsigned int peerAge = sqorigin::LoadAgeAdvance(pc.peerLoadAgeMs, (unsigned int)(::GetTickCount() - pc.recvMs));   /* the announcer's age at send, brought to now */
+            const unsigned int peerAge = sqorigin::LoadAgeAdvance(pc.peerLoadAgeMs, (unsigned int)(::GetTickCount() - pc.recvMs));   /* the announcer's age at send, brought to now (too old if it reloaded since: see SameIdCopyJudge) */
             liftKind = sqorigin::OwnIdLiftedByLoadAge(idWhy, sv == coopsp::kReloadRetire ? 1 : 0, ownAge, peerAge, mySlot, peerSeat);
             if (liftKind == sqorigin::kOwnIdLifted)
             {
@@ -13723,7 +14312,26 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
         }
         /* looked up whatever the origin: a save squad this game gave away has the receiving game as its origin */
         const int handedOver = HandedOverHas((void*)faction, pc.platoonId) ? 1 : 0;
-        const bool ownId = coopsquad::SupersedeOwnIdAfterHandover(ownBlk, handedOver) != 0;
+        bool ownId = coopsquad::SupersedeOwnIdAfterHandover(ownBlk, handedOver) != 0;
+        /* the same-id copy rule (sameidpair.h CopyYield): this game's AWAKE copy built from the world record, or from this game's save,
+           yields to the game that runs the squad - put away by the awake retire below (no record written), its registered people
+           withdrawn, the announcer's copy built and bound in its place. Judged before the id refusal, which then stands only for a copy
+           the rule keeps. */
+        void* yieldP = 0; int yieldOrigin = sameid::kCopyLive;
+        const int yieldVerdict = SameIdCopyJudge(faction, pc, uid, ctxOwn, ownId ? 1 : 0, idWhy, handedOver, mySlot, &yieldP, &yieldOrigin);
+        if (yieldP != 0 && g_ctxSameIdYieldSeen.insert(pc.platoonId + "|" + sameid::VerdictWord(yieldVerdict)).second)   /* counted once per id and verdict, not per announced person */
+        {
+            ++g_ctxSameIdYield[yieldVerdict];
+            if (yieldVerdict != sameid::kVerdictToday)
+                DebugLog("[CTX] same-id copy id='" + pc.platoonId + "': this game's AWAKE platoon " + P(yieldP) + " came " + SameIdOriginWords(yieldOrigin)
+                         + ", the announcer's copy " + sameid::OriginWord(pc.peerOrigin)
+                         + (ownId ? ", decided as this game's (origin slot " + S((long long)idBlk) + ")" : std::string(", decided as another game's"))
+                         + " - verdict " + sameid::VerdictWord(yieldVerdict)
+                         + (yieldVerdict == sameid::kVerdictYield ? std::string(": put away for the announcing game's copy") : std::string(": kept, the earlier roads decide"))
+                         + " (" + sameid::VerdictWord(yieldVerdict) + "=" + S(g_ctxSameIdYield[yieldVerdict]) + ")");
+        }
+        const bool ownIdBeforeYield = ownId;
+        if (yieldVerdict == sameid::kVerdictYield) ownId = false;   /* the awake retire and the asleep destroy below run for it */
         if (handedOver != 0)
         {
             ++g_ctxHandedOverSupersede;
@@ -13756,6 +14364,11 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
             /* M7a3f4 item 1 [m7a3f4-sc0]: the retire runs here ONLY because this game handed the squad over (handedOver) - hand-overs are
                per person, so this platoon may still hold a person this game runs (one never handed, one kept by the receiver, one taken
                back): never retired then, nor when it cannot be read. Logged once per id, counted (handedOverKeptMine). */
+            const bool yieldNow = (awakeLocal == yieldP && yieldVerdict == sameid::kVerdictYield);   /* the same-id copy rule puts it away */
+            /* the retire runs for the yield alone: the id was decided as this game's (no earlier road reaches here then), or no earlier road
+               retires it (it holds session people and is not the reloaded copy). A retire an earlier road runs anyway is booked there, so
+               each put-away is counted once */
+            const bool yieldOnly = yieldNow && (ownIdBeforeYield || !(hasSession == 0 || reload == coopsp::kReloadRetire));
             const int hoMine = (handedOver != 0) ? StorePlatoonMineMembers(awakeLocal) : 0;
             const bool hoKeep = coopsquad::HandedOverRetireRefuse(handedOver, hoMine) != 0;
             if (hoKeep)
@@ -13766,24 +14379,40 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
                              + (hoMine < 0 ? std::string("people that could not be read") : S((long long)hoMine) + " person(s) this game runs")
                              + " (handedOverKeptMine=" + S(g_ctxHandedOverKeptMine) + ")");
             }
-            else if (hasSession == 0 || reload == coopsp::kReloadRetire)
+            else if (hasSession == 0 || reload == coopsp::kReloadRetire || yieldNow)
             {
                 for (int i = 0; i < rn; ++i) ruAnn[i] = AnnouncedExplicit(ru[i]);   /* before the retire: the unload-destroy path may withdraw some */
-                if (StoreRetireLocalCopy(awakeLocal) == 1)
+                /* this copy gives way to another game's running copy of the same squad (the yield, or the reloaded-copy retire): its own-uid
+                   people are marked first, so their put-away unloads them from the other games and never offers them (handoff.h) */
+                const int sameIdKind = yieldNow ? kSameIdYield : (reload == coopsp::kReloadRetire ? kSameIdReload : 0);
+                if (sameIdKind != 0) SameIdWithdrawMark(ru, rn, sameIdKind);
+                const int retired = StoreRetireLocalCopy(awakeLocal);
+                if (retired == 1)
                 {
-                    ++g_ctxRetiredAwake; DebugLog("[CTX] this save's own AWAKE platoon " + P(awakeLocal) + " id='" + pc.platoonId + "' retired (engine unload) - the peer's squad replaces it");
-                    if (reload == coopsp::kReloadRetire)
+                    if (!yieldOnly) { ++g_ctxRetiredAwake; DebugLog("[CTX] this save's own AWAKE platoon " + P(awakeLocal) + " id='" + pc.platoonId + "' retired (engine unload) - the peer's squad replaces it"); }
+                    if (!yieldOnly && reload == coopsp::kReloadRetire)
                     {
-                        int withdrawn = 0, owed = 0, unannounced = 0;
-                        for (int i = 0; i < rn; ++i) { const int w = WithdrawReloadedCopy(ru[i], ruAnn[i]); if (w == 1) { ++withdrawn; ++g_staleWithdrawnReloaded; } else if (w == 2) ++owed; else ++unannounced; }
+                        int withdrawn = 0, owed = 0, unannounced = 0, held = 0;
+                        for (int i = 0; i < rn; ++i) { const int w = WithdrawReloadedCopy(ru[i], ruAnn[i]); if (w == 1) { ++withdrawn; ++g_staleWithdrawnReloaded; } else if (w == 2) ++owed; else if (w == 3) ++held; else ++unannounced; }
                         ++g_staleRetiredReloaded;
                         DebugLog("[STALE] reloaded copy id='" + pc.platoonId + "' retired: all " + S((long long)rn) + " session members were picked up by this game's sweep from world load " + S((long long)StoreWorldGenNow()) + (liftKind == sqorigin::kOwnIdLifted ? std::string(", a fresh load (own-id refusal lifted)") : std::string(", loaded after this game's last link-down"))
-                                 + " - the peer's continuously running squad wins; withdrawn=" + S((long long)withdrawn) + " owed=" + S((long long)owed) + " neverAnnounced=" + S((long long)unannounced)
+                                 + " - the peer's continuously running squad wins; withdrawn=" + S((long long)withdrawn) + " owed=" + S((long long)owed) + " held=" + S((long long)held) + " neverAnnounced=" + S((long long)unannounced)
                                  + " retiredReloaded=" + S(g_staleRetiredReloaded) + " withdrawnReloaded=" + S(g_staleWithdrawnReloaded) + " keptEarlierGen=" + S(g_staleKeptEarlierGen)
              + " keptNotReloaded=" + S(g_staleKeptNotReloaded) + " keptNoSlot=" + S(g_staleKeptNoSlot));
                     }
+                    else if (yieldOnly)
+                    {
+                        int withdrawn = 0, owed = 0, unannounced = 0, held = 0;
+                        for (int i = 0; i < rn; ++i) { const int w = WithdrawReloadedCopy(ru[i], ruAnn[i]); if (w == 1) ++withdrawn; else if (w == 2) ++owed; else if (w == 3) ++held; else ++unannounced; }
+                        if (yieldOrigin == sameid::kCopyFromRecord) ++g_ctxSameIdYieldRecord; else ++g_ctxSameIdYieldSave;
+                        g_ctxSameIdYieldWithdrawn += withdrawn;
+                        DebugLog("[CTX] same-id copy id='" + pc.platoonId + "' put away: this game's AWAKE platoon " + P(awakeLocal) + " came " + SameIdOriginWords(yieldOrigin)
+                                 + "; its " + S((long long)rn) + " registered people withdrawn=" + S((long long)withdrawn) + " owed=" + S((long long)owed) + " held=" + S((long long)held) + " neverAnnounced=" + S((long long)unannounced)
+                                 + " - the announcing game's copy is built in its place;" + SameIdCopyReport());
+                    }
                 }
-                else { ++g_ctxRetireFailed; DebugLog("[CTX] this save's own AWAKE platoon " + P(awakeLocal) + " id='" + pc.platoonId + "' could not be retired"); }
+                else { if (yieldOnly) ++g_ctxSameIdYieldFailed; else ++g_ctxRetireFailed; DebugLog("[CTX] this save's own AWAKE platoon " + P(awakeLocal) + " id='" + pc.platoonId + "' could not be retired"); }
+                if (sameIdKind != 0) SameIdWithdrawDone();   /* the withdrawals are done: only marks an XFER flight still holds stay */
             }
             else
             {
@@ -13813,8 +14442,9 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
             if (DestroyPlatoonPod(faction, asleep) == 1) { ++g_ctxSupersededAsleep; DebugLog("[CTX] sleeping platoon " + P(asleep) + " id='" + pc.platoonId + "' (this save's own copy) destroyed - superseded by the live announcement (P1c)"); }
             else { ++g_ctxSupersedeFailed; break; }
         }
-        // P3 (decision 23, two saves = two worlds): this save may hold its OWN AWAKE squad with the host's id (a town both
-        // worlds generated). Counted and named here, not destroyed - destroying a live platoon is unmeasured (F459 class).
+        /* an AWAKE platoon of this game's that still answers to the announced id after the roads above (one the same-id copy rule
+           keeps, or one whose retire was refused or failed) is counted and named here, not destroyed; the store's pair guard keeps
+           both platoons from writing the squad's record or moving its by-id entry while both stand */
         void* awake = FindAwakePlatoon(faction, pc.platoonId);
         if (awake != 0 && !(pit != g_ctxPlatoons.end() && pit->second == awake) && g_ctxAwakeSameIdSeen.insert(pc.platoonId).second)
         { ++g_ctxAwakeSameId; DebugLog("[CTX] this save's own AWAKE platoon " + P(awake) + " shares id='" + pc.platoonId + "' with the peer's squad - a duplicate (counted, not destroyed)"); }
@@ -13864,7 +14494,7 @@ bool PrepareContextForSpawn(unsigned int uid, const std::string& factionName, co
 
 // H027 - the client already holds this character (same handle): register IT as the uid's object, with the same
 // bookkeeping CreateAt does after `create`, and let the caller gate it. No twin is created.
-bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos)
+bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos, const std::string& factionName)
 {
     if (g_spawned.find(uid) != g_spawned.end()) return false;   // already registered (CreateAt's own idempotency applies)
     std::map<unsigned int, PendingContext>::iterator it = g_pendingCtx.find(uid);
@@ -13872,6 +14502,34 @@ bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos)
     ::Character* c = SafeHandToCharacter(LocalHandFromRaw(it->second.chand));
     if (!PlausibleObject(c)) { ++g_twinLookupFailed; return false; }
     if (FindSpawnedUid(c) != 0) return false;                   // already someone's puppet: not a twin
+    /* the same-id copy rule's twin step (sameidpair.h TwinAdoptRefused): this runs before the squad's platoon is prepared, so a body
+       standing in this game's awake platoon of the squad that the platoon step is about to put away is not adopted in place - it goes
+       with that platoon, and the copy is built in the announcer's squad. The id test is the platoon step's without its load-age lift
+       (a lifted copy is put away by the reload retire, not by this rule). */
+    {
+        const PendingContext& tpc = it->second;
+        Faction* tf = (tpc.platoonId.empty() || factionName.empty()) ? 0 : ResolveWireFaction(factionName);
+        if (PlausibleObject(tf))
+        {
+            std::map<std::string, void*>::const_iterator tp = g_ctxPlatoons.find(CtxIdKey(tf, tpc.platoonId));
+            const void* tOwn = tp != g_ctxPlatoons.end() ? tp->second : 0;
+            int tMy = -1, tNum = -1, tWhy = sqorigin::kFallback;
+            const int tBlk = StoreIdOriginSlot((void*)tf, tpc.platoonId, tOwn, &tMy, &tNum, &tWhy);
+            const int tHo = HandedOverHas((void*)tf, tpc.platoonId) ? 1 : 0;
+            const int tOwnId = coopsquad::SupersedeOwnIdAfterHandover(coopsp::SupersedeRefuseOwn(tBlk, tMy), tHo) != 0 ? 1 : 0;
+            void* tP = 0; int tOrigin = sameid::kCopyLive;
+            const int tv = SameIdCopyJudge(tf, tpc, uid, tOwn, tOwnId, tWhy, tHo, tMy, &tP, &tOrigin);
+            void* const tActive = tP != 0 ? ReadActivePlatoonPod(tP) : 0;
+            if (sameid::TwinAdoptRefused(tv) != 0 && tActive != 0 && coop::SquadActivePlatoonOf(c) == tActive)
+            {
+                ++g_ctxTwinNotAdoptedYield;
+                if (g_ctxTwinNotAdoptedSeen.insert(tpc.platoonId).second)
+                    DebugLog("[CTX] twin NOT adopted uid " + S(uid) + " id='" + tpc.platoonId + "': it stands in this game's AWAKE platoon " + P(tP) + ", which came " + SameIdOriginWords(tOrigin)
+                             + " and is put away for the announcement - the copy is built in the announcer's squad (twinNotAdopted=" + S(g_ctxTwinNotAdoptedYield) + ")");
+                return false;
+            }
+        }
+    }
     // mirror1 (crash T487) A: a twin the uid table cannot hold is not adopted - it stays this engine's.
     if (!MirrorAdd(uid, (RootObjectBase*)c))
     {
@@ -14119,6 +14777,7 @@ void SpawnWorldTeardown()
     MedicalForgetAllCopies();   // the owner's medical words per copy: every copy of this world is gone
     DeadlookForgetAllCopies();  // the per-copy look marks (first look taken, dead-copy holds, createBody guard) go with them
     g_knockHold.clear();        // and the knockdowns held for those copies' looks
+    poselayer::StartForgetAll(&g_layerStarts);   // T-307: the layer start notes name this world's animation objects (safe beside the detour)
 
     int mirrorSlots = 0, indexSlots = 0;
     MirrorRowLock();   // mirror1 fold (review-mirror1 #5): no RetireOnDestroy mark lands between these clears

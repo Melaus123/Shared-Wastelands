@@ -9,6 +9,7 @@
 #include "../common/squadwriter.h"   /* M7a3f5 [m7a3f5-zc0]: PutAwayOtherKeeps, swept by the offline suite */
 #include "../common/areadrop.h"   /* W1-b (review 2026-09-22 H2/H3): the effective area map as a pure function, swept by the offline suite */
 #include "../common/orphanhold.h"   /* T-306 (owner decision 226; fold 1): when an orphaned zone tick sends its player sector as unknown, swept by the offline suite */
+#include "../common/townverwire.h"   /* TvKey - the placed-town key the world server stores */
 #include "../common/presence.h"   /* M11 C1: is another player in this world - the old link or the roster (PresenceDecide) */
 #include "../common/peergone.h"   /* M8 review F9: the loaded-bit rule of a departure (PeerGoneMaskBits), swept by the offline suite */
 #include "../common/loadedzones.h"   /* the loaded set from the engine's active-zone list (SectorOfZoneAt, Normalise, CountSources), swept by the offline suite */
@@ -1452,7 +1453,7 @@ int SectorHoldersTS(const Sector& s, unsigned* words, int n)
 namespace coop {
 // `towns`: the engine's TownList (global pointer at RVA 0x21330A0; getAllTowns = this+0x50: count +0x58, pointers +0x60 - decomp_b85f0 /
 // decomp_927d30) listed nearest-first from the watched player: sid, sector, position, held-by-the-host (client) - a recipe aid for T192+.
-struct TownRow { float d; float x, y, z; char sid[96]; char name[96]; };
+struct TownRow { float d; float x, y, z; char sid[96]; char name[96]; char own[96]; char repl[96]; char fac[96]; };   /* sid/name = the record the engine reads now; own = the placed town's own record; repl = the applied version's sid ("" = none); fac = the owner faction's sid */
 static bool TownRowLess(const TownRow& a, const TownRow& b) { return a.d < b.d; }
 static int ReadTownListPod(void** count_out, void*** ptrs_out)
 {
@@ -1474,12 +1475,84 @@ static int TownRowPod(void* town, TownRow* r)
     {
         void** vt = *(void***)town; float v[3] = { 0, 0, 0 }; ((GetPositionFn)vt[8])(town, v);
         if (v[0] == 0.0f && v[2] == 0.0f) return 0;   // (0,0) = no write (review-p4c MEDIUM: sector 32,32 otherwise)
-        r->x = v[0]; r->y = v[1]; r->z = v[2]; r->sid[0] = 0; r->name[0] = 0;
+        r->x = v[0]; r->y = v[1]; r->z = v[2]; r->sid[0] = 0; r->name[0] = 0; r->own[0] = 0; r->repl[0] = 0; r->fac[0] = 0;
         void* gd = ((RootObjectBase*)town)->getRecord();
         if (gd != 0) { CopyStdStringPodZ((const char*)gd + 0x58, r->sid, 96); CopyStdStringPodZ((const char*)gd + 0x28, r->name, 96); }   /* GameData stringID +0x58, name +0x28 (build.cpp kGdName) */
+        /* own = RootObjectBase::data +0x40. The virtual record read (0x9510A0) answers the applied version (Town+0x338) when there is
+           one, else +0x40 - so "a version is applied" = the two differ, and repl = that version's sid. +0x338 is not read raw: a
+           TownBase that is not a Town ends there. Owner: RootObjectBase::owner +0x10 -> Faction+0x240 record -> stringID +0x58. */
+        void* own = *(void**)((char*)town + 0x40);
+        if (own == 0) own = gd;
+        if (own != 0) CopyStdStringPodZ((const char*)own + 0x58, r->own, 96);
+        if (gd != 0 && gd != own) CopyStdStringPodZ((const char*)gd + 0x58, r->repl, 96);
+        void* fac = *(void**)((char*)town + 0x10);
+        if (fac != 0) { void* fgd = *(void**)((char*)fac + 0x240); if (fgd != 0) CopyStdStringPodZ((const char*)fgd + 0x58, r->fac, 96); }
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+/* THE PLACED-TOWN KEY: one town record is placed several times (Hive Village x8), so a town is keyed by its OWN record id
+   (RootObjectBase::data +0x40, not the applied version) and its position rounded to whole metres - both games place towns from the
+   same data. The world server stores exactly this key (townverwire.h TvKey). */
+static std::string TownKey(const TownRow& r)
+{
+    return cooptv::TvKey(r.own, r.x, r.z);
+}
+static std::string TownVal(const char* s) { return s[0] != 0 ? ("'" + std::string(s) + "'") : std::string("-"); }
+/* townver.cpp, MAIN THREAD: the placed town as the readout sees it (key, applied version, owner, position), and the town of a key. */
+bool TownPlacedRead(void* town, std::string* key, std::string* repl, std::string* fac, float* x, float* y, float* z)
+{
+    TownRow r;
+    if (town == 0 || !TownRowPod(town, &r) || r.own[0] == 0) return false;
+    *key = TownKey(r); *repl = r.repl; *fac = r.fac; *x = r.x; *y = r.y; *z = r.z;
+    return true;
+}
+void* TownFindByKey(const std::string& key)
+{
+    void* countv = 0; void** ptrs = 0;
+    if (key.empty() || !ReadTownListPod(&countv, &ptrs)) return 0;
+    const unsigned n = (unsigned)(size_t)countv;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        TownRow r; void* tp = 0;
+        if (!ReadTownPtrPod(ptrs, i, &tp) || tp == 0 || !TownRowPod(tp, &r) || r.own[0] == 0) continue;
+        if (TownKey(r) == key) return tp;
+    }
+    return 0;
+}
+/* TEST, read-only: `townparity` - every PLACED town as one sorted [TOWNPARITY] row holding exactly what every game must agree on
+   (key, applied version, owner) and nothing that legitimately differs (distance, holder), then one summary line with an FNV-1a
+   digest of the rows. Equal digests = the same towns on both games; on a mismatch the rows diff by key. dupKeys counts two placed
+   towns that round to the same key (the key would then be ambiguous). */
+std::string TownParityCommand()
+{
+    void* countv = 0; void** ptrs = 0;
+    if (!ReadTownListPod(&countv, &ptrs)) return "error townparity: no town list";
+    const unsigned n = (unsigned)(size_t)countv;
+    unsigned faults = 0, rejected = 0, withRepl = 0, dupKeys = 0;
+    std::vector<std::pair<std::string, std::string> > rows; rows.reserve(n);
+    for (unsigned i = 0; i < n; ++i)
+    {
+        TownRow r; void* tp = 0;
+        if (!ReadTownPtrPod(ptrs, i, &tp) || tp == 0) { ++faults; continue; }
+        if (!TownRowPod(tp, &r) || r.own[0] == 0) { ++rejected; continue; }
+        if (r.repl[0] != 0) ++withRepl;
+        rows.push_back(std::make_pair(TownKey(r), "repl=" + TownVal(r.repl) + " fac=" + TownVal(r.fac)));
+    }
+    std::sort(rows.begin(), rows.end());
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        if (i > 0 && rows[i].first == rows[i - 1].first) ++dupKeys;
+        const std::string row = "key='" + rows[i].first + "' " + rows[i].second;
+        for (size_t k = 0; k < row.size(); ++k) { h ^= (unsigned char)row[k]; h *= 16777619u; }
+        h ^= (unsigned char)'\n'; h *= 16777619u;
+        DebugLog("[TOWNPARITY] " + row);
+    }
+    char hx[16]; _snprintf(hx, 15, "%08X", h); hx[15] = 0;
+    std::ostringstream o; o.imbue(std::locale::classic());
+    o << "townparity towns=" << n << " rows=" << rows.size() << " withRepl=" << withRepl << " faults=" << faults << " rejected=" << rejected << " dupKeys=" << dupKeys << " digest=" << hx;
+    DebugLog("[TOWNPARITY] " + o.str()); return o.str();
 }
 std::string TownsCommand()
 {
@@ -1496,7 +1569,8 @@ std::string TownsCommand()
     for (size_t i = 0; i < rows.size() && i < 16; ++i)
     {
         const Sector s = SectorOf(rows[i].x, rows[i].z);
-        o << " | '" << rows[i].sid << "' d=" << F1(rows[i].d) << " sector=" << s.x << "," << s.y << " pos=" << F1(rows[i].x) << "," << F1(rows[i].y) << "," << F1(rows[i].z);
+        o << " | '" << rows[i].sid << "' key='" << TownKey(rows[i]) << "' name=\"" << rows[i].name << "\" d=" << F1(rows[i].d) << " sector=" << s.x << "," << s.y << " pos=" << F1(rows[i].x) << "," << F1(rows[i].y) << "," << F1(rows[i].z)
+          << " repl=" << TownVal(rows[i].repl) << " fac=" << TownVal(rows[i].fac) << " hold=" << MayInventHereTS(s);   /* hold: does THIS game run the area (1 yes, 0 no, -1 no fresh map, -2 teardown) */
         if (!net::SessionIsHost()) o << " host=" << HostHoldsSectorTS(s);
     }
     const std::string line = o.str(); DebugLog("[TOWNS] " + line); return line;
@@ -1518,7 +1592,8 @@ std::string TownListCommand()
         if (!TownRowPod(tp, &r)) { ++rejected; continue; }
         const Sector s = SectorOf(r.x, r.z);
         std::ostringstream o; o.imbue(std::locale::classic());
-        o << "[TOWNS] town name='" << r.name << "' sid='" << r.sid << "' sector=" << s.x << "," << s.y << " pos=" << F1(r.x) << "," << F1(r.y) << "," << F1(r.z);
+        o << "[TOWNS] town name='" << r.name << "' sid='" << r.sid << "' sector=" << s.x << "," << s.y << " pos=" << F1(r.x) << "," << F1(r.y) << "," << F1(r.z)
+          << " key='" << TownKey(r) << "' repl=" << TownVal(r.repl) << " fac=" << TownVal(r.fac);
         DebugLog(o.str()); ++listed;
     }
     std::ostringstream t; t.imbue(std::locale::classic());

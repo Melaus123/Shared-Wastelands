@@ -4,6 +4,9 @@
 
 #include "identity.h"
 
+namespace handwire { struct Hand; }   /* src/common/handwire.h - MSG_HAND's word */
+namespace hitwire { struct Blow; }   /* src/common/hitwire.h - the decided blow on HIT */
+
 namespace coop {
 
 // Install the damage-chokepoint hook (Character::hitByMeleeAttack, F083).
@@ -41,19 +44,22 @@ void InstallEndActionProbe();
 void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
                     const char* damages24, int comboId,
                     const float* parts, int partCount, float blood,
-                    const ObjId& attackerId, bool knock, bool attackerPlayed = false);
+                    const ObjId& attackerId, bool knock, bool attackerPlayed = false,
+                    const hitwire::Blow* blow = 0);   // blow: what the deciding game's engine chose - its result and stumble are played here; 0 = not carried
 
 // P104 fix (protocol 104) - A CROSSBOW BOLT THAT STRIKES THIS GAME'S CHARACTER ON THE OTHER GAME IS PLAYED HERE.
 // session.cpp OnShot hands every MSG_SHOT here (MAIN THREAD): refusal 0 = we drive the victim and the sender drives the shooter;
-// 1 = the victim is not ours, 2 = the sender does not drive the shooter, 3 = it did not decode (uids 0, rec4 0). Counted and
-// logged here; accepted ones are queued for ShotSafePointDrain.
+// 1 = the victim is not ours, 2 = the sender does not drive the shooter, 3 = it did not decode (uids 0, rec4 0). A victim this game
+// classifies as a player character is refused here too (4): its bolt hits are decided on this game from the shooter's copy
+// (shotgate.h). Counted and logged here; accepted ones are queued for ShotSafePointDrain.
 void ShotOnNet(unsigned int victimUid, unsigned int shooterUid, const float* rec4, bool onPurpose, int refusal);
 // MSG_MELEE_DECIDED - another game's player character's melee blow on our NPC, decided on that game. session.cpp OnMeleeDecided hands
 // every one here (MAIN THREAD): refusal 0 = we run the victim and the sender runs the attacker; 1 = the victim is not ours, 2 = the
 // sender does not run the attacker, 3 = it did not decode (uids 0, damages6 0). Counted and logged here; accepted ones wait for the
 // K2 safe point (ShotSafePointDrain), where the wound goes through MedicalSystem::addWound and a HIT goes to every game.
 void MeleeOnNet(unsigned int victimUid, unsigned int attackerUid, int cutDir, int comboId, const float* damages6,
-                unsigned char techFlag, int refusal);
+                unsigned char techFlag, int refusal,
+                const hitwire::Blow* blow = 0);   // blow: the attacker's game's decided blow (landed + its stumble), carried on this game's HIT; 0 = not carried
 // M7a (T-197 piece 7a): the catch-up's combat mode - an owned character whose last sampled edge was ON against a replicated
 // target says so again (the caller has addressed the stream, net::CharStreamToSlot). false = not fighting / not sent. MAIN THREAD.
 bool CombatModeResendOwned(unsigned int uid);
@@ -64,6 +70,10 @@ void ShotSafePointDrain();
 // entries), temporary-enemy / temporary-ally marks, attacker and threat lists, combat target and mode; one [FF] line at the next
 // K2 safe point. Returns the status.
 std::string FfShowLever(const std::string& args);
+// TEST-ONLY, MAIN THREAD: `stancetest <uid> <block|ranged|taunt|hold|passive|chase> <0|1>` - that stance button's saved mode
+// of a character this game runs, set through the engine's own setter (Character vtable +0x308) and read back;
+// `stancetest <uid> show` - the six stance bytes of any loaded character (own or copy). One [TEST] stancetest line; returns the status.
+std::string StanceTestLever(const std::string& args);
 
 // K2 (decision 61 follow-up) - a copy's fall starts on the SAME hit that knocked its owner down.
 // Owner side: medical.cpp's applyDamage detour calls this, on whatever thread applies the hit (the AI
@@ -121,7 +131,54 @@ void SetCombatPulse(bool on);
 // `decisionState` cannot start a swing at all, so a swing needs no decision.
 //
 // MAIN THREAD ONLY.
-void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid);
+void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid, const char* move = 0);   // move: the attack move the owner's swing started (hitwire.h), "" = not carried
+
+// MSG_SWING_END (MAIN THREAD): the owner's swing of uid ended on its game - its copy here drops every swing credit it still holds
+// (swinggate.h OwnerEnd) and the retry of its start on arrival stops. targetUid: the target the SWING named (not used here).
+void ApplyRemoteSwingEnd(unsigned int uid, unsigned int targetUid);
+
+// T-1101 design (c) - MSG_FIGHT_CHOICE (MAIN THREAD, session.cpp OnFightChoice): the owner's fight decide step chose for its player
+// character uid (src/common/fightchoice.h). Kept for this game's copy of uid, which takes it at its own decide step; refusal != 0 =
+// it did not decode (counted). Not a copy here of another game's player character: counted notCopy.
+void ApplyRemoteFightChoice(unsigned int uid, unsigned int targetUid, unsigned int seq, int state, int next, float readyTimer, int refusal);
+// MAIN THREAD (CombatWorldTeardown; session.cpp OnPeerGone): every copy's fight-choice row is freed; why names the event in the line.
+void FightChoiceForget(const char* why);
+
+// T-1101 step 5 - MSG_BLOCK_PICK: session.cpp OnBlockPick hands every one here (MAIN THREAD): refusal 0 = we run the attacker and
+// the sender runs the defender - kept for our copy's block pick of that pair (blockpick.h; name "" = no block); 1 = the attacker
+// is not ours, 2 = the sender does not run the defender, 3 = it did not decode (uids 0, name 0). Counted only.
+void ApplyRemoteBlockPick(unsigned int defenderUid, unsigned int attackerUid, const char* name, int refusal);
+
+// MSG_SHOT_FIRED: session.cpp OnShotFired hands every one here (MAIN THREAD): refusal 0 = the shooter is not ours and the sender
+// runs it - our copy of the shooter fires one real bolt at targetUid, aimed at aim3 moved with the target from targetAt3 (its
+// position on the owner's game), at the next K2 safe point (shotgate.h; combat.cpp ShotFireDrain); 1 = the shooter is ours,
+// 2 = the sender does not run it, 3 = it did not decode (uids 0, aim3 / targetAt3 0). Counted on the [P104] REPORT line.
+void ApplyRemoteShotFired(unsigned int shooterUid, unsigned int targetUid, const float* aim3, const float* targetAt3, int refusal);
+
+// MSG_HAND: session.cpp OnHand hands every one here (MAIN THREAD): refusal 0 = the character is not ours and the sender runs it -
+// its word (an item by section, slot and base sid, or bare hands) is kept for our copy and applied at the K2 safe point through
+// the engine's own draw / put-away (combat.cpp HandApplyDrain); 1 = the character is ours, 2 = the sender does not run it, 3 = it
+// did not decode. Counted on the [P104] REPORT line (hand[...]). The word is kept while the copy is not present, so a copy built
+// or rebuilt later is drawn.
+void ApplyRemoteHand(const handwire::Hand& h, int refusal);
+// MAIN THREAD (session.cpp OnDespawn): copy uid was withdrawn by the game running it - its kept hand word goes (counted forgotten).
+void HandCopyDespawned(unsigned int uid);
+// MAIN THREAD (worldsync.cpp CatchupSendState and the two catch-up SPAWN announces): our character uid's current hand word - its
+// item by section, slot and sid, or bare hands - sent again behind its SPAWN on the road the caller addressed
+// (net::CharStreamToSlot). false = not ours, not readable, an animal, an item it could not name, or not sent.
+bool HandResendOwned(unsigned int uid);
+
+// The six stance buttons of a character as STATE latchBits bits 8-13, bit 14 'read' (statewire.h WithStance), and its ranged
+// mode as bits 15-16 (WithRangedMode); 0 when unreadable.
+unsigned int StanceStateBits(const void* c);
+// MAIN THREAD (spawn.cpp ApplyState): the owner's stance buttons from its STATE onto the copy of another game's player character,
+// through the engine's own setter; a switch into block or passive drops the copy's unthrown swing credits. Also keeps the owner's
+// ranged mode (bits 15-16) for any copy; the K2 safe point writes it (combat.cpp RangedModeApplyDrain).
+void ApplyRemoteStance(unsigned int uid, void* c, unsigned int latchBits);
+// MAIN THREAD (session.cpp OnPlayerGone, SessionForgetRows): copy uid's owner left, or its owner row ended with the session - at
+// the next K2 safe point the copy's ranged mode is written OFF if this game last wrote it ON, and its entry goes. The copy's
+// wanted hand item (MSG_HAND) is dropped at once: the copy's hands are left as its engine has them.
+void RangedModeOwnerGone(unsigned int uid);
 
 // ON by default. `swingrepl off` restores the previous behaviour in one command, so the run can
 // measure the fix against its own absence without a rebuild.

@@ -9,10 +9,14 @@ setlocal
 call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
 cd /d "%~dp0"
 
-rem /bigobj: test_main.cpp holds more sections than the default object format allows (error C1128).
-cl /nologo /O2 /EHsc /MD /W4 /bigobj /D_CRT_SECURE_NO_WARNINGS ^
+rem /bigobj: test_main.cpp held more sections than the default object format allows (error C1128); kept for each part.
+rem Owner decision 1204: the suite is test_main.cpp (the runner, the table, the newer tests) plus suite_part1..7.cpp
+rem (older tests) sharing suite.h, so /MP8 compiles them side by side. The run order is kTests in test_main.cpp.
+echo [STEP] offline suite compile %time%
+cl /nologo /MP8 /O2 /EHsc /MD /W4 /bigobj /D_CRT_SECURE_NO_WARNINGS ^
    /I ..\common ^
-   test_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
+   test_main.cpp suite_part1.cpp suite_part2.cpp suite_part3.cpp suite_part4.cpp suite_part5.cpp suite_part6.cpp suite_part7.cpp ^
+   ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
    /Fecoop_test.exe ^
    /link /MACHINE:X64 /SUBSYSTEM:CONSOLE
 if errorlevel 1 (
@@ -26,6 +30,7 @@ rem wrong reason - a build gate that cannot tell "a test failed" from "the runne
 rem worse than none.
 rem `if errorlevel 1` is true only for codes of 1 and above: a crash ends the runner with a negative code
 rem (0xC0000005 = -1073741819), so the gate tests for any code other than 0.
+echo [STEP] offline suite run %time%
 "%~dp0coop_test.exe"
 if not "%errorlevel%"=="0" (
     echo BUILD FAILED ^(tests: a test FAILED or the runner crashed, exit %errorlevel% - the DLL was NOT relinked^)

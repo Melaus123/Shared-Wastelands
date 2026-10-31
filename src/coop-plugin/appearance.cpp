@@ -601,11 +601,13 @@ int RebuildInFlightGuarded(::Character* c)
 // slot +0x58 while +0x143 is set) are the only appearance steps that replace the body entity, so every road that rebuilds a
 // body - the APPEARANCE apply, a clothing apply that queues a rebuild, a limb or race change, the engine's own - arrives
 // here. On the MAIN thread a replicated character with a body (app +0xD8) - a copy or this game's own: the body decides, not
-// the owner - does not rebuild while it lies in
-// ragdoll (anim +0x2E8, anim = app +0x138) or while the main thread is inside the engine's ragdoll pass (the K2 detour on
-// ThreadSafeRagdollUpdates counts the depth: the get-up blend's last update reaches AppearanceBase::update from inside the
-// pass, and a rebuild there deletes the running blend and leaves it reading the destroyed node). coopbody::CopyBodyDecide
-// says why. The detour then returns without the original: createBody clears +0x143 as its first action, so the byte stays
+// the owner - does not rebuild while the main
+// thread is inside the engine's ragdoll pass (the K2 detour on ThreadSafeRagdollUpdates counts the depth: the get-up blend's
+// last update reaches AppearanceBase::update from inside the pass, and a rebuild there deletes the running blend and leaves
+// it reading the destroyed node), and an ANIMAL also not while it lies in ragdoll (anim +0x2E8, anim = app +0x138: the animal
+// createBody destroys the scene node before it ends the ragdoll; the human createBody ends the ragdoll first, so a human
+// lying in ragdoll is rebuilt - while the animation's has-body byte +0x88 is set, which that ragdoll switch-off needs; with
+// it clear a human waits too). coopbody::CopyBodyDecide says why. The detour then returns without the original: createBody clears +0x143 as its first action, so the byte stays
 // set and the engine calls again on its next update - nothing is destroyed and the rebuild is retried until it runs. A read
 // that faults also waits. Off the main thread it never waits. While +0x143 stays set AppearanceBase::update calls createBody
 // and RETURNS before its +0x142 step (vt+0x30/+0x68) and its +0x141 step, so those wait with it. CopyRebuildInFlightAny
@@ -819,11 +821,11 @@ static void P091ReportLine()
 // PROBE-END: P091
 
 // crash2: the guard's reads. POD only - no C++ object with a destructor in a frame with __try (C2712). MAIN THREAD.
-struct CopyBodyRead { unsigned int uid; int replicated; int owned; int entity; int ragdoll; int fault; };
+struct CopyBodyRead { unsigned int uid; int replicated; int owned; int entity; int ragdoll; int ragdollOffReady; int fault; };
 
 static void CopyBodyReadPod(void* app, CopyBodyRead* r)
 {
-    r->uid = 0; r->replicated = 0; r->owned = 0; r->entity = 0; r->ragdoll = 0; r->fault = 0;
+    r->uid = 0; r->replicated = 0; r->owned = 0; r->entity = 0; r->ragdoll = 0; r->ragdollOffReady = 0; r->fault = 0;
     __try
     {
         if (app == 0) { r->fault = 1; return; }
@@ -840,6 +842,15 @@ static void CopyBodyReadPod(void* app, CopyBodyRead* r)
         void* anim = *(void**)((char*)app + kAppearanceAnimOff);
         if (anim == 0) { r->fault = 1; return; }   // (app +0x138) +0x2E8 cannot be read
         r->ragdoll = (*(void**)((char*)anim + kCopyBodyRagdollOff) != 0) ? 1 : 0;
+        if (r->ragdoll == 0) return;
+        // T-1133: set-body ends a ragdoll through the switch-off 0x5D0320 (decomp_5b8910.txt:42-44), which does its work only
+        // while the has-body byte of the animation object at character +0x448 reads set (+0x88, decomp_5d0320.txt:47). It is
+        // read here through that same character +0x448. The switch-off's other condition, the character's vtable +0xF8
+        // (decomp_5d0320.txt:35-36), is not decompiled and is not checked.
+        void* canim = *(void**)((char*)c + kCharAnimationOff);
+        if (canim == 0) { r->fault = 1; return; }
+        if (canim != anim) return;   // the appearance's and the character's animation objects differ: not ready (waits)
+        r->ragdollOffReady = (*((unsigned char*)canim + kAnimWoundGateOff) != 0) ? 1 : 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { r->fault = 1; }
 }
@@ -851,8 +862,8 @@ static std::map<unsigned int, char> g_copyBodyUidsEver;
 // The uids whose body rebuild the MOD queued (a look, kit or limb apply left +0x143 set on a replicated
 // character) and whose createBody has not run since. The guard holds such a rebuild as it holds a carried-over one
 // (heldBefore), so a rebuild queued on a copy that becomes this game's own before its createBody comes (an area hand-over, a
-// RELEASE adopt, a hire) is still held while the body lies in ragdoll - without the mark the guard read "owned, no hold" and
-// ran it on the ragdolled body (F986). Cleared when the guard lets that uid's createBody run, when the uid is forgotten, and at
+// RELEASE adopt, a hire) is still held as a copy's would be (an animal's while it lies in ragdoll) - without the mark the guard
+// read "owned, no hold" and ran it on the ragdolled body (F986). Cleared when the guard lets that uid's createBody run, when the uid is forgotten, and at
 // a world load / teardown. MAIN THREAD.
 static std::map<unsigned int, char> g_copyBodyModQueued;
 static LONG g_copyBodyModMarks = 0;                      // marks placed (main thread)
@@ -981,6 +992,19 @@ static const size_t kBodyTestRunningOff = 0x61;   // RagdollAnimation : byte, is
 static const size_t kBodyTestTimerOff = 0x68;     // RagdollAnimation : float, time into the blend
 static const size_t kBodyTestLengthOff = 0x64;    // RagdollAnimation : float, the blend's length
 
+// bodytest ragdoll <copyUid | name:<N> | spawned:<T>> - TEST-ONLY, the same lever's second mode, on the game that holds the
+// COPY: on the copy's next ordinary main-thread update OUTSIDE the ragdoll pass while it lies in ragdoll (the ragdoll object
+// exists) with a body and no rebuild pending, it sets the rebuild-pending byte (+0x143) once - the state a carried, knocked-out
+// copy reaches by itself when the engine queues a rebuild - and logs the guard's answer the first time the guard decides for
+// that uid (ran / held). It is not marked as the mod's own rebuild: the engine queues that one. A human copy's rebuild should
+// run (it is held instead while the animation's has-body byte +0x88 reads 0); an animal's is held until it is out of ragdoll.
+// Gives up after kBodyTestWindowMs. Its arms / timeouts / refusals are its own counters. [BODYTEST] lines. MAIN THREAD.
+static unsigned int g_bodyTestRagUid = 0;          // the armed copy (0 = not armed)
+static DWORD        g_bodyTestRagArmedAt = 0;
+static unsigned int g_bodyTestRagOutcomeUid = 0;   // the copy whose next guard decision is logged (0 = none)
+static LONG g_bodyTestRagSet = 0, g_bodyTestRagOutcomes = 0;
+static LONG g_bodyTestRagArms = 0, g_bodyTestRagTimeouts = 0, g_bodyTestRagRefused = 0;   // this mode's own, apart from `pending`'s
+
 struct BodyTestRead { int ok; int blend; int running; int pending; float timer; float length; void* app; };
 
 // No C++ object with a destructor in this frame (C2712).
@@ -1027,12 +1051,18 @@ static std::string BodyTestCounts()
 {
     return " bodytest[arms,fired,timeouts,refused]=" + S((long long)g_bodyTestArms) + "," + S((long long)g_bodyTestFired) + ","
          + S((long long)g_bodyTestTimeouts) + "," + S((long long)g_bodyTestRefused)
-         + " copyBodyPassDeferred=" + S((long long)g_copyBodyPassDeferred);
+         + " copyBodyPassDeferred=" + S((long long)g_copyBodyPassDeferred)
+         + " bodytestRagdoll[arms,set,decided,timeouts,refused]=" + S((long long)g_bodyTestRagArms) + ","
+         + S((long long)g_bodyTestRagSet) + "," + S((long long)g_bodyTestRagOutcomes) + ","
+         + S((long long)g_bodyTestRagTimeouts) + "," + S((long long)g_bodyTestRagRefused);
 }
 
 std::string BodyTestLever(const std::string& sub, unsigned int uid)
 {
-    if (sub != "pending" || uid == 0) return "error bodytest usage: bodytest pending <copyUid>";
+    const bool rag = (sub == "ragdoll");
+    if ((sub != "pending" && !rag) || uid == 0)
+        return "error bodytest usage: bodytest pending <copyUid> | bodytest ragdoll <copyUid | name:<N> | spawned:<T>>";
+    const std::string mode = rag ? "ragdoll" : "pending";
     std::string why;
     ::Character* c = FindSpawned(uid);
     if (net::IsUidMine(uid)) why = "this game drives it (arm it on the game that holds the copy)";
@@ -1045,9 +1075,19 @@ std::string BodyTestLever(const std::string& sub, unsigned int uid)
     }
     if (!why.empty())
     {
-        ::InterlockedIncrement(&g_bodyTestRefused);
-        DebugLog("[BODYTEST] pending (TEST) uid=" + S((long long)uid) + " refused: " + why + BodyTestCounts());
-        return "error bodytest pending: " + why;
+        ::InterlockedIncrement(rag ? &g_bodyTestRagRefused : &g_bodyTestRefused);
+        DebugLog("[BODYTEST] " + mode + " (TEST) uid=" + S((long long)uid) + " refused: " + why + BodyTestCounts());
+        return "error bodytest " + mode + ": " + why;
+    }
+    if (rag)
+    {
+        if (g_bodyTestRagUid != 0 && g_bodyTestRagUid != uid)
+            DebugLog("[BODYTEST] ragdoll (TEST) uid=" + S((long long)g_bodyTestRagUid) + " disarmed: a new arming replaces it");
+        g_bodyTestRagUid = uid; g_bodyTestRagArmedAt = ::GetTickCount(); g_bodyTestRagOutcomeUid = 0;
+        ::InterlockedIncrement(&g_bodyTestRagArms);
+        DebugLog("[BODYTEST] ragdoll (TEST) uid=" + S((long long)uid) + " armed: +0x143 will be set once on an ordinary update"
+                 " outside the ragdoll pass while the copy lies in ragdoll with a body and no rebuild pending" + BodyTestCounts());
+        return "ok bodytest ragdoll uid=" + S((long long)uid) + " armed";
     }
     if (g_bodyTestUid != 0 && g_bodyTestUid != uid)
         DebugLog("[BODYTEST] pending (TEST) uid=" + S((long long)g_bodyTestUid) + " disarmed: a new arming replaces it");
@@ -1058,9 +1098,61 @@ std::string BodyTestLever(const std::string& sub, unsigned int uid)
     return "ok bodytest pending uid=" + S((long long)uid) + " armed";
 }
 
-// MAIN THREAD, from AppearanceTick: the arming gives up when no get-up blend came in the window.
+// TEST-ONLY (bodytest ragdoll). MAIN THREAD, from BodyTestTick (AppearanceTick: an ordinary update outside the ragdoll pass).
+static void BodyTestRagdollTick()
+{
+    if (g_bodyTestRagUid == 0) return;
+    const unsigned int uid = g_bodyTestRagUid;
+    if (net::IsUidMine(uid))
+    {
+        DebugLog("[BODYTEST] ragdoll (TEST) uid=" + S((long long)uid) + " disarmed: this game drives it now (not a copy)"
+                 + BodyTestCounts());
+        g_bodyTestRagUid = 0;
+        return;
+    }
+    if ((DWORD)(::GetTickCount() - g_bodyTestRagArmedAt) >= kBodyTestWindowMs)
+    {
+        ::InterlockedIncrement(&g_bodyTestRagTimeouts);
+        DebugLog("[BODYTEST] ragdoll (TEST) uid=" + S((long long)uid) + " gave up: the copy did not lie in ragdoll with a body"
+                 " and no rebuild pending within " + S((long long)(kBodyTestWindowMs / 1000)) + " s" + BodyTestCounts());
+        g_bodyTestRagUid = 0;
+        return;
+    }
+    if (g_ragdollPassDepth > 0) return;   // only outside the engine's ragdoll pass
+    ::Character* c = FindSpawned(uid);
+    BodyTestRead br;
+    BodyTestReadPod(c, &br);
+    if (br.ok == 0 || br.app == 0 || br.pending != 0) return;
+    CopyBodyRead r;
+    CopyBodyReadPod(br.app, &r);
+    if (r.fault != 0 || r.entity == 0 || r.ragdoll == 0) return;
+    if (BodyTestWritePendingPod(br.app, 1) == 0) return;
+    const int human = HumanClassOf(br.app);   // 1 human, 0 another class (an animal), -1 unreadable
+    g_bodyTestRagUid = 0;
+    g_bodyTestRagOutcomeUid = uid;
+    ::InterlockedIncrement(&g_bodyTestRagSet);
+    DebugLog("[BODYTEST] ragdoll (TEST) uid=" + S((long long)uid) + " set +0x143 while lying in ragdoll (human="
+             + S((long long)human) + ")");
+}
+
+// TEST-ONLY (bodytest ragdoll). MAIN THREAD, from the guard: its first answer for the copy the lever queued a rebuild on.
+static void BodyTestRagdollOutcome(unsigned int uid, int human, int decided, int ragdoll, int ragdollOffReady, int inPass,
+                                   int fault)
+{
+    if (g_bodyTestRagOutcomeUid == 0 || uid != g_bodyTestRagOutcomeUid) return;
+    g_bodyTestRagOutcomeUid = 0;
+    ::InterlockedIncrement(&g_bodyTestRagOutcomes);
+    DebugLog("[BODYTEST] ragdoll (TEST) uid=" + S((long long)uid) + " guard "
+             + std::string(decided == coopbody::kCopyBodyRun ? "RAN the rebuild" : "HELD the rebuild") + " (human="
+             + S((long long)human) + " ragdoll=" + S((long long)ragdoll) + " hasBody(+0x88)=" + S((long long)ragdollOffReady)
+             + " inPass=" + S((long long)inPass) + " fault=" + S((long long)fault) + ")" + BodyTestCounts());
+}
+
+// MAIN THREAD, from AppearanceTick: the `bodytest ragdoll` arming's step; the `bodytest pending` arming gives up when no
+// get-up blend came in the window.
 static void BodyTestTick()
 {
+    BodyTestRagdollTick();   // TEST-ONLY lever: returns at once unless `bodytest ragdoll` is armed
     if (g_bodyTestUid == 0) return;
     if ((DWORD)(::GetTickCount() - g_bodyTestArmedAt) < kBodyTestWindowMs) return;
     ::InterlockedIncrement(&g_bodyTestTimeouts);
@@ -1140,8 +1232,9 @@ void RagdollPassLeave(long saved)
     if (saved == 0) BodyTestPassAfter();    // TEST-ONLY lever
 }
 
-// MAIN THREAD. true = skip this createBody call (the engine calls again next update). One rule for both classes; the
-// counters are the class's own, the pass counters are shared.
+// MAIN THREAD. true = skip this createBody call (the engine calls again next update). One rule, told the class: a human is
+// held inside the ragdoll pass, and while it lies in ragdoll only when its animation's has-body byte (+0x88) reads 0; an
+// animal also whenever it lies in ragdoll. The counters are the class's own, the pass counters are shared.
 static bool AnimalBodyMustWait(void* app, int human)
 {
     volatile LONG* const cDeferred     = (human != 0) ? &g_copyBodyHumanDeferred     : &g_copyBodyDeferred;
@@ -1158,10 +1251,14 @@ static bool AnimalBodyMustWait(void* app, int human)
     const bool inEpisode = (e != g_copyBodyEpisodes.end());
     std::map<unsigned int, char>::iterator mk = (r.uid != 0) ? g_copyBodyModQueued.find(r.uid) : g_copyBodyModQueued.end();
     const bool modMarked = (mk != g_copyBodyModQueued.end());
-    // held before = an open hold for this uid, or a rebuild the mod queued that has not run yet - whoever owns the
-    // uid now, so a rebuild queued on a copy that became this game's own before this call still waits out the ragdoll
+    // held before = an open hold for this uid, or a rebuild the mod queued that has not run yet - whoever owns the uid now,
+    // so a rebuild queued on a copy that became this game's own before this call is still held as a copy's would be: inside
+    // the ragdoll pass for both classes, and lying in ragdoll for an animal or for a human whose has-body byte reads 0
     const int heldBefore = (inEpisode || modMarked) ? 1 : 0;
-    if (coopbody::CopyBodyDecide(1, r.replicated, r.owned, heldBefore, r.entity, r.ragdoll, inPass, r.fault) == coopbody::kCopyBodyRun)
+    const int decided = coopbody::CopyBodyDecide(1, human, r.replicated, r.owned, heldBefore, r.entity, r.ragdoll,
+                                                 r.ragdollOffReady, inPass, r.fault);
+    BodyTestRagdollOutcome(r.uid, human, decided, r.ragdoll, r.ragdollOffReady, inPass, r.fault);   // TEST-ONLY lever: returns at once unless armed
+    if (decided == coopbody::kCopyBodyRun)
     {
         if (modMarked) g_copyBodyModQueued.erase(mk);   // the rebuild the mod queued runs now
         if (!inEpisode)
@@ -1193,9 +1290,14 @@ static bool AnimalBodyMustWait(void* app, int human)
     }
     ::InterlockedIncrement(cDeferred);
     if (r.fault != 0) ::InterlockedIncrement(cReadFault);
-    const bool byPass = (r.fault == 0 && r.ragdoll == 0 && inPass != 0);
+    // held for ragdoll: an animal always; a human only while its has-body byte reads 0 (set-body could not end the ragdoll)
+    const bool ragdollHolds = (r.ragdoll != 0 && (human == 0 || r.ragdollOffReady == 0));
+    const bool byPass = (r.fault == 0 && !ragdollHolds && inPass != 0);
     if (byPass) ::InterlockedIncrement(&g_copyBodyPassDeferred);
-    const char* why = (r.fault != 0) ? "a read faulted" : (r.ragdoll != 0) ? "lying in ragdoll" : "inside the engine's ragdoll pass";
+    const char* why = (r.fault != 0) ? "a read faulted"
+                    : !ragdollHolds ? "inside the engine's ragdoll pass"
+                    : (human != 0) ? "lying in ragdoll with the animation's has-body byte (+0x88) clear - set-body could not end the ragdoll"
+                    : "lying in ragdoll";
     if (r.uid == 0) return true;
     if (inEpisode)
     {
@@ -1230,10 +1332,11 @@ static bool AnimalBodyMustWait(void* app, int human)
 // ANY THREAD. 1 = the guard holds this copy's createBody NOW: +0x143 is set, the body is not being created (+0xE8 clear), it is a
 // copy with a body, and the guard held this uid on the main thread and has not let it through since (the held table, this world
 // load) - so the engine's update calls createBody and either the guard holds it again or it runs on the main thread, and update
-// returns before its +0x142 / +0x141 steps. A read that faults, or anything unproven, reads 0 (not held). needRagdoll = 1 also
-// asks that the copy lies in ragdoll - a hold that lasts (a corpse); a hold inside the ragdoll pass ends at the next update.
+// returns before its +0x142 / +0x141 steps. A read that faults, or anything unproven, reads 0 (not held). needLasting = 1 also
+// asks that the hold lasts past the next update - the guard's ragdoll hold: the copy lies in ragdoll and, for a human
+// (human != 0), its animation's has-body byte (+0x88) reads 0; a hold inside the ragdoll pass ends at the next update.
 // No C++ object with a destructor here (C2712).
-static int CopyBodyHeldNowPod(::Character* c, int needRagdoll)
+static int CopyBodyHeldNowPod(::Character* c, int needLasting, int human)
 {
     __try
     {
@@ -1246,7 +1349,7 @@ static int CopyBodyHeldNowPod(::Character* c, int needRagdoll)
         CopyBodyReadPod(app, &r);
         if (r.fault != 0 || r.uid == 0) return 0;
         if (r.replicated == 0 || r.owned != 0 || r.entity == 0) return 0;   // the gates ask about copies only (their old answer)
-        if (needRagdoll != 0 && r.ragdoll == 0) return 0;
+        if (needLasting != 0 && (r.ragdoll == 0 || (human != 0 && r.ragdollOffReady != 0))) return 0;
         return CopyBodyHeldHas(r.uid);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
@@ -1258,7 +1361,7 @@ static int CopyBodyHeldNowPod(::Character* c, int needRagdoll)
 int CopyRebuildInFlightAny(::Character* c)
 {
     if (RebuildInFlightGuarded(c) == 0) return 0;
-    if (CopyBodyHeldNowPod(c, 0) == 0) return 1;
+    if (CopyBodyHeldNowPod(c, 0, 0) == 0) return 1;
     ::InterlockedIncrement(&g_gateHeldPassed);
     return 0;
 }
@@ -1749,7 +1852,7 @@ const DWORD  kDeadSettleMs         = 2000;    // review D3b
 
 const int kDeadGo = 0, kDeadHeldAnimal = 1, kDeadHeldNotHuman = 2, kDeadHeldCarried = 3, kDeadHeldRebuild = 4;
 const int kDeadHeldSettling = 5, kDeadLooted = 6, kDeadNotDead = 7;
-const int kDeadHeldCorpse = 8;   // T-293 fold 2 (F2-B): the createBody guard holds this corpse's rebuild - for good (a corpse stays limp)
+const int kDeadHeldCorpse = 8;   // the createBody guard holds this corpse's rebuild for good while it lies in ragdoll (an animal, or a human whose animation +0x88 reads clear)
 
 // 1 dead, 0 alive, -1 unreadable. hasDied 0x620B20 reads +0x5BC (answers-deadlook2, Confirmed bytes). No C++ object here (C2712).
 static int DeadPod(::Character* c)
@@ -1815,9 +1918,12 @@ static int DeadClothingVerdict(unsigned int uid, ::Character* c)
     std::map<unsigned int, DWORD>::const_iterator fs = g_deadFirstSeen.find(uid);
     if (fs == g_deadFirstSeen.end()) return kDeadHeldSettling;
     if ((DWORD)(::GetTickCount() - fs->second) < kDeadSettleMs) return kDeadHeldSettling;
-    // T-293 fold 2 (F2-B): a corpse whose createBody the guard holds is held for good (+0x143 never clears on it), so waiting for
-    // its rebuild would keep the list forever - its own outcome: the caller drops the list.
-    if (CopyBodyHeldNowPod(c, 1) != 0) return kDeadHeldCorpse;
+    // T-293 fold 2 (F2-B), T-1133: a corpse whose createBody the guard holds now. Only a human reaches here (an animal returned
+    // kDeadHeldAnimal above). Held lying in ragdoll with its animation's has-body byte (+0x88) clear, the hold lasts (as an
+    // animal's would): the caller drops the list (kDeadHeldCorpse). Held only inside the ragdoll pass, the hold ends at the next
+    // ordinary update and the rebuild runs, so the list waits for it (kDeadHeldRebuild) instead of being dropped.
+    if (CopyBodyHeldNowPod(c, 1, 1) != 0) return kDeadHeldCorpse;
+    if (CopyBodyHeldNowPod(c, 0, 1) != 0) return kDeadHeldRebuild;
     if (!CharacterBuilt(c, 0) || AppearanceRebuildInFlight(c) != 0) return kDeadHeldRebuild;
     return kDeadGo;
 }
@@ -1898,7 +2004,7 @@ void AppearanceForgetCopyBody(unsigned int uid)
 
 // MAIN THREAD (off it: counted, never marked). The mod has just made an apply that may queue a body rebuild on
 // `uid` (a look, kit or limb apply): when the rebuild-pending byte (+0x143) reads set now - or cannot be read - the uid is
-// marked, so the createBody guard holds that rebuild in ragdoll even if the uid becomes this game's own before it runs.
+// marked, so the createBody guard holds that rebuild as a copy's even if the uid becomes this game's own before it runs.
 void CopyBodyNoteModApply(unsigned int uid, ::Character* c)
 {
     const unsigned long m = StoreMainThreadId();
@@ -2276,16 +2382,18 @@ static RecordCopy   g_lookTestRec;          // the record it waits to take
 static DWORD        g_lookTestAt     = 0;   // when the lever ran
 static LONG g_lookTestCalls = 0, g_lookTestSent = 0, g_lookTestSelfApplied = 0;
 
-// The rule's body reads for this game's OWN character: the ragdoll object and a fault. No C++ object with a destructor (C2712).
-static void OwnBodyHoldPod(::Character* c, int* ragdoll, int* fault)
+// The rule's body reads for this game's OWN character: the ragdoll object, the animation's has-body byte (+0x88, which
+// set-body's ragdoll switch-off needs - CopyBodyReadPod) and a fault. No C++ object with a destructor (C2712).
+static void OwnBodyHoldPod(::Character* c, int* ragdoll, int* ready, int* fault)
 {
-    *ragdoll = 0; *fault = 0;
+    *ragdoll = 0; *ready = 0; *fault = 0;
     if (c == 0 || !Obj(c)) { *fault = 1; return; }
     __try
     {
         void* anim = *(void**)((char*)c + kCharAnimationOff);
         if (anim == 0) { *fault = 1; return; }
         *ragdoll = (*(void**)((char*)anim + kCopyBodyRagdollOff) != 0) ? 1 : 0;
+        *ready = (*((unsigned char*)anim + kAnimWoundGateOff) != 0) ? 1 : 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { *fault = 1; }
 }
@@ -2375,18 +2483,20 @@ static void LookTestTick()
         return;
     }
     const DWORD now = P10Now();
-    int ragdoll = 0, fault = 0;
-    OwnBodyHoldPod(c, &ragdoll, &fault);
-    if (coopbody::CopyBodyDecide(1, 1, 1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) return;   // the tick is outside the pass
+    int ragdoll = 0, ready = 0, fault = 0;
+    OwnBodyHoldPod(c, &ragdoll, &ready, &fault);
+    const int human = (DeadHumanPod(c) == 1) ? 1 : 0;   // the class test (appearance vtable); unreadable reads as an animal (stricter)
+    if (coopbody::CopyBodyDecide(1, human, 1, 1, 1, 1, ragdoll, ready, 0, fault) == coopbody::kCopyBodyWait) return;   // the tick is outside the pass
     // The guard holds this game's own character's rebuild only when the mod queued it (this apply marks it below) or a hold
-    // carried over, and then only in ragdoll and inside the ragdoll pass: a rebuild queued while its get-up blend runs would be
-    // held until the blend ends, so the own apply also waits for the blend to end.
+    // carried over, and then only inside the ragdoll pass (an animal also while it lies in ragdoll, a human too while its
+    // has-body byte reads 0): a rebuild queued while its
+    // get-up blend runs would be held until the blend ends, so the own apply also waits for the blend to end.
     BodyTestRead br;
     BodyTestReadPod(c, &br);
     if (br.ok == 0 || (br.blend != 0 && br.running != 0)) return;
     if (CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0)) return;
     const bool ok = ApplyAppearanceRecord(c, g_lookTestRec);
-    CopyBodyNoteModApply(g_lookTestUid, c);   // a rebuild this apply queued is held in ragdoll
+    CopyBodyNoteModApply(g_lookTestUid, c);   // a rebuild this apply queued is held as the mod's own
     if (ok) ::InterlockedIncrement(&g_lookTestSelfApplied);
     DebugLog("[LOOK] looktest own apply (TEST) uid=" + S((long long)g_lookTestUid) + " waitedMs="
              + S((long long)(DWORD)(now - g_lookTestAt)) + (ok ? " applied" : " FAILED") + " calls,sent,selfApplied="
@@ -2540,16 +2650,17 @@ static void OwnLookTick()
             ++it;
             continue;
         }
-        int ragdoll = 0, fault = 0;
-        OwnBodyHoldPod(c, &ragdoll, &fault);
+        int ragdoll = 0, ready = 0, fault = 0;
+        OwnBodyHoldPod(c, &ragdoll, &ready, &fault);
         BodyTestRead br;
-        if (coopbody::CopyBodyDecide(1, 1, 1, 1, 1, ragdoll, 0, fault) == coopbody::kCopyBodyWait) { ++it; continue; }
+        const int human = (DeadHumanPod(c) == 1) ? 1 : 0;   // as LookTestTick: unreadable reads as an animal (stricter)
+        if (coopbody::CopyBodyDecide(1, human, 1, 1, 1, 1, ragdoll, ready, 0, fault) == coopbody::kCopyBodyWait) { ++it; continue; }
         BodyTestReadPod(c, &br);
         if (br.ok == 0 || (br.blend != 0 && br.running != 0)) { ++it; continue; }
         if (CopyDownedPod(c) != 0 || !AppearanceSettled(c) || !CharacterBuilt(c, 0)) { ++it; continue; }
         int r = 4;
         const bool applied = ApplyAppearanceRecord(c, it->second.rec);
-        CopyBodyNoteModApply(uid, c);   // a rebuild this apply queued is held in ragdoll
+        CopyBodyNoteModApply(uid, c);   // a rebuild this apply queued is held as the mod's own
         if (applied)
         {
             r = net::SendAppearance(uid, it->second.rec) ? 1 : 2;
@@ -2583,7 +2694,7 @@ void AppearanceTick()
     KoSelfTick();     // P11 fold 1 TEST-ONLY lever: returns at once unless a `koself` call is being checked
     LookTestTick();   // TEST-ONLY lever: returns at once unless a `looktest` own apply waits
     OwnLookTick();    // T-556: returns at once unless a brought-back character's record waits for its body
-    BodyTestTick();   // TEST-ONLY lever: returns at once unless `bodytest pending` is armed
+    BodyTestTick();   // TEST-ONLY lever: returns at once unless a `bodytest` mode is armed
     // Send half: a uid we own, once its roll has settled. F157 is the whole reason this is a
     // tick and not a line inside the spawn path - at the moment the spawn returns the roll
     // has not been applied yet and reads as defaults on both sides, which would have
@@ -2643,7 +2754,7 @@ void AppearanceTick()
             g_waitNotBuiltAppearance.erase(uid);
             // crash1 (T293 / F912): never rebuild a body that is lying down or limp; it applies once the copy stands.
             // This holds the whole apply (its +0x142 / +0x141 steps too) while the copy lies down; the body rebuild itself is
-            // held by the copy body-rebuild guard (AnimalBodyMustWait) while the copy is in ragdoll or the engine's ragdoll pass runs.
+            // held by the copy body-rebuild guard (AnimalBodyMustWait) while the engine's ragdoll pass runs (an animal also in ragdoll).
             // crash1b (T323): ... nor while its OWNER says it is knocked out - a copy re-spawned under a KO'd owner stands for a
             // moment, and the knockdown that follows would land on the queued rebuild (T293 again)
             // deadlook1 (review D4a): the appearance is NEVER applied to a dead copy (the body rebuild makes a corpse jump,
@@ -2676,7 +2787,7 @@ void AppearanceTick()
 
             std::string before = AppearanceString(c);
             bool ok = ApplyAppearanceRecord(c, it->second);
-            CopyBodyNoteModApply(uid, c);   // held in ragdoll even if the uid becomes this game's own first
+            CopyBodyNoteModApply(uid, c);   // held as a copy's even if the uid becomes this game's own first
             if (ok) { ++g_c.applied; g_appearanceDone[uid] = true; g_copyLookApplied[uid] = true; }
             else    ++g_c.applyFailed;
             if (ok && lookKoThrough)
@@ -2794,9 +2905,13 @@ void ApplyPendingGarments()
                 g_waitKitOpen.erase(uid);
                 g_deadHeldReason.erase(uid);
                 ++g_kitStaleHeldCorpse;
+                // the reason by class: DeadClothingVerdict gives kDeadHeldCorpse only for a lasting (ragdoll) hold
+                const char* heldWhy = (DeadHumanPod(c) == 1)
+                    ? "a human lying in ragdoll whose animation has-body byte (+0x88) reads 0, so set-body could not end the ragdoll"
+                    : "an animal lying in ragdoll";
                 if (++g_kitStaleLines <= 50)
                     SW_DEVLOG("[P022] CLOTHING uid=" + S(uid) + " DROPPED before it was applied - a dead copy whose body rebuild the"
-                             " createBody guard holds for good (+0x143 set, lying in ragdoll); clothes are never applied to a held"
+                             " createBody guard holds now (+0x143 set; " + heldWhy + "); clothes are never applied to a held"
                              " corpse (T-293 fold 2, kitStale[heldCorpse]; 50 lines at most)");
                 g_pendingGarments.erase(it++);
                 continue;
@@ -2833,7 +2948,7 @@ void ApplyPendingGarments()
         std::string before = GearString(c);
         // deadlook1 fold 1: a dead copy gets its WORN slots only (clothing.cpp ApplyWornGarments); everything else stays.
         bool ok = deadApply ? ApplyWornGarments(c, it->second) : ApplyGarments(c, it->second);
-        CopyBodyNoteModApply(uid, c);   // a rebuild the kit apply queued is held in ragdoll whoever owns it
+        CopyBodyNoteModApply(uid, c);   // a rebuild the kit apply queued is held as a copy's whoever owns it
         if (deadApply && ok)
         {
             ++g_deadClothingApplied;

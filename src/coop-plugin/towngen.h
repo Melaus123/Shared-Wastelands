@@ -88,5 +88,6 @@ int  TownGenPlayerHouseSkip(void* building, int rerun);
 int  TownGenBuyHeld(void* building);
 int  TownGenBuyHeldGroups(void** out, int cap);
 int  TownGenTownSid(void* town, char* out, int cap);   /* decision 34: the town's string id (guarded), 1 ok 0 fault; any thread */       // forgets the refusal keys (town x cause) and their counts
+void TownGenUnparkAfterPublish();   /* T-1099, MAIN THREAD (store.cpp PublishPendingTowns, at its end): un-parks every parked residents building whose note no longer holds it */
 int  TownGenTownPos(void* town, float* pos);   /* the town's position (guarded; 0,0 reads as none), 1 read 0 none or fault; main thread */
 }

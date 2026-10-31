@@ -1122,6 +1122,17 @@ int RelationsTagLevel(::Faction* mine, ::Faction* theirs, int* reads)
 
 long long RelationsPlayerPairEpoch() { return (long long)g_playerPairEpoch; }
 
+int RelationsTheirSideRaw(::Faction* theirs, ::Faction* mine, float* v, unsigned* flags)
+{
+    *v = 0.0f; *flags = 0u;
+    if (kGetDataRva == 0 || !Plaus(mine) || !Plaus(theirs)) return 0;
+    void* rt = RelationsOfPod(theirs);
+    Entry e = { 0.0f, 0.0f, 0.0f, 0u };
+    if (!Plaus(rt) || ReadEntry(rt, mine, &e) != 1) return 0;
+    *v = e.relation; *flags = e.flags;
+    return 1;
+}
+
 /* T-545: both directions between this game's player faction and another player's faction, each as the name tag judges it
    (kUnknown when unread). MAIN THREAD - the same inserting accessor as RelationsTagLevel. */
 void RelationsStanceLevels(::Faction* mine, ::Faction* theirs, int* you, int* them)

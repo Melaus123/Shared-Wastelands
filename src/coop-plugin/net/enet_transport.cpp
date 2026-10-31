@@ -22,6 +22,7 @@
 #include "../config.h"   /* ConfigBenchCapKbs (TEST ONLY) */
 #include "../../common/sendbundle.h"   /* M13: what is handed to ENet for the world server during one pass leaves as one packet per lane */
 #include "steam_transport.h"   /* the factory's Steam backend */
+#include "../store.h"   /* T-1118 (a) review fold: StoreMainThreadId - only the main thread's waits for the link's lock are timed */
 
 #include <sstream>
 #include <locale>
@@ -41,12 +42,13 @@ typedef char M13EnetSizesAgree[(sizeof(ENetProtocolHeader) == coopbundle::kEnetP
     && (unsigned int)ENET_PROTOCOL_MAXIMUM_MTU == coopbundle::kEnetMaximumMtu) ? 1 : -1];
 
 /* M16 (T-197): THIS LINK'S NETWORK QUEUE, counted by ENet's own packet free callback - a packet is freed when it is
-   on the wire (unreliable) or acknowledged (reliable), so count/bytes are what ENet still holds for this link. */
-struct SbNetQ { long long count, bytes; SbNetQ() : count(0), bytes(0) {} };
+   on the wire (unreliable) or acknowledged (reliable), so count/bytes are what ENet still holds for this link; freed counts
+   every packet ENet let go (KeepServiced's ackedPackets is its rise during the helper's passes). */
+struct SbNetQ { long long count, bytes, freed; SbNetQ() : count(0), bytes(0), freed(0) {} };
 void SbOnPacketFree(ENetPacket* p)
 {
     SbNetQ* q = (SbNetQ*)p->userData;
-    if (q != 0) { --q->count; q->bytes -= (long long)p->dataLength; }
+    if (q != 0) { --q->count; q->bytes -= (long long)p->dataLength; ++q->freed; }
 }
 
 std::string N(long long v)   // RE_Kenshi's locale mangles raw numbers (F030)
@@ -60,21 +62,71 @@ std::string N(long long v)   // RE_Kenshi's locale mangles raw numbers (F030)
 class EnetTransport : public ITransport
 {
 public:
+    /* T-1118 (a) review fold: WHAT THE HELPER THREAD TOUCHES - the link's lock, its wake event and its two flags - lives in
+       this block, apart from the transport. The helper reaches the transport itself (owner) only inside a pass, and it makes
+       a pass only while `on` is 1, read under the lock; KeepThreadStop sets `on` to 0 under the lock before it waits for the
+       helper to end. So when that wait runs out the transport can still be freed: the block is left allocated, its lock never
+       deleted and its event never closed (keepLeaked_), and a helper that wakes later touches only the block. */
+    struct KeepShared
+    {
+        CRITICAL_SECTION cs;
+        HANDLE wake;             /* manual reset: set at on, reset at off, set again at stop */
+        volatile LONG on, quit;
+        EnetTransport* owner;
+    };
+
+    /* T-1118 (a): THE LINK'S LOCK (ks_->cs). Every method below that touches ENet, the waiting line or the counters takes it,
+       and the helper thread takes it for each pass (KeepServiced). Outside a kept window only the main thread calls in, so
+       the lock is always free and taken at once. A wait for it by the main thread is timed into the window's lockWaitMaxUs
+       (the [LINK] line's "the main thread waited"); the helper's waits and any other thread's are not timed. A critical
+       section is re-entered freely by its owner (Host / Join call Disconnect). */
+    void LockIn() const
+    {
+        if (::TryEnterCriticalSection(&ks_->cs)) return;
+        LARGE_INTEGER a; ::QueryPerformanceCounter(&a);
+        ::EnterCriticalSection(&ks_->cs);
+        const unsigned long mt = coop::StoreMainThreadId();
+        if (mt == 0 || ::GetCurrentThreadId() != (DWORD)mt) return;   /* not the main thread (0 = not known yet): not timed */
+        LARGE_INTEGER b, f; ::QueryPerformanceCounter(&b); ::QueryPerformanceFrequency(&f);
+        if (f.QuadPart <= 0) return;
+        const long long us = ((long long)(b.QuadPart - a.QuadPart) * 1000000LL) / (long long)f.QuadPart;
+        if (us > keepPass_.lockWaitMaxUs) keepPass_.lockWaitMaxUs = us;
+    }
+    void LockOut() const { ::LeaveCriticalSection(&ks_->cs); }
+    class Guard
+    {
+    public:
+        explicit Guard(const EnetTransport* t) : t_(t) { t_->LockIn(); }
+        ~Guard() { t_->LockOut(); }
+    private:
+        const EnetTransport* t_;
+        Guard(const Guard&);
+        Guard& operator=(const Guard&);
+    };
+
     EnetTransport()
         : host_(0), peer_(0), state_(LINK_DOWN), sent_(0), recv_(0),
           nextPeerId_(1), hosting_(false), connectGen_(0), tLimit_(0), tMinMs_(0), tMaxMs_(0),
           sbDirect_(0), sbWaited_(0), sbCoalesced_(0), sbEpisodes_(0), sbDropped_(0), sbSendFailed_(0), sbWaitMax_(0), liveDir_(coopsb::kDirNoLive), tallyLink_(nettally::kLinkSession),
-          bundle_(false), bnSendFailed_(0), bnRecvBundles_(0), bnRecvBundled_(0), bnRecvBad_(0), bnLinksOn_(0), udpPackets_(0), udpBytes_(0), bytesOut_(0), bytesIn_(0)
+          bundle_(false), bnSendFailed_(0), bnRecvBundles_(0), bnRecvBundled_(0), bnRecvBad_(0), bnLinksOn_(0), udpPackets_(0), udpBytes_(0), bytesOut_(0), bytesIn_(0),
+          keepThread_(0), ks_(new KeepShared()), keepLeaked_(false)
     {
+        ::InitializeCriticalSection(&ks_->cs);
+        ks_->wake = 0; ks_->on = 0; ks_->quit = 0; ks_->owner = this;
     }
 
     ~EnetTransport()
     {
+        KeepThreadStop();   /* T-1118 (a): the helper is gone - or, if it did not end in time, can no longer reach this transport - before the host it services */
         Disconnect();
+        if (keepLeaked_) return;   /* the helper may still wait on the block's lock or event: the block stays (KeepThreadStop) */
+        ::DeleteCriticalSection(&ks_->cs);
+        delete ks_; ks_ = 0;
     }
 
     bool Host(unsigned short port, std::string* errOut)
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (!EnsureEnet(errOut)) return false;
         Disconnect();
 
@@ -99,6 +151,7 @@ public:
 
     bool Join(const std::string& address, unsigned short port, std::string* errOut)
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (!EnsureEnet(errOut)) return false;
         Disconnect();
 
@@ -137,6 +190,7 @@ public:
 
     void Disconnect()
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (peer_ != 0)
         {
             // F069: disconnect_now() DISCARDS the outgoing queue, so a BYE queued just
@@ -190,6 +244,7 @@ public:
        because both pointers are already 0. */
     void Abort()
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (peer_ != 0) { enet_peer_reset(peer_); peer_ = 0; }
         if (host_ != 0) { UdpHarvest(); enet_host_destroy(host_); host_ = 0; }
         SbLinkGone("the link was aborted");
@@ -200,6 +255,7 @@ public:
     // a disconnect would otherwise still be sitting in the queue (F069).
     void Flush()
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         SbDrain();   /* M16: what waits goes to ENet first, while its queue has room */
         BundleSealAll();   /* M13: and the open bundles, before ENet transmits */
         if (host_) enet_host_flush(host_);
@@ -207,6 +263,7 @@ public:
 
     void Poll(std::vector<Message>* out)
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (host_ == 0) return;
 
         /* M13: everything handed over since the last pass leaves now, one packet per lane - the first enet_host_service
@@ -262,6 +319,7 @@ public:
 
     bool Send(unsigned int /*peer*/, MsgType type, const char* data, size_t len, Channel ch)
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (host_ == 0 || peer_ == 0 || state_ != LINK_UP) return false;
         nettally::CountOut(tallyLink_, (unsigned int)type, kHeaderBytes + len);   /* what this link was handed, by type (sent now or waiting) */
 
@@ -396,6 +454,7 @@ public:
     /* M13: see transport.h. Only the world-server link bundles; turning it off sends what is open first. */
     void SetBundling(bool on)
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         const bool want = on && liveDir_ == coopsb::kDirUp && host_ != 0 && peer_ != 0 && state_ == LINK_UP;
         if (!want) { BundleSealAll(); bundle_ = false; return; }
         if (bundle_) return;
@@ -420,6 +479,7 @@ public:
        messages in them; recvBad = bundles refused whole; udpPackets / udpBytes = what ENet put on the wire for this link. */
     std::string BundleToken()
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (liveDir_ != coopsb::kDirUp) return std::string();
         UdpHarvest();
         return " bundle[packets,bundles,bundled,bytesSaved,single,alone,sendFailed,recvBundles,recvBundled,recvBad,udpPackets,udpBytes]="
@@ -429,8 +489,8 @@ public:
     }
     /* sendBound[waitNow,waitBytesNow,waitMax,netQueued,netBytes,direct,waited,coalesced,episodes,droppedAtClose,sendFailed] - see sendbound.h;
        waitMax = the most waiting since the previous REPORT; netQueued/netBytes = what ENet holds for this link now. */
-    void SetStoreLink() { liveDir_ = coopsb::kDirUp; if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* M16 fold 2: see transport.h */
-    void SetTrafficLink(int link) { tallyLink_ = link; }   /* the [NET] TRAFFIC REPORT line this link is counted on - see transport.h */
+    void SetStoreLink() { Guard g(this); liveDir_ = coopsb::kDirUp; if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* M16 fold 2: see transport.h */
+    void SetTrafficLink(int link) { Guard g(this); tallyLink_ = link; }   /* the [NET] TRAFFIC REPORT line this link is counted on - see transport.h */
     /* TEST ONLY (benchcapkbs=<n>; absent = off): ENet's own bandwidth limit, <n> KB/s (1000 bytes) in and out, on the host made just
        now, so a bench can see a game on a slow line. ENet paces what it sends and tells the far end what it may send here. */
     void BenchCap()
@@ -443,6 +503,7 @@ public:
     }
     std::string SendBoundToken()
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         const long long wm = sbWaitMax_; sbWaitMax_ = box_.Count();
         return " sendBound[waitNow,waitBytesNow,waitMax,netQueued,netBytes,direct,waited,coalesced,episodes,droppedAtClose,sendFailed]="
              + N(box_.Count()) + "," + N(box_.Bytes()) + "," + N(wm) + "," + N(netq_.count) + "," + N(netq_.bytes) + "," + N(sbDirect_)
@@ -455,16 +516,19 @@ public:
 
     unsigned int RoundTripMs() const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         return (peer_ != 0) ? (unsigned int)peer_->roundTripTime : 0;
     }
     /* P7f (review-p6z H-1): ENet's own count, read straight off the host. */
     unsigned int PeerCount() const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         return (host_ != 0) ? (unsigned int)host_->connectedPeers : 0;
     }
     /* T-355 fold 2: see transport.h. peer_ is the one session peer; its data is the id set at CONNECT (0 = the host). */
     bool CurrentPeerId(unsigned int* out) const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (peer_ == 0 || state_ != LINK_UP) return false;
         if (out != 0) *out = (unsigned int)(size_t)peer_->data;
         return true;
@@ -474,12 +538,14 @@ public:
     /* link1 (T416): see transport.h. Applied at each CONNECT event (host and joiner), and at once to a peer already up. */
     void SetPeerTimeouts(unsigned int limit, unsigned int minimumMs, unsigned int maximumMs)
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         tLimit_ = limit; tMinMs_ = minimumMs; tMaxMs_ = maximumMs;
         if (peer_ != 0 && state_ == LINK_UP) enet_peer_timeout(peer_, tLimit_, tMinMs_, tMaxMs_);
     }
     /* addr1: see transport.h. peer_ is the host for a joining game (set by Join); ENet already resolved it. */
     std::string PeerHostIp() const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (peer_ == 0) return std::string();
         char buf[64];
         std::memset(buf, 0, sizeof(buf));
@@ -489,6 +555,7 @@ public:
     /* ui1: see transport.h. peer_ is the host for a joining game; lastReceiveTime is set from host->serviceTime (ENet's clock). */
     unsigned int HostSilenceMs() const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (peer_ == 0 || state_ != LINK_UP) return 0;
         const enet_uint32 now = enet_time_get();
         const enet_uint32 d = now - peer_->lastReceiveTime;   /* ui1: unsigned - a wrap is harmless */
@@ -499,6 +566,7 @@ public:
        other control commands count as 0 bytes). Read on the thread that services the link, like every other peer_ access. */
     bool SendQueued(long long* packets, long long* bytes) const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (peer_ == 0 || state_ != LINK_UP) return false;
         ENetList* const lists[3] = { &peer_->outgoingCommands, &peer_->outgoingSendReliableCommands, &peer_->sentReliableCommands };
         long long n = 0, b = 0;
@@ -513,16 +581,112 @@ public:
         if (bytes != 0) *bytes = b;
         return true;
     }
-    unsigned long long SentCount() const { return sent_; }
+    unsigned long long SentCount() const { Guard g(this); return sent_; }   /* the helper's passes send too */
     unsigned long long RecvCount() const { return recv_; }
     bool ByteCounts(unsigned long long* sent, unsigned long long* recv) const
     {
+        Guard g(this);   /* T-1118 (a): the link's lock */
         if (sent != 0) *sent = bytesOut_;
         if (recv != 0) *recv = bytesIn_;
         return true;
     }
 
+    /* T-1118 (a): see transport.h. The helper thread is made at the first kept window and lives as long as this transport;
+       between windows it waits on ks_->wake (manual reset: set here at on, reset at off). */
+    bool KeepServiced(bool on, linkkeep::Pass* out)
+    {
+        Guard g(this);
+        if (!on)
+        {
+            ::InterlockedExchange(&ks_->on, 0);   /* under the lock: the helper is not inside a pass, and its next one sees 0 */
+            if (ks_->wake != 0) ::ResetEvent(ks_->wake);
+            if (out != 0) *out = keepPass_;
+            keepPass_ = linkkeep::Pass();
+            return true;
+        }
+        if (host_ == 0 || peer_ == 0 || state_ != LINK_UP) return false;
+        if (keepThread_ == 0)
+        {
+            ks_->wake = ::CreateEventW(0, TRUE, FALSE, 0);
+            if (ks_->wake == 0) { ErrorLog("[net] T-1118: could not make the link helper's event - this link is not kept serviced during saves"); return false; }
+            keepThread_ = ::CreateThread(0, 0, &KeepThreadMain, ks_, 0, 0);   /* the helper is handed the block, not the transport */
+            if (keepThread_ == 0)
+            {
+                ::CloseHandle(ks_->wake); ks_->wake = 0;
+                ErrorLog("[net] T-1118: could not start the link helper thread - this link is not kept serviced during saves");
+                return false;
+            }
+        }
+        keepPass_ = linkkeep::Pass();
+        ::InterlockedExchange(&ks_->on, 1);
+        ::SetEvent(ks_->wake);
+        return true;
+    }
+    /* T-1118 (a) review fold: this backend has a helper, so a refused KeepServiced(true) on an up link means the helper
+       could not be started (store.cpp counts that window noHelper, apart from a Steam link's noKeeper). */
+    bool KeepHasHelper() const { return true; }
+
 private:
+    static DWORD WINAPI KeepThreadMain(LPVOID p) { KeepLoop((KeepShared*)p); return 0; }
+    /* T-1118 (a): THE HELPER THREAD. While a window is on it makes one pass about every millisecond (Sleep(1); the system
+       timer decides the real step); between windows it waits. It ends only at KeepThreadStop. It touches only its block
+       (KeepShared) and reaches the transport only for a pass, which `on` - 0 from KeepThreadStop on - allows. */
+    static void KeepLoop(KeepShared* ks)
+    {
+        for (;;)
+        {
+            ::WaitForSingleObject(ks->wake, INFINITE);
+            if (::InterlockedCompareExchange(&ks->quit, 0, 0) != 0) return;
+            ::EnterCriticalSection(&ks->cs);
+            if (ks->on != 0) ks->owner->KeepPass();
+            ::LeaveCriticalSection(&ks->cs);
+            ::Sleep(1);
+        }
+    }
+    /* T-1118 (a): ONE PASS, under the lock: the open bundles to ENet, one ENet service with no event (it sends, takes in
+       the world server's acknowledgements and data, and acknowledges that data; received packets and any connect or
+       disconnect wait inside ENet for the next Poll), then the waiting line into the room the acknowledgements made -
+       the same three steps Poll makes, without handing anything over. */
+    void KeepPass()
+    {
+        if (host_ == 0 || peer_ == 0 || state_ != LINK_UP) return;
+        const enet_uint32 sent0 = host_->totalSentData;
+        const long long freed0 = netq_.freed;
+        BundleSealAll();
+        enet_host_service(host_, 0, 0);
+        SbDrain();
+        ++keepPass_.services;
+        keepPass_.sentBytes += (long long)(enet_uint32)(host_->totalSentData - sent0);
+        keepPass_.ackedPackets += netq_.freed - freed0;
+    }
+    /* T-1118 (a): the helper ends before this transport does. The flags are set under the lock and the lock is let go
+       before the wait, so the helper's last pass can finish; it holds the lock only for one pass.
+       Review fold: the wait is bounded (2 s). A memory fault caught by an outer handler while the main thread held the lock
+       leaves the lock held for good, and the helper waits on it forever; waiting for the helper without a limit would then
+       freeze the main thread at `delete g_link`. When the wait runs out the helper is left where it is and its block is
+       kept (keepLeaked_: the lock is never deleted, the event never closed); `on` is already 0 under the lock, so the helper
+       never reaches this transport again and the transport and its host can still be freed. Said once per transport. */
+    void KeepThreadStop()
+    {
+        if (keepThread_ == 0) return;
+        {
+            Guard g(this);
+            ::InterlockedExchange(&ks_->quit, 1);
+            ::InterlockedExchange(&ks_->on, 0);
+            ::SetEvent(ks_->wake);
+        }
+        const DWORD w = ::WaitForSingleObject(keepThread_, 2000);
+        ::CloseHandle(keepThread_); keepThread_ = 0;   /* closing the handle does not end the thread */
+        if (w != WAIT_OBJECT_0)
+        {
+            keepLeaked_ = true;
+            ErrorLog("[net] T-1118: the link helper thread did not end within 2 s (wait result " + N((long long)w) + ") - it is left"
+                     " running; its lock and wake event are kept, never freed, and it no longer reaches this link, which closes without it");
+            return;
+        }
+        ::CloseHandle(ks_->wake); ks_->wake = 0;
+    }
+
     // ENet's global init is process-wide and must happen exactly once.
     static bool EnsureEnet(std::string* errOut)
     {
@@ -629,6 +793,11 @@ private:
     long long bnSendFailed_, bnRecvBundles_, bnRecvBundled_, bnRecvBad_, bnLinksOn_;
     long long udpPackets_, udpBytes_;   /* M13: ENet's datagram counters, harvested (UdpHarvest) */
     unsigned long long bytesOut_, bytesIn_;   /* ByteCounts */
+    /* T-1118 (a): the helper that keeps the link serviced during a save (KeepServiced), and the block holding the link's lock */
+    HANDLE keepThread_;
+    KeepShared* ks_;      /* the lock, the wake event and the helper's flags (KeepShared); never 0 while the transport lives */
+    bool keepLeaked_;     /* KeepThreadStop's wait ran out: ks_ is left allocated, its lock and event untouched */
+    mutable linkkeep::Pass keepPass_;   /* what the helper did in the open window; lockWaitMaxUs is written by LockIn (main thread only) */
 };
 
 } // namespace
@@ -715,6 +884,11 @@ const char* MsgTypeName(MsgType t)
     case MSG_KEEPER_RESTOCK: return "KEEPER_RESTOCK";   /* T-799 D4 */
     case MSG_MELEE_DECIDED: return "MELEE_DECIDED";
     case MSG_ITEM_HANDOVER: return "ITEM_HANDOVER";   /* T-889 step 2 */
+    case MSG_BLOCK_PICK: return "BLOCK_PICK";   /* T-1101 step 5 */
+    case MSG_SWING_END: return "SWING_END";
+    case MSG_FIGHT_CHOICE: return "FIGHT_CHOICE";   /* T-1101 design (c) */
+    case MSG_SHOT_FIRED: return "SHOT_FIRED";
+    case MSG_HAND: return "HAND";
     case MSG_SESSION_CLOSING: return "SESSION_CLOSING";   /* mmo5 */
     case MSG_SQUAD_LEAD: return "SQUAD_LEAD";   /* T-1 B1 restructure */
     /* 58 (KEEPER) retired by protocol 89 - T-1 B3 restructure */

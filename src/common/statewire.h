@@ -5,6 +5,10 @@
  *                                             (T-178 crawl1, session 86: latchBits bit 6 = the owner's own inRagdoll,
  *                                              getupcrawl.h kStateOwnerRagdollBit; bits 0-5 the medical latch)
  *                                             (latchBits bit 7 = the owner's stealth mode, sneakwire.h kStateOwnerSneakBit)
+ *                                             (latchBits bits 8-13 = the owner's six stance buttons, bit 14 = they were read:
+ *                                              WithStance below)
+ *                                             (latchBits bits 15-16 = the owner's ranged mode, bit 16 = it was read:
+ *                                              WithRangedMode below)
  *     | koTimer f32                             (H029 - optional: absent = -1, "not carried")
  *     | carryingUid u32                         (K1, session protocol 47 - optional: absent = 0, flagged)
  *     | restHas u8 | restX f32 | restY f32 | restZ f32   (R3, session protocol 48 - optional: absent = no rest)
@@ -264,6 +268,98 @@ inline int DecodeState(const char* p, size_t size, unsigned int maxParts, unsign
         }
     }
     return kStateDecodeOk;
+}
+
+/* latchBits bits 8-13: the owner's six stance buttons in the order block, ranged, taunt, hold, passive, chase (combat.cpp
+   kStanceName), 1 = on; bit 14 (kStanceReadBit): the six were read on the owner's game - clear = not carried, and the copy's
+   buttons are left as they are. Bits 0-7 (the medical latch, the ragdoll and sneak bits) are not touched. */
+const unsigned int kStanceShift   = 8;
+const int          kStanceCount   = 6;
+const unsigned int kStanceReadBit = 1u << 14;
+const unsigned int kStanceMask    = (0x3Fu << kStanceShift) | kStanceReadBit;
+
+/* latchBits with its stance bits replaced by six button bytes (0 off, anything else on); read false = not carried. */
+inline unsigned int WithStance(unsigned int latchBits, const unsigned char* six, bool read)
+{
+    unsigned int b = latchBits & ~kStanceMask;
+    if (!read || six == 0) return b;
+    for (int i = 0; i < kStanceCount; ++i)
+        if (six[i] != 0) b |= 1u << (kStanceShift + (unsigned int)i);
+    return b | kStanceReadBit;
+}
+inline bool StanceCarried(unsigned int latchBits) { return (latchBits & kStanceReadBit) != 0; }
+/* button i (0..5, kStanceName order): 1 on, 0 off or out of range */
+inline int StanceOn(unsigned int latchBits, int i)
+{
+    return (i >= 0 && i < kStanceCount && (latchBits & (1u << (kStanceShift + (unsigned int)i))) != 0) ? 1 : 0;
+}
+/* T-1101 step 4: the stance bits read just before and just after one call of the engine's stance setter - true when the call
+   changed a button (after read, and before unread or different in bits 8-13). An unreadable 'after' is false: a STATE would not
+   carry the buttons either. */
+inline bool StanceChanged(unsigned int before, unsigned int after)
+{
+    if (!StanceCarried(after)) return false;
+    return !StanceCarried(before) || ((before ^ after) & kStanceMask) != 0;
+}
+/* latchBits bit 15: the owner's ranged mode (Character +0x2F0 -> RangedCombatClass +0x36, the flag the engine's per-frame ranged
+   update tests before it fetches the gun); bit 16 (kRangedModeReadBit): it was read on the owner's game - clear = not carried, and
+   the copy's ranged mode is left as it is. Bits 0-14 are not touched. */
+const unsigned int kRangedModeBit     = 1u << 15;
+const unsigned int kRangedModeReadBit = 1u << 16;
+const unsigned int kRangedModeMask    = kRangedModeBit | kRangedModeReadBit;
+/* latchBits with its ranged-mode bits replaced: mode 1 (any non-zero) on, 0 off, negative = not read (not carried). */
+inline unsigned int WithRangedMode(unsigned int latchBits, int mode)
+{
+    const unsigned int b = latchBits & ~kRangedModeMask;
+    if (mode < 0) return b;
+    return b | kRangedModeReadBit | (mode != 0 ? kRangedModeBit : 0u);
+}
+/* the owner's ranged mode a STATE carries: 1 on, 0 off, -1 not carried */
+inline int RangedModeCarried(unsigned int latchBits)
+{
+    if ((latchBits & kRangedModeReadBit) == 0) return -1;
+    return (latchBits & kRangedModeBit) != 0 ? 1 : 0;
+}
+/* the owner's side: two samples of its own character's ranged mode (-1 unreadable) - true when both read and they differ. */
+inline bool RangedModeChanged(int seen, int now)
+{
+    return seen >= 0 && now >= 0 && (seen != 0) != (now != 0);
+}
+/* the copy's side: the byte to write into the copy's ranged mode for the owner's word `want` (-1 none) when the copy's own reads
+   `here` (-1 unreadable): 1 or 0, or -1 = write nothing (no word, unreadable, or already the same). */
+inline int RangedModeWrite(int want, int here)
+{
+    if (want < 0 || here < 0) return -1;
+    if ((want != 0) == (here != 0)) return -1;
+    return want != 0 ? 1 : 0;
+}
+/* the copy's side: a copy whose ranged mode was written ON in safe-point pass onPass (0 = none) fires only from a later pass
+   passNow - the gun it fires with is the one the engine's ranged update stores after the write. */
+inline bool RangedModeOnSettled(unsigned int onPass, unsigned int passNow)
+{
+    return onPass == 0u || passNow != onPass;
+}
+/* the safe-point pass counter's next value; it skips 0, which means 'none' above. */
+inline unsigned int RangedModePassNext(unsigned int pass)
+{
+    return (pass + 1u == 0u) ? 1u : pass + 1u;
+}
+/* the copy's side: how many times one owner word is written back after the copy's own engine changed the byte back; after that
+   the word is not written again until it changes. */
+const int kRangedModeRevertCap = 20;
+inline bool RangedModeRevertsLeft(int reverts)
+{
+    return reverts < kRangedModeRevertCap;
+}
+/* T-1101 step 4: a uid put in a small set waiting for one STATE each - several buttons in one frame give one push.
+   1 added, 0 already in it (or uid 0), -1 the set is full. */
+inline int DirtyAdd(unsigned int* set, int* n, int cap, unsigned int uid)
+{
+    if (uid == 0) return 0;
+    for (int i = 0; i < *n; ++i) if (set[i] == uid) return 0;
+    if (*n >= cap) return -1;
+    set[(*n)++] = uid;
+    return 1;
 }
 
 }   /* namespace coopstate */

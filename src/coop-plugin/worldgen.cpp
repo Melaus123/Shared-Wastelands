@@ -27,6 +27,7 @@ std::string P072ReportToken();                  /* PROBE P072: counters for the 
 #include "zones.h"        /* P4z: SectorOf / HeldByOtherTS - the decision-33 area question */
 #include "../common/removalreason.h"   /* M7a3: the engine's removal reason - an unload is never sent as a death */
 #include "towngen.h"      /* T-392 (owner 335 a): TownGenResidentsGate - the residents gate */
+#include "townver.h"      /* TownVerChoose / TownVerInstall / TownVerReportToken */
 #include "../common/townreoffer.h"   /* T-438: PopulateMode - the SAME header the offline suite compiles */
 #include "handoff.h"      /* PROBE P116: ReadSquadAt - the guarded squad read */
 #include "speech.h"       /* T-831: TalkWindowBeforeRemove - a shown conversation naming the object ends before it goes */
@@ -571,7 +572,9 @@ bool detour_checkForRepopulateTown(ZoneManager* self, Town* t)
     NoteThread(&g_tidRepop);
     if (UpstreamGated()) { InterlockedIncrement64(&g_blkRepop); return false; }
     InterlockedIncrement64(&g_repopTown);
-    const bool r = orig_checkForRepopulateTown(self, t);
+    /* the stored town version first, then the engine's chooser (owner 260 in force): the holder publishes, another game lets no
+       version qualify (townver.cpp). Off the main thread it is the engine alone. */
+    const bool r = coop::TownVerChoose((void*)self, (void*)t, (coop::TvChooserFn)orig_checkForRepopulateTown);
     if (r || t == 0 || InterlockedCompareExchange(&g_repopForceOn, 0, 0) == 0) return r;
     InterlockedIncrement64(&g_repopForced);   /* townrepop (TEST-ONLY): the engine's own rebuild branch of _activate runs for this town */
     return true;
@@ -677,7 +680,7 @@ void ReportWorldGen()
              + " charCreated=" + S(g_charCreated)
              + " charForBuilding=" + S(g_charForBld)
              + " populateBuilding=" + S(g_populateBld)
-             + " repopulateTown=" + S(g_repopTown) + " repopForced=" + S(g_repopForced)
+             + " repopulateTown=" + S(g_repopTown) + " repopForced=" + S(g_repopForced) + " " + coop::TownVerReportToken()
              + " | blockedChar=" + S(g_blkChar) + " charPlayerPass=" + S(g_charPlayerPass)
              + " leafArea[allowed,gatedHeld,gatedNotMine,leafRefusedNoMap,allowedSingle,gatedTeardown]=" + S(g_leafAllowedArea)
              + "," + S(g_leafGatedHeld) + "," + S(g_leafGatedOtherLoaded) + "," + S(g_leafGatedNoMap)
@@ -820,6 +823,7 @@ void InstallWorldGen()
                                          : "[P032] checkForRepopulateTown AddHook FAILED");
     }
     else ErrorLog("[P032] checkForRepopulateTown resolved to 0");
+    coop::TownVerInstall();   /* the town-version world-state hooks */
 
 #ifdef SW_DEV_BUILD
     P072Install((unsigned long long)imgBase);   /* PROBE P072 (test build only, T-879 E) */

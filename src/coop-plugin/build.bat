@@ -36,6 +36,7 @@ rem It compiles src\common\clockmath.cpp with this same cl.exe and runs the test
 rem non-zero and STOPS THIS BUILD BEFORE THE DLL IS LINKED, so a DLL carrying a failed assertion cannot
 rem reach tools\deploy.ps1. src\coop-store\build.bat runs the SAME step 0 itself (P7w, review-p7u M-1):
 rem it did NOT inherit the gate - its host.obj check only asks whether a plugin build ever happened.
+echo [STEP] offline suite %time%
 call "%~dp0..\coop-test\build.bat"
 if errorlevel 1 (
     echo BUILD FAILED ^(offline tests - the DLL was NOT rebuilt^)
@@ -49,7 +50,8 @@ rem enet.h carries extern "C" guards, so building the definitions as C++ keeps t
 rem linkage identical - the symbols stay unmangled and our C++ links against them.
 rem WINVER/_WIN32_WINNT 0x0501: ENet needs the XP-era socket API surface under v100.
 rem win32.c/unix.c self-guard on _WIN32, so both may be listed; only win32 compiles.
-cl /nologo /c /TP /O2 /GL /MD /D_CRT_SECURE_NO_WARNINGS ^
+echo [STEP] enet %time%
+cl /nologo /MP8 /c /TP /O2 /GL /MD /D_CRT_SECURE_NO_WARNINGS ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include ^
    third_party\enet\callbacks.c third_party\enet\compress.c third_party\enet\host.c ^
@@ -68,7 +70,8 @@ rem brings offsetof, which hook.c uses - the sources stay unmodified. UNICODE ma
 rem character set (hook.c passes a wide string to GetModuleHandle). NDEBUG/STRICT as upstream's Release.
 rem The objects go to obj\minhook\ so none can collide with the ENet objects in this folder.
 if not exist obj\minhook mkdir obj\minhook
-cl /nologo /c /TP /O2 /GL /EHsc /MD /DSTRICT /DNDEBUG /DUNICODE /D_UNICODE /FIstddef.h ^
+echo [STEP] minhook %time%
+cl /nologo /MP8 /c /TP /O2 /GL /EHsc /MD /DSTRICT /DNDEBUG /DUNICODE /D_UNICODE /FIstddef.h ^
    /I third_party\minhook\include /Foobj\minhook\ ^
    third_party\minhook\src\buffer.c third_party\minhook\src\hook.c third_party\minhook\src\trampoline.c ^
    third_party\minhook\src\hde\hde32.c third_party\minhook\src\hde\hde64.c
@@ -81,6 +84,7 @@ rem --- Step 1b2: EVERY ADDRESS TABLE NAMES THE SAME ROWS (mig7, owner decision 
 rem The mod picks addresses\<fingerprint>.txt by the game's fingerprint and refuses to start when a name it registers
 rem is missing (addrBindMissing). A row added to the 1.0.65 table only would disable the mod on Steam 1.0.68 alone,
 rem which no 1.0.65 bench run would notice - so the build fails here instead. Fix: re-run tools\gen_table_1068.py.
+echo [STEP] table checks %time%
 python "%~dp0..\..\tools\check_tables.py" "%~dp0addresses"
 if errorlevel 1 (
     echo BUILD FAILED ^(address tables disagree - see TABLE CHECK FAILED above^)
@@ -93,7 +97,11 @@ rem both Steam executables with every cross-check (rank order, distinct, globals
 rem "PROOF: PASS"; anything else - a row that differs, one not found, one with no signature, a failed cross-check, a
 rem missing executable - fails the build, so a signatures.sig that no longer reproduces both tables cannot ship.
 rem READ-ONLY on both executables. Fix: re-run tools\gen_signatures.py.
-python "%~dp0..\..\tools\prove_signatures.py"
+rem Owner decision 1204: --stamp skips the proof (one SKIPPED line) when no file in addresses\, the tool itself and neither
+rem executable (its size and time) changed since its last PASS in this tree; the stamp is written only after a PASS and is
+rem not committed (obj\ is in .gitignore). A missing or different stamp runs the proof as before.
+echo [STEP] signature proof %time%
+python "%~dp0..\..\tools\prove_signatures.py" --stamp "%~dp0obj\signatures.proved"
 if errorlevel 1 (
     echo BUILD FAILED ^(signatures do not reproduce both Steam tables - see PROOF above^)
     exit /b 1
@@ -103,12 +111,14 @@ rem --- Step 1b3: NO ENGINE ADDRESS WRITTEN INTO THE CODE (stage 7/9, 2026-09-29
 rem Every engine address comes from the address table (AddrReg); a number typed into the code is a 1.0.65 number and
 rem calls the wrong code on Steam 1.0.68. tools\scan_hardcoded_rva.py lists every such literal (its rules are in its
 rem header; tools\scan_hardcoded_rva.allow holds only proven non-addresses) and fails the build on any hit.
+echo [STEP] address scan %time%
 python "%~dp0..\..\tools\scan_hardcoded_rva.py"
 if errorlevel 1 (
     echo BUILD FAILED ^(an engine address is written into the code - see RVA SCAN above^)
     exit /b 1
 )
 
+echo [STEP] layout check %time%
 rem --- Step 1c: THE LAYOUT CHECK -----------------------------------------------------------------------------
 rem game\decl_check.cpp static_asserts OUR declarations (game\*.h) against the numbers in game\gamelayout.h (the
 rem list is game\layout_asserts.inl). Compiled with the DLL's flags plus /c; the object goes to obj\layout\ and is
@@ -122,22 +132,40 @@ if errorlevel 1 (
 )
 
 rem --- Step 2: our plugin, linked against the ENet objects --------------------------
-cl /nologo /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
+rem /MP8 (owner decision 1202): up to 8 files compile at once - each file's code is made as before; 8, not every core,
+rem because test games run on this machine while it builds. /GL + /LTCG stay (the link step is unchanged).
+rem Owner decision 1204: compile and link are two calls, so the log times each. The compile is the one-call form's cl
+rem with /c added and the objects sent to obj\plugin\ (the same flags, /LD included). The link is what that cl handed
+rem the linker: /DLL (from /LD), /OUT (from /Fe), the objects in the order the sources are listed and then ENet's and
+rem MinHook's, and the same /LTCG, map, machine and libraries - so the DLL and its map come out as before. A source
+rem added to PLUGIN_SRC is compiled and linked; nothing else lists it.
+set PLUGIN_SRC=coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_channel.cpp ai_spike.cpp spawn.cpp replicate.cpp combat.cpp medical.cpp ^
+   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp townver.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp money.cpp u8file.cpp ^
+   net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\routerask.cpp net\steam_probe.cpp net\steam_transport.cpp net\relay_test.cpp net\relay_bridge.cpp net\steam_friends.cpp ^
+   ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp
+if not exist obj\plugin mkdir obj\plugin
+echo [STEP] plugin compile %time%
+cl /nologo /MP8 /c /LD /O2 /GL /EHsc /MD /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /wd4482 %SWDEV% ^
    /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I third_party\enet\include /I third_party\minhook\include ^
-   coop.cpp hooks.cpp coop_log.cpp config.cpp addresses.cpp command_channel.cpp ai_spike.cpp spawn.cpp replicate.cpp combat.cpp medical.cpp ^
-   identity.cpp soak.cpp appearance.cpp appearance_record.cpp clothing.cpp worldgen.cpp worldsync.cpp zones.cpp handoff.cpp hire.cpp store.cpp playerfaction.cpp relations.cpp peace.cpp towngen.cpp worldstate.cpp items.cpp policy.cpp ui.cpp doors.cpp speech.cpp stats.cpp crime.cpp build.cpp farm.cpp tags.cpp settings.cpp ownstore.cpp gamecalls.cpp effect.cpp bugreport.cpp titleart.cpp fontguard.cpp upnp.cpp team.cpp playerstab.cpp resurrect.cpp fallentab.cpp chat.cpp money.cpp u8file.cpp ^
-   net\enet_transport.cpp net\session.cpp net\homeaddr.cpp net\routerask.cpp net\steam_probe.cpp net\steam_transport.cpp net\relay_test.cpp net\relay_bridge.cpp net\steam_friends.cpp ^
-   ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\addrtable.cpp ..\common\sigtable.cpp ..\common\writerladder.cpp ..\common\cfgtext.cpp ..\common\steamprobe.cpp ^
+   /Foobj\plugin\ %PLUGIN_SRC%
+if errorlevel 1 (
+    echo BUILD FAILED ^(plugin compile^)
+    exit /b 1
+)
+set PLUGIN_OBJ=
+for %%F in (%PLUGIN_SRC%) do call :plugin_obj %%~nF
+echo [STEP] plugin link %time%
+link /nologo /DLL /LTCG /OUT:SharedWastelands.dll /MAP:SharedWastelands.map /MACHINE:X64 %PLUGIN_OBJ% ^
    callbacks.obj compress.obj host.obj list.obj packet.obj peer.obj protocol.obj win32.obj ^
    obj\minhook\buffer.obj obj\minhook\hook.obj obj\minhook\trampoline.obj obj\minhook\hde32.obj obj\minhook\hde64.obj ^
-   /FeSharedWastelands.dll ^
-   /link /LTCG /MAP:SharedWastelands.map /MACHINE:X64 OgreMain_x64.lib MyGUIEngine_x64.lib ws2_32.lib winmm.lib user32.lib ole32.lib oleaut32.lib
+   OgreMain_x64.lib MyGUIEngine_x64.lib ws2_32.lib winmm.lib user32.lib ole32.lib oleaut32.lib
 if errorlevel 1 (
-    echo BUILD FAILED
+    echo BUILD FAILED ^(plugin link^)
     exit /b 1
 )
 
+echo [STEP] import gates %time%
 rem --- Step 3: THE MyGUI IMPORT NAME GATE, AFTER THE LINK (P8i / design-ui-panel V1h) ---------
 rem F654 checked, by hand and once, that all 18 MyGUI symbols the one button imported exist by name
 rem in the MyGUIEngine_x64.dll the game ships. The panel imports Window, EditBox, TextBox,
@@ -206,9 +234,16 @@ if errorlevel 1 (
 rem --- Step 5: SharedWastelandsLoader.dll (mig6, RE_Kenshi migration stage 6) - its own build.bat, the same VS2010 toolset -----
 rem The Ogre plugin the game's Plugins_x64.cfg names (owner 117). Its own gate runs inside: KERNEL32.dll the only import,
 rem dllStartPlugin and dllStopPlugin exported. A failure there fails this build.
+echo [STEP] loader %time%
 call "%~dp0..\kenshi-loader\build.bat"
 if errorlevel 1 (
     echo BUILD FAILED ^(SharedWastelandsLoader.dll^)
     exit /b 1
 )
 endlocal
+goto :eof
+
+rem PLUGIN_OBJ += obj\plugin\<name>.obj, one source at a time, in PLUGIN_SRC's order (the link order).
+:plugin_obj
+set PLUGIN_OBJ=%PLUGIN_OBJ% obj\plugin\%1.obj
+goto :eof

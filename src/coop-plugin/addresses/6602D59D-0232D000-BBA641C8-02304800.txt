@@ -11,7 +11,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 6602D59D-0232D000-BBA641C8-02304800
 !version Steam_1.0.68
-!count 561
+!count 625
 AbstractMovementBase_pathGoal            code 0065E7D0 0065E7D0 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE040 002AE040 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 00332110 00332110 83FA047403895120F3C3CCCCCCCCCCCC
@@ -343,6 +343,21 @@ PlacementCommit                                code 004D72A0 004D72A0 488BC45541
 PlatoonSid                                     code 00384C30 00384C30 40534883EC2033C048C742180F000000
 Platoon_findNewHome                            code 0099E6E0 0099E6E0 488BC44154415541574883EC5048C744
 PlayActionByName                               code 005203B0 005203B0 4053574881EC9800000048C7442430FE
+AnimLayerPlay                                  code 005B7AC0 005B7AC0 48896C2420564883EC704883B9A80000
+AnimCtlIdle                                    code 0051D3B0 0051D3B0 48895C2408574883EC40F30F10818001
+AnimCtlLocoBlend                               code 0051D8E0 0051D8E0 488BC457415441554881EC9000000048
+AnimCtlHeadTurn                                code 005B8430 005B8430 488BC455565741544155488D68A14881
+AnimCtlOther                                   code 005F16A0 005F16A0 48895C24104889742418574883EC7048
+AnimCtlMainSlotFill                            code 0051EAB0 0051EAB0 4885D20F84BA01000048895C24185748
+AnimTaskRestrain                               code 0034AF20 0034AF20 405556574154415541564157488D6C24
+AnimTaskLoot                                   code 0034D930 0034D930 4C8BDC55565741544155415641574883
+AnimTaskChopStatic                             code 003534B0 003534B0 488BC45557415441554156488D68A148
+AnimTaskUnshackle                              code 00359F80 00359F80 488BC45556574154415541564157488D
+AnimTaskOther1                                 code 00353C50 00353C50 488BC455565741544155488D68A14881
+AnimTaskOther2                                 code 00349290 00349290 405556574881EC9000000048C7442430
+AnimTaskCombatStance                           code 003474F0 003474F0 488BC4565741544881ECB000000048C7
+AnimTaskProspect                               code 00348610 00348610 4C8BDC5556574881EC9000000048C744
+AnimTaskTrainingDummy                          code 0035C1E0 0035C1E0 488BC4555657415441554881ECA00000
 PlayerInterfaceGlobal                          var  02134690 02134690 -
 PlayerInterfaceRecruit                         code 00692820 00692820 4C8BDC5741544155415641574883EC40
 ProcessKeys                                    code 00788100 00788100 488BC4554154415541564157488D6888
@@ -483,6 +498,9 @@ ZoneDeactivationCountdown                      code 00A09380 00A09380 F30F1081C4
 ZoneGetAllActiveZones                          code 00A0A710 00A0A710 48895C2418574883EC204883B9288116
 ZoneIsActivationType                           code 00A08A40 00A08A40 4863C2F30F108481C00000000F2F05E5
 ZoneManager_refillTownCheck             code 009FF5A0 009FF5A0 488BC45556574154415541564157488D
+Town_setVersion                         code 009FE7A0 009FE7A0 40555657488BEC4883EC6048C745C0FE
+WorldStateQuery_holds                   code 009A7E00 009A7E00 4057415441554883EC3048C7442420FE
+WorldStateQueryList_fill                code 009AA5D0 009AA5D0 40535741564883EC30498BF8488BDA4C
 ZoneManagerPtr                                 var  021349C0 021349C0 -
 ZoneSaveLevelData                              code 0036DDE0 0036DDE0 405556574154415541564157488D6C24
 Inventory_onOwnerDeath                           code 0075E7E0 0075E7E0 488BC4574881ECA002000048C7442420
@@ -573,3 +591,49 @@ ActivePlatoon_specialToNewSquads               code 0079C1C0 0079C1C0 488BC45541
 DoorHitByMelee                                 code 0029D690 0029D690 488BC4574881EC9000000048C7442448
 LockPickTick                                   code 00297E50 00297E50 40534883EC30F30F5851180F29742420
 Ownerships_takeMoney                           code 007CBAA0 007CBAA0 8B81880000003BC27D0785D2780332C0
+AttackState_initialiseAttack                   code 002B4570 002B4570 4056574881ECB80000000F29B424A000
+CombatTechnique_pickAttack                     code 00888030 00888030 488BC455574154488D68A94881EC0001
+CombatTechnique_pickBlock                      code 00887970 00887970 488BC4554154415541564157488D68A9
+CombatClass_blockCheck                         code 00665FA0 00665FA0 40555641544883EC40498BF1448BE248
+AnimationClass_pickStumble                     code 0051F420 0051F420 488BC45556574154415541564157488D
+AnimationClass_playStumble                     code 00520490 00520490 4885D2746248895C2408574883EC3048
+AnimClassBase_playMoveByName                   code 005B7800 005B7800 4053555741544881ECC800000048C744
+AttackMoveListGlobal                           var  02011F78 02011F78 -
+BlockMoveListGlobal                            var  02011F90 02011F90 -
+OrdersReceiver_removeTasksOfType               code 00507390 00507390 48895C240848897C24108BFA4C8D81A8
+OrdersReceiver_hasTaskOfType                   code 00507440 00507440 48895C24088BDA4C8D99B000000033D2
+OrdersReceiver_addTask                         code 00507950 00507950 4885D20F8417010000415441574883EC
+TaskFactory_create                             code 0032EBD0 0032EBD0 4055565741544155488D6C24E94881EC
+Character_setSavedMode                         code 005CAA50 005CAA50 48895C24084889742410574881ECB000
+CombatClass_blockWindow                        code 00608460 00608460 48895C240848896C2410488974241857
+BlockStartWindowRet                            ret  006093D6 006093D1 E8C606A1FF
+CombatClassAI_decide                           code 0060C8B0 0060C8B0 40534883EC20488BD9488B8980010000
+InventoryGUI_stealFlag                         code 00711740 00711740 4C8BDC5556574883EC7048C7442430FE
+ItemHoverOwnerTest                             code 007FC5A0 007FC5A0 4883B85002000000751280B8D0010000
+TradeWindowTargetOwnerTest                     code 00791978 00791978 4883B85002000000400F95C5EB034032
+PlacementHostOwnerTest                         code 004D6CB2 004D6CB2 4C39A0500200000F859500000048C745
+ResearchBenchWorkOwnerTest                     code 0029B913 0029B913 4883B850020000000F84180100000F28
+ResearchBenchProgressOwnerTest                 code 0029B94B 0029B94B 4883B850020000000F84E000000033FF
+ResearchOperate                                code 0029B8D0 0029B8D0 48895C2408574881ECA000000080B960
+NpcSensePlayerTest1                            code 00859887 00859887 4883B850020000000F84B1070000488B
+NpcSensePlayerTest2                            code 00859EB6 00859EB6 4883B850020000007446488B06488BBD
+NpcSensePlayerTest3                            code 00859FBC 00859FBC 4883B85002000000747B83BE48010000
+NpcSensePlayerTest4                            code 00857CEB 00857CEB 4883B850020000000F84CC000000488B
+NpcSensePlayerTest5                            code 00857FD8 00857FD8 4883B850020000000F8599000000488B
+NpcSensePlayerTest6                            code 0085801D 0085801D 4883B85002000000755C488B8D480100
+NpcSensePlayerTest7                            code 0085829C 0085829C 4883B85002000000740E488D4D28488B
+NpcSensePlayerTest8                            code 00859175 00859175 4883B850020000007450488B06488BCE
+NpcMemPlayerTest1                              code 006718A6 006718A6 4839B050020000743D8B0533ECAB0189
+NpcMemPlayerTest2                              code 00671A96 00671A96 4883B85002000000488D052B38010148
+NpcMemPlayerTest3                              code 0067438F 0067438F 48399850020000751B488D1501C2AB01
+NpcMemPlayerTest4                              code 0067444C 0067444C 4883B8500200000074354183FC037504
+NpcMemPlayerTest5                              code 00674569 00674569 4883B850020000007515488BD3488BCE
+NpcMemPlayerTest6                              code 00674E2C 00674E2C 4883B85002000000488BCF740F488B5C
+NpcMemPlayerTest7                              code 006757F2 006757F2 4C39B8500200007407E819889BFFEB05
+NpcMemPlayerTest8                              code 0067874B 0067874B 4883B850020000007412B001488B5C24
+NpcMemPlayerTest9                              code 00678776 00678776 4883B850020000007407E894589BFFEB
+NpcMemPlayerTest10                             code 006787EC 006787EC 4883B85002000000488BCF7407E81B58
+NpcMemPlayerTest11                             code 00678857 00678857 4883B8500200000074140FB64328488B
+NpcMemPlayerTest12                             code 00678884 00678884 4883B850020000007407E886579BFFEB
+NpcMemPlayerTest13                             code 006788F7 006788F7 4883B850020000007404C6472800488B
+NpcMemPlayerTest14                             code 00678914 00678914 4883B850020000007407E8F6569BFFEB

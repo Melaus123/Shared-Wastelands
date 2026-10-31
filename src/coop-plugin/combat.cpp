@@ -41,6 +41,14 @@
 #include "crime.h"   // crime3: CrimeApplyDrain writes the owner's crimes onto copies at this same safe point
 #include "../common/shotwire.h"   /* P104 fix: MSG_SHOT - the bolt's record and the Damages iShotYou builds */
 #include "../common/meleewire.h"   /* MSG_MELEE_DECIDED - the blow's record, and which game decides a blow */
+#include "../common/swinggate.h"   /* the swing credit: a copy of another player's character swings only after its owner did */
+#include "../common/shotgate.h"   /* a copy fires on its owner's word only; which game decides a bolt's hit */
+#include "../common/handwire.h"   /* MSG_HAND: the owner's hand item, and the copy's draw / put-away decision */
+#include "../common/fightlog.h"   /* the [FIGHT] lines: the moves, blocks and stumbles each game's engine chose */
+#include "../common/hitwire.h"   /* fight parity: the decided blow on HIT, the attack move on SWING */
+#include "../common/blockpick.h"   /* T-1101 step 5: MSG_BLOCK_PICK and the arrived block picks */
+#include "../common/fightchoice.h"   /* T-1101 design (c): the owner's fight choices and its copies' decide step */
+#include "../common/statewire.h"   /* fight parity: the stance buttons in STATE latchBits */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
 #include "../common/windowbound.h"   /* T-986 fold 1: which close leaves combat mode (winbound::CloseKind) */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
@@ -48,6 +56,7 @@ namespace coop { void TraderSpawnDrain(); }   /* traderspawn: items.cpp - the `t
 namespace coop { void SquadLeaderSafePointDrain(); }   /* T-1 B1: handoff.cpp - the copy squad's leader set to the owner's at this safe point */
 namespace coop { void SquadCatsSafePointDrain(); }   /* T-1 B3 restructure: handoff.cpp - the squads' money (MSG_SQUAD_LEAD) into the pots */
 namespace coop { void LimbSafePointDrain(); }   /* LIMBS: clothing.cpp - the owner's limbs onto its copies, and the limbtest lever */
+namespace coop { int AiWorkerBusyNow(); }   /* T-1101 step 3: coop.cpp - the engine's own AI-worker busy test: 1 running, 0 idle, -1 cannot be told. MAIN THREAD */
 namespace coop { void BoxTakeDrain(); }      /* loot2c: items.cpp - the `boxtake` lever's move runs at this same safe point */
 
 #include "coop_log.h"
@@ -236,6 +245,17 @@ struct PendingHit
     // inside the original call). Known only AFTER the original ran, which is why the entry is published
     // after it.
     unsigned char knock;
+    // The decided blow for the HIT (hitwire.h, BlowNoteBefore / BlowNoteAfter): the hit's answer (-1 not noted) and, as
+    // [FIGHT] names ('-' none, '?' unreadable), the attacker's attack move, the victim's block move and the stumble it played.
+    int          blowResult;
+    char         blowMove[fightlog::kNameBuf];
+    char         blowBlock[fightlog::kNameBuf];
+    char         blowStumble[fightlog::kNameBuf];
+#ifdef SW_DEV_BUILD
+    // PROBE-START: P181 - what the engine's hit returned (2 landed, 5 blocked), for the hit line
+    int p181Result;
+    // PROBE-END: P181
+#endif
 };
 
 const unsigned int kHitQueueSize = 64;          // power of two
@@ -258,6 +278,7 @@ struct PendingMelee
     int           comboId;
     float         damages[6];
     unsigned char techFlag;
+    char          stumble[fightlog::kNameBuf];   /* the stumble this engine picked for the blow (FpDecideStumble) */
 };
 const unsigned int kMeleeQueueSize = 64;          // power of two
 const unsigned int kMeleeQueueMask = kMeleeQueueSize - 1;
@@ -443,6 +464,266 @@ std::string F6(float v)
     return ss.str();
 }
 
+// ===========================================================================================
+// THE [FIGHT] LINES - which attack move, block move and stumble each game's engine chose for a blow between player characters.
+//
+// Each game picks these by its own dice, so the same blow can look different on the two screens; one line per swing start
+// (detour_sgAttackStart) and per melee hit (detour_hitByMelee where the victim's game decides it, ApplyRemoteHit where the
+// other game plays the received HIT) lets a readout set the two games' names side by side. Reads only - nothing is changed.
+//
+// Engine fields (1.0.65 decompiles):
+//   Character +0x648 -> +8           its CombatClass (Character_getCombat 0x5C8820: MOV RAX,[RCX+0x648]; MOV RAX,[RAX+8])
+//   CombatClass +0x150               the move it plays now: an attack move (stored by initialiseAttack, decomp_2b4530) or a
+//                                    block move (stored by the block start 0x608800, decomp_608800); the move's +0x2C is set
+//                                    for a block move (the block check 0x665510 tests it, decomp_665510:28-31)
+//   move +0x00                       its name, a std::string (moves are compared by it, decomp_608800; animation names are
+//                                    built from it, decomp_5b6d70)
+//   Character +0x448                 its AnimationClass (Character_flinch reads param_1[0x89], decomp_438e50:72-87)
+//   stumble                          an AnimationData whose name is the std::string at +0x8: the one the stumble picker
+//                                    0x51E990 answered in that hit (FpDecide; AnimationClass +0x228 keeps the LAST one played
+//                                    and is never cleared, so it cannot tell a repeat from none)
+// std::string is the VS2010 layout: 16-byte buffer, size +0x10, capacity +0x18 (a pointer at +0 when capacity >= 16).
+//
+// THREAD: the swing and the decided hit run on the engine's AI worker, the replayed hit on the main thread. Every read is POD
+// under __try; the event goes into one fightlog::Ring behind a short spin lock no engine call is made under; the main thread
+// (CombatModeTick) takes the events and writes the lines. No allocation and no log on the capture side.
+// ===========================================================================================
+static fightlog::Ring g_fight;                 /* zero before any constructor runs; read and written only under g_fightLock */
+static volatile LONG  g_fightLock = 0;
+
+static void FightLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_fightLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+static void FightUnlock() { InterlockedExchange(&g_fightLock, 0); }
+
+// A pointer field of an engine object; 0 when the object is 0 or the read faults. POD, __try (C2712).
+static void* FightPtrAt(const void* p, size_t off)
+{
+    if (p == 0) return 0;
+    __try { return *(void* const*)((const char*)p + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// The name in the engine std::string at obj+off into out (fightlog::kNameBuf bytes): '-' when obj is 0, '?' when the string
+// is unreadable, empty, longer than fightlog::kNameMax or not printable. POD, __try (C2712).
+static void FightNameAt(const void* obj, size_t off, char* out)
+{
+    if (obj == 0) { fightlog::NoName(out); return; }
+    char raw[fightlog::kNameBuf];
+    size_t n = 0;
+    int ok = 0;
+    __try
+    {
+        const char* s = (const char*)obj + off;
+        const size_t len = *(const size_t*)(s + 0x10), res = *(const size_t*)(s + 0x18);
+        if (len >= 1 && len <= (size_t)fightlog::kNameMax && res >= len)
+        {
+            const char* p = (res >= 16) ? *(const char* const*)s : s;
+            for (size_t i = 0; i < len; ++i) raw[i] = p[i];
+            n = len;
+            ok = 1;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    fightlog::CleanName(ok ? raw : 0, ok ? n : 0, out);
+}
+
+// The CombatClass's current move when it is of the wanted kind (wantBlock 1: a block move, 0: an attack move); 0 for none,
+// the other kind, or a fault. POD, __try (C2712).
+static const void* FightMoveOf(const void* cc, int wantBlock)
+{
+    const void* m = FightPtrAt(cc, 0x150);
+    if (m == 0) return 0;
+    __try
+    {
+        const int isBlock = (*((const unsigned char*)m + 0x2C) != 0) ? 1 : 0;
+        return (isBlock == wantBlock) ? m : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static const void* FightCombatOf(const void* c) { return FightPtrAt(FightPtrAt(c, 0x648), 8); }
+
+static void FightPush(const fightlog::Event& ev)
+{
+    FightLock();
+    fightlog::Push(&g_fight, ev);
+    FightUnlock();
+}
+
+// Any thread, right after a swing really started (the attack start answered yes): the move it stored at CombatClass +0x150.
+static void FightNoteSwing(const void* combat, unsigned int uid, int own, unsigned int targetUid)
+{
+    if (g_fight.accepted >= fightlog::kCap) return;   /* a stale read only costs one refused Push */
+    fightlog::Event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.kind = fightlog::kSwing;
+    ev.a = uid;
+    ev.b = targetUid;
+    ev.own = own;
+    FightNameAt(FightMoveOf(combat, 0), 0x0, ev.move);
+    fightlog::NoName(ev.block);
+    fightlog::NoName(ev.stumble);
+    FightPush(ev);
+}
+
+// THE STUMBLE A HIT PICKED (fight parity): AnimationClass +0x228 keeps the LAST stumble played and is not cleared, so a change
+// of it cannot tell 'played the same stumble again' from 'played none'. Around each engine hit whose stumble is reported (the
+// deciding hit in detour_hitByMelee, the replayed hit in ApplyRemoteHit) this thread's TLS slot names the victim's AnimationClass;
+// the AnimationClass_pickStumble detour records what it answered for that AnimationClass (FpDecideNote). Not asked or answered 0 =
+// no stumble. Unknown ('?') when the stumble detour or the TLS slot is missing - the replaying engine then picks its own.
+static DWORD g_fpDecTls = TLS_OUT_OF_INDEXES;   /* TlsAlloc (InstallFightParity), not __declspec(thread): this DLL loads late */
+static int   g_fpHookStumble = 0;               /* the AnimationClass_pickStumble detour: 1 hooked, 0 failed / not yet, -1 no row */
+struct FpDecide
+{
+    const void* anim;     /* the victim's AnimationClass (Character +0x448) */
+    const void* pick;     /* what the stumble picker answered for it in this hit (0 none) */
+    int         asked;    /* the picker was asked for it */
+    int         armed;    /* the TLS slot named this record */
+    void*       prev;     /* the slot's value before (a hit inside a hit) */
+};
+// Any thread, right before the engine's hit on victim.
+static void FpDecideArm(FpDecide* d, const void* victim)
+{
+    d->anim = FightPtrAt(victim, 0x448);
+    d->pick = 0;
+    d->asked = 0;
+    d->armed = 0;
+    d->prev = 0;
+    if (g_fpDecTls == TLS_OUT_OF_INDEXES || d->anim == 0) return;
+    d->prev = ::TlsGetValue(g_fpDecTls);
+    d->armed = ::TlsSetValue(g_fpDecTls, d) != 0 ? 1 : 0;
+}
+// The same thread, right after it.
+static void FpDecideDisarm(FpDecide* d)
+{
+    if (d->armed) ::TlsSetValue(g_fpDecTls, d->prev);
+}
+// The stumble picker's detour, any thread: its answer for anim, recorded when this thread's armed hit is on anim.
+static void FpDecideNote(const void* anim, const void* pick)
+{
+    if (g_fpDecTls == TLS_OUT_OF_INDEXES) return;
+    FpDecide* d = (FpDecide*)::TlsGetValue(g_fpDecTls);
+    if (d == 0 || d->anim != anim) return;
+    d->asked = 1;
+    d->pick = pick;
+}
+// The recorded stumble as a [FIGHT] name (fightlog::kNameBuf): '-' none, '?' not known, else its name (AnimationData +0x8).
+static void FpDecideStumble(const FpDecide* d, char* out)
+{
+    if (d == 0 || !d->armed || g_fpHookStumble != 1) { out[0] = '?'; out[1] = 0; return; }
+    if (!d->asked || d->pick == 0) { fightlog::NoName(out); return; }
+    FightNameAt(d->pick, 0x8, out);
+}
+
+// A hit about to run through the engine: the attacker's attack move and the victim's block move before the call.
+// FightHitAfter completes it with the result and the stumble the engine picked in the call (FpDecide; '-' none).
+struct FightHitNote
+{
+    int         on;
+    fightlog::Event ev;
+};
+static void FightHitBefore(FightHitNote* h, const void* victim, unsigned int victimUid, const void* attacker,
+                           unsigned int attackerUid, int side)
+{
+    h->on = 0;
+    if (g_fight.accepted >= fightlog::kCap) return;
+    std::memset(&h->ev, 0, sizeof(h->ev));
+    h->ev.kind = fightlog::kHit;
+    h->ev.a = victimUid;
+    h->ev.b = attackerUid;
+    h->ev.side = side;
+    FightNameAt(FightMoveOf(FightCombatOf(attacker), 0), 0x0, h->ev.move);
+    FightNameAt(FightMoveOf(FightCombatOf(victim), 1), 0x0, h->ev.block);
+    h->on = 1;
+}
+static void FightHitAfter(FightHitNote* h, const FpDecide* d, int result)
+{
+    if (!h->on) return;
+    h->ev.result = result;
+    FpDecideStumble(d, h->ev.stumble);
+    FightPush(h->ev);
+}
+
+// The decided blow of a hit on a character this game runs, for its HIT (hitwire.h; FIGHT PARITY above ApplyRemoteHit): the
+// attacker's attack move and the victim's block move before the original call; its answer and the stumble the engine picked
+// in it (FpDecide) after it. Any thread (the AI worker): the same POD reads under __try as the [FIGHT] hit line.
+static void BlowNoteBefore(PendingHit* s, const void* victim, const void* attacker)
+{
+    s->blowResult = -1;
+    FightNameAt(FightMoveOf(FightCombatOf(attacker), 0), 0x0, s->blowMove);
+    FightNameAt(FightMoveOf(FightCombatOf(victim), 1), 0x0, s->blowBlock);
+    fightlog::NoName(s->blowStumble);
+}
+static void BlowNoteAfter(PendingHit* s, const FpDecide* d, int result)
+{
+    s->blowResult = result;
+    FpDecideStumble(d, s->blowStumble);
+}
+// MAIN THREAD (the HIT drain): the noted blow as the wire's; false when the hit's answer is none of 0 / 2 / 5 (not carried). An
+// unreadable stumble travels as not known (the replaying engine picks its own); an unreadable move or block as none.
+static bool BlowWire(const PendingHit& h, hitwire::Blow* w)
+{
+    hitwire::ClearBlow(w);
+    if (!hitwire::ResultOk(h.blowResult)) return false;
+    w->result = h.blowResult;
+    hitwire::WireNameOf(h.blowMove, w->move);
+    hitwire::WireNameOf(h.blowBlock, w->block);
+    w->stumbleKnown = hitwire::WireNameOf(h.blowStumble, w->stumble) ? 1 : 0;
+    return true;
+}
+
+// A [FIGHT] blockpick line's how= word (fightlog.h kHow*).
+static const char* FpBlockHowName(int how)
+{
+    switch (how)
+    {
+    case fightlog::kHowEngine: return "engine";
+    case fightlog::kHowSame: return "same";
+    case fightlog::kHowForced: return "forced";
+    case fightlog::kHowNotInList: return "notInList";
+    case fightlog::kHowNoEntry: return "noEntry";
+    case fightlog::kHowStale: return "stale";
+    case fightlog::kHowForcedNone: return "forcedNone";
+    default: return "?";
+    }
+}
+
+// MAIN THREAD (CombatModeTick): the waiting events as [FIGHT] lines; the last line the cap allows says so.
+static void FightLogDrain()
+{
+    if (g_fight.w == g_fight.r && g_fight.lost == 0) return;   /* a stale read only delays the lines one tick */
+    fightlog::Event ev[16];
+    long long lost = 0;
+    FightLock();
+    const int n = fightlog::Take(&g_fight, ev, 16, &lost);
+    FightUnlock();
+    for (int i = 0; i < n; ++i)
+    {
+        const fightlog::Event& e = ev[i];
+        std::string line;
+        if (e.kind == fightlog::kSwing)
+            line = "[FIGHT] swing uid=" + N3((long long)e.a) + (e.own ? " own" : " copy") + " move='" + e.move + "' target="
+                 + N3((long long)e.b);
+        else if (e.kind == fightlog::kBlockPick)
+            line = "[FIGHT] blockpick defender=" + N3((long long)e.a) + (e.own ? " own" : " copy") + " attacker=" + N3((long long)e.b)
+                 + " block='" + e.block + "' how=" + FpBlockHowName(e.how);
+        else
+            line = "[FIGHT] hit victim=" + N3((long long)e.a) + " attacker=" + N3((long long)e.b) + " move='" + e.move
+                 + "' result=" + N3((long long)e.result) + " block='" + e.block + "' stumble='" + e.stumble + "' side="
+                 + (e.side == fightlog::kSideReplay ? "replay" : "decide");
+        if (i == 0 && lost != 0) line += " (" + N3(lost) + " FIGHT events lost before this line: too many waiting)";
+        if (fightlog::LineIsLast(&g_fight)) line += " (cap: the last FIGHT line)";
+        DebugLog(line);
+    }
+}
+
 // Reverse lookup: is this character one we hold a uid for? Only replicated characters are
 // interesting; the world's own NPCs fighting each other are not our business.
 unsigned int UidOf(Character* c)
@@ -512,9 +793,26 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
                     CaptureObjId(attacker, &slot.attackerId);
                 slot.knock = 0;
             }
+            /* [FIGHT]: a blow between player characters, decided here (the victim is ours) */
+            FightHitNote fight;
+            fight.on = 0;
+            if (slot.attackerUid != 0 && g_fight.accepted < fightlog::kCap
+                && IsUidPlayerCharAnyThread(uid) == 1 && IsUidPlayerCharAnyThread(slot.attackerUid) == 1)
+                FightHitBefore(&fight, self, uid, attacker, slot.attackerUid, fightlog::kSideDecide);
+            BlowNoteBefore(&slot, self, attacker);   /* the decided blow, for the HIT */
+            FpDecide dec;   /* the stumble the engine picks in this hit */
+            FpDecideArm(&dec, self);
             const int arm = KnockArmClaim(self);   // K2: applyDamage marks it on this thread
             const int result = orig_hitByMelee(self, cutDir, damages, attacker, technique, comboId);
+            FpDecideDisarm(&dec);
             slot.knock = KnockArmRelease(arm);
+            BlowNoteAfter(&slot, &dec, result);
+            FightHitAfter(&fight, &dec, result);
+#ifdef SW_DEV_BUILD
+            // PROBE-START: P181 - the hit's result, carried to the main thread's line
+            slot.p181Result = result;
+            // PROBE-END: P181
+#endif
 
             LONG w = g_hitWrite;
             if (((w + 1) & kHitQueueMask) == (g_hitRead & kHitQueueMask))
@@ -554,7 +852,11 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
                 md.comboId     = comboId;
                 std::memcpy(md.damages, damages, kDamagesBytes);   // before the hit runs, as the OURS path copies it
                 md.techFlag    = MeleeTechFlagPod(technique);
+                FpDecide dec;   /* the stumble the engine picks in this hit, for the NPC's game's HIT */
+                FpDecideArm(&dec, self);
                 const int result = orig_hitByMelee(self, cutDir, damages, attacker, technique, comboId);
+                FpDecideDisarm(&dec);
+                FpDecideStumble(&dec, md.stumble);
                 if (result == meleewire::kMeleeHitLanded) MeleePush(md);
                 else if (result == meleewire::kMeleeHitBlocked) InterlockedIncrement64(&g_meleeBlocked);
                 else InterlockedIncrement64(&g_meleeNoHit);
@@ -612,10 +914,146 @@ void NoteKnockEdgeAnyThread(const void* character)
             InterlockedExchange(&g_knockArm[i].knocked, 1);
 }
 
+// ===========================================================================================
+// FIGHT PARITY - every game shows the blow its victim's owner decided.
+//
+// The victim's owner decides each melee blow through its own engine (detour_hitByMelee) and sends it on HIT with what that
+// engine chose (hitwire.h): the answer (5 blocked / 0 dodged / 2 landed) and the stumble it played. Every other game plays the
+// received blow through its own engine on the victim's copy (ApplyRemoteHit), and that engine would roll the block and pick the
+// stumble again. While ApplyRemoteHit runs one received blow, two detours give the engine the carried choice instead - for that
+// call only: FpArm / FpDisarm around the original hit, on the main thread, name the thread and the victim copy's CombatClass and
+// AnimationClass; every other call (another thread, another character, no carried blow) gets the engine's own answer untouched.
+//   CombatClass_blockCheck (1.0.65 0x665510 / 1.0.68 0x665FA0): the original runs (its side effects stay the engine's) and, for
+//     the victim copy's CombatClass, the carried answer is returned. Its only caller is the melee hit 0x439150, whose paths for
+//     5 (blocked), 0 (dodged) and any other answer (landed, the hit returns 2) are the engine's own (decomp_439150:60-114).
+//   AnimationClass_pickStumble (0x51E990 / 0x51F420): for the victim copy's AnimationClass, the carried stumble found BY NAME
+//     among what the engine itself picks from. The picker builds its candidates (this skeleton, this direction, light or heavy)
+//     and rolls one; it stores nothing (decomp_51e990), so it is asked again until it answers the carried name (at most
+//     kFpStumbleTries rolls). The carried 'no stumble', or a name its candidates do not answer, returns 0 - no stumble rather than
+//     a different one (the engine's own answer when no candidate fits). A stumble the deciding game could not read leaves the
+//     engine's pick.
+// The victim copy's BLOCK POSE is not forced: its engine starts the block when the attacker's swing begins on this game, before
+// the owner's game has decided the blow (the HIT arrives about a second later), and putting a block move on the copy then would
+// mean playing it through 0x5B6D70, which uses the move's animation without a null check (decomp_5b6d70:78). The carried block
+// move is compared with the copy's own (blockSame / blockDiffer).
+// THREAD: the arm is written only by the main thread, and every detour first compares its own thread id with it.
+// ===========================================================================================
+static unsigned long long kFpBlockCheck = 0; static coop::AddrReg kFpBlockCheck_reg("CombatClass_blockCheck", &kFpBlockCheck);   /* Steam_1.0.65 0x665510, 1.0.68 0x665FA0 */
+static unsigned long long kFpPickStumble = 0; static coop::AddrReg kFpPickStumble_reg("AnimationClass_pickStumble", &kFpPickStumble);   /* Steam_1.0.65 0x51E990, 1.0.68 0x51F420 */
+static unsigned long long kFpPickAttack = 0; static coop::AddrReg kFpPickAttack_reg("CombatTechnique_pickAttack", &kFpPickAttack);   /* Steam_1.0.65 0x887160, 1.0.68 0x888030 */
+
+typedef char FpNameBufAgrees[(fightlog::kNameBuf == hitwire::kNameBuf && swinggate::kMoveBuf == hitwire::kNameBuf) ? 1 : -1];
+
+const int kFpStumbleTries = 32;   /* rolls of the stumble picker for the carried name */
+const int kFpMoveTries    = 32;   /* rolls of the attack-move picker for the carried name */
+
+static int g_fpHookBlock = 0, g_fpHookMove = 0;   /* 1 hooked, 0 AddHook failed / not installed, -1 no address row (g_fpHookStumble: FpDecide) */
+static volatile LONG64 g_fpResultForced = 0, g_fpResultSame = 0, g_fpResultNotAsked = 0;
+static volatile LONG64 g_fpStumbleForced = 0, g_fpStumbleNone = 0, g_fpStumbleNotFound = 0, g_fpStumbleNotAsked = 0, g_fpStumbleUnknown = 0;
+static volatile LONG64 g_fpBlockSame = 0, g_fpBlockDiffer = 0;
+static volatile LONG64 g_fpMoveForced = 0, g_fpMoveSame = 0, g_fpMoveFallback = 0, g_fpMoveNoMove = 0, g_fpMoveNotCarried = 0, g_fpSwingNoMove = 0;
+static volatile LONG64 g_fpStanceApplied = 0, g_fpStanceNotTaken = 0, g_fpStanceDrops = 0, g_fpStanceUnread = 0;
+static volatile LONG64 g_fpStanceHoldAdded = 0, g_fpStanceHoldRemoved = 0, g_fpStanceHoldBusy = 0, g_fpStanceReverted = 0;   /* T-1101 step 3 */
+static volatile LONG64 g_fpBlowSent = 0, g_fpBlowUnsent = 0, g_fpBlowAbsent = 0;
+
+// The engine name at obj+off equals want (a wire name; "" never matches). POD reads under __try (FightNameAt).
+static bool FpNameIs(const void* obj, size_t off, const char* want)
+{
+    if (obj == 0 || want == 0 || want[0] == 0) return false;
+    char got[fightlog::kNameBuf];
+    FightNameAt(obj, off, got);
+    return std::strcmp(got, want) == 0;
+}
+
+struct FpArmed
+{
+    volatile LONG tid;            /* the thread playing the received blow (the main thread); 0 = nothing armed */
+    const void*   combat;         /* the victim copy's CombatClass */
+    const void*   anim;           /* the victim copy's AnimationClass (Character +0x448) */
+    int           result;         /* the carried answer, 0 / 2 / 5 */
+    int           stumbleKnown;
+    char          stumble[hitwire::kNameBuf];
+    int           resultAsked;    /* the engine asked the block check during this blow */
+    int           stumbleAsked;   /* the engine asked for a stumble during this blow */
+};
+static FpArmed g_fpArm;           /* zero before any constructor runs */
+
+typedef unsigned long long (*FpBlockCheckFn)(void* combat, int cutDir, void* damages, void* attacker);
+static FpBlockCheckFn orig_fpBlockCheck = 0;
+typedef void* (*FpPickStumbleFn)(void* anim, void* key, int dir, char heavy);
+static FpPickStumbleFn orig_fpPickStumble = 0;
+
+// DETOUR, any thread (every melee hit's block check). The engine's answer unless this is the armed blow's victim copy.
+static unsigned long long detour_fpBlockCheck(void* combat, int cutDir, void* damages, void* attacker)
+{
+    const unsigned long long r = orig_fpBlockCheck(combat, cutDir, damages, attacker);
+    if (g_fpArm.tid == 0 || g_fpArm.tid != (LONG)::GetCurrentThreadId() || combat != g_fpArm.combat) return r;
+    g_fpArm.resultAsked = 1;
+    if ((int)(unsigned int)r == g_fpArm.result) { InterlockedIncrement64(&g_fpResultSame); return r; }
+    InterlockedIncrement64(&g_fpResultForced);
+    return (unsigned long long)(unsigned int)g_fpArm.result;
+}
+
+// Any thread (every stumble pick). The engine's pick unless this is the armed blow's victim copy (see above).
+static void* FpPickStumbleAnswer(void* anim, void* key, int dir, char heavy)
+{
+    void* const first = orig_fpPickStumble(anim, key, dir, heavy);
+    if (g_fpArm.tid == 0 || g_fpArm.tid != (LONG)::GetCurrentThreadId() || anim != g_fpArm.anim) return first;
+    g_fpArm.stumbleAsked = 1;
+    if (!g_fpArm.stumbleKnown) { InterlockedIncrement64(&g_fpStumbleUnknown); return first; }
+    if (g_fpArm.stumble[0] == 0) { InterlockedIncrement64(&g_fpStumbleNone); return 0; }
+    void* s = first;
+    for (int i = 0; s != 0; ++i)
+    {
+        if (FpNameIs(s, 0x8, g_fpArm.stumble)) { InterlockedIncrement64(&g_fpStumbleForced); return s; }
+        if (i >= kFpStumbleTries) break;
+        s = orig_fpPickStumble(anim, key, dir, heavy);
+    }
+    InterlockedIncrement64(&g_fpStumbleNotFound);
+    return 0;
+}
+
+// DETOUR, any thread: the answer above, recorded for this thread's armed hit on anim (FpDecideNote).
+static void* detour_fpPickStumble(void* anim, void* key, int dir, char heavy)
+{
+    void* const r = FpPickStumbleAnswer(anim, key, dir, heavy);
+    FpDecideNote(anim, r);
+    return r;
+}
+
+// MAIN THREAD (ApplyRemoteHit), just before the engine's hit on the victim's copy: the carried blow, for this call only.
+static void FpArm(const void* victim, const hitwire::Blow* blow)
+{
+    if (blow == 0) { InterlockedIncrement64(&g_fpBlowAbsent); return; }
+    const void* combat = FightCombatOf(victim);
+    char own[fightlog::kNameBuf], ownWire[hitwire::kNameBuf];
+    FightNameAt(FightMoveOf(combat, 1), 0x0, own);
+    if (hitwire::WireNameOf(own, ownWire))
+        InterlockedIncrement64(std::strcmp(ownWire, blow->block) == 0 ? &g_fpBlockSame : &g_fpBlockDiffer);
+    if (combat == 0) return;
+    g_fpArm.combat = combat;
+    g_fpArm.anim = FightPtrAt(victim, 0x448);
+    g_fpArm.result = blow->result;
+    g_fpArm.stumbleKnown = blow->stumbleKnown;
+    std::memcpy(g_fpArm.stumble, blow->stumble, hitwire::kNameBuf);
+    g_fpArm.resultAsked = 0;
+    g_fpArm.stumbleAsked = 0;
+    InterlockedExchange(&g_fpArm.tid, (LONG)::GetCurrentThreadId());
+}
+
+// MAIN THREAD, right after that hit: disarmed; a carried answer or stumble the engine never asked for is counted.
+static void FpDisarm()
+{
+    if (g_fpArm.tid == 0) return;
+    InterlockedExchange(&g_fpArm.tid, 0);
+    if (!g_fpArm.resultAsked) InterlockedIncrement64(&g_fpResultNotAsked);
+    if (g_fpArm.stumbleKnown && g_fpArm.stumble[0] != 0 && !g_fpArm.stumbleAsked) InterlockedIncrement64(&g_fpStumbleNotAsked);
+}
+
 void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
                     const char* damages24, int comboId,
                     const float* parts, int partCount, float blood,
-                    const ObjId& attackerId, bool knock, bool attackerPlayed)
+                    const ObjId& attackerId, bool knock, bool attackerPlayed, const hitwire::Blow* blow)
 {
     Character* victim = FindSpawned(victimUid);
     if (victim == 0)
@@ -771,9 +1209,21 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
         // is ours. Changes nothing; competing explanations stay live until this speaks.
         int proneBefore = (int)victim->poseState();
 
+        /* [FIGHT]: the received blow between player characters, played through this game's engine */
+        FightHitNote fight;
+        fight.on = 0;
+        if (attackerUid != 0 && g_fight.accepted < fightlog::kCap
+            && IsUidPlayerCharAnyThread(victimUid) == 1 && IsUidPlayerCharAnyThread(attackerUid) == 1)
+            FightHitBefore(&fight, victim, victimUid, attacker, attackerUid, fightlog::kSideReplay);
         InterlockedExchange(&g_applyingRemote, 1);
-        orig_hitByMelee(victim, cutDirection, dmg, attacker, 0, comboId);
+        FpArm(victim, blow);   /* fight parity: the engine plays the carried answer and stumble in this call */
+        FpDecide dec;          /* the stumble the engine picks in this call, for the [FIGHT] line */
+        FpDecideArm(&dec, victim);
+        const int fightResult = orig_hitByMelee(victim, cutDirection, dmg, attacker, 0, comboId);
+        FpDecideDisarm(&dec);
+        FpDisarm();
         InterlockedExchange(&g_applyingRemote, 0);
+        FightHitAfter(&fight, &dec, fightResult);
 
         int proneAfter = (int)victim->poseState();
         if (proneBefore != proneAfter && g_proneLogged < kProneLogLimit)
@@ -875,8 +1325,9 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
 //     shooter's copy must be orientable (T240 / C1-b, the same test as ApplyRemoteHit). applyDamage runs inside (our own
 //     character: C2-b lets it through), so wounds, blood, knock-out and death are the engine's; the result reaches the
 //     shooter's game in our STATE.
-//   * A COPY's bolt (the shooter is not ours) makes no hit on this game: iShotYou returns 1 without the engine's hit. Only the
-//     shooter's owner decides hits (T668: a copy never fired, shotsCopy=0 on both games - this is the guard for when one does).
+//   * A COPY fires only on its owner's MSG_SHOT_FIRED (ShotFireDrain); its own engine's fires are held. Which game decides a
+//     bolt's hit: src/common/shotgate.h HitDecide - a copy's bolt makes no hit here unless it was fired here at our own player
+//     character and struck it (then this game decides, as the owner of that character).
 //   * T-311 (pvp1 'Being attacked keeps the standard automatic combat response'): after the wound the owner also plays
 //     iShotYou's victim-side reactions with the shooter's COPY as the attacker - rememberCharacter 0x673A10 (ST_TEMPORARY_ENEMY,
 //     onPurpose), AI::underRangedAttack 0x998E80 (onPurpose, combat +0x130 clear) and the hit reaction 0x438E50 - see ShotReactOne.
@@ -895,6 +1346,8 @@ const size_t kRsRcTurretType = 0x10;    /* RangedCombatClass::turret (a hand at 
 const size_t kRsRcGun        = 0x28;    /* RangedCombatClass::gun (items.cpp kCcRcGun) */
 const size_t kRsRcCombatMode = 0x36;    /* RangedCombatClass::combatMode - updateMT's first test */
 const size_t kRsGunLoaded    = 0x20;    /* GunClass: loaded bolts, shoot's decrement (items.cpp kCcGunLoaded) */
+const size_t kRsRcStat       = 0x30;    /* RangedCombatClass::currentStat - shoot's 4th argument (decomp_43ab40.txt:32) */
+const size_t kRsCharPos      = 0x48;    /* Character logical position (replicate.cpp P071ReadPos) */
 const size_t kRsHarpoonDmg   = 0x4C;    /* the projectile's damage, iShotYou's Damages third float */
 const int    kRsRangedAttackFocused = 263;   /* TaskType RANGED_ATTACK_FOCUSED (tasktype-classification.md) */
 
@@ -924,11 +1377,43 @@ volatile LONG64 g_rsHitCross = 0;      /* shooter ours, victim a copy: the engin
 volatile LONG64 g_rsHitFromCopy = 0;   /* shooter a copy: a bolt a copy fired on this game */
 volatile LONG64 g_rsDropped = 0;       /* the event ring was full (the counters above still count) */
 volatile LONG64 g_rsHitCopyBlocked = 0;   /* P104 fix: a COPY's bolt struck something here - no hit (the shooter's owner decides) */
+volatile LONG64 g_rsHitDecidedHere = 0;   /* a copy's bolt struck our own player character: the engine's hit ran here (this game decides) */
+volatile LONG64 g_rsHitLeftToOwner = 0;   /* our bolt struck the copy of another game's player character: the look only, its owner decides */
+volatile LONG64 g_rsHitKeptUnclassified = 0;   /* a copy's bolt struck our own character not classified yet: no hit here (inside rhitCopyBlocked) */
+volatile LONG64 g_rsHitNotAimed = 0;   /* a copy's bolt struck our player character it was not fired at here: the look only (inside rhitCopyBlocked) */
+volatile LONG64 g_rsHitSentUnclassified = 0;   /* our bolt on a copy not classified here: MSG_SHOT sent; its game may decide otherwise */
+volatile LONG64 g_rsShotFiredLost = 0;   /* our own character's fire lost to a full event ring: no MSG_SHOT_FIRED (not in dropped) */
 /* P104 fix, MAIN THREAD only (the drain, the net pump, the K2 safe point) */
 long long g_shotSent = 0, g_shotSendFail = 0, g_shotSendBad = 0, g_shotOutLogged = 0, g_rsBlockLogged = 0;
 long long g_shotIn = 0, g_shotApplied = 0, g_shotRefusedNotMine = 0, g_shotRefusedShooter = 0, g_shotMalformed = 0, g_shotQDrop = 0;
 long long g_shotNoVictim = 0, g_shotNoShooter = 0, g_shotNotOrientable = 0, g_shotBlockedLoad = 0, g_shotFault = 0, g_shotNoAddWound = 0;
 long long g_shotInLogged = 0;
+long long g_shotRefusedRule = 0;   /* MSG_SHOT for a victim this game classifies as a player character (its hits are decided here) */
+long long g_shotFiredSent = 0, g_shotFiredNotSent = 0, g_shotFiredRecv = 0, g_shotFiredRefused = 0, g_shotFiredLogged = 0;   /* MSG_SHOT_FIRED */
+long long g_shotFiredNoAim = 0;   /* our fire's aim point unreadable: not sent */
+/* MAIN THREAD: the copy's fires on its owner's MSG_SHOT_FIRED (ApplyRemoteShotFired -> ShotFireDrain at the K2 safe point) */
+long long g_cfFired = 0, g_cfMoved = 0, g_cfLookOnly = 0, g_cfPrimed = 0, g_cfTargetAbsent = 0, g_cfTargetNoAI = 0;
+long long g_cfLapsedNoCopy = 0, g_cfLapsedNotReady = 0, g_cfNowOurs = 0, g_cfQDrop = 0, g_cfFault = 0, g_cfNoHook = 0, g_cfLogged = 0;
+long long g_cfLapsedModeOff = 0, g_cfLapsedNoGun = 0;   /* of lapsedNotReady: the copy's ranged mode was off / it was on with no gun */
+/* MAIN THREAD: the owner's ranged mode on its copy (RangedModeSample, RangedModeNote, RangedModeApplyDrain) */
+long long g_rmEdges = 0, g_rmPushQueued = 0, g_rmPushFull = 0, g_rmNoted = 0, g_rmWritten = 0, g_rmReverted = 0;
+long long g_rmNotTaken = 0, g_rmFault = 0, g_rmNoHook = 0, g_rmRevertStopped = 0, g_rmShotNoted = 0, g_rmGoneOff = 0, g_cfOnPassWait = 0;
+long long g_rmLoggedOwn = 0, g_rmLoggedCopy = 0, g_rmLoggedStop = 0;   /* separate line caps: own edges, writes on copies, stops */
+const long long kRmLogLimit = 40;
+/* MAIN THREAD: the owner's hand item on its copy (HandSample, ApplyRemoteHand, HandApplyDrain). notFound counts each lookup that
+   missed, waiting each owner word that had to wait for its item or for its copy at least once; notSent each send that found no
+   road (once until one goes through) or an item it could not name; resent each catch-up / announce resend sent; rearmed each time
+   the re-apply count started again; tableFull each new word dropped with the table full of present copies; forgotten each word
+   dropped at its copy's despawn. */
+long long g_hdSent = 0, g_hdRecv = 0, g_hdDrew = 0, g_hdPutAway = 0, g_hdNotFound = 0, g_hdWaiting = 0, g_hdReverts = 0;
+long long g_hdCapped = 0, g_hdSkippedAnimal = 0, g_hdNotSent = 0, g_hdRefused = 0, g_hdNoRender = 0, g_hdEngineRefused = 0;
+long long g_hdFault = 0, g_hdLoggedSend = 0, g_hdLoggedApply = 0;
+long long g_hdResent = 0, g_hdRearmed = 0, g_hdTableFull = 0, g_hdForgotten = 0;
+const long long kHdLogLimit = 2000;   /* each: send lines, apply lines, all characters together */
+const int kHdLogPerUid = 12;   /* each: send lines, apply lines, per character - one game's many NPCs cannot use up a player's lines */
+struct ShotFire { shotgate::Fired f; unsigned int at; };
+std::vector<ShotFire> g_shotFireQ;      /* net pump -> K2 safe point, both MAIN THREAD */
+const size_t kShotFireMax = 64;
 /* T-311, MAIN THREAD: the victim-side reactions after a SHOT-IN wound (ShotReactOne) and the follow-up WATCH lines */
 long long g_shotReactRuns = 0, g_shotReactRemember = 0, g_shotReactUnderRanged = 0, g_shotReactHitReaction = 0;
 long long g_shotReactNoCopy = 0, g_shotReactNoRow = 0, g_shotReactFault = 0, g_shotReactNoAI = 0, g_shotReactNoPart = 0;
@@ -943,7 +1428,7 @@ long long g_rsHooks = 0, g_rsLeverRuns = 0, g_rsShotLogged = 0, g_rsHitLogged = 
 const long long kRsLogLimit = 80;
 
 // Vyukov's bounded queue: many producers (whatever thread shoots or is hit), one consumer (the main thread).
-struct RsEvent { volatile LONG seq; int kind; unsigned int who; unsigned int other; int whoMine; int otherMine; float dmg; int flag; float rec[4]; };
+struct RsEvent { volatile LONG seq; int kind; unsigned int who; unsigned int other; int whoMine; int otherMine; float dmg; int flag; float rec[4]; int posOk; float pos[6]; };
 const LONG kRsRing = 64;   /* power of two */
 RsEvent g_rsRing[kRsRing];
 volatile LONG g_rsEnq = 0;
@@ -965,9 +1450,11 @@ int RsOwn(const void* obj, unsigned int* uid)
     return net::IsUidMineAnyThread(u) ? 1 : 0;
 }
 
-void RsPush(int kind, unsigned int who, int whoMine, unsigned int other, int otherMine, float dmg, int flag, const float* rec)
+// false: the ring is not ready or full (nothing stored). pos6: a fire's aim point and its target's position (kind 1), or 0.
+bool RsPushTry(int kind, unsigned int who, int whoMine, unsigned int other, int otherMine, float dmg, int flag, const float* rec,
+               const float* pos6)
 {
-    if (g_rsRingReady == 0) { InterlockedIncrement64(&g_rsDropped); return; }
+    if (g_rsRingReady == 0) return false;
     for (;;)
     {
         const LONG pos = g_rsEnq;
@@ -979,12 +1466,19 @@ void RsPush(int kind, unsigned int who, int whoMine, unsigned int other, int oth
             e->kind = kind; e->who = who; e->whoMine = whoMine; e->other = other; e->otherMine = otherMine;
             e->dmg = dmg; e->flag = flag;
             for (int r = 0; r < 4; ++r) e->rec[r] = (rec != 0) ? rec[r] : -1.0f;   /* P104 fix: the bolt's record */
+            e->posOk = (pos6 != 0) ? 1 : 0;
+            for (int r = 0; r < 6; ++r) e->pos[r] = (pos6 != 0) ? pos6[r] : 0.0f;
             InterlockedExchange(&e->seq, pos + 1);
-            return;
+            return true;
         }
-        if (dif < 0) { InterlockedIncrement64(&g_rsDropped); return; }
+        if (dif < 0) return false;
         /* dif > 0: another producer took this position first - reload and retry */
     }
+}
+
+void RsPush(int kind, unsigned int who, int whoMine, unsigned int other, int otherMine, float dmg, int flag, const float* rec)
+{
+    if (!RsPushTry(kind, who, whoMine, other, otherMine, dmg, flag, rec, 0)) InterlockedIncrement64(&g_rsDropped);
 }
 
 // =====================================================================================================================
@@ -1351,7 +1845,118 @@ void detour_p112Bolt(void* h)
 }
 // PROBE-END: P112 (block 1 of 2)
 
-// DETOUR, any thread: no allocation, no lock, no log.
+// THE COPY'S FIRES (src/common/shotgate.h): a copy (a character another game runs) fires only on its owner's MSG_SHOT_FIRED,
+// fired here by ShotFireDrain through the engine's own fire routine; every fire of the copy's own engine is held. The held-fire
+// runs and the aimed-bolt records live in one POD store behind a short spin lock that no engine call is ever made under; safe on
+// any thread (the fire routine and the bolt hit have run on the main thread in every measured run - the shootThread / hitThread
+// fields of the [P104] REPORT line). No allocation, no log on the fire or hit path.
+shotgate::Store g_shg;                 /* zero before any constructor runs; read and written only under g_shgLock */
+volatile LONG   g_shgLock = 0;
+
+void ShgLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_shgLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+void ShgUnlock() { InterlockedExchange(&g_shgLock, 0); }
+
+// Any thread: 1 = the engine's fire routine runs for this shooter, 0 = it is held (a copy's own engine's fire).
+// su / sm: the shooter's uid and RsOwn answer.
+int ShotGateLets(unsigned int su, int sm)
+{
+    ShgLock();
+    const int r = shotgate::Shoot(&g_shg, (sm == -1) ? 0u : su, (sm == 1) ? 1 : 0, (unsigned int)::GetTickCount());
+    ShgUnlock();
+    return r;
+}
+
+// Any thread (iShotYou): which game decides this bolt's hit (shotgate.h HitDecideAimed); a copy's bolt on our player character
+// spends the record of the bolt fired here at it.
+int ShotHitDecide(int am, unsigned int au, int vm, unsigned int vu, int vPc)
+{
+    ShgLock();
+    const int how = shotgate::HitDecideAimed(&g_shg, am, au, vm, vu, vPc, (unsigned int)::GetTickCount());
+    ShgUnlock();
+    return how;
+}
+
+// Any thread, no C++ objects (SEH): a fire's aim point (the Vector3 shoot aims at) and its target's logical position. Returns 1
+// with out6[0..2] = the aim point, out6[3..5] = the target's position (0,0,0 for no target); 0 when either is unreadable.
+int RsReadFire(const void* aim, const void* target, float* out6)
+{
+    int r = 0;
+    for (int i = 0; i < 6; ++i) out6[i] = 0.0f;
+    __try
+    {
+        if (aim != 0)
+        {
+            const float* a = (const float*)aim;
+            out6[0] = a[0]; out6[1] = a[1]; out6[2] = a[2];
+            if (target != 0)
+            {
+                if (RsPlaus(target))
+                {
+                    const float* t = (const float*)((const char*)target + kRsCharPos);
+                    out6[3] = t[0]; out6[4] = t[1]; out6[5] = t[2];
+                    r = 1;
+                }
+            }
+            else r = 1;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
+    return r;
+}
+
+// MAIN THREAD (CombatTick): one line for each of the first shotgate::kLogPerCopy runs of held fires per copy.
+void ShotCreditLogDrain()
+{
+    unsigned int uids[8];
+    int runs[8];
+    ShgLock();
+    const int n = shotgate::TakeLogs(&g_shg, uids, runs, 8);
+    ShgUnlock();
+    for (int i = 0; i < n; ++i)
+        DebugLog("[SHOTGATE] HOLD uid=" + N3((long long)uids[i]) + ": the copy's own engine tried to fire - held (a copy fires only"
+                 " on its owner's SHOT_FIRED) (hold run " + N3((long long)runs[i]) + " for this copy; at most "
+                 + N3((long long)shotgate::kLogPerCopy) + " such lines per copy)");
+}
+
+// MAIN THREAD: the gate's counters, appended to the [P104] REPORT line.
+std::string ShotGateToken()
+{
+    ShgLock();
+    const shotgate::Counts k = g_shg.c;
+    ShgUnlock();
+    return " shotGate[firedSent=" + N3(g_shotFiredSent) + ",firedNotSent=" + N3(g_shotFiredNotSent)
+         + ",firedNoAim=" + N3(g_shotFiredNoAim) + ",firedLost=" + N3(g_rsShotFiredLost)
+         + ",firedRecv=" + N3(g_shotFiredRecv) + ",firedRefused=" + N3(g_shotFiredRefused)
+         + ",held=" + N3(k.held) + ",holds=" + N3(k.holds) + ",aimed=" + N3(k.aimed) + ",hitAimed=" + N3(k.hitAimed)
+         + ",notAimed=" + N3(k.notAimed) + ",lapsed=" + N3(k.lapsed) + ",capped=" + N3(k.capped) + ",noSlot=" + N3(k.noSlot)
+         + ",passOwn=" + N3(k.passOwn) + ",passNotCopy=" + N3(k.passNotCopy) + "]"
+         + " copyFire[fired=" + N3(g_cfFired) + ",moved=" + N3(g_cfMoved) + ",lookOnly=" + N3(g_cfLookOnly)
+         + ",primed=" + N3(g_cfPrimed) + ",targetAbsent=" + N3(g_cfTargetAbsent) + ",targetNoAI=" + N3(g_cfTargetNoAI)
+         + ",lapsedNoCopy=" + N3(g_cfLapsedNoCopy) + ",lapsedNotReady=" + N3(g_cfLapsedNotReady) + ",nowOurs=" + N3(g_cfNowOurs)
+         + ",waiting=" + N3((long long)g_shotFireQ.size()) + ",qDrop=" + N3(g_cfQDrop) + ",fault=" + N3(g_cfFault)
+         + ",noHook=" + N3(g_cfNoHook) + ",lapsedModeOff=" + N3(g_cfLapsedModeOff) + ",lapsedNoGun=" + N3(g_cfLapsedNoGun) + "]"
+         + " rangedMode[edges=" + N3(g_rmEdges) + ",pushQueued=" + N3(g_rmPushQueued) + ",pushFull=" + N3(g_rmPushFull)
+         + ",noted=" + N3(g_rmNoted) + ",written=" + N3(g_rmWritten) + ",reverted=" + N3(g_rmReverted)
+         + ",notTaken=" + N3(g_rmNotTaken) + ",fault=" + N3(g_rmFault) + ",noHook=" + N3(g_rmNoHook)
+         + ",revertStopped=" + N3(g_rmRevertStopped) + ",shotNoted=" + N3(g_rmShotNoted) + ",goneOff=" + N3(g_rmGoneOff)
+         + ",onPassWait=" + N3(g_cfOnPassWait) + "]"
+         + " hand[sent,recv,drew,putAway,notFound,waiting,reverts,capped,skippedAnimal]=" + N3(g_hdSent) + "," + N3(g_hdRecv)
+         + "," + N3(g_hdDrew) + "," + N3(g_hdPutAway) + "," + N3(g_hdNotFound) + "," + N3(g_hdWaiting) + "," + N3(g_hdReverts)
+         + "," + N3(g_hdCapped) + "," + N3(g_hdSkippedAnimal)
+         + " handMore[notSent,refused,noRender,engineRefused,fault,resent,rearmed,tableFull,forgotten]=" + N3(g_hdNotSent) + ","
+         + N3(g_hdRefused) + "," + N3(g_hdNoRender) + "," + N3(g_hdEngineRefused) + "," + N3(g_hdFault) + "," + N3(g_hdResent)
+         + "," + N3(g_hdRearmed) + "," + N3(g_hdTableFull) + "," + N3(g_hdForgotten);
+}
+
+// DETOUR, any thread: no allocation, no log; the copy-fire store's short spin lock only.
 void detour_p104Shoot(void* gun, ::Character* me, void* target, int stat, const void* aim)
 {
     InterlockedIncrement64(&g_rsShots);
@@ -1369,12 +1974,24 @@ void detour_p104Shoot(void* gun, ::Character* me, void* target, int stat, const 
         if (RsPlaus(rc)) turretType = *(const int*)((const char*)rc + kRsRcTurretType);
     }
     if (turretType != -1 && turretType != 0 && turretType != 0xB) InterlockedIncrement64(&g_rsShotsTurret);   /* 0xB: a null hand's type (Hand_ctor) */
-    RsPush(1, su, sm, tu, tm, 0.0f, turretType, 0);
+    /* a copy's own engine never fires: its bolts are fired by ShotFireDrain on its owner's MSG_SHOT_FIRED. Held, the fire
+       routine does not run - no bolt, no sound, the gun keeps its bolt - and its one caller, the per-frame ranged update, goes on
+       as after a fire (it uses nothing the fire routine returns or writes: decomp_43ab40.txt:30-35). */
+    if (!ShotGateLets(su, sm)) return;
+    /* our own character's fire: the drain sends MSG_SHOT_FIRED with the aim point and the target's position. A fire lost to a
+       full event ring is counted on its own (shotFiredLost): the other games' copies never fire that bolt. */
+    float fire[6];
+    const int fireOk = (sm == 1) ? RsReadFire(aim, target, fire) : 0;
+    if (!RsPushTry(1, su, sm, tu, tm, 0.0f, turretType, 0, (fireOk != 0) ? fire : 0))
+    {
+        if (sm == 1) InterlockedIncrement64(&g_rsShotFiredLost);
+        else InterlockedIncrement64(&g_rsDropped);
+    }
     P112OnShoot(me, target, aim);   /* PROBE P112: our shooter's aim point at this shot */
     orig_p104Shoot(gun, me, target, stat, aim);
 }
 
-// DETOUR, any thread: no allocation, no lock, no log.
+// DETOUR, any thread: no allocation, no log; the copy-fire store's short spin lock only.
 bool detour_p104ShotYou(::Character* self, ::Character* attacker, void* harpoon, bool onPurpose)
 {
     InterlockedIncrement64(&g_rsHits);
@@ -1394,16 +2011,32 @@ bool detour_p104ShotYou(::Character* self, ::Character* attacker, void* harpoon,
         std::memcpy(rec, (const char*)harpoon + kRsHarpoonRec, sizeof(rec));
         dmg = *(const float*)((const char*)harpoon + kRsHarpoonDmg);
     }
-    /* P104 fix: a COPY's bolt makes no hit on this game - only the shooter's owner decides hits (its MSG_SHOT reaches the victim's
-       owner). The engine's hit (wound, damage, reaction, sound) does not run; 1 is iShotYou's answer on every path
-       (decomp_4398f0.txt:92), so the projectile manager goes on as after a hit. */
-    if (am == 0)
+    /* which game decides this hit (shotgate.h HitDecideAimed): a bolt on a player character is decided by that character's
+       owner's game, with the shooter's copy's bolt there - only a copy's bolt fired here at that character; a bolt on an NPC by
+       the shooter's game, whose MSG_SHOT reaches the NPC's game. Blocked, the engine's hit (wound, damage, reaction, sound) does
+       not run; 1 is iShotYou's answer on every path (decomp_4398f0.txt:92), so the projectile manager goes on as after a hit. */
+    const int vPc = (vu != 0) ? IsUidPlayerCharAnyThread(vu) : -1;
+    const int how = ShotHitDecide(am, au, vm, vu, vPc);
+    if (!shotgate::HitRuns(how))
     {
         InterlockedIncrement64(&g_rsHitCopyBlocked);
-        RsPush(3, vu, vm, au, am, dmg, onPurpose ? 1 : 0, rec);
+        if (how == shotgate::kHitBlockUnclassified) InterlockedIncrement64(&g_rsHitKeptUnclassified);
+        else if (how == shotgate::kHitBlockNotAimed) InterlockedIncrement64(&g_rsHitNotAimed);
+        RsPush((how == shotgate::kHitBlockNotAimed) ? 6 : 3, vu, vm, au, am, dmg, onPurpose ? 1 : 0, rec);
         return true;
     }
-    RsPush(2, vu, vm, au, am, dmg, onPurpose ? 1 : 0, rec);   /* victim a COPY + shooter ours: the drain sends MSG_SHOT */
+    if (shotgate::SentUnclassified(am, vm, vPc)) InterlockedIncrement64(&g_rsHitSentUnclassified);
+    if (how == shotgate::kHitHere)
+    {
+        InterlockedIncrement64(&g_rsHitDecidedHere);
+        RsPush(5, vu, vm, au, am, dmg, onPurpose ? 1 : 0, rec);
+    }
+    else if (how == shotgate::kHitLeave)
+    {
+        InterlockedIncrement64(&g_rsHitLeftToOwner);
+        RsPush(4, vu, vm, au, am, dmg, onPurpose ? 1 : 0, rec);
+    }
+    else RsPush(2, vu, vm, au, am, dmg, onPurpose ? 1 : 0, rec);   /* kHitSend (victim a COPY + shooter ours): the drain sends MSG_SHOT */
     return orig_p104ShotYou(self, attacker, harpoon, onPurpose);
 }
 
@@ -1686,6 +2319,8 @@ ShotWatch g_shotWatch[kShotWatchMax];   /* zero-initialised: stage 0 = free */
 
 std::string RangedTestGive(unsigned int uid, const std::string& sid, int count);   /* items.cpp - P104 */
 std::string RangedTestGiveAmmo(unsigned int uid, const std::string& sid, int rounds);   /* items.cpp - P104f1 */
+int LeverNameUid(const std::string& w, unsigned int* uid, std::string* label);   /* items.cpp - TEST-ONLY: uid | name:<N> | spawned:<T> */
+std::string RangedHeldItems(unsigned int uid);   /* items.cpp - TEST-ONLY (rangedtest show): the items a character holds, read only */
 
 // P104 fix, MAIN THREAD (the drain): our bolt struck the other game's character's copy - tell its owner.
 static void ShotSendOne(unsigned int victim, unsigned int shooter, const float* rec, bool onPurpose)
@@ -1712,6 +2347,36 @@ static void ShotSendOne(unsigned int victim, unsigned int shooter, const float* 
     }
 }
 
+// MAIN THREAD (the drain): our character's engine fired one bolt - every game in its area fires its copy's bolt at that target.
+// pos6: the aim point and the target's position (detour_p104Shoot), 0 when they were unreadable (nothing sent, counted).
+static void ShotFiredSendOne(unsigned int shooter, unsigned int target, const float* pos6)
+{
+    if (pos6 == 0)
+    {
+        ++g_shotFiredNoAim;
+        if (g_shotFiredLogged < kRsLogLimit)
+        {
+            ++g_shotFiredLogged;
+            DebugLog("[SHOTGATE] FIRED-NOT-SENT shooter uid=" + N3(shooter) + " (mine) target uid=" + N3(target)
+                     + " - the aim point or the target's position was unreadable: no copy fires this bolt");
+        }
+        return;
+    }
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    const bool sent = net::SendShotFired(shooter, target, pos6, (target != 0) ? pos6 + 3 : zero);
+    if (sent) ++g_shotFiredSent;
+    else ++g_shotFiredNotSent;
+    if (g_shotFiredLogged < kRsLogLimit)
+    {
+        ++g_shotFiredLogged;
+        DebugLog(std::string(sent ? "[SHOTGATE] FIRED-SENT #" + N3(g_shotFiredSent) : "[SHOTGATE] FIRED-NOT-SENT")
+                 + " shooter uid=" + N3(shooter) + " (mine) target uid=" + N3(target)
+                 + " aim=(" + F1(pos6[0]) + "," + F1(pos6[1]) + "," + F1(pos6[2]) + ")"
+                 + (sent ? " -> MSG_SHOT_FIRED to the shooter's area: its copies there fire this bolt at that target"
+                         : " - no road to another game (or not encodable): no copy fires this bolt"));
+    }
+}
+
 // MAIN THREAD (CombatTick): the shot / ranged-hit lines, bounded per kind.
 void RangedEventsDrain()
 {
@@ -1724,9 +2389,13 @@ void RangedEventsDrain()
         const float dmg = e->dmg;
         float rec[4];
         for (int r = 0; r < 4; ++r) rec[r] = e->rec[r];
+        const int posOk = e->posOk;
+        float pos[6];
+        for (int r = 0; r < 6; ++r) pos[r] = e->pos[r];
         InterlockedExchange(&e->seq, g_rsDeq + kRsRing);
         ++g_rsDeq;
         if (kind == 2 && whoMine == 0 && otherMine == 1) ShotSendOne(who, other, rec, flag != 0);   /* P104 fix: every such hit, not only logged ones */
+        if (kind == 1 && whoMine == 1) ShotFiredSendOne(who, other, (posOk != 0) ? pos : 0);   /* every fire of our own character */
         if (kind == 1 && g_rsShotLogged < kRsLogLimit)
         {
             ++g_rsShotLogged;
@@ -1750,7 +2419,24 @@ void RangedEventsDrain()
             ++g_rsBlockLogged;
             SW_DEVLOG("[P104] RHIT-BLOCKED #" + N3(g_rsBlockLogged) + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
                      + " shooter uid=" + N3(other) + " (copy) dmg=" + F1(dmg) + " onPurpose=" + N3(flag)
-                     + " - a COPY's bolt: NO hit on this game (only the shooter's owner decides hits)");
+                     + " - a COPY's bolt: NO hit on this game (the victim is no player character of ours: the shooter's game decides)");
+        }
+        else if (kind == 6 && g_rsBlockLogged < kRsLogLimit)
+        {
+            ++g_rsBlockLogged;
+            SW_DEVLOG("[SHOTGATE] RHIT-NOT-AIMED #" + N3(g_rsBlockLogged) + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ")"
+                     + " shooter uid=" + N3(other) + " (copy) dmg=" + F1(dmg) + " onPurpose=" + N3(flag)
+                     + " - a copy's bolt on our player character it was not fired at here (its owner aimed elsewhere or at no"
+                       " replicated character): the look only, no hit");
+        }
+        else if ((kind == 4 || kind == 5) && g_rsHitLogged < kRsLogLimit)
+        {
+            ++g_rsHitLogged;
+            SW_DEVLOG("[SHOTGATE] RHIT-" + std::string(kind == 5 ? "DECIDED-HERE" : "LEFT-TO-OWNER") + " #" + N3(g_rsHitLogged)
+                     + " victim uid=" + N3(who) + " (" + RsOwnWord(whoMine) + ") shooter uid=" + N3(other) + " (" + RsOwnWord(otherMine) + ")"
+                     + " dmg=" + F1(dmg) + " onPurpose=" + N3(flag)
+                     + (kind == 5 ? " - the shooter's copy's bolt on our player character: the engine's hit runs HERE (this game decides)"
+                                  : " - our bolt on another game's player character's copy: the look only here, its owner's game decides"));
         }
     }
 }
@@ -1767,6 +2453,9 @@ std::string RangedCountersLine()
          + " shotNot[victim,shooter,orientable,loading,addWoundOff,fault,qDrop]=" + N3(g_shotNoVictim) + "," + N3(g_shotNoShooter)
          + "," + N3(g_shotNotOrientable) + "," + N3(g_shotBlockedLoad) + "," + N3(g_shotNoAddWound) + "," + N3(g_shotFault) + "," + N3(g_shotQDrop)
          + " addWound=" + (g_p104AddWound != 0 ? std::string("ON") : "OFF(why=" + N3(g_p104AddWoundWhy) + ")")
+         + " rhitDecided[here,leftToOwner,notAimed]=" + N3(g_rsHitDecidedHere) + "," + N3(g_rsHitLeftToOwner) + ","
+         + N3(g_rsHitNotAimed) + " rangedKeptUnclassified[sent,blocked]=" + N3(g_rsHitSentUnclassified) + ","
+         + N3(g_rsHitKeptUnclassified) + " shotRefusedRule=" + N3(g_shotRefusedRule) + ShotGateToken()
          + " rhitFromCopy=" + N3(g_rsHitFromCopy) + " dropped=" + N3(g_rsDropped)
          + " shootThread=" + N3(g_rsShootThread) + " hitThread=" + N3(g_rsHitThread)
          + " hooks=" + N3(g_rsHooks) + "/2 leverRuns=" + N3(g_rsLeverRuns)
@@ -1978,13 +2667,18 @@ void RangedReport()
 void ShotOnNet(unsigned int victimUid, unsigned int shooterUid, const float* rec4, bool onPurpose, int refusal)
 {
     ++g_shotIn;
+    /* a player character's bolt hits are decided on this game from the shooter's copy's bolt (shotgate.h): the message would
+       count the hit twice */
+    if (refusal == 0 && rec4 != 0 && !shotgate::ShotReceiverApplies(IsUidPlayerCharAnyThread(victimUid))) refusal = 4;
     if (refusal != 0 || rec4 == 0)
     {
         const char* why = (refusal == 1) ? "the victim is not driven by this game"
                         : (refusal == 2) ? "the sender does not drive the shooter"
+                        : (refusal == 4) ? "the victim is a player character: this game decides its bolt hits from the shooter's copy"
                         : "it did not decode";
         if (refusal == 1) ++g_shotRefusedNotMine;
         else if (refusal == 2) ++g_shotRefusedShooter;
+        else if (refusal == 4) ++g_shotRefusedRule;
         else ++g_shotMalformed;
         if (g_shotInLogged < kRsLogLimit)
         {
@@ -2237,7 +2931,8 @@ std::string FfShowLever(const std::string& args)
 
 // --- MELEE_DECIDED on the victim's game (MAIN THREAD) -------------------------------------------------------------------------
 namespace {
-struct MeleeIn { unsigned int victim; unsigned int attacker; int cutDir; int comboId; float dmg[6]; unsigned char techFlag; };
+struct MeleeIn { unsigned int victim; unsigned int attacker; int cutDir; int comboId; float dmg[6]; unsigned char techFlag;
+                 int hasBlow; hitwire::Blow blow; };   /* blow: the attacker's game's decided blow, for this game's HIT */
 std::vector<MeleeIn> g_meleeInQ;          /* net pump -> K2 safe point, both MAIN THREAD */
 const size_t kMeleeInMax = 256;
 long long g_meleeIn = 0, g_meleeApplied = 0, g_meleeRefused = 0, g_meleeRefNotMine = 0, g_meleeRefSender = 0, g_meleeMalformed = 0,
@@ -2400,7 +3095,7 @@ void MeleeSafePointDrain()
         char d24[kDamagesBytes];
         std::memcpy(d24, s.dmg, kDamagesBytes);
         const bool hitSent = net::SendHit(s.victim, s.attacker, s.cutDir, d24, s.comboId, after, na > 0 ? na : 0, bloodAfter,
-                                          noId, knock, 1);
+                                          noId, knock, 1, s.hasBlow ? &s.blow : 0);
         if (hitSent) ++g_meleeHitSent;
         if (MeleeLogThis(g_meleeApplied))
         {
@@ -2432,8 +3127,13 @@ void MeleeDecidedDrain()
         m.comboId = h.comboId;
         for (int k = 0; k < 6; ++k) m.damages[k] = h.damages[k];
         m.techFlag = h.techFlag;
+        /* fight parity: the decided blow - landed, and the stumble this engine picked - for the HIT the NPC's game sends */
+        hitwire::Blow blow;
+        hitwire::ClearBlow(&blow);
+        blow.result = meleewire::kMeleeHitLanded;
+        blow.stumbleKnown = hitwire::WireNameOf(h.stumble, blow.stumble) ? 1 : 0;
         InterlockedExchange(&g_meleeRead, g_meleeRead + 1);
-        const bool sent = net::SendMeleeDecided(m);
+        const bool sent = net::SendMeleeDecided(m, &blow);
         if (sent) ++g_meleeSent; else ++g_meleeNotSent;
         if (MeleeLogThis(sent ? g_meleeSent : g_meleeNotSent))
             DebugLog(std::string(sent ? "[MELEE] decided sent" : "[MELEE] decided not sent") + " victim=" + N3(m.victimUid)
@@ -2461,7 +3161,7 @@ void MeleeDecidedDrain()
 
 // MAIN THREAD (session.cpp OnMeleeDecided). See combat.h.
 void MeleeOnNet(unsigned int victimUid, unsigned int attackerUid, int cutDir, int comboId, const float* damages6,
-                unsigned char techFlag, int refusal)
+                unsigned char techFlag, int refusal, const hitwire::Blow* blow)
 {
     ++g_meleeIn;
     if (refusal != 0 || damages6 == 0)
@@ -2484,9 +3184,342 @@ void MeleeOnNet(unsigned int victimUid, unsigned int attackerUid, int cutDir, in
     s.comboId = comboId;
     for (int k = 0; k < 6; ++k) s.dmg[k] = damages6[k];
     s.techFlag = techFlag;
+    s.hasBlow = (blow != 0) ? 1 : 0;
+    if (blow != 0) s.blow = *blow; else hitwire::ClearBlow(&s.blow);
     g_meleeInQ.push_back(s);
 }
 
+// MAIN THREAD, no C++ objects (SEH): the copy c's gun and current stat while its ranged mode is on and it holds a gun, and the
+// gun's loaded bolts. 1 ready, 0 not ready, -1 faulted. *why: 1 no ranged combat object, 2 its ranged mode is off, 3 it is on and
+// no gun is stored at +0x28, 0 ready.
+static int RsCopyGun(const void* c, void** gun, int* stat, int* loaded, int* why)
+{
+    *why = 0;
+    __try
+    {
+        const char* rc = *(const char* const*)((const char*)c + kRsCharRanged);
+        if (!RsPlaus(rc)) { *why = 1; return 0; }
+        if (*(const unsigned char*)(rc + kRsRcCombatMode) == 0) { *why = 2; return 0; }
+        void* g = *(void* const*)(rc + kRsRcGun);
+        if (!RsPlaus(g)) { *why = 3; return 0; }
+        *gun = g;
+        *stat = *(const int*)(rc + kRsRcStat);
+        *loaded = *(const int*)((const char*)g + kRsGunLoaded);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// =====================================================================================================================
+// THE OWNER'S RANGED MODE ON ITS COPY. The engine's per-frame ranged update stores the gun at +0x28 only while the ranged combat
+// object's +0x36 is on (decomp_43ab40.txt:12-14), and a copy's +0x36 is otherwise never turned on, so a copy asked to fire on
+// its owner's word (ShotFireDrain) held no gun. The owner's +0x36 rides its STATE as latchBits bits 15-16 (statewire.h
+// WithRangedMode, through StanceStateBits); a change on one of this game's own characters is sampled every frame
+// (CombatModeTick -> RangedModeSample) and sends one STATE at once on the stance push's road (StanceChangeDrain); the periodic
+// STATE carries it too. The copy keeps its owner's latest word (RangedModeNote, from ApplyState) and the K2 safe point writes the
+// byte (RangedModeApplyDrain, worker paused, before ShotFireDrain). No engine setter for +0x36 is in the decompiled functions
+// in hand, so the byte is written directly under __try. ON is written only while the fire hook is in: with +0x36 on, the copy's
+// own ranged update may call the fire routine, and that hook holds every fire of a copy's own engine (detour_p104Shoot ->
+// ShotGateLets). A byte found changed back since its last write is written again and counted (rangedMode reverted), up to
+// kRangedModeRevertCap times under one owner word (then rangedMode revertStopped). The owner's MSG_SHOT_FIRED also counts as its
+// word ON (RangedModeNote), so a lost STATE push does not cost the first bolts. Writing ON clears the copy's stored gun (+0x28)
+// and the copy fires from the next safe-point pass on, with a gun its own ranged update stored after the write. When the owner
+// leaves, a copy this game turned ON is written OFF (RangedModeOwnerGone).
+// =====================================================================================================================
+// Any thread, read only, no C++ objects (SEH): character c's ranged mode, 1 on, 0 off, -1 no ranged combat object / faulted.
+// Reached on the main thread (the K2 safe point, the per-frame sample) and, through StanceStateBits, from the stance setter's
+// detour on whatever thread calls the setter.
+static int RsReadMode(const void* c)
+{
+    __try
+    {
+        const char* rc = *(const char* const*)((const char*)c + kRsCharRanged);
+        if (!RsPlaus(rc)) return -1;
+        return (*(const unsigned char*)(rc + kRsRcCombatMode) != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// MAIN THREAD at the K2 safe point, no C++ objects (SEH): writes the copy c's ranged mode byte. Writing ON first clears the gun
+// stored at +0x28: the engine's ranged update stores the gun there afresh on every frame the mode is on, whatever +0x28 held
+// (decomp_43ab40.txt:12-13), so a later fire reads a gun stored after this write, never one left from the last time the mode
+// was on (a crossbow since swapped or freed). 1 written and read back, 0 no ranged combat object or it did not read back,
+// -1 faulted.
+static int RsWriteMode(void* c, int on)
+{
+    __try
+    {
+        char* rc = *(char* const*)((const char*)c + kRsCharRanged);
+        if (!RsPlaus(rc)) return 0;
+        if (on) *(void**)(rc + kRsRcGun) = 0;
+        *(unsigned char*)(rc + kRsRcCombatMode) = (unsigned char)(on ? 1 : 0);
+        return ((*(const unsigned char*)(rc + kRsRcCombatMode) != 0) == (on != 0)) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* the owner's word (1 on / 0 off); the byte last written here (-1 none, -2 ON held: no fire hook); the safe-point pass that wrote
+   ON (0 none); write-backs after the copy's byte changed back under this word; 1 = its owner left: written OFF once, then dropped */
+struct RmWant { int want; int wrote; unsigned int onPass; int reverts; int gone; };
+static std::map<unsigned int, RmWant> g_rmWant;   /* MAIN THREAD: uid of a copy -> its owner's ranged mode */
+static unsigned int g_rmPass = 0;   /* MAIN THREAD: the K2 safe-point pass count (RangedModeApplyDrain); 0 only before the first */
+
+// MAIN THREAD: the owner's ranged mode its last STATE carried for copy uid, -1 none.
+static int RangedModeWantOf(unsigned int uid)
+{
+    std::map<unsigned int, RmWant>::const_iterator it = g_rmWant.find(uid);
+    return (it == g_rmWant.end()) ? -1 : it->second.want;
+}
+
+// MAIN THREAD: false while copy uid's ranged mode was written ON in this same safe-point pass - its gun is the one the engine's
+// next ranged update stores (ShotFireDrain holds its fires until a later pass).
+static bool RangedModeSettledFor(unsigned int uid)
+{
+    std::map<unsigned int, RmWant>::const_iterator it = g_rmWant.find(uid);
+    return (it == g_rmWant.end()) ? true : coopstate::RangedModeOnSettled(it->second.onPass, g_rmPass);
+}
+
+// MAIN THREAD: the owner's ranged mode for copy uid (latchBits bits 15-16), kept for the safe point - from its STATE (spawn.cpp
+// ApplyState -> ApplyRemoteStance), and ON from its MSG_SHOT_FIRED (ApplyRemoteShotFired): the owner's fire comes from its ranged
+// update, which runs only while its mode is on (decomp_43ab40.txt:12, 31), so a fire stands in for an ON whose STATE was lost;
+// the owner's next STATE replaces it. A changed word restarts the write-back count. 1 the word is new or changed, 0 not.
+static int RangedModeNote(unsigned int uid, unsigned int latchBits)
+{
+    const int want = coopstate::RangedModeCarried(latchBits);
+    if (uid == 0 || want < 0 || net::IsUidMine(uid)) return 0;
+    std::map<unsigned int, RmWant>::iterator it = g_rmWant.find(uid);
+    if (it == g_rmWant.end())
+    {
+        RmWant w; w.want = want; w.wrote = -1; w.onPass = 0u; w.reverts = 0; w.gone = 0;
+        g_rmWant[uid] = w;
+        ++g_rmNoted;
+        return 1;
+    }
+    it->second.gone = 0;
+    if (it->second.want == want) return 0;
+    it->second.want = want;
+    it->second.reverts = 0;
+    ++g_rmNoted;
+    return 1;
+}
+
+// K2 safe point (MAIN THREAD, worker paused): each copy's ranged mode made its owner's. A copy gone, or handed to this game,
+// leaves the table unwritten: a copy handed here keeps the engine's own byte - the character is this game's now. An entry whose
+// owner left (RangedModeOwnerGone) is written OFF once if this game last wrote it ON, and leaves. A byte that changes back
+// kRangedModeRevertCap times under one owner word is not written again until the word changes (one line; rangedMode
+// revertStopped). Writing ON notes this pass: the copy fires from a later one (RangedModeSettledFor).
+static void RangedModeApplyDrain()
+{
+    g_rmPass = coopstate::RangedModePassNext(g_rmPass);
+    if (g_rmWant.empty() || EngineWritesBlocked()) return;
+    std::map<unsigned int, RmWant>::iterator it = g_rmWant.begin();
+    while (it != g_rmWant.end())
+    {
+        const unsigned int uid = it->first;
+        ::Character* c = net::IsUidMine(uid) ? 0 : FindSpawned(uid);
+        if (c == 0) { g_rmWant.erase(it++); continue; }
+        RmWant& w = it->second;
+        ++it;
+        const int v = coopstate::RangedModeWrite(w.want, RsReadMode(c));
+        if (w.gone)
+        {
+            if (w.wrote == 1 && v == 0)
+            {
+                const int rc = RsWriteMode(c, 0);
+                if (rc == 1) ++g_rmGoneOff;
+                if (g_rmLoggedCopy < kRmLogLimit)
+                {
+                    ++g_rmLoggedCopy;
+                    DebugLog("[SHOTGATE] RANGED-MODE copy uid=" + N3(uid) + " set OFF (its owner left) write=" + N3(rc)
+                             + (rc == 1 ? std::string(" ok") : std::string(rc == 0 ? " NOT TAKEN" : " FAULTED")));
+                }
+            }
+            g_rmWant.erase(uid);
+            continue;
+        }
+        if (v < 0) continue;
+        if (v == 1 && orig_p104Shoot == 0) { if (w.wrote != -2) { ++g_rmNoHook; w.wrote = -2; } continue; }
+        const bool again = (w.wrote == v);
+        if (again && !coopstate::RangedModeRevertsLeft(w.reverts)) continue;   /* stopped: the copy's engine keeps its byte until the owner's word changes */
+        const int rc = RsWriteMode(c, v);
+        if (rc == 1)
+        {
+            ++g_rmWritten;
+            w.wrote = v;
+            w.onPass = (v == 1) ? g_rmPass : 0u;
+            if (again) { ++g_rmReverted; ++w.reverts; }
+        }
+        else if (rc == 0) { ++g_rmNotTaken; w.wrote = -1; }
+        else { ++g_rmFault; w.wrote = -1; }
+        if (g_rmLoggedCopy < kRmLogLimit)
+        {
+            ++g_rmLoggedCopy;
+            DebugLog("[SHOTGATE] RANGED-MODE copy uid=" + N3(uid) + " set " + std::string(v ? "ON" : "OFF") + " (its owner's ranged mode)"
+                     + " write=" + N3(rc) + (rc == 1 ? std::string(" ok") : std::string(rc == 0 ? " NOT TAKEN" : " FAULTED"))
+                     + (again ? std::string(" - again: the copy's byte had changed back since the last write") : std::string()));
+        }
+        if (rc == 1 && again && !coopstate::RangedModeRevertsLeft(w.reverts))
+        {
+            ++g_rmRevertStopped;
+            if (g_rmLoggedStop < kRmLogLimit)
+            {
+                ++g_rmLoggedStop;
+                DebugLog("[SHOTGATE] RANGED-MODE copy uid=" + N3(uid) + " changed back " + N3((long long)w.reverts) + " times under its owner's "
+                         + std::string(v ? "ON" : "OFF") + " - not written again until its owner's word changes (rangedMode revertStopped "
+                         + N3(g_rmRevertStopped) + ")");
+            }
+        }
+        if (rc < 0) g_rmWant.erase(uid);   /* a faulting copy is not written every frame; its next STATE notes it again */
+    }
+}
+
+static void HandOwnerGone(unsigned int uid);   /* below: the copy's wanted hand item dropped */
+// MAIN THREAD. See combat.h.
+void RangedModeOwnerGone(unsigned int uid)
+{
+    HandOwnerGone(uid);   /* the copy's hands are left as its engine has them */
+    std::map<unsigned int, RmWant>::iterator it = g_rmWant.find(uid);
+    if (it == g_rmWant.end()) return;
+    it->second.want = 0;
+    it->second.gone = 1;
+    it->second.reverts = 0;
+}
+
+// MAIN THREAD: why a copy's fire was dropped, for its COPY-FIRE DROPPED line.
+static std::string RsNotReadyWhy(bool haveCopy, int ready, int why, int ownerWant)
+{
+    if (!haveCopy) return "no copy of the shooter here";
+    if (ready < 0) return "the copy's ranged combat object could not be read (faulted)";
+    if (why == 1) return "the copy has no ranged combat object (+0x2F0)";
+    if (why == 2)
+        return std::string("the copy's ranged mode (+0x36) is off - ")
+             + (ownerWant < 0 ? "no STATE has carried its owner's ranged mode"
+                              : (ownerWant ? "its owner's last STATE said ON" : "its owner's last STATE said OFF"));
+    if (why == 3) return "the copy's ranged mode is on but no gun is stored at +0x28 (its ranged update found no drawable crossbow)";
+    if (why == 4) return "the copy's ranged mode was written ON in the same safe-point pass (its gun is the engine's next store)";
+    return "the copy is not ready";
+}
+
+// MAIN THREAD, no C++ objects (SEH): the target t's logical position and whether it has an AI (+0x650, which shoot hands to
+// underRangedAttack 0x998E80 unchecked). 1 read, 0 faulted.
+static int RsTargetRead(const void* t, float* pos, int* hasAI)
+{
+    __try
+    {
+        const float* p = (const float*)((const char*)t + kRsCharPos);
+        pos[0] = p[0]; pos[1] = p[1]; pos[2] = p[2];
+        *hasAI = (*(void* const*)((const char*)t + kRsCharAI) != 0) ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// MAIN THREAD, no C++ objects (SEH): the engine's own fire routine (the hook's original, so the held-fire gate is not asked)
+// for the copy. prime: the gun holds no loaded bolt - one is put in first, which the fire takes out again. 1 ran, 0 faulted.
+static int RsFireCall(void* gun, ::Character* me, void* target, int stat, const float* aim, int prime)
+{
+    __try
+    {
+        if (prime) *(int*)((char*)gun + kRsGunLoaded) = 1;
+        orig_p104Shoot(gun, me, target, stat, aim);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// K2 safe point (MAIN THREAD, worker paused): each arrived owner fire is fired with its copy's own gun through the engine's fire
+// routine GunClass::shoot (decomp_43a390.txt). What shoot reads: the gun (its vtable, the loaded count +0x20 it decrements,
+// its bolt meshes +0xA8 / +0xB0, its projectile type +0x70), the shooter (its stats +0x450, its hand +0x58), the target (its
+// hand, its AI +0x650 for underRangedAttack; 0 = none) and the aim point - nothing from the aim step (updateT 0x4388D0). The
+// copy's gun is the one its own per-frame ranged update stores at +0x28 every frame while its ranged mode (+0x36) is on, and its
+// current stat is +0x30 (decomp_43ab40.txt:12-14, 32). The aim point is the owner's, moved with the target by how far it stands
+// here from where it stood there (shotgate.h AimHere). A fire whose copy is not ready - or whose copy's ranged mode was written ON
+// in this same pass (RangedModeSettledFor) - waits up to shotgate::kFireWaitMs.
+static void ShotFireDrain()
+{
+    if (g_shotFireQ.empty()) return;
+    const bool blocked = EngineWritesBlocked();
+    const unsigned int now = (unsigned int)::GetTickCount();
+    std::vector<ShotFire> keep;
+    for (size_t i = 0; i < g_shotFireQ.size(); ++i)
+    {
+        const ShotFire s = g_shotFireQ[i];
+        if (net::IsUidMine(s.f.shooterUid)) { ++g_cfNowOurs; continue; }   /* handed to this game since: its own engine fires now */
+        if (orig_p104Shoot == 0) { ++g_cfNoHook; continue; }
+        ::Character* c = blocked ? 0 : FindSpawned(s.f.shooterUid);
+        void* gun = 0;
+        int stat = 0, loaded = 0, why = 0;
+        int ready = (c != 0) ? RsCopyGun(c, &gun, &stat, &loaded, &why) : 0;
+        if (ready >= 0 && c != 0 && !RangedModeSettledFor(s.f.shooterUid)) { ready = 0; why = 4; ++g_cfOnPassWait; }   /* ON written this pass */
+        if (ready != 1)
+        {
+            if (!shotgate::FireWaitOver(s.at, now)) { keep.push_back(s); continue; }
+            if (c == 0) ++g_cfLapsedNoCopy;
+            else
+            {
+                ++g_cfLapsedNotReady;
+                if (ready == 0 && why == 2) ++g_cfLapsedModeOff;
+                else if (ready == 0 && why == 3) ++g_cfLapsedNoGun;
+            }
+            if (g_cfLogged < kRsLogLimit)
+            {
+                ++g_cfLogged;
+                DebugLog("[SHOTGATE] COPY-FIRE DROPPED shooter uid=" + N3(s.f.shooterUid) + " target uid=" + N3(s.f.targetUid) + " - "
+                         + RsNotReadyWhy(c != 0, ready, why, RangedModeWantOf(s.f.shooterUid))
+                         + " for " + N3((long long)shotgate::kFireWaitMs) + " ms: this bolt is not fired here");
+            }
+            continue;
+        }
+        ::Character* t = 0;
+        float hereAt[3] = { 0.0f, 0.0f, 0.0f };
+        int haveHere = 0;
+        if (s.f.targetUid != 0)
+        {
+            t = FindSpawned(s.f.targetUid);
+            int hasAI = 0;
+            if (t != 0 && RsTargetRead(t, hereAt, &hasAI) == 1)
+            {
+                haveHere = 1;
+                if (!hasAI) { ++g_cfTargetNoAI; t = 0; }
+            }
+            else { ++g_cfTargetAbsent; t = 0; }
+        }
+        else ++g_cfLookOnly;
+        float aim[3];
+        const int moved = shotgate::AimHere(s.f, haveHere, hereAt, aim);
+        const int prime = (loaded <= 0) ? 1 : 0;
+        if (!RsFireCall(gun, c, t, stat, aim, prime))
+        {
+            ++g_cfFault;
+            ErrorLog("[SHOTGATE] COPY-FIRE FAULTED inside GunClass::shoot shooter uid=" + N3(s.f.shooterUid) + " target uid="
+                     + N3(s.f.targetUid) + " - caught, not retried");
+            continue;
+        }
+        ++g_cfFired;
+        if (moved) ++g_cfMoved;
+        if (prime) ++g_cfPrimed;
+        // Only a bolt aimed at a player character this game runs can need its record (HitDecideAimed); keeping one for every
+        // NPC target would fill the table in a large fight and block a later aimed bolt's hit.
+        if (net::IsUidMineAnyThread(s.f.targetUid) && IsUidPlayerCharAnyThread(s.f.targetUid) == 1)
+        {
+            ShgLock();
+            shotgate::FiredHere(&g_shg, s.f.shooterUid, s.f.targetUid, now);
+            ShgUnlock();
+        }
+        if (g_cfLogged < kRsLogLimit)
+        {
+            ++g_cfLogged;
+            DebugLog("[SHOTGATE] COPY-FIRED #" + N3(g_cfFired) + " shooter uid=" + N3(s.f.shooterUid) + " (copy) target uid="
+                     + N3(s.f.targetUid) + (s.f.targetUid == 0 ? " (none: the look only)" : (t != 0 ? " (here)" : " (not here, or no AI)"))
+                     + " aim=(" + F1(aim[0]) + "," + F1(aim[1]) + "," + F1(aim[2]) + ") moved=" + N3((long long)moved)
+                     + " primed=" + N3((long long)prime) + " waited=" + N3((long long)(unsigned int)(now - s.at)) + "ms"
+                     + " - the owner's fire, fired here through the engine's shoot");
+        }
+    }
+    g_shotFireQ.swap(keep);
+}
+
+static void HandApplyDrain();   /* below: the owner's hand item on its copy (MSG_HAND) */
 // P104 fix, K2 safe point (MAIN THREAD, worker paused). See combat.h.
 void ShotSafePointDrain()
 {
@@ -2495,6 +3528,9 @@ void ShotSafePointDrain()
        which the ordinary per-frame tick must not do while the worker runs. Not while a world loads or tears down. */
     if (!EngineWritesBlocked()) ShotReactWatchTick();
     MeleeSafePointDrain();   /* MSG_MELEE_DECIDED: the attacker's game's blow on our NPC, through addWound, worker paused */
+    HandApplyDrain();   /* the owner's hand item drawn / put away on its copy (MSG_HAND), worker paused, before its fires */
+    RangedModeApplyDrain();   /* the owner's ranged mode on its copy (STATE bits 15-16), worker paused, before its fires */
+    ShotFireDrain();   /* MSG_SHOT_FIRED: the owner's fire, fired here with its copy's gun, worker paused */
     if (g_shotInQ.empty()) return;
     std::vector<ShotIn> q;
     q.swap(g_shotInQ);
@@ -2611,6 +3647,8 @@ void InstallRangedProbe()
 //   rangedtest <shooterUid> <targetUid> [crossbowSid [boltSid [boltCount]]]   the shooter must be OURS
 //   rangedtest report | rangedtest health <uid>
 //   rangedtest skill <uid> <0..100>   P104s: crossbows and precision shooting of an OWNED character (the aim cone)
+//   rangedtest show <uid|name:<Name>|spawned:<Template>>   READ ONLY, any character here (a copy too): its ranged mode, the gun
+//                                                          at +0x28, loaded bolts, its owner's last carried ranged mode, held items
 // P104f1: boltCount is ROUNDS (ammo items hold their rounds in chargesLeft; they do not stack).
 // T-310: TWO RECHECK lines (CombatTick), +2 s and +10 s after the order. One reload cycle is ~7 s (T686: the first bolt 7.0 s after
 // the order, then one every 7.0 s), so loaded=0 at +2 s is the engine's own reload running, not a fault; +10 s is the answer.
@@ -2666,7 +3704,7 @@ static void RangedTestRecheckTick()
 
 std::string RangedTestLever(const std::string& args)
 {
-    const std::string usage = "error rangedtest: usage rangedtest <shooterUid> <targetUid> [crossbowSid [boltSid [boltCount]]] | report | health <uid> | skill <uid> <0..100>";
+    const std::string usage = "error rangedtest: usage rangedtest <shooter> <target> (each a uid, name:<Name> or spawned:<Template>) [crossbowSid [boltSid [boltCount]]] | report | health <uid> | skill <uid> <0..100> | show <uid|name:<Name>|spawned:<Template>>";
     std::istringstream is(args);
     std::string first;
     if (!(is >> first)) return usage;
@@ -2725,9 +3763,40 @@ std::string RangedTestLever(const std::string& args)
         if (r1 != 1) return "error rangedtest skill: the write faulted (" + N3(r1) + ") " + l;
         return "ok rangedtest " + l;
     }
+    if (first == "show")   /* TEST-ONLY, read only: any character here, a copy too - it gives, orders and writes nothing */
+    {
+        std::string who, why;
+        unsigned int uid = 0;
+        if (!(is >> who)) return "error rangedtest show: usage rangedtest show <uid|name:<Name>|spawned:<Template>>";
+        const int nr = LeverNameUid(who, &uid, &why);
+        if (nr < 0) return "error rangedtest show: " + why;
+        if (nr == 0) uid = (unsigned int)strtoul(who.c_str(), 0, 10);
+        if (uid == 0) return "error rangedtest show: usage rangedtest show <uid|name:<Name>|spawned:<Template>>";
+        ::Character* c = FindSpawned(uid);
+        if (c == 0) return "error rangedtest show: no character for uid " + N3(uid);
+        int hasRc = 0, mode = -1, hasGun = 0, loaded = -1, tt = -1;
+        const int rdOk = RsReadRanged(c, &hasRc, &mode, &hasGun, &loaded, &tt);
+        const int ownerWant = RangedModeWantOf(uid);
+        const std::string l = "[P104] rangedtest show (TEST, read only) uid=" + N3(uid) + " mine=" + N3(net::IsUidMine(uid) ? 1 : 0)
+                            + " read=" + N3(rdOk) + " rc=" + N3(hasRc) + " rcCombatMode=" + N3(mode) + " gun=" + N3(hasGun)
+                            + " loaded=" + N3(loaded) + " turretHandType=" + N3(tt)
+                            + " ownerRangedMode=" + (ownerWant < 0 ? std::string("-") : std::string(ownerWant ? "ON" : "OFF"))
+                            + " held=" + RangedHeldItems(uid);
+        DebugLog(l);
+        return "ok rangedtest " + l;
+    }
+    // The shooter and target may be named as the other levers name them, so a character made during the run (a spawned NPC)
+    // can be armed and ordered: uid, name:<Name> or spawned:<Template>.
     unsigned int su = 0, tu = 0;
-    { std::istringstream fs(first); fs >> su; }
-    if (!(is >> tu) || su == 0 || tu == 0) return usage;
+    std::string second, why;
+    if (!(is >> second)) return usage;
+    const int ns = LeverNameUid(first, &su, &why);
+    if (ns < 0) return "error rangedtest: shooter " + why;
+    if (ns == 0) su = (unsigned int)strtoul(first.c_str(), 0, 10);
+    const int nt = LeverNameUid(second, &tu, &why);
+    if (nt < 0) return "error rangedtest: target " + why;
+    if (nt == 0) tu = (unsigned int)strtoul(second.c_str(), 0, 10);
+    if (su == 0 || tu == 0) return usage;
     std::string xbow, bolt;
     int boltCount = 30;
     if (is >> xbow) { if (is >> bolt) { int bc = 0; if ((is >> bc) && bc > 0) boltCount = bc; } }
@@ -3328,9 +4397,323 @@ std::string GroundFindLever(const std::string& args)
 }
 // T-310 groundline / groundfind: END
 
+// The six stance buttons of a character (block, ranged, taunt, hold, passive, chase) are saved modes the engine keeps one byte
+// each. Its own setter is Character vtable slot +0x308 (character, modeId, byte) - the call the save loader
+// (Character::loadFromSerialise 0x6264C0) makes for each saved mode; the getter 0x5C8C30 reads the same bytes. Five sit in the
+// stats object (Character +0x450): block id 0xB at +0x128, ranged 0x11 +0x129, taunt 0xE +0x12A, hold ("non combat mode") 0xC
+// +0x12B, passive 0xD +0x12C; chase 0xF at Character +0x650 -> +0x20 -> +0x35. Steam_1.0.65: slot +0x308 of the Character
+// (0x16F8D88) and CharacterHuman (0x16F1718) vtables is the thunk 0x2DE84 -> 0x5C9FC0, which switches on the id and writes those
+// bytes - block on only when the character's vtable +0x250 answers non-zero, and nothing at all when the object its vtable +0x58
+// returns has 0 at +0x250. The setter is called on the main thread, as the panel's buttons call it.
+namespace { bool PlausibleObject(const void* p); }   /* defined below in this file's unnamed namespace */
+const int kStanceN = 6;
+const char* const kStanceName[kStanceN] = { "block", "ranged", "taunt", "hold", "passive", "chase" };
+const unsigned int kStanceId[kStanceN] = { 0xB, 0x11, 0xE, 0xC, 0xD, 0xF };
+const size_t kStanceStatsOff[kStanceN - 1] = { 0x128, 0x129, 0x12A, 0x12B, 0x12C };   /* in the stats object; chase is elsewhere */
+const size_t kStanceCharStats = 0x450;   /* Character: its stats object */
+const size_t kStanceChaseA = 0x650, kStanceChaseB = 0x20, kStanceChaseByte = 0x35;   /* Character +0x650 -> +0x20 -> byte +0x35 */
+const size_t kStanceSetSlot = 0x308;     /* Character vtable: set a saved mode (id, byte) */
+typedef void (*StanceSetFn)(void* character, unsigned int modeId, char value);
+
+/* ANY THREAD, fault-guarded (no object with a destructor here): the six bytes in kStanceName order, 0xFF for a byte not read.
+   False when any could not be read. */
+static bool StanceReadPod(const void* c, unsigned char* out)
+{
+    for (int i = 0; i < kStanceN; ++i) out[i] = 0xFF;
+    if (c == 0) return false;
+    __try
+    {
+        const char* st = *(const char* const*)((const char*)c + kStanceCharStats);
+        if (st != 0)
+            for (int i = 0; i < kStanceN - 1; ++i) out[i] = *(const unsigned char*)(st + kStanceStatsOff[i]);
+        const char* a = *(const char* const*)((const char*)c + kStanceChaseA);
+        const char* b = (a != 0) ? *(const char* const*)(a + kStanceChaseB) : 0;
+        if (b != 0) out[kStanceN - 1] = *(const unsigned char*)(b + kStanceChaseByte);
+        return st != 0 && b != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+/* MAIN THREAD, fault-guarded: the engine's own setter through the character's own vtable slot +0x308. 1 called, 0 no slot,
+   -1 faulted. *slot = the function the slot holds (for the log). */
+static int StanceSetPod(void* c, unsigned int modeId, char value, uintptr_t* slot)
+{
+    *slot = 0;
+    __try
+    {
+        const uintptr_t* vt = *(const uintptr_t* const*)c;
+        if (vt == 0) return 0;
+        *slot = vt[kStanceSetSlot / sizeof(uintptr_t)];
+        if (*slot == 0) return 0;
+        ((StanceSetFn)*slot)(c, modeId, value);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* T-1101 step 3 (T1626: stanceApplied=0, stanceNotTaken=23). The setter 0x5C9FC0 returns at once unless the character's faction
+   (vtable +0x58) has a player controller at +0x250 - only this game's own player faction has one; a copy of another player's
+   character lives in that player's stand-in faction (07-bug-classes 'An engine rule gated on "player faction"'; fixed per SITE
+   here, the engine rule is not changed). So for a COPY the setter's own effects are written here, as decomp_5c9fc0:106-151
+   writes them: AI = Character +0x650, its orders object AI +0x20, its task factory AI +0x2A8. The rows below are only called. */
+static unsigned long long kStRemoveTasks = 0; static coop::AddrReg kStRemoveTasks_reg("OrdersReceiver_removeTasksOfType", &kStRemoveTasks);   /* Steam_1.0.65 0x506900, 1.0.68 0x507390 */   /* void (orders, int taskType) */
+static unsigned long long kStHasTask = 0; static coop::AddrReg kStHasTask_reg("OrdersReceiver_hasTaskOfType", &kStHasTask);   /* Steam_1.0.65 0x5069B0, 1.0.68 0x507440 */   /* bool (orders, int taskType) */
+static unsigned long long kStAddTask = 0; static coop::AddrReg kStAddTask_reg("OrdersReceiver_addTask", &kStAddTask);   /* Steam_1.0.65 0x506EC0, 1.0.68 0x507950 */   /* void (orders, task) */
+static unsigned long long kStTaskCreate = 0; static coop::AddrReg kStTaskCreate_reg("TaskFactory_create", &kStTaskCreate);   /* Steam_1.0.65 0x32EB90, 1.0.68 0x32EBD0 */   /* task* (factory, type, hand*, int, float, Vector3*, int, int) */
+static unsigned long long kStSetJobMode = 0; static coop::AddrReg kStSetJobMode_reg("OrdersReceiver_setJobMode", &kStSetJobMode);   /* Steam_1.0.65 0x507780, 1.0.68 0x508210 */   /* void (orders, char) - chase */
+static unsigned long long kStHandVt = 0; static coop::AddrReg kStHandVt_reg("HandVt", &kStHandVt);   /* Steam_1.0.65 0x16842D0, 1.0.68 0x16852D0 - hand's vtable, for the empty hand */
+const size_t kStanceAi = 0x650, kStanceAiOrders = 0x20, kStanceAiFactory = 0x2A8;
+const size_t kStanceCanBlockSlot = 0x250;   /* Character vtable: non-zero = this class may switch block on (human 0x5E4F30 yes) */
+const size_t kStancePosSlot = 0x40;         /* Character vtable: Vector3* (self, Vector3* out) - its position */
+const size_t kStanceHoldPos = 0x130;        /* stats object: the hold position (Vector3) */
+const int kStanceHoldTaskType = 0x10;
+/* the game's hand, 0x20 bytes, filled as the setter fills its empty hand: hand::vftable, type 0xB, the rest 0 */
+struct StEmptyHand { void* vtbl; int type; unsigned int container, containerStamp, index, serial; };
+typedef char StEmptyHandIs0x20[(sizeof(StEmptyHand) == 0x20) ? 1 : -1];
+typedef void  (*StRemoveTasksFn)(void* orders, int taskType);
+typedef bool  (*StHasTaskFn)(void* orders, int taskType);
+typedef void  (*StAddTaskFn)(void* orders, void* task);
+typedef void* (*StTaskCreateFn)(void* factory, int taskType, void* hand, int a4, float a5, const float* at, int a7, int a8);
+typedef void  (*StSetJobModeFn)(void* orders, char on);
+typedef void* (*StCanBlockFn)(void* character);
+typedef float* (*StPosFn)(void* character, float* out);
+
+/* MAIN THREAD, fault-guarded, PODs only (C2712): button idx (kStanceName order) of a COPY set to v by the setter's own effects.
+   1 written, 0 not written (an address row missing, the class may not switch block on - as the setter refuses it - or an object
+   missing), -1 faulted. *hold: +1 a hold task added, -1 hold tasks removed, 0 neither. */
+static int StanceCopyWritePod(void* c, int idx, unsigned char v, int* hold)
+{
+    *hold = 0;
+    __try
+    {
+        const uintptr_t* vt = *(const uintptr_t* const*)c;
+        char* st = *(char* const*)((const char*)c + kStanceCharStats);
+        char* ai = *(char* const*)((const char*)c + kStanceAi);
+        void* orders = (ai != 0) ? *(void* const*)(ai + kStanceAiOrders) : 0;
+        if (vt == 0 || st == 0) return 0;
+        const unsigned int id = kStanceId[idx];
+        if (id == 0xB)
+        {
+            if (v != 0 && ((StCanBlockFn)vt[kStanceCanBlockSlot / sizeof(uintptr_t)])(c) == 0) return 0;
+            st[kStanceStatsOff[idx]] = (char)v;
+            return 1;
+        }
+        if (id == 0x11 || id == 0xE || id == 0xD)
+        {
+            st[kStanceStatsOff[idx]] = (char)v;
+            return 1;
+        }
+        if (id == 0xF)
+        {
+            if (kStSetJobMode == 0 || orders == 0) return 0;
+            ((StSetJobModeFn)coop::AddrAbs(kStSetJobMode))(orders, (char)v);
+            return 1;
+        }
+        if (id != 0xC || orders == 0) return 0;
+        if (v == 0)
+        {
+            if (kStRemoveTasks == 0 || kStHasTask == 0) return 0;
+            const bool had = ((StHasTaskFn)coop::AddrAbs(kStHasTask))(orders, kStanceHoldTaskType);
+            st[kStanceStatsOff[idx]] = 0;
+            ((StRemoveTasksFn)coop::AddrAbs(kStRemoveTasks))(orders, kStanceHoldTaskType);
+            if (had) *hold = -1;
+            return 1;
+        }
+        void* factory = *(void* const*)(ai + kStanceAiFactory);
+        if (kStHasTask == 0 || kStAddTask == 0 || kStTaskCreate == 0 || kStHandVt == 0 || factory == 0) return 0;
+        st[kStanceStatsOff[idx]] = 1;
+        float buf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const float* p = ((StPosFn)vt[kStancePosSlot / sizeof(uintptr_t)])(c, buf);
+        if (p != 0)
+        {
+            float* hp = (float*)(st + kStanceHoldPos);
+            hp[0] = p[0]; hp[1] = p[1]; hp[2] = p[2];
+        }
+        if (!((StHasTaskFn)coop::AddrAbs(kStHasTask))(orders, kStanceHoldTaskType))
+        {
+            StEmptyHand h;
+            h.vtbl = (void*)coop::AddrAbs(kStHandVt); h.type = 0xB;
+            h.container = 0; h.containerStamp = 0; h.index = 0; h.serial = 0;
+            const float zero[3] = { 0.0f, 0.0f, 0.0f };   /* Ogre::Vector3::ZERO */
+            void* task = ((StTaskCreateFn)coop::AddrAbs(kStTaskCreate))(factory, kStanceHoldTaskType, &h, 3, 1.0f, zero, 0, 100);
+            if (task != 0)
+            {
+                ((StAddTaskFn)coop::AddrAbs(kStAddTask))(orders, task);
+                *hold = 1;
+            }
+        }
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static std::string StanceByte(unsigned char v)
+{
+    return v == 0xFF ? std::string("?") : N3((long long)v);
+}
+
+static std::string StanceText(const unsigned char* b)
+{
+    std::string t;
+    for (int i = 0; i < kStanceN; ++i) t += std::string(i ? " " : "") + kStanceName[i] + "=" + StanceByte(b[i]);
+    return t;
+}
+
+/* MAIN THREAD (the command channel). `stancetest <uid> <block|ranged|taunt|hold|passive|chase> <0|1>`: that stance of a character
+   this game runs set through the engine's own setter, then read back; `stancetest <uid> show`: the six bytes of any loaded
+   character (own or copy). One [TEST] stancetest line each. */
+std::string StanceTestLever(const std::string& args)
+{
+    std::istringstream is(args);
+    std::string us, what, val, extra;
+    is >> us >> what >> val >> extra;
+    const std::string usage = "stancetest <uid> block|ranged|taunt|hold|passive|chase 0|1 | stancetest <uid> show";
+    unsigned long long u64 = 0;
+    bool digits = !us.empty() && us.size() <= 10;
+    for (size_t i = 0; digits && i < us.size(); ++i)
+    {
+        if (us[i] < '0' || us[i] > '9') digits = false;
+        else u64 = u64 * 10 + (unsigned long long)(us[i] - '0');
+    }
+    const unsigned int uid = (digits && u64 <= 0xFFFFFFFFULL) ? (unsigned int)u64 : 0;
+    int idx = -1;
+    for (int i = 0; i < kStanceN; ++i) if (what == kStanceName[i]) idx = i;
+    const bool show = (what == "show");
+    const bool argsOk = uid != 0 && extra.empty()
+                        && (show ? val.empty() : (idx >= 0 && (val == "0" || val == "1")));
+    if (!argsOk) { DebugLog("[TEST] stancetest usage: " + usage); return "error stancetest usage: " + usage; }
+    const std::string su = N3((long long)uid);
+    ::Character* c = FindSpawned(uid);
+    if (c == 0 || !PlausibleObject(c))
+    {
+        DebugLog("[TEST] stancetest uid=" + su + " refused: no such character is loaded here");
+        return "error stancetest: uid " + su + " is not loaded here";
+    }
+    std::string name;
+    if (!NameOf(c, &name) || name.empty()) name = "?";
+    const bool mine = net::IsUidMine(uid);
+    unsigned char b[kStanceN];
+    if (show)
+    {
+        const bool ok = StanceReadPod(c, b);
+        DebugLog("[TEST] stancetest show uid=" + su + " " + name + (mine ? " own " : " copy ") + StanceText(b)
+                 + (ok ? "" : " (not all readable)"));
+        return ok ? "ok stancetest show" : "error stancetest show: not all readable";
+    }
+    if (!mine)
+    {
+        DebugLog("[TEST] stancetest uid=" + su + " " + name + " refused: a copy - its owner's game runs it");
+        return "error stancetest: uid " + su + " is not run here";
+    }
+    if (EngineWritesBlocked())
+    {
+        DebugLog("[TEST] stancetest uid=" + su + " refused: a world is loading or tearing down");
+        return "error stancetest: engine writes blocked";
+    }
+    StanceReadPod(c, b);
+    const unsigned char want = (val == "1") ? 1 : 0;
+    uintptr_t slot = 0;
+    const int rc = StanceSetPod(c, kStanceId[idx], (char)want, &slot);
+    unsigned char a[kStanceN];
+    StanceReadPod(c, a);
+    const bool took = (rc == 1 && a[idx] == want);
+    char where[96];
+    if (idx == kStanceN - 1)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "id 0x%X, +0x650->+0x20->+0x35; vt+0x308 = rva 0x%llX", kStanceId[idx],
+                    slot != 0 ? (unsigned long long)(slot - (uintptr_t)::GetModuleHandleA(0)) : 0ULL);
+    else
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "id 0x%X, stats+0x%X; vt+0x308 = rva 0x%llX", kStanceId[idx],
+                    (unsigned int)kStanceStatsOff[idx],
+                    slot != 0 ? (unsigned long long)(slot - (uintptr_t)::GetModuleHandleA(0)) : 0ULL);
+    DebugLog("[TEST] stancetest uid=" + su + " " + name + " " + what + " " + StanceByte(b[idx]) + "->" + StanceByte(a[idx])
+             + " (" + where + ")"
+             + (rc == 1 ? (took ? " took" : " DID NOT TAKE (the setter returned without writing it)")
+                : rc == 0 ? " NOT CALLED (no vtable slot)" : " SETTER FAULTED")
+             + " now " + StanceText(a));
+    if (took) return "ok stancetest uid=" + su + " " + what + "=" + StanceByte(a[idx]);
+    return "error stancetest: uid " + su + " " + what + " is " + StanceByte(a[idx]) + " after the call";
+}
+
+#ifdef SW_DEV_BUILD
+// PROBE-START: P181 - T-1101: the stance of a player character on its owner's game; the stance of its copy at each combat order,
+// swing and hit on the other game
+/* LOG ONLY, MAIN THREAD. Owner side: a line the first time a player character this game runs is seen and each time any of its
+   six stance bytes changes (CombatModeTick, every frame). Copy side, for the copy of another game's player character: a line
+   at each COMBATMODE order applied to it (ApplyRemoteCombatMode), at each swing it starts here (CombatModeTick's state edge into
+   SWORD_SWING), and - on the victim's game - at each hit its swing makes on our own character, with the engine's result (2
+   landed, 5 blocked) and the copy's stance bytes. At most 400 lines a game life, at most 200 of them copy / hit lines. */
+const long long kP181LineCap = 400, kP181CopyCap = 200;
+long long g_p181Lines = 0, g_p181CopyLines = 0;
+std::map<unsigned int, unsigned long long> g_p181OwnSeen;   /* uid -> its six bytes, packed */
+
+static bool P181Room(bool copyLine)
+{
+    return g_p181Lines < kP181LineCap && (!copyLine || g_p181CopyLines < kP181CopyCap);
+}
+
+static void P181Line(bool copyLine, const std::string& s)
+{
+    if (!P181Room(copyLine)) return;
+    ++g_p181Lines;
+    if (copyLine) ++g_p181CopyLines;
+    DebugLog("[PROBE] P181 " + s + (g_p181Lines == kP181LineCap ? " (cap: the last P181 line)" : ""));
+}
+
+static void P181OwnerCheck(unsigned int uid, const ::Character* c)
+{
+    if (!P181Room(false) || IsUidPlayerCharAnyThread(uid) != 1) return;
+    unsigned char b[kStanceN];
+    StanceReadPod(c, b);
+    unsigned long long packed = 0;
+    for (int i = 0; i < kStanceN; ++i) packed |= (unsigned long long)b[i] << (8 * i);
+    std::map<unsigned int, unsigned long long>::iterator it = g_p181OwnSeen.find(uid);
+    const bool first = (it == g_p181OwnSeen.end());
+    if (!first && it->second == packed) return;
+    g_p181OwnSeen[uid] = packed;
+    P181Line(false, "owner uid=" + N3((long long)uid) + " stance " + StanceText(b) + (first ? " first" : ""));
+}
+
+static void P181CopyOrder(unsigned int uid, const ::Character* c, bool on, unsigned int targetUid)
+{
+    if (!P181Room(true) || IsUidPlayerCharAnyThread(uid) != 1) return;
+    unsigned char b[kStanceN];
+    StanceReadPod(c, b);
+    P181Line(true, "copy uid=" + N3((long long)uid) + " order " + (on ? "on" : "off") + " target=" + N3((long long)targetUid)
+                   + " copyStance " + StanceText(b));
+}
+
+static void P181CopySwing(unsigned int uid, ::Character* c, CombatClass* cc)
+{
+    if (!P181Room(true) || IsUidPlayerCharAnyThread(uid) != 1) return;
+    unsigned int tgt = 0;
+    hand t = cc->currentTarget();
+    ::Character* tc = t.getCharacter();
+    if (PlausibleObject(tc)) tgt = FindSpawnedUid(tc);
+    unsigned char b[kStanceN];
+    StanceReadPod(c, b);
+    P181Line(true, "copy uid=" + N3((long long)uid) + " swing target=" + N3((long long)tgt) + " copyStance " + StanceText(b));
+}
+
+static void P181CopyHit(unsigned int victimUid, unsigned int attackerUid, int result, unsigned char knock)
+{
+    if (!P181Room(true) || attackerUid == 0 || net::IsUidMine(attackerUid) || IsUidPlayerCharAnyThread(attackerUid) != 1) return;
+    unsigned char b[kStanceN];
+    StanceReadPod(FindSpawned(attackerUid), b);
+    P181Line(true, "hit victim=" + N3((long long)victimUid) + " attacker=" + N3((long long)attackerUid) + " result=" + N3((long long)result)
+                   + (result == 2 ? " landed" : result == 5 ? " blocked" : "") + " knock=" + N3((long long)knock)
+                   + " copyStance " + StanceText(b));
+}
+// PROBE-END: P181
+#endif
+
+static void StanceChangeDrain();   /* T-1101 step 4, defined with fight parity below */
+static void FpBlockPickDrain();    /* T-1101 step 5, defined with fight parity below */
+static void FightChoiceDrain();    /* T-1101 design (c), defined below fight parity */
+
 void CombatTick()
 {
     RangedEventsDrain();   /* P104: the shot / ranged-hit lines, main thread */
+    ShotCreditLogDrain();   /* the shot credit's hold lines */
     RangedTestRecheckTick();   /* P104f1: the lever's +2 s re-read, main thread */
     /* T-311 fold 1: ShotReactWatchTick runs in ShotSafePointDrain now (the K2 safe point, worker paused - F617) */
     GroundLineTick();   /* T-310: the groundline / groundfind jobs, main thread */
@@ -3340,6 +4723,11 @@ void CombatTick()
     while (g_hitRead != g_hitWrite)
     {
         const PendingHit& h = g_hitQueue[g_hitRead & kHitQueueMask];
+#ifdef SW_DEV_BUILD
+        // PROBE-START: P181 - a hit on our own character from the copy of another game's player character
+        P181CopyHit(h.uid, h.attackerUid, h.p181Result, h.knock);
+        // PROBE-END: P181
+#endif
 
         // P012 (F113): log the first few emissions in full so `emitted` can be ATTRIBUTED
         // rather than believed. Bounded, because an ambient world produces these steadily
@@ -3384,13 +4772,19 @@ void CombatTick()
         float blood = 0.0f;
         int nParts = SnapshotHealth(h.uid, rec, 32, &blood);
 
+        hitwire::Blow blow;
+        const bool blowOk = BlowWire(h, &blow);   /* fight parity: what this engine decided, for the other games' replay */
         const bool sent = net::SendHit(h.uid, h.attackerUid, h.cutDir, h.damages, h.comboId,
-                                       rec, nParts, blood, h.attackerId, h.knock);
+                                       rec, nParts, blood, h.attackerId, h.knock, 0, blowOk ? &blow : 0);
+        if (sent) InterlockedIncrement64(blowOk ? &g_fpBlowSent : &g_fpBlowUnsent);
         if (sent && h.knock) ++g_knockSent;   // K2
         InterlockedExchange(&g_hitRead, g_hitRead + 1);
     }
     PlayerCharTableTick();   /* the player-character table the AI worker's melee hit reads (spawn.cpp), every 0.5 s */
     MeleeDecidedDrain();     /* our landed blows on another game's NPC copies -> MSG_MELEE_DECIDED */
+    StanceChangeDrain();     /* T-1101 step 4: a stance button changed on our own player character -> one STATE at once */
+    FpBlockPickDrain();      /* T-1101 step 5: our engine's block picks for our own player character against other players -> BLOCK_PICK */
+    FightChoiceDrain();      /* T-1101 design (c): our player characters' fight choices -> FIGHT_CHOICE; the applied-choice lines */
 }
 
 void ReportCombat()
@@ -3454,6 +4848,1044 @@ void ReportCombat()
     GroundLineReport();     /* T-310: the groundline / groundfind counters */
 }
 
+// ===========================================================================================
+// THE SWING GATE - a copy of another player's character swings only after its owner's real swing.
+//
+// The copy's own engine AI is released while it fights (ApplyRemoteCombatMode), and on its own it starts swings its owner
+// never threw - also while the owner stands on BLOCK. The engine starts every swing in AttackState::initialiseAttack
+// (1.0.65 0x2B4530 / 1.0.68 0x2B4570, address row AttackState_initialiseAttack), called through its jump stub from
+// AttackState's initialise (0x2B4AB0), which treats a 0 answer as "no technique fits this gap": it does not start the swing and
+// walks the character toward its target (decomp_2b4ab0.txt:10-20); the combat state machine stays in STARTUP and asks again
+// next frame (decomp_60c620.txt). Declining here runs NONE of the original, so nothing of a swing is half set - the same as the
+// original's own early `return 0` for a missing target.
+//
+// Each MSG_SWING from the owner's game is one credit for its copy (ApplyRemoteSwing -> SwingCreditAdd); an attack start of
+// that copy spends one or is declined. The rule and its numbers are src/common/swinggate.h. This game's own characters, NPC
+// copies and world NPCs always run the original.
+//
+// THREAD: the engine's combat update runs this (the same chain as Character::hitByMeleeAttack, which runs on the AI worker -
+// F095); the first caller's thread id is recorded and shown on the [M6] REPORT line beside the main thread's. Everything
+// here is safe on any thread: the character is read under __try, the uid and the player-character answer come from the
+// lock-free any-thread tables (FindSpawnedUid, IsUidMineAnyThread, IsUidPlayerCharAnyThread), and the credit store is one POD
+// behind a short spin lock that no engine call is ever made under. No allocation, no log on this path.
+// ===========================================================================================
+static unsigned long long kSgAttackStart = 0; static coop::AddrReg kSgAttackStart_reg("AttackState_initialiseAttack", &kSgAttackStart);   /* Steam_1.0.65 0x2B4530, 1.0.68 0x2B4570 */
+
+static swinggate::Store g_sg;                  /* zero before any constructor runs; read and written only under g_sgLock */
+static volatile LONG    g_sgLock = 0;
+static int              g_sgHook = 0;          /* 1 hooked, 0 AddHook failed, -1 no address for this game (the gate is off) */
+static volatile LONG    g_sgThread = 0;        /* the first thread that started an attack through the hook */
+static volatile LONG64  g_sgUnread = 0;        /* attack starts whose character could not be read - passed, never declined */
+static long long        g_sgEndSent = 0;       /* SWING_END sent: a swing of ours that sent SWING ended (main thread) */
+static long long        g_sgEndRecv = 0;       /* SWING_END received (main thread) */
+static unsigned long long (*orig_sgAttackStart)(void* state, void* target) = 0;
+
+static void SgLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_sgLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+static void SgUnlock() { InterlockedExchange(&g_sgLock, 0); }
+
+// The character whose attack is starting: AttackState +8 is its CombatClass, CombatClass +0x188 its `me` (ai_spike.cpp reads
+// the same field). POD only, __try (C2712: no std::string here). 0 when anything is unreadable.
+static ::Character* SgCharacterOf(void* state)
+{
+    __try
+    {
+        if (!PlausibleObject(state)) return 0;
+        void* cc = *(void* const*)((const char*)state + 8);
+        if (!PlausibleObject(cc)) return 0;
+        ::Character* c = *(::Character* const*)((const char*)cc + 0x188);
+        return PlausibleObject(c) ? c : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// The uid of the character this attack is aimed at: the engine's own argument, or - when the caller passed none - the
+// CombatClass's current target (+0x290, which is what AttackState's initialise passes, decomp_2b4ab0.txt:10). 0 when neither
+// reads or the target is no replicated character: such an attack matches only a credit whose owner swing named no target.
+// The engine's own fallback for a null argument (0x608DA0, a target choice) is not called from here: no engine call on this
+// thread. POD only, __try (C2712).
+static unsigned int SgTargetUid(void* state, void* target)
+{
+    __try
+    {
+        const void* t = target;
+        if (t == 0)
+        {
+            void* cc = *(void* const*)((const char*)state + 8);
+            if (PlausibleObject(cc)) t = *(const void* const*)((const char*)cc + 0x290);
+        }
+        return PlausibleObject(t) ? FindSpawnedUid(t) : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// FIGHT PARITY, the attack move (see FIGHT PARITY above ApplyRemoteHit): each SWING carries the move its owner's swing started
+// (hitwire.h), kept with the swing credit (swinggate.h MoveFor). While the engine starts a copy's swing on such a credit (the
+// detour below, any thread), this thread's TLS slot names the carried move and the copy's CombatTechnique (CombatClass +0x190,
+// the object initialiseAttack asks, decomp_2b4530); CombatTechnique_pickAttack (1.0.65 0x887160 / 1.0.68 0x888030) then answers
+// the carried move when the copy's own list of moves for this gap holds it. The picker builds that list (weapon, race, skill,
+// reach - 0x886800) and rolls one; it writes nothing but a reach it recomputes from scratch on each call (decomp_887160:52,
+// decomp_886800), so it is asked again until it answers the carried name (at most kFpMoveTries rolls). Never a move from outside
+// the copy's list - the engine's play 0x5B6D70 uses the move's animation without a null check. Not answered: the engine's first
+// pick stands (moveFallback).
+static DWORD g_fpTls = TLS_OUT_OF_INDEXES;   /* TlsAlloc, not __declspec(thread): this DLL is loaded after the process started */
+struct FpMoveWant
+{
+    const void* tech;                        /* the copy's CombatTechnique: the object the picker is asked on */
+    char        name[hitwire::kNameBuf];     /* the carried move */
+};
+typedef void* (*FpPickAttackFn)(void* tech, float gap, float p3, void* lastMove, unsigned char p5);
+static FpPickAttackFn orig_fpPickAttack = 0;
+
+// DETOUR, any thread (every attack-move pick). The engine's pick unless this thread is starting a credited copy swing on tech.
+static void* detour_fpPickAttack(void* tech, float gap, float p3, void* lastMove, unsigned char p5)
+{
+    const FpMoveWant* w = (g_fpTls != TLS_OUT_OF_INDEXES) ? (const FpMoveWant*)::TlsGetValue(g_fpTls) : 0;
+    void* const first = orig_fpPickAttack(tech, gap, p3, lastMove, p5);
+    if (w == 0 || w->tech != tech) return first;
+    if (first == 0) { InterlockedIncrement64(&g_fpMoveNoMove); return 0; }
+    void* m = first;
+    for (int i = 0; m != 0; ++i)
+    {
+        if (FpNameIs(m, 0x0, w->name)) { InterlockedIncrement64(i == 0 ? &g_fpMoveSame : &g_fpMoveForced); return m; }
+        if (i >= kFpMoveTries) break;
+        m = orig_fpPickAttack(tech, gap, p3, lastMove, p5);
+    }
+    InterlockedIncrement64(&g_fpMoveFallback);
+    return first;
+}
+
+// Any thread (detour_sgAttackStart, a credited copy swing): the move of the credit this start would spend, named in this thread's
+// TLS slot for the picker. False (nothing set) when the move is not forced: no hook, no move carried, no CombatTechnique.
+static bool FpMoveArm(FpMoveWant* w, void* state, unsigned int uid, unsigned int tgt)
+{
+    w->tech = 0;
+    w->name[0] = 0;
+    if (g_fpHookMove != 1 || g_fpTls == TLS_OUT_OF_INDEXES) return false;
+    SgLock();
+    const int named = swinggate::MoveFor(&g_sg, uid, tgt, (unsigned int)::GetTickCount(), w->name);
+    SgUnlock();
+    if (!named) { InterlockedIncrement64(&g_fpMoveNotCarried); return false; }
+    w->tech = FightPtrAt(FightPtrAt(state, 8), 0x190);
+    return w->tech != 0 && ::TlsSetValue(g_fpTls, w) != 0;
+}
+
+// DETOUR, any thread (see above). 0 = the engine's own "no swing now" answer; otherwise the original's answer, untouched. A
+// gated copy's credit is spent only after the original has answered, and only when its answer's low byte (the caller tests
+// AL, decomp_2b4ab0.txt:10-11) says the swing started: the original itself answers 0 when no technique fits the gap, and the
+// engine asks again next frame. The lock is never held across the engine's call.
+static unsigned long long detour_sgAttackStart(void* state, void* target)
+{
+    if (g_sgThread == 0) InterlockedExchange(&g_sgThread, (LONG)::GetCurrentThreadId());
+    ::Character* c = SgCharacterOf(state);
+    unsigned int uid = 0;
+    int mine = 0, pc = -1;
+    if (c == 0) InterlockedIncrement64(&g_sgUnread);
+    else
+    {
+        uid = FindSpawnedUid(c);
+        if (uid != 0)
+        {
+            mine = net::IsUidMineAnyThread(uid) ? 1 : 0;
+            if (!mine) pc = IsUidPlayerCharAnyThread(uid);
+        }
+    }
+    const unsigned int tgt = (uid != 0 && !mine && pc == 1) ? SgTargetUid(state, target) : 0;
+    SgLock();
+    const int v = swinggate::Before(&g_sg, uid, mine, pc, tgt, (unsigned int)::GetTickCount());
+    SgUnlock();
+    if (v == swinggate::kDecline) return 0;
+    FpMoveWant want;   /* fight parity: the credit's attack move, for the picker inside the original */
+    const bool wantMove = (v == swinggate::kRunThenSettle) && FpMoveArm(&want, state, uid, tgt);
+    const unsigned long long r = orig_sgAttackStart(state, target);
+    if (wantMove) ::TlsSetValue(g_fpTls, 0);
+    if (v == swinggate::kRunThenSettle)
+    {
+        SgLock();
+        swinggate::After(&g_sg, uid, tgt, (unsigned int)::GetTickCount(), (r & 0xFF) != 0 ? 1 : 0);
+        SgUnlock();
+    }
+    if ((r & 0xFF) != 0 && uid != 0 && g_fight.accepted < fightlog::kCap)
+    {
+        /* a player character's swing really started: name the move initialiseAttack stored (its CombatClass is AttackState +8) */
+        const int player = mine ? IsUidPlayerCharAnyThread(uid) : pc;
+        if (player == 1)
+            FightNoteSwing(FightPtrAt(state, 8), uid, mine, (tgt != 0) ? tgt : SgTargetUid(state, target));
+    }
+    return r;
+}
+
+// MAIN THREAD (ApplyRemoteSwing): the owner's game reports a real swing start of uid at targetUid with its attack move - one
+// credit for that target, holding that move, for its copy here. An NPC's copy is not gated, so it gets none; a copy the player-character table has not classified yet
+// does (it is gated as soon as it is classified a player character). Returns 1 when a credit was stored.
+static int SwingCreditAdd(unsigned int uid, unsigned int targetUid, const char* move)
+{
+    if (g_sgHook != 1 || uid == 0) return 0;
+    if (IsUidPlayerCharAnyThread(uid) == 0) return 0;
+    SgLock();
+    const int stored = swinggate::Add(&g_sg, uid, targetUid, (unsigned int)::GetTickCount(), move);
+    SgUnlock();
+    return stored;
+}
+
+// MAIN THREAD (ApplyRemoteCombatMode): the owner's combat-off for uid arrived - every credit its copy still holds is dropped
+// (counted dropCombatOff), so a blow the owner's fight did not get to throw here is not thrown after the fight.
+static void SwingCreditDrop(unsigned int uid)
+{
+    if (g_sgHook != 1 || uid == 0) return;
+    SgLock();
+    swinggate::DropAll(&g_sg, uid);
+    SgUnlock();
+}
+
+// MAIN THREAD (ApplyRemoteSwingEnd): the owner's swing of uid ended - every credit its copy still holds is dropped (counted
+// ownerEndDrop): a blow the copy did not throw while its owner's swing went on is not thrown. Returns the number dropped.
+static int SwingCreditEnd(unsigned int uid)
+{
+    if (g_sgHook != 1 || uid == 0) return 0;
+    SgLock();
+    const int n = swinggate::OwnerEnd(&g_sg, uid, (unsigned int)::GetTickCount());
+    SgUnlock();
+    return n;
+}
+
+// MAIN THREAD (CombatModeTick): one line for each of the first swinggate::kLogPerCopy runs of declines per copy.
+static void SwingCreditLogDrain()
+{
+    if (g_sgHook != 1) return;
+    unsigned int uids[8];
+    int runs[8];
+    SgLock();
+    const int n = swinggate::TakeLogs(&g_sg, uids, runs, 8);
+    SgUnlock();
+    for (int i = 0; i < n; ++i)
+        DebugLog("[SWINGGATE] uid=" + N3((long long)uids[i]) + ": the copy of another player's character tried to start a swing"
+                 " with no swing of its owner at that target still unthrown here (a credit lasts at most " + N3((long long)swinggate::kLifeMs) + " ms) - not started (hold "
+                 + N3((long long)runs[i]) + " for this copy; at most " + N3((long long)swinggate::kLogPerCopy) + " such lines per copy)");
+}
+
+// MAIN THREAD: the gate's counters, appended to the [M6] REPORT swing line.
+static std::string SwingCreditToken()
+{
+    SgLock();
+    const swinggate::Counts k = g_sg.c;
+    SgUnlock();
+    return " swingGate[hook=" + N3(g_sgHook) + ",added=" + N3(k.added) + ",allowed=" + N3(k.allowed)
+         + ",declined=" + N3(k.declined) + ",holds=" + N3(k.holds) + ",lapsed=" + N3(k.lapsed) + ",capped=" + N3(k.capped)
+         + ",noSlot=" + N3(k.noSlot) + ",passOwn=" + N3(k.passOwn) + ",passNpc=" + N3(k.passNpc)
+         + ",passUnclassified=" + N3(k.passUnclassified) + ",passNotCopy=" + N3(k.passNotCopy)
+         + ",unread=" + N3((long long)g_sgUnread) + ",firstThread=" + N3((long long)g_sgThread)
+         + ",mainThread=" + N3((long long)StoreMainThreadId())
+         + ",engineNo=" + N3(k.engineNo) + ",allowedNoCredit=" + N3(k.allowedNoCredit)
+         + ",dropCombatOff=" + N3(k.dropCombatOff)
+         + ",swingEndSent=" + N3(g_sgEndSent) + ",swingEndRecv=" + N3(g_sgEndRecv)
+         + ",ownerEndDrop=" + N3(k.ownerEndDrop) + ",supersededDrop=" + N3(k.supersededDrop) + "]";
+}
+
+static void InstallSwingGate()
+{
+    const intptr_t fn = (kSgAttackStart != 0) ? (intptr_t)coop::AddrAbs(kSgAttackStart) : 0;
+    if (fn == 0)
+    {
+        g_sgHook = -1;
+        ErrorLog("[SWINGGATE] this game's address table has no AttackState_initialiseAttack row - the swing gate is OFF: copies of"
+                 " other players' characters start swings on their own AI as before (swingGate hook=-1 on the [M6] REPORT line)");
+        return;
+    }
+    g_sgHook = (coop::AddHook((void*)fn, (void*)&detour_sgAttackStart, (void**)&orig_sgAttackStart) == coop::SUCCESS) ? 1 : 0;
+    if (g_sgHook == 1)
+        DebugLog("[SWINGGATE] AttackState::initialiseAttack AddHook SUCCESS - a copy of another player's character starts a swing"
+                 " only on a swing of its owner it has not yet thrown (spent by its next started swing at that target, dropped at"
+                 " the owner's swing end, its next swing or its combat-off, at most " + N3((long long)swinggate::kLifeMs) + " ms after arrival, at most "
+                 + N3((long long)swinggate::kCap) + " held); own characters and NPCs are not gated");
+    else
+        ErrorLog("[SWINGGATE] AttackState::initialiseAttack AddHook FAILED - the swing gate is OFF (swingGate hook=0)");
+}
+
+// ===========================================================================================
+// FIGHT PARITY, the stance: the owner's six stance buttons (block, ranged, taunt, hold, passive, chase) ride its STATE as
+// latchBits bits 8-13, bit 14 'read' (statewire.h WithStance; spawn.cpp SnapshotState). On the copy of another game's player
+// character, each STATE's buttons that differ from the copy's own are written on the main thread (spawn.cpp ApplyState) as the
+// engine's own setter (Character vtable +0x308 -> 0x5C9FC0) writes them - not through it: it refuses a character of a faction
+// with no player controller, which every copy is (T1626; StanceCopyWritePod). A switch into block or
+// passive drops the copy's unthrown swing credits: its owner throws no blow from that stance, so a credit still waiting here is
+// a blow the owner no longer throws.
+// ===========================================================================================
+unsigned int StanceStateBits(const void* c)
+{
+    unsigned char b[kStanceN];
+    const bool read = StanceReadPod(c, b);
+    return coopstate::WithRangedMode(coopstate::WithStance(0u, b, read), RsReadMode(c));   /* + the ranged mode, bits 15-16 */
+}
+
+static std::map<unsigned int, unsigned int> g_fpStanceSeen;   /* MAIN THREAD: uid -> the owner's stance bits its last STATE carried */
+static std::map<unsigned int, int> g_fpStanceUnreadUid;      /* MAIN THREAD: copies whose buttons did not read (counted once) */
+static std::map<unsigned int, unsigned int> g_fpStanceTook;  /* MAIN THREAD: uid -> the buttons whose last write read back right */
+
+void ApplyRemoteStance(unsigned int uid, void* c, unsigned int latchBits)
+{
+    RangedModeNote(uid, latchBits);   /* the owner's ranged mode (bits 15-16), any copy; written at the K2 safe point */
+    if (uid == 0 || c == 0 || !coopstate::StanceCarried(latchBits)) return;
+    if (net::IsUidMine(uid) || IsUidPlayerCharAnyThread(uid) != 1) return;
+    if (EngineWritesBlocked()) return;   /* the owner's next STATE carries the buttons again */
+    const unsigned int want = latchBits & coopstate::kStanceMask;
+    std::map<unsigned int, unsigned int>::iterator it = g_fpStanceSeen.find(uid);
+    const bool seenBefore = (it != g_fpStanceSeen.end());
+    const unsigned int prev = seenBefore ? it->second : 0u;
+    g_fpStanceSeen[uid] = want;
+    /* block is button 0, passive button 4 (kStanceName) */
+    if ((coopstate::StanceOn(want, 0) && !coopstate::StanceOn(prev, 0)) || (coopstate::StanceOn(want, 4) && !coopstate::StanceOn(prev, 4)))
+    {
+        InterlockedIncrement64(&g_fpStanceDrops);
+        SwingCreditDrop(uid);
+    }
+    /* a copy whose buttons cannot be read is not set (counted once until it reads again) */
+    unsigned char now[kStanceN];
+    if (!StanceReadPod(c, now))
+    {
+        if (g_fpStanceUnreadUid.insert(std::make_pair(uid, 1)).second) InterlockedIncrement64(&g_fpStanceUnread);
+        return;
+    }
+    g_fpStanceUnreadUid.erase(uid);
+    /* T-1101 step 3: the setter refuses a copy (its stand-in faction has no player controller), so the setter's own effects are
+       written (StanceCopyWritePod). took = the buttons whose last write here read back right: one of those found different
+       again while the owner's buttons did not change is counted stanceReverted (07-bug-classes 'The engine reverts a value'). */
+    unsigned int& took = g_fpStanceTook[uid];
+    for (int i = 0; i < kStanceN; ++i)
+    {
+        const unsigned char v = (unsigned char)coopstate::StanceOn(want, i);
+        if (now[i] == v) continue;
+        if (seenBefore && prev == want && (took & (1u << i)) != 0) InterlockedIncrement64(&g_fpStanceReverted);
+        /* hold adds / removes a task in the copy's AI task lists and chase pushes onto an engine-wide list (decomp_507780:59-70),
+           both walked by the AI worker: not while it runs (the next STATE carries the buttons again; the button is not counted as
+           taken meanwhile); -1 (cannot be told) goes ahead, as the panel's own button does */
+        if ((kStanceId[i] == 0xC || kStanceId[i] == 0xF) && coop::AiWorkerBusyNow() == 1) { took &= ~(1u << i); InterlockedIncrement64(&g_fpStanceHoldBusy); continue; }
+        int hold = 0;
+        const int rc = StanceCopyWritePod(c, i, v, &hold);
+        if (hold > 0) InterlockedIncrement64(&g_fpStanceHoldAdded);
+        if (hold < 0) InterlockedIncrement64(&g_fpStanceHoldRemoved);
+        unsigned char back[kStanceN];
+        StanceReadPod(c, back);
+        const bool ok = (rc == 1 && back[i] == v);
+        InterlockedIncrement64(ok ? &g_fpStanceApplied : &g_fpStanceNotTaken);
+        if (ok) took |= (1u << i); else took &= ~(1u << i);
+    }
+}
+
+// ===========================================================================================
+// FIGHT PARITY, the stance sent at once (T-1101 step 4). Every stance button change but one goes through the engine's setter, Character
+// vtable +0x308 -> Character_setSavedMode (Steam_1.0.65 0x5C9FC0 / 1.0.68 0x5CAA50; the panel's buttons, the stancetest lever,
+// the save loader) - the exception: chase switched on by add-job 0x507C40, which calls setJobMode directly (items.cpp:54643,
+// spawn.cpp:12806); that change rides the periodic STATE. Its after-call detour reads the six buttons just before and just after the call (StanceStateBits, POD reads
+// under __try) and, when the call changed one on a character this game owns that is a player character, puts its uid in a small
+// set; the main tick (CombatTick -> StanceChangeDrain) sends one STATE per uid in it, so several buttons in one frame give one
+// push. The detour never sends: StatePush reads the engine and the transport, main thread only.
+// THREAD: the detour runs on whatever thread calls the setter (main thread per the panel and lever; not measured for the loader,
+// whose characters have no uid yet). It reads only the lock-free any-thread tables (FindSpawnedUid, IsUidMineAnyThread,
+// IsUidPlayerCharAnyThread - 07-bug-classes 188) and writes a POD set under a spin lock no engine call is made under; a call off
+// the main thread is counted (stanceSet's second number - 07-bug-classes 266). The setter's first argument is the character the
+// vtable slot belongs to; a call on any other object finds no uid (an address compare) and does nothing (07-bug-classes 384).
+// A set that is full (kStanceDirtyCap uids in one frame) drops the uid and counts stanceDirtyFull; its periodic STATE (every
+// 5 s) still carries the buttons. A push that cannot be sent (not announced yet) is not retried here, for the same reason.
+// ===========================================================================================
+bool StatePush(unsigned int uid);   /* medical.cpp: one STATE for a character we own, at once. MAIN THREAD */
+
+static unsigned long long kFpStanceSet = 0; static coop::AddrReg kFpStanceSet_reg("Character_setSavedMode", &kFpStanceSet);   /* Steam_1.0.65 0x5C9FC0, 1.0.68 0x5CAA50 */
+static StanceSetFn orig_fpStanceSet = 0;
+static int g_fpHookStanceSet = 0;   /* 1 hooked, 0 AddHook failed, -1 no address row (a stance change waits for the periodic STATE) */
+const int kStanceDirtyCap = 64;
+static unsigned int g_fpStanceDirty[kStanceDirtyCap];   /* read and written only under g_fpStanceDirtyLock */
+static int g_fpStanceDirtyN = 0;
+static volatile LONG g_fpStanceDirtyLock = 0;
+static volatile LONG64 g_fpStanceSetCalls = 0, g_fpStanceSetOffMain = 0, g_fpStancePush = 0, g_fpStanceDirtyMax = 0, g_fpStanceDirtyFull = 0;
+
+static void StanceDirtyLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_fpStanceDirtyLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+static void StanceDirtyUnlock() { InterlockedExchange(&g_fpStanceDirtyLock, 0); }
+
+static bool StanceIdIsButton(unsigned int modeId)
+{
+    for (int i = 0; i < kStanceN; ++i) if (kStanceId[i] == modeId) return true;
+    return false;
+}
+
+// DETOUR, any thread (every call of the engine's stance setter). The original always runs, unchanged.
+static void detour_fpStanceSet(void* c, unsigned int modeId, char value)
+{
+    unsigned int uid = 0;
+    if (StanceIdIsButton(modeId)) uid = FindSpawnedUid(c);
+    if (uid != 0 && (!net::IsUidMineAnyThread(uid) || IsUidPlayerCharAnyThread(uid) == 0)) uid = 0;   /* -1 (not in the table yet) passes: the setter writes nothing for an NPC */
+    const unsigned int before = (uid != 0) ? StanceStateBits(c) : 0u;
+    orig_fpStanceSet(c, modeId, value);
+    if (uid == 0) return;
+    InterlockedIncrement64(&g_fpStanceSetCalls);
+    const unsigned long mt = StoreMainThreadId();
+    if (mt == 0 || mt != (unsigned long)::GetCurrentThreadId()) InterlockedIncrement64(&g_fpStanceSetOffMain);
+    if (!coopstate::StanceChanged(before, StanceStateBits(c))) return;
+    StanceDirtyLock();
+    const int added = coopstate::DirtyAdd(g_fpStanceDirty, &g_fpStanceDirtyN, kStanceDirtyCap, uid);
+    const int n = g_fpStanceDirtyN;
+    StanceDirtyUnlock();
+    if (added < 0) InterlockedIncrement64(&g_fpStanceDirtyFull);
+    if (n > g_fpStanceDirtyMax) InterlockedExchange64(&g_fpStanceDirtyMax, n);
+}
+
+// MAIN THREAD (CombatTick, every frame): one STATE for each uid the setter marked since the last frame.
+static void StanceChangeDrain()
+{
+    unsigned int uids[kStanceDirtyCap];
+    int n = 0;
+    StanceDirtyLock();
+    n = g_fpStanceDirtyN;
+    for (int i = 0; i < n; ++i) uids[i] = g_fpStanceDirty[i];
+    g_fpStanceDirtyN = 0;
+    StanceDirtyUnlock();
+    for (int i = 0; i < n; ++i)
+        if (StatePush(uids[i])) InterlockedIncrement64(&g_fpStancePush);   /* StatePush checks the uid is still ours (net::IsUidMine) */
+}
+
+// ===========================================================================================
+// FIGHT PARITY, the block pose (T-1101 step 5; src/common/blockpick.h). A defender's block pose is picked during the attacker's
+// swing by CombatTechnique_pickBlock (1.0.65 0x886AA0 / 1.0.68 0x887970), on every game for its own copy of the defender
+// (05-findings 'T-1101 BLOCK POSE DESIGN READ'). Its call in the block start 0x608800 (disassembly 0x6089F2-0x608A07, 1.0.65):
+// RCX = the defender's CombatTechnique (CombatClass +0x190), EDX = the attack direction (int), XMM2 = the attacker's skill (a
+// float: 0x884010's XMM0 answer, kept in XMM6), R9D = front / behind (int, 0x435260's answer), [RSP+0x20] = the attacker's
+// Character (R12, the character 0x665370 found swinging; the callee reads it at [RBP+0x7f]); R8 is not set (the callee
+// overwrites it unread, 0x886ADF). It answers a CombatTechniqueData* (name +0x00; 0 = no block). It builds its candidates in
+// locals and frees them and writes nothing else (decomp_886aa0), so asking it again only advances the engine's dice. The
+// technique's +0x10 is its character (handed to 0x435320 with the front / behind answer; Inferred: the defender).
+// The victim's owner decides every blow (see FIGHT PARITY above), so the defender's owner's pick is the real one.
+//   The defender's owner, its own player character against the copy of another game's player character: the engine's answer is
+//     returned untouched and goes into a fixed ring (no lock: one producer at a time - a second one drops and counts, never
+//     waits) - its name, or an empty name for the engine's 'no block' (blockEngineNone); the main thread sends it as
+//     MSG_BLOCK_PICK on the character stream's road (blockPickSent). A block whose name cannot travel is not sent (blockPickNone).
+//   The attacker's game, its own player character against its copy of another game's player character: the copy's block start
+//     is held until that pick arrives, at most blockpick.h kHoldMaxMs (detour_fpBlockWindow, below). Then a fresh unused pick for
+//     the pair (blockpick.h Take, under a short lock with no engine call under it): a name has the picker asked again (up to
+//     kTries more times; an ask that answers no block is skipped, not the end) until it answers that name (blockForced;
+//     blockPickSame when its first answer was it), else its first pick stands (blockNotInList); an empty name answers no block
+//     (blockForcedNone - the engine's own 0, which the block start handles as it handles its own); no pick / a stale one -> the
+//     engine's pick (blockNoEntry / blockStale). The answer is always 0 or one of the engine's own answers for this call.
+// Each pick between two player characters is a [FIGHT] blockpick line at pick time (own how=engine on the defender's owner; copy
+// how=same / forced / forcedNone / notInList / noEntry / stale on the attacker's game).
+// ===========================================================================================
+static unsigned long long kFpPickBlock = 0; static coop::AddrReg kFpPickBlock_reg("CombatTechnique_pickBlock", &kFpPickBlock);   /* Steam_1.0.65 0x886AA0, 1.0.68 0x887970 */
+typedef void* (*FpPickBlockFn)(void* tech, int dir, float skill, int side, void* attacker);
+static FpPickBlockFn orig_fpPickBlock = 0;
+static int g_fpHookPickBlock = 0;   /* 1 hooked, 0 AddHook failed / not installed, -1 no address row */
+static volatile LONG64 g_fpBlockPickSent = 0, g_fpBlockPickUnsent = 0, g_fpBlockPickDropped = 0, g_fpBlockPickNone = 0;
+static volatile LONG64 g_fpBlockPickRecv = 0, g_fpBlockPickRefused = 0, g_fpBlockLate = 0;
+static volatile LONG64 g_fpBlockForced = 0, g_fpBlockPickSame = 0, g_fpBlockNotInList = 0, g_fpBlockNoEntry = 0, g_fpBlockStale = 0;
+static volatile LONG64 g_fpBlockEngineNone = 0, g_fpBlockForcedNone = 0;
+
+// The defender's owner: picks waiting for the main thread. Written by one producer at a time (g_fpBlockProducer), read by the
+// main thread; a slot is published by the write index after it is filled.
+struct FpBlockOut
+{
+    unsigned int def, att;
+    char         name[hitwire::kNameBuf];
+};
+const unsigned long kFpBlockRing = 32;
+static FpBlockOut g_fpBlockRing[kFpBlockRing];
+static volatile LONG g_fpBlockW = 0, g_fpBlockR = 0, g_fpBlockProducer = 0;
+
+// Any thread (the pick's detour): one pick to send, or counted dropped (the ring full, or another thread queueing now).
+static void FpBlockQueue(unsigned int def, unsigned int att, const char* name)
+{
+    if (InterlockedCompareExchange(&g_fpBlockProducer, 1, 0) != 0) { InterlockedIncrement64(&g_fpBlockPickDropped); return; }
+    const unsigned long w = (unsigned long)g_fpBlockW;
+    if (w - (unsigned long)g_fpBlockR >= kFpBlockRing) InterlockedIncrement64(&g_fpBlockPickDropped);
+    else
+    {
+        FpBlockOut& o = g_fpBlockRing[w % kFpBlockRing];
+        o.def = def;
+        o.att = att;
+        std::memcpy(o.name, name, hitwire::kNameBuf);
+        InterlockedExchange(&g_fpBlockW, (LONG)(w + 1));   /* published only after the slot is filled */
+    }
+    InterlockedExchange(&g_fpBlockProducer, 0);
+}
+
+// MAIN THREAD (CombatTick, every frame): each waiting pick as one MSG_BLOCK_PICK.
+static void FpBlockPickDrain()
+{
+    for (unsigned long k = 0; k < kFpBlockRing; ++k)
+    {
+        const unsigned long r = (unsigned long)g_fpBlockR;
+        if (r == (unsigned long)g_fpBlockW) break;
+        const FpBlockOut o = g_fpBlockRing[r % kFpBlockRing];
+        InterlockedExchange(&g_fpBlockR, (LONG)(r + 1));
+        InterlockedIncrement64(net::SendBlockPick(o.def, o.att, o.name) ? &g_fpBlockPickSent : &g_fpBlockPickUnsent);
+    }
+}
+
+// The attacker's game: the arrived picks (blockpick.h), read and written only under g_fpBlockTableLock - a short lock, no engine
+// call and no allocation under it.
+static blockpick::Table g_fpBlockTable;   /* zero before any constructor runs */
+static volatile LONG    g_fpBlockTableLock = 0;
+static void FpBlockTableLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_fpBlockTableLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+static void FpBlockTableUnlock() { InterlockedExchange(&g_fpBlockTableLock, 0); }
+static volatile LONG64 g_fpBlockPickOld = 0, g_fpBlockHoldLeft = 0;
+
+// MAIN THREAD: our player character began a swing at the copy of another game's player character - the pair's waiting pick
+// (an earlier swing's), hold and miss stamp are cleared, so this swing waits for its own pick (blockpick.h NewSwing).
+static void FpBlockNewSwing(unsigned int def, unsigned int att)
+{
+    FpBlockTableLock();
+    const int r = blockpick::NewSwing(&g_fpBlockTable, def, att);
+    FpBlockTableUnlock();
+    if (r & blockpick::kNewSwingOldPick)  InterlockedIncrement64(&g_fpBlockPickOld);
+    if (r & blockpick::kNewSwingHoldLeft) InterlockedIncrement64(&g_fpBlockHoldLeft);
+}
+
+// MAIN THREAD (session.cpp OnBlockPick). See combat.h.
+void ApplyRemoteBlockPick(unsigned int defenderUid, unsigned int attackerUid, const char* name, int refusal)
+{
+    if (refusal != 0 || name == 0) { InterlockedIncrement64(&g_fpBlockPickRefused); return; }
+    FpBlockTableLock();
+    const int late = blockpick::Put(&g_fpBlockTable, defenderUid, attackerUid, name, (unsigned int)::GetTickCount());
+    FpBlockTableUnlock();
+    if (late < 0) { InterlockedIncrement64(&g_fpBlockPickRefused); return; }
+    InterlockedIncrement64(&g_fpBlockPickRecv);
+    if (late > 0) InterlockedIncrement64(&g_fpBlockLate);
+}
+
+// MAIN THREAD (session.cpp OnShotFired). See combat.h. The fire is queued for ShotFireDrain (the K2 safe point, worker paused);
+// a full queue drops its oldest fire, counted. An accepted fire also notes its owner's ranged mode ON for the copy (RangedModeNote).
+void ApplyRemoteShotFired(unsigned int shooterUid, unsigned int targetUid, const float* aim3, const float* targetAt3, int refusal)
+{
+    if (refusal != 0 || shooterUid == 0 || aim3 == 0 || targetAt3 == 0) { ++g_shotFiredRefused; return; }
+    ++g_shotFiredRecv;
+    if (RangedModeNote(shooterUid, coopstate::WithRangedMode(0u, 1)) == 1) ++g_rmShotNoted;   /* the owner fired: its ranged mode is on */
+    ShotFire s;
+    s.f.shooterUid = shooterUid;
+    s.f.targetUid = targetUid;
+    for (int i = 0; i < 3; ++i) { s.f.aim[i] = aim3[i]; s.f.targetAt[i] = targetAt3[i]; }
+    s.at = (unsigned int)::GetTickCount();
+    if (g_shotFireQ.size() >= kShotFireMax) { g_shotFireQ.erase(g_shotFireQ.begin()); ++g_cfQDrop; }
+    g_shotFireQ.push_back(s);
+}
+
+// Any thread: one [FIGHT] blockpick line's event (the pick named at +0x00; '-' none).
+static void FightNoteBlockPick(unsigned int def, unsigned int att, int own, const void* pick, int how)
+{
+    if (g_fight.accepted >= fightlog::kCap) return;   /* a stale read only costs one refused Push */
+    fightlog::Event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.kind = fightlog::kBlockPick;
+    ev.a = def;
+    ev.b = att;
+    ev.own = own;
+    ev.how = how;
+    fightlog::NoName(ev.move);
+    FightNameAt(pick, 0x0, ev.block);
+    fightlog::NoName(ev.stumble);
+    FightPush(ev);
+}
+
+// DETOUR, any thread (every block-pose pick; the AI worker - Inferred). See above.
+static void* detour_fpPickBlock(void* tech, int dir, float skill, int side, void* attacker)
+{
+    void* const first = orig_fpPickBlock(tech, dir, skill, side, attacker);
+    const void* defender = FightPtrAt(tech, 0x10);
+    const unsigned int def = (defender != 0) ? FindSpawnedUid(defender) : 0;
+    const unsigned int att = (attacker != 0) ? FindSpawnedUid(attacker) : 0;
+    if (def == 0 || att == 0 || def == att) return first;
+    const bool defMine = net::IsUidMineAnyThread(def);
+    const bool attMine = net::IsUidMineAnyThread(att);
+    if (defMine == attMine || IsUidPlayerCharAnyThread(def) != 1 || IsUidPlayerCharAnyThread(att) != 1) return first;   /* both player characters, one ours */
+    if (defMine)
+    {
+        /* the defender's owner: its engine's pick is played as it is and goes to the attacker's game ("" = no block) */
+        char wire[hitwire::kNameBuf];
+        wire[0] = 0;
+        if (first == 0)
+        {
+            FpBlockQueue(def, att, wire);
+            InterlockedIncrement64(&g_fpBlockEngineNone);
+        }
+        else
+        {
+            char got[fightlog::kNameBuf];
+            FightNameAt(first, 0x0, got);
+            if (hitwire::WireNameOf(got, wire) && wire[0] != 0) FpBlockQueue(def, att, wire);
+            else InterlockedIncrement64(&g_fpBlockPickNone);   /* a block whose name cannot travel: nothing sent */
+        }
+        FightNoteBlockPick(def, att, 1, first, fightlog::kHowEngine);
+        return first;
+    }
+    /* the attacker's game, its copy of the defender: the defender's owner's pick, once */
+    char want[hitwire::kNameBuf];
+    want[0] = 0;
+    FpBlockTableLock();
+    const int took = blockpick::Take(&g_fpBlockTable, def, att, (unsigned int)::GetTickCount(), want);
+    FpBlockTableUnlock();
+    void* answer = first;
+    int how = fightlog::kHowNoEntry;
+    if (took == blockpick::kTakeStale) { how = fightlog::kHowStale; InterlockedIncrement64(&g_fpBlockStale); }
+    else if (took != blockpick::kTakeFresh) InterlockedIncrement64(&g_fpBlockNoEntry);
+    else if (want[0] == 0) { answer = 0; how = fightlog::kHowForcedNone; InterlockedIncrement64(&g_fpBlockForcedNone); }
+    else
+    {
+        how = fightlog::kHowNotInList;
+        void* m = first;
+        for (int i = 0; ; ++i)
+        {
+            if (m != 0 && FpNameIs(m, 0x0, want)) { answer = m; how = (i == 0) ? fightlog::kHowSame : fightlog::kHowForced; break; }
+            if (i >= blockpick::kTries) break;
+            m = orig_fpPickBlock(tech, dir, skill, side, attacker);   /* an ask answering no block is skipped: the asks go on to the cap */
+        }
+        InterlockedIncrement64(how == fightlog::kHowSame ? &g_fpBlockPickSame
+                               : (how == fightlog::kHowForced ? &g_fpBlockForced : &g_fpBlockNotInList));
+    }
+    FightNoteBlockPick(def, att, 0, answer, how);
+    return answer;
+}
+
+// FIGHT PARITY, holding the copy's block start for the defender's owner's pick (blockpick.h Hold). The block window check
+// CombatClass_blockWindow (1.0.65 0x6079D0 / 1.0.68 0x608460; 05-findings 'T-1101 BLOCK WINDOW READ') is
+// `bool f(CombatClass* attackerCC RCX, Character* defender RDX)`, called from five sites every frame on the AI worker, all
+// through a jump stub (1.0.65 0x19A97 / 1.0.68 0x19A9C, a JMP: _ReturnAddress() inside the detour is the caller's own return
+// address). In the block
+// start 0x608800 (1.0.68 0x609290) its call returns to BlockStartWindowRet (1.0.65 0x608946 / 1.0.68 0x6093D6): 0 there takes the
+// engine's 0.1 s retry path, 1 goes on to the pick. The original always runs first; only its 1, at that return address, for this
+// game's own player character (the attacker, attackerCC +0x188) against its copy of another game's player character, with no
+// fresh pick of the pair yet, is answered 0 (blockWaitHeld, once per hold). The hold ends when the pick arrives (the original's
+// 1; blockWaitArrived) or kHoldMaxMs after its first held call (1; blockWaitCapped) - by TIME, because the block start is also
+// re-run from 0x6091E0 with no timer. A hold that outlasts the swing's block window leaves the copy without a block that swing.
+static unsigned long long kFpBlockWindow = 0; static coop::AddrReg kFpBlockWindow_reg("CombatClass_blockWindow", &kFpBlockWindow);   /* Steam_1.0.65 0x6079D0, 1.0.68 0x608460 */
+static unsigned long long kFpBlockStartRet = 0; static coop::AddrReg kFpBlockStartRet_reg("BlockStartWindowRet", &kFpBlockStartRet);   /* Steam_1.0.65 0x608946, 1.0.68 0x6093D6 */
+typedef bool (*FpBlockWindowFn)(void* attackerCC, void* defender);
+static FpBlockWindowFn orig_fpBlockWindow = 0;
+static uintptr_t g_fpBlockStartRetAbs = 0;   /* the block start's return address in this process; 0 = nothing is held */
+static int g_fpHookBlockWindow = 0;          /* 1 hooked, 0 AddHook failed / not installed, -1 no address row */
+static volatile LONG64 g_fpBlockWaitHeld = 0, g_fpBlockWaitArrived = 0, g_fpBlockWaitCapped = 0;
+
+// DETOUR, any thread (the AI worker). The engine's own answer except while a hold lasts, see above.
+static bool detour_fpBlockWindow(void* attackerCC, void* defender)
+{
+    const bool in = orig_fpBlockWindow(attackerCC, defender);
+    if (!in || g_fpBlockStartRetAbs == 0 || (uintptr_t)_ReturnAddress() != g_fpBlockStartRetAbs) return in;   /* the cheap filter first */
+    const void* attacker = FightPtrAt(attackerCC, 0x188);
+    const unsigned int att = (attacker != 0) ? FindSpawnedUid(attacker) : 0;
+    const unsigned int def = (defender != 0) ? FindSpawnedUid(defender) : 0;
+    if (def == 0 || att == 0 || def == att) return in;
+    if (!net::IsUidMineAnyThread(att) || net::IsUidMineAnyThread(def)) return in;
+    if (IsUidPlayerCharAnyThread(att) != 1 || IsUidPlayerCharAnyThread(def) != 1) return in;
+    FpBlockTableLock();
+    const int h = blockpick::Hold(&g_fpBlockTable, def, att, (unsigned int)::GetTickCount());
+    FpBlockTableUnlock();
+    if (h == blockpick::kHoldStart) { InterlockedIncrement64(&g_fpBlockWaitHeld); return false; }
+    if (h == blockpick::kHoldWait) return false;
+    if (h == blockpick::kHoldArrived) InterlockedIncrement64(&g_fpBlockWaitArrived);
+    else if (h == blockpick::kHoldCapped) InterlockedIncrement64(&g_fpBlockWaitCapped);
+    return in;
+}
+
+// MAIN THREAD: fight parity's counters, appended to the [M6] REPORT swing line.
+static std::string FightParityToken()
+{
+    return " fightParity[hook=" + N3((long long)g_fpHookBlock) + "/" + N3((long long)g_fpHookStumble) + "/" + N3((long long)g_fpHookMove)
+         + ",hitResultForced=" + N3((long long)g_fpResultForced) + ",hitResultSame=" + N3((long long)g_fpResultSame)
+         + ",resultNotAsked=" + N3((long long)g_fpResultNotAsked)
+         + ",stumbleForced=" + N3((long long)g_fpStumbleForced) + ",stumbleNone=" + N3((long long)g_fpStumbleNone)
+         + ",stumbleNotFound=" + N3((long long)g_fpStumbleNotFound) + ",stumbleNotAsked=" + N3((long long)g_fpStumbleNotAsked)
+         + ",stumbleUnknown=" + N3((long long)g_fpStumbleUnknown)
+         + ",blockSame=" + N3((long long)g_fpBlockSame) + ",blockDiffer=" + N3((long long)g_fpBlockDiffer)
+         + ",moveForced=" + N3((long long)g_fpMoveForced) + ",moveSame=" + N3((long long)g_fpMoveSame)
+         + ",moveFallback=" + N3((long long)g_fpMoveFallback) + ",moveNoMove=" + N3((long long)g_fpMoveNoMove)
+         + ",moveNotCarried=" + N3((long long)g_fpMoveNotCarried) + ",swingNoMove=" + N3((long long)g_fpSwingNoMove)
+         + ",stanceApplied=" + N3((long long)g_fpStanceApplied) + ",stanceNotTaken=" + N3((long long)g_fpStanceNotTaken)
+         + ",stanceDrops=" + N3((long long)g_fpStanceDrops) + ",stanceUnread=" + N3((long long)g_fpStanceUnread)
+         + ",stanceHoldTask=" + N3((long long)g_fpStanceHoldAdded) + "/" + N3((long long)g_fpStanceHoldRemoved)
+         + ",stanceHoldBusy=" + N3((long long)g_fpStanceHoldBusy) + ",stanceReverted=" + N3((long long)g_fpStanceReverted)
+         + ",stanceSet=" + N3((long long)g_fpStanceSetCalls) + "/" + N3((long long)g_fpStanceSetOffMain)
+         + ",stancePush=" + N3((long long)g_fpStancePush) + ",stanceDirtyMax=" + N3((long long)g_fpStanceDirtyMax)
+         + ",stanceDirtyFull=" + N3((long long)g_fpStanceDirtyFull)
+         + ",blowSent=" + N3((long long)g_fpBlowSent) + ",blowUnsent=" + N3((long long)g_fpBlowUnsent)
+         + ",blowAbsent=" + N3((long long)g_fpBlowAbsent)
+         + ",pickBlockHook=" + N3((long long)g_fpHookPickBlock)
+         + ",blockPickSent=" + N3((long long)g_fpBlockPickSent) + ",blockPickUnsent=" + N3((long long)g_fpBlockPickUnsent)
+         + ",blockPickDropped=" + N3((long long)g_fpBlockPickDropped) + ",blockPickNone=" + N3((long long)g_fpBlockPickNone)
+         + ",blockPickRecv=" + N3((long long)g_fpBlockPickRecv) + ",blockPickRefused=" + N3((long long)g_fpBlockPickRefused)
+         + ",blockLate=" + N3((long long)g_fpBlockLate)
+         + ",blockForced=" + N3((long long)g_fpBlockForced) + ",blockPickSame=" + N3((long long)g_fpBlockPickSame)
+         + ",blockNotInList=" + N3((long long)g_fpBlockNotInList) + ",blockNoEntry=" + N3((long long)g_fpBlockNoEntry)
+         + ",blockStale=" + N3((long long)g_fpBlockStale) + ",blockEngineNone=" + N3((long long)g_fpBlockEngineNone)
+         + ",blockWindowHook=" + N3((long long)g_fpHookBlockWindow) + ",blockWaitHeld=" + N3((long long)g_fpBlockWaitHeld)
+         + ",blockWaitArrived=" + N3((long long)g_fpBlockWaitArrived) + ",blockWaitCapped=" + N3((long long)g_fpBlockWaitCapped)
+         + ",blockPickOld=" + N3((long long)g_fpBlockPickOld) + ",blockHoldLeft=" + N3((long long)g_fpBlockHoldLeft)
+         + ",blockForcedNone=" + N3((long long)g_fpBlockForcedNone) + "]";
+}
+
+// 1 hooked, 0 AddHook failed, -1 no address row for this game.
+static int FpHook(unsigned long long rva, void* detour, void** orig, const char* row)
+{
+    const intptr_t fn = (rva != 0) ? (intptr_t)coop::AddrAbs(rva) : 0;
+    if (fn == 0)
+    {
+        ErrorLog(std::string("[FIGHTPARITY] this game's address table has no ") + row + " row - that part of fight parity is OFF");
+        return -1;
+    }
+    if (coop::AddHook((void*)fn, detour, orig) == coop::SUCCESS) return 1;
+    ErrorLog(std::string("[FIGHTPARITY] ") + row + " AddHook FAILED - that part of fight parity is OFF");
+    return 0;
+}
+
+static void InstallFightParity()
+{
+    if (g_fpTls == TLS_OUT_OF_INDEXES) g_fpTls = ::TlsAlloc();
+    if (g_fpDecTls == TLS_OUT_OF_INDEXES) g_fpDecTls = ::TlsAlloc();
+    g_fpHookBlock   = FpHook(kFpBlockCheck, (void*)&detour_fpBlockCheck, (void**)&orig_fpBlockCheck, "CombatClass_blockCheck");
+    g_fpHookStumble = FpHook(kFpPickStumble, (void*)&detour_fpPickStumble, (void**)&orig_fpPickStumble, "AnimationClass_pickStumble");
+    g_fpHookStanceSet = FpHook(kFpStanceSet, (void*)&detour_fpStanceSet, (void**)&orig_fpStanceSet, "Character_setSavedMode");
+    g_fpHookPickBlock = FpHook(kFpPickBlock, (void*)&detour_fpPickBlock, (void**)&orig_fpPickBlock, "CombatTechnique_pickBlock");
+    if (g_fpHookPickBlock != 1)
+    {
+        g_fpHookBlockWindow = 0;
+        ErrorLog(std::string("[FIGHTPARITY] the block start is not held for the defender's owner's pick: the block pick is not hooked"));
+    }
+    else if (kFpBlockStartRet == 0 || kFpBlockWindow == 0)
+    {
+        g_fpHookBlockWindow = -1;
+        ErrorLog(std::string("[FIGHTPARITY] this game's address table has no CombatClass_blockWindow / BlockStartWindowRet row - that part of fight parity is OFF"));
+    }
+    else
+    {
+        g_fpBlockStartRetAbs = (uintptr_t)coop::AddrAbs(kFpBlockStartRet);   /* set before the detour can run */
+        g_fpHookBlockWindow = FpHook(kFpBlockWindow, (void*)&detour_fpBlockWindow, (void**)&orig_fpBlockWindow, "CombatClass_blockWindow");
+    }
+    if (g_sgHook == 1 && g_fpTls != TLS_OUT_OF_INDEXES)
+        g_fpHookMove = FpHook(kFpPickAttack, (void*)&detour_fpPickAttack, (void**)&orig_fpPickAttack, "CombatTechnique_pickAttack");
+    else
+    {
+        g_fpHookMove = 0;
+        ErrorLog(std::string("[FIGHTPARITY] the attack move is not forced: ") + (g_sgHook != 1 ? "the swing gate is off" : "TlsAlloc failed"));
+    }
+    DebugLog("[FIGHTPARITY] hooks blockCheck=" + N3((long long)g_fpHookBlock) + " pickStumble=" + N3((long long)g_fpHookStumble)
+             + " pickAttack=" + N3((long long)g_fpHookMove) + " stanceSet=" + N3((long long)g_fpHookStanceSet)
+             + " pickBlock=" + N3((long long)g_fpHookPickBlock) + " blockWindow=" + N3((long long)g_fpHookBlockWindow)
+             + " - a received HIT plays the answer (blocked / dodged / landed) and the"
+               " stumble its victim's game decided (by name; none when this copy's candidates lack it); a copy of another player's"
+               " character swings the attack move its owner's SWING named when its own move list holds it; the owner's stance"
+               " buttons ride its STATE, sent at once when a button changes (stanceSet=1); the block pose this game picks for its own"
+               " player's character against another player's goes to that player's game (BLOCK_PICK), whose copy answers that pose when"
+               " its list holds it (pickBlock=1), its block start held up to 300 ms for it (blockWindow=1)");
+}
+
+// ===========================================================================================
+// T-1101 DESIGN (c), BUILD A - THE OWNER'S FIGHT CHOICES DRIVE ITS COPIES' CHOICES (src/common/fightchoice.h, FIGHT_CHOICE 83).
+//
+// The engine's fight decide step (CombatClassAI 1.0.65 0x60BE20 / 1.0.68 0x60C8B0, address row CombatClassAI_decide; one input,
+// the fight object; always answers 1, which its caller 0x60CC10 does not read - decomp_60cc10:168-169) runs for a fighter in
+// state 4 and chooses its next move. It runs on the AI worker thread for owners and copies alike (Confirmed T1662).
+//   OWNER SIDE - our own player character in combat mode: the original runs; a call that changed the state +0x1F0, the next move
+//     +0x1F4 or the target +0x290 into one of the decide step's own answers (fightchoice.h Sendable) is queued (OwnerPush) and the
+//     main thread sends it as FIGHT_CHOICE on SWING's road and lane (FightChoiceDrain, CombatTick). Nothing is written.
+//   COPY SIDE - the copy of another game's player character in combat mode, in state 4 (fightchoice.h Gate): an owner choice
+//     waiting -> the original runs, then the next move +0x1F4 is set to the owner's when both chose 'getting ready' (PlanFor);
+//     none waiting -> the original is NOT run and nothing is written, the decide step's own 'choose nothing' answer
+//     (decomp_60be20:9-10: the copy stays in state 4 and is asked again next frame), at most fightchoice::kHoldMs per wait;
+//     after that the original runs as before (holdExpired). The swing gate (a swing still needs its owner's SWING) and the
+//     block-pick hold stay as they are.
+// The one field written, the copy's own +0x1F4, is the field the decide step itself writes on this thread at this point, with
+// one of its own values (0 / 1 / 5 / 6), through the fight object the engine handed this call (never a stored pointer). The
+// target is never written (0x664AF0 changes it together with both targets' attacker lists, 0x5C8800). No engine call but the
+// original, no allocation, no log on the worker: the store is one POD behind a short spin lock with no engine call under it; the
+// uids come from the lock-free any-thread tables (FindSpawnedUid, IsUidMineAnyThread, IsUidPlayerCharAnyThread); the lines are
+// written by the main thread from the store.
+// ===========================================================================================
+static unsigned long long kFcDecide = 0; static coop::AddrReg kFcDecide_reg("CombatClassAI_decide", &kFcDecide);   /* Steam_1.0.65 0x60BE20, 1.0.68 0x60C8B0 */
+typedef unsigned long long (*FcDecideFn)(void* cc);
+static FcDecideFn          orig_fcDecide = 0;
+static int                 g_fcHook = 0;          /* 1 hooked, 0 AddHook failed, -1 no address row for this game (nothing is sent or held) */
+static fightchoice::Store  g_fc;                  /* zero before any constructor runs; read and written only under g_fcLock */
+static volatile LONG       g_fcLock = 0;
+static volatile LONG64     g_fcUnwritten = 0;     /* a planned next-move write whose fight object did not take it (counted kept) */
+static int                 g_fcLogDone = 0;       /* MAIN THREAD: applied lines written so far */
+static long long           g_fcSentLogged = 0;    /* MAIN THREAD: sent lines written so far (the first kLogFirst) */
+
+static void FcLock()
+{
+    int spins = 0;
+    while (InterlockedCompareExchange(&g_fcLock, 1, 0) != 0)
+    {
+        if (++spins < 64) YieldProcessor();
+        else { spins = 0; ::SwitchToThread(); }
+    }
+}
+static void FcUnlock() { InterlockedExchange(&g_fcLock, 0); }
+
+// The fight object's fields read here (decomp_60be20 writes each): +0x130 the combat-mode byte (_isInCombatMode 0x4400B0),
+// +0x188 the character, +0x1F0 state, +0x1F4 next move, +0x290 target, +0x148 the getting-ready timer. POD, __try (C2712).
+struct FcRead
+{
+    int         ok, inCombat, state, next;
+    const void* ch;
+    const void* target;
+    float       ready;
+};
+static void FcReadCc(const void* cc, FcRead* o)
+{
+    o->ok = 0; o->inCombat = 0; o->state = -1; o->next = -1; o->ch = 0; o->target = 0; o->ready = 0.0f;
+    __try
+    {
+        const char* b = (const char*)cc;
+        o->inCombat = (*(const unsigned char*)(b + 0x130) != 0) ? 1 : 0;
+        o->ch       = *(const void* const*)(b + 0x188);
+        o->state    = *(const int*)(b + 0x1F0);
+        o->next     = *(const int*)(b + 0x1F4);
+        o->target   = *(const void* const*)(b + 0x290);
+        o->ready    = *(const float*)(b + 0x148);
+        o->ok = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { o->ok = 0; }
+}
+
+// The copy's next move +0x1F4 (decomp_60be20 writes it on every state-3 branch; decomp_60bbe0:52 the attack choice's answer).
+// 1 written, 0 not. POD, __try.
+static int FcWriteNext(void* cc, int next)
+{
+    __try { *(int*)((char*)cc + 0x1F4) = next; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Seconds on the performance counter (the clock CmNowSeconds reads), for pairing the two games' lines.
+static double FcSeconds()
+{
+    LARGE_INTEGER f, t; f.QuadPart = 0; t.QuadPart = 0;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (f.QuadPart > 0) ? (double)t.QuadPart / (double)f.QuadPart : 0.0;
+}
+
+static unsigned int FcUidOf(const void* p) { return PlausibleObject(p) ? FindSpawnedUid(p) : 0; }
+
+// DETOUR, any thread (the AI worker). See above.
+static unsigned long long detour_fcDecide(void* cc)
+{
+    FcRead before;
+    FcReadCc(cc, &before);
+    if (!before.ok || !before.inCombat || !PlausibleObject(before.ch)) return orig_fcDecide(cc);
+    const unsigned int uid = FindSpawnedUid(before.ch);
+    if (uid == 0 || IsUidPlayerCharAnyThread(uid) != 1) return orig_fcDecide(cc);
+
+    if (net::IsUidMineAnyThread(uid))
+    {
+        const unsigned long long r = orig_fcDecide(cc);
+        FcRead after;
+        FcReadCc(cc, &after);
+        if (!after.ok || (after.state == before.state && after.next == before.next && after.target == before.target)) return r;
+        if (!fightchoice::Sendable(after.state, after.next))
+        {   /* an answer FIGHT_CHOICE does not carry (state 3 with an attack answer other than 0): not sent, counted */
+            FcLock();
+            ++g_fc.c.notSendable;
+            FcUnlock();
+            return r;
+        }
+        fightchoice::Choice c;
+        c.uid = uid;
+        c.targetUid = FcUidOf(after.target);
+        if (c.targetUid == uid) c.targetUid = 0;
+        c.seq = 0;
+        c.state = after.state;
+        c.next = after.next;
+        c.readyTimer = after.ready;
+        const double t = FcSeconds();
+        const unsigned int now = (unsigned int)::GetTickCount();
+        FcLock();
+        fightchoice::OwnerPush(&g_fc, c, t, now);
+        FcUnlock();
+        return r;
+    }
+
+    /* A character that just became ours may read 'not ours' above until the next tick rebuilds the any-thread table; its arrivals
+       are refused from then on (ApplyRemoteFightChoice), so Gate finds no recent arrival and runs the engine (kTrafficMs). */
+    if (before.state != 4) return orig_fcDecide(cc);   /* the fight routine asks only in state 4 (decomp_60cc10:168) */
+    const unsigned int now = (unsigned int)::GetTickCount();
+    fightchoice::Choice c = fightchoice::Choice();
+    unsigned int waited = 0;
+    FcLock();
+    const int g = fightchoice::Gate(&g_fc, uid, now, &c, &waited);
+    FcUnlock();
+    if (g == fightchoice::kGateHold) return 1;   /* the decide step's own answer on its 'choose nothing' exit: nothing written */
+    const unsigned long long r = orig_fcDecide(cc);
+    FcRead after;
+    FcReadCc(cc, &after);
+    const int engineState = after.ok ? after.state : -1;
+    if (g != fightchoice::kGateApply)
+    {
+        FcLock();
+        fightchoice::AfterRun(&g_fc, uid, engineState);
+        FcUnlock();
+        return r;
+    }
+    int plan = fightchoice::PlanFor(c.state, c.next, engineState);
+    if (plan == fightchoice::kPlanWrite && !FcWriteNext(cc, c.next)) { plan = fightchoice::kPlanKept; InterlockedIncrement64(&g_fcUnwritten); }
+    const unsigned int engineTarget = after.ok ? FcUidOf(after.target) : 0;
+    const double t = FcSeconds();
+    FcLock();
+    fightchoice::Settle(&g_fc, c, plan, engineTarget, waited, t);
+    FcUnlock();
+    return r;
+}
+
+// MAIN THREAD (CombatTick, every frame): our characters' waiting choices as FIGHT_CHOICE; the first kLogFirst sent and applied
+// choices one line each (a readout pairs them by uid and seq; t = seconds on each game's own performance counter).
+static void FightChoiceDrain()
+{
+    if (g_fcHook != 1) return;
+    fightchoice::Sent out[16];
+    for (int round = 0; round < 4; ++round)
+    {
+        FcLock();
+        const int n = fightchoice::OwnerTake(&g_fc, out, 16);
+        FcUnlock();
+        if (n == 0) break;
+        const unsigned int now = (unsigned int)::GetTickCount();
+        for (int i = 0; i < n; ++i)
+        {
+            const fightchoice::Choice& c = out[i].c;
+            const bool ok = net::SendFightChoice(c.uid, c.targetUid, c.seq, c.state, c.next, c.readyTimer);
+            FcLock();
+            if (ok) ++g_fc.c.sent; else ++g_fc.c.unsent;
+            FcUnlock();
+            if (g_fcSentLogged < fightchoice::kLogFirst)
+            {
+                ++g_fcSentLogged;
+                char line[256];
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[FIGHTCHOICE] %s #%lld uid=%u seq=%u st=%d next=%d(%s) tgt=%u ready=%.2f t=%.3f"
+                            " queued=%u ms (our character's decide step chose; the copies follow it at their own decide step)",
+                            ok ? "sent" : "NOT sent (no road)", g_fcSentLogged, c.uid, c.seq, c.state, c.next, fightchoice::NextName(c.next),
+                            c.targetUid, (double)c.readyTimer, out[i].t, fightchoice::AgeMs(now, out[i].decidedMs));
+                DebugLog(line);
+            }
+        }
+    }
+    fightchoice::Applied a[8];
+    FcLock();
+    const int na = fightchoice::TakeLog(&g_fc, g_fcLogDone, a, 8);
+    FcUnlock();
+    for (int i = 0; i < na; ++i)
+    {
+        ++g_fcLogDone;
+        char line[320];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[FIGHTCHOICE] applied #%d uid=%u seq=%u next=%d(%s) ownerTgt=%u engineTgt=%u%s"
+                    " waited=%u ms since it arrived t=%.3f (the copy's decide step took its owner's next move; the delay from the owner's"
+                    " send is this t against the owner's 'sent' line with this uid and seq)",
+                    g_fcLogDone, a[i].uid, a[i].seq, a[i].next, fightchoice::NextName(a[i].next), a[i].ownerTarget, a[i].engineTarget,
+                    a[i].ownerTarget != a[i].engineTarget ? " (target kept: the engine's)" : "", a[i].waitedMs, a[i].t);
+        DebugLog(line);
+    }
+}
+
+// MAIN THREAD (ApplyRemoteFightChoice, session.cpp OnFightChoice). refusal fightchoice::kNotOwner: the sender does not run uid
+// (counted notOwner); any other refusal != 0: it did not decode (counted refused).
+void ApplyRemoteFightChoice(unsigned int uid, unsigned int targetUid, unsigned int seq, int state, int next, float readyTimer, int refusal)
+{
+    const unsigned int now = (unsigned int)::GetTickCount();
+    if (refusal == fightchoice::kNotOwner) { FcLock(); ++g_fc.c.notOwner; FcUnlock(); return; }
+    if (refusal != 0) { FcLock(); ++g_fc.c.refused; FcUnlock(); return; }
+    if (g_fcHook != 1) return;
+    /* only for a copy here of another game's player character: not ours, a body here, not an NPC */
+    if (net::IsUidMine(uid) || FindSpawned(uid) == 0 || IsUidPlayerCharAnyThread(uid) == 0) { FcLock(); ++g_fc.c.notCopy; FcUnlock(); return; }
+    fightchoice::Choice c;
+    c.uid = uid; c.targetUid = targetUid; c.seq = seq; c.state = state; c.next = next; c.readyTimer = readyTimer;
+    FcLock();
+    fightchoice::Put(&g_fc, c, now);
+    FcUnlock();
+}
+
+// MAIN THREAD (ApplyRemoteCombatMode, the owner's combat-off): one line with this copy's fight leg, when it had any; its row is
+// freed, so a choice still waiting is not used in a later fight.
+static void FightChoiceLegEnd(unsigned int uid)
+{
+    if (g_fcHook != 1 || uid == 0) return;
+    fightchoice::LegCounts k;
+    FcLock();
+    const int had = fightchoice::LegEnd(&g_fc, uid, &k);
+    FcUnlock();
+    if (!had || (k.recv == 0 && k.heldNothing == 0 && k.applied == 0 && k.runNoTraffic == 0)) return;
+    char line[480];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[FIGHTCHOICE] leg uid=%u recv=%lld applied=%lld targetKept=%lld heldNothing=%lld"
+                " holdExpired=%lld staleSeq=%lld staleAge=%lld kept=%lld busy=%lld superseded=%lld runNoTraffic=%lld (the owner's"
+                " fight ended: its choices this copy received, took, held for and lost; runNoTraffic = waits the engine chose alone"
+                " because no choice had arrived for 5 s)",
+                uid, k.recv, k.applied, k.targetKept, k.heldNothing, k.holdExpired, k.staleSeq, k.staleAge, k.kept, k.busy, k.superseded,
+                k.runNoTraffic);
+    DebugLog(line);
+}
+
+// MAIN THREAD (CombatWorldTeardown; session.cpp OnPeerGone, the link went down or the session was left): every copy's row is
+// freed - a choice still waiting or a hold in progress belongs to a copy that is gone or has no feed now. One line when any was
+// in use.
+void FightChoiceForget(const char* why)
+{
+    FcLock();
+    const int n = fightchoice::ClearRows(&g_fc);
+    FcUnlock();
+    if (n == 0) return;
+    DebugLog(std::string("[FIGHTCHOICE] ") + (why ? why : "?") + ": " + N3((long long)n)
+             + " copies' fight-choice rows freed (no leg lines; a copy still fighting takes a fresh row at its owner's next choice)");
+}
+
+// MAIN THREAD: the counters, appended to the [M6] REPORT swing line.
+static std::string FightChoiceToken()
+{
+    FcLock();
+    const fightchoice::Counts k = g_fc.c;
+    FcUnlock();
+    return " fightChoice[sent=" + N3(k.sent) + ",recv=" + N3(k.recv) + ",applied=" + N3(k.applied) + ",targetKept=" + N3(k.targetKept)
+         + ",heldNothing=" + N3(k.heldNothing) + ",holdExpired=" + N3(k.holdExpired) + ",staleSeq=" + N3(k.staleSeq)
+         + ",staleAge=" + N3(k.staleAge)
+         + ",queueFull=" + N3(k.queueFull) + ",kept=" + N3(k.kept) + ",busy=" + N3(k.busy) + ",superseded=" + N3(k.superseded)
+         + ",unsent=" + N3(k.unsent) + ",noRow=" + N3(k.noRow) + ",refused=" + N3(k.refused) + ",notCopy=" + N3(k.notCopy)
+         + ",runNoTraffic=" + N3(k.runNoTraffic) + ",notSendable=" + N3(k.notSendable) + ",notOwner=" + N3(k.notOwner)
+         + ",unwritten=" + N3((long long)g_fcUnwritten) + ",hook=" + N3((long long)g_fcHook) + "]";
+}
+
+// One line either way: hooked, or why not.
+static void InstallFightChoice()
+{
+    const intptr_t fn = (kFcDecide != 0) ? (intptr_t)coop::AddrAbs(kFcDecide) : 0;
+    if (fn == 0)
+    {
+        g_fcHook = -1;
+        ErrorLog("[FIGHTCHOICE] this game's address table has no CombatClassAI_decide row - the owner's fight choices are not sent and"
+                 " copies choose on their own AI as before (fightChoice hook=-1 on the [M6] REPORT line)");
+        return;
+    }
+    g_fcHook = (coop::AddHook((void*)fn, (void*)&detour_fcDecide, (void**)&orig_fcDecide) == coop::SUCCESS) ? 1 : 0;
+    if (g_fcHook == 1)
+        DebugLog("[FIGHTCHOICE] CombatClassAI decide step AddHook SUCCESS - our player characters' fight choices are sent; a copy of"
+                 " another player's character takes its owner's next move when both get ready, and otherwise chooses nothing for up to "
+                 + N3((long long)fightchoice::kHoldMs) + " ms of each wait for its owner's choice while those arrive (one within the last "
+                 + N3((long long)fightchoice::kTrafficMs) + " ms)");
+    else
+        ErrorLog("[FIGHTCHOICE] CombatClassAI decide step AddHook FAILED - fight choices are off (fightChoice hook=0)");
+}
+
 void InstallCombatHook()
 {
     DebugLog("[M3] resolving Character::hitByMeleeAttack ...");
@@ -3473,6 +5905,9 @@ void InstallCombatHook()
     InstallEffectHook();       /* T-327: Character::gettingEaten - a copy eaten by our eater is a request to its owner */
     InstallKnockSafePoint();   // K2: the copy side's safe point for its knock
     InstallPhysicsGuard();     // T-211 / H054: the AI-thread box query and the physics-thread actor release never overlap
+    InstallSwingGate();        /* AttackState::initialiseAttack - a copy of another player's character swings only after its owner */
+    InstallFightParity();      /* the block check, the stumble pick and the attack-move pick play what the owner's game decided */
+    InstallFightChoice();      /* the fight decide step: our player characters' choices are sent; copies of others' take their owners' */
 }
 
 
@@ -3864,6 +6299,18 @@ struct CombatWatch
     // reads - so without this, an intent that expired because the puppet was invisible would be
     // booked to whichever gate happened to be shut the last time anyone looked, minutes ago.
     long long    swingIntentLastTry;
+    // The swing gate: 1 when this intent's SWING also stored a swing credit (a copy of another player's character); such an
+    // intent expires with its credit, swinggate::kLifeMs after arrival (swingIntentMs), when that comes before
+    // kSwingIntentTicks frames - at a low frame rate the frame window alone would outlive the credit it needs.
+    int           swingIntentGated;
+    unsigned long swingIntentMs;
+    // 1 once the owner's SWING_END arrived for this intent's swing: the retry stops (expires) - a busy copy throws its owner's
+    // blow late only while the owner's swing goes on.
+    int           swingIntentEnded;
+    // OWNER SIDE: 1 from a sent SWING until this character leaves the attack state, which sends SWING_END (swingEndTarget = the
+    // target that SWING named).
+    int           swingEndOwed;
+    unsigned int  swingEndTarget;
 
     // P045 / T095 - IS THIS CHARACTER'S COMBAT STATE MACHINE BEING TICKED?
     //
@@ -4331,7 +6778,8 @@ long long g_swWroteFirstTry  = 0; // F356: the retry was not needed for this one
 long long g_swWroteAfterWait = 0; // F356: the retry IS what got this swing through
 long long g_swWrote         = 0;  // peer: the three writes were made
 long long g_swLanded        = 0;  // peer: and the state actually reached SWORD_SWING afterwards
-long long g_swDeclined      = 0;  // peer: it did NOT - initialiseAttack refused (see the probe)
+long long g_swDeclined      = 0;  // peer: it did NOT - initialiseAttack refused (see the probe), or, for a copy of another
+                                  //        player's character, the swing gate held it: swingGate[declined,engineNo] split them
 long long g_swUnscoredStale = 0;  // peer: F351 - pending far too long to score honestly (streamed
                                   //        out and back); counted, never booked as a decline
 
@@ -4727,6 +7175,11 @@ void ResetCombatWatchRow(CombatWatch* w, unsigned int uid)
     w->swingIntentTarget = 0;
     w->swingIntentGate = 0;
     w->swingIntentLastTry = 0;
+    w->swingIntentGated = 0;
+    w->swingIntentMs = 0;
+    w->swingIntentEnded = 0;
+    w->swingEndOwed = 0;
+    w->swingEndTarget = 0;
     w->swingWroteTick = 0;
     w->swingTarget    = 0;
     // P045 - reset here too, even though `g_cmWatch` starts zeroed and no slot is ever released,
@@ -6300,9 +8753,497 @@ void InstallEndActionProbe()
                  " prologue, it is the byte in memory rather than a return value.**");
 }
 
+// MAIN THREAD (CombatModeTick): one of this game's own characters' ranged mode, sampled every frame by mirror slot i; a change
+// between two readable samples puts its uid in the stance push's set, so one STATE carries it at once (StanceChangeDrain). The
+// first sample of a slot's character only records it: the periodic STATE carries that one.
+static unsigned int g_rmSeenUid[kMaxCombatWatch];
+static signed char  g_rmSeen[kMaxCombatWatch];
+static void RangedModeSample(int i, unsigned int uid, const void* c)
+{
+    if (i < 0 || i >= kMaxCombatWatch) return;
+    const int now = RsReadMode(c);
+    if (now < 0) return;
+    if (g_rmSeenUid[i] != uid) { g_rmSeenUid[i] = uid; g_rmSeen[i] = (signed char)now; return; }
+    const int seen = (int)g_rmSeen[i];
+    g_rmSeen[i] = (signed char)now;
+    if (!coopstate::RangedModeChanged(seen, now)) return;
+    ++g_rmEdges;
+    StanceDirtyLock();
+    const int added = coopstate::DirtyAdd(g_fpStanceDirty, &g_fpStanceDirtyN, kStanceDirtyCap, uid);
+    const int n = g_fpStanceDirtyN;
+    StanceDirtyUnlock();
+    if (added < 0) ++g_rmPushFull; else if (added > 0) ++g_rmPushQueued;
+    if (n > g_fpStanceDirtyMax) InterlockedExchange64(&g_fpStanceDirtyMax, n);
+    if (g_rmLoggedOwn < kRmLogLimit)
+    {
+        ++g_rmLoggedOwn;
+        DebugLog("[SHOTGATE] RANGED-MODE own uid=" + N3(uid) + " " + std::string(now ? "ON" : "OFF")
+                 + (added < 0 ? std::string(" - the push set is full: the periodic STATE carries it") : std::string(" - one STATE carries it at once")));
+    }
+}
+
+#ifdef SW_DEV_BUILD
+// PROBE-START: P190 (T-330) - a player character's hands, back and hip while it is in combat or ranged mode
+/* LOG ONLY, MAIN THREAD. This half reads the ranged combat object (its mode +0x36, its stored gun +0x28) and the engine's
+   weaponInHands (WeaponInHandsOf); items.cpp's P190Gear reads the back and hip sections, decides when a line is due and caps them. */
+void P190Gear(unsigned int uid, ::Character* c, int copy, int combatOn, int rangedMode, int gun, const void* hand, int handRead);   /* items.cpp */
+std::string P190ReportToken();   /* items.cpp - the [M6] REPORT swing line's token */
+/* the ranged combat object's stored gun: 1 set, 0 empty, -1 no ranged combat object / faulted. No C++ objects (SEH). */
+static int P190GunPod(const void* c)
+{
+    __try
+    {
+        const char* rc = *(const char* const*)((const char*)c + kRsCharRanged);
+        if (!RsPlaus(rc)) return -1;
+        return (*(void* const*)(rc + kRsRcGun) != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static void P190GearSample(unsigned int uid, ::Character* c, bool mine, int on)
+{
+    const void* hand = WeaponInHandsOf(c, 0);
+    const int handRead = (hand == kWeaponUnreadable) ? 0 : 1;
+    P190Gear(uid, c, mine ? 0 : 1, on, RsReadMode(c), P190GunPod(c), handRead ? hand : 0, handRead);
+}
+// PROBE-END: P190
+#endif
+
+// =====================================================================================================================
+// THE OWNER'S HAND ITEM ON ITS COPY (MSG_HAND, src/common/handwire.h). A copy's AI planner is held outside fight windows, so the
+// engine's own draw (Task_EquipBestWeapon 0x346BD0 -> Character vtable +0x3D8) never runs on it, and in a fight window its own
+// planner may draw a different weapon. The fact is the owner's hand item (weaponInHands, WeaponInHandsOf): a change of it is seen
+// on the per-character sampling pass (CombatModeTick -> HandSample) and sent at once as one MSG_HAND naming the item as an item
+// move does (section + slot + base sid, items.cpp HandItemIdentity), or bare hands (no item, or the engine's fists object). The
+// copy keeps its owner's latest word (ApplyRemoteHand) and the K2 safe point (worker paused, not while EngineWritesBlocked) makes
+// the copy's hands match (HandApplyDrain): the copy's own item at that section and slot with that sid (items.cpp HandFindItem) is
+// drawn through the engine's draw (vtable +0x3D8, CharacterHuman 0x5DB4F0: it puts a different hand item away first,
+// decomp_5db4f0.txt:44-46; refuses an item the inventory does not hold, :48-59; marks the item in hands and attaches it to the
+// hands bone, :62-105; sets the hand item, :106; records the section it came from, :116-117); bare hands put a held item away
+// through the engine's put-away (vtable +0x2D0, CharacterHuman 0x5CBD90: detaches it from the hands bone, re-attaches it at the
+// recorded back / hip place when there is one, clears the hand item, decomp_5cbd90.txt:22-40). The gun the ranged update fires
+// (+0x28) is not written here: the engine stores it every frame from the hand weapon while ranged mode is on
+// (decomp_43ab40.txt:12-14 -> 0x434220: vtable +0x3C0 -> the weapon's +0x2D8 -> +0x240). An item not (yet) in the copy's section
+// is waited for (it arrives by an item move) and looked up again every kHdRetryPasses passes; hands the copy's own engine changes
+// back after this game set them are set again, at most handwire::kRevertCap times in a row (the count starts again when the copy's
+// planner is held again after its fight window, or after handwire::kRevertQuietPasses quiet passes). A copy not present keeps its
+// owner's word until the owner leaves, the copy's DESPAWN or a world teardown, so a copy rebuilt is drawn again. The owner's side
+// also resends its current word with every catch-up / announce SPAWN (HandResendOwned), and a send that found no road is tried
+// again on the next frame. Animals (weaponInHands +0x708, natural weapons) are skipped, counted.
+// =====================================================================================================================
+int HandItemIdentity(const void* item, char* sec, int secCap, int* x, int* y, char* sid, int sidCap);   /* items.cpp */
+int HandFindItem(::Character* c, const char* sec, int x, int y, const char* sid, void** out);           /* items.cpp */
+
+const size_t kHdCharInventory = 0x2E8;   /* Character::inventory - the draw hands it to the section lookup untested (5db4f0:48) */
+const size_t kHdCharRender    = 0x448;   /* the render object - the draw (5db4f0:97, :103) and the put-away (5cbd90:23, :27) use it untested */
+const size_t kHdCharHandUser  = 0x450;   /* handed the new hand item by the draw and the put-away (0x897060, 5db4f0:107, 5cbd90:29) */
+const size_t kHdCharFists     = 0x6D0;   /* the engine's own fists object (the draw's item when none is named, 5db4f0:32-35) */
+const size_t kHdCharHand      = 0x6D8;   /* CharacterHuman::weaponInHands */
+const size_t kHdVtDraw        = 0x3D8;   /* Character vtable: draw an item into the hands (CharacterHuman 0x5DB4F0) */
+const size_t kHdVtPutAway     = 0x2D0;   /* Character vtable: put the hand item away (CharacterHuman 0x5CBD90) */
+const unsigned int kHdRetryPasses = 8;   /* safe-point passes before a missed or refused apply is tried again */
+
+typedef unsigned char (*HdDrawFn)(void* c, void* item, void* sectionByValue);
+typedef void (*HdPutAwayFn)(void* c);
+/* the engine's std::string as the draw takes it by value (the draw reads size +0x10 and capacity +0x18 and empties it before it
+   returns, 5db4f0:39-43 / :126-130); a capacity of 15 keeps the text in the string's own buffer, so the engine frees nothing this
+   side allocated */
+struct HdStdStr { char buf[16]; size_t size; size_t cap; };
+
+/* any thread, read only, SEH: character c's fists object (+0x6D0), 0 none or unreadable */
+static const void* HdFistsPod(const void* c)
+{
+    __try { return *(const void* const*)((const char*)c + kHdCharFists); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* the engine function in vtable slot `slot` of c; 0 when the vtable or the slot lies outside the image or the read faulted. SEH. */
+static const void* HdVtSlotPod(const void* c, size_t slot)
+{
+    const uintptr_t lo = g_imageBase, hi = g_imageBase + 0x4000000;
+    if (lo == 0) return 0;
+    __try
+    {
+        const void* const* vt = *(const void* const* const*)c;
+        if ((uintptr_t)vt <= lo || (uintptr_t)vt >= hi) return 0;
+        const void* f = vt[slot / sizeof(void*)];
+        return ((uintptr_t)f > lo && (uintptr_t)f < hi) ? f : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/* 1 c has the render object, the hand-item user and the inventory the engine's draw / put-away use untested; 0 not; -1 faulted */
+static int HdBodyReadyPod(const void* c)
+{
+    __try
+    {
+        const char* cc = (const char*)c;
+        return (*(void* const*)(cc + kHdCharRender) != 0 && *(void* const*)(cc + kHdCharHandUser) != 0
+                && *(void* const*)(cc + kHdCharInventory) != 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* K2 safe point (MAIN THREAD, worker paused), no C++ objects (SEH): copy c draws `item` from section `sec` (n bytes, at most
+   handwire::kDrawSecMax) through the engine's draw. 1 drawn (the hand item reads back as `item`); 0 the engine refused it or it
+   did not read back; -2 no render object / hand-item user / inventory; -1 faulted, or no draw function in the vtable. */
+static int HdDrawPod(void* c, void* item, const char* sec, size_t n)
+{
+    const int ready = HdBodyReadyPod(c);
+    if (ready < 0) return -1;
+    if (ready == 0) return -2;
+    const HdDrawFn f = (HdDrawFn)HdVtSlotPod(c, kHdVtDraw);
+    if (f == 0 || n == 0 || n > (size_t)handwire::kDrawSecMax) return -1;
+    __try
+    {
+        HdStdStr s;
+        std::memset(&s, 0, sizeof(s));
+        std::memcpy(s.buf, sec, n);
+        s.size = n;
+        s.cap = 15;
+        if (f(c, item, &s) == 0) return 0;
+        return (*(void* const*)((const char*)c + kHdCharHand) == item) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* K2 safe point (MAIN THREAD, worker paused), no C++ objects (SEH): copy c puts its hand item away through the engine's put-away.
+   1 the hand item reads back 0; 0 it did not; -2 no render object / hand-item user; -1 faulted, or no put-away in the vtable. */
+static int HdPutAwayPod(void* c)
+{
+    const int ready = HdBodyReadyPod(c);
+    if (ready < 0) return -1;
+    if (ready == 0) return -2;
+    const HdPutAwayFn f = (HdPutAwayFn)HdVtSlotPod(c, kHdVtPutAway);
+    if (f == 0) return -1;
+    __try
+    {
+        f(c);
+        return (*(void* const*)((const char*)c + kHdCharHand) == 0) ? 1 : 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* the owner's word; 1 = this game drew / put away under it; re-applies in a row; 1 = it waited for its item or its copy at least
+   once; the lines already written under it (kHdLog* bits); the pass before which it is not tried again (0 none); the copy body it
+   was applied to (another body - a copy rebuilt - starts the word afresh); the copy's planner let run (1), held (0) or not known
+   (-1) on the last pass that had re-applies to re-arm; the pass of the last re-apply */
+struct HdWant
+{
+    handwire::Hand h; int acted; int reverts; int waited; int logged; unsigned int nextPass;
+    const void* body; int released; unsigned int revertPass;
+};
+static std::map<unsigned int, HdWant> g_hdWant;   /* MAIN THREAD: uid of a copy -> its owner's hand item */
+static unsigned int g_hdPass = 0;                 /* MAIN THREAD: HandApplyDrain's pass count */
+const int kHdLogNotFound = 1, kHdLogNoRender = 2, kHdLogCapped = 4, kHdLogRefused = 8, kHdLogTooLong = 16, kHdLogNoCopy = 32;
+/* words kept at most: one per copy the mirror can hold (kMaxCombatWatch = kMaxMirror); a word for a copy not present waits in the
+   table, so a full table first drops the words of copies not present */
+const size_t kHdWantMax = (size_t)kMaxCombatWatch;
+
+/* MAIN THREAD: the word's per-copy state started afresh (a new owner word, or another copy body) */
+static void HdWantRestart(HdWant* w)
+{
+    w->acted = 0; w->reverts = 0; w->waited = 0; w->logged = 0; w->nextPass = 0; w->released = -1; w->revertPass = g_hdPass;
+}
+
+static std::string HdWordText(const handwire::Hand& h)
+{
+    if (!h.has) return "item=- sec=- slot=-";
+    return "item=" + std::string(h.sid) + " sec=" + std::string(h.section) + " slot=" + N3((long long)h.x) + "," + N3((long long)h.y);
+}
+
+/* MAIN THREAD: one capped [HAND] apply line */
+static void HdApplyLine(unsigned int uid, const char* what, const std::string& rest)
+{
+    static std::map<unsigned int, int> perUid;
+    if (g_hdLoggedApply >= kHdLogLimit || perUid[uid] >= kHdLogPerUid) return;
+    ++perUid[uid];
+    ++g_hdLoggedApply;
+    DebugLog("[HAND] apply uid=" + N3(uid) + " " + std::string(what) + " " + rest);
+}
+
+// MAIN THREAD. See combat.h. A word the same as the kept one changes nothing (a copy rebuilt since is noticed by its body at the
+// safe point); a new word restarts the re-apply count. A new uid with the table full first drops the words of copies not present;
+// still full, the word is dropped, counted.
+void ApplyRemoteHand(const handwire::Hand& h, int refusal)
+{
+    if (refusal != 0) { ++g_hdRefused; return; }
+    ++g_hdRecv;
+    std::map<unsigned int, HdWant>::iterator it = g_hdWant.find(h.uid);
+    if (it != g_hdWant.end() && handwire::Same(it->second.h, h)) return;
+    if (it == g_hdWant.end() && g_hdWant.size() >= kHdWantMax)
+    {
+        for (std::map<unsigned int, HdWant>::iterator e = g_hdWant.begin(); e != g_hdWant.end(); )
+        {
+            if (FindSpawned(e->first) == 0) g_hdWant.erase(e++); else ++e;
+        }
+        if (g_hdWant.size() >= kHdWantMax) { ++g_hdTableFull; return; }
+    }
+    HdWant w;
+    w.h = h; w.body = 0;
+    HdWantRestart(&w);
+    g_hdWant[h.uid] = w;
+}
+
+// MAIN THREAD (RangedModeOwnerGone): the copy's owner left - its wanted hand item goes; its hands stay as its engine has them.
+static void HandOwnerGone(unsigned int uid)
+{
+    g_hdWant.erase(uid);
+}
+
+// MAIN THREAD. See combat.h.
+void HandCopyDespawned(unsigned int uid)
+{
+    if (g_hdWant.erase(uid) != 0) ++g_hdForgotten;
+}
+
+// K2 safe point (MAIN THREAD, worker paused): each copy's hands made its owner's (handwire::Decide). A character handed to this
+// game leaves the table unwritten - its engine keeps its own hands. A copy not present (not built yet, or torn down to be rebuilt)
+// keeps its word, counted waiting, until its owner leaves, its DESPAWN or a world teardown; another copy body starts the word
+// afresh. The re-apply count starts again when the copy's planner is held again after its fight window, or after
+// handwire::kRevertQuietPasses passes with no re-apply (handwire::RearmReverts). A lookup that missed, an engine refusal and a copy
+// with no render object are tried again kHdRetryPasses passes later; a faulting copy leaves the table (its owner's next word notes
+// it again). Each kind of line is written once per owner word and copy body.
+static void HandApplyDrain()
+{
+    ++g_hdPass;
+    if (g_hdWant.empty() || EngineWritesBlocked()) return;
+    std::map<unsigned int, HdWant>::iterator it = g_hdWant.begin();
+    while (it != g_hdWant.end())
+    {
+        const unsigned int uid = it->first;
+        if (net::IsUidMine(uid)) { g_hdWant.erase(it++); continue; }
+        ::Character* c = FindSpawned(uid);
+        HdWant& w = it->second;
+        ++it;
+        if (c == 0)
+        {
+            if (!w.waited) { w.waited = 1; ++g_hdWaiting; }
+            if ((w.logged & kHdLogNoCopy) == 0)
+            {
+                w.logged |= kHdLogNoCopy;
+                HdApplyLine(uid, "notFound", HdWordText(w.h) + " - no copy here yet: kept until the copy is built");
+            }
+            continue;
+        }
+        if (w.body != (const void*)c)
+        {
+            HdWantRestart(&w);   /* a copy body not seen under this word: nothing has been applied to it yet */
+            w.body = c;
+        }
+        if (w.reverts > 0)
+        {
+            const int released = IsSuppressed(c) ? 0 : 1;
+            if (handwire::RearmReverts(w.reverts, w.released, released, g_hdPass - w.revertPass))
+            {
+                ++g_hdRearmed;
+                w.reverts = 0;
+                w.released = -1;
+                w.logged &= ~kHdLogCapped;
+            }
+            else w.released = released;
+        }
+        else w.released = -1;
+        if (w.nextPass != 0 && (int)(g_hdPass - w.nextPass) < 0) continue;
+        w.nextPass = 0;
+        unsigned int off = 0;
+        const void* hand = WeaponInHandsOf(c, &off);
+        if (hand == kWeaponUnreadable) continue;
+        if (off == 0x708) { ++g_hdSkippedAnimal; g_hdWant.erase(uid); continue; }   /* an animal's natural weapons are its own */
+        if (hand != 0 && hand == HdFistsPod(c)) hand = 0;
+        void* item = 0;
+        const int found = w.h.has ? HandFindItem(c, w.h.section, w.h.x, w.h.y, w.h.sid, &item) : 0;
+        const int held = (hand == 0) ? handwire::kHeldNone : ((found && hand == item) ? handwire::kHeldWant : handwire::kHeldOther);
+        const int act = handwire::Decide(w.h.has, held, found, w.acted, w.reverts);
+        if (act == handwire::kActNone) continue;
+        if (act == handwire::kActWait)
+        {
+            ++g_hdNotFound;
+            if (!w.waited) { w.waited = 1; ++g_hdWaiting; }
+            if ((w.logged & kHdLogNotFound) == 0)
+            {
+                w.logged |= kHdLogNotFound;
+                HdApplyLine(uid, "notFound", HdWordText(w.h) + " - not in the copy's section yet: looked up again on later passes");
+            }
+            w.nextPass = g_hdPass + kHdRetryPasses;
+            continue;
+        }
+        if (act == handwire::kActCapped)
+        {
+            if ((w.logged & kHdLogCapped) == 0)
+            {
+                w.logged |= kHdLogCapped;
+                ++g_hdCapped;
+                HdApplyLine(uid, "capped", HdWordText(w.h) + " - the copy's own engine changed its hands back " + N3((long long)w.reverts)
+                            + " times in a row: left as it is until its planner is held again after its fight window, "
+                            + N3((long long)handwire::kRevertQuietPasses) + " passes go by, or its owner's hands change");
+            }
+            continue;
+        }
+        const size_t n = std::strlen(w.h.section);
+        if (act == handwire::kActDraw && n > (size_t)handwire::kDrawSecMax)
+        {
+            ++g_hdNotFound;
+            if ((w.logged & kHdLogTooLong) == 0)
+            {
+                w.logged |= kHdLogTooLong;
+                HdApplyLine(uid, "notFound", HdWordText(w.h) + " - the section name is longer than the draw takes here: not drawn");
+            }
+            w.nextPass = g_hdPass + kHdRetryPasses;
+            continue;
+        }
+        const bool again = handwire::IsRevert(act, w.acted);
+        const bool draw = (act == handwire::kActDraw);
+        const int rc = draw ? HdDrawPod(c, item, w.h.section, n) : HdPutAwayPod(c);
+        if (rc == 1)
+        {
+            if (draw) ++g_hdDrew; else ++g_hdPutAway;
+            if (again) { ++g_hdReverts; ++w.reverts; w.revertPass = g_hdPass; }
+            w.acted = 1;
+            HdApplyLine(uid, draw ? "drew" : "putAway", HdWordText(w.h)
+                        + (again ? " - again: the copy's own engine had changed its hands (" + N3((long long)w.reverts) + " of "
+                                   + N3((long long)handwire::kRevertCap) + ")" : std::string()));
+            continue;
+        }
+        if (rc == -2)
+        {
+            ++g_hdNoRender;
+            if ((w.logged & kHdLogNoRender) == 0)
+            {
+                w.logged |= kHdLogNoRender;
+                HdApplyLine(uid, "noRender", HdWordText(w.h) + " - no render object / hand-item user / inventory yet: tried again later");
+            }
+            w.nextPass = g_hdPass + kHdRetryPasses;
+            continue;
+        }
+        if (rc == 0)
+        {
+            ++g_hdEngineRefused;
+            if ((w.logged & kHdLogRefused) == 0)
+            {
+                w.logged |= kHdLogRefused;
+                HdApplyLine(uid, draw ? "notFound" : "putAway", HdWordText(w.h) + (draw
+                            ? std::string(" - the engine's draw refused the item (its inventory does not hold it): tried again later")
+                            : std::string(" - NOT TAKEN: the hand item did not read back empty: tried again later")));
+            }
+            w.nextPass = g_hdPass + kHdRetryPasses;
+            continue;
+        }
+        ++g_hdFault;
+        HdApplyLine(uid, draw ? "drew" : "putAway", HdWordText(w.h) + " FAULTED - the entry goes; its owner's next word notes it again");
+        g_hdWant.erase(uid);
+    }
+}
+
+/* MAIN THREAD: character c's hand word now (handwire::OwnerWord); *hand the held item (0 bare hands, the fists object included),
+   *h its word (uid, has, and section / slot / sid when the item could be named) */
+static int HdOwnerWordNow(unsigned int uid, const void* c, const void** hand, handwire::Hand* h)
+{
+    handwire::Clear(h);
+    h->uid = uid;
+    *hand = 0;
+    unsigned int off = 0;
+    const void* p = WeaponInHandsOf(c, &off);
+    if (p == kWeaponUnreadable) return handwire::OwnerWord(0, 0, 0, 0);
+    if (off == 0x708) return handwire::OwnerWord(1, 1, 0, 0);
+    if (p != 0 && p == HdFistsPod(c)) p = 0;
+    *hand = p;
+    int named = 0;
+    if (p != 0)
+    {
+        h->has = 1;
+        named = HandItemIdentity(p, h->section, (int)sizeof(h->section), &h->x, &h->y, h->sid, (int)sizeof(h->sid)) != 0
+                && handwire::HandOk(*h) ? 1 : 0;
+    }
+    return handwire::OwnerWord(1, 0, p != 0 ? 1 : 0, named);
+}
+
+/* MAIN THREAD: one capped [HAND] send line */
+static void HdSendLine(unsigned int uid, const handwire::Hand& h, const char* tail)
+{
+    static std::map<unsigned int, int> perUid;
+    if (g_hdLoggedSend >= kHdLogLimit || perUid[uid] >= kHdLogPerUid) return;
+    ++perUid[uid];
+    ++g_hdLoggedSend;
+    DebugLog("[HAND] send uid=" + N3(uid) + " " + HdWordText(h) + std::string(tail));
+}
+
+// MAIN THREAD (CombatModeTick): one of this game's own characters' hand item, sampled every frame by mirror slot i; a change of the
+// item, or of its section or slot (read again every kHdSlotRecheck frames while the same item is held), sends one MSG_HAND at once.
+// A send that found no road is tried again every frame until one goes through (counted and logged once). The first sample of a
+// slot's character sends only a held item (a new copy's hands are bare).
+static unsigned int   g_hdSeenUid[kMaxCombatWatch];
+static const void*    g_hdSeen[kMaxCombatWatch];       /* the item last sent for slot i (0 bare hands) */
+static handwire::Hand g_hdSeenWord[kMaxCombatWatch];   /* the word last sent for slot i */
+static unsigned char  g_hdSendFailed[kMaxCombatWatch]; /* 1: slot i's last send found no road */
+const long long kHdSlotRecheck = 15;   /* frames between section / slot reads of an unchanged hand item (a quarter second at 60) */
+static void HandSample(int i, unsigned int uid, const void* c)
+{
+    if (i < 0 || i >= kMaxCombatWatch) return;
+    unsigned int off = 0;
+    const void* hand = WeaponInHandsOf(c, &off);
+    if (hand == kWeaponUnreadable) return;
+    const bool fresh = (g_hdSeenUid[i] != uid);
+    if (fresh) { g_hdSeenUid[i] = uid; g_hdSeen[i] = 0; handwire::Clear(&g_hdSeenWord[i]); g_hdSendFailed[i] = 0; }
+    if (off == 0x708) { if (fresh) ++g_hdSkippedAnimal; return; }   /* an animal's natural weapons: not sent */
+    if (hand != 0 && hand == HdFistsPod(c)) hand = 0;
+    const bool recheck = hand != 0 && ((g_cmPulseTick + (long long)i) % kHdSlotRecheck) == 0;
+    if (hand == g_hdSeen[i] && !g_hdSendFailed[i] && !recheck) return;
+    const void* now = 0;
+    handwire::Hand h;
+    const int word = HdOwnerWordNow(uid, c, &now, &h);
+    if (word == handwire::kWordUnnamed)
+    {
+        if (hand == g_hdSeen[i]) return;   /* the word already sent for this item stands */
+        g_hdSeen[i] = hand;
+        g_hdSendFailed[i] = 0;
+        ++g_hdNotSent;
+        if (g_hdLoggedSend < kHdLogLimit)
+        {
+            ++g_hdLoggedSend;
+            DebugLog("[HAND] send uid=" + N3(uid) + " item=? - its section, slot or sid could not be read (or is too long): NOT SENT");
+        }
+        return;
+    }
+    if (word != handwire::kWordBare && word != handwire::kWordItem) return;
+    if (hand == g_hdSeen[i] && !g_hdSendFailed[i] && handwire::Same(h, g_hdSeenWord[i])) return;   /* the same section and slot */
+    const bool sent = net::SendHand(uid, h.has, h.section, h.x, h.y, h.sid);
+    if (!sent)
+    {
+        if (!g_hdSendFailed[i])
+        {
+            g_hdSendFailed[i] = 1;
+            ++g_hdNotSent;
+            HdSendLine(uid, h, " NOT SENT (no road): tried again every frame");
+        }
+        return;
+    }
+    g_hdSendFailed[i] = 0;
+    g_hdSeen[i] = hand;
+    g_hdSeenWord[i] = h;
+    ++g_hdSent;
+    HdSendLine(uid, h, "");
+}
+
+// MAIN THREAD. See combat.h.
+bool HandResendOwned(unsigned int uid)
+{
+    if (!net::IsUidMine(uid)) return false;
+    ::Character* c = FindSpawned(uid);
+    if (!PlausibleObject(c)) return false;
+    const void* hand = 0;
+    handwire::Hand h;
+    if (!handwire::ResendSends(HdOwnerWordNow(uid, c, &hand, &h))) return false;
+    if (!net::SendHand(uid, h.has, h.section, h.x, h.y, h.sid)) { ++g_hdNotSent; return false; }
+    ++g_hdResent;
+    HdSendLine(uid, h, " (resent with its SPAWN)");
+    return true;
+}
+
 void CombatModeTick()
 {
     ++g_cmPulseTick;
+    if ((g_cmPulseTick % 60) == 0) SwingCreditLogDrain();   /* the swing gate's hold lines, at most a few per copy */
+    FightLogDrain();   /* the [FIGHT] lines waiting from the swing and hit hooks */
 
     // F391 / F267 - **THE ONE ASSUMPTION THE INDEXING REWRITE STILL RESTS ON, CHECKED OUT LOUD.**
     // The watch is indexed by mirror slot, so the table must be at least as large as the mirror.
@@ -6353,12 +9294,24 @@ void CombatModeTick()
         // 9 ms cannot be found by a poll.
         const bool mine = net::IsUidMine(uid);
         const int  st   = *(const int*)((const char*)cc + kCombatStateOff);
+#ifdef SW_DEV_BUILD
+        // PROBE-START: P181 - the owner's stance bytes, a line on each change
+        if (mine) P181OwnerCheck(uid, c);
+        // PROBE-END: P181
+#endif
 
         // P045 / T095 - taken BEFORE anything below can write to this combat object, and taken on
         // BOTH instances for BOTH owned characters and puppets. The owned characters are the
         // control and they are the reason this is not a switch position: a control arm has to be
         // capable of a non-zero reading (T094).
         SampleCombatTick(w, c, cc, mine, on);
+        if (mine) RangedModeSample(i, uid, c);   /* the owner's ranged mode: a change sends one STATE at once */
+        if (mine) HandSample(i, uid, c);   /* the owner's hand item: a change sends one MSG_HAND at once */
+#ifdef SW_DEV_BUILD
+        // PROBE-START: P190 - the hands, back and hip of a player character in combat or ranged mode
+        P190GearSample(uid, c, mine, on);
+        // PROBE-END: P190
+#endif
 
         // F416 - per-frame visible displacement while in combat (both instances). Reset when combat
         // starts so a row carries one fight's number; the authority emits it at the OFF edge.
@@ -6437,6 +9390,11 @@ void CombatModeTick()
                              + "," + q + "tick" + q + ":" + N3(g_cmPulseTick) + "}");
                 }
 
+#ifdef SW_DEV_BUILD
+                // PROBE-START: P181 - a swing the copy of another game's player character starts here, with its stance
+                if (!mine && st == SWORD_SWING && w->lastState != SWORD_SWING && w->lastState != -1) P181CopySwing(uid, c, cc);
+                // PROBE-END: P181
+#endif
                 // F348 - THE SWING, SENT ON THE TRANSITION INTO THE ATTACK STATE.
                 //
                 // Not on the transition into STARTUP with nextMove==0, which is one frame earlier
@@ -6479,8 +9437,28 @@ void CombatModeTick()
                     // like.
                     if (!haveTarget)      ++g_swSendNoTargetObj;
                     else if (tgtUid == 0) ++g_swSendNotReplicated;
-                    else if (net::SendSwing(uid, tgtUid)) ++g_swSent;
-                    else                  ++g_swSendFailed;
+                    else
+                    {
+                        // The attack move this swing started (initialiseAttack stored it at CombatClass +0x150), for
+                        // the copy to play the same one (fight parity, hitwire.h); unreadable = not carried.
+                        char mv[fightlog::kNameBuf], wire[hitwire::kNameBuf];
+                        FightNameAt(FightMoveOf((const void*)cc, 0), 0x0, mv);
+                        hitwire::WireNameOf(mv, wire);
+                        if (wire[0] == 0) InterlockedIncrement64(&g_fpSwingNoMove);
+                        if (IsUidPlayerCharAnyThread(uid) == 1 && IsUidPlayerCharAnyThread(tgtUid) == 1) FpBlockNewSwing(tgtUid, uid);
+                        if (net::SendSwing(uid, tgtUid, wire)) { ++g_swSent; w->swingEndOwed = 1; w->swingEndTarget = tgtUid; }
+                        else                               ++g_swSendFailed;
+                    }
+                }
+
+                // THE OWNER'S SWING ENDED: the transition OUT of the attack state whose entry sent SWING above (same row, same
+                // frame sampling, main thread). SWING_END lets the copies drop the credit of a blow they have not thrown by now
+                // (swinggate.h OwnerEnd). Only after a SWING was sent; a rebind clears the debt (the copies' next SWING
+                // supersedes instead).
+                if (w->swingEndOwed && w->lastState == SWORD_SWING && st != SWORD_SWING)
+                {
+                    w->swingEndOwed = 0;
+                    if (mine && net::SendSwingEnd(uid, w->swingEndTarget)) ++g_sgEndSent;
                 }
 
                 w->lastState = st;
@@ -6524,7 +9502,10 @@ void CombatModeTick()
                 // - which then reaches SWORD_SWING within 30 frames BECAUSE WE JUST CAUSED IT, and
                 // is counted LANDED. That is F354's own headline defect, one level up, on the
                 // state F354 introduced.
-                if (iage > kSwingIntentTicks)
+                if (iage > kSwingIntentTicks
+                    || (w->swingIntentGated
+                        && (unsigned long)(::GetTickCount() - w->swingIntentMs) >= (unsigned long)swinggate::kLifeMs)
+                    || (w->swingIntentGated && w->swingIntentEnded))   /* the owner's swing ended: its credit is gone */
                 {
                     w->swingIntent = 0;
                     ++g_swIntentExpired;
@@ -6648,7 +9629,8 @@ void CombatModeTick()
                             gap = ::sqrtf(dx * dx + dz * dz);
                         }
 
-                        ErrorLog("[M6] SWING DECLINED BY THE ENGINE uid=" + N3(uid)
+                        ErrorLog("[M6] SWING DECLINED (by the engine, or - for a copy of another player's character - by"
+                                 " the swing gate for want of a matching credit: see swingGate[declined,engineNo]) uid=" + N3(uid)
                                  + " target=" + N3(w->swingTarget)
                                  + " - we wrote nextMove=0/STARTUP and the state did not reach"
                                    " SWORD_SWING WITHIN " + N3(kSwingVerdictTicks) + " frames."
@@ -7193,6 +10175,10 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
     // (src/common/uidlayout.h, uidblock.h), so two games cannot mint one uid; this test stays as the ownership rule.
     if (net::IsUidMine(uid)) { ++g_cmNotOurs; return; }
 
+    // The owner's fight ended: its copy's unthrown swing credits go with it (swinggate.h DropAll), whether or not the copy
+    // can be found here.
+    if (!on) { SwingCreditDrop(uid); FightChoiceLegEnd(uid); }   /* and its fight-choice row: one leg line, nothing left waiting */
+
     ::Character* c = FindSpawned(uid);
     if (c == 0)
     {
@@ -7211,6 +10197,11 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
         ErrorLog("[M6] COMBATMODE uid=" + N3(uid) + " - no readable CombatClass, refused");
         return;
     }
+#ifdef SW_DEV_BUILD
+    // PROBE-START: P181 - the combat order applied to the copy, with the copy's stance
+    P181CopyOrder(uid, c, on, targetUid);
+    // PROBE-END: P181
+#endif
 
     int before = CombatModeOf(cc);
 
@@ -7664,9 +10655,12 @@ void ApplyRemoteCombatMode(unsigned int uid, bool on, unsigned int targetUid)
 // **which gate was still closed** - which is a far more useful number than "we refused once".
 //
 // MAIN THREAD ONLY - it touches the engine's combat object, same as ApplyRemoteCombatMode.
-void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid)
+void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid, const char* move)
 {
     ++g_swRecv;
+    // The owner's real swing: one swing credit for its copy here (the swing gate), holding the attack move it started,
+    // whatever the intent below becomes.
+    const int credited = net::IsUidMine(uid) ? 0 : SwingCreditAdd(uid, targetUid, move);
     if (!g_swingRepl) { ++g_swDisabled; return; }
 
     // F351 - AUTHORITY CHECK. `OnDespawn` has one and this did not, so a SWING naming a uid WE
@@ -7688,10 +10682,29 @@ void ApplyRemoteSwing(unsigned int uid, unsigned int targetUid)
     if (w->swingIntent) ++g_swIntentSuperseded;   // the previous blow never got its chance
     w->swingIntent       = 1;
     w->swingIntentTick   = g_cmPulseTick;
+    w->swingIntentGated  = credited;
+    w->swingIntentEnded  = 0;
+    w->swingIntentMs     = ::GetTickCount();
     w->swingIntentTarget = targetUid;
     w->swingIntentGate   = SW_GATE_NONE;
     w->swingIntentLastTry = g_cmPulseTick;
     ++g_swIntents;
+}
+
+// MSG_SWING_END: the owner's swing of uid ended on its game. Every swing credit its copy here still holds belongs to that swing
+// or an older one (the owner throws one swing at a time), so all are dropped (counted ownerEndDrop - owner blows the copy did
+// not throw, blows that do no damage), and a pending start-on-arrival intent of that copy expires at its next service (its
+// retry would have no credit to start on: the gate reads the credit at the engine's attack start, detour_sgAttackStart).
+// MAIN THREAD ONLY.
+void ApplyRemoteSwingEnd(unsigned int uid, unsigned int targetUid)
+{
+    (void)targetUid;
+    ++g_sgEndRecv;
+    if (uid == 0 || net::IsUidMine(uid)) return;
+    SwingCreditEnd(uid);
+    if (FindSpawned(uid) == 0) return;
+    CombatWatch* w = CombatWatchFor(uid);
+    if (w != 0 && w->swingIntent && w->swingIntentGated) w->swingIntentEnded = 1;
 }
 
 // P055 / P057 / F408 - **THE FORBIDDEN COMBINATION IS NOW AN INTERLOCK, NOT A PARAGRAPH.**
@@ -7982,7 +10995,16 @@ void ReportCombatMode()
              + " unscoredStale=" + N3(g_swUnscoredStale)
              + " writesPendingNow=" + N3(writesPending)
              // F392 - the `wrote = …` identity's matching term. Same reason as the one above.
-             + " writeDroppedByRebind=" + N3(g_swUnscoredRebind));
+             + " writeDroppedByRebind=" + N3(g_swUnscoredRebind)
+             + SwingCreditToken()     /* the swing gate's counters */
+             + FightParityToken()     /* fight parity's counters */
+             + FightChoiceToken()     /* T-1101 design (c): the owner's fight choices sent, and its copies' use of them */
+#ifdef SW_DEV_BUILD
+             // PROBE-START: P190
+             + P190ReportToken()
+             // PROBE-END: P190
+#endif
+             );
 
     // F354 - THE TWO IDENTITIES, WRITTEN OUT SO A READER CHECKS THEM RATHER THAN TRUSTING THEM.
     // The first repair asserted an identity its code did not maintain (the F343 class), because a
@@ -9061,6 +12083,8 @@ void ReportCombatMode()
 void CombatWorldTeardown()
 {
     g_knockPendingCount = 0;   // K2 (review-k2 LOW): pending knocks name uids of the world being destroyed
+    g_hdWant.clear();   // the copies' wanted hand items (MSG_HAND) name copies of the world being destroyed
+    memset((void*)g_hdSeenUid, 0, sizeof(g_hdSeenUid));   // each slot's next hand sample starts afresh (its items are freed)
     int watched = 0, windows = 0;
     for (int i = 0; i < kMaxCombatWatch; ++i)
     {
@@ -9092,6 +12116,7 @@ void CombatWorldTeardown()
     }
     InterlockedExchange(&g_endWatchNext, 0);
     InterlockedExchange(&g_endWatchAny, 0);
+    FightChoiceForget("world teardown");   /* every fight-choice row names a copy of the world being destroyed */
 
     DebugLog("[M6] world teardown: forgot " + N3((long long)watched) + " combat watch rows ("
              + N3((long long)windows) + " with the AI released), " + N3((long long)slots)

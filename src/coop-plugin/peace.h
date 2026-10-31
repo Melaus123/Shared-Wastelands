@@ -29,7 +29,12 @@
 #include <string>
 namespace coop {
 void InstallPeace();               // startPlugin: prologue-checked MinHook install of the two virtuals
-void SetPeaceOn(bool on);          // the peace on|off verb. MAIN THREAD: the ON edge does the evidence walk
+void SetPeaceOn(bool on);          // the peace on|off verb (plain peace; ends the fight form). MAIN THREAD: the ON edge does the evidence walk
+// Owner 1205 a, TEST-ONLY: `peace fight <faction>[,<faction>]` - the lever on in its FIGHT form: covered as plain peace except two
+// player-side characters and a pair whose non-player side's faction is one of these (at most 4, looked up by name as `spawnfaction`
+// does; a name that does not resolve, or a player-side faction, refuses the whole command). No names = only player pairs are
+// left to the engine. Returns the status line: `ok peace fight exempt=<n>` or `error peace fight: ...`. MAIN THREAD.
+std::string PeaceFightLever(const std::string& list);
 void ReportPeace();                // folded into ReportEverything() (F125/F177), not behind a verb of its own
 // T-546 (owner 512): teammates' characters are one side, "as if one person owned both sets". For a pair of DIFFERENT factions both
 // in this player's team - this game's player faction and its teammates' factions - both detours answer before the engine is asked,

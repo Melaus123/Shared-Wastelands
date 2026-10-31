@@ -121,7 +121,7 @@ inline int ResetClassify(const std::string& name, int isDir)
     static const char* const move[] = { "uniques.txt", "world_relations.txt", "town_losses.txt", "town_bars.txt", "owed_people.txt",
                                         "owed_done.txt", "owed_meta.txt", "research_boxes.txt", "research_takes.txt", "clock.txt", "areas.txt", "pendingpos.txt", "repair.txt",
                                         "queue.txt", "kept-pieces.txt", "kept-state.txt", "player-towns.txt", "kept-towns.txt",
-                                        "recorded_areas.txt", "area_holders.txt" };   /* T-1084 step 3: the area-recorded marks (store_main.cpp RecordedAreasFile) and the holder history (AreaHoldersFile) belong to the old world's records */
+                                        "recorded_areas.txt", "area_holders.txt", "town_versions.txt" };   /* town_versions.txt: the old world's town versions (store_main.cpp TownVersFile); T-1084 step 3: the area-recorded marks (store_main.cpp RecordedAreasFile) and the holder history (AreaHoldersFile) belong to the old world's records */
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); ++i) if (b == keep[i]) return kResetKeep;
     for (size_t i = 0; i < sizeof(move) / sizeof(move[0]); ++i) if (b == move[i]) return kResetMove;
     if (b.size() > 13 && b.compare(0, 8, "deleted.") == 0 && worldkeep::EndsWith(b, ".bits")) return kResetMove;

@@ -116,7 +116,7 @@ void DeadlookForgetCopy(unsigned int uid);
 // MAIN THREAD (spawn.cpp RepeatSpawnAct): a stale copy is made again - the old body's 'owner's record applied' mark is forgotten.
 void AppearanceForgetCopyBody(unsigned int uid);
 // MAIN THREAD (off it: counted, never marked). Called right after a mod apply that may queue a body rebuild on
-// `uid` (look, kit, limb): a set rebuild-pending byte marks the uid, and the createBody guard holds that rebuild in ragdoll
+// `uid` (look, kit, limb): a set rebuild-pending byte marks the uid, and the createBody guard holds that rebuild as a copy's
 // even if the uid becomes this game's own before it runs.
 void CopyBodyNoteModApply(unsigned int uid, ::Character* c);
 // MAIN THREAD (spawn.cpp SpawnWorldTeardown): the world is going - every copy's marks DeadlookForgetCopy forgets one copy at a
@@ -226,7 +226,9 @@ std::string LookTestLever(unsigned int uid, bool restore);
 // looktest show <uid> - the lever's read half, any game: the character's look as this game shows it. MAIN THREAD.
 std::string LookTestShow(unsigned int uid);
 // bodytest pending <copyUid> - TEST-ONLY lever (appearance.cpp): forces a copy's queued body rebuild into the engine's ragdoll
-// pass at the end of its get-up blend (the window the copy body-rebuild guard holds). MAIN THREAD.
+// pass at the end of its get-up blend (the window the copy body-rebuild guard holds). bodytest ragdoll <copyUid> - the same
+// lever's second mode: sets a copy's rebuild-pending byte once while it lies in ragdoll outside the pass and logs whether the
+// guard ran or held that rebuild. sub = "pending" | "ragdoll". MAIN THREAD.
 std::string BodyTestLever(const std::string& sub, unsigned int uid);
 // The K2 detour around the engine's ragdoll pass (ThreadSafeRagdollUpdates): RagdollPassEnter returns the depth that
 // RagdollPassLeave restores (-1 off the main thread, counted). While the main thread is inside the pass no copy's body is rebuilt.

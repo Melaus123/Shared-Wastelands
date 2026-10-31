@@ -176,7 +176,8 @@ void NoteAnnouncedOnTake(unsigned int uid);   /* M7a3f3 [m7a3f3-ws2] */
 void NoteNotAnnounced(unsigned int uid);      /* T-556: a SPAWN that did not go out - the announce pass sends it. MAIN THREAD */
 // inv7e2: a reloaded copy's character was retired - unregister it (tracking, adopted row, uid->object index) and withdraw
 // what this game announced for it. 1 = the peer's copy is withdrawn (now, or already by the unload-destroy path),
-// 0 = it was never announced, 2 = the send was declined and the P8m registry owes it. MAIN THREAD.
+// 0 = it was never announced, 2 = the send was declined and the P8m registry owes it, 3 = held (an open release, its batch or an XFER
+// flight decides; nothing sent). MAIN THREAD.
 int WithdrawReloadedCopy(unsigned int uid, bool wasAnnounced);
 
 // Counters into the report line. Read-only.

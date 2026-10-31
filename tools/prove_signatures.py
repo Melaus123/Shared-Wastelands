@@ -6,15 +6,24 @@ READ-ONLY on the executables: each is read as bytes; nothing is written, run or 
 
     python tools/prove_signatures.py                     both Steam exes against their own tables (the proof)
     python tools/prove_signatures.py EXE [TABLE]         one exe; with TABLE, compared to it row by row
+    python tools/prove_signatures.py --stamp FILE        the proof, skipped when FILE holds the stamp of its last PASS
 
 For each row it prints nothing when the resolved line equals the table's line exactly (name, kind, rva, verify_at,
 bytes / pointer target / '-'), and names every row that differs or does not resolve. Exit 0 only when every exe
 given reproduces its table with 0 differences and 0 unresolved rows.
 
+THE STAMP (owner decision 1204; build.bat passes --stamp src/coop-plugin/obj/signatures.proved). The proof's answer
+depends only on the files in src/coop-plugin/addresses/, this tool and the two executables, and it takes about 20 s of
+every build. So after a PASS the tool writes a SHA-256 over every file in addresses/ (name and bytes), this file's bytes
+and each executable's path, size and modified time; the next run with the same stamp prints one SKIPPED line and exits
+0. A missing stamp, a different one, or an executable that is gone runs the proof as before (a stamp is never written
+for a run that did not pass, so a missing executable still fails the build).
+
 WHAT THIS PROVES: that on Steam 1.0.65 (the RE_Kenshi-patched file this project runs) and on Steam 1.0.68 the
 pattern road gives EXACTLY the tables. It proves nothing about a GOG executable: that claim needs a GOG player's
 test (owner 99).
 """
+import hashlib
 import os
 import struct
 import sys
@@ -322,7 +331,7 @@ def prove(exe, table, rows, nosig):
 
 
 def selftest():
-    """gog1 fold 2: the prover refuses a rank tie exactly as the plugin does (test_main.cpp holds the plugin's side).
+    """gog1 fold 2: the prover refuses a rank tie exactly as the plugin does (src/coop-test/suite_part1.cpp holds the plugin's side).
     Returns '' or what went wrong."""
     head = ['!sigversion 2', '!count 2', '!nosigcount 0']
     a = 'A code 0 40534883EC20C3 0 0 7 0 - .text 0 -'
@@ -362,5 +371,51 @@ def main():
     return bad
 
 
+def stamp_of():
+    """what the proof's answer depends on, as one hash: every file in addresses/, this tool, each executable's size and time"""
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(ADDR)):
+        path = os.path.join(ADDR, name)
+        if os.path.isfile(path):
+            with open(path, 'rb') as f:
+                h.update(name.encode('utf-8') + b'\0' + f.read() + b'\0')
+    with open(os.path.abspath(__file__), 'rb') as f:
+        h.update(f.read())
+    for exe, _ in PAIRS:
+        try:
+            st = os.stat(exe)
+            h.update(('%s|%d|%d\n' % (exe, st.st_size, int(st.st_mtime))).encode('utf-8'))
+        except OSError:
+            h.update(('%s|missing\n' % exe).encode('utf-8'))
+    return h.hexdigest()
+
+
+def main_stamped(stamp):
+    want = stamp_of()
+    try:
+        with open(stamp) as f:
+            have = f.read().strip()
+    except (IOError, OSError):
+        have = ''
+    if have == want:
+        print('PROOF: SKIPPED - no address file, signatures.sig, executable or this tool changed since its last PASS here (%s)' % stamp)
+        return 0
+    rc = main()
+    if rc == 0:
+        d = os.path.dirname(os.path.abspath(stamp))
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        with open(stamp, 'w') as f:
+            f.write(want + '\n')
+    return rc
+
+
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--stamp':
+        if len(sys.argv) != 3:
+            print('PROOF: FAIL - --stamp takes one file and no executable')
+            sys.exit(2)
+        stamp_path = sys.argv[2]
+        del sys.argv[1:]
+        sys.exit(main_stamped(stamp_path))
     sys.exit(main())

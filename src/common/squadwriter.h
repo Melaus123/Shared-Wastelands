@@ -441,18 +441,34 @@ inline int TravelInBuild(int usable, int hasCopy, int failedBefore, int mineHeld
 inline int NewlyHeld(int before, int now) { return (now == 1 && before != 1) ? 1 : 0; }
 /* T-1084: the kept-records sweep's queue (store.cpp KeptSweepQueue / KeptRecordSweepTick). Why a record was queued, kept per entry:
    this game became the off-screen authority / an area map came after a no-map refusal / this game newly holds the record's area. */
-enum { kSweepWhyAuthority = 1, kSweepWhyMapFresh = 2, kSweepWhyNewlyHeld = 4, kSweepWhyFreed = 8, kSweepWhyLoaded = 16 };   /* T-1084 step 3: kSweepWhyFreed - the off-screen authority, an area another game held is held by nobody now (arearec.h AreaFreedStep). kSweepWhyLoaded: a record refused as kCopyNotKeptUnloaded whose area is loaded here now - queued with its area, as a newly held one */
+enum { kSweepWhyAuthority = 1, kSweepWhyMapFresh = 2, kSweepWhyNewlyHeld = 4, kSweepWhyFreed = 8, kSweepWhyLoaded = 16, kSweepWhyWriterLeft = 32, kSweepWhyReask = 64 };   /* kSweepWhyWriterLeft: a squad another game ran, refused here meanwhile, let go now - queued with its area, as a newly held one [t1084i-sweep]. kSweepWhyReask: a squad still waiting after its release (refused then by the area gate), asked again because an applied map changed its area's holder or came after a no-map refusal - queued with its area the same way */   /* T-1084 step 3: kSweepWhyFreed - the off-screen authority, an area another game held is held by nobody now (arearec.h AreaFreedStep). kSweepWhyLoaded: a record refused as kCopyNotKeptUnloaded whose area is loaded here now - queued with its area, as a newly held one */
 /* 1 = a record is queued: not a zone record, and inside the trigger's areas when the trigger names areas (filtered) */
 inline int SweepQueueTakes(int isZone, int filtered, int inFilter) { return (isZone == 0 && (filtered == 0 || inFilter != 0)) ? 1 : 0; }
 /* 1 = the record stands, at its turn (nowSector), in the area it was queued for as newly held, or as loaded here now for a squad the
    engine does not keep (queuedSector; area key x * 64 + y) - either way this game runs that area and the engine wakes it in place */
 inline int SweepInNewlyHeld(int why, int queuedSector, int nowSector)
 {
-    return ((why & (kSweepWhyNewlyHeld | kSweepWhyLoaded)) != 0 && queuedSector >= 0 && queuedSector == nowSector) ? 1 : 0;
+    return ((why & (kSweepWhyNewlyHeld | kSweepWhyLoaded | kSweepWhyWriterLeft | kSweepWhyReask)) != 0 && queuedSector >= 0 && queuedSector == nowSector) ? 1 : 0;
 }
 /* 1 = the area-bound triggers (newly held, loaded here) are the record's only reasons (then a record outside its area is not built by
    the sweep) */
-inline int SweepOnlyNewlyHeld(int why) { return (why != 0 && (why & ~(kSweepWhyNewlyHeld | kSweepWhyLoaded)) == 0) ? 1 : 0; }
+/* a writer-left or re-asked entry (kSweepWhyWriterLeft, kSweepWhyReask) stops waiting once the sweep decided it [t1084i-f1-sweep]: built (or tried), a copy here, no usable
+   record, or failed before; refused by the area gate, deferred or outside its area it keeps waiting for the next release, list end or re-ask */
+inline int SweepWriterLeftDone(int pick) { return (pick == kSwBuild || pick == kSwGone || pick == kSwHasCopy || pick == kSwFailedBefore) ? 1 : 0; }
+inline int SweepOnlyNewlyHeld(int why) { return (why != 0 && (why & ~(kSweepWhyNewlyHeld | kSweepWhyLoaded | kSweepWhyWriterLeft | kSweepWhyReask)) == 0) ? 1 : 0; }
+/* the kept-records sweep's build line [t1084i-f2-sweep]: the words for the entry's reasons (kSweepWhy*), inNew = the record stands in the
+   area it was queued for - each trigger its own words */
+inline const char* SweepWhyLabel(int why, int inNew)
+{
+    if ((why & kSweepWhyWriterLeft) != 0) return "the game that ran the squad let it go";
+    if ((why & kSweepWhyReask) != 0) return "asked again while waiting since its release: its area's holder changed or an area map came after a no-map refusal";
+    if (inNew != 0 && (why & kSweepWhyNewlyHeld) != 0) return "this game newly holds its area";
+    if (inNew != 0 && (why & kSweepWhyLoaded) != 0) return "its area is loaded here now (a squad the engine does not keep)";
+    if ((why & kSweepWhyFreed) != 0) return "an area another game held is held by nobody now (this game is the off-screen authority)";
+    if ((why & kSweepWhyAuthority) != 0) return "this game is the off-screen authority now";
+    if ((why & kSweepWhyMapFresh) != 0) return "the area map is fresh again after a no-map refusal";
+    return "queued with no reason recorded";
+}
 /* one area at an applied area map: before = this game's stored answer (1 held, 0 not), now = MineHeldTS (1 / 0 / -1 no fresh map /
    -2 frozen); *newly = 1 when this game newly holds it; returns the answer to store (no fresh map keeps the stored one) */
 inline int SweepAreaStep(int before, int now, int* newly)

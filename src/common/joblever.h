@@ -5,7 +5,10 @@
 //   jobtest input <buildingKey> <itemSid> <n> [section=<name>]  - P17: n of an item into the machine's input section (items.cpp)
 //   jobtest input <buildingKey> need<i> <n> [section=<name>]    - T-609: the same, the item being the one the machine's i-th
 //                                                                  input asks for (i = 0..; read as `jobtest show` reads it)
-//   jobtest show <buildingKey>                                   - P17: read-only - the machine's name, product, inputs, sections
+//   jobtest show <needle...> [near=<x>,<z>]                      - P17: read-only - the machine's name, product, inputs, sections
+//   The <needle> of work / show / list is one or more words, matched in any case against a loaded building's, furniture row's or
+//   interior piece's instance id, position key, record id or name; near=<x>,<z> takes the match nearest that world point.
+//   jobtest list <needle...> [radius]                           - read-only - every match, with its position and distance
 //   cagetest <copyUid> nearest                                   - P43: this game's engine cages the other game's character's copy
 //                                                                  in the nearest free cage (spawn.cpp)
 //   boxdigest [<window>] players                                 - the digest with player-owned boxes included (items.cpp)
@@ -25,23 +28,129 @@ const int kWorkDoorMax = 31;            // jobtest work door=<i>: i at most this
 const int kInputMax = 1000;             // jobtest input: at most this many items in one put
 const int kNeedMax = 15;                // jobtest input need<i>: i at most this (a machine's input list holds at most 16)
 
-struct JobWork { unsigned int uid; std::string key; int task; int plain; int door; };   // door -1 = the building itself
+struct JobWork { unsigned int uid; std::string key; int task; int plain; int door; int hasNear; float nearX, nearZ; };   // door -1 = the building itself
+struct JobPick { std::string key; int hasNear; float nearX, nearZ; };   // `show <needle...> [near=<x>,<z>]`
 struct JobInput { std::string key, sid, section; int count; int need; };   // need = i of need<i>, -1 = sid is an item sid
 
-/* `work <uid> <key> [plain] [task=<n>]`: uid decimal or 0x hex, non-zero; no `plain` = the order as a player's (giveOrder's
-   player-order argument set), `plain` = without it (the way the mod's NPC orders give one); task= overrides OPERATE_MACHINERY; door=<i> (decimal 0..kWorkDoorMax) gives the order on door i of the building (out->door, -1 = the
-   building itself). Each option at most once, in any order. 1 parsed, 0 not this form or malformed. */
+const int kNeedleTokMax = 12;            // jobtest: at most this many words in one command line
+const double kJobCoordMax = 10000000.0;  // near=: a world coordinate beyond this is a typing error
+const int kJobListRadiusMax = 1000000;   // jobtest list: the largest radius (world units)
+
+/* One ASCII letter lower-cased (the needle match ignores case). */
+inline char JobLow(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+
+/* Does `hay` contain `needle`, ignoring ASCII case? An empty needle matches nothing. 1 yes, 0 no. */
+inline int JobNeedleMatches(const std::string& hay, const std::string& needle)
+{
+    if (needle.empty() || needle.size() > hay.size()) return 0;
+    for (size_t i = 0; i + needle.size() <= hay.size(); ++i)
+    {
+        size_t k = 0;
+        while (k < needle.size() && JobLow(hay[i + k]) == JobLow(needle[k])) ++k;
+        if (k == needle.size()) return 1;
+    }
+    return 0;
+}
+
+/* A world coordinate - an optional sign, digits, an optional '.' and digits (at least one digit). 1 parsed, 0 not. */
+inline int JobCoordParse(const std::string& s, float* out)
+{
+    size_t i = 0;
+    int neg = 0, digits = 0, frac = 0;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) { neg = (s[i] == '-') ? 1 : 0; ++i; }
+    double v = 0.0, scale = 1.0;
+    for (; i < s.size(); ++i)
+    {
+        const char c = s[i];
+        if (c == '.' && frac == 0) { frac = 1; continue; }
+        if (c < '0' || c > '9') return 0;
+        ++digits;
+        if (frac != 0) { scale /= 10.0; v += (double)(c - '0') * scale; }
+        else v = v * 10.0 + (double)(c - '0');
+        if (v > kJobCoordMax) return 0;
+    }
+    if (digits == 0) return 0;
+    *out = (float)(neg != 0 ? -v : v);
+    return 1;
+}
+
+/* `near=<x>,<z>` (world units, the x and z of a world position). 1 parsed, 0 not this option or malformed. */
+inline int JobNearParse(const std::string& tok, float* x, float* z)
+{
+    if (tok.compare(0, 5, "near=") != 0) return 0;
+    const std::string v = tok.substr(5);
+    const size_t c = v.find(',');
+    if (c == std::string::npos || v.find(',', c + 1) != std::string::npos) return 0;
+    float a = 0.0f, b = 0.0f;
+    if (!JobCoordParse(v.substr(0, c), &a) || !JobCoordParse(v.substr(c + 1), &b)) return 0;
+    *x = a; *z = b;
+    return 1;
+}
+
+/* The needle = the words from `from` up to the first option word (near=..., and with workOptions also `plain`, task=... and
+   door=...), joined by one space, so `Training Dummy` is one needle. *next = the first word after it. */
+inline std::string JobNeedleJoin(const std::string* tok, int n, int from, int workOptions, int* next)
+{
+    std::string needle;
+    int k = from;
+    for (; k < n; ++k)
+    {
+        const std::string& t = tok[k];
+        if (t.compare(0, 5, "near=") == 0) break;
+        if (workOptions != 0 && (t == "plain" || t.compare(0, 5, "task=") == 0 || t.compare(0, 5, "door=") == 0)) break;
+        if (!needle.empty()) needle += " ";
+        needle += t;
+    }
+    *next = k;
+    return needle;
+}
+
+/* WHICH MATCH `jobtest show` / `work` take. Without near: the first (index 0 - the walk order). With near: the one whose x,z is
+   nearest (nx, nz) among those with a position (has[i] != 0), the earlier one on a tie. -1 = none (no match, or near asked and
+   no match has a position). */
+inline int JobPickNearest(const float* xs, const float* zs, const int* has, int n, int hasNear, float nx, float nz)
+{
+    if (n <= 0) return -1;
+    if (hasNear == 0) return 0;
+    int best = -1;
+    double bestD = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (has[i] == 0) continue;
+        const double dx = (double)xs[i] - (double)nx, dz = (double)zs[i] - (double)nz, d = dx * dx + dz * dz;
+        if (best < 0 || d < bestD) { best = i; bestD = d; }
+    }
+    return best;
+}
+
+/* `work <uid> <needle...> [plain] [task=<n>] [door=<i>] [near=<x>,<z>]`: uid decimal or 0x hex, non-zero; the needle is every word
+   up to the first option (so it never holds the word `plain` or a word starting task= / door= / near=); no `plain` = the order as
+   a player's (giveOrder's player-order argument set), `plain` = without it (the way the mod's NPC orders give one); task= overrides
+   OPERATE_MACHINERY; door=<i> (decimal 0..kWorkDoorMax) gives the order on door i of the building (out->door, -1 = the building
+   itself); near= takes the match nearest that world point. Each option at most once, in any order, all after the needle.
+   1 parsed, 0 not this form or malformed. */
 inline int JobWorkParse(const std::string& arg, JobWork* out)
 {
     out->uid = 0; out->key.clear(); out->task = kTaskOperateMachinery; out->plain = 0; out->door = -1;
-    std::string tok[6];
-    const int n = coopsay::TalkSplit(arg, tok, 6);
+    out->hasNear = 0; out->nearX = 0.0f; out->nearZ = 0.0f;
+    std::string tok[kNeedleTokMax];
+    const int n = coopsay::TalkSplit(arg, tok, kNeedleTokMax);
     if (n < 3 || tok[0] != "work") return 0;
     unsigned long long v = 0;
     if (!coopsay::TalkParseNumber(tok[1], &v) || v == 0 || v > 0xFFFFFFFFULL) return 0;
-    int plain = 0, task = -1, door = -1;
-    for (int k = 3; k < n; ++k)
+    int k = 2;
+    const std::string needle = JobNeedleJoin(tok, n, 2, 1, &k);
+    if (needle.empty()) return 0;
+    int plain = 0, task = -1, door = -1, hasNear = 0;
+    float nx = 0.0f, nz = 0.0f;
+    for (; k < n; ++k)
     {
+        if (tok[k].compare(0, 5, "near=") == 0 && hasNear == 0)
+        {
+            if (!JobNearParse(tok[k], &nx, &nz)) return 0;
+            hasNear = 1;
+            continue;
+        }
         if (tok[k] == "plain" && plain == 0) { plain = 1; continue; }
         if (tok[k].compare(0, 5, "door=") == 0 && door < 0)
         {
@@ -61,8 +170,9 @@ inline int JobWorkParse(const std::string& arg, JobWork* out)
         }
         return 0;
     }
-    out->uid = (unsigned int)v; out->key = tok[2]; out->plain = plain; out->door = door;
+    out->uid = (unsigned int)v; out->key = needle; out->plain = plain; out->door = door;
     if (task > 0) out->task = task;
+    out->hasNear = hasNear; out->nearX = nx; out->nearZ = nz;
     return 1;
 }
 
@@ -123,13 +233,52 @@ inline int JobDoJobsParse(const std::string& arg, unsigned int* uid, int* on)
     return 1;
 }
 
-/* `show <key>`. 1 parsed, 0 not. */
-inline int JobShowParse(const std::string& arg, std::string* key)
+/* `show <needle...> [near=<x>,<z>]`: a needle of one or more words; near= takes the match nearest that world point, and must be
+   the last word. 1 parsed, 0 not. */
+inline int JobShowParse(const std::string& arg, JobPick* out)
 {
-    key->clear();
-    std::string tok[3];
-    if (coopsay::TalkSplit(arg, tok, 3) != 2 || tok[0] != "show") return 0;
-    *key = tok[1];
+    out->key.clear(); out->hasNear = 0; out->nearX = 0.0f; out->nearZ = 0.0f;
+    std::string tok[kNeedleTokMax];
+    const int n = coopsay::TalkSplit(arg, tok, kNeedleTokMax);
+    if (n < 2 || tok[0] != "show") return 0;
+    int k = 1;
+    const std::string needle = JobNeedleJoin(tok, n, 1, 0, &k);
+    if (needle.empty()) return 0;
+    if (k < n)
+    {
+        float x = 0.0f, z = 0.0f;
+        if (k != n - 1 || !JobNearParse(tok[k], &x, &z)) return 0;
+        out->hasNear = 1; out->nearX = x; out->nearZ = z;
+    }
+    out->key = needle;
+    return 1;
+}
+
+/* `list <needle...> [radius]` (read only): a last word of digits only, after at least one needle word, is the radius in world
+   units (1..kJobListRadiusMax); without it *radius = 0 (no limit). The needle is every other word. 1 parsed, 0 not. */
+inline int JobListParse(const std::string& arg, std::string* needle, int* radius)
+{
+    needle->clear(); *radius = 0;
+    std::string tok[kNeedleTokMax];
+    int n = coopsay::TalkSplit(arg, tok, kNeedleTokMax);
+    if (n < 2 || tok[0] != "list") return 0;
+    int r = 0;
+    if (n >= 3)
+    {
+        const std::string& last = tok[n - 1];
+        size_t d = 0;
+        while (d < last.size() && last[d] >= '0' && last[d] <= '9') ++d;
+        if (d == last.size())
+        {
+            unsigned long long v = 0;
+            if (!coopsay::TalkParseNumber(last, &v) || v == 0 || v > (unsigned long long)kJobListRadiusMax) return 0;
+            r = (int)v;
+            --n;
+        }
+    }
+    std::string w;
+    for (int k = 1; k < n; ++k) { if (!w.empty()) w += " "; w += tok[k]; }
+    *needle = w; *radius = r;
     return 1;
 }
 

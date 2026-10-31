@@ -127,6 +127,7 @@ namespace coop { int AiWorkerBusyNow(); }   /* coop.cpp - the engine's own AI-wo
 #include "../common/townwake.h"    /* T-936: a newly founded outpost woken - the queue, the one-look verdict, the area-record check */
 #include "../common/buildnear.h"   /* T-923: the "too close to another town" decision (the canbuild lever) */
 #include "../common/buildpick.h"   /* T-906: the building-swap pick's list walk and the world-stable draw */
+#include "../common/loadedzones.h"   /* T-959: an area's first-time flag read the engine's way (ZoneMapAddr / AreaFlagOf) */
 #include <cstddef>
 #include <vector>
 #include "coop_log.h"
@@ -2582,6 +2583,24 @@ int BdByteAt(const void* p, size_t off, int* out)
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 int BdByteAtOr0(const void* p, size_t off) { int v = 0; return BdByteAt(p, off, &v) != 0 ? v : 0; }   /* review-build1e N3 */
+/* T-959: an area's first-time flag read as createBuilding 0x57C1E0 reads it (decomp_57c1e0.txt:243-264, 360, 513-518): the ZoneMap
+   0xA07C10 answers for the area, the area pointer AT it (local_490 = *local_438), that area's byte +0xA8. 0 / 1 = the flag;
+   loadedzones::kFlagNoZone / kFlagNoArea (createBuilding would make nothing there) / kFlagUnread. ANY THREAD, POD only. */
+int BdAreaFlag(int sx, int sy)
+{
+    const unsigned long long rZm = Rva("ZoneManagerPtr");
+    void* zm = (rZm != 0) ? BdPtrAt((const void*)((uintptr_t)::GetModuleHandleA(0) + (uintptr_t)rZm), 0) : 0;
+    const unsigned long long zmap = loadedzones::ZoneMapAddr((unsigned long long)(uintptr_t)zm, sx, sy);
+    unsigned long long area = 0;
+    int areaOk = 0, byteOk = 0, v = 0;
+    if (zmap != 0)
+    {
+        __try { area = (unsigned long long)(uintptr_t)*(void* const*)((uintptr_t)zmap + (uintptr_t)loadedzones::kZoneMapArea); areaOk = 1; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { areaOk = 0; }
+        if (areaOk != 0 && area != 0) byteOk = BdByteAt((const void*)(uintptr_t)area, (size_t)loadedzones::kAreaFirstTimeFlag, &v);
+    }
+    return loadedzones::AreaFlagOf(zmap != 0 ? 1 : 0, areaOk, area, byteOk, v);
+}
 /* review-build1d D2: isDismantled as 0x2A2820 tests it - the piece's OWN +0x162. For every class but WallBuilding that is the
    byte vt+0x228()+2 already gave (`stateDism`, returned unchanged); a wall segment's vt+0x228 is the run's shared state, so
    its own byte is read. ANY THREAD, POD only. */
@@ -2760,7 +2779,7 @@ void BdPickPastEnd(const BdPickRead& r)
 }
 /* the hook: everything but the draw is the engine's own - no list, an empty list, one choice, no capture, no world key yet, or any
    read fault calls the original unchanged */
-void* detour_swapPick(void* fac, void* data)
+void* BdSwapPickBody(void* fac, void* data)
 {
     if (BdOnMain() == 0) ::InterlockedIncrement64(&g_pickOffMain);
     const BdPickCap* c = (g_pickTls != TLS_OUT_OF_INDEXES) ? (const BdPickCap*)::TlsGetValue(g_pickTls) : 0;
@@ -2776,6 +2795,11 @@ void* detour_swapPick(void* fac, void* data)
     if (r.pastEnd != 0) BdPickPastEnd(r);
     BdPickLog(data, r, key);
     return r.rec;
+}
+void* detour_swapPick(void* fac, void* data)
+{
+    void* res = BdSwapPickBody(fac, data);
+    return res;
 }
 void* BdCallCreateTownRaw(BdCreateFn fn, void* factory, void* data, float* pos, void* town, void* owner, float* rot, bool completed, int* faulted)
 {
@@ -4137,6 +4161,124 @@ int BdHandToHouseOwner(void* b, void* host, int* why, int posOk = 1)
     if (BdSetFactionPod(b, (void*)to) == 0) { *why = kHoSetFailed; ++g_houseOwnerUnresolved; return -1; }
     ++g_houseHanded;
     return k;
+}
+
+/* T-1128 review MED 2: A PIECE PLACED INSIDE A TEAMMATE'S HOUSE IS THE HOUSE OWNER'S OR IS NOT KEPT. Since policy.cpp's house stub lets
+   this player place inside a teammate's house, a piece whose hand-over failed (BdHandToHouseOwner: owner unresolved, no key or the
+   registry full, no stand-in, the faction change failed) would stay this player's inside the teammate's house, against the house-owner
+   rule (02-project-rules :270, :307, :1032). Such a piece is not announced (no BdOnNewPiece: no row, no PLACE) and is queued here by its
+   key and its host's key; the next safe point (BuildTestDrain, threadSafeRagdollUpdates, where the buildtest lever dismantles) takes
+   it down through the engine's own dismantle (BdDismantlePod, vt+0x248 with FLT_MAX - the REMOVE road's call). A commit seen OFF the
+   main thread never tries the hand-over (detour_create hands only on the main thread) and announces nothing: its pieces with a host
+   are queued too, and the drain removes only those whose host is a teammate's. Any other house (a town's, a friend's, a stranger's,
+   this player's own) keeps today's behaviour. The queue slots are claimed with an interlocked exchange, so any thread may queue;
+   only the main thread drains. A queue that cannot take the piece (no key, all slots busy) leaves it to today's road. */
+const int kHoOffMain = 13;   /* T-1128: the commit ran off the main thread - no hand-over was tried */
+const int kMateDropCap = 16;
+const int kMateDropTries = 60;   /* drains (safe points) an entry is tried before it is given up: the house or the piece may resolve a few frames late */
+struct BdMateDrop { volatile LONG state; int why; int tries; char key[kKeyCap]; char hostKey[kKeyCap]; };   /* state 0 free, 1 being written, 2 queued */
+BdMateDrop g_mateDrop[kMateDropCap];
+volatile LONG64 g_mateDropQueued = 0, g_mateDropFull = 0, g_mateDropNoKey = 0, g_mateDropRemoved = 0, g_mateDropFailed = 0,
+                g_mateDropNotFound = 0, g_mateDropNotMate = 0, g_mateDropNotMine = 0, g_mateDropGaveUp = 0, g_mateDropUnresolved = 0,
+                g_mateDropRetried = 0;
+const char* BdHandWhyWords(int why)
+{
+    if (why == coopown::kHoUnresolved) return "the house owner could not be resolved";
+    if (why == kHoPreflight) return "no key for the piece or the house, no placement position, or the registry is full";
+    if (why == kHoNoStandIn) return "the house owner has no stand-in here";
+    if (why == kHoSetFailed) return "the engine's faction change failed";
+    if (why == kHoOffMain) return "the placement ran off the main thread (no hand-over tried)";
+    return "the hand-over did not happen";
+}
+/* ANY THREAD: 1 = queued (the caller announces nothing), 0 = not queued (the caller keeps today's road) */
+int BdMateDropQueue(void* b, void* host, int why)
+{
+    char pk[kKeyCap], hk[kKeyCap];
+    pk[0] = 0; hk[0] = 0;
+    if (ObjectPositionKey(b, pk, kKeyCap, "", 3, 1) == 0 || ObjectPositionKey(host, hk, kKeyCap, "", 3, 0) == 0)
+    { ::InterlockedIncrement64(&g_mateDropNoKey); return 0; }
+    for (int k = 0; k < kMateDropCap; ++k)
+    {
+        if (::InterlockedCompareExchange(&g_mateDrop[k].state, 1, 0) != 0) continue;
+        std::memcpy(g_mateDrop[k].key, pk, sizeof pk);
+        std::memcpy(g_mateDrop[k].hostKey, hk, sizeof hk);
+        g_mateDrop[k].why = why;
+        g_mateDrop[k].tries = 0;
+        ::InterlockedExchange(&g_mateDrop[k].state, 2);
+        ::InterlockedIncrement64(&g_mateDropQueued);
+        return 1;
+    }
+    ::InterlockedIncrement64(&g_mateDropFull);
+    return 0;
+}
+/* MAIN THREAD, at the safe point (engine writes not blocked). An entry whose house or piece does not resolve, or whose dismantle
+   faulted, stays queued and is tried again at the next drains, up to kMateDropTries; then it is given up with one line. An entry
+   queued off the main thread whose house never resolved is "unresolved" (whose house it was is not known), not a teammate's. */
+void BdMateDropDrain()
+{
+    for (int k = 0; k < kMateDropCap; ++k)
+    {
+        if (::InterlockedCompareExchange(&g_mateDrop[k].state, 2, 2) != 2) continue;   /* only this thread changes a queued slot */
+        BdMateDrop& e = g_mateDrop[k];
+        const int why = e.why;
+        char line[460];
+        void* const host = ObjectByPositionKey(e.hostKey);
+        if (host != 0 && PolicyTeammateSlot(BdOwnerPod(host)) < 0)   /* an off-main entry in another house: today's road */
+        { ::InterlockedIncrement64(&g_mateDropNotMate); ::InterlockedExchange(&e.state, 0); continue; }
+        int v = 0;
+        void* const b = (host != 0) ? BdFindInHostNear(host, e.key, &v) : 0;
+        int ok = 0;
+        if (b != 0)
+        {
+            if (BdOwnerPod(b) != (void*)LocalPlayerFaction())   /* no longer this player's: nothing to undo */
+            { ::InterlockedIncrement64(&g_mateDropNotMine); ::InterlockedExchange(&e.state, 0); continue; }
+            int ret = -1;
+            ok = BdDismantlePod(b, FLT_MAX, &ret);   /* the engine's own dismantle, as REMOVE */
+            if (ok != 0)
+            {
+                ::InterlockedIncrement64(&g_mateDropRemoved);
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] piece key=%.63s inside a teammate's house REMOVED (try %d) - the hand-over to the house owner failed: %s (why=%d)"
+                            " - a piece in a teammate's house is the house owner's or is not kept",
+                            e.key, e.tries + 1, BdHandWhyWords(why), why);
+                BdLogCapped(line);
+                ::InterlockedExchange(&e.state, 0);
+                continue;
+            }
+        }
+        if (++e.tries < kMateDropTries) { ::InterlockedIncrement64(&g_mateDropRetried); continue; }   /* stays queued: the next drain tries again */
+        if (host == 0 && why == kHoOffMain)
+        {
+            ::InterlockedIncrement64(&g_mateDropUnresolved);
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] piece key=%.63s placed off the main thread: its house key=%.63s did not resolve in %d tries - unresolved"
+                        " (whose house it is is not known; nothing removed)", e.key, e.hostKey, e.tries);
+        }
+        else
+        {
+            ::InterlockedIncrement64(b == 0 ? &g_mateDropNotFound : &g_mateDropFailed);
+            ::InterlockedIncrement64(&g_mateDropGaveUp);
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[BUILD] piece key=%.63s inside a teammate's house NOT REMOVED after %d tries - GIVEN UP: %s (the hand-over failed: %s, why=%d)",
+                        e.key, e.tries, b != 0 ? "the dismantle call faulted" : (host == 0 ? "the house does not resolve here" : BdVerdictWord(v)),
+                        BdHandWhyWords(why), why);
+        }
+        BdLogCapped(line);
+        ::InterlockedExchange(&e.state, 0);
+    }
+}
+/* T-1128: world teardown (BuildForgetWorld) - the queued keys belong to the world going away. MAIN THREAD. */
+void BdMateDropForget()
+{
+    for (int k = 0; k < kMateDropCap; ++k)
+        if (::InterlockedCompareExchange(&g_mateDrop[k].state, 0, 2) == 2) g_mateDrop[k].tries = 0;
+}
+/* T-1128: the queue's counts on the house1b REPORT line */
+std::string BdMateDropTokens()
+{
+    char t[300];
+    _snprintf_s(t, sizeof(t), _TRUNCATE, " mateHouseDrop[queued,removed,retried,gaveUp,notFound,failed,unresolvedOffMain,notMate,notMine,full,noKey]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                (long long)g_mateDropQueued, (long long)g_mateDropRemoved, (long long)g_mateDropRetried, (long long)g_mateDropGaveUp,
+                (long long)g_mateDropNotFound, (long long)g_mateDropFailed, (long long)g_mateDropUnresolved, (long long)g_mateDropNotMate,
+                (long long)g_mateDropNotMine, (long long)g_mateDropFull, (long long)g_mateDropNoKey);
+    return std::string(t);
 }
 /* T-923 (decision 967 a), MAIN THREAD: an outdoor piece (no host building) whose town - the town createBuilding received, the confirm's
    pick in preview+0x90 - is a CURRENT teammate's outpost town (its faction is that teammate's stand-in or coop-p<n> faction:
@@ -5997,9 +6139,20 @@ void detour_commit(void* list)
     const int n = g_commitNewN;
     g_commitNewN = 0;
     g_commitTid = 0;
-    if (BdOnMain() == 0) { g_commitOffMain += n; return; }
-    for (int i = 0; i < n; ++i) BdOnNewPiece(g_commitNew[i], 1, g_commitPos[i], g_commitRot[i], g_commitMeta[i], g_commitHost[i],
-                                             g_commitForm[i], g_commitFloor[i], g_commitOutside[i], g_commitHanded[i], g_commitHandWhy[i], g_commitTown[i]);   /* the same call, so the pointers are still live */
+    if (BdOnMain() == 0)
+    {
+        g_commitOffMain += n;
+        for (int i = 0; i < n; ++i) if (g_commitHost[i] != 0) BdMateDropQueue(g_commitNew[i], g_commitHost[i], kHoOffMain);   /* T-1128 MED 2: judged at the drain */
+        return;
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        /* T-1128 MED 2: a piece in a teammate's house whose hand-over failed is not announced - it is taken down at the next safe point */
+        if (g_commitHost[i] != 0 && g_commitHanded[i] < 0 && PolicyTeammateSlot(BdOwnerPod(g_commitHost[i])) >= 0
+            && BdMateDropQueue(g_commitNew[i], g_commitHost[i], g_commitHandWhy[i]) != 0) continue;
+        BdOnNewPiece(g_commitNew[i], 1, g_commitPos[i], g_commitRot[i], g_commitMeta[i], g_commitHost[i],
+                     g_commitForm[i], g_commitFloor[i], g_commitOutside[i], g_commitHanded[i], g_commitHandWhy[i], g_commitTown[i]);   /* the same call, so the pointers are still live */
+    }
     int handedN = 0;   /* house2 (item 5): the commit issues ONE build order (4d6810:452) - counted once, not once per handed piece */
     for (int i = 0; i < n; ++i) if (g_commitHanded[i] >= 0) ++handedN;
     g_orderKept += coopbuild::BuildCommitOrderKept(handedN, g_hkOrder == 1 ? 1 : 0);   /* house1b: no order gate - the build order went to the placer's workers */
@@ -6998,13 +7151,14 @@ void BdTestPlace()
     /* createBuilding adds the ground height at (x, z) to the y it is given (it takes a height above the ground), so 0 sets the
        piece on the ground; the character's own height would float it by about the ground height. */
     pos[0] = cp[0] + g_btDx; pos[1] = 0.0f; pos[2] = cp[2] + g_btDz;
-    /* the recipe's zone check: zone = ZoneManager + 200 + (cellX*64 + cellZ)*0x168 (0xA07C10), newGameFirstTimeLoaded +0xA8 */
+    /* the recipe's zone check, read as createBuilding reads it (T-959, BdAreaFlag): the ZoneMap 0xA07C10 answers
+       (ZoneManager + 200 + (cellX*64 + cellZ)*0x168), the area pointer AT it, that area's first-time flag +0xA8 */
     void* zm = BdPtrAt((const void*)(base + (uintptr_t)rZm), 0);
     if (zm == 0) { BdTestFail("no zone manager"); return; }
     const Sector s = SectorOf(pos[0], pos[2]);
-    int fresh = 0;
-    if (!BdByteAt(zm, 200 + ((size_t)s.x * 64 + (size_t)s.y) * 0x168 + 0xA8, &fresh)) { BdTestFail("the zone flag could not be read"); return; }
-    if (fresh != 0)   /* review-build1a / T319: the owner swap needs a NON-player owner (answers-build1b R1) - ours is this
+    const int fresh = BdAreaFlag(s.x, s.y);
+    /* a readout only: an unread flag or no area there (-1 / -2 / -3) is not refused here - createBuilding answers for itself */
+    if (fresh > 0)   /* review-build1a / T319: the owner swap needs a NON-player owner (answers-build1b R1) - ours is this
                          game's player faction, so the flag is noted, not refused (the copy path in build1-b must refuse) */
     {
         ++g_zoneFreshRefused;
@@ -8727,13 +8881,13 @@ static int BdCopyOneBody(BdPending& p, int* called)
         BdLogCapped(line);
         return 1;
     }
-    /* zone+0xA8 newGameFirstTimeLoaded (T321: SET in normal play). With a non-player owner the engine may hand the piece to
-       the town's faction, or run the faction's building substitution 0x7F3BD0, which can return null. Read and reported,
-       not refused: the owner is put back below and a null return is counted. */
+    /* the area's first-time flag (area +0xA8), read as createBuilding reads it (T-959, BdAreaFlag: the pointer at the ZoneMap,
+       then +0xA8; the earlier read took ZoneMap+0xA8 itself - not the flag, so T321's "SET in normal play" and T1188's counts of
+       it are void). When set, the engine may hand a non-player-owned piece to the town's faction and runs the faction's building
+       substitution 0x7F3BD0, which can return null or another record. Read and reported, not refused: the owner is put back below
+       and a null return is counted. -2 = no area there (createBuilding returns null), -1 / -3 = unread. */
     const Sector s = (furn != 0) ? SectorOf(hostPos[0], hostPos[2]) : SectorOf(m.pos[0], m.pos[2]);   /* build1-e: the host's cell */
-    int fresh = -1;
-    void* zm = BdPtrAt((const void*)(base + (uintptr_t)rZm), 0);
-    if (zm != 0) BdByteAt(zm, 200 + ((size_t)s.x * 64 + (size_t)s.y) * 0x168 + 0xA8, &fresh);
+    const int fresh = BdAreaFlag(s.x, s.y);
     if (fresh > 0) ++g_copyZoneFresh;
     float pos[3], rot[4];
     for (int i = 0; i < 3; ++i) pos[i] = m.pos[i];
@@ -14814,6 +14968,17 @@ int BuildRegLastKey(const std::string& arg, std::string* key, long long* hits)
              + std::to_string(*hits) + " registry rows containing '" + sub + "')");
     return found != 0 ? 1 : -1;
 }
+/* T-1128 TEST-ONLY: the live piece of the first registry row whose key contains `sub`, found as `buildtest mats / progress` find it
+   (BdFindReg, then BdFindPiece: a free piece by its key, a piece inside a building through its host's piece list). items.cpp's
+   jobtest lookup asks it when the loaded-building walk, which never lists a piece inside a building, finds nothing. *key = the
+   row's full key. 0 = no row, or the row's piece is not loaded here. MAIN THREAD (the registry's thread). */
+void* BuildRegFindPiece(const std::string& sub, std::string* key)
+{
+    if (!BdFindReg(sub, key)) return 0;
+    std::map<std::string, BdReg>::iterator row = g_reg.find(*key);
+    int tv = 0;
+    return (row != g_reg.end()) ? BdFindPiece(*key, row->second, &tv) : 0;
+}
 std::string BuildTestArm(const std::string& arg)
 {
     std::istringstream is(arg);
@@ -14823,7 +14988,7 @@ std::string BuildTestArm(const std::string& arg)
                         " | into <near|host-key-substring> <sid> [indoors|<dx>,<dz>] | mats <key-substring> <n> | destroy <key-substring> | broken <key-substring> 0|1"
                         " | order <key-substring> repair|dismantle|build|materials | town <sid|key-substring> | upgrade|downgrade <key-substring>"
                         " | canbuild <sid> [dx dz | abs <x> <z>] | cursor <sid> abs <x> <z> | townpick <sid> abs <x> <z> [place | hold | confirm]"
-                        " | hit <key-substring> <cut> <blunt> [door] [times]";
+                        " | hit <key-substring> <cut> <blunt> [door] [times] | areaflag <x,y>";
     if (sub == "farm")   /* par16: the farm lever (farm.cpp FarmTestArm) */
     {
         const std::string::size_type at = arg.find("farm");
@@ -14839,6 +15004,15 @@ std::string BuildTestArm(const std::string& arg)
     {
         if (a1.empty() || !a2.empty()) return usage;
         return BdTestTown(a1);
+    }
+    if (sub == "areaflag")   /* T-959: TEST-ONLY - an area's first-time flag read as createBuilding reads it (BdAreaFlag), nothing written */
+    {
+        int ax = -1, ay = -1;
+        if (a1.empty() || std::sscanf(a1.c_str(), "%d,%d", &ax, &ay) != 2 || !a2.empty()) return usage;
+        char b[160];
+        std::sprintf(b, "areaflag %d,%d flag=%d (1 set, 0 clear, -2 no area there, -1 / -3 unread)", ax, ay, BdAreaFlag(ax, ay));
+        DebugLog("[BUILD] buildtest " + std::string(b));
+        return "ok " + std::string(b);
     }
     LONG kind = 0;
     if (sub == "place")
@@ -14957,6 +15131,7 @@ void BuildTestDrain()
 {
     BdOutpostDrain();   /* TEST-ONLY outposttest found / link, armed apart from buildtest */
     BdBldSetDrain();   /* TEST-ONLY bldset, armed apart from buildtest */
+    if (!EngineWritesBlocked()) BdMateDropDrain();   /* T-1128 MED 2: a piece left this player's inside a teammate's house is taken down */
     const LONG kind = ::InterlockedExchange(&g_btPending, 0);
     if (kind == 0) return;
     if (EngineWritesBlocked())
@@ -21862,6 +22037,7 @@ void BuildForgetWorld()
     FarmForgetWorld();   /* par16 */
     PieceRecForgetWorld();   /* the piece records' write state is this world's */
     g_bdHarvestDue.clear();   /* the marked copies belong to the world going away */
+    BdMateDropForget();   /* T-1128: pieces queued for removal from a teammate's house belong to the world going away */
     BdHelpJobForget();   /* T-903 (F1041): the stand-ins the job hooks named and their answers, and the queued ENDED lines */
     BdJobFinderForget();   /* the job finder's stand-in rows, the player faction and the logged stand-ins */
     PowerForgetWorld();   /* P47 (H-P47a): the published writer verdicts belong to the world going away */
@@ -24616,7 +24792,7 @@ void ReportBuild()
                 g_hkJob, g_jobBlocked, g_jobKept, g_lateRevivedRefused, g_owedSaveRefused, g_owedLoadUnread,
                 (long long)g_pickSeeded, (long long)g_pickOriginal, (long long)g_pickNoPos, (long long)g_pickFault, (long long)g_pickNoKey,
                 (long long)g_pickOffMain, g_hkSwapPick, (long long)g_pickPastEnd);   /* T-906: the building-swap pick's draws, by what decided them */
-    DebugLog(std::string(h));
+    DebugLog(std::string(h) + BdMateDropTokens());   /* T-1128: the teammate's-house removal queue */
     char p15[700];   /* P15 */
     _snprintf_s(p15, sizeof(p15), _TRUNCATE, "[BUILD] REPORT destroyed[destroySent,repairSent,destroyApplied,repairApplied,destroyAlready,destroyPosted,destroyFaulted,destroyWaitRemove,"
                 "destroySeen,wholeSeen,copyDestroyReverted,copyDestroyWait,repairOrderHelp,repairRefused,repairHelpReset,testDestroy]"

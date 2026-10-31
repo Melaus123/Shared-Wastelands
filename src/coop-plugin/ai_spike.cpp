@@ -549,6 +549,7 @@ void detour_update(Character* self)
     }
 
     orig_update(self);
+    PoseReplayAfterUpdate(self);   // T-890: a held copy's action, played again after its animation update cleared it
 
 #ifdef SW_DEV_BUILD   /* T-879 A: the [P006] status line and its tick are the test build's only (P006 answered, F047/F058) */
     // Throttled status line. Character::update runs once per character per frame, so this

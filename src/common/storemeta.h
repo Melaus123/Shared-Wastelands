@@ -38,6 +38,11 @@
  * written only when known, after field 15 (empty when the record has no home), and read the same way: a line without it, any other
  * value, and every line below v7, read back as unknown (-1).
  *
+ * AN OPTIONAL FIELD 17 ON A v7 LINE, `writer`: the squad's registered writer and its generation, "<slot>.<gen>" (squadwriterreg.h, T-1084
+ * step 5). Written only when the squad has a registered writer, after fields 15 and 16 (field 16 is "-" when the birth flag is unknown,
+ * which reads back as unknown). A line without it, any text that is not "<digits>.<digits>", and every line below v7, read back as
+ * unregistered (slot -1).
+ *
  * STORE-FILE FORMAT 6 (B10, design-e46-store 3.5). The same line without the last field:
  *
  *   v6 <writtenAt> <owner> <x> <y> <z> <squadSid> <factionName> <worldId> <posAt> <town> <len> <crc32>
@@ -145,6 +150,8 @@ struct MetaLine
     unsigned long long seq;   /* B12 (decision 52): the notebook's own sequence number; 0 below v7 */
     std::string  home;        /* the group's home building key; "" = none (optional field 15 of a v7 line) */
     int          birth;       /* the squad's birth flag (squadbirth.h): 1 born kept, 0 born not kept, -1 unknown (optional field 16 of a v7 line) */
+    int          wslot;       /* the squad's registered writer slot, -1 unregistered (optional field 17 of a v7 line, squadwriterreg.h) */
+    unsigned int wgen;        /* its generation */
     MetaLine();
 };
 

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "../../common/linkkeep.h"   /* T-1118 (a): KeepServiced's window numbers */
+
 namespace coop {
 namespace net {
 
@@ -277,7 +279,36 @@ enum MsgType
     // receiver's VERDICT (1 holds, 0 not placed, 2 unknown), the holder's CLOSED (1 closed, 2 returned); also the receiver's QUERY.
     // 78 is left to effort/t811's world-server SHOW, 73-77 to effort/t810's MONEY (the world-server message numbers).
     // RELIABLE.  u8 kind | u32 askerSlot | u32 reqId | u32 holderSlot | u8 value   (src/common/handrec.h)
-    MSG_ITEM_HANDOVER = 79
+    MSG_ITEM_HANDOVER = 79,
+    // BLOCK_PICK (T-1101 step 5, game-to-game protocol 184; the defender's owner -> every game in the defender's area, on the
+    // character stream's road; taken only by the attacker's owner, from the defender's owner): the block pose the defender's
+    // owner's engine picked for it, an empty name = no block. The attacker's game asks its own picker for its copy of the
+    // defender again until it answers that name (combat.cpp detour_fpPickBlock). RELIABLE.
+    //   defender u32 | attacker u32 | nameLen u8 | name   (src/common/blockpick.h)
+    MSG_BLOCK_PICK = 80,
+    // SWING_END (game-to-game protocol 185; the owner's game -> its character's area, on SWING's road and lane, so it never
+    // overtakes its SWING): one of this game's characters that sent SWING left the attack state - the owner's swing is over. The
+    // copy drops the swing credit it did not spend in time (src/common/swinggate.h OwnerEnd). RELIABLE.
+    //   uid u32 | targetUid u32 (the target its SWING named)   (src/common/hitwire.h)
+    MSG_SWING_END = 81,
+    // SHOT_FIRED (game-to-game protocol 186; the game that runs the shooter -> every game in the shooter's area, on the character
+    // stream's road; taken only for a copy of the shooter, from the game that runs it): its engine fired one bolt at that target.
+    // Each one makes that game fire its copy's real bolt at that target, the copy's own engine fires being held (combat.cpp
+    // ShotFireDrain, detour_p104Shoot). RELIABLE.
+    //   shooter u32 | target u32 (0 = no replicated character) | aim xyz f32 | target's position xyz f32   (src/common/shotgate.h)
+    MSG_SHOT_FIRED = 82,
+    // FIGHT_CHOICE (T-1101 design (c) build A, game-to-game protocol 187; the owner's game -> its character's area, on SWING's road
+    // and lane, so it never overtakes a SWING / SWING_END sent before it): the fight decide step of one of this game's player
+    // characters chose (getting ready with attack / block / circle / wait, approach, or no target). The copy takes the owner's
+    // next move at its own decide step, or chooses nothing until it arrives (src/common/fightchoice.h; combat.cpp). RELIABLE.
+    //   uid u32 | targetUid u32 | seq u32 | state u8 | next u8 | 0 u8 | 0 u8 | readyTimer f32   (src/common/fightchoice.h)
+    MSG_FIGHT_CHOICE = 83,
+    // HAND (game-to-game protocol 186; the game that runs a character -> every game in its area, on the character stream's road;
+    // taken only for a copy, from the game that runs it): the item the character holds in its hands now, named as an item move
+    // names it, or bare hands - sent once per change. That game's copy draws the same item from its own section through the
+    // engine's draw, or puts its held item away (combat.cpp HandApplyDrain). RELIABLE.
+    //   uid u32 | has u8 | when has = 1: secLen u8 | section | x i32 | y i32 | sidLen u8 | sid   (src/common/handwire.h)
+    MSG_HAND = 84
 };
 
 enum Channel
@@ -410,6 +441,15 @@ public:
        (a bundle once, with its header), Steam each whole frame (5-byte header included) before it is split / after it is rejoined.
        false = the backend cannot say. */
     virtual bool ByteCounts(unsigned long long* /*sent*/, unsigned long long* /*recv*/) const { return false; }
+    /* T-1118 (a): KEEP THIS LINK MOVING WHILE THE MAIN THREAD IS INSIDE THE ENGINE'S SAVE (src/common/linkkeep.h).
+       on = true: a helper thread services the backend alone - sends, receives and acknowledges; nothing received is handed
+       over before the next Poll - until this is called with false. true = it does; false = this backend has no helper, or
+       no peer is up. on = false: the helper stops after its current pass (this call waits for it) and *out (may be 0) gets
+       what it did since on. Every call on the link takes the same lock as the helper's pass. MAIN THREAD. */
+    virtual bool KeepServiced(bool /*on*/, linkkeep::Pass* /*out*/) { return false; }
+    /* T-1118 (a) review fold: true = this backend has a helper (ENet), so KeepServiced(true) refused on an up link means the
+       helper could not be started; false = no helper exists (Steam: Valve's library sends and acknowledges on its own thread). */
+    virtual bool KeepHasHelper() const { return false; }
 
     // Diagnostics for the netstat command (round-trip ms, counts).
     virtual unsigned int RoundTripMs() const = 0;

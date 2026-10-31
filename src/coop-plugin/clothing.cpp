@@ -1414,7 +1414,7 @@ static void ApplyOwnerLimbsNow(unsigned int uid, const cooplimb::LimbsWire& w, u
                         : rc == -2 ? std::string("recalc ran, medical push faulted") : std::string("recalc faulted"))
                      + " (line " + S(g_limbLogLines) + ")");
     }
-    CopyBodyNoteModApply(uid, c);   // a rebuild the limb apply queued is held in ragdoll whoever owns it
+    CopyBodyNoteModApply(uid, c);   // a rebuild the limb apply queued is held as a copy's whoever owns it
 }
 
 static std::string LimbF(float v)
@@ -1517,7 +1517,7 @@ static void LimbTestDrain()
             }
         }
     }
-    CopyBodyNoteModApply(t.uid, c);   // a rebuild the lever's limb change queued is held in ragdoll (TEST)
+    CopyBodyNoteModApply(t.uid, c);   // a rebuild the lever's limb change queued is held as a copy's (TEST)
     DebugLog(head + " before=[" + before + "] after=[" + LimbStateText(c) + "] -> " + outcome);
 }
 

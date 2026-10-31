@@ -35,7 +35,7 @@
 namespace arearec {
 
 const unsigned kMsgAreaRecorded = 83u;   /* 28-82 are taken on the world-server link (store_main.cpp's enum; 70 TOWNS, 78 SHOW) */
-const unsigned kProtocol = 121u;         /* the world-server protocol that carries AREA_RECORDED */
+const unsigned kProtocol = 125u;         /* the world-server protocol that carries AREA_RECORDED */
 const int kGrid = 64;
 const int kKeys = kGrid * kGrid;         /* 4096 */
 const int kNoKey = -1;

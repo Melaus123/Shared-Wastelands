@@ -49,8 +49,7 @@ namespace hovrec {
 const int          kHandFamily   = 17;
 const unsigned int kHandCap      = 256;    /* lines the file keeps; only SETTLED lines (closed / returned) are dropped to fit */
 inline std::string HandFile() { return "pp.handover"; }
-const unsigned int kGameProtocol = 180;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it; 180: every
-                                              ITEM_REQUEST ends with the 'ASK1' trailer, coopbrec::AskTail) */
+const unsigned int kGameProtocol = 187;    /* the game-to-game protocol of this build (net/session.cpp kProtocolVersion asserts it) */
 
 const unsigned int kMsgHandover  = 79;     /* MSG_ITEM_HANDOVER (net/transport.h, liveenvelope.h kInnerItemHandover assert it) */
 

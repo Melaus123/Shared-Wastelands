@@ -164,6 +164,60 @@ inline int RevokeKeeperAction(int traded, int removed, int keeperCopyHere)
     return kRkUndo;
 }
 
+/* THE GIVER'S 'GIVE DONE'. MSG_ITEM_PLACED's value byte: 0 / 1 answer a TAKE (not placed / placed); kPlacedGiveDone says the
+   giver of a GIVE had the owner's yes in time and removed its own copy, so it will never send a REVOKE for that request. The owner's
+   GIVE row then ends at once instead of after kOwnerGiveStandMs; that window stays the ending when this message is lost. Sent once,
+   never re-sent. */
+const int kPlacedGiveDone = 2;
+/* Does a PLACED close this owner row? Only a 'give done' (value 2) naming a GIVE row (dir 1) by its request id, from the connection
+   the request came from or from the same player (the REVOKE's own match, GiveRowMatch). kDnNotDone: the value is a TAKE's answer
+   (the TAKE road decides it); kDnClose: the row ends now, as if it had stood; kDnNoRow: a done that names no open GIVE row of its
+   sender - the row already stood, was revoked, or never existed; nothing is done and it is counted. */
+const int kDnNotDone = 0, kDnClose = 1, kDnNoRow = 2;
+inline int PlacedDoneAction(int value, int rowFound, int rowDir, unsigned int rowId, unsigned int id, int samePeerId, int samePlayer)
+{
+    if (value != kPlacedGiveDone) return kDnNotDone;
+    if (rowFound == 0) return kDnNoRow;
+    return (GiveRowMatch(rowDir, rowId, id, samePeerId, samePlayer) != kGmNone) ? kDnClose : kDnNoRow;
+}
+/* MAY THE OBJECT A GIVE BUILT MERGE ONTO A MATCHING STACK NOW? The owner's give never merges at the build (items.cpp
+   ItPlaceRule: a REVOKE removes exactly the object built), so the built stack sits beside a stack of the same item. Once the row has
+   ended no REVOKE can find it, and the stack may be merged - only then, and only when every check holds: the row is closed; it was a
+   box's row and this game writes that box; the hand-over IN line of that give is gone (an open line's look at its square would read
+   an empty square as 'not placed' - the giver could then rebuild it: a double); the section resolves; the built object is still in it
+   (by pointer) and its fields read; it still holds exactly the quantity built (units stacked onto it since are the player's); a
+   different stack of the same item (every field the same) is in that section, with room under the engine's stack limit for all of
+   it. The first failing check is the answer; anything but kMgMerge leaves the stack as it is. */
+const int kMgMerge = 0, kMgRowOpen = 1, kMgNotBox = 2, kMgNotWriter = 3, kMgLineOpen = 4, kMgNoSection = 5, kMgBuiltGone = 6,
+          kMgUnread = 7, kMgQtyChanged = 8, kMgNoStack = 9, kMgNoRoom = 10;
+const int kMgReasons = 11;
+inline int GiveMergeAction(int rowClosed, int isBox, int boxMine, int lineGone, int secFound, int builtFound, int fieldsRead,
+                           int haveQty, int builtQty, int stackFound, int room)
+{
+    if (rowClosed == 0) return kMgRowOpen;
+    if (isBox == 0) return kMgNotBox;
+    if (boxMine == 0) return kMgNotWriter;
+    if (lineGone == 0) return kMgLineOpen;
+    if (secFound == 0) return kMgNoSection;
+    if (builtFound == 0) return kMgBuiltGone;
+    if (fieldsRead == 0) return kMgUnread;
+    if (builtQty <= 0 || haveQty != builtQty) return kMgQtyChanged;
+    if (stackFound == 0) return kMgNoStack;
+    if (room < builtQty) return kMgNoRoom;
+    return kMgMerge;
+}
+/* A FAULT INSIDE THE MERGE. removed: the built stack was already out of the box (its removal published) when the fault came; left: the
+   units it still holds (-1 unread); placed: the put-back into its square or a free one (1 placed, 0 refused, -1 faulted or not tried).
+   kMfNothing: the fault came before the removal - nothing changed; kMfMerged: the stack had already gone into its target (the caller
+   destroys the empty object); kMfPutBack: it is in the box again; kMfLost: it is in no inventory (alive, logged). */
+const int kMfNothing = 0, kMfMerged = 1, kMfPutBack = 2, kMfLost = 3;
+inline int MergeFaultEnd(int removed, int left, int placed)
+{
+    if (removed == 0) return kMfNothing;
+    if (left == 0) return kMfMerged;
+    return (left > 0 && placed == 1) ? kMfPutBack : kMfLost;
+}
+
 /* TEST-ONLY `itemtest confirmdelay <seconds>`: 0..30, digits only (at most three), 0 = off. */
 inline bool ConfirmDelayParse(const char* s, int* out)
 {

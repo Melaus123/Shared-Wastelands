@@ -113,10 +113,18 @@
 #include "../common/crimewire.h"   /* T-546 step 4b: SightStubBuild - the same cell stub crime.cpp's sight1 patch uses */
 #include "../common/teamorders.h" /* T-546 step 7: the orders a teammate's character is not offered */
 #include "peace.h"   /* T-546 (owner 512): the team set the isAllyOf / isEnemyOf detours answer from */
+#include "relations.h"               /* T-942: the other player's side towards this game's player (friend), and its change count */
+#include "../common/nametag.h"       /* T-942: kFriendly - the ally level */
+#include "../common/thingaccess.h"   /* T-942: own / teammate / friend / stranger (owner 1187 a, 1188) */
+#include "../common/npcsense.h"      /* T-943: the NPC senses' and memory's player tests, their forms and the teammate list */
 #include "game/GameWorld.h"       /* T-546 step 7: the `team orders` lever walks activeCharacters() */
 #include "coop_log.h"
 #include "hooks.h"   /* coop::AddHook (own MinHook) / HookStatus - same include items.cpp uses for its four hooks */
 #include "speech.h"  /* T-737: TalkCursorHoverEnter / Leave - the talk cursor's test runs only inside characterSelected */
+#include "../common/teamstub.h"   /* T-1128: the house / research bench sites' expected bytes and the teammate cells' write */
+#include "../common/farmwire.h"   /* T-1128 HIGH 1: WorkerIsCopy / MineWorkerSkip - the copy worker's step skipped, as factory work */
+#include "spawn.h"                /* T-1128 HIGH 1: FindSpawnedUid (address compares, any thread) */
+#include "config.h"               /* T-1128 HIGH 1: RoleIsSingle (any thread) */
 #include <Windows.h>
 #include <intrin.h>   /* _ReturnAddress: which of OwnedByAPlayerFaction's sixteen callers is asking */
 #include <sstream>
@@ -513,6 +521,8 @@ char detour_OwnedByAPlayerFaction(void* building)
         return a;
     }
     const bool member = inTeam && TeammateFaction(fac);   /* the answered sites only (main thread) */
+    /* owner 1192 a: under `shared` every other player's box opens on a click, a stranger's included; whether a take from it shows
+       stealing is the stealing decision's (the kit: a teammate's or an allowed friend's does not, a stranger's does) */
     if (!member && (!standIn || !shared)) return a;
     if (doorPanel)
     {
@@ -557,7 +567,7 @@ DoorCursorFn    orig_DoorCursor    = 0;
 bool CursorIsPeerObject(void* self)
 {
     if (coop::BasePolicyValue() != coop::kPolicyShared) return false;
-    return coop::IsStandInFaction((::Faction*)FactionOfBuildingPod(self));   /* stand1 fold (2b) */   /* stand1: ANY player's stand-in */
+    return coop::IsStandInFaction((::Faction*)FactionOfBuildingPod(self));   /* stand1 fold (2b) */   /* stand1: ANY player's stand-in (owner 1192 a: a stranger's too) */
 }
 // 0xF (a stranger's locked box) and 0x18 (a stranger's lootable container) both become 9, which is what the
 // engine itself returns for a box a player faction owns - it returns it BEFORE consulting the lock at all, so
@@ -890,6 +900,129 @@ BoxCells* g_groupCells = 0;
 const char* g_groupWhy = "not tried";
 int g_groupHeld = 0;
 
+/* ---- T-1128 (owner 1188, 1194 a): A TEAMMATE'S HOUSE TAKES THIS PLAYER'S BUILDING PIECES ---------------------------------------
+   The place test 0x4DAFB0 asks the host test 0x4D5F30 whether a piece placed inside a building may go there; for a building owned
+   by a faction the test answers 1 only when that faction is a player faction (Read, build/decomp_4d5f30.txt:93-95; capstone on both
+   Steam builds, 1.0.65 shown, 1.0.68 0x4D6CB2 the same bytes):
+     0x4D5F76  45 33 E4               xor r12d, r12d          r12 = 0; the only later write (0x4D6199, mov r12d,1) is on the other
+                                                              road, which returns at 0x4D6200 and never reaches this compare
+     0x4D621F  call [rax+0x58]                                the host building's owner faction (rax)
+     0x4D6222  4C 39 A0 50 02 00 00   cmp qword [rax+0x250], r12   its PlayerInterface* against 0
+     0x4D6229  0F 85 95 00 00 00      jne 0x4D62C4            NOT EQUAL (ZF=0): a player faction - `mov al,1`, the piece may go here
+     0x4D622F  ...                                            EQUAL (ZF=1): not a player's - "Can't place in a building you don't own"
+   So ZF=0 means "a player", the polarity of the box / near-town stubs. A teammate's house is owned on this game by that teammate's
+   stand-in faction, which has no PlayerInterface, so the teammate's house refused this player's pieces (T1668, P191). THE FIX:
+   the 7-byte compare is replaced (E9 rel32 + 2 NOPs, ending at the jne) by a jump to SightStubBuild's stub (crimewire.h) built with
+   THIS compare's own 7 bytes: it re-does the compare (a player faction: ZF=0, as before), else compares the faction against cells
+   holding this game's teammates' factions (a match: `cmp rax, 0` with rax non-zero, so ZF=0 - the jne takes the allowed road,
+   counted in hits), else re-does the compare (ZF=1, as before) and jumps back to the jne at site + 7. It reads only rax, r12 and
+   its own page, calls nothing and writes no register. The cells are written with the others (PolicyTeammateFactions, main thread,
+   only when they change), empty with no team: a friend's or a stranger's house keeps the engine's rule. The piece itself is then
+   handed to the house owner by build.cpp's BdHandToHouseOwner (boxowner.h HouseOwnerOfNewPiece), as the owner rules say.
+   Written once at InstallPolicy (the preload stage). */
+unsigned long long kHouseOwnerTestRva = 0; static AddrReg kHouseOwnerTestRva_reg("PlacementHostOwnerTest", &kHouseOwnerTestRva);   /* Steam_1.0.65 0x4D6222 - a patch site, not a function */
+using teamstub::kHouseOwnerOrig;      /* the compare, then its jne (src/common/teamstub.h, shared with the tests) */
+using teamstub::kHouseOwnerTestLen;
+using teamstub::kHouseOwnerOrigLen;
+typedef char kHouseStubBeforeCells[(2 * kHouseOwnerTestLen + 34 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];
+BoxCells* g_houseCells = 0;
+const char* g_houseWhy = "not tried";
+int g_houseHeld = 0;
+int HouseOwnerTestPatch(uintptr_t site)
+{
+    unsigned char now[kHouseOwnerOrigLen];
+    if (!BoxReadPod((const void*)site, now, kHouseOwnerOrigLen)) { g_houseWhy = "the site could not be read"; return 0; }
+    if (std::memcmp(now, kHouseOwnerOrig, kHouseOwnerOrigLen) != 0) { g_houseWhy = "the 13 bytes at the site are not the expected test (another mod?)"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_houseWhy = "no page for the stub within a jump of the site"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_houseWhy = "the stub page is out of jump range"; return 0; }
+    BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
+    for (int k = 0; k < kBoxCells; ++k) cells->cell[k] = 0;
+    cells->hits = 0;
+    if (coopcrime::SightStubBuild(stub, (unsigned long long)site, kBoxCells, (int)kBoxCellsOff, kHouseOwnerOrig, kHouseOwnerTestLen)
+        != coopcrime::SightStubLenFor(kHouseOwnerTestLen, kBoxCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_houseWhy = "the stub came out at an unexpected length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[kHouseOwnerTestLen];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = patch[6] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, kHouseOwnerTestLen, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_houseWhy = "VirtualProtect refused"; return 0; }
+    std::memcpy((void*)site, patch, kHouseOwnerTestLen);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, kHouseOwnerTestLen, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, kHouseOwnerTestLen);
+    g_houseCells = cells;
+    g_houseWhy = "patched";
+    return 1;
+}
+
+/* ---- T-1128 (owner 1188, 1194 a): A TEAMMATE'S RESEARCH BENCH WORKS FOR THIS PLAYER'S CHARACTER -----------------------------------
+   ResearchBuilding::operate 0x29B890 (1.0.68 0x29B8D0; the ResearchBuilding vtable's +0x4B0 through the thunk 0xD378), run for a
+   character working the bench, tests the bench's owner twice, each time with the 8-byte test the box stub replaces (Read, capstone
+   on both Steam builds, 1.0.65 shown):
+     0x29B8D0  call [rax+0x58]                                the bench's owner faction (rax; null-checked by the same call at 0x29B8BE)
+     0x29B8D3  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0   has a PlayerInterface?
+     0x29B8DB  0F 84 18 01 00 00         je 0x29B9F9 (the end)      EQUAL (ZF=1): not a player's - nothing happens
+     0x29B8E1  call 0x2974F0 (thunk 0x29537)                  the worker's science training (decomp_2974f0.txt: worker+0x450 stats
+                                                              and the bench's own +0x160 / +0x158 / +0x1A4 / +0x3F8 / +0x3A4)
+     0x29B908  call [rax+0x58] (null-checked at 0x29B8F9)
+     0x29B90B  48 83 B8 50 02 00 00 00   cmp qword [rax+0x250], 0
+     0x29B913  0F 84 E0 00 00 00         je 0x29B9F9
+     0x29B919  ...                       the research progress: the bench's vt+0x3C0 (0x297AF0) x vt+0x368 (0x296DC0) x the time step,
+                                         one entry appended to the engine's list at 0x2133678 - the owner faction is not used again
+                                         (the callees vt+0x520 / vt+0x518 / 0x3BA61 inside those two were not read)
+   1.0.68: 0x29B913 / 0x29B94B, the same bytes. So ZF=0 means "a player" here too (the je skips on ZF=1). A teammate's bench is owned
+   on this game by that teammate's stand-in faction, so this player's character worked it for nothing. THE FIX: each 8-byte test is
+   replaced (E9 rel32 + 3 NOPs, ending at the je) by the box test's stub (Test8Patch: the original compare, else the teammate cells -
+   a match gives ZF=0, counted in hits - else the original compare again), back to the je at site + 8. The check covers the test
+   and the je's two opcode bytes (its rel32 stays in place and is not changed). The cells are written with the others
+   (PolicyTeammateFactions); a friend's or a stranger's bench keeps the engine's rule. Written once at InstallPolicy. */
+unsigned long long kResearchWorkTestRva = 0; static AddrReg kResearchWorkTestRva_reg("ResearchBenchWorkOwnerTest", &kResearchWorkTestRva);   /* Steam_1.0.65 0x29B8D3 - a patch site, not a function */
+unsigned long long kResearchProgressTestRva = 0; static AddrReg kResearchProgressTestRva_reg("ResearchBenchProgressOwnerTest", &kResearchProgressTestRva);   /* Steam_1.0.65 0x29B90B - a patch site, not a function */
+using teamstub::kResearchTestOrig;   /* the test, then its je's opcode (src/common/teamstub.h, shared with the tests) */
+typedef char kResearchOrigIsTest8[(teamstub::kResearchOrigLen == 10 && teamstub::kResearchTestLen == 8) ? 1 : -1];   /* Test8Patch's shape */
+BoxCells* g_resWorkCells = 0;
+BoxCells* g_resProgCells = 0;
+const char* g_resWorkWhy = "not tried";
+const char* g_resProgWhy = "not tried";
+int g_resHeld = 0;
+/* the teammate cells of one stub set to the given factions (MAIN THREAD, PolicyTeammateFactions); the count held */
+int MateCellsWrite(BoxCells* c, void* const* facs, int n) { return teamstub::MateCellsWrite(c->cell, kBoxCells, facs, n); }
+
+/* ---- T-1128 review HIGH 1: A COPY WORKER'S RESEARCH IS COUNTED ON ITS OWN GAME ONLY ---------------------------------------------
+   ResearchBuilding::operate (row ResearchOperate: 1.0.65 0x29B890 / 1.0.68 0x29B8D0, the ResearchBuilding vtable's +0x4B0 on both
+   builds - the slot ProductionBuilding::operate fills, items.cpp detour_prodOperate) is void(bench, Character* who, float dt): rcx the
+   bench, rdx the worker (kept in rdi and passed as the worker to the science training 0x2974F0, which reads who+0x450), xmm2 the time
+   step (Read, capstone). With the bench stubs above, a COPY of another game's character working a teammate's bench would add progress
+   on this game while its own game counts the same work (and finished research is merged across the team: team.cpp) - the work counted
+   twice, as T1321 found for machines. So operate is skipped for a copy worker exactly as factory and farm work are (T-610:
+   farmwire.h WorkerIsCopy / MineWorkerSkip): each game counts only its own characters' work. This deliberately also changes the bench
+   owner's own game: another player's copy working your own bench no longer counts there either - its own game counts it (the single
+   count rule). The step is reached through the vtable slot the work task calls from Character::threadedUpdate (the AI worker thread,
+   as for ProductionBuilding::operate - farm.cpp T-853 #9), so only the any-thread copy test is used: FindSpawnedUid (address
+   compares) and the owned mirror (net::IsUidMineAnyThread); a "not mine" from an inexact mirror is no proof and the step runs (the
+   T-610 fail-safe). A lone game is never touched. Hooked once at InstallPolicy. */
+typedef void (*ResearchOperateFn)(void* bench, void* who, float dt);
+unsigned long long kResearchOperateRva = 0; static AddrReg kResearchOperateRva_reg("ResearchOperate", &kResearchOperateRva);   /* Steam_1.0.65 0x29B890 - ResearchBuilding::operate, vtable +0x4B0 */
+ResearchOperateFn orig_researchOperate = 0;
+int g_resHook = 0;
+volatile LONG64 g_resCopySkipped = 0;
+void detour_researchOperate(void* bench, void* who, float dt)
+{
+    if (who != 0 && !RoleIsSingle())
+    {
+        const unsigned int whoUid = FindSpawnedUid(who);
+        const int whoCopy = (whoUid != 0) ? coopfarm::WorkerIsCopy(whoUid, net::IsUidMineAnyThread(whoUid) ? 1 : 0,
+                                                                   net::OwnedMirrorExactAnyThread() ? 1 : 0) : 0;
+        if (coopfarm::MineWorkerSkip(0, whoCopy) != 0) { ::InterlockedIncrement64(&g_resCopySkipped); return; }
+    }
+    orig_researchOperate(bench, who, dt);
+}
+
 /* ---- T-968: ANOTHER PLAYER'S OUTPOST COPY KEEPS THE WORLD OBJECTS THE OWNER'S GAME KEEPS NEAR IT ---------------------------------
    The foliage routine (0x6D20C0, which places an area's scattered world objects - world buildings and boxes among them) leaves an
    object marked avoid-towns out when it stands inside the nearest town's no-foliage range (town+0x384, squared, against the
@@ -958,6 +1091,411 @@ int FoliageTownTestPatch(uintptr_t site)
     g_foliageCells = cells;
     g_foliageWhy = "patched";
     return 1;
+}
+
+/* ---- T-942 (owner 1187 a, 1188, 1189 a): ANOTHER PLAYER'S BOX AND CHARACTER - TEAMMATE / FRIEND / STRANGER ----------------------
+   THE KIT TABLE: every other player's faction on this game (the stand-in list PolicyStandInFactions keeps, and this game's teammates
+   PolicyTeammateFactions gives) with its class from swaccess::Classify (src/common/thingaccess.h): teammate (the team table),
+   friend allowed / refused (that player's side towards this game's player is ally - its players tab - and the host's base-access
+   option is / is not `shared`), stranger. Written on the MAIN THREAD only (PolicyKitTick, when the team, a standing between players,
+   the option or this game's slot changes; pruned at once when a faction list changes, so a freed faction never stays); read by any
+   thread (count first set to 0, then the rows, then the count - a reader in between finds nothing and keeps the engine's answer).
+   This game's own player faction is never in it: it is told by its PlayerInterface (Faction+0x250).
+   THE SITES (Read, build/decomp_*.txt for 1.0.65; bytes by capstone on both Steam exes):
+   1  the stealing decision 0x710B70 (1.0.68 0x711740), InventoryGUI's 'is this move stealing?' for every item move between two
+      windows (box or character on each side; 0x713150 right-click / shift-click, 0x714990 drop, 0x7118C0) and the box window's
+      'Stealing chance' label (0x711D50:71): a function hook. The engine's answer first (it also makes the windows' records); a
+      'stealing' answer becomes 'not stealing' when the side least this player's own is a teammate's or an allowed friend's.
+   2  the item hover cursor 0x7FB8A0: `cmp qword [rax+0x250],0 ; jne` at 0x7FBA00 (1.0.68 0x7FC5A0), then the +0x1D0 test and the
+      stealing cursor 0x15 / ALT hint: a cell stub (crime.cpp's sight stub) - a teammate's or allowed friend's owner takes the jne as
+      a player faction does.
+   3  the trade / loot window choice 0x790D00 (row ShowTradeWindow; 1.0.68 0x7918A0): `cmp qword [rax+0x250],0 ; setne bpl` at
+      0x790DD8 (1.0.68 0x791978) on the other side's faction - bpl set opens its window with the +9 / +10 'free' flags (no stealing)
+      and no shop window: the same cell stub; and a function hook that picks the window for another player's thing
+      (swaccess::WindowFor): a box, or a character down or carried (the function's own test, Character_inRagdoll 0x7D08A0,
+      decomp_790d00.txt:61), opens as a loot window (2) - stealing shown for anyone but a teammate or an allowed friend, no crime
+      (crime.cpp refuses crimes between players); an awake character opens as this player's own for a teammate or an allowed
+      friend, and opens NO window for anyone else (the call is skipped).
+   4  the box click (buildingSelected's inline owner test 0x7FC241, the box stub above): its cells now hold the same teammate +
+      allowed-friend set, written here.
+   OWNER-MESSAGE HOOK POINT (not built here): the moves these sites allow reach the other player's box or character through
+   items.cpp ItCrossTransfer (the mover's side) and ApplyItemRequest (the game that holds the box applies it). */
+const int kKitCap = kFoliageCells + kBoxCells;
+void* volatile g_kitFac[kKitCap];
+volatile LONG g_kitWho[kKitCap];
+volatile LONG g_kitN = 0;
+void* g_kitMates[kBoxCells];   /* MAIN THREAD: the teammates PolicyTeammateFactions last gave */
+int g_kitMatesN = 0;
+bool g_kitDirty = true;        /* MAIN THREAD: a faction list changed - classify at the next tick */
+long long g_kitRelEp = -1;
+int g_kitPol = -1, g_kitMe = -2;
+void* g_kitMine = 0;
+DWORD g_kitAt = 0;
+long long g_kitBuilds = 0;     /* full classifications */
+int g_kitLike = 0, g_kitLikeDrops = 0;   /* teammates + allowed friends in the stub cells; those past the cells */
+int g_kitCount[swaccess::kWhoCount];     /* the table's rows by class at the last write (MAIN THREAD) */
+/* the per-site counters: [team, friend allowed, friend refused, stranger] (swaccess::CounterOf) */
+volatile LONG64 g_stealJudged[swaccess::kCounters];   /* site 1: the engine said 'stealing' (team / friend cleared, the rest kept) */
+volatile LONG64 g_stealOffMain = 0;                    /* site 1 judged off the main thread (the engine's thread is measured, not assumed) */
+volatile LONG64 g_tradeJudged[swaccess::kCounters];   /* site 3: window opens on another player's thing */
+volatile LONG64 g_tradeNoWindow = 0;                   /* site 3: an awake character of a stranger / refused friend: no window */
+volatile LONG64 g_tradeNever = 0;                      /* site 3: the caller's choice changed to 'never a shop window' */
+int g_stealHook = 0, g_tradeHook = 0;
+FoliageCells* g_hoverCells = 0;
+const char* g_hoverWhy = "not-tried";
+FoliageCells* g_tradeCells = 0;
+const char* g_tradeWhy = "not-tried";
+const void* g_kitPlaced[kFoliageCells];   /* the placement the hover and trade cells carry (MAIN THREAD) */
+const void* g_boxPlaced[kBoxCells];       /* the placement the box click cells carry (MAIN THREAD) */
+unsigned long long kStealFlagRva = 0; static AddrReg kStealFlagRva_reg("InventoryGUI_stealFlag", &kStealFlagRva);   /* Steam_1.0.65 0x710B70 */
+unsigned long long kItemHoverOwnerTestRva = 0; static AddrReg kItemHoverOwnerTestRva_reg("ItemHoverOwnerTest", &kItemHoverOwnerTestRva);   /* Steam_1.0.65 0x7FBA00 - a patch site */
+unsigned long long kTradeTargetOwnerTestRva = 0; static AddrReg kTradeTargetOwnerTestRva_reg("TradeWindowTargetOwnerTest", &kTradeTargetOwnerTestRva);   /* Steam_1.0.65 0x790DD8 - a patch site */
+unsigned long long kKitShowTradeRva = 0; static AddrReg kKitShowTradeRva_reg("ShowTradeWindow", &kKitShowTradeRva);   /* Steam_1.0.65 0x790D00 */
+unsigned long long kKitInRagdollRva = 0; static AddrReg kKitInRagdollRva_reg("Character_inRagdoll", &kKitInRagdollRva);   /* Steam_1.0.65 0x7D08A0: down or carried */
+const unsigned char kItemHoverOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x75, 0x12 };   /* the test, then its jne */
+const unsigned char kTradeTargetOrig[10] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x40, 0x0F };   /* the test, then setne bpl's first bytes */
+typedef char kKitPolicyShared[(swaccess::kPolicyShared == coop::kPolicyShared && swaccess::kPolicyOwner == coop::kPolicyOwner
+                               && swaccess::kPolicyLocked == coop::kPolicyLocked && swaccess::kPolicyUnknown == coop::kPolicyUnknown) ? 1 : -1];
+
+int KitClassOfPod(void* faction)
+{
+    if (!Plaus(faction)) return swaccess::kNotPlayer;
+    void* pi = 0;
+    if (IsPlayerFieldPod(faction, &pi) != 1) return swaccess::kNotPlayer;
+    if (pi != 0) return swaccess::kOwn;
+    const int n = (int)g_kitN;
+    for (int k = 0; k < n && k < kKitCap; ++k)
+        if (g_kitFac[k] == faction) return (int)g_kitWho[k];
+    return swaccess::kNotPlayer;
+}
+/* the 8-byte owner test at `site` (`orig` = it and the 2 bytes after it) replaced by a jump to the sight stub with kFoliageCells
+   cells (rax holds the faction); out / why get the result. Written once at InstallPolicy. */
+int KitStubPatch(uintptr_t site, const unsigned char* orig, FoliageCells*& out, const char*& why)
+{
+    unsigned char now[10];
+    if (!BoxReadPod((const void*)site, now, 10)) { why = "unreadable"; return 0; }
+    if (std::memcmp(now, orig, 10) != 0) { why = "not-expected"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { why = "no-page"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); why = "out-of-range"; return 0; }
+    FoliageCells* cells = (FoliageCells*)(stub + kBoxCellsOff);
+    for (int k = 0; k < kFoliageCells; ++k) cells->cell[k] = 0;
+    cells->hits = 0;
+    if (coopcrime::SightStubBuild(stub, (unsigned long long)site, kFoliageCells, (int)kBoxCellsOff) != coopcrime::SightStubLenFor(8, kFoliageCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); why = "bad-length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    patch[5] = patch[6] = patch[7] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, 8, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); why = "protect-refused"; return 0; }
+    std::memcpy((void*)site, patch, 8);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, 8, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, 8);
+    out = cells;
+    why = "patched";
+    return 1;
+}
+void KitAdd(const void** facs, int* who, int* n, const void* f, int cls)
+{
+    if (f == 0 || *n >= kKitCap) return;
+    for (int i = 0; i < *n; ++i) if (facs[i] == f) return;
+    facs[*n] = f; who[*n] = cls; ++*n;
+}
+/* MAIN THREAD. The table and every stub's cells written again. classify: each faction judged afresh (its standing read through
+   the engine's accessor - only while engine writes are allowed); otherwise (a faction list changed) a faction keeps the class it
+   had, except that one no longer a teammate is a stranger until the next tick judges it. Nothing is kept while engine writes are
+   blocked (a world loading or torn down: the factions may be freed). */
+void KitBuild(bool classify)
+{
+    const void* facs[kKitCap];
+    int who[kKitCap];
+    int n = 0;
+    if (!coop::EngineWritesBlocked())
+    {
+        const int pol = coop::BasePolicyValue();
+        ::Faction* mine = coop::LocalPlayerFaction();
+        for (int k = 0; k < g_kitMatesN; ++k) KitAdd(facs, who, &n, g_kitMates[k], swaccess::kTeam);
+        for (int k = 0; k < kFoliageCells; ++k)
+        {
+            const void* f = g_foliagePlaced[k];
+            if (f == 0) continue;
+            const bool mate = coop::PolicyTeammateFaction((void*)f);
+            int cls = swaccess::kStranger;
+            if (mate) cls = swaccess::kTeam;
+            else if (classify)
+            {
+                /* that player's own side towards this game's player, as its players tab set it - no team fold */
+                float v = 0.0f; unsigned flags = 0;
+                const int read = Plaus(mine) ? coop::RelationsTheirSideRaw((::Faction*)f, mine, &v, &flags) : 0;
+                cls = swaccess::Classify(false, true, false, swaccess::TabAlly(read, v, (flags & 1u) != 0), pol);
+            }
+            else
+            {
+                const int was = KitClassOfPod((void*)f);
+                if (was == swaccess::kFriendAllowed || was == swaccess::kFriendRefused) cls = swaccess::Classify(false, true, false, true, pol);
+            }
+            KitAdd(facs, who, &n, f, cls);
+        }
+    }
+    ::InterlockedExchange(&g_kitN, 0);
+    for (int k = 0; k < kKitCap; ++k)
+    {
+        g_kitWho[k] = (k < n) ? (LONG)who[k] : 0;
+        g_kitFac[k] = (k < n) ? (void*)facs[k] : 0;
+    }
+    ::InterlockedExchange(&g_kitN, (LONG)n);
+    for (int c = 0; c < swaccess::kWhoCount; ++c) g_kitCount[c] = 0;
+    for (int k = 0; k < n; ++k) if (who[k] >= 0 && who[k] < swaccess::kWhoCount) ++g_kitCount[who[k]];
+    /* the stubs' cells: teammates and allowed friends - a faction keeps its cell while it stays */
+    const void* like[kKitCap];
+    int likeDrops = 0;
+    const int nl = swaccess::LikeOwnList(facs, who, n, like, kKitCap, &likeDrops);
+    const void* next[kFoliageCells];
+    int drops = 0;
+    g_kitLike = coopcrime::StableCellsPlace(g_kitPlaced, like, nl, next, kFoliageCells, &drops);
+    g_kitLikeDrops = drops + likeDrops;
+    for (int k = 0; k < kFoliageCells; ++k)
+    {
+        g_kitPlaced[k] = next[k];
+        if (g_hoverCells != 0 && g_hoverCells->cell[k] != next[k]) g_hoverCells->cell[k] = (void*)next[k];
+        if (g_tradeCells != 0 && g_tradeCells->cell[k] != next[k]) g_tradeCells->cell[k] = (void*)next[k];
+    }
+    const void* nextBox[kBoxCells];
+    int boxDrops = 0;
+    g_boxHeld = coopcrime::StableCellsPlace(g_boxPlaced, like, nl, nextBox, kBoxCells, &boxDrops);
+    for (int k = 0; k < kBoxCells; ++k)
+    {
+        g_boxPlaced[k] = nextBox[k];
+        if (g_boxCells != 0 && g_boxCells->cell[k] != nextBox[k]) g_boxCells->cell[k] = (void*)nextBox[k];
+    }
+}
+/* a list changed: freed factions leave at once, the classes are judged again at the next tick */
+void KitListChanged() { KitBuild(false); g_kitDirty = true; }
+
+/* site 1: InventoryGUI's stealing decision. Its windows' owners: window vt+0x80 (the owner object), then vt+0x58 (its faction) - the
+   two calls 0x710B70 itself makes on its first window (decomp_710b70.txt:44-45) and 0x713150 on the other (:119). */
+typedef char (*StealFlagFn)(void*, void*);
+StealFlagFn orig_StealFlag = 0;
+typedef void* (*KitGetFn)(void*);
+int KitWindowFactionPod(void* win, void** fac)
+{
+    __try
+    {
+        *fac = 0;
+        if (!Plaus(win)) return 0;
+        void* owner = ((KitGetFn)((*(void***)win)[0x80 / 8]))(win);
+        if (!Plaus(owner)) return 0;
+        *fac = ((KitGetFn)((*(void***)owner)[0x58 / 8]))(owner);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int KitObjectFactionPod(void* obj, void** fac)
+{
+    __try
+    {
+        *fac = 0;
+        if (!Plaus(obj)) return 0;
+        *fac = ((KitGetFn)((*(void***)obj)[0x58 / 8]))(obj);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+char detour_StealFlag(void* clicked, void* other)
+{
+    const char a = orig_StealFlag(clicked, other);
+    if (a == 0 || clicked == other || g_kitN == 0) return a;
+    void* fa = 0;
+    void* fb = 0;
+    if (KitWindowFactionPod(clicked, &fa) != 1 || KitWindowFactionPod(other, &fb) != 1) return a;
+    const int cls = swaccess::PairClass(KitClassOfPod(fa), KitClassOfPod(fb));
+    const int c = swaccess::CounterOf(cls);
+    if (c < 0) return a;
+    ::InterlockedIncrement64(&g_stealJudged[c]);
+    const unsigned long m = coop::StoreMainThreadId();
+    if (m == 0 || ::GetCurrentThreadId() != (DWORD)m) ::InterlockedIncrement64(&g_stealOffMain);
+    return swaccess::ClearsStealing(cls) ? (char)0 : a;
+}
+/* site 3: is `obj` a character (vt+0x20 == 1, decomp_790d00.txt:52), and is it down or carried (Character_inRagdoll, the test the
+   function itself makes at :61); 1 = a character read, 0 = not a character, -1 unreadable (then judged as not down) */
+typedef char (*KitInRagdollFn)(void*);
+typedef int (*KitTypeFn)(void*);
+int KitCharacterPod(void* obj, int* down)
+{
+    *down = 0;
+    __try
+    {
+        if (!Plaus(obj)) return -1;
+        if (((KitTypeFn)((*(void***)obj)[0x20 / 8]))(obj) != 1) return 0;
+        if (kKitInRagdollRva != 0 && g_base != 0) *down = ((KitInRagdollFn)(g_base + (uintptr_t)kKitInRagdollRva))(obj) != 0 ? 1 : 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *down = 0; return -1; }
+}
+/* site 3: the trade / loot window choice for another player's thing (swaccess::WindowFor) */
+typedef void (*KitShowTradeFn)(void*, void*, void*, int);
+KitShowTradeFn orig_KitShowTrade = 0;
+void detour_KitShowTrade(void* gui, void* player, void* other, int type)
+{
+    if (g_kitN != 0 && other != 0)
+    {
+        void* fac = 0;
+        if (KitObjectFactionPod(other, &fac) == 1)
+        {
+            const int who = KitClassOfPod(fac);
+            const int c = swaccess::CounterOf(who);
+            if (c >= 0)
+            {
+                ::InterlockedIncrement64(&g_tradeJudged[c]);
+                int down = 0;
+                const int character = KitCharacterPod(other, &down);
+                const int want = swaccess::WindowFor(who, character == 1, down != 0, type);
+                if (want == swaccess::kNoWindow) { ::InterlockedIncrement64(&g_tradeNoWindow); return; }
+                if (want != type) { ::InterlockedIncrement64(&g_tradeNever); type = want; }
+            }
+        }
+    }
+    orig_KitShowTrade(gui, player, other, type);
+}
+
+/* ---- T-943 (owner 1187 a, 1188): NPCS ON THIS GAME TREAT A TEAMMATE'S CHARACTERS AS THIS GAME'S PLAYER'S OWN ---------------------
+   The NPC senses (AI worker thread) and NPC memory ask inline, at 22 sites, whether a character's faction is a player faction (its
+   PlayerInterface at Faction+0x250); a teammate's characters on this game carry that player's stand-in faction, which has none, so
+   NPCs took them for strangers. Each site's compare (8 bytes `cmp qword [rax+0x250],0`, or 7 bytes `cmp qword [rax+0x250],reg` with
+   reg = 0 there) is replaced (E9 rel32, NOPs to the compare's end; the jcc after it stays) by a jump to coopcrime::SightStubBuild's
+   stub built with that compare's own bytes, on a page of its own (swnpc::SiteAt, src/common/npcsense.h: the sites, their forms and
+   the 10 bytes each must hold, the same in Steam 1.0.65 and 1.0.68): a player faction keeps the engine's answer; a faction in the
+   stub's cells answers as a player faction and is counted in the cells' hits (the per-site counter on the report line); any other
+   faction keeps the engine's answer. The stub reads only rax, the compare's zero register and its own page; it calls nothing and
+   writes no register.
+   THE LIST: the cells hold this game's current TEAMMATES' factions only (swnpc::MateList of what team.cpp CellsTick gives
+   PolicyTeammateFactions - not the kit table, which also holds allowed friends): written on the MAIN THREAD when the team table is
+   read again, emptied while a world loads or is torn down and when the table copy is dropped (team.cpp), each faction keeping its
+   cell while it stays (coopcrime::StableCellsPlace); read lock-free by the AI worker thread and any other (one aligned pointer per
+   cell: a reader sees the old or the new faction in a cell, never a torn one; a cell is compared, never followed).
+   Left with the engine's own answer: 0x858B5F, the 7 tests in 0x853E40, the NPC-side tests in 0x856C40, 0x8561AA / 0x85624A,
+   0x671F32 (the NPC's own faction), and crime.cpp's 0x858D13 / 0x85635D and speech.cpp's P26 stage 6 (their own rules).
+   Not covered: the allied / enemy player events 0x42 / 0x43 (sites 1 and 2) still weigh the NPC faction's standing towards the
+   teammate's stand-in faction, not towards this game's player faction. */
+BoxCells* g_npcCells[swnpc::kSites];          /* each site's stub cells; 0 = not patched */
+const char* g_npcWhy[swnpc::kSites];          /* each site's install result */
+const void* g_npcPlaced[kBoxCells];           /* MAIN THREAD: the teammates the cells carry, by cell */
+int g_npcHeld = 0, g_npcDrops = 0, g_npcPatched = 0;
+long long g_npcSaidAt[swnpc::kSites];         /* MAIN THREAD: each site's hit count at its last log line */
+int g_npcSaid[swnpc::kSites];                 /* MAIN THREAD: each site's log lines so far (swnpc::kSayCap at most) */
+DWORD g_npcLookAt = 0;
+unsigned long long g_npcRva[swnpc::kSites];
+static AddrReg g_npcRva0_reg(swnpc::SiteAt(0).row, &g_npcRva[0]);     /* Steam_1.0.65 0x8589B7 - a patch site */
+static AddrReg g_npcRva1_reg(swnpc::SiteAt(1).row, &g_npcRva[1]);     /* Steam_1.0.65 0x858FE6 */
+static AddrReg g_npcRva2_reg(swnpc::SiteAt(2).row, &g_npcRva[2]);     /* Steam_1.0.65 0x8590EC */
+static AddrReg g_npcRva3_reg(swnpc::SiteAt(3).row, &g_npcRva[3]);     /* Steam_1.0.65 0x856E1B */
+static AddrReg g_npcRva4_reg(swnpc::SiteAt(4).row, &g_npcRva[4]);     /* Steam_1.0.65 0x857108 */
+static AddrReg g_npcRva5_reg(swnpc::SiteAt(5).row, &g_npcRva[5]);     /* Steam_1.0.65 0x85714D */
+static AddrReg g_npcRva6_reg(swnpc::SiteAt(6).row, &g_npcRva[6]);     /* Steam_1.0.65 0x8573CC */
+static AddrReg g_npcRva7_reg(swnpc::SiteAt(7).row, &g_npcRva[7]);     /* Steam_1.0.65 0x8582A5 */
+static AddrReg g_npcRva8_reg(swnpc::SiteAt(8).row, &g_npcRva[8]);     /* Steam_1.0.65 0x670E16 */
+static AddrReg g_npcRva9_reg(swnpc::SiteAt(9).row, &g_npcRva[9]);     /* Steam_1.0.65 0x671006 */
+static AddrReg g_npcRva10_reg(swnpc::SiteAt(10).row, &g_npcRva[10]);  /* Steam_1.0.65 0x6738FF */
+static AddrReg g_npcRva11_reg(swnpc::SiteAt(11).row, &g_npcRva[11]);  /* Steam_1.0.65 0x6739BC */
+static AddrReg g_npcRva12_reg(swnpc::SiteAt(12).row, &g_npcRva[12]);  /* Steam_1.0.65 0x673AD9 */
+static AddrReg g_npcRva13_reg(swnpc::SiteAt(13).row, &g_npcRva[13]);  /* Steam_1.0.65 0x67439C */
+static AddrReg g_npcRva14_reg(swnpc::SiteAt(14).row, &g_npcRva[14]);  /* Steam_1.0.65 0x674D62 */
+static AddrReg g_npcRva15_reg(swnpc::SiteAt(15).row, &g_npcRva[15]);  /* Steam_1.0.65 0x677CBB */
+static AddrReg g_npcRva16_reg(swnpc::SiteAt(16).row, &g_npcRva[16]);  /* Steam_1.0.65 0x677CE6 */
+static AddrReg g_npcRva17_reg(swnpc::SiteAt(17).row, &g_npcRva[17]);  /* Steam_1.0.65 0x677D5C */
+static AddrReg g_npcRva18_reg(swnpc::SiteAt(18).row, &g_npcRva[18]);  /* Steam_1.0.65 0x677DC7 */
+static AddrReg g_npcRva19_reg(swnpc::SiteAt(19).row, &g_npcRva[19]);  /* Steam_1.0.65 0x677DF4 */
+static AddrReg g_npcRva20_reg(swnpc::SiteAt(20).row, &g_npcRva[20]);  /* Steam_1.0.65 0x677E67 */
+static AddrReg g_npcRva21_reg(swnpc::SiteAt(21).row, &g_npcRva[21]);  /* Steam_1.0.65 0x677E84 */
+typedef char kNpcSitesRegistered[(swnpc::kSites == 22) ? 1 : -1];   /* one AddrReg line above per site */
+typedef char kNpcStubBeforeCells[(2 * 8 + 34 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];
+
+/* site k's compare replaced by a jump to its stub; the cells start with the teammates already known. Written once at InstallPolicy
+   (the preload stage, before any NPC thinks). */
+int NpcSitePatch(int k, uintptr_t site)
+{
+    const swnpc::Site& s = swnpc::SiteAt(k);
+    const int L = swnpc::TestLen(s.form);
+    unsigned char want[swnpc::kCheckLen], now[swnpc::kCheckLen];
+    swnpc::Expected(k, want);
+    if (!BoxReadPod((const void*)site, now, swnpc::kCheckLen)) { g_npcWhy[k] = "unreadable"; return 0; }
+    if (std::memcmp(now, want, swnpc::kCheckLen) != 0) { g_npcWhy[k] = "not-expected"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_npcWhy[k] = "no-page"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_npcWhy[k] = "out-of-range"; return 0; }
+    BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
+    for (int c = 0; c < kBoxCells; ++c) cells->cell[c] = (void*)g_npcPlaced[c];
+    cells->hits = 0;
+    if (coopcrime::SightStubBuild(stub, (unsigned long long)site, kBoxCells, (int)kBoxCellsOff, swnpc::TestBytes(s.form), L)
+        != coopcrime::SightStubLenFor(L, kBoxCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_npcWhy[k] = "bad-length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    for (int i = 5; i < L; ++i) patch[i] = 0x90;
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, (SIZE_T)L, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_npcWhy[k] = "protect-refused"; return 0; }
+    std::memcpy((void*)site, patch, (size_t)L);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, (SIZE_T)L, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, (SIZE_T)L);
+    g_npcCells[k] = cells;
+    g_npcWhy[k] = "patched";
+    ++g_npcPatched;
+    return 1;
+}
+/* MAIN THREAD: this game's teammates' factions into every patched site's cells (n = 0: emptied) */
+void NpcCellsWrite(void* const* facs, int n)
+{
+    const void* mates[kBoxCells];
+    int over = 0;
+    const int m = swnpc::MateList((const void* const*)facs, n, mates, kBoxCells, &over);
+    const void* next[kBoxCells];
+    int drops = 0;
+    g_npcHeld = coopcrime::StableCellsPlace(g_npcPlaced, mates, m, next, kBoxCells, &drops);
+    g_npcDrops = drops + over;
+    for (int c = 0; c < kBoxCells; ++c) g_npcPlaced[c] = next[c];
+    for (int k = 0; k < swnpc::kSites; ++k)
+    {
+        BoxCells* cells = g_npcCells[k];
+        if (cells == 0) continue;
+        for (int c = 0; c < kBoxCells; ++c) if (cells->cell[c] != next[c]) cells->cell[c] = (void*)next[c];
+    }
+}
+/* MAIN THREAD, looked at once a second: a site whose teammate count rose since its last line gets a line, swnpc::kSayCap lines
+   per site at most (the report line keeps counting) */
+void NpcHitsLook()
+{
+    if (g_npcPatched == 0) return;
+    const DWORD now = ::GetTickCount();
+    if ((DWORD)(now - g_npcLookAt) < 1000u) return;
+    g_npcLookAt = now;
+    for (int k = 0; k < swnpc::kSites; ++k)
+    {
+        if (g_npcCells[k] == 0) continue;
+        const long long h = (long long)g_npcCells[k]->hits;
+        if (!swnpc::SayNow(h, g_npcSaidAt[k], g_npcSaid[k])) continue;
+        g_npcSaidAt[k] = h;
+        ++g_npcSaid[k];
+        DebugLog("[POLICY] T-943 NPC site " + PN((long long)(k + 1)) + " (" + swnpc::SiteAt(k).what + "): a teammate's character taken as this game's player, hits "
+                 + PN(h) + (g_npcSaid[k] == swnpc::kSayCap ? " - the last line for this site; the report line keeps counting" : ""));
+    }
+}
+/* the report's per-site counts, site 1 first; -1 = not patched */
+std::string NpcHitsText()
+{
+    std::string t;
+    for (int k = 0; k < swnpc::kSites; ++k)
+        t += (k ? "," : "") + PN(g_npcCells[k] != 0 ? (long long)g_npcCells[k]->hits : -1);
+    return t;
 }
 }   // namespace
 
@@ -1284,6 +1822,7 @@ void PolicyStandInFactions(void* const* facs, int n)
     for (int k = 0; k < kFoliageCells; ++k) g_foliagePlaced[k] = next[k];
     g_foliageHeld = held;
     g_foliageDrops = drops;
+    KitListChanged();   /* T-942: the kit table reads the same list */
     if (g_foliageCells == 0) return;
     for (int k = 0; k < kFoliageCells; ++k)
         if (g_foliageCells->cell[k] != next[k]) g_foliageCells->cell[k] = (void*)next[k];
@@ -1335,16 +1874,46 @@ void PolicyTeammateFactions(void* const* facs, int n)
         }
         g_groupHeld = gheld;
     }
-    if (g_boxCells == 0) return;
-    int held = 0;
-    for (int k = 0; k < kBoxCells; ++k)
-    {
-        void* want = (k < n && facs != 0) ? facs[k] : 0;
-        if (want != 0) ++held;
-        if (g_boxCells->cell[k] != want) g_boxCells->cell[k] = want;
+    /* T-1128: the house owner test's and the research bench tests' cells */
+    if (g_houseCells != 0) g_houseHeld = MateCellsWrite(g_houseCells, facs, n);
+    {   /* both bench stubs take the same factions: one count */
+        int rheld = 0;
+        if (g_resWorkCells != 0) rheld = MateCellsWrite(g_resWorkCells, facs, n);
+        if (g_resProgCells != 0) rheld = MateCellsWrite(g_resProgCells, facs, n);
+        g_resHeld = rheld;
     }
-    g_boxHeld = held;
+    NpcCellsWrite(facs, n);   /* T-943: the NPC senses' and memory's cells - teammates only */
+    /* T-942: the box click cells are the kit's (teammates and allowed friends), written by KitBuild */
+    g_kitMatesN = 0;
+    for (int k = 0; k < n && k < kBoxCells && facs != 0; ++k) if (facs[k] != 0) g_kitMates[g_kitMatesN++] = facs[k];
+    KitListChanged();
 }
+
+void PolicyKitTick()
+{
+    NpcHitsLook();   /* T-943: the first lines of each NPC site's teammate count */
+    /* T-942: the kit table judged again when anything it depends on changed - a faction list (KitListChanged), a standing between
+       players (the relations change count), the base-access option, this game's slot or player faction; standing changes at most
+       four times a second. Nothing is judged while engine writes are blocked (the table was emptied when they were). */
+    if (coop::EngineWritesBlocked())
+    {
+        if (g_kitN != 0 || g_kitLike != 0) KitBuild(false);
+        g_kitDirty = true;
+        return;
+    }
+    const long long relEp = coop::RelationsPlayerPairEpoch();
+    const int pol = coop::BasePolicyValue();
+    const int me = coop::MySlotForWire();
+    void* const mine = (void*)coop::LocalPlayerFaction();
+    if (!g_kitDirty && relEp == g_kitRelEp && pol == g_kitPol && me == g_kitMe && mine == g_kitMine) return;
+    const DWORD now = ::GetTickCount();
+    if (!g_kitDirty && pol == g_kitPol && me == g_kitMe && mine == g_kitMine && (DWORD)(now - g_kitAt) < 250u) return;
+    g_kitDirty = false;
+    g_kitRelEp = relEp; g_kitPol = pol; g_kitMe = me; g_kitMine = mine; g_kitAt = now;
+    ++g_kitBuilds;
+    KitBuild(true);
+}
+int PolicyKitClassOf(void* faction) { return KitClassOfPod(faction); }
 
 void InstallPolicy()
 {
@@ -1388,6 +1957,59 @@ void InstallPolicy()
     DebugLog(std::string("[POLICY] grouped-confirm player-town test: ") + g_groupWhy
              + (g_groupCells != 0 ? " (the placement confirm's group town, 1.0.65 0x4DA8A3: a teammate's outpost town counts as a player's town; every other town as before)"
                                   : " - a grouped placement beside a teammate's outpost may still found its own outpost for a piece that found no town"));
+    /* T-1128: a teammate's house (the host test's owner compare) and a teammate's research bench (operate's two owner tests) */
+    if (kHouseOwnerTestRva == 0) g_houseWhy = "no address row";
+    else HouseOwnerTestPatch(g_base + (uintptr_t)kHouseOwnerTestRva);
+    if (kResearchWorkTestRva == 0) g_resWorkWhy = "no address row";
+    else Test8Patch(g_base + (uintptr_t)kResearchWorkTestRva, kResearchTestOrig, g_resWorkCells, g_resWorkWhy);
+    if (kResearchProgressTestRva == 0) g_resProgWhy = "no address row";
+    else Test8Patch(g_base + (uintptr_t)kResearchProgressTestRva, kResearchTestOrig, g_resProgCells, g_resProgWhy);
+    /* T-1128 HIGH 1: a copy worker's research step skipped (each game counts only its own characters' work) */
+    const char* resHookWhy = "no address row";
+    if (kResearchOperateRva != 0)
+    {
+        if (coop::AddHook((void*)(g_base + kResearchOperateRva), (void*)&detour_researchOperate, (void**)&orig_researchOperate) == coop::SUCCESS) { g_resHook = 1; resHookWhy = "hooked"; }
+        else resHookWhy = "AddHook FAILED";
+    }
+    {
+        const int patched = (g_houseCells != 0 ? 1 : 0) + (g_resWorkCells != 0 ? 1 : 0) + (g_resProgCells != 0 ? 1 : 0);
+        DebugLog("[POLICY] T-1128 teammate's house and research bench: " + PN((long long)patched) + " of 3 patched - house owner test (1.0.65 0x4D6222): "
+                 + g_houseWhy + "; research bench work test (0x29B8D3): " + g_resWorkWhy + "; research progress test (0x29B90B): " + g_resProgWhy
+                 + "; research operate copy-worker skip (0x29B890): " + resHookWhy
+                 + (g_resHook != 0 ? "" : " (a copy of another game's character working a bench may count research here as well as on its own game)")
+                 + (patched == 3 ? " - this player's pieces may go inside a teammate's house and this player's character researches at a teammate's bench; friends' and strangers' as before"
+                                 : " - where not patched, a teammate's house still refuses this player's pieces / a teammate's bench gives no research"));
+    }
+    /* T-942: another player's box and character - the stealing decision, the item hover cursor, the trade / loot window choice */
+    if (kStealFlagRva == 0) DebugLog("[POLICY] T-942 stealing decision: no address row - another player's box or downed character shows stealing for everyone");
+    else if (coop::AddHook((void*)(g_base + kStealFlagRva), (void*)&detour_StealFlag, (void**)&orig_StealFlag) != coop::SUCCESS)
+        ErrorLog("[POLICY] AddHook stealing decision 0x710B70 FAILED - a teammate's or friend's box and downed character still show stealing");
+    else g_stealHook = 1;
+    if (kKitShowTradeRva == 0) DebugLog("[POLICY] T-942 trade window choice: no address row");
+    else if (coop::AddHook((void*)(g_base + kKitShowTradeRva), (void*)&detour_KitShowTrade, (void**)&orig_KitShowTrade) != coop::SUCCESS)
+        ErrorLog("[POLICY] AddHook trade window choice 0x790D00 FAILED - another player's character may still open a shop window");
+    else g_tradeHook = 1;
+    if (kItemHoverOwnerTestRva == 0) g_hoverWhy = "no-row";
+    else KitStubPatch(g_base + (uintptr_t)kItemHoverOwnerTestRva, kItemHoverOrig, g_hoverCells, g_hoverWhy);
+    if (kTradeTargetOwnerTestRva == 0) g_tradeWhy = "no-row";
+    else KitStubPatch(g_base + (uintptr_t)kTradeTargetOwnerTestRva, kTradeTargetOrig, g_tradeCells, g_tradeWhy);
+    DebugLog(std::string("[POLICY] T-942 another player's things: stealing decision hook=") + (g_stealHook ? "1" : "0")
+             + " trade choice hook=" + (g_tradeHook ? "1" : "0") + " item hover test (1.0.65 0x7FBA00): " + g_hoverWhy
+             + " trade window owner test (1.0.65 0x790DD8): " + g_tradeWhy
+             + " - a teammate's or allowed friend's box and character are used as this player's own; another player's character never opens a shop window");
+    /* T-943: the NPC senses' and memory's player tests - a teammate's character taken as this game's player */
+    {
+        std::string skipped;
+        for (int k = 0; k < swnpc::kSites; ++k)
+        {
+            if (g_npcRva[k] == 0) g_npcWhy[k] = "no-row";
+            else NpcSitePatch(k, g_base + (uintptr_t)g_npcRva[k]);
+            if (g_npcCells[k] == 0) skipped += std::string(skipped.empty() ? "" : "; ") + swnpc::SiteAt(k).row + " " + g_npcWhy[k];
+        }
+        DebugLog("[POLICY] T-943 NPC senses and memory: " + PN((long long)g_npcPatched) + " of " + PN((long long)swnpc::kSites)
+                 + " player tests patched - an NPC takes a teammate's character as this game's player's own (friends and strangers as any other faction)"
+                 + (skipped.empty() ? std::string() : " - NOT PATCHED (the engine's answer stays there): " + skipped));
+    }
     /* T-968: the foliage routine's town owner test */
     if (kFoliageTownTestRva == 0) g_foliageWhy = "no-row";
     else FoliageTownTestPatch(g_base + (uintptr_t)kFoliageTownTestRva);
@@ -1884,6 +2506,10 @@ std::string PolicyReport()
          + "," + PN(g_foliageCells != 0 ? (long long)g_foliageCells->hits : 0) + "," + PN((long long)g_foliageDrops)
          + " foliageCellsAtFirstAreaRead=" + PN((long long)g_foliageAtFirstRead)
          + " teamBox[patched,cellsHeld,hits]=" + PN(g_boxCells != 0 ? 1 : 0) + "," + PN((long long)g_boxHeld) + "," + PN(g_boxCells != 0 ? (long long)g_boxCells->hits : 0)
+         + " teamHouse[patched,cellsHeld,hits]=" + PN(g_houseCells != 0 ? 1 : 0) + "," + PN((long long)g_houseHeld) + "," + PN(g_houseCells != 0 ? (long long)g_houseCells->hits : 0)
+         + " teamResearch[patched,cellsHeld,workHits,progressHits,hook,copySkipped]=" + PN((long long)((g_resWorkCells != 0 ? 1 : 0) + (g_resProgCells != 0 ? 1 : 0))) + "," + PN((long long)g_resHeld)
+         + "," + PN(g_resWorkCells != 0 ? (long long)g_resWorkCells->hits : 0) + "," + PN(g_resProgCells != 0 ? (long long)g_resProgCells->hits : 0)
+         + "," + PN((long long)g_resHook) + "," + PN((long long)g_resCopySkipped)
          + " ownedByPeerAnswered=" + PN(g_ownedByPeerAnswered)
          + " ownedByPeerAnsweredClick=" + PN(g_ownedByPeerAnsweredClick)
          + " doors1[ownedByPeerStranger,cursorStranger,doorCursorStranger]=" + PN(g_ownedByPeerStranger) + "," + PN(g_cursorStranger) + "," + PN(g_doorCursorStranger)
@@ -1893,7 +2519,18 @@ std::string PolicyReport()
          + " ownedByPeerDoorPanelPassedThrough=" + PN(g_ownedByPeerDoorPanelPassedThrough)
          + " ownedByPeerOtherCallerRva=" + PH(g_retSample1) + "," + PH(g_retSample2)
          + " rttiOutOfImage=" + PN(g_rttiOutOfImage) + " imageSize=" + PH((long long)g_imageSize)
-         + " cursorRemapped=" + PN(g_cursorRemapped) + " cursorOtherAnswer=" + PN(g_cursorOtherAnswer) + " cursorHooks=" + PN(g_cursorHooks));
+         + " cursorRemapped=" + PN(g_cursorRemapped) + " cursorOtherAnswer=" + PN(g_cursorOtherAnswer) + " cursorHooks=" + PN(g_cursorHooks)
+         + " kit[rows,team,friend,friendRefused,stranger,likeOwnCells,cellDrops,builds]=" + PN((long long)g_kitN) + "," + PN((long long)g_kitCount[swaccess::kTeam])
+         + "," + PN((long long)g_kitCount[swaccess::kFriendAllowed]) + "," + PN((long long)g_kitCount[swaccess::kFriendRefused]) + "," + PN((long long)g_kitCount[swaccess::kStranger])
+         + "," + PN((long long)g_kitLike) + "," + PN((long long)g_kitLikeDrops) + "," + PN(g_kitBuilds)
+         + " kitSteal[hook,team,friend,friendRefused,stranger,offMain]=" + PN((long long)g_stealHook) + "," + PN((long long)g_stealJudged[0]) + "," + PN((long long)g_stealJudged[1])
+         + "," + PN((long long)g_stealJudged[2]) + "," + PN((long long)g_stealJudged[3]) + "," + PN((long long)g_stealOffMain)
+         + " kitTrade[hook,team,friend,friendRefused,stranger,madeNever,noWindow]=" + PN((long long)g_tradeHook) + "," + PN((long long)g_tradeJudged[0]) + "," + PN((long long)g_tradeJudged[1])
+         + "," + PN((long long)g_tradeJudged[2]) + "," + PN((long long)g_tradeJudged[3]) + "," + PN((long long)g_tradeNever) + "," + PN((long long)g_tradeNoWindow)
+         + " kitHover[why,hits]=" + std::string(g_hoverWhy) + "," + PN(g_hoverCells != 0 ? (long long)g_hoverCells->hits : -1)
+         + " kitTradeOwner[why,hits]=" + std::string(g_tradeWhy) + "," + PN(g_tradeCells != 0 ? (long long)g_tradeCells->hits : -1)
+         + " kitNpc[patched,sites,mates,cellDrops]=" + PN((long long)g_npcPatched) + "," + PN((long long)swnpc::kSites) + "," + PN((long long)g_npcHeld)
+         + "," + PN((long long)g_npcDrops) + " kitNpcHits[site1..site22]=" + NpcHitsText());
 }
 
 }

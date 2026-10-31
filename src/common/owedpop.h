@@ -32,6 +32,7 @@
 //   CLAIM   u32 kind, str key            RELEASE  u32 kind, str key            DONE  u32 kind, str key, u32 why
 //   ROWS    u32 count 1..256, count x [u32 kind, str key, str sid, f32 x, f32 z, u32 claim]
 //   GONE    u32 kind, str key, u32 why
+//   REOPEN  u32 kind (residents only), str key, str sid, f32 x, f32 z - the ADD's body, from the empty-building repair (ReopenDecide)
 //   str = u32 length 1..128, the bytes (no control characters).
 // FILE LINE: v1<TAB>kind<TAB>key<TAB>sid<TAB>x<TAB>z  (who holds a row is never written: every link ends with the process)
 // A row the world server lost (its file unreadable at start, a write that failed before a restart) is settled by every game that had seen it - an accepted trade-off.
@@ -46,14 +47,16 @@
 namespace owedpop {
 
 const unsigned kMsgOwed = 63;
-const unsigned kProtocol = 121;   /* the world-server protocol that carries OWED */
+const unsigned kProtocol = 125;   /* the world-server protocol that carries OWED */
 
 
 
 
 const unsigned kKindResidents = 1, kKindBar = 2;
 const unsigned kOpAdd = 1, kOpClaim = 2, kOpRelease = 3, kOpDone = 4, kOpRows = 5, kOpGone = 6;
+const unsigned kOpReopen = 7;   /* up: an ADD that may lift the building's filled mark - judged by ReopenDecide, then stored as an ADD */
 const unsigned kWhyMade = 1, kWhyHas = 2, kWhyGone = 3, kWhyFault = 4, kWhyAway = 5, kWhyEmpty = 6, kWhyFull = 7;   /* kWhyAway / kWhyFull: GONE only - never sent up (kWhyFull: the world server refused to store the work - the game makes it as before). kWhyEmpty: the engine call ran, chose no residents and nothing refused one */
+const unsigned kWhyReopenNotHolder = 8, kWhyReopenTownLoss = 9, kWhyReopenLivingHome = 10, kWhyReopenUnknown = 11;   /* GONE only, never sent up: a REOPEN refused, and why (ReopenRefusalWhy) */
 const unsigned kClaimNone = 0, kClaimYou = 1, kClaimOther = 2;
 const size_t kMaxRows = 256;
 const size_t kStrMax = 128;
@@ -80,6 +83,10 @@ inline const char* WhyName(unsigned w)
     if (w == kWhyAway) return "away";
     if (w == kWhyEmpty) return "empty";
     if (w == kWhyFull) return "full";
+    if (w == kWhyReopenNotHolder) return "reopen-not-holder";
+    if (w == kWhyReopenTownLoss) return "reopen-town-loss";
+    if (w == kWhyReopenLivingHome) return "reopen-living-home";
+    if (w == kWhyReopenUnknown) return "reopen-unknown";
     return "?";
 }
 inline const char* ClaimName(int c) { return c == (int)kClaimYou ? "you" : (c == (int)kClaimOther ? "other" : "none"); }
@@ -112,6 +119,14 @@ inline bool EncodeAdd(std::vector<char>* out, const Row& r)
     out->clear();
     if (!RowOk(r)) return false;
     PutU32(out, kOpAdd); PutU32(out, r.kind); PutStr(out, r.key); PutStr(out, r.sid); PutF32(out, r.x); PutF32(out, r.z);
+    return true;
+}
+// REOPEN: a building's residents only (only those are ever marked filled)
+inline bool EncodeReopen(std::vector<char>* out, const Row& r)
+{
+    out->clear();
+    if (!RowOk(r) || r.kind != kKindResidents) return false;
+    PutU32(out, kOpReopen); PutU32(out, r.kind); PutStr(out, r.key); PutStr(out, r.sid); PutF32(out, r.x); PutF32(out, r.z);
     return true;
 }
 // CLAIM / RELEASE
@@ -153,10 +168,11 @@ inline int Decode(const char* p, size_t n, Msg* m)
     Reader r(p, n);
     m->op = r.U32();
     if (r.bad) return 0;
-    if (m->op == kOpAdd)
+    if (m->op == kOpAdd || m->op == kOpReopen)
     {
         m->row.kind = r.U32(); m->row.key = r.Str(); m->row.sid = r.Str(); m->row.x = r.F32(); m->row.z = r.F32();
         if (!r.Done() || !RowOk(m->row)) return 0;
+        if (m->op == kOpReopen && m->row.kind != kKindResidents) return 0;
         m->kind = m->row.kind; m->key = m->row.key;
         return 1;
     }
@@ -563,6 +579,59 @@ inline int T392MayRepairEmpty(int heldLive, int populatable, int has, int owedRo
 typedef std::set<std::string> DoneSet;   /* TableKey(kind, key) */
 inline int DoneKept(unsigned kind, unsigned why) { return (kind == kKindResidents && (why == kWhyMade || why == kWhyHas)) ? 1 : 0; }
 inline int AddIsDone(const DoneSet& d, unsigned kind, const std::string& key) { return d.count(TableKey(kind, key)) != 0 ? 1 : 0; }
+// REOPEN: THE FILLED MARK LIFTED WHEN THE GAME HOLDING THE AREA SEES THE BUILDING EMPTY. The mark stops a second roll of a building's
+// people where a game's live check cannot see the world server's records; without a way to lift it, a building whose people are gone
+// stays empty for good. The empty-building repair sends REOPEN (never ADD) for a building its live check found empty; for a building
+// on the filled list the world server reads, at that moment: holder = the slot + 1 its area map names as the holder of the building's
+// area (0 = nobody), who = the sender's slot + 1; lossKnown = its town loss table was read (0 = on disk and unreadable); losses = the
+// town's recorded losses (a town whose people were killed is the town refill's to judge, never reopened); livingHomes = its records
+// naming the building as their group's home (-1 = could not be counted). Accepted: the mark is lifted (ReopenApply, written to
+// owed_done.txt) and the REOPEN is stored as the ADD it carries - the holder then claims and makes the row like any owed row, and a
+// later DONE made marks it filled again. Refused: GONE with the reason (ReopenRefusalWhy); the mark stays. A REOPEN for a building not
+// on the filled list is a plain ADD (nothing to lift).
+const int kReopenAccepted = 0, kReopenNotHolder = 1, kReopenTownLoss = 2, kReopenLivingHome = 3, kReopenUnknown = 4, kReopenVerdicts = 5;
+inline int ReopenDecide(int holder, int who, int lossKnown, unsigned losses, int livingHomes)
+{
+    if (who <= 0 || holder != who) return kReopenNotHolder;
+    if (lossKnown == 0) return kReopenUnknown;
+    if (losses > 0) return kReopenTownLoss;
+    if (livingHomes < 0) return kReopenUnknown;
+    if (livingHomes > 0) return kReopenLivingHome;
+    return kReopenAccepted;
+}
+inline const char* ReopenName(int v)
+{
+    if (v == kReopenAccepted) return "accepted";
+    if (v == kReopenNotHolder) return "notHolder";
+    if (v == kReopenTownLoss) return "townLoss";
+    if (v == kReopenLivingHome) return "livingHome";
+    if (v == kReopenUnknown) return "unknown";
+    return "?";
+}
+// the GONE reason a refused verdict answers with (0 for accepted: nothing is answered GONE)
+inline unsigned ReopenRefusalWhy(int v)
+{
+    if (v == kReopenAccepted) return 0;
+    if (v == kReopenNotHolder) return kWhyReopenNotHolder;
+    if (v == kReopenTownLoss) return kWhyReopenTownLoss;
+    if (v == kReopenLivingHome) return kWhyReopenLivingHome;
+    return kWhyReopenUnknown;
+}
+// 1 = a GONE reason that answers a refused REOPEN (the game clears its repaired mark, so its next look reads the building again live)
+inline int ReopenRefused(unsigned why) { return (why >= kWhyReopenNotHolder && why <= kWhyReopenUnknown) ? 1 : 0; }
+// an accepted verdict lifts the building's filled mark: 1 = it was on the list and is gone from it now
+inline int ReopenApply(DoneSet* d, unsigned kind, const std::string& key, int verdict)
+{
+    if (verdict != kReopenAccepted) return 0;
+    return d->erase(TableKey(kind, key)) != 0 ? 1 : 0;
+}
+// a REOPEN whose mark was lifted but whose row could not be stored (the sender's table is full): the mark goes back, because the
+// sender then makes the people itself and no row will ever report the building done. 1 = the mark was put back
+inline int ReopenUndoOnFull(DoneSet* d, unsigned kind, const std::string& key, int lifted, int addResult)
+{
+    if (lifted == 0 || addResult != kAddFull) return 0;
+    return d->insert(TableKey(kind, key)).second ? 1 : 0;
+}
 inline void LineFields(const std::string& line0, std::vector<std::string>* f)
 {
     std::string line = line0;
@@ -618,6 +687,29 @@ inline int ParseMetaLine(const std::string& line, Table* t, double now)
     it->second.adder = (int)v[0]; it->second.gones = (int)v[1]; it->second.faults = (int)v[2]; it->second.empties = (int)v[3];
     it->second.retryAt = left > 0.0 ? now + left : 0.0;
     return 1;
+}
+
+// --owed-seed-key (TEST ONLY, the world server): the building-key substrings it names, '+' between them (a key holds commas); an
+// empty piece is dropped. SeedKeyMatches: 1 = --owed-seed-filled may seed this key - it holds one of the substrings, or none were given.
+inline std::vector<std::string> SeedKeyList(const std::string& arg)
+{
+    std::vector<std::string> v;
+    size_t a = 0;
+    for (;;)
+    {
+        const size_t c = arg.find('+', a);
+        const std::string p = arg.substr(a, c == std::string::npos ? std::string::npos : c - a);
+        if (!p.empty()) v.push_back(p);
+        if (c == std::string::npos) break;
+        a = c + 1;
+    }
+    return v;
+}
+inline int SeedKeyMatches(const std::vector<std::string>& subs, const std::string& key)
+{
+    if (subs.empty()) return 1;
+    for (size_t i = 0; i < subs.size(); ++i) if (key.find(subs[i]) != std::string::npos) return 1;
+    return 0;
 }
 
 }   // namespace owedpop

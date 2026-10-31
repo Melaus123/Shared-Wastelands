@@ -10,6 +10,7 @@ namespace coopbounty { struct BountyEntry; }   /* crime5: src/common/bountywire.
 namespace cooprison { struct PrisonMsg; }   /* arrest2: src/common/prisonwire.h */
 namespace cooptreat { struct TreatMsg; }    /* heal1: src/common/treatwire.h */
 namespace coopbuild { struct BuildMsg; }    /* build1-b: src/common/buildwire.h */
+namespace hitwire { struct Blow; }          /* T-1101: src/common/hitwire.h - the decided blow on HIT */
 namespace coopfarm { struct FarmMsg; }      /* par16: src/common/farmwire.h */
 namespace cooplive { struct ExceptPlan; }    /* src/common/ownerroute.h */
 namespace coopsquad { struct SquadLeadMsg; struct KeeperRestockMsg; }   /* T-1 B1 restructure: src/common/squadlead.h */
@@ -167,7 +168,7 @@ int OwnerSlotOf(unsigned int uid);
 void SessionCatchupApplyTick();   /* M7a2 fold 1 [m7a2f-ap3]: MAIN THREAD, CommandChannelTick right after coop::InQueueDrain() - the catch-up's engine writes */
 bool SendContext(unsigned int uid, const std::string& squadSid, int squadType, const std::string& townSid,
                  const unsigned char* handRaw32, const unsigned char* charRaw32, float bx, float by, float bz, int memberType,
-                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire);   // + the squad's birth flag (squadbirth.h WireOfBirth). M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
+                 const std::string& platoonId, unsigned int loadAgeMs, unsigned int birthWire, unsigned int originWire);   // + where the sender's copy came from (sameidpair.h WireOfOrigin); + the squad's birth flag (squadbirth.h WireOfBirth). M-B / P064 / H027; P1: + the sender's platoon id (the squad's world id); + the age of the sender's current world load in ms (squadorigin.h OwnIdLiftedByLoadAge)
 bool SendRelSync();   // ask the peer to re-send its owned standings (after my world was rebuilt)
 bool SessionPeerRelayOk();   // M5a fold 1, MAIN THREAD: the session peer is KNOWN reachable through the notebook (a relayed standing stamped with its slot arrived on this session link and this welcomed notebook link)
 void SetRecordTownLookup(std::string (*fn)(const std::string&));   /* decision 34: the store supplies each note's home town to the encoder */
@@ -236,7 +237,7 @@ bool SendCapture(const char* p, size_t n, unsigned int victimUid);       // P11:
 bool SendCaptureDone(const char* p, size_t n, unsigned int askerPeer);   // P11: MSG_CAPTURE_DONE - an encoded capturewire.h answer (items.cpp); M7b: back to the asker
 bool SendCapturePlaced(const char* p, size_t n, unsigned int victimUid);   // P11 f3: MSG_CAPTURE_PLACED - which taken rows landed (items.cpp); M7b: to the victim's owner
 bool SendShot(const coopshot::ShotMsg& m);   // P104 fix: MSG_SHOT - our bolt struck the other game's character's copy. False when the link is down or it does not encode. MAIN THREAD (combat.cpp)
-bool SendMeleeDecided(const meleewire::MeleeMsg& m);   // MSG_MELEE_DECIDED - our player character's blow landed on the copy of an NPC another game runs, to that NPC's owner. False when no owner / road is known or it does not encode. MAIN THREAD (combat.cpp)
+bool SendMeleeDecided(const meleewire::MeleeMsg& m, const hitwire::Blow* blow = 0);   // blow: appended after the 41 bytes (hitwire.h), for the HIT the NPC's game sends;   // MSG_MELEE_DECIDED - our player character's blow landed on the copy of an NPC another game runs, to that NPC's owner. False when no owner / road is known or it does not encode. MAIN THREAD (combat.cpp)
 /* T-327: MSG_EFFECT. The request goes to the TARGET's recorded owner (LIVE route SLOT when the notebook road is up, else the
    session link - cooffect::EffectRequestRoad); the answer goes back on the road its request came by. Both return the road
    used (cooffect::kRoadSession 1 / kRoadLive 2) or 0 = not sent (no owner record, no road, or the send failed). MAIN THREAD. */
@@ -307,7 +308,33 @@ bool SendCombatMode(unsigned int uid, bool on, unsigned int targetUid);
 // F348 - the authority's character has begun a blow against `targetUid`. Sent on the transition
 // INTO the engine's attack state, so it reports a swing that actually started rather than one the
 // AI merely intended. RELIABLE: there is no later message that repairs a lost swing.
-bool SendSwing(unsigned int uid, unsigned int targetUid);
+bool SendSwing(unsigned int uid, unsigned int targetUid, const char* move = 0);   // move: the attack move the swing started (hitwire.h); 0 or "" = not carried
+
+// MSG_SWING_END: our character uid, whose swing start sent SWING at targetUid, left the attack state - its swing is over. On
+// SWING's road and lane (CharSend, RELIABLE), so it never overtakes its SWING. False: no road, or not encodable (hitwire.h).
+bool SendSwingEnd(unsigned int uid, unsigned int targetUid);
+
+// T-1101 design (c) - MSG_FIGHT_CHOICE: our player character uid's fight decide step chose (src/common/fightchoice.h: state 3 with
+// next move 0 / 1 / 5 / 6, state 9, or state 10 with 10; seq = this game's choice number). On SWING's road and lane (CharSend,
+// RELIABLE), so it never overtakes a SWING / SWING_END sent before it. False: no road, or not encodable.
+bool SendFightChoice(unsigned int uid, unsigned int targetUid, unsigned int seq, int state, int next, float readyTimer);
+
+// T-1101 step 5 - MSG_BLOCK_PICK: the block pose this game's engine picked for our own player character (the defender) while the
+// copy of another game's player character (the attacker) swings at it; name "" = no block. On the character stream's road (the
+// defender's area); the attacker's game takes it for its copy of the defender. RELIABLE. False: no road, or not encodable
+// (blockpick.h).
+bool SendBlockPick(unsigned int defenderUid, unsigned int attackerUid, const char* name);
+
+// MSG_SHOT_FIRED: our character's engine fired one bolt at targetUid (0 = no replicated character), aimed at aim3; targetAt3 is
+// that target's position here. On the character stream's road (the shooter's area); every game there fires its copy of the
+// shooter's bolt at that target (shotgate.h). RELIABLE. False: no road, or not encodable. MAIN THREAD (combat.cpp
+// RangedEventsDrain).
+bool SendShotFired(unsigned int shooterUid, unsigned int targetUid, const float* aim3, const float* targetAt3);
+
+// MSG_HAND: what our character uid holds in its hands now - has 1: the item in `section` at slot (x, y) whose base sid is `sid`;
+// has 0: bare hands (section / sid unused). On the character stream's road (its area); every game there makes its copy hold the
+// same (handwire.h). RELIABLE. False: no road, or not encodable (an empty or overlong name). MAIN THREAD (combat.cpp HandSample).
+bool SendHand(unsigned int uid, int has, const char* section, int x, int y, const char* sid);
 
 // M3: replicate a resolved hit. RELIABLE - a dropped hit is a permanent health divergence.
 // F117: the ATTACKER travels with the hit. The engine's hit function dereferences the
@@ -322,7 +349,8 @@ bool SendSwing(unsigned int uid, unsigned int targetUid);
 bool SendHit(unsigned int victimUid, unsigned int attackerUid, int cutDirection,
              const char* damages24, int comboId,
              const float* parts, int partCount, float blood,
-             const ObjId& attackerId, unsigned char knock, unsigned char attackerPlayed = 0);   // attackerPlayed: a second trailing byte - 1 = the blow was decided and already played on the attacker's game (MELEE_DECIDED)
+             const ObjId& attackerId, unsigned char knock, unsigned char attackerPlayed = 0,
+             const hitwire::Blow* blow = 0);   // blow: the decided blow (hitwire.h), 0 = not carried; attackerPlayed: a second trailing byte - 1 = the blow was decided and already played on the attacker's game (MELEE_DECIDED)
 
 // M4 (F126): periodic full state for an owned character. UNRELIABLE and periodic, like
 // M2a's position stream - a dropped snapshot is superseded by the next one, so reliability
@@ -395,6 +423,7 @@ bool DecodeItemConfirmBody(const std::vector<char>& bytes, coop::ItemConfirmMsg*
 bool SendItemHandover(int kind, unsigned int asker, unsigned int reqId, unsigned int holder, int value, int toSlot);
 // E22b-2 (P6b). The taker's "it landed" / "it did not", and the giver's "undo your half".
 bool SendItemPlaced(unsigned int id, int ok);
+bool SendItemGiveDone(unsigned int id);   // MSG_ITEM_PLACED value 2 - the giver's GIVE `id` is done (its yes came in time)
 bool SendItemRevoke(unsigned int id);
 bool SendShopTail(unsigned int id, unsigned int epoch, int kind);   // T-164 B4-4 fold 2: MSG_ITEM_REVOKE + 'SHK1' - kind 0 shop revoke, 1 shop ack
 bool SendItemRequestToSlot(const ItemRequestMsg& r, int toSlot);   // a request to one named game (a lapsed shop trade's settle-only ask); MAIN THREAD

@@ -27,6 +27,9 @@ long long ZonesSecondCount();
 void ReportZones();
 std::string BuildingsCommand();     // piece 3b lever: buildings in the active zones by owner faction
 std::string TownsCommand();         // P4c lever: every town in the engine's TownList, nearest first (sid, sector, position, held-by-host)
+bool TownPlacedRead(void* town, std::string* key, std::string* repl, std::string* fac, float* x, float* y, float* z);   // MAIN THREAD: key / applied version / owner / position of a placed town
+void* TownFindByKey(const std::string& key);   // MAIN THREAD: the placed town with that key, or 0
+std::string TownParityCommand();    // TEST, read-only: one [TOWNPARITY] row per placed town (key, repl, fac) + a digest line
 std::string TownListCommand();      // towns1: every town, one [TOWNS] town line each (name, sid, sector, position)
 // The engine's TownList as (record name, distance on the ground from x,z) - the same guarded reads as `towns`; a town whose row
 // does not read is left out. false = no town list. *faults = the towns left out. MAIN THREAD.

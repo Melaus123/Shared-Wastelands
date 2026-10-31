@@ -4841,6 +4841,13 @@ static void PanelBuild(MyGUI::Gui* gui, MyGUI::Widget* parent)
         { w = UiFind(gui, *labs[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); }
         for (int li = 0; li < coopui::kOptRowsShown; ++li)
         { w = UiFind(gui, n.optLabel[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter); }
+        /* Kenshi_TextboxStandardText's own text colour is near-black, unreadable on the dark window: these labels take the
+           light body-text colour the status area's sentences use (above). */
+        const std::string* const plain[] = { &n.hostProfValue, &n.resetKeepLabel };
+        for (size_t li = 0; li < sizeof(plain) / sizeof(plain[0]); ++li)
+        { w = UiFind(gui, *plain[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f)); }
+        for (int li = 0; li < coopui::kOptRowsShown; ++li)
+        { w = UiFind(gui, n.optLabel[li]); t = w ? w->castType<MyGUI::TextBox>(false) : 0; if (t) t->setTextColour(MyGUI::Colour(0.871f, 0.845f, 0.810f, 1.0f)); }
     }
 
     MyGUI::Button* b;

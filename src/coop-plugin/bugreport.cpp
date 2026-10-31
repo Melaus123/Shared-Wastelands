@@ -1329,7 +1329,8 @@ void TitleNoteBuild(MyGUI::Widget* art, int pw, int ph, int margin, const MyGUI:
 }
 
 /* THE TITLE SCREEN'S VERSION LINE (owner 629): "Shared Wastelands <version>" in the bottom-right corner, directly above the game's own
-   version text, in its font and colour, the two lines ending at the same right edge; not clickable. Without the game's version text:
+   version text, in its font, the two lines ending at the same right edge; not clickable. T-1091 (owner 1153 a): bright white with a dark
+   shadow, no backing, so it reads over the title art (the game's own faint version colour was hard to read). Without the game's version text:
    the bottom-right corner, `margin` from both edges, in the game's standard text. A child of the title art, built and taken down with
    the title button. */
 void TitleVersionBuild(MyGUI::Widget* art, int pw, int ph, int margin)
@@ -1344,10 +1345,10 @@ void TitleVersionBuild(MyGUI::Widget* art, int pw, int ph, int margin)
     if (ver != 0)
     {
         t->setFontName(ver->getFontName());
-        t->setTextColour(ver->getTextColour());
-        t->setTextShadow(ver->getTextShadow());
-        t->setTextShadowColour(ver->getTextShadowColour());
     }
+    t->setTextColour(MyGUI::Colour(1.0f, 1.0f, 1.0f, 1.0f));
+    t->setTextShadow(true);
+    t->setTextShadowColour(MyGUI::Colour(0.0f, 0.0f, 0.0f, 1.0f));
     t->setSize(pw, ph);
     const MyGUI::IntSize ts = t->getTextSize();
     const int w = ts.width + 4, h = ts.height + 2;
