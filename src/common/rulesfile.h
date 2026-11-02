@@ -31,7 +31,7 @@
 namespace rulesfile {
 
 const unsigned int kMsgRulesChanged = 92u;   /* down only: {u32 count, [str key, str value]...}, an empty value = the row was removed */
-const unsigned int kProtocol = 133u;          /* the world-server protocol that carries RULES_CHANGED */
+const unsigned int kProtocol = 134u;          /* the world-server protocol that carries RULES_CHANGED */
 const char* const kFile = "rules.txt";
 const char* const kOldFile = "options.txt";
 const unsigned int kMaxPairs = 64u;           /* as OPTIONS: the most rows one message carries */

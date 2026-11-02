@@ -185,7 +185,7 @@ void SessionRefuseAndLeaveLater(const char* why, long long* counter)
              " blocked, which is by construction outside every gate. The gate's own !SessionLinked() break"
              " still ends its wait: the refusal never reached SetStoreServer, so the notebook link stays 0.");
 }
-const unsigned int kProtocolVersion = 187;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
+const unsigned int kProtocolVersion = 188;   /* The game-to-game protocol: raise it when any message's meaning changes (an older game is then refused at HELLO / WELCOME); the reason goes in the commit message (owner 355 / 356, 2026-10-02) */
 typedef char PieceFeedProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolRecordFeed) ? 1 : -1];   /* PLACE / STATE / REMOVE / ROSTER_REQUEST are no longer sent */
 typedef char PieceLiveBarProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveBar) ? 1 : -1];   /* T-1047 step 2b (175): a player's power piece's production bar and work state ride its record's LIVE part - no MINE_STATE for it */
 typedef char PieceLiveProtocolAgrees[(kProtocolVersion >= piecerec::kGameProtocolLiveRecord) ? 1 : -1];   /* a player's power piece: no POWER_STATE, its record's LIVE part */

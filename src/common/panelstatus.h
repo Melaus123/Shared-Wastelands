@@ -994,14 +994,16 @@ inline int BoxBlockStrips(int pw, int ph, int l, int t, int w, int h, int* out)
 /* PP6b - the name-taken box (title CAN'T JOIN by NoticeTitle). */
 inline std::string NameTakenText(const std::string& name)
 { return "The name \"" + name + "\" is already taken in this world."; }   /* T-201 N1: double quotes */
-/* T-368 (owner 270 a, exact words): the two boxes about this player's faction name, shown in the game world in Kenshi's own message box
-   with Kenshi's own "Faction Name" title and one OK. Back = a rename another player made at the same moment won the name; Moved = the
-   world loaded with a name another player of this world already uses. */
+/* T-368 (owner 270 a, exact words): the box about this player's faction name, shown in the game world in Kenshi's own message box with
+   Kenshi's own "Faction Name" title and one OK. Back = a rename another player made at the same moment won the name. (A load whose name
+   another player uses is said on the message line since contributor task 2: FactionMovedLineText.) */
 const char* const kFactionBoxTitle = "Faction Name";
 inline std::string FactionBackText(const std::string& asked, const std::string& old)
 { return "Your faction name \"" + asked + "\" is already taken in this world, so it was changed back to \"" + old + "\"."; }
-inline std::string FactionMovedText(const std::string& asked, const std::string& now)
-{ return "Another player in this world already uses the faction name \"" + asked + "\". Your faction is now called \"" + now + "\"."; }
+/* contributor task 2, case B (approved words): a load whose faction name another player of this world holds is said on Kenshi's message
+   line, not in a box. old = the name the save loaded with, now = the name the world gave. */
+inline std::string FactionMovedLineText(const std::string& old, const std::string& now)
+{ return "The faction name \"" + old + "\" is already taken in this world. Your faction is now called \"" + now + "\"."; }
 /* PP6 - after PLAY on PROFILES: a played profile loads, a never-played one opens Kenshi's NEW GAME. */
 inline std::string ProfLoadingText(const std::string& name)     { return "Loading \"" + name + "\"..."; }   /* T-201 N1: double quotes */
 const char* const kImportMovingText = "Importing from single player...";   /* T-1096 part 3: that line while the profile starts from a single-player save (the same road) */

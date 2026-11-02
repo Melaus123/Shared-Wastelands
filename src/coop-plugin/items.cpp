@@ -58,6 +58,7 @@
 #include "../common/groundname.h"   /* ground items' shared names - the table, the lookup, the removed-name memory */
 #include "../common/ownpick.h"      /* an item this game's own player lifts out of a container this game writes: its removal goes out at once */
 #include "../common/rcgive.h"       /* T-1079: a give made without the cursor (the right-click) - its pairing */
+#include "../common/hovground.h"   /* task 3: the ground hand-over's exact-item rule */
 #include "../common/givelate.h"   /* give1: the late-give removal, the cancel refunds and the confirmdelay lever's parse */
 #include "../common/showmove.h"   /* T-164 non-shop road: a move with the other game's character / box / pack shows at once */
 #include "../common/handrec.h"   /* T-889 step 2: the hand-over record pp.handover */
@@ -14392,6 +14393,8 @@ void ItRollbackTake(ItOwnerPend* p, const char* why)
 ::Item* GrBuild(const ItemMoveMsg& mm, const std::vector<coopbag::BagRow>* bag, ::Character* c, const char** why);
 int GrSendAddExcept(void* item, const std::string& key, int qty, unsigned int exceptPeer, int undo, int* whyOut);
 void* GrFind(const char* key, int wantQty, float wantQ, int exactOnly, int* fuzzyOut);
+struct GpRow;
+void* GrFindName(const std::string& name, int wantQty, float wantQ, int exactOnly, int* howOut, GpRow* rowOut, int bare);   /* task 3 */
 std::string GrIdOf(void* item);                                       /* T-889 fold 2: the ground's own roads, defined further down in this namespace */
 std::string GrKeyOf(void* item);
 int GrRemoveLocal(void* item, const char* why);
@@ -14435,6 +14438,7 @@ long long g_hovSettleRetry = 0, g_hovSettleGaveUp = 0, g_hovTakeParked = 0, g_ho
    the ground at its feet - N3), parkedNoSlot (a verdict / PLACED on a parked take settled in place, the owner table full - N5),
    lookNoMatch (an item at a line's place that is NOT the line's item - another quality, stack size or level - N1) */
 long long g_hovHolderRemoveWait = 0, g_hovGroundRemoved = 0, g_hovRebuildToGround = 0, g_hovParkedNoSlot = 0, g_hovLookNoMatch = 0;
+long long g_hovGroundIdRejected = 0;   /* task 3: a ground candidate refused for not being the item by its name */
 ItOwnerPend g_hovSpareRow;   /* N5: a parked row being settled while every owner row is in use (used only within one settle) */
 /* T-889 fold 3 (re-check 2 of fold 2, 2026-10-17), REPORT itemHandoverFold3[...]: charIdUnread (a character's save-stable id could not
    be read when its line was written: the hand-over refused, or the line written naming no character - held; F1), charAmbiguous (a
@@ -14785,10 +14789,23 @@ int HovLiveCopy(const hovrec::HandLine& l, int wide, int doRemove, ::Character**
         float pos[3] = { 0.0f, 0.0f, 0.0f };
         if (std::sscanf(l.section.c_str(), "%f,%f,%f", &pos[0], &pos[1], &pos[2]) != 3) return -1;
         if (ItAreaVerdictAt(pos, kAreaForGround) != kBoxMine) return -1;
-        int fz = 0;
-        void* const gi = GrFind(l.where.c_str() + 2, qty, cf.quality, 0, &fz);
+        /* task 3: the item itself or nothing - looked up by its stored name, exact only (never the 0.5-unit fallback), and accepted
+           only when its id IS that name (hovground.h). Another player's identical stack close by is never taken for it. */
+        const std::string stored = l.where.substr(2);
+        int how = coopgname::kHowNone;
+        void* const gi = GrFindName(stored, qty, cf.quality, 1, &how, 0, 0);
         if (gi == 0) return 0;
-        if (HovItemIs(gi, cf, qty, 0) == 0) { ++g_hovLookNoMatch; return 0; }
+        const int fields = HovItemIs(gi, cf, qty, 0);
+        const int verdict = hovrec::GroundCandidateVerdict(stored, GrIdOf(gi), how == coopgname::kHowNear ? 1 : 0, fields);
+        if (verdict != hovrec::kGroundOk)
+        {
+            if (verdict == hovrec::kGroundFields) ++g_hovLookNoMatch; else ++g_hovGroundIdRejected;
+            if (HovSay(g_hovLookNoMatch + g_hovGroundIdRejected))
+                DebugLog("[ITEMS] T-889 " + HovWhy(l.askerSlot, l.reqId, l.holderSlot) + ": the ground candidate for " + stored
+                         + " refused (" + hovrec::GroundVerdictWord(verdict) + ") - not there, nothing removed (groundIdRejected="
+                         + N(g_hovGroundIdRejected) + ")");
+            return 0;
+        }
         if (doRemove == 0) return 1;
         /* T-889 fold 3 (F3): CLAIM AND REMOVE FIRST; GROUND GONE (its name and published-name flag read beforehand) only when the
            removal took. A removal deferred by a busy claim is taken back (the next verdict tries the whole of it again) and a failed

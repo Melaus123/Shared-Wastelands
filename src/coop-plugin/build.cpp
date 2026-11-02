@@ -115,6 +115,7 @@ namespace coop { int AiWorkerBusyNow(); }   /* coop.cpp - the engine's own AI-wo
 #include "../common/keptwire.h"    /* KEPT: the players' kept pieces laid back into a reset world (and zonekeep.h) */
 #include "../common/townkeep.h"    /* TOWNS: the players' outposts carried into a reset world */
 #include "../common/baseshow.h"    /* T-811: SHOW - the teammates' outposts on the map */
+#include "../common/pathparents.h"   /* task 4: the owed file's folders, top first */
 #include "../common/townmove.h"    /* T-924 fault 2: a teammate's outpost copy moved to the sent centre (the pure decision) */
 #include "../common/boxowner.h"    /* WorldNodeOf - a world resource node is nobody's piece */
 #include "../common/slotwire.h"    /* P18 fold 2: StandInSlotOfId / IsLegacyPeerId - a saved owner id read as a stand-in record */
@@ -2994,6 +2995,27 @@ void BdOwedSave()
                     path.c_str(), g_owedSaveRefused);
         BdLogCapped(sl);
         return;
+    }
+    /* task 4 (0.4.0 brief): make the world folder (every level) first - on a joining PC nothing else may have made it */
+    const std::vector<std::string> dirs = cooppath::ParentDirsTopFirst(path);
+    for (size_t i = 0; i < dirs.size(); ++i)
+    {
+        if (U8GetFileAttributes(dirs[i].c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        if (!U8CreateDirectory(dirs[i].c_str(), 0) && ::GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            const DWORD er = ::GetLastError();
+            ++g_owedSaveFailed;
+            static int s_saidDir = 0;   /* logged once; the counter keeps counting */
+            if (s_saidDir == 0)
+            {
+                s_saidDir = 1;
+                char dl[360];
+                _snprintf_s(dl, sizeof(dl), _TRUNCATE, "[BUILD] owed hand-offs save FAILED: its folder could not be created (err=%lu): %.200s (owedSaveFailed=%lld)",
+                            er, dirs[i].c_str(), g_owedSaveFailed);
+                BdLogCapped(dl);
+            }
+            return;
+        }
     }
     const std::string tmp = path + ".tmp";   /* house2 (item 2): written aside, then renamed over the file in one step */
     std::FILE* f = U8fopen(tmp.c_str(), "wb");

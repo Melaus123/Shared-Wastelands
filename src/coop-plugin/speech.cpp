@@ -856,6 +856,19 @@ struct TkActHold { unsigned int seq, convId, peer, n; void* dlg; void* me; void*
    0x673DA0 only clears the Dialogue's +0x198); the private 0x320 copy is made at run time inside TkRunViewPod (g_tkLineCopy). */
 const size_t kTkActHoldCap = 16;
 std::vector<TkActHold> g_tkActHolds;
+/* contributor task 5 (talkrefund.h), A: a held line dropped at the cap never runs its NPC-side part - its seq is still listed on its
+   conversation's END so the talker's game refunds what it took (bounded: the oldest goes). MAIN THREAD. */
+struct TkUnrunDrop { unsigned int convId, seq; };
+std::vector<TkUnrunDrop> g_tkUnrunDropped;
+const size_t kTkUnrunDroppedCap = 32;
+/* contributor task 5, B: the paid ACTs this game applied (talkrefund.h) and the refunds an END made due, paid when the money may move
+   (StoreMoneyReady). MAIN THREAD. */
+cooptalk::TalkRefundBook g_tkRefundBook;
+struct TkRefundDue { unsigned int convId, seq; int amount; long long base; int tries; };   /* base: StoreMoneyBaseReads when it fell due */
+const int kTkRefundTries = 600;   /* "no purse" (Zero, Z-T5-1) or an unwritable pp.money (audit 3) at pay time: retried each tick, at most this many times */
+std::vector<TkRefundDue> g_tkRefundDue;
+long long g_tkPaidBooked = 0, g_tkRefunds = 0, g_tkRefundMoney = 0, g_tkRefundFailed = 0, g_tkUnrunListed = 0, g_tkRefundStale = 0;
+struct TkSamePlayer { bool operator()(unsigned int a, unsigned int b) const { return cooplive::SamePlayer(a, b, coop::LinkPeerSlot()); } };
 long long g_tkActHeld = 0, g_tkActHoldRefused = 0, g_tkActHoldLost = 0, g_tkActHoldDropped = 0, g_tkActCarriedNone = 0,
           g_tkAct28Refused = 0, g_tkActEndsTalk = 0, g_tkNotices = 0;
 /* carried-person lines: A - sent, the engine's case run here (this game owns the person), take orders given / not given / faulted;
@@ -1222,6 +1235,25 @@ void TkPurseTalkEnded(unsigned int uid);   /* below, with the purse table */
 /* A, MAIN THREAD: end THIS game's side of a forwarded (or not-forwarded) conversation. The mark is kept through the engine's
    endDialogue (so its setInDialog(false) leaves the window alone), then dropped; END goes to the peer when sendReason != 0 and
    the conversation had been forwarded. callEnd 0 = the engine has already ended it. */
+/* contributor task 5, A: the ACT seqs of conversation convId whose NPC-side part has not run - its held lines (and lines dropped at the
+   hold cap) - listed on its END, so the talker's game gives back what it took for them (talkrefund.h). A line whose ACT_RESULT came
+   and ran is no longer held, so it is never listed. A held carried-person line (takeOrders) is never listed either: its hold outlives
+   the END, and a late APPLIED still takes the person (TkApplyActResult) - so it is never both refunded and taken (audit 3, T5-2).
+   MAIN THREAD. */
+static std::vector<unsigned int> TkUnrunFor(unsigned int convId)
+{
+    std::vector<unsigned int> out;
+    for (size_t k = 0; k < g_tkActHolds.size() && out.size() < cooptalk::kTalkMaxUnrun; ++k)
+        if (g_tkActHolds[k].convId == convId && g_tkActHolds[k].n > 0 && g_tkActHolds[k].takeOrders == 0) out.push_back(g_tkActHolds[k].seq);
+    for (size_t k = 0; k < g_tkUnrunDropped.size();)
+    {
+        if (g_tkUnrunDropped[k].convId != convId) { ++k; continue; }
+        if (out.size() < cooptalk::kTalkMaxUnrun) out.push_back(g_tkUnrunDropped[k].seq);
+        g_tkUnrunDropped.erase(g_tkUnrunDropped.begin() + k);
+    }
+    g_tkUnrunListed += (long long)out.size();
+    return out;
+}
 void TkEndOwn(void* dlg, void* me, int sendReason, const char* why, int callEnd, int endsType = 0)   /* P25: endsType on the END (1 / 11) */
 {
     std::map<void*, TkConv>::iterator it = g_tkConvs.find(dlg);
@@ -1243,6 +1275,7 @@ void TkEndOwn(void* dlg, void* me, int sendReason, const char* why, int callEnd,
         cooptalk::TalkMsg e;
         e.kind = cooptalk::kTalkEnd; e.convId = c.convId; e.npcUid = c.npcUid; e.targetUid = c.targetUid; e.reason = sendReason;
         e.endsType = endsType;   /* P25 step 5: the other game opens that window itself */
+        e.unrun = TkUnrunFor(c.convId);   /* contributor task 5: the paid lines this end leaves unrun - the other game refunds them */
         sent = net::SendTalk(e) ? 1 : 0;
         if (sent) ++g_tkEndSent;
     }
@@ -1414,6 +1447,7 @@ void TkAfterStart(void* dlg, void* who, int started, int ev, int mark, int creat
         ++g_tkRestarted;
         cooptalk::TalkMsg e;
         e.kind = cooptalk::kTalkEnd; e.convId = o.convId; e.npcUid = o.npcUid; e.targetUid = o.targetUid; e.reason = cooptalk::kTalkEndRestarted;
+        e.unrun = TkUnrunFor(o.convId);   /* contributor task 5 */
         if (net::SendTalk(e)) ++g_tkEndSent;
         TkLog("[TALK] A conv=" + TkU(o.convId) + " replaced by a new start on the same Dialogue - END RESTARTED");
     }
@@ -3635,6 +3669,70 @@ static std::string TkPairsStr(const std::vector<std::string>& sid, const std::ve
     return s;
 }
 
+/* contributor task 5, B: pay the refunds an END made due - the talker's purse moved back by what this game took for the unrun lines,
+   once each (the book forgot them when it made them due). Waits while the money may not move (StoreMoneyReady: a save, a restore, no
+   world); retried from TkTimeouts. MAIN THREAD. */
+static void TkRefundPay()
+{
+    if (g_tkRefundDue.empty()) return;
+    std::string why;
+    if (coop::StoreMoneyReady(&why) != 1) return;
+    const long long base = coop::StoreMoneyBaseReads();
+    std::vector<TkRefundDue> later;
+    for (size_t k = 0; k < g_tkRefundDue.size(); ++k)
+    {
+        const TkRefundDue& d = g_tkRefundDue[k];
+        const std::string what = " conv=" + TkU(d.convId) + " ACT seq=" + TkU(d.seq) + " amount=" + TkI(d.amount);
+        if (d.base != base)   /* another world, store or profile was taken since it fell due: never paid into that one (audit 1, S1) */
+        {
+            ++g_tkRefundStale;
+            TkLog("[TALK] B refund DROPPED" + what + " - the money ledger was taken anew since (another world, store or profile)");
+            continue;
+        }
+        /* money.cpp's order (audit 1, S2): the purse moved, then pp.money written; a write that cannot be made takes it back out and
+           the refund waits for the next tick */
+        const int r = coop::StoreMoneyAdjust(d.amount);
+        if (r == -1 && d.tries + 1 < kTkRefundTries) { TkRefundDue w = d; ++w.tries; later.push_back(w); continue; }   /* no purse now: next tick */
+        if (r != 1)
+        {
+            ++g_tkRefundFailed;
+            TkLog("[TALK] B refund FAILED" + what + (r == 0 ? std::string(" - the purse would pass an int") : std::string(" - no purse, after retries")));
+            continue;
+        }
+        unsigned long long seq = 0;
+        if (!coop::StoreMoneyWriteNow(&seq))
+        {
+            if (coop::StoreMoneyAdjust(-d.amount) == 1)   /* nothing changed: tried again next tick, at most kTkRefundTries times (audit 3) */
+            {
+                if (d.tries + 1 < kTkRefundTries) { TkRefundDue w = d; ++w.tries; later.push_back(w); continue; }
+                ++g_tkRefundFailed;
+                TkLog("[TALK] B refund FAILED" + what + " - pp.money could not be written, after retries (the money was taken back out)");
+                continue;
+            }
+            TkLogFail("[TALK] B refund" + what + " is in the purse but pp.money could not be written nor the money taken back - the next money write carries it");
+        }
+        ++g_tkRefunds; g_tkRefundMoney += d.amount;
+        TkLog("[TALK] B refund" + what + " - paid back: the NPC's part of that line never ran on its game (pp.money write " + TkU((unsigned int)seq) + ")");
+    }
+    g_tkRefundDue.swap(later);
+}
+/* contributor task 5, B: an END from the NPC's game - the paid lines it lists as unrun are refunded once; the conversation's other
+   booked lines ran there and are forgotten. Before the END's window checks: a window already closed here does not lose a refund. */
+static void TkRefundOnEnd(const cooptalk::TalkMsg& m, unsigned int peer)
+{
+    std::vector<cooptalk::TalkPaid> due;
+    g_tkRefundBook.OnEnd(peer, m.convId, m.unrun, &due, TkSamePlayer());
+    for (size_t k = 0; k < due.size(); ++k)
+    {
+        TkRefundDue d; d.convId = due[k].convId; d.seq = due[k].seq; d.amount = due[k].amount; d.base = coop::StoreMoneyBaseReads(); d.tries = 0;
+        g_tkRefundDue.push_back(d);
+    }
+    if (!due.empty() || !m.unrun.empty())
+        TkLog("[TALK] B END conv=" + TkU(m.convId) + " lists " + TkI((int)m.unrun.size()) + " unrun ACT seq(s); " + TkI((int)due.size())
+              + " of them took money here - refunds due");
+    TkRefundPay();
+}
+
 /* P26 stage 5: B - an ACT: the TARGET-side part of one line of the mirrored conversation, applied to this game's own character with
    the engine's own code - _doActions on THIS game's copy of the same line (looked up by its string id), viewed down to exactly the
    ACT's parts (TkRunViewPod side 1), on the NPC copy's Dialogue, whose conversation target is this game's character while the
@@ -3770,6 +3868,10 @@ static void TkApplyAct(const cooptalk::TalkMsg& m, unsigned int peer)
     if (r.result == cooptalk::kTalkActFault) ++g_tkActFault;
     if (hired) ++g_tkActHires;
     g_tkActUnsupported += unsupported;
+    {   /* contributor task 5: a line that took money is booked, so an END listing it as unrun gives it back (talkrefund.h) */
+        const int owed = cooptalk::TalkRefundAmount(r.result == cooptalk::kTalkActApplied, r.moneyBefore, r.moneyAfter, m.actTypes, m.actValues);
+        if (owed > 0 && g_tkRefundBook.Note(peer, m.convId, m.seq, owed, ::GetTickCount(), TkSamePlayer()) == 1) ++g_tkPaidBooked;
+    }
     const int sent = net::SendTalk(r) ? 1 : 0;
     TkLog("[TALK] B ACT seq=" + TkU(m.seq) + " conv=" + TkU(m.convId) + " line=" + m.lineSid + " acts=[" + TkActsStr(m.actTypes, m.actValues)
           + "] items=[" + TkPairsStr(m.itemSids, m.itemValues) + "] rels=[" + TkPairsStr(m.relSids, m.relValues) + "] -> "
@@ -3964,6 +4066,7 @@ static void TkApplyEnd(const cooptalk::TalkMsg& m, unsigned int peer)
         }
         return;
     }
+    TkRefundOnEnd(m, peer);   /* contributor task 5 */
     if (!g_tkMirror.active || !cooplive::SamePlayer(g_tkMirror.peer, peer, coop::LinkPeerSlot()) || g_tkMirror.convId != m.convId)
     {
         ++g_tkEndUnknown;
@@ -4747,6 +4850,8 @@ static void TkSweep()
 static void TkTimeouts()
 {
     const unsigned long now = ::GetTickCount();
+    g_tkRefundBook.Expire(now);   /* contributor task 5: a paid line no END ever named (a lost link) is forgotten after 10 minutes */
+    TkRefundPay();                /* contributor task 5: refunds that waited for the money to be movable */
     std::vector<TkLater> late;
     for (std::map<void*, TkConv>::iterator it = g_tkConvs.begin(); it != g_tkConvs.end(); ++it)
         if (it->second.endClock && (unsigned long)(now - it->second.endTick) >= (unsigned long)kTkHeldEndWaitMs)
@@ -4932,7 +5037,10 @@ static std::string TkCountsString()
                  (long long)g_p25MineMiss, g_p25MineMissConfirmed, g_p25StalePrompt, g_p25ThirdOwner,   /* [p25f1-repa] */
                  (long long)g_p25StartUnwound, (long long)g_p25NestedCleared,
                  TalkHookState(g_p25ViewHook), g_p25On);
-    return std::string(b) + f + g + s4 + s5 + s5f2 + car + s5f4 + s6 + p25;
+    char rf[320];   /* contributor task 5: 87 literal bytes + 7 commas + 8 numbers of at most 20 + NUL = 255 */
+    _snprintf_s(rf, sizeof(rf), _TRUNCATE, " talkRefund[unrunListed,paidBooked,refunds,refundMoney,refundFailed,stale,due,expired]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld",
+                 g_tkUnrunListed, g_tkPaidBooked, g_tkRefunds, g_tkRefundMoney, g_tkRefundFailed, g_tkRefundStale, (long long)g_tkRefundDue.size(), g_tkRefundBook.expired);
+    return std::string(b) + f + g + s4 + s5 + s5f2 + car + s5f4 + s6 + p25 + rf;
 }
 
 /* M7b slice 4 fold 1 (review 2026-10-02 F1): a stored TALK sender is the id it arrived with (the session link's raw id, or the
@@ -5251,6 +5359,12 @@ bool TalkDeferTargetActs(void* dlg, void* line)
         {
             ++g_tkEndHeldNotRun;
             dropped += " (it held conv=" + TkU(g_tkActHolds[0].convId) + "'s end: that conversation ends on its 30 s clock, nothing run)";
+        }
+        if (g_tkActHolds[0].n > 0)   /* contributor task 5: its END still lists it */
+        {
+            if (g_tkUnrunDropped.size() >= kTkUnrunDroppedCap) g_tkUnrunDropped.erase(g_tkUnrunDropped.begin());
+            TkUnrunDrop d; d.convId = g_tkActHolds[0].convId; d.seq = g_tkActHolds[0].seq;
+            g_tkUnrunDropped.push_back(d);
         }
         g_tkActHolds.erase(g_tkActHolds.begin());
     }

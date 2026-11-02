@@ -2247,6 +2247,100 @@ void t_cfg_panel_field_validators()
         Fail("CfgNameFieldOk accepted a name one character over the cap the EditBox enforces");
 }
 
+/* JOIN BY ADDRESS's ADDRESS and PORT boxes (contributor task 1): the split ADDRESS hands to PORT (typed or pasted "host:port",
+   "[v6]:port"; never steam: or a bare IPv6 literal), the PORT range and its one sentence, and the JOIN press's address and port. */
+void t_cfg_join_addr_port()
+{
+    const std::string why1 = "Port must be a number from 1 to 65535.";
+    if (std::string(coopcfg::kCfgJoinPortWhy) != why1) Fail("the PORT sentence is not the approved one");
+    struct TakeRow { const char* in; bool ok; const char* host; const char* port; };
+    const TakeRow take[] = {
+        { "192.168.1.20:7778", true,  "192.168.1.20", "7778" },
+        { "host.example:7778", true,  "host.example", "7778" },
+        { " 10.0.0.2:27015 ",  true,  "10.0.0.2",     "27015" },
+        { "[::1]:7777",        true,  "[::1]",        "7777" },
+        { "1.2.3.4:99999",     true,  "1.2.3.4",      "99999" },   /* moved; PORT's check refuses it */
+        { "192.168.1.20",      false, "", "" },
+        { "[::1]",             false, "", "" },
+        { "::1",               false, "", "" },                    /* bare IPv6: its last colon is not a port */
+        { "fe80::1:7777",      false, "", "" },
+        { "host:abc",          false, "", "" },
+        { "host:",             false, "", "" },
+        { ":7777",             false, "", "" },
+        { "[::1:7777",         false, "", "" },
+        { "steam:76561198000000000", false, "", "" },
+        { "",                  false, "", "" },
+    };
+    for (size_t i = 0; i < sizeof(take) / sizeof(take[0]); ++i)
+    {
+        std::string h = "!", p = "!";
+        const bool got = coopcfg::CfgJoinTakePort(take[i].in, &h, &p);
+        if (got != take[i].ok) { Fail(std::string("CfgJoinTakePort('") + take[i].in + "') answered " + I(got ? 1 : 0)); continue; }
+        if (got && (h != take[i].host || p != take[i].port)) Fail(std::string("CfgJoinTakePort('") + take[i].in + "') gave '" + h + "' / '" + p + "'");
+        if (!got && (h != "!" || p != "!")) Fail(std::string("CfgJoinTakePort('") + take[i].in + "') refused but wrote");
+    }
+    if (!coopcfg::CfgJoinIsSteam("steam:76561198000000000") || coopcfg::CfgJoinIsSteam("192.168.1.20") || coopcfg::CfgJoinIsSteam(""))
+        Fail("CfgJoinIsSteam");
+
+    /* PORT: the range edges, digits only, and empty - each refusal the one sentence */
+    struct PortRow { const char* in; bool ok; int port; };
+    const PortRow ports[] = { { "1", true, 1 }, { "7777", true, 7777 }, { "65535", true, 65535 }, { " 7778 ", true, 7778 },
+                              { "0", false, 0 }, { "65536", false, 0 }, { "abc", false, 0 }, { "", false, 0 }, { "-1", false, 0 },
+                              { "77a7", false, 0 }, { "123456", false, 0 } };
+    for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); ++i)
+    {
+        unsigned short p = 0; std::string why;
+        const bool got = coopcfg::CfgJoinPortOk(ports[i].in, &p, &why);
+        if (got != ports[i].ok) Fail(std::string("CfgJoinPortOk('") + ports[i].in + "') answered " + I(got ? 1 : 0));
+        else if (got && p != (unsigned short)ports[i].port) Fail(std::string("CfgJoinPortOk('") + ports[i].in + "') gave " + I((int)p));
+        else if (!got && why != why1) Fail(std::string("CfgJoinPortOk('") + ports[i].in + "') said '" + why + "'");
+    }
+
+    /* the JOIN press */
+    struct JoinRow { const char* addr; const char* port; bool ok; const char* host; int p; const char* why; };
+    const JoinRow joins[] = {
+        { "192.168.1.20",      "7777",  true,  "192.168.1.20", 7777, "" },        /* no port typed: PORT's number */
+        { "192.168.1.20",      "7778",  true,  "192.168.1.20", 7778, "" },
+        { "192.168.1.20:7778", "7777",  true,  "192.168.1.20", 7778, "" },        /* still in ADDRESS: that port wins */
+        { "host.example",      "27015", true,  "host.example", 27015, "" },
+        { "[::1]",             "7777",  true,  "[::1]",        7777, "" },
+        { "[::1]:7778",        "7777",  true,  "[::1]",        7778, "" },
+        { "::1",               "7777",  true,  "[::1]",        7777, "" },        /* a bare IPv6 literal is bracketed */
+        { "192.168.1.20",      "0",     false, "", 0, "Port must be a number from 1 to 65535." },
+        { "192.168.1.20",      "65536", false, "", 0, "Port must be a number from 1 to 65535." },
+        { "192.168.1.20",      "abc",   false, "", 0, "Port must be a number from 1 to 65535." },
+        { "192.168.1.20",      "",      false, "", 0, "Port must be a number from 1 to 65535." },
+        { "1.2.3.4:99999",     "7777",  false, "", 0, "Port must be a number from 1 to 65535." },
+        { "",                  "7777",  false, "", 0, "No host address entered." },
+        { "host:abc",          "7777",  false, "", 0, "\"host:abc\" isn't a valid address." },
+        { "0.0.0.0",           "7777",  false, "", 0, "0.0.0.0 can't be joined." },
+        { "no spaces",         "7777",  false, "", 0, "\"no spaces\" isn't a valid IP address or host name." },
+    };
+    for (size_t i = 0; i < sizeof(joins) / sizeof(joins[0]); ++i)
+    {
+        std::string a = "!untouched!", why; unsigned short p = 4242;
+        const bool got = coopcfg::CfgJoinAddrOk(joins[i].addr, joins[i].port, &a, &p, &why);
+        const std::string row = std::string("CfgJoinAddrOk('") + joins[i].addr + "', '" + joins[i].port + "')";
+        if (got != joins[i].ok) { Fail(row + " answered " + I(got ? 1 : 0) + " (" + why + ")"); continue; }
+        if (got && (a != joins[i].host || p != (unsigned short)joins[i].p)) Fail(row + " gave '" + a + "':" + I((int)p));
+        if (!got && why != joins[i].why) Fail(row + " said '" + why + "'");
+        if (!got && (a != "!untouched!" || p != 4242)) Fail(row + " refused but wrote");
+    }
+    /* steam: joins as today - PORT is ignored, whatever it holds */
+    {
+        std::string a, why; unsigned short p = 0, p2 = 0; std::string a2, why2;
+        const bool now = coopcfg::CfgAddrFieldOk("steam:76561198000000000", "address", &a2, &p2, &why2);
+        const bool got = coopcfg::CfgJoinAddrOk("steam:76561198000000000", "abc", &a, &p, &why);
+        if (!now || !got || a != a2 || p != p2) Fail("a steam: address does not join as it did, or PORT was read for it");
+    }
+    /* the settings file's own address:port rule is untouched: CfgSplitAddr still refuses an address with no port */
+    {
+        std::string a; unsigned short p = 0;
+        if (coopcfg::CfgSplitAddr("192.168.1.20", &a, &p) || !coopcfg::CfgSplitAddr("192.168.1.20:7777", &a, &p) || p != 7777)
+            Fail("CfgSplitAddr changed");
+    }
+}
+
 /* 4. WHAT A PASTE OR A KEYSTROKE IS REDUCED TO.  A newline in a value would be two lines on the next
       read, which is how a paste becomes a parse error nobody can see. */
 void t_cfg_sanitise_typed()

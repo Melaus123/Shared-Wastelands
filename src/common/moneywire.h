@@ -30,7 +30,7 @@
 namespace moneyw {
 
 /* ---- message numbers and the world-server protocol (store_main.cpp and store.cpp check these at compile time) ---- */
-const unsigned kProtocol = 133;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
+const unsigned kProtocol = 134;       /* the world-server protocol that carries the five (99 when T-810 added them; 100 since T-811's SHOW 78; 101 since TOWNS SHOW KEYS) */
 
 
 

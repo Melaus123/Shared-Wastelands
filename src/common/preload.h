@@ -52,7 +52,7 @@
 
 namespace cooppre {
 
-const unsigned int kPreProtocol = 133;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
+const unsigned int kPreProtocol = 134;   /* the world-server protocol that carries kinds 5-8 (checked against coopfeed::kFeedProtocol) */
 
 
 

@@ -213,7 +213,7 @@
 
 namespace {
 
-const unsigned int kProtocol = 133;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
+const unsigned int kProtocol = 134;   /* the world-server protocol: raise it when any message's meaning changes; the reason goes in the commit message (owner 356, 2026-10-02) */
 enum { MSG_RECORD = 28, MSG_STORE_HELLO = 29, MSG_STORE_WELCOME = 30, MSG_STORE_AUTH = 31, MSG_RECORD_GONE = 32, MSG_DELETED_BITS = 33, MSG_AREAS = 34, MSG_AREAMAP = 35, MSG_UNIQUE_STATE = 36, MSG_PLAYERSECTORS = 37, MSG_OPTIONS = 38, MSG_CLOCK = 39, MSG_SPEEDVOTE = 40, MSG_WEATHER = 41, MSG_STORE_REFUSE = 42, MSG_RECORD_SEQ = 43, MSG_RESEARCH_BOX = 44, MSG_PROFILES = 45, MSG_RESEARCH_TAKE = 46, MSG_TOWN_BAR = 47, MSG_WORLD_SAVED = 48, MSG_OWN_HIGH = 49, MSG_WORLD_REL = 51, MSG_UID_BLOCK = 52, MSG_LIVE = 53, MSG_PLAYERS = 54, MSG_JOIN_STAGE = 55, MSG_CATCHUP = 56, MSG_PLAYER_GONE = 57, MSG_RECORD_FEED = 58, MSG_BUNDLE = 59, MSG_TEAM = 60, MSG_FALLEN = 61, MSG_OWED = 63, MSG_TOWN_LOSS = 64, MSG_AUTH_CHALLENGE = 65, MSG_AUTH_PROOF = 66, MSG_STEAM_ID = 67, MSG_HOST_TOKEN = 68, MSG_KEPT = 69, MSG_GROUND_REFUSE = 71, MSG_BOX_REFUSE = 72, MSG_MONEY_SEND = 73, MSG_MONEY_SENT_OK = 74, MSG_MONEY_DELIVER = 75, MSG_MONEY_APPLIED = 76, MSG_MONEY_REFUSE = 77, MSG_PIECE_REFUSE = 79, MSG_BOX_TAKEN = 80, MSG_BOX_ASK = 81, MSG_BOX_ASKED = 82 };   /* T-810: MONEY (73-77) - src/common/moneywire.h */
 const int MSG_AREA_RECORDED = 83;   /* T-1084 step 3 (protocol 121): AREA_RECORDED, up MARK / down LIST, MARK - src/common/arearec.h */
 const int MSG_SQUAD_TAKE = 84, MSG_SQUAD_WRITER = 85, MSG_SQUAD_RELEASE = 86;   /* T-1084 step 5 (protocol 122): a take up, the writer register's answer down, the writer's release up - src/common/squadwriterreg.h */
@@ -460,6 +460,7 @@ std::vector<coopprof::Row> g_profiles;
 long long g_profAdopted = 0;   /* prof1 fold */
 long long g_profFactionSet = 0, g_profFactionSame = 0, g_profFactionRefused = 0;   /* names2a: PROFILES kind 3 */
 long long g_profFactionBack = 0, g_profFactionMoved = 0, g_profFactionDefault = 0, g_takenSent = 0;   /* T-368: names the world changed; TAKEN answers sent */
+long long g_profFactionKept = 0;   /* contributor task 2, case A: a load with an older name - the row's name kept and sent back */
 std::map<std::string, coopprof::FactionAnswer> g_facOwed;   /* T-368: per profile (its slot key), the FACTION answer its game has not acknowledged (kind 6) */
 long long g_facOwedResent = 0, g_facSeen = 0, g_facSeenStale = 0;
 /* restore1a (design s1; fold review-restore1a): world.gen - {profile -> highest worldGen} (owner ruling 1: per profile), ONE
@@ -4955,7 +4956,7 @@ void LogStoreCounters()
         + " refused[samePerson]=" + N(g_profRefusedSamePerson) + " profileRefused[cap,name,unknown,inUse,other]=" + N(g_profRefusedCap) + "," + N(g_profRefusedName) + "," + N(g_profRefusedUnknown) + "," + N(g_profRefusedInUse) + "," + N(g_profRefusedOther)
         /* names2a: a playing game's faction name into its own profile's row (PROFILES kind 3). */
         + " profFaction[set,same,refused]=" + N(g_profFactionSet) + "," + N(g_profFactionSame) + "," + N(g_profFactionRefused)
-        + " profFactionWorld[back,moved,default,takenSent]=" + N(g_profFactionBack) + "," + N(g_profFactionMoved) + "," + N(g_profFactionDefault) + "," + N(g_takenSent)
+        + " profFactionWorld[back,moved,default,takenSent]=" + N(g_profFactionBack) + "," + N(g_profFactionMoved) + "," + N(g_profFactionDefault) + "," + N(g_takenSent) + " profFactionKept=" + N(g_profFactionKept)
         + " factionAnswers[owed,resent,seen,stale]=" + N((long long)g_facOwed.size()) + "," + N(g_facOwedResent) + "," + N(g_facSeen) + "," + N(g_facSeenStale)
         /* restore1a (+ fold): world.gen and the operator's WORLD_SAVED stamps (stampedAcked = answers sent; gen = the highest profile's). */
         + " world[gen=" + N((long long)restoreguard::MaxGen(g_wg)) + ",profiles=" + N((long long)restoreguard::NumberedCount(g_wg)) + ",seqHigh=" + N((long long)WorldSeqHighNow())
@@ -11415,18 +11416,19 @@ void OnProfileFaction(ENetPeer* from, unsigned num, const std::string& name, int
     const std::string old = r.faction;
     std::string asked;
     coopprof::FactionForRow(name, &asked);
-    if (v != coopprof::kFacBack)
+    if (v != coopprof::kFacBack && v != coopprof::kFacKeep)   /* Back and Keep leave the row as it is */
     {
         r.faction = fac;
         WriteProfiles();
     }
     if (v == coopprof::kFacSet) ++g_profFactionSet; else if (v == coopprof::kFacBack) ++g_profFactionBack;
-    else if (v == coopprof::kFacMoved) ++g_profFactionMoved; else ++g_profFactionDefault;
+    else if (v == coopprof::kFacMoved) ++g_profFactionMoved; else if (v == coopprof::kFacKeep) ++g_profFactionKept; else ++g_profFactionDefault;
     Log("profile " + coopprof::ProfileIdOfKey(key) + " faction '" + SanitizeForLog(old) + "' -> '" + SanitizeForLog(r.faction) + "' (" + (rename ? "RENAME" : "FACTION at a load") + " '"
         + SanitizeForLog(name) + "': " + coopprof::FactionVerdictName(v)
         + (v == coopprof::kFacBack ? " - another profile of this world holds that name; the game goes back to its own"
            : v == coopprof::kFacMoved ? " - another profile of this world holds that name; the game takes the lowest free Nameless number"
            : v == coopprof::kFacDefault ? " - Kenshi's default name: the faction takes this profile's own Nameless number"
+           : v == coopprof::kFacKeep ? " - the save's name is older than the one this profile holds: the game takes the world's name"
            : (asked != name ? " - the game's name was trimmed or cut to fit the row" : "")) + ")");
     if (coopprof::FactionOwedAfter(v) == coopprof::kFacOwedReplace)
     {
@@ -11435,7 +11437,7 @@ void OnProfileFaction(ENetPeer* from, unsigned num, const std::string& name, int
         SendMsg(from, MSG_PROFILES, m);
         g_facOwed[key] = a;   /* sent again at this profile's next admission until its game acknowledges it (kind 6) */
     }
-    if (v != coopprof::kFacBack) TakenSendAll("profile " + coopprof::ProfileIdOfKey(key) + "'s faction is '" + SanitizeForLog(r.faction) + "' now");
+    if (v != coopprof::kFacBack && v != coopprof::kFacKeep) TakenSendAll("profile " + coopprof::ProfileIdOfKey(key) + "'s faction is '" + SanitizeForLog(r.faction) + "' now");
 }
 /* T-368: PROFILES kind 6 FACTION SEEN - the game admitted under a profile has the FACTION answer that named `name`; it is not sent again.
    An acknowledgement of an older answer (another name) leaves a newer one owed. */

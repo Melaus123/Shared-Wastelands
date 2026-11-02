@@ -1393,7 +1393,7 @@ void t_mmo8a2_world_scope()
 void t_t810_money()
 {
     namespace mw = moneyw;
-    if (mw::kProtocol != 133u || mw::kMsgSend != 73u || mw::kMsgSentOk != 74u || mw::kMsgDeliver != 75u || mw::kMsgApplied != 76u || mw::kMsgRefuse != 77u)
+    if (mw::kProtocol != 134u || mw::kMsgSend != 73u || mw::kMsgSentOk != 74u || mw::kMsgDeliver != 75u || mw::kMsgApplied != 76u || mw::kMsgRefuse != 77u)
         Fail("T-810: MONEY is not 73-77 of world-server protocol 101");
     if (mw::NextNumber(0, 10) != (10ULL << 16) || mw::NextNumber((10ULL << 16) + 5, 10) != (10ULL << 16) + 5 || mw::NextNumber(7, 0) != 7)
         Fail("T-810: a number is the larger of the next one and the clock's");
@@ -1605,8 +1605,8 @@ void T1118DrainAll(coopsb::Outbox* b, livefirst::Joiner* j, std::vector<std::vec
 }
 void t_t1118b_numbers()
 {
-    if (livefirst::kMsgChunk != 88u || livefirst::kProtocol != 133u || livefirst::kProtocol != coopfeed::kFeedProtocol || livefirst::kProtocol != authproof::kProtocol)
-        Fail("T-1118 b: CHUNK is not message 88 of world-server protocol 133");
+    if (livefirst::kMsgChunk != 88u || livefirst::kProtocol != 134u || livefirst::kProtocol != coopfeed::kFeedProtocol || livefirst::kProtocol != authproof::kProtocol)
+        Fail("T-1118 b: CHUNK is not message 88 of world-server protocol 134");
     if (livefirst::kInnerLogPart != cooplive::kInnerLogPart || livefirst::kLiveUpHeader != cooplive::kLiveUpHeader || livefirst::kLiveDownHeader != cooplive::kLiveDownHeader
         || livefirst::kTypeLive != coopsb::kTypeLive || livefirst::kBudgetMax != coopsb::kNetBytesMax || (int)livefirst::kDirUp != (int)coopsb::kDirUp || (int)livefirst::kDirDown != (int)coopsb::kDirDown)
         Fail("T-1118 b: livefirst.h's copies of the envelope, LOG_PART and send-bound numbers disagree with their headers");
@@ -3002,22 +3002,22 @@ void t_t716_repair_removed()
 }
 void t_t313_protocol_63_both_sides()
 {
-    if (coopfeed::kFeedProtocol != 133 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 133) Fail("the feed's protocol/message numbers are not 133/58");
+    if (coopfeed::kFeedProtocol != 134 || coopfeed::kMsgRecordFeed != 58 || cooppre::kPreProtocol != 134) Fail("the feed's protocol/message numbers are not 134/58");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
     if (plugin.empty() || server.empty()) { Fail("could not read the plugin's store.cpp or the world server's store_main.cpp"); return; }
-    if (plugin.find("const unsigned int kStoreProtocol = 133;") == std::string::npos) Fail("the plugin does not speak world-server protocol 133");
-    if (server.find("const unsigned int kProtocol = 133;") == std::string::npos) Fail("the world server does not speak protocol 133");
-    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 133u) Fail("OWED is not 63 (protocol 133) on both sides and in owedpop.h");
-    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 133u) Fail("TOWN_LOSS is not 64 (protocol 133) on both sides and in townrefill.h");
+    if (plugin.find("const unsigned int kStoreProtocol = 134;") == std::string::npos) Fail("the plugin does not speak world-server protocol 134");
+    if (server.find("const unsigned int kProtocol = 134;") == std::string::npos) Fail("the world server does not speak protocol 134");
+    if (plugin.find("kStoreMsgOwed = 63;") == std::string::npos || server.find("MSG_OWED = 63") == std::string::npos || owedpop::kMsgOwed != 63u || owedpop::kProtocol != 134u) Fail("OWED is not 63 (protocol 134) on both sides and in owedpop.h");
+    if (plugin.find("kStoreMsgTownLoss = 64;") == std::string::npos || server.find("MSG_TOWN_LOSS = 64") == std::string::npos || townrefill::kMsgTownLoss != 64u || townrefill::kProtocol != 134u) Fail("TOWN_LOSS is not 64 (protocol 134) on both sides and in townrefill.h");
     if (plugin.find("kStoreMsgBundle = 59;") == std::string::npos || server.find("MSG_BUNDLE = 59") == std::string::npos || coopbundle::kMsgBundle != 59u) Fail("BUNDLE is not 59 on both sides and in sendbundle.h");
     if (plugin.find("kStoreMsgRecordFeed = 58;") == std::string::npos || server.find("MSG_RECORD_FEED = 58") == std::string::npos) Fail("RECORD_FEED is not 58 on both sides");
 }
 /* the protocol constants agree: world-server 107 in the header of every message that pins it, on both sides */
 void t_t985s2b_protocols()
 {
-    if (coopfeed::kFeedProtocol != 133u || cooppre::kPreProtocol != 133u || owedpop::kProtocol != 133u || townrefill::kProtocol != 133u) Fail("the feed, preload, OWED and TOWN_LOSS headers are not world-server protocol 133");
+    if (coopfeed::kFeedProtocol != 134u || cooppre::kPreProtocol != 134u || owedpop::kProtocol != 134u || townrefill::kProtocol != 134u) Fail("the feed, preload, OWED and TOWN_LOSS headers are not world-server protocol 134");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp");
-    if (plugin.find("const unsigned int kStoreProtocol = 133;") == std::string::npos || server.find("const unsigned int kProtocol = 133;") == std::string::npos) Fail("the game and the world server do not both speak protocol 133");
+    if (plugin.find("const unsigned int kStoreProtocol = 134;") == std::string::npos || server.find("const unsigned int kProtocol = 134;") == std::string::npos) Fail("the game and the world server do not both speak protocol 134");
     const char* const heads[] = { "../common/authproof.h", "../common/baseshow.h", "../common/boxrec.h", "../common/groundrec.h", "../common/keptwire.h",
                                   "../common/moneywire.h", "../common/owedpop.h", "../common/preload.h", "../common/recordfeed.h", "../common/townrefill.h",
                                   "../common/piecerec.h", "../common/shoprec.h", "../common/lookalikelist.h" };
@@ -3030,10 +3030,10 @@ void t_t985s2b_protocols()
             b = s.find('\n', a); if (b == std::string::npos) b = s.size();
             const std::string ln = s.substr(a, b - a);
             if (ln.find("Protocol") == std::string::npos) continue;
-            if (ln.find("= 132;") != std::string::npos) old = true;
-            if (ln.find("= 133;") != std::string::npos) pinned = true;
+            if (ln.find("= 133;") != std::string::npos) old = true;
+            if (ln.find("= 134;") != std::string::npos) pinned = true;
         }
-        if (s.empty() || old || !pinned) Fail(std::string("a header does not pin world-server protocol 133: ") + heads[i]);
+        if (s.empty() || old || !pinned) Fail(std::string("a header does not pin world-server protocol 134: ") + heads[i]);
     }
 }
 /* ---- THE LOAD'S FETCH BY AREA (src/common/preload.h): an index row's area and size, INDEX_ASK's area list, the ring rule ---- */
@@ -3349,7 +3349,7 @@ void t_o1205_peace_fight_gate()
 void t_t1129_areafresh()
 {
     using namespace areafresh;
-    if (kMsgAreaFresh != 89u || kProtocol != 133u || kProtocol != coopfeed::kFeedProtocol || kProtocol != cooptv::kTvProtocol) Fail("t1129: AREA_FRESH is not message 89 of world-server protocol 133");
+    if (kMsgAreaFresh != 89u || kProtocol != 134u || kProtocol != coopfeed::kFeedProtocol || kProtocol != cooptv::kTvProtocol) Fail("t1129: AREA_FRESH is not message 89 of world-server protocol 134");
     /* the wire */
     for (unsigned k = (unsigned)kAsk; k <= (unsigned)kFresh; ++k)
     {
@@ -3967,7 +3967,7 @@ void t_t546f_team_pair()
 void t_t591_town_refill()
 {
     using namespace townrefill;
-    if (kMsgTownLoss != 64u || kProtocol != 133u) Fail("TOWN_LOSS is not message 64 of protocol 133");
+    if (kMsgTownLoss != 64u || kProtocol != 134u) Fail("TOWN_LOSS is not message 64 of protocol 134");
     Table t;
     if (AddLoss(&t, "town-a") != 1 || AddLoss(&t, "town-a") != 2) Fail("a loss did not add one to its town");
     if (AddLoss(&t, "") != 0 || AddLoss(&t, std::string(129, 'x')) != 0 || AddLoss(&t, "a\tb") != 0) Fail("a loss was taken for a town id that is not usable");
@@ -4136,7 +4136,7 @@ void t_t290s3a_proof()
     if (ht.size() != 32 || authproof::kHostTokenBytes != 32 || !authproof::HostTokenDecode(ht, tok2) || std::memcmp(tok2, tok, 32) != 0) Fail("HOST_TOKEN is not {token 32}, or its round trip");
     ht.push_back(0);
     if (authproof::HostTokenDecode(ht, tok2)) Fail("a 33-byte HOST_TOKEN is read");
-    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 133u)
+    if (authproof::kMsgAuthChallenge != 65u || authproof::kMsgAuthProof != 66u || authproof::kMsgSteamId != 67u || authproof::kMsgHostToken != 68u || authproof::kProtocol != 134u)
         Fail("the message numbers are not 65/66/67/68 of protocol 101");
 }
 
@@ -4186,7 +4186,7 @@ void t_t36g_wire_and_rules()
     if (keptwire::RowOk(bad)) Fail("wire2: a door state of 4 is valid");
     bad = w; bad.p.doors.resize(keptwire::kMaxDoors + 1, d);
     if (keptwire::RowOk(bad)) Fail("wire2: a row of 33 doors is valid");
-    if (keptwire::kProtocol != 133u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 133");
+    if (keptwire::kProtocol != 134u || keptwire::kProtocol != authproof::kProtocol) Fail("wire2: KEPT is not world-server protocol 134");
     /* RecordHoldsItems' 'has' mode (zonekeep::KeptItemsHas) and its 'all' mode count a pack's own items */
     std::vector<std::string> box(1, "4003-gamedata.base");
     if (zonekeep::KeptItemsHas(std::vector<zonekeep::KeptItem>(1, pack), box) != 1) Fail("has2: a box holding a kept pack's item is not 'has'");
@@ -4216,7 +4216,7 @@ void t_t1090_reopen_full_restores()
 }
 void t_t1090_reopen_wire()
 {
-    if (owedpop::kOpReopen != 7u || owedpop::kProtocol != 133u) Fail("REOPEN is not op 7 of world-server protocol 133");
+    if (owedpop::kOpReopen != 7u || owedpop::kProtocol != 134u) Fail("REOPEN is not op 7 of world-server protocol 134");
     std::vector<char> b, a; owedpop::Msg m;
     const owedpop::Row r = T581Row(owedpop::kKindResidents, "1535097-market.mod@26,13@-21505,98762", "49386-rebirth.mod");
     if (!owedpop::EncodeReopen(&b, r) || owedpop::Decode(&b[0], b.size(), &m) != 1 || m.op != owedpop::kOpReopen || m.kind != owedpop::kKindResidents
@@ -4241,7 +4241,7 @@ void t_t1090_reopen_wire()
 void t_t697_ground_record()
 {
     using namespace coopgrec;
-    if (kProtocol != 133u || kMsgGroundRefuse != 71u) Fail("T-697: ground records are not world-server protocol 133 / GROUND_REFUSE 71");
+    if (kProtocol != 134u || kMsgGroundRefuse != 71u) Fail("T-697: ground records are not world-server protocol 134 / GROUND_REFUSE 71");
     /* the id */
     if (GroundRecId(3, 41) != "ground.3.41" || GroundRecId(0, 0) != "ground.0.0" || GroundRecId(63, 63) != "ground.63.63") Fail("T-697: GroundRecId spelling");
     if (!GroundRecId(64, 0).empty() || !GroundRecId(0, -1).empty()) Fail("T-697: an out-of-range sector made an id");
@@ -4636,7 +4636,7 @@ void t_t697_made_rule()
     if (coopgrec::GrMadeRule(0, 0, 0) != 0 || coopgrec::GrMadeRule(0, 1, 1) != 0) Fail("T-697: an object with a link of its own is not the map's");
     if (coopgrec::GrMadeRule(1, 0, 1) != 0) Fail("T-697: after the registry overflowed an unlisted 0xB object still reads as made");
     if (coopgrec::GrMadeRule(-1, 0, 0) != 0) Fail("T-697: an unreadable object is not the map's");
-    if (coopgrec::kProtocol != 133u || coopgrec::kGrFormat != 2u) Fail("T-697: format-2 ground records are not world-server protocol 133");
+    if (coopgrec::kProtocol != 134u || coopgrec::kGrFormat != 2u) Fail("T-697: format-2 ground records are not world-server protocol 134");
 }
 /* T-697: the mark of what the mod makes or moves (coopgrec::GrMadeOfPlaced) and a map copy's entry after a pickup
    (coopgrec::GrPickKeepsMapCopy), every input walked. The engine makes any item picked up into an inventory made during play
@@ -4782,7 +4782,7 @@ std::vector<char> T1045Rec(const std::string& key, unsigned int gen, int writer,
 void t_t1045_piece_record()
 {
     using namespace piecerec;
-    if (kProtocol != 133u || kMsgPieceRefuse != 79u || kProtocol != coopbrec::kProtocol) Fail("piece records are not world-server protocol 133 / PIECE_REFUSE 79");
+    if (kProtocol != 134u || kMsgPieceRefuse != 79u || kProtocol != coopbrec::kProtocol) Fail("piece records are not world-server protocol 134 / PIECE_REFUSE 79");
 
     /* the id: the key with its height, the record name always in its hashed form */
     const std::string key = "12-wall.mod@3,41@1003,-205,100";
@@ -4958,7 +4958,7 @@ void t_t1047d_doors()
     if (kPrLiveFlagDoors != 8u || kPrLiveFlagNoPower != 16u || kPrLiveFlagsAll != 63u || kPrLiveMaxDoors != 16u || kPrLiveDoorFlagsAll != 7u || kPrLiveLockLevelMax != 100
         || kPieceLiveDoorBands != 20 || kPrLiveMaxBytes != 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u)
         Fail("t1047d: the doors part's flag bit, room, door flags, lock level range or band count");
-    if (kGameProtocolDoors != 176u || hovrec::kGameProtocol < kGameProtocolDoors || kProtocol != 133u) Fail("t1047d: the game-to-game protocol is not 176 or the world-server protocol not 133");
+    if (kGameProtocolDoors != 176u || hovrec::kGameProtocol < kGameProtocolDoors || kProtocol != 134u) Fail("t1047d: the game-to-game protocol is not 176 or the world-server protocol not 134");
 
     /* round trip: a power piece's values with two doors */
     PieceLive l;
@@ -5261,7 +5261,7 @@ void t_t1047c_live_bar()
     using namespace piecerec;
     if (kPrLiveFlagBar != 4u || kPrLiveFlagsAll != 63u || kPrLiveMaxBytes != 12u + 4u * kPrLiveMaxStocks + 8u + 4u + 12u * kPrLiveMaxDoors + 4u || kPrLiveBarLimit != 2.0f || kPrLiveStateMax != 2
         || kPieceLiveBarBandsWorked != 20 || kPieceLiveBarBandsIdle != 4) Fail("t1047c: the bar's flag bit, the LIVE part's room, the bar's range or its band counts");
-    if (kGameProtocolLiveBar != 175u || hovrec::kGameProtocol < kGameProtocolLiveBar || kProtocol != 133u) Fail("t1047c: the game-to-game protocol is not 175 or the world-server protocol not 133");
+    if (kGameProtocolLiveBar != 175u || hovrec::kGameProtocol < kGameProtocolLiveBar || kProtocol != 134u) Fail("t1047c: the game-to-game protocol is not 175 or the world-server protocol not 134");
 
     /* the LIVE part's bytes, without the bar and with it */
     PieceLive l;
@@ -5462,7 +5462,7 @@ void t_t1047c_live_bar()
 void t_t1047e_player_box()
 {
     using namespace coopbrec;
-    if (kProtocol != 133u || hovrec::kGameProtocol != 187u) Fail("t1047e: the world-server protocol is not 133 or the game-to-game protocol not 187");
+    if (kProtocol != 134u || hovrec::kGameProtocol != 188u) Fail("t1047e: the world-server protocol is not 134 or the game-to-game protocol not 188");
     const std::string key = "12-box.mod@3,41@1003,-205,100";
     const std::string hs = T823Hash("12-box.mod");
     const std::string oldId = MakeBoxRecId(key);
@@ -5606,7 +5606,7 @@ void t_t1047g_handover()
 {
     using namespace coopbrec;
     const unsigned int kBjAnswerWaitMsTest = 60000u;   /* items.cpp kBjAnswerWaitMs */
-    if (kProtocol != 133u || kMsgBoxTaken != 80u || kMsgBoxRefuse != 72u) Fail("t1047g: BOX_TAKEN is not message 80 of world-server protocol 133");
+    if (kProtocol != 134u || kMsgBoxTaken != 80u || kMsgBoxRefuse != 72u) Fail("t1047g: BOX_TAKEN is not message 80 of world-server protocol 134");
     /* BOX_TAKEN: sent only for a write the rule took, or the very same bytes again - never for a refusal */
     if (BoxTakenNoteDue(kBrAccept) != 1 || BoxTakenNoteDue(kBrRepeat) != 1) Fail("t1047g: a taken write is not answered with BOX_TAKEN");
     for (int r = 1; r <= kBrJudgeMax; ++r)
@@ -6607,7 +6607,7 @@ void t_t1047g_handover()
             if (sess.empty() || sess.find("coopbrec::PutAskTail(&b, at);") == std::string::npos
                 || sess.find("!coopbrec::TakeAskTail(&m0.payload[0], m0.payload.size(), &ask, &askLen)") == std::string::npos
                 || sess.find("r.askId = ask.askId; r.askSlot = ask.slot; r.askCarry = ask.carry;") == std::string::npos
-                || sess.find("const unsigned int kProtocolVersion = 187;") == std::string::npos)
+                || sess.find("const unsigned int kProtocolVersion = 188;") == std::string::npos)
                 Fail("t1047g: the item request does not carry the ask's id (ASK1, game protocol 180 and later)");
             const size_t pt = sess.find("coopbrec::PutAskTail(&b, at);"), ph = sess.find("coophold::PutHoldTail(&b, ht);");
             if (pt == std::string::npos || ph == std::string::npos || pt < ph) Fail("t1047g: the ASK1 trailer is not the last block of the item request");
@@ -6686,7 +6686,7 @@ void t_t1047g_handover()
 void t_t823_box_record()
 {
     using namespace coopbrec;
-    if (kProtocol != 133u || kMsgBoxRefuse != 72u) Fail("T-823: box records are not world-server protocol 133 / BOX_REFUSE 72");
+    if (kProtocol != 134u || kMsgBoxRefuse != 72u) Fail("T-823: box records are not world-server protocol 134 / BOX_REFUSE 72");
 
     /* the id: the key without its height, the record name always in its hashed form */
     const std::string key = "12-box.mod@3,41@1003,-205,100";
@@ -7192,7 +7192,7 @@ void t_t823a_box_intake()
 void t_t811_base_show()
 {
     using namespace baseshow;
-    if (kMsgShow != 78u || kProtocol != 133u || kProtocol != keptwire::kProtocol || kProtocol != authproof::kProtocol) Fail("T-811: SHOW is not message 78 of world-server protocol 133");
+    if (kMsgShow != 78u || kProtocol != 134u || kProtocol != keptwire::kProtocol || kProtocol != authproof::kProtocol) Fail("T-811: SHOW is not message 78 of world-server protocol 134");
     std::vector<townkeep::TownRow> said;
     townkeep::TownRow a; a.owner = 1; a.name = "Rock Camp"; a.pos[0] = 100.0f; a.pos[1] = 5.0f; a.pos[2] = 200.0f; said.push_back(a);
     townkeep::TownRow b = a; b.owner = 2; b.name = "Hill Fort"; b.pos[0] = -50.0f; said.push_back(b);
@@ -7500,14 +7500,14 @@ void t_t924_town_copies()
     ApplyPlan p4;
     PlanApply(sh2, rows, std::vector<townkeep::TownRow>(), 0, 0, &p4);
     if (p4.held.size() != 1 || p4.held[0] != 0 || p4.gone.size() != 1 || p4.gone[0] != 1) Fail("t924: an owner with no row waiting has its base held");
-    if (kProtocol != 133u) Fail("t924: the world-server protocol changed (the owner's handle rides the same five words)");
+    if (kProtocol != 134u) Fail("t924: the world-server protocol changed (the owner's handle rides the same five words)");
 }
 /* owner 936 / 937 (protocol 101): TOWNS SHOW KEYS - the shown rows' piece keys (baseshow.h KeyRowsFor, townkeep.h EncodeShowKeys /
    ShowKeysTake), the wire fails closed, and the game's per-copy link decision (KeyRowOf, LinkStep) on every branch */
 void t_p47d_show_keys()
 {
     using namespace baseshow;
-    if (kProtocol != 133u || townkeep::kOpShowKeys != 3u || townkeep::kOpSay != 1u || townkeep::kOpList != 2u || townkeep::kMsgTowns != 70u)
+    if (kProtocol != 134u || townkeep::kOpShowKeys != 3u || townkeep::kOpSay != 1u || townkeep::kOpList != 2u || townkeep::kMsgTowns != 70u)
         Fail("p47d: SHOW KEYS is not TOWNS op 3 of world-server protocol 101");
     if (townkeep::kMaxShowKeyRows != kMaxShowRows) Fail("p47d: a SHOW KEYS list does not hold one row per shown row");
     /* KeyRowsFor: one key row per shown row, its keys and cut flag, (T-924) its owner's handle words; the viewer's own and a non-teammate's never */
@@ -7723,7 +7723,7 @@ void t_t889_wire_and_protocol()
     if (b[1] != 1 || b[2] != 0 || b[5] != 2 || b[9] != 3) Fail("t889: little-endian on the wire");
     /* the numbers: game-to-game protocol 187 (net/session.cpp's kProtocolVersion, which this test cannot see, asserts it equals
        kGameProtocol; an older game has no SHOT_FIRED, FIGHT_CHOICE or HAND and is refused); message 79 (free on main and outside 73-78) */
-    if (kGameProtocol != 187u) Fail("t889: the game-to-game protocol is 187");
+    if (kGameProtocol != 188u) Fail("t889: the game-to-game protocol is 188");
     if (kMsgHandover != 79u || cooplive::kInnerItemHandover != 79u) Fail("t889: MSG_ITEM_HANDOVER is 79");
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerItemHandover)) Fail("t889: the world server road delivers it");
     if (!cooplive::LiveInnerWaitsForWorld(cooplive::kInnerItemHandover)) Fail("t889: it waits for the world like the other item messages");
@@ -7737,8 +7737,8 @@ void t_t889_wire_and_protocol()
 void t_t1084_step5()
 {
     using namespace sqwreg;
-    if (kMsgSquadTake != 84u || kMsgSquadWriter != 85u || kMsgSquadRelease != 86u || kProtocol != 133u || kProtocol != arearec::kProtocol || kProtocol != authproof::kProtocol || kProtocol != coopfeed::kFeedProtocol)
-        Fail("T-1084 s5: SQUAD_TAKE / SQUAD_WRITER / SQUAD_RELEASE are not messages 84 / 85 / 86 of world-server protocol 133");
+    if (kMsgSquadTake != 84u || kMsgSquadWriter != 85u || kMsgSquadRelease != 86u || kProtocol != 134u || kProtocol != arearec::kProtocol || kProtocol != authproof::kProtocol || kProtocol != coopfeed::kFeedProtocol)
+        Fail("T-1084 s5: SQUAD_TAKE / SQUAD_WRITER / SQUAD_RELEASE are not messages 84 / 85 / 86 of world-server protocol 134");
     const int kinds[3] = { kKindFull, kKindDelete, kKindDiscard };
     /* unregistered: a full write is taken and registers its sender at generation 1; a delete is taken and registers nobody */
     {
@@ -7965,8 +7965,8 @@ static std::string T1084NoteCrlf(const char* s) { std::string o; for (const char
 void t_t1084_writer_note()
 {
     using namespace sqwreg;
-    if (kProtocol != 133u || kMsgSquadWriter != 85u || kKindNote != 6 || kSwNoteRuns != 21 || kSwNoteStopped != 22 || kSwNoteSlotGone != 23 || kSwNoteListEnd != 24)
-        Fail("T-1084 note: the writer notes are not SQUAD_WRITER 85, kind 6, verdicts 21-24, world-server protocol 133");
+    if (kProtocol != 134u || kMsgSquadWriter != 85u || kKindNote != 6 || kSwNoteRuns != 21 || kSwNoteStopped != 22 || kSwNoteSlotGone != 23 || kSwNoteListEnd != 24)
+        Fail("T-1084 note: the writer notes are not SQUAD_WRITER 85, kind 6, verdicts 21-24, world-server protocol 134");
     /* the wire: a note has the answer's bytes, and decodes only with its own kind */
     {
         WriterReply r; r.id = "Hive_12"; r.verdict = kSwNoteRuns; r.kind = kKindNote; r.writerSlot = 2; r.gen = 9u;
@@ -8418,7 +8418,7 @@ void t_t1084_step3()
 {
     using namespace arearec;
     /* the message number and protocol, on both sides */
-    if (kMsgAreaRecorded != 83u || kProtocol != 133u || kProtocol != authproof::kProtocol || kProtocol != coopfeed::kFeedProtocol) Fail("T-1084 s3: AREA_RECORDED is not message 83 of world-server protocol 133");
+    if (kMsgAreaRecorded != 83u || kProtocol != 134u || kProtocol != authproof::kProtocol || kProtocol != coopfeed::kFeedProtocol) Fail("T-1084 s3: AREA_RECORDED is not message 83 of world-server protocol 134");
     /* area keys: y * 64 + x, and the sweep's x * 64 + y converted both ways */
     if (AreaKeyXY(5, 7) != 7 * 64 + 5 || AreaKeyXY(5, 7) != coopfeed::FeedAreaKey(5, 7) || AreaKeyXY(-1, 0) != kNoKey || AreaKeyXY(0, 64) != kNoKey) Fail("T-1084 s3: the area key is not the area map's");
     if (AreaKeyX(AreaKeyXY(5, 7)) != 5 || AreaKeyY(AreaKeyXY(5, 7)) != 7) Fail("T-1084 s3: an area key's x / y");
@@ -8738,7 +8738,7 @@ void t_t1084_step3()
 void t_t1047f_record_link()
 {
     using namespace piecerec;
-    if (kProtocol != 133u || baseshow::kProtocol != 133u || hovrec::kGameProtocol != 187u) Fail("t1047f: the world-server protocol is not 133 or the game-to-game protocol not 187");
+    if (kProtocol != 134u || baseshow::kProtocol != 134u || hovrec::kGameProtocol != 188u) Fail("t1047f: the world-server protocol is not 134 or the game-to-game protocol not 188");
     PieceLive l;
     l.have = 1; l.hasPower = 0;
     PieceTownSet(&l, 77u);
@@ -8772,7 +8772,7 @@ void t_t1047f_record_link()
 void t_t940_show_anchor()
 {
     using namespace baseshow;
-    if (kProtocol != 133u || townkeep::kTownsFormat != 5) Fail("t940: SHOW is not world-server protocol 133 / the files not format 5");
+    if (kProtocol != 134u || townkeep::kTownsFormat != 5) Fail("t940: SHOW is not world-server protocol 134 / the files not format 5");
     std::vector<townkeep::TownRow> said;
     said.push_back(T1047fRow(2, 7000.0f, 8000.0f, 4u, 0));
     townkeep::SetAnchor(&said[0], 6500.0f, 7500.0f);
@@ -8809,7 +8809,7 @@ void t1097g_context_origin_wire()
     const size_t gb = sess.find("GetU32(m.payload, off + 4, &bw)"), go = sess.find("GetU32(m.payload, off + 8, &ow)");
     if (pb == std::string::npos || po == std::string::npos || po < pb) Fail("t1097g: CONTEXT's writer does not put the origin after the birth flag");
     if (gb == std::string::npos || go == std::string::npos || sess.find("unsigned int originWire = 0xFFFFFFFFu;") == std::string::npos) Fail("t1097g: CONTEXT's reader does not take the origin after the birth flag, unknown when absent");
-    if (sess.find("const unsigned int kProtocolVersion = 187;") == std::string::npos) Fail("t1097g: the game-to-game protocol is not 187");
+    if (sess.find("const unsigned int kProtocolVersion = 188;") == std::string::npos) Fail("t1097g: the game-to-game protocol is not 188");
 }
 
 /* The decided blow on HIT (hitwire.h): a round trip after the HIT's own bytes, trailing bytes ignored; none / not known names;
@@ -9093,7 +9093,7 @@ void t_t1101_swing_end_wire()
         || cooplive::CharStreamRoute(cooplive::kInnerSwingEnd) != (unsigned int)cooplive::kRouteArea)
         Fail("t1101 swing end: it does not ride SWING's road (AREA)");
     if (cooplive::AreaMissedIsOneOff(cooplive::kInnerSwingEnd) != cooplive::AreaMissedIsOneOff(cooplive::kInnerSwing)) Fail("t1101 swing end: a missed one is not treated as a missed SWING");
-    if (hovrec::kGameProtocol != 187u) Fail("t1101 swing end: the game-to-game protocol is not 187");
+    if (hovrec::kGameProtocol != 188u) Fail("t1101 swing end: the game-to-game protocol is not 188");
     std::vector<unsigned int> got;
     const int n = spawnpace::MessageSubjects(spawnpace::kMsgSwingEnd, (const unsigned char*)&b[0], b.size(), &got);
     std::vector<unsigned int> sw;
@@ -9169,7 +9169,7 @@ void t_t1101_fight_choice_wire()
         || cooplive::CharStreamRoute(cooplive::kInnerFightChoice) != (unsigned int)cooplive::kRouteArea)
         Fail("t1101 fight choice: it does not ride SWING's road (AREA)");
     if (cooplive::CharStreamIndex(cooplive::kInnerFightChoice) != -1) Fail("t1101 fight choice: it took a counted stream column (the twelve are unchanged)");
-    if (hovrec::kGameProtocol != 187u) Fail("t1101 fight choice: the game-to-game protocol is not 187");
+    if (hovrec::kGameProtocol != 188u) Fail("t1101 fight choice: the game-to-game protocol is not 188");
     std::vector<unsigned int> got, sw;
     const int n = spawnpace::MessageSubjects(spawnpace::kMsgFightChoice, (const unsigned char*)&b[0], b.size(), &got);
     const int ns = spawnpace::MessageSubjects(spawnpace::kMsgSwing, (const unsigned char*)&b[0], b.size(), &sw);
@@ -9426,7 +9426,7 @@ void t_t330_ranged_mode_bits()
     if (kRangedModeRevertCap < 1 || !RangedModeRevertsLeft(0) || !RangedModeRevertsLeft(kRangedModeRevertCap - 1)
         || RangedModeRevertsLeft(kRangedModeRevertCap) || RangedModeRevertsLeft(kRangedModeRevertCap + 5))
         Fail("t330 ranged: the write-backs under one word do not stop at the cap");
-    if (hovrec::kGameProtocol != 187u) Fail("t330 ranged: the game-to-game protocol is not 187 (the bits ride the same latchBits word)");
+    if (hovrec::kGameProtocol != 188u) Fail("t330 ranged: the game-to-game protocol is not 188 (the bits ride the same latchBits word)");
 }
 
 /* T-330 aim (statewire.h WithAim, aimstamp.h): bit 17 aiming, bit 18 'read'; bits 0-16 (the ranged mode 15-16 among them)
@@ -10153,7 +10153,7 @@ void t_t330_shot_fired_wire()
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerShotFired)) Fail("t330 fired: refused from the world server");
     if (cooplive::CharStreamNeedsOwnerGate(cooplive::kInnerShotFired)) Fail("t330 fired: its handler's own owner test is gated twice");
     if (cooplive::LiveInnerWaitsForWorld(cooplive::kInnerShotFired)) Fail("t330 fired: a relayed fire waits for a world");
-    if (hovrec::kGameProtocol != 187u) Fail("t330 fired: the game-to-game protocol is not 187");
+    if (hovrec::kGameProtocol != 188u) Fail("t330 fired: the game-to-game protocol is not 188");
     std::vector<unsigned int> got;
     const int n = spawnpace::MessageSubjects(spawnpace::kMsgShotFired, (const unsigned char*)&b[0], b.size(), &got);
     if (n != 2 || got.size() != 2 || got[0] != 0x01020304u || got[1] != 77) Fail("t330 fired: it does not wait for its shooter and target");
@@ -10270,7 +10270,7 @@ void t_t330_hand_wire()
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerHand)) Fail("t330 hand: refused from the world server");
     if (cooplive::CharStreamNeedsOwnerGate(cooplive::kInnerHand)) Fail("t330 hand: its handler's own owner test is gated twice");
     if (cooplive::LiveInnerWaitsForWorld(cooplive::kInnerHand)) Fail("t330 hand: a hand word waits for a world");
-    if (hovrec::kGameProtocol != 187u) Fail("t330 hand: the game-to-game protocol is not 187");
+    if (hovrec::kGameProtocol != 188u) Fail("t330 hand: the game-to-game protocol is not 188");
     if (!Encode(&b, h)) Fail("t330 hand: the word for the subject leg not encoded");
     std::vector<unsigned int> got;
     if (spawnpace::MessageSubjects(spawnpace::kMsgHand, (const unsigned char*)&b[0], b.size(), &got) != 1 || got.size() != 1 || got[0] != 0x01020304u)
@@ -10360,7 +10360,7 @@ void t_t1101_block_pick_wire()
     if (!cooplive::LiveInnerAccepted(cooplive::kInnerBlockPick)) Fail("t1101 block pick: refused from the world server");
     if (cooplive::CharStreamNeedsOwnerGate(cooplive::kInnerBlockPick)) Fail("t1101 block pick: its handler's own owner test is gated twice");
     if (cooplive::LiveInnerWaitsForWorld(cooplive::kInnerBlockPick)) Fail("t1101 block pick: a relayed pick waits for a world");
-    if (hovrec::kGameProtocol != 187u) Fail("t1101 block pick: the game-to-game protocol is not 187");
+    if (hovrec::kGameProtocol != 188u) Fail("t1101 block pick: the game-to-game protocol is not 188");
     std::vector<unsigned int> got;
     const int n = spawnpace::MessageSubjects(spawnpace::kMsgBlockPick, (const unsigned char*)&b[0], b.size(), &got);
     if (n != 2 || got.size() != 2 || got[0] != 0x01020304u || got[1] != 77) Fail("t1101 block pick: it does not wait for its defender and attacker");
@@ -10570,8 +10570,8 @@ void t_townver_wire()
     }
     if (cooptv::TvForwardTo(1, 0, 1) != 1 || cooptv::TvForwardTo(1, 0, 0) != 0 || cooptv::TvForwardTo(1, 1, 1) != 0 || cooptv::TvForwardTo(0, 0, 1) != 0)
         Fail("an accepted TOWN_VER does not go to exactly the other connected games whose feed is on");
-    if (cooptv::kMsgTownVer != 87u || cooptv::kTvProtocol != 133u || cooptv::kTvProtocol != coopfeed::kFeedProtocol || cooptv::kTvProtocol != arearec::kProtocol)
-        Fail("TOWN_VER is not message 87 of world-server protocol 133");
+    if (cooptv::kMsgTownVer != 87u || cooptv::kTvProtocol != 134u || cooptv::kTvProtocol != coopfeed::kFeedProtocol || cooptv::kTvProtocol != arearec::kProtocol)
+        Fail("TOWN_VER is not message 87 of world-server protocol 134");
     const std::string plugin = T313ReadFile("../coop-plugin/store.cpp"), server = T313ReadFile("../coop-store/store_main.cpp"), zones = T313ReadFile("../coop-plugin/zones.cpp");
     if (plugin.find("kStoreMsgTownVer = 87;") == std::string::npos || server.find("MSG_TOWN_VER = 87") == std::string::npos) Fail("TOWN_VER is not 87 on both sides");
     if (zones.find("return cooptv::TvKey(r.own, r.x, r.z);") == std::string::npos) Fail("the readout's key is not the world server's key (one hand)");
@@ -11298,7 +11298,7 @@ void t_rulesfile_lines()
     now["basepolicy"] = "owner"; now["gt.raidsize"] = "1"; now["gt.pop"] = "2";
     const Pairs d = Diff(was, now);
     if (d.size() != 3 || d[0].first != "gt.pop" || d[1].first != "basepolicy" || d[1].second != "owner" || d[2].first != "race.x" || !d[2].second.empty()) Fail("rulesfile: the change list is not in the screen's order with the removal last");
-    if (kMsgRulesChanged != 92u || kProtocol != 133u) Fail("rulesfile: RULES_CHANGED is not message 92 of world-server protocol 133");
+    if (kMsgRulesChanged != 92u || kProtocol != 134u) Fail("rulesfile: RULES_CHANGED is not message 92 of world-server protocol 134");
 }
 /* rulesfile.h names its rules as GAME OPTIONS does (panelstatus.h OptDefs, in its order) and shows the same words for their values */
 void t_rulesfile_names()
@@ -12695,6 +12695,75 @@ void t_t1140_box_aside_folds()
     }
 }
 
+/* task 3 (0.4.0 contributor brief): a ground hand-over line removes only the item whose id IS its stored name */
+void t_task3_ground_exact_item()
+{
+    using namespace hovrec;
+    const std::string nm = "Leather Turtleneck|12.500,3.250,-7.000";
+    if (GroundCandidateVerdict(nm, nm, 0, 1) != kGroundOk) Fail("task3: the item by its own name, fields matching, is accepted");
+    /* two identical stacks within 0.5 units: the other one has another id and is refused, fields matching or not */
+    if (GroundCandidateVerdict(nm, "Leather Turtleneck|12.700,3.250,-7.100", 0, 1) != kGroundOtherId) Fail("task3: another stack's id is refused");
+    if (GroundCandidateVerdict(nm, "", 0, 1) != kGroundOtherId) Fail("task3: an unreadable candidate id is refused");
+    /* a candidate found only by the near fallback is refused even when its id happened to match */
+    if (GroundCandidateVerdict(nm, nm, 1, 1) != kGroundFuzzy) Fail("task3: a fuzzy candidate is refused");
+    if (GroundCandidateVerdict(nm, "x", 1, 0) != kGroundFuzzy) Fail("task3: fuzzy is refused before anything else");
+    if (GroundCandidateVerdict("", "", 0, 1) != kGroundNoName || GroundCandidateVerdict("", nm, 0, 1) != kGroundNoName)
+        Fail("task3: an empty stored name is refused");
+    if (GroundCandidateVerdict(nm, nm, 0, 0) != kGroundFields) Fail("task3: the right id with other fields is still refused");
+    if (std::string(GroundVerdictWord(kGroundOk)) != "ok" || std::string(GroundVerdictWord(kGroundOtherId)) != "another item's id")
+        Fail("task3: the log words");
+}
+
+/* task 4 (0.4.0 contributor brief): the owed file's folders, top first, so a joining PC's first save creates them */
+void t_task4_parent_dirs()
+{
+    using cooppath::ParentDirsTopFirst;
+    std::vector<std::string> d = ParentDirsTopFirst("C:\\Users\\p\\Kenshi\\save\\coop\\World One\\build_handoffs_owed_ab12.txt");
+    if (d.size() != 6 || d[0] != "C:\\Users" || d[4] != "C:\\Users\\p\\Kenshi\\save\\coop" || d[5] != "C:\\Users\\p\\Kenshi\\save\\coop\\World One")
+        Fail("task4: a drive path lists every folder, top first, without the root or the file");
+    d = ParentDirsTopFirst("\\\\nas\\games\\coop\\w\\f.txt");
+    if (d.size() != 2 || d[0] != "\\\\nas\\games\\coop" || d[1] != "\\\\nas\\games\\coop\\w") Fail("task4: a UNC path skips the server and the share");
+    if (!ParentDirsTopFirst("\\\\nas\\games").empty() || !ParentDirsTopFirst("\\\\nas").empty()) Fail("task4: a bare share names no folder");
+    d = ParentDirsTopFirst("C:/a//b/f.txt");
+    if (d.size() != 2 || d[0] != "C:/a" || d[1] != "C:/a//b") Fail("task4: forward and doubled separators");
+    d = ParentDirsTopFirst("\xc3\xa9t\xc3\xa9\\mon monde\\f.txt");   /* UTF-8 names: bytes kept as written (relative path) */
+    if (d.size() != 2 || d[0] != "\xc3\xa9t\xc3\xa9" || d[1] != "\xc3\xa9t\xc3\xa9\\mon monde") Fail("task4: UTF-8 folder names, relative path");
+    if (!ParentDirsTopFirst("").empty() || !ParentDirsTopFirst("f.txt").empty() || !ParentDirsTopFirst("C:\\f.txt").empty() || !ParentDirsTopFirst("C:f.txt").empty())
+        Fail("task4: no folder to make");
+    d = ParentDirsTopFirst("\\top\\f.txt");
+    if (d.size() != 1 || d[0] != "\\top") Fail("task4: a rooted path without a drive");
+}
+
+/* task 6 (0.4.0 contributor brief): the game's link measures its drain rate while any frame waits, not only record pieces */
+void t_task6_rate_any_frame()
+{
+    using namespace livefirst;
+    if (GameDrainBusy(false, 0) || !GameDrainBusy(true, 0) || !GameDrainBusy(false, 1) || !GameDrainBusy(true, 7)) Fail("task6: busy = record pieces OR any frame");
+    /* a record file at 40 KB/s, then a quiet second, then a burst of introductions / live frames only (no record pieces) draining at
+       1 MB/s for one second. Old busy (record pieces only) keeps 40 KB/s and the budget at the floor; the game's new busy follows the drain. */
+    Rate oldR, newR;
+    double t = 0.0; long long left = 0;
+    for (int i = 0; i < 8; ++i) { oldR.Note(t, left, true); newR.Note(t, left, GameDrainBusy(true, 3)); t += 0.25; left += 10000; }
+    const double before = newR.BytesPerSec();
+    if (before < 30000.0 || before > 50000.0 || oldR.BytesPerSec() != before) Fail("task6: the record-file rate, identical both ways");
+    for (int i = 0; i < 4; ++i) { oldR.Note(t, left, false); newR.Note(t, left, GameDrainBusy(false, 0)); t += 0.25; }   /* quiet: kept */
+    if (newR.BytesPerSec() != before || oldR.BytesPerSec() != before) Fail("task6: a quiet link keeps its last rate");
+    const double rtt = 0.050;
+    for (int i = 0; i < 5; ++i) { oldR.Note(t, left, false); newR.Note(t, left, GameDrainBusy(false, 120)); t += 0.25; left += 250000; }
+    if (oldR.BytesPerSec() != before || oldR.Budget(rtt) != kBudgetMin) Fail("task6: the old rule did not measure the burst (the bug, kept for contrast)");
+    if (newR.BytesPerSec() < 800000.0) Fail("task6: the burst's rate follows the real drain within a few windows");
+    if (newR.Budget(rtt) <= kBudgetMin) Fail("task6: the budget leaves the 16 KB floor during the burst");
+    /* with record pieces waiting the result is identical to the old rule, window for window */
+    Rate a, b;
+    const long long drains[] = { 0, 5000, 12000, 30000, 30000, 61000, 90000, 90500 };
+    const bool rest[] = { true, true, false, true, true, false, true, true };
+    for (int i = 0; i < 8; ++i)
+    {
+        a.Note(i * 0.3, drains[i], rest[i]);
+        b.Note(i * 0.3, drains[i], rest[i] ? GameDrainBusy(true, 4) : rest[i]);
+        if (a.BytesPerSec() != b.BytesPerSec()) Fail("task6: with record pieces waiting the rate is unchanged");
+    }
+}
 const TestRow kTests[] =
 {
     { "t923_town_pick_takes_mate",                            t_t923_town_pick_takes_mate },
@@ -12737,6 +12806,8 @@ const TestRow kTests[] =
     { "cfg_write_round_trips_through_the_parser",     t_cfg_write_round_trips_through_the_parser },
     { "cfg_addr_rule",                                t_cfg_addr_rule },
     { "cfg_panel_field_validators",                   t_cfg_panel_field_validators },
+    { "cfg_join_addr_port",                           t_cfg_join_addr_port },
+    { "task5_paid_conversation_refund",               t_task5_paid_refund },
     { "cfg_sanitise_typed",                           t_cfg_sanitise_typed },
     { "cfg_incomplete_reason",                        t_cfg_incomplete_reason },
     { "cfg_parser_bounds_and_notes",                  t_cfg_parser_bounds_and_notes },
@@ -13035,6 +13106,7 @@ const TestRow kTests[] =
     { "ground_player_mark_decision396",                                t_ground_player_mark },
     { "names2a_faction_row_cut_trim_empty_sender",                    t_names2a_faction_row },
     { "t368_unique_player_and_faction_names_nameless_n",              t_t368_unique_names },
+    { "task2_faction_name_on_reload",                                  t_task2_faction_reload },
     { "h068_default_faction_is_each_profiles_nameless_n",             t_h068_default_faction_numbers },
     { "h069_freed_faction_names_are_free",                             t_h069_freed_names_are_free },
     { "t368_every_typed_name_own_recase_aside_ack_edges",             t_t368_names_all_typed },
@@ -14156,6 +14228,9 @@ const TestRow kTests[] =
     , { "t889f3_char_id", t_t889f3_char_id }
     , { "t889f3_placed", t_t889f3_placed }
     , { "t889f3_ground_order", t_t889f3_ground_order }
+    , { "task3_ground_exact_item", t_task3_ground_exact_item }
+    , { "task4_parent_dirs", t_task4_parent_dirs }
+    , { "task6_rate_any_frame", t_task6_rate_any_frame }
     , { "t889f3_search_before_rebuild", t_t889f3_search_before_rebuild }
     , { "t889f4_late_take_line", t_t889f4_late_take_line }
     , { "t889f4_holder_look", t_t889f4_holder_look }
