@@ -25,6 +25,7 @@
  */
 #pragma once
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -208,6 +209,20 @@ inline int DecodeSpawn(const char* p, size_t size, SpawnMsg* out)
     }
     if (out) *out = m;
     return kSpawnDecodeOk;
+}
+
+/* THE spawncontainer LEVER (TEST-ONLY, command_channel.cpp / spawn.cpp): which squad a local `spawn` with a named faction
+   (`spawnfaction`) goes into. "new" = a fresh empty squad of that faction made by the engine (Faction::spawnEmptySquad) and
+   given as the container, so the engine does not place the person into a nearby squad another game runs. Any other word
+   reads as before: a leading integer, 0 = no container (the engine chooses), non-zero = the reference platoon; no integer
+   (or nothing) = the reference platoon. */
+const int kSpawnContainerNull = 0, kSpawnContainerKeep = 1, kSpawnContainerNew = 2;
+inline int SpawnContainerWord(const std::string& w)
+{
+    if (w == "new") return kSpawnContainerNew;
+    int v = 1;
+    if (std::sscanf(w.c_str(), "%d", &v) != 1) v = 1;
+    return v != 0 ? kSpawnContainerKeep : kSpawnContainerNull;
 }
 
 }   /* namespace coopspawn */

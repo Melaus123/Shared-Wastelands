@@ -8,7 +8,7 @@
 // Values are decimal text; floats are written with %.9g, which reads back to the same bits.
 // RANGES: floats finite and inside 0.01..100 (Guess on the upper bound - the slider limits the Advanced window's ctor
 // passes were not decoded; 0 is refused because research speed is a divisor, review-settings2 D6), bools 0/1, attacks 0..5,
-// limbloss 0..3 (Guess on the upper bound).
+// limbloss 0..3 (Guess on the upper bound). The world server accepts this whole range; GAME OPTIONS' steps: RuleLimits below.
 #include <string>
 #include <cstdlib>
 #include <float.h>
@@ -75,6 +75,33 @@ inline bool GtValueOk(const std::string& key, const std::string& value)
         return n >= 0 && n <= (k == "attacks" ? 5 : 3);
     }
     return false;
+}
+
+// GAME OPTIONS' STEPS for its number and word rows: the values Kenshi's own New Game and Options windows allow (panelstatus.h
+// OptStep). They hold no world value: the world takes anything the checks above accept, set by a hand-edited Kenshi or in rules.txt.
+struct RuleLimit { const char* key; double lo; double hi; };
+const int kRuleLimitCount = 13;
+inline const RuleLimit* RuleLimits()
+{
+    static const RuleLimit l[kRuleLimitCount] = {
+        { "gp.gdm", 0.5, 4.0 }, { "gp.cod", 0.5, 4.0 }, { "gp.ht", 0.25, 8.0 }, { "gp.bs", 0.5, 2.0 }, { "gp.rs", 0.5, 2.0 },
+        { "gp.ps", 0.5, 2.0 }, { "gp.nnm", 0.5, 4.0 }, { "gt.pop", 0.5, 4.0 }, { "gt.squad", 0.5, 3.0 }, { "gt.raidsize", 0.25, 4.0 },
+        { "gt.raidfreq", 0.25, 3.0 }, { "gt.attacks", 0.0, 5.0 }, { "gt.limbloss", 0.0, 2.0 } };
+    return l;
+}
+// The key's limits; false for a key with none.
+inline bool LimitsOf(const std::string& key, double* lo, double* hi)
+{
+    for (int i = 0; i < kRuleLimitCount; ++i)
+        if (key == RuleLimits()[i].key) { *lo = RuleLimits()[i].lo; *hi = RuleLimits()[i].hi; return true; }
+    return false;
+}
+// The authority writes the world's stored value over its own live one: its live value is one the world cannot record (outside the
+// range above) and the world's value is one it can. A live value inside the range that differs from the world's is the authority's
+// own change not yet sent, and stays.
+inline bool TakesWorldValue(const std::string& key, const std::string& live, const std::string& world)
+{
+    return !(GpValueOk(key, live, 0) || GtValueOk(key, live)) && (GpValueOk(key, world, 0) || GtValueOk(key, world));
 }
 
 } // namespace coopgp

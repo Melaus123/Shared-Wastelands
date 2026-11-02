@@ -42,6 +42,8 @@
 #include "store.h"   /* EngineWritesBlocked */
 #include "config.h"  /* settings5 S5: ConfigModFingerprintSalt */
 #include "u8file.h"   /* UTF-8 paths through the wide Windows file calls */
+#include "admin.h"   /* AdminNow: the rule-setter is an admin now */
+#include "../common/stewardrules.h"   /* KeepsWorldRules: a game made the steward mid-world keeps the world's rules */
 
 namespace coop {
 namespace {
@@ -424,6 +426,55 @@ std::string GtLine();       /* settings4 S4: defined below, same (anonymous) nam
 int HostChoicesToLive(const char* at);   /* mp5: defined below, same (anonymous) namespace */
 int HostChoicesSnapshot(std::vector<std::pair<std::string, std::string> >* out);   /* mp5b: defined below, same (anonymous) namespace */
 volatile LONG g_hcNotAuth = 0;           /* mp5: MAIN THREAD writes (SettingsTick), the load hook reads - 1 = a notebook link is up and calls another game the authority */
+/* THE STEWARD SETS NO RULES (src/common/worldroles.h, stewardrules.h). The world server's authority flag names the STEWARD, which runs
+   the technical duties. A game made the steward in a running world that it did not start the server for (the owner away, "keep this
+   world running") follows the world's rule record, already here or still to come: it never restores, records or sends its own values
+   as the world's. 1 = this
+   game is the steward and NOT the rule-setter. Raised and lowered by the authority message (SettingsStewardEdge), lowered when the
+   flag drops or the link goes down (SettingsTick). MAIN THREAD. */
+int g_stewardKeepsRules = 0;
+/* THIS GAME SETS THE WORLD'S RULES only while the world server counts it an ADMIN NOW (decision 1294 a; admin.cpp AdminNow): the
+   owner's own game, which showed this hosting's secret on this link, or a game logged in with /login on this link and not idle.
+   The world server takes OPTIONS from such a game alone (store_main.cpp OnOptions). The steward flag gives no say in the rules: a
+   steward that is not an admin now keeps the duties only and follows the record (g_stewardKeepsRules is its log's word for that);
+   a logged-in admin stops being the rule-setter when its login ends. A rule-setter that keeps the world's record (KeepsRecord,
+   below) is still the rule-setter - its own changes go up - but its own values are not put back or sent when it becomes one. */
+bool RulesAuthority() { return AdminNow(); }
+/* EVERY GAME FOLLOWS THE RECORD, THE OWNER TOO (stewardrules.h). The rule-setter KEEPS the world's record (KeepsRecord) when
+   - it followed a record holding rules on this link (g_followedRecordGen: the notebook link on which such a record last reached this
+     game while it was NOT the rule-setter, -1 = none; set at the OPTIONS map, a new link's generation ends it) - the owner's game
+     back in a kept world, joined without the flag, then AUTH; or
+   - its HOST press joined this world while it ran, no world server started (g_hostJoinedWorld, set by ui.cpp's press, ended by any
+     other press) and the link is in that world (StoreIndexWorld) - whichever order the flag and the record arrive in, and across a
+     link drop and re-link in that world;
+   and the record it knows holds at least one rule (g_recRules: a world whose rules were never set has nothing to keep).
+   Keeping: its own gameplay-tab values are not put back, and neither they nor the host's Game options are sent (those are dropped for
+   this world); the record is applied on it as on any follower. Its own change from then on (Options window, advset, gtset) goes up
+   as the rule-setter's. Its own gameplay-tab values come back on its game at world leave and link down as for every follower; a
+   re-link's OPTIONS map applies the record again. MAIN THREAD. */
+int g_followedRecordGen = -1;
+std::string g_hostJoinedWorld;   /* the folder of the world this game's HOST press joined while it ran; "" = no such press */
+int g_recRules = -1;             /* the record of this link: -1 = not here yet, 0 = here with no rule (gp.* / gt.*), 1 = holds rules */
+/* THE RULES FILE DECIDES (stewardrules.h RuleSetterKeepsRecord): the rule-setter keeps the world's record unless this
+   game's HOST press is the world's first hosting (g_hostFirstWorld: the folder of the world that press started a world server for,
+   holding neither rules.txt nor options.txt then; set by ui.cpp's press, ended by any other press and once this game's values have gone
+   up with the record in hand - FirstHostingDone) or the record holds no rule. g_followedRecordGen and g_hostJoinedWorld are kept for
+   the log lines; every other rule-setter keeps the record now, whichever way it came to set the rules. */
+std::string g_hostFirstWorld;
+bool FirstHosting() { return !g_hostFirstWorld.empty(); }
+bool KeepsRecord()
+{
+    return stewardrules::RuleSetterKeepsRecord(RulesAuthority(), FirstHosting(), g_recRules == 0);
+}
+/* The first hosting has put this game's values in the record (the world-live edge or an OPTIONS arrival while live, with the record in
+   hand): from here on this game keeps the world's record like every later hosting. */
+void FirstHostingDone(const char* at)
+{
+    if (!FirstHosting()) return;
+    DebugLog(std::string("[SETTINGS] world '") + g_hostFirstWorld + "'s first hosting has put this game's values in its rules (at=" + at
+             + ") - from now on this game keeps the world's record; a rule changes through an admin's change in the game or rules.txt");
+    g_hostFirstWorld.clear();
+}
 void LogAll(const char* at)
 {
     const std::string tail = std::string(" at=") + at;
@@ -523,31 +574,38 @@ int ApplyRecord(const char* over, int logAlways)
 
 /* THE AUTHORITY'S CHANGE PATH. Keys absent from the record are always sent (first record); a live value that
    differs from a recorded one is sent only when `ownChange` (the world-live edge, the advset lever) - on an
-   OPTIONS arrival the record has just been applied, so a difference there is not this game's change. */
+   OPTIONS arrival the record has just been applied, so a difference there is not this game's change - except a live value
+   the world cannot record, which takes the world's value there. */
 void AuthoritySync(const char* at, int ownChange)
 {
-    if (!StoreIsWorldAuthority()) return;
+    if (!RulesAuthority()) return;
     std::map<std::string, std::string> rec;
     if (!RecSnapshot(&rec)) return;   /* no map on this link yet: its arrival runs this again */
     unsigned char b[0x24];
     if (!GpReadLive(b)) { ErrorLog("[SETTINGS] authority: the advanced options global is unreadable - nothing recorded"); return; }
     std::vector<std::pair<std::string, std::string> > send;
-    std::string firstList, changeList;
-    int same = 0, differs = 0, badLive = 0;
+    std::string firstList, changeList, takenList;
+    int same = 0, differs = 0, badLive = 0, taken = 0;
     for (int i = 0; i < coopgp::kGpCount; ++i)
     {
         const std::string key = "gp." + GpName(i);
         const std::string live = GpLiveText(b, i);
-        double lv = 0.0;
-        if (!coopgp::GpKindValueOk(coopgp::GpFields()[i].kind, live, &lv)) { ++badLive; ErrorLog("[SETTINGS] authority: live " + key + "=" + live + " is outside the recordable range - not sent"); continue; }
         std::map<std::string, std::string>::const_iterator it = rec.find(key);
-        if (it == rec.end()) { send.push_back(std::make_pair(key, live)); firstList += " " + GpName(i) + "=" + live; continue; }
         double rv = 0.0;
+        if (!coopgp::GpKindValueOk(coopgp::GpFields()[i].kind, live, 0))
+        {   /* a live value the world cannot record is never sent: on an arrival the world's value is written over it, so this game plays
+               what every other game plays; live then equals the record, so nothing is tried again */
+            if (!ownChange && it != rec.end() && coopgp::TakesWorldValue(key, live, it->second) && coopgp::GpValueOk(key, it->second, &rv) && GpWrite(i, rv))
+            { ++taken; takenList += " " + GpName(i) + " " + live + "->" + it->second; continue; }
+            ++badLive; ErrorLog("[SETTINGS] authority: live " + key + "=" + live + " is outside the recordable range - not sent"); continue;
+        }
+        if (it == rec.end()) { send.push_back(std::make_pair(key, live)); firstList += " " + GpName(i) + "=" + live; continue; }
         if (coopgp::GpValueOk(key, it->second, &rv) && GpEquals(b, i, rv)) { ++same; continue; }
         if (!ownChange) { ++differs; continue; }
         send.push_back(std::make_pair(key, live));
         changeList += " " + GpName(i) + " " + it->second + "->" + live;
     }
+    if (taken) { ::InterlockedExchangeAdd64(&g_gpApplied, (LONGLONG)taken); DebugLog("[SETTINGS] authority: " + I(taken) + " live advanced option(s) the world cannot record took the world's value:" + takenList + " (at=" + at + ")"); }
     if (send.empty())
     {
         DebugLog(std::string("[SETTINGS] gp.* already recorded - not re-sent (") + I(same) + " match the live values"
@@ -555,7 +613,7 @@ void AuthoritySync(const char* at, int ownChange)
                  + (badLive ? ", " + I(badLive) + " unrecordable" : std::string()) + ", at=" + at + ")");
         return;
     }
-    const bool ok = StoreSendOptions(send);
+    const bool ok = StoreSendOptions(send, FirstHosting());   /* at the world's first hosting these are its settings filling the rules: not said */
     if (ok) g_gpSent += (long long)send.size();
     DebugLog(std::string("[SETTINGS] authority: ") + (ok ? "sent " : "could NOT send ") + I((long long)send.size())
              + " advanced option(s) to the world record at=" + at
@@ -568,7 +626,7 @@ std::string RecordLine()
 {
     std::map<std::string, std::string> rec;
     const int known = RecSnapshot(&rec);
-    std::string s = "[SETTINGS] world record known=" + I(known) + " authority=" + I(StoreIsWorldAuthority() ? 1 : 0)
+    std::string s = "[SETTINGS] world record known=" + I(known) + " authority=" + I(RulesAuthority() ? 1 : 0)
                     + " hook=" + I(g_gpHook) + " loads=" + I((long long)g_gpLoads) + " applied=" + I((long long)g_gpApplied) + " sent=" + I(g_gpSent)
                     + " s3lock=" + I(g_ngHook) + "/" + I(g_smHook) + " locks=" + I(g_ngLocks) + " commits=" + I(g_ngCommits) + " unlocks=" + I(g_ngUnlocks) + " gp:";   /* settings3 S3 */
     int n = 0;
@@ -605,7 +663,8 @@ unsigned long long detour_gpLoad(void* self, void* data)
    OWN CHANGE at the world-live edge, at every Options-window close, and on `gtset`). Every other game writes the
    record's values over its own and holds its own IN MEMORY ONLY (g_gtOwn); they are put back at the notebook link's
    down edge, at world leave, and when this game becomes the authority (review-settings4 D1: also on the authority
-   edge itself, which can come without an OPTIONS map). Process exit needs nothing (below).
+   edge itself, which can come without an OPTIONS map) - except a rule-setter that joined following the record on this
+   link (KeepsRecord), which goes on holding them until world leave or link down. Process exit needs nothing (below).
    settings.cfg WRITERS (review-settings4, corrected): OptionsWindow::saveOptions 0x3EC950 (sole caller
    OptionsWindow::hide 0x3EE6E0) is the ONLY writer of the IN-MEMORY gameplay values. Six other writers exist -
    SaveManager::execute ('continue'), updateAutoSave ('autosaveindex'), LocaleManager setCurrentLocale/init
@@ -711,10 +770,11 @@ void GtRestore(const std::string& why)
 }
 
 /* A non-authority writes the world's gt.* over its own, capturing each field's own value the moment it first becomes
-   held (so a relink captures the values the link-down restored, never the world's). */
+   held (so a relink captures the values the link-down restored, never the world's). A rule-setter that keeps the record
+   (KeepsRecord) follows the same way. */
 void GtFollow(const char* at)
 {
-    if (StoreIsWorldAuthority()) { GtRestore(std::string("this game is the world's authority (") + at + ")"); return; }
+    if (RulesAuthority() && !KeepsRecord()) { GtRestore(std::string("this game is the world's authority (") + at + ")"); return; }
     if (g_gtLeft || GtHolder() == 0) return;
     std::map<std::string, std::string> rec;
     if (!RecSnapshot(&rec)) return;   /* no map on this notebook link: nothing to follow */
@@ -762,27 +822,33 @@ void GtFollow(const char* at)
    value that differs from the record goes up only as an own change (world-live edge, Options close, gtset). */
 void GtAuthoritySync(const char* at, int ownChange)
 {
-    if (!StoreIsWorldAuthority() || GtHolder() == 0) return;
+    if (!RulesAuthority() || GtHolder() == 0) return;
     std::map<std::string, std::string> rec;
     if (!RecSnapshot(&rec)) return;   /* no map on this link yet: its arrival runs this again */
     std::vector<std::pair<std::string, std::string> > send;
-    std::string firstList, changeList;
-    int same = 0, differs = 0, bad = 0;
+    std::string firstList, changeList, takenList;
+    int same = 0, differs = 0, bad = 0, taken = 0;
     for (int i = 0; i < kGtCount; ++i)
     {
         const std::string key = std::string("gt.") + kGt[i].key;
         unsigned int live = 0;
         if (!GtRead(i, &live)) { ++bad; continue; }
         const std::string lt = GtText(i, live);
-        if (!coopgp::GtValueOk(key, lt)) { ++bad; ErrorLog("[SETTINGS] authority: live " + key + "=" + lt + " is outside the recordable range - not sent"); continue; }
         std::map<std::string, std::string>::const_iterator it = rec.find(key);
-        if (it == rec.end()) { send.push_back(std::make_pair(key, lt)); firstList += std::string(" ") + kGt[i].key + "=" + lt; continue; }
         unsigned int rv = 0;
+        if (!coopgp::GtValueOk(key, lt))
+        {   /* as AuthoritySync: a live value the world cannot record takes the world's value on an arrival, so nothing is tried again */
+            if (!ownChange && it != rec.end() && coopgp::TakesWorldValue(key, lt, it->second) && GtParse(i, it->second, &rv) && GtWrite(i, rv))
+            { ++taken; takenList += std::string(" ") + kGt[i].key + " " + lt + "->" + it->second; continue; }
+            ++bad; ErrorLog("[SETTINGS] authority: live " + key + "=" + lt + " is outside the recordable range - not sent"); continue;
+        }
+        if (it == rec.end()) { send.push_back(std::make_pair(key, lt)); firstList += std::string(" ") + kGt[i].key + "=" + lt; continue; }
         if (GtParse(i, it->second, &rv) && rv == live) { ++same; continue; }
         if (!ownChange) { ++differs; continue; }
         send.push_back(std::make_pair(key, lt));
         changeList += std::string(" ") + kGt[i].key + " " + it->second + "->" + lt;
     }
+    if (taken) DebugLog("[SETTINGS] authority: " + I(taken) + " live gameplay-tab setting(s) the world cannot record took the world's value:" + takenList + " (at=" + at + ")");
     if (send.empty())
     {
         DebugLog(std::string("[SETTINGS] gt.* already recorded - not re-sent (") + I(same) + " match the live values"
@@ -790,7 +856,7 @@ void GtAuthoritySync(const char* at, int ownChange)
                  + (bad ? ", " + I(bad) + " unrecordable" : std::string()) + ", at=" + at + ")");
         return;
     }
-    const bool ok = StoreSendOptions(send);
+    const bool ok = StoreSendOptions(send, FirstHosting());   /* at the world's first hosting these are its settings filling the rules: not said */
     if (ok) g_gtSent += (long long)send.size();
     DebugLog(std::string("[SETTINGS] authority: ") + (ok ? "sent " : "could NOT send ") + I((long long)send.size())
              + " gameplay-tab setting(s) to the world record at=" + at
@@ -805,12 +871,17 @@ void GtAuthoritySync(const char* at, int ownChange)
 void detour_optSave(void* self)
 {
     ++g_gtSaves;
+    /* A rule-setter that keeps the world's record holds its own values like a follower; a held field the player changed in the
+       window is its change to the world's rules: it becomes its own value too, stays in force, and goes up after the write. */
+    const bool keep = KeepsRecord();
     /* review-settings4 D1: the authority's live values are its own and the truth - never saved as a personal change and reverted */
-    if (g_gtHeld != 0 && StoreIsWorldAuthority()) GtRestore("this game is the world's authority (Options window closed)");
+    if (g_gtHeld != 0 && RulesAuthority() && !keep) GtRestore("this game is the world's authority (Options window closed)");
     if (g_gtHeld == 0)
     {
         orig_optSave(self);
-        if (StoreIsWorldAuthority()) GtAuthoritySync("Options window closed", 1);
+        /* nothing held on a rule-setter that keeps the record (it left the world, the link still up): its live values are its own,
+           not a change to the world's - only keys the record lacks go up */
+        if (RulesAuthority()) GtAuthoritySync("Options window closed", keep ? 0 : 1);
         return;
     }
     std::string moved;
@@ -822,6 +893,7 @@ void detour_optSave(void* self)
         {
             moved += std::string(" ") + kGt[i].key + " " + GtText(i, g_gtOwn[i]) + "->" + GtText(i, live);
             g_gtOwn[i] = live;
+            if (keep) g_gtWorld[i] = live;
         }
     }
     int ownFail = 0, backFail = 0;
@@ -844,15 +916,18 @@ void detour_optSave(void* self)
     ++g_gtWrapped;
     DebugLog("[SETTINGS] settings.cfg written by the Options window with this player's own gameplay values (" + GtHeldOwnList().substr(1)
              + "); the world's values re-applied after the write"
-             + (moved.empty() ? std::string() : " - the player's own change(s) kept for when they leave:" + moved + " (the world's value stays in force while connected)"));
+             + (moved.empty() ? std::string()
+                : keep ? " - the rule-setter's change(s), kept as its own and in force:" + moved + " (sent to the world record below)"
+                       : " - the player's own change(s) kept for when they leave:" + moved + " (the world's value stays in force while connected)"));
     if (ownFail || backFail) ErrorLog("[SETTINGS] settings.cfg wrapper: " + I(ownFail) + " own-value write fault(s) before the save, " + I(backFail) + " world-value write fault(s) after it");
+    if (keep) GtAuthoritySync("Options window closed", 1);
 }
 
 std::string GtLine()
 {
     std::map<std::string, std::string> rec;
     const int known = RecSnapshot(&rec);
-    std::string s = "[SETTINGS] gameplay-tab world follow: authority=" + I(StoreIsWorldAuthority() ? 1 : 0) + " following=" + I(g_gtHeld != 0 ? 1 : 0)
+    std::string s = "[SETTINGS] gameplay-tab world follow: authority=" + I(RulesAuthority() ? 1 : 0) + " following=" + I(g_gtHeld != 0 ? 1 : 0)
                     + " held:";
     int n = 0;
     for (int i = 0; i < kGtCount; ++i)
@@ -928,7 +1003,7 @@ int SlotIs(uintptr_t slot, uintptr_t want)
 /* The joiner test both halves share. 1 = lock; else `why` says whose options stand. */
 int NgJoiner(std::string* why)
 {
-    if (StoreIsWorldAuthority()) { *why = "this game is the world's authority - its own options stand"; return 0; }
+    if (RulesAuthority()) { *why = "this game is the world's authority - its own options stand"; return 0; }
     std::map<std::string, std::string> rec;
     if (!RecSnapshot(&rec)) { *why = "no world record on this link - not joined to a world"; return 0; }
     int n = 0;
@@ -1110,6 +1185,12 @@ unsigned long long detour_smNewGame(void* self, void* a2, void* a3, void* a4)
    g_hostChoices is under g_recCs (the load hook runs inside loadGame); g_hostChoicesSent is MAIN THREAD. */
 std::vector<std::pair<std::string, std::string> > g_hostChoices;
 int g_hostChoicesSent = 0;
+/* The HOST screen's rows handed over and not yet seen stored (g_hcAwait), and those an OPTIONS map from the world has since held at
+   the same value (g_hcStored, in world g_hcStoredWorld) - ui.cpp takes these as the rows that already went (SettingsHostRowsStored).
+   MAIN THREAD. */
+std::vector<std::pair<std::string, std::string> > g_hcAwait, g_hcStored;
+std::string g_hcStoredWorld;
+std::map<std::string, std::string> g_worldVals;   /* MAIN THREAD: every value of the OPTIONS map being read (stewardrules.h NoteWorldValue) - what g_hcAwait is checked against */
 volatile LONGLONG g_hcWritten = 0;
 long long g_hcSends = 0;
 
@@ -1158,12 +1239,27 @@ int HostChoicesToLive(const char* at)
 
 void HostChoicesSend(const char* at)
 {
-    if (g_hostChoicesSent || !StoreIsWorldAuthority()) return;
+    if (g_hostChoicesSent || !RulesAuthority()) return;
     std::vector<std::pair<std::string, std::string> > ch;
     if (!HostChoicesSnapshot(&ch)) return;
     std::map<std::string, std::string> rec;
     if (!RecSnapshot(&rec)) return;   /* no map on this link yet: its arrival runs this again */
-    const bool ok = StoreSendOptions(ch);
+    if (KeepsRecord())
+    {
+        /* a world that already has rules: the rows the owner changed on GAME OPTIONS for this HOST press are the owner's change, sent
+           as one - only those rows (the world server writes them into rules.txt and every game says it); the world's other rules stay.
+           Not written over the live values: the stored record comes back in the world server's OPTIONS map and is applied as on any game. */
+        const bool ok = StoreSendOptions(ch);
+        if (ok) { { RecLock l; g_hostChoices.clear(); } ++g_hcSends; }
+        std::string what;
+        for (size_t k = 0; k < ch.size(); ++k) what += " " + ch[k].first + "=" + ch[k].second;
+        DebugLog(std::string("[SETTINGS] Game options from the HOST screen while this game sets the rules: ") + (ok ? "sent " : "could NOT send (no world server link) ")
+                 + I((long long)ch.size()) + " change(s) to the world record at=" + at + ":" + what + (ok ? std::string() : std::string(" - kept; sent at the next OPTIONS arrival")));
+        return;
+    }
+    /* every row goes: at the world's first hosting as the host's settings filling its rules (not said in any game's chat); for a world
+       whose record holds no gp. / gt. row yet, as the owner's change (said like any other) */
+    const bool ok = StoreSendOptions(ch, FirstHosting());
     if (ok) { g_hostChoicesSent = 1; ++g_hcSends; }
     std::string what;
     for (size_t k = 0; k < ch.size(); ++k) what += " " + ch[k].first + "=" + ch[k].second;
@@ -1185,6 +1281,58 @@ void HostChoicesClear(const char* at)
 }
 
 } // namespace
+
+/* this game's own values are the world's rules (RulesAuthority) - for the other rule senders (kapi.cpp's race rows). MAIN THREAD. */
+bool SettingsRulesAuthority() { return RulesAuthority(); }
+bool SettingsKeepsRecord() { return KeepsRecord(); }
+bool SettingsFirstHosting() { return FirstHosting(); }
+
+void SettingsHostFirstWorld(const std::string& worldFolder)
+{
+    if (worldFolder == g_hostFirstWorld) return;
+    if (!worldFolder.empty())
+        DebugLog("[SETTINGS] this HOST press is world '" + worldFolder + "'s first hosting (no rules.txt or options.txt in its folder) - this game's own"
+                 " gameplay settings and Game options become the world's rules");
+    g_hostFirstWorld = worldFolder;
+}
+
+void SettingsHostJoinedRunning(const std::string& worldFolder)
+{
+    if (worldFolder == g_hostJoinedWorld) return;
+    if (!worldFolder.empty())
+        DebugLog("[SETTINGS] this game's HOST press joined world '" + worldFolder + "' while it runs - as the world's rule-setter there it keeps"
+                 " the world's record: its own gameplay settings and Game options are not put back or sent; a change it makes goes to the world");
+    else
+        DebugLog("[SETTINGS] a new HOST or JOIN press - this game no longer keeps world '" + g_hostJoinedWorld + "'s record as the game that joined it running");
+    g_hostJoinedWorld = worldFolder;
+}
+
+/* THE AUTHORITY MESSAGE'S EDGE (store.cpp, MSG_STORE_AUTH - declared there): nowSteward 1 = this game was just made the world's
+   steward, 0 = the duties just left it. Decided at the message itself, so an OPTIONS map or an Options-window close handled in the
+   same frame already gets the answer. startedThisServer: this game launched this world's server (the host role and its hosting
+   secret) - the owner coming back, which is the rule-setter again. If it keeps the world's record (KeepsRecord: the record reached
+   it on this link before the flag, or its HOST press joined this world running), it keeps the record's values - SettingsTick's gain edge puts none of its own
+   back and sends nothing, and its Game options for this world are dropped; only its own changes from then on go up. MAIN THREAD. */
+void SettingsStewardEdge(int nowSteward)
+{
+    if (nowSteward == 0)
+    {
+        if (g_stewardKeepsRules != 0) DebugLog("[SETTINGS] the steward duties left this game - it follows the world's rule record as any other game");
+        g_stewardKeepsRules = 0;
+        return;
+    }
+    std::map<std::string, std::string> rec;
+    const bool relay = StoreRelayLinked(), running = GameplayRunning(), haveRec = RecSnapshot(&rec) != 0;
+    unsigned char tok[32];
+    const bool started = ConfigRole() == kRoleHost && StoreHostToken(tok);
+    SecureZeroMemory(tok, sizeof tok);
+    g_stewardKeepsRules = stewardrules::KeepsWorldRules(relay, running, started) ? 1 : 0;
+    DebugLog(std::string("[SETTINGS] this game was made the world's steward (relay=") + (relay ? "1" : "0") + " running=" + (running ? "1" : "0")
+             + " record=" + (haveRec ? "1" : "0") + " ownerSecret=" + (started ? "1" : "0") + ") - "
+             + (!RulesAuthority() ? "it is not an admin now, so it keeps the duties only and follows the world's rule record; its own values are not sent"
+                                  : KeepsRecord() ? "it is an admin now: it sets the world's rules and keeps the world's record (see the gain edge)"
+                                                  : "it is an admin now: its own values are the world's rules"));
+}
 
 void SettingsTick()
 {
@@ -1211,24 +1359,49 @@ void SettingsTick()
     if (run && !s_run) g_gtLeft = 0;
     s_run = run;
     /* review-settings4 D1: the notebook's authority message can make this game the authority with no OPTIONS map - its
-       live values are its own and the truth from that moment. */
+       live values are its own and the truth from that moment. A steward that only keeps the duties (g_stewardKeepsRules) is not
+       that authority: it goes on following the record, so no edge fires for it. */
+    if (g_stewardKeepsRules != 0 && !StoreIsWorldAuthority())
+    {
+        g_stewardKeepsRules = 0;
+        DebugLog("[SETTINGS] this game is no longer the world's steward (or the link went down) - it follows the world's rule record as any other game");
+    }
     static int s_auth = 0;
-    const int auth = StoreIsWorldAuthority() ? 1 : 0;
-    if (auth && !s_auth) GtRestore("this game became the world's authority");
+    const int auth = RulesAuthority() ? 1 : 0;
+    const bool keep = KeepsRecord();
+    /* A rule-setter that keeps the record (KeepsRecord: every hosting but a world's first) keeps the world's values: nothing of its own
+       is put back or sent; the rows its HOST press carries from GAME OPTIONS go up as the owner's change (HostChoicesSend), now when
+       the record is here, else at its OPTIONS map, which also applies the record. Any other new rule-setter's live values are its own
+       from this moment. */
+    if (auth && !s_auth)
+    {
+        if (keep)
+        {
+            DebugLog("[SETTINGS] this game is now the world's rule-setter and keeps the world's current rules - its own gameplay settings are not put back or sent"
+                     "; a change it makes from now on goes to the world record");
+            HostChoicesSend("rule-setter edge");
+        }
+        else GtRestore("this game became the world's authority");
+    }
     s_auth = auth;
-    ::InterlockedExchange(&g_hcNotAuth, (relay && !auth) ? 1 : 0);   /* mp5: the load hook never writes the host's choices over another authority's world */
-    if (!relay && s_relay) { { RecLock l; g_rec.clear(); g_recKnown = 0; } DebugLog("[SETTINGS] notebook link down - the world record is forgotten until the next WELCOME's OPTIONS map"); }
+    ::InterlockedExchange(&g_hcNotAuth, (relay && (!auth || keep)) ? 1 : 0);   /* mp5: the load hook never writes the host's choices over another authority's world, nor over a record this game keeps */
+    if (!relay && s_relay) { { RecLock l; g_rec.clear(); g_recKnown = 0; } g_recRules = -1; DebugLog("[SETTINGS] notebook link down - the world record is forgotten until the next WELCOME's OPTIONS map"); }
     if (!relay && s_relay) g_hostChoicesSent = 0;   /* mp5: a new link sends the host's Game options again (the notebook may have restarted) */
     s_relay = relay;
     if (liveEdge)
     {
+        /* A rule-setter that keeps the record (the authority came before this edge) follows it here like any other game: nothing of
+           its own is restored, written or sent. */
+        const bool own = RulesAuthority() && !keep;
         /* mp5: the host's Game options over the live values first, so the world-live record below sends them as its own change */
-        if (StoreIsWorldAuthority()) { GtRestore("this game is the world's authority (world-live edge)"); HostChoicesToLive("world-live edge"); }
-        if (StoreIsWorldAuthority()) AuthoritySync("worldlive", 1);
+        if (own) { GtRestore("this game is the world's authority (world-live edge)"); HostChoicesToLive("world-live edge"); }
+        if (own) AuthoritySync("worldlive", 1);
         else ApplyRecord("this game's values at the world-live edge", 0);
-        if (StoreIsWorldAuthority()) { GtRestore("this game is the world's authority (world-live edge)"); GtAuthoritySync("worldlive", 1); }   /* settings4 S4 */
+        if (own) { GtRestore("this game is the world's authority (world-live edge)"); GtAuthoritySync("worldlive", 1); }   /* settings4 S4 */
         else GtFollow("world-live edge");
-        if (StoreIsWorldAuthority()) { HostChoicesSend("world-live edge"); if (g_hostChoicesSent) HostChoicesClear("world-live edge"); }   /* mp5 */
+        if (own) { HostChoicesSend("world-live edge"); if (g_hostChoicesSent) HostChoicesClear("world-live edge"); }   /* mp5 */
+        else if (RulesAuthority()) HostChoicesSend("world-live edge");   /* a rule-setter that keeps the record: the HOST screen's rows not sent yet */
+        if (own && FirstHosting()) { std::map<std::string, std::string> rec; if (RecSnapshot(&rec)) FirstHostingDone("world-live edge"); }   /* the record was in hand, so the sends above went */
     }
 }
 
@@ -1269,8 +1442,9 @@ void InstallSettings()
     else ErrorLog("[SETTINGS] S2: GameplayOptions::load post-hook NOT installed - the world's advanced options are applied only on OPTIONS arrival and the world-live edge");
 }
 
-void SettingsWorldOptionsBegin() { g_recPending.clear(); }
+void SettingsWorldOptionsBegin() { g_recPending.clear(); g_worldVals.clear(); }
 void SettingsWorldOption(const std::string& key, const std::string& value) { g_recPending[key] = value; }
+void SettingsWorldValue(const std::string& key, const std::string& value) { stewardrules::NoteWorldValue(&g_worldVals, key, value); }
 void SettingsWorldOptionsEnd(bool complete)
 {
     if (!complete) { DebugLog("[SETTINGS] an OPTIONS map was cut short - the world record is left as it was"); return; }
@@ -1286,17 +1460,38 @@ void SettingsWorldOptionsEnd(bool complete)
     }
     s_refusedEpisode = 0;
     { RecLock l; g_rec = g_recPending; g_recKnown = 1; }
+    if (!g_hcAwait.empty())   /* the HOST screen's rows this world's complete map now holds at those values (any key, not only gp.* / gt.*): stored, so they have gone */
+    {
+        const std::string w = StoreIndexWorld();
+        if (!w.empty())
+        {
+            if (w != g_hcStoredWorld) { g_hcStored.clear(); g_hcStoredWorld = w; }
+            const size_t before = g_hcAwait.size();
+            stewardrules::TakeStored(&g_hcAwait, g_worldVals, &g_hcStored);
+            if (g_hcAwait.size() != before) DebugLog("[SETTINGS] " + I((long long)(before - g_hcAwait.size())) + " Game options row(s) from the HOST screen are stored in world '" + w + "'");
+        }
+    }
+    g_recRules = 0;
+    for (std::map<std::string, std::string>::const_iterator it = g_recPending.begin(); it != g_recPending.end(); ++it)
+        if (stewardrules::IsRuleKey(it->first)) { g_recRules = 1; break; }
+    /* a record holding rules reaching this game while it is not the rule-setter is this game following it on this link (KeepsRecord);
+       one with no rule (a world whose rules were never set) marks nothing - its first rule-setter's own values become the world's */
+    g_followedRecordGen = stewardrules::FollowedRecordGen(g_followedRecordGen, StoreLinkGen(), RulesAuthority(), g_recRules == 1);
     DebugLog(RecordLine() + " at=OPTIONS");
     HostChoicesSend("OPTIONS arrival");   /* mp5: the host's Game options, the first time this game is the authority with the record */
     if (g_hostChoicesSent && GameplayRunning() && !EngineWritesBlocked()) HostChoicesClear("OPTIONS arrival");
     /* review-settings2 D11: ON THE AUTHORITY an arrival never writes the live values - they are the truth, and a
        change not yet sent would be silently undone. It only records keys the notebook does not hold; a changed value
-       goes up through the change path (world-live edge, advset). Every other game applies the record as before. */
-    if (StoreIsWorldAuthority()) { if (GameplayRunning() && !EngineWritesBlocked()) AuthoritySync("OPTIONS arrival", 0); }
+       goes up through the change path (world-live edge, advset). The one exception: a live value the world cannot record,
+       which is never sent, takes the world's value (AuthoritySync / GtAuthoritySync). Every other game applies the record as before, and so
+       does a rule-setter that keeps the record (its own changes go up the moment they are made). */
+    const bool own = RulesAuthority() && !KeepsRecord();
+    if (own) { if (GameplayRunning() && !EngineWritesBlocked()) AuthoritySync("OPTIONS arrival", 0); }
     else ApplyRecord("this game's values (OPTIONS arrival)", 0);
     /* settings4 S4: gt.* the same way - the authority records absent keys, every other game follows the record. */
-    if (StoreIsWorldAuthority()) { GtRestore("this game is the world's authority (OPTIONS arrival)"); if (GameplayRunning() && !EngineWritesBlocked()) GtAuthoritySync("OPTIONS arrival", 0); }
+    if (own) { GtRestore("this game is the world's authority (OPTIONS arrival)"); if (GameplayRunning() && !EngineWritesBlocked()) GtAuthoritySync("OPTIONS arrival", 0); }
     else GtFollow("OPTIONS arrival");
+    if (own && FirstHosting() && GameplayRunning() && !EngineWritesBlocked()) FirstHostingDone("OPTIONS arrival");   /* the first hosting's values went up with this record in hand */
 }
 
 std::string SettingsAdvSetCommand(const std::string& keyIn, const std::string& value)
@@ -1310,7 +1505,7 @@ std::string SettingsAdvSetCommand(const std::string& keyIn, const std::string& v
     unsigned char b[0x24];
     if (!GpReadLive(b)) return "error advset: the advanced options global is unreadable";
     const std::string was = GpLiveText(b, i);
-    if (!StoreIsWorldAuthority())
+    if (!RulesAuthority())
     {
         const bool sent = StoreSendOptions(std::vector<std::pair<std::string, std::string> >(1, std::make_pair(key, canon)));
         DebugLog("[SETTINGS] advset " + key + "=" + canon + " REFUSED on this game - it is not the world's authority, so the world's value stays in force (live " + was + ")"
@@ -1336,15 +1531,19 @@ std::string SettingsGtSetCommand(const std::string& keyIn, const std::string& va
     unsigned int live = 0;
     if (!GtRead(i, &live)) return "error gtset: the gameplay options object is unreadable";
     const std::string was = GtText(i, live);
-    if (!StoreIsWorldAuthority())
+    if (!RulesAuthority())
     {
         const bool sent = StoreSendOptions(std::vector<std::pair<std::string, std::string> >(1, std::make_pair(key, canon)));
         DebugLog("[SETTINGS] gtset " + key + "=" + canon + " REFUSED on this game - it is not the world's authority, so the world's value stays in force (live " + was + ")"
                  + (sent ? "; the offer went up so the notebook logs its own refusal" : "; no notebook link - nothing sent"));
         return "refused gtset " + std::string(kGt[i].key) + ": this game is not the world's authority (live stays " + was + ")";
     }
-    GtRestore("this game is the world's authority (gtset)");   /* review-settings4 D1: a held field would undo the lever at the next restore */
+    /* review-settings4 D1: a held field would undo the lever at the next restore. A rule-setter that keeps the record puts none of
+       its own values back: the lever's value becomes the world's value of a held field instead. */
+    const bool keep = KeepsRecord();
+    if (!keep) GtRestore("this game is the world's authority (gtset)");
     if (!GtWrite(i, v)) return "error gtset: the live value could not be written";
+    if (keep && (g_gtHeld & (1 << i))) g_gtWorld[i] = v;
     DebugLog("[SETTINGS] gtset " + key + ": " + was + "->" + canon + " on the world's authority (live now; settings.cfg not written) - recorded as an own change");
     const long long sentBefore = g_gtSent;
     GtAuthoritySync("gtset", 1);
@@ -1372,20 +1571,44 @@ int SettingsHostChoices(const std::vector<std::pair<std::string, std::string> >&
     int had = 0;
     { RecLock l; had = g_hostChoices.empty() ? 0 : 1; g_hostChoices = keep; }
     g_hostChoicesSent = 0;
+    g_hcAwait = keep;
     if (keep.empty())
     {
         if (had) DebugLog("[SETTINGS] host's Game options withdrawn - nothing chosen on that screen is waiting to go into a world");
         return 0;
     }
     DebugLog("[SETTINGS] host's Game options handed over:" + what + " - sent when this game is the world's authority with its record, and written over the live values at this game's load and world-live edge");
+    if (RulesAuthority() && KeepsRecord())
+    {
+        /* this game sets the world's rules and keeps its record: a choice made on GAME OPTIONS while it hosts the world is an admin's
+           change made in the game - it goes to the world record now (the world server writes it into rules.txt and every game says it) */
+        const bool ok = StoreSendOptions(keep);
+        if (ok) { RecLock l; g_hostChoices.clear(); }   /* not sent: held, and HostChoicesSend sends them at the next OPTIONS arrival */
+        DebugLog(std::string("[SETTINGS] Game options while this game sets the rules: ") + (ok ? "sent " : "could NOT send (no world server link) - held ") + I((long long)keep.size()) + " change(s) to the world record");
+        return ok ? 1 : 0;
+    }
     const int live = (GameplayRunning() && !EngineWritesBlocked()) ? 1 : 0;
-    if (live && StoreIsWorldAuthority()) HostChoicesToLive("Game options screen (world live)");
+    if (live && RulesAuthority() && !KeepsRecord()) HostChoicesToLive("Game options screen (world live)");   /* a rule-setter that keeps the record sends none (HostChoicesSend), so none are written either */
     HostChoicesSend("Game options screen");
     const int sent = g_hostChoicesSent;
     if (sent && live) HostChoicesClear("Game options screen (world live)");
     return sent;
 }
 
+int SettingsHostRowsStored(const std::string& worldFolder, std::vector<std::pair<std::string, std::string> >* out)
+{
+    out->clear();
+    if (worldFolder.empty() || worldFolder != g_hcStoredWorld) return 0;
+    out->swap(g_hcStored);
+    return (int)out->size();
+}
+
+std::string SettingsWorldValueOf(const std::string& worldFolder, const std::string& key)
+{
+    if (worldFolder.empty() || worldFolder != StoreIndexWorld()) return std::string();
+    std::map<std::string, std::string>::const_iterator it = g_worldVals.find(key);
+    return it != g_worldVals.end() ? it->second : std::string();
+}
 std::string SettingsLiveValue(const std::string& key)
 {
     if (key.compare(0, 3, "gp.") == 0)

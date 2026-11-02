@@ -122,13 +122,14 @@ inline std::string Lower(const std::string& s)
 
 /* Does this entry of a world folder travel with the world? rel is its path below the world folder ('/'-joined). Everything
    does except the world lock, the world's password key at the top (auth.txt: the host's game writes it anew each time it hosts, so
-   a copy would only carry the key away; access.txt, the host's list, travels), the logs, temp files, a manifest.txt at the top and
-   the recycle folder (removed records). */
+   a copy would only carry the key away; access.txt, the host's list, travels), the owner's secret at the top (host.key, keeprun.h
+   kKeyFile: it lets its holder in as the owner without the password, and the owner's game writes it anew each time it hosts), the
+   logs, temp files, a manifest.txt at the top and the recycle folder (removed records). */
 inline int ExportTakes(const std::string& rel, int isDir)
 {
     const std::string l = Lower(rel);
     if (isDir) return l == "recycle" ? 0 : 1;
-    if (l.find('/') == std::string::npos && (l == "server.lock" || l == kManifestFile || l == "auth.txt")) return 0;
+    if (l.find('/') == std::string::npos && (l == "server.lock" || l == kManifestFile || l == "auth.txt" || l == "host.key")) return 0;
     if (EndsWith(l, ".log") || EndsWith(l, ".tmp")) return 0;
     return 1;
 }

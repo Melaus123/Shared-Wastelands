@@ -72,6 +72,7 @@
 #include "joinstage.h"        /* M11a S1 (T-197 piece #10): the join stage, the join gate, PLAYERS and JOIN_STAGE */
 #include "presence.h"         /* M11 C1 (T-197, to-do M11): is another player in this world; the area tie-break with no host */
 #include "../common/poselayer.h"   /* T-307: the layer table's held state as a pose - the pick and the settle rule */
+#include "../common/aimstamp.h"   /* T-330: the owner's aim stamp, its word and the copy's raise / lower step */
 #include "arrivals.h"         /* M11 C2 (T-197, row M11): which other player has just entered the world */
 #include <ctime>
 #include "areaclaim.h"   /* B13: what the notebook remembers across a restart - the area-claim rule, the slot rule and the three file lines */
@@ -215,6 +216,7 @@
 #include "linekeep.h"   /* T-910: the bug report's keeper-lines.txt - the first and the newest lines of one kind */
 #include "logrotate.h"   /* T-417: the names of the mod log's kept copies of earlier launches */
 #include "pausemenu.h"   /* T-514: where the pause menu's rows go */
+#include "tagcfg.h"      /* T-1153: tags.cfg - the three name-tag parts the MULTIPLAYER window keeps */
 #include "addrlookup.h"  /* T-524: the internet address from the lookup websites */
 #include "bugreport.h"   /* T-461: REPORT A BUG - words, scrub, compressor, budget, zip, the nearby-log messages */
 #include "portraitdefer.h"   /* T-804: the dialogue window's portrait refresh, held off the AI thread */
@@ -462,6 +464,7 @@ void t_pp3b_old_panel_cfg_and_prefill();
 void t_pp3b_store_root_default();
 void t_pp3_player_cfg_round_trip();
 void t_pp3_cfg_datadir_key();
+void t_cfg_hosttoken_key();
 void t_pp3_test_keys_layered();
 void t_cfg_roots_absent_is_unchanged();
 void t_cfg_roots_parse_refuse_and_round_trip();
@@ -575,6 +578,7 @@ void t_limbs_state_block_round_trips_and_malformed_reads_absent();
 void t_limbs_plan_limb_per_owner_and_copy_state();
 void t_limbs_quality_refit_robot_class_and_limbtest_args();
 void t_statstest_args_and_levels();
+void t_squadtest_args();
 void t_par6b_medical_update_death_call_by_return_address();
 void t_bed1_pick_piece_key_exact_near_tiebreak_and_refusals();
 void t_bed1_pick_refuses_a_lone_piece_a_floor_away();
@@ -1037,10 +1041,14 @@ void t_t693_rebind_after_address_change();
 void t_t693_table_overflow();
 void t_t693_reason_by_gone_memory();
 void t_t693_dead_name_never_rebinds();
+void t_t693_rebind_pile_by_height();
 void t_t693_bare_key_reaches_named();
 void t_t693_address_swap();
 void t_t693_orphan_expiry();
 void t_t693_name_for_check();
+void t_t1129_stale_name_after_catchup();
+void t_t1129_drop_pick_pile();
+void t_t1129_rebind_then_forget();
 void t_t693_kept_id_match();
 void t_t693_nearest_pair_first();
 void t_t693_more_than_16_twins();
@@ -1346,6 +1354,7 @@ void t_t651_earlier_log_order();
 void t_t461_nearby_messages();
 void t_t461_answer_manners();
 void t_t53_upnp_text_and_start();
+void t_t1158_router_owner();
 void t_t53_routerport_cfg_key();
 void t_t53_upnp_find_and_existing();
 void t_t510_internet_address();
@@ -1416,6 +1425,8 @@ void t_pausemenu_closed_up_in_multiplayer();
 void t_pausemenu_order_and_reopen_never_move_twice();
 void t_pausemenu_refuses_rows_out_of_order();
 void t_pausemenu_hosting_row();
+void t_pausemenu_multiplayer_row();
+void t_tagcfg_read_write();
 void t_addrlookup_sites_and_answers();
 void t_netaddr_presses_and_answers();
 void t_t556_fallen_round_trip();
@@ -1718,6 +1729,7 @@ void t_t798_owed_files();
 void t_t1090_reopen_decide();
 void t_t804_portrait_hold();
 void t809_lever_window_pick();
+void t1170_spawncontainer_word();
 void t809_editorstate();
 void t_t831_window_guard();
 void t_t761_twin_sleep();
@@ -1834,6 +1846,10 @@ void t_t985c1f3_refuse_named();
 void t_t985_area_file_round_trip();
 void t_t985_area_file_refused();
 void t_t985_area_file_missing();
+void t_t1175_area_file_save_list();
+void t_t1175_area_list_union();
+void t_t1175_save_list_kept();
+void t_t1175_load_start_list();
 void t_t922_template_sid_sender();
 void t_t922_template_lookup_order();
 void t_t926f2_camera_road_words();
@@ -1895,6 +1911,7 @@ void t_t942_thing_sites();
 void t_t942_item_notice();
 void t_t943_npc_sites();
 void t_t943_npc_stub();
+void t_t943_npc_call();
 void t_t943_npc_list();
 
 }   /* namespace suite */

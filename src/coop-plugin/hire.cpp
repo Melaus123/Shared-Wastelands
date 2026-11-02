@@ -24,10 +24,14 @@
 #include "playerfaction.h"  // IsPlayerFaction, IsPeerFaction, LocalPlayerFaction, StandInForSlot
 #include "replicate.h"      // UnpuppetForOwnership, AdoptRemotePuppet, IsDownedCharacter
 #include "worldstate.h"     // WorldStateOnOwnershipReleased
+#include "../common/squadtest.h"   /* squadtest: the lever's argument shape */
 #include "speech.h"         // SayOnCopy (the refusal line)
 #include "handoff.h"        // SquadActivePlatoonOf - reads a character's squad without making one
 #include "coop_log.h"
 #include "../common/peergone.h"   // PlayerGoneTakesRow: a player who leaves takes only its own rows
+#include "../common/recruitguard.h"   // another player's character is never recruited (every road to recruit 0x693010)
+#include "chat.h"           // ChatNoticeLine - the refused player's grey line
+#include "team.h"           // TeamPlayerName - the owning player's name for that line
 #include "game/Character.h"
 #include "game/Faction.h"
 #include "game/hand.h"
@@ -80,6 +84,9 @@ typedef void (*EndDialogueFn)(void* dlg, char a2);   /* 0x673DA0 (Read decomp_67
 
 DoActionsFn g_doActionsOrig = 0;
 int g_doActionsHook = 0;   // 1 armed, -1 AddHook failed, -2 no table address
+RecruitFn g_recruitOrig = 0;
+int g_recruitHook = 0;     // the 0x693010 detour (recruitguard.h): 1 armed, -1 AddHook failed, -2 no table address
+int g_ownRecruitDepth = 0;   // MAIN THREAD: above 0 while RecruitPod runs - this file's roads, which tell the other games themselves
 
 struct Pending { unsigned int reqId; unsigned int hirerUid; int price; int joinType; std::string faction; int ownerSlot; };   // ownerSlot: the player the REQ went to (the person's owner then; -1 unknown)
 struct Reserved { unsigned int reqId; unsigned int hirerUid; unsigned int peer; int slot; };   // slot: the player the promise is made to (the asker; -1 unknown)
@@ -91,9 +98,10 @@ std::vector<Inbound>             g_inbound;    // MAIN THREAD: arrival order, dr
 unsigned int g_nextReqId = 1;
 
 // the lever (MAIN THREAD: armed by the verb, drained at the safe point)
-int g_testArmed = 0; int g_testMode = 0; unsigned int g_testUid = 0; int g_testPrice = kDefaultPrice;   /* mode 1 near, 2 uid, 3 near same */
+int g_testArmed = 0; int g_testMode = 0; unsigned int g_testUid = 0; int g_testPrice = kDefaultPrice;   /* mode 1 near, 2 uid, 3 near same, 4 nearestpeer */
 int g_testJoinType = 18;   /* the hire's join type: 18 no editor; 3 (hiretest editor ...) recruit with the editor, as the dialogue's act 3 */
 float g_testX = kSameX, g_testZ = kSameZ;
+float g_testRadius = kNearMax;   /* mode 4 (nearestpeer): the search radius around the hirer */
 
 long long g_reqOut = 0, g_reqIn = 0, g_okOut = 0, g_okIn = 0, g_noIn = 0, g_doneOut = 0, g_doneIn = 0, g_taken = 0;
 long long g_noOut[coophire::kNoReasonMax + 1] = { 0 };
@@ -102,8 +110,22 @@ long long g_cancelledLinkDown = 0, g_otherActs = 0, g_bad = 0, g_sendFailed = 0,
 long long g_localHires = 0, g_localRefused = 0, g_testRuns = 0, g_testNoPerson = 0, g_testNoHirer = 0, g_noPeerFaction = 0;
 long long g_linesSeen = 0, g_linesPlayer = 0, g_linesLogged = 0, g_linesUnread = 0, g_setFactionFault = 0;
 volatile LONGLONG g_linesOffMain = 0;   // any thread (the detour runs wherever the engine calls it)
+long long g_ownedHeld = 0, g_ownedOwnerNo = 0, g_ownedTake = 0, g_ownedLocal = 0, g_ownedNoticed = 0;   // recruitguard.h refusals: hire line, owner NO, hirer re-check, lever / talk; lines shown
+volatile LONGLONG g_ownedEngine = 0;   // the 0x693010 detour refused (any thread)
+/* the engine's own recruits (detour_recruit, recruitguard.h EngineRecruitDecide): verdicts by kind, DONEs sent / not sent, queued
+   people gone by the safe point, and the full queue reported so far (MAIN THREAD); queued, not queued (queue full) and refused off
+   the main thread (any thread) */
+long long g_engVerdict[recruitguard::kEngineRecruitMax + 1] = { 0 };
+long long g_engSent = 0, g_engSendFailed = 0, g_engGone = 0, g_engFullLogged = 0;
+volatile LONGLONG g_engQueued = 0, g_engQueueFull = 0, g_engOffMainRefused = 0;
 long long g_linesHeld = 0, g_linesOwn = 0, g_linesNoUid = 0, g_linesNoHirer = 0, g_linesNoAddr = 0, g_endFault = 0;
 std::map<int, long long> g_otherActTypes;   // held lines: action type -> count (not run)
+
+// squadtest (TEST-ONLY): the one armed request, drained at the K2 safe point (MAIN THREAD). ownerUid 0 = `first`.
+struct SquadTest { int armed; unsigned int ownerUid; int n; std::string templateSid; };
+SquadTest g_squadTest = { 0, 0, 0, std::string() };
+const float kSquadRing = 15.0f;               // the new members stand on a ring this far round their leader
+const char* const kSquadMadeIn = "Drifters";  // the faction a new member is made in before this game's player hires it
 
 std::string N(long long v) { std::ostringstream o; o << v; return o.str(); }
 bool Plaus(const void* p) { return p != 0 && (uintptr_t)p > 0x10000 && (uintptr_t)p < 0x00007FFFFFFFFFFFull; }
@@ -159,10 +181,20 @@ int TakeMoneyPod(void* own, int amount)   // 1 paid, 0 refused (short), -1 fault
     __try { TakeMoneyFn fn = (TakeMoneyFn)(*(void***)own)[0]; return fn(own, amount) ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
-int RecruitPod(void* pi, ::Character* c, bool edit)   // 1 joined, 0 refused (squad full / limit), -1 fault
+int RecruitCallPod(void* pi, ::Character* c, bool edit)   // 1 joined, 0 refused (squad full / limit), -1 fault
 {
     __try { RecruitFn fn = (RecruitFn)(Base() + (uintptr_t)kRecruitRva); return fn(pi, c, edit) != 0 ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* This file's own recruit roads - the own hire (LocalHire: a DONE when joined), TakeAndHire (its DONE), HireRecruitNoEdit (the
+   brought-back character is announced by its SPAWN right after, resurrect.cpp) - each tells the other games itself, so the 0x693010
+   detour sends nothing while the depth is above 0. The depth is kept outside the __try: a fault still brings it back. MAIN THREAD. */
+int RecruitPod(void* pi, ::Character* c, bool edit)   // 1 joined, 0 refused (squad full / limit), -1 fault
+{
+    ++g_ownRecruitDepth;
+    const int rc = RecruitCallPod(pi, c, edit);
+    --g_ownRecruitDepth;
+    return rc;
 }
 void* PlayerInterfacePod()
 {
@@ -207,6 +239,35 @@ int ReadLinePod(void* dlg, void* line, int* types, int* values, int cap, int* to
 // ---- helpers ----
 std::string FactionName(::Faction* f) { return Plaus(f) ? f->getName() : std::string(); }
 bool Alive(::Character* c) { return Plaus(c) && !IsDownedCharacter(c); }
+/* a faction's name for the log: another player's faction is named by that player, so only printable ASCII, at most 64 bytes */
+std::string FacLog(::Faction* f)
+{
+    const std::string n = FactionName(f);
+    std::string o;
+    for (size_t i = 0; i < n.size() && o.size() < 64; ++i) { const unsigned char c = (unsigned char)n[i]; o += (c >= 0x20 && c <= 0x7E && c != '\'') ? (char)c : '?'; }
+    return o;
+}
+
+// recruitguard.h: the person as this game sees it - kRecruitRefuseOwned when it is in a player's faction that is not this game's own
+// player's (another player's stand-in, or a recorded stand-in). An NPC, or a faction pointer that cannot be read, is allowed. ANY THREAD.
+int OwnedVerdict(::Character* c)
+{
+    ::Faction* f = Plaus(c) ? FactionOfPod(c) : 0;
+    if (!Plaus(f)) return recruitguard::kRecruitAllow;
+    return recruitguard::LocalRecruitDecide(AnyPlayersFaction(f) ? 1 : 0, IsPlayerFaction(f) ? 1 : 0);
+}
+// The refused player's grey chat line, naming the player the person belongs to when this game knows it. MAIN THREAD.
+void NoticeOwned(::Character* c)
+{
+    ::Faction* f = Plaus(c) ? FactionOfPod(c) : 0;
+    int slot = Plaus(f) ? StandInSlotOf(f) : -1;
+    if (slot < 0 && Plaus(f)) { const int r = StandInRecordSlot(f); slot = r >= 0 ? r : -1; }
+    const std::string name = TeamPlayerName(slot);
+    std::string fac = Plaus(f) ? StandInDisplayName(f) : std::string();
+    if (fac.empty() && Plaus(f) && !IsPlayerFaction(f) && AnyPlayersFaction(f)) fac = FactionName(f);
+    ChatNoticeLine(slot, name, recruitguard::OwnedLine(name, fac));
+    ++g_ownedNoticed;
+}
 
 bool Send(const coophire::HireMsg& m, unsigned int toPeer)
 {
@@ -258,6 +319,13 @@ void ForgetEmptiedCopySquad(void* oldActive)
 // Hire on the game that runs the person (design step 2, and the lever's positive control). MAIN THREAD, K2.
 void LocalHire(unsigned int uid, ::Character* person, ::Character* hirer, unsigned int hirerUid, int price, int joinType)
 {
+    if (OwnedVerdict(person) != recruitguard::kRecruitAllow)
+    {
+        ++g_ownedLocal;
+        DebugLog("[HIRE] own hire uid=" + N(uid) + " refused: another player's character (fac='" + FacLog(FactionOfPod(person)) + "')");
+        NoticeOwned(person);
+        return;
+    }
     std::map<unsigned int, Reserved>::iterator r = g_reserved.find(uid);
     if (r != g_reserved.end())
     {
@@ -285,6 +353,13 @@ void LocalHire(unsigned int uid, ::Character* person, ::Character* hirer, unsign
 void Hold(unsigned int uid, ::Character* person, unsigned int hirerUid, int price, int joinType)
 {
     if (g_pending.find(uid) != g_pending.end()) { DebugLog("[HIRE] hold uid=" + N(uid) + " already pending - not asked twice"); return; }
+    if (OwnedVerdict(person) != recruitguard::kRecruitAllow)   /* recruitguard.h: never asked for another player's character */
+    {
+        ++g_ownedLocal;
+        DebugLog("[HIRE] hold uid=" + N(uid) + " refused: another player's character (fac='" + FacLog(FactionOfPod(person)) + "') - not asked");
+        NoticeOwned(person);
+        return;
+    }
     Pending p; p.reqId = g_nextReqId++; p.hirerUid = hirerUid; p.price = price; p.joinType = joinType; p.faction = FactionName(FactionOfPod(person));
     p.ownerSlot = net::OwnerSlotOf(uid);
     coophire::HireMsg m; m.kind = coophire::kHireReq; m.reqId = p.reqId; m.uid = uid; m.hirerUid = hirerUid; m.price = price; m.joinType = joinType;
@@ -307,10 +382,12 @@ void OwnerCheck(const coophire::HireMsg& m, unsigned int peer)
     else if (g_reserved.find(m.uid) != g_reserved.end()) reason = coophire::kNoReserved;
     else
     {
-        // The hirer's game already ran the game's own dialogue, which offered the hire; the owner adds no rules of its own and
-        // refuses only a person whose faction, cage state or slave state it cannot read.
+        // The hirer's game already ran the game's own dialogue, which offered the hire; the owner refuses a person whose faction,
+        // cage state or slave state it cannot read - and (recruitguard.h) a person in ANY player's faction: its own player's recruit
+        // (the hire dialogue still runs on the other games' copies) or a stand-in's. A player's recruit is never hired away.
         ::Faction* f = FactionOfPod(c);
         if (!Plaus(f)) reason = coophire::kNoFaction;
+        else if (recruitguard::OwnerHireReason(AnyPlayersFaction(f) ? 1 : 0) != coophire::kNoNone) { reason = coophire::kNoFaction; ++g_ownedOwnerNo; }
         else if (InSomethingPod(c) < 0) reason = coophire::kNoCaged;
         else if (SlaveStateOfCharacter(c) < 0) reason = coophire::kNoSlave;
     }
@@ -356,6 +433,16 @@ void TakeAndHire(const coophire::HireMsg& m, unsigned int peer)   // peer: the g
         SendDone(peer, m.reqId, m.uid, p.hirerUid, 0, 0);
         return;
     }
+    // recruitguard.h: re-checked before the take - the person joined another player between REQ and OK (its copy is in that
+    // player's stand-in here): nothing is taken, DONE {taken 0} clears the owner's promise.
+    if (OwnedVerdict(person) != recruitguard::kRecruitAllow)
+    {
+        ++g_ownedTake;
+        DebugLog("[HIRE] take uid=" + N(m.uid) + " abandoned: another player's character (fac='" + FacLog(FactionOfPod(person)) + "') - DONE taken=0");
+        SendDone(peer, m.reqId, m.uid, p.hirerUid, 0, 0);
+        NoticeOwned(person);   /* the grey line only: another player's character is not given a spoken line by this game */
+        return;
+    }
     void* own = OwnershipsPod(FactionOfPod(hirer)); int money = 0;
     void* pi = PlayerInterfacePod();
     if (own == 0 || !MoneyPod(own, &money) || money < p.price || pi == 0)
@@ -399,7 +486,16 @@ void Refused(const coophire::HireMsg& m)
     const bool mine = it != g_pending.end() && it->second.reqId == m.reqId;
     if (mine) g_pending.erase(it);
     DebugLog("[HIRE] refused uid=" + N(m.uid) + " reason=" + N(m.reason) + " req=" + N(m.reqId) + (mine ? "" : " (nothing pending)"));
-    if (mine) SayRefusal(m.uid);
+    bool owned = false;
+    if (mine && m.reason == coophire::kNoFaction)   /* recruitguard.h: the owner's word for a player's character - or for a faction it cannot read */
+    {
+        /* "belongs to <who>" only when this game's own copy shows the person in another player's faction; otherwise the neutral
+           line (the owner sends the same reason when it cannot read the person's faction) */
+        ::Character* c = FindSpawned(m.uid);
+        if (Plaus(c) && OwnedVerdict(c) != recruitguard::kRecruitAllow) { NoticeOwned(c); owned = true; }
+        else { ChatNoticeLine(-1, std::string(), recruitguard::NotHireableLine()); ++g_ownedNoticed; }
+    }
+    if (mine && !owned) SayRefusal(m.uid);   /* another player's character is not given a spoken line by this game */
 }
 
 // Owner (and a copy's game for an own-game hire), design step 7.
@@ -451,6 +547,108 @@ void Finish(const coophire::HireMsg& m, unsigned int peer)
              + "," + q + "joined" + q + ":" + N(m.joined) + "," + q + "released" + q + ":" + N(released) + "," + q + "factionSet" + q + ":" + N(factionSet) + "}");
 }
 
+// squadtest (TEST-ONLY), MAIN THREAD at the K2 safe point. Each member is made near the leader in the Drifters faction and hired
+// by this game's player through the engine's PlayerInterface::recruit (the hire a bar recruit takes); if the engine put it in
+// another of the player's squads it is moved into the leader's through the engine's setFaction. Linked to a world server with a
+// leader that has a uid: the member is made under a uid owned here and announced to the other games as it stands (the adoption
+// sweep's announcement). No link (single player) or no leader uid: made with no uid and announced to nobody.
+// A named (unique) template is one person (n 1): a loaded body of it is the named character himself and is hired as he is; with
+// none loaded and the engine's 'already made' slot empty a body is made and the slot written as the engine's own character maker
+// writes it (so this world never makes a second one); with the slot held and no body loaded here he lives elsewhere in this
+// world and nothing is made. One [SQUAD] line per member.
+void RunSquadTest(const SquadTest& t)
+{
+    const std::string leaderWord = t.ownerUid != 0 ? N(t.ownerUid) : std::string("first");
+    const std::string head = "[SQUAD] squadtest add leader=" + leaderWord + " n=" + N(t.n) + " template=" + t.templateSid;
+    ::Character* leader = t.ownerUid != 0 ? FindSpawned(t.ownerUid) : SpawnFirstPlayerCharacter();
+    const unsigned int leaderUid = t.ownerUid != 0 ? t.ownerUid : (Plaus(leader) ? FindSpawnedUid(leader) : 0);
+    void* pi = PlayerInterfacePod();
+    std::string name;
+    void* gd = SpawnCharacterRecord(t.templateSid, &name);
+    const int unique = gd != 0 ? WsTemplateIsUnique(gd) : -1;
+    const char* why = 0;
+    if (t.ownerUid != 0 && !net::IsUidMine(t.ownerUid)) why = "not this game's own character";
+    else if (!Plaus(leader)) why = t.ownerUid != 0 ? "no character for that uid" : "no living character in this game's player faction";
+    else if (!IsPlayerFaction(FactionOfPod(leader))) why = "the character is not in this game's player faction";
+    else if (kRecruitRva == 0 || pi == 0) why = "recruit / PlayerInterface not in the address table";
+    else if (gd == 0) why = "the sid names no CHARACTER record";
+    else if (unique < 0) why = "the template's unique flag is unreadable";
+    else if (unique == 1 && t.n != 1) why = "a named (unique) character is one person - n must be 1";
+    if (why != 0) { DebugLog(head + " refused: " + why); return; }
+    const bool linked = coop::StoreWelcomedThisLink() != 0 && coop::StoreMySlot() >= 0 && leaderUid != 0 && net::IsUidMine(leaderUid);
+    std::string leaderName;
+    if (!NameOf(leader, &leaderName)) leaderName = "?";
+    DebugLog(head + " '" + name + "' unique=" + N(unique) + " leaderName='" + leaderName + "' leaderUid=" + N(leaderUid)
+             + (linked ? " linked=1 (made under a uid owned here, then announced)" : " linked=0 (made with no uid, announced to nobody)"));
+    ::Faction* fac = FactionOfPod(leader);
+    void* squad = PlatoonOfPod(leader);
+    int joinedN = 0, sentN = 0;
+    for (int i = 0; i < t.n; ++i)
+    {
+        const std::string tag = "[SQUAD] member " + N(i + 1) + "/" + N(t.n) + " '" + name + "' template=" + t.templateSid + " unique=" + N(unique);
+        const int madeBefore = unique == 1 ? WsUniqueSlotPod(gd) : 0;
+        unsigned int uid = 0; ::Character* c = 0;
+        bool original = false;
+        if (unique == 1)
+        {
+            int dead = -1;
+            ::Character* orig = (::Character*)WsLoadedBodyOf(gd, &dead);
+            if (Plaus(orig))
+            {
+                const unsigned int ou = FindSpawnedUid(orig);
+                const char* no = 0;
+                if (dead != 0) no = "is dead or unreadable";
+                else if (IsPlayerFaction(FactionOfPod(orig))) no = "is already in this game's player faction";
+                else if (ou != 0 && !net::IsUidMine(ou)) no = "is run by another game";
+                if (no != 0)
+                {
+                    DebugLog(tag + " alreadyMade=" + N(madeBefore) + " - the loaded named character " + no + "; nothing made");
+                    continue;
+                }
+                c = orig; uid = ou; original = true;
+            }
+            else if (madeBefore != 0)
+            {
+                DebugLog(tag + " alreadyMade=" + N(madeBefore) + " - this world already made him and no body of him is loaded here;"
+                         " no second one is made");
+                continue;
+            }
+        }
+        if (c == 0)
+        {
+            const float ang = 6.2831853f * (float)i / (float)t.n;
+            const float dx = kSquadRing * cosf(ang), dz = kSquadRing * sinf(ang);
+            if (linked)
+            {
+                if (!SpawnOwnLocalNear(name, t.templateSid, leaderUid, dx, dz, kSquadMadeIn, &uid, &c) || !Plaus(c)) c = 0;
+            }
+            else c = SpawnPlainNear(t.templateSid, name, leader, dx, dz, kSquadMadeIn);
+            if (!Plaus(c))
+            {
+                DebugLog(tag + " alreadyMade=" + N(madeBefore) + " not made (the [M1] line says why)");
+                continue;
+            }
+        }
+        const int mark = unique == 1 ? WsUniqueMarkMade(gd) : 0;
+        const int rec = RecruitPod(pi, c, false);
+        int moved = 0;
+        if (rec == 1 && Plaus(squad) && PlatoonOfPod(c) != squad) moved = SetFactionPod(c, fac, squad) == 1 ? 1 : -1;
+        const bool joined = rec == 1 && FactionOfPod(c) == fac && PlatoonOfPod(c) == squad;
+        const bool sent = linked && !original && uid != 0 && SpawnAnnounceOwn(uid);
+        if (joined) ++joinedN;
+        if (sent) ++sentN;
+        const int madeAfter = unique == 1 ? WsUniqueSlotPod(gd) : 0;
+        std::string shown;
+        if (!NameOf(c, &shown)) shown = "?";
+        DebugLog(tag + " name='" + shown + "' uid=" + (uid != 0 ? N(uid) : std::string("none")) + " body=" + (original ? "original" : "new")
+                 + " leader=" + leaderWord + " recruit=" + N(rec) + " moved=" + N(moved) + " joined=" + N(joined ? 1 : 0)
+                 + " spawnSent=" + N(sent ? 1 : 0) + " faction='" + FactionName(FactionOfPod(c)) + "' inLeaderSquad="
+                 + N(PlatoonOfPod(c) == squad ? 1 : 0) + " squadCount=" + N(PlatoonCountPod(PlatoonOfPod(c)))
+                 + " alreadyMade=" + N(madeBefore) + "->" + N(madeAfter) + " markWrite=" + N(mark));
+    }
+    DebugLog(head + " done: joined=" + N(joinedN) + " spawnSent=" + N(sentN) + " (of " + N(t.n) + ")");
+}
+
 void RunTestLever()
 {
     ++g_testRuns;
@@ -463,6 +661,27 @@ void RunTestLever()
     {
         uid = g_testUid; person = FindSpawned(uid);
         if (!Plaus(person)) person = 0;
+    }
+    else if (g_testMode == 4)
+    {
+        /* T-1022 nearestpeer (TEST-ONLY): the nearest living character of ANOTHER player to the hirer - OwnedVerdict, the test every
+           hire road refuses by - then the ordinary road below (Hold for a copy, LocalHire for a person this game runs) */
+        Ogre::Vector3 hp;
+        if (!SafeReadPosition(hirer, &hp)) { ++g_testNoPerson; DebugLog("[HIRE] hiretest skipped: the hirer's position is unreadable"); return; }
+        float best = g_testRadius;
+        const int cap = MirrorCapacity();
+        for (int i = 0; i < cap; ++i)
+        {
+            unsigned int u = 0; ::Character* c = 0; Ogre::Vector3 q;
+            if (!MirrorSlot(i, &u, &c) || u == 0 || !Plaus(c) || c == hirer) continue;
+            if (OwnedVerdict(c) == recruitguard::kRecruitAllow) continue;
+            if (!Alive(c) || !SafeReadPosition(c, &q)) continue;
+            const float dx = q.x - hp.x, dz = q.z - hp.z, d = sqrtf(dx * dx + dz * dz);
+            if (d < best || (d == best && person != 0 && u < uid)) { best = d; uid = u; person = c; }
+        }
+        if (person == 0) { ++g_testNoPerson; DebugLog("[HIRE] hiretest error nearestpeer: none within " + N((long long)g_testRadius) + " u of the hirer"); return; }
+        DebugLog("[HIRE] hiretest nearestpeer pick uid=" + N(uid) + " faction=otherPlayer fac='" + FacLog(FactionOfPod(person)) + "' mine=" + N(net::IsUidMine(uid) ? 1 : 0)
+                 + " dist=" + N((long long)best) + " radius=" + N((long long)g_testRadius));
     }
     else
     {
@@ -505,7 +724,8 @@ void RunTestLever()
 // refuses (Read 67fad0:1225-1229) - and Hold() starts the same REQ the lever starts, at the price the line's action 8
 // carries (the engine hands that value to Ownerships::takeMoney, Confirmed bytes 0x682865). OK -> TakeAndHire, exactly
 // the lever's take + recruit + pay. A person this game runs, a line with no 3/18, an NPC target, a person with no uid:
-// the engine runs the line unchanged. Returns true when the line was held (the original must NOT run). MAIN THREAD.
+// the engine runs the line unchanged - except for another player's character (recruitguard.h), whose hire line is never run
+// (below). Returns true when the line was held (the original must NOT run). MAIN THREAD.
 bool HoldLine(void* dlg, void* line)
 {
     int types[16], values[16], total = 0; ::Character* person = 0; ::Character* target = 0;
@@ -528,6 +748,18 @@ bool HoldLine(void* dlg, void* line)
     const unsigned int uid = Plaus(person) ? FindSpawnedUid(person) : 0;
     const unsigned int hirerUid = FindSpawnedUid(target);
     const bool mine = uid != 0 && net::IsUidMine(uid);
+    /* recruitguard.h: a hire reply on ANOTHER PLAYER'S character (its copy here is in that player's stand-in) is not run - none of
+       its actions (the price included) - and the chat is closed: the hire dialogue the copy still carries never takes a player's
+       recruit. Without endDialogue in the table the line runs and the 0x693010 detour refuses the recruit itself. */
+    if (kEndDialogueRva != 0 && Plaus(person) && OwnedVerdict(person) != recruitguard::kRecruitAllow)
+    {
+        ++g_ownedHeld;
+        DebugLog("[HIRE] line person=" + N(uid) + " mine=" + N(mine ? 1 : 0) + " target=" + N(hirerUid) + " acts=[" + acts + "] REFUSED - another player's character (fac='"
+                 + FacLog(FactionOfPod(person)) + "'); not run, chat closed by endDialogue");
+        if (EndDialoguePod(dlg) != 1) { ++g_endFault; ErrorLog("[HIRE] endDialogue 0x673DA0 faulted on a refused hire of another player's character uid=" + N(uid)); }
+        NoticeOwned(person);   /* the grey line only: another player's character is not given a spoken line by this game */
+        return true;
+    }
     /* review-recruit2 3: the OWNER's own dialogue hire of a person RESERVED for the other game's pending request is
        refused (the lever's own-hire path already checks this) - otherwise both games hire the same person. */
     if (mine && kEndDialogueRva != 0 && g_reserved.find(uid) != g_reserved.end())
@@ -583,6 +815,134 @@ void detour_doActions(void* dlg, void* line, void* a3, void* a4)
     if (s6Target != 0) TalkS6LeaderOrder(dlg, s6Target);   /* P26s6 S6-3: the walk-over the engine gives a player target */
 }
 
+// ---- the engine's own recruit of a person this game runs: the other games move their copies ----
+// A dialogue hire of a person this game runs (HoldLine lets it run unchanged), a freed prisoner, any other engine road: the other
+// games learned the person's faction when it was announced and still show the old one. The one road for a faction change between
+// games is the hire handshake's DONE {taken 0, joined 1} to every game - what the own hire sends after its recruit; Finish there
+// moves the copy into this game's stand-in faction.
+
+/* The hirer for that DONE: an own-uid character of this game's player faction in the squad the engine just put the person in, 0
+   when none (Finish on the other game then uses the sender's stand-in and a new squad). MAIN THREAD. */
+unsigned int SquadHirerUid(::Character* person, unsigned int personUid)
+{
+    void* const squad = Plaus(person) ? coop::SquadActivePlatoonOf(person) : 0;
+    if (squad == 0) return 0;
+    const int cap = MirrorCapacity();
+    for (int i = 0; i < cap; ++i)
+    {
+        unsigned int u = 0; ::Character* c = 0;
+        if (!MirrorSlot(i, &u, &c) || u == 0 || u == personUid || c == person || !net::IsUidMine(u) || !Plaus(c)) continue;
+        if (!IsPlayerFaction(FactionOfPod(c))) continue;
+        if (coop::SquadActivePlatoonOf(c) == squad) return u;
+    }
+    return 0;
+}
+
+/* The verdict on one engine recruit (recruitguard.h EngineRecruitDecide) and its DONE when it is sent. uid 0: not a character this
+   game replicates - its faction is not read (a queued pointer may be stale). MAIN THREAD. */
+void EngineRecruitSettle(::Character* c, unsigned int uid, int wasInMine, int depth, int recruited, bool queued)
+{
+    const int nowInMine = (uid != 0 && Plaus(c) && IsPlayerFaction(FactionOfPod(c))) ? 1 : 0;
+    const int uidMine = (uid != 0 && net::IsUidMine(uid)) ? 1 : 0;
+    const int v = recruitguard::EngineRecruitDecide(recruited, depth, uid, uidMine, wasInMine, nowInMine);
+    ++g_engVerdict[v];
+    if (v == recruitguard::kEngineRecruitOwnRoad || v == recruitguard::kEngineRecruitRefused) return;   /* counted only */
+    const std::string fac = (uid != 0 && Plaus(c)) ? FacLog(FactionOfPod(c)) : std::string("?");
+    const std::string where = queued ? std::string(" (recruited off the main thread, settled at the safe point)") : std::string();
+    if (v != recruitguard::kEngineRecruitSend)
+    {
+        DebugLog("[HIRE] engine recruit uid=" + N(uid) + " hirer=0 fac='" + fac + "' - hire done NOT sent: " + recruitguard::EngineRecruitWhy(v) + where);
+        return;
+    }
+    const unsigned int hirerUid = SquadHirerUid(c, uid);
+    const long long before = g_doneOut;
+    SendDone(net::kHireNoAsker, 0, uid, hirerUid, 0, 1);   // to every game: each moves its copy into this game's stand-in (Finish)
+    const bool sent = g_doneOut != before;
+    if (sent) ++g_engSent; else ++g_engSendFailed;
+    DebugLog("[HIRE] engine recruit uid=" + N(uid) + " hirer=" + N(hirerUid) + " fac='" + fac + "' - "
+             + (sent ? std::string("hire done sent to the other games") : std::string("hire done NOT sent: no road to the other games (send failed)")) + where);
+}
+
+/* The hand-over for a recruit the engine ran off the main thread (a dialogue line can run there): the person's pointer, its uid
+   then, and whether it was in this game's player faction before the call. Filled on ANY THREAD, emptied by HireSafePointDrain on
+   the MAIN THREAD, both under g_engQLock. A full queue is counted and reported at the safe point. */
+struct EngRecruit { ::Character* c; unsigned int uid; int wasInMine; };
+const int kEngQCap = 32;
+EngRecruit g_engQ[kEngQCap];
+volatile LONG g_engQN = 0;
+SRWLOCK g_engQLock = SRWLOCK_INIT;
+
+void EngineRecruitQueue(::Character* c, int wasInMine)   // ANY THREAD: POD only, nothing allocated
+{
+    const unsigned int uid = Plaus(c) ? FindSpawnedUid(c) : 0u;   /* address compares only (spawn.h): safe on any thread */
+    bool full = false;
+    ::AcquireSRWLockExclusive(&g_engQLock);
+    if (g_engQN < kEngQCap) { g_engQ[g_engQN].c = c; g_engQ[g_engQN].uid = uid; g_engQ[g_engQN].wasInMine = wasInMine; ++g_engQN; }
+    else full = true;
+    ::ReleaseSRWLockExclusive(&g_engQLock);
+    if (full) ::InterlockedIncrement64(&g_engQueueFull); else ::InterlockedIncrement64(&g_engQueued);
+}
+
+void EngineRecruitDrain()   // MAIN THREAD, at the safe point
+{
+    EngRecruit batch[kEngQCap];
+    int n = 0;
+    ::AcquireSRWLockExclusive(&g_engQLock);
+    n = (int)g_engQN;
+    for (int i = 0; i < n; ++i) batch[i] = g_engQ[i];
+    g_engQN = 0;
+    ::ReleaseSRWLockExclusive(&g_engQLock);
+    for (int i = 0; i < n; ++i)
+    {
+        const EngRecruit& q = batch[i];
+        /* the pointer is read only while the spawn table still maps it to the same uid: a person gone since is not read */
+        if (q.uid != 0 && FindSpawnedUid(q.c) != q.uid)
+        {
+            ++g_engGone;
+            DebugLog("[HIRE] engine recruit uid=" + N(q.uid) + " hirer=0 fac='?' - hire done NOT sent: the person is no longer in this game's character table (recruited off the main thread)");
+            continue;
+        }
+        EngineRecruitSettle(q.c, q.uid, q.wasInMine, 0, 1, true);
+    }
+    const long long full = (long long)g_engQueueFull;
+    if (full != g_engFullLogged)
+    {
+        ErrorLog("[HIRE] engine recruit: " + N(full - g_engFullLogged) + " recruit(s) off the main thread were not queued (queue full, " + N(kEngQCap)
+                 + ") - hire done NOT sent; the other games keep the old faction on those copies");
+        g_engFullLogged = full;
+    }
+}
+
+// ---- the 0x693010 detour (recruitguard.h): the engine's own recruit refuses another player's character ----
+// Every road ends here - a dialogue line's act 3 / 18 that ran unheld, this file's own RecruitPod (the lever, TakeAndHire,
+// HireRecruitNoEdit), any other engine caller. A refusal answers 0, the engine's own "not recruited" answer (squad full / limit).
+// The roads above refuse earlier, so this one fires only for a road they do not see. An NPC, or this game's own character, goes to
+// the engine unchanged. ANY THREAD (the log line and the chat line only on the main thread). After the engine's call, a recruit
+// that did not come through RecruitPod is settled by EngineRecruitSettle - at once on the main thread, else through the queue.
+char detour_recruit(void* pi, ::Character* c, bool edit)
+{
+    if (Plaus(c) && OwnedVerdict(c) != recruitguard::kRecruitAllow)
+    {
+        ::InterlockedIncrement64(&g_ownedEngine);
+        const unsigned long mt = StoreMainThreadId();
+        if (mt != 0 && ::GetCurrentThreadId() == mt)
+        {
+            DebugLog("[HIRE] recruit 0x693010 REFUSED: another player's character uid=" + N(FindSpawnedUid(c)) + " fac='" + FacLog(FactionOfPod(c)) + "'");
+            NoticeOwned(c);
+        }
+        return 0;
+    }
+    /* read before the call: a person already in this game's player faction changes no faction the other games show */
+    const int wasInMine = (Plaus(c) && IsPlayerFaction(FactionOfPod(c))) ? 1 : 0;
+    const char rc = g_recruitOrig(pi, c, edit);
+    const unsigned long mt = StoreMainThreadId();
+    if (mt != 0 && ::GetCurrentThreadId() == mt) EngineRecruitSettle(c, Plaus(c) ? FindSpawnedUid(c) : 0u, wasInMine, g_ownRecruitDepth, rc != 0 ? 1 : 0, false);
+    else if (g_ownRecruitDepth > 0) ++g_engVerdict[recruitguard::kEngineRecruitOwnRoad];   /* the main thread before its id is known: one of this file's roads, which tells the other games itself */
+    else if (rc != 0) EngineRecruitQueue(c, wasInMine);   /* RecruitPod runs on the main thread only: off it, every recruit is the engine's own */
+    else ::InterlockedIncrement64(&g_engOffMainRefused);
+    return rc;
+}
+
 } // namespace
 
 int HireDoActionsHookState() { return g_doActionsHook; }   /* P26s1 fold 1 M3 (declared in speech.h, namespace coop) */
@@ -594,6 +954,18 @@ int HireCallDoActions(void* dlg, void* line)
 {
     if (g_doActionsHook != 1 || g_doActionsOrig == 0) return 0;
     __try { g_doActionsOrig(dlg, line, 0, 0); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+/* talkprompt joinact (speech.cpp TkLeverDrain, MAIN THREAD, the K2 safe point): the engine's own Dialogue::_doActions through its
+   ENTRY, so this file's detour (and with it HoldLine and the recruit detour) runs exactly as for a clicked reply's line - the call
+   replyClicked(string) 0x683170 makes (Read decomp_683170:29). a3 / a4 go as 0, as HireCallDoActions. 1 ran, 0 the hook or its
+   address is missing, -1 the engine faulted (caught). */
+int HireCallDoActionsEntry(void* dlg, void* line)
+{
+    if (g_doActionsHook != 1 || kDoActionsRva == 0) return 0;
+    const DoActionsFn fn = (DoActionsFn)(Base() + (uintptr_t)kDoActionsRva);
+    __try { fn(dlg, line, 0, 0); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
@@ -609,6 +981,7 @@ int HireForTalk(unsigned int npcUid, unsigned int hirerUid, int price, int joinT
     if (hirerUid == 0 || !net::IsUidMine(hirerUid)) { *why = "the addressed character is not this game's"; return 0; }
     if (kEndDialogueRva == 0 || kRecruitRva == 0 || kPlayerIfaceRva == 0) { *why = "endDialogue / recruit / PlayerInterface not in the address table"; return 0; }
     if (g_pending.find(npcUid) != g_pending.end()) { *why = "a hire of that NPC is already pending"; return 0; }
+    if (OwnedVerdict(person) != recruitguard::kRecruitAllow) { ++g_ownedLocal; NoticeOwned(person); *why = "another player's character (recruitguard.h)"; return 0; }
     DebugLog("[HIRE] talk hire uid=" + N(npcUid) + " hirer=" + N(hirerUid) + " price=" + N(price) + " type=" + N(joinType)
              + " - the other game's NPC joins this game's squad through the owner's REQ (P26 stage 5)");
     Hold(npcUid, person, hirerUid, price, joinType);
@@ -620,9 +993,11 @@ void InstallHire()
 {
     if (kDoActionsRva == 0) g_doActionsHook = -2;
     else g_doActionsHook = (coop::AddHook((void*)(Base() + (uintptr_t)kDoActionsRva), (void*)&detour_doActions, (void**)&g_doActionsOrig) == coop::SUCCESS) ? 1 : -1;
+    if (kRecruitRva == 0) g_recruitHook = -2;
+    else g_recruitHook = (coop::AddHook((void*)(Base() + (uintptr_t)kRecruitRva), (void*)&detour_recruit, (void**)&g_recruitOrig) == coop::SUCCESS) ? 1 : -1;
     const std::string line = "[HIRE] hooks: Dialogue::_doActions 0x67FAD0=" + N(g_doActionsHook) + " (R0-b hold; 1 armed, -1 AddHook failed, -2 no table address)"
-        + " recruit 0x693010=" + N(kRecruitRva != 0 ? 1 : 0) + " PlayerInterface=" + N(kPlayerIfaceRva != 0 ? 1 : 0) + " endDialogue 0x673DA0=" + N(kEndDialogueRva != 0 ? 1 : 0);
-    if (g_doActionsHook == 1 && kRecruitRva != 0 && kPlayerIfaceRva != 0 && kEndDialogueRva != 0) DebugLog(line); else ErrorLog(line);
+        + " recruit 0x693010=" + N(kRecruitRva != 0 ? 1 : 0) + " recruitGuard=" + N(g_recruitHook) + " PlayerInterface=" + N(kPlayerIfaceRva != 0 ? 1 : 0) + " endDialogue 0x673DA0=" + N(kEndDialogueRva != 0 ? 1 : 0);
+    if (g_doActionsHook == 1 && g_recruitHook == 1 && kRecruitRva != 0 && kPlayerIfaceRva != 0 && kEndDialogueRva != 0) DebugLog(line); else ErrorLog(line);
 }
 
 void HireNoteRecv(const coophire::HireMsg& m, unsigned int fromPeer)
@@ -880,7 +1255,9 @@ void HireSafePointDrain()
 {
     EditorStateTick();
     EditorBodyStep();   /* every frame, before the held-while-loading return below: it checks the world itself */
-    if ((g_testArmed == 0 && g_inbound.empty()) || EngineWritesBlocked()) return;   // held while loading: runs every frame
+    if (g_squadTest.armed != 0 && !EngineWritesBlocked()) { const SquadTest t = g_squadTest; g_squadTest.armed = 0; RunSquadTest(t); }
+    if ((g_testArmed == 0 && g_inbound.empty() && g_engQN == 0) || EngineWritesBlocked()) return;   // held while loading: runs every frame
+    if (g_engQN != 0) EngineRecruitDrain();   /* the engine's recruits off the main thread: their DONE goes out here */
     if (g_testArmed != 0 && (kRecruitRva == 0 || kPlayerIfaceRva == 0)) { g_testArmed = 0; ++g_testNoHirer; DebugLog("[HIRE] hiretest skipped: recruit / PlayerInterface not in the address table"); }
     if (g_testArmed != 0) { g_testArmed = 0; RunTestLever(); }
     std::vector<Inbound> batch;
@@ -931,11 +1308,28 @@ std::string HireTestArm(const std::string& arg)
        reply makes - instead of join type 18 */
     const bool editor = mode == "editor";
     if (editor) { mode.clear(); is >> mode; }
-    const std::string usage = "error hiretest: usage hiretest [editor] near [price] | [editor] near same [<x> <z> [price]] | [editor] uid <n> [price]";
+    const std::string usage = "error hiretest: usage hiretest [editor] near [price] | [editor] near same [<x> <z> [price]] | [editor] uid <n> [price] | [editor] nearestpeer [<radius>]";
     std::vector<std::string> t; std::string w;
     while (is >> w) t.push_back(w);
     unsigned int uid = 0; int price = kDefaultPrice; bool same = false; float sx = kSameX, sz = kSameZ;
     size_t ip = 0;   /* index of the optional price token */
+    if (mode == "nearestpeer")
+    {
+        /* T-1022 nearestpeer [<radius>] - TEST-ONLY: the nearest living character of ANOTHER player to my first player character
+           (OwnedVerdict, the test every hire road refuses by), then the ordinary hire road (RunTestLever: Hold, or LocalHire) */
+        float r = kNearMax;
+        if (t.size() > 1) return usage;
+        if (t.size() == 1)
+        {
+            char* e = 0; const double v = strtod(t[0].c_str(), &e);
+            if (e == t[0].c_str() || *e != 0 || !(v >= 1.0) || v > 20000.0) return "error hiretest: nearestpeer radius 1..20000";
+            r = (float)v;
+        }
+        g_testMode = 4; g_testUid = 0; g_testPrice = price; g_testRadius = r; g_testJoinType = editor ? 3 : 18; g_testArmed = 1;
+        DebugLog("[HIRE] hiretest " + std::string(editor ? "editor " : "") + "nearestpeer radius=" + N((long long)r) + " price=" + N(price)
+                 + " join=" + N(g_testJoinType) + " ARMED - runs at the next safe point");
+        return "ok hiretest armed";
+    }
     if (mode == "uid") { if (t.empty() || (uid = (unsigned int)strtoul(t[0].c_str(), 0, 10)) == 0) return usage; ip = 1; }
     else if (mode != "near") return usage;
     else if (!t.empty() && t[0] == "same")
@@ -956,6 +1350,30 @@ std::string HireTestArm(const std::string& arg)
     DebugLog("[HIRE] hiretest " + std::string(editor ? "editor " : "") + mode + (uid ? " " + N(uid) : std::string()) + (same ? " same point=(" + N((long long)sx) + "," + N((long long)sz) + ")" : std::string())
              + " price=" + N(price) + " join=" + N(g_testJoinType) + " ARMED - runs at the next safe point");
     return "ok hiretest armed";
+}
+
+std::string SquadTestArm(const std::string& arg)
+{
+    unsigned int uid = 0; int n = 0; std::string sid;
+    if (!swsquad::SquadTestParse(arg, &uid, &n, &sid))
+    {
+        DebugLog("[cmd] usage: squadtest add <ownUid|first> <n 1.." + N(swsquad::kSquadAddMax) + "> [templateSid]");
+        return "error squadtest usage";
+    }
+    const std::string leaderWord = uid != 0 ? N(uid) : std::string("first");
+    if (uid != 0 && !net::IsUidMine(uid))
+    {
+        DebugLog("[SQUAD] squadtest add leader=" + leaderWord + " refused: not this game's own character");
+        return "error squadtest: not this game's own character";
+    }
+    if (g_squadTest.armed != 0)
+    {
+        DebugLog("[SQUAD] squadtest add leader=" + leaderWord + " refused: one request is already waiting for the safe point");
+        return "error squadtest: one request is already waiting";
+    }
+    g_squadTest.armed = 1; g_squadTest.ownerUid = uid; g_squadTest.n = n; g_squadTest.templateSid = sid;
+    DebugLog("[SQUAD] squadtest add leader=" + leaderWord + " n=" + N(n) + " template=" + sid + " ARMED - runs at the next safe point");
+    return "ok squadtest armed";
 }
 
 void OwnSquadUids(std::vector<unsigned int>* out)
@@ -984,7 +1402,8 @@ void ReportHire()
     for (int r = 1; r <= coophire::kNoReasonMax; ++r) no += (r > 1 ? "/" : "") + N(g_noOut[r]);
     DebugLog("[HIRE] REPORT reqOut=" + N(g_reqOut) + " reqIn=" + N(g_reqIn) + " okOut=" + N(g_okOut) + " okIn=" + N(g_okIn)
              + " noOut=" + no + " noIn=" + N(g_noIn) + " doneOut=" + N(g_doneOut) + " doneIn=" + N(g_doneIn) + " taken=" + N(g_taken)
-             + " recruitRefused=" + N(g_recruitRefused) + " purseShort=" + N(g_purseShort) + " released=" + N(g_released)
+             + " recruitRefused=" + N(g_recruitRefused) + " owned[held,ownerNo,take,local,engine,noticed]=" + N(g_ownedHeld) + "," + N(g_ownedOwnerNo) + ","
+             + N(g_ownedTake) + "," + N(g_ownedLocal) + "," + N((long long)g_ownedEngine) + "," + N(g_ownedNoticed) + " purseShort=" + N(g_purseShort) + " released=" + N(g_released)
              + " factionSet=" + N(g_factionSet) + " joinedApplied=" + N(g_joinedApplied) + " lateOk=" + N(g_lateOk)
              + " cancelledLinkDown=" + N(g_cancelledLinkDown) + " otherActs=" + N(g_otherActs) + " otherActTypes=[" + OtherActTypes() + "]"
              + " pendingNow=" + N((long long)g_pending.size()) + " reservedNow=" + N((long long)g_reserved.size())
@@ -996,7 +1415,13 @@ void ReportHire()
              + " linesNoAddr=" + N(g_linesNoAddr) + " endFault=" + N(g_endFault)
              + " | editorBody[frames,calls,rebuilt,gaveUp,fault]=" + N(g_bsSteps) + "," + N(g_bsCalls) + "," + N(g_bsRebuilt) + ","
              + N(g_bsGiveUps) + "," + N(g_bsFaults)
-             + " linesOffMain=" + N((long long)g_linesOffMain) + " linesUnread=" + N(g_linesUnread) + " hook=" + N(g_doActionsHook));
+             + " linesOffMain=" + N((long long)g_linesOffMain) + " linesUnread=" + N(g_linesUnread) + " hook=" + N(g_doActionsHook)
+             + " | engineRecruit[sent,sendFailed,queued,queueFull,gone,offMainRefused]=" + N(g_engSent) + "," + N(g_engSendFailed) + ","
+             + N((long long)g_engQueued) + "," + N((long long)g_engQueueFull) + "," + N(g_engGone) + "," + N((long long)g_engOffMainRefused)
+             + " engineRecruitSkip[ownRoad,refused,noUid,notJoined,wasPlayers,notMine]=" + N(g_engVerdict[recruitguard::kEngineRecruitOwnRoad]) + ","
+             + N(g_engVerdict[recruitguard::kEngineRecruitRefused]) + "," + N(g_engVerdict[recruitguard::kEngineRecruitNoUid]) + ","
+             + N(g_engVerdict[recruitguard::kEngineRecruitNotJoined]) + "," + N(g_engVerdict[recruitguard::kEngineRecruitWasPlayers]) + ","
+             + N(g_engVerdict[recruitguard::kEngineRecruitNotMine]));
 }
 
 // T-556 (resurrect.cpp), MAIN THREAD: PlayerInterface::recruit(c, edit = false). 1 joined, 0 refused, -1 fault, -2 no table
@@ -1212,6 +1637,22 @@ std::string SsRun(int n)
     return "ok splitsquad " + body;
 }
 } // namespace
+
+/* TEST-ONLY (`spawncontainer new`, spawn.cpp SpawnTemplate): a fresh empty squad of faction f at pos, made by the engine's
+   Faction::spawnEmptySquad as splitsquad makes one (no template, permanent). *activeOut = its ActivePlatoon (0 when none),
+   *sid = its id ("?" when unread). 1 made, 0 not (*why says why). MAIN THREAD. */
+int SpawnEmptySquadFor(::Faction* f, const Ogre::Vector3& pos, void** activeOut, std::string* sid, std::string* why)
+{
+    *activeOut = 0; *sid = "?"; *why = "";
+    if (kSsSpawnEmptySquadRva == 0) { *why = "Faction_spawnEmptySquad is not in the address table"; return 0; }
+    if (!Plaus(f)) { *why = "no faction"; return 0; }
+    void* ap = 0;
+    void* platoon = SsSpawnEmptySquadPod((void*)f, &pos, &ap);
+    if (!Plaus(platoon) || !Plaus(ap)) { *why = "Faction::spawnEmptySquad made no squad (platoon " + N((long long)(uintptr_t)platoon) + ")"; return 0; }
+    if (kSsPlatoonSidRva != 0) *sid = SsSid(platoon);
+    *activeOut = ap;
+    return 1;
+}
 
 void CommandStatusLate(const std::string& text);   /* command_channel.cpp (ui.h): the status file, written after the verb returned */
 

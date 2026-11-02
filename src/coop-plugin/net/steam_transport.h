@@ -76,6 +76,10 @@ public:
        the link, or RefuseHeld. Until then the link has no transport (Link() 0, Send false) and the joiner's Steam connection is
        still connecting; a held arrival the joiner gives up on is closed here and reported as SL_ENDED (wasUp 0). */
     virtual void SetHoldArrivals(bool on) = 0;
+    /* T-1118 (b) stage 2 (off by default). On: the links accepted from now on carry a world server's traffic toward Steam joiners (the
+       host's bridge) - live messages before record pieces under a budget, barriers kept, and CHUNK pieces (src/common/livefirst.h)
+       handed up and sent on as they came, never joined or cut (the joiner and the world server join them). */
+    virtual void SetBridgeLinks(bool on) = 0;
     /* Accepts a held arrival: true = it is now a link like any accepted one. false = no such held arrival, or Steam would not
        accept it (then it is closed with steamlisten::kEndListenerNoRoom and its place is free). */
     virtual bool AcceptHeld(unsigned int link) = 0;

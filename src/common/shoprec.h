@@ -41,7 +41,9 @@
 
 namespace shoprec {
 
-const unsigned int kProtocol = 125;            /* the world-server protocol that carries shop records */
+const unsigned int kProtocol = 133;            /* the world-server protocol that carries shop records */
+
+
 
 
 const unsigned int kSrMarker = 0x31504853u;    /* 'S','H','P','1' little-endian */

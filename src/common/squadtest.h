@@ -1,12 +1,16 @@
-// statstest: the argument shape of a TEST-ONLY lever and the stat levels it writes. Pure; offline tests in
+// squadtest / statstest: the argument shapes of two TEST-ONLY levers and the stat levels statstest writes. Pure; offline tests in
 // src/coop-test/test_main.cpp.
 //
+//   squadtest add <ownUid|first> <n> [templateSid]   (hire.cpp SquadTestArm)
 //   statstest squad <level> | statstest show <uid>   (stats.cpp StatsTestLever)
 //
 // statstest squad: every character of this game's own squad gets its 39 skills and attributes plus attack and defence (the
 // first kStatsLevelCount values of the 44-value stats block, src/common/statswire.h) set to level (1..kStatsLevelMax);
 // warrior spirit, xp and the free attribute points are left as they are. statstest show: a read of any character's main
 // combat values here.
+// squadtest: n (1..kSquadAddMax) characters made from the CHARACTER record templateSid (default kSquadDefaultTemplate, the
+// Drifter) are hired by this game's own player into the squad of its character ownUid - or, with `first`, of its first living
+// player-faction character (a single-player game gives out no uids).
 #pragma once
 
 #include "statswire.h"
@@ -16,6 +20,9 @@
 
 namespace swsquad {
 
+const int kSquadAddMax = 8;
+const size_t kSquadTemplateMax = 63;
+const char* const kSquadDefaultTemplate = "2205-gamedata.base";   // the CHARACTER record 'Drifter' (gamedata.base)
 const int kStatsLevelCount = 41;    // block indices 0..38 (skills and attributes), 39 attack, 40 defence
 const int kStatsLevelMax = 100;
 
@@ -43,6 +50,27 @@ inline int SquadIntText(const std::string& t, int lo, int hi)
         v = v * 10 + (t[i] - '0');
     }
     return (v < lo || v > hi) ? -1 : v;
+}
+
+// `add <ownUid|first> <n> [templateSid]`. True with the outputs filled - *uid 0 stands for `first`; false leaves them untouched.
+inline bool SquadTestParse(const std::string& args, unsigned int* uid, int* n, std::string* templateSid)
+{
+    std::istringstream is(args);
+    std::string what, uidText, nText, sid, extra;
+    if (!(is >> what) || what != "add" || !(is >> uidText) || !(is >> nText)) return false;
+    const bool first = uidText == "first";
+    const unsigned int u = first ? 0u : SquadUidText(uidText);
+    const int k = SquadIntText(nText, 1, kSquadAddMax);
+    if ((!first && u == 0) || k < 0) return false;
+    if (is >> sid)
+    {
+        if (sid.size() > kSquadTemplateMax || (is >> extra)) return false;
+    }
+    else sid = kSquadDefaultTemplate;
+    if (uid != 0) *uid = u;
+    if (n != 0) *n = k;
+    if (templateSid != 0) *templateSid = sid;
+    return true;
 }
 
 enum { kStatsTestBad = 0, kStatsTestSquad = 1, kStatsTestShow = 2 };

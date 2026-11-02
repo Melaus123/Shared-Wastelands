@@ -51,9 +51,21 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         /* T-510: HOSTING's INTERNET ADDRESS row - SHOW / HIDE (one button) and its own COPY */
         { "hostaddrshow",  kDriveButton, "SWNetAddrShowBtn",      0 },
         { "hosting",       kDriveButton, "SWHostingPauseButton",  0 },   /* T-524: HOSTING on the host's pause menu */
+        /* T-1154: MULTIPLAYER on the pause menu (a multiplayer world) and its window: the three tick boxes, their three labels (a
+           click on the words ticks the box), DONE - ui.cpp kMultiplayerButtonName, kMpTickName, kMpLabelName, kMpDoneName */
+        { "pausemultiplayer",  kDriveButton, "SWMultiplayerPauseButton",       0 },
+        { "tagplayer",         kDriveButton, "SWMultiplayerTagPlayer",         0 },
+        { "tagcharacter",      kDriveButton, "SWMultiplayerTagCharacter",      0 },
+        { "tagfaction",        kDriveButton, "SWMultiplayerTagFaction",        0 },
+        { "tagplayerlabel",    kDriveButton, "SWMultiplayerTagPlayerLabel",    0 },
+        { "tagcharacterlabel", kDriveButton, "SWMultiplayerTagCharacterLabel", 0 },
+        { "tagfactionlabel",   kDriveButton, "SWMultiplayerTagFactionLabel",   0 },
+        { "tagsdone",          kDriveButton, "SWMultiplayerDone",              0 },
         { "hostaddrcopy",  kDriveButton, "SWNetAddrCopyBtn",      0 },
         { "hostvpncopy",   kDriveButton, "SWVpnAddrCopyBtn",      0 },   /* T-631: the RADMIN / HAMACHI ADDRESS row's COPY */
         { "hostpwshow",    kDriveButton, "SWHostPwShowBtn",       0 },   /* T-290: HOST GAME's PASSWORD row SHOW / HIDE (one button) */
+        { "startinc",      kDriveButton, "SWStartIncBtn",         0 },   /* T-1096: the profile window's START WITH row, next choice */
+        { "startdec",      kDriveButton, "SWStartDecBtn",         0 },   /* T-1096: the profile window's START WITH row, previous choice */
         /* JOIN GAME's friends list REFRESH; HOSTING's INVITE FRIENDS; INVITE FRIENDS' INVITE and its BACK (the panel's one BACK) */
         { "refresh",       kDriveButton, "SWFriendRefreshBtn",    0 },
         { "invitefriends", kDriveButton, "SWInviteOpenBtn",       0 },
@@ -67,7 +79,11 @@ inline const UiDriveName* UiDriveTable(size_t* count)
         { "resetcancel",   kDriveButton, "CoopDlgCancelBtn",      0, "CANCEL" },
         { "resetok",       kDriveButton, "CoopDlgOkBtn",          0, "RESET WORLD" },
         { "resetkeep",     kDriveButton, "SWResetKeepTick",       0 },
-        { "options",       kDriveButton, "CoopGameOptionsBtn",    0 },
+        /* HOST GAME's "Keep this world running for others" tick box, and the STOP WORLD? dialog's STOP WORLD - pressed only while it
+           reads that, so a world that is no longer running (DELETE WORLD? in its place) is never deleted by it */
+        { "keeprun",       kDriveButton, "SWKeepRunTick",         0 },
+        { "stopok",        kDriveButton, "CoopDlgOkBtn",          0, "STOP WORLD" },
+        { "options",      kDriveButton, "CoopGameOptionsBtn",    0 },
         { "optdefaults",   kDriveButton, "CoopOptDefaultsBtn",    0 },
         { "optdone",       kDriveButton, "CoopOptDoneBtn",        0 },
         { "dlgok",         kDriveButton, "CoopDlgOkBtn",          0 },            /* the dialog's confirm, whatever it reads */
@@ -245,7 +261,7 @@ inline int CmdIsObservationVerb(const std::string& verb)
 {
     static const char* const k[] = { "report", "netstat", "roster", "relation", "snapshot", "boxlist", "boxdigest", "researchlist",
         "settingsdump", "captlist", "buildlist", "nearlist", "shoplist", "townlist", "recruitlist", "tasks", "health", "look",
-        "handle", "factions", "templates" };
+        "handle", "factions", "templates", "townnear" };   /* T-795 step 4: townnear reads the town list and the player's position */
     for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); ++i) if (verb == k[i]) return 1;
     return 0;
 }

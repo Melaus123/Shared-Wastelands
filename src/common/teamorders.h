@@ -12,6 +12,7 @@
 //     at one call site on every branch but the cage's (the character's inSomething +0x2F8 == 2).
 // What the plugin does (policy.cpp): isEnemy answers no for a teammate's character, the sneaking test answers no at the right-click's
 // one call site for a teammate's character, and the list built for a teammate's character keeps only the orders below.
+// T-1022: the list built for another player's character outside the team loses Talk only (TalkOffered, FilterForOtherPlayer below).
 // PURE: no engine, no plugin types.
 #pragma once
 #include <cstdio>
@@ -48,7 +49,7 @@ inline int FilterForTeammate(int* tasks, int n, bool inCage, int* removed, int* 
     {
         int t = tasks[r];
         if (t == kKidnap && !carry) { t = kCarry; carry = true; if (replaced != 0) ++*replaced; }
-        if (!OwnOffered(t, inCage)) { if (removed != 0) ++*removed; continue; }
+        if (t == kTalk || !OwnOffered(t, inCage)) { if (removed != 0) ++*removed; continue; }   /* Talk: TalkOffered */
         tasks[w++] = t;
     }
     return w;
@@ -61,6 +62,32 @@ inline int FilterForTeammate(int* tasks, int n, bool inCage, int* removed, int* 
 inline bool MenuFiltered(bool ordersMark, unsigned long long sub, bool forTarget, bool forOccupant)
 {
     return ordersMark || (sub != 0 ? forOccupant : forTarget);
+}
+// T-1022 (owner 1246 a, 2026-10-31): Talk (PLAYER_TALK_TO 12) is not offered on ANOTHER player's character outside this player's team
+// (a copy in a player's stand-in faction, as the conversation start's speaker test reads it - speech.cpp TkPlayerSpeaker, an old save's
+// stand-in record included), in a cage or not: that start refuses every conversation whose speaker is another player's character, so
+// the order would only open a refused start (freeing a caged one is its own order, RELEASE_PRISONER 110, which stays). A teammate's
+// character loses Talk too, caged or not (the same start refuses it: a teammate's character is another player's); a character of no
+// player keeps Talk.
+inline bool TalkOffered(bool otherPlayer, bool teammate, bool inCage)
+{
+    (void)inCage;
+    return !otherPlayer && !teammate;
+}
+// The list built for a non-team other player's character, in place: every Talk entry goes, every other order stays in its order (the
+// engine's own list: attack, knock-out, kidnap, loot, first aid, follow, bodyguard, release, shackles). Returns the new count; *removed
+// (may be 0) gets how many Talk entries went. A list that cannot be read (n < 0) is left as it is.
+inline int FilterForOtherPlayer(int* tasks, int n, int* removed)
+{
+    if (removed != 0) *removed = 0;
+    if (tasks == 0 || n <= 0) return n < 0 ? n : 0;
+    int w = 0;
+    for (int r = 0; r < n; ++r)
+    {
+        if (tasks[r] == kTalk && !TalkOffered(true, false, false)) { if (removed != 0) ++*removed; continue; }
+        tasks[w++] = tasks[r];
+    }
+    return w;
 }
 // A faction is a teammate's when one of the cells holds it (the cells: this game's teammates' factions, 0 = empty).
 inline bool TeammateFaction(const void* f, void* const volatile* cells, int n)

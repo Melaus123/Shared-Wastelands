@@ -2630,6 +2630,36 @@ void t_pp3_cfg_datadir_key()
     if (coopcfg::CfgFormat(w).find("datadir") != std::string::npos) Fail("CfgFormat wrote datadir=");
 }
 
+/* hosttoken= (TEST ONLY): exactly 64 lowercase hex digits fill CfgFields::hostToken; anything else is a bad line whose note never
+   holds the value, and the field stays empty */
+void t_cfg_hosttoken_key()
+{
+    const std::string good = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    {
+        coopcfg::CfgFields f; std::vector<coopcfg::CfgNote> notes; long long unknown = 0, bad = 0;
+        coopcfg::CfgParseText("role=host\nhosttoken=" + good + "\n", &f, &notes, 0, &unknown, &bad);
+        if (f.hostToken != good) Fail("a 64-hex hosttoken= was not read");
+        if (unknown != 0 || bad != 0 || !notes.empty()) Fail("a good hosttoken= counted as unknown or bad, or left a note");
+    }
+    std::string upper = good; upper[63] = 'F';
+    std::string nonHex = good; nonHex[10] = 'g';
+    const std::string badVals[] = { good.substr(0, 63), upper, nonHex, good + "0", std::string() };
+    for (size_t i = 0; i < sizeof(badVals) / sizeof(badVals[0]); ++i)
+    {
+        coopcfg::CfgFields f; std::vector<coopcfg::CfgNote> notes; long long unknown = 0, bad = 0;
+        coopcfg::CfgParseText("hosttoken=" + badVals[i] + "\n", &f, &notes, 0, &unknown, &bad);
+        if (!f.hostToken.empty()) Fail("a bad hosttoken= (case " + I((int)i) + ") filled the field");
+        if (bad != 1 || unknown != 0) Fail("a bad hosttoken= (case " + I((int)i) + ") is not one bad line");
+        if (notes.size() != 1 || notes[0].bad != 1 || notes[0].text != "hosttoken= is not 64 hexadecimal digits - ignored")
+            Fail("a bad hosttoken= (case " + I((int)i) + ") has not its note");
+        if (!badVals[i].empty() && !notes.empty() && notes[0].text.find(badVals[i].substr(0, 16)) != std::string::npos)
+            Fail("a bad hosttoken='s note holds the value");
+    }
+    /* the panel's writer never carries the TEST key */
+    coopcfg::CfgFields w; w.role = coopcfg::kCfgHost; w.hostPort = 7777; w.hostToken = good;
+    if (coopcfg::CfgFormat(w).find("hosttoken") != std::string::npos) Fail("CfgFormat wrote hosttoken=");
+}
+
 void t_pp3_test_keys_layered()
 {
     const std::string session = "role=client\r\nhost=10.0.0.5:7777\r\nworld=far west\r\nslot=s2\r\n";
@@ -7318,6 +7348,26 @@ void t_limbs_quality_refit_robot_class_and_limbtest_args()
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); ++k)
         if (cooplimb::LimbTestParse(bad[k], &uid, &limb, &sid) != cooplimb::kLimbTestBad)
             Fail(std::string("limbtest must refuse '") + bad[k] + "'");
+}
+
+/* squadtest: swsquad::SquadTestParse - add <ownUid|first> <n 1..8> [templateSid]; `first` hands back uid 0. */
+void t_squadtest_args()
+{
+    unsigned int uid = 7; int n = 7; std::string sid = "x";
+    if (!swsquad::SquadTestParse("add 4194305 5", &uid, &n, &sid) || uid != 4194305u || n != 5 || sid != "2205-gamedata.base")
+        Fail("squadtest add: the Drifter record when no template is named");
+    if (!swsquad::SquadTestParse(" add 1 8 1234-gamedata.base ", &uid, &n, &sid) || uid != 1 || n != 8 || sid != "1234-gamedata.base")
+        Fail("squadtest add with a template sid");
+    if (!swsquad::SquadTestParse("add 4294967295 1", &uid, &n, &sid) || uid != 4294967295u || n != 1) Fail("squadtest: the largest uid");
+    if (!swsquad::SquadTestParse("add first 1 57390-rebirth.mod", &uid, &n, &sid) || uid != 0 || n != 1 || sid != "57390-rebirth.mod")
+        Fail("squadtest add first: the player's first character and a named template");
+    uid = 9; n = 9; sid = "keep";
+    const char* bad[] = { "", "add", "add 1", "add 0 1", "add 1 0", "add 1 9", "add x 1", "add First 1", "add 4294967296 1",
+                          "remove 1 1", "add 1 1 a b", "add -1 1", "add 1 -1", "add first 0", "add first",
+                          "add 1 1 0123456789012345678901234567890123456789012345678901234567890123" };
+    for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); ++k)
+        if (swsquad::SquadTestParse(bad[k], &uid, &n, &sid)) Fail(std::string("squadtest must refuse '") + bad[k] + "'");
+    if (uid != 9 || n != 9 || sid != "keep") Fail("squadtest: a refused shape leaves the outputs untouched");
 }
 
 /* statstest: swsquad::StatsTestParse (squad <level 1..100> | show <uid>) and StatsLevelApply - block values 0..40 (skills, attributes,

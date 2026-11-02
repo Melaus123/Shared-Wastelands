@@ -132,6 +132,8 @@ const int kGsGuardOwn = 2;      /* this game's own unconfirmed or pending drop, 
                                    never taken over or removed (a name it already carries still keeps it) */
 const int kGsGuardRecent = 4;   /* fold 1 (M6): added to (fold 2: or changed on) this ground within the last ~10 s (a record from around a
                                    holder change can be older than it): never removed, its quantity never set (it may still be kept or taken over) */
+const int kGsGuardSpot = 8;     /* T-1129: an item a shop spot holds here - the area file is its source: never removed, its quantity never
+                                   set (it may still be kept or taken over, so a record row of it builds nothing beside it) */
 struct GsLocal
 {
     std::string name;   /* the name the item carries here, "" = none */
@@ -224,6 +226,32 @@ inline void GsApplyPlan(const std::vector<GsRow>& rows, const std::vector<GsLoca
         p.remove.push_back(i);
     }
     if (out) *out = p;
+}
+
+/* ---- T-1129: a shop spot's item has ONE source, the area file the holder writes ----
+   The engine's spot load-from-save (0x5562A0) restores the item from that file and links it both ways: item+0x188 = the spot, and the
+   spot's held hand (five id words from +0x148, type 0xB = none) names the item. The spot update releases a picked-up item without
+   clearing item+0x188, so a set +0x188 alone does not mean held. SpotHeldJudge is the verdict from those reads: 1 held, 0 not held
+   (no spot, a stale +0x188 - the spot's hand is none or names another item), -1 a read faulted (callers handle it as 0, counted).
+   SpotRowDecide is what the ground road does with an item at each site: a held item is never sent by the holder's catch-up answer
+   (ADD, world-loot ADD or pairing), never listed by the asker, never a row of the ground record, and never removed by a record
+   apply (it may still be kept or taken over by a row); a GONE still matches it, so a live pick-up on the holder removes the other
+   game's restored copy. An item not held (or unreadable) is handled as any ground item. */
+const unsigned int kSpotHandNone = 0xBu;   /* the hand type of an empty hand */
+const int kSpotSiteServe = 0, kSpotSiteList = 1, kSpotSiteWrite = 2, kSpotSiteApply = 3, kSpotSiteGone = 4;
+const int kSpotRowPass = 0, kSpotRowSkip = 1, kSpotRowGuard = 2;
+inline int SpotHeldJudge(int readOk, int spotSet, unsigned int handType, int handNamesItem)
+{
+    if (readOk == 0) return -1;
+    if (spotSet == 0 || handType == kSpotHandNone || handNamesItem == 0) return 0;
+    return 1;
+}
+inline int SpotRowDecide(int spotHeld, int site)
+{
+    if (spotHeld != 1) return kSpotRowPass;
+    if (site == kSpotSiteApply) return kSpotRowGuard;
+    if (site == kSpotSiteGone) return kSpotRowPass;
+    return kSpotRowSkip;
 }
 
 }   /* namespace coopgsync */

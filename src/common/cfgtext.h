@@ -148,6 +148,15 @@ struct CfgFields
        0 = absent = off. */
     int            benchCapKbs;
     int            netRateLog;
+    /* TEST ONLY, no writer carries it: hosttoken=<64 lowercase hex digits> - the hosting secret the bench started this game's world
+       server with, read only from the bench's test file and only by a host (config.cpp), so a bench-started world's own game proves
+       HOST_TOKEN without the HOST panel. Never logged. Empty = absent = off. */
+    std::string    hostToken;
+    /* T-1118 f - TEST ONLY, no writer carries them: steamfakelag=<ms> (0-1000) / steamfakeloss=<percent> (0-50) - Steam's global fake
+       lag / loss on this game's sends, set when its first Steam link comes UP (net/steam_transport.cpp), for a proving run on a real
+       game's Steam link (relaylag= / relayloss= act only inside the echo test). 0 = absent = nothing is set. */
+    int            steamFakeLagMs;
+    int            steamFakeLossPct;
     CfgFields();      /* role=single, slot="s1", ports 0, no playerId - ConfigLoad's own defaults */
 };
 

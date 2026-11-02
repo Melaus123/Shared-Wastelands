@@ -16,7 +16,9 @@
    2. SETTLE (CandStep): a picked name counts only after it has stayed the pick for kSettleMs - a blend between two states
       (a stop, an action ending) is never sent as a pose. A different name, or no pick, starts over.
 
-   3. WHO STARTED IT (StartTable, LayerStartSendable): the picked state is a pose only when a TASK put it in the layer table.
+   3. WHO STARTED IT (StartTable, LayerStartSendable): the picked state is a pose unless a starter on the REFUSE LIST put it in
+      the layer table (owner decision 1236 a, 2026-10-31: every layer-1 animation is sent except the engine's background
+      ones, so an animation a mod's new task plays copies without being listed).
       The engine puts an animation into a layer through one function (AnimationClass layer play, Steam 1.0.65 0x5B7030),
       called by the layer-only tasks ('medic' 0x34D8D0, 'chop down static' 0x353450, ...) and by the animation update's own
       controllers (idle chooser 0x51C920, walk / run blend 0x51CE50, head turn 0x5B79A0, 0x5F0C10, and the main-slot fill
@@ -25,7 +27,9 @@
       task's code, a listed controller's code, or neither (CallerKind) - the latest call wins. Layer 1 also holds looped
       upper-body locomotion ('jog upper' 1.00 looped - T1630, Confirmed), which the walk / run blend plays (Inferred from
       its decomp). The listed tasks are code; the animation names are not listed, so a mod's animation played by one of
-      them is a pose. An unknown caller, or no note (the hook off, a state started before it, a note pushed out), refuses.
+      them is a pose. 'Controller' below means a function on the refuse list (the five AnimCtl* rows, the derived entries
+      kRefuseDerived* and the bed entry RefuseBedStart); its state, or no note (the hook off, a state started before it, a note pushed out), refuses. Any other
+      game code (an unlisted task, a mod's task) is allowed and counted (spawn.cpp poseLayerAllowedUnknown).
 
    The road's own rules still decide afterwards, as for +0x210: the excluded names, the 'idle' prefix, the moving owner. */
 
@@ -90,9 +94,65 @@ inline int FirstGameFrameKind(const unsigned long long* frames, int n, unsigned 
     return kCallerNone;
 }
 
-/* 1 a layer state with this caller type may be sent as a pose: only a task's; a controller's, an unknown caller's or none
-   (no note) never */
-inline int LayerStartSendable(int kind) { return kind == kCallerTask ? 1 : 0; }
+/* 1 a layer state with this caller type may be sent as a pose (owner decision 1236 a): a listed task's, or any other game
+   code's (unknown: an unlisted task, a mod's task); a refuse-list starter's (kCallerController) or none (no note) never */
+inline int LayerStartSendable(int kind) { return (kind == kCallerTask || kind == kCallerUnknown) ? 1 : 0; }
+
+/* THE REFUSE LIST (owner decision 1236 a). The five table rows AnimCtl* (spawn.cpp: idle chooser, walk / run blend, head
+   turn, 0x5F0C10 - role unread, kept as background -, the main-slot fill, whose action the main-slot road sends) and these
+   engine animation-update functions, each a caller of the layer play (T1695 install line, 1.0.68) whose layer-1 state is
+   not a task's held action:
+     0 base animation   1.0.65 0x51C130 / 1.0.68 0x51CBC0 - the base animation, every frame (UNKNOWN CALLERS READ)
+     1 paired partner   0x51CA80 / 0x51D510 - plays the carried character's half of a two-character animation ('carry me',
+                        return address 0x51D58D in 1.0.68): the state comes from being carried, not from an action the
+                        carried character holds (the carrier's own lift 'pickup' is excluded too); sent as a pose, the
+                        carried copy would be held at its owner's spot instead of following its carrier (Inferred)
+     2 idle / stance    0x51CFF0 / 0x51DA80 - the random idle and guard-stance chooser ('guard 1h', 'guard polearm',
+                        'guard5', 'MA idle1'; T1665, T1695 ret 0x51DCD4): background fidgets
+     3 movement blend   0x51D3E0 / 0x51DE70 - blends movement states (UNKNOWN CALLERS READ)
+     4 aim / reload     0x51DA50 / 0x51E4E0 - the ranged aim 'aimH' (ret 0x51E7DF) and the reload motion: T-330's own road
+                        copies the aim; never a pose here
+     5 held-slot replay 0x51DDF0 / 0x51E880 - replays the held action slot ('sitting chair', 'sitting idle', 'medic',
+                        'chop down static'; ret 0x51E96E): that action is the main-slot road's to send; let through, the same
+                        action would reach the copy by a second road
+     6 arm poses        0x51F570 / 0x520000 - arm overlays (UNKNOWN CALLERS READ)
+   Not on it (allowed; role unread): 0x3343F0 / 0x334430 (no caller found) - named by the 'layer send allowed unknown'
+   line when it first flows. The bed's state animation is refused by its own entry below (RefuseBedStart).
+   The engine's animation-update code moved as one block between Steam 1.0.65 and 1.0.68 (+0xA90 for every function above
+   and for the AnimCtlIdle / LocoBlend / MainSlotFill rows), so each entry's start is the AnimCtlIdle row's start plus a fixed
+   offset; the install checks each is a calling function of the layer play, else the hook stays off (every pick refused). */
+const int kRefuseDerived = 7;
+const int kRefuseDerivedDelta[kRefuseDerived] = { -0x7F0, 0x160, 0x6D0, 0xAC0, 0x1130, 0x14D0, 0x2C50 };
+const char* const kRefuseDerivedName[kRefuseDerived] = { "RefuseBaseAnim", "RefusePairedPartner", "RefuseIdleStance",
+                                                         "RefuseMoveBlend", "RefuseAimReload", "RefuseHeldSlotReplay",
+                                                         "RefuseArmPoses" };
+
+/* the start of derived refuse-list entry i from the AnimCtlIdle row's start: 0 no row, i out of range, or no valid start */
+inline unsigned int RefuseDerivedStart(unsigned int idleRow, int i)
+{
+    if (idleRow == 0 || i < 0 || i >= kRefuseDerived) return 0;
+    const long long s = (long long)idleRow + (long long)kRefuseDerivedDelta[i];
+    if (s <= 0 || s > 0xFFFFFFFFll) return 0;
+    return (unsigned int)s;
+}
+
+/* THE BED ENTRY: 1.0.65 0x33A170 / 1.0.68 0x33A1B0 plays the bed's state animation on the character's layer; the
+   every-frame animation update calls it while the character is in a bed (+0x2F8 == 1, decomp_51fa70.txt:31-42). That
+   state belongs to the bed, which the bed road sends; it is never a pose. This function moved by +0x40 between 1.0.65 and
+   1.0.68, not with the animation-update block above, so its start is placed from the CombatClass_currentTarget row
+   (1.0.65 0x33A2A0 / 1.0.68 0x33A2E0), 0x130 before it in both builds; the install checks it as it checks the entries
+   above (a calling function of the layer play, else the hook stays off). */
+const int kRefuseBedDelta = -0x130;
+const char* const kRefuseBedName = "RefuseBedState";
+
+/* the bed entry's start from the CombatClass_currentTarget row's start: 0 no row or no valid start */
+inline unsigned int RefuseBedStart(unsigned int combatTargetRow)
+{
+    if (combatTargetRow == 0) return 0;
+    const long long s = (long long)combatTargetRow + (long long)kRefuseBedDelta;
+    if (s <= 0 || s > 0xFFFFFFFFll) return 0;
+    return (unsigned int)s;
+}
 
 /* ---- the install's reads of the game's function table (pure over a copy of it) ---- */
 
@@ -170,7 +230,7 @@ inline int TallyCallSite(const FnPiece* p, int np, unsigned int rva, CallerTally
    sequence number - even = settled, odd = one writer holds it; a writer takes a slot by moving it from even to odd with
    one compare-exchange and publishes with the next even number; a reader keeps a slot's fields only when the number was
    even and unchanged around its reads. A pair lives in one of kStartProbe slots from its hash: its own slot, else the
-   first free one, else the oldest note that is not a task's, else the oldest task note (bounded: a full table pushes out
+   first free one, else the oldest note that is not sendable, else the oldest sendable note (bounded: a full table pushes out
    a note, never grows; a task note written once outlives controller notes rewritten every frame). A call that would
    write what its slot already holds (same kind and caller, written less than kStartRefreshMs ago) writes nothing. */
 const unsigned int kStartSlots = 4096;   /* a power of two */
@@ -265,7 +325,7 @@ inline int StartNote(StartTable* t, const void* anim, const void* rec, int kind,
             }
             if (a == 0) { if (freeAt < 0) { freeAt = (int)at; freeSeq = s1; } continue; }
             const unsigned int age = now - st;
-            if (k == kCallerTask) { if (oldTaskAt < 0 || age > oldTaskAge) { oldTaskAt = (int)at; oldTaskSeq = s1; oldTaskAge = age; } }
+            if (LayerStartSendable((int)k)) { if (oldTaskAt < 0 || age > oldTaskAge) { oldTaskAt = (int)at; oldTaskSeq = s1; oldTaskAge = age; } }
             else if (oldAt < 0 || age > oldAge) { oldAt = (int)at; oldSeq = s1; oldAge = age; }
         }
         int at = -1, result = kNoteDropped;

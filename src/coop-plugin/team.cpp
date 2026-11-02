@@ -789,6 +789,137 @@ std::string ResearchText()
            + " | level: own=" + N((long long)StoreResearchBenchLevel()) + " team=" + N((long long)g_lvLevel) + " (team " + N((long long)g_lvTeam) + ") reports=" + N(g_lvReports)
            + " reportsAgain=" + N(g_lvReportsAgain) + " answers=" + N(g_lvAnswers) + " in=" + N(g_lvIn) + " raises=" + N(g_lvRaises) + " raiseFails=" + N(g_lvRaiseFails) + " notSent=" + N(g_lvNotSent);
 }
+/* RESEARCH PROGRESS SHARED WITH TEAMMATES (teamwire.h WORK), every frame: this game's own steps the addProgress hook took (the
+   progress each of its calls added; one sum per topic per frame, with the front's progress after the last call - the level -
+   on the last piece) are sent while the player is in a team, and the teammates' WORK received since the last frame raises
+   this game's front entry to the larger of its progress plus the step and the level (never lower), each only when its topic
+   is this game's front topic at that moment (the others are counted and dropped). Out of a team, or with no world ready, both
+   are dropped. The proving lines: each applied WORK (amount, level, before, after, after - before, which won) and each pass
+   with messages, up to kWorkSayCap lines each; the front topic and its progress once a second while it moves (up to
+   kWorkSayCap lines, then counted), and always at the first read, at a topic change and when it comes to rest. */
+struct WorkIn { unsigned team, by; std::string sid; float amount, level; };
+std::vector<WorkIn> g_wkIn;
+const size_t kWorkInCap = 256;
+const long long kWorkSayCap = 300;   /* [TEAM] work in (applied) lines and work pass lines, each; the rest only counted */
+long long g_wkOut = 0, g_wkOutNotSent = 0, g_wkOutNoTeam = 0, g_wkOutBad = 0, g_wkInMsgs = 0, g_wkInCapDropped = 0, g_wkInNoTeam = 0;
+long long g_wkVerdicts[swteam::kWaLast + 1] = { 0 };
+long long g_wkPasses = 0, g_wkInSaid = 0, g_wkInUnsaid = 0, g_wkPassSaid = 0, g_wkPassUnsaid = 0, g_wkFrontLines = 0;
+long long g_wkWonStep = 0, g_wkWonLevel = 0, g_wkFrontMovingSaid = 0, g_wkFrontMovingUnsaid = 0;
+double g_wkOutSum = 0.0, g_wkAppliedSum = 0.0;
+unsigned long g_wkFrontAt = 0;       /* GetTickCount of the last front read (once a second; 0 = never) */
+std::string g_wkFrontSid;            /* the last front line's topic and progress */
+float g_wkFrontProg = -1.0f;
+bool g_wkFrontSaid = false, g_wkFrontMoving = false;
+bool WorkSay(long long n) { return n <= 20 || n % 500 == 0; }
+std::string WorkNum(double v) { std::ostringstream o; o.setf(std::ios::fixed); o.precision(7); o << v; return o.str(); }
+/* once a second while in a team: this game's front topic and its progress - a line while it moves (up to kWorkSayCap, then
+   only counted) and always one at the first read, at a topic change and when it has come to rest, so the teammates' at-rest
+   lines compare */
+void WorkFrontTick()
+{
+    const unsigned long now = ::GetTickCount();
+    if (g_wkFrontAt != 0 && now - g_wkFrontAt < 1000) return;
+    g_wkFrontAt = now | 1u;
+    std::string sid; float prog = -1.0f;
+    if (StoreResearchFront(&sid, &prog) != 1) return;
+    const bool first = !g_wkFrontSaid;
+    const bool topicChanged = !first && sid != g_wkFrontSid;
+    const bool changed = first || topicChanged || prog != g_wkFrontProg;
+    if (!changed && !g_wkFrontMoving) return;   /* at rest and already said */
+    g_wkFrontMoving = changed;
+    g_wkFrontSid = sid; g_wkFrontProg = prog; g_wkFrontSaid = true;
+    const bool moving = changed && !first && !topicChanged;
+    if (moving)
+    {
+        if (g_wkFrontMovingSaid >= kWorkSayCap) { ++g_wkFrontMovingUnsaid; return; }
+        ++g_wkFrontMovingSaid;
+    }
+    ++g_wkFrontLines;
+    DebugLog("[TEAM] work front topic=" + (sid.empty() ? std::string("none") : sid) + " progress=" + (sid.empty() ? std::string("-") : WorkNum(prog))
+             + (first ? " (first)" : topicChanged ? " (topic changed)" : moving ? " (moving)" : " (at rest)") + " (front lines " + N(g_wkFrontLines) + ")");
+}
+void WorkTick()
+{
+    std::vector<swteam::WorkSum> out;
+    StoreResearchTakeWork(&out);
+    const int me = StoreMySlot();
+    int founder = 0;
+    const int t = (me < 0 || g_tableGen < 0) ? -1 : swteam::WireTeamOf(g_table, (unsigned)me, &founder);
+    const unsigned myTeam = t < 0 ? 0u : g_table[t].no;
+    const bool on = myTeam != 0 && WorldReady();
+    StoreResearchWorkInTeam(on);   /* the hook's per-call lines only while in a team with a world */
+    if (!on)
+    {
+        g_wkOutNoTeam += (long long)out.size(); g_wkInNoTeam += (long long)g_wkIn.size(); g_wkIn.clear();
+        return;
+    }
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        const std::vector<float> parts = swteam::WorkPieces(out[i].amount);
+        for (size_t k = 0; k < parts.size(); ++k)
+        {
+            std::vector<char> b;
+            const float lv = swteam::WorkPieceLevel(k, parts.size(), out[i].level);
+            if (!swteam::EncodeWorkUp(&b, out[i].topic, parts[k], lv)) { ++g_wkOutBad; continue; }
+            if (!Send(b))
+            {
+                ++g_wkOutNotSent;
+                if (WorkSay(g_wkOutNotSent)) DebugLog("[TEAM] work out topic=" + out[i].topic + " amount=" + WorkNum(parts[k]) + " level=" + WorkNum(lv) + " NOT sent (no link; notSent " + N(g_wkOutNotSent) + ")");
+                continue;
+            }
+            ++g_wkOut; g_wkOutSum += parts[k];
+            if (WorkSay(g_wkOut)) DebugLog("[TEAM] work out topic=" + out[i].topic + " amount=" + WorkNum(parts[k]) + " level=" + WorkNum(lv) + " (team " + N((long long)myTeam) + ", sent " + N(g_wkOut) + ")");
+        }
+    }
+    std::vector<WorkIn> in; in.swap(g_wkIn);
+    long long applied = 0;
+    double appliedSum = 0.0;
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        float before = -1.0f, after = -1.0f;
+        int won = swteam::kWtNone;
+        const int v = StoreResearchWorkApply(in[i].team == myTeam, in[i].sid, in[i].amount, in[i].level, &before, &after, &won);
+        const long long n = (v >= 0 && v <= swteam::kWaLast) ? ++g_wkVerdicts[v] : 1;
+        if (v == swteam::kWaApplied)
+        {
+            ++applied; appliedSum += in[i].amount; g_wkAppliedSum += in[i].amount;
+            ++(won == swteam::kWtLevel ? g_wkWonLevel : g_wkWonStep);
+            if (g_wkInSaid >= kWorkSayCap) { ++g_wkInUnsaid; continue; }
+            ++g_wkInSaid;
+            DebugLog("[TEAM] work in #" + N(n) + " from slot " + N((long long)in[i].by) + " topic=" + in[i].sid + " amount=" + WorkNum(in[i].amount)
+                     + " level=" + WorkNum(in[i].level) + " before=" + WorkNum(before) + " after=" + WorkNum(after) + " diff=" + WorkNum((double)after - (double)before)
+                     + " won=" + swteam::WorkTargetName(won) + " -> applied");
+        }
+        else if (WorkSay(n))
+            DebugLog("[TEAM] work in from slot " + N((long long)in[i].by) + " topic=" + in[i].sid + " amount=" + WorkNum(in[i].amount) + " level=" + WorkNum(in[i].level)
+                     + " before=" + WorkNum(before) + " -> " + swteam::WorkArriveName(v)
+                     + " (" + N(n) + ")");
+    }
+    if (!in.empty())
+    {
+        ++g_wkPasses;
+        if (g_wkPassSaid >= kWorkSayCap) ++g_wkPassUnsaid;
+        else
+        {
+            ++g_wkPassSaid;
+            DebugLog("[TEAM] work pass #" + N(g_wkPasses) + ": messages=" + N((long long)in.size()) + " applied=" + N(applied) + " appliedSum=" + WorkNum(appliedSum)
+                     + " notApplied=" + N((long long)in.size() - applied));
+        }
+    }
+    WorkFrontTick();
+}
+std::string WorkText()
+{
+    std::string v;
+    for (int i = 0; i <= swteam::kWaLast; ++i) v += std::string(i ? " " : "") + swteam::WorkArriveName(i) + "=" + N(g_wkVerdicts[i]);
+    return "work: out=" + N(g_wkOut) + " outSum=" + WorkNum(g_wkOutSum) + " notSent=" + N(g_wkOutNotSent) + " outNoTeam=" + N(g_wkOutNoTeam) + " outBad=" + N(g_wkOutBad)
+           + " in=" + N(g_wkInMsgs) + " inCapDropped=" + N(g_wkInCapDropped) + " inNoTeam=" + N(g_wkInNoTeam) + " " + v + " appliedSum=" + WorkNum(g_wkAppliedSum)
+           + " passes=" + N(g_wkPasses) + " inLines=" + N(g_wkInSaid) + " inUnsaid=" + N(g_wkInUnsaid) + " passLines=" + N(g_wkPassSaid) + " passUnsaid=" + N(g_wkPassUnsaid)
+           + " wonStep=" + N(g_wkWonStep) + " wonLevel=" + N(g_wkWonLevel) + " frontMovingLines=" + N(g_wkFrontMovingSaid)
+           + " frontMovingUnsaid=" + N(g_wkFrontMovingUnsaid)
+           + " front=" + (g_wkFrontSaid ? (g_wkFrontSid.empty() ? std::string("none") : g_wkFrontSid) : std::string("-")) + " frontProgress=" + WorkNum(g_wkFrontProg)
+           + " | " + StoreResearchWorkText();
+}
 /* THE TEAM'S RESEARCH LEVEL, every frame (owner 517 a): with the player in a team and the world ready, the engine's level raised
    to the team's whenever it is lower (a world load that reset it is raised again here), and this game's own bench level reported
    once per world load, link and team, again when it changes, and again after a growing wait while not answered. Out of a team
@@ -1000,6 +1131,13 @@ void TeamArrive(const std::vector<char>& payload)
                 DebugLog("[TEAM] research: " + d.techs[i] + " finished by s" + N((long long)d.resBy) + " (" + NameOf(d.resBy) + ") in team " + N((long long)d.resTeam) + " received");
             }
     }
+    else if (d.kind == swteam::kDnWork)
+    {
+        /* a teammate's research progress: applied at the next frame's WorkTick (only to this game's front topic) */
+        ++g_wkInMsgs;
+        if (g_wkIn.size() >= kWorkInCap) ++g_wkInCapDropped;
+        else { WorkIn w; w.team = d.wkTeam; w.by = d.wkBy; w.sid = d.wkSid; w.amount = d.wkAmount; w.level = d.wkLevel; g_wkIn.push_back(w); }
+    }
     else if (d.kind == swteam::kDnLevel)
     {
         /* the team's research level: the answer to this game's report (bySlot = this game), or the team's changed; the engine's
@@ -1045,6 +1183,7 @@ void TeamTick()
     PinTick();
     RecordTick();
     ResearchTick();
+    WorkTick();
     LevelTick();
     CellsTick();
     const int gen = StoreLinkGen();
@@ -1167,7 +1306,7 @@ std::string TeamCommand(const std::string& args)
                  + " stances=" + N((long long)g_rec.stances.size()) + " owed=" + N(g_recOwed ? 1 : 0) + " records=" + N(g_records) + " writes=" + N(g_recordWrites) + " writeFails=" + N(g_recordWriteFails)
                  + " seeds=" + N(g_seeds) + " deltaSends=" + N(g_deltaSends) + " deltaSendFails=" + N(g_deltaSendFails) + " stances=" + N(g_stances)
                  + " sides=" + N(g_sides) + " sidesOwed=" + N((long long)g_sideOwed.size()) + " sidesNothingToWrite=" + N(g_sidesNothing) + " sidesKeptOwn=" + N(g_sidesKeptOwn) + " restoreFails=" + N(g_restoreFails)
-                 + " " + RelationsTeamText() + " | " + ResearchText());
+                 + " " + RelationsTeamText() + " | " + ResearchText() + " | " + WorkText());
         return "ok team show";
     }
     if (sub == "access")

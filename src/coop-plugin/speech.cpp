@@ -998,6 +998,7 @@ void TkLogP25(int kind, const std::string& s)
     DebugLog(s + t);
 }
 
+volatile LONG64 g_tkPeerSpeakerRefused = 0;   /* conversations not started: the speaker is another player's character (any thread) */
 /* 1 = who is a character of a peer's stand-in faction (a copy the other player drives). ANY THREAD: one guarded read, then
    pointer compares (IsPeerFaction). No C++ object here (C2712). */
 int TkPeerTarget(void* who)
@@ -1007,6 +1008,22 @@ int TkPeerTarget(void* who)
     __try { f = *(::Faction* const*)((const char*)who + kRootFaction); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
     return (f != 0 && IsPeerFaction(f)) ? 1 : 0;
+}
+
+/* 1 = who is a character of a player's stand-in faction as startPlayerConversation's speaker test sees it: one in the stand-in table
+   or an old save's coop-peer (IsStandInFaction), or a faction whose record id names a stand-in ("coop-p<n>", or the old "coop-peer")
+   that the table does not hold (an old save's stand-in record, StandInRecordSlot). An unreadable record id is not refused. ANY
+   THREAD: one guarded read here, pointer compares, and StandInRecordSlot's guarded record-id read. No C++ object here (C2712). */
+int TkPlayerSpeaker(void* who)
+{
+    if (who == 0) return 0;
+    ::Faction* f = 0;
+    __try { f = *(::Faction* const*)((const char*)who + kRootFaction); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (f == 0) return 0;
+    if (IsStandInFaction(f)) return 1;
+    const int r = StandInRecordSlot(f);
+    return (r >= 0 || r == -2) ? 1 : 0;
 }
 
 int TkMarkFind(void* dlg)
@@ -1898,12 +1915,23 @@ static unsigned long long TkP25CallStart(void* dlg, void* who, void* line, P25Ga
 
 unsigned long long detour_startPlayerConv(void* dlg, void* who, void* line)
 {
+    /* A conversation whose SPEAKER is another player's character (its copy here, in a stand-in faction) never starts: the copy still
+       carries the dialogue of the NPC it was before it was recruited (a hired mercenary still offers "hire me"), so this game's
+       player would be offered another player's character, and that character would speak lines this game chose. Players talk by
+       chat. 0 is the engine's own "not started". Any thread: guarded reads and pointer compares, no C++ object. The talk order (T-726)
+       is marked reached first, so the refusal is logged as its own outcome (kTalkOrderPlayerSpeaker). */
+    TkOrderCtx* const oc = TkOrderCur();   /* T-726: this game's player's talk order on this Dialogue reached the start, with a line or not */
+    if (oc != 0 && oc->dlg == dlg && !oc->reached) { oc->reached = 1; oc->hadLine = (line != 0) ? 1 : 0; }
+    if (dlg != 0 && TkPlayerSpeaker(SayReadPtr(dlg, kDlgMe)))
+    {
+        ::InterlockedIncrement64(&g_tkPeerSpeakerRefused);
+        TkOrderSetFor(dlg, cooptalk::kTalkOrderPlayerSpeaker, -1.0f);
+        return 0;
+    }
     /* P26 stages 1-3: a start toward the OTHER player's character is marked FIRST (any thread), so this game's window stays shut;
        with no free mark the start is refused (the NPC simply does not start - never a window for the other player's character) */
     /* P26s1 fold 1 H1: a start on a MARKED Dialogue toward anyone else releases the mark first (TkRelease). */
     int mark = -1, created = 0;
-    TkOrderCtx* const oc = TkOrderCur();   /* T-726: this game's player's talk order on this Dialogue reached the start, with a line or not */
-    if (oc != 0 && oc->dlg == dlg && !oc->reached) { oc->reached = 1; oc->hadLine = (line != 0) ? 1 : 0; }
     if (g_tkOn && dlg != 0)
     {
         if (TkPeerTarget(who))
@@ -2802,11 +2830,15 @@ void ReportCrimeTest()
 // (the engine's character update list, as crimetest attacknear). A uid names either one directly (a positive control: the
 // target uid of this game's own character). It logs its inputs, sendEvent's result and the starts during the call. Nothing
 // else: no order, no message, no write.
+// `talktest nearestpeer [<radius>]` (TEST-ONLY, T-1152): the speaker is the nearest character of ANOTHER player (TkPlayerSpeaker,
+// the test detour_startPlayerConv refuses by) and `who` is this game's first own player character - the click's call (TalkTestPeerArm).
 // ===========================================================================================
 static volatile LONG g_talkTestPending = 0;
 static unsigned int g_talkTestNpcUid = 0, g_talkTestTargetUid = 0;
 static int g_talkTestEvent = 1;
 static int g_talkTestNearCopy = 0;   /* P25: `talktest nearcopy ...` - the near NPC must be a copy the other game drives */
+static int g_talkTestPeer = 0;   /* T-1152 `talktest nearestpeer`: the speaker is the nearest character of another player (TkPlayerSpeaker) */
+static float g_talkTestPeerR = kTalkNearMax;   /* nearestpeer: the search radius around this game's first own player character */
 static long long g_talkTestArmed = 0, g_talkTestRan = 0, g_talkTestSkipped = 0, g_talkTestFaulted = 0;
 
 std::string TalkTestArm(const std::string& arg)
@@ -2814,11 +2846,42 @@ std::string TalkTestArm(const std::string& arg)
     unsigned int n = 0, t = 0; int ev = 1, nc = 0;
     if (!coopsay::TalkTestParse(arg, &n, &t, &ev, &nc))   /* P25: nearcopy */
         return "error talktest: usage talktest [npcUid|near|nearcopy] [targetUid|near] [event 0..255, default 1]";
-    g_talkTestNpcUid = n; g_talkTestTargetUid = t; g_talkTestEvent = ev; g_talkTestNearCopy = nc;
+    g_talkTestNpcUid = n; g_talkTestTargetUid = t; g_talkTestEvent = ev; g_talkTestNearCopy = nc; g_talkTestPeer = 0;   /* replaces a pending nearestpeer */
     ::InterlockedExchange(&g_talkTestPending, 1);
     ++g_talkTestArmed;
     char b[200];
     std::sprintf(b, "[TALK] talktest npc=%u target=%u (0 = near) ev=0x%X nearcopy=%d ARMED - runs at the next safe point", n, t, (unsigned int)ev, nc);   /* P25 */
+    DebugLog(std::string(b));
+    return "ok talktest armed";
+}
+
+/* T-1152: `talktest nearestpeer [<radius>]` - TEST-ONLY lever. Arms one talktest whose SPEAKER is the nearest living, conscious
+   character with a Dialogue that TkPlayerSpeaker reads as another player's (a copy here in a player's stand-in faction - the test
+   detour_startPlayerConv refuses by) within <radius> (default 3000) of this game's first own player character, with that own
+   character as `who` and event 1 (EV_PLAYER_TALK_TO_ME): the call a click on that character makes, so detour_sendEvent keeps it as
+   a talk order and the speaker refusal is reached as in play. The pick runs at the K2 safe point (TalkTestDrain) and is logged
+   there. MAIN THREAD (the command channel). */
+std::string TalkTestPeerArm(const std::string& arg)
+{
+    const char* const usage = "error talktest: usage talktest nearestpeer [<radius 1..20000, default 3000>]";
+    const char* p = arg.c_str();
+    if (std::strncmp(p, "nearestpeer", 11) != 0) return usage;
+    p += 11;
+    while (*p == ' ' || *p == '\t') ++p;
+    float r = kTalkNearMax;
+    if (*p != 0)
+    {
+        char* e = 0; const double v = strtod(p, &e);
+        if (e == p) return usage;
+        while (*e == ' ' || *e == '\t') ++e;
+        if (*e != 0 || !(v >= 1.0) || v > 20000.0) return usage;
+        r = (float)v;
+    }
+    g_talkTestNpcUid = 0; g_talkTestTargetUid = 0; g_talkTestEvent = 1; g_talkTestNearCopy = 0; g_talkTestPeer = 1; g_talkTestPeerR = r;
+    ::InterlockedExchange(&g_talkTestPending, 1);
+    ++g_talkTestArmed;
+    char b[200];
+    std::sprintf(b, "[TALK] talktest nearestpeer radius=%.0f ev=0x1 ARMED - runs at the next safe point", (double)r);
     DebugLog(std::string(b));
     return "ok talktest armed";
 }
@@ -4515,6 +4578,7 @@ static void TkLeverStart()
 }
 
 static int TkAnswerActPick(void* dlg, int act, int* pick, std::string* replies);   /* talkprompt answer act - defined with the TALKSIGHT scan helpers */
+static int TkJoinActFind(void* dlg, int act, void** hit, int* depth, int* searched);   /* talkprompt joinact - defined with TkAnswerActPick */
 
 static int WgWindow(void** win, void** dlg);   /* the one dialogue window and the Dialogue it shows - with the window guard below */
 
@@ -4522,9 +4586,10 @@ static void TkLeverDrain()
 {
     if (::InterlockedExchange(&g_tkLeverPending, 0) == 0) return;
     if (g_tkLeverMode == cooptalk::kTalkLeverStart) { TkLeverStart(); return; }
-    /* answer / answer act click the mirrored conversation while one is open; otherwise the conversation this game's own window
-       shows (this game's own player talking to an NPC here), when its owner is a live character whose Dialogue is still that
-       one. close ends only a mirrored one. */
+    /* answer / answer act / close act on the mirrored conversation while one is open; otherwise on the conversation this game's
+       own window shows (this game's own player talking to an NPC here), when its owner is a live character whose Dialogue is
+       still that one. close on the own window ends this game's own conversation through the same hooked endDialogue, so a test
+       can clear the talk window that stays open over the character editor after joinact ran a line's actions. */
     void* ownWin = 0; void* ownDlg = 0;
     const int ownShown = g_tkMirror.active ? 0 : WgWindow(&ownWin, &ownDlg);
     const int ownLive = (ownShown == 1) ? TkLiveOwner(ownDlg, SayReadPtr(ownDlg, kDlgMe)) : 0;
@@ -4535,6 +4600,41 @@ static void TkLeverDrain()
     void* const dlg = (use == cooptalk::kLeverWinMirror) ? g_tkMirror.dlg : ownDlg;
     const std::string which = (use == cooptalk::kLeverWinMirror) ? std::string("the mirrored window")
                             : ("this game's own window (npc uid=" + TkU(FindSpawnedUid(SayReadPtr(dlg, kDlgMe))) + ")");
+    if (g_tkLeverMode == cooptalk::kTalkLeverJoinAct)
+    {
+        /* joinact <type>: the first line (fewest steps down) in the open conversation's whole line tree whose actions hold the
+           type, then the engine's own _doActions on that line through its hooked entry - what the engine runs for a clicked reply's
+           line, so hire.cpp's detour and the engine's recruit step run as in play. The lines on the way are not said. */
+        void* hit = 0;
+        int depth = -1, searched = 0;
+        const std::string head = "[TALK] talkprompt joinact " + TkI(g_tkLeverIndex) + " on " + which + ": ";
+        ::Faction* const meFac = (::Faction*)SayReadPtr(SayReadPtr(dlg, kDlgMe), kRootFaction);
+        if (meFac != 0 && IsPlayerFaction(meFac))
+        {
+            ++g_tkLeverSkipped;
+            DebugLog(head + "the npc is in this game's player faction already - not run (searched 0 lines)");
+            return;
+        }
+        TkJoinActFind(dlg, g_tkLeverIndex, &hit, &depth, &searched);
+        if (hit == 0)
+        {
+            ++g_tkLeverSkipped;
+            DebugLog(head + "no line carries it (searched " + TkI(searched) + " lines)");
+            return;
+        }
+        const std::string at = "line " + TkLineSid(hit) + " at depth " + TkI(depth) + " (searched " + TkI(searched) + " lines)";   /* read before: the line may end the conversation */
+        const int ran = HireCallDoActionsEntry(dlg, hit);
+        if (ran != 1)
+        {
+            ++g_tkLeverSkipped;
+            DebugLog(head + at + " -> _doActions NOT called: " + (ran == -1 ? std::string("the engine faulted (caught)")
+                                                                            : std::string("hire.cpp's _doActions hook or its address is missing")));
+            return;
+        }
+        ++g_tkLeverRan;
+        DebugLog(head + at + " -> _doActions called");
+        return;
+    }
     if (g_tkLeverMode == cooptalk::kTalkLeverAnswerAct)
     {
         /* answer act <type>: the reply whose line (or a line up to 3 below it) carries the action, read from the conversation's
@@ -4567,9 +4667,9 @@ static void TkLeverDrain()
     }
     if (kTkEndDialogueRva == 0) { TkLeverSkip("endDialogue is not in the address table"); return; }
     const TkEndDialogueFn fn = (TkEndDialogueFn)(g_base + (uintptr_t)kTkEndDialogueRva);   /* the engine's entry (hooked) */
-    const int called = TkEndEntryPod(fn, g_tkMirror.dlg);
+    const int called = TkEndEntryPod(fn, dlg);   /* the mirrored Dialogue, or this game's own one */
     ++g_tkLeverRan;
-    DebugLog("[TALK] talkprompt close called=" + TkI(called) + " (through the endDialogue hook)");
+    DebugLog("[TALK] talkprompt close on " + which + " called=" + TkI(called) + " (through the endDialogue hook)");
 }
 
 /* P26s1 fold 1 L4: a PROMPT held too long (the world was blocked) is not shown - SHOW_FAILED, so the NPC's game ends its side.
@@ -4771,7 +4871,8 @@ static std::string TkCountsString()
                  g_tkHandMismatch, g_tkIdTooLong, TalkHookState(g_convReplyGuiHook), TalkHookState(g_responsesGuiHook),
                  kDialogueWindowRva != 0 ? "row" : "noAddress", HireDoActionsHookState());
     char g[160];   /* P26s1 fold 2 */
-    std::sprintf(g, " talkP26f2[ownWindowRefused,mirrorNewStart]=%lld,%lld", (long long)g_tkOwnWinRefused, (long long)g_tkMirrorNewStart);
+    std::sprintf(g, " talkP26f2[ownWindowRefused,mirrorNewStart]=%lld,%lld talkPlayerSpeakerRefused=%lld", (long long)g_tkOwnWinRefused,
+                 (long long)g_tkMirrorNewStart, (long long)g_tkPeerSpeakerRefused);
     char s4[640];   /* P26 stage 4: ~220 literal bytes + 14 numbers of at most 20 */
     /* P26s5 fold 5: 'timeouts' counts only held ends that got no ACT_RESULT (decision 229: no answer deadline) */
     std::sprintf(s4, " talkP26s4A[applied,applyFault,nextPrompt,nextUnforwardable,unmapped,heldEndTimeouts,endAnswered,linesDeferred,actsDeferred,"
@@ -5259,11 +5360,11 @@ std::string TalkPromptArm(const std::string& arg)
     unsigned int n = 0, t = 0;
     std::string sid;
     if (!cooptalk::TalkPromptParse(arg, &mode, &n, &t, &sid, &idx))
-        return "error talkprompt: usage talkprompt [npcUid|near] [targetUid|near] [lineSid|auto] | talkprompt answer <0..9> | talkprompt answer act <type 0..255> | talkprompt close";
+        return "error talkprompt: usage talkprompt [npcUid|near] [targetUid|near] [lineSid|auto] | talkprompt answer <0..9> | talkprompt answer act <type 0..255> | talkprompt joinact <type 0..255> | talkprompt close";
     g_tkLeverMode = mode; g_tkLeverIndex = idx; g_tkLeverNpc = n; g_tkLeverTarget = t; g_tkLeverSid = sid;
     ::InterlockedExchange(&g_tkLeverPending, 1);
     ++g_tkLeverArmed;
-    DebugLog("[TALK] talkprompt " + std::string(mode == cooptalk::kTalkLeverStart ? "start" : (mode == cooptalk::kTalkLeverAnswer ? "answer" : (mode == cooptalk::kTalkLeverAnswerAct ? "answer act" : "close")))
+    DebugLog("[TALK] talkprompt " + std::string(mode == cooptalk::kTalkLeverStart ? "start" : (mode == cooptalk::kTalkLeverAnswer ? "answer" : (mode == cooptalk::kTalkLeverAnswerAct ? "answer act" : (mode == cooptalk::kTalkLeverJoinAct ? "joinact" : "close"))))
              + " npc=" + TkU(n) + " target=" + TkU(t) + " (0 = near) line=" + (sid.empty() ? std::string("auto") : sid) + " index=" + TkI(idx)
              + " ARMED - runs at the next safe point");
     return "ok talkprompt armed";
@@ -5610,6 +5711,46 @@ static int TkAnswerActPick(void* dlg, int act, int* pick, std::string* replies)
     }
     if (cur == 0) *replies += " (no current line)";
     return *pick >= 0 ? 1 : 0;
+}
+
+/* talkprompt joinact (the talker's game, MAIN THREAD, K2 safe point): breadth-first from the conversation's current line
+   (kDlgCurLine) through every line below it, any depth; each line is read once (a conversation can lead back to an earlier line)
+   and at most kTkJoinActNodeCap lines are read. *hit = the first line whose actions hold type act (its own action list or
+   TkLineViewPod's read), 0 none; *depth = its steps below the current line; *searched = the lines read. 1 found. */
+const int kTkJoinActNodeCap = 4096;
+static int TkJoinActFind(void* dlg, int act, void** hit, int* depth, int* searched)
+{
+    *hit = 0; *depth = -1; *searched = 0;
+    void* const cur = SayReadPtr(dlg, kDlgCurLine);
+    if (cur == 0) return 0;
+    std::vector<void*> seen;
+    std::vector<std::pair<void*, int> > queue;
+    seen.push_back(cur);
+    queue.push_back(std::make_pair(cur, 0));
+    for (size_t q = 0; q < queue.size(); ++q)
+    {
+        void* const line = queue[q].first;
+        const int d = queue[q].second;
+        ++*searched;
+        int has = 0; void* kids = 0;
+        if (!TsLineActKidsPod(line, act, &has, &kids)) continue;
+        if (!has)
+        {
+            TkLineView v;
+            if (TkLineViewPod(line, &v) > 0)
+                for (int i = 0; i < v.n; ++i) if (v.types[i] == act) has = 1;
+        }
+        if (has) { *hit = line; *depth = d; return 1; }
+        const int nk = TkChoiceCountPod(kids);
+        for (int j = 0; j < nk && queue.size() < (size_t)kTkJoinActNodeCap; ++j)
+        {
+            void* const c = TkChoiceAtPod(kids, j);
+            if (c == 0 || std::find(seen.begin(), seen.end(), c) != seen.end()) continue;
+            seen.push_back(c);
+            queue.push_back(std::make_pair(c, d + 1));
+        }
+    }
+    return 0;
 }
 
 // P26s6 ARRIVAL WATCH (T714, log-only). MAIN THREAD (K2 safe point). Armed by TalkSightTick when a walk-over line starts.
@@ -6814,6 +6955,7 @@ static void TalkOrderDrain()
         case cooptalk::kTalkOrderRingFull: std::strcpy(res, "NOT started: the click queue was full"); break;
         case cooptalk::kTalkOrderDup: std::strcpy(res, "NOT started: the same click already waits to be sent (duplicate)"); break;
         case cooptalk::kTalkOrderLineNotStarted: std::strcpy(res, "NOT started: the NPC had a line, the camera gate passed, and the engine still did not start it"); break;
+        case cooptalk::kTalkOrderPlayerSpeaker: std::strcpy(res, "NOT started: the speaker is another player's character"); break;
         default:
         {
             int gb = -1, gl = -1, gd = -1, gi = -1, gr = -1, gx = -1;
@@ -6846,10 +6988,10 @@ static std::string TalkOrderCountsString()
     const long long* o = g_tkOrderByOutcome;
     char b[600];
     std::sprintf(b, " talkOrder[orders,dropped,drained,blocked,stale,logged]=%lld,%lld,%lld,%lld,%lld,%u"
-                 " talkOrderBy[notReached,started,noLine,request,gate,ringFull,dup,lineNotStarted]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
+                 " talkOrderBy[notReached,started,noLine,request,gate,ringFull,dup,lineNotStarted,playerSpeaker]=%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld"
                  " talkOrderNotReachedCopyBusy=%lld",
                  (long long)g_tkOrders, (long long)g_tkOrderDropped, g_tkOrderDrained, g_tkOrderBlocked, g_tkOrderStale, g_tkOrderLogged,
-                 o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], g_tkOrderNotReachedBusy);
+                 o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], g_tkOrderNotReachedBusy);
     return std::string(b);
 }
 
@@ -7226,7 +7368,41 @@ void TalkTestDrain()
         ref = c;
     }
     ::Character* target = 0; unsigned int tuid = 0; float tdist = -1.0f;
-    if (g_talkTestTargetUid != 0)
+    ::Character* peerNpc = 0; float peerDist = -1.0f;   /* nearestpeer: the speaker picked here */
+    if (g_talkTestPeer)
+    {
+        /* T-1152 nearestpeer (TEST-ONLY): the speaker is the nearest living, conscious character with a Dialogue that TkPlayerSpeaker
+           reads as another player's within the radius of this game's first own player character; the target (`who`) is that own
+           character, so the sendEvent below is the call a click on that character makes (detour_sendEvent keeps the talk order). */
+        if (ref == 0) { TalkTestSkip("nearestpeer: no own player-faction character with a readable position to search near"); return; }
+        float best = g_talkTestPeerR; unsigned int pu = 0;
+        for (int i = 0; i < cap; ++i)
+        {
+            unsigned int u = 0; ::Character* c = 0; Ogre::Vector3 q;
+            if (!MirrorSlot(i, &u, &c) || u == 0 || c == ref || SayPlausiblePtr(c) == 0) continue;
+            if (!TkPlayerSpeaker(c)) continue;   /* the speaker test detour_startPlayerConv refuses by */
+            if (CrimeIsDead(c) != 0 || IsDownedCharacter(c)) continue;
+            if (TalkDialogueOf(c) == 0 || !SafeReadPosition(c, &q)) continue;
+            const float dx = q.x - rpos.x, dz = q.z - rpos.z, d = sqrtf(dx * dx + dz * dz);
+            if (d < best || (d == best && peerNpc != 0 && u < pu)) { best = d; peerNpc = c; pu = u; }
+        }
+        if (peerNpc == 0)
+        {
+            ++g_talkTestSkipped;
+            char eb[200];
+            std::sprintf(eb, "[TALK] talktest error nearestpeer: none within %.0f u of this game's first own player character", (double)g_talkTestPeerR);
+            DebugLog(std::string(eb));
+            return;
+        }
+        target = ref; tuid = FindSpawnedUid(ref); tdist = 0.0f; peerDist = best;
+        char pn[48];
+        TalkName(peerNpc, pn);
+        char pb[320];
+        std::sprintf(pb, "[TALK] talktest nearestpeer pick: npc uid=%u '%s' faction=otherPlayer mine=%d dist=%.1f (radius %.0f) -> target uid=%u (this game's first own player character)",
+                     pu, pn, net::IsUidMine(pu) ? 1 : 0, (double)best, (double)g_talkTestPeerR, tuid);
+        DebugLog(std::string(pb));
+    }
+    else if (g_talkTestTargetUid != 0)
     {
         target = FindSpawned(g_talkTestTargetUid);
         if (target == 0 || SayPlausiblePtr(target) == 0) { char nb[80]; std::sprintf(nb, "target uid %u is not here", g_talkTestTargetUid); TalkTestSkip(nb); return; }
@@ -7251,7 +7427,8 @@ void TalkTestDrain()
     Ogre::Vector3 tpos;
     if (!SafeReadPosition(target, &tpos)) { TalkTestSkip("the target's position is unreadable"); return; }
     ::Character* npc = 0; float ndist = -1.0f;
-    if (g_talkTestNpcUid != 0)
+    if (peerNpc != 0) { npc = peerNpc; ndist = peerDist; }   /* nearestpeer: picked above */
+    else if (g_talkTestNpcUid != 0)
     {
         npc = FindSpawned(g_talkTestNpcUid);
         if (npc == 0 || SayPlausiblePtr(npc) == 0) { char nb[80]; std::sprintf(nb, "NPC uid %u is not here", g_talkTestNpcUid); TalkTestSkip(nb); return; }
@@ -7606,6 +7783,12 @@ void TalkCursorInstall()
         + TalkHookState(g_tcChooseHook) + " - the hover on another game's NPC shows that game's answer: "
         + (g_tcOn ? "ON" : "OFF (the copy's own answer stands)");
     if (g_tcOn) DebugLog(s); else ErrorLog(s);
+}
+
+/* T-1022: the speaker test the conversation start refuses by (TkPlayerSpeaker), for policy.cpp's menu filter. ANY THREAD. */
+int TalkPlayerCharacter(void* who)
+{
+    return TkPlayerSpeaker(who);
 }
 
 void TalkCursorHoverEnter(void* who, int kind, unsigned long* prevTid, void** prevWho, int* prevKind)

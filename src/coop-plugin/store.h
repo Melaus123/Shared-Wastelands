@@ -16,6 +16,7 @@
 #include "../common/townrefill.h"   /* townrefill::Tally - StoreTownRecordTally */
 class Faction;
 namespace moneyw { struct Ledger; }   /* T-810: src/common/moneywire.h */
+namespace swteam { struct WorkSum; }   /* teamwire.h: one topic's steps and level (a pointer here, so no include) */
 namespace coop {
 void InstallStore();                         // hooks Platoon::deactivate (post) and Platoon::activate (pre)
 void InstallFontGuard();                     // T-730 (fontguard.cpp, fontguard.h): InstallStore calls it before the title screen is built
@@ -178,6 +179,10 @@ int  StoreLobbyAnswerGen();        /* T552, MAIN THREAD: the link generation the
 long long StoreProfilesPanel(std::vector<StoreProfRow>* rows, unsigned* cap, unsigned* select, std::string* say, int* verdict);   /* the last answer handed to the screen; returns its change number (0 = none yet) */
 int  StoreOpenSaveName(char* out, int cap);   /* PP6 fold-2 F2, MAIN THREAD: SaveFileSystem+0x120, the open save's name (the PP5 redirect's read) - 1 = read into out, 0 = unreadable */
 int  StoreAutoLoadFacts(std::string* folder, int* found, int* quickSave, int* neverPlayed, std::string* profName);   /* T-201 PP6': MAIN THREAD - 1 = the pick is admitted and its folder decided */
+bool StoreSpImportRequest(const std::string& name, const std::string& folder);   /* T-1096, MAIN THREAD: NEW PROFILE with import from a single-player save (PROFILES kind 7); false = not a single-player save or the link is down */
+unsigned StoreSpImportWord();   /* T-1096: the last PROFILES answer's import word (spimport::kWord*; 0 = none sent) */
+int  StoreSpImportMoving();   /* T-1096 part 3, MAIN THREAD: 1 while the carry StoreResetCarryMoving reports is an import from single player */
+int  StoreSpImportSaves(std::vector<std::pair<std::string, unsigned long long> >* rows);   /* T-1096, MAIN THREAD: the single-player saves (folder, quick.save FILETIME), newest first */
 int  StoreResetCarryPost(const std::string& folder);   /* T-36 S2, MAIN THREAD: PostLoadChecked(folder), or Kenshi's IMPORT GAME in its place when the pick is carried into the reset world - the same return codes */
 int  StoreResetCarryMoving();   /* T-36, MAIN THREAD: 1 while this pick is carried into the reset world (decided, its own save not yet made) - the HOST GAME / JOIN line says so */
 int  StoreNewGameReshowTake();
@@ -263,6 +268,7 @@ int  StoreJoinHoldPoll(int holdKind);                      // a held load of tha
 int  StoreRosterSlotInWorld(int slot);   // M7a fold F1, MAIN THREAD: 1 = that slot is IN_WORLD on THIS link's PLAYERS roster, 0 = it is not, -1 = no roster on this link / no slot
 int  StoreRosterNames(std::vector<std::string>* others);   // the other players on THIS link's PLAYERS roster; -1 = no roster on this link
 int  StoreWorldPlayerCount();                              // MAIN THREAD: every player number the world server ever gave in this world (THIS link's PLAYERS roster); -1 = no roster on this link
+int  StoreRosterOpOf(int slot);   // MAIN THREAD: that slot's op bits (coopjoin::kRosterOp*) on THIS link's PLAYERS roster; -1 = no roster on this link / not listed
 int  StoreRosterNameOf(int slot, std::string* name);   // MAIN THREAD: the player name the last PLAYERS roster gives that slot; 1 = a name, 0 = listed without one or not listed, -1 = no roster yet
 /* M11 C1 (T-197, to-do M11; src/common/presence.h): is another player in this world - the old game-to-game link up, OR this link's
    PLAYERS roster shows another slot IN_WORLD. The seven single-writer sites ask this instead of the old link alone. */
@@ -297,8 +303,20 @@ void SetJoinPassword(const std::string& password);       // MAIN THREAD: the pas
 bool StoreWriteWorldAuth(const std::string& worldDir);   // MAIN THREAD, before the world server starts: auth.txt from SetHostPassword's password (removed for none)
 bool StoreNewHostToken(std::string* hex);                // MAIN THREAD, before the world server starts: this hosting's new secret, as hex for its --host-token - never logged
 bool StoreHostToken(unsigned char out[32]);              // MAIN THREAD: this hosting's secret (HOST_TOKEN / the bridge's STEAM_ID); false = this game started no world server
+// THE ADMIN ROAD (admin.cpp). StoreOwnerTokenThisLink: this game showed this hosting's secret (HOST_TOKEN) ahead of the HELLO of
+// the link that is up and welcomed now - the world server then counts it as the owner's own game, an admin with no password.
+// StoreSendAdmin: one ADMIN_LOGIN / ADMIN_REQ up (false = the link is down or not welcomed). StoreLinkWorldId: the world id
+// this link's WELCOME named ("" = none) - the admin proof is bound to it. MAIN THREAD.
+bool StoreOwnerTokenThisLink();
+bool StoreSendAdmin(unsigned type, const std::vector<char>& payload);
+std::string StoreLinkWorldId();
 std::string StoreAccessTest(const std::string& args);    // TEST-ONLY `accesstest`: the hosting game writes its world's access.txt
 int  StoreMySlot();                                      // decision 32: my slot in the relay's order (-1 unknown)
+void* StoreLookalikeEnsure(const std::string& copySid);  // T-1096 (owner 1234 e), MAIN THREAD: the look-alike record a copy id ('<original id>~i<slot>') names - found, or made from its original; 0 = none
+void* StoreLookalikeAtBuild(const std::string& copySid); // T-1096, MAIN THREAD: the look-alike a squad member's build needs (worldstate.cpp detour_loadInstance) - found, or made now; 0 = none
+void StoreLookalikeLeftOut(const char* copySid, void* activePlatoon);         // T-1096, ANY THREAD: a member of the build's group (its ActivePlatoon) on this look-alike was left out of its build (counted with its squad; its copy is made at the next tick)
+void StoreLookalikeBuilt(const char* copySid);           // T-1096, ANY THREAD: a member on this look-alike was built - it is no longer left out
+int  StoreLookalikeLeftCount();                          // T-1096, ANY THREAD: look-alike members left out and not built again, of any squad (the import's save hold counts only the imported squads' share)
 void StoreApplyBlockToNewFaction(void* faction);         // MAIN THREAD: a faction made after this world's number block was applied (a stand-in) takes this game's block
 /* B9 (design-e46-store 2.2, decision 44). ANY THREAD: how many milliseconds this game has been unable to
    see the notebook process. 0 while the link is up. The clock starts at the store's FIRST tick, so a game
@@ -448,6 +466,7 @@ const char* TimeModeName();
 bool StoreSendOption(const std::string& key, const std::string& value);
 // settings2 S2, MAIN THREAD: several keys in one OPTIONS message (same contract: false = not sent).
 bool StoreSendOptions(const std::vector<std::pair<std::string, std::string> >& kv);
+bool StoreSendOptions(const std::vector<std::pair<std::string, std::string> >& kv, bool fill);   /* fill: a first hosting's settings, stored and not said */
 // settings2 S2, MAIN THREAD: the notebook calls this game the world's authority on the current link.
 bool StoreIsWorldAuthority();
 int  StoreTearingDown();                                 // P6c (p5z MEDIUM-2), ANY thread: the engine is tearing the world down - nothing may be invented while it is. P6q (review-p6j LOW-1): an INTERLOCKED read, because the callers that matter are worker threads and a stale `false` here means "invent into a world the engine is freeing right now". P6x (review-p6q MEDIUM-2): the flag behind it is a DEPTH (raised in TeardownBroadcast, lowered in TeardownBroadcastLateFlags) and this answers depth > 0, so a nested teardown's lower cannot open the gate while an outer teardown is still freeing the world
@@ -563,6 +582,22 @@ bool StoreResearchOff();
 bool StoreResearchQueue(std::vector<std::pair<std::string, float> >* q, std::string* text, std::string* why);
 std::string StoreResearchQueueTech(const std::string& sid, std::string* name, std::string* detail);
 std::string StoreResearchNameOf(const std::string& sid);
+/* T-928: research progress shared with teammates. StoreResearchTakeWork: this game's own steps per topic (teamwire.h WORK:
+   the progress each Research::addProgress call added to the front entry) and each topic's latest level (the front's progress
+   after the last call) the hook took since the last call.
+   StoreResearchWorkApply: a teammate's WORK written into this game's front entry's progress, with no engine call, when `sid`
+   is this game's front topic now: the larger of the progress plus the step and the level, never lower (teamwire.h
+   WorkArriveVerdict / WorkTarget; *won = kWtStep / kWtLevel / kWtNone; *before / *after = the front's progress around the
+   write, -1 = not read); kWaNoChange = nothing to write; off the main thread nothing is written (kWaOffMain); after a write
+   the research window, when open, is redrawn as the engine does. MAIN THREAD.
+   StoreResearchWorkInTeam: team.cpp says each frame whether the player is in a team with a world (the hook logs its calls only
+   then). StoreResearchFront: this game's front topic ("" = an empty queue) and its progress; 1 = read, 0 = not. MAIN THREAD.
+   StoreResearchWorkText: the hook's counters. */
+void StoreResearchTakeWork(std::vector<swteam::WorkSum>* out);
+int StoreResearchWorkApply(bool myTeam, const std::string& sid, float amount, float level, float* before, float* after, int* won);
+void StoreResearchWorkInTeam(bool on);
+int StoreResearchFront(std::string* sid, float* prog);
+std::string StoreResearchWorkText();
 /* TEST-ONLY (src/common/carrycheck.h; store.cpp): `carryread [<tag>] [full]` - read-only, this player's finished research, map
    knowledge and faction standings, each as a count and an exact sum on a [CARRY] line, so a read before RESET WORLD and one after
    it compare; `carryset research <techStringID|any> | map <townStringID|town name|any> [explored] | standing <faction>` - one

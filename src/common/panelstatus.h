@@ -36,6 +36,7 @@
 #include "diskformat.h"  /* the newer-format refusal words */
 #include "resurrectfee.h" /* T-556: the resurrection options' keys and the price rule the fee explanation shows */
 #include "panelfit.h"    /* kWorldDlgReset: which dialog the world dialog screen shows */
+#include "spimport.h"    /* T-1096: the import options' keys and their greying rule */
 
 namespace coopui {
 
@@ -284,7 +285,7 @@ inline std::string PanelNotebookText(int state, int port, long exitCode)
 
 /* mp1 (design-mpmenu1 section 7) - WHY THE SHARED WORLD SAID NO, in the Join screen's words. `reason` is
    coopstore::StoreRefuseReason (src/common/storelink.h: 0 versions, 1 no player id, 2 already in, 3 full, 4 lifetime
-   full, 5 mods, 8-14 the password and the access list) - a pure header may not include it, so the offline suite ties the numbers. -1 = not refused. The mods
+   full, 5 mods, 8-14 the password and the access list, 15 removed by an admin, 16 banned) - a pure header may not include it, so the offline suite ties the numbers. -1 = not refused. The mods
    sentence is store.cpp's own (it names what differs) and is passed in; empty falls back to the design's words. */
 inline std::string PanelRefusalText(int reason, const std::string& modsText, int hostMode = 0)   /* T-201 N1b: hostMode 1 = under CAN'T HOST */
 {
@@ -311,6 +312,8 @@ inline std::string PanelRefusalText(int reason, const std::string& modsText, int
         case 12: return kPwFileBadText;
         case 13: return kPwNotOnListText;
         case 14: return kAccessFileBadText;
+        case 15: return "An admin removed you from the world.";   /* kRefuseKicked (mock-up t1159 screen 13) */
+        case 16: return "You are banned from this world.";        /* kRefuseBanned: the JOIN status line too (screen 13) */
         default: return "Version mismatch: this multiplayer mod is a different version from the one running the world.";   /* words1b: host-neutral - the host's own game can see it too */
     }
 }
@@ -790,13 +793,14 @@ inline std::string PanelScreenTitle(int screen, int profDlg, int hostMode, const
     {
         if (profDlg == 1) return "NEW PROFILE";
         if (profDlg == 2) return "DELETE PROFILE?";
+        if (profDlg == kProfDlgImport) return spimport::kPickTitle;   /* T-1096 part 3 */
         return (hostMode != 0 && !hostWorld.empty()) ? "PROFILES: " + hostWorld : std::string("PROFILES");   /* NEW WORDING: was "PROFILES - " */
     }
     if (screen == 8) return "PASSWORD REQUIRED";   /* T-290 */
     if (screen == 9) return "INVITE FRIENDS";
     if (screen == 6) return "GAME OPTIONS: " + optWorld;
     if (screen == 5) return "HOSTING: " + hostWorld;
-    if (screen == 4) return profDlg == kWorldDlgReset ? "RESET WORLD?" : "DELETE WORLD?";
+    if (screen == 4) return profDlg == kWorldDlgReset ? "RESET WORLD?" : profDlg == kWorldDlgStop ? "STOP WORLD?" : "DELETE WORLD?";
     if (screen == 3) return "NEW WORLD";
     if (screen == 2) return "JOIN GAME";
     if (screen == 1) return "HOST GAME";
@@ -1000,6 +1004,7 @@ inline std::string FactionMovedText(const std::string& asked, const std::string&
 { return "Another player in this world already uses the faction name \"" + asked + "\". Your faction is now called \"" + now + "\"."; }
 /* PP6 - after PLAY on PROFILES: a played profile loads, a never-played one opens Kenshi's NEW GAME. */
 inline std::string ProfLoadingText(const std::string& name)     { return "Loading \"" + name + "\"..."; }   /* T-201 N1: double quotes */
+const char* const kImportMovingText = "Importing from single player...";   /* T-1096 part 3: that line while the profile starts from a single-player save (the same road) */
 const char* const kResetMovingText = "Moving your characters into the reset world...";   /* the HOST GAME / JOIN line while the profile is carried into a reset world */
 inline std::string ProfOpeningNewGameText(const std::string& name) { return "Opening NEW GAME for \"" + name + "\"..."; }
 /* T-201 PP6' (approved 2026-09-29): a profile made on PROFILES - PLAY (or the HOST press) loads it by itself now, so the line
@@ -1161,26 +1166,28 @@ inline std::string PanelPlayersText(const std::string& me, const std::vector<std
 /* mp5 (design-mpmenu1 section 5) - [C] GAME OPTIONS: the rows, their steps and their words.  Every value a row can
    produce is one the notebook's own checks accept (gpoptions.h GpValueOk / GtValueOk, recruitmult.h, and the
    basepolicy / timemode word sets) - the offline suite walks every step of every row to prove it.
-   STEP LIMITS: the design's proposed ranges, 0.25x-4x (difficulty) and 0.25x-2x (world).  Kenshi builds its own
-   sliders in code (no range in its layout files) and their limits were NOT decoded - Guess that they may differ.
-   Attacks on your base 0-5 with 5 = off, limb loss 0-3: shown as numbers, the engine's own labels not read.
+   STEP LIMITS: each number row steps through its ladder inside Kenshi's own New Game and Options limits for that row
+   (gpoptions.h RuleLimits), so every row reaches both its ends and holds 1.  BASE ATTACKS 0-5 and LIMB LOSS 0-2 show
+   Kenshi's words (rulesfile.h Words - the offline suite checks the two agree).  A world value outside the steps (the world
+   accepts the wider range of gpoptions.h GpValueOk / GtValueOk) is shown as it is, a word row's as its number, and a step
+   from it goes to the nearest choice in that direction.
    gp.ae, gp.dh, gt.civ (no visible effect, design-settings1) and researchmode (hidden until L2c') are not rows. */
 enum { kOptTabDifficulty = 0, kOptTabWorld = 1, kOptTabCoop = 2, kOptTabCount = 3 };
 /* kOptKindSwitch: a tick box whose values are "on" / "off" (the world server's words); kOptKindAmount: a typing box of digits. */
 enum { kOptKindDifficulty = 0, kOptKindWorld = 1, kOptKindTick = 2, kOptKindPick = 3, kOptKindSwitch = 4, kOptKindAmount = 5 };
-const int kOptCount = 22;   /* ui5: + PROFILES PER PLAYER; T-556: + RESURRECTION, RESURRECTION FEE, FEE GROWTH */
-const int kOptRowsShown = 9;   /* the most rows one tab has (Difficulty) */
+const int kOptCount = 25;   /* ui5: + PROFILES PER PLAYER; T-556: + RESURRECTION, RESURRECTION FEE, FEE GROWTH; T-1096: + the three import rows */
+const int kOptRowsShown = 10;   /* the most rows one tab has (MULTIPLAYER since T-1096) */
 struct OptDef { int tab; const char* key; const char* label; int kind; const char* dflt; };
 inline const OptDef* OptDefs()
 {
     static const OptDef d[kOptCount] = {
         { kOptTabDifficulty, "gp.gdm", "DAMAGE", kOptKindDifficulty, "1" },
         { kOptTabDifficulty, "gp.cod", "CHANCE OF DEATH", kOptKindDifficulty, "1" },
-        { kOptTabDifficulty, "gp.ht", "HUNGER SPEED", kOptKindDifficulty, "1" },
+        { kOptTabDifficulty, "gp.ht", "HUNGER TIME", kOptKindDifficulty, "1" },
         { kOptTabDifficulty, "gp.bs", "BUILDING SPEED", kOptKindDifficulty, "1" },
         { kOptTabDifficulty, "gp.rs", "RESEARCH SPEED", kOptKindDifficulty, "1" },
         { kOptTabDifficulty, "gp.ps", "CRAFTING SPEED", kOptKindDifficulty, "1" },
-        { kOptTabDifficulty, "gp.nnm", "ANIMAL NESTS", kOptKindDifficulty, "1" },
+        { kOptTabDifficulty, "gp.nnm", "NESTS AND CAMPS", kOptKindDifficulty, "1" },
         { kOptTabDifficulty, "gp.bl", "BANDITS LOOT DOWNED CHARACTERS", kOptKindTick, "1" },
         { kOptTabDifficulty, "gp.ep", "EASY PROSPECTING", kOptKindTick, "0" },
         { kOptTabWorld, "gt.pop", "POPULATION", kOptKindWorld, "1" },
@@ -1199,34 +1206,42 @@ inline const OptDef* OptDefs()
            server keeps (resurrectfee.h) - off, 1000 and steep unless the host changes them. */
         { kOptTabCoop, "resurrect", "RESURRECTION", kOptKindSwitch, "off" },
         { kOptTabCoop, "resurrectfee", "RESURRECTION FEE", kOptKindAmount, "1000" },
-        { kOptTabCoop, "resurrectgrowth", "FEE GROWTH", kOptKindPick, "steep" } };
+        { kOptTabCoop, "resurrectgrowth", "FEE GROWTH", kOptKindPick, "steep" },
+        /* T-1096 (owner 1224; the approved page): who may start a profile from a single-player save, and whether its money and
+           research come along - the world server keeps them (spimport.h; store_main.cpp OptionValueOk). */
+        { kOptTabCoop, "spimport", "IMPORT FROM SINGLE PLAYER", kOptKindPick, "all" },
+        { kOptTabCoop, "spimportmoney", "IMPORT INCLUDES MONEY", kOptKindPick, "yes" },
+        { kOptTabCoop, "spimportresearch", "IMPORT INCLUDES RESEARCH", kOptKindPick, "yes" } };
     return d;
 }
 struct OptChoice { const char* key; const char* wire; const char* shown; };
-const int kOptChoiceCount = 38;   /* ui5: + profilecap 1..16; T-556: + resurrectgrowth */
+const int kOptChoiceCount = 44;   /* ui5: + profilecap 1..16; T-556: + resurrectgrowth; T-1096: + the import rows */
 inline const OptChoice* OptChoices()
 {
     static const OptChoice c[kOptChoiceCount] = {
-        { "gt.attacks", "0", "0" }, { "gt.attacks", "1", "1" }, { "gt.attacks", "2", "2" }, { "gt.attacks", "3", "3" },
-        { "gt.attacks", "4", "4" }, { "gt.attacks", "5", "5 (Off)" },
-        { "gt.limbloss", "0", "0" }, { "gt.limbloss", "1", "1" }, { "gt.limbloss", "2", "2" }, { "gt.limbloss", "3", "3" },
+        { "gt.attacks", "0", "Bombardment" }, { "gt.attacks", "1", "High" }, { "gt.attacks", "2", "Normal" }, { "gt.attacks", "3", "Fewer" },
+        { "gt.attacks", "4", "Rare" }, { "gt.attacks", "5", "Never" },
+        { "gt.limbloss", "0", "Never" }, { "gt.limbloss", "1", "Rare" }, { "gt.limbloss", "2", "Frequent" },
         { "recruitmult", "auto", "Auto" }, { "recruitmult", "1", "1" }, { "recruitmult", "2", "2" }, { "recruitmult", "3", "3" },
         { "recruitmult", "4", "4" },
         { "basepolicy", "shared", "Everyone" }, { "basepolicy", "owner", "Owner only" }, { "basepolicy", "locked", "Locked" },
-        { "timemode", "fixed", "Host" }, { "timemode", "consensus", "Vote" },
+        { "timemode", "fixed", "Admin only" }, { "timemode", "consensus", "Slowest wins" },
         { "profilecap", "1", "1" }, { "profilecap", "2", "2" }, { "profilecap", "3", "3" }, { "profilecap", "4", "4" },
         { "profilecap", "5", "5" }, { "profilecap", "6", "6" }, { "profilecap", "7", "7" }, { "profilecap", "8", "8" },
         { "profilecap", "9", "9" }, { "profilecap", "10", "10" }, { "profilecap", "11", "11" }, { "profilecap", "12", "12" },
         { "profilecap", "13", "13" }, { "profilecap", "14", "14" }, { "profilecap", "15", "15" }, { "profilecap", "16", "16" },
-        { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" } };
+        { "resurrectgrowth", "steady", "Steady" }, { "resurrectgrowth", "steep", "Steep" },
+        { "spimport", "all", "Allowed for everyone" }, { "spimport", "host", "Host only" }, { "spimport", "off", "Not allowed" },
+        { "spimportmoney", "yes", "Yes" }, { "spimportmoney", "no", "No" },
+        { "spimportresearch", "yes", "Yes" }, { "spimportresearch", "no", "No" } };
     return c;
 }
 inline const double* OptLadder(int kind, int* n)
 {
-    static const double diff[10]  = { 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0 };
-    static const double world[8]  = { 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0 };
-    if (kind == kOptKindDifficulty) { *n = 10; return diff; }
-    if (kind == kOptKindWorld) { *n = 8; return world; }
+    static const double diff[12]  = { 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0 };
+    static const double world[11] = { 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0 };
+    if (kind == kOptKindDifficulty) { *n = 12; return diff; }
+    if (kind == kOptKindWorld) { *n = 11; return world; }
     *n = 0;
     return 0;
 }
@@ -1327,6 +1342,11 @@ inline bool OptRowLit(int i, const std::string* vals)
 {
     if (i < 0 || i >= kOptCount) return false;
     const std::string k = OptDefs()[i].key;
+    if (k == spimport::kKeyMoney || k == spimport::kKeyResearch)   /* T-1096: greyed while IMPORT FROM SINGLE PLAYER is Not allowed */
+    {
+        const int mode = OptIndexOfKey(spimport::kKeyMode);
+        return mode >= 0 && spimport::IncludesRowLit(vals[mode]);
+    }
     if (k != swfee::kKeyAmount && k != swfee::kKeyGrowth) return true;
     const int on = OptIndexOfKey(swfee::kKeyOn);
     if (on < 0 || vals[on] != "on") return false;
@@ -1342,12 +1362,12 @@ inline bool OptHasHoverNote(int i)
     const std::string k = OptDefs()[i].key;
     return k == "gp.nnm" || k == swfee::kKeyAmount || k == swfee::kKeyGrowth;
 }
-/* Row i's hover note with the screen's values `vals` (indexed like OptDefs), or "" for none: ANIMAL NESTS' note, and for
+/* Row i's hover note with the screen's values `vals` (indexed like OptDefs), or "" for none: NESTS AND CAMPS' note, and for
    both RESURRECTION FEE and FEE GROWTH the same OptFeeNoteText. */
 inline std::string OptHoverText(int i, const std::string* vals)
 {
     if (!OptHasHoverNote(i)) return std::string();
-    if (std::string(OptDefs()[i].key) == "gp.nnm") return "Animal nests: only affects areas not yet visited.";
+    if (std::string(OptDefs()[i].key) == "gp.nnm") return "Nests and camps: only affects areas not yet visited.";
     const int on = OptIndexOfKey(swfee::kKeyOn), am = OptIndexOfKey(swfee::kKeyAmount), gr = OptIndexOfKey(swfee::kKeyGrowth);
     if (on < 0 || am < 0 || gr < 0) return std::string();
     return OptFeeNoteText(vals[on], vals[am], vals[gr]);
@@ -1372,10 +1392,17 @@ inline std::string OptCanon(int i, const std::string& v)
     {
         for (int c = 0; c < kOptChoiceCount; ++c)
             if (std::string(OptChoices()[c].key) == d.key && v == OptChoices()[c].wire) return v;
+        const std::string k = d.key;   /* BASE ATTACKS / LIMB LOSS: any whole number the world accepts, as a number */
+        if ((k == "gt.attacks" || k == "gt.limbloss") && coopgp::GtValueOk(k, v))
+        {
+            std::string t = v;
+            while (t.size() > 1 && t[0] == '0') t.erase(0, 1);
+            return t;
+        }
         return std::string();
     }
     double x = 0.0;
-    if (!coopgp::GpKindValueOk(coopgp::kGpFloat, v, &x)) return std::string();
+    if (!coopgp::GpKindValueOk(coopgp::kGpFloat, v, &x)) return std::string();   /* a value the world refuses is never shown */
     return OptFloatText(x);
 }
 /* One step of row i: dir -1 down, +1 up (a tick box flips; a typing box does not step).  At an end the same value comes
@@ -1393,16 +1420,31 @@ inline std::string OptStep(int i, const std::string& cur, int dir)
         for (int c = 0; c < kOptChoiceCount; ++c) if (std::string(OptChoices()[c].key) == d.key) w.push_back(OptChoices()[c].wire);
         int at = -1;
         for (int k = 0; k < (int)w.size(); ++k) if (w[(size_t)k] == cur) at = k;
+        double x = 0.0, y = 0.0;
+        if (at < 0 && coopgp::GpParseNumber(cur, &x))
+        {   /* a world value that is none of the choices (a number set in rules.txt): the nearest choice in that direction */
+            std::string best = cur;
+            double gap = 0.0;
+            for (size_t k = 0; k < w.size(); ++k)
+            {
+                if (!coopgp::GpParseNumber(w[k], &y) || (dir > 0 ? y <= x : y >= x)) continue;
+                const double g = dir > 0 ? y - x : x - y;
+                if (best == cur || g < gap) { best = w[k]; gap = g; }
+            }
+            return best;
+        }
         if (at < 0) return w.empty() ? cur : w[0];
         const int to = at + (dir > 0 ? 1 : -1);
         return (to < 0 || to >= (int)w.size()) ? cur : w[(size_t)to];
     }
     int n = 0;
     const double* l = OptLadder(d.kind, &n);
+    double lo = 0.0, hi = 0.0;   /* the row's steps are the ladder's inside Kenshi's own limits for it */
+    if (!coopgp::LimitsOf(d.key, &lo, &hi)) { lo = 0.0; hi = 1e9; }
     double x = 0.0;
     if (!coopgp::GpParseNumber(cur, &x)) return OptFloatText(1.0);
-    if (dir > 0) { for (int k = 0; k < n; ++k) if (l[k] > x + 1e-6) return OptFloatText(l[k]); }
-    else         { for (int k = n - 1; k >= 0; --k) if (l[k] < x - 1e-6) return OptFloatText(l[k]); }
+    if (dir > 0) { for (int k = 0; k < n; ++k) if (l[k] > x + 1e-6 && l[k] >= lo - 1e-9 && l[k] <= hi + 1e-9) return OptFloatText(l[k]); }
+    else         { for (int k = n - 1; k >= 0; --k) if (l[k] < x - 1e-6 && l[k] >= lo - 1e-9 && l[k] <= hi + 1e-9) return OptFloatText(l[k]); }
     return cur;
 }
 inline bool OptCanStep(int i, const std::string& cur, int dir) { return OptStep(i, cur, dir) != cur; }
@@ -1430,6 +1472,12 @@ inline std::string OptShown(int i, const std::string& cur)
     else if (frac % 10 == 0) s += PanelNum(frac / 10);
     else s += (frac < 10 ? std::string("0") : std::string()) + PanelNum(frac);
     return s + "x";
+}
+/* The panel's status line when GAME OPTIONS is pressed for a world whose rules.txt is on disk and cannot be read: GAME OPTIONS
+   stays closed. */
+inline std::string PanelRulesUnreadableText()
+{
+    return "This world's rules file can't be read right now. Close any program that has rules.txt open, then try again.";
 }
 /* The notebook's options.txt (`v1<TAB>key<TAB>value` per line, store_main.cpp OptionsParseInto) as a map. */
 inline void OptParseFile(const std::string& text, std::map<std::string, std::string>* out)

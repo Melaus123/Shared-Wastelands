@@ -31,6 +31,8 @@
 #include "money.h"   /* T-810: GIVE MONEY - money.cpp takes SEND from the box */
 #include "../common/moneywire.h"   /* T-810: GIVE MONEY's words */
 #include "../common/chatwire.h"   /* MESSAGE's word */
+#include "admin.h"   /* the owner's admin row: AdminOwnerNow, AdminListChange */
+#include "../common/adminwords.h"   /* the admin row's words */
 #include "../common/teamscreens.h"   /* the faction screens: the bottom line's actions, the boxes' words */
 #include "soak.h"
 #include "net/session.h"
@@ -84,6 +86,8 @@ const char* const kActName[2] = { "SWPlayersLeftActBtn", "SWPlayersRightActBtn" 
 const char* const kNoteName   = "SWPlayersRightNote";   /* the words in the right-hand button's place (why a player cannot be invited) */
 const char* const kMsgName = "SWPlayersMessageBtn";   /* MESSAGE: the chat with TO set to the selected player */
 const char* const kGiveName = "SWPlayersGiveMoneyBtn";   /* T-810 GIVE MONEY: the GIVE MONEY box for the selected player */
+const char* const kAdminLineName = "SWPlayersAdminLine";   /* the owner's admin row: the picked player's words */
+const char* const kAdminBtnName = "SWPlayersAdminBtn";     /* the owner's admin row: MAKE ADMIN / REMOVE ADMIN */
 const char* const kBoxAmount = "SWGiveMoneyAmount";   /* the GIVE MONEY box's typing box and its hint line */
 const char* const kBoxHint = "SWGiveMoneyHint";
 const int kBoxGiveMoney = 1000;   /* the GIVE MONEY box: this module's own box kind, beside teamscreen::kBox* */
@@ -127,6 +131,13 @@ int g_giveShown = -1;
 MyGUI::EditBox* g_boxAmount = 0;     /* the GIVE MONEY box's amount and hint line, while that box is up */
 MyGUI::TextBox* g_boxHint = 0;
 long long g_givePressed = 0, g_giveSent = 0, g_giveRefused = 0;
+/* the owner's admin row under the bottom row: the picked player's words and MAKE ADMIN / REMOVE ADMIN */
+MyGUI::TextBox* g_adminLine = 0;
+MyGUI::Button* g_adminBtn = 0;
+bool g_adminRow = false;             /* the page was built with the admin row (this game was the owner's own game then) */
+std::string g_adminShown;            /* the admin row as last applied */
+int g_adminListed = -1;              /* the picked player's admin-list mark as the row shows it (-1 = the row hidden) */
+long long g_adminPressed = 0;
 std::string g_shownView;
 teamscreen::View g_view;
 bool g_viewSelected = false;
@@ -206,6 +217,8 @@ public:
         if (g_note != 0 && Inside(g_note, w)) g_note = 0;
         if (g_msg != 0 && Inside(g_msg, w)) g_msg = 0;
         if (g_give != 0 && Inside(g_give, w)) g_give = 0;
+        if (g_adminLine != 0 && Inside(g_adminLine, w)) g_adminLine = 0;
+        if (g_adminBtn != 0 && Inside(g_adminBtn, w)) g_adminBtn = 0;
         if (g_boxAmount != 0 && Inside(g_boxAmount, w)) g_boxAmount = 0;
         if (g_boxHint != 0 && Inside(g_boxHint, w)) g_boxHint = 0;
     }
@@ -221,7 +234,8 @@ bool UnlinkerOn()
     g_unlinkerOn = true;
     return true;
 }
-bool PageWhole() { return g_list != 0 && g_line != 0 && g_select != 0 && g_btn[0] != 0 && g_btn[1] != 0 && g_btn[2] != 0 && g_act[0] != 0 && g_act[1] != 0 && g_note != 0; }
+bool PageWhole() { return g_list != 0 && g_line != 0 && g_select != 0 && g_btn[0] != 0 && g_btn[1] != 0 && g_btn[2] != 0 && g_act[0] != 0 && g_act[1] != 0 && g_note != 0
+                          && (!g_adminRow || (g_adminLine != 0 && g_adminBtn != 0)); }
 
 /* the management window's tab control, or 0 while the window has not been built (it is built the first time it opens) */
 MyGUI::TabControl* FindTabs()
@@ -378,6 +392,7 @@ void ForgetTab()
     g_tabs = 0; g_item = 0; g_list = 0; g_line = 0; g_select = 0; g_btn[0] = g_btn[1] = g_btn[2] = 0;
     g_msg = 0; g_msgShown = -1;
     g_give = 0; g_giveShown = -1;
+    g_adminLine = 0; g_adminBtn = 0; g_adminRow = false; g_adminShown.clear(); g_adminListed = -1;
     g_rows.clear(); g_selSlot = -1; g_shownLine.clear(); g_shownSelect.clear(); g_shownTicked = -2; g_shownSelected = -1; g_shownLocked = -1; g_rowsEpoch = -1;
 }
 
@@ -389,6 +404,7 @@ void OnBoxConfirm(MyGUI::Widget* w);
 void OnActClicked(MyGUI::Widget* w);
 void OnMessageClicked(MyGUI::Widget* w);
 void OnGiveClicked(MyGUI::Widget* w);
+void OnAdminClicked(MyGUI::Widget* w);
 
 /* THE PAGE (mock-up A4.2): the table (Kenshi's own Kenshi_MultiListBox, as the Load Game list) over the tab's height, the
    stance line (painted text, the window's label face) and the three tick buttons (Kenshi_TickButton1) along the bottom. Sizes
@@ -403,7 +419,10 @@ bool BuildPage(MyGUI::TabItem* item)
     const int actW = Clamp(W * 26 / 100, 150, 300);
     const int btnW = Clamp((W - actW - 5 * gap) / 3, 60, Clamp(W * 16 / 100, 96, 200));
     const int lineH = Clamp(H * 32 / 1000, 18, 32);
-    const int btnY = H - pad - btnH;
+    /* on the owner's own game one more row under the bottom row, the same height (the admin row): the bottom row moves up by it */
+    const bool adminRow = coop::AdminOwnerNow();
+    const int adminY = H - pad - btnH;
+    const int btnY = adminRow ? adminY - pad / 2 - btnH : adminY;
     const int lineY = btnY - pad / 2 - lineH;
     const int listY = pad, listH = lineY - pad - listY;
     if (listH < 60) return false;
@@ -506,6 +525,30 @@ bool BuildPage(MyGUI::TabItem* item)
         const int lineW = giveX - gap - lc.left;
         lt->setCoord(MyGUI::IntCoord(lc.left, lc.top, lineW > 1 ? lineW : 1, lc.height));
         DebugLog("[UI] rect playerstab give money x=" + S(giveX) + " y=" + S(giveY) + " w=" + S(giveW) + " h=" + S(btnH) + " left of MESSAGE (the line's text now w=" + S(lineW) + ")");
+    }
+    /* the owner's admin row: the picked player's words from where the line's text starts, MAKE ADMIN / REMOVE ADMIN at the right edge
+       where INVITE TO FACTION is on the row above, the same size and style */
+    g_adminRow = false;
+    if (adminRow)
+    {
+        const int abX = W - actW - gap;
+        MyGUI::Widget* aw = Mk(item, "Button", "Kenshi_Button2", abX, adminY, actW, btnH, MyGUI::Align::Right | MyGUI::Align::Bottom, kAdminBtnName);
+        MyGUI::Button* a = aw != 0 ? aw->castType<MyGUI::Button>(false) : 0;
+        const MyGUI::IntCoord lc = lt->getCoord();
+        const int textW = abX - gap - lc.left;
+        MyGUI::Widget* tw = Mk(item, "TextBox", "Kenshi_TextboxPaintedText", lc.left, adminY + (btnH - lineH) / 2, textW, lineH, MyGUI::Align::HStretch | MyGUI::Align::Bottom, kAdminLineName);
+        MyGUI::TextBox* t = tw != 0 ? tw->castType<MyGUI::TextBox>(false) : 0;
+        if (a == 0 || t == 0) return false;
+        g_adminBtn = a; g_adminLine = t; g_adminRow = true; g_adminShown.clear(); g_adminListed = -1;
+        a->setTextColour(Lit());
+        a->setCaption(MyGUI::UString(""));
+        a->eventMouseButtonClick += MyGUI::newDelegate(OnAdminClicked);
+        a->setVisible(false);
+        t->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
+        t->setCaption(MyGUI::UString(""));
+        t->setVisible(false);
+        DebugLog("[UI] rect playerstab admin row y=" + S(adminY) + " h=" + S(btnH) + " words x=" + S(lc.left) + " w=" + S(textW) + " button x=" + S(abX) + " w=" + S(actW)
+                 + " (the bottom row moved up to y=" + S(btnY) + ")");
     }
     DebugLog("[UI] rect playerstab actions w=" + S(actW) + " h=" + S(btnH) + " left x=" + S(gap) + " right x=" + S(W - actW - gap) + " y=" + S(btnY)
              + " stance buttons x=" + S(gap) + ".." + S(gap + 3 * btnW + 2 * gap) + " (clear of the right-hand button: " + (gap + 3 * btnW + 2 * gap <= W - actW - gap ? "yes" : "NO") + ")");
@@ -611,6 +654,29 @@ void FitCaption(MyGUI::TextBox* t, const std::string& s)
     }
 }
 
+/* the owner's admin row for the picked player: "<name> is not an admin." + MAKE ADMIN, or "<name> is an admin." + REMOVE ADMIN, by
+   the admin-list mark of this link's PLAYERS roster (only the owner's own game's copy carries it); hidden with no player picked */
+void ApplyAdminRow(const std::vector<playerstab::RowView>& rows, bool selected)
+{
+    if (!g_adminRow || g_adminLine == 0 || g_adminBtn == 0) return;
+    const int i = (selected && g_selSlot >= 0 && coop::AdminOwnerNow()) ? playerstab::RowOfSlot(rows, g_selSlot) : -1;
+    const int op = i >= 0 ? coop::StoreRosterOpOf(g_selSlot) : -1;
+    const int listed = op < 0 ? -1 : ((op & (int)admincmd::kOpAdmin) != 0 ? 1 : 0);
+    const std::string line = listed < 0 ? std::string() : adminwords::AdminRowLine(rows[(size_t)i].name, listed == 1);
+    const std::string sig = S(listed) + "|" + line;
+    g_adminListed = listed;
+    if (sig == g_adminShown) return;
+    g_adminShown = sig;
+    g_adminLine->setVisible(listed >= 0);
+    g_adminBtn->setVisible(listed >= 0);
+    if (listed >= 0)
+    {
+        FitCaption(g_adminLine, playerstab::EscapeHash(line));
+        g_adminBtn->setCaption(MyGUI::UString(adminwords::AdminRowButton(listed == 1)));
+    }
+    DebugLog("[PLAYERS] admin row: " + (listed < 0 ? std::string("hidden") : "'" + line + "' [" + adminwords::AdminRowButton(listed == 1) + "]") + " (selected slot " + S(g_selSlot) + ")");
+}
+
 void ApplyBottom(const std::vector<playerstab::RowView>& rows)
 {
     const playerstab::Bottom b = playerstab::BottomFor(rows, g_selSlot);
@@ -659,6 +725,7 @@ void ApplyBottom(const std::vector<playerstab::RowView>& rows)
         g_shownLocked = playerstab::LockLook(b);
         for (int k = 0; k < 3; ++k) if (g_btn[k] != 0) g_btn[k]->setEnabled(playerstab::ButtonEnabled(b, k));
     }
+    ApplyAdminRow(rows, b.selected);
 }
 /* the rows' inputs moved since they were built: a standing with this game's player faction (RelationsPlayerPairEpoch), or
    kRowsEveryMs passed (the roster's names and who is online, a player's faction arriving) */
@@ -803,6 +870,7 @@ void TickBody()
         if (!PageWhole()) { Remove(g_tabs, "a widget of its page was destroyed"); return; }
         const bool shown = Shown(g_tabs);
         if (!shown && !Wanted()) { Remove(g_tabs, "this world has no other players"); return; }
+        if (!shown && g_adminRow != coop::AdminOwnerNow()) { Remove(g_tabs, "this game's owner standing changed - the page is built again with or without the admin row"); return; }
         coop::MgmtTabsFitTick(g_tabs);   /* the strip's captions measured once the window is open */
         if (shown && g_tabs->getIndexSelected() == (size_t)playerstab::kTabIndex && RowsStale()) Refresh();
         return;
@@ -1249,6 +1317,18 @@ void MessageBody()
 }
 void MessageCatching() { try { MessageBody(); } catch (...) { ++g_throws; } }
 void OnMessageClicked(MyGUI::Widget*) { __try { MessageCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
+/* the owner's MAKE ADMIN / REMOVE ADMIN: sent at once (no box), for the player picked and the mark the row shows; the world server's
+   answer comes as this player's chat line */
+void AdminBody()
+{
+    ++g_adminPressed;
+    const int slot = g_selSlot, listed = g_adminListed;
+    if (slot < 0 || listed < 0) { DebugLog("[PLAYERS] the admin row's button pressed with no player picked - nothing sent"); return; }
+    DebugLog("[PLAYERS] " + std::string(adminwords::AdminRowButton(listed == 1)) + " pressed for slot " + S(slot) + " (pressed " + S(g_adminPressed) + ")");
+    coop::AdminListChange(slot, listed == 0, "the PLAYERS tab");
+}
+void AdminCatching() { try { AdminBody(); } catch (...) { ++g_throws; } }
+void OnAdminClicked(MyGUI::Widget*) { __try { AdminCatching(); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
 void OnBoxConfirm(MyGUI::Widget*) { g_boxPressedOn = g_box; ::InterlockedExchange(&g_boxPress, 2); }
 void RowCatching(MyGUI::MultiListBox* list, size_t index) { try { RowBody(list, index); } catch (...) { ++g_throws; } }
 void OnRowPicked(MyGUI::MultiListBox* list, size_t index) { __try { RowCatching(list, index); } __except (EXCEPTION_EXECUTE_HANDLER) { ++g_faults; g_uiDead = true; } }
@@ -1280,6 +1360,7 @@ void ShownReport()
              + " right='" + (g_act[1] != 0 && Shown(g_act[1]) ? std::string(teamscreen::ActionCaption(g_actShown[1])) : std::string()) + "'"
              + " rightWords='" + (g_note != 0 && Shown(g_note) ? g_view.note : std::string()) + "'"
              + " | GIVE MONEY " + (g_give != 0 ? Vis(g_give) : std::string("none"))
+             + " | admin row " + (g_adminLine != 0 && Shown(g_adminLine) ? "'" + g_adminLine->getCaption().asUTF8() + "' [" + (g_adminBtn != 0 ? g_adminBtn->getCaption().asUTF8() : std::string()) + "]" : std::string(g_adminRow ? "hidden" : "none"))
              + " | rows: " + (rows.empty() ? std::string("none") : rows)
              + " | box: " + (g_box != 0 ? "'" + BoxTitleOf(g_boxKind) + "' text=" + (g_boxKind == kBoxGiveMoney ? S((int)g_boxText.size()) + " chars" : "'" + g_boxText + "'")   /* GIVE MONEY: counts only - its text names a player */
                             + " left='" + BoxLeftOf(g_boxKind) + "' right='" + BoxRightOf(g_boxKind) + "'"

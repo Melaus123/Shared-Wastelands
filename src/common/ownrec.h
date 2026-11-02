@@ -1326,6 +1326,55 @@ inline int GdcAddChar(const char* src, size_t sn, const char* dst, size_t dn, co
     return kStripOk;
 }
 
+/* T-1139: a person the roster check copies back (addBack) may have a NEWER copy than the save's - in the record of a squad the save
+   does not have (made after the save; the load cannot rebuild that squad yet, so he goes back into his old squad - design 3.3,
+   decisions 1091 a / 1092 a). HeldRec = one such record: its key, seq, written-at time and people. NewestHolder = the one that holds
+   who and that the overlay rule takes (OverlayCandidate: newer than the save), the highest seq when several do (the last place he
+   was recorded); v.size() = none - his copy comes from the save, as before. Nobody, or a person with no hand ('?'), never matches. */
+struct HeldRec
+{
+    std::string              key;
+    unsigned long long       seq;
+    long long                writtenAt;
+    std::vector<std::string> chars;
+    HeldRec() : seq(0), writtenAt(0) {}
+};
+inline size_t NewestHolder(const std::vector<HeldRec>& v, const std::string& who, int rule, unsigned long long markSeq, long long saveTime)
+{
+    size_t best = v.size();
+    if (who.empty() || who[0] == '?') return best;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (!OverlayCandidate(rule, markSeq, saveTime, v[i].seq, v[i].writtenAt)) continue;
+        if (std::find(v[i].chars.begin(), v[i].chars.end(), who) == v[i].chars.end()) continue;
+        if (best == v.size() || v[i].seq > v[best].seq) best = i;
+    }
+    return best;
+}
+/* T-1139: what the records store's own.index says at a load. No index file, or an empty one, and no record file beside it:
+   kIdxNoRecords - no records yet for this world and profile, nothing to lay over (NOT a refusal). The refusals (identityRefused):
+   kIdxLost = record files but no index (or an empty one), kIdxUnreadable = the index is there but could not be read, kIdxNoHead =
+   an index with no identity line, kIdxOtherWorld = its identity line names another world or profile. kIdxOk = this world's.
+   probeFailed (review fold): looking for the index or the record files failed for a reason other than "not found" (access denied) -
+   with no index read, that is kIdxUncheckable, a refusal: missing and unreadable are never one answer. */
+const int kIdxOk = 0, kIdxNoRecords = 1, kIdxLost = 2, kIdxUnreadable = 3, kIdxNoHead = 4, kIdxOtherWorld = 5, kIdxUncheckable = 6;
+inline int StoreIndexVerdict(bool exists, bool read, size_t bytes, bool recFiles, bool haveHead, bool matches, bool probeFailed = false)
+{
+    if (!exists || (read && bytes == 0)) return probeFailed ? kIdxUncheckable : recFiles ? kIdxLost : kIdxNoRecords;
+    if (!read) return kIdxUnreadable;
+    if (!haveHead) return kIdxNoHead;
+    return matches ? kIdxOk : kIdxOtherWorld;
+}
+/* the verdict in words, for the overlay's REFUSED line and the pending-strips line */
+inline const char* StoreIndexVerdictName(int v)
+{
+    return v == kIdxOk ? "this world's own.index" : v == kIdxNoRecords ? "no records yet for this world and profile"
+         : v == kIdxLost ? "the store holds record files but no own.index (or an empty one)"
+         : v == kIdxUnreadable ? "the store's own.index is there but could not be read"
+         : v == kIdxNoHead ? "the store's own.index has no identity line"
+         : v == kIdxOtherWorld ? "the store's own.index names another world or profile"
+         : v == kIdxUncheckable ? "the store's own.index or record files could not be looked for (not a 'not found')" : "unknown";
+}
 /* THE ROSTER CHECK (design 3.3; review-mmo2 items 2 and 5). One squad the overlay may apply: its characters in the
    save's version and in the record. apply: in = 1 for a candidate; out = 1 when the record is laid over the save.
    conflict / duplicate / empty: why it was refused (the save's version is kept).
@@ -1995,6 +2044,12 @@ inline int LeaveSaveStep(int phase, unsigned int msInPhase, int drainDone, int r
    game. THE TWO WAYS TO KNOW IT: the host's SESSION_CLOSING (a deliberate leave or exit), or the game link staying down
    through link1's whole backoff (the 2, 4, 8 and 16 s re-dials, gamelink.h) after the host was seen in this world. */
 const int kHlNone = 0, kHlAnnounced = 1, kHlLost = 2;
+const int kHlWorldStopped = 3;   /* a kept world's server said it is stopping (WORLD_STOPPING, keeprunning.h): DISCONNECTED as announced, its own sentence */
+const int kHlKicked = 4, kHlBanned = 5;   /* an admin removed this player (REFUSE reason 15) or banned them (16): DISCONNECTED as announced, its own sentence */
+/* a running world's REFUSE that removed this player: the box's kind (banned = reason 16, else 15) */
+inline int HostLeftRemovedKind(bool banned) { return banned ? kHlBanned : kHlKicked; }
+/* a box the world server ended this game's place in the world for - saved first, closed after 20 s on the fallback */
+inline bool HostLeftDeliberate(int kind) { return kind == kHlAnnounced || kind == kHlWorldStopped || kind == kHlKicked || kind == kHlBanned; }
 const unsigned int kHlLostRedials = 4;      /* link1's backoff steps; after them link1 only re-dials every 30 s, for ever */
 const unsigned int kHlAutoExitMs = 20000;   /* the fallback's automatic exit, counted from the moment the save settled */
 const int kHlSaveNone = 0, kHlSaving = 1, kHlSaved = 2, kHlSaveGaveUp = 3;
@@ -2006,6 +2061,13 @@ inline int HostLeftDecide(bool joiner, bool worldRunning, bool hostSeenInWorld, 
     if (closingSeen) return kHlAnnounced;
     (void)dialing; (void)redialAttempts;   /* ui1 (owner 2026-09-27): logged only - the link DOWN is the CONNECTION LOST edge at once */
     return linkUp ? kHlNone : kHlLost;
+}
+/* A KEPT WORLD STOPPED (WORLD_STOPPING from the world server this game is linked to): every game in the running world - a joiner, the
+   steward, the owner - saves, pauses and shows DISCONNECTED / "The world was stopped.", the announced host-left's road with its own
+   sentence. Held while the world is not running (a game still loading shows it once it runs); never during this game's own exit. */
+inline bool WorldStoppedShows(bool stoppedSeen, bool worldRunning, bool stopping)
+{
+    return stoppedSeen && worldRunning && !stopping;
 }
 /* M11a S3 (T-197; manager decisions 4(a), 6(a), 7(a), 2026-09-30) - WHICH ROAD FEEDS HostLeftDecide, AND THE SOURCE OF AN EDGE.
    ROAD SESSION (this game is a session-link joiner): today's inputs exactly - the session link, link1's re-dials, its
@@ -2076,6 +2138,9 @@ inline const char* HostLeftTitle(int kind) { return kind == kHlLost ? "CONNECTIO
 inline const char* HostLeftSentence(int kind)
 {
     if (kind == kHlAnnounced) return "The host has ended the game.";
+    if (kind == kHlWorldStopped) return "The world was stopped.";
+    if (kind == kHlKicked) return "An admin removed you from the world.";
+    if (kind == kHlBanned) return "You are banned from this world.";
     if (kind == kHlLost) return "Reconnecting to host...";
     return "";
 }
@@ -2083,7 +2148,7 @@ inline bool HostLeftButtonEnabled(int saveState, bool exiting) { return saveStat
 /* ui1 follow-up: only DISCONNECTED (a deliberate leave) saves at once. CONNECTION LOST starts NO leave save - a reconnect
    resumes with everything running (the records writer on); its EXIT GAME, enabled from the start, goes through mmo4's
    held exit, which saves first on the way out. */
-inline bool HostLeftStartsSave(int kind) { return kind == kHlAnnounced; }
+inline bool HostLeftStartsSave(int kind) { return HostLeftDeliberate(kind); }
 /* The fallback's message line when no dialog can be built - never the save's outcome; only a DISCONNECTED game closes on
    its own (a lost one keeps re-dialling). */
 inline std::string HostLeftFallbackLine(int kind, int saveState, bool exiting, bool harnessDriven)
@@ -2091,7 +2156,7 @@ inline std::string HostLeftFallbackLine(int kind, int saveState, bool exiting, b
     std::string s = kind == kHlLost ? std::string("Connection lost. Reconnecting to host...") : std::string(HostLeftSentence(kind));
     if (exiting) s += " Closing the game...";
     else if (saveState == kHlSaving) s += " Saving your game...";
-    else if (kind == kHlAnnounced && !harnessDriven) s += " Kenshi will close in 20 seconds.";
+    else if (HostLeftDeliberate(kind) && !harnessDriven) s += " Kenshi will close in 20 seconds.";
     return s;
 }
 /* ui1 review MED: with no dialog (the fallback), a LOST host's line is shown again every 30 s while the pause holds, so the

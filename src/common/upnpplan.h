@@ -10,19 +10,32 @@
  *   windows  Windows' own UPnP interface (NATUPnP), the last fallback.
  * The first route that settles the port (forwarded, already forwarded here, or forwarded to another computer) ends the
  * ask.  Every decision lives here, so the offline suite (src/coop-test) checks the same rules the plugin compiles:
- *   MapOnHostStart                    which HOST presses ask the router at all.
+ *   MapOwner / MapOnHostStart / ServerMapsAtStart
+ *                                     who holds a world server's entry (the hosting game, or a world kept running itself)
+ *                                     and which HOST presses ask the router at all.
+ *   HandOver / HandBack / MayRemove / PortLockName
+ *                                     a game handing its entry to a world kept running, and the last look before a removal.
+ *   NoteOfOutcome / NoteOfEnd / NotRemovedNote / NoteShown / NotClosedNote / NotClosedAtWaitEnd / StopStageAfter
+ *                                     the kept world's window notes, and which of them its stop still shows.
  *   Description / IsOurDescription    the text the router's port list shows for the entry, and how our own entry is known.
  *   FirstRoute / NextRoute / RouteSettles / FoldOutcome
  *                                     the route order, when it stops, and what the routes' answers add up to.
  *   FindRouterOutcome                 Windows' answer to "find the router" -> go on / no router / failed (windows route).
  *   ClassifyExisting / ActionFor      what an entry already on the router for that port means, and what is done about it.
  *   RemoveAtEnd                       whether the entry is taken away when hosting ends.
+ *   TimeLimitedOnly / AskAgainPermanent / WindowsStep / GrantIsTimeLimited / GrantKept / LeaseKept / RemoveLeftoverNow /
+ *   RenewRefusedShowsFailed / AfterHandBack / AfterAsk / AfterRenewResult / RenewOfHandBack / EndLease
+ *                                     a world kept running takes only openings with a time limit: which re-asks, routes,
+ *                                     granted lifetimes and listed leases that leaves, what is handed back, and what an
+ *                                     opening it could not hand back is held as.
  *   State, HostStart, HostEnd, NextStep, AfterMap, AfterRenew, AfterUnmap, RenewAfterMs, RenewWaitMs
  *                                     the background worker's state, what it does next, and when a lease is renewed.
  *   OutcomeWord / StepWord            one word each, for the [UPNP] log lines.
  *
  * NOTHING HERE IS SHOWN TO THE PLAYER (owner decision 382): the router work is background work, so success and failure
- * only reach the log and the REPORT line; the router help text on the hosting screen is unchanged.
+ * only reach the log and the REPORT line; the router help text on the hosting screen is unchanged.  The one exception is
+ * a world kept running: its own window says, in src/common/keeprunning.h's words (RouterLine), what its ask and its removal
+ * came to, because the person running it has no other way to know whether players from the internet can reach it.
  *
  * PURE: no Windows.h, no logging, no globals. C++03 (VS2010 v100).
  */
@@ -42,8 +55,9 @@ const char* const kDescPrefix = swnames::kServerTitle;
 
 /* THE LEASE.  The igd, pcp and natpmp routes ask for an entry that lasts kAskLeaseSeconds and renew it while hosting
    lasts (RenewAfterMs), asking kAskLeaseSeconds every time, so a leased entry a crashed game leaves behind disappears
-   from the router on its own within the hour.  A router that only takes permanent entries (IGD fault 725) gets lease 0,
-   and such an entry stays until it is removed.  The windows route (NATUPnP's
+   from the router on its own within the hour.  For the game's own hosting, a router that only takes permanent entries
+   (IGD fault 725) gets lease 0, and such an entry stays until it is removed; a world kept running never makes a permanent
+   entry (TimeLimitedOnly).  The windows route (NATUPnP's
    IStaticPortMappingCollection::Add) takes no lease at all: kWindowsLeaseSeconds, permanent until removed or the router
    restarts.  Either way the end of hosting removes the entry, and an entry a crashed game left on the same port,
    pointing at this computer with our description, is taken over by the next host on that port (ActionFor gives
@@ -97,10 +111,23 @@ inline bool IsOurDescription(const std::string& d)
     return d.size() >= p.size() && d.compare(0, p.size(), p) == 0;
 }
 
+/* WHO HOLDS THE ROUTER'S ENTRY FOR A WORLD SERVER - one owner each, so it is asked for once and removed once.  A world kept
+   running (SharedWastelandsServer.exe --keep-running) outlives the game that started it, so the world server asks for its
+   own entry when it starts listening and removes it when it stops (src/coop-store/store_main.cpp); any other world server
+   is the hosting game's (upnp.cpp UpnpHostStart), removed when that process ends or the game quits. */
+enum { kOwnerGame = 0, kOwnerServer = 1 };
+inline int MapOwner(bool keepRunning) { return keepRunning ? kOwnerServer : kOwnerGame; }
+
 /* WHICH HOST PRESSES ASK THE ROUTER. startResult is the panel's PanelStartNotebook answer: 1 = a new world server process
    was started on this computer (ask), 2 = the one this game started earlier still runs (its start already asked),
-   0 = none was started (nothing listens here, or the world server is on another computer). */
-inline bool MapOnHostStart(int startResult) { return startResult == 1; }
+   0 = none was started (nothing listens here, or the world server is on another computer).  keptWorld: the process just
+   started is a world kept running - it asks for itself, and this game does not (the game hands it its entry just before
+   that process is made, ui.cpp PanelStartNotebook: HandOver). */
+inline bool MapOnHostStart(int startResult, bool keptWorld) { return startResult == 1 && MapOwner(keptWorld) == kOwnerGame; }
+
+/* THE WORLD SERVER'S OWN ASK: at its start, only a world kept running, and not when the game that started it was told to
+   leave the router alone (routerport=0 in its settings file, passed on as --no-router). */
+inline bool ServerMapsAtStart(bool keepRunning, bool routerOff) { return MapOwner(keepRunning) == kOwnerServer && !routerOff; }
 
 /* What one attempt came to. Each is counted once (the REPORT's upnp[...] field). */
 enum
@@ -236,11 +263,85 @@ inline bool RemoveAtEnd(int action, const std::string& existingDescription)
     return false;
 }
 
+/* A WORLD KEPT RUNNING TAKES ONLY OPENINGS WITH A TIME LIMIT.  It runs unattended, so an opening it makes must close by
+   itself within about an hour when it crashes or is stopped wrongly - nobody may be there to remove it.  Its ask (owner
+   kOwnerServer) therefore never makes a permanent entry: IGD fault 725 is not asked again with lease 0 (the igd route is
+   refused), the windows route adds nothing (NATUPnP takes no lease) and only removes an entry of ours it finds on the port
+   (WindowsStep: a permanent one the game handed over, or one a crashed game left - nothing else would remove it); an igd
+   lease the router lists as none or longer than asked (LeaseKept), and a PCP / NAT-PMP lifetime granted so, is handed back
+   at once (that route is refused): after a crash the port stays open an hour at most.  An opening the router does not take
+   back is held only to be removed (AfterHandBack), never counted as opened.  When no route gives a time-limited opening the ask has failed (or found no
+   router), and the kept world's window tells the person running it to open the port by hand.  The game's own hosting
+   (kOwnerGame) still takes a permanent entry when nothing else is offered: it removes it when hosting ends, and the next
+   host on that port takes over one a crashed game left. */
+inline bool TimeLimitedOnly(int owner) { return owner == kOwnerServer; }
+
+/* IGD fault 725 to a time-limited ask (src/common/routerwire.h AddFaultNext gave kAddRetryPermanent): asked again as
+   permanent only when this ask may make a permanent entry. */
+inline bool AskAgainPermanent(bool retryPermanentOffered, bool timeLimitedOnly) { return retryPermanentOffered && !timeLimitedOnly; }
+
+/* What the windows route does about the entry on the port (ActionFor's `action`, the entry's description).  The game's
+   own hosting: add / keep / leave, as ActionFor says.  An ask that takes time-limited openings only adds nothing (NATUPnP
+   takes no lease) and removes an entry of ours it finds - one the game handed over or a crashed game left, with no time
+   limit, which nothing else would remove; an entry made by hand forwarding here is kept (and left), another's left. */
+enum { kWinAdd = 0, kWinKeep = 1, kWinLeave = 2, kWinRemoveOurs = 3, kWinNoAdd = 4 };
+inline int WindowsStep(int action, const std::string& existingDescription, bool timeLimitedOnly)
+{
+    if (action == kActLeave) return kWinLeave;
+    if (!timeLimitedOnly) return (action == kActKeep) ? kWinKeep : kWinAdd;
+    if (action == kActKeep) return IsOurDescription(existingDescription) ? kWinRemoveOurs : kWinKeep;
+    return kWinNoAdd;
+}
+
+/* A PCP / NAT-PMP lifetime the router granted is time-limited enough for a world kept running: not 0 (no limit), and no
+   longer than the kAskLeaseSeconds asked - all ones (kLifeNoLimit, the largest lifetime the answer can carry, read as no
+   limit) among the longer ones. */
+const unsigned long kLifeNoLimit = 0xFFFFFFFFul;
+inline bool GrantIsTimeLimited(unsigned long granted) { return granted != 0 && granted <= (unsigned long)kAskLeaseSeconds; }
+
+/* Is a granted lifetime kept as the opening?  An ask that takes time-limited openings only hands any other back. */
+inline bool GrantKept(unsigned long granted, bool timeLimitedOnly) { return !timeLimitedOnly || GrantIsTimeLimited(granted); }
+
+/* A world kept running's igd renewal the router refused (fault 725 among others): its entry ends when its lease runs out
+   unless a later renewal is accepted, so the window's "open" line no longer holds - the failed line (kNoteFailed) is shown,
+   once per opening (alreadyShown), at that moment.  Silence is not a refusal: the renewal is asked again sooner. */
+inline bool RenewRefusedShowsFailed(bool timeLimitedOnly, int route, int rr, bool alreadyShown)
+{
+    return timeLimitedOnly && route == kRouteIgd && rr == kRrRefused && !alreadyShown;
+}
+
+/* An entry of ours already on the router for this computer and port (one a crashed world or game left, or the one the game
+   handed to a world kept running) that a time-limited-only ask could not lease again (the add was refused - fault 725
+   among others - or answered 718 although the entry is this computer's and ours): it may have no time limit and nothing
+   else will ever remove it, so it is removed at once - it is ours to remove - and it never counts as this world's opening
+   (the igd route stays refused). */
+inline bool RemoveLeftoverNow(bool timeLimitedOnly, int action, const std::string& existingDescription, int addResult)
+{
+    return timeLimitedOnly && action == kActKeep && IsOurDescription(existingDescription)
+        && (addResult == kRrRefused || addResult == kRrElsewhere);
+}
+
+/* The lease the router lists for an entry of ours (igd GetSpecificPortMappingEntry's NewLeaseDuration: read back after an
+   add or a renewal, or at a renewal answered 718): kept unless this ask takes time-limited openings only and the lease was
+   read as 0 (none) or longer than asked.  A lease that could not be read leaves the one asked standing. */
+inline bool LeaseKept(bool timeLimitedOnly, bool leaseRead, long listedSeconds)
+{
+    return !timeLimitedOnly || !leaseRead || (listedSeconds > 0 && listedSeconds <= kAskLeaseSeconds);
+}
+
+/* What became of an opening a world kept running hands back: none was handed back / handed back (removed, or already
+   gone) / not handed back - the router did not take the removal, so it stays this world's to remove (AfterHandBack). */
+enum { kBackNone = 0, kBackDone = 1, kBackFailed = 2 };
+
 /* THE WORKER'S STATE. want: the port hosting needs open now (0 = not hosting). held: the port the router forwards for
    us now (0 = none). tried: the port already asked for in this hosting (one attempt per world server start - a router
    that said no is not asked again and again). removeAtEnd: RemoveAtEnd's answer for held.  route: the route that holds
    it (renewed and removed by that route).  lease: the seconds the router granted (0 = permanent, never renewed).
-   renewDue: the lease's renewal time has come (set by the worker's timer, cleared by AfterRenew). */
+   renewDue: the lease's renewal time has come (set by the worker's timer, cleared by AfterRenew).  handedOver: the port
+   this game handed to a world kept running (HandOver) - this game never removes an entry on it after that, whatever its
+   router thread was doing at the hand-over (0 = none).  handedHeld / handedRemove / handedRoute / handedLease: the entry this
+   game held on handedOver when it was left to that world (removeAtEnd, route and lease as they were), so HandBack can take it
+   back when that world could not be started. */
 struct State
 {
     long want;
@@ -250,7 +351,14 @@ struct State
     int  route;
     long lease;
     bool renewDue;
-    State() : want(0), held(0), tried(0), removeAtEnd(false), route(kRouteNone), lease(0), renewDue(false) {}
+    long handedOver;
+    bool handedHeld;
+    bool handedRemove;
+    int  handedRoute;
+    long handedLease;
+    bool noLimit;   /* the entry held has no time limit and is held only to be removed (AfterHandBack) */
+    State() : want(0), held(0), tried(0), removeAtEnd(false), route(kRouteNone), lease(0), renewDue(false), handedOver(0),
+              handedHeld(false), handedRemove(false), handedRoute(kRouteNone), handedLease(0), noLimit(false) {}
 };
 
 /* A world server was started on this computer on `port` (once per process start). */
@@ -259,6 +367,9 @@ inline void HostStart(State* s, long port)
     if (!PortOk(port)) return;
     s->want = port;
     s->tried = 0;
+    /* a world server this game starts on a port it handed over is this game's again: the world kept running there has
+       stopped (two cannot listen on one port) */
+    if (s->handedOver == port) { s->handedOver = 0; s->handedHeld = false; }
 }
 
 /* Hosting ended: the world server stopped, or the game is quitting. */
@@ -267,6 +378,115 @@ inline void HostEnd(State* s)
     s->want = 0;
     s->tried = 0;
 }
+
+/* This game's hosting ends because it is starting a world kept running on `keptPort`: an entry held on that port is the new
+   world server's now (it finds it there and keeps it, ClassifyExisting / ActionFor), so this game forgets it instead of
+   removing it (NextStep gives forget); an entry held on any other port is removed as at any hosting end.  The port is
+   marked (handedOver), so an ask for it still on this game's router thread lands as not this game's to remove (AfterMap),
+   and a removal of it chosen before the hand-over is not sent (MayRemove). */
+/* The entry held on the handed-over port is left to the world kept running: never removed here, and what it was is kept for
+   HandBack. */
+inline void LeaveHanded(State* s)
+{
+    s->handedHeld   = true;
+    s->handedRemove = s->removeAtEnd;
+    s->handedRoute  = s->route;
+    s->handedLease  = s->lease;
+    s->removeAtEnd  = false;
+}
+inline void HandOver(State* s, long keptPort)
+{
+    HostEnd(s);
+    if (!PortOk(keptPort)) return;
+    s->handedOver = keptPort;
+    s->handedHeld = false;
+    if (s->held == keptPort) LeaveHanded(s);
+}
+
+/* The world kept running on `keptPort` could not be started (its process was never made): the hand-over is undone, and the
+   entry left to it is this game's again as it was before - removed now, this game's hosting having ended (unless it was
+   never this game's to remove), even when the router thread already forgot it (a forget never touches the router). */
+inline void HandBack(State* s, long keptPort)
+{
+    if (!PortOk(keptPort) || s->handedOver != keptPort) return;
+    s->handedOver = 0;
+    if (!s->handedHeld) return;
+    s->handedHeld = false;
+    if (s->held == 0)
+    {
+        s->held = keptPort;
+        s->route = s->handedRoute;
+        s->lease = s->handedLease;
+        s->renewDue = false;
+    }
+    if (s->held == keptPort) s->removeAtEnd = s->handedRemove;
+}
+
+/* THE PORT'S ROUTER LOCK: the name of a lock every program on this computer that compiles upnp.cpp (the game and its world
+   servers) holds while it asks the router for that port or removes it.  A world kept running therefore asks only after a
+   removal of its port by the game that started it has ended - it then finds the entry gone and adds its own, or finds the
+   game left it (MayRemove) and keeps it - so it never keeps an entry that is about to be removed. */
+inline std::string PortLockName(long port)
+{
+    return std::string("Local\\SharedWastelandsRouterEntry-") + kProtocol + "-" + PortText(port);
+}
+
+/* WHAT A WORLD KEPT RUNNING TELLS THE PERSON RUNNING IT (src/common/keeprunning.h RouterLine says it in words): one note for
+   its ask at start and one for the removal at its stop. */
+enum
+{
+    kNoteMapped     = 1,   /* the router accepted the entry */
+    kNoteAlready    = 2,   /* the router already forwarded the port to this computer */
+    kNoteFailed     = 3,   /* refused, forwarded to another computer, or the ask could not run */
+    kNoteNoRouter   = 4,   /* no router answered */
+    kNoteRemoved    = 5,   /* the entry was removed at the stop */
+    kNoteGone       = 6,   /* the entry was already gone at the stop (its lease ran out, or the router restarted) */
+    kNoteNotRemoved = 7,   /* the removal was not accepted or not answered (the entry has a lease: it ends by itself) */
+    kNoteLeft       = 8,   /* the entry is not this program's to remove (made by hand, or another device holds the port now) */
+    kNoteNotRemovedNoLimit = 9   /* as kNoteNotRemoved, for an entry the router granted with no time limit (lease 0) */
+};
+inline int NoteOfOutcome(int outcome)
+{
+    if (outcome == kOutMapped)   return kNoteMapped;
+    if (outcome == kOutAlready)  return kNoteAlready;
+    if (outcome == kOutNoRouter) return kNoteNoRouter;
+    return kNoteFailed;
+}
+
+/* An opening that was not closed: which note, from the lease the router granted the entry held (`held`: an entry is held;
+   lease 0 = no time limit, it never ends by itself).  Nothing held, or its lease unknown: the note for a leased one. */
+inline int NotRemovedNote(bool held, long lease) { return (held && lease == 0) ? kNoteNotRemovedNoLimit : kNoteNotRemoved; }
+
+/* The stop's wait ran out: the note for an opening this program knows it holds (by the lease granted it), 0 when it holds
+   none - its start-up ask still in progress has opened nothing it knows of. */
+inline int NotClosedNote(bool held, long lease) { return held ? NotRemovedNote(true, lease) : 0; }
+
+/* The note at the end of hosting: a removal not sent (forget) leaves the entry; a sent one says what it came to, and one
+   not accepted says whether the entry ends by itself (heldLease). */
+inline int NoteOfEnd(bool removalSent, int removalNote, long heldLease)
+{
+    if (!removalSent) return kNoteLeft;
+    if (removalNote == kNoteNotRemoved) return NotRemovedNote(true, heldLease);
+    return removalNote;
+}
+
+/* WHICH NOTES THE KEPT WORLD'S WINDOW STILL SHOWS, by how far its stop has come: the ask's note only while the world runs
+   (never after "Saving the world..."), the removal's note until the stop's wait for the router ended (never after
+   "The world has stopped."). */
+enum { kStopRunning = 0, kStopBegun = 1, kStopWaited = 2 };
+inline bool IsRemovalNote(int note)
+{
+    return note == kNoteRemoved || note == kNoteGone || note == kNoteNotRemoved || note == kNoteLeft || note == kNoteNotRemovedNoLimit;
+}
+inline bool NoteShown(int note, int stopStage) { return IsRemovalNote(note) ? stopStage < kStopWaited : stopStage == kStopRunning; }
+
+/* The stop's wait for the router ended: the "did not close" note (NotClosedNote) is shown when the router thread had not
+   finished, no removal note (nor this note) was shown, and an opening is known to be held (note != 0). */
+inline bool NotClosedAtWaitEnd(bool routerFinished, bool removalShown, int note) { return !routerFinished && !removalShown && note != 0; }
+
+/* How far the stop has come once a stop door reached `reached`: never back (a second door, such as Ctrl+C during a typed
+   stop, runs the same stop again). */
+inline int StopStageAfter(int now, int reached) { return reached > now ? reached : now; }
 
 enum
 {
@@ -294,7 +514,7 @@ inline const char* StepWord(int step)
    goes first; then the wanted port, once; then a held lease whose renewal time has come. */
 inline int NextStep(const State& s)
 {
-    if (s.held != 0 && s.held != s.want) return s.removeAtEnd ? kStepUnmap : kStepForget;
+    if (s.held != 0 && s.held != s.want) return (s.removeAtEnd && s.held != s.handedOver) ? kStepUnmap : kStepForget;
     if (s.want != 0 && s.held == 0 && s.tried != s.want) return kStepMap;
     if (s.held != 0 && s.held == s.want && s.lease > 0 && s.renewDue) return kStepRenew;
     return kStepIdle;
@@ -306,12 +526,14 @@ inline void AfterMap(State* s, long port, int outcome, bool removeAtEnd, int rou
 {
     s->tried = port;
     s->renewDue = false;
+    s->noLimit = false;
     if (outcome == kOutMapped || outcome == kOutAlready)
     {
         s->held = port;
         s->removeAtEnd = removeAtEnd;
         s->route = route;
         s->lease = ClampLease(lease);
+        if (port == s->handedOver) LeaveHanded(s);   /* handed to a world kept running while it was asked: never removed here */
     }
     else
     {
@@ -339,6 +561,52 @@ inline void AfterRenewLost(State* s)
     s->lease = 0;
     s->removeAtEnd = false;
 }
+
+/* AN OPENING WITH NO TIME LIMIT (or a longer one than asked) THAT A WORLD KEPT RUNNING HANDS BACK, at its ask or at a
+   renewal, on `route`.  Handed back -> nothing is held: nothing is removed and its stop shows no line for it (its window
+   already showed the failed line).  Not handed back (the router did not take the removal) -> held only to be removed,
+   never counted as opened: the worker asks the removal again instead of each renewal (kMinLeaseSeconds sets how soon),
+   and the stop removes it, its note being the one for an entry with no time limit (EndLease). */
+inline void AfterHandBack(State* s, long port, int route, bool handedBack)
+{
+    s->tried = port;
+    s->renewDue = false;
+    if (handedBack)
+    {
+        s->held = 0;
+        s->removeAtEnd = false;
+        s->route = kRouteNone;
+        s->lease = 0;
+        s->noLimit = false;
+        return;
+    }
+    s->held = port;
+    s->removeAtEnd = true;
+    s->route = route;
+    s->lease = kMinLeaseSeconds;
+    s->noLimit = true;
+}
+
+/* After an ask (the worker's map step): AfterMap, or AfterHandBack for an opening the router did not take back. */
+inline void AfterAsk(State* s, long port, int outcome, bool removeAtEnd, int route, long lease, int handBack)
+{
+    if (handBack == kBackFailed) AfterHandBack(s, port, route, false);
+    else AfterMap(s, port, outcome, removeAtEnd, route, lease);
+}
+
+/* What a renewal came to (upnp.cpp RenewPort returns these), or, for an entry held only to be removed, the removal asked
+   again instead (RenewOfHandBack, from that removal's note). */
+enum { kRenewLost = -1, kRenewNotAccepted = 0, kRenewAccepted = 1, kRenewHandedBack = 2, kRenewNotHandedBack = 3 };
+inline int RenewOfHandBack(int removalNote) { return removalNote == kNoteNotRemoved ? kRenewNotHandedBack : kRenewHandedBack; }
+inline void AfterRenewResult(State* s, int result, long grantedLease)
+{
+    if (result == kRenewLost) AfterRenewLost(s);
+    else if (result == kRenewHandedBack || result == kRenewNotHandedBack) AfterHandBack(s, s->held, s->route, result == kRenewHandedBack);
+    else AfterRenew(s, result == kRenewAccepted, grantedLease);
+}
+
+/* The lease a stop's note is judged by (NoteOfEnd, NotClosedNote): none for an entry held only to be removed. */
+inline long EndLease(const State& s) { return s.noLimit ? 0 : s.lease; }
 
 /* THE REMOVAL AT HOSTING END (igd): the router is asked what it forwards on the port first, and our entry is deleted only
    when it still points at this computer and port and carries our description; nothing there = already gone (its lease
@@ -375,8 +643,13 @@ inline bool RenewConflictStillOurs(bool found, const std::string& itsClient, lon
 
 /* After an unmap or a forget, whatever the router answered: a removal that failed is not tried again (the router may
    never answer, and the entry carries our description, so the next host on that port takes it over). */
+/* THE LAST LOOK BEFORE A REMOVAL IS SENT (the worker, holding the port's lock PortLockName, on the live state): `port` is
+   still held and still to be removed - not handed over, and not wanted again, since the step was chosen. */
+inline bool MayRemove(const State& s, long port) { return port != 0 && s.held == port && NextStep(s) == kStepUnmap; }
+
 inline void AfterUnmap(State* s)
 {
+    s->noLimit = false;
     s->held = 0;
     s->removeAtEnd = false;
     s->route = kRouteNone;

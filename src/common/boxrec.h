@@ -61,7 +61,7 @@
 
 namespace coopbrec {
 
-const unsigned int kProtocol = 125;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
+const unsigned int kProtocol = 133;            /* the world-server protocol that carries box records and BOX_REFUSE (a record may carry its undo
                                                  list, kBrFlagUndos, and its ledger, kBrFlagLedger) */
 
 
@@ -1142,7 +1142,10 @@ const int kBasRefused = 4;    /* the record was not laid at this load (the swap 
                                  twice did not start): this game's box stands and is written as the next generation above that
                                  record - a newer stored record is tried afresh before that write */
 const int kBasNoBox = 6;      /* the record's box is not found here (looked for again) */
-const int kBasMax = 6;
+const int kBasHeldFail = 7;   /* the record was not laid at this load for a reason other than items this game cannot make: nothing
+                                 is written from the box and its moves in and out are undone until a later update succeeds (a newer
+                                 stored record, the area loaded again, or a link loss) */
+const int kBasMax = 7;
 
 /* 1 = the stored record must be put into this game's box: one is stored, and the box is not already that record or a newer one
    (haveMine 0: nothing put into or written from the box in this world - a game that loaded the world again always applies) */
@@ -1198,7 +1201,7 @@ inline int BoxKnownAbove(int knownHave, unsigned int knownGen, int haveMine, uns
 }
 /* 1 = a shop restock in the box's area waits: the stock's stored record is not decided yet at this load (a restock before the apply
    would be undone by it; the engine asks for the restock again on its next pass) */
-inline int BoxApplyHoldsRestock(int applyState) { return (applyState == kBasNone || applyState == kBasWait) ? 1 : 0; }
+inline int BoxApplyHoldsRestock(int applyState) { return (applyState == kBasNone || applyState == kBasWait || applyState == kBasHeldFail) ? 1 : 0; }
 /* 1 = a refusal answers this game's LATEST write of the box (sentGen is the box's generation): the box is then what it was before
    that write */
 inline int BoxRefuseLatest(int haveMine, unsigned int mineGen, unsigned int sentGen) { return (haveMine != 0 && sentGen == mineGen) ? 1 : 0; }
@@ -1216,7 +1219,7 @@ const int kBahNo = 0, kBahHold = 1;
 inline int BoxApplyHold(int haveKept, int areaLoaded, int applyState, int needed)
 {
     if (haveKept == 0 || areaLoaded == 0 || needed == 0) return kBahNo;
-    return (applyState == kBasNone || applyState == kBasWait || applyState == kBasNoBox) ? kBahHold : kBahNo;
+    return (applyState == kBasNone || applyState == kBasWait || applyState == kBasNoBox || applyState == kBasHeldFail) ? kBahHold : kBahNo;
 }
 /* 1 = the moves on a box in a loaded area with no stored record here wait too: the world server's records for this world have not all
    been applied here (feedDone 0: the feed's last page not applied yet, or no link at all - a game with no world server holds back as

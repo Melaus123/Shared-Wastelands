@@ -95,7 +95,9 @@ enum StoreRefuseReason
     kRefuseTooManyWrong   = 11, /* too many wrong passwords in a row: this player waits out its minute (authlock.h) - the password was not checked */
     kRefuseAuthFileBad    = 12, /* the world's auth.txt is there but holds no readable key: nobody is let in until the host hosts again and writes it anew */
     kRefuseNotOnList      = 13, /* access.txt in allow-list mode: this player is not on the list (an address joiner has no Steam-checked id, so never is) - accessrule.h */
-    kRefuseAccessUnreadable = 14  /* access.txt is there but could not be read: nobody but the owner is let in until it can be (it fails closed) */
+    kRefuseAccessUnreadable = 14, /* access.txt is there but could not be read: nobody but the owner is let in until it can be (it fails closed) */
+    kRefuseKicked         = 15, /* an admin removed this player from the world (the kick verb); a game that does not know 15 reads it as the protocol refusal */
+    kRefuseBanned         = 16  /* this player is in the world's bans.txt (the ban verb, and every later HELLO of that player); a game that does not know 16 reads it as the protocol refusal */
 };
 
 /* A count with thousands commas, so the sentence reads "65,520" as the limit is named everywhere else. */
@@ -120,6 +122,8 @@ inline std::string StoreRefuseReasonText(unsigned int reason, unsigned int store
     if (reason == (unsigned int)kRefuseAuthFileBad)    return std::string("the world's password file is damaged - the host must host again");
     if (reason == (unsigned int)kRefuseNotOnList)      return std::string("this world only lets in players the host has added (the host's access list)");
     if (reason == (unsigned int)kRefuseAccessUnreadable) return std::string("the host's player list could not be read - the host must host again");
+    if (reason == (unsigned int)kRefuseKicked)         return std::string("an admin removed this game from the world");
+    if (reason == (unsigned int)kRefuseBanned)         return std::string("this player is banned from this world (the world's ban list)");
     if (reason == (unsigned int)kRefuseFull)
     {
         const unsigned int lim = n2 ? n2 : 256u;
@@ -155,12 +159,12 @@ inline std::string StoreRefuseReasonText(unsigned int reason, unsigned int store
     return StoreHandshakeRefusalText(storeProtocol, gameProtocol);
 }
 
-/* A REFUSAL THE PLAYER MUST ANSWER. The password and access refusals, and a damaged password file, are not an outage and not a full
-   world: dialling again gets the same answer (and wrong passwords lead to the wait), so the join stops dialling until the player
-   acts. */
+/* A REFUSAL THE PLAYER MUST ANSWER. The password and access refusals, a damaged password file, a kick and a ban are not an outage
+   and not a full world: dialling again gets the same answer (and wrong passwords lead to the wait), so the join stops dialling until
+   the player acts. */
 inline bool StoreRefuseStopsJoin(unsigned int reason)
 {
-    return reason >= (unsigned int)kRefusePasswordNeeded && reason <= (unsigned int)kRefuseAccessUnreadable;
+    return reason >= (unsigned int)kRefusePasswordNeeded && reason <= (unsigned int)kRefuseBanned;
 }
 
 /* ---- IS THE NOTEBOOK LINK TO BE RE-DIALLED ON THIS TICK (B12-e / B12-f, T238) ----

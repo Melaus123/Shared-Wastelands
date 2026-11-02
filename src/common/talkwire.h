@@ -687,6 +687,7 @@ const int kTalkLeverStart  = 0;   /* talkprompt [npcUid|near] [targetUid|near] [
 const int kTalkLeverAnswer = 1;   /* talkprompt answer <0..9> */
 const int kTalkLeverClose  = 2;   /* talkprompt close */
 const int kTalkLeverAnswerAct = 3;   /* talkprompt answer act <type 0..255>: *index carries the dialogue action type */
+const int kTalkLeverJoinAct = 4;   /* talkprompt joinact <type 0..255>: *index carries the dialogue action type */
 
 /* "near" -> 0; a decimal or 0x-hex uid 1..0xFFFFFFFF. 1 parsed, 0 refused. */
 inline int TalkLeverUid(const std::string& s, unsigned int* out)
@@ -743,6 +744,21 @@ inline int TalkPromptParse(const std::string& arg, int* mode, unsigned int* npcU
         *index = v;
         return 1;
     }
+    if (!tok.empty() && tok[0] == "joinact")
+    {
+        /* the line to run is the one in the conversation's whole line tree whose actions hold this dialogue action (speech.cpp) */
+        if (tok.size() != 2 || tok[1].empty() || tok[1].size() > 3) return 0;
+        int v = 0;
+        for (size_t k = 0; k < tok[1].size(); ++k)
+        {
+            if (tok[1][k] < '0' || tok[1][k] > '9') return 0;
+            v = v * 10 + (tok[1][k] - '0');
+        }
+        if (v > 255) return 0;
+        *mode = kTalkLeverJoinAct;
+        *index = v;
+        return 1;
+    }
     if (!tok.empty() && tok[0] == "answer")
     {
         if (tok.size() != 2 || tok[1].size() != 1 || tok[1][0] < '0' || tok[1][0] > '9') return 0;
@@ -772,9 +788,10 @@ inline int TalkPromptParse(const std::string& arg, int* mode, unsigned int* npcU
    camera gate refused it; 0 none); reached = startPlayerConversation ran on the NPC's Dialogue inside that sendEvent; hadLine =
    _chooseDialog handed it a line; started = it returned true. Not reached = the engine refused before startPlayerConversation: sendEvent goes on to it for
    event 1 whether or not the NPC's Dialogue is busy, so a busy Dialogue is never the cause by itself (the caller shows it beside
-   the refusal). */
+   the refusal). kTalkOrderPlayerSpeaker = startPlayerConversation was reached and refused because the speaker is another player's
+   character. The kinds stay on this game: the talk-order ring and its log lines only, never a message. */
 const int kTalkOrderNotReached = 0, kTalkOrderStarted = 1, kTalkOrderNoLine = 2, kTalkOrderIntercepted = 3, kTalkOrderGate = 4,
-          kTalkOrderRingFull = 5, kTalkOrderDup = 6, kTalkOrderLineNotStarted = 7, kTalkOrderKinds = 8;
+          kTalkOrderRingFull = 5, kTalkOrderDup = 6, kTalkOrderLineNotStarted = 7, kTalkOrderPlayerSpeaker = 8, kTalkOrderKinds = 9;
 inline int TalkOrderOutcome(int set, int reached, int hadLine, int started)
 {
     if (set != 0) return set;
@@ -799,14 +816,21 @@ inline int TalkOrderLogDue(unsigned lastMs, unsigned nowMs, unsigned nLogged)
 inline int TalkLogNthDue(long long n) { return (n >= 1 && (n <= 5 || n % 100 == 0)) ? 1 : 0; }
 
 /* Which conversation `talkprompt answer <k>` / `answer act <type>` / `close` acts on (the talker's game, at the safe point):
-   the mirrored one while it is open; otherwise, for answer and answer act only, the one this game's own dialogue window shows
-   (ownShown 1) when its owner is a live character whose Dialogue is still that one (ownOwnerLive 1). *why names a refusal. */
+   the mirrored one while it is open; otherwise, for answer, answer act, joinact and close, the one this game's own dialogue
+   window shows (ownShown 1) when its owner is a live character whose Dialogue is still that one (ownOwnerLive 1). close on the
+   own window is a test lever: it ends this game's own conversation (e.g. the one left open over the character editor after
+   joinact ran a line's actions). *why names a refusal. */
 const int kLeverWinNone = 0, kLeverWinMirror = 1, kLeverWinOwn = 2;
 inline int LeverWindowPick(int mode, int mirrorActive, int ownShown, int ownOwnerLive, const char** why)
 {
     *why = "";
-    if (mirrorActive != 0) return kLeverWinMirror;
-    if (mode != kTalkLeverAnswer && mode != kTalkLeverAnswerAct) { *why = "no mirrored conversation is open on this game"; return kLeverWinNone; }
+    if (mirrorActive != 0)
+    {
+        /* joinact runs a line's actions on this game's own conversation only - a mirrored copy's actions belong to the NPC's game */
+        if (mode == kTalkLeverJoinAct) { *why = "joinact runs on this game's own window only and a mirrored conversation is open"; return kLeverWinNone; }
+        return kLeverWinMirror;
+    }
+    if (mode != kTalkLeverAnswer && mode != kTalkLeverAnswerAct && mode != kTalkLeverJoinAct && mode != kTalkLeverClose) { *why = "no mirrored conversation is open on this game"; return kLeverWinNone; }
     if (ownShown != 1) { *why = "no mirrored conversation is open and this game's own window shows no conversation"; return kLeverWinNone; }
     if (ownOwnerLive != 1) { *why = "no mirrored conversation is open and the own window's conversation has no live owner"; return kLeverWinNone; }
     return kLeverWinOwn;

@@ -570,7 +570,7 @@ inline bool OwnHighLoadHeld(int blocked, bool rejudgePending, bool storeChosen, 
 /* The notebook's small non-record files copied into repair\<tag>\ at each new operator world save (a missing one is skipped). */
 inline std::vector<std::string> RepairCopyFiles()
 {
-    static const char* const k[] = { "clock.txt", "uniques.txt", "options.txt", "research_boxes.txt", "research_takes.txt", "town_bars.txt", "world_relations.txt", "world.gen" };   /* par24: world_relations.txt */
+    static const char* const k[] = { "clock.txt", "uniques.txt", "options.txt", "rules.txt", "research_boxes.txt", "research_takes.txt", "town_bars.txt", "world_relations.txt", "world.gen" };   /* par24: world_relations.txt */
     return std::vector<std::string>(k, k + sizeof(k) / sizeof(k[0]));
 }
 /* THE BROADCAST WORD after a WORLD_SAVED down's profile. */

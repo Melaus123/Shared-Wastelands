@@ -45,10 +45,12 @@
 #include "../common/shotgate.h"   /* a copy fires on its owner's word only; which game decides a bolt's hit */
 #include "../common/handwire.h"   /* MSG_HAND: the owner's hand item, and the copy's draw / put-away decision */
 #include "../common/fightlog.h"   /* the [FIGHT] lines: the moves, blocks and stumbles each game's engine chose */
+#include "../common/fightready.h"   /* T-890: the getting-ready pause from a blow's real result */
 #include "../common/hitwire.h"   /* fight parity: the decided blow on HIT, the attack move on SWING */
 #include "../common/blockpick.h"   /* T-1101 step 5: MSG_BLOCK_PICK and the arrived block picks */
 #include "../common/fightchoice.h"   /* T-1101 design (c): the owner's fight choices and its copies' decide step */
 #include "../common/statewire.h"   /* fight parity: the stance buttons in STATE latchBits */
+#include "../common/aimstamp.h"   /* T-330: the owner's aim word and the copy's raise / lower step */
 #include "effect.h"   /* T-327: InstallEffectHook, EffectSafePointDrain */
 #include "../common/windowbound.h"   /* T-986 fold 1: which close leaves combat mode (winbound::CloseKind) */
 namespace coop { void RestockNowDrain(); }   /* par2: items.cpp - the `restocknow` lever runs at this same safe point */
@@ -557,6 +559,122 @@ static void FightPush(const fightlog::Event& ev)
     FightUnlock();
 }
 
+// --- T-890 fightReady: the getting-ready pause after this game's own player character's blow, from the blow's real result ----
+// The engine's swing-contact routine (1.0.65 0x609860) writes the attacker's fight object +0x148 from the hit's answer: no hit
+// -> the lookup's index 6 (0.2 s), blocked -> 1 (0.3 s), landed -> 0 (0.6 s) (t890-readytimer-read.md Q1). A blow on another
+// player's copy is not run here (the suppressed branch of detour_hitByMelee answers 0), so our character always got the no-hit
+// pause while the victim's game's copy of it got the real one. Now: the detour notes each contact by our player character on a
+// fixed ring (AI worker, never waits, as g_hitQueue); ApplyRemoteHit queues the victim's game's result for that blow (main
+// thread, the worker may run); the K2 safe point (worker paused) matches the result to the attacker's LAST contact and writes
+// the engine's own value for it, read through the engine's lookup (FightReadyTime) - fightready.h has the rule.
+struct ReadyNote { unsigned int attacker, victim; int combo, suppressed, flag; };
+const unsigned int kReadyNoteSize = 64;   /* a power of two; a swing's contacts are a handful */
+const unsigned int kReadyNoteMask = kReadyNoteSize - 1;
+ReadyNote g_readyNote[kReadyNoteSize];
+volatile LONG g_readyNoteW = 0;   /* producer: the AI worker (the hit detour) */
+volatile LONG g_readyNoteR = 0;   /* consumer: the main thread, at the K2 safe point */
+volatile LONG64 g_frRingFull = 0;   /* notes (AI worker) or results (main thread) refused because their ring was full */
+long long g_frWritten = 0, g_frAdded = 0, g_frLate = 0, g_frNoContact = 0, g_frOtherVictim = 0, g_frNoBlow = 0;   /* MAIN THREAD */
+
+// The attacker's fight object flag +0x144 at the hit call: 0x60CC10 counts +0x148 down only while it is set
+// (decomp_60cc10.txt:149-157). The fight object is Character +0x648 -> +8 (getCombat, F205), the rbx of 0x609860's store.
+// -1 unreadable. POD, __try (C2712).
+static int ReadyFlagOf(const void* attacker)
+{
+    const void* cc = FightCombatOf(attacker);
+    if (cc == 0) return -1;
+    __try { return (*((const unsigned char*)cc + 0x144) != 0) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// AI WORKER (detour_hitByMelee): one contact by this game's own player character - suppressed 1 when the engine's hit was not
+// run here (the victim's game decides it), 0 when it ran and its own answer set the timer. A full ring refuses and counts.
+static void ReadyNotePush(const void* attacker, unsigned int auid, unsigned int vuid, int comboId, int suppressed)
+{
+    if (auid == 0 || !net::IsUidMineAnyThread(auid) || IsUidPlayerCharAnyThread(auid) != 1) return;
+    const LONG w = g_readyNoteW;
+    if ((unsigned int)(w - g_readyNoteR) >= kReadyNoteSize) { InterlockedIncrement64(&g_frRingFull); return; }
+    ReadyNote& n = g_readyNote[(unsigned int)w & kReadyNoteMask];
+    n.attacker = auid; n.victim = vuid; n.combo = comboId; n.suppressed = suppressed; n.flag = ReadyFlagOf(attacker);
+    InterlockedExchange(&g_readyNoteW, w + 1);   /* published only after the note is written */
+}
+
+// MAIN THREAD: per own player character, its swing number (raised at each of its swing starts) and its last contact.
+// 32 rows, reused oldest first: with more than 32 own player characters fighting, a row is taken over and its character's
+// pending result then reads noContact (its pause stays the engine's no-hit one).
+struct ReadyRow { unsigned int uid; unsigned int swing; fightready::Contact last; };
+const int kReadyRows = 32;
+ReadyRow g_readyRow[kReadyRows];
+int g_readyRowNext = 0;
+static ReadyRow* ReadyRowFor(unsigned int uid)
+{
+    for (int i = 0; i < kReadyRows; ++i)
+        if (g_readyRow[i].uid == uid) return &g_readyRow[i];
+    ReadyRow* r = &g_readyRow[g_readyRowNext];
+    g_readyRowNext = (g_readyRowNext + 1) % kReadyRows;
+    std::memset(r, 0, sizeof(*r));
+    r->uid = uid;
+    return r;
+}
+
+// MAIN THREAD (every swing start of an own player character, whatever its target and whether or not SWING went out): a new
+// swing of this character - a result for an older one no longer applies, so it cannot add to this swing's pause.
+static void ReadySwingStart(unsigned int uid)
+{
+    if (uid == 0 || IsUidPlayerCharAnyThread(uid) != 1) return;
+    ++ReadyRowFor(uid)->swing;
+}
+
+// MAIN THREAD (ApplyRemoteHit): the victim's game's result for a blow by this game's own player character on a copy, queued for
+// the K2 safe point (the worker may be running here). Played or not: the timer follows the result, not the play. A blow this
+// game decided (attackerPlayed) already set the timer from its own hit.
+struct ReadyResult { unsigned int attacker, victim; int combo, result; };
+const int kReadyResults = 64;
+ReadyResult g_readyResult[kReadyResults];
+int g_readyResultCount = 0;
+static void ReadyResultQueue(unsigned int auid, unsigned int vuid, int comboId, bool attackerPlayed, const hitwire::Blow* blow)
+{
+    if (attackerPlayed || auid == 0 || vuid == 0 || !net::IsUidMine(auid) || IsUidPlayerCharAnyThread(auid) != 1 || net::IsUidMine(vuid)) return;
+    if (blow == 0 || !hitwire::ResultOk(blow->result)) { ++g_frNoBlow; return; }
+    if (g_readyResultCount >= kReadyResults) { InterlockedIncrement64(&g_frRingFull); return; }   /* counted as ringFull only */
+    ReadyResult& r = g_readyResult[g_readyResultCount++];
+    r.attacker = auid; r.victim = vuid; r.combo = comboId; r.result = blow->result;
+}
+
+static std::string FrF3(float v)
+{
+    if (_finite((double)v) == 0) return "nan";
+    std::ostringstream o;
+    o.imbue(std::locale::classic());
+    o.setf(std::ios::fixed);
+    o.precision(3);
+    o << v;
+    return o.str();
+}
+
+// MAIN THREAD (FightLogDrain): the [FIGHT] ready line.
+static std::string FightReadyText(const fightlog::Event& e)
+{
+    std::string line = "[FIGHT] ready uid=" + N3((long long)e.a) + " victim=" + N3((long long)e.b) + " combo=" + N3((long long)e.combo)
+                     + " result=" + N3((long long)e.result);
+    if (e.why == fightready::kWhyNone)
+        line += " timer " + FrF3(e.before) + " -> " + FrF3(e.after) + " held=" + (e.held ? "1" : "0");
+    else
+        line += std::string(" late why=") + fightready::WhyName(e.why);
+    return line;
+}
+
+// MAIN THREAD: the REPORT counters, after fightParity on the [M6] REPORT swing line. written = a result set a held pause;
+// added = a result added to a counting pause; late = a result matched its contact but wrote nothing (timerDone, newSwing,
+// noFight, loading); noContact / otherVictim = a result matched no unanswered contact / another one; noBlow = a result with no
+// readable blow; ringFull = contact notes or results dropped because their queue was full (counted nowhere else).
+static std::string FightReadyToken()
+{
+    return " fightReady[written=" + N3(g_frWritten) + ",added=" + N3(g_frAdded) + ",late=" + N3(g_frLate)
+         + ",noContact=" + N3(g_frNoContact) + ",otherVictim=" + N3(g_frOtherVictim) + ",noBlow=" + N3(g_frNoBlow)
+         + ",ringFull=" + N3((long long)g_frRingFull) + "]";
+}
+
 // Any thread, right after a swing really started (the attack start answered yes): the move it stored at CombatClass +0x150.
 static void FightNoteSwing(const void* combat, unsigned int uid, int own, unsigned int targetUid)
 {
@@ -714,6 +832,8 @@ static void FightLogDrain()
         else if (e.kind == fightlog::kBlockPick)
             line = "[FIGHT] blockpick defender=" + N3((long long)e.a) + (e.own ? " own" : " copy") + " attacker=" + N3((long long)e.b)
                  + " block='" + e.block + "' how=" + FpBlockHowName(e.how);
+        else if (e.kind == fightlog::kReady)
+            line = FightReadyText(e);
         else
             line = "[FIGHT] hit victim=" + N3((long long)e.a) + " attacker=" + N3((long long)e.b) + " move='" + e.move
                  + "' result=" + N3((long long)e.result) + " block='" + e.block + "' stumble='" + e.stumble + "' side="
@@ -808,6 +928,7 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
             slot.knock = KnockArmRelease(arm);
             BlowNoteAfter(&slot, &dec, result);
             FightHitAfter(&fight, &dec, result);
+            ReadyNotePush(attacker, slot.attackerUid, uid, comboId, 0);   /* T-890: our character's real hit on our own character */
 #ifdef SW_DEV_BUILD
             // PROBE-START: P181 - the hit's result, carried to the main thread's line
             slot.p181Result = result;
@@ -857,6 +978,7 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
                 const int result = orig_hitByMelee(self, cutDir, damages, attacker, technique, comboId);
                 FpDecideDisarm(&dec);
                 FpDecideStumble(&dec, md.stumble);
+                ReadyNotePush(attacker, auid, uid, comboId, 0);   /* T-890: the hit ran here - its own answer set the timer */
                 if (result == meleewire::kMeleeHitLanded) MeleePush(md);
                 else if (result == meleewire::kMeleeHitBlocked) InterlockedIncrement64(&g_meleeBlocked);
                 else InterlockedIncrement64(&g_meleeNoHit);
@@ -867,6 +989,7 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
             if (auid != 0 && meleewire::MeleeKeptUnclassified(aMine, aPc, false, vPc)) InterlockedIncrement64(&g_meleeKeptUnclassified);
             // Every other blow on a copy: the owner will tell us the outcome. Applying local damage
             // as well would double-count and diverge.
+            ReadyNotePush(attacker, auid, uid, comboId, 1);   /* T-890: the victim's game decides it - its result sets the timer */
             InterlockedIncrement64(&g_hitsSuppressed);
             return 0;   // HitMaterialType 0 - no material reaction
         }
@@ -895,6 +1018,12 @@ int detour_hitByMelee(Character* self, int cutDir, void* damages,
         {
             InterlockedIncrement64(&g_hitsPuppetThrown);
             return 0;
+        }
+        if (auid != 0)   /* T-890: our own character's real hit on a world NPC is its last contact (no victim uid) */
+        {
+            const int r = orig_hitByMelee(self, cutDir, damages, attacker, technique, comboId);
+            ReadyNotePush(attacker, auid, 0, comboId, 0);
+            return r;
         }
     }
 
@@ -1278,6 +1407,8 @@ void ApplyRemoteHit(unsigned int victimUid, unsigned int attackerUid, int cutDir
         else ++g_knockNotPlayed;   // no played hit, or no applied health: no fall is started
     }
 
+    ReadyResultQueue(attackerUid, victimUid, comboId, attackerPlayed, blow);   /* T-890: the timer at the K2 safe point */
+
 #ifndef SW_DEV_BUILD
     /* the release build: a failed health correction or a hit with no visual in full always, the rest the first few in full
        then a count a minute */
@@ -1400,6 +1531,17 @@ long long g_rmEdges = 0, g_rmPushQueued = 0, g_rmPushFull = 0, g_rmNoted = 0, g_
 long long g_rmNotTaken = 0, g_rmFault = 0, g_rmNoHook = 0, g_rmRevertStopped = 0, g_rmShotNoted = 0, g_rmGoneOff = 0, g_cfOnPassWait = 0;
 long long g_rmLoggedOwn = 0, g_rmLoggedCopy = 0, g_rmLoggedStop = 0;   /* separate line caps: own edges, writes on copies, stops */
 const long long kRmLogLimit = 40;
+/* T-330 aim (MAIN THREAD): own edges on / off; copy frames raised through the aim code, raises, lowerings; a wanted raise the aim
+   code's own tests refused (each change of reason per copy): state 1, +0x1A9 clear, no gun, a turret; faults (a call, or the
+   copy's ranged combat object, character or animation object unreadable) */
+long long g_aimOwnOn = 0, g_aimOwnOff = 0, g_aimCopyCalls = 0, g_aimCopyRaised = 0, g_aimCopyLowered = 0;
+long long g_aimRefState1 = 0, g_aimRefFlag1A9 = 0, g_aimRefNoGun = 0, g_aimRefTurret = 0, g_aimFault = 0;
+/* T-330 reload (MAIN THREAD): copy frames shown the reload motion through the aim code, motions started, motions ended, faults (a
+   call, its put-back, or the closing lowering) */
+long long g_aimReloadCalls = 0, g_aimReloadStarted = 0, g_aimReloadEnded = 0, g_aimReloadFault = 0;
+long long g_aimReloadOwnOn = 0, g_aimReloadOwnOff = 0;   /* own edges of the reload word */
+long long g_aimLoggedOwn = 0, g_aimLoggedCopy = 0;   /* separate line caps: own edges, copy raises / lowerings */
+const long long kAimLogLimit = 40;
 /* MAIN THREAD: the owner's hand item on its copy (HandSample, ApplyRemoteHand, HandApplyDrain). notFound counts each lookup that
    missed, waiting each owner word that had to wait for its item or for its copy at least once; notSent each send that found no
    road (once until one goes through) or an item it could not name; resent each catch-up / announce resend sent; rearmed each time
@@ -1948,6 +2090,12 @@ std::string ShotGateToken()
          + ",notTaken=" + N3(g_rmNotTaken) + ",fault=" + N3(g_rmFault) + ",noHook=" + N3(g_rmNoHook)
          + ",revertStopped=" + N3(g_rmRevertStopped) + ",shotNoted=" + N3(g_rmShotNoted) + ",goneOff=" + N3(g_rmGoneOff)
          + ",onPassWait=" + N3(g_cfOnPassWait) + "]"
+         + " aim[ownOn,ownOff,copyCalls,copyRaised,copyLowered,refState1,refFlag1A9,refNoGun,refTurret,fault,reloadCalls,reloadStarted,reloadEnded,reloadFault,reloadOwnOn,reloadOwnOff]="
+         + N3(g_aimOwnOn)
+         + "," + N3(g_aimOwnOff) + "," + N3(g_aimCopyCalls) + "," + N3(g_aimCopyRaised) + "," + N3(g_aimCopyLowered)
+         + "," + N3(g_aimRefState1) + "," + N3(g_aimRefFlag1A9) + "," + N3(g_aimRefNoGun) + "," + N3(g_aimRefTurret)
+         + "," + N3(g_aimFault) + "," + N3(g_aimReloadCalls) + "," + N3(g_aimReloadStarted) + "," + N3(g_aimReloadEnded)
+         + "," + N3(g_aimReloadFault) + "," + N3(g_aimReloadOwnOn) + "," + N3(g_aimReloadOwnOff)
          + " hand[sent,recv,drew,putAway,notFound,waiting,reverts,capped,skippedAnimal]=" + N3(g_hdSent) + "," + N3(g_hdRecv)
          + "," + N3(g_hdDrew) + "," + N3(g_hdPutAway) + "," + N3(g_hdNotFound) + "," + N3(g_hdWaiting) + "," + N3(g_hdReverts)
          + "," + N3(g_hdCapped) + "," + N3(g_hdSkippedAnimal)
@@ -3007,8 +3155,108 @@ int MeleeCallUnderAttack(MeleeUnderAttackFn f, ::Character* v, ::Character* a)
 // NPC - never hitByMeleeAttack, which would roll the block again here. Then the victim-side reactions the melee hit runs
 // (rememberCharacter, the hit reaction 0x438E50) with the attacker's copy, and the HIT to every game that holds a copy, its
 // second trailing byte set: the attacker's game already played the blow.
+// T-890 fightReady, K2 safe point (MAIN THREAD, worker paused). The engine's lookup 0x883120 (FightReadyTime) ignores its object
+// and returns read-only constants (decomp_883120.txt); called as 0x609860 calls it, with the fight object's +0x190.
+static unsigned long long kFrLookupRva = 0; static coop::AddrReg kFrLookupRva_reg("FightReadyTime", &kFrLookupRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x883120, 1.0.68 0x883FF0 */
+typedef float (*FrLookupFn)(void*, int);
+static int FrLookupPod(FrLookupFn f, void* obj, int index, float* out)
+{
+    *out = 0.0f;
+    __try { *out = f(obj, index); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// Live, at the write: +0x148 the getting-ready timer, +0x144 its countdown flag, +0x190 the lookup's object. POD, __try.
+static int FrLiveRead(const void* cc, float* timer, int* flag, void** obj)
+{
+    __try
+    {
+        const char* b = (const char*)cc;
+        *timer = *(const float*)(b + 0x148);
+        *flag  = (*(const unsigned char*)(b + 0x144) != 0) ? 1 : 0;
+        *obj   = *(void* const*)(b + 0x190);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static int FrTimerWrite(const void* cc, float v)
+{
+    __try { *(float*)((char*)cc + 0x148) = v; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static void FightReadyLine(const ReadyResult& r, int why, float before, float after, int held)
+{
+    if (g_fight.accepted >= fightlog::kCap) return;   /* capped with the other [FIGHT] lines */
+    fightlog::Event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.kind = fightlog::kReady;
+    ev.a = r.attacker; ev.b = r.victim; ev.combo = r.combo; ev.result = r.result;
+    ev.why = why; ev.before = before; ev.after = after; ev.held = held;
+    FightPush(ev);
+}
+// The contact notes onto their attackers' rows, stamped with the swing number now; then each queued result: matched to the
+// attacker's last contact, the fight object found live from the attacker, the timer written (held), added to (counting) or left.
+// Never waits for a result; a contact with no result keeps the engine's no-hit pause.
+static void FightReadySafePoint()
+{
+    while (g_readyNoteR != g_readyNoteW)
+    {
+        const ReadyNote n = g_readyNote[(unsigned int)g_readyNoteR & kReadyNoteMask];
+        InterlockedExchange(&g_readyNoteR, g_readyNoteR + 1);
+        ReadyRow* row = ReadyRowFor(n.attacker);
+        row->last.have = 1;
+        row->last.victim = n.victim;
+        row->last.combo = n.combo;
+        row->last.suppressed = n.suppressed;
+        row->last.flag = n.flag;
+        row->last.swing = row->swing;
+        row->last.resolved = 0;
+    }
+    if (g_readyResultCount == 0) return;
+    const bool blocked = EngineWritesBlocked();
+    const FrLookupFn look = (kFrLookupRva != 0) ? (FrLookupFn)((unsigned long long)::GetModuleHandleA(0) + kFrLookupRva) : 0;
+    for (int i = 0; i < g_readyResultCount; ++i)
+    {
+        const ReadyResult r = g_readyResult[i];
+        ReadyRow* row = ReadyRowFor(r.attacker);
+        int why = fightready::Match(row->last, r.victim, r.combo, row->swing);
+        if (why == fightready::kWhyNoContact) { ++g_frNoContact; FightReadyLine(r, why, 0.0f, 0.0f, 0); continue; }
+        if (why == fightready::kWhyOtherVictim) { ++g_frOtherVictim; FightReadyLine(r, why, 0.0f, 0.0f, 0); continue; }
+        if (why == fightready::kWhyNone) row->last.resolved = 1;   /* one result per contact */
+        float before = 0.0f, after = 0.0f, value = 0.0f, contactValue = 0.0f;
+        int flag = 0, held = 0;
+        void* obj = 0;
+        const void* cc = 0;
+        if (why == fightready::kWhyNone && blocked) why = fightready::kWhyLoading;
+        if (why == fightready::kWhyNone)
+        {
+            ::Character* a = net::IsUidMine(r.attacker) ? FindSpawned(r.attacker) : 0;
+            cc = (a != 0) ? FightCombatOf(a) : 0;
+            if (look == 0 || cc == 0 || !FrLiveRead(cc, &before, &flag, &obj)
+                || !FrLookupPod(look, obj, fightready::LookupIndex(r.result), &value)
+                || !FrLookupPod(look, obj, fightready::kIndexNoHit, &contactValue))
+                why = fightready::kWhyNoFight;
+        }
+        if (why == fightready::kWhyNone)
+        {
+            const int arm = fightready::Arm(before, flag, row->last.flag, contactValue);
+            why = fightready::ArmWhy(arm);
+            if (why == fightready::kWhyNone)
+            {
+                after = fightready::After(arm, before, value, contactValue);
+                held = (arm == fightready::kArmHeld) ? 1 : 0;
+                if (!FrTimerWrite(cc, after)) why = fightready::kWhyNoFight;
+            }
+        }
+        if (why == fightready::kWhyNone) { if (held) ++g_frWritten; else ++g_frAdded; }
+        else ++g_frLate;
+        FightReadyLine(r, why, before, after, held);
+    }
+    g_readyResultCount = 0;
+}
+
 void MeleeSafePointDrain()
 {
+    FightReadySafePoint();   /* T-890: the owner's getting-ready timer from its blows' real results, worker paused */
     if (g_meleeInQ.empty()) return;
     std::vector<MeleeIn> q;
     q.swap(g_meleeInQ);
@@ -3303,6 +3551,386 @@ static int RangedModeNote(unsigned int uid, unsigned int latchBits)
     return 1;
 }
 
+// =====================================================================================================================
+// T-330 THE OWNER'S AIM ON ITS COPY (src/common/aimstamp.h). The engine raises a crossbow / bow in its aim code, which only its
+// ranged update calls - and a copy never runs that update, so its crossbow stays lowered while its owner aims. The owner: the
+// layer-play detour stamps a character's animation object whenever a play returns into the aim code (spawn.cpp); a character
+// aims while its ranged mode is on and its stamp is under 250 ms old (AimOwnRead). That word rides its STATE as latchBits bits
+// 17-18 (StanceStateBits, beside the ranged mode) and a change on one of this game's own characters is sampled every frame
+// (CombatModeTick -> AimOwnSample) and sent at once on the stance push's road. The copy keeps its owner's latest word
+// (AimNote, from ApplyRemoteStance); right after its own Character::update (AimCopyAfterUpdate) the engine's aim code is called
+// for it with a zero target position (no turn - the copy's facing is its owner's) and the copy itself as the target (the code
+// only tests it against null); when the word falls, the ranged mode goes off, it can no longer aim, it is handed here or its
+// owner leaves, the aim code is called once with no target - the engine's own lowering.
+// =====================================================================================================================
+/* the owner's aim word, raised by our last step, the last refusal counted, its owner left; the owner's reload word, the motion
+   shown, a shown motion ended under this word, the owner's bolt fired here since the last step, its last step (a GetTickCount
+   value), the seconds into it and its length in seconds */
+struct AimCopy { int want; int raised; int lastRef; int gone; int rlWant; int rlOn; int rlSpent; int rlFired; unsigned int rlAt; float rlElapsed; float rlSec; };
+static std::map<unsigned int, AimCopy> g_aimCopy;   /* MAIN THREAD: uid of a copy -> its owner's aim word and our last step */
+
+// T-330 reload (aimstamp.h 4): the ranged combat object's reload flag (byte) and time left (float), the weapon kind its skill is
+// read for and its character; the character's stats; the gun's loaded count and reload progress - decomp_437940.txt,
+// decomp_51da50.txt:69-84.
+const size_t kRlRcFlag = 0x80, kRlRcLeft = 0x78, kRlRcSkillKind = 0x30, kRlRcChar = 0x68, kRlCharStats = 0x450;
+const size_t kRlGunAmmo = 0x20, kRlGunProgress = 0xE0;
+/* the copy's own reload time, as the reload check reads it: skill = (CharStats*, weapon kind) -> float, then (gun, skill) -> seconds.
+   Only called (call-only rows). */
+static unsigned long long kRlSkillRva = 0; static coop::AddrReg kRlSkillRva_reg("RangedReloadSkill", &kRlSkillRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x884E10, 1.0.68 0x885CE0 */
+static unsigned long long kRlTimeRva = 0; static coop::AddrReg kRlTimeRva_reg("RangedReloadTime", &kRlTimeRva, coop::kAddrUseCallOnly);   /* Steam_1.0.65 0x435C70, 1.0.68 0x436010 */
+/* the owner's time left per mirror slot (CombatModeTick -> ReloadOwnSample); read from any thread by ReloadOwnRead */
+const int kRlSeenCap = 4096;   /* = kMaxCombatWatch (checked beside ReloadOwnSample) */
+static coopaim::ReloadSeen g_rlSeen[kRlSeenCap];
+/* the engine's frame step, the step the reload check counts the time left down by (decomp_437940.txt) - 0 while paused */
+static unsigned long long kRlDtRva = 0; static coop::AddrReg kRlDtRva_reg("GameFrameDt", &kRlDtRva);   /* Steam_1.0.65 0x2132734, a float var (farm.cpp's row) */
+
+// Any thread, read only, no C++ objects (SEH): the engine's frame step. 1 read, 0 no table row, -1 faulted.
+static int RlFrameDtPod(float* dt)
+{
+    *dt = 0.0f;
+    if (kRlDtRva == 0) return 0;
+    __try { *dt = *(const float*)((unsigned long long)::GetModuleHandleA(0) + kRlDtRva); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *dt = 0.0f; return -1; }
+}
+
+// Any thread (also from the stance setter's detour, through StanceStateBits): whether this game's character c aims - 1, 0, or
+// -1 not known (its ranged mode unreadable, or the stamps cannot be known here).
+static int AimOwnRead(const void* c)
+{
+    const int mode = RsReadMode(c);
+    unsigned int stamp = 0, window = coopaim::kFreshMs;
+    const int have = (mode == 1) ? AimStampOf(c, &stamp, &window) : 0;   /* the window: c's own update cadence */
+    return coopaim::OwnDecide(mode, have, stamp, ::GetTickCount(), window);
+}
+
+// Any thread, read only, no C++ objects (SEH): character c's reload branch inputs - the ranged combat object's kind, reload flag
+// and time left, its stored gun's loaded count and progress. 1 all read, 0 no gun stored (kind / flag / left read), -1 the object
+// or the gun unreadable or implausible.
+static int ReloadOwnFieldsPod(const void* c, int* kind, int* flag, int* ammo, float* prog, float* left)
+{
+    *kind = 0; *flag = 0; *ammo = 0; *prog = 0.0f; *left = 0.0f;
+    __try
+    {
+        const char* rc = *(const char* const*)((const char*)c + kRsCharRanged);
+        if (!RsPlaus(rc)) return -1;
+        *kind = *(const int*)(rc + 0x10);
+        *flag = (*(const unsigned char*)(rc + kRlRcFlag) != 0) ? 1 : 0;
+        *left = *(const float*)(rc + kRlRcLeft);
+        const char* gun = *(const char* const*)(rc + kRsRcGun);
+        if (gun == 0) return 0;
+        if (!RsPlaus(gun)) return -1;
+        *ammo = *(const int*)(gun + kRlGunAmmo);
+        *prog = *(const float*)(gun + kRlGunProgress);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// Any thread: the mirror slot whose last sample was character c, 0 none (a character not sampled every frame - an owned NPC).
+// A character that moved to another slot can be in two; the one that saw the latest change is taken.
+static const coopaim::ReloadSeen* ReloadSeenOf(const void* c)
+{
+    if (c == 0) return 0;
+    const coopaim::ReloadSeen* best = 0;
+    unsigned int bestAt = 0u;
+    int bestCh = 0;
+    for (int i = 0; i < kRlSeenCap; ++i)
+    {
+        const coopaim::ReloadSeen& s = g_rlSeen[i];
+        if (s.c != c || s.have == 0) continue;
+        unsigned int at = 0u;
+        const int ch = coopaim::ReloadSeenChanged(&s, &at);
+        if (best == 0 || (ch != 0 && (bestCh == 0 || (int)(at - bestAt) > 0))) { best = &s; bestAt = at; bestCh = ch; }
+    }
+    return best;
+}
+
+// Any thread (also from the stance setter's detour, through StanceStateBits): whether this game's character c reloads - 1, 0,
+// or -1 not known (unreadable, or the branch's test passes on a character whose time left is not sampled every frame). seen:
+// its slot (0 = looked up by c).
+static int ReloadOwnRead(const void* c, const coopaim::ReloadSeen* seen)
+{
+    const int mode = RsReadMode(c);
+    int kind = 0, flag = 0, ammo = 0;
+    float prog = 0.0f, left = 0.0f;
+    const int r = (mode == 1) ? ReloadOwnFieldsPod(c, &kind, &flag, &ammo, &prog, &left) : -1;
+    if (seen != 0 && seen->c != c) seen = 0;
+    if (seen == 0 && mode == 1 && r == 1) seen = ReloadSeenOf(c);
+    unsigned int at = 0u, window = coopaim::kReloadFreshMs;
+    int changed = (seen == 0) ? -1 : coopaim::ReloadSeenChanged(seen, &at, &window);   /* the window: its own update cadence */
+    if (seen != 0 && seen->c != c) changed = -1;   /* the slot was taken by another character while it was read */
+    return coopaim::OwnReloadDecide(mode, (r >= 0) ? 1 : 0, kind, (r == 1) ? flag : 0, ammo, prog, changed, at, ::GetTickCount(),
+                                    window);
+}
+
+// MAIN THREAD (ApplyRemoteStance): the owner's aim word for copy uid, when its STATE carries one. A 'not aiming' word for a
+// copy we never raised is not kept.
+static void AimNote(unsigned int uid, unsigned int latchBits)
+{
+    const int want = coopstate::AimCarried(latchBits);
+    const int rl = coopstate::ReloadCarried(latchBits);   /* the owner's reload (bits 19-20); an older owner's build carries none */
+    if (uid == 0 || (want < 0 && rl < 0) || net::IsUidMine(uid)) return;
+    std::map<unsigned int, AimCopy>::iterator it = g_aimCopy.find(uid);
+    if (it == g_aimCopy.end())
+    {
+        if ((want != 1 && rl != 1) || AimCodeAddr() == 0) return;
+        AimCopy w; w.want = (want == 1) ? 1 : 0; w.raised = 0; w.lastRef = coopaim::kReady; w.gone = 0;
+        w.rlWant = (rl == 1) ? 1 : 0; w.rlOn = 0; w.rlSpent = 0; w.rlFired = 0; w.rlAt = 0u; w.rlElapsed = 0.0f; w.rlSec = coopaim::kReloadFallbackSec;
+        g_aimCopy[uid] = w;
+        return;
+    }
+    if (want >= 0) it->second.want = want;
+    if (rl >= 0) it->second.rlWant = rl;
+    it->second.gone = 0;
+    if (it->second.want == 0 && it->second.raised == 0 && it->second.rlWant != 1 && it->second.rlOn == 0) g_aimCopy.erase(it);
+}
+
+// MAIN THREAD (ShotFireDrain): the owner's bolt was fired on copy uid - its reload, if one is shown, is over.
+static void AimReloadFired(unsigned int uid)
+{
+    std::map<unsigned int, AimCopy>::iterator it = g_aimCopy.find(uid);
+    if (it != g_aimCopy.end()) it->second.rlFired = 1;
+}
+
+// MAIN THREAD (RangedModeOwnerGone): the copy's owner left - it is lowered after its next update, then forgotten.
+static void AimOwnerGone(unsigned int uid)
+{
+    std::map<unsigned int, AimCopy>::iterator it = g_aimCopy.find(uid);
+    if (it == g_aimCopy.end()) return;
+    it->second.want = 0;
+    it->second.gone = 1;
+}
+
+// K2 safe point (MAIN THREAD): words of copies no longer here go.
+static void AimCopySweep()
+{
+    std::map<unsigned int, AimCopy>::iterator it = g_aimCopy.begin();
+    while (it != g_aimCopy.end())
+    {
+        if (FindSpawned(it->first) == 0) g_aimCopy.erase(it++);
+        else ++it;
+    }
+}
+
+// MAIN THREAD, no C++ objects (SEH): the aim code's own tests on copy c (coopaim::EngineReason) and *rcOut its ranged combat
+// object; -1 the object, its character (+0x68) or that character's animation object (+0x448) unreadable or implausible - the
+// aim code reads all three.
+static int AimEngineReadPod(const void* c, void** rcOut)
+{
+    *rcOut = 0;
+    __try
+    {
+        char* rc = *(char* const*)((const char*)c + kRsCharRanged);
+        if (!RsPlaus(rc)) return -1;
+        const char* owner = *(const char* const*)(rc + 0x68);
+        if (!RsPlaus(owner) || !RsPlaus(*(const void* const*)(owner + 0x448))) return -1;
+        *rcOut = rc;
+        return coopaim::EngineReason(*(const int*)(rc + 0x10), (*(void* const*)(rc + kRsRcGun) != 0) ? 1 : 0,
+                                     *(const int*)(rc + 0x00), (*(const unsigned char*)(owner + 0x1A9) != 0) ? 1 : 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *rcOut = 0; return -1; }
+}
+
+// MAIN THREAD, no C++ objects (SEH): the engine's aim code for ranged combat object rc - target non-null raises (plays 'aimH'),
+// null lowers. The target position is zero: the code turns the character only toward a non-zero one. 1 called, -1 faulted.
+typedef void (*AimCodeFn)(void* rc, void* unused, const float* targetPos, void* target);
+static int AimCallPod(unsigned long long fn, void* rc, void* target)
+{
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    __try
+    {
+        ((AimCodeFn)fn)(rc, 0, zero, target);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// MAIN THREAD, no C++ objects (SEH): puts the three reload inputs back. 1 written, -1 faulted.
+static int ReloadPutBackPod(char* rc, char* gun, unsigned char flag, int ammo, float prog)
+{
+    __try
+    {
+        *(unsigned char*)(rc + kRlRcFlag) = flag;
+        *(int*)(gun + kRlGunAmmo) = ammo;
+        *(float*)(gun + kRlGunProgress) = prog;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// MAIN THREAD, no C++ objects (SEH): the aim code's reload branch on copy ranged combat object rc at progress (> 0): for this
+// one call the reload flag is set, the gun reads empty and its progress is `progress`; all three are put back right after it,
+// also when the call faults. The target is null: the branch returns before the target is read, and were it not taken the aim
+// code would only lower. 1 called and put back, 0 no plausible gun (nothing written), -1 faulted.
+static int ReloadCallPod(unsigned long long fn, void* rcv, float progress)
+{
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    char* const rc = (char*)rcv;
+    char* volatile gun = 0;
+    volatile unsigned char flag = 0;
+    volatile int ammo = 0;
+    volatile float prog = 0.0f;
+    volatile int held = 0;
+    __try
+    {
+        gun = *(char* const*)(rc + kRsRcGun);
+        if (!RsPlaus(gun)) return 0;
+        flag = *(const unsigned char*)(rc + kRlRcFlag);
+        ammo = *(const int*)(gun + kRlGunAmmo);
+        prog = *(const float*)(gun + kRlGunProgress);
+        held = 1;
+        *(unsigned char*)(rc + kRlRcFlag) = 1;
+        *(int*)(gun + kRlGunAmmo) = 0;
+        *(float*)(gun + kRlGunProgress) = progress;
+        ((AimCodeFn)fn)(rc, 0, zero, 0);
+        held = 0;
+        return (ReloadPutBackPod(rc, gun, flag, ammo, prog) == 1) ? 1 : -1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (held != 0) ReloadPutBackPod(rc, gun, flag, ammo, prog);
+        return -1;
+    }
+}
+
+// MAIN THREAD, no C++ objects (SEH): the copy's own reload time in seconds, as the engine's reload check reads it (its skill for
+// the weapon kind, then the gun's time for that skill). 1 read, 0 a row missing or a pointer implausible, -1 faulted.
+typedef float (*ReloadSkillFn)(void* stats, int kind);
+typedef float (*ReloadTimeFn)(void* gun, float skill);
+static int ReloadTimePod(unsigned long long skillFn, unsigned long long timeFn, void* rcv, float* sec)
+{
+    *sec = 0.0f;
+    if (skillFn == 0 || timeFn == 0) return 0;
+    __try
+    {
+        char* rc = (char*)rcv;
+        char* ch = *(char* const*)(rc + kRlRcChar);
+        if (!RsPlaus(ch)) return 0;
+        void* stats = *(void* const*)(ch + kRlCharStats);
+        void* gun = *(void* const*)(rc + kRsRcGun);
+        if (!RsPlaus(stats) || !RsPlaus(gun)) return 0;
+        const float skill = ((ReloadSkillFn)skillFn)(stats, *(const int*)(rc + kRlRcSkillKind));
+        *sec = ((ReloadTimeFn)timeFn)(gun, skill);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *sec = 0.0f; return -1; }
+}
+
+static void AimCopyLine(unsigned int uid, const std::string& what)
+{
+    if (g_aimLoggedCopy >= kAimLogLimit) return;
+    ++g_aimLoggedCopy;
+    DebugLog("[AIM] copy uid=" + N3(uid) + " " + what
+             + (g_aimLoggedCopy == kAimLogLimit ? std::string(" - the copy lines are used up") : std::string()));
+}
+
+// See spawn.h. Called for every character after its update: anything not a copy with a kept word leaves at the first lookups.
+void AimCopyAfterUpdate(::Character* c)
+{
+    if (g_aimCopy.empty() || c == 0) return;
+    const unsigned int uid = FindSpawnedUid(c);
+    if (uid == 0) return;
+    std::map<unsigned int, AimCopy>::iterator it = g_aimCopy.find(uid);
+    if (it == g_aimCopy.end()) return;
+    const unsigned long long fn = AimCodeAddr();
+    if (fn == 0 || EngineWritesBlocked()) return;
+    AimCopy& w = it->second;
+    const bool mine = net::IsUidMine(uid);
+    const int want = (mine || w.gone) ? 0 : w.want;
+    const int fit = (!mine && AimCopyFit(c)) ? 1 : 0;
+    const int mode = RsReadMode(c);
+    void* rc = 0;
+    const int ref = AimEngineReadPod(c, &rc);
+    if (want == 1 && mode == 1 && fit == 1)
+    {
+        if (ref != w.lastRef)
+        {
+            if (ref == coopaim::kRefState1) ++g_aimRefState1;
+            else if (ref == coopaim::kRefFlag) ++g_aimRefFlag1A9;
+            else if (ref == coopaim::kRefNoGun) ++g_aimRefNoGun;
+            else if (ref == coopaim::kRefTurret) ++g_aimRefTurret;
+            else if (ref < 0) ++g_aimFault;
+            w.lastRef = ref;
+        }
+    }
+    else w.lastRef = coopaim::kReady;
+    const int step = coopaim::CopyStep(want, mode, fit, ref, w.raised);
+    if (step == coopaim::kStepCall)
+    {
+        if (AimCallPod(fn, rc, c) < 0) ++g_aimFault;
+        else
+        {
+            ++g_aimCopyCalls;
+            if (w.raised == 0) { w.raised = 1; ++g_aimCopyRaised; AimCopyLine(uid, "raised"); }
+        }
+    }
+    else if (step == coopaim::kStepFade)
+    {
+        /* the aim code lowers only where its own tests pass; refused or unreadable, it is not called, its motion ends on its own */
+        if (ref == coopaim::kReady) { if (AimCallPod(fn, rc, 0) < 0) ++g_aimFault; else ++g_aimCopyLowered; }
+        w.raised = 0;
+        AimCopyLine(uid, std::string("lowered - ")
+                    + (mine ? "handed to this game" : w.gone ? "its owner left" : want != 1 ? "its owner stopped aiming"
+                       : mode != 1 ? "its ranged mode is off" : fit != 1 ? "carried, ragdolled or dead"
+                       : ref < 0 ? "its ranged combat object is unreadable" : "the aim code's own tests refuse it"));
+    }
+    /* the owner's reload motion (aimstamp.h 4): the aim code's reload branch, its inputs set for each call only */
+    const unsigned int nowMs = ::GetTickCount();
+    const int rlWant = (mine || w.gone) ? 0 : w.rlWant;
+    const int fired = w.rlFired;
+    w.rlFired = 0;
+    const int ok = coopaim::ReloadMayShow(mine ? 1 : 0, w.gone, fit, mode, ref);
+    int why = coopaim::kRlWhyNone;
+    int rl = coopaim::ReloadStep(rlWant, want, fired, ok, w.rlOn, w.rlSpent, &why);
+    if (rl == coopaim::kRlStart)
+    {
+        float sec = 0.0f;
+        const int own = ReloadTimePod(kRlSkillRva != 0 ? (unsigned long long)::GetModuleHandleA(0) + kRlSkillRva : 0,
+                                      kRlTimeRva != 0 ? (unsigned long long)::GetModuleHandleA(0) + kRlTimeRva : 0, rc, &sec);
+        w.rlSec = coopaim::ReloadSeconds(own == 1 ? 1 : 0, sec);
+        const bool usedOwn = (own == 1 && w.rlSec == sec);
+        w.rlOn = 1;
+        w.rlAt = nowMs;
+        w.rlElapsed = 0.0f;
+        ++g_aimReloadStarted;
+        AimCopyLine(uid, "reload shown - its owner reloads (" + F1(w.rlSec) + " s, "
+                    + (usedOwn ? std::string("its own reload time)") : std::string("the fixed time: its own could not be read)")));
+        rl = coopaim::kRlCall;
+    }
+    else if (rl == coopaim::kRlCall)
+    {
+        /* one more frame of the engine's own step: the motion follows the world's speed and stands still while paused */
+        float dt = 0.0f;
+        const int dtRead = (RlFrameDtPod(&dt) == 1) ? 1 : 0;
+        w.rlElapsed = coopaim::ReloadAdvance(w.rlElapsed, dtRead, dt, (float)(nowMs - w.rlAt) / 1000.0f);
+        w.rlAt = nowMs;
+    }
+    if (rl == coopaim::kRlCall)
+    {
+        const int called = ReloadCallPod(fn, rc, coopaim::ReloadProgress(w.rlElapsed, w.rlSec));
+        if (called == 1) ++g_aimReloadCalls;
+        else
+        {
+            if (called < 0) ++g_aimReloadFault;
+            rl = coopaim::kRlEnd;
+            why = coopaim::ReloadEndAfterCall(called);
+        }
+    }
+    if (rl == coopaim::kRlEnd)
+    {
+        w.rlOn = 0;
+        ++g_aimReloadEnded;
+        if (coopaim::ReloadLowerAfterEnd(why, (step == coopaim::kStepCall) ? 1 : 0, ref) == 1 && AimCallPod(fn, rc, 0) < 0)
+            ++g_aimReloadFault;
+        AimCopyLine(uid, std::string("reload ended - ")
+                    + (why == coopaim::kRlWhyAim ? "its owner aims" : why == coopaim::kRlWhyFired ? "its owner fired"
+                       : why == coopaim::kRlWhyOwner ? "its owner stopped reloading" : why == coopaim::kRlWhyNoGun ? "it holds no plausible gun"
+                       : why == coopaim::kRlWhyFault ? "the call faulted" : "it may no longer show it (handed here, owner left, unfit, ranged mode off or refused)"));
+    }
+    w.rlSpent = coopaim::ReloadSpentNext(w.rlSpent, rl, rlWant, want, fired);
+    if ((mine || w.gone) && w.raised == 0 && w.rlOn == 0) g_aimCopy.erase(it);
+}
+
 // K2 safe point (MAIN THREAD, worker paused): each copy's ranged mode made its owner's. A copy gone, or handed to this game,
 // leaves the table unwritten: a copy handed here keeps the engine's own byte - the character is this game's now. An entry whose
 // owner left (RangedModeOwnerGone) is written OFF once if this game last wrote it ON, and leaves. A byte that changes back
@@ -3311,6 +3939,7 @@ static int RangedModeNote(unsigned int uid, unsigned int latchBits)
 static void RangedModeApplyDrain()
 {
     g_rmPass = coopstate::RangedModePassNext(g_rmPass);
+    AimCopySweep();   /* T-330: the aim words of copies no longer here */
     if (g_rmWant.empty() || EngineWritesBlocked()) return;
     std::map<unsigned int, RmWant>::iterator it = g_rmWant.begin();
     while (it != g_rmWant.end())
@@ -3378,6 +4007,7 @@ static void HandOwnerGone(unsigned int uid);   /* below: the copy's wanted hand 
 void RangedModeOwnerGone(unsigned int uid)
 {
     HandOwnerGone(uid);   /* the copy's hands are left as its engine has them */
+    AimOwnerGone(uid);    /* a raised copy is lowered after its next update */
     std::map<unsigned int, RmWant>::iterator it = g_rmWant.find(uid);
     if (it == g_rmWant.end()) return;
     it->second.want = 0;
@@ -3496,6 +4126,7 @@ static void ShotFireDrain()
             continue;
         }
         ++g_cfFired;
+        AimReloadFired(s.f.shooterUid);   /* T-330: a reload shown on this copy is over */
         if (moved) ++g_cfMoved;
         if (prime) ++g_cfPrimed;
         // Only a bolt aimed at a player character this game runs can need its record (HitDecideAimed); keeping one for every
@@ -5122,7 +5753,10 @@ unsigned int StanceStateBits(const void* c)
 {
     unsigned char b[kStanceN];
     const bool read = StanceReadPod(c, b);
-    return coopstate::WithRangedMode(coopstate::WithStance(0u, b, read), RsReadMode(c));   /* + the ranged mode, bits 15-16 */
+    const int reloading = ReloadOwnRead(c, 0);
+    return coopstate::WithReload(coopstate::WithAim(coopstate::WithRangedMode(coopstate::WithStance(0u, b, read), RsReadMode(c)),
+                                                    coopaim::AimWhileReload(AimOwnRead(c), reloading)),
+                                 reloading);   /* + the ranged mode, bits 15-16, the aim, bits 17-18 (0 while reloading), the reload, 19-20 */
 }
 
 static std::map<unsigned int, unsigned int> g_fpStanceSeen;   /* MAIN THREAD: uid -> the owner's stance bits its last STATE carried */
@@ -5132,6 +5766,7 @@ static std::map<unsigned int, unsigned int> g_fpStanceTook;  /* MAIN THREAD: uid
 void ApplyRemoteStance(unsigned int uid, void* c, unsigned int latchBits)
 {
     RangedModeNote(uid, latchBits);   /* the owner's ranged mode (bits 15-16), any copy; written at the K2 safe point */
+    AimNote(uid, latchBits);          /* T-330: the owner's aim (bits 17-18), any copy; acted on after the copy's update */
     if (uid == 0 || c == 0 || !coopstate::StanceCarried(latchBits)) return;
     if (net::IsUidMine(uid) || IsUidPlayerCharAnyThread(uid) != 1) return;
     if (EngineWritesBlocked()) return;   /* the owner's next STATE carries the buttons again */
@@ -5537,7 +6172,7 @@ static std::string FightParityToken()
          + ",blockWindowHook=" + N3((long long)g_fpHookBlockWindow) + ",blockWaitHeld=" + N3((long long)g_fpBlockWaitHeld)
          + ",blockWaitArrived=" + N3((long long)g_fpBlockWaitArrived) + ",blockWaitCapped=" + N3((long long)g_fpBlockWaitCapped)
          + ",blockPickOld=" + N3((long long)g_fpBlockPickOld) + ",blockHoldLeft=" + N3((long long)g_fpBlockHoldLeft)
-         + ",blockForcedNone=" + N3((long long)g_fpBlockForcedNone) + "]";
+         + ",blockForcedNone=" + N3((long long)g_fpBlockForcedNone) + "]" + FightReadyToken();
 }
 
 // 1 hooked, 0 AddHook failed, -1 no address row for this game.
@@ -8782,6 +9417,73 @@ static void RangedModeSample(int i, unsigned int uid, const void* c)
     }
 }
 
+// MAIN THREAD (CombatModeTick): T-330 - one of this game's own characters' aim (AimOwnRead), sampled every frame by mirror slot
+// i; a change between two known samples puts its uid in the stance push's set, so one STATE carries it at once
+// (StanceChangeDrain). The first sample of a slot's character only records it: the periodic STATE carries that one.
+static unsigned int g_aimSeenUid[kMaxCombatWatch];
+static signed char  g_aimSeen[kMaxCombatWatch];
+static void AimOwnSample(int i, unsigned int uid, const void* c)
+{
+    if (i < 0 || i >= kMaxCombatWatch) return;
+    float dt = 0.0f;
+    if (RlFrameDtPod(&dt) == 1 && !(dt > 0.0f)) AimStampKeep(c, ::GetTickCount());   /* paused: the aim word is kept as it was */
+    const int now = coopaim::AimWhileReload(AimOwnRead(c), ReloadOwnRead(c, &g_rlSeen[i]));   /* 'not aiming' while it reloads */
+    if (now < 0) return;
+    if (g_aimSeenUid[i] != uid) { g_aimSeenUid[i] = uid; g_aimSeen[i] = (signed char)now; return; }
+    const int seen = (int)g_aimSeen[i];
+    g_aimSeen[i] = (signed char)now;
+    if (!coopaim::Changed(seen, now)) return;
+    if (now) ++g_aimOwnOn; else ++g_aimOwnOff;
+    StanceDirtyLock();
+    const int added = coopstate::DirtyAdd(g_fpStanceDirty, &g_fpStanceDirtyN, kStanceDirtyCap, uid);
+    const int n = g_fpStanceDirtyN;
+    StanceDirtyUnlock();
+    if (n > g_fpStanceDirtyMax) InterlockedExchange64(&g_fpStanceDirtyMax, n);
+    if (g_aimLoggedOwn < kAimLogLimit)
+    {
+        ++g_aimLoggedOwn;
+        DebugLog("[AIM] own uid=" + N3(uid) + " " + std::string(now ? "on" : "off")
+                 + (added < 0 ? std::string(" - the push set is full: the periodic STATE carries it") : std::string(" - one STATE carries it at once")));
+    }
+}
+
+// MAIN THREAD (CombatModeTick): T-330 - one of this game's own characters' reload. Its time left is noted in mirror slot i every
+// frame (the 'counted down within its window' half of ReloadOwnRead: the window follows the character's own update cadence, so
+// a character far from the camera, updated on a shared turn ~0.3 s apart, does not flicker - T1717), then its word is read; a
+// change between two known words puts its uid in the stance push's set, so one STATE carries it at once. The first word of a
+// slot's character only records it.
+typedef char RlSeenCapIsMirrorCap[(kRlSeenCap == kMaxCombatWatch) ? 1 : -1];
+static unsigned int g_rlWordUid[kMaxCombatWatch];
+static signed char  g_rlWord[kMaxCombatWatch];
+static void ReloadOwnSample(int i, unsigned int uid, const void* c)
+{
+    if (i < 0 || i >= kMaxCombatWatch) return;
+    int kind = 0, flag = 0, ammo = 0;
+    float prog = 0.0f, left = 0.0f;
+    const int r = (RsReadMode(c) == 1) ? ReloadOwnFieldsPod(c, &kind, &flag, &ammo, &prog, &left) : -1;
+    float dt = 0.0f;
+    const int stopped = (RlFrameDtPod(&dt) == 1 && !(dt > 0.0f)) ? 1 : 0;   /* paused: the word is kept as it was */
+    coopaim::ReloadSeenNote(&g_rlSeen[i], uid, c, (r >= 0) ? 1 : 0, left, stopped, ::GetTickCount());
+    const int now = ReloadOwnRead(c, &g_rlSeen[i]);
+    if (now < 0) return;
+    if (g_rlWordUid[i] != uid) { g_rlWordUid[i] = uid; g_rlWord[i] = (signed char)now; return; }
+    const int seen = (int)g_rlWord[i];
+    g_rlWord[i] = (signed char)now;
+    if (!coopaim::Changed(seen, now)) return;
+    if (now) ++g_aimReloadOwnOn; else ++g_aimReloadOwnOff;
+    StanceDirtyLock();
+    const int added = coopstate::DirtyAdd(g_fpStanceDirty, &g_fpStanceDirtyN, kStanceDirtyCap, uid);
+    const int n = g_fpStanceDirtyN;
+    StanceDirtyUnlock();
+    if (n > g_fpStanceDirtyMax) InterlockedExchange64(&g_fpStanceDirtyMax, n);
+    if (g_aimLoggedOwn < kAimLogLimit)
+    {
+        ++g_aimLoggedOwn;
+        DebugLog("[AIM] own uid=" + N3(uid) + " reload " + std::string(now ? "on" : "off")
+                 + (added < 0 ? std::string(" - the push set is full: the periodic STATE carries it") : std::string(" - one STATE carries it at once")));
+    }
+}
+
 #ifdef SW_DEV_BUILD
 // PROBE-START: P190 (T-330) - a player character's hands, back and hip while it is in combat or ranged mode
 /* LOG ONLY, MAIN THREAD. This half reads the ranged combat object (its mode +0x36, its stored gun +0x28) and the engine's
@@ -9306,6 +10008,8 @@ void CombatModeTick()
         // capable of a non-zero reading (T094).
         SampleCombatTick(w, c, cc, mine, on);
         if (mine) RangedModeSample(i, uid, c);   /* the owner's ranged mode: a change sends one STATE at once */
+        if (mine) AimOwnSample(i, uid, c);       /* T-330: the owner's aim: a change sends one STATE at once */
+        if (mine) ReloadOwnSample(i, uid, c);    /* T-330: the owner's reload: a change sends one STATE at once */
         if (mine) HandSample(i, uid, c);   /* the owner's hand item: a change sends one MSG_HAND at once */
 #ifdef SW_DEV_BUILD
         // PROBE-START: P190 - the hands, back and hip of a player character in combat or ranged mode
@@ -9409,6 +10113,9 @@ void CombatModeTick()
                 // `swingSent` inflating the numerator of the P041 arithmetic. `lastOn` was given
                 // exactly this treatment when it was written ("never sampled, so the first read is
                 // not an edge"); `lastState` was not, and rebinds did not exist to expose it.
+                // T-890: every own swing start raises the character's swing number, before the target checks below, so a
+                // late result of an earlier swing cannot add to this one's pause (a swing at a world NPC sends no SWING).
+                if (mine && st == SWORD_SWING && w->lastState != SWORD_SWING && w->lastState != -1) ReadySwingStart(uid);
                 if (mine && g_swingRepl && st == SWORD_SWING
                     && w->lastState != SWORD_SWING && w->lastState != -1)
                 {
@@ -12206,6 +12913,37 @@ long long g_p169FlagRead = 0, g_p169Lines = 0, g_p169Capped = 0;   /* main threa
 unsigned long long g_p169BaseVt = 0, g_p169ImageLo = 0, g_p169ImageHi = 0;
 typedef void (*P169DtorFn)(void* obj);
 P169DtorFn g_p169OrigDtor = 0;
+// PROBE-START: P210
+/* P210's records, here so P169DtorDetour can keep a P210StackRec on its own stack. */
+struct P210SubData { unsigned long long obj, vt, from; long long frame; unsigned long tid; int which, kind; };   /* which 1 SimplePhysXEntity, 2 ScytheRootObject; kind 1 twice, 2 bare */
+struct P210Prev { LONG64 num; unsigned long long vt, from; long long frame; unsigned long tid; int ring, which; };   /* the earlier destroy matched: ring 1 P169's base ring, 2 the subclass ring (which as above) */
+struct P210AddData { unsigned long long hull, mov, from; long long frame, listLen; unsigned long tid; int twice, via; };   /* mov = the object the hull came from (0 for DeleteListAdd); via: P210ViaName */
+/* A flagged destroy's records on the destroying thread's own stack while the original destructor runs, so a crash
+   inside it still has them in a dump (which holds stacks, not the heap). Find it by the 8 marker bytes "P210FLAG";
+   g_p210StackRec points at the live one. 280 bytes, offsets in 04-probes.md P210. */
+struct P210StackRec
+{
+    unsigned long long magic;      /* +0   "P210FLAG", written last */
+    unsigned long long obj;        /* +8   the object being destroyed */
+    LONG64 flagNum;                /* +16  P169's flag number (where 1) or P210's subclass flag number (where 2, 3) */
+    int where, kind;               /* +24  where 1 the base destructor (P169), 2 SimplePhysXEntity, 3 ScytheRootObject; +28 kind 1 twice, 2 bare */
+    P210SubData cur;               /* +32  this destroy (where 2, 3; zero for where 1 - P169FLAG holds it) */
+    P210Prev prev;                 /* +80  the earlier destroy it matched (where 2, 3) */
+    LONG64 subNum, subTotal;       /* +128 the newest earlier subclass-destructor record's number (0 none); +136 subclass destroys so far */
+    long long subOldestFrame;      /* +144 the subclass ring's oldest whole slot's frame (-1 empty) */
+    P210SubData sub;               /* +152 that newest earlier subclass-destructor record */
+    LONG64 addNum, addCount;       /* +200 the newest delete-list add of obj (0 none); +208 how many adds of it the ring holds */
+    P210AddData add;               /* +216 that add */
+    unsigned long long magicEnd;   /* +272 "P210END." */
+};
+typedef char P210StackRecSizeCheck[sizeof(P210StackRec) == 280 ? 1 : -1];   /* the offsets above and in 04-probes.md */
+const unsigned long long kP210StackMagic = 0x47414C4630313250ULL;      /* the bytes "P210FLAG" */
+const unsigned long long kP210StackEndMagic = 0x2E444E4530313250ULL;   /* the bytes "P210END." */
+P210StackRec* volatile g_p210StackRec = 0;
+void P210FlagNote(LONG64 f, unsigned long long obj, int kind, P210StackRec* rec);   /* P210 block below: a flagged destroy's sub-destructor and hull-add records */
+void P210FlagLine(long long f, unsigned long long obj);
+void P210Drain();
+// PROBE-END: P210
 
 /* KnockDrain (main thread): a copy was just switched to ragdoll - its old click hull is on the physics destroy list */
 void P169NoteKnock(unsigned int uid)
@@ -12266,6 +13004,10 @@ void P169DtorDetour(void* obj)
     slot.d = me;
     ::InterlockedExchange64(&slot.num, num);
     P169FlagData flag = { 0 };
+// PROBE-START: P210
+    P210StackRec rec210;   /* filled for a flagged destroy; on this stack while the original runs */
+    rec210.magic = 0;
+// PROBE-END: P210
     if (kind != 0)
     {
         if (kind & 1) ::InterlockedIncrement64(&g_p169Twice);
@@ -12278,6 +13020,10 @@ void P169DtorDetour(void* obj)
         flag.kind = kind;
         g_p169StackFlag = &flag;
         const LONG64 f = ::InterlockedIncrement64(&g_p169FlagNext);
+// PROBE-START: P210
+        P210FlagNote(f, me.obj, kind, &rec210);   /* before the flag's number is published, so the drain finds the record written */
+        g_p210StackRec = &rec210;
+// PROBE-END: P210
         P169FlagSlot& fs = g_p169Flags[(size_t)((f - 1) & (kP169FlagN - 1))];
         ::InterlockedExchange64(&fs.num, 0);
         fs.d = flag;
@@ -12285,6 +13031,9 @@ void P169DtorDetour(void* obj)
     }
     g_p169OrigDtor(obj);
     if (kind != 0) g_p169StackFlag = 0;
+// PROBE-START: P210
+    if (rec210.magic != 0) g_p210StackRec = 0;   /* read after the call: the record stays on the stack until here */
+// PROBE-END: P210
 }
 
 std::string P169Where(unsigned long long a)
@@ -12338,7 +13087,13 @@ void P169Drain()
         line += P169Since("lastKnock", d.knockFrame, d.knockUid, d.frame);
         line += P169Since("lastCopyDestroy", d.copyFrame, d.copyUid, d.frame);
         DebugLog(line + " (PROBE P169)");
+// PROBE-START: P210
+        P210FlagLine(f, d.obj);
+// PROBE-END: P210
     }
+// PROBE-START: P210
+    P210Drain();
+// PROBE-END: P210
 }
 
 /* From InstallPhysicsGuard, at the preload like every other hook. */
@@ -12375,6 +13130,567 @@ void P169Report()
 }
 // PROBE-END: P169
 #endif   /* SW_DEV_BUILD - PROBE P169 */
+
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+/* PROBE P210 (T-1046, LOG ONLY): looks for the FIRST destroy of an object the physics thread destroys again (T1746: the
+   object reached the base destructor already carrying the bare base vtable, and P169's ring held no earlier destroy of
+   it). Changes nothing in the game.
+   (a) The two subclass destructors that carry an inlined copy of the base destructor, so P169 never sees them -
+   SimplePhysXEntity (1.0.65 0x7DC240) and _ScytheRootObjectInterfaceT (0x7DC3A0), both void(this) - are hooked and noted
+   in their own 256-slot ring under P169's rules: on the destroying thread no heap, no strings, no log, no lock; the slot's
+   number is written last and a reader keeps a slot only when its number reads the same before and after. An entry whose
+   pointer is already in P169's ring or this one within kP169TwiceFrames frames, or that arrives with the bare base vtable,
+   also goes into a 16-slot flag ring, written from the safe point (40 lines).
+   (b) Every adder to the main thread's physics delete list is hooked: CharMovementJunkHull (0x65F3B0) and the hull
+   rebuild CharMovementRebuildHull (0x660FE0, its own inlined copy of the add), both for the click hull at CharMovement
+   +0x3B0 (GameWorld::destroy calls the first for every character it removes); PhysObjectJunk340 (0x561F10, +0x340) and
+   PhysObjectJunk1C0 (0x75D0B0, +0x1C0), noted only when the add cleared the field; DeleteListAdd (0xF15E0), noted only
+   for the main list. updateUT hands that list to the physics thread each frame with no duplicate check. Each add goes
+   into one 256-slot ring with its adder ('via'), caller, frame and the list's length before the add; a hull already in
+   the ring within kP169TwiceFrames frames is counted as queued twice.
+   (c) When P169 flags a destroy, or a subclass destructor is flagged, the destroying thread copies the newest (a) and
+   (b) records for that pointer into a side table under the flag's number (P169Drain prints them as one FLAGMATCH line
+   under its [P169] line) and into a P210StackRec on its own stack, marked "P210FLAG", kept there while the original
+   destructor runs: the second free crashes inside the original, before any line is written.
+   (d) Every copy the mod destroys (RemoveLocalCopy, both purge roads) gets one COPYDESTROY line, read just before the
+   destroy: ms since the copy was made (CreateAt's registration or the twin adoption), whether P091's createBody note saw
+   its body since then, CharacterBuilt, and its click hull and that hull's vtable. 400 lines; REPORT counts by age. */
+const int kP210RingN = 256;   /* a power of two */
+const int kP210SubFlagN = 16;   /* a power of two */
+const int kP210MadeN = 512;
+const long long kP210SubLineCap = 40;
+const long long kP210CopyLineCap = 400;
+const size_t kP210CharMovementOff = 0x640;   /* Character -> CharMovement* (appearance.cpp kCharMovementOff) */
+const size_t kP210HullOff = 0x3B0;           /* CharMovement -> the click hull CharMovementJunkHull queues (decomp_65f3b0) */
+unsigned long long kP210SubDtorARva = 0; static coop::AddrReg kP210SubDtorARva_reg("SimplePhysXEntityDtor", &kP210SubDtorARva);   /* P8h: the address table fills this. Steam_1.0.65 0x7DC240 */   /* SimplePhysXEntity destructor void(this) - hooked (PROBE P210) */
+unsigned long long kP210SubDtorBRva = 0; static coop::AddrReg kP210SubDtorBRva_reg("ScytheRootObjectDtor", &kP210SubDtorBRva);   /* P8h: the address table fills this. Steam_1.0.65 0x7DC3A0 */   /* _ScytheRootObjectInterfaceT destructor void(this) - hooked (PROBE P210) */
+unsigned long long kP210HullJunkRva = 0; static coop::AddrReg kP210HullJunkRva_reg("CharMovementJunkHull", &kP210HullJunkRva);   /* P8h: the address table fills this. Steam_1.0.65 0x65F3B0 */   /* CharMovement: queue the click hull for the physics delete void(CharMovement*) - hooked (PROBE P210) */
+unsigned long long kP210HullRebuildRva = 0; static coop::AddrReg kP210HullRebuildRva_reg("CharMovementRebuildHull", &kP210HullRebuildRva);   /* P8h: the address table fills this. Steam_1.0.65 0x660FE0 */   /* CharMovement: queue the old click hull, build a new one void(CharMovement*) - hooked (PROBE P210) */
+unsigned long long kP210Junk340Rva = 0; static coop::AddrReg kP210Junk340Rva_reg("PhysObjectJunk340", &kP210Junk340Rva);   /* P8h: the address table fills this. Steam_1.0.65 0x561F10 */   /* an object's physics teardown, queues its +0x340 unless deferred void(this) - hooked (PROBE P210) */
+unsigned long long kP210Junk1C0Rva = 0; static coop::AddrReg kP210Junk1C0Rva_reg("PhysObjectJunk1C0", &kP210Junk1C0Rva);   /* P8h: the address table fills this. Steam_1.0.65 0x75D0B0 */   /* an object's physics teardown, queues its +0x1C0 when +0x1C8 is set void(this) - hooked (PROBE P210) */
+unsigned long long kP210ListAddRva = 0; static coop::AddrReg kP210ListAddRva_reg("DeleteListAdd", &kP210ListAddRva);   /* P8h: the address table fills this. Steam_1.0.65 0xF15E0 */   /* append one object to a holder's physics delete list void(holder, obj) - hooked (PROBE P210) */
+const size_t kP210Junk340Off = 0x340;   /* decomp_561f10: the object PhysObjectJunk340 queues and then clears */
+const size_t kP210Junk1C0Off = 0x1C0;   /* decomp_75d0b0: the object PhysObjectJunk1C0 queues and then clears */
+struct P210SubSlot { volatile LONG64 num; P210SubData d; };   /* num 0 = being written */
+struct P210SubFlagSlot { volatile LONG64 num; P210SubData d; P210Prev prev; };
+struct P210AddSlot { volatile LONG64 num; P210AddData d; };
+struct P210FlagX { volatile LONG64 num; LONG64 subNum, addNum, addCount, subTotal; long long subOldestFrame; P210SubData sub; P210AddData add; };
+struct P210Made { volatile LONG uid; volatile LONG madeAt; volatile LONG bodyAt; volatile LONG kind; };   /* kind 1 spawn, 2 twin */
+struct P210Pre { unsigned int uid; int valid, charBuilt; unsigned long long hull, hullVt; };
+P210SubSlot g_p210Sub[kP210RingN];
+P210SubFlagSlot g_p210SubFlags[kP210SubFlagN];
+P210AddSlot g_p210Add[kP210RingN];
+P210FlagX g_p210FlagX[kP169FlagN];
+P210Made g_p210Made[kP210MadeN];
+volatile LONG64 g_p210SubNext = 0, g_p210SubA = 0, g_p210SubB = 0, g_p210SubTwice = 0, g_p210SubBare = 0, g_p210SubFlagNext = 0;
+volatile LONG64 g_p210Adds = 0, g_p210AddTwice = 0;
+volatile LONG64 g_p210AddVia[6] = { 0 };   /* adds by adder, indexed by via (1..5) */
+long long g_p210SubFlagRead = 0, g_p210SubLines = 0, g_p210SubCapped = 0, g_p210FlagMatches = 0;   /* main thread only */
+long long g_p210Copies = 0, g_p210CopyU100 = 0, g_p210CopyU1000 = 0, g_p210CopyOlder = 0, g_p210CopyNoMake = 0;   /* main thread only */
+long long g_p210CopyNotBuilt = 0, g_p210CopyNoBody = 0, g_p210CopyLines = 0, g_p210CopyCapped = 0;
+long long g_p210CopyRefused = 0, g_p210Purges = 0, g_p210PurgeRefused = 0;   /* main thread only: kept out of the age buckets */
+LONG g_p210MadeNext = 0;   /* main thread only */
+P210Pre g_p210Pre = { 0 };   /* main thread only: the read taken just before a copy destroy */
+unsigned long long g_p210ListVar = 0;   /* the global holding the main delete list, read from CharMovementJunkHull's own mov; 0 = unknown */
+typedef void (*P210DtorFn)(void* obj);
+typedef void (*P210HullJunkFn)(void* movement);
+typedef void (*P210ListAddFn)(void* holder, void* obj);
+P210DtorFn g_p210OrigSubA = 0, g_p210OrigSubB = 0, g_p210OrigJunk340 = 0, g_p210OrigJunk1C0 = 0;
+P210HullJunkFn g_p210OrigHullJunk = 0, g_p210OrigHullRebuild = 0;
+P210ListAddFn g_p210OrigListAdd = 0;
+
+/* The newest whole slot of ring for obj numbered below `below`: 1 found, 0 none. */
+int P210FindSub(const P210SubSlot* ring, int n, unsigned long long obj, LONG64 below, LONG64* numOut, P210SubData* out)
+{
+    LONG64 best = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const P210SubSlot& s = ring[i];
+        const LONG64 n1 = s.num;
+        if (n1 <= best || n1 >= below) continue;
+        const P210SubData c = s.d;
+        _ReadWriteBarrier();
+        if (s.num != n1 || c.obj != obj) continue;
+        best = n1;
+        *out = c;
+    }
+    *numOut = best;
+    return best != 0 ? 1 : 0;
+}
+
+/* The same for the delete-list add ring; *countOut = how many whole slots name this object. */
+int P210FindAdd(unsigned long long hull, LONG64 below, LONG64* numOut, P210AddData* out, LONG64* countOut)
+{
+    LONG64 best = 0, count = 0;
+    for (int i = 0; i < kP210RingN; ++i)
+    {
+        const P210AddSlot& s = g_p210Add[i];
+        const LONG64 n1 = s.num;
+        if (n1 == 0 || n1 >= below) continue;
+        const P210AddData c = s.d;
+        _ReadWriteBarrier();
+        if (s.num != n1 || c.hull != hull) continue;
+        ++count;
+        if (n1 > best) { best = n1; *out = c; }
+    }
+    *numOut = best;
+    *countOut = count;
+    return best != 0 ? 1 : 0;
+}
+
+/* The frame of the subclass ring's oldest whole slot, -1 if it is empty: how far back a 'none' looked. */
+long long P210SubOldestFrame()
+{
+    LONG64 low = 0;
+    long long frame = -1;
+    for (int i = 0; i < kP210RingN; ++i)
+    {
+        const P210SubSlot& s = g_p210Sub[i];
+        const LONG64 n1 = s.num;
+        if (n1 == 0 || (low != 0 && n1 >= low)) continue;
+        const long long fr = s.d.frame;
+        _ReadWriteBarrier();
+        if (s.num != n1) continue;
+        low = n1;
+        frame = fr;
+    }
+    return frame;
+}
+
+/* ANY THREAD (mostly the physics thread), from the two subclass destructor detours. No heap, no log, no lock.
+   A flagged destroy also fills *rec (the detour's own stack record); rec->magic stays 0 otherwise. */
+void P210SubEnter(void* obj, unsigned long long from, int which, P210StackRec* rec)
+{
+    const LONG64 num = ::InterlockedIncrement64(&g_p210SubNext);
+    ::InterlockedIncrement64(which == 1 ? &g_p210SubA : &g_p210SubB);
+    P210SubData me = { 0 };
+    me.obj = (unsigned long long)(uintptr_t)obj;
+    P169ReadVt(obj, &me.vt);
+    me.from = from;
+    me.frame = MainLoopFrames();
+    me.tid = ::GetCurrentThreadId();
+    me.which = which;
+    P210Prev pv = { 0 };
+    LONG64 pn = 0;
+    P169EntryData pb = { 0 };
+    if (P169FindPrev(me.obj, g_p169Deletes + 1, &pn, &pb) != 0 && me.frame - pb.frame <= kP169TwiceFrames)
+    {
+        me.kind |= 1;
+        pv.num = pn; pv.vt = pb.vt; pv.from = pb.from; pv.frame = pb.frame; pv.tid = pb.tid; pv.ring = 1;
+    }
+    LONG64 sn = 0;
+    P210SubData ps = { 0 };
+    if (P210FindSub(g_p210Sub, kP210RingN, me.obj, num, &sn, &ps) != 0 && me.frame - ps.frame <= kP169TwiceFrames)
+    {
+        me.kind |= 1;
+        if (pv.ring == 0 || ps.frame >= pv.frame)   /* the newer of the two matches */
+        {
+            pv.num = sn; pv.vt = ps.vt; pv.from = ps.from; pv.frame = ps.frame; pv.tid = ps.tid; pv.ring = 2; pv.which = ps.which;
+        }
+    }
+    if (g_p169BaseVt != 0 && me.vt == g_p169BaseVt) me.kind |= 2;
+    P210SubSlot& slot = g_p210Sub[(size_t)((num - 1) & (kP210RingN - 1))];
+    ::InterlockedExchange64(&slot.num, 0);
+    slot.d = me;
+    ::InterlockedExchange64(&slot.num, num);
+    if (me.kind == 0) return;
+    if (me.kind & 1) ::InterlockedIncrement64(&g_p210SubTwice);
+    if (me.kind & 2) ::InterlockedIncrement64(&g_p210SubBare);
+    const LONG64 f = ::InterlockedIncrement64(&g_p210SubFlagNext);
+    LONG64 an = 0, ac = 0;
+    P210AddData pa = { 0 };
+    P210FindAdd(me.obj, g_p210Adds + 1, &an, &pa, &ac);
+    rec->obj = me.obj;
+    rec->flagNum = f;
+    rec->where = which + 1;
+    rec->kind = me.kind;
+    rec->cur = me;
+    rec->prev = pv;
+    rec->subNum = sn;
+    rec->subTotal = num;
+    rec->subOldestFrame = P210SubOldestFrame();
+    rec->sub = ps;
+    rec->addNum = an;
+    rec->addCount = ac;
+    rec->add = pa;
+    rec->magicEnd = kP210StackEndMagic;
+    rec->magic = kP210StackMagic;
+    P210SubFlagSlot& fs = g_p210SubFlags[(size_t)((f - 1) & (kP210SubFlagN - 1))];
+    ::InterlockedExchange64(&fs.num, 0);
+    fs.d = me;
+    fs.prev = pv;
+    ::InterlockedExchange64(&fs.num, f);
+}
+
+/* The stack record stays live across the original (its address is published and it is read after the call). */
+void P210SubDtorDetourA(void* obj)
+{
+    P210StackRec rec;
+    rec.magic = 0;
+    P210SubEnter(obj, (unsigned long long)(uintptr_t)_ReturnAddress(), 1, &rec);
+    if (rec.magic != 0) g_p210StackRec = &rec;
+    g_p210OrigSubA(obj);
+    if (rec.magic != 0) g_p210StackRec = 0;
+}
+void P210SubDtorDetourB(void* obj)
+{
+    P210StackRec rec;
+    rec.magic = 0;
+    P210SubEnter(obj, (unsigned long long)(uintptr_t)_ReturnAddress(), 2, &rec);
+    if (rec.magic != 0) g_p210StackRec = &rec;
+    g_p210OrigSubB(obj);
+    if (rec.magic != 0) g_p210StackRec = 0;
+}
+
+/* The main delete list's length now, -1 unread. Guarded reads only; no C++ object with a destructor here (C2712). */
+long long P210ListLen()
+{
+    if (g_p210ListVar == 0) return -1;
+    __try
+    {
+        const char* list = *(const char* const*)(uintptr_t)g_p210ListVar;
+        return list != 0 ? (long long)*(const unsigned int*)(list + 0x200) : -1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+const char* P210ViaName(int via)
+{
+    switch (via)
+    {
+    case 1: return "junkHull";
+    case 2: return "hullRebuild";
+    case 3: return "junk340";
+    case 4: return "junk1C0";
+    case 5: return "listAdd";
+    default: return "?";
+    }
+}
+
+/* ANY THREAD: one add to the main delete list - the object queued, the object it came from, the caller, the list's
+   length before the add and the adder (via). Written lock-free; no heap, no log. */
+void P210NoteAdd(unsigned long long hull, unsigned long long owner, unsigned long long from, long long listLen, int via)
+{
+    const LONG64 num = ::InterlockedIncrement64(&g_p210Adds);
+    if (via >= 1 && via <= 5) ::InterlockedIncrement64(&g_p210AddVia[via]);
+    P210AddData me = { 0 };
+    me.hull = hull;
+    me.mov = owner;
+    me.from = from;
+    me.frame = MainLoopFrames();
+    me.listLen = listLen;
+    me.tid = ::GetCurrentThreadId();
+    me.via = via;
+    LONG64 pn = 0, cnt = 0;
+    P210AddData prev = { 0 };
+    if (P210FindAdd(hull, num, &pn, &prev, &cnt) != 0 && me.frame - prev.frame <= kP169TwiceFrames)
+    {
+        me.twice = 1;
+        ::InterlockedIncrement64(&g_p210AddTwice);
+    }
+    P210AddSlot& slot = g_p210Add[(size_t)((num - 1) & (kP210RingN - 1))];
+    ::InterlockedExchange64(&slot.num, 0);
+    slot.d = me;
+    ::InterlockedExchange64(&slot.num, num);
+}
+
+/* MAIN THREAD in every caller read (GameWorld::destroy, setProneState): the click hull at +0x3B0, read before the add. */
+void P210HullJunkDetour(void* movement)
+{
+    unsigned long long hull = 0;
+    if (movement != 0) P169ReadVt((const char*)movement + kP210HullOff, &hull);   /* a guarded 8-byte read */
+    if (hull != 0)
+        P210NoteAdd(hull, (unsigned long long)(uintptr_t)movement, (unsigned long long)(uintptr_t)_ReturnAddress(), P210ListLen(), 1);
+    g_p210OrigHullJunk(movement);
+}
+
+/* The hull rebuild (decomp_660fe0): its first step queues the hull at +0x3B0 when there is one, then it builds a new one there. */
+void P210HullRebuildDetour(void* movement)
+{
+    unsigned long long hull = 0;
+    if (movement != 0) P169ReadVt((const char*)movement + kP210HullOff, &hull);
+    if (hull != 0)
+        P210NoteAdd(hull, (unsigned long long)(uintptr_t)movement, (unsigned long long)(uintptr_t)_ReturnAddress(), P210ListLen(), 2);
+    g_p210OrigHullRebuild(movement);
+}
+
+/* decomp_561f10: queues +0x340 and clears it, unless the call is deferred (it then posts a message and returns with
+   +0x340 untouched), so a value there before and 0 after is an add. Noted after the original returns. */
+void P210Junk340Detour(void* obj)
+{
+    const unsigned long long from = (unsigned long long)(uintptr_t)_ReturnAddress();
+    unsigned long long before = 0, after = 1;
+    if (obj != 0) P169ReadVt((const char*)obj + kP210Junk340Off, &before);
+    const long long len = before != 0 ? P210ListLen() : -1;
+    g_p210OrigJunk340(obj);
+    if (before != 0 && P169ReadVt((const char*)obj + kP210Junk340Off, &after) != 0 && after == 0)
+        P210NoteAdd(before, (unsigned long long)(uintptr_t)obj, from, len, 3);
+}
+
+/* decomp_75d0b0: queues +0x1C0 and clears it when the flag byte at +0x1C8 is set; read the same way as P210Junk340Detour. */
+void P210Junk1C0Detour(void* obj)
+{
+    const unsigned long long from = (unsigned long long)(uintptr_t)_ReturnAddress();
+    unsigned long long before = 0, after = 1;
+    if (obj != 0) P169ReadVt((const char*)obj + kP210Junk1C0Off, &before);
+    const long long len = before != 0 ? P210ListLen() : -1;
+    g_p210OrigJunk1C0(obj);
+    if (before != 0 && P169ReadVt((const char*)obj + kP210Junk1C0Off, &after) != 0 && after == 0)
+        P210NoteAdd(before, (unsigned long long)(uintptr_t)obj, from, len, 4);
+}
+
+/* decomp_f15e0: the plain add to a holder's delete list (holder +0x1F8). Only adds to the main list - the holder the
+   list global points at - are noted. */
+void P210ListAddDetour(void* holder, void* obj)
+{
+    unsigned long long mainHolder = 0;
+    if (g_p210ListVar != 0 && holder != 0 && obj != 0
+        && P169ReadVt((const void*)(uintptr_t)g_p210ListVar, &mainHolder) != 0
+        && mainHolder == (unsigned long long)(uintptr_t)holder)
+        P210NoteAdd((unsigned long long)(uintptr_t)obj, 0, (unsigned long long)(uintptr_t)_ReturnAddress(), P210ListLen(), 5);
+    g_p210OrigListAdd(holder, obj);
+}
+
+/* ANY THREAD, from P169DtorDetour for a flagged destroy, before the flag's number is published. No heap, no log, no lock.
+   Also fills *rec, the record P169DtorDetour keeps on its stack while the original runs. */
+void P210FlagNote(LONG64 f, unsigned long long obj, int kind, P210StackRec* rec)
+{
+    P210FlagX& x = g_p210FlagX[(size_t)((f - 1) & (kP169FlagN - 1))];
+    ::InterlockedExchange64(&x.num, 0);
+    LONG64 n = 0, an = 0, c = 0;
+    P210SubData s = { 0 };
+    P210AddData a = { 0 };
+    const LONG64 subTotal = g_p210SubNext;
+    P210FindSub(g_p210Sub, kP210RingN, obj, subTotal + 1, &n, &s);
+    P210FindAdd(obj, g_p210Adds + 1, &an, &a, &c);
+    const long long oldest = P210SubOldestFrame();
+    x.subNum = n;
+    x.sub = s;
+    x.addNum = an;
+    x.add = a;
+    x.addCount = c;
+    x.subTotal = subTotal;
+    x.subOldestFrame = oldest;
+    const P210SubData z = { 0 };
+    const P210Prev zp = { 0 };
+    rec->obj = obj;
+    rec->flagNum = f;
+    rec->where = 1;
+    rec->kind = kind;
+    rec->cur = z;
+    rec->prev = zp;
+    rec->subNum = n;
+    rec->subTotal = subTotal;
+    rec->subOldestFrame = oldest;
+    rec->sub = s;
+    rec->addNum = an;
+    rec->addCount = c;
+    rec->add = a;
+    rec->magicEnd = kP210StackEndMagic;
+    rec->magic = kP210StackMagic;
+    ::InterlockedExchange64(&x.num, f);
+}
+
+const char* P210DtorName(int which) { return which == 1 ? "SimplePhysXEntity" : "ScytheRootObject"; }
+
+/* MAIN THREAD, from P169Drain under its own line cap: what P210 holds for flag f's pointer. */
+void P210FlagLine(long long f, unsigned long long obj)
+{
+    const P210FlagX& x = g_p210FlagX[(size_t)((f - 1) & (kP169FlagN - 1))];
+    const LONG64 n1 = x.num;
+    const LONG64 subNum = x.subNum, addNum = x.addNum, addCount = x.addCount, subTotal = x.subTotal;
+    const long long oldest = x.subOldestFrame;
+    const P210SubData s = x.sub;
+    const P210AddData a = x.add;
+    _ReadWriteBarrier();
+    std::string line = "[PROBE] P210 FLAGMATCH #" + N3(f) + " obj=" + P169Hex(obj);
+    if (n1 != f || x.num != n1)
+    {
+        DebugLog(line + " record=overwritten (PROBE P210)");
+        return;
+    }
+    ++g_p210FlagMatches;
+    if (subNum != 0)
+        line += std::string(" subDtor[") + P210DtorName(s.which) + " #" + N3(subNum) + " vt=" + P169Where(s.vt)
+                + " from=" + P169Where(s.from) + " thread=" + N3((long long)s.tid) + " frame=" + N3(s.frame) + "]";
+    else
+        line += " subDtor[none ringDestroys=" + N3(subTotal) + " wrapped=" + (subTotal > kP210RingN ? "1" : "0")
+                + " oldestFrame=" + N3(oldest) + "]";
+    if (addNum != 0)
+        line += " queued[times=" + N3(addCount) + " last#" + N3(addNum) + " via=" + P210ViaName(a.via) + " from=" + P169Where(a.from)
+                + " owner=" + P169Hex(a.mov) + " thread=" + N3((long long)a.tid) + " frame=" + N3(a.frame) + " listLen=" + N3(a.listLen)
+                + " twice=" + N3((long long)a.twice) + "]";
+    else
+        line += " queued[none]";
+    DebugLog(line + " (PROBE P210)");
+}
+
+/* MAIN THREAD, the end of P169Drain (the ragdoll safe point, once a frame): one line per flagged subclass destroy. */
+void P210Drain()
+{
+    const LONG64 next = g_p210SubFlagNext;
+    while (g_p210SubFlagRead < next)
+    {
+        const long long f = g_p210SubFlagRead + 1;
+        if (next - f >= kP210SubFlagN) { g_p210SubFlagRead = f; ++g_p210SubCapped; continue; }   /* overwritten before it was read */
+        P210SubFlagSlot& s = g_p210SubFlags[(size_t)((f - 1) & (kP210SubFlagN - 1))];
+        const LONG64 n1 = s.num;
+        if (n1 == 0 || n1 < f) break;   /* still being written: read it next frame */
+        const P210SubData d = s.d;
+        const P210Prev p = s.prev;
+        _ReadWriteBarrier();
+        g_p210SubFlagRead = f;
+        if (n1 != f || s.num != n1) { ++g_p210SubCapped; continue; }
+        if (g_p210SubLines >= kP210SubLineCap) { ++g_p210SubCapped; continue; }
+        ++g_p210SubLines;
+        std::string line = std::string("[PROBE] P210 SUBDTOR flagged=") + ((d.kind & 3) == 3 ? "twice+bare" : ((d.kind & 1) ? "twice" : "bare"))
+                           + " dtor=" + P210DtorName(d.which) + " obj=" + P169Hex(d.obj) + " vt=" + P169Where(d.vt) + " from=" + P169Where(d.from)
+                           + " thread=" + N3((long long)d.tid) + " frame=" + N3(d.frame) + " #" + N3(f);
+        if (p.ring != 0)
+            line += std::string(" prev[") + (p.ring == 1 ? "base" : P210DtorName(p.which)) + " #" + N3(p.num) + " vt=" + P169Where(p.vt)
+                    + " from=" + P169Where(p.from) + " thread=" + N3((long long)p.tid) + " frame=" + N3(p.frame)
+                    + " framesSince=" + N3(d.frame - p.frame) + "]";
+        else
+            line += " prev[none]";
+        DebugLog(line + " (PROBE P210)");
+    }
+}
+
+LONG P210Now() { const DWORD t = ::GetTickCount(); return (LONG)(t != 0 ? t : 1); }
+
+/* ANY THREAD, read only. */
+P210Made* P210FindMade(unsigned int uid)
+{
+    if (uid == 0) return 0;
+    for (int i = 0; i < kP210MadeN; ++i)
+        if ((unsigned int)g_p210Made[i].uid == uid) return &g_p210Made[i];
+    return 0;
+}
+
+/* MAIN THREAD (CreateAt's registration, the twin adoption): this uid's copy was made now. */
+void P210NoteMade(unsigned int uid, int kind)
+{
+    if (uid == 0) return;
+    P210Made* r = P210FindMade(uid);
+    if (r == 0) { r = &g_p210Made[g_p210MadeNext % kP210MadeN]; ++g_p210MadeNext; }
+    r->uid = 0;
+    r->bodyAt = 0;
+    r->madeAt = P210Now();
+    r->kind = kind;
+    r->uid = (LONG)uid;
+}
+
+/* ANY THREAD (P091's createBody note, appearance.cpp): the engine is building this copy's body. */
+void P210NoteBodyBuild(unsigned int uid)
+{
+    P210Made* r = P210FindMade(uid);
+    if (r != 0 && r->bodyAt == 0) ::InterlockedExchange(&r->bodyAt, P210Now());
+}
+
+/* MAIN THREAD, just before the mod destroys character c (uid 0: a purge, no uid). Reads only. */
+void P210CopyDestroyBegin(unsigned int uid, void* c)
+{
+    g_p210Pre.uid = uid;
+    g_p210Pre.valid = 1;
+    g_p210Pre.hull = 0;
+    g_p210Pre.hullVt = 0;
+    unsigned long long mov = 0;
+    if (c != 0 && P169ReadVt((const char*)c + kP210CharMovementOff, &mov) != 0 && mov != 0
+        && P169ReadVt((const char*)(uintptr_t)mov + kP210HullOff, &g_p210Pre.hull) != 0 && g_p210Pre.hull != 0)
+        P169ReadVt((const void*)(uintptr_t)g_p210Pre.hull, &g_p210Pre.hullVt);
+    g_p210Pre.charBuilt = (c != 0 && CharacterBuilt((::Character*)c, 0) != 0) ? 1 : 0;
+}
+
+/* MAIN THREAD, just after that destroy: one COPYDESTROY line (400 in all) and the REPORT buckets. */
+void P210CopyDestroyEnd(unsigned int uid, const char* what, int destroyed)
+{
+    P210Pre pre = g_p210Pre;
+    g_p210Pre.valid = 0;
+    if (pre.valid == 0 || pre.uid != uid) { pre.charBuilt = 0; pre.hull = 0; pre.hullVt = 0; }
+    const P210Made* r = P210FindMade(uid);
+    const long long ms = (r != 0 && r->madeAt != 0) ? (long long)(DWORD)(::GetTickCount() - (DWORD)r->madeAt) : -1;
+    const int body = (r != 0 && r->bodyAt != 0) ? 1 : 0;
+    const int kind = (r != 0) ? (int)r->kind : 0;
+    if (uid == 0)   /* the purge roads have no uid: counted apart from the copy buckets */
+    {
+        ++g_p210Purges;
+        if (destroyed == 0) ++g_p210PurgeRefused;
+    }
+    else if (destroyed == 0)
+        ++g_p210CopyRefused;
+    else
+    {
+        ++g_p210Copies;
+        if (ms < 0) ++g_p210CopyNoMake;
+        else if (ms < 100) ++g_p210CopyU100;
+        else if (ms < 1000) ++g_p210CopyU1000;
+        else ++g_p210CopyOlder;
+        if (pre.charBuilt == 0) ++g_p210CopyNotBuilt;
+        if (body == 0) ++g_p210CopyNoBody;
+    }
+    if (g_p210CopyLines >= kP210CopyLineCap) { ++g_p210CopyCapped; return; }
+    ++g_p210CopyLines;
+    DebugLog("[PROBE] P210 COPYDESTROY uid=" + N3((long long)uid) + " msSinceMade=" + N3(ms) + " bodyBuilt=" + N3((long long)body)
+             + " charBuilt=" + N3((long long)pre.charBuilt) + " hull=" + P169Hex(pre.hull) + " hullVt=" + P169Where(pre.hullVt)
+             + " made=" + (kind == 1 ? "spawn" : (kind == 2 ? "twin" : "none")) + " destroyed=" + N3((long long)destroyed)
+             + " what='" + (what != 0 ? what : "?") + "' frame=" + N3(MainLoopFrames()) + " (PROBE P210)");
+}
+
+void P210HookOne(const char* what, unsigned long long rva, void* detour, void** orig)
+{
+    if (rva == 0)
+    {
+        ErrorLog(std::string("[PROBE] P210 ") + what + " not in the address table - not hooked (PROBE P210)");
+        return;
+    }
+    void* fn = (void*)(uintptr_t)coop::AddrAbs(rva);
+    const coop::HookStatus st = coop::AddHook(fn, detour, orig);
+    DebugLog(std::string("[PROBE] P210 ") + what + " hook " + (st == coop::SUCCESS ? "SUCCESS" : "FAILED")
+             + " at " + P169Where((unsigned long long)(uintptr_t)fn) + " (PROBE P210)");
+}
+
+/* From InstallPhysicsGuard, right after P169Install. */
+void P210Install()
+{
+    if (kP210HullJunkRva != 0)
+    {
+        const unsigned char* fn = (const unsigned char*)(uintptr_t)coop::AddrAbs(kP210HullJunkRva);
+        /* +0x22: mov rdi,[rip+disp32] - the global holding the main delete list (both builds) */
+        if (fn != 0 && fn[0x22] == 0x48 && fn[0x23] == 0x8B && fn[0x24] == 0x3D)
+        {
+            int disp = 0;
+            std::memcpy(&disp, fn + 0x25, sizeof disp);
+            g_p210ListVar = (unsigned long long)(uintptr_t)(fn + 0x29 + disp);
+        }
+        else
+            ErrorLog("[PROBE] P210 CharMovementJunkHull bytes are not the expected mov at +0x22 - listLen reads -1 (PROBE P210)");
+    }
+    P210HookOne("SimplePhysXEntity destructor", kP210SubDtorARva, (void*)&P210SubDtorDetourA, (void**)&g_p210OrigSubA);
+    P210HookOne("ScytheRootObject destructor", kP210SubDtorBRva, (void*)&P210SubDtorDetourB, (void**)&g_p210OrigSubB);
+    P210HookOne("CharMovementJunkHull", kP210HullJunkRva, (void*)&P210HullJunkDetour, (void**)&g_p210OrigHullJunk);
+    P210HookOne("CharMovementRebuildHull", kP210HullRebuildRva, (void*)&P210HullRebuildDetour, (void**)&g_p210OrigHullRebuild);
+    P210HookOne("PhysObjectJunk340", kP210Junk340Rva, (void*)&P210Junk340Detour, (void**)&g_p210OrigJunk340);
+    P210HookOne("PhysObjectJunk1C0", kP210Junk1C0Rva, (void*)&P210Junk1C0Detour, (void**)&g_p210OrigJunk1C0);
+    P210HookOne("DeleteListAdd", kP210ListAddRva, (void*)&P210ListAddDetour, (void**)&g_p210OrigListAdd);
+}
+
+void P210Report()
+{
+    DebugLog("[H054] REPORT probeP210[subA,subB,subTwice,subBare,hullAdds,hullAddTwice,flagMatches,subLines,subCapped]="
+             + N3((long long)g_p210SubA) + "," + N3((long long)g_p210SubB) + "," + N3((long long)g_p210SubTwice) + ","
+             + N3((long long)g_p210SubBare) + "," + N3((long long)g_p210Adds) + "," + N3((long long)g_p210AddTwice) + ","
+             + N3(g_p210FlagMatches) + "," + N3(g_p210SubLines) + "," + N3(g_p210SubCapped));
+    DebugLog("[H054] REPORT probeP210copy[destroys,under100ms,100to1000ms,older,noMakeTime,charNotBuilt,bodyNotSeen,lines,capped,refused,purges,purgesRefused]="
+             + N3(g_p210Copies) + "," + N3(g_p210CopyU100) + "," + N3(g_p210CopyU1000) + "," + N3(g_p210CopyOlder) + ","
+             + N3(g_p210CopyNoMake) + "," + N3(g_p210CopyNotBuilt) + "," + N3(g_p210CopyNoBody) + "," + N3(g_p210CopyLines) + ","
+             + N3(g_p210CopyCapped) + "," + N3(g_p210CopyRefused) + "," + N3(g_p210Purges) + "," + N3(g_p210PurgeRefused));
+    DebugLog("[H054] REPORT probeP210adds[junkHull,hullRebuild,junk340,junk1C0,listAdd]=" + N3((long long)g_p210AddVia[1]) + ","
+             + N3((long long)g_p210AddVia[2]) + "," + N3((long long)g_p210AddVia[3]) + "," + N3((long long)g_p210AddVia[4]) + ","
+             + N3((long long)g_p210AddVia[5]));
+}
+// PROBE-END: P210
+#endif   /* SW_DEV_BUILD - PROBE P210 */
 
 namespace {
 
@@ -12600,6 +13916,9 @@ void InstallPhysicsGuard()
 {
 #ifdef SW_DEV_BUILD
     P169Install();   /* PROBE P169 */
+// PROBE-START: P210
+    P210Install();   /* after P169Install: it uses P169's bare base vtable and image bounds */
+// PROBE-END: P210
 #endif
     const uintptr_t base = (uintptr_t)::GetModuleHandleA(0);
     bool boxOk = false;
@@ -12635,6 +13954,9 @@ void ReportPhysicsGuard()
              + N3(g_pgQueryWaited) + "," + N3(g_pgQueryWaitedQuery) + "," + N3(g_pgMaxWaitUs));
 #ifdef SW_DEV_BUILD
     P169Report();   /* PROBE P169 */
+// PROBE-START: P210
+    P210Report();
+// PROBE-END: P210
 #endif
 }
 

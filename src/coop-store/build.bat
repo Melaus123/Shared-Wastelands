@@ -3,6 +3,8 @@ rem Build SharedWastelandsServer.exe (the standalone sleeping-record store) with
 rem The file names below repeat src\common\names.h (a .bat cannot include it): change both together.
 rem Reuses the ENet objects the plugin's build.bat compiles into src\coop-plugin (run that first).
 rem Compiles the plugin's ..\coop-plugin\u8file.cpp in as well: the same UTF-8 file-call wrappers over the wide Windows calls.
+rem And the plugin's router code (..\coop-plugin\upnp.cpp, net\routerask.cpp, net\homeaddr.cpp): a world kept running asks the
+rem home router for its own port; its DebugLog / ErrorLog are defined in store_main.cpp (iphlpapi and winhttp come by #pragma).
 setlocal
 call "%~dp0..\..\tools\vc2010-env.bat" || exit /b 1
 
@@ -36,12 +38,14 @@ if not exist server_version.res (
     echo BUILD FAILED ^(world server: server_version.res missing - run python make_version.py^)
     exit /b 1
 )
-cl /nologo /O2 /EHsc /MD /D_CRT_SECURE_NO_WARNINGS /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
+rem /bigobj: store_main.cpp held more sections than the default object format allows (error C1128).
+cl /nologo /O2 /EHsc /MD /bigobj /D_CRT_SECURE_NO_WARNINGS /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 ^
    /I ..\coop-plugin\third_party\enet\include ^
-   store_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\cfgtext.cpp ..\coop-plugin\u8file.cpp server_version.res ^
+   store_main.cpp ..\common\clockmath.cpp ..\common\storemeta.cpp ..\common\cfgtext.cpp ..\coop-plugin\u8file.cpp ^
+   ..\coop-plugin\upnp.cpp ..\coop-plugin\net\routerask.cpp ..\coop-plugin\net\homeaddr.cpp server_version.res ^
    %OBJ%\callbacks.obj %OBJ%\compress.obj %OBJ%\host.obj %OBJ%\list.obj %OBJ%\packet.obj %OBJ%\peer.obj %OBJ%\protocol.obj %OBJ%\win32.obj ^
    /FeSharedWastelandsServer.exe ^
-   /link /MACHINE:X64 /SUBSYSTEM:CONSOLE ws2_32.lib winmm.lib
+   /link /MACHINE:X64 /SUBSYSTEM:CONSOLE ws2_32.lib winmm.lib ole32.lib oleaut32.lib
 if errorlevel 1 (
     echo BUILD FAILED ^(world server^)
     exit /b 1

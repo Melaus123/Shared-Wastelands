@@ -16,7 +16,10 @@ void HireNoteRecv(const coophire::HireMsg& m, unsigned int fromPeer);    // MAIN
 void HireNoteBad();                                                       // a MSG_HIRE that did not decode
 void HireSafePointDrain();                                                // MAIN THREAD, worker paused (combat.cpp K2)
 void HireForgetPeer(int slot);                                            // the player in `slot` left: my requests to it, my promises to it and its undrained messages dropped (-1: every row)
+std::string SquadTestArm(const std::string& arg);                         // `squadtest add <ownUid|first> <n> [templateSid]` (TEST-ONLY): armed for the K2 safe point
 std::string HireTestArm(const std::string& arg);                          // `hiretest [editor] near [price] | [editor] near same [<x> <z> [price]] | [editor] uid <n> [price]` (TEST-ONLY; editor = recruit with the character editor)
+
+std::string HireTestArm(const std::string& arg);                          // `hiretest [editor] near [price] | [editor] near same [<x> <z> [price]] | [editor] uid <n> [price] | [editor] nearestpeer [<radius>]` (TEST-ONLY; editor = recruit with the character editor; nearestpeer = the nearest character of another player, T-1022)
 void OwnSquadUids(std::vector<unsigned int>* out);                        // MAIN THREAD: every character this game drives in its player faction (the test levers' squad)
 void ReportHire();                                                        // one [HIRE] REPORT line
 int HireRecruitNoEdit(::Character* c);                                   // T-556: PlayerInterface::recruit(c, edit=false); 1 joined, 0 refused, <0 not called / fault

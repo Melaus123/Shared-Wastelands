@@ -9,7 +9,7 @@
      KEEP    - the players and the host's choices: world.txt, format.txt, slots.txt, profiles.txt, aliases.txt, owner.txt, options.txt,
                mods.txt, uid_seats.txt (each seat's highest uid: going back could hand a kept character's uid out again), fallen.txt,
                teams.txt, own_high.txt, world.gen (a number it has seen is never issued again), auth.txt (the world's password),
-               access.txt (who may enter), the world lock, the logs, server-refused.txt and a keep-buildings-<time>\ folder (the area
+               access.txt (who may enter), lookalike_list.txt (the world's look-alike copy ids: a kept profile's characters are built from them), the world lock, the logs, server-refused.txt and a keep-buildings-<time>\ folder (the area
                records an earlier build's reset kept). A ".1" backup or a ".tmp" leftover is what its file is. The old world keeps each; the
                reset world gets a copy of each but world.txt (written new) and the world lock (made by its first start).
      MOVE    - the world's state: every squad record (<id>.platoon and <id>.meta, with their .prev and .refused; the ground, box and
@@ -115,9 +115,9 @@ inline int ResetClassify(const std::string& name, int isDir)
     }
     const std::string b = ResetBaseName(name);
     if (worldkeep::EndsWith(l, ".log") || worldkeep::EndsWith(b, ".log")) return kResetKeep;
-    static const char* const keep[] = { "world.txt", "format.txt", "slots.txt", "profiles.txt", "aliases.txt", "owner.txt", "options.txt",
+    static const char* const keep[] = { "world.txt", "format.txt", "slots.txt", "profiles.txt", "aliases.txt", "owner.txt", "options.txt", "rules.txt",
                                         "mods.txt", "uid_seats.txt", "fallen.txt", "teams.txt", "own_high.txt", "world.gen", "server.lock",
-                                        "auth.txt", "access.txt", worldkeep::kRefusedFile };   /* authproof::kAuthFile, accessrule::kAccessFile */
+                                        "auth.txt", "access.txt", "lookalike_list.txt", worldkeep::kRefusedFile };   /* authproof::kAuthFile, accessrule::kAccessFile, lalist::kListFile */
     static const char* const move[] = { "uniques.txt", "world_relations.txt", "town_losses.txt", "town_bars.txt", "owed_people.txt",
                                         "owed_done.txt", "owed_meta.txt", "research_boxes.txt", "research_takes.txt", "clock.txt", "areas.txt", "pendingpos.txt", "repair.txt",
                                         "queue.txt", "kept-pieces.txt", "kept-state.txt", "player-towns.txt", "kept-towns.txt",

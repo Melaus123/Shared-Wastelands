@@ -12,7 +12,8 @@ namespace coopcfg {
 CfgFields::CfgFields()
     : role(kCfgSingle), hostPort(0), storePort(0), slot("s1"), modSalt(0), profileTest(0), ownSave(1), joinViaWorld(0), routerPort(1),
       relayTestMode(kRelayTestNone), relayTestPort(0), relayLagMs(0), relayLossPct(0), relayTestCap(0), relayTestDials(0),
-      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0), benchCapKbs(0), netRateLog(0)
+      relayBridgeMode(kRelayBridgeOn), relayBridgePort(0), relayViaPort(0), relayCap(0), parityHoldSec(0), benchCapKbs(0), netRateLog(0),
+      steamFakeLagMs(0), steamFakeLossPct(0)
 {
     /* B13: playerId is deliberately EMPTY by default and never invented here. This is a text layer; the
        thing that generates an id is config.cpp, once, and it writes the file back when it does. */
@@ -358,6 +359,20 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = key + "='" + val + "' is not a number 0-" + (lag ? "1000" : "50") + " - ignored"; notes->push_back(nt); }
             }
         }
+        else if (key == "steamfakelag" || key == "steamfakeloss")   /* TEST ONLY - see CfgFields::steamFakeLagMs; ms 0-1000 / percent 0-50 */
+        {
+            const bool lag = (key == "steamfakelag");
+            const std::string v = CfgTrim(val);
+            int n = 0; bool ok = !v.empty() && v.size() <= 4;
+            for (size_t i = 0; ok && i < v.size(); ++i) { if (v[i] < '0' || v[i] > '9') ok = false; else n = n * 10 + (v[i] - '0'); }
+            if (ok && n > (lag ? 1000 : 50)) ok = false;
+            if (ok) { if (lag) f.steamFakeLagMs = n; else f.steamFakeLossPct = n; }
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = key + "='" + val + "' is not a number 0-" + (lag ? "1000" : "50") + " - ignored"; notes->push_back(nt); }
+            }
+        }
         else if (key == "relaybridge")   /* TEST ONLY - see CfgFields::relayBridgeMode */
         {
             int m = kRelayBridgeOn; unsigned short p = 0;
@@ -425,6 +440,17 @@ void CfgParseText(const std::string& text, CfgFields* out, std::vector<CfgNote>*
             {
                 ++bad;
                 if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "netratelog='" + val + "' is not 1, on, 0 or off - ignored"; notes->push_back(nt); }
+            }
+        }
+        else if (key == "hosttoken")   /* TEST ONLY - see CfgFields::hostToken; exactly 64 lowercase hex digits; the value is never put in a note */
+        {
+            bool ok = val.size() == 64;
+            for (size_t i = 0; ok && i < val.size(); ++i) { if (!((val[i] >= '0' && val[i] <= '9') || (val[i] >= 'a' && val[i] <= 'f'))) ok = false; }
+            if (ok) f.hostToken = val;
+            else
+            {
+                ++bad;
+                if (notes != 0) { CfgNote nt; nt.line = lines; nt.bad = 1; nt.text = "hosttoken= is not 64 hexadecimal digits - ignored"; notes->push_back(nt); }
             }
         }
         else if (key == "sweepskip")   /* TEST ONLY - see CfgFields::sweepSkip; 0-64 printable characters, no space; empty = off */

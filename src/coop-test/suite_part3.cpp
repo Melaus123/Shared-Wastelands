@@ -472,6 +472,7 @@ bool Mp5NotebookOk(const std::string& k, const std::string& v)
     if (k == "timemode") return v == "fixed" || v == "consensus";
     if (k == "profilecap") return coopprof::CapValueOk(v) != 0;   /* ui5: store_main.cpp OptionValueOk's own check */
     if (swfee::IsOptionKey(k)) return swfee::OptionValueOk(k, v);   /* T-556: the world server's own check */
+    if (spimport::IsOptionKey(k)) return spimport::OptionValueOk(k, v);   /* T-1096: the world server's own check */
     return false;
 }
 void t_mp5_game_options_rows()
@@ -500,21 +501,29 @@ void t_mp5_game_options_rows()
         const std::string high = v;
         std::string wantLow, wantHigh; int wantN = 0;
         const std::string k = d.key;
-        if (d.kind == coopui::kOptKindDifficulty) { wantLow = "0.25"; wantHigh = "4"; wantN = 10; }
-        else if (d.kind == coopui::kOptKindWorld) { wantLow = "0.25"; wantHigh = "2"; wantN = 8; }
+        /* the number rows: each steps inside Kenshi's own limits, both ends reached */
+        if (k == "gp.gdm" || k == "gp.cod" || k == "gp.nnm") { wantLow = "0.5"; wantHigh = "4"; wantN = 9; }
+        else if (k == "gp.ht") { wantLow = "0.25"; wantHigh = "8"; wantN = 12; }
+        else if (k == "gp.bs" || k == "gp.rs" || k == "gp.ps") { wantLow = "0.5"; wantHigh = "2"; wantN = 6; }
+        else if (k == "gt.pop") { wantLow = "0.5"; wantHigh = "4"; wantN = 10; }
+        else if (k == "gt.squad") { wantLow = "0.5"; wantHigh = "3"; wantN = 9; }
+        else if (k == "gt.raidsize") { wantLow = "0.25"; wantHigh = "4"; wantN = 11; }
+        else if (k == "gt.raidfreq") { wantLow = "0.25"; wantHigh = "3"; wantN = 10; }
         else if (fixedRow) { wantLow = d.dflt; wantHigh = d.dflt; wantN = 1; }
         else if (k == "resurrectgrowth") { wantLow = "steady"; wantHigh = "steep"; wantN = 2; }   /* T-556 */
         else if (k == "gt.attacks") { wantLow = "0"; wantHigh = "5"; wantN = 6; }
-        else if (k == "gt.limbloss") { wantLow = "0"; wantHigh = "3"; wantN = 4; }
+        else if (k == "gt.limbloss") { wantLow = "0"; wantHigh = "2"; wantN = 3; }
         else if (k == "recruitmult") { wantLow = "auto"; wantHigh = "4"; wantN = 5; }
         else if (k == "basepolicy") { wantLow = "shared"; wantHigh = "locked"; wantN = 3; }
         else if (k == "timemode") { wantLow = "fixed"; wantHigh = "consensus"; wantN = 2; }
         else if (k == "profilecap") { wantLow = "1"; wantHigh = "16"; wantN = 16; }   /* ui5 */
+        else if (k == "spimport") { wantLow = "all"; wantHigh = "off"; wantN = 3; }   /* T-1096 */
+        else if (k == "spimportmoney" || k == "spimportresearch") { wantLow = "yes"; wantHigh = "no"; wantN = 2; }   /* T-1096 */
         if (low != wantLow || high != wantHigh || values != wantN)
             Fail(k + ": steps " + low + ".." + high + " (" + I(values) + ") - wanted " + wantLow + ".." + wantHigh + " (" + I(wantN) + ")");
         if (d.kind == coopui::kOptKindTick && (coopui::OptStep(i, "0", 1) != "1" || coopui::OptStep(i, "1", 1) != "0")) Fail(k + ": a tick box flips");
     }
-    if (perTab[0] != 9 || perTab[1] != 6 || perTab[2] != 7) Fail("rows per tab: " + I(perTab[0]) + "/" + I(perTab[1]) + "/" + I(perTab[2]));
+    if (perTab[0] != 9 || perTab[1] != 6 || perTab[2] != 10) Fail("rows per tab: " + I(perTab[0]) + "/" + I(perTab[1]) + "/" + I(perTab[2]));
     for (int t = 0; t < coopui::kOptTabCount; ++t) if (perTab[t] > coopui::kOptRowsShown || coopui::OptIndexOf(t, perTab[t]) != -1) Fail("a tab has more rows than the screen");
     const int gdm = coopui::OptIndexOf(coopui::kOptTabDifficulty, 0);
     if (coopui::OptShown(gdm, "1") != "1.0x" || coopui::OptShown(gdm, "0.25") != "0.25x" || coopui::OptShown(gdm, "1.5") != "1.5x"
@@ -523,7 +532,7 @@ void t_mp5_game_options_rows()
         || coopui::OptStep(gdm, "4", 1) != "4") Fail("a value between steps moves to the next step; the ends hold");
     if (coopui::OptCanon(gdm, "0") != "" || coopui::OptCanon(gdm, "1.50") != "1.5") Fail("canonical text");
     const int att = coopui::OptIndexOf(coopui::kOptTabWorld, 4), pol = coopui::OptIndexOf(coopui::kOptTabCoop, 1);
-    if (coopui::OptShown(att, "5") != "5 (Off)" || coopui::OptShown(pol, "owner") != "Owner only" || coopui::OptCanon(pol, "open") != "")
+    if (coopui::OptShown(att, "5") != "Never" || coopui::OptShown(att, "0") != "Bombardment" || coopui::OptShown(pol, "owner") != "Owner only" || coopui::OptCanon(pol, "open") != "")
         Fail("the choice words");
     std::map<std::string, std::string> m;
     coopui::OptParseFile("v1\tgp.gdm\t2\r\nbad line\nv2\tgp.cod\t3\nv1\tbasepolicy\towner\textra\nv1\t\tx\n", &m);
@@ -541,7 +550,7 @@ void t_t556f_fee_rows()
     const int on = coopui::OptIndexOfKey("resurrect"), fee = coopui::OptIndexOfKey("resurrectfee"), gr = coopui::OptIndexOfKey("resurrectgrowth");
     if (on < 0 || fee < 0 || gr < 0) { Fail("the three rows exist"); return; }
     if (coopui::OptIndexOf(coopui::kOptTabCoop, 4) != on || coopui::OptIndexOf(coopui::kOptTabCoop, 5) != fee || coopui::OptIndexOf(coopui::kOptTabCoop, 6) != gr
-        || coopui::OptRowOf(coopui::kOptTabCoop, fee) != 5 || coopui::OptTabRows(coopui::kOptTabCoop) != 7)
+        || coopui::OptRowOf(coopui::kOptTabCoop, fee) != 5 || coopui::OptTabRows(coopui::kOptTabCoop) != 10)   /* T-1096: + the three import rows after them */
         Fail("RESURRECTION, RESURRECTION FEE, FEE GROWTH are the MULTIPLAYER tab's rows 5, 6, 7");
     if (std::string(coopui::OptDefs()[on].label) != "RESURRECTION" || std::string(coopui::OptDefs()[fee].label) != "RESURRECTION FEE"
         || std::string(coopui::OptDefs()[gr].label) != "FEE GROWTH") Fail("the approved labels");
@@ -600,7 +609,7 @@ void t_t556f_fee_rows()
         for (int i = 0; i < coopui::kOptCount; ++i)
             if (coopui::OptHasHoverNote(i) != (i == fee || i == gr || i == nests) || (!coopui::OptHasHoverNote(i) && coopui::OptHoverText(i, h) != ""))
                 Fail(std::string("a hover note on the wrong row: ") + coopui::OptDefs()[i].key);
-        if (coopui::OptHoverText(nests, h) != "Animal nests: only affects areas not yet visited.") Fail("the ANIMAL NESTS note");
+        if (coopui::OptHoverText(nests, h) != "Nests and camps: only affects areas not yet visited.") Fail("the NESTS AND CAMPS note");
         if (coopui::OptHoverText(fee, h) != "Bringing back a fallen character is free." || coopui::OptHoverText(gr, h) != coopui::OptHoverText(fee, h))
             Fail("amount 0: both fee rows note that it is free");
         h[fee] = "1000"; h[gr] = "steady";
@@ -608,7 +617,7 @@ void t_t556f_fee_rows()
             Fail("an amount: both fee rows note the prices: " + coopui::OptHoverText(gr, h));
         h[on] = "off";
         if (coopui::OptHoverText(fee, h) != "" || coopui::OptHoverText(gr, h) != "") Fail("no fee note while RESURRECTION is not ticked");
-        if (coopui::OptHoverText(nests, h) != "Animal nests: only affects areas not yet visited.") Fail("the ANIMAL NESTS note does not depend on RESURRECTION");
+        if (coopui::OptHoverText(nests, h) != "Nests and camps: only affects areas not yet visited.") Fail("the NESTS AND CAMPS note does not depend on RESURRECTION");
         if (coopui::OptHoverText(-1, h) != "" || coopui::OptHoverText(coopui::kOptCount, h) != "" || coopui::OptHasHoverNote(-1) || coopui::OptHasHoverNote(coopui::kOptCount))
             Fail("no note off the list");
     }

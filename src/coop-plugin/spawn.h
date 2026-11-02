@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <vector>   /* T-1096 part 2: SquadIdsHere */
 #include "../common/statewire.h"   // POSE (read-poses): coopstate::PoseWire
 
 // F316: SafeReadPosition returns a position by pointer, so the type must be complete here. It is a
@@ -27,6 +28,25 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
 // `factionName` (empty = the reference's, as `spawn`), the new uid handed back. CreateAt still needs `watchplayer`.
 bool SpawnTemplateNear(const std::string& templateName, unsigned int anchorUid, float dx, float dz,
                        const std::string& factionName, bool keepContainer, unsigned int* uidOut);
+// squadtest (TEST-ONLY): SpawnTemplateNear's creation without its SPAWN - the record templateSid (else the shown name) is made,
+// registered under a uid minted here and owned by this game, and no other game is told yet; the caller changes it first
+// (squadtest hires it) and then announces it with SpawnAnnounceOwn. A uid needs the world-server link. MAIN THREAD.
+bool SpawnOwnLocalNear(const std::string& templateName, const std::string& templateSid, unsigned int anchorUid, float dx, float dz,
+                       const std::string& factionName, unsigned int* uidOut, ::Character** charOut);
+// squadtest (TEST-ONLY) on a game with no uids (single player): the record templateSid made by RootObjectFactory::create near
+// anchor in factionName - no uid, no row in the spawn index, announced to nobody. 0 when refused (an [M1] line says why).
+// MAIN THREAD.
+::Character* SpawnPlainNear(const std::string& templateSid, const std::string& templateName, ::Character* anchor, float dx, float dz,
+                            const std::string& factionName);
+// One own character announced to the other games as it stands now: CONTEXT, then SPAWN with its current faction (the wire name
+// a sent SPAWN uses), then its look and kit once its roll has settled. False when it is not this game's, is not readable, or the
+// SPAWN could not be sent. MAIN THREAD.
+bool SpawnAnnounceOwn(unsigned int uid);
+// squadtest (TEST-ONLY): the CHARACTER record with that stringID, its shown name in *name; 0 if none. MAIN THREAD.
+void* SpawnCharacterRecord(const std::string& sid, std::string* name);
+// squadtest (TEST-ONLY) `first`: the watched player character when it is a living member of this game's player faction, else
+// the first living one in the engine's active-character list; 0 if none. Needs no uid. MAIN THREAD.
+::Character* SpawnFirstPlayerCharacter();
 // T-556: a new character of this player's own faction (LocalPlayerFaction, passed to the creation core explicitly) made at
 // `pos` into `squad`, owned here, NOT announced (the caller sends CONTEXT + SPAWN). MAIN THREAD.
 bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos, ActivePlatoon* squad, float age, unsigned int* uidOut);
@@ -34,6 +54,10 @@ bool CreateOwnInSquad(const std::string& templateName, const Ogre::Vector3& pos,
 // character this game drives (its rename is sent like any other). MAIN THREAD.
 bool NameOf(const void* c, std::string* out);
 bool NameSetOwn(::Character* c, const std::string& name);
+// T-1153 TEST-ONLY levers: the first character of the player's selection (0 = none / no world / a fault), and `renametest <name> [uid]`
+// - the loaded character <uid> or, with none, that character, when it is this game's own, renamed through NameSetOwn ("ok renametest uid=.. name=.. was=.." or "error ..."). MAIN THREAD.
+void* FirstSelectedCharacter();
+std::string RenameTestCommand(const std::string& arg);
 // P11: what `tasks <uid>` prints, handed back - the adopted goal and hasPendingOrders (-1 = unreadable). False = not readable here.
 bool TaskGoalOf(unsigned int uid, std::string* goal, int* hasPendingOrders);
 // T-608 fold: the same read from a character pointer - any loaded character, in the spawn index or not (a town NPC). MAIN THREAD.
@@ -522,8 +546,8 @@ std::string NameReportLine();                                     // "[NAME] REP
 void InstallSlaves();
 // T-1084: Ownerships::setHomeBuilding hooked - a world squad's home building set by the engine marks its record due (spawn.cpp).
 void InstallHomeWatch();
-// T-307: the AnimationClass layer play hooked (table rows AnimLayerPlay, AnimCtl*, the 11 layer-only tasks): who started each layer state, so only a listed
-// task's layer state is sent as a pose (common/poselayer.h 3). MAIN THREAD install; the detour runs on any thread.
+// T-307: the AnimationClass layer play hooked (table rows AnimLayerPlay, AnimCtl*, the layer-only tasks): who started each layer state, so a
+// refuse-list starter's state is never sent as a pose and any other's is (common/poselayer.h 3, decision 1236 a). MAIN THREAD install; the detour runs on any thread.
 void InstallPoseLayerStart();
 std::string HomeWatchReport();   // the homeHook[...] counts for the [SAVE] heartbeat line (plain counter reads)
 std::string SameIdCopyReport();   /* the same-id copy rule's sameIdCopy[...] and sameIdYield[...] counts for the [SAVE] heartbeat line (MAIN THREAD) */
@@ -638,6 +662,20 @@ void PoseNoteHeldFrame();
 // only the first time and when the last after-update play did not happen - one play per frame. The copy gets no task and
 // no seat or machine registration. MAIN THREAD (ai_spike.cpp detour_update).
 void PoseReplayAfterUpdate(::Character* c);
+// T-330 (src/common/aimstamp.h). ANY THREAD: the time the engine's aim code last played its aim motion on character c (its
+// AnimationClass, +0x448): 1 and *stamp (and *windowMs, how long that stamp stays fresh at c's own update cadence - aimstamp.h
+// FreshMarkWindow), 0 none, -1 not known (the layer-play hook or the aim code's pieces are missing, or c is unreadable).
+int AimStampOf(const void* c, unsigned int* stamp, unsigned int* windowMs);
+// T-330. MAIN THREAD, a frame of a pause (the game's frame step 0): c's aim stamp, when still inside its window, is carried to now
+// (aimstamp.h FreshMarkPause), so the owner's aim word stays as it was through the pause.
+void AimStampKeep(const void* c, unsigned int now);
+// The engine's aim code (Steam 1.0.65 0x51DA50, 1.0.68 0x51E4E0) as an address in this game, 0 = no table row.
+unsigned long long AimCodeAddr();
+// MAIN THREAD: c may aim - not carried, not ragdolled, not dead (the pose replay's checks).
+bool AimCopyFit(::Character* c);
+// combat.cpp, MAIN THREAD (ai_spike.cpp detour_update, right after the copy's Character::update): a copy whose owner aims is
+// raised through the engine's aim code; when that ends it is lowered once.
+void AimCopyAfterUpdate(::Character* c);
 // True while the copy `uid` is held in an ACTION pose (seat / work), not a bed or cage - replicate.cpp turns only those.
 bool PoseHoldsActionCopy(unsigned int uid);
 // replicate.cpp: a copy held in an action pose was turned to its owner's streamed facing (poseFacingApplied).
@@ -671,6 +709,9 @@ void WatchTaskTick();
 // T029 runaway could not be attributed to either. This separates them so one run can
 // compare the two variants directly instead of guessing which mattered.
 void SetSpawnContainer(bool keep);
+// The `spawncontainer` verb: coopspawn::kSpawnContainerNull / Keep (as SetSpawnContainer) or New (TEST-ONLY: an explicit-faction
+// local spawn goes into a fresh empty squad of that faction - SpawnTemplate). MAIN THREAD (the command channel).
+void SetSpawnContainerMode(int mode);
 
 // Enumerate factions present in this save, optionally substring-filtered. Enumerating
 // beats guessing a name (F038's lesson, same as templates).
@@ -704,6 +745,13 @@ namespace coop { void CopySquadIdCheckHired(::Faction* faction, void* active); }
    characters are read in. 1 renamed, 0 kept (no other squad holds the id), -1 not a stand-in's squad under `id` any more, -2 the check
    could not rename it. MAIN THREAD. */
 namespace coop { int CopySquadIdCheckAtLoad(void* platoon, const std::string& id); }
+/* T-1096 part 2 (store.cpp SpImportSquadIds): every squad id this game holds (every faction's awake and asleep lists, this game's own
+   faction, the stand-ins) but the squads in `except`, appended to *out: 1 walked, 2 walked with a list unread, 0 not walked. And an
+   imported squad's id written as a copy squad's fresh id is (the live id, the state record's "platoon stringID", the content file):
+   1 written, 0 no state record, -1 the live id faulted, -2 the id is written but the squad's save file name (its content file) could
+   not be renamed (T-1096 fold (review 2026-10-31): the caller holds the save). MAIN THREAD. */
+namespace coop { int SquadIdsHere(std::vector<std::string>* out, const std::vector<void*>& except); }
+namespace coop { int ImportSquadIdWrite(void* platoon, const std::string& engineId, const std::string& fresh, std::string* note); }
 /* snap1 (user decision 2026-09-26): the `snapshot` verb's per-character engine facts. Every engine read is a guarded POD
    frame (spawn.cpp SnapCharFacts). MAIN THREAD. 1 = read (fields that would not read are flagged), 0 = not a live character. */
 namespace coop {

@@ -38,6 +38,8 @@
 #include "fallentab.h"   /* T-556: the FALLEN tab */
 #include "chat.h"        /* in-game text chat */
 #include "money.h"       /* T-810: money between players */
+#include "admin.h"       /* the admin login and the admin commands */
+#include "kapi.h"        /* per-race rules: kenshi_api.cfg, the world's race.* options, the equip and XP hooks */
 #include "titleart.h"  /* T-513: the mod's own title-screen art */
 #include "config.h"   /* E38 / decisions 42-43: shared_wastelands.cfg - the role and the addresses */
 #include "addresses.h" /* P8h: the executable fingerprint and its address table - the gate below */
@@ -264,6 +266,7 @@ static void detour_mainLoop(GameWorld* thisptr, float time)
     coop::BugReportTick(0);   /* T-461: REPORT A BUG - its window over the pause menu, the nearby-log ask and answer */
     coop::ChatTick();         /* in-game text chat - Enter, the window, the fading feed, join / leave lines */
     coop::MoneyTick();        /* T-810: money between players - given back, added, acknowledged, sent once on disk */
+    coop::AdminTick();        /* the admin login: an unused typed password wiped; a link that ended ends this game's admin standing */
     coop::UiDriveEngineClickFlush(0);   /* pp1b: a queued `uiclick engine:` fires at the tail of the in-world pump; T-201 PP6': never the one-press load */
 }
 
@@ -433,6 +436,7 @@ static void detour_titleUpdate(TitleScreen* thisptr)
     coop::BugReportTick(1);  /* T-461: REPORT A BUG - the title screen's button and its window */
     coop::PlayersTabTitleTick();   /* T-545: a SET HOSTILE box left up from the world is taken down */
     coop::ChatTitleTick();         /* the chat of the world just left is taken down */
+    coop::AdminTick();             /* and at the title too */
     coop::FallenTabTitleTick();    /* T-556: a BRING BACK box left up from the world is taken down */
     coop::TagsTitleTick();   /* tags1: no world at the title - a name label still standing is destroyed */
     coop::SteamProbeTick();  /* T-290 S0 title: the first title frame looks Steam up (the game's SteamAPI_Init has run); later frames poll the relay status until it settles. Logs only. */
@@ -866,6 +870,7 @@ static void startPluginOn(const char* road)
     /* PROBE P140 BEGIN */ coop::InstallP140();   /* T-806: who starts the cage-use task (0x357FE0), log only */ /* PROBE P140 END */
     coop::InstallHire();       /* recruit1 R0-a: Dialogue::_doActions 0x67FAD0, LOG ONLY */
     coop::InstallWorldGen();
+    coop::InstallKapi();       /* per-race rules: the equip check and the two XP hooks, kenshi_api.cfg read */
     logHookCounts();   /* mig1: every install above went through coop::AddHook (hooks.cpp, our own MinHook) */
     LARGE_INTEGER t1;
     ::QueryPerformanceCounter(&t1);

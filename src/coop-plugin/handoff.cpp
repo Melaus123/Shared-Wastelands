@@ -2495,6 +2495,72 @@ int FocusCameraPod(float x, float y, float z)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+/* T-890 TEST-ONLY lever `camturn` (command_channel.cpp; the rig and the setter: src/common/camturn.h). MAIN THREAD.
+   The engine's own setter is the PlayerInterface function right after focusCamera (Steam 1.0.65 0x7F1F20 = FocusCameraOn + 0x10;
+   the FocusCameraOn row's byte pattern in signatures.sig already spans its first 8 bytes, so it sits there in every exe that row
+   matches): (this, const Quaternion& rot, float zoom) -> the camera object (+0x30) 0x6AF0C0 -> target node setOrientation(rot),
+   camera node setPosition(0, 0, zoom). Before the call its first 11 bytes are checked (refused if they differ). No new address row.
+   The read-back goes through Kenshi's own Ogre exports (Node::getOrientation / Node::getPosition, by value: this, hidden out). */
+typedef void (*CamSetFn)(void* playerInterface, const float* quatWxyz, float zoom);
+typedef float* (*CamNodeGetOriFn)(const void* node, float* out);   /* Ogre::Node::getOrientation() const - a Quaternion by value */
+typedef float* (*CamNodeGetPosFn)(const void* node, float* out);   /* Ogre::Node::getPosition() const - a Vector3 by value */
+static const unsigned char kCamSetHead[11] = { 0x48, 0x83, 0xEC, 0x38, 0x0F, 0x10, 0x02, 0x48, 0x8B, 0x49, 0x30 };   /* sub rsp,38h; movups xmm0,[rdx]; mov rcx,[rcx+30h] */
+static CamNodeGetOriFn g_camGetOri = 0;
+static CamNodeGetPosFn g_camGetPos = 0;
+static int g_camOgreLooked = 0;
+static void* CamPlayerInterface()
+{
+    if (!Plaus(coop::GameWorldPtr())) return 0;
+    void* pi = *(void**)((char*)coop::GameWorldPtr() + 0x580);
+    return Plaus(pi) ? pi : 0;
+}
+/* 1 = q (w,x,y,z) and the camera node's local z read; 0 = no PlayerInterface / camera / Ogre export; -1 = a fault */
+int CameraReadPod(float* q, float* zoom)
+{
+    if (!g_camOgreLooked)
+    {
+        g_camOgreLooked = 1;
+        HMODULE og = ::GetModuleHandleA("OgreMain_x64.dll");
+        if (og != 0)
+        {
+            g_camGetOri = (CamNodeGetOriFn)::GetProcAddress(og, "?getOrientation@Node@Ogre@@QEBA?AVQuaternion@2@XZ");
+            g_camGetPos = (CamNodeGetPosFn)::GetProcAddress(og, "?getPosition@Node@Ogre@@QEBA?AVVector3@2@XZ");
+        }
+    }
+    if (g_camGetOri == 0 || g_camGetPos == 0) return 0;
+    __try
+    {
+        void* pi = CamPlayerInterface();
+        if (pi == 0) return 0;
+        void* cam = *(void**)((char*)pi + 0x30);
+        if (!Plaus(cam)) return 0;
+        void* target = *(void**)((char*)cam + 0x58);
+        void* camNode = *(void**)((char*)cam + 0x70);
+        if (!Plaus(target) || !Plaus(camNode)) return 0;
+        float o[4] = { 0, 0, 0, 0 }, p[3] = { 0, 0, 0 };
+        g_camGetOri(target, o);
+        g_camGetPos(camNode, p);
+        q[0] = o[0]; q[1] = o[1]; q[2] = o[2]; q[3] = o[3];
+        *zoom = p[2];
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* 1 = the engine's setter called; 0 = no PlayerInterface / no FocusCameraOn row; 2 = the setter's first bytes are not the expected
+   ones (another exe or another mod) - not called; -1 = a fault */
+int CameraTurnPod(const float* q, float zoom)
+{
+    __try
+    {
+        void* pi = CamPlayerInterface();
+        if (pi == 0 || kHoFocusCameraOnRva == 0) return 0;
+        const unsigned char* fn = (const unsigned char*)(uintptr_t)(coop::AddrAbs(kHoFocusCameraOnRva) + 0x10);
+        for (int i = 0; i < (int)sizeof(kCamSetHead); ++i) if (fn[i] != kCamSetHead[i]) return 2;
+        ((CamSetFn)fn)(pi, q, zoom);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 bool PlayerTeleportAbs(float x, float z)
 {
     ::Character* pc = GetTarget();

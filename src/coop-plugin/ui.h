@@ -103,6 +103,9 @@ int UiPauseMenuReshow();
 // (Kenshi_MainMenuPopupPanel) through the engine's own getter and show function - the route the in-game ESC key takes (F537(a):
 // 0x47A0B0 -> 0x9164F0 -> show 0x913250) - no injected input (F010). Refused (logged) at the title screen. true = the menu is open.
 bool UiMenuCommand(const std::string& args);
+// T-1154 TEST-ONLY `mpesc`: the ESC key as MyGUI hands it to the pause menu's MULTIPLAYER window (its own key handler). true = the
+// window was open and its handler ran (it closes at the next in-world tick). MAIN THREAD.
+bool UiMpEscCommand();
 bool UiFactionTabCaption(const std::string& name);   // T-368, MAIN THREAD: the FACTION tab's name box shows the name the world gave this game's player faction
 bool UiFactionTabRename(const std::string& name);   // T-368, TEST-ONLY `renamemyfaction tab <name>`: the FACTION tab's name box gets the name and its Enter (the engine's own handler runs)
 // pp1b (review 2026-09-27) - an accepted `uiclick engine:<Suffix>` (T-903: and `uiclick point:<x>,<y>`, MyGUI's own mouse input) is QUEUED and fired here, at the TAIL of the pump that ran the

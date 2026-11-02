@@ -269,10 +269,13 @@ inline int NameOrphanCount(const NameTable& t)
 }
 struct NameSidRow { std::string sid; int row; };
 inline bool NameSidRowLess(const NameSidRow& a, const NameSidRow& b) { return (a.sid != b.sid) ? (a.sid < b.sid) : (a.row < b.row); }
-struct NamePair { long long d; int live; int row; };
+struct NamePair { long long dy; long long d; int live; int row; };   /* dy: height difference, d: flat distance squared (tenths) */
+/* the near order (coopground::GroundNearBetter; an orphan row keeps no quantity or quality, so every pair has the same match rank):
+   the smaller height difference first - a pile's items share one flat spot at different heights - then the smaller flat distance,
+   then the live item and the row in list order */
 inline bool NamePairLess(const NamePair& a, const NamePair& b)
 {
-    if (a.d != b.d) return a.d < b.d;
+    if (a.dy != b.dy || a.d != b.d) return coopground::GroundNearBetter(0, a.dy, a.d, 0, b.dy, b.d) != 0;
     return (a.live != b.live) ? (a.live < b.live) : (a.row < b.row);
 }
 /* MAIN THREAD, outside the ground lock (it allocates): what to change so the table follows the live ground list. unloadedNow 1 = a
@@ -285,7 +288,8 @@ inline bool NamePairLess(const NamePair& a, const NamePair& b)
      apart) is detached (an orphan) and that item is offered an orphan like any item carrying no name;
    - a row whose address is not live becomes an orphan only when a zone was taken apart (marked); otherwise it is left as it is;
    - the orphans, grouped by sid, are handed to the live items carrying no name: every (item, orphan) pair of one sid within
-     kGroundNearTenths flat, the nearest pair first, each item and each orphan once.
+     kGroundNearTenths flat, in the near order (NamePairLess: the smaller height difference first, then the smaller flat
+     distance), each item and each orphan once.
    Returns the number of re-binds planned. */
 inline int NameRebindPlan(const NameTable& t, const LiveItem* live, int n, const void* const* skip, int nSkip, int unloadedNow, std::vector<NameChange>* out)
 {
@@ -355,7 +359,7 @@ inline int NameRebindPlan(const NameTable& t, const LiveItem* live, int n, const
         {
             const long long d = coopground::GroundKeyDist2XZ(t.row[o->row].cur, li.cur);
             if (d < 0 || d > fitNear) continue;
-            NamePair p; p.d = d; p.live = cand[c]; p.row = o->row;
+            NamePair p; p.dy = coopground::GroundKeyDy(t.row[o->row].cur, li.cur); p.d = d; p.live = cand[c]; p.row = o->row;
             pairs.push_back(p);
         }
     }
@@ -399,6 +403,42 @@ inline int NameExpireOrphans(NameTable* t, unsigned int now)
         if (NameIsOrphan(t->row[i]) != 0 && (unsigned int)(now - t->row[i].orphanAt) >= kOrphanKeepMs) { NameForgetRow(t, i); ++n; }
     return n;
 }
+/* T-1129: 1 = `name` is in keep[] (this game's own drops not yet confirmed - their PUT still stands for them, so their orphan
+   rows are never forgotten or passed over by the helpers below) */
+inline int NameKeptIn(const char* name, const char* const* keep, int nKeep)
+{
+    if (name == 0 || keep == 0) return 0;
+    for (int k = 0; k < nKeep; ++k) if (keep[k] != 0 && NameStrEq(name, keep[k]) != 0) return 1;
+    return 0;
+}
+/* T-1129, under the ground lock (allocates nothing): area square (sx, sy) is loaded and settled here and a re-bind pass has run
+   since - every item back at a new address has taken its name back - so the orphans whose item was last seen in that square are
+   names nobody here took back: forgotten, never offered to a later re-bind. The caller runs this BEFORE the square's ground
+   listing goes out (re-bind, then forget, then list). A name in keep[] is kept. Returns how many were forgotten. */
+inline int NameForgetOrphansIn(NameTable* t, int sx, int sy, const char* const* keep, int nKeep)
+{
+    int n = 0;
+    for (int i = 0; i < kNameCap; ++i)
+    {
+        const NameRow& r = t->row[i];
+        if (NameIsOrphan(r) == 0 || r.cur.sx != sx || r.cur.sy != sy) continue;
+        if (NameKeptIn(r.name, keep, nKeep) != 0) continue;
+        NameForgetRow(t, i);
+        ++n;
+    }
+    return n;
+}
+/* T-1129, under the ground lock: the orphans carrying `name` exactly are forgotten (the catch-up gave that name to a live item
+   here - one name, one row); a name in keep[] forgets nothing. Returns how many. */
+inline int NameForgetOrphansNamed(NameTable* t, const char* name, const char* const* keep = 0, int nKeep = 0)
+{
+    int n = 0;
+    if (name == 0 || name[0] == 0) return 0;
+    if (NameKeptIn(name, keep, nKeep) != 0) return 0;
+    for (int i = 0; i < kNameCap; ++i)
+        if (NameIsOrphan(t->row[i]) != 0 && NameStrEq(t->row[i].name, name) != 0) { NameForgetRow(t, i); ++n; }
+    return n;
+}
 
 /* ---- the catch-up's NAME FOR on the asker, and a repeated TAKE's match ---- */
 const int kNfOk = 0, kNfSkipped = 1, kNfOtherName = 2, kNfNameTaken = 3, kNfUnreadable = 4;
@@ -410,17 +450,22 @@ inline int NameAddrIn(const void* const* list, int n, const void* addr)
 }
 /* May the item at `addr` (lying at `cur`), found for the listed id `idFor`, take `name`? Never: an address on the re-bind skip list
    (skip[]) or this game's own unconfirmed drop (ownDrop 1); an item carrying a name other than idFor and other than `name`; a name a
-   row at another address already carries (one name, one row). Returns kNf*. */
+   row at another address already carries (one name, one row). T-1129: an ORPHAN carrying the name (a waiting name nobody here took
+   back) does not hold it - the catch-up's list is the holder's fact; the caller forgets that orphan (NameForgetOrphansNamed) when it
+   gives the name - unless the name is in keep[] (this game's own drop not yet confirmed: its orphan still holds it). Returns kNf*. */
 inline int NameForCheck(const NameTable& t, const void* addr, const coopground::GroundKeyParts& cur, const char* name, const char* idFor,
-                        const void* const* skip, int nSkip, int ownDrop)
+                        const void* const* skip, int nSkip, int ownDrop, const char* const* keep = 0, int nKeep = 0)
 {
     if (ownDrop != 0 || NameAddrIn(skip, nSkip, addr) != 0) return kNfSkipped;
     const int own = NameAt(t, addr, cur);
     if (own >= 0 && NameStrEq(t.row[own].name, name) == 0 && (idFor == 0 || NameStrEq(t.row[own].name, idFor) == 0)) return kNfOtherName;
     const int self = NameAtAddr(t, addr);
-    int at[2]; at[0] = -1; at[1] = -1;
-    const int nf = NameFindName(t, name, at, 2);
-    if (nf > 1 || (nf == 1 && at[0] != self)) return kNfNameTaken;
+    for (int i = 0; i < kNameCap; ++i)
+    {   /* another row carrying the name holds it - unless that row is an orphan */
+        if (t.row[i].used == 0 || i == self || NameStrEq(t.row[i].name, name) == 0) continue;
+        if (NameIsOrphan(t.row[i]) != 0 && NameKeptIn(t.row[i].name, keep, nKeep) == 0) continue;
+        return kNfNameTaken;
+    }
     return kNfOk;
 }
 inline const char* NameForWhy(int nf)

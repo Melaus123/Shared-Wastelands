@@ -79,6 +79,8 @@ int            ConfigRelayCap();             /* TEST ONLY: relaycap= (1-32), 0 =
 int            ConfigParityHoldSec();        /* T-734 TEST ONLY: parityholdsec= (0-600 s) - ItCanMakeItems answers 0 that long from its first ask; 0 = absent = off */
 int            ConfigBenchCapKbs();          /* TEST ONLY: benchcapkbs= (KB/s) - ENet's bandwidth limit, in and out, on this game's links; 0 = absent = off */
 int            ConfigNetRateLog();           /* TEST ONLY: netratelog=1 - each Steam link logs a [net] RATE line once a second; 0 = absent = off */
+int            ConfigSteamFakeLagMs();       /* T-1118 f TEST ONLY: steamfakelag= (ms, 0-1000) - Steam's fake lag on a real game's Steam link; 0 = absent */
+int            ConfigSteamFakeLossPct();     /* T-1118 f TEST ONLY: steamfakeloss= (percent, 0-50) - Steam's fake loss on it; 0 = absent */
 std::string    ConfigSweepSkip();            /* TEST ONLY: sweepskip= - the T-300 arrival sweep leaves alone every record whose id starts with it; empty = absent = off */
 void           ConfigSetSlotForProfile(const std::string& slot);   /* prof1: the picked profile's save folder, IN MEMORY ONLY (never written to shared_wastelands.cfg). MAIN THREAD */
 int            ConfigModFingerprintSalt();   /* settings5 S5 TEST ONLY: 1 = shared_wastelands.cfg says modfingerprint_salt=1 */

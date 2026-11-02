@@ -76,6 +76,11 @@ static unsigned long long kHumanVtRva = 0; static coop::AddrReg kHumanVtRva_reg(
 
 namespace coop {
 
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+void P210NoteBodyBuild(unsigned int uid);   /* combat.cpp: P091's createBody note saw this copy's body being built */
+// PROBE-END: P210
+#endif
 void InvNetNoteAnnounced(void* ch, unsigned int uid);   /* inv2a (items.cpp, declared in items.h) */
 int KitApplyBusy(void* ch, unsigned int uid);            /* T-1 B2 fold (review F2; items.cpp, declared in items.h) */
 
@@ -746,6 +751,11 @@ static void P091CreateBodyNote(void* app)
         if (c == 0 || !Obj(c)) return;
         const unsigned int uid = FindSpawnedUid(c);
         if (uid == 0) return;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+        P210NoteBodyBuild(uid);
+// PROBE-END: P210
+#endif
         P091Snap sn;
         P091SnapPod(c, app, &sn);
         ::InterlockedIncrement(&g_p091CreateBodyCopy);
@@ -3118,12 +3128,14 @@ int GroundAnimalAppPod(::Character* c)
 }
 
 // ground5 fold 3: the race record the [P019] lines print (appearance +kRaceOff), 0 = none / unreadable. No C++ object (C2712).
+// T-1157 review fold: GetAppearance's two hops (Character + kCharAnimationOff, then + kAnimAppearanceOff) are read inside the
+// same SEH guard as the race pointer - kapi.cpp asks this from the engine's worker threads, where a character can go mid-read.
 static ::GameData* GroundRacePod(::Character* c)
 {
-    void* app = GetAppearance(c);
-    if (app == 0) return 0;
     __try
     {
+        void* app = GetAppearance(c);
+        if (app == 0) return 0;
         ::GameData* gd = *(::GameData**)((char*)app + kRaceOff);
         return (gd != 0 && Obj(gd)) ? gd : 0;
     }
@@ -3134,6 +3146,34 @@ std::string GroundRaceName(::Character* c)
 {
     ::GameData* gd = GroundRacePod(c);
     return gd != 0 ? gd->name : std::string("?");
+}
+
+// Per-race rules (kapi.cpp): a std::string's text into a fixed buffer under the SEH guard. 1 copied, 0 empty or unreadable,
+// 2 longer than cap - 1. No C++ object here (C2712).
+static int KapiSidCopyPod(const std::string* s, char* out, int cap)
+{
+    __try
+    {
+        const size_t n = s->size();
+        if (n == 0) return 0;
+        if (n >= (size_t)cap) return 2;
+        std::memcpy(out, s->data(), n);
+        out[n] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Per-race rules (kapi.cpp): the character's race record's string ID - the rules name a race by its string ID only, never by
+// the shown name. 1 = copied into out, 0 = no race readable (the rules then leave Kenshi's own behaviour), 2 = longer than
+// cap - 1. ANY THREAD: the race pointer is read under SEH, the record itself is the game's static data.
+int KapiRaceSidOf(::Character* c, char* out, int cap)
+{
+    if (out == 0 || cap <= 0) return 0;
+    out[0] = 0;
+    ::GameData* gd = (c != 0) ? GroundRacePod(c) : 0;
+    if (gd == 0) return 0;
+    return KapiSidCopyPod(&gd->stringID, out, cap);
 }
 
 } // namespace coop

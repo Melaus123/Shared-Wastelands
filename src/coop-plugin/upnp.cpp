@@ -6,12 +6,14 @@
  * FOUR ROUTES, tried in src/common/upnpplan.h's order until one settles the port (forwarded, already forwarded here, or
  * forwarded to another computer and left alone):
  *   igd      the mod's own UPnP IGD ask: an SSDP search from the home adapter's address, the router's device description,
- *            GetSpecificPortMappingEntry (what is there already), then AddPortMapping with a kAskLeaseSeconds lease - or
- *            lease 0 when the router answers fault 725 (it only takes permanent entries);
- *   pcp      a PCP MAP request to the router's UDP port 5351, kAskLeaseSeconds asked, the router's granted lifetime kept;
+ *            GetSpecificPortMappingEntry (what is there already), then AddPortMapping with a kAskLeaseSeconds lease - or,
+ *            for the game's own hosting only, lease 0 when the router answers fault 725 (it only takes permanent entries);
+ *   pcp      a PCP MAP request to the router's UDP port 5351, kAskLeaseSeconds asked, the router's granted lifetime kept
+ *            (a world kept running hands back a lifetime granted with no limit);
  *   natpmp   the same as NAT-PMP, only when the router answered PCP in NAT-PMP's format;
  *   windows  Windows' own UPnP interface (NATUPnP in hnetcfg.dll: IUPnPNAT, IStaticPortMappingCollection, COM), the last
- *            fallback; it takes no lease.
+ *            fallback; it takes no lease, so for a world kept running it adds nothing and only removes an entry of ours
+ *            it finds on the port.
  * The texts, bytes and readings of every route are src/common/routerwire.h; the sending and receiving net/routerask.cpp;
  * the decisions src/common/upnpplan.h - all swept by the offline suite.
  *
@@ -20,6 +22,17 @@
  * again, for kAskLeaseSeconds.  A LEASED entry a crashed game leaves behind therefore disappears from the router on its
  * own when its lease runs out; a permanent one (a router that answered fault 725, or the windows route) stays until the
  * next host on that port takes it over.  A renewal that finds the port forwarded elsewhere marks it no longer ours.
+ *
+ * A WORLD KEPT RUNNING TAKES ONLY OPENINGS WITH A TIME LIMIT (upnpplan.h TimeLimitedOnly; g_upTimeLimitedOnly): it runs
+ * unattended, so a crashed or wrongly stopped one must never leave the port open for more than about an hour.  Its ask
+ * makes no permanent entry: fault 725 refuses the igd route; the windows route adds nothing and only removes an entry of
+ * ours it finds on the port (a permanent one the game handed over, or one a crashed game left - nothing else would,
+ * WindowsStep); an igd lease is read back after each add and renewal, and one listed as none or longer than asked is
+ * handed back (LeaseKept), as is a PCP / NAT-PMP lifetime granted so, at the ask or at a renewal; an igd renewal the
+ * router refuses shows the failed line (RenewRefusedShowsFailed); an entry of ours already on the port that could not be
+ * leased again is removed (RemoveLeftoverNow).  After a hand-back nothing is held; an opening the router would not take
+ * back is held only to be removed - asked again at each renewal time and at the stop (upnpplan.h AfterHandBack).  No time-limited opening = failed (no router, when none
+ * answered); its window then says to open the port by hand.  The game's own hosting keeps the permanent fallbacks.
  *
  * THE GAME NEVER WAITS FOR THE ROUTER. Finding the router takes seconds, and a router may never answer at all, so every
  * router call runs on ONE background thread made here (UpnpWorker). The main thread only records what hosting needs
@@ -30,6 +43,12 @@
  * the panel may close its own) and removes the entry, by the route that holds it, when the process ends. (2) The game
  * quits: the world server only closes itself after this game is gone (--parent), so the exit path (store.cpp
  * detour_gameWorldDtor) calls UpnpQuitBegin / UpnpQuitWait and the entry is removed before the process ends.
+ *
+ * A WORLD KEPT RUNNING HOLDS ITS OWN ENTRY (upnpplan.h MapOwner). SharedWastelandsServer.exe compiles this file in (with
+ * net/routerask.cpp and net/homeaddr.cpp; its DebugLog / ErrorLog write its own log): started with --keep-running, it calls
+ * UpnpServeStart once it listens - the same worker, with no process to watch - and UpnpQuitBegin / UpnpQuitWait at every
+ * stop (its QuitDrain), and its window shows one plain line per note (UpnpNoteFn).  The game that started it does not ask
+ * (MapOnHostStart) and hands it any entry it held on that port (UpnpHandOver).
  *
  * NOTHING ABOUT THE FORWARDING IS SHOWN TO THE PLAYER (owner decision 382): [UPNP] log lines and the REPORT's upnp[...]
  * fields only.  The same thread also answers the HOSTING window's first INTERNET ADDRESS ask: the address the router itself
@@ -87,6 +106,14 @@ volatile LONG    g_upReady      = 0;        /* 1 once the lock, the wake event a
 volatile LONG    g_upStopped    = 0;        /* 1 once the worker has ended (quitting, or it could not wait): no ask is answered after */
 HANDLE           g_upWake       = 0;        /* auto-reset: the main thread changed what hosting needs */
 HANDLE           g_upThread     = 0;
+/* THE WORLD SERVER'S NOTES (UpnpServeStart): set before the worker is made (CreateThread orders it), never changed after;
+   0 in the game. */
+UpnpNoteFn       g_upNote       = 0;
+/* Set with g_upNote, never changed after: true in a world kept running (coopupnp::TimeLimitedOnly(kOwnerServer)), whose ask
+   takes only openings with a time limit; false in the game. */
+bool             g_upTimeLimitedOnly = false;
+/* Router thread only: the failed line was shown for a refused renewal of the opening held now (cleared at each ask). */
+bool             g_upRenewNoteShown = false;
 
 /* Under g_upLock. */
 HANDLE              g_upServer   = 0;       /* our duplicate of the world server's process handle (0 = none watched) */
@@ -271,7 +298,8 @@ std::string DescForLog(const std::string& d)
 }
 
 /* AddPortMapping for `port` to this computer, asking `*lease` seconds; a 725 to a time-limited ask is asked again as
-   permanent (*lease becomes 0).  kRrMapped, kRrElsewhere (718) or kRrRefused; *detail says what happened. */
+   permanent (*lease becomes 0) - except in a world kept running (g_upTimeLimitedOnly), where it is a refusal.
+   kRrMapped, kRrElsewhere (718) or kRrRefused; *detail says what happened. */
 int IgdAdd(Router* r, long port, long* lease, std::string* detail)
 {
     for (int attempt = 0; attempt < 2; ++attempt)
@@ -285,7 +313,13 @@ int IgdAdd(Router* r, long port, long* lease, std::string* detail)
         if (a == 0)
         {
             const int next = swrouter::AddFaultNext(fault, *lease);
-            if (next == swrouter::kAddRetryPermanent)
+            if (next == swrouter::kAddRetryPermanent && !coopupnp::AskAgainPermanent(true, g_upTimeLimitedOnly))
+            {
+                *detail = "the router only takes permanent entries (" + w + ") - none asked for: a world kept running takes only"
+                          " openings with a time limit";
+                return coopupnp::kRrRefused;
+            }
+            if (coopupnp::AskAgainPermanent(next == swrouter::kAddRetryPermanent, g_upTimeLimitedOnly))
             {
                 DebugLog("[UPNP] igd: " + std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(port) + ": " + w
                          + " - the router only takes permanent entries; asked again with lease 0");
@@ -305,8 +339,42 @@ int IgdAdd(Router* r, long port, long* lease, std::string* detail)
     return coopupnp::kRrRefused;
 }
 
-int IgdMap(Router* r, long port, bool* removeAtEnd, long* lease, std::string* detail)
+/* A world kept running hands back its igd entry on `port`, which has or may have no time limit (`reason` says why):
+   DeletePortMapping.  kBackDone = removed (or already gone), kBackFailed = not removed - still this world's to remove. */
+int IgdHandBack(Router* r, long port, const std::string& reason, std::string* detail)
 {
+    std::string ans, w;
+    int fault = -1;
+    const int d = IgdCall(*r, "DeletePortMapping", swrouter::SoapDeletePortMapping(r->igdService, port, coopupnp::kProtocol),
+                          &ans, &fault, &w);
+    const bool gone = (d == 1 || (d == 0 && fault == 714));
+    *detail += (detail->empty() ? "" : "; ") + reason + " - "
+             + (gone ? std::string("handed back") : "not handed back (" + w + "): held only to be removed")
+             + "; a world kept running takes only openings with a time limit";
+    return gone ? coopupnp::kBackDone : coopupnp::kBackFailed;
+}
+
+/* A world kept running's igd entry just leased (an add or a renewal): the router's own record of it is read back, and a
+   lease it lists as none or longer than asked is handed back (coopupnp::LeaseKept).  kBackNone = kept; the game's own
+   hosting reads nothing back. */
+int IgdLeaseReadBack(Router* r, long port, std::string* detail)
+{
+    if (!g_upTimeLimitedOnly) return coopupnp::kBackNone;
+    std::string ans, w;
+    int fault = -1;
+    const int g = IgdCall(*r, "GetSpecificPortMappingEntry", swrouter::SoapGetSpecificEntry(r->igdService, port, coopupnp::kProtocol),
+                          &ans, &fault, &w);
+    long listed = 0;
+    const bool read = (g == 1) && swrouter::ReadNum(swrouter::XmlValue(ans, "NewLeaseDuration"), &listed);
+    if (coopupnp::LeaseKept(true, read, listed)) return coopupnp::kBackNone;
+    return IgdHandBack(r, port, "the router lists the entry's lease as " + Num((long long)listed) + " s (no time limit, or longer"
+                       " than the " + Num((long long)coopupnp::kAskLeaseSeconds) + " s asked)", detail);
+}
+
+/* *back: kBackNone, or what became of an entry of ours with no time limit that this ask handed back (a world kept running). */
+int IgdMap(Router* r, long port, bool* removeAtEnd, long* lease, std::string* detail, int* back)
+{
+    *back = coopupnp::kBackNone;
     std::string why;
     const int f = IgdFind(r, &why);
     if (f != 1)
@@ -351,7 +419,20 @@ int IgdMap(Router* r, long port, bool* removeAtEnd, long* lease, std::string* de
     }
     *lease = coopupnp::kAskLeaseSeconds;
     const int rr = IgdAdd(r, port, lease, detail);
+    if (coopupnp::RemoveLeftoverNow(g_upTimeLimitedOnly, act, exDesc, rr))
+    {
+        /* our entry already on the port could not be leased again: it may have no time limit, so it is handed back now */
+        *back = IgdHandBack(r, port, "the entry of ours already on the port (" + DescForLog(exDesc) + ") could not be leased again", detail);
+        *removeAtEnd = (*back == coopupnp::kBackFailed);
+        return coopupnp::kRrRefused;
+    }
     if (rr != coopupnp::kRrMapped) return rr;
+    *back = IgdLeaseReadBack(r, port, detail);
+    if (*back != coopupnp::kBackNone)
+    {
+        *removeAtEnd = (*back == coopupnp::kBackFailed);
+        return coopupnp::kRrRefused;
+    }
     *removeAtEnd = true;
     if (act == coopupnp::kActKeep)
     {
@@ -467,6 +548,22 @@ int PmpAsk(Router* r, long port, unsigned long lifetime, unsigned long* granted,
     return coopupnp::kRrMapped;
 }
 
+/* A PCP / NAT-PMP opening granted to a world kept running with no time limit (`life` 0) or longer than kAskLeaseSeconds
+   (coopupnp::GrantKept): handed back at once (lifetime 0), so it never counts as an opening.  kBackDone = handed back,
+   kBackFailed = the router did not take it back - still this world's to remove. */
+int HandBackNoLimit(Router* r, int route, long port, unsigned long life, std::string* detail)
+{
+    unsigned long lifeLeft = 0;
+    std::string why;
+    const int rr = (route == coopupnp::kRoutePcp) ? PcpAsk(r, port, 0, &lifeLeft, &why) : PmpAsk(r, port, 0, &lifeLeft, &why);
+    const bool gone = (rr == coopupnp::kRrMapped);
+    *detail = "the router granted lifetime " + Num((long long)life) + " (no time limit, or longer than the "
+            + Num((long long)coopupnp::kAskLeaseSeconds) + " s asked) - "
+            + (gone ? std::string("handed back") : "not handed back (" + why + "): held only to be removed")
+            + "; a world kept running takes only openings with a time limit";
+    return gone ? coopupnp::kBackDone : coopupnp::kBackFailed;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------ */
 /* windows (NATUPnP)                                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -495,8 +592,11 @@ int FindRouter(Router* r, bool comReady, bool homeAddrFound, std::string* why)
     return out;
 }
 
-int WindowsMap(Router* r, bool comReady, long port, bool* removeAtEnd, std::string* detail)
+/* *back: kBackNone, or what became of an entry of ours with no time limit that this ask handed back (a world kept running,
+   coopupnp::WindowsStep). */
+int WindowsMap(Router* r, bool comReady, long port, bool* removeAtEnd, int* back, std::string* detail)
 {
+    *back = coopupnp::kBackNone;
     const std::string& client = r->homeIp;
     const std::string desc = coopupnp::Description(port);
     const int found = FindRouter(r, comReady, !client.empty(), detail);
@@ -527,7 +627,21 @@ int WindowsMap(Router* r, bool comReady, long port, bool* removeAtEnd, std::stri
         }
         if (ex != 0) ex->Release();
         const int act = coopupnp::ActionFor(coopupnp::ClassifyExisting(exists, exClient, exPort, client, port));
-        if (act == coopupnp::kActKeep)
+        const int step = coopupnp::WindowsStep(act, exDesc, g_upTimeLimitedOnly);
+        if (step == coopupnp::kWinRemoveOurs)
+        {
+            /* an entry of ours with no lease - the game's, handed to this world, or a crashed game's: this world cannot
+               hold it, and nothing else would remove it */
+            const HRESULT hrRm = r->col->Remove(port, proto);
+            *back = SUCCEEDED(hrRm) ? coopupnp::kBackDone : coopupnp::kBackFailed;
+            *removeAtEnd = !SUCCEEDED(hrRm);
+            *detail = "an entry of ours with no time limit is on the port (" + DescForLog(exDesc) + ") - "
+                    + (SUCCEEDED(hrRm) ? std::string("removed") : "not removed (Remove, HRESULT " + Hr(hrRm) + "): held only to be removed")
+                    + "; a world kept running takes only openings with a time limit";
+        }
+        else if (step == coopupnp::kWinNoAdd)
+            *detail = "nothing added: this route takes no lease, and a world kept running takes only openings with a time limit";
+        else if (act == coopupnp::kActKeep)
         {
             rr = coopupnp::kRrAlready;
             *removeAtEnd = coopupnp::RemoveAtEnd(act, exDesc);
@@ -586,12 +700,13 @@ bool WindowsUnmap(Router* r, bool comReady, long port, std::string* why)
 
 /* One attempt for `port`: the routes in upnpplan.h's order until one settles it.  Returns the outcome; *removeAtEnd,
    *route (the route that settled it) and *lease (its granted seconds, 0 = permanent). */
-int MapPort(Router* r, bool comReady, long port, bool* removeAtEnd, int* route, long* lease)
+int MapPort(Router* r, bool comReady, long port, bool* removeAtEnd, int* route, long* lease, int* handBack)
 {
     ::InterlockedIncrement64(&g_upAsked);
     *removeAtEnd = false;
     *route = coopupnp::kRouteNone;
     *lease = 0;
+    *handBack = coopupnp::kBackNone;   /* kBackFailed: an opening with no time limit the router would not take back, held only to be removed */
     const DWORD t0 = ::GetTickCount();
     const std::string what = std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(port);
     net::HomeNet h;
@@ -604,6 +719,7 @@ int MapPort(Router* r, bool comReady, long port, bool* removeAtEnd, int* route, 
     r->nonceMade = false;
     r->pmpSpeaks = false;
     r->mapAsked = true;
+    g_upRenewNoteShown = false;
     DebugLog("[UPNP] asking the router to forward " + what + " to this computer - home network: " + h.how);
 
     int out = coopupnp::kOutNoRouter;
@@ -616,20 +732,36 @@ int MapPort(Router* r, bool comReady, long port, bool* removeAtEnd, int* route, 
         bool rm = false;
         long granted = 0;
         int rr = coopupnp::kRrUnavailable;
-        if (rt == coopupnp::kRouteIgd) rr = IgdMap(r, port, &rm, &granted, &detail);
+        int back = coopupnp::kBackNone;
+        if (rt == coopupnp::kRouteIgd) rr = IgdMap(r, port, &rm, &granted, &detail, &back);
         else if (rt == coopupnp::kRoutePcp || rt == coopupnp::kRoutePmp)
         {
             unsigned long life = 0;
             if (r->gateway.empty()) detail = "the home adapter names no router address";
             else rr = (rt == coopupnp::kRoutePcp) ? PcpAsk(r, port, (unsigned long)coopupnp::kAskLeaseSeconds, &life, &detail)
                                                   : PmpAsk(r, port, (unsigned long)coopupnp::kAskLeaseSeconds, &life, &detail);
+            if (rr == coopupnp::kRrMapped && !coopupnp::GrantKept(life, g_upTimeLimitedOnly))
+            {
+                back = HandBackNoLimit(r, rt, port, life, &detail);
+                rm = (back == coopupnp::kBackFailed);
+                rr = coopupnp::kRrRefused;
+            }
             if (rr == coopupnp::kRrMapped) { rm = true; granted = coopupnp::ClampLease((long)(life > 0x7FFFFFFFul ? 0x7FFFFFFFul : life)); }
             if (rr != coopupnp::kRrNoAnswer && rr != coopupnp::kRrUnavailable) r->pmpSpeaks = true;
         }
-        else rr = WindowsMap(r, comReady, port, &rm, &detail);
+        else rr = WindowsMap(r, comReady, port, &rm, &back, &detail);
         DebugLog("[UPNP] " + std::string(coopupnp::RouteWord(rt)) + ": " + what + ": " + coopupnp::RouteResultWord(rr) + " - "
                  + detail + " (" + Ms(t1) + ")");
         out = coopupnp::FoldOutcome(out, rr);
+        if (back == coopupnp::kBackFailed)
+        {
+            /* an opening with no time limit the router would not take back: held only to be removed (upnpplan.h AfterAsk);
+               no further route is asked, so no second opening is made */
+            *route = rt;
+            *removeAtEnd = true;
+            *handBack = back;
+            break;
+        }
         if (coopupnp::RouteSettles(rr))
         {
             *route = rt;
@@ -651,14 +783,25 @@ int MapPort(Router* r, bool comReady, long port, bool* removeAtEnd, int* route, 
     return out;
 }
 
-/* Asks the route that holds `port` again, for kAskLeaseSeconds, so its lease does not run out.  1 = accepted (*granted =
-   the new lease), 0 = not accepted (asked again sooner), -1 = the port is forwarded elsewhere now - no longer ours. */
+/* The kept world's window says the router did not open the port (line kNoteFailed), once per opening. */
+void ShowRenewFailed(long port)
+{
+    if (g_upRenewNoteShown) return;
+    g_upRenewNoteShown = true;
+    if (g_upNote != 0) g_upNote(coopupnp::kNoteFailed, port);
+}
+
+/* Asks the route that holds `port` again, for kAskLeaseSeconds, so its lease does not run out.  Returns coopupnp::kRenew*:
+   accepted (*granted = the new lease), not accepted (asked again sooner), lost (the port is forwarded elsewhere now - no
+   longer ours), or, in a world kept running, handed back / not handed back (the renewal came back with no time limit or a
+   longer one than asked: upnpplan.h AfterHandBack). */
 int RenewPort(Router* r, int route, long port, long lease, long* granted)
 {
     const DWORD t0 = ::GetTickCount();
     const std::string what = std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(port);
     std::string detail;
     bool ok = false, lost = false;
+    int back = coopupnp::kBackNone;
     *granted = lease;
     if (route == coopupnp::kRouteIgd)
     {
@@ -675,6 +818,7 @@ int RenewPort(Router* r, int route, long port, long lease, long* granted)
                 if (IgdFind(r, &why) == 1) { asked = coopupnp::kAskLeaseSeconds; rr = IgdAdd(r, port, &asked, &detail); }
                 else detail += "; " + why;
             }
+            if (rr == coopupnp::kRrMapped) back = IgdLeaseReadBack(r, port, &detail);
             if (rr == coopupnp::kRrElsewhere)
             {
                 /* 718: the entry on the port is looked up first - one that is still this computer's and ours is kept
@@ -689,17 +833,26 @@ int RenewPort(Router* r, int route, long port, long lease, long* granted)
                 if (coopupnp::RenewConflictStillOurs(g == 1, (g == 1) ? swrouter::XmlValue(ans, "NewInternalClient") : std::string(),
                                                      exPort, exDesc, r->homeIp, port))
                 {
-                    asked = (swrouter::ReadNum(swrouter::XmlValue(ans, "NewLeaseDuration"), &left) && left > 0) ? left : lease;
-                    rr = coopupnp::kRrMapped;
-                    DebugLog("[UPNP] igd: " + what + ": the router answered 718 to the renewal, but its entry on the port is still"
-                             " this computer's and ours - kept");
+                    const bool leftRead = swrouter::ReadNum(swrouter::XmlValue(ans, "NewLeaseDuration"), &left);
+                    if (!coopupnp::LeaseKept(g_upTimeLimitedOnly, leftRead, left))
+                        back = IgdHandBack(r, port, "the router answered 718 to the renewal; its entry of ours on the port lists lease "
+                                           + Num((long long)left) + " s (no time limit, or longer than asked)", &detail);
+                    else
+                    {
+                        asked = (leftRead && left > 0) ? left : lease;
+                        rr = coopupnp::kRrMapped;
+                        DebugLog("[UPNP] igd: " + what + ": the router answered 718 to the renewal, but its entry on the port is"
+                                 " still this computer's and ours - kept");
+                    }
                 }
                 else if (g == 1) detail += "; the entry on that port: " + DescForLog(exDesc);
                 else detail += "; the entry on that port could not be looked up (" + w + ")";
             }
-            ok = (rr == coopupnp::kRrMapped);
-            lost = (rr == coopupnp::kRrElsewhere);
+            ok = (rr == coopupnp::kRrMapped) && back == coopupnp::kBackNone;
+            lost = (rr == coopupnp::kRrElsewhere) && back == coopupnp::kBackNone;
             if (ok) *granted = asked;
+            /* the router refused to lease the entry again: the kept world's window no longer says it is open */
+            if (coopupnp::RenewRefusedShowsFailed(g_upTimeLimitedOnly, route, rr, g_upRenewNoteShown)) ShowRenewFailed(port);
         }
     }
     else if (route == coopupnp::kRoutePcp || route == coopupnp::kRoutePmp)
@@ -709,10 +862,25 @@ int RenewPort(Router* r, int route, long port, long lease, long* granted)
                                                       : PmpAsk(r, port, (unsigned long)coopupnp::kAskLeaseSeconds, &life, &detail);
         ok = (rr == coopupnp::kRrMapped);
         lost = (rr == coopupnp::kRrElsewhere);
+        if (ok && !coopupnp::GrantKept(life, g_upTimeLimitedOnly))
+        {
+            /* the renewal came back with no time limit or a longer one than asked: handed back (upnpplan.h AfterHandBack) */
+            back = HandBackNoLimit(r, route, port, life, &detail);
+            ok = false;
+        }
         if (ok) *granted = (long)(life > 0x7FFFFFFFul ? 0x7FFFFFFFul : life);
     }
     else detail = "this route holds no lease";
     *granted = coopupnp::ClampLease(*granted);
+    if (back != coopupnp::kBackNone)
+    {
+        ::InterlockedIncrement64(&g_upRenewFailed);
+        ShowRenewFailed(port);
+        DebugLog("[UPNP] " + std::string(coopupnp::RouteWord(route)) + ": " + what + ": NOT renewed - " + detail + " (" + Ms(t0)
+                 + (back == coopupnp::kBackDone ? std::string("); nothing is held now")
+                                                : std::string("); held only to be removed - asked again soon and at the stop")));
+        return (back == coopupnp::kBackDone) ? coopupnp::kRenewHandedBack : coopupnp::kRenewNotHandedBack;
+    }
     if (ok)
     {
         ::InterlockedIncrement64(&g_upRenewed);
@@ -735,8 +903,9 @@ int RenewPort(Router* r, int route, long port, long lease, long* granted)
 
 /* Removes our entry for `port` by the route that holds it.  Whatever the answer, it is not tried again: a leased entry
    ends on its own when its lease runs out, and every entry carries our description, so the next host on that port
-   takes it over. */
-void UnmapPort(Router* r, bool comReady, long port, int route)
+   takes it over.  Returns what it came to, as a world server's note (coopupnp::kNoteRemoved / kNoteGone / kNoteNotRemoved /
+   kNoteLeft). */
+int UnmapPort(Router* r, bool comReady, long port, int route)
 {
     const DWORD t0 = ::GetTickCount();
     const std::string what = std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(port);
@@ -756,7 +925,7 @@ void UnmapPort(Router* r, bool comReady, long port, int route)
             if (next == coopupnp::kDelCheckGone)
             {
                 DebugLog("[UPNP] igd: " + what + ": already gone from the router (its lease ran out, or the router restarted)");
-                return;
+                return coopupnp::kNoteGone;
             }
             if (next == coopupnp::kDelCheckJudge)
             {
@@ -767,7 +936,7 @@ void UnmapPort(Router* r, bool comReady, long port, int route)
                 {
                     DebugLog("[UPNP] igd: " + what + ": the router's entry on that port is no longer ours (" + DescForLog(exDesc)
                              + ") - left as it is");
-                    return;
+                    return coopupnp::kNoteLeft;
                 }
             }
             if (next == coopupnp::kDelCheckUnchecked)
@@ -792,13 +961,12 @@ void UnmapPort(Router* r, bool comReady, long port, int route)
     {
         ::InterlockedIncrement64(&g_upRemoved);
         DebugLog("[UPNP] " + std::string(coopupnp::RouteWord(route)) + ": " + what + ": removed from the router (" + Ms(t0) + ")");
+        return coopupnp::kNoteRemoved;
     }
-    else
-    {
-        ::InterlockedIncrement64(&g_upFailed);
-        DebugLog("[UPNP] " + std::string(coopupnp::RouteWord(route)) + ": " + what + ": NOT removed - " + why + " (" + Ms(t0)
-                 + "); a leased entry ends with its lease, and the entry carries our description, so the next host on this port takes it over");
-    }
+    ::InterlockedIncrement64(&g_upFailed);
+    DebugLog("[UPNP] " + std::string(coopupnp::RouteWord(route)) + ": " + what + ": NOT removed - " + why + " (" + Ms(t0)
+             + "); a leased entry ends with its lease, and the entry carries our description, so the next host on this port takes it over");
+    return coopupnp::kNoteNotRemoved;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -1036,6 +1204,31 @@ int LookupFromSites(DWORD startMs, std::string* ip, std::string* source, std::st
     return 2;
 }
 
+/* Holds coopupnp::PortLockName(port) for one ask or one removal, against every other program on this computer that compiles
+   this file.  A lock that cannot be made is not waited for (the step goes on as before); one left by a program that ended
+   while holding it is taken over (WAIT_ABANDONED). */
+class PortLock
+{
+public:
+    explicit PortLock(long port) : h_(0)
+    {
+        h_ = ::CreateMutexA(0, FALSE, coopupnp::PortLockName(port).c_str());
+        if (h_ == 0)
+        {
+            DebugLog("[UPNP] the router lock for " + std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(port)
+                     + " could not be made, Windows error " + Num((long long)::GetLastError()) + " - the step goes on without it");
+            return;
+        }
+        const DWORD w = ::WaitForSingleObject(h_, INFINITE);
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) { ::CloseHandle(h_); h_ = 0; }
+    }
+    ~PortLock() { if (h_ != 0) { ::ReleaseMutex(h_); ::CloseHandle(h_); } }
+private:
+    HANDLE h_;
+    PortLock(const PortLock&);
+    PortLock& operator=(const PortLock&);
+};
+
 DWORD WINAPI UpnpWorker(LPVOID)
 {
     const HRESULT hrCom = ::CoInitializeEx(0, COINIT_MULTITHREADED);
@@ -1070,11 +1263,17 @@ DWORD WINAPI UpnpWorker(LPVOID)
             bool removeAtEnd = false;
             int route = coopupnp::kRouteNone;
             long lease = 0;
-            const int out = MapPort(&router, comReady, s.want, &removeAtEnd, &route, &lease);
+            int out = coopupnp::kOutNone;
+            int back = coopupnp::kBackNone;
+            {
+                PortLock lock(s.want);   /* no other program on this computer asks for or removes this port meanwhile */
+                out = MapPort(&router, comReady, s.want, &removeAtEnd, &route, &lease, &back);
+            }
             ::EnterCriticalSection(&g_upLock);
-            coopupnp::AfterMap(&g_upState, s.want, out, removeAtEnd, route, lease);
+            coopupnp::AfterAsk(&g_upState, s.want, out, removeAtEnd, route, lease, back);
             const long heldLease = (g_upState.held != 0) ? g_upState.lease : 0;
             ::LeaveCriticalSection(&g_upLock);
+            if (g_upNote != 0) g_upNote(coopupnp::NoteOfOutcome(out), s.want);
             renewArmedAt = ::GetTickCount();
             renewAfter = coopupnp::RenewAfterMs(heldLease, true);
             continue;
@@ -1082,11 +1281,17 @@ DWORD WINAPI UpnpWorker(LPVOID)
         if (step == coopupnp::kStepRenew)
         {
             long granted = s.lease;
-            const int renewed = RenewPort(&router, s.route, s.held, s.lease, &granted);
-            const bool ok = (renewed > 0);
+            int renewed = coopupnp::kRenewNotAccepted;
+            if (s.noLimit)
+            {
+                /* an opening with no time limit held only to be removed: its removal is asked again instead of a renewal */
+                PortLock lock(s.held);
+                renewed = coopupnp::RenewOfHandBack(UnmapPort(&router, comReady, s.held, s.route));
+            }
+            else renewed = RenewPort(&router, s.route, s.held, s.lease, &granted);
+            const bool ok = (renewed == coopupnp::kRenewAccepted);
             ::EnterCriticalSection(&g_upLock);
-            if (renewed < 0) coopupnp::AfterRenewLost(&g_upState);
-            else coopupnp::AfterRenew(&g_upState, ok, granted);
+            coopupnp::AfterRenewResult(&g_upState, renewed, granted);
             const long heldLease = (g_upState.held != 0) ? g_upState.lease : 0;
             ::LeaveCriticalSection(&g_upLock);
             renewArmedAt = ::GetTickCount();
@@ -1095,12 +1300,30 @@ DWORD WINAPI UpnpWorker(LPVOID)
         }
         if (step == coopupnp::kStepUnmap || step == coopupnp::kStepForget)
         {
-            if (step == coopupnp::kStepUnmap) UnmapPort(&router, comReady, s.held, s.route);
-            else DebugLog("[UPNP] " + std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(s.held)
-                          + ": hosting ended - the router's entry was not made by this mod, so it is left there");
+            /* the last look before a removal is sent, holding the port's lock: a hand-over to a world kept running that came
+               after the step was chosen leaves the entry to it (coopupnp::MayRemove), and that world's own ask waits for a
+               removal already sent to end */
+            bool remove = false;
+            int removal = 0;
+            if (step == coopupnp::kStepUnmap)
+            {
+                PortLock lock(s.held);
+                ::EnterCriticalSection(&g_upLock);
+                remove = coopupnp::MayRemove(g_upState, s.held);
+                ::LeaveCriticalSection(&g_upLock);
+                if (remove) removal = UnmapPort(&router, comReady, s.held, s.route);
+            }
+            const int note = coopupnp::NoteOfEnd(remove, removal, coopupnp::EndLease(s));
+            if (!remove) DebugLog("[UPNP] " + std::string(coopupnp::kProtocol) + " " + coopupnp::PortText(s.held)
+                          + ": hosting ended - the router's entry is not this program's to remove (made by hand, another device holds the"
+                            " port now, or it was handed to a world kept running), so it is left there");
+            if (g_upNote != 0) g_upNote(note, s.held);
             router.EndHosting();
             ::EnterCriticalSection(&g_upLock);
-            coopupnp::AfterUnmap(&g_upState);
+            /* a hand-over undone meanwhile (coopupnp::HandBack) made the entry this game's to remove again: it stays held, and
+               the next pass removes it */
+            const bool again = !remove && coopupnp::MayRemove(g_upState, s.held);
+            if (!again) coopupnp::AfterUnmap(&g_upState);
             ::LeaveCriticalSection(&g_upLock);
             renewAfter = 0;
             continue;
@@ -1281,6 +1504,64 @@ void UpnpHostOff(unsigned short port)
              + " " + coopupnp::PortText((long)port) + "; hosting goes on without it");
 }
 
+void UpnpHandOver(unsigned short port)
+{
+    if (::InterlockedCompareExchange(&g_upReady, 0, 0) == 0) return;   /* this game never asked the router: nothing to hand over */
+    bool taken = false;
+    long held = 0;
+    ::EnterCriticalSection(&g_upLock);
+    if (!g_upQuitting)
+    {
+        if (g_upServer != 0) { g_upRetired.push_back(g_upServer); g_upServer = 0; }
+        coopupnp::HandOver(&g_upState, (long)port);
+        held = g_upState.held;
+        taken = true;
+    }
+    ::LeaveCriticalSection(&g_upLock);
+    if (!taken) return;
+    ::SetEvent(g_upWake);
+    DebugLog("[UPNP] a world kept running is being started on " + std::string(coopupnp::kProtocol) + " " + coopupnp::PortText((long)port)
+             + " - it asks the router for itself, so this game's hosting ends here"
+             + (held == (long)port ? std::string("; the entry this game holds on that port is left for it") : std::string()));
+}
+
+void UpnpHandBack(unsigned short port)
+{
+    if (::InterlockedCompareExchange(&g_upReady, 0, 0) == 0) return;
+    ::EnterCriticalSection(&g_upLock);
+    coopupnp::HandBack(&g_upState, (long)port);
+    const long held = g_upState.held;
+    ::LeaveCriticalSection(&g_upLock);
+    ::SetEvent(g_upWake);
+    DebugLog("[UPNP] the world kept running on " + std::string(coopupnp::kProtocol) + " " + coopupnp::PortText((long)port)
+             + " was not started - the hand-over is undone"
+             + (held == (long)port ? std::string("; the entry this game holds on that port is this game's again") : std::string()));
+}
+
+void UpnpServeStart(unsigned short port, UpnpNoteFn note)
+{
+    if (!coopupnp::PortOk((long)port)) return;
+    g_upNote = note;   /* before EnsureWorker makes the worker, which reads it */
+    g_upTimeLimitedOnly = coopupnp::TimeLimitedOnly(coopupnp::kOwnerServer);   /* the same */
+    if (!EnsureWorker())
+    {
+        if (note != 0) note(coopupnp::kNoteFailed, (long)port);
+        return;
+    }
+    bool taken = false;
+    ::EnterCriticalSection(&g_upLock);
+    if (!g_upQuitting)
+    {
+        coopupnp::HostStart(&g_upState, (long)port);
+        taken = true;
+    }
+    ::LeaveCriticalSection(&g_upLock);
+    if (!taken) return;
+    ::SetEvent(g_upWake);
+    DebugLog("[UPNP] this world is kept running, so this world server asks the router itself to forward " + std::string(coopupnp::kProtocol)
+             + " " + coopupnp::PortText((long)port) + " - on the router thread; the entry is removed when this world server stops");
+}
+
 void UpnpQuitBegin()
 {
     if (::InterlockedCompareExchange(&g_upReady, 0, 0) == 0) return;
@@ -1291,17 +1572,34 @@ void UpnpQuitBegin()
     ::SetEvent(g_upWake);
 }
 
-void UpnpQuitWait()
+int UpnpNotClosedNote()
 {
-    if (::InterlockedCompareExchange(&g_upReady, 0, 0) == 0) return;
+    bool held = false;
+    long lease = 0;
+    if (::InterlockedCompareExchange(&g_upReady, 0, 0) != 0)
+    {
+        ::EnterCriticalSection(&g_upLock);
+        held = (g_upState.held != 0);
+        lease = coopupnp::EndLease(g_upState);
+        ::LeaveCriticalSection(&g_upLock);
+    }
+    return coopupnp::NotClosedNote(held, lease);
+}
+
+bool UpnpQuitWait()
+{
+    if (::InterlockedCompareExchange(&g_upReady, 0, 0) == 0) return true;
     const DWORD t0 = ::GetTickCount();
     const DWORD w = ::WaitForSingleObject(g_upThread, coopupnp::kQuitWaitMs);
     const std::string ms = Num((long long)(DWORD)(::GetTickCount() - t0));
     if (w == WAIT_OBJECT_0)
+    {
         DebugLog("[UPNP] quit: the router thread finished in " + ms + " ms");
-    else
-        DebugLog("[UPNP] quit: the router has not finished after " + ms + " ms - the game ends anyway; an entry left on the"
+        return true;
+    }
+    DebugLog("[UPNP] quit: the router has not finished after " + ms + " ms - the game ends anyway; an entry left on the"
                  " router carries our description, so the next host on that port takes it over");
+    return false;
 }
 
 long UpnpAddrAsk(unsigned short port)

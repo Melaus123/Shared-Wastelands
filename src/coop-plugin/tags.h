@@ -25,5 +25,9 @@ void TagsTitleTick();
 void TagsSetOn(bool on);
 // The `tags lift <units>` verb: the height above the feet the label is drawn at (0 = back to automatic).
 void TagsSetLift(float lift);
+// MAIN THREAD: which parts the tag shows - the player's name, the character's own name, the faction or team name. All on at
+// start; the pause menu's MULTIPLAYER window (ui.cpp) sets them from this computer's tags.cfg on the first frame of a multiplayer
+// world and again on each of its tick boxes. A part switched off is left out; all three off hides the tag. Every tag is built again.
+void TagPartsSet(bool player, bool character, bool faction);
 std::string TagsReportLine();   // "[TAGS] REPORT ..."
 }

@@ -27,12 +27,15 @@
 #include "worldsync.h"
 #include "../common/lostcopy.h"   /* kCr*: which creation refusals would repeat on a re-send */
 #include "../common/templatekey.h"   /* T-922: a template travels by its stringID, a shown name only as the fallback */
+#include "../common/spimport.h"      /* T-1096 (owner 1234 e): a look-alike's copy id - made from its original, never found by name */
 #include "../common/stalecopy.h"  /* a repeat SPAWN over a stale copy; a copy whose owner is in an area not loaded here */
 #include "../common/poselayer.h"  /* T-307: the layer table's held state as a pose - the pick and the settle rule */
+#include "../common/aimstamp.h"   /* T-330: the owner's aim stamp, its word and the copy's step */
 #include "../common/twinsleep.h"  /* a save-born non-player twin no game drives here: put to sleep or taken */
 #include "store.h"   // P1: StoreBindPlatoon
 #include "../common/squadevent.h"   // T-1084: sqevent::HomeChanged - a home hand that changed marks the squad's record due
 #include "../common/squadbirth.h"   // CONTEXT's birth word
+#include "../common/spawnage.h"   // the spawncontainer modes (kSpawnContainer*)
 namespace coop { void LimbsForgetUid(unsigned int uid); void LimbsWorldTeardown(); }   /* LIMBS: clothing.cpp */
 namespace coop { void LiveMemoForgetAddress(const void* obj); }   /* beside LiveCharacter: a registered address is asked afresh */
 namespace coop { int GroundTerrainHeightAt(float x, float z, float* out); }   /* combat.cpp: the terrain height at (x,z) - 1 a height, 0 no terrain, -1 not read */
@@ -45,6 +48,11 @@ namespace coop { void P169NoteCopyDestroy(unsigned int uid); }   /* PROBE P169: 
 namespace coop { std::string StoreP172SquadRow(void* platoon); std::string ItP172CaptFields(void* c); }
 // PROBE-END: P172
 #endif
+#endif
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+namespace coop { void P210NoteMade(unsigned int uid, int kind); void P210CopyDestroyBegin(unsigned int uid, void* c); void P210CopyDestroyEnd(unsigned int uid, const char* what, int destroyed); }   /* combat.cpp */
+// PROBE-END: P210
 #endif
 #include "worldgen.h"   // F322: DestroyLocalObject   // F318: TrackForLiveness - P034 must cover BOTH instances   // P031: the roster is keyed by the engine's own handle
 #include "appearance.h"
@@ -146,6 +154,8 @@ namespace coop {
 /* T-304 (3): the stand-in reference for building the other game's characters when this game's watched player is gone -
    defined beside IsPlayerFactionPod, declared here at coop scope so the anonymous namespace below sees THIS function (C2668). */
 ::Character* SpawnFallbackReference();
+/* TEST-ONLY `spawncontainer new`: a fresh empty squad of a faction (hire.cpp, beside splitsquad) - declared at coop scope, as defined */
+int SpawnEmptySquadFor(::Faction* f, const Ogre::Vector3& pos, void** activeOut, std::string* sid, std::string* why);
 long long g_spawnRefFallback = 0, g_spawnBuiltNoRef = 0, g_spawnRefusedNoRef = 0;   /* T-304 (3): [M1] REPORT */
 
 namespace {
@@ -176,6 +186,9 @@ std::string g_spawnFactionName;
 // always kept the platoon and is measured to stay put. Default TRUE, i.e. the OPPOSITE of the
 // original F103 behaviour, because null is the variant T029 measured running away.
 bool g_spawnKeepContainer = true;
+// TEST-ONLY (`spawncontainer new`): an explicit-faction local spawn goes into a fresh empty squad of that faction, made here
+// by the engine's Faction::spawnEmptySquad - so a test's character is not placed into a nearby squad another game runs.
+bool g_spawnNewSquad = false;
 
 coopuid::UidMinter g_uidMint;   // M4 (owner 203, 2026-09-29): the 22-bit counter (last minted; monotonic, never wraps) and the counted refusals; the slot is read at each mint
 long long g_uidRowSkipped = 0, g_uidBlockBadReply = 0, g_uidBlockFailed = 0, g_uidNoSeatAnswers = 0; bool g_uidNoSeatSaid = false;   // M4 fold: minted uids skipped for an existing row (must read 0); UID_BLOCK answers malformed / for another slot; FAILED answers
@@ -822,11 +835,13 @@ GameData* ResolveTemplate(const std::string& sid, const std::string& name, templ
     if (l->tried)
     {
         data = coop::GameWorldPtr()->gamedata.getData(sid);
+        if ((data == 0 || !PlausibleObject(data)) && spimport::IsCopySid(sid)) data = (GameData*)coop::StoreLookalikeEnsure(sid);   /* T-1096 (owner 1234 e): a look-alike is made here from its original */
         l->idFound = data != 0 && PlausibleObject(data);
         if (l->idFound) l->idType = (int)data->type;
         l->idTypeOk = l->idFound && templatekey::TypeAccepted(l->idType, (int)RECORD_CHARACTER, (int)RECORD_ANIMAL);
     }
     if (!templatekey::NameLookupNeeded(*l)) return data;
+    if (spimport::IsCopySid(sid)) return 0;   /* T-1096 (owner 1234 e): never by its shown name - that would find the named original */
     l->nameTried = !name.empty();
     if (!l->nameTried) return 0;
     data = coop::GameWorldPtr()->gamedata.findRecordByName(name, RECORD_CHARACTER);
@@ -1100,6 +1115,11 @@ bool CreateAt(unsigned int uid, const std::string& templateName, const std::stri
         return false;
     }
     g_spawned[uid] = obj;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+    coop::P210NoteMade(uid, 1);   /* the copy's make time, for COPYDESTROY's msSinceMade */
+// PROBE-END: P210
+#endif
     g_twinUids.erase(uid);   /* a copy built from a SPAWN is no save-born body: a twin mark an earlier body of this uid left goes */
     coop::ItemOwnParkNoteUid(uid);   /* stolen marks parked for this uid are tried at the next ItemsTick */
     if (usedFallback) ++g_spawnRefFallback;   /* T-304 (3) fold 1: a built and registered copy only */
@@ -1397,14 +1417,58 @@ bool SpawnTemplate(const std::string& templateName, float dx, float dz,
         }
     }
 
+    // TEST-ONLY `spawncontainer new`: the person goes into a fresh empty squad of the named faction, made here by the engine
+    // (Faction::spawnEmptySquad), so the engine cannot place it into a nearby squad of that faction another game runs. Only an
+    // NPC faction: a player's faction would make a player squad. MAIN THREAD - the command channel, in the main loop after the
+    // engine's own AI-worker wait, where CreateAt's factory->create runs too.
+    RootObjectContainer* newSquad = 0;
+    std::string newSid;
+    if (g_spawnNewSquad && !g_spawnFactionName.empty())
+    {
+        ::Faction* nf = ResolveWireFaction(g_spawnFactionName);
+        std::string why;
+        if (EngineWritesBlocked()) why = "a world is loading or tearing down";
+        else if (!PlausibleObject(nf)) why = "the faction '" + g_spawnFactionName + "' did not resolve";
+        else if (AnyPlayersFaction(nf)) why = "the faction '" + g_spawnFactionName + "' is a player's faction - its new squad would be a player squad";
+        else
+        {
+            void* ap = 0;
+            if (SpawnEmptySquadFor(nf, pos, &ap, &newSid, &why) == 1) newSquad = (RootObjectContainer*)ap;
+        }
+        if (newSquad == 0)
+        {
+            ErrorLog("[M1] spawncontainer new: no new squad - " + why + "; nothing was created (uid " + S(uid) + " unused)");
+            return false;
+        }
+    }
+
     // The local spawn is where the per-instance modifier state is READ - once, here - and
     // from this point it travels explicitly rather than being re-read on the far side.
-    if (!CreateAt(uid, templateName, std::string(), pos, "local", g_spawnFactionName, g_spawnKeepContainer, 0, 0, 0.0f))
+    if (!CreateAt(uid, templateName, std::string(), pos, "local", g_spawnFactionName, g_spawnKeepContainer, newSquad, 0, 0.0f))
         return false;
 
     // We made it, so we are its authority - recorded unconditionally, session or not.
     net::SetLocalOwner(uid);
     coop::ClearNearNoteRunUid(uid);   /* owner 1205 a: a lever's spawn is the run's own - the TEST-ONLY clearnear keeps its squad */
+
+    if (newSquad != 0)
+    {
+        // The new squad must hold only this person, as its leader, and be no player squad; this game runs the person, so the
+        // squad's leader is run here and no follow-leader hand-over moves it to another game.
+        ::Character* made = FindSpawned(uid);
+        SquadView sv;
+        const int read = (made != 0 && PlausibleObject(made)) ? ReadSquadAt((void*)newSquad, &sv) : 0;
+        const int inIt = (made != 0 && SquadActivePlatoonOf(made) == (void*)newSquad) ? 1 : 0;
+        const int leads = (read == 1 && sv.leader == made) ? 1 : 0;
+        const int ok = (read == 1 && inIt == 1 && leads == 1 && sv.count == 1 && sv.playerFlag == 0 && net::IsUidMine(uid)) ? 1 : 0;
+        std::ostringstream ls;
+        ls.imbue(std::locale::classic());
+        ls << "[M1] spawncontainer new: uid " << uid << " made into NEW squad '" << newSid << "' (" << P((const void*)newSquad)
+           << ") faction '" << g_spawnFactionName << "' inSquad=" << inIt << " leader=" << leads << " members="
+           << (read == 1 ? sv.count : -1) << " playerSquad=" << (read == 1 ? sv.playerFlag : -1)
+           << " runHere=" << (net::IsUidMine(uid) ? 1 : 0) << (ok ? " - OK" : " - NOT as asked");
+        if (ok) DebugLog(ls.str()); else ErrorLog(ls.str());
+    }
 
     if (replicate)
     {
@@ -1458,6 +1522,128 @@ bool SpawnTemplateNear(const std::string& templateName, unsigned int anchorUid, 
     WatchLocalRoll(uid);
     if (uidOut) *uidOut = uid;
     return true;
+}
+
+/* spawn.h. SpawnTemplateNear's creation without its SPAWN. */
+bool SpawnOwnLocalNear(const std::string& templateName, const std::string& templateSid, unsigned int anchorUid, float dx, float dz,
+                       const std::string& factionName, unsigned int* uidOut, ::Character** charOut)
+{
+    if (uidOut) *uidOut = 0;
+    if (charOut) *charOut = 0;
+    ::Character* anchor = FindSpawned(anchorUid);
+    Ogre::Vector3 base(0.0f, 0.0f, 0.0f);
+    if (anchor == 0 || !SafeReadPosition(anchor, &base))
+    {
+        ErrorLog("[M1] spawn (own, near) refused: uid " + S(anchorUid) + " is not a character with a readable position on this game");
+        return false;
+    }
+    Ogre::Vector3 pos(base.x + dx, base.y, base.z + dz);
+    const unsigned int uid = AllocateUid();
+    if (uid == 0)
+    {
+        ErrorLog(std::string("[M1] spawn (own, near) refused: no uid could be minted - ") + coopuid::UidMintWords(g_uidMint.last)
+                 + ". Nothing was created.");
+        return false;
+    }
+    if (!CreateAt(uid, templateName, templateSid, pos, "local", factionName, false, 0, 0, 0.0f))
+        return false;
+    net::SetLocalOwner(uid);
+    coop::ClearNearNoteRunUid(uid);   /* the run's own spawn - kept by the TEST-ONLY clearnear */
+    if (uidOut) *uidOut = uid;
+    if (charOut) *charOut = FindSpawned(uid);
+    return true;
+}
+
+/* spawn.h. CreateAt's factory call alone: no uid, no row in the spawn index, no SPAWN. */
+::Character* SpawnPlainNear(const std::string& templateSid, const std::string& templateName, ::Character* anchor, float dx, float dz,
+                            const std::string& factionName)
+{
+    if (coop::GameWorldPtr() == 0) { ErrorLog("[M1] spawn (plain) refused: no GameWorld"); return 0; }
+    Ogre::Vector3 base(0.0f, 0.0f, 0.0f);
+    if (anchor == 0 || !SafeReadPosition(anchor, &base))
+    {
+        ErrorLog("[M1] spawn (plain) refused: the anchor is not a character with a readable position");
+        return 0;
+    }
+    templatekey::Lookup tl;
+    GameData* data = ResolveTemplate(templateSid, templateName, &tl);
+    if (data == 0 || templatekey::Verdict(tl) == templatekey::kTkRefused)
+    {
+        ErrorLog("[M1] spawn (plain) refused: no CHARACTER or RECORD_ANIMAL template '" + templateSid + "' ('" + templateName + "')");
+        return 0;
+    }
+    RootObjectFactory* factory = coop::GameWorldPtr()->objectFactory;
+    if (!PlausiblePtr(factory))
+    {
+        ErrorLog("[M1] spawn (plain) refused: objectFactory failed validation (value " + P(factory) + ")");
+        return 0;
+    }
+    Faction* faction = ResolveWireFaction(factionName);
+    if (!PlausibleObject(faction))
+    {
+        ErrorLog("[M1] spawn (plain) refused: faction '" + factionName + "' did not resolve");
+        return 0;
+    }
+    const Ogre::Vector3 pos(base.x + dx, base.y, base.z + dz);
+    Ogre::Quaternion rot = Ogre::Quaternion::IDENTITY;
+    RootObjectBase* obj = factory->create(data, pos, false, faction, rot, 0, 0, 0, false, 0, 0.0f);
+    if (obj == 0 || !PlausibleObject(obj))
+    {
+        ErrorLog("[M1] spawn (plain) FAILED: create returned " + P(obj));
+        return 0;
+    }
+    LiveCharacterBorn((Character*)obj);   // the factory made it this frame
+    const Ogre::Vector3 actual = ((Character*)obj)->worldPosition();
+    DebugLog("[M1] spawned with no uid, announced to nobody: '" + templateName + "' (" + templateSid + ") obj=" + P(obj)
+             + " ACTUAL=" + F1(actual.x) + "," + F1(actual.y) + "," + F1(actual.z) + " (squadtest)");
+    return (::Character*)obj;
+}
+
+/* spawn.h. The adoption sweep's announcement of one of this game's characters (worldsync.cpp), for a character made here. */
+bool SpawnAnnounceOwn(unsigned int uid)
+{
+    if (!net::IsUidMine(uid)) return false;
+    ::Character* c = FindSpawned(uid);
+    if (!PlausibleObject(c) || !PlausibleObject(*(void**)((char*)c + 0x448))) return false;   // the adoption sweep's own guard
+    GameData* gd = c->getRecordDirect();
+    Faction* f = c->getOwnerFactionDirect();
+    if (!PlausibleObject(gd) || !PlausibleObject(f)) return false;
+    const Ogre::Vector3 pos = c->worldPosition();
+    SendContextFor(uid, c);
+    if (!net::SendSpawn(uid, gd->name, pos.x, pos.y, pos.z, WireFactionName(f, true), false, c)) return false;
+    WatchLocalRoll(uid);
+    return true;
+}
+
+/* spawn.h. */
+void* SpawnCharacterRecord(const std::string& sid, std::string* name)
+{
+    if (coop::GameWorldPtr() == 0 || !templatekey::TryAsId(sid)) return 0;
+    GameData* gd = coop::GameWorldPtr()->gamedata.getData(sid);
+    if (gd == 0 || !PlausibleObject(gd) || gd->type != RECORD_CHARACTER || gd->name.empty()) return 0;
+    *name = gd->name;
+    return gd;
+}
+
+namespace {
+int SquadLeaderLivingPod(::Character* c)   // 1 a living member of this game's player faction, 0 not or unreadable
+{
+    __try { return (IsPlayerFaction(c->getOwnerFactionDirect()) && !c->hasDied()) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+} // namespace
+
+/* spawn.h. */
+::Character* SpawnFirstPlayerCharacter()
+{
+    ::Character* watched = GetTarget();
+    if (PlausibleObject(watched) && SquadLeaderLivingPod(watched) == 1) return watched;
+    if (!PlausiblePtr(coop::GameWorldPtr())) return 0;
+    const GameHashSet< ::Character*>::type& all = coop::GameWorldPtr()->activeCharacters();
+    if (all.size() > 20000) return 0;   // the census's own bound: an implausible list is not walked
+    for (GameHashSet< ::Character*>::type::const_iterator it = all.begin(); it != all.end(); ++it)
+        if (PlausibleObject(*it) && SquadLeaderLivingPod(*it) == 1) return *it;
+    return 0;
 }
 
 /* T-556 (resurrect.cpp): a new character of this player's own faction made at `pos` into `squad` (the shared creation core,
@@ -3300,10 +3486,18 @@ static int RemoveLocalCopy(unsigned int uid, ::Character* c, const char* what, b
     }
     const void* prevSelf = g_selfDespawnObj;
     g_selfDespawnObj = c;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+    coop::P210CopyDestroyBegin(uid, c);   /* the hull and build state, read before the destroy */
+// PROBE-END: P210
+#endif
     bool destroyed = DestroyLocalObject(c);   // 3
     g_selfDespawnObj = prevSelf;
 #ifdef SW_DEV_BUILD
     if (destroyed) coop::P169NoteCopyDestroy(uid);   /* PROBE P169 */
+// PROBE-START: P210
+    coop::P210CopyDestroyEnd(uid, what, destroyed ? 1 : 0);
+// PROBE-END: P210
 #endif
     // mirror1 (crash T487) C: the copy is gone, so its row is released (4). AFTER the destroy, because
     // the destroy detour identifies our own destruction through this row. A copy the engine refused to
@@ -4146,8 +4340,17 @@ bool SetSpawnFaction(const std::string& factionName)
     return true;
 }
 
+void SetSpawnContainerMode(int mode)
+{
+    if (mode != coopspawn::kSpawnContainerNew) { SetSpawnContainer(mode != coopspawn::kSpawnContainerNull); return; }
+    g_spawnNewSquad = true;
+    g_spawnKeepContainer = true;   /* overridden by the new squad whenever one is made (CreateAt's forced container) */
+    DebugLog("[M1] explicit-faction local spawns will use container=a NEW empty squad of that faction (spawncontainer new, TEST-ONLY)");
+}
+
 void SetSpawnContainer(bool keep)
 {
+    g_spawnNewSquad = false;
     g_spawnKeepContainer = keep;
     DebugLog(std::string("[M1] explicit-faction spawns will use container=")
              + (keep ? "reference platoon (kept)"
@@ -5231,7 +5434,7 @@ int SnapshotState(unsigned int uid, float* parts, int maxParts, float* blood,
     // positive evidence. ApplyLatch reads only bits 0-5.
     if (GetupIsRagdoll(c) != 0) bits |= coopgetup::kStateOwnerRagdollBit;
     bits = coopsneak::WithSneak(bits, SneakRead(c));   // the stealth mode rides as bit 7 (sneakwire.h); unreadable = not sneaking
-    bits |= StanceStateBits(c);   // the six stance buttons ride as bits 8-13, bit 14 = read (statewire.h WithStance); the ranged mode as bits 15-16 (WithRangedMode)
+    bits |= StanceStateBits(c);   // the six stance buttons ride as bits 8-13, bit 14 = read (statewire.h WithStance); the ranged mode as bits 15-16 (WithRangedMode), the aim as bits 17-18 (WithAim), the reload as bits 19-20 (WithReload)
     if (latchBits)  *latchBits  = bits;
     if (nextKnockoutAt) *nextKnockoutAt = nk;
     if (koTimer)    *koTimer    = kt;
@@ -7302,11 +7505,16 @@ unsigned long long kStopActionRva = 0; static coop::AddrReg kStopActionRva_reg("
    entries does not stop the mod). AnimationClass layer play (anim, AnimationData*, float speed in xmm2, int layer, float on
    the stack) - decomp_5b7030.txt:2-3, call sites decomp_51c920.txt:46 / decomp_353450.txt:106 (xmm2 / r9d / [rsp+0x20], Read). */
 unsigned long long kAnimLayerPlayRva = 0; static coop::AddrReg kAnimLayerPlayRva_reg("AnimLayerPlay", &kAnimLayerPlayRva);   /* Steam_1.0.65 0x5B7030, 1.0.68 0x5B7AC0 */
+/* T-330 (common/aimstamp.h): the engine's aim code - its layer plays are stamped (owner) and it is called for a copy (combat.cpp
+   AimCopyAfterUpdate), so the row is strict. (RangedCombatClass*, unused, const Vector3* target position, target) -
+   decomp_51da50.txt. */
+unsigned long long kRangedAimAnimRva = 0; static coop::AddrReg kRangedAimAnimRva_reg("RangedAimAnim", &kRangedAimAnimRva);   /* Steam_1.0.65 0x51DA50, 1.0.68 0x51E4E0 */
 unsigned long long kAnimCtlIdleRva = 0; static coop::AddrReg kAnimCtlIdleRva_reg("AnimCtlIdle", &kAnimCtlIdleRva, coop::kAddrUseCallOnly);   /* idle chooser, Steam_1.0.65 0x51C920, 1.0.68 0x51D3B0 */
 unsigned long long kAnimCtlLocoBlendRva = 0; static coop::AddrReg kAnimCtlLocoBlendRva_reg("AnimCtlLocoBlend", &kAnimCtlLocoBlendRva, coop::kAddrUseCallOnly);   /* walk / run blend, Steam_1.0.65 0x51CE50, 1.0.68 0x51D8E0 */
 unsigned long long kAnimCtlHeadTurnRva = 0; static coop::AddrReg kAnimCtlHeadTurnRva_reg("AnimCtlHeadTurn", &kAnimCtlHeadTurnRva, coop::kAddrUseCallOnly);   /* head turn, Steam_1.0.65 0x5B79A0, 1.0.68 0x5B8430 */
 unsigned long long kAnimCtlOtherRva = 0; static coop::AddrReg kAnimCtlOtherRva_reg("AnimCtlOther", &kAnimCtlOtherRva, coop::kAddrUseCallOnly);   /* role unread, treated as a controller, Steam_1.0.65 0x5F0C10, 1.0.68 0x5F16A0 */
 unsigned long long kAnimCtlMainSlotFillRva = 0; static coop::AddrReg kAnimCtlMainSlotFillRva_reg("AnimCtlMainSlotFill", &kAnimCtlMainSlotFillRva, coop::kAddrUseCallOnly);   /* the main-slot fill under playAction, Steam_1.0.65 0x51E020, 1.0.68 0x51EAB0 */
+static unsigned long long kRefuseBedAnchorRva = 0; static coop::AddrReg kRefuseBedAnchorRva_reg("CombatClass_currentTarget", &kRefuseBedAnchorRva, coop::kAddrUseCallOnly);   /* only read: places the bed refuse entry (poselayer.h RefuseBedStart), Steam_1.0.65 0x33A2A0, 1.0.68 0x33A2E0 */
 /* the layer-only tasks (Steam 1.0.65 / 1.0.68; five rows are shared with the mod's own task hooks, which keep them strict) */
 const int kLayerTasks = 14;
 unsigned long long g_layerTaskRva[kLayerTasks] = { 0 };
@@ -7433,6 +7641,13 @@ LayerCaptureFn g_layerCapture = 0;      // RtlCaptureStackBackTrace (ntdll), 0 =
 const int kLayerStackDepth = 8;
 int g_layerStartOn = 0;                 // 1 the hook is in and every controller's code was found; 0 the layer rule refuses every pick
 poselayer::StartTable g_layerStarts;    // ANY THREAD writes (the detour), MAIN THREAD reads
+// T-330: the aim code's pieces and its stamps (common/aimstamp.h). The pieces are written once at install, before the hook goes
+// in; the count is set last.
+const int kAimRangeCap = 8;
+poselayer::Range g_aimRanges[kAimRangeCap];
+volatile int g_aimRangeCount = 0;       // 0 = no row or not found: no stamp is written, no owned character's aim is known
+coopaim::StampTable g_aimStamps;        // ANY THREAD writes (the detour) and reads
+unsigned long long g_aimCodeAddr = 0;   // the aim code in this game, 0 = no table row (MAIN THREAD writes once at install)
 poselayer::Range g_layerTaskRanges[poselayer::kRangeCap];
 int g_layerTaskRangeCount = 0;
 poselayer::Range g_layerCtlRanges[poselayer::kRangeCap];
@@ -7448,8 +7663,11 @@ long long g_layerOutsideLost = 0;       // detour: ... and no frame inside the g
 long long g_layerNoteEvicted = 0;       // detour: the pair's slots were all taken - a note pushed out (table full)
 long long g_layerNoteDropped = 0;       // detour: every slot of the pair's window stayed busy with other writers - not noted
 long long g_poseLayerRefusedCtl = 0;    // owner: a looped full-weight layer-1 pick refused - a controller started it
-long long g_poseLayerRefusedUnknown = 0;   // owner: ... refused - an unknown caller started it
 long long g_poseLayerRefusedNone = 0;   // owner: ... refused - no start note (hook off, started before it, or pushed out)
+long long g_poseLayerAllowedUnknown = 0;   // owner: T-890 decision 1236 a - a layer pose SENT whose starter is game code not on the refuse list
+long long g_poseLayerAllowedUnknownLogged = 0;   // owner: T-890 - 'layer send allowed unknown' lines printed
+const long long kPoseLayerAllowedUnknownLogLimit = 20;
+std::set<std::string> g_poseLayerAllowedUnknownSeen;   // owner: T-890 - the 'name|caller rva' keys already logged (MAIN THREAD)
 int g_layerOutsideLogged = 0;           // MAIN THREAD: the 'most calls come from outside the game' line printed
 
 void detour_animLayerPlay(void* anim, void* rec, float speed, int layer, float weight)
@@ -7476,6 +7694,9 @@ void detour_animLayerPlay(void* anim, void* rec, float speed, int layer, float w
             if (at >= 0) ret = frames[at];
             else ::InterlockedIncrement64(&g_layerOutsideLost);
         }
+        const int nAim = g_aimRangeCount;
+        if (kind != poselayer::kCallerNone && nAim > 0 && poselayer::InRanges(ret, g_aimRanges, nAim) != 0)
+            coopaim::StampNote(&g_aimStamps, anim, ::GetTickCount());   // the aim code raised this character's gun just now
         const unsigned int rv = (kind != poselayer::kCallerNone) ? (unsigned int)(ret - g_layerImageBegin) : 0u;
         const int r = poselayer::StartNote(&g_layerStarts, anim, rec, kind, rv, ::GetTickCount());
         if (r != poselayer::kNoteSame && r != poselayer::kNoteDropped)
@@ -7492,6 +7713,43 @@ void detour_animLayerPlay(void* anim, void* rec, float speed, int layer, float w
 
 struct PoseLayerRf { DWORD begin; DWORD end; DWORD unwind; };   /* an x64 function-table entry (RUNTIME_FUNCTION) */
 const int kLayerCallerCap = 64;
+
+// T-330 (MAIN THREAD, at install): the pieces [begin, end) of the game function starting at fn, as image addresses - every
+// function-table entry whose unwind chain leads back to fn's entry (as PoseLayerScanImage reads the chains). The count, 0 none
+// or no function table, -1 more than cap or a fault. POD only (C2712).
+int AimRangesPod(unsigned int fn, poselayer::Range* out, int cap)
+{
+    const unsigned int kUnwChainInfo = 0x4;
+    int found = 0;
+    __try
+    {
+        const unsigned char* image = (const unsigned char*)::GetModuleHandleA(0);
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(image + ((const IMAGE_DOS_HEADER*)image)->e_lfanew);
+        const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (dir.VirtualAddress == 0 || dir.Size < sizeof(PoseLayerRf)) return 0;
+        const PoseLayerRf* rf = (const PoseLayerRf*)(image + dir.VirtualAddress);
+        const int n = (int)(dir.Size / (unsigned int)sizeof(PoseLayerRf));
+        for (int i = 0; i < n; ++i)
+        {
+            const PoseLayerRf* root = &rf[i];
+            for (int depth = 0; depth < 8; ++depth)
+            {
+                const unsigned int ud = root->unwind;
+                if ((ud & 1u) != 0) { root = (const PoseLayerRf*)(image + (ud & ~1u)); continue; }
+                const unsigned char* ui = image + ud;
+                if ((((unsigned int)ui[0] >> 3) & kUnwChainInfo) == 0) break;
+                root = (const PoseLayerRf*)(ui + 4 + (((unsigned int)ui[2] + 1u) & ~1u) * 2u);
+            }
+            if (root->begin != fn) continue;
+            if (found >= cap) return -1;
+            out[found].begin = (unsigned long long)image + rf[i].begin;
+            out[found].end = (unsigned long long)image + rf[i].end;
+            ++found;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return found;
+}
 
 // THE INSTALL'S READ OF THE GAME'S CODE (MAIN THREAD, before the hook): the function table copied with each entry's function
 // (an entry whose unwind chain leads to another belongs to that one - 0x51E020's and 0x5F0C10's layer-play calls sit in
@@ -8440,13 +8698,13 @@ bool PoseOfOwned(unsigned int uid, coopstate::PoseWire* out)
 
 int AiWorkerBusyNow();   /* coop.cpp - the engine's own AI-worker busy test: 1 running, 0 idle, -1 cannot be told. MAIN THREAD */
 
-// T-307: a picked layer-1 state not started by a task (common/poselayer.h 3) - counted once per character per name and caller
+// T-307: a picked layer-1 state refused - a refuse-list starter's, or no start note (common/poselayer.h 3, decision 1236 a) - counted once per character per name and caller
 // type, one capped line per distinct name and type a process, naming who started it, so a refused held action is found
 // from the logs.
 static void PoseLayerNotAllowedSeen(unsigned int uid, const char* name, int kind, unsigned int retRva)
 {
-    const char* who = (kind == poselayer::kCallerController) ? "controller"
-                    : (kind == poselayer::kCallerUnknown ? "unknown caller" : (kind == poselayer::kCallerTask ? "task" : "no start note"));
+    /* only a refuse-list starter's state or one with no start note reaches here (LayerStartSendable) */
+    const char* who = (kind == poselayer::kCallerController) ? "controller (refuse list)" : "no start note";
     char rv[24];
     _snprintf_s(rv, sizeof(rv), _TRUNCATE, "0x%X", retRva);
     const std::string n = std::string(name) + "|" + who + "|" + rv;
@@ -8455,18 +8713,16 @@ static void PoseLayerNotAllowedSeen(unsigned int uid, const char* name, int kind
     g_poseLayerNotAllowedLast[uid] = n;
     ++g_poseLayerNotAllowed;
     if (kind == poselayer::kCallerController) ++g_poseLayerRefusedCtl;
-    else if (kind == poselayer::kCallerUnknown) ++g_poseLayerRefusedUnknown;
     else ++g_poseLayerRefusedNone;
     if (g_poseLayerNotAllowedLogged >= kPoseLayerNotAllowedLogLimit) return;
     if (!g_poseLayerNotAllowedSeen.insert(n).second) return;
     ++g_poseLayerNotAllowedLogged;
     std::string tail;
     if (kind == poselayer::kCallerController) tail = std::string(" (caller rva ") + rv + ")";
-    else if (kind == poselayer::kCallerUnknown) tail = std::string(" (caller rva ") + rv + ": game code that is neither a listed task nor a listed controller)";
     else tail = (g_layerStartOn == 1) ? std::string(" (started before the hook, pushed out, or played from outside the game)")
                                       : std::string(" (the layer-play hook is off)");
     DebugLog("[POSE] layer pick refused '" + std::string(name) + "' uid=" + S((long long)uid) + " started by " + who + tail
-             + " - layer 1, looped, full weight: not sent (only a listed task's layer state is a pose)");
+             + " - layer 1, looped, full weight: not sent (a refuse-list starter's state, or one with no start note, is never a pose)");
 }
 
 // MAIN THREAD, once per frame: one line the first time most layer-play calls came from outside the game's code - another
@@ -8486,11 +8742,12 @@ static void PoseLayerOutsideCheck()
 // T-307 (owner, MAIN THREAD, PoseWatchTick - after TickWaitAi): the layer table's held state of an owned character whose
 // current-action slot is empty, read only while the AI worker is idle - its pass writes the table (bug classes 188 / 266).
 // *busy is the frame's one worker test (2 = not asked yet); a skipped read keeps a settled pick, so a busy frame never
-// clears a pose. 1 act holds the name (looped set) and *startRva the task that started it (0 not read this frame), 0 nothing
-// from the layer.
-static int PoseLayerAction(unsigned int uid, const void* c, int* busy, char* act, int* looped, unsigned int* startRva)
+// clears a pose. 1 act holds the name (looped set), *startRva its starter's return address and *startKind its caller type (a
+// listed task or unlisted game code; 0 and none when a busy frame kept the settled pick unread), 0 nothing from the layer.
+static int PoseLayerAction(unsigned int uid, const void* c, int* busy, char* act, int* looped, unsigned int* startRva, int* startKind)
 {
     *startRva = 0;
+    *startKind = poselayer::kCallerNone;   /* T-890: the starter's caller type (task / unknown) with *startRva */
     if (*busy == 2) *busy = AiWorkerBusyNow();
     std::map<unsigned int, poselayer::Cand>::iterator it = g_poseLayerCand.find(uid);
     if (*busy != 0)
@@ -8509,7 +8766,7 @@ static int PoseLayerAction(unsigned int uid, const void* c, int* busy, char* act
     if (r != 1) { if (it != g_poseLayerCand.end()) g_poseLayerCand.erase(it); g_poseLayerNotAllowedLast.erase(uid); return 0; }
     unsigned int rv = 0;
     const int kind = (g_layerStartOn == 1) ? poselayer::StartFind(&g_layerStarts, anim, rec, &rv) : poselayer::kCallerNone;
-    if (!poselayer::LayerStartSendable(kind))   // only a task's layer state is a pose (layer 1 also holds 'jog upper')
+    if (!poselayer::LayerStartSendable(kind))   // decision 1236 a: a refuse-list starter's state ('jog upper', idles, stances, aim) or no note is never a pose
     {
         PoseLayerNotAllowedSeen(uid, name, kind, rv);
         if (it != g_poseLayerCand.end()) g_poseLayerCand.erase(it);
@@ -8526,6 +8783,7 @@ static int PoseLayerAction(unsigned int uid, const void* c, int* busy, char* act
     std::memcpy(act, it->second.name, sizeof(it->second.name));
     *looped = 1;
     *startRva = rv;
+    *startKind = kind;
     return 1;
 }
 
@@ -8549,9 +8807,10 @@ void PoseWatchTick()
         // T-307: an empty current-action slot of a character standing still and not in a bed or cage - the layer table's
         // held state (an NPC-type loot plays 'medic' only there, T1630); the rules below decide as for +0x210
         bool fromLayer = false;
-        unsigned int layerStartRva = 0;   // the task that started the layer state (0 = a busy frame kept the settled pick)
+        unsigned int layerStartRva = 0;   // the layer state's starter's return address (0 = a busy frame kept the settled pick unread)
+        int layerStartKind = poselayer::kCallerNone;   // T-890: its caller type (a listed task, or unknown code not on the refuse list)
         if (ins == 0 && act[0] == 0 && actLong == 0 && speed < kPoseOwnerStillSpeed)
-            fromLayer = PoseLayerAction(uid, c, &layerBusy, act, &looped, &layerStartRva) == 1;
+            fromLayer = PoseLayerAction(uid, c, &layerBusy, act, &looped, &layerStartRva, &layerStartKind) == 1;
         else { g_poseLayerCand.erase(uid); g_poseLayerNotAllowedLast.erase(uid); }
 
         coopstate::PoseWire pw;
@@ -8629,8 +8888,25 @@ void PoseWatchTick()
                     char srv[24];
                     _snprintf_s(srv, sizeof(srv), _TRUNCATE, "0x%X", layerStartRva);
                     DebugLog("[POSE] layer send #" + S(g_poseLayerLogged) + " uid=" + S((long long)uid) + " action='"
-                             + std::string(pw.action) + "' started by task rva " + srv
+                             + std::string(pw.action) + "' started by "
+                             + (layerStartKind == poselayer::kCallerUnknown ? std::string("unknown caller rva ") + srv
+                                : layerStartKind == poselayer::kCallerTask ? std::string("task rva ") + srv
+                                : std::string("a starter not read on this busy frame (the settled pick was kept)"))
                              + " (current-action slot empty: the layer table's held state)");
+                }
+                if (layerStartKind == poselayer::kCallerUnknown)   // T-890 decision 1236 a: sent because its starter is not on the refuse list
+                {
+                    ++g_poseLayerAllowedUnknown;
+                    char urv[24];
+                    _snprintf_s(urv, sizeof(urv), _TRUNCATE, "0x%X", layerStartRva);
+                    if (g_poseLayerAllowedUnknownLogged < kPoseLayerAllowedUnknownLogLimit
+                        && g_poseLayerAllowedUnknownSeen.insert(std::string(pw.action) + "|" + urv).second)
+                    {
+                        ++g_poseLayerAllowedUnknownLogged;
+                        DebugLog("[POSE] layer send allowed unknown #" + S(g_poseLayerAllowedUnknownLogged) + " uid=" + S((long long)uid)
+                                 + " action='" + std::string(pw.action) + "' caller rva " + urv
+                                 + " (game code not on the refuse list: sent; one line per name and caller)");
+                    }
                 }
             }
         }
@@ -8866,6 +9142,40 @@ void PoseReplayAfterUpdate(::Character* c)
     if (!w.refusedNow) { w.refusedNow = true; ++g_poseActionRefused; }
 }
 
+// T-330: character c's AnimationClass (+0x448), 0 unreadable. Any thread, no C++ objects (SEH).
+static const void* AimAnimOfPod(const void* c)
+{
+    __try { return *(const void* const*)((const char*)c + kPoseAnimOff); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// See spawn.h. Any thread: the stamp table is lock-free and the ranges are fixed once the count is set.
+int AimStampOf(const void* c, unsigned int* stamp, unsigned int* windowMs)
+{
+    if (stamp != 0) *stamp = 0;
+    if (windowMs != 0) *windowMs = coopaim::kFreshMs;
+    if (c == 0 || g_aimRangeCount <= 0 || g_layerStartOn != 1) return -1;
+    const void* anim = AimAnimOfPod(c);
+    if (anim == 0) return -1;
+    return coopaim::StampFind(&g_aimStamps, anim, stamp, windowMs);
+}
+
+// See spawn.h. MAIN THREAD (a frame of a pause): character c's aim stamp, when still inside its window, is carried to now.
+void AimStampKeep(const void* c, unsigned int now)
+{
+    if (c == 0 || g_aimRangeCount <= 0 || g_layerStartOn != 1) return;
+    const void* anim = AimAnimOfPod(c);
+    if (anim == 0) return;
+    coopaim::StampNote(&g_aimStamps, anim, now, 1);
+}
+
+unsigned long long AimCodeAddr() { return g_aimCodeAddr; }
+
+bool AimCopyFit(::Character* c)
+{
+    return c != 0 && !BeingCarried(c) && !RagdollActive(c) && !c->hasDied();
+}
+
 bool PoseHoldsActionCopy(unsigned int uid)
 {
     if (g_poseWant.empty()) return false;
@@ -8892,13 +9202,14 @@ std::string PoseReportToken()
          + " poseFromLayer=" + S(g_poseFromLayer) + " poseLayerBusySkip=" + S(g_poseLayerBusySkip)
          + " poseLayerFaults=" + S(g_poseLayerFaults)   /* T-307 */
          + " poseLayerNotAllowed=" + S(g_poseLayerNotAllowed)   /* T-307 review */
-         + " poseLayerStart[on,callsMain,callsOffMain,task,ctl,unknown,outside,outsideLost,full,dropped,refCtl,refUnknown,refNone]="
+         + " poseLayerAllowedUnknown=" + S(g_poseLayerAllowedUnknown)   /* T-890 decision 1236 a */
+         + " poseLayerStart[on,callsMain,callsOffMain,task,ctl,unknown,outside,outsideLost,full,dropped,refCtl,refNone]="
          + S((long long)g_layerStartOn) + "," + S(g_layerCallsMain) + "," + S(::InterlockedCompareExchange64(&g_layerCallsOffMain, 0, 0))
          + "," + S(::InterlockedCompareExchange64(&g_layerNoteTask, 0, 0)) + "," + S(::InterlockedCompareExchange64(&g_layerNoteCtl, 0, 0))
          + "," + S(::InterlockedCompareExchange64(&g_layerNoteUnknown, 0, 0)) + "," + S(::InterlockedCompareExchange64(&g_layerOutside, 0, 0))
          + "," + S(::InterlockedCompareExchange64(&g_layerOutsideLost, 0, 0)) + "," + S(::InterlockedCompareExchange64(&g_layerNoteEvicted, 0, 0))
          + "," + S(::InterlockedCompareExchange64(&g_layerNoteDropped, 0, 0)) + "," + S(g_poseLayerRefusedCtl)
-         + "," + S(g_poseLayerRefusedUnknown) + "," + S(g_poseLayerRefusedNone)
+         + "," + S(g_poseLayerRefusedNone)
          ;
 }
 
@@ -8909,12 +9220,25 @@ std::string PoseReportToken()
 void InstallPoseLayerStart()
 {
     poselayer::StartClear(&g_layerStarts);
+    // T-330: the aim code's pieces, read before the hook goes in (the detour stamps a play returning into them)
+    coopaim::StampClear(&g_aimStamps);
+    g_aimRangeCount = 0;
+    g_aimCodeAddr = (kRangedAimAnimRva != 0) ? (unsigned long long)::GetModuleHandleA(0) + kRangedAimAnimRva : 0;
+    int aimPieces = 0;
+    if (kRangedAimAnimRva != 0)
+    {
+        poselayer::Range ar[kAimRangeCap];
+        aimPieces = AimRangesPod((unsigned int)kRangedAimAnimRva, ar, kAimRangeCap);
+        for (int i = 0; i < aimPieces; ++i) g_aimRanges[i] = ar[i];
+        if (aimPieces > 0) g_aimRangeCount = aimPieces;
+    }
     const unsigned long long base = (unsigned long long)::GetModuleHandleA(0);
     const HMODULE ntdll = ::GetModuleHandleA("ntdll.dll");
     if (ntdll != 0) g_layerCapture = (LayerCaptureFn)::GetProcAddress(ntdll, "RtlCaptureStackBackTrace");
-    const char* const ctlName[5] = { "AnimCtlIdle", "AnimCtlLocoBlend", "AnimCtlHeadTurn", "AnimCtlOther", "AnimCtlMainSlotFill" };
+    const int kCtl = 5 + poselayer::kRefuseDerived + 1;   /* T-890 decision 1236 a: the refuse list - five table rows, the derived entries, then the bed entry */
+    const char* ctlName[kCtl] = { "AnimCtlIdle", "AnimCtlLocoBlend", "AnimCtlHeadTurn", "AnimCtlOther", "AnimCtlMainSlotFill" };
     const unsigned long long ctl64[5] = { kAnimCtlIdleRva, kAnimCtlLocoBlendRva, kAnimCtlHeadTurnRva, kAnimCtlOtherRva, kAnimCtlMainSlotFillRva };
-    unsigned int ctl[5];
+    unsigned int ctl[kCtl];
     unsigned int task[kLayerTasks];
     std::string why;
     if (kAnimLayerPlayRva == 0) why = "no table row AnimLayerPlay";
@@ -8923,6 +9247,15 @@ void InstallPoseLayerStart()
         ctl[c] = (unsigned int)ctl64[c];
         if (ctl64[c] == 0 && why.empty()) why = std::string("no table row ") + ctlName[c];
     }
+    for (int d = 0; d < poselayer::kRefuseDerived; ++d)   /* each derived refuse entry placed from the AnimCtlIdle row (poselayer.h) */
+    {
+        ctlName[5 + d] = poselayer::kRefuseDerivedName[d];
+        ctl[5 + d] = poselayer::RefuseDerivedStart((unsigned int)kAnimCtlIdleRva, d);
+        if (ctl[5 + d] == 0 && why.empty()) why = std::string("no place for refuse-list entry ") + ctlName[5 + d];
+    }
+    ctlName[kCtl - 1] = poselayer::kRefuseBedName;   /* the bed entry, placed from the CombatClass_currentTarget row (poselayer.h) */
+    ctl[kCtl - 1] = poselayer::RefuseBedStart((unsigned int)kRefuseBedAnchorRva);
+    if (ctl[kCtl - 1] == 0 && why.empty()) why = std::string("no place for refuse-list entry ") + ctlName[kCtl - 1];
     int tasksMissing = 0;
     for (int i = 0; i < kLayerTasks; ++i) { task[i] = (unsigned int)g_layerTaskRva[i]; if (task[i] == 0) ++tasksMissing; }
     poselayer::Range taskRanges[poselayer::kRangeCap];
@@ -8931,7 +9264,7 @@ void InstallPoseLayerStart()
     int nTask = 0, nCtl = 0, nCallers = 0, unplaced = 0;
     if (why.empty())
     {
-        const int r = PoseLayerScanImage(kAnimLayerPlayRva, task, kLayerTasks, ctl, 5, taskRanges, &nTask, ctlRanges, &nCtl,
+        const int r = PoseLayerScanImage(kAnimLayerPlayRva, task, kLayerTasks, ctl, kCtl, taskRanges, &nTask, ctlRanges, &nCtl,
                                          callers, &nCallers, &unplaced);
         if (r < 0) why = "reading the game's code faulted";
         else if (r == 0) why = "the game's function table is missing, or its task / controller code or callers overflow the mod's lists";
@@ -8939,14 +9272,14 @@ void InstallPoseLayerStart()
     int unknownFns = 0;
     for (int i = 0; i < nCallers; ++i)
     {
-        const int k = (callers[i].fn == 0) ? poselayer::kCallerUnknown : poselayer::KindOfFunction(callers[i].fn, task, kLayerTasks, ctl, 5);
+        const int k = (callers[i].fn == 0) ? poselayer::kCallerUnknown : poselayer::KindOfFunction(callers[i].fn, task, kLayerTasks, ctl, kCtl);
         if (k == poselayer::kCallerUnknown) ++unknownFns;
         char line[160];
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[POSE] layer play caller 0x%X %s calls=%d", callers[i].fn,
-                    k == poselayer::kCallerTask ? "task" : (k == poselayer::kCallerController ? "controller" : "UNKNOWN (refused)"), callers[i].calls);
+                    k == poselayer::kCallerTask ? "task" : (k == poselayer::kCallerController ? "controller (refused)" : "unknown (sent)"), callers[i].calls);
         DebugLog(line);
     }
-    for (int c = 0; c < 5 && why.empty(); ++c)
+    for (int c = 0; c < kCtl && why.empty(); ++c)
     {
         int seen = 0;
         for (int i = 0; i < nCallers; ++i) if (callers[i].fn == ctl[c]) seen = callers[i].calls;
@@ -8980,7 +9313,7 @@ void InstallPoseLayerStart()
     {
         g_layerStartOn = 1;
         DebugLog("[POSE] layer start hook ON: the layer play hooked; " + counts
-                 + " - a layer-1 state is a pose only when a listed task started it");
+                 + " - a layer-1 state is a pose unless a refuse-list starter started it or it has no start note (decision 1236 a)");
     }
     else
     {
@@ -8988,6 +9321,15 @@ void InstallPoseLayerStart()
         ErrorLog("[POSE] layer start hook OFF: " + why + " (" + counts
                  + ") - no layer state is sent as a pose on this game; main-slot poses are unaffected");
     }
+    if (g_aimRangeCount > 0 && g_layerStartOn == 1)
+        DebugLog("[AIM] owner side ON: the aim code in " + S((long long)aimPieces)
+                 + " piece(s); its layer plays are stamped - an owned character's aim rides STATE bits 17-18");
+    else
+        ErrorLog(std::string("[AIM] owner side OFF: ")
+                 + (kRangedAimAnimRva == 0 ? "no table row RangedAimAnim"
+                    : (aimPieces <= 0 ? "the aim code's pieces were not found in the function table" : "the layer play is not hooked"))
+                 + " - this game's characters are never sent as aiming"
+                 + (g_aimCodeAddr != 0 ? "; copies still aim on their owners' word" : "; copies never aim either"));
 }
 
 // ---- arrest2 (docs/design-arrest.md 3 "arrest2"): a guard's game caged the other game's character ------------------------
@@ -9967,8 +10309,18 @@ int StandinPurgeTick(long worldGen)
             void* pl = PurgePlatoonPod(c);
             const void* prevSelf = g_selfDespawnObj;
             g_selfDespawnObj = c;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+            coop::P210CopyDestroyBegin(0, c);
+// PROBE-END: P210
+#endif
             const int r = PurgeDestroyPod(c);
             g_selfDespawnObj = prevSelf;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+            coop::P210CopyDestroyEnd(0, "purge stale copy", r == 1 ? 1 : 0);
+// PROBE-END: P210
+#endif
             if (r == 1)
             {
                 g_purgeDestroyed.insert(c); ++g_purgeChars; g_sweepReqAsked.erase((const void*)c);
@@ -10461,8 +10813,18 @@ void OrphanPurgeTick(long worldGen)
             }
             const void* prevSelf = g_selfDespawnObj;
             g_selfDespawnObj = c;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+            coop::P210CopyDestroyBegin(0, c);
+// PROBE-END: P210
+#endif
             const int r = PurgeDestroyPod(c);
             g_selfDespawnObj = prevSelf;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+            coop::P210CopyDestroyEnd(0, "orphan caged duplicate", r == 1 ? 1 : 0);
+// PROBE-END: P210
+#endif
             ++removed;
             if (r == 1)
             {
@@ -11730,6 +12092,7 @@ bool NameApplyToCopy(unsigned int uid, ::Character* c, const std::string& name, 
     ::InterlockedExchange(&g_nameApplyTid, 0);
     if (!ok) { ++g_nameApplyFailed; ErrorLog("[NAME] setName FAULTED on the copy of uid " + S((long long)uid)); return false; }
     ++g_nameApplied;
+    coop::TagsCaptionsDirty();   /* line 2 of the name tags is the character's own name: every tag is built again with the new one (any thread) */
     if (g_nameLogged < 20)
     {
         ++g_nameLogged;
@@ -13930,6 +14293,70 @@ int CopySquadIdCheckAtLoad(void* platoon, const std::string& id)
     return fresh.empty() ? -2 : 1;
 }
 
+/* T-1096 part 2: THE IMPORTED SQUADS' IDS (store.cpp SpImportSquadIds; spawn.h). The walk is CollectCopyIdHolders' (every faction, this
+   game's own, the stand-ins; awake and asleep) keeping every id; the write is CopySquadIdCheck's. MAIN THREAD. */
+int SquadIdsHere(std::vector<std::string>* out, const std::vector<void*>& except)
+{
+    if (coop::GameWorldPtr() == 0 || !PlausiblePtr(coop::GameWorldPtr()->factionDirectory)) return 0;
+    const lektor<Faction*>* all = coop::GameWorldPtr()->factionDirectory->allFactions();
+    if (all == 0) return 0;
+    std::vector<Faction*> fs;
+    for (unsigned i = 0; i < all->size() && i < 4096; ++i) fs.push_back((*all)[i]);
+    ::Faction* mine = LocalPlayerFaction();
+    fs.push_back((Faction*)mine);
+    { int slots[kStandInTableCap]; ::Faction* si[kStandInTableCap]; const int n = StandInList(slots, si, kStandInTableCap); for (int i = 0; i < n && i < kStandInTableCap; ++i) fs.push_back((Faction*)si[i]); }
+    std::set<void*> seen;
+    int unread = 0;
+    for (size_t fi = 0; fi < fs.size(); ++fi)
+    {
+        Faction* f = fs[fi];
+        if (!PlausibleObject(f) || !seen.insert((void*)f).second) continue;
+        std::vector<void*> sq;
+        void** items = 0; unsigned n = 0;
+        if (FactionActiveListPod((void*)f, &items, &n) != 1 || n > 4096 || (n != 0 && !PlausiblePtr(items))) ++unread;
+        else for (unsigned i = 0; i < n; ++i) sq.push_back(items[i]);
+        const lektor<Platoon*>* ul = f->unloadedSquads();
+        if (ul == 0) ++unread;
+        else for (unsigned i = 0; i < ul->size() && i < 4096; ++i) sq.push_back((void*)(*ul)[i]);
+        for (size_t k = 0; k < sq.size(); ++k)
+        {
+            bool skip = false;
+            for (size_t e = 0; e < except.size() && !skip; ++e) if (except[e] == sq[k]) skip = true;
+            std::string id;
+            if (skip || !PlausibleObject(sq[k]) || !PlatoonIdPod(sq[k], &id) || id.empty()) continue;
+            out->push_back(id);
+        }
+    }
+    return unread == 0 ? 1 : 2;
+}
+int ImportSquadIdWrite(void* platoon, const std::string& engineId, const std::string& fresh, std::string* note)
+{
+    note->clear();
+    if (platoon == 0 || engineId.empty() || fresh.empty()) return 0;
+    GameData* state = (GameData*)PlatoonStatePod(platoon);
+    if (!PlausibleObject(state)) return 0;
+    char cfb[261];
+    const int cfLiveOk = ActiveContentFileRead(platoon, cfb, (int)sizeof(cfb));
+    const std::string cfLive = cfLiveOk == 1 ? std::string(cfb) : std::string();
+    if (PlatoonIdWritePod(platoon, &fresh) != 1) return -1;
+    state->stringFields["platoon stringID"] = fresh;
+    std::string nv;
+    int fileFault = 0;   /* T-1096 fold (review 2026-10-31): the squad's save file name not renamed = not written (-2) */
+    if (cfLiveOk == 1 && copysq::ContentFileRenamed(cfLive, engineId, fresh, &nv) == 1)
+    {
+        void* active = ReadActivePlatoonPod(platoon);
+        if (PlausibleObject(active) && ActiveContentFileWritePod(active, &nv) == 1) *note += " contentFile->'" + nv + "'";
+        else { *note += " contentFile-> FAULTED"; fileFault = 1; }
+    }
+    GameHashMap<std::string, std::string>::type::iterator ci = state->fileFields.find(std::string("content file"));
+    if (ci != state->fileFields.end() && copysq::ContentFileRenamed(ci->second, engineId, fresh, &nv) == 1)
+    {
+        ci->second = nv;
+        *note += " stateContentFile->'" + nv + "'";
+    }
+    return fileFault != 0 ? -2 : 1;
+}
+
 /* Ownerships::setHomeBuilding for a group - the call createRandomUnloadedSquad makes for a group it creates, which also puts the group
    on the building's residents hand (towngen.cpp T392ResidentHandPod's note) - with the building's own hand (RootObjectBase::getHandle,
    +0x58) and the group's squad type (Platoon+0xA8, the field ReadContextPod reads). Used for a group made from its world record
@@ -14541,6 +14968,11 @@ bool AdoptExistingTwin(unsigned int uid, const Ogre::Vector3& authorityPos, cons
         return false;
     }
     g_spawned[uid] = (RootObjectBase*)c;
+#ifdef SW_DEV_BUILD
+// PROBE-START: P210
+    coop::P210NoteMade(uid, 2);   /* a twin's adoption time, for COPYDESTROY's msSinceMade */
+// PROBE-END: P210
+#endif
     coop::ItemOwnParkNoteUid(uid);   /* stolen marks parked for this uid are tried at the next ItemsTick */
     TrackForLiveness(uid, c, true);   // a twin is our own save's character: authored
     ++g_twinAdopted;
@@ -15158,6 +15590,80 @@ void detour_p140CageUseStart(void* task, void* who)
     P140StartLog(c, r, after, cage, ht, fr);
 }
 }   // namespace (P140)
+
+/* T-1153 TEST-ONLY levers (`chattest link`, `renametest`, when no uid is given): the first character of the player's selection as 0x7F9280 walks it
+   (P140SelectionPod), the PlayerInterface read at GameWorld+0x580 (resurrect.cpp SelectedInGamePod). 0 = none selected, no
+   world, or a read faulted. MAIN THREAD. */
+void* FirstSelectedCharacter()
+{
+    void* pi = 0;
+    __try
+    {
+        void* gw = (void*)GameWorldPtr();
+        if (gw == 0) return 0;
+        pi = *(void**)((char*)gw + 0x580);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (pi == 0) return 0;
+    void* sel[1] = { 0 };
+    return P140SelectionPod(pi, sel, 1) == 1 ? sel[0] : 0;
+}
+/* TEST-ONLY `renametest <name> [uid]` (command_channel): the loaded character <uid> (the last word, when it is a number 1..4294967295;
+   so a name whose last word is a number needs the uid after it) or, with none, the first selected character - when it is this
+   game's own - renamed through
+   Character::setName's hooked entry (NameSetOwn) - the setter the name sync hooks: detour_setName marks the uid, NameTick sends
+   MSG_NAME, and the other games run NameApplyToCopy (which rebuilds their name tags). One [NAME] line. MAIN THREAD. */
+std::string RenameTestCommand(const std::string& arg)
+{
+    std::string name = arg;
+    while (!name.empty() && (name[0] == ' ' || name[0] == '\t')) name.erase(0, 1);
+    while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t' || name[name.size() - 1] == '\r')) name.erase(name.size() - 1);
+    unsigned int want = 0;   /* the optional last word: the character's uid */
+    const size_t sp = name.find_last_of(" \t");
+    if (sp != std::string::npos)
+    {
+        const std::string w = name.substr(sp + 1);
+        bool num = !w.empty() && w.size() <= 10;
+        unsigned long long v = 0;
+        for (size_t i = 0; i < w.size(); ++i) { if (w[i] < '0' || w[i] > '9') num = false; else v = v * 10 + (unsigned long long)(w[i] - '0'); }
+        if (num && v != 0 && v <= 0xFFFFFFFFULL)
+        {
+            want = (unsigned int)v;
+            name.erase(sp);
+            while (!name.empty() && (name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t')) name.erase(name.size() - 1);
+        }
+    }
+    bool clean = !name.empty() && name.size() <= (size_t)coopname::kNameMax;
+    for (size_t i = 0; i < name.size(); ++i) { const unsigned char b = (unsigned char)name[i]; if (b < 0x20 || b == 0x7F) clean = false; }
+    if (!clean) return "error renametest usage: renametest <name> [uid] (1.." + S((long long)coopname::kNameMax) + " bytes, no control characters)";
+    void* c = want != 0 ? (void*)FindSpawned(want) : FirstSelectedCharacter();
+    if (c == 0)
+    {
+        const std::string r = want != 0 ? "error renametest uid=" + S((long long)want) + ": no loaded character has this uid" : std::string("error renametest: no character selected");
+        DebugLog("[NAME] " + r);
+        return r;
+    }
+    const unsigned int uid = FindSpawnedUid(c);
+    if (uid == 0 || !net::IsUidMineAnyThread(uid))
+    {
+        const std::string r = "error renametest uid=" + S((long long)uid) + (want != 0 ? ": the character is not this game's own" : ": the selected character is not this game's own");
+        DebugLog("[NAME] " + r);
+        return r;
+    }
+    std::string was;
+    if (!NameOf(c, &was)) was = "?";
+    if (!NameSetOwn((::Character*)c, name))
+    {
+        const std::string r = "error renametest uid=" + S((long long)uid) + ": the setter has no address or faulted";
+        ErrorLog("[NAME] " + r);
+        return r;
+    }
+    std::string now;
+    if (!NameOf(c, &now)) now = "?";
+    const std::string r = "ok renametest uid=" + S((long long)uid) + " name=" + now + " was=" + was;
+    DebugLog("[NAME] " + r);
+    return r;
+}
 
 void InstallP140()
 {

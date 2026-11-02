@@ -62,7 +62,7 @@ const unsigned kNumMax = 9999;                                /* profile numbers
 const unsigned kWireRowsMax = 64;                             /* active rows in one PROFILES answer (cap <= 16) */
 const size_t   kWireStrMax = 64;
 
-enum Kind { kReqNew = 1, kReqDelete = 2, kReqFaction = 3, kReqSaved = 4, kReqRename = 5, kReqFactionSeen = 6 };   /* T-368: 5 RENAME - the player renamed its faction; 6 FACTION SEEN - the game has a FACTION answer */   /* T-201 PP6' (owner 175): 4 SAVED - a game's own save of its profile finished */   /* names2a: 3 FACTION - a playing game's faction name for its own row */
+enum Kind { kReqNew = 1, kReqDelete = 2, kReqFaction = 3, kReqSaved = 4, kReqRename = 5, kReqFactionSeen = 6, kReqNewImport = 7 };   /* T-1096: 7 NEW with import from single player (store protocol 129) */   /* T-368: 5 RENAME - the player renamed its faction; 6 FACTION SEEN - the game has a FACTION answer */   /* T-201 PP6' (owner 175): 4 SAVED - a game's own save of its profile finished */   /* names2a: 3 FACTION - a playing game's faction name for its own row */
 enum Answers { kAnsList = 0, kAnsNew = 1, kAnsDelete = 2, kAnsPick = 3, kAnsFaction = 4, kAnsTaken = 5 };   /* T-368: 4 and 5 have their own bodies */
 enum Verdict
 {
@@ -73,7 +73,8 @@ enum Verdict
     kRefusedUnknown = 4,    /* PICK / DELETE of a number this person has no active profile under */
     kRefusedInUse = 5,      /* DELETE of the profile being played right now */
     kRefusedNumUsed = 6,    /* NEW asking for a number this person has held before (TEST profile=<n> only) */
-    kRefusedNotReady = 7    /* a PROFILES request from a connection the notebook has not heard a HELLO from */
+    kRefusedNotReady = 7,   /* a PROFILES request from a connection the notebook has not heard a HELLO from */
+    kRefusedImport = 8      /* T-1096: NEW with import from single player that the host's IMPORT FROM SINGLE PLAYER option does not allow this player */
 };
 
 inline std::string PNum(long long v) { char b[32]; std::sprintf(b, "%lld", v); return b; }
@@ -999,6 +1000,7 @@ inline std::string VerdictText(int v, unsigned cap)
     case kRefusedInUse:     return "that profile is being played right now, so it cannot be deleted";
     case kRefusedNumUsed:   return "that profile can't be reused";
     case kRefusedNotReady:  return "still connecting";
+    case kRefusedImport:    return "the host hasn't allowed importing from single player in this world";   /* T-1096: the approved hint's words */
     default:                return "the world is running a different version of the mod";   /* words1b: host-neutral - the host sees it too */
     }
 }
@@ -1008,7 +1010,7 @@ inline const char* VerdictName(int v)
     {
     case kOk: return "ok"; case kRefusedCap: return "cap"; case kRefusedName: return "name"; case kRefusedNameTaken: return "nameTaken";
     case kRefusedUnknown: return "unknown"; case kRefusedInUse: return "inUse"; case kRefusedNumUsed: return "numUsed";
-    case kRefusedNotReady: return "notReady"; default: return "other";
+    case kRefusedNotReady: return "notReady"; case kRefusedImport: return "import"; default: return "other";
     }
 }
 
@@ -1036,7 +1038,7 @@ inline bool DecodeRequest(const std::vector<char>& b, int* kind, unsigned* num, 
     if (b.empty()) return false;
     size_t at = 1;
     const int k = (unsigned char)b[0];
-    if (k != kReqNew && k != kReqDelete && k != kReqFaction && k != kReqSaved && k != kReqRename && k != kReqFactionSeen) return false;   /* names2a: kind 3; T-201 PP6': kind 4; T-368: kinds 5, 6 */
+    if (k != kReqNew && k != kReqDelete && k != kReqFaction && k != kReqSaved && k != kReqRename && k != kReqFactionSeen && k != kReqNewImport) return false;   /* names2a: kind 3; T-201 PP6': kind 4; T-368: kinds 5, 6; T-1096: kind 7 */
     if (!WGetU32(b, &at, num) || !WGetStr(b, &at, name) || at != b.size()) return false;
     *kind = k; return true;
 }
@@ -1049,7 +1051,8 @@ struct Answer
     /* T-490 (store protocol 69): the world's identity after the rows - {str world, str world id, u32 flags (bit 0 = upgraded)} - so a
        game in the lobby, which gets no WELCOME until it picks, can judge the folder it would use before the PROFILES screen opens */
     bool hasWorld, worldIdUpgraded; std::string world, worldId;
-    Answer() : answers(kAnsList), verdict(kOk), cap(kCapDefault), subject(0), hasWorld(false), worldIdUpgraded(false) {}
+    unsigned importWord;   /* T-1096 (store protocol 129): after the world's identity, spimport::AnswerWord - 0 = none sent */
+    Answer() : answers(kAnsList), verdict(kOk), cap(kCapDefault), subject(0), hasWorld(false), worldIdUpgraded(false), importWord(0) {}
 };
 inline void EncodeAnswer(std::vector<char>* b, const Answer& a)
 {
@@ -1064,6 +1067,7 @@ inline void EncodeAnswer(std::vector<char>* b, const Answer& a)
         WPutStr(b, r.name); WPutStr(b, r.faction);
     }
     if (a.hasWorld) { WPutStr(b, a.world.substr(0, kWireStrMax)); WPutStr(b, a.worldId.substr(0, kWireStrMax)); WPutU32(b, a.worldIdUpgraded ? 1u : 0u); }   /* T-490 */
+    if (a.hasWorld && a.importWord != 0) WPutU32(b, a.importWord);   /* T-1096 */
 }
 inline bool DecodeAnswer(const std::vector<char>& b, Answer* a)
 {
@@ -1084,7 +1088,8 @@ inline bool DecodeAnswer(const std::vector<char>& b, Answer* a)
     if (at != b.size())   /* T-490: the world's identity */
     {
         unsigned fl = 0;
-        if (!WGetStr(b, &at, &o.world) || !WGetStr(b, &at, &o.worldId) || !WGetU32(b, &at, &fl) || at != b.size()) return false;
+        if (!WGetStr(b, &at, &o.world) || !WGetStr(b, &at, &o.worldId) || !WGetU32(b, &at, &fl)) return false;
+        if (at != b.size() && (!WGetU32(b, &at, &o.importWord) || at != b.size())) return false;   /* T-1096: the import word */
         o.hasWorld = true; o.worldIdUpgraded = (fl & 1u) != 0;
     }
     *a = o; return true;

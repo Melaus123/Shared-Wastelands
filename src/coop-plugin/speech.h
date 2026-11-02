@@ -40,6 +40,7 @@ void CrimeTestDrain();
    event through Dialogue::sendEvent at the K2 safe point and logs what started. TalkCountsString: the [net] REPORT counters
    "talk[started,withCopy,withMine,windowWouldOpen,...]=... talkByEvent=[..] sendEventWouldBlockByEvent=[..] talkHooks=..". */
 std::string TalkTestArm(const std::string& arg);
+std::string TalkTestPeerArm(const std::string& arg);   /* `talktest nearestpeer [<radius>]` (TEST-ONLY, T-1152): the speaker is the nearest character of another player (speech.cpp) */
 void TalkTestDrain();
 std::string TalkCountsString();
 /* T-831: before this mod removes character c - a conversation the dialogue window shows whose owner, target or stored
@@ -111,6 +112,9 @@ void TalkNoteOffMainActs(void* dlg, void* line);
    0 no trampoline, -1 faulted). HireForTalk: B - the other game's NPC hires itself into this game's squad through the
    owner-applied hire road (1 asked, 0 not: *why). MAIN THREAD. */
 int HireCallDoActions(void* dlg, void* line);
+/* talkprompt joinact - defined in hire.cpp, namespace coop: the engine's _doActions through its hooked ENTRY (the detour runs), as a
+   clicked reply's line. 1 ran, 0 not available, -1 faulted. MAIN THREAD. */
+int HireCallDoActionsEntry(void* dlg, void* line);
 int HireForTalk(unsigned int npcUid, unsigned int hirerUid, int price, int joinType, std::string* why);
 std::string TalkPromptArm(const std::string& arg);
 
@@ -125,6 +129,10 @@ void TalkCursorInstall();
 const int kTalkScopeHover = 0, kTalkScopeClick = 1, kTalkScopeMenu = 2;
 void TalkCursorHoverEnter(void* who, int kind, unsigned long* prevTid, void** prevWho, int* prevKind);
 void TalkCursorHoverLeave(unsigned long prevTid, void* prevWho, int prevKind);
+/* T-1022 (owner 1246 a): 1 = who (a character) is another player's character as startPlayerConversation's speaker test reads it
+   (TkPlayerSpeaker: a copy in a player's stand-in faction, an old save's stand-in record included), 0 = not or unreadable. policy.cpp's
+   showContextMenu detour hides Talk on it when it is not a teammate's. ANY THREAD. Defined in speech.cpp. */
+int TalkPlayerCharacter(void* who);
 void TalkCursorFaultReset();
 void TalkCursorCopyReady(unsigned int uid);
 void TalkCursorForgetNpc(unsigned int uid);

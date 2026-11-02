@@ -13,6 +13,11 @@
    - Whole messages: both transports hand up whole messages (the world-server connection unpacks the world server's bundles, the
      Steam link rejoins its pieces), and each is handed on as one message. Nothing is bundled toward the world server: a connection
      inside this PC gains nothing from it.
+   - Pieces (T-1118 (b) stage 2): a big message cut into CHUNK pieces (src/common/livefirst.h) - by the world server toward the
+     joiner, by the joiner's Steam link toward the world server - is NOT joined here: both of a pair's transports hand the pieces up
+     as they came (SetHandOnPieces, SteamListener::SetBridgeLinks) and each piece goes on as one message, never cut again; the far
+     end joins them. Both sides of the pair run the live-first waiting line, so a live message passes a record's pieces here too, and
+     the last piece of a barrier handed on is a barrier on the far side (livefirst.h HandOn).
    - Lanes: Message::lane is the lane a message arrived on; it is handed on on the same lane.
    - Order: a joiner's arrival is held, not accepted (SteamListener::SetHoldArrivals), while its own connection to the world server
      is dialled, and is accepted once that connection is up - so nothing the joiner sends (its HELLO first) arrives before the world
@@ -121,6 +126,28 @@ long long g_routeSteamUp = 0, g_routeSteamClosed = 0;
 int g_lastRoute = relaybridge::kRouteDirect;
 bool g_exitClosed = false;        /* RelayBridgeShutdown ran: the game is exiting and the bridge is never opened again */
 
+/* The bridge's world-server links' live-first counters (each pair's own ENet link, counted under nettally::kLinkBridge): taken from
+   every link at each REPORT and from a pair's link as it closes; counts since this game started, the two maxima since the last REPORT. */
+long long g_lwPassed = 0, g_lwWaited = 0, g_lwHeld = 0, g_lwWaitMaxMs = 0, g_lwAheadMaxMs = 0;
+long long g_lwAnnQueued = 0, g_lwAnnSent = 0, g_lwAnnWaitMaxMs = 0, g_lwGateHeld = 0;   /* the ANNOUNCE line, as the four above */
+long long g_lwBulkQueued = 0, g_lwBulkSent = 0, g_lwBulkHeld = 0, g_lwBulkBySize = 0, g_lwBulkByShare = 0, g_lwBulkBySticky = 0,
+          g_lwBulkWaitMaxMs = 0, g_lwAheadMaxBytes = 0;   /* T-1118 (c): the BULK line, as above (the two maxima since the last REPORT) */
+/* One pair's link's counters into the bridge's; true = a live-first link (*w then holds its budget and rate now). */
+bool TakeLiveWaitsOf(Pair* p, ITransport::LiveWaits* w)
+{
+    if (p == 0 || p->local == 0 || !p->local->TakeLiveWaits(w)) return false;
+    g_lwPassed += w->livePassed; g_lwWaited += w->liveWaited; g_lwHeld += w->barrierHeld;
+    if (w->liveWaitMaxMs > g_lwWaitMaxMs) g_lwWaitMaxMs = w->liveWaitMaxMs;
+    if (w->aheadMaxMs > g_lwAheadMaxMs) g_lwAheadMaxMs = w->aheadMaxMs;
+    g_lwAnnQueued += w->announceQueued; g_lwAnnSent += w->announceSent; g_lwGateHeld += w->gateHeld;
+    if (w->announceMaxWaitMs > g_lwAnnWaitMaxMs) g_lwAnnWaitMaxMs = w->announceMaxWaitMs;
+    g_lwBulkQueued += w->bulkQueued; g_lwBulkSent += w->bulkSent; g_lwBulkHeld += w->bulkHeld;
+    g_lwBulkBySize += w->bulkBySize; g_lwBulkByShare += w->bulkByShare; g_lwBulkBySticky += w->bulkBySticky;
+    if (w->bulkMaxWaitMs > g_lwBulkWaitMaxMs) g_lwBulkWaitMaxMs = w->bulkMaxWaitMs;
+    if (w->liveAheadMaxBytes > g_lwAheadMaxBytes) g_lwAheadMaxBytes = w->liveAheadMaxBytes;
+    return true;
+}
+
 Channel LaneOf(const Message& m) { return m.lane == CH_UNRELIABLE ? CH_UNRELIABLE : CH_RELIABLE; }
 const char* DataOf(const Message& m) { return m.payload.empty() ? 0 : &m.payload[0]; }
 
@@ -165,6 +192,7 @@ void ClosePairAt(size_t i, bool graceful, int heldEnd)
     if (p->local != 0)
     {
         if (p->local->State() == LINK_UP && graceful) p->local->Disconnect(); else p->local->Abort();   /* graceful: the joiner's last messages arrive */
+        { ITransport::LiveWaits w; TakeLiveWaitsOf(p, &w); }   /* its live-first counters outlive it */
         delete p->local;
         p->local = 0;
     }
@@ -210,6 +238,7 @@ bool OpenBridge(const std::string& storeAddr, unsigned short storePort, unsigned
     l->SetLinkTimeoutMs(coopgl::kGameLinkTimeoutMaximumMs);   /* a joiner's Steam link outlasts a world load here as the game link does */
     l->SetCap(ConfigRelayCap());   /* 0 (absent) = steamlisten::kLinkCap */
     l->SetHoldArrivals(true);      /* an arrival is accepted only once its own world-server connection is up */
+    l->SetBridgeLinks(true);       /* T-1118 (b) stage 2: live first toward the joiner; the world server's pieces handed on unjoined */
     std::string err;
     if (!l->Open(ipPort, &err))
     {
@@ -325,6 +354,7 @@ void NewPair(unsigned int link, DWORD now)
     if (p->local != 0)
     {
         p->local->SetStoreLink();   /* the world server's bundles are unpacked into whole messages; type 53 is a LIVE envelope */
+        p->local->SetHandOnPieces();   /* T-1118 (b) stage 2: its CHUNK pieces go to the joiner unjoined; the joiner's go on uncut */
         p->local->SetTrafficLink(nettally::kLinkBridge);   /* counted on the bridge's TRAFFIC REPORT line, not this game's own world link */
         p->local->SetPeerTimeouts(coopgl::kGameLinkTimeoutLimit, coopgl::kGameLinkTimeoutMinimumMs, coopgl::kGameLinkTimeoutMaximumMs);
         err.clear();
@@ -536,6 +566,34 @@ int RelayBridgeSteamFull(int* cap)
     return (c > 0 && g_listener->LinkCount() >= c) ? 1 : 0;
 }
 
+/* bridgeLiveFirst[links,livePassed,liveWaited,barrierHeld,liveWaitMaxMs,aheadMaxMs,budgetMin,rateKBsMax] - the bridge's world-server
+   links (each pair's own ENet link toward the world server), the same fields as the game's own link's liveFirst[...]: links = links
+   read now; livePassed / liveWaited / barrierHeld summed since this game started (closed pairs' included); liveWaitMaxMs = the
+   longest a live message waited in a link's line, aheadMaxMs = the longest it should wait in ENet behind bytes not yet sent, both
+   since the last REPORT; budgetMin / rateKBsMax = the smallest budget and the fastest measured drain of the links now;
+   announceQueued, announceSent, announceMaxWaitMs, gateHeld = the ANNOUNCE line, as the game's own liveFirst[...]. MAIN THREAD. */
+static std::string BridgeLiveFirstToken()
+{
+    long long links = 0, budgetMin = 0, rateMax = 0;
+    for (size_t i = 0; i < g_pairs.size(); ++i)
+    {
+        ITransport::LiveWaits w;
+        if (!TakeLiveWaitsOf(g_pairs[i], &w)) continue;
+        if (links == 0 || w.budget < budgetMin) budgetMin = w.budget;
+        if (w.rateBps > rateMax) rateMax = w.rateBps;
+        ++links;
+    }
+    const std::string t = " bridgeLiveFirst[links,livePassed,liveWaited,barrierHeld,liveWaitMaxMs,aheadMaxMs,budgetMin,rateKBsMax,announceQueued,announceSent,announceMaxWaitMs,gateHeld,"
+                          "bulkQueued,bulkSent,bulkHeld,bulkBySize,bulkByShare,bulkBySticky,bulkMaxWaitMs,liveAheadMaxBytes]=" + N(links) + ","
+        + N(g_lwPassed) + "," + N(g_lwWaited) + "," + N(g_lwHeld) + "," + N(g_lwWaitMaxMs) + "," + N(g_lwAheadMaxMs) + "," + N(budgetMin) + "," + N(rateMax / 1024)
+        + "," + N(g_lwAnnQueued) + "," + N(g_lwAnnSent) + "," + N(g_lwAnnWaitMaxMs) + "," + N(g_lwGateHeld)
+        + "," + N(g_lwBulkQueued) + "," + N(g_lwBulkSent) + "," + N(g_lwBulkHeld) + "," + N(g_lwBulkBySize) + "," + N(g_lwBulkByShare) + "," + N(g_lwBulkBySticky)
+        + "," + N(g_lwBulkWaitMaxMs) + "," + N(g_lwAheadMaxBytes);   /* T-1118 (c): the BULK line, as the game's own liveFirst[...] */
+    g_lwWaitMaxMs = 0; g_lwAheadMaxMs = 0; g_lwAnnWaitMaxMs = 0;   /* the maxima restart at each REPORT */
+    g_lwBulkWaitMaxMs = 0; g_lwAheadMaxBytes = 0;
+    return t;
+}
+
 std::string RelayBridgeReportToken()
 {
     return "relayBridge[open,linksNow,linksMax,accepted,refused,serverUp,serverFailed,ended,toServer,toJoiner,bytesToServer,bytesToJoiner,"
@@ -547,7 +605,7 @@ std::string RelayBridgeReportToken()
            + N(g_bs.stalls) + "," + N(g_bs.stallMaxMs) + "," + N(g_bs.opened) + "," + N(g_bs.openFailed) + "," + N(g_bs.arrived) + "," + N(g_bs.heldRefused) + "," + N(g_bs.waitedMax) + "," + N(g_bs.idKnown) + "," + N(g_bs.idUnchecked) + "," + N(g_bs.idNoToken)
            + " relayRoute[direct,steam,steamIp,steamUp,steamClosed]=" + N(g_routeDials[relaybridge::kRouteDirect]) + ","
            + N(g_routeDials[relaybridge::kRouteSteam]) + "," + N(g_routeDials[relaybridge::kRouteSteamIpTest]) + "," + N(g_routeSteamUp) + ","
-           + N(g_routeSteamClosed);
+           + N(g_routeSteamClosed) + BridgeLiveFirstToken();
 }
 
 int RelayRouteFor(const std::string& address)

@@ -250,6 +250,34 @@ inline int GroundNearBetter(int rankA, long long dyA, long long d2A, int rankB, 
     if (dyA != dyB) return dyA < dyB ? 1 : 0;
     return d2A < d2B ? 1 : 0;
 }
+/* T-1129: THE DROP RECORD'S PICK - 1 = candidate A (flat distance squared, height difference) is a better match for one of this
+   game's own drop records than B. A drop record's key is taken as the item leaves the hand, before it falls (T629: placed at 3065.5,
+   landed at 1532.9), so its height is no evidence on its own: the smaller flat distance first, as the drop road's match; the height
+   difference decides only when the flat distances tie - a pile's items lie at one flat spot at different heights. */
+inline int GroundDropPickBetter(long long d2A, long long dyA, long long d2B, long long dyB)
+{
+    if (d2A != d2B) return d2A < d2B ? 1 : 0;
+    return dyA < dyB ? 1 : 0;
+}
+/* T-1129: among n candidate keys (taken[i] != 0 skipped; taken 0 = none taken) the index of the one a drop record `rec` matches by
+   nearness: the same sid within kGroundNearTenths flat of rec, in GroundDropPickBetter order with each candidate's height compared
+   to refY10 (the item's last-seen height here when known, else the record's own); a full tie keeps the first listed. -1 = none. */
+inline int GroundDropPick(const GroundKeyParts* cand, const unsigned char* taken, int n, const GroundKeyParts& rec, long refY10)
+{
+    const long long nearMax = (long long)kGroundNearTenths * kGroundNearTenths;
+    int best = -1;
+    long long bD = 0, bDy = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (taken != 0 && taken[i] != 0) continue;
+        const long long d2 = GroundKeyDist2XZ(cand[i], rec);
+        if (d2 < 0 || d2 > nearMax) continue;
+        const long long dy0 = (long long)cand[i].y10 - (long long)refY10;
+        const long long dy = dy0 < 0 ? -dy0 : dy0;
+        if (best < 0 || GroundDropPickBetter(d2, dy, bD, bDy) != 0) { best = i; bD = d2; bDy = dy; }
+    }
+    return best;
+}
 
 /* inv5 phase 1: the position a receiver places a created ground item at - the key's own tenths. No float rides on the wire;
    a float rebuilt from its tenths rounds back to the same tenths for any plausible world coordinate (offline test), so both

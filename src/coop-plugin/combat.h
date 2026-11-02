@@ -169,7 +169,8 @@ void HandCopyDespawned(unsigned int uid);
 bool HandResendOwned(unsigned int uid);
 
 // The six stance buttons of a character as STATE latchBits bits 8-13, bit 14 'read' (statewire.h WithStance), and its ranged
-// mode as bits 15-16 (WithRangedMode); 0 when unreadable.
+// mode as bits 15-16 (WithRangedMode), whether it aims as bits 17-18 (WithAim) and whether it reloads as bits 19-20
+// (WithReload); 0 when unreadable.
 unsigned int StanceStateBits(const void* c);
 // MAIN THREAD (spawn.cpp ApplyState): the owner's stance buttons from its STATE onto the copy of another game's player character,
 // through the engine's own setter; a switch into block or passive drops the copy's unthrown swing credits. Also keeps the owner's

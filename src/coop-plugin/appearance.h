@@ -241,5 +241,6 @@ unsigned int KoSelfLastUid();
 // 1 = an animal (the appearance vtable holds AppearanceAnimal::createBody 0x539C50), 0 = another class, -1 = unreadable.
 int GroundAnimalAppPod(::Character* c);
 std::string GroundRaceName(::Character* c);   // the appearance's race record name, "?" = unreadable
+int KapiRaceSidOf(::Character* c, char* out, int cap);   // per-race rules: the race record's string ID; 1 copied, 0 none, 2 too long
 
 } // namespace coop

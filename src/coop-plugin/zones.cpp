@@ -14,6 +14,7 @@
 #include "../common/peergone.h"   /* M8 review F9: the loaded-bit rule of a departure (PeerGoneMaskBits), swept by the offline suite */
 #include "../common/loadedzones.h"   /* the loaded set from the engine's active-zone list (SectorOfZoneAt, Normalise, CountSources), swept by the offline suite */
 #include "../common/liveowner.h"   /* EngineKeepsAt - the engine's keep rule, swept by the offline suite */
+#include "../common/townnear.h"   /* T-795 step 4: the townnear reply line, swept by the offline suite */
 #include "coop_log.h"
 namespace { swlogbudget::Gate g_qZonesPlayer; }   /* the release build's quiet-logging gates (coop_log.h SW_QUIETLOG) */
 #include "game/Character.h"
@@ -1614,6 +1615,18 @@ bool TownDistances(float x, float z, std::vector<std::pair<std::string, float> >
     }
     return true;
 }
+// T-795 step 4: `townnear` (TEST, read-only) - the nearest town to this game's player character (GetTarget, as `towns`) and its
+// distance on the ground, one reply line (townnear.h Reply); the harness's town-far check reads dist=. Nothing is changed.
+std::string TownNearCommand()
+{
+    ::Character* pc = GetTarget(); float px = 0, py = 0, pz = 0;
+    if (!PlausiblePod(pc) || !ReadPosition(pc, &px, &py, &pz)) return "error townnear: no player";
+    std::vector<std::pair<std::string, float> > rows; unsigned faults = 0;
+    if (!TownDistances(px, pz, &rows, &faults)) return "error townnear: no town list";
+    const std::string line = swtownnear::Reply(rows, faults, px, pz);
+    DebugLog("[TOWNS] " + line);
+    return line;
+}
 }
 
 namespace coop { void ZonesInitLocks() { HeldLockInit(); } }   // called from InstallTownGen (preload, main thread) before any worker can reach HostHoldsSectorTS
@@ -1801,20 +1814,23 @@ void AreaProbeTS(const Sector& s, int* owner, double* heldAge)
 // PROBE-END: P025
 /* M7b slice 2 (T-197): the area's HOLDER for deciding - the same grid AreaProbeTS reports, read under the same lock with the
    freshness every other area answer has (a map no older than 5 s). -1 = unknown. */
-int AreaHolderSlotTS(const Sector& s)
+int AreaHolderSlotAgeTS(const Sector& s, int* mapFresh)   /* T-1129 part 3: mapFresh = the same 5 s freshness, read under the same lock */
 {
-    int o = -1, frozen = 0;
+    int o = -1, frozen = 0, fresh = 0;
     if (s.x >= 0 && s.x < 64 && s.y >= 0 && s.y < 64)
     {
         HeldLockInit();
         ::EnterCriticalSection(&g_heldLock);
-        if (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) o = g_ownerSlot[s.x][s.y];
+        fresh = (g_hostHeldAt > 0.0 && NowSec() - g_hostHeldAt <= 5.0) ? 1 : 0;
+        if (fresh != 0) o = g_ownerSlot[s.x][s.y];
         if (o >= 0 && g_areaFrozen[s.x][s.y] != 0) { frozen = 1; ++g_areaFrozenAnswers; }
         ::LeaveCriticalSection(&g_heldLock);
     }
+    if (mapFresh != 0) *mapFresh = fresh;
     if (frozen != 0) return coopdrop::kAreaFrozen;   /* -2 frozen: the holder is a player not in the world */
     return (o >= 0) ? o : -1;
 }
+int AreaHolderSlotTS(const Sector& s) { return AreaHolderSlotAgeTS(s, 0); }
 // THE RULE ITSELF, over a view somebody else has already read. One copy, called from the wrapper below AND from every gate
 // that needs the refusal's CAUSE as well as the decision (review-p5g Q5: those gates used to ask a SECOND question through
 // HeldByOtherTS after the decision, so an AREAMAP arriving between the two could label a refusal with a different map's

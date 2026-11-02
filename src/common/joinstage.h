@@ -217,7 +217,14 @@ inline bool HelloTailDecode(const char* p, size_t n, size_t at, HelloTail* t)
 }
 
 /* PLAYERS (54, down): every admitted game, sorted by slot, then u32 worldPlayers - every player number this world's server ever
-   gave (slots.txt, connected or not), so every game counts the same players (slotwire.h LegacyPeerIsMineByWorld). */
+   gave (slots.txt, connected or not), so every game counts the same players (slotwire.h LegacyPeerIsMineByWorld) - then (world-server
+   protocol 131) u32 opVacant: 1 = a kept world's steward post is empty with its owner gone (worldroles::JoinWaitsForNobody) - nobody
+   is in the world and nobody will be until a game loads in, so a joiner's load does not wait for an operator (JoinOperatorReady).
+   0 in every hosted and world-door world, and in a kept world before its owner's game first arrived.
+   A row's op is a set of bits (world-server protocol 132): kRosterOpSteward = that game holds the steward's duties (every copy);
+   kRosterOpAdmin = that player is on the world's admin list and kRosterOpOwner = that player is the owner - these two only in the copy
+   sent to the owner's own game (admincmd.h RosterOp), which alone may MAKE / REMOVE ADMIN. A login is never marked. */
+const unsigned kRosterOpSteward = 1u, kRosterOpAdmin = 2u, kRosterOpOwner = 4u, kRosterOpBits = 7u;
 const unsigned kWorldPlayersMax = 1024;   /* the notebook's slots 0..1023 */
 struct RosterRow
 {
@@ -231,16 +238,17 @@ inline void RosterSortBySlot(std::vector<RosterRow>* rows)
     for (size_t i = 1; i < rows->size(); ++i)
         for (size_t j = i; j > 0 && (*rows)[j - 1].slot > (*rows)[j].slot; --j) { RosterRow t = (*rows)[j - 1]; (*rows)[j - 1] = (*rows)[j]; (*rows)[j] = t; }
 }
-inline bool RosterEncode(const std::vector<RosterRow>& rows, unsigned worldPlayers, std::vector<char>* b)
+inline bool RosterEncode(const std::vector<RosterRow>& rows, unsigned worldPlayers, std::vector<char>* b, bool opVacant = false)
 {
     if (rows.size() > kRosterMax || worldPlayers > kWorldPlayersMax) return false;
     JsPut32(b, (unsigned)rows.size());
     for (size_t i = 0; i < rows.size(); ++i)
-    { JsPut32(b, rows[i].slot); JsPut32(b, rows[i].stage); JsPut32(b, rows[i].op ? 1u : 0u); JsPutStr(b, rows[i].name); JsPutF32(b, rows[i].viewDist); }
+    { JsPut32(b, rows[i].slot); JsPut32(b, rows[i].stage); JsPut32(b, rows[i].op & kRosterOpBits); JsPutStr(b, rows[i].name); JsPutF32(b, rows[i].viewDist); }
     JsPut32(b, worldPlayers);
+    JsPut32(b, opVacant ? 1u : 0u);
     return true;
 }
-inline bool RosterDecode(const char* p, size_t n, std::vector<RosterRow>* out, unsigned* worldPlayers)
+inline bool RosterDecode(const char* p, size_t n, std::vector<RosterRow>* out, unsigned* worldPlayers, bool* opVacant = 0)
 {
     size_t at = 0; unsigned cnt = 0;
     if (!JsGet32(p, n, &at, &cnt) || cnt > kRosterMax) return false;
@@ -249,19 +257,29 @@ inline bool RosterDecode(const char* p, size_t n, std::vector<RosterRow>* out, u
     {
         RosterRow r;
         if (!JsGet32(p, n, &at, &r.slot) || !JsGet32(p, n, &at, &r.stage) || !JsGet32(p, n, &at, &r.op) || !JsGetStr(p, n, &at, &r.name) || !JsGetF32(p, n, &at, &r.viewDist)) return false;
-        if (r.stage > (unsigned)kStageInWorld || r.op > 1) return false;
+        if (r.stage > (unsigned)kStageInWorld || r.op > kRosterOpBits) return false;
         rows.push_back(r);
     }
     unsigned wp = 0;
     if (!JsGet32(p, n, &at, &wp) || wp > kWorldPlayersMax) return false;
+    unsigned vac = 0;
+    if (!JsGet32(p, n, &at, &vac) || vac > 1) return false;
     if (at != n) return false;   /* exact: a longer frame is another shape */
     *out = rows;
     if (worldPlayers != 0) *worldPlayers = wp;
+    if (opVacant != 0) *opVacant = vac != 0;
     return true;
+}
+/* THE JOIN GATE'S "OPERATOR" ANSWER. A game that is the steward itself waits for nobody; else this link's roster must show the
+   operator in the world, or say the kept world's post is vacant with its owner gone (opVacant) - then the first game to load in
+   takes the duties once it is in the world (worldroles::StewardFor), and its save is a joiner's while it loads (no AUTH yet). */
+inline bool JoinOperatorReady(bool isSteward, bool rosterThisLink, bool operatorInWorld, bool opVacant)
+{
+    return isSteward || (rosterThisLink && (operatorInWorld || opVacant));
 }
 inline bool RosterOperatorInWorld(const std::vector<RosterRow>& rows)
 {
-    for (size_t i = 0; i < rows.size(); ++i) if (rows[i].op != 0 && rows[i].stage == (unsigned)kStageInWorld) return true;
+    for (size_t i = 0; i < rows.size(); ++i) if ((rows[i].op & kRosterOpSteward) != 0 && rows[i].stage == (unsigned)kStageInWorld) return true;
     return false;
 }
 /* M11a S3 (T-197; manager decision 7(a), 2026-09-30) - THE OPERATOR ON THE ROSTER, FOR A WORLD-ROAD GAME'S HOST-LEFT.
@@ -272,7 +290,7 @@ inline bool RosterOperatorInWorld(const std::vector<RosterRow>& rows)
    hold, so a blip it forgives never reaches here - names the operator's slot, and no roster since lists that slot again. */
 inline int RosterOperatorSlot(const std::vector<RosterRow>& rows)
 {
-    for (size_t i = 0; i < rows.size(); ++i) if (rows[i].op != 0) return (int)rows[i].slot;
+    for (size_t i = 0; i < rows.size(); ++i) if ((rows[i].op & kRosterOpSteward) != 0) return (int)rows[i].slot;
     return -1;
 }
 inline bool RosterListsSlot(const std::vector<RosterRow>& rows, int slot)
@@ -324,7 +342,9 @@ inline std::string RosterText(const std::vector<RosterRow>& rows, int mySlot)
         s += b;
         s += rows[i].name.empty() ? std::string("(no name)") : "'" + JsLogSafe(rows[i].name) + "'";
         s += std::string(" ") + StageName((int)rows[i].stage);
-        if (rows[i].op != 0) s += " operator";
+        if ((rows[i].op & kRosterOpSteward) != 0) s += " operator";
+        if ((rows[i].op & kRosterOpAdmin) != 0) s += " admin";
+        if ((rows[i].op & kRosterOpOwner) != 0) s += " owner";
         if (mySlot >= 0 && rows[i].slot == (unsigned)mySlot) s += " (this game)";
     }
     return s;

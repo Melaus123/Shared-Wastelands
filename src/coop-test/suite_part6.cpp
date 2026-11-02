@@ -2118,33 +2118,336 @@ void t_steamlink_linger_buffer()
     if (relaysplit::LingerBufferBytes(-5, normal, cap) != normal) Fail("a negative queue count");
 }
 
-/* THE STEAM LINK'S SEND RATE (relaysplit.h NextSendRate, owner decision 594): each branch, the floor and the ceiling, unknown
-   quality, no waiting data. */
+/* THE STEAM LINK'S SEND RATE (relaysplit.h NextSendRate): only the far end's quality (how well this end's sends arrive) judges
+   delivery. A fresh reading is a changed value, or the same value kSendRateReadingMs after the last one counted; the repeats between
+   are not readings. A cut takes a fifth off after kSendRateLossReadings fresh bad readings while the link is busy, at least
+   kSendRateReadingMs apart, with no fresh clean reading between, or after a rising ping; never below the floor. Loss on an idle link
+   never cuts and does not break a run. kSendRateProveReadings fresh clean readings at one rate prove it; the quick climb goes only up
+   to the proven rate; after a cut the rate cut to holds until proven, then grows; on a connection never cut growth is unchanged; a
+   reconnect (Reset) forgets everything. Each step of a SendRateLink is one second on its own clock. */
+namespace
+{
+struct SendRateLink
+{
+    relaysplit::SendRateState s;
+    unsigned int now;
+    SendRateLink() : now(5000u) {}
+    int Step(int rate, float qL, float qR, int ping, float outBps, unsigned int waiting, int* why)
+    {
+        const int next = relaysplit::NextSendRate(s, now, rate, qL, qR, ping, outBps, waiting, why);
+        now += 1000u;
+        return next;
+    }
+};
+}
+
 void t_steamlink_send_rate()
 {
     const int start = relaysplit::kSendRateStartBytes, low = relaysplit::kSendRateFloorBytes, top = relaysplit::kSendRateCeilingBytes;
-    if (start != 524288 || low != 131072 || top != 4194304) Fail("the start, floor and ceiling");
+    if (start != 524288 || low != 262144 || top != 4194304) Fail("the start, floor and ceiling");
+    if (relaysplit::kSendRateBadSteps != 3 || relaysplit::kSendRateLossReadings != 2 || relaysplit::kSendRateReadingMs != 20000u || relaysplit::kSendRateLossGapMs != 15000u
+        || relaysplit::kSendRateBusyPercent != 50 || relaysplit::kSendRateBusyWaitMs != 100 || relaysplit::kSendRateProveReadings != 2
+        || relaysplit::kSendRateCutPercent != 20 || relaysplit::kSendRateClimbPercent != 25
+        || relaysplit::kSendRateDelayPercent != 50 || relaysplit::kSendRateDelayMinMs != 100 || relaysplit::kSendRateSettleSteps != 10)
+        Fail("the rule's numbers");
     const unsigned int lots = 1000000u;
-    /* halve: either quality known and below 0.97 */
-    if (relaysplit::NextSendRate(start, 0.96f, 1.0f, lots) != start / 2) Fail("local loss halves");
-    if (relaysplit::NextSendRate(start, 1.0f, 0.5f, 0) != start / 2) Fail("remote loss halves, data waiting or not");
-    if (relaysplit::NextSendRate(start, 0.5f, -1.0f, lots) != start / 2) Fail("local loss halves while remote is unknown");
-    if (relaysplit::NextSendRate(start, -1.0f, 0.9f, lots) != start / 2) Fail("remote loss halves while local is unknown");
-    if (relaysplit::NextSendRate(200000, 0.0f, 0.0f, 0) != low) Fail("halving stops at the floor");
-    if (relaysplit::NextSendRate(low, 0.1f, 0.1f, 0) != low) Fail("the floor holds");
-    /* raise: both known and at least 0.99, more than a quarter of the rate waiting */
-    if (relaysplit::NextSendRate(start, 0.99f, 1.0f, (unsigned int)(start / 4) + 1u) != start + start / 4) Fail("clean delivery with data waiting raises a quarter");
-    if (relaysplit::NextSendRate(start, 1.0f, 1.0f, (unsigned int)(start / 4)) != start) Fail("exactly a quarter waiting keeps");
-    if (relaysplit::NextSendRate(start, 1.0f, 1.0f, 0) != start) Fail("no waiting data keeps");
-    if (relaysplit::NextSendRate(4000000, 1.0f, 1.0f, lots * 4) != top) Fail("raising stops at the ceiling");
-    if (relaysplit::NextSendRate(top, 1.0f, 1.0f, 4294967295u) != top) Fail("the ceiling holds");
-    /* keep: quality from 0.97 to under 0.99, or not known */
-    if (relaysplit::NextSendRate(start, 0.98f, 1.0f, lots) != start) Fail("0.98 keeps");
-    if (relaysplit::NextSendRate(start, 0.97f, 0.97f, lots) != start) Fail("exactly 0.97 keeps");
-    if (relaysplit::NextSendRate(start, -1.0f, -1.0f, lots) != start) Fail("both unknown keeps");
-    if (relaysplit::NextSendRate(start, -1.0f, 1.0f, lots) != start) Fail("local unknown does not raise");
-    if (relaysplit::NextSendRate(start, 1.0f, -1.0f, lots) != start) Fail("remote unknown does not raise");
-    if (relaysplit::NextSendRate(start, 1.5f, 1.0f, lots) != start) Fail("an out-of-range quality is unknown");
+    const int cut1 = 419430, cut2 = 335544;   /* start less a fifth, and less a fifth again */
+    const int readSteps = (int)(relaysplit::kSendRateReadingMs / 1000u);   /* 20 one-second steps between Steam's quality refreshes */
+    int why = -1;
+    {   /* the idle link seen live: the far end's quality held at 0.93 for 60 s, about 1.7 KB/s going out against 512 KB/s, nothing
+           waiting - the fresh readings (at 0, 20 and 40 s) are seen, but loss on an idle link says nothing about the rate: no cut */
+        SendRateLink a;
+        int freshSeen = 0;
+        for (int k = 0; k < 60; ++k)
+        {
+            if (a.Step(start, 1.0f, 0.93f, 60, 1700.0f, 0, &why) != start || why != relaysplit::kRateKeep) Fail("idle loss: no cut");
+            if (a.s.busy || a.s.lossRun != 0 || a.s.hadCut) Fail("idle loss: not busy, no run");
+            if (a.s.fresh) ++freshSeen;
+        }
+        if (freshSeen != 3) Fail("idle loss: a held reading is fresh once every 20 s");
+    }
+    {   /* Steam's refresh seen 19 s after the first counted bad reading (the link steps once a second, so a refresh lands 19-21 s
+           on): the changed value counts and cuts at k == 19; a change only 10 s on is a fresh reading but not counted */
+        SendRateLink g;
+        int rate = start, cutAt = -1;
+        for (int k = 0; k < 25; ++k)
+        {
+            const float q = (k < 19) ? 0.93f : 0.92f;
+            const int next = g.Step(rate, 1.0f, q, 60, (float)rate, 0, &why);
+            if (why == relaysplit::kRateSustainedLoss && cutAt < 0) cutAt = k;
+            rate = next;
+        }
+        if (cutAt != 19) Fail("busy loss: a refresh seen 19 s on counts");
+        SendRateLink h;
+        rate = start; cutAt = -1;
+        for (int k = 0; k < 25; ++k)
+        {
+            const float q = (k < 10) ? 0.93f : 0.92f;
+            const int next = h.Step(rate, 1.0f, q, 60, (float)rate, 0, &why);
+            if (why == relaysplit::kRateSustainedLoss && cutAt < 0) cutAt = k;
+            if (k == 10 && (!h.s.fresh || h.s.lossRun != 1)) Fail("busy loss: a change 10 s on is fresh but not counted");
+            rate = next;
+        }
+        if (cutAt >= 0) Fail("busy loss: no cut on two readings 10 s apart");
+    }
+    {   /* an unknown far-end quality on one step between two fresh clean readings: neither clean nor bad, the proving count keeps */
+        SendRateLink u;
+        u.Step(start, 1.0f, 1.0f, 60, 0.0f, 0, &why);
+        u.Step(start, 1.0f, -1.0f, 60, 0.0f, 0, &why);
+        if (u.s.cleanReadings != 1) Fail("unknown quality: the proving count keeps");
+    }
+    {   /* a busy lossy link, the far end's quality held at 0.93 for 45 s while sending at the rate: the first reading counts, its
+           repeats do not, the unchanged value 20 s later is the second reading and cuts a fifth; the run then starts again (the
+           reading at 40 s is its first): exactly one cut */
+        SendRateLink b;
+        int rate = start, cuts = 0;
+        for (int k = 0; k < 45; ++k)
+        {
+            const int next = b.Step(rate, 1.0f, 0.93f, 60, (float)rate, 0, &why);
+            if (why == relaysplit::kRateSustainedLoss)
+            {
+                ++cuts;
+                if (k != readSteps || next != cut1) Fail("busy loss held: the cut comes at the second fresh reading, 20 s on");
+            }
+            else if (next != rate) Fail("busy loss held: no other change");
+            if (k == 1 && (b.s.fresh || b.s.lossRun != 1)) Fail("busy loss held: a repeat is no reading");
+            rate = next;
+        }
+        if (cuts != 1 || b.s.lossRun != 1 || !b.s.hadCut || b.s.proven != 0) Fail("busy loss held: exactly one cut, the run started again");
+        /* the same with the value changing at Steam's 20 s refreshes (0.93, 0.92, 0.93) and busy by data waiting (just over 100 ms of
+           the rate) while Steam's outgoing average reads 0 */
+        SendRateLink c;
+        rate = start; cuts = 0;
+        for (int k = 0; k < 45; ++k)
+        {
+            const float q = ((k / readSteps) % 2 == 0) ? 0.93f : 0.92f;
+            const int next = c.Step(rate, 1.0f, q, 60, 0.0f, (unsigned int)(rate / 10 + 1), &why);
+            if (why == relaysplit::kRateSustainedLoss)
+            {
+                ++cuts;
+                if (k != readSteps || next != cut1) Fail("busy loss changing: the cut comes at the second fresh reading");
+            }
+            rate = next;
+        }
+        if (cuts != 1 || c.s.lossRun != 1) Fail("busy loss changing: exactly one cut");
+    }
+    {   /* busy: Steam's outgoing bytes per second at least half the rate, or MORE than 100 ms of the rate waiting */
+        SendRateLink e;
+        e.Step(start, 1.0f, 0.93f, 60, (float)(start / 2), 0, &why);
+        if (!e.s.busy || !e.s.fresh || e.s.lossRun != 1) Fail("half the rate going out is busy");
+        SendRateLink f;
+        f.Step(start, 1.0f, 0.93f, 60, (float)(start / 2 - 1), (unsigned int)(start / 10), &why);
+        if (f.s.busy || !f.s.fresh || f.s.lossRun != 0) Fail("just under half going out and 100 ms waiting is idle");
+        SendRateLink g;
+        g.Step(start, 1.0f, 0.93f, 60, 0.0f, (unsigned int)(start / 10) + 1u, &why);
+        if (!g.s.busy || g.s.lossRun != 1) Fail("over 100 ms waiting is busy");
+    }
+    {   /* a stale repeat: the same value within 20 s is one reading, counted once; a changed value 5 s on is fresh but too close to
+           the counted one to count; the unchanged value 20 s after that change is fresh again and, 25 s after the first, cuts */
+        SendRateLink r;
+        for (int k = 0; k < 26; ++k)
+        {
+            const float q = k < 5 ? 0.93f : 0.92f;
+            const int next = r.Step(start, 1.0f, q, 60, (float)start, 0, &why);
+            if (r.s.fresh != (k == 0 || k == 5 || k == 25)) Fail("stale repeat: which steps are fresh readings");
+            if (k < 25 && (next != start || r.s.lossRun != 1)) Fail("stale repeat: counted once, no cut");
+            if (k == 25 && (next != cut1 || why != relaysplit::kRateSustainedLoss)) Fail("stale repeat: the reading 20 s on cuts");
+        }
+    }
+    {   /* this end's own receive quality decides nothing: local 0.5, remote clean, busy for 60 s - no cut, and the two fresh clean
+           readings (0 and 20 s) prove the rate */
+        SendRateLink l;
+        for (int k = 0; k < 60; ++k)
+        {
+            if (l.Step(start, 0.5f, 1.0f, 60, (float)start, 0, &why) != start || why != relaysplit::kRateKeep) Fail("local bad: no cut");
+            if (l.s.proven != (k < readSteps ? 0 : start)) Fail("local bad: the second fresh clean reading proves the rate");
+        }
+        if (l.s.hadCut || l.s.lossRun != 0) Fail("local bad: no run");
+    }
+    {   /* a fresh clean reading between two bad ones empties the run: bad (0 s), clean (10 s), bad (20 s) is a run of one; the cut
+           waits for the reading 20 s after the second bad one */
+        SendRateLink m;
+        for (int k = 0; k <= 40; ++k)
+        {
+            const float q = (k >= 10 && k < 20) ? 1.0f : 0.93f;
+            const int next = m.Step(start, 1.0f, q, 60, (float)start, 0, &why);
+            if (k < 40 && next != start) Fail("clean between: no cut");
+            if (k == 40 && (next != cut1 || why != relaysplit::kRateSustainedLoss)) Fail("clean between: the run restarted at 20 s");
+        }
+        /* an idle bad reading between two busy bad ones neither counts nor breaks the run */
+        SendRateLink n;
+        for (int k = 0; k <= 40; ++k)
+        {
+            const bool idle = k >= 20 && k < 40;
+            const float q = idle ? 0.92f : 0.93f;
+            const int next = n.Step(start, 1.0f, q, 60, idle ? 1700.0f : (float)start, 0, &why);
+            if (k == 20 && (!n.s.fresh || n.s.busy || n.s.lossRun != 1)) Fail("idle between: seen, not counted, the run kept");
+            if (k < 40 && next != start) Fail("idle between: no cut");
+            if (k == 40 && (next != cut1 || why != relaysplit::kRateSustainedLoss)) Fail("idle between: the busy reading 40 s on cuts");
+        }
+        /* a middling (0.98) or unknown reading neither counts nor breaks the run; exactly 0.97 is not bad */
+        SendRateLink o;
+        for (int k = 0; k <= 20; ++k)
+        {
+            const float q = k < 10 ? 0.93f : (k < 15 ? 0.98f : (k < 20 ? -1.0f : 0.93f));
+            const int next = o.Step(start, 1.0f, q, 60, (float)start, 0, &why);
+            if (k < 20 && next != start) Fail("middling and unknown: no cut");
+            if (k == 20 && next != cut1) Fail("middling and unknown: the run kept, the bad reading 20 s on cuts");
+        }
+        SendRateLink p;
+        for (int k = 0; k < 45; ++k)
+            if (p.Step(start, 1.0f, 0.97f, 60, (float)start, 0, &why) != start || p.s.lossRun != 0) Fail("exactly 0.97 is not bad");
+        if (p.Step(start, 1.0f, 1.5f, 0, 0.0f, lots, &why) != start) Fail("an out-of-range quality is unknown and does not grow");
+    }
+    {   /* a transient loss at a proven rate r: two fresh clean readings prove r; busy loss cuts to 0.8 r and r is no longer proven;
+           0.8 r holds with data waiting until its second fresh clean reading proves it (not before), then grows a quarter (to about
+           r), and the grown rate waits to be proven before growing further */
+        SendRateLink t;
+        for (int k = 0; k <= readSteps; ++k) t.Step(start, 1.0f, 1.0f, 60, 0.0f, 0, &why);
+        if (t.s.proven != start) Fail("transient: two fresh clean readings prove r");
+        int rate = start, k = 0;
+        for (; k < readSteps; ++k)
+            if ((rate = t.Step(rate, 1.0f, 0.93f, 60, (float)rate, 0, &why)) != start) Fail("transient: one counted reading does not cut");
+        if (t.Step(rate, 1.0f, 0.93f, 60, (float)rate, 0, &why) != cut1 || why != relaysplit::kRateSustainedLoss || t.s.proven != 0)
+            Fail("transient: the cut to 0.8 r forgets r as proven");
+        if (t.Step(cut1, 1.0f, 1.0f, 60, (float)cut1, lots, &why) != cut1 || why != relaysplit::kRateKeep || t.s.cleanReadings != 1)
+            Fail("transient: the first fresh clean reading after the cut counts, no growth");
+        for (k = 1; k < readSteps; ++k)
+            if (t.Step(cut1, 1.0f, 1.0f, 60, (float)cut1, lots, &why) != cut1 || why != relaysplit::kRateKeep || t.s.proven != 0)
+                Fail("transient: 0.8 r holds until proven");
+        if (t.Step(cut1, 1.0f, 1.0f, 60, (float)cut1, lots, &why) != cut1 + cut1 / 4 || why != relaysplit::kRateGrowth || t.s.proven != cut1)
+            Fail("transient: the second fresh clean reading proves 0.8 r and growth tries about r");
+        if (t.Step(cut1 + cut1 / 4, 1.0f, 1.0f, 60, (float)cut1, lots, &why) != cut1 + cut1 / 4 || why != relaysplit::kRateKeep)
+            Fail("transient: the grown rate waits to be proven before growing again");
+    }
+    {   /* the quick climb, from a set state (a failed probe's cut lands at the proven rate or one byte under it): a quarter per clean
+           step, rounded up, no waiting data and no fresh reading needed, never past the proven rate; an unclean step keeps */
+        SendRateLink c;
+        c.s.proven = start;
+        if (c.Step(cut2, 1.0f, 0.98f, 0, 0.0f, 0, &why) != cut2 || why != relaysplit::kRateKeep) Fail("no climb on an unclean step");
+        if (c.Step(cut2, 0.5f, 0.99f, 0, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateClimb) Fail("the first climb step");
+        if (c.Step(cut1, 1.0f, 0.99f, 0, 0.0f, 0, &why) != start || why != relaysplit::kRateClimb) Fail("the climb stops at the proven rate");
+    }
+    {   /* the floor: a cut stops at it and it holds while the loss goes on; with nothing proven a clean reading does not climb */
+        SendRateLink s;
+        int rate = 300000;
+        for (int k = 0; k <= readSteps; ++k) rate = s.Step(rate, 1.0f, 0.5f, 0, (float)rate, 0, &why);
+        if (rate != low || why != relaysplit::kRateSustainedLoss) Fail("a cut stops at the floor");
+        for (int k = 0; k < 3 * readSteps; ++k)
+            if (s.Step(low, 1.0f, 0.5f, 0, (float)low, 0, &why) != low || why != relaysplit::kRateKeep) Fail("the floor holds");
+        if (s.Step(low, 1.0f, 1.0f, 0, (float)low, 0, &why) != low || why != relaysplit::kRateKeep || s.s.lossRun != 0)
+            Fail("a fresh clean reading empties the run; no climb from the floor with nothing proven");
+        SendRateLink f;
+        for (int k = 0; k <= readSteps; ++k)
+            if (f.Step(low, 1.0f, 0.5f, 0, (float)low, 0, &why) != low || f.s.hadCut) Fail("loss at the floor is no cut");
+    }
+    {   /* rising delay (unchanged): needs a full window of three pings; at least half again and 100 ms above the window's lowest cuts */
+        SendRateLink s;
+        if (s.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why) != start || s.Step(start, 1.0f, 1.0f, 500, 0.0f, 0, &why) != start)
+            Fail("no delay cut without a full window");
+        SendRateLink d;
+        d.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why); d.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why); d.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why);
+        if (d.Step(start, 1.0f, 1.0f, 140, 0.0f, 0, &why) != start) Fail("50 -> 140 ms is under the 100 ms margin");
+        if (d.Step(start, 1.0f, 1.0f, 0, 0.0f, 0, &why) != start) Fail("an unknown ping is not rising");
+        if (d.Step(start, 1.0f, 1.0f, 150, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateRisingDelay) Fail("50 -> 150 ms is rising delay");
+        if (d.s.proven != 0 || !d.s.hadCut || d.s.basePing != 50) Fail("a delay cut remembers the base ping");
+        if (d.Step(cut1, 1.0f, 1.0f, 400, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep)
+            Fail("a cut empties the ping window, and no climb while the ping stays high");
+        /* the ping back down (step 7): a clean step at once, but the rate cut to holds until two fresh clean readings (20 and 40 s) prove it */
+        if (d.Step(cut1, 1.0f, 1.0f, 60, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep) Fail("the ping back down: no climb");
+        for (int k = 8; k < 2 * readSteps; ++k)
+            if (d.Step(cut1, 1.0f, 1.0f, 60, 0.0f, 0, &why) != cut1 || d.s.proven != 0) Fail("the ping back down: held until proven");
+        d.Step(cut1, 1.0f, 1.0f, 60, 0.0f, 0, &why);
+        if (d.s.proven != cut1 || d.s.basePing != 0) Fail("two fresh clean readings prove the rate cut to and end the recovery");
+        SendRateLink h;
+        h.Step(start, 1.0f, 1.0f, 300, 0.0f, 0, &why); h.Step(start, 1.0f, 1.0f, 300, 0.0f, 0, &why); h.Step(start, 1.0f, 1.0f, 300, 0.0f, 0, &why);
+        if (h.Step(start, 1.0f, 1.0f, 420, 0.0f, 0, &why) != start) Fail("300 -> 420 ms is under half again");
+        if (h.Step(start, 1.0f, 1.0f, 450, 0.0f, 0, &why) != cut1) Fail("300 -> 450 ms is rising delay");
+    }
+    {   /* the route's ping rises for good (50 -> about 300 ms): a delay cut; the step right after it does not count toward settling;
+           kSendRateSettleSteps steady steps make the window's lowest the base ping; the fresh clean readings at 20 and 40 s then prove
+           the rate cut to and growth resumes */
+        SendRateLink r;
+        r.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why); r.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why); r.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why);
+        if (r.Step(start, 1.0f, 1.0f, 300, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateRisingDelay || r.s.basePing != 50) Fail("a lasting rise: the delay cut");
+        if (r.Step(cut1, 1.0f, 1.0f, 310, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep || r.s.settleSteps != 0)
+            Fail("a lasting rise: the step right after the cut neither climbs nor counts");
+        const int steady[] = { 300, 320, 295, 305, 300, 330, 300, 310, 300 };
+        for (int k = 0; k < relaysplit::kSendRateSettleSteps - 1; ++k)
+            if (r.Step(cut1, 1.0f, 1.0f, steady[k % 9], 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep || r.s.basePing != 50)
+                Fail("a lasting rise: no climb before the steady steps are complete");
+        if (r.Step(cut1, 1.0f, 1.0f, 300, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep || r.s.basePing != 300)
+            Fail("a lasting rise: the last steady step makes the window's lowest the base ping");
+        for (int k = 15; k < 2 * readSteps; ++k)
+            if (r.Step(cut1, 1.0f, 1.0f, 300, 0.0f, lots, &why) != cut1 || why != relaysplit::kRateKeep) Fail("a lasting rise: no growth before proven");
+        if (r.Step(cut1, 1.0f, 1.0f, 300, 0.0f, lots, &why) != cut1 + cut1 / 4 || why != relaysplit::kRateGrowth || r.s.proven != cut1 || r.s.basePing != 0)
+            Fail("a lasting rise: the second fresh clean reading proves the rate and growth resumes");
+        /* a brief rise: still cut, no climb while the ping is high, the old base kept, the ping back down is a clean step, no climb */
+        SendRateLink b;
+        b.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why); b.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why); b.Step(start, 1.0f, 1.0f, 50, 0.0f, 0, &why);
+        if (b.Step(start, 1.0f, 1.0f, 200, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateRisingDelay) Fail("a brief rise: the delay cut");
+        for (int k = 0; k < 3; ++k)
+            if (b.Step(cut1, 1.0f, 1.0f, 200, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep) Fail("a brief rise: no climb while the ping is high");
+        if (b.s.basePing != 50) Fail("a brief rise: the base ping is kept");
+        if (b.Step(cut1, 1.0f, 1.0f, 55, 0.0f, 0, &why) != cut1 || why != relaysplit::kRateKeep) Fail("a brief rise: the ping back down, no climb");
+    }
+    {   /* growth on a connection never cut: unchanged, and this end's own quality is no input */
+        SendRateLink s;
+        if (s.Step(start, 0.99f, 1.0f, 0, 0.0f, (unsigned int)(start / 4) + 1u, &why) != start + start / 4 || why != relaysplit::kRateGrowth)
+            Fail("clean delivery with data waiting grows a quarter");
+        if (s.Step(start, 1.0f, 1.0f, 0, 0.0f, (unsigned int)(start / 4), &why) != start) Fail("exactly a quarter waiting keeps");
+        if (s.Step(start, 1.0f, 1.0f, 0, 0.0f, 0, &why) != start) Fail("no waiting data keeps");
+        if (s.Step(4000000, 1.0f, 1.0f, 0, 0.0f, lots * 4, &why) != top) Fail("growth stops at the ceiling");
+        if (s.Step(top, 1.0f, 1.0f, 0, 0.0f, 4294967295u, &why) != top || why != relaysplit::kRateKeep) Fail("the ceiling holds");
+        if (s.Step(start, -1.0f, 1.0f, 0, 0.0f, lots, &why) != start + start / 4) Fail("local unknown, remote clean grows");
+        if (s.Step(start, 0.5f, 1.0f, 0, 0.0f, lots, &why) != start + start / 4) Fail("local poor, remote clean grows");
+        if (s.Step(start, 1.0f, -1.0f, 0, 0.0f, lots, &why) != start) Fail("remote unknown does not grow");
+        if (s.Step(start, 1.0f, 0.98f, 0, 0.0f, lots, &why) != start) Fail("remote 0.98 does not grow");
+    }
+    {   /* a reconnect (Reset) forgets the loss run, the quality reading, the ping window and the episode */
+        SendRateLink s;
+        s.Step(start, 1.0f, 0.5f, 50, (float)start, 0, &why);   /* one counted reading, one short of a cut */
+        s.s.proven = start * 2; s.s.hadCut = true; s.s.cleanReadings = 1; s.s.cleanRate = start; s.s.basePing = 50;
+        s.s.Reset();
+        if (s.s.lossRun != 0 || s.s.lossMs != 0 || s.s.readingKnown || s.s.readingQuality != 0.0f || s.s.readingMs != 0 || s.s.fresh
+            || s.s.busy || s.s.proven != 0 || s.s.hadCut || s.s.cleanReadings != 0 || s.s.cleanRate != 0 || s.s.basePing != 0
+            || s.s.pingCount != 0 || s.s.settleSteps != 0)
+            Fail("Reset empties the state");
+        if (s.Step(start, 1.0f, 0.5f, 500, (float)start, 0, &why) != start || !s.s.fresh || s.s.lossRun != 1)
+            Fail("after Reset the same value is a fresh reading again, and one reading does not cut");
+        if (s.Step(start, 1.0f, 1.0f, 0, 0.0f, 0, &why) != start || why != relaysplit::kRateKeep) Fail("after Reset there is no climb");
+    }
+    {   /* oscillation: a link lossy above 450000 bytes/s (so at start, r) and clean at 0.8 r, sending at the rate with data always
+           waiting. After each cut the rate holds (a failed probe above the proven rate may climb back to it, never past it, never to
+           r) until two fresh clean readings prove it; growth then tries about r once, r is lossy again and cuts after a fresh run of
+           two readings: cuts come at least 40 s apart */
+        SendRateLink o;
+        int rate = start, lastCut = -1, cuts = 0;
+        for (int i = 0; i < 300; ++i)
+        {
+            const float q = rate > 450000 ? 0.9f : 1.0f;
+            const int provenBefore = o.s.proven;
+            const int next = o.Step(rate, 1.0f, q, 0, (float)rate, lots, &why);
+            if (why == relaysplit::kRateSustainedLoss && provenBefore > 0 && rate > provenBefore && o.s.proven != provenBefore)
+                Fail("oscillation: a failed probe above the proven rate forgot it");
+            if (next > start || (why == relaysplit::kRateClimb && next > o.s.proven)) Fail("oscillation: above r, or a climb past the proven rate");
+            if (lastCut >= 0 && i - lastCut < readSteps && next != rate && why != relaysplit::kRateClimb)
+                Fail("oscillation: the rate cut to grew before proven");
+            if (why == relaysplit::kRateSustainedLoss)
+            {
+                if (lastCut >= 0 && i - lastCut < 2 * readSteps) Fail("oscillation: two cuts less than 40 s apart");
+                lastCut = i;
+                ++cuts;
+            }
+            rate = next;
+        }
+        if (cuts < 4) Fail("oscillation: growth tries r again after each proving");
+    }
+    if (std::string(relaysplit::SendRateReasonText(relaysplit::kRateSustainedLoss)) != "sustained loss"
+        || std::string(relaysplit::SendRateReasonText(relaysplit::kRateRisingDelay)) != "rising delay"
+        || std::string(relaysplit::SendRateReasonText(relaysplit::kRateClimb)) != "climb to proven"
+        || std::string(relaysplit::SendRateReasonText(relaysplit::kRateGrowth)) != "growth")
+        Fail("the reasons' log words");
     if (relaysplit::SendQualityKnown(-1.0f) || !relaysplit::SendQualityKnown(0.0f) || !relaysplit::SendQualityKnown(1.0f))
         Fail("which qualities are known");
 }
@@ -2197,6 +2500,20 @@ void t_steamlink_relaytest_cfg()
     const std::string written = coopcfg::CfgFormat(f);
     if (written.find("relaytest") != std::string::npos || written.find("relaylag") != std::string::npos || written.find("relayloss") != std::string::npos)
         Fail("a writer carries a relay TEST key");
+    coopcfg::CfgFields s;   /* T-1118 f: steamfakelag= / steamfakeloss= - the same ranges as relaylag= / relayloss=, its own fields */
+    bad = -1;
+    coopcfg::CfgParseText("steamfakelag=200\r\nsteamfakeloss=5\r\n", &s, 0, 0, 0, &bad);
+    if (bad != 0 || s.steamFakeLagMs != 200 || s.steamFakeLossPct != 5 || s.relayLagMs != 0 || s.relayLossPct != 0) Fail("steamfakelag / steamfakeloss");
+    const char* const refusedFake[] = { "steamfakelag=1001", "steamfakeloss=51", "steamfakelag=-1", "steamfakeloss=on" };
+    for (i = 0; i < sizeof(refusedFake) / sizeof(refusedFake[0]); ++i)
+    {
+        coopcfg::CfgFields x;
+        long long b = -1;
+        coopcfg::CfgParseText(std::string(refusedFake[i]) + "\r\n", &x, 0, 0, 0, &b);
+        if (b != 1 || x.steamFakeLagMs != 0 || x.steamFakeLossPct != 0) Fail(std::string("not refused: ") + refusedFake[i]);
+    }
+    if (none.steamFakeLagMs != 0 || none.steamFakeLossPct != 0) Fail("the steamfake defaults");
+    if (coopcfg::CfgFormat(s).find("steamfake") != std::string::npos) Fail("a writer carries a steamfake TEST key");
 }
 
 /* STEAM FRIENDS FIND AND JOIN A HOST (src/common/steamfriends.h): the connect string a host sets and the joining game reads back from
@@ -3331,9 +3648,11 @@ void t_t36_reset_world()
         const char* keep[] = { "world.txt", "World.TXT", "world.txt.1", "world.txt.tmp", "format.txt", "slots.txt", "slots.txt.1", "profiles.txt",
                                "profiles.txt.1", "aliases.txt", "aliases.txt.1", "owner.txt", "options.txt", "mods.txt", "uid_seats.txt", "fallen.txt",
                                "teams.txt", "own_high.txt", "own_high.txt.tmp", "world.gen", "world.gen.tmp", "server.lock", "server-refused.txt",
-                               "shared-wastelands-server.log", "shared-wastelands-server.log.1", "auth.txt", "auth.txt.tmp", "access.txt", "access.txt.1" };
+                               "shared-wastelands-server.log", "shared-wastelands-server.log.1", "auth.txt", "auth.txt.tmp", "access.txt", "access.txt.1", "lookalike_list.txt", "lookalike_list.txt.tmp" };
         for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); ++i)
             if (ResetClassify(keep[i], 0) != kResetKeep) Fail(std::string("reset: '") + keep[i] + "' is not kept (" + ResetKindName(ResetClassify(keep[i], 0)) + ")");
+        if (ResetWorldGets("lookalike_list.txt", kResetKeep, 0) != kResetGetCopy || ResetWorldGets("lookalike_list.txt", kResetKeep, 1) != kResetGetCopy)
+            Fail("reset: the reset world gets a copy of the world's look-alike list (a kept profile's characters are built from it)");
         const char* move[] = { "uniques.txt", "world_relations.txt", "town_losses.txt", "town_bars.txt", "owed_people.txt", "research_boxes.txt",
                                "research_takes.txt", "clock.txt", "clock.txt.tmp", "areas.txt", "pendingpos.txt", "repair.txt", "queue.txt",
                                "deleted.Holy_Nation.bits", "deleted.204-gamedata.base.bits", "12345-gamedata.base_7.platoon", "12345-gamedata.base_7.meta",
@@ -5951,7 +6270,7 @@ void t_t290s3a_steam_id_trust()
     }
 }
 
-/* refusal reasons 8-14: their words, they stop the join's re-dial, and a reason this build does not know is the protocol one */
+/* refusal reasons 8-16: their words, they stop the join's re-dial, and a reason this build does not know is the protocol one */
 void t_t290s3a_refusal_words()
 {
     if (coopstore::StoreRefuseReasonText(coopstore::kRefusePasswordNeeded, 92u, 92u) != "the world needs a password") Fail("reason 8's words");
@@ -5966,10 +6285,18 @@ void t_t290s3a_refusal_words()
     if ((int)coopstore::kRefuseAccessUnreadable != 14
         || coopstore::StoreRefuseReasonText(coopstore::kRefuseAccessUnreadable, 92u, 92u) != "the host's player list could not be read - the host must host again")
         Fail("reason 14's number and words");
+    if ((int)coopstore::kRefuseKicked != 15
+        || coopstore::StoreRefuseReasonText(coopstore::kRefuseKicked, 92u, 92u) != "an admin removed this game from the world")
+        Fail("reason 15's number and words");
+    if ((int)coopstore::kRefuseBanned != 16
+        || coopstore::StoreRefuseReasonText(coopstore::kRefuseBanned, 92u, 92u) != "this player is banned from this world (the world's ban list)")
+        Fail("reason 16's number and words");
+    if (!coopstore::StoreRefuseStopsJoin(coopstore::kRefuseKicked) || !coopstore::StoreRefuseStopsJoin(coopstore::kRefuseBanned))
+        Fail("a kick or a ban does not stop the join's re-dial");
     if ((int)coopstore::kRefusePasswordNeeded != 8 || (int)coopstore::kRefuseWrongPassword != 9 || (int)coopstore::kRefuseNotAllowed != 10 || (int)coopstore::kRefuseTooManyWrong != 11) Fail("the reason numbers");
-    for (unsigned int r = 0; r < 16; ++r)
-        if (coopstore::StoreRefuseStopsJoin(r) != (r >= 8 && r <= 14)) Fail("which refusals stop the join's re-dial");
-    if (coopstore::StoreRefuseReasonText(15u, 92u, 91u) != coopstore::StoreRefuseReasonText(coopstore::kRefuseProtocol, 92u, 91u)) Fail("an unknown reason is not read as the protocol refusal");
+    for (unsigned int r = 0; r < 20; ++r)
+        if (coopstore::StoreRefuseStopsJoin(r) != (r >= 8 && r <= 16)) Fail("which refusals stop the join's re-dial");
+    if (coopstore::StoreRefuseReasonText(17u, 92u, 91u) != coopstore::StoreRefuseReasonText(coopstore::kRefuseProtocol, 92u, 91u)) Fail("an unknown reason is not read as the protocol refusal");
     if (coopstore::StoreHandshakeDecide(95u, 94u) != coopstore::kHandshakeRefuse || coopstore::StoreHandshakeDecide(95u, 95u) != coopstore::kHandshakeAccept) Fail("a game of protocol 94 is not refused by a world server of 95");
 }
 
@@ -5992,7 +6319,7 @@ void t_t290s3b_password_screen()
             if (s != kWords[i].text || s == version)
                 Fail("T-290: refusal " + I(kWords[i].r) + (host != 0 ? " under CAN'T HOST" : " under CAN'T JOIN") + " -> '" + s + "'");
         }
-    if (coopui::PanelRefusalText(15, "") != version) Fail("T-290: a reason this build does not know is not the version sentence");
+    if (coopui::PanelRefusalText(17, "") != version) Fail("T-290: a reason this build does not know is not the version sentence");
     if ((int)coopstore::kRefusePasswordNeeded != 8 || (int)coopstore::kRefuseWrongPassword != 9 || (int)coopstore::kRefuseNotAllowed != 10
         || (int)coopstore::kRefuseTooManyWrong != 11 || (int)coopstore::kRefuseAuthFileBad != 12 || (int)coopstore::kRefuseNotOnList != 13
         || (int)coopstore::kRefuseAccessUnreadable != 14)
@@ -6041,8 +6368,8 @@ void t_t290s3b_password_screen()
             if (2 * p.top + p.h != 2 * pb.top + pb.h || p.boxW < coopui::kPanelMinFieldW) Fail("T-290: PASSWORD's label / box on " + where);
         }
     }
-    if (coopui::PanelLayoutHalves(coopui::kLayHost) != coopui::kPanelMaxHalves - 2 || coopui::PanelLayoutHalves(coopui::kLayHostHint) != coopui::kPanelMaxHalves - 2)
-        Fail("T-290: HOST GAME is not twelve rows at its ceilings (no line under PASSWORD)");
+    if (coopui::PanelLayoutHalves(coopui::kLayHost) != coopui::kPanelMaxHalves || coopui::PanelLayoutHalves(coopui::kLayHostHint) != coopui::kPanelMaxHalves)
+        Fail("T-290: HOST GAME is not the window's thirteen rows at its ceilings (the keep-running tick box and note took the gaps; no line under PASSWORD)");
     {
         /* the driver's names: SHOW / HIDE, PASSWORD REQUIRED's JOIN and CANCEL, and the two boxes, whose typed text is never logged */
         const coopui::UiDriveName* s = coopui::UiDriveFind("hostpwshow", coopui::kDriveButton);
@@ -6089,6 +6416,8 @@ void t_t290s3a_export_auth()
     if (worldkeep::ExportTakes("auth.txt", 0) || worldkeep::ExportTakes("AUTH.TXT", 0)) Fail("auth.txt travels with an export");
     if (!worldkeep::ExportTakes("access.txt", 0)) Fail("access.txt is left out of an export");
     if (!worldkeep::ExportTakes("repair/7/auth.txt", 0)) Fail("a file named auth.txt below the top is left out");
+    if (worldkeep::ExportTakes("host.key", 0) || worldkeep::ExportTakes("HOST.KEY", 0)) Fail("host.key (the owner's secret) travels with an export");
+    if (!worldkeep::ExportTakes("repair/7/host.key", 0)) Fail("a file named host.key below the top is left out");
 }
 
 /* T-424 / T-472 (src/common/floorplace.h): a copy on another floor than its stopped owner is placed at the owner's height. */

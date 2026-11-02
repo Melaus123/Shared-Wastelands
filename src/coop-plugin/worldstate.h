@@ -35,6 +35,10 @@ void WorldStateTick();        // MAIN THREAD, every frame: drains the detours' r
 int WsTemplateIsUnique(void* gd);        // MAIN THREAD: 1 = the character template is flagged "unique", 0 = not or no such field (its bool-field table walked, nothing inserted), -1 = the read faulted
 int WsUniqueSlotPod(void* gd);           // MAIN THREAD: 1 = this game's unique-state entry for the template holds it (+8: the game's own 0x591720 refuses to make it); 0 = no entry or an empty slot; -1 = fault
 void* WsTemplateBySid(const char* sid);  // MAIN THREAD: the record with that stringID in the base game-data container, 0 if none
+int WsUniqueMarkMade(void* gd);          // TEST-ONLY squadtest, MAIN THREAD: the 'already made' slot written as the engine's character maker writes it; 1 written, 2 already held, 0 no map / address, -1 fault
+void* WsLoadedBodyOf(void* gd, int* dead);   // TEST-ONLY squadtest, MAIN THREAD: a loaded body of that template (0 none); *dead 1 dead, 0 alive, -1 unreadable
+void WorldStateImportLoad(int on);   // T-1096, MAIN THREAD (store.cpp): 1 from a single-player import's post to its first save's arm; 0 otherwise
+int WorldStateImportLoading();       // T-1096 (owner 1234 e), ANY THREAD: 1 while that window is open - store.cpp's look-alike pass makes the import's named characters copies
 long long WorldStateGeneration();   // MAIN THREAD: grows by one whenever a named character's state changes on this game (seen in the drain, or applied from the world); towns2 reads it
 void WorldStateWorldTeardown();   // MAIN THREAD, from the store's teardown broadcast: the shadow, the register and the ring all name the world being destroyed
 void ApplyRemoteUniqueState(const std::string& sid, int state, int playerInvolved, unsigned int back);   // MAIN THREAD: a state from the notebook; back = how many times the world server says that character was brought back

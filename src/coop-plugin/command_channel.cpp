@@ -29,12 +29,14 @@
 #include "relations.h"
 #include "playerstab.h"   /* T-545: the TEST-ONLY playerstab lever, [PLAYERS] REPORT */
 #include "chat.h"   /* the TEST-ONLY chat lever */
+#include "admin.h"   /* the TEST-ONLY admintest lever */
 #include "peace.h"
 #include "towngen.h"
 #include "../common/recruitmult.h"   /* recruit3: the recruitmult values */
 #include "zones.h"      // M-A
 #include "handoff.h"    // M-D
 #include "hire.h"       /* recruit1: hiretest, ReportHire */
+#include "kapi.h"       /* per-race rules: ReportKapi */
 #include "worldgen.h"
 #include "worldstate.h"
 #include "townver.h"   /* TownVerTick */
@@ -42,6 +44,9 @@
 namespace coop { std::string RangedTestLever(const std::string& args); }   /* P104: combat.cpp */
 namespace coop { std::string GroundLineLever(const std::string& args); std::string GroundFindLever(const std::string& args); }   /* T-310: combat.cpp */
 namespace coop { bool GroundFindLastPick(bool target, float* x, float* z, long long* id); }   /* T-310: combat.cpp, playerteleport groundpick */
+namespace coop { int CameraReadPod(float* q, float* zoom); int CameraTurnPod(const float* q, float zoom); }   /* T-890 TEST-ONLY lever camturn: handoff.cpp (the engine's camera setter after focusCamera; read back through Ogre). MAIN THREAD */
+#include "../common/camturn.h"   /* T-890: camturn's arguments and the rig's yaw / pitch as a quaternion */
+#include "../common/spawnage.h"   /* the spawncontainer word (SpawnContainerWord) */
 namespace coop { int FocusCameraPod(float x, float y, float z); int GroundTerrainHeightAt(float x, float z, float* out); }   /* TEST-ONLY lever camlook: handoff.cpp (PlayerInterface::focusCamera, row FocusCameraOn) / combat.cpp (1 height, 0 no terrain, -1 no row or a fault). MAIN THREAD */
 #include "speech.h"   /* ReportCrimeTest */
 #include "../common/saywire.h"   /* the name levers' argument shapes (koself name, talkcarriers ev/act) */
@@ -353,6 +358,7 @@ void ReportEverything()
     coop::ReportZones();
     coop::ReportHandoff();
     coop::ReportHire();   /* recruit1 */
+    coop::ReportKapi();   /* per-race rules: the [KAPI] REPORT line */
     coop::ReportStore();
     coop::ReportPlayerFaction();
     coop::ReportTownGen();
@@ -675,7 +681,8 @@ void CommandChannelTick()
     if (coopui::CmdMarksHarness(verb) != 0) ++g_cmdVerbsRun;   /* mmo5: this game is harness-driven - the host-left fallback never exits it on its own; pp1b: nor do the read-only observation verbs (uidrive.h CmdIsObservationVerb) */
 
     bool finished = false;
-    bool cmdChainB = false;   /* batch2: the verb chain is split in two halves - MSVC caps one if / else-if chain (C1061, blocks nested too deeply) */
+    bool cmdChainB = false;   /* the verb chain is split in three parts - MSVC caps one if / else-if chain (C1061, blocks nested too deeply) */
+    bool cmdChainC = false;
     if (verb == "load")
     {
         /* PP5: a profile save folder is "<World> - Multiplayer - <Profile>" - it has spaces, so the whole rest of the
@@ -962,6 +969,16 @@ void CommandChannelTick()
     {
         std::string rest; std::getline(is, rest);
         WriteStatus(coop::PlayersTabCommand(rest));
+        finished = true;
+    }
+    else if (verb == "admintest")
+    {
+        // admintest setpw sample | makeadmin <slot> | removeadmin <slot> | type login right|login wrong|logout|kick <slot>|ban <slot>
+        //      |ban nobody|unban <slot>|stop   - TEST-ONLY (admin.cpp AdminTestCommand, the forms admincmd.h TestParse): the admin
+        // password set to a fixed made-up sample through the MULTIPLAYER window's DONE road, the PLAYERS tab's MAKE / REMOVE ADMIN
+        // road, or one fixed command line through the road a typed '/' chat line takes. No free text; the password is never logged.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::AdminTestCommand(rest));
         finished = true;
     }
     else if (verb == "relate")   /* relate1: relate <target> ally|neutral|hostile - towards another player's stand-in only; `ally on|off` is the alias */
@@ -1857,7 +1874,9 @@ void CommandChannelTick()
             sid = tok[end - 1]; --end;
             for (size_t i = 0; i < end; ++i) { if (i != 0) nm += " "; nm += tok[i]; }
         }
-        WriteStatus(coop::BoxTest(nm, sid, cnt) ? "ok boxtest" : "error boxtest"); finished = true;
+        // boxtest cantmake <item string id> | off   - TEST-ONLY: this game reads that item template as missing from its data
+        if (!tok.empty() && tok[0] == "cantmake") { WriteStatus(coop::BoxTestCantMake(tok.size() >= 2 ? tok[1] : std::string())); finished = true; }
+        else { WriteStatus(coop::BoxTest(nm, sid, cnt) ? "ok boxtest" : "error boxtest"); finished = true; }
     }
     else if (verb == "buytest")
     {
@@ -2145,8 +2164,9 @@ void CommandChannelTick()
         std::string rest; std::getline(is, rest); size_t s0 = rest.find_first_not_of(" \t"); rest = (s0 == std::string::npos) ? std::string() : rest.substr(s0);
         bool ok = false;
         if (sub == "new") ok = coop::StoreProfileRequest(1, 0, rest);
+        else if (sub == "import") ok = coop::StoreSpImportRequest(rest, rest);   /* T-1096 TEST-ONLY: NEW PROFILE's IMPORT road - a new profile named after the single-player save folder <rest> */
         else if (sub == "delete") ok = coop::StoreProfileRequest(2, (unsigned)std::atoi(rest.c_str()), std::string());
-        WriteStatus(ok ? "ok profile " + sub : std::string("error profile (use: profile new <name> | profile delete <n>; the notebook link must be up)"));
+        WriteStatus(ok ? "ok profile " + sub : std::string("error profile (use: profile new <name> | profile import <folder> | profile delete <n>; the notebook link must be up)"));
         finished = true;
     }
     else if (verb == "renamemyfaction")
@@ -2411,7 +2431,11 @@ void CommandChannelTick()
         const std::string ta = Trim(arg);
         const bool byName = (ta == "nearestname" || ta.compare(0, 12, "nearestname ") == 0 || ta.compare(0, 12, "nearestname\t") == 0
                              || ta == "nearestfaction" || ta.compare(0, 15, "nearestfaction ") == 0 || ta.compare(0, 15, "nearestfaction\t") == 0);   /* nearestfaction: the same pick by faction name */
-        WriteStatus(byName ? coop::TalkTestNameArm(ta) : coop::TalkTestArm(ta)); finished = true;
+        /* T-1152: `talktest nearestpeer [<radius>]` - TEST-ONLY: the speaker is the nearest character of ANOTHER player (a copy in a
+           player's stand-in faction, speech.cpp TkPlayerSpeaker) within <radius> (default 3000) of this game's first own player
+           character, the target that own character, event 1 - the call a click on that character makes (speech.cpp TalkTestPeerArm) */
+        const bool byPeer = (ta == "nearestpeer" || ta.compare(0, 12, "nearestpeer ") == 0 || ta.compare(0, 12, "nearestpeer\t") == 0);
+        WriteStatus(byPeer ? coop::TalkTestPeerArm(ta) : (byName ? coop::TalkTestNameArm(ta) : coop::TalkTestArm(ta))); finished = true;
     }
     else if (verb == "talksight")
     {
@@ -2442,7 +2466,10 @@ void CommandChannelTick()
            lever (P26 stages 1-3, speech.cpp): at the K2 safe point the engine's own Dialogue::startPlayerConversation 0x683890 is
            called THROUGH its hook (the stage-2 intercept) for an NPC this game owns toward the other player's character (a copy
            here); on the addressed game `answer k` clicks reply k of the mirrored window through the engine's replyClicked entry
-           and `close` ends it through the engine's endDialogue entry. */
+           and `close` ends it through the engine's endDialogue entry (with no mirrored window open, `close` ends this game's own
+           window's conversation the same way). `talkprompt joinact <type>`: on this game's own window, the
+           first line anywhere in the conversation's line tree carrying that dialogue action is run by the engine's own _doActions
+           through its hooked entry (as a clicked reply's line). */
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::TalkPromptArm(Trim(arg))); finished = true;
     }
@@ -2479,7 +2506,9 @@ void CommandChannelTick()
            hiretest near same [<x> <z> [price]] - recruit2 race: the Drifter nearest to one fixed map point (default The Hub
            -50978,2932; ties to the lower uid), so both games pick the same person in the same step.
            hiretest editor near|uid <n> [price] (and editor near same ...) - the same hire with join type 3: the engine's recruit
-           with edit = true, the call the dialogue's join-with-edit reply makes, so the engine opens the character editor. */
+           with edit = true, the call the dialogue's join-with-edit reply makes, so the engine opens the character editor.
+           hiretest [editor] nearestpeer [<radius>] - T-1022: the nearest living character of ANOTHER player (hire.cpp OwnedVerdict,
+           the test every hire road refuses by) within <radius> (default 3000) of my first player character, then the same hire road. */
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::HireTestArm(Trim(arg))); finished = true;
     }
@@ -2622,6 +2651,7 @@ void CommandChannelTick()
         WriteStatus(coop::StoreTestCommand(Trim(arg))); finished = true;
     }
     else if (verb == "townlist") { WriteStatus(coop::TownListCommand()); finished = true; }   // towns1: read-only, every town with name and position
+    else if (verb == "townnear") { WriteStatus(coop::TownNearCommand()); finished = true; }   /* T-795 step 4 (TEST, read-only): the nearest town to the player and its distance - the harness's town-far check */
     else if (verb == "townparity") { WriteStatus(coop::TownParityCommand()); finished = true; }   /* TEST, read-only: one [TOWNPARITY] row per placed town + a digest line */
     else if (verb == "ownbuilding") { WriteStatus(coop::OwnBuildingCommand()); finished = true; }
     else if (verb == "jobtest")
@@ -2684,6 +2714,37 @@ void CommandChannelTick()
         // to this game's own character at the K2 safe point through the engine's whole-inventory add. [HEAL] kitgive lines.
         std::string arg; std::getline(is, arg);
         WriteStatus(coop::KitGiveCommand(Trim(arg))); finished = true;
+    }
+    else cmdChainC = true;   /* no verb of the second part - try the third */
+    if (cmdChainC)
+    {
+    if (verb == "chattest")
+    {
+        // chattest link <1-40> [uid] | chattest garbage   - TEST-ONLY (T-1153, chat.cpp TestInner, reached as the chat lever's `test ...`):
+        // link puts <n> links to the first item of the loaded character <uid> (none given: the first selected character) in the chat's typing line through the Shift +
+        // middle-click's own step (LinkPut, its 16-link check included) and sends the line through Enter's own send; garbage sends
+        // three broken link codes on the wire as written (Expand skipped). One `[CHAT] ok chattest ...` line; each receiver logs
+        // `[CHAT] in ... links=<k> plain=<bytes>`.
+        std::string rest; std::getline(is, rest); rest = Trim(rest);
+        WriteStatus(coop::ChatCommand("test " + rest));
+        finished = true;
+    }
+    else if (verb == "renametest")
+    {
+        // renametest <name> [uid]   - TEST-ONLY (T-1153, spawn.cpp RenameTestCommand): this game's own character <uid> (none given:
+        // the first selected one) renamed
+        // through Character::setName's hooked entry (NameSetOwn), the setter the name sync hooks; the other games apply it
+        // (NameApplyToCopy). One `[NAME] ok renametest uid=.. name=.. was=..` line.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::RenameTestCommand(rest));
+        finished = true;
+    }
+    else if (verb == "mpesc")
+    {
+        // mpesc   - TEST-ONLY (T-1154, ui.cpp UiMpEscCommand): the ESC key as MyGUI hands it to the pause menu's MULTIPLAYER
+        // window (its own key handler); the engine's menu toggle a real ESC also makes is not made.
+        WriteStatus(coop::UiMpEscCommand() ? "ok mpesc" : "error mpesc");
+        finished = true;
     }
     else if (verb == "bailtest")
     {
@@ -2792,8 +2853,8 @@ void CommandChannelTick()
         // outlives any single game. With no argument this reports what the notebook's CLOCK last said.
         std::string mode; is >> mode;
         if (mode.empty()) WriteStatus(std::string("ok timemode ") + coop::TimeModeName());
-        else if (mode != "fixed" && mode != "consensus") WriteStatus("error timemode: fixed|consensus");
-        else if (!coop::StoreSendOption("timemode", mode)) WriteStatus("error timemode: no notebook link - the option is kept by SharedWastelandsServer.exe, not by this game");
+        else if (mode != "fixed" && mode != "admin" && mode != "consensus") WriteStatus("error timemode: admin|fixed|consensus");   /* admin: GAME SPEED CONTROL Admin only, stored as fixed */
+        else if (!coop::StoreSendOption("timemode", mode == "admin" ? std::string("fixed") : mode)) WriteStatus("error timemode: no notebook link - the option is kept by SharedWastelandsServer.exe, not by this game");
         else WriteStatus("ok timemode sent");
         finished = true;
     }
@@ -3271,6 +3332,17 @@ void CommandChannelTick()
         WriteStatus(coop::LimbTestLever(rest));
         finished = true;
     }
+    else if (verb == "squadtest")
+    {
+        // squadtest add <ownUid|first> <n 1..8> [templateSid]  - TEST-ONLY lever (hire.cpp SquadTestArm / RunSquadTest at the K2
+        // safe point): n characters from the CHARACTER record (default 2205-gamedata.base, the Drifter) are hired by this game's
+        // player into the squad of its character ownUid - `first`: its first living player-faction character, for a game with no
+        // uids (single player). Announced to the other games only when linked. A named (unique) record: n 1, the loaded original
+        // hired if there is one, else one body made and the engine's 'already made' slot written. [SQUAD] lines, one per member.
+        std::string rest; std::getline(is, rest);
+        WriteStatus(coop::SquadTestArm(Trim(rest)));
+        finished = true;
+    }
     else if (verb == "statstest")
     {
         // statstest squad <level 1..100> | statstest show <uid>  - TEST-ONLY lever (stats.cpp StatsTestLever): every character
@@ -3526,11 +3598,15 @@ void CommandChannelTick()
     {
         // spawncontainer 1  - explicit-faction spawns keep the reference platoon (default)
         // spawncontainer 0  - explicit-faction spawns pass a null container (F103 original)
+        // spawncontainer new - TEST-ONLY: explicit-faction local spawns go into a fresh empty squad of that faction
+        //                      (spawn.cpp SpawnTemplate), so the engine cannot put them into a nearby squad another game runs
         // Only affects spawns that also have an explicit faction set.
-        int keep = 1;
-        if (!(is >> keep)) keep = 1;
-        coop::SetSpawnContainer(keep != 0);
-        WriteStatus(keep != 0 ? "ok spawncontainer keep" : "ok spawncontainer null");
+        std::string word;
+        is >> word;
+        const int mode = coopspawn::SpawnContainerWord(word);
+        coop::SetSpawnContainerMode(mode);
+        WriteStatus(mode == coopspawn::kSpawnContainerNew ? "ok spawncontainer new"
+                    : (mode == coopspawn::kSpawnContainerKeep ? "ok spawncontainer keep" : "ok spawncontainer null"));
         finished = true;
     }
     else if (verb == "factions")
@@ -3654,6 +3730,72 @@ void CommandChannelTick()
         }
         finished = true;
     }
+    else if (verb == "camturn")
+    {
+        /* TEST-ONLY lever (DEV build), T-890: camturn [<yaw>] [yaw <deg>] [pitch <deg>] [dist <d>] | camturn show - the camera's facing,
+           tilt and distance set through the engine's own camera setter (handoff.cpp CameraTurnPod: PlayerInterface's function after
+           focusCamera, the one the save loader's "rot" / "zoom" use); a value not given keeps the current one. yaw 0 = the camera faces
+           +z, 90 = +x, 180 = -z (it sits north of its target, looking south); pitch positive = looking down (the engine's default 30);
+           dist in world units (default 150). Where the camera looks is not changed (camlook / camfollow keep doing that; a follow
+           stays on). One [CAMFOLLOW] turn line with the values read back before and after. Nothing in the world is moved. */
+        std::string rest;
+        std::getline(is, rest);
+        camturn::Args a;
+        if (!camturn::Parse(rest, &a))
+        {
+            DebugLog("[CAMFOLLOW] turn refused: usage camturn [<yaw>] [yaw <deg>] [pitch <1-89>] [dist <10-3000>] | camturn show");
+            WriteStatus("error camturn: usage camturn [<yaw>] [yaw <deg>] [pitch <1-89>] [dist <10-3000>] | show");
+        }
+        else
+        {
+            float q0[4] = { 1, 0, 0, 0 }, z0 = 0.0f, y0 = 0.0f, p0 = 0.0f;
+            const int r0 = coop::CameraReadPod(q0, &z0);
+            const int ok0 = (r0 == 1 && camturn::YawPitchFromQuat(q0, &y0, &p0)) ? 1 : 0;
+            std::ostringstream o; o.setf(std::ios::fixed); o.precision(1);
+            if (a.show)
+            {
+                o << "[CAMFOLLOW] turn show ";
+                if (ok0) o << "yaw=" << y0 << " pitch=" << p0 << " dist=" << -z0;
+                else o << "camera NOT read (" << (r0 == 1 ? "not a rotation" : (r0 == 0 ? "no PlayerInterface, camera or Ogre export" : "FAULTED")) << ")";
+                DebugLog(o.str());
+                WriteStatus(ok0 ? "ok camturn show" : "error camturn: the camera could not be read");
+            }
+            else
+            {
+                const float yaw = a.haveYaw ? a.yaw : y0, pitch = a.havePitch ? a.pitch : p0, dist = a.haveDist ? a.dist : -z0;
+                const int needRead = (!a.haveYaw || !a.havePitch || !a.haveDist) ? 1 : 0;
+                if (needRead && !ok0)
+                {
+                    DebugLog("[CAMFOLLOW] turn refused: the camera's current values could not be read - give yaw, pitch and dist");
+                    WriteStatus("error camturn: camera not readable - give yaw, pitch and dist");
+                }
+                else if (pitch < camturn::kPitchMin || pitch > camturn::kPitchMax || dist < camturn::kDistMin || dist > camturn::kDistMax)
+                {
+                    o << "[CAMFOLLOW] turn refused: a kept value is outside the lever's range (pitch=" << pitch << " dist=" << dist << ") - give it";
+                    DebugLog(o.str());
+                    WriteStatus("error camturn: a kept value is out of range - give it");
+                }
+                else
+                {
+                    float q[4];
+                    camturn::QuatFromYawPitch(yaw, pitch, q);
+                    const int r = coop::CameraTurnPod(q, -dist);
+                    float q1[4] = { 1, 0, 0, 0 }, z1 = 0.0f, y1 = 0.0f, p1 = 0.0f;
+                    const int r1 = coop::CameraReadPod(q1, &z1);
+                    const int ok1 = (r1 == 1 && camturn::YawPitchFromQuat(q1, &y1, &p1)) ? 1 : 0;
+                    o << "[CAMFOLLOW] turn " << (r == 1 ? "set" : (r == 0 ? "NOT set (no PlayerInterface or no FocusCameraOn row)" : (r == 2 ? "NOT set (the setter's first bytes differ)" : "FAULTED")))
+                      << " asked yaw=" << yaw << " pitch=" << pitch << " dist=" << dist << " | before ";
+                    if (ok0) o << "yaw=" << y0 << " pitch=" << p0 << " dist=" << -z0; else o << "unread";
+                    o << " | after ";
+                    if (ok1) o << "yaw=" << y1 << " pitch=" << p1 << " dist=" << -z1; else o << "unread";
+                    o << " (where the camera looks is unchanged; nothing moved)";
+                    DebugLog(o.str());
+                    WriteStatus(r == 1 ? "ok camturn" : (r == 2 ? "error camturn: the setter's first bytes differ" : (r == 0 ? "error camturn: no PlayerInterface or no FocusCameraOn row" : "error camturn: the setter faulted")));
+                }
+            }
+        }
+        finished = true;
+    }
     else if (verb == "camfollow")
     {
         /* TEST-ONLY lever (DEV build): camfollow <uid> | camfollow off | camfollow <uid> off | camfollow show - the camera is kept on
@@ -3727,7 +3869,8 @@ void CommandChannelTick()
         WriteStatus("error unknown-verb " + verb);
         finished = true;
     }
-    }   /* batch2: end of the second half of the verb chain */
+    }   /* end of the third part of the verb chain */
+    }   /* end of the second part of the verb chain */
 
     if (finished)
     {

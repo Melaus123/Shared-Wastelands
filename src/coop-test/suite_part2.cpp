@@ -2780,10 +2780,10 @@ void t_p106_world_players_wire()
     std::vector<RosterRow> back; unsigned wp = 0;
     if (!RosterDecode(&m[0], m.size(), &back, &wp) || back.size() != 1 || back[0].slot != 2 || wp != 3) Fail("p106: the world count did not round-trip");
     if (!RosterDecode(&m[0], m.size(), &back, 0)) Fail("p106: the count may be ignored");
-    std::vector<char> old(m.begin(), m.end() - 4);   /* the rows alone */
+    std::vector<char> old(m.begin(), m.end() - 8);   /* the rows alone (without the world count and the vacancy word) */
     if (RosterDecode(&old[0], old.size(), &back, &wp)) Fail("p106: a roster without the world count decoded");
     std::vector<char> big; if (RosterEncode(rows, kWorldPlayersMax + 1, &big)) Fail("p106: more players than slots was encoded");
-    std::vector<char> hand(old); const unsigned over = kWorldPlayersMax + 1; JsPut32(&hand, over);
+    std::vector<char> hand(old); const unsigned over = kWorldPlayersMax + 1; JsPut32(&hand, over); JsPut32(&hand, 0u);
     if (RosterDecode(&hand[0], hand.size(), &back, &wp)) Fail("p106: more players than slots decoded");
     std::vector<char> full; if (!RosterEncode(rows, kWorldPlayersMax, &full) || !RosterDecode(&full[0], full.size(), &back, &wp) || wp != kWorldPlayersMax) Fail("p106: 1024 players fit");
 }
@@ -7663,7 +7663,10 @@ void t_t726_talk_order_log_due_outcome_and_nth()
         Fail("T-726: an outcome the click's road wrote stands");
     if (TalkOrderOutcome(0, 0, 0, 0) != kTalkOrderNotReached || TalkOrderOutcome(0, 0, 1, 1) != kTalkOrderNotReached)
         Fail("T-726: not reached is the engine's refusal before choosing a line, whatever else was written");
-    if (kTalkOrderLineNotStarted != 7 || kTalkOrderKinds != 8) Fail("T-726: a busy copy is not an outcome of its own (8 kinds)");
+    if (kTalkOrderLineNotStarted != 7 || kTalkOrderPlayerSpeaker != 8 || kTalkOrderKinds != 9)
+        Fail("T-726: a busy copy is not an outcome of its own; another player's character as the speaker is (9 kinds)");
+    if (TalkOrderOutcome(kTalkOrderPlayerSpeaker, 1, 1, 0) != kTalkOrderPlayerSpeaker || TalkOrderOutcome(kTalkOrderPlayerSpeaker, 1, 0, 0) != kTalkOrderPlayerSpeaker)
+        Fail("T-726: a start refused for another player's character as the speaker is told apart");
     if (TalkOrderOutcome(0, 1, 1, 1) != kTalkOrderStarted) Fail("T-726: a start that returned true started here");
     if (TalkOrderOutcome(0, 1, 0, 0) != kTalkOrderNoLine) Fail("T-726: reached with no line is 'no line'");
     if (TalkOrderOutcome(0, 1, 1, 0) != kTalkOrderLineNotStarted) Fail("T-726: reached with a line and not started is told apart");
@@ -7734,6 +7737,12 @@ void t_t430_lever_shapes_parse()
     if (cooptalk::TalkPromptParse("answer act 256", &mode, &n, &t, &sid, &idx)) Fail("answer act 256 must be refused");
     if (cooptalk::TalkPromptParse("answer act x", &mode, &n, &t, &sid, &idx)) Fail("answer act x must be refused");
     if (cooptalk::TalkPromptParse("answer act 10 1", &mode, &n, &t, &sid, &idx)) Fail("answer act with a trailing word must be refused");
+    if (!cooptalk::TalkPromptParse("joinact 18", &mode, &n, &t, &sid, &idx) || mode != cooptalk::kTalkLeverJoinAct || idx != 18)
+        Fail("talkprompt joinact 18 must parse");
+    if (cooptalk::TalkPromptParse("joinact", &mode, &n, &t, &sid, &idx)) Fail("joinact without a type must be refused");
+    if (cooptalk::TalkPromptParse("joinact 256", &mode, &n, &t, &sid, &idx)) Fail("joinact 256 must be refused");
+    if (cooptalk::TalkPromptParse("joinact 3x", &mode, &n, &t, &sid, &idx)) Fail("joinact 3x must be refused");
+    if (cooptalk::TalkPromptParse("joinact 3 1", &mode, &n, &t, &sid, &idx)) Fail("joinact with a trailing word must be refused");
 }
 
 /* P26 stages 1-3. `talkprompt [npcUid|near] [targetUid|near] [lineSid|auto]` | `talkprompt answer <0..9>` | `talkprompt close`. */

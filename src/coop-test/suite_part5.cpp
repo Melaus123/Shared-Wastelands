@@ -5,6 +5,7 @@
  * than one file uses is in suite.h. New tests go in test_main.cpp.
  */
 #include "suite.h"
+#include "keeprunning.h"   /* the kept world's router lines (RouterLine) */
 
 namespace suite {
 
@@ -3361,12 +3362,278 @@ void t_t53_upnp_text_and_start()
     if (IsOurDescription("Minecraft server"))                              Fail("another program's entry is not ours");
     if (IsOurDescription(""))                                              Fail("an empty description is not ours");
     if (!PortOk(1) || !PortOk(65535) || PortOk(0) || PortOk(65536) || PortOk(-5)) Fail("PortOk is 1..65535");
-    if (!MapOnHostStart(1))                                                Fail("a newly started world server asks the router");
-    if (MapOnHostStart(2))                                                 Fail("a world server that already ran asked at its own start");
-    if (MapOnHostStart(0))                                                 Fail("no world server started here: nothing to forward");
+    if (!MapOnHostStart(1, false))                                         Fail("a newly started world server asks the router");
+    if (MapOnHostStart(2, false))                                          Fail("a world server that already ran asked at its own start");
+    if (MapOnHostStart(0, false))                                          Fail("no world server started here: nothing to forward");
     if (std::string(OutcomeWord(kOutNoRouter)) != "noRouter" || std::string(OutcomeWord(kOutMapped)) != "mapped"
      || std::string(OutcomeWord(kOutAlready)) != "already" || std::string(OutcomeWord(kOutFailed)) != "failed"
      || std::string(OutcomeWord(99)) != "other")                           Fail("OutcomeWord");
+}
+
+/* A WORLD KEPT RUNNING HOLDS ITS OWN ROUTER ENTRY (upnpplan.h MapOwner ... NoteOfOutcome, keeprunning.h RouterLine): one
+   owner per world server, the game's entry handed over and never removed by it, and one plain window line per note. */
+void t_t1158_router_owner()
+{
+    using namespace coopupnp;
+    /* who holds it */
+    if (MapOwner(true) != kOwnerServer || MapOwner(false) != kOwnerGame)  Fail("a world kept running holds its own entry; any other is the game's");
+    for (int started = 0; started <= 2; ++started)
+        for (int kept = 0; kept <= 1; ++kept)
+            if (MapOnHostStart(started, kept != 0) != (started == 1 && kept == 0)) Fail("the game asks only for a new world server that is not kept running");
+    if (!ServerMapsAtStart(true, false))                                   Fail("a world kept running asks the router at its start");
+    if (ServerMapsAtStart(true, true))                                     Fail("--no-router: a world kept running left the router alone");
+    if (ServerMapsAtStart(false, false) || ServerMapsAtStart(false, true)) Fail("a world server its game hosts never asks for itself");
+    /* a kept world's ask takes only openings with a time limit; the game's own hosting keeps its permanent fallbacks */
+    const bool keptOnly = TimeLimitedOnly(MapOwner(true)), gameOnly = TimeLimitedOnly(MapOwner(false));
+    if (!keptOnly || gameOnly)                                             Fail("only a world kept running takes time-limited openings only");
+    const bool offered725 = (swrouter::AddFaultNext(725, kAskLeaseSeconds) == swrouter::kAddRetryPermanent);
+    if (!offered725)                                                       Fail("725 to a leased ask no longer offers the permanent re-ask");
+    if (AskAgainPermanent(offered725, keptOnly))                           Fail("725 on a kept world's ask was asked again as permanent");
+    if (!AskAgainPermanent(offered725, gameOnly))                          Fail("725 on the game's ask is no longer asked again as permanent");
+    if (AskAgainPermanent(swrouter::AddFaultNext(725, 0) == swrouter::kAddRetryPermanent, gameOnly))
+                                                                           Fail("725 to a permanent ask was asked again");
+    if (NoteOfOutcome(FoldOutcome(kOutNoRouter, kRrRefused)) != kNoteFailed) Fail("a refused 725 does not end as failed (open by hand)");
+    /* the windows route: the game's adds / keeps / leaves as before; a kept world's adds nothing and removes an entry of ours
+       it finds (a permanent one the game handed over) */
+    const std::string ourDesc = Description(27016);
+    if (WindowsStep(kActAdd, std::string(), gameOnly) != kWinAdd || WindowsStep(kActKeep, ourDesc, gameOnly) != kWinKeep
+     || WindowsStep(kActKeep, "made by hand", gameOnly) != kWinKeep || WindowsStep(kActLeave, ourDesc, gameOnly) != kWinLeave)
+                                                                           Fail("the game's windows route changed");
+    if (WindowsStep(kActAdd, std::string(), keptOnly) != kWinNoAdd)       Fail("a kept world added an entry with no time limit");
+    if (WindowsStep(kActKeep, ourDesc, keptOnly) != kWinRemoveOurs)          Fail("a kept world left a handed-over entry with no time limit");
+    if (WindowsStep(kActKeep, "made by hand", keptOnly) != kWinKeep || WindowsStep(kActLeave, ourDesc, keptOnly) != kWinLeave)
+                                                                           Fail("a kept world touched an entry that is not ours");
+    {
+        int out = kOutNoRouter;                                            /* nothing answered any route */
+        for (int rt = FirstRoute(); rt != kRouteNone; rt = NextRoute(rt, kRrNoAnswer)) out = FoldOutcome(out, kRrNoAnswer);
+        if (NoteOfOutcome(out) != kNoteNoRouter)                           Fail("a kept world no router answered does not show the no-router line");
+        out = FoldOutcome(FoldOutcome(kOutNoRouter, kRrNoAnswer), kRrRefused);   /* only the windows route answered: nothing added */
+        if (NoteOfOutcome(out) != kNoteFailed)                             Fail("a router that offers only permanent openings does not show the failed line");
+    }
+    if (GrantIsTimeLimited(0) || GrantIsTimeLimited(kLifeNoLimit) || !GrantIsTimeLimited(1) || !GrantIsTimeLimited(3600))
+                                                                           Fail("GrantIsTimeLimited");
+    if (GrantKept(0, keptOnly) || GrantKept(0xFFFFFFFFul, keptOnly))       Fail("a lifetime with no limit was kept as a kept world's opening");
+    if (!GrantKept(3600, keptOnly) || !GrantKept(0, gameOnly) || !GrantKept(0xFFFFFFFFul, gameOnly))
+                                                                           Fail("the game keeps any granted lifetime; a kept world a limited one");
+    const unsigned long asked = (unsigned long)kAskLeaseSeconds;
+    if (!GrantKept(asked, keptOnly) || !GrantKept(asked - 1, keptOnly))    Fail("a kept world refused a lifetime no longer than asked");
+    if (GrantKept(asked + 1, keptOnly) || GrantIsTimeLimited(asked + 1))   Fail("a kept world kept a lifetime longer than asked");
+    if (!GrantKept(asked + 1, gameOnly))                                   Fail("the game refused a lifetime longer than asked");
+    if (!RenewRefusedShowsFailed(keptOnly, kRouteIgd, kRrRefused, false))  Fail("a kept world's refused igd renewal left the open line");
+    if (RenewRefusedShowsFailed(keptOnly, kRouteIgd, kRrRefused, true))    Fail("the failed line was shown twice for one opening");
+    if (RenewRefusedShowsFailed(gameOnly, kRouteIgd, kRrRefused, false))   Fail("the game showed a renewal line");
+    if (RenewRefusedShowsFailed(keptOnly, kRouteIgd, kRrMapped, false) || RenewRefusedShowsFailed(keptOnly, kRouteIgd, kRrNoAnswer, false)
+     || RenewRefusedShowsFailed(keptOnly, kRouteIgd, kRrElsewhere, false)) Fail("a renewal that was not refused showed the failed line");
+    if (!RemoveLeftoverNow(true, kActKeep, Description(27016), kRrRefused)) Fail("our entry a kept world could not lease again was not removed");
+    if (RemoveLeftoverNow(false, kActKeep, Description(27016), kRrRefused)) Fail("the game removed our entry at a refused add");
+    if (RemoveLeftoverNow(true, kActKeep, "made by hand", kRrRefused))      Fail("an entry made by hand was removed");
+    if (!RemoveLeftoverNow(true, kActKeep, Description(27016), kRrElsewhere)) Fail("our entry answered 718 at its re-ask was kept");
+    if (RemoveLeftoverNow(true, kActKeep, Description(27016), kRrMapped) || RemoveLeftoverNow(true, kActAdd, std::string(), kRrRefused)
+     || RemoveLeftoverNow(true, kActLeave, Description(27016), kRrRefused) || RemoveLeftoverNow(false, kActKeep, Description(27016), kRrElsewhere))
+                                                                           Fail("RemoveLeftoverNow removed what is not a leftover of ours");
+    /* the lease the router lists (read back after an add or renewal, or at a renewal answered 718) */
+    if (LeaseKept(true, true, 0) || LeaseKept(true, true, kAskLeaseSeconds + 1)) Fail("a kept world kept a listed lease of none or over the hour");
+    if (!LeaseKept(true, true, kAskLeaseSeconds) || !LeaseKept(true, true, 1) || !LeaseKept(true, false, 0))
+                                                                           Fail("a kept world handed back a lease within the hour, or one it could not read");
+    if (!LeaseKept(false, true, 0) || !LeaseKept(false, true, kAskLeaseSeconds + 1)) Fail("the game read back a lease");
+    /* after a hand-back: nothing held, no stop line */
+    {
+        State kh;
+        HostStart(&kh, 27016);
+        AfterAsk(&kh, 27016, kOutFailed, false, kRoutePcp, 0, kBackDone);
+        if (kh.held != 0 || NextStep(kh) != kStepIdle)                       Fail("an ask whose opening was handed back holds it");
+        HostEnd(&kh);
+        if (NextStep(kh) != kStepIdle || NotClosedNote(kh.held != 0, EndLease(kh)) != 0) Fail("a handed-back opening has a stop line");
+        State kp;
+        HostStart(&kp, 27016);
+        AfterAsk(&kp, 27016, kOutMapped, true, kRoutePcp, 3600, kBackNone);
+        if (kp.held != 27016 || kp.noLimit || kp.lease != 3600)               Fail("AfterAsk with nothing handed back is AfterMap");
+        AfterRenewResult(&kp, kRenewHandedBack, 0);
+        if (kp.held != 0 || kp.removeAtEnd || NextStep(kp) != kStepIdle)      Fail("a renewal handed back left the port held");
+        HostEnd(&kp);
+        if (NextStep(kp) != kStepIdle)                                      Fail("the stop after a renewal hand-back removes or forgets something");
+    }
+    /* not handed back: held only to be removed - the removal asked again at renewal time and at the stop, never "not ours" */
+    {
+        State kf;
+        HostStart(&kf, 27016);
+        AfterAsk(&kf, 27016, kOutFailed, true, kRouteWindows, 0, kBackFailed);
+        if (kf.held != 27016 || !kf.removeAtEnd || !kf.noLimit || kf.route != kRouteWindows || kf.lease <= 0)
+                                                                           Fail("an opening not handed back is not held to be removed");
+        if (NoteOfOutcome(kOutFailed) != kNoteFailed)                      Fail("an opening not handed back counted as opened");
+        kf.renewDue = true;
+        if (NextStep(kf) != kStepRenew)                                     Fail("the removal of an opening not handed back is not asked again");
+        if (RenewOfHandBack(kNoteNotRemoved) != kRenewNotHandedBack || RenewOfHandBack(kNoteRemoved) != kRenewHandedBack
+         || RenewOfHandBack(kNoteGone) != kRenewHandedBack || RenewOfHandBack(kNoteLeft) != kRenewHandedBack) Fail("RenewOfHandBack");
+        AfterRenewResult(&kf, RenewOfHandBack(kNoteNotRemoved), 0);
+        if (kf.held != 27016 || !kf.removeAtEnd || !kf.noLimit || kf.renewDue) Fail("a removal asked again and refused let the opening go");
+        if (NotClosedNote(true, EndLease(kf)) != kNoteNotRemovedNoLimit)    Fail("a stuck opening with no time limit says it closes by itself");
+        HostEnd(&kf);
+        if (NextStep(kf) != kStepUnmap || !MayRemove(kf, 27016))             Fail("the stop does not remove an opening not handed back");
+        if (NoteOfEnd(true, kNoteNotRemoved, EndLease(kf)) != kNoteNotRemovedNoLimit) Fail("the stop's note for it says it closes by itself");
+        AfterUnmap(&kf);
+        if (kf.noLimit || NextStep(kf) != kStepIdle)                         Fail("AfterUnmap left the no-limit mark");
+        State kq;
+        HostStart(&kq, 27016);
+        AfterAsk(&kq, 27016, kOutMapped, true, kRouteIgd, 3600, kBackNone);
+        AfterRenewResult(&kq, kRenewNotHandedBack, 0);
+        if (kq.held != 27016 || !kq.removeAtEnd || !kq.noLimit)               Fail("a renewal not handed back is not held to be removed");
+        AfterRenewResult(&kq, RenewOfHandBack(kNoteRemoved), 0);
+        if (kq.held != 0 || kq.noLimit)                                      Fail("a removal asked again and taken still holds the port");
+        State kl;
+        HostStart(&kl, 27016);
+        AfterAsk(&kl, 27016, kOutMapped, true, kRouteIgd, 3600, kBackNone);
+        AfterRenewResult(&kl, kRenewLost, 0);
+        if (kl.held != 27016 || kl.removeAtEnd || kl.lease != 0)              Fail("AfterRenewResult lost is AfterRenewLost");
+    }
+    /* the hand-over: the entry on the kept world's port is forgotten, never removed; one on another port is removed */
+    State s;
+    HostStart(&s, 27016);
+    AfterMap(&s, 27016, kOutMapped, true, kRouteIgd, 3600);
+    HandOver(&s, 27016);
+    if (s.want != 0 || s.held != 27016 || s.removeAtEnd)                   Fail("the entry on the kept world's port was not left for it");
+    if (NextStep(s) != kStepForget)                                        Fail("a handed-over entry is forgotten, not removed");
+    AfterUnmap(&s);
+    if (NextStep(s) != kStepIdle)                                          Fail("after the hand-over the game does nothing more");
+    State o;
+    HostStart(&o, 27016);
+    AfterMap(&o, 27016, kOutMapped, true, kRoutePcp, 3600);
+    HandOver(&o, 27020);
+    if (o.want != 0 || !o.removeAtEnd || NextStep(o) != kStepUnmap)        Fail("an entry on another port than the kept world's was not removed");
+    State n;
+    HandOver(&n, 27016);
+    if (NextStep(n) != kStepIdle)                                          Fail("a game holding nothing has nothing to hand over");
+    /* the game's ask for that port was still on its router thread at the hand-over: it lands after, and is never removed */
+    State a;
+    HostStart(&a, 27016);
+    const State asking = a;                                                /* the router thread's look: it asks */
+    if (NextStep(asking) != kStepMap)                                      Fail("the game asks for its world server's port");
+    HandOver(&a, 27016);
+    AfterMap(&a, 27016, kOutMapped, true, kRouteIgd, 3600);
+    if (a.held != 27016 || a.removeAtEnd || NextStep(a) != kStepForget)   Fail("an ask that landed after the hand-over was set to be removed");
+    if (MayRemove(a, 27016))                                               Fail("an ask that landed after the hand-over may be removed");
+    AfterUnmap(&a);
+    if (NextStep(a) != kStepIdle)                                          Fail("after a late ask is forgotten the game does nothing more");
+    /* a world server the game starts again on that port (the world kept running there stopped) is the game's own again */
+    HostStart(&a, 27016);
+    AfterMap(&a, 27016, kOutMapped, true, kRouteIgd, 3600);
+    HostEnd(&a);
+    if (NextStep(a) != kStepUnmap || !MayRemove(a, 27016))                 Fail("a later world server's entry on a once handed-over port was not removed");
+    /* the game's removal of that port was chosen (a world server before it ended) when the hand-over came: the last look,
+       under the port's lock, does not send it - and the world kept running asks under that same lock */
+    State b;
+    HostStart(&b, 27016);
+    AfterMap(&b, 27016, kOutMapped, true, kRouteIgd, 3600);
+    HostEnd(&b);
+    const State removing = b;                                              /* the router thread's look: it removes */
+    if (NextStep(removing) != kStepUnmap || !MayRemove(b, 27016))          Fail("an ended world server's entry is removed");
+    HandOver(&b, 27016);
+    if (MayRemove(b, 27016))                                               Fail("a removal chosen before the hand-over was sent after it");
+    /* the world kept running could not be started: the hand-over is undone and the removal chosen before it is sent again */
+    HandBack(&b, 27016);
+    if (b.handedOver != 0 || !b.removeAtEnd || NextStep(b) != kStepUnmap || !MayRemove(b, 27016))
+        Fail("an undone hand-over did not give the removal back");
+    State f;                                                               /* the router thread had already forgotten it */
+    HostStart(&f, 27016);
+    AfterMap(&f, 27016, kOutMapped, true, kRoutePcp, 3600);
+    HostEnd(&f);
+    HandOver(&f, 27016);
+    AfterUnmap(&f);
+    HandBack(&f, 27016);
+    if (f.held != 27016 || f.route != kRoutePcp || f.lease != 3600 || !MayRemove(f, 27016))
+        Fail("an undone hand-over did not take back an entry already forgotten");
+    State l;                                                               /* an ask that landed after the hand-over */
+    HostStart(&l, 27016);
+    HandOver(&l, 27016);
+    AfterMap(&l, 27016, kOutMapped, true, kRouteIgd, 3600);
+    HandBack(&l, 27016);
+    if (!MayRemove(l, 27016))                                              Fail("an undone hand-over did not give back an ask that landed after it");
+    State m;                                                               /* an entry not this game's to remove stays so */
+    HostStart(&m, 27016);
+    AfterMap(&m, 27016, kOutAlready, false, kRouteIgd, 0);
+    HandOver(&m, 27016);
+    AfterUnmap(&m);
+    HandBack(&m, 27016);
+    if (m.held != 27016 || m.removeAtEnd || NextStep(m) != kStepForget)    Fail("an undone hand-over made a hand-made entry removable");
+    State w;                                                               /* nothing held; an undo for another port */
+    HandOver(&w, 27016);
+    HandBack(&w, 27020);
+    if (w.handedOver != 27016)                                             Fail("an undo for another port undid this one");
+    HandBack(&w, 27016);
+    if (w.handedOver != 0 || NextStep(w) != kStepIdle)                     Fail("an undone hand-over with nothing held did something");
+    if (NoteOfEnd(false, 0, 3600) != kNoteLeft)                            Fail("a removal not sent is noted as left");
+    if (PortLockName(27016) != PortLockName(27016) || PortLockName(27016) == PortLockName(27017))
+        Fail("the port's lock is one per port, the same name in the game and the world server");
+    if (PortLockName(27016).compare(0, 6, "Local\\") != 0)                 Fail("the port's lock is this user session's");
+    /* a hand-made entry the world kept running found there: kept, never removed - its stop says it is left open */
+    State h;
+    HostStart(&h, 27016);
+    AfterMap(&h, 27016, kOutAlready, RemoveAtEnd(kActKeep, "my own game server"), kRouteIgd, 0);
+    HostEnd(&h);
+    if (NextStep(h) != kStepForget || MayRemove(h, 27016))                 Fail("a hand-made entry was set to be removed");
+    if (NoteOfEnd(false, 0, h.lease) != kNoteLeft)                         Fail("a hand-made entry's stop is not noted as left open");
+    /* a removal sent: what it came to; one not accepted says whether the entry ends by itself (the lease it was granted) */
+    if (NoteOfEnd(true, kNoteRemoved, 3600) != kNoteRemoved || NoteOfEnd(true, kNoteGone, 0) != kNoteGone)  Fail("NoteOfEnd removed / gone");
+    if (NoteOfEnd(true, kNoteNotRemoved, 3600) != kNoteNotRemoved)         Fail("a leased entry not closed");
+    if (NoteOfEnd(true, kNoteNotRemoved, 0) != kNoteNotRemovedNoLimit)     Fail("an entry with no time limit not closed");
+    if (NotRemovedNote(true, 0) != kNoteNotRemovedNoLimit || NotRemovedNote(true, 1800) != kNoteNotRemoved
+     || NotRemovedNote(false, 0) != kNoteNotRemoved)                       Fail("NotRemovedNote");
+    /* the window and the stop: the ask's line only while the world runs, the removal's until the stop's wait ended */
+    for (int note = kNoteMapped; note <= kNoteNotRemovedNoLimit; ++note)
+    {
+        const bool removal = (note >= kNoteRemoved);
+        if (IsRemovalNote(note) != removal)                                Fail("IsRemovalNote");
+        if (!NoteShown(note, kStopRunning))                                Fail("a router line not shown while the world runs");
+        if (NoteShown(note, kStopBegun) != removal)                        Fail("the ask's line shown after the stop began, or the removal's not");
+        if (NoteShown(note, kStopWaited))                                  Fail("a router line shown after the stop's wait");
+    }
+    if (!NotClosedAtWaitEnd(false, false, kNoteNotRemoved) || !NotClosedAtWaitEnd(false, false, kNoteNotRemovedNoLimit)
+     || NotClosedAtWaitEnd(true, false, kNoteNotRemoved) || NotClosedAtWaitEnd(false, true, kNoteNotRemoved))
+        Fail("the did-not-close line at the end of the stop's wait");
+    /* the wait ran out while the start-up ask was still in progress: no opening is known, so no did-not-close line */
+    if (NotClosedNote(false, 0) != 0 || NotClosedNote(false, 3600) != 0 || NotClosedAtWaitEnd(false, false, NotClosedNote(false, 0)))
+        Fail("a did-not-close line for an opening never known to be held");
+    if (NotClosedNote(true, 0) != kNoteNotRemovedNoLimit || NotClosedNote(true, 3600) != kNoteNotRemoved)
+        Fail("the did-not-close line does not follow the lease granted");
+    /* a second stop door never moves the stop back */
+    if (StopStageAfter(kStopRunning, kStopBegun) != kStopBegun || StopStageAfter(kStopBegun, kStopWaited) != kStopWaited
+     || StopStageAfter(kStopWaited, kStopBegun) != kStopWaited || StopStageAfter(kStopBegun, kStopBegun) != kStopBegun)
+        Fail("the stop's stage moved backwards");
+    /* the server's stop: an entry it added is removed (the same State steps as the game's quit) */
+    State v;
+    HostStart(&v, 27016);
+    AfterMap(&v, 27016, kOutAlready, RemoveAtEnd(kActKeep, Description(27016)), kRouteIgd, 3600);
+    HostEnd(&v);
+    if (NextStep(v) != kStepUnmap)                                         Fail("a crashed run's leftover the next start kept was not removed at its stop");
+    /* the notes */
+    if (NoteOfOutcome(kOutMapped) != kNoteMapped || NoteOfOutcome(kOutAlready) != kNoteAlready
+     || NoteOfOutcome(kOutNoRouter) != kNoteNoRouter || NoteOfOutcome(kOutFailed) != kNoteFailed
+     || NoteOfOutcome(kOutNone) != kNoteFailed)                            Fail("NoteOfOutcome");
+    /* the window's words: one line each, naming the port and the protocol, nothing for an unknown note */
+    for (int note = kNoteMapped; note <= kNoteNotRemovedNoLimit; ++note)
+    {
+        const std::string line = keeprun::RouterLine(note, 27016);
+        if (line.empty() || line.find("port 27016 (UDP)") == std::string::npos) Fail("a router line does not name the port and the protocol");
+        for (int other = kNoteMapped; other < note; ++other)
+            if (keeprun::RouterLine(other, 27016) == line)                 Fail("two router notes have the same line");
+    }
+    if (!keeprun::RouterLine(0, 27016).empty() || !keeprun::RouterLine(99, 27016).empty()) Fail("an unknown note wrote a line");
+    if (keeprun::RouterLine(kNoteRemoved, 7) != "The router's opening on port 7 (UDP) is closed.") Fail("the removal's line");
+    /* every line word for word */
+    const char* const words[] =
+    {
+        "The router is now open on port 27016 (UDP): players can join from the internet.",
+        "The router was already open on port 27016 (UDP): players can join from the internet.",
+        "The router did not open port 27016 (UDP). Players from the internet may not get in - open that port on the router by hand.",
+        "No router answered, so port 27016 (UDP) was not opened. Players from the internet may not get in - open that port on the router by hand.",
+        "The router's opening on port 27016 (UDP) is closed.",
+        "The router's opening on port 27016 (UDP) had already closed.",
+        "The router did not close port 27016 (UDP). It closes by itself within an hour, or the next time this world stops.",
+        "The router's opening on port 27016 (UDP) was not made by this world server, so it is left open.",
+        "The router did not close port 27016 (UDP). Close it on the router by hand, or it closes the next time this world stops."
+    };
+    for (int note = kNoteMapped; note <= kNoteNotRemovedNoLimit; ++note)
+        if (keeprun::RouterLine(note, 27016) != words[note - kNoteMapped]) Fail("router line " + keeprun::RouterLine(note, 27016));
 }
 
 /* routerport= in shared_wastelands.cfg: the HOST press asks the router unless the file says 0 (the harness's default). */
@@ -5692,7 +5959,7 @@ pausemenu::KenshiRows PmKenshi()
 bool PmSame(const pausemenu::Placement& a, const pausemenu::Placement& b)
 {
     return a.hosting == b.hosting && a.newGame == b.newGame && a.saveGame == b.saveGame && a.loadGame == b.loadGame && a.options == b.options && a.exitGame == b.exitGame
-        && a.bug == b.bug && a.resume == b.resume && a.panelTop == b.panelTop && a.panelHeight == b.panelHeight;
+        && a.multiplayer == b.multiplayer && a.bug == b.bug && a.resume == b.resume && a.panelTop == b.panelTop && a.panelHeight == b.panelHeight;
 }
 void t_pausemenu_kenshi_layout_outside_multiplayer()
 {
@@ -5793,6 +6060,72 @@ void t_pausemenu_hosting_row()
     if (!pausemenu::Place(k, true, true, false, p.panelTop, p.panelHeight, &r) || !PmSame(q, r)) Fail("host -> joiner placed differently");
     if (!pausemenu::Place(k, true, false, true, 368, 344, &r) || r.options != 65 || r.resume != 185 || r.panelHeight != 244) Fail("host menu without REPORT A BUG");
 }
+/* T-1153 (owner 1245): MULTIPLAYER directly below OPTIONS in a multiplayer world - EXIT GAME and every row below it one pitch
+   lower, the panel one pitch taller around the same centre - with and without HOSTING and REPORT A BUG; the mock-up's order
+   HOSTING, OPTIONS, MULTIPLAYER, EXIT GAME, REPORT A BUG, RESUME at Kenshi's pitch and gap. */
+void t_pausemenu_multiplayer_row()
+{
+    const pausemenu::KenshiRows k = PmKenshi();
+    /* REPORT A BUG?, HOSTING?; then HOSTING, OPTIONS, MULTIPLAYER, EXIT GAME, REPORT A BUG, RESUME (tops), the panel's height and top */
+    static const int kWant[4][10] = {
+        { 0, 0, -1, 15,  65, 115,  -1, 185, 244, 418 },
+        { 1, 0, -1, 15,  65, 115, 185, 255, 314, 383 },
+        { 0, 1, 15, 65, 115, 165,  -1, 235, 294, 393 },
+        { 1, 1, 15, 65, 115, 165, 235, 305, 364, 358 } };
+    for (int c = 0; c < 4; ++c)
+    {
+        const int* w = kWant[c];
+        const bool bug = w[0] != 0, host = w[1] != 0;
+        const std::string tag = std::string(bug ? "with" : "without") + " REPORT A BUG, " + (host ? "with" : "without") + " HOSTING: ";
+        pausemenu::Placement p, q, r;
+        if (!pausemenu::Place(k, true, bug, host, true, 368, 344, &p)) { Fail(tag + "refused"); continue; }
+        if ((host && p.hosting != w[2]) || p.options != w[3] || p.multiplayer != w[4] || p.exitGame != w[5] || (bug && p.bug != w[6]) || p.resume != w[7])
+            Fail(tag + "rows " + I(p.hosting) + " " + I(p.options) + " " + I(p.multiplayer) + " " + I(p.exitGame) + " " + I(p.bug) + " " + I(p.resume));
+        if (p.panelHeight != w[8] || p.panelTop != w[9]) Fail(tag + "panel " + I(p.panelTop) + "/" + I(p.panelHeight));
+        /* the mock-up's order at Kenshi's pitch, the gap before REPORT A BUG and RESUME, Kenshi's margin below RESUME, the centre kept */
+        if ((host && p.options - p.hosting != p.pitch) || p.multiplayer - p.options != p.pitch || p.exitGame - p.multiplayer != p.pitch)
+            Fail(tag + "MULTIPLAYER not one pitch below OPTIONS and above EXIT GAME");
+        if ((bug && (p.bug - p.exitGame != p.pitch + p.gap || p.resume - p.bug != p.pitch + p.gap)) || (!bug && p.resume - p.exitGame != p.pitch + p.gap))
+            Fail(tag + "the gap before REPORT A BUG / RESUME not Kenshi's");
+        if (p.panelHeight - p.resume != 344 - 285 || p.panelTop + p.panelHeight / 2 != 368 + 344 / 2) Fail(tag + "margin or centre moved");
+        /* a second call on the placed menu moves nothing; without MULTIPLAYER it is T-514 / T-524's placement, one pitch shorter */
+        if (!pausemenu::Place(k, true, bug, host, true, p.panelTop, p.panelHeight, &q) || !PmSame(p, q)) Fail(tag + "a second call moved something");
+        if (!pausemenu::Place(k, true, bug, host, false, 368, 344, &q) || !pausemenu::Place(k, true, bug, host, 368, 344, &r) || !PmSame(q, r))
+            Fail(tag + "MULTIPLAYER off is not the placement without it");
+        if (q.options != p.options || q.exitGame != p.exitGame - p.pitch || q.resume != p.resume - p.pitch || q.panelHeight != p.panelHeight - p.pitch)
+            Fail(tag + "MULTIPLAYER is not exactly one row");
+    }
+}
+/* T-1153 (owner 1245): tags.cfg's three keys (src/common/tagcfg.h) - every part on when the file or a key is missing, a bad line
+   ignored, what is written is what is read for all eight choices, and the written text is exactly the three lines. */
+void t_tagcfg_read_write()
+{
+    tagcfg::Parts p = tagcfg::Parse(std::string());
+    if (!p.player || !p.character || !p.faction) Fail("no tags.cfg: not every part on");
+    if (tagcfg::Format(tagcfg::Defaults()) != "tagPlayer=1\r\ntagCharacter=1\r\ntagFaction=1\r\n") Fail("defaults written as '" + tagcfg::Format(tagcfg::Defaults()) + "'");
+    for (int m = 0; m < 8; ++m)
+    {
+        tagcfg::Parts a;
+        a.player = (m & 1) != 0; a.character = (m & 2) != 0; a.faction = (m & 4) != 0;
+        const tagcfg::Parts b = tagcfg::Parse(tagcfg::Format(a));
+        if (!tagcfg::Same(a, b)) Fail("choice " + I(m) + " read back as " + tagcfg::Words(b));
+    }
+    p = tagcfg::Parse("tagCharacter=0\n");
+    if (!p.player || p.character || !p.faction) Fail("tagCharacter=0: " + tagcfg::Words(p));
+    p = tagcfg::Parse("  tagFaction = 0 \r\n");
+    if (!p.player || !p.character || p.faction) Fail("spaces round the key and value: " + tagcfg::Words(p));
+    p = tagcfg::Parse("tagPlayer=0");
+    if (p.player) Fail("a last line with no line end not read");
+    p = tagcfg::Parse("tagPlayer=0\ntagPlayer=1\n");
+    if (!p.player) Fail("a key named twice: the last line does not win");
+    p = tagcfg::Parse("tagPlayer=2\ntagCharacter=off\nTagFaction=0\ntagFaction\n=0\n");
+    if (!p.player || !p.character || !p.faction) Fail("a bad value or an unknown key turned a part off: " + tagcfg::Words(p));
+    const char junk[6] = { 't', 0, '=', '0', (char)0xFF, '\n' };
+    p = tagcfg::Parse(std::string(junk, 6));
+    if (!p.player || !p.character || !p.faction) Fail("junk bytes turned a part off");
+    if (tagcfg::Words(tagcfg::Parse("tagPlayer=0\r\ntagFaction=0\r\n")) != "player=off character=on faction=off") Fail("the log words");
+}
+
 /* The websites, in the owner's order, each with its scheme (api.ipify.org HTTPS, the other two plain HTTP; the third the
    IPv4-only name), the limits (3 s a step, no further website after 12 s since the press, across the clock's wrap), and the
    reading of an answer: trimmed, a dotted IPv4 internet address, nothing else. */

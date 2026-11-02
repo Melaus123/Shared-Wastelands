@@ -5,7 +5,8 @@
  * apart by that same gap below EXIT GAME, RESUME one more pitch-plus-gap further down. In a multiplayer world NEW GAME, SAVE
  * GAME and LOAD GAME are hidden and the rows below them close up to where NEW GAME stands; outside one every row is where
  * Kenshi put it. The game that hosts a multiplayer world also gets HOSTING (owner 454): the top row, every row below it one
- * pitch further down, the panel one pitch taller.
+ * pitch further down, the panel one pitch taller. In a multiplayer world (host and joiner alike) MULTIPLAYER (owner 1245) stands
+ * directly below OPTIONS: EXIT GAME and every row below it one pitch further down, the panel one pitch taller.
  *
  * Every answer is computed from Kenshi's own positions (recorded once, before anything was moved) and the panel's CURRENT
  * centre, never from where a row stands now - so the answer is the same whichever caller asks first, and asking again on the
@@ -21,6 +22,8 @@ namespace pausemenu {
 const char* const kBugButtonName = "BugReportPauseButton";
 /* HOSTING's button on the panel (ui.cpp makes and places it). */
 const char* const kHostingButtonName = "SWHostingPauseButton";
+/* MULTIPLAYER's button on the panel (ui.cpp makes and places it; its click opens the MULTIPLAYER window). */
+const char* const kMultiplayerButtonName = "SWMultiplayerPauseButton";
 
 /* Kenshi's layout as the engine built it: each button's top inside the panel, and the panel's height. */
 struct KenshiRows
@@ -30,10 +33,11 @@ struct KenshiRows
 };
 
 /* Where everything goes: each button's top inside the panel (bug only meaningful when there is a REPORT A BUG row, hosting
-   only when there is a HOSTING row), and the panel's own top and height in its parent. */
+   only when there is a HOSTING row, multiplayer only when there is a MULTIPLAYER row), and the panel's own top and height in its
+   parent. */
 struct Placement
 {
-    int hosting, newGame, saveGame, loadGame, options, exitGame, bug, resume;
+    int hosting, newGame, saveGame, loadGame, options, multiplayer, exitGame, bug, resume;
     int panelTop, panelHeight;
     int pitch, gap;
 };
@@ -56,8 +60,10 @@ inline int CentredTop(int curTop, int curHeight, int newHeight)
 
 /* The placement for this open. `closeUp` = a multiplayer world (the three rows hidden); `hasBug` = REPORT A BUG is on the
    panel; `hasHosting` = HOSTING is on the panel (the top row, where NEW GAME stands; everything below it one pitch lower);
+   `hasMultiplayer` = MULTIPLAYER is on the panel (one pitch below OPTIONS; EXIT GAME and everything below it one pitch lower);
    curPanelTop / curPanelHeight = the panel as it stands now. false (and *out untouched) when the rows are refused. */
-inline bool Place(const KenshiRows& k, bool closeUp, bool hasBug, bool hasHosting, int curPanelTop, int curPanelHeight, Placement* out)
+inline bool Place(const KenshiRows& k, bool closeUp, bool hasBug, bool hasHosting, bool hasMultiplayer, int curPanelTop, int curPanelHeight,
+                  Placement* out)
 {
     if (!RowsUsable(k)) return false;
     Placement p;
@@ -67,18 +73,25 @@ inline bool Place(const KenshiRows& k, bool closeUp, bool hasBug, bool hasHostin
     const int lift = closeUp ? k.options - k.newGame : 0;   /* the three rows' height, taken out */
     const int grow = hasBug ? step : 0;                     /* REPORT A BUG's row and its gap, put in */
     const int down = hasHosting ? p.pitch : 0;              /* HOSTING's row, put in at the top */
+    const int mp = hasMultiplayer ? p.pitch : 0;            /* MULTIPLAYER's row, put in below OPTIONS */
     p.hosting = k.newGame;
     p.newGame = k.newGame + down;
     p.saveGame = k.saveGame + down;
     p.loadGame = k.loadGame + down;
     p.options = k.options - lift + down;
-    p.exitGame = k.exitGame - lift + down;
+    p.multiplayer = p.options + p.pitch;
+    p.exitGame = k.exitGame - lift + down + mp;
     p.bug = p.exitGame + step;
-    p.resume = k.resume - lift + grow + down;
-    p.panelHeight = k.panelHeight - lift + grow + down;
+    p.resume = k.resume - lift + grow + down + mp;
+    p.panelHeight = k.panelHeight - lift + grow + down + mp;
     p.panelTop = CentredTop(curPanelTop, curPanelHeight, p.panelHeight);
     *out = p;
     return true;
+}
+/* The same placement with no MULTIPLAYER row. */
+inline bool Place(const KenshiRows& k, bool closeUp, bool hasBug, bool hasHosting, int curPanelTop, int curPanelHeight, Placement* out)
+{
+    return Place(k, closeUp, hasBug, hasHosting, false, curPanelTop, curPanelHeight, out);
 }
 
 }   /* namespace pausemenu */

@@ -18,6 +18,7 @@
 #include "../common/relaybridge.h"   /* AddrForLog (a Steam id is never logged) and a Steam dial's connect budget */
 #include "net/relay_bridge.h"        /* RelayRouteFor: the route the title dial takes */
 #include "../common/areaclaim.h"   /* B13: coopstore::PlayerIdOk and kPlayerIdLen - the notebook refuses a malformed id, so the shape rule is read from ONE place */
+#include "../common/authproof.h"   /* kTokenBytes and Unhex: the test file's hosttoken= */
 #include "command_channel.h"   // PathNextToDll - the same directory the command channel already uses
 #include "net/session.h"
 #include "store.h"
@@ -64,6 +65,7 @@ int g_relayTestCap = 0, g_relayTestDials = 0;   /* TEST ONLY: relaytest=many's c
 int g_relayBridgeMode = 0; unsigned short g_relayBridgePort = 0, g_relayViaPort = 0; int g_relayCap = 0;   /* relaybridge= / relayvia= / relaycap= */
 int g_parityHoldSec = 0;                    /* T-734 TEST ONLY: parityholdsec= */
 int g_benchCapKbs = 0, g_netRateLog = 0;    /* TEST ONLY: benchcapkbs= / netratelog= */
+int g_steamFakeLagMs = 0, g_steamFakeLossPct = 0;   /* T-1118 f TEST ONLY: steamfakelag= / steamfakeloss= */
 std::string g_sweepSkip;                    /* TEST ONLY: sweepskip= */
 std::string g_slotProfile;                   /* prof1 fold (review-prof1 4): the picked profile's save folder - a re-arm keeps it over the file's slot= */
 std::string g_slotFile;                      /* T-201 PP5: the settings' own slot= as last armed - what ConfigLeave puts back when the profile's folder goes */
@@ -464,6 +466,8 @@ int            ConfigParityHoldSec()   { return g_parityHoldSec; }
 std::string    ConfigSweepSkip()       { return g_sweepSkip; }
 int            ConfigBenchCapKbs()     { return g_benchCapKbs; }
 int            ConfigNetRateLog()      { return g_netRateLog; }
+int            ConfigSteamFakeLagMs()  { return g_steamFakeLagMs; }
+int            ConfigSteamFakeLossPct() { return g_steamFakeLossPct; }
 void           ConfigSetSlotForProfile(const std::string& slot) { g_slot = slot; g_slotProfile = slot; }
 std::string    ConfigPlayerId()  { EnsurePlayerId("asked for before one existed"); return g_playerId; }
 
@@ -718,6 +722,8 @@ bool ConfigWritePlayerName(const std::string& name, std::string* err)
    ConfigLoad and ConfigRearmFromFile are the two callers.  A second reader beside it would be the
    two-things-kept-in-step-by-hand shape 6a lesson 11 names, and the thing kept in step would be the
    meaning of the settings file. */
+extern unsigned char g_hostToken[];   /* store.cpp: this hosting's secret (HOST_TOKEN, the bridge's STEAM_ID) - a bench host takes the test file's hosttoken= */
+extern bool g_hostTokenSet;
 static int ConfigReadFileInto(std::string* whyOut)
 {
     /* PP3: THE TEST FILE FIRST. The DLL-side shared_wastelands.cfg names the data folder (datadir=) and the bench folders, and its
@@ -879,6 +885,11 @@ static int ConfigReadFileInto(std::string* whyOut)
     if (fields.netRateLog != g_netRateLog && fields.netRateLog != 0)
         DebugLog("[CFG] TEST ONLY: netratelog=1 - each Steam link logs a [net] RATE line once a second");
     g_benchCapKbs = fields.benchCapKbs; g_netRateLog = fields.netRateLog;
+    if ((fields.steamFakeLagMs != g_steamFakeLagMs || fields.steamFakeLossPct != g_steamFakeLossPct) && (fields.steamFakeLagMs != 0 || fields.steamFakeLossPct != 0))
+        DebugLog("[CFG] TEST ONLY: steamfakelag=" + N((long long)fields.steamFakeLagMs) + " / steamfakeloss=" + N((long long)fields.steamFakeLossPct)
+                 + " - Steam's fake lag (ms) / loss (%) on every Steam packet this game sends, if this game has not set them yet: set once"
+                 + " per game, at the first Steam link UP that Steam accepts them (a change after that applies only after a restart)");
+    g_steamFakeLagMs = fields.steamFakeLagMs; g_steamFakeLossPct = fields.steamFakeLossPct;
     g_modSalt   = fields.modSalt;
     g_ownSaveCfg = fields.ownSave;   /* mmo1 */
     if (fields.routerPort != g_routerPortCfg)
@@ -889,6 +900,20 @@ static int ConfigReadFileInto(std::string* whyOut)
         DebugLog("[CFG] joinvia= is not read: every joining game rings the world server alone");
     g_joinViaWorld = fields.joinViaWorld;   /* M11a S1 */
     const int wanted = fields.role;
+    /* TEST ONLY: a host the bench armed at start, whose world server the bench started with --host-token, holds that secret from the
+       bench's test file (tf - never session.cfg), so it proves HOST_TOKEN as a game that started its own world server does. A real
+       host gets the secret from its own world-server start or the HOST panel's host.key. The value is never logged. */
+    if (atStart && haveTestEff && wanted == kRoleHost && !tf.hostToken.empty())
+    {
+        unsigned char tok[authproof::kTokenBytes];
+        if (authproof::Unhex(tf.hostToken, tok, authproof::kTokenBytes))
+        {
+            memcpy(g_hostToken, tok, sizeof tok);
+            g_hostTokenSet = true;
+            DebugLog("[CFG] TEST ONLY: hosttoken= - this game holds the hosting secret its world server was started with (not logged)");
+        }
+        SecureZeroMemory(tok, sizeof tok);
+    }
 
     ::InterlockedExchange(&g_role, (long)wanted);
     if (atStart && haveTestEff && wanted != kRoleSingle)   /* T-202: only the harness's test file can do this */

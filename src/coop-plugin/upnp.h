@@ -15,15 +15,40 @@ namespace coop {
    caller may close its own at any time). Never waits: it records the request and wakes the worker. */
 void UpnpHostStart(unsigned short port, void* serverProcess);
 
+/* MAIN THREAD, just before the MULTIPLAYER panel's HOST press makes a world kept running on `port` (ui.cpp PanelStartNotebook) -
+   before that process exists, so its own ask always comes after this: that world server asks the router for itself
+   (UpnpServeStart, in its own process), so this game's hosting ends here - an entry it holds on `port` is left for that world
+   server (coopupnp::HandOver), never removed by this game, even one its router thread is asking for or about to remove right
+   now; one on any other port is removed as usual.  Does nothing when this game never asked the router.  Never waits. */
+void UpnpHandOver(unsigned short port);
+
+/* MAIN THREAD, when the world kept running could not be started after UpnpHandOver (its process was never made): the hand-over
+   is undone (coopupnp::HandBack) - an entry on `port` left for that world is this game's again and is removed, this game's
+   hosting having ended, as it was to be before the hand-over.  Does nothing when this game never asked the router.  Never waits. */
+void UpnpHandBack(unsigned short port);
+
+/* THE WORLD SERVER'S OWN ASK (SharedWastelandsServer.exe --keep-running compiles this file in; coopupnp::ServerMapsAtStart).
+   ITS MAIN THREAD, once it listens on `port`: the router thread asks for the port as UpnpHostStart does, with no process to
+   watch - the entry is removed by UpnpQuitBegin / UpnpQuitWait on the world server's stop.  note (may be 0) is called ON THE
+   ROUTER THREAD, never under this file's lock, once for the ask's outcome and once for the removal (coopupnp::kNote*).
+   Never waits. */
+typedef void (*UpnpNoteFn)(int note, long port);
+void UpnpServeStart(unsigned short port, UpnpNoteFn note);
+
 /* MAIN THREAD, in place of UpnpHostStart when the settings file says routerport=0: the router is not asked. Logs one
    [UPNP] line and counts it in the REPORT's `off` field. */
 void UpnpHostOff(unsigned short port);
 
-/* THE GAME IS QUITTING (the exit path in store.cpp). Begin: hosting has ended, the worker is told to remove the entry
-   and stop; returns at once. Wait: waits at most coopupnp::kQuitWaitMs for the worker to finish. Both do nothing when
-   this game never hosted. */
+/* THE GAME IS QUITTING (the exit path in store.cpp), or a world kept running stops (its QuitDrain). Begin: hosting has ended, the worker is told to remove the entry
+   and stop; returns at once. Wait: waits at most coopupnp::kQuitWaitMs for the worker to finish - true when it finished
+   (or there was none), false when the wait ran out. Both do nothing when this game never hosted. */
 void UpnpQuitBegin();
-void UpnpQuitWait();
+bool UpnpQuitWait();
+
+/* An opening this program could not be sure it closed (its stop's wait ran out): coopupnp::kNoteNotRemovedNoLimit when the
+   entry it holds now was granted with no time limit, coopupnp::kNoteNotRemoved for a leased one, 0 when it holds none (its
+   start-up ask still in progress has opened nothing it knows of) - coopupnp::NotClosedNote. */
+int UpnpNotClosedNote();
 
 /* THE INTERNET ADDRESS, FROM THE ROUTER (nothing outside the home is contacted by this ask).  MAIN THREAD, when
    the HOSTING window opens: the router thread is asked for the address the router reports (UPnP IGD GetExternalIPAddress,

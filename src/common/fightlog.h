@@ -26,6 +26,7 @@ const int kRing    = 64;                  /* events waiting for the main thread 
 const int kSwing = 0;
 const int kHit   = 1;
 const int kBlockPick = 2;                 /* T-1101 step 5: the block pose a game's engine picked, at pick time */
+const int kReady     = 3;                 /* T-890 fightReady: the getting-ready timer set from a blow's real result (fightready.h) */
 /* how a block pick was made (Event.how) */
 const int kHowEngine     = 0;             /* the engine's own pick, nothing carried (the defender's owner: the pick it plays and sends) */
 const int kHowSame       = 1;             /* the attacker's game: the engine's first pick was the carried one */
@@ -68,6 +69,10 @@ struct Event
     char         move[kNameBuf];         /* swing: the move started; hit: the attacker's current attack move */
     char         block[kNameBuf];        /* hit: the victim's block move; block pick: the pick ('-' none) */
     char         stumble[kNameBuf];      /* hit: the stumble the hit played */
+    int          combo;                  /* ready: the blow's comboId */
+    int          held;                   /* ready: 1 the timer was still held (written), 0 it was counting (added) */
+    int          why;                    /* ready: fightready.h kWhy*, kWhyNone = written or added */
+    float        before, after;          /* ready: the attacker's +0x148 before and after */
 };
 
 struct Ring

@@ -422,6 +422,25 @@ public:
     /* M16 fold 2: this link is the game's link to the world server - type 53 is a LIVE envelope on it (on the session link
        it is MSG_PARITY_REQ and must-deliver). A no-op for a backend without the bound. */
     virtual void SetStoreLink() {}
+    /* T-1118 (b) stage 2: this world-server link is the host's Steam bridge's own (net/relay_bridge.cpp): the world server's CHUNK
+       pieces (src/common/livefirst.h) are handed up as they came, not joined, and a CHUNK handed to Send goes on as it is, never cut
+       again - the Steam joiner and the world server join each other's pieces. Call after SetStoreLink. A no-op for a backend without
+       the live-first mode. */
+    virtual void SetHandOnPieces() {}
+    /* A live-first world-server link's live-message counters since the last call (the host's bridge reads its own links here,
+       net/relay_bridge.cpp): live messages that passed waiting record pieces, that waited in the line, holds behind a barrier, the
+       longest wait in the line and the longest ahead estimate (ms; both restart at each call), and the link's budget (bytes) and
+       measured drain rate (bytes/s) now. false = not a live-first link (nothing set); a backend without the mode answers false. */
+    struct LiveWaits
+    {
+        long long livePassed, liveWaited, barrierHeld, liveWaitMaxMs, aheadMaxMs, budget, rateBps;
+        long long announceQueued, announceSent, announceMaxWaitMs, gateHeld;   /* the ANNOUNCE line (livefirst.h Stats) */
+        long long bulkQueued, bulkSent, bulkHeld, bulkBySize, bulkByShare, bulkBySticky, bulkMaxWaitMs, liveAheadMaxBytes;   /* T-1118 (c): the BULK line (livefirst.h Stats) */
+        LiveWaits() : livePassed(0), liveWaited(0), barrierHeld(0), liveWaitMaxMs(0), aheadMaxMs(0), budget(0), rateBps(0),
+                      announceQueued(0), announceSent(0), announceMaxWaitMs(0), gateHeld(0),
+                      bulkQueued(0), bulkSent(0), bulkHeld(0), bulkBySize(0), bulkByShare(0), bulkBySticky(0), bulkMaxWaitMs(0), liveAheadMaxBytes(0) {}
+    };
+    virtual bool TakeLiveWaits(LiveWaits* /*out*/) { return false; }
     /* M13: bundling on this link on (true) or off - the messages handed over during one pass leave as one packet per lane
        (src/common/sendbundle.h). The store layer turns it on at a WELCOME of the same world-server protocol; the link turns
        it off itself at every connect and disconnect. A no-op for a backend without it, and for the session link. */

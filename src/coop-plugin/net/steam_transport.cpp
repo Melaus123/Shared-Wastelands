@@ -26,9 +26,23 @@
 
    THE LOCAL SEND QUEUE. Steam refuses a send past its send buffer (k_EResultLimitExceeded). This link raises the buffer to 4 MB and starts the
    send rate at 512 KB/s (4 Mbit/s) when each socket is made, then steps it once a second from Steam's delivery quality and the data
-   waiting (128 KB/s to 4 MB/s; Valve's library does not estimate bandwidth itself), and keeps every reliable message Steam has not yet taken in its own queue, in order,
+   waiting (256 KB/s to 4 MB/s; Valve's library does not estimate bandwidth itself), and keeps every reliable message Steam has not yet taken in its own queue, in order,
    handing it on at every Poll and Flush: a refused send is retried, never dropped. An unreliable message Steam refuses is dropped and
    counted (the lane is lossy by definition).
+
+   LIVE FIRST (T-1118 (b) stage 2; world-server links only - a Steam joiner's own link (SetStoreLink) and the host bridge's links
+   toward joiners (SteamListener::SetBridgeLinks); any other Steam link is exactly as above). Steam sends a link's reliable messages
+   strictly in the order it took them, so a live message (a movement, a swing) handed to Steam waited behind every byte of an area
+   record or a save handed before it - up to the 4 MB buffer. Now such a link runs the same waiting line as the ENet world-server
+   links (src/common/sendbound.h Outbox in live-first mode, src/common/livefirst.h): live messages go before record (REST) frames;
+   a REST frame over 32 KB leaves as CHUNK messages (88) of up to 32 KB each, at most the room left under the budget - each one whole Steam message - while what Steam has
+   not sent yet (its pending reliable and unreliable bytes, read every Poll with GetConnectionRealTimeStatus, plus what it took since)
+   is under the BUDGET: 100 ms of the send rate this link set on Steam (16 KB..1 MB); the barriers (WELCOME, AREAMAP, PLAYER_GONE
+   toward a joiner, JOIN_STAGE toward the world server) are never passed by a live message put after them. A joiner's link joins the
+   world server's CHUNKs before anything reads them; a bridge link hands CHUNKs up and sends them on as they came (never joined,
+   never cut again), marking the last piece of a barrier it hands on as the barrier (livefirst.h HandOn), so the order holds through
+   the bridge both ways. Counted per link on sendBound[...] liveFirst[...] (SendBoundToken: the joiner's world link on the store
+   REPORT line) and summed over every such link on steamLiveFirst[...] (SteamLinkReportToken).
 
    THE END OF A LINK. After the peer closes (or Steam finds a problem here) the messages Steam already received can still be read
    (Valve, steamnetworkingtypes.h): CheckConn reads them all before it frees the handle, so the peer's goodbye arrives. A graceful
@@ -67,6 +81,10 @@
 #include "steam_probe.h"
 #include "../coop_log.h"
 #include "../../common/relaysplit.h"
+#include "../../common/sendbound.h"   /* T-1118 (b) stage 2: the live-first waiting line (and livefirst.h) on world-server links */
+// PROBE-START: P199 - the live-wait stamps
+#include "../../common/p199livewait.h"
+// PROBE-END: P199
 #include "../../common/steamlisten.h"
 #include "../../common/typetally.h"   /* what each link carried, by message type - the [NET] TRAFFIC REPORT line */
 #include "../config.h"   /* ConfigNetRateLog (TEST ONLY) */
@@ -298,6 +316,34 @@ const int kSendRateBytes = relaysplit::kSendRateStartBytes;   /* 512 KB/s (4 Mbi
                                                                   rate each connection starts at; Steam's default is 256 KB/s */
 const int kRateLogMax = 40;               /* send-rate changes logged per link; the rest are counted (steamLink rateChanges) */
 const DWORD kRateStepMs = 1000;           /* the send rate is stepped once a second while the link is UP */
+
+/* T-1118 f, TEST ONLY: steamfakelag=<ms> / steamfakeloss=<percent> put Steam's fake lag / loss on a real game's Steam link for a proving
+   run (relaylag= / relayloss= act only inside the echo test, net/relay_test.cpp). SteamSetFakeLagLoss sets Steam's GLOBAL values: from
+   then on they act on every Steam packet this whole game sends (every Steam link, a host's bridge too), and on sends only, so lag both
+   ways needs the keys in both games' cfg. Set once per game: at a Steam link UP that finds either key set, and only an accepted set
+   counts - a refused set is tried again at the next link UP (the refusal logged once). After an accepted set, values read from the
+   cfg later do not apply. Both 0 (absent) = nothing is set and nothing changes. */
+bool g_testFakeSet = false;
+bool g_testFakeRefusalLogged = false;
+void SteamTestFakeLagLossOnce()
+{
+    if (g_testFakeSet) return;
+    const int lag = ConfigSteamFakeLagMs(), loss = ConfigSteamFakeLossPct();
+    if (lag == 0 && loss == 0) return;
+    std::string err;
+    if (SteamSetFakeLagLoss(lag, loss, &err))
+    {
+        g_testFakeSet = true;   /* Steam accepted: no more tries this game */
+        DebugLog("[STEAMLINK] (TEST) fake lag=" + N((long long)lag) + " ms loss=" + N((long long)loss)
+                 + " % on every Steam packet this game sends (Steam's global setting; steamfakelag= / steamfakeloss=)");
+    }
+    else if (!g_testFakeRefusalLogged)
+    {
+        g_testFakeRefusalLogged = true;
+        ErrorLog("[STEAMLINK] (TEST) fake lag=" + N((long long)lag) + " ms loss=" + N((long long)loss) + " % NOT set - " + err
+                 + " (tried again at each Steam link UP until Steam accepts; this refusal is logged once)");
+    }
+}
 const int kLingerBufferCapBytes = 41943040;   /* 40 MB: a graceful close's send buffer at most (the link's own queue + the normal 4 MB) */
 const int kTimeoutInitialMs = 10000;
 const int kTimeoutConnectedMs = 10000;
@@ -334,6 +380,15 @@ struct IceStats
     long long read0, not0;   /* P2P listen sockets whose relay-only option read back as 0; ones whose did not (each closed) */
 };
 IceStats g_iceStats;   /* every P2P listen socket of this game (static storage: zero) */
+
+/* T-1118 (b) stage 2: the live-first mode of every Steam world-server link of this game (a joiner's own link and the bridge's links),
+   summed for the steamLiveFirst[...] token; the two maxima restart at each REPORT. */
+struct LfAll
+{
+    livefirst::Stats st;
+    long long links, chunksIn, joinedIn, joinFault, joinDup, handedIn, handedOut, aheadMaxMs;
+};
+LfAll g_lf;   /* static storage: zero */
 
 /* A send rate a Steam link now runs at, into the REPORT's rateNow / rateMin / rateMax. */
 void NoteRate(int rate)
@@ -631,9 +686,14 @@ public:
           sent_(0), recv_(0), bytesOut_(0), bytesIn_(0), connectGen_(0), nextPeerId_(1), peerId_(0), ping_(0),
           steamPending_(0), queueBytes_(0), dialMs_(0), upMs_(0), lastRecvMs_(0), relayed_(0), endReason_(0), maxState_(0), endedConn_(0),
           timeoutConnectedMs_(kTimeoutConnectedMs), nEvents_(0), registered_(false), rate_(kSendRateBytes), rateNextMs_(0), rateFrozen_(false),
-          rateLogged_(0), p2p_(false), remoteKind_(0), remoteId64_(0), rateLogMs_(0), tallyLink_(nettally::kLinkSession)
+          rateLogged_(0), p2p_(false), remoteKind_(0), remoteId64_(0), rateLogMs_(0), tallyLink_(nettally::kLinkSession),
+          lfDir_(-1), lfHandOn_(false), steamUnsent_(0), lfChunksIn_(0), lfJoinedIn_(0), lfJoinFault_(0), lfJoinDup_(0), lfAheadMaxMs_(0),
+          sbDirect_(0), sbWaited_(0), sbCoalesced_(0), sbEpisodes_(0), sbDropped_(0), sbSendFailed_(0), sbWaitMax_(0)
     {
         endText_[0] = 0;
+        // PROBE-START: P199 - no stamp handed over yet; the byte totals start at 0
+        p199Cur_ = -1; p199QOut_ = 0; p199ToSteam_ = 0; p199Rtt_ = 0;
+        // PROBE-END: P199
         EnsureLock();
         ::EnterCriticalSection(&g_cs);
         for (int i = 0; i < kLiveMax; ++i)
@@ -650,6 +710,9 @@ public:
     ~SteamTransport()
     {
         Close(true);
+        // PROBE-START: P199 - a world-server link's last window (its close loses what had not left)
+        if (lfDir_ >= 0) { std::vector<std::string> l; P199Report(&l); for (size_t i = 0; i < l.size(); ++i) DebugLog(l[i]); }
+        // PROBE-END: P199
         ::EnterCriticalSection(&g_cs);
         for (int i = 0; i < kLiveMax; ++i)
             if (g_live[i] == this) g_live[i] = 0;
@@ -805,6 +868,8 @@ public:
         PumpQueue();
         if (broken_ || conn_ == 0 || state_ != LINK_UP) return;
         RefreshStatus();
+        if (broken_ || conn_ == 0 || state_ != LINK_UP) return;
+        LfDrain();   /* T-1118 (b) stage 2: with Steam's fresh pending bytes */
     }
 
     bool Send(unsigned int /*peer*/, MsgType type, const char* data, size_t len, Channel ch)
@@ -829,6 +894,7 @@ public:
         const unsigned int len32 = (unsigned int)len;
         std::memcpy(&frame[1], &len32, 4);
         if (len != 0) std::memcpy(&frame[5], data, len);
+        if (lfDir_ >= 0) return LfSend(type, data, len, ch, &frame);   /* T-1118 (b) stage 2: a world-server link - live first */
         std::vector<std::vector<char> > msgs;
         if (!relaysplit::Split(&frame[0], frame.size(), reliable, &msgs)) return false;
         if (!reliable)
@@ -865,6 +931,8 @@ public:
     {
         if (broken_ || conn_ == 0 || state_ != LINK_UP) return;
         if (SteamProbeSockets() == 0) { Stop(NoSteamWhy("another Steam call in this game faulted")); return; }   /* no Steam call after any fault */
+        LfDrain();
+        if (broken_ || conn_ == 0) return;
         PumpQueue();
         if (broken_ || conn_ == 0) return;
         if (!SehFlush(sockets_, conn_)) Fault("FlushMessagesOnConnection");
@@ -873,7 +941,37 @@ public:
     LinkState   State() const { return state_; }
     BackendId   Backend() const { return BACKEND_STEAM; }
     const char* BackendName() const { return "steam"; }
-    void SetStoreLink() { if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* counted as the world link; nothing else changes on Steam */
+    /* Counted as the world link, and (T-1118 (b) stage 2) a Steam joiner's link to the world server runs the live-first mode: live
+       messages before record pieces, its own big frames cut, the world server's pieces joined (livefirst.h, sendbound.h). */
+    void SetStoreLink()
+    {
+        if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld;
+        LfOn(livefirst::kDirUp, false);
+    }
+    /* T-1118 (b) stage 2, from the listener (SetBridgeLinks): a bridge link toward a Steam joiner - live first, pieces handed on. */
+    void SetBridgeLink() { LfOn(livefirst::kDirDown, true); }
+    /* M16 / T-1118 (b): what waits on a world-server link (empty on any other Steam link) - the same sendBound[...] fields as an ENet
+       link (netQueued / netBytes = this link's own queue plus what Steam has not sent yet, its packets counted as full 32 KB pieces - smaller pieces count low), then
+       liveFirst[...] as the ENet link prints it (budget = 100 ms of the send rate; rateKBs = the send rate set on Steam). */
+    std::string SendBoundToken()
+    {
+        if (lfDir_ < 0) return std::string();
+        LfCollect();
+        const long long wm = sbWaitMax_; sbWaitMax_ = box_.Count();
+        const std::string t = " sendBound[waitNow,waitBytesNow,waitMax,netQueued,netBytes,direct,waited,coalesced,episodes,droppedAtClose,sendFailed]="
+             + N(box_.Count()) + "," + N(box_.Bytes()) + "," + N(wm) + "," + N(LfNetCount()) + "," + N(LfNetBytes()) + "," + N(sbDirect_)
+             + "," + N(sbWaited_) + "," + N(sbCoalesced_) + "," + N(sbEpisodes_) + "," + N(sbDropped_) + "," + N(sbSendFailed_)
+             + " liveFirst[piecesOut,cutOut,piecesIn,joinedIn,joinFault,joinDup,livePassed,liveWaited,barrierHeld,liveWaitMaxMs,aheadMaxMs,budget,rateKBs,announceQueued,announceSent,announceMaxWaitMs,gateHeld"
+             + livefirst::BulkTokenNames() + "]="   /* T-1118 (c): the BULK line's fields appended, as the ENet link's */
+             + N(lfStats_.chunks) + "," + N(lfStats_.cutFrames) + "," + N(lfChunksIn_) + "," + N(lfJoinedIn_) + "," + N(lfJoinFault_) + "," + N(lfJoinDup_)
+             + "," + N(lfStats_.livePassed) + "," + N(lfStats_.liveWaited) + "," + N(lfStats_.barrierHeld) + "," + N((long long)(lfStats_.liveWaitMaxSec * 1000.0))
+             + "," + N(lfAheadMaxMs_) + "," + N(box_.Budget()) + "," + N((long long)rate_ / 1024)
+             + "," + N(lfStats_.announceQueued) + "," + N(lfStats_.announceSent) + "," + N((long long)(lfStats_.announceWaitMaxSec * 1000.0)) + "," + N(lfStats_.gateHeld)
+             + livefirst::BulkTokenValues(lfStats_);
+        lfStats_.liveWaitMaxSec = 0.0; lfStats_.announceWaitMaxSec = 0.0; lfAheadMaxMs_ = 0;   /* the maxima restart at each REPORT */
+        lfStats_.RestartBulkMaxima();
+        return t;
+    }
     void SetTrafficLink(int link) { tallyLink_ = link; }   /* the [NET] TRAFFIC REPORT line this link is counted on - see transport.h */
     unsigned int PeerCount() const { return state_ == LINK_UP ? 1u : 0u; }
     bool CurrentPeerId(unsigned int* out) const
@@ -898,8 +996,8 @@ public:
     {
         if (state_ != LINK_UP) return false;
         const long long piece = (long long)relaysplit::kPieceBytes;
-        if (packets != 0) *packets = (long long)queue_.size() + (steamPending_ + piece - 1) / piece;
-        if (bytes != 0) *bytes = queueBytes_ + steamPending_;
+        if (packets != 0) *packets = (long long)queue_.size() + (steamPending_ + piece - 1) / piece + box_.Count();   /* T-1118 (b): and the live-first line */
+        if (bytes != 0) *bytes = queueBytes_ + steamPending_ + box_.Bytes();
         return true;
     }
     bool ByteCounts(unsigned long long* sent, unsigned long long* recv) const
@@ -1067,6 +1165,7 @@ private:
         queueBytes_ = 0;
         steamPending_ = 0;
         rejoin_.Reset();
+        LfLinkGone();
     }
 
     /* The graceful close (linger: Steam still sends what it holds) or the abrupt one. A graceful close first raises this connection's
@@ -1084,6 +1183,7 @@ private:
             bool lingerRaised = false;
             if (conn_ != 0 && state_ == LINK_UP && linger)
             {
+                LfHandAll();   /* T-1118 (b): what waits on the live-first line goes into this link's queue first, in its order */
                 if (!queue_.empty()) lingerRaised = RaiseLingerBuffer();
                 if (!broken_) PumpQueue();
             }
@@ -1104,6 +1204,7 @@ private:
         queueBytes_ = 0;
         steamPending_ = 0;
         rejoin_.Reset();
+        LfLinkGone();
         if (g_csReady)
         {
             ::EnterCriticalSection(&g_cs);
@@ -1203,6 +1304,8 @@ private:
                 rate_ = kSendRateBytes;   /* each connection starts at the rate its socket was made with; the first step is a second on */
                 rateNextMs_ = now + kRateStepMs;
                 rateFrozen_ = false;
+                rateState_.Reset();   /* a reconnect starts the rate rule clean: no bad run, no ping history, no proven rate, no cut */
+                SteamTestFakeLagLossOnce();   /* TEST ONLY: steamfakelag= / steamfakeloss=, until Steam accepts them once per game */
                 NoteRate(rate_);
                 remoteKind_ = info.identityRemote.type;
                 remoteId64_ = 0;
@@ -1257,6 +1360,7 @@ private:
         queueBytes_ = 0;
         steamPending_ = 0;
         rejoin_.Reset();
+        LfLinkGone();
         DebugLog("[net] Steam link ended (" + std::string(how) + "): end reason " + N(reason) + " '" + endText_ + "'"
                  + (wasUp ? "" : " - it never came up"));
         if (closeIt) DebugLog("[net] Steam link facts at end: " + facts);
@@ -1345,6 +1449,11 @@ private:
             return false;
         }
         if (pieces > 1) ++g_stats.rejoined;
+        if (lfDir_ >= 0 && frame.size() > 5 && (unsigned int)(unsigned char)frame[0] == livefirst::kMsgChunk && (flags & kSendReliableBit) != 0)
+        {
+            if (lfHandOn_) { ++lfChunksIn_; ++g_lf.handedIn; }    /* a bridge link: the piece goes up as it came, for the far side to join */
+            else if (!LfJoin(&frame)) return true;               /* a joiner's link: kept, or refused (counted) - nothing to hand up yet */
+        }
         unsigned int declared = 0;
         if (frame.size() >= 5) std::memcpy(&declared, &frame[1], 4);
         if (frame.size() < 5 || (size_t)declared != frame.size() - 5)
@@ -1380,6 +1489,11 @@ private:
             if (!SehSend(sockets_, conn_, &m[0], (unsigned int)m.size(), kSendReliableNoNagle, &res)) { Fault("SendMessageToConnection"); return; }
             if (res == kResultOk)
             {
+                steamUnsent_ += (long long)m.size();   /* T-1118 (b): Steam holds it unsent until the next status read says otherwise */
+                // PROBE-START: P199 - the bytes pumped from this link's queue and taken by Steam, in all; stamps whose last piece is now with Steam get their mark
+                p199QOut_ += (unsigned long long)m.size(); p199ToSteam_ += (unsigned long long)m.size();
+                p199_.Pumped(p199QOut_, p199ToSteam_);
+                // PROBE-END: P199
                 queueBytes_ -= (long long)m.size();
                 queue_.pop_front();
                 continue;
@@ -1410,31 +1524,46 @@ private:
            heard from, as ENet counts any packet, so the host-silence clock does not run while the peer is alive but quiet. */
         if (st.inPacketsPerSec > 0.0f) lastRecvMs_ = ::GetTickCount();
         steamPending_ = (long long)st.pendingUnreliable + (long long)st.pendingReliable + (long long)st.sentUnackedReliable;
+        steamUnsent_ = (long long)st.pendingUnreliable + (long long)st.pendingReliable;   /* T-1118 (b): not yet on the wire - what a live message waits behind */
+        // PROBE-START: P199 - bytes Steam has sent = bytes it took minus what it still holds unsent; a stamp at or under that mark has left (approximate - p199livewait.h)
+        if (p199_.Any())
+        {
+            const unsigned long long u = (unsigned long long)(st.pendingUnreliable > 0 ? st.pendingUnreliable : 0) + (unsigned long long)(st.pendingReliable > 0 ? st.pendingReliable : 0);
+            p199_.SentUpTo(p199ToSteam_ > u ? p199ToSteam_ - u : 0ULL);
+        }
+        p199Rtt_ = st.ping > 0 ? (long long)st.ping : 0;
+        // PROBE-END: P199
         NoteQueued();
         StepRate(st);
         RateLog(st);
     }
 
     /* TEST ONLY (netratelog=1; absent = off): once a second per link, what Steam reports for it beside this link's own rate and queue,
-       so a bench sees real Steam numbers. Reads only. Integers only: q = quality x100 (-100 = Steam cannot say yet). */
+       so a bench sees real Steam numbers. Reads only. Integers only: q = quality x100 (-100 = Steam cannot say yet). Last, the
+       rate rule's last step (relaysplit::NextSendRate): fresh = a fresh far-end quality reading, busy = the link busy, run = the
+       busy-bad readings counted toward a cut. */
     void RateLog(const SnRealTimeStatus& st)
     {
         if (ConfigNetRateLog() == 0) return;
         const DWORD now = ::GetTickCount();
         if (rateLogMs_ != 0 && now - rateLogMs_ < 1000u) return;
         rateLogMs_ = (now == 0) ? 1 : now;
-        char b[384];
+        char b[448];
         _snprintf(b, sizeof(b) - 1, "[net] RATE link=%s peer=%u rate=%d steamRate=%d outBps=%d inBps=%d ping=%d qL=%d qR=%d pendRel=%d pendUnrel=%d"
-                  " unacked=%d queueUs=%lld ownQ=%lld", nettally::LinkName(tallyLink_), peerId_, rate_, st.sendRateBytesPerSecond,
+                  " unacked=%d queueUs=%lld ownQ=%lld fresh=%d busy=%d run=%d", nettally::LinkName(tallyLink_), peerId_, rate_, st.sendRateBytesPerSecond,
                   (int)st.outBytesPerSec, (int)st.inBytesPerSec, st.ping, (int)(st.qualityLocal * 100.0f), (int)(st.qualityRemote * 100.0f),
-                  st.pendingReliable, st.pendingUnreliable, st.sentUnackedReliable, st.queueTimeUsec, queueBytes_);
+                  st.pendingReliable, st.pendingUnreliable, st.sentUnackedReliable, st.queueTimeUsec, queueBytes_,
+                  rateState_.fresh ? 1 : 0, rateState_.busy ? 1 : 0, rateState_.lossRun);
         b[sizeof(b) - 1] = 0;
         DebugLog(b);
     }
 
-    /* Owner decision 594: once a second while the link is UP the send rate follows Steam's live delivery quality and the data waiting
-       (relaysplit::NextSendRate); a change is set on this connection for SendRateMin and SendRateMax alike. If Steam refuses it, the
-       link keeps the last rate Steam accepted and stops adjusting (logged once). */
+    /* Owner decision 991: once a second while the link is UP the send rate follows the far end's delivery quality of this link's
+       sends, Steam's outgoing bytes per second and live ping (read this step, from this connection's real-time status) and the data
+       waiting (relaysplit::NextSendRate with this connection's rateState_ and the time now); a change is set on this connection for
+       SendRateMin and SendRateMax alike. Steam's queue time is not a delay input: it is the wait for the rate this link set, so it
+       grows when the link cuts and would drive cut after cut. If Steam refuses a rate, the link keeps the last rate Steam accepted
+       and stops adjusting (logged once). */
     void StepRate(const SnRealTimeStatus& st)
     {
         if (rateFrozen_ || broken_ || conn_ == 0 || state_ != LINK_UP) return;
@@ -1444,7 +1573,9 @@ private:
         long long waiting = (long long)st.pendingReliable + (long long)st.pendingUnreliable + queueBytes_;
         if (waiting < 0) waiting = 0;
         if (waiting > 4294967295LL) waiting = 4294967295LL;
-        const int next = relaysplit::NextSendRate(rate_, st.qualityLocal, st.qualityRemote, (unsigned int)waiting);
+        int why = relaysplit::kRateKeep;
+        const int next = relaysplit::NextSendRate(rateState_, (unsigned int)now, rate_, st.qualityLocal, st.qualityRemote, st.ping,
+                                                     st.outBytesPerSec, (unsigned int)waiting, &why);
         if (next == rate_) return;
         /* Raising sets the maximum first, lowering the minimum first: the minimum never stands above the maximum between the calls. */
         const bool raise = next > rate_;
@@ -1466,12 +1597,241 @@ private:
         ++g_stats.rateChanges;
         ++rateLogged_;
         if (rateLogged_ <= kRateLogMax)
-            DebugLog("[net] Steam link: send rate " + N(rate_) + " -> " + N(next) + " bytes/s (quality local " + QualityText(st.qualityLocal)
-                     + " remote " + QualityText(st.qualityRemote) + ", waiting " + N(waiting) + " bytes; Steam's own rate now "
+            DebugLog("[net] Steam link: send rate " + N(rate_) + " -> " + N(next) + " bytes/s (" + relaysplit::SendRateReasonText(why)
+                     + ": quality local " + QualityText(st.qualityLocal) + " remote " + QualityText(st.qualityRemote) + ", ping "
+                     + N(st.ping) + " ms, waiting " + N(waiting) + " bytes; Steam's own rate now "
                      + N(st.sendRateBytesPerSecond) + ")"
                      + (rateLogged_ == kRateLogMax ? " - further changes on this link are counted only (steamLink rateChanges)" : ""));
         rate_ = next;
         NoteRate(rate_);
+    }
+
+    /* ---- T-1118 (b) stage 2: the live-first mode on a Steam world-server link (the file comment's LIVE FIRST paragraph) ---- */
+    void LfOn(int dir, bool handOn)
+    {
+        if (lfDir_ < 0) ++g_lf.links;
+        lfDir_ = dir;
+        lfHandOn_ = handOn;
+        box_.SetLiveFirst(true);
+        lfMapRep_.Reset();
+    }
+    static double LfNow()
+    {
+        LARGE_INTEGER c, f; ::QueryPerformanceCounter(&c); ::QueryPerformanceFrequency(&f);
+        return f.QuadPart > 0 ? (double)c.QuadPart / (double)f.QuadPart : 0.0;
+    }
+    /* What a live message handed over now waits behind: this link's own queue (Steam refused it so far) and what Steam has not sent.
+       Steam reports bytes, not messages: its share is counted as full kChunkBytes pieces (one CHUNK each; a piece cut to the room
+       left is smaller, so this counts low - the byte budget, not this count, bounds record pieces). */
+    long long LfNetBytes() const { return queueBytes_ + steamUnsent_; }
+    long long LfNetCount() const
+    {
+        const long long c = (long long)livefirst::kChunkBytes;
+        return (long long)queue_.size() + (steamUnsent_ + c - 1) / c;
+    }
+    /* The clock, and the budget: 100 ms of the send rate this link set on Steam (Steam sends at exactly that rate - min and max are
+       the same), counted against bytes not yet sent, so no round trip is added. */
+    void LfTick()
+    {
+        box_.SetNow(LfNow());
+        box_.SetBudget(livefirst::BudgetOf((double)rate_, 0.0));
+    }
+    /* Send on a world-server link: the frame's line, barrier and latest-value class, then straight to Steam or into the waiting line
+       (sendbound.h Outbox). A bridge link marks the last piece of a barrier it hands on as the barrier (livefirst.h HandOn). */
+    bool LfSend(MsgType type, const char* data, size_t len, Channel ch, std::vector<char>* frame)
+    {
+        const bool reliable = (ch == CH_RELIABLE);
+        // PROBE-START: P199 - the hand-over time
+        const double p199t0 = p199::Now();
+        // PROBE-END: P199
+        coopsb::Item it;
+        it.type = (unsigned int)(unsigned char)type;
+        it.channel = (int)ch;
+        it.cls = coopsb::ClassOf(it.type, data, len, lfDir_, &it.key);
+        it.line = livefirst::LineOf(it.type, data, len, lfDir_);
+        it.bySender = livefirst::SubjectsOf(it.type, data, len, lfDir_, &it.subjects, &it.origin) == livefirst::kSubjSender;   /* the per-character gate: every character it names (sendbound.h) */
+        it.barrier = livefirst::IsBarrier(it.type, lfDir_);
+        it.kind = livefirst::KindOf(it.type, data, len, lfDir_);   /* T-1118 (c): measured with its sender (the BULK line, sendbound.h) */
+        it.listOnly = livefirst::ListOnly(it.type, data, len, lfDir_);
+        if (lfHandOn_ && it.type == livefirst::kMsgChunk && reliable)
+        {
+            it.barrier = lfHandOnOut_.LastOfBarrier(data, len, lfDir_);
+            ++g_lf.handedOut;
+        }
+        /* a bridge link toward a joiner: a WHOLE AREAMAP or PLAYERSECTORS whose bytes equal the last one put on this link is no barrier,
+           and goes LIVE when no earlier one waits here (livefirst.h MapRepeat); a map handed on in pieces stays a barrier, and makes
+           the next whole one count as changed */
+        if (lfHandOn_ && lfDir_ == livefirst::kDirDown && reliable && !frame->empty())
+            lfMapRep_.Classify(it.type, &(*frame)[0], frame->size(), box_.RestWaitingOf(livefirst::kTypeAreaMap) > 0,
+                               box_.RestWaitingOf(livefirst::kTypePlayerSectors) > 0, &it.line, &it.barrier);
+        it.len = frame->size();
+        it.bytes.swap(*frame);
+        if (reliable)
+        {
+            CountSent(it.bytes.size(), 0);   /* a reliable frame counts when handed over (it is retried, never dropped); its Steam messages as they go */
+            nettally::CountOut(tallyLink_, it.type, it.bytes.size());
+        }
+        LfTick();
+        bool superseded = false;
+        if (box_.Direct(LfNetCount(), LfNetBytes(), it, &superseded))
+        {
+            if (superseded) ++sbCoalesced_;   /* an older waiting value of this character was removed: this one replaces it */
+            ++sbDirect_;
+            if (it.line == livefirst::kLineLive && reliable && !box_.LastDirectBulk()) LfAheadNote();   /* a BULK frame is not timed as live */
+            // PROBE-START: P199 - a live frame straight to Steam is stamped (the original line follows the hand-over)
+            p199Cur_ = (it.line == livefirst::kLineLive && !box_.LastDirectBulk()) ? p199_.Open(p199t0, it.type, p199::InnerOf(it.type, data, len, lfDir_), LfNetBytes()) : -1;
+            const int p199i = p199Cur_;
+            const bool ok = LfHandOver(&it, true);
+            p199Cur_ = -1; p199_.LoseIfNew(p199i);
+            // PROBE-END: P199
+            /* a send Steam refused ends the link inside PumpQueue; a guaranteed frame LfHandOver refused (it could not be split -
+               over 32 MiB) was never queued, and answers false as the path without the waiting line does */
+            return reliable ? (ok && !broken_ && conn_ != 0) : ok;
+        }
+        // PROBE-START: P199 - a live frame that waits carries its hand-over time
+        it.p199At = it.line == livefirst::kLineLive ? p199t0 : 0.0;
+        // PROBE-END: P199
+        if (box_.Put(it)) ++sbCoalesced_;
+        ++sbWaited_;
+        if (box_.Count() > sbWaitMax_) sbWaitMax_ = box_.Count();
+        if (box_.Edge() > 0) ++sbEpisodes_;
+        return true;
+    }
+    /* One frame the waiting line handed over (or Direct let through), to Steam: a guaranteed one into this link's queue in its order
+       (pumped now unless `pump` is false - a graceful close pumps after raising the buffer); an unreliable one to Steam at once,
+       dropped and counted if Steam refuses it, counted as sent once Steam took it. */
+    bool LfHandOver(coopsb::Item* x, bool pump)
+    {
+        const bool reliable = x->channel == (int)CH_RELIABLE;
+        std::vector<std::vector<char> > msgs;
+        if (x->bytes.empty() || !relaysplit::Split(&x->bytes[0], x->bytes.size(), reliable, &msgs)) { ++sbSendFailed_; return false; }
+        if (!reliable)
+        {
+            int res = 0;
+            if (!SehSend(sockets_, conn_, &msgs[0][0], (unsigned int)msgs[0].size(), kSendUnreliableNoNagle, &res)) { Fault("SendMessageToConnection"); return false; }
+            if (res != kResultOk) { ++g_stats.unrelDropped; return false; }
+            steamUnsent_ += (long long)msgs[0].size();
+            // PROBE-START: P199 - an unreliable frame Steam took: its mark is the bytes Steam took through it
+            p199ToSteam_ += (unsigned long long)msgs[0].size();
+            if (p199Cur_ >= 0) p199_.OutAt(p199Cur_, p199ToSteam_);
+            // PROBE-END: P199
+            CountSent(x->bytes.size(), 1);
+            nettally::CountOut(tallyLink_, x->type, x->bytes.size());
+            return true;
+        }
+        g_stats.pieces += (long long)msgs.size();
+        // PROBE-START: P199 - a guaranteed frame into this link's queue: pumped whole once the pumped total passes what the queue holds after it
+        {
+            unsigned long long p199b = 0;
+            for (size_t i = 0; i < msgs.size(); ++i) p199b += (unsigned long long)msgs[i].size();
+            if (p199Cur_ >= 0) p199_.Queued(p199Cur_, p199QOut_ + (unsigned long long)(queueBytes_ > 0 ? queueBytes_ : 0) + p199b);
+        }
+        // PROBE-END: P199
+        for (size_t i = 0; i < msgs.size(); ++i)
+        {
+            queueBytes_ += (long long)msgs[i].size();
+            queue_.push_back(std::vector<char>());
+            queue_.back().swap(msgs[i]);
+        }
+        if (pump) PumpQueue();
+        NoteQueued();
+        return true;
+    }
+    /* At every Poll (after Steam's status is read) and Flush: the waiting line to Steam as the rules allow - live frames while Steam
+       holds under 1 MB, record pieces while it holds under the budget. */
+    void LfDrain()
+    {
+        if (lfDir_ < 0 || broken_ || conn_ == 0 || state_ != LINK_UP) return;
+        LfTick();
+        coopsb::Item x;
+        while (!broken_ && conn_ != 0 && box_.Take(LfNetCount(), LfNetBytes(), &x))
+        {
+            if (x.line == livefirst::kLineLive && x.channel == (int)CH_RELIABLE) LfAheadNote();
+            // PROBE-START: P199 - a live frame that waited keeps its hand-over stamp (the original line follows the hand-over)
+            p199Cur_ = (x.p199At > 0.0 && x.line == livefirst::kLineLive) ? p199_.Open(x.p199At, x.type, p199::InnerOfFrame(x.bytes, lfDir_), LfNetBytes()) : -1;
+            const int p199i = p199Cur_;
+            LfHandOver(&x, true);
+            p199Cur_ = -1; p199_.LoseIfNew(p199i);
+            // PROBE-END: P199
+        }
+        if (box_.Edge() > 0) ++sbEpisodes_;
+        LfCollect();
+    }
+    /* A graceful close: everything waiting goes into this link's queue, barriers and order kept (Outbox::TakeAny). */
+    void LfHandAll()
+    {
+        if (lfDir_ < 0) return;
+        coopsb::Item x;
+        while (!broken_ && conn_ != 0 && box_.TakeAny(&x)) LfHandOver(&x, false);
+        box_.Edge();
+        LfCollect();
+    }
+    /* The link is gone (ended, closed, stopped): what waits goes with it (counted droppedAtClose), nothing half joined carries over. */
+    void LfLinkGone()
+    {
+        steamUnsent_ = 0;
+        // PROBE-START: P199 - every open stamp goes with the link
+        p199_.LoseAll();
+        // PROBE-END: P199
+        if (lfDir_ < 0) return;
+        sbDropped_ += box_.Clear();
+        box_.Edge();
+        lfJoin_ = livefirst::Joiner();
+        lfHandOnOut_.Reset();
+        lfMapRep_.Reset();
+        LfCollect();
+    }
+    void LfCollect()
+    {
+        livefirst::Stats d;
+        box_.DrainStats(&d);
+        lfStats_.Add(d);
+        g_lf.st.Add(d);
+    }
+    /* A live message handed to Steam: how long it should wait there behind what Steam has not sent, at the send rate this link set on
+       Steam (min = max, so Steam paces at exactly it). This link measures no drain rate of its own; the budget uses the same rate. */
+    void LfAheadNote()
+    {
+        const long long ahead = LfNetBytes();
+        if (rate_ <= 0 || ahead <= 0) return;
+        const long long ms = ahead * 1000 / (long long)rate_;
+        if (ms > lfAheadMaxMs_) lfAheadMaxMs_ = ms;
+        if (ms > g_lf.aheadMaxMs) g_lf.aheadMaxMs = ms;
+    }
+    /* A joiner's link: one CHUNK (a whole received frame of type 88) into the joiner. true = *frame now holds the whole frame joined
+       from the world server's pieces - or the CHUNK unchanged when its own header is bad, for TakeOne's check to drop and count;
+       false = nothing to hand up (a piece kept, a repeat ignored, or a piece refused - counted and logged). */
+    bool LfJoin(std::vector<char>* frame)
+    {
+        unsigned int declared = 0;
+        std::memcpy(&declared, &(*frame)[1], 4);
+        if ((size_t)declared != frame->size() - 5) return true;
+        ++lfChunksIn_; ++g_lf.chunksIn;
+        std::vector<char> whole;
+        const int v = lfJoin_.Feed(&(*frame)[5], frame->size() - 5, &whole);
+        if (v == livefirst::kJoinDup) { ++lfJoinDup_; ++g_lf.joinDup; return false; }
+        if (livefirst::JoinFault(v))
+        {
+            ++lfJoinFault_; ++g_lf.joinFault;
+            if (LogThis(lfJoinFault_))
+                ErrorLog("[net] Steam link T-1118: a piece of a big message from the world server was refused - " + std::string(livefirst::JoinWord(v))
+                         + " (" + N((long long)frame->size()) + " bytes; counted liveFirst[joinFault]; the first 5 and every 100th are logged)");
+        }
+        if (v != livefirst::kJoinDone) return false;
+        unsigned int t = 0;
+        if (!livefirst::FrameOk(whole, &t))
+        {
+            ++lfJoinFault_; ++g_lf.joinFault;
+            if (LogThis(lfJoinFault_))
+                ErrorLog("[net] Steam link T-1118: a big message joined from " + N((long long)whole.size()) + " bytes of pieces has a bad header - dropped (counted liveFirst[joinFault])");
+            return false;
+        }
+        ++lfJoinedIn_; ++g_lf.joinedIn;
+        if (LogThis(lfJoinedIn_))
+            DebugLog("[net] Steam link T-1118: a " + N((long long)whole.size()) + "-byte message (type " + N((long long)t) + ") from the world server was joined from "
+                     + N((long long)lfJoin_.LastPieces()) + " pieces (joined message " + N(lfJoinedIn_) + "; the first 5 and every 100th are logged)");
+        frame->swap(whole);
+        return true;
     }
 
     void CountSent(size_t frameBytes, size_t pieces)
@@ -1520,12 +1880,38 @@ private:
     int          rate_;          /* the send rate (bytes/s) Steam last accepted for this link's connection, min and max alike */
     DWORD        rateNextMs_;    /* GetTickCount of the next send-rate step */
     bool         rateFrozen_;    /* Steam refused a rate: this connection keeps rate_ and is not adjusted again */
+    relaysplit::SendRateState rateState_;   /* the rate rule's memory for this connection (loss run, quality reading, ping window, proven rate, clean count); reset at UP */
     long long    rateLogged_;    /* send-rate changes of this link so far (the first kRateLogMax are logged) */
     bool         p2p_;           /* this link's connection is Steam P2P (relay only), not the relay test's plain UDP or socket pair */
     int          remoteKind_;    /* the remote identity's type at UP (kIdentitySteamId, kIdentityIpAddress, 0 none) */
     unsigned long long remoteId64_;   /* the remote's Steam id at UP when it is one: for the host's allow / block rules, never logged */
     DWORD        rateLogMs_;     /* TEST ONLY netratelog: GetTickCount of this link's last [net] RATE line; 0 = none yet */
     int          tallyLink_;     /* nettally::kLink*: the [NET] TRAFFIC REPORT line this link is counted on (SetStoreLink, SetTrafficLink) */
+    /* T-1118 (b) stage 2: the live-first mode of a world-server link (LfOn) */
+    int          lfDir_;         /* livefirst::kDirUp (a joiner's link to the world server) / kDirDown (a bridge link toward a joiner) / -1 off */
+    bool         lfHandOn_;      /* a bridge link: CHUNKs are handed up and sent on as they came */
+    coopsb::Outbox box_;         /* the LIVE / REST lines, the barriers, the cutting (sendbound.h) */
+    livefirst::Joiner lfJoin_;   /* a joiner's link: the world server's pieces */
+    livefirst::HandOn lfHandOnOut_;   /* a bridge link: which world-server piece handed on is the last of a barrier */
+    livefirst::MapRepeat lfMapRep_;   /* a bridge link: the last whole AREAMAP and PLAYERSECTORS handed on toward the joiner */
+    livefirst::Stats lfStats_;
+    long long    steamUnsent_;   /* bytes Steam holds not yet sent: the last status read (pending reliable + unreliable) plus what it took since */
+    long long    lfChunksIn_, lfJoinedIn_, lfJoinFault_, lfJoinDup_, lfAheadMaxMs_;
+    long long    sbDirect_, sbWaited_, sbCoalesced_, sbEpisodes_, sbDropped_, sbSendFailed_, sbWaitMax_;
+    // PROBE-START: P199 - the stamps (main thread, as every other member here), the window's lines (SteamLiveFirstToken, the destructor)
+    public:
+        bool P199On() const { return lfDir_ >= 0; }
+        void P199Report(std::vector<std::string>* out)
+        {
+            p199_.Report(lfDir_ == livefirst::kDirUp ? "steam" : "steam:bridge", "bytes", p199Rtt_, p199::Now(), out);
+        }
+    private:
+        p199::Link p199_;
+        int p199Cur_;                       /* the stamp of the frame being handed over now (-1 = none) */
+        unsigned long long p199QOut_;       /* bytes pumped from this link's queue to Steam, in all */
+        unsigned long long p199ToSteam_;    /* bytes Steam took on this link, in all (pumped guaranteed pieces, unreliable frames) */
+        long long p199Rtt_;                 /* Steam's ping at the last status read */
+    // PROBE-END: P199
 };
 
 /* ---- the Steam listener: many links on one listen socket ---- */
@@ -1535,7 +1921,7 @@ class SteamListenerImpl : public SteamListener
 public:
     SteamListenerImpl()
         : sockets_(0), listen_(0), ipTest_(false), broken_(false), cap_(steamlisten::kLinkCap), nEvents_(0), registered_(false),
-          refusedLogged_(0), linkTimeoutMs_((unsigned int)kTimeoutConnectedMs), hold_(false)
+          refusedLogged_(0), linkTimeoutMs_((unsigned int)kTimeoutConnectedMs), hold_(false), bridge_(false)
     {
         steamlisten::Reset(&table_);
         for (int i = 0; i < steamlisten::kLinkCap; ++i) links_[i] = 0;
@@ -1653,6 +2039,7 @@ public:
     void SetCap(int cap) { cap_ = steamlisten::CapFrom(cap); }
     void SetLinkTimeoutMs(unsigned int ms) { linkTimeoutMs_ = ms != 0 ? ms : (unsigned int)kTimeoutConnectedMs; }
     void SetHoldArrivals(bool on) { hold_ = on; }
+    void SetBridgeLinks(bool on) { bridge_ = on; }   /* T-1118 (b) stage 2 - steam_transport.h */
 
     bool AcceptHeld(unsigned int link)
     {
@@ -1662,6 +2049,7 @@ public:
         const unsigned int h = table_.handle[s];
         SteamTransport* t = new SteamTransport();
         t->SetTrafficLink(nettally::kLinkBridge);   /* a listener's links are the bridge's */
+        if (bridge_) t->SetBridgeLink();            /* T-1118 (b) stage 2: live first; pieces handed on */
         if (t->Stopped())   /* the link registry is full */
         {
             delete t;
@@ -1893,6 +2281,7 @@ private:
         {
             t = new SteamTransport();
             t->SetTrafficLink(nettally::kLinkBridge);   /* a listener's links are the bridge's */
+            if (bridge_) t->SetBridgeLink();            /* T-1118 (b) stage 2: live first; pieces handed on */
             if (t->Stopped()) { delete t; t = 0; verdict = steamlisten::kArriveNoRoom; }   /* the link registry is full */
         }
         if (t == 0) { Refuse(h, verdict, events); return; }
@@ -2021,6 +2410,7 @@ private:
     long long    refusedLogged_;
     unsigned int linkTimeoutMs_;   /* Steam's TimeoutConnected for the links this listener accepts (SetLinkTimeoutMs) */
     bool         hold_;            /* SetHoldArrivals: an arrival within the cap waits for AcceptHeld / RefuseHeld */
+    bool         bridge_;          /* SetBridgeLinks: the links accepted carry a world server's traffic (T-1118 (b) stage 2) */
 };
 
 /* Links every listener holds now, for the REPORT (main thread). */
@@ -2140,6 +2530,39 @@ bool SteamTransportFacts(ITransport* t, SteamLinkFacts* out)
     return true;
 }
 
+/* T-1118 (b) stage 2: steamLiveFirst[links,piecesOut,cutOut,piecesIn,joinedIn,joinFault,joinDup,handedUp,handedOn,livePassed,liveWaited,
+   barrierHeld,liveWaitMaxMs,aheadMaxMs] - every Steam world-server link of this game summed (a joiner's own link, the host bridge's
+   links): links = links that ran the live-first mode; piecesOut / cutOut = CHUNKs cut here and the messages cut into them; piecesIn /
+   joinedIn / joinFault / joinDup = a joiner's link joining the world server's pieces (as liveFirst[...]); handedUp / handedOn = pieces a
+   bridge link handed up unjoined / sent on uncut; the rest as liveFirst[...] (the maxima since the previous REPORT), the ANNOUNCE line's
+   four (announceQueued, announceSent, announceMaxWaitMs, gateHeld) last. */
+static std::string SteamLiveFirstToken()
+{
+    if (g_lf.links == 0) return std::string();
+    // PROBE-START: P199 - each Steam world-server link's window, with the REPORT (lines written after the registry's lock is let go)
+    {
+        std::vector<std::string> l;
+        if (g_csReady)
+        {
+            ::EnterCriticalSection(&g_cs);
+            for (int i = 0; i < kLiveMax; ++i) if (g_live[i] != 0 && g_live[i]->P199On()) g_live[i]->P199Report(&l);
+            ::LeaveCriticalSection(&g_cs);
+        }
+        for (size_t i = 0; i < l.size(); ++i) DebugLog(l[i]);
+    }
+    // PROBE-END: P199
+    const std::string t = " steamLiveFirst[links,piecesOut,cutOut,piecesIn,joinedIn,joinFault,joinDup,handedUp,handedOn,livePassed,liveWaited,barrierHeld,liveWaitMaxMs,aheadMaxMs,announceQueued,announceSent,announceMaxWaitMs,gateHeld"
+         + livefirst::BulkTokenNames() + "]="   /* T-1118 (c): the BULK line's fields appended */
+         + N(g_lf.links) + "," + N(g_lf.st.chunks) + "," + N(g_lf.st.cutFrames) + "," + N(g_lf.chunksIn) + "," + N(g_lf.joinedIn) + "," + N(g_lf.joinFault)
+         + "," + N(g_lf.joinDup) + "," + N(g_lf.handedIn) + "," + N(g_lf.handedOut) + "," + N(g_lf.st.livePassed) + "," + N(g_lf.st.liveWaited)
+         + "," + N(g_lf.st.barrierHeld) + "," + N((long long)(g_lf.st.liveWaitMaxSec * 1000.0)) + "," + N(g_lf.aheadMaxMs)
+         + "," + N(g_lf.st.announceQueued) + "," + N(g_lf.st.announceSent) + "," + N((long long)(g_lf.st.announceWaitMaxSec * 1000.0)) + "," + N(g_lf.st.gateHeld)
+         + livefirst::BulkTokenValues(g_lf.st);
+    g_lf.st.liveWaitMaxSec = 0.0; g_lf.st.announceWaitMaxSec = 0.0; g_lf.aheadMaxMs = 0;
+    g_lf.st.RestartBulkMaxima();
+    return t;
+}
+
 std::string SteamLinkReportToken()
 {
     const LinkStats& s = g_stats;
@@ -2152,7 +2575,7 @@ std::string SteamLinkReportToken()
            + N(s.dropped) + "," + N(s.limitHits) + "," + N(s.unrelDropped) + "," + N(s.recvBad) + "," + N((long long)g_cbFaults)
            + " steamListen[opened,heldNow,heldMax,accepted,refusedFull,refusedOther,ended]=" + N(l.opened) + "," + N(HeldNow()) + ","
            + N(l.heldMax) + "," + N(l.accepted) + "," + N(l.refusedFull) + "," + N(l.refusedOther) + "," + N(l.ended)
-           + " steamIceOff[read0,not0]=" + N(g_iceStats.read0) + "," + N(g_iceStats.not0);
+           + " steamIceOff[read0,not0]=" + N(g_iceStats.read0) + "," + N(g_iceStats.not0) + SteamLiveFirstToken();
 }
 
 long long SteamIceOffRead0()

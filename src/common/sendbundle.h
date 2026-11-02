@@ -41,6 +41,8 @@
 #include <cstring>
 #include <vector>
 
+#include "livefirst.h"   /* T-1118 (b): CHUNK's number (kMsgChunk) - a CHUNK never rides inside a bundle */
+
 namespace coopbundle {
 
 const unsigned int kMsgBundle = 59;                                        /* store_main.cpp MSG_BUNDLE / store.cpp kStoreMsgBundle */
@@ -66,10 +68,12 @@ inline size_t Budget(unsigned int mtu, bool checksum)
 }
 /* Channel 0 is the guaranteed, ordered lane; every other channel is unreliable. */
 inline int LaneOf(int channel) { return channel == 0 ? (int)kLaneReliable : (int)kLaneUnreliable; }
-/* The handshake and a bundle itself never ride inside a bundle. */
+/* The handshake, a bundle itself and a CHUNK never ride inside a bundle. A CHUNK goes alone because unpacking a bundle hands
+   its messages straight to the message handlers, never to the link's joiner (livefirst.h Joiner): a piece inside a bundle
+   would be lost, and with it the whole frame it belongs to. */
 inline bool MayBundle(unsigned int type)
 {
-    return type != kMsgBundle && type != kMsgStoreHello && type != kMsgStoreWelcome && type != kMsgStoreRefuse;
+    return type != kMsgBundle && type != livefirst::kMsgChunk && type != kMsgStoreHello && type != kMsgStoreWelcome && type != kMsgStoreRefuse;
 }
 inline bool FrameOk(const char* frame, size_t len)
 {

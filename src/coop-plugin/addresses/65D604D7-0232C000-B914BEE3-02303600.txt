@@ -10,7 +10,7 @@
 #   var   a writable global; NOT VERIFIABLE at start - see build/prep-p8h.md
 !fingerprint 65D604D7-0232C000-B914BEE3-02303600
 !version Steam_1.0.65
-!count 625
+!count 651
 AbstractMovementBase_pathGoal            code 0065DD40 0065DD40 8B81DC00000089028B81E00000008942
 AbstractMovementBase_headingVector        code 002AE000 002AE000 488D81D0000000C3CCCCCCCCCCCCCCCC
 AbstractMovementBase_orderMoveSpeed     code 003320D0 003320D0 83FA047403895120F3C3CCCCCCCCCCCC
@@ -583,6 +583,13 @@ TownMoveRegion                                 code 008F47E0 008F47E0 F30F10024C
 TownMoveRegionMgr                              var  02133098 02133098 -
 TownAddArea                                    code 0092C860 0092C860 4889542410534883EC308B81D8000000
 PhysicsThreadedBaseDtor                        code 007DC1F0 007DC1F0 40534883EC20488B5908488D057714F0
+SimplePhysXEntityDtor                          code 007DC240 007DC240 48894C240857415441554883EC3048C7
+ScytheRootObjectDtor                           code 007DC3A0 007DC3A0 48894C2408534883EC3048C7442420FE
+CharMovementJunkHull                           code 0065F3B0 0065F3B0 48895C2410564883EC20488BB1B00300
+CharMovementRebuildHull                        code 00660FE0 00660FE0 488BC45541544155488D68A14881ECC0
+PhysObjectJunk340                              code 00561F10 00561F10 48896C2420574881EC80000000488BF9
+PhysObjectJunk1C0                              code 0075D0B0 0075D0B0 40534883EC2080B9D801000000488BD9
+DeleteListAdd                                  code 000F15E0 000F15E0 48895C2408574883EC20488D99F80100
 ZoneManager_resetPopulation                    code 009FCC30 009FCC30 40534883EC40488B05F3697301488BD9
 LevelEditor_setVisible                         code 0077B350 0077B350 488BC45557415441554156488DA8E8FE
 Character_moveToNewSquad                       code 005CDA50 005CDA50 48896C242041544883EC30440FB6E248
@@ -636,3 +643,22 @@ NpcMemPlayerTest11                             code 00677DC7 00677DC7 4883B85002
 NpcMemPlayerTest12                             code 00677DF4 00677DF4 4883B850020000007407E8F8619BFFEB
 NpcMemPlayerTest13                             code 00677E67 00677E67 4883B850020000007404C6472800488B
 NpcMemPlayerTest14                             code 00677E84 00677E84 4883B850020000007407E868619BFFEB
+NpcSensePlayerTest23                           code 008586A8 008586A8 4883B85002000000741F4C8D4758488D
+NpcCountsAsPlayer                              code 00855CF0 00855CF0 40534883EC40488B01488BD9FF505848
+NpcSensePlayerTest24                           code 0065DA7D 0065DA7D E888369EFF84C0750C488BCFE8ECDD9A
+NpcSensePlayerTest25                           code 0065DADD 0065DADD 4883B850020000000F8482000000488B
+NpcSensePlayerTest26                           code 008517F4 008517F4 4883B850020000007414488B13488BCB
+ZoneMapContent_activate                        code 009FEC00 009FEC00 488BC45741544155415641574881EC80
+ZoneMap_activate                               code 00A0D6A0 00A0D6A0 40574883EC5048C7442420FEFFFFFF48
+ZoneMapContent_loadItemList                    code 0036F810 0036F810 4C8BDC55565741544155415641574881
+BuildingItemSpot_loadFromSave                  code 005562A0 005562A0 405556574154415541564157488BEC48
+RangedAimAnim                                  code 0051DA50 0051DA50 488BC45557415441554156488D68A148
+RangedReloadTime                               code 00435C70 00435C70 4883EC480F29742430F30F1071280F28
+RangedReloadSkill                              code 00884E10 00884E10 488BC448895808574883EC60C640D001
+FightReadyTime                                 code 00883120 00883120 85D27509F30F1005602BE100C383FA01
+InventorySection_isLimitedSlotCompatible       code 0074B0F0 0074B0F0 48895C24084889742410574883EC2048
+Kapi_SkillXpGain                               code 008C4F20 008C4F20 40534883EC30F30F1005DA63DB000F29
+Kapi_SkillXpTask                               code 008C5260 008C5260 4885D20F840801000048895C24185748
+ResearchAddProgress                            code 00835CA0 00835CA0 40534883EC70488BD98B89740100000F
+ResearchFrontFraction                          code 0082E1C0 0082E1C0 40534883EC60488BDA4885D275534839
+ResearchWindowRedrawFront                      code 0048B720 0048B720 40534883EC20488B8138010000488BD9

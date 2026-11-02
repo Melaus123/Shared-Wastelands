@@ -124,8 +124,8 @@ const unsigned kMaxSides = 256;           // recorded sides in one team / one RE
 const float kRecLow = -100.0f, kRecHigh = 100.0f;   // the engine's standing scale
 
 enum { kUpInvite = 1, kUpAnswer = 2, kUpLeave = 3, kUpRemove = 4, kUpDisband = 5, kUpRestoreDone = 6, kUpAsk = 7,
-       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpLevel = 13 };
-enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnLevel = 26 };
+       kUpSeed = 8, kUpDelta = 9, kUpStance = 10, kUpSide = 11, kUpResearch = 12, kUpLevel = 13, kUpWork = 14 };
+enum { kDnTable = 20, kDnInvited = 21, kDnNotice = 22, kDnRestore = 23, kDnRecord = 24, kDnResearch = 25, kDnLevel = 26, kDnWork = 27 };
 const unsigned kMaxTechs = 4096;          // techs in a team's research and in one RESEARCH message
 const unsigned kMaxLevel = 100;           // a research level a LEVEL report may carry
 /* results: 0 = done; every other number is the reason a request was refused */
@@ -730,6 +730,149 @@ inline int ResearchDecide(Book* b, const std::string& id, const std::vector<std:
     have.swap(merged);
     return kOk;
 }
+/* WORK: research progress one game made on one topic, for its teammates. A game reports {topic, amount, level}: the amount is
+   the progress its own Research::addProgress calls added to that game's front topic (WorkLanded: the front entry's progress
+   after a call minus before it - the engine's cut for further calls in a period and its scaling by that game's frame time
+   already applied), summed over one frame; the level is that front entry's progress after the last of those calls (0 = none:
+   a piece of a split sum before its last). The world server checks both (WorkDecide) and forwards them to the team's other
+   connected games; each raises its own front entry's progress to the larger of its progress plus the amount and the level
+   (WorkTarget) - never lower - only while that topic is its own front topic (WorkArriveVerdict), and never through
+   addProgress, whose scaling by the receiving game's own frame time would give each game a different step. The level makes
+   the games meet: a starting gap or a step one game did not apply is closed by the next WORK whose level is higher.
+   THE CAPS: the amount is the bench's rate (two virtual factors, ResearchBuilding vt+0x3C0 x vt+0x368, values from the game
+   data) times the worker's step and frame time - it cannot be bounded from the code alone. The caps are set far above any
+   step seen (about 0.004-0.007 a call) and guard against a broken or runaway sender, not against cheating: RESEARCH already
+   accepts a finished topic from any member, so a level is not charged to the budget. A small positive amount passes every
+   check unrounded (the wire carries the float's own bits). */
+const float kWorkMaxAmount = 100.0f;      // one WORK message
+const double kWorkPerSec = 200.0;         // a sender's budget refills at this amount per second ...
+const double kWorkBurst = 400.0;          // ... up to this (two seconds of it)
+/* the highest level a WORK may carry: 1e6, the bound WorkLanded and WorkPieces already put on one call's step and one frame's
+   sum (a progress no finite step sum below it can pass unnoticed); at the full budget (kWorkPerSec) it is over 80 minutes of
+   uninterrupted work on one topic, far past any finish line seen (progress about 3 on a first topic), and below WorkApplied's
+   1e9 bound on a written value */
+const float kWorkMaxLevel = 1.0e6f;
+enum { kWkOk = 0, kWkNotInTeam = 1, kWkBadTopic = 2, kWkBadAmount = 3, kWkFinished = 4, kWkOverBudget = 5, kWkBadLevel = 6, kWkLast = 6 };
+inline const char* WorkVerdictName(int v)
+{
+    switch (v)
+    {
+    case kWkOk: return "ok"; case kWkNotInTeam: return "not-in-team"; case kWkBadTopic: return "bad-topic";
+    case kWkBadAmount: return "bad-amount"; case kWkFinished: return "finished"; case kWkOverBudget: return "over-budget";
+    case kWkBadLevel: return "bad-level";
+    default: return "?";
+    }
+}
+/* finite, above 0, at most kWorkMaxAmount (a NaN fails every compare) */
+inline bool WorkAmountOk(float a) { return a == a && a > 0.0f && a <= kWorkMaxAmount; }
+/* a level: finite, at least 0 (0 = none), at most kWorkMaxLevel (a NaN fails every compare) */
+inline bool WorkLevelOk(float l) { return l == l && l >= 0.0f && l <= kWorkMaxLevel; }
+inline bool WorkTopicOk(const std::string& s) { return !s.empty() && s.size() <= kMaxName; }
+/* a sender's budget: full at the start, refilled at kWorkPerSec, never above kWorkBurst; a clock that runs back refills nothing */
+struct WorkBudget { double level, at; WorkBudget() : level(kWorkBurst), at(-1.0) {} };
+inline bool WorkBudgetTake(WorkBudget* b, double now, float amount)
+{
+    if (b->at >= 0.0 && now > b->at) { b->level += (now - b->at) * kWorkPerSec; if (b->level > kWorkBurst) b->level = kWorkBurst; }
+    if (b->at < 0.0 || now > b->at) b->at = now;
+    if ((double)amount > b->level) return false;
+    b->level -= (double)amount;
+    return true;
+}
+/* the world server's check of one WORK from `id`: *team = its team's index (-1: none). The budget is charged (by the amount,
+   never the level) only when every other check passed. */
+inline int WorkDecide(const Book& b, const std::string& id, const std::string& topic, float amount, float level, WorkBudget* budget, double now, int* team)
+{
+    *team = TeamOf(b, id);
+    if (*team < 0) return kWkNotInTeam;
+    if (!WorkTopicOk(topic)) return kWkBadTopic;
+    if (!WorkAmountOk(amount)) return kWkBadAmount;
+    if (!WorkLevelOk(level)) return kWkBadLevel;
+    const std::vector<std::string>& have = b.teams[*team].research;
+    if (std::find(have.begin(), have.end(), topic) != have.end()) return kWkFinished;
+    if (!WorkBudgetTake(budget, now, amount)) return kWkOverBudget;
+    return kWkOk;
+}
+/* a receiving game's verdict on one teammate's WORK: myTeam = it names this game's team; hooked = addProgress is hooked here
+   (this game's own progress is taken, so the sharing is on here); frontRead 1 = this game's queue was read (front = its front
+   topic, "" = an empty queue), else unreadable; known = this game's data holds the topic as research. The store decides the
+   last three, not this function: kWaFault = the write faulted; kWaOffMain = the write was asked for off the main thread and
+   not made; kWaNoChange = nothing written (the front moved before the write, or neither the step nor the level raises this
+   game's progress - a step too small to change a large float included, WorkTarget). */
+enum { kWaApplied = 0, kWaNotFront = 1, kWaUnknownTopic = 2, kWaNotMine = 3, kWaUnreadable = 4, kWaNoHook = 5, kWaFault = 6, kWaOffMain = 7,
+       kWaNoChange = 8, kWaLast = 8 };
+inline const char* WorkArriveName(int v)
+{
+    switch (v)
+    {
+    case kWaApplied: return "applied"; case kWaNotFront: return "notFront"; case kWaUnknownTopic: return "unknownTopic";
+    case kWaNotMine: return "notMine"; case kWaUnreadable: return "unreadable"; case kWaNoHook: return "noHook"; case kWaFault: return "fault";
+    case kWaOffMain: return "offMain"; case kWaNoChange: return "noChange";
+    default: return "?";
+    }
+}
+inline int WorkArriveVerdict(bool myTeam, bool hooked, int frontRead, const std::string& front, const std::string& topic, bool known)
+{
+    if (!myTeam) return kWaNotMine;
+    if (!hooked) return kWaNoHook;
+    if (!WorkTopicOk(topic) || !known) return kWaUnknownTopic;
+    if (frontRead != 1) return kWaUnreadable;
+    return front == topic ? kWaApplied : kWaNotFront;
+}
+/* one frame's own work on one topic: the steps summed and the front's progress after the latest of them (the level) */
+struct WorkSum { std::string topic; float amount, level; WorkSum() : amount(0.0f), level(0.0f) {} };
+/* one frame's own steps: one entry per topic, summed, the level replaced by each later call's; false = a new topic past `cap`
+   (dropped) */
+inline bool WorkAdd(std::vector<WorkSum>* acc, const std::string& topic, float amount, float level, size_t cap)
+{
+    for (size_t i = 0; i < acc->size(); ++i) if ((*acc)[i].topic == topic) { (*acc)[i].amount += amount; (*acc)[i].level = level; return true; }
+    if (acc->size() >= cap) return false;
+    WorkSum s; s.topic = topic; s.amount = amount; s.level = level;
+    acc->push_back(s);
+    return true;
+}
+/* a summed amount as WORK messages of at most kWorkMaxAmount each; nothing for 0, a negative amount or a NaN */
+inline std::vector<float> WorkPieces(float amount)
+{
+    std::vector<float> out;
+    if (!(amount > 0.0f) || amount > 1.0e6f) return out;
+    while (amount > kWorkMaxAmount) { out.push_back(kWorkMaxAmount); amount -= kWorkMaxAmount; }
+    if (amount > 0.0f) out.push_back(amount);
+    return out;
+}
+/* the level piece k of n carries: the frame's level on the last piece (the progress after all of the sum), 0 = none before it */
+inline float WorkPieceLevel(size_t k, size_t n, float level) { return k + 1 == n ? level : 0.0f; }
+/* the progress one of this game's own addProgress calls added to the front entry: after - before when it is finite and above
+   0, else 0 (nothing to send) */
+inline float WorkLanded(float before, float after)
+{
+    const float d = after - before;
+    return (d == d && d > 0.0f && d <= 1.0e6f) ? d : 0.0f;
+}
+/* a teammate's amount added to this game's front entry's progress: *out = prog + amount; false (nothing to write) when the
+   amount is not finite and above 0 or the sum is not finite and above prog */
+inline bool WorkApplied(float prog, float amount, float* out)
+{
+    if (!(amount == amount) || !(amount > 0.0f) || amount > 1.0e6f) return false;
+    const float v = prog + amount;
+    if (!(v == v) || !(v > prog) || v > 1.0e9f) return false;
+    *out = v;
+    return true;
+}
+/* the value a teammate's WORK writes into this game's front entry: the larger of prog + amount (WorkApplied) and the sender's
+   level, never below prog. kWtStep = prog + amount (it also wins a tie), kWtLevel = the level (finite, above prog, at most
+   kWorkMaxLevel), kWtNone = nothing to write (neither raises prog: a bad step, a step too small to change prog, a level 0, NaN
+   or not higher, or prog not finite). */
+enum { kWtNone = 0, kWtStep = 1, kWtLevel = 2 };
+inline const char* WorkTargetName(int w) { return w == kWtStep ? "step" : w == kWtLevel ? "level" : "none"; }
+inline int WorkTarget(float prog, float amount, float level, float* out)
+{
+    float s = 0.0f;
+    const bool step = WorkApplied(prog, amount, &s);
+    const bool lv = prog == prog && level == level && level > prog && level <= kWorkMaxLevel;
+    if (step && (!lv || s >= level)) { *out = s; return kWtStep; }
+    if (lv) { *out = level; return kWtLevel; }
+    return kWtNone;
+}
 /* a player of the team (its founder or a member) */
 inline bool InTeam(const Team& t, const std::string& id)
 {
@@ -926,7 +1069,8 @@ struct Up
     unsigned whole;                  // RESEARCH: 1 = this game's whole finished list, 0 = techs its own player finished now
     std::vector<std::string> techs;  // RESEARCH
     unsigned level;                  // LEVEL
-    Up() : kind(0), slot(0), accept(0), snapRows(0), no(0), rel(0.0f), flags(0), whole(0), level(0) {}
+    std::string workSid; float workAmount, workLevel;   // WORK: the topic (stringID), the amount and the sender's level (0 = none)
+    Up() : kind(0), slot(0), accept(0), snapRows(0), no(0), rel(0.0f), flags(0), whole(0), level(0), workAmount(0.0f), workLevel(0.0f) {}
 };
 inline void EncodeInvite(std::vector<char>* b, unsigned slot, const std::string& factionName) { b->clear(); PutU8(b, kUpInvite); PutU32(b, slot); PutStr(b, factionName.substr(0, kMaxName)); }
 inline bool EncodeAnswer(std::vector<char>* b, bool accept, unsigned snapRows, const std::vector<char>& snap)
@@ -976,6 +1120,9 @@ inline bool EncodeResearchUp(std::vector<char>* b, bool whole, const std::vector
     return true;
 }
 inline void EncodeLevelUp(std::vector<char>* b, unsigned level) { b->clear(); PutU8(b, kUpLevel); PutU32(b, level); }
+/* false = an empty or over-long topic (nothing is encoded) */
+inline bool EncodeWorkUp(std::vector<char>* b, const std::string& topic, float amount, float level)
+{ b->clear(); if (!WorkTopicOk(topic)) return false; PutU8(b, kUpWork); PutStr(b, topic); PutF32(b, amount); PutF32(b, level); return true; }
 /* false = not an up message this header knows, or malformed (trailing bytes included) */
 inline bool DecodeUp(const char* p, size_t n, Up* u)
 {
@@ -1003,6 +1150,7 @@ inline bool DecodeUp(const char* p, size_t n, Up* u)
     else if (u->kind == kUpStance || u->kind == kUpSide) { u->slot = GetU32(&c); u->rel = GetF32(&c); u->flags = GetU32(&c); }
     else if (u->kind == kUpResearch) { u->whole = GetU8(&c); if (u->whole > 1) c.bad = true; GetTechs(&c, &u->techs); }
     else if (u->kind == kUpLevel) u->level = GetU32(&c);
+    else if (u->kind == kUpWork) { GetStr(&c, &u->workSid, kMaxName); u->workAmount = GetF32(&c); u->workLevel = GetF32(&c); if (u->workSid.empty()) c.bad = true; }
     else if (u->kind != kUpLeave && u->kind != kUpDisband && u->kind != kUpAsk) return false;
     return !c.bad && c.at == n;
 }
@@ -1029,7 +1177,8 @@ struct Down
     unsigned resTeam, resWhole, resBy;                   // RESEARCH (resBy: the game a reply answers, or the finisher of an OWN tech; 0xFFFFFFFF = for all)
     std::vector<std::string> techs;                      // RESEARCH
     unsigned lvTeam, lvLevel, lvBy;                      // LEVEL (lvBy: the reporter a reply answers; 0xFFFFFFFF = for all)
-    Down() : lvTeam(0), lvLevel(0), lvBy(0xFFFFFFFFu), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
+    unsigned wkTeam, wkBy; std::string wkSid; float wkAmount, wkLevel;   // WORK (wkBy: the teammate whose game made the progress; wkLevel 0 = none)
+    Down() : wkTeam(0), wkBy(0xFFFFFFFFu), wkAmount(0.0f), wkLevel(0.0f), lvTeam(0), lvLevel(0), lvBy(0xFFFFFFFFu), recTeam(0), resTeam(0), resWhole(0), resBy(0xFFFFFFFFu), kind(0), fromSlot(0), secondsLeft(0), event(0), result(0), actorSlot(0), subjectSlot(0), no(0), why(0), away(0), snapRows(0) {}
 };
 /* the table as the games see it: profile ids turned into slots (slotOf: profile id -> slot; a player with no slot is skipped) */
 inline std::vector<WireTeam> ToWire(const Book& b, const std::map<std::string, unsigned>& slotOf)
@@ -1081,6 +1230,9 @@ inline void EncodeLevelDown(std::vector<char>* b, unsigned team, unsigned level,
 {
     b->clear(); PutU8(b, kDnLevel); PutU32(b, team); PutU32(b, level); PutU32(b, bySlot);
 }
+/* false = an empty or over-long topic (nothing is encoded); bySlot = the teammate whose game made the progress */
+inline bool EncodeWorkDown(std::vector<char>* b, unsigned team, unsigned bySlot, const std::string& topic, float amount, float level)
+{ b->clear(); if (!WorkTopicOk(topic)) return false; PutU8(b, kDnWork); PutU32(b, team); PutU32(b, bySlot); PutStr(b, topic); PutF32(b, amount); PutF32(b, level); return true; }
 inline bool DecodeDown(const char* p, size_t n, Down* d)
 {
     if (d == 0) return false;
@@ -1116,6 +1268,7 @@ inline bool DecodeDown(const char* p, size_t n, Down* d)
     }
     else if (d->kind == kDnResearch) { d->resTeam = GetU32(&c); d->resWhole = GetU8(&c); d->resBy = GetU32(&c); if (d->resWhole > 1) c.bad = true; GetTechs(&c, &d->techs); }
     else if (d->kind == kDnLevel) { d->lvTeam = GetU32(&c); d->lvLevel = GetU32(&c); d->lvBy = GetU32(&c); }
+    else if (d->kind == kDnWork) { d->wkTeam = GetU32(&c); d->wkBy = GetU32(&c); GetStr(&c, &d->wkSid, kMaxName); d->wkAmount = GetF32(&c); d->wkLevel = GetF32(&c); if (d->wkSid.empty()) c.bad = true; }
     else return false;
     return !c.bad && c.at == n;
 }

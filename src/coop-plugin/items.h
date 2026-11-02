@@ -320,6 +320,9 @@ std::string BagTestCommand(const std::string& arg);
 // box's patch of map, and the other game applies it by key. The hit line prints the FULL instance id so the
 // next run can name that exact box. A test lever, not a game feature.
 bool BoxTest(const std::string& needle, const std::string& baseSid, int count);
+/* TEST-ONLY `boxtest cantmake <item string id>` (`off` clears): this game reads that item template as missing from its data, so a box
+   whose world copy holds it keeps that row aside and refuses puts here. Only that answer changes. Returns the status line. */
+std::string BoxTestCantMake(const std::string& sid);
 /* P17 TEST LEVER: boxtest's path into one chosen section - `input` = the section whose limit list names the item, any other text =
    the section of that name; no whole-inventory fallback after a refusal. MAIN THREAD, command channel only. */
 bool BoxTestIn(const std::string& needle, const std::string& baseSid, int count, const std::string& sectionWant);
@@ -817,5 +820,21 @@ std::string ItemsKeeperRepairToken();
    town a walked character names, then `done`. tools/parity_compare.py pairs the blocks of the two games. */
 std::string SnapshotCommand(const std::string& tag);
 void SnapshotTick();
+
+/* CHATLINK (src/common/chatlink.h), MAIN THREAD: the item under the mouse in an open inventory window, for the chat's item links.
+   `widget` is the MyGUI widget under the mouse (InputManager::getMouseFocusWidget), `widgetName` its name, then its absolute left,
+   top, width and height and the mouse's absolute position. Guarded POD reads only (items.cpp, the CHATLINK block); no engine call
+   beyond the getInventory / getLevel virtuals this file already makes, and no new address. On kLinkFound *out holds the item's
+   GameData name, its material record's name (a weapon's model), its string id, its GameData type, its level and its artifact
+   flag; any other answer says why there is no item. */
+struct ItemLinkFacts { char name[128]; char model[128]; char sid[128]; int type; int level; int artifact; };
+enum { kLinkFound = 1, kLinkNoWindow = 2, kLinkNoSection = 3, kLinkEmpty = 4, kLinkUnreadable = 5, kLinkNoTable = 6 };
+int ItemLinkUnderMouse(const void* widget, const char* widgetName, int absLeft, int absTop, int width, int height,
+                       int mouseX, int mouseY, ItemLinkFacts* out);
+/* TEST-ONLY (chat.cpp `chattest link`): the same facts for the first item in the inventory of the loaded character `uid`
+   (FindSpawned), or with uid 0 of the first selected character (FirstSelectedCharacter); kLinkNoWindow = no loaded character has
+   that uid / no character selected, kLinkEmpty = it carries nothing. *usedUid (when given) = that character's uid (0 = none / not
+   in the uid table). MAIN THREAD. */
+int ItemLinkFirstOfCharacter(ItemLinkFacts* out, unsigned int uid, unsigned int* usedUid);
 
 }

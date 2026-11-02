@@ -41,7 +41,7 @@ const char* const kUnmigrateLog = "worlds.unmigrate.log";
 const char* const kMigratedMarker = "migrated.done";
 /* W2-f (review-w2 G): THE LOOSE WORLD FILES BY EXACT NAME - ONE list, read by WorldFileKnown (what PlanMigration moves)
    and by WorldNameIsStoreReserved (a world folder of one of these names would sit where the migration expects that file). */
-const char* const kWorldFileExact[] = { "slots.txt", "areas.txt", "owner.txt", "pendingpos.txt", "options.txt",
+const char* const kWorldFileExact[] = { "slots.txt", "areas.txt", "owner.txt", "pendingpos.txt", "options.txt", "rules.txt",
                                         "clock.txt", "uniques.txt", "coop-store.log" };
 const size_t kWorldFileExactCount = sizeof(kWorldFileExact) / sizeof(kWorldFileExact[0]);
 

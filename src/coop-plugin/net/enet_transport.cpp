@@ -18,6 +18,9 @@
 #define ENET_IMPLEMENTATION_NOT_USED  // (ENet has no header-only mode; sources are compiled separately)
 #include "../third_party/enet/include/enet/enet.h"
 #include "../../common/sendbound.h"   /* M16 (T-197): what waits to be sent on this link is bounded */
+// PROBE-START: P199 - the live-wait stamps
+#include "../../common/p199livewait.h"
+// PROBE-END: P199
 #include "../../common/typetally.h"   /* what each link carried, by message type - the [NET] TRAFFIC REPORT line */
 #include "../config.h"   /* ConfigBenchCapKbs (TEST ONLY) */
 #include "../../common/sendbundle.h"   /* M13: what is handed to ENet for the world server during one pass leaves as one packet per lane */
@@ -44,11 +47,22 @@ typedef char M13EnetSizesAgree[(sizeof(ENetProtocolHeader) == coopbundle::kEnetP
 /* M16 (T-197): THIS LINK'S NETWORK QUEUE, counted by ENet's own packet free callback - a packet is freed when it is
    on the wire (unreliable) or acknowledged (reliable), so count/bytes are what ENet still holds for this link; freed counts
    every packet ENet let go (KeepServiced's ackedPackets is its rise during the helper's passes). */
-struct SbNetQ { long long count, bytes, freed; SbNetQ() : count(0), bytes(0), freed(0) {} };
+// PROBE-START: P199 - the link's live-wait stamps, closed or lost here when ENet frees a packet (p199 0 = none), and the link's peer (P199b: is it still up?); the original line, plus p199 / p199Peer
+struct SbNetQ { long long count, bytes, freed, freedBytes; p199::Link* p199; ENetPeer** p199Peer; SbNetQ() : count(0), bytes(0), freed(0), freedBytes(0), p199(0), p199Peer(0) {} };   /* T-1118 (b): freedBytes = every byte ENet let go - the drain rate (livefirst::Rate) */
+// PROBE-END: P199
 void SbOnPacketFree(ENetPacket* p)
 {
     SbNetQ* q = (SbNetQ*)p->userData;
-    if (q != 0) { --q->count; q->bytes -= (long long)p->dataLength; ++q->freed; }
+    if (q != 0) { --q->count; q->bytes -= (long long)p->dataLength; ++q->freed; q->freedBytes += (long long)p->dataLength; }
+    // PROBE-START: P199 - a stamped packet freed: on the wire or acknowledged (flag SENT) closes its stamps; one freed unsent
+    // P199b: was dropped by ENet's throttle while the peer is up, or went with the link once ENet reset the peer (DISCONNECTED first)
+    if (q != 0 && q->p199 != 0)
+    {
+        const ENetPeer* pe = q->p199Peer != 0 ? *q->p199Peer : 0;
+        const bool up = pe != 0 && (pe->state == ENET_PEER_STATE_CONNECTED || pe->state == ENET_PEER_STATE_DISCONNECT_LATER);
+        q->p199->Freed(p, (p->flags & ENET_PACKET_FLAG_SENT) != 0, up);
+    }
+    // PROBE-END: P199
 }
 
 std::string N(long long v)   // RE_Kenshi's locale mangles raw numbers (F030)
@@ -109,10 +123,14 @@ public:
           nextPeerId_(1), hosting_(false), connectGen_(0), tLimit_(0), tMinMs_(0), tMaxMs_(0),
           sbDirect_(0), sbWaited_(0), sbCoalesced_(0), sbEpisodes_(0), sbDropped_(0), sbSendFailed_(0), sbWaitMax_(0), liveDir_(coopsb::kDirNoLive), tallyLink_(nettally::kLinkSession),
           bundle_(false), bnSendFailed_(0), bnRecvBundles_(0), bnRecvBundled_(0), bnRecvBad_(0), bnLinksOn_(0), udpPackets_(0), udpBytes_(0), bytesOut_(0), bytesIn_(0),
-          keepThread_(0), ks_(new KeepShared()), keepLeaked_(false)
+          keepThread_(0), ks_(new KeepShared()), keepLeaked_(false),
+          lfChunksIn_(0), lfJoinedIn_(0), lfJoinFault_(0), lfJoinDup_(0), lfAheadMaxMs_(0), lfCutLines_(0), lfHandOn_(false)
     {
         ::InitializeCriticalSection(&ks_->cs);
         ks_->wake = 0; ks_->on = 0; ks_->quit = 0; ks_->owner = this;
+        // PROBE-START: P199 - no stamp handed over yet; ENet's free callback reaches the stamps
+        p199Cur_ = -1; p199LastPkt_ = 0; p199Rtt_ = 0; netq_.p199 = &p199_; netq_.p199Peer = &peer_;   /* P199b: the free callback reads whether the peer is up */
+        // PROBE-END: P199
     }
 
     ~EnetTransport()
@@ -259,6 +277,9 @@ public:
         SbDrain();   /* M16: what waits goes to ENet first, while its queue has room */
         BundleSealAll();   /* M13: and the open bundles, before ENet transmits */
         if (host_) enet_host_flush(host_);
+        // PROBE-START: P199 - what left in the flush
+        P199Walk();
+        // PROBE-END: P199
     }
 
     void Poll(std::vector<Message>* out)
@@ -280,6 +301,8 @@ public:
                 state_ = LINK_UP;
                 ++connectGen_;   /* P7v: the EDGE, countable even when a DISCONNECT and a CONNECT land in one Poll */
                 bundle_ = false;   /* M13: a new connection bundles only after its own WELCOME */
+                lfJoin_ = livefirst::Joiner();   /* T-1118 (b): nothing half joined carries over */
+                lfHandOnUp_.Reset();
                 // The HOST is always peer 0, everywhere. T019 found the client labelling
                 // the host as peer 1 - the same id the client itself holds - so an
                 // inbound message appeared to come from the receiver. Ownership records
@@ -314,6 +337,9 @@ public:
                 break;
             }
         }
+        // PROBE-START: P199 - what left in the service calls above
+        P199Walk();
+        // PROBE-END: P199
         SbDrain();   /* M16: what waits goes out as ENet's queue drains */
     }
 
@@ -340,15 +366,40 @@ public:
            dropped) and goes out from Poll/Flush - sendbound.h. true = sent or waiting, as 'queued' always meant here. */
         coopsb::Item it; it.type = (unsigned int)type; it.channel = (int)ch;
         it.cls = coopsb::ClassOf((unsigned int)type, data, len, liveDir_, &it.key);   /* M16 fold 2: by link */
+        if (box_.LiveFirst())   /* T-1118 (b): the world-server link - live messages first, big ones in pieces (sendbound.h, livefirst.h) */
+        {
+            it.line = livefirst::LineOf((unsigned int)type, data, len, livefirst::kDirUp);
+            it.bySender = livefirst::SubjectsOf((unsigned int)type, data, len, livefirst::kDirUp, &it.subjects, &it.origin) == livefirst::kSubjSender;   /* the per-character gate: every character it names (sendbound.h) */
+            it.barrier = livefirst::IsBarrier((unsigned int)type, livefirst::kDirUp);
+            it.kind = livefirst::KindOf((unsigned int)type, data, len, livefirst::kDirUp);   /* T-1118 (c): measured (the BULK line, sendbound.h) */
+            it.listOnly = livefirst::ListOnly((unsigned int)type, data, len, livefirst::kDirUp);
+            if (lfHandOn_ && (unsigned int)type == livefirst::kMsgChunk && ch == CH_RELIABLE)   /* stage 2: a joiner's piece the bridge hands on (never cut again) */
+                it.barrier = lfHandOnUp_.LastOfBarrier(data, len, livefirst::kDirUp);
+            it.len = buf.size();
+            LfTick();
+        }
+        // PROBE-START: P199 - a live message on a world-server link is stamped now, at the hand-over
+        const double p199t0 = (box_.LiveFirst() && it.line == livefirst::kLineLive) ? LfNow() : 0.0;
+        // PROBE-END: P199
         bool superseded = false;
         if (box_.Direct(NetCount(), NetBytes(), it, &superseded))
         {
             if (superseded) ++sbCoalesced_;   /* an older waiting value of this character was removed: this one replaces it */
-            if (!SendNow(ch, buf)) return false;
+            if (it.line == livefirst::kLineLive && ch == CH_RELIABLE && !box_.LastDirectBulk()) LfAheadNote();   /* a BULK frame is not timed as live */
+            // PROBE-START: P199 - the stamp goes with the frame into its packet or bundle (the original line follows the hand-over)
+            p199Cur_ = P199Open(box_.LastDirectBulk() ? 0.0 : p199t0, (unsigned int)type, data, len);   /* a BULK frame is not timed */
+            const int p199i = p199Cur_;
+            const bool p199ok = SendNow(ch, buf);
+            p199Cur_ = -1; p199_.LoseIfNew(p199i);
+            if (!p199ok) return false;
+            // PROBE-END: P199
             ++sbDirect_;
             return true;
         }
         it.bytes.swap(buf);
+        // PROBE-START: P199 - a live frame that waits carries its hand-over time
+        it.p199At = p199t0;
+        // PROBE-END: P199
         if (box_.Put(it)) ++sbCoalesced_;
         ++sbWaited_;
         if (box_.Count() > sbWaitMax_) sbWaitMax_ = box_.Count();
@@ -364,18 +415,26 @@ public:
     bool SendNow(Channel ch, const std::vector<char>& buf)
     {
         if (host_ == 0 || peer_ == 0 || buf.empty()) return false;
-        if (!bundle_) return SendPacket(ch, &buf[0], buf.size());
+        // PROBE-START: P199 - the frame's own packet carries the stamp being handed over (the original line, through P199Sent)
+        if (!bundle_) return P199Sent(SendPacket(ch, &buf[0], buf.size()));
+        // PROBE-END: P199
         std::vector<char> first; size_t firstEntries = 0;
         const int r = col_.Offer(coopbundle::LaneOf((int)ch), &buf[0], buf.size(), coopbundle::Budget(peer_->mtu, host_->checksum != 0), &first, &firstEntries, &bnTally_);
         if (firstEntries != 0) BundleSend(ch, first, firstEntries);
-        if (r == coopbundle::kAlone) return SendPacket(ch, &buf[0], buf.size());
+        // PROBE-START: P199 - alone: its own packet carries the stamp; taken: the stamp waits with the lane's open bundle (the original line, through P199Sent)
+        if (r == coopbundle::kAlone) return P199Sent(SendPacket(ch, &buf[0], buf.size()));
+        if (p199Cur_ >= 0) p199_.Hold(p199Cur_, coopbundle::LaneOf((int)ch));
+        // PROBE-END: P199
         return true;
     }
     /* M13: a sealed bundle (or the one message an open bundle held) to ENet; a refusal loses every message in it - counted
        and logged (the first 5 and every 100th). */
     void BundleSend(Channel ch, const std::vector<char>& frame, size_t entries)
     {
-        if (!frame.empty() && SendPacket(ch, &frame[0], frame.size())) return;
+        // PROBE-START: P199 - a bundle's packet carries the stamps of the lane's open bundle; a refused bundle loses them (the original line, plus the stamps)
+        if (!frame.empty() && SendPacket(ch, &frame[0], frame.size())) { p199_.LaneOnPacket(coopbundle::LaneOf((int)ch), p199LastPkt_); return; }
+        p199_.LoseLane(coopbundle::LaneOf((int)ch));
+        // PROBE-END: P199
         bnSendFailed_ += (long long)entries;
         if (coopsbLogThis(bnSendFailed_))
             ErrorLog("[net] M13: ENet REFUSED a bundle of " + N((long long)entries) + " message(s), " + N((long long)frame.size()) + " bytes, on the "
@@ -409,6 +468,9 @@ public:
             enet_packet_destroy(pkt);   /* the free callback takes it back off netq_ */
             return false;
         }
+        // PROBE-START: P199 - the packet ENet took last
+        p199LastPkt_ = pkt;
+        // PROBE-END: P199
         ++sent_;
         bytesOut_ += (unsigned long long)len;   /* ByteCounts: every packet handed to ENet, a bundle once */
         return true;
@@ -416,10 +478,112 @@ public:
     void SbDrain()
     {
         if (host_ == 0 || peer_ == 0 || state_ != LINK_UP) return;
+        LfTick();   /* T-1118 (b): the clock and the budget for this drain */
         coopsb::Item x;
-        while (box_.Take(NetCount(), NetBytes(), &x)) { if (!SendNow((Channel)x.channel, x.bytes)) ++sbSendFailed_; }
+        while (box_.Take(NetCount(), NetBytes(), &x))
+        {
+            if (box_.LiveFirst()) LfTaken(x);
+            // PROBE-START: P199 - a live frame that waited keeps its hand-over stamp (the original line follows the hand-over)
+            p199Cur_ = P199OpenFrame(x.line == livefirst::kLineLive ? x.p199At : 0.0, x.bytes);   /* a BULK frame is not timed */
+            const int p199i = p199Cur_;
+            if (!SendNow((Channel)x.channel, x.bytes)) ++sbSendFailed_;
+            p199Cur_ = -1; p199_.LoseIfNew(p199i);
+            // PROBE-END: P199
+        }
         SbEdgeLog();
     }
+    /* T-1118 (b): THE LIVE-FIRST MODE'S CLOCK AND BUDGET. The drain rate is what ENet let go (acknowledged) per second while record
+       pieces waited; ENet holds a reliable packet until it is acknowledged, so the budget covers a round trip plus 100 ms of it. */
+    static double LfNow()
+    {
+        LARGE_INTEGER c, f; ::QueryPerformanceCounter(&c); ::QueryPerformanceFrequency(&f);
+        return f.QuadPart > 0 ? (double)c.QuadPart / (double)f.QuadPart : 0.0;
+    }
+    void LfTick()
+    {
+        if (!box_.LiveFirst()) return;
+        const double now = LfNow();
+        box_.SetNow(now);
+        lfRate_.Note(now, netq_.freedBytes, box_.RestWaiting());
+        box_.SetBudget(lfRate_.Budget(peer_ != 0 ? (double)peer_->roundTripTime / 1000.0 : 0.0));
+    }
+    /* What a live message handed over now waits behind in ENet: the bytes ENet has not put on the wire for this link (both of its
+       outgoing lists; each command's fragmentLength is its share of a packet, a resend waiting there included) and the open bundles it
+       is about to get. NetBytes() (the budget's count) also holds packets sent and not yet acknowledged; they are left out here, yet
+       they can hold a new guaranteed send back: ENet sends no further reliable command while the reliable bytes in flight plus that
+       command's would pass its window (third_party/enet/protocol.c, enet_protocol_check_outgoing_commands), so with the window full a
+       live message also waits for acknowledgements (up to about a round trip) and this estimate is then low. */
+    long long LfUnsentBytes() const
+    {
+        long long b = (long long)col_.OpenBytes();
+        if (peer_ == 0) return b;
+        for (ENetListIterator i = enet_list_begin(&peer_->outgoingCommands); i != enet_list_end(&peer_->outgoingCommands); i = enet_list_next(i))
+            b += (long long)((ENetOutgoingCommand*)i)->fragmentLength;
+        for (ENetListIterator i = enet_list_begin(&peer_->outgoingSendReliableCommands); i != enet_list_end(&peer_->outgoingSendReliableCommands); i = enet_list_next(i))
+            b += (long long)((ENetOutgoingCommand*)i)->fragmentLength;
+        return b;
+    }
+    /* A live message handed to ENet: how long it should wait there behind what ENet has not sent yet, at the measured drain rate. */
+    void LfAheadNote()
+    {
+        const double r = lfRate_.BytesPerSec();
+        const long long ahead = LfUnsentBytes();
+        if (r <= 0.0 || ahead <= 0) return;
+        const long long ms = (long long)((double)ahead * 1000.0 / r);
+        if (ms > lfAheadMaxMs_) lfAheadMaxMs_ = ms;
+    }
+    /* One frame Take handed over: a live one is measured; the first piece of a cut frame is said (the first 5 and every 100th). */
+    void LfTaken(const coopsb::Item& x)
+    {
+        if (x.line == livefirst::kLineLive && x.channel == (int)CH_RELIABLE) { LfAheadNote(); return; }
+        if (x.type != livefirst::kMsgChunk || x.bytes.size() <= livefirst::kFrameHeader + livefirst::kChunkHeader) return;
+        unsigned int total = 0, at = 0;
+        std::memcpy(&total, &x.bytes[livefirst::kFrameHeader], 4);
+        std::memcpy(&at, &x.bytes[livefirst::kFrameHeader + 4], 4);
+        if (at != 0 || !coopsbLogThis(++lfCutLines_)) return;
+        DebugLog("[net] T-1118: a " + N((long long)total) + "-byte message (type " + N((long long)(unsigned char)x.bytes[livefirst::kFrameHeader + livefirst::kChunkHeader])
+                 + ") goes to the world server in at least " + N((long long)livefirst::ChunkCount(total)) + " pieces of up to " + N((long long)livefirst::kChunkBytes)
+                 + " bytes, each at most the room left under the budget; live messages go before its pieces, which go while ENet holds under " + N(box_.Budget()) + " bytes (measured drain "
+                 + N((long long)(lfRate_.BytesPerSec() / 1024.0)) + " KB/s; cut message " + N(lfCutLines_) + "; the first 5 and every 100th are logged; liveFirst[...] on the REPORT line)");
+    }
+    // PROBE-START: P199 - the stamps' helpers - every caller holds the link's lock (the free callback runs inside ENet calls made under it)
+    int P199Open(double t0, unsigned int type, const char* payload, size_t n)
+    {
+        if (t0 <= 0.0) return -1;
+        return p199_.Open(t0, type, p199::InnerOf(type, payload, n, livefirst::kDirUp), LfUnsentBytes());
+    }
+    int P199OpenFrame(double t0, const std::vector<char>& f)
+    {
+        if (t0 <= 0.0 || f.empty()) return -1;
+        return p199_.Open(t0, (unsigned int)(unsigned char)f[0], p199::InnerOfFrame(f, livefirst::kDirUp), LfUnsentBytes());
+    }
+    bool P199Sent(bool ok)
+    {
+        if (ok && p199Cur_ >= 0) p199_.OnPacket(p199Cur_, p199LastPkt_);
+        return ok;
+    }
+    /* Right after an ENet call that transmits: a stamped packet no longer in the peer's two outgoing lists has gone on the wire. */
+    void P199Walk()
+    {
+        if (peer_ == 0 || !p199_.Any()) return;
+        p199_.WalkBegin();
+        if (!p199_.Walking()) return;
+        for (ENetListIterator i = enet_list_begin(&peer_->outgoingCommands); i != enet_list_end(&peer_->outgoingCommands); i = enet_list_next(i))
+            p199_.Seen(((ENetOutgoingCommand*)i)->packet);
+        for (ENetListIterator i = enet_list_begin(&peer_->outgoingSendReliableCommands); i != enet_list_end(&peer_->outgoingSendReliableCommands); i = enet_list_next(i))
+            p199_.Seen(((ENetOutgoingCommand*)i)->packet);
+        p199_.WalkEnd(LfNow());
+        p199Rtt_ = (long long)peer_->roundTripTime;
+    }
+    /* With the REPORT (the own link: SendBoundToken; the bridge's links: TakeLiveWaits) - one window per call. */
+    void P199Report()
+    {
+        if (peer_ != 0) p199Rtt_ = (long long)peer_->roundTripTime;
+        std::vector<std::string> l;
+        p199_.Report(lfHandOn_ ? "bridge" : "own", "walk", p199Rtt_, LfNow(), &l);
+        for (size_t i = 0; i < l.size(); ++i) DebugLog(l[i]);
+    }
+    // PROBE-END: P199
     void SbEdgeLog()
     {
         const int e = box_.Edge();
@@ -443,7 +607,12 @@ public:
     static bool coopsbLogThis(long long n) { return n >= 1 && (n <= 5 || (n % 100) == 0); }
     void SbLinkGone(const char* why)
     {
+        // PROBE-START: P199 - stamps not yet in a packet go with the link (a packet's go with it when ENet frees it unsent)
+        p199_.LoseNotOut();
+        // PROBE-END: P199
         bundle_ = false;   /* M13: the next connection bundles only after its own WELCOME */
+        lfJoin_ = livefirst::Joiner();   /* T-1118 (b): a message half joined goes with the link */
+        lfHandOnUp_.Reset();
         const long long n = box_.Clear() + col_.Clear();   /* M13: the open bundles' messages were waiting to go too */
         if (box_.Edge() < 0 && coopsbLogThis(sbEpisodes_))   /* T742: an episode still open when the link goes ends here, logged */
             DebugLog(std::string("[net] M16: the ") + SbLinkName() + "'s congestion episode " + N(sbEpisodes_) + " ended with the link (" + why + ")");
@@ -489,7 +658,8 @@ public:
     }
     /* sendBound[waitNow,waitBytesNow,waitMax,netQueued,netBytes,direct,waited,coalesced,episodes,droppedAtClose,sendFailed] - see sendbound.h;
        waitMax = the most waiting since the previous REPORT; netQueued/netBytes = what ENet holds for this link now. */
-    void SetStoreLink() { Guard g(this); liveDir_ = coopsb::kDirUp; if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* M16 fold 2: see transport.h */
+    void SetStoreLink() { Guard g(this); liveDir_ = coopsb::kDirUp; box_.SetLiveFirst(true); if (tallyLink_ == nettally::kLinkSession) tallyLink_ = nettally::kLinkWorld; }   /* T-1118 (b): live first, big messages in pieces */   /* M16 fold 2: see transport.h */
+    void SetHandOnPieces() { Guard g(this); lfHandOn_ = true; }   /* T-1118 (b) stage 2: the host's bridge - see transport.h */
     void SetTrafficLink(int link) { Guard g(this); tallyLink_ = link; }   /* the [NET] TRAFFIC REPORT line this link is counted on - see transport.h */
     /* TEST ONLY (benchcapkbs=<n>; absent = off): ENet's own bandwidth limit, <n> KB/s (1000 bytes) in and out, on the host made just
        now, so a bench can see a game on a slow line. ENet paces what it sends and tells the far end what it may send here. */
@@ -507,7 +677,61 @@ public:
         const long long wm = sbWaitMax_; sbWaitMax_ = box_.Count();
         return " sendBound[waitNow,waitBytesNow,waitMax,netQueued,netBytes,direct,waited,coalesced,episodes,droppedAtClose,sendFailed]="
              + N(box_.Count()) + "," + N(box_.Bytes()) + "," + N(wm) + "," + N(netq_.count) + "," + N(netq_.bytes) + "," + N(sbDirect_)
-             + "," + N(sbWaited_) + "," + N(sbCoalesced_) + "," + N(sbEpisodes_) + "," + N(sbDropped_) + "," + N(sbSendFailed_);
+             + "," + N(sbWaited_) + "," + N(sbCoalesced_) + "," + N(sbEpisodes_) + "," + N(sbDropped_) + "," + N(sbSendFailed_) + LfToken();
+    }
+
+    /* T-1118 (b): liveFirst[piecesOut,cutOut,piecesIn,joinedIn,joinFault,joinDup,livePassed,liveWaited,barrierHeld,liveWaitMaxMs,aheadMaxMs,budget,rateKBs,announceQueued,announceSent,announceMaxWaitMs,gateHeld]
+       on the world-server link only (absent elsewhere). piecesOut / cutOut = CHUNK messages sent and the messages cut into them;
+       piecesIn / joinedIn = CHUNKs received and the messages joined from them; joinFault = CHUNKs refused (a half-joined message is
+       lost with each, livefirst.h JoinWord); joinDup = repeated pieces ignored; livePassed = live messages sent while a record or
+       its pieces waited ahead of them; liveWaited / liveWaitMaxMs = live messages that waited in the line and the longest wait since
+       the last REPORT; barrierHeld = holds behind a barrier; aheadMaxMs = the longest a live message should wait in ENet behind the
+       bytes ENet had not yet sent when it was handed over (/ measured rate) since the last REPORT; budget = record bytes ENet may hold now; rateKBs = the
+       measured drain rate; announceQueued / announceSent = character announcements (CONTEXT, SPAWN, APPEARANCE, CLOTHING) that waited on the ANNOUNCE line /
+       left it, announceMaxWaitMs = the longest an announcement waited there since the last REPORT, gateHeld = live messages held
+       behind an announcement of a character they name (sendbound.h; their wait counts in liveWaited / liveWaitMaxMs).
+       T-1118 (c), appended (livefirst.h BulkTokenNames): bulkQueued / bulkSent = frames that waited on / left the BULK line, bulkHeld =
+       live messages held behind a waiting BULK frame naming their character, bulkBySize / bulkByShare / bulkBySticky = frames moved off
+       the LIVE line by each reason, bulkMaxWaitMs = the longest a BULK frame waited, liveAheadMaxBytes = the most bytes ENet held when
+       a guaranteed live message was handed to it (both maxima since the last REPORT). */
+    std::string LfToken()
+    {
+        if (!box_.LiveFirst()) return std::string();
+        // PROBE-START: P199 - the own link's window, with its REPORT
+        P199Report();
+        // PROBE-END: P199
+        box_.DrainStats(&lfStats_);
+        const std::string t = " liveFirst[piecesOut,cutOut,piecesIn,joinedIn,joinFault,joinDup,livePassed,liveWaited,barrierHeld,liveWaitMaxMs,aheadMaxMs,budget,rateKBs,announceQueued,announceSent,announceMaxWaitMs,gateHeld"
+             + livefirst::BulkTokenNames() + "]="
+             + N(lfStats_.chunks) + "," + N(lfStats_.cutFrames) + "," + N(lfChunksIn_) + "," + N(lfJoinedIn_) + "," + N(lfJoinFault_) + "," + N(lfJoinDup_)
+             + "," + N(lfStats_.livePassed) + "," + N(lfStats_.liveWaited) + "," + N(lfStats_.barrierHeld) + "," + N((long long)(lfStats_.liveWaitMaxSec * 1000.0))
+             + "," + N(lfAheadMaxMs_) + "," + N(box_.Budget()) + "," + N((long long)(lfRate_.BytesPerSec() / 1024.0))
+             + "," + N(lfStats_.announceQueued) + "," + N(lfStats_.announceSent) + "," + N((long long)(lfStats_.announceWaitMaxSec * 1000.0)) + "," + N(lfStats_.gateHeld)
+             + livefirst::BulkTokenValues(lfStats_);
+        lfStats_.liveWaitMaxSec = 0.0; lfStats_.announceWaitMaxSec = 0.0; lfAheadMaxMs_ = 0;   /* the maxima restart at each REPORT */
+        lfStats_.RestartBulkMaxima();
+        return t;
+    }
+    /* The host's bridge reads its own world-server links here (transport.h TakeLiveWaits); their SendBoundToken is never read, so the
+       ahead maximum restarts here instead. */
+    bool TakeLiveWaits(LiveWaits* out)
+    {
+        Guard g(this);   /* the link's lock */
+        if (out == 0 || !box_.LiveFirst()) return false;
+        // PROBE-START: P199 - a bridge link's window, with the bridge's REPORT (or its pair's close)
+        P199Report();
+        // PROBE-END: P199
+        livefirst::Stats d; box_.DrainStats(&d); lfStats_.Add(d);
+        out->livePassed = d.livePassed; out->liveWaited = d.liveWaited; out->barrierHeld = d.barrierHeld;
+        out->liveWaitMaxMs = (long long)(d.liveWaitMaxSec * 1000.0); out->aheadMaxMs = lfAheadMaxMs_;
+        out->budget = box_.Budget(); out->rateBps = (long long)lfRate_.BytesPerSec();
+        out->announceQueued = d.announceQueued; out->announceSent = d.announceSent; out->gateHeld = d.gateHeld;
+        out->announceMaxWaitMs = (long long)(d.announceWaitMaxSec * 1000.0);
+        out->bulkQueued = d.bulkQueued; out->bulkSent = d.bulkSent; out->bulkHeld = d.bulkHeld;   /* T-1118 (c): the BULK line (maxima since the last call) */
+        out->bulkBySize = d.bulkBySize; out->bulkByShare = d.bulkByShare; out->bulkBySticky = d.bulkBySticky;
+        out->bulkMaxWaitMs = (long long)(d.bulkWaitMaxSec * 1000.0); out->liveAheadMaxBytes = d.liveAheadMaxBytes;
+        lfAheadMaxMs_ = 0;
+        return true;
     }
 
     LinkState   State() const       { return state_; }
@@ -654,6 +878,9 @@ private:
         const long long freed0 = netq_.freed;
         BundleSealAll();
         enet_host_service(host_, 0, 0);
+        // PROBE-START: P199 - what left in the helper's service
+        P199Walk();
+        // PROBE-END: P199
         SbDrain();
         ++keepPass_.services;
         keepPass_.sentBytes += (long long)(enet_uint32)(host_->totalSentData - sent0);
@@ -730,11 +957,64 @@ private:
             return;
         }
 
+        const unsigned int from = (unsigned int)(size_t)ev->peer->data;
+        const Channel lane = (ev->channelID == (enet_uint8)CH_UNRELIABLE) ? CH_UNRELIABLE : CH_RELIABLE;
+        /* T-1118 (b): a CHUNK (world-server link only - 88 is no message on the session link) is a piece of a bigger message; the
+           pieces are joined here and the whole message is read as if it had come alone (livefirst.h). */
+        if (liveDir_ == coopsb::kDirUp && (unsigned int)p->data[0] == livefirst::kMsgChunk && lfHandOn_)
+        {
+            ++lfChunksIn_;   /* stage 2: the host's bridge hands the world server's pieces on to a Steam joiner unjoined - the joiner joins them */
+            DeliverFrame((const char*)p->data, p->dataLength, from, lane, out);
+            return;
+        }
+        if (liveDir_ == coopsb::kDirUp && (unsigned int)p->data[0] == livefirst::kMsgChunk)
+        {
+            LfChunkIn((const char*)p->data + kHeaderBytes, declared, from, lane, out);
+            return;
+        }
+        DeliverFrame((const char*)p->data, p->dataLength, from, lane, out);
+    }
+    /* T-1118 (b): one CHUNK's payload into the joiner; a whole message joined goes on as a received frame. A refused piece throws
+       away the message being joined (logged: the first 5 and every 100th; counted liveFirst[joinFault]). */
+    void LfChunkIn(const char* body, size_t n, unsigned int from, Channel lane, std::vector<Message>* out)
+    {
+        ++lfChunksIn_;
+        std::vector<char> whole;
+        const int v = lfJoin_.Feed(body, n, &whole);
+        if (v == livefirst::kJoinDup) { ++lfJoinDup_; return; }
+        if (livefirst::JoinFault(v))
+        {
+            ++lfJoinFault_;
+            if (coopsbLogThis(lfJoinFault_))
+                ErrorLog("[net] T-1118: a piece of a big message from the world server was refused - " + std::string(livefirst::JoinWord(v))
+                         + " (" + N((long long)n) + " bytes; counted liveFirst[joinFault]; the first 5 and every 100th are logged)");
+        }
+        if (v != livefirst::kJoinDone) return;
+        unsigned int type = 0;
+        if (!livefirst::FrameOk(whole, &type))
+        {
+            ++lfJoinFault_;
+            if (coopsbLogThis(lfJoinFault_))
+                ErrorLog("[net] T-1118: a big message joined from " + N((long long)whole.size()) + " bytes of pieces has a bad header - dropped (counted liveFirst[joinFault])");
+            return;
+        }
+        ++lfJoinedIn_;
+        if (coopsbLogThis(lfJoinedIn_))
+            DebugLog("[net] T-1118: a " + N((long long)whole.size()) + "-byte message (type " + N((long long)type) + ") from the world server was joined from "
+                     + N((long long)lfJoin_.LastPieces()) + " pieces (joined message " + N(lfJoinedIn_) + "; the first 5 and every 100th are logged)");
+        DeliverFrame(&whole[0], whole.size(), from, lane, out);
+    }
+    /* One whole frame (its length already checked) to the messages handed up. */
+    void DeliverFrame(const char* f, size_t flen, unsigned int from, Channel lane, std::vector<Message>* out)
+    {
+        unsigned int declared = 0;
+        std::memcpy(&declared, f + 1, 4);
+        (void)flen;
         /* M13: a BUNDLE (world-server link only - 59 is MSG_TALK on the session link) is unpacked here into its messages, in
            order, so everything above this sees them exactly as if each had come alone. A malformed one is refused whole. */
-        if (liveDir_ == coopsb::kDirUp && (unsigned int)p->data[0] == coopbundle::kMsgBundle)
+        if (liveDir_ == coopsb::kDirUp && (unsigned int)(unsigned char)f[0] == coopbundle::kMsgBundle)
         {
-            const char* body = (const char*)p->data + kHeaderBytes;
+            const char* body = f + kHeaderBytes;
             std::vector<coopbundle::Entry> es;
             if (!coopbundle::Decode(body, declared, &es))
             {
@@ -749,8 +1029,8 @@ private:
             {
                 Message e;
                 e.type = (MsgType)es[i].type;
-                e.peer = (unsigned int)(size_t)ev->peer->data;
-                e.lane = (ev->channelID == (enet_uint8)CH_UNRELIABLE) ? CH_UNRELIABLE : CH_RELIABLE;   /* a bundle's messages arrived on its lane */
+                e.peer = from;
+                e.lane = lane;   /* a bundle's messages arrived on its lane */
                 if (es[i].len) e.payload.assign(body + es[i].at, body + es[i].at + es[i].len);
                 out->push_back(e);
                 ++recv_;
@@ -760,17 +1040,16 @@ private:
             return;
         }
         Message m;
-        m.type = (MsgType)p->data[0];
-        m.peer = (unsigned int)(size_t)ev->peer->data;
-        m.lane = (ev->channelID == (enet_uint8)CH_UNRELIABLE) ? CH_UNRELIABLE : CH_RELIABLE;
+        m.type = (MsgType)(unsigned char)f[0];
+        m.peer = from;
+        m.lane = lane;
         if (declared)
-            m.payload.assign((const char*)p->data + kHeaderBytes,
-                             (const char*)p->data + kHeaderBytes + declared);
+            m.payload.assign(f + kHeaderBytes, f + kHeaderBytes + declared);
         out->push_back(m);
         ++recv_;
-        nettally::CountIn(tallyLink_, (unsigned int)p->data[0], kHeaderBytes + (size_t)declared);
-        if (liveDir_ == coopsb::kDirUp && (unsigned int)p->data[0] == nettally::kTypeLive)   /* 53 is a LIVE envelope on a link to the world server only */
-            nettally::CountLiveIn(tallyLink_, true, (const char*)p->data + kHeaderBytes, (size_t)declared);
+        nettally::CountIn(tallyLink_, (unsigned int)(unsigned char)f[0], kHeaderBytes + (size_t)declared);
+        if (liveDir_ == coopsb::kDirUp && (unsigned int)(unsigned char)f[0] == nettally::kTypeLive)   /* 53 is a LIVE envelope on a link to the world server only */
+            nettally::CountLiveIn(tallyLink_, true, f + kHeaderBytes, (size_t)declared);
     }
 
     ENetHost* host_;
@@ -798,6 +1077,19 @@ private:
     KeepShared* ks_;      /* the lock, the wake event and the helper's flags (KeepShared); never 0 while the transport lives */
     bool keepLeaked_;     /* KeepThreadStop's wait ran out: ks_ is left allocated, its lock and event untouched */
     mutable linkkeep::Pass keepPass_;   /* what the helper did in the open window; lockWaitMaxUs is written by LockIn (main thread only) */
+    /* T-1118 (b): the live-first mode (world-server link): the drain rate, the joiner of the world server's pieces, the counters */
+    livefirst::Rate lfRate_;
+    livefirst::Joiner lfJoin_;
+    livefirst::Stats lfStats_;
+    long long lfChunksIn_, lfJoinedIn_, lfJoinFault_, lfJoinDup_, lfAheadMaxMs_, lfCutLines_;
+    bool lfHandOn_;                 /* T-1118 (b) stage 2: the host's bridge's link - CHUNKs are handed up and sent on, never joined or cut here */
+    livefirst::HandOn lfHandOnUp_;  /* which joiner's piece handed on is the last of a barrier (JOIN_STAGE) */
+    // PROBE-START: P199 - the stamps (under the link's lock), the stamp being handed over now, the packet ENet took last, the last round trip read
+    p199::Link p199_;
+    int p199Cur_;
+    ENetPacket* p199LastPkt_;
+    long long p199Rtt_;
+    // PROBE-END: P199
 };
 
 } // namespace

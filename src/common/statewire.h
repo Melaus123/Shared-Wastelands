@@ -9,6 +9,10 @@
  *                                              WithStance below)
  *                                             (latchBits bits 15-16 = the owner's ranged mode, bit 16 = it was read:
  *                                              WithRangedMode below)
+ *                                             (latchBits bits 17-18 = the owner's character aiming its crossbow / bow,
+ *                                              bit 18 = it was read: WithAim below)
+ *                                             (latchBits bits 19-20 = the owner's character reloading its crossbow / bow,
+ *                                              bit 20 = it was read: WithReload below)
  *     | koTimer f32                             (H029 - optional: absent = -1, "not carried")
  *     | carryingUid u32                         (K1, session protocol 47 - optional: absent = 0, flagged)
  *     | restHas u8 | restX f32 | restY f32 | restZ f32   (R3, session protocol 48 - optional: absent = no rest)
@@ -332,6 +336,44 @@ inline int RangedModeWrite(int want, int here)
     if (want < 0 || here < 0) return -1;
     if ((want != 0) == (here != 0)) return -1;
     return want != 0 ? 1 : 0;
+}
+/* latchBits bit 17: the owner's character aims its crossbow / bow (aimstamp.h OwnDecide: its ranged mode on and the engine's
+   aim code played its aim motion within the last 250 ms); bit 18 (kAimReadBit): it was known on the owner's game - clear = not
+   carried, and the copy keeps its owner's last word. Bits 0-16 are not touched. */
+const unsigned int kAimBit     = 1u << 17;
+const unsigned int kAimReadBit = 1u << 18;
+const unsigned int kAimMask    = kAimBit | kAimReadBit;
+/* latchBits with its aim bits replaced: aim 1 (any positive) aiming, 0 not, negative = not known (not carried). */
+inline unsigned int WithAim(unsigned int latchBits, int aim)
+{
+    const unsigned int b = latchBits & ~kAimMask;
+    if (aim < 0) return b;
+    return b | kAimReadBit | (aim != 0 ? kAimBit : 0u);
+}
+/* the owner's aim a STATE carries: 1 aiming, 0 not, -1 not carried */
+inline int AimCarried(unsigned int latchBits)
+{
+    if ((latchBits & kAimReadBit) == 0) return -1;
+    return (latchBits & kAimBit) != 0 ? 1 : 0;
+}
+/* latchBits bit 19: the owner's character reloads its crossbow / bow (aimstamp.h OwnReloadDecide: the aim code's reload branch's
+   own test passes and the reload check counted its time down within the last 250 ms); bit 20 (kReloadReadBit): it was known on
+   the owner's game - clear = not carried, and the copy keeps its owner's last word. Bits 0-18 are not touched. */
+const unsigned int kReloadBit     = 1u << 19;
+const unsigned int kReloadReadBit = 1u << 20;
+const unsigned int kReloadMask    = kReloadBit | kReloadReadBit;
+/* latchBits with its reload bits replaced: 1 (any positive) reloading, 0 not, negative = not known (not carried). */
+inline unsigned int WithReload(unsigned int latchBits, int reloading)
+{
+    const unsigned int b = latchBits & ~kReloadMask;
+    if (reloading < 0) return b;
+    return b | kReloadReadBit | (reloading != 0 ? kReloadBit : 0u);
+}
+/* the owner's reload a STATE carries: 1 reloading, 0 not, -1 not carried */
+inline int ReloadCarried(unsigned int latchBits)
+{
+    if ((latchBits & kReloadReadBit) == 0) return -1;
+    return (latchBits & kReloadBit) != 0 ? 1 : 0;
 }
 /* the copy's side: a copy whose ranged mode was written ON in safe-point pass onPass (0 = none) fires only from a later pass
    passNow - the gun it fires with is the one the engine's ranged update stores after the write. */

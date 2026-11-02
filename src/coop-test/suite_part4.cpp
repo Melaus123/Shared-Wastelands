@@ -4044,6 +4044,49 @@ void t_t693_dead_name_never_rebinds()
     T693Apply(&t, ch);
     if (T693NameOf(t, nb) != n || NameOrphanCount(t) != 0) Fail("T-693: the item back at a new address carries the old name; no orphan left");
 }
+void t_t693_rebind_pile_by_height()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    /* as T1714: five items stacked in one pile (one flat spot, 1.4 units apart in height), bound in drop order */
+    const float h[5] = { 10.0f, 11.4f, 12.8f, 14.2f, 15.6f };
+    std::string nm[5];
+    for (int i = 0; i < 5; ++i)
+    {
+        const LiveItem was = T693Live(1 + i, 5460.0f, -9360.0f, h[i], 1);
+        nm[i] = T693Key(5460.0f, -9360.0f, h[i], 0);
+        NameBind(&t, was.addr, nm[i].c_str(), was.cur, 1);
+    }
+    std::vector<NameChange> ch;
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);   /* the zone is taken apart: all five become orphans */
+    T693Apply(&t, ch);
+    if (NameOrphanCount(t) != 5) Fail("T-693 pile: five orphans after the zone was taken apart");
+    /* three come back at new addresses, listed in another order than they were dropped (the 5th, the 3rd, the 4th) */
+    LiveItem live[3];
+    live[0] = T693Live(20, 5460.0f, -9360.0f, h[4], 1);
+    live[1] = T693Live(21, 5460.0f, -9360.0f, h[2], 1);
+    live[2] = T693Live(22, 5460.0f, -9360.0f, h[3], 1);
+    if (NameRebindPlan(t, live, 3, 0, 0, 0, &ch) != 3) Fail("T-693 pile: three items, three re-binds");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, live[0]) != nm[4] || T693NameOf(t, live[1]) != nm[2] || T693NameOf(t, live[2]) != nm[3])
+        Fail("T-693 pile: each item in a pile takes the name at its own height, not the list order");
+    if (NameOrphanCount(t) != 2) Fail("T-693 pile: the two items not back keep their rows as orphans");
+    /* a pile that settled 0.1 flat apart: the height still decides when the heights differ clearly */
+    NameClear(&t);
+    const LiveItem a = T693Live(1, 5460.0f, -9360.0f, 10.0f, 1), b = T693Live(2, 5460.1f, -9360.0f, 11.4f, 1);
+    const std::string na = T693Key(5460.0f, -9360.0f, 10.0f, 0), nb = T693Key(5460.1f, -9360.0f, 11.4f, 0);
+    NameBind(&t, a.addr, na.c_str(), a.cur, 1);
+    NameBind(&t, b.addr, nb.c_str(), b.cur, 1);
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);
+    T693Apply(&t, ch);
+    LiveItem back[2];
+    back[0] = T693Live(30, 5460.1f, -9360.0f, 10.0f, 1);   /* a's height, at b's flat spot */
+    back[1] = T693Live(31, 5460.0f, -9360.0f, 11.4f, 1);   /* b's height, at a's flat spot */
+    if (NameRebindPlan(t, back, 2, 0, 0, 0, &ch) != 2) Fail("T-693 pile: two items, two re-binds");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, back[0]) != na || T693NameOf(t, back[1]) != nb) Fail("T-693 pile: 0.1 flat apart, the height difference decides");
+}
 void t_t693_bare_key_reaches_named()
 {
     using namespace coopgname;
@@ -4166,6 +4209,151 @@ void t_t693_name_for_check()
     NameClear(&t);
     NameBind(&t, a.addr, nm.c_str(), a.cur, 1);
     if (NameForCheck(t, a.addr, a.cur, nm.c_str(), listed.c_str(), 0, 0, 0) != kNfOk) Fail("T-693: NAME FOR an item already carrying that name: given (its own row)");
+}
+/* T-1129: a waiting name (orphan) left after the re-bind is forgotten once the catch-up for its area square is applied, and is then
+   never handed to a returning item; an orphan does not refuse the catch-up's rename */
+void t_t1129_stale_name_after_catchup()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    NameClear(&t);
+    coopground::GroundKeyParts sp;
+    T693Key(5460.0f, -9360.0f, 10.0f, &sp);   /* the area square the pile lies in */
+    /* three plates in one pile; the plate at 12.8 was picked on the other game while this game was away */
+    const float h[3] = { 10.0f, 11.4f, 12.8f };
+    std::string nm[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        const LiveItem was = T693Live(1 + i, 5460.0f, -9360.0f, h[i], 1);
+        nm[i] = T693Key(5460.0f, -9360.0f, h[i], 0);
+        NameBind(&t, was.addr, nm[i].c_str(), was.cur, 1);
+    }
+    /* another area's orphan and this game's own unconfirmed drop's orphan, in the same square */
+    const LiveItem far1 = T693Live(9, 9000.0f, -9360.0f, 10.0f, 1);
+    coopground::GroundKeyParts fp = far1.cur;
+    fp.sx = sp.sx + 1;   /* last seen in the next area square */
+    const std::string nFar = T693Key(9000.0f, -9360.0f, 10.0f, 0);
+    NameBind(&t, far1.addr, nFar.c_str(), fp, 1);
+    const LiveItem own = T693Live(8, 5440.0f, -9360.0f, 10.0f, 1);
+    const std::string nOwn = T693Key(5440.0f, -9360.0f, 10.0f, 0);
+    NameBind(&t, own.addr, nOwn.c_str(), own.cur, 0);
+    std::vector<NameChange> ch;
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);   /* the area is taken apart: every row an orphan */
+    T693Apply(&t, ch);
+    if (NameOrphanCount(t) != 5) Fail("T-1129: five orphans after the area was taken apart");
+    LiveItem back[2];
+    back[0] = T693Live(20, 5460.0f, -9360.0f, h[0], 1);
+    back[1] = T693Live(21, 5460.0f, -9360.0f, h[1], 1);
+    if (NameRebindPlan(t, back, 2, 0, 0, 0, &ch) != 2) Fail("T-1129: the two plates still there take their names back");
+    T693Apply(&t, ch);
+    /* the stale name does not refuse the catch-up's rename of a plate here */
+    const LiveItem fresh = T693Live(30, 5460.0f, -9360.0f, 13.0f, 1);
+    const std::string listedFresh = T693Key(5460.0f, -9360.0f, 13.0f, 0);
+    if (NameForCheck(t, fresh.addr, fresh.cur, nm[2].c_str(), listedFresh.c_str(), 0, 0, 0) != kNfOk)
+        Fail("T-1129: an orphan carrying the name does not refuse the catch-up's NAME FOR");
+    if (NameForCheck(t, fresh.addr, fresh.cur, nm[0].c_str(), listedFresh.c_str(), 0, 0, 0) != kNfNameTaken)
+        Fail("T-1129: a live row carrying the name still refuses it");
+    /* the catch-up for the square is applied: its orphans go, except this game's own unconfirmed drop and another square's */
+    const char* keep[1]; keep[0] = nOwn.c_str();
+    if (NameForgetOrphansIn(&t, sp.sx, sp.sy, keep, 1) != 1) Fail("T-1129: the one stale orphan of the square is forgotten");
+    if (NameOrphanCount(t) != 2 || NameFindName(t, nm[2].c_str(), 0, 0) != 0) Fail("T-1129: the stale name is gone; the own drop's and the other square's orphans stay");
+    if (NameForgetOrphansIn(&t, sp.sx, sp.sy, 0, 0) != 1 || NameFindName(t, nOwn.c_str(), 0, 0) != 0) Fail("T-1129: without keep the own drop's orphan goes too");
+    if (NameFindName(t, nFar.c_str(), 0, 0) != 1 || (fp.sx == sp.sx && fp.sy == sp.sy)) Fail("T-1129: another square's orphan is kept");
+    /* the area reloads again: the two plates and a third unnamed plate at the stale name's height - the stale name is never handed on */
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);
+    T693Apply(&t, ch);
+    LiveItem again[3];
+    again[0] = T693Live(40, 5460.0f, -9360.0f, h[0], 1);
+    again[1] = T693Live(41, 5460.0f, -9360.0f, h[1], 1);
+    again[2] = T693Live(42, 5460.0f, -9360.0f, h[2], 1);
+    if (NameRebindPlan(t, again, 3, 0, 0, 0, &ch) != 2) Fail("T-1129: after the catch-up only the two real names re-bind");
+    T693Apply(&t, ch);
+    if (T693NameOf(t, again[0]) != nm[0] || T693NameOf(t, again[1]) != nm[1] || !T693NameOf(t, again[2]).empty())
+        Fail("T-1129: the stale name of a picked plate is never taken after the catch-up");
+    /* the name the catch-up gives: its orphan forgotten, one name one row */
+    NameClear(&t);
+    NameBind(&t, T693Addr(50), nm[2].c_str(), back[0].cur, 1);
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);
+    T693Apply(&t, ch);
+    if (NameForgetOrphansNamed(&t, nm[1].c_str()) != 0 || NameForgetOrphansNamed(&t, nm[2].c_str()) != 1 || t.n != 0)
+        Fail("T-1129: the orphan carrying the given name is forgotten, no other");
+}
+/* T-1129: before a square's ground listing - re-bind, then forget the waiting names left, then list. Forgetting first would strip
+   the names of items that came back; an own unconfirmed drop's orphan is kept by every helper */
+void t_t1129_rebind_then_forget()
+{
+    using namespace coopgname;
+    NameTable& t = g_t693Tab;
+    coopground::GroundKeyParts sp;
+    T693Key(5460.0f, -9360.0f, 10.0f, &sp);
+    const float h[3] = { 10.0f, 11.4f, 12.8f };
+    std::string nm[3];
+    LiveItem back[2];
+    back[0] = T693Live(20, 5460.0f, -9360.0f, h[0], 1);
+    back[1] = T693Live(21, 5460.0f, -9360.0f, h[1], 1);
+    std::vector<NameChange> ch;
+    for (int order = 0; order < 2; ++order)   /* 0: forget first (wrong); 1: re-bind first (as GrListingOrphansClose) */
+    {
+        NameClear(&t);
+        for (int i = 0; i < 3; ++i)
+        {
+            const LiveItem was = T693Live(1 + i, 5460.0f, -9360.0f, h[i], 1);
+            nm[i] = T693Key(5460.0f, -9360.0f, h[i], 0);
+            NameBind(&t, was.addr, nm[i].c_str(), was.cur, 1);
+        }
+        NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);   /* the square is taken apart */
+        T693Apply(&t, ch);
+        if (order == 0)
+        {
+            if (NameForgetOrphansIn(&t, sp.sx, sp.sy, 0, 0) != 3) Fail("T-1129 order: forgetting first takes all three");
+            if (NameRebindPlan(t, back, 2, 0, 0, 0, &ch) != 0) Fail("T-1129 order: forgetting first leaves the two returning items nameless");
+            continue;
+        }
+        if (NameRebindPlan(t, back, 2, 0, 0, 0, &ch) != 2) Fail("T-1129 order: the re-bind first gives the two items their names");
+        T693Apply(&t, ch);
+        if (NameForgetOrphansIn(&t, sp.sx, sp.sy, 0, 0) != 1) Fail("T-1129 order: then only the one name nobody took back is forgotten");
+        if (T693NameOf(t, back[0]) != nm[0] || T693NameOf(t, back[1]) != nm[1] || NameOrphanCount(t) != 0) Fail("T-1129 order: the listing then sees both names");
+    }
+    /* the keep list: an own unconfirmed drop's orphan holds its name against a NAME FOR and is never forgotten by name */
+    NameClear(&t);
+    NameBind(&t, T693Addr(60), nm[2].c_str(), back[0].cur, 0);
+    NameRebindPlan(t, 0, 0, 0, 0, 1, &ch);
+    T693Apply(&t, ch);
+    const LiveItem fresh = T693Live(61, 5460.0f, -9360.0f, 13.0f, 1);
+    const std::string listedFresh = T693Key(5460.0f, -9360.0f, 13.0f, 0);
+    const char* keep[1]; keep[0] = nm[2].c_str();
+    if (NameForCheck(t, fresh.addr, fresh.cur, nm[2].c_str(), listedFresh.c_str(), 0, 0, 0, keep, 1) != kNfNameTaken)
+        Fail("T-1129 keep: an own drop's orphan still holds its name");
+    if (NameForCheck(t, fresh.addr, fresh.cur, nm[2].c_str(), listedFresh.c_str(), 0, 0, 0) != kNfOk) Fail("T-1129 keep: without the keep list the orphan does not hold it");
+    if (NameForgetOrphansNamed(&t, nm[2].c_str(), keep, 1) != 0 || t.n != 1) Fail("T-1129 keep: an own drop's orphan is not forgotten by name");
+    if (NameForgetOrphansIn(&t, sp.sx, sp.sy, keep, 1) != 0 || t.n != 1) Fail("T-1129 keep: nor with its square");
+}
+/* T-1129: which of this game's own drops in a pile is held back from the ground listing - flat distance first (the record's height is
+   from before the fall), the height difference to the item's last-seen height only when flat distances tie */
+void t_t1129_drop_pick_pile()
+{
+    using namespace coopground;
+    GroundKeyParts c[3], rec;
+    T693Key(5460.0f, -9360.0f, 10.0f, &c[0]);
+    T693Key(5460.0f, -9360.0f, 11.4f, &c[1]);
+    T693Key(5460.0f, -9360.0f, 13.0f, &c[2]);
+    T693Key(5460.0f, -9360.0f, 30.0f, &rec);   /* the record: the same flat spot, taken at hand height */
+    if (GroundDropPick(c, 0, 3, rec, c[1].y10) != 1) Fail("T-1129: in a pile the item at its last-seen height is held back, not the first listed");
+    unsigned char taken[3]; taken[0] = 0; taken[1] = 1; taken[2] = 0;
+    if (GroundDropPick(c, taken, 3, rec, c[1].y10) != 0) Fail("T-1129: that item taken, the next nearest in height (1.4 below vs 1.6 above)");
+    if (GroundDropPick(c, 0, 3, rec, rec.y10) != 2) Fail("T-1129: no last-seen height: the record's own height breaks the tie");
+    GroundKeyParts d[2];
+    T693Key(5460.0f, -9360.0f, 30.0f, &d[0]);   /* at the record's height but 0.1 flat off */
+    d[0].x10 += 1;
+    T693Key(5460.0f, -9360.0f, 10.0f, &d[1]);   /* exactly at the record's flat spot, 20 units below */
+    if (GroundDropPick(d, 0, 2, rec, rec.y10) != 1) Fail("T-1129: flat distance first - a fall changes the height");
+    GroundKeyParts e[2];
+    T693Key(5460.6f, -9360.0f, 30.0f, &e[0]);   /* 0.6 flat: out of reach */
+    e[1] = c[0];
+    e[1].sid[0] = (e[1].sid[0] == 'X') ? 'Y' : 'X';   /* another sid */
+    if (GroundDropPick(e, 0, 2, rec, rec.y10) != -1) Fail("T-1129: nothing past 0.5 flat or of another sid");
+    if (GroundDropPickBetter(4, 100, 9, 0) != 1 || GroundDropPickBetter(4, 5, 4, 3) != 0 || GroundDropPickBetter(4, 3, 4, 5) != 1)
+        Fail("T-1129: the drop pick's order");
 }
 void t_t693_kept_id_match()
 {

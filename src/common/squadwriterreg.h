@@ -62,7 +62,9 @@
 
 namespace sqwreg {
 
-const unsigned kProtocol = 125u;          /* the world-server protocol that carries SQUAD_TAKE, SQUAD_WRITER (its answers and its writer notes) and SQUAD_RELEASE */
+const unsigned kProtocol = 133u;          /* the world-server protocol that carries SQUAD_TAKE, SQUAD_WRITER (its answers and its writer notes) and SQUAD_RELEASE */
+
+
 const unsigned kMsgSquadTake = 84u;
 const unsigned kMsgSquadWriter = 85u;
 const unsigned kMsgSquadRelease = 86u;

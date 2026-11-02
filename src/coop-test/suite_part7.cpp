@@ -586,7 +586,7 @@ void t_t804_portrait_hold()
 }
 
 /* talkprompt answer / answer act use the mirrored conversation while one is open, else this game's own window's conversation with
-   a live owner; close only a mirrored one (src/common/talkwire.h LeverWindowPick). */
+   a live owner; close and joinact too (joinact never on a mirror) (src/common/talkwire.h LeverWindowPick). */
 void t809_lever_window_pick()
 {
     using namespace cooptalk;
@@ -595,9 +595,28 @@ void t809_lever_window_pick()
     if (LeverWindowPick(kTalkLeverClose, 1, 0, 0, &why) != kLeverWinMirror) Fail("close with a mirror open: not the mirror");
     if (LeverWindowPick(kTalkLeverAnswer, 0, 1, 1, &why) != kLeverWinOwn) Fail("answer, no mirror, own window live: not the own window");
     if (LeverWindowPick(kTalkLeverAnswerAct, 0, 1, 1, &why) != kLeverWinOwn) Fail("answer act, no mirror, own window live: not the own window");
-    if (LeverWindowPick(kTalkLeverClose, 0, 1, 1, &why) != kLeverWinNone || why == 0 || *why == 0) Fail("close without a mirror: not refused with a reason");
+    if (LeverWindowPick(kTalkLeverClose, 0, 1, 1, &why) != kLeverWinOwn) Fail("close, no mirror, own window live: not the own window");
+    if (LeverWindowPick(kTalkLeverClose, 0, 0, 0, &why) != kLeverWinNone || why == 0 || *why == 0) Fail("close, nothing shown: not refused with a reason");
+    if (LeverWindowPick(kTalkLeverClose, 0, 1, 0, &why) != kLeverWinNone || why == 0 || *why == 0) Fail("close, owner not live: not refused with a reason");
     if (LeverWindowPick(kTalkLeverAnswer, 0, 0, 0, &why) != kLeverWinNone || why == 0 || *why == 0) Fail("answer, nothing shown: not refused with a reason");
     if (LeverWindowPick(kTalkLeverAnswerAct, 0, 1, 0, &why) != kLeverWinNone || why == 0 || *why == 0) Fail("answer act, owner not live: not refused with a reason");
+    if (LeverWindowPick(kTalkLeverJoinAct, 0, 1, 1, &why) != kLeverWinOwn) Fail("joinact, no mirror, own window live: not the own window");
+    if (LeverWindowPick(kTalkLeverJoinAct, 1, 1, 1, &why) != kLeverWinNone || why == 0 || *why == 0) Fail("joinact, mirror open: not refused with a reason");
+    if (LeverWindowPick(kTalkLeverJoinAct, 0, 0, 0, &why) != kLeverWinNone) Fail("joinact, no window: not refused");
+}
+
+/* `spawncontainer new | 0 | 1`: the word read (src/common/spawnage.h SpawnContainerWord) - 0 and 1 as before, "new" the third. */
+void t1170_spawncontainer_word()
+{
+    using namespace coopspawn;
+    if (SpawnContainerWord("new") != kSpawnContainerNew) Fail("new: not the new-squad mode");
+    if (SpawnContainerWord("0") != kSpawnContainerNull) Fail("0: not the null container");
+    if (SpawnContainerWord("1") != kSpawnContainerKeep) Fail("1: not the reference platoon");
+    if (SpawnContainerWord("2") != kSpawnContainerKeep) Fail("2: a non-zero integer is not the reference platoon");
+    if (SpawnContainerWord("") != kSpawnContainerKeep) Fail("nothing: not the reference platoon (the default)");
+    if (SpawnContainerWord("x") != kSpawnContainerKeep) Fail("a non-number: not the reference platoon (as before)");
+    if (SpawnContainerWord("NEW") != kSpawnContainerKeep) Fail("NEW: the word is lower case only");
+    if (kSpawnContainerNull == kSpawnContainerKeep || kSpawnContainerKeep == kSpawnContainerNew || kSpawnContainerNull == kSpawnContainerNew) Fail("the three modes are not distinct");
 }
 
 /* `editorstate [watch <N>]` and the editor's per-recruit body test (src/common/editorstate.h). */
@@ -5782,6 +5801,126 @@ void t_t985_area_file_missing()
     areafile::Build(p1, 2, 0, 0, &b);
     if (areafile::SameContent(a, b) == 0 || areafile::Rows(a, 0) != areafile::Rows(b, 0)) Fail("T-985: the same lists counted as a change");
 }
+/* T-1175: the area file with and without the last save's list - version 2 only with one, version 1 byte for byte as before */
+void t_t1175_area_file_save_list()
+{
+    const int ps[] = { 44, 11 };
+    const int ld[] = { 44, 12, 20, 32 };
+    const int sps[] = { 20, 32, 44, 11 };   /* the save's player areas: one is also a live area */
+    const int sld[] = { 21, 32 };
+    areafile::Content live, save, back, backSave;
+    areafile::Build(ps, 1, ld, 2, &live); areafile::Build(sps, 2, sld, 1, &save);
+    std::string v1, v1old, v2;
+    unsigned long long stamp = 0; unsigned int ver = 9u;
+    if (!areafile::FormatWithSave("world-1", "hash-1", 55ULL, live, 0, &v1) || !areafile::Format("world-1", "hash-1", 55ULL, live, &v1old) || v1 != v1old)
+        { Fail("T-1175: an area file with no save list is not written as before"); return; }
+    areafile::Content none;
+    if (!areafile::FormatWithSave("world-1", "hash-1", 55ULL, live, &none, &v2) || v2 != v1) Fail("T-1175: an empty save list changed the file");
+    if (v1.compare(0, 10, "swareas\t1\t") != 0) Fail("T-1175: a file with no save list is not version 1");
+    if (areafile::ParseWithSave(v1, "world-1", "hash-1", &back, &backSave, &stamp, &ver) != areafile::kOk || ver != 1u || areafile::HasAreas(backSave) != 0
+        || areafile::SameContent(back, live) == 0 || stamp != 55ULL)
+        Fail("T-1175: a version 1 file did not read as its live lists and no save list");
+    if (!areafile::FormatWithSave("world-1", "hash-1", 66ULL, live, &save, &v2)) { Fail("T-1175: the area file with a save list was not formatted"); return; }
+    if (v2.compare(0, 10, "swareas\t2\t") != 0 || v2.find("sp\t20\t32\nsp\t44\t11\nsl\t21\t32\nend\t6\t") == std::string::npos)
+        Fail("T-1175: the save list's rows are not sp then sl after the live rows, counted in the end line");
+    if (areafile::ParseWithSave(v2, "world-1", "hash-1", &back, &backSave, &stamp, &ver) != areafile::kOk || ver != 2u || stamp != 66ULL
+        || areafile::SameContent(back, live) == 0 || areafile::SameContent(backSave, save) == 0)
+        Fail("T-1175: the area file with a save list did not read back as written");
+    if (areafile::Parse(v2, "world-1", "hash-1", &back, 0) != areafile::kOk || areafile::SameContent(back, live) == 0) Fail("T-1175: the live lists of a version 2 file did not read alone");
+    /* an old file, written by hand as the earlier build wrote it */
+    const std::string head1 = "swareas\t1\tworld-1\thash-1\t77\n", head2 = "swareas\t2\tworld-1\thash-1\t77\n";
+    if (areafile::ParseWithSave(T985AreaText(head1 + "p\t3\t3\nl\t4\t4\n", 2), "world-1", "hash-1", &back, &backSave, 0, &ver) != areafile::kOk || ver != 1u
+        || back.player.size() != 2 || back.loaded.size() != 2 || !backSave.player.empty() || !backSave.loaded.empty())
+        Fail("T-1175: an old area file did not read as no save list");
+    if (areafile::ParseWithSave(T985AreaText(head1 + "p\t3\t3\nsp\t4\t4\n", 2), "world-1", "hash-1", &back, &backSave, 0, 0) != areafile::kTorn)
+        Fail("T-1175: a version 1 file with a save row was taken");
+    if (areafile::ParseWithSave(T985AreaText(head2 + "p\t3\t3\n", 1), "world-1", "hash-1", &back, &backSave, 0, 0) != areafile::kTorn)
+        Fail("T-1175: a version 2 file with no save list was taken");
+    if (areafile::ParseWithSave(T985AreaText(head2 + "p\t3\t3\nsp\t3\t3\n", 2), "world-1", "hash-1", &back, &backSave, 0, 0) != areafile::kOk || backSave.player.size() != 2)
+        Fail("T-1175: a save area that is also a live area was refused");
+    if (areafile::ParseWithSave(T985AreaText(head2 + "p\t3\t3\nsp\t5\t5\nsl\t5\t5\n", 3), "world-1", "hash-1", &back, &backSave, 0, 0) != areafile::kTorn
+        || !back.player.empty() || !backSave.player.empty())
+        Fail("T-1175: a save list naming an area twice was taken (or a refusal left lists behind)");
+    if (areafile::ParseWithSave(T985AreaText("swareas\t3\tworld-1\thash-1\t77\np\t3\t3\n", 1), "world-1", "hash-1", &back, &backSave, 0, 0) != areafile::kBadHeader)
+        Fail("T-1175: an area file of an unknown version was taken");
+    std::string bad = v2;
+    const size_t row = bad.find("sp\t20\t32");
+    if (row == std::string::npos) { Fail("T-1175: no save row for 20,32"); return; }
+    bad[row + 3] = '3';   /* sp 30 32: the checksum no longer matches */
+    if (areafile::ParseWithSave(bad, "world-1", "hash-1", &back, &backSave, 0, 0) != areafile::kTorn) Fail("T-1175: a damaged save row was taken");
+}
+/* T-1175: the load's area list is the live lists and the last save's list - a record within ring 2 of the save's area is fetched,
+   one near neither is not */
+void t_t1175_area_list_union()
+{
+    const int ps[] = { 44, 11 };
+    const int ld[] = { 45, 11 };
+    const int sps[] = { 20, 32, 44, 11 };
+    const int sld[] = { 45, 11, 19, 32 };
+    areafile::Content live, save, empty;
+    areafile::Build(ps, 1, ld, 1, &live); areafile::Build(sps, 2, sld, 2, &save);
+    std::vector<int> xy; long long fromLive = -1, fromSave = -1;
+    areafile::UnionAreas(live, save, &xy, &fromLive, &fromSave);
+    if (fromLive != 2 || fromSave != 2 || xy.size() != 8) { Fail("T-1175: the union did not name each area once, by the list it came from"); return; }
+    if (xy[0] != 44 || xy[1] != 11 || xy[2] != 20 || xy[3] != 32 || xy[4] != 45 || xy[5] != 11 || xy[6] != 19 || xy[7] != 32)
+        Fail("T-1175: the union's player areas do not come first (live, then the save's)");
+    if (cooppre::PreAoiClass(22, 34, xy, cooppre::kPreRing) != cooppre::kPreAoiIn) Fail("T-1175: a record within ring 2 of the save's area is not fetched");
+    if (cooppre::PreAoiClass(43, 13, xy, cooppre::kPreRing) != cooppre::kPreAoiIn) Fail("T-1175: a record within ring 2 of the live area is not fetched");
+    if (cooppre::PreAoiClass(30, 20, xy, cooppre::kPreRing) != cooppre::kPreAoiOut) Fail("T-1175: a record near neither list was fetched");
+    areafile::UnionAreas(live, empty, &xy, &fromLive, &fromSave);
+    if (fromLive != 2 || fromSave != 0 || cooppre::PreAoiClass(22, 34, xy, cooppre::kPreRing) != cooppre::kPreAoiOut)
+        Fail("T-1175: with no save list the area list is not the live lists alone");
+    areafile::UnionAreas(empty, save, &xy, &fromLive, &fromSave);
+    if (fromLive != 0 || fromSave != 4) Fail("T-1175: a save list alone did not make the area list");
+}
+/* T-1175: the save list is taken only at this world's own finished save with lists noted, kept through later live writes, and
+   replaced at the next such save */
+void t_t1175_save_list_kept()
+{
+    const int a[] = { 20, 32 };
+    const int b[] = { 44, 11 };
+    const int c[] = { 50, 50 };
+    areafile::Content held, save, back, backSave;
+    areafile::Build(a, 1, 0, 0, &held);
+    if (areafile::TakeSaveList(1, 1, held, &save) != 1 || areafile::SameContent(save, held) == 0) Fail("T-1175: an own save with lists noted did not take them");
+    areafile::Build(b, 1, 0, 0, &held);   /* the player walks on: later live writes */
+    std::string text;
+    if (!areafile::FormatWithSave("w", "h", 2ULL, held, &save, &text) || areafile::ParseWithSave(text, "w", "h", &back, &backSave, 0, 0) != areafile::kOk
+        || backSave.player.size() != 2 || backSave.player[0] != 20 || back.player[0] != 44)
+        Fail("T-1175: a later live write did not keep the last save's list");
+    if (areafile::TakeSaveList(0, 1, held, &save) != 0 || save.player[0] != 20) Fail("T-1175: another folder's save replaced the save list");
+    if (areafile::TakeSaveList(1, 0, held, &save) != -1 || save.player[0] != 20) Fail("T-1175: a save with no lists noted replaced the save list");
+    if (areafile::TakeSaveList(1, 1, held, &save) != 1 || save.player[0] != 44) Fail("T-1175: the next own save did not replace the save list");
+    areafile::Build(c, 1, 0, 0, &held);
+    if (!areafile::FormatWithSave("w", "h", 3ULL, held, &save, &text) || areafile::ParseWithSave(text, "w", "h", &back, &backSave, 0, 0) != areafile::kOk
+        || backSave.player.size() != 2 || backSave.player[0] != 44 || back.player[0] != 50)
+        Fail("T-1175: the replaced save list was not written with the next live write");
+}
+
+/* T-1175: a load of the profile save that the records store laid nothing over starts the characters where the save put them, so
+   its first player-area list is the save's list; a load the store laid squads over, an unarmed load or one before the file was read
+   leaves the save list as it was */
+void t_t1175_load_start_list()
+{
+    const int a[] = { 20, 32 };
+    const int b[] = { 44, 11 };
+    const int c[] = { 50, 50 };
+    areafile::Content save, first, empty;
+    areafile::Build(a, 1, 0, 0, &save);   /* the file's save list: an older save */
+    areafile::Build(b, 1, c, 1, &first);  /* the load's first list: where the quit save put them */
+    if (areafile::TakeLoadStartList(0, 0, 1, first, &save) != 0 || save.player[0] != 20) Fail("T-1175: an unarmed load took its first list");
+    if (areafile::TakeLoadStartList(1, 0, 1, empty, &save) != -3 || save.player[0] != 20) Fail("T-1175: an empty list replaced the save list");
+    if (areafile::TakeLoadStartList(1, 1, 1, first, &save) != -2 || save.player[0] != 20) Fail("T-1175: a load the records store moved squads in took its first list");
+    if (areafile::TakeLoadStartList(1, 0, 0, first, &save) != -1 || save.player[0] != 20) Fail("T-1175: a first list before the file was read replaced the save list");
+    if (areafile::TakeLoadStartList(1, 1, 0, first, &save) != -2 || save.player[0] != 20) Fail("T-1175: a moved squad was not told before readiness");
+    if (areafile::TakeLoadStartList(1, 0, 1, first, &save) != 1 || areafile::SameContent(save, first) == 0) Fail("T-1175: the first list of an own load the store left alone was not taken");
+    std::string text;
+    areafile::Content held, back, backSave;
+    areafile::Build(c, 1, 0, 0, &held);   /* the player walks on */
+    if (!areafile::FormatWithSave("w", "h", 4ULL, held, &save, &text) || areafile::ParseWithSave(text, "w", "h", &back, &backSave, 0, 0) != areafile::kOk
+        || backSave.player.size() != 2 || backSave.player[0] != 44 || back.player[0] != 50)
+        Fail("T-1175: the load-start save list was not written with the next live write");
+}
 
 
 /* ---- T-922: src/common/templatekey.h + spawnage.h - a SPAWN carries the template's stringID AND its shown name ---- */
@@ -8019,18 +8158,24 @@ void t_t942_item_notice()
     if (Wanted(1, 77, 0, true, true, false)) Fail("a taker that is not that player's own character (an NPC its game runs): no line");
 }
 
-/* T-943: the site table - 22 sites, each one's compare form and the bytes it must hold; every compare is `cmp qword [rax+0x250], x`
+/* T-943: the site table - 26 sites, each one's compare form (site 24: a call, kCallPlayer) and the bytes it must hold; every compare is `cmp qword [rax+0x250], x`
    with x = 0 or a register (the stub's answer assumes ZF=1 = no PlayerInterface) */
 void t_t943_npc_sites()
 {
     using namespace swnpc;
-    if (kSites != 22 || kSenseSites != 8) Fail("22 sites, the senses first");
+    if (kSites != 26 || kSenseSites != 8) Fail("26 sites, the senses first, then the memory, then sites 23 - 26");
     for (int k = 0; k < kSites; ++k)
     {
         const Site& s = SiteAt(k);
         for (int j = 0; j < k; ++j) if (std::string(SiteAt(j).row) == s.row) Fail("row names are unique: " + std::string(s.row));
-        if (std::string(s.row).find(k < kSenseSites ? "NpcSense" : "NpcMem") != 0) Fail("senses first, then memory: " + I(k));
+        const bool sense = k < kSenseSites || k >= 22;   /* sites 23 - 26 (0x8586A8, 0x65DA7D, 0x65DADD, 0x8517F4) were added after the memory's */
+        if (std::string(s.row).find(sense ? "NpcSense" : "NpcMem") != 0) Fail("senses first, then memory, then sites 23 - 26: " + I(k));
         unsigned char b[kCheckLen];
+        if (s.form == kCallPlayer)
+        {   /* a call site: no fixed bytes (its rel32 is the build's own); test al, al after the call */
+            if (Expected(k, b) != 0 || TestLen(s.form) != kCallLen || s.next[0] != 0x84 || s.next[1] != 0xC0) Fail("a call site: CallSiteOk checks it, 84 C0 after it: " + I(k));
+            continue;
+        }
         if (Expected(k, b) != kCheckLen) Fail("10 bytes checked");
         const int L = TestLen(s.form);
         if (std::memcmp(b, TestBytes(s.form), (size_t)L) != 0) Fail("the site starts with its compare: " + I(k));
@@ -8048,6 +8193,30 @@ void t_t943_npc_sites()
     if (((TestBytes(kCmpRsi7)[2] >> 3) & 7) != 6 || ((TestBytes(kCmpRbx7)[2] >> 3) & 7) != 3 || ((TestBytes(kCmpR15_7)[2] >> 3) & 7) != 7
         || TestBytes(kCmpR15_7)[0] != 0x4C) Fail("the register forms");
     if (SiteAt(8).form != kCmpRsi7 || SiteAt(10).form != kCmpRbx7 || SiteAt(14).form != kCmpR15_7) Fail("0x670E16 rsi, 0x6738FF rbx, 0x674D62 r15");
+    {   /* site 23: 1.0.65 0x8586A8 / 1.0.68 0x859578 - cmp qword [rax+0x250],0 then je +0x1F (over the watch-set re-add) */
+        static const unsigned char want23[kCheckLen] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x1F };
+        unsigned char b23[kCheckLen];
+        Expected(22, b23);
+        if (std::string(SiteAt(22).row) != "NpcSensePlayerTest23" || SiteAt(22).form != kCmpZero8 || std::memcmp(b23, want23, (size_t)kCheckLen) != 0)
+            Fail("site 23: NpcSensePlayerTest23, 48 83 B8 50 02 00 00 00 74 1F");
+    }
+    {   /* site 24: 1.0.65 0x65DA7D / 1.0.68 0x65E50D - the call to 'counts as the player'; site 25: 1.0.65 0x65DADD / 1.0.68 0x65E56D -
+           cmp qword [rax+0x250],0 then je rel32 (the end point's player test, on the same target) */
+        static const unsigned char want25[kCheckLen] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x0F, 0x84 };
+        unsigned char b25[kCheckLen];
+        Expected(24, b25);
+        if (std::string(SiteAt(23).row) != "NpcSensePlayerTest24" || SiteAt(23).form != kCallPlayer) Fail("site 24: NpcSensePlayerTest24, the call form");
+        if (std::string(SiteAt(24).row) != "NpcSensePlayerTest25" || SiteAt(24).form != kCmpZero8 || std::memcmp(b25, want25, (size_t)kCheckLen) != 0)
+            Fail("site 25: NpcSensePlayerTest25, 48 83 B8 50 02 00 00 00 0F 84");
+    }
+    {   /* site 26: 1.0.65 0x8517F4 / 1.0.68 0x8526C4 - inside my private building 0x8516F0: cmp qword [rax+0x250],0 (the target's
+           faction) then je +0x14 (to the 'not inside' return) */
+        static const unsigned char want26[kCheckLen] = { 0x48, 0x83, 0xB8, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x14 };
+        unsigned char b26[kCheckLen];
+        Expected(25, b26);
+        if (std::string(SiteAt(25).row) != "NpcSensePlayerTest26" || SiteAt(25).form != kCmpZero8 || std::memcmp(b26, want26, (size_t)kCheckLen) != 0)
+            Fail("site 26: NpcSensePlayerTest26, 48 83 B8 50 02 00 00 00 74 14");
+    }
 }
 /* T-943: the stub each form gets - the compare at 0 and at NOTPEER, the cells, and BACK to the site + the compare's length (the jcc) */
 void t_t943_npc_stub()
@@ -8086,6 +8255,71 @@ void t_t943_npc_stub()
         if (p[back] != 0xFF || p[back + 1] != 0x25 || to != site + (unsigned long long)L) Fail("T-943: BACK returns to the jcc at site + " + I(L) + ", form " + I(f));
         if (p[len] != 0xCC) Fail("T-943: nothing written past the stub, form " + I(f));
     }
+}
+/* T-943: the call form - the site check (E8 rel32 reaching 'counts as the player' directly or through one E9 jump, then 84 C0) and
+   its stub (the engine's call first, then the target's faction against the cells) */
+void t_t943_npc_call()
+{
+    using namespace swnpc;
+    /* the real sites: 1.0.65 0x65DA7D -> jump 0x4110A -> 0x855CF0; 1.0.68 0x65E50D -> jump 0x41132 -> 0x856BC0 */
+    const unsigned char at65[7] = { 0xE8, 0x88, 0x36, 0x9E, 0xFF, 0x84, 0xC0 }, hop65[5] = { 0xE9, 0xE1, 0x4B, 0x81, 0x00 };
+    const unsigned char at68[7] = { 0xE8, 0x20, 0x2C, 0x9E, 0xFF, 0x84, 0xC0 }, hop68[5] = { 0xE9, 0x89, 0x5A, 0x81, 0x00 };
+    const unsigned long long s65 = 0x14065DA7DULL, s68 = 0x14065E50DULL;
+    if (CallDest(at65, s65) != 0x14004110AULL || CallDest(at68, s68) != 0x140041132ULL) Fail("the call's target decoded (1.0.65 0x4110A, 1.0.68 0x41132)");
+    if (!CallSiteOk(at65, s65, hop65, 0x140855CF0ULL) || !CallSiteOk(at68, s68, hop68, 0x140856BC0ULL)) Fail("the real sites reach their build's function through the jump");
+    if (CallSiteOk(at65, s65, hop65, 0x140856BC0ULL) || CallSiteOk(at68, s68, hop68, 0x140855CF0ULL) || CallSiteOk(at65, s65, hop65, 0))
+        Fail("the other build's function, or no row: refused");
+    {   /* a direct call to the function */
+        const unsigned long long site = 0x140001000ULL, callee = 0x140855CF0ULL;
+        const int rel = (int)(long long)(callee - (site + 5));
+        unsigned char at[7] = { 0xE8, 0, 0, 0, 0, 0x84, 0xC0 };
+        CallPut32(at + 1, rel);
+        const unsigned char nohop[5] = { 0x40, 0x53, 0x48, 0x83, 0xEC };
+        if (CallDest(at, site) != callee || !CallSiteOk(at, site, nohop, callee) || !CallSiteOk(at, site, 0, callee)) Fail("a direct call to the function");
+        if (CallSiteOk(at, site, nohop, callee + 0x10)) Fail("a direct call to another function: refused");
+    }
+    {   /* a wrong follow byte, a non-E8 site, a target that is no jump to the function */
+        unsigned char at[7]; unsigned char hop[5];
+        std::memcpy(at, at65, 7); at[6] = 0xC9; if (CallSiteOk(at, s65, hop65, 0x140855CF0ULL)) Fail("84 C9 after the call: refused");
+        std::memcpy(at, at65, 7); at[5] = 0x85; if (CallSiteOk(at, s65, hop65, 0x140855CF0ULL)) Fail("85 C0 after the call: refused");
+        std::memcpy(at, at65, 7); at[0] = 0xE9; if (CallSiteOk(at, s65, hop65, 0x140855CF0ULL) || CallDest(at, s65) != 0) Fail("a jump, not a call: refused");
+        std::memcpy(at, at65, 7); at[0] = 0x90; if (CallSiteOk(at, s65, hop65, 0x140855CF0ULL)) Fail("not a call: refused");
+        std::memcpy(hop, hop65, 5); hop[0] = 0xE8; if (CallSiteOk(at65, s65, hop, 0x140855CF0ULL)) Fail("the target is not a jump: refused");
+        std::memcpy(hop, hop65, 5); hop[1] = 0xE2; if (CallSiteOk(at65, s65, hop, 0x140855CF0ULL)) Fail("the jump goes elsewhere: refused");
+        if (CallSiteOk(at65, s65, 0, 0x140855CF0ULL)) Fail("the jump unread: refused");
+    }
+    /* the stub */
+    const int off = 0x400, cells = 16;
+    const unsigned long long to = 0x14004110AULL;
+    std::vector<unsigned char> p(0x1000, 0xCC);
+    const int len = CallStubBuild(&p[0], to, cells, off);
+    const int N = 45 + 13 * cells, hit = N + 4, done = N + 14;
+    if (len != CallStubLenFor(cells) || len != done + 6 || len > off) Fail("the call stub's length");
+    static const unsigned char head[5] = { 0x51, 0x48, 0x83, 0xEC, 0x20 };
+    if (std::memcmp(&p[0], head, 5) != 0) Fail("push rcx; sub rsp, 0x20 (rsp 16-aligned at its calls)");
+    unsigned long long imm = 0;
+    std::memcpy(&imm, &p[7], 8);
+    if (p[5] != 0x48 || p[6] != 0xB8 || imm != to || p[15] != 0xFF || p[16] != 0xD0) Fail("mov rax, the site's call target; call rax");
+    int d = 0;
+    std::memcpy(&d, &p[21], 4);
+    if (p[17] != 0x84 || p[18] != 0xC0 || p[19] != 0x0F || p[20] != 0x85 || 25 + d != done) Fail("the engine's yes goes straight to DONE");
+    static const unsigned char fac[14] = { 0x48, 0x8B, 0x4C, 0x24, 0x20, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x58, 0x48, 0x85, 0xC0 };
+    if (std::memcmp(&p[25], fac, 14) != 0) Fail("the target from its saved slot, its faction through vtable +0x58, tested for null");
+    std::memcpy(&d, &p[41], 4);
+    if (p[39] != 0x0F || p[40] != 0x84 || 45 + d != N) Fail("no faction: NO");
+    for (int k = 0; k < cells; ++k)
+    {
+        const int o = 45 + 13 * k;
+        std::memcpy(&d, &p[o + 3], 4); if (p[o] != 0x48 || p[o + 1] != 0x3B || p[o + 2] != 0x05 || o + 7 + d != off + 8 + 8 * k) { Fail("call stub cell " + I(k) + " compares rax with its cell"); break; }
+        std::memcpy(&d, &p[o + 9], 4); if (p[o + 7] != 0x0F || p[o + 8] != 0x84 || o + 13 + d != hit) { Fail("call stub cell " + I(k) + " jumps to HIT"); break; }
+    }
+    if (p[N] != 0x31 || p[N + 1] != 0xC0 || p[N + 2] != 0xEB || N + 4 + (int)p[N + 3] != done) Fail("NO: al = 0, then DONE");
+    std::memcpy(&d, &p[hit + 4], 4);
+    if (p[hit] != 0xF0 || p[hit + 1] != 0x48 || p[hit + 2] != 0xFF || p[hit + 3] != 0x05 || hit + 8 + d != off) Fail("HIT counts into the site's hits");
+    if (p[hit + 8] != 0xB0 || p[hit + 9] != 0x01) Fail("HIT: al = 1");
+    static const unsigned char tail[6] = { 0x48, 0x83, 0xC4, 0x20, 0x59, 0xC3 };
+    if (std::memcmp(&p[done], tail, 6) != 0) Fail("DONE: add rsp, 0x20; pop rcx; ret");
+    if (p[len] != 0xCC) Fail("nothing written past the call stub");
 }
 /* T-943: the teammate list - teammates only, no nulls or repeats, capped; each faction keeps its cell; the log cap */
 void t_t943_npc_list()

@@ -104,6 +104,7 @@
 #include "game/GameData.h"    // WsTemplateIsUnique: a template's bool-field table, walked
 #include "../common/fallenwire.h"   // T-556: BringBackWrite, DeadMayPublish
 #include "../common/uniqslot.h"     // FirstSightAlive, ElsewhereMember, DeadSetMember, MemberVerdict, DupDecide
+#include "../common/lookalikelist.h"   // BuildStepFor and the copy id: a squad member on a look-alike not made yet
 #include "../common/removalreason.h"   // kDuplicateNamedRemoved - the reason a second living body is destroyed with
 #include "zones.h"          // SectorOf, AreaHolderSlotTS - which game runs a body's area
 #include "handoff.h"        // HandoffPendingHas, ReleasePendingHas, SquadActivePlatoonOf
@@ -751,6 +752,7 @@ CRITICAL_SECTION g_wsSetCs;
 volatile LONG g_wsSetCsReady = 0;
 std::vector<void*> g_wsDead;          // sorted; guarded by g_wsSetCs
 std::vector<void*> g_wsElsewhere;     // sorted; guarded by g_wsSetCs
+volatile LONG g_wsImportLoad = 0;     // T-1096: 1 while a single-player import's crew loads (store.cpp WorldStateImportLoad; read by store.cpp's look-alike pass, owner 1234 e)
 bool g_wsSetsDirty = true;            // MAIN THREAD: the shadow changed since the last copy
 DWORD g_wsSetsAt = 0;                 // MAIN THREAD: GetTickCount at the last copy
 const DWORD kSetsRefreshMs = 1000;
@@ -1090,6 +1092,51 @@ int WsMemberDeadPod(void* st)         // 1 a dead body, 0 alive, -1 the read fau
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+// T-1096: a squad member whose template record is missing. Its template id as the squad record names it: SavedObjectState+0x18 points at
+// the record's instance position and the templateRef string sits 0x20 past it (the engine's own read for its "missing character base
+// data" line, decomp_36f570.txt:38-41). Copied into `out` (cap bytes, NUL-ended); 1 = read, 0 = absent or unreadable. No std::string here.
+long long g_memberLaMade = 0, g_memberLaLeftOut = 0, g_memberLaOffMain = 0;
+int WsStateTemplateIdPod(void* st, char* out, int cap)
+{
+    out[0] = 0;
+    if (!WsPlaus(st) || cap < 2) return 0;
+    __try
+    {
+        const char* pos = *(const char* const*)((const char*)st + 0x18);
+        if (!WsPlaus(pos)) return 0;
+        const char* s = pos + 0x20;
+        const unsigned long long size = *(const unsigned long long*)(s + 0x10);
+        const unsigned long long res = *(const unsigned long long*)(s + 0x18);
+        if (size == 0 || size >= (unsigned long long)cap || size > res) return 0;
+        const char* d = (res > 0xF) ? *(const char* const*)s : s;
+        if (!WsPlaus(d)) return 0;
+        std::memcpy(out, d, (size_t)size); out[size] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+// the record's own string id (GameData::stringID), the same way. 1 = read.
+int WsRecordSidPod(void* gd, char* out, int cap)
+{
+    out[0] = 0;
+    if (!WsPlaus(gd) || cap < 2) return 0;
+    __try
+    {
+        const std::string& s = ((const ::GameData*)gd)->stringID;
+        const size_t n = s.size();
+        if (n == 0 || n >= (size_t)cap) return 0;
+        std::memcpy(out, s.c_str(), n); out[n] = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+// the template the build goes on with (SavedObjectState::baseRecord). 1 = written.
+int WsStateSetTemplatePod(void* st, void* gd)
+{
+    if (!WsPlaus(st)) return 0;
+    __try { ((SavedObjectState*)st)->baseRecord = (::GameData*)gd; return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 // uniqslot.h MemberVerdict. The template is asked first against the dead set (a search under the lock); only a template in that set
 // has its "unique" flag read, and the member's own record only when the load is not the group's first time (with a non-zero
 // third argument the engine makes the member fresh from its template and never reads the record - decomp_36f570:65-77).
@@ -1097,7 +1144,37 @@ int WsMemberDeadPod(void* st)         // 1 a dead body, 0 alive, -1 the read fau
 void detour_loadInstance(void* self, void* st, void* a3, void* a4, void* a5, void* a6, void* a7)
 {
     WsNoteThread(&g_memberMain, &g_memberOff);
-    void* const gd = WsStateTemplatePod(st);
+    void* gd = WsStateTemplatePod(st);
+    if (gd == 0)
+    {
+        /* T-1096: a member on a look-alike copy not made yet - made here on the main thread and the build goes on with it; off the main
+           thread the record table is not touched (it has no lock) and the member is left out (the engine itself would swap in its
+           placeholder record 136-gamedata.quack, decomp_36f570.txt:40-52, and build it on that - not this character - so the original is
+           not called), counted with its squad, and its copy made at the next tick (store.cpp LookalikeTick) */
+        char tid[128];
+        if (WsStateTemplateIdPod(st, tid, (int)sizeof(tid)) == 1)
+        {
+            const std::string sid(tid);
+            const int step = lalist::BuildStepFor(false, spimport::IsCopySid(sid), WsOnMainThread() != 0);
+            if (step == lalist::kBuildMake)
+            {
+                void* made = StoreLookalikeAtBuild(sid);
+                if (made != 0 && WsStateSetTemplatePod(st, made) == 1) { gd = made; ::InterlockedIncrement64(&g_memberLaMade); }
+                else { ::InterlockedIncrement64(&g_memberLaLeftOut); StoreLookalikeLeftOut(tid, self); return; }
+            }
+            else if (step == lalist::kBuildLeaveOut)
+            {
+                ::InterlockedIncrement64(&g_memberLaLeftOut); ::InterlockedIncrement64(&g_memberLaOffMain);
+                StoreLookalikeLeftOut(tid, self);
+                return;
+            }
+        }
+    }
+    else if (StoreLookalikeLeftCount() > 0)
+    {
+        char rid[128];   /* a member on a copy that was left out is built now: it is no longer left out */
+        if (WsRecordSidPod(gd, rid, (int)sizeof(rid)) == 1 && spimport::IsCopySid(std::string(rid))) StoreLookalikeBuilt(rid);
+    }
     const int inDead = (gd != 0) ? WsDeadSetHas(gd) : 0;
     if (inDead != 0)
     {
@@ -1158,6 +1235,14 @@ void WsLogQueueDrain(WsLogQueue& q, std::set<void*>& logged, int refused)
 
 } // namespace
 
+// T-1096: the import window (worldstate.h).
+int WorldStateImportLoading() { return ::InterlockedCompareExchange(&g_wsImportLoad, 0, 0) != 0 ? 1 : 0; }
+void WorldStateImportLoad(int on)
+{
+    const LONG was = ::InterlockedExchange(&g_wsImportLoad, on != 0 ? 1 : 0);
+    if (was != (on != 0 ? 1 : 0))
+        DebugLog(std::string("[IMPORT] the import's crew ") + (on != 0 ? "now loads: its named characters come along as look-alike copies (owner 1234 e)" : "is in, or no import"));
+}
 // The template's own bool field "unique", the one Character::isUnique 0x505ED0 reads (decomp_505ed0: *(GameData**)(this+0x40)
 // + 0xF8, boolFields); towns2's recipe check (towngen.cpp T2RecipeUnique) and the record-member detour ask it. The table is
 // WALKED and nothing is inserted here; a missing key is not unique, the engine's answer (items.cpp ItSquadIsTraderPod reads
@@ -1225,6 +1310,38 @@ int WsUniqueSlotPod(void* gd)   // MAIN THREAD: 1 the entry's made slot holds a 
     if (r <= 0) return r;
     __try { return (*(void* const*)((const char*)node + kUsedOff) != 0) ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* squadtest (TEST-ONLY), MAIN THREAD. RootObjectFactory::create 0x582970 writes no entry when it makes a named character; the
+   engine's character maker 0x582C50 writes one before it calls it (decomp_582c50.txt:107-112: find_or_insert, +8 the template,
+   +0x18 = 0xB, +0x20 = 0, +0x28 = 0). The same writes here, only when the slot is empty, so the may-make check 0x591720 then
+   refuses to make that character again in this world. 1 written, 2 the slot already held a template, 0 no map or no address,
+   -1 a fault. */
+int WsUniqueMarkMade(void* gd)
+{
+    if (!WsPlaus(gd) || kGetMapRva == 0 || kFindOrInsertRva == 0) return 0;
+    __try
+    {
+        void* map = ((GetMapFn)(g_base + kGetMapRva))();   // the creating accessor - main thread only
+        if (!WsPlaus(map)) return 0;
+        void* key = gd;
+        void* node = ((FindOrInsertFn)(g_base + kFindOrInsertRva))(map, &key);
+        if (!WsPlaus(node)) return -1;
+        if (*(void**)((char*)node + kUsedOff) != 0) return 2;
+        *(void**)((char*)node + kUsedOff) = gd;
+        *(unsigned long long*)((char*)node + 0x18) = 0xB;
+        *(unsigned long long*)((char*)node + 0x20) = 0;
+        *(unsigned int*)((char*)node + 0x28) = 0;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+/* squadtest (TEST-ONLY), MAIN THREAD: the body WsFindLoadedCharacter answers for that template, and whether it is dead. */
+void* WsLoadedBodyOf(void* gd, int* dead)
+{
+    *dead = -1;
+    ::Character* c = WsFindLoadedCharacter(gd);
+    if (c != 0) *dead = WsCharDeadPod(c);
+    return c;
 }
 int WsEntryPlayerInvolvedPod(void* gd)   // MAIN THREAD: the entry's +0x34 (1/0); 0 with no entry (the engine's default) or a fault
 {

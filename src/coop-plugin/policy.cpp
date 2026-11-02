@@ -1364,7 +1364,7 @@ void detour_KitShowTrade(void* gui, void* player, void* other, int type)
 }
 
 /* ---- T-943 (owner 1187 a, 1188): NPCS ON THIS GAME TREAT A TEAMMATE'S CHARACTERS AS THIS GAME'S PLAYER'S OWN ---------------------
-   The NPC senses (AI worker thread) and NPC memory ask inline, at 22 sites, whether a character's faction is a player faction (its
+   The NPC senses (AI worker thread) and NPC memory ask inline, at 23 sites, whether a character's faction is a player faction (its
    PlayerInterface at Faction+0x250); a teammate's characters on this game carry that player's stand-in faction, which has none, so
    NPCs took them for strangers. Each site's compare (8 bytes `cmp qword [rax+0x250],0`, or 7 bytes `cmp qword [rax+0x250],reg` with
    reg = 0 there) is replaced (E9 rel32, NOPs to the compare's end; the jcc after it stays) by a jump to coopcrime::SightStubBuild's
@@ -1380,8 +1380,20 @@ void detour_KitShowTrade(void* gui, void* player, void* other, int type)
    cell: a reader sees the old or the new faction in a cell, never a torn one; a cell is compared, never followed).
    Left with the engine's own answer: 0x858B5F, the 7 tests in 0x853E40, the NPC-side tests in 0x856C40, 0x8561AA / 0x85624A,
    0x671F32 (the NPC's own faction), and crime.cpp's 0x858D13 / 0x85635D and speech.cpp's P26 stage 6 (their own rules).
-   Not covered: the allied / enemy player events 0x42 / 0x43 (sites 1 and 2) still weigh the NPC faction's standing towards the
-   teammate's stand-in faction, not towards this game's player faction. */
+   Not covered: the allied / enemy player events 0x42 / 0x43 (sites 1 - 3; site 23 lets an enemy teammate reach 0x8587B0 at all) still weigh the NPC faction's standing towards the
+   teammate's stand-in faction, not towards this game's player faction.
+   SITES 24 AND 25 (CharMovement's 'move to a character' 0x65D9F0, which may run on the AI worker thread): a mover that is not a
+   player heads for its REMEMBERED position of a target that counts as the player (the engine's 0x855CF0 on the target: site 24),
+   and moves that end point a fixed distance for a player target (site 25: the 8-byte compare above, on the same target, kept in
+   rdi). Site 24 is a call, not a compare (swnpc::kCallPlayer): its `E8 rel32` is replaced by a call to swnpc::CallStubBuild's stub,
+   which calls the same target first (the engine's answer kept) and, only where that answered no, reads the target's faction as the
+   engine's function does (the character's vtable +0x58) and answers yes for a faction in the cells. That stub keeps the stack
+   16-byte aligned and clobbers only the scratch registers the original call clobbers. It has no unwind data: an exception thrown inside either of its two
+   calls could not be unwound through it.
+   SITE 26 (the senses' 'inside my private building' 0x8516F0, 1.0.68 0x8525C0; called only by the sense check 0x8587B0 on the AI
+   worker thread): its last gate is the 8-byte compare above on the TARGET's faction (decomp_8516f0.txt:28). A teammate's
+   character is refused there (+0x250 = 0 on its stand-in faction), so an NPC would never raise event 9 for it inside a private
+   building; patched, a teammate's faction answers as a player faction and the owner's vt+0x290 check after it still runs. */
 BoxCells* g_npcCells[swnpc::kSites];          /* each site's stub cells; 0 = not patched */
 const char* g_npcWhy[swnpc::kSites];          /* each site's install result */
 const void* g_npcPlaced[kBoxCells];           /* MAIN THREAD: the teammates the cells carry, by cell */
@@ -1412,14 +1424,60 @@ static AddrReg g_npcRva18_reg(swnpc::SiteAt(18).row, &g_npcRva[18]);  /* Steam_1
 static AddrReg g_npcRva19_reg(swnpc::SiteAt(19).row, &g_npcRva[19]);  /* Steam_1.0.65 0x677DF4 */
 static AddrReg g_npcRva20_reg(swnpc::SiteAt(20).row, &g_npcRva[20]);  /* Steam_1.0.65 0x677E67 */
 static AddrReg g_npcRva21_reg(swnpc::SiteAt(21).row, &g_npcRva[21]);  /* Steam_1.0.65 0x677E84 */
-typedef char kNpcSitesRegistered[(swnpc::kSites == 22) ? 1 : -1];   /* one AddrReg line above per site */
+static AddrReg g_npcRva22_reg(swnpc::SiteAt(22).row, &g_npcRva[22]);  /* Steam_1.0.65 0x8586A8 - site 23, the watch-list return */
+static AddrReg g_npcRva23_reg(swnpc::SiteAt(23).row, &g_npcRva[23]);  /* Steam_1.0.65 0x65DA7D - site 24, the call to 0x855CF0 */
+static AddrReg g_npcRva24_reg(swnpc::SiteAt(24).row, &g_npcRva[24]);  /* Steam_1.0.65 0x65DADD - site 25, the end point's player test */
+static AddrReg g_npcRva25_reg(swnpc::SiteAt(25).row, &g_npcRva[25]);  /* Steam_1.0.65 0x8517F4 - site 26, inside my private building */
+typedef char kNpcSitesRegistered[(swnpc::kSites == 26) ? 1 : -1];   /* one AddrReg line above per site */
+/* 'counts as the player' (Steam_1.0.65 0x855CF0): only compared with site 24's call target, never called or patched here */
+unsigned long long g_npcCalleeRva = 0;
+static AddrReg g_npcCalleeRva_reg("NpcCountsAsPlayer", &g_npcCalleeRva, kAddrUseCallOnly);
+typedef char kNpcCallStubBeforeCells[(65 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];   /* swnpc::CallStubLenFor(kBoxCells) */
 typedef char kNpcStubBeforeCells[(2 * 8 + 34 + 13 * kBoxCells <= (int)kBoxCellsOff) ? 1 : -1];
 
+/* a call site (swnpc::kCallPlayer): its call to 'counts as the player' replaced by a call to its stub, which calls the same target
+   first; the cells start with the teammates already known. The call must reach this build's NpcCountsAsPlayer (directly or through
+   one jump) and be followed by `test al, al`, else the site is left alone. Written once at InstallPolicy (the preload stage). */
+int NpcCallSitePatch(int k, uintptr_t site)
+{
+    if (g_npcCalleeRva == 0) { g_npcWhy[k] = "no-callee-row"; return 0; }
+    unsigned char now[swnpc::kCallCheckLen], hop[swnpc::kCallLen];
+    if (!BoxReadPod((const void*)site, now, swnpc::kCallCheckLen)) { g_npcWhy[k] = "unreadable"; return 0; }
+    const unsigned long long dest = swnpc::CallDest(now, (unsigned long long)site);
+    if (dest == 0 || !BoxReadPod((const void*)(uintptr_t)dest, hop, swnpc::kCallLen)) { g_npcWhy[k] = "not-expected"; return 0; }
+    if (!swnpc::CallSiteOk(now, (unsigned long long)site, hop, (unsigned long long)(g_base + (uintptr_t)g_npcCalleeRva)))
+    { g_npcWhy[k] = "not-expected"; return 0; }
+    unsigned char* stub = (unsigned char*)BoxAllocNear(site);
+    if (stub == 0) { g_npcWhy[k] = "no-page"; return 0; }
+    const long long rel = (long long)((intptr_t)stub - (intptr_t)(site + 5));
+    if (rel > 0x7FFFFFF0LL || rel < -0x7FFFFFF0LL) { ::VirtualFree(stub, 0, MEM_RELEASE); g_npcWhy[k] = "out-of-range"; return 0; }
+    BoxCells* cells = (BoxCells*)(stub + kBoxCellsOff);
+    for (int c = 0; c < kBoxCells; ++c) cells->cell[c] = (void*)g_npcPlaced[c];
+    cells->hits = 0;
+    if (swnpc::CallStubBuild(stub, dest, kBoxCells, (int)kBoxCellsOff) != swnpc::CallStubLenFor(kBoxCells))
+    { ::VirtualFree(stub, 0, MEM_RELEASE); g_npcWhy[k] = "bad-length"; return 0; }
+    ::FlushInstructionCache(::GetCurrentProcess(), stub, 0x1000);
+    unsigned char patch[swnpc::kCallLen];
+    patch[0] = 0xE8;
+    const int rel32 = (int)rel;
+    std::memcpy(patch + 1, &rel32, 4);
+    DWORD oldProt = 0;
+    if (!::VirtualProtect((void*)site, (SIZE_T)swnpc::kCallLen, PAGE_EXECUTE_READWRITE, &oldProt)) { ::VirtualFree(stub, 0, MEM_RELEASE); g_npcWhy[k] = "protect-refused"; return 0; }
+    std::memcpy((void*)site, patch, (size_t)swnpc::kCallLen);
+    DWORD ignored = 0;
+    ::VirtualProtect((void*)site, (SIZE_T)swnpc::kCallLen, oldProt, &ignored);
+    ::FlushInstructionCache(::GetCurrentProcess(), (void*)site, (SIZE_T)swnpc::kCallLen);
+    g_npcCells[k] = cells;
+    g_npcWhy[k] = "patched";
+    ++g_npcPatched;
+    return 1;
+}
 /* site k's compare replaced by a jump to its stub; the cells start with the teammates already known. Written once at InstallPolicy
    (the preload stage, before any NPC thinks). */
 int NpcSitePatch(int k, uintptr_t site)
 {
     const swnpc::Site& s = swnpc::SiteAt(k);
+    if (s.form == swnpc::kCallPlayer) return NpcCallSitePatch(k, site);
     const int L = swnpc::TestLen(s.form);
     unsigned char want[swnpc::kCheckLen], now[swnpc::kCheckLen];
     swnpc::Expected(k, want);
@@ -1516,7 +1574,10 @@ std::string NpcHitsText()
    The flags a hook sets are put back on every exit, a C++ exception from the engine's code included (the scope objects below).
    The cells hold this game's teammates' factions (written by the main thread through PolicyTeammateFactions, read by any thread); they
    are empty while this game's player is in no team, and every hook then answers as the engine. Shown nowhere: the engine simply does
-   not offer the orders, as it does not for the player's own characters. Installed at InstallPolicy (the preload stage). */
+   not offer the orders, as it does not for the player's own characters. Installed at InstallPolicy (the preload stage).
+   T-1022 (owner 1246 a): the list built for ANOTHER player's character outside the team (speech.cpp's conversation-start speaker test,
+   TalkPlayerCharacter) loses Talk only, in a cage or not (teamorders.h TalkOffered / FilterForOtherPlayer), with or without a team;
+   every other order on it stays as the engine built it. */
 namespace {
 unsigned long long kPiIsEnemyRva = 0;    static AddrReg kPiIsEnemyRva_reg("PlayerInterface_isEnemy", &kPiIsEnemyRva);                   /* Steam_1.0.65 0x79C040 */
 unsigned long long kCharSelectedRva = 0; static AddrReg kCharSelectedRva_reg("PlayerInterface_characterSelected", &kCharSelectedRva);   /* Steam_1.0.65 0x7FA870 */
@@ -1548,12 +1609,14 @@ const size_t kOrdFurnHandType = 0x308;           /* Character: the furniture han
 const size_t kUseOccupied = 0x3A8, kUseHeldHead = 0x3D8, kUseHeldCount = 0x3E0, kHeldNodeHand = 0x18;   /* the furniture's useable part (Building vtable +0x300) */
 volatile LONG64 g_ordEnemyAsked = 0, g_ordEnemyForced = 0, g_ordClicks = 0, g_ordSneakForced = 0, g_ordMenus = 0, g_ordRemoved = 0;
 volatile LONG64 g_ordMenuMarks = 0, g_ordReplaced = 0, g_ordForFound = 0;
+volatile LONG64 g_ordPeerFound = 0, g_ordPeerMenus = 0, g_ordPeerTalkHidden = 0;   /* T-1022: builds for another player's character outside the team, its lists filtered, Talk entries hidden */
 int g_ordHooks = 0;                              /* how many of the five are installed */
 std::string g_ordWhy = "not tried";
 volatile LONG g_clickMate = 0;                   /* inside characterSelected on a teammate's character */
 volatile DWORD g_clickTid = 0;
 /* inside showContextMenu (main thread): the build's depth and thread; the isEnemy mark; what was found before the build */
 volatile LONG g_menuDepth = 0, g_menuOrdMark = 0, g_menuForTarget = 0, g_menuForOcc = 0, g_menuTargetCage = 0, g_menuOccCage = 0;
+volatile LONG g_menuPeerTarget = 0, g_menuPeerOcc = 0;   /* T-1022: the character found before the build is another player's outside the team (clicked: sub 0; in the clicked furniture: sub 1) */
 volatile DWORD g_menuTid = 0;
 /* the `team orders` lever's capture of the last list the menu was handed (main thread) */
 int g_capOn = 0, g_capBuilt = 0, g_capRawN = 0, g_capShownN = 0, g_capSub = 0, g_capCage = 0;
@@ -1678,12 +1741,13 @@ unsigned long long detour_sneakTest(void* ch)
 }
 struct MenuScope    /* showContextMenu's build state, put back on every exit (a build inside a build included) */
 {
-    LONG depth, ordMark, forTarget, forOcc, targetCage, occCage; DWORD tid;
+    LONG depth, ordMark, forTarget, forOcc, targetCage, occCage, peerTarget, peerOcc; DWORD tid;
     MenuScope() : depth(g_menuDepth), ordMark(g_menuOrdMark), forTarget(g_menuForTarget), forOcc(g_menuForOcc), targetCage(g_menuTargetCage),
-                  occCage(g_menuOccCage), tid(g_menuTid) {}
+                  occCage(g_menuOccCage), peerTarget(g_menuPeerTarget), peerOcc(g_menuPeerOcc), tid(g_menuTid) {}
     ~MenuScope()
     {
         g_menuOrdMark = ordMark; g_menuForTarget = forTarget; g_menuForOcc = forOcc; g_menuTargetCage = targetCage; g_menuOccCage = occCage;
+        g_menuPeerTarget = peerTarget; g_menuPeerOcc = peerOcc;
         g_menuTid = tid; g_menuDepth = depth;
     }
 };
@@ -1691,23 +1755,29 @@ void detour_showMenu(void* menu, char show, void* target)
 {
     TalkHoverScope talk(target, coop::kTalkScopeMenu);   /* T-737: the menu's Talk entry follows the talk cursor's answer, as a click */
     MenuScope keep;
-    g_menuOrdMark = 0; g_menuForTarget = 0; g_menuForOcc = 0; g_menuTargetCage = 0; g_menuOccCage = 0;
-    if (show != 0 && target != 0 && g_ordHeld != 0)
+    g_menuOrdMark = 0; g_menuForTarget = 0; g_menuForOcc = 0; g_menuTargetCage = 0; g_menuOccCage = 0; g_menuPeerTarget = 0; g_menuPeerOcc = 0;
+    if (show != 0 && target != 0)
     {
         int nested = 0, cage = 0;
         void* who = OrdersForPod(target, &nested, &cage);
-        if (who != 0 && TeammateObjPod(who, 1) != 0)
+        if (who != 0 && g_ordHeld != 0 && TeammateObjPod(who, 1) != 0)
         {
             ::InterlockedIncrement64(&g_ordForFound);
             if (nested != 0) { g_menuForOcc = 1; g_menuOccCage = cage; }
             else             { g_menuForTarget = 1; g_menuTargetCage = cage; }
+        }
+        else if (who != 0 && coop::TalkPlayerCharacter(who) != 0)   /* T-1022: another player's character outside the team, in a cage or not */
+        {
+            ::InterlockedIncrement64(&g_ordPeerFound);
+            if (nested != 0) g_menuPeerOcc = 1; else g_menuPeerTarget = 1;
         }
     }
     g_menuTid = ::GetCurrentThreadId();
     g_menuDepth = keep.depth + 1;
     orig_showMenu(menu, show, target);
 }
-/* The menu's list: captured for the lever, and for a teammate's character filtered in place. Never faults. */
+/* The menu's list: captured for the lever, and filtered in place - filter 1: a teammate's character (FilterForTeammate); filter 2
+   (T-1022): another player's character outside the team (FilterForOtherPlayer, Talk goes). Never faults. */
 void MenuListPod(void* list, int filter, int cage, unsigned long long sub)
 {
     __try
@@ -1722,7 +1792,7 @@ void MenuListPod(void* list, int filter, int cage, unsigned long long sub)
             for (int i = 0; i < n && i < 64; ++i) g_capRaw[g_capRawN++] = d[i];
         }
         int m = n;
-        if (filter != 0)
+        if (filter == 1)
         {
             int removed = 0, replaced = 0;
             m = swteamord::FilterForTeammate(d, n, cage != 0, &removed, &replaced);
@@ -1730,6 +1800,14 @@ void MenuListPod(void* list, int filter, int cage, unsigned long long sub)
             if (removed > 0) ::InterlockedExchangeAdd64(&g_ordRemoved, removed);
             if (replaced > 0) ::InterlockedExchangeAdd64(&g_ordReplaced, replaced);
             ::InterlockedIncrement64(&g_ordMenus);
+        }
+        else if (filter == 2)
+        {
+            int removed = 0;
+            m = swteamord::FilterForOtherPlayer(d, n, &removed);
+            if (m != n) *pn = (unsigned)m;
+            if (removed > 0) ::InterlockedExchangeAdd64(&g_ordPeerTalkHidden, removed);
+            ::InterlockedIncrement64(&g_ordPeerMenus);
         }
         if (g_capOn != 0)
         {
@@ -1744,7 +1822,8 @@ void detour_menuFill(void* menu, void* list, void* name, unsigned long long sub)
     const bool inBuild = g_menuDepth > 0 && ::GetCurrentThreadId() == g_menuTid;
     const bool filter = inBuild && swteamord::MenuFiltered(g_menuOrdMark != 0, sub, g_menuForTarget != 0, g_menuForOcc != 0);
     const bool cage = filter && g_menuOrdMark == 0 && (sub != 0 ? g_menuOccCage : g_menuTargetCage) != 0;
-    if (list != 0 && (filter || g_capOn != 0)) MenuListPod(list, filter ? 1 : 0, cage ? 1 : 0, sub);
+    const bool peer = inBuild && !filter && swteamord::MenuFiltered(false, sub, g_menuPeerTarget != 0, g_menuPeerOcc != 0);   /* T-1022 */
+    if (list != 0 && (filter || peer || g_capOn != 0)) MenuListPod(list, filter ? 1 : (peer ? 2 : 0), cage ? 1 : 0, sub);
     orig_menuFill(menu, list, name, sub);
 }
 int OrdHook(unsigned long long rva, void* detour, void** orig, const char* what)
@@ -1771,9 +1850,10 @@ void InstallTeamOrders()
 }
 std::string TeamOrdersTokens()
 {
-    return " teamOrders[hooks,cells,enemyAsked,enemyForced,clicks,sneakForced,menus,removed,menuMarks,forFound,replaced]=" + PN((long long)g_ordHooks) + "," + PN((long long)g_ordHeld)
+    return " teamOrders[hooks,cells,enemyAsked,enemyForced,clicks,sneakForced,menus,removed,menuMarks,forFound,replaced,peerFound,peerMenus,peerTalkHidden]=" + PN((long long)g_ordHooks) + "," + PN((long long)g_ordHeld)
          + "," + PN(g_ordEnemyAsked) + "," + PN(g_ordEnemyForced) + "," + PN(g_ordClicks) + "," + PN(g_ordSneakForced) + "," + PN(g_ordMenus) + "," + PN(g_ordRemoved)
-         + "," + PN(g_ordMenuMarks) + "," + PN(g_ordForFound) + "," + PN(g_ordReplaced);
+         + "," + PN(g_ordMenuMarks) + "," + PN(g_ordForFound) + "," + PN(g_ordReplaced)
+         + "," + PN(g_ordPeerFound) + "," + PN(g_ordPeerMenus) + "," + PN(g_ordPeerTalkHidden);
 }
 }   // namespace
 
@@ -2530,7 +2610,7 @@ std::string PolicyReport()
          + " kitHover[why,hits]=" + std::string(g_hoverWhy) + "," + PN(g_hoverCells != 0 ? (long long)g_hoverCells->hits : -1)
          + " kitTradeOwner[why,hits]=" + std::string(g_tradeWhy) + "," + PN(g_tradeCells != 0 ? (long long)g_tradeCells->hits : -1)
          + " kitNpc[patched,sites,mates,cellDrops]=" + PN((long long)g_npcPatched) + "," + PN((long long)swnpc::kSites) + "," + PN((long long)g_npcHeld)
-         + "," + PN((long long)g_npcDrops) + " kitNpcHits[site1..site22]=" + NpcHitsText());
+         + "," + PN((long long)g_npcDrops) + " kitNpcHits[site1..site26]=" + NpcHitsText());
 }
 
 }
